@@ -61,10 +61,17 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config) -> Self {
+        // 超时策略：不设总时限（会掐断超过时限的慢流式生成，导致无限重试永不成功），
+        // 只限制连接建立（30s）与两次读到数据之间的间隔（60s）——spool 设计本身容忍慢流。
         let mut builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(60))
             .pool_idle_timeout(Duration::from_secs(90))
-            .tcp_keepalive(Duration::from_secs(30));
+            .tcp_keepalive(Duration::from_secs(30))
+            // 透明代理不跟随重定向：跟随会把 Authorization/api_key 与请求体外带到
+            // 3xx 指向的任意主机，且 3xx 永远到不了客户端；禁用后 3xx 作为普通
+            // 成功响应原样回放（is_retryable_status 本就排除 3xx）。
+            .redirect(reqwest::redirect::Policy::none());
 
         // 显式配置代理：所有上游请求经该代理转发；reqwest 在 .proxy() 时会自动关闭
         // 系统代理（不再读取 HTTP_PROXY 等环境变量），避免两者互相干扰。
@@ -93,12 +100,18 @@ pub fn router(state: AppState) -> Router {
 
 /// 将配置中的头覆盖/追加逻辑应用到待发往上游的 HeaderMap（大小写不敏感判定）。
 fn apply_header_overrides(headers: &mut HeaderMap, config: &Config) {
-    // api_key 快捷：等效覆盖 Authorization: Bearer <key>（大小写不敏感覆盖）
+    // api_key 快捷：等效覆盖 Authorization: Bearer <key>（大小写不敏感覆盖）。
+    // 同时覆盖 x-api-key（Anthropic 风格上游使用该头携带原始 key，若只覆盖
+    // Authorization，客户端原带的 x-api-key 会原样漏到上游造成鉴权混乱）。
     if let Some(key) = config.api_key.as_deref() {
         let val = format!("Bearer {key}");
         if let Ok(v) = HeaderValue::from_str(&val) {
             headers.remove(http::header::AUTHORIZATION);
             headers.insert(http::header::AUTHORIZATION, v);
+        }
+        if let Ok(raw) = HeaderValue::from_str(key) {
+            headers.remove("x-api-key");
+            headers.insert(HeaderName::from_static("x-api-key"), raw);
         }
     }
 
@@ -143,7 +156,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
         Ok(b) => b,
         Err(e) => {
             tracing::error!(error = %e, "读取请求体失败");
-            return (StatusCode::BAD_REQUEST, format!("读取请求体失败: {e}")).into_response();
+            return (StatusCode::PAYLOAD_TOO_LARGE, format!("请求体超出 10 MiB 上限: {e}")).into_response();
         }
     };
 
@@ -392,7 +405,8 @@ async fn forward_once(
     }
 
     if !body.is_empty() {
-        builder = builder.body(body.to_vec());
+        // Bytes 直接复用（reqwest From<Bytes> 零拷贝），避免每次重试多拷贝至多 10 MiB
+        builder = builder.body(body.clone());
     }
 
     let resp = match builder.send().await {
@@ -412,7 +426,8 @@ async fn forward_once(
         }
         if let Ok(n) = HeaderName::from_bytes(name_str.as_bytes()) {
             if let Ok(v) = HeaderValue::from_bytes(value.as_bytes()) {
-                resp_headers.insert(n, v);
+                // append 而非 insert：Set-Cookie 等同名多值头不能坍缩为最后一个
+                resp_headers.append(n, v);
             }
         }
     }
@@ -454,7 +469,7 @@ fn build_stream_replay_response(status: StatusCode, headers: HeaderMap, body: By
         return resp.body(Body::empty()).unwrap().into_response();
     }
 
-    // 将 Bytes 按 8 KiB 切块，零拷贝（Bytes::slice 引用同一内存）
+    // 将 Bytes 按 8 KiB 切块（copy_from_slice 深拷贝；量级小，成本可忽略）
     const CHUNK_SIZE: usize = 8 * 1024;
     let chunks: Vec<Bytes> = body
         .chunks(CHUNK_SIZE)

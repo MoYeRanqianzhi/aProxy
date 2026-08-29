@@ -61,12 +61,24 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config) -> Self {
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .pool_idle_timeout(Duration::from_secs(90))
-            .tcp_keepalive(Duration::from_secs(30))
-            .build()
-            .expect("构建 reqwest client 失败");
+            .tcp_keepalive(Duration::from_secs(30));
+
+        // 显式配置代理：所有上游请求经该代理转发；reqwest 在 .proxy() 时会自动关闭
+        // 系统代理（不再读取 HTTP_PROXY 等环境变量），避免两者互相干扰。
+        // 代理 URL 已在 Config::validate() 校验，此处 expect 不会失败。
+        if let Some(proxy_url) = config.proxy.as_deref() {
+            let mut proxy = reqwest::Proxy::all(proxy_url).expect("代理 URL 已在 validate() 校验");
+            // 单独配置的用户名/密码优先于 URL 内嵌凭据；仅配置密码而无用户名则忽略
+            if let Some(username) = config.proxy_username.as_deref() {
+                proxy = proxy.basic_auth(username, config.proxy_password.as_deref().unwrap_or(""));
+            }
+            builder = builder.proxy(proxy);
+        }
+
+        let client = builder.build().expect("构建 reqwest client 失败");
         Self {
             config: Arc::new(config),
             client,

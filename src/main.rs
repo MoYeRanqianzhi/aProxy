@@ -16,6 +16,10 @@ struct Cli {
     #[arg(long, value_name = "ADDR")]
     listen: Option<String>,
 
+    /// 上游代理 URL（仅本次运行生效，不写入配置），覆盖配置文件中的 proxy
+    #[arg(long, value_name = "URL")]
+    proxy: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -42,12 +46,24 @@ enum Commands {
         /// 保活心跳间隔秒数，0 表示关闭
         #[arg(long, value_name = "SECS")]
         keepalive_secs: Option<u64>,
+        /// 设置上游代理 URL，例如 http://127.0.0.1:7890 或 socks5://user:pass@127.0.0.1:7890
+        #[arg(long, value_name = "URL")]
+        proxy: Option<String>,
+        /// 设置代理用户名（可选，优先于 URL 内嵌的用户名）
+        #[arg(long, value_name = "USER")]
+        proxy_username: Option<String>,
+        /// 设置代理密码（可选，优先于 URL 内嵌的密码）
+        #[arg(long, value_name = "PASS")]
+        proxy_password: Option<String>,
         /// 清空已配置的 api_key
         #[arg(long)]
         clear_api_key: bool,
         /// 清空 extra/override 头
         #[arg(long)]
         clear_headers: bool,
+        /// 清空代理配置（URL、用户名、密码）
+        #[arg(long)]
+        clear_proxy: bool,
         /// 打印当前配置及文件路径
         #[arg(long)]
         show: bool,
@@ -73,8 +89,12 @@ async fn main() {
         extra_headers,
         override_headers,
         keepalive_secs,
+        proxy,
+        proxy_username,
+        proxy_password,
         clear_api_key,
         clear_headers,
+        clear_proxy,
         show,
     }) = cli.command
     {
@@ -85,8 +105,12 @@ async fn main() {
             extra_headers,
             override_headers,
             keepalive_secs,
+            proxy,
+            proxy_username,
+            proxy_password,
             clear_api_key,
             clear_headers,
+            clear_proxy,
             show,
         );
         return;
@@ -101,6 +125,9 @@ async fn main() {
     }
     if let Some(l) = cli.listen {
         cfg.listen_addr = l;
+    }
+    if let Some(p) = cli.proxy {
+        cfg.proxy = Some(p);
     }
     cfg = cfg.normalized();
 
@@ -144,6 +171,30 @@ async fn main() {
         .unwrap();
 }
 
+/// 对代理 URL 中的密码打码（`http://user:***@host:port`），仅用于展示，绝不输出真实密码。
+fn mask_proxy_url(raw: &str) -> String {
+    let Ok(url) = url::Url::parse(raw) else {
+        return raw.to_string();
+    };
+    let user = url.username();
+    if user.is_empty() && url.password().is_none() {
+        return raw.to_string();
+    }
+    let host = url.host_str().unwrap_or("");
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let auth = if user.is_empty() {
+        ":***@".to_string()
+    } else {
+        format!("{user}:***@")
+    };
+    let mut masked = format!("{}://{}{}{}", url.scheme(), auth, host, port);
+    if let Some(q) = url.query() {
+        masked.push('?');
+        masked.push_str(q);
+    }
+    masked
+}
+
 fn parse_kv(s: &str) -> Option<(String, String)> {
     let (k, v) = s.split_once('=')?;
     let k = k.trim();
@@ -161,8 +212,12 @@ fn handle_config_cmd(
     extra_headers: Vec<String>,
     override_headers: Vec<String>,
     keepalive_secs: Option<u64>,
+    proxy: Option<String>,
+    proxy_username: Option<String>,
+    proxy_password: Option<String>,
     clear_api_key: bool,
     clear_headers: bool,
+    clear_proxy: bool,
     show: bool,
 ) {
     let path = config::config_path();
@@ -213,6 +268,35 @@ fn handle_config_cmd(
         cfg.keepalive_interval_secs = s;
         changed = true;
     }
+    if clear_proxy {
+        cfg.proxy = None;
+        cfg.proxy_username = None;
+        cfg.proxy_password = None;
+        changed = true;
+    } else if let Some(p) = proxy {
+        if p.trim().is_empty() {
+            eprintln!("proxy 不能为空（用 --clear-proxy 清空）");
+            std::process::exit(1);
+        }
+        cfg.proxy = Some(p.trim().to_string());
+        changed = true;
+    }
+    if let Some(u) = proxy_username {
+        if u.trim().is_empty() {
+            eprintln!("proxy-username 不能为空（用 --clear-proxy 清空）");
+            std::process::exit(1);
+        }
+        cfg.proxy_username = Some(u.trim().to_string());
+        changed = true;
+    }
+    if let Some(p) = proxy_password {
+        if p.trim().is_empty() {
+            eprintln!("proxy-password 不能为空（用 --clear-proxy 清空）");
+            std::process::exit(1);
+        }
+        cfg.proxy_password = Some(p.trim().to_string());
+        changed = true;
+    }
 
     if changed {
         cfg = cfg.normalized();
@@ -239,6 +323,26 @@ fn handle_config_cmd(
                 .unwrap_or_else(|| "(未设置)".to_string())
         );
         println!("keepalive_interval_secs = {}", cfg.keepalive_interval_secs);
+        println!(
+            "proxy          = {}",
+            cfg.proxy
+                .as_deref()
+                .map(mask_proxy_url)
+                .unwrap_or_else(|| "(未设置)".to_string())
+        );
+        println!(
+            "proxy_username = {}",
+            cfg.proxy_username
+                .as_deref()
+                .unwrap_or("(未设置)")
+        );
+        println!(
+            "proxy_password = {}",
+            cfg.proxy_password
+                .as_deref()
+                .map(|_| "***".to_string())
+                .unwrap_or_else(|| "(未设置)".to_string())
+        );
         if cfg.extra_headers.is_empty() {
             println!("extra_headers    = (空)");
         } else {

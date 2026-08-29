@@ -6,9 +6,8 @@
 //! 客户端直接请求 aProxy，断言重试与字节保真行为。
 
 use axum::{
-    body::Body,
     http::{HeaderMap, HeaderValue, StatusCode},
-    routing::{any, get, post},
+    routing::{any, get},
     Router,
 };
 use std::{
@@ -436,4 +435,105 @@ async fn header_override_and_extra() {
         .unwrap();
     let body2: serde_json::Value = resp2.json().await.unwrap();
     assert_eq!(body2["extra"], "from-config");
+}
+
+// ---------------------------------------------------------------------------
+// 10. 配置代理：上游请求经配置的 HTTP 代理转发，路径与查询串完整透传
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn proxy_config_routes_through_proxy() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+
+    // 本地上游：回显所请求的路径与查询串
+    let upstream = Router::new().fallback(any(|req: axum::extract::Request| async move {
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/")
+            .to_string();
+        axum::Json(serde_json::json!({"ok": true, "path": path})).into_response()
+    }));
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let upstream_host = upstream_url.trim_start_matches("http://").to_string();
+
+    // 微型 HTTP 代理：接收“绝对 URI”形式的代理请求（GET http://host:port/path HTTP/1.1），
+    // 剥离绝对 URL 为 path+query 后转发给目标并回传响应；记录被命中的次数
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_hits = Arc::new(AtomicUsize::new(0));
+
+    let ph = proxy_hits.clone();
+    let uh = upstream_host.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = proxy_listener.accept().await else { break };
+            let ph = ph.clone();
+            let uh = uh.clone();
+            tokio::spawn(async move {
+                let mut line = String::new();
+                let mut reader = BufReader::new(&mut stream);
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 2 {
+                    return;
+                }
+                let absolute_url = parts[1].to_string();
+                // 读头直到空行，仅验证代理确实收到了请求
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if header == "\r\n" || header == "\n" {
+                        break;
+                    }
+                }
+                drop(reader);
+
+                ph.fetch_add(1, Ordering::SeqCst);
+
+                let Ok(url) = url::Url::parse(&absolute_url) else { return };
+                let path = url.path().to_string();
+                let query = url.query().map(|q| format!("?{q}")).unwrap_or_default();
+                let req_head = format!(
+                    "GET {path}{query} HTTP/1.1\r\nHost: {uh}\r\nConnection: close\r\n\r\n"
+                );
+
+                let Ok(mut up) = TcpStream::connect(&uh).await else { return };
+                if up.write_all(req_head.as_bytes()).await.is_err() {
+                    return;
+                }
+                // 双向转发：上游响应回给客户端
+                let (mut up_r, mut up_w) = up.split();
+                let (mut cli_r, mut cli_w) = stream.split();
+                let _ = tokio::io::copy(&mut up_r, &mut cli_w).await;
+                let _ = tokio::io::copy(&mut cli_r, &mut up_w).await;
+            });
+        }
+    });
+
+    // aProxy 配置走该代理（显式代理会关闭系统/环境变量代理）
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.proxy = Some(format!("http://{proxy_addr}"));
+    let proxy_state = AppState::new(cfg);
+    let (aproxy_url, _h3) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    // 测试客户端直连 aProxy，避免被环境变量代理干扰
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let resp = client
+        .get(format!("{aproxy_url}/v1/deep/path?q=1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    // 路径与查询串经代理后完整透传
+    assert_eq!(body["path"], "/v1/deep/path?q=1");
+    // 请求确实经过了配置的代理
+    assert_eq!(proxy_hits.load(Ordering::SeqCst), 1);
 }

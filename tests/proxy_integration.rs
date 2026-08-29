@@ -7,13 +7,14 @@
 
 use axum::{
     http::{HeaderMap, HeaderValue, StatusCode},
-    routing::{any, get},
+    routing::{any, get, post},
     Router,
 };
+use bytes::Bytes;
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -536,4 +537,167 @@ async fn proxy_config_routes_through_proxy() {
     assert_eq!(body["path"], "/v1/deep/path?q=1");
     // 请求确实经过了配置的代理
     assert_eq!(proxy_hits.load(Ordering::SeqCst), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 11. 重试时原样重放请求体：上游两次尝试读到的请求体字节完全一致
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn request_body_replayed_on_retry() {
+    // 记录每次上游尝试实际读到的请求体
+    let body_log = Arc::new(Mutex::new(Vec::<Bytes>::new()));
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    let bl = body_log.clone();
+    let c = counter.clone();
+    let upstream = Router::new().route(
+        "/v1/echo",
+        post(move |req: axum::extract::Request| {
+            let bl = bl.clone();
+            let c = c.clone();
+            async move {
+                let n = c.fetch_add(1, Ordering::SeqCst);
+                // 读取完整请求体并记录，验证重试时是否原样重放
+                let bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
+                    .await
+                    .unwrap();
+                bl.lock().unwrap().push(bytes);
+                // 首次返回 500 触发重试，第二次成功
+                if n == 0 {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "upstream overloaded").into_response()
+                } else {
+                    (StatusCode::OK, "ok").into_response()
+                }
+            }
+        }),
+    );
+
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let proxy_state = AppState::new(proxy_config_for(&upstream_url));
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    // 客户端直连 aProxy，避免被环境变量代理干扰
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let payload = serde_json::json!({"model": "test", "prompt": "你好，世界"});
+    let resp = client
+        .post(format!("{proxy_url}/v1/echo"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // 恰好两次上游尝试（首次 500 + 第二次成功）
+    assert_eq!(counter.load(Ordering::SeqCst), 2);
+    let log = body_log.lock().unwrap();
+    assert_eq!(log.len(), 2);
+    // 两次尝试收到的请求体字节完全一致（重试原样重放）
+    assert_eq!(log[0], log[1]);
+    // 且等于客户端实际发送的 JSON 字节
+    let expected = serde_json::to_vec(&payload).unwrap();
+    assert_eq!(log[0].as_ref(), expected.as_slice());
+}
+
+// ---------------------------------------------------------------------------
+// 12. 配置的代理用户名/密码：reqwest 向代理发送 Proxy-Authorization: Basic ...
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn proxy_basic_auth_sent() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+
+    // 本地上游：返回成功即可
+    let upstream = Router::new().fallback(any(|| async {
+        (StatusCode::OK, axum::Json(serde_json::json!({"ok": true}))).into_response()
+    }));
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let upstream_host = upstream_url.trim_start_matches("http://").to_string();
+
+    // 微型 HTTP 代理：参考 proxy_config_routes_through_proxy 的写法，额外在
+    // 读请求头循环中捕获 Proxy-Authorization 行的值到共享变量
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let captured_auth = Arc::new(Mutex::new(None::<String>));
+
+    let ca = captured_auth.clone();
+    let uh = upstream_host.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = proxy_listener.accept().await else { break };
+            let ca = ca.clone();
+            let uh = uh.clone();
+            tokio::spawn(async move {
+                let mut line = String::new();
+                let mut reader = BufReader::new(&mut stream);
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 2 {
+                    return;
+                }
+                let absolute_url = parts[1].to_string();
+                // 读头直到空行，大小写不敏感捕获 Proxy-Authorization 的值
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if header == "\r\n" || header == "\n" {
+                        break;
+                    }
+                    // 仅对头名做大小写不敏感比较，值原样保留（base64 区分大小写）
+                    if let Some(idx) = header.find(':') {
+                        if header[..idx].trim().eq_ignore_ascii_case("proxy-authorization") {
+                            *ca.lock().unwrap() = Some(header[idx + 1..].trim().to_string());
+                        }
+                    }
+                }
+                drop(reader);
+
+                let Ok(url) = url::Url::parse(&absolute_url) else { return };
+                let path = url.path().to_string();
+                let query = url.query().map(|q| format!("?{q}")).unwrap_or_default();
+                let req_head = format!(
+                    "GET {path}{query} HTTP/1.1\r\nHost: {uh}\r\nConnection: close\r\n\r\n"
+                );
+
+                let Ok(mut up) = TcpStream::connect(&uh).await else { return };
+                if up.write_all(req_head.as_bytes()).await.is_err() {
+                    return;
+                }
+                // 双向转发：上游响应回给客户端
+                let (mut up_r, mut up_w) = up.split();
+                let (mut cli_r, mut cli_w) = stream.split();
+                let _ = tokio::io::copy(&mut up_r, &mut cli_w).await;
+                let _ = tokio::io::copy(&mut cli_r, &mut up_w).await;
+            });
+        }
+    });
+
+    // aProxy 配置走该代理，并单独配置代理用户名/密码
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.proxy = Some(format!("http://{proxy_addr}"));
+    cfg.proxy_username = Some("alice".to_string());
+    cfg.proxy_password = Some("secret".to_string());
+    let proxy_state = AppState::new(cfg);
+    let (aproxy_url, _h3) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    // 测试客户端直连 aProxy，避免被环境变量代理干扰
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let resp = client
+        .get(format!("{aproxy_url}/v1/ping"))
+        .send()
+        .await
+        .unwrap();
+
+    // 请求成功透传（上游返回 200）
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+
+    // 代理确实收到了 Proxy-Authorization: Basic base64(alice:secret)
+    // base64 值 "YWxpY2U6c2VjcmV0" 已用 PowerShell 验证
+    let captured = captured_auth.lock().unwrap();
+    assert_eq!(captured.as_deref(), Some("Basic YWxpY2U6c2VjcmV0"));
 }

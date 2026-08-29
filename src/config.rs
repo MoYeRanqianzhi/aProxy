@@ -128,6 +128,9 @@ impl Config {
             if url.host_str().is_none() {
                 return Err(format!("proxy 缺少主机地址: {p}"));
             }
+        } else if self.proxy_username.is_some() || self.proxy_password.is_some() {
+            // 仅当显式配置代理 URL 时用户名/密码才有意义，否则是配置遗漏
+            return Err("配置了 proxy_username/proxy_password 但未配置 proxy URL".to_string());
         }
         Ok(())
     }
@@ -340,6 +343,24 @@ mod tests {
             };
             assert!(cfg.validate().is_err(), "应拒绝代理 {p}");
         }
+    }
+
+    #[test]
+    fn validate_rejects_creds_without_proxy_url() {
+        let cfg = Config {
+            upstream_url: "https://api.example.com".to_string(),
+            proxy_username: Some("alice".to_string()),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+
+        // 仅有 proxy URL 时凭据字段不填应通过
+        let cfg = Config {
+            upstream_url: "https://api.example.com".to_string(),
+            proxy: Some("http://127.0.0.1:7890".to_string()),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

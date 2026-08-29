@@ -1,11 +1,11 @@
 //! 代理核心：将本地请求完整透传到上游，并在失败时无限重试。
 //!
 //! 设计要点：
-//! - 单一 upstream URL，其余路径与查询参数完整透传（包含 `/health` 等，上游若有同名路径亦完整透传）
+//! - 单一 upstream base URL，其余路径与查询参数完整透传（包含 `/health` 等，上游若有同名路径亦完整透传）
 //! - 网络错误 / 4xx / 5xx / 错误 JSON 内容 → 全部无限重试，梯度延迟（`retry` 模块）
 //!   原型阶段 4xx 同样视为易发瞬时错误（如限流、临时鉴权波动、上游误报）
 //! - 非流式与流式统一缓冲策略：
-//!   1. 对上游响应先完整缓冲（spool）到内存，期间任何网络中断（`bytes().await` 失败）
+//!   1. 对上游响应先完整缓冲（spool）到内存（上限 `MAX_SPOOL_BYTES`），期间任何网络中断
 //!      均视为 `NetworkError` 触发重试——满足“流式中断可重试”的需求。
 //!   2. 缓冲完成后，再做“是否可重试”的判定：
 //!      - HTTP 状态码可重试（4xx / 5xx，`is_retryable_status`）
@@ -14,11 +14,14 @@
 //!   3. 仅当整轮缓冲成功且判定为不可重试时，才将缓冲体回放给客户端；
 //!      若判定为流式（`is_streaming_response`），则以 chunked 流式分块原样回放，
 //!      逐块产出保持与上游字节完全一致，SSE 解析器语义不受影响。
-//! - 重试期间对客户端的保活：若上游迟迟不成功，代理不在重试循环中静默等待，而是
-//!   在重试间隙向下游（agent 客户端）发送 SSE 注释保活（`: keepalive ...\n\n`），
-//!   防止客户端因 idle 超时而断开；同时缓冲与回放流程用分块流式消除首字节假死
-//! - 头处理：`api_key` 快捷覆盖 `Authorization: Bearer`，`extra_headers` 追加缺失头，
-//!   `override_headers` 无条件覆盖（兼容非 Bearer 鉴权与额外头需求）
+//! - 首轮快速路径：attempt 1 的结果先做判定，成功则直接原样回放（status 与全部
+//!   响应头保真）；仅当需要重试时才进入重试通道——首轮成功是常态路径，保真优先。
+//! - 重试期间对客户端的保活：仅在「需要重试」且客户端接受 SSE 时，才立即返回
+//!   SSE 流式骨架，由后台任务从 attempt 2 继续无限重试，并在重试间隙向下游发送
+//!   SSE 注释保活（`: keepalive ...\n\n`），防止客户端因 idle 超时而断开；
+//!   后台任务在客户端断开（channel 关闭）时立即退出，不空转。
+//! - 头处理：`api_key` 快捷覆盖 `Authorization: Bearer` 与 `x-api-key`（Anthropic 风格），
+//!   `extra_headers` 追加缺失头，`override_headers` 无条件覆盖（兼容非 Bearer 鉴权与额外头需求）
 
 use axum::{
     body::Body,
@@ -179,15 +182,94 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
     let keepalive_dur = state.config.keepalive_interval();
     let keepalive_enabled = state.config.keepalive_enabled() && keepalive_dur.as_secs() > 0;
 
-    // 若需保活，则以流式 Body 立即响应，后台在重试间隙穿插 SSE 注释心跳，避免客户端 idle 超时
-    if keepalive_enabled && client_wants_sse {
-        return proxy_with_keepalive(state.clone(), method, target_url, headers, body_bytes).await;
+    // 首轮（attempt 1）先行：成功则完整保真回放（status/headers 不失真），
+    // 需要重试才进入重试通道——首轮成功是常态路径。
+    let first = forward_once(&state.client, &method, &target_url, &headers, body_bytes.clone()).await;
+
+    let needs_retry = match &first {
+        ForwardResult::NetworkError(e) => {
+            tracing::warn!(error = %e, "首轮上游网络错误，进入重试");
+            true
+        }
+        // 超过 spool 上限重试无意义（确定性失败），直接终态回放 502
+        ForwardResult::TooLarge => false,
+        ForwardResult::Response {
+            status,
+            raw_headers,
+            body,
+            ..
+        } => should_retry_response(1, status, raw_headers, body),
+    };
+
+    if !needs_retry {
+        return match first {
+            ForwardResult::TooLarge => (
+                StatusCode::BAD_GATEWAY,
+                "上游响应体超出 spool 上限，无法回放（重试无意义）",
+            )
+                .into_response(),
+            ForwardResult::Response {
+                status,
+                headers: resp_headers,
+                raw_headers,
+                body,
+            } => {
+                let is_streaming = retry::is_streaming_response(&raw_headers, &body);
+                if is_streaming {
+                    build_stream_replay_response(status, resp_headers, body)
+                } else {
+                    build_response(status, resp_headers, body)
+                }
+            }
+            ForwardResult::NetworkError(_) => unreachable!("NetworkError 必定 needs_retry"),
+        };
     }
 
-    // 非 SSE 客户端：仍走原有的重试循环（响应在成功后一次性返回）
+    // 需要重试：按 keepalive 条件选择通道
+    if keepalive_enabled && client_wants_sse {
+        return proxy_with_keepalive(state, method, target_url, headers, body_bytes).await;
+    }
     proxy_without_keepalive(state, method, target_url, headers, body_bytes).await
 }
 
+/// 判定一次上游响应是否需要重试，并输出对应的诊断日志。
+///
+/// 判定顺序：可重试状态码（4xx/5xx）→ 内容错误（流式扫描 data 行，或非流式错误 JSON）。
+/// 首轮与两个重试通道共用，保证三处判定语义一致。
+fn should_retry_response(
+    attempt: u32,
+    status: &StatusCode,
+    raw_headers: &reqwest::header::HeaderMap,
+    body: &[u8],
+) -> bool {
+    let is_streaming = retry::is_streaming_response(raw_headers, body);
+
+    // 1. HTTP 状态码可重试：无论是否流式，都重试
+    if retry::is_retryable_status(status.as_u16()) {
+        tracing::warn!(attempt, status = %status, is_streaming, "上游返回可重试状态码，重试");
+        let preview = String::from_utf8_lossy(&body[..body.len().min(500)]);
+        tracing::warn!(preview = %preview, "错误响应预览");
+        return true;
+    }
+
+    // 2. 内容错误检测：对所有错误都重试——原型期 4xx 亦视为易发生的瞬时错误。
+    //    即使状态码未命中可重试（如 200 携带 error JSON），只要 body 语义为报错就重试。
+    let is_error = if is_streaming {
+        retry::is_stream_error_body(body)
+    } else {
+        retry::is_error_body(body)
+    };
+    if is_error {
+        let preview = String::from_utf8_lossy(&body[..body.len().min(1000)]);
+        tracing::warn!(attempt, is_streaming, preview = %preview, "上游返回错误内容，重试");
+        return true;
+    }
+
+    false
+}
+
+/// 非 SSE 客户端的重试通道：从 attempt 2 起无限重试（attempt 1 已在 proxy_handler 完成），
+/// 响应在成功后一次性返回。
 async fn proxy_without_keepalive(
     state: AppState,
     method: http::Method,
@@ -195,17 +277,15 @@ async fn proxy_without_keepalive(
     headers: HeaderMap,
     body_bytes: Bytes,
 ) -> Response {
-    let mut attempt: u32 = 0;
+    let mut attempt: u32 = 1;
     loop {
         attempt += 1;
-        if attempt > 1 {
-            let delay = retry::delay_for_attempt(attempt - 1);
-            if !delay.is_zero() {
-                tracing::warn!(attempt, delay_ms = delay.as_millis() as u64, "重试延迟");
-                tokio::time::sleep(delay).await;
-            } else {
-                tracing::warn!(attempt, "立即重试");
-            }
+        let delay = retry::delay_for_attempt(attempt - 1);
+        if !delay.is_zero() {
+            tracing::warn!(attempt, delay_ms = delay.as_millis() as u64, "重试延迟");
+            tokio::time::sleep(delay).await;
+        } else {
+            tracing::warn!(attempt, "立即重试");
         }
 
         let result = forward_once(&state.client, &method, &target_url, &headers, body_bytes.clone()).await;
@@ -215,39 +295,27 @@ async fn proxy_without_keepalive(
                 tracing::warn!(attempt, error = %e, "上游网络错误，重试");
                 continue;
             }
+            ForwardResult::TooLarge => {
+                tracing::error!(attempt, "上游响应体超出 spool 上限，终止重试");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    "上游响应体超出 spool 上限，无法回放（重试无意义）",
+                )
+                    .into_response();
+            }
             ForwardResult::Response {
                 status,
                 headers: resp_headers,
                 raw_headers,
                 body,
             } => {
+                if should_retry_response(attempt, &status, &raw_headers, &body) {
+                    continue;
+                }
+
+                // 成功：按是否流式选择回放方式，保证“原样流式”
                 let is_streaming = retry::is_streaming_response(&raw_headers, &body);
-
-                // 1. HTTP 状态码可重试：无论是否流式，都重试
-                if retry::is_retryable_status(status.as_u16()) {
-                    tracing::warn!(attempt, status = %status, is_streaming, "上游返回可重试状态码，重试");
-                    let preview = String::from_utf8_lossy(&body[..body.len().min(500)]);
-                    tracing::warn!(preview = %preview, "错误响应预览");
-                    continue;
-                }
-
-                // 2. 内容错误检测：对所有错误都重试——原型期 4xx 亦视为易发生的瞬时错误。
-                //    即使状态码未命中可重试（如 200 携带 error JSON），只要 body 语义为报错就重试。
-                let is_error = if is_streaming {
-                    retry::is_stream_error_body(&body)
-                } else {
-                    retry::is_error_body(&body)
-                };
-                if is_error {
-                    let preview = String::from_utf8_lossy(&body[..body.len().min(1000)]);
-                    tracing::warn!(attempt, is_streaming, preview = %preview, "上游返回错误内容，重试");
-                    continue;
-                }
-
-                // 3. 成功：按是否流式选择回放方式，保证“原样流式”
-                if attempt > 1 {
-                    tracing::info!(attempt, status = %status, is_streaming, "重试后成功");
-                }
+                tracing::info!(attempt, status = %status, is_streaming, "重试后成功");
                 if is_streaming {
                     return build_stream_replay_response(status, resp_headers, body);
                 } else {
@@ -258,7 +326,12 @@ async fn proxy_without_keepalive(
     }
 }
 
-/// 带保活的代理：立即以 SSE 流响应，在重试间隙发送 `: keepalive\n\n`，成功后无缝拼接上游响应
+/// 带保活的重试通道：仅在上游首轮已失败后进入。立即以 SSE 流响应并在流中发送
+/// `: keepalive\n\n` 注释，后台从 attempt 2 起无限重试，成功后将上游 body 分块转发。
+///
+/// 注意：此通道的骨架响应已先行发出（200 + text/event-stream），上游真实 status
+/// 与响应头无法再回放——这是「先保活、后成功」的固有取舍；首轮成功走的是
+/// proxy_handler 的保真快速路径，不受影响。
 async fn proxy_with_keepalive(
     state: AppState,
     method: http::Method,
@@ -269,32 +342,38 @@ async fn proxy_with_keepalive(
     let keepalive_dur = state.config.keepalive_interval();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
 
-    // 后台任务：无限重试上游，期间按 keepalive_dur 发送 SSE 注释；成功后将上游响应分块转发
+    // 心跳为 SSE 注释（": keepalive\n\n"），合法 SSE 客户端按规范忽略
+    let heartbeat = || Bytes::from_static(b": keepalive\n\n");
+
+    // 后台任务：无限重试上游，期间按 keepalive_dur 发送 SSE 注释；成功后将上游响应分块转发。
+    // 所有 send 都检查客户端是否已断开（channel 关闭 → 立即退出，不空转）。
     let state_bg = state.clone();
     tokio::spawn(async move {
-        let mut attempt: u32 = 0;
+        // 骨架发出后立即发首个心跳：客户端 idle 计时从收到字节起算
+        if tx.send(Ok(heartbeat())).await.is_err() {
+            return;
+        }
+
+        let mut attempt: u32 = 1;
         loop {
             attempt += 1;
-            if attempt > 1 {
-                let delay = retry::delay_for_attempt(attempt - 1);
-                if !delay.is_zero() {
-                    // 在延迟期间按 keepalive_dur 切片发送心跳，避免客户端 idle 超时
-                    let mut elapsed = Duration::ZERO;
-                    while elapsed < delay {
-                        let slice = std::cmp::min(keepalive_dur, delay - elapsed);
-                        tokio::time::sleep(slice).await;
-                        elapsed += slice;
-                        if elapsed < delay {
-                            // 仅在尚未到下一轮重试时发送心跳
-                            let hb = Bytes::from_static(b": keepalive\n\n");
-                            if tx.send(Ok(hb)).await.is_err() {
-                                return;
-                            }
+            let delay = retry::delay_for_attempt(attempt - 1);
+            if !delay.is_zero() {
+                // 在延迟期间按 keepalive_dur 切片发送心跳，避免客户端 idle 超时
+                let mut elapsed = Duration::ZERO;
+                while elapsed < delay {
+                    let slice = std::cmp::min(keepalive_dur, delay - elapsed);
+                    tokio::time::sleep(slice).await;
+                    elapsed += slice;
+                    if elapsed < delay {
+                        // 仅在尚未到下一轮重试时发送心跳
+                        if tx.send(Ok(heartbeat())).await.is_err() {
+                            return;
                         }
                     }
-                } else {
-                    tracing::warn!(attempt, "立即重试（保活通道）");
                 }
+            } else {
+                tracing::warn!(attempt, "立即重试（保活通道）");
             }
 
             let result = forward_once(&state_bg.client, &method, &target_url, &headers, body_bytes.clone()).await;
@@ -302,51 +381,41 @@ async fn proxy_with_keepalive(
             match result {
                 ForwardResult::NetworkError(e) => {
                     tracing::warn!(attempt, error = %e, "上游网络错误，重试（保活通道）");
-                    let hb = Bytes::from_static(b": keepalive\n\n");
-                    let _ = tx.send(Ok(hb)).await;
+                    if tx.send(Ok(heartbeat())).await.is_err() {
+                        return;
+                    }
                     continue;
+                }
+                ForwardResult::TooLarge => {
+                    tracing::error!(attempt, "上游响应体超出 spool 上限，终止重试（保活通道）");
+                    return;
                 }
                 ForwardResult::Response {
                     status,
-                    headers: _resp_headers,
                     raw_headers,
                     body,
+                    ..
                 } => {
+                    if should_retry_response(attempt, &status, &raw_headers, &body) {
+                        if tx.send(Ok(heartbeat())).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+
                     let is_streaming = retry::is_streaming_response(&raw_headers, &body);
+                    tracing::info!(attempt, status = %status, is_streaming, "重试后成功（保活通道）");
 
-                    if retry::is_retryable_status(status.as_u16()) {
-                        tracing::warn!(attempt, status = %status, is_streaming, "上游返回可重试状态码，重试（保活通道）");
-                        let hb = Bytes::from_static(b": keepalive\n\n");
-                        let _ = tx.send(Ok(hb)).await;
-                        continue;
-                    }
-
-                    let is_error = if is_streaming {
-                        retry::is_stream_error_body(&body)
-                    } else {
-                        retry::is_error_body(&body)
-                    };
-                    if is_error {
-                        tracing::warn!(attempt, is_streaming, "上游返回错误内容，重试（保活通道）");
-                        let hb = Bytes::from_static(b": keepalive\n\n");
-                        let _ = tx.send(Ok(hb)).await;
-                        continue;
-                    }
-
-                    if attempt > 1 {
-                        tracing::info!(attempt, status = %status, is_streaming, "重试后成功（保活通道）");
-                    }
-
-                    // 成功：将完整 body 按块转发；若为 SSE，保持 SSE 语义（心跳为注释，不影响解析）
+                    // 成功：将完整 body 按块转发；若为 SSE，保持 SSE 语义（心跳为注释，不影响解析）。
+                    // 空 body 直接结束流，不注入任何上游未发送的字节。
                     if body.is_empty() {
-                        let _ = tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n"))).await;
-                    } else {
-                        const CHUNK_SIZE: usize = 8 * 1024;
-                        for chunk in body.as_ref().chunks(CHUNK_SIZE) {
-                            let b = Bytes::copy_from_slice(chunk);
-                            if tx.send(Ok(b)).await.is_err() {
-                                return;
-                            }
+                        return;
+                    }
+                    const CHUNK_SIZE: usize = 8 * 1024;
+                    for chunk in body.as_ref().chunks(CHUNK_SIZE) {
+                        let b = Bytes::copy_from_slice(chunk);
+                        if tx.send(Ok(b)).await.is_err() {
+                            return;
                         }
                     }
                     return;
@@ -355,7 +424,7 @@ async fn proxy_with_keepalive(
         }
     });
 
-    // 立即返回 SSE 流；首轮成功时不注入任何额外字节，仅在重试间隙注入 ": keepalive\n\n"（SSE 注释，客户端会忽略）
+    // SSE 流式骨架；仅在重试间隙注入 ": keepalive\n\n"（SSE 注释，客户端会忽略）
     let rx_stream = tokio_stream::wrappers::ReceiverStream::new(rx)
         .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
     let body = Body::from_stream(rx_stream);
@@ -363,12 +432,14 @@ async fn proxy_with_keepalive(
     let mut resp = Response::builder().status(StatusCode::OK);
     resp = resp.header(http::header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
     resp = resp.header(http::header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    resp = resp.header(http::header::CONNECTION, HeaderValue::from_static("keep-alive"));
+    // 不设置 connection 头：hyper 按协议自动管理
     resp.body(body).unwrap().into_response()
 }
 
 enum ForwardResult {
     NetworkError(String),
+    /// 上游响应体超出 `MAX_SPOOL_BYTES`：确定性失败，重试无意义，各通道直接终态处理。
+    TooLarge,
     /// 完整缓冲后的响应；`raw_headers` 保留原始 reqwest 头用于流式嗅探，
     /// `headers` 为已过滤 hop-by-hop 后的待透传头。
     Response {
@@ -378,6 +449,10 @@ enum ForwardResult {
         body: Bytes,
     },
 }
+
+/// 响应体 spool 上限：防止失控/恶意上游把内存打爆。
+/// 超过该上限的响应无法完整缓冲，也就无法满足“spool 后回放”的设计，直接按 TooLarge 终态处理。
+const MAX_SPOOL_BYTES: usize = 256 * 1024 * 1024;
 
 async fn forward_once(
     client: &reqwest::Client,
@@ -432,11 +507,23 @@ async fn forward_once(
         }
     }
 
-    // 关键：完整 spool——任何流式中断都会在此处以 Err 形式暴露，从而触发重试
-    let body_bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => return ForwardResult::NetworkError(format!("读取上游响应体失败: {e}")),
-    };
+    // 关键：完整 spool（分块累积）——任何流式中断都会在此处以 Err 形式暴露，从而触发重试；
+    // 超出上限按 TooLarge 终态处理
+    let mut spooled: Vec<u8> = Vec::new();
+    let mut resp_stream = resp;
+    loop {
+        match resp_stream.chunk().await {
+            Ok(Some(chunk)) => {
+                if spooled.len() + chunk.len() > MAX_SPOOL_BYTES {
+                    return ForwardResult::TooLarge;
+                }
+                spooled.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => return ForwardResult::NetworkError(format!("读取上游响应体失败: {e}")),
+        }
+    }
+    let body_bytes = Bytes::from(spooled);
 
     ForwardResult::Response {
         status,

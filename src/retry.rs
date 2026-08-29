@@ -46,7 +46,11 @@ pub fn is_error_body(body: &[u8]) -> bool {
         return false;
     };
     if obj.contains_key("error") {
-        return true;
+        // error: null 视为未携带有效错误——某些上游成功体会带 error:null 字段，
+        // 若判为错误会导致 200 成功响应被无限重试
+        if !obj.get("error").map(|v| v.is_null()).unwrap_or(false) {
+            return true;
+        }
     }
     if obj.get("type").and_then(|t| t.as_str()) == Some("error") {
         return true;
@@ -210,9 +214,12 @@ mod tests {
 
     #[test]
     fn error_body_key_presence() {
-        // 只要含顶层 error 键即判定为错误，与值类型无关（null / 数组）
-        assert!(is_error_body(br#"{"error": null}"#));
+        // 含顶层 error 键且值有效即判定为错误（数组/对象/字符串）
         assert!(is_error_body(br#"{"error": []}"#));
+
+        // "error": null 视为未携带有效错误（部分上游成功体如此），不应触发无限重试
+        assert!(!is_error_body(br#"{"error": null}"#));
+        assert!(!is_error_body(br#"{"error": null, "ok": true}"#));
     }
 
     #[test]

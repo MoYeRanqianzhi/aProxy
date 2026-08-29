@@ -83,9 +83,19 @@ impl Config {
                 self.api_key = Some(k.trim().to_string());
             }
         }
-        // 清理空键
-        self.extra_headers.retain(|k, _| !k.trim().is_empty());
-        self.override_headers.retain(|k, _| !k.trim().is_empty());
+        // 头 k/v 统一 trim（与 CLI 路径 parse_kv 行为一致），trim 后 key 为空则剔除
+        self.extra_headers = self
+            .extra_headers
+            .iter()
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .filter(|(k, _)| !k.is_empty())
+            .collect();
+        self.override_headers = self
+            .override_headers
+            .iter()
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .filter(|(k, _)| !k.is_empty())
+            .collect();
         // 代理：空白视为未设置
         self.proxy = self
             .proxy
@@ -110,9 +120,18 @@ impl Config {
         if self.base_url.trim().is_empty() {
             return Err("base_url 不能为空，请在 ~/.aproxy/config.toml 中配置".to_string());
         }
-        if !(self.base_url.starts_with("http://") || self.base_url.starts_with("https://")) {
+        // scheme 判定大小写不敏感（"HTTP://" 亦合法）
+        let scheme_lower = self.base_url.trim().to_ascii_lowercase();
+        if !(scheme_lower.starts_with("http://") || scheme_lower.starts_with("https://")) {
             return Err(format!(
                 "base_url 必须以 http:// 或 https:// 开头，当前值: {}",
+                self.base_url
+            ));
+        }
+        // 拒绝带 query/fragment 的 base_url：拼接 path 时会把路径拼进 query，静默错路由
+        if self.base_url.contains('?') || self.base_url.contains('#') {
+            return Err(format!(
+                "base_url 不应包含 ? 或 #（路径拼接会错路由），当前值: {}",
                 self.base_url
             ));
         }
@@ -429,6 +448,54 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_base_url_with_query_or_fragment() {
+        // 带 query/fragment 的 base_url 拼接 path 时会把路径拼进 query，静默错路由
+        for p in ["https://api.example.com?v=1", "https://api.example.com#frag"] {
+            let cfg = Config {
+                base_url: p.to_string(),
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_err(), "应拒绝含 query/fragment 的 base_url {p}");
+        }
+        // 带路径前缀仍合法（如反向代理子路径）
+        let cfg = Config {
+            base_url: "https://api.example.com/api".to_string(),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_uppercase_scheme() {
+        for p in ["HTTP://api.example.com", "Https://api.example.com"] {
+            let cfg = Config {
+                base_url: p.to_string(),
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_ok(), "大写 scheme {p} 应被接受");
+        }
+    }
+
+    #[test]
+    fn normalized_trims_header_keys_and_values() {
+        // 配置文件路径进来的头 k/v 统一 trim，与 CLI parse_kv 行为一致；trim 后空 key 剔除
+        let cfg = Config {
+            base_url: "https://api.example.com".to_string(),
+            extra_headers: HashMap::from([
+                ("  x-a  ".to_string(), "  v1  ".to_string()),
+                ("   ".to_string(), "dropped".to_string()),
+            ]),
+            override_headers: HashMap::from([("x-b".to_string(), "".to_string())]),
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(cfg.extra_headers.get("x-a").map(String::as_str), Some("v1"));
+        assert!(cfg.extra_headers.get("x-a") != cfg.extra_headers.get("  x-a  "));
+        assert!(!cfg.extra_headers.contains_key("   "));
+        assert_eq!(cfg.override_headers.get("x-b").map(String::as_str), Some(""));
     }
 
     #[test]

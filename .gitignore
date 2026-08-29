@@ -1,0 +1,28 @@
+# Rust
+/target/
+/Cargo.lock.bak
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Agent memory (optional, keep .agents/ if team uses it)
+# .agents/memory/*.md are committed; ignore scratch files
+.agents/tmp/
+.agents/cache/
+
+# Logs
+*.log

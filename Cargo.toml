@@ -1,0 +1,38 @@
+[package]
+name = "aproxy"
+version = "0.1.0-alpha.1"
+edition = "2024"
+description = "Local API proxy with infinite retries for agent workloads"
+license = "MIT"
+authors = ["aProxy Contributors"]
+repository = "https://github.com/aProxy/aProxy"
+keywords = ["proxy", "retry", "api", "agent", "claude-code"]
+categories = ["network-programming", "web-programming"]
+
+[[bin]]
+name = "aproxy"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dirs = "6"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+http-body-util = "0.1"
+futures-util = "0.3"
+http = "1"
+tokio-util = { version = "0.7", features = ["io"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"

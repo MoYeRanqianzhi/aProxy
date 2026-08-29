@@ -35,7 +35,7 @@ async fn bind_random_router(router: Router) -> (String, tokio::task::JoinHandle<
 
 fn proxy_config_for(upstream: &str) -> Config {
     Config {
-        upstream_url: upstream.to_string(),
+        base_url: upstream.to_string(),
         listen_addr: "127.0.0.1:0".to_string(),
         ..Default::default()
     }

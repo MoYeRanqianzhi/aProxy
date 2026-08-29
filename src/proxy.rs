@@ -152,7 +152,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
         .map(|pq| pq.as_str())
         .unwrap_or("/");
 
-    let upstream_base = state.config.upstream_url.trim_end_matches('/');
+    let upstream_base = state.config.base_url.trim_end_matches('/');
     let target_url = format!("{}{}", upstream_base, path_and_query);
 
     tracing::info!(method = %method, path = %path_and_query, target = %target_url, "代理请求");
@@ -519,7 +519,7 @@ mod tests {
     #[test]
     fn api_key_sets_bearer_authorization() {
         let cfg = Config {
-            upstream_url: "https://api.example.com".to_string(),
+            base_url: "https://api.example.com".to_string(),
             api_key: Some("sk-test".to_string()),
             ..Default::default()
         };
@@ -531,7 +531,7 @@ mod tests {
     #[test]
     fn api_key_overwrites_existing_authorization() {
         let cfg = Config {
-            upstream_url: "https://api.example.com".to_string(),
+            base_url: "https://api.example.com".to_string(),
             api_key: Some("sk-test".to_string()),
             ..Default::default()
         };
@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn missing_api_key_adds_no_authorization() {
         let cfg = Config {
-            upstream_url: "https://api.example.com".to_string(),
+            base_url: "https://api.example.com".to_string(),
             ..Default::default()
         };
         let mut headers = HeaderMap::new();
@@ -558,7 +558,7 @@ mod tests {
     fn override_headers_unconditionally_replace_existing() {
         // 配置键 "X-Foo" 应覆盖已有 "x-foo"（大小写不敏感），且同名多值全部收敛为单个新值
         let cfg = Config {
-            upstream_url: "https://api.example.com".to_string(),
+            base_url: "https://api.example.com".to_string(),
             override_headers: HashMap::from([("X-Foo".to_string(), "new".to_string())]),
             ..Default::default()
         };
@@ -573,7 +573,7 @@ mod tests {
     #[test]
     fn override_headers_add_missing_headers() {
         let cfg = Config {
-            upstream_url: "https://api.example.com".to_string(),
+            base_url: "https://api.example.com".to_string(),
             override_headers: HashMap::from([("x-added".to_string(), "v".to_string())]),
             ..Default::default()
         };
@@ -585,7 +585,7 @@ mod tests {
     #[test]
     fn extra_headers_only_fill_missing() {
         let cfg = Config {
-            upstream_url: "https://api.example.com".to_string(),
+            base_url: "https://api.example.com".to_string(),
             extra_headers: HashMap::from([
                 ("x-extra".to_string(), "added".to_string()),
                 ("x-present".to_string(), "ignored".to_string()),
@@ -604,7 +604,7 @@ mod tests {
     fn override_headers_beat_api_key_for_authorization() {
         // 优先级：api_key 先应用、override_headers 后应用 → authorization 最终取 override 值
         let cfg = Config {
-            upstream_url: "https://api.example.com".to_string(),
+            base_url: "https://api.example.com".to_string(),
             api_key: Some("sk-api".to_string()),
             override_headers: HashMap::from([("Authorization".to_string(), "Bearer sk-override".to_string())]),
             ..Default::default()
@@ -618,7 +618,7 @@ mod tests {
     fn extra_headers_do_not_overwrite_existing_authorization() {
         // extra_headers 优先级最低（只补缺失）：api_key 已写入 authorization 时不再覆盖
         let cfg = Config {
-            upstream_url: "https://api.example.com".to_string(),
+            base_url: "https://api.example.com".to_string(),
             api_key: Some("sk-api".to_string()),
             extra_headers: HashMap::from([("Authorization".to_string(), "should-not-win".to_string())]),
             ..Default::default()
@@ -632,7 +632,7 @@ mod tests {
     fn invalid_names_and_values_are_silently_skipped() {
         // 非法头名（含空格/控制字符）与非法头值（含控制字符）应被静默跳过，不 panic
         let cfg = Config {
-            upstream_url: "https://api.example.com".to_string(),
+            base_url: "https://api.example.com".to_string(),
             api_key: Some("bad\nkey".to_string()), // 含换行控制符 → HeaderValue 非法，api_key 应被跳过
             override_headers: HashMap::from([
                 ("bad name".to_string(), "v".to_string()), // 含空格 → HeaderName 非法

@@ -8,9 +8,9 @@ use aproxy::config;
 #[derive(Parser, Debug)]
 #[command(name = "aproxy", version, about = "Local API proxy with infinite retries", long_about = None)]
 struct Cli {
-    /// 上游 API base URL，覆盖配置文件中的 upstream_url
+    /// 上游 API base URL，覆盖配置文件中的 base_url
     #[arg(long, value_name = "URL")]
-    upstream: Option<String>,
+    baseurl: Option<String>,
 
     /// 监听地址，覆盖配置文件中的 listen_addr
     #[arg(long, value_name = "ADDR")]
@@ -20,6 +20,10 @@ struct Cli {
     #[arg(long, value_name = "URL")]
     proxy: Option<String>,
 
+    /// 快捷 api_key（等效覆盖 Authorization: Bearer <key>，仅本次运行生效），覆盖配置文件中的 api_key
+    #[arg(long, value_name = "KEY")]
+    api_key: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -28,9 +32,9 @@ struct Cli {
 enum Commands {
     /// 查看或修改配置（配置文件位于 ~/.aproxy/config.toml）
     Config {
-        /// 设置上游 URL，例如 https://api.anthropic.com
+        /// 设置上游 base URL，例如 https://api.anthropic.com
         #[arg(long, value_name = "URL")]
-        upstream: Option<String>,
+        baseurl: Option<String>,
         /// 设置监听地址，例如 127.0.0.1:12345
         #[arg(long, value_name = "ADDR")]
         listen: Option<String>,
@@ -83,7 +87,7 @@ async fn main() {
 
     // 子命令：config
     if let Some(Commands::Config {
-        upstream,
+        baseurl,
         listen,
         api_key,
         extra_headers,
@@ -99,7 +103,7 @@ async fn main() {
     }) = cli.command
     {
         handle_config_cmd(
-            upstream,
+            baseurl,
             listen,
             api_key,
             extra_headers,
@@ -120,14 +124,17 @@ async fn main() {
     let mut cfg = config::load();
 
     // 命令行参数覆盖配置文件
-    if let Some(u) = cli.upstream {
-        cfg.upstream_url = u;
+    if let Some(u) = cli.baseurl {
+        cfg.base_url = u;
     }
     if let Some(l) = cli.listen {
         cfg.listen_addr = l;
     }
     if let Some(p) = cli.proxy {
         cfg.proxy = Some(p);
+    }
+    if let Some(k) = cli.api_key {
+        cfg.api_key = Some(k);
     }
     cfg = cfg.normalized();
 
@@ -136,14 +143,14 @@ async fn main() {
         eprintln!("位置: {}", config::config_path().display());
         eprintln!();
         eprintln!("请执行以下任一操作后重试:");
-        eprintln!("  aproxy config --upstream https://api.anthropic.com");
+        eprintln!("  aproxy config --baseurl https://api.anthropic.com");
         eprintln!("  或手动编辑 {}", config::config_path().display());
         std::process::exit(1);
     }
 
     let listen_addr = cfg.listen_addr.clone();
-    let upstream_url = cfg.upstream_url.clone();
-    tracing::info!(listen = %listen_addr, upstream = %upstream_url, config = %config::config_path().display(), "启动 aProxy");
+    let base_url = cfg.base_url.clone();
+    tracing::info!(listen = %listen_addr, base_url = %base_url, config = %config::config_path().display(), "启动 aProxy");
 
     let state = aproxy::proxy::AppState::new(cfg);
     let app = aproxy::proxy::router(state);
@@ -157,9 +164,9 @@ async fn main() {
 
     println!("aProxy 已启动");
     println!("  监听: http://{listen_addr}");
-    println!("  上游: {upstream_url}");
-    if !upstream_url.is_empty() {
-        let base = upstream_url.trim_end_matches('/');
+    println!("  Base URL: {base_url}");
+    if !base_url.is_empty() {
+        let base = base_url.trim_end_matches('/');
         println!("  提示: 将你的 API base URL 指向 http://{listen_addr}");
         println!("        上游路径与查询参数将完整透传到 {base}/<path>?<query>");
     }
@@ -206,7 +213,7 @@ fn parse_kv(s: &str) -> Option<(String, String)> {
 }
 
 fn handle_config_cmd(
-    upstream: Option<String>,
+    baseurl: Option<String>,
     listen: Option<String>,
     api_key: Option<String>,
     extra_headers: Vec<String>,
@@ -224,8 +231,8 @@ fn handle_config_cmd(
     let mut cfg = config::load();
 
     let mut changed = false;
-    if let Some(u) = upstream {
-        cfg.upstream_url = u.trim_end_matches('/').to_string();
+    if let Some(u) = baseurl {
+        cfg.base_url = u.trim_end_matches('/').to_string();
         changed = true;
     }
     if let Some(l) = listen {
@@ -313,7 +320,7 @@ fn handle_config_cmd(
         // 重新加载以展示最终值
         let cfg = config::load().normalized();
         println!("配置文件: {}", path.display());
-        println!("upstream_url = \"{}\"", cfg.upstream_url);
+        println!("base_url     = \"{}\"", cfg.base_url);
         println!("listen_addr  = \"{}\"", cfg.listen_addr);
         println!(
             "api_key      = {}",
@@ -359,10 +366,10 @@ fn handle_config_cmd(
                 println!("  {k} = \"{v}\"");
             }
         }
-        if cfg.upstream_url.is_empty() {
+        if cfg.base_url.is_empty() {
             println!();
-            println!("提示: upstream_url 为空，请设置:");
-            println!("  aproxy config --upstream https://api.anthropic.com");
+            println!("提示: base_url 为空，请设置:");
+            println!("  aproxy config --baseurl https://api.anthropic.com");
         }
     }
 }

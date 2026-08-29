@@ -1,4 +1,4 @@
-//! 配置管理：`~/.aproxy/config.toml`，单一 upstream URL，完整透传。
+//! 配置管理：`~/.aproxy/config.toml`，单一 upstream base URL，完整透传。
 //!
 //! 额外能力（兼容设计）：
 //! - `api_key` 快捷：等效覆盖 `Authorization: Bearer <key>`
@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     /// 上游 API 的 base URL，例如 `https://api.anthropic.com`
     /// 末尾斜杠会被自动去除以避免拼接时产生 `//`。
-    pub upstream_url: String,
+    /// 旧版字段名 `upstream_url` 仍可读取（alias），保存时写为新名 `base_url`。
+    #[serde(default, alias = "upstream_url")]
+    pub base_url: String,
     /// 本地代理监听地址，默认 `127.0.0.1:12345`（仅本地可访问，避免局域网暴露）。
     #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
@@ -57,7 +59,7 @@ fn default_keepalive_secs() -> u64 {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            upstream_url: String::new(),
+            base_url: String::new(),
             listen_addr: default_listen_addr(),
             api_key: None,
             extra_headers: HashMap::new(),
@@ -71,9 +73,9 @@ impl Default for Config {
 }
 
 impl Config {
-    /// 归一化：去除 upstream 末尾斜杠；清理空 api_key；清理空代理配置。
+    /// 归一化：去除 base_url 末尾斜杠；清理空 api_key；清理空代理配置。
     pub fn normalized(mut self) -> Self {
-        self.upstream_url = self.upstream_url.trim_end_matches('/').to_string();
+        self.base_url = self.base_url.trim_end_matches('/').to_string();
         if let Some(k) = &self.api_key {
             if k.trim().is_empty() {
                 self.api_key = None;
@@ -103,15 +105,15 @@ impl Config {
         self
     }
 
-    /// 校验：upstream 必须非空且为 http/https URL；proxy 若配置必须为受支持的代理 URL。
+    /// 校验：base_url 必须非空且为 http/https URL；proxy 若配置必须为受支持的代理 URL。
     pub fn validate(&self) -> Result<(), String> {
-        if self.upstream_url.trim().is_empty() {
-            return Err("upstream_url 不能为空，请在 ~/.aproxy/config.toml 中配置".to_string());
+        if self.base_url.trim().is_empty() {
+            return Err("base_url 不能为空，请在 ~/.aproxy/config.toml 中配置".to_string());
         }
-        if !(self.upstream_url.starts_with("http://") || self.upstream_url.starts_with("https://")) {
+        if !(self.base_url.starts_with("http://") || self.base_url.starts_with("https://")) {
             return Err(format!(
-                "upstream_url 必须以 http:// 或 https:// 开头，当前值: {}",
-                self.upstream_url
+                "base_url 必须以 http:// 或 https:// 开头，当前值: {}",
+                self.base_url
             ));
         }
         if let Some(p) = &self.proxy {
@@ -158,7 +160,7 @@ pub fn config_dir() -> PathBuf {
     home.join(".aproxy")
 }
 
-/// 加载配置：若文件不存在则返回默认配置（upstream 为空，后续 validate 会提示）。
+/// 加载配置：若文件不存在则返回默认配置（base_url 为空，后续 validate 会提示）。
 pub fn load() -> Config {
     load_from(&config_path())
 }
@@ -200,7 +202,7 @@ mod tests {
     #[test]
     fn validate_rejects_empty() {
         let cfg = Config {
-            upstream_url: "".to_string(),
+            base_url: "".to_string(),
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
@@ -209,7 +211,7 @@ mod tests {
     #[test]
     fn validate_rejects_non_http() {
         let cfg = Config {
-            upstream_url: "ftp://example.com".to_string(),
+            base_url: "ftp://example.com".to_string(),
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
@@ -218,7 +220,7 @@ mod tests {
     #[test]
     fn validate_accepts_https() {
         let cfg = Config {
-            upstream_url: "https://api.anthropic.com".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
@@ -227,18 +229,18 @@ mod tests {
     #[test]
     fn normalized_trims_trailing_slash() {
         let cfg = Config {
-            upstream_url: "https://api.anthropic.com/".to_string(),
+            base_url: "https://api.anthropic.com/".to_string(),
             ..Default::default()
         }
         .normalized();
-        assert_eq!(cfg.upstream_url, "https://api.anthropic.com");
+        assert_eq!(cfg.base_url, "https://api.anthropic.com");
     }
 
     #[test]
     fn normalized_trims_api_key_and_empties() {
         // api_key 前后空白被裁剪
         let cfg = Config {
-            upstream_url: "https://api.example.com".to_string(),
+            base_url: "https://api.example.com".to_string(),
             api_key: Some("  sk-test  ".to_string()),
             ..Default::default()
         }
@@ -248,7 +250,7 @@ mod tests {
         // 全空白或空串视为未设置
         for k in ["   ", ""] {
             let cfg = Config {
-                upstream_url: "https://api.example.com".to_string(),
+                base_url: "https://api.example.com".to_string(),
                 api_key: Some(k.to_string()),
                 ..Default::default()
             }
@@ -260,7 +262,7 @@ mod tests {
     #[test]
     fn normalized_removes_blank_extra_header_keys() {
         let cfg = Config {
-            upstream_url: "https://api.example.com".to_string(),
+            base_url: "https://api.example.com".to_string(),
             extra_headers: HashMap::from([
                 ("x-keep".to_string(), "1".to_string()),
                 ("   ".to_string(), "2".to_string()),
@@ -284,7 +286,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let mut cfg = Config {
-            upstream_url: "https://api.example.com".to_string(),
+            base_url: "https://api.example.com".to_string(),
             listen_addr: "127.0.0.1:9999".to_string(),
             ..Default::default()
         };
@@ -293,7 +295,7 @@ mod tests {
         cfg.override_headers.insert("authorization".to_string(), "Bearer x".to_string());
         save_to(&path, &cfg).unwrap();
         let loaded = load_from(&path);
-        assert_eq!(loaded.upstream_url, cfg.upstream_url);
+        assert_eq!(loaded.base_url, cfg.base_url);
         assert_eq!(loaded.listen_addr, cfg.listen_addr);
         assert_eq!(loaded.api_key, cfg.api_key);
         assert_eq!(loaded.extra_headers.get("x-extra").unwrap(), "1");
@@ -305,7 +307,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nonexistent.toml");
         let cfg = load_from(&path);
-        assert!(cfg.upstream_url.is_empty());
+        assert!(cfg.base_url.is_empty());
         assert_eq!(cfg.listen_addr, default_listen_addr());
     }
 
@@ -327,7 +329,7 @@ mod tests {
     #[test]
     fn default_completeness() {
         let cfg = Config::default();
-        assert_eq!(cfg.upstream_url, "");
+        assert_eq!(cfg.base_url, "");
         assert_eq!(cfg.listen_addr, "127.0.0.1:12345");
         assert_eq!(cfg.keepalive_interval_secs, 15);
         assert!(cfg.api_key.is_none());
@@ -341,7 +343,7 @@ mod tests {
     #[test]
     fn proxy_normalized_trims_and_empties() {
         let cfg = Config {
-            upstream_url: "https://api.example.com".to_string(),
+            base_url: "https://api.example.com".to_string(),
             proxy: Some("  http://127.0.0.1:7890  ".to_string()),
             proxy_username: Some("  user  ".to_string()),
             proxy_password: Some("  pass  ".to_string()),
@@ -354,7 +356,7 @@ mod tests {
 
         // 纯空白视为未设置
         let cfg = Config {
-            upstream_url: "https://api.example.com".to_string(),
+            base_url: "https://api.example.com".to_string(),
             proxy: Some("   ".to_string()),
             proxy_username: Some("".to_string()),
             ..Default::default()
@@ -374,7 +376,7 @@ mod tests {
             "socks5://user:pass@127.0.0.1:1080",
         ] {
             let cfg = Config {
-                upstream_url: "https://api.example.com".to_string(),
+                base_url: "https://api.example.com".to_string(),
                 proxy: Some(p.to_string()),
                 ..Default::default()
             };
@@ -387,7 +389,7 @@ mod tests {
         // socks5h/socks4a（DNS 走代理解析的变体）也应被接受
         for p in ["socks5h://127.0.0.1:1080", "socks4a://127.0.0.1:1080"] {
             let cfg = Config {
-                upstream_url: "https://api.example.com".to_string(),
+                base_url: "https://api.example.com".to_string(),
                 proxy: Some(p.to_string()),
                 ..Default::default()
             };
@@ -403,7 +405,7 @@ mod tests {
             "http://",            // 缺少主机
         ] {
             let cfg = Config {
-                upstream_url: "https://api.example.com".to_string(),
+                base_url: "https://api.example.com".to_string(),
                 proxy: Some(p.to_string()),
                 ..Default::default()
             };
@@ -414,7 +416,7 @@ mod tests {
     #[test]
     fn validate_rejects_creds_without_proxy_url() {
         let cfg = Config {
-            upstream_url: "https://api.example.com".to_string(),
+            base_url: "https://api.example.com".to_string(),
             proxy_username: Some("alice".to_string()),
             ..Default::default()
         };
@@ -422,7 +424,7 @@ mod tests {
 
         // 仅有 proxy URL 时凭据字段不填应通过
         let cfg = Config {
-            upstream_url: "https://api.example.com".to_string(),
+            base_url: "https://api.example.com".to_string(),
             proxy: Some("http://127.0.0.1:7890".to_string()),
             ..Default::default()
         };
@@ -430,11 +432,31 @@ mod tests {
     }
 
     #[test]
+    fn legacy_upstream_url_field_still_loads() {
+        // 旧版配置文件字段名 upstream_url 应经 alias 正常读取，保存时写为新名 base_url
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "upstream_url = \"https://legacy.example.com\"\nlisten_addr = \"127.0.0.1:12345\"\n",
+        )
+        .unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.base_url, "https://legacy.example.com");
+
+        // roundtrip 后应写为新字段名
+        save_to(&path, &loaded).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("base_url"), "保存后应写新字段名 base_url");
+        assert!(!content.contains("upstream_url"), "保存后不应再写旧字段名");
+    }
+
+    #[test]
     fn proxy_survives_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let cfg = Config {
-            upstream_url: "https://api.example.com".to_string(),
+            base_url: "https://api.example.com".to_string(),
             proxy: Some("socks5://127.0.0.1:1080".to_string()),
             proxy_username: Some("alice".to_string()),
             proxy_password: Some("secret".to_string()),

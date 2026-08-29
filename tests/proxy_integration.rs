@@ -701,3 +701,60 @@ async fn proxy_basic_auth_sent() {
     let captured = captured_auth.lock().unwrap();
     assert_eq!(captured.as_deref(), Some("Basic YWxpY2U6c2VjcmV0"));
 }
+
+// ---------------------------------------------------------------------------
+// 15. 客户端断开 → 后台任务立即中止：上游计数停滞（计费保护）
+//
+// keepalive 通道下上游持续 429，客户端读到首个心跳后主动断开。
+// 断开后后台任务必须退出：不再发起新的上游请求，in-flight 的请求也被 select 竞速丢弃。
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn client_disconnect_stops_upstream_requests() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c2 = counter.clone();
+    let upstream = Router::new().route(
+        "/v1/slow",
+        any(move |_req: axum::extract::Request| {
+            let c = c2.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                // 永远 429：迫使代理进入无限重试
+                (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response()
+            }
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.keepalive_interval_secs = 1;
+    let proxy_state = AppState::new(cfg);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/v1/slow", proxy_url))
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "keepalive 骨架应立即返回 200");
+
+    // 读到首个 ": keepalive" 心跳（证明后台任务在跑）后立即断开
+    use futures_util::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        buf.extend_from_slice(&chunk.unwrap());
+        if String::from_utf8_lossy(&buf).contains(": keepalive") {
+            break;
+        }
+    }
+    assert!(!buf.is_empty(), "断开前应已收到心跳字节");
+    drop(stream); // bytes_stream 借用 resp，先 drop 流再随作用域 drop resp → 连接断开
+
+    // 断开后的首次重试窗口：select 竞速应拦下 in-flight 与后续尝试
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let c1 = counter.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let c2 = counter.load(Ordering::SeqCst);
+    assert_eq!(c1, c2, "客户端断开后上游请求计数必须停滞（后台任务已退出），断开时 c1={c1}");
+}

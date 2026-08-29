@@ -342,6 +342,12 @@ async fn proxy_with_keepalive(
     let keepalive_dur = state.config.keepalive_interval();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
 
+    // 客户端断开信号：watch(false→true)。哨兵被 move 进响应 Body 的流闭包，
+    // hyper 因客户端断开而 drop Body 时闭包随之销毁，哨兵 Drop 中置位；
+    // 后台任务据此立即中止 in-flight 的上游请求（避免断开后上游继续生成白自计费）。
+    let (gone_tx, mut gone_rx) = tokio::sync::watch::channel(false);
+    let gone_guard = ClientGoneGuard { tx: gone_tx };
+
     // 心跳为 SSE 注释（": keepalive\n\n"），合法 SSE 客户端按规范忽略
     let heartbeat = || Bytes::from_static(b": keepalive\n\n");
 
@@ -376,7 +382,20 @@ async fn proxy_with_keepalive(
                 tracing::warn!(attempt, "立即重试（保活通道）");
             }
 
-            let result = forward_once(&state_bg.client, &method, &target_url, &headers, body_bytes.clone()).await;
+            // in-flight 期间与客户端断开信号竞速：断开即丢弃 forward_once future，
+            // reqwest 连接随之关闭，上游（如 LLM API）会因连接断开停止生成——
+            // 这是「客户端断开后本条请求立即断开」的关键点，防止计费浪费。
+            let client_gone = async {
+                // 信号置位或哨兵随 Body 提前销毁（channel 关闭）都视为断开
+                let _ = gone_rx.wait_for(|v| *v).await;
+            };
+            let result = tokio::select! {
+                r = forward_once(&state_bg.client, &method, &target_url, &headers, body_bytes.clone()) => r,
+                _ = client_gone => {
+                    tracing::info!("客户端已断开，中止 in-flight 上游请求（保活通道）");
+                    return;
+                }
+            };
 
             match result {
                 ForwardResult::NetworkError(e) => {
@@ -424,9 +443,13 @@ async fn proxy_with_keepalive(
         }
     });
 
-    // SSE 流式骨架；仅在重试间隙注入 ": keepalive\n\n"（SSE 注释，客户端会忽略）
+    // SSE 流式骨架；仅在重试间隙注入 ": keepalive\n\n"（SSE 注释，客户端会忽略）。
+    // 哨兵 move 进 map 闭包：Body 被客户端断开而 drop 时闭包销毁 → 置位断开信号。
     let rx_stream = tokio_stream::wrappers::ReceiverStream::new(rx)
-        .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
+        .map(move |r| {
+            let _ = &gone_guard;
+            r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        });
     let body = Body::from_stream(rx_stream);
 
     let mut resp = Response::builder().status(StatusCode::OK);
@@ -434,6 +457,18 @@ async fn proxy_with_keepalive(
     resp = resp.header(http::header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     // 不设置 connection 头：hyper 按协议自动管理
     resp.body(body).unwrap().into_response()
+}
+
+/// 客户端断开哨兵：持有 watch 发送端，Drop 时置位断开信号。
+/// 被 move 进 keepalive 响应 Body 的流闭包，Body 随客户端断开被 hyper drop 时触发。
+struct ClientGoneGuard {
+    tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl Drop for ClientGoneGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.send(true);
+    }
 }
 
 enum ForwardResult {

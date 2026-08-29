@@ -161,6 +161,17 @@ mod tests {
     }
 
     #[test]
+    fn delay_attempt_zero_and_max() {
+        // attempt=0：当前行为与 1-3 相同，直接返回 ZERO
+        assert_eq!(delay_for_attempt(0), std::time::Duration::ZERO);
+        // u32::MAX：减法不会下溢，指数移位被 min(6) 封顶，不 panic 且封顶 320s
+        assert_eq!(
+            delay_for_attempt(u32::MAX),
+            std::time::Duration::from_secs(320)
+        );
+    }
+
+    #[test]
     fn retryable_status() {
         // 原型：所有错误状态码都重试（4xx / 5xx）
         assert!(is_retryable_status(400));
@@ -177,6 +188,17 @@ mod tests {
     }
 
     #[test]
+    fn retryable_status_boundaries() {
+        // 重试区间 [400, 599] 的边界：399/600 不重试，400/599 重试，3xx 一律不重试
+        assert!(!is_retryable_status(399));
+        assert!(is_retryable_status(400));
+        assert!(is_retryable_status(599));
+        assert!(!is_retryable_status(600));
+        assert!(!is_retryable_status(300));
+        assert!(!is_retryable_status(302));
+    }
+
+    #[test]
     fn error_body_detection() {
         assert!(is_error_body(br#"{"error": "overloaded"}"#));
         assert!(is_error_body(br#"{"error": {"message": "x"}}"#));
@@ -184,6 +206,29 @@ mod tests {
         assert!(!is_error_body(br#"{"content": "hello"}"#));
         assert!(!is_error_body(br#"not json"#));
         assert!(!is_error_body(br#"[]"#));
+    }
+
+    #[test]
+    fn error_body_key_presence() {
+        // 只要含顶层 error 键即判定为错误，与值类型无关（null / 数组）
+        assert!(is_error_body(br#"{"error": null}"#));
+        assert!(is_error_body(br#"{"error": []}"#));
+    }
+
+    #[test]
+    fn error_body_case_and_nesting() {
+        // type 值大小写敏感：仅小写 "error" 命中
+        assert!(!is_error_body(br#"{"type": "Error"}"#));
+        // error 键必须位于顶层，嵌套在内层不命中
+        assert!(!is_error_body(br#"{"data":{"error":"x"}}"#));
+    }
+
+    #[test]
+    fn error_body_non_object() {
+        // 非对象 JSON（null / 数字 / 普通字符串）均不判定为错误
+        assert!(!is_error_body(br#"null"#));
+        assert!(!is_error_body(br#"42"#));
+        assert!(!is_error_body(br#""hello""#));
     }
 
     #[test]
@@ -207,6 +252,47 @@ mod tests {
     #[test]
     fn stream_error_body_non_json() {
         assert!(!is_stream_error_body(b"hello world"));
+    }
+
+    #[test]
+    fn stream_error_body_trailing_error() {
+        // 多个正常 data 事件后，末尾出现 error 事件仍应命中
+        let sse = b"data: {\"type\":\"content_block_delta\",\"text\":\"a\"}\ndata: {\"type\":\"content_block_delta\",\"text\":\"b\"}\ndata: {\"error\":\"boom\"}\n";
+        assert!(is_stream_error_body(sse));
+    }
+
+    #[test]
+    fn stream_error_body_data_space_variant() {
+        // SSE "data :"（冒号前带空格）变体应能识别错误
+        let sse = b"data : {\"error\":\"overloaded\"}\n";
+        assert!(is_stream_error_body(sse));
+    }
+
+    #[test]
+    fn stream_error_body_crlf() {
+        // CRLF（\r\n）行尾的 SSE 应能识别错误
+        let sse = b"data: {\"type\":\"content\"}\r\ndata: {\"error\":\"x\"}\r\n";
+        assert!(is_stream_error_body(sse));
+    }
+
+    #[test]
+    fn stream_error_body_bom() {
+        // 以 BOM 开头的 body：不 panic，判定为无错误即可
+        let body = b"\xEF\xBB\xBFdata: {\"error\":\"x\"}\n";
+        assert!(!is_stream_error_body(body));
+    }
+
+    #[test]
+    fn stream_error_body_ndjson_mixed_lines() {
+        // NDJSON 混入空行 / 注释等非 JSON 行时，错误行仍被识别
+        let ndjson = b"\n# comment\n{\"type\":\"content\"}\n{\"error\":\"x\"}\n";
+        assert!(is_stream_error_body(ndjson));
+    }
+
+    #[test]
+    fn stream_error_body_empty() {
+        // 空 body：不 panic，返回 false
+        assert!(!is_stream_error_body(b""));
     }
 
     #[test]
@@ -234,5 +320,43 @@ mod tests {
             "application/json".parse().unwrap(),
         );
         assert!(!is_streaming_response(&headers, br#"{"ok":true}"#));
+    }
+
+    #[test]
+    fn streaming_response_content_type_variants() {
+        // Content-Type 大小写不敏感：大写 TEXT/EVENT-STREAM 命中
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            "TEXT/EVENT-STREAM".parse().unwrap(),
+        );
+        assert!(is_streaming_response(&headers, b""));
+
+        // 带 charset 参数仍命中
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            "text/event-stream; charset=utf-8".parse().unwrap(),
+        );
+        assert!(is_streaming_response(&headers, b""));
+    }
+
+    #[test]
+    fn streaming_response_data_space_sniff() {
+        // body 嗅探兼容 "data :"（冒号前带空格）变体
+        let headers = reqwest::header::HeaderMap::new();
+        assert!(is_streaming_response(&headers, b"data : {\"a\":1}\n"));
+    }
+
+    #[test]
+    fn streaming_response_json_without_data_line() {
+        // application/json 且 body 无 data 行：不判定为流式
+        // "data" 出现在行首之外，不应命中嗅探
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        assert!(!is_streaming_response(&headers, br#"{"content":"data: not a stream"}"#));
     }
 }

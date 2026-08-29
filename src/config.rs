@@ -235,6 +235,45 @@ mod tests {
     }
 
     #[test]
+    fn normalized_trims_api_key_and_empties() {
+        // api_key 前后空白被裁剪
+        let cfg = Config {
+            upstream_url: "https://api.example.com".to_string(),
+            api_key: Some("  sk-test  ".to_string()),
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(cfg.api_key.as_deref(), Some("sk-test"));
+
+        // 全空白或空串视为未设置
+        for k in ["   ", ""] {
+            let cfg = Config {
+                upstream_url: "https://api.example.com".to_string(),
+                api_key: Some(k.to_string()),
+                ..Default::default()
+            }
+            .normalized();
+            assert!(cfg.api_key.is_none(), "api_key {:?} 应被置空", k);
+        }
+    }
+
+    #[test]
+    fn normalized_removes_blank_extra_header_keys() {
+        let cfg = Config {
+            upstream_url: "https://api.example.com".to_string(),
+            extra_headers: HashMap::from([
+                ("x-keep".to_string(), "1".to_string()),
+                ("   ".to_string(), "2".to_string()),
+                ("".to_string(), "3".to_string()),
+            ]),
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(cfg.extra_headers.len(), 1);
+        assert_eq!(cfg.extra_headers.get("x-keep").unwrap(), "1");
+    }
+
+    #[test]
     fn default_port_is_12345() {
         assert_eq!(default_listen_addr(), "127.0.0.1:12345");
         assert_eq!(Config::default().listen_addr, "127.0.0.1:12345");
@@ -286,6 +325,20 @@ mod tests {
     }
 
     #[test]
+    fn default_completeness() {
+        let cfg = Config::default();
+        assert_eq!(cfg.upstream_url, "");
+        assert_eq!(cfg.listen_addr, "127.0.0.1:12345");
+        assert_eq!(cfg.keepalive_interval_secs, 15);
+        assert!(cfg.api_key.is_none());
+        assert!(cfg.extra_headers.is_empty());
+        assert!(cfg.override_headers.is_empty());
+        assert!(cfg.proxy.is_none());
+        assert!(cfg.proxy_username.is_none());
+        assert!(cfg.proxy_password.is_none());
+    }
+
+    #[test]
     fn proxy_normalized_trims_and_empties() {
         let cfg = Config {
             upstream_url: "https://api.example.com".to_string(),
@@ -320,6 +373,19 @@ mod tests {
             "socks4://127.0.0.1:1080",
             "socks5://user:pass@127.0.0.1:1080",
         ] {
+            let cfg = Config {
+                upstream_url: "https://api.example.com".to_string(),
+                proxy: Some(p.to_string()),
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_ok(), "应接受代理 {p}");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_socks_proxy_variants() {
+        // socks5h/socks4a（DNS 走代理解析的变体）也应被接受
+        for p in ["socks5h://127.0.0.1:1080", "socks4a://127.0.0.1:1080"] {
             let cfg = Config {
                 upstream_url: "https://api.example.com".to_string(),
                 proxy: Some(p.to_string()),

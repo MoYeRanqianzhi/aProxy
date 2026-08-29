@@ -172,16 +172,32 @@ async fn main() {
     }
     println!("按 Ctrl+C 退出。");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .unwrap();
+    // 优雅关闭 + 宽限强退：keepalive 后台重试任务不会主动结束，axum::serve 等待
+    // 在途连接完成时可能被其无限期挂起，收到退出信号后给 10 秒宽限窗口即强制退出。
+    tokio::select! {
+        result = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()) => {
+            result.unwrap();
+        }
+        _ = async {
+            shutdown_signal().await;
+            tracing::info!("10 秒后强制退出（在途请求将中断）");
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            std::process::exit(0);
+        } => {}
+    }
+}
+
+/// 密钥类值的展示打码：保留前 6 个字符 + "***"（按字符截断，避免多字节字符在字节边界 panic）。
+fn mask_secret(s: &str) -> String {
+    let prefix: String = s.chars().take(6).collect();
+    format!("{prefix}***")
 }
 
 /// 对代理 URL 中的密码打码（`http://user:***@host:port`），仅用于展示，绝不输出真实密码。
 fn mask_proxy_url(raw: &str) -> String {
+    // 解析失败时原样返回会泄露内嵌密码，只回显已隐去的安全占位
     let Ok(url) = url::Url::parse(raw) else {
-        return raw.to_string();
+        return "<无法解析的代理配置，已隐去>".to_string();
     };
     let user = url.username();
     if user.is_empty() && url.password().is_none() {
@@ -189,10 +205,11 @@ fn mask_proxy_url(raw: &str) -> String {
     }
     let host = url.host_str().unwrap_or("");
     let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
-    let auth = if user.is_empty() {
-        ":***@".to_string()
-    } else {
+    // 仅用户名无密码时不渲染 ":***@"，避免让人误以为配置了密码
+    let auth = if url.password().is_some() {
         format!("{user}:***@")
+    } else {
+        format!("{user}@")
     };
     let mut masked = format!("{}://{}{}{}", url.scheme(), auth, host, port);
     if let Some(q) = url.query() {
@@ -306,6 +323,24 @@ fn handle_config_cmd(
     }
 
     if changed {
+        // 保存前守卫：配置文件存在但解析失败时 load() 会静默回退默认值，
+        // 直接保存会把用户手写（或损坏）的配置整个覆盖掉——拒绝修改并报告解析错误。
+        let path = config::config_path();
+        if path.exists() {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    if let Err(e) = toml::from_str::<aproxy::config::Config>(&content) {
+                        eprintln!("现有配置文件解析失败，拒绝覆盖（请先修复或删除 {}）", path.display());
+                        eprintln!("解析错误: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("读取配置文件失败: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         cfg = cfg.normalized();
         match config::save(&cfg) {
             Ok(()) => println!("已保存配置到 {}", path.display()),
@@ -326,7 +361,8 @@ fn handle_config_cmd(
             "api_key      = {}",
             cfg.api_key
                 .as_deref()
-                .map(|k| format!("\"{}***\"", &k[..k.len().min(6)]))
+                .map(mask_secret)
+                .map(|s| format!("\"{s}\""))
                 .unwrap_or_else(|| "(未设置)".to_string())
         );
         println!("keepalive_interval_secs = {}", cfg.keepalive_interval_secs);
@@ -355,7 +391,8 @@ fn handle_config_cmd(
         } else {
             println!("extra_headers:");
             for (k, v) in &cfg.extra_headers {
-                println!("  {k} = \"{v}\"");
+                // 头值常含完整鉴权令牌，与 api_key 一致做截断打码
+                println!("  {k} = \"{}\"", mask_secret(v));
             }
         }
         if cfg.override_headers.is_empty() {
@@ -363,7 +400,7 @@ fn handle_config_cmd(
         } else {
             println!("override_headers:");
             for (k, v) in &cfg.override_headers {
-                println!("  {k} = \"{v}\"");
+                println!("  {k} = \"{}\"", mask_secret(v));
             }
         }
         if cfg.base_url.is_empty() {

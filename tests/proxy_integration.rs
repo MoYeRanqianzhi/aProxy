@@ -758,3 +758,251 @@ async fn client_disconnect_stops_upstream_requests() {
     let c2 = counter.load(Ordering::SeqCst);
     assert_eq!(c1, c2, "客户端断开后上游请求计数必须停滞（后台任务已退出），断开时 c1={c1}");
 }
+
+// ---------------------------------------------------------------------------
+// 16. 超过 10 MiB 的请求体 → 413
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn oversized_request_returns_413() {
+    let upstream = Router::new().route("/v1/x", any(|| async { "ok" }));
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let proxy_state = AppState::new(proxy_config_for(&upstream_url));
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let big = vec![b'a'; 10 * 1024 * 1024 + 1];
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{proxy_url}/v1/x"))
+        .body(big)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413, "超过 10 MiB 上限应返回 413");
+}
+
+// ---------------------------------------------------------------------------
+// 17. 8 KiB 块边界：恰好 2×8KiB 的 body 回放字节完全一致
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn chunk_boundary_body_replayed_byte_exact() {
+    // 16384 = 8 KiB × 2：恰好跨回放分块边界，验证多块循环与字节保真
+    let payload = vec![b'x'; 16 * 1024];
+    let upstream = Router::new().route(
+        "/v1/big",
+        any(move || {
+            let payload = payload.clone();
+            async move { (StatusCode::OK, payload).into_response() }
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let proxy_state = AppState::new(proxy_config_for(&upstream_url));
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client.get(format!("{proxy_url}/v1/big")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.len(), 16 * 1024, "回放 body 长度必须与上游一致");
+    assert!(body.iter().all(|&b| b == b'x'), "回放 body 内容必须与上游一致");
+}
+
+// ---------------------------------------------------------------------------
+// 18. api_key 同时覆盖 Authorization 与 x-api-key
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn api_key_overrides_both_auth_headers() {
+    let captured: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+    let cap = captured.clone();
+    let upstream = Router::new().route(
+        "/v1/echo",
+        any(move |req: axum::extract::Request| {
+            let cap = cap.clone();
+            async move {
+                let auth = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let xkey = req
+                    .headers()
+                    .get("x-api-key")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                *cap.lock().unwrap() = Some((auth, xkey));
+                "ok".into_response()
+            }
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.api_key = Some("sk-proxy-key".to_string());
+    let proxy_state = AppState::new(cfg.normalized());
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = reqwest::Client::new();
+    client
+        .post(format!("{proxy_url}/v1/echo"))
+        .header("x-api-key", "sk-client-original")
+        .send()
+        .await
+        .unwrap();
+
+    let (auth, xkey) = captured.lock().unwrap().clone().expect("上游应收到请求");
+    assert_eq!(auth, "Bearer sk-proxy-key", "authorization 应为配置 key");
+    assert_eq!(xkey, "sk-proxy-key", "x-api-key 应被配置 key 覆盖，不得泄漏客户端原值");
+}
+
+// ---------------------------------------------------------------------------
+// 19. 多值 Set-Cookie 头透传（append 而非坍缩）
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn multi_value_set_cookie_headers_pass_through() {
+    let upstream = Router::new().route(
+        "/v1/cookies",
+        any(|| async {
+            let mut headers = HeaderMap::new();
+            headers.append(axum::http::header::SET_COOKIE, HeaderValue::from_static("a=1"));
+            headers.append(axum::http::header::SET_COOKIE, HeaderValue::from_static("b=2"));
+            (StatusCode::OK, headers, "ok").into_response()
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let proxy_state = AppState::new(proxy_config_for(&upstream_url));
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client.get(format!("{proxy_url}/v1/cookies")).send().await.unwrap();
+    let cookies: Vec<_> = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect();
+    assert_eq!(cookies.len(), 2, "两个 Set-Cookie 都应透传，不得坍缩");
+    assert!(cookies.contains(&"a=1".to_string()) && cookies.contains(&"b=2".to_string()));
+}
+
+// ---------------------------------------------------------------------------
+// 20. 流式中断可重试：上游发出部分 SSE 后断开连接，代理 spool 失败必须重试
+//     （原始 TCP 上游，axum 无法模拟「响应中途掐断」）
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn interrupted_stream_is_retried() {
+    use tokio::io::AsyncWriteExt;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c2 = counter.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let n = c2.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // 首次：chunked 响应写出部分数据后不发终止块直接断开
+                // （connection-close framing 下 FIN 即合法结束，必须用 chunked 半截才构成"中断"）
+                let partial = b"data: {\"partial\":true}\n\n";
+                let mut head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n",
+                    partial.len()
+                )
+                .into_bytes();
+                head.extend_from_slice(partial);
+                head.extend_from_slice(b"\r\n");
+                let _ = sock.write_all(&head).await;
+                let _ = sock.flush().await;
+                drop(sock);
+            } else {
+                // 第二次：完整成功响应（chunked + 终止块）
+                let body = b"data: {\"ok\":true}\n\ndata: [DONE]\n\n";
+                let mut resp = String::from(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+                );
+                resp.push_str(&format!("{:x}\r\n", body.len()));
+                // 将 body 转义为单帧写入
+                let mut frame = resp.into_bytes();
+                frame.extend_from_slice(body);
+                frame.extend_from_slice(b"\r\n0\r\n\r\n");
+                let _ = sock.write_all(&frame).await;
+                let _ = sock.flush().await;
+                let _ = sock.shutdown().await;
+            }
+        }
+    });
+
+    let proxy_state = AppState::new(proxy_config_for(&format!("http://{addr}")));
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client.post(format!("{proxy_url}/v1/messages")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("data: {\"ok\":true}"), "中断后应回放第二次成功的完整 body，得到: {body}");
+    assert!(!body.contains("\"partial\""), "首次中断的部分流不得泄漏给客户端");
+    assert_eq!(counter.load(Ordering::SeqCst), 2, "spool 中断后应恰好重试一次");
+}
+
+// ---------------------------------------------------------------------------
+// 21. parity：首轮成功时 keepalive 开与关的回放完全一致（保真快速路径锁定）
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn keepalive_first_attempt_success_matches_non_keepalive() {
+    let upstream = Router::new().route(
+        "/v1/sse",
+        any(|| async {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            (StatusCode::OK, headers, "data: {\"ok\":true}\n\ndata: [DONE]\n\n").into_response()
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+
+    // keepalive 开（默认间隔）与关（0 = 禁用）两个实例
+    let on_state = AppState::new(proxy_config_for(&upstream_url));
+    let (on_url, _p1) = bind_random_router(aproxy::proxy::router(on_state)).await;
+    let mut cfg_off = proxy_config_for(&upstream_url);
+    cfg_off.keepalive_interval_secs = 0;
+    let off_state = AppState::new(cfg_off);
+    let (off_url, _p2) = bind_random_router(aproxy::proxy::router(off_state)).await;
+
+    let client = reqwest::Client::new();
+    let r1 = client
+        .post(format!("{on_url}/v1/sse"))
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    let r2 = client
+        .post(format!("{off_url}/v1/sse"))
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(r1.status(), r2.status(), "status 必须一致");
+    let ct1 = r1
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let ct2 = r2
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let b1 = r1.bytes().await.unwrap();
+    let b2 = r2.bytes().await.unwrap();
+    assert_eq!(b1, b2, "keepalive 开与关的回放 body 必须字节一致");
+    assert_eq!(ct1, ct2, "content-type 必须一致");
+    assert!(ct1.contains("text/event-stream"), "上游 SSE 头应原样透传");
+}

@@ -65,10 +65,13 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Config) -> Self {
         // 超时策略：不设总时限（会掐断超过时限的慢流式生成，导致无限重试永不成功），
-        // 只限制连接建立（30s）与两次读到数据之间的间隔（60s）——spool 设计本身容忍慢流。
+        // 只限制连接建立（30s）与两次读到数据之间的间隔（5 分钟）。
+        // 注意 read_timeout 同样钳制首字节等待——LLM 上游排队时 TTFB 可达数十秒，
+        // 阈值过小（如 60s）会把「慢但活着」的上游变成确定性无限重试；5 分钟
+        // 无任何字节才判定为真停滞。spool 设计本身容忍慢流。
         let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
-            .read_timeout(Duration::from_secs(60))
+            .read_timeout(Duration::from_secs(300))
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(30))
             // 透明代理不跟随重定向：跟随会把 Authorization/api_key 与请求体外带到
@@ -154,12 +157,14 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
     // 在本地侧先应用覆盖/追加，避免重试间重复计算
     apply_header_overrides(&mut headers, &state.config);
 
-    // 缓冲请求体以支持重试重放；10 MiB 上限，超出则直接返回 413
+    // 缓冲请求体以支持重试重放；10 MiB 上限，超出则直接返回 413。
+    // 注意 to_bytes 的 Err 同时覆盖超限与连接中断两类原因，状态码取主流场景
+    // （超限 413），消息保持中性不断言原因。
     let body_bytes = match axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
             tracing::error!(error = %e, "读取请求体失败");
-            return (StatusCode::PAYLOAD_TOO_LARGE, format!("请求体超出 10 MiB 上限: {e}")).into_response();
+            return (StatusCode::PAYLOAD_TOO_LARGE, format!("请求体读取失败（超出 10 MiB 上限或连接中断）: {e}")).into_response();
         }
     };
 
@@ -407,6 +412,13 @@ async fn proxy_with_keepalive(
                 }
                 ForwardResult::TooLarge => {
                     tracing::error!(attempt, "上游响应体超出 spool 上限，终止重试（保活通道）");
+                    // 骨架 200 已发出、状态行不可再改：静默结束流与「上游成功返回
+                    // 空 body」在客户端视角不可区分。发一个终态错误事件让客户端
+                    // 明确感知代理放弃了这条请求。
+                    let err_event = Bytes::from_static(
+                        b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"proxy_spool_limit\",\"message\":\"upstream response exceeded proxy spool limit\"}}\n\n",
+                    );
+                    let _ = tx.send(Ok(err_event)).await;
                     return;
                 }
                 ForwardResult::Response {

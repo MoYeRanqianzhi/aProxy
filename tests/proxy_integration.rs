@@ -21,6 +21,29 @@ use std::{
 
 use aproxy::{config::Config, proxy::AppState};
 
+// 本机环境常带 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY（指向外部代理），会把指向
+// 127.0.0.1 mock 的测试流量也送出去，造成随机假失败（实测约半数跑挂）。
+// 两层隔离：测试客户端一律 no_proxy()；aproxy 内部 upstream 客户端读环境变量
+// 构建（生产语义），靠 NO_PROXY 排除环回目标——须在任何 AppState::new 之前设置。
+static ENV_GUARD: std::sync::Once = std::sync::Once::new();
+
+fn isolate_env_proxy() {
+    ENV_GUARD.call_once(|| {
+        // SAFETY: 测试进程内仅此一处写环境变量；首次 proxy_config_for 调用早于
+        // 绝大多数 reqwest 客户端构建。多线程并发读写 env 理论上 UB，但此处
+        // 一次性写入且早于测试主体，实践中安全。
+        unsafe {
+            std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+            std::env::set_var("no_proxy", "127.0.0.1,localhost");
+        }
+    });
+}
+
+fn local_client() -> reqwest::Client {
+    isolate_env_proxy();
+    reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
 async fn bind_random_router(router: Router) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -34,6 +57,7 @@ async fn bind_random_router(router: Router) -> (String, tokio::task::JoinHandle<
 }
 
 fn proxy_config_for(upstream: &str) -> Config {
+    isolate_env_proxy();
     Config {
         base_url: upstream.to_string(),
         listen_addr: "127.0.0.1:0".to_string(),
@@ -71,7 +95,7 @@ async fn retry_on_500_then_success() {
     let proxy_router = aproxy::proxy::router(proxy_state);
     let (proxy_url, _h2) = bind_random_router(proxy_router).await;
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let resp = client
         .post(format!("{}/v1/chat", proxy_url))
         .json(&serde_json::json!({"model": "test"}))
@@ -117,7 +141,7 @@ async fn retry_on_error_body_then_success() {
     let proxy_state = AppState::new(proxy_config_for(&upstream_url));
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let resp = client
         .post(format!("{}/v1/messages", proxy_url))
         .json(&serde_json::json!({"stream": false}))
@@ -163,7 +187,7 @@ async fn stream_spool_then_replay_preserves_bytes() {
     let proxy_state = AppState::new(proxy_config_for(&upstream_url));
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let resp = client
         .get(format!("{}/v1/stream", proxy_url))
         .header("Accept", "text/event-stream")
@@ -233,7 +257,7 @@ async fn stream_error_data_triggers_retry() {
     let proxy_state = AppState::new(proxy_config_for(&upstream_url));
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let resp = client
         .get(format!("{}/v1/stream", proxy_url))
         .send()
@@ -263,7 +287,7 @@ async fn passthrough_success() {
     let proxy_state = AppState::new(proxy_config_for(&upstream_url));
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let resp = client.get(format!("{}/v1/ping", proxy_url)).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers().get("x-custom").unwrap(), "abc");
@@ -283,7 +307,7 @@ async fn health_is_proxied() {
     let proxy_state = AppState::new(proxy_config_for(&upstream_url));
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let resp = client.get(format!("{}/health", proxy_url)).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
@@ -319,7 +343,7 @@ async fn retry_on_4xx_then_success() {
     let proxy_state = AppState::new(proxy_config_for(&upstream_url));
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let resp = client.get(format!("{}/v1/auth", proxy_url)).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
@@ -362,7 +386,7 @@ async fn keepalive_during_retry() {
     let proxy_state = AppState::new(cfg);
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let resp = client
         .get(format!("{}/v1/slow", proxy_url))
         .header("Accept", "text/event-stream")
@@ -374,6 +398,9 @@ async fn keepalive_during_retry() {
     // SSE 保活注释不应影响最终内容，且应出现在流中
     assert!(body.contains("data: {\"ok\":true}"));
     assert!(body.contains("data: [DONE]"));
+    // 测试名称所声称的两个前提必须被验证：心跳确实发过、重试确实发生
+    assert!(body.contains(": keepalive"), "重试期间应收到 : keepalive 心跳注释");
+    assert_eq!(counter.load(Ordering::SeqCst), 2, "应恰好两次上游尝试（首次 500 + 重试成功）");
 }
 
 // ---------------------------------------------------------------------------
@@ -413,7 +440,7 @@ async fn header_override_and_extra() {
     let proxy_state = AppState::new(cfg);
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let resp = client
         .get(format!("{}/v1/echo", proxy_url))
         .header("x-override", "client-value")
@@ -524,7 +551,7 @@ async fn proxy_config_routes_through_proxy() {
     let (aproxy_url, _h3) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
     // 测试客户端直连 aProxy，避免被环境变量代理干扰
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let client = local_client();
     let resp = client
         .get(format!("{aproxy_url}/v1/deep/path?q=1"))
         .send()
@@ -577,7 +604,7 @@ async fn request_body_replayed_on_retry() {
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
     // 客户端直连 aProxy，避免被环境变量代理干扰
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let client = local_client();
     let payload = serde_json::json!({"model": "test", "prompt": "你好，世界"});
     let resp = client
         .post(format!("{proxy_url}/v1/echo"))
@@ -684,7 +711,7 @@ async fn proxy_basic_auth_sent() {
     let (aproxy_url, _h3) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
     // 测试客户端直连 aProxy，避免被环境变量代理干扰
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let client = local_client();
     let resp = client
         .get(format!("{aproxy_url}/v1/ping"))
         .send()
@@ -707,17 +734,25 @@ async fn proxy_basic_auth_sent() {
 //
 // keepalive 通道下上游持续 429，客户端读到首个心跳后主动断开。
 // 断开后后台任务必须退出：不再发起新的上游请求，in-flight 的请求也被 select 竞速丢弃。
+//
+// 观测窗口必须覆盖完整退避周期（attempt4 起 5s、10s…）：断开通常发生在
+// 5s 退避间隙内，过短的窗口即使删除断开保护计数也自然停滞，测试失去区分度。
+// 用请求时间戳断言「断开时刻（+余量）之后没有任何新请求」。
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn client_disconnect_stops_upstream_requests() {
     let counter = Arc::new(AtomicUsize::new(0));
+    let stamps: Arc<Mutex<Vec<std::time::Instant>>> = Arc::new(Mutex::new(Vec::new()));
     let c2 = counter.clone();
+    let s2 = stamps.clone();
     let upstream = Router::new().route(
         "/v1/slow",
         any(move |_req: axum::extract::Request| {
             let c = c2.clone();
+            let s = s2.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
+                s.lock().unwrap().push(std::time::Instant::now());
                 // 永远 429：迫使代理进入无限重试
                 (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response()
             }
@@ -729,7 +764,7 @@ async fn client_disconnect_stops_upstream_requests() {
     let proxy_state = AppState::new(cfg);
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let resp = client
         .get(format!("{}/v1/slow", proxy_url))
         .header("Accept", "text/event-stream")
@@ -752,11 +787,22 @@ async fn client_disconnect_stops_upstream_requests() {
     drop(stream); // bytes_stream 借用 resp，先 drop 流再随作用域 drop resp → 连接断开
 
     // 断开后的首次重试窗口：select 竞速应拦下 in-flight 与后续尝试
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let c1 = counter.load(Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    let c2 = counter.load(Ordering::SeqCst);
-    assert_eq!(c1, c2, "客户端断开后上游请求计数必须停滞（后台任务已退出），断开时 c1={c1}");
+    let c_at_disconnect = counter.load(Ordering::SeqCst);
+    let disconnected_at = std::time::Instant::now();
+    // 覆盖断开后的两个退避周期（5s + 10s）：若保护失效，5s 退避结束后的
+    // attempt4 必然产生新请求并落入窗口
+    tokio::time::sleep(Duration::from_secs(17)).await;
+    // 1.5s 为调度余量；保护失效场景的新请求出现在断开 +5s 处，远超余量
+    let leaks = stamps
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|&&t| t >= disconnected_at + Duration::from_millis(1500))
+        .count();
+    assert_eq!(
+        leaks, 0,
+        "断开后不得发起新的上游请求（计费保护），断开时计数={c_at_disconnect}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -770,7 +816,7 @@ async fn oversized_request_returns_413() {
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
     let big = vec![b'a'; 10 * 1024 * 1024 + 1];
-    let client = reqwest::Client::new();
+    let client = local_client();
     let resp = client
         .post(format!("{proxy_url}/v1/x"))
         .body(big)
@@ -798,7 +844,7 @@ async fn chunk_boundary_body_replayed_byte_exact() {
     let proxy_state = AppState::new(proxy_config_for(&upstream_url));
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let resp = client.get(format!("{proxy_url}/v1/big")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.bytes().await.unwrap();
@@ -842,7 +888,7 @@ async fn api_key_overrides_both_auth_headers() {
     let proxy_state = AppState::new(cfg.normalized());
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     client
         .post(format!("{proxy_url}/v1/echo"))
         .header("x-api-key", "sk-client-original")
@@ -873,7 +919,7 @@ async fn multi_value_set_cookie_headers_pass_through() {
     let proxy_state = AppState::new(proxy_config_for(&upstream_url));
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let resp = client.get(format!("{proxy_url}/v1/cookies")).send().await.unwrap();
     let cookies: Vec<_> = resp
         .headers()
@@ -938,7 +984,7 @@ async fn interrupted_stream_is_retried() {
     let proxy_state = AppState::new(proxy_config_for(&format!("http://{addr}")));
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let resp = client.post(format!("{proxy_url}/v1/messages")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
@@ -973,7 +1019,7 @@ async fn keepalive_first_attempt_success_matches_non_keepalive() {
     let off_state = AppState::new(cfg_off);
     let (off_url, _p2) = bind_random_router(aproxy::proxy::router(off_state)).await;
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let r1 = client
         .post(format!("{on_url}/v1/sse"))
         .header("Accept", "text/event-stream")

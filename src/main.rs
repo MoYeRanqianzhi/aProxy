@@ -4,7 +4,8 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
-use aproxy::config;
+use aproxy::config::{self, Config};
+use aproxy::daemon;
 
 #[derive(Parser, Debug)]
 #[command(name = "aproxy", version, about = "Local API proxy with infinite retries", long_about = None)]
@@ -15,6 +16,11 @@ struct Cli {
     /// （listen_addr 须互不相同）
     #[arg(long, value_name = "PATH", global = true)]
     config: Option<PathBuf>,
+
+    /// 前台运行（日志输出到控制台，Ctrl+C 停止）；默认在后台运行，
+    /// 日志写 ~/.aproxy/logs/<端口>.log，用 `aproxy status`/`aproxy stop` 管理
+    #[arg(long)]
+    foreground: bool,
 
     /// 上游 API base URL，覆盖配置文件中的 base_url
     #[arg(long, value_name = "URL")]
@@ -32,12 +38,29 @@ struct Cli {
     #[arg(long, value_name = "KEY")]
     api_key: Option<String>,
 
+    /// [内部] 守护子进程标记：后台启动时父进程把它附加到子进程命令行，
+    /// 子进程据此以守护模式运行（无控制台、日志写文件）。勿手动使用。
+    #[arg(long, hide = true)]
+    daemon_child: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// 列出运行中的 aProxy 实例（来自实例注册表，存活以 IPC 探测为准）
+    Status,
+
+    /// 停止运行中的实例。
+    /// 单个实例时可直接 `aproxy stop`；多实例必须指定端口号或 `all`：
+    /// `aproxy stop 12345` / `aproxy stop all`
+    Stop {
+        /// 端口号或 all
+        #[arg(value_name = "PORT|all")]
+        target: Option<String>,
+    },
+
     /// 查看或修改配置（配置文件位于 ~/.aproxy/config.toml）
     Config {
         /// 设置上游 base URL，例如 https://api.anthropic.com
@@ -84,37 +107,26 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
-    // 日志：默认 info，可通过 RUST_LOG 覆盖
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
 
     // 实际生效的配置文件路径：--config 显式指定，否则默认 ~/.aproxy/config.toml
     let cfg_path = cli.config.clone().unwrap_or_else(config::config_path);
 
-    // 子命令：config
-    if let Some(Commands::Config {
-        baseurl,
-        listen,
-        api_key,
-        extra_headers,
-        override_headers,
-        keepalive_secs,
-        proxy,
-        proxy_username,
-        proxy_password,
-        clear_api_key,
-        clear_headers,
-        clear_proxy,
-        show,
-    }) = cli.command
-    {
-        handle_config_cmd(
-            cfg_path,
+    // 日志初始化：守护子进程无控制台，写日志文件；其余走 stdout（RUST_LOG 可覆盖）
+    if cli.daemon_child {
+        // 此刻配置尚未严格校验，用宽松 load 取监听端口命名日志文件；
+        // 校验失败的错误会写入 startup.log（见 report_config_error）
+        let cfg = config::load_from(&cfg_path);
+        init_daemon_logging(&cfg.listen_addr);
+    } else {
+        init_stdout_logging();
+    }
+
+    // 子命令分派；无子命令 = 启动代理（默认后台）
+    match cli.command {
+        Some(Commands::Status) => handle_status_cmd().await,
+        Some(Commands::Stop { target }) => handle_stop_cmd(target).await,
+        Some(Commands::Config {
             baseurl,
             listen,
             api_key,
@@ -128,50 +140,145 @@ async fn main() {
             clear_headers,
             clear_proxy,
             show,
-        );
+        }) => {
+            handle_config_cmd(
+                cfg_path,
+                baseurl,
+                listen,
+                api_key,
+                extra_headers,
+                override_headers,
+                keepalive_secs,
+                proxy,
+                proxy_username,
+                proxy_password,
+                clear_api_key,
+                clear_headers,
+                clear_proxy,
+                show,
+            );
+        }
+        None => handle_start_cmd(&cli, cfg_path).await,
+    }
+}
+
+/// 启动路径共用的配置解析：显式配置路径必须存在（打错路径时报明确错误而非
+/// 静默回退默认配置）、CLI 覆盖参数、normalize、validate。
+fn resolve_runtime_config(cli: &Cli, cfg_path: &std::path::Path) -> Result<Config, String> {
+    if cli.config.is_some() && !cfg_path.exists() {
+        return Err(format!("指定的配置文件不存在: {}", cfg_path.display()));
+    }
+    let mut cfg = config::load_from(cfg_path);
+    if let Some(u) = &cli.baseurl {
+        cfg.base_url = u.clone();
+    }
+    if let Some(l) = &cli.listen {
+        cfg.listen_addr = l.clone();
+    }
+    if let Some(p) = &cli.proxy {
+        cfg.proxy = Some(p.clone());
+    }
+    if let Some(k) = &cli.api_key {
+        cfg.api_key = Some(k.clone());
+    }
+    let cfg = cfg.normalized();
+    cfg.validate().map_err(|msg| {
+        format!(
+            "配置错误: {msg}\n位置: {}\n\n请执行以下任一操作后重试:\n  aproxy config --baseurl https://api.anthropic.com\n  或手动编辑 {}",
+            cfg_path.display(),
+            cfg_path.display()
+        )
+    })?;
+    Ok(cfg)
+}
+
+/// `aproxy`（无子命令）：后台启动守护进程；--foreground 前台运行。
+///
+/// 端口冲突的两种情况严格区分（控制通道走 IPC，不触碰代理端口）：
+/// - IPC ping 通 → 同端口已有 aProxy 实例，提示正在运行，不重复启动；
+/// - TCP bind 失败 → 端口被其他程序占用，报错退出。
+async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf) {
+    let cfg = match resolve_runtime_config(cli, &cfg_path) {
+        Ok(c) => c,
+        Err(msg) => {
+            report_config_error(&msg, cli.daemon_child);
+            std::process::exit(1);
+        }
+    };
+    let listen_addr = cfg.listen_addr.clone();
+    let port = daemon::port_of(&listen_addr).to_string();
+
+    // 守护子进程：直接承载服务，不再走启动预检/后台 spawn（父进程已做）
+    if cli.daemon_child {
+        serve_forever(cfg, &cfg_path, true).await;
         return;
     }
 
-    // 主流程：启动代理服务。显式指定的配置文件必须存在——打错路径时给出明确
-    // 报错，而不是静默回退默认配置后报「base_url 为空」误导排查
-    if cli.config.is_some() && !cfg_path.exists() {
-        eprintln!("指定的配置文件不存在: {}", cfg_path.display());
-        std::process::exit(1);
+    // 预检 1：同端口是否已有 aProxy 实例（IPC 探测，不经代理端口）
+    if let Ok(info) = daemon::ipc_ping(&port).await {
+        println!("此端口已有 aProxy 在运行，无需重复启动：");
+        println!("  pid {}  监听 http://{}  v{}", info.pid, info.listen_addr, info.version);
+        println!("查看实例: aproxy status    停止: aproxy stop {port}");
+        return;
     }
-    let mut cfg = config::load_from(&cfg_path);
 
-    // 命令行参数覆盖配置文件
-    if let Some(u) = cli.baseurl {
-        cfg.base_url = u;
-    }
-    if let Some(l) = cli.listen {
-        cfg.listen_addr = l;
-    }
-    if let Some(p) = cli.proxy {
-        cfg.proxy = Some(p);
-    }
-    if let Some(k) = cli.api_key {
-        cfg.api_key = Some(k);
-    }
-    cfg = cfg.normalized();
-
-    if let Err(msg) = cfg.validate() {
-        eprintln!("配置错误: {msg}");
-        eprintln!("位置: {}", cfg_path.display());
-        eprintln!();
-        eprintln!("请执行以下任一操作后重试:");
-        eprintln!("  aproxy config --baseurl https://api.anthropic.com");
-        eprintln!("  或手动编辑 {}", cfg_path.display());
+    // 预检 2：端口能否绑定（探测 listener 随即释放，端口让给守护子进程）
+    if let Err(e) = tokio::net::TcpListener::bind(&listen_addr).await {
+        eprintln!("端口 {listen_addr} 被其他程序占用，无法启动（{e}）");
         std::process::exit(1);
     }
 
+    if cli.foreground {
+        serve_forever(cfg, &cfg_path, false).await;
+        return;
+    }
+
+    // 后台：分离子进程承载服务，命令行参数原样转发 + --daemon-child 标记
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    args.push("--daemon-child".to_string());
+    let exe = std::env::current_exe().expect("无法定位自身可执行文件");
+    let pid = match daemon::spawn_detached(&exe, &args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("启动后台进程失败: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // 等待子进程完成 bind（端口可连即就绪）；超时视为启动失败，指向日志排查
+    let log_path = daemon::logs_dir().join(format!("{port}.log"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if tokio::net::TcpStream::connect(&listen_addr).await.is_ok() {
+            println!("aProxy 已在后台启动");
+            println!("  pid: {pid}");
+            println!("  监听: http://{listen_addr}");
+            println!("  Base URL: {}", mask_base_url(&cfg.base_url));
+            if !cfg.base_url.is_empty() {
+                let base = cfg.base_url.trim_end_matches('/');
+                println!("  提示: 将你的 API base URL 指向 http://{listen_addr}");
+                println!("        上游路径与查询参数将完整透传到 {base}/<path>?<query>");
+            }
+            println!("  配置: {}", cfg_path.display());
+            println!("  日志: {}", log_path.display());
+            println!("查看实例: aproxy status    停止: aproxy stop {port}");
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            eprintln!("后台进程未在预期时间内就绪（pid {pid}），请查看日志: {}", log_path.display());
+            std::process::exit(1);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// 服务主循环：前台与守护子进程共用。bind、注册实例、启动 IPC 控制通道，
+/// 一直服务到停止信号（Ctrl+C/SIGTERM 或 `aproxy stop` 经 IPC 触发）。
+async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemon_child: bool) {
     let listen_addr = cfg.listen_addr.clone();
     let base_url = cfg.base_url.clone();
-    // 日志与控制台都可能被粘贴分享，内嵌凭据的 base_url 一律打码后输出
-    tracing::info!(listen = %listen_addr, base_url = %mask_base_url(&base_url), config = %cfg_path.display(), "启动 aProxy");
-
     let state = aproxy::proxy::AppState::new(cfg);
-    let app = aproxy::proxy::router(state);
+    let app = aproxy::proxy::router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&listen_addr)
         .await
@@ -179,29 +286,236 @@ async fn main() {
             eprintln!("无法监听 {listen_addr}: {e}");
             std::process::exit(1);
         });
+    let actual_addr = listener
+        .local_addr()
+        .expect("获取监听地址失败")
+        .to_string();
+    let port = daemon::port_of(&actual_addr).to_string();
 
-    println!("aProxy 已启动");
-    println!("  监听: http://{listen_addr}");
-    println!("  Base URL: {}", mask_base_url(&base_url));
-    if !base_url.is_empty() {
-        let base = base_url.trim_end_matches('/');
-        println!("  提示: 将你的 API base URL 指向 http://{listen_addr}");
-        println!("        上游路径与查询参数将完整透传到 {base}/<path>?<query>");
+    // 注册实例信息（bind 成功后才写，避免留下死记录）
+    let info = daemon::InstanceInfo {
+        pid: std::process::id(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        listen_addr: actual_addr.clone(),
+        config_path: cfg_path.display().to_string(),
+        base_url: base_url.clone(),
+        started_at: now_unix(),
+    };
+    if let Err(e) = daemon::write_instance_file(&info) {
+        tracing::warn!(error = %e, "实例注册表写入失败（不影响代理功能）");
     }
-    println!("按 Ctrl+C 退出。");
+
+    // IPC 控制通道：ping/shutdown 走命名管道，与代理端口完全隔离
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let ipc_port = port.clone();
+    let ipc_info = info.clone();
+    tokio::spawn(async move {
+        if let Err(e) = daemon::serve_ipc(ipc_port, stop_tx, ipc_info).await {
+            tracing::error!(error = %e, "IPC 控制通道启动失败（aproxy stop/status 将不可用）");
+        }
+    });
+
+    // 日志与控制台都可能被粘贴分享，内嵌凭据的 base_url 一律打码后输出
+    tracing::info!(
+        listen = %actual_addr,
+        base_url = %mask_base_url(&base_url),
+        config = %cfg_path.display(),
+        pid = %std::process::id(),
+        "启动 aProxy"
+    );
+    if !daemon_child {
+        println!("aProxy 已启动（前台）");
+        println!("  监听: http://{actual_addr}");
+        println!("  Base URL: {}", mask_base_url(&base_url));
+        println!("按 Ctrl+C 退出。");
+    }
 
     // 优雅关闭 + 宽限强退：keepalive 后台重试任务不会主动结束，axum::serve 等待
-    // 在途连接完成时可能被其无限期挂起，收到退出信号后给 10 秒宽限窗口即强制退出。
+    // 在途连接完成时可能被其无限期挂起，收到停止信号后给 10 秒宽限窗口即强制退出。
+    let graceful = stop_signal(stop_rx.clone());
     tokio::select! {
-        result = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()) => {
+        result = axum::serve(listener, app).with_graceful_shutdown(graceful) => {
             result.unwrap();
         }
         _ = async {
-            shutdown_signal().await;
+            stop_signal(stop_rx).await;
             tracing::info!("10 秒后强制退出（在途请求将中断）");
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            daemon::remove_instance_file(&actual_addr);
             std::process::exit(0);
         } => {}
+    }
+    daemon::remove_instance_file(&actual_addr);
+    tracing::info!("aProxy 已停止");
+}
+
+/// 优雅停止信号：控制台 Ctrl+C/SIGTERM，或 `aproxy stop` 经 IPC 触发，任一即到。
+async fn stop_signal(mut ipc_rx: tokio::sync::watch::Receiver<bool>) {
+    tokio::select! {
+        _ = shutdown_signal() => {},
+        _ = ipc_rx.wait_for(|v| *v) => {},
+    }
+    tracing::info!("收到停止信号，正在关闭...");
+}
+
+/// `aproxy status`：列出注册表中的实例（存活以 IPC 探测为准）。
+async fn handle_status_cmd() {
+    let instances = daemon::list_instances().await;
+    if instances.is_empty() {
+        println!("没有运行中的 aProxy 实例。");
+        return;
+    }
+    println!("运行中的 aProxy 实例 ({}):", instances.len());
+    for info in &instances {
+        println!(
+            "  端口 {}  pid {}  v{}  已运行 {}",
+            daemon::port_of(&info.listen_addr),
+            info.pid,
+            info.version,
+            humanize_uptime(info.started_at)
+        );
+        println!(
+            "    监听 http://{}   上游 {}   配置 {}",
+            info.listen_addr,
+            mask_base_url(&info.base_url),
+            info.config_path
+        );
+    }
+}
+
+/// `aproxy stop [PORT|all]`：单个实例可省略参数；多实例必须指定端口号或 all。
+async fn handle_stop_cmd(target: Option<String>) {
+    // 指定端口时不依赖注册表：直接按端口 IPC 定位（注册表丢失也能停）
+    if let Some(target) = target.as_deref() {
+        if target != "all" {
+            let port = daemon::port_of(target).to_string();
+            let info = match daemon::ipc_ping(&port).await {
+                Ok(info) => info,
+                Err(_) => {
+                    println!("端口 {port} 上没有运行中的 aProxy 实例。");
+                    println!("（若该端口被其他程序占用，与本工具无关）");
+                    std::process::exit(1);
+                }
+            };
+            stop_instance(&info).await;
+            return;
+        }
+    }
+
+    let instances = daemon::list_instances().await;
+    match target.as_deref() {
+        Some("all") => {
+            if instances.is_empty() {
+                println!("没有运行中的 aProxy 实例。");
+                return;
+            }
+            for info in &instances {
+                stop_instance(info).await;
+            }
+        }
+        _ => match instances.len() {
+            0 => println!("没有运行中的 aProxy 实例。"),
+            1 => stop_instance(&instances[0]).await,
+            n => {
+                eprintln!("有 {n} 个实例在运行，必须指定端口号或 all：");
+                for info in &instances {
+                    eprintln!("  aproxy stop {}", daemon::port_of(&info.listen_addr));
+                }
+                std::process::exit(1);
+            }
+        },
+    }
+}
+
+/// 停止单个实例：发 IPC shutdown，轮询确认退出（宽限 10 秒 + 余量）。
+async fn stop_instance(info: &daemon::InstanceInfo) {
+    let port = daemon::port_of(&info.listen_addr).to_string();
+    match daemon::ipc_request(&port, &daemon::IpcRequest::Shutdown).await {
+        Ok(_) => {
+            if daemon::wait_until_gone(&port, std::time::Duration::from_secs(12)).await {
+                println!("已停止 pid {}（端口 {}）", info.pid, port);
+            } else {
+                println!(
+                    "pid {} 已收到停止请求但尚未退出，可用 aproxy status 稍后确认，或 taskkill /PID {} /F 强制结束",
+                    info.pid, info.pid
+                );
+            }
+        }
+        Err(e) => println!("pid {} 无响应（可能已停止）: {}", info.pid, e),
+    }
+}
+
+/// 配置错误报告：前台/父进程走 stderr；守护子进程无控制台，错误写
+/// startup.log——就绪等待超时的提示虽指向端口日志，但配置错误发生在
+/// 日志初始化之前，只有这里能留下线索。
+fn report_config_error(msg: &str, daemon_child: bool) {
+    if daemon_child {
+        let _ = std::fs::create_dir_all(daemon::logs_dir());
+        let path = daemon::logs_dir().join("startup.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            use std::io::Write;
+            let _ = writeln!(f, "[{}] {msg}", chrono_like_timestamp());
+        }
+    }
+    eprintln!("{msg}");
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 日志时间戳（无 chrono 依赖，仅用于 startup.log 行前缀）
+fn chrono_like_timestamp() -> String {
+    // 简单格式化：秒级 Unix 时间足以定位启动失败的顺序
+    format!("unix+{}s", now_unix())
+}
+
+fn humanize_uptime(started_at: u64) -> String {
+    let secs = now_unix().saturating_sub(started_at);
+    if secs < 60 {
+        format!("{secs} 秒")
+    } else if secs < 3600 {
+        format!("{} 分 {} 秒", secs / 60, secs % 60)
+    } else if secs < 86400 {
+        format!("{} 小时 {} 分", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{} 天 {} 小时", secs / 86400, (secs % 86400) / 3600)
+    }
+}
+
+fn init_stdout_logging() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+}
+
+/// 守护子进程日志：写 `~/.aproxy/logs/<端口>.log`（超过 2 MiB 截断重写，
+/// 保留最近一次运行的日志即可，避免无限膨胀）。
+fn init_daemon_logging(listen_addr: &str) {
+    let _ = std::fs::create_dir_all(daemon::logs_dir());
+    let path = daemon::logs_dir().join(format!("{}.log", daemon::port_of(listen_addr)));
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 2 * 1024 * 1024 {
+            let _ = std::fs::write(&path, b"");
+        }
+    }
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+                )
+                .with_writer(std::sync::Mutex::new(file))
+                .with_ansi(false)
+                .init();
+        }
+        // 日志文件打不开则回退 stdout（会被 Stdio::null 吞掉，但至少不 panic）
+        Err(_) => init_stdout_logging(),
     }
 }
 
@@ -561,5 +875,5 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
-    tracing::info!("收到退出信号，正在关闭...");
+    // 停止原因的日志由调用方 stop_signal 统一输出
 }

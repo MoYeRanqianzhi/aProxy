@@ -1124,3 +1124,120 @@ fn cli_config_flag_scopes_config_subcommand() {
         "--show 应展示 --config 文件的内容，实际: {stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 22. 守护进程生命周期：守护子进程承载服务 → status 列出 → stop 优雅停止
+//
+// 控制通道走 IPC（命名管道），代理端口完全用于透传，此处一并验证互不干扰。
+// 注意：直接以 --daemon-child 拉起守护（与 `aproxy start` 的 spawn_detached
+// 同一路径），不在测试进程树里再嵌套一层 start 父进程。
+// ---------------------------------------------------------------------------
+#[test]
+fn daemon_lifecycle_start_status_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_file = dir.path().join("daemon.toml");
+    std::fs::write(
+        &cfg_file,
+        "base_url = \"https://daemon-test.example.com\"\nlisten_addr = \"127.0.0.1:59001\"\n",
+    )
+    .unwrap();
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+
+    // 预清理：上次运行残留（崩溃等）会让端口被占导致本次启动失败
+    let _ = Command::new(exe).args(["stop", "59001"]).output();
+
+    let pid = aproxy::daemon::spawn_detached(
+        std::path::Path::new(exe),
+        &[
+            "--config".to_string(),
+            cfg_file.display().to_string(),
+            "--daemon-child".to_string(),
+        ],
+    )
+    .expect("spawn 守护子进程失败");
+
+    // 等待守护完成 bind（端口可连即就绪，最多 5 秒）
+    let mut ready = false;
+    for _ in 0..50 {
+        if std::net::TcpStream::connect("127.0.0.1:59001").is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ready, "守护子进程未就绪 (pid {pid})");
+
+    // status 列出该实例（信息来自实例注册表，存活以 IPC 探测为准）
+    let out = Command::new(exe).arg("status").output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("59001"), "status 应列出实例: {stdout}");
+    assert!(
+        stdout.contains("daemon-test.example.com"),
+        "status 应展示上游: {stdout}"
+    );
+
+    // stop 指定端口：经 IPC 优雅停止并确认退出
+    let out = Command::new(exe).args(["stop", "59001"]).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("已停止"), "实际: {stdout}");
+
+    // status 不再列出本实例（其他端口上可能还有并行测试的实例，不全局断言为空）
+    let out = Command::new(exe).arg("status").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("59001"),
+        "stop 后 status 不应再列出 59001: {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 23. 同端口重复守护：第二个守护 bind 失败即退出，原实例不受影响
+// ---------------------------------------------------------------------------
+#[test]
+fn daemon_second_instance_on_same_port_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_file = dir.path().join("twice.toml");
+    std::fs::write(
+        &cfg_file,
+        "base_url = \"https://twice-test.example.com\"\nlisten_addr = \"127.0.0.1:59002\"\n",
+    )
+    .unwrap();
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+    let _ = Command::new(exe).args(["stop", "59002"]).output();
+
+    let args = |file: &std::path::Path| {
+        vec![
+            "--config".to_string(),
+            file.display().to_string(),
+            "--daemon-child".to_string(),
+        ]
+    };
+
+    // 第一个守护：正常承载服务
+    let pid1 = aproxy::daemon::spawn_detached(std::path::Path::new(exe), &args(&cfg_file))
+        .expect("spawn 第一个守护失败");
+    let mut ready = false;
+    for _ in 0..50 {
+        if std::net::TcpStream::connect("127.0.0.1:59002").is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ready, "第一个守护未就绪 (pid {pid1})");
+
+    // 第二个守护：同端口 bind 失败 → 快速退出（不挂、不影响原实例）
+    let _pid2 = aproxy::daemon::spawn_detached(std::path::Path::new(exe), &args(&cfg_file))
+        .expect("spawn 第二个守护失败");
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // 原实例仍在服务
+    let out = Command::new(exe).arg("status").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("59002"), "原实例应仍在运行: {stdout}");
+
+    // 清理
+    let _ = Command::new(exe).args(["stop", "59002"]).output();
+}

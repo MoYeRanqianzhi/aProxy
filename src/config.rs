@@ -204,7 +204,9 @@ pub fn load() -> Config {
     load_from(&config_path())
 }
 
-fn load_from(path: &std::path::Path) -> Config {
+/// 加载指定路径的配置：语义同 `load`（不存在/解析失败回退默认配置）。
+/// 多开场景由 `--config <PATH>` 显式指定路径；是否要求文件存在由调用方决定。
+pub fn load_from(path: &std::path::Path) -> Config {
     match std::fs::read_to_string(path) {
         Ok(content) => match toml::from_str::<Config>(&content) {
             Ok(cfg) => cfg.normalized(),
@@ -226,7 +228,8 @@ pub fn save(cfg: &Config) -> std::io::Result<()> {
     save_to(&config_path(), cfg)
 }
 
-fn save_to(path: &std::path::Path, cfg: &Config) -> std::io::Result<()> {
+/// 保存配置到指定路径（自动创建目录）。多开场景配合 `--config <PATH>` 使用。
+pub fn save_to(path: &std::path::Path, cfg: &Config) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

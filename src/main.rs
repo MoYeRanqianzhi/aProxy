@@ -1,6 +1,7 @@
 //! aProxy — 本地 API 代理，无限重试保障 agent 工作流不中断。
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 use aproxy::config;
@@ -8,6 +9,13 @@ use aproxy::config;
 #[derive(Parser, Debug)]
 #[command(name = "aproxy", version, about = "Local API proxy with infinite retries", long_about = None)]
 struct Cli {
+    /// 配置文件路径（默认 ~/.aproxy/config.toml）。
+    /// 多开不同配置的进程时各自指定，例如：
+    /// aproxy --config ~/.aproxy/work.toml 与 aproxy --config ~/.aproxy/personal.toml
+    /// （listen_addr 须互不相同）
+    #[arg(long, value_name = "PATH", global = true)]
+    config: Option<PathBuf>,
+
     /// 上游 API base URL，覆盖配置文件中的 base_url
     #[arg(long, value_name = "URL")]
     baseurl: Option<String>,
@@ -85,6 +93,9 @@ async fn main() {
 
     let cli = Cli::parse();
 
+    // 实际生效的配置文件路径：--config 显式指定，否则默认 ~/.aproxy/config.toml
+    let cfg_path = cli.config.clone().unwrap_or_else(config::config_path);
+
     // 子命令：config
     if let Some(Commands::Config {
         baseurl,
@@ -103,6 +114,7 @@ async fn main() {
     }) = cli.command
     {
         handle_config_cmd(
+            cfg_path,
             baseurl,
             listen,
             api_key,
@@ -120,8 +132,13 @@ async fn main() {
         return;
     }
 
-    // 主流程：启动代理服务
-    let mut cfg = config::load();
+    // 主流程：启动代理服务。显式指定的配置文件必须存在——打错路径时给出明确
+    // 报错，而不是静默回退默认配置后报「base_url 为空」误导排查
+    if cli.config.is_some() && !cfg_path.exists() {
+        eprintln!("指定的配置文件不存在: {}", cfg_path.display());
+        std::process::exit(1);
+    }
+    let mut cfg = config::load_from(&cfg_path);
 
     // 命令行参数覆盖配置文件
     if let Some(u) = cli.baseurl {
@@ -140,18 +157,18 @@ async fn main() {
 
     if let Err(msg) = cfg.validate() {
         eprintln!("配置错误: {msg}");
-        eprintln!("位置: {}", config::config_path().display());
+        eprintln!("位置: {}", cfg_path.display());
         eprintln!();
         eprintln!("请执行以下任一操作后重试:");
         eprintln!("  aproxy config --baseurl https://api.anthropic.com");
-        eprintln!("  或手动编辑 {}", config::config_path().display());
+        eprintln!("  或手动编辑 {}", cfg_path.display());
         std::process::exit(1);
     }
 
     let listen_addr = cfg.listen_addr.clone();
     let base_url = cfg.base_url.clone();
     // 日志与控制台都可能被粘贴分享，内嵌凭据的 base_url 一律打码后输出
-    tracing::info!(listen = %listen_addr, base_url = %mask_base_url(&base_url), config = %config::config_path().display(), "启动 aProxy");
+    tracing::info!(listen = %listen_addr, base_url = %mask_base_url(&base_url), config = %cfg_path.display(), "启动 aProxy");
 
     let state = aproxy::proxy::AppState::new(cfg);
     let app = aproxy::proxy::router(state);
@@ -333,6 +350,7 @@ mod tests {
 }
 
 fn handle_config_cmd(
+    path: PathBuf,
     baseurl: Option<String>,
     listen: Option<String>,
     api_key: Option<String>,
@@ -347,8 +365,7 @@ fn handle_config_cmd(
     clear_proxy: bool,
     show: bool,
 ) {
-    let path = config::config_path();
-    let mut cfg = config::load();
+    let mut cfg = config::load_from(&path);
 
     let mut changed = false;
     if let Some(u) = baseurl {
@@ -428,7 +445,6 @@ fn handle_config_cmd(
     if changed {
         // 保存前守卫：配置文件存在但解析失败时 load() 会静默回退默认值，
         // 直接保存会把用户手写（或损坏）的配置整个覆盖掉——拒绝修改并报告解析错误。
-        let path = config::config_path();
         if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
@@ -453,7 +469,7 @@ fn handle_config_cmd(
                 std::process::exit(1);
             }
         }
-        match config::save(&cfg) {
+        match config::save_to(&path, &cfg) {
             Ok(()) => println!("已保存配置到 {}", path.display()),
             Err(e) => {
                 eprintln!("保存配置失败: {e}");
@@ -465,7 +481,7 @@ fn handle_config_cmd(
     if show || !changed {
         // 重新加载以展示最终值
         warn_if_config_broken(&path);
-        let cfg = config::load().normalized();
+        let cfg = config::load_from(&path).normalized();
         println!("配置文件: {}", path.display());
         println!("base_url     = \"{}\"", mask_base_url(&cfg.base_url));
         println!("listen_addr  = \"{}\"", cfg.listen_addr);

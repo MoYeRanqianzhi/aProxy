@@ -1052,3 +1052,75 @@ async fn keepalive_first_attempt_success_matches_non_keepalive() {
     assert_eq!(ct1, ct2, "content-type 必须一致");
     assert!(ct1.contains("text/event-stream"), "上游 SSE 头应原样透传");
 }
+
+// ---------------------------------------------------------------------------
+// 21. CLI 进程级：--config 显式配置文件（多开不同配置的进程）
+//
+// 每个进程一份配置：启动时加载指定文件，config 子命令读写同一文件。
+// ---------------------------------------------------------------------------
+use std::process::Command;
+
+#[test]
+fn cli_config_flag_rejects_missing_file_on_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("nope.toml");
+    let out = Command::new(env!("CARGO_BIN_EXE_aproxy"))
+        .arg("--config")
+        .arg(&missing)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "显式指定的配置文件不存在时启动必须失败（而非静默回退默认配置）"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("不存在"), "stderr 应提示文件不存在，实际: {stderr}");
+}
+
+#[test]
+fn cli_config_flag_scopes_config_subcommand() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_file = dir.path().join("instance.toml");
+
+    // 多开工作流：为新实例创建独立配置，写入 --config 指定的文件
+    let out = Command::new(env!("CARGO_BIN_EXE_aproxy"))
+        .arg("--config")
+        .arg(&cfg_file)
+        .args([
+            "config",
+            "--baseurl",
+            "https://multi-instance.example.com",
+            "--keepalive-secs",
+            "30",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "config 子命令应成功，stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let saved = std::fs::read_to_string(&cfg_file).unwrap();
+    assert!(
+        saved.contains("multi-instance.example.com"),
+        "配置应写入 --config 指定的文件，实际: {saved}"
+    );
+    assert!(
+        saved.contains("keepalive_interval_secs = 30"),
+        "其他字段应一并保存，实际: {saved}"
+    );
+
+    // --show 读取的也是同一份文件
+    let out = Command::new(env!("CARGO_BIN_EXE_aproxy"))
+        .arg("--config")
+        .arg(&cfg_file)
+        .args(["config", "--show"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("multi-instance.example.com"),
+        "--show 应展示 --config 文件的内容，实际: {stdout}"
+    );
+}

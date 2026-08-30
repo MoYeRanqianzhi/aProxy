@@ -150,7 +150,8 @@ async fn main() {
 
     let listen_addr = cfg.listen_addr.clone();
     let base_url = cfg.base_url.clone();
-    tracing::info!(listen = %listen_addr, base_url = %base_url, config = %config::config_path().display(), "启动 aProxy");
+    // 日志与控制台都可能被粘贴分享，内嵌凭据的 base_url 一律打码后输出
+    tracing::info!(listen = %listen_addr, base_url = %mask_base_url(&base_url), config = %config::config_path().display(), "启动 aProxy");
 
     let state = aproxy::proxy::AppState::new(cfg);
     let app = aproxy::proxy::router(state);
@@ -164,7 +165,7 @@ async fn main() {
 
     println!("aProxy 已启动");
     println!("  监听: http://{listen_addr}");
-    println!("  Base URL: {base_url}");
+    println!("  Base URL: {}", mask_base_url(&base_url));
     if !base_url.is_empty() {
         let base = base_url.trim_end_matches('/');
         println!("  提示: 将你的 API base URL 指向 http://{listen_addr}");
@@ -227,6 +228,108 @@ fn parse_kv(s: &str) -> Option<(String, String)> {
         return None;
     }
     Some((k.to_string(), v.to_string()))
+}
+
+/// base_url 展示打码：内嵌 userinfo（`https://user:pass@host`）时隐去密码段。
+/// 无凭据（绝大多数情况）或解析失败时原样返回。
+fn mask_base_url(raw: &str) -> String {
+    let Ok(url) = url::Url::parse(raw) else {
+        return raw.to_string();
+    };
+    if url.password().is_none() {
+        return raw.to_string();
+    }
+    let host = url.host_str().unwrap_or("");
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let path = url.path();
+    format!("{}://{}:***@{}{}{}", url.scheme(), url.username(), host, port, path)
+}
+
+/// 展示前守卫：配置文件存在但解析失败时 load() 会静默回退默认值，`--show` 打印的
+/// 「当前配置」并非用户文件的真实内容——至少要警告，避免误导排障。
+fn warn_if_config_broken(path: &std::path::Path) {
+    if let Ok(content) = std::fs::read_to_string(path) {
+        if let Err(e) = toml::from_str::<aproxy::config::Config>(&content) {
+            eprintln!("警告: 配置文件解析失败，以下展示的是回退默认值而非文件内容");
+            eprintln!("解析错误: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_secret_keeps_prefix_and_masks_rest() {
+        // 保留前 6 个字符
+        assert_eq!(mask_secret("sk-ant-api03-abcdef"), "sk-ant***");
+        assert_eq!(mask_secret("abc"), "abc***");
+        assert_eq!(mask_secret(""), "***");
+    }
+
+    #[test]
+    fn mask_secret_multibyte_no_panic() {
+        // 按 char 截断，多字节字符不会在字节边界 panic
+        assert_eq!(mask_secret("你好世界，测试"), "你好世界，测***");
+    }
+
+    #[test]
+    fn mask_proxy_url_variants() {
+        // 无凭据原样返回
+        assert_eq!(
+            mask_proxy_url("http://127.0.0.1:7890"),
+            "http://127.0.0.1:7890"
+        );
+        // 有密码打码
+        assert_eq!(
+            mask_proxy_url("http://alice:secret@127.0.0.1:7890"),
+            "http://alice:***@127.0.0.1:7890"
+        );
+        // 仅用户名不加 ":***@"
+        assert_eq!(
+            mask_proxy_url("socks5://alice@127.0.0.1:1080"),
+            "socks5://alice@127.0.0.1:1080"
+        );
+        // 解析失败回安全占位而非原文（原文可能含密码）
+        assert_eq!(mask_proxy_url("not a url"), "<无法解析的代理配置，已隐去>");
+        // query 保留
+        assert_eq!(
+            mask_proxy_url("http://alice:pw@h:1?p=x"),
+            "http://alice:***@h:1?p=x"
+        );
+    }
+
+    #[test]
+    fn mask_base_url_variants() {
+        // 无凭据原样返回（绝大多数情况）
+        assert_eq!(
+            mask_base_url("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1"
+        );
+        // 内嵌密码打码，路径保留
+        assert_eq!(
+            mask_base_url("https://alice:secret@example.com/anthropic"),
+            "https://alice:***@example.com/anthropic"
+        );
+        // 解析失败原样返回（base_url 已过 validate，此处不会发生）
+        assert_eq!(mask_base_url("::bad::"), "::bad::");
+    }
+
+    #[test]
+    fn parse_kv_variants() {
+        assert_eq!(
+            parse_kv("x-key = some value"),
+            Some(("x-key".into(), "some value".into()))
+        );
+        // 值中允许 '='：只按第一个 '=' 切分
+        assert_eq!(
+            parse_kv("authorization=Bearer a=b"),
+            Some(("authorization".into(), "Bearer a=b".into()))
+        );
+        assert_eq!(parse_kv("no-equals"), None);
+        assert_eq!(parse_kv("  =value"), None);
+    }
 }
 
 fn handle_config_cmd(
@@ -342,6 +445,14 @@ fn handle_config_cmd(
             }
         }
         cfg = cfg.normalized();
+        // 保存前校验已设置的 base_url 格式（允许为空——首次配置可分多次完成，中间态
+        // 合法）；否则 query 形式的 base_url 会被存盘，直到下次启动才报错
+        if !cfg.base_url.is_empty() {
+            if let Err(msg) = cfg.validate_base_url() {
+                eprintln!("base_url 无效，未保存: {msg}");
+                std::process::exit(1);
+            }
+        }
         match config::save(&cfg) {
             Ok(()) => println!("已保存配置到 {}", path.display()),
             Err(e) => {
@@ -353,9 +464,10 @@ fn handle_config_cmd(
 
     if show || !changed {
         // 重新加载以展示最终值
+        warn_if_config_broken(&path);
         let cfg = config::load().normalized();
         println!("配置文件: {}", path.display());
-        println!("base_url     = \"{}\"", cfg.base_url);
+        println!("base_url     = \"{}\"", mask_base_url(&cfg.base_url));
         println!("listen_addr  = \"{}\"", cfg.listen_addr);
         println!(
             "api_key      = {}",

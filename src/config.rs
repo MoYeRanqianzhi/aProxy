@@ -83,19 +83,32 @@ impl Config {
                 self.api_key = Some(k.trim().to_string());
             }
         }
-        // 头 k/v 统一 trim（与 CLI 路径 parse_kv 行为一致），trim 后 key 为空则剔除
-        self.extra_headers = self
-            .extra_headers
-            .iter()
-            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-            .filter(|(k, _)| !k.is_empty())
-            .collect();
-        self.override_headers = self
-            .override_headers
-            .iter()
-            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-            .filter(|(k, _)| !k.is_empty())
-            .collect();
+        // 头 k/v 统一 trim（与 CLI 路径 parse_kv 行为一致），trim 后 key 为空则剔除；
+        // trim 后同键冲突时保留先出现者——HashMap::collect 对坍缩键的赢家是非确定的
+        self.extra_headers = {
+            let mut m = HashMap::new();
+            for (k, v) in &self.extra_headers {
+                let k = k.trim();
+                if k.is_empty() {
+                    continue;
+                }
+                m.entry(k.to_string())
+                    .or_insert_with(|| v.trim().to_string());
+            }
+            m
+        };
+        self.override_headers = {
+            let mut m = HashMap::new();
+            for (k, v) in &self.override_headers {
+                let k = k.trim();
+                if k.is_empty() {
+                    continue;
+                }
+                m.entry(k.to_string())
+                    .or_insert_with(|| v.trim().to_string());
+            }
+            m
+        };
         // 代理：空白视为未设置
         self.proxy = self
             .proxy
@@ -120,21 +133,7 @@ impl Config {
         if self.base_url.trim().is_empty() {
             return Err("base_url 不能为空，请在 ~/.aproxy/config.toml 中配置".to_string());
         }
-        // scheme 判定大小写不敏感（"HTTP://" 亦合法）
-        let scheme_lower = self.base_url.trim().to_ascii_lowercase();
-        if !(scheme_lower.starts_with("http://") || scheme_lower.starts_with("https://")) {
-            return Err(format!(
-                "base_url 必须以 http:// 或 https:// 开头，当前值: {}",
-                self.base_url
-            ));
-        }
-        // 拒绝带 query/fragment 的 base_url：拼接 path 时会把路径拼进 query，静默错路由
-        if self.base_url.contains('?') || self.base_url.contains('#') {
-            return Err(format!(
-                "base_url 不应包含 ? 或 #（路径拼接会错路由），当前值: {}",
-                self.base_url
-            ));
-        }
+        self.validate_base_url()?;
         if let Some(p) = &self.proxy {
             let url = url::Url::parse(p).map_err(|e| format!("proxy 配置无效 ({p}): {e}"))?;
             let scheme = url.scheme();
@@ -152,6 +151,27 @@ impl Config {
         } else if self.proxy_username.is_some() || self.proxy_password.is_some() {
             // 仅当显式配置代理 URL 时用户名/密码才有意义，否则是配置遗漏
             return Err("配置了 proxy_username/proxy_password 但未配置 proxy URL".to_string());
+        }
+        Ok(())
+    }
+
+    /// 校验 base_url 自身的格式（scheme、无 query/fragment）。空值是否允许由调用方
+    /// 决定——启动时禁止，而 `aproxy config` 允许分多次配置的中间态，故单独拆出。
+    pub fn validate_base_url(&self) -> Result<(), String> {
+        // scheme 判定大小写不敏感（"HTTP://" 亦合法）
+        let scheme_lower = self.base_url.trim().to_ascii_lowercase();
+        if !(scheme_lower.starts_with("http://") || scheme_lower.starts_with("https://")) {
+            return Err(format!(
+                "base_url 必须以 http:// 或 https:// 开头，当前值: {}",
+                self.base_url
+            ));
+        }
+        // 拒绝带 query/fragment 的 base_url：拼接 path 时会把路径拼进 query，静默错路由
+        if self.base_url.contains('?') || self.base_url.contains('#') {
+            return Err(format!(
+                "base_url 不应包含 ? 或 #（路径拼接会错路由），当前值: {}",
+                self.base_url
+            ));
         }
         Ok(())
     }

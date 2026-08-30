@@ -79,12 +79,26 @@ pub struct IpcResponse {
 /// 探测端口上是否有 aProxy 实例（纯 IPC，不触碰任何 TCP 端口）。
 /// Ok(info) = 实例在运行；Err = 端点上没有可识别的 aProxy（无实例，
 /// 或该端口被其他程序占用——由调用方结合 TCP bind 结果区分这两种情况）。
+///
+/// 判死门槛：连续 3 次（间隔 200ms）都拿不到有效响应才算 Err。单次 ping
+/// 可能因 Windows 命名管道瞬时 busy（serve 重建监听实例的零监听窗口）或
+/// 3 秒超时等瞬态原因失败；调用方（list_instances 的注册清理、stop 的
+/// 已停止判定）会把 Err 当作「实例已死」处理，误判会删掉活实例的注册记录。
 pub async fn ipc_ping(port: &str) -> Result<InstanceInfo, String> {
-    match ipc_request(port, &IpcRequest::Ping).await {
-        Ok(resp) if resp.ok => resp.info.ok_or_else(|| "实例响应缺少信息".to_string()),
-        Ok(_) => Err("实例返回失败".to_string()),
-        Err(e) => Err(e),
+    const DEAD_AFTER: usize = 3;
+    const RETRY_INTERVAL: Duration = Duration::from_millis(200);
+    let mut last_err = String::new();
+    for attempt in 0..DEAD_AFTER {
+        if attempt > 0 {
+            tokio::time::sleep(RETRY_INTERVAL).await;
+        }
+        match ipc_request(port, &IpcRequest::Ping).await {
+            Ok(resp) if resp.ok => return resp.info.ok_or_else(|| "实例响应缺少信息".to_string()),
+            Ok(_) => last_err = "实例返回失败".to_string(),
+            Err(e) => last_err = e,
+        }
     }
+    Err(last_err)
 }
 
 /// 发送 IPC 请求并等待响应（3 秒超时）。
@@ -110,12 +124,20 @@ pub async fn serve_ipc(
     imp::serve(endpoint_for(&port), on_shutdown, info).await
 }
 
-/// 等待实例退出（IPC ping 失败即视为已退出），超时返回 false。
+/// 等待实例退出（连续 2 轮探测都失败才视为已退出），超时返回 false。
+/// 单轮失败可能是 IPC 通道瞬态问题（管道 busy / 超时），据此上报「已停止」
+/// 会掩盖仍存活的实例。
 pub async fn wait_until_gone(port: &str, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut consecutive_failures = 0usize;
     loop {
         if ipc_ping(port).await.is_err() {
-            return true;
+            consecutive_failures += 1;
+            if consecutive_failures >= 2 {
+                return true;
+            }
+        } else {
+            consecutive_failures = 0;
         }
         if tokio::time::Instant::now() >= deadline {
             return false;
@@ -128,21 +150,107 @@ pub async fn wait_until_gone(port: &str, timeout: Duration) -> bool {
 ///
 /// CREATE_NO_WINDOW：不继承父控制台、无窗口——关闭终端、控制台进程树清理
 /// 都不会连带杀掉守护进程（这正是前台进程被「常规清理」关掉的根因）。
+///
+/// Windows 上不走 std::process::Command：std 的 CreateProcessW 调用固定
+/// bInheritHandles=TRUE 且无稳定 API 可关闭（CommandExt::inherit_handles
+/// 仍 unstable）。这意味着调用方（cargo test / agent 脚本 / CI）经
+/// Command::output() 捕获输出运行 `aproxy start` 时，其 stdout/stderr 管道
+/// 写端句柄会被常驻守护进程继承，EOF 永不到来，调用方永久挂死。因此这里
+/// 手写 CreateProcessW，以 bInheritHandles=FALSE 启动，不继承任何句柄。
+/// 刻意不加 CREATE_BREAKAWAY_FROM_JOB：作业对象不允许 breakaway 时该标志
+/// 会让 CreateProcess 直接失败，把「父环境关闭可能连带杀掉守护」这一罕见
+/// 场景恶化成「根本启动不了」，得不偿失。
 /// 返回子进程 pid（spawn 即返回，不等待——守护不随父进程生命周期）。
 pub fn spawn_detached(exe: &std::path::Path, args: &[String]) -> io::Result<u32> {
-    use std::process::{Command, Stdio};
-    let mut cmd = Command::new(exe);
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+        use windows_sys::Win32::System::Threading::{
+            CreateProcessW, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
+            STARTUPINFOW,
+        };
+
+        /// Windows 命令行引号规则：含空格/制表符/引号的参数包引号；
+        /// 参数内的 `"` 转成 `""`，引号前的连续 `\` 翻倍（闭引号前同样翻倍）。
+        fn quote_arg(arg: &str) -> String {
+            if !arg.is_empty()
+                && !arg
+                    .chars()
+                    .any(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c' | '"'))
+            {
+                return arg.to_string();
+            }
+            let mut out = String::with_capacity(arg.len() + 2);
+            out.push('"');
+            let mut backslashes = 0usize;
+            for c in arg.chars() {
+                match c {
+                    '\\' => backslashes += 1,
+                    '"' => {
+                        out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                        out.push('"');
+                        backslashes = 0;
+                    }
+                    _ => {
+                        out.push_str(&"\\".repeat(backslashes));
+                        out.push(c);
+                        backslashes = 0;
+                    }
+                }
+            }
+            // 闭引号前的 `\` 同样要翻倍，否则会被当作转义引号
+            out.push_str(&"\\".repeat(backslashes * 2));
+            out.push('"');
+            out
+        }
+
+        let mut cmdline = quote_arg(&exe.display().to_string());
+        for arg in args {
+            cmdline.push(' ');
+            cmdline.push_str(&quote_arg(arg));
+        }
+        let exe_wide: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut cmdline_wide: Vec<u16> = cmdline.encode_utf16().chain(Some(0)).collect();
+
+        let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            CreateProcessW(
+                exe_wide.as_ptr(),
+                cmdline_wide.as_mut_ptr(),
+                std::ptr::null(), // lpProcessAttributes：默认安全描述符
+                std::ptr::null(), // lpThreadAttributes：默认安全描述符
+                0,                // bInheritHandles=FALSE：核心目的，杜绝句柄泄漏
+                CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                std::ptr::null(), // lpEnvironment=NULL：继承父进程环境
+                std::ptr::null(), // lpCurrentDirectory=NULL：维持继承 cwd 的现状
+                &mut si,
+                &mut pi,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::from_raw_os_error(unsafe { GetLastError() } as i32));
+        }
+        let pid = pi.dwProcessId;
+        // 守护进程只关心 pid；句柄持有会导致进程退出通知与资源泄漏
+        unsafe {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
+        Ok(pid)
     }
-    Ok(cmd.spawn()?.id())
+    #[cfg(unix)]
+    {
+        use std::process::{Command, Stdio};
+        let mut cmd = Command::new(exe);
+        cmd.args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        Ok(cmd.spawn()?.id())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -165,11 +273,25 @@ pub fn write_instance_file(info: &InstanceInfo) -> io::Result<()> {
 }
 
 /// 同上，目录可指定（测试注入用）
+///
+/// 原子写：先写同目录临时文件再 rename 覆盖目标。直接写目标文件时，
+/// 并发的 list_instances 可能读到写到一半的 JSON，把记录当损坏清理掉。
+/// rename 在同卷内是原子操作（Windows 上经 MoveFileEx 的替换语义覆盖
+/// 已存在文件）；临时文件名按端口隔离，实例间不会互踩。
 pub fn write_instance_file_in(run_dir: &std::path::Path, info: &InstanceInfo) -> io::Result<()> {
     std::fs::create_dir_all(run_dir)?;
     let path = instance_file_path_in(run_dir, &info.listen_addr);
     let json = serde_json::to_string_pretty(info).expect("序列化实例信息失败");
-    std::fs::write(path, json)
+    let tmp = path.with_extension("pid.tmp");
+    std::fs::write(&tmp, json)?;
+    match std::fs::rename(&tmp, &path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // rename 失败时清掉残留临时文件，避免堆积成永久垃圾
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// 删除实例注册（服务退出时调用）
@@ -246,10 +368,23 @@ async fn handle_conn<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     let (reader, mut writer) = tokio::io::split(stream);
     let mut line = String::new();
-    BufReader::new(reader).read_line(&mut line).await?;
+    // 请求行长度上限：命名管道是系统边界输入（同用户本地进程均可打开写入），
+    // read_line 会无界累积直到遇到 \n，恶意/异常客户端可借此把守护进程内存
+    // 吃到 OOM。超过上限即按无效请求回 ok:false 后断开。
+    const MAX_REQUEST_LINE: u64 = 64 * 1024;
+    let mut limited = BufReader::new(reader).take(MAX_REQUEST_LINE);
+    limited.read_line(&mut line).await?;
+    if !line.ends_with('\n') {
+        // 行未正常终止：超过长度上限被截断，或对端在发完整请求前就断开——
+        // 两种情况都不再继续累积，直接以无效请求收尾。
+        let resp = IpcResponse { ok: false, info: None };
+        let resp_line = serde_json::to_string(&resp).expect("序列化 IPC 响应失败");
+        let _ = write_line(&mut writer, &resp_line).await;
+        return Ok(());
+    }
     let resp: IpcResponse = match serde_json::from_str(&line) {
         Ok(IpcRequest::Ping) => IpcResponse { ok: true, info: Some(info) },
         Ok(IpcRequest::Shutdown) => {
@@ -280,16 +415,32 @@ where
 #[cfg(windows)]
 mod imp {
     use super::{handle_conn, exchange_over, InstanceInfo};
-    use std::io;
+    use std::{io, time::Duration};
     use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
     use tokio::sync::watch::Sender;
-
-    /// 单次请求-响应交换：连接端点、发请求行、收响应行。
     /// 端点不存在（无实例）时返回可读错误。
+    ///
+    /// ERROR_PIPE_BUSY(231) 重试：serve 循环在 connect() 完成、重建下一个
+    /// 监听实例之间存在零监听窗口，管道名存在但无空闲实例，此时 CreateFile
+    /// 返回 busy 而非「端点不存在」。tokio 文档明确要求客户端对该错误
+    /// sleep 后重试；封顶 2 秒（上层 ipc_request 的 3 秒超时之内）。
     pub async fn exchange(endpoint: &str, req_line: &str) -> Result<String, String> {
-        let client = ClientOptions::new()
-            .open(endpoint)
-            .map_err(|e| format!("无法连接（{e}）"))?;
+        const ERROR_PIPE_BUSY: i32 = 231;
+        const BUSY_RETRY_CAP: Duration = Duration::from_secs(2);
+        const BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+        let deadline = tokio::time::Instant::now() + BUSY_RETRY_CAP;
+        let client = loop {
+            match ClientOptions::new().open(endpoint) {
+                Ok(client) => break client,
+                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(format!("无法连接（{e}）"));
+                    }
+                    tokio::time::sleep(BUSY_RETRY_INTERVAL).await;
+                }
+                Err(e) => return Err(format!("无法连接（{e}）")),
+            }
+        };
         exchange_over(client, req_line).await
     }
 
@@ -314,7 +465,7 @@ mod imp {
 #[cfg(unix)]
 mod imp {
     use super::{handle_conn, exchange_over, InstanceInfo};
-    use std::{io, path::Path};
+    use std::{io, path::Path, time::Duration};
     use tokio::net::UnixListener;
     use tokio::sync::watch::Sender;
 
@@ -331,8 +482,14 @@ mod imp {
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path)?;
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                continue;
+            let (stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => {
+                    // 持续性 accept 错误（如 fd 耗尽的 EMFILE）不会自行恢复，
+                    // 立即重试会形成占满 CPU 的紧死循环；睡一拍给错误源恢复机会。
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
             };
             let shutdown = on_shutdown.clone();
             let info = info.clone();

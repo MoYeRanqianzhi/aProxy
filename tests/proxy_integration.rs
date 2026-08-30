@@ -1126,25 +1126,107 @@ fn cli_config_flag_scopes_config_subcommand() {
 }
 
 // ---------------------------------------------------------------------------
+// 22-24 守护进程测试公共设施
+//
+// 端口派生：守护测试曾硬编码 59001/59002 并对这些端口无条件执行真实
+// `aproxy stop`——stop 按端口 IPC 定位、不区分实例身份，开发者若恰好把日常
+// 实例跑在这两个端口，cargo test 会静默关掉它（生产代理中断且无任何提示）。
+// 改为从测试进程 pid 派生专属高位端口：与用户实例、跨 worktree 并行测试撞
+// 端口的概率都降到可忽略；预清理 stop 也只针对派生端口，永远不会触碰
+// 12345 等用户可能使用的端口。
+// ---------------------------------------------------------------------------
+
+/// 从测试进程 pid 派生三个互不相同的守护测试端口（25000..=65000 区间，
+/// 避开默认端口 12345 与常见手工实例端口；最大值 65000 在 u16 范围内不回绕）。
+fn daemon_test_ports() -> (u16, u16, u16) {
+    let base = 25000u32 + (std::process::id() % 20000) * 2;
+    (base as u16, (base + 1) as u16, (base + 2) as u16)
+}
+
+/// 守护清理守卫：Drop 时对测试派生端口执行 `aproxy stop`。
+/// 守护以分离进程运行（不随测试进程退出），此前 stop 只在全部断言通过后才
+/// 执行——任何一处断言失败都会把携带假上游的守护泄漏在真实 ~/.aproxy
+/// 注册表/日志里，直到手工清理。Drop 在断言失败的 unwind 路径同样运行，
+/// 杜绝泄漏。
+struct DaemonGuard {
+    exe: &'static str,
+    port: u16,
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let _ = Command::new(self.exe)
+            .args(["stop", &self.port.to_string()])
+            .output();
+    }
+}
+
+/// 等待守护就绪：TCP 可连只能证明「端口上有监听者」——可能是恰好占用端口的
+/// 其他程序，或并行测试的另一实例，此前的 ready 判定会让这类占用者造成
+/// 误导性假失败。须再经 IPC ping 确认是自家守护（管道名含端口，只有我们的
+/// --daemon-child 子进程会创建它）才算就绪。
+fn wait_daemon_ready(port: u16) -> bool {
+    let port_str = port.to_string();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("创建测试 tokio runtime 失败");
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+            && rt.block_on(aproxy::daemon::ipc_ping(&port_str)).is_ok()
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// 进程存活探测：Windows 用 tasklist 按 PID 过滤；无匹配时输出为纯文字
+/// 提示（不含数字），以「输出中出现该 pid」作为存活判据。
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    let out = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}")])
+        .output()
+        .expect("tasklist 执行失败");
+    String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    Command::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
 // 22. 守护进程生命周期：守护子进程承载服务 → status 列出 → stop 优雅停止
 //
 // 控制通道走 IPC（命名管道），代理端口完全用于透传，此处一并验证互不干扰。
 // 注意：直接以 --daemon-child 拉起守护（与 `aproxy start` 的 spawn_detached
-// 同一路径），不在测试进程树里再嵌套一层 start 父进程。
+// 同一路径），不在测试进程树里再嵌套一层 start 父进程（该路径由测试 24 覆盖）。
 // ---------------------------------------------------------------------------
 #[test]
 fn daemon_lifecycle_start_status_stop() {
+    let (port, _port_b, _port_c) = daemon_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let cfg_file = dir.path().join("daemon.toml");
     std::fs::write(
         &cfg_file,
-        "base_url = \"https://daemon-test.example.com\"\nlisten_addr = \"127.0.0.1:59001\"\n",
+        format!(
+            "base_url = \"https://daemon-test.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"
+        ),
     )
     .unwrap();
     let exe = env!("CARGO_BIN_EXE_aproxy");
 
-    // 预清理：上次运行残留（崩溃等）会让端口被占导致本次启动失败
-    let _ = Command::new(exe).args(["stop", "59001"]).output();
+    // 预清理：仅针对派生端口，清掉同端口残留（不影响任何其他端口上的实例）
+    let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
+    let _guard = DaemonGuard { exe, port };
 
     let pid = aproxy::daemon::spawn_detached(
         std::path::Path::new(exe),
@@ -1156,29 +1238,21 @@ fn daemon_lifecycle_start_status_stop() {
     )
     .expect("spawn 守护子进程失败");
 
-    // 等待守护完成 bind（端口可连即就绪，最多 5 秒）
-    let mut ready = false;
-    for _ in 0..50 {
-        if std::net::TcpStream::connect("127.0.0.1:59001").is_ok() {
-            ready = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(ready, "守护子进程未就绪 (pid {pid})");
+    // 就绪 = TCP 可连且 IPC ping 确认是自家守护（最多 10 秒）
+    assert!(wait_daemon_ready(port), "守护子进程未就绪 (pid {pid})");
 
     // status 列出该实例（信息来自实例注册表，存活以 IPC 探测为准）
     let out = Command::new(exe).arg("status").output().unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("59001"), "status 应列出实例: {stdout}");
+    assert!(stdout.contains(&port.to_string()), "status 应列出实例: {stdout}");
     assert!(
         stdout.contains("daemon-test.example.com"),
         "status 应展示上游: {stdout}"
     );
 
     // stop 指定端口：经 IPC 优雅停止并确认退出
-    let out = Command::new(exe).args(["stop", "59001"]).output().unwrap();
+    let out = Command::new(exe).args(["stop", &port.to_string()]).output().unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("已停止"), "实际: {stdout}");
@@ -1187,8 +1261,8 @@ fn daemon_lifecycle_start_status_stop() {
     let out = Command::new(exe).arg("status").output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        !stdout.contains("59001"),
-        "stop 后 status 不应再列出 59001: {stdout}"
+        !stdout.contains(&port.to_string()),
+        "stop 后 status 不应再列出 {port}: {stdout}"
     );
 }
 
@@ -1197,15 +1271,19 @@ fn daemon_lifecycle_start_status_stop() {
 // ---------------------------------------------------------------------------
 #[test]
 fn daemon_second_instance_on_same_port_exits() {
+    let (_port_a, port, _port_c) = daemon_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let cfg_file = dir.path().join("twice.toml");
     std::fs::write(
         &cfg_file,
-        "base_url = \"https://twice-test.example.com\"\nlisten_addr = \"127.0.0.1:59002\"\n",
+        format!(
+            "base_url = \"https://twice-test.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"
+        ),
     )
     .unwrap();
     let exe = env!("CARGO_BIN_EXE_aproxy");
-    let _ = Command::new(exe).args(["stop", "59002"]).output();
+    let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
+    let _guard = DaemonGuard { exe, port };
 
     let args = |file: &std::path::Path| {
         vec![
@@ -1218,26 +1296,73 @@ fn daemon_second_instance_on_same_port_exits() {
     // 第一个守护：正常承载服务
     let pid1 = aproxy::daemon::spawn_detached(std::path::Path::new(exe), &args(&cfg_file))
         .expect("spawn 第一个守护失败");
-    let mut ready = false;
-    for _ in 0..50 {
-        if std::net::TcpStream::connect("127.0.0.1:59002").is_ok() {
-            ready = true;
+    assert!(wait_daemon_ready(port), "第一个守护未就绪 (pid {pid1})");
+
+    // 第二个守护：同端口 bind 失败 → 快速退出（不挂、不影响原实例）
+    let pid2 = aproxy::daemon::spawn_detached(std::path::Path::new(exe), &args(&cfg_file))
+        .expect("spawn 第二个守护失败");
+
+    // 必须真正验证「第二个守护退出」：轮询 pid2 进程消失（最多 15 秒），
+    // 不能只靠固定 sleep——回归成「第二实例滞留」时测试必须失败
+    let mut exited = false;
+    for _ in 0..150 {
+        if !process_alive(pid2) {
+            exited = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(ready, "第一个守护未就绪 (pid {pid1})");
+    assert!(exited, "第二个守护 (pid {pid2}) 应在 bind 失败后退出");
 
-    // 第二个守护：同端口 bind 失败 → 快速退出（不挂、不影响原实例）
-    let _pid2 = aproxy::daemon::spawn_detached(std::path::Path::new(exe), &args(&cfg_file))
-        .expect("spawn 第二个守护失败");
-    std::thread::sleep(Duration::from_millis(1500));
-
-    // 原实例仍在服务
+    // 原实例仍在服务（IPC ping 可达 + status 仍列出）
+    assert!(wait_daemon_ready(port), "原实例应仍在运行 (pid {pid1})");
     let out = Command::new(exe).arg("status").output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("59002"), "原实例应仍在运行: {stdout}");
+    assert!(stdout.contains(&port.to_string()), "原实例应仍在运行: {stdout}");
+}
 
-    // 清理
-    let _ = Command::new(exe).args(["stop", "59002"]).output();
+// ---------------------------------------------------------------------------
+// 24. 回归：start 父进程经 Command::output() 运行必须正常返回
+//
+// spawn_detached 曾用 std::process::Command 启动守护子进程，Windows 上其
+// CreateProcessW 固定 bInheritHandles=TRUE，调用方 Command::output() 的
+// stdout/stderr 管道写端句柄会被常驻守护继承，EOF 永不到来——以捕获输出的
+// 方式运行 `aproxy start`（agent 脚本/CI 的典型调用形态）会永久挂死。
+// 修复后（手写 CreateProcessW，bInheritHandles=FALSE）此调用必须正常返回：
+// 本测试若挂死即说明修复回归。
+// ---------------------------------------------------------------------------
+#[test]
+fn start_parent_command_output_returns() {
+    let (_port_a, _port_b, port) = daemon_test_ports();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_file = dir.path().join("start.toml");
+    std::fs::write(
+        &cfg_file,
+        format!(
+            "base_url = \"https://start-parent-test.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"
+        ),
+    )
+    .unwrap();
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+
+    let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
+    let _guard = DaemonGuard { exe, port };
+
+    // 无子命令 = 后台启动：真实 start 父进程做预检、spawn 分离守护、
+    // 等待 IPC 就绪后打印结果并退出——捕获输出的调用必须能等到这个退出
+    let out = Command::new(exe)
+        .arg("--config")
+        .arg(&cfg_file)
+        .output()
+        .expect("start 父进程执行失败");
+    assert!(
+        out.status.success(),
+        "start 应成功，stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("已在后台启动"),
+        "start 父进程应报告后台启动，实际: {stdout}"
+    );
 }

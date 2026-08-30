@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "aproxy"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.3"
 dependencies = [
  "axum",
  "bytes",
@@ -85,6 +85,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

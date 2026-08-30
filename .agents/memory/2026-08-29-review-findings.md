@@ -16,4 +16,6 @@ metadata:
 
 **Why:** 审查发现大量集中于「keepalive 骨架先于上游响应」这一架构决策的连锁后果；总超时问题在开发期被 `client.timeout(300)` 顺手感掩盖。
 
-**How to apply:** 修复 workflow `fix-review-findings`（wf_4920bb7e-dee）按文件边界分派：proxy.rs 核心 / config+retry / main / 集成测试（依赖 proxy 完成）。复审时以本文件为基线核对跳过项是否仍成立。相关 [[baseurl-rename]] [[proxy-config]]。
+**修复轮复核（2026-08-30，50 agent 审查确认 18 项并已全部修复）**：read_timeout 60s 钳制 TTFB→300s；16/19 测试未隔离环境代理→local_client()+NO_PROXY；断开保护测试观测窗口落在退避间隙（删保护仍绿）→17s 窗口+时间戳断言；keepalive 通道 spool 超限静默结束流→发 `event: error`（proxy_spool_limit）终态事件；config 保存前校验 base_url（validate_base_url 拆出）；normalized 头 trim 冲突 first-wins；--show 解析失败警告；base_url 内嵌凭据打码（mask_base_url）；main mask/parse_kv 补单测；413 消息中性化；keepalive_during_retry 补心跳/计数断言。提交 339c0ae/dddfadf/43dbf18/ecb58bf，59 单测+5 bin 测试+19 集成全绿。修复轮审查中发现验证 agent 曾修改工作区做实验（select 竞速被移除、新增临时测试文件），已 git checkout 恢复——**审查 workflow 的验证 agent 必须要求只读，修复验证一律不许改工作区**。
+
+**How to apply:** 复审时以本文件为基线核对跳过项是否仍成立。相关 [[baseurl-rename]] [[proxy-config]] [[disconnect-billing-protection]]。

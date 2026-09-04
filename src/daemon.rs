@@ -107,7 +107,9 @@ pub async fn ipc_request(port: &str, req: &IpcRequest) -> Result<IpcResponse, St
     let req_line = serde_json::to_string(req).expect("序列化 IPC 请求失败");
     let fut = imp::exchange(&endpoint, &req_line);
     match tokio::time::timeout(Duration::from_secs(3), fut).await {
-        Ok(Ok(line)) => serde_json::from_str(&line).map_err(|e| format!("{endpoint}: 响应解析失败 {e}")),
+        Ok(Ok(line)) => {
+            serde_json::from_str(&line).map_err(|e| format!("{endpoint}: 响应解析失败 {e}"))
+        }
         Ok(Err(e)) => Err(format!("{endpoint}: {e}")),
         Err(_) => Err(format!("{endpoint}: 请求超时")),
     }
@@ -167,7 +169,7 @@ pub fn spawn_detached(exe: &std::path::Path, args: &[String]) -> io::Result<u32>
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
         use windows_sys::Win32::System::Threading::{
-            CreateProcessW, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
+            CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, PROCESS_INFORMATION,
             STARTUPINFOW,
         };
 
@@ -226,12 +228,14 @@ pub fn spawn_detached(exe: &std::path::Path, args: &[String]) -> io::Result<u32>
                 CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
                 std::ptr::null(), // lpEnvironment=NULL：继承父进程环境
                 std::ptr::null(), // lpCurrentDirectory=NULL：维持继承 cwd 的现状
-                &mut si,
+                &si,
                 &mut pi,
             )
         };
         if ok == 0 {
-            return Err(io::Error::from_raw_os_error(unsafe { GetLastError() } as i32));
+            return Err(io::Error::from_raw_os_error(
+                unsafe { GetLastError() } as i32
+            ));
         }
         let pid = pi.dwProcessId;
         // 守护进程只关心 pid；句柄持有会导致进程退出通知与资源泄漏
@@ -380,23 +384,43 @@ where
     if !line.ends_with('\n') {
         // 行未正常终止：超过长度上限被截断，或对端在发完整请求前就断开——
         // 两种情况都不再继续累积，直接以无效请求收尾。
-        let resp = IpcResponse { ok: false, info: None };
+        let resp = IpcResponse {
+            ok: false,
+            info: None,
+        };
         let resp_line = serde_json::to_string(&resp).expect("序列化 IPC 响应失败");
         let _ = write_line(&mut writer, &resp_line).await;
         return Ok(());
     }
     let resp: IpcResponse = match serde_json::from_str(&line) {
-        Ok(IpcRequest::Ping) => IpcResponse { ok: true, info: Some(info) },
+        Ok(IpcRequest::Ping) => IpcResponse {
+            ok: true,
+            info: Some(info),
+        },
         Ok(IpcRequest::Shutdown) => {
             // 响应先发出去再触发停止：客户端立刻拿到确认，服务随后优雅退出
-            let resp = IpcResponse { ok: true, info: Some(info) };
-            write_line(&mut writer, &serde_json::to_string(&resp).expect("序列化 IPC 响应失败")).await?;
+            let resp = IpcResponse {
+                ok: true,
+                info: Some(info),
+            };
+            write_line(
+                &mut writer,
+                &serde_json::to_string(&resp).expect("序列化 IPC 响应失败"),
+            )
+            .await?;
             let _ = on_shutdown.send(true);
             return Ok(());
         }
-        Err(_) => IpcResponse { ok: false, info: None },
+        Err(_) => IpcResponse {
+            ok: false,
+            info: None,
+        },
     };
-    write_line(&mut writer, &serde_json::to_string(&resp).expect("序列化 IPC 响应失败")).await
+    write_line(
+        &mut writer,
+        &serde_json::to_string(&resp).expect("序列化 IPC 响应失败"),
+    )
+    .await
 }
 
 async fn write_line<W>(writer: &mut W, line: &str) -> io::Result<()>
@@ -414,7 +438,7 @@ where
 // ---------------------------------------------------------------------------
 #[cfg(windows)]
 mod imp {
-    use super::{handle_conn, exchange_over, InstanceInfo};
+    use super::{InstanceInfo, exchange_over, handle_conn};
     use std::{io, time::Duration};
     use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
     use tokio::sync::watch::Sender;
@@ -445,7 +469,11 @@ mod imp {
     }
 
     /// 接受循环：为每个连接 spawn 处理任务；始终重建监听实例以接受后续连接。
-    pub async fn serve(endpoint: String, on_shutdown: Sender<bool>, info: InstanceInfo) -> io::Result<()> {
+    pub async fn serve(
+        endpoint: String,
+        on_shutdown: Sender<bool>,
+        info: InstanceInfo,
+    ) -> io::Result<()> {
         let mut server = ServerOptions::new()
             .first_pipe_instance(true)
             .create(&endpoint)?;
@@ -464,7 +492,7 @@ mod imp {
 
 #[cfg(unix)]
 mod imp {
-    use super::{handle_conn, exchange_over, InstanceInfo};
+    use super::{InstanceInfo, exchange_over, handle_conn};
     use std::{io, path::Path, time::Duration};
     use tokio::net::UnixListener;
     use tokio::sync::watch::Sender;
@@ -476,7 +504,11 @@ mod imp {
         exchange_over(client, req_line).await
     }
 
-    pub async fn serve(endpoint: String, on_shutdown: Sender<bool>, info: InstanceInfo) -> io::Result<()> {
+    pub async fn serve(
+        endpoint: String,
+        on_shutdown: Sender<bool>,
+        info: InstanceInfo,
+    ) -> io::Result<()> {
         let path = Path::new(&endpoint);
         // 残留 socket 文件会令 bind 失败，先清理
         let _ = std::fs::remove_file(path);
@@ -563,7 +595,9 @@ mod tests {
         assert_eq!(resp.info.unwrap().pid, 42);
 
         // shutdown：响应确认后置位停止信号
-        let line = imp::exchange(&endpoint, r#"{"op":"shutdown"}"#).await.unwrap();
+        let line = imp::exchange(&endpoint, r#"{"op":"shutdown"}"#)
+            .await
+            .unwrap();
         let resp: IpcResponse = serde_json::from_str(&line).unwrap();
         assert!(resp.ok);
         rx.changed().await.unwrap();

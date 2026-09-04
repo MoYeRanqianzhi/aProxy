@@ -24,11 +24,11 @@
 //!   `extra_headers` 追加缺失头，`override_headers` 无条件覆盖（兼容非 Bearer 鉴权与额外头需求）
 
 use axum::{
+    Router,
     body::Body,
     extract::{Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    Router,
 };
 use bytes::Bytes;
 use futures_util::StreamExt as _;
@@ -164,14 +164,15 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
         Ok(b) => b,
         Err(e) => {
             tracing::error!(error = %e, "读取请求体失败");
-            return (StatusCode::PAYLOAD_TOO_LARGE, format!("请求体读取失败（超出 10 MiB 上限或连接中断）: {e}")).into_response();
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("请求体读取失败（超出 10 MiB 上限或连接中断）: {e}"),
+            )
+                .into_response();
         }
     };
 
-    let path_and_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
+    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
     let upstream_base = state.config.base_url.trim_end_matches('/');
     let target_url = format!("{}{}", upstream_base, path_and_query);
@@ -189,7 +190,14 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
 
     // 首轮（attempt 1）先行：成功则完整保真回放（status/headers 不失真），
     // 需要重试才进入重试通道——首轮成功是常态路径。
-    let first = forward_once(&state.client, &method, &target_url, &headers, body_bytes.clone()).await;
+    let first = forward_once(
+        &state.client,
+        &method,
+        &target_url,
+        &headers,
+        body_bytes.clone(),
+    )
+    .await;
 
     let needs_retry = match &first {
         ForwardResult::NetworkError(e) => {
@@ -293,7 +301,14 @@ async fn proxy_without_keepalive(
             tracing::warn!(attempt, "立即重试");
         }
 
-        let result = forward_once(&state.client, &method, &target_url, &headers, body_bytes.clone()).await;
+        let result = forward_once(
+            &state.client,
+            &method,
+            &target_url,
+            &headers,
+            body_bytes.clone(),
+        )
+        .await;
 
         match result {
             ForwardResult::NetworkError(e) => {
@@ -457,16 +472,21 @@ async fn proxy_with_keepalive(
 
     // SSE 流式骨架；仅在重试间隙注入 ": keepalive\n\n"（SSE 注释，客户端会忽略）。
     // 哨兵 move 进 map 闭包：Body 被客户端断开而 drop 时闭包销毁 → 置位断开信号。
-    let rx_stream = tokio_stream::wrappers::ReceiverStream::new(rx)
-        .map(move |r| {
-            let _ = &gone_guard;
-            r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-        });
+    let rx_stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(move |r| {
+        let _ = &gone_guard;
+        r.map_err(|e| std::io::Error::other(e.to_string()))
+    });
     let body = Body::from_stream(rx_stream);
 
     let mut resp = Response::builder().status(StatusCode::OK);
-    resp = resp.header(http::header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-    resp = resp.header(http::header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    resp = resp.header(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    resp = resp.header(
+        http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    );
     // 不设置 connection 头：hyper 按协议自动管理
     resp.body(body).unwrap().into_response()
 }
@@ -483,6 +503,10 @@ impl Drop for ClientGoneGuard {
     }
 }
 
+// Response 变体比其他变体大（status + 双头表 + Bytes 共约百余字节）：body 本身
+// 已是引用计数的 Bytes，装箱只能省这点栈空间，而本枚举只在单一路径按值传递
+// 一次，不构成热点。保持扁平匹配更直接。
+#[allow(clippy::large_enum_variant)]
 enum ForwardResult {
     NetworkError(String),
     /// 上游响应体超出 `MAX_SPOOL_BYTES`：确定性失败，重试无意义，各通道直接终态处理。
@@ -519,10 +543,10 @@ async fn forward_once(
         if is_hop_header(name_str) {
             continue;
         }
-        if let Ok(n) = reqwest::header::HeaderName::from_bytes(name_str.as_bytes()) {
-            if let Ok(v) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
-                builder = builder.header(n, v);
-            }
+        if let Ok(n) = reqwest::header::HeaderName::from_bytes(name_str.as_bytes())
+            && let Ok(v) = reqwest::header::HeaderValue::from_bytes(value.as_bytes())
+        {
+            builder = builder.header(n, v);
         }
     }
 
@@ -546,11 +570,11 @@ async fn forward_once(
         if is_hop_header(name_str) {
             continue;
         }
-        if let Ok(n) = HeaderName::from_bytes(name_str.as_bytes()) {
-            if let Ok(v) = HeaderValue::from_bytes(value.as_bytes()) {
-                // append 而非 insert：Set-Cookie 等同名多值头不能坍缩为最后一个
-                resp_headers.append(n, v);
-            }
+        if let Ok(n) = HeaderName::from_bytes(name_str.as_bytes())
+            && let Ok(v) = HeaderValue::from_bytes(value.as_bytes())
+        {
+            // append 而非 insert：Set-Cookie 等同名多值头不能坍缩为最后一个
+            resp_headers.append(n, v);
         }
     }
 
@@ -685,7 +709,10 @@ mod tests {
             ..Default::default()
         };
         let mut headers = HeaderMap::new();
-        headers.insert("authorization", HeaderValue::from_static("Basic dXNlcjpwYXNz"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
         apply_header_overrides(&mut headers, &cfg);
         assert_eq!(headers.get("authorization").unwrap(), "Bearer sk-test");
     }
@@ -699,7 +726,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-custom", HeaderValue::from_static("keep"));
         apply_header_overrides(&mut headers, &cfg);
-        assert!(headers.get("authorization").is_none(), "未配置 api_key 不应新增 Authorization");
+        assert!(
+            headers.get("authorization").is_none(),
+            "未配置 api_key 不应新增 Authorization"
+        );
         assert_eq!(headers.get("x-custom").unwrap(), "keep", "其余头应保持不变");
     }
 
@@ -715,7 +745,11 @@ mod tests {
         headers.append("x-foo", HeaderValue::from_static("old1"));
         headers.append("x-foo", HeaderValue::from_static("old2"));
         apply_header_overrides(&mut headers, &cfg);
-        assert_eq!(headers.get_all("x-foo").iter().count(), 1, "覆盖后应只剩一个值");
+        assert_eq!(
+            headers.get_all("x-foo").iter().count(),
+            1,
+            "覆盖后应只剩一个值"
+        );
         assert_eq!(headers.get("x-foo").unwrap(), "new");
     }
 
@@ -728,7 +762,11 @@ mod tests {
         };
         let mut headers = HeaderMap::new();
         apply_header_overrides(&mut headers, &cfg);
-        assert_eq!(headers.get("x-added").unwrap(), "v", "override 对缺失头应直接新增");
+        assert_eq!(
+            headers.get("x-added").unwrap(),
+            "v",
+            "override 对缺失头应直接新增"
+        );
     }
 
     #[test]
@@ -746,7 +784,11 @@ mod tests {
         headers.insert("X-PRESENT", HeaderValue::from_static("keep"));
         apply_header_overrides(&mut headers, &cfg);
         assert_eq!(headers.get("x-extra").unwrap(), "added", "缺失头应被追加");
-        assert_eq!(headers.get("x-present").unwrap(), "keep", "已存在头不应被覆盖");
+        assert_eq!(
+            headers.get("x-present").unwrap(),
+            "keep",
+            "已存在头不应被覆盖"
+        );
     }
 
     #[test]
@@ -755,7 +797,10 @@ mod tests {
         let cfg = Config {
             base_url: "https://api.example.com".to_string(),
             api_key: Some("sk-api".to_string()),
-            override_headers: HashMap::from([("Authorization".to_string(), "Bearer sk-override".to_string())]),
+            override_headers: HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer sk-override".to_string(),
+            )]),
             ..Default::default()
         };
         let mut headers = HeaderMap::new();
@@ -769,7 +814,10 @@ mod tests {
         let cfg = Config {
             base_url: "https://api.example.com".to_string(),
             api_key: Some("sk-api".to_string()),
-            extra_headers: HashMap::from([("Authorization".to_string(), "should-not-win".to_string())]),
+            extra_headers: HashMap::from([(
+                "Authorization".to_string(),
+                "should-not-win".to_string(),
+            )]),
             ..Default::default()
         };
         let mut headers = HeaderMap::new();
@@ -792,9 +840,16 @@ mod tests {
         };
         let mut headers = HeaderMap::new();
         apply_header_overrides(&mut headers, &cfg);
-        assert!(headers.get("authorization").is_none(), "非法 api_key 不应写入 Authorization");
+        assert!(
+            headers.get("authorization").is_none(),
+            "非法 api_key 不应写入 Authorization"
+        );
         assert!(headers.get("bad name").is_none(), "非法头名应跳过");
-        assert_eq!(headers.get("x-good").unwrap(), "ok", "合法 override 应正常生效");
+        assert_eq!(
+            headers.get("x-good").unwrap(),
+            "ok",
+            "合法 override 应正常生效"
+        );
         assert!(headers.get("x-bad-val").is_none(), "非法头值应跳过");
     }
 }

@@ -1,22 +1,23 @@
-//! 端到端集成测试：通过真实的 mock 上游 + 代理联调验证重/RY与流式暂存回放。
+//! 端到端集成测试：通过真实的 mock 上游 + 代理联调验证重试与流式暂存回放。
 //!
 //! 每个测试启动两个本地服务：
 //! - mock 上游：按需返回 500 / 错误 JSON / SSE 成功载荷
 //! - aProxy：指向该上游，监听随机端口
+//!
 //! 客户端直接请求 aProxy，断言重试与字节保真行为。
 
 use axum::{
+    Router,
     http::{HeaderMap, HeaderValue, StatusCode},
     routing::{any, get, post},
-    Router,
 };
 use bytes::Bytes;
 use std::{
     io::Read,
     process::Stdio,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -129,11 +130,17 @@ async fn retry_on_error_body_then_success() {
                 if n == 0 {
                     (
                         StatusCode::OK,
-                        axum::Json(serde_json::json!({"type":"error","error":{"type":"overloaded"}})),
+                        axum::Json(
+                            serde_json::json!({"type":"error","error":{"type":"overloaded"}}),
+                        ),
                     )
                         .into_response()
                 } else {
-                    (StatusCode::OK, axum::Json(serde_json::json!({"content":"hello"}))).into_response()
+                    (
+                        StatusCode::OK,
+                        axum::Json(serde_json::json!({"content":"hello"})),
+                    )
+                        .into_response()
                 }
             }
         }),
@@ -198,13 +205,14 @@ async fn stream_spool_then_replay_preserves_bytes() {
         .unwrap();
 
     assert_eq!(resp.status(), 200);
-    assert!(resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .contains("text/event-stream"));
+    assert!(
+        resp.headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("text/event-stream")
+    );
 
     let bytes = resp.bytes().await.unwrap();
     let text = String::from_utf8_lossy(&bytes);
@@ -233,7 +241,8 @@ async fn stream_error_data_triggers_retry() {
     let c2 = counter.clone();
 
     let bad_sse = "data: {\"type\":\"content_block_delta\",\"text\":\"hi\"}\n\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded\"}}\n\n";
-    let good_sse = "data: {\"type\":\"content_block_delta\",\"text\":\"hello\"}\n\ndata: [DONE]\n\n";
+    let good_sse =
+        "data: {\"type\":\"content_block_delta\",\"text\":\"hello\"}\n\ndata: [DONE]\n\n";
 
     let upstream = Router::new().route(
         "/v1/stream",
@@ -282,7 +291,12 @@ async fn passthrough_success() {
         get(|| async {
             let mut headers = HeaderMap::new();
             headers.insert("x-custom", HeaderValue::from_static("abc"));
-            (StatusCode::OK, headers, axum::Json(serde_json::json!({"pong":1}))).into_response()
+            (
+                StatusCode::OK,
+                headers,
+                axum::Json(serde_json::json!({"pong":1})),
+            )
+                .into_response()
         }),
     );
     let (upstream_url, _h1) = bind_random_router(upstream).await;
@@ -290,7 +304,11 @@ async fn passthrough_success() {
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
     let client = local_client();
-    let resp = client.get(format!("{}/v1/ping", proxy_url)).send().await.unwrap();
+    let resp = client
+        .get(format!("{}/v1/ping", proxy_url))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers().get("x-custom").unwrap(), "abc");
     let body: serde_json::Value = resp.json().await.unwrap();
@@ -303,14 +321,22 @@ async fn passthrough_success() {
 #[tokio::test]
 async fn health_is_proxied() {
     let upstream = Router::new().fallback(any(|| async {
-        (StatusCode::OK, axum::Json(serde_json::json!({"upstream": "health"}))).into_response()
+        (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"upstream": "health"})),
+        )
+            .into_response()
     }));
     let (upstream_url, _h1) = bind_random_router(upstream).await;
     let proxy_state = AppState::new(proxy_config_for(&upstream_url));
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
     let client = local_client();
-    let resp = client.get(format!("{}/health", proxy_url)).send().await.unwrap();
+    let resp = client
+        .get(format!("{}/health", proxy_url))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["upstream"], "health");
@@ -333,7 +359,10 @@ async fn retry_on_4xx_then_success() {
                 if n == 0 {
                     (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response()
                 } else if n == 1 {
-                    (StatusCode::UNAUTHORIZED, axum::Json(serde_json::json!({"error":"unauthorized"})))
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        axum::Json(serde_json::json!({"error":"unauthorized"})),
+                    )
                         .into_response()
                 } else {
                     (StatusCode::OK, axum::Json(serde_json::json!({"ok": true}))).into_response()
@@ -346,7 +375,11 @@ async fn retry_on_4xx_then_success() {
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
     let client = local_client();
-    let resp = client.get(format!("{}/v1/auth", proxy_url)).send().await.unwrap();
+    let resp = client
+        .get(format!("{}/v1/auth", proxy_url))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["ok"], true);
@@ -376,7 +409,12 @@ async fn keepalive_during_retry() {
                         axum::http::header::CONTENT_TYPE,
                         HeaderValue::from_static("text/event-stream"),
                     );
-                    (StatusCode::OK, headers, "data: {\"ok\":true}\n\ndata: [DONE]\n\n").into_response()
+                    (
+                        StatusCode::OK,
+                        headers,
+                        "data: {\"ok\":true}\n\ndata: [DONE]\n\n",
+                    )
+                        .into_response()
                 }
             }
         }),
@@ -401,8 +439,15 @@ async fn keepalive_during_retry() {
     assert!(body.contains("data: {\"ok\":true}"));
     assert!(body.contains("data: [DONE]"));
     // 测试名称所声称的两个前提必须被验证：心跳确实发过、重试确实发生
-    assert!(body.contains(": keepalive"), "重试期间应收到 : keepalive 心跳注释");
-    assert_eq!(counter.load(Ordering::SeqCst), 2, "应恰好两次上游尝试（首次 500 + 重试成功）");
+    assert!(
+        body.contains(": keepalive"),
+        "重试期间应收到 : keepalive 心跳注释"
+    );
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        2,
+        "应恰好两次上游尝试（首次 500 + 重试成功）"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -437,8 +482,10 @@ async fn header_override_and_extra() {
     let (upstream_url, _h1) = bind_random_router(upstream).await;
     let mut cfg = proxy_config_for(&upstream_url);
     cfg.api_key = Some("sk-test123".to_string());
-    cfg.extra_headers.insert("x-extra".to_string(), "from-config".to_string());
-    cfg.override_headers.insert("x-override".to_string(), "forced".to_string());
+    cfg.extra_headers
+        .insert("x-extra".to_string(), "from-config".to_string());
+    cfg.override_headers
+        .insert("x-override".to_string(), "forced".to_string());
     let proxy_state = AppState::new(cfg);
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
@@ -498,7 +545,9 @@ async fn proxy_config_routes_through_proxy() {
     let uh = upstream_host.clone();
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = proxy_listener.accept().await else { break };
+            let Ok((mut stream, _)) = proxy_listener.accept().await else {
+                break;
+            };
             let ph = ph.clone();
             let uh = uh.clone();
             tokio::spawn(async move {
@@ -526,14 +575,18 @@ async fn proxy_config_routes_through_proxy() {
 
                 ph.fetch_add(1, Ordering::SeqCst);
 
-                let Ok(url) = url::Url::parse(&absolute_url) else { return };
+                let Ok(url) = url::Url::parse(&absolute_url) else {
+                    return;
+                };
                 let path = url.path().to_string();
                 let query = url.query().map(|q| format!("?{q}")).unwrap_or_default();
                 let req_head = format!(
                     "GET {path}{query} HTTP/1.1\r\nHost: {uh}\r\nConnection: close\r\n\r\n"
                 );
 
-                let Ok(mut up) = TcpStream::connect(&uh).await else { return };
+                let Ok(mut up) = TcpStream::connect(&uh).await else {
+                    return;
+                };
                 if up.write_all(req_head.as_bytes()).await.is_err() {
                     return;
                 }
@@ -652,7 +705,9 @@ async fn proxy_basic_auth_sent() {
     let uh = upstream_host.clone();
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = proxy_listener.accept().await else { break };
+            let Ok((mut stream, _)) = proxy_listener.accept().await else {
+                break;
+            };
             let ca = ca.clone();
             let uh = uh.clone();
             tokio::spawn(async move {
@@ -676,22 +731,28 @@ async fn proxy_basic_auth_sent() {
                         break;
                     }
                     // 仅对头名做大小写不敏感比较，值原样保留（base64 区分大小写）
-                    if let Some(idx) = header.find(':') {
-                        if header[..idx].trim().eq_ignore_ascii_case("proxy-authorization") {
-                            *ca.lock().unwrap() = Some(header[idx + 1..].trim().to_string());
-                        }
+                    if let Some(idx) = header.find(':')
+                        && header[..idx]
+                            .trim()
+                            .eq_ignore_ascii_case("proxy-authorization")
+                    {
+                        *ca.lock().unwrap() = Some(header[idx + 1..].trim().to_string());
                     }
                 }
                 drop(reader);
 
-                let Ok(url) = url::Url::parse(&absolute_url) else { return };
+                let Ok(url) = url::Url::parse(&absolute_url) else {
+                    return;
+                };
                 let path = url.path().to_string();
                 let query = url.query().map(|q| format!("?{q}")).unwrap_or_default();
                 let req_head = format!(
                     "GET {path}{query} HTTP/1.1\r\nHost: {uh}\r\nConnection: close\r\n\r\n"
                 );
 
-                let Ok(mut up) = TcpStream::connect(&uh).await else { return };
+                let Ok(mut up) = TcpStream::connect(&uh).await else {
+                    return;
+                };
                 if up.write_all(req_head.as_bytes()).await.is_err() {
                     return;
                 }
@@ -847,11 +908,18 @@ async fn chunk_boundary_body_replayed_byte_exact() {
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
     let client = local_client();
-    let resp = client.get(format!("{proxy_url}/v1/big")).send().await.unwrap();
+    let resp = client
+        .get(format!("{proxy_url}/v1/big"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.bytes().await.unwrap();
     assert_eq!(body.len(), 16 * 1024, "回放 body 长度必须与上游一致");
-    assert!(body.iter().all(|&b| b == b'x'), "回放 body 内容必须与上游一致");
+    assert!(
+        body.iter().all(|&b| b == b'x'),
+        "回放 body 内容必须与上游一致"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -900,7 +968,10 @@ async fn api_key_overrides_both_auth_headers() {
 
     let (auth, xkey) = captured.lock().unwrap().clone().expect("上游应收到请求");
     assert_eq!(auth, "Bearer sk-proxy-key", "authorization 应为配置 key");
-    assert_eq!(xkey, "sk-proxy-key", "x-api-key 应被配置 key 覆盖，不得泄漏客户端原值");
+    assert_eq!(
+        xkey, "sk-proxy-key",
+        "x-api-key 应被配置 key 覆盖，不得泄漏客户端原值"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -912,8 +983,14 @@ async fn multi_value_set_cookie_headers_pass_through() {
         "/v1/cookies",
         any(|| async {
             let mut headers = HeaderMap::new();
-            headers.append(axum::http::header::SET_COOKIE, HeaderValue::from_static("a=1"));
-            headers.append(axum::http::header::SET_COOKIE, HeaderValue::from_static("b=2"));
+            headers.append(
+                axum::http::header::SET_COOKIE,
+                HeaderValue::from_static("a=1"),
+            );
+            headers.append(
+                axum::http::header::SET_COOKIE,
+                HeaderValue::from_static("b=2"),
+            );
             (StatusCode::OK, headers, "ok").into_response()
         }),
     );
@@ -922,7 +999,11 @@ async fn multi_value_set_cookie_headers_pass_through() {
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
     let client = local_client();
-    let resp = client.get(format!("{proxy_url}/v1/cookies")).send().await.unwrap();
+    let resp = client
+        .get(format!("{proxy_url}/v1/cookies"))
+        .send()
+        .await
+        .unwrap();
     let cookies: Vec<_> = resp
         .headers()
         .get_all("set-cookie")
@@ -987,12 +1068,26 @@ async fn interrupted_stream_is_retried() {
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
     let client = local_client();
-    let resp = client.post(format!("{proxy_url}/v1/messages")).send().await.unwrap();
+    let resp = client
+        .post(format!("{proxy_url}/v1/messages"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("data: {\"ok\":true}"), "中断后应回放第二次成功的完整 body，得到: {body}");
-    assert!(!body.contains("\"partial\""), "首次中断的部分流不得泄漏给客户端");
-    assert_eq!(counter.load(Ordering::SeqCst), 2, "spool 中断后应恰好重试一次");
+    assert!(
+        body.contains("data: {\"ok\":true}"),
+        "中断后应回放第二次成功的完整 body，得到: {body}"
+    );
+    assert!(
+        !body.contains("\"partial\""),
+        "首次中断的部分流不得泄漏给客户端"
+    );
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        2,
+        "spool 中断后应恰好重试一次"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,7 +1103,12 @@ async fn keepalive_first_attempt_success_matches_non_keepalive() {
                 axum::http::header::CONTENT_TYPE,
                 HeaderValue::from_static("text/event-stream"),
             );
-            (StatusCode::OK, headers, "data: {\"ok\":true}\n\ndata: [DONE]\n\n").into_response()
+            (
+                StatusCode::OK,
+                headers,
+                "data: {\"ok\":true}\n\ndata: [DONE]\n\n",
+            )
+                .into_response()
         }),
     );
     let (upstream_url, _h1) = bind_random_router(upstream).await;
@@ -1076,7 +1176,10 @@ fn cli_config_flag_rejects_missing_file_on_start() {
         "显式指定的配置文件不存在时启动必须失败（而非静默回退默认配置）"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("不存在"), "stderr 应提示文件不存在，实际: {stderr}");
+    assert!(
+        stderr.contains("不存在"),
+        "stderr 应提示文件不存在，实际: {stderr}"
+    );
 }
 
 #[test]
@@ -1255,14 +1358,20 @@ fn daemon_lifecycle_start_status_stop() {
     let out = Command::new(exe).arg("status").output().unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains(&port.to_string()), "status 应列出实例: {stdout}");
+    assert!(
+        stdout.contains(&port.to_string()),
+        "status 应列出实例: {stdout}"
+    );
     assert!(
         stdout.contains("daemon-test.example.com"),
         "status 应展示上游: {stdout}"
     );
 
     // stop 指定端口：经 IPC 优雅停止并确认退出
-    let out = Command::new(exe).args(["stop", &port.to_string()]).output().unwrap();
+    let out = Command::new(exe)
+        .args(["stop", &port.to_string()])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("已停止"), "实际: {stdout}");
@@ -1328,7 +1437,10 @@ fn daemon_second_instance_on_same_port_exits() {
     assert!(wait_daemon_ready(port), "原实例应仍在运行 (pid {pid1})");
     let out = Command::new(exe).arg("status").output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains(&port.to_string()), "原实例应仍在运行: {stdout}");
+    assert!(
+        stdout.contains(&port.to_string()),
+        "原实例应仍在运行: {stdout}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1388,7 +1500,9 @@ fn logs_follows_daemon_and_exits_on_stop() {
     let cfg_file = dir.path().join("logs.toml");
     std::fs::write(
         &cfg_file,
-        format!("base_url = \"https://logs-test.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
+        format!(
+            "base_url = \"https://logs-test.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"
+        ),
     )
     .unwrap();
     let exe = env!("CARGO_BIN_EXE_aproxy");
@@ -1542,7 +1656,10 @@ fn logs_requires_port_when_multiple_instances() {
 fn logs_reports_missing_instance() {
     let port = daemon_test_port(6); // 从未在该端口启动守护
     let exe = env!("CARGO_BIN_EXE_aproxy");
-    let out = Command::new(exe).args(["logs", &port.to_string()]).output().unwrap();
+    let out = Command::new(exe)
+        .args(["logs", &port.to_string()])
+        .output()
+        .unwrap();
     assert!(!out.status.success(), "无实例时 logs 应失败");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(

@@ -364,6 +364,9 @@ mod tests {
             reqwest::header::CONTENT_TYPE,
             "application/json".parse().unwrap(),
         );
-        assert!(!is_streaming_response(&headers, br#"{"content":"data: not a stream"}"#));
+        assert!(!is_streaming_response(
+            &headers,
+            br#"{"content":"data: not a stream"}"#
+        ));
     }
 }

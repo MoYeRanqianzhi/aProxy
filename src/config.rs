@@ -333,15 +333,20 @@ mod tests {
             ..Default::default()
         };
         cfg.api_key = Some("sk-test".to_string());
-        cfg.extra_headers.insert("x-extra".to_string(), "1".to_string());
-        cfg.override_headers.insert("authorization".to_string(), "Bearer x".to_string());
+        cfg.extra_headers
+            .insert("x-extra".to_string(), "1".to_string());
+        cfg.override_headers
+            .insert("authorization".to_string(), "Bearer x".to_string());
         save_to(&path, &cfg).unwrap();
         let loaded = load_from(&path);
         assert_eq!(loaded.base_url, cfg.base_url);
         assert_eq!(loaded.listen_addr, cfg.listen_addr);
         assert_eq!(loaded.api_key, cfg.api_key);
         assert_eq!(loaded.extra_headers.get("x-extra").unwrap(), "1");
-        assert_eq!(loaded.override_headers.get("authorization").unwrap(), "Bearer x");
+        assert_eq!(
+            loaded.override_headers.get("authorization").unwrap(),
+            "Bearer x"
+        );
     }
 
     #[test]
@@ -476,12 +481,18 @@ mod tests {
     #[test]
     fn validate_rejects_base_url_with_query_or_fragment() {
         // 带 query/fragment 的 base_url 拼接 path 时会把路径拼进 query，静默错路由
-        for p in ["https://api.example.com?v=1", "https://api.example.com#frag"] {
+        for p in [
+            "https://api.example.com?v=1",
+            "https://api.example.com#frag",
+        ] {
             let cfg = Config {
                 base_url: p.to_string(),
                 ..Default::default()
             };
-            assert!(cfg.validate().is_err(), "应拒绝含 query/fragment 的 base_url {p}");
+            assert!(
+                cfg.validate().is_err(),
+                "应拒绝含 query/fragment 的 base_url {p}"
+            );
         }
         // 带路径前缀仍合法（如反向代理子路径）
         let cfg = Config {
@@ -518,7 +529,10 @@ mod tests {
         assert_eq!(cfg.extra_headers.get("x-a").map(String::as_str), Some("v1"));
         assert!(cfg.extra_headers.get("x-a") != cfg.extra_headers.get("  x-a  "));
         assert!(!cfg.extra_headers.contains_key("   "));
-        assert_eq!(cfg.override_headers.get("x-b").map(String::as_str), Some(""));
+        assert_eq!(
+            cfg.override_headers.get("x-b").map(String::as_str),
+            Some("")
+        );
     }
 
     #[test]

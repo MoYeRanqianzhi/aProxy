@@ -73,47 +73,52 @@ enum Commands {
     },
 
     /// 查看或修改配置（配置文件位于 ~/.aproxy/config.toml）
-    Config {
-        /// 设置上游 base URL，例如 https://api.anthropic.com
-        #[arg(long, value_name = "URL")]
-        baseurl: Option<String>,
-        /// 设置监听地址，例如 127.0.0.1:12345
-        #[arg(long, value_name = "ADDR")]
-        listen: Option<String>,
-        /// 快捷设置 api_key（等效覆盖 Authorization: Bearer <key>）
-        #[arg(long, value_name = "KEY")]
-        api_key: Option<String>,
-        /// 额外请求头（仅当未携带时追加），格式 key=value，可重复
-        #[arg(long = "extra-header", value_name = "KEY=VALUE")]
-        extra_headers: Vec<String>,
-        /// 覆盖请求头（无条件覆盖），格式 key=value，可重复
-        #[arg(long = "override-header", value_name = "KEY=VALUE")]
-        override_headers: Vec<String>,
-        /// 保活心跳间隔秒数，0 表示关闭
-        #[arg(long, value_name = "SECS")]
-        keepalive_secs: Option<u64>,
-        /// 设置上游代理 URL，例如 http://127.0.0.1:7890 或 socks5://user:pass@127.0.0.1:7890
-        #[arg(long, value_name = "URL")]
-        proxy: Option<String>,
-        /// 设置代理用户名（可选，优先于 URL 内嵌的用户名）
-        #[arg(long, value_name = "USER")]
-        proxy_username: Option<String>,
-        /// 设置代理密码（可选，优先于 URL 内嵌的密码）
-        #[arg(long, value_name = "PASS")]
-        proxy_password: Option<String>,
-        /// 清空已配置的 api_key
-        #[arg(long)]
-        clear_api_key: bool,
-        /// 清空 extra/override 头
-        #[arg(long)]
-        clear_headers: bool,
-        /// 清空代理配置（URL、用户名、密码）
-        #[arg(long)]
-        clear_proxy: bool,
-        /// 打印当前配置及文件路径
-        #[arg(long)]
-        show: bool,
-    },
+    Config(ConfigArgs),
+}
+
+/// `aproxy config` 的参数集。独立成结构体以整体传递给处理函数，
+/// 避免 main 与函数之间逐字段搬运十几个参数。
+#[derive(clap::Args, Debug)]
+struct ConfigArgs {
+    /// 设置上游 base URL，例如 https://api.anthropic.com
+    #[arg(long, value_name = "URL")]
+    baseurl: Option<String>,
+    /// 设置监听地址，例如 127.0.0.1:12345
+    #[arg(long, value_name = "ADDR")]
+    listen: Option<String>,
+    /// 快捷设置 api_key（等效覆盖 Authorization: Bearer <key>）
+    #[arg(long, value_name = "KEY")]
+    api_key: Option<String>,
+    /// 额外请求头（仅当未携带时追加），格式 key=value，可重复
+    #[arg(long = "extra-header", value_name = "KEY=VALUE")]
+    extra_headers: Vec<String>,
+    /// 覆盖请求头（无条件覆盖），格式 key=value，可重复
+    #[arg(long = "override-header", value_name = "KEY=VALUE")]
+    override_headers: Vec<String>,
+    /// 保活心跳间隔秒数，0 表示关闭
+    #[arg(long, value_name = "SECS")]
+    keepalive_secs: Option<u64>,
+    /// 设置上游代理 URL，例如 http://127.0.0.1:7890 或 socks5://user:pass@127.0.0.1:7890
+    #[arg(long, value_name = "URL")]
+    proxy: Option<String>,
+    /// 设置代理用户名（可选，优先于 URL 内嵌的用户名）
+    #[arg(long, value_name = "USER")]
+    proxy_username: Option<String>,
+    /// 设置代理密码（可选，优先于 URL 内嵌的密码）
+    #[arg(long, value_name = "PASS")]
+    proxy_password: Option<String>,
+    /// 清空已配置的 api_key
+    #[arg(long)]
+    clear_api_key: bool,
+    /// 清空 extra/override 头
+    #[arg(long)]
+    clear_headers: bool,
+    /// 清空代理配置（URL、用户名、密码）
+    #[arg(long)]
+    clear_proxy: bool,
+    /// 打印当前配置及文件路径
+    #[arg(long)]
+    show: bool,
 }
 
 #[tokio::main]
@@ -140,38 +145,7 @@ async fn main() {
         Some(Commands::Status) => handle_status_cmd().await,
         Some(Commands::Stop { target }) => handle_stop_cmd(target).await,
         Some(Commands::Logs { target }) => handle_logs_cmd(target).await,
-        Some(Commands::Config {
-            baseurl,
-            listen,
-            api_key,
-            extra_headers,
-            override_headers,
-            keepalive_secs,
-            proxy,
-            proxy_username,
-            proxy_password,
-            clear_api_key,
-            clear_headers,
-            clear_proxy,
-            show,
-        }) => {
-            handle_config_cmd(
-                cfg_path,
-                baseurl,
-                listen,
-                api_key,
-                extra_headers,
-                override_headers,
-                keepalive_secs,
-                proxy,
-                proxy_username,
-                proxy_password,
-                clear_api_key,
-                clear_headers,
-                clear_proxy,
-                show,
-            );
-        }
+        Some(Commands::Config(args)) => handle_config_cmd(cfg_path, args),
         None => handle_start_cmd(&cli, cfg_path).await,
     }
 }
@@ -256,7 +230,10 @@ async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf) {
     if let Ok(info) = daemon::ipc_ping(&port).await {
         if info.listen_addr == listen_addr {
             println!("此端口已有 aProxy 在运行，无需重复启动：");
-            println!("  pid {}  监听 http://{}  v{}", info.pid, info.listen_addr, info.version);
+            println!(
+                "  pid {}  监听 http://{}  v{}",
+                info.pid, info.listen_addr, info.version
+            );
             println!("查看实例: aproxy status    停止: aproxy stop {port}");
             return;
         }
@@ -276,7 +253,10 @@ async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf) {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         if let Ok(info) = daemon::ipc_ping(&port).await {
             println!("此端口已有 aProxy 在运行，无需重复启动：");
-            println!("  pid {}  监听 http://{}  v{}", info.pid, info.listen_addr, info.version);
+            println!(
+                "  pid {}  监听 http://{}  v{}",
+                info.pid, info.listen_addr, info.version
+            );
             println!("查看实例: aproxy status    停止: aproxy stop {port}");
             return;
         }
@@ -294,12 +274,11 @@ async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf) {
     // 都不应依赖进程工作目录（用 absolute 而非 canonicalize，避免 Windows 的
     // \\?\ verbatim 前缀混进注册表与命令行）。
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(i) = args.iter().position(|a| a == "--config") {
-        if let Some(val) = args.get_mut(i + 1) {
-            if let Ok(abs) = std::path::absolute(val.as_str()) {
-                *val = abs.display().to_string();
-            }
-        }
+    if let Some(i) = args.iter().position(|a| a == "--config")
+        && let Some(val) = args.get_mut(i + 1)
+        && let Ok(abs) = std::path::absolute(val.as_str())
+    {
+        *val = abs.display().to_string();
     }
     args.push("--daemon-child".to_string());
     let exe = std::env::current_exe().expect("无法定位自身可执行文件");
@@ -335,7 +314,10 @@ async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf) {
             println!("  Base URL: {}", mask_base_url(&cfg.base_url));
             if !cfg.base_url.is_empty() {
                 let base = cfg.base_url.trim_end_matches('/');
-                println!("  提示: 将你的 API base URL 指向 http://{}", info.listen_addr);
+                println!(
+                    "  提示: 将你的 API base URL 指向 http://{}",
+                    info.listen_addr
+                );
                 println!("        上游路径与查询参数将完整透传到 {base}/<path>?<query>");
             }
             println!("  配置: {}", cfg_path.display());
@@ -386,10 +368,7 @@ async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemon_child: bo
             std::process::exit(1);
         }
     };
-    let actual_addr = listener
-        .local_addr()
-        .expect("获取监听地址失败")
-        .to_string();
+    let actual_addr = listener.local_addr().expect("获取监听地址失败").to_string();
     let port = daemon::port_of(&actual_addr).to_string();
 
     // 注册实例信息（bind 成功后才写，避免留下死记录）
@@ -499,20 +478,20 @@ async fn handle_status_cmd() {
 /// `aproxy stop [PORT|all]`：单个实例可省略参数；多实例必须指定端口号或 all。
 async fn handle_stop_cmd(target: Option<String>) {
     // 指定端口时不依赖注册表：直接按端口 IPC 定位（注册表丢失也能停）
-    if let Some(target) = target.as_deref() {
-        if target != "all" {
-            let port = daemon::port_of(target).to_string();
-            let info = match daemon::ipc_ping(&port).await {
-                Ok(info) => info,
-                Err(_) => {
-                    println!("端口 {port} 上没有运行中的 aProxy 实例。");
-                    println!("（若该端口被其他程序占用，与本工具无关）");
-                    std::process::exit(1);
-                }
-            };
-            stop_instance(&info).await;
-            return;
-        }
+    if let Some(target) = target.as_deref()
+        && target != "all"
+    {
+        let port = daemon::port_of(target).to_string();
+        let info = match daemon::ipc_ping(&port).await {
+            Ok(info) => info,
+            Err(_) => {
+                println!("端口 {port} 上没有运行中的 aProxy 实例。");
+                println!("（若该端口被其他程序占用，与本工具无关）");
+                std::process::exit(1);
+            }
+        };
+        stop_instance(&info).await;
+        return;
     }
 
     let instances = daemon::list_instances().await;
@@ -632,7 +611,8 @@ async fn follow_log_file(path: &std::path::Path, port: &str) -> Result<(), Strin
     let mut file = std::fs::File::open(path).map_err(|e| format!("无法打开日志文件: {e}"))?;
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
     let start = len.saturating_sub(TAIL_WINDOW);
-    file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
     if start > 0 {
@@ -660,7 +640,7 @@ async fn follow_log_file(path: &std::path::Path, port: &str) -> Result<(), Strin
     loop {
         tokio::time::sleep(Duration::from_millis(POLL_MS)).await;
         polls += 1;
-        if polls % PING_EVERY == 0 && daemon::ipc_ping(port).await.is_err() {
+        if polls.is_multiple_of(PING_EVERY) && daemon::ipc_ping(port).await.is_err() {
             // 实例已退出（ping 内部含判死重试）：冲掉残余半行后结束
             if !pending.is_empty() {
                 let _ = out.write_all(&pending);
@@ -714,11 +694,10 @@ fn report_config_error(msg: &str, daemon_child: bool) {
                 .open(path)
                 .ok()
         };
-        let mut file = open(&daemon::logs_dir().join("startup.log"))
-            .or_else(|| {
-                let _ = std::fs::create_dir_all(config::config_dir());
-                open(&config::config_dir().join("startup.log"))
-            });
+        let mut file = open(&daemon::logs_dir().join("startup.log")).or_else(|| {
+            let _ = std::fs::create_dir_all(config::config_dir());
+            open(&config::config_dir().join("startup.log"))
+        });
         if let Some(f) = file.as_mut() {
             use std::io::Write;
             let _ = writeln!(f, "[{}] {msg}", chrono_like_timestamp());
@@ -766,12 +745,16 @@ fn init_stdout_logging() {
 fn init_daemon_logging(listen_addr: &str) {
     let _ = std::fs::create_dir_all(daemon::logs_dir());
     let path = daemon::logs_dir().join(format!("{}.log", daemon::port_of(listen_addr)));
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() > 2 * 1024 * 1024 {
-            let _ = std::fs::write(&path, b"");
-        }
+    if let Ok(meta) = std::fs::metadata(&path)
+        && meta.len() > 2 * 1024 * 1024
+    {
+        let _ = std::fs::write(&path, b"");
     }
-    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         Ok(file) => {
             tracing_subscriber::fmt()
                 .with_env_filter(
@@ -840,112 +823,43 @@ fn mask_base_url(raw: &str) -> String {
     let host = url.host_str().unwrap_or("");
     let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
     let path = url.path();
-    format!("{}://{}:***@{}{}{}", url.scheme(), url.username(), host, port, path)
+    format!(
+        "{}://{}:***@{}{}{}",
+        url.scheme(),
+        url.username(),
+        host,
+        port,
+        path
+    )
 }
 
 /// 展示前守卫：配置文件存在但解析失败时 load() 会静默回退默认值，`--show` 打印的
 /// 「当前配置」并非用户文件的真实内容——至少要警告，避免误导排障。
 fn warn_if_config_broken(path: &std::path::Path) {
-    if let Ok(content) = std::fs::read_to_string(path) {
-        if let Err(e) = toml::from_str::<aproxy::config::Config>(&content) {
-            eprintln!("警告: 配置文件解析失败，以下展示的是回退默认值而非文件内容");
-            eprintln!("解析错误: {e}");
-        }
+    if let Ok(content) = std::fs::read_to_string(path)
+        && let Err(e) = toml::from_str::<aproxy::config::Config>(&content)
+    {
+        eprintln!("警告: 配置文件解析失败，以下展示的是回退默认值而非文件内容");
+        eprintln!("解析错误: {e}");
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mask_secret_keeps_prefix_and_masks_rest() {
-        // 保留前 6 个字符
-        assert_eq!(mask_secret("sk-ant-api03-abcdef"), "sk-ant***");
-        assert_eq!(mask_secret("abc"), "abc***");
-        assert_eq!(mask_secret(""), "***");
-    }
-
-    #[test]
-    fn mask_secret_multibyte_no_panic() {
-        // 按 char 截断，多字节字符不会在字节边界 panic
-        assert_eq!(mask_secret("你好世界，测试"), "你好世界，测***");
-    }
-
-    #[test]
-    fn mask_proxy_url_variants() {
-        // 无凭据原样返回
-        assert_eq!(
-            mask_proxy_url("http://127.0.0.1:7890"),
-            "http://127.0.0.1:7890"
-        );
-        // 有密码打码
-        assert_eq!(
-            mask_proxy_url("http://alice:secret@127.0.0.1:7890"),
-            "http://alice:***@127.0.0.1:7890"
-        );
-        // 仅用户名不加 ":***@"
-        assert_eq!(
-            mask_proxy_url("socks5://alice@127.0.0.1:1080"),
-            "socks5://alice@127.0.0.1:1080"
-        );
-        // 解析失败回安全占位而非原文（原文可能含密码）
-        assert_eq!(mask_proxy_url("not a url"), "<无法解析的代理配置，已隐去>");
-        // query 保留
-        assert_eq!(
-            mask_proxy_url("http://alice:pw@h:1?p=x"),
-            "http://alice:***@h:1?p=x"
-        );
-    }
-
-    #[test]
-    fn mask_base_url_variants() {
-        // 无凭据原样返回（绝大多数情况）
-        assert_eq!(
-            mask_base_url("https://api.anthropic.com/v1"),
-            "https://api.anthropic.com/v1"
-        );
-        // 内嵌密码打码，路径保留
-        assert_eq!(
-            mask_base_url("https://alice:secret@example.com/anthropic"),
-            "https://alice:***@example.com/anthropic"
-        );
-        // 解析失败原样返回（base_url 已过 validate，此处不会发生）
-        assert_eq!(mask_base_url("::bad::"), "::bad::");
-    }
-
-    #[test]
-    fn parse_kv_variants() {
-        assert_eq!(
-            parse_kv("x-key = some value"),
-            Some(("x-key".into(), "some value".into()))
-        );
-        // 值中允许 '='：只按第一个 '=' 切分
-        assert_eq!(
-            parse_kv("authorization=Bearer a=b"),
-            Some(("authorization".into(), "Bearer a=b".into()))
-        );
-        assert_eq!(parse_kv("no-equals"), None);
-        assert_eq!(parse_kv("  =value"), None);
-    }
-}
-
-fn handle_config_cmd(
-    path: PathBuf,
-    baseurl: Option<String>,
-    listen: Option<String>,
-    api_key: Option<String>,
-    extra_headers: Vec<String>,
-    override_headers: Vec<String>,
-    keepalive_secs: Option<u64>,
-    proxy: Option<String>,
-    proxy_username: Option<String>,
-    proxy_password: Option<String>,
-    clear_api_key: bool,
-    clear_headers: bool,
-    clear_proxy: bool,
-    show: bool,
-) {
+fn handle_config_cmd(path: PathBuf, args: ConfigArgs) {
+    let ConfigArgs {
+        baseurl,
+        listen,
+        api_key,
+        extra_headers,
+        override_headers,
+        keepalive_secs,
+        proxy,
+        proxy_username,
+        proxy_password,
+        clear_api_key,
+        clear_headers,
+        clear_proxy,
+        show,
+    } = args;
     let mut cfg = config::load_from(&path);
 
     let mut changed = false;
@@ -1030,7 +944,10 @@ fn handle_config_cmd(
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
                     if let Err(e) = toml::from_str::<aproxy::config::Config>(&content) {
-                        eprintln!("现有配置文件解析失败，拒绝覆盖（请先修复或删除 {}）", path.display());
+                        eprintln!(
+                            "现有配置文件解析失败，拒绝覆盖（请先修复或删除 {}）",
+                            path.display()
+                        );
                         eprintln!("解析错误: {e}");
                         std::process::exit(1);
                     }
@@ -1044,11 +961,11 @@ fn handle_config_cmd(
         cfg = cfg.normalized();
         // 保存前校验已设置的 base_url 格式（允许为空——首次配置可分多次完成，中间态
         // 合法）；否则 query 形式的 base_url 会被存盘，直到下次启动才报错
-        if !cfg.base_url.is_empty() {
-            if let Err(msg) = cfg.validate_base_url() {
-                eprintln!("base_url 无效，未保存: {msg}");
-                std::process::exit(1);
-            }
+        if !cfg.base_url.is_empty()
+            && let Err(msg) = cfg.validate_base_url()
+        {
+            eprintln!("base_url 无效，未保存: {msg}");
+            std::process::exit(1);
         }
         match config::save_to(&path, &cfg) {
             Ok(()) => println!("已保存配置到 {}", path.display()),
@@ -1084,9 +1001,7 @@ fn handle_config_cmd(
         );
         println!(
             "proxy_username = {}",
-            cfg.proxy_username
-                .as_deref()
-                .unwrap_or("(未设置)")
+            cfg.proxy_username.as_deref().unwrap_or("(未设置)")
         );
         println!(
             "proxy_password = {}",
@@ -1122,9 +1037,7 @@ fn handle_config_cmd(
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("安装 Ctrl+C 监听失败");
+        tokio::signal::ctrl_c().await.expect("安装 Ctrl+C 监听失败");
     };
 
     #[cfg(unix)]
@@ -1143,4 +1056,80 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     // 停止原因的日志由调用方 stop_signal 统一输出
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_secret_keeps_prefix_and_masks_rest() {
+        // 保留前 6 个字符
+        assert_eq!(mask_secret("sk-ant-api03-abcdef"), "sk-ant***");
+        assert_eq!(mask_secret("abc"), "abc***");
+        assert_eq!(mask_secret(""), "***");
+    }
+
+    #[test]
+    fn mask_secret_multibyte_no_panic() {
+        // 按 char 截断，多字节字符不会在字节边界 panic
+        assert_eq!(mask_secret("你好世界，测试"), "你好世界，测***");
+    }
+
+    #[test]
+    fn mask_proxy_url_variants() {
+        // 无凭据原样返回
+        assert_eq!(
+            mask_proxy_url("http://127.0.0.1:7890"),
+            "http://127.0.0.1:7890"
+        );
+        // 有密码打码
+        assert_eq!(
+            mask_proxy_url("http://alice:secret@127.0.0.1:7890"),
+            "http://alice:***@127.0.0.1:7890"
+        );
+        // 仅用户名不加 ":***@"
+        assert_eq!(
+            mask_proxy_url("socks5://alice@127.0.0.1:1080"),
+            "socks5://alice@127.0.0.1:1080"
+        );
+        // 解析失败回安全占位而非原文（原文可能含密码）
+        assert_eq!(mask_proxy_url("not a url"), "<无法解析的代理配置，已隐去>");
+        // query 保留
+        assert_eq!(
+            mask_proxy_url("http://alice:pw@h:1?p=x"),
+            "http://alice:***@h:1?p=x"
+        );
+    }
+
+    #[test]
+    fn mask_base_url_variants() {
+        // 无凭据原样返回（绝大多数情况）
+        assert_eq!(
+            mask_base_url("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1"
+        );
+        // 内嵌密码打码，路径保留
+        assert_eq!(
+            mask_base_url("https://alice:secret@example.com/anthropic"),
+            "https://alice:***@example.com/anthropic"
+        );
+        // 解析失败原样返回（base_url 已过 validate，此处不会发生）
+        assert_eq!(mask_base_url("::bad::"), "::bad::");
+    }
+
+    #[test]
+    fn parse_kv_variants() {
+        assert_eq!(
+            parse_kv("x-key = some value"),
+            Some(("x-key".into(), "some value".into()))
+        );
+        // 值中允许 '='：只按第一个 '=' 切分
+        assert_eq!(
+            parse_kv("authorization=Bearer a=b"),
+            Some(("authorization".into(), "Bearer a=b".into()))
+        );
+        assert_eq!(parse_kv("no-equals"), None);
+        assert_eq!(parse_kv("  =value"), None);
+    }
 }

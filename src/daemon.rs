@@ -304,8 +304,50 @@ pub fn remove_instance_file(listen_addr: &str) {
 }
 
 /// 列出注册表中的实例并逐个 IPC ping 验活；已死亡/损坏的记录直接清理残留文件。
+/// 顺带清理孤儿日志（status 是唯一可靠的清理时机）。
 pub async fn list_instances() -> Vec<InstanceInfo> {
-    list_instances_in(&run_dir()).await
+    let live = list_instances_in(&run_dir()).await;
+    cleanup_orphan_logs_in(&logs_dir(), &live, &list_restore_entries());
+    live
+}
+
+/// 清理孤儿日志：日志目录中 `<端口>.log` 的端口既无存活实例、也无 .restore
+/// 恢复记录时删除。startup.log 不按端口归属，跳过。
+/// .restore 在此**保留不删**：它的语义是「期望恢复」——崩溃实例恰恰要靠它
+/// 存活到 `aproxy restore` 执行；先跑一次 status 就把记录清掉会让自愈失效。
+/// 崩溃待恢复实例的日志同理保留（排障线索，复活后同端口继续追加）。
+/// 目录与待恢复清单参数化（测试注入用）。
+fn cleanup_orphan_logs_in(
+    logs_dir: &std::path::Path,
+    live: &[InstanceInfo],
+    pending_restore: &[RestoreEntry],
+) {
+    let live_ports: std::collections::HashSet<String> = live
+        .iter()
+        .map(|i| port_of(&i.listen_addr).to_string())
+        .collect();
+    let pending_ports: std::collections::HashSet<String> =
+        pending_restore.iter().map(|e| e.port.clone()).collect();
+
+    let Ok(entries) = std::fs::read_dir(logs_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if path.extension().and_then(|e| e.to_str()) != Some("log") || stem == "startup" {
+            continue;
+        }
+        // 只清理端口命名的日志（防御：目录里若有非端口命名文件一律不动）
+        if stem.parse::<u16>().is_err() {
+            continue;
+        }
+        if !live_ports.contains(stem) && !pending_ports.contains(stem) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// 同上，目录可指定（测试注入用）
@@ -772,5 +814,34 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].port, "59807");
         assert!(entries[0].args.is_empty());
+    }
+
+    #[test]
+    fn orphan_log_cleanup_keeps_live_pending_and_startup() {
+        let logs = tempfile::tempdir().unwrap();
+        // 三个日志：存活实例 59811 / 待恢复（崩溃）59812 / 彻底死亡 59813；
+        // 另有 startup.log（永不按端口清理）与非数字名（防御性跳过）
+        for name in [
+            "59811.log",
+            "59812.log",
+            "59813.log",
+            "startup.log",
+            "weird.log",
+        ] {
+            std::fs::write(logs.path().join(name), "x").unwrap();
+        }
+        let live = vec![sample_info("59811")];
+        let pending = vec![RestoreEntry {
+            port: "59812".into(),
+            args: vec![],
+        }];
+        cleanup_orphan_logs_in(logs.path(), &live, &pending);
+        for kept in ["59811.log", "59812.log", "startup.log", "weird.log"] {
+            assert!(logs.path().join(kept).exists(), "{kept} 不应被孤儿清理删除");
+        }
+        assert!(
+            !logs.path().join("59813.log").exists(),
+            "彻底死亡实例的孤儿日志应被删除"
+        );
     }
 }

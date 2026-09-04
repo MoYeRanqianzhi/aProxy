@@ -413,6 +413,27 @@ async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemon_child: bo
         }
     });
 
+    // 运行期日志轮转：守护日志只在启动时做过一次 2MiB 检查，长期运行的实例
+    // （正是本项目的目标形态）仍会无限膨胀。每小时检查一次，超限截断；
+    // `aproxy logs` 跟随器已有截断检测（文件变小时自动从头重跟），不会被破坏。
+    // 仅守护实例执行——前台实例的日志走控制台，无文件可轮转。
+    if daemon_child {
+        let rotate_path = daemon::logs_dir().join(format!("{port}.log"));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                if let Ok(meta) = std::fs::metadata(&rotate_path)
+                    && meta.len() > 8 * 1024 * 1024
+                {
+                    // 截断而非 rename 轮转：跟随器与启动时的 2MiB 检查都按
+                    // 「文件变小」设计，且不产生需要再治理的轮转文件堆
+                    let _ = std::fs::write(&rotate_path, b"");
+                    tracing::info!("日志文件超过 8MiB，已截断");
+                }
+            }
+        });
+    }
+
     // 日志与控制台都可能被粘贴分享，内嵌凭据的 base_url 一律打码后输出
     tracing::info!(
         listen = %actual_addr,

@@ -1,0 +1,94 @@
+# aProxy
+
+本地 API 代理：为 agent 软件的请求提供**无限重试**与**不中断保障**。
+
+上游过载、断流、超时……aProxy 在本地完整缓冲请求与流式响应（SSE 逐块暂存），失败自动重试（指数退避，间隔封顶 320s），期间向客户端注入 SSE 注释心跳保活连接，成功后原样回放——客户端零感知，工作流不中断。
+
+## 特性
+
+- **无限重试**：网络错误、5xx、错误 JSON（200 携带 error）都触发重试；客户端断开即中止上游请求（计费保护）
+- **完全透传**：路径、查询、请求头原样转发；端口只做透传（控制通道走独立 IPC，绝不占用代理端口）
+- **后台守护**：`aproxy` 默认后台启动（分离子进程，关终端不掉）；`status` / `stop` / `logs` / `restore` 全套实例管理
+- **多开**：`--config` 各自指定配置文件与端口，多实例并存
+- **自愈**：崩溃/断电/系统重启后 `aproxy restore` 一键恢复，空清单静默成功——可配置为开机自启
+
+## 安装
+
+```powershell
+git clone https://github.com/MoYeRanQianZhi/aProxy.git
+cd aProxy
+cargo build --release
+# 可执行文件: target/release/aproxy.exe
+```
+
+要求 Rust 1.85+（edition 2024）。
+
+## 快速开始
+
+```powershell
+# 1. 配置上游（交互写入 ~/.aproxy/config.toml）
+aproxy config --baseurl https://api.anthropic.com --api-key sk-ant-...
+
+# 2. 启动（默认后台）
+aproxy
+
+# 3. 把 agent 软件的 API base URL 指向本地代理
+#    https://api.anthropic.com  →  http://127.0.0.1:12345
+```
+
+## 命令
+
+| 命令 | 说明 |
+|---|---|
+| `aproxy` | 后台启动代理（默认端口 127.0.0.1:12345） |
+| `aproxy --foreground` | 前台运行（日志走控制台，Ctrl+C 停止） |
+| `aproxy status` | 列出运行中的实例（端口/pid/版本/上游/配置） |
+| `aproxy stop [PORT\|all]` | 停止实例；单实例可省略，多实例必须指定端口或 `all` |
+| `aproxy logs [PORT]` | 连接实例实时输出日志；单实例可省略；不支持 `all` |
+| `aproxy restore` | 恢复崩溃/重启前在运行的实例；无实例则静默结束（开机自启友好） |
+| `aproxy config [选项]` | 查看或修改配置（`--show` 打印当前配置） |
+
+通用参数：`--config <PATH>`（指定配置文件，多开用）、`--listen <ADDR>`、`--proxy <URL>`、`--api-key <KEY>`（启动路径仅本次生效）。
+
+## 多开
+
+```powershell
+aproxy --config ~/.aproxy/work.toml      # listen_addr = "127.0.0.1:12345"
+aproxy --config ~/.aproxy/personal.toml  # listen_addr = "127.0.0.1:12346"
+aproxy status                            # 两个实例都可见
+aproxy stop 12346                        # 按端口管理
+```
+
+## 开机自启（可选）
+
+任务计划程序创建「登录时运行」任务，操作指向 `aproxy.exe`，参数 `restore`。
+之前在运行的实例自动恢复；之前全关了则静默结束，无副作用。
+
+## 配置文件
+
+`~/.aproxy/config.toml`（多开时各配置文件独立）：
+
+```toml
+base_url = "https://api.anthropic.com"   # 上游地址
+listen_addr = "127.0.0.1:12345"          # 本地监听
+# api_key = "sk-..."                     # 快捷鉴权（等效覆盖 Authorization: Bearer）
+# keepalive_interval_secs = 15           # 重试期间 SSE 心跳间隔，0 关闭
+# proxy = "http://127.0.0.1:7890"        # 上游经代理转发（支持 socks5，可配用户名密码）
+# extra_headers / override_headers       # 追加/覆盖请求头
+```
+
+运行数据在 `~/.aproxy/`：`run/`（实例注册与恢复记录）、`logs/`（守护日志，自动清理与轮转）。
+
+## 开发
+
+```powershell
+cargo test          # 全量测试（69 单测 + 28 集成）
+cargo clippy --all-targets   # 必须零警告（项目纪律）
+cargo fmt --check
+```
+
+架构与开发文档见 [`docs/`](docs/)；面向 agent 的开发文档在 `.agents/docs/`。
+
+## License
+
+MIT

@@ -72,6 +72,11 @@ enum Commands {
         target: Option<String>,
     },
 
+    /// 一键恢复先前在运行、因崩溃/断电/系统重启而消失的实例。
+    /// 无可恢复实例时静默结束（适合配置为开机自启）。
+    /// 已在运行的实例自动跳过；配置文件已不存在的记录被清理。
+    Restore,
+
     /// 查看或修改配置（配置文件位于 ~/.aproxy/config.toml）
     Config(ConfigArgs),
 }
@@ -145,6 +150,7 @@ async fn main() {
         Some(Commands::Status) => handle_status_cmd().await,
         Some(Commands::Stop { target }) => handle_stop_cmd(target).await,
         Some(Commands::Logs { target }) => handle_logs_cmd(target).await,
+        Some(Commands::Restore) => handle_restore_cmd().await,
         Some(Commands::Config(args)) => handle_config_cmd(cfg_path, args),
         None => handle_start_cmd(&cli, cfg_path).await,
     }
@@ -384,6 +390,19 @@ async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemon_child: bo
         tracing::warn!(error = %e, "实例注册表写入失败（不影响代理功能）");
     }
 
+    // 自愈恢复记录：bind 成功即认为「此实例期望在运行」。记录的是启动参数
+    // （从当前进程命令行取，即 start 父进程转发来的原始参数），崩溃/断电/
+    // 系统重启后 aproxy restore 据此一键拉起；优雅退出时删除。前台实例也写
+    // （前台被终端关闭属非正常退出，恢复合理）。
+    let restore_args: Vec<String> = {
+        let mut v: Vec<String> = std::env::args().skip(1).collect();
+        v.retain(|a| a != "--daemon-child" && a != "--foreground");
+        v
+    };
+    if let Err(e) = daemon::write_restore_file(&listen_addr, &restore_args) {
+        tracing::warn!(error = %e, "自愈恢复记录写入失败（不影响代理功能）");
+    }
+
     // IPC 控制通道：ping/shutdown 走命名管道，与代理端口完全隔离
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let ipc_port = port.clone();
@@ -421,10 +440,12 @@ async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemon_child: bo
             tracing::info!("10 秒后强制退出（在途请求将中断）");
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             daemon::remove_instance_file(&actual_addr);
+            daemon::remove_restore_file(&actual_addr);
             std::process::exit(0);
         } => {}
     }
     daemon::remove_instance_file(&actual_addr);
+    daemon::remove_restore_file(&actual_addr);
     tracing::info!("aProxy 已停止");
 }
 
@@ -537,6 +558,68 @@ async fn stop_instance(info: &daemon::InstanceInfo) {
     }
 }
 
+/// `aproxy restore`：一键恢复先前非正常退出（崩溃/断电/系统重启）的实例。
+///
+/// 依据 run/<端口>.restore 恢复记录（守护 bind 成功时写入、优雅退出时删除）。
+/// 空清单时静默成功而非报错——本命令的典型用法是配置为开机自启，重启后
+/// 「之前全关了」是正常状态而非故障。幂等：已在运行的实例跳过，可重复执行。
+async fn handle_restore_cmd() {
+    let entries = daemon::list_restore_entries();
+    if entries.is_empty() {
+        println!("没有需要恢复的实例。");
+        return;
+    }
+    let exe = std::env::current_exe().expect("无法定位自身可执行文件");
+    for entry in entries {
+        // 幂等：记录存在但实例已被手工拉起（或同端口重启过）时，不重复启动
+        if daemon::ipc_ping(&entry.port).await.is_ok() {
+            println!("端口 {} 已在运行，跳过。", entry.port);
+            continue;
+        }
+        // 配置文件已被删除的记录无法忠实恢复，清理之（下次 restore 不再重试）
+        let cfg_arg = entry
+            .args
+            .iter()
+            .position(|a| a == "--config")
+            .and_then(|i| entry.args.get(i + 1));
+        if let Some(cfg) = cfg_arg
+            && !std::path::Path::new(cfg).exists()
+        {
+            println!(
+                "端口 {} 的配置文件已不存在（{}），跳过并清理该记录。",
+                entry.port, cfg
+            );
+            daemon::remove_restore_file(&entry.port);
+            continue;
+        }
+        let mut args = entry.args.clone();
+        args.push("--daemon-child".to_string());
+        match daemon::spawn_detached(&exe, &args) {
+            Ok(pid) => {
+                // 与 start 相同的就绪判定：IPC ping 通才算恢复成功（轮询 8 秒，
+                // 冷启动受 Defender 扫描等影响可能偏慢）
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+                loop {
+                    if daemon::ipc_ping(&entry.port).await.is_ok() {
+                        println!("已恢复 pid {pid}（端口 {}）", entry.port);
+                        break;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        eprintln!(
+                            "端口 {} 的实例（pid {pid}）未在预期时间内就绪，原因通常记录在 {}",
+                            entry.port,
+                            daemon::logs_dir().join("startup.log").display()
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+            Err(e) => eprintln!("端口 {} 恢复失败: {e}", entry.port),
+        }
+    }
+}
+
 /// `aproxy logs [PORT]`：连接到运行中的实例并实时输出其守护日志。
 /// 语义与 stop 一致：单实例可省略端口；多实例必须指定；不支持 all
 /// （一次只能连接一个实例，传入 all 视为端口解析失败）。
@@ -596,13 +679,23 @@ async fn follow_log_file(path: &std::path::Path, port: &str) -> Result<(), Strin
     const TAIL_LINES: usize = 30; // 首屏最多显示 30 行
     const PING_EVERY: u32 = 5; // 每 5 轮（约 1 秒）探活一次
 
-    // 等待日志文件出现（实例刚启动时 IPC 已通、日志可能尚未落盘）
+    // 等待日志文件出现（实例刚启动时 IPC 已通、日志可能尚未落盘）。限时 5 秒：
+    // 守护实例的日志文件在进程启动最先创建，5 秒未出现说明它永远不会有——
+    // 典型是 --foreground 实例（日志走控制台，但同样注册注册表、ping 可通），
+    // 不能在这里无限等待
+    let wait_deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if path.exists() {
             break;
         }
         if daemon::ipc_ping(port).await.is_err() {
             return Err("实例已退出，日志文件未生成。".to_string());
+        }
+        if std::time::Instant::now() > wait_deadline {
+            return Err(format!(
+                "日志文件迟迟未生成: {}（该实例可能以 --foreground 运行，日志输出在它的控制台）",
+                path.display()
+            ));
         }
         tokio::time::sleep(Duration::from_millis(POLL_MS)).await;
     }

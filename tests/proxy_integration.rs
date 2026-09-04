@@ -1667,3 +1667,89 @@ fn logs_reports_missing_instance() {
         "实际: {stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 28. `aproxy restore`：崩溃实例一键复活、幂等跳过、优雅停止后不再恢复
+//
+// restore 记录（run/<端口>.restore）语义：守护 bind 成功写入、优雅退出删除、
+// 崩溃/系统重启保留。此处以 taskkill /F 模拟崩溃（目标仅为本测试拉起的守护）。
+// ---------------------------------------------------------------------------
+#[test]
+fn restore_recovers_crashed_daemon_and_is_idempotent() {
+    let port = daemon_test_port(7);
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_file = dir.path().join("restore.toml");
+    std::fs::write(
+        &cfg_file,
+        format!(
+            "base_url = \"https://restore-test.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"
+        ),
+    )
+    .unwrap();
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+    let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
+    let _guard = DaemonGuard { exe, port };
+    let restore_path = aproxy::daemon::restore_file_path(&format!("127.0.0.1:{port}"));
+
+    // 正常后台启动：bind 成功即写恢复记录
+    let pid = aproxy::daemon::spawn_detached(
+        std::path::Path::new(exe),
+        &[
+            "--config".to_string(),
+            cfg_file.display().to_string(),
+            "--daemon-child".to_string(),
+        ],
+    )
+    .expect("spawn 守护子进程失败");
+    assert!(wait_daemon_ready(port), "守护未就绪 (pid {pid})");
+    assert!(
+        restore_path.exists(),
+        "守护启动后应写入恢复记录: {}",
+        restore_path.display()
+    );
+
+    // 模拟崩溃：强杀守护进程（不经过 IPC 优雅退出），恢复记录应残留
+    let killed = Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .output()
+        .expect("taskkill 执行失败");
+    assert!(killed.status.success(), "taskkill 应成功杀死测试守护");
+    let mut gone = false;
+    for _ in 0..50 {
+        if !process_alive(pid) {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(gone, "测试守护 (pid {pid}) 应已被强杀");
+    assert!(restore_path.exists(), "崩溃后恢复记录应保留");
+
+    // restore：一键拉起崩溃实例
+    let out = Command::new(exe).arg("restore").output().unwrap();
+    assert!(out.status.success(), "restore 应成功");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("已恢复") && stdout.contains(&port.to_string()),
+        "restore 应恢复实例: {stdout}"
+    );
+    assert!(wait_daemon_ready(port), "恢复后的实例应就绪");
+
+    // 幂等：再次 restore 时已在运行 → 跳过而非报错/重复启动
+    let out = Command::new(exe).arg("restore").output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("已在运行，跳过"), "幂等跳过: {stdout}");
+
+    // 优雅停止：恢复记录被删除，此后 restore 无事可做（静默成功，开机自启友好）
+    let out = Command::new(exe)
+        .args(["stop", &port.to_string()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stop 恢复实例应成功: {stdout}");
+    assert!(!restore_path.exists(), "优雅停止后恢复记录应被删除");
+    let out = Command::new(exe).arg("restore").output().unwrap();
+    assert!(out.status.success(), "无记录时 restore 应静默成功");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("没有需要恢复的实例"), "实际: {stdout}");
+}

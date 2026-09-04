@@ -340,6 +340,103 @@ pub async fn list_instances_in(dir: &std::path::Path) -> Vec<InstanceInfo> {
 }
 
 // ---------------------------------------------------------------------------
+// 自愈恢复记录（~/.aproxy/run/<port>.restore）
+//
+// 与 .pid 注册表互补：.pid 只在实例存活期间存在，而崩溃/断电/系统重启时守护
+// 进程来不及清理任何文件——restore 记录承载「期望在运行」的语义：守护 bind
+// 成功时写入当时的启动参数，优雅退出（含 `aproxy stop`）时删除，非正常死亡
+// 则保留，`aproxy restore` 据此一键拉起。注意：参数可能含 --api-key 等明文，
+// 与 config.toml 同级存放（用户主目录内），不额外加密。
+// ---------------------------------------------------------------------------
+
+/// 恢复记录文件路径：`<run_dir>/<port>.restore`
+pub fn restore_file_path(listen_addr: &str) -> PathBuf {
+    restore_file_path_in(&run_dir(), listen_addr)
+}
+
+/// 同上，目录可指定（测试注入用）
+pub fn restore_file_path_in(run_dir: &std::path::Path, listen_addr: &str) -> PathBuf {
+    run_dir.join(format!("{}.restore", port_of(listen_addr)))
+}
+
+/// 写入恢复记录：`args` 为实例的启动参数（不含 --daemon-child，恢复时统一追加）。
+/// bind 成功后调用；同端口重复启动时覆盖旧记录。
+pub fn write_restore_file(listen_addr: &str, args: &[String]) -> io::Result<()> {
+    write_restore_file_in(&run_dir(), listen_addr, args)
+}
+
+/// 同上，目录可指定（测试注入用）。原子写语义同 write_instance_file_in。
+pub fn write_restore_file_in(
+    run_dir: &std::path::Path,
+    listen_addr: &str,
+    args: &[String],
+) -> io::Result<()> {
+    std::fs::create_dir_all(run_dir)?;
+    let path = restore_file_path_in(run_dir, listen_addr);
+    let json = serde_json::to_string(args).expect("序列化恢复记录失败");
+    let tmp = path.with_extension("restore.tmp");
+    std::fs::write(&tmp, json)?;
+    match std::fs::rename(&tmp, &path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// 删除恢复记录（实例优雅退出时调用；无记录时静默）
+pub fn remove_restore_file(listen_addr: &str) {
+    remove_restore_file_in(&run_dir(), listen_addr)
+}
+
+/// 同上，目录可指定（测试注入用）
+pub fn remove_restore_file_in(run_dir: &std::path::Path, listen_addr: &str) {
+    let _ = std::fs::remove_file(restore_file_path_in(run_dir, listen_addr));
+}
+
+/// 一条恢复记录：端口 + 启动参数
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoreEntry {
+    pub port: String,
+    pub args: Vec<String>,
+}
+
+/// 列出全部恢复记录；损坏记录直接清理。不做存活校验——记录的本义就是
+/// 「实例可能已死」。
+pub fn list_restore_entries() -> Vec<RestoreEntry> {
+    list_restore_entries_in(&run_dir())
+}
+
+/// 同上，目录可指定（测试注入用）
+pub fn list_restore_entries_in(dir: &std::path::Path) -> Vec<RestoreEntry> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("restore") {
+            continue;
+        }
+        let Some(port) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
+            continue;
+        };
+        let args = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<Vec<String>>(&c).ok());
+        match args {
+            Some(args) => out.push(RestoreEntry { port, args }),
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.port.cmp(&b.port));
+    out
+}
+
+// ---------------------------------------------------------------------------
 // 通用协议层：请求-响应各一行 JSON。两个平台的传输实现共用这套编解码。
 // ---------------------------------------------------------------------------
 
@@ -628,5 +725,52 @@ mod tests {
         let listed = list_instances_in(dir.path()).await;
         assert!(listed.iter().all(|i| i.listen_addr != "127.0.0.1:59801"));
         assert!(!path.exists(), "死亡实例的注册记录应被清理");
+    }
+
+    #[test]
+    fn restore_file_roundtrip_and_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = vec![
+            "--config".to_string(),
+            "C:/tmp/cfg.toml".to_string(),
+            "--api-key".to_string(),
+            "sk-test".to_string(),
+        ];
+        write_restore_file_in(dir.path(), "127.0.0.1:59805", &args).unwrap();
+        let path = restore_file_path_in(dir.path(), "127.0.0.1:59805");
+        assert_eq!(path.file_name().unwrap(), "59805.restore");
+
+        // 覆盖写：同端口再次启动应以最新参数为准
+        let args2 = vec!["--config".to_string(), "C:/tmp/new.toml".to_string()];
+        write_restore_file_in(dir.path(), "127.0.0.1:59805", &args2).unwrap();
+
+        let entries = list_restore_entries_in(dir.path());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].port, "59805");
+        assert_eq!(entries[0].args, args2);
+
+        remove_restore_file_in(dir.path(), "127.0.0.1:59805");
+        assert!(!path.exists());
+        assert!(list_restore_entries_in(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn restore_list_cleans_corrupted_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = restore_file_path_in(dir.path(), "127.0.0.1:59806");
+        std::fs::write(&path, "{not-json").unwrap();
+        assert!(list_restore_entries_in(dir.path()).is_empty());
+        assert!(!path.exists(), "损坏的恢复记录应被清理");
+    }
+
+    #[test]
+    fn restore_entry_without_config_is_listed() {
+        // 无 --config 参数的实例（纯默认配置）也应能列出与恢复
+        let dir = tempfile::tempdir().unwrap();
+        write_restore_file_in(dir.path(), "127.0.0.1:59807", &[]).unwrap();
+        let entries = list_restore_entries_in(dir.path());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].port, "59807");
+        assert!(entries[0].args.is_empty());
     }
 }

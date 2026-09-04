@@ -12,6 +12,8 @@ use axum::{
 };
 use bytes::Bytes;
 use std::{
+    io::Read,
+    process::Stdio,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -1136,11 +1138,19 @@ fn cli_config_flag_scopes_config_subcommand() {
 // 12345 等用户可能使用的端口。
 // ---------------------------------------------------------------------------
 
-/// 从测试进程 pid 派生三个互不相同的守护测试端口（25000..=65000 区间，
-/// 避开默认端口 12345 与常见手工实例端口；最大值 65000 在 u16 范围内不回绕）。
+/// 从测试进程 pid 派生第 offset 个互不相同的守护测试端口（25000..=65000 区间，
+/// 避开默认端口 12345 与常见手工实例端口；每个测试用不同 offset，互不冲突）。
+fn daemon_test_port(offset: u32) -> u16 {
+    (25000 + (std::process::id() % 20000) * 2 + offset) as u16
+}
+
+/// 既有守护测试的三个端口（offset 0..=2）。
 fn daemon_test_ports() -> (u16, u16, u16) {
-    let base = 25000u32 + (std::process::id() % 20000) * 2;
-    (base as u16, (base + 1) as u16, (base + 2) as u16)
+    (
+        daemon_test_port(0),
+        daemon_test_port(1),
+        daemon_test_port(2),
+    )
 }
 
 /// 守护清理守卫：Drop 时对测试派生端口执行 `aproxy stop`。
@@ -1364,5 +1374,179 @@ fn start_parent_command_output_returns() {
     assert!(
         stdout.contains("已在后台启动"),
         "start 父进程应报告后台启动，实际: {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 25. `aproxy logs [PORT]`：连接实例实时输出守护日志，实例停止后自动退出
+// ---------------------------------------------------------------------------
+#[test]
+fn logs_follows_daemon_and_exits_on_stop() {
+    // 独立派生端口：既有测试占用 daemon_test_ports() 的前三个，这里从偏移 3 起
+    let port = daemon_test_port(3);
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_file = dir.path().join("logs.toml");
+    std::fs::write(
+        &cfg_file,
+        format!("base_url = \"https://logs-test.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
+    )
+    .unwrap();
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+    let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
+    let _guard = DaemonGuard { exe, port };
+
+    let pid = aproxy::daemon::spawn_detached(
+        std::path::Path::new(exe),
+        &[
+            "--config".to_string(),
+            cfg_file.display().to_string(),
+            "--daemon-child".to_string(),
+        ],
+    )
+    .expect("spawn 守护子进程失败");
+    assert!(wait_daemon_ready(port), "守护子进程未就绪 (pid {pid})");
+
+    // 连接 logs（stdout 管道捕获；logs 进程为单层 spawn，无句柄继承问题）
+    let mut child = Command::new(exe)
+        .args(["logs", &port.to_string()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn aproxy logs 失败");
+    let collected = Arc::new(Mutex::new(String::new()));
+    let reader = {
+        let collected = collected.clone();
+        let mut pipe = child.stdout.take().expect("logs stdout 管道");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => collected
+                        .lock()
+                        .unwrap()
+                        .push_str(&String::from_utf8_lossy(&buf[..n])),
+                }
+            }
+        })
+    };
+
+    // 首屏应包含守护的启动日志行（tracing 写入日志文件，logs 回读输出）
+    let mut saw_startup = false;
+    for _ in 0..100 {
+        if collected.lock().unwrap().contains("启动 aProxy") {
+            saw_startup = true;
+            break;
+        }
+        if child.try_wait().ok().flatten().is_some() {
+            break; // logs 进程提前退出：断言时以已收集内容为准
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        saw_startup,
+        "logs 首屏应输出启动日志行，实际: {}",
+        collected.lock().unwrap()
+    );
+
+    // stop 实例 → logs 感知实例死亡后自动退出（IPC 探活），不挂死
+    let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
+    let mut exited = false;
+    for _ in 0..150 {
+        if child.try_wait().ok().flatten().is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !exited {
+        // 兜底清理（断言仍会失败，但不能泄漏挂死的 logs 进程）
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(exited, "实例停止后 aproxy logs 应自动退出");
+    let _ = reader.join();
+    let out = collected.lock().unwrap();
+    assert!(
+        out.contains("实例已停止，日志跟踪结束"),
+        "logs 退出前应说明原因，实际: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 26. `aproxy logs` 多实例时必须指定端口；不支持 all
+// ---------------------------------------------------------------------------
+#[test]
+fn logs_requires_port_when_multiple_instances() {
+    let port_a = daemon_test_port(4);
+    let port_b = daemon_test_port(5);
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+
+    let spawn_daemon = |port: u16, name: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_file = dir.path().join(name);
+        std::fs::write(
+            &cfg_file,
+            format!(
+                "base_url = \"https://{name}.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"
+            ),
+        )
+        .unwrap();
+        let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
+        let pid = aproxy::daemon::spawn_detached(
+            std::path::Path::new(exe),
+            &[
+                "--config".to_string(),
+                cfg_file.display().to_string(),
+                "--daemon-child".to_string(),
+            ],
+        )
+        .expect("spawn 守护子进程失败");
+        (pid, dir)
+    };
+    // dir 须存活到测试结束（注册表里 config_path 引用它，无需实际存在，但保持干净）
+    let (pid_a, _dir_a) = spawn_daemon(port_a, "logs-multi-a.toml");
+    let (pid_b, _dir_b) = spawn_daemon(port_b, "logs-multi-b.toml");
+    let _guard_a = DaemonGuard { exe, port: port_a };
+    let _guard_b = DaemonGuard { exe, port: port_b };
+    assert!(wait_daemon_ready(port_a), "守护 a 未就绪 (pid {pid_a})");
+    assert!(wait_daemon_ready(port_b), "守护 b 未就绪 (pid {pid_b})");
+
+    // 无参：报错列出两个端口
+    let out = Command::new(exe).arg("logs").output().unwrap();
+    assert!(!out.status.success(), "多实例时无参 logs 应失败");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("必须指定端口号"), "实际: {text}");
+    assert!(text.contains(&port_a.to_string()), "应列出端口 a: {text}");
+    assert!(text.contains(&port_b.to_string()), "应列出端口 b: {text}");
+
+    // all：明确拒绝（一次只能连接一个）
+    let out = Command::new(exe).args(["logs", "all"]).output().unwrap();
+    assert!(!out.status.success(), "logs all 应失败");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("不支持 all"), "实际: {text}");
+}
+
+// ---------------------------------------------------------------------------
+// 27. `aproxy logs <空端口>`：实例不存在时报错退出
+// ---------------------------------------------------------------------------
+#[test]
+fn logs_reports_missing_instance() {
+    let port = daemon_test_port(6); // 从未在该端口启动守护
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+    let out = Command::new(exe).args(["logs", &port.to_string()]).output().unwrap();
+    assert!(!out.status.success(), "无实例时 logs 应失败");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("没有运行中的 aProxy 实例"),
+        "实际: {stdout}"
     );
 }

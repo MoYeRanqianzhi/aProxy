@@ -7,8 +7,9 @@ use tracing_subscriber::EnvFilter;
 
 use aproxy::config::{self, Config};
 use aproxy::daemon;
+use aproxy::settings;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "aproxy", version, about = "Local API proxy with infinite retries", long_about = None)]
 struct Cli {
     /// 配置文件路径（默认 ~/.aproxy/config.toml）。
@@ -42,24 +43,33 @@ struct Cli {
 
     /// [内部] 守护子进程标记：后台启动时父进程把它附加到子进程命令行，
     /// 子进程据此以守护模式运行（无控制台、日志写文件）。勿手动使用。
-    #[arg(long, hide = true)]
+    /// 必须是 global：start 子命令转发时它出现在 `start` 之后。
+    #[arg(long, hide = true, global = true)]
     daemon_child: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum Commands {
     /// 列出运行中的 aProxy 实例（来自实例注册表，存活以 IPC 探测为准）
     Status,
 
+    /// 启动代理（与直接运行 `aproxy` 相同），可指定配置别名或配置文件路径。
+    /// 别名用 `aproxy alias add` 管理，如 `aproxy start openrouter`。
+    Start {
+        /// 配置别名（settings.json 中的别名表）或配置文件路径
+        #[arg(value_name = "ALIAS|PATH")]
+        target: Option<String>,
+    },
+
     /// 停止运行中的实例。
-    /// 单个实例时可直接 `aproxy stop`；多实例必须指定端口号或 `all`：
-    /// `aproxy stop 12345` / `aproxy stop all`
+    /// 单个实例时可直接 `aproxy stop`；多实例必须指定端口号、`all` 或配置别名：
+    /// `aproxy stop 12345` / `aproxy stop all` / `aproxy stop openrouter`
     Stop {
-        /// 端口号或 all
-        #[arg(value_name = "PORT|all")]
+        /// 端口号、all 或配置别名
+        #[arg(value_name = "PORT|all|ALIAS")]
         target: Option<String>,
     },
 
@@ -77,13 +87,39 @@ enum Commands {
     /// 已在运行的实例自动跳过；配置文件已不存在的记录被清理。
     Restore,
 
+    /// 管理配置别名（存于 ~/.aproxy/settings.json，内部配置不建议手改）。
+    /// 别名指向某个 config.toml，让多开配置可以用名字快捷启停。
+    Alias {
+        #[command(subcommand)]
+        cmd: AliasCmd,
+    },
+
     /// 查看或修改配置（配置文件位于 ~/.aproxy/config.toml）
     Config(ConfigArgs),
 }
 
+#[derive(Subcommand, Debug, Clone)]
+enum AliasCmd {
+    /// 添加/覆盖别名（path 省略时指向默认配置 ~/.aproxy/config.toml）
+    Add {
+        /// 别名（不能为 all 或纯数字——会被 start/stop 当作端口/保留字解析）
+        name: String,
+        /// 指向的 config.toml 路径（支持 ~ 展开）
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+    },
+    /// 删除别名
+    Remove {
+        /// 别名
+        name: String,
+    },
+    /// 列出全部别名
+    List,
+}
+
 /// `aproxy config` 的参数集。独立成结构体以整体传递给处理函数，
 /// 避免 main 与函数之间逐字段搬运十几个参数。
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args, Debug, Clone)]
 struct ConfigArgs {
     /// 设置上游 base URL，例如 https://api.anthropic.com
     #[arg(long, value_name = "URL")]
@@ -145,14 +181,56 @@ async fn main() {
         init_stdout_logging();
     }
 
+    // 守护子进程只承载服务，忽略转发来的子命令：start 父进程把完整命令行
+    // （含 `start <别名>`）转发给子进程，若子进程再进入 Start 分支会递归
+    // spawn 出套娃进程。分流必须先于子命令 match。
+    if cli.daemon_child {
+        handle_start_cmd(&cli, cfg_path, None).await;
+        return;
+    }
+
     // 子命令分派；无子命令 = 启动代理（默认后台）
     match cli.command {
         Some(Commands::Status) => handle_status_cmd().await,
+        Some(Commands::Start { ref target }) => {
+            let cli = cli.clone();
+            handle_start_cmd(&cli, cfg_path, target.clone()).await;
+        }
         Some(Commands::Stop { target }) => handle_stop_cmd(target).await,
         Some(Commands::Logs { target }) => handle_logs_cmd(target).await,
         Some(Commands::Restore) => handle_restore_cmd().await,
+        Some(Commands::Alias { cmd }) => handle_alias_cmd(cmd),
         Some(Commands::Config(args)) => handle_config_cmd(cfg_path, args),
-        None => handle_start_cmd(&cli, cfg_path).await,
+        None => handle_start_cmd(&cli, cfg_path, None).await,
+    }
+}
+
+/// 解析 start/stop 的 target：别名优先（settings.json），其次按配置文件路径。
+/// 都落空返回 None（调用方报「未知的别名或配置文件」）。
+fn resolve_config_target(target: &str) -> Option<PathBuf> {
+    if let Some(p) = settings::resolve_alias(target) {
+        return Some(PathBuf::from(p));
+    }
+    let p = settings::expand_path(target);
+    if p.is_file() {
+        return Some(p);
+    }
+    None
+}
+
+/// 配置路径的运行实例匹配键：绝对化 + 分隔符统一 + 小写（Windows 文件系统
+/// 大小写不敏感；别名表存的是 add 时的写法，与注册表记录的写法可能不同）。
+fn config_path_key(p: &str) -> String {
+    let abs = std::path::absolute(p)
+        .map(|a| a.display().to_string())
+        .unwrap_or_else(|_| p.to_string());
+    #[cfg(windows)]
+    {
+        abs.replace('/', "\\").to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        abs
     }
 }
 
@@ -206,14 +284,32 @@ fn load_with_cli_overrides(cli: &Cli, cfg_path: &std::path::Path) -> Config {
     cfg.normalized()
 }
 
-/// `aproxy`（无子命令）：后台启动守护进程；--foreground 前台运行。
+/// `aproxy`（无子命令）/ `aproxy start [别名|路径]`：后台启动守护进程；
+/// --foreground 前台运行。
+///
+/// target 解析：settings.json 别名表优先（`aproxy alias add` 管理），
+/// 其次按配置文件路径；都落空则报错。
 ///
 /// 端口冲突的情况严格区分（控制通道走 IPC，不触碰代理端口）：
 /// - IPC ping 通且监听地址一致 → 同端口已有 aProxy 实例，提示正在运行，不重复启动；
 /// - IPC ping 通但监听地址不同 → 同端口不同地址的另一实例，实例键（端口号）
 ///   无法区分，明确拒绝启动；
 /// - TCP bind 失败 → 按错误类别区分「被其他程序占用」/「无权限或被系统保留」。
-async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf) {
+async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf, target: Option<String>) {
+    // start <别名|路径>：别名解析出的路径只在本进程可见，守护子进程的命令行
+    // 里必须显式带上 --config（见下方转发参数构造），否则子进程会回退默认配置
+    let cfg_path = match target.as_deref() {
+        None => cfg_path,
+        Some(t) => match resolve_config_target(t) {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "未知的别名或配置文件: {t}\n用 aproxy alias list 查看已有别名，或 aproxy alias add {t} <路径> 添加"
+                );
+                std::process::exit(1);
+            }
+        },
+    };
     let cfg = match resolve_runtime_config(cli, &cfg_path) {
         Ok(c) => c,
         Err(msg) => {
@@ -276,15 +372,25 @@ async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf) {
     }
 
     // 后台：分离子进程承载服务，命令行参数原样转发 + --daemon-child 标记。
-    // --config 的值转绝对路径后再传：注册表里的 config_path 与子进程的文件读取
-    // 都不应依赖进程工作目录（用 absolute 而非 canonicalize，避免 Windows 的
-    // \\?\ verbatim 前缀混进注册表与命令行）。
+    // --config 的值统一改写为本进程解析出的 cfg_path（绝对路径）：普通启动时
+    // 这只是把相对路径转绝对（注册表与子进程的文件读取不依赖工作目录）；
+    // `start <别名|路径>` 时命令行里根本没有 --config，别名解析出的路径只有
+    // 本进程知道，必须在此注入，否则守护子进程会回退默认配置。
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(i) = args.iter().position(|a| a == "--config")
-        && let Some(val) = args.get_mut(i + 1)
-        && let Ok(abs) = std::path::absolute(val.as_str())
-    {
-        *val = abs.display().to_string();
+    let cfg_str = cfg_path.display().to_string();
+    match args.iter().position(|a| a == "--config") {
+        Some(i) => {
+            if let Some(val) = args.get_mut(i + 1) {
+                *val = cfg_str;
+            }
+        }
+        None => match args.iter().position(|a| a.starts_with("--config=")) {
+            Some(i) => args[i] = format!("--config={cfg_str}"),
+            None => {
+                args.push("--config".to_string());
+                args.push(cfg_str);
+            }
+        },
     }
     args.push("--daemon-child".to_string());
     let exe = std::env::current_exe().expect("无法定位自身可执行文件");
@@ -517,8 +623,40 @@ async fn handle_status_cmd() {
     }
 }
 
-/// `aproxy stop [PORT|all]`：单个实例可省略参数；多实例必须指定端口号或 all。
+/// `aproxy stop [PORT|all|ALIAS]`：单个实例可省略参数；多实例必须指定端口号、
+/// all 或配置别名（按实例注册的 config_path 匹配）。
 async fn handle_stop_cmd(target: Option<String>) {
+    // 别名定位：非数字且非 all 的 target 先查别名表——按 config_path 匹配
+    // 运行实例（别名不依赖端口号，端口变了别名依然有效）
+    if let Some(target) = target.as_deref()
+        && target != "all"
+        && target.parse::<u16>().is_err()
+    {
+        match resolve_config_target(target) {
+            Some(cfg_path) => {
+                let key = config_path_key(&cfg_path.display().to_string());
+                let instances = daemon::list_instances().await;
+                let found = instances
+                    .iter()
+                    .find(|i| config_path_key(&i.config_path) == key);
+                match found {
+                    Some(info) => stop_instance(info).await,
+                    None => {
+                        println!("别名 {target}（配置 {}）当前未在运行。", cfg_path.display());
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+            None => {
+                eprintln!(
+                    "未知的别名或端口号: {target}\n用 aproxy alias list 查看已有别名，或 aproxy alias add {target} <路径> 添加"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
     // 指定端口时不依赖注册表：直接按端口 IPC 定位（注册表丢失也能停）
     if let Some(target) = target.as_deref()
         && target != "all"
@@ -637,6 +775,73 @@ async fn handle_restore_cmd() {
                 }
             }
             Err(e) => eprintln!("端口 {} 恢复失败: {e}", entry.port),
+        }
+    }
+}
+
+/// `aproxy alias add/remove/list`：别名管理，存于 settings.json（内部配置，
+/// 唯一；toml 配置可多份平行并存）。
+fn handle_alias_cmd(cmd: AliasCmd) {
+    match cmd {
+        AliasCmd::Add { name, path } => {
+            if let Err(e) = settings::validate_alias_name(&name) {
+                eprintln!("别名无效: {e}");
+                std::process::exit(1);
+            }
+            let path = match path {
+                Some(p) => settings::expand_path(&p),
+                None => config::config_path(),
+            };
+            if !path.exists() {
+                eprintln!("配置文件不存在: {}", path.display());
+                std::process::exit(1);
+            }
+            let mut s = settings::load();
+            let replacing = s.aliases.contains_key(&name);
+            s.aliases.insert(name.clone(), path.display().to_string());
+            match settings::save(&s) {
+                Ok(()) => {
+                    if replacing {
+                        println!("已更新别名 {} -> {}", name, path.display());
+                    } else {
+                        println!("已添加别名 {} -> {}", name, path.display());
+                    }
+                    println!("启动: aproxy start {name}    停止: aproxy stop {name}");
+                }
+                Err(e) => {
+                    eprintln!("保存 settings.json 失败: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        AliasCmd::Remove { name } => {
+            let mut s = settings::load();
+            match s.aliases.remove(&name) {
+                Some(path) => match settings::save(&s) {
+                    Ok(()) => println!("已删除别名 {name}（原指向 {path}）"),
+                    Err(e) => {
+                        eprintln!("保存 settings.json 失败: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                None => {
+                    eprintln!("别名 {name} 不存在。用 aproxy alias list 查看。");
+                    std::process::exit(1);
+                }
+            }
+        }
+        AliasCmd::List => {
+            let s = settings::load();
+            if s.aliases.is_empty() {
+                println!("暂无别名。添加: aproxy alias add <名称> <config.toml 路径>");
+                return;
+            }
+            println!("别名 ({}):", s.aliases.len());
+            let mut names: Vec<_> = s.aliases.iter().collect();
+            names.sort();
+            for (name, path) in names {
+                println!("  {name} -> {path}");
+            }
         }
     }
 }

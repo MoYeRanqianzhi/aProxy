@@ -1753,3 +1753,167 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("没有需要恢复的实例"), "实际: {stdout}");
 }
+
+// ---------------------------------------------------------------------------
+// 29. 配置别名：alias add → start <别名> → stop <别名> 端到端
+//
+// 别名存于真实 ~/.aproxy/settings.json（进程级全局配置，无测试注入点），
+// 用 pid 派生的唯一别名名避免与其他测试/用户数据冲突，测试尾部删除清理。
+// ---------------------------------------------------------------------------
+#[test]
+fn alias_start_and_stop_roundtrip() {
+    let port = daemon_test_port(8);
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+    let alias = format!("alias-test-{}", std::process::id());
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_file = dir.path().join("aliased.toml");
+    std::fs::write(
+        &cfg_file,
+        format!(
+            "base_url = \"https://alias-test.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"
+        ),
+    )
+    .unwrap();
+    let _guard = DaemonGuard { exe, port };
+
+    // add 别名（指向临时配置）
+    let out = Command::new(exe)
+        .args(["alias", "add", &alias])
+        .arg(&cfg_file)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "alias add 应成功: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // list 包含该别名
+    let out = Command::new(exe).args(["alias", "list"]).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&alias),
+        "alias list 应包含 {alias}: {stdout}"
+    );
+
+    // start <别名>：后台启动别名指向的配置
+    let out = Command::new(exe).args(["start", &alias]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "start 别名应成功: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("已在后台启动"), "实际: {stdout}");
+    assert!(
+        wait_daemon_ready(port),
+        "别名启动的守护应就绪 (端口 {port})"
+    );
+
+    // 别名启动的实例 config_path 应指向别名配置（status 可见）
+    let out = Command::new(exe).arg("status").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("alias-test.example.com"),
+        "status 应展示别名配置的上游: {stdout}"
+    );
+
+    // stop <别名>：按 config_path 匹配并停止
+    let out = Command::new(exe).args(["stop", &alias]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "stop 别名应成功: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("已停止"), "实际: {stdout}");
+
+    // 已停止后再 stop 别名：明确报「未在运行」
+    let out = Command::new(exe).args(["stop", &alias]).output().unwrap();
+    assert!(!out.status.success(), "别名配置未运行时 stop 应失败");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("未在运行"), "实际: {text}");
+
+    // 清理别名（无论如何执行，不留测试残留）
+    let _ = Command::new(exe).args(["alias", "remove", &alias]).output();
+}
+
+// ---------------------------------------------------------------------------
+// 30. 别名错误路径：start/stop 未知别名明确报错；保留字校验
+// ---------------------------------------------------------------------------
+#[test]
+fn alias_errors_on_unknown_names() {
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+    let unknown = format!("no-such-alias-{}", std::process::id());
+
+    // start 未知别名：报错并列出管理方式
+    let out = Command::new(exe)
+        .args(["start", &unknown])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "start 未知别名应失败");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("未知的别名或配置文件"), "实际: {text}");
+
+    // stop 未知别名：报错
+    let out = Command::new(exe).args(["stop", &unknown]).output().unwrap();
+    assert!(!out.status.success(), "stop 未知别名应失败");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("未知的别名或端口号"), "实际: {text}");
+
+    // add 保留字：all / 纯数字被拒绝
+    for bad in ["all", "12345"] {
+        let out = Command::new(exe)
+            .args(["alias", "add", bad])
+            .arg("x.toml")
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "别名 {bad} 应被拒绝");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(text.contains("别名无效"), "实际: {text}");
+    }
+
+    // add 不存在的配置路径：报错
+    let out = Command::new(exe)
+        .args(["alias", "add", &format!("bad-{}", std::process::id())])
+        .arg("Z:/no/such/file.toml")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "add 不存在的路径应失败");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("配置文件不存在"), "实际: {text}");
+
+    // remove 不存在的别名：报错
+    let out = Command::new(exe)
+        .args(["alias", "remove", &unknown])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "remove 不存在的别名应失败");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("不存在"), "实际: {text}");
+}

@@ -55,6 +55,10 @@ pub struct InstanceInfo {
     pub base_url: String,
     /// 启动时刻（Unix 秒）
     pub started_at: u64,
+    /// 最近一次收到客户端请求的时刻（Unix 秒）。0 = 实例未上报（旧版本
+    /// 或注册时快照）——调用方按「未知，视为非闲置」处理。
+    #[serde(default)]
+    pub last_activity_secs: u64,
 }
 
 /// IPC 请求。framing：一行 JSON + `\n`。
@@ -118,12 +122,14 @@ pub async fn ipc_request(port: &str, req: &IpcRequest) -> Result<IpcResponse, St
 /// 启动实例的 IPC 控制服务（每实例一条独立端点，随进程退出而终止）。
 /// 收到 shutdown 时置位 `on_shutdown`（watch bool），由服务主循环执行优雅退出。
 /// `port` 收 owned 值：调用方以 tokio::spawn 运行本 future，参数不能借用。
+/// `last_activity_secs`：代理层的活动时间戳共享原子，ping 实时读取。
 pub async fn serve_ipc(
     port: String,
     on_shutdown: tokio::sync::watch::Sender<bool>,
     info: InstanceInfo,
+    last_activity_secs: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> io::Result<()> {
-    imp::serve(endpoint_for(&port), on_shutdown, info).await
+    imp::serve(endpoint_for(&port), on_shutdown, info, last_activity_secs).await
 }
 
 /// 等待实例退出（连续 2 轮探测都失败才视为已退出），超时返回 false。
@@ -370,11 +376,15 @@ pub async fn list_instances_in(dir: &std::path::Path) -> Vec<InstanceInfo> {
             continue;
         };
         let port = port_of(&info.listen_addr).to_string();
-        if ipc_ping(&port).await.is_ok() {
-            out.push(info);
-        } else {
-            // 实例不在了：注册已失效，清理
-            let _ = std::fs::remove_file(&path);
+        match ipc_ping(&port).await {
+            // ping 响应携带实例的实时信息（含 last_activity_secs）——注册表
+            // .pid 是启动时刻的快照，闲置判定/展示必须用实时值，否则活动
+            // 时间永远停留在启动时刻、闲置=运行时长（实测踩坑）
+            Ok(live_info) => out.push(live_info),
+            Err(_) => {
+                // 实例不在了：注册已失效，清理
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
     out.sort_by(|a, b| a.listen_addr.cmp(&b.listen_addr));
@@ -502,11 +512,24 @@ where
     Ok(line)
 }
 
+/// 快照实例信息并把活动时间戳刷新为当前值（IPC 响应出实时闲置判定数据）
+fn with_last_activity(
+    mut info: InstanceInfo,
+    last_activity_secs: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> InstanceInfo {
+    use std::sync::atomic::Ordering;
+    info.last_activity_secs = last_activity_secs.load(Ordering::Relaxed);
+    info
+}
+
 /// 处理一条 IPC 连接：解析请求行 → 执行 → 回响应行。
+/// `last_activity_secs`：代理层共享的活动时间戳（AtomicU64 存 Unix 秒），
+/// ping/shutdown 响应实时读取——stop idle/status 筛选靠它判定实例闲置。
 async fn handle_conn<S>(
     stream: S,
     on_shutdown: tokio::sync::watch::Sender<bool>,
     info: InstanceInfo,
+    last_activity_secs: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -534,13 +557,13 @@ where
     let resp: IpcResponse = match serde_json::from_str(&line) {
         Ok(IpcRequest::Ping) => IpcResponse {
             ok: true,
-            info: Some(info),
+            info: Some(with_last_activity(info, &last_activity_secs)),
         },
         Ok(IpcRequest::Shutdown) => {
             // 响应先发出去再触发停止：客户端立刻拿到确认，服务随后优雅退出
             let resp = IpcResponse {
                 ok: true,
-                info: Some(info),
+                info: Some(with_last_activity(info, &last_activity_secs)),
             };
             write_line(
                 &mut writer,
@@ -612,6 +635,7 @@ mod imp {
         endpoint: String,
         on_shutdown: Sender<bool>,
         info: InstanceInfo,
+        last_activity_secs: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> io::Result<()> {
         let mut server = ServerOptions::new()
             .first_pipe_instance(true)
@@ -622,8 +646,9 @@ mod imp {
             server = ServerOptions::new().create(&endpoint)?;
             let shutdown = on_shutdown.clone();
             let info = info.clone();
+            let activity = last_activity_secs.clone();
             tokio::spawn(async move {
-                let _ = handle_conn(client, shutdown, info).await;
+                let _ = handle_conn(client, shutdown, info, activity).await;
             });
         }
     }
@@ -647,6 +672,7 @@ mod imp {
         endpoint: String,
         on_shutdown: Sender<bool>,
         info: InstanceInfo,
+        last_activity_secs: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> io::Result<()> {
         let path = Path::new(&endpoint);
         // 残留 socket 文件会令 bind 失败，先清理
@@ -664,8 +690,9 @@ mod imp {
             };
             let shutdown = on_shutdown.clone();
             let info = info.clone();
+            let activity = last_activity_secs.clone();
             tokio::spawn(async move {
-                let _ = handle_conn(stream, shutdown, info).await;
+                let _ = handle_conn(stream, shutdown, info, activity).await;
             });
         }
     }
@@ -683,6 +710,7 @@ mod tests {
             config_path: "C:/tmp/config.toml".into(),
             base_url: "https://api.example.com".into(),
             started_at: 1_700_000_000,
+            last_activity_secs: 0,
         }
     }
 
@@ -723,7 +751,13 @@ mod tests {
         let endpoint = format!(r"\\.\pipe\aproxy-test-{}", std::process::id());
         let (tx, mut rx) = tokio::sync::watch::channel(false);
         let info = sample_info("0");
-        let server = tokio::spawn(imp::serve(endpoint.clone(), tx, info.clone()));
+        let activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let server = tokio::spawn(imp::serve(
+            endpoint.clone(),
+            tx,
+            info.clone(),
+            activity.clone(),
+        ));
         // 等待服务端监听实例建好
         tokio::time::sleep(Duration::from_millis(100)).await;
 

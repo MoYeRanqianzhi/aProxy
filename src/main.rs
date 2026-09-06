@@ -55,8 +55,17 @@ struct Cli {
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 enum Commands {
-    /// 列出运行中的 aProxy 实例（来自实例注册表，存活以 IPC 探测为准）
-    Status,
+    /// 列出运行中的 aProxy 实例（来自实例注册表，存活以 IPC 探测为准）。
+    /// --idle 只列闲置实例，--busy 只列活跃实例（判定阈值 settings 的
+    /// idle_timeout_secs，默认 1800s）
+    Status {
+        /// 只列闲置（空闲超过阈值）的实例
+        #[arg(long, conflicts_with = "busy")]
+        idle: bool,
+        /// 只列活跃（阈值内有请求）的实例
+        #[arg(long)]
+        busy: bool,
+    },
 
     /// 启动代理（与直接运行 `aproxy` 相同），可指定配置别名或配置文件路径。
     /// 别名用 `aproxy alias add` 管理，如 `aproxy start openrouter`。
@@ -67,12 +76,17 @@ enum Commands {
     },
 
     /// 停止运行中的实例。
-    /// 单个实例时可直接 `aproxy stop`；多实例必须指定端口号、`all` 或配置别名：
+    /// 单个实例时可直接 `aproxy stop`；多实例必须指定端口号、`all`、配置别名
+    /// 或 `idle`（可带秒数）：
     /// `aproxy stop 12345` / `aproxy stop all` / `aproxy stop openrouter`
+    /// `aproxy stop idle`（闲置超 1800s 的全部实例）/ `aproxy stop idle 600`
     Stop {
-        /// 端口号、all 或配置别名
-        #[arg(value_name = "PORT|all|ALIAS")]
+        /// 端口号、all、配置别名或 idle
+        #[arg(value_name = "PORT|all|ALIAS|idle")]
         target: Option<String>,
+        /// idle 模式的空闲阈值（秒），覆盖 settings.json 的 idle_timeout_secs
+        #[arg(value_name = "SECS", requires = "target")]
+        threshold: Option<u64>,
     },
 
     /// 连接到运行中的实例并实时输出其守护日志（Ctrl+C 退出）。
@@ -262,12 +276,12 @@ async fn main() {
 
     // 子命令分派；无子命令 = 启动代理（默认后台）
     match cli.command {
-        Some(Commands::Status) => handle_status_cmd().await,
+        Some(Commands::Status { idle, busy }) => handle_status_cmd(idle, busy).await,
         Some(Commands::Start { ref target }) => {
             let cli = cli.clone();
             handle_start_cmd(&cli, cfg_path, target.clone()).await;
         }
-        Some(Commands::Stop { target }) => handle_stop_cmd(target).await,
+        Some(Commands::Stop { target, threshold }) => handle_stop_cmd(target, threshold).await,
         Some(Commands::Logs { target }) => handle_logs_cmd(target).await,
         Some(Commands::Restore) => handle_restore_cmd().await,
         Some(Commands::Alias { cmd }) => handle_alias_cmd(cmd),
@@ -283,11 +297,15 @@ async fn main() {
     }
 }
 
-/// 解析 start/stop 的 target：别名优先（settings.json），其次按配置文件路径。
-/// 都落空返回 None（调用方报「未知的别名或配置文件」）。
+/// 解析 start/stop 的 target：别名优先（settings.json），其次 `default`
+/// 保留字（settings.default_config / ~/.aproxy/config.toml），最后按配置文件
+/// 路径。都落空返回 None（调用方报「未知的别名或配置文件」）。
 fn resolve_config_target(target: &str) -> Option<PathBuf> {
     if let Some(p) = settings::resolve_alias(target) {
         return Some(PathBuf::from(p));
+    }
+    if let Some(p) = settings::resolve_default_target(target) {
+        return Some(p);
     }
     let p = settings::expand_path(target);
     if p.is_file() {
@@ -549,7 +567,9 @@ async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemon_child: bo
     let actual_addr = listener.local_addr().expect("获取监听地址失败").to_string();
     let port = daemon::port_of(&actual_addr).to_string();
 
-    // 注册实例信息（bind 成功后才写，避免留下死记录）
+    // 注册实例信息（bind 成功后才写，避免留下死记录）。
+    // last_activity_secs 落盘的是注册时刻快照（注册表仅供枚举展示），
+    // 实时值由 IPC ping 响应携带。
     let info = daemon::InstanceInfo {
         pid: std::process::id(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -557,6 +577,9 @@ async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemon_child: bo
         config_path: cfg_path.display().to_string(),
         base_url: base_url.clone(),
         started_at: now_unix(),
+        last_activity_secs: state
+            .last_activity_secs
+            .load(std::sync::atomic::Ordering::Relaxed),
     };
     if let Err(e) = daemon::write_instance_file(&info) {
         tracing::warn!(error = %e, "实例注册表写入失败（不影响代理功能）");
@@ -575,12 +598,14 @@ async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemon_child: bo
         tracing::warn!(error = %e, "自愈恢复记录写入失败（不影响代理功能）");
     }
 
-    // IPC 控制通道：ping/shutdown 走命名管道，与代理端口完全隔离
+    // IPC 控制通道：ping/shutdown 走命名管道，与代理端口完全隔离。
+    // 活动时间戳由 AppState 持有（请求热路径更新），IPC ping 实时读取。
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let ipc_port = port.clone();
     let ipc_info = info.clone();
+    let last_activity = state.last_activity_secs.clone();
     tokio::spawn(async move {
-        if let Err(e) = daemon::serve_ipc(ipc_port, stop_tx, ipc_info).await {
+        if let Err(e) = daemon::serve_ipc(ipc_port, stop_tx, ipc_info, last_activity).await {
             tracing::error!(error = %e, "IPC 控制通道启动失败（aproxy stop/status 将不可用）");
         }
     });
@@ -668,21 +693,50 @@ async fn stop_signal(mut ipc_rx: tokio::sync::watch::Receiver<bool>) {
     tracing::info!("收到停止信号，正在关闭...");
 }
 
-/// `aproxy status`：列出注册表中的实例（存活以 IPC 探测为准）。
-async fn handle_status_cmd() {
+/// `aproxy status [--idle|--busy]`：列出注册表中的实例（存活以 IPC 探测为准）。
+/// idle/busy 按实例的最近活动时间与 settings.idle_timeout_secs 判定。
+async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
+    let threshold = settings::load().idle_timeout_secs;
     let instances = daemon::list_instances().await;
     if instances.is_empty() {
         println!("没有运行中的 aProxy 实例。");
         return;
     }
-    println!("运行中的 aProxy 实例 ({}):", instances.len());
-    for info in &instances {
+    let now = now_unix();
+    let is_idle = |info: &daemon::InstanceInfo| {
+        // last_activity_secs 为 0 = 实例未上报活动时间（旧版本守护），视为非闲置
+        info.last_activity_secs > 0 && now.saturating_sub(info.last_activity_secs) >= threshold
+    };
+    let filtered: Vec<_> = instances
+        .into_iter()
+        .filter(|info| !idle_only || is_idle(info))
+        .filter(|info| !busy_only || !is_idle(info))
+        .collect();
+    if filtered.is_empty() {
+        let which = if idle_only {
+            "闲置"
+        } else if busy_only {
+            "活跃"
+        } else {
+            unreachable!("idle 与 busy 互斥，二者必有一为假");
+        };
+        println!("没有{which}的 aProxy 实例（阈值 {} 秒）。", threshold);
+        return;
+    }
+    println!("运行中的 aProxy 实例 ({}):", filtered.len());
+    for info in &filtered {
+        let idle_secs = if info.last_activity_secs > 0 {
+            now.saturating_sub(info.last_activity_secs)
+        } else {
+            0
+        };
         println!(
-            "  端口 {}  pid {}  v{}  已运行 {}",
+            "  端口 {}  pid {}  v{}  已运行 {}  闲置 {}",
             daemon::port_of(&info.listen_addr),
             info.pid,
             info.version,
-            humanize_uptime(info.started_at)
+            humanize_uptime(info.started_at),
+            humanize_duration(idle_secs)
         );
         println!(
             "    监听 http://{}   上游 {}   配置 {}",
@@ -693,10 +747,36 @@ async fn handle_status_cmd() {
     }
 }
 
-/// `aproxy stop [PORT|all|ALIAS]`：单个实例可省略参数；多实例必须指定端口号、
-/// all 或配置别名（按实例注册的 config_path 匹配）。
-async fn handle_stop_cmd(target: Option<String>) {
-    // 别名定位：非数字且非 all 的 target 先查别名表——按 config_path 匹配
+/// `aproxy stop [PORT|all|ALIAS|idle [SECS]]`：单个实例可省略参数；多实例必须
+/// 指定端口号、all、配置别名（按实例注册的 config_path 匹配）或 idle。
+async fn handle_stop_cmd(target: Option<String>, threshold: Option<u64>) {
+    // idle 保留字：停止全部空闲超阈值的实例（阈值可临时覆盖 settings 配置）
+    if target
+        .as_deref()
+        .is_some_and(|t| t.eq_ignore_ascii_case("idle"))
+    {
+        let idle_secs = threshold.unwrap_or(settings::load().idle_timeout_secs);
+        let instances = daemon::list_instances().await;
+        let now = now_unix();
+        let idle_targets: Vec<_> = instances
+            .iter()
+            // last_activity_secs 为 0 = 未上报（旧版本守护），不纳入 idle 停止
+            .filter(|i| {
+                i.last_activity_secs > 0 && now.saturating_sub(i.last_activity_secs) >= idle_secs
+            })
+            .collect();
+        if idle_targets.is_empty() {
+            println!("没有闲置超过 {idle_secs} 秒的实例。");
+            return;
+        }
+        println!("闲置超过 {idle_secs} 秒的实例 ({}):", idle_targets.len());
+        for info in &idle_targets {
+            stop_instance(info).await;
+        }
+        return;
+    }
+
+    // 别名定位：非数字且非 all 的 target 先查别名表/default——按 config_path 匹配
     // 运行实例（别名不依赖端口号，端口变了别名依然有效）
     if let Some(target) = target.as_deref()
         && target != "all"
@@ -1155,7 +1235,11 @@ fn chrono_like_timestamp() -> String {
 }
 
 fn humanize_uptime(started_at: u64) -> String {
-    let secs = now_unix().saturating_sub(started_at);
+    humanize_duration(now_unix().saturating_sub(started_at))
+}
+
+/// 时长人性化（秒 → 中文）：uptime 与闲置时长共用
+fn humanize_duration(secs: u64) -> String {
     if secs < 60 {
         format!("{secs} 秒")
     } else if secs < 3600 {

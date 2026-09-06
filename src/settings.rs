@@ -17,7 +17,7 @@ pub fn settings_path_in(config_dir: &std::path::Path) -> PathBuf {
     config_dir.join("settings.json")
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     /// 配置文件别名表：名称 → config.toml 的绝对路径。
     /// 供 `aproxy start/stop <别名>` 快捷定位配置。
@@ -36,10 +36,33 @@ pub struct Settings {
     /// （所有实例共用同一日志策略，故放 settings 而非各 config.toml）。默认 8。
     #[serde(default = "default_log_rotate_mb")]
     pub log_rotate_mb: u64,
+    /// 实例空闲判定阈值（秒）：`aproxy status --idle` 筛选与 `aproxy stop idle`
+    /// 的判定依据（距最近一次收到客户端请求）。默认 1800（30 分钟）。
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
 }
 
 fn default_log_rotate_mb() -> u64 {
     8
+}
+
+fn default_idle_timeout_secs() -> u64 {
+    1800
+}
+
+// 手动 Default：serde 的字段默认值（log_rotate_mb=8、idle_timeout_secs=1800）
+// 只作用于反序列化，derive 出的 Default 会给数值字段填 0——「默认 0」与
+// 「默认 8/1800」语义不同（0=关闭轮转），必须与反序列化保持一致。
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            aliases: HashMap::new(),
+            default_config: None,
+            config_dirs: Vec::new(),
+            log_rotate_mb: default_log_rotate_mb(),
+            idle_timeout_secs: default_idle_timeout_secs(),
+        }
+    }
 }
 
 /// 加载：文件不存在 → 默认空配置；损坏 → 警告后回退默认（内部配置损坏
@@ -145,19 +168,46 @@ pub fn path_match_key(p: &str) -> String {
     }
 }
 
-/// 别名合法性与端口号/all 保留字冲突：纯数字会被 start/stop 当端口解析，
-/// "all" 是 stop 的保留目标，均禁止作为别名。
+/// 别名合法性与保留字冲突：纯数字会被 start/stop 当端口解析；all/idle/default
+/// 是 start/stop/status 的保留目标，均禁止作为别名（"defult" 一并拒绝并提示
+/// 正确拼写，避免用户注册后实际无法按预期解析）。
 pub fn validate_alias_name(name: &str) -> Result<(), String> {
     if name.trim().is_empty() {
         return Err("别名不能为空".to_string());
     }
-    if name == "all" || name.eq_ignore_ascii_case("all") {
-        return Err("\"all\" 是 stop 的保留目标，不能用作别名".to_string());
-    }
     if name.parse::<u16>().is_ok() {
         return Err("别名不能是纯数字（会与端口号解析冲突）".to_string());
     }
+    let lower = name.to_ascii_lowercase();
+    let reserved: &[(&str, &str)] = &[
+        ("all", "\"all\" 是 stop 的保留目标（停止全部实例）"),
+        ("idle", "\"idle\" 是 stop/status 的保留目标（空闲实例筛选）"),
+        (
+            "default",
+            "\"default\" 指代默认配置文件（settings 的 default_config），是保留字",
+        ),
+        (
+            "defult",
+            "\"defult\" 是 \"default\" 的常见笔误，两者都保留以免混淆",
+        ),
+    ];
+    for (word, why) in reserved {
+        if lower == *word {
+            return Err(format!("{why}，不能用作别名"));
+        }
+    }
     Ok(())
+}
+
+/// 默认配置的保留字解析：`default`（含笔误 `defult`，大小写不敏感）→
+/// settings.default_config 或 ~/.aproxy/config.toml。供 start/stop 使用。
+pub fn resolve_default_target(target: &str) -> Option<PathBuf> {
+    let lower = target.to_ascii_lowercase();
+    if lower == "default" || lower == "defult" {
+        Some(default_config_path())
+    } else {
+        None
+    }
 }
 
 /// 固定参与检查的两个默认配置目录（始终在列表中，用户重复添加也静默去重）
@@ -339,8 +389,44 @@ mod tests {
         assert!(validate_alias_name("all").is_err());
         assert!(validate_alias_name("ALL").is_err());
         assert!(validate_alias_name("12345").is_err());
+        // default/defult/idle 均为保留字（大小写不敏感）
+        for bad in ["default", "DEFAULT", "defult", "Defult", "idle", "IDLE"] {
+            assert!(validate_alias_name(bad).is_err(), "{bad} 应被拒绝");
+        }
         assert!(validate_alias_name("openrouter").is_ok());
         assert!(validate_alias_name("my-cfg").is_ok());
+    }
+
+    #[test]
+    fn resolve_default_target_matches_default_and_typo() {
+        // default/defult（大小写不敏感）解析为默认配置路径
+        for good in ["default", "DEFAULT", "defult", "Defult"] {
+            assert_eq!(
+                resolve_default_target(good),
+                Some(crate::config::config_path()),
+                "{good} 应解析为默认配置"
+            );
+        }
+        // 非保留字不命中
+        assert_eq!(resolve_default_target("openrouter"), None);
+        assert_eq!(resolve_default_target("my-cfg"), None);
+    }
+
+    #[test]
+    fn idle_timeout_roundtrip_and_default() {
+        // 默认 1800；自定义值落盘往返；旧 settings（无字段）读出默认
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path_in(dir.path());
+        let s = Settings::default();
+        assert_eq!(s.idle_timeout_secs, 1800);
+        let s = Settings {
+            idle_timeout_secs: 600,
+            ..Default::default()
+        };
+        save_to(&path, &s).unwrap();
+        assert_eq!(load_from(&path).idle_timeout_secs, 600);
+        std::fs::write(&path, r#"{"aliases":{}}"#).unwrap();
+        assert_eq!(load_from(&path).idle_timeout_secs, 1800);
     }
 
     #[test]

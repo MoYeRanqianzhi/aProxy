@@ -60,6 +60,10 @@ fn is_hop_header(name: &str) -> bool {
 pub struct AppState {
     pub config: Arc<Config>,
     pub client: reqwest::Client,
+    /// 最近一次收到客户端请求的时刻（Unix 秒）。AtomicU64 供 IPC ping 读取
+    /// 展示/判闲置，请求热路径上仅一次 store（Relaxed 足够：只用于粗粒度的
+    /// 空闲判定，无需跨线程因果序）。
+    pub last_activity_secs: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AppState {
@@ -99,7 +103,25 @@ impl AppState {
         Self {
             config: Arc::new(config),
             client,
+            last_activity_secs: Arc::new(std::sync::atomic::AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            )),
         }
+    }
+
+    /// 实例闲置时长（秒）：距最近一次收到客户端请求。
+    pub fn idle_secs(&self) -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        now.saturating_sub(
+            self.last_activity_secs
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 }
 
@@ -157,6 +179,15 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
     let method = req.method().clone();
     let uri = req.uri().clone();
     let mut headers = req.headers().clone();
+
+    // 活动时间戳：收到请求即更新（stop idle / status 筛选的判定依据）
+    state.last_activity_secs.store(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // 在本地侧先应用覆盖/追加，避免重试间重复计算
     apply_header_overrides(&mut headers, &state.config);

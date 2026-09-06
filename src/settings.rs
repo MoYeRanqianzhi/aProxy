@@ -32,6 +32,14 @@ pub struct Settings {
     /// 两者始终参与检查；用户手动添加这两者也不会报错（去重静默）。
     #[serde(default)]
     pub config_dirs: Vec<String>,
+    /// 守护日志运行期轮转阈值（MB）：超过即截断；0 表示不轮转。全局治理项
+    /// （所有实例共用同一日志策略，故放 settings 而非各 config.toml）。默认 8。
+    #[serde(default = "default_log_rotate_mb")]
+    pub log_rotate_mb: u64,
+}
+
+fn default_log_rotate_mb() -> u64 {
+    8
 }
 
 /// 加载：文件不存在 → 默认空配置；损坏 → 警告后回退默认（内部配置损坏

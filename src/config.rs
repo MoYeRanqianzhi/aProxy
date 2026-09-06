@@ -50,6 +50,18 @@ pub struct Config {
     /// 设为 0 表示所有重试零延迟（立即重试）。默认 320 秒。
     #[serde(default = "default_max_backoff_secs")]
     pub max_retry_backoff_secs: u64,
+    /// 上游响应缓冲（spool）上限（MB）。超过即视为不可重试的确定性失败。
+    /// 默认 256；小内存机器可调小，转发超大文件可调大。
+    #[serde(default = "default_spool_limit_mb")]
+    pub spool_limit_mb: u64,
+    /// 上游连接建立超时（秒）。默认 30；慢网络/高延迟上游可调大。
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// 上游两次读到数据之间的超时（秒，同样钳制首字节等待）。默认 300；
+    /// LLM 上游排队久（TTFB 数十秒）可调大，调过小会把「慢但活着」的上游
+    /// 变成确定性无限重试。
+    #[serde(default = "default_read_timeout_secs")]
+    pub read_timeout_secs: u64,
 }
 
 fn default_listen_addr() -> String {
@@ -62,6 +74,18 @@ fn default_keepalive_secs() -> u64 {
 
 fn default_max_backoff_secs() -> u64 {
     320
+}
+
+fn default_spool_limit_mb() -> u64 {
+    256
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    30
+}
+
+fn default_read_timeout_secs() -> u64 {
+    300
 }
 
 impl Default for Config {
@@ -77,6 +101,9 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             max_retry_backoff_secs: default_max_backoff_secs(),
+            spool_limit_mb: default_spool_limit_mb(),
+            connect_timeout_secs: default_connect_timeout_secs(),
+            read_timeout_secs: default_read_timeout_secs(),
         }
     }
 }
@@ -417,6 +444,33 @@ mod tests {
         assert!(cfg.proxy_username.is_none());
         assert!(cfg.proxy_password.is_none());
         assert_eq!(cfg.max_retry_backoff_secs, 320);
+        assert_eq!(cfg.spool_limit_mb, 256);
+        assert_eq!(cfg.connect_timeout_secs, 30);
+        assert_eq!(cfg.read_timeout_secs, 300);
+    }
+
+    #[test]
+    fn tuning_fields_roundtrip() {
+        // 三个调参字段写入读出 + 旧配置文件（无字段）读出默认值
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.toml");
+        let cfg = Config {
+            base_url: "https://api.example.com".to_string(),
+            spool_limit_mb: 64,
+            connect_timeout_secs: 60,
+            read_timeout_secs: 600,
+            ..Default::default()
+        };
+        save_to(&path, &cfg).unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.spool_limit_mb, 64);
+        assert_eq!(loaded.connect_timeout_secs, 60);
+        assert_eq!(loaded.read_timeout_secs, 600);
+        std::fs::write(&path, "base_url = \"https://api.example.com\"").unwrap();
+        let legacy = load_from(&path);
+        assert_eq!(legacy.spool_limit_mb, 256);
+        assert_eq!(legacy.connect_timeout_secs, 30);
+        assert_eq!(legacy.read_timeout_secs, 300);
     }
 
     #[test]

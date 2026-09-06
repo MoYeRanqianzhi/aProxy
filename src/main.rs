@@ -586,24 +586,29 @@ async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemon_child: bo
     });
 
     // 运行期日志轮转：守护日志只在启动时做过一次 2MiB 检查，长期运行的实例
-    // （正是本项目的目标形态）仍会无限膨胀。每小时检查一次，超限截断；
+    // （正是本项目的目标形态）仍会无限膨胀。每小时检查一次，超过 settings 的
+    // log_rotate_mb（全局治理项，默认 8MB，0=不轮转）即截断；
     // `aproxy logs` 跟随器已有截断检测（文件变小时自动从头重跟），不会被破坏。
     // 仅守护实例执行——前台实例的日志走控制台，无文件可轮转。
     if daemon_child {
-        let rotate_path = daemon::logs_dir().join(format!("{port}.log"));
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                if let Ok(meta) = std::fs::metadata(&rotate_path)
-                    && meta.len() > 8 * 1024 * 1024
-                {
-                    // 截断而非 rename 轮转：跟随器与启动时的 2MiB 检查都按
-                    // 「文件变小」设计，且不产生需要再治理的轮转文件堆
-                    let _ = std::fs::write(&rotate_path, b"");
-                    tracing::info!("日志文件超过 8MiB，已截断");
+        let rotate_limit = settings::load().log_rotate_mb.saturating_mul(1024 * 1024);
+        if rotate_limit > 0 {
+            let rotate_path = daemon::logs_dir().join(format!("{port}.log"));
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    if let Ok(meta) = std::fs::metadata(&rotate_path)
+                        && meta.len() > rotate_limit
+                    {
+                        // 截断而非 rename 轮转：跟随器与启动时的 2MiB 检查都按
+                        // 「文件变小」设计，且不产生需要再治理的轮转文件堆。
+                        // 截断后补 BOM（tracing 的 append 句柄随后从新 EOF 写起）
+                        let _ = std::fs::write(&rotate_path, daemon::UTF8_BOM);
+                        tracing::info!("日志文件超过 {} MB，已截断", rotate_limit / 1024 / 1024);
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     // 日志与控制台都可能被粘贴分享，内嵌凭据的 base_url 一律打码后输出
@@ -1046,6 +1051,10 @@ async fn follow_log_file(path: &std::path::Path, port: &str) -> Result<(), Strin
         .map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    // 从文件头读起时剥掉 UTF-8 BOM（零宽字符，避免混进首行输出）
+    if start == 0 && buf.starts_with(&daemon::UTF8_BOM) {
+        buf.drain(..3);
+    }
     if start > 0 {
         // 丢弃残行（回读起点未必落在行边界；找不到 \n 则整个窗口都是残行，全部丢弃）
         if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
@@ -1083,7 +1092,8 @@ async fn follow_log_file(path: &std::path::Path, port: &str) -> Result<(), Strin
         }
         let cur_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(pos);
         if cur_len < pos {
-            // 文件被截断（守护启动时 >2MiB 清空）：从头重新跟踪
+            // 文件被截断（启动时 2MiB 清空或运行期轮转）：从头重新跟踪。
+            // 新文件头可能是 BOM（轮转后按 BOM 开头），从 0 读时剥掉
             println!("── 日志文件已被截断，重新从头跟踪 ──");
             pos = 0;
             pending.clear();
@@ -1098,6 +1108,9 @@ async fn follow_log_file(path: &std::path::Path, port: &str) -> Result<(), Strin
             let mut chunk = Vec::with_capacity((cur_len - pos) as usize);
             if f.read_to_end(&mut chunk).is_err() {
                 continue;
+            }
+            if pos == 0 && chunk.starts_with(&daemon::UTF8_BOM) {
+                chunk.drain(..3);
             }
             pos += chunk.len() as u64;
             pending.extend_from_slice(&chunk);
@@ -1172,7 +1185,9 @@ fn init_stdout_logging() {
 }
 
 /// 守护子进程日志：写 `~/.aproxy/logs/<端口>.log`（超过 2 MiB 截断重写，
-/// 保留最近一次运行的日志即可，避免无限膨胀）。
+/// 保留最近一次运行的日志即可，避免无限膨胀）。文件创建/截断时写入 UTF-8
+/// BOM——无 BOM 的 UTF-8 会被按 ANSI 探测的查看器（记事本旧版/部分编辑器）
+/// 误判为 GBK 而显示中文乱码。
 fn init_daemon_logging(listen_addr: &str) {
     let _ = std::fs::create_dir_all(daemon::logs_dir());
     let path = daemon::logs_dir().join(format!("{}.log", daemon::port_of(listen_addr)));
@@ -1187,6 +1202,7 @@ fn init_daemon_logging(listen_addr: &str) {
         .open(&path)
     {
         Ok(file) => {
+            let _ = daemon::write_utf8_bom_if_empty(&path);
             tracing_subscriber::fmt()
                 .with_env_filter(
                     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -1447,6 +1463,18 @@ fn handle_config_cmd(path: PathBuf, args: ConfigArgs) {
             println!("max_retry_backoff_secs = 0（所有重试零延迟）");
         } else {
             println!("max_retry_backoff_secs = {}", cfg.max_retry_backoff_secs);
+        }
+        println!("spool_limit_mb          = {}", cfg.spool_limit_mb);
+        // 0 表示不设限，语义特殊，提示出来
+        if cfg.connect_timeout_secs == 0 {
+            println!("connect_timeout_secs    = 0（不设限）");
+        } else {
+            println!("connect_timeout_secs    = {}", cfg.connect_timeout_secs);
+        }
+        if cfg.read_timeout_secs == 0 {
+            println!("read_timeout_secs       = 0（不设限）");
+        } else {
+            println!("read_timeout_secs       = {}", cfg.read_timeout_secs);
         }
         println!(
             "proxy          = {}",

@@ -65,19 +65,23 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Config) -> Self {
         // 超时策略：不设总时限（会掐断超过时限的慢流式生成，导致无限重试永不成功），
-        // 只限制连接建立（30s）与两次读到数据之间的间隔（5 分钟）。
+        // 只限制连接建立与两次读到数据之间的间隔（均可经 config.toml 调整）。
         // 注意 read_timeout 同样钳制首字节等待——LLM 上游排队时 TTFB 可达数十秒，
-        // 阈值过小（如 60s）会把「慢但活着」的上游变成确定性无限重试；5 分钟
-        // 无任何字节才判定为真停滞。spool 设计本身容忍慢流。
+        // 阈值过小（如 60s）会把「慢但活着」的上游变成确定性无限重试。spool 设计
+        // 本身容忍慢流。0 表示该项不设限。
         let mut builder = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .read_timeout(Duration::from_secs(300))
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(30))
             // 透明代理不跟随重定向：跟随会把 Authorization/api_key 与请求体外带到
             // 3xx 指向的任意主机，且 3xx 永远到不了客户端；禁用后 3xx 作为普通
             // 成功响应原样回放（is_retryable_status 本就排除 3xx）。
             .redirect(reqwest::redirect::Policy::none());
+        if config.connect_timeout_secs > 0 {
+            builder = builder.connect_timeout(Duration::from_secs(config.connect_timeout_secs));
+        }
+        if config.read_timeout_secs > 0 {
+            builder = builder.read_timeout(Duration::from_secs(config.read_timeout_secs));
+        }
 
         // 显式配置代理：所有上游请求经该代理转发；reqwest 在 .proxy() 时会自动关闭
         // 系统代理（不再读取 HTTP_PROXY 等环境变量），避免两者互相干扰。
@@ -190,12 +194,14 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
 
     // 首轮（attempt 1）先行：成功则完整保真回放（status/headers 不失真），
     // 需要重试才进入重试通道——首轮成功是常态路径。
+    let max_spool_bytes = spool_limit_bytes(&state.config);
     let first = forward_once(
         &state.client,
         &method,
         &target_url,
         &headers,
         body_bytes.clone(),
+        max_spool_bytes,
     )
     .await;
 
@@ -260,8 +266,7 @@ fn should_retry_response(
     // 1. HTTP 状态码可重试：无论是否流式，都重试
     if retry::is_retryable_status(status.as_u16()) {
         tracing::warn!(attempt, status = %status, is_streaming, "上游返回可重试状态码，重试");
-        let preview = String::from_utf8_lossy(&body[..body.len().min(500)]);
-        tracing::warn!(preview = %preview, "错误响应预览");
+        tracing::warn!(preview = %preview_body(body, 500), "错误响应预览");
         return true;
     }
 
@@ -273,12 +278,42 @@ fn should_retry_response(
         retry::is_error_body(body)
     };
     if is_error {
-        let preview = String::from_utf8_lossy(&body[..body.len().min(1000)]);
-        tracing::warn!(attempt, is_streaming, preview = %preview, "上游返回错误内容，重试");
+        tracing::warn!(attempt, is_streaming, preview = %preview_body(body, 1000), "上游返回错误内容，重试");
         return true;
     }
 
     false
+}
+
+/// 错误响应体的日志预览。上游可能返回压缩/二进制错误体（如 zstd/gzip 压缩的
+/// 错误页——reqwest 未开自动解压以保真透传），直接 from_utf8_lossy 会把控制
+/// 字节渲染成整片乱码污染日志。判定：替换符/控制字符占比超阈值视为二进制，
+/// 改为 hex 摘要（可直接识别压缩 magic：zstd 28 b5 2f fd、gzip 1f 8b 等）。
+fn preview_body(body: &[u8], limit: usize) -> String {
+    let head = &body[..body.len().min(limit)];
+    // lossy 渲染后统计非文本占比：U+FFFD 与 C0 控制字符
+    let text = String::from_utf8_lossy(head);
+    let total = text.chars().count().max(1);
+    let weird = text
+        .chars()
+        .filter(|&c| c == '\u{FFFD}' || (c.is_control() && c != '\t' && c != '\n' && c != '\r'))
+        .count();
+    if weird * 10 >= total {
+        // 二进制/压缩内容：hex 前 48 字节足够识别压缩 magic 与排障
+        let hex: String = head.iter().take(48).map(|b| format!("{b:02x} ")).collect();
+        format!(
+            "（二进制/压缩内容，共 {} 字节，hex 前 48: {}…）",
+            body.len(),
+            hex.trim_end()
+        )
+    } else {
+        let s = text.trim_end();
+        if body.len() > limit {
+            format!("{s}…（截断，共 {} 字节）", body.len())
+        } else {
+            s.to_string()
+        }
+    }
 }
 
 /// 非 SSE 客户端的重试通道：从 attempt 2 起无限重试（attempt 1 已在 proxy_handler 完成），
@@ -292,6 +327,7 @@ async fn proxy_without_keepalive(
 ) -> Response {
     let mut attempt: u32 = 1;
     let max_backoff = state.config.max_retry_backoff_secs;
+    let max_spool_bytes = spool_limit_bytes(&state.config);
     loop {
         attempt += 1;
         let delay = retry::delay_for_attempt(attempt - 1, max_backoff);
@@ -308,6 +344,7 @@ async fn proxy_without_keepalive(
             &target_url,
             &headers,
             body_bytes.clone(),
+            max_spool_bytes,
         )
         .await;
 
@@ -375,6 +412,7 @@ async fn proxy_with_keepalive(
     // 后台任务：无限重试上游，期间按 keepalive_dur 发送 SSE 注释；成功后将上游响应分块转发。
     // 所有 send 都检查客户端是否已断开（channel 关闭 → 立即退出，不空转）。
     let state_bg = state.clone();
+    let max_spool_bytes = spool_limit_bytes(&state.config);
     tokio::spawn(async move {
         // 骨架发出后立即发首个心跳：客户端 idle 计时从收到字节起算
         if tx.send(Ok(heartbeat())).await.is_err() {
@@ -412,7 +450,14 @@ async fn proxy_with_keepalive(
                 let _ = gone_rx.wait_for(|v| *v).await;
             };
             let result = tokio::select! {
-                r = forward_once(&state_bg.client, &method, &target_url, &headers, body_bytes.clone()) => r,
+                r = forward_once(
+                    &state_bg.client,
+                    &method,
+                    &target_url,
+                    &headers,
+                    body_bytes.clone(),
+                    max_spool_bytes,
+                ) => r,
                 _ = client_gone => {
                     tracing::info!("客户端已断开，中止 in-flight 上游请求（保活通道）");
                     return;
@@ -523,9 +568,12 @@ enum ForwardResult {
     },
 }
 
-/// 响应体 spool 上限：防止失控/恶意上游把内存打爆。
-/// 超过该上限的响应无法完整缓冲，也就无法满足“spool 后回放”的设计，直接按 TooLarge 终态处理。
-const MAX_SPOOL_BYTES: usize = 256 * 1024 * 1024;
+/// 响应体 spool 上限（字节）：配置 spool_limit_mb（MB，最小 1）换算，
+/// 防止失控/恶意上游把内存打爆。超过上限的响应无法完整缓冲，直接按
+/// TooLarge 终态处理。
+fn spool_limit_bytes(config: &Config) -> usize {
+    (config.spool_limit_mb.max(1) as usize).saturating_mul(1024 * 1024)
+}
 
 async fn forward_once(
     client: &reqwest::Client,
@@ -533,6 +581,7 @@ async fn forward_once(
     url: &str,
     headers: &HeaderMap,
     body: Bytes,
+    max_spool_bytes: usize,
 ) -> ForwardResult {
     let reqwest_method =
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
@@ -587,7 +636,7 @@ async fn forward_once(
     loop {
         match resp_stream.chunk().await {
             Ok(Some(chunk)) => {
-                if spooled.len() + chunk.len() > MAX_SPOOL_BYTES {
+                if spooled.len() + chunk.len() > max_spool_bytes {
                     return ForwardResult::TooLarge;
                 }
                 spooled.extend_from_slice(&chunk);
@@ -645,6 +694,31 @@ fn build_stream_replay_response(status: StatusCode, headers: HeaderMap, body: By
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    // ---- preview_body：二进制/压缩体不污染日志（回归：zstd 错误体曾被
+    // from_utf8_lossy 渲染成整片乱码）----
+
+    #[test]
+    fn preview_of_binary_shows_hex_not_mojibake() {
+        // zstd magic 开头的压缩体（真实日志中出现过）
+        let mut zstd_like = vec![0x28, 0xb5, 0x2f, 0xfd];
+        zstd_like.extend((0..200u8).map(|i| i.wrapping_mul(37)));
+        let p = preview_body(&zstd_like, 500);
+        assert!(p.contains("二进制/压缩内容"), "{p}");
+        assert!(p.contains("28 b5 2f fd"), "hex 应含 zstd magic: {p}");
+        assert!(!p.contains('\u{FFFD}'), "不应输出替换符: {p}");
+    }
+
+    #[test]
+    fn preview_of_text_is_plain_and_truncated() {
+        let text = "上游过载：请稍后重试".repeat(50);
+        let p = preview_body(text.as_bytes(), 100);
+        assert!(p.contains("上游过载"), "{p}");
+        assert!(p.contains("截断"), "{p}");
+        // 正常 JSON 错误体
+        let json = br#"{"type":"error","error":{"type":"overloaded"}}"#;
+        assert_eq!(preview_body(json, 500), String::from_utf8_lossy(json));
+    }
 
     // ---- is_hop_header：hop-by-hop 头识别（大小写不敏感）----
 

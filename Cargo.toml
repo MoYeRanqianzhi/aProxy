@@ -42,3 +42,22 @@ windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Securit
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 tempfile = "3"
+
+# release 优化：代理是网络 IO 密集型（转发时间花在等上游/等客户端，CPU 占比
+# 极低），speed 与 size 基本不冲突，可兼得：
+# - lto="fat" + codegen-units=1：跨 crate 全量优化，热路径内联与死代码消除
+#   最大化（speed+size 双收益），代价是编译时间显著变长——release 构建不
+#   频繁，可接受
+# - opt-level="z"：对 IO 密集负载的吞吐无可测影响，二进制却显著更小
+# - panic 保持默认 unwind（不设 panic="abort"）：axum/hyper 每连接是独立
+#   tokio 任务，handler panic 时 unwind 只断该连接、实例继续服务；abort 会
+#   让任何一处 bug 杀掉整个实例——对「无限重试不间断」的使命与依赖本代理
+#   的 agent 会话是严重回退，且 LTO 后 abort 省的体积有限，不值得
+# - strip=true：符号/调试信息不参与运行（排查 backtrace 用 dev 构建复现）
+# - target-cpu 不设：构建产物会分发到不同机器，native 指令集会在他机直接
+#   非法指令崩溃
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = "z"
+strip = true

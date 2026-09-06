@@ -8,4 +8,4 @@
 - [warning-zero-policy](memory/2026-09-04-warning-zero-policy.md) — 编译器零警告零建议纪律：可修复的修复、故意保留的 #[allow]+理由；clippy --fix 后必须 cargo fmt [[warning-zero-policy]]
 - [alias-settings](memory/2026-09-05-alias-settings.md) — 别名系统（3e5e1a1）：settings.json 内部配置层与 config.toml 分层；start/stop <别名>；--daemon-child 必须 global=true 的教训与 settings 测试污染修复 [[alias-settings]] [[daemon-model]]
 - [log-mojibake](memory/2026-09-07-log-mojibake.md) — 日志乱码唯一根因：上游 zstd 压缩错误体被 lossy 渲染→preview_body hex 摘要修复；BOM 曾错误添加后撤销（教训：修复范围须与取证对齐） [[log-mojibake]] [[daemon-model]]
-- [protect-production-instances](memory/2026-09-07-protect-production-instances.md) — 铁律+教训：绝不 stop 用户生产实例（stop default 曾命中 12345 险断会话）；破坏性测试前备好即时恢复 [[protect-production-instances]] [[daemon-model]]
+- [protect-production-instances](memory/2026-09-07-protect-production-instances.md) — 铁律+教训：绝不 stop 用户生产实例（stop default 曾命中 12345 并实际停掉（已即时恢复））；破坏性测试前备好即时恢复 [[protect-production-instances]] [[daemon-model]]

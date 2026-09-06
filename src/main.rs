@@ -185,11 +185,29 @@ async fn main() {
     let cli = Cli::parse();
 
     // 实际生效的配置文件路径：--config 显式指定 > settings.json 的 default_config
-    // （用户可把日常主力配置换成任意文件）> 默认 ~/.aproxy/config.toml
-    let cfg_path = cli
-        .config
-        .clone()
-        .unwrap_or_else(settings::default_config_path);
+    // （用户可把日常主力配置换成任意文件）> 默认 ~/.aproxy/config.toml。
+    // default_config 失效（文件被删/移动）必须在此明确报错：静默回退默认配置会让
+    // 用户在错误的配置文件上排障（报错信息指向 config.toml，而他配置的是另一个文件）
+    let cfg_path = match cli.config.clone() {
+        Some(p) => p,
+        None => {
+            let s = settings::load();
+            match &s.default_config {
+                Some(p) => {
+                    let path = settings::expand_path(p);
+                    if !path.is_file() {
+                        eprintln!(
+                            "settings.json 指定的默认配置文件不存在: {}\n用 aproxy config --set-default <路径> 重新指定，或 aproxy config --clear-default 取消",
+                            path.display()
+                        );
+                        std::process::exit(1);
+                    }
+                    path
+                }
+                None => config::config_path(),
+            }
+        }
+    };
 
     // 日志初始化：守护子进程无控制台，写日志文件；其余走 stdout（RUST_LOG 可覆盖）
     if cli.daemon_child {
@@ -242,10 +260,17 @@ fn resolve_config_target(target: &str) -> Option<PathBuf> {
 
 /// 配置路径的运行实例匹配键：绝对化 + 分隔符统一 + 小写（Windows 文件系统
 /// 大小写不敏感；别名表存的是 add 时的写法，与注册表记录的写法可能不同）。
+/// \\?\ verbatim 前缀一并剥除——absolute 不产生它，但注册表里可能存有
+/// 历史版本（canonicalize）或外部工具写入的带前缀路径。
 fn config_path_key(p: &str) -> String {
     let abs = std::path::absolute(p)
         .map(|a| a.display().to_string())
         .unwrap_or_else(|_| p.to_string());
+    let abs = abs
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| abs.strip_prefix(r"\\?\").map(String::from))
+        .unwrap_or(abs);
     #[cfg(windows)]
     {
         abs.replace('/', "\\").to_lowercase()

@@ -9,6 +9,8 @@
 ///
 /// `attempt` 为 1-based：第一次重试为 1，第二次为 2……
 /// `max_backoff_secs` 为退避封顶（配置项，0 = 所有重试立即执行）。
+/// 指数增长按封顶动态截断：封顶 1000 时序列可增长到 5s…640s、1280s→1000，
+/// 而非被写死的 min(6) 卡在 320——否则用户配了更大封顶却完全无效。
 pub fn delay_for_attempt(attempt: u32, max_backoff_secs: u64) -> std::time::Duration {
     if max_backoff_secs == 0 {
         return std::time::Duration::ZERO;
@@ -18,7 +20,13 @@ pub fn delay_for_attempt(attempt: u32, max_backoff_secs: u64) -> std::time::Dura
     } else {
         // attempt 4 -> 5s, 5 -> 10s, 6 -> 20s, ...
         let exp = attempt - 4;
-        let secs = 5u64.saturating_mul(1u64 << exp.min(6));
+        // exp 钳位到「5*2^exp 首次 ≥ 封顶」处：超过后 min(cap) 恒为 cap，再增大
+        // 只会溢出。cap/5 取 log2；cap<5 时钳到 0（恒返回 cap）。另受 1<<exp
+        // 不溢出约束（exp ≤ 63），双 min 保证 saturating_mul 不会真的溢出。
+        let cap_exp = u64::BITS - (max_backoff_secs / 5).max(1).leading_zeros();
+        let overflow_exp = u64::BITS - 1 - 2; // 5 * 2^exp ≤ u64::MAX ⇒ exp ≤ 61
+        let exp = exp.min(cap_exp).min(overflow_exp);
+        let secs = 5u64.saturating_mul(1u64 << exp);
         std::time::Duration::from_secs(secs.min(max_backoff_secs))
     }
 }
@@ -197,6 +205,37 @@ mod tests {
         // 自定义封顶：低于默认 320 时按配置截断
         assert_eq!(delay_for_attempt(8, 60), std::time::Duration::from_secs(60));
         assert_eq!(delay_for_attempt(9, 60), std::time::Duration::from_secs(60));
+        // 高于默认 320：指数增长必须继续到封顶（回归：exp 曾被写死 min(6)，
+        // 配 1000 无效）；cap=1000 序列 5,10,…,320,640,1280→1000
+        assert_eq!(
+            delay_for_attempt(10, 1000),
+            std::time::Duration::from_secs(320)
+        );
+        assert_eq!(
+            delay_for_attempt(11, 1000),
+            std::time::Duration::from_secs(640)
+        );
+        assert_eq!(
+            delay_for_attempt(12, 1000),
+            std::time::Duration::from_secs(1000)
+        );
+        assert_eq!(
+            delay_for_attempt(13, 1000),
+            std::time::Duration::from_secs(1000)
+        );
+        // cap 小于 5：恒返回 cap 本身
+        assert_eq!(delay_for_attempt(4, 3), std::time::Duration::from_secs(3));
+        assert_eq!(delay_for_attempt(5, 3), std::time::Duration::from_secs(3));
+        // 极大封顶不溢出：指数增长持续到 exp=61（5·2^61 是 5·2^e ≤ u64::MAX
+        // 的上界），天文数字但数学正确、不 panic——封顶本身就是用户配置
+        assert_eq!(
+            delay_for_attempt(4, u64::MAX),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            delay_for_attempt(u32::MAX, u64::MAX),
+            std::time::Duration::from_secs(5u64 << 61)
+        );
     }
 
     #[test]

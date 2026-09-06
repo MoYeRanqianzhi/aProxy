@@ -536,8 +536,9 @@ async fn proxy_with_keepalive(
                         return;
                     }
                     const CHUNK_SIZE: usize = 8 * 1024;
+                    // slice_ref 零拷贝共享原分配（取舍同 build_stream_replay_response）
                     for chunk in body.as_ref().chunks(CHUNK_SIZE) {
-                        let b = Bytes::copy_from_slice(chunk);
+                        let b = body.slice_ref(chunk);
                         if tx.send(Ok(b)).await.is_err() {
                             return;
                         }
@@ -709,12 +710,12 @@ fn build_stream_replay_response(status: StatusCode, headers: HeaderMap, body: By
         return resp.body(Body::empty()).unwrap().into_response();
     }
 
-    // 将 Bytes 按 8 KiB 切块（copy_from_slice 深拷贝；量级小，成本可忽略）
+    // 将 Bytes 按 8 KiB 零拷贝切块：slice_ref 是引用计数切片，共享同一底层
+    // 分配——峰值内存为响应体一份而非深拷贝的两份。代价是任一未消费的块
+    // 都会把整份分配钉到流结束/断开；body 本就因重试保障全量驻留 spool，
+    // 此处无额外驻留
     const CHUNK_SIZE: usize = 8 * 1024;
-    let chunks: Vec<Bytes> = body
-        .chunks(CHUNK_SIZE)
-        .map(Bytes::copy_from_slice)
-        .collect();
+    let chunks: Vec<Bytes> = body.chunks(CHUNK_SIZE).map(|c| body.slice_ref(c)).collect();
 
     let stream = futures_util::stream::iter(chunks.into_iter().map(Ok::<Bytes, std::io::Error>));
     let body = Body::from_stream(stream);
@@ -725,6 +726,43 @@ fn build_stream_replay_response(status: StatusCode, headers: HeaderMap, body: By
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    // ---- 流式回放零拷贝：切块必须共享原 body 的底层分配（slice_ref 引用
+    // 计数切片），而非 copy_from_slice 深拷贝——深拷贝会让峰值内存瞬时
+    // 翻倍（50MB SSE 实测曾达 64MB）。指针区间断言：任何拷贝都会落到
+    // 原分配之外的新地址 ----
+
+    #[tokio::test]
+    async fn replay_chunks_are_zero_copy_views_of_source() {
+        // 20 KiB → 3 块（8K + 8K + 4K），含非整除边界
+        let body = Bytes::from(vec![0xA5u8; 20 * 1024]);
+        let base = body.as_ptr() as usize;
+        let end = base + body.len();
+
+        let resp = build_stream_replay_response(StatusCode::OK, HeaderMap::new(), body.clone());
+        // 逐帧轮询响应体：axum 的 Body::from_stream 原样透传我们产出的 Bytes
+        //（不再复制），故帧数据指针可直接检验
+        let mut streamed = resp.into_body();
+        let mut frames = Vec::new();
+        while let Some(frame) = http_body_util::BodyExt::frame(&mut streamed)
+            .await
+            .transpose()
+            .unwrap()
+        {
+            if let Some(data) = frame.data_ref() {
+                let p = data.as_ptr() as usize;
+                assert!(
+                    (base..end).contains(&p),
+                    "回放块指针 {p:#x} 必须落在原 body 分配 [{base:#x}, {end:#x}) 内（零拷贝）"
+                );
+                frames.push(data.to_vec());
+            }
+        }
+        assert_eq!(frames.len(), 3, "20 KiB 应切为 3 块");
+        // 各块按序还原 == 原 body（切块只分不变）
+        let reassembled: Vec<u8> = frames.into_iter().flatten().collect();
+        assert_eq!(reassembled, body.as_ref());
+    }
 
     // ---- preview_body：二进制/压缩体不污染日志（回归：zstd 错误体曾被
     // from_utf8_lossy 渲染成整片乱码）----

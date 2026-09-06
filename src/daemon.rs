@@ -27,25 +27,6 @@ pub fn logs_dir() -> PathBuf {
     crate::config::config_dir().join("logs")
 }
 
-/// UTF-8 BOM（EF BB BF）：标记文件编码，让按 ANSI/GBK 探测的查看器
-/// （记事本旧版、PowerShell Get-Content、部分编辑器）正确识别 UTF-8，
-/// 否则中文日志在这些工具里显示为乱码。
-pub const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
-
-/// 文件为空（新建或刚截断）时写入 UTF-8 BOM。已有内容不动——BOM 只能
-/// 出现在文件头，重复写会插进中间。
-pub fn write_utf8_bom_if_empty(path: &std::path::Path) -> std::io::Result<()> {
-    let empty = std::fs::metadata(path)
-        .map(|m| m.len() == 0)
-        .unwrap_or(false);
-    if empty {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(path)?;
-        f.write_all(&UTF8_BOM)?;
-    }
-    Ok(())
-}
-
 /// 实例的 IPC 端点：windows 为命名管道名，unix 为 UDS 路径。
 /// 端口号唯一区分实例（同端口=同实例；多实例的监听端口必然互不相同）。
 pub fn endpoint_for(port: &str) -> String {
@@ -862,25 +843,5 @@ mod tests {
             !logs.path().join("59813.log").exists(),
             "彻底死亡实例的孤儿日志应被删除"
         );
-    }
-
-    #[test]
-    fn utf8_bom_written_only_when_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.log");
-
-        // 空文件（新建）→ 写入 BOM
-        std::fs::File::create(&path).unwrap();
-        write_utf8_bom_if_empty(&path).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), UTF8_BOM);
-
-        // 已有内容 → 不动（BOM 只能在文件头，重复写会插进中间）
-        write_utf8_bom_if_empty(&path).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), UTF8_BOM);
-
-        // 截断为空后 → 再补 BOM（运行期轮转/启动截断场景）
-        std::fs::write(&path, b"").unwrap();
-        write_utf8_bom_if_empty(&path).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), UTF8_BOM);
     }
 }

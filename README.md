@@ -48,6 +48,8 @@ aproxy
 | `aproxy logs [PORT]` | 连接实例实时输出日志；单实例可省略；不支持 `all` |
 | `aproxy restore` | 恢复崩溃/重启前在运行的实例；无实例则静默结束（开机自启友好） |
 | `aproxy alias add\|remove\|list` | 管理配置别名（存于 settings.json） |
+| `aproxy doctor` | 配置体检：settings.json error 级检查 + 别名配置与目录 toml 审查（warning） |
+| `aproxy find [关键字]` | 从配置目录发现全部配置；`--aliased/--unaliased --port PORT` 过滤 |
 | `aproxy config [选项]` | 查看或修改配置（`--show` 打印当前配置） |
 
 通用参数：`--config <PATH>`（指定配置文件，多开用）、`--listen <ADDR>`、`--proxy <URL>`、`--api-key <KEY>`（启动路径仅本次生效）。
@@ -90,15 +92,23 @@ listen_addr = "127.0.0.1:12345"          # 本地监听
 # keepalive_interval_secs = 15           # 重试期间 SSE 心跳间隔，0 关闭
 # proxy = "http://127.0.0.1:7890"        # 上游经代理转发（支持 socks5，可配用户名密码）
 # extra_headers / override_headers       # 追加/覆盖请求头
+# max_retry_backoff_secs = 320           # 重试退避封顶（0 = 所有重试零延迟）
+# spool_limit_mb = 256                   # 上游响应缓冲上限（MB）
+# connect_timeout_secs = 30              # 上游连接建立超时（0 = 不设限）
+# read_timeout_secs = 300                # 两次读到数据间隔超时（0 = 不设限）
 ```
 
 运行数据在 `~/.aproxy/`：`run/`（实例注册与恢复记录）、`logs/`（守护日志，自动清理与轮转）、
-`settings.json`（内部配置：别名等，程序管理不建议手改）。
+`settings.json`（内部配置：别名、默认配置文件、配置目录列表、日志轮转阈值等，
+程序管理不建议手改）。
+
+配置目录列表默认含 `~/.aproxy/` 与 `~/.aproxy/configs/`，`aproxy find`/`aproxy doctor`
+会扫描其中的 `*.toml`（不递归）。
 
 ## 开发
 
 ```powershell
-cargo test          # 全量测试（69 单测 + 28 集成）
+cargo test          # 全量测试（89 单测 + 31 集成）
 cargo clippy --all-targets   # 必须零警告（项目纪律）
 cargo fmt --check
 ```

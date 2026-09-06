@@ -7,3 +7,4 @@
 - [daemon-model](memory/2026-08-30-daemon-model.md) — 守护进程运行模型（alpha.3）：后台启动+命名管道 IPC（不占代理端口铁律）+status/stop 多实例；start 挂起之谜已解（句柄泄漏，b31461c） [[daemon-model]] [[review-findings]]
 - [warning-zero-policy](memory/2026-09-04-warning-zero-policy.md) — 编译器零警告零建议纪律：可修复的修复、故意保留的 #[allow]+理由；clippy --fix 后必须 cargo fmt [[warning-zero-policy]]
 - [alias-settings](memory/2026-09-05-alias-settings.md) — 别名系统（3e5e1a1）：settings.json 内部配置层与 config.toml 分层；start/stop <别名>；--daemon-child 必须 global=true 的教训与 settings 测试污染修复 [[alias-settings]] [[daemon-model]]
+- [log-mojibake](memory/2026-09-07-log-mojibake.md) — 日志乱码两案：控制台 GBK→65001；错误预览乱码实为上游 zstd 压缩体被 lossy 渲染→hex 摘要 + 日志 BOM [[log-mojibake]] [[daemon-model]]

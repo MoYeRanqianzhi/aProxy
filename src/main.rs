@@ -7,6 +7,8 @@ use tracing_subscriber::EnvFilter;
 
 use aproxy::config::{self, Config};
 use aproxy::daemon;
+use aproxy::doctor;
+use aproxy::find;
 use aproxy::settings;
 
 #[derive(Parser, Debug, Clone)]
@@ -51,7 +53,7 @@ struct Cli {
     command: Option<Commands>,
 }
 
-#[derive(Subcommand, Debug, Clone)]
+#[derive(Subcommand, Debug, Clone, PartialEq)]
 enum Commands {
     /// 列出运行中的 aProxy 实例（来自实例注册表，存活以 IPC 探测为准）
     Status,
@@ -94,11 +96,32 @@ enum Commands {
         cmd: AliasCmd,
     },
 
+    /// 全面体检全部配置（settings.json error 级检查 + 别名配置深入审查 +
+    /// 配置目录 toml 扫描，均含端口冲突检测）
+    Doctor,
+
+    /// 从配置目录列表（settings.json 的 config_dirs + 默认两个）发现全部
+    /// config（toml），支持按别名归属与关键字/端口过滤
+    Find {
+        /// 别名归属过滤：--aliased 只列已配别名的，--unaliased 只列未配的
+        #[arg(long, conflicts_with = "unaliased")]
+        aliased: bool,
+        /// 只列未配置别名的
+        #[arg(long)]
+        unaliased: bool,
+        /// 关键字过滤：匹配路径片段或别名（大小写不敏感）
+        #[arg(value_name = "QUERY")]
+        query: Option<String>,
+        /// 按监听端口过滤
+        #[arg(long, value_name = "PORT")]
+        port: Option<u16>,
+    },
+
     /// 查看或修改配置（配置文件位于 ~/.aproxy/config.toml）
     Config(ConfigArgs),
 }
 
-#[derive(Subcommand, Debug, Clone)]
+#[derive(Subcommand, Debug, Clone, PartialEq)]
 enum AliasCmd {
     /// 添加/覆盖别名（path 省略时指向默认配置 ~/.aproxy/config.toml）
     Add {
@@ -119,7 +142,7 @@ enum AliasCmd {
 
 /// `aproxy config` 的参数集。独立成结构体以整体传递给处理函数，
 /// 避免 main 与函数之间逐字段搬运十几个参数。
-#[derive(clap::Args, Debug, Clone)]
+#[derive(clap::Args, Debug, Clone, PartialEq)]
 struct ConfigArgs {
     /// 设置上游 base URL，例如 https://api.anthropic.com
     #[arg(long, value_name = "URL")]
@@ -229,6 +252,14 @@ async fn main() {
         return;
     }
 
+    // settings.json 检查（error 级）：每次软件运行都执行——别名损坏、JSON 语法
+    // 错误等会严重影响 start/stop 按名字操作，必须立刻报出。不退出：管理命令
+    // status/stop 不能因内部配置损坏而不可用。doctor 子命令会再次汇总（含分级），
+    // 此处跳过避免重复输出。
+    if cli.command != Some(Commands::Doctor) {
+        settings::check_and_report();
+    }
+
     // 子命令分派；无子命令 = 启动代理（默认后台）
     match cli.command {
         Some(Commands::Status) => handle_status_cmd().await,
@@ -240,6 +271,13 @@ async fn main() {
         Some(Commands::Logs { target }) => handle_logs_cmd(target).await,
         Some(Commands::Restore) => handle_restore_cmd().await,
         Some(Commands::Alias { cmd }) => handle_alias_cmd(cmd),
+        Some(Commands::Doctor) => handle_doctor_cmd().await,
+        Some(Commands::Find {
+            aliased,
+            unaliased,
+            query,
+            port,
+        }) => handle_find_cmd(aliased, unaliased, query, port),
         Some(Commands::Config(args)) => handle_config_cmd(cfg_path, args),
         None => handle_start_cmd(&cli, cfg_path, None).await,
     }
@@ -258,28 +296,9 @@ fn resolve_config_target(target: &str) -> Option<PathBuf> {
     None
 }
 
-/// 配置路径的运行实例匹配键：绝对化 + 分隔符统一 + 小写（Windows 文件系统
-/// 大小写不敏感；别名表存的是 add 时的写法，与注册表记录的写法可能不同）。
-/// \\?\ verbatim 前缀一并剥除——absolute 不产生它，但注册表里可能存有
-/// 历史版本（canonicalize）或外部工具写入的带前缀路径。
-fn config_path_key(p: &str) -> String {
-    let abs = std::path::absolute(p)
-        .map(|a| a.display().to_string())
-        .unwrap_or_else(|_| p.to_string());
-    let abs = abs
-        .strip_prefix(r"\\?\UNC\")
-        .map(|rest| format!(r"\\{rest}"))
-        .or_else(|| abs.strip_prefix(r"\\?\").map(String::from))
-        .unwrap_or(abs);
-    #[cfg(windows)]
-    {
-        abs.replace('/', "\\").to_lowercase()
-    }
-    #[cfg(not(windows))]
-    {
-        abs
-    }
-}
+/// 配置路径的运行实例匹配键：下沉到 settings::path_match_key（别名匹配、
+/// 配置目录去重、doctor 扫描共用同一比较规则）。
+use settings::path_match_key as config_path_key;
 
 /// 启动路径共用的配置解析：显式配置路径必须存在（打错路径时报明确错误而非
 /// 静默回退默认配置）、CLI 覆盖参数、normalize、validate。
@@ -893,6 +912,52 @@ fn handle_alias_cmd(cmd: AliasCmd) {
     }
 }
 
+/// `aproxy doctor`：配置体检。settings.json 的 error 级检查每次软件运行都会
+/// 执行；别名配置深入审查与目录 toml 扫描（warning 级）只在此处执行。
+async fn handle_doctor_cmd() {
+    println!("aProxy 配置体检");
+    println!("════════════════");
+    let report = doctor::run(&settings::settings_path());
+    if report.is_clean() {
+        println!("全部配置正常，未发现问题。");
+        return;
+    }
+    report.print();
+    if report.error_count() > 0 {
+        println!(
+            "\nerror 级问题会影响按名字的 start/stop 等操作，建议先修复；warning 级仅供参考。"
+        );
+    }
+}
+
+/// `aproxy find [查询] [--aliased|--unaliased] [--port 端口]`：
+/// 从配置目录列表发现全部配置并列出。
+fn handle_find_cmd(aliased: bool, unaliased: bool, query: Option<String>, port: Option<u16>) {
+    let settings = settings::load();
+    let filter = if aliased {
+        find::AliasFilter::Aliased
+    } else if unaliased {
+        find::AliasFilter::Unaliased
+    } else {
+        find::AliasFilter::All
+    };
+    let mut items: Vec<_> = find::discover(&settings)
+        .into_iter()
+        .filter(|d| match filter {
+            find::AliasFilter::All => true,
+            find::AliasFilter::Aliased => !d.aliases.is_empty(),
+            find::AliasFilter::Unaliased => d.aliases.is_empty(),
+        })
+        .filter(|d| query.as_deref().is_none_or(|q| d.matches_query(q)))
+        .filter(|d| port.is_none_or(|p| d.matches_port(p)))
+        .collect();
+    // --port 过滤下不可解析的配置必然不匹配，无需特判；空结果统一提示
+    if let Some(p) = port {
+        items.retain(|d| d.matches_port(p));
+    }
+    find::print_list(&items);
+}
+
 /// `aproxy logs [PORT]`：连接到运行中的实例并实时输出其守护日志。
 /// 语义与 stop 一致：单实例可省略端口；多实例必须指定；不支持 all
 /// （一次只能连接一个实例，传入 all 视为端口解析失败）。
@@ -1177,27 +1242,8 @@ fn parse_kv(s: &str) -> Option<(String, String)> {
     Some((k.to_string(), v.to_string()))
 }
 
-/// base_url 展示打码：内嵌 userinfo（`https://user:pass@host`）时隐去密码段。
-/// 无凭据（绝大多数情况）或解析失败时原样返回。
-fn mask_base_url(raw: &str) -> String {
-    let Ok(url) = url::Url::parse(raw) else {
-        return raw.to_string();
-    };
-    if url.password().is_none() {
-        return raw.to_string();
-    }
-    let host = url.host_str().unwrap_or("");
-    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
-    let path = url.path();
-    format!(
-        "{}://{}:***@{}{}{}",
-        url.scheme(),
-        url.username(),
-        host,
-        port,
-        path
-    )
-}
+/// base_url 展示打码：下沉到 config::mask_base_url（find/doctor 等 lib 侧共用）。
+use config::mask_base_url;
 
 /// 展示前守卫：配置文件存在但解析失败时 load() 会静默回退默认值，`--show` 打印的
 /// 「当前配置」并非用户文件的真实内容——至少要警告，避免误导排障。

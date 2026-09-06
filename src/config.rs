@@ -213,6 +213,28 @@ pub fn load() -> Config {
     load_from(&config_path())
 }
 
+/// base_url 展示打码：内嵌 userinfo（`https://user:pass@host`）时隐去密码段。
+/// 无凭据（绝大多数情况）或解析失败时原样返回。
+pub fn mask_base_url(raw: &str) -> String {
+    let Ok(url) = url::Url::parse(raw) else {
+        return raw.to_string();
+    };
+    if url.password().is_none() {
+        return raw.to_string();
+    }
+    let host = url.host_str().unwrap_or("");
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let path = url.path();
+    format!(
+        "{}://{}:***@{}{}{}",
+        url.scheme(),
+        url.username(),
+        host,
+        port,
+        path
+    )
+}
+
 /// 加载指定路径的配置：语义同 `load`（不存在/解析失败回退默认配置）。
 /// 多开场景由 `--config <PATH>` 显式指定路径；是否要求文件存在由调用方决定。
 pub fn load_from(path: &std::path::Path) -> Config {

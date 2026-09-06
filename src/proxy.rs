@@ -291,9 +291,10 @@ async fn proxy_without_keepalive(
     body_bytes: Bytes,
 ) -> Response {
     let mut attempt: u32 = 1;
+    let max_backoff = state.config.max_retry_backoff_secs;
     loop {
         attempt += 1;
-        let delay = retry::delay_for_attempt(attempt - 1);
+        let delay = retry::delay_for_attempt(attempt - 1, max_backoff);
         if !delay.is_zero() {
             tracing::warn!(attempt, delay_ms = delay.as_millis() as u64, "重试延迟");
             tokio::time::sleep(delay).await;
@@ -381,9 +382,10 @@ async fn proxy_with_keepalive(
         }
 
         let mut attempt: u32 = 1;
+        let max_backoff = state.config.max_retry_backoff_secs;
         loop {
             attempt += 1;
-            let delay = retry::delay_for_attempt(attempt - 1);
+            let delay = retry::delay_for_attempt(attempt - 1, max_backoff);
             if !delay.is_zero() {
                 // 在延迟期间按 keepalive_dur 切片发送心跳，避免客户端 idle 超时
                 let mut elapsed = Duration::ZERO;

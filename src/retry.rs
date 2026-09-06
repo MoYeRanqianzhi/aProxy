@@ -1,22 +1,25 @@
 //! 重试策略：无限重试，梯度延迟。
 //!
 //! - 第 1-3 次重试：0 延迟（立即重试，应对瞬时抖动）
-//! - 第 4 次起：5s, 10s, 20s, 40s, 80s, 160s, 320s，之后固定 320s（约 5 分钟）
+//! - 第 4 次起：5s, 10s, 20s, 40s, 80s, 160s, 320s…，增长到 `max_backoff_secs`
+//!   （配置项 `max_retry_backoff_secs`，默认 320）后固定该值；设为 0 则全部零延迟
 //! - attempt 从 1 开始计数（第 1 次重试对应 attempt=1）
 
 /// 根据重试次数计算延迟时长。
 ///
 /// `attempt` 为 1-based：第一次重试为 1，第二次为 2……
-/// 返回 `std::time::Duration`。
-pub fn delay_for_attempt(attempt: u32) -> std::time::Duration {
+/// `max_backoff_secs` 为退避封顶（配置项，0 = 所有重试立即执行）。
+pub fn delay_for_attempt(attempt: u32, max_backoff_secs: u64) -> std::time::Duration {
+    if max_backoff_secs == 0 {
+        return std::time::Duration::ZERO;
+    }
     if attempt <= 3 {
         std::time::Duration::ZERO
     } else {
         // attempt 4 -> 5s, 5 -> 10s, 6 -> 20s, ...
         let exp = attempt - 4;
         let secs = 5u64.saturating_mul(1u64 << exp.min(6));
-        let capped = secs.min(320);
-        std::time::Duration::from_secs(capped)
+        std::time::Duration::from_secs(secs.min(max_backoff_secs))
     }
 }
 
@@ -146,31 +149,75 @@ mod tests {
 
     #[test]
     fn delay_first_three_zero() {
-        assert_eq!(delay_for_attempt(1), std::time::Duration::ZERO);
-        assert_eq!(delay_for_attempt(2), std::time::Duration::ZERO);
-        assert_eq!(delay_for_attempt(3), std::time::Duration::ZERO);
+        assert_eq!(delay_for_attempt(1, 320), std::time::Duration::ZERO);
+        assert_eq!(delay_for_attempt(2, 320), std::time::Duration::ZERO);
+        assert_eq!(delay_for_attempt(3, 320), std::time::Duration::ZERO);
     }
 
     #[test]
     fn delay_exponential_then_cap() {
-        assert_eq!(delay_for_attempt(4), std::time::Duration::from_secs(5));
-        assert_eq!(delay_for_attempt(5), std::time::Duration::from_secs(10));
-        assert_eq!(delay_for_attempt(6), std::time::Duration::from_secs(20));
-        assert_eq!(delay_for_attempt(7), std::time::Duration::from_secs(40));
-        assert_eq!(delay_for_attempt(8), std::time::Duration::from_secs(80));
-        assert_eq!(delay_for_attempt(9), std::time::Duration::from_secs(160));
-        assert_eq!(delay_for_attempt(10), std::time::Duration::from_secs(320));
-        assert_eq!(delay_for_attempt(11), std::time::Duration::from_secs(320));
-        assert_eq!(delay_for_attempt(100), std::time::Duration::from_secs(320));
+        let cap = 320;
+        assert_eq!(delay_for_attempt(4, cap), std::time::Duration::from_secs(5));
+        assert_eq!(
+            delay_for_attempt(5, cap),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            delay_for_attempt(6, cap),
+            std::time::Duration::from_secs(20)
+        );
+        assert_eq!(
+            delay_for_attempt(7, cap),
+            std::time::Duration::from_secs(40)
+        );
+        assert_eq!(
+            delay_for_attempt(8, cap),
+            std::time::Duration::from_secs(80)
+        );
+        assert_eq!(
+            delay_for_attempt(9, cap),
+            std::time::Duration::from_secs(160)
+        );
+        assert_eq!(
+            delay_for_attempt(10, cap),
+            std::time::Duration::from_secs(320)
+        );
+        assert_eq!(
+            delay_for_attempt(11, cap),
+            std::time::Duration::from_secs(320)
+        );
+        assert_eq!(
+            delay_for_attempt(100, cap),
+            std::time::Duration::from_secs(320)
+        );
+    }
+
+    #[test]
+    fn delay_custom_cap() {
+        // 自定义封顶：低于默认 320 时按配置截断
+        assert_eq!(delay_for_attempt(8, 60), std::time::Duration::from_secs(60));
+        assert_eq!(delay_for_attempt(9, 60), std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn delay_zero_cap_means_no_wait() {
+        // max_retry_backoff_secs = 0：所有重试零延迟（用户明确要求的语义）
+        for attempt in [1, 4, 10, 100] {
+            assert_eq!(
+                delay_for_attempt(attempt, 0),
+                std::time::Duration::ZERO,
+                "cap=0 时 attempt {attempt} 应零延迟"
+            );
+        }
     }
 
     #[test]
     fn delay_attempt_zero_and_max() {
         // attempt=0：当前行为与 1-3 相同，直接返回 ZERO
-        assert_eq!(delay_for_attempt(0), std::time::Duration::ZERO);
+        assert_eq!(delay_for_attempt(0, 320), std::time::Duration::ZERO);
         // u32::MAX：减法不会下溢，指数移位被 min(6) 封顶，不 panic 且封顶 320s
         assert_eq!(
-            delay_for_attempt(u32::MAX),
+            delay_for_attempt(u32::MAX, 320),
             std::time::Duration::from_secs(320)
         );
     }

@@ -23,6 +23,10 @@ pub struct Settings {
     /// 供 `aproxy start/stop <别名>` 快捷定位配置。
     #[serde(default)]
     pub aliases: HashMap<String, String>,
+    /// 默认配置文件路径（绝对路径或 `~` 展开）：未指定时启动用
+    /// `~/.aproxy/config.toml`。让用户可以把日常主力配置换成任意文件。
+    #[serde(default)]
+    pub default_config: Option<String>,
 }
 
 /// 加载：文件不存在 → 默认空配置；损坏 → 警告后回退默认（内部配置损坏
@@ -46,6 +50,21 @@ pub fn load_from(path: &std::path::Path) -> Settings {
         },
         Err(_) => Settings::default(),
     }
+}
+
+/// 解析默认配置文件路径：settings.json 的 `default_config` 优先（`~` 展开），
+/// 未指定/指定失效时回退 `~/.aproxy/config.toml`。
+pub fn default_config_path() -> PathBuf {
+    default_config_path_in(&load())
+}
+
+/// 同上，Settings 已加载时直接解析（避免重复读文件）
+pub fn default_config_path_in(settings: &Settings) -> PathBuf {
+    settings
+        .default_config
+        .as_deref()
+        .map(expand_path)
+        .unwrap_or_else(crate::config::config_path)
 }
 
 /// 原子保存：同目录 tmp 文件 + rename 覆盖（与实例注册表同思路，
@@ -153,6 +172,49 @@ mod tests {
         // 已绝对路径原样（转 absolute 不改变语义）
         let abs = expand_path("C:/tmp/b.toml");
         assert!(abs.is_absolute());
+    }
+
+    #[test]
+    fn default_config_path_resolution() {
+        // 未指定 → ~/.aproxy/config.toml
+        let s = Settings::default();
+        assert_eq!(default_config_path_in(&s), crate::config::config_path());
+        // 指定 → 展开后使用（~ 展开 + 绝对化）
+        let s = Settings {
+            default_config: Some("~/my-cfg.toml".into()),
+            ..Default::default()
+        };
+        let p = default_config_path_in(&s);
+        assert!(p.ends_with("my-cfg.toml"));
+        assert!(p.is_absolute());
+        // 绝对路径原样
+        let s = Settings {
+            default_config: Some("D:/work/main.toml".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            default_config_path_in(&s).display().to_string(),
+            std::path::absolute("D:/work/main.toml")
+                .unwrap()
+                .display()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn default_config_survives_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path_in(dir.path());
+        let s = Settings {
+            default_config: Some("C:/tmp/main.toml".into()),
+            ..Default::default()
+        };
+        save_to(&path, &s).unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.default_config.as_deref(), Some("C:/tmp/main.toml"));
+        // 旧版 settings.json（无该字段）也能加载
+        std::fs::write(&path, r#"{"aliases":{}}"#).unwrap();
+        assert!(load_from(&path).default_config.is_none());
     }
 
     #[test]

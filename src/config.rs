@@ -46,6 +46,10 @@ pub struct Config {
     /// 代理密码（可选；优先于代理 URL 内嵌的密码）。
     #[serde(default)]
     pub proxy_password: Option<String>,
+    /// 重试退避的最大等待时间（秒）。指数退避 5s→10s→20s→…增长到该值后封顶；
+    /// 设为 0 表示所有重试零延迟（立即重试）。默认 320 秒。
+    #[serde(default = "default_max_backoff_secs")]
+    pub max_retry_backoff_secs: u64,
 }
 
 fn default_listen_addr() -> String {
@@ -54,6 +58,10 @@ fn default_listen_addr() -> String {
 
 fn default_keepalive_secs() -> u64 {
     15
+}
+
+fn default_max_backoff_secs() -> u64 {
+    320
 }
 
 impl Default for Config {
@@ -68,6 +76,7 @@ impl Default for Config {
             proxy: None,
             proxy_username: None,
             proxy_password: None,
+            max_retry_backoff_secs: default_max_backoff_secs(),
         }
     }
 }
@@ -385,6 +394,27 @@ mod tests {
         assert!(cfg.proxy.is_none());
         assert!(cfg.proxy_username.is_none());
         assert!(cfg.proxy_password.is_none());
+        assert_eq!(cfg.max_retry_backoff_secs, 320);
+    }
+
+    #[test]
+    fn max_backoff_roundtrip_and_zero() {
+        // 自定义封顶写入读出；0（所有重试零延迟）也必须能落盘往返
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.toml");
+        let mut cfg = Config {
+            base_url: "https://api.example.com".to_string(),
+            ..Default::default()
+        };
+        cfg.max_retry_backoff_secs = 60;
+        save_to(&path, &cfg).unwrap();
+        assert_eq!(load_from(&path).max_retry_backoff_secs, 60);
+        cfg.max_retry_backoff_secs = 0;
+        save_to(&path, &cfg).unwrap();
+        assert_eq!(load_from(&path).max_retry_backoff_secs, 0);
+        // 旧版配置文件（无该字段）读出默认 320
+        std::fs::write(&path, "base_url = \"https://api.example.com\"").unwrap();
+        assert_eq!(load_from(&path).max_retry_backoff_secs, 320);
     }
 
     #[test]

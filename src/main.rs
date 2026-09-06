@@ -157,6 +157,13 @@ struct ConfigArgs {
     /// 清空代理配置（URL、用户名、密码）
     #[arg(long)]
     clear_proxy: bool,
+    /// 把指定路径设为默认配置文件（写入 settings.json，不指定时默认
+    /// ~/.aproxy/config.toml；支持 ~ 展开）
+    #[arg(long, value_name = "PATH")]
+    set_default: Option<String>,
+    /// 取消默认配置文件设置（恢复用 ~/.aproxy/config.toml）
+    #[arg(long)]
+    clear_default: bool,
     /// 打印当前配置及文件路径
     #[arg(long)]
     show: bool,
@@ -164,10 +171,25 @@ struct ConfigArgs {
 
 #[tokio::main]
 async fn main() {
+    // Windows 控制台默认代码页（如 936/GBK）会把 Rust 输出的 UTF-8 中文显示为
+    // 乱码——status/stop/logs 等所有面向用户的输出都是中文。切换到 UTF-8
+    // （65001）；无控制台的守护子进程上调用失败被忽略，无副作用。
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Console::{GetConsoleOutputCP, SetConsoleOutputCP};
+        if GetConsoleOutputCP() != 65001 {
+            SetConsoleOutputCP(65001);
+        }
+    }
+
     let cli = Cli::parse();
 
-    // 实际生效的配置文件路径：--config 显式指定，否则默认 ~/.aproxy/config.toml
-    let cfg_path = cli.config.clone().unwrap_or_else(config::config_path);
+    // 实际生效的配置文件路径：--config 显式指定 > settings.json 的 default_config
+    // （用户可把日常主力配置换成任意文件）> 默认 ~/.aproxy/config.toml
+    let cfg_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(settings::default_config_path);
 
     // 日志初始化：守护子进程无控制台，写日志文件；其余走 stdout（RUST_LOG 可覆盖）
     if cli.daemon_child {
@@ -1177,8 +1199,46 @@ fn handle_config_cmd(path: PathBuf, args: ConfigArgs) {
         clear_api_key,
         clear_headers,
         clear_proxy,
+        set_default,
+        clear_default,
         show,
     } = args;
+
+    // 默认配置文件指向存于 settings.json（内部配置），与 config.toml 内容无关，
+    // 独立处理后再进入 toml 内容编辑流程
+    if set_default.is_some() || clear_default {
+        if set_default.is_some() && clear_default {
+            eprintln!("--set-default 与 --clear-default 不能同时使用");
+            std::process::exit(1);
+        }
+        let mut s = settings::load();
+        if let Some(p) = set_default {
+            let abs = settings::expand_path(&p);
+            if !abs.is_file() {
+                eprintln!("配置文件不存在: {}", abs.display());
+                std::process::exit(1);
+            }
+            s.default_config = Some(abs.display().to_string());
+            match settings::save(&s) {
+                Ok(()) => println!("已把 {} 设为默认配置文件", abs.display()),
+                Err(e) => {
+                    eprintln!("保存 settings.json 失败: {e}");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            s.default_config = None;
+            match settings::save(&s) {
+                Ok(()) => println!("已取消默认配置文件设置（恢复用 ~/.aproxy/config.toml）"),
+                Err(e) => {
+                    eprintln!("保存 settings.json 失败: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        return;
+    }
+
     let mut cfg = config::load_from(&path);
 
     let mut changed = false;
@@ -1311,6 +1371,12 @@ fn handle_config_cmd(path: PathBuf, args: ConfigArgs) {
                 .unwrap_or_else(|| "(未设置)".to_string())
         );
         println!("keepalive_interval_secs = {}", cfg.keepalive_interval_secs);
+        // 0 表示所有重试零延迟，语义特殊，提示出来
+        if cfg.max_retry_backoff_secs == 0 {
+            println!("max_retry_backoff_secs = 0（所有重试零延迟）");
+        } else {
+            println!("max_retry_backoff_secs = {}", cfg.max_retry_backoff_secs);
+        }
         println!(
             "proxy          = {}",
             cfg.proxy

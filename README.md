@@ -40,17 +40,19 @@ aproxy
 
 | 命令 | 说明 |
 |---|---|
-| `aproxy` | 后台启动代理（默认端口 127.0.0.1:12345） |
+| `aproxy [start]` | 后台启动代理（默认端口 127.0.0.1:12345） |
+| `aproxy start <别名\|路径>` | 按别名或配置文件路径启动（别名见下方「别名」） |
 | `aproxy --foreground` | 前台运行（日志走控制台，Ctrl+C 停止） |
 | `aproxy status` | 列出运行中的实例（端口/pid/版本/上游/配置） |
-| `aproxy stop [PORT\|all]` | 停止实例；单实例可省略，多实例必须指定端口或 `all` |
+| `aproxy stop [PORT\|all\|别名]` | 停止实例；单实例可省略；多实例指定端口、`all` 或别名 |
 | `aproxy logs [PORT]` | 连接实例实时输出日志；单实例可省略；不支持 `all` |
 | `aproxy restore` | 恢复崩溃/重启前在运行的实例；无实例则静默结束（开机自启友好） |
+| `aproxy alias add\|remove\|list` | 管理配置别名（存于 settings.json） |
 | `aproxy config [选项]` | 查看或修改配置（`--show` 打印当前配置） |
 
 通用参数：`--config <PATH>`（指定配置文件，多开用）、`--listen <ADDR>`、`--proxy <URL>`、`--api-key <KEY>`（启动路径仅本次生效）。
 
-## 多开
+## 多开与别名
 
 ```powershell
 aproxy --config ~/.aproxy/work.toml      # listen_addr = "127.0.0.1:12345"
@@ -58,6 +60,19 @@ aproxy --config ~/.aproxy/personal.toml  # listen_addr = "127.0.0.1:12346"
 aproxy status                            # 两个实例都可见
 aproxy stop 12346                        # 按端口管理
 ```
+
+给配置起别名后可按名字快捷启停（不必记端口）：
+
+```powershell
+aproxy alias add openrouter ~/.aproxy/openrouter.toml
+aproxy alias add anthropic               # 省略路径 = 默认 ~/.aproxy/config.toml
+aproxy start openrouter                  # 按别名启动
+aproxy stop openrouter                   # 按别名停止（端口变了依然有效）
+aproxy alias list                        # 查看全部别名
+```
+
+别名存于 `~/.aproxy/settings.json`（程序管理的内部配置，唯一；不建议手改，
+用 `aproxy alias` 管理）。config.toml 保持人类可读可写、可多份平行并存。
 
 ## 开机自启（可选）
 
@@ -77,7 +92,8 @@ listen_addr = "127.0.0.1:12345"          # 本地监听
 # extra_headers / override_headers       # 追加/覆盖请求头
 ```
 
-运行数据在 `~/.aproxy/`：`run/`（实例注册与恢复记录）、`logs/`（守护日志，自动清理与轮转）。
+运行数据在 `~/.aproxy/`：`run/`（实例注册与恢复记录）、`logs/`（守护日志，自动清理与轮转）、
+`settings.json`（内部配置：别名等，程序管理不建议手改）。
 
 ## 开发
 

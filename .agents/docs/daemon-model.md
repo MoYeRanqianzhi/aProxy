@@ -1,6 +1,18 @@
 # 守护进程运行模型——决策记录
 
-> 沉淀自 alpha.3 开发与两轮审查。改动进程模型/IPC/注册表前先读本文。
+> 沉淀自 alpha.3 开发与多轮审查。改动进程模型/IPC/注册表/别名前先读本文。
+> 别名与 settings.json 分层详见 [[alias-settings]]（.agents/memory/2026-09-05-alias-settings.md）。
+
+## 配置别名与 --daemon-child 的 global 陷阱
+
+`start <别名>` 父进程把完整命令行转发给守护子进程（含 `start <别名>` 本身）。
+子进程按 daemon_child 分流忽略子命令，但顶层 flag 若未标 `global = true`，
+出现在子命令之后会被 clap 拒绝——守护子进程秒死且 stderr 进 null（无日志、
+无报错，表现为父进程「未在预期时间内就绪」）。**凡会被转发到子命令之后的
+顶层参数必须 global**（目前：--config、--daemon-child）。
+
+settings.json 单测必须走 `load_from/save_to` 注入版（tempdir），绝不能读写
+真实用户文件——曾污染用户 settings（测试别名写入真实配置）。
 
 ## 为什么控制通道绝不用代理端口（铁律）
 

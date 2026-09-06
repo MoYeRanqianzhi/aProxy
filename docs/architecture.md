@@ -25,9 +25,10 @@ agent 软件 ──HTTP──▶ [代理端口 12345] ──重试循环──�
 |---|---|
 | `src/proxy.rs` | 转发核心：hop-by-hop 过滤、请求/响应 spool、错误判定、keepalive、断开保护 |
 | `src/retry.rs` | 重试判定：状态码、错误 JSON（含流式 NDJSON/SSE 形态） |
-| `src/config.rs` | 配置加载/保存/校验（`~/.aproxy/config.toml`） |
+| `src/config.rs` | 代理配置加载/保存/校验（`~/.aproxy/config.toml`，可多份平行并存） |
+| `src/settings.rs` | 内部配置（`~/.aproxy/settings.json`，唯一）：别名表等程序管理状态 |
 | `src/daemon.rs` | 守护编排：IPC（ping/shutdown）、实例注册表、恢复记录、孤儿清理 |
-| `src/main.rs` | CLI（start/status/stop/logs/restore/config）、serve_forever、日志 |
+| `src/main.rs` | CLI（start/status/stop/logs/restore/alias/config）、serve_forever、日志 |
 
 ## 重试与流式回放
 
@@ -57,6 +58,19 @@ agent 软件 ──HTTP──▶ [代理端口 12345] ──重试循环──�
 
 端口号是实例唯一键：同端口不同监听地址的第二实例会在启动时被显式拒绝
 （注册表与 IPC 管道按端口命名，无法并存）。
+
+## 配置别名（settings.json）
+
+两层配置分工：`config.toml` 是人类可读可写的代理配置，可多份（多开各自指定）；
+`settings.json` 是程序管理的内部配置，**全局唯一**（JSON 原子写，损坏回退空表），
+当前存放别名表，后续其他内部状态也归入此处。
+
+- `aproxy alias add <名> [路径]`：路径省略时指向默认 config.toml；
+  别名不得为 `all`/纯数字（与 stop 保留字、端口解析冲突）
+- `aproxy start <别名>`：别名解析出的配置路径以 `--config` 绝对路径注入
+  守护子进程命令行（别名解析只发生在父进程）
+- `aproxy stop <别名>`：按实例注册的 config_path 归一匹配（大小写/分隔符），
+  端口变了别名依然有效
 
 ## 自愈恢复（restore）
 

@@ -326,8 +326,10 @@ mod tests {
         // 3×周期新鲜阈值：周期 30s → 90s 内算新鲜
         assert_eq!(heartbeat_fresh_secs(&settings::Settings::default()), 90);
         // 周期 0 防御为 1（doctor 拦 0，这里双保险）
-        let mut s = settings::Settings::default();
-        s.watchdog_heartbeat_secs = 0;
+        let s = settings::Settings {
+            watchdog_heartbeat_secs: 0,
+            ..Default::default()
+        };
         assert_eq!(heartbeat_period(&s), Duration::from_secs(1));
         assert_eq!(heartbeat_fresh_secs(&s), 3);
     }

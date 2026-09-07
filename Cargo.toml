@@ -52,7 +52,9 @@ tempfile = "3"
 # - panic 保持默认 unwind（不设 panic="abort"）：axum/hyper 每连接是独立
 #   tokio 任务，handler panic 时 unwind 只断该连接、实例继续服务；abort 会
 #   让任何一处 bug 杀掉整个实例——对「无限重试不间断」的使命与依赖本代理
-#   的 agent 会话是严重回退，且 LTO 后 abort 省的体积有限，不值得
+#   的 agent 会话是严重回退。实测 abort 可再省 32% 体积（4.06→2.77MB），
+#   但那是磁盘占用不是运行性能；若未来采用 abort，必须配套看门狗自动重启，
+#   且重启窗口期全连接断流仍劣于连接级隔离
 # - strip=true：符号/调试信息不参与运行（排查 backtrace 用 dev 构建复现）
 # - target-cpu 不设：构建产物会分发到不同机器，native 指令集会在他机直接
 #   非法指令崩溃

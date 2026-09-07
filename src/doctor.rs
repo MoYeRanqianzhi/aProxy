@@ -92,7 +92,46 @@ fn run_with(errors: Vec<String>, settings: Settings) -> Report {
     // 3) warning 级：配置目录下未被别名覆盖的其余 toml
     report.findings.extend(check_unaliased_configs(&settings));
 
+    // 4) 看门狗字段越界检查（error=会造成看护故障；warning=合法但需确认意图）
+    report.findings.extend(check_watchdog_settings(&settings));
+
     report
+}
+
+/// 看门狗字段的越界检查：
+/// - heartbeat_secs = 0：扫描周期退化为紧死循环（空转烧 CPU），error
+/// - stale_after_cycles = 0：除数为 0 / 永远无法确认挂死，error
+/// - max_restarts = 0：合法（仅观测不重拉）但等于放弃自愈，warning 确认意图
+/// - heartbeat_secs 过大：挂死检测延迟随之放大到分钟级，warning 提示
+pub fn check_watchdog_settings(settings: &Settings) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    if settings.watchdog_heartbeat_secs == 0 {
+        findings.push(Finding {
+            level: Level::Error,
+            message: "settings.json 的 watchdog_heartbeat_secs = 0：心跳扫描周期为 0 会让看护者空转烧 CPU，请设为 ≥ 5".to_string(),
+        });
+    } else if settings.watchdog_heartbeat_secs > 600 {
+        findings.push(Finding {
+            level: Level::Warn,
+            message: format!(
+                "settings.json 的 watchdog_heartbeat_secs = {}：心跳周期过大，挂死检测延迟将达 {} 秒级",
+                settings.watchdog_heartbeat_secs, settings.watchdog_heartbeat_secs
+            ),
+        });
+    }
+    if settings.watchdog_stale_after_cycles == 0 {
+        findings.push(Finding {
+            level: Level::Error,
+            message: "settings.json 的 watchdog_stale_after_cycles = 0：挂死容忍周期数必须 ≥ 1，否则无法判定挂死".to_string(),
+        });
+    }
+    if settings.watchdog_max_restarts == 0 {
+        findings.push(Finding {
+            level: Level::Warn,
+            message: "settings.json 的 watchdog_max_restarts = 0：看护者只观测不重拉，实例崩溃后不会自动恢复".to_string(),
+        });
+    }
+    findings
 }
 
 /// 别名配置深入审查（warning 级）：
@@ -390,6 +429,36 @@ mod tests {
         .unwrap();
         let report = run(&settings_path_in_tmp(dir.path()));
         assert!(report.is_clean(), "不应有发现: {:?}", report.findings);
+    }
+
+    #[test]
+    fn doctor_watchdog_field_bounds() {
+        // 0 周期 / 0 容忍 → error；max_restarts=0 与过大周期 → warning
+        let mut s = Settings::default();
+        assert!(check_watchdog_settings(&s).is_empty());
+        s.watchdog_heartbeat_secs = 0;
+        assert!(
+            check_watchdog_settings(&s)
+                .iter()
+                .any(|f| f.level == Level::Error && f.message.contains("heartbeat_secs"))
+        );
+        s.watchdog_heartbeat_secs = 3600;
+        let f = check_watchdog_settings(&s);
+        assert!(f.iter().any(|f| f.level == Level::Warn));
+        s.watchdog_heartbeat_secs = 30;
+        s.watchdog_stale_after_cycles = 0;
+        assert!(
+            check_watchdog_settings(&s)
+                .iter()
+                .any(|f| f.level == Level::Error && f.message.contains("stale_after_cycles"))
+        );
+        s.watchdog_stale_after_cycles = 1;
+        s.watchdog_max_restarts = 0;
+        assert!(
+            check_watchdog_settings(&s)
+                .iter()
+                .any(|f| f.level == Level::Warn && f.message.contains("max_restarts"))
+        );
     }
 
     #[test]

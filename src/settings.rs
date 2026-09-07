@@ -50,6 +50,31 @@ pub struct Settings {
     /// 低并发实例可关闭以保持全内存行为。
     #[serde(default = "default_disk_cache")]
     pub disk_cache: bool,
+    /// 看门狗总开关：开启时 `aproxy start`/守护自检会确保存在一个全局看护进程
+    /// （`aproxy watchdog`），守护崩溃/挂死时按 .restore 记录自动重拉。
+    /// 看门狗是系统级单例（一个看护进程看护全部实例），故只在 settings 配置，
+    /// config.toml 不参与。默认 true；false 时回到无看护行为（已运行实例不受
+    /// 影响——守护与看护者完全解耦）。
+    #[serde(default = "default_watchdog")]
+    pub watchdog: bool,
+    /// 看门狗心跳扫描周期（秒）：看护者每此间隔醒来扫描一次全部实例的共享内存
+    /// 心跳表；心跳「新鲜」判定也以此为基准（3×周期内算新鲜）。仅调优用。
+    /// 默认 30。
+    #[serde(default = "default_watchdog_heartbeat_secs")]
+    pub watchdog_heartbeat_secs: u64,
+    /// 挂死判定容忍周期数：连续 N 轮心跳扫描都没更新且 IPC ping 也失败，才判定
+    /// 实例挂死并杀+重拉。1 = 一轮超时即启动二意见确认。误杀调节阀，默认 1。
+    #[serde(default = "default_watchdog_stale_after_cycles")]
+    pub watchdog_stale_after_cycles: u64,
+    /// crashloop 上限：同一实例连续重拉失败达此次数后放弃（指数退避封顶 300s），
+    /// 保留 .restore 记录等人工 `aproxy restore`。默认 5。
+    #[serde(default = "default_watchdog_max_restarts")]
+    pub watchdog_max_restarts: u32,
+    /// 看护者闲置自灭等待（秒）：全部实例清零（优雅停止/无人看护对象）后，看护者
+    /// 再等待此时长即自行退出并清理 claim，系统回到零常驻。0 = 永不自灭。
+    /// 默认 300。
+    #[serde(default = "default_watchdog_idle_exit_secs")]
+    pub watchdog_idle_exit_secs: u64,
 }
 
 fn default_log_rotate_mb() -> u64 {
@@ -68,6 +93,26 @@ fn default_disk_cache() -> bool {
     crate::config::DEFAULT_DISK_CACHE
 }
 
+pub(crate) fn default_watchdog() -> bool {
+    true
+}
+
+pub(crate) fn default_watchdog_heartbeat_secs() -> u64 {
+    30
+}
+
+pub(crate) fn default_watchdog_stale_after_cycles() -> u64 {
+    1
+}
+
+pub(crate) fn default_watchdog_max_restarts() -> u32 {
+    5
+}
+
+pub(crate) fn default_watchdog_idle_exit_secs() -> u64 {
+    300
+}
+
 // 手动 Default：serde 的字段默认值（log_rotate_mb=8、idle_timeout_secs=1800）
 // 只作用于反序列化，derive 出的 Default 会给数值字段填 0——「默认 0」与
 // 「默认 8/1800」语义不同（0=关闭轮转），必须与反序列化保持一致。
@@ -81,6 +126,11 @@ impl Default for Settings {
             idle_timeout_secs: default_idle_timeout_secs(),
             max_body_mb: default_max_body_mb(),
             disk_cache: default_disk_cache(),
+            watchdog: default_watchdog(),
+            watchdog_heartbeat_secs: default_watchdog_heartbeat_secs(),
+            watchdog_stale_after_cycles: default_watchdog_stale_after_cycles(),
+            watchdog_max_restarts: default_watchdog_max_restarts(),
+            watchdog_idle_exit_secs: default_watchdog_idle_exit_secs(),
         }
     }
 }
@@ -472,6 +522,43 @@ mod tests {
         let loaded = load_from(&path);
         assert_eq!(loaded.max_body_mb, 128);
         assert!(loaded.disk_cache);
+    }
+
+    #[test]
+    fn watchdog_fields_roundtrip_and_default() {
+        // 五字段默认值；自定义落盘往返；旧 settings（无字段）读出默认——
+        // 升级 alpha.5 的 settings.json 时看门狗自动按默认开启
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path_in(dir.path());
+        let s = Settings::default();
+        assert!(s.watchdog);
+        assert_eq!(s.watchdog_heartbeat_secs, 30);
+        assert_eq!(s.watchdog_stale_after_cycles, 1);
+        assert_eq!(s.watchdog_max_restarts, 5);
+        assert_eq!(s.watchdog_idle_exit_secs, 300);
+        let s = Settings {
+            watchdog: false,
+            watchdog_heartbeat_secs: 10,
+            watchdog_stale_after_cycles: 3,
+            watchdog_max_restarts: 2,
+            watchdog_idle_exit_secs: 0,
+            ..Default::default()
+        };
+        save_to(&path, &s).unwrap();
+        let loaded = load_from(&path);
+        assert!(!loaded.watchdog);
+        assert_eq!(loaded.watchdog_heartbeat_secs, 10);
+        assert_eq!(loaded.watchdog_stale_after_cycles, 3);
+        assert_eq!(loaded.watchdog_max_restarts, 2);
+        assert_eq!(loaded.watchdog_idle_exit_secs, 0);
+        // 旧版 settings.json（无字段）全取默认
+        std::fs::write(&path, r#"{"aliases":{}}"#).unwrap();
+        let loaded = load_from(&path);
+        assert!(loaded.watchdog);
+        assert_eq!(loaded.watchdog_heartbeat_secs, 30);
+        assert_eq!(loaded.watchdog_stale_after_cycles, 1);
+        assert_eq!(loaded.watchdog_max_restarts, 5);
+        assert_eq!(loaded.watchdog_idle_exit_secs, 300);
     }
 
     #[test]

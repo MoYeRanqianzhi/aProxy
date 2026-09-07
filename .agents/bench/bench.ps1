@@ -71,6 +71,6 @@ while ($c -le 4096) {
 }
 
 Stop-Job $sampler
-Receive-Job $sampler -Keep | Export-Csv -Path 'G:\ClaudeProjects\aProxy\.tmp-mem\samples.csv' -NoTypeInformation
-$results | Export-Csv -Path 'G:\ClaudeProjects\aProxy\.tmp-mem\levels.csv' -NoTypeInformation
+Receive-Job $sampler -Keep | Export-Csv -Path 'G:\ClaudeProjects\aProxy\.agents/bench/samples-after.csv' -NoTypeInformation
+$results | Export-Csv -Path 'G:\ClaudeProjects\aProxy\.agents/bench/levels-after.csv' -NoTypeInformation
 Write-Output "--- 压测结束：档位 $results.Count 个已存 levels.csv，全程采样已存 samples.csv ---"

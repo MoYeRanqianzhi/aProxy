@@ -22,7 +22,7 @@
 - [x] **max_body_mb 分层配置**（随磁盘缓存）：默认 128MB（0=不限），settings.json 全局默认 + toml 覆盖，解锁旧 10MiB 硬上限
 - [x] **main.rs 拆分**（70e103f）：1719→114 行；cli.rs + commands/ 九命令 + server.rs + util.rs
 - [x] **aproxy-cli skill**（f62d837）：.claude/skills/ 渐进式全量参考；版本留存策略见 memory/2026-09-07-aproxy-cli-skill-versioning（小版本直改 latest，大版本才留存）；评测经用户决定放弃（agent 越界读源码，验证靠逐条源码核对）
-- [ ] **待办收口：bump v0.1.0-alpha.5 + tag**（磁盘缓存是 feat 级变更，应发版）；生产实例（12345/12349）仍跑旧二进制，新功能需用户替换部署后生效
+- [x] **alpha.5 收口**（2026-09-08）：bump v0.1.0-alpha.5 + tag；architecture.md 文档同步（模块分工/双模缓冲/版本路线）；版本路线定调——0.1.x 全程预发布后缀，0.2.0 起才引入 UI（远期）；生产实例（12345/12349）仍跑旧二进制，新功能需用户替换部署后生效
 
 ## 中期功能（对齐「无限重试、不中断」使命）
 
@@ -30,7 +30,6 @@
 - [ ] **F. IPC 观测扩展**：ping 响应带请求计数/重试计数/最近错误，`status` 展示（走管道不碰代理端口，符合铁律）
 - [ ] **G2. 运行期看门狗** [G]：守护崩溃自动拉起（与「分离无父进程」模型有张力，需小型监督进程，先讨论再动）。2026-09-07 定调：这是通向「绝对不间断」的缺失一环——unwind 管小故障隔离，看门狗兜底进程级死亡；也是未来若采用 panic=abort 的前置配套（见 memory/panic-abort-outlook）
 - [ ] **H.（可选）配置热重载**：IPC reload，避免 stop/start 断流
-- [ ] **文档同步：docs/architecture.md**：模块表仍写「main.rs = CLI + serve_forever」（拆分后应为 main/cli/commands/server/util 分工），proxy.rs 双模缓冲与 spool 生命周期未收录
 - [ ] unix 分支实测（UDS IPC / unix spawn 路径从未在类 Unix 环境运行过；CI ubuntu/macos 只 cargo check）
 
 ## 已结案（有意跳过，见记忆/审查记录）

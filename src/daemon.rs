@@ -17,8 +17,14 @@
 use serde::{Deserialize, Serialize};
 use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
-/// 实例注册表目录：`~/.aproxy/run/`
+/// 实例注册表目录：`~/.aproxy/run/`。
+/// `APROXY_RUN_DIR` 环境变量可整体改指别处——集成测试用它与 tempdir 隔离
+/// （守护/看护子进程经 spawn_detached 继承环境），高级用户亦可借此自定义
+/// 运行数据位置。
 pub fn run_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("APROXY_RUN_DIR") {
+        return PathBuf::from(d);
+    }
     crate::config::config_dir().join("run")
 }
 

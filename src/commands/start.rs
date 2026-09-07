@@ -208,6 +208,7 @@ pub(crate) async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf, target: Optio
     let log_path = daemon::logs_dir().join(format!("{port}.log"));
     let startup_log_path = daemon::logs_dir().join("startup.log");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut ready = false;
     loop {
         if let Ok(info) = daemon::ipc_ping(&port).await {
             println!("aProxy 已在后台启动");
@@ -225,7 +226,8 @@ pub(crate) async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf, target: Optio
             println!("  配置: {}", cfg_path.display());
             println!("  日志: {}", log_path.display());
             println!("查看实例: aproxy status    停止: aproxy stop {port}");
-            return;
+            ready = true;
+            break;
         }
         if std::time::Instant::now() > deadline {
             // 子进程无控制台，失败原因只可能落盘：配置/绑定错误写 startup.log，
@@ -236,5 +238,35 @@ pub(crate) async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf, target: Optio
             std::process::exit(1);
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // 看护者出簇（watchdog 总开关，settings 层）：实例就绪后确保存在看护者。
+    // 选举规范防止多实例并发 start 时的重复拉起：claim 有效让位；缺席时仅
+    // 存活实例 PID 最小者有权 spawn；claim 原子接管最终裁决唯一性。
+    ensure_watchdog_if_enabled();
+}
+
+/// 确保看护者在任（settings.watchdog 开启时）。
+/// 失败静默（看护者缺失只是失去自愈保护，不应让 start 失败）。
+fn ensure_watchdog_if_enabled() {
+    if !aproxy::settings::load().watchdog {
+        return;
+    }
+    let run_dir = daemon::run_dir();
+    let fresh = aproxy::watchdog::heartbeat_fresh_secs(&aproxy::settings::load());
+    if aproxy::watchdog::claim_is_in_effect_in(&run_dir, fresh, aproxy::watchdog::now_secs()) {
+        return; // 已有在任看护者
+    }
+    if !aproxy::watchdog::this_process_may_spawn_watchdog_in(&run_dir) {
+        return; // 有更小 PID 的存活实例，拉起是它的事（其自检/该实例 start 兜底）
+    }
+    aproxy::watchdog::remove_claim_in(&run_dir); // 清理无效残留 claim
+    let args = aproxy::watchdog::watchdog_spawn_args();
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    match daemon::spawn_detached(&exe, &args) {
+        Ok(pid) => tracing::info!(pid, "看护者已随实例启动拉起"),
+        Err(e) => tracing::warn!(error = %e, "看护者拉起失败（守护自检会补种）"),
     }
 }

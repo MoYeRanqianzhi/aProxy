@@ -2149,3 +2149,162 @@ fn alias_errors_on_unknown_names() {
     );
     assert!(text.contains("不存在"), "实际: {text}");
 }
+
+// ---------------------------------------------------------------------------
+// 17. 看门狗（G2）：全局单看护进程的重拉/放行/补种端到端
+//
+// 隔离：APROXY_RUN_DIR 指向 tempdir（守护/看护子进程经 spawn_detached 继承
+// 环境），APROXY_WATCHDOG_SCAN_SECS=1 让看护者秒级扫描。测试端口照旧从测试
+// 进程 pid 派生，绝不触碰生产实例；结束清理 claim 与残留守护。
+// ---------------------------------------------------------------------------
+#[test]
+#[cfg(windows)]
+fn watchdog_respawns_killed_daemon() {
+    let (port, _b, _c) = daemon_test_ports();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_file = dir.path().join("wd.toml");
+    std::fs::write(
+        &cfg_file,
+        format!("base_url = \"https://wd-test.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
+    )
+    .unwrap();
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+    let _guard = DaemonGuard { exe, port };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // 带隔离环境启动守护：必须用 Command::env（spawn_detached 继承的是测试
+    // 进程环境，无法逐子进程注入）——守护与看护者都要看到同一个 tempdir 注册表
+    let envs = [
+        ("APROXY_RUN_DIR", dir.path().display().to_string()),
+        ("APROXY_WATCHDOG_SCAN_SECS", "1".to_string()),
+    ];
+    let mut daemon_child = {
+        let mut cmd = Command::new(exe);
+        cmd.args([
+            "--config",
+            cfg_file.display().to_string().as_str(),
+            "--daemon-child",
+        ]);
+        for (k, v) in &envs {
+            cmd.env(k, v);
+        }
+        cmd.spawn().expect("spawn 守护失败")
+    };
+    let orig_pid = daemon_child.id();
+    assert!(wait_daemon_ready_in(&rt, port), "守护未就绪");
+
+    // 启动看护进程（同一隔离 run 目录）
+    let mut wd_cmd = Command::new(exe);
+    wd_cmd.arg("--daemon-watchdog");
+    for (k, v) in envs {
+        wd_cmd.env(k, v);
+    }
+    let mut wd_child = wd_cmd.spawn().expect("spawn 看护者失败");
+    // 等看护者收养（扫描周期 1s，给 3s）
+    std::thread::sleep(Duration::from_secs(3));
+
+    // 强杀守护（模拟崩溃——.restore 残留 = 异常死亡信号）
+    kill_pid(orig_pid);
+    let new_ready = {
+        let mut ok = false;
+        for _ in 0..150 {
+            // 看护者 scan 1s + 退避 0（首次）+ spawn + 就绪，30s 足够
+            if rt
+                .block_on(aproxy::daemon::ipc_ping(&port.to_string()))
+                .is_ok()
+            {
+                ok = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        ok
+    };
+    assert!(new_ready, "看护者未在预期时间内重拉守护");
+
+    // 确认是新进程（旧 pid 已死，新 pid 就绪）
+    let live = rt
+        .block_on(aproxy::daemon::ipc_ping(&port.to_string()))
+        .unwrap();
+    assert_ne!(live.pid, orig_pid, "应是被重拉的新进程");
+    // 看护者仍在运行（收养新实例继续看护）
+    assert!(wd_child.try_wait().unwrap().is_none(), "看护者不应退出");
+
+    // 清理：优雅 stop（.restore 删除）→ 看护者不得复活它；随后闲置自灭前
+    // 先杀看护者防泄漏
+    let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        rt.block_on(aproxy::daemon::ipc_ping(&port.to_string()))
+            .is_err(),
+        "优雅停止后看护者不得复活实例"
+    );
+    let _ = wd_child.kill();
+    let _ = std::fs::remove_file(dir.path().join("watchdog.claim"));
+}
+
+#[test]
+#[cfg(windows)]
+fn watchdog_lease_prevents_duplicate_watchdogs() {
+    // 并发 spawn 两个看护者（同一隔离 run 目录）：claim 原子接管保证只有一个
+    // 在任——后启动者应自行退出（选举唯一性）
+    let dir = tempfile::tempdir().unwrap();
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+    let envs = [
+        ("APROXY_RUN_DIR", dir.path().display().to_string()),
+        ("APROXY_WATCHDOG_SCAN_SECS", "1".to_string()),
+    ];
+    let mut c1 = {
+        let mut cmd = Command::new(exe);
+        cmd.arg("--daemon-watchdog");
+        for (k, v) in &envs {
+            cmd.env(k, v);
+        }
+        cmd.spawn().unwrap()
+    };
+    // 等 c1 接管 claim
+    std::thread::sleep(Duration::from_secs(2));
+    let mut c2 = {
+        let mut cmd = Command::new(exe);
+        cmd.arg("--daemon-watchdog");
+        for (k, v) in &envs {
+            cmd.env(k, v);
+        }
+        cmd.spawn().unwrap()
+    };
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(c1.try_wait().unwrap().is_none(), "先任看护者应持续在任");
+    assert!(
+        c2.try_wait().unwrap().is_some(),
+        "后任看护者应因 claim 被占而退出"
+    );
+    let _ = c1.kill();
+    let _ = std::fs::remove_file(dir.path().join("watchdog.claim"));
+}
+
+/// wait_daemon_ready 的 run-dir 无关版本（IPC ping 不依赖 run 目录）
+#[cfg(windows)]
+fn wait_daemon_ready_in(rt: &tokio::runtime::Runtime, port: u16) -> bool {
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+            && rt
+                .block_on(aproxy::daemon::ipc_ping(&port.to_string()))
+                .is_ok()
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// 强杀进程（模拟崩溃）：Windows taskkill /F
+#[cfg(windows)]
+fn kill_pid(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .output();
+}

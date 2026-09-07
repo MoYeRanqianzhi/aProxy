@@ -4,7 +4,7 @@
 //! 与 `commands/start.rs` 的分工：start 负责启动预检与后台 spawn 的父进程侧，
 //! server 负责真正「跑起来」的服务进程本身。
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use tracing_subscriber::EnvFilter;
 
@@ -107,6 +107,42 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
         });
     } else {
         tracing::warn!("看门狗心跳节创建失败，该实例将不受挂死检测保护（进程死亡检测不受影响）");
+    }
+
+    // 守护侧互保（watchdog 总开关，settings 层）：看护者是增值层而非依赖层——
+    // 它崩溃实例不死，本任务只负责把「无人看护」状态在 5 分钟内修复。
+    // 选举规范：claim 判定缺席后，存活实例中 PID 最小者才有权 spawn（防
+    // N 个守护同时拉起看护者）；claim 原子接管兜底唯一性。
+    if settings::load().watchdog {
+        tokio::spawn(async move {
+            const SELF_CHECK_INTERVAL: Duration = Duration::from_secs(300);
+            loop {
+                tokio::time::sleep(SELF_CHECK_INTERVAL).await;
+                let run_dir = daemon::run_dir();
+                let fresh = watchdog::heartbeat_fresh_secs(&settings::load());
+                if watchdog::claim_is_in_effect_in(&run_dir, fresh, watchdog::now_secs()) {
+                    continue;
+                }
+                if !watchdog::this_process_may_spawn_watchdog_in(&run_dir) {
+                    continue; // 有更小 PID 的存活实例，拉起是它的事
+                }
+                // 残留 claim（已判无效）清理后拉起；spawn 失败下轮再试
+                watchdog::remove_claim_in(&run_dir);
+                let args = watchdog::watchdog_spawn_args();
+                let exe = match std::env::current_exe() {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                match daemon::spawn_detached(&exe, &args) {
+                    Ok(pid) => {
+                        tracing::info!(pid, "看护者缺席，已由守护补种（选举胜出者）");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "看护者补种失败（下轮自检重试）");
+                    }
+                }
+            }
+        });
     }
 
     // 运行期日志轮转：守护日志只在启动时做过一次 2MiB 检查，长期运行的实例

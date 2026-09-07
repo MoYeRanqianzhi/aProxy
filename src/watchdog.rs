@@ -182,12 +182,19 @@ pub struct WatchdogConfig {
 }
 
 impl WatchdogConfig {
-    /// 从 settings 组装（生产路径）
+    /// 从 settings 组装（生产路径）。
+    /// `APROXY_WATCHDOG_SCAN_SECS` 可覆盖扫描周期——集成测试以秒级周期驱动
+    /// 真实看护进程；也可作为高级用户临时调频入口（正式调优走 settings）。
     pub fn from_settings() -> Self {
         let s = settings::load();
+        let scan_secs = std::env::var("APROXY_WATCHDOG_SCAN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or_else(|| s.watchdog_heartbeat_secs.max(1));
         Self {
             run_dir: crate::daemon::run_dir(),
-            scan_secs: s.watchdog_heartbeat_secs.max(1),
+            scan_secs,
             stale_after_cycles: s.watchdog_stale_after_cycles.max(1),
             max_restarts: s.watchdog_max_restarts,
             idle_exit_secs: s.watchdog_idle_exit_secs,

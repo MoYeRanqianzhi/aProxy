@@ -3,6 +3,13 @@
 ## 面向人类（./docs/）
 
 - `docs/architecture.md` — 架构总览：模块职责、重试/流式回放、守护模型、IPC、restore、日志治理
+  （**待同步**：main.rs 拆分后的模块分工、磁盘缓存双模缓冲）
+- `docs/benchmark-memory.md` — 高并发压测与磁盘缓存优化报告（before/after 实证）
+
+## 面向 AI 用户（.claude/skills/）
+
+- `aproxy-cli/` — aProxy CLI 全量参考（SKILL.md 导航 + references/latest/ 五分文件）；
+  版本留存策略与持续更新义务见 `.agents/memory/2026-09-07-aproxy-cli-skill-versioning.md`
 
 ## 面向 agent（./.agents/）
 
@@ -10,6 +17,7 @@
 - `.agents/MEMORY.md` — 关键记忆索引
 - `.agents/memory/` — 长期记忆（架构决策、审查结论、环境事实）
 - `.agents/TODO.md` — 共享待办
+- `.agents/bench/` — 压测编排脚本与原始采样数据（before/after CSV）
 - `.agents/docs/` — 开发文档（本文档树）
 
 ## .agents/docs/ 内容规划

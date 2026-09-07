@@ -15,12 +15,7 @@
 //! 实例；存活一律以 IPC ping 为准，不信任注册文件与 pid 本身。
 
 use serde::{Deserialize, Serialize};
-use std::{
-    io,
-    path::PathBuf,
-    sync::{Arc, atomic::Ordering},
-    time::Duration,
-};
+use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
 /// 实例注册表目录：`~/.aproxy/run/`
 pub fn run_dir() -> PathBuf {
@@ -668,11 +663,11 @@ where
     info.last_activity_secs = stats
         .last_activity_secs
         .load(std::sync::atomic::Ordering::Relaxed);
-    if let Ok(slot) = stats.last_error.lock() {
-        if let Some((msg, at)) = slot.as_ref() {
-            info.last_error = Some(msg.clone());
-            info.last_error_at = *at;
-        }
+    if let Ok(slot) = stats.last_error.lock()
+        && let Some((msg, at)) = slot.as_ref()
+    {
+        info.last_error = Some(msg.clone());
+        info.last_error_at = *at;
     }
     let resp: IpcResponse = match serde_json::from_str(&line) {
         Ok(IpcRequest::Ping | IpcRequest::Stats) => IpcResponse {
@@ -824,6 +819,7 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     fn sample_info(port: &str) -> InstanceInfo {
         InstanceInfo {

@@ -78,6 +78,14 @@ async fn main() {
         return;
     }
 
+    // 看护进程：进入看护主循环（claim 接管 + 收养 + 健康扫描 + 重拉）。
+    // 同样忽略一切子命令（转发来的参数对看护者无意义）。
+    if cli.daemon_watchdog {
+        let cfg = aproxy::watchdog::WatchdogConfig::from_settings();
+        aproxy::watchdog::serve(cfg).await;
+        return;
+    }
+
     // settings.json 检查（error 级）：每次软件运行都执行——别名损坏、JSON 语法
     // 错误等会严重影响 start/stop 按名字操作，必须立刻报出。不退出：管理命令
     // status/stop 不能因内部配置损坏而不可用。doctor 子命令会再次汇总（含分级），

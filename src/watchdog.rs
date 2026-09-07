@@ -163,6 +163,403 @@ pub fn heartbeat_fresh_secs(settings: &settings::Settings) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// 看护者主循环状态：全部步进函数可测（serve() 只是 tick 循环壳）
+// ---------------------------------------------------------------------------
+
+/// 看护者配置（测试注入友好——settings 只在 CLI 层读取一次转成本结构）
+#[derive(Debug, Clone)]
+pub struct WatchdogConfig {
+    /// 实例注册表/run 目录（测试注入 tempdir，绝不触碰真实 run/）
+    pub run_dir: PathBuf,
+    /// 心跳扫描周期（秒）：每此间隔执行一次 adopt/health/claim 续写
+    pub scan_secs: u64,
+    /// 挂死容忍周期数：连续 N 轮心跳过期 + ping 失败才判挂死
+    pub stale_after_cycles: u64,
+    /// 同一实例连续重拉失败上限（crashloop 防护）
+    pub max_restarts: u32,
+    /// 全部实例清零后的闲置自灭等待（秒）；0 = 永不自灭
+    pub idle_exit_secs: u64,
+}
+
+impl WatchdogConfig {
+    /// 从 settings 组装（生产路径）
+    pub fn from_settings() -> Self {
+        let s = settings::load();
+        Self {
+            run_dir: crate::daemon::run_dir(),
+            scan_secs: s.watchdog_heartbeat_secs.max(1),
+            stale_after_cycles: s.watchdog_stale_after_cycles.max(1),
+            max_restarts: s.watchdog_max_restarts,
+            idle_exit_secs: s.watchdog_idle_exit_secs,
+        }
+    }
+}
+
+/// 被看护实例的跟踪状态
+struct Watched {
+    port: String,
+    pid: u32,
+    /// 进程句柄（SYNCHRONIZE|TERMINATE）：挂死杀进程与死亡等待都用它——
+    /// 句柄绑定原进程对象，PID 复用不影响其语义。unix 无句柄对象恒为 0
+    /// （死亡检测退化为轮询，未实测分支）。
+    handle: isize,
+    /// 本实例连续重拉失败次数（crashloop 防护计数，重拉成功清零）
+    consecutive_failures: u32,
+}
+
+/// 一个步进周期的完整看护状态
+pub struct WatchdogState {
+    pub cfg: WatchdogConfig,
+    /// 被收养的实例（端口 → 状态）
+    watched: Vec<Watched>,
+    /// 死亡事件接收端（等待任务 → 主循环）
+    deaths: tokio::sync::mpsc::UnboundedReceiver<(String, u32)>,
+    #[allow(dead_code)] // 发送端由等待任务持有（字段仅生命周期管理需要）
+    death_tx: tokio::sync::mpsc::UnboundedSender<(String, u32)>,
+    /// 全部实例清零的起始时刻（None = 非空）；闲置自灭计时
+    empty_since: Option<std::time::Instant>,
+}
+
+impl WatchdogState {
+    pub fn new(cfg: WatchdogConfig) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            cfg,
+            watched: Vec::new(),
+            deaths: rx,
+            death_tx: tx,
+            empty_since: None,
+        }
+    }
+
+    /// 当前在册（收养中）实例端口
+    pub fn watched_ports(&self) -> Vec<String> {
+        self.watched.iter().map(|w| w.port.clone()).collect()
+    }
+
+    /// 收养扫描：注册表 diff——新出现的 aProxy 实例开句柄纳入看护；
+    /// 死亡事件里已摘除的不在此重复纳入（除非注册表又有它的记录 = 手工重启）。
+    /// 返回本次新收养的端口（日志/测试断言用）。
+    pub async fn adopt_scan(&mut self) -> Vec<String> {
+        let mut adopted = Vec::new();
+        for entry in crate::daemon::list_restore_entries_in(&self.cfg.run_dir) {
+            if self.watched.iter().any(|w| w.port == entry.port) {
+                continue;
+            }
+            // 实例身份建立：注册 PID 必须是活着的 aProxy 进程（PID 复用防冒名）。
+            // 不通过（刚死/被复用）→ 跳过，下轮再看（restore 记录仍在，等
+            // respawn 路径或真实实例出现）
+            let Some(info) = read_registry_info(&self.cfg.run_dir, &entry.port) else {
+                continue;
+            };
+            if !imp_process::is_aproxy_process(info.pid) {
+                continue;
+            }
+            let Some(handle) = imp::open_sync_handle(info.pid) else {
+                continue;
+            };
+            tracing::info!(port = %entry.port, pid = info.pid, "看护者收养实例");
+            self.watched.push(Watched {
+                port: entry.port.clone(),
+                pid: info.pid,
+                handle,
+                consecutive_failures: 0,
+            });
+            self.spawn_death_watcher(entry.port.clone(), info.pid, handle);
+            adopted.push(entry.port);
+        }
+        adopted
+    }
+
+    /// 为实例挂等待任务：进程死亡（句柄 signaled）即发死亡事件。
+    /// 阻塞在内核 WaitForSingleObject——无轮询，无 CPU 占用。
+    fn spawn_death_watcher(&self, port: String, pid: u32, handle: isize) {
+        let tx = self.death_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            imp::wait_blocking(handle);
+            let _ = tx.send((port, pid));
+        });
+    }
+
+    /// 健康扫描：心跳过期者走 IPC ping 二意见，都失败判挂死 → 杀（本方句柄
+    /// 绑定原进程，无 PID 复用风险）→ 死亡事件走统一 respawn 路径。
+    /// 返回被判挂死的端口（测试断言用）。
+    pub async fn health_scan(&mut self) -> Vec<String> {
+        let stale_ms = self.cfg.scan_secs * 1000 * (self.cfg.stale_after_cycles.max(1) + 1);
+        let now_ms = now_millis();
+        let mut hung = Vec::new();
+        for w in &self.watched {
+            match read_heartbeat(&w.port) {
+                // 无心跳数据（旧版本守护/创建失败）：退化为纯死亡检测
+                None => continue,
+                Some(ts) if now_ms.saturating_sub(ts) <= stale_ms => continue,
+                Some(_) => {}
+            }
+            // 心跳过期：IPC ping 二意见（3s 超时 ×1——已在 3× 周期容忍之后，
+            // ping 内部还有 3 次重试判死语义）
+            if crate::daemon::ipc_ping(&w.port).await.is_ok() {
+                continue; // runtime 活着（可能调度延迟），下轮再看
+            }
+            tracing::error!(port = %w.port, pid = w.pid, "实例心跳过期且 IPC 无响应，判定挂死，终止进程");
+            hung.push(w.port.clone());
+            imp::terminate_handle(w.handle);
+        }
+        hung
+    }
+
+    /// 处理死亡事件：.restore + 注册表都在 = 崩溃 → 重拉；否则优雅退出/清理，
+    /// 摘除看护。指数退避 + crashloop 上限。返回处置结果（测试断言用）。
+    pub async fn handle_death(&mut self, port: &str) -> DeathOutcome {
+        let Some(idx) = self.watched.iter().position(|w| w.port == port) else {
+            return DeathOutcome::Unknown;
+        };
+        let mut w = self.watched.swap_remove(idx);
+        imp::close_handle(w.handle);
+
+        let restore_path = crate::daemon::restore_file_path_in(&self.cfg.run_dir, port);
+        let registry_path = crate::daemon::instance_file_path_in(&self.cfg.run_dir, port);
+        if !restore_path.is_file() || !registry_path.is_file() {
+            tracing::info!(port = %port, "实例已优雅退出（无恢复记录），摘除看护");
+            self.after_watch_removal();
+            return DeathOutcome::GracefulExit;
+        }
+
+        // crashloop 上限：连续失败达上限 → 放弃（保留 .restore 人工兜底）
+        if w.consecutive_failures >= self.cfg.max_restarts {
+            tracing::error!(
+                port = %port,
+                attempts = w.consecutive_failures,
+                "实例连续重拉失败达上限，放弃自动重拉（.restore 已保留，可 aproxy restore 手工恢复）"
+            );
+            crate::daemon::append_startup_log(&format!(
+                "[watchdog] 端口 {port} 的实例连续重拉 {} 次失败，已放弃自动重拉；可执行 aproxy restore 手工恢复",
+                w.consecutive_failures
+            ));
+            self.after_watch_removal();
+            return DeathOutcome::GaveUp;
+        }
+
+        // 退避：1s→2s→4s→…封顶 300s（按已连续失败次数）
+        let delay = backoff_delay_secs(w.consecutive_failures);
+        if delay > 0 {
+            tracing::warn!(port = %port, delay_secs = delay, "实例崩溃，退避后重拉");
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+        } else {
+            tracing::warn!(port = %port, "实例崩溃，立即重拉");
+        }
+
+        match respawn_instance(&self.cfg.run_dir, port).await {
+            Ok(pid) => {
+                tracing::info!(port = %port, new_pid = pid, "实例已重拉并就绪");
+                w.pid = pid;
+                w.consecutive_failures = 0;
+                if let Some(h) = imp::open_sync_handle(pid) {
+                    w.handle = h;
+                    self.spawn_death_watcher(port.to_string(), pid, h);
+                } else {
+                    // 句柄开不出来：轮询兜底（adopt_scan 下轮会补挂正确句柄）
+                    w.handle = 0;
+                }
+                self.watched.push(w);
+                self.empty_since = None;
+                DeathOutcome::Respawned(pid)
+            }
+            Err(e) => {
+                w.consecutive_failures += 1;
+                tracing::error!(port = %port, error = %e, attempt = w.consecutive_failures, "重拉失败");
+                // 保留 .restore（人工兜底），下轮 adopt_scan 视注册表情况重试；
+                // 连续失败计数挂在端口上（不重新收养即丢失计数 → 记回 watched，
+                // 下一轮死亡/adopt 后继续累计）
+                self.watched.push(w);
+                self.after_watch_removal();
+                DeathOutcome::RespawnFailed
+            }
+        }
+    }
+
+    /// 一个完整步进周期：claim 续写 + 收养 + 健康 + 挂死事件处理 + 闲置自灭判定
+    pub async fn tick(&mut self) {
+        // 消化本周期内累积的死亡事件
+        let mut deaths = Vec::new();
+        while let Ok((port, _pid)) = self.deaths.try_recv() {
+            deaths.push(port);
+        }
+        for port in deaths {
+            self.handle_death(&port).await;
+        }
+        self.adopt_scan().await;
+        self.health_scan().await;
+        self.refresh_claim();
+        self.maybe_idle_exit().await;
+    }
+
+    /// claim 续写：心跳时间戳刷新（其他进程据此刻定本看护者是否在任/假死）
+    fn refresh_claim(&mut self) {
+        let claim = WatchdogClaim {
+            pid: std::process::id(),
+            created_at_process: process_start_time(std::process::id()).unwrap_or(0),
+            heartbeat_secs: now_secs(),
+        };
+        let path = claim_path_in(&self.cfg.run_dir);
+        if let Ok(json) = serde_json::to_string(&claim)
+            && let Err(e) = std::fs::write(&path, json + "\n")
+        {
+            tracing::warn!(error = %e, "claim 心跳续写失败");
+        }
+    }
+
+    /// 闲置自灭：全部实例清零（收养表空且注册表空）持续 idle_exit_secs 后
+    /// 删除 claim 退出，系统回到零常驻。
+    async fn maybe_idle_exit(&mut self) {
+        if self.cfg.idle_exit_secs == 0 {
+            return;
+        }
+        let registry_empty = crate::daemon::registry_pids_in(&self.cfg.run_dir).is_empty();
+        if self.watched.is_empty() && registry_empty {
+            let since = *self.empty_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed().as_secs() >= self.cfg.idle_exit_secs {
+                tracing::info!("无任何实例需要看护，看护者退出（闲置自灭）");
+                remove_claim_in(&self.cfg.run_dir);
+                std::process::exit(0);
+            }
+        } else {
+            self.empty_since = None;
+        }
+    }
+
+    fn after_watch_removal(&mut self) {
+        if self.watched.is_empty() {
+            self.empty_since = Some(std::time::Instant::now());
+        }
+    }
+}
+
+/// 死亡事件处置结果（handle_death 返回，测试断言用）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DeathOutcome {
+    /// 崩溃并成功重拉（携带新 PID）
+    Respawned(u32),
+    /// 重拉失败（退避计数 +1，未达上限）
+    RespawnFailed,
+    /// 连续失败达上限，放弃自动重拉
+    GaveUp,
+    /// 优雅退出（无 .restore），正常摘除
+    GracefulExit,
+    /// 端口不在看护表中（重复事件等）
+    Unknown,
+}
+
+/// 重拉退避：`consecutive_failures` 为已连续失败次数。首次崩溃（0）立即重拉；
+/// 失败 1 次后等 1s、2 次后 2s、3 次后 4s……封顶 300s。
+pub fn backoff_delay_secs(consecutive_failures: u32) -> u64 {
+    if consecutive_failures == 0 {
+        return 0;
+    }
+    // 移位上限 30 防 u32::MAX 溢出（1<<30 已远超 300s 封顶）
+    (1u64 << (consecutive_failures - 1).min(30)).min(300)
+}
+
+/// 读注册表文件获取实例信息（收养时的身份基线）
+fn read_registry_info(run_dir: &Path, port: &str) -> Option<crate::daemon::InstanceInfo> {
+    let path = crate::daemon::instance_file_path_in(run_dir, port);
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// 当前 Unix 秒
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 按 .restore 记录重拉实例并等待 IPC 就绪（8s，与 restore/start 一致）。
+/// 成功返回新 PID；注册表缺失记录的实例恢复（实例文件由守护 bind 后自写）。
+async fn respawn_instance(run_dir: &Path, port: &str) -> Result<u32, String> {
+    let entries = crate::daemon::list_restore_entries_in(run_dir);
+    let entry = entries
+        .iter()
+        .find(|e| e.port == port)
+        .ok_or_else(|| "恢复记录不存在".to_string())?;
+    // 配置文件已被删的记录无法忠实恢复（与 aproxy restore 同语义）
+    if let Some(cfg) = entry
+        .args
+        .iter()
+        .position(|a| a == "--config")
+        .and_then(|i| entry.args.get(i + 1))
+        && !std::path::Path::new(cfg).exists()
+    {
+        crate::daemon::remove_restore_file_in(run_dir, port);
+        return Err(format!("配置文件已不存在: {cfg}"));
+    }
+    let mut args = entry.args.clone();
+    args.push("--daemon-child".to_string());
+    let exe = std::env::current_exe().map_err(|e| format!("无法定位自身可执行文件: {e}"))?;
+    let pid = crate::daemon::spawn_detached(&exe, &args).map_err(|e| format!("spawn 失败: {e}"))?;
+    // 就绪判定：IPC ping（8s，与 start/restore 一致）
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        if crate::daemon::ipc_ping(port).await.is_ok() {
+            return Ok(pid);
+        }
+        if std::time::Instant::now() > deadline {
+            return Err("重拉后 IPC 未在预期时间内就绪".to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// 看护者主循环（CLI 入口调用）：接管 claim → tick 循环。
+/// claim 被竞争者持有且有效时安静退出（唯一性落点）。
+pub async fn serve(cfg: WatchdogConfig) {
+    // claim 接管：已有有效 claim = 另一个看护者在任 → 让位退出
+    let my_claim = WatchdogClaim {
+        pid: std::process::id(),
+        created_at_process: process_start_time(std::process::id()).unwrap_or(0),
+        heartbeat_secs: now_secs(),
+    };
+    if acquire_claim_in(&cfg.run_dir, &my_claim).is_none() {
+        // 已有 claim：验证其有效性；无效则清理重试（前任死亡/假死/残留）
+        if claim_is_in_effect_in(
+            &cfg.run_dir,
+            heartbeat_fresh_secs(&settings::load()),
+            now_secs(),
+        ) {
+            tracing::info!("已有在任的看护者，本进程退出（选举唯一性）");
+            return;
+        }
+        // 无效 claim：先杀掉「活着但假死」的前任（身份可验证才杀——PID 复用
+        // 防冒名的最后一道关），再原子接管
+        if let Some(old) = read_claim_in(&cfg.run_dir) {
+            let old_alive = imp_process::is_aproxy_process(old.pid)
+                && verify_claim_identity(old.pid, old.created_at_process);
+            if old_alive {
+                tracing::error!(
+                    pid = old.pid,
+                    "前任看护者仍在但心跳过期（假死），终止后接管"
+                );
+                imp::terminate_verified(old.pid);
+            }
+            remove_claim_in(&cfg.run_dir);
+        }
+        if acquire_claim_in(&cfg.run_dir, &my_claim).is_none() {
+            tracing::info!("claim 被竞争者抢先，本进程退出（选举唯一性）");
+            return;
+        }
+    }
+    tracing::info!(pid = std::process::id(), "看护者就绪（watchdog）");
+
+    let mut state = WatchdogState::new(cfg);
+    state.adopt_scan().await;
+    let scan = Duration::from_secs(state.cfg.scan_secs.max(1));
+    loop {
+        tokio::time::sleep(scan).await;
+        state.tick().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 共享内存心跳：守护每周期写毫秒时间戳，看护者扫描判定挂死
 // ---------------------------------------------------------------------------
 //
@@ -213,18 +610,18 @@ impl HeartbeatWriter {
     /// 创建/打开本实例的心跳节并写入初始时间戳。实例 bind 成功后调用；
     /// 失败只降级（看护者对该实例退化为纯进程死亡检测），绝不能阻断启动。
     pub fn create(port: &str) -> Option<Self> {
-        imp::create_heartbeat(port)
+        imp_heart::create_heartbeat(port)
     }
 
     /// 写入当前毫秒时间戳（原子 store，无锁）
     pub fn beat(&self) {
-        imp::heartbeat_store(self, now_millis());
+        imp_heart::heartbeat_store(self, now_millis());
     }
 }
 
 impl Drop for HeartbeatWriter {
     fn drop(&mut self) {
-        imp::unmap_heartbeat(self);
+        imp_heart::unmap_heartbeat(self);
     }
 }
 
@@ -232,7 +629,7 @@ impl Drop for HeartbeatWriter {
 /// （旧版本守护或创建失败）→ None，看护者按「无心跳数据」处理（只做
 /// 进程死亡检测，不做挂死判定）。
 pub fn read_heartbeat(port: &str) -> Option<u64> {
-    imp::heartbeat_load(port)
+    imp_heart::heartbeat_load(port)
 }
 
 /// 当前 Unix 毫秒（系统时钟早于 epoch 回退 0——仅用于新鲜度比较，
@@ -247,8 +644,79 @@ pub fn now_millis() -> u64 {
 // ---------------------------------------------------------------------------
 // 平台实现
 // ---------------------------------------------------------------------------
+
 #[cfg(windows)]
 mod imp {
+    /// 打开进程的 SYNCHRONIZE|TERMINATE 句柄（死亡等待/挂死终止共用）
+    pub fn open_sync_handle(pid: u32) -> Option<isize> {
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        };
+        unsafe {
+            let h = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid);
+            if h == 0 { None } else { Some(h) }
+        }
+    }
+
+    /// 阻塞等待进程死亡（内核对象 signaled）。仅在 spawn_blocking 中调用。
+    pub fn wait_blocking(handle: isize) {
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        unsafe {
+            // INFINITE：进程死亡是必然事件（迟早 signaled），无需超时
+            let _ = WaitForSingleObject(handle, 0xFFFF_FFFF);
+        }
+    }
+
+    /// 终止挂死实例（句柄绑定原进程对象，无 PID 复用风险）
+    pub fn terminate_handle(handle: isize) {
+        use windows_sys::Win32::System::Threading::TerminateProcess;
+        unsafe {
+            let _ = TerminateProcess(handle, 1);
+        }
+    }
+
+    /// 关闭句柄（摘除看护/重拉换句柄时）
+    pub fn close_handle(handle: isize) {
+        if handle != 0 {
+            unsafe {
+                let _ = windows_sys::Win32::Foundation::CloseHandle(handle);
+            }
+        }
+    }
+
+    /// 杀掉经身份验证的假死前任看护者（claim 记录的 PID + 创建时间已验证，
+    /// PID 复用冒名在此被拒绝）。验证失败静默返回——宁可漏杀不误杀。
+    pub fn terminate_verified(pid: u32) {
+        if !super::imp_process::is_aproxy_process(pid) {
+            return;
+        }
+        if let Some(h) = open_sync_handle(pid) {
+            terminate_handle(h);
+            close_handle(h);
+        }
+    }
+}
+
+#[cfg(unix)]
+mod imp {
+    pub fn open_sync_handle(_pid: u32) -> Option<isize> {
+        // unix 无进程句柄对象；死亡检测退化为轮询（未实测分支，同 UDS 批处理）
+        None
+    }
+    pub fn wait_blocking(_handle: isize) {
+        // unix 无句柄等待原语接入（未实测分支）：恒久挂起占位，
+        // 死亡检测退化为 adopt/health 轮询
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+    }
+    pub fn terminate_handle(_handle: isize) {}
+    pub fn close_handle(_handle: isize) {}
+    pub fn terminate_verified(_pid: u32) {}
+}
+
+#[cfg(windows)]
+mod imp_heart {
     /// 创建命名节并映射视图（守护侧）
     pub fn create_heartbeat(port: &str) -> Option<super::HeartbeatWriter> {
         use windows_sys::Win32::System::Memory::{
@@ -326,7 +794,7 @@ mod imp {
 }
 
 #[cfg(unix)]
-mod imp {
+mod imp_heart {
     pub fn create_heartbeat(port: &str) -> Option<super::HeartbeatWriter> {
         // posix shm：/dev/shm/aproxy-heart-<port>；写透文件实现同一语义
         // （unix 未实测，与 UDS IPC 同批处理）
@@ -465,6 +933,16 @@ mod imp_process {
 mod tests {
     use super::*;
 
+    fn test_cfg(dir: &Path) -> WatchdogConfig {
+        WatchdogConfig {
+            run_dir: dir.to_path_buf(),
+            scan_secs: 1,
+            stale_after_cycles: 1,
+            max_restarts: 2,
+            idle_exit_secs: 0, // 测试不自灭（退出会杀测试进程！）
+        }
+    }
+
     #[test]
     fn claim_roundtrip_and_missing() {
         let dir = tempfile::tempdir().unwrap();
@@ -560,5 +1038,113 @@ mod tests {
         assert!(second >= first, "时间戳应单调不减");
         // 另一个端口没有节：读 None（看护者按「无心跳数据」处理）
         assert!(read_heartbeat(&format!("{port}-absent")).is_none());
+    }
+
+    // ---------------- 看护主循环状态机（纯逻辑，tempdir 注入） ----------------
+
+    /// 构造一个伪实例环境：注册表 + 恢复记录齐全（进程身份不真存在——
+    /// adopt_scan 的 is_aproxy_process 探活会拒绝它，测试直接操纵 watched）
+    fn write_crashed_instance(dir: &Path, port: &str) {
+        let info = crate::daemon::InstanceInfo {
+            pid: u32::MAX - 777, // 不会存活也不易复用的 PID
+            version: "0.0.0-test".into(),
+            listen_addr: format!("127.0.0.1:{port}"),
+            config_path: "C:/tmp/no-such-config.toml".into(),
+            base_url: "https://x".into(),
+            started_at: now_secs(),
+            last_activity_secs: 0,
+            proto_version: 2,
+            requests_total: 0,
+            retries_total: 0,
+            last_error: None,
+            last_error_at: 0,
+        };
+        crate::daemon::write_instance_file_in(dir, &info).unwrap();
+        // restore 记录（崩溃信号）
+        let args: Vec<String> = vec![
+            "--config".to_string(),
+            "C:/tmp/no-such-config.toml".to_string(),
+        ];
+        crate::daemon::write_restore_file_in(dir, port, &args).unwrap();
+    }
+
+    #[tokio::test]
+    async fn watchdog_state_death_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path());
+        let mut st = WatchdogState::new(cfg);
+        assert!(st.watched_ports().is_empty());
+
+        // 优雅退出：无 .restore → GracefulExit（不在看护表也返回 Unknown 先验证）
+        assert_eq!(st.handle_death("59901").await, DeathOutcome::Unknown);
+
+        // 把伪实例直接塞进看护表（绕过 adopt 的真实进程探活）
+        st.watched.push(Watched {
+            port: "59901".into(),
+            pid: u32::MAX - 777,
+            handle: 0,
+            consecutive_failures: 0,
+        });
+        // 有注册表无 .restore → 优雅退出语义
+        let info = crate::daemon::InstanceInfo {
+            pid: u32::MAX - 777,
+            version: "t".into(),
+            listen_addr: "127.0.0.1:59901".into(),
+            config_path: "C:/tmp/c.toml".into(),
+            base_url: "https://x".into(),
+            started_at: now_secs(),
+            last_activity_secs: 0,
+            proto_version: 2,
+            requests_total: 0,
+            retries_total: 0,
+            last_error: None,
+            last_error_at: 0,
+        };
+        crate::daemon::write_instance_file_in(dir.path(), &info).unwrap();
+        assert_eq!(st.handle_death("59901").await, DeathOutcome::GracefulExit);
+        assert!(st.watched_ports().is_empty(), "优雅退出后应摘除看护");
+    }
+
+    #[tokio::test]
+    async fn watchdog_state_crashloop_gives_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = "59902";
+        write_crashed_instance(dir.path(), port);
+        let cfg = test_cfg(dir.path());
+        let mut st = WatchdogState::new(cfg);
+        st.watched.push(Watched {
+            port: port.into(),
+            pid: u32::MAX - 777,
+            handle: 0,
+            consecutive_failures: st.cfg.max_restarts, // 已达上限
+        });
+        // 崩溃（restore+registry 都在）但失败计数达上限 → GaveUp，记录保留
+        assert_eq!(st.handle_death(port).await, DeathOutcome::GaveUp);
+        assert!(st.watched_ports().is_empty(), "放弃后应摘除看护");
+        assert!(
+            crate::daemon::restore_file_path_in(dir.path(), port).is_file(),
+            ".restore 必须保留（人工 restore 兜底）"
+        );
+    }
+
+    #[test]
+    fn watchdog_backoff_progression() {
+        // 1→2→4→8 指数增长，封顶 300
+        assert_eq!(backoff_delay_secs(0), 0, "首次崩溃立即重拉");
+        assert_eq!(backoff_delay_secs(1), 1);
+        assert_eq!(backoff_delay_secs(2), 2);
+        assert_eq!(backoff_delay_secs(3), 4);
+        assert_eq!(backoff_delay_secs(4), 8);
+        assert_eq!(backoff_delay_secs(20), 300, "封顶 300s");
+        assert_eq!(backoff_delay_secs(u32::MAX), 300, "不溢出");
+    }
+
+    #[test]
+    fn watchdog_config_from_settings_defaults() {
+        // 生产路径组装：字段对齐 settings 语义
+        let s = settings::Settings::default();
+        assert_eq!(s.watchdog_heartbeat_secs.max(1), 30);
+        assert_eq!(s.watchdog_max_restarts, 5);
+        assert_eq!(s.watchdog_idle_exit_secs, 300);
     }
 }

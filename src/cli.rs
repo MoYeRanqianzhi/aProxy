@@ -44,6 +44,11 @@ pub(crate) struct Cli {
     #[arg(long, hide = true, global = true)]
     pub(crate) daemon_child: bool,
 
+    /// [内部] 看护进程标记：守护/CLI 拉起看护者时附加到命令行，
+    /// 本进程据此进入看护主循环。勿手动使用。
+    #[arg(long, hide = true, global = true)]
+    pub(crate) daemon_watchdog: bool,
+
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
 }

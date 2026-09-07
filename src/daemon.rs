@@ -262,6 +262,25 @@ pub fn registry_pids_in(run_dir: &std::path::Path) -> Vec<u32> {
     out
 }
 
+/// 向 startup.log 追加一行（带 unix 时间戳前缀）。看门狗的 crashloop 放弃、
+/// 假死接管等重大事件写这里——用户排查「实例为什么没被拉起」的第一个入口。
+pub fn append_startup_log(line: &str) {
+    let _ = std::fs::create_dir_all(logs_dir());
+    let path = logs_dir().join("startup.log");
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "[unix+{ts}s] {line}");
+    }
+}
+
 /// 等待实例退出（连续 2 轮探测都失败才视为已退出），超时返回 false。
 /// 单轮失败可能是 IPC 通道瞬态问题（管道 busy / 超时），据此上报「已停止」
 /// 会掩盖仍存活的实例。

@@ -94,13 +94,16 @@ listen_addr = "127.0.0.1:12345"          # 本地监听
 # extra_headers / override_headers       # 追加/覆盖请求头
 # max_retry_backoff_secs = 320           # 重试退避封顶（0 = 所有重试零延迟）
 # spool_limit_mb = 256                   # 上游响应缓冲上限（MB）
+# max_body_mb = 128                      # 请求体上限（MB；0 = 不设限。未设时取 settings.json 全局默认）
+# disk_cache = true                      # 磁盘缓存：大请求体/响应溢写磁盘，内存与负载解耦（实测见 docs/benchmark-memory.md）
 # connect_timeout_secs = 30              # 上游连接建立超时（0 = 不设限）
 # read_timeout_secs = 300                # 两次读到数据间隔超时（0 = 不设限）
 ```
 
 运行数据在 `~/.aproxy/`：`run/`（实例注册与恢复记录）、`logs/`（守护日志，自动清理与轮转）、
-`settings.json`（内部配置：别名、默认配置文件、配置目录列表、日志轮转阈值等，
-程序管理不建议手改）。
+`spool/<端口>/`（磁盘缓存临时文件，启动时自动清理）、
+`settings.json`（内部配置：别名、默认配置文件、配置目录列表、日志轮转阈值、
+`max_body_mb`/`disk_cache` 全局默认（toml 可按实例覆盖）等，程序管理不建议手改）。
 
 配置目录列表默认含 `~/.aproxy/` 与 `~/.aproxy/configs/`，`aproxy find`/`aproxy doctor`
 会扫描其中的 `*.toml`（不递归）。
@@ -108,7 +111,7 @@ listen_addr = "127.0.0.1:12345"          # 本地监听
 ## 开发
 
 ```powershell
-cargo test          # 全量测试（89 单测 + 31 集成）
+cargo test          # 全量测试（93 单测 + 34 集成）
 cargo clippy --all-targets   # 必须零警告（项目纪律）
 cargo fmt --check
 ```

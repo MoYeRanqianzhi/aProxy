@@ -5,3 +5,4 @@ pub mod find;
 pub mod proxy;
 pub mod retry;
 pub mod settings;
+pub mod watchdog;

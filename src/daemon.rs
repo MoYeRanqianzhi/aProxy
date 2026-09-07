@@ -238,6 +238,30 @@ impl IpcStats {
     }
 }
 
+/// 注册表中登记的全部实例 PID（只读 *.pid 文件，不做 IPC 探活）。
+/// 看门狗选举的输入：探活由调用方用自己的进程级手段完成（实例 IPC 不可达
+/// 恰恰是需要看护的信号，不能作为「死」的依据参与选举）。
+pub fn registry_pids_in(run_dir: &std::path::Path) -> Vec<u32> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(run_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("pid") {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && let Ok(info) = serde_json::from_str::<InstanceInfo>(&content)
+        {
+            out.push(info.pid);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// 等待实例退出（连续 2 轮探测都失败才视为已退出），超时返回 false。
 /// 单轮失败可能是 IPC 通道瞬态问题（管道 busy / 超时），据此上报「已停止」
 /// 会掩盖仍存活的实例。

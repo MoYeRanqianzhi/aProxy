@@ -37,6 +37,47 @@ spike 后再议）、unix 适配（架构兼容但只在 Windows 实测）。
 - **诚实边界（写进文档）**：进程级死亡的自愈空窗 = 在途请求全灭（连接断）
   + ~1s 重拉；看门狗救的是「之后永久断流」不是在途请求。
 
+## IPC v2 协议增强（并入本计划；rolling upgrade 的地基）
+
+现状（alpha.5）：一行 JSON framing；`IpcRequest` = tagged enum（`op: ping|shutdown`）；
+`IpcResponse { ok, info: Option<InstanceInfo> }`；`InstanceInfo` 已有
+`pid/version/listen_addr/config_path/base_url/started_at/last_activity_secs`。
+
+### 协议版本化（双向兼容的关键）
+
+- `IpcResponse` 增 `proto: u32`（`#[serde(default = "proto_v1")]`）——旧实例
+  响应缺字段读为 v1；新客户端按此降级。
+- `IpcRequest` 增变体 `Stats`（观测细节，原 F 项并入）。**未知 op 的降级语义**：
+  旧实例收到未知 op 反序列化失败——客户端对「解析失败」回退为仅可用 Ping/
+  Shutdown（能力探测：首个响应带 proto=1 即认定对端无 Stats）。
+- 新实例读旧请求：serde 默认忽略未知字段，天然兼容。
+- 兼容矩阵进测试：新 CLI×旧实例（缺字段→默认值）、旧 CLI×新实例（多余字段忽略）、
+  未知 op 降级。
+
+### InstanceInfo 扩展（全部 serde default，旧文件/旧响应无损读取）
+
+| 字段 | 语义 |
+|---|---|
+| `proto_version: u32` | 协议版本（响应同时带顶层 proto，双保险） |
+| `requests_total: u64` | 实例累计转发请求数（AppState AtomicU64） |
+| `retries_total: u64` | 累计重试次数 |
+| `last_error: Option<String>` | 最近一次上游错误摘要（打码后） |
+| `last_error_at: u64` | 该错误时刻（Unix 秒，0=无） |
+| `uptime` 不加 | 由 started_at 推导，不冗余存储 |
+
+### status 展示增强（消费侧）
+
+- 实例行增：请求数、重试数、最近错误摘要与时间
+- **混版本检测**：实例 version 与 CLI 自身 version 分组展示——`status` 即可发现
+  「有实例跑旧版本」，为滚动升级提供事实源
+
+### 滚动升级定位
+
+`aproxy upgrade`（逐实例 stop→start 替换、串行、失败即停）**不在 G2 范围**；
+本节交付其全部地基：版本字段、混版本检测、restore 参数可重启性（现有）、
+看护者不误拉优雅 stop（`.restore` 删除信号，已设计）。升级时看护者按现有
+优雅退出语义放行——滚动升级与看门狗天然协作。
+
 ## settings.json 配置项（watchdog 分层 = settings 全局层，无 toml 覆盖）
 
 看门狗是**系统级单例**（一个看护进程看护全部实例），不像 disk_cache/max_body_mb
@@ -70,18 +111,23 @@ toml 对同一看护者语义打架）。
 ## 分步提交（每步：实现 + 测试 + clippy 零警告 + fmt + commit）
 
 1. **settings 五字段** + doctor 检查（纯配置层，先行合入不激活）
-2. **claim 选举原语**：`watchdog.claim` 读写、在任判定、CREATE_NEW 原子接管、
+2. **IPC v2 协议**：proto 字段 + Stats op + InstanceInfo 观测字段（requests/
+   retries/last_error）+ status 展示增强与混版本检测 + 兼容矩阵测试
+   （AppState 加两个 AtomicU64 计数器——热路径各一条 Relaxed add，量级同现有
+   last_activity 更新）
+3. **claim 选举原语**：`watchdog.claim` 读写、在任判定、CREATE_NEW 原子接管、
    PID 复用防冒名——单测覆盖边界表全部场景（模拟 PID 复用/心跳过期/竞态接管）
-3. **共享内存心跳**：守护侧节创建 + store；看护侧读表扫描。Windows API 封装
+4. **共享内存心跳**：守护侧节创建 + store；看护侧读表扫描。Windows API 封装
    + 集成测试（测试端口派生规则）
-4. **`aproxy watchdog` 主循环**：收养现有实例（OpenProcess + 线程池等待）、
-   死亡→按 `.restore` 重拉 + IPC 就绪判定、退避状态机、闲置自灭
-5. **守护侧互保**：5 分钟自检 + 选举补种挂载进 serve_forever；
+5. **`aproxy watchdog` 主循环**：收养现有实例（OpenProcess + 线程池等待）、
+   死亡→按 `.restore` 重拉 + IPC 就绪判定（消费 v2 字段）、退避状态机、闲置自灭
+6. **守护侧互保**：5 分钟自检 + 选举补种挂载进 serve_forever；
    `start` 首启触发出簇；`watchdog=false` 全链路关闭语义
-6. **收尾**：skill 文档增补、README、architecture.md 看门狗节、bump alpha.6 + tag
+7. **收尾**：skill 文档增补、README、architecture.md 看门狗节、bump alpha.6 + tag
 
 ## 测试矩阵（边界表全量化）
 
+- IPC：新 CLI×旧实例 / 旧 CLI×新实例 / 未知 op 降级 / Stats 计数正确性
 - 选举：无 claim / claim 残留 / PID 复用 / 心跳过期 / 并发接管（多线程竞态测试）
 - 死亡检测：kill -9 等价（taskkill /F）→ 秒级检出 → 重拉 → ping 就绪
 - 优雅 stop 不复活：stop → .restore 删 → 看护不重拉

@@ -27,7 +27,7 @@
 ## 中期功能（对齐「无限重试、不中断」使命）
 
 - [ ] **正式发布：GitHub 构建指令集多版本**（必然项，2026-09-07 定调）：CI 矩阵 baseline + `RUSTFLAGS="-C target-cpu=x86-64-v3"`（AVX2），产物命名区分，发布页两者都放；详见 memory/release-engineering
-- [ ] **F. IPC 观测扩展**：ping 响应带请求计数/重试计数/最近错误，`status` 展示（走管道不碰代理端口，符合铁律）
+- [ ] **F. IPC 观测扩展**（已并入 G2 计划作为 IPC v2 协议步）：proto 版本化 + Stats op + InstanceInfo 观测字段 + status 混版本检测——滚动升级地基；计划见 .agents/plan/watchdog-v1.md
 - [ ] **G2. 运行期看门狗** [G]：守护崩溃自动拉起（与「分离无父进程」模型有张力，需小型监督进程，先讨论再动）。2026-09-07 定调：这是通向「绝对不间断」的缺失一环——unwind 管小故障隔离，看门狗兜底进程级死亡；也是未来若采用 panic=abort 的前置配套（见 memory/panic-abort-outlook）
 - [ ] **H.（可选）配置热重载**：IPC reload，避免 stop/start 断流
 - [ ] unix 分支实测（UDS IPC / unix spawn 路径从未在类 Unix 环境运行过；CI ubuntu/macos 只 cargo check）

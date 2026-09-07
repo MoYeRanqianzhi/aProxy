@@ -23,14 +23,16 @@
 - [x] **main.rs 拆分**（70e103f）：1719→114 行；cli.rs + commands/ 九命令 + server.rs + util.rs
 - [x] **aproxy-cli skill**（f62d837）：.claude/skills/ 渐进式全量参考；版本留存策略见 memory/2026-09-07-aproxy-cli-skill-versioning（小版本直改 latest，大版本才留存）；评测经用户决定放弃（agent 越界读源码，验证靠逐条源码核对）
 - [x] **alpha.5 收口**（2026-09-08）：bump v0.1.0-alpha.5 + tag；architecture.md 文档同步（模块分工/双模缓冲/版本路线）；版本路线定调——0.1.x 全程预发布后缀，0.2.0 起才引入 UI（远期）；生产实例（12345/12349）仍跑旧二进制，新功能需用户替换部署后生效
+- [x] **G2 看门狗**（W1-W7，2026-09-08 完成）：全局单看护进程 + 内核等待 + 选举规范 + settings 五字段 + IPC v2 观测；实测 +2.4% 体积/+2.9MB 常驻/热路径零损耗（docs/benchmark-watchdog.md）；计划偏差 3 项记录；107 lib + 36 集成全绿
+- [x] **F. IPC 观测扩展**（随 G2 落地）：proto 版本化 + InstanceInfo 观测字段（请求数/重试数/最近错误）+ status 混版本检测——滚动升级地基齐备
 
 ## 中期功能（对齐「无限重试、不中断」使命）
 
 - [ ] **正式发布：GitHub 构建指令集多版本**（必然项，2026-09-07 定调）：CI 矩阵 baseline + `RUSTFLAGS="-C target-cpu=x86-64-v3"`（AVX2），产物命名区分，发布页两者都放；详见 memory/release-engineering
-- [ ] **F. IPC 观测扩展**（已并入 G2 计划作为 IPC v2 协议步）：proto 版本化 + Stats op + InstanceInfo 观测字段 + status 混版本检测——滚动升级地基；计划见 .agents/plan/watchdog-v1.md
-- [ ] **G2. 运行期看门狗** [G]：守护崩溃自动拉起（与「分离无父进程」模型有张力，需小型监督进程，先讨论再动）。2026-09-07 定调：这是通向「绝对不间断」的缺失一环——unwind 管小故障隔离，看门狗兜底进程级死亡；也是未来若采用 panic=abort 的前置配套（见 memory/panic-abort-outlook）
 - [ ] **H.（可选）配置热重载**：IPC reload，避免 stop/start 断流
-- [ ] unix 分支实测（UDS IPC / unix spawn 路径从未在类 Unix 环境运行过；CI ubuntu/macos 只 cargo check）
+- [ ] **滚动升级 `aproxy upgrade`**（可选）：逐实例 stop→start 替换——IPC v2 混版本检测地基已备（status 可见旧版本实例）
+- [ ] **看门狗二期（可选）**：挂死不杀进程原地救（scoped runtime 注入 spike）、实例数极大时线程池死亡等待、unix 分支实测
+- [ ] unix 分支实测（UDS IPC / unix spawn / /dev/shm 心跳从未在类 Unix 环境运行过；CI ubuntu/macos 只 cargo check）
 
 ## 已结案（有意跳过，见记忆/审查记录）
 

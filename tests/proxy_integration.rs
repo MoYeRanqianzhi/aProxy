@@ -921,16 +921,19 @@ async fn client_disconnect_stops_upstream_requests() {
 }
 
 // ---------------------------------------------------------------------------
-// 16. 超过 10 MiB 的请求体 → 413
+// 16. 超过 max_body_mb 的请求体 → 413（显式设小上限；默认 128 MB 太大，
+//     真发 128MiB+1 的测试体既慢又会触发上游/客户端的其他上限）
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn oversized_request_returns_413() {
     let upstream = Router::new().route("/v1/x", any(|| async { "ok" }));
     let (upstream_url, _h1) = bind_random_router(upstream).await;
-    let proxy_state = AppState::new(proxy_config_for(&upstream_url));
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.max_body_mb = Some(1); // 1 MiB 上限
+    let proxy_state = AppState::new(cfg);
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
-    let big = vec![b'a'; 10 * 1024 * 1024 + 1];
+    let big = vec![b'a'; 1024 * 1024 + 1];
     let client = local_client();
     let resp = client
         .post(format!("{proxy_url}/v1/x"))
@@ -938,8 +941,172 @@ async fn oversized_request_returns_413() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 413, "超过 10 MiB 上限应返回 413");
+    assert_eq!(resp.status(), 413, "超过 max_body_mb 上限应返回 413");
 }
+
+// ---------------------------------------------------------------------------
+// 16b. 大请求体走磁盘缓存（disk_cache 默认开）：> 1 MiB 驻留阈值的请求体
+//      溢写临时文件，上游收到的字节必须与发送完全一致（重试重放路径同样
+//      从文件流式读取），且请求结束后临时文件被清理
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn large_request_body_spools_to_disk_and_replays() {
+    use tempfile::TempDir;
+
+    let received = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let received_clone = received.clone();
+    let upstream = Router::new().route(
+        "/v1/upload",
+        any(move |req: axum::extract::Request| {
+            let received = received_clone.clone();
+            async move {
+                let bytes = axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024)
+                    .await
+                    .unwrap();
+                received.lock().unwrap().extend_from_slice(&bytes);
+                (StatusCode::OK, "stored").into_response()
+            }
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+
+    // spool 目录注入 tempdir：断言临时文件生命周期（请求结束后目录应为空）
+    let spool_dir = TempDir::new().unwrap();
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.spool_dir_override = Some(spool_dir.path().to_path_buf());
+    let proxy_state = AppState::new(cfg);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    // 2 MiB：超过 1 MiB 驻留阈值，必然溢写磁盘
+    let big: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let client = local_client();
+    let resp = client
+        .post(format!("{proxy_url}/v1/upload"))
+        .body(big.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        received.lock().unwrap().as_slice(),
+        &big,
+        "上游收到的字节必须与发送一致"
+    );
+    // 请求结束（RequestBody Drop）后临时文件应已清理
+    let leftover: Vec<_> = std::fs::read_dir(spool_dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "请求结束后 spool 目录不应残留临时文件: {:?}",
+        leftover.iter().map(|e| e.path()).collect::<Vec<_>>()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 16c. 大响应走磁盘缓存：> 1 MiB 的响应 spool 溢写，客户端收到的字节必须
+//      与上游完全一致（回放从临时文件流式读出），结束后无残留
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn large_response_spools_to_disk_and_replays() {
+    use tempfile::TempDir;
+
+    // 3 MiB 伪随机（避免可压缩）SSE 载荷
+    let payload: Vec<u8> = (0..3 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let payload_clone = payload.clone();
+    let upstream = Router::new().route(
+        "/v1/large",
+        any(move || {
+            let payload = payload_clone.clone();
+            async move { (StatusCode::OK, payload).into_response() }
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+
+    let spool_dir = TempDir::new().unwrap();
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.spool_dir_override = Some(spool_dir.path().to_path_buf());
+    let proxy_state = AppState::new(cfg);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = local_client();
+    let resp = client
+        .get(format!("{proxy_url}/v1/large"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(
+        body.as_ref(),
+        &payload[..],
+        "磁盘回放字节必须与上游完全一致"
+    );
+    // 回放完成（流 EOF 删除）后 spool 目录应为空
+    let leftover: Vec<_> = std::fs::read_dir(spool_dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "回放结束后 spool 目录不应残留临时文件: {:?}",
+        leftover.iter().map(|e| e.path()).collect::<Vec<_>>()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 16d. 磁盘模式下大响应流尾错误仍触发重试（StreamErrorScanner 增量扫描：
+//      流尾 error 事件必须命中——与 is_stream_error_body 的测试锚定对齐）
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn disk_spool_stream_trailing_error_retries() {
+    use tempfile::TempDir;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = counter.clone();
+    // 响应 > 1 MiB（必然溢写磁盘），错误事件在流尾
+    let padding = "x".repeat(1024 * 1024 + 42);
+    let sse =
+        format!("data: {{\"type\":\"content\"}}\n\n{padding}\ndata: {{\"error\":\"boom\"}}\n");
+    let sse_clone = sse.clone();
+    let upstream = Router::new().route(
+        "/v1/sse",
+        any(move || {
+            let c = counter_clone.clone();
+            let sse = sse_clone.clone();
+            async move {
+                let n = c.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    (StatusCode::OK, sse).into_response()
+                } else {
+                    (StatusCode::OK, "fixed").into_response()
+                }
+            }
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+
+    let spool_dir = TempDir::new().unwrap();
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.spool_dir_override = Some(spool_dir.path().to_path_buf());
+    let proxy_state = AppState::new(cfg);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = local_client();
+    let resp = client
+        .get(format!("{proxy_url}/v1/sse"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "fixed");
+    assert_eq!(counter.load(Ordering::SeqCst), 2, "流尾错误应恰好重试一次");
+}
+
+// ---------------------------------------------------------------------------
+// 17. 8 KiB 块边界：恰好 2×8KiB 的 body 回放字节完全一致
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // 17. 8 KiB 块边界：恰好 2×8KiB 的 body 回放字节完全一致

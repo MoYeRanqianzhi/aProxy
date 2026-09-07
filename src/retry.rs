@@ -130,14 +130,8 @@ pub fn is_stream_error_body(body: &[u8]) -> bool {
 /// 依据 1：`Content-Type` 包含 `text/event-stream` / `application/x-ndjson`
 /// 依据 2：body 文本中出现 SSE 标志 `data:`（兼容上游未正确设置 Content-Type 的情况）
 pub fn is_streaming_response(headers: &reqwest::header::HeaderMap, body: &[u8]) -> bool {
-    if let Some(ct) = headers
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-    {
-        let lower = ct.to_ascii_lowercase();
-        if lower.contains("text/event-stream") || lower.contains("application/x-ndjson") {
-            return true;
-        }
+    if is_streaming_content_type(headers) {
+        return true;
     }
     // 嗅探 body：包含 SSE data 行则视为流式
     if let Ok(text) = std::str::from_utf8(body) {
@@ -149,6 +143,18 @@ pub fn is_streaming_response(headers: &reqwest::header::HeaderMap, body: &[u8]) 
         }
     }
     false
+}
+
+/// 仅凭响应头的流式判定（磁盘模式：全量 body 不可即时获得，嗅探不可用）
+pub fn is_streaming_content_type(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| {
+            let lower = ct.to_ascii_lowercase();
+            lower.contains("text/event-stream") || lower.contains("application/x-ndjson")
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

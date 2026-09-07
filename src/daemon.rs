@@ -27,6 +27,41 @@ pub fn logs_dir() -> PathBuf {
     crate::config::config_dir().join("logs")
 }
 
+/// spool 临时文件目录基址：`~/.aproxy/spool/<端口>/`。每实例独立子目录，
+/// 启动时清空自己的子目录即可回收崩溃残留，互不干扰。
+pub fn spool_dir_for(port: &str) -> PathBuf {
+    crate::config::config_dir().join("spool").join(port)
+}
+
+/// 清空实例的 spool 目录（启动时调用）：删除崩溃/强杀残留的 *.spooltmp。
+/// 目录不存在视为首次运行（创建之）。仅在 bind 监听端口之前调用——此后
+/// 该端口目录归本进程独占，运行中不清理（清理职责在临时文件的使用方）。
+pub fn clean_spool_dir(port: &str) {
+    let dir = spool_dir_for(port);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(error = %e, dir = %dir.display(), "spool 目录创建失败（磁盘缓存将不可用，回退纯内存）");
+        return;
+    }
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                // 只删本实例的 spool 临时文件；意外出现的其他内容保留（不扩大删除面）
+                if entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "spooltmp")
+                    && let Err(e) = std::fs::remove_file(entry.path())
+                {
+                    tracing::warn!(error = %e, path = %entry.path().display(), "spool 残留清理失败");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, dir = %dir.display(), "spool 目录读取失败");
+        }
+    }
+}
+
 /// 实例的 IPC 端点：windows 为命名管道名，unix 为 UDS 路径。
 /// 端口号唯一区分实例（同端口=同实例；多实例的监听端口必然互不相同）。
 pub fn endpoint_for(port: &str) -> String {

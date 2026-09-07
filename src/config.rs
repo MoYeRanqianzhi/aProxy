@@ -13,6 +13,12 @@ use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// 请求体大小上限的内置默认值（MB）。settings.json 与 config.toml 均可覆盖
+/// （toml > settings > 本值）。
+pub const DEFAULT_MAX_BODY_MB: u64 = 128;
+/// 磁盘缓存的内置默认值（开）。语义见 Config::disk_cache。
+pub const DEFAULT_DISK_CACHE: bool = true;
+
 /// 配置文件内容
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -62,6 +68,34 @@ pub struct Config {
     /// 变成确定性无限重试。
     #[serde(default = "default_read_timeout_secs")]
     pub read_timeout_secs: u64,
+    /// 请求体大小上限（MB），超出直接 413。未设置时用 settings.json 的
+    /// `max_body_mb`（全局默认，内置 128）；设 0 表示不设限。
+    /// None = toml 未显式配置（由 main 启动时注入 settings 值）。
+    #[serde(default)]
+    pub max_body_mb: Option<u64>,
+    /// 磁盘缓存：开启时超过内存驻留阈值（1 MiB）的请求体与响应 spool 溢写
+    /// 到磁盘临时文件——进程内存与负载大小解耦（SSD 上 IO 开销为噪声级）。
+    /// 未设置时用 settings.json 的 `disk_cache`（全局默认，内置 true）。
+    /// 高并发大请求体实例务必开启；低并发实例可关闭保持全内存行为。
+    /// None = toml 未显式配置（由 main 启动时注入 settings 值）。
+    #[serde(default)]
+    pub disk_cache: Option<bool>,
+    /// spool 临时文件目录覆盖（serde skip，不落盘）。仅测试注入用：集成测试
+    /// 进程内构建 AppState 时若无此覆盖，会按端口写入真实 ~/.aproxy/spool/。
+    /// 生产路径为 None，实际目录 = ~/.aproxy/spool/<端口>/。
+    #[serde(skip)]
+    pub spool_dir_override: Option<PathBuf>,
+}
+
+/// 请求体上限（字节）：toml 显式值 > settings 注入值 > 内置 128。
+/// 0 = 不设限（与其他超时/上限配置的 0 语义一致）。
+/// None（未注入 settings 值，如测试直连构建）按内置默认。
+pub(crate) fn body_limit_bytes(max_body_mb: Option<u64>) -> usize {
+    match max_body_mb {
+        Some(0) => usize::MAX,
+        Some(mb) => (mb as usize).saturating_mul(1024 * 1024),
+        None => (DEFAULT_MAX_BODY_MB as usize).saturating_mul(1024 * 1024),
+    }
 }
 
 fn default_listen_addr() -> String {
@@ -104,6 +138,9 @@ impl Default for Config {
             spool_limit_mb: default_spool_limit_mb(),
             connect_timeout_secs: default_connect_timeout_secs(),
             read_timeout_secs: default_read_timeout_secs(),
+            max_body_mb: None,
+            disk_cache: None,
+            spool_dir_override: None,
         }
     }
 }
@@ -220,6 +257,17 @@ impl Config {
     /// 保活间隔
     pub fn keepalive_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.keepalive_interval_secs)
+    }
+
+    /// 请求体大小上限（字节）。max_body_mb 已在启动时注入 settings 值（toml
+    /// 覆盖 settings），此处仅处理未注入（测试直连）的回退。
+    pub fn body_limit_bytes(&self) -> usize {
+        body_limit_bytes(self.max_body_mb)
+    }
+
+    /// 磁盘缓存是否启用（同 body_limit_bytes 的注入/回退语义）
+    pub fn disk_cache_enabled(&self) -> bool {
+        self.disk_cache.unwrap_or(DEFAULT_DISK_CACHE)
     }
 }
 
@@ -471,6 +519,38 @@ mod tests {
         assert_eq!(legacy.spool_limit_mb, 256);
         assert_eq!(legacy.connect_timeout_secs, 30);
         assert_eq!(legacy.read_timeout_secs, 300);
+    }
+
+    #[test]
+    fn body_limit_and_disk_cache_override_semantics() {
+        // toml 覆盖字段：显式值/0（不设限）写入读出；未配置（None）时
+        // body_limit_bytes 回退内置默认 128MB，disk_cache_enabled 回退 true。
+        // None 语义是「运行时由 settings 注入」，此处验证的是注入前的回退。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.toml");
+        let cfg = Config {
+            base_url: "https://api.example.com".to_string(),
+            max_body_mb: Some(0),
+            disk_cache: Some(false),
+            ..Default::default()
+        };
+        save_to(&path, &cfg).unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.max_body_mb, Some(0));
+        assert_eq!(loaded.disk_cache, Some(false));
+        assert_eq!(loaded.body_limit_bytes(), usize::MAX, "0 = 不设限");
+        assert!(!loaded.disk_cache_enabled());
+
+        // 未配置：回退内置默认（128MB / 开启）
+        std::fs::write(&path, "base_url = \"https://api.example.com\"").unwrap();
+        let legacy = load_from(&path);
+        assert_eq!(legacy.max_body_mb, None);
+        assert_eq!(
+            legacy.body_limit_bytes(),
+            128 * 1024 * 1024,
+            "None 回退内置 128MB"
+        );
+        assert!(legacy.disk_cache_enabled(), "None 回退内置开启");
     }
 
     #[test]

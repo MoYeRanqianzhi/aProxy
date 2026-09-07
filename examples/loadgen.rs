@@ -6,7 +6,10 @@
 //! 恒定。逐请求计时并统计 P50/P99 与总吞吐。
 
 use bytes::Bytes;
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone)]
 struct Args {
@@ -45,7 +48,9 @@ fn parse_args() -> Args {
 /// base64 碎片）让体量接近真实混合负载。
 fn build_body() -> Vec<u8> {
     let mut b = Vec::with_capacity(2 * 1024 * 1024 + 64 * 1024);
-    b.extend_from_slice(b"{\"model\":\"claude-sonnet-5\",\"messages\":[{\"role\":\"user\",\"content\":[");
+    b.extend_from_slice(
+        b"{\"model\":\"claude-sonnet-5\",\"messages\":[{\"role\":\"user\",\"content\":[",
+    );
     b.extend_from_slice(b"{\"type\":\"text\",\"text\":\"");
     b.resize(b.len() + 2 * 1024 * 1024, b'a');
     b.extend_from_slice(b"\"},{\"type\":\"image\",\"source\":{\"data\":\"");
@@ -99,7 +104,11 @@ async fn main() {
                 match req.send().await {
                     Ok(resp) => {
                         if !resp.status().is_success() {
-                            errors.push(format!("{} HTTP {}", t0.elapsed().as_millis(), resp.status()));
+                            errors.push(format!(
+                                "{} HTTP {}",
+                                t0.elapsed().as_millis(),
+                                resp.status()
+                            ));
                         } else {
                             // 流式接收至结束：内存恒定（逐 chunk 丢弃），计入总接收量
                             let mut resp = resp;

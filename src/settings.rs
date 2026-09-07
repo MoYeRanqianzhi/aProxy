@@ -40,6 +40,16 @@ pub struct Settings {
     /// 的判定依据（距最近一次收到客户端请求）。默认 1800（30 分钟）。
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
+    /// 请求体大小上限（MB，全局默认值）：超出即 413。各 config.toml 可用
+    /// `max_body_mb` 按实例覆盖（toml > settings > 内置默认）。默认 128。
+    #[serde(default = "default_max_body_mb")]
+    pub max_body_mb: u64,
+    /// 磁盘缓存（全局默认值）：开启时，超过内存驻留阈值的请求体与响应 spool
+    /// 溢写到磁盘临时文件，进程内存与负载大小解耦（用 page cache 换进程内存）。
+    /// 各 config.toml 可用 `disk_cache` 按实例覆盖。默认 true；
+    /// 低并发实例可关闭以保持全内存行为。
+    #[serde(default = "default_disk_cache")]
+    pub disk_cache: bool,
 }
 
 fn default_log_rotate_mb() -> u64 {
@@ -48,6 +58,14 @@ fn default_log_rotate_mb() -> u64 {
 
 fn default_idle_timeout_secs() -> u64 {
     1800
+}
+
+fn default_max_body_mb() -> u64 {
+    crate::config::DEFAULT_MAX_BODY_MB
+}
+
+fn default_disk_cache() -> bool {
+    crate::config::DEFAULT_DISK_CACHE
 }
 
 // 手动 Default：serde 的字段默认值（log_rotate_mb=8、idle_timeout_secs=1800）
@@ -61,6 +79,8 @@ impl Default for Settings {
             config_dirs: Vec::new(),
             log_rotate_mb: default_log_rotate_mb(),
             idle_timeout_secs: default_idle_timeout_secs(),
+            max_body_mb: default_max_body_mb(),
+            disk_cache: default_disk_cache(),
         }
     }
 }
@@ -427,6 +447,31 @@ mod tests {
         assert_eq!(load_from(&path).idle_timeout_secs, 600);
         std::fs::write(&path, r#"{"aliases":{}}"#).unwrap();
         assert_eq!(load_from(&path).idle_timeout_secs, 1800);
+    }
+
+    #[test]
+    fn body_limit_and_disk_cache_roundtrip_and_default() {
+        // 新字段默认值（128MB / 开启）；自定义落盘往返；旧 settings（无字段）
+        // 读出默认——保证升级不改变行为
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path_in(dir.path());
+        let s = Settings::default();
+        assert_eq!(s.max_body_mb, 128);
+        assert!(s.disk_cache);
+        let s = Settings {
+            max_body_mb: 256,
+            disk_cache: false,
+            ..Default::default()
+        };
+        save_to(&path, &s).unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.max_body_mb, 256);
+        assert!(!loaded.disk_cache);
+        // 旧版 settings.json（无这两个字段）也能加载且取默认
+        std::fs::write(&path, r#"{"aliases":{}}"#).unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.max_body_mb, 128);
+        assert!(loaded.disk_cache);
     }
 
     #[test]

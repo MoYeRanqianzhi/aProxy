@@ -324,7 +324,15 @@ fn resolve_runtime_config(cli: &Cli, cfg_path: &std::path::Path) -> Result<Confi
     if cli.config.is_some() && !cfg_path.exists() {
         return Err(format!("指定的配置文件不存在: {}", cfg_path.display()));
     }
-    let cfg = load_with_cli_overrides(cli, cfg_path);
+    let mut cfg = load_with_cli_overrides(cli, cfg_path);
+    // settings.json 全局默认注入：toml 显式值 > settings 值 > 内置默认。
+    // get_or_insert 只在 toml 未显式配置时写入 settings 值——这正是
+    // 「settings 公用默认、toml 按实例覆盖」的优先级实现点。
+    {
+        let s = settings::load();
+        cfg.max_body_mb.get_or_insert(s.max_body_mb);
+        cfg.disk_cache.get_or_insert(s.disk_cache);
+    }
     // listen_addr 必须带端口（port_of 取最后一个 ':' 之后）：缺端口/端口越界的
     // bind 失败不是占用，提前拦截给出明确错误，避免被误诊为「被其他程序占用」
     if daemon::port_of(&cfg.listen_addr).parse::<u16>().is_err() {
@@ -551,6 +559,9 @@ fn bind_error_message(addr: &str, e: &std::io::Error) -> String {
 async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemon_child: bool) {
     let listen_addr = cfg.listen_addr.clone();
     let base_url = cfg.base_url.clone();
+    // spool 残留清理（disk_cache）：bind 前清空本端口的 spool 目录——目录
+    // 归本进程独占，启动时清空即可回收崩溃/强杀残留的临时文件
+    daemon::clean_spool_dir(daemon::port_of(&listen_addr));
     let state = aproxy::proxy::AppState::new(cfg);
     let app = aproxy::proxy::router(state.clone());
 
@@ -1539,6 +1550,21 @@ fn handle_config_cmd(path: PathBuf, args: ConfigArgs) {
             println!("max_retry_backoff_secs = {}", cfg.max_retry_backoff_secs);
         }
         println!("spool_limit_mb          = {}", cfg.spool_limit_mb);
+        // max_body_mb / disk_cache：None = toml 未显式配置（运行时由 settings
+        // 注入），展示生效值更利于排障——但此处 cfg 未经启动注入，注明来源
+        match cfg.max_body_mb {
+            Some(0) => println!("max_body_mb             = 0（不设限）"),
+            Some(mb) => println!("max_body_mb             = {mb}"),
+            None => println!(
+                "max_body_mb             = （未在 toml 设置，运行时取 settings.json 全局默认）"
+            ),
+        }
+        match cfg.disk_cache {
+            Some(dc) => println!("disk_cache              = {dc}"),
+            None => println!(
+                "disk_cache              = （未在 toml 设置，运行时取 settings.json 全局默认）"
+            ),
+        }
         // 0 表示不设限，语义特殊，提示出来
         if cfg.connect_timeout_secs == 0 {
             println!("connect_timeout_secs    = 0（不设限）");

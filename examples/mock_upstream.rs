@@ -12,11 +12,11 @@
 //! - `rate_mb_s`：响应吐出速率上限 MB/s（默认 5，0=不限速）
 
 use axum::{
+    Router,
     body::Body,
     extract::{Query, Request},
     http::StatusCode,
     response::Response,
-    Router,
 };
 use bytes::Bytes;
 use futures_util::stream::unfold;
@@ -30,7 +30,7 @@ const MSG_STOP: &[u8] = b"event: message_stop\ndata: {\"type\":\"message_stop\"}
 /// 过大则限速粒度变粗——100 条是吞吐与平滑的折衷）
 const BATCH_MSGS: usize = 100;
 
-async fn handle(Query(params): Query<HashMap<String, u64>>, req: Request) -> Response {
+async fn handle(Query(params): Query<HashMap<String, String>>, req: Request) -> Response {
     // 丢弃式读请求体：mock 不缓冲、不解析，只消耗转发带宽
     let mut body = req.into_body();
     while let Some(frame) = body.frame().await {
@@ -40,9 +40,12 @@ async fn handle(Query(params): Query<HashMap<String, u64>>, req: Request) -> Res
         }
     }
 
-    let msgs = *params.get("msgs").unwrap_or(&50_000) as usize;
-    let pad = *params.get("pad").unwrap_or(&40) as usize;
-    let rate = (*params.get("rate_mb_s").unwrap_or(&5) as f64) * 1024.0 * 1024.0;
+    // query 只识别本 mock 的调参键，其余（如 stream=true）容忍忽略——
+    // 真实上游不会因 query 带了别的键而 400
+    let num = |k: &str, d: u64| -> u64 { params.get(k).and_then(|v| v.parse().ok()).unwrap_or(d) };
+    let msgs = num("msgs", 50_000) as usize;
+    let pad = num("pad", 40) as usize;
+    let rate = (num("rate_mb_s", 5) as f64) * 1024.0 * 1024.0;
 
     let msg_len = MSG_PREFIX.len() + pad + MSG_SUFFIX.len();
     let stream = unfold(0usize, move |sent| async move {

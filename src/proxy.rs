@@ -82,6 +82,9 @@ pub struct AppState {
     /// 展示/判闲置，请求热路径上仅一次 store（Relaxed 足够：只用于粗粒度的
     /// 空闲判定，无需跨线程因果序）。
     pub last_activity_secs: Arc<std::sync::atomic::AtomicU64>,
+    /// IPC 实时观测源（请求数/重试数/最近错误）：热路径各一条 Relaxed 原子
+    /// 操作，量级同上；serve_forever 组装进 IpcStats 供 IPC 响应读取。
+    pub stats: Arc<crate::daemon::IpcStats>,
     /// 磁盘缓存的 spool 临时目录；None = disk_cache 关闭（全程纯内存）。
     /// 生产路径 `~/.aproxy/spool/<端口>/`，测试可经 Config::spool_dir_override 注入。
     pub spool_dir: Option<PathBuf>,
@@ -140,7 +143,13 @@ impl AppState {
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
             )),
+            stats: Arc::new(crate::daemon::IpcStats::default()),
         }
+    }
+
+    /// 记录一次上游失败摘要（覆盖式，只保留最近一次；IPC/status 展示用）
+    fn note_upstream_failure(&self, msg: &str) {
+        self.stats.record_error(msg);
     }
 
     /// 实例闲置时长（秒）：距最近一次收到客户端请求。
@@ -748,6 +757,11 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
             .unwrap_or(0),
         std::sync::atomic::Ordering::Relaxed,
     );
+    // IPC 观测计数（一条 Relaxed fetch_add，与上面 store 同量级）
+    state
+        .stats
+        .requests_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // 在本地侧先应用覆盖/追加，避免重试间重复计算
     apply_header_overrides(&mut headers, &state.config);
@@ -815,12 +829,17 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
 
     let needs_retry = match &first {
         ForwardResult::NetworkError(e) => {
+            state.note_upstream_failure(&format!("网络错误: {e}"));
             tracing::warn!(error = %e, "首轮上游网络错误，进入重试");
             true
         }
         // spool 上限 / 本地磁盘故障重试无意义（确定性失败），直接终态回放 502
-        ForwardResult::TooLarge => false,
+        ForwardResult::TooLarge => {
+            state.note_upstream_failure("上游响应体超出 spool 上限");
+            false
+        }
         ForwardResult::SpoolFailed(e) => {
+            state.note_upstream_failure(&format!("本地 spool 故障: {e}"));
             tracing::error!(error = %e, "首轮本地 spool 故障，终态返回");
             false
         }
@@ -830,7 +849,13 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
             body,
             disk_scan,
             ..
-        } => needs_retry_response(1, status, raw_headers, body, disk_scan),
+        } => {
+            let retry = needs_retry_response(1, status, raw_headers, body, disk_scan);
+            if retry {
+                state.note_upstream_failure(&format!("上游返回 {status}（错误内容，重试）"));
+            }
+            retry
+        }
     };
 
     if !needs_retry {
@@ -1021,6 +1046,10 @@ async fn proxy_without_keepalive(
     let max_backoff = state.config.max_retry_backoff_secs;
     loop {
         attempt += 1;
+        state
+            .stats
+            .retries_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let delay = retry::delay_for_attempt(attempt - 1, max_backoff);
         if !delay.is_zero() {
             tracing::warn!(attempt, delay_ms = delay.as_millis() as u64, "重试延迟");
@@ -1042,10 +1071,12 @@ async fn proxy_without_keepalive(
 
         match result {
             ForwardResult::NetworkError(e) => {
+                state.note_upstream_failure(&format!("网络错误: {e}"));
                 tracing::warn!(attempt, error = %e, "上游网络错误，重试");
                 continue;
             }
             ForwardResult::TooLarge => {
+                state.note_upstream_failure("上游响应体超出 spool 上限");
                 tracing::error!(attempt, "上游响应体超出 spool 上限，终止重试");
                 return (
                     StatusCode::BAD_GATEWAY,
@@ -1054,6 +1085,7 @@ async fn proxy_without_keepalive(
                     .into_response();
             }
             ForwardResult::SpoolFailed(e) => {
+                state.note_upstream_failure(&format!("本地 spool 故障: {e}"));
                 tracing::error!(attempt, error = %e, "本地 spool 故障，终止重试");
                 return (
                     StatusCode::BAD_GATEWAY,
@@ -1069,6 +1101,7 @@ async fn proxy_without_keepalive(
                 disk_scan,
             } => {
                 if needs_retry_response(attempt, &status, &raw_headers, &body, &disk_scan) {
+                    state.note_upstream_failure(&format!("上游返回 {status}（错误内容，重试）"));
                     continue; // body Drop：磁盘临时文件删除
                 }
 
@@ -1132,6 +1165,10 @@ async fn proxy_with_keepalive(
         let max_backoff = state.config.max_retry_backoff_secs;
         loop {
             attempt += 1;
+            state_bg
+                .stats
+                .retries_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let delay = retry::delay_for_attempt(attempt - 1, max_backoff);
             if !delay.is_zero() {
                 // 在延迟期间按 keepalive_dur 切片发送心跳，避免客户端 idle 超时
@@ -1176,6 +1213,7 @@ async fn proxy_with_keepalive(
 
             match result {
                 ForwardResult::NetworkError(e) => {
+                    state_bg.note_upstream_failure(&format!("网络错误: {e}"));
                     tracing::warn!(attempt, error = %e, "上游网络错误，重试（保活通道）");
                     if tx.send(Ok(heartbeat())).await.is_err() {
                         return;
@@ -1183,6 +1221,7 @@ async fn proxy_with_keepalive(
                     continue;
                 }
                 ForwardResult::TooLarge => {
+                    state_bg.note_upstream_failure("上游响应体超出 spool 上限");
                     tracing::error!(attempt, "上游响应体超出 spool 上限，终止重试（保活通道）");
                     // 骨架 200 已发出、状态行不可再改：静默结束流与「上游成功返回
                     // 空 body」在客户端视角不可区分。发一个终态错误事件让客户端
@@ -1194,6 +1233,7 @@ async fn proxy_with_keepalive(
                     return;
                 }
                 ForwardResult::SpoolFailed(e) => {
+                    state_bg.note_upstream_failure(&format!("本地 spool 故障: {e}"));
                     tracing::error!(attempt, error = %e, "本地 spool 故障，终止重试（保活通道）");
                     let err_event = Bytes::from_static(
                         b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"proxy_spool_failed\",\"message\":\"local disk cache write failed\"}}\n\n",
@@ -1209,6 +1249,8 @@ async fn proxy_with_keepalive(
                     ..
                 } => {
                     if needs_retry_response(attempt, &status, &raw_headers, &body, &disk_scan) {
+                        state_bg
+                            .note_upstream_failure(&format!("上游返回 {status}（错误内容，重试）"));
                         // 发心跳前先丢弃（body Drop 删临时文件，杜绝任何
                         // return 路径上的泄漏）
                         drop(body);

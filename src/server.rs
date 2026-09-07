@@ -4,6 +4,8 @@
 //! 与 `commands/start.rs` 的分工：start 负责启动预检与后台 spawn 的父进程侧，
 //! server 负责真正「跑起来」的服务进程本身。
 
+use std::sync::Arc;
+
 use tracing_subscriber::EnvFilter;
 
 use aproxy::config::{self, Config};
@@ -50,6 +52,11 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
         last_activity_secs: state
             .last_activity_secs
             .load(std::sync::atomic::Ordering::Relaxed),
+        proto_version: daemon::IPC_PROTO_VERSION,
+        requests_total: 0,
+        retries_total: 0,
+        last_error: None,
+        last_error_at: 0,
     };
     if let Err(e) = daemon::write_instance_file(&info) {
         tracing::warn!(error = %e, "实例注册表写入失败（不影响代理功能）");
@@ -69,13 +76,16 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     }
 
     // IPC 控制通道：ping/shutdown 走命名管道，与代理端口完全隔离。
-    // 活动时间戳由 AppState 持有（请求热路径更新），IPC ping 实时读取。
+    // 活动时间戳与观测计数由 AppState 持有（请求热路径更新），IPC ping 实时读取。
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let ipc_port = port.clone();
     let ipc_info = info.clone();
-    let last_activity = state.last_activity_secs.clone();
+    let ipc_stats = Arc::new(daemon::IpcStats {
+        last_activity_secs: state.last_activity_secs.clone(),
+        ..Default::default()
+    });
     tokio::spawn(async move {
-        if let Err(e) = daemon::serve_ipc(ipc_port, stop_tx, ipc_info, last_activity).await {
+        if let Err(e) = daemon::serve_ipc(ipc_port, stop_tx, ipc_info, ipc_stats).await {
             tracing::error!(error = %e, "IPC 控制通道启动失败（aproxy stop/status 将不可用）");
         }
     });

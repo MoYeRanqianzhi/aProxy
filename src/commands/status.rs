@@ -37,6 +37,7 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
         return;
     }
     println!("运行中的 aProxy 实例 ({}):", filtered.len());
+    let cli_version = env!("CARGO_PKG_VERSION");
     for info in &filtered {
         let idle_secs = if info.last_activity_secs > 0 {
             now.saturating_sub(info.last_activity_secs)
@@ -57,5 +58,33 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
             mask_base_url(&info.base_url),
             info.config_path
         );
+        // 观测计数（IPC v2 起 ping 携带；v1 实例读出全 0——展示为「—」而非
+        // 误导性的 0）
+        if info.proto_version >= 2 {
+            let err_text = match (&info.last_error, info.last_error_at) {
+                (Some(msg), at) if at > 0 => {
+                    format!(
+                        "\"{}\"（{} 前）",
+                        msg,
+                        humanize_duration(now.saturating_sub(at))
+                    )
+                }
+                (Some(msg), _) => format!("\"{msg}\""),
+                (None, _) => "无".to_string(),
+            };
+            println!(
+                "    请求 {}  重试 {}  最近错误: {}",
+                info.requests_total, info.retries_total, err_text
+            );
+        }
+        // 混版本检测：CLI 与实例版本不一致说明该实例还在跑旧二进制（替换 exe
+        // 后需 stop+start 才升级）——滚动升级的事实源
+        if info.version != cli_version {
+            println!(
+                "    注意: 实例版本 v{} 与当前 CLI v{cli_version} 不同，替换二进制后重启该实例（aproxy stop {} && aproxy start）可完成升级",
+                info.version,
+                daemon::port_of(&info.listen_addr)
+            );
+        }
     }
 }

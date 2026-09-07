@@ -37,7 +37,8 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 [target.'cfg(windows)'.dependencies]
 # spawn_detached 手写 CreateProcessW（bInheritHandles=FALSE，std 无稳定 API 可关）。
 # 版本对齐 Cargo.lock 中已有的 windows-sys 0.52.0（tokio/mio 间接依赖）。
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Threading"] }
+# Win32_System_Memory：看门狗共享内存心跳节（CreateFileMappingW/MapViewOfFile）。
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Memory"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 use aproxy::config::{self, Config};
 use aproxy::daemon;
 use aproxy::settings;
+use aproxy::watchdog;
 
 use crate::util::{chrono_like_timestamp, now_unix};
 use aproxy::config::mask_base_url;
@@ -89,6 +90,24 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
             tracing::error!(error = %e, "IPC 控制通道启动失败（aproxy stop/status 将不可用）");
         }
     });
+
+    // 看门狗心跳（共享内存节）：独立 ticker 每 10s 写一次毫秒时间戳——挂死的
+    // 定义是「runtime 无法调度」，ticker 停摆与 runtime 死锁等价；不经请求
+    // 热路径（零请求成本）。创建失败只降级（看护者对该实例退化为纯进程死亡
+    // 检测），绝不阻断启动。句柄存活于整个服务生命周期（随进程退出由系统回收）。
+    if let Some(writer) = watchdog::HeartbeatWriter::create(&port) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    watchdog::HEARTBEAT_WRITE_INTERVAL_SECS,
+                ))
+                .await;
+                writer.beat();
+            }
+        });
+    } else {
+        tracing::warn!("看门狗心跳节创建失败，该实例将不受挂死检测保护（进程死亡检测不受影响）");
+    }
 
     // 运行期日志轮转：守护日志只在启动时做过一次 2MiB 检查，长期运行的实例
     // （正是本项目的目标形态）仍会无限膨胀。每小时检查一次，超过 settings 的

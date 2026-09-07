@@ -111,13 +111,13 @@ pub fn verify_claim_identity_in(_run_dir: &Path, claim: &WatchdogClaim) -> bool 
 /// 探活失败（进程不存在）与身份不符（PID 复用）统一返回 false——
 /// 对「在任判定」两者等价：都不是我们的看护者。
 pub fn verify_claim_identity(pid: u32, created_at: u64) -> bool {
-    imp::process_alive_with_start(pid, created_at).unwrap_or(false)
+    imp_process::process_alive_with_start(pid, created_at).unwrap_or(false)
 }
 
 /// 查询进程创建时间（FILETIME/滴答）；进程不存在返回 None。
 /// 供 spawn 前登记与收养时建立身份基线。
 pub fn process_start_time(pid: u32) -> Option<u64> {
-    imp::process_start_time(pid)
+    imp_process::process_start_time(pid)
 }
 
 // ---------------------------------------------------------------------------
@@ -133,7 +133,7 @@ pub fn this_process_may_spawn_watchdog_in(run_dir: &Path) -> bool {
     let mut min_alive: Option<u32> = None;
     for pid in crate::daemon::registry_pids_in(run_dir) {
         // 只把「真正存活的 aProxy 实例」计入集合（PID 复用防冒名同款逻辑）
-        if imp::is_aproxy_process(pid) && min_alive.is_none_or(|m| pid < m) {
+        if imp_process::is_aproxy_process(pid) && min_alive.is_none_or(|m| pid < m) {
             min_alive = Some(pid);
         }
     }
@@ -163,10 +163,215 @@ pub fn heartbeat_fresh_secs(settings: &settings::Settings) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// 共享内存心跳：守护每周期写毫秒时间戳，看护者扫描判定挂死
+// ---------------------------------------------------------------------------
+//
+// 设计要点：
+// - 节名 `aproxy-heart-<端口>`（与 IPC 管道命名同款规则，端口唯一区分实例）。
+// - 8 字节 = 毫秒级 Unix 时间戳（Windows FILETIME 换算），原子 u64 读写。
+// - **守护侧由独立 ticker 任务每 10s 写一次，不经请求热路径**：挂死的定义是
+//   「tokio runtime 无法调度」，ticker 停摆与 runtime 死锁等价；零热路径成本
+//   是它优于请求内 store 的地方（计划偏差：热路径 store 改 ticker，W7 记录）。
+// - 心跳新鲜阈值（3×看护扫描周期）远大于 10s 写入间隔，时钟毛刺无影响。
+
+/// 守护侧心跳写入间隔（秒）。远小于看护扫描周期（默认 30s），
+/// 保证任何一次扫描都能读到新鲜值。
+pub const HEARTBEAT_WRITE_INTERVAL_SECS: u64 = 10;
+
+/// 共享内存节的命名（与 IPC 端点同款端口规则）
+pub fn heartbeat_section_name(port: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!(r"Local\aproxy-heart-{port}")
+    }
+    #[cfg(unix)]
+    {
+        format!("aproxy-heart-{port}")
+    }
+}
+
+/// 守护侧心跳句柄：持有映射视图，Drop 时 UnmapViewOfFile（句柄随进程退出
+/// 由系统回收，测试中显式 Drop 防泄漏）。
+pub struct HeartbeatWriter {
+    port: String,
+    /// 节句柄：映射期间必须保持打开——关闭节句柄后 OpenFileMappingW 将找不到
+    /// 该节（内核对象仅剩视图弱引用，名字空间注册随之消失）
+    #[cfg(windows)]
+    mapping: isize,
+    #[cfg(windows)]
+    view: *mut std::ffi::c_void,
+    #[cfg(unix)]
+    _shm_fd: std::fs::File,
+}
+
+// 视图指针跨线程使用（写操作是原子 store）；Windows 句柄本身线程无关
+#[cfg(windows)]
+unsafe impl Send for HeartbeatWriter {}
+#[cfg(windows)]
+unsafe impl Sync for HeartbeatWriter {}
+
+impl HeartbeatWriter {
+    /// 创建/打开本实例的心跳节并写入初始时间戳。实例 bind 成功后调用；
+    /// 失败只降级（看护者对该实例退化为纯进程死亡检测），绝不能阻断启动。
+    pub fn create(port: &str) -> Option<Self> {
+        imp::create_heartbeat(port)
+    }
+
+    /// 写入当前毫秒时间戳（原子 store，无锁）
+    pub fn beat(&self) {
+        imp::heartbeat_store(self, now_millis());
+    }
+}
+
+impl Drop for HeartbeatWriter {
+    fn drop(&mut self) {
+        imp::unmap_heartbeat(self);
+    }
+}
+
+/// 看护侧读取：实例最近一次心跳的毫秒时间戳；节不存在 = 实例无心跳
+/// （旧版本守护或创建失败）→ None，看护者按「无心跳数据」处理（只做
+/// 进程死亡检测，不做挂死判定）。
+pub fn read_heartbeat(port: &str) -> Option<u64> {
+    imp::heartbeat_load(port)
+}
+
+/// 当前 Unix 毫秒（系统时钟早于 epoch 回退 0——仅用于新鲜度比较，
+/// 看护侧同时校验非 0）
+pub fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
 // 平台实现
 // ---------------------------------------------------------------------------
 #[cfg(windows)]
 mod imp {
+    /// 创建命名节并映射视图（守护侧）
+    pub fn create_heartbeat(port: &str) -> Option<super::HeartbeatWriter> {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
+        };
+        let name = super::heartbeat_section_name(port);
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            // 8 字节节：一个 u64 毫秒时间戳。INVALID_HANDLE_VALUE = 由页面
+            // 文件支撑的共享节（不落盘、随最后一个句柄关闭消失）
+            let mapping = CreateFileMappingW(
+                windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                8,
+                wide.as_ptr(),
+            );
+            if mapping == 0 {
+                return None;
+            }
+            let view = MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 8);
+            if view.Value.is_null() {
+                let _ = windows_sys::Win32::Foundation::CloseHandle(mapping);
+                return None;
+            }
+            let writer = super::HeartbeatWriter {
+                port: port.to_string(),
+                mapping,
+                view: view.Value,
+            };
+            writer.beat();
+            Some(writer)
+        }
+    }
+
+    /// 原子写毫秒时间戳到视图首 8 字节（writer 持有写视图）
+    pub fn heartbeat_store(writer: &super::HeartbeatWriter, millis: u64) {
+        let ptr = writer.view as *mut std::sync::atomic::AtomicU64;
+        unsafe {
+            (*ptr).store(millis, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// 读侧：打开命名节映射只读视图并读首 8 字节
+    pub fn heartbeat_load(port: &str) -> Option<u64> {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_READ, MapViewOfFile, OpenFileMappingW};
+        let name = super::heartbeat_section_name(port);
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            let mapping = OpenFileMappingW(FILE_MAP_READ, 0, wide.as_ptr());
+            if mapping == 0 {
+                return None;
+            }
+            let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 8);
+            let _ = windows_sys::Win32::Foundation::CloseHandle(mapping);
+            if view.Value.is_null() {
+                return None;
+            }
+            let ptr = view.Value as *const std::sync::atomic::AtomicU64;
+            let val = (*ptr).load(std::sync::atomic::Ordering::Acquire);
+            let _ = windows_sys::Win32::System::Memory::UnmapViewOfFile(view);
+            Some(val)
+        }
+    }
+
+    pub fn unmap_heartbeat(writer: &super::HeartbeatWriter) {
+        // MEMORY_MAPPED_VIEW_ADDRESS 结构体重组（0.52 的 MapViewOfFile 返回形状）
+        let view =
+            windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: writer.view };
+        unsafe {
+            let _ = windows_sys::Win32::System::Memory::UnmapViewOfFile(view);
+            let _ = windows_sys::Win32::Foundation::CloseHandle(writer.mapping);
+        }
+    }
+}
+
+#[cfg(unix)]
+mod imp {
+    pub fn create_heartbeat(port: &str) -> Option<super::HeartbeatWriter> {
+        // posix shm：/dev/shm/aproxy-heart-<port>；写透文件实现同一语义
+        // （unix 未实测，与 UDS IPC 同批处理）
+        let path = format!("/dev/shm/{}", super::heartbeat_section_name(port));
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .ok()?;
+        use std::io::Write;
+        f.write_all(&super::now_millis().to_le_bytes()).ok()?;
+        Some(super::HeartbeatWriter {
+            port: port.to_string(),
+            _shm_fd: f,
+        })
+    }
+
+    pub fn heartbeat_store(writer: &super::HeartbeatWriter, millis: u64) {
+        let path = format!("/dev/shm/{}", super::heartbeat_section_name(&writer.port));
+        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) {
+            use std::io::{Seek, SeekFrom, Write};
+            let _ = f.seek(SeekFrom::Start(0));
+            let _ = f.write_all(&millis.to_le_bytes());
+        }
+    }
+
+    pub fn heartbeat_load(port: &str) -> Option<u64> {
+        let path = format!("/dev/shm/{}", super::heartbeat_section_name(port));
+        let data = std::fs::read(path).ok()?;
+        if data.len() < 8 {
+            return None;
+        }
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&data[..8]);
+        Some(u64::from_le_bytes(b))
+    }
+
+    pub fn unmap_heartbeat(_writer: &super::HeartbeatWriter) {}
+}
+
+#[cfg(windows)]
+mod imp_process {
     /// 进程存活且创建时间匹配（FILETIME 100ns）。
     pub fn process_alive_with_start(pid: u32, created_at: u64) -> Option<bool> {
         let actual = process_start_time(pid)?;
@@ -236,7 +441,7 @@ mod imp {
 }
 
 #[cfg(unix)]
-mod imp {
+mod imp_process {
     pub fn process_alive_with_start(pid: u32, created_at: u64) -> Option<bool> {
         let actual = process_start_time(pid)?;
         Some(actual == created_at)
@@ -332,5 +537,30 @@ mod tests {
         };
         assert_eq!(heartbeat_period(&s), Duration::from_secs(1));
         assert_eq!(heartbeat_fresh_secs(&s), 3);
+    }
+
+    #[test]
+    fn heartbeat_section_name_uses_port() {
+        // 节名含端口：实例唯一区分（同 IPC 管道命名规则）
+        let n = heartbeat_section_name("12345");
+        assert!(n.contains("12345"), "{n}");
+        assert!(n.contains("aproxy-heart"), "{n}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn heartbeat_write_and_read_same_process() {
+        // 同进程内写读往返：节创建 → beat → 读取值非 0 且随时间推进增长。
+        // （跨进程读由集成测试覆盖——看护进程场景）
+        let port = format!("598{:02}", std::process::id() % 100);
+        let writer = HeartbeatWriter::create(&port).expect("心跳节创建");
+        let first = read_heartbeat(&port).expect("写入后立即可读");
+        assert!(first > 0, "初始时间戳应为正毫秒值");
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        writer.beat();
+        let second = read_heartbeat(&port).expect("二次读取");
+        assert!(second >= first, "时间戳应单调不减");
+        // 另一个端口没有节：读 None（看护者按「无心跳数据」处理）
+        assert!(read_heartbeat(&format!("{port}-absent")).is_none());
     }
 }

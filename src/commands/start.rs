@@ -208,7 +208,6 @@ pub(crate) async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf, target: Optio
     let log_path = daemon::logs_dir().join(format!("{port}.log"));
     let startup_log_path = daemon::logs_dir().join("startup.log");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-    let mut ready = false;
     loop {
         if let Ok(info) = daemon::ipc_ping(&port).await {
             println!("aProxy 已在后台启动");
@@ -226,7 +225,6 @@ pub(crate) async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf, target: Optio
             println!("  配置: {}", cfg_path.display());
             println!("  日志: {}", log_path.display());
             println!("查看实例: aproxy status    停止: aproxy stop {port}");
-            ready = true;
             break;
         }
         if std::time::Instant::now() > deadline {

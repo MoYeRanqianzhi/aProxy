@@ -2160,7 +2160,9 @@ fn alias_errors_on_unknown_names() {
 #[test]
 #[cfg(windows)]
 fn watchdog_respawns_killed_daemon() {
-    let (port, _b, _c) = daemon_test_ports();
+    // 独立端口（偏移 9）：既有守护测试并行占用 daemon_test_ports() 的前三个，
+    // 本测试窗口长（看护扫描+重拉），同端口会与之互踩（实测 flaky）
+    let port = daemon_test_port(9);
     let dir = tempfile::tempdir().unwrap();
     let cfg_file = dir.path().join("wd.toml");
     std::fs::write(
@@ -2181,7 +2183,7 @@ fn watchdog_respawns_killed_daemon() {
         ("APROXY_RUN_DIR", dir.path().display().to_string()),
         ("APROXY_WATCHDOG_SCAN_SECS", "1".to_string()),
     ];
-    let mut daemon_child = {
+    let daemon_child = {
         let mut cmd = Command::new(exe);
         cmd.args([
             "--config",

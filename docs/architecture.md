@@ -31,7 +31,8 @@ agent 软件 ──HTTP──▶ [代理端口 12345] ──重试循环──�
 | `src/retry.rs` | 重试判定：状态码、错误 JSON（含流式 NDJSON/SSE 形态） |
 | `src/config.rs` | 代理配置加载/保存/校验（`~/.aproxy/config.toml`，可多份平行并存） |
 | `src/settings.rs` | 内部配置（`~/.aproxy/settings.json`，唯一）：别名表、全局默认等程序管理状态 |
-| `src/daemon.rs` | 守护编排：IPC（ping/shutdown）、实例注册表、恢复记录、孤儿清理 |
+| `src/daemon.rs` | 守护编排：IPC（ping/shutdown/观测）、实例注册表、恢复记录、孤儿清理 |
+| `src/watchdog.rs` | 看门狗：claim 选举、进程探活/句柄等待、共享内存心跳、重拉退避状态机 |
 | `src/util.rs` | bin 侧共用小工具：时间戳、时长人性化、凭据打码、key=value 解析 |
 
 CLI 定义（cli.rs）与子命令处理（commands/）分离；启动父进程逻辑（预检/spawn）
@@ -104,6 +105,33 @@ config_dirs、日志轮转阈值、空闲阈值与上述两个字段的全局默
 端口号是实例唯一键：同端口不同监听地址的第二实例会在启动时被显式拒绝
 （注册表与 IPC 管道按端口命名，无法并存）。
 
+## 看门狗（watchdog）
+
+全局单看护进程（`aproxy watchdog`，同二进制 `--daemon-watchdog` 隐藏标记分离
+启动），把「进程级死亡/挂死 → 永久断流直到人工发现」降级为「秒级检出 → 退避
+重拉」。实测 +2.4% 体积、+2.9MB 常驻、热路径零损耗（[benchmark-watchdog.md](benchmark-watchdog.md)）。
+
+- **死亡检测**：收养时 `OpenProcess(SYNCHRONIZE|TERMINATE)` 取进程句柄，
+  `spawn_blocking` 内核阻塞等待——死亡信号即时、零轮询线程。
+- **挂死检测**：实例侧独立 ticker 每 10s 向命名共享内存节
+  （`Local\aproxy-heart-<端口>`，8 字节原子 u64 毫秒时间戳）写心跳——挂死 =
+  runtime 无法调度 = ticker 停摆，与请求热路径零耦合。看护侧扫描过期 +
+  IPC ping 二意见都失败才终止进程（句柄绑定原进程，PID 复用免疫）。
+- **重拉与退避**：`.restore` 残留 = 异常死亡信号；优雅退出（记录已删）摘除
+  看护。崩溃按指数退避 1/2/4/8…封顶 300s 重拉，IPC 就绪判定同 start；
+  连续失败达 `watchdog_max_restarts` 放弃并写 startup.log（`.restore` 保留
+  人工兜底）。
+- **选举规范**（多守护并发拉起看护者的唯一性保障）：claim 文件
+  `run/watchdog.claim`（PID + 进程创建时间 + 心跳）为在任真相源——
+  排序定发起者（存活实例 PID 最小者才有权 spawn）+ `create_new` 原子接管
+  定在任者；进程创建时间比对拒绝 PID 复用冒名；假死前任（心跳过期）经验证
+  后终止接管。
+- **互保**：守护与看护者完全解耦（看护者死亡实例不受影响）；守护每 5 分钟
+  自检，缺席即按选举规范补种。全部实例清零后看护者闲置自灭（默认 300s），
+  系统回到零常驻。
+- 配置：settings.json `watchdog` 五字段（总开关/扫描周期/挂死容忍/重拉上限/
+  闲置自灭）——系统级单例故无 toml 层。
+
 ## 自愈恢复（restore）
 
 `run/<端口>.restore` 存实例的启动参数：
@@ -126,9 +154,10 @@ config_dirs、日志轮转阈值、空闲阈值与上述两个字段的全局默
 
 ## 测试
 
-- 单元测试 93 个（lib）+ 4 个（bin）：重试判定、配置分层、IPC 协议、注册表/恢复记录、打码
-- 集成测试 34 个：mock 上游 + 真实代理联调、守护生命周期、logs/restore 端到端、
-  双模缓冲（磁盘 spool 字节保真/EOF 清理/流尾错误重试）
+- 单元测试 107 个（lib）+ 4 个（bin）：重试判定、配置分层、IPC 协议、注册表/恢复记录、打码、claim 选举、退避状态机
+- 集成测试 36 个：mock 上游 + 真实代理联调、守护生命周期、logs/restore 端到端、
+  双模缓冲（磁盘 spool 字节保真/EOF 清理/流尾错误重试）、看门狗（强杀重拉/
+  优雅停不复活/并发看护者唯一性）
 - 测试端口从测试进程 pid 派生（25000-65000 区间），绝不触碰用户实例；
   `DaemonGuard` 保证断言失败路径也清理守护
 

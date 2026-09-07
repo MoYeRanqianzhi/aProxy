@@ -27,6 +27,11 @@
 | `idle_timeout_secs` | u64 | 1800 | 手编（进阶） |
 | `max_body_mb` | u64 | 128 | 手编（进阶；toml 可按实例覆盖） |
 | `disk_cache` | bool | true | 手编（进阶；toml 可按实例覆盖） |
+| `watchdog` | bool | true | 看门狗总开关 |
+| `watchdog_heartbeat_secs` | u64 | 30 | 看护扫描周期（调优） |
+| `watchdog_stale_after_cycles` | u64 | 1 | 挂死容忍周期数（误杀调节阀） |
+| `watchdog_max_restarts` | u32 | 5 | crashloop 放弃上限 |
+| `watchdog_idle_exit_secs` | u64 | 300 | 闲置自灭等待；0=常驻 |
 
 ## 各字段语义
 
@@ -73,6 +78,25 @@
 
 `config.toml` 未显式写 `disk_cache` 的实例取此值（内置默认 true）。toml 显式值
 优先。语义见 config-toml.md。
+
+### watchdog（及四个 watchdog_* 调优字段）
+
+看门狗是**系统级单例**（一个全局看护进程 `aproxy watchdog` 看护全部实例），
+故只在 settings 配置、config.toml 不参与（多份 toml 对同一看护者会语义打架）。
+
+- `watchdog`（默认 true）：false 时 `aproxy start` 不拉起看护者，守护自检
+  补种停用；已在运行的看护者继续工作（实例与看护者完全解耦）。
+- `watchdog_heartbeat_secs`（默认 30）：看护者扫描周期；实例挂死检测延迟
+  ≈ 周期×(1+容忍周期数)。设 0 会被 doctor 报 error（空转烧 CPU）。
+- `watchdog_stale_after_cycles`（默认 1）：心跳过期且 IPC ping 无响应连续
+  N 轮才判挂死杀进程。
+- `watchdog_max_restarts`（默认 5）：同一实例连续重拉失败达上限即放弃
+  （指数退避 1s→2s→4s…封顶 300s），保留 `.restore` 供 `aproxy restore`
+  人工恢复；放弃事件写 startup.log。0 = 只观测不重拉（doctor 报 warning）。
+- `watchdog_idle_exit_secs`（默认 300）：全部实例清零后看护者闲置自灭的
+  等待秒数；0 = 永不自灭（常驻）。
+
+行为细节见 behaviors.md 看门狗节。
 
 ## 与 config.toml 的分层关系
 

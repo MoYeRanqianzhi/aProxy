@@ -193,7 +193,6 @@ pub fn heartbeat_section_name(port: &str) -> String {
 /// 守护侧心跳句柄：持有映射视图，Drop 时 UnmapViewOfFile（句柄随进程退出
 /// 由系统回收，测试中显式 Drop 防泄漏）。
 pub struct HeartbeatWriter {
-    port: String,
     /// 节句柄：映射期间必须保持打开——关闭节句柄后 OpenFileMappingW 将找不到
     /// 该节（内核对象仅剩视图弱引用，名字空间注册随之消失）
     #[cfg(windows)]
@@ -277,7 +276,6 @@ mod imp {
                 return None;
             }
             let writer = super::HeartbeatWriter {
-                port: port.to_string(),
                 mapping,
                 view: view.Value,
             };

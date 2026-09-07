@@ -11,3 +11,4 @@
 - [protect-production-instances](memory/2026-09-07-protect-production-instances.md) — 铁律+教训：绝不 stop 用户生产实例（stop default 曾命中 12345 并实际停掉（已即时恢复））；破坏性测试前备好即时恢复 [[protect-production-instances]] [[daemon-model]]
 - [panic-abort-outlook](memory/2026-09-07-panic-abort-outlook.md) — abort 展望（遥遥无期）：实测省 32% 体积（4.06→2.77MB），待代码足够安全成熟且需更多优势时才考虑，须配看门狗 [[panic-abort-outlook]] [[daemon-model]]
 - [release-engineering](memory/2026-09-07-release-engineering.md) — 发布工程铁则：正式发布起 GitHub 必构建指令集多版本（baseline + x86-64-v3），必然项非展望 [[release-engineering]] [[daemon-model]]
+- [aproxy-cli-skill-versioning](memory/2026-09-07-aproxy-cli-skill-versioning.md) — aproxy-cli skill（.claude/skills/）版本化策略：latest 直改小版本、大版本才留存 references/<版本>/ 每版一 compatibility；CLI/配置/行为变更必须同步更新 skill [[aproxy-cli-skill-versioning]]

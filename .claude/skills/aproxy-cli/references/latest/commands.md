@@ -70,7 +70,7 @@ ping 不通即已死）。每行含：端口、pid、版本号（`v<semver>`）�
 监听地址、上游（打码）、配置文件路径。闲置/活跃阈值 = settings.json 的
 `idle_timeout_secs`（默认 1800 秒）。
 
-## stop
+## stop / restart
 
 ```
 aproxy stop                 # 恰好 1 个实例时可省略参数
@@ -79,15 +79,30 @@ aproxy stop all             # 停全部
 aproxy stop <ALIAS>         # 按别名停（按配置路径匹配运行实例，端口变了依然有效）
 aproxy stop idle            # 停全部空闲超阈值（idle_timeout_secs）的实例
 aproxy stop idle <SECS>     # 同上，阈值临时改为 SECS 秒
+aproxy stop --force ...     # 任意 target 组合加 --force：立即 TerminateProcess，零等待
 ```
 
-target 同样走「别名 → default → 路径」解析，但纯数字按端口。语义细节：
+`restart` 的 target 语义与 stop **完全一致**（把上面命令里的 `stop` 换成
+`restart` 即可）。两者的差异：
+
+- `stop` 停止后结束；`restart` 停止后用**原始启动参数**立即拉起并等 IPC
+  就绪（8 秒判定），报出新 pid。
+- **restart 只负责重启，不负责启动**：target 未在运行时提示「端口 X 上没有
+  运行中的 aProxy 实例」并退出 1——不会顺手把没启动的实例拉起来。重启后想
+  首次启动请用 `aproxy start <别名|路径>`。
+- 重启参数来源：`.restore` 记录的原始启动参数（保 `--api-key`/`--listen` 等
+  仅本次参数）；缺失时回退注册表的配置文件路径。
+- `--force`（stop/restart 通用）：跳过 IPC 优雅关闭，立即 `TerminateProcess`
+  ——零等待。终止前验证进程镜像名，非 aProxy 进程（PID 复用）拒绝执行。
+  在途请求会立即中断，仅用于优雅停止失效或需要瞬间重启的场景。
+
+语义细节：
 
 - 多实例时省略参数是**错误**（退出 1，并列出每个实例的 stop 命令）——防止误停。
 - 别名命中但该配置的实例未运行：报「未在运行」退出 1。
-- 单实例停止流程：IPC shutdown → 轮询至多 12 秒确认退出；未退出则提示
-  `taskkill /PID <pid> /F`。
-- 停止是优雅关闭：守护进程收到信号后有 10 秒宽限强退兜底（在途请求会中断）。
+- 优雅停止流程：IPC shutdown → 轮询至多 12 秒确认退出；未退出则提示
+  `taskkill /PID <pid> /F`（`--force` 则由 aProxy 自己完成且零等待）。
+- 优雅停止时守护进程有 10 秒宽限强退兜底（在途请求会中断）。
 
 ## logs
 

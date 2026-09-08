@@ -24,6 +24,14 @@
 回归面（rustfmt/let-chains/flatten）、测试覆盖缺口。结果见本轮 workflow
 报告（运行于 wf_c3ef2aa0-144）。
 
+## 第四轮（2026-09-08，看门狗全链路 + IPC v2 + 文档/skill 一致性）
+
+范围：b31461c..HEAD（约 +10.1k 行）：看门狗 W1-W7、IPC v2、双模缓冲、
+main.rs 拆分、restart/--force，及 docs/README/skill 一致性。主会话逐步审查。
+3 HIGH（respawn 失败永久失护、unix cfg 编译错误且 CI 从未运行、behaviors.md
+4xx 重试语义写反）+ 5 MEDIUM + 4 LOW。全量测试 107+4+36 复测全绿；
+BOM 实测无 BOM（四处声称有）。报告：`.agents/review/2026-09-08-第四轮-看门狗与文档一致性.md`。
+
 ## 有意跳过项汇总（勿重复报告）
 
 - `CREATE_BREAKAWAY_FROM_JOB`：作业不允许 breakaway 时 CreateProcess 直接失败

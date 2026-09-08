@@ -103,9 +103,16 @@ async fn main() {
             let cli = cli.clone();
             commands::start::handle_start_cmd(&cli, cfg_path, target.clone()).await;
         }
-        Some(Commands::Stop { target, threshold }) => {
-            commands::stop::handle_stop_cmd(target, threshold).await
-        }
+        Some(Commands::Stop {
+            target,
+            threshold,
+            force,
+        }) => commands::stop::handle_stop_cmd(target, threshold, force).await,
+        Some(Commands::Restart {
+            target,
+            threshold,
+            force,
+        }) => commands::restart::handle_restart_cmd(target, threshold, force).await,
         Some(Commands::Logs { target }) => commands::logs::handle_logs_cmd(target).await,
         Some(Commands::Restore) => commands::restore::handle_restore_cmd().await,
         Some(Commands::Alias { cmd }) => commands::alias::handle_alias_cmd(cmd),

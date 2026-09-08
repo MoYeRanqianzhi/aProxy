@@ -87,6 +87,25 @@ pub(crate) enum Commands {
         /// idle 模式的空闲阈值（秒），覆盖 settings.json 的 idle_timeout_secs
         #[arg(value_name = "SECS", requires = "target")]
         threshold: Option<u64>,
+        /// 立即强制终止（跳过优雅关闭，零等待；进程终止前验证镜像名防杀错）
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// 重启运行中的实例（等价于对该实例执行 stop 后用原参数立即 start）。
+    /// 只负责重启已运行的实例：未启动的 target 会提示「未启动」而不会拉起。
+    /// 单个实例时可直接 `aproxy restart`；多实例必须指定端口号、`all`、配置
+    /// 别名或 `idle`（可带秒数），语义与 stop 一致。
+    Restart {
+        /// 端口号、all、配置别名或 idle
+        #[arg(value_name = "PORT|all|ALIAS|idle")]
+        target: Option<String>,
+        /// idle 模式的空闲阈值（秒），覆盖 settings.json 的 idle_timeout_secs
+        #[arg(value_name = "SECS", requires = "target")]
+        threshold: Option<u64>,
+        /// 立即强制终止旧进程（跳过优雅关闭，零等待）再重启
+        #[arg(long)]
+        force: bool,
     },
 
     /// 连接到运行中的实例并实时输出其守护日志（Ctrl+C 退出）。

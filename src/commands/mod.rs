@@ -11,6 +11,7 @@ pub(crate) mod config;
 pub(crate) mod doctor;
 pub(crate) mod find;
 pub(crate) mod logs;
+pub(crate) mod restart;
 pub(crate) mod restore;
 pub(crate) mod start;
 pub(crate) mod status;

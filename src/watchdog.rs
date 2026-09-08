@@ -120,6 +120,12 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
     imp_process::process_start_time(pid)
 }
 
+/// 该 PID 是否为 aProxy 进程（镜像名验证）。
+/// 一切「主动杀」动作（--force、看门狗挂死终止）前的防误杀关卡。
+pub fn is_aproxy_process(pid: u32) -> bool {
+    imp_process::is_aproxy_process(pid)
+}
+
 // ---------------------------------------------------------------------------
 // 看护者拉起：排序定发起者
 // ---------------------------------------------------------------------------

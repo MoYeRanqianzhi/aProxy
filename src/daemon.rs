@@ -268,6 +268,13 @@ pub fn registry_pids_in(run_dir: &std::path::Path) -> Vec<u32> {
     out
 }
 
+/// 强制终止实例进程（`--force`）：跳过 IPC 优雅关闭直接 TerminateProcess。
+/// 终止前验证进程镜像名——PID 复用下杀错进程不可逆，宁可拒绝执行。
+/// 返回 Err 的信息已含原因，调用方直接展示。
+pub fn force_terminate(pid: u32) -> Result<(), String> {
+    imp::terminate_process(pid)
+}
+
 /// 向 startup.log 追加一行（带 unix 时间戳前缀）。看门狗的 crashloop 放弃、
 /// 假死接管等重大事件写这里——用户排查「实例为什么没被拉起」的第一个入口。
 pub fn append_startup_log(line: &str) {
@@ -771,6 +778,36 @@ mod imp {
     use std::{io, sync::Arc, time::Duration};
     use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
     use tokio::sync::watch::Sender;
+
+    /// 强制终止（--force）：镜像名验证 + TerminateProcess。
+    /// 复用 watchdog::imp_process 的验证原语——同一套防 PID 复用逻辑。
+    pub fn terminate_process(pid: u32) -> Result<(), String> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+        };
+        if !crate::watchdog::is_aproxy_process(pid) {
+            return Err(format!(
+                "pid {pid} 不是 aProxy 进程（镜像名不符），拒绝强制终止以防误杀"
+            ));
+        }
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if handle == 0 {
+                return Err(format!("无法打开 pid {pid}（可能已退出）"));
+            }
+            let ok = TerminateProcess(handle, 1);
+            let _ = CloseHandle(handle);
+            if ok == 0 {
+                return Err(format!(
+                    "终止 pid {pid} 失败（{}）",
+                    io::Error::last_os_error()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// 端点不存在（无实例）时返回可读错误。
     ///
     /// ERROR_PIPE_BUSY(231) 重试：serve 循环在 connect() 完成、重建下一个
@@ -827,6 +864,23 @@ mod imp {
     use std::{io, path::Path, sync::Arc, time::Duration};
     use tokio::net::UnixListener;
     use tokio::sync::watch::Sender;
+
+    /// 强制终止（--force）：SIGKILL（unix 无镜像名 API，靠 claim/探活上层验证）
+    pub fn terminate_process(pid: u32) -> Result<(), String> {
+        let r = unsafe { libc_kill(pid as i32, 9) };
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "终止 pid {pid} 失败（{}）",
+                io::Error::last_os_error()
+            ))
+        }
+    }
+
+    unsafe extern "C" {
+        fn libc_kill(pid: i32, sig: i32) -> i32;
+    }
 
     pub async fn exchange(endpoint: &str, req_line: &str) -> Result<String, String> {
         let client = tokio::net::UnixStream::connect(endpoint)

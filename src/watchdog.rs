@@ -840,22 +840,48 @@ mod imp {
     pub fn open_sync_handle(pid: u32) -> Option<isize> {
         Some(pid as isize)
     }
-    /// 轮询进程死亡（kill(pid,0) 仅做存在性探测，不杀进程）。仅在
-    /// spawn_blocking 中调用——扫描周期由调用方健康检查兜底，此处 1s 粒度
-    /// 足够（Windows 侧为内核事件驱动，unix 无等价原语，这是设计内的退化）。
+    /// 轮询进程死亡。仅在 spawn_blocking 中调用——扫描周期由调用方健康检查
+    /// 兜底，此处 1s 粒度足够（Windows 侧为内核事件驱动，unix 无等价原语，
+    /// 这是设计内的退化）。
+    ///
+    /// 不能只用 kill(pid,0)：它对 zombie（已死未收割）也返回成功——守护的
+    /// 父进程（start/测试/看护者自己）不 wait 之前死亡事件永远不触发。
+    /// 须读 /proc 的进程态排除 Z。无 /proc 的平台（macOS）回退 kill(pid,0)。
     pub fn wait_blocking(handle: isize) {
         let pid = handle as i32;
         loop {
-            // 进程不存在（ESRCH）或僵尸回收后即视为死亡；EPERM（无权限）
-            // 说明进程存在但非本用户，也按存活继续等
-            let r = unsafe { kill(pid, 0) };
-            if r != 0 && std::io::Error::last_os_error().raw_os_error() != Some(1) {
+            if !process_alive_for_wait(pid) {
                 return;
             }
             std::thread::sleep(Duration::from_secs(1));
         }
     }
-    pub fn terminate_handle(_handle: isize) {}
+
+    /// 死亡等待的存在性探测：/proc 可用（Linux）时 zombie 视为死亡；
+    /// 无 /proc（macOS）回退 kill(pid,0)（EPERM 视为存活，其余错误为死亡）。
+    fn process_alive_for_wait(pid: i32) -> bool {
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            // stat 形如 "pid (comm) S ..."，comm 可含空格/括号，取 ')' 之后首字段
+            return stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .map(|state| state != "Z")
+                .unwrap_or(false);
+        }
+        let r = unsafe { kill(pid, 0) };
+        if r == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(1)
+    }
+
+    /// SIGKILL 处决（挂死判定后调用）：unix 直接以句柄中保存的 pid 杀进程。
+    /// 上层靠死亡 watcher 的轮询确认死亡。
+    pub fn terminate_handle(handle: isize) {
+        unsafe {
+            kill(handle as i32, 9);
+        }
+    }
     pub fn close_handle(_handle: isize) {}
     pub fn terminate_verified(_pid: u32) {}
 }

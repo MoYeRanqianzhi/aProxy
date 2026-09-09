@@ -2,6 +2,7 @@
 
 > 2026-09-05 据进度盘点建立。2026-09-07 全部近期收口完成（v0.1.0-alpha.4 已 tag）。
 > 2026-09-08 补录 tag 之后一轮（性能优化 + 磁盘缓存 + 重构 + skill），全部已完成。
+> 2026-09-09 第四轮审查修复 + 实测 restart bug + skill 指引优化，全部已完成。
 
 ## 近期收口（全部完成）
 
@@ -26,12 +27,22 @@
 - [x] **G2 看门狗**（W1-W7，2026-09-08 完成）：全局单看护进程 + 内核等待 + 选举规范 + settings 五字段 + IPC v2 观测；实测 +2.4% 体积/+2.9MB 常驻/热路径零损耗（docs/benchmark-watchdog.md）；计划偏差 3 项记录；107 lib + 36 集成全绿
 - [x] **F. IPC 观测扩展**（随 G2 落地）：proto 版本化 + InstanceInfo 观测字段（请求数/重试数/最近错误）+ status 混版本检测——滚动升级地基齐备
 
+## alpha.6 之后（2026-09-09，全部完成）
+
+- [x] **第四轮审查修复**（7bef574/4ba5b5c/6492740/4c89ab9/e6f676b，详见
+  review-history.md 第四轮修复节）：H1 重试队列 + M2 退避移出主循环 +
+  H2 unix 字段 + M1 重试中不算闲置 + L3/L4/L1/M3 + 文档/skill 全批；
+  配套修复用户实测「改端口 restart 误报未就绪」（就绪判定按新 pid 定位，
+  restart 与看门狗 respawn 同款）与 skill「stop 后再 start」误导源三处
+- [x] restart 换端口回归集成测试（tests/restart_integration.rs 2 例）
+
 ## 中期功能（对齐「无限重试、不中断」使命）
 
 - [ ] **正式发布：GitHub 构建指令集多版本**（必然项，2026-09-07 定调）：CI 矩阵 baseline + `RUSTFLAGS="-C target-cpu=x86-64-v3"`（AVX2），产物命名区分，发布页两者都放；详见 memory/release-engineering
-- [ ] **H.（可选）配置热重载**：IPC reload，避免 stop/start 断流
-- [ ] **滚动升级 `aproxy upgrade`**（可选）：逐实例 stop→start 替换——IPC v2 混版本检测地基已备（status 可见旧版本实例）
+- [ ] **H.（可选）配置热重载**：IPC reload，避免 restart 断流（改配置生效目前用 restart，已有单命令路径）
+- [ ] **滚动升级 `aproxy upgrade`**（可选）：逐实例 restart 替换——IPC v2 混版本检测地基已备（status 提示已指向 restart）
 - [ ] **看门狗二期（可选）**：挂死不杀进程原地救（scoped runtime 注入 spike）、实例数极大时线程池死亡等待、unix 分支实测
+- [ ] **仓库挂 remote 让 CI 真正运行**（H2 修复时确认的防线缺口）：.github/workflows 已配置 ubuntu/macos cargo check，但无 remote 从未运行——unix cfg 编译错误（H2，已修）靠它拦截
 - [ ] unix 分支实测（UDS IPC / unix spawn / /dev/shm 心跳从未在类 Unix 环境运行过；CI ubuntu/macos 只 cargo check）
 
 ## 已结案（有意跳过，见记忆/审查记录）

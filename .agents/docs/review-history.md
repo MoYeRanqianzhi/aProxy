@@ -32,6 +32,26 @@ main.rs 拆分、restart/--force，及 docs/README/skill 一致性。主会话�
 4xx 重试语义写反）+ 5 MEDIUM + 4 LOW。全量测试 107+4+36 复测全绿；
 BOM 实测无 BOM（四处声称有）。报告：`.agents/review/2026-09-08-第四轮-看门狗与文档一致性.md`。
 
+**修复（2026-09-09，主会话逐项串行完成，全部验证提交）**：
+- H1+M2：watchdog 重试队列重构（4ba5b5c）——失败实例摘出 watched 进
+  PendingRetry 队列（crashloop 计数跨周期累计、句柄不再悬空）；退避等待移出
+  主循环（serve 按 next_pending_deadline select 竞速，claim 续写不再被
+  300s 退避卡死）；maybe_idle_exit 把 pending 算非空闲；respawn/重启就绪判定
+  一律按新 pid 在注册表定位（配套修复用户实测的「改端口 restart 误报未就绪」，
+  7bef574 + 新集成测试 tests/restart_integration.rs 2 例）。
+- H2：unix HeartbeatWriter 补回 port 字段（4ba5b5c）。CI 从未运行的根因
+  （无 remote）仍开放——TODO 跟踪。
+- M1：两条重试通道每轮 attempt 刷新 last_activity_secs（6492740），
+  语义 = 「最近收到请求或仍在处理」。
+- L3/L4/L1/M3 代码侧（4c89ab9）：status 升级建议改 restart；find 删重复
+  --port 过滤；settings/architecture 注释对齐实现；BOM 注释改「无 BOM」。
+- H3/M3/M4/M5/L1文档/L2（e6f676b）：4xx 口径三处修正；compatibility bump
+  alpha.6 + alpha.5/6 关键行为节；README 补 restart 行 + 测试数；
+  **skill restart 指引重写**（SKILL.md 高频守则/config 尾注/排障表三处
+  「stop 后再 start」误导源改为直接推荐 restart——用户实测发现模型被
+  概览页误导多走一步）；architecture 启动顺序与重试队列描述精确化。
+- 用户实测 restart bug + skill 描述问题与审查项同批收口。
+
 ## 有意跳过项汇总（勿重复报告）
 
 - `CREATE_BREAKAWAY_FROM_JOB`：作业不允许 breakaway 时 CreateProcess 直接失败

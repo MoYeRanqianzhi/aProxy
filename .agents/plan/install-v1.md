@@ -30,8 +30,11 @@
 ## 规范位置与管辖边界
 
 - 安装二进制唯一管辖位置：`~/.aproxy/bin/aproxy.exe`。
-- 旧二进制：`~/.aproxy/bin/aproxy.exe.old-<旧版本>`（只保留最近 1 份——
-  连续升级互相覆盖，更早版本走 GitHub Releases 随时可取）。
+- 旧二进制：`~/.aproxy/bin/aproxy.old.exe`（固定名——保持 exe 后缀使其可
+  作为 fallback 执行目标，见 swapping 专节防线 0；只保留最近 1 份，连续
+  升级互相覆盖，更早版本走 GitHub Releases 随时可取；cleaning 终验后才删）。
+- 常驻入口脚本：`bin/aproxy.bat` + `bin/aproxy`（无后缀 sh）——安全中间态
+  fallback，见 swapping 专节。
 - 备料区：`~/.aproxy/staging/<目标版本>/`（与 bin 同在 APROXY_HOME 下——
   rename 原子性的同卷前提；staging 文件保留至 done/abort 才清理，它是
   swapping 中断的恢复源，见下文专节）。
@@ -67,16 +70,18 @@
 ```
 
 - **create_new = 安装锁**：已存在 → 并发安装拒绝（带 stale 判定：updated_at
-  超 10 分钟且 installer_pid 不存活 → 视为残留，提示 `install --resume`）。
+  超 10 分钟且 installer_pid 不存活 → 视为残留，**不询问直接续跑**，见恢复节）。
 - 每次阶段推进原子重写（tmp + rename，同 `write_instance_file` 既有模式）。
-- `--resume` 继续；`--abort` 回滚（仅 swapping 前可完全回滚，之后只进不退）。
+- **`--abort` 显式回滚**（仅 swapping 前可完全回滚，之后只进不退）；
+  **无 `--resume`**（用户定调 2026-09-09：用户调 install 的期望就是装完，
+  恢复不该要求二次显式指令——中断后续作是自动的，入口见恢复节）。
 
 ## 阶段状态机
 
 ```
 marking → downloading → downloaded → broadcasting → acked
         → swapping → swapped → relaying → restarting → verifying → cleaning → done
-失败/中止：failed（保留现场可 --resume）| aborted（干净回滚）
+失败/中止：failed（保留现场，自动续作见恢复节）| aborted（干净回滚）
 ```
 
 | 阶段 | 动作 | 状态文件更新时机 |
@@ -85,10 +90,10 @@ marking → downloading → downloaded → broadcasting → acked
 | downloading | 渠道备料到 staging + sha256/可执行校验 | 进入前置 downloading，校验过后置 downloaded |
 | broadcasting | IPC 广播 PrepareSwap + ACK 确认（含重试/restart 收敛） | 进入前置 broadcasting，全 ACK 后置 acked |
 | swapping | rename 旧 exe → .old；staging → bin 落位；`--version` 验证新 exe | rename 前置 swapping，落位+验证后置 swapped |
-| relaying | 旧安装进程 spawn 新二进制 `install --relay`，确认接管后自行退出 | 新进程接管后置 relaying（见接力协议） |
+| relaying | 旧安装进程 spawn 新二进制 `install --continue`（续跑模式），确认接管后自行退出 | 新进程接管后置 relaying（见接力协议） |
 | restarting | 逐实例 stop(优雅)→新 exe spawn→IPC 就绪→下一个 | 每重启一个实例更新一次（记录进度） |
 | verifying | 全实例 ping：version==target && swap_phase==false | 前置 verifying，通过后置 cleaning |
-| cleaning | 删 .old（被锁则保留待下次启动 cleanup 例行重试，绝不强杀） | 删除成功置 done |
+| cleaning | 删 `aproxy.old.exe`（被锁则保留待下次启动 cleanup 例行重试，绝不强杀）；入口脚本常驻不删 | 删除成功置 done |
 
 ### swapping 极端情况专节（用户定调：最要命的失败态）
 
@@ -96,23 +101,48 @@ marking → downloading → downloaded → broadcasting → acked
 崩溃 = bin 目录只剩 `.old`、`aproxy.exe` 不存在——**所有 aproxy 指令无处可
 落**（二进制没了，status/stop/install 全都调不出来），重启后也无法自愈。
 
-三层防线：
+四层防线（第 0 层 = 安全中间态入口，用户定调 2026-09-09）：
 
+0. **安全中间态入口脚本（常驻 bin，fallback 重定向到旧二进制）**：
+   - `aproxy.bat`（Windows 主力）+ 无后缀 `aproxy`（Git Bash/MSYS 补充），
+     内容以 `%~dp0` 相对定位：`aproxy.exe` 存在则调它，否则调
+     `aproxy.old.exe`。**`aproxy.ps1` 不做**（PowerShell 命令发现不含
+     .ps1，无价值）。
+   - **生效机制 = PATHEXT 优先级**（Windows 数十年稳定语义）：cmd/PowerShell
+     解析 `aproxy` 简名时同目录 `.EXE` 先于 `.BAT`——exe 在场脚本零参与
+     （常态**精确零开销**），exe 缺席的空窗自动落到脚本 → `.old.exe`。
+     `.old.exe` 保持 exe 后缀（用户定调）：空窗期它被旧安装进程锁定，
+     但镜像锁只禁写删不禁运行，fallback 执行不受影响。
+   - **放置时机**：bootstrap 渠道（install.ps1/npm 首装）随首装放置 +
+     install 每次 swapping 前幂等 ensure（只靠 swap 后放来不及保护本次
+     空窗）。cleaning 不删（常驻基础设施）。
+   - **价值定位（写进 skill）**：空窗期 fallback 到的是旧版本 CLI——
+     stop/status/logs/start 全部可用，**实例管理命令不断线**（对「绝对
+     不间断」的补全）；但它无 install 状态检测（且若 .old 早于本功能
+     上线则无 --continue 续跑）——修复仍走下述手动退路。
+   - 盲区：绝对路径调用（任务计划程序/其他软件）不走 PATH 解析，脚本
+     不参与——可接受（那是程序间调用，fallback 目标是用户/agent 敲命令）。
 1. **预防（主防线）**：交换顺序设计为「bin 永不空窗」——**先落新、后改名旧**：
    staging 新 exe rename 到 bin 时路径已被旧 exe 占用，不可行；改为
    **copy 新 exe 到 bin 下的临时名（aproxy.exe.new，不占锁）→ rename 旧
    exe → rename .new → aproxy.exe**，两步 rename 之间窗口从「整个文件
    落位」缩到一次系统调用；`.new` 的存在本身就是「swapping 进行中」的标记。
+   rename 原子性保证脚本永远调到完整文件，不存在半成品态。
 2. **检测**：入口检测（见恢复节）发现 swapping 中断 → 无论手动修复还是
-   --resume，路径都成立（staging 完整在盘）。
+   续跑（--continue），路径都成立（staging 完整在盘）。
 3. **兜底（手动修复指南，skill 专节）**：一切 CLI 失效时的 agent 手动步骤
    （全部是文件操作，不需要 aproxy 二进制可用）：
    - `~/.aproxy/staging/<版本>/aproxy.exe` 仍在 → **复制**到
      `~/.aproxy/bin/aproxy.exe`（Windows copy 对 .new 无锁——它没在运行）；
-   - staging 也没了（极端中的极端）→ `bin/aproxy.exe.old-<版本>` 直接改名
+   - staging 也没了（极端中的极端）→ `bin/aproxy.old.exe` 直接改名
      回 `aproxy.exe`（旧版本可用 > 没有版本），再跑 `aproxy install` 重来；
    - 两者皆失 → 从 GitHub Releases 重新下载或 `--from` 任意可用二进制。
-   恢复后 `install --resume`/`--abort` 清理状态文件。
+   恢复后续跑进程（或 --abort）清理状态文件。
+
+可行性/稳定性/性能评估结论（讨论沉淀）：**可行**（PATHEXT 是 shell 解析层
+的机制，比程序化包装可靠）、**稳定**（无版本耦合/幂等放置/被锁不影响执行/
+rename 原子无半成品）、**零常态开销**（exe 在场脚本不执行；空窗 +20-50ms
+属灾难恢复场景无意义；磁盘 <1KB）。
 
 注：防线 1 的 copy+双 rename 使「bin 完全不存在二进制」只能发生在
 copy+rename(旧) 之间约一次系统调用的窗口，且即使发生，手动修复的三个
@@ -124,19 +154,91 @@ copy+rename(旧) 之间约一次系统调用的窗口，且即使发生，手动
 
 | 崩溃点 | 现场特征 | 下次启动恢复动作 | 服务是否受影响 |
 |---|---|---|---|
-| marking 后 | 状态文件在，staging 空 | 残留判定 → 提示 --resume/--abort；无实际影响 | 无 |
-| downloading 中 | staging 有半截文件 | 删半截重下（--resume）或 --abort | 无 |
+| marking 后 | 状态文件在，staging 空 | 自动续（判定无实际工作 → done 清状态文件）| 无 |
+| downloading 中 | staging 有半截文件 | 自动续：删半截重下 | 无 |
 | downloaded/broadcasting | staging 完整，二进制未动 | 直接重入该阶段（幂等） | 无 |
-| **swapping 中**（bin 空窗：旧已改名、新未落位） | bin 只有 .old（可能还有 .new），staging 完整 | **关键恢复**：从 staging 重新落位 → 验证 → 续 relay；CLI 全失效时走手动修复三退路（见 swapping 专节） | 无（实例全在跑） |
-| swapped | bin=新 exe，.old 存在 | 验证新 exe → 续 relay | 无 |
-| relaying 中 | relay 未起/已死 | 重新 spawn relay（幂等，读同一状态文件） | 无 |
+| **swapping 中**（bin 空窗：旧已改名、新未落位） | bin 只有 .old（可能还有 .new），staging 完整 | **关键恢复**：从 staging 重新落位 → 验证 → --continue 续跑；CLI 全失效时走手动修复三退路（见 swapping 专节） | 无（实例全在跑） |
+| swapped | bin=新 exe，.old 存在 | 验证新 exe → --continue 续跑 | 无 |
+| relaying 中 | 续跑进程未起/已死 | 重新 spawn --continue（幂等，读同一状态文件） | 无 |
 | restarting 中 | 部分实例新版本 | 续滚动（跳过已就绪的） | 单实例滚动窗口内 |
 | verifying/cleaning | 全新，.old 残留 | 补验证/删 .old（锁住则下次再试） | 无 |
 | 任何阶段 | 状态文件损坏 | 按 aborted 处理 + 审计日志；swapping 前无影响，swapping 后以 .old 存在性推断 | 视阶段 |
 
-恢复的检测点：**每个 aproxy 进程入口**（main.rs 子命令分派前）读状态文件，
-活动中的安装 → 显著提示 + 给出 `install --resume` / `--abort`；不自动执行
-破坏性动作（人/agent 确认后执行）。
+## 恢复机制（用户定调：全自动，无 --resume，无人工询问）
+
+**原则**：用户调 install 的期望就是「装完」——中断后自动继续，不问任何人。
+安装的每一步本就设计为安全/幂等/可回滚，续作没有破坏性，无需确认。
+
+**续跑入口统一为 `install --continue`（隐藏标志）**：读状态文件 → 判定当前
+phase → 从该步幂等推进（含用户点名的场景：实际已装完只差清理 → 走到
+cleaning 清掉 `.old` 与状态文件即 done——状态文件删除 = 安装完成的标志，
+任何非 aborted/failed 的残留状态文件都意味着未完成）。
+
+**检测点分层**：
+
+1. **主责 = 看门狗（用户定调）**：看护者启动时全量检查（启动时一次 +
+   运行中每日一次，避免常态浪费）——检查对象是**各类本地状态文件**
+   （当前只有 install.state.json，后续扩展更多），职责仅为「发现残留 →
+   `spawn_detached(current_exe, ["install", "--continue"])` 拉起对应处理者」。
+   **看护者绝不解读状态文件语义**（用户定调的分工原则）：残留只能说明
+   install 未正常结束，处于哪一步、已完成则清文件退出还是续跑——全部由
+   install 进程自己判断。闭环：安装中断 → 看护者若已被杀（广播前换血）→
+   守护 5 分钟自检补种（空窗期 spawn 因 exe 路径不存在失败也无碍，落位
+   完成后下轮成功）→ 新看护者启动检查 → 拉起续跑。看护者常驻 + 自愈补种，
+   天然覆盖「下一次启动」语义。
+2. **兜底 = CLI 入口静默续**（main.rs 子命令分派前）：watchdog=false 或
+   无实例场景看护者不存在，任何 aproxy 命令入口读到活动安装态 → 静默
+   spawn `install --continue`（无提示无等待，用户命令照常执行）。同样
+   无询问。
+3. **并发防重**：续跑进程先做 stale 判定（installer_pid 存活性 + updated_at
+   超时），确认原安装进程已死后把自己写进 installer_pid 再续；原进程还活
+   着（误判）→ 不动。两个续跑进程竞争 → 状态文件原子重写的阶段推进天然
+   串行化（后写者读到最新 phase 继续，幂等保证收敛）。
+
+**`--abort` 保留**（显式决策才回滚：仅 swapping 前可完全回滚）。手动修复
+三退路保留（bin 空窗极端下 CLI 全失效，文件操作是最后手段）——自动恢复
+覆盖 99% 场景，手动指南是最后防线。
+
+## 安装态宣告与看门狗差异化行为（用户定调 2026-09-09）
+
+### 显式宣告协议（双介质分离——分工原则的落点）
+
+- **持久介质 = install.state.json**：install 自己的进度账本，**只有 install
+  读**。残留 ≠ 在安装（可能没正常结束），看护者/守护不做语义解读。
+- **易失介质 = 共享内存节 `Local\aproxy-install`**：install 启动时创建并
+  持有句柄，内容 `{installer_pid: u32, 心跳毫秒: u64}`（独立 ticker 周期
+  beat，复用心跳节基建）；**install 进程退出（done/abort/崩溃）节即消失 =
+  宣告自然解除**，零清理逻辑。这是运行时「安装进行中」的唯一真相源。
+- 看护者/守护读节判定：节存在 + 心跳新鲜 + pid 存活 = 显式宣告有效。
+
+### 看门狗在安装态下的差异化行为（仅宣告有效时激活，常态行为零改变）
+
+1. **实例死亡多次复查**（用户定调）：安装态下收到死亡事件不立即走
+   handle_death——复查 5 次 × 3s（覆盖 install 单实例重启 stop+spawn+ready
+   通常 2-3s、上限 10s）：任一次发现实例回归（install 已以新 pid 拉起）→
+   刷新 watched（新 pid/新句柄），不动作；复查耗尽仍死 → **照常走重拉**
+   （短窗口不拖长——真崩溃不悬置，且看护者已换血，current_exe = 新二进制，
+   「拉起新实例直接从新二进制」天然成立）。与 install 的竞争收敛分析：
+   看护者重拉成功 = install 的该实例就绪判定（IPC ping）直接通过，两者
+   收敛到同一目标态（新版本实例就绪），worst case 双 spawn 端口冲突后者
+   退出，无死锁。
+2. **install 进程保活（仅安装态）**：节在但心跳过期（install 挂死）→
+   拉起 `install --continue` 续作。常态不看护 install（零浪费）。
+3. **守护自检补种抑制**（联动发现的关键点）：守护 5 分钟自检读到有效
+   宣告 → **跳过补种**。否则 restarting 窗口内旧守护（尚为旧版本）会补种
+   旧看护者 → 误判滚动重启为崩溃 → 用旧二进制重拉 → 与 install 拉锯
+   （verifying 能兜底收敛但多轮无谓折腾）。install 结束节消失 → 自检
+   恢复 → 新看护者出簇。
+4. **诚实边界（混版本窗口）**：restarting 早期守护/看护者仍为旧版本、
+   不认识宣告节——旧守护恰逢 5 分钟周期补种的竞态窗口存在（install
+   restarting 通常 < 1 分钟，概率低），发生后由 verifying 版本校验兜底
+   收敛。不做 claim 冒名等全版本兼容 hack（语义污染，分工原则优先）。
+
+### 时序闭环（宣告从生到死）
+
+install 启动（marking 后）创建宣告节 → 广播前停旧看护者（守护自检被宣告
+抑制，不再复活旧看护者）→ swap/relay/restarting → install 结束节消失 →
+守护自检恢复 → 新看护者出簇（新 exe）→ 读宣告节不存在 = 常态行为。
 
 ## IPC 扩展（PrepareSwap 广播 + ACK）
 
@@ -163,12 +265,16 @@ copy+rename(旧) 之间约一次系统调用的窗口，且即使发生，手动
   升级永不完成（Linux 无此问题——exec 按路径解析自动拿到新文件）。
 - 看护者不承载流量，停掉零服务影响；换血窗口内实例崩溃 = 失去自动重拉
   （秒级~分钟级，可接受的微窗）。
-- relaying 之后由新二进制 `ensure_watchdog_if_enabled` 重新出簇（既有逻辑复用）。
+- **宣告节在换血之前创建**（install 启动即创建，先于停看护者）：停看护者
+  与新看护者出簇之间的窗口，守护自检因读到有效宣告而抑制补种（见安装态
+  宣告节第 3 条）——补种时序与宣告生命周期严格咬合。
+- relaying 之后由新二进制 `ensure_watchdog_if_enabled` 重新出簇（既有逻辑
+  复用）；新看护者启动检查宣告节不存在（install 已结束）→ 常态行为。
 
 ## 接力协议（Windows 无 exec 的替代）
 
 - swapping 完成后，旧安装进程（跑在 .old 镜像上）spawn 新二进制
-  `aproxy install --relay`（隐藏标志，读同一状态文件）。
+  `aproxy install --continue`（续跑模式，读同一状态文件）。
 - 旧进程轮询状态文件 `phase >= relaying && updated_at 刷新`（新进程接管即
   推进状态文件 = 自证存活），确认后**自行退出**（=「旧二进制自动停止」）。
 - 回滚窗口说明：swapped 之前均可完全回滚（rename 回去——运行中的旧安装进程
@@ -216,10 +322,13 @@ Rust 工具链）。绕开编译的两条路：cargo-binstall 约定（P1 顺带
 
 ## skill 增补（commands.md / behaviors.md / compatibility.md）
 
-- install/upgrade 命令参考（含 --from/--variant/--allow-downgrade/--resume/--abort）。
+- install/upgrade 命令参考（含 --from/--adopt/--variant/--allow-downgrade/
+  --abort；续作全自动，无 --resume）。
 - behaviors.md「二进制更换阶段」节：语义、status 可见性、**ACK 失败处置**——
   某实例多轮未表达 = 该实例有隐患，skill 指引：将其关闭后重试安装
   （为什么不能强杀：避免服务中断原则）。
+- **恢复自动化节**：中断续作全自动（看门狗主责 + CLI 兜底），无 --resume
+  无人工询问；看护者/守护只认 install 的显式宣告，不解读状态文件残留。
 - **手动更新兜底节**：install 反复失败的特殊情况由 agent 手动执行——
   `aproxy stop all` → 替换 `~/.aproxy/bin/aproxy.exe` → `aproxy restore`；
   明确标注此路径**有服务中断**，仅作兜底。
@@ -228,10 +337,13 @@ Rust 工具链）。绕开编译的两条路：cargo-binstall 约定（P1 顺带
 ## 测试矩阵
 
 - 单测：状态机迁移合法性 / 恢复矩阵逐行注入 / staging 校验 / 降级防呆 /
-  变体选择逻辑。
+  变体选择逻辑 / 宣告节读写与心跳过期判定。
 - 集成（需目录重定向，见开放问题 1）：`--from` 全流程（有实例/无实例）/
-  各崩溃点 kill 安装进程 → --resume 恢复 / 多实例逐个重启顺序断言（任一时刻
-  至多一个下线）/ ACK 失败 → restart 收敛 / 管辖外实例拒绝。
+  各崩溃点 kill 安装进程 → 自动续恢复（看门狗/CLI 触发）/ 多实例逐个重启
+  顺序断言（任一时刻至多一个下线）/ ACK 失败 → restart 收敛 / 管辖外实例
+  拒绝 / **安装态看护者差异化**：滚动重启中看护者不误判死亡（复查路径）、
+  kill install 进程 → 看护者保活拉起 --continue、守护自检在宣告有效时不
+  补种、install 结束后自检恢复出簇。
 - Windows 专属：rename 锁定 exe 语义（已有实证）/ .old 被锁时 cleaning 重试。
 
 ## 分步提交（每步：实现 + 测试 + clippy 零警告 + fmt + commit）
@@ -243,11 +355,13 @@ Rust 工具链）。绕开编译的两条路：cargo-binstall 约定（P1 顺带
 2. **staging 备料与校验**：--from 渠道（复制 + `--version` 校验）+ sha256 通用件
    + `--adopt` 标志（复用 --from 流水线）。
 3. **交换与接力**：copy+双 rename 舞（.new 中间态）/ `--version` 验证 /
-   --relay 隐藏标志 / 回滚窗口。
+   --continue 续跑模式（=relay/恢复统一入口）/ 回滚窗口。
 4. **IPC PrepareSwap + swap_phase**（协议 + 实例侧 + status 展示）+ ACK 收敛
-   （重试/restart/abort）+ 看护者换血顺序。
+   （重试/restart/abort）+ 看护者换血顺序 + **安装态宣告节**（共享内存心跳
+   介质）+ 看护者差异化行为（死亡多次复查/install 保活/守护自检抑制）+
+   看护者启动全量检查（状态文件残留 → 拉起对应处理者）。
 5. **滚动重启与终验清理** + 无实例快路径 + 竞态窗口防护。
-6. **入口检测与 --resume/--abort**：main.rs 活动安装提示 + 恢复矩阵全链路
+6. **恢复机制**：看门狗启动检测 + CLI 静默兜底 + --continue 续跑 + 恢复矩阵全链路
    集成测试（崩溃点注入，含 swapping 空窗的手动修复三退路验证）。
 7. **GitHub Releases 渠道**：API 列表/下载/变体选择/sha256（P0 收尾）。
 8. **收尾**：skill 三处增补（含手动更新兜底 + swapping 手动修复指南）+
@@ -260,8 +374,19 @@ Rust 工具链）。绕开编译的两条路：cargo-binstall 约定（P1 顺带
    相对 APROXY_HOME（未设 = `~/.aproxy`），APROXY_RUN_DIR 仍独立可覆盖
    （粒度优先）。路径推导集中在 settings/daemon 的既有函数改造一次；
    集成测试从此全量隔离，logs/spool 不再有真实目录污染。
-2. **relay 存活判据**：状态文件 phase+updated_at 轮询（简单方案）。
+2. **relay 存活判据**：状态文件 phase+updated_at 轮询（简单方案）——已在
+   恢复机制节定夺沿用。
 3. **failed 现场保留**：staging 永久保留，用户显式 --abort 才清理。
+4. **状态文件位置**：run/ 子目录（根目录只放长期稳定件，防混乱）。
+5. **恢复自动化**：无 --resume 无询问——看门狗主责 + CLI 兜底 + install
+   --continue 统一续跑入口；看护者/守护只认显式宣告（共享内存节），绝不
+   解读状态文件残留（分工原则）；看护者启动全量检查只在启动一次（后续
+   或每日一次），防常态浪费。
+6. **安装态看门狗差异化**：实例死亡多次复查（5×3s，防误判滚动重启）/
+   install 保活（仅安装态）/ 守护自检补种抑制（防旧看护者复活拉锯）——
+   全部由宣告节门控，常态行为零改变。
+7. **安全中间态入口**：aproxy.bat + 无后缀 aproxy（sh）常驻 bin，PATHEXT
+   优先级实现 fallback（→ aproxy.old.exe，保持 exe 后缀）；ps1 不做。
 
 ## APROXY_HOME 的影响面（实现注意）
 

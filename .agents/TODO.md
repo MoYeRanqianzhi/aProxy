@@ -36,14 +36,28 @@
   restart 与看门狗 respawn 同款）与 skill「stop 后再 start」误导源三处
 - [x] restart 换端口回归集成测试（tests/restart_integration.rs 2 例）
 
+## alpha.6 之后（2026-09-09~10，unix 实测轮）
+
+- [x] **unix 分支实测**（ssh remote Ubuntu 24.04 实机，报告 .agents/docs/unix-testing.md）：
+  修复 5 项——P0 编译/链接阻断 2 项（watchdog Duration 导入、daemon extern 符号名
+  libc_kill→kill）、P1 看门狗 unix 失效 2 项（adopt_scan 收养不进 + zombie 误判/
+  terminate 空操作）、P2 测试平台假设 3 处；解锁 5 个 Windows-only 测试并在 Linux
+  通过；功能/并发/内存/perf/valgrind/体积全套数据入报告。
+  分支 fix/unix-first-test（.worktree/unix-fixes），待合并。
+- [ ] **产品语义决策**（实测发现）：unix 上 APROXY_RUN_DIR 影响 IPC 寻址
+  （UDS 路径在 run_dir 内，Windows 管道全局名不受影响）——是否对齐待定
+- [ ] **优化候选**：upstream client（reqwest/hyper）开启 TCP_NODELAY——实测与
+  无 NODELAY 上游配合时有 40ms Nagle×delayed-ACK 咬合
+- [ ] **测试基建**：看门狗测试子进程清理 RAII 化（panic 路径手写 kill 会跳过）；
+  daemon.rs 的 UDS IPC roundtrip 单测（现为 Windows-only）
+
 ## 中期功能（对齐「无限重试、不中断」使命）
 
 - [ ] **正式发布：GitHub 构建指令集多版本**（必然项，2026-09-07 定调）：CI 矩阵 baseline + `RUSTFLAGS="-C target-cpu=x86-64-v3"`（AVX2），产物命名区分，发布页两者都放；详见 memory/release-engineering
 - [ ] **H.（可选）配置热重载**：IPC reload，避免 restart 断流（改配置生效目前用 restart，已有单命令路径）
 - [ ] **滚动升级 `aproxy upgrade`**（可选）：逐实例 restart 替换——IPC v2 混版本检测地基已备（status 提示已指向 restart）
-- [ ] **看门狗二期（可选）**：挂死不杀进程原地救（scoped runtime 注入 spike）、实例数极大时线程池死亡等待、unix 分支实测
-- [ ] **仓库挂 remote 让 CI 真正运行**（H2 修复时确认的防线缺口）：.github/workflows 已配置 ubuntu/macos cargo check，但无 remote 从未运行——unix cfg 编译错误（H2，已修）靠它拦截
-- [ ] unix 分支实测（UDS IPC / unix spawn / /dev/shm 心跳从未在类 Unix 环境运行过；CI ubuntu/macos 只 cargo check）
+- [ ] **看门狗二期（可选）**：挂死不杀进程原地救（scoped runtime 注入 spike）、实例数极大时线程池死亡等待（unix 死亡等待已实装为轮询，见 unix-testing.md）
+- [ ] **仓库挂 remote 让 CI 真正运行**（H2 修复时确认的防线缺口）：.github/workflows 已配置 ubuntu/macos cargo check，但无 remote 从未运行——本次实测证明该防线的必要性（unix 编译/链接错误两处正是它该拦下的）
 
 ## 已结案（有意跳过，见记忆/审查记录）
 
@@ -51,3 +65,4 @@
 - 命名管道 ACL/冒名校验（tokio 不暴露，误判方向 fail-safe）
 - stop 退出码差异、status/stop/logs 忽略 --config（有意设计）
 - settings.json 并发 add 丢更新（本地单用户 CLI，last-write-wins 可接受）
+- ~~unix 分支实测~~ → 已完成（2026-09-10，见上节与 .agents/docs/unix-testing.md）

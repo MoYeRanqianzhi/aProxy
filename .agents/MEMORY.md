@@ -12,3 +12,4 @@
 - [panic-abort-outlook](memory/2026-09-07-panic-abort-outlook.md) — abort 展望（遥遥无期）：实测省 32% 体积（4.06→2.77MB），待代码足够安全成熟且需更多优势时才考虑，须配看门狗 [[panic-abort-outlook]] [[daemon-model]]
 - [release-engineering](memory/2026-09-07-release-engineering.md) — 发布工程铁则：正式发布起 GitHub 必构建指令集多版本（baseline + x86-64-v3），必然项非展望 [[release-engineering]] [[daemon-model]]
 - [aproxy-cli-skill-versioning](memory/2026-09-07-aproxy-cli-skill-versioning.md) — aproxy-cli skill（.claude/skills/）版本化策略：latest 直改小版本、大版本才留存 references/<版本>/ 每版一 compatibility；CLI/配置/行为变更必须同步更新 skill [[aproxy-cli-skill-versioning]]
+- [unix-first-test](memory/2026-09-10-unix-first-test.md) — unix 分支首次实机（Ubuntu）：看门狗曾整体失效+extern 符号名两处 P0 已修；mock Content-Length 错标教训；APROXY_RUN_DIR 平台语义待决策 [[daemon-model]] [[review-findings]]

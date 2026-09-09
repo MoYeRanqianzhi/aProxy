@@ -831,15 +831,28 @@ mod imp {
 mod imp {
     use std::time::Duration;
 
-    pub fn open_sync_handle(_pid: u32) -> Option<isize> {
-        // unix 无进程句柄对象；死亡检测退化为轮询（未实测分支，同 UDS 批处理）
-        None
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
     }
-    pub fn wait_blocking(_handle: isize) {
-        // unix 无句柄等待原语接入（未实测分支）：恒久挂起占位，
-        // 死亡检测退化为 adopt/health 轮询
+
+    /// unix 无可等待的进程句柄对象：句柄值直接存 pid，死亡等待退化为轮询。
+    /// 存 pid 而非 0 的意义：0 会被 adopt_scan 视作「句柄缺失」反复补挂。
+    pub fn open_sync_handle(pid: u32) -> Option<isize> {
+        Some(pid as isize)
+    }
+    /// 轮询进程死亡（kill(pid,0) 仅做存在性探测，不杀进程）。仅在
+    /// spawn_blocking 中调用——扫描周期由调用方健康检查兜底，此处 1s 粒度
+    /// 足够（Windows 侧为内核事件驱动，unix 无等价原语，这是设计内的退化）。
+    pub fn wait_blocking(handle: isize) {
+        let pid = handle as i32;
         loop {
-            std::thread::sleep(Duration::from_secs(3600));
+            // 进程不存在（ESRCH）或僵尸回收后即视为死亡；EPERM（无权限）
+            // 说明进程存在但非本用户，也按存活继续等
+            let r = unsafe { kill(pid, 0) };
+            if r != 0 && std::io::Error::last_os_error().raw_os_error() != Some(1) {
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(1));
         }
     }
     pub fn terminate_handle(_handle: isize) {}

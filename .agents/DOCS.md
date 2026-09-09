@@ -30,3 +30,7 @@
 - `unix-testing.md` — unix 分支首次实机测试报告（2026-09-09，Ubuntu 实机）：
   5 个 unix 专属缺陷的发现与修复、功能/并发/内存/perf/体积全套数据、
   mock 脚本教训、遗留事项清单
+- `unix-stress-review.md` — unix 分支压力实测审查报告（2026-09-10 第二轮）：
+  代码逐行审查 + 10 项压力场景实测的问题归档（S1 respawn 竞态/S2 claim 覆写/
+  S3-S6 遗留占位与多端差异），含根因链、实测证据、修复方向与探针复现指引；
+  探针资产 `.agents/bench/probe/`

@@ -13,3 +13,4 @@
 - [release-engineering](memory/2026-09-07-release-engineering.md) — 发布工程铁则：正式发布起 GitHub 必构建指令集多版本（baseline + x86-64-v3），必然项非展望 [[release-engineering]] [[daemon-model]]
 - [aproxy-cli-skill-versioning](memory/2026-09-07-aproxy-cli-skill-versioning.md) — aproxy-cli skill（.claude/skills/）版本化策略：latest 直改小版本、大版本才留存 references/<版本>/ 每版一 compatibility；CLI/配置/行为变更必须同步更新 skill [[aproxy-cli-skill-versioning]]
 - [unix-first-test](memory/2026-09-10-unix-first-test.md) — unix 分支首次实机（Ubuntu）：看门狗曾整体失效+extern 符号名两处 P0 已修；mock Content-Length 错标教训；APROXY_RUN_DIR 平台语义待决策 [[daemon-model]] [[review-findings]]
+- [unix-stress-review](memory/2026-09-10-unix-stress-review.md) — 压力实测审查第二轮：S1 respawn 竞态（list_instances_in 清理副作用误杀同表死实例，最高优先）+ S2 claim 覆写无夺权检测；挂死处决/重试语义实测全过；探针 .agents/bench/probe/ [[unix-first-test]] [[daemon-model]]

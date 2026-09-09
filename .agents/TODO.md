@@ -51,6 +51,30 @@
 - [ ] **测试基建**：看门狗测试子进程清理 RAII 化（panic 路径手写 kill 会跳过）；
   daemon.rs 的 UDS IPC roundtrip 单测（现为 Windows-only）
 
+## 待修（2026-09-10 压力实测审查轮，详录 .agents/docs/unix-stress-review.md）
+
+- [ ] **S1（产品级，两平台同病）：respawn 就绪判定竞态**——respawn A 的就绪等待
+  （每 200ms 调 list_instances_in，watchdog.rs:612）顺带删掉同注册表里 B/C 死实例的
+  .pid（daemon.rs:555 ping 失败即清理）→ B/C 死亡事件被 handle_death 误判优雅退出
+  （watchdog.rs:368 混合态判定失效）→ 永不 respawn。修复：respawn_instance 改只读
+  pid 检索 + handle_death 以 .restore 为唯一优雅退出依据。复现 p6_storm.sh。
+- [ ] **S2：refresh_claim 无条件覆写（watchdog.rs:501-513）无运行期夺权检测**——
+  被接管的前任恢复后与接管者互相翻转 claim（P7 实测 10s 内两 pid 翻转）、双看护者
+  共存。修复：refresh_claim 校验 pid 归属，被夺权安静退出；配套 unix 实装
+  terminate_verified（kill(9)，身份由 verify_claim_identity starttime 比对把关）。
+  复现 p7_takeover.sh。
+- [ ] **S3：is_aproxy_process unix 占位恒 true（watchdog.rs:1096）**——收养防冒名
+  失效（unix 会收养死条目并 respawn，Windows 拒收，多端行为差异）+ 选举可被注册表
+  死条目卡住。修复：读 /proc/<pid>/exe 比对 basename（fail-open 语义保持）。
+- [ ] **S4：health_scan 注释「无 PID 复用风险」（watchdog.rs:329-330）在 unix 不成立**
+  ——unix terminate_handle 是裸 kill(pid,9)。注释按平台区分；可选：terminate 前比对
+  starttime 加固（随 S3 一起加 Watched.starttime 字段）。
+- [ ] **S5：/dev/shm 心跳文件与 UDS socket 无退出清理**——守护死亡后残留（实测
+  cargo test 一轮留 13 个心跳文件）；socket 靠 bind 前自愈。修复：unix 守护退出路径
+  删除两文件，或看护者摘除时顺带清。
+- [ ] **S6：macOS 回退分支对 zombie 失效（watchdog.rs:862-876）**——kill(pid,0) 对
+  zombie 返回成功 → watcher 永不触发；注释补声明，靠 health_scan 兜底。
+
 ## 中期功能（对齐「无限重试、不中断」使命）
 
 - [ ] **正式发布：GitHub 构建指令集多版本**（必然项，2026-09-07 定调）：CI 矩阵 baseline + `RUSTFLAGS="-C target-cpu=x86-64-v3"`（AVX2），产物命名区分，发布页两者都放；详见 memory/release-engineering

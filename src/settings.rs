@@ -568,12 +568,28 @@ mod tests {
         let s = Settings::default();
         let dirs = effective_config_dirs(&s);
         assert_eq!(dirs.len(), 2);
-        // 重复添加默认目录 → 静默去重不报错；分隔符/大小写变体也去重
+        // 重复添加默认目录 → 静默去重不报错；分隔符变体也去重
         let mut s = Settings::default();
         let root = crate::config::config_dir().display().to_string();
-        s.config_dirs = vec![root.clone(), root.replace('\\', "/").to_uppercase()];
+        s.config_dirs = vec![root.clone(), root.replace('\\', "/")];
         let dirs = effective_config_dirs(&s);
         assert_eq!(dirs.len(), 2, "重复/变体写法应去重: {dirs:?}");
+    }
+
+    // 大小写变体去重只在 Windows 成立（文件系统大小写不敏感，path_match_key
+    // 才做 lowercase 归一）；Linux 上 /ROOT 与 /root 是不同目录，去重反而错误
+    #[cfg(windows)]
+    #[test]
+    fn effective_config_dirs_dedupes_case_variants_on_windows() {
+        let mut s = Settings::default();
+        let root = crate::config::config_dir().display().to_string();
+        s.config_dirs = vec![root.to_uppercase()];
+        let dirs = effective_config_dirs(&s);
+        assert_eq!(
+            dirs.len(),
+            2,
+            "大小写变体也应去重（Windows 语义）: {dirs:?}"
+        );
     }
 
     #[test]

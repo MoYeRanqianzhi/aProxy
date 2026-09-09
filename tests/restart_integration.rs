@@ -76,7 +76,6 @@ fn spawn_daemon(
 // 1. 改端口后 restart：误报回归——就绪判定按新 pid 定位
 // ---------------------------------------------------------------------------
 #[test]
-#[cfg(windows)]
 fn restart_after_port_change_reports_new_port() {
     let port_a = restart_test_port(20);
     let port_b = restart_test_port(21);
@@ -161,7 +160,6 @@ fn restart_after_port_change_reports_new_port() {
 // 2. restart 未启动的端口：只重启不启动语义——提示未运行并退出 1
 // ---------------------------------------------------------------------------
 #[test]
-#[cfg(windows)]
 fn restart_not_running_port_fails() {
     let port = restart_test_port(22);
     let dir = tempfile::tempdir().unwrap();

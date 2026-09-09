@@ -829,6 +829,8 @@ mod imp {
 
 #[cfg(unix)]
 mod imp {
+    use std::time::Duration;
+
     pub fn open_sync_handle(_pid: u32) -> Option<isize> {
         // unix 无进程句柄对象；死亡检测退化为轮询（未实测分支，同 UDS 批处理）
         None
@@ -1153,7 +1155,6 @@ mod tests {
         assert!(n.contains("aproxy-heart"), "{n}");
     }
 
-    #[cfg(windows)]
     #[test]
     fn heartbeat_write_and_read_same_process() {
         // 同进程内写读往返：节创建 → beat → 读取值非 0 且随时间推进增长。

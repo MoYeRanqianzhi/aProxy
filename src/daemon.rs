@@ -185,9 +185,16 @@ pub async fn ipc_ping(port: &str) -> Result<InstanceInfo, String> {
 
 /// 发送 IPC 请求并等待响应（3 秒超时）。
 pub async fn ipc_request(port: &str, req: &IpcRequest) -> Result<IpcResponse, String> {
-    let endpoint = endpoint_for(port);
+    ipc_request_to(&endpoint_for(port), req).await
+}
+
+/// 按显式端点发送 IPC 请求并等待响应（3 秒超时）。
+/// 供绕过 `endpoint_for` 解析的场景使用：unix 的 UDS 路径在 run_dir 里，
+/// 守护以隔离 `APROXY_RUN_DIR` 运行时，同进程的库调用方（测试）须按守护
+/// 实际的 socket 路径寻址；Windows 管道名全局唯一，不受 run_dir 影响。
+pub async fn ipc_request_to(endpoint: &str, req: &IpcRequest) -> Result<IpcResponse, String> {
     let req_line = serde_json::to_string(req).expect("序列化 IPC 请求失败");
-    let fut = imp::exchange(&endpoint, &req_line);
+    let fut = imp::exchange(endpoint, &req_line);
     match tokio::time::timeout(Duration::from_secs(3), fut).await {
         Ok(Ok(line)) => {
             serde_json::from_str(&line).map_err(|e| format!("{endpoint}: 响应解析失败 {e}"))
@@ -867,7 +874,9 @@ mod imp {
 
     /// 强制终止（--force）：SIGKILL（unix 无镜像名 API，靠 claim/探活上层验证）
     pub fn terminate_process(pid: u32) -> Result<(), String> {
-        let r = unsafe { libc_kill(pid as i32, 9) };
+        // 裸 extern 声明直接指向 libc 的 kill(2) 符号（unix 分支不引 libc crate，
+        // Windows 下整个 imp 模块被 cfg 排除，符号只在 unix 链接）
+        let r = unsafe { kill(pid as i32, 9) };
         if r == 0 {
             Ok(())
         } else {
@@ -879,7 +888,7 @@ mod imp {
     }
 
     unsafe extern "C" {
-        fn libc_kill(pid: i32, sig: i32) -> i32;
+        fn kill(pid: i32, sig: i32) -> i32;
     }
 
     pub async fn exchange(endpoint: &str, req_line: &str) -> Result<String, String> {
@@ -922,6 +931,9 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 唯一消费者是下方 cfg(windows) 的 IPC roundtrip 测试（unix 分支的
+    // UDS roundtrip 测试尚未编写）
+    #[cfg(windows)]
     use std::sync::atomic::Ordering;
 
     fn sample_info(port: &str) -> InstanceInfo {

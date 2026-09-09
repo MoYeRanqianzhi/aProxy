@@ -32,15 +32,25 @@
 - 安装二进制唯一管辖位置：`~/.aproxy/bin/aproxy.exe`。
 - 旧二进制：`~/.aproxy/bin/aproxy.exe.old-<旧版本>`（只保留最近 1 份——
   连续升级互相覆盖，更早版本走 GitHub Releases 随时可取）。
-- 备料区：`~/.aproxy/staging/<目标版本>/`（与 bin 同卷，rename 原子性前提）。
+- 备料区：`~/.aproxy/staging/<目标版本>/`（与 bin 同在 APROXY_HOME 下——
+  rename 原子性的同卷前提；staging 文件保留至 done/abort 才清理，它是
+  swapping 中断的恢复源，见下文专节）。
+- **状态文件放 run/ 下**（用户定调 2026-09-09：根目录只放长期稳定件，
+  状态类文件进子目录防混乱）：`~/.aproxy/run/install.state.json`——自动
+  享受 APROXY_RUN_DIR 重定向（测试隔离白送），run/ 本身在主目录下跨重启
+  稳定，断电恢复语义不受影响。
 - **管辖检查**（安装前）：枚举运行实例的进程镜像路径（QueryFullProcessImageNameW），
-  任何实例的 exe 不在 `~/.aproxy/bin/` 下 → 拒绝安装并提示「该实例由
-  <包管理器> 管理，请用对应渠道升级」。零实例时跳过检查。
+  任何实例的 exe 不在 `~/.aproxy/bin/` 下 → 拒绝安装并提示两条出路：
+  对应包管理器渠道升级，或 **`aproxy install --adopt`**。
+- **`--adopt`（收编，用户定调：显式执行，绝不自动）**：包管理器安装的
+  aProxy 迁移到标准位置——把当前运行 exe 自身作为 `--from` 源复制进
+  staging，走完整标准流水线（swap → 滚动重启实例）落到 `~/.aproxy/bin/`。
+  之后升级由 install 自管；包管理器那份闲置（提示可自行 uninstall）。
+  复用 `--from` 流水线，实现成本 ≈ 一个标志。
 
 ## 状态文件（安装的真相源 + 安装锁）
 
-`~/.aproxy/install.state.json`（与 bin 同级的持久区，**不放 run/**——run/
-是运行时目录且被 APROXY_RUN_DIR 重定向，断电恢复需要跨重启的稳定位置）。
+`~/.aproxy/run/install.state.json`（见上节——run/ 子目录 + 重定向友好）。
 
 ```json
 {
@@ -80,6 +90,34 @@ marking → downloading → downloaded → broadcasting → acked
 | verifying | 全实例 ping：version==target && swap_phase==false | 前置 verifying，通过后置 cleaning |
 | cleaning | 删 .old（被锁则保留待下次启动 cleanup 例行重试，绝不强杀） | 删除成功置 done |
 
+### swapping 极端情况专节（用户定调：最要命的失败态）
+
+正常路径 rename 旧→落位新是**毫秒级**两步（同卷 rename 原子）；但两步之间
+崩溃 = bin 目录只剩 `.old`、`aproxy.exe` 不存在——**所有 aproxy 指令无处可
+落**（二进制没了，status/stop/install 全都调不出来），重启后也无法自愈。
+
+三层防线：
+
+1. **预防（主防线）**：交换顺序设计为「bin 永不空窗」——**先落新、后改名旧**：
+   staging 新 exe rename 到 bin 时路径已被旧 exe 占用，不可行；改为
+   **copy 新 exe 到 bin 下的临时名（aproxy.exe.new，不占锁）→ rename 旧
+   exe → rename .new → aproxy.exe**，两步 rename 之间窗口从「整个文件
+   落位」缩到一次系统调用；`.new` 的存在本身就是「swapping 进行中」的标记。
+2. **检测**：入口检测（见恢复节）发现 swapping 中断 → 无论手动修复还是
+   --resume，路径都成立（staging 完整在盘）。
+3. **兜底（手动修复指南，skill 专节）**：一切 CLI 失效时的 agent 手动步骤
+   （全部是文件操作，不需要 aproxy 二进制可用）：
+   - `~/.aproxy/staging/<版本>/aproxy.exe` 仍在 → **复制**到
+     `~/.aproxy/bin/aproxy.exe`（Windows copy 对 .new 无锁——它没在运行）；
+   - staging 也没了（极端中的极端）→ `bin/aproxy.exe.old-<版本>` 直接改名
+     回 `aproxy.exe`（旧版本可用 > 没有版本），再跑 `aproxy install` 重来；
+   - 两者皆失 → 从 GitHub Releases 重新下载或 `--from` 任意可用二进制。
+   恢复后 `install --resume`/`--abort` 清理状态文件。
+
+注：防线 1 的 copy+双 rename 使「bin 完全不存在二进制」只能发生在
+copy+rename(旧) 之间约一次系统调用的窗口，且即使发生，手动修复的三个
+退路全部成立——该状态**永远可恢复**，只是可能需要人工。
+
 无实例快路径：broadcasting/relaying 直接跳过（restarting 为空）。
 
 ## 断电恢复矩阵（核心交付物——每行都必须有集成测试）
@@ -89,7 +127,7 @@ marking → downloading → downloaded → broadcasting → acked
 | marking 后 | 状态文件在，staging 空 | 残留判定 → 提示 --resume/--abort；无实际影响 | 无 |
 | downloading 中 | staging 有半截文件 | 删半截重下（--resume）或 --abort | 无 |
 | downloaded/broadcasting | staging 完整，二进制未动 | 直接重入该阶段（幂等） | 无 |
-| **swapping 中**（rename 完、新 exe 未落位） | bin 只有 .old，staging 完整 | **关键恢复**：从 staging 重新落位 → 验证 → 续 relay | 无（实例全在跑） |
+| **swapping 中**（bin 空窗：旧已改名、新未落位） | bin 只有 .old（可能还有 .new），staging 完整 | **关键恢复**：从 staging 重新落位 → 验证 → 续 relay；CLI 全失效时走手动修复三退路（见 swapping 专节） | 无（实例全在跑） |
 | swapped | bin=新 exe，.old 存在 | 验证新 exe → 续 relay | 无 |
 | relaying 中 | relay 未起/已死 | 重新 spawn relay（幂等，读同一状态文件） | 无 |
 | restarting 中 | 部分实例新版本 | 续滚动（跳过已就绪的） | 单实例滚动窗口内 |
@@ -198,27 +236,40 @@ Rust 工具链）。绕开编译的两条路：cargo-binstall 约定（P1 顺带
 
 ## 分步提交（每步：实现 + 测试 + clippy 零警告 + fmt + commit）
 
+0. **APROXY_HOME 全量重定向**（前置基建步，不激活 install）：settings.rs
+   集中读取 + 全部路径函数改造 + 既有测试基建迁移 + roundtrip 测试。
 1. **状态文件与状态机骨架**（lib）：schema/create_new 锁/原子重写/迁移合法性
    + 恢复矩阵表驱动单测。
-2. **staging 备料与校验**：--from 渠道（复制 + `--version` 校验）+ sha256 通用件。
-3. **交换与接力**：rename 舞 / `--version` 验证 / --relay 隐藏标志 / 回滚窗口。
+2. **staging 备料与校验**：--from 渠道（复制 + `--version` 校验）+ sha256 通用件
+   + `--adopt` 标志（复用 --from 流水线）。
+3. **交换与接力**：copy+双 rename 舞（.new 中间态）/ `--version` 验证 /
+   --relay 隐藏标志 / 回滚窗口。
 4. **IPC PrepareSwap + swap_phase**（协议 + 实例侧 + status 展示）+ ACK 收敛
    （重试/restart/abort）+ 看护者换血顺序。
 5. **滚动重启与终验清理** + 无实例快路径 + 竞态窗口防护。
 6. **入口检测与 --resume/--abort**：main.rs 活动安装提示 + 恢复矩阵全链路
-   集成测试（崩溃点注入）。
+   集成测试（崩溃点注入，含 swapping 空窗的手动修复三退路验证）。
 7. **GitHub Releases 渠道**：API 列表/下载/变体选择/sha256（P0 收尾）。
-8. **收尾**：skill 三处增补 + README + architecture.md 节 + TODO 收口。
+8. **收尾**：skill 三处增补（含手动更新兜底 + swapping 手动修复指南）+
+   README + architecture.md 节 + TODO 收口。
    （P1/P2 渠道各自独立任务，不阻塞本计划验收。）
 
-## 开放问题（实现前需定夺）
+## 已定夺（原开放问题，2026-09-09 用户拍板）
 
-1. **目录重定向**：install 的落位目标是真实 `~/.aproxy/bin`——集成测试必须有
-   重定向出口。建议 `APROXY_HOME`（bin/staging/logs/spool/run 全量重定向，
-   APROXY_RUN_DIR 仍独立可覆盖）：一处环境变量惠及测试与多用户场景，代价是
-   路径推导集中重构一次。备选：仅 `APROXY_BIN_DIR`+`APROXY_STAGING_DIR`
-   （改动最小，但 logs/spool 仍真目录，测试污染残留）。
-2. **relay 存活判据**：状态文件 phase+updated_at 轮询（简单，倾向）vs 安装器
-   临时 IPC 端口（复杂）。
-3. **failed 现场保留策略**：--resume 永久可用 vs staging 只保留 N 天（倾向
-   永久保留，用户显式 --abort 才清）。
+1. **APROXY_HOME**：采纳全量重定向方案——bin/staging/logs/spool/run 全部
+   相对 APROXY_HOME（未设 = `~/.aproxy`），APROXY_RUN_DIR 仍独立可覆盖
+   （粒度优先）。路径推导集中在 settings/daemon 的既有函数改造一次；
+   集成测试从此全量隔离，logs/spool 不再有真实目录污染。
+2. **relay 存活判据**：状态文件 phase+updated_at 轮询（简单方案）。
+3. **failed 现场保留**：staging 永久保留，用户显式 --abort 才清理。
+
+## APROXY_HOME 的影响面（实现注意）
+
+- 覆盖点收敛到少数函数：`settings::home_dir()`（或等价）、`daemon::run_dir/
+  logs_dir/spool 根`、`config::config_path` 默认值、install 的 bin/staging
+  推导——全部改为 `home()` 前缀拼接，APROXY_HOME 读取集中在 `settings.rs`。
+- 既有行为不变：未设环境变量 = `~/.aproxy`，用户无感知。
+- 测试基建：tests 里的 tempdir + env 注入模式不变，只是注入的是
+  APROXY_HOME（APROXY_RUN_DIR 注入继续有效，优先级：RUN_DIR > HOME 派生）。
+- install.state.json 在 run/ 下：测试注入 HOME 后状态文件自动隔离，无需
+  额外处理。

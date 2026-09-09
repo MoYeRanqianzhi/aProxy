@@ -468,18 +468,22 @@ cargo-binstall → cargo，可配 url 模板通道），产物差异仅两点：
 - settings.json `skill_auto_update = false` 时主流程完全跳过 skill 任务
   （status=skipped）。
 
-## 渠道矩阵（全部配置，按期上线；零经济成本，开源无顾虑）
+## 渠道矩阵（用户定调 2026-09-10：**P0 全部一次性完成，不留缺漏**；零经济成本，开源无顾虑）
+
+默认下载链条（github → npm → cargo-binstall → cargo）的四级渠道必须与
+install 本体同期全配——链条若指向不存在的渠道就是死路。发布 workflow
+（tag 触发）同步包含 crates.io publish 与 npm publish。
 
 | 渠道 | 形态 | 期 |
 |---|---|---|
-| `--from <路径>` | 安装器内置（流水线收敛点，今天可用） | **P0** |
-| GitHub Releases | API 拉取 + sha256 + AVX2 变体选择 | **P0**（硬依赖：CI 产物规范） |
-| `install.ps1` / `install.sh` | 引导脚本（irm \| iex）：首次安装到 ~/.aproxy/bin；检测到已安装则指路 `aproxy install` | P1 |
-| cargo（crates.io） | `cargo install aproxy --root ~/.aproxy`（产物恰落规范位置）——**源码本地编译**，编译经 staging 交换，绝不直写锁定 exe | P1 |
-| cargo-binstall | Cargo.toml `[package.metadata.binstall]` 模板指向 GH 资产，零成本顺带预编译能力 | P1 |
-| npm | 主包 + optionalDependencies 平台包（esbuild 模式）；postinstall 从已装平台包**复制**（非网络下载）到 ~/.aproxy/bin（unix 侧复制后 chmod 755） | P2 |
-| Scoop bucket / winget-pkgs PR / Chocolatey（Windows） | manifest 指向 GH Releases；管辖外目录 → install 拒绝换血并指路 | P2 |
-| Homebrew tap（macOS/Linux）/ AUR（Arch） | formula/PKGBUILD 指向 GH Releases；管辖外目录 → install 拒绝换血并指路（同 Windows 包管理器边界规则） | P2 |
+| `--from <路径>` | 安装器内置（流水线收敛点） | **P0** |
+| GitHub Releases | API 拉取 + sha256 + AVX2 变体选择（workflow 已就绪） | **P0** |
+| npm | 主包（附 skill）+ optionalDependencies 平台包（esbuild 模式，包名暂定 `@moyeranqianzhi/aproxy`，发布前定稿）；postinstall 从已装平台包**复制**（非网络下载）到 ~/.aproxy/bin（unix 侧复制后 chmod 755）；tag 触发 npm publish 进 release workflow | **P0** |
+| cargo（crates.io） | `cargo install aproxy --root ~/.aproxy`（产物恰落规范位置）——**源码本地编译**，编译经 staging 交换，绝不直写锁定 exe；crate 内打包 skill（include）；tag 触发 cargo publish 进 release workflow；crates.io 名称可用性需首跑验证 | **P0** |
+| cargo-binstall | Cargo.toml `[package.metadata.binstall]` 模板指向 GH 资产（无需独立发布动作，随 crate 元数据生效） | **P0** |
+| `install.ps1` / `install.sh` | 引导脚本（irm \| iex）：首次安装到 ~/.aproxy/bin；检测到已安装则指路 `aproxy install` | **P0** |
+| Scoop bucket / winget-pkgs PR / Chocolatey（Windows） | manifest 指向 GH Releases；管辖外目录 → install 拒绝换血并指路 | 发布后即配（不砍） |
+| Homebrew tap（macOS/Linux）/ AUR（Arch） | formula/PKGBUILD 指向 GH Releases；管辖外目录 → install 拒绝换血并指路（同 Windows 包管理器边界规则） | 发布后即配（不砍） |
 
 bootstrap 脚本与包管理器 = **首装渠道**；装机后的升级一律 `aproxy install` 自管。
 npm/cargo 渠道发布产物**附带 skill 文件**（postinstall/cargo 装完复制到
@@ -559,10 +563,13 @@ Rust 工具链）。绕开编译的两条路：cargo-binstall 约定（P1 顺带
    `download_chain` 严格数组 + url 模板通道）+ GitHub API 列表/下载/变体
    选择/sha256 + **下载代理分离**（download_proxy/--download-proxy + 打码）
    + npm 通道（registry HTTP 直拉 + 跟随 ~/.npmrc）。
-8. **skill 更新支线**：共用链条的 skill 产物路径（aproxy-skills.zip/单包）
+8. **skill 更新支线 + 剩余通道**：共用链条的 skill 产物路径（aproxy-skills.zip/单包）
    + 并行任务 + 子状态 + 落位替换 + --no-skills/--skills-only + settings
    `skill_auto_update` + cargo/binstall 通道（binstall 模板解析、cargo
-   build + crate 内 skill 提取；测试用本地 mock registry/服务器）。
+   build + crate 内 skill 提取）+ 引导脚本 install.ps1/install.sh +
+   **发布扩展**：release workflow 增 crates.io publish 与 npm publish
+   job（包结构与 binstall 元数据/Cargo.toml include 定稿随本步落地；
+   测试用本地 mock registry/服务器）。
 9. **收尾**：skill 文档增补（含手动更新兜底 + swapping 手动修复指南 +
    skill 更新节 + 下载链条节 + 下载代理节）+ README + architecture.md 节
    + TODO 收口。

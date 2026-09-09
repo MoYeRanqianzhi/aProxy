@@ -29,12 +29,15 @@
 
 ## 规范位置与管辖边界
 
-- 安装二进制唯一管辖位置：`~/.aproxy/bin/aproxy.exe`。
+- 安装二进制唯一管辖位置：`~/.aproxy/bin/aproxy.exe`（unix 为 `aproxy`，
+  无 exe 后缀；下文以 Windows 形式书写，unix 对应替换）。
 - 旧二进制：`~/.aproxy/bin/aproxy.old.exe`（固定名——保持 exe 后缀使其可
   作为 fallback 执行目标，见 swapping 专节防线 0；只保留最近 1 份，连续
   升级互相覆盖，更早版本走 GitHub Releases 随时可取；cleaning 终验后才删）。
+  **仅 Windows 创建**；unix 无 .old（跨平台对照表）。
 - 常驻入口脚本：`bin/aproxy.bat` + `bin/aproxy`（无后缀 sh）——安全中间态
-  fallback，见 swapping 专节。
+  fallback，见 swapping 专节。**仅 Windows 创建**（unix 无空窗需求；
+  unix 的无后缀 `aproxy` 本身就是二进制）。
 - 备料区：`~/.aproxy/staging/<目标版本>/`（与 bin 同在 APROXY_HOME 下——
   rename 原子性的同卷前提；staging 文件保留至 done/abort 才清理，它是
   swapping 中断的恢复源，见下文专节）。
@@ -96,6 +99,10 @@ marking → downloading → downloaded → broadcasting → acked
 | cleaning | 删 `aproxy.old.exe`（被锁则保留待下次启动 cleanup 例行重试，绝不强杀）；入口脚本常驻不删 | 删除成功置 done |
 
 ### swapping 极端情况专节（用户定调：最要命的失败态）
+
+> 本节主要讨论 Windows。unix 单步 rename 原子覆盖**无此失败态**（见
+> 「跨平台文件交换对照」表）——空窗/fallback/`.old`/接力全是 Windows 特有
+> 复杂度，unix 分支天然豁免。
 
 正常路径 rename 旧→落位新是**毫秒级**两步（同卷 rename 原子）；但两步之间
 崩溃 = bin 目录只剩 `.old`、`aproxy.exe` 不存在——**所有 aproxy 指令无处可
@@ -223,7 +230,9 @@ cleaning 清掉 `.old` 与状态文件即 done——状态文件删除 = 安装�
    收敛到同一目标态（新版本实例就绪），worst case 双 spawn 端口冲突后者
    退出，无死锁。
 2. **install 进程保活（仅安装态）**：节在但心跳过期（install 挂死）→
-   拉起 `install --continue` 续作。常态不看护 install（零浪费）。
+   拉起 `install --continue` 续作。常态不看护 install（零浪费）。unix 注：
+   残留节文件（install 崩溃未 unlink）与挂死区分**正靠心跳过期**——节在、
+   心跳旧 = 拉起续作，与 Windows 同一判定路径（介质差异不影响语义）。
 3. **守护自检补种抑制**（联动发现的关键点）：守护 5 分钟自检读到有效
    宣告 → **跳过补种**。否则 restarting 窗口内旧守护（尚为旧版本）会补种
    旧看护者 → 误判滚动重启为崩溃 → 用旧二进制重拉 → 与 install 拉锯
@@ -270,6 +279,10 @@ install 启动（marking 后）创建宣告节 → 广播前停旧看护者（�
   宣告节第 3 条）——补种时序与宣告生命周期严格咬合。
 - relaying 之后由新二进制 `ensure_watchdog_if_enabled` 重新出簇（既有逻辑
   复用）；新看护者启动检查宣告节不存在（install 已结束）→ 常态行为。
+- **unix 无此环节**（用户要求全平台决策）：旧看护者的 `current_exe()` 返回
+  路径字符串，exec 时按路径重新解析——swap 后自动拿到**新二进制**，换血/
+  自检抑制对旧看护者都无必要；看护者保持运行，宣告节照常创建（守护自检
+  抑制逻辑 unix 同样实现——统一行为，减少分支）。
 
 ## 接力协议（Windows 无 exec 的替代）
 
@@ -280,6 +293,31 @@ install 启动（marking 后）创建宣告节 → 广播前停旧看护者（�
 - 回滚窗口说明：swapped 之前均可完全回滚（rename 回去——运行中的旧安装进程
   自身 image 允许再次 rename）；实例开始重启后只进不退（forward-fix：继续
   用新 exe 重启）。
+- **unix 简化**：swap 即「新文件落位、旧 inode 挂起」，安装进程本体不受
+  影响——**不需要接力**（继续跑的进程就是新二进制路径的持有者，直接续跑
+  剩余阶段）；Windows 才需要 spawn --continue 换镜像。状态机 relaying 阶段
+  unix 直接跳过（同无实例快路径的跳法）。
+
+## 跨平台文件交换对照（用户要求全平台决策——两套语义一处对照）
+
+| 环节 | Windows | unix (Linux/macOS) |
+|---|---|---|
+| 运行中二进制的锁 | 镜像锁：禁写/删/覆盖，**允许 rename** | 只锁 inode：**允许 rename 覆盖与 unlink**，禁就地写（ETXTBSY） |
+| swap 动作 | copy→.new → rename 旧→.old → rename .new→aproxy.exe（防空窗双 rename） | **单步 rename**（staging 临时文件 → bin/aproxy.exe 原子覆盖；旧 inode 由运行中进程挂着，自动消亡） |
+| bin 空窗 | 理论存在（一次系统调用窗），四层防线 | **不存在**（rename 原子覆盖，无中间态） |
+| `.old` 二进制 | 必须保留（fallback 目标 + swapping 中断恢复源） | **不需要**（旧 inode 天然挂在活进程上；崩溃恢复直接用 staging 或重装；不创建） |
+| fallback 入口脚本 | aproxy.bat + 无后缀 aproxy（PATHEXT 机制） | **不创建**（无空窗即无 fallback 需求；install.sh bootstrap 首装除外） |
+| 安装进程镜像 | 旧 exe rename 后 current_exe 指向 .old，**需接力**（spawn --continue） | 路径不变（内容已被覆盖为新文件），**无需接力**（直接续跑） |
+| 看护者换血 | 必须停旧（respawn 用 .old 旧镜像） | **不需要**（exec 按路径解析自动新二进制）；保持运行 |
+| cleaning 删 .old | 可能被锁（终验后仍有引用）→ 重试 | 不适用（无 .old）；staging 目录直接 rm -rf，永不失败 |
+| 可执行位 | N/A | **下载/复制后必须 chmod 755**（GitHub tarball/staging 复制均要；`--from` 校验前先 chmod，否则 `--version` 试跑失败） |
+| 宣告节介质 | `Local\aproxy-install` 命名节（进程死节消失，天然自清） | `/dev/shm/aproxy-install`（**持久文件，进程死不消失**）——宣告解除 = 心跳过期判定 + install 正常结束**主动 unlink**（done/abort 路径）；崩溃残留靠心跳过期自然失效 |
+| swapping 中断恢复 | staging 重新落位（四层防线） | rename 前中断 = 原文件完好（无任何改变）；rename 后中断 = 新文件已就位——**两态都无需修复**，--continue 直接续跑 |
+
+设计原则：**状态机/IPC/恢复/滚动重启全部平台无关**（一套代码）；平台分支
+只存在于「交换原语」「宣告节介质」「可执行位」三个收口点（各一个
+cfg/函数级分支，复用现有 imp 模块模式）。CI ubuntu/macos check + TODO 的
+unix 实测项覆盖此面。
 
 ## 版本与变体
 
@@ -302,8 +340,9 @@ install 启动（marking 后）创建宣告节 → 广播前停旧看护者（�
 | `install.ps1` / `install.sh` | 引导脚本（irm \| iex）：首次安装到 ~/.aproxy/bin；检测到已安装则指路 `aproxy install` | P1 |
 | cargo（crates.io） | `cargo install aproxy --root ~/.aproxy`（产物恰落规范位置）——**源码本地编译**，编译经 staging 交换，绝不直写锁定 exe | P1 |
 | cargo-binstall | Cargo.toml `[package.metadata.binstall]` 模板指向 GH 资产，零成本顺带预编译能力 | P1 |
-| npm | 主包 + optionalDependencies 平台包（esbuild 模式）；postinstall 从已装平台包**复制**（非网络下载）到 ~/.aproxy/bin | P2 |
-| Scoop bucket / winget-pkgs PR / Chocolatey | manifest 指向 GH Releases；管辖外目录 → install 拒绝换血并指路 | P2 |
+| npm | 主包 + optionalDependencies 平台包（esbuild 模式）；postinstall 从已装平台包**复制**（非网络下载）到 ~/.aproxy/bin（unix 侧复制后 chmod 755） | P2 |
+| Scoop bucket / winget-pkgs PR / Chocolatey（Windows） | manifest 指向 GH Releases；管辖外目录 → install 拒绝换血并指路 | P2 |
+| Homebrew tap（macOS/Linux）/ AUR（Arch） | formula/PKGBUILD 指向 GH Releases；管辖外目录 → install 拒绝换血并指路（同 Windows 包管理器边界规则） | P2 |
 
 bootstrap 脚本与包管理器 = **首装渠道**；装机后的升级一律 `aproxy install` 自管。
 
@@ -345,6 +384,9 @@ Rust 工具链）。绕开编译的两条路：cargo-binstall 约定（P1 顺带
   kill install 进程 → 看护者保活拉起 --continue、守护自检在宣告有效时不
   补种、install 结束后自检恢复出簇。
 - Windows 专属：rename 锁定 exe 语义（已有实证）/ .old 被锁时 cleaning 重试。
+- **unix 专属**（CI check 覆盖编译面，行为面入 TODO 实测项）：单步 rename
+  swap / chmod 755 / /dev/shm 宣告残留的心跳过期失效 + 正常结束 unlink /
+  relaying 跳过 / 无 .old 分支。
 
 ## 分步提交（每步：实现 + 测试 + clippy 零警告 + fmt + commit）
 
@@ -352,10 +394,12 @@ Rust 工具链）。绕开编译的两条路：cargo-binstall 约定（P1 顺带
    集中读取 + 全部路径函数改造 + 既有测试基建迁移 + roundtrip 测试。
 1. **状态文件与状态机骨架**（lib）：schema/create_new 锁/原子重写/迁移合法性
    + 恢复矩阵表驱动单测。
-2. **staging 备料与校验**：--from 渠道（复制 + `--version` 校验）+ sha256 通用件
-   + `--adopt` 标志（复用 --from 流水线）。
-3. **交换与接力**：copy+双 rename 舞（.new 中间态）/ `--version` 验证 /
-   --continue 续跑模式（=relay/恢复统一入口）/ 回滚窗口。
+2. **staging 备料与校验**：--from 渠道（复制 + `--version` 校验 + unix chmod
+   755）+ sha256 通用件 + `--adopt` 标志（复用 --from 流水线）。
+3. **交换原语与接力**（平台收口点，见跨平台对照表）：Windows copy+双 rename
+   舞（.new 中间态/.old/fallback 脚本 ensure）/ unix 单步 rename 覆盖（无
+   .old 无脚本）/ `--version` 验证 / --continue 续跑模式（Windows 换镜像
+   接力，unix 直接续跑）/ 回滚窗口。
 4. **IPC PrepareSwap + swap_phase**（协议 + 实例侧 + status 展示）+ ACK 收敛
    （重试/restart/abort）+ 看护者换血顺序 + **安装态宣告节**（共享内存心跳
    介质）+ 看护者差异化行为（死亡多次复查/install 保活/守护自检抑制）+

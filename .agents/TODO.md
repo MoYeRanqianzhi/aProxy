@@ -76,15 +76,17 @@
 
 ## 修复审查轮遗留（2026-09-10，独立复验后记录，详录 .agents/docs/unix-stress-review.md 复验节）
 
-- [ ] **R1（测试覆盖）**：修复未配单元测试——registry_contains_pid_in 与
-  is_aproxy_process unix 版三档判定（ENOENT 判死 / `(deleted)` 剥离 / fail-open）
-  纯函数分支可低成本补单测；当前靠实机探针覆盖，强度足够
-- [ ] **R2（探针维护）**：p7_takeover.sh「unix no-op 未杀」文案按旧行为写
-  （断言兼容新行为，5/5 可复跑）；下次触碰时更新文案并追加「接管即杀前任后
-  SIGCONT 不可恢复」断言
+- [x] **R1（测试覆盖）→ 已补（75afe6b）**：registry_contains_pid_in 四分支 +
+  is_aproxy_process unix 版真实 zombie/ENOENT 判死单测 + 正名成功路径集成断言 +
+  swap 覆盖替换 (deleted) 语义集成测试（unix）。实测纠正：rename 走开（mv）不产生
+  「 (deleted)」后缀（exe 跟随新路径名）；fail-open 分支无法确定性构造，留人工路径。
+- [x] **R2（探针维护）→ 已修（75afe6b）**：p7_takeover.sh 文案与断言对齐修复后
+  语义（接管即杀前任 SIGCONT 不可恢复 / 接管者在任 / claim 单一 pid 三条硬断言），
+  复跑 PASS=7 FAIL=0
 - [ ] **F2（产品决策）：is_aproxy_process 二进制名精确耦合**——改名运行的二进制
   （如生产 aproxy-using.exe 部署形态）被判非 aProxy 进程：不被收养（失去看门狗
-  自动恢复）、不计入选举、处决被关卡拒绝（防误杀方向正确）、claim 接管不杀前任。
+  自动恢复，remote 实证：改名副本运行时看护者收养日志 0 条）、不计入选举、
+  处决被关卡拒绝（防误杀方向正确）、claim 接管不杀前任。
   Windows 侧 merge-base 前已有语义，unix 实装后两端一致。待决策：接受「改名
   二进制不受看护」为约定，或放宽比对（会同时削弱防冒名闸门）
 

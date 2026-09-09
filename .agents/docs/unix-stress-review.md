@@ -36,15 +36,25 @@
   P6 死亡风暴修复前 3/5 → **5/5**（S1）、P7 修复前 claim 双 pid 翻转 →
   **5/5，前任被真杀（A=0 B=1）、claim 单一 pid**（S2）。
 
-### 复验遗留小项（不阻断合并，供后续窗口）
+### 复验遗留小项（不阻断合并，供后续窗口）——R1/R2 已关闭（75afe6b）
 
-- **R1（测试覆盖）**：修复未配单元测试。`registry_contains_pid_in`（解析失败
-  跳过、目录缺失返 false）与 `is_aproxy_process` unix 版的三档判定
-  （ENOENT 判死 / `(deleted)` 后缀剥离 / 非 ENOENT fail-open）纯函数分支
-  可低成本补单测；当前核心验证靠实机探针（p6/p7）覆盖真实进程语义，强度足够。
-- **R2（探针资产维护）**：p7_takeover.sh 的「unix no-op 未杀」文案按旧行为写，
-  修复后行为已变，断言本身兼容新行为（5/5 可复跑）。下次触碰探针时顺手更新
-  文案，并考虑在「接管即杀前任」后追加 SIGCONT 验证 A 不可恢复的断言。
+- **R1（测试覆盖）→ 已补（75afe6b）**：`registry_contains_pid_in` 四分支
+  （pid 匹配 / 非 .pid 忽略 / 损坏记录跳过 / 目录缺失）+ `is_aproxy_process`
+  unix 版真实 zombie 判死与 pid_max 外 ENOENT 判死（cfg(unix) 单测）+
+  daemon_lifecycle 正名守护成功路径断言 + 新集成
+  `identity_check_tolerates_swapped_binary`（unix，见下）。实机全绿：
+  Windows lib 115/集成 36+2；remote lib 114/集成 37+2。
+  **实测纠正一个假设**：rename 走开（mv）运行中二进制不产生「 (deleted)」
+  后缀——exe 链接跟随新路径名（`aproxy.swapped`），basename 变化判异己；
+  「 (deleted)」仅出现在新文件 rename 原子覆盖原路径（swap 升级真实形态）
+  的场景。fail-open 分支（跨用户权限）无法确定性构造，留探针/人工路径。
+- **R2（探针资产维护）→ 已修（75afe6b）**：p7_takeover.sh 头注/文案/尾部
+  断言全部对齐修复后语义，「接管即杀前任（SIGCONT 不可恢复）/接管者在任/
+  claim 单一 pid」三条硬断言，任一不满足即 FAIL。复跑 **PASS=7 FAIL=0**。
+- **F2（产品决策，保持待决）**：事实已 remote 实证——副本改名
+  `aproxy-renamed` 运行时看护者收养日志 0 条（正名对照组有收养），改名
+  实例确实失去看门狗自动恢复。Windows 侧同语义 merge-base 前已有。
+  决策选项与权衡见下方 F2 条目。
 
 ### 新发现：S3 实装的两个行为面（需产品决策/知悉）
 

@@ -500,8 +500,22 @@ impl WatchdogState {
         self.maybe_idle_exit().await;
     }
 
-    /// claim 续写：心跳时间戳刷新（其他进程据此刻定本看护者是否在任/假死）
+    /// claim 续写：心跳时间戳刷新（其他进程据此刻定本看护者是否在任/假死）。
+    /// 覆写前先校验归属——claim 已易主（被接管者夺权）还继续双写，两个看护者
+    /// 会同时 respawn 同一实例（P7 实测 claim 内容在两 pid 间翻转的根源）。
+    /// 正常路径接管者已把前任杀掉（terminate_verified），这里只是杀失败/
+    /// 竞态窗口的确定性收尾：让位退出，claim 文件留给新任（勿动，动了会被
+    /// 新任按「心跳停滞」再次夺权）。
     fn refresh_claim(&mut self) {
+        if let Some(existing) = read_claim_in(&self.cfg.run_dir)
+            && existing.pid != std::process::id()
+        {
+            tracing::warn!(
+                claim_pid = existing.pid,
+                "claim 已被其他看护者接管，本进程让位退出"
+            );
+            std::process::exit(0);
+        }
         let claim = WatchdogClaim {
             pid: std::process::id(),
             created_at_process: process_start_time(std::process::id()).unwrap_or(0),
@@ -885,7 +899,15 @@ mod imp {
         }
     }
     pub fn close_handle(_handle: isize) {}
-    pub fn terminate_verified(_pid: u32) {}
+    /// 杀掉经身份验证的假死前任看护者：身份由调用方把关（is_aproxy_process
+    /// 的 /proc exe 比对 + verify_claim_identity 的 starttime 比对），此处
+    /// 只负责 SIGKILL。unix 上无句柄对象，直接按 pid 杀——claim 记录到被
+    /// 杀之间的复用窗口由上述双重验证封住。
+    pub fn terminate_verified(pid: u32) {
+        unsafe {
+            kill(pid as i32, 9);
+        }
+    }
 }
 
 #[cfg(windows)]

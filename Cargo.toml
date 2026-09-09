@@ -5,7 +5,7 @@ edition = "2024"
 description = "Local API proxy with infinite retries for agent workloads"
 license = "MIT"
 authors = ["aProxy Contributors"]
-repository = "https://github.com/aProxy/aProxy"
+repository = "https://github.com/MoYeRanQianZhi/aProxy"
 keywords = ["proxy", "retry", "api", "agent", "claude-code"]
 categories = ["network-programming", "web-programming"]
 

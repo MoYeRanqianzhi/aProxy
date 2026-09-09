@@ -1,9 +1,17 @@
 name: CI
 
+# 每次提交（push / PR）的全量测试与静态门槛。
+# 发布门槛（fmt/clippy/test）在 release.yml 中独立复跑——tag 可能落后 main。
+
 on:
   push:
     branches: [main, master]
   pull_request:
+
+# 同一分支的新提交取消进行中的旧跑（省 runner 时间，最新结论才有意义）
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,24 +21,27 @@ jobs:
     # 主开发平台：全量验证。零警告（-D warnings）是项目纪律。
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --verbose
 
   unix:
-    # unix 分支（UDS IPC、spawn 路径）从未实测过——至少保证可编译。
+    # unix 分支（UDS IPC、spawn 路径）从未实测过——先保证可编译。
+    # 升级为 cargo test 的前置是「unix 分支实测」（见 .agents/TODO.md）：
+    # 直接开跑大概率爆出未适配的测试（Windows 专属 #[cfg] 测试之外的
+    # 真实行为差异），先把可编译基线钉住。
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo check --all-targets

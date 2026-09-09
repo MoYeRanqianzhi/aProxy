@@ -1,0 +1,191 @@
+name: Release
+
+# tag 推送触发：全量测试门槛 → 多平台构建矩阵 → skill 打包 → GitHub Release。
+# 产物命名（文件名不带版本号，版本由 tag 承载，见 install 计划「发布资产命名」）：
+#   aproxy-<target>[-v3][.exe]  +  aproxy-skills.zip  +  aproxy-skill-<名>.zip
+#   每个资产附 .sha256
+# Release 说明自动包含「下载与更新链」说明 + SHA256 清单，
+# 变更记录由 GitHub generate_release_notes 生成，叠在自定义正文之后。
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # 发布绝不被并发取消
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    # 发布门槛：与 CI 相同的全量验证（fmt/clippy/测试），全绿才进入构建
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false # 单平台失败不连坐其他平台的产物
+      matrix:
+        include:
+          # Windows 主平台：baseline + x86-64-v3（AVX2，约 2013 年后主流 CPU；
+          # install 按 is_x86_feature_detected 自动选变体，失败回退 baseline）
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            variant: ""
+            rustflags: ""
+            ext: .exe
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            variant: "-v3"
+            rustflags: "-C target-cpu=x86-64-v3"
+            ext: .exe
+          # Linux：gnu（常规发行版）双变体 + musl（静态链接，无 glibc 环境可用；
+          # musl 不出 v3——变体组合收益低）
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            variant: ""
+            rustflags: ""
+            ext: ""
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            variant: "-v3"
+            rustflags: "-C target-cpu=x86-64-v3"
+            ext: ""
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            variant: ""
+            rustflags: ""
+            ext: ""
+            musl: true
+          # macOS：Apple Silicon 原生 + Intel 交叉编译（arm runner 可交叉出 x86_64）
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            variant: ""
+            rustflags: ""
+            ext: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            variant: ""
+            rustflags: ""
+            ext: ""
+    name: build (${{ matrix.target }}${{ matrix.variant }})
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      # musl 目标的 ring（rustls-tls）要编 C 代码，需要 musl-gcc 工具链
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # RUSTFLAGS 参与 rust-cache 的缓存键——变体间缓存互不污染
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: ${{ matrix.target }}${{ matrix.variant }}
+      - name: Build
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Stage asset
+        shell: pwsh
+        env:
+          ASSET: aproxy-${{ matrix.target }}${{ matrix.variant }}${{ matrix.ext }}
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/aproxy${{ matrix.ext }}" "dist/$env:ASSET"
+          $hash = (Get-FileHash "dist/$env:ASSET" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $env:ASSET" | Out-File -NoNewline -Encoding ascii "dist/$env:ASSET.sha256"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: bin-${{ matrix.target }}${{ matrix.variant }}
+          path: dist
+
+  skills:
+    # skill 文档打包：总包（解压得 ~/.aproxy/skills/ 内容）+ 每个 skill 单包
+    # （当前仅 aproxy-cli 一个，内容相同；未来多 skill 时单包只含各自的）。
+    # 顶层目录统一为 aproxy-cli/，解压到 ~/.aproxy/skills/ 即落位。
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Package skills
+        run: |
+          mkdir -p stage
+          cp -r .claude/skills/aproxy-cli stage/
+          cd stage
+          zip -r ../aproxy-skills.zip aproxy-cli
+          cp ../aproxy-skills.zip ../aproxy-skill-aproxy-cli.zip
+          cd ..
+          for f in aproxy-skills.zip aproxy-skill-aproxy-cli.zip; do
+            sha256sum "$f" > "$f.sha256"
+          done
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: skills
+          path: |
+            aproxy-skills.zip
+            aproxy-skills.zip.sha256
+            aproxy-skill-aproxy-cli.zip
+            aproxy-skill-aproxy-cli.zip.sha256
+
+  release:
+    needs: [build, skills]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Assemble release body（更新链 + 基础信息 + SHA256 清单）
+        run: |
+          cd artifacts
+          {
+            echo "## 下载与更新链"
+            echo ""
+            echo "\`aproxy install\` 自动按默认链条尝试：**github → npm → cargo-binstall → cargo**。"
+            echo ""
+            echo "- **GitHub（本页 assets）**：按平台选择 \`aproxy-<target>[-v3]\`；\`-v3\` 需要 AVX2（约 2013 年后的主流 x86_64 CPU），不确定就选无后缀的 baseline 版本"
+            echo "- **npm**：随 npm 渠道发布（本版本可能尚未上架，链条会自动落到下一级）"
+            echo "- **cargo-binstall**：\`cargo binstall aproxy\`（预编译，免编译）"
+            echo "- **cargo（源码编译）**：\`cargo install aproxy --root ~/.aproxy\`"
+            echo ""
+            echo "安装/升级推荐直接用 install 指令：\`aproxy install\`（自动选变体并滚动重启实例）。"
+            echo ""
+            echo "## 基础信息"
+            echo ""
+            echo "- 版本：\`${GITHUB_REF_NAME}\`"
+            echo "- 平台产物：windows / linux（gnu+musl）/ macOS（aarch64 + x86_64），x86_64 提供 baseline 与 AVX2（-v3）两种指令集变体"
+            echo "- 变更记录：见下方 Automatic release notes"
+            echo ""
+            echo "## SHA256"
+            echo ""
+            echo "| 文件 | SHA256 |"
+            echo "|---|---|"
+            for f in *.sha256; do
+              h=$(cut -d' ' -f1 "$f")
+              a=$(cut -d' ' -f2- "$f")
+              echo "| \`$a\` | \`$h\` |"
+            done
+          } > ../release_body.md
+      - name: Publish release
+        uses: softprops/action-gh-release@v3.0.3
+        with:
+          files: artifacts/*
+          body_path: release_body.md
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}

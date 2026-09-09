@@ -1,0 +1,26 @@
+name: Review
+
+# 零成本静态审查矩阵：cargo-deny（RUSTSEC 安全通告 + 许可证合规 + 依赖源可信）。
+# 每次提交跑一遍；另设每周定时——RUSTSEC 数据库是持续更新的，
+# 「旧代码 + 新漏洞」也要被抓住（这层只有 schedule 能覆盖）。
+# AI 代码审查不在此文件：GitHub Copilot code review 在仓库设置中启用
+# （PR 触发、界面配置），不引入按次计费的第三方 action。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    - cron: "0 3 * * 1" # 每周一 03:00 UTC
+
+concurrency:
+  group: review-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      # 检查维度与豁免口径见仓库根 deny.toml
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1

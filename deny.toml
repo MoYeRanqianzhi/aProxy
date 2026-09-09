@@ -1,0 +1,34 @@
+# cargo-deny 配置（review 工作流的静态审查矩阵）
+# 三维审查：advisories（RUSTSEC 安全通告）/ licenses（合规）/ sources（依赖源可信）
+# 每次提交与每周定时（RUSTSEC 数据库更新后）都会跑。
+
+# 依赖源审查：只允许 crates.io registry 依赖，禁止混入 git/路径外源——
+# 防止依赖被替换为不可信源（供应链攻击面收口）。
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+# 安全通告：有 RUSTSEC 漏洞即红灯（安装器/代理面向公网依赖，安全优先）
+[advisories]
+version = 2
+yanked = "deny"
+
+# 许可证合规：项目 MIT，依赖白名单为开源常见宽松许可集合。
+# ring 0.17（rustls-tls 依赖）的 SPDX 为 "ISC AND MIT AND OpenSSL"，
+# OpenSSL 派生代码条款在此随 ISC/MIT 一并允许。
+# 首次运行若爆出未收录许可，按实际依赖补充 allow 而不是放宽机制。
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "Zlib",
+    "MPL-2.0",
+    "OpenSSL",
+]

@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # CI 使用的 actions 版本自动跟进（本仓库铁则：actions 用最新发布版本）
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  # 依赖升级 PR 会跑完整 CI（fmt/clippy/test + cargo-deny），升级质量有门槛
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly

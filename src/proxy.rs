@@ -1046,6 +1046,19 @@ async fn proxy_without_keepalive(
     let max_backoff = state.config.max_retry_backoff_secs;
     loop {
         attempt += 1;
+        // 每轮重试开始处刷新活动时间戳：last_activity_secs 的语义是「最近一次
+        // 收到请求**或仍在处理**」——长退避（封顶默认 320s）可能超过
+        // idle_timeout_secs（默认 1800s 之内更长的自定义值更危险），不刷新的话
+        // 无限重试中的实例会被 stop idle / status --idle 误判为闲置并强退，
+        // 恰恰杀掉最需要「不中断」保障的实例（M1）。放在重试轮开头而非退避
+        // sleep 之后：退避等待期间的实例也视为活跃。
+        state.last_activity_secs.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         state
             .stats
             .retries_total
@@ -1165,6 +1178,15 @@ async fn proxy_with_keepalive(
         let max_backoff = state.config.max_retry_backoff_secs;
         loop {
             attempt += 1;
+            // 与非保活通道同款：每轮重试刷新活动时间戳（语义 = 仍在处理中），
+            // 防止无限重试中的实例被 stop idle 误判闲置强退（M1）
+            state_bg.last_activity_secs.store(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             state_bg
                 .stats
                 .retries_total

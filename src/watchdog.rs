@@ -326,8 +326,10 @@ impl WatchdogState {
         });
     }
 
-    /// 健康扫描：心跳过期者走 IPC ping 二意见，都失败判挂死 → 杀（本方句柄
-    /// 绑定原进程，无 PID 复用风险）→ 死亡事件走统一 respawn 路径。
+    /// 健康扫描：心跳过期者走 IPC ping 二意见，都失败判挂死 → 杀 → 死亡事件
+    /// 走统一 respawn 路径。杀的边界按平台：Windows 句柄绑定原进程，无 PID
+    /// 复用风险；unix 是裸 SIGKILL(pid)，处决前以 is_aproxy_process 做防误杀
+    /// 关卡（见下）——句柄语义差异由该关卡收敛到等效安全性。
     /// 返回被判挂死的端口（测试断言用）。
     pub async fn health_scan(&mut self) -> Vec<String> {
         let stale_ms = self.cfg.scan_secs * 1000 * (self.cfg.stale_after_cycles.max(1) + 1);
@@ -344,6 +346,15 @@ impl WatchdogState {
             // ping 内部还有 3 次重试判死语义）
             if crate::daemon::ipc_ping(&w.port).await.is_ok() {
                 continue; // runtime 活着（可能调度延迟），下轮再看
+            }
+            // 防误杀关卡：「主动杀」前的既定验证。pid 若被复用给无关进程，
+            // 心跳/IPC 失效的表现与「实例挂死」不可区分，但那个进程是无辜的。
+            // unix 的裸 SIGKILL 尤其依赖此关（Windows 侧为冗余的第二道验证）。
+            // 候选已死（zombie/reaped）时关卡判 false → 跳过处决，死亡事件由
+            // watcher 兜底
+            if !imp_process::is_aproxy_process(w.pid) {
+                tracing::warn!(port = %w.port, pid = w.pid, "挂死候选的 pid 已非 aProxy 进程（疑似复用），跳过处决");
+                continue;
             }
             tracing::error!(port = %w.port, pid = w.pid, "实例心跳过期且 IPC 无响应，判定挂死，终止进程");
             hung.push(w.port.clone());
@@ -1117,10 +1128,26 @@ mod imp_process {
         fields.get(19)?.parse().ok()
     }
 
-    pub fn is_aproxy_process(_pid: u32) -> bool {
-        // unix 分支未实测（TODO）；镜像名校验缺位时保守放行——选举只影响
-        // 谁发起 spawn，误判最坏结果是多个 spawn 尝试（claim 原子性兜底）
-        true
+    /// 是否 aProxy 进程：/proc/<pid>/exe 指向实际二进制，比对 basename。
+    /// 判定分三档：
+    /// - readlink 成功：比对 basename（Linux 二进制无 .exe 后缀；二进制被
+    ///   原地替换后内核附加「 (deleted)」后缀，剥除后再比——swap 升级场景下
+    ///   正在运行的进程不该因此被判定为异己）
+    /// - ENOENT：进程已死（含 zombie，exe 随地址空间一并消失）→ false。
+    ///   选举不再被注册表死条目卡住、收养不再收编死条目（与 Windows 的
+    ///   OpenProcess 失败即拒收对齐）
+    /// - 其他失败（跨用户权限等）：不可知 → 保守放行（fail-open）。误放行
+    ///   的最坏结果是多一次 spawn 尝试 / 一次有身份验证前置的杀；误拒绝则
+    ///   会让存活实例失去看护——两个方向上前者代价小得多
+    pub fn is_aproxy_process(pid: u32) -> bool {
+        match std::fs::read_link(format!("/proc/{pid}/exe")) {
+            Ok(target) => {
+                let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let name = name.strip_suffix(" (deleted)").unwrap_or(name);
+                name == "aproxy"
+            }
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        }
     }
 }
 

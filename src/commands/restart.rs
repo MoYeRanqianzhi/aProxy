@@ -30,6 +30,7 @@ pub(crate) async fn handle_restart_cmd(
 }
 
 /// 重启单个实例：捕获原始启动参数 → stop → spawn → IPC 就绪判定。
+/// 就绪判定按新 pid 定位（见循环处注释）——配置改端口后依然能正确确认。
 async fn restart_instance(info: &daemon::InstanceInfo, mode: StopMode) {
     let port = daemon::port_of(&info.listen_addr).to_string();
     let cfg_path = info.config_path.clone();
@@ -65,21 +66,35 @@ async fn restart_instance(info: &daemon::InstanceInfo, mode: StopMode) {
         }
     };
 
-    // 就绪等待 8 秒（同 start/看门狗重拉）：ping 通才算成功
+    // 就绪等待 8 秒（同 start/看门狗重拉）。判定按新 pid 在注册表定位而非
+    // ping 旧端口：restart 的用途之一就是「改了 config.toml（含换端口）后让
+    // 新配置生效」，新守护监听哪个端口由它读到的配置决定，旧端口 ping 不到
+    // 并不代表失败（实测踩坑：改端口重启误报「未就绪」而实例已在新端口运行）。
+    // pid 来自 spawn 返回值，唯一可靠锚点；顺带覆盖 --listen 0（系统分配端口）
+    // 的场景。用 list_instances_in 而非 list_instances：后者附带孤儿日志清理，
+    // 在 APROXY_RUN_DIR 重定向场景（测试/多主目录）live 清单与真实 logs 目录
+    // 不一致，会把用户实例的日志误判为孤儿删除。
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     loop {
-        if let Ok(new_info) = daemon::ipc_ping(&port).await {
-            println!("已重启（端口 {port}）");
+        if let Some(new_info) = daemon::list_instances_in(&daemon::run_dir())
+            .await
+            .into_iter()
+            .find(|i| i.pid == new_pid)
+        {
+            let new_port = daemon::port_of(&new_info.listen_addr).to_string();
+            println!("已重启（端口 {new_port}）");
             println!("  pid: {}（旧 pid {}）", new_info.pid, info.pid);
             println!("  监听: http://{}", new_info.listen_addr);
             return;
         }
         if std::time::Instant::now() > deadline {
-            let startup_log = daemon::logs_dir().join("startup.log");
+            // 端口可能已变（配置改动），旧端口拼出的日志路径不可靠——指向
+            // startup.log（bind/配置错误原因落盘处）与 logs 目录两处
             eprintln!(
-                "重启后实例（pid {new_pid}）未在预期时间内就绪（端口 {port}），原因通常记录在:"
+                "重启后实例（pid {new_pid}）未在预期时间内就绪（配置 {cfg_path}），原因通常记录在:"
             );
-            eprintln!("  {}", startup_log.display());
+            eprintln!("  {}", daemon::logs_dir().join("startup.log").display());
+            eprintln!("  {}", daemon::logs_dir().display());
             std::process::exit(1);
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

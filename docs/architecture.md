@@ -25,7 +25,7 @@ agent 软件 ──HTTP──▶ [代理端口 12345] ──重试循环──�
 |---|---|
 | `src/main.rs` | 进程入口：控制台代码页、配置文件定位、日志初始化、子命令分派（仅 ~110 行） |
 | `src/cli.rs` | clap 命令树定义（`Cli`/`Commands`/`AliasCmd`/`ConfigArgs`），只承载定义不含逻辑 |
-| `src/commands/` | 九个子命令各自一文件（start/status/stop/restore/alias/doctor/find/logs/config），共享 target 解析在 `mod.rs` |
+| `src/commands/` | 十个子命令各自一文件（start/status/stop/restart/restore/alias/doctor/find/logs/config），共享 target 解析在 `mod.rs` |
 | `src/server.rs` | 服务承载：`serve_forever` 主循环、停止信号、日志初始化、配置错误落盘 startup.log |
 | `src/proxy.rs` | 转发核心：hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、keepalive、断开保护 |
 | `src/retry.rs` | 重试判定：状态码、错误 JSON（含流式 NDJSON/SSE 形态） |
@@ -90,8 +90,10 @@ config_dirs、日志轮转阈值、空闲阈值与上述两个字段的全局默
 - `aproxy`（默认）= 后台启动：父进程预检（IPC ping → TCP bind 探测）→
   `spawn_detached` 分离子进程（Windows 手写 `CreateProcessW`，
   `bInheritHandles=FALSE` + `CREATE_NO_WINDOW`）→ 父进程轮询 IPC ping 就绪后返回。
-- 子进程（`--daemon-child`）承载服务：bind → 清 spool 目录 → 写实例注册表
-  （`run/<端口>.pid`）→ 写恢复记录（`run/<端口>.restore`）→ 启动 IPC 管道 → serve。
+- 子进程（`--daemon-child`）承载服务：清 spool 目录（bind 前，回收崩溃残留）→
+  bind → 写实例注册表（`run/<端口>.pid`）→ 写恢复记录
+  （`run/<端口>.restore`）→ 启动 IPC 管道 → 创建看门狗心跳节 + 心跳 ticker
+  （10s）→ 守护侧互保任务（5 分钟自检）→ serve。
 - 停止：IPC `shutdown` → 优雅关闭（10s 宽限强退）→ 清注册表与恢复记录。
 
 ### 端口冲突的两种情况
@@ -118,9 +120,10 @@ config_dirs、日志轮转阈值、空闲阈值与上述两个字段的全局默
   runtime 无法调度 = ticker 停摆，与请求热路径零耦合。看护侧扫描过期 +
   IPC ping 二意见都失败才终止进程（句柄绑定原进程，PID 复用免疫）。
 - **重拉与退避**：`.restore` 残留 = 异常死亡信号；优雅退出（记录已删）摘除
-  看护。崩溃按指数退避 1/2/4/8…封顶 300s 重拉，IPC 就绪判定同 start；
-  连续失败达 `watchdog_max_restarts` 放弃并写 startup.log（`.restore` 保留
-  人工兜底）。
+  看护。首次崩溃立即重拉；重拉失败进退避队列，按指数退避 1/2/4/8…封顶 300s
+  由主循环时间驱动重试（等待不阻塞 tick——否则长退避会让 claim 心跳停摆、
+  现任被竞争者按「假死」夺权），就绪判定按新 pid 定位；连续失败达
+  `watchdog_max_restarts` 放弃并写 startup.log（`.restore` 保留人工兜底）。
 - **选举规范**（多守护并发拉起看护者的唯一性保障）：claim 文件
   `run/watchdog.claim`（PID + 进程创建时间 + 心跳）为在任真相源——
   排序定发起者（存活实例 PID 最小者才有权 spawn）+ `create_new` 原子接管

@@ -8,10 +8,10 @@ description: aProxy CLI 完整参考——本地 API 代理（无限重试保障
 ## 一分钟心智模型
 
 aProxy 是本地 HTTP 代理：客户端把 API base URL 指向 `http://127.0.0.1:<端口>`，
-aProxy 原样透传路径/查询/请求头到上游 `base_url`。请求失败（网络错误、5xx、错误 JSON）
-时**无限重试**（指数退避，封顶 `max_retry_backoff_secs`），流式响应期间向客户端发
-SSE 心跳注释保活，成功后原样回放——客户端零感知。控制通道（status/stop/logs）走
-命名管道 IPC，**永不占用代理端口**。
+aProxy 原样透传路径/查询/请求头到上游 `base_url`。请求失败（网络错误、4xx、5xx、
+错误 JSON）时**无限重试**（指数退避，封顶 `max_retry_backoff_secs`），流式响应期间
+向客户端发 SSE 心跳注释保活，成功后原样回放——客户端零感知。控制通道
+（status/stop/logs）走命名管道 IPC，**永不占用代理端口**。
 
 两种配置文件分工（勿混淆）：
 - `config.toml`（~/.aproxy/config.toml）——人类可读可写，可多份平行并存（多开）
@@ -47,9 +47,10 @@ compatibility.md 确认行为差异（旧版本可能缺字段、语义不同）
   `aproxy --foreground`。
 - 多实例必须先 `aproxy status` 再操作：`stop`/`logs` 在多实例时不接受省略参数，
   需要端口号或别名。`stop all` 停全部；`stop idle [秒]` 只停空闲实例。
-- 改配置走 `aproxy config --<选项>` 或直接编辑 toml；**改 toml 后需重启实例生效**
-  （重启 = `aproxy stop <端口>` 后再 start）。
+- **改配置（toml 或 `aproxy config`）后用 `aproxy restart <端口或别名>` 使其
+  生效**——一条命令完成停止+按原参数拉起+等就绪，改端口也适用。它只重启
+  不启动：目标没在运行会报错退出 1，首次启动用 `aproxy start`。
 - 端口占用排查：bind 失败分「被其他程序占用」与「无权限/被系统保留（Hyper-V
   排除区间）」，不要一律当占用处理——详见 behaviors.md 排障节。
-- 守护日志是 UTF-8（带 BOM），终端乱码是控制台代码页问题，进程入口已自动切
+- 守护日志是 UTF-8（无 BOM），终端乱码是控制台代码页问题，进程入口已自动切
   65001，无需 chcp。

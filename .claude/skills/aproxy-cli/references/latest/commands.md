@@ -87,6 +87,8 @@ aproxy stop --force ...     # 任意 target 组合加 --force：立即 Terminate
 
 - `stop` 停止后结束；`restart` 停止后用**原始启动参数**立即拉起并等 IPC
   就绪（8 秒判定），报出新 pid。
+- **改配置（toml，含换端口）后重启生效**：就绪判定按新实例 pid 定位，配置
+  改了端口也能正确确认，成功输出新监听地址。
 - **restart 只负责重启，不负责启动**：target 未在运行时提示「端口 X 上没有
   运行中的 aProxy 实例」并退出 1——不会顺手把没启动的实例拉起来。重启后想
   首次启动请用 `aproxy start <别名|路径>`。
@@ -184,7 +186,8 @@ aproxy config --clear-default
 `--set-default` 与 `--clear-default` 互斥；api_key/proxy 及代理凭据不允许空串
 （清空用对应 --clear-*）。保存前校验 base_url 格式（http/https 开头、无 ? #）。
 
-注意：修改 toml 的 config 命令**不会重启已运行实例**——需 stop 后重新 start。
+注意：修改 toml 的 config 命令**不会重启已运行实例**——用 `aproxy restart <端口>`
+使修改生效。
 
 ## 退出码与输出约定
 
@@ -193,4 +196,4 @@ aproxy config --clear-default
 - 面向用户的输出全部简体中文；stderr 报错、stdout 出结果。
 - 所有展示输出对 api_key/头值/代理密码/base_url 内嵌凭据打码（前 6 字符 + `***`
   或 `user:***@host`），日志同理——粘贴分享日志不泄露凭据。
-- Windows 控制台代码页在进程入口自动切 UTF-8（65001），守护日志写 UTF-8 BOM。
+- Windows 控制台代码页在进程入口自动切 UTF-8（65001），守护日志为 UTF-8（无 BOM）。

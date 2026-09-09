@@ -88,8 +88,9 @@
   补种停用；已在运行的看护者继续工作（实例与看护者完全解耦）。
 - `watchdog_heartbeat_secs`（默认 30）：看护者扫描周期；实例挂死检测延迟
   ≈ 周期×(1+容忍周期数)。设 0 会被 doctor 报 error（空转烧 CPU）。
-- `watchdog_stale_after_cycles`（默认 1）：心跳过期且 IPC ping 无响应连续
-  N 轮才判挂死杀进程。
+- `watchdog_stale_after_cycles`（默认 1）：心跳过期（阈值 = 扫描周期×(N+1)，
+  N 倍容忍已被过期窗口吸收）且一轮 IPC ping（内含 3 次探测）无响应，才判定
+  挂死杀进程。
 - `watchdog_max_restarts`（默认 5）：同一实例连续重拉失败达上限即放弃
   （指数退避 1s→2s→4s…封顶 300s），保留 `.restore` 供 `aproxy restore`
   人工恢复；放弃事件写 startup.log。0 = 只观测不重拉（doctor 报 warning）。

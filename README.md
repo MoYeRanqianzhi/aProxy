@@ -6,7 +6,7 @@
 
 ## 特性
 
-- **无限重试**：网络错误、5xx、错误 JSON（200 携带 error）都触发重试；客户端断开即中止上游请求（计费保护）
+- **无限重试**：网络错误、4xx/5xx、错误 JSON（200 携带 error）都触发重试；客户端断开即中止上游请求（计费保护）
 - **完全透传**：路径、查询、请求头原样转发；端口只做透传（控制通道走独立 IPC，绝不占用代理端口）
 - **后台守护**：`aproxy` 默认后台启动（分离子进程，关终端不掉）；`status` / `stop` / `logs` / `restore` 全套实例管理
 - **看门狗**：全局看护进程自动重拉崩溃/挂死的实例（默认开启，实测 +2.4% 体积 / +2.9MB 常驻 / 转发热路径零损耗，见 docs/benchmark-watchdog.md）
@@ -46,6 +46,7 @@ aproxy
 | `aproxy --foreground` | 前台运行（日志走控制台，Ctrl+C 停止） |
 | `aproxy status` | 列出运行中的实例（端口/pid/版本/上游/配置） |
 | `aproxy stop [PORT\|all\|别名]` | 停止实例；单实例可省略；多实例指定端口、`all` 或别名 |
+| `aproxy restart [PORT\|all\|别名]` | 重启运行中的实例（只重启不启动；改配置生效用）；`--force` 立即强杀重启 |
 | `aproxy logs [PORT]` | 连接实例实时输出日志；单实例可省略；不支持 `all` |
 | `aproxy restore` | 恢复崩溃/重启前在运行的实例；无实例则静默结束（开机自启友好） |
 | `aproxy alias add\|remove\|list` | 管理配置别名（存于 settings.json） |
@@ -113,7 +114,7 @@ listen_addr = "127.0.0.1:12345"          # 本地监听
 ## 开发
 
 ```powershell
-cargo test          # 全量测试（93 lib + 4 bin + 34 集成）
+cargo test          # 全量测试（112 lib + 4 bin + 38 集成）
 cargo clippy --all-targets   # 必须零警告（项目纪律）
 cargo fmt --check
 ```

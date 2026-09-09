@@ -6,6 +6,23 @@
 > 本文档是问题归档：**每项问题的根因、位置、实测证据、修复方向**，供修复窗口直接使用。
 > 结论：分支可合并（Windows 零行为变化确认、unix 实装质量扎实），下述问题按严重度待修。
 
+## 修复记录（2026-09-10，S1-S6 全部关闭）
+
+六项问题经代码确认后全部修复，实测复跑验证：
+
+| 项 | 提交 | 修复 | 复跑实证 |
+|---|---|---|---|
+| S1 | a389d40 | respawn 就绪判定改 `registry_contains_pid_in` 只读检索；`handle_death` 以 `.restore` 为优雅退出唯一判据；server.rs 退出清理先 `.restore` 后 `.pid` | p6_storm：修复前 3/5 → **PASS=5 FAIL=0**，3 实例全部 respawn（1s） |
+| S2 | 01978b4 | `refresh_claim` 覆写前校验归属，易主即让位退出；unix `terminate_verified` 实装 SIGKILL（身份由调用方 exe+starttime 双重把关） | p7_takeover：修复前 claim 两 pid 翻转/双存活 → **PASS=5 FAIL=0**，接管即杀前任，claim 单一 pid，A=0 B=1 |
+| S3 | f13bc0a | unix `is_aproxy_process` 实装：`/proc/<pid>/exe` 比对 basename（剥「 (deleted)」后缀）；ENOENT（含 zombie，remote 实证 errno 2）判死；权限类失败 fail-open | 集成测试全绿；选举/收养链随判定生效自动修复 |
+| S4 | f13bc0a | health_scan 注释按平台改写 + 处决前加 `is_aproxy_process` 防误杀关卡（unix 裸 SIGKILL 的闸，Windows 侧冗余第二道） | 挂死处决探针（审查时 9/9）路径不变 |
+| S5 | 9cc53c8 | 新增 `remove_heartbeat_file`（unix 删 /dev/shm，Windows no-op）与 `daemon::remove_socket_file`，守护优雅退出 + 看护者 `handle_death` 两处调用 | 全量测试后 /dev/shm 零 aproxy-heart 残留 |
+| S6 | 9cc53c8 | `process_alive_for_wait` 注释声明 macOS 回退对 zombie 失效、由 health_scan 兜底 | 文档性修复 |
+
+回归验证：Windows fmt/clippy -D warnings/lib 113/集成 36+2 全绿；remote lib 111/
+集成 36+2 全绿。探针注意事项：p7 输出中「unix no-op 未杀」是探针按旧行为写的
+文案，修复后实际已真杀（SIGCONT 时 A 已不存在即证据），探针文案未随行为更新。
+
 ## 审查与实测结论摘要
 
 - 5 项 unix 修复（2×P0 编译/链接 + 2×P1 看门狗 + 测试平台假设）全部落实且无超范围改动；

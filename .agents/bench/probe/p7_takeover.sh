@@ -1,6 +1,7 @@
 #!/bin/bash
-# P7: claim 接管与双看护者窗口——SIGSTOP 假死前任 → 接管者接管（unix 不杀前任）
-# → SIGCONT 恢复前任 → 观察双看护者共存与 claim 覆写竞争（审查隐患 D5 实证）
+# P7: claim 接管与假死前任处决——SIGSTOP 假死前任 → claim 心跳过期 →
+# 接管者验证身份后 SIGKILL 前任并接管（S2 修复后 terminate_verified 已实装）
+# → SIGCONT 确认前任不可恢复、claim 单一 pid 无覆写竞争
 set -u
 BIN=/root/probe/aproxy
 RUN=/root/probe/run
@@ -53,18 +54,19 @@ fi
 # 等 claim 心跳过期（3×watchdog_heartbeat_secs=90s）
 say INFO "等待 claim 心跳过期（90s）……"
 sleep 95
-# B2：claim 过期 → old_alive（恒 true + starttime 匹配）→ terminate_verified(unix no-op) → 接管
+# B2：claim 过期 → 身份验证（is_aproxy_process + starttime）通过 → SIGKILL 前任 → 接管
 env APROXY_RUN_DIR=$RUN APROXY_WATCHDOG_SCAN_SECS=1 $BIN --daemon-watchdog > $LOGB 2>&1 &
 WDB=$!
 B_OK=0
 for i in $(seq 1 20); do [ "$(claim_pid)" = "$WDB" ] && { B_OK=1; break; }; sleep 0.5; done
 [ $B_OK = 1 ] && ok "看护者 B2 已接管 claim (pid=$WDB)" || { say INFO "claim=$(cat $RUN/watchdog.claim 2>/dev/null)"; bad "B2 未接管（claim 心跳过期判定失效？）"; }
-grep -qa "前任看护者仍在但心跳过期" $LOGB && ok "日志实证: B2 检出假死前任并尝试终止（unix no-op 未杀）" || say INFO "B2 未检出假死前任（时序）"
+grep -qa "前任看护者仍在但心跳过期" $LOGB && ok "日志实证: B2 检出假死前任并处决后接管" || say INFO "B2 未检出假死前任（时序）"
 grep -qa "已有在任的看护者" $LOGB && bad "B2 让位退出（接管未发生）"
 
-# 恢复 A（SIGCONT）——观察夺权后行为
-kill -CONT $WDA
-say INFO "SIGCONT 恢复 A，观察 10s：夺权检测 / claim 双写竞争"
+# 恢复 A（SIGCONT）——修复后语义：接管者已 SIGKILL 前任，SIGCONT 打在
+# 不存在的 pid 上（no-op），前任不可复活；claim 全程只有接管者一个 pid
+kill -CONT $WDA 2>/dev/null
+say INFO "SIGCONT 恢复 A（预期打在已死 pid 上无效果），观察 10s"
 PID_SEEN=""
 for i in $(seq 1 20); do
   sleep 0.5
@@ -75,14 +77,11 @@ kill -0 $WDA 2>/dev/null && ALIVE_A=1 || ALIVE_A=0
 kill -0 $WDB 2>/dev/null && ALIVE_B=1 || ALIVE_B=0
 say INFO "10s 内 claim 出现过的 pid: $PID_SEEN"
 say INFO "存活: A=$ALIVE_A B=$ALIVE_B"
-# 无夺权检测 → A 醒来继续跑（双看护者）；claim 双写 → 出现 ≥2 个 pid
-if [ "$ALIVE_A" = 1 ] && [ "$ALIVE_B" = 1 ]; then
-  ok "双看护者共存实证（A 恢复后不退出，unix 不杀假死前任 + 无运行期夺权检测）"
-else
-  ok "单看护者收敛（A 恢复后自退出或被杀）——需查日志归因"
-fi
-[ $(echo $PID_SEEN | wc -w) -ge 2 ] && ok "claim 覆写竞争实证（claim pid 在 $PID_SEEN 间翻转）" \
-  || say INFO "claim pid 未翻转（$PID_SEEN——refresh_claim 覆写竞争未观测到，人工复核）"
+[ "$ALIVE_A" = 1 ] && bad "前任看护者在接管后仍存活（terminate_verified 未生效或被 SIGCONT 复活）" \
+  || ok "接管即杀前任（SIGCONT 不可恢复）"
+[ "$ALIVE_B" = 1 ] && ok "接管者持续在任" || bad "接管者意外退出"
+[ "$PID_SEEN" = "$WDB " ] && ok "claim 单一 pid 无覆写竞争" \
+  || bad "claim 出现多个 pid: $PID_SEEN（refresh_claim 归属校验失效？）"
 say INFO "--- A 日志 ---"; cat $LOGA
 say INFO "--- B 日志 ---"; cat $LOGB
 say INFO "P7 结果: PASS=$PASS FAIL=$FAIL"

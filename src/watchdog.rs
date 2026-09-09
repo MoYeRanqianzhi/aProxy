@@ -1266,6 +1266,29 @@ mod tests {
         assert_eq!(heartbeat_fresh_secs(&s), 3);
     }
 
+    // unix：身份判定对「已死进程」的两种形态都判 false——
+    // 大号未用 pid（/proc 条目不存在）与真实 zombie（已 kill 未收割）
+    #[cfg(unix)]
+    #[test]
+    fn is_aproxy_process_rejects_dead_pids() {
+        // Linux pid_max 上限 4194304，此 pid 不可能存在 → readlink ENOENT → false
+        assert!(!is_aproxy_process(u32::MAX - 1));
+
+        // 真实 zombie：子进程被 SIGKILL 后、父进程收割前，/proc/<pid> 仍在但
+        // exe 语义随地址空间消失（readlink ENOENT）→ false
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep 失败（unix 测试环境必备）");
+        child.kill().expect("SIGKILL 失败");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            !is_aproxy_process(child.id()),
+            "zombie 进程不应通过身份判定"
+        );
+        child.wait().unwrap(); // 收割，避免测试自身留 zombie
+    }
+
     #[test]
     fn heartbeat_section_name_uses_port() {
         // 节名含端口：实例唯一区分（同 IPC 管道命名规则）

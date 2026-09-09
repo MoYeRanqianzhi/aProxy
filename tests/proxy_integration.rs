@@ -1588,6 +1588,14 @@ fn daemon_lifecycle_start_status_stop() {
     // 就绪 = TCP 可连且 IPC ping 确认是自家守护（最多 10 秒）
     assert!(wait_daemon_ready(port), "守护子进程未就绪 (pid {pid})");
 
+    // 身份判定：正名运行的守护必须通过 is_aproxy_process（看门狗收养/选举/
+    // 处决关卡的全部前置）。镜像名精确比对的成功路径（Windows aproxy.exe /
+    // unix aproxy）
+    assert!(
+        aproxy::watchdog::is_aproxy_process(pid),
+        "正名运行的守护 (pid {pid}) 应通过进程身份判定"
+    );
+
     // status 列出该实例（信息来自实例注册表，存活以 IPC 探测为准）
     let out = Command::new(exe).arg("status").output().unwrap();
     assert!(out.status.success());
@@ -2296,6 +2304,90 @@ fn watchdog_respawns_killed_daemon() {
     );
     let _ = wd_child.kill();
     let _ = std::fs::remove_file(dir.path().join("watchdog.claim"));
+}
+
+// ---------------------------------------------------------------------------
+// 身份判定对「二进制被原地替换」的容忍（unix swap 升级场景）：运行中的守护
+// 的 exe 链接会被内核附加「 (deleted)」后缀，is_aproxy_process 剥除后比对，
+// 升级动作不得让在运行实例被判为异己（否则收养/选举/处决关卡全体失效）
+// ---------------------------------------------------------------------------
+#[test]
+#[cfg(unix)]
+fn identity_check_tolerates_swapped_binary() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let port = daemon_test_port(10);
+    let dir = tempfile::tempdir().unwrap();
+    // 守护用副本二进制运行（不碰真实 target 二进制——并行测试共用它）。
+    // 副本必须正名 `aproxy`：身份判定按 basename 精确比对
+    let bin = dir.path().join("aproxy");
+    std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &bin).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cfg_file = dir.path().join("swap.toml");
+    std::fs::write(
+        &cfg_file,
+        format!(
+            "base_url = \"https://swap-test.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"
+        ),
+    )
+    .unwrap();
+    let run_dir = dir.path().join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let leaked_bin: &'static str = Box::leak(bin.display().to_string().into_boxed_str());
+    let guard = DaemonGuard {
+        exe: leaked_bin,
+        port,
+        run_dir: Some(run_dir.clone()),
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let daemon_child = Command::new(&bin)
+        .args([
+            "--config",
+            cfg_file.display().to_string().as_str(),
+            "--daemon-child",
+        ])
+        .env("APROXY_RUN_DIR", run_dir.display().to_string())
+        .spawn()
+        .expect("spawn 副本守护失败");
+    let pid = daemon_child.id();
+    let mut ready = false;
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+            && ipc_ping_in_dir(&rt, port, &run_dir).is_ok()
+        {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ready, "副本守护未就绪");
+    assert!(
+        aproxy::watchdog::is_aproxy_process(pid),
+        "替换前正名守护应通过身份判定"
+    );
+
+    // 原地替换（swap 升级的真实形态）：新文件 rename 原子覆盖原路径 →
+    // 旧 inode 失名，内核把运行中进程的 exe 链接标为「... (deleted)」。
+    // 注意不是把运行中二进制 rename 走开——那种场景 exe 跟随新路径名、
+    // 无 (deleted) 后缀，basename 随之改变（精确比对判异己，属 F2 边界）
+    let new_bin = dir.path().join("aproxy.new");
+    std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &new_bin).unwrap();
+    std::fs::rename(&new_bin, &bin).unwrap();
+    assert!(
+        aproxy::watchdog::is_aproxy_process(pid),
+        "二进制被覆盖替换后，运行中守护仍应通过身份判定（(deleted) 后缀剥离）"
+    );
+
+    // 守护仍在正常服务（IPC 可达）——身份判定未误杀正常实例
+    assert!(
+        ipc_ping_in_dir(&rt, port, &run_dir).is_ok(),
+        "替换后守护应继续可 ping"
+    );
+    drop(guard);
 }
 
 #[test]

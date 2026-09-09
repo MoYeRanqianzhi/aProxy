@@ -996,6 +996,33 @@ mod tests {
     }
 
     #[test]
+    fn registry_contains_pid_matches_by_parsed_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut info = sample_info("59901");
+        info.pid = 4242;
+        write_instance_file_in(dir.path(), &info).unwrap();
+
+        assert!(registry_contains_pid_in(dir.path(), 4242));
+        assert!(!registry_contains_pid_in(dir.path(), 4243));
+        // 非 .pid 后缀的文件不参与检索
+        std::fs::write(dir.path().join("59901.restore"), "args").unwrap();
+        assert!(registry_contains_pid_in(dir.path(), 4242));
+    }
+
+    #[test]
+    fn registry_contains_pid_skips_corrupt_and_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // 损坏记录（不可解析）跳过，不 panic 不误报
+        std::fs::write(dir.path().join("59902.pid"), "not-json").unwrap();
+        assert!(!registry_contains_pid_in(dir.path(), 1));
+        // 目录不存在 → false（respawn 轮询的前置态）
+        assert!(!registry_contains_pid_in(
+            dir.path().join("no-such").as_path(),
+            1
+        ));
+    }
+
+    #[test]
     fn ipc_request_serde_roundtrip() {
         let ping = serde_json::to_string(&IpcRequest::Ping).unwrap();
         assert_eq!(ping, r#"{"op":"ping"}"#);

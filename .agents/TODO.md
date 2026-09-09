@@ -40,7 +40,10 @@
 
 - [ ] **正式发布：GitHub 构建指令集多版本**（必然项，2026-09-07 定调）：CI 矩阵 baseline + `RUSTFLAGS="-C target-cpu=x86-64-v3"`（AVX2），产物命名区分，发布页两者都放；详见 memory/release-engineering
 - [ ] **H.（可选）配置热重载**：IPC reload，避免 restart 断流（改配置生效目前用 restart，已有单命令路径）
-- [ ] **滚动升级 `aproxy upgrade`**（可选）：逐实例 restart 替换——IPC v2 混版本检测地基已备（status 提示已指向 restart）
+- [ ] **install/upgrade 二进制安装升级**（计划已批准，2026-09-09）：完整计划
+  `.agents/plan/install-v1.md`——状态机 + 断电恢复矩阵 + PrepareSwap 广播
+  ACK + Windows rename 接力 + 渠道矩阵（--from/GH/cargo/npm/包管理器全配置）；
+  P0 = --from + GitHub Releases（后者硬依赖 CI 产物规范）
 - [ ] **看门狗二期（可选）**：挂死不杀进程原地救（scoped runtime 注入 spike）、实例数极大时线程池死亡等待、unix 分支实测
 - [ ] **仓库挂 remote 让 CI 真正运行**（H2 修复时确认的防线缺口）：.github/workflows 已配置 ubuntu/macos cargo check，但无 remote 从未运行——unix cfg 编译错误（H2，已修）靠它拦截
 - [ ] unix 分支实测（UDS IPC / unix spawn / /dev/shm 心跳从未在类 Unix 环境运行过；CI ubuntu/macos 只 cargo check）

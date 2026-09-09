@@ -332,6 +332,79 @@ unix 实测项覆盖此面。
 - 校验：GitHub 渠道 sha256（发布资产附 `.sha256`）；`--from` 校验 = 临时执行
   `--version` 验证可运行且版本号 == 目标。
 
+## 发布资产命名（用户定调 2026-09-10：文件名不带版本号，后缀齐全）
+
+版本信息由 **release tag** 承载（下载 URL 自含 `releases/download/v<版本>/…`），
+资产文件名不重复版本号：
+
+| 资产 | 命名 | 附带校验 |
+|---|---|---|
+| 二进制 | `aproxy-<target>[-v3].exe`（unix 无 .exe） | `.sha256` |
+| skill 总包 | `aproxy-skills.zip` | `.sha256` |
+| 单 skill 包 | `aproxy-skill-<名>.zip`（每个 skill 单独打包一次——当前仅 aproxy-cli 一个，未来多 skill 可按需单独更新） | `.sha256` |
+
+skill 仓库源路径 = `.claude/skills/<名>/`（不另复制目录）：CI 从此打包 zip，
+CDN/模板通道按同路径直拉仓库内容。
+
+## 下载链条（用户定调 2026-09-10：多级尝试，全部方法入档）
+
+install 获取产物（二进制/skill）按**有序链条**逐级尝试，第一级成功即用。
+默认链（暂定，用户拍板可再议）：**github → npm → cargo-binstall → cargo**。
+
+### 通道详述（全部方法）
+
+**github（默认第 1 级）**：Release asset 直下 + `.sha256` 强校验（信任锚 =
+仓库所有者 release 身份）。国外最优；国内常不可达（用户配 download_proxy
+或环境代理可解）。
+
+**npm（默认第 2 级）**：registry 纯 HTTP API——拉主包元数据（含各版本
+tarball URL 与 sha512 integrity）→ 下载 tgz → 解压提取（二进制在平台包，
+skill 在主包）。**不依赖用户装 node**。关键机制：**跟随 `~/.npmrc` 的
+registry 配置**——配了 npmmirror 的用户自动走镜像，这就是「npm 更大概率
+被用户安装/可用」的机制化落地；强校验（registry integrity）。
+
+**cargo-binstall（默认第 3 级）**：拉 `.crate` 读 `[package.metadata.
+binstall]` 模板 → 按模板拼 URL 下预编译二进制 + 模板校验。**诚实局限**：
+模板大多仍指向 GitHub Releases——国内经常退化为 github 链（失败无害，
+链条继续）；独立价值在模板可指向任意源。对 skill 无贡献（该级对 skill
+按不可用处理，直接下一级）。
+
+**cargo（build）（默认第 4 级）**：crates.io 拉 `.crate`（**skill 文件随
+crate 分发**，include 指令打包）→ `cargo build --release` 编译 → 产物
++ 从 .crate 提取 skill。**跟随 `~/.cargo/config.toml` 的 source
+replacement**（rsproxy 等镜像自动生效）；crates.io 国内可达性通常好于
+GitHub。代价：需 Rust 工具链 + 编译时间，故置链尾。产物 = 本地编译自证，
+crate 校验走 crates.io checksum。
+
+**url 模板（可选通道，不在默认链）**：用户在 settings 数组写 URL 模板
+（占位符 `{version}/{asset}/{target}/{variant}` 等），代码实现通用的模板
+填充器——**具体 CDN 域名绝不硬编码进二进制**（用户定调）：jsDelivr/
+ghfast 等常见 CDN 在文档与 skill 中作为示例提及，不进代码。适用：任意
+加速器、自建反代、内网镜像。校验弱档：模板若能拼出 `.sha256` 资产则校验，
+否则输出「来源为非官方镜像、未校验」提示后接受。
+
+### 信任/校验矩阵
+
+| 通道 | 校验强度 | 信任锚 |
+|---|---|---|
+| github | sha256 强校验 | 仓库所有者 release |
+| npm | registry integrity（sha512）强校验 | npm registry |
+| cargo-binstall | 模板 checksum（有则验） | 模板目标源 |
+| cargo(build) | crates.io checksum + 编译自证 | crates.io |
+| url 模板 | 弱（能拼 .sha256 则验，否则提示） | 用户自己选择的源（用户自担） |
+
+### 可选链条配置（settings.json，用户定调）
+
+- settings 增 `download_chain: Option<Vec<ChainStep>>`（ChainStep = 枚举
+  github/npm/cargo-binstall/cargo 或 url 模板对象）。
+- **严格数组语义（与 config_dirs 明确不同）**：配置后**完全按数组执行，
+  绝不自动在前面追加默认项**（config 发现目录会自动补 `~/.aproxy/` 等，
+  下载链不会）——链条写少了会增加失败概率，文档/skill 提醒：建议多写几
+  项，前几项建议 github、npm、cargo-binstall、cargo。
+- 未配置 = 内置默认链（github → npm → cargo-binstall → cargo）。
+- 二进制与 skill 各自独立跑链（skill 支线本就并行）：同一顺序，对当前
+  产物不可用的通道（如 binstall 对 skill）按该级失败处理，直接下一级。
+
 ## 下载代理（用户定调：与请求代理绝对分离）
 
 **下载代理 ≠ 请求代理**：`config.toml` 的 `proxy` 是上游请求转发用的，
@@ -362,25 +435,23 @@ install 下载**绝不读取**。下载代理独立配置两处：
 
 ### 下载通道（难点：GitHub 国内大概率无法连接）
 
-skill 的决定性优势：**它是纯文本且本来就以仓库文件存在**——除 Release
-asset 外还能经 jsDelivr CDN 按 tag 直拉仓库内容（国内可达性远好于
-GitHub）。三级通道顺序：
+skill 与二进制**共用同一条下载链条**（见「下载链条」节：github → npm →
+cargo-binstall → cargo，可配 url 模板通道），产物差异仅两点：
 
-1. **GitHub Releases asset**：`aproxy-skill-v<版本>.zip` + `.sha256`，与
-   二进制同下载路径、同下载代理、同校验强度（信任锚 = 仓库所有者的
-   release 身份）。
-2. **jsDelivr CDN**：`cdn.jsdelivr.net/gh/<owner>/<repo>@v<版本>/
-   skill/aproxy-cli/<文件>`（skill 目录随仓库发布，tag 精确锁版本）。
-   **信任模型如实降级**：CDN 是中间人、无 sha256 强校验——风险接受理由：
-   纯文本低危（最坏 = 文档过时/误导，非可执行代码）+ tag 锁定 + CDN 中立
-   性；输出里注明来源是镜像（用户可 `--no-skills` 或仅用 GitHub 源）。
-3. **放弃**：重试 3 次（每级通道内重试）全失败 → `status=failed`，
-   **安装照常成功**——skill 不是二进制的依赖，主流程任何阶段都不等待/
-   不受影响（唯一同步点：install 进程退出前 join skill 任务收尾）。
+1. **skill 专属资产**：GitHub 级取 `aproxy-skills.zip`（或
+   `aproxy-skill-<名>.zip` 单包，用户定调：每个 skill 单独额外打包一次）；
+   npm 级取主包内 skill 文件；cargo 级从 `.crate` 提取；binstall 级对
+   skill 不可用（跳过）。
+2. **skill 独有捷径（url 模板通道）**：skill 是纯文本且本来就以仓库文件
+   存在（`.claude/skills/<名>/`）——jsDelivr 等仓库内容 CDN 可按 tag 直拉
+   （`…@v<版本>/.claude/skills/aproxy-cli/<文件>`），国内可达性远好于
+   GitHub。**代码不内置任何 CDN 域名**（用户定调）：文档/skill 提及
+   jsDelivr 等常见 CDN 作为可填示例，模板 URL 由用户在 settings
+   download_chain 的 url 项里自己指定。
 
-npm/cargo 渠道（P2）自带国内镜像（npmmirror/rsproxy），是最终态的国内
-最优路径：npm 包直接附带 skill 文件，postinstall 复制——与二进制同渠道
-国内可达。
+失败语义（用户定调）：每级通道内重试 3 次，链条全失败 → `status=failed`，
+**安装照常成功**——skill 不是二进制的依赖，主流程任何阶段都不等待/不受
+影响（唯一同步点：install 进程退出前 join skill 任务收尾）。
 
 ### 状态与幂等（无恢复状态机——有意简化）
 
@@ -424,7 +495,8 @@ Rust 工具链）。绕开编译的两条路：cargo-binstall 约定（P1 顺带
 ## 依赖与前置
 
 - **CI 发布产物规范**（P0 GitHub 渠道的硬依赖，`--from` 不依赖）：资产命名
-  `aproxy-<版本>-<target>[-v3].exe` + `.sha256`，与
+  见「发布资产命名」节（文件名不带版本号：`aproxy-<target>[-v3].exe` /
+  `aproxy-skills.zip` / `aproxy-skill-<名>.zip`，各附 `.sha256`），与
   `.agents/memory/2026-09-07-release-engineering.md` 的指令集矩阵合并落地。
 - 仓库公开（开源已定，GH API 匿名限流 60/h 够用）。
 
@@ -483,13 +555,17 @@ Rust 工具链）。绕开编译的两条路：cargo-binstall 约定（P1 顺带
 5. **滚动重启与终验清理** + 无实例快路径 + 竞态窗口防护。
 6. **恢复机制**：看门狗启动检测 + CLI 静默兜底 + --continue 续跑 + 恢复矩阵全链路
    集成测试（崩溃点注入，含 swapping 空窗的手动修复三退路验证）。
-7. **GitHub Releases 渠道 + 下载基建**：API 列表/下载/变体选择/sha256 +
-   **下载代理分离**（download_proxy/--download-proxy + 打码）。
-8. **skill 更新支线**：三级通道（Release asset → jsDelivr → 放弃）+ 并行
-   任务 + 子状态 + 落位替换 + --no-skills/--skills-only + settings
-   `skill_auto_update`（测试用本地 mock 服务器 + 假 CDN 域名注入）。
+7. **下载链条基建**（github 通道先行）：链条框架（默认链 + settings
+   `download_chain` 严格数组 + url 模板通道）+ GitHub API 列表/下载/变体
+   选择/sha256 + **下载代理分离**（download_proxy/--download-proxy + 打码）
+   + npm 通道（registry HTTP 直拉 + 跟随 ~/.npmrc）。
+8. **skill 更新支线**：共用链条的 skill 产物路径（aproxy-skills.zip/单包）
+   + 并行任务 + 子状态 + 落位替换 + --no-skills/--skills-only + settings
+   `skill_auto_update` + cargo/binstall 通道（binstall 模板解析、cargo
+   build + crate 内 skill 提取；测试用本地 mock registry/服务器）。
 9. **收尾**：skill 文档增补（含手动更新兜底 + swapping 手动修复指南 +
-   skill 更新节 + 下载代理节）+ README + architecture.md 节 + TODO 收口。
+   skill 更新节 + 下载链条节 + 下载代理节）+ README + architecture.md 节
+   + TODO 收口。
    （P1/P2 渠道各自独立任务，不阻塞本计划验收。）
 
 ## 已定夺（原开放问题，2026-09-09 用户拍板）
@@ -513,10 +589,17 @@ Rust 工具链）。绕开编译的两条路：cargo-binstall 约定（P1 顺带
    优先级实现 fallback（→ aproxy.old.exe，保持 exe 后缀）；ps1 不做。
 8. **skill 更新**（2026-09-10 用户定调）：~/.aproxy/skills/ 位置；默认下载、
    settings `skill_auto_update` 可禁、--no-skills 本次禁、--skills-only 单独
-   更新；与二进制下载并行、失败重试 3 次后放弃且不影响安装成功；三级通道
-   （Release asset → jsDelivr tag 内容 → 放弃）应对 GitHub 国内不可达；
+   更新；与二进制下载并行、失败重试 3 次后放弃且不影响安装成功；
    skill 子状态入 install.state，下载幂等无恢复状态机；下载代理与请求代理
    绝对分离（download_proxy/--download-proxy）。
+9. **发布资产命名**（2026-09-10 用户定调）：文件名不带版本号（版本由
+   release tag 承载）——`aproxy-<target>[-v3].exe`、`aproxy-skills.zip`、
+   每个 skill 单独打包 `aproxy-skill-<名>.zip`，各附 `.sha256`。
+10. **下载链条**（2026-09-10 用户定调）：默认链 github → npm →
+    cargo-binstall → cargo(build)；可选通道（含 CDN/url 模板）由用户在
+    settings `download_chain` 数组自指定——**严格数组语义**，不自动追加
+    默认项（与 config_dirs 相反），文档提醒链条写全；CDN 域名不硬编码进
+    二进制，文档/skill 只作示例提及。
 
 ## APROXY_HOME 的影响面（实现注意）
 

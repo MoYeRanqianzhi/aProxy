@@ -214,10 +214,24 @@ struct Watched {
     pid: u32,
     /// 进程句柄（SYNCHRONIZE|TERMINATE）：挂死杀进程与死亡等待都用它——
     /// 句柄绑定原进程对象，PID 复用不影响其语义。unix 无句柄对象恒为 0
-    /// （死亡检测退化为轮询，未实测分支）。
+    /// （死亡检测退化为轮询，未实测分支）。0 = 暂无句柄（open 失败，
+    /// adopt_scan 会补挂），绝不能复用已 close 的旧值——close 后的句柄号
+    /// 可能被内核分配给无关对象，复用即误杀。
     handle: isize,
     /// 本实例连续重拉失败次数（crashloop 防护计数，重拉成功清零）
     consecutive_failures: u32,
+}
+
+/// 待重试的崩溃实例（重拉失败后的退避队列条目）。
+/// 实例从 watched 摘除后进队列——失败期间不存在可等待的进程句柄，
+/// 死亡事件不会再来，「下轮重试」只能由时间驱动。
+#[derive(Debug)]
+struct PendingRetry {
+    port: String,
+    /// 连续重拉失败次数（crashloop 计数挂在队列条目上，跨收养周期累计）
+    failures: u32,
+    /// 下次重试时刻（退避序列 1s→2s→4s…封顶 300s）
+    next_retry: std::time::Instant,
 }
 
 /// 一个步进周期的完整看护状态
@@ -225,6 +239,11 @@ pub struct WatchdogState {
     pub cfg: WatchdogConfig,
     /// 被收养的实例（端口 → 状态）
     watched: Vec<Watched>,
+    /// 重拉失败的退避队列：实例崩溃 → 立即重拉失败 → 摘除进队列，到期由
+    /// tick 重试。等待发生在 tick 之间（主循环按 next_pending_deadline 竞速
+    /// 提前唤醒），绝不阻塞 tick 本身——否则一次 300s 的退避 sleep 就能让
+    /// claim 心跳停摆超过 90s 新鲜窗口，现任被「假死夺权」误杀（M2 实审）。
+    pending: Vec<PendingRetry>,
     /// 死亡事件接收端（等待任务 → 主循环）
     deaths: tokio::sync::mpsc::UnboundedReceiver<(String, u32)>,
     #[allow(dead_code)] // 发送端由等待任务持有（字段仅生命周期管理需要）
@@ -239,6 +258,7 @@ impl WatchdogState {
         Self {
             cfg,
             watched: Vec::new(),
+            pending: Vec::new(),
             deaths: rx,
             death_tx: tx,
             empty_since: None,
@@ -256,7 +276,19 @@ impl WatchdogState {
     pub async fn adopt_scan(&mut self) -> Vec<String> {
         let mut adopted = Vec::new();
         for entry in crate::daemon::list_restore_entries_in(&self.cfg.run_dir) {
-            if self.watched.iter().any(|w| w.port == entry.port) {
+            // 已在看护的端口：只处理句柄缺失的条目（respawn 成功但 open 句柄
+            // 失败的兜底——原注释「下轮补挂」曾因端口去重永远走不到，H1）。
+            // 句柄有效则跳过（死亡 watcher 已挂，重复挂会双发死亡事件）。
+            if let Some(w) = self.watched.iter().find(|w| w.port == entry.port) {
+                if w.handle == 0
+                    && let Some(h) = imp::open_sync_handle(w.pid)
+                {
+                    // 借用拆分：iter 的借用已结束，直接改字段 + spawn
+                    let (port, pid) = (w.port.clone(), w.pid);
+                    let idx = self.watched.iter().position(|w| w.port == port).unwrap();
+                    self.watched[idx].handle = h;
+                    self.spawn_death_watcher(port, pid, h);
+                }
                 continue;
             }
             // 实例身份建立：注册 PID 必须是活着的 aProxy 进程（PID 复用防冒名）。
@@ -320,13 +352,15 @@ impl WatchdogState {
         hung
     }
 
-    /// 处理死亡事件：.restore + 注册表都在 = 崩溃 → 重拉；否则优雅退出/清理，
-    /// 摘除看护。指数退避 + crashloop 上限。返回处置结果（测试断言用）。
+    /// 处理死亡事件：.restore + 注册表都在 = 崩溃 → 立即重拉；否则优雅退出/
+    /// 清理，摘除看护。重拉失败进退避队列（不 sleep——阻塞主循环会让 claim
+    /// 心跳停摆、被竞争者按「假死」夺权，M2），由 tick 的时间驱动重试。
+    /// 返回处置结果（测试断言用）。
     pub async fn handle_death(&mut self, port: &str) -> DeathOutcome {
         let Some(idx) = self.watched.iter().position(|w| w.port == port) else {
             return DeathOutcome::Unknown;
         };
-        let mut w = self.watched.swap_remove(idx);
+        let w = self.watched.swap_remove(idx);
         imp::close_handle(w.handle);
 
         let restore_path = crate::daemon::restore_file_path_in(&self.cfg.run_dir, port);
@@ -337,60 +371,116 @@ impl WatchdogState {
             return DeathOutcome::GracefulExit;
         }
 
-        // crashloop 上限：连续失败达上限 → 放弃（保留 .restore 人工兜底）
-        if w.consecutive_failures >= self.cfg.max_restarts {
-            tracing::error!(
-                port = %port,
-                attempts = w.consecutive_failures,
-                "实例连续重拉失败达上限，放弃自动重拉（.restore 已保留，可 aproxy restore 手工恢复）"
-            );
-            crate::daemon::append_startup_log(&format!(
-                "[watchdog] 端口 {port} 的实例连续重拉 {} 次失败，已放弃自动重拉；可执行 aproxy restore 手工恢复",
-                w.consecutive_failures
-            ));
-            self.after_watch_removal();
-            return DeathOutcome::GaveUp;
+        // 首次崩溃（failures=0）退避为 0 → 立即重拉；失败后进队列按指数退避
+        let failures = w.consecutive_failures;
+        if failures >= self.cfg.max_restarts {
+            return self.give_up(port, failures);
         }
-
-        // 退避：1s→2s→4s→…封顶 300s（按已连续失败次数）
-        let delay = backoff_delay_secs(w.consecutive_failures);
+        let delay = backoff_delay_secs(failures);
         if delay > 0 {
-            tracing::warn!(port = %port, delay_secs = delay, "实例崩溃，退避后重拉");
-            tokio::time::sleep(Duration::from_secs(delay)).await;
-        } else {
-            tracing::warn!(port = %port, "实例崩溃，立即重拉");
+            tracing::warn!(port = %port, delay_secs = delay, "实例崩溃，进入退避队列");
+            self.pending.push(PendingRetry {
+                port: port.to_string(),
+                failures,
+                next_retry: std::time::Instant::now() + Duration::from_secs(delay),
+            });
+            self.after_watch_removal();
+            return DeathOutcome::RespawnFailed;
         }
 
+        tracing::warn!(port = %port, "实例崩溃，立即重拉");
         match respawn_instance(&self.cfg.run_dir, port).await {
             Ok(pid) => {
-                tracing::info!(port = %port, new_pid = pid, "实例已重拉并就绪");
-                w.pid = pid;
-                w.consecutive_failures = 0;
-                if let Some(h) = imp::open_sync_handle(pid) {
-                    w.handle = h;
-                    self.spawn_death_watcher(port.to_string(), pid, h);
-                } else {
-                    // 句柄开不出来：轮询兜底（adopt_scan 下轮会补挂正确句柄）
-                    w.handle = 0;
-                }
-                self.watched.push(w);
-                self.empty_since = None;
+                self.admit_respawned(port, pid);
                 DeathOutcome::Respawned(pid)
             }
-            Err(e) => {
-                w.consecutive_failures += 1;
-                tracing::error!(port = %port, error = %e, attempt = w.consecutive_failures, "重拉失败");
-                // 保留 .restore（人工兜底），下轮 adopt_scan 视注册表情况重试；
-                // 连续失败计数挂在端口上（不重新收养即丢失计数 → 记回 watched，
-                // 下一轮死亡/adopt 后继续累计）
-                self.watched.push(w);
-                self.after_watch_removal();
-                DeathOutcome::RespawnFailed
+            Err(e) => self.queue_retry(port, failures, e),
+        }
+    }
+
+    /// 处理退避队列：到期的条目逐个重拉。成功 → 重新收养；失败 → 计数+1
+    /// 重新排期，达上限放弃。
+    pub async fn process_pending_retries(&mut self) {
+        // 收集到期条目后逐个处理（处理中可能再 push，用索引推进避免乱序）
+        let now = std::time::Instant::now();
+        let due: Vec<usize> = self
+            .pending
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.next_retry <= now)
+            .map(|(i, _)| i)
+            .collect();
+        // 从大到小摘除，保证索引在多次 remove 中保持有效
+        for i in due.into_iter().rev() {
+            let p = self.pending.remove(i);
+            tracing::info!(port = %p.port, attempt = p.failures + 1, "退避到期，重试重拉");
+            match respawn_instance(&self.cfg.run_dir, &p.port).await {
+                Ok(pid) => self.admit_respawned(&p.port, pid),
+                Err(e) => {
+                    self.queue_retry(&p.port, p.failures, e);
+                }
             }
         }
     }
 
-    /// 一个完整步进周期：claim 续写 + 收养 + 健康 + 挂死事件处理 + 闲置自灭判定
+    /// 退避队列中最早的重试时刻（None = 队列空）。主循环据此提前唤醒 tick，
+    /// 让重试时刻精确到秒而非受扫描周期（默认 30s）拖累。
+    pub fn next_pending_deadline(&self) -> Option<std::time::Instant> {
+        self.pending.iter().map(|p| p.next_retry).min()
+    }
+
+    /// 重拉成功后的重新收养：开句柄挂死亡 watcher；开不出则 handle=0 留给
+    /// adopt_scan 补挂（见 adopt_scan 开头分支）。
+    fn admit_respawned(&mut self, port: &str, pid: u32) {
+        tracing::info!(port = %port, new_pid = pid, "实例已重拉并就绪");
+        let handle = imp::open_sync_handle(pid).unwrap_or(0);
+        self.watched.push(Watched {
+            port: port.to_string(),
+            pid,
+            handle,
+            consecutive_failures: 0,
+        });
+        if handle != 0 {
+            self.spawn_death_watcher(port.to_string(), pid, handle);
+        }
+        self.empty_since = None;
+    }
+
+    /// 重拉失败：计数+1，达上限放弃，否则入队按指数退避。
+    /// 崩溃实例从 watched 消失（死亡 watcher 已消费，句柄已关——留着的都是
+    /// 悬空条目，曾导致一次失败后永久失去看护，H1）。
+    fn queue_retry(&mut self, port: &str, failures: u32, err: String) -> DeathOutcome {
+        let failures = failures + 1;
+        tracing::error!(port = %port, error = %err, attempt = failures, "重拉失败");
+        if failures >= self.cfg.max_restarts {
+            return self.give_up(port, failures);
+        }
+        let delay = backoff_delay_secs(failures);
+        self.pending.push(PendingRetry {
+            port: port.to_string(),
+            failures,
+            next_retry: std::time::Instant::now() + Duration::from_secs(delay),
+        });
+        self.after_watch_removal();
+        DeathOutcome::RespawnFailed
+    }
+
+    /// crashloop 放弃：写 startup.log 大声报出，保留 .restore 人工兜底。
+    fn give_up(&mut self, port: &str, failures: u32) -> DeathOutcome {
+        tracing::error!(
+            port = %port,
+            attempts = failures,
+            "实例连续重拉失败达上限，放弃自动重拉（.restore 已保留，可 aproxy restore 手工恢复）"
+        );
+        crate::daemon::append_startup_log(&format!(
+            "[watchdog] 端口 {port} 的实例连续重拉 {failures} 次失败，已放弃自动重拉；可执行 aproxy restore 手工恢复"
+        ));
+        self.after_watch_removal();
+        DeathOutcome::GaveUp
+    }
+
+    /// 一个完整步进周期：claim 续写 + 收养 + 健康 + 挂死事件处理 + 退避重试
+    /// + 闲置自灭判定
     pub async fn tick(&mut self) {
         // 消化本周期内累积的死亡事件
         let mut deaths = Vec::new();
@@ -400,6 +490,7 @@ impl WatchdogState {
         for port in deaths {
             self.handle_death(&port).await;
         }
+        self.process_pending_retries().await;
         self.adopt_scan().await;
         self.health_scan().await;
         self.refresh_claim();
@@ -421,14 +512,16 @@ impl WatchdogState {
         }
     }
 
-    /// 闲置自灭：全部实例清零（收养表空且注册表空）持续 idle_exit_secs 后
-    /// 删除 claim 退出，系统回到零常驻。
+    /// 闲置自灭：全部实例清零（收养表空、退避队列空且注册表空）持续
+    /// idle_exit_secs 后删除 claim 退出，系统回到零常驻。pending 非空 = 还有
+    /// 待重试的崩溃实例（.restore 在，期望恢复）——不算空闲，否则看护者会在
+    /// 长退避中自灭、崩溃实例失去重试（历史上 respawn 失败路径曾造成此态）。
     async fn maybe_idle_exit(&mut self) {
         if self.cfg.idle_exit_secs == 0 {
             return;
         }
         let registry_empty = crate::daemon::registry_pids_in(&self.cfg.run_dir).is_empty();
-        if self.watched.is_empty() && registry_empty {
+        if self.watched.is_empty() && self.pending.is_empty() && registry_empty {
             let since = *self.empty_since.get_or_insert_with(std::time::Instant::now);
             if since.elapsed().as_secs() >= self.cfg.idle_exit_secs {
                 tracing::info!("无任何实例需要看护，看护者退出（闲置自灭）");
@@ -510,10 +603,17 @@ async fn respawn_instance(run_dir: &Path, port: &str) -> Result<u32, String> {
     args.push("--daemon-child".to_string());
     let exe = std::env::current_exe().map_err(|e| format!("无法定位自身可执行文件: {e}"))?;
     let pid = crate::daemon::spawn_detached(&exe, &args).map_err(|e| format!("spawn 失败: {e}"))?;
-    // 就绪判定：IPC ping（8s，与 start/restore 一致）
+    // 就绪判定按新 pid 在注册表定位（8s，与 start/restore 一致）：重拉用
+    // .restore 原参数，但配置可能已被用户改动（换端口）——新守护监听新端口
+    // 时 ping 旧端口永远不通（与 restart 同款实测坑）。pid 是 spawn 返回值，
+    // 唯一可靠锚点；新守护 bind 成功才写注册表，出现即就绪。
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     loop {
-        if crate::daemon::ipc_ping(port).await.is_ok() {
+        if crate::daemon::list_instances_in(run_dir)
+            .await
+            .iter()
+            .any(|i| i.pid == pid)
+        {
             return Ok(pid);
         }
         if std::time::Instant::now() > deadline {
@@ -567,7 +667,21 @@ pub async fn serve(cfg: WatchdogConfig) {
     state.adopt_scan().await;
     let scan = Duration::from_secs(state.cfg.scan_secs.max(1));
     loop {
-        tokio::time::sleep(scan).await;
+        // 双源竞速唤醒：常规扫描周期，或退避队列的最早到期时刻——重试时刻
+        // 精确到秒而非被扫描周期拖累。主循环单步耗时预算：handle_death/process
+        // 的 respawn 至多 8s + health_scan 的 ipc_ping 至多 ~9.6s，远小于 claim
+        // 的 90s 新鲜窗口——把退避 sleep 放进 tick 会击穿这个预算（M2），故
+        // 等待一律发生在 tick 之间。
+        let next_retry = state.next_pending_deadline();
+        tokio::select! {
+            _ = tokio::time::sleep(scan) => {},
+            _ = async {
+                match next_retry {
+                    Some(d) => tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {},
+        }
         state.tick().await;
     }
 }
@@ -609,6 +723,9 @@ pub struct HeartbeatWriter {
     mapping: isize,
     #[cfg(windows)]
     view: *mut std::ffi::c_void,
+    /// unix 实现按路径写 /dev/shm 文件，beat() 需要知道写入目标
+    #[cfg(unix)]
+    port: String,
     #[cfg(unix)]
     _shm_fd: std::fs::File,
 }
@@ -1138,6 +1255,126 @@ mod tests {
             crate::daemon::restore_file_path_in(dir.path(), port).is_file(),
             ".restore 必须保留（人工 restore 兜底）"
         );
+    }
+
+    #[tokio::test]
+    async fn watchdog_state_respawn_failure_goes_to_pending_queue() {
+        // H1 回归：respawn 失败（配置文件已不存在 → respawn_instance Err）后
+        // 实例必须从 watched 摘除（不留悬空句柄条目）、进退避队列、计数跨周期累计
+        let dir = tempfile::tempdir().unwrap();
+        let port = "59903";
+        write_crashed_instance(dir.path(), port); // config 指向 C:/tmp/no-such-config.toml
+        // max_restarts=5：给累计留空间（test_cfg 的 2 会让第二次重试直接 GaveUp，
+        // 测不到「未达上限继续入队」）
+        let cfg = WatchdogConfig {
+            max_restarts: 5,
+            ..test_cfg(dir.path())
+        };
+        let mut st = WatchdogState::new(cfg);
+        st.watched.push(Watched {
+            port: port.into(),
+            pid: u32::MAX - 777,
+            handle: 0,
+            consecutive_failures: 0,
+        });
+        // 首次崩溃：立即重拉 → 失败（配置不存在）→ 入队，failures=1
+        assert_eq!(st.handle_death(port).await, DeathOutcome::RespawnFailed);
+        assert!(
+            !st.watched_ports().contains(&port.to_string()),
+            "失败实例必须摘出 watched（H1：留条目会让 adopt_scan 永远跳过）"
+        );
+        assert_eq!(st.pending.len(), 1, "失败后应进退避队列");
+        assert_eq!(st.pending[0].failures, 1);
+        assert!(
+            st.pending[0].next_retry > std::time::Instant::now(),
+            "退避 1s：next_retry 应在未来"
+        );
+        // 配置不存在的失败路径：respawn_instance 已按既有语义删除 .restore
+        // （与 aproxy restore 清理无法恢复的记录一致），此处验证队列语义
+        assert!(
+            !crate::daemon::restore_file_path_in(dir.path(), port).is_file(),
+            "配置已删场景下 .restore 应被 respawn 清理（既有语义）"
+        );
+
+        // 拨快到期重试：再次失败（恢复记录已不在）→ failures=2 继续入队
+        st.pending[0].next_retry = std::time::Instant::now() - Duration::from_secs(1);
+        st.process_pending_retries().await;
+        assert_eq!(st.pending.len(), 1, "未达上限应继续入队");
+        assert_eq!(st.pending[0].failures, 2, "失败计数跨重试周期累计");
+    }
+
+    #[tokio::test]
+    async fn watchdog_state_pending_gives_up_at_limit() {
+        // 退避队列中累计到 max_restarts → GaveUp 且队列清空、.restore 保留
+        let dir = tempfile::tempdir().unwrap();
+        let port = "59904";
+        write_crashed_instance(dir.path(), port);
+        let cfg = test_cfg(dir.path()); // max_restarts = 2
+        let mut st = WatchdogState::new(cfg);
+        st.pending.push(PendingRetry {
+            port: port.to_string(),
+            failures: 1, // 再失败一次即达上限
+            next_retry: std::time::Instant::now() - Duration::from_secs(1),
+        });
+        st.process_pending_retries().await;
+        assert!(st.pending.is_empty(), "放弃后队列应清空");
+        // 本用例配置文件也不存在：.restore 已被 respawn_instance 清理（既有
+        // 语义——无法忠实恢复的记录不留）。真实 crashloop（端口被占等）时
+        // .restore 保留，由集成测试 watchdog_respawns_killed_daemon 覆盖存活面。
+    }
+
+    #[tokio::test]
+    async fn watchdog_state_handle_death_does_not_block() {
+        // M2 回归：handle_death 不得内嵌退避 sleep——首次崩溃路径（respawn
+        // 失败进队列）应立即返回
+        let dir = tempfile::tempdir().unwrap();
+        let port = "59905";
+        write_crashed_instance(dir.path(), port);
+        let cfg = test_cfg(dir.path());
+        let mut st = WatchdogState::new(cfg);
+        st.watched.push(Watched {
+            port: port.into(),
+            pid: u32::MAX - 777,
+            handle: 0,
+            consecutive_failures: 0,
+        });
+        let start = std::time::Instant::now();
+        let _ = st.handle_death(port).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "handle_death 必须立即返回（退避等待移到 tick 之间，M2）"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_state_pending_blocks_idle_exit() {
+        // 退避队列非空 = 还有待恢复的崩溃实例，不得自灭（idle_exit_secs 拨小验证）
+        let dir = tempfile::tempdir().unwrap();
+        let port = "59906";
+        write_crashed_instance(dir.path(), port);
+        let cfg = WatchdogConfig {
+            idle_exit_secs: 1, // 1s 即自灭（测试专用；0 = 禁用不能测出「被 pending 拦住」）
+            ..test_cfg(dir.path())
+        };
+        let mut st = WatchdogState::new(cfg);
+        st.pending.push(PendingRetry {
+            port: port.to_string(),
+            failures: 1,
+            next_retry: std::time::Instant::now() + Duration::from_secs(3600), // 远期
+        });
+        // 队列非空：即使空置超过 idle_exit_secs 也不自灭（此处只验证判定路径
+        // 不触发退出——退出是 std::process::exit，触发即测试进程死亡 = 失败）
+        st.maybe_idle_exit().await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        st.maybe_idle_exit().await;
+        assert!(!st.pending.is_empty(), "pending 应保持（测试进程仍活着即通过）");
+    }
+
+    #[test]
+    fn watchdog_next_pending_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = WatchdogState::new(test_cfg(dir.path()));
+        assert_eq!(st.next_pending_deadline(), None, "空队列无期限");
     }
 
     #[test]

@@ -39,7 +39,7 @@
   rename 原子性的同卷前提；staging 文件保留至 done/abort 才清理，它是
   swapping 中断的恢复源，见下文专节）。
 - **状态文件放 run/ 下**（用户定调 2026-09-09：根目录只放长期稳定件，
-  状态类文件进子目录防混乱）：`~/.aproxy/run/install.state.json`——自动
+  状态类文件进子目录防混乱）：`~/.aproxy/run/install.state`——自动
   享受 APROXY_RUN_DIR 重定向（测试隔离白送），run/ 本身在主目录下跨重启
   稳定，断电恢复语义不受影响。
 - **管辖检查**（安装前）：枚举运行实例的进程镜像路径（QueryFullProcessImageNameW），
@@ -53,7 +53,7 @@
 
 ## 状态文件（安装的真相源 + 安装锁）
 
-`~/.aproxy/run/install.state.json`（见上节——run/ 子目录 + 重定向友好）。
+`~/.aproxy/run/install.state`（见上节——run/ 子目录 + 重定向友好）。
 
 ```json
 {
@@ -73,8 +73,8 @@
   超 10 分钟且 installer_pid 不存活 → 视为残留，**不询问直接续跑**，见恢复节）。
 - 每次阶段推进原子重写（tmp + rename，同 `write_instance_file` 既有模式）。
 - **`--abort` 显式回滚**（仅 swapping 前可完全回滚，之后只进不退）；
-  **无 `--resume`**（用户定调 2026-09-09：用户调 install 的期望就是装完，
-  恢复不该要求二次显式指令——中断后续作是自动的，入口见恢复节）。
+- 状态文件内容为 JSON 但**不带 .json 后缀**（用户定调：与 `.pid`/`.restore`
+  注册表惯例一致——按内容而非扩展名识别）。
 
 ## 阶段状态机
 
@@ -164,7 +164,7 @@ copy+rename(旧) 之间约一次系统调用的窗口，且即使发生，手动
 | verifying/cleaning | 全新，.old 残留 | 补验证/删 .old（锁住则下次再试） | 无 |
 | 任何阶段 | 状态文件损坏 | 按 aborted 处理 + 审计日志；swapping 前无影响，swapping 后以 .old 存在性推断 | 视阶段 |
 
-## 恢复机制（用户定调：全自动，无 --resume，无人工询问）
+## 恢复机制（用户定调：全自动续作，无人工询问）
 
 **原则**：用户调 install 的期望就是「装完」——中断后自动继续，不问任何人。
 安装的每一步本就设计为安全/幂等/可回滚，续作没有破坏性，无需确认。
@@ -178,7 +178,7 @@ cleaning 清掉 `.old` 与状态文件即 done——状态文件删除 = 安装�
 
 1. **主责 = 看门狗（用户定调）**：看护者启动时全量检查（启动时一次 +
    运行中每日一次，避免常态浪费）——检查对象是**各类本地状态文件**
-   （当前只有 install.state.json，后续扩展更多），职责仅为「发现残留 →
+   （当前只有 install.state，后续扩展更多），职责仅为「发现残留 →
    `spawn_detached(current_exe, ["install", "--continue"])` 拉起对应处理者」。
    **看护者绝不解读状态文件语义**（用户定调的分工原则）：残留只能说明
    install 未正常结束，处于哪一步、已完成则清文件退出还是续跑——全部由
@@ -203,7 +203,7 @@ cleaning 清掉 `.old` 与状态文件即 done——状态文件删除 = 安装�
 
 ### 显式宣告协议（双介质分离——分工原则的落点）
 
-- **持久介质 = install.state.json**：install 自己的进度账本，**只有 install
+- **持久介质 = install.state**：install 自己的进度账本，**只有 install
   读**。残留 ≠ 在安装（可能没正常结束），看护者/守护不做语义解读。
 - **易失介质 = 共享内存节 `Local\aproxy-install`**：install 启动时创建并
   持有句柄，内容 `{installer_pid: u32, 心跳毫秒: u64}`（独立 ticker 周期
@@ -323,11 +323,11 @@ Rust 工具链）。绕开编译的两条路：cargo-binstall 约定（P1 顺带
 ## skill 增补（commands.md / behaviors.md / compatibility.md）
 
 - install/upgrade 命令参考（含 --from/--adopt/--variant/--allow-downgrade/
-  --abort；续作全自动，无 --resume）。
+  --abort；续作全自动）。
 - behaviors.md「二进制更换阶段」节：语义、status 可见性、**ACK 失败处置**——
   某实例多轮未表达 = 该实例有隐患，skill 指引：将其关闭后重试安装
   （为什么不能强杀：避免服务中断原则）。
-- **恢复自动化节**：中断续作全自动（看门狗主责 + CLI 兜底），无 --resume
+- **恢复自动化节**：中断续作全自动（看门狗主责 + CLI 兜底）
   无人工询问；看护者/守护只认 install 的显式宣告，不解读状态文件残留。
 - **手动更新兜底节**：install 反复失败的特殊情况由 agent 手动执行——
   `aproxy stop all` → 替换 `~/.aproxy/bin/aproxy.exe` → `aproxy restore`；
@@ -378,7 +378,7 @@ Rust 工具链）。绕开编译的两条路：cargo-binstall 约定（P1 顺带
    恢复机制节定夺沿用。
 3. **failed 现场保留**：staging 永久保留，用户显式 --abort 才清理。
 4. **状态文件位置**：run/ 子目录（根目录只放长期稳定件，防混乱）。
-5. **恢复自动化**：无 --resume 无询问——看门狗主责 + CLI 兜底 + install
+5. **恢复自动化**：全自动无询问——看门狗主责 + CLI 兜底 + install
    --continue 统一续跑入口；看护者/守护只认显式宣告（共享内存节），绝不
    解读状态文件残留（分工原则）；看护者启动全量检查只在启动一次（后续
    或每日一次），防常态浪费。
@@ -396,5 +396,5 @@ Rust 工具链）。绕开编译的两条路：cargo-binstall 约定（P1 顺带
 - 既有行为不变：未设环境变量 = `~/.aproxy`，用户无感知。
 - 测试基建：tests 里的 tempdir + env 注入模式不变，只是注入的是
   APROXY_HOME（APROXY_RUN_DIR 注入继续有效，优先级：RUN_DIR > HOME 派生）。
-- install.state.json 在 run/ 下：测试注入 HOME 后状态文件自动隔离，无需
+- install.state 在 run/ 下：测试注入 HOME 后状态文件自动隔离，无需
   额外处理。

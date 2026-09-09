@@ -67,6 +67,7 @@
   "sha256": "…",
   "old_path": "~/.aproxy/bin/aproxy.exe.old-0.1.0-alpha.6", // swap 后填充
   "instance_snapshot": ["12345", "12349"],  // ACK 阶段的实例清单
+  "skill": { "status": "downloading", "attempt": 1, "version": "0.1.0-alpha.7" },  // skill 支线（非强制，见 skill 更新节）
   "started_at": 0, "updated_at": 0,
   "installer_pid": 0
 }
@@ -331,6 +332,71 @@ unix 实测项覆盖此面。
 - 校验：GitHub 渠道 sha256（发布资产附 `.sha256`）；`--from` 校验 = 临时执行
   `--version` 验证可运行且版本号 == 目标。
 
+## 下载代理（用户定调：与请求代理绝对分离）
+
+**下载代理 ≠ 请求代理**：`config.toml` 的 `proxy` 是上游请求转发用的，
+install 下载**绝不读取**。下载代理独立配置两处：
+
+- settings.json 增 `download_proxy: Option<String>`（程序管理，经 CLI 写入）
+- install 参数 `--download-proxy <URL>`（仅本次，优先于 settings）
+- 两者都未配置 → reqwest 自然回退环境变量（HTTPS_PROXY 等）——系统代理
+  用户零配置即可用。
+
+错误信息与 `config --show` 对下载代理同样打码（内嵌凭据）。两套代理字段
+命名严格区分，文档/skill 明确「下载代理管 install 下载，请求代理管上游
+转发」，杜绝混淆。
+
+## skill 更新（非强制支线，用户定调 2026-09-10）
+
+### 定位与位置
+
+- skill 文档（SKILL.md + references/）安装于 `~/.aproxy/skills/aproxy-cli/`，
+  install 时随二进制**并行下载更新**（独立任务，不阻塞交换/滚动重启任何
+  阶段）。
+- **非强制**：默认下载；settings.json 增 `skill_auto_update: bool`（默认
+  true）全局禁止；参数 `--no-skills` 本次禁止。**可单独更新**：参数
+  `--skills-only` 只更新 skill 不动二进制（跳过整个二进制状态机）。
+- **安装到 agent 侧不做**：`~/.claude/skills/` 等目录归各 agent 管，
+  install 不越界触碰——落位后输出提示（如何链接/复制到所用 agent 的
+  skills 目录）。
+
+### 下载通道（难点：GitHub 国内大概率无法连接）
+
+skill 的决定性优势：**它是纯文本且本来就以仓库文件存在**——除 Release
+asset 外还能经 jsDelivr CDN 按 tag 直拉仓库内容（国内可达性远好于
+GitHub）。三级通道顺序：
+
+1. **GitHub Releases asset**：`aproxy-skill-v<版本>.zip` + `.sha256`，与
+   二进制同下载路径、同下载代理、同校验强度（信任锚 = 仓库所有者的
+   release 身份）。
+2. **jsDelivr CDN**：`cdn.jsdelivr.net/gh/<owner>/<repo>@v<版本>/
+   skill/aproxy-cli/<文件>`（skill 目录随仓库发布，tag 精确锁版本）。
+   **信任模型如实降级**：CDN 是中间人、无 sha256 强校验——风险接受理由：
+   纯文本低危（最坏 = 文档过时/误导，非可执行代码）+ tag 锁定 + CDN 中立
+   性；输出里注明来源是镜像（用户可 `--no-skills` 或仅用 GitHub 源）。
+3. **放弃**：重试 3 次（每级通道内重试）全失败 → `status=failed`，
+   **安装照常成功**——skill 不是二进制的依赖，主流程任何阶段都不等待/
+   不受影响（唯一同步点：install 进程退出前 join skill 任务收尾）。
+
+npm/cargo 渠道（P2）自带国内镜像（npmmirror/rsproxy），是最终态的国内
+最优路径：npm 包直接附带 skill 文件，postinstall 复制——与二进制同渠道
+国内可达。
+
+### 状态与幂等（无恢复状态机——有意简化）
+
+- install.state 增 `skill: {status: pending|downloading|done|failed|skipped,
+  attempt, version}` 子状态（单独可观察，用户定调要求）。
+- **skill 下载是幂等覆盖操作，不建断电恢复状态机**：半截文件下次重下即
+  愈；`--continue` 续跑时 failed **不再自动重试**（避免每次续作都拖一遍
+  下载）——`--skills-only` 手动重试。
+- 落位 = 目录原子替换：staging 解压 → 旧目录 rename 走 → 新目录 rename 进
+  → 删旧；Windows 上 agent 正读 skill 文件的冲突短重试 3 次，失败放弃
+  （下次 install 再覆盖）。
+- 版本对齐：skill 跟随 install 目标版本（同一 tag）；`--skills-only` 无参
+  默认 latest。
+- settings.json `skill_auto_update = false` 时主流程完全跳过 skill 任务
+  （status=skipped）。
+
 ## 渠道矩阵（全部配置，按期上线；零经济成本，开源无顾虑）
 
 | 渠道 | 形态 | 期 |
@@ -345,6 +411,9 @@ unix 实测项覆盖此面。
 | Homebrew tap（macOS/Linux）/ AUR（Arch） | formula/PKGBUILD 指向 GH Releases；管辖外目录 → install 拒绝换血并指路（同 Windows 包管理器边界规则） | P2 |
 
 bootstrap 脚本与包管理器 = **首装渠道**；装机后的升级一律 `aproxy install` 自管。
+npm/cargo 渠道发布产物**附带 skill 文件**（postinstall/cargo 装完复制到
+`~/.aproxy/skills/`）——包管理器镜像（npmmirror/rsproxy）天然解决 skill 的
+国内可达性。
 
 ### Cargo 问题的结论（讨论沉淀）
 
@@ -362,12 +431,17 @@ Rust 工具链）。绕开编译的两条路：cargo-binstall 约定（P1 顺带
 ## skill 增补（commands.md / behaviors.md / compatibility.md）
 
 - install/upgrade 命令参考（含 --from/--adopt/--variant/--allow-downgrade/
-  --abort；续作全自动）。
+  --abort/--no-skills/--skills-only/--download-proxy；续作全自动）。
 - behaviors.md「二进制更换阶段」节：语义、status 可见性、**ACK 失败处置**——
   某实例多轮未表达 = 该实例有隐患，skill 指引：将其关闭后重试安装
   （为什么不能强杀：避免服务中断原则）。
 - **恢复自动化节**：中断续作全自动（看门狗主责 + CLI 兜底）
   无人工询问；看护者/守护只认 install 的显式宣告，不解读状态文件残留。
+- **skill 更新节**：~/.aproxy/skills/ 位置、三级下载通道（国内可达性）、
+  非强制语义（失败不影响安装）、--skills-only 单独更新、skill 文件安装到
+  agent 目录由用户/agent 自行链接（install 只落规范位置）。
+- **下载代理节**：下载代理（download_proxy/--download-proxy）与请求代理
+  （config.toml proxy）严格分离——命名、文档、打码口径三处对齐。
 - **手动更新兜底节**：install 反复失败的特殊情况由 agent 手动执行——
   `aproxy stop all` → 替换 `~/.aproxy/bin/aproxy.exe` → `aproxy restore`；
   明确标注此路径**有服务中断**，仅作兜底。
@@ -376,13 +450,15 @@ Rust 工具链）。绕开编译的两条路：cargo-binstall 约定（P1 顺带
 ## 测试矩阵
 
 - 单测：状态机迁移合法性 / 恢复矩阵逐行注入 / staging 校验 / 降级防呆 /
-  变体选择逻辑 / 宣告节读写与心跳过期判定。
+  变体选择逻辑 / 宣告节读写与心跳过期判定 / skill 三通道选择与重试放弃。
 - 集成（需目录重定向，见开放问题 1）：`--from` 全流程（有实例/无实例）/
   各崩溃点 kill 安装进程 → 自动续恢复（看门狗/CLI 触发）/ 多实例逐个重启
   顺序断言（任一时刻至多一个下线）/ ACK 失败 → restart 收敛 / 管辖外实例
   拒绝 / **安装态看护者差异化**：滚动重启中看护者不误判死亡（复查路径）、
   kill install 进程 → 看护者保活拉起 --continue、守护自检在宣告有效时不
-  补种、install 结束后自检恢复出簇。
+  补种、install 结束后自检恢复出簇 / **skill 支线**：--no-skills 跳过、
+  下载失败 3 次后放弃且安装仍成功（本地 mock 服务器模拟不可达）、
+  --skills-only 单独更新、skill 落位目录原子替换。
 - Windows 专属：rename 锁定 exe 语义（已有实证）/ .old 被锁时 cleaning 重试。
 - **unix 专属**（CI check 覆盖编译面，行为面入 TODO 实测项）：单步 rename
   swap / chmod 755 / /dev/shm 宣告残留的心跳过期失效 + 正常结束 unlink /
@@ -407,9 +483,13 @@ Rust 工具链）。绕开编译的两条路：cargo-binstall 约定（P1 顺带
 5. **滚动重启与终验清理** + 无实例快路径 + 竞态窗口防护。
 6. **恢复机制**：看门狗启动检测 + CLI 静默兜底 + --continue 续跑 + 恢复矩阵全链路
    集成测试（崩溃点注入，含 swapping 空窗的手动修复三退路验证）。
-7. **GitHub Releases 渠道**：API 列表/下载/变体选择/sha256（P0 收尾）。
-8. **收尾**：skill 三处增补（含手动更新兜底 + swapping 手动修复指南）+
-   README + architecture.md 节 + TODO 收口。
+7. **GitHub Releases 渠道 + 下载基建**：API 列表/下载/变体选择/sha256 +
+   **下载代理分离**（download_proxy/--download-proxy + 打码）。
+8. **skill 更新支线**：三级通道（Release asset → jsDelivr → 放弃）+ 并行
+   任务 + 子状态 + 落位替换 + --no-skills/--skills-only + settings
+   `skill_auto_update`（测试用本地 mock 服务器 + 假 CDN 域名注入）。
+9. **收尾**：skill 文档增补（含手动更新兜底 + swapping 手动修复指南 +
+   skill 更新节 + 下载代理节）+ README + architecture.md 节 + TODO 收口。
    （P1/P2 渠道各自独立任务，不阻塞本计划验收。）
 
 ## 已定夺（原开放问题，2026-09-09 用户拍板）
@@ -431,6 +511,12 @@ Rust 工具链）。绕开编译的两条路：cargo-binstall 约定（P1 顺带
    全部由宣告节门控，常态行为零改变。
 7. **安全中间态入口**：aproxy.bat + 无后缀 aproxy（sh）常驻 bin，PATHEXT
    优先级实现 fallback（→ aproxy.old.exe，保持 exe 后缀）；ps1 不做。
+8. **skill 更新**（2026-09-10 用户定调）：~/.aproxy/skills/ 位置；默认下载、
+   settings `skill_auto_update` 可禁、--no-skills 本次禁、--skills-only 单独
+   更新；与二进制下载并行、失败重试 3 次后放弃且不影响安装成功；三级通道
+   （Release asset → jsDelivr tag 内容 → 放弃）应对 GitHub 国内不可达；
+   skill 子状态入 install.state，下载幂等无恢复状态机；下载代理与请求代理
+   绝对分离（download_proxy/--download-proxy）。
 
 ## APROXY_HOME 的影响面（实现注意）
 

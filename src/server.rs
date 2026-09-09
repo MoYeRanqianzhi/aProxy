@@ -273,9 +273,9 @@ pub(crate) fn init_stdout_logging() {
 }
 
 /// 守护子进程日志：写 `~/.aproxy/logs/<端口>.log`（超过 2 MiB 截断重写，
-/// 保留最近一次运行的日志即可，避免无限膨胀）。文件创建/截断时写入 UTF-8
-/// BOM——无 BOM 的 UTF-8 会被按 ANSI 探测的查看器（记事本旧版/部分编辑器）
-/// 误判为 GBK 而显示中文乱码。
+/// 保留最近一次运行的日志即可，避免无限膨胀）。UTF-8 无 BOM——历史上曾写过
+/// BOM 后撤销（部分工具链对 BOM 敏感），日志查看依赖终端/编辑器自身的 UTF-8
+/// 解码；Windows 控制台乱码与文件无关（进程入口已切 65001）。
 pub(crate) fn init_daemon_logging(listen_addr: &str) {
     let _ = std::fs::create_dir_all(daemon::logs_dir());
     let path = daemon::logs_dir().join(format!("{}.log", daemon::port_of(listen_addr)));

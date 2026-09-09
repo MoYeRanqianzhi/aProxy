@@ -62,8 +62,9 @@ pub struct Settings {
     /// 默认 30。
     #[serde(default = "default_watchdog_heartbeat_secs")]
     pub watchdog_heartbeat_secs: u64,
-    /// 挂死判定容忍周期数：连续 N 轮心跳扫描都没更新且 IPC ping 也失败，才判定
-    /// 实例挂死并杀+重拉。1 = 一轮超时即启动二意见确认。误杀调节阀，默认 1。
+    /// 挂死判定容忍周期数：心跳过期（阈值 = 扫描周期×(N+1)，即 N 倍容忍已被
+    /// 过期窗口吸收）且一轮 IPC ping（内部含 3 次探测）无响应，才判定实例挂死
+    /// 并杀+重拉。1 = 一轮超时即启动二意见确认。误杀调节阀，默认 1。
     #[serde(default = "default_watchdog_stale_after_cycles")]
     pub watchdog_stale_after_cycles: u64,
     /// crashloop 上限：同一实例连续重拉失败达此次数后放弃（指数退避封顶 300s），

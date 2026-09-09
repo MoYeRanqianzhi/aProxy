@@ -78,10 +78,12 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
             );
         }
         // 混版本检测：CLI 与实例版本不一致说明该实例还在跑旧二进制（替换 exe
-        // 后需 stop+start 才升级）——滚动升级的事实源
+        // 后重启该实例即升级）——滚动升级的事实源。推荐 restart 而非 stop+start：
+        // stop&&start 的无参 start 走 default_config，别名启动的实例会被指到
+        // 错误配置；restart 按 .restore 原参数拉起，不会指错。
         if info.version != cli_version {
             println!(
-                "    注意: 实例版本 v{} 与当前 CLI v{cli_version} 不同，替换二进制后重启该实例（aproxy stop {} && aproxy start）可完成升级",
+                "    注意: 实例版本 v{} 与当前 CLI v{cli_version} 不同，替换二进制后执行 aproxy restart {} 可完成升级",
                 info.version,
                 daemon::port_of(&info.listen_addr)
             );

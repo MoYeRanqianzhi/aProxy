@@ -19,7 +19,7 @@ pub(crate) fn handle_find_cmd(
     } else {
         find::AliasFilter::All
     };
-    let mut items: Vec<_> = find::discover(&settings)
+    let items: Vec<_> = find::discover(&settings)
         .into_iter()
         .filter(|d| match filter {
             find::AliasFilter::All => true,
@@ -27,11 +27,9 @@ pub(crate) fn handle_find_cmd(
             find::AliasFilter::Unaliased => d.aliases.is_empty(),
         })
         .filter(|d| query.as_deref().is_none_or(|q| d.matches_query(q)))
+        // --port 过滤：不可解析端口（listen_addr 缺失/损坏）的配置 matches_port
+        // 必为 false，无需特判
         .filter(|d| port.is_none_or(|p| d.matches_port(p)))
         .collect();
-    // --port 过滤下不可解析的配置必然不匹配，无需特判；空结果统一提示
-    if let Some(p) = port {
-        items.retain(|d| d.matches_port(p));
-    }
     find::print_list(&items);
 }

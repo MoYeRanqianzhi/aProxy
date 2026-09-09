@@ -1367,7 +1367,10 @@ mod tests {
         st.maybe_idle_exit().await;
         tokio::time::sleep(Duration::from_millis(1100)).await;
         st.maybe_idle_exit().await;
-        assert!(!st.pending.is_empty(), "pending 应保持（测试进程仍活着即通过）");
+        assert!(
+            !st.pending.is_empty(),
+            "pending 应保持（测试进程仍活着即通过）"
+        );
     }
 
     #[test]

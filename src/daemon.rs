@@ -581,6 +581,20 @@ pub fn registry_contains_pid_in(dir: &std::path::Path, pid: u32) -> bool {
     })
 }
 
+/// 删除实例的 IPC 端点文件（优雅退出/看护摘除时调用）。
+/// Windows 命名管道由内核回收（no-op）；unix 的 UDS socket 是真实文件，
+/// bind 前的 remove_file 已自愈残留，此处显式清理让 run/ 目录不留死端点。
+pub fn remove_socket_file(port: &str) {
+    #[cfg(unix)]
+    {
+        let _ = std::fs::remove_file(endpoint_for(port));
+    }
+    #[cfg(windows)]
+    {
+        let _ = port;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 自愈恢复记录（~/.aproxy/run/<port>.restore）
 //

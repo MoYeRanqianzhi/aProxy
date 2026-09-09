@@ -377,6 +377,12 @@ impl WatchdogState {
         };
         let w = self.watched.swap_remove(idx);
         imp::close_handle(w.handle);
+        // 看护关系终止即清理实例的 IPC 端点与心跳残留：优雅退出路径守护会
+        // 自清，崩溃/强杀路径靠这里兜底（Windows 管道/节对象由内核回收，
+        // 两个清理在 Windows 上均为 no-op；unix 的 .sock 靠 respawn 前
+        // remove_file 自愈，但清掉更干净，/dev/shm 心跳文件则无人自愈）
+        remove_heartbeat_file(port);
+        crate::daemon::remove_socket_file(port);
 
         let restore_path = crate::daemon::restore_file_path_in(&self.cfg.run_dir, port);
         if !restore_path.is_file() {
@@ -789,6 +795,13 @@ pub fn read_heartbeat(port: &str) -> Option<u64> {
     imp_heart::heartbeat_load(port)
 }
 
+/// 清理实例的心跳文件（守护优雅退出/看护摘除时调用）。
+/// Windows 节对象由内核回收（no-op）；unix 删除 /dev/shm 下的文件，
+/// 消除崩溃/强杀后的 tmpfs 残留（实测一轮测试曾留 13 个）。
+pub fn remove_heartbeat_file(port: &str) {
+    imp_heart::remove_heartbeat_file(port)
+}
+
 /// 当前 Unix 毫秒（系统时钟早于 epoch 回退 0——仅用于新鲜度比较，
 /// 看护侧同时校验非 0）
 pub fn now_millis() -> u64 {
@@ -886,6 +899,9 @@ mod imp {
 
     /// 死亡等待的存在性探测：/proc 可用（Linux）时 zombie 视为死亡；
     /// 无 /proc（macOS）回退 kill(pid,0)（EPERM 视为存活，其余错误为死亡）。
+    /// 已知退化：回退分支对 zombie 失效——kill(pid,0) 对已死未收割的进程
+    /// 也返回成功，死亡事件会延迟到 health_scan 兜底。macOS 属未实测平台，
+    /// 接受此退化；若未来需要，可改 waitid(WNOHANG) 或进程状态查询。
     fn process_alive_for_wait(pid: i32) -> bool {
         if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             // stat 形如 "pid (comm) S ..."，comm 可含空格/括号，取 ')' 之后首字段
@@ -997,6 +1013,9 @@ mod imp_heart {
             let _ = windows_sys::Win32::Foundation::CloseHandle(writer.mapping);
         }
     }
+
+    /// 节对象由内核在最后一个句柄关闭时回收，无文件系统残留可清
+    pub fn remove_heartbeat_file(_port: &str) {}
 }
 
 #[cfg(unix)]
@@ -1040,6 +1059,16 @@ mod imp_heart {
     }
 
     pub fn unmap_heartbeat(_writer: &super::HeartbeatWriter) {}
+
+    /// 删除心跳文件。Windows 的节对象随进程退出由内核回收，unix 是 /dev/shm
+    /// 下的真实文件（tmpfs 内存计费），守护优雅退出/看护摘除时清掉，崩溃残留
+    /// 由下次同端口 create 的 truncate 覆盖 + 人工/治理路径兜底
+    pub fn remove_heartbeat_file(port: &str) {
+        let path = format!("/dev/shm/{}", super::heartbeat_section_name(port));
+        // 写侧仍持有打开句柄时 unlink 合法（句柄继续可写直至关闭），
+        // 残留仅出现在「创建后未到优雅退出就崩溃」的场景
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[cfg(windows)]

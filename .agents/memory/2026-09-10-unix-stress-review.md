@@ -18,6 +18,13 @@ unix terminate_verified 实装 SIGKILL）、f13bc0a（S3 is_aproxy_process /proc
 缺陷声明）。复跑实证：p6_storm 修复前 3/5 → PASS=5 FAIL=0；p7_takeover claim
 单一 pid、前任被真杀。双平台全量测试全绿。
 
+**修复审查轮独立复验（同日，审查窗口执行）**：4 个修复提交与归档方向逐项对应；
+Windows lib 113/集成 36+2、remote lib 111/集成 36+2 全绿；核心探针独立复验
+P1 9/9（S4 关卡不挡处决）、P6 5/5（S1）、P7 5/5 前任被真杀+claim 单一 pid（S2）。
+遗留 R1（纯函数分支补单测）/R2（p7 探针文案过时）/**F2（is_aproxy_process
+按镜像名精确比对——改名部署形态如生产 aproxy-using.exe 不受看护：不收养、
+不选举、不处决；两端一致，待产品决策）**，详录归档文档「修复审查轮」节。
+
 关键事实：
 
 1. **S1 根因（已修）**：respawn_instance 就绪判定复用 list_instances_in

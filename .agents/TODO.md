@@ -74,6 +74,20 @@
 - [x] **S6：macOS 回退分支对 zombie 失效**——注释补声明，health_scan 兜底
   （macOS 未实测平台，接受退化）。
 
+## 修复审查轮遗留（2026-09-10，独立复验后记录，详录 .agents/docs/unix-stress-review.md 复验节）
+
+- [ ] **R1（测试覆盖）**：修复未配单元测试——registry_contains_pid_in 与
+  is_aproxy_process unix 版三档判定（ENOENT 判死 / `(deleted)` 剥离 / fail-open）
+  纯函数分支可低成本补单测；当前靠实机探针覆盖，强度足够
+- [ ] **R2（探针维护）**：p7_takeover.sh「unix no-op 未杀」文案按旧行为写
+  （断言兼容新行为，5/5 可复跑）；下次触碰时更新文案并追加「接管即杀前任后
+  SIGCONT 不可恢复」断言
+- [ ] **F2（产品决策）：is_aproxy_process 二进制名精确耦合**——改名运行的二进制
+  （如生产 aproxy-using.exe 部署形态）被判非 aProxy 进程：不被收养（失去看门狗
+  自动恢复）、不计入选举、处决被关卡拒绝（防误杀方向正确）、claim 接管不杀前任。
+  Windows 侧 merge-base 前已有语义，unix 实装后两端一致。待决策：接受「改名
+  二进制不受看护」为约定，或放宽比对（会同时削弱防冒名闸门）
+
 ## 中期功能（对齐「无限重试、不中断」使命）
 
 - [ ] **正式发布：GitHub 构建指令集多版本**（必然项，2026-09-07 定调）：CI 矩阵 baseline + `RUSTFLAGS="-C target-cpu=x86-64-v3"`（AVX2），产物命名区分，发布页两者都放；详见 memory/release-engineering

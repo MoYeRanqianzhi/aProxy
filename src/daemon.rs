@@ -560,6 +560,27 @@ pub async fn list_instances_in(dir: &std::path::Path) -> Vec<InstanceInfo> {
     out
 }
 
+/// 只读检索注册表：是否存在 pid 匹配的实例记录。
+/// respawn 的就绪判定专用——不复用 `list_instances_in`（它对 ping 失败的
+/// 条目有删除副作用：A 实例重拉的就绪轮询会顺带清掉同注册表里 B/C 死实例
+/// 的记录，其死亡事件随后被混合态误判为优雅退出而失去自动恢复）。就绪只需
+/// 「新 pid 的注册记录已出现」，读文件即可，无需 IPC。
+pub fn registry_contains_pid_in(dir: &std::path::Path, pid: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("pid") {
+            return false;
+        }
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<InstanceInfo>(&c).ok())
+            .is_some_and(|info| info.pid == pid)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 自愈恢复记录（~/.aproxy/run/<port>.restore）
 //

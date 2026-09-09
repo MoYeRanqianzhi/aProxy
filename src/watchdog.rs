@@ -352,9 +352,13 @@ impl WatchdogState {
         hung
     }
 
-    /// 处理死亡事件：.restore + 注册表都在 = 崩溃 → 立即重拉；否则优雅退出/
-    /// 清理，摘除看护。重拉失败进退避队列（不 sleep——阻塞主循环会让 claim
-    /// 心跳停摆、被竞争者按「假死」夺权，M2），由 tick 的时间驱动重试。
+    /// 处理死亡事件：.restore 缺失 = 优雅退出 → 摘除看护；.restore 在 = 崩溃
+    /// → 立即重拉（注册表 .pid 是否在不是判据——其他实例 respawn 的验活清理
+    /// 会顺带删掉本实例的死注册记录，混合态若据此判「优雅退出」会让崩溃实例
+    /// 静默失去自动恢复，P6 死亡风暴实测）。优雅退出会删 .restore（守护退出
+    /// 路径先 .restore 后 .pid，两 unlink 间死亡事件最多多拉一次，方向安全）。
+    /// 重拉失败进退避队列（不 sleep——阻塞主循环会让 claim 心跳停摆、被竞争者
+    /// 按「假死」夺权，M2），由 tick 的时间驱动重试。
     /// 返回处置结果（测试断言用）。
     pub async fn handle_death(&mut self, port: &str) -> DeathOutcome {
         let Some(idx) = self.watched.iter().position(|w| w.port == port) else {
@@ -364,8 +368,7 @@ impl WatchdogState {
         imp::close_handle(w.handle);
 
         let restore_path = crate::daemon::restore_file_path_in(&self.cfg.run_dir, port);
-        let registry_path = crate::daemon::instance_file_path_in(&self.cfg.run_dir, port);
-        if !restore_path.is_file() || !registry_path.is_file() {
+        if !restore_path.is_file() {
             tracing::info!(port = %port, "实例已优雅退出（无恢复记录），摘除看护");
             self.after_watch_removal();
             return DeathOutcome::GracefulExit;
@@ -607,13 +610,12 @@ async fn respawn_instance(run_dir: &Path, port: &str) -> Result<u32, String> {
     // .restore 原参数，但配置可能已被用户改动（换端口）——新守护监听新端口
     // 时 ping 旧端口永远不通（与 restart 同款实测坑）。pid 是 spawn 返回值，
     // 唯一可靠锚点；新守护 bind 成功才写注册表，出现即就绪。
+    // 用只读检索而非 list_instances_in：后者的验活清理副作用会在本循环的
+    // 200ms 轮询里顺带删掉同注册表其他死实例的记录，其死亡事件随后被混合态
+    // 误判为优雅退出、静默失去自动恢复（P6 死亡风暴实测）。
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     loop {
-        if crate::daemon::list_instances_in(run_dir)
-            .await
-            .iter()
-            .any(|i| i.pid == pid)
-        {
+        if crate::daemon::registry_contains_pid_in(run_dir, pid) {
             return Ok(pid);
         }
         if std::time::Instant::now() > deadline {

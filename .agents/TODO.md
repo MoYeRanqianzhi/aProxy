@@ -97,7 +97,18 @@
 - [ ] **install/upgrade 二进制安装升级**（计划已批准，2026-09-09）：完整计划
   `.agents/plan/install-v1.md`——状态机 + 断电恢复矩阵 + PrepareSwap 广播
   ACK + Windows rename 接力 + 渠道矩阵（--from/GH/cargo/npm/包管理器全配置）；
-  发布 workflow 已就绪（e5136fc），渠道 P0 全配定调（dc3434b）
+  发布 workflow 已就绪（e5136fc），**渠道 P0 全部上线（2026-09-11，见下条）**
+- [x] **渠道 P0 全配 + 可信发布自动化**（2026-09-11，alpha.7~9 三轮发布实测）：
+  npm（@meowo/aproxy，esbuild 式多平台包：主包 JS 转发器 + 9 平台子包
+  os/cpu/libc 装配）、crates.io（aproxy）、cargo-binstall（零配置命中内置
+  模板）、GitHub（11 变体：win x64±v3/x86/arm64 + linux x64/arm64 gnu+musl
+  + macOS arm64/x64）；tag 推送全自动发布（release.yml publish job，
+  npm OIDC provenance SLSA v1 实证 + crates.io trusted publishing #19617）；
+  种子发布走本地 token，token 退役（NPM_TOKEN secret 已删）。
+  坑与边界：npm GAT 有 IP 允许列表（GitHub runner 必 404，token 路径在 CI
+  不可行）；npm trust 网页绑定强制人类 2FA（AI 不可代办，crates.io 有
+  API 可代办——POST /api/v1/trusted_publishing/github_configs）；
+  npm 11 prerelease 强制 --tag latest（0.1.x 全程 alpha，latest=最新 alpha）
 - [ ] **看门狗二期（可选）**：挂死不杀进程原地救（scoped runtime 注入 spike）、实例数极大时线程池死亡等待（unix 死亡等待已实装为轮询，见 unix-testing.md）
 - [x] **CI 激活与首版发布**（2026-09-10）：仓库开源（MoYeRanqianzhi/aProxy）+
   workflows 首跑全绿（CI/Review）；首跑抓到并修复 windows-sys 解析漂移

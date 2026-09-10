@@ -16,3 +16,4 @@
 - [unix-stress-review](memory/2026-09-10-unix-stress-review.md) — 压力实测审查全记录：S1-S6 修复+独立复验+R1/R2 关闭（75afe6b）+纯净性核查（功能稿完整封装于 stash@{0}，HEAD 零残留，双平台复验全绿 p7 7/7）；分支可合并；并行 cargo 竞争假编译错误教训 [[unix-first-test]] [[identity-no-name]] [[daemon-model]]
 - [identity-no-name](memory/2026-09-10-identity-no-name.md) — 用户定调：进程身份判定严禁依赖二进制名称（严重谬误）；正确锚点=spawn 链/IPC 端点归属/创建时间戳；机制替换方案与范围（A 本分支全换/B 独立成支）待批，重构稿在 stash@{0} [[unix-stress-review]] [[criticism-not-authorization]]
 - [criticism-not-authorization](memory/2026-09-10-criticism-not-authorization.md) — 教训：用户批评 ≠ 实施授权，先对齐修正方案再动手；平台共享语义重构不塞进单平台修复分支；方向稿 stash 留档规范 [[identity-no-name]]
+- [trusted-publishing-p0](memory/2026-09-11-trusted-publishing-p0.md) — 渠道 P0 落地：npm(@meowo 10 包)/crates.io/binstall 全自动 OIDC 发布（tag 即发）；关键坑：npm GAT IP 白名单杀 CI token 路径、npm TP 绑定强制人类 2FA 而 crates.io 有 API、cargo include 前导 / 锚定 [[daemon-model]]

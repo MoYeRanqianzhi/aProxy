@@ -185,9 +185,16 @@ pub async fn ipc_ping(port: &str) -> Result<InstanceInfo, String> {
 
 /// 发送 IPC 请求并等待响应（3 秒超时）。
 pub async fn ipc_request(port: &str, req: &IpcRequest) -> Result<IpcResponse, String> {
-    let endpoint = endpoint_for(port);
+    ipc_request_to(&endpoint_for(port), req).await
+}
+
+/// 按显式端点发送 IPC 请求并等待响应（3 秒超时）。
+/// 供绕过 `endpoint_for` 解析的场景使用：unix 的 UDS 路径在 run_dir 里，
+/// 守护以隔离 `APROXY_RUN_DIR` 运行时，同进程的库调用方（测试）须按守护
+/// 实际的 socket 路径寻址；Windows 管道名全局唯一，不受 run_dir 影响。
+pub async fn ipc_request_to(endpoint: &str, req: &IpcRequest) -> Result<IpcResponse, String> {
     let req_line = serde_json::to_string(req).expect("序列化 IPC 请求失败");
-    let fut = imp::exchange(&endpoint, &req_line);
+    let fut = imp::exchange(endpoint, &req_line);
     match tokio::time::timeout(Duration::from_secs(3), fut).await {
         Ok(Ok(line)) => {
             serde_json::from_str(&line).map_err(|e| format!("{endpoint}: 响应解析失败 {e}"))
@@ -553,6 +560,41 @@ pub async fn list_instances_in(dir: &std::path::Path) -> Vec<InstanceInfo> {
     out
 }
 
+/// 只读检索注册表：是否存在 pid 匹配的实例记录。
+/// respawn 的就绪判定专用——不复用 `list_instances_in`（它对 ping 失败的
+/// 条目有删除副作用：A 实例重拉的就绪轮询会顺带清掉同注册表里 B/C 死实例
+/// 的记录，其死亡事件随后被混合态误判为优雅退出而失去自动恢复）。就绪只需
+/// 「新 pid 的注册记录已出现」，读文件即可，无需 IPC。
+pub fn registry_contains_pid_in(dir: &std::path::Path, pid: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("pid") {
+            return false;
+        }
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<InstanceInfo>(&c).ok())
+            .is_some_and(|info| info.pid == pid)
+    })
+}
+
+/// 删除实例的 IPC 端点文件（优雅退出/看护摘除时调用）。
+/// Windows 命名管道由内核回收（no-op）；unix 的 UDS socket 是真实文件，
+/// bind 前的 remove_file 已自愈残留，此处显式清理让 run/ 目录不留死端点。
+pub fn remove_socket_file(port: &str) {
+    #[cfg(unix)]
+    {
+        let _ = std::fs::remove_file(endpoint_for(port));
+    }
+    #[cfg(windows)]
+    {
+        let _ = port;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 自愈恢复记录（~/.aproxy/run/<port>.restore）
 //
@@ -867,7 +909,9 @@ mod imp {
 
     /// 强制终止（--force）：SIGKILL（unix 无镜像名 API，靠 claim/探活上层验证）
     pub fn terminate_process(pid: u32) -> Result<(), String> {
-        let r = unsafe { libc_kill(pid as i32, 9) };
+        // 裸 extern 声明直接指向 libc 的 kill(2) 符号（unix 分支不引 libc crate，
+        // Windows 下整个 imp 模块被 cfg 排除，符号只在 unix 链接）
+        let r = unsafe { kill(pid as i32, 9) };
         if r == 0 {
             Ok(())
         } else {
@@ -879,7 +923,7 @@ mod imp {
     }
 
     unsafe extern "C" {
-        fn libc_kill(pid: i32, sig: i32) -> i32;
+        fn kill(pid: i32, sig: i32) -> i32;
     }
 
     pub async fn exchange(endpoint: &str, req_line: &str) -> Result<String, String> {
@@ -922,6 +966,9 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 唯一消费者是下方 cfg(windows) 的 IPC roundtrip 测试（unix 分支的
+    // UDS roundtrip 测试尚未编写）
+    #[cfg(windows)]
     use std::sync::atomic::Ordering;
 
     fn sample_info(port: &str) -> InstanceInfo {
@@ -946,6 +993,33 @@ mod tests {
         assert_eq!(port_of("127.0.0.1:12345"), "12345");
         assert_eq!(port_of("[::1]:8080"), "8080");
         assert_eq!(port_of("no-port"), "no-port");
+    }
+
+    #[test]
+    fn registry_contains_pid_matches_by_parsed_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut info = sample_info("59901");
+        info.pid = 4242;
+        write_instance_file_in(dir.path(), &info).unwrap();
+
+        assert!(registry_contains_pid_in(dir.path(), 4242));
+        assert!(!registry_contains_pid_in(dir.path(), 4243));
+        // 非 .pid 后缀的文件不参与检索
+        std::fs::write(dir.path().join("59901.restore"), "args").unwrap();
+        assert!(registry_contains_pid_in(dir.path(), 4242));
+    }
+
+    #[test]
+    fn registry_contains_pid_skips_corrupt_and_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // 损坏记录（不可解析）跳过，不 panic 不误报
+        std::fs::write(dir.path().join("59902.pid"), "not-json").unwrap();
+        assert!(!registry_contains_pid_in(dir.path(), 1));
+        // 目录不存在 → false（respawn 轮询的前置态）
+        assert!(!registry_contains_pid_in(
+            dir.path().join("no-such").as_path(),
+            1
+        ));
     }
 
     #[test]

@@ -12,3 +12,7 @@
 - [panic-abort-outlook](memory/2026-09-07-panic-abort-outlook.md) — abort 展望（遥遥无期）：实测省 32% 体积（4.06→2.77MB），待代码足够安全成熟且需更多优势时才考虑，须配看门狗 [[panic-abort-outlook]] [[daemon-model]]
 - [release-engineering](memory/2026-09-07-release-engineering.md) — 发布工程铁则：正式发布起 GitHub 必构建指令集多版本（baseline + x86-64-v3），必然项非展望 [[release-engineering]] [[daemon-model]]
 - [aproxy-cli-skill-versioning](memory/2026-09-07-aproxy-cli-skill-versioning.md) — aproxy-cli skill（.claude/skills/）版本化策略：latest 直改小版本、大版本才留存 references/<版本>/ 每版一 compatibility；CLI/配置/行为变更必须同步更新 skill [[aproxy-cli-skill-versioning]]
+- [unix-first-test](memory/2026-09-10-unix-first-test.md) — unix 分支首次实机（Ubuntu）：看门狗曾整体失效+extern 符号名两处 P0 已修；mock Content-Length 错标教训；APROXY_RUN_DIR 平台语义待决策 [[daemon-model]] [[review-findings]]
+- [unix-stress-review](memory/2026-09-10-unix-stress-review.md) — 压力实测审查全记录：S1-S6 修复+独立复验+R1/R2 关闭（75afe6b）+纯净性核查（功能稿完整封装于 stash@{0}，HEAD 零残留，双平台复验全绿 p7 7/7）；分支可合并；并行 cargo 竞争假编译错误教训 [[unix-first-test]] [[identity-no-name]] [[daemon-model]]
+- [identity-no-name](memory/2026-09-10-identity-no-name.md) — 用户定调：进程身份判定严禁依赖二进制名称（严重谬误）；正确锚点=spawn 链/IPC 端点归属/创建时间戳；机制替换方案与范围（A 本分支全换/B 独立成支）待批，重构稿在 stash@{0} [[unix-stress-review]] [[criticism-not-authorization]]
+- [criticism-not-authorization](memory/2026-09-10-criticism-not-authorization.md) — 教训：用户批评 ≠ 实施授权，先对齐修正方案再动手；平台共享语义重构不塞进单平台修复分支；方向稿 stash 留档规范 [[identity-no-name]]

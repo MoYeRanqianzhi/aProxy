@@ -196,14 +196,24 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
             stop_signal(stop_rx).await;
             tracing::info!("10 秒后强制退出（在途请求将中断）");
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            daemon::remove_instance_file(&actual_addr);
-            daemon::remove_restore_file(&actual_addr);
+            remove_registry_files(&actual_addr);
             std::process::exit(0);
         } => {}
     }
-    daemon::remove_instance_file(&actual_addr);
-    daemon::remove_restore_file(&actual_addr);
+    remove_registry_files(&actual_addr);
     tracing::info!("aProxy 已停止");
+}
+
+/// 优雅退出的注册表清理。顺序是刻意的：先删 .restore 再删 .pid——看门狗的
+/// 死亡事件若恰在两个 unlink 之间触发，读到的状态是「无恢复记录」= 优雅退出；
+/// 反序则会误判为崩溃而重拉一个用户刚停掉的实例。末尾顺带清 IPC 端点文件与
+/// 心跳文件（Windows 侧均为内核回收，这两个调用是 no-op；unix 清 unix socket
+/// 与 /dev/shm 心跳，消除残留）。
+fn remove_registry_files(listen_addr: &str) {
+    daemon::remove_restore_file(listen_addr);
+    daemon::remove_instance_file(listen_addr);
+    watchdog::remove_heartbeat_file(daemon::port_of(listen_addr));
+    daemon::remove_socket_file(daemon::port_of(listen_addr));
 }
 
 /// bind 失败分类：「地址被占用」/「权限不足或被系统保留」（Windows 上常见于

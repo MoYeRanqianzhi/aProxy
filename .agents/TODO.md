@@ -36,6 +36,60 @@
   restart 与看门狗 respawn 同款）与 skill「stop 后再 start」误导源三处
 - [x] restart 换端口回归集成测试（tests/restart_integration.rs 2 例）
 
+## alpha.6 之后（2026-09-09~10，unix 实测轮）
+
+- [x] **unix 分支实测**（ssh remote Ubuntu 24.04 实机，报告 .agents/docs/unix-testing.md）：
+  修复 5 项——P0 编译/链接阻断 2 项（watchdog Duration 导入、daemon extern 符号名
+  libc_kill→kill）、P1 看门狗 unix 失效 2 项（adopt_scan 收养不进 + zombie 误判/
+  terminate 空操作）、P2 测试平台假设 3 处；解锁 5 个 Windows-only 测试并在 Linux
+  通过；功能/并发/内存/perf/valgrind/体积全套数据入报告。
+  分支 fix/unix-first-test（.worktree/unix-fixes），待合并。
+- [ ] **产品语义决策**（实测发现）：unix 上 APROXY_RUN_DIR 影响 IPC 寻址
+  （UDS 路径在 run_dir 内，Windows 管道全局名不受影响）——是否对齐待定
+- [ ] **优化候选**：upstream client（reqwest/hyper）开启 TCP_NODELAY——实测与
+  无 NODELAY 上游配合时有 40ms Nagle×delayed-ACK 咬合
+- [ ] **测试基建**：看门狗测试子进程清理 RAII 化（panic 路径手写 kill 会跳过）；
+  daemon.rs 的 UDS IPC roundtrip 单测（现为 Windows-only）
+
+## 待修（2026-09-10 压力实测审查轮）——已全部修复（a389d40/01978b4/f13bc0a/9cc53c8，详录 .agents/docs/unix-stress-review.md 修复记录节）
+
+- [x] **S1（产品级，两平台同病）：respawn 就绪判定竞态**——respawn A 的就绪等待
+  （每 200ms 调 list_instances_in）顺带删掉同注册表里 B/C 死实例的 .pid → 死亡事件
+  被误判优雅退出 → 永不 respawn。修复：respawn_instance 改 registry_contains_pid_in
+  只读检索 + handle_death 以 .restore 为唯一优雅退出依据 + server.rs 退出清理先
+  .restore 后 .pid。复跑 p6_storm：3/5 → PASS=5 FAIL=0（3 实例全部 respawn）。
+- [x] **S2：refresh_claim 无条件覆写无运行期夺权检测**——被接管的前任恢复后与
+  接管者互相翻转 claim、双看护者共存。修复：refresh_claim 覆写前校验 pid 归属，
+  易主即让位退出；unix terminate_verified 实装 SIGKILL。复跑 p7_takeover：
+  PASS=5 FAIL=0，claim 单一 pid，前任被真杀。
+- [x] **S3：is_aproxy_process unix 占位恒 true**——/proc/<pid>/exe 比对 basename
+  实装（ENOENT 判死对齐 Windows 拒收；权限失败 fail-open；「 (deleted)」后缀兼容
+  swap 升级）。选举与收养链随判定生效自动修复。
+- [x] **S4：health_scan「无 PID 复用风险」注释 unix 不成立**——注释按平台改写 +
+  处决前加 is_aproxy_process 防误杀关卡（ starttime 字段方案未采纳：S3 的 exe
+  比对已封住复用误杀面，字段增加无增量收益）。
+- [x] **S5：/dev/shm 心跳文件与 UDS socket 无退出清理**——新增 remove_heartbeat_file
+  与 daemon::remove_socket_file（Windows 均 no-op），守护优雅退出 + 看护者
+  handle_death 两处调用。
+- [x] **S6：macOS 回退分支对 zombie 失效**——注释补声明，health_scan 兜底
+  （macOS 未实测平台，接受退化）。
+
+## 修复审查轮遗留（2026-09-10，独立复验后记录，详录 .agents/docs/unix-stress-review.md 复验节）
+
+- [x] **R1（测试覆盖）→ 已补（75afe6b）**：registry_contains_pid_in 四分支 +
+  is_aproxy_process unix 版真实 zombie/ENOENT 判死单测 + 正名成功路径集成断言 +
+  swap 覆盖替换 (deleted) 语义集成测试（unix）。实测纠正：rename 走开（mv）不产生
+  「 (deleted)」后缀（exe 跟随新路径名）；fail-open 分支无法确定性构造，留人工路径。
+- [x] **R2（探针维护）→ 已修（75afe6b）**：p7_takeover.sh 文案与断言对齐修复后
+  语义（接管即杀前任 SIGCONT 不可恢复 / 接管者在任 / claim 单一 pid 三条硬断言），
+  复跑 PASS=7 FAIL=0
+- [ ] **F2（产品决策）：is_aproxy_process 二进制名精确耦合**——改名运行的二进制
+  （如生产 aproxy-using.exe 部署形态）被判非 aProxy 进程：不被收养（失去看门狗
+  自动恢复，remote 实证：改名副本运行时看护者收养日志 0 条）、不计入选举、
+  处决被关卡拒绝（防误杀方向正确）、claim 接管不杀前任。
+  Windows 侧 merge-base 前已有语义，unix 实装后两端一致。待决策：接受「改名
+  二进制不受看护」为约定，或放宽比对（会同时削弱防冒名闸门）
+
 ## 中期功能（对齐「无限重试、不中断」使命）
 
 - [ ] **正式发布：GitHub 构建指令集多版本**（必然项，2026-09-07 定调）：CI 矩阵 baseline + `RUSTFLAGS="-C target-cpu=x86-64-v3"`（AVX2），产物命名区分，发布页两者都放；详见 memory/release-engineering
@@ -43,10 +97,11 @@
 - [ ] **install/upgrade 二进制安装升级**（计划已批准，2026-09-09）：完整计划
   `.agents/plan/install-v1.md`——状态机 + 断电恢复矩阵 + PrepareSwap 广播
   ACK + Windows rename 接力 + 渠道矩阵（--from/GH/cargo/npm/包管理器全配置）；
-  P0 = --from + GitHub Releases（后者硬依赖 CI 产物规范）
-- [ ] **看门狗二期（可选）**：挂死不杀进程原地救（scoped runtime 注入 spike）、实例数极大时线程池死亡等待、unix 分支实测
-- [ ] **仓库挂 remote 让 CI 真正运行**（H2 修复时确认的防线缺口）：.github/workflows 已配置 ubuntu/macos cargo check，但无 remote 从未运行——unix cfg 编译错误（H2，已修）靠它拦截
-- [ ] unix 分支实测（UDS IPC / unix spawn / /dev/shm 心跳从未在类 Unix 环境运行过；CI ubuntu/macos 只 cargo check）
+  发布 workflow 已就绪（e5136fc），渠道 P0 全配定调（dc3434b）
+- [ ] **看门狗二期（可选）**：挂死不杀进程原地救（scoped runtime 注入 spike）、实例数极大时线程池死亡等待（unix 死亡等待已实装为轮询，见 unix-testing.md）
+- [ ] **首次 push 激活 CI**：remote 已加（origin = MoYeRanQianZhi/aProxy），
+  workflows 已配齐（CI/审查/发布）；首跑风险点：unix cargo check 未本地验证过、
+  deny.toml license 白名单可能按实际依赖补条目
 
 ## 已结案（有意跳过，见记忆/审查记录）
 
@@ -54,3 +109,4 @@
 - 命名管道 ACL/冒名校验（tokio 不暴露，误判方向 fail-safe）
 - stop 退出码差异、status/stop/logs 忽略 --config（有意设计）
 - settings.json 并发 add 丢更新（本地单用户 CLI，last-write-wins 可接受）
+- ~~unix 分支实测~~ → 已完成（2026-09-10，见上节与 .agents/docs/unix-testing.md）

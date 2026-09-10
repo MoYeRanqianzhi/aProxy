@@ -1483,13 +1483,19 @@ fn daemon_test_ports() -> (u16, u16, u16) {
 struct DaemonGuard {
     exe: &'static str,
     port: u16,
+    /// 守护的隔离 run 目录：unix 的 UDS socket 与注册表都在 run_dir 里，
+    /// stop 须看到同一 run_dir 才找得到守护；None = 默认 ~/.aproxy/run
+    run_dir: Option<std::path::PathBuf>,
 }
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
-        let _ = Command::new(self.exe)
-            .args(["stop", &self.port.to_string()])
-            .output();
+        let mut cmd = Command::new(self.exe);
+        cmd.args(["stop", &self.port.to_string()]);
+        if let Some(dir) = &self.run_dir {
+            cmd.env("APROXY_RUN_DIR", dir);
+        }
+        let _ = cmd.output();
     }
 }
 
@@ -1525,13 +1531,18 @@ fn process_alive(pid: u32) -> bool {
     String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
 }
 
+// ps -p 对 zombie（defunct）进程也返回成功——守护已退出但尚未被收割时
+// 会被误判为存活；须读取进程态排除 Z 状态。进程不存在时 ps 以非零退出
+// 且 stdout 为空，须先校验退出码，否则会被误判为存活。
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
     Command::new("ps")
-        .arg("-p")
-        .arg(pid.to_string())
+        .args(["-p", &pid.to_string(), "-o", "stat="])
         .output()
-        .map(|o| o.status.success())
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|stat| !stat.trim_start().starts_with('Z'))
         .unwrap_or(false)
 }
 
@@ -1558,7 +1569,11 @@ fn daemon_lifecycle_start_status_stop() {
 
     // 预清理：仅针对派生端口，清掉同端口残留（不影响任何其他端口上的实例）
     let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
-    let _guard = DaemonGuard { exe, port };
+    let _guard = DaemonGuard {
+        exe,
+        port,
+        run_dir: None,
+    };
 
     let pid = aproxy::daemon::spawn_detached(
         std::path::Path::new(exe),
@@ -1572,6 +1587,14 @@ fn daemon_lifecycle_start_status_stop() {
 
     // 就绪 = TCP 可连且 IPC ping 确认是自家守护（最多 10 秒）
     assert!(wait_daemon_ready(port), "守护子进程未就绪 (pid {pid})");
+
+    // 身份判定：正名运行的守护必须通过 is_aproxy_process（看门狗收养/选举/
+    // 处决关卡的全部前置）。镜像名精确比对的成功路径（Windows aproxy.exe /
+    // unix aproxy）
+    assert!(
+        aproxy::watchdog::is_aproxy_process(pid),
+        "正名运行的守护 (pid {pid}) 应通过进程身份判定"
+    );
 
     // status 列出该实例（信息来自实例注册表，存活以 IPC 探测为准）
     let out = Command::new(exe).arg("status").output().unwrap();
@@ -1621,7 +1644,11 @@ fn daemon_second_instance_on_same_port_exits() {
     .unwrap();
     let exe = env!("CARGO_BIN_EXE_aproxy");
     let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
-    let _guard = DaemonGuard { exe, port };
+    let _guard = DaemonGuard {
+        exe,
+        port,
+        run_dir: None,
+    };
 
     let args = |file: &std::path::Path| {
         vec![
@@ -1687,7 +1714,11 @@ fn start_parent_command_output_returns() {
     let exe = env!("CARGO_BIN_EXE_aproxy");
 
     let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
-    let _guard = DaemonGuard { exe, port };
+    let _guard = DaemonGuard {
+        exe,
+        port,
+        run_dir: None,
+    };
 
     // 无子命令 = 后台启动：真实 start 父进程做预检、spawn 分离守护、
     // 等待 IPC 就绪后打印结果并退出——捕获输出的调用必须能等到这个退出
@@ -1726,7 +1757,11 @@ fn logs_follows_daemon_and_exits_on_stop() {
     .unwrap();
     let exe = env!("CARGO_BIN_EXE_aproxy");
     let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
-    let _guard = DaemonGuard { exe, port };
+    let _guard = DaemonGuard {
+        exe,
+        port,
+        run_dir: None,
+    };
 
     let pid = aproxy::daemon::spawn_detached(
         std::path::Path::new(exe),
@@ -1840,8 +1875,16 @@ fn logs_requires_port_when_multiple_instances() {
     // dir 须存活到测试结束（注册表里 config_path 引用它，无需实际存在，但保持干净）
     let (pid_a, _dir_a) = spawn_daemon(port_a, "logs-multi-a.toml");
     let (pid_b, _dir_b) = spawn_daemon(port_b, "logs-multi-b.toml");
-    let _guard_a = DaemonGuard { exe, port: port_a };
-    let _guard_b = DaemonGuard { exe, port: port_b };
+    let _guard_a = DaemonGuard {
+        exe,
+        port: port_a,
+        run_dir: None,
+    };
+    let _guard_b = DaemonGuard {
+        exe,
+        port: port_b,
+        run_dir: None,
+    };
     assert!(wait_daemon_ready(port_a), "守护 a 未就绪 (pid {pid_a})");
     assert!(wait_daemon_ready(port_b), "守护 b 未就绪 (pid {pid_b})");
 
@@ -1907,7 +1950,11 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     .unwrap();
     let exe = env!("CARGO_BIN_EXE_aproxy");
     let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
-    let _guard = DaemonGuard { exe, port };
+    let _guard = DaemonGuard {
+        exe,
+        port,
+        run_dir: None,
+    };
     let restore_path = aproxy::daemon::restore_file_path(&format!("127.0.0.1:{port}"));
 
     // 正常后台启动：bind 成功即写恢复记录
@@ -1928,11 +1975,7 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     );
 
     // 模拟崩溃：强杀守护进程（不经过 IPC 优雅退出），恢复记录应残留
-    let killed = Command::new("taskkill")
-        .args(["/F", "/PID", &pid.to_string()])
-        .output()
-        .expect("taskkill 执行失败");
-    assert!(killed.status.success(), "taskkill 应成功杀死测试守护");
+    kill_pid(pid);
     let mut gone = false;
     for _ in 0..50 {
         if !process_alive(pid) {
@@ -2006,7 +2049,11 @@ fn alias_start_and_stop_roundtrip() {
         ),
     )
     .unwrap();
-    let _guard = DaemonGuard { exe, port };
+    let _guard = DaemonGuard {
+        exe,
+        port,
+        run_dir: None,
+    };
 
     // add 别名（指向临时配置）
     let out = Command::new(exe)
@@ -2158,7 +2205,6 @@ fn alias_errors_on_unknown_names() {
 // 进程 pid 派生，绝不触碰生产实例；结束清理 claim 与残留守护。
 // ---------------------------------------------------------------------------
 #[test]
-#[cfg(windows)]
 fn watchdog_respawns_killed_daemon() {
     // 独立端口（偏移 9）：既有守护测试并行占用 daemon_test_ports() 的前三个，
     // 本测试窗口长（看护扫描+重拉），同端口会与之互踩（实测 flaky）
@@ -2171,7 +2217,11 @@ fn watchdog_respawns_killed_daemon() {
     )
     .unwrap();
     let exe = env!("CARGO_BIN_EXE_aproxy");
-    let _guard = DaemonGuard { exe, port };
+    let _guard = DaemonGuard {
+        exe,
+        port,
+        run_dir: Some(dir.path().to_path_buf()),
+    };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2196,7 +2246,18 @@ fn watchdog_respawns_killed_daemon() {
         cmd.spawn().expect("spawn 守护失败")
     };
     let orig_pid = daemon_child.id();
-    assert!(wait_daemon_ready_in(&rt, port), "守护未就绪");
+    // 隔离 run_dir 版的就绪等待：TCP 可连 + 隔离 socket 的 IPC ping 可达
+    let mut ready = false;
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+            && ipc_ping_in_dir(&rt, port, dir.path()).is_ok()
+        {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ready, "守护未就绪");
 
     // 启动看护进程（同一隔离 run 目录）
     let mut wd_cmd = Command::new(exe);
@@ -2214,10 +2275,7 @@ fn watchdog_respawns_killed_daemon() {
         let mut ok = false;
         for _ in 0..150 {
             // 看护者 scan 1s + 退避 0（首次）+ spawn + 就绪，30s 足够
-            if rt
-                .block_on(aproxy::daemon::ipc_ping(&port.to_string()))
-                .is_ok()
-            {
+            if ipc_ping_in_dir(&rt, port, dir.path()).is_ok() {
                 ok = true;
                 break;
             }
@@ -2228,28 +2286,111 @@ fn watchdog_respawns_killed_daemon() {
     assert!(new_ready, "看护者未在预期时间内重拉守护");
 
     // 确认是新进程（旧 pid 已死，新 pid 就绪）
-    let live = rt
-        .block_on(aproxy::daemon::ipc_ping(&port.to_string()))
-        .unwrap();
+    let live = ipc_ping_in_dir(&rt, port, dir.path()).unwrap();
     assert_ne!(live.pid, orig_pid, "应是被重拉的新进程");
     // 看护者仍在运行（收养新实例继续看护）
     assert!(wd_child.try_wait().unwrap().is_none(), "看护者不应退出");
 
     // 清理：优雅 stop（.restore 删除）→ 看护者不得复活它；随后闲置自灭前
-    // 先杀看护者防泄漏
-    let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
+    // 先杀看护者防泄漏。stop 须带同一 run_dir（unix 的 UDS socket 在其中）
+    let _ = Command::new(exe)
+        .args(["stop", &port.to_string()])
+        .env("APROXY_RUN_DIR", dir.path())
+        .output();
     std::thread::sleep(Duration::from_secs(3));
     assert!(
-        rt.block_on(aproxy::daemon::ipc_ping(&port.to_string()))
-            .is_err(),
+        ipc_ping_in_dir(&rt, port, dir.path()).is_err(),
         "优雅停止后看护者不得复活实例"
     );
     let _ = wd_child.kill();
     let _ = std::fs::remove_file(dir.path().join("watchdog.claim"));
 }
 
+// ---------------------------------------------------------------------------
+// 身份判定对「二进制被原地替换」的容忍（unix swap 升级场景）：运行中的守护
+// 的 exe 链接会被内核附加「 (deleted)」后缀，is_aproxy_process 剥除后比对，
+// 升级动作不得让在运行实例被判为异己（否则收养/选举/处决关卡全体失效）
+// ---------------------------------------------------------------------------
 #[test]
-#[cfg(windows)]
+#[cfg(unix)]
+fn identity_check_tolerates_swapped_binary() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let port = daemon_test_port(10);
+    let dir = tempfile::tempdir().unwrap();
+    // 守护用副本二进制运行（不碰真实 target 二进制——并行测试共用它）。
+    // 副本必须正名 `aproxy`：身份判定按 basename 精确比对
+    let bin = dir.path().join("aproxy");
+    std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &bin).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cfg_file = dir.path().join("swap.toml");
+    std::fs::write(
+        &cfg_file,
+        format!(
+            "base_url = \"https://swap-test.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"
+        ),
+    )
+    .unwrap();
+    let run_dir = dir.path().join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let leaked_bin: &'static str = Box::leak(bin.display().to_string().into_boxed_str());
+    let guard = DaemonGuard {
+        exe: leaked_bin,
+        port,
+        run_dir: Some(run_dir.clone()),
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let daemon_child = Command::new(&bin)
+        .args([
+            "--config",
+            cfg_file.display().to_string().as_str(),
+            "--daemon-child",
+        ])
+        .env("APROXY_RUN_DIR", run_dir.display().to_string())
+        .spawn()
+        .expect("spawn 副本守护失败");
+    let pid = daemon_child.id();
+    let mut ready = false;
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+            && ipc_ping_in_dir(&rt, port, &run_dir).is_ok()
+        {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ready, "副本守护未就绪");
+    assert!(
+        aproxy::watchdog::is_aproxy_process(pid),
+        "替换前正名守护应通过身份判定"
+    );
+
+    // 原地替换（swap 升级的真实形态）：新文件 rename 原子覆盖原路径 →
+    // 旧 inode 失名，内核把运行中进程的 exe 链接标为「... (deleted)」。
+    // 注意不是把运行中二进制 rename 走开——那种场景 exe 跟随新路径名、
+    // 无 (deleted) 后缀，basename 随之改变（精确比对判异己，属 F2 边界）
+    let new_bin = dir.path().join("aproxy.new");
+    std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &new_bin).unwrap();
+    std::fs::rename(&new_bin, &bin).unwrap();
+    assert!(
+        aproxy::watchdog::is_aproxy_process(pid),
+        "二进制被覆盖替换后，运行中守护仍应通过身份判定（(deleted) 后缀剥离）"
+    );
+
+    // 守护仍在正常服务（IPC 可达）——身份判定未误杀正常实例
+    assert!(
+        ipc_ping_in_dir(&rt, port, &run_dir).is_ok(),
+        "替换后守护应继续可 ping"
+    );
+    drop(guard);
+}
+
+#[test]
 fn watchdog_lease_prevents_duplicate_watchdogs() {
     // 并发 spawn 两个看护者（同一隔离 run 目录）：claim 原子接管保证只有一个
     // 在任——后启动者应自行退出（选举唯一性）
@@ -2287,26 +2428,47 @@ fn watchdog_lease_prevents_duplicate_watchdogs() {
     let _ = std::fs::remove_file(dir.path().join("watchdog.claim"));
 }
 
-/// wait_daemon_ready 的 run-dir 无关版本（IPC ping 不依赖 run 目录）
-#[cfg(windows)]
-fn wait_daemon_ready_in(rt: &tokio::runtime::Runtime, port: u16) -> bool {
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
-            && rt
-                .block_on(aproxy::daemon::ipc_ping(&port.to_string()))
-                .is_ok()
-        {
-            return true;
+/// 对运行在隔离 run 目录里的守护做 IPC ping：unix 的 UDS socket 路径在
+/// run_dir 下（endpoint_for 解析依赖进程环境，库调用方须显式给目录）；
+/// Windows 管道名全局唯一，run_dir 只影响注册表文件，端点忽略该参数。
+fn ipc_ping_in_dir(
+    rt: &tokio::runtime::Runtime,
+    port: u16,
+    #[cfg(unix)] run_dir: &std::path::Path,
+    #[cfg(windows)] _run_dir: &std::path::Path,
+) -> Result<aproxy::daemon::InstanceInfo, String> {
+    #[cfg(windows)]
+    let endpoint = aproxy::daemon::endpoint_for(&port.to_string());
+    #[cfg(unix)]
+    let endpoint = run_dir.join(format!("{}.sock", port)).display().to_string();
+    rt.block_on(async {
+        let mut last = String::new();
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            match aproxy::daemon::ipc_request_to(&endpoint, &aproxy::daemon::IpcRequest::Ping).await
+            {
+                Ok(resp) if resp.ok => {
+                    return resp.info.ok_or_else(|| "实例响应缺少信息".to_string());
+                }
+                Ok(_) => last = "实例返回失败".to_string(),
+                Err(e) => last = e,
+            }
         }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    false
+        Err(last)
+    })
 }
 
-/// 强杀进程（模拟崩溃）：Windows taskkill /F
+/// 强杀进程（模拟崩溃）：Windows taskkill /F；unix SIGKILL
 #[cfg(windows)]
 fn kill_pid(pid: u32) {
     let _ = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/F"])
         .output();
+}
+
+#[cfg(unix)]
+fn kill_pid(pid: u32) {
+    let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
 }

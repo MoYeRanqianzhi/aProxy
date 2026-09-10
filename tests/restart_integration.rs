@@ -19,30 +19,61 @@ fn restart_test_port(offset: u32) -> u16 {
 
 /// 测试收尾守卫：Drop 时对测试派生端口执行 `aproxy stop`（断言失败路径也
 /// 运行，杜绝守护泄漏在真实注册表）。两个端口都可能被拉起，分别守卫。
+/// 本文件守护一律跑在隔离 run 目录：unix 的 UDS socket 与注册表都在其中，
+/// stop 须带同一 run_dir 才找得到守护（Windows 管道名全局唯一，不受影响）。
 struct RestartGuard {
     exe: &'static str,
     port: u16,
+    run_dir: std::path::PathBuf,
 }
 
 impl Drop for RestartGuard {
     fn drop(&mut self) {
         let _ = Command::new(self.exe)
             .args(["stop", &self.port.to_string()])
+            .env("APROXY_RUN_DIR", &self.run_dir)
             .output();
     }
 }
 
-/// 等待端口就绪：TCP 可连 + IPC ping 确认是自家守护（管道名含端口，
+/// 对运行在隔离 run 目录里的守护做 IPC ping：unix 的 UDS socket 路径在
+/// run_dir 下，测试进程（默认 run_dir）的 ipc_ping 会找错位置，须显式按
+/// 守护实际的 socket 路径寻址；Windows 管道名全局唯一，忽略该参数。
+fn ipc_ping_in_dir(
+    rt: &tokio::runtime::Runtime,
+    port: u16,
+    #[cfg(unix)] run_dir: &std::path::Path,
+    #[cfg(windows)] _run_dir: &std::path::Path,
+) -> Result<aproxy::daemon::InstanceInfo, String> {
+    #[cfg(windows)]
+    let endpoint = aproxy::daemon::endpoint_for(&port.to_string());
+    #[cfg(unix)]
+    let endpoint = run_dir.join(format!("{}.sock", port)).display().to_string();
+    rt.block_on(async {
+        let mut last = String::new();
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            match aproxy::daemon::ipc_request_to(&endpoint, &aproxy::daemon::IpcRequest::Ping).await
+            {
+                Ok(resp) if resp.ok => {
+                    return resp.info.ok_or_else(|| "实例响应缺少信息".to_string());
+                }
+                Ok(_) => last = "实例返回失败".to_string(),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    })
+}
+
+/// 等待端口就绪：TCP 可连 + IPC ping 确认是自家守护（端点名含端口，
 /// 只有我们的 --daemon-child 子进程会创建它），最多 10 秒。
-fn wait_daemon_ready(port: u16) -> bool {
-    let port_str = port.to_string();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("创建测试 tokio runtime 失败");
+fn wait_daemon_ready(rt: &tokio::runtime::Runtime, port: u16, run_dir: &std::path::Path) -> bool {
     for _ in 0..100 {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
-            && rt.block_on(aproxy::daemon::ipc_ping(&port_str)).is_ok()
+            && ipc_ping_in_dir(rt, port, run_dir).is_ok()
         {
             return true;
         }
@@ -76,7 +107,6 @@ fn spawn_daemon(
 // 1. 改端口后 restart：误报回归——就绪判定按新 pid 定位
 // ---------------------------------------------------------------------------
 #[test]
-#[cfg(windows)]
 fn restart_after_port_change_reports_new_port() {
     let port_a = restart_test_port(20);
     let port_b = restart_test_port(21);
@@ -89,8 +119,16 @@ fn restart_after_port_change_reports_new_port() {
     )
     .unwrap();
     let exe = env!("CARGO_BIN_EXE_aproxy");
-    let guard_a = RestartGuard { exe, port: port_a };
-    let guard_b = RestartGuard { exe, port: port_b };
+    let guard_a = RestartGuard {
+        exe,
+        port: port_a,
+        run_dir: run_dir.clone(),
+    };
+    let guard_b = RestartGuard {
+        exe,
+        port: port_b,
+        run_dir: run_dir.clone(),
+    };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -100,7 +138,10 @@ fn restart_after_port_change_reports_new_port() {
     // 它再拉起新进程），句柄立即泄漏（forget）——wait 会阻塞且无意义
     let child = spawn_daemon(exe, &cfg_file, &run_dir);
     std::mem::forget(child);
-    assert!(wait_daemon_ready(port_a), "初始守护（端口 {port_a}）未就绪");
+    assert!(
+        wait_daemon_ready(&rt, port_a, &run_dir),
+        "初始守护（端口 {port_a}）未就绪"
+    );
 
     // 改配置换端口（restart 的真实用途：让新配置生效）
     std::fs::write(
@@ -130,13 +171,11 @@ fn restart_after_port_change_reports_new_port() {
 
     // 新端口 IPC 可达（新配置生效），旧端口无实例
     assert!(
-        rt.block_on(aproxy::daemon::ipc_ping(&port_b.to_string()))
-            .is_ok(),
+        ipc_ping_in_dir(&rt, port_b, &run_dir).is_ok(),
         "新端口 {port_b} 应有运行中的实例"
     );
     assert!(
-        rt.block_on(aproxy::daemon::ipc_ping(&port_a.to_string()))
-            .is_err(),
+        ipc_ping_in_dir(&rt, port_a, &run_dir).is_err(),
         "旧端口 {port_a} 不应再有实例"
     );
 
@@ -144,9 +183,7 @@ fn restart_after_port_change_reports_new_port() {
     // 断言经 ipc_ping 的响应取信息——不用 list_instances（它附带孤儿日志
     // 清理，在 APROXY_RUN_DIR 重定向场景会误删真实 logs 目录的文件）。
     // 路径按原样字符串比对：restore 参数里的值就是初始 spawn 传入的原文。
-    let live = rt
-        .block_on(aproxy::daemon::ipc_ping(&port_b.to_string()))
-        .expect("端口 B 实例应可 ping");
+    let live = ipc_ping_in_dir(&rt, port_b, &run_dir).expect("端口 B 实例应可 ping");
     assert_eq!(
         live.config_path,
         cfg_file.display().to_string(),
@@ -161,7 +198,6 @@ fn restart_after_port_change_reports_new_port() {
 // 2. restart 未启动的端口：只重启不启动语义——提示未运行并退出 1
 // ---------------------------------------------------------------------------
 #[test]
-#[cfg(windows)]
 fn restart_not_running_port_fails() {
     let port = restart_test_port(22);
     let dir = tempfile::tempdir().unwrap();

@@ -326,8 +326,10 @@ impl WatchdogState {
         });
     }
 
-    /// 健康扫描：心跳过期者走 IPC ping 二意见，都失败判挂死 → 杀（本方句柄
-    /// 绑定原进程，无 PID 复用风险）→ 死亡事件走统一 respawn 路径。
+    /// 健康扫描：心跳过期者走 IPC ping 二意见，都失败判挂死 → 杀 → 死亡事件
+    /// 走统一 respawn 路径。杀的边界按平台：Windows 句柄绑定原进程，无 PID
+    /// 复用风险；unix 是裸 SIGKILL(pid)，处决前以 is_aproxy_process 做防误杀
+    /// 关卡（见下）——句柄语义差异由该关卡收敛到等效安全性。
     /// 返回被判挂死的端口（测试断言用）。
     pub async fn health_scan(&mut self) -> Vec<String> {
         let stale_ms = self.cfg.scan_secs * 1000 * (self.cfg.stale_after_cycles.max(1) + 1);
@@ -345,6 +347,15 @@ impl WatchdogState {
             if crate::daemon::ipc_ping(&w.port).await.is_ok() {
                 continue; // runtime 活着（可能调度延迟），下轮再看
             }
+            // 防误杀关卡：「主动杀」前的既定验证。pid 若被复用给无关进程，
+            // 心跳/IPC 失效的表现与「实例挂死」不可区分，但那个进程是无辜的。
+            // unix 的裸 SIGKILL 尤其依赖此关（Windows 侧为冗余的第二道验证）。
+            // 候选已死（zombie/reaped）时关卡判 false → 跳过处决，死亡事件由
+            // watcher 兜底
+            if !imp_process::is_aproxy_process(w.pid) {
+                tracing::warn!(port = %w.port, pid = w.pid, "挂死候选的 pid 已非 aProxy 进程（疑似复用），跳过处决");
+                continue;
+            }
             tracing::error!(port = %w.port, pid = w.pid, "实例心跳过期且 IPC 无响应，判定挂死，终止进程");
             hung.push(w.port.clone());
             imp::terminate_handle(w.handle);
@@ -352,9 +363,13 @@ impl WatchdogState {
         hung
     }
 
-    /// 处理死亡事件：.restore + 注册表都在 = 崩溃 → 立即重拉；否则优雅退出/
-    /// 清理，摘除看护。重拉失败进退避队列（不 sleep——阻塞主循环会让 claim
-    /// 心跳停摆、被竞争者按「假死」夺权，M2），由 tick 的时间驱动重试。
+    /// 处理死亡事件：.restore 缺失 = 优雅退出 → 摘除看护；.restore 在 = 崩溃
+    /// → 立即重拉（注册表 .pid 是否在不是判据——其他实例 respawn 的验活清理
+    /// 会顺带删掉本实例的死注册记录，混合态若据此判「优雅退出」会让崩溃实例
+    /// 静默失去自动恢复，P6 死亡风暴实测）。优雅退出会删 .restore（守护退出
+    /// 路径先 .restore 后 .pid，两 unlink 间死亡事件最多多拉一次，方向安全）。
+    /// 重拉失败进退避队列（不 sleep——阻塞主循环会让 claim 心跳停摆、被竞争者
+    /// 按「假死」夺权，M2），由 tick 的时间驱动重试。
     /// 返回处置结果（测试断言用）。
     pub async fn handle_death(&mut self, port: &str) -> DeathOutcome {
         let Some(idx) = self.watched.iter().position(|w| w.port == port) else {
@@ -362,10 +377,15 @@ impl WatchdogState {
         };
         let w = self.watched.swap_remove(idx);
         imp::close_handle(w.handle);
+        // 看护关系终止即清理实例的 IPC 端点与心跳残留：优雅退出路径守护会
+        // 自清，崩溃/强杀路径靠这里兜底（Windows 管道/节对象由内核回收，
+        // 两个清理在 Windows 上均为 no-op；unix 的 .sock 靠 respawn 前
+        // remove_file 自愈，但清掉更干净，/dev/shm 心跳文件则无人自愈）
+        remove_heartbeat_file(port);
+        crate::daemon::remove_socket_file(port);
 
         let restore_path = crate::daemon::restore_file_path_in(&self.cfg.run_dir, port);
-        let registry_path = crate::daemon::instance_file_path_in(&self.cfg.run_dir, port);
-        if !restore_path.is_file() || !registry_path.is_file() {
+        if !restore_path.is_file() {
             tracing::info!(port = %port, "实例已优雅退出（无恢复记录），摘除看护");
             self.after_watch_removal();
             return DeathOutcome::GracefulExit;
@@ -497,8 +517,22 @@ impl WatchdogState {
         self.maybe_idle_exit().await;
     }
 
-    /// claim 续写：心跳时间戳刷新（其他进程据此刻定本看护者是否在任/假死）
+    /// claim 续写：心跳时间戳刷新（其他进程据此刻定本看护者是否在任/假死）。
+    /// 覆写前先校验归属——claim 已易主（被接管者夺权）还继续双写，两个看护者
+    /// 会同时 respawn 同一实例（P7 实测 claim 内容在两 pid 间翻转的根源）。
+    /// 正常路径接管者已把前任杀掉（terminate_verified），这里只是杀失败/
+    /// 竞态窗口的确定性收尾：让位退出，claim 文件留给新任（勿动，动了会被
+    /// 新任按「心跳停滞」再次夺权）。
     fn refresh_claim(&mut self) {
+        if let Some(existing) = read_claim_in(&self.cfg.run_dir)
+            && existing.pid != std::process::id()
+        {
+            tracing::warn!(
+                claim_pid = existing.pid,
+                "claim 已被其他看护者接管，本进程让位退出"
+            );
+            std::process::exit(0);
+        }
         let claim = WatchdogClaim {
             pid: std::process::id(),
             created_at_process: process_start_time(std::process::id()).unwrap_or(0),
@@ -607,13 +641,12 @@ async fn respawn_instance(run_dir: &Path, port: &str) -> Result<u32, String> {
     // .restore 原参数，但配置可能已被用户改动（换端口）——新守护监听新端口
     // 时 ping 旧端口永远不通（与 restart 同款实测坑）。pid 是 spawn 返回值，
     // 唯一可靠锚点；新守护 bind 成功才写注册表，出现即就绪。
+    // 用只读检索而非 list_instances_in：后者的验活清理副作用会在本循环的
+    // 200ms 轮询里顺带删掉同注册表其他死实例的记录，其死亡事件随后被混合态
+    // 误判为优雅退出、静默失去自动恢复（P6 死亡风暴实测）。
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     loop {
-        if crate::daemon::list_instances_in(run_dir)
-            .await
-            .iter()
-            .any(|i| i.pid == pid)
-        {
+        if crate::daemon::registry_contains_pid_in(run_dir, pid) {
             return Ok(pid);
         }
         if std::time::Instant::now() > deadline {
@@ -762,6 +795,13 @@ pub fn read_heartbeat(port: &str) -> Option<u64> {
     imp_heart::heartbeat_load(port)
 }
 
+/// 清理实例的心跳文件（守护优雅退出/看护摘除时调用）。
+/// Windows 节对象由内核回收（no-op）；unix 删除 /dev/shm 下的文件，
+/// 消除崩溃/强杀后的 tmpfs 残留（实测一轮测试曾留 13 个）。
+pub fn remove_heartbeat_file(port: &str) {
+    imp_heart::remove_heartbeat_file(port)
+}
+
 /// 当前 Unix 毫秒（系统时钟早于 epoch 回退 0——仅用于新鲜度比较，
 /// 看护侧同时校验非 0）
 pub fn now_millis() -> u64 {
@@ -829,20 +869,72 @@ mod imp {
 
 #[cfg(unix)]
 mod imp {
-    pub fn open_sync_handle(_pid: u32) -> Option<isize> {
-        // unix 无进程句柄对象；死亡检测退化为轮询（未实测分支，同 UDS 批处理）
-        None
+    use std::time::Duration;
+
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
     }
-    pub fn wait_blocking(_handle: isize) {
-        // unix 无句柄等待原语接入（未实测分支）：恒久挂起占位，
-        // 死亡检测退化为 adopt/health 轮询
+
+    /// unix 无可等待的进程句柄对象：句柄值直接存 pid，死亡等待退化为轮询。
+    /// 存 pid 而非 0 的意义：0 会被 adopt_scan 视作「句柄缺失」反复补挂。
+    pub fn open_sync_handle(pid: u32) -> Option<isize> {
+        Some(pid as isize)
+    }
+    /// 轮询进程死亡。仅在 spawn_blocking 中调用——扫描周期由调用方健康检查
+    /// 兜底，此处 1s 粒度足够（Windows 侧为内核事件驱动，unix 无等价原语，
+    /// 这是设计内的退化）。
+    ///
+    /// 不能只用 kill(pid,0)：它对 zombie（已死未收割）也返回成功——守护的
+    /// 父进程（start/测试/看护者自己）不 wait 之前死亡事件永远不触发。
+    /// 须读 /proc 的进程态排除 Z。无 /proc 的平台（macOS）回退 kill(pid,0)。
+    pub fn wait_blocking(handle: isize) {
+        let pid = handle as i32;
         loop {
-            std::thread::sleep(Duration::from_secs(3600));
+            if !process_alive_for_wait(pid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(1));
         }
     }
-    pub fn terminate_handle(_handle: isize) {}
+
+    /// 死亡等待的存在性探测：/proc 可用（Linux）时 zombie 视为死亡；
+    /// 无 /proc（macOS）回退 kill(pid,0)（EPERM 视为存活，其余错误为死亡）。
+    /// 已知退化：回退分支对 zombie 失效——kill(pid,0) 对已死未收割的进程
+    /// 也返回成功，死亡事件会延迟到 health_scan 兜底。macOS 属未实测平台，
+    /// 接受此退化；若未来需要，可改 waitid(WNOHANG) 或进程状态查询。
+    fn process_alive_for_wait(pid: i32) -> bool {
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            // stat 形如 "pid (comm) S ..."，comm 可含空格/括号，取 ')' 之后首字段
+            return stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .map(|state| state != "Z")
+                .unwrap_or(false);
+        }
+        let r = unsafe { kill(pid, 0) };
+        if r == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(1)
+    }
+
+    /// SIGKILL 处决（挂死判定后调用）：unix 直接以句柄中保存的 pid 杀进程。
+    /// 上层靠死亡 watcher 的轮询确认死亡。
+    pub fn terminate_handle(handle: isize) {
+        unsafe {
+            kill(handle as i32, 9);
+        }
+    }
     pub fn close_handle(_handle: isize) {}
-    pub fn terminate_verified(_pid: u32) {}
+    /// 杀掉经身份验证的假死前任看护者：身份由调用方把关（is_aproxy_process
+    /// 的 /proc exe 比对 + verify_claim_identity 的 starttime 比对），此处
+    /// 只负责 SIGKILL。unix 上无句柄对象，直接按 pid 杀——claim 记录到被
+    /// 杀之间的复用窗口由上述双重验证封住。
+    pub fn terminate_verified(pid: u32) {
+        unsafe {
+            kill(pid as i32, 9);
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -921,6 +1013,9 @@ mod imp_heart {
             let _ = windows_sys::Win32::Foundation::CloseHandle(writer.mapping);
         }
     }
+
+    /// 节对象由内核在最后一个句柄关闭时回收，无文件系统残留可清
+    pub fn remove_heartbeat_file(_port: &str) {}
 }
 
 #[cfg(unix)]
@@ -964,6 +1059,16 @@ mod imp_heart {
     }
 
     pub fn unmap_heartbeat(_writer: &super::HeartbeatWriter) {}
+
+    /// 删除心跳文件。Windows 的节对象随进程退出由内核回收，unix 是 /dev/shm
+    /// 下的真实文件（tmpfs 内存计费），守护优雅退出/看护摘除时清掉，崩溃残留
+    /// 由下次同端口 create 的 truncate 覆盖 + 人工/治理路径兜底
+    pub fn remove_heartbeat_file(port: &str) {
+        let path = format!("/dev/shm/{}", super::heartbeat_section_name(port));
+        // 写侧仍持有打开句柄时 unlink 合法（句柄继续可写直至关闭），
+        // 残留仅出现在「创建后未到优雅退出就崩溃」的场景
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[cfg(windows)]
@@ -1052,10 +1157,26 @@ mod imp_process {
         fields.get(19)?.parse().ok()
     }
 
-    pub fn is_aproxy_process(_pid: u32) -> bool {
-        // unix 分支未实测（TODO）；镜像名校验缺位时保守放行——选举只影响
-        // 谁发起 spawn，误判最坏结果是多个 spawn 尝试（claim 原子性兜底）
-        true
+    /// 是否 aProxy 进程：/proc/<pid>/exe 指向实际二进制，比对 basename。
+    /// 判定分三档：
+    /// - readlink 成功：比对 basename（Linux 二进制无 .exe 后缀；二进制被
+    ///   原地替换后内核附加「 (deleted)」后缀，剥除后再比——swap 升级场景下
+    ///   正在运行的进程不该因此被判定为异己）
+    /// - ENOENT：进程已死（含 zombie，exe 随地址空间一并消失）→ false。
+    ///   选举不再被注册表死条目卡住、收养不再收编死条目（与 Windows 的
+    ///   OpenProcess 失败即拒收对齐）
+    /// - 其他失败（跨用户权限等）：不可知 → 保守放行（fail-open）。误放行
+    ///   的最坏结果是多一次 spawn 尝试 / 一次有身份验证前置的杀；误拒绝则
+    ///   会让存活实例失去看护——两个方向上前者代价小得多
+    pub fn is_aproxy_process(pid: u32) -> bool {
+        match std::fs::read_link(format!("/proc/{pid}/exe")) {
+            Ok(target) => {
+                let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let name = name.strip_suffix(" (deleted)").unwrap_or(name);
+                name == "aproxy"
+            }
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        }
     }
 }
 
@@ -1145,6 +1266,29 @@ mod tests {
         assert_eq!(heartbeat_fresh_secs(&s), 3);
     }
 
+    // unix：身份判定对「已死进程」的两种形态都判 false——
+    // 大号未用 pid（/proc 条目不存在）与真实 zombie（已 kill 未收割）
+    #[cfg(unix)]
+    #[test]
+    fn is_aproxy_process_rejects_dead_pids() {
+        // Linux pid_max 上限 4194304，此 pid 不可能存在 → readlink ENOENT → false
+        assert!(!is_aproxy_process(u32::MAX - 1));
+
+        // 真实 zombie：子进程被 SIGKILL 后、父进程收割前，/proc/<pid> 仍在但
+        // exe 语义随地址空间消失（readlink ENOENT）→ false
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep 失败（unix 测试环境必备）");
+        child.kill().expect("SIGKILL 失败");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            !is_aproxy_process(child.id()),
+            "zombie 进程不应通过身份判定"
+        );
+        child.wait().unwrap(); // 收割，避免测试自身留 zombie
+    }
+
     #[test]
     fn heartbeat_section_name_uses_port() {
         // 节名含端口：实例唯一区分（同 IPC 管道命名规则）
@@ -1153,7 +1297,6 @@ mod tests {
         assert!(n.contains("aproxy-heart"), "{n}");
     }
 
-    #[cfg(windows)]
     #[test]
     fn heartbeat_write_and_read_same_process() {
         // 同进程内写读往返：节创建 → beat → 读取值非 0 且随时间推进增长。

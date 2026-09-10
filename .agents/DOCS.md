@@ -20,11 +20,17 @@
 - `.agents/bench/` — 压测编排脚本与原始采样数据（before/after CSV）
 - `.agents/docs/` — 开发文档（本文档树）
 
-## .agents/docs/ 内容规划
+## .agents/docs/ 实际内容
 
 - `daemon-model.md` — 守护进程运行模型决策记录（为什么命名管道而非端口、
   实例键=端口号、restore 记录的生命周期、.restore 不被 status 清理的原因）
-- `review-history.md` — 两轮审查（66 项首轮 + 40 项守护轮 + 本轮）的发现与
-  修复分布、有意跳过项及其理由
+- `review-history.md` — 各轮审查的发现与修复分布、有意跳过项及其理由
 - `environment.md` — 开发环境事实（本机代理环境变量污染与 NO_PROXY 隔离、
   生产实例保护约定、测试端口派生规则）
+- `unix-testing.md` — unix 分支首次实机测试报告（2026-09-09，Ubuntu 实机）：
+  5 个 unix 专属缺陷的发现与修复、功能/并发/内存/perf/体积全套数据、
+  mock 脚本教训、遗留事项清单
+- `unix-stress-review.md` — unix 分支压力实测审查报告（2026-09-10 第二轮）：
+  代码逐行审查 + 10 项压力场景实测的问题归档（S1 respawn 竞态/S2 claim 覆写/
+  S3-S6 遗留占位与多端差异），含根因链、实测证据、修复方向与探针复现指引；
+  探针资产 `.agents/bench/probe/`

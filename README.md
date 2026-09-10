@@ -15,6 +15,27 @@
 
 ## 安装
 
+**引导脚本（推荐，首装二进制 + skill 文档一步到位）**：
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/master/scripts/install.ps1 | iex
+```
+
+```sh
+# Linux / macOS / Git Bash
+curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/master/scripts/install.sh | sh
+```
+
+```bat
+rem Windows (cmd 兜底)
+curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/master/scripts/install.cmd -o install.cmd && install.cmd
+```
+
+**升级**：替换二进制后 `aproxy install` 自动滚动重启实例（后续版本提供）。
+
+**源码构建**：
+
 ```powershell
 git clone https://github.com/MoYeRanQianZhi/aProxy.git
 cd aProxy

@@ -5,7 +5,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
 
 # 同一分支的新提交取消进行中的旧跑（省 runner 时间，最新结论才有意义）

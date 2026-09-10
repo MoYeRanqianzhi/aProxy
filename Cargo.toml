@@ -36,9 +36,12 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 
 [target.'cfg(windows)'.dependencies]
 # spawn_detached 手写 CreateProcessW（bInheritHandles=FALSE，std 无稳定 API 可关）。
-# 版本对齐 Cargo.lock 中已有的 windows-sys 0.52.0（tokio/mio 间接依赖）。
+# 精确钉死 =0.52.0：HANDLE 在 windows-sys 0.59+ 从 isize 改为 *mut c_void，
+# 本仓库句柄逻辑（看门狗/force_terminate）全部按 isize 书写；CI 首跑曾观察到
+# ^0.52 被解析为 0.61.2（本地同款 lock 解析 0.52.0 正常，机制未定位），
+# 精确钉死 + CI --locked 双保险根除解析漂移。
 # Win32_System_Memory：看门狗共享内存心跳节（CreateFileMappingW/MapViewOfFile）。
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Memory"] }
+windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Memory"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

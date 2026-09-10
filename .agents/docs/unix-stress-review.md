@@ -63,16 +63,16 @@
   respawn，`aproxy restore` 手工路径保留。看护者运行中实例崩溃 → respawn
   的核心语义不变（watched 表内，`.restore` 判据）。两端一致，防 PID 复用
   冒名收养的合理权衡。
-- **F2（二进制名耦合，两端一致，生产影响面待确认）**：`is_aproxy_process`
-  两平台都按镜像名精确比对（Windows `aproxy.exe` / unix basename `aproxy`）。
-  **改名运行的二进制会被判为非 aProxy 进程**——已知生产实例曾以
-  `aproxy-using.exe`（Windows，绕开 target/release 文件锁的部署方式）运行，
-  该形态下：不被收养（失去看门狗自动恢复）、不计入选举 min_alive、
-  health_scan 处决被关卡拒绝（防误杀方向正确）、claim 接管时前任判定为
-  「非 aProxy」不杀直接接管。Windows 侧此语义 merge-base 前已有（非新引入）；
-  unix 实装后两端行为一致。**待决策**：接受「改名二进制不受看护」为约定，
-  或放宽比对（如前缀匹配 / exe 路径白名单）——放宽会同时削弱防冒名闸门，
-  需要权衡。
+- **F2（已升级为用户定调的方向修正，2026-09-10 末）**：`is_aproxy_process`
+  按镜像名精确比对（Windows `aproxy.exe` / unix basename `aproxy`）——改名
+  运行的二进制（生产真实存在 `aproxy-using.exe` 形态）被判异己：不被收养、
+  不计入选举、处决被关卡拒、claim 接管不杀前任。**用户定调：名称判断是
+  严重谬误**——进程身份由归属关系（spawn 链 / IPC 端点应答 / 进程创建
+  时间戳）决定，与二进制名无关；名称比对两头皆错（改名的被排除、冒名的
+  改名即绕过）。本审查最初给出的 F2 两个选项（「接受改名不受看护」/
+  「放宽比对」）**全部作废**——都建立在名称判断前提上。机制替换的重构稿
+  在 stash@{0}（约 60% 完成），**方案 A（本分支全换）/ B（独立成支评审）
+  待用户拍板**，详见记忆 identity-no-name 与 criticism-not-authorization。
 
 ## 审查与实测结论摘要
 

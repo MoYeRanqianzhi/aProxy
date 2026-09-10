@@ -77,6 +77,11 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
                 info.requests_total, info.retries_total, err_text
             );
         }
+        // 二进制更换阶段（install 的 PrepareSwap 广播后置位，IPC v3 观测）：
+        // 滚动重启中该实例随时会被 stop+新 exe 重拉——外部不要在此窗口 stop/kill
+        if info.swap_phase {
+            println!("    二进制更换中（install 滚动重启阶段，请勿手动干预此实例）");
+        }
         // 混版本检测：CLI 与实例版本不一致说明该实例还在跑旧二进制（替换 exe
         // 后重启该实例即升级）——滚动升级的事实源。推荐 restart 而非 stop+start：
         // stop&&start 的无参 start 走 default_config，别名启动的实例会被指到

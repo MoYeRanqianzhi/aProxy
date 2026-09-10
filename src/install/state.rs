@@ -228,6 +228,25 @@ pub fn is_stale(state: &InstallState, now_secs: u64) -> bool {
     }
 }
 
+/// 续作接管判定（--continue 入口用）：常规 stale，或「宣告节心跳过期且
+/// 宣告 pid 与状态文件 installer_pid 一致」。后者是 install runtime 挂死的
+/// 即时证据——挂死进程 pid 仍存活，常规 stale 判定（10 分钟 + pid 死亡）
+/// 抓不住它；宣告心跳停摆（独立 ticker 停止）与 runtime 死锁等价，接管
+/// 无需等满 10 分钟。接管后原挂死进程若恢复，写状态文件前的归属校验
+/// （refresh 同款）会让它让位退出。
+pub fn is_takeable(state: &InstallState, now_secs: u64) -> bool {
+    if is_stale(state, now_secs) {
+        return true;
+    }
+    match crate::install::announce::read() {
+        Some(ann) if ann.installer_pid == state.installer_pid => {
+            crate::watchdog::now_millis().saturating_sub(ann.heartbeat_ms)
+                > crate::install::announce::FRESH_MS
+        }
+        _ => false,
+    }
+}
+
 /// 安装锁下的新建：状态文件不存在或已 stale 才成功（stale 即接管续跑），
 /// 存在且新鲜 → Err（并发安装拒绝）。成功返回带锁信息（pid/时间戳）的状态。
 pub fn create_new_in(run_dir: &Path, mut state: InstallState) -> Result<InstallState, String> {

@@ -117,6 +117,11 @@ pub struct InstanceInfo {
     /// last_error 的发生时刻（Unix 秒；0 = 无错误记录）
     #[serde(default)]
     pub last_error_at: u64,
+    /// 二进制更换阶段（install 的 PrepareSwap 广播后置位，内存态，重启自然
+    /// 清除——「退出更换阶段」由逐实例重启天然完成）。status 据此展示
+    /// 「二进制更换中」；install 的 ACK 判定 = ping 读到 true。
+    #[serde(default)]
+    pub swap_phase: bool,
 }
 
 /// 当前 IPC 协议版本。协议变更（增字段/增 op）不递增——serde default/忽略
@@ -139,6 +144,11 @@ pub enum IpcRequest {
     /// 观测数据查询（IPC v2）：携带实时计数器与最近错误。旧实例收到此 op
     /// 反序列化失败（未知 tag）——客户端据此探测对端能力并降级为仅 Ping。
     Stats,
+    /// install 广播：实例进入二进制更换阶段（PrepareSwap）。实例置位自己的
+    /// 可观测状态（swap_phase），安装器 ping 读到 true = ACK——表达的是
+    /// 「进入阶段」而非口头 ok。旧实例（无此 op）反序列化失败回 ok:false
+    /// = 未表达，安装器走 restart 收敛（混版本舰队自动收敛到安装器版本）。
+    PrepareSwap,
 }
 
 /// IPC 响应：一行 JSON + `\n`。
@@ -231,6 +241,8 @@ pub struct IpcStats {
     pub retries_total: std::sync::atomic::AtomicU64,
     /// 最近一次上游失败的简短摘要（打码后的短串；None = 从未失败）
     pub last_error: std::sync::Mutex<Option<(String, u64)>>,
+    /// 二进制更换阶段（PrepareSwap 广播后置位，重启自然清除）
+    pub swap_phase: std::sync::atomic::AtomicBool,
 }
 
 impl IpcStats {
@@ -768,12 +780,26 @@ where
         info.last_error = Some(msg.clone());
         info.last_error_at = *at;
     }
+    info.swap_phase = stats.swap_phase.load(std::sync::atomic::Ordering::Relaxed);
     let resp: IpcResponse = match serde_json::from_str(&line) {
         Ok(IpcRequest::Ping | IpcRequest::Stats) => IpcResponse {
             ok: true,
             info: Some(info),
             proto: IPC_PROTO_VERSION,
         },
+        Ok(IpcRequest::PrepareSwap) => {
+            // 置位后组装响应——响应里的 info 立即反映 swap_phase=true，
+            // 安装器拿这一响应即可完成 ACK 判定，无需再补一次 ping
+            stats
+                .swap_phase
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            info.swap_phase = true;
+            IpcResponse {
+                ok: true,
+                info: Some(info),
+                proto: IPC_PROTO_VERSION,
+            }
+        }
         Ok(IpcRequest::Shutdown) => {
             // 响应先发出去再触发停止：客户端立刻拿到确认，服务随后优雅退出
             let resp = IpcResponse {
@@ -986,6 +1012,7 @@ mod tests {
             retries_total: 0,
             last_error: None,
             last_error_at: 0,
+            swap_phase: false,
         }
     }
 
@@ -1077,6 +1104,22 @@ mod tests {
             info.last_error
         );
         assert!(info.last_error_at > 0);
+
+        // PrepareSwap：置位 swap_phase 并在响应里立即反映（一个请求完成
+        // 表达+确认——install 的 ACK 判定）
+        let line = imp::exchange(&endpoint, r#"{"op":"prepare_swap"}"#)
+            .await
+            .unwrap();
+        let resp: IpcResponse = serde_json::from_str(&line).unwrap();
+        assert!(resp.ok);
+        assert!(
+            resp.info.as_ref().map(|i| i.swap_phase).unwrap_or(false),
+            "PrepareSwap 响应应携带置位后的 swap_phase"
+        );
+        // 后续 ping 持续反映该状态（重启前不消失——内存态由滚动重启清除）
+        let line = imp::exchange(&endpoint, r#"{"op":"ping"}"#).await.unwrap();
+        let resp: IpcResponse = serde_json::from_str(&line).unwrap();
+        assert!(resp.info.as_ref().map(|i| i.swap_phase).unwrap_or(false));
 
         // shutdown：响应确认后置位停止信号
         let line = imp::exchange(&endpoint, r#"{"op":"shutdown"}"#)

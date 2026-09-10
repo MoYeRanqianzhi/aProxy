@@ -384,6 +384,20 @@ impl WatchdogState {
         remove_heartbeat_file(port);
         crate::daemon::remove_socket_file(port);
 
+        // 安装态差异化（宣告有效时）：死亡事件可能是 install 滚动重启的
+        // 预期内 stop（stop→新 exe spawn→IPC 就绪通常 2-3s、上限 10s）——
+        // 复查 5×3s 等实例以新 pid 回归，回归即重新收养（新 pid 挂死亡
+        // watcher，不动作）；复查耗尽仍死 → 落回常规路径照常重拉（短窗口
+        // 不拖长——真崩溃不悬置）。与 install 的竞争收敛：看护者重拉成功
+        // = install 的就绪判定（IPC ping）直接通过，两者收敛到同一目标态
+        // （新版本实例就绪），worst case 双 spawn 端口冲突后者退出，无死锁。
+        if self.install_announcement_active()
+            && let Some(new_pid) = self.wait_for_install_restart(port, w.pid).await
+        {
+            self.admit_respawned(port, new_pid);
+            return DeathOutcome::Reclaimed(new_pid);
+        }
+
         let restore_path = crate::daemon::restore_file_path_in(&self.cfg.run_dir, port);
         if !restore_path.is_file() {
             tracing::info!(port = %port, "实例已优雅退出（无恢复记录），摘除看护");
@@ -500,7 +514,7 @@ impl WatchdogState {
     }
 
     /// 一个完整步进周期：claim 续写 + 收养 + 健康 + 挂死事件处理 + 退避重试
-    /// + 闲置自灭判定
+    /// + 闲置自灭判定 + install 保活
     pub async fn tick(&mut self) {
         // 消化本周期内累积的死亡事件
         let mut deaths = Vec::new();
@@ -515,6 +529,7 @@ impl WatchdogState {
         self.health_scan().await;
         self.refresh_claim();
         self.maybe_idle_exit().await;
+        self.check_install_keepalive();
     }
 
     /// claim 续写：心跳时间戳刷新（其他进程据此刻定本看护者是否在任/假死）。
@@ -572,6 +587,55 @@ impl WatchdogState {
             self.empty_since = Some(std::time::Instant::now());
         }
     }
+
+    /// 安装态宣告是否有效（看护者只认易失介质的显式宣告，绝不解读
+    /// install.state 残留——分工原则）。无效/无宣告 → false，常态零改变。
+    fn install_announcement_active(&self) -> bool {
+        crate::install::announce::read()
+            .is_some_and(|a| crate::install::announce::is_active(&a, now_millis()))
+    }
+
+    /// 安装态死亡复查：等 install 以新 exe 重新拉起实例（注册表记录重新
+    /// 出现——优雅退出会删文件，回归 = 记录带着新 pid 重现）且新 pid 通过
+    /// 身份判定（防 PID 复用，与 adopt 同关）。5×3s 覆盖 stop+spawn+ready
+    /// 通常 2-3s、上限 10s 的窗口。
+    async fn wait_for_install_restart(&self, port: &str, old_pid: u32) -> Option<u32> {
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            if let Some(info) = read_registry_info(&self.cfg.run_dir, port)
+                && info.pid != old_pid
+                && imp_process::is_aproxy_process(info.pid)
+            {
+                tracing::info!(port = %port, new_pid = info.pid, "安装态复查：实例已以新 pid 回归，重新收养");
+                return Some(info.pid);
+            }
+        }
+        None
+    }
+
+    /// install 保活（仅安装态）：宣告节在但心跳过期（install 挂死——
+    /// Windows 节随进程死消失，此态即挂死；unix 崩溃残留文件同判定路径）
+    /// → 拉起 `install --continue` 续作。常态无宣告 = 零成本跳过。重复拉起
+    /// 由 --continue 的接管判定收敛（未 stale 即退出；接管后宣告刷新），
+    /// 最坏情况是每周期一个短命进程直到 updated_at 过 stale 阈值。
+    fn check_install_keepalive(&self) {
+        let Some(ann) = crate::install::announce::read() else {
+            return;
+        };
+        if crate::install::announce::is_active(&ann, now_millis()) {
+            return;
+        }
+        tracing::warn!(
+            installer_pid = ann.installer_pid,
+            "install 宣告心跳过期（挂死/残留），拉起 install --continue 续作"
+        );
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = crate::daemon::spawn_detached(
+                &exe,
+                &["install".to_string(), "--continue".to_string()],
+            );
+        }
+    }
 }
 
 /// 死亡事件处置结果（handle_death 返回，测试断言用）
@@ -579,6 +643,8 @@ impl WatchdogState {
 pub enum DeathOutcome {
     /// 崩溃并成功重拉（携带新 PID）
     Respawned(u32),
+    /// 安装态复查：实例以新 pid 回归（install 滚动重启），重新收养
+    Reclaimed(u32),
     /// 重拉失败（退避计数 +1，未达上限）
     RespawnFailed,
     /// 连续失败达上限，放弃自动重拉
@@ -696,9 +762,17 @@ pub async fn serve(cfg: WatchdogConfig) {
     }
     tracing::info!(pid = std::process::id(), "看护者就绪（watchdog）");
 
+    // 启动全量检查：本地状态文件残留 → 拉起对应处理者（恢复机制的主责入口，
+    // 用户定调）。检查对象是各类本地状态文件（当前只有 install.state，后续
+    // 扩展更多）；职责仅为「发现残留 → spawn」，处于哪一步、续跑还是清理
+    // 全部由处理者自己判断——看护者绝不解读状态文件语义（分工原则）。
+    // 启动时一次 + 运行中每日一次（防常态浪费）。
+    sweep_local_states(&cfg.run_dir);
+
     let mut state = WatchdogState::new(cfg);
     state.adopt_scan().await;
     let scan = Duration::from_secs(state.cfg.scan_secs.max(1));
+    let mut last_sweep = std::time::Instant::now();
     loop {
         // 双源竞速唤醒：常规扫描周期，或退避队列的最早到期时刻——重试时刻
         // 精确到秒而非被扫描周期拖累。主循环单步耗时预算：handle_death/process
@@ -716,6 +790,26 @@ pub async fn serve(cfg: WatchdogConfig) {
             } => {},
         }
         state.tick().await;
+        // 每日一次的残留状态文件复查（安装中断后看护者长期存活的场景）
+        if last_sweep.elapsed() >= Duration::from_secs(24 * 3600) {
+            last_sweep = std::time::Instant::now();
+            sweep_local_states(&state.cfg.run_dir);
+        }
+    }
+}
+
+/// 本地状态文件残留全量检查（当前只有 install.state）：存在即拉起
+/// `install --continue`（detached，短命进程——已正常结束的场景由续作进程
+/// 自行清文件退出，幂等收敛）。
+fn sweep_local_states(run_dir: &Path) {
+    if crate::install::state::load_in(run_dir).is_some() {
+        tracing::info!("发现 install 状态文件残留，拉起 install --continue 续作");
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = crate::daemon::spawn_detached(
+                &exe,
+                &["install".to_string(), "--continue".to_string()],
+            );
+        }
     }
 }
 
@@ -1331,6 +1425,7 @@ mod tests {
             retries_total: 0,
             last_error: None,
             last_error_at: 0,
+            swap_phase: false,
         };
         crate::daemon::write_instance_file_in(dir, &info).unwrap();
         // restore 记录（崩溃信号）
@@ -1372,6 +1467,7 @@ mod tests {
             retries_total: 0,
             last_error: None,
             last_error_at: 0,
+            swap_phase: false,
         };
         crate::daemon::write_instance_file_in(dir.path(), &info).unwrap();
         assert_eq!(st.handle_death("59901").await, DeathOutcome::GracefulExit);

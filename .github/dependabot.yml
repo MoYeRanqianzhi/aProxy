@@ -10,3 +10,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # windows-sys 精确钉死 =0.52.0：HANDLE 类型为 isize，0.59+ 改为
+      # *mut c_void（本仓库句柄逻辑全部按 isize 书写，Cargo.toml 有注释）。
+      # 忽略它的所有升级建议，避免周期性无效 PR。
+      - dependency-name: "windows-sys"
+        versions: [">=0.53"]

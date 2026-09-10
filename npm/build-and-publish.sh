@@ -80,9 +80,9 @@ for m in "${MAPPINGS[@]}"; do
   cp "$ASSET_DIR/$asset" "$dir/bin/$bin_out"
   chmod +x "$dir/bin/$bin_out" 2>/dev/null || true
 
-  # libc 字段：仅 musl 包声明（npm 据此在 Alpine 等 musl 环境选包）
+  # libc 字段：musl 包声明（npm 据此在 Alpine 等 musl 环境选包）
   libc_json=""
-  [ "$suffix" = "linux-x64-musl" ] && libc_json=$',\n  "libc": ["musl"]'
+  case "$suffix" in *-musl) libc_json=$',\n  "libc": ["musl"]' ;; esac
 
   cat >"$dir/package.json" <<EOF
 {

@@ -18,6 +18,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# 输出统一 UTF-8：中文提示在重定向/管道场景不再按系统 OEM 码页转码乱码
+# （与 aproxy 进程入口的 SetConsoleOutputCP(65001) 同款语义）
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $Repo = "MoYeRanqianzhi/aProxy"
 $Home_ = if ($env:APROXY_HOME) { $env:APROXY_HOME } else { Join-Path $HOME ".aproxy" }

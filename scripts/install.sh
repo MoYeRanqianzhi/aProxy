@@ -49,9 +49,28 @@ latest_tag() {
         | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/'
 }
 
+# ---- 平台解析（先于已安装检测：Windows 落位 aproxy.exe，检测名随平台）----
+OS="$(uname -s)"; ARCH="$(uname -m)"
+# EXE_SUFFIX/BAT_FALLBACK：Windows 侧（含 Git Bash/MSYS）二进制带 .exe 且需要
+# aproxy.bat fallback 入口（PATHEXT 机制，见 install 计划 swapping 专节）
+EXE_SUFFIX=""
+BAT_FALLBACK=0
+case "$OS" in
+    Linux) platform="unknown-linux-gnu" ;;
+    Darwin) platform="apple-darwin" ;;
+    MINGW*|MSYS*|CYGWIN*) platform="pc-windows-msvc"; EXE_SUFFIX=".exe"; BAT_FALLBACK=1 ;;
+    *) echo "不支持的平台: $OS" >&2; exit 1 ;;
+esac
+case "$ARCH" in
+    x86_64|amd64) rust_arch="x86_64" ;;
+    aarch64|arm64) rust_arch="aarch64" ;;
+    *) echo "不支持的架构: $ARCH" >&2; exit 1 ;;
+esac
+BIN_NAME="aproxy${EXE_SUFFIX}"
+
 # ---- 已安装检测：装机后的升级归 install 管，本脚本只做首装 ----
-if [ -f "$BIN_DIR/aproxy" ]; then
-    echo "aProxy 已安装于 $BIN_DIR/aproxy，本脚本不做覆盖。"
+if [ -f "$BIN_DIR/$BIN_NAME" ]; then
+    echo "aProxy 已安装于 $BIN_DIR/$BIN_NAME，本脚本不做覆盖。"
     echo "升级请使用: aproxy install"
     exit 0
 fi
@@ -61,19 +80,8 @@ TAG="${1:-$(latest_tag)}"
 [ -n "$TAG" ] || { echo "无法解析最新 release（仓库无 release 或网络不可达）" >&2; exit 1; }
 echo "安装 aProxy $TAG"
 
-OS="$(uname -s)"; ARCH="$(uname -m)"
-case "$OS" in
-    Linux) platform="unknown-linux-gnu" ;;
-    Darwin) platform="apple-darwin" ;;
-    *) echo "不支持的平台: $OS" >&2; exit 1 ;;
-esac
-case "$ARCH" in
-    x86_64|amd64) rust_arch="x86_64" ;;
-    aarch64|arm64) rust_arch="aarch64" ;;
-    *) echo "不支持的架构: $ARCH" >&2; exit 1 ;;
-esac
 # 本脚本不探测 AVX2（保守拉 baseline）；指令集变体选择由 `aproxy install` 做
-ASSET="aproxy-${rust_arch}-${platform}"
+ASSET="aproxy-${rust_arch}-${platform}${EXE_SUFFIX}"
 BASE="https://github.com/$REPO/releases/download/$TAG"
 
 mkdir -p "$BIN_DIR" "$SKILLS_DIR" "$TMP_DIR"
@@ -91,7 +99,13 @@ actual=$(sha256sum "$TMP_DIR/aproxy" | cut -d' ' -f1)
     exit 1
 }
 chmod 755 "$TMP_DIR/aproxy"
-mv "$TMP_DIR/aproxy" "$BIN_DIR/aproxy"
+mv "$TMP_DIR/aproxy" "$BIN_DIR/$BIN_NAME"
+
+# ---- Windows：fallback 入口脚本（exe 缺席时重定向旧二进制）----
+if [ "$BAT_FALLBACK" = "1" ]; then
+    printf '@echo off\r\nif exist "%%~dp0aproxy.exe" (\r\n  "%%~dp0aproxy.exe" %%*\r\n) else if exist "%%~dp0aproxy.old.exe" (\r\n  "%%~dp0aproxy.old.exe" %%*\r\n)\r\n' \
+        > "$BIN_DIR/aproxy.bat"
+fi
 
 # ---- skill 文档（非强制：失败不影响安装）----
 if [ "${APROXY_NO_SKILLS:-}" != "1" ]; then
@@ -120,7 +134,7 @@ fi
 rm -rf "$TMP_DIR"
 
 echo ""
-echo "aProxy 已安装: $BIN_DIR/aproxy"
+echo "aProxy 已安装: $BIN_DIR/$BIN_NAME"
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
     *)
@@ -128,5 +142,5 @@ case ":$PATH:" in
         echo "  echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.profile && source ~/.profile"
         ;;
 esac
-echo "启动: aproxy   （或完整路径 \"$BIN_DIR/aproxy\"）"
+echo "启动: aproxy   （或完整路径 \"$BIN_DIR/$BIN_NAME\"）"
 echo "状态: aproxy status    升级: aproxy install"

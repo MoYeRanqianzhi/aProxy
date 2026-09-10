@@ -42,8 +42,8 @@ jobs:
       fail-fast: false # 单平台失败不连坐其他平台的产物
       matrix:
         include:
-          # Windows 主平台：baseline + x86-64-v3（AVX2，约 2013 年后主流 CPU；
-          # install 按 is_x86_feature_detected 自动选变体，失败回退 baseline）
+          # Windows 主平台 x64：baseline + x86-64-v3（AVX2，约 2013 年后主流
+          # CPU；install 按 is_x86_feature_detected 自动选变体，失败回退 baseline）
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             variant: ""
@@ -54,8 +54,20 @@ jobs:
             variant: "-v3"
             rustflags: "-C target-cpu=x86-64-v3"
             ext: .exe
-          # Linux：gnu（常规发行版）双变体 + musl（静态链接，无 glibc 环境可用；
-          # musl 不出 v3——变体组合收益低）
+          # Windows x86（32 位）与 ARM64：x64 runner 交叉编 x86（MSVC 自带
+          # x86 交叉工具链）；ARM64 用原生 arm runner（ring 要编 C）
+          - os: windows-latest
+            target: i686-pc-windows-msvc
+            variant: ""
+            rustflags: ""
+            ext: .exe
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            variant: ""
+            rustflags: ""
+            ext: .exe
+          # Linux x64：gnu（常规发行版）双变体 + musl（静态链接，无 glibc 环境
+          # 可用；musl 不出 v3——变体组合收益低）
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             variant: ""
@@ -68,6 +80,19 @@ jobs:
             ext: ""
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            variant: ""
+            rustflags: ""
+            ext: ""
+            musl: true
+          # Linux ARM64：Graviton/Ampere 服务器 + M 系列 Mac 的 Docker arm64
+          # 容器（刚需场景）；gnu + musl 双库，原生 arm runner
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            variant: ""
+            rustflags: ""
+            ext: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
             variant: ""
             rustflags: ""
             ext: ""
@@ -172,7 +197,7 @@ jobs:
             echo "## 基础信息"
             echo ""
             echo "- 版本：\`${GITHUB_REF_NAME}\`"
-            echo "- 平台产物：windows / linux（gnu+musl）/ macOS（aarch64 + x86_64），x86_64 提供 baseline 与 AVX2（-v3）两种指令集变体"
+            echo "- 平台产物：windows（x64/x86/arm64）/ linux（x64+arm64，gnu+musl）/ macOS（arm64+x64），x86_64 提供 baseline 与 AVX2（-v3）两种指令集变体"
             echo "- 变更记录：见下方 Automatic release notes"
             echo ""
             echo "## SHA256"

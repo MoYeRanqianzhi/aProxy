@@ -14,9 +14,10 @@ the storm upstream; it only notices that the request took a little longer.
 npm install -g @meowo/aproxy
 ```
 
-The right platform binary (windows / linux-glibc / linux-musl / macOS, x64 or
-arm64) is installed automatically via `optionalDependencies` — no postinstall
-downloads, everything comes from the npm registry.
+The right platform binary (windows x64/x86/arm64, linux x64/arm64 with glibc
+or musl, macOS arm64/x64) is installed automatically via
+`optionalDependencies` — no postinstall downloads, everything comes from the
+npm registry.
 
 ## Quick start
 

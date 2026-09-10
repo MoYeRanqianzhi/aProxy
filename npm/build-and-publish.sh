@@ -48,8 +48,12 @@ PKG_SCOPE="@meowo/aproxy"
 # npm 分发固定取 baseline 变体（-v3 是 GitHub 资产的安装优化，npm 链不提供）
 MAPPINGS=(
   "windows-x64:aproxy-x86_64-pc-windows-msvc.exe:win32:x64"
+  "windows-ia32:aproxy-i686-pc-windows-msvc.exe:win32:ia32"
+  "windows-arm64:aproxy-aarch64-pc-windows-msvc.exe:win32:arm64"
   "linux-x64:aproxy-x86_64-unknown-linux-gnu:linux:x64"
   "linux-x64-musl:aproxy-x86_64-unknown-linux-musl:linux:x64"
+  "linux-arm64:aproxy-aarch64-unknown-linux-gnu:linux:arm64"
+  "linux-arm64-musl:aproxy-aarch64-unknown-linux-musl:linux:arm64"
   "darwin-arm64:aproxy-aarch64-apple-darwin:darwin:arm64"
   "darwin-x64:aproxy-x86_64-apple-darwin:darwin:x64"
 )

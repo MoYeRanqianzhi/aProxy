@@ -16,11 +16,20 @@ const PKG_PREFIX = '@meowo/aproxy-';
 // 平台 → 子包后缀。linux 需区分 glibc/musl（两套静态链接产物）。
 function platformPackage() {
   const { platform, arch } = process;
-  if (platform === 'win32' && arch === 'x64') return PKG_PREFIX + 'windows-x64';
-  if (platform === 'darwin' && arch === 'arm64') return PKG_PREFIX + 'darwin-arm64';
-  if (platform === 'darwin' && arch === 'x64') return PKG_PREFIX + 'darwin-x64';
+  if (platform === 'win32') {
+    if (arch === 'x64') return PKG_PREFIX + 'windows-x64';
+    if (arch === 'ia32') return PKG_PREFIX + 'windows-ia32';
+    if (arch === 'arm64') return PKG_PREFIX + 'windows-arm64';
+  }
+  if (platform === 'darwin') {
+    if (arch === 'arm64') return PKG_PREFIX + 'darwin-arm64';
+    if (arch === 'x64') return PKG_PREFIX + 'darwin-x64';
+  }
   if (platform === 'linux' && arch === 'x64') {
     return PKG_PREFIX + 'linux-x64' + (isMusl() ? '-musl' : '');
+  }
+  if (platform === 'linux' && arch === 'arm64') {
+    return PKG_PREFIX + 'linux-arm64' + (isMusl() ? '-musl' : '');
   }
   return null;
 }

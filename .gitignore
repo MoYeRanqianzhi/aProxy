@@ -29,5 +29,5 @@ desktop.ini
 /target-rel/
 
 # npm 渠道组包产物（npm/build-and-publish.sh 生成，不进 git）
-/npm/@moyeranqianzhi/
+/npm/@meowo/
 /.npm-assets/

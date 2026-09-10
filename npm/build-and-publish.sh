@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # npm 渠道组包与发布。
 #
-# 结构（esbuild/rollup 同款多平台包模式）：主包 @moyeranqianzhi/aproxy 只含
+# 结构（esbuild/rollup 同款多平台包模式）：主包 @meowo/aproxy 只含
 # JS 转发器；5 个平台子包各携带一份对应平台二进制，经 optionalDependencies
 # 的 os/cpu/libc 字段由 npm 自动按平台装配——全程 registry 内分发，无二次下载。
 #
@@ -19,7 +19,7 @@
 # 与 OIDC claims 精确匹配（大小写敏感）——改仓库名时必须同步此处模板。
 #
 # --tag latest：npm 11 对 prerelease 版本强制显式 tag。0.1.x 全程预发布、
-# 无 stable，latest 指向最新 alpha 语义正确（`npm i -g @moyeranqianzhi/aproxy`
+# 无 stable，latest 指向最新 alpha 语义正确（`npm i -g @meowo/aproxy`
 # 直接可装）；首个 stable（0.2.0）发布后 latest 自然指向 stable，无需改动。
 
 set -euo pipefail
@@ -42,7 +42,7 @@ fi
 VERSION="${VERSION#v}"
 
 REPO_URL="https://github.com/MoYeRanqianzhi/aProxy"
-PKG_SCOPE="@moyeranqianzhi/aproxy"
+PKG_SCOPE="@meowo/aproxy"
 
 # 子包后缀 : 资产文件名 : os : cpu
 # npm 分发固定取 baseline 变体（-v3 是 GitHub 资产的安装优化，npm 链不提供）

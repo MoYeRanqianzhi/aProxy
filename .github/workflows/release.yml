@@ -161,7 +161,7 @@ jobs:
             echo "\`aproxy install\` 自动按默认链条尝试：**github → npm → cargo-binstall → cargo**。"
             echo ""
             echo "- **GitHub（本页 assets）**：按平台选择 \`aproxy-<target>[-v3]\`；\`-v3\` 需要 AVX2（约 2013 年后的主流 x86_64 CPU），不确定就选无后缀的 baseline 版本"
-            echo "- **npm**：\`npm install -g @moyeranqianzhi/aproxy\`（含全平台预编译包）"
+            echo "- **npm**：\`npm install -g @meowo/aproxy\`（含全平台预编译包）"
             echo "- **cargo-binstall**：\`cargo binstall aproxy\`（预编译，免编译）"
             echo "- **cargo（源码编译）**：\`cargo install aproxy --root ~/.aproxy\`"
             echo ""

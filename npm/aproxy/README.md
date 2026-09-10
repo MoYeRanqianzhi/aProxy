@@ -1,4 +1,4 @@
-# @moyeranqianzhi/aproxy
+# @meowo/aproxy
 
 Local API proxy with **infinite retries** for agent workloads.
 
@@ -11,7 +11,7 @@ the storm upstream; it only notices that the request took a little longer.
 ## Install
 
 ```sh
-npm install -g @moyeranqianzhi/aproxy
+npm install -g @meowo/aproxy
 ```
 
 The right platform binary (windows / linux-glibc / linux-musl / macOS, x64 or

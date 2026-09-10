@@ -3,7 +3,7 @@
 
 // aProxy npm 入口转发器（esbuild/rollup 同款多平台包模式）。
 //
-// 原理：npm 主包 @moyeranqianzhi/aproxy 只含这个 JS 脚本；真正的二进制在
+// 原理：npm 主包 @meowo/aproxy 只含这个 JS 脚本；真正的二进制在
 // 各平台子包里（optionalDependencies），npm install 时按 os/cpu/libc 字段
 // 自动只装当前平台的那一个——全程 registry 内分发，无二次网络下载。
 // 本脚本运行时解析出平台子包内的二进制路径，spawn 并透传参数/stdio/退出码。
@@ -11,7 +11,7 @@
 const { spawnSync } = require('child_process');
 const path = require('path');
 
-const PKG_PREFIX = '@moyeranqianzhi/aproxy-';
+const PKG_PREFIX = '@meowo/aproxy-';
 
 // 平台 → 子包后缀。linux 需区分 glibc/musl（两套静态链接产物）。
 function platformPackage() {
@@ -52,7 +52,7 @@ try {
 } catch {
   // optionalDependencies 被 --omit=optional 跳过、或 npm 平台过滤未装上时走到这里
   console.error(
-    `aproxy: 平台包 ${pkg} 未安装。请重新安装：npm install -g @moyeranqianzhi/aproxy`
+    `aproxy: 平台包 ${pkg} 未安装。请重新安装：npm install -g @meowo/aproxy`
   );
   process.exit(1);
 }

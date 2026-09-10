@@ -1483,17 +1483,18 @@ fn daemon_test_ports() -> (u16, u16, u16) {
 struct DaemonGuard {
     exe: &'static str,
     port: u16,
-    /// 守护的隔离 run 目录：unix 的 UDS socket 与注册表都在 run_dir 里，
-    /// stop 须看到同一 run_dir 才找得到守护；None = 默认 ~/.aproxy/run
-    run_dir: Option<std::path::PathBuf>,
+    /// 守护的隔离主目录（APROXY_HOME）：注册表在 home/run/ 下，unix 的
+    /// UDS socket 也在其中，stop 须看到同一 APROXY_HOME 才找得到守护；
+    /// None = 默认主目录 ~/.aproxy
+    home_dir: Option<std::path::PathBuf>,
 }
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         let mut cmd = Command::new(self.exe);
         cmd.args(["stop", &self.port.to_string()]);
-        if let Some(dir) = &self.run_dir {
-            cmd.env("APROXY_RUN_DIR", dir);
+        if let Some(dir) = &self.home_dir {
+            cmd.env("APROXY_HOME", dir);
         }
         let _ = cmd.output();
     }
@@ -1572,7 +1573,7 @@ fn daemon_lifecycle_start_status_stop() {
     let _guard = DaemonGuard {
         exe,
         port,
-        run_dir: None,
+        home_dir: None,
     };
 
     let pid = aproxy::daemon::spawn_detached(
@@ -1647,7 +1648,7 @@ fn daemon_second_instance_on_same_port_exits() {
     let _guard = DaemonGuard {
         exe,
         port,
-        run_dir: None,
+        home_dir: None,
     };
 
     let args = |file: &std::path::Path| {
@@ -1717,7 +1718,7 @@ fn start_parent_command_output_returns() {
     let _guard = DaemonGuard {
         exe,
         port,
-        run_dir: None,
+        home_dir: None,
     };
 
     // 无子命令 = 后台启动：真实 start 父进程做预检、spawn 分离守护、
@@ -1760,7 +1761,7 @@ fn logs_follows_daemon_and_exits_on_stop() {
     let _guard = DaemonGuard {
         exe,
         port,
-        run_dir: None,
+        home_dir: None,
     };
 
     let pid = aproxy::daemon::spawn_detached(
@@ -1878,12 +1879,12 @@ fn logs_requires_port_when_multiple_instances() {
     let _guard_a = DaemonGuard {
         exe,
         port: port_a,
-        run_dir: None,
+        home_dir: None,
     };
     let _guard_b = DaemonGuard {
         exe,
         port: port_b,
-        run_dir: None,
+        home_dir: None,
     };
     assert!(wait_daemon_ready(port_a), "守护 a 未就绪 (pid {pid_a})");
     assert!(wait_daemon_ready(port_b), "守护 b 未就绪 (pid {pid_b})");
@@ -1953,7 +1954,7 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     let _guard = DaemonGuard {
         exe,
         port,
-        run_dir: None,
+        home_dir: None,
     };
     let restore_path = aproxy::daemon::restore_file_path(&format!("127.0.0.1:{port}"));
 
@@ -2052,7 +2053,7 @@ fn alias_start_and_stop_roundtrip() {
     let _guard = DaemonGuard {
         exe,
         port,
-        run_dir: None,
+        home_dir: None,
     };
 
     // add 别名（指向临时配置）
@@ -2200,7 +2201,7 @@ fn alias_errors_on_unknown_names() {
 // ---------------------------------------------------------------------------
 // 17. 看门狗（G2）：全局单看护进程的重拉/放行/补种端到端
 //
-// 隔离：APROXY_RUN_DIR 指向 tempdir（守护/看护子进程经 spawn_detached 继承
+// 隔离：APROXY_HOME 指向 tempdir（守护/看护子进程经 spawn_detached 继承
 // 环境），APROXY_WATCHDOG_SCAN_SECS=1 让看护者秒级扫描。测试端口照旧从测试
 // 进程 pid 派生，绝不触碰生产实例；结束清理 claim 与残留守护。
 // ---------------------------------------------------------------------------
@@ -2220,7 +2221,7 @@ fn watchdog_respawns_killed_daemon() {
     let _guard = DaemonGuard {
         exe,
         port,
-        run_dir: Some(dir.path().to_path_buf()),
+        home_dir: Some(dir.path().to_path_buf()),
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2230,7 +2231,7 @@ fn watchdog_respawns_killed_daemon() {
     // 带隔离环境启动守护：必须用 Command::env（spawn_detached 继承的是测试
     // 进程环境，无法逐子进程注入）——守护与看护者都要看到同一个 tempdir 注册表
     let envs = [
-        ("APROXY_RUN_DIR", dir.path().display().to_string()),
+        ("APROXY_HOME", dir.path().display().to_string()),
         ("APROXY_WATCHDOG_SCAN_SECS", "1".to_string()),
     ];
     let daemon_child = {
@@ -2246,7 +2247,7 @@ fn watchdog_respawns_killed_daemon() {
         cmd.spawn().expect("spawn 守护失败")
     };
     let orig_pid = daemon_child.id();
-    // 隔离 run_dir 版的就绪等待：TCP 可连 + 隔离 socket 的 IPC ping 可达
+    // 隔离主目录版的就绪等待：TCP 可连 + 隔离 socket 的 IPC ping 可达
     let mut ready = false;
     for _ in 0..100 {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
@@ -2292,10 +2293,10 @@ fn watchdog_respawns_killed_daemon() {
     assert!(wd_child.try_wait().unwrap().is_none(), "看护者不应退出");
 
     // 清理：优雅 stop（.restore 删除）→ 看护者不得复活它；随后闲置自灭前
-    // 先杀看护者防泄漏。stop 须带同一 run_dir（unix 的 UDS socket 在其中）
+    // 先杀看护者防泄漏。stop 须带同一 APROXY_HOME（unix 的 UDS socket 在其中）
     let _ = Command::new(exe)
         .args(["stop", &port.to_string()])
-        .env("APROXY_RUN_DIR", dir.path())
+        .env("APROXY_HOME", dir.path())
         .output();
     std::thread::sleep(Duration::from_secs(3));
     assert!(
@@ -2303,7 +2304,7 @@ fn watchdog_respawns_killed_daemon() {
         "优雅停止后看护者不得复活实例"
     );
     let _ = wd_child.kill();
-    let _ = std::fs::remove_file(dir.path().join("watchdog.claim"));
+    let _ = std::fs::remove_file(dir.path().join("run").join("watchdog.claim"));
 }
 
 // ---------------------------------------------------------------------------
@@ -2331,13 +2332,12 @@ fn identity_check_tolerates_swapped_binary() {
         ),
     )
     .unwrap();
-    let run_dir = dir.path().join("run");
-    std::fs::create_dir_all(&run_dir).unwrap();
+    let home_dir = dir.path();
     let leaked_bin: &'static str = Box::leak(bin.display().to_string().into_boxed_str());
     let guard = DaemonGuard {
         exe: leaked_bin,
         port,
-        run_dir: Some(run_dir.clone()),
+        home_dir: Some(home_dir.to_path_buf()),
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2350,14 +2350,14 @@ fn identity_check_tolerates_swapped_binary() {
             cfg_file.display().to_string().as_str(),
             "--daemon-child",
         ])
-        .env("APROXY_RUN_DIR", run_dir.display().to_string())
+        .env("APROXY_HOME", home_dir.display().to_string())
         .spawn()
         .expect("spawn 副本守护失败");
     let pid = daemon_child.id();
     let mut ready = false;
     for _ in 0..100 {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
-            && ipc_ping_in_dir(&rt, port, &run_dir).is_ok()
+            && ipc_ping_in_dir(&rt, port, home_dir).is_ok()
         {
             ready = true;
             break;
@@ -2384,7 +2384,7 @@ fn identity_check_tolerates_swapped_binary() {
 
     // 守护仍在正常服务（IPC 可达）——身份判定未误杀正常实例
     assert!(
-        ipc_ping_in_dir(&rt, port, &run_dir).is_ok(),
+        ipc_ping_in_dir(&rt, port, home_dir).is_ok(),
         "替换后守护应继续可 ping"
     );
     drop(guard);
@@ -2392,12 +2392,12 @@ fn identity_check_tolerates_swapped_binary() {
 
 #[test]
 fn watchdog_lease_prevents_duplicate_watchdogs() {
-    // 并发 spawn 两个看护者（同一隔离 run 目录）：claim 原子接管保证只有一个
+    // 并发 spawn 两个看护者（同一隔离主目录）：claim 原子接管保证只有一个
     // 在任——后启动者应自行退出（选举唯一性）
     let dir = tempfile::tempdir().unwrap();
     let exe = env!("CARGO_BIN_EXE_aproxy");
     let envs = [
-        ("APROXY_RUN_DIR", dir.path().display().to_string()),
+        ("APROXY_HOME", dir.path().display().to_string()),
         ("APROXY_WATCHDOG_SCAN_SECS", "1".to_string()),
     ];
     let mut c1 = {
@@ -2425,22 +2425,26 @@ fn watchdog_lease_prevents_duplicate_watchdogs() {
         "后任看护者应因 claim 被占而退出"
     );
     let _ = c1.kill();
-    let _ = std::fs::remove_file(dir.path().join("watchdog.claim"));
+    let _ = std::fs::remove_file(dir.path().join("run").join("watchdog.claim"));
 }
 
-/// 对运行在隔离 run 目录里的守护做 IPC ping：unix 的 UDS socket 路径在
-/// run_dir 下（endpoint_for 解析依赖进程环境，库调用方须显式给目录）；
-/// Windows 管道名全局唯一，run_dir 只影响注册表文件，端点忽略该参数。
+/// 对运行在隔离主目录里的守护做 IPC ping：unix 的 UDS socket 路径在
+/// home/run/ 下（endpoint_for 解析依赖进程环境，库调用方须显式给目录）；
+/// Windows 管道名全局唯一，主目录只影响注册表文件，端点忽略该参数。
 fn ipc_ping_in_dir(
     rt: &tokio::runtime::Runtime,
     port: u16,
-    #[cfg(unix)] run_dir: &std::path::Path,
-    #[cfg(windows)] _run_dir: &std::path::Path,
+    #[cfg(unix)] home_dir: &std::path::Path,
+    #[cfg(windows)] _home_dir: &std::path::Path,
 ) -> Result<aproxy::daemon::InstanceInfo, String> {
     #[cfg(windows)]
     let endpoint = aproxy::daemon::endpoint_for(&port.to_string());
     #[cfg(unix)]
-    let endpoint = run_dir.join(format!("{}.sock", port)).display().to_string();
+    let endpoint = home_dir
+        .join("run")
+        .join(format!("{}.sock", port))
+        .display()
+        .to_string();
     rt.block_on(async {
         let mut last = String::new();
         for attempt in 0..3 {

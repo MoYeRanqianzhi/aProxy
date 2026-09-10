@@ -7,7 +7,26 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf};
 
-/// settings.json 路径：`~/.aproxy/settings.json`
+/// aProxy 主目录：`APROXY_HOME` 环境变量优先，未设 = `~/.aproxy`。
+/// config/settings/bin/staging/logs/spool/run 全部相对它派生——测试与
+/// 多份部署经环境变量整体重定向（子进程经 spawn 继承环境，隔离白送）。
+pub fn home() -> PathBuf {
+    home_in(std::env::var("APROXY_HOME").ok().as_deref())
+}
+
+/// 同上，环境变量值可指定（单测注入用——std::env 是全局可变态，并行测试
+/// 直接改进程环境会互相污染，故逻辑收敛到纯函数、env 读取只留薄壳）。
+fn home_in(env_value: Option<&str>) -> PathBuf {
+    match env_value.map(str::trim) {
+        // 空串/空白视为未设：环境变量空值不应把全部路径变成相对路径
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => dirs::home_dir()
+            .expect("无法获取用户主目录")
+            .join(".aproxy"),
+    }
+}
+
+/// settings.json 路径：`<home>/settings.json`
 pub fn settings_path() -> PathBuf {
     settings_path_in(&crate::config::config_dir())
 }
@@ -365,6 +384,21 @@ pub fn check_and_report() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_env_override_and_default() {
+        // 未设 → ~/.aproxy
+        let default = dirs::home_dir().unwrap().join(".aproxy");
+        assert_eq!(home_in(None), default);
+        // 设了 → 原样使用（测试/多部署整体重定向的根基）
+        assert_eq!(
+            home_in(Some("D:/aproxy-home")),
+            PathBuf::from("D:/aproxy-home")
+        );
+        // 空串/空白 → 视为未设（环境变量空值不应把全部路径变成相对路径）
+        assert_eq!(home_in(Some("")), default);
+        assert_eq!(home_in(Some("   ")), default);
+    }
 
     #[test]
     fn settings_roundtrip() {

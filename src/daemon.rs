@@ -17,26 +17,26 @@
 use serde::{Deserialize, Serialize};
 use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
-/// 实例注册表目录：`~/.aproxy/run/`。
-/// `APROXY_RUN_DIR` 环境变量可整体改指别处——集成测试用它与 tempdir 隔离
+/// 实例注册表目录：`<home>/run/`。`APROXY_RUN_DIR` 环境变量可整体改指
+/// 别处（粒度优先于 APROXY_HOME 派生）——集成测试用它与 tempdir 隔离
 /// （守护/看护子进程经 spawn_detached 继承环境），高级用户亦可借此自定义
 /// 运行数据位置。
 pub fn run_dir() -> PathBuf {
     if let Ok(d) = std::env::var("APROXY_RUN_DIR") {
         return PathBuf::from(d);
     }
-    crate::config::config_dir().join("run")
+    crate::settings::home().join("run")
 }
 
-/// 守护进程日志目录：`~/.aproxy/logs/`
+/// 守护进程日志目录：`<home>/logs/`
 pub fn logs_dir() -> PathBuf {
-    crate::config::config_dir().join("logs")
+    crate::settings::home().join("logs")
 }
 
-/// spool 临时文件目录基址：`~/.aproxy/spool/<端口>/`。每实例独立子目录，
+/// spool 临时文件目录基址：`<home>/spool/<端口>/`。每实例独立子目录，
 /// 启动时清空自己的子目录即可回收崩溃残留，互不干扰。
 pub fn spool_dir_for(port: &str) -> PathBuf {
-    crate::config::config_dir().join("spool").join(port)
+    crate::settings::home().join("spool").join(port)
 }
 
 /// 清空实例的 spool 目录（启动时调用）：删除崩溃/强杀残留的 *.spooltmp。
@@ -190,8 +190,9 @@ pub async fn ipc_request(port: &str, req: &IpcRequest) -> Result<IpcResponse, St
 
 /// 按显式端点发送 IPC 请求并等待响应（3 秒超时）。
 /// 供绕过 `endpoint_for` 解析的场景使用：unix 的 UDS 路径在 run_dir 里，
-/// 守护以隔离 `APROXY_RUN_DIR` 运行时，同进程的库调用方（测试）须按守护
-/// 实际的 socket 路径寻址；Windows 管道名全局唯一，不受 run_dir 影响。
+/// 守护以隔离主目录（`APROXY_HOME`/`APROXY_RUN_DIR`）运行时，同进程的
+/// 库调用方（测试）须按守护实际的 socket 路径寻址；Windows 管道名全局
+/// 唯一，不受 run_dir 影响。
 pub async fn ipc_request_to(endpoint: &str, req: &IpcRequest) -> Result<IpcResponse, String> {
     let req_line = serde_json::to_string(req).expect("序列化 IPC 请求失败");
     let fut = imp::exchange(endpoint, &req_line);

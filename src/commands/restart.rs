@@ -72,8 +72,8 @@ async fn restart_instance(info: &daemon::InstanceInfo, mode: StopMode) {
     // 并不代表失败（实测踩坑：改端口重启误报「未就绪」而实例已在新端口运行）。
     // pid 来自 spawn 返回值，唯一可靠锚点；顺带覆盖 --listen 0（系统分配端口）
     // 的场景。用 list_instances_in 而非 list_instances：后者附带孤儿日志清理，
-    // 在 APROXY_RUN_DIR 重定向场景（测试/多主目录）live 清单与真实 logs 目录
-    // 不一致，会把用户实例的日志误判为孤儿删除。
+    // 在 APROXY_HOME/APROXY_RUN_DIR 重定向场景（测试/多主目录）live 清单与
+    // 真实 logs 目录不一致，会把用户实例的日志误判为孤儿删除。
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     loop {
         if let Some(new_info) = daemon::list_instances_in(&daemon::run_dir())

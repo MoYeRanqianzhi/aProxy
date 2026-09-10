@@ -273,14 +273,13 @@ impl Config {
 
 /// 返回配置文件路径：`~/.aproxy/config.toml`。
 pub fn config_path() -> PathBuf {
-    let home = dirs::home_dir().expect("无法获取用户主目录");
-    home.join(".aproxy").join("config.toml")
+    config_dir().join("config.toml")
 }
 
-/// 返回配置目录：`~/.aproxy/`。
+/// 返回配置目录：aProxy 主目录（`APROXY_HOME`，未设 = `~/.aproxy`，
+/// 见 `settings::home`）。
 pub fn config_dir() -> PathBuf {
-    let home = dirs::home_dir().expect("无法获取用户主目录");
-    home.join(".aproxy")
+    crate::settings::home()
 }
 
 /// 加载配置：若文件不存在则返回默认配置（base_url 为空，后续 validate 会提示）。

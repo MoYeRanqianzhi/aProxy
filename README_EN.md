@@ -40,7 +40,7 @@ that the request took a little longer.
 and it will read the instructions and take care of installation:
 
 ```text
-Read https://raw.githubusercontent.com/MoYeRanQianZhi/aProxy/master/docs/INSTALL_AGENT.md and install (or upgrade) aProxy on this machine exactly as it says.
+Read https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/docs/INSTALL_AGENT.md and install (or upgrade) aProxy on this machine exactly as it says.
 ```
 
 **Manual install** (first install pulls the binary + skill docs, verifies
@@ -48,12 +48,12 @@ SHA256, places everything under `~/.aproxy/`):
 
 ```sh
 # Linux / macOS / Git Bash
-curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/master/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.sh | sh
 ```
 
 ```powershell
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/master/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.ps1 | iex
 ```
 
 Upgrades: `aproxy install` rolling-restarts running instances after a binary
@@ -63,7 +63,7 @@ swap (shipping in a later release); on current alphas do it manually —
 From source:
 
 ```powershell
-git clone https://github.com/MoYeRanQianZhi/aProxy.git
+git clone https://github.com/MoYeRanqianzhi/aProxy.git
 cd aProxy
 cargo build --release
 ```

@@ -6,7 +6,7 @@
 # `aproxy install` 自管（本脚本指路）。
 #
 # 用法：
-#   curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/master/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.sh | sh
 #   或本地执行：sh scripts/install.sh [v0.1.0-alpha.7]
 # 环境变量：
 #   APROXY_HOME     目录根（默认 ~/.aproxy）

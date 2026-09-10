@@ -22,24 +22,24 @@
 **交给 agent 一句话即可**——把下面这行发给你的 agent（Claude Code 等），它会读文档并完成安装与配置：
 
 ```text
-Read https://raw.githubusercontent.com/MoYeRanQianzhi/aProxy/master/docs/INSTALL_AGENT.md and install (or upgrade) aProxy on this machine exactly as it says.
+Read https://raw.githubusercontent.com/MoYeRanQianzhi/aProxy/main/docs/INSTALL_AGENT.md and install (or upgrade) aProxy on this machine exactly as it says.
 ```
 
 **人类自装**（首装二进制 + skill 文档，SHA256 校验，落位 `~/.aproxy/`）：
 
 ```powershell
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/master/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.ps1 | iex
 ```
 
 ```sh
 # Linux / macOS / Git Bash
-curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/master/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.sh | sh
 ```
 
 ```bat
 rem Windows (cmd 兜底)
-curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/master/scripts/install.cmd -o install.cmd && install.cmd
+curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.cmd -o install.cmd && install.cmd
 ```
 
 升级：替换二进制后 `aproxy install` 自动滚动重启实例（后续版本提供）；当前版本手动三步——`aproxy stop all` → 覆盖二进制 → `aproxy restore`。
@@ -47,7 +47,7 @@ curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/master/script
 源码构建：
 
 ```powershell
-git clone https://github.com/MoYeRanQianZhi/aProxy.git
+git clone https://github.com/MoYeRanqianzhi/aProxy.git
 cd aProxy
 cargo build --release
 ```

@@ -5,7 +5,7 @@
 # `aproxy install` 自管（本脚本指路）。
 #
 # 用法：
-#   irm https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/master/scripts/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.ps1 | iex
 #   或本地执行：pwsh -File scripts/install.ps1 [-Version v0.1.0-alpha.7] [-NoSkills]
 #
 # 环境变量：APROXY_HOME（默认 ~\.aproxy）——bin/skills/run 全目录的根。

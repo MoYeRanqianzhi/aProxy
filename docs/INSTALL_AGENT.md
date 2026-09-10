@@ -29,19 +29,19 @@ existing installation.
 **Windows (PowerShell — preferred):**
 
 ```powershell
-irm https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/master/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.ps1 | iex
 ```
 
 **Windows (cmd fallback, when PowerShell is unavailable):**
 
 ```bat
-curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/master/scripts/install.cmd -o "%TEMP%\aproxy-install.cmd" && "%TEMP%\aproxy-install.cmd"
+curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.cmd -o "%TEMP%\aproxy-install.cmd" && "%TEMP%\aproxy-install.cmd"
 ```
 
 **Linux / macOS / Git Bash on Windows:**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/master/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.sh | sh
 ```
 
 Notes:
@@ -127,4 +127,4 @@ troubleshooting — read it before improvising CLI flags.
 | Everything else | `aproxy status`, instance logs `~/.aproxy/logs/<port>.log` |
 
 The full reference lives in the skill docs (step 5) or
-[docs/](https://github.com/MoYeRanqianzhi/aProxy/tree/master/docs).
+[docs/](https://github.com/MoYeRanqianzhi/aProxy/tree/main/docs).

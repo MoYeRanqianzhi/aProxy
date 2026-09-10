@@ -99,9 +99,14 @@
   ACK + Windows rename 接力 + 渠道矩阵（--from/GH/cargo/npm/包管理器全配置）；
   发布 workflow 已就绪（e5136fc），渠道 P0 全配定调（dc3434b）
 - [ ] **看门狗二期（可选）**：挂死不杀进程原地救（scoped runtime 注入 spike）、实例数极大时线程池死亡等待（unix 死亡等待已实装为轮询，见 unix-testing.md）
-- [ ] **首次 push 激活 CI**：remote 已加（origin = MoYeRanQianZhi/aProxy），
-  workflows 已配齐（CI/审查/发布）；首跑风险点：unix cargo check 未本地验证过、
-  deny.toml license 白名单可能按实际依赖补条目
+- [x] **CI 激活与首版发布**（2026-09-10）：仓库开源（MoYeRanqianzhi/aProxy）+
+  workflows 首跑全绿（CI/Review）；首跑抓到并修复 windows-sys 解析漂移
+  （^0.52 被 CI 解析为 0.61.2，HANDLE 类型不兼容）——精确钉死 =0.52.0 +
+  全工作流 --locked；v0.1.0-alpha.7 发布全链实测通过（7 变体 + skill 双包 +
+  SHA256 表 + 更新链文案 + prerelease 标记）；三平台引导脚本实测通过
+  （scripts/install.ps1|sh|cmd，APROXY_HOME 隔离测试，均实测从 GitHub 拉取
+  二进制与 skill 并通过校验/落位/--version/幂等全断言）；dependabot 运行中
+  （windows-sys 升级建议已忽略并关 PR）
 
 ## 已结案（有意跳过，见记忆/审查记录）
 

@@ -6,3 +6,4 @@
 
 pub mod staging;
 pub mod state;
+pub mod swap;

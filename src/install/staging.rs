@@ -99,7 +99,7 @@ pub fn stage_from_in(
 
 /// unix 侧复制后必须补可执行位（GitHub tarball/staging 复制均不保留 755，
 /// 否则 `--version` 试跑直接失败）；Windows 无此概念，no-op。
-fn ensure_executable(bin: &Path) {
+pub fn ensure_executable(bin: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

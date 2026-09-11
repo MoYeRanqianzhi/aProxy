@@ -44,7 +44,15 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
             source: aproxy::install::state::InstallSource::From,
             from: from_path,
         };
-        run_plan(&home, &run_dir, plan, false, !args.no_skills).await;
+        run_plan(
+            &home,
+            &run_dir,
+            plan,
+            false,
+            !args.no_skills,
+            effective_proxy(&args).as_deref(),
+        )
+        .await;
         return;
     }
 
@@ -69,7 +77,15 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
             source: aproxy::install::state::InstallSource::From,
             from: self_exe,
         };
-        run_plan(&home, &run_dir, plan, true, !args.no_skills).await;
+        run_plan(
+            &home,
+            &run_dir,
+            plan,
+            true,
+            !args.no_skills,
+            effective_proxy(&args).as_deref(),
+        )
+        .await;
         return;
     }
 
@@ -77,6 +93,14 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
     // → …，settings download_chain 可配严格数组与 url 模板），产物落
     // staging 后走与 --from 同一条交换/滚动流水线
     run_online(&home, &run_dir, &args).await;
+}
+
+/// 本次生效的下载代理：CLI --download-proxy 优先，未设回落 settings——
+/// 二进制链与 skill 支线共用同一归一结果（入口处统一，避免两条链分叉）。
+fn effective_proxy(args: &InstallArgs) -> Option<String> {
+    args.download_proxy
+        .clone()
+        .or_else(|| aproxy::settings::load().download_proxy)
 }
 
 /// --skills-only：只更新 skill 文档。版本默认 latest（github 列表第一个）；
@@ -246,6 +270,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         &fetched.path,
         source,
         !args.no_skills,
+        proxy,
     )
     .await
     {
@@ -270,12 +295,15 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
 }
 
 /// 执行安装计划：管辖检查 → 主流程。成功/失败的用户可见输出在此统一。
+/// `download_proxy` 为本次生效的下载代理（CLI 参数优先于 settings），贯穿
+/// 二进制链与 skill 支线。
 async fn run_plan(
     home: &std::path::Path,
     run_dir: &std::path::Path,
     plan: aproxy::install::flow::InstallPlan,
     adopt: bool,
     skill_enabled: bool,
+    download_proxy: Option<&str>,
 ) {
     if let Err(e) = aproxy::install::flow::check_jurisdiction(run_dir, home, adopt).await {
         eprintln!("[ERROR] {e}");
@@ -283,7 +311,9 @@ async fn run_plan(
     }
     let target = plan.target_version.clone();
     println!("开始安装 aProxy {target}...");
-    match aproxy::install::flow::run_install(home, run_dir, &plan, skill_enabled).await {
+    match aproxy::install::flow::run_install(home, run_dir, &plan, skill_enabled, download_proxy)
+        .await
+    {
         Ok(exit) => {
             if exit == aproxy::install::flow::FlowExit::HandedOver {
                 // Windows 接力：续作由新二进制进程完成，本进程（旧镜像）

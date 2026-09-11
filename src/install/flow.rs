@@ -118,6 +118,10 @@ pub enum FlowExit {
 
 /// 三入口共用的外壳：skill 支线并行任务 + 唯一同步点 join + 终态落盘。
 ///
+/// `download_proxy`：本次安装的生效下载代理（CLI --download-proxy 优先于
+/// settings 的归一结果，续作入口传 settings 值）——skill 支线与二进制链
+/// 同一代理语义，避免「CLI 参数只管二进制、skill 悄悄走别路」的分裂。
+///
 /// skill 非强制：任务失败不影响 fut 的结果；终态只在 install.state 仍存在
 /// 时补写（安装成功场景 state 已被 done 清掉，skill 状态随之不持久——
 /// 「安装成功 ⇒ skill 已尽力更新」是合理推断；failed 现场保留时终态可查）。
@@ -126,14 +130,14 @@ async fn drive_with_skill(
     run_dir: &Path,
     version: &str,
     skill_enabled: bool,
+    download_proxy: Option<&str>,
     fut: impl std::future::Future<Output = Result<FlowExit, String>>,
 ) -> Result<FlowExit, String> {
     let settings = crate::settings::load();
     let mut skill_handle = None;
     if skill_enabled
         && settings.skill_auto_update
-        && let Ok(ctx) =
-            super::download::DownloadCtx::build(version, settings.download_proxy.as_deref(), None)
+        && let Ok(ctx) = super::download::DownloadCtx::build(version, download_proxy, None)
     {
         let chain = super::download::effective_chain(&settings);
         let home_buf = home.to_path_buf();
@@ -166,12 +170,15 @@ async fn drive_with_skill(
 }
 
 /// 一次完整安装（--from/--adopt 流水线）。`home`/`run_dir` 显式传入
-/// （测试注入 tempdir；生产为同一 APROXY_HOME 派生值）。
+/// （测试注入 tempdir；生产为同一 APROXY_HOME 派生值）。`download_proxy`
+/// 为本次生效的下载代理（CLI 参数优先于 settings 的归一结果，skill 支线
+/// 与二进制链共用）。
 pub async fn run_install(
     home: &Path,
     run_dir: &Path,
     plan: &InstallPlan,
     skill_enabled: bool,
+    download_proxy: Option<&str>,
 ) -> Result<FlowExit, String> {
     // ---- marking：第一件事写状态文件（铁律 1）——此后任何时刻崩溃，
     // 下一次启动都能识别「正在 install」并恢复。宣告节在停看护者之前创建
@@ -181,23 +188,30 @@ pub async fn run_install(
     let mut state = super::state::create_new_in(run_dir, state)?;
     let announcer = spawn_announcer();
 
-    drive_with_skill(home, run_dir, &plan.target_version, skill_enabled, async {
-        match run_forward(home, run_dir, &mut state, &plan.from).await {
-            // 接力交棒：本进程即将退出，宣告 ticker 不 abort（随进程消亡）；
-            // 接管者的 --continue 入口创建自己的宣告
-            Ok(FlowExit::HandedOver) => Ok(FlowExit::HandedOver),
-            Ok(exit) => {
-                stop_announcer(announcer);
-                Ok(exit)
+    drive_with_skill(
+        home,
+        run_dir,
+        &plan.target_version,
+        skill_enabled,
+        download_proxy,
+        async {
+            match run_forward(home, run_dir, &mut state, &plan.from).await {
+                // 接力交棒：本进程即将退出，宣告 ticker 不 abort（随进程消亡）；
+                // 接管者的 --continue 入口创建自己的宣告
+                Ok(FlowExit::HandedOver) => Ok(FlowExit::HandedOver),
+                Ok(exit) => {
+                    stop_announcer(announcer);
+                    Ok(exit)
+                }
+                Err(e) => {
+                    // failed 保留现场（staging 不清），续作由 --continue 从残留推进
+                    let _ = super::state::advance_in(run_dir, &mut state, InstallPhase::Failed);
+                    stop_announcer(announcer);
+                    Err(e)
+                }
             }
-            Err(e) => {
-                // failed 保留现场（staging 不清），续作由 --continue 从残留推进
-                let _ = super::state::advance_in(run_dir, &mut state, InstallPhase::Failed);
-                stop_announcer(announcer);
-                Err(e)
-            }
-        }
-    })
+        },
+    )
     .await
 }
 
@@ -396,25 +410,33 @@ pub async fn run_install_online(
     staged: &Path,
     source: InstallSource,
     skill_enabled: bool,
+    download_proxy: Option<&str>,
 ) -> Result<FlowExit, String> {
     let state = InstallState::new_marking(version.to_string(), source);
     let mut state = super::state::create_new_in(run_dir, state)?;
     let announcer = spawn_announcer();
 
-    drive_with_skill(home, run_dir, version, skill_enabled, async {
-        match run_forward_from_staged(home, run_dir, &mut state, staged).await {
-            Ok(FlowExit::HandedOver) => Ok(FlowExit::HandedOver),
-            Ok(exit) => {
-                stop_announcer(announcer);
-                Ok(exit)
+    drive_with_skill(
+        home,
+        run_dir,
+        version,
+        skill_enabled,
+        download_proxy,
+        async {
+            match run_forward_from_staged(home, run_dir, &mut state, staged).await {
+                Ok(FlowExit::HandedOver) => Ok(FlowExit::HandedOver),
+                Ok(exit) => {
+                    stop_announcer(announcer);
+                    Ok(exit)
+                }
+                Err(e) => {
+                    let _ = super::state::advance_in(run_dir, &mut state, InstallPhase::Failed);
+                    stop_announcer(announcer);
+                    Err(e)
+                }
             }
-            Err(e) => {
-                let _ = super::state::advance_in(run_dir, &mut state, InstallPhase::Failed);
-                stop_announcer(announcer);
-                Err(e)
-            }
-        }
-    })
+        },
+    )
     .await
 }
 
@@ -454,64 +476,82 @@ pub async fn continue_install(home: &Path, run_dir: &Path) -> Result<FlowExit, S
         Some(crate::install::state::SkillPhase::Failed)
     );
     let target_version = state.target_version.clone();
+    // 续作无 CLI 上下文，下载代理按 settings（与首跑 --download-proxy 未设
+    // 时的归一结果一致）
+    let settings = crate::settings::load();
 
-    drive_with_skill(home, run_dir, &target_version, skill_should_run, async {
-        let result = match state.phase {
-            // 备料前/备料中中断：staging 可能半截——重新备料（幂等重做；
-            // --from 源路径已记录；网络渠道续作因 from_path 缺失而请用户重跑）
-            InstallPhase::Marking | InstallPhase::Downloading | InstallPhase::Failed => {
-                let Some(from) = state.from_path.clone() else {
-                    stop_announcer(announcer);
-                    return Err("续作缺少 --from 源记录（状态文件损坏？），请重新执行安装".into());
-                };
-                run_forward(home, run_dir, &mut state, Path::new(&from)).await
-            }
-            // 备料完成、交换前：staging 完整在盘——直接从广播重入
-            InstallPhase::Downloaded | InstallPhase::Broadcasting | InstallPhase::Acked => {
-                let Some(staged_path) = state.staged_path.clone() else {
-                    stop_announcer(announcer);
-                    return Err("续作缺少 staging 记录（状态文件损坏？），请重新执行安装".into());
-                };
-                run_forward_from_staged(home, run_dir, &mut state, Path::new(&staged_path)).await
-            }
-            // swapping 中断：Windows bin 可能空窗（旧已改名新未落位）——swap 原语
-            // 对「bin 缺失」幂等（首次安装同款路径），重新执行交换即恢复；
-            // unix 两态（rename 前中断 = 原文件完好 / rename 后 = 新文件已就位）
-            // 都无需修复。重入走广播（ACK 是幂等置位）+ 交换。
-            InstallPhase::Swapping => {
-                let Some(staged_path) = state.staged_path.clone() else {
-                    stop_announcer(announcer);
-                    return Err("续作缺少 staging 记录（状态文件损坏？），请重新执行安装".into());
-                };
-                run_forward_from_staged(home, run_dir, &mut state, Path::new(&staged_path)).await
-            }
-            // 交换完成及以后：新 bin 已在规范位置——直接进尾部（滚动/终验/清理）
-            InstallPhase::Swapped
-            | InstallPhase::Relaying
-            | InstallPhase::Restarting
-            | InstallPhase::Verifying
-            | InstallPhase::Cleaning => {
-                run_tail(home, run_dir, &mut state, &swap::bin_path_in(home), true)
-                    .await
-                    .map(|_| FlowExit::Completed)
-            }
-            InstallPhase::Done | InstallPhase::Aborted => unreachable!("终态已在入口处理"),
-        };
+    drive_with_skill(
+        home,
+        run_dir,
+        &target_version,
+        skill_should_run,
+        settings.download_proxy.as_deref(),
+        async {
+            let result = match state.phase {
+                // 备料前/备料中中断：staging 可能半截——重新备料（幂等重做；
+                // --from 源路径已记录；网络渠道续作因 from_path 缺失而请用户重跑）
+                InstallPhase::Marking | InstallPhase::Downloading | InstallPhase::Failed => {
+                    let Some(from) = state.from_path.clone() else {
+                        stop_announcer(announcer);
+                        return Err(
+                            "续作缺少 --from 源记录（状态文件损坏？），请重新执行安装".into()
+                        );
+                    };
+                    run_forward(home, run_dir, &mut state, Path::new(&from)).await
+                }
+                // 备料完成、交换前：staging 完整在盘——直接从广播重入
+                InstallPhase::Downloaded | InstallPhase::Broadcasting | InstallPhase::Acked => {
+                    let Some(staged_path) = state.staged_path.clone() else {
+                        stop_announcer(announcer);
+                        return Err(
+                            "续作缺少 staging 记录（状态文件损坏？），请重新执行安装".into()
+                        );
+                    };
+                    run_forward_from_staged(home, run_dir, &mut state, Path::new(&staged_path))
+                        .await
+                }
+                // swapping 中断：Windows bin 可能空窗（旧已改名新未落位）——swap 原语
+                // 对「bin 缺失」幂等（首次安装同款路径），重新执行交换即恢复；
+                // unix 两态（rename 前中断 = 原文件完好 / rename 后 = 新文件已就位）
+                // 都无需修复。重入走广播（ACK 是幂等置位）+ 交换。
+                InstallPhase::Swapping => {
+                    let Some(staged_path) = state.staged_path.clone() else {
+                        stop_announcer(announcer);
+                        return Err(
+                            "续作缺少 staging 记录（状态文件损坏？），请重新执行安装".into()
+                        );
+                    };
+                    run_forward_from_staged(home, run_dir, &mut state, Path::new(&staged_path))
+                        .await
+                }
+                // 交换完成及以后：新 bin 已在规范位置——直接进尾部（滚动/终验/清理）
+                InstallPhase::Swapped
+                | InstallPhase::Relaying
+                | InstallPhase::Restarting
+                | InstallPhase::Verifying
+                | InstallPhase::Cleaning => {
+                    run_tail(home, run_dir, &mut state, &swap::bin_path_in(home), true)
+                        .await
+                        .map(|_| FlowExit::Completed)
+                }
+                InstallPhase::Done | InstallPhase::Aborted => unreachable!("终态已在入口处理"),
+            };
 
-        match result {
-            // 接力交棒：同 run_install——本进程即将退出，ticker 不 abort
-            Ok(FlowExit::HandedOver) => Ok(FlowExit::HandedOver),
-            Ok(exit) => {
-                stop_announcer(announcer);
-                Ok(exit)
+            match result {
+                // 接力交棒：同 run_install——本进程即将退出，ticker 不 abort
+                Ok(FlowExit::HandedOver) => Ok(FlowExit::HandedOver),
+                Ok(exit) => {
+                    stop_announcer(announcer);
+                    Ok(exit)
+                }
+                Err(e) => {
+                    let _ = super::state::advance_in(run_dir, &mut state, InstallPhase::Failed);
+                    stop_announcer(announcer);
+                    Err(e)
+                }
             }
-            Err(e) => {
-                let _ = super::state::advance_in(run_dir, &mut state, InstallPhase::Failed);
-                stop_announcer(announcer);
-                Err(e)
-            }
-        }
-    })
+        },
+    )
     .await
 }
 

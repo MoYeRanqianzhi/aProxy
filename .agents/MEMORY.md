@@ -19,3 +19,5 @@
 - [trusted-publishing-p0](memory/2026-09-11-trusted-publishing-p0.md) — 渠道 P0 落地：npm(@meowo 10 包)/crates.io/binstall 全自动 OIDC 发布（tag 即发）；关键坑：npm GAT IP 白名单杀 CI token 路径、npm TP 绑定强制人类 2FA 而 crates.io 有 API、cargo include 前导 / 锚定 [[daemon-model]]
 - [安全铁则：绝不按名杀 aproxy.exe](memory/2026-09-11-never-kill-aproxy-by-name.md) — 2026-09-11 实际事故：记忆 pid 过期+会话经 aproxy 代理，批量杀=断用户会话；测试守护只走 APROXY_HOME+stop <端口>
 - [install 实测深坑集](memory/2026-09-11-install-pitfalls.md) — tokio runtime drop 等无限任务须硬退/IPC 消失≠进程终止（退出码判死）/spawn_detached 只继承父 env（库层测试须 set_var）/测试端口 bind 试探+两段等待
+- [CI unix 编译盲区](memory/2026-09-11-ci-unix-blindspot.md) — 918ea33 的 unix job 红着没人看就报了收尾；push 后必须 gh run list 确认 CI 绿；unix-only 改动本地无法编译验证时交 WSL/CI 裁决
+- [install 三平台实测记录](memory/2026-09-11-install-three-platform-e2e.md) — Windows/Ubuntu/WSL 全量+e2e 全绿；挖出 5 个真 bug（unix 编译面×2、平台硬编码测试、库层 IPC 环境泄漏、有实例 swapping 续作状态机拒绝）；WSL TUN 劫持 TLS 的绕法与 e2e 脚本坑集

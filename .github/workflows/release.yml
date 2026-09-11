@@ -131,16 +131,21 @@ jobs:
       - name: Align version with tag
         shell: bash
         run: |
-          V="${GITHUB_REF_NAME#v}"
-          sed -i "s/^version = \".*\"/version = \"${V}\"/" Cargo.toml
           python3 - <<'EOF'
-          import re
-          ver = re.search(r'^version = "(.*)"', open('Cargo.toml').read(), re.M).group(1)
-          lock = open('Cargo.lock', newline='').read()
-          # \r?\n：Cargo.lock 实际行尾随提交环境可能是 CRLF（实测踩过）
-          lock, n = re.subn(r'(name = "aproxy"\r?\nversion = )"[^"]*"', r'\g<1>"%s"' % ver, lock)
-          assert n == 1, "Cargo.lock 中未找到唯一的 aproxy 版本行"
-          open('Cargo.lock', 'w', newline='').write(lock)
+          import re, os
+          v = os.environ.get('GITHUB_REF_NAME', '')[1:]
+          assert v, "GITHUB_REF_NAME 为空（非 tag 触发？）"
+          # encoding 显式 utf-8（Windows runner 默认 cp1252 解码会崩）；
+          # \r?\n 兼容 CRLF 行尾；不用 sed（BSD/GNU 的 -i 语法分裂）
+          toml = open('Cargo.toml', encoding='utf-8', newline='').read()
+          toml, n1 = re.subn(r'(^version = )"[^"]*"', r'\g<1>"%s"' % v, toml, count=1, flags=re.M)
+          assert n1 == 1, "Cargo.toml 中未找到 [package] version 行"
+          open('Cargo.toml', 'w', encoding='utf-8', newline='').write(toml)
+          lock = open('Cargo.lock', encoding='utf-8', newline='').read()
+          lock, n2 = re.subn(r'(name = "aproxy"\r?\nversion = )"[^"]*"', r'\g<1>"%s"' % v, lock)
+          assert n2 == 1, "Cargo.lock 中未找到唯一的 aproxy 版本行"
+          open('Cargo.lock', 'w', encoding='utf-8', newline='').write(lock)
+          print("version ->", v)
           EOF
       - name: Build
         env:

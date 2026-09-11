@@ -129,16 +129,18 @@ jobs:
       # 仍是 Cargo.toml 里的旧版本号，install 特定版本的全渠道自证全炸
       # （实测暴露），且 crates.io 会按旧版本号注册、污染正式版号。
       - name: Align version with tag
+        shell: bash
         run: |
           V="${GITHUB_REF_NAME#v}"
           sed -i "s/^version = \".*\"/version = \"${V}\"/" Cargo.toml
           python3 - <<'EOF'
           import re
           ver = re.search(r'^version = "(.*)"', open('Cargo.toml').read(), re.M).group(1)
-          lock = open('Cargo.lock').read()
-          lock, n = re.subn(r'(name = "aproxy"\nversion = )"[^"]*"', r'\g<1>"%s"' % ver, lock)
+          lock = open('Cargo.lock', newline='').read()
+          # \r?\n：Cargo.lock 实际行尾随提交环境可能是 CRLF（实测踩过）
+          lock, n = re.subn(r'(name = "aproxy"\r?\nversion = )"[^"]*"', r'\g<1>"%s"' % ver, lock)
           assert n == 1, "Cargo.lock 中未找到唯一的 aproxy 版本行"
-          open('Cargo.lock', 'w').write(lock)
+          open('Cargo.lock', 'w', newline='').write(lock)
           EOF
       - name: Build
         env:

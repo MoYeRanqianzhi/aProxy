@@ -250,34 +250,50 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     let staged_dir = aproxy::install::staging::staging_dir_in(home, &target);
 
     // 下载 + 自证（能运行且自报版本 == 目标——与 --from 的信任锚同级）。
-    // gnu 产物试跑失败（构建机 glibc 高于本机）→ musl 静态产物回退重跑。
+    // gnu 产物**试跑失败**（构建机 glibc 高于本机）→ musl 静态产物回退；
+    // 下载链条本身失败（网络/404）不回退——musl 重跑只会重复同一网络错误。
+    enum DownloadOutcome {
+        Ok(aproxy::install::download::Fetched),
+        VerifyFailed(String),
+        ChainFailed(String),
+    }
     async fn download_verified(
         ctx: &aproxy::install::download::DownloadCtx,
         chain: &[aproxy::install::download::ChainStep],
         target: &str,
         staged_dir: &std::path::Path,
-    ) -> Result<aproxy::install::download::Fetched, String> {
-        let fetched = aproxy::install::download::fetch_artifact(
+    ) -> DownloadOutcome {
+        let fetched = match aproxy::install::download::fetch_artifact(
             ctx,
             chain,
             aproxy::install::download::Artifact::Binary,
             staged_dir,
         )
-        .await?;
+        .await
+        {
+            Ok(f) => f,
+            Err(e) => return DownloadOutcome::ChainFailed(e),
+        };
         match aproxy::install::staging::probe_version(&fetched.path) {
-            Ok(v) if v == target => Ok(fetched),
-            Ok(v) => Err(format!("下载产物自报 {v}，与目标版本 {target} 不符")),
-            Err(e) => Err(format!("下载产物校验失败（不可运行）: {e}")),
+            Ok(v) if v == target => DownloadOutcome::Ok(fetched),
+            Ok(v) => {
+                DownloadOutcome::VerifyFailed(format!("下载产物自报 {v}，与目标版本 {target} 不符"))
+            }
+            Err(e) => DownloadOutcome::VerifyFailed(format!("下载产物校验失败（不可运行）: {e}")),
         }
     }
     let fetched = match download_verified(&ctx, &chain, &target, &staged_dir).await {
-        Ok(f) => f,
-        Err(e) => match ctx.musl_fallback() {
+        DownloadOutcome::Ok(f) => f,
+        DownloadOutcome::VerifyFailed(e) => match ctx.musl_fallback() {
             Some(mctx) => {
                 println!("gnu 产物在本机不可运行（{e}），回退 musl 静态产物...");
                 match download_verified(&mctx, &chain, &target, &staged_dir).await {
-                    Ok(f) => f,
-                    Err(e2) => {
+                    DownloadOutcome::Ok(f) => f,
+                    other => {
+                        let e2 = match other {
+                            DownloadOutcome::VerifyFailed(e) | DownloadOutcome::ChainFailed(e) => e,
+                            DownloadOutcome::Ok(_) => unreachable!(),
+                        };
                         eprintln!("[ERROR] musl 回退仍失败: {e2}");
                         std::process::exit(1);
                     }
@@ -291,6 +307,13 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
                 std::process::exit(1);
             }
         },
+        DownloadOutcome::ChainFailed(e) => {
+            eprintln!("[ERROR] {e}");
+            eprintln!(
+                "可尝试：--download-proxy <URL> 配置下载代理，或在 settings.json 配置 download_chain（含 url 模板 CDN 通道，文档见 README）。"
+            );
+            std::process::exit(1);
+        }
     };
 
     println!("开始安装 aProxy {target}...");

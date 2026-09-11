@@ -414,6 +414,15 @@ pub async fn run_install_online(
 ) -> Result<FlowExit, String> {
     let state = InstallState::new_marking(version.to_string(), source);
     let mut state = super::state::create_new_in(run_dir, state)?;
+    // 在线路径的备料（下载链条落 staging）发生在建状态之前——state 直接
+    // 推进到 Downloaded（staged_path/sha256 补记）。缺此步时 phase 停在
+    // Marking，无实例场景 run_forward_from_staged 跳过广播段直进
+    // advance(Swapping) → 「非法状态迁移 Marking → Swapping」（实测暴露：
+    // 此前在线路径一直被下载问题挡住，从未跑通到安装段）
+    super::state::advance_in(run_dir, &mut state, InstallPhase::Downloading)?;
+    state.staged_path = Some(staged.display().to_string());
+    state.sha256 = Some(crate::install::staging::sha256_hex(staged)?);
+    super::state::advance_in(run_dir, &mut state, InstallPhase::Downloaded)?;
     let announcer = spawn_announcer();
 
     drive_with_skill(

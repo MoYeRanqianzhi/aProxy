@@ -185,6 +185,9 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("[ERROR] {e}");
+                    eprintln!(
+                        "可尝试：install <具体版本号>（跳过 latest 查询），或 --download-proxy <URL> 更换出口。"
+                    );
                     std::process::exit(1);
                 }
             }

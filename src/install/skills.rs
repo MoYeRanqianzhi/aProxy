@@ -35,9 +35,12 @@ pub async fn update_skills(
     chain: &[download::ChainStep],
     home: &Path,
 ) -> SkillOutcome {
-    let staging = home.join("skills").join(".staging");
+    // 下载目录独立于解包区（.staging）——install_skill_dir 开头会清空
+    // .staging，若 zip 下载进同一目录会在解包前被自己删掉（实测暴露）
+    let dl = home.join("skills").join(".dl");
     let attempt = 1u32;
-    match download::fetch_artifact(ctx, chain, Artifact::Skills, &staging).await {
+    let result = download::fetch_artifact(ctx, chain, Artifact::Skills, &dl).await;
+    let outcome = match result {
         Ok(fetched) => match install_skill_dir(home, &fetched.path) {
             Ok(()) => SkillOutcome {
                 phase: SkillPhase::Done,
@@ -58,7 +61,9 @@ pub async fn update_skills(
                 attempt,
             }
         }
-    }
+    };
+    let _ = std::fs::remove_dir_all(&dl);
+    outcome
 }
 
 /// zip 落位为 skill 目录（原子替换）：解包到 .staging/<名>/ → 旧目录 rename

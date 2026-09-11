@@ -324,9 +324,12 @@ pub async fn fetch_artifact(
             };
             match r {
                 Ok(fetched) => {
-                    // 原子改名：dl → 最终名（半截文件绝不冒充成品）
+                    // 原子改名：dl → 最终名（半截文件绝不冒充成品）；
+                    // unix 下载产物必须补可执行位（GitHub 裸下载不带 755，
+                    // 缺位会让后续 --version 自证直接 Permission denied）
                     let final_dest = dest_dir.join(&asset);
                     std::fs::rename(&dest, &final_dest).map_err(|e| format!("落位失败: {e}"))?;
+                    crate::install::staging::ensure_executable(&final_dest);
                     return Ok(Fetched {
                         path: final_dest,
                         ..fetched

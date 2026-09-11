@@ -150,8 +150,42 @@ pub(crate) enum Commands {
         port: Option<u16>,
     },
 
+    /// 安装/升级 aProxy 到规范位置（~/.aproxy/bin/）：全程对客户端 ≈ 无感
+    /// （逐实例滚动重启，任一时刻至多一个实例在重启）。`upgrade` 为其别名。
+    /// 指定版本/在线渠道（github/npm/cargo）随后续版本提供；当前支持
+    /// `--from` 本地路径与 `--adopt` 收编。
+    Install(InstallArgs),
+
+    /// `aproxy install` 的别名（可发现性）
+    Upgrade(InstallArgs),
+
     /// 查看或修改配置（配置文件位于 ~/.aproxy/config.toml）
     Config(ConfigArgs),
+}
+
+/// `aproxy install` 的参数集。
+#[derive(clap::Args, Debug, Clone, PartialEq)]
+pub(crate) struct InstallArgs {
+    /// 从本地二进制文件安装（复制 → 校验 → 原子落位 → 滚动重启实例）。
+    /// 二进制的 `--version` 自报版本即安装目标版本。
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["adopt", "abort"])]
+    pub(crate) from: Option<String>,
+
+    /// 收编：把当前运行的 aProxy（如包管理器/npm 安装的）迁移到标准位置
+    /// `~/.aproxy/bin/`——当前进程镜像作为安装源，走完整标准流水线。
+    /// 显式执行，绝不自动。
+    #[arg(long, conflicts_with_all = ["from", "abort"])]
+    pub(crate) adopt: bool,
+
+    /// 中止进行中的安装：仅 swapping 前可完全回滚（此后只进不退）。
+    /// 清理状态文件与 staging 现场。
+    #[arg(long, conflicts_with_all = ["from", "adopt"])]
+    pub(crate) abort: bool,
+
+    /// [内部] 续作模式：从 install.state 残留的 phase 幂等推进（看门狗/
+    /// CLI 入口/接力自动拉起，全自动无人工询问）。勿手动使用。
+    #[arg(long, hide = true)]
+    pub(crate) continue_: bool,
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]

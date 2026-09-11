@@ -2033,8 +2033,9 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
 // ---------------------------------------------------------------------------
 // 29. 配置别名：alias add → start <别名> → stop <别名> 端到端
 //
-// 别名存于真实 ~/.aproxy/settings.json（进程级全局配置，无测试注入点），
-// 用 pid 派生的唯一别名名避免与其他测试/用户数据冲突，测试尾部删除清理。
+// 隔离：别名表存于 settings.json（进程级全局配置），APROXY_HOME 注入
+// tempdir 后写入隔离目录——不再触碰真实 ~/.aproxy/settings.json
+// （历史版本无重定向注入点，曾用真实 settings.json + pid 派生唯一别名妥协）。
 // ---------------------------------------------------------------------------
 #[test]
 fn alias_start_and_stop_roundtrip() {
@@ -2042,6 +2043,7 @@ fn alias_start_and_stop_roundtrip() {
     let exe = env!("CARGO_BIN_EXE_aproxy");
     let alias = format!("alias-test-{}", std::process::id());
     let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
     let cfg_file = dir.path().join("aliased.toml");
     std::fs::write(
         &cfg_file,
@@ -2053,13 +2055,14 @@ fn alias_start_and_stop_roundtrip() {
     let _guard = DaemonGuard {
         exe,
         port,
-        home_dir: None,
+        home_dir: Some(home.to_path_buf()),
     };
 
     // add 别名（指向临时配置）
     let out = Command::new(exe)
         .args(["alias", "add", &alias])
         .arg(&cfg_file)
+        .env("APROXY_HOME", home)
         .output()
         .unwrap();
     assert!(
@@ -2069,7 +2072,11 @@ fn alias_start_and_stop_roundtrip() {
     );
 
     // list 包含该别名
-    let out = Command::new(exe).args(["alias", "list"]).output().unwrap();
+    let out = Command::new(exe)
+        .args(["alias", "list"])
+        .env("APROXY_HOME", home)
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -2078,7 +2085,11 @@ fn alias_start_and_stop_roundtrip() {
     );
 
     // start <别名>：后台启动别名指向的配置
-    let out = Command::new(exe).args(["start", &alias]).output().unwrap();
+    let out = Command::new(exe)
+        .args(["start", &alias])
+        .env("APROXY_HOME", home)
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "start 别名应成功: {}",
@@ -2086,13 +2097,29 @@ fn alias_start_and_stop_roundtrip() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("已在后台启动"), "实际: {stdout}");
-    assert!(
-        wait_daemon_ready(port),
-        "别名启动的守护应就绪 (端口 {port})"
-    );
+    // 就绪：隔离 home 的 IPC 寻址（unix UDS 在 home/run/ 下）
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut ready = false;
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+            && ipc_ping_in_dir(&rt, port, home).is_ok()
+        {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ready, "别名启动的守护应就绪 (端口 {port})");
 
     // 别名启动的实例 config_path 应指向别名配置（status 可见）
-    let out = Command::new(exe).arg("status").output().unwrap();
+    let out = Command::new(exe)
+        .arg("status")
+        .env("APROXY_HOME", home)
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("alias-test.example.com"),
@@ -2100,7 +2127,11 @@ fn alias_start_and_stop_roundtrip() {
     );
 
     // stop <别名>：按 config_path 匹配并停止
-    let out = Command::new(exe).args(["stop", &alias]).output().unwrap();
+    let out = Command::new(exe)
+        .args(["stop", &alias])
+        .env("APROXY_HOME", home)
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "stop 别名应成功: {}",
@@ -2110,7 +2141,11 @@ fn alias_start_and_stop_roundtrip() {
     assert!(stdout.contains("已停止"), "实际: {stdout}");
 
     // 已停止后再 stop 别名：明确报「未在运行」
-    let out = Command::new(exe).args(["stop", &alias]).output().unwrap();
+    let out = Command::new(exe)
+        .args(["stop", &alias])
+        .env("APROXY_HOME", home)
+        .output()
+        .unwrap();
     assert!(!out.status.success(), "别名配置未运行时 stop 应失败");
     let text = format!(
         "{}{}",
@@ -2119,8 +2154,11 @@ fn alias_start_and_stop_roundtrip() {
     );
     assert!(text.contains("未在运行"), "实际: {text}");
 
-    // 清理别名（无论如何执行，不留测试残留）
-    let _ = Command::new(exe).args(["alias", "remove", &alias]).output();
+    // 清理别名（无论如何执行，不留测试残留——隔离 home 内本就随 tempdir 删除）
+    let _ = Command::new(exe)
+        .args(["alias", "remove", &alias])
+        .env("APROXY_HOME", home)
+        .output();
 }
 
 // ---------------------------------------------------------------------------
@@ -2130,10 +2168,14 @@ fn alias_start_and_stop_roundtrip() {
 fn alias_errors_on_unknown_names() {
     let exe = env!("CARGO_BIN_EXE_aproxy");
     let unknown = format!("no-such-alias-{}", std::process::id());
+    // 隔离：别名读写不触碰真实 settings.json
+    let dir = tempfile::tempdir().unwrap();
+    let home_arg = ("APROXY_HOME", dir.path().display().to_string());
 
     // start 未知别名：报错并列出管理方式
     let out = Command::new(exe)
         .args(["start", &unknown])
+        .env(home_arg.0, &home_arg.1)
         .output()
         .unwrap();
     assert!(!out.status.success(), "start 未知别名应失败");
@@ -2145,7 +2187,11 @@ fn alias_errors_on_unknown_names() {
     assert!(text.contains("未知的别名或配置文件"), "实际: {text}");
 
     // stop 未知别名：报错
-    let out = Command::new(exe).args(["stop", &unknown]).output().unwrap();
+    let out = Command::new(exe)
+        .args(["stop", &unknown])
+        .env(home_arg.0, &home_arg.1)
+        .output()
+        .unwrap();
     assert!(!out.status.success(), "stop 未知别名应失败");
     let text = format!(
         "{}{}",
@@ -2159,6 +2205,7 @@ fn alias_errors_on_unknown_names() {
         let out = Command::new(exe)
             .args(["alias", "add", bad])
             .arg("x.toml")
+            .env(home_arg.0, &home_arg.1)
             .output()
             .unwrap();
         assert!(!out.status.success(), "别名 {bad} 应被拒绝");
@@ -2174,6 +2221,7 @@ fn alias_errors_on_unknown_names() {
     let out = Command::new(exe)
         .args(["alias", "add", &format!("bad-{}", std::process::id())])
         .arg("Z:/no/such/file.toml")
+        .env(home_arg.0, &home_arg.1)
         .output()
         .unwrap();
     assert!(!out.status.success(), "add 不存在的路径应失败");
@@ -2187,6 +2235,7 @@ fn alias_errors_on_unknown_names() {
     // remove 不存在的别名：报错
     let out = Command::new(exe)
         .args(["alias", "remove", &unknown])
+        .env(home_arg.0, &home_arg.1)
         .output()
         .unwrap();
     assert!(!out.status.success(), "remove 不存在的别名应失败");

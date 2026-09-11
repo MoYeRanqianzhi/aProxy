@@ -141,9 +141,12 @@ mod imp {
     }
 
     unsafe fn store_view(view: *mut std::ffi::c_void, pid: u32, ms: u64) {
-        let base = view as *mut u8;
-        std::ptr::copy_nonoverlapping(pid.to_le_bytes().as_ptr(), base, 4);
-        std::ptr::copy_nonoverlapping(ms.to_le_bytes().as_ptr(), base.add(8), 8);
+        // edition 2024：unsafe fn 体内的 unsafe 操作须显式块
+        unsafe {
+            let base = view as *mut u8;
+            std::ptr::copy_nonoverlapping(pid.to_le_bytes().as_ptr(), base, 4);
+            std::ptr::copy_nonoverlapping(ms.to_le_bytes().as_ptr(), base.add(8), 8);
+        }
     }
 
     pub fn store_announcement(a: &super::Announcer, ms: u64) {
@@ -165,11 +168,14 @@ mod imp {
             if view.Value.is_null() {
                 return None;
             }
-            let base = view.Value as *const u8;
-            let mut pid_b = [0u8; 4];
-            let mut ms_b = [0u8; 8];
-            std::ptr::copy_nonoverlapping(base, pid_b.as_mut_ptr(), 4);
-            std::ptr::copy_nonoverlapping(base.add(8), ms_b.as_mut_ptr(), 8);
+            let (pid_b, ms_b) = {
+                let base = view.Value as *const u8;
+                let mut pid_b = [0u8; 4];
+                let mut ms_b = [0u8; 8];
+                std::ptr::copy_nonoverlapping(base, pid_b.as_mut_ptr(), 4);
+                std::ptr::copy_nonoverlapping(base.add(8), ms_b.as_mut_ptr(), 8);
+                (pid_b, ms_b)
+            };
             let _ = windows_sys::Win32::System::Memory::UnmapViewOfFile(view);
             Some(Announcement {
                 installer_pid: u32::from_le_bytes(pid_b),

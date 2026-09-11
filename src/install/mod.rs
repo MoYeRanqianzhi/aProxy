@@ -6,6 +6,7 @@
 
 pub mod announce;
 pub mod broadcast;
+pub mod flow;
 pub mod restart;
 pub mod staging;
 pub mod state;

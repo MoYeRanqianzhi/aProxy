@@ -50,6 +50,7 @@ sha2 = "0.10"
 windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Memory"] }
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
 tempfile = "3"
 

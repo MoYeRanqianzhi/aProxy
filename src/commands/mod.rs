@@ -10,6 +10,7 @@ pub(crate) mod alias;
 pub(crate) mod config;
 pub(crate) mod doctor;
 pub(crate) mod find;
+pub(crate) mod install;
 pub(crate) mod logs;
 pub(crate) mod restart;
 pub(crate) mod restore;

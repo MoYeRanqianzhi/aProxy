@@ -120,10 +120,36 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
     imp_process::process_start_time(pid)
 }
 
+/// 进程是否已退出（终止确认）。与 `process_start_time(pid).is_none()` 的
+/// 本质区别：进程终止后只要还有任何句柄（Rust 的 Child、看门狗的 sync
+/// handle、调试器）维持内核对象，OpenProcess 就依然成功、start_time 查询
+/// 依旧返回原值——「停止后等进程终止」场景（install 滚动重启）用 start_time
+/// 判死会永远等不到。本原语查退出码（Windows）/进程态（unix），句柄存在
+/// 不影响结论。
+///
+/// 返回 None = 无法判定（进程对象已彻底回收后 OpenProcess 失败 → Some(true)；
+/// 权限不足等 → None，调用方保守处理）。
+pub fn process_exited(pid: u32) -> Option<bool> {
+    imp_process::process_exited(pid)
+}
+
 /// 该 PID 是否为 aProxy 进程（镜像名验证）。
 /// 一切「主动杀」动作（--force、看门狗挂死终止）前的防误杀关卡。
 pub fn is_aproxy_process(pid: u32) -> bool {
     imp_process::is_aproxy_process(pid)
+}
+
+/// 进程镜像的完整路径（install 管辖检查用：实例 exe 是否在 ~/.aproxy/bin/
+/// 下）。查询失败（进程刚死/权限）→ None——调用方按「不可判 → 不拦」处理
+/// （管辖检查只拦「确认在管辖外」，误拦的代价是安装不可用）。
+pub fn process_image_path(pid: u32) -> Option<PathBuf> {
+    imp_process::process_image_path(pid)
+}
+
+/// 终止经身份验证的进程（install 换血用：停旧看护者）。防冒名验证内置——
+/// pid 被复用给无关进程时拒绝执行，宁可漏杀不误杀。
+pub fn terminate_verified_process(pid: u32) {
+    imp::terminate_verified(pid);
 }
 
 // ---------------------------------------------------------------------------
@@ -1207,6 +1233,42 @@ mod imp_process {
     /// 是否 aProxy 进程：镜像名比对（看门狗对 PID 复用的第二道防线——
     /// 纯死亡检测不需要它；任何「主动杀」动作前必须过这道验证）。
     pub fn is_aproxy_process(pid: u32) -> bool {
+        let Some(path) = process_image_path(pid) else {
+            return false;
+        };
+        let name = path.to_string_lossy().to_string();
+        let base = name.rsplit(['\\', '/']).next().unwrap_or("");
+        base.eq_ignore_ascii_case("aproxy.exe")
+    }
+
+    /// 进程是否已退出：OpenProcess + GetExitCodeProcess。退出后即使进程
+    /// 对象被其他句柄（Rust Child 等）维持，退出码也已确定——终止确认的
+    /// 唯一可靠判据（start_time 查询在对象被引用期间会误报存活）。
+    /// OpenProcess 失败（对象已彻底回收）= 已退出 → Some(true)。
+    pub fn process_exited(pid: u32) -> Option<bool> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle == 0 {
+                return Some(true);
+            }
+            let mut code: u32 = 0;
+            let ok = GetExitCodeProcess(handle, &mut code);
+            let _ = CloseHandle(handle);
+            if ok == 0 {
+                return None;
+            }
+            // STILL_ACTIVE(259) = 未退出；注意退出码恰为 259 的进程无法区分
+            // （Windows 文档明示的固有局限）——本仓库进程不用 259 作退出码
+            Some(code != 259)
+        }
+    }
+
+    /// 进程镜像完整路径（QueryFullProcessImageNameW）。
+    pub fn process_image_path(pid: u32) -> Option<std::path::PathBuf> {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{
             OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -1214,7 +1276,7 @@ mod imp_process {
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if handle == 0 {
-                return false;
+                return None;
             }
             let mut buf = [0u16; 512];
             let mut len = buf.len() as u32;
@@ -1226,11 +1288,11 @@ mod imp_process {
             );
             let _ = CloseHandle(handle);
             if ok == 0 {
-                return false;
+                return None;
             }
-            let name = String::from_utf16_lossy(&buf[..len as usize]);
-            let base = name.rsplit(['\\', '/']).next().unwrap_or("");
-            base.eq_ignore_ascii_case("aproxy.exe")
+            Some(std::path::PathBuf::from(String::from_utf16_lossy(
+                &buf[..len as usize],
+            )))
         }
     }
 }
@@ -1271,6 +1333,32 @@ mod imp_process {
             }
             Err(e) => e.kind() != std::io::ErrorKind::NotFound,
         }
+    }
+
+    /// 进程是否已退出：/proc/<pid>/stat 的进程态——'Z'（zombie，已退出未
+    /// 收割）与文件不存在（已收割）都算已退出。macOS 无 /proc 回退
+    /// kill(pid,0)：ESRCH = 已退出；EPERM = 活着（权限拒绝但存在）。
+    pub fn process_exited(pid: u32) -> Option<bool> {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                // comm 可含空格与括号，取最后一个 ')' 之后的首字段为 state
+                let after = stat.rsplit(')').next()?;
+                let state = after.split_whitespace().next()?;
+                Some(state == "Z")
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(true),
+            Err(_) => None,
+        }
+    }
+
+    /// 进程镜像完整路径：/proc/<pid>/exe readlink。进程已死（ENOENT，含
+    /// zombie）→ None；其他失败（跨用户权限等）→ None（调用方按「不可判
+    /// → 不拦」处理）。路径可能带「 (deleted)」后缀（swap 升级场景），
+    /// 调用方按需剥除。与 is_aproxy_process 语义不同处：身份判定对权限
+    /// 失败 fail-open（误放行代价小），管辖检查对一切失败 fail-closed
+    /// （拿不到路径就不拦）。
+    pub fn process_image_path(pid: u32) -> Option<std::path::PathBuf> {
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
     }
 }
 

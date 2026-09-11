@@ -124,6 +124,9 @@ async fn main() {
             port,
         }) => commands::find::handle_find_cmd(aliased, unaliased, query, port),
         Some(Commands::Config(args)) => commands::config::handle_config_cmd(cfg_path, args),
+        Some(Commands::Install(args) | Commands::Upgrade(args)) => {
+            commands::install::handle_install_cmd(args).await
+        }
         None => commands::start::handle_start_cmd(&cli, cfg_path, None).await,
     }
 }

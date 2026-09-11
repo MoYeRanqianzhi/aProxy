@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 ///         → swapping → swapped → relaying → restarting → verifying → cleaning → done
 /// 失败/中止：failed（保留现场，续跑重试）| aborted（干净回滚，终态）
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InstallPhase {
     Marking,
@@ -69,14 +69,29 @@ impl InstallPhase {
     }
 }
 
-/// 迁移合法性：线性主线只允许前进一格；任意运行阶段可转 failed（保留现场）
-/// ；--abort 仅 swapping 前可完全回滚（ack 及之前）——此后只进不退；
+/// 迁移合法性：线性主线只允许前进一格；三条**快路径跨段**显式白名单
+/// （无实例时 broadcasting/restarting 为空操作、续作接管从 swapped 重入，
+/// 跳过的是空操作段而非逻辑）；任意运行阶段可转 failed（保留现场）；
+/// --abort 仅 swapping 前可完全回滚（ack 及之前）——此后只进不退；
 /// failed 续跑从 downloading 重来（幂等重下）。终态无出边（重装 = 删状态
 /// 文件重新 create_new）。
 pub fn can_transition(from: InstallPhase, to: InstallPhase) -> bool {
     use InstallPhase::*;
     if let (Some(i), Some(j)) = (from.run_index(), to.run_index()) {
-        return j == i + 1;
+        return j == i + 1
+            || matches!(
+                (from, to),
+                // 无实例快路径：广播空集合是 no-op，跳过 Broadcasting/Acked
+                (Downloaded, Swapping)
+                // 续作接管（swapped 残留）：跳过空 relaying 直进滚动/终验
+                | (Swapped, Restarting)
+                | (Swapped, Verifying)
+            );
+    }
+    // Cleaning → Done：done 不在 RUN_ORDER（终态刻意不入运行序列），
+    // run_index 双 Some 分支覆盖不到——主线的终点在此显式放行
+    if from == InstallPhase::Cleaning && to == InstallPhase::Done {
+        return true;
     }
     match (from, to) {
         (Failed, Downloading) => true,
@@ -140,6 +155,10 @@ pub struct InstallState {
     /// staging 里的新二进制绝对路径（swapping 的恢复源）
     #[serde(default)]
     pub staged_path: Option<String>,
+    /// --from 渠道的源二进制路径（downloading 中断后续作重新备料的依据；
+    /// 网络渠道续作按渠道语义重新获取，不用此字段）
+    #[serde(default)]
+    pub from_path: Option<String>,
     /// 新二进制 sha256（github 渠道强校验值；--from 为计算值）
     #[serde(default)]
     pub sha256: Option<String>,
@@ -170,6 +189,7 @@ impl InstallState {
             target_version: target_version.into(),
             source,
             staged_path: None,
+            from_path: None,
             sha256: None,
             old_path: None,
             instance_snapshot: Vec::new(),
@@ -215,16 +235,19 @@ pub fn load() -> Option<InstallState> {
     load_in(&crate::daemon::run_dir())
 }
 
-/// stale 判定：updated_at 超时 **且** 原安装进程已死。pid = 0（未填/损坏）
-/// 直接视为死；pid 为当前进程（同一进程重入）视为活。
+/// stale 判定（锁失效 = 可接管）：**原安装进程已死即残留**（进程死亡后
+/// 现场不再变化，接管安全——不必等超时；典型场景：接力接管者失败退出后
+/// 留下的 failed 现场）；进程存活则 updated_at 超时（卡死兜底——活着的
+/// 挂死另有宣告心跳过期判据，见 is_takeable）。pid = 0（未填/损坏）直接
+/// 视为死；pid 为当前进程（同一进程重入）视为活。
 pub fn is_stale(state: &InstallState, now_secs: u64) -> bool {
-    if state.updated_at.saturating_add(STALE_AFTER_SECS) > now_secs {
-        return false;
-    }
     match state.installer_pid {
         0 => true,
         pid if pid == std::process::id() => false,
-        pid => crate::watchdog::process_start_time(pid).is_none(),
+        pid => match crate::watchdog::process_start_time(pid) {
+            None => true,
+            Some(_) => state.updated_at.saturating_add(STALE_AFTER_SECS) <= now_secs,
+        },
     }
 }
 
@@ -327,19 +350,26 @@ mod tests {
                 pair[1]
             );
         }
-        // 隔行跳跃全部拒绝
+        // 隔行跳跃全部拒绝（快路径白名单对除外）
+        let skips = [
+            (InstallPhase::Downloaded, InstallPhase::Swapping),
+            (InstallPhase::Swapped, InstallPhase::Restarting),
+            (InstallPhase::Swapped, InstallPhase::Verifying),
+        ];
         for i in 0..InstallPhase::RUN_ORDER.len() {
             for j in 0..InstallPhase::RUN_ORDER.len() {
                 if j != i + 1 {
-                    assert!(
-                        !can_transition(InstallPhase::RUN_ORDER[i], InstallPhase::RUN_ORDER[j]),
-                        "{:?} → {:?} 应非法（只能前进一格）",
-                        InstallPhase::RUN_ORDER[i],
-                        InstallPhase::RUN_ORDER[j]
+                    let (from, to) = (InstallPhase::RUN_ORDER[i], InstallPhase::RUN_ORDER[j]);
+                    assert_eq!(
+                        can_transition(from, to),
+                        skips.contains(&(from, to)),
+                        "{from:?} → {to:?} 合法性应与白名单一致"
                     );
                 }
             }
         }
+        // 主线终点：Cleaning → Done（done 不在 RUN_ORDER，单独放行）
+        assert!(can_transition(InstallPhase::Cleaning, InstallPhase::Done));
     }
 
     #[test]

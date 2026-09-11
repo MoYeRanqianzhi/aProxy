@@ -207,19 +207,20 @@ pub fn spawn_continuator(new_bin: &Path) -> std::io::Result<u32> {
     crate::daemon::spawn_detached(new_bin, &["install".to_string(), "--continue".to_string()])
 }
 
-/// 旧进程确认接管：轮询状态文件 phase 已推进到 relaying 及以后（新进程把
-/// phase 写进状态文件的动作与 updated_at 刷新是同一次原子写——推进本身就是
-/// 自证存活）。确认后旧进程自行退出（=「旧二进制自动停止」）。phase 停在
-/// relaying 但新进程随后死亡属于「relaying 中断」恢复场景，由看门狗/CLI
-/// 兜底拉起 --continue，不是接力确认的职责。
+/// 旧进程确认接管：轮询状态文件 phase 已**越过** relaying（推进到
+/// restarting 及以后 = 接管者 run_tail 的 advance，与 updated_at 刷新是
+/// 同一次原子写——推进本身就是接管者自证存活）。注意不能判 `>= relaying`
+/// ：安装者自己在 spawn 接棒者前就写了 relaying，读到相等值不代表有人接管。
+/// 确认后旧进程自行退出（=「旧二进制自动停止」）。接管者始终不出现属于
+/// 「relaying 中断」恢复场景——超时返回 false，安装者兜底继续或看护者
+/// 拉起 --continue。
 #[cfg(windows)]
 pub fn wait_for_takeover(run_dir: &Path, deadline: std::time::Instant) -> bool {
     use crate::install::state::{InstallPhase, load_in};
     let takeover_reached = |p: InstallPhase| {
         matches!(
             p,
-            InstallPhase::Relaying
-                | InstallPhase::Restarting
+            InstallPhase::Restarting
                 | InstallPhase::Verifying
                 | InstallPhase::Cleaning
                 | InstallPhase::Done
@@ -228,6 +229,10 @@ pub fn wait_for_takeover(run_dir: &Path, deadline: std::time::Instant) -> bool {
     loop {
         if std::time::Instant::now() >= deadline {
             return false;
+        }
+        // 状态文件消失 = done 清场（接管者极快完成的场景）
+        if !crate::install::state::state_path_in(run_dir).exists() {
+            return true;
         }
         if let Some(s) = load_in(run_dir)
             && takeover_reached(s.phase)

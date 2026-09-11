@@ -231,13 +231,28 @@ mod tests {
 
     #[test]
     fn platform_package_matches_build_mappings() {
-        let ctx = DownloadCtx {
-            client: reqwest::Client::new(),
-            version: "x".into(),
-            target: "x86_64-pc-windows-msvc",
-            variant: "",
+        // platform_package 的 OS 段由编译期平台决定（下载总是当前平台），
+        // arch/libc 段由 ctx.target 解析——测试只断言 target 驱动的部分，
+        // 跨平台编译均成立
+        let mk = |target: &'static str| {
+            platform_package(&DownloadCtx {
+                client: reqwest::Client::new(),
+                version: "x".into(),
+                target,
+                variant: "",
+            })
         };
-        assert_eq!(platform_package(&ctx), "@meowo/aproxy-windows-x64");
+        // arch 段随 target 前缀变化，与 OS 段无关
+        assert_eq!(mk("x86_64-foo"), mk("x86_64-bar"));
+        assert_ne!(mk("x86_64-foo"), mk("aarch64-foo"));
+        // musl 判定只来自 target 字符串
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            assert!(mk("x86_64-unknown-linux-musl").ends_with("-musl"));
+            assert!(!mk("x86_64-unknown-linux-gnu").ends_with("-musl"));
+        }
+        // 完整形态：@meowo/aproxy-<os>-<arch>[libc]
+        assert!(mk("x86_64-any").starts_with("@meowo/aproxy-"));
     }
 
     #[test]

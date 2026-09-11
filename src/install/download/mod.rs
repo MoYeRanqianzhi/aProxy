@@ -435,6 +435,8 @@ mod tests {
 
     #[test]
     fn asset_names_and_template_fill() {
+        // .exe 后缀由编译期平台决定（asset_name 的契约），断言随之动态拼
+        let exe = if cfg!(windows) { ".exe" } else { "" };
         let ctx = DownloadCtx {
             client: reqwest::Client::new(),
             version: "0.1.0-alpha.9".into(),
@@ -443,14 +445,14 @@ mod tests {
         };
         assert_eq!(
             Artifact::Binary.asset_name(ctx.target, ctx.variant),
-            "aproxy-x86_64-pc-windows-msvc-v3.exe"
+            format!("aproxy-x86_64-pc-windows-msvc-v3{exe}")
         );
         assert_eq!(
             ctx.fill_template(
                 "https://m/{version}/{asset}/{target}/{variant}",
                 Artifact::Binary
             ),
-            "https://m/0.1.0-alpha.9/aproxy-x86_64-pc-windows-msvc-v3.exe/x86_64-pc-windows-msvc/-v3"
+            format!("https://m/0.1.0-alpha.9/aproxy-x86_64-pc-windows-msvc-v3{exe}/x86_64-pc-windows-msvc/-v3")
         );
     }
 

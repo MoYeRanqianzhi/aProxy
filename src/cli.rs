@@ -152,8 +152,8 @@ pub(crate) enum Commands {
 
     /// 安装/升级 aProxy 到规范位置（~/.aproxy/bin/）：全程对客户端 ≈ 无感
     /// （逐实例滚动重启，任一时刻至多一个实例在重启）。`upgrade` 为其别名。
-    /// 指定版本/在线渠道（github/npm/cargo）随后续版本提供；当前支持
-    /// `--from` 本地路径与 `--adopt` 收编。
+    /// 在线安装走下载链条（github → npm → cargo-binstall → cargo，可配
+    /// settings 的 download_chain/url 模板与 --download-proxy）；中断自动续作。
     Install(InstallArgs),
 
     /// `aproxy install` 的别名（可发现性）

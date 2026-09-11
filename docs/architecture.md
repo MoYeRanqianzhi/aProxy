@@ -188,17 +188,19 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
 
 ## 测试
 
-- 单元测试 107 个（lib）+ 4 个（bin）：重试判定、配置分层、IPC 协议、注册表/恢复记录、打码、claim 选举、退避状态机
-- 集成测试 36 个：mock 上游 + 真实代理联调、守护生命周期、logs/restore 端到端、
+- 单元测试（lib + bin）：重试判定、配置分层、IPC 协议、注册表/恢复记录、打码、claim 选举、退避状态机、安装状态机/下载链条/zip 安全
+- 集成测试：mock 上游 + 真实代理联调、守护生命周期、logs/restore 端到端、
   双模缓冲（磁盘 spool 字节保真/EOF 清理/流尾错误重试）、看门狗（强杀重拉/
-  优雅停不复活/并发看护者唯一性）
-- 测试端口从测试进程 pid 派生（25000-65000 区间），绝不触碰用户实例；
+  优雅停不复活/并发看护者唯一性）、install 流程（恢复矩阵崩溃注入 + CLI
+  级完整链路）、交换原语（双 rename 舞 + fallback 脚本）、备料全链
+- 测试端口 bind 试探选取（排除区间/占用者自动跳过），绝不触碰用户实例；
   `DaemonGuard` 保证断言失败路径也清理守护
 
 ## 平台
 
-Windows 优先（开发与测试都在 Windows）；unix 分支（UDS IPC、spawn）已实现
-但未在类 Unix 环境实测。欢迎在 Linux/macOS 上反馈。
+Windows 优先（开发与主测试平台）；unix 分支（UDS IPC、/dev/shm 宣告与心跳、
+单步 rename 交换）已在 Ubuntu 与 WSL Debian 实测（全量测试 + e2e 实测全绿），
+macOS 为编译面覆盖（CI check）。欢迎在 Linux/macOS 上反馈。
 
 ## 版本路线
 

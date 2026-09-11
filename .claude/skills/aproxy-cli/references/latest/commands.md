@@ -222,6 +222,12 @@ github 渠道另有 `.sha256` 强校验、npm 渠道有 registry integrity 校�
 url 模板占位符：`{version}/{asset}/{target}/{variant}`（jsDelivr 等国内可达
 CDN 可自行填入；代码不内置任何 CDN 域名）。未配置 = 内置默认链。
 
+**返回时机（agent 验证注意）**：Windows 上有实例滚动时，install 命令在交换
+完成后**交棒返回**（退出 0 = 交换成功，剩余滚动/终验由后台续作进程完成）。
+返回后立刻验证可能看到 `install.state` 尚存或实例仍在滚动——轮询等待
+`install.state` 消失（通常几秒到几十秒）再断言结果，不要立即判失败。unix
+无交棒，命令返回即全部完成。
+
 ## 恢复自动化（install 中断）
 
 安装每一步都先写进度（`~/.aproxy/run/install.state`）再执行——崩溃/断电/强杀

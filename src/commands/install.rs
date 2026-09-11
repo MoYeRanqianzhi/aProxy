@@ -91,9 +91,12 @@ async fn run_plan(
         Ok(exit) => {
             if exit == aproxy::install::flow::FlowExit::HandedOver {
                 // Windows 接力：续作由新二进制进程完成，本进程（旧镜像）
-                // 到此结束——对用户表现为同一条命令装完
+                // 到此结束——对用户表现为同一条命令装完。**必须硬退**：
+                // 交棒路径刻意不 abort 宣告 ticker（进程退出即节消失），
+                // 走正常 return 会让 tokio runtime drop 永久等待无限循环
+                // 的 ticker 任务（实测 27 个交棒进程全体挂死的根源）
                 println!("交换完成，剩余阶段由新版本继续（接力交棒）。");
-                return;
+                std::process::exit(0);
             }
             println!(
                 "安装完成：{}（二进制已落位，实例已滚动到新版本）",

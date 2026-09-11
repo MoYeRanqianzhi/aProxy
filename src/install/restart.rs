@@ -51,10 +51,14 @@ pub async fn stop_and_wait(run_dir: &Path, port: &str, timeout: Duration) -> Res
         .iter()
         .find(|i| crate::daemon::port_of(&i.listen_addr) == port)
         .map(|i| i.pid);
-    crate::daemon::ipc_request(port, &crate::daemon::IpcRequest::Shutdown).await?;
+    crate::daemon::ipc_request_to(
+        &crate::daemon::endpoint_for_in(run_dir, port),
+        &crate::daemon::IpcRequest::Shutdown,
+    )
+    .await?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if crate::daemon::ipc_ping(port).await.is_err() {
+        if crate::daemon::ipc_ping_in(run_dir, port).await.is_err() {
             break;
         }
         if std::time::Instant::now() >= deadline {

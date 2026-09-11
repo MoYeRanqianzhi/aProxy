@@ -41,7 +41,7 @@ pub async fn check_jurisdiction(run_dir: &Path, home: &Path, adopt: bool) -> Res
     }
     let bin_dir = swap::bin_dir_in(home);
     for port in live_ports(run_dir).await {
-        let Ok(info) = crate::daemon::ipc_ping(&port).await else {
+        let Ok(info) = crate::daemon::ipc_ping_in(run_dir, &port).await else {
             continue;
         };
         let Some(image) = crate::watchdog::process_image_path(info.pid) else {
@@ -306,7 +306,7 @@ async fn run_tail(
     for port in &snapshot {
         // 跳过已就绪（仅续作：崩溃前已滚动的实例不再动）
         if skip_ready
-            && let Ok(info) = crate::daemon::ipc_ping(port).await
+            && let Ok(info) = crate::daemon::ipc_ping_in(run_dir, port).await
             && info.version == state.target_version
             && !info.swap_phase
         {
@@ -331,7 +331,7 @@ async fn run_tail(
     for round in 0..2 {
         let mut bad = Vec::new();
         for port in &snapshot {
-            match crate::daemon::ipc_ping(port).await {
+            match crate::daemon::ipc_ping_in(run_dir, port).await {
                 Ok(info) if info.version == state.target_version && !info.swap_phase => {}
                 _ => bad.push(port.clone()),
             }

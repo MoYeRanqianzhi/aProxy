@@ -71,13 +71,22 @@ pub fn clean_spool_dir(port: &str) {
 /// 实例的 IPC 端点：windows 为命名管道名，unix 为 UDS 路径。
 /// 端口号唯一区分实例（同端口=同实例；多实例的监听端口必然互不相同）。
 pub fn endpoint_for(port: &str) -> String {
+    endpoint_for_in(&run_dir(), port)
+}
+
+/// 同 endpoint_for，但 unix 的 UDS 路径按**显式 run_dir** 派生。库层函数
+/// （install 的 flow/restart）收了 run_dir 参数就必须全程用它——若内部
+/// 回落到进程级 APROXY_HOME 派生，测试进程与多 home 场景下会 ping 到
+/// 别的 home 的端点（unix 实测暴露：jurisdiction 库层测试全 continue）。
+pub fn endpoint_for_in(run_dir: &std::path::Path, port: &str) -> String {
     #[cfg(windows)]
     {
+        let _ = run_dir;
         format!(r"\\.\pipe\aproxy-{port}")
     }
     #[cfg(unix)]
     {
-        run_dir().join(format!("{port}.sock")).display().to_string()
+        run_dir.join(format!("{port}.sock")).display().to_string()
     }
 }
 
@@ -177,6 +186,19 @@ fn ipc_proto_v1_default() -> u32 {
 /// 3 秒超时等瞬态原因失败；调用方（list_instances 的注册清理、stop 的
 /// 已停止判定）会把 Err 当作「实例已死」处理，误判会删掉活实例的注册记录。
 pub async fn ipc_ping(port: &str) -> Result<InstanceInfo, String> {
+    ping_endpoint(&endpoint_for(port)).await
+}
+
+/// 同 ipc_ping，但 unix 的 UDS 端点按显式 run_dir 派生（库层调用者用这个）。
+pub async fn ipc_ping_in(run_dir: &std::path::Path, port: &str) -> Result<InstanceInfo, String> {
+    ping_endpoint(&endpoint_for_in(run_dir, port)).await
+}
+
+/// 判死门槛：连续 3 次（间隔 200ms）都拿不到有效响应才算 Err。单次 ping
+/// 可能因 Windows 命名管道瞬时 busy（serve 重建监听实例的零监听窗口）或
+/// 3 秒超时等瞬态原因失败；调用方（list_instances 的注册清理、stop 的
+/// 已停止判定）会把 Err 当作「实例已死」处理，误判会删掉活实例的注册记录。
+async fn ping_endpoint(endpoint: &str) -> Result<InstanceInfo, String> {
     const DEAD_AFTER: usize = 3;
     const RETRY_INTERVAL: Duration = Duration::from_millis(200);
     let mut last_err = String::new();
@@ -184,7 +206,7 @@ pub async fn ipc_ping(port: &str) -> Result<InstanceInfo, String> {
         if attempt > 0 {
             tokio::time::sleep(RETRY_INTERVAL).await;
         }
-        match ipc_request(port, &IpcRequest::Ping).await {
+        match ipc_request_to(endpoint, &IpcRequest::Ping).await {
             Ok(resp) if resp.ok => return resp.info.ok_or_else(|| "实例响应缺少信息".to_string()),
             Ok(_) => last_err = "实例返回失败".to_string(),
             Err(e) => last_err = e,

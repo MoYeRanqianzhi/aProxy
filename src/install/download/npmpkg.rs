@@ -173,6 +173,30 @@ fn extract_from_tgz(tgz: &Path, inner_path: &str, dest: &Path) -> Result<(), Str
     Err(format!("tgz 内未找到 {inner_path}"))
 }
 
+/// 主包 dist-tags.latest（latest 查询的 npm 兜底）：github API 限流/不可达
+/// 时，registry 通常可达且跟随 ~/.npmrc 镜像配置。
+pub async fn latest_version(ctx: &DownloadCtx) -> Result<String, String> {
+    let registry = registry_from_npmrc();
+    let url = format!("{registry}/@meowo/aproxy");
+    let resp = ctx
+        .client
+        .get(&url)
+        .header("Accept", "application/vnd.npm.install-v1+json")
+        .send()
+        .await
+        .map_err(|e| format!("registry 请求失败（{registry}）: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("registry 无主包（{registry}）: {e}"))?;
+    let meta: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("registry 元数据解析失败: {e}"))?;
+    meta["dist-tags"]["latest"]
+        .as_str()
+        .map(String::from)
+        .ok_or_else(|| "元数据缺 dist-tags.latest".to_string())
+}
+
 /// npm 通道获取：元数据 → tgz 下载 + integrity 强校验 → 解包提取产物。
 pub async fn fetch(ctx: &DownloadCtx, artifact: Artifact, dest: &Path) -> Result<Fetched, String> {
     let meta = fetch_meta(ctx, artifact).await?;

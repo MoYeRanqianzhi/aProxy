@@ -129,9 +129,18 @@ async fn run_skills_only(args: &InstallArgs) {
             println!("查询最新版本...");
             match aproxy::install::download::github::latest_version(&ctx).await {
                 Ok(v) => v,
-                Err(e) => {
-                    eprintln!("[ERROR] {e}");
-                    std::process::exit(1);
+                Err(gh_err) => {
+                    match aproxy::install::download::npmpkg::latest_version(&ctx).await {
+                        Ok(v) => {
+                            println!("github 查询失败（{gh_err}），npm 兜底命中 {v}");
+                            v
+                        }
+                        Err(_) => {
+                            eprintln!("[ERROR] {gh_err}");
+                            eprintln!("可尝试：--skills-only <具体版本号>（跳过 latest 查询）。");
+                            std::process::exit(1);
+                        }
+                    }
                 }
             }
         }
@@ -177,18 +186,28 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         }
     };
 
-    // 版本解析：latest = GitHub Releases 最新（列表第一个，<1.0 含 prerelease）
+    // 版本解析：latest = GitHub Releases 最新（列表第一个，<1.0 含
+    // prerelease）；github API 限流/不可达时兜底 npm dist-tags.latest
+    // （跟随 ~/.npmrc 镜像——共享出口 IP 场景 github 不可用是常态）
     let target = match args.version.as_deref() {
         None | Some("latest") => {
             println!("查询最新版本...");
             match aproxy::install::download::github::latest_version(&ctx).await {
                 Ok(v) => v,
-                Err(e) => {
-                    eprintln!("[ERROR] {e}");
-                    eprintln!(
-                        "可尝试：install <具体版本号>（跳过 latest 查询），或 --download-proxy <URL> 更换出口。"
-                    );
-                    std::process::exit(1);
+                Err(gh_err) => {
+                    match aproxy::install::download::npmpkg::latest_version(&ctx).await {
+                        Ok(v) => {
+                            println!("github 查询失败（{gh_err}），npm 兜底命中 {v}");
+                            v
+                        }
+                        Err(_) => {
+                            eprintln!("[ERROR] {gh_err}");
+                            eprintln!(
+                                "可尝试：install <具体版本号>（跳过 latest 查询），或 --download-proxy <URL> 更换出口。"
+                            );
+                            std::process::exit(1);
+                        }
+                    }
                 }
             }
         }
@@ -229,35 +248,50 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     );
     let chain = aproxy::install::download::effective_chain(&settings);
     let staged_dir = aproxy::install::staging::staging_dir_in(home, &target);
-    let fetched = match aproxy::install::download::fetch_artifact(
-        &ctx,
-        &chain,
-        aproxy::install::download::Artifact::Binary,
-        &staged_dir,
-    )
-    .await
-    {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("[ERROR] {e}");
-            eprintln!(
-                "可尝试：--download-proxy <URL> 配置下载代理，或在 settings.json 配置 download_chain（含 url 模板 CDN 通道，文档见 README）。"
-            );
-            std::process::exit(1);
-        }
-    };
-    // staged 自证校验：能运行且自报版本 == 目标（与 --from 的信任锚同级）
-    match aproxy::install::staging::probe_version(&fetched.path) {
-        Ok(v) if v == target => {}
-        Ok(v) => {
-            eprintln!("[ERROR] 下载产物自报 {v}，与目标版本 {target} 不符，中止");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("[ERROR] 下载产物校验失败（不可运行）: {e}");
-            std::process::exit(1);
+
+    // 下载 + 自证（能运行且自报版本 == 目标——与 --from 的信任锚同级）。
+    // gnu 产物试跑失败（构建机 glibc 高于本机）→ musl 静态产物回退重跑。
+    async fn download_verified(
+        ctx: &aproxy::install::download::DownloadCtx,
+        chain: &[aproxy::install::download::ChainStep],
+        target: &str,
+        staged_dir: &std::path::Path,
+    ) -> Result<aproxy::install::download::Fetched, String> {
+        let fetched = aproxy::install::download::fetch_artifact(
+            ctx,
+            chain,
+            aproxy::install::download::Artifact::Binary,
+            staged_dir,
+        )
+        .await?;
+        match aproxy::install::staging::probe_version(&fetched.path) {
+            Ok(v) if v == target => Ok(fetched),
+            Ok(v) => Err(format!("下载产物自报 {v}，与目标版本 {target} 不符")),
+            Err(e) => Err(format!("下载产物校验失败（不可运行）: {e}")),
         }
     }
+    let fetched = match download_verified(&ctx, &chain, &target, &staged_dir).await {
+        Ok(f) => f,
+        Err(e) => match ctx.musl_fallback() {
+            Some(mctx) => {
+                println!("gnu 产物在本机不可运行（{e}），回退 musl 静态产物...");
+                match download_verified(&mctx, &chain, &target, &staged_dir).await {
+                    Ok(f) => f,
+                    Err(e2) => {
+                        eprintln!("[ERROR] musl 回退仍失败: {e2}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            None => {
+                eprintln!("[ERROR] {e}");
+                eprintln!(
+                    "可尝试：--download-proxy <URL> 配置下载代理，或在 settings.json 配置 download_chain（含 url 模板 CDN 通道，文档见 README）。"
+                );
+                std::process::exit(1);
+            }
+        },
+    };
 
     println!("开始安装 aProxy {target}...");
     // source 记录实际命中的链条级（status/排查用）

@@ -209,6 +209,24 @@ impl DownloadCtx {
             .replace("{target}", self.target)
             .replace("{variant}", self.variant)
     }
+
+    /// linux-gnu 产物的 musl 回退：gnu 产物按构建机的 glibc 链接（CI 是
+    /// ubuntu 24.04 = glibc 2.39），老发行版（Debian 12 = 2.36 等）试跑即
+    /// 失败——musl 静态产物无 glibc 要求，任何 linux 可跑。musl 不发布 -v3
+    /// 变体，回退时恒 baseline。
+    pub fn musl_fallback(&self) -> Option<DownloadCtx> {
+        let musl = match self.target {
+            "x86_64-unknown-linux-gnu" => "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-gnu" => "aarch64-unknown-linux-musl",
+            _ => return None,
+        };
+        Some(DownloadCtx {
+            client: self.client.clone(),
+            version: self.version.clone(),
+            target: musl,
+            variant: "",
+        })
+    }
 }
 
 /// 一级通道的获取结果：产物已落盘 dest + 完整性信息。

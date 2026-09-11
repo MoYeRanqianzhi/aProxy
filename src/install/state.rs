@@ -78,7 +78,8 @@ impl InstallPhase {
 pub fn can_transition(from: InstallPhase, to: InstallPhase) -> bool {
     use InstallPhase::*;
     if let (Some(i), Some(j)) = (from.run_index(), to.run_index()) {
-        return j == i + 1
+        return i == j  // 重入（恢复矩阵的幂等续作：中断后从同阶段重做）
+            || j == i + 1
             || matches!(
                 (from, to),
                 // 无实例快路径：广播空集合是 no-op，跳过 Broadcasting/Acked
@@ -119,6 +120,8 @@ pub enum InstallSource {
     Npm,
     /// cargo-binstall（模板指向的预编译产物）
     Binstall,
+    /// url 模板通道（用户自指定源，弱校验档）
+    Url,
 }
 
 /// skill 支线子状态（单独可观察；下载幂等，不建断电恢复状态机）。
@@ -350,7 +353,7 @@ mod tests {
                 pair[1]
             );
         }
-        // 隔行跳跃全部拒绝（快路径白名单对除外）
+        // 隔行跳跃全部拒绝（快路径白名单对与重入对角线除外）
         let skips = [
             (InstallPhase::Downloaded, InstallPhase::Swapping),
             (InstallPhase::Swapped, InstallPhase::Restarting),
@@ -360,10 +363,11 @@ mod tests {
             for j in 0..InstallPhase::RUN_ORDER.len() {
                 if j != i + 1 {
                     let (from, to) = (InstallPhase::RUN_ORDER[i], InstallPhase::RUN_ORDER[j]);
+                    let expected = i == j || skips.contains(&(from, to));
                     assert_eq!(
                         can_transition(from, to),
-                        skips.contains(&(from, to)),
-                        "{from:?} → {to:?} 合法性应与白名单一致"
+                        expected,
+                        "{from:?} → {to:?} 合法性应与白名单/重入语义一致"
                     );
                 }
             }

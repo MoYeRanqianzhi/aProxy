@@ -1,6 +1,7 @@
 //! install 库层诊断：continue_install 从 restarting 残局续作（接管者视角，
 //! 进程内直接跑——子进程黑盒链路里看不到的卡点在此暴露）。
 
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -169,4 +170,175 @@ async fn continue_from_restarting_reclaims_instance() {
     assert_ne!(info.pid, old_pid, "实例应已滚动到新 pid");
     assert!(!info.swap_phase, "滚动后应退出更换阶段");
     let _ = child.kill();
+}
+
+// ---------------------------------------------------------------------------
+// 恢复矩阵崩溃注入（无实例快路径形态——覆盖纯文件舞的各中断点；有实例的
+// 续作由上方测试覆盖）。
+// ---------------------------------------------------------------------------
+
+use aproxy::install::state::{InstallPhase, InstallSource, InstallState};
+
+/// 残局构造：phase + 过期时间 + 死 pid（is_takeable 通过）+ from/staged 路径。
+fn crash_state(phase: InstallPhase, from: &Path, staged: Option<&Path>) -> InstallState {
+    let mut state = InstallState::new_marking(env!("CARGO_PKG_VERSION"), InstallSource::From);
+    state.phase = phase;
+    state.from_path = Some(from.display().to_string());
+    state.staged_path = staged.map(|p| p.display().to_string());
+    state.installer_pid = u32::MAX - 7;
+    state.updated_at =
+        aproxy::watchdog::now_secs().saturating_sub(aproxy::install::state::STALE_AFTER_SECS + 60);
+    state
+}
+
+fn usable_from(home: &Path) -> std::path::PathBuf {
+    let from = home.join("download.exe");
+    std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &from).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    from
+}
+
+/// 恢复矩阵行「downloading 中」：staging 半截文件 → 删半截重下 → done。
+#[tokio::test(flavor = "current_thread")]
+async fn crash_during_downloading_redownloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let run_dir = home.join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let from = usable_from(home);
+    // 半截 staged（损坏的截断文件——备料会整体重做覆盖它）
+    let staged = aproxy::install::staging::staging_dir_in(home, env!("CARGO_PKG_VERSION"))
+        .join(aproxy::install::staging::binary_name());
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::write(&staged, b"truncated").unwrap();
+    let state = crash_state(InstallPhase::Downloading, &from, Some(&staged));
+    aproxy::install::state::write_in(&run_dir, &mut state.clone()).unwrap();
+
+    aproxy::install::flow::continue_install(home, &run_dir)
+        .await
+        .expect("downloading 中断续作应完成");
+    assert!(
+        !aproxy::install::state::state_path_in(&run_dir).exists(),
+        "续作应走到 done 清状态"
+    );
+    assert!(bin_works(home), "重备料后规范位置应有可用二进制");
+}
+
+/// 恢复矩阵行「swapping 中（Windows bin 空窗：旧已改名、新未落位）」——
+/// 计划标注的最要命失败态：bin 只有 .old（+残留 .new），staging 完整。
+/// 续作从 staging 重新落位 → bin 恢复 → done。
+#[cfg(windows)]
+#[tokio::test(flavor = "current_thread")]
+async fn crash_during_swapping_recovers_from_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let run_dir = home.join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let from = usable_from(home);
+
+    // 空窗现场：bin 缺失、.old 在场（可用旧版）、.new 半成品、staging 完整
+    let bin = aproxy::install::swap::bin_path_in(home);
+    let old = aproxy::install::swap::old_path_in(home);
+    let new_tmp = aproxy::install::swap::new_tmp_path_in(home);
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &old).unwrap();
+    std::fs::write(&new_tmp, b"half-written-new").unwrap();
+    let staged = aproxy::install::staging::staging_dir_in(home, env!("CARGO_PKG_VERSION"))
+        .join(aproxy::install::staging::binary_name());
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &staged).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let state = crash_state(InstallPhase::Swapping, &from, Some(&staged));
+    aproxy::install::state::write_in(&run_dir, &mut state.clone()).unwrap();
+
+    aproxy::install::flow::continue_install(home, &run_dir)
+        .await
+        .expect("swapping 空窗续作应完成");
+    // 终态：bin 恢复可用、.new 消费、.old 清理（无实例 → cleaning 可删）
+    assert!(bin_works(home), "空窗后 bin 应从 staging 恢复");
+    assert!(!new_tmp.exists(), "残留 .new 应被 swap 舞消费");
+    assert!(!old.exists(), ".old 应在 cleaning 删除（无实例无镜像锁）");
+    assert!(!aproxy::install::state::state_path_in(&run_dir).exists());
+}
+
+/// 恢复矩阵行「swapped」：bin=新、.old 残留 → 续作直接进尾部（滚动/终验/
+/// 清理）→ done。
+#[tokio::test(flavor = "current_thread")]
+async fn crash_after_swap_finishes_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let run_dir = home.join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let from = usable_from(home);
+    // swapped 现场：bin=新（可用）、.old 残留
+    let bin = aproxy::install::swap::bin_path_in(home);
+    let old = aproxy::install::swap::old_path_in(home);
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &bin).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(&old, b"old-binary").unwrap();
+    let mut state = crash_state(InstallPhase::Swapped, &from, None);
+    state.old_path = Some(old.display().to_string());
+    aproxy::install::state::write_in(&run_dir, &mut state).unwrap();
+
+    aproxy::install::flow::continue_install(home, &run_dir)
+        .await
+        .expect("swapped 残留续作应完成");
+    assert!(bin_works(home));
+    assert!(!old.exists(), "尾部 cleaning 应删除 .old");
+    assert!(!aproxy::install::state::state_path_in(&run_dir).exists());
+}
+
+/// 恢复矩阵行「任何阶段：状态文件损坏」→ 按无/失效处理，continue 静默退出
+/// （不 crash 不留半成品）。
+#[tokio::test(flavor = "current_thread")]
+async fn corrupted_state_file_is_handled_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let run_dir = home.join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(
+        aproxy::install::state::state_path_in(&run_dir),
+        "{corrupted",
+    )
+    .unwrap();
+    // 静默退出：无残留、无 panic（库层返回 Ok——无有效状态即无事发生）
+    aproxy::install::flow::continue_install(home, &run_dir)
+        .await
+        .expect("损坏状态文件应被静默处置");
+}
+
+/// 恢复矩阵行「done 残留（清文件前崩溃）」→ 清文件即完成。
+#[tokio::test(flavor = "current_thread")]
+async fn done_residue_is_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let run_dir = home.join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let state = crash_state(InstallPhase::Done, &usable_from(home), None);
+    aproxy::install::state::write_in(&run_dir, &mut state.clone()).unwrap();
+    aproxy::install::flow::continue_install(home, &run_dir)
+        .await
+        .expect("done 残留应被清理");
+    assert!(!aproxy::install::state::state_path_in(&run_dir).exists());
+}
+
+fn bin_works(home: &Path) -> bool {
+    let bin = aproxy::install::swap::bin_path_in(home);
+    bin.is_file()
+        && aproxy::install::staging::probe_version(&bin)
+            .map(|v| v == env!("CARGO_PKG_VERSION"))
+            .unwrap_or(false)
 }

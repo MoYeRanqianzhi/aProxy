@@ -95,6 +95,24 @@ pub struct Settings {
     /// 默认 300。
     #[serde(default = "default_watchdog_idle_exit_secs")]
     pub watchdog_idle_exit_secs: u64,
+    /// install 下载链条（可选，未配置 = 内置默认链 github → npm →
+    /// cargo-binstall → cargo）。**严格数组语义**（与 config_dirs 相反）：
+    /// 配置后完全按数组执行，绝不自动追加默认项——写少了会增加失败概率，
+    /// 建议写全。元素为渠道名（"github"/"npm"/"cargo-binstall"/"cargo"）
+    /// 或 url 模板对象（{"url": "https://…/{version}/{asset}"}，CDN 域名
+    /// 不硬编码进二进制，由用户自指定）。
+    #[serde(default)]
+    pub download_chain: Option<Vec<crate::install::download::ChainStep>>,
+    /// skill 文档自动更新总开关：install 时随二进制并行下载更新
+    /// ~/.aproxy/skills/。默认 true；false 时 install 完全跳过 skill 任务。
+    #[serde(default = "default_true")]
+    pub skill_auto_update: bool,
+    /// 下载代理 URL（仅 install 下载使用）：与 config.toml 的 `proxy`
+    /// （上游请求转发）**绝对分离**——两套命名、两套配置。未配置时回退
+    /// 环境变量（HTTPS_PROXY 等系统代理）。可用 CLI --download-proxy
+    /// 按次覆盖。错误信息与 config --show 同样对内嵌凭据打码。
+    #[serde(default)]
+    pub download_proxy: Option<String>,
 }
 
 fn default_log_rotate_mb() -> u64 {
@@ -133,6 +151,10 @@ pub(crate) fn default_watchdog_idle_exit_secs() -> u64 {
     300
 }
 
+fn default_true() -> bool {
+    true
+}
+
 // 手动 Default：serde 的字段默认值（log_rotate_mb=8、idle_timeout_secs=1800）
 // 只作用于反序列化，derive 出的 Default 会给数值字段填 0——「默认 0」与
 // 「默认 8/1800」语义不同（0=关闭轮转），必须与反序列化保持一致。
@@ -151,6 +173,9 @@ impl Default for Settings {
             watchdog_stale_after_cycles: default_watchdog_stale_after_cycles(),
             watchdog_max_restarts: default_watchdog_max_restarts(),
             watchdog_idle_exit_secs: default_watchdog_idle_exit_secs(),
+            download_chain: None,
+            skill_auto_update: default_true(),
+            download_proxy: None,
         }
     }
 }

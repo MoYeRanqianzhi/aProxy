@@ -166,21 +166,51 @@ pub(crate) enum Commands {
 /// `aproxy install` 的参数集。
 #[derive(clap::Args, Debug, Clone, PartialEq)]
 pub(crate) struct InstallArgs {
+    /// 安装目标版本：`latest`（默认，GitHub Releases 最新，含 prerelease）
+    /// 或具体版本号（如 0.1.0-alpha.9）。默认拒绝降级（--allow-downgrade
+    /// 放行）。与 --from/--adopt 互斥。
+    #[arg(value_name = "VERSION", conflicts_with_all = ["from", "adopt", "abort"])]
+    pub(crate) version: Option<String>,
+
     /// 从本地二进制文件安装（复制 → 校验 → 原子落位 → 滚动重启实例）。
     /// 二进制的 `--version` 自报版本即安装目标版本。
-    #[arg(long, value_name = "PATH", conflicts_with_all = ["adopt", "abort"])]
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["adopt", "abort", "version"])]
     pub(crate) from: Option<String>,
 
     /// 收编：把当前运行的 aProxy（如包管理器/npm 安装的）迁移到标准位置
     /// `~/.aproxy/bin/`——当前进程镜像作为安装源，走完整标准流水线。
     /// 显式执行，绝不自动。
-    #[arg(long, conflicts_with_all = ["from", "abort"])]
+    #[arg(long, conflicts_with_all = ["from", "abort", "version"])]
     pub(crate) adopt: bool,
 
     /// 中止进行中的安装：仅 swapping 前可完全回滚（此后只进不退）。
     /// 清理状态文件与 staging 现场。
-    #[arg(long, conflicts_with_all = ["from", "adopt"])]
+    #[arg(long, conflicts_with_all = ["from", "adopt", "version"])]
     pub(crate) abort: bool,
+
+    /// 手动指定指令集变体（默认按运行时检测：AVX2 → -v3，否则 baseline）。
+    /// 取值 `v3` 或 `baseline`。
+    #[arg(long, value_name = "VARIANT", value_parser = ["v3", "baseline"])]
+    pub(crate) variant: Option<String>,
+
+    /// 允许降级安装（目标版本 < 当前已安装版本时默认拒绝）
+    #[arg(long)]
+    pub(crate) allow_downgrade: bool,
+
+    /// 仅本次下载使用的代理 URL（与 config.toml 的请求代理绝对分离）；
+    /// 未指定时用 settings 的 download_proxy，再未配置则走系统环境代理
+    #[arg(long, value_name = "URL")]
+    pub(crate) download_proxy: Option<String>,
+
+    /// 本次安装跳过 skill 文档更新（全局开关在 settings 的
+    /// skill_auto_update）
+    #[arg(long)]
+    pub(crate) no_skills: bool,
+
+    /// 只更新 skill 文档，不动二进制（跳过整个安装状态机；skill 上次
+    /// failed 后的单独重试入口）
+    #[arg(long, conflicts_with_all = ["from", "adopt", "abort", "version"])]
+    pub(crate) skills_only: bool,
 
     /// [内部] 续作模式：从 install.state 残留的 phase 幂等推进（看门狗/
     /// CLI 入口/接力自动拉起，全自动无人工询问）。勿手动使用。

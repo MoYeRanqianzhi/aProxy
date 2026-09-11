@@ -39,6 +39,12 @@ tokio-util = { version = "0.7", features = ["io"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 # install 下载校验：github 渠道 .sha256 强校验 / npm integrity 换算 / --from 完整性记录
 sha2 = "0.10"
+# install 下载链条：npm/cargo 渠道的 tgz/.crate 解包 + 版本比较（降级防呆）
+tar = "0.4"
+flate2 = "1"
+semver = "1"
+# skill 更新支线：GitHub skills 资产的 zip 解包
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 # spawn_detached 手写 CreateProcessW（bInheritHandles=FALSE，std 无稳定 API 可关）。

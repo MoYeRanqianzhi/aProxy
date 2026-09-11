@@ -94,6 +94,25 @@ async fn main() {
         settings::check_and_report();
     }
 
+    // 恢复机制兜底（看门狗为主责，此为无看护者场景的静默兜底）：任何命令
+    // 入口读到活动安装态（install.state 残留）→ 静默 spawn `install
+    // --continue`（不等待不提示，本命令照常执行）。续作进程的接管判定
+    // 自会收敛（原安装进程健在则不动）。install 自身的分派分支跳过
+    // （--continue/--abort 与续作无并发意义，且避免递归拉起）。
+    let is_install_cmd = matches!(
+        cli.command,
+        Some(Commands::Install(_)) | Some(Commands::Upgrade(_))
+    );
+    if !is_install_cmd
+        && aproxy::install::state::load().is_some()
+        && let Ok(exe) = std::env::current_exe()
+    {
+        let _ = aproxy::daemon::spawn_detached(
+            &exe,
+            &["install".to_string(), "--continue".to_string()],
+        );
+    }
+
     // 子命令分派；无子命令 = 启动代理（默认后台）
     match cli.command {
         Some(Commands::Status { idle, busy }) => {

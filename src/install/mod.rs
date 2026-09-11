@@ -6,8 +6,10 @@
 
 pub mod announce;
 pub mod broadcast;
+pub mod download;
 pub mod flow;
 pub mod restart;
+pub mod skills;
 pub mod staging;
 pub mod state;
 pub mod swap;

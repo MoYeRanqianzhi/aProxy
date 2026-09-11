@@ -189,7 +189,7 @@ fn install_from_with_instance_rolling_restart_and_relay() {
 
     let from = env.source_file("rolling");
     let mut installer = env
-        .install_cmd(&["--from", &from.display().to_string()])
+        .install_cmd(&["--from", &from.display().to_string(), "--no-skills"])
         .spawn()
         .unwrap();
     // 安装含 relay（等接管最多 30s）+ 滚动重启 + 终验，给 120s
@@ -328,7 +328,10 @@ fn adopt_migrates_foreign_instance() {
     assert!(old_pid != 0, "外域实例未就绪");
 
     // --adopt：当前进程（CARGO_BIN_EXE）作为源收编
-    let mut installer = env.install_cmd(&["--adopt"]).spawn().unwrap();
+    let mut installer = env
+        .install_cmd(&["--adopt", "--no-skills"])
+        .spawn()
+        .unwrap();
     let _ = installer.wait();
     let done = wait_install_done(&env, Duration::from_secs(90));
     assert!(done, "收编未完成（状态文件残留）");

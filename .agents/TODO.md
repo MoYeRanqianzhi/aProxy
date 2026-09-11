@@ -114,6 +114,15 @@
   有实例 Acked/Swapping 续作被状态机拒绝（相位守卫）。CI unix job 同步升级
   为 cargo test。CI 首次暴露流程教训：push 后必须 gh run list 确认绿。
   详录 .agents/memory/2026-09-11-install-three-platform-e2e.md
+- [x] **install 在线渠道深度实测**（2026-09-12，WSL 3 轮 × 16 场景全 PASS）：
+  测试 tag（v…tN，用户授权）触发全链发布做真实下载测试。挖出并修复 5 个
+  产品 bug + 2 个韧性改进（gnu→musl 自动回退、latest 查询 npm 兜底）+
+  release 版本对齐机制（build/publish 双 job）。代价：crates.io 的
+  alpha.10/alpha.11 正式号被测试发布抢注（对齐缺失时代），正式版顺延
+  alpha.12（Cargo.toml 已 bump，待发布）。详录
+  .agents/memory/2026-09-12-install-online-deep-test.md 与
+  .agents/memory/2026-09-12-release-version-alignment.md
+- [ ] **正式发布 v0.1.0-alpha.12**（等用户下令；测试 tag 全链已验证）
 - [ ] **测试稳定性**：proxy_integration 的 alias_start_and_stop_roundtrip
   偶发并行失败（单跑必过——端口/时序竞争，本轮全量跑撞上一次）
 - [x] **渠道 P0 全配 + 可信发布自动化**（2026-09-11，alpha.7~9 三轮发布实测）：

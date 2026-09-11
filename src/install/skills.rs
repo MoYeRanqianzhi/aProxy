@@ -65,17 +65,24 @@ pub async fn update_skills(
 /// 走 → 新目录 rename 进 → 清理。Windows 上 agent 正读文件导致的 rename
 /// 冲突短重试 3 次，失败放弃（下次 install 再覆盖）。
 fn install_skill_dir(home: &Path, zip: &Path) -> Result<(), String> {
-    let staging = home.join("skills").join(".staging").join("unpack");
+    // zip 内条目自带 `aproxy-cli/` 顶层前缀（发布组包同款，实测确认）——
+    // 解包到 .staging 本身，incoming 即 .staging/aproxy-cli，rename 进位后
+    // 不产生双层嵌套
+    let staging = home.join("skills").join(".staging");
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|e| format!("skill staging 创建失败: {e}"))?;
     unpack_zip(zip, &staging)?;
+    let incoming = staging.join("aproxy-cli");
+    if !incoming.is_dir() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err("skills zip 缺 aproxy-cli/ 顶层目录（组包形态不符）".into());
+    }
 
     let dir = skill_dir_in(home);
     std::fs::create_dir_all(dir.parent().unwrap())
         .map_err(|e| format!("skills 目录创建失败: {e}"))?;
     // 旧目录 rename 走（Windows 冲突短重试）
-    let old = home.join("skills").join(".staging").join("old");
-    let _ = std::fs::remove_dir_all(&old);
+    let old = staging.join("old");
     if dir.exists() {
         let mut renamed = false;
         for attempt in 0..3 {
@@ -91,9 +98,8 @@ fn install_skill_dir(home: &Path, zip: &Path) -> Result<(), String> {
         }
     }
     // 新目录 rename 进（同卷原子）
-    std::fs::rename(&staging, &dir).map_err(|e| format!("skill 目录落位失败: {e}"))?;
-    let _ = std::fs::remove_dir_all(&old);
-    let _ = std::fs::remove_dir_all(home.join("skills").join(".staging"));
+    std::fs::rename(&incoming, &dir).map_err(|e| format!("skill 目录落位失败: {e}"))?;
+    let _ = std::fs::remove_dir_all(&staging);
     Ok(())
 }
 
@@ -127,16 +133,6 @@ fn unpack_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// skill 子状态初值（安装开始时主流程写入 install.state——中途可观察
-/// 「下载中」；终态由主流程 join 后统一落盘，避免与主流程并发写状态文件）。
-pub fn initial_skill_state(version: &str) -> SkillState {
-    SkillState {
-        status: SkillPhase::Downloading,
-        attempt: 1,
-        version: version.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +142,44 @@ mod tests {
         assert_eq!(
             skill_dir_in(Path::new("/tmp/h")),
             Path::new("/tmp/h/skills/aproxy-cli")
+        );
+    }
+
+    #[test]
+    fn install_skill_dir_consumes_zip_top_prefix() {
+        // 真实发布 zip 的形态：条目自带 aproxy-cli/ 顶层前缀（alpha.9
+        // aproxy-skills.zip 实测）——落位后不得双层嵌套
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let zip_path = home.join("skills.zip");
+        let f = std::fs::File::create(&zip_path).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        w.start_file("aproxy-cli/SKILL.md", opts).unwrap();
+        std::io::Write::write_all(&mut w, b"# aProxy CLI").unwrap();
+        w.start_file("aproxy-cli/references/latest/commands.md", opts)
+            .unwrap();
+        std::io::Write::write_all(&mut w, b"# commands").unwrap();
+        w.finish().unwrap();
+
+        install_skill_dir(home, &zip_path).unwrap();
+        let dir_out = skill_dir_in(home);
+        assert!(dir_out.join("SKILL.md").is_file(), "SKILL.md 应落位一层");
+        assert!(
+            dir_out
+                .join("references")
+                .join("latest")
+                .join("commands.md")
+                .is_file(),
+            "references 子树应完整"
+        );
+        assert!(
+            !dir_out.join("aproxy-cli").exists(),
+            "不得产生 aproxy-cli/aproxy-cli 双层嵌套"
+        );
+        assert!(
+            !home.join("skills").join(".staging").exists(),
+            "staging 应清理"
         );
     }
 

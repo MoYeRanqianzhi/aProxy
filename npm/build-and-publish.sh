@@ -108,6 +108,14 @@ mkdir -p "$main_dir/bin"
 cp npm/aproxy/bin/aproxy.js "$main_dir/bin/aproxy.js"
 cp npm/aproxy/README.md "$main_dir/README.md"
 
+# skill 支线：主包附带 skill zip（install 的 npm 通道从这里提取；内容与
+# GH release 的 aproxy-skill-<名>.zip 同源——现场从 .claude/skills 打包）
+mkdir -p "$main_dir/skills"
+(
+  cd .claude/skills/aproxy-cli
+  zip -qr "../../$main_dir/skills/aproxy-cli.zip" . -x '*.zip'
+)
+
 opt_deps=""
 for m in "${MAPPINGS[@]}"; do
   IFS=: read -r suffix _ <<<"$m"
@@ -129,7 +137,7 @@ cat >"$main_dir/package.json" <<EOF
   "bin": {
     "aproxy": "bin/aproxy.js"
   },
-  "files": ["bin/", "README.md"],
+  "files": ["bin/", "README.md", "skills/"],
   "engines": {
     "node": ">=18"
   },

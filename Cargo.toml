@@ -11,7 +11,7 @@ categories = ["network-programming", "web-programming"]
 # crates.io 白名单：crate 只装代码与文档，仓库其余（bench/文档树/工作流）不进包。
 # 前导 / 锚定仓库根——不带 / 的模式（如 README.md）会按 gitignore 语义匹配
 # 任意层级（实测 npm/ 子目录的 README 混进过包）
-include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
+include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/.claude/skills/aproxy-cli/**"]
 
 [[bin]]
 name = "aproxy"

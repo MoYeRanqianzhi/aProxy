@@ -167,6 +167,11 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         }
         Some(v) => v.to_string(),
     };
+    // ctx 初建用编译版本仅够 latest 查询用；目标版本确定后必须回写——
+    // 各渠道（github tag/npm registry/crates.io）都按 ctx.version 定位产物，
+    // 漏回写会让 `install <特定版本>` 全渠道查错版本（实测暴露）
+    let mut ctx = ctx;
+    ctx.version = target.clone();
 
     // 降级防呆：target < 当前运行版本 → 拒绝（--allow-downgrade 放行）。
     // semver 比较：prerelease 语义 alpha.9 < alpha.10 与 0.2.0 > 0.1.0-x

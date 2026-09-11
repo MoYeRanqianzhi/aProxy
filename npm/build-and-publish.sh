@@ -25,6 +25,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+ROOT=$(pwd)
 
 DRY_RUN=""
 if [ "${1:-}" = "--dry-run" ]; then
@@ -109,11 +110,14 @@ cp npm/aproxy/bin/aproxy.js "$main_dir/bin/aproxy.js"
 cp npm/aproxy/README.md "$main_dir/README.md"
 
 # skill 支线：主包附带 skill zip（install 的 npm 通道从这里提取；内容与
-# GH release 的 aproxy-skill-<名>.zip 同源——现场从 .claude/skills 打包）
+# GH release 的 aproxy-skills.zip 同源同形——条目自带 aproxy-cli/ 顶层前缀，
+# 消费侧 install_skill_dir 按此形态解包）
 mkdir -p "$main_dir/skills"
 (
-  cd .claude/skills/aproxy-cli
-  zip -qr "../../$main_dir/skills/aproxy-cli.zip" . -x '*.zip'
+  cd .claude/skills
+  # zip 输出走仓库根绝对路径——相对路径会按 cd 后的 cwd 解析（alpha.10
+  # 首跑曾因 "../../" 指到 .claude/skills/npm/ 下而创建失败）
+  zip -qr "$ROOT/$main_dir/skills/aproxy-cli.zip" aproxy-cli -x '*.zip'
 )
 
 opt_deps=""

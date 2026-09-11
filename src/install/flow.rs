@@ -537,11 +537,18 @@ async fn run_forward_from_staged(
     if !snapshot.is_empty() {
         #[cfg(windows)]
         stop_old_watchdog(run_dir);
-        super::state::advance_in(run_dir, state, InstallPhase::Broadcasting)?;
+        // 相位守卫（与 run_tail 同款）：Acked/Swapping 残留的续作重入时
+        // phase 已高于 Broadcasting/Acked——逆向迁移非法，保留高位重做即可
+        //（广播是幂等置位）
+        if state.phase < InstallPhase::Broadcasting {
+            super::state::advance_in(run_dir, state, InstallPhase::Broadcasting)?;
+        }
         if let Err(bad) = super::broadcast::broadcast_prepare_swap(run_dir, &snapshot).await {
             return Err(format!("PrepareSwap 广播终失败: {bad:?}"));
         }
-        super::state::advance_in(run_dir, state, InstallPhase::Acked)?;
+        if state.phase < InstallPhase::Acked {
+            super::state::advance_in(run_dir, state, InstallPhase::Acked)?;
+        }
     }
     let now_live = live_ports(run_dir).await;
     let fresh: Vec<String> = now_live

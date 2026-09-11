@@ -5,6 +5,12 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// live 测试（起真实守护 + 进程级 set_var APROXY_HOME）互斥：env 是进程级
+/// 的，并行线程交错 set_var 会把对方守护的注册表指到别的 tempdir（实测
+/// 90s 超时的根源）。async Mutex——guard 跨 await 持有整个测试期，串行执行
+/// 所有 live 测试。
+static LIVE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// bind 试探选取可用端口（排除区间/占用者自动跳过；原子计数保证同进程
 /// 并发测试不互撞）
 fn free_port() -> u16 {
@@ -22,6 +28,7 @@ fn free_port() -> u16 {
 
 #[tokio::test(flavor = "current_thread")]
 async fn continue_from_restarting_reclaims_instance() {
+    let _guard = LIVE_TEST_LOCK.lock().await;
     // 测试进程内可见内部日志（tracing 默认无订阅者，输出被丢弃）
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -170,6 +177,111 @@ async fn continue_from_restarting_reclaims_instance() {
     assert_ne!(info.pid, old_pid, "实例应已滚动到新 pid");
     assert!(!info.swap_phase, "滚动后应退出更换阶段");
     let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// 恢复矩阵行「swapping 中（Windows bin 空窗）」的**有实例版本**：实例已
+/// ACK（swap_phase 置位）+ staging 完整在盘。续作重入 run_forward_from_staged
+/// 时 phase(Swapping) 已高于 Broadcasting/Acked——相位守卫必须跳过逆向
+/// advance，广播幂等重做后重入 Swapping 完成交换与滚动（无守卫版本会被
+/// 状态机「非法迁移 Swapping → Broadcasting」拒绝，回归用）。
+#[tokio::test(flavor = "current_thread")]
+async fn continue_from_swapping_with_live_instance_redoes_swap() {
+    let _guard = LIVE_TEST_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("APROXY_HOME", dir.path()) };
+    let home = dir.path();
+    let run_dir = home.join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+
+    let bin = aproxy::install::swap::bin_path_in(home);
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &bin).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let port = free_port();
+    let cfg_file = home.join("cfg.toml");
+    std::fs::write(
+        &cfg_file,
+        format!("base_url = \"https://libdiag.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
+    )
+    .unwrap();
+    let mut child = Command::new(&bin)
+        .args([
+            "--config",
+            &cfg_file.display().to_string(),
+            "--daemon-child",
+        ])
+        .env("APROXY_HOME", home)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let old_pid = child.id();
+    let mut ready = false;
+    for _ in 0..100 {
+        if aproxy::daemon::registry_pids_in(&run_dir).contains(&old_pid) {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ready, "实例未就绪");
+
+    // swapping 现场语义：实例已 ACK（swap_phase 置位）+ staging 完整在盘
+    aproxy::install::broadcast::ack_one(&run_dir, &port.to_string())
+        .await
+        .expect("PrepareSwap 广播应成功");
+    let staged = aproxy::install::staging::staging_dir_in(home, env!("CARGO_PKG_VERSION"))
+        .join(aproxy::install::staging::binary_name());
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &staged).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut state = aproxy::install::state::InstallState::new_marking(
+        env!("CARGO_PKG_VERSION"),
+        aproxy::install::state::InstallSource::From,
+    );
+    state.phase = aproxy::install::state::InstallPhase::Swapping;
+    state.instance_snapshot = vec![port.to_string()];
+    state.from_path = Some(bin.display().to_string());
+    state.staged_path = Some(staged.display().to_string());
+    state.installer_pid = u32::MAX - 7;
+    state.updated_at =
+        aproxy::watchdog::now_secs().saturating_sub(aproxy::install::state::STALE_AFTER_SECS + 60);
+    aproxy::install::state::write_in(&run_dir, &mut state).unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(90),
+        aproxy::install::flow::continue_install(home, &run_dir),
+    )
+    .await;
+    if result.is_err() {
+        let cur = aproxy::install::state::load_in(&run_dir).map(|s| format!("{:?}", s.phase));
+        panic!("swapping 有实例续作 90s 未返回（phase={cur:?}）");
+    }
+    result
+        .expect("swapping 有实例续作应完成")
+        .expect("swapping 有实例续作不应报错");
+    assert!(
+        !aproxy::install::state::state_path_in(&run_dir).exists(),
+        "done 后状态文件应删除"
+    );
+    let info = aproxy::daemon::ipc_ping_in(&run_dir, &port.to_string())
+        .await
+        .expect("滚动后实例应可 ping");
+    assert_ne!(info.pid, old_pid, "实例应已滚动到新 pid");
+    assert!(!info.swap_phase, "滚动后应退出更换阶段");
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // ---------------------------------------------------------------------------

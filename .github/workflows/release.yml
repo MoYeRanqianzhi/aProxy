@@ -273,6 +273,26 @@ jobs:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: bash npm/build-and-publish.sh
       - uses: dtolnay/rust-toolchain@stable
+      # publish job 是独立 checkout，Cargo.toml 是原始版本号——crates.io 按
+      # .crate 内 manifest 注册版本，不对齐会把无后缀正式号被测试 tag 抢注
+      # （alpha.10/alpha.11 就这么被占掉的）。与 build job 同款对齐逻辑。
+      - name: Align version with tag (publish)
+        shell: bash
+        run: |
+          python3 - <<'EOF'
+          import re, os
+          v = os.environ.get('GITHUB_REF_NAME', '')[1:]
+          assert v, "GITHUB_REF_NAME 为空（非 tag 触发？）"
+          toml = open('Cargo.toml', encoding='utf-8', newline='').read()
+          toml, n1 = re.subn(r'(^version = )"[^"]*"', r'\g<1>"%s"' % v, toml, count=1, flags=re.M)
+          assert n1 == 1, "Cargo.toml 中未找到 [package] version 行"
+          open('Cargo.toml', 'w', encoding='utf-8', newline='').write(toml)
+          lock = open('Cargo.lock', encoding='utf-8', newline='').read()
+          lock, n2 = re.subn(r'(name = "aproxy"\r?\nversion = )"[^"]*"', r'\g<1>"%s"' % v, lock)
+          assert n2 == 1, "Cargo.lock 中未找到唯一的 aproxy 版本行"
+          open('Cargo.lock', 'w', encoding='utf-8', newline='').write(lock)
+          print("version ->", v)
+          EOF
       - uses: rust-lang/crates-io-auth-action@v1.0.5
         id: crates-auth
       - name: Publish to crates.io

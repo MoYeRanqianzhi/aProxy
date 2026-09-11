@@ -323,8 +323,11 @@ async fn run_tail(
     }
 
     // ---- verifying：全实例版本==target 且已退出更换阶段。不满足（restarting
-    // 中用户新启的旧版本实例等竞态）→ 补 restart 一轮，仍不满足 → failed
-    super::state::advance_in(run_dir, state, InstallPhase::Verifying)?;
+    // 中用户新启的旧版本实例等竞态）→ 补 restart 一轮，仍不满足 → failed。
+    // 相位守卫：Cleaning 及以后的续作重入不回退重验（逆向迁移非法）
+    if state.phase < InstallPhase::Verifying {
+        super::state::advance_in(run_dir, state, InstallPhase::Verifying)?;
+    }
     for round in 0..2 {
         let mut bad = Vec::new();
         for port in &snapshot {
@@ -348,8 +351,11 @@ async fn run_tail(
 
     // ---- cleaning：删 .old（Windows；短重试吸收进程退出末尾的镜像锁残留
     // 窗口，仍被锁则保留待下次，绝不强杀）+ staging 清理（它是 swapping
-    // 中断的恢复源，done 后即无用）+ 入口脚本常驻不删（防线 0 是基础设施）
-    super::state::advance_in(run_dir, state, InstallPhase::Cleaning)?;
+    // 中断的恢复源，done 后即无用）+ 入口脚本常驻不删（防线 0 是基础设施）。
+    // 相位守卫：Cleaning 残留的续作重入不重复迁移
+    if state.phase < InstallPhase::Cleaning {
+        super::state::advance_in(run_dir, state, InstallPhase::Cleaning)?;
+    }
     if let Some(old) = &state.old_path {
         let mut removed = false;
         for attempt in 0..6 {

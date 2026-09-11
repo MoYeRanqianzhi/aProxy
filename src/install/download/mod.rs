@@ -177,7 +177,10 @@ impl DownloadCtx {
             .connect_timeout(std::time::Duration::from_secs(15))
             .timeout(std::time::Duration::from_secs(120));
         if let Some(proxy) = download_proxy {
-            let p = reqwest::Proxy::all(proxy).map_err(|e| format!("下载代理 URL 非法: {e}"))?;
+            // 代理 URL 可能内嵌凭据（user:pass@host）——错误信息打码（计划
+            // 定调：与 config --show 的 base_url 同一口径）
+            let p = reqwest::Proxy::all(proxy)
+                .map_err(|_| "下载代理 URL 非法（凭据已隐去）".to_string())?;
             builder = builder.proxy(p);
         }
         let client = builder

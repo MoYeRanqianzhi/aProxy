@@ -320,6 +320,38 @@ async fn corrupted_state_file_is_handled_cleanly() {
         .expect("损坏状态文件应被静默处置");
 }
 
+/// 恢复矩阵行「cleaning 残留（删除 .old 中崩溃）」→ 重入不回退重验
+/// （Cleaning → Verifying 逆向迁移会被状态机拒绝——相位守卫修复的回归），
+/// 重做清理即 done。
+#[tokio::test(flavor = "current_thread")]
+async fn crash_during_cleaning_resumes_without_backward_move() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let run_dir = home.join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let from = usable_from(home);
+    let bin = aproxy::install::swap::bin_path_in(home);
+    let old = aproxy::install::swap::old_path_in(home);
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &bin).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(&old, b"old-binary-residual").unwrap();
+    let mut state = crash_state(InstallPhase::Cleaning, &from, None);
+    state.old_path = Some(old.display().to_string());
+    aproxy::install::state::write_in(&run_dir, &mut state).unwrap();
+
+    aproxy::install::flow::continue_install(home, &run_dir)
+        .await
+        .expect("cleaning 残留续作应完成");
+    assert!(bin_works(home));
+    assert!(!old.exists(), ".old 应重做清理");
+    assert!(!aproxy::install::state::state_path_in(&run_dir).exists());
+}
+
 /// 恢复矩阵行「done 残留（清文件前崩溃）」→ 清文件即完成。
 #[tokio::test(flavor = "current_thread")]
 async fn done_residue_is_cleared() {

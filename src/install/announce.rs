@@ -48,7 +48,7 @@ pub struct Announcer {
     #[cfg(windows)]
     view: *mut std::ffi::c_void,
     #[cfg(not(windows))]
-    _keepalive: std::fs::File,
+    _keepalive: std::sync::Mutex<std::fs::File>,
 }
 
 // Windows 视图指针跨线程（beat 是原子 store）；unix 无共享字段
@@ -209,7 +209,9 @@ mod imp {
             .open(shm_path())
             .ok()?;
         write_content(&mut f, &ann);
-        Some(super::Announcer { _keepalive: f })
+        Some(super::Announcer {
+            _keepalive: std::sync::Mutex::new(f),
+        })
     }
 
     fn write_content(f: &mut std::fs::File, ann: &Announcement) {
@@ -223,13 +225,16 @@ mod imp {
     }
 
     pub fn store_announcement(a: &super::Announcer, ms: u64) {
-        write_content(
-            &mut &a._keepalive,
-            &Announcement {
-                installer_pid: std::process::id(),
-                heartbeat_ms: ms,
-            },
-        );
+        // 心跳写已打开的 fd（锁内短临界区；&Announcer 共享引用不可变借用）
+        if let Ok(mut f) = a._keepalive.lock() {
+            write_content(
+                &mut f,
+                &Announcement {
+                    installer_pid: std::process::id(),
+                    heartbeat_ms: ms,
+                },
+            );
+        }
     }
 
     pub fn load_announcement() -> Option<Announcement> {

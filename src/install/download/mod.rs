@@ -163,11 +163,17 @@ impl DownloadCtx {
             Some("baseline") => "",
             Some(other) => return Err(format!("未知变体 {other}（取值 v3 | baseline）")),
             None => {
-                if std::arch::is_x86_feature_detected!("avx2") {
+                // AVX2 检测仅 x86 可用（aarch64 等 target 上该宏编译失败——
+                // CI unix job 曾因此全红）；非 x86 目标恒 baseline
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                let variant = if std::arch::is_x86_feature_detected!("avx2") {
                     "-v3"
                 } else {
                     ""
-                }
+                };
+                #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+                let variant = "";
+                variant
             }
         };
         let mut builder = reqwest::Client::builder()

@@ -5,6 +5,7 @@
 //! 分支 CI check 覆盖编译面，行为面入 TODO unix 实测项。
 
 use std::path::Path;
+#[cfg(windows)]
 use std::process::Command;
 
 #[cfg(unix)]

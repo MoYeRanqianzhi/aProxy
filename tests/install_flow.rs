@@ -77,6 +77,8 @@ impl TestEnv {
 /// 轮询安装完成标志：状态文件**先出现（installer 抢锁）后消失（done 清场）**。
 /// 两段缺一不可——直接等「消失」有启动竞态：installer 尚未 create_new 时
 /// state 也不存在，会被误判为已完成（实测三轮 1.6s 假通过的根源）。
+/// 调用方均为 Windows 滚动升级测试（unix 无实例滚动路径待实测项）
+#[cfg(windows)]
 fn wait_install_done(env: &TestEnv, timeout: Duration) -> bool {
     let state = aproxy::install::state::state_path_in(&env.home().join("run"));
     let deadline = Instant::now() + timeout;

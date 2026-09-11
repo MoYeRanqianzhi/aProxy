@@ -31,3 +31,4 @@ desktop.ini
 # npm 渠道组包产物（npm/build-and-publish.sh 生成，不进 git）
 /npm/@meowo/
 /.npm-assets/
+.worktree/

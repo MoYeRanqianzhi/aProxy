@@ -452,7 +452,9 @@ mod tests {
                 "https://m/{version}/{asset}/{target}/{variant}",
                 Artifact::Binary
             ),
-            format!("https://m/0.1.0-alpha.9/aproxy-x86_64-pc-windows-msvc-v3{exe}/x86_64-pc-windows-msvc/-v3")
+            format!(
+                "https://m/0.1.0-alpha.9/aproxy-x86_64-pc-windows-msvc-v3{exe}/x86_64-pc-windows-msvc/-v3"
+            )
         );
     }
 

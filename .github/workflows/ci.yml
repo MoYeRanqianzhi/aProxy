@@ -33,10 +33,9 @@ jobs:
       - run: cargo test --locked --verbose
 
   unix:
-    # unix 分支（UDS IPC、spawn 路径）从未实测过——先保证可编译。
-    # 升级为 cargo test 的前置是「unix 分支实测」（见 .agents/TODO.md）：
-    # 直接开跑大概率爆出未适配的测试（Windows 专属 #[cfg] 测试之外的
-    # 真实行为差异），先把可编译基线钉住。
+    # unix 分支已在 Ubuntu/WSL 实测全绿（2026-09-11，见团队记忆
+    # install-three-platform-e2e）——CI 从编译面 check 升级为真实测试门槛，
+    # 防止 unix-only 代码的编译/行为回归再次溜进 main。
     strategy:
       fail-fast: false
       matrix:
@@ -46,4 +45,4 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.2
-      - run: cargo check --all-targets --locked
+      - run: cargo test --locked

@@ -106,6 +106,16 @@
   IPC 消失≠进程终止（新增 process_exited 退出码判死）、10s 宽限强退竞速、
   tokio runtime drop 等无限任务须硬退、fallback bat 空窗验证通过。
   坑与教训：.agents/memory/2026-09-11-install-pitfalls.md
+- [x] **install 三平台深审查实测**（2026-09-11，090ea90 前后提交链）：Windows/
+  Ubuntu(ssh remote)/WSL(Debian) 三平台全量测试 + CLI 级 e2e 全绿（Windows
+  24/24、两 Linux 各 26/26）。实测挖出并修复 5 个真 bug：unix 编译面×2
+  （announce E0596、is_x86_feature_detected aarch64）、平台硬编码测试×2、
+  库层 IPC 环境依赖泄漏（run_dir 参数被全局 env 派生架空 + 误删注册表副作用）、
+  有实例 Acked/Swapping 续作被状态机拒绝（相位守卫）。CI unix job 同步升级
+  为 cargo test。CI 首次暴露流程教训：push 后必须 gh run list 确认绿。
+  详录 .agents/memory/2026-09-11-install-three-platform-e2e.md
+- [ ] **测试稳定性**：proxy_integration 的 alias_start_and_stop_roundtrip
+  偶发并行失败（单跑必过——端口/时序竞争，本轮全量跑撞上一次）
 - [x] **渠道 P0 全配 + 可信发布自动化**（2026-09-11，alpha.7~9 三轮发布实测）：
   npm（@meowo/aproxy，esbuild 式多平台包：主包 JS 转发器 + 9 平台子包
   os/cpu/libc 装配）、crates.io（aproxy）、cargo-binstall（零配置命中内置

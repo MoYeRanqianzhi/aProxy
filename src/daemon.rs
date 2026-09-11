@@ -580,7 +580,7 @@ pub async fn list_instances_in(dir: &std::path::Path) -> Vec<InstanceInfo> {
             continue;
         };
         let port = port_of(&info.listen_addr).to_string();
-        match ipc_ping(&port).await {
+        match ipc_ping_in(dir, &port).await {
             // ping 响应携带实例的实时信息（含 last_activity_secs）——注册表
             // .pid 是启动时刻的快照，闲置判定/展示必须用实时值，否则活动
             // 时间永远停留在启动时刻、闲置=运行时长（实测踩坑）

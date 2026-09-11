@@ -99,7 +99,7 @@ async fn continue_from_restarting_reclaims_instance() {
 
     // 真实广播：实例置入 swap_phase（swapping 前的 ACK 形态）——续作 restart
     // 不得跳过它（跳过条件要求 !swap_phase）
-    aproxy::install::broadcast::ack_one(&port.to_string())
+    aproxy::install::broadcast::ack_one(&run_dir, &port.to_string())
         .await
         .expect("PrepareSwap 广播应成功");
 

@@ -15,13 +15,17 @@ use std::time::Duration;
 
 /// 单实例 ACK 判定：PrepareSwap 响应 ok 且 swap_phase == true。
 /// 内部 3 次探测（间隔 500ms）吸收命名管道瞬时 busy 等瞬态失败。
-pub async fn ack_one(port: &str) -> Result<(), String> {
+/// unix 端点按显式 run_dir 派生（与库层其他 IPC 调用同一纪律）。
+pub async fn ack_one(run_dir: &Path, port: &str) -> Result<(), String> {
+    let endpoint = crate::daemon::endpoint_for_in(run_dir, port);
     let mut last = String::new();
     for attempt in 0..3 {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        match crate::daemon::ipc_request(port, &crate::daemon::IpcRequest::PrepareSwap).await {
+        match crate::daemon::ipc_request_to(&endpoint, &crate::daemon::IpcRequest::PrepareSwap)
+            .await
+        {
             // 响应里的 info 是实例置位后组装的——ok 即 ACK 完成
             Ok(resp) if resp.ok => {
                 return Ok(());
@@ -42,7 +46,7 @@ pub async fn broadcast_prepare_swap(run_dir: &Path, ports: &[String]) -> Result<
     for round in 0..3 {
         unacked.clear();
         for port in ports {
-            if ack_one(port).await.is_err() {
+            if ack_one(run_dir, port).await.is_err() {
                 unacked.push(port.clone());
             }
         }
@@ -71,7 +75,8 @@ mod tests {
     #[tokio::test]
     async fn ack_one_fails_cleanly_on_dead_port() {
         // 无实例的端口：PrepareSwap 不可达 → 未 ACK（不发火、不 panic）
-        assert!(ack_one("59987").await.is_err());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(ack_one(dir.path(), "59987").await.is_err());
     }
 
     #[tokio::test]

@@ -123,6 +123,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
         with:
           key: ${{ matrix.target }}${{ matrix.variant }}
+      # 版本对齐（测试 tag 与正式 tag 同样生效）：产物自报版本必须等于
+      # tag 版本——staged 自证（install 的 --version 校验）、npm 包 version、
+      # crates.io 注册版本全部以此为准。缺失此步时 tag v…t1 发布的产物
+      # 仍是 Cargo.toml 里的旧版本号，install 特定版本的全渠道自证全炸
+      # （实测暴露），且 crates.io 会按旧版本号注册、污染正式版号。
+      - name: Align version with tag
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = \".*\"/version = \"${V}\"/" Cargo.toml
+          python3 - <<'EOF'
+          import re
+          ver = re.search(r'^version = "(.*)"', open('Cargo.toml').read(), re.M).group(1)
+          lock = open('Cargo.lock').read()
+          lock, n = re.subn(r'(name = "aproxy"\nversion = )"[^"]*"', r'\g<1>"%s"' % ver, lock)
+          assert n == 1, "Cargo.lock 中未找到唯一的 aproxy 版本行"
+          open('Cargo.lock', 'w').write(lock)
+          EOF
       - name: Build
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}

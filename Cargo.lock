@@ -69,7 +69,7 @@ dependencies = [
 
 [[package]]
 name = "aproxy"
-version = "0.1.0-alpha.10"
+version = "0.1.0-alpha.11"
 dependencies = [
  "axum",
  "bytes",

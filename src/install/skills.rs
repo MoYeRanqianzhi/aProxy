@@ -11,7 +11,7 @@
 //! rename 进 → 删旧；Windows 上 agent 正读 skill 文件的冲突短重试。
 
 use super::download::{self, Artifact, DownloadCtx};
-use crate::install::state::{SkillPhase, SkillState};
+use crate::install::state::SkillPhase;
 use std::path::{Path, PathBuf};
 
 /// skill 安装目录：`~/.aproxy/skills/aproxy-cli/`（agent 侧目录归各 agent

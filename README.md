@@ -42,7 +42,7 @@ rem Windows (cmd 兜底)
 curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.cmd -o install.cmd && install.cmd
 ```
 
-升级：替换二进制后 `aproxy install` 自动滚动重启实例（后续版本提供）；当前版本手动三步——`aproxy stop all` → 覆盖二进制 → `aproxy restore`。
+升级：`aproxy install`（在线下载链条自动滚动重启，逐实例无感；`--from <路径>` 本地安装、`--adopt` 收编既有安装）。手动兜底：`aproxy stop all` → 覆盖二进制 → `aproxy restore`。
 
 源码构建：
 

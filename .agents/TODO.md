@@ -94,10 +94,18 @@
 
 - [ ] **正式发布：GitHub 构建指令集多版本**（必然项，2026-09-07 定调）：CI 矩阵 baseline + `RUSTFLAGS="-C target-cpu=x86-64-v3"`（AVX2），产物命名区分，发布页两者都放；详见 memory/release-engineering
 - [ ] **H.（可选）配置热重载**：IPC reload，避免 restart 断流（改配置生效目前用 restart，已有单命令路径）
-- [ ] **install/upgrade 二进制安装升级**（计划已批准，2026-09-09）：完整计划
-  `.agents/plan/install-v1.md`——状态机 + 断电恢复矩阵 + PrepareSwap 广播
-  ACK + Windows rename 接力 + 渠道矩阵（--from/GH/cargo/npm/包管理器全配置）；
-  发布 workflow 已就绪（e5136fc），**渠道 P0 全部上线（2026-09-11，见下条）**
+- [x] **install/upgrade 二进制安装升级**（2026-09-11 完成，alpha.10）：完整计划
+  `.agents/plan/install-v1.md` 十步全部落地——APROXY_HOME 重定向/状态机/
+  staging/交换原语（Windows 双 rename 舞 + PATHEXT fallback）/PrepareSwap
+  广播 + 安装态宣告节 + 看护者差异化/滚动重启/恢复续作（崩溃注入测试
+  全矩阵）/下载链条（github+sha256/npm+integrity/binstall/cargo + url 模板
+  + 下载代理分离）/skill 支线（并行 + 原子落位 + 路径穿越防护）。
+  CLI：`install [latest|版本]`、`--from/--adopt/--skills-only/--abort/
+  --no-skills/--variant/--allow-downgrade/--download-proxy`。
+  实测挖出并修复的深层 bug：守护优雅退出删 .restore（restart 须先取参数）、
+  IPC 消失≠进程终止（新增 process_exited 退出码判死）、10s 宽限强退竞速、
+  tokio runtime drop 等无限任务须硬退、fallback bat 空窗验证通过。
+  坑与教训：.agents/memory/2026-09-11-install-pitfalls.md
 - [x] **渠道 P0 全配 + 可信发布自动化**（2026-09-11，alpha.7~9 三轮发布实测）：
   npm（@meowo/aproxy，esbuild 式多平台包：主包 JS 转发器 + 9 平台子包
   os/cpu/libc 装配）、crates.io（aproxy）、cargo-binstall（零配置命中内置

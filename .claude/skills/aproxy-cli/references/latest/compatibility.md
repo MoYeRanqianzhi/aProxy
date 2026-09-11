@@ -16,9 +16,27 @@ aproxy status               # 每行 v<semver> = 各实例实际运行的守护�
 
 | 项 | 值 |
 |---|---|
-| 文档适用版本 | **0.1.0-alpha.7**（含 alpha.4→alpha.7 引入的全部行为） |
+| 文档适用版本 | **0.1.0-alpha.10**（含 alpha.4→alpha.10 引入的全部行为） |
 | 代码版本坐标 | Cargo.toml `version` 字段；alpha 线于 2026-09 发布 |
 | 大版本线 | 0.1.x（0.1 系列内小版本不另开目录，直接更新 latest/ 文档） |
+
+## alpha.10 关键行为（相对 alpha.9 及更早）
+
+- **install/upgrade 命令引入**（`--from/--adopt/--skills-only/--abort` 及在线
+  渠道）：本版本起可用。更早版本的二进制没有 install——升级到 alpha.10 用
+  引导脚本重装或手动替换二进制
+- **APROXY_HOME 环境变量**：config/settings/run/logs/spool/bin/staging 全部
+  相对该主目录派生（未设 = `~/.aproxy`，行为不变）；APROXY_RUN_DIR 仍独立
+  可覆盖（粒度优先）
+- **install.state 残留语义**：`~/.aproxy/run/install.state` 存在 = 有未完成
+  的安装——看护者/CLI 入口会自动拉起续作（全自动）。**不要手删**；确认要
+  放弃用 `aproxy install --abort`
+- **混版本舰队收敛**：install 广播 PrepareSwap 后，旧版本实例（无此 op）
+  未表达 = 未 ACK，install 按轮次 restart 它们（用安装器自身 exe）——舰队
+  自动收敛到安装器版本
+- settings.json 新字段：`download_chain`（下载链条严格数组）、
+  `skill_auto_update`（默认 true）、`download_proxy`（下载代理）——全部
+  serde default，旧文件缺字段读默认，升级无感
 
 ## alpha.6 关键行为（相对 alpha.5 及更早）
 

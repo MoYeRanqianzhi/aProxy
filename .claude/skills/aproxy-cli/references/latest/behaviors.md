@@ -154,6 +154,37 @@ IPC 通道故障（启动失败）只影响管理命令，代理转发继续（�
 对自带重试的客户端（Claude Code 等）表现为「卡一下」而非「会话死了」。
 升级二进制后请一并重启看护者（旧看护者会用旧 exe 重拉实例）。
 
+## 二进制更换阶段（install 运行期）
+
+`aproxy install` 滚动重启期间，正在换血的实例经 IPC 广播进入「二进制更换
+阶段」——`aproxy status` 对该实例显示「二进制更换中」，且语义为：
+- 该实例随时会被 stop + 新二进制重拉（秒级窗口）
+- **外部不要在此窗口 stop/kill 该实例**（与 install 拉锯）
+- 看门狗进入差异化模式：此窗口内的实例死亡先复查 5×3s 等回归（install 主动
+  重启的正常形态），复查耗尽才走重拉；install 自身挂死由看护者保活续作；
+  守护自检补种被抑制（防旧版本看护者复活拉锯）
+- ACK 失败处置：某实例多轮未表达「进入更换阶段」= 该实例有隐患（旧版本/
+  故障），install 会先按轮次 restart 收敛（顺带拉到安装器版本）；终失败则
+  abort 安装并明确指出问题实例——**不强杀**（绝对避免服务中断）。skill 指引：
+  将该实例关闭后重试安装
+
+## skill 文档更新（install 支线）
+
+install 时随二进制**并行**更新 `~/.aproxy/skills/aproxy-cli/`（与二进制同一
+版本 tag）。非强制：下载失败重试后放弃，**安装照常成功**；子状态在
+install.state 的 `skill` 字段可查。`--skills-only` 单独更新。安装到 agent 侧
+（如 `~/.claude/skills/`）由用户/agent 自行链接——install 不越界触碰各 agent
+目录。`--continue` 续作时 failed 不自动重试（避免每次续作拖一遍下载）。
+
+## 下载代理（≠ 请求代理）
+
+两套代理严格分离，勿混淆：
+- **请求代理**：config.toml 的 `proxy`——管**上游 API 转发**
+- **下载代理**：settings.json 的 `download_proxy` / `aproxy install
+  --download-proxy`——只管 **install 的下载**（二进制/skill）
+- 两者都未配置时 install 回退环境变量（HTTPS_PROXY 等系统代理），用户零
+  配置可用；错误信息与 `config --show` 同样对内嵌凭据打码
+
 ## 排障速查
 
 | 症状 | 原因与处理 |

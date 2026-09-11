@@ -17,3 +17,5 @@
 - [identity-no-name](memory/2026-09-10-identity-no-name.md) — 用户定调：进程身份判定严禁依赖二进制名称（严重谬误）；正确锚点=spawn 链/IPC 端点归属/创建时间戳；机制替换方案与范围（A 本分支全换/B 独立成支）待批，重构稿在 stash@{0} [[unix-stress-review]] [[criticism-not-authorization]]
 - [criticism-not-authorization](memory/2026-09-10-criticism-not-authorization.md) — 教训：用户批评 ≠ 实施授权，先对齐修正方案再动手；平台共享语义重构不塞进单平台修复分支；方向稿 stash 留档规范 [[identity-no-name]]
 - [trusted-publishing-p0](memory/2026-09-11-trusted-publishing-p0.md) — 渠道 P0 落地：npm(@meowo 10 包)/crates.io/binstall 全自动 OIDC 发布（tag 即发）；关键坑：npm GAT IP 白名单杀 CI token 路径、npm TP 绑定强制人类 2FA 而 crates.io 有 API、cargo include 前导 / 锚定 [[daemon-model]]
+- [安全铁则：绝不按名杀 aproxy.exe](memory/2026-09-11-never-kill-aproxy-by-name.md) — 2026-09-11 实际事故：记忆 pid 过期+会话经 aproxy 代理，批量杀=断用户会话；测试守护只走 APROXY_HOME+stop <端口>
+- [install 实测深坑集](memory/2026-09-11-install-pitfalls.md) — tokio runtime drop 等无限任务须硬退/IPC 消失≠进程终止（退出码判死）/spawn_detached 只继承父 env（库层测试须 set_var）/测试端口 bind 试探+两段等待

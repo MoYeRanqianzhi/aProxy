@@ -31,7 +31,7 @@
 | `watchdog_heartbeat_secs` | u64 | 30 | 看护扫描周期（调优） |
 | `watchdog_stale_after_cycles` | u64 | 1 | 挂死容忍周期数（误杀调节阀） |
 | `watchdog_max_restarts` | u32 | 5 | crashloop 放弃上限 |
-| `watchdog_idle_exit_secs` | u64 | 300 | 闲置自灭等待；0=常驻 |
+| `watchdog_idle_exit_secs`、`download_chain`、`skill_auto_update`、`download_proxy` | u64 | 300 | 闲置自灭等待；0=常驻 |
 
 ## 各字段语义
 
@@ -98,6 +98,26 @@
   等待秒数；0 = 永不自灭（常驻）。
 
 行为细节见 behaviors.md 看门狗节。
+
+### download_chain（下载链条，install 用）
+
+`aproxy install` 获取产物的有序尝试链。**未配置 = 内置默认链**
+`["github", "npm", "cargo-binstall", "cargo"]`；**配置后完全按数组执行，
+绝不自动追加默认项**（严格数组语义，与 config_dirs 相反）——写少了会增加
+失败概率，建议写全。元素为渠道名字符串或 url 模板对象（占位符
+`{version}/{asset}/{target}/{variant}`）；jsDelivr 等国内可达 CDN 自行填入，
+代码不内置任何 CDN 域名。
+
+### skill_auto_update
+
+默认 `true`。install 时随二进制并行更新 `~/.aproxy/skills/aproxy-cli/`；
+`false` 时完全跳过（单次跳过用 `--no-skills`，单独更新用 `--skills-only`）。
+
+### download_proxy
+
+install 下载专用代理（与 config.toml 的 `proxy` 上游请求代理**绝对分离**）。
+未配置回退环境代理；单次覆盖用 `aproxy install --download-proxy <URL>`。
+含凭据的 URL 在错误信息中打码。
 
 ## 与 config.toml 的分层关系
 

@@ -189,6 +189,60 @@ aproxy config --clear-default
 注意：修改 toml 的 config 命令**不会重启已运行实例**——用 `aproxy restart <端口>`
 使修改生效。
 
+## install / upgrade
+
+`aproxy install`（`upgrade` 为别名）：把 aProxy 安全安装/升级到规范位置
+`~/.aproxy/bin/aproxy.exe`，全程对客户端 ≈ 无感（逐实例滚动重启，任一时刻
+至多一个实例在重启，status 中该实例显示「二进制更换中」）。
+
+```
+aproxy install [latest|版本]        # 在线安装：下载链条 github→npm→cargo-binstall→cargo
+aproxy install --from <二进制路径>   # 从本地文件安装（--version 自报版本即目标）
+aproxy install --adopt              # 收编：包管理器/npm 装的 aProxy 迁到标准位置
+aproxy install --abort              # 中止进行中的安装（仅交换开始前可回滚）
+aproxy install --skills-only        # 只更新 skill 文档，不动二进制
+```
+
+参数：
+- `--variant v3|baseline`：手动指定指令集变体（默认运行时检测 AVX2）
+- `--allow-downgrade`：目标版本低于当前时默认拒绝，此开关放行
+- `--download-proxy <URL>`：仅本次下载用的代理（**与 config.toml 的请求代理
+  绝对分离**——后者管上游转发，前者只管 install 下载）
+- `--no-skills`：本次跳过 skill 文档更新（全局开关 settings 的 skill_auto_update）
+
+版本语义：`latest` = GitHub Releases 最新（<1.0 时代含 prerelease）。目标版本
+经下载链条获取后先 `--version` 试跑自证（自报必须等于目标），再走交换；
+github 渠道另有 `.sha256` 强校验、npm 渠道有 registry integrity 校验。
+
+下载链条（settings `download_chain` 可配，**严格数组语义**：配置后完全按
+数组执行，不自动补默认项，建议写全）：
+```json
+"download_chain": ["github", "npm", {"url": "https://mirror.example/{version}/{asset}"}]
+```
+url 模板占位符：`{version}/{asset}/{target}/{variant}`（jsDelivr 等国内可达
+CDN 可自行填入；代码不内置任何 CDN 域名）。未配置 = 内置默认链。
+
+## 恢复自动化（install 中断）
+
+安装每一步都先写进度（`~/.aproxy/run/install.state`）再执行——崩溃/断电/强杀
+后**自动续作，无人工询问**：
+- 主责：看护者启动时与每日一次发现残留 → 自动拉起 `install --continue`
+- 兜底：任何 aproxy 命令入口读到残留 → 静默拉起续作（本命令照常执行）
+- Windows 接力：交换后旧镜像进程自动退出，新二进制进程接管剩余阶段
+- `install.state` 残留 ≠ 完成残留——done/aborted 时文件即删除
+
+`--abort` 仅在二进制交换**开始前**可完全回滚；此后只进不退（实例可能已开始
+滚动），中断的安装会自动续作完成。
+
+**手动修复（最后防线，仅 CLI 全失效时）**——swapping 空窗（bin 里只剩
+`aproxy.old.exe`）时所有 aproxy 命令无处可落，按序尝试（全部是文件操作）：
+1. `~/.aproxy/staging/<版本>/aproxy.exe` 仍在 → **复制**到 `~/.aproxy/bin/aproxy.exe`
+2. staging 也没了 → `bin/aproxy.old.exe` 改名回 `aproxy.exe`（旧版本可用优先），重跑 `aproxy install`
+3. 两者皆失 → GitHub Releases 重新下载或 `--from` 任意可用二进制
+
+**手动更新兜底（install 反复失败时，有服务中断，仅作最后手段）**：
+`aproxy stop all` → 替换 `~/.aproxy/bin/aproxy.exe` → `aproxy restore`。
+
 ## 退出码与输出约定
 
 - 成功 0；用户可修复的错误（配置错误、未知别名、多实例未指定 target、端口

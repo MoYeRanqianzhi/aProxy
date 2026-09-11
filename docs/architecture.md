@@ -155,6 +155,37 @@ config_dirs、日志轮转阈值、空闲阈值与上述两个字段的全局默
 - 孤儿清理：`status` 时删除既无存活实例也无 `.restore` 的端口日志
 - 全部输出对凭据打码（api_key/头值/代理密码/base_url 内嵌密码）——可安全粘贴分享
 
+## 安装与升级（install）
+
+`aproxy install` 把二进制安全落位到 `~/.aproxy/bin/`，对客户端 ≈ 无感。
+四条铁律：先标记（install.state 先于一切动作，崩溃可识别）、先下载后
+rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC PrepareSwap
+广播，实例置位自己的可观测状态 swap_phase）、逐个重启最后删除（.old 在
+终验后清理）。模块 `src/install/`：
+
+- **state**：状态文件即安装锁（run/ 下，原子重写，updated_at 自动刷新供
+  接力存活判据）；阶段状态机线性主线 + failed/aborted 旁路，abort 仅
+  swapping 前可回滚
+- **staging**：备料区（复制/chmod/sha256/`--version` 试跑自证）
+- **swap**：平台收口点——Windows copy+双 rename 舞（bin 永不空窗 + .old
+  固定名 + PATHEXT fallback 入口脚本常驻）；unix 单步 rename 原子覆盖
+  （无空窗无 .old）
+- **announce**：安装态宣告节（Windows 命名节 / unix /dev/shm，进程退出即
+  解除）——看护者/守护的差异化行为全部由它门控：实例死亡复查 5×3s、
+  install 保活续作、守护自检补种抑制
+- **flow**：编排（管辖检查 → 备料 → 广播 ACK → 交换 → Windows 接力交棒 →
+  滚动重启 → 终验 → 清理）；任何中断点由 `--continue` 幂等续作
+  （恢复矩阵：看护者主责 + CLI 入口兜底，全自动无询问）
+- **download**：有序下载链条 github → npm → cargo-binstall → cargo
+  （settings download_chain 严格数组可配 + url 模板通道，CDN 域名不硬
+  编码）；github=.sha256 强校验、npm=integrity 强校验（跟随 ~/.npmrc
+  镜像）、cargo=本地编译自证；下载代理（download_proxy/--download-proxy）
+  与上游请求代理绝对分离
+- **skills**：skill 文档支线（并行下载、失败不影响安装、原子目录替换）
+
+跨平台分工：状态机/IPC/恢复全部平台无关，平台分支只收口在交换原语、
+宣告节介质、可执行位三处。
+
 ## 测试
 
 - 单元测试 107 个（lib）+ 4 个（bin）：重试判定、配置分层、IPC 协议、注册表/恢复记录、打码、claim 选举、退避状态机

@@ -51,10 +51,17 @@ pub fn for_inspection(content_encoding: Option<&str>, body: &[u8]) -> Option<Vec
     if encoding.is_empty() || encoding.eq_ignore_ascii_case("identity") {
         return None;
     }
-    // 多层编码按逆序解：`gzip, br` 表示先 gzip 后 br，故先解 br 再解 gzip
-    let mut data: Vec<u8> = body.to_vec();
-    for layer in encoding.split(',').rev() {
-        data = decode_one(layer.trim(), &data)?;
+    // 多层编码按逆序解：`gzip, br` 表示先 gzip 后 br，故先解 br 再解 gzip。
+    // 首层直接在原始字节上解——单层是绝对常态，这样能省掉一次整体拷贝
+    //（压缩体可达 1 MiB，且首轮判定对**每个**响应都要跑一遍）。
+    let mut layers = encoding
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .rev();
+    let mut data = decode_one(layers.next()?, body)?;
+    for layer in layers {
+        data = decode_one(layer, &data)?;
     }
     Some(data)
 }

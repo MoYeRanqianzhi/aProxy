@@ -950,12 +950,23 @@ fn should_retry_response(
     raw_headers: &reqwest::header::HeaderMap,
     body: &[u8],
 ) -> bool {
+    // 压缩响应体（上游按客户端 accept-encoding 压缩，而 reqwest 为保真透传刻意
+    // 不解压）在**原始字节**上做任何内容判定都是无效的：JSON 解析与 SSE 行扫描
+    // 会静默失败，预览只能打 hex。故检查一律走解码副本——转发给客户端的字节
+    // 不受影响（`decode` 模块文档记录了这组失效的完整清单与事故由来）。
+    // 无 content-encoding 时 for_inspection 立即返回 None，不产生任何拷贝。
+    let inspected = crate::decode::for_inspection(
+        header_opt(raw_headers, http::header::CONTENT_ENCODING),
+        body,
+    );
+    let body = inspected.as_deref().unwrap_or(body);
+
     let is_streaming = retry::is_streaming_response(raw_headers, body);
 
     // 1. HTTP 状态码可重试：无论是否流式，都重试
     if retry::is_retryable_status(status.as_u16()) {
         tracing::warn!(attempt, status = %status, is_streaming, "上游返回可重试状态码，重试");
-        tracing::warn!(preview = %preview_body(body, 500), "错误响应预览");
+        warn_preview(raw_headers, body, 500);
         return true;
     }
 
@@ -967,7 +978,8 @@ fn should_retry_response(
         retry::is_error_body(body)
     };
     if is_error {
-        tracing::warn!(attempt, is_streaming, preview = %preview_body(body, 1000), "上游返回错误内容，重试");
+        tracing::warn!(attempt, is_streaming, "上游返回错误内容，重试");
+        warn_preview(raw_headers, body, 1000);
         return true;
     }
 
@@ -985,26 +997,63 @@ fn should_retry_response_disk(
 ) -> bool {
     let is_streaming = retry::is_streaming_content_type(raw_headers);
 
+    // 预览用解码：头部快照正是压缩流的开头，解出的前缀足以看清错误页内容
+    //（截断流取已解出部分）。**判定**不在此列——`scan_error` 来自原始字节的
+    // 增量扫描结论；为 >1 MiB 的响应改造成流式解码，收益与风险不成比例，
+    // 见 `decode` 模块文档的「已知边界」。
+    let inspected = crate::decode::for_inspection(
+        header_opt(raw_headers, http::header::CONTENT_ENCODING),
+        head_snapshot,
+    );
+    let head = inspected.as_deref().unwrap_or(head_snapshot);
+
     // 1. HTTP 状态码可重试：无论是否流式，都重试
     if retry::is_retryable_status(status.as_u16()) {
         tracing::warn!(attempt, status = %status, is_streaming, "上游返回可重试状态码，重试");
-        tracing::warn!(preview = %preview_body(head_snapshot, 500), "错误响应预览");
+        warn_preview(raw_headers, head, 500);
         return true;
     }
 
     // 2. 内容错误：增量扫描结论（SSE data 行 / NDJSON 行级判定）
     if scan_error {
-        tracing::warn!(attempt, is_streaming, preview = %preview_body(head_snapshot, 1000), "上游返回错误内容，重试");
+        tracing::warn!(attempt, is_streaming, "上游返回错误内容，重试");
+        warn_preview(raw_headers, head, 1000);
         return true;
     }
 
     false
 }
 
-/// 错误响应体的日志预览。上游可能返回压缩/二进制错误体（如 zstd/gzip 压缩的
-/// 错误页——reqwest 未开自动解压以保真透传），直接 from_utf8_lossy 会把控制
-/// 字节渲染成整片乱码污染日志。判定：替换符/控制字符占比超阈值视为二进制，
-/// 改为 hex 摘要（可直接识别压缩 magic：zstd 28 b5 2f fd、gzip 1f 8b 等）。
+/// 取响应头值的字符串视图；缺失或非 UTF-8 → `None`。
+/// 保留 `None`（而非直接给占位符）是因为调用方需要区分「有没有这个头」——
+/// 解码与否正取决于此（`"-"` 会被当成一个未知编码）。
+fn header_opt(
+    headers: &reqwest::header::HeaderMap,
+    name: http::header::HeaderName,
+) -> Option<&str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// 错误响应预览日志：预览内容 + `content-type` / `content-encoding`。
+///
+/// 两个头在任何情况下都打——**解码失败退化为 hex 摘要时，它们正是判断「上游
+/// 到底回了什么」的关键线索**：brotli 没有 magic number，光看字节连「这是压缩体」
+/// 都认不出（2026-09-14 事故：Cloudflare 的 brotli 404 页在日志里只剩一串 hex）。
+/// 缺失时以 `"-"` 占位，日志字段不留空以便 grep 与扫读。
+fn warn_preview(raw_headers: &reqwest::header::HeaderMap, body: &[u8], limit: usize) {
+    tracing::warn!(
+        content_type = %header_opt(raw_headers, http::header::CONTENT_TYPE).unwrap_or("-"),
+        content_encoding = %header_opt(raw_headers, http::header::CONTENT_ENCODING).unwrap_or("-"),
+        preview = %preview_body(body, limit),
+        "错误响应预览"
+    );
+}
+
+/// 错误响应体的日志预览。**压缩体已在调用方按 `content-encoding` 解码**
+/// （见 `decode` 模块），走到这里的是解不出的、本就二进制/压缩但编码未知的体；
+/// 直接 from_utf8_lossy 会把控制字节渲染成整片乱码污染日志。判定：替换符/控制
+/// 字符占比超阈值视为二进制，改为 hex 摘要（hex 可识别压缩 magic：zstd
+/// 28 b5 2f fd、gzip 1f 8b 等，据此判断解码为何没成功）。
 fn preview_body(body: &[u8], limit: usize) -> String {
     let head = &body[..body.len().min(limit)];
     // lossy 渲染后统计非文本占比：U+FFFD 与 C0 控制字符
@@ -1814,5 +1863,86 @@ mod tests {
             "合法 override 应正常生效"
         );
         assert!(headers.get("x-bad-val").is_none(), "非法头值应跳过");
+    }
+
+    // ---- 压缩响应体：检查必须走解码副本 ----
+    //
+    // 上游按客户端 accept-encoding 压缩响应，而 reqwest 为保真透传刻意不解压，
+    // 于是判定与预览都跑在压缩字节上——JSON 解析必然失败、SSE 行扫描全失效、
+    // 预览只剩 hex。2026-09-14 由 opencode.ai 的 brotli 404 页实测暴露。
+
+    /// 构造带 content-encoding 的响应头（判定只看这一个头）
+    fn headers_with_encoding(encoding: &str) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(reqwest::header::CONTENT_ENCODING, encoding.parse().unwrap());
+        h
+    }
+
+    fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn compressed_error_json_with_200_is_retried() {
+        // 回归：压缩后「200 携带 error JSON」曾完全检测不到——状态码 200 不触发
+        // 重试，而 is_error_body 对压缩字节解析 JSON 必然失败
+        let payload = br#"{"type":"error","error":{"type":"overloaded_error"}}"#;
+        let headers = headers_with_encoding("gzip");
+        assert!(
+            should_retry_response(1, &StatusCode::OK, &headers, &gzip_bytes(payload)),
+            "gzip 压缩的错误 JSON（HTTP 200）必须判定为需重试"
+        );
+        // 反向锚定：同一份 payload 不压缩时本就命中——证明样本有效，断言不是恒真
+        assert!(
+            should_retry_response(
+                1,
+                &StatusCode::OK,
+                &reqwest::header::HeaderMap::new(),
+                payload
+            ),
+            "未压缩的同一 payload 必须命中（样本有效性锚点）"
+        );
+    }
+
+    #[test]
+    fn brotli_cloudflare_404_page_is_retried_and_readable() {
+        // 事故原形：Cloudflare 对不存在的路径返回 **brotli** 压缩的 HTML 404 页。
+        // brotli 没有 magic number，日志里只剩一串 hex，连「是压缩体」都认不出
+        let page = b"<!DOCTYPE html><html><head><title>404 Not Found</title></head>\
+<body><h1>404 Not Found</h1></body></html>";
+        let mut enc = brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22);
+        std::io::Write::write_all(&mut enc, page).unwrap();
+        let compressed = enc.into_inner();
+
+        let mut headers = headers_with_encoding("br");
+        headers.insert(reqwest::header::CONTENT_TYPE, "text/html".parse().unwrap());
+        assert!(
+            should_retry_response(1, &StatusCode::NOT_FOUND, &headers, &compressed),
+            "404 必须重试"
+        );
+
+        // 修复目标本身：预览必须读得出正文（此前只剩 hex 摘要）
+        let decoded = crate::decode::for_inspection(Some("br"), &compressed)
+            .expect("br 应可解码（检查副本）");
+        let preview = preview_body(&decoded, 500);
+        assert!(
+            preview.contains("404 Not Found"),
+            "预览应含 404 页正文，实际: {preview}"
+        );
+    }
+
+    #[test]
+    fn uncompressed_responses_are_judged_without_decoding() {
+        // 无 content-encoding 时不得解码（否则是一次无谓的整体拷贝）：
+        // 传入「看起来像压缩体」的明文字节，判定仍按明文语义走
+        let plain = br#"{"content":"hello"}"#;
+        assert!(!should_retry_response(
+            1,
+            &StatusCode::OK,
+            &reqwest::header::HeaderMap::new(),
+            plain
+        ));
     }
 }

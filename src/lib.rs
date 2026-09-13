@@ -1,5 +1,6 @@
 pub mod config;
 pub mod daemon;
+pub mod decode;
 pub mod doctor;
 pub mod find;
 pub mod install;

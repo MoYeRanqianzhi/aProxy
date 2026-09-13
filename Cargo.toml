@@ -45,6 +45,12 @@ flate2 = "1"
 semver = "1"
 # skill 更新支线：GitHub skills 资产的 zip 解包
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# 响应体检查用解码器（src/decode.rs）：把压缩响应解出一份副本供「错误判定 +
+# 日志预览」使用——转发给客户端的字节始终是上游原样，本模块不参与转发路径。
+# 两者均为**纯 Rust**实现（无 C 依赖，故 musl/aarch64 交叉编译与 CI 各平台不受
+# 影响）；gzip/deflate 复用上面的 flate2，不重复引依赖。
+brotli = "9.0.0"
+ruzstd = "0.9.0"
 
 [target.'cfg(windows)'.dependencies]
 # spawn_detached 手写 CreateProcessW（bInheritHandles=FALSE，std 无稳定 API 可关）。

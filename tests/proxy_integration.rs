@@ -2593,6 +2593,12 @@ fn alias_start_and_stop_roundtrip() {
     let alias = format!("alias-test-{}", std::process::id());
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
+    // 关掉看护者：`start` 会顺带拉起全局看护进程，而它带着 target/debug/aproxy.exe
+    // 的镜像一直存活到 watchdog_idle_exit_secs（默认 300s）——测试早已结束，它却
+    // 继续锁着构建产物，让随后的 cargo 重新链接失败（实测踩过：`failed to remove
+    // file … 拒绝访问`，并让并行跑的 restart_integration 超时假失败）。
+    // 本测试不涉及看护者行为，关掉不影响断言。
+    std::fs::write(home.join("settings.json"), r#"{"watchdog": false}"#).unwrap();
     let cfg_file = dir.path().join("aliased.toml");
     std::fs::write(
         &cfg_file,

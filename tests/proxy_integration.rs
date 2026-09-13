@@ -1375,6 +1375,555 @@ async fn keepalive_first_attempt_success_matches_non_keepalive() {
 }
 
 // ---------------------------------------------------------------------------
+// 22. 仅转发模式：门控分块 mock（下面 22a/22b 两条对照测试共用）
+//
+// 「首字节是否真·增量转发」需要一个能**停在半途等外部放行**的上游：吐第一块
+// 之后挂起，测试确认收到首块才放行，再吐第二块。默认模式必须 spool 完整响应
+// 才回放，故放行前一个字节都拿不到；仅转发模式边收边发，放行前就该拿到首块。
+// 两条测试跑同一个 mock，互为对照——单独一条无法证明断言有鉴别力。
+// ---------------------------------------------------------------------------
+
+/// 门控分块 mock：任何匹配 `path` 的请求都在响应里先吐 `first`，随后**停等**
+/// 调用方通过返回的 oneshot 放行，再吐 `second` 并正常结束。
+///
+/// 返回 `(router, release)`：`release.send(())` 即放行。
+fn gated_chunk_router(
+    path: &'static str,
+    first: &'static [u8],
+    second: &'static [u8],
+) -> (Router, tokio::sync::oneshot::Sender<()>) {
+    let (release, rx) = tokio::sync::oneshot::channel::<()>();
+    // oneshot::Receiver 不是 Clone：门控状态放进 Arc<Mutex<Option<..>>>，
+    // 首个请求 take() 出来 await（只放行一次）。
+    let gate: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>> =
+        Arc::new(tokio::sync::Mutex::new(Some(rx)));
+
+    let router = Router::new().route(
+        path,
+        any(move |_req: axum::extract::Request| {
+            let gate = gate.clone();
+            async move {
+                // unfold 的流是一次性的，故每次请求都在 handler 内新建
+                let stream = futures_util::stream::unfold(0u8, move |step| {
+                    let gate = gate.clone();
+                    async move {
+                        match step {
+                            0 => Some((Ok::<Bytes, std::io::Error>(Bytes::from_static(first)), 1)),
+                            1 => {
+                                let rx = gate.lock().await.take();
+                                if let Some(rx) = rx {
+                                    let _ = rx.await;
+                                }
+                                Some((Ok(Bytes::from_static(second)), 2))
+                            }
+                            _ => None,
+                        }
+                    }
+                });
+                axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from_stream(stream))
+                    .unwrap()
+            }
+        }),
+    );
+    (router, release)
+}
+
+// ---------------------------------------------------------------------------
+// 22a. 仅转发模式：真·增量流——上游放行之前客户端就应拿到首块
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn forward_only_streams_incrementally() {
+    use futures_util::StreamExt;
+
+    let (upstream, release) =
+        gated_chunk_router("/v1/messages", b"data: chunk-A\n\n", b"data: chunk-B\n\n");
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.forward_only = Some(true);
+    let proxy_state = AppState::new(cfg);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = local_client();
+    let resp = client
+        .post(format!("{proxy_url}/v1/messages"))
+        .body("ping")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "上游 200 应原样透传");
+
+    let mut stream = resp.bytes_stream();
+    // 关键断言：**放行之前**就必须收到首块。上游此刻还挂在第 1 步的 await 上，
+    // 能拿到 chunk-A 只可能来自「边收边发」。
+    let first = tokio::time::timeout(Duration::from_secs(3), stream.next()).await;
+    let first = first.unwrap_or_else(|e| {
+        panic!("仅转发模式应在上游放行前就转发首块，但 3 秒内未收到任何字节: {e}")
+    });
+    let first = first
+        .expect("响应流不应在首块前结束")
+        .expect("首块不应是错误");
+    assert_eq!(
+        first.as_ref(),
+        b"data: chunk-A\n\n",
+        "首块字节必须原样到达客户端"
+    );
+
+    // 放行后应拿到第二块并正常收尾
+    release.send(()).unwrap();
+    let mut rest = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        rest.extend_from_slice(&chunk.expect("第二块不应是错误"));
+    }
+    assert_eq!(
+        rest.as_slice(),
+        b"data: chunk-B\n\n",
+        "放行后应收到第二块并正常收尾"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 22b. 负向对照：同款 mock 走**默认（非仅转发）模式**——必须 spool 完整响应
+//      才回放，3 秒内拿不到任何字节。没有这一条，22a 的断言无法证明有鉴别力
+//      （可能只是「恰好为真」）。
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn default_mode_buffers_whole_response_before_first_byte() {
+    use futures_util::StreamExt;
+
+    let (upstream, release) =
+        gated_chunk_router("/v1/messages", b"data: chunk-A\n\n", b"data: chunk-B\n\n");
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+
+    // 显式关掉仅转发（也是内置默认），确保走的是缓冲 + spool 回放路径
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.forward_only = Some(false);
+    let proxy_state = AppState::new(cfg);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = local_client();
+    // 默认模式下连响应头都要等 spool 完成才发（build_replay_response 在读完
+    // 整个上游响应之后才调用），故 send() 本身就该超时——两者一并用超时包住
+    let fut = client
+        .post(format!("{proxy_url}/v1/messages"))
+        .body("ping")
+        .send();
+    let got = tokio::time::timeout(Duration::from_secs(3), async move {
+        let resp = fut.await.unwrap();
+        resp.bytes_stream().next().await
+    })
+    .await;
+    assert!(
+        got.is_err(),
+        "默认模式必须 spool 完整响应才回放，3 秒内不得有任何字节（含响应头）到达客户端；\
+         实际拿到: {got:?}"
+    );
+
+    // 放行让上游收尾，避免遗留挂起的任务
+    release.send(()).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 22c. 仅转发模式：上游 5xx + 错误 JSON 一律不重试，原样透传给客户端
+//      （默认模式会对这种响应重试——见测试 1/2）
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn forward_only_does_not_retry_on_error_status() {
+    const ERROR_BODY: &str =
+        r#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c2 = counter.clone();
+    let upstream = Router::new().route(
+        "/v1/messages",
+        any(move || {
+            let c = c2.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("content-type", "application/json")],
+                    ERROR_BODY,
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.forward_only = Some(true);
+    let proxy_state = AppState::new(cfg);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = local_client();
+    let resp = client
+        .post(format!("{proxy_url}/v1/messages"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500, "上游 500 应原样透传");
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(
+        body.as_ref(),
+        ERROR_BODY.as_bytes(),
+        "错误体必须原样到达客户端——既不被拦截判定，也不被重试替换"
+    );
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "仅转发模式不得重试：上游应被调用恰好 1 次"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 22d. 仅转发模式：api_key / override_headers 照常生效，路径与查询串透传
+//      （本模式的用户场景本体：本地改写鉴权头 + 真流式）
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn forward_only_applies_header_overrides() {
+    let upstream = Router::new().route(
+        "/v1/echo",
+        any(|req: axum::extract::Request| async move {
+            let pick = |name: &str| {
+                req.headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let uri = req.uri().to_string();
+            axum::Json(serde_json::json!({
+                "uri": uri,
+                "auth": pick("authorization"),
+                "ov": pick("x-override"),
+            }))
+            .into_response()
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.forward_only = Some(true);
+    cfg.api_key = Some("sk-forward".to_string());
+    cfg.override_headers
+        .insert("x-override".to_string(), "forced".to_string());
+    let proxy_state = AppState::new(cfg);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = local_client();
+    let resp = client
+        .get(format!("{proxy_url}/v1/echo?a=1&b=two"))
+        .header("x-override", "client-value")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["auth"], "Bearer sk-forward",
+        "api_key 应转为 Bearer authorization 到达上游"
+    );
+    assert_eq!(
+        body["ov"], "forced",
+        "override_headers 应无条件覆盖客户端值"
+    );
+    assert_eq!(
+        body["uri"], "/v1/echo?a=1&b=two",
+        "路径与查询串必须照常透传（仅转发模式只在请求体与响应体上改变行为）"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 22e. 仅转发模式：上游响应流中断 → 直接截断（不注入上游未发出的字节）、
+//      不重试、不挂起。裸 TCP 上游：axum 无法模拟「响应中途掐断」。
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn forward_only_truncates_on_upstream_abort() {
+    use futures_util::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let conns = Arc::new(AtomicUsize::new(0));
+    let c2 = conns.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            c2.fetch_add(1, Ordering::SeqCst);
+
+            // 先把请求读干净再回。裸 TCP 上游不会自动消费请求体，若接收缓冲
+            // 仍有未读字节，close 时会对端 RST，把刚写出的响应字节一起丢掉。
+            let mut buf = [0u8; 4096];
+            loop {
+                match tokio::time::timeout(Duration::from_millis(150), sock.read(&mut buf)).await {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(_)) => continue,
+                }
+            }
+
+            // 写出一个**完整** chunk 帧后不发终止块直接断开：chunked framing 下
+            // FIN 提前到达即「上游响应流中断」
+            let partial = b"data: {\"partial\":true}\n\n";
+            let mut head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n",
+                partial.len()
+            )
+            .into_bytes();
+            head.extend_from_slice(partial);
+            head.extend_from_slice(b"\r\n");
+            let _ = sock.write_all(&head).await;
+            let _ = sock.flush().await;
+            drop(sock);
+        }
+    });
+
+    let mut cfg = proxy_config_for(&format!("http://{addr}"));
+    cfg.forward_only = Some(true);
+    let proxy_state = AppState::new(cfg);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = local_client();
+    let resp = client
+        .post(format!("{proxy_url}/v1/messages"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "上游已发出响应头，状态码应原样透传");
+
+    let mut stream = resp.bytes_stream();
+    let mut got = Vec::new();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(c) => got.extend_from_slice(&c),
+                Err(_) => return "err",
+            }
+        }
+        "eof"
+    })
+    .await;
+    let outcome = outcome
+        .unwrap_or_else(|e| panic!("上游中途断开后响应流必须立刻结束，不得在 5 秒内挂起: {e}"));
+    assert_eq!(
+        outcome, "err",
+        "半截 chunked 帧应表现为响应流错误（截断），而不是静默 EOF"
+    );
+    assert_eq!(
+        got.as_slice(),
+        b"data: {\"partial\":true}\n\n",
+        "上游已发出的字节必须原样转发；截断处不得注入任何上游未发出的字节"
+    );
+    assert_eq!(
+        conns.load(Ordering::SeqCst),
+        1,
+        "仅转发模式不得重试：上游应被连接恰好 1 次"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 22f. 仅转发模式：全程不 spool。> 1 MiB 请求体 + > 1 MiB 响应往返期间与结束
+//      后各做一次目录快照，spool 目录必须始终为空（默认模式这两侧都会溢写磁盘）。
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn forward_only_never_spools() {
+    use futures_util::StreamExt;
+    use tempfile::TempDir;
+
+    // 24 × 64 KiB = 1.5 MiB，必然越过 1 MiB 内存驻留阈值
+    const CHUNKS: usize = 24;
+    const CHUNK: usize = 64 * 1024;
+
+    let upstream = Router::new().route(
+        "/v1/upload",
+        any(|req: axum::extract::Request| async move {
+            // 请求体（1.5 MiB）必须整份读掉，否则上游侧背压会把发送卡住
+            let _ = axum::body::to_bytes(req.into_body(), 16 * 1024 * 1024)
+                .await
+                .expect("上游应能读完整请求体");
+            // 分块 + 小延迟，保证客户端读第一块时响应确实还在途（而非已被
+            // 上游一次性塞进缓冲区），「流式读取途中」的快照才有意义
+            let stream = futures_util::stream::unfold(0usize, |i| async move {
+                if i >= CHUNKS {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                Some((
+                    Ok::<Bytes, std::io::Error>(Bytes::from(vec![(i % 251) as u8; CHUNK])),
+                    i + 1,
+                ))
+            });
+            axum::body::Body::from_stream(stream)
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+
+    let spool_dir = TempDir::new().unwrap();
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.forward_only = Some(true);
+    cfg.spool_dir_override = Some(spool_dir.path().to_path_buf());
+    let proxy_state = AppState::new(cfg);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let assert_spool_empty = |tag: &str| {
+        let entries: Vec<_> = std::fs::read_dir(spool_dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "{tag}：仅转发模式不得产生任何 spool 临时文件，实际: {entries:?}"
+        );
+    };
+
+    let big: Vec<u8> = (0..3 * 512 * 1024).map(|i| (i % 251) as u8).collect(); // 1.5 MiB
+    let client = local_client();
+    let resp = client
+        .post(format!("{proxy_url}/v1/upload"))
+        .body(big)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let mut stream = resp.bytes_stream();
+    let mut total = 0usize;
+    let mut mid_checked = false;
+    while let Some(chunk) = stream.next().await {
+        total += chunk.expect("响应流不应出错").len();
+        if !mid_checked {
+            mid_checked = true;
+            assert!(
+                total < CHUNKS * CHUNK,
+                "首块之后响应应仍在流式中（实际已收完 {total} 字节），否则「途中」快照无意义"
+            );
+            assert_spool_empty("流式读取途中");
+        }
+    }
+    assert_eq!(total, CHUNKS * CHUNK, "响应字节总数应与上游发出的完全一致");
+    assert_spool_empty("响应结束后");
+}
+
+// ---------------------------------------------------------------------------
+// 22g. 仅转发模式：8 MiB 请求体/响应体字节保真，且远低于默认 128 MiB 上限的
+//      大流量不得误触 413（流式计数上限只在真正越界时才触发）
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn forward_only_large_body_streams_through() {
+    const SIZE: usize = 8 * 1024 * 1024; // 8 MiB
+
+    let received = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let received_clone = received.clone();
+    let resp_payload: Vec<u8> = (0..SIZE).map(|i| (i % 253) as u8).collect();
+    let resp_clone = resp_payload.clone();
+    let upstream = Router::new().route(
+        "/v1/upload",
+        any(move |req: axum::extract::Request| {
+            let received = received_clone.clone();
+            let resp_payload = resp_clone.clone();
+            async move {
+                let bytes = axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024)
+                    .await
+                    .expect("上游应能读完整 8 MiB 请求体");
+                received.lock().unwrap().extend_from_slice(&bytes);
+                axum::body::Body::from(resp_payload)
+            }
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.forward_only = Some(true);
+    let proxy_state = AppState::new(cfg);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let big: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+    let client = local_client();
+    let resp = client
+        .post(format!("{proxy_url}/v1/upload"))
+        .body(big.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "8 MiB 远低于默认 128 MiB 上限，不得误触 413"
+    );
+    let got = resp.bytes().await.unwrap();
+    assert_eq!(got.len(), SIZE, "响应字节数应保真（期望 {SIZE}）");
+    assert_eq!(
+        got.as_ref(),
+        resp_payload.as_slice(),
+        "响应字节必须与上游发出的完全一致"
+    );
+    let upstream_saw = received.lock().unwrap().clone();
+    assert_eq!(
+        upstream_saw.len(),
+        SIZE,
+        "上游收到的请求体字节数应保真（期望 {SIZE}）"
+    );
+    assert_eq!(
+        upstream_saw.as_slice(),
+        big.as_slice(),
+        "上游收到的请求体必须与客户端发送的完全一致"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 22h. 仅转发模式：max_body_mb 仍强制——流式途中计数越界即 413
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn forward_only_enforces_max_body_mb() {
+    let upstream = Router::new().route(
+        "/v1/upload",
+        any(|req: axum::extract::Request| async move {
+            // 上游必须**读完整个请求体**才回响应：这样请求体适配器一旦产出
+            // Err（超限），上游永不给出响应，reqwest::send() 必然以错误收场，
+            // 413 的判定就是确定性的，而非与「上游抢答」赛跑
+            match axum::body::to_bytes(req.into_body(), 64 * 1024 * 1024).await {
+                Ok(_) => (StatusCode::OK, "stored").into_response(),
+                Err(_) => (StatusCode::BAD_REQUEST, "incomplete body").into_response(),
+            }
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.forward_only = Some(true);
+    cfg.max_body_mb = Some(1); // 1 MiB 上限
+    let proxy_state = AppState::new(cfg);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let big = vec![b'a'; 2 * 1024 * 1024];
+    let client = local_client();
+    let resp = client
+        .post(format!("{proxy_url}/v1/upload"))
+        .body(big)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        413,
+        "仅转发模式流式计数越过 max_body_mb 后应返回 413"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("请求体超出上限"),
+        "413 文案应与缓冲路径共用（期望含「请求体超出上限」），实际: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 21. CLI 进程级：--config 显式配置文件（多开不同配置的进程）
 //
 // 每个进程一份配置：启动时加载指定文件，config 子命令读写同一文件。

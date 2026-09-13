@@ -3074,3 +3074,97 @@ fn kill_pid(pid: u32) {
 fn kill_pid(pid: u32) {
     let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
 }
+
+// ---------------------------------------------------------------------------
+// 31. IPC 观测计数：status 的「请求 / 重试 / 最近错误」必须反映真实流量
+//
+// 回归锚点（2026-09-14 端到端实测发现）：serve_forever 曾在此**另建一份**
+// IpcStats、只把活动时间戳共享进来，而请求热路径累加的是 AppState 里另一份——
+// 于是「请求 / 重试 / 最近错误」三项对任何实例恒为 0。活动时间戳恰好正常
+// （它确实是共享的），反而掩盖了缺陷，直到端到端实测才暴露。
+//
+// 断言刻意走 **IPC ping 的真实响应**而非进程内的同一个 Arc——后者无论如何
+// 都自洽，正是这类接线缺陷的盲区。
+//
+// 隔离：APROXY_HOME 指向 tempdir，并在其中**关掉 watchdog**——看护进程带着
+// target/debug/aproxy.exe 的镜像存活到 watchdog_idle_exit_secs，会锁住后续
+// cargo 构建（实测踩过：`failed to remove file … 拒绝访问`）。
+// ---------------------------------------------------------------------------
+#[test]
+fn ipc_stats_reflect_real_traffic() {
+    isolate_env_proxy(); // 必须在 spawn 前：守护子进程继承 NO_PROXY
+    let port = daemon_test_port(11);
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().to_path_buf();
+    std::fs::write(home.join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // mock 上游恒 200：走首轮成功快速路径，不涉及重试
+    let (upstream, _handle) = rt.block_on(bind_random_router(
+        Router::new().fallback(any(|| async { (StatusCode::OK, "{\"ok\":true}") })),
+    ));
+
+    let cfg_file = home.join("observe.toml");
+    std::fs::write(
+        &cfg_file,
+        format!("base_url = \"{upstream}\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
+    )
+    .unwrap();
+    let _guard = DaemonGuard {
+        exe,
+        port,
+        home_dir: Some(home.clone()),
+    };
+
+    let out = Command::new(exe)
+        .arg("start")
+        .arg("--config")
+        .arg(&cfg_file)
+        .env("APROXY_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "start 应成功，stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 就绪判定按**隔离 home 里的端点**寻址：unix 的 UDS 在 home/run/ 下，
+    // 用默认主目录的 ipc_ping 会找错位置
+    let run_dir = home.join("run");
+    let port_str = port.to_string();
+    let mut ready = false;
+    for _ in 0..100 {
+        if rt
+            .block_on(aproxy::daemon::ipc_ping_in(&run_dir, &port_str))
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ready, "守护未在 10 秒内就绪");
+
+    let client = local_client();
+    let url = format!("http://127.0.0.1:{port}/v1/observe");
+    for i in 0..3 {
+        let resp = rt.block_on(client.get(&url).send()).unwrap();
+        assert_eq!(resp.status(), 200, "第 {i} 个请求应 200");
+        rt.block_on(resp.bytes()).unwrap();
+    }
+
+    let info = rt
+        .block_on(aproxy::daemon::ipc_ping_in(&run_dir, &port_str))
+        .expect("实例应可 ping");
+    assert_eq!(
+        info.requests_total, 3,
+        "IPC 应报告 3 次请求（回归：曾因统计源不共享而恒为 0）"
+    );
+    assert_eq!(info.retries_total, 0, "全部首轮成功，不应有重试");
+}

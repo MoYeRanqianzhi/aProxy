@@ -4,7 +4,7 @@
 //! 与 `commands/start.rs` 的分工：start 负责启动预检与后台 spawn 的父进程侧，
 //! server 负责真正「跑起来」的服务进程本身。
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use tracing_subscriber::EnvFilter;
 
@@ -80,14 +80,13 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     }
 
     // IPC 控制通道：ping/shutdown 走命名管道，与代理端口完全隔离。
-    // 活动时间戳与观测计数由 AppState 持有（请求热路径更新），IPC ping 实时读取。
+    // 活动时间戳与观测计数由 AppState 持有（请求热路径更新），IPC ping 实时读取——
+    // 直接复用 `state.stats` 这**同一份**：此处曾另建一个 IpcStats 只共享活动
+    // 时间戳，导致「请求 / 重试 / 最近错误」对任何实例都恒为 0（时间戳正常掩盖了它）。
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let ipc_port = port.clone();
     let ipc_info = info.clone();
-    let ipc_stats = Arc::new(daemon::IpcStats {
-        last_activity_secs: state.last_activity_secs.clone(),
-        ..Default::default()
-    });
+    let ipc_stats = state.stats.clone();
     tokio::spawn(async move {
         if let Err(e) = daemon::serve_ipc(ipc_port, stop_tx, ipc_info, ipc_stats).await {
             tracing::error!(error = %e, "IPC 控制通道启动失败（aproxy stop/status 将不可用）");

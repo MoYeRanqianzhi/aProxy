@@ -144,17 +144,26 @@ impl AppState {
         } else {
             None
         };
+        // 活动时间戳与观测计数同属一个 IpcStats：serve_forever 把这一份整体交给
+        // IPC 线程读。**两者必须同源**——本项目曾在此各建一份（IpcStats 里另有一个
+        // 活动时间戳），而 serve_forever 只把活动时间戳共享进 IPC 那份，
+        // 于是「请求 / 重试 / 最近错误」三项对任何实例都恒显示 0（活动时间戳正常
+        // 反而掩盖了该缺陷，直到 2026-09-14 端到端实测才发现）。
+        let last_activity_secs = Arc::new(std::sync::atomic::AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        ));
         Self {
             spool_dir,
             config: Arc::new(config),
             client,
-            last_activity_secs: Arc::new(std::sync::atomic::AtomicU64::new(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-            )),
-            stats: Arc::new(crate::daemon::IpcStats::default()),
+            stats: Arc::new(crate::daemon::IpcStats {
+                last_activity_secs: last_activity_secs.clone(),
+                ..Default::default()
+            }),
+            last_activity_secs,
         }
     }
 

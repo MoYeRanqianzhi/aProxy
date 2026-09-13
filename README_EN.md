@@ -10,7 +10,9 @@ aProxy catches the request locally: on failure it **retries without limit**
 (exponential backoff, capped and configurable), keeps streaming responses
 alive with injected SSE heartbeats, and replays the successful response
 byte-for-byte. Your client never notices the storm upstream; it only notices
-that the request took a little longer.
+that the request took a little longer. (The one exception is `forward_only`
+mode — it explicitly gives up that retry guarantee for true streaming
+passthrough; see Configuration.)
 
 [中文](README.md)
 
@@ -19,7 +21,8 @@ that the request took a little longer.
 - **Infinite retries** — What stands in the way becomes the way. Network
   errors, 4xx/5xx, error JSON (a 200 carrying an error) all trigger retries;
   when the client disconnects, the upstream request is aborted immediately
-  (billing protection).
+  (billing protection). **The only way out is `forward_only` mode** — an
+  explicit trade that drops retries for streamed request/response passthrough.
 - **Total passthrough** — Transparency as a principle. Paths, queries, and
   headers forwarded untouched; control traffic rides a separate named pipe,
   so the proxy port does exactly one thing.
@@ -143,6 +146,7 @@ listen_addr = "127.0.0.1:12345"          # local listener
 # spool_limit_mb = 256                   # upstream response buffer cap (MB)
 # max_body_mb = 128                      # request body cap (MB; 0 = unlimited)
 # disk_cache = true                      # spool large bodies/responses to disk
+# forward_only = true                    # forward-only: no retries/buffering/heartbeats, stream both ways
 # connect_timeout_secs = 30              # upstream connect timeout (0 = none)
 # read_timeout_secs = 300                # inter-read timeout (0 = none)
 ```

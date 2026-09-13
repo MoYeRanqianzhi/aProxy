@@ -10,8 +10,9 @@ description: aProxy CLI 完整参考——本地 API 代理（无限重试保障
 aProxy 是本地 HTTP 代理：客户端把 API base URL 指向 `http://127.0.0.1:<端口>`，
 aProxy 原样透传路径/查询/请求头到上游 `base_url`。请求失败（网络错误、4xx、5xx、
 错误 JSON）时**无限重试**（指数退避，封顶 `max_retry_backoff_secs`），流式响应期间
-向客户端发 SSE 心跳注释保活，成功后原样回放——客户端零感知。控制通道
-（status/stop/logs）走命名管道 IPC，**永不占用代理端口**。
+向客户端发 SSE 心跳注释保活，成功后原样回放——客户端零感知。（唯一例外是
+`forward_only` 模式：放弃重试与缓冲、请求体与响应真流式直通，见 behaviors.md。）
+控制通道（status/stop/logs）走命名管道 IPC，**永不占用代理端口**。
 
 两种配置文件分工（勿混淆）：
 - `config.toml`（~/.aproxy/config.toml）——人类可读可写，可多份平行并存（多开）
@@ -21,7 +22,7 @@ aProxy 原样透传路径/查询/请求头到上游 `base_url`。请求失败（
 配置生效优先级（高 → 低）：
 1. CLI 覆盖参数 `--baseurl/--listen/--proxy/--api-key`（仅本次运行，不落盘）
 2. config.toml 显式配置的值（各实例独立）
-3. settings.json 全局默认（仅 `max_body_mb`、`disk_cache` 两个字段参与此层）
+3. settings.json 全局默认（仅 `max_body_mb`、`disk_cache`、`forward_only` 三个字段参与此层）
 4. 内置默认值
 
 target 参数（start/stop/logs 的 `[目标]`）解析顺序：**别名 → `default` 保留字

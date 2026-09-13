@@ -32,6 +32,7 @@ listen_addr = "127.0.0.1:12345"
 # read_timeout_secs = 300
 # max_body_mb = 128
 # disk_cache = true
+# forward_only = false
 ```
 
 ## 字段总表
@@ -53,9 +54,10 @@ listen_addr = "127.0.0.1:12345"
 | `read_timeout_secs` | u64 | 300 | 两次读到数据间隔超时秒（钳制首字节等待）；0=不设限 |
 | `max_body_mb` | u64? | settings 层 | 请求体上限 MB，超出 413；0=不设限 |
 | `disk_cache` | bool? | settings 层 | 磁盘缓存开关 |
+| `forward_only` | bool? | settings 层 | 仅转发模式：放弃重试/缓冲/心跳，请求体与响应流式直通 |
 
-**优先级**（`max_body_mb`/`disk_cache` 两个 Option 字段独有）：
-toml 显式值 > settings.json 全局默认 > 内置默认（128 / true）。
+**优先级**（`max_body_mb`/`disk_cache`/`forward_only` 三个 Option 字段独有）：
+toml 显式值 > settings.json 全局默认 > 内置默认（128 / true / false）。
 其余字段无 settings 层：toml 显式值 > 内置默认。
 
 ## 各字段语义
@@ -141,6 +143,30 @@ override_headers = { "user-agent" = "my-agent/1.0" }
 完成/实例启动时清理，磁盘写失败按 SpoolFailed 终态处理（不打爆内存）。
 未在 toml 显式配置时取 settings.json 的 `disk_cache`（全局默认开）。
 低并发小流量实例可关（<1 MiB 的负载本就全程内存，不产生磁盘 IO）。
+
+### forward_only
+
+**仅转发模式开关**（默认 `false`）。开启后实例**放弃本产品最核心的重试保障**，
+换取请求体与响应的真流式直通：请求体边收边发上游、响应边收边回客户端——
+**不缓冲、不重试、不落盘、不发心跳**。这是给「上游可信 + 客户端要真流式」场景
+的**显式取舍**，不是普通开关：开启前请确认上游无需重试兜底，且客户端自己能
+处理上游的错误与断流。
+
+- **仍然强制**：`max_body_mb`——流式途中计数，超限即中止上游请求并回 413
+  （复用既有文案）。这是本模式下唯一仍生效的限制。
+- **不生效**：`disk_cache`/`spool_limit_mb`/`keepalive_interval_secs`/
+  `max_retry_backoff_secs`——磁盘 spool 完全不参与（无缓冲可 spool）。
+- **不再有**：无限重试、SSE 保活心跳、错误内容拦截（HTTP 200 携带 error 不再
+  判失败）、缓冲后的原字节回放。
+- **上游请求失败**：502 + 原因，**不重试**（同时记入 status 的「最近错误」）。
+- **响应流中途中断**：**直接截断**——不注入任何上游未发出的字节，日志留痕
+  （tracing 以 warn 记录错误与已转发字节数）。
+- **客户端断开**：连接随之关闭（计费保护行为不变）。
+- **`content-length` 原样透传**：字节未经变换，上游声明仍精确（其余 hop-by-hop
+  头照旧过滤）。
+- 未在 toml 显式配置时取 settings.json 的 `forward_only`（全局默认 false）。
+  **无对应 CLI 旗标**，只能写 toml 或 settings.json；改后
+  `aproxy restart <端口或别名>` 生效。
 
 ## 校验规则
 

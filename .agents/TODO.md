@@ -4,6 +4,19 @@
 > 2026-09-08 补录 tag 之后一轮（性能优化 + 磁盘缓存 + 重构 + skill），全部已完成。
 > 2026-09-09 第四轮审查修复 + 实测 restart bug + skill 指引优化，全部已完成。
 
+## 仅转发模式 forward_only（2026-09-14）
+
+- [ ] **仅转发模式（forward_only）落地确认**：config.toml 每实例字段 +
+  settings.json 全局默认（内置 false），与 `max_body_mb`/`disk_cache` 同款分层。
+  开启后**放弃重试/缓冲/心跳**，请求体与响应流式直通——可信上游 + 要真流式的
+  **显式取舍**（产品最核心的重试保障让位于真流式）。`max_body_mb` 仍强制；
+  上游失败 502 不重试并记 `note_upstream_failure`；响应流中断直接截断 +
+  `tracing::warn`。分支点在 `read_request_body` 之前、`requests_total.fetch_add`
+  之后；消费统一走 `forward_only_enabled()`（**不得 unwrap**）。文档与 skill 已
+  同步（README/README_EN/docs/architecture.md + skill 四份 references + SKILL.md）；
+  **代码实现与测试由并行 agent 完成，落地后按上列约束逐条核对本条目**。
+  详见 `.agents/memory/2026-09-14-forward-only.md`
+
 ## 近期收口（全部完成）
 
 - [x] **A. alpha.4 收口**：bump + tag v0.1.0-alpha.4；release 构建于独立 `CARGO_TARGET_DIR=target-rel`（target/release/aproxy.exe 被生产实例锁定不可覆盖）——用户自行替换部署

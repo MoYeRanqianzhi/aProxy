@@ -27,6 +27,7 @@
 | `idle_timeout_secs` | u64 | 1800 | 手编（进阶） |
 | `max_body_mb` | u64 | 128 | 手编（进阶；toml 可按实例覆盖） |
 | `disk_cache` | bool | true | 手编（进阶；toml 可按实例覆盖） |
+| `forward_only` | bool | false | 手编（进阶；toml 可按实例覆盖） |
 | `watchdog` | bool | true | 看门狗总开关 |
 | `watchdog_heartbeat_secs` | u64 | 30 | 看护扫描周期（调优） |
 | `watchdog_stale_after_cycles` | u64 | 1 | 挂死容忍周期数（误杀调节阀） |
@@ -79,6 +80,13 @@
 `config.toml` 未显式写 `disk_cache` 的实例取此值（内置默认 true）。toml 显式值
 优先。语义见 config-toml.md。
 
+### forward_only（全局默认层）
+
+`config.toml` 未显式写 `forward_only` 的实例取此值（内置默认 false）。toml 显式值
+优先。**开启即放弃重试保障**：请求体与响应流式直通、不缓冲不重试不发心跳——
+适合「上游可信 + 要真流式」的实例。完整语义与取舍见 config-toml.md 的
+`forward_only` 节。
+
 ### watchdog（及四个 watchdog_* 调优字段）
 
 看门狗是**系统级单例**（一个全局看护进程 `aproxy watchdog` 看护全部实例），
@@ -121,10 +129,10 @@ install 下载专用代理（与 config.toml 的 `proxy` 上游请求代理**绝
 
 ## 与 config.toml 的分层关系
 
-只有 `max_body_mb` 与 `disk_cache` 存在三层优先级：
+只有 `max_body_mb`、`disk_cache` 与 `forward_only` 存在三层优先级：
 
 ```
-config.toml 显式值  >  settings.json 值  >  内置默认 (128 / true)
+config.toml 显式值  >  settings.json 值  >  内置默认 (128 / true / false)
 ```
 
 其余字段是「toml 显式值 > 内置默认」或完全归 settings 管理（本文件全部字段）。

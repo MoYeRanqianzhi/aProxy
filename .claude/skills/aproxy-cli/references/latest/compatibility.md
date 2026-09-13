@@ -16,9 +16,18 @@ aproxy status               # 每行 v<semver> = 各实例实际运行的守护�
 
 | 项 | 值 |
 |---|---|
-| 文档适用版本 | **0.1.0-alpha.10**（含 alpha.4→alpha.10 引入的全部行为） |
+| 文档适用版本 | **0.1.0-alpha.12**（含 alpha.4→alpha.12 引入的全部行为） |
 | 代码版本坐标 | Cargo.toml `version` 字段；alpha 线于 2026-09 发布 |
 | 大版本线 | 0.1.x（0.1 系列内小版本不另开目录，直接更新 latest/ 文档） |
+
+## alpha.12 关键行为（相对 alpha.10 及更早）
+
+- **仅转发模式 `forward_only`（新字段，默认 false）**：config.toml 与
+  settings.json 均支持（toml 显式值 > settings 全局默认，与 `max_body_mb`/
+  `disk_cache` 同款分层）。开启后该实例**放弃重试/缓冲/心跳**，请求体与响应
+  流式直通——**这是显式取舍**，不是普通加速开关。`max_body_mb` 仍强制。
+  旧二进制读到该字段会忽略（行为不变），新二进制读旧配置文件取默认 false
+  （升级安全）。语义详见 config-toml.md 的 `forward_only` 节与 behaviors.md
 
 ## alpha.10 关键行为（相对 alpha.9 及更早）
 

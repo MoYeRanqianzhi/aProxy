@@ -24,3 +24,4 @@
 - [release 版本对齐](memory/2026-09-12-release-version-alignment.md) — build+publish 双 job 对齐 tag 版本（python 显式 utf-8 + \r?\n + --allow-dirty）；alpha.10/11 被 t 标签抢注正式版顺延 alpha.12；测试 tag 一次性（失败必须 bump tN）
 - [macOS 支持必须完成](memory/2026-09-12-macos-support-required.md) — 用户 2026-09-12 定调：后续协作者在 macOS 真机实现；现状看护者/install 在 macOS 坏（/dev/shm 与 /proc 皆为 Linux 专用，is_aproxy_process 对活进程误判 false）；含逐行影响面、libproc 实现方向与验收标准
 - [install 三平台实测记录](memory/2026-09-11-install-three-platform-e2e.md) — Windows/Ubuntu/WSL 全量+e2e 全绿；挖出 5 个真 bug（unix 编译面×2、平台硬编码测试、库层 IPC 环境泄漏、有实例 swapping 续作状态机拒绝）；WSL TUN 劫持 TLS 的绕法与 e2e 脚本坑集
+- [仅转发模式](memory/2026-09-14-forward-only.md) — forward_only（alpha.12）：放弃重试/缓冲/心跳换真流式直通（可信上游的显式取舍），config.toml + settings.json 分层；分支点/流式/透传与「不得 unwrap」消费点约束 [[forward-only]] [[alias-settings]] [[disconnect-billing-protection]]

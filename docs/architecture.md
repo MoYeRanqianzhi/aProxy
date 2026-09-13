@@ -19,6 +19,9 @@ agent 软件 ──HTTP──▶ [代理端口 12345] ──重试循环──�
 `\\.\pipe\aproxy-<端口>`（unix 为 `~/.aproxy/run/<端口>.sock`），杜绝控制路径与
 客户端请求路径重叠。
 
+上图的「重试循环 / spool / 回放」是默认模式的主流程；`forward_only` 模式下这两
+环整体旁路（见「仅转发模式（forward_only）」）。
+
 ## 模块
 
 | 模块 | 职责 |
@@ -27,7 +30,7 @@ agent 软件 ──HTTP──▶ [代理端口 12345] ──重试循环──�
 | `src/cli.rs` | clap 命令树定义（`Cli`/`Commands`/`AliasCmd`/`ConfigArgs`），只承载定义不含逻辑 |
 | `src/commands/` | 十个子命令各自一文件（start/status/stop/restart/restore/alias/doctor/find/logs/config），共享 target 解析在 `mod.rs` |
 | `src/server.rs` | 服务承载：`serve_forever` 主循环、停止信号、日志初始化、配置错误落盘 startup.log |
-| `src/proxy.rs` | 转发核心：hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、keepalive、断开保护 |
+| `src/proxy.rs` | 转发核心：hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、keepalive、断开保护、仅转发模式 |
 | `src/retry.rs` | 重试判定：状态码、错误 JSON（含流式 NDJSON/SSE 形态） |
 | `src/config.rs` | 代理配置加载/保存/校验（`~/.aproxy/config.toml`，可多份平行并存） |
 | `src/settings.rs` | 内部配置（`~/.aproxy/settings.json`，唯一）：别名表、全局默认等程序管理状态 |
@@ -51,7 +54,8 @@ CLI 定义（cli.rs）与子命令处理（commands/）分离；启动父进程�
 生命周期保证：临时文件在请求结束（Drop）、回放流 EOF、重试丢弃三路删除；
 实例启动时清空本端口目录回收崩溃残留。磁盘写失败按 `SpoolFailed` 终态处理
 （502 / SSE error 事件），绝不退化成内存堆积。`disk_cache = false`（settings
-全局默认或 toml 覆盖）关闭时回到纯内存行为。
+全局默认或 toml 覆盖）关闭时回到纯内存行为。`forward_only` 模式下请求体与响应
+均**不缓冲**，本节整节不适用——见「仅转发模式（forward_only）」。
 
 ## 重试与流式回放
 
@@ -65,9 +69,44 @@ CLI 定义（cli.rs）与子命令处理（commands/）分离；启动父进程�
 重试退避：前 3 次零延迟，第 4 次起 5s→10s→20s→…封顶 `max_retry_backoff_secs`
 （默认 320s），无限重试。客户端断开立即中止上游请求并停止重试（计费保护）。
 
+`forward_only` 模式整体旁路本节：不缓冲完整请求体、不进重试循环、不发心跳——
+见下一节。
+
+## 仅转发模式（forward_only）
+
+`forward_only = true`（toml 显式值，或 settings.json 全局默认）时，实例走一条与
+上面主流程完全不同的极简路径：**不缓冲、不重试、不保活**。请求体边收边发上游，
+响应边收边回客户端。这是给「上游可信、且要真流式」场景的**显式取舍**——它放弃
+了本产品最核心的重试保障，请勿当作普通开关随手打开。
+
+- **分叉点**：在 `read_request_body` 之前判定（否则缓冲已发生，模式失去意义），
+  且在 `requests_total.fetch_add` 之后（否则 status 的请求数恒为 0）。
+- **请求体**：`req.into_body().into_data_stream()` 经计数适配器交给
+  `reqwest::Body::wrap_stream` 流式直发——一律流式，不做空 body 特判；不缓冲、
+  不落盘。计数在流式途中进行，超 `max_body_mb` 即让请求体流产出 `Err`（令
+  reqwest 中止上游请求），回 413（复用既有文案）。**`max_body_mb` 是本模式下
+  唯一仍然强制的限制。**
+- **响应**：`resp.bytes_stream()` 直回客户端，状态码与响应头原样透传；
+  hop-by-hop 照旧过滤，但 **`content-length` 必须保留**（字节未经变换，
+  上游声明仍精确）。
+- **上游请求失败**：502 + 原因，不重试，并调 `state.note_upstream_failure`
+  记录——否则 status 的「最近错误」对这类实例永久显示「无」。
+- **响应流中途中断**：**直接截断**，不注入任何上游未发出的字节；
+  `tracing::warn!` 记录错误与已转发字节数，并调 `note_upstream_failure`。
+- **客户端断开**：响应 Body 被 drop，reqwest 连接随之关闭——既有计费保护靠
+  Drop 天然成立。
+- **不进入的路径**：重试循环、SSE 保活骨架、错误内容拦截
+  （`is_error_body`/`is_stream_error_body`）、spool、`client_wants_sse` 判定。
+- **本模式下不生效**：`disk_cache`/`spool_limit_mb`/`keepalive_interval_secs`/
+  `max_retry_backoff_secs`（磁盘 spool 完全不参与）。
+- 消费方一律走 `Config::forward_only_enabled()`（`unwrap_or(DEFAULT_FORWARD_ONLY)`），
+  **不得 `unwrap()`**——doctor 的 `parse_config_file`、`find::discover` 与大量
+  测试的 `AppState::new` 都不经 settings 注入。`proxy::router(AppState)` 签名不变。
+
 ## 配置分层
 
-三级优先级（仅 `max_body_mb`/`disk_cache` 有 settings 层；其余字段 toml > 内置默认）：
+三级优先级（仅 `max_body_mb`/`disk_cache`/`forward_only` 有 settings 层；其余
+字段 toml > 内置默认）：
 
 ```
 CLI 覆盖参数（--baseurl 等，仅本次） > config.toml 显式值 > settings.json 全局默认 > 内置默认
@@ -75,7 +114,7 @@ CLI 覆盖参数（--baseurl 等，仅本次） > config.toml 显式值 > settin
 
 `config.toml` 人类可读可写、可多份（多开各自指定）；`settings.json` 程序管理的
 内部配置，**全局唯一**（JSON 原子写，损坏回退默认），存别名表、default_config、
-config_dirs、日志轮转阈值、空闲阈值与上述两个字段的全局默认。
+config_dirs、日志轮转阈值、空闲阈值与上述三个字段的全局默认。
 
 ### 配置别名（settings.json）
 

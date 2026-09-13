@@ -228,6 +228,17 @@ pub(crate) fn handle_config_cmd(path: PathBuf, args: ConfigArgs) {
                 "disk_cache              = （未在 toml 设置，运行时取 settings.json 全局默认）"
             ),
         }
+        // forward_only：None 与 Some 一起展示来源；true 必须把「放弃重试」
+        // 写在脸上——它不是一个无害的性能开关
+        match cfg.forward_only {
+            Some(true) => {
+                println!("forward_only            = true（仅转发：不缓冲、不重试）")
+            }
+            Some(false) => println!("forward_only            = false"),
+            None => println!(
+                "forward_only            = （未在 toml 设置，运行时取 settings.json 全局默认）"
+            ),
+        }
         // 0 表示不设限，语义特殊，提示出来
         if cfg.connect_timeout_secs == 0 {
             println!("connect_timeout_secs    = 0（不设限）");

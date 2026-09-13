@@ -69,6 +69,12 @@ pub struct Settings {
     /// 低并发实例可关闭以保持全内存行为。
     #[serde(default = "default_disk_cache")]
     pub disk_cache: bool,
+    /// 仅转发模式（全局默认值）：开启后实例的请求体与响应均不缓冲、不落盘、
+    /// 不重试（内存与负载大小解耦，下游拿到真·增量流，代价是失去重试能力）。
+    /// 各 config.toml 可用 `forward_only` 按实例覆盖。默认 false——它与
+    /// `disk_cache` 不同，是放弃产品核心保障的取舍，不该被全局默认打开。
+    #[serde(default = "default_forward_only")]
+    pub forward_only: bool,
     /// 看门狗总开关：开启时 `aproxy start`/守护自检会确保存在一个全局看护进程
     /// （`aproxy watchdog`），守护崩溃/挂死时按 .restore 记录自动重拉。
     /// 看门狗是系统级单例（一个看护进程看护全部实例），故只在 settings 配置，
@@ -131,6 +137,10 @@ fn default_disk_cache() -> bool {
     crate::config::DEFAULT_DISK_CACHE
 }
 
+fn default_forward_only() -> bool {
+    crate::config::DEFAULT_FORWARD_ONLY
+}
+
 pub(crate) fn default_watchdog() -> bool {
     true
 }
@@ -168,6 +178,7 @@ impl Default for Settings {
             idle_timeout_secs: default_idle_timeout_secs(),
             max_body_mb: default_max_body_mb(),
             disk_cache: default_disk_cache(),
+            forward_only: default_forward_only(),
             watchdog: default_watchdog(),
             watchdog_heartbeat_secs: default_watchdog_heartbeat_secs(),
             watchdog_stale_after_cycles: default_watchdog_stale_after_cycles(),
@@ -582,6 +593,23 @@ mod tests {
         let loaded = load_from(&path);
         assert_eq!(loaded.max_body_mb, 128);
         assert!(loaded.disk_cache);
+    }
+
+    #[test]
+    fn forward_only_roundtrip_and_default() {
+        // 默认 false（绝不默认启用——这是放弃重试保障的取舍）；自定义 true
+        // 落盘往返；旧 settings.json（无该字段）读出 false，保证升级不改行为
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path_in(dir.path());
+        assert!(!Settings::default().forward_only);
+        let s = Settings {
+            forward_only: true,
+            ..Default::default()
+        };
+        save_to(&path, &s).unwrap();
+        assert!(load_from(&path).forward_only);
+        std::fs::write(&path, r#"{"aliases":{}}"#).unwrap();
+        assert!(!load_from(&path).forward_only);
     }
 
     #[test]

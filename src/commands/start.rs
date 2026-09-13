@@ -30,6 +30,7 @@ pub(crate) fn resolve_runtime_config(
         let s = settings::load();
         cfg.max_body_mb.get_or_insert(s.max_body_mb);
         cfg.disk_cache.get_or_insert(s.disk_cache);
+        cfg.forward_only.get_or_insert(s.forward_only);
     }
     // listen_addr 必须带端口（port_of 取最后一个 ':' 之后）：缺端口/端口越界的
     // bind 失败不是占用，提前拦截给出明确错误，避免被误诊为「被其他程序占用」
@@ -221,6 +222,11 @@ pub(crate) async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf, target: Optio
                     info.listen_addr
                 );
                 println!("        上游路径与查询参数将完整透传到 {base}/<path>?<query>");
+            }
+            // 仅转发模式是放弃重试保障的取舍，启动提示里必须显式说出来
+            // （父进程的 cfg 已完成 settings 注入，取值与守护子进程一致）
+            if cfg.forward_only_enabled() {
+                println!("  仅转发模式：不缓冲、不重试");
             }
             println!("  配置: {}", cfg_path.display());
             println!("  日志: {}", log_path.display());

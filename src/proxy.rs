@@ -73,6 +73,17 @@ fn is_hop_header(name: &str) -> bool {
     HOP_HEADERS.contains(&name.to_ascii_lowercase().as_str())
 }
 
+/// 响应侧的 hop-by-hop 过滤：同 `is_hop_header`，但**排除 content-length**。
+///
+/// 理由与磁盘回放分支显式回填 content-length 完全一致：仅转发模式转发的字节
+/// 未经任何变换（不解码、不重写、不拼接），上游声明的长度仍然精确——剥掉它
+/// 只会让本可定长的响应退化为 chunked，白白丢掉客户端的长度可见性。
+/// 请求侧不能照此办理：那侧的 content-length 描述的是客户端发来的字节，
+/// 而 hyper/reqwest 会按实际发送的 body 自行管理，必须交由它们决定。
+fn is_hop_response_header(name: &str) -> bool {
+    !name.eq_ignore_ascii_case("content-length") && is_hop_header(name)
+}
+
 /// 共享状态
 #[derive(Clone)]
 pub struct AppState {
@@ -766,41 +777,38 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
     // 在本地侧先应用覆盖/追加，避免重试间重复计算
     apply_header_overrides(&mut headers, &state.config);
 
+    // 仅转发模式：分支点必须在 read_request_body **之前**——缓冲一旦发生，本模式
+    // 就丢掉了全部意义（内存随负载增长、下游要等请求体读完才见到首字节）；
+    // 同时它位于 requests_total.fetch_add 与 apply_header_overrides **之后**，
+    // 所以 status 的请求计数与鉴权/头改写行为与常规模式完全一致。
+    // 这条路径整体不进重试循环、保活心跳、错误内容拦截、spool 与 client_wants_sse
+    // 判定，也不做响应体解码（本模式不对响应内容做任何检查，无需解码）。
+    if state.config.forward_only_enabled() {
+        let target_url = upstream_url(&state.config, &uri);
+        tracing::info!(method = %method, target = %target_url, "代理请求（仅转发）");
+        return forward_only_proxy(state, method, target_url, headers, req.into_body()).await;
+    }
+
     // 缓冲请求体以支持重试重放；上限 max_body_mb（默认 128 MB，0=不限），
     // 超出直接 413。disk_cache 开启时超过内存驻留阈值（1 MiB）溢写磁盘，
     // 大请求体的进程内存在途占用恒定。
     let body_limit = state.config.body_limit_bytes();
-    let req_body = match read_request_body(req.into_body(), body_limit, state.spool_dir.as_deref())
-        .await
-    {
-        Ok(b) => b,
-        Err(ReadBodyError::TooLarge) => {
-            let limit_text = if body_limit == usize::MAX {
-                "不设限".to_string()
-            } else {
-                format!("{} MiB", body_limit / 1024 / 1024)
-            };
-            tracing::warn!(limit = %limit_text, "请求体超出上限");
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("请求体超出上限（{limit_text}），可在 settings.json 的 max_body_mb 或 config.toml 的 max_body_mb 调整"),
-            )
-                .into_response();
-        }
-        Err(ReadBodyError::Io(e)) => {
-            tracing::error!(error = %e, "读取请求体失败");
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("请求体读取失败（连接中断或本地磁盘缓存写入失败）: {e}"),
-            )
-                .into_response();
-        }
-    };
+    let req_body =
+        match read_request_body(req.into_body(), body_limit, state.spool_dir.as_deref()).await {
+            Ok(b) => b,
+            Err(ReadBodyError::TooLarge) => return body_too_large_response(body_limit),
+            Err(ReadBodyError::Io(e)) => {
+                tracing::error!(error = %e, "读取请求体失败");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("请求体读取失败（连接中断或本地磁盘缓存写入失败）: {e}"),
+                )
+                    .into_response();
+            }
+        };
 
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-
-    let upstream_base = state.config.base_url.trim_end_matches('/');
-    let target_url = format!("{}{}", upstream_base, path_and_query);
+    let target_url = upstream_url(&state.config, &uri);
 
     tracing::info!(method = %method, path = %path_and_query, target = %target_url, "代理请求");
 
@@ -1517,6 +1525,186 @@ async fn forward_once(
     }
 }
 
+/// 上游目标 URL：base_url（归一时已去尾斜杠，此处再 trim 一次以容忍直接构造的
+/// Config）+ 原样的 path/query。两条转发路径共用，避免拼接规则各写一遍而漂移。
+fn upstream_url(config: &Config, uri: &http::Uri) -> String {
+    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    format!(
+        "{}{}",
+        config.base_url.trim_end_matches('/'),
+        path_and_query
+    )
+}
+
+/// 请求体上限的人类可读文案（0 = 不设限 → 「不设限」，否则「N MiB」）。
+/// 缓冲路径与仅转发路径的 413 共用，保证两条路径对用户说同一句话。
+fn limit_text(body_limit: usize) -> String {
+    if body_limit == usize::MAX {
+        "不设限".to_string()
+    } else {
+        format!("{} MiB", body_limit / 1024 / 1024)
+    }
+}
+
+/// 请求体超限的 413 响应：判定、日志与文案收敛在一处，两条路径共用。
+fn body_too_large_response(body_limit: usize) -> Response {
+    let limit_text = limit_text(body_limit);
+    tracing::warn!(limit = %limit_text, "请求体超出上限");
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!("请求体超出上限（{limit_text}），可在 settings.json 的 max_body_mb 或 config.toml 的 max_body_mb 调整"),
+    )
+        .into_response()
+}
+
+/// 仅转发模式的核心路径：请求体边收边发上游、上游响应边收边回客户端，
+/// **不缓冲、不落盘、不重试、不检查响应内容**。
+///
+/// 这是模式的定义而非实现偷懒：任何缓冲都会让内存占用随负载增长，任何重放都
+/// 需要先持有完整 body，两者都与「真·增量流（首字节即转发）」互斥。因此这里
+/// 刻意不进重试循环、SSE 保活骨架、错误内容拦截（`is_error_body` /
+/// `is_stream_error_body`）、spool 与 `client_wants_sse` 判定，并且**不做
+/// decode 模块的解码**——本模式不对响应体做任何内容检查，没有解码的用武之地。
+///
+/// 本模式下不生效的配置项：`disk_cache`、`spool_limit_mb`、
+/// `keepalive_interval_secs`、`max_retry_backoff_secs`；`max_body_mb` 仍强制。
+async fn forward_only_proxy(
+    state: AppState,
+    method: http::Method,
+    target_url: String,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Response {
+    let reqwest_method =
+        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
+
+    let mut builder = state.client.request(reqwest_method, &target_url);
+
+    // 请求头透传：与 forward_once 相同的「过滤 hop-by-hop + 逐个 header」写法
+    //（覆盖/追加已在 proxy_handler 中应用）
+    for (name, value) in headers.iter() {
+        let name_str = name.as_str();
+        if is_hop_header(name_str) {
+            continue;
+        }
+        if let Ok(n) = reqwest::header::HeaderName::from_bytes(name_str.as_bytes())
+            && let Ok(v) = reqwest::header::HeaderValue::from_bytes(value.as_bytes())
+        {
+            builder = builder.header(n, v);
+        }
+    }
+
+    // 请求体：一律流式（不做空 body 特判——空 body 的流只是立刻结束）。计数
+    // 适配器边收边数，累计超过 max_body_mb 即产出 Err——Err 会让 reqwest 立刻
+    // 中止上游请求（不再继续拉请求体），我们据此回 413。limit 为 usize::MAX
+    //（max_body_mb=0）时永不触发，这是本模式唯一仍强制的限制。
+    let limit = state.config.body_limit_bytes();
+    let too_large = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = too_large.clone();
+    // unfold 状态 = (上游流, 已见字节数)；产出的就是同一份 chunk（移动，不拷贝、
+    // 不累积），故在途内存与负载大小无关
+    let counted = futures_util::stream::unfold(
+        (body.into_data_stream(), 0usize),
+        move |(mut stream, seen)| {
+            let flag = flag.clone();
+            async move {
+                let chunk = stream.next().await?;
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => return Some((Err(e), (stream, seen))),
+                };
+                let seen = seen.saturating_add(chunk.len());
+                if seen > limit {
+                    flag.store(true, AtomicOrdering::Relaxed);
+                    // axum::Error 满足 wrap_stream 的错误约束（Into<BoxError>），
+                    // 无需 map_err；真实原因由 too_large 标记承载
+                    return Some((
+                        Err(axum::Error::new(std::io::Error::other(
+                            "请求体超出上限（仅转发模式流式中断）",
+                        ))),
+                        (stream, seen),
+                    ));
+                }
+                Some((Ok(chunk), (stream, seen)))
+            }
+        },
+    );
+    // 以 chunked 发往上游：我们不再持有完整长度（长度要读完才知道，而读完即
+    // 缓冲），content-length 无从回填——这是本模式的代价之一，也是必然后果。
+    builder = builder.body(reqwest::Body::wrap_stream(counted));
+
+    let resp = match builder.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            // send() 的失败有两种来源：上游真的失败，或请求体适配器产出 Err 令
+            // reqwest 主动中止（此时超限标记已置位）。必须先查标记再定状态码，
+            // 否则用户看到的是「上游 502」而非「你的请求体太大」。
+            if too_large.load(AtomicOrdering::Relaxed) {
+                return body_too_large_response(limit);
+            }
+            // 上游失败不重试（本模式的定义），但必须记进 note_upstream_failure，
+            // 否则 status 的「最近错误」对这类实例永久显示「无」
+            let reason = format!("上游请求失败: {e}");
+            state.note_upstream_failure(&reason);
+            tracing::warn!(error = %e, target = %target_url, "上游请求失败（仅转发模式不重试）");
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("{reason}（仅转发模式不重试）"),
+            )
+                .into_response();
+        }
+    };
+
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut resp_builder = Response::builder().status(status);
+    // 状态码与响应头原样透传（过滤 hop-by-hop，但保留 content-length）。append
+    // 而非 insert：Set-Cookie 等同名多值头不能坍缩为最后一个
+    for (name, value) in resp.headers().iter() {
+        let name_str = name.as_str();
+        if is_hop_response_header(name_str) {
+            continue;
+        }
+        if let Ok(n) = HeaderName::from_bytes(name_str.as_bytes())
+            && let Ok(v) = HeaderValue::from_bytes(value.as_bytes())
+        {
+            resp_builder = resp_builder.header(n, v);
+        }
+    }
+
+    // 响应流：直回客户端。成功块只累加已转发字节数（供中断日志定位断点），不
+    // 复制、不缓存、不检查内容。客户端断开时本 Body 被 drop，reqwest 连接随之
+    // 关闭、上游生成立即停止——既有的计费保护靠 Drop 天然成立，无需额外代码。
+    let forwarded = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = forwarded.clone();
+    let stream = resp.bytes_stream().map(move |chunk| match chunk {
+        Ok(c) => {
+            counter.fetch_add(c.len() as u64, AtomicOrdering::Relaxed);
+            Ok(c)
+        }
+        Err(e) => {
+            // 上游响应流中断：**直接截断**——绝不注入任何上游未发出的字节（那
+            // 是伪造数据），也不重试（本模式已放弃重试能力）。错误记入
+            // note_upstream_failure 并带上已转发字节数，便于判断断在了哪里。
+            let forwarded_bytes = counter.load(AtomicOrdering::Relaxed);
+            let reason = format!("上游响应流中断: {e}");
+            state.note_upstream_failure(&reason);
+            tracing::warn!(
+                error = %e,
+                forwarded_bytes,
+                "上游响应流中断，连接就此截断（仅转发模式不重试）"
+            );
+            Err(std::io::Error::other(reason))
+        }
+    });
+
+    // 与 build_replay_response 同款收尾：header 逐条经 from_bytes 校验过、status
+    // 已降级兜底，body() 的错误态不可能出现（框架保证，不做不可达分支）
+    resp_builder
+        .body(Body::from_stream(stream))
+        .unwrap()
+        .into_response()
+}
+
 fn build_response(status: StatusCode, headers: HeaderMap, body: Bytes) -> Response {
     let mut resp = Response::builder().status(status);
     for (name, value) in headers.iter() {
@@ -1696,6 +1884,38 @@ mod tests {
             "Upgrade",
         ] {
             assert!(is_hop_header(name), "大小写不应影响 {name} 的 hop 判定");
+        }
+    }
+
+    // ---- is_hop_response_header：响应侧过滤 = hop 头去掉 content-length ----
+
+    #[test]
+    fn response_hop_filter_keeps_content_length() {
+        // 字节未经变换，上游声明的长度仍精确：剥掉只会让定长响应退化为 chunked
+        for name in ["content-length", "Content-Length", "CONTENT-LENGTH"] {
+            assert!(
+                !is_hop_response_header(name),
+                "{name} 在响应侧必须保留（字节未经变换）"
+            );
+            assert!(is_hop_header(name), "但它在请求侧仍是 hop 头");
+        }
+        // 其余 hop 头响应侧照旧过滤
+        for name in [
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "host",
+        ] {
+            assert!(is_hop_response_header(name), "{name} 在响应侧应被过滤");
+        }
+        // 普通端到端头不受影响
+        for name in ["content-type", "set-cookie", "x-custom"] {
+            assert!(!is_hop_response_header(name), "{name} 不应被过滤");
         }
     }
 

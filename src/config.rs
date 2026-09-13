@@ -18,6 +18,9 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_MAX_BODY_MB: u64 = 128;
 /// 磁盘缓存的内置默认值（开）。语义见 Config::disk_cache。
 pub const DEFAULT_DISK_CACHE: bool = true;
+/// 仅转发模式的内置默认值（关）。语义与代价见 Config::forward_only——
+/// 开启即放弃本产品最核心的重试保障，故默认必须为关。
+pub const DEFAULT_FORWARD_ONLY: bool = false;
 
 /// 配置文件内容
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +83,21 @@ pub struct Config {
     /// None = toml 未显式配置（由 main 启动时注入 settings 值）。
     #[serde(default)]
     pub disk_cache: Option<bool>,
+    /// 仅转发模式：请求体边收边转发上游、上游响应边收边回客户端，全程不缓冲、
+    /// 不落盘、不重试，也不发保活心跳。进程内存与负载大小完全解耦，下游拿到
+    /// 真·增量流（首字节即转发，不必等上游 spool 完成）。
+    /// **代价是失去重试能力**——这是模式的定义而非缺陷：上游中途断开时响应就
+    /// 到此截断（不注入任何上游未发出的字节），代理不会重放请求；上游请求失败
+    /// 直接 502。要让出核心保障，请确认你确实接受这一点。
+    /// 适用场景：需要本地改写请求头（鉴权/追加头）+ 需要真流式 + 对该 API 的
+    /// 稳定性有把握（不频繁中断）。
+    /// 本模式下**不生效**的配置项：`disk_cache`、`spool_limit_mb`、
+    /// `keepalive_interval_secs`、`max_retry_backoff_secs`（重试与 spool 两条
+    /// 链路整体不进）；`max_body_mb` 仍强制——流式途中计数超限即 413。
+    /// 未设置时用 settings.json 的 `forward_only`（全局默认，内置 false）。
+    /// None = toml 未显式配置（由 main 启动时注入 settings 值）。
+    #[serde(default)]
+    pub forward_only: Option<bool>,
     /// spool 临时文件目录覆盖（serde skip，不落盘）。仅测试注入用：集成测试
     /// 进程内构建 AppState 时若无此覆盖，会按端口写入真实 ~/.aproxy/spool/。
     /// 生产路径为 None，实际目录 = ~/.aproxy/spool/<端口>/。
@@ -140,6 +158,7 @@ impl Default for Config {
             read_timeout_secs: default_read_timeout_secs(),
             max_body_mb: None,
             disk_cache: None,
+            forward_only: None,
             spool_dir_override: None,
         }
     }
@@ -268,6 +287,16 @@ impl Config {
     /// 磁盘缓存是否启用（同 body_limit_bytes 的注入/回退语义）
     pub fn disk_cache_enabled(&self) -> bool {
         self.disk_cache.unwrap_or(DEFAULT_DISK_CACHE)
+    }
+
+    /// 仅转发模式是否启用（同 body_limit_bytes 的注入/回退语义：toml 显式值 >
+    /// settings 注入值 > 内置 false）。
+    ///
+    /// 所有消费点都必须走本方法而非 `Option::unwrap()`——doctor 的
+    /// parse_config_file、find::discover 与大量测试直接构建的 AppState 都不经
+    /// settings 注入，`None` 在这些路径上是常态。
+    pub fn forward_only_enabled(&self) -> bool {
+        self.forward_only.unwrap_or(DEFAULT_FORWARD_ONLY)
     }
 }
 
@@ -550,6 +579,36 @@ mod tests {
             "None 回退内置 128MB"
         );
         assert!(legacy.disk_cache_enabled(), "None 回退内置开启");
+    }
+
+    #[test]
+    fn forward_only_override_semantics() {
+        // toml 覆盖字段：Some(true)/Some(false) 落盘往返；未配置（None）时
+        // forward_only_enabled 回退内置默认 false。None 语义是「运行时由
+        // settings 注入」，此处验证的是注入前的回退（doctor / find / 测试
+        // 直接构建 AppState 时正是这条路径，故绝不能对 None 做 unwrap）。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.toml");
+        for value in [true, false] {
+            let cfg = Config {
+                base_url: "https://api.example.com".to_string(),
+                forward_only: Some(value),
+                ..Default::default()
+            };
+            save_to(&path, &cfg).unwrap();
+            let loaded = load_from(&path);
+            assert_eq!(loaded.forward_only, Some(value), "显式值应落盘往返");
+            assert_eq!(loaded.forward_only_enabled(), value);
+        }
+
+        // 未配置：回退内置默认（关闭）
+        std::fs::write(&path, "base_url = \"https://api.example.com\"").unwrap();
+        let legacy = load_from(&path);
+        assert_eq!(legacy.forward_only, None, "旧配置文件应读出 None");
+        assert!(
+            !legacy.forward_only_enabled(),
+            "None 回退内置关闭（默认不得启用仅转发模式）"
+        );
     }
 
     #[test]

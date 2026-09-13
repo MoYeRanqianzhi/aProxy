@@ -22,7 +22,9 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     let listen_addr = cfg.listen_addr.clone();
     let base_url = cfg.base_url.clone();
     // spool 残留清理（disk_cache）：bind 前清空本端口的 spool 目录——目录
-    // 归本进程独占，启动时清空即可回收崩溃/强杀残留的临时文件
+    // 归本进程独占，启动时清空即可回收崩溃/强杀残留的临时文件。
+    // 仅转发模式下 spool 链路整体不进，本实例永不产生 spool 文件，此处退化为
+    // no-op（目录可能为空甚至不存在，清理本身幂等无害，故不做特判）
     daemon::clean_spool_dir(daemon::port_of(&listen_addr));
     let state = aproxy::proxy::AppState::new(cfg);
     let app = aproxy::proxy::router(state.clone());
@@ -190,6 +192,15 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
         pid = %std::process::id(),
         "启动 aProxy"
     );
+    // 仅转发模式是「主动放弃重试保障」的取舍，不是无害开关：用 warn 级（而非
+    // info）显式提示，并列出本模式下失效的配置项——按老习惯调过的参数不再生效
+    // 这件事，用户必须知道，否则排障时会往错误的方向找。取值一律走
+    // forward_only_enabled()（settings 注入已完成）。
+    if state.config.forward_only_enabled() {
+        tracing::warn!(
+            "仅转发模式已启用：请求体与响应均不缓冲、不重试（上游失败直接 502、响应流中断直接截断）；disk_cache / spool_limit_mb / keepalive_interval_secs / max_retry_backoff_secs 在本模式下不生效"
+        );
+    }
     if !daemon_child {
         println!("aProxy 已启动（前台）");
         println!("  监听: http://{actual_addr}");

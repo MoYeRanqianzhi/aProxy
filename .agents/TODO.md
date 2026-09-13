@@ -112,8 +112,10 @@
   （announce E0596、is_x86_feature_detected aarch64）、平台硬编码测试×2、
   库层 IPC 环境依赖泄漏（run_dir 参数被全局 env 派生架空 + 误删注册表副作用）、
   有实例 Acked/Swapping 续作被状态机拒绝（相位守卫）。CI unix job 同步升级
-  为 cargo test。CI 首次暴露流程教训：push 后必须 gh run list 确认绿。
+  为 cargo test。CI 首次暴露流程教训：push 后必须 gh run list 确认绿
+  （且要按 workflow 名过滤——同一次 push 会同时触发 CI 与 Review）。
   详录 .agents/memory/2026-09-11-install-three-platform-e2e.md
+  **遗留**：CI 升级后 macos job 一直红（见下节 macOS 支持），当时误报为绿
 - [x] **install 在线渠道深度实测**（2026-09-12，WSL 3 轮 × 16 场景全 PASS）：
   测试 tag（v…tN，用户授权）触发全链发布做真实下载测试。挖出并修复 5 个
   产品 bug + 2 个韧性改进（gnu→musl 自动回退、latest 查询 npm 兜底）+
@@ -145,6 +147,29 @@
   （scripts/install.ps1|sh|cmd，APROXY_HOME 隔离测试，均实测从 GitHub 拉取
   二进制与 skill 并通过校验/落位/--version/幂等全断言）；dependabot 运行中
   （windows-sys 升级建议已忽略并关 PR）
+
+## macOS 支持（必须完成——用户 2026-09-12 定调）
+
+- [ ] **macOS 平台支持修复**（后续协作者在 macOS 真机上完成实现与验证）：
+  当前 macOS 上代理转发可用，但**看护者与 install 的核心保障是坏的**——
+  `#[cfg(unix)]` 的实现依赖 Linux 专用原语：`/dev/shm`（install 宣告节、
+  看护者心跳节）与 `/proc`（进程创建时间 / 镜像路径 / 退出判定 / zombie），
+  macOS 两者皆无。
+  - 症状：CI macos job（`cargo test`）自 `bd36e10` 起**每次红、从未绿过**
+    （3 个 lib 测试失败：宣告节创建 / 心跳节创建 / 本进程创建时间）
+  - 更严重的静默失效：`is_aproxy_process` 对**活**进程返回 false
+    （readlink ENOENT 被当作「进程已死」）→ 选举、收养、处决验证全部失效
+    且不报错；`process_image_path` 恒 None → install 管辖检查全部跳过
+  - 实现方向：介质换 `<APROXY_HOME>/run`（或 temp_dir）并注释语义差异；
+    进程查询走 libproc（`proc_pidpath`/`proc_pidinfo`）+ sysctl（zombie）
+  - 验收：CI macos job 全绿 + 真机行为面实测（看护者选举/收养/心跳/清理、
+    进程身份判定、install 宣告与滚动升级）
+  - 影响面逐行清单、实现细节与验收标准详见
+    `.agents/memory/2026-09-12-macos-support-required.md`
+- [ ] **CI 现状处理（待用户定）**：macos job 红着会让每次 push 的 CI 结论
+  成为 failure，长期会掩盖新失败。可选：(a) 加 `continue-on-error: true`
+  并注释指向本工作项；(b) 保持红作显式提示。**回退到 `cargo check` 不可取**
+  ——check 通过正是这次问题被藏住的原因
 
 ## 已结案（有意跳过，见记忆/审查记录）
 

@@ -21,10 +21,31 @@ install 功能收尾汇报「204 项测试全绿 + 已推送」时，`main` 分�
 
 ## 纪律
 
-- **每次 push 后 `gh run list --branch main --limit 2` 确认 CI 绿，才算收尾。**
+- **每次 push 后确认 CI 绿才算收尾——且必须按 workflow 名过滤**：
+  `gh run list --workflow=CI --limit 3`。同一 push 会同时触发 CI 与 Review
+  两个 workflow，`gh run list --limit 1` 可能抓到 Review 的 success 而误判
+  CI 绿（2026-09-11 夜与 09-12 两次实际踩中，见下节）。
 - unix-only 代码改动后，本地无法编译验证时（交叉缺 gcc），交给 WSL/远端/CI
   三者之一裁决，绝不凭「看起来对」就提交。
-- `.github/workflows/ci.yml` 的 unix job 升级为 `cargo test` 是 TODO 项
-  （行为面实测），编译面 check 至少要盯住。
 
-相关：[[2026-09-11-never-kill-aproxy-by-name]]、[[2026-09-11-install-pitfalls]]
+## 复发（2026-09-12 发现，事故升级为 macOS 未支持）
+
+`gh run list --limit 1` 抓到并发 Review run 的 success，据此两次误报「CI 全绿」。
+实测真相：**macOS job 自 unix job 升级为 `cargo test`（bd36e10）起每次都红**，
+从未绿过一次。3 个失败：
+
+1. `install::announce` 宣告节创建失败
+2. `watchdog` 心跳节创建失败
+3. `watchdog` 本进程创建时间查不到
+
+根因：`#[cfg(unix)]` 的共享内存与进程查询实现是 **Linux 专用**——
+`/dev/shm`（宣告节、心跳节）与 `/proc`（进程创建时间/镜像路径/退出判定）
+在 macOS 都不存在。影响面比测试失败更大：macOS 上看护者心跳、install 宣告、
+进程身份（选举/收养/处决验证）全部失效，且 `is_aproxy_process` 对活进程
+返回 false（readlink ENOENT 被当作「进程已死」）——**静默失效不报错**。
+
+教训：编译面 check 通过 ≠ 平台可用；把 job 从 check 升级为 test 必须当次
+就盯结论，不能默认「升完就绿」。
+
+相关：[[2026-09-11-never-kill-aproxy-by-name]]、[[2026-09-11-install-pitfalls]]、
+[[2026-09-12-install-online-deep-test]]

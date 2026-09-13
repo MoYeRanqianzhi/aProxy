@@ -150,6 +150,10 @@ IPC 通道故障（启动失败）只影响管理命令，代理转发继续（�
   （默认 8 MB，0=不轮转）清空。
 - 所有日志对凭据打码（api_key/头值前 6 字符 + `***`，代理密码、base_url 内嵌
   密码隐去）——日志可安全粘贴分享。
+- 「错误响应预览」行附带 `content-type` / `content-encoding`，并按
+  `content-encoding` **解压后**展示正文（gzip / deflate / br / zstd）——上游压缩
+  的错误页不再只显示一串 hex。**解压只用于日志与错误判定，转发给客户端的字节
+  始终是上游原样**（保真透传不变）。
 
 ## 自愈恢复
 
@@ -237,6 +241,7 @@ install.state 的 `skill` 字段可查。`--skills-only` 单独更新。安装�
 | 客户端非流式请求超时 | 非流式无心跳通道：调大客户端 HTTP 超时或调小 max_retry_backoff_secs |
 | 413 Request Entity Too Large | 请求体超 `max_body_mb`：调大 toml/settings 的值或设 0 |
 | 中文乱码 | 控制台代码页问题；进程入口已自动切 65001，若仍乱查终端自身设置 |
+| 错误响应预览是一串 hex | 该响应体确实是二进制，或其 `content-encoding` 本地无法解码（未知编码/内容损坏/解压后超 8 MiB）——看同一行的 `content-encoding` 字段判断是什么编码 |
 | spool 目录残留 .spooltmp | 异常退出的残留；重启该端口实例即清理 |
 | 实例崩溃后被自动拉起但配置是旧的 | 看门狗按 .restore 记录重拉——改配置后执行 `aproxy restart <端口>`，重启成功即以当前参数重写记录 |
 | status 显示「看护者缺席」相关告警 | 看护者被杀/假死；守护 5 分钟内自动补种，或手动跑一次 `aproxy start <别名>` |

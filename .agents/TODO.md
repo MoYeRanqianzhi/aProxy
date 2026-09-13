@@ -17,6 +17,23 @@
   **代码实现与测试由并行 agent 完成，落地后按上列约束逐条核对本条目**。
   详见 `.agents/memory/2026-09-14-forward-only.md`
 
+## 压缩响应体检查（2026-09-14，用户实测暴露）
+
+- [x] **压缩错误体不再退化为 hex**（f37e813 + 9ed566f）：Cloudflare 的 brotli
+  404 页在日志里只剩 hex。根因是**检查路径跑在压缩字节上**（reqwest 为保真透传
+  刻意不解压），连带 `is_error_body` / `is_stream_error_body` **静默失效**——
+  HTTP 200 携带 error JSON 不再重试、流尾 error 事件检测不到。修法：新增
+  `src/decode.rs` 解一份副本供检查，**转发字节不变**；日志补
+  content-type/content-encoding 字段。新依赖 brotli + ruzstd（均纯 Rust）。
+  端到端复现验证 + `cargo test --locked` 220 项全绿 + clippy 零警告。
+  详见 `.agents/memory/2026-09-14-compressed-body-inspection.md`
+- [ ] **测试补强：mock 上游要覆盖压缩**：既有集成测试的 mock 从不发
+  `content-encoding`，这正是 220 项全绿却漏掉上述 bug 的直接原因。补一组
+  「压缩响应体」集成测试（gzip/br 各一，覆盖判定与预览两条路径）
+- [ ] **磁盘模式的压缩体判定（已知边界）**：响应 > 1 MiB 时判定仍走原始字节的
+  增量扫描，压缩体不解码（仅预览解头部快照）。现实中 >1 MiB 的压缩错误体不存在，
+  故不做流式解码；若将来出现真实场景再补
+
 ## 近期收口（全部完成）
 
 - [x] **A. alpha.4 收口**：bump + tag v0.1.0-alpha.4；release 构建于独立 `CARGO_TARGET_DIR=target-rel`（target/release/aproxy.exe 被生产实例锁定不可覆盖）——用户自行替换部署
@@ -63,6 +80,15 @@
   无 NODELAY 上游配合时有 40ms Nagle×delayed-ACK 咬合
 - [ ] **测试基建**：看门狗测试子进程清理 RAII 化（panic 路径手写 kill 会跳过）；
   daemon.rs 的 UDS IPC roundtrip 单测（现为 Windows-only）
+- [ ] **测试守护泄漏治理**（2026-09-14 现场实测）：机器上累积过 46 个 aproxy 进程，
+  绝大多数是历史测试遗留的守护（最老 70 小时），其中 `start alias-test-<端口>
+  --daemon-watchdog` 这个**看护进程**锁住 `target/debug/aproxy.exe`，导致后续
+  `cargo test` 无法重新链接（`failed to remove file … 拒绝访问`），并让
+  `restart_integration` 并行跑失败 215 秒（**单跑 4.5 秒通过**，与既有
+  `alias_start_and_stop_roundtrip` 同族的端口/时序竞争）。清理须遵铁则：
+  **绝不按名批量杀**，只走测试守护的 `APROXY_HOME` + `stop <端口>`（看护进程
+  无端口，等其 `watchdog_idle_exit_secs` 空闲自灭）。根因是测试收尾未覆盖
+  panic/超时路径，与上一条 RAII 化同源
 
 ## 待修（2026-09-10 压力实测审查轮）——已全部修复（a389d40/01978b4/f13bc0a/9cc53c8，详录 .agents/docs/unix-stress-review.md 修复记录节）
 

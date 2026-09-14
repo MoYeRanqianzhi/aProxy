@@ -177,9 +177,23 @@
   alpha.12（Cargo.toml 已 bump，待发布）。详录
   .agents/memory/2026-09-12-install-online-deep-test.md 与
   .agents/memory/2026-09-12-release-version-alignment.md
-- [ ] **正式发布 v0.1.0-alpha.12**（等用户下令；测试 tag 全链已验证）
+- [x] **正式发布 v0.1.0-alpha.12**（2026-09-14，用户下令）：annotated tag
+  `v0.1.0-alpha.12` 打于 `50b94f2`，触发 Release workflow（test 门禁 → 11 变体
+  构建 → GitHub/npm/crates.io 发布）。发版时 CI 状态：ubuntu job 绿、macOS 红
+  （既有未支持平台）、windows 红于一条**既有竞态偶发**（见下条）。三平台验证：
+  本地 Windows 241 项全绿、远端 Ubuntu 全绿；WSL 因无网络拉不下新依赖
+  （brotli/ruzstd）未能跑，其环境事实见
+  `.agents/docs/environment.md` / 本文件「WSL 无 git/curl/python3 且有 TLS 故障」
 - [ ] **测试稳定性**：proxy_integration 的 alias_start_and_stop_roundtrip
   偶发并行失败（单跑必过——端口/时序竞争，本轮全量跑撞上一次）
+- [ ] **测试稳定性（新，有本机复现）**：`install_flow_lib` 的
+  `continue_from_swapping_with_live_instance_redoes_swap` 是**既有竞态偶发**——
+  2026-09-14 本机隔离重复 5 次**复现 1 次失败**（第 2 次耗时 90.33 秒，撞测试
+  内部 90 秒超时；CI 那次是同一测试的 `done 后状态文件应删除` 断言，症状不同但
+  同一处）。与当轮改动无文件交集（该文件未被触碰），ubuntu CI 恒绿、远端 Ubuntu
+  全绿。**注意它会卡住 Release 的 test 门禁（跑在 windows-latest）**，
+  值得专项排查：疑似「活实例滚动重启 + 状态文件删除」这条路径在 Windows 上有
+  时序/句柄竞争（Windows 上删除被打开的文件会失败）。
 - [x] **渠道 P0 全配 + 可信发布自动化**（2026-09-11，alpha.7~9 三轮发布实测）：
   npm（@meowo/aproxy，esbuild 式多平台包：主包 JS 转发器 + 9 平台子包
   os/cpu/libc 装配）、crates.io（aproxy）、cargo-binstall（零配置命中内置

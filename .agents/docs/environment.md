@@ -35,6 +35,26 @@
   [[warning-zero-policy]]）
 - `clippy --fix` 的 let-chains 合并会打乱缩进——跑完必须 `cargo fmt`
 
+## 三平台实测环境（2026-09-14 实测）
+
+三个平台各有各的坑，动手前先看这里能省一轮：
+
+- **WSL（Debian，WSL2）**：有 rustup 工具链（cargo 1.98.1），但**没有 git / curl /
+  python3**，且**网络不可用**（TLS 全失败，疑似 Windows 侧 TUN 劫持）——因此
+  **拉不下新依赖**。仓库经 `/mnt/g/ClaudeProjects/aProxy` 直接访问（无独立克隆，
+  同一棵工作树，故不需要 git）。2026-09-14 就是卡在这：`cargo test` 报
+  `failed to get brotli-decompressor as a dependency`。要在 WSL 跑全量，
+  得先把 crates 的 registry 缓存同步进去（或改用远端机器）。
+  **教训**：新增依赖后，WSL 不再能靠 `git pull` 直接验证。
+- **远端 `ssh remote`**（Ubuntu，kernel 6.8，x86_64，10 核）：工具链在
+  `~/.cargo/bin`（非交互 shell 的 PATH 里没有，须 `export PATH=$HOME/.cargo/bin:$PATH`），
+  有 git 与 curl，网络正常。历史测试克隆散落在 `/root/aproxy-{e2e,fix,test,unixfix}`，
+  **新验证请用全新目录**（如 `/root/aproxy-wfverify`）克隆，别覆盖它们。
+  glibc 2.39（与 CI ubuntu-24.04 同级）。
+- **CI（GitHub Actions）**：`gh run list --limit 1` 会误抓到并发的 Review workflow，
+  **必须 `--workflow=CI` 过滤**（见 [[2026-09-11-ci-unix-blindspot]]）。
+  Release 的 test 门禁跑在 **windows-latest**，与 CI 的 windows job 同平台。
+
 ## 已知坑
 
 - `cargo test` 全量在 Windows 上约 20-40s（集成 17s 主导），守护测试串行更稳

@@ -1924,6 +1924,329 @@ async fn forward_only_enforces_max_body_mb() {
 }
 
 // ---------------------------------------------------------------------------
+// 22i. 仅转发模式：上游不可达 → 502 + 不重试 + 失败进入观测
+//
+// 规格原文是「上游请求失败 → 502 + note_upstream_failure + 不重试」，此前零覆盖。
+//
+// 鉴别力（实现退化成什么样会红）：
+// - 若 forward_only 分支被移出 proxy_handler（落回常规缓冲路径），常规模式对
+//   不可达上游是**无限重试**，下面的 10 秒超时直接红；
+// - 若去掉 note_upstream_failure 调用，last_error 保持 None → 红；
+// - 若 retries_total 被计入（把首轮当重试、或误入重试循环），计数断言红；
+// - 状态码改成 500/504 或去掉原因文案 → 状态码/正文断言红。
+//
+// 观测经**进程内同一个 Arc**（AppState::stats）读取：这正是热路径写入的那一份。
+// 「serve_forever 是否把它共享进 IPC」属于接线问题，由进程级测试 31/32 覆盖，
+// 此处不重复（那条才是接线缺陷的盲区）。
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn forward_only_unreachable_upstream_returns_502() {
+    // 取一个刚释放的端口：bind 到 0 拿到内核分配的端口后立刻 drop，此后对该
+    // 端口的 connect 必然 ECONNREFUSED（环回上无监听者），且失败是即时的——
+    // 不依赖 connect_timeout 收敛
+    let dead_addr = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        drop(l);
+        addr
+    };
+
+    let mut cfg = proxy_config_for(&format!("http://{dead_addr}"));
+    cfg.forward_only = Some(true);
+    let state = AppState::new(cfg);
+    // 路由拿走一份 AppState，这里留一份读观测：两者共享同一组 Arc
+    let probe = state.clone();
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(state)).await;
+
+    let client = local_client();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        client
+            .post(format!("{proxy_url}/v1/messages"))
+            .body("{}")
+            .send(),
+    )
+    .await
+    .expect("仅转发模式的上游失败必须立刻终结；10 秒内没有响应说明落进了常规模式的重试循环")
+    .unwrap();
+
+    assert_eq!(resp.status(), 502, "上游请求失败应回 502");
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("上游请求失败"),
+        "502 正文应带上失败原因，实际: {body}"
+    );
+    assert!(
+        body.contains("仅转发模式不重试"),
+        "502 正文应指明本模式不重试（否则排障会指望它重试），实际: {body}"
+    );
+
+    assert_eq!(
+        probe.stats.requests_total.load(Ordering::Relaxed),
+        1,
+        "应恰好计 1 次客户端请求"
+    );
+    assert_eq!(
+        probe.stats.retries_total.load(Ordering::Relaxed),
+        0,
+        "仅转发模式不得重试：重试计数必须为 0（常规模式对不可达上游会无限重试）"
+    );
+    let last_error = probe.stats.last_error.lock().unwrap().clone();
+    let msg = last_error.map(|(m, _)| m).unwrap_or_default();
+    assert!(
+        msg.contains("上游请求失败"),
+        "失败必须记入观测（status 的「最近错误」），实际: {msg:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 22i-2. 仅转发模式：网络失败在上游侧只有**一次**尝试（监听器直接计数）
+//
+// 22i 指向的端口无人监听，「尝试了几次」在那一侧不可观测——那条测试能证明
+// 「没有落进无限重试循环」（10 秒超时是硬约束），但不能证明「恰好一次」。
+// 这里换成**接受连接后立刻关闭、不回任何字节**的计数监听器：每次尝试必然
+// 建立一条连接，于是连接数就是尝试数。
+//
+// 鉴别力：若 forward_only_proxy 被接回重试循环（哪怕只重试一次），计数变 2 → 红；
+// 若错误分支被改成「失败当成功回放」，502 断言红。
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn forward_only_makes_exactly_one_upstream_attempt_on_network_failure() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let counter = attempts.clone();
+    // 接受即关闭：不给状态行、不给响应体，对代理就是 send() 失败
+    let acceptor = tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((sock, _)) => {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    drop(sock);
+                }
+                // 监听器出错即收工，避免测试结束后任务空转
+                Err(_) => return,
+            }
+        }
+    });
+
+    let mut cfg = proxy_config_for(&format!("http://{addr}"));
+    cfg.forward_only = Some(true);
+    let state = AppState::new(cfg);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(state)).await;
+
+    let client = local_client();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.get(format!("{proxy_url}/v1/attempts")).send(),
+    )
+    .await
+    .expect("上游连接被立即关闭时必须立刻终结；10 秒内没有响应说明进了重试循环")
+    .unwrap();
+    assert_eq!(resp.status(), 502, "上游网络失败应回 502");
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("上游请求失败"),
+        "502 正文应带上失败原因，实际: {body}"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "网络失败在上游侧必须只尝试一次（仅转发模式不重试）"
+    );
+
+    acceptor.abort();
+}
+
+// ---------------------------------------------------------------------------
+// 22j. 仅转发模式：上游定长响应经代理后**仍带 content-length**（不退化为 chunked）
+//
+// 规格「保留 content-length」此前只有 helper 单测（is_hop_response_header 的
+// 直接调用），没有端到端断言——调用点写错（比如传错 upstream_has_te）照样能过。
+//
+// 鉴别力：断言落在**响应头**上。若调用点退回 is_hop_header（无条件剥 CL）或
+// upstream_has_te 传成 true，CL 被剥掉，下游只能按 chunked 分帧（from_stream
+// 的 body 无精确长度），客户端拿到的响应头里就没有 content-length → 红。
+// 只断言 body 字节的写法抓不到这个退化。
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn forward_only_preserves_content_length_on_fixed_length_response() {
+    /// 定长响应体：axum 对 &'static str 自动写入 content-length
+    const BODY: &str = r#"{"ok":true,"model":"test","n":1234567890}"#;
+
+    let upstream = Router::new().route("/v1/fixed", any(|| async { (StatusCode::OK, BODY) }));
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.forward_only = Some(true);
+    let proxy_state = AppState::new(cfg);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = local_client();
+    let resp = client
+        .get(format!("{proxy_url}/v1/fixed"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let cl = resp
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .map(|v| v.to_str().unwrap().to_string());
+    assert_eq!(
+        cl.as_deref(),
+        Some(BODY.len().to_string().as_str()),
+        "上游定长响应的 content-length 必须原样保留（字节未经变换，长度仍精确）；\
+         实际响应头: {:?}",
+        resp.headers()
+    );
+    assert!(
+        resp.headers()
+            .get(axum::http::header::TRANSFER_ENCODING)
+            .is_none(),
+        "保留 content-length 后不应退化为 chunked 分帧，实际响应头: {:?}",
+        resp.headers()
+    );
+    assert_eq!(resp.text().await.unwrap(), BODY, "响应体应原样透传");
+}
+
+// ---------------------------------------------------------------------------
+// 22k. 仅转发模式：响应流式期间刷新活动时间戳
+//
+// 回归锚点（刚修的行为）：本模式下小时级长流是常态，若响应流路径不刷新
+// last_activity_secs，一个正在传输的实例会被 stop idle / status --idle 判为
+// 闲置并强退——恰在传输中途被掐断，正砸在本模式的存在理由上。
+//
+// 构造成确定性的（不依赖真实时钟竞态）：门控上游在两次 chunk 之间挂起，客户端
+// 收到首块后把活动时间戳**显式拨回远古**（模拟上游长时间无输出、idle 已越线），
+// 此时上游仍被门控，唯一可能刷新它的就是「放行后的那个 chunk 被转发」。
+//
+// 鉴别力：若响应流 map 里的 store 被删（或只在请求入口刷新一次），时间戳会
+// 停在 1 → 红。
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn forward_only_refreshes_activity_while_response_streams() {
+    use futures_util::StreamExt;
+
+    let (upstream, release) =
+        gated_chunk_router("/v1/messages", b"data: chunk-A\n\n", b"data: chunk-B\n\n");
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.forward_only = Some(true);
+    let state = AppState::new(cfg);
+    let probe = state.clone();
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(state)).await;
+
+    let client = local_client();
+    let resp = client
+        .post(format!("{proxy_url}/v1/messages"))
+        .body("ping")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let mut stream = resp.bytes_stream();
+    let first = stream.next().await.unwrap().unwrap();
+    assert_eq!(first.as_ref(), b"data: chunk-A\n\n");
+
+    // 拨回远古：此后到 chunk-B 到达之前，上游被门控挂住，不可能有任何刷新
+    // （请求入口那次 store 早已发生，重试轮也不存在——本模式无重试）
+    probe.last_activity_secs.store(1, Ordering::Relaxed);
+
+    release.send(()).unwrap();
+    let second = stream.next().await.unwrap().unwrap();
+    assert_eq!(second.as_ref(), b"data: chunk-B\n\n");
+
+    let activity = probe.last_activity_secs.load(Ordering::Relaxed);
+    assert!(
+        activity > 1,
+        "转发 chunk 时必须刷新活动时间戳，否则长流实例会被 stop idle 误杀；实际仍为 {activity}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 22l. 仅转发模式：客户端上传途中断开 → 400，且**不**记入「上游请求失败」
+//
+// 回归锚点（刚修的行为）：reqwest 的 send() 失败有两种来源——上游真的失败，
+// 或请求体适配器产出 Err 令其主动中止（超限 / 客户端上传中断）。此前两类混为
+// 一谈，客户端自己断开会把排障矛头指向根本没收到完整请求体的上游。
+//
+// 构造：裸 TCP 客户端声明一个远大于实发字节数的 Content-Length，发一部分就
+// 半关写端（FIN 但保留读端），于是代理侧的请求体流以 Err 收场；上游则必须
+// **读完整个请求体**才回响应（否则它抢答，send() 会先拿到 200）。
+//
+// 鉴别力：若 client_gone 标记缺失（或判定顺序错、标记未置位），send() 的错误
+// 会落进通用分支，记下「上游请求失败: …」并回 502 → last_error 断言与状态码
+// 断言都会红。
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn forward_only_client_upload_abort_is_not_an_upstream_failure() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // 上游读完整个请求体才回响应：读失败（客户端中断导致 reqwest 中止）时回 400，
+    // 绝不会先于 reqwest 的错误抢答一个成功响应
+    let upstream = Router::new().route(
+        "/v1/upload",
+        any(|req: axum::extract::Request| async move {
+            match axum::body::to_bytes(req.into_body(), 64 * 1024 * 1024).await {
+                Ok(b) => (StatusCode::OK, format!("stored {}", b.len())).into_response(),
+                Err(_) => (StatusCode::BAD_REQUEST, "incomplete body").into_response(),
+            }
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.forward_only = Some(true);
+    let state = AppState::new(cfg);
+    let probe = state.clone();
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(state)).await;
+
+    // 裸 TCP：声明 64 KiB 却只发 1 KiB 就半关写端
+    let addr = proxy_url.trim_start_matches("http://").to_string();
+    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let head = format!(
+        "POST /v1/upload HTTP/1.1\r\nhost: {addr}\r\ncontent-length: {}\r\n\r\n",
+        64 * 1024
+    );
+    sock.write_all(head.as_bytes()).await.unwrap();
+    sock.write_all(&vec![b'x'; 1024]).await.unwrap();
+    sock.flush().await.unwrap();
+    // 半关：发 FIN 但保留读端，好让代理侧的 400 能回到我们手里
+    sock.shutdown().await.unwrap();
+
+    // 读回响应（半关后仍可读）。代理可能只回状态行与正文，不保证本机 socket
+    // 何时收到 EOF，故读到「读满一段」或超时即止
+    let mut raw = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut raw)).await;
+    let text = String::from_utf8_lossy(&raw).to_string();
+    assert!(
+        text.starts_with("HTTP/1.1 400"),
+        "客户端上传途中断开应与缓冲路径同一归因（400），实际响应: {text:?}"
+    );
+    assert!(
+        text.contains("客户端在上传途中断开"),
+        "400 正文应指明是客户端断开，而非上游失败，实际: {text:?}"
+    );
+
+    // 归因锚点：客户端自己断开**不得**污染「最近错误」——否则 status 会把矛头
+    // 指向根本没收到完整请求体的上游
+    let last_error = probe.stats.last_error.lock().unwrap().clone();
+    assert!(
+        last_error.is_none(),
+        "客户端主动断开不是上游失败，不得记入 last_error，实际: {last_error:?}"
+    );
+    assert_eq!(
+        probe.stats.requests_total.load(Ordering::Relaxed),
+        1,
+        "应恰好计 1 次客户端请求"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 21. CLI 进程级：--config 显式配置文件（多开不同配置的进程）
 //
 // 每个进程一份配置：启动时加载指定文件，config 子命令读写同一文件。
@@ -2009,10 +2332,34 @@ fn cli_config_flag_scopes_config_subcommand() {
 // 12345 等用户可能使用的端口。
 // ---------------------------------------------------------------------------
 
-/// 从测试进程 pid 派生第 offset 个互不相同的守护测试端口（25000..=65000 区间，
+/// 从测试进程 pid 派生第 offset 个互不相同的守护测试端口（25000..=65535 区间，
 /// 避开默认端口 12345 与常见手工实例端口；每个测试用不同 offset，互不冲突）。
+///
+/// 派生出起点后**逐个试探可绑定性**，而不是盲取：Windows 上 Hyper-V/WinNAT 会
+/// 保留成片的排除区间（`netsh interface ipv4 show excludedportrange protocol=tcp`
+/// 实测本机有 50000-51059、63912-65081 等），落进去时守护以「无法绑定」直接启动
+/// 失败。危害不止一个端口：同一进程内所有守护测试共用同一 base，一挂就是一整片，
+/// 实测约一成多的整套运行会因此变红（与实现无关的假失败，最坏时被当成回归）。
+///
+/// 步长取 16 而非 1：offset 实际只用 0..=12，故不同 offset 落在不同的模 16 余数
+/// 类里，「每个测试用不同端口」的既有约束得以保持——顺带还能跳过正被其他测试的
+/// 残留守护占用的端口。
 fn daemon_test_port(offset: u32) -> u16 {
-    (25000 + (std::process::id() % 20000) * 2 + offset) as u16
+    let base = 25000 + (std::process::id() % 20000) * 2;
+    // 96 步 × 16 = 1536 宽的窗口：本机最宽的连续排除块（50000-51059，1060 宽）
+    // 装得下。窗口贴着上界时循环会提前 break，那里 65082..65535 是空的，够用。
+    for step in 0..96u32 {
+        let candidate = base + offset + step * 16;
+        if candidate > u16::MAX as u32 {
+            break;
+        }
+        if std::net::TcpListener::bind(("127.0.0.1", candidate as u16)).is_ok() {
+            return candidate as u16;
+        }
+    }
+    // 全部候选都不可绑定（实测不会发生）：退回起点，让测试以「无法绑定」明确
+    // 失败，而不是悄悄换到别的端口导致断言指向错的地方
+    (base + offset) as u16
 }
 
 /// 既有守护测试的三个端口（offset 0..=2）。
@@ -3110,10 +3457,27 @@ fn ipc_stats_reflect_real_traffic() {
         .build()
         .unwrap();
 
-    // mock 上游恒 200：走首轮成功快速路径，不涉及重试
-    let (upstream, _handle) = rt.block_on(bind_random_router(
-        Router::new().fallback(any(|| async { (StatusCode::OK, "{\"ok\":true}") })),
-    ));
+    // mock 上游：**只对第一个请求**回 500，其后恒 200。刻意的——若上游恒 200
+    // 走首轮成功快速路径，`retries_total == 0` 这条断言无论实现好坏都成立
+    // （恒真、无法证伪）：0 既可能是「没重试」，也可能是「重试计数根本没接线」。
+    // 让第一个请求必然产生一次重试，该断言才有鉴别力。
+    let seen = Arc::new(AtomicUsize::new(0));
+    let seen_clone = seen.clone();
+    let (upstream, _handle) =
+        rt.block_on(bind_random_router(Router::new().fallback(any(move || {
+            let seen = seen_clone.clone();
+            async move {
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "{\"type\":\"error\",\"error\":{\"type\":\"overloaded\"}}",
+                    )
+                } else {
+                    (StatusCode::OK, "{\"ok\":true}")
+                }
+            }
+        }))));
 
     let cfg_file = home.join("observe.toml");
     std::fs::write(
@@ -3161,7 +3525,11 @@ fn ipc_stats_reflect_real_traffic() {
     let url = format!("http://127.0.0.1:{port}/v1/observe");
     for i in 0..3 {
         let resp = rt.block_on(client.get(&url).send()).unwrap();
-        assert_eq!(resp.status(), 200, "第 {i} 个请求应 200");
+        assert_eq!(
+            resp.status(),
+            200,
+            "第 {i} 个请求应 200（首个经一次重试后成功）"
+        );
         rt.block_on(resp.bytes()).unwrap();
     }
 
@@ -3172,5 +3540,178 @@ fn ipc_stats_reflect_real_traffic() {
         info.requests_total, 3,
         "IPC 应报告 3 次请求（回归：曾因统计源不共享而恒为 0）"
     );
-    assert_eq!(info.retries_total, 0, "全部首轮成功，不应有重试");
+    // 鉴别力：3 个请求里第 1 个上游先回 500，必然重试一次后成功。若重试计数
+    // 未接线（恒 0）或漏计，这里就是红的——恒 200 的场景抓不到这一点
+    assert!(
+        info.retries_total >= 1,
+        "首个请求上游回 500，必然产生至少一次重试；IPC 报告的重试数为 {}",
+        info.retries_total
+    );
+    // 重试本身是成功收尾的，但「最近错误」保留覆盖式的最后一次失败记录——
+    // 这一半此前完全没断言（接线曾恒为 None）
+    let last_error = info.last_error.clone().unwrap_or_default();
+    assert!(
+        last_error.contains("500"),
+        "重试前的 500 应被记为最近错误（覆盖式保留），实际: {last_error:?}"
+    );
+    assert!(
+        info.last_error_at > 0,
+        "最近错误应带发生时刻，实际: {}",
+        info.last_error_at
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 32. IPC 请求计数：**仅转发模式**实例的分支点必须在计数之后
+//
+// proxy_handler 里 forward_only 分支位于 requests_total.fetch_add **之后**，
+// 本模式的请求计数与常规模式完全一致（也就是说 status 的请求数对本模式不是
+// 恒 0）。分支点一旦被挪到 requests_total.fetch_add **之前**（例如把仅转发
+// 判定提到覆写/计数之前），这里就是红的。
+//
+// 与 31 同款：断言走 **IPC ping 的真实响应**而非进程内 Arc，隔离 home + 关
+// watchdog 的理由见 31 的说明。
+// ---------------------------------------------------------------------------
+#[test]
+fn ipc_stats_reflect_forward_only_traffic() {
+    const REQUESTS: u64 = 4;
+
+    isolate_env_proxy();
+    let port = daemon_test_port(12);
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().to_path_buf();
+    std::fs::write(home.join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // 句柄留着：下半场要主动掐掉 mock 上游，把「上游请求失败」这条路径也拉到
+    // 进程级 IPC 断言里。
+    // 上游每个响应都带 connection: close：否则 reqwest 会把连接放回池子，掐掉
+    // 监听后第 5 个请求仍可能复用那条（已被 accept、仍由 axum 连接任务持有）的
+    // 长连接成功拿到 200，测试会随机红。close 让每次请求都新建连接，掐掉监听即
+    // 必然不可达。（该头是 hop-by-hop，代理不会透传给客户端。）
+    let (upstream, upstream_handle) =
+        rt.block_on(bind_random_router(Router::new().fallback(any(|| async {
+            (StatusCode::OK, [("connection", "close")], "{\"ok\":true}")
+        }))));
+
+    let cfg_file = home.join("forward-observe.toml");
+    std::fs::write(
+        &cfg_file,
+        format!(
+            "base_url = \"{upstream}\"\nlisten_addr = \"127.0.0.1:{port}\"\nforward_only = true\n"
+        ),
+    )
+    .unwrap();
+    let _guard = DaemonGuard {
+        exe,
+        port,
+        home_dir: Some(home.clone()),
+    };
+
+    let out = Command::new(exe)
+        .arg("start")
+        .arg("--config")
+        .arg(&cfg_file)
+        .env("APROXY_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "start 应成功，stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let run_dir = home.join("run");
+    let port_str = port.to_string();
+    let mut ready = false;
+    for _ in 0..100 {
+        if rt
+            .block_on(aproxy::daemon::ipc_ping_in(&run_dir, &port_str))
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ready, "守护未在 10 秒内就绪");
+
+    let client = local_client();
+    let url = format!("http://127.0.0.1:{port}/v1/observe");
+    for i in 0..REQUESTS {
+        let resp = rt.block_on(client.get(&url).send()).unwrap();
+        assert_eq!(resp.status(), 200, "第 {i} 个请求应 200");
+        rt.block_on(resp.bytes()).unwrap();
+    }
+
+    let info = rt
+        .block_on(aproxy::daemon::ipc_ping_in(&run_dir, &port_str))
+        .expect("实例应可 ping");
+    assert_eq!(
+        info.requests_total, REQUESTS,
+        "仅转发模式的请求计数必须与常规模式一致（回归：分支点若移到计数之前，这里恒为 0）"
+    );
+    // 这里刻意**不**断言 retries_total == 0：上游恒 200，连常规模式都不会重试，
+    // 该断言无论实现好坏都成立（恒真，证明不了「仅转发不重试」的任何事）。
+    // 重试计数的**接线**由 31 覆盖（那里首个请求上游必回 500）；无论落到哪个
+    // 分支都不重试这一行为由 22c（上游 500）与 22i（上游不可达）覆盖。
+
+    // ---- 下半场：掐掉上游，验证「上游请求失败」的**进程级**观测链路 ----
+    //
+    // 22i 已在进程内 Arc 上断言过 note_upstream_failure 被调用；这里补的是它与
+    // IPC 的**接线**——热路径写进 AppState.stats 的最近错误，能否经 ipc_ping
+    // 真的读到（历史上 234d520 修的正是「观测统计源与热路径不同一」这一类断链）。
+    //
+    // 鉴别力：若 note_upstream_failure 被删、或 stats 与 IPC 又各持一份，
+    // last_error 将是 None → 红。
+    upstream_handle.abort();
+    // abort 只是打标记：current_thread 运行时里被中止的 future 要等调度器再转
+    // 一圈才真正 drop，监听套接字那一刻才关闭。await 这个句柄把「已取消」逼出来，
+    // 否则下面的探测永远看到监听仍在
+    let _ = rt.block_on(upstream_handle);
+    // 再等端口真的拒绝连接才发请求：轮询把「套接字关闭 → 生效」这段抹成确定性
+    let upstream_addr = upstream.trim_start_matches("http://").to_string();
+    let mut refused = false;
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(&upstream_addr).is_err() {
+            refused = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(refused, "mock 上游未能关闭，无法构造「上游不可达」场景");
+
+    let resp = rt
+        .block_on(client.get(&url).send())
+        .expect("上游不可达时必须立刻终结（本模式不重试）");
+    assert_eq!(resp.status(), 502, "上游请求失败应回 502");
+    let body = rt.block_on(resp.text()).unwrap();
+    assert!(
+        body.contains("上游请求失败"),
+        "502 正文应带上失败原因，实际: {body}"
+    );
+
+    let info = rt
+        .block_on(aproxy::daemon::ipc_ping_in(&run_dir, &port_str))
+        .expect("实例应可 ping");
+    assert_eq!(
+        info.requests_total,
+        REQUESTS + 1,
+        "失败的请求同样走 forward_only 分支，必须照常计数"
+    );
+    let last_error = info.last_error.clone().unwrap_or_default();
+    assert!(
+        last_error.contains("上游请求失败"),
+        "仅转发模式的上游失败必须经 IPC 可见（status 的「最近错误」），实际: {last_error:?}"
+    );
+    assert!(
+        info.last_error_at > 0,
+        "最近错误应带发生时刻，实际: {}",
+        info.last_error_at
+    );
 }

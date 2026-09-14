@@ -73,15 +73,27 @@ fn is_hop_header(name: &str) -> bool {
     HOP_HEADERS.contains(&name.to_ascii_lowercase().as_str())
 }
 
-/// 响应侧的 hop-by-hop 过滤：同 `is_hop_header`，但**排除 content-length**。
+/// 响应侧的 hop-by-hop 过滤：同 `is_hop_header`，但**在上游未用
+/// transfer-encoding 分帧时排除 content-length**（即把它保留下来）。
 ///
-/// 理由与磁盘回放分支显式回填 content-length 完全一致：仅转发模式转发的字节
-/// 未经任何变换（不解码、不重写、不拼接），上游声明的长度仍然精确——剥掉它
+/// 保留的理由与磁盘回放分支显式回填 content-length 完全一致：仅转发模式转发的
+/// 字节未经任何变换（不解码、不重写、不拼接），上游声明的长度仍然精确——剥掉它
 /// 只会让本可定长的响应退化为 chunked，白白丢掉客户端的长度可见性。
 /// 请求侧不能照此办理：那侧的 content-length 描述的是客户端发来的字节，
 /// 而 hyper/reqwest 会按实际发送的 body 自行管理，必须交由它们决定。
-fn is_hop_response_header(name: &str) -> bool {
-    !name.eq_ignore_ascii_case("content-length") && is_hop_header(name)
+///
+/// `upstream_has_te` 必须取自**上游原始响应头**是否含 transfer-encoding。
+/// 「上游声明的长度仍然精确」这条前提在 CL 与 TE 并存时不成立（协议违规但现实
+/// 中存在）：hyper 客户端会保留 CL 头、改按 TE 分帧，于是我们手里的 CL 只是
+/// 上游的一句声明，与实际响应字节数可能不符。后果最坏的那种是**静默**的——
+/// CL 声称的字节数大于实际时，hyper 服务端按 CL 分帧、把缺额一直等下去，
+/// 客户端拿不到响应却毫无线索（RFC 7230 §3.3.3 因此要求：带 TE 的消息转发前
+/// 必须移除收到的 content-length，交由接收方重新分帧）。
+fn is_hop_response_header(name: &str, upstream_has_te: bool) -> bool {
+    if name.eq_ignore_ascii_case("content-length") {
+        return upstream_has_te;
+    }
+    is_hop_header(name)
 }
 
 /// 共享状态
@@ -945,8 +957,10 @@ fn needs_retry_response(
 ) -> bool {
     match (body, disk_scan) {
         (SpooledBody::Memory(b), _) => should_retry_response(attempt, status, raw_headers, b),
-        (SpooledBody::Disk { .. }, Some((error, head))) => {
-            should_retry_response_disk(attempt, status, raw_headers, *error, head)
+        // 真实响应大小取自 spool 长度（`head` 只是 1 KiB 头部快照，其长度不能
+        // 当响应大小用——预览日志的「共 N 字节」正因此改成显式传入）
+        (SpooledBody::Disk { len, .. }, Some((error, head))) => {
+            should_retry_response_disk(attempt, status, raw_headers, *error, head, *len as usize)
         }
         // 不可能：磁盘模式必有增量扫描结果。防御性回退到「不重试」并留痕，
         // 而非 panic——代理服务不能因内部不变量被破坏而失能
@@ -983,7 +997,7 @@ fn should_retry_response(
     // 1. HTTP 状态码可重试：无论是否流式，都重试
     if retry::is_retryable_status(status.as_u16()) {
         tracing::warn!(attempt, status = %status, is_streaming, "上游返回可重试状态码，重试");
-        warn_preview(raw_headers, body, 500);
+        warn_preview(raw_headers, body, 500, body.len());
         return true;
     }
 
@@ -996,7 +1010,7 @@ fn should_retry_response(
     };
     if is_error {
         tracing::warn!(attempt, is_streaming, "上游返回错误内容，重试");
-        warn_preview(raw_headers, body, 1000);
+        warn_preview(raw_headers, body, 1000, body.len());
         return true;
     }
 
@@ -1005,12 +1019,17 @@ fn should_retry_response(
 
 /// 磁盘模式的重试判定：状态码/流式判定用响应头；内容错误用收集期间的增量
 /// 扫描结论；预览用头部快照（磁盘全量不可得，头部 1 KiB 足够排障）。
+///
+/// `total_bytes` 是 spool 里的**实际响应字节数**（`SpooledBody::Disk::len`）：
+/// 内存模式那份 body 就是全部内容，长度自证；磁盘模式给到这里的只是 1 KiB 快照，
+/// 快照长度与响应大小无关，日志里的字节数必须由调用方从 spool 长度补进来。
 fn should_retry_response_disk(
     attempt: u32,
     status: &StatusCode,
     raw_headers: &reqwest::header::HeaderMap,
     scan_error: bool,
     head_snapshot: &[u8],
+    total_bytes: usize,
 ) -> bool {
     let is_streaming = retry::is_streaming_content_type(raw_headers);
 
@@ -1027,14 +1046,14 @@ fn should_retry_response_disk(
     // 1. HTTP 状态码可重试：无论是否流式，都重试
     if retry::is_retryable_status(status.as_u16()) {
         tracing::warn!(attempt, status = %status, is_streaming, "上游返回可重试状态码，重试");
-        warn_preview(raw_headers, head, 500);
+        warn_preview(raw_headers, head, 500, total_bytes);
         return true;
     }
 
     // 2. 内容错误：增量扫描结论（SSE data 行 / NDJSON 行级判定）
     if scan_error {
         tracing::warn!(attempt, is_streaming, "上游返回错误内容，重试");
-        warn_preview(raw_headers, head, 1000);
+        warn_preview(raw_headers, head, 1000, total_bytes);
         return true;
     }
 
@@ -1057,11 +1076,19 @@ fn header_opt(
 /// 到底回了什么」的关键线索**：brotli 没有 magic number，光看字节连「这是压缩体」
 /// 都认不出（2026-09-14 事故：Cloudflare 的 brotli 404 页在日志里只剩一串 hex）。
 /// 缺失时以 `"-"` 占位，日志字段不留空以便 grep 与扫读。
-fn warn_preview(raw_headers: &reqwest::header::HeaderMap, body: &[u8], limit: usize) {
+/// `total_bytes` 是「共 N 字节」的口径，由调用方按自己掌握的信息给出：
+/// 内存模式传整份 body 的长度（body 就在手上，长度即响应大小）；磁盘模式只能
+/// 传真值——传 `SpooledBody::Disk::len`（spool 里的实际字节数）。见 `preview_body`。
+fn warn_preview(
+    raw_headers: &reqwest::header::HeaderMap,
+    body: &[u8],
+    limit: usize,
+    total_bytes: usize,
+) {
     tracing::warn!(
         content_type = %header_opt(raw_headers, http::header::CONTENT_TYPE).unwrap_or("-"),
         content_encoding = %header_opt(raw_headers, http::header::CONTENT_ENCODING).unwrap_or("-"),
-        preview = %preview_body(body, limit),
+        preview = %preview_body(body, limit, total_bytes),
         "错误响应预览"
     );
 }
@@ -1071,7 +1098,12 @@ fn warn_preview(raw_headers: &reqwest::header::HeaderMap, body: &[u8], limit: us
 /// 直接 from_utf8_lossy 会把控制字节渲染成整片乱码污染日志。判定：替换符/控制
 /// 字符占比超阈值视为二进制，改为 hex 摘要（hex 可识别压缩 magic：zstd
 /// 28 b5 2f fd、gzip 1f 8b 等，据此判断解码为何没成功）。
-fn preview_body(body: &[u8], limit: usize) -> String {
+/// `total_bytes` 是日志里「共 N 字节」用的**实际响应字节数**，不是本函数手里
+/// 这份字节的长度。两者只在内存模式相同；磁盘模式传入的是 1 KiB **头部快照**
+/// （且可能已被 `content-encoding` 解码成更短的副本），其长度只反映快照本身，
+/// 与响应大小无关——照快照长度打印会让读日志的人以为上游只回了这么点数据，
+/// 把排障方向带偏（磁盘模式 > 1 MiB 的响应恰恰最需要看真实量级）。
+fn preview_body(body: &[u8], limit: usize, total_bytes: usize) -> String {
     let head = &body[..body.len().min(limit)];
     // lossy 渲染后统计非文本占比：U+FFFD 与 C0 控制字符
     let text = String::from_utf8_lossy(head);
@@ -1084,14 +1116,13 @@ fn preview_body(body: &[u8], limit: usize) -> String {
         // 二进制/压缩内容：hex 前 48 字节足够识别压缩 magic 与排障
         let hex: String = head.iter().take(48).map(|b| format!("{b:02x} ")).collect();
         format!(
-            "（二进制/压缩内容，共 {} 字节，hex 前 48: {}…）",
-            body.len(),
+            "（二进制/压缩内容，共 {total_bytes} 字节，hex 前 48: {}…）",
             hex.trim_end()
         )
     } else {
         let s = text.trim_end();
         if body.len() > limit {
-            format!("{s}…（截断，共 {} 字节）", body.len())
+            format!("{s}…（截断，共 {total_bytes} 字节）")
         } else {
             s.to_string()
         }
@@ -1610,17 +1641,32 @@ async fn forward_only_proxy(
     let limit = state.config.body_limit_bytes();
     let too_large = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = too_large.clone();
+    // 客户端侧请求体中断标记：与 too_large 同款——适配器产出的 Err 会被 reqwest
+    // 当作「body 出错」进而中止上游请求，`send()` 随之返回 Err，两种来源在下游
+    // 长得一模一样，只能靠标记区分。客户端在上传途中断开（裸 TCP 声明
+    // Content-Length 却提前 close、进程被杀……）必须与「上游请求失败」分开：
+    // 后者会把排障矛头指向根本没有收到完整请求体的上游。缓冲路径的同一事件映射为
+    // `ReadBodyError::Io` → 400 且**不碰** last_error（见 `read_request_body` 的
+    // 错误分支），两条路径归因必须一致——仅转发模式此前是异常的那一侧。
+    let client_gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gone_flag = client_gone.clone();
     // unfold 状态 = (上游流, 已见字节数)；产出的就是同一份 chunk（移动，不拷贝、
     // 不累积），故在途内存与负载大小无关
     let counted = futures_util::stream::unfold(
         (body.into_data_stream(), 0usize),
         move |(mut stream, seen)| {
             let flag = flag.clone();
+            let gone_flag = gone_flag.clone();
             async move {
                 let chunk = stream.next().await?;
                 let chunk = match chunk {
                     Ok(c) => c,
-                    Err(e) => return Some((Err(e), (stream, seen))),
+                    Err(e) => {
+                        // 这里的 Err 只可能来自客户端侧（body 即客户端请求体）；
+                        // 原样透传给 reqwest 以中止上游请求，真实原因由标记承载
+                        gone_flag.store(true, AtomicOrdering::Relaxed);
+                        return Some((Err(e), (stream, seen)));
+                    }
                 };
                 let seen = seen.saturating_add(chunk.len());
                 if seen > limit {
@@ -1645,11 +1691,24 @@ async fn forward_only_proxy(
     let resp = match builder.send().await {
         Ok(r) => r,
         Err(e) => {
-            // send() 的失败有两种来源：上游真的失败，或请求体适配器产出 Err 令
-            // reqwest 主动中止（此时超限标记已置位）。必须先查标记再定状态码，
-            // 否则用户看到的是「上游 502」而非「你的请求体太大」。
+            // send() 的失败有三种来源：上游真的失败，或请求体适配器产出 Err 令
+            // reqwest 主动中止（超限 / 客户端上传中断，各有一个标记）。判定顺序
+            // 是刻意的：超限排在最前——它同时也会让适配器产出 Err，而「你的请求体
+            // 太大」比「你断开了」更接近事实、更可操作。两个标记都没置位才是真·上游失败。
             if too_large.load(AtomicOrdering::Relaxed) {
                 return body_too_large_response(limit);
+            }
+            // 客户端上传途中断开：**不记 last_error、不打「上游请求失败」**——
+            // 那一头根本没有失败，是我们应客户端断开而主动中止了上游请求。
+            // 也不回 502：发起断开的客户端读不到响应，这里的状态码只是给日志与
+            // 中间观测看的，取与缓冲路径同一事件一致的 400。
+            if client_gone.load(AtomicOrdering::Relaxed) {
+                tracing::error!(error = %e, target = %target_url, "客户端请求体传输中断，已中止上游请求");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "请求体读取失败（客户端在上传途中断开）",
+                )
+                    .into_response();
             }
             // 上游失败不重试（本模式的定义），但必须记进 note_upstream_failure，
             // 否则 status 的「最近错误」对这类实例永久显示「无」
@@ -1666,11 +1725,14 @@ async fn forward_only_proxy(
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut resp_builder = Response::builder().status(status);
-    // 状态码与响应头原样透传（过滤 hop-by-hop，但保留 content-length）。append
+    // 上游是否用 transfer-encoding 分帧（判定取自**上游原始响应头**，而非我们
+    // 正在拼的下游头表）：决定 content-length 能否保留，理由见 is_hop_response_header
+    let upstream_has_te = resp.headers().contains_key(http::header::TRANSFER_ENCODING);
+    // 状态码与响应头原样透传（过滤 hop-by-hop，常规情况下保留 content-length）。append
     // 而非 insert：Set-Cookie 等同名多值头不能坍缩为最后一个
     for (name, value) in resp.headers().iter() {
         let name_str = name.as_str();
-        if is_hop_response_header(name_str) {
+        if is_hop_response_header(name_str, upstream_has_te) {
             continue;
         }
         if let Ok(n) = HeaderName::from_bytes(name_str.as_bytes())
@@ -1683,11 +1745,28 @@ async fn forward_only_proxy(
     // 响应流：直回客户端。成功块只累加已转发字节数（供中断日志定位断点），不
     // 复制、不缓存、不检查内容。客户端断开时本 Body 被 drop，reqwest 连接随之
     // 关闭、上游生成立即停止——既有的计费保护靠 Drop 天然成立，无需额外代码。
+    //
+    // 每转发一个 chunk 顺带刷新 last_activity_secs：本模式下小时级长流是常态
+    //（这正是它存在的理由），而该时间戳的语义是「最近一次收到请求**或仍在处理**」
+    //（与常规路径重试轮开头的刷新同义）。不刷新的话，一个正在传输的实例会被
+    // stop idle / status --idle 判为闲置并强退——idle_timeout_secs 默认 1800s，
+    // 任何长流都会越线，恰在传输中途被掐断。覆盖范围与残余窗口：chunk 持续到达
+    // 即视为活跃；上游长时间一个字节都不发（真正的停滞，read_timeout 才是该管
+    // 这件事的地方）期间不刷新——那时实例确实没在推进任何数据，被判闲置符合语义。
+    // 代价是每 chunk 一次 SystemTime::now() + 一条 Relaxed store，相对该 chunk
+    // 的网络读写开销可忽略。
     let forwarded = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let counter = forwarded.clone();
     let stream = resp.bytes_stream().map(move |chunk| match chunk {
         Ok(c) => {
             counter.fetch_add(c.len() as u64, AtomicOrdering::Relaxed);
+            state.last_activity_secs.store(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                AtomicOrdering::Relaxed,
+            );
             Ok(c)
         }
         Err(e) => {
@@ -1836,7 +1915,7 @@ mod tests {
         // zstd magic 开头的压缩体（真实日志中出现过）
         let mut zstd_like = vec![0x28, 0xb5, 0x2f, 0xfd];
         zstd_like.extend((0..200u8).map(|i| i.wrapping_mul(37)));
-        let p = preview_body(&zstd_like, 500);
+        let p = preview_body(&zstd_like, 500, zstd_like.len());
         assert!(p.contains("二进制/压缩内容"), "{p}");
         assert!(p.contains("28 b5 2f fd"), "hex 应含 zstd magic: {p}");
         assert!(!p.contains('\u{FFFD}'), "不应输出替换符: {p}");
@@ -1845,12 +1924,36 @@ mod tests {
     #[test]
     fn preview_of_text_is_plain_and_truncated() {
         let text = "上游过载：请稍后重试".repeat(50);
-        let p = preview_body(text.as_bytes(), 100);
+        let p = preview_body(text.as_bytes(), 100, text.len());
         assert!(p.contains("上游过载"), "{p}");
         assert!(p.contains("截断"), "{p}");
         // 正常 JSON 错误体
         let json = br#"{"type":"error","error":{"type":"overloaded"}}"#;
-        assert_eq!(preview_body(json, 500), String::from_utf8_lossy(json));
+        assert_eq!(
+            preview_body(json, 500, json.len()),
+            String::from_utf8_lossy(json)
+        );
+    }
+
+    #[test]
+    fn preview_byte_count_is_the_response_size_not_the_snapshot_size() {
+        // 磁盘模式回归：喂进来的是 1 KiB 头部快照，字节数必须报**响应真实大小**
+        //（spool 长度），否则日志会把 10 MB 的响应说成 1 KiB，误导排障
+        let snapshot = "上游过载：请稍后重试".repeat(60); // > limit，触发截断分支
+        let p = preview_body(snapshot.as_bytes(), 100, 10 * 1024 * 1024);
+        assert!(p.contains("截断"), "{p}");
+        assert!(
+            p.contains("共 10485760 字节"),
+            "截断提示应报响应真实大小而非快照长度: {p}"
+        );
+        assert!(
+            !p.contains(&format!("共 {} 字节", snapshot.len())),
+            "不得把快照长度当成响应大小: {p}"
+        );
+        // 二进制分支同样按真实大小口径
+        let bin = [0x28u8, 0xb5, 0x2f, 0xfd].repeat(500);
+        let p = preview_body(&bin, 500, 7_000_000);
+        assert!(p.contains("共 7000000 字节"), "{p}");
     }
 
     // ---- is_hop_header：hop-by-hop 头识别（大小写不敏感）----
@@ -1896,15 +1999,16 @@ mod tests {
         }
     }
 
-    // ---- is_hop_response_header：响应侧过滤 = hop 头去掉 content-length ----
+    // ---- is_hop_response_header：响应侧过滤 = hop 头去掉 content-length
+    //（仅当上游未用 transfer-encoding 分帧时）----
 
     #[test]
     fn response_hop_filter_keeps_content_length() {
         // 字节未经变换，上游声明的长度仍精确：剥掉只会让定长响应退化为 chunked
         for name in ["content-length", "Content-Length", "CONTENT-LENGTH"] {
             assert!(
-                !is_hop_response_header(name),
-                "{name} 在响应侧必须保留（字节未经变换）"
+                !is_hop_response_header(name, false),
+                "{name} 在响应侧必须保留（上游未分帧，字节未经变换）"
             );
             assert!(is_hop_header(name), "但它在请求侧仍是 hop 头");
         }
@@ -1920,12 +2024,33 @@ mod tests {
             "upgrade",
             "host",
         ] {
-            assert!(is_hop_response_header(name), "{name} 在响应侧应被过滤");
+            assert!(
+                is_hop_response_header(name, false),
+                "{name} 在响应侧应被过滤"
+            );
         }
         // 普通端到端头不受影响
         for name in ["content-type", "set-cookie", "x-custom"] {
-            assert!(!is_hop_response_header(name), "{name} 不应被过滤");
+            assert!(!is_hop_response_header(name, false), "{name} 不应被过滤");
         }
+    }
+
+    #[test]
+    fn response_hop_filter_drops_content_length_when_upstream_chunked() {
+        // 上游同时带 CL 与 TE（协议违规但现实存在）：hyper 客户端按 TE 分帧，
+        // 我们手里的 CL 只是上游的一句声明，与实际字节数可能不符——必须连同
+        // transfer-encoding 一起剥掉，交由 hyper 重新分帧（RFC 7230 §3.3.3）。
+        // CL 声称值大于实际时的后果是**静默**的：服务端按 CL 等缺额，客户端
+        // 拿不到完整响应也看不出原因。
+        for name in ["content-length", "Content-Length", "CONTENT-LENGTH"] {
+            assert!(
+                is_hop_response_header(name, true),
+                "{name} 在上游用 TE 分帧时必须剥离"
+            );
+        }
+        // 上游带 TE 时其余头的判定不受影响
+        assert!(is_hop_response_header("transfer-encoding", true));
+        assert!(!is_hop_response_header("content-type", true));
     }
 
     // ---- apply_header_overrides：api_key / override_headers / extra_headers 三层头策略 ----
@@ -2155,7 +2280,7 @@ mod tests {
         // 修复目标本身：预览必须读得出正文（此前只剩 hex 摘要）
         let decoded = crate::decode::for_inspection(Some("br"), &compressed)
             .expect("br 应可解码（检查副本）");
-        let preview = preview_body(&decoded, 500);
+        let preview = preview_body(&decoded, 500, decoded.len());
         assert!(
             preview.contains("404 Not Found"),
             "预览应含 404 页正文，实际: {preview}"

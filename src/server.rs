@@ -23,8 +23,10 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     let base_url = cfg.base_url.clone();
     // spool 残留清理（disk_cache）：bind 前清空本端口的 spool 目录——目录
     // 归本进程独占，启动时清空即可回收崩溃/强杀残留的临时文件。
-    // 仅转发模式下 spool 链路整体不进，本实例永不产生 spool 文件，此处退化为
-    // no-op（目录可能为空甚至不存在，清理本身幂等无害，故不做特判）
+    // 仅转发模式下 spool 链路整体不进，本实例永不产生 spool 文件；但这里**不是**
+    // no-op：清理逻辑自身会 create_dir_all，于是每个仅转发实例启动时仍会创建
+    // ~/.aproxy/spool/<端口>/ 这个空目录，只是无文件可清。空目录无害（不占空间、
+    // 与磁盘缓存实例的目录互不干扰），故不做特判，只把注释说准。
     daemon::clean_spool_dir(daemon::port_of(&listen_addr));
     let state = aproxy::proxy::AppState::new(cfg);
     let app = aproxy::proxy::router(state.clone());

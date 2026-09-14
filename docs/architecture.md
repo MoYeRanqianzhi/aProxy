@@ -31,6 +31,7 @@ agent 软件 ──HTTP──▶ [代理端口 12345] ──重试循环──�
 | `src/commands/` | 十个子命令各自一文件（start/status/stop/restart/restore/alias/doctor/find/logs/config），共享 target 解析在 `mod.rs` |
 | `src/server.rs` | 服务承载：`serve_forever` 主循环、停止信号、日志初始化、配置错误落盘 startup.log |
 | `src/proxy.rs` | 转发核心：hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、keepalive、断开保护、仅转发模式 |
+| `src/decode.rs` | 检查用解码：按 `content-encoding`（gzip/deflate/br/zstd，多层逆序）解出一份**仅供检查/预览**的副本，转发字节不受影响 |
 | `src/retry.rs` | 重试判定：状态码、错误 JSON（含流式 NDJSON/SSE 形态） |
 | `src/config.rs` | 代理配置加载/保存/校验（`~/.aproxy/config.toml`，可多份平行并存） |
 | `src/settings.rs` | 内部配置（`~/.aproxy/settings.json`，唯一）：别名表、全局默认等程序管理状态 |
@@ -71,6 +72,22 @@ CLI 定义（cli.rs）与子命令处理（commands/）分离；启动父进程�
 
 `forward_only` 模式整体旁路本节：不缓冲完整请求体、不进重试循环、不发心跳——
 见下一节。
+
+## 压缩响应体：检查解码、转发不解码
+
+agent 客户端普遍发 `accept-encoding: gzip, deflate, br, zstd`，而上游字节必须
+原样转发（保真契约：status/头/体逐字节一致），故 reqwest 刻意不开自动解压。
+代价是**检查**跑在压缩字节上会静默失效——`retry::is_error_body` 的 JSON 解析
+必然失败（HTTP 200 携带 error JSON 不再触发重试）、`is_stream_error_body` 的
+SSE 行扫描全失效（流尾 error 事件检测不到）、预览只剩 hex 摘要（brotli 没有
+magic number，连「这是压缩体」都认不出；2026-09-14 的 Cloudflare brotli 404
+页事故即此）。`src/decode.rs` 因此解出一份**副本**喂给检查路径，两条路径互不
+影响：**检查解码、转发不解码**。
+
+已知边界：解码只接在内存判定路径（`should_retry_response`）上。磁盘路径
+（响应 >1 MiB）的增量扫描器（`proxy::StreamErrorScanner`）吃的仍是原始字节，
+压缩体上不判内容（仍按状态码判），只为日志预览解一份头部快照——>1 MiB 的压缩
+错误体现实中不存在，为它改造成流式解码的收益与风险不成比例。
 
 ## 仅转发模式（forward_only）
 

@@ -146,7 +146,7 @@ listen_addr = "127.0.0.1:12345"          # local listener
 # spool_limit_mb = 256                   # upstream response buffer cap (MB)
 # max_body_mb = 128                      # request body cap (MB; 0 = unlimited)
 # disk_cache = true                      # spool large bodies/responses to disk
-# forward_only = true                    # forward-only: no retries/buffering/heartbeats, stream both ways
+# forward_only = false                   # forward-only (gives up retries): stream both ways, no retries/buffering/heartbeats
 # connect_timeout_secs = 30              # upstream connect timeout (0 = none)
 # read_timeout_secs = 300                # inter-read timeout (0 = none)
 ```
@@ -159,7 +159,7 @@ fields — program-managed).
 ## Development
 
 ```sh
-cargo test --locked                                # full suite (115 lib + 4 bin + 38 integration)
+cargo test --locked                                # full suite (232 tests: 159 lib + 4 bin + 69 integration)
 cargo clippy --all-targets --locked -- -D warnings # must be warning-free (project rule)
 cargo fmt --all -- --check
 ```

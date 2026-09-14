@@ -22,6 +22,13 @@ aproxy status               # 每行 v<semver> = 各实例实际运行的守护�
 
 ## alpha.12 关键行为（相对 alpha.10 及更早）
 
+- **压缩响应体检查（修复静默失效）**：上游按 `accept-encoding` 压缩时，
+  「HTTP 200 + error JSON」的重试判定与流尾 SSE error 事件检测此前在压缩体上
+  **全部静默失效**（JSON 解析与行扫描对压缩字节必然失败），日志预览也只能打
+  hex 摘要（brotli 无 magic number）。本版起检查路径先解一份副本再判定
+  （gzip/deflate/br/zstd，多层按逆序解），**转发给客户端的字节不变**——仍是
+  上游原样。已知边界：磁盘模式（响应 >1 MiB）仍走原始字节的增量扫描，不做
+  解码（>1 MiB 的压缩错误体现实中不存在）。语义见 behaviors.md
 - **仅转发模式 `forward_only`（新字段，默认 false）**：config.toml 与
   settings.json 均支持（toml 显式值 > settings 全局默认，与 `max_body_mb`/
   `disk_cache` 同款分层）。开启后该实例**放弃重试/缓冲/心跳**，请求体与响应

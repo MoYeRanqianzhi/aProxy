@@ -117,7 +117,10 @@ override_headers = { "user-agent" = "my-agent/1.0" }
 ### spool_limit_mb
 
 上游响应缓冲上限（MB）。响应超过此大小视为**确定性失败，不重试**（重试注定
-再次超限）——返回透传已缓冲部分。转发超大文件（模型权重下载等）时调大。
+再次超限）——**直接回 502，不向客户端转发任何字节**（已缓冲的部分一并丢弃）。
+若该请求已进入重试保活的 SSE 通道（HTTP 200 骨架已发出、状态行不可再改），
+则以 `event: error` 事件（`error.type = proxy_spool_limit`）收尾替代 502。
+转发超大文件（模型权重下载等）时调大。
 
 ### connect_timeout_secs / read_timeout_secs
 
@@ -162,8 +165,9 @@ override_headers = { "user-agent" = "my-agent/1.0" }
 - **响应流中途中断**：**直接截断**——不注入任何上游未发出的字节，日志留痕
   （tracing 以 warn 记录错误与已转发字节数）。
 - **客户端断开**：连接随之关闭（计费保护行为不变）。
-- **`content-length` 原样透传**：字节未经变换，上游声明仍精确（其余 hop-by-hop
-  头照旧过滤）。
+- **`content-length` 仅响应侧保留**：响应字节未经变换，上游声明的长度仍精确
+  （其余 hop-by-hop 头照旧过滤）。**请求侧不保留**——请求体不再整体持有，没有
+  精确长度可回填，一律以 `chunked` 发往上游。
 - 未在 toml 显式配置时取 settings.json 的 `forward_only`（全局默认 false）。
   **无对应 CLI 旗标**，只能写 toml 或 settings.json；改后
   `aproxy restart <端口或别名>` 生效。

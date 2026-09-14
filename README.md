@@ -122,7 +122,7 @@ listen_addr = "127.0.0.1:12345"          # 本地监听
 # spool_limit_mb = 256                   # 上游响应缓冲上限（MB）
 # max_body_mb = 128                      # 请求体上限（MB；0 = 不设限。未设时取 settings.json 全局默认）
 # disk_cache = true                      # 磁盘缓存：大请求体/响应溢写磁盘，内存与负载解耦
-# forward_only = true                    # 仅转发模式：放弃重试/缓冲/心跳，请求体与响应流式直通（可信 API + 要真流式的取舍）
+# forward_only = false                   # 仅转发模式（开启即放弃重试）：请求体与响应流式直通，无重试/缓冲/心跳
 # connect_timeout_secs = 30              # 上游连接建立超时（0 = 不设限）
 # read_timeout_secs = 300                # 两次读到数据间隔超时（0 = 不设限）
 ```
@@ -134,7 +134,7 @@ listen_addr = "127.0.0.1:12345"          # 本地监听
 ## 开发
 
 ```powershell
-cargo test --locked           # 全量测试（115 lib + 4 bin + 38 集成）
+cargo test --locked           # 全量测试（当前基线 232 项：159 lib + 4 bin + 69 集成）
 cargo clippy --all-targets --locked -- -D warnings   # 必须零警告（项目纪律）
 cargo fmt --all -- --check
 ```

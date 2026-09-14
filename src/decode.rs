@@ -37,6 +37,31 @@ use std::io::Read;
 /// 检查用解码的输出上限：超出即按「不可解码」处理（调用方回退原始字节）。
 /// 真实错误体解压后都是 KB 级；上限只为把恶意/失控上游的 CPU 与内存开销钉死
 /// 在常数——压缩炸弹可以用几百字节换出几十 GB。
+///
+/// **注意它只约束输出，不约束解码器自身的内部缓冲**——brotli 是唯一例外，
+/// 且不受本常数约束：解码器在解出第一个 metablock 之前，就按**流头自己声明**
+/// 的 window 预分配环形缓冲（brotli-decompressor 6.0.0 `src/decode.rs` 的
+/// `BrotliAllocateRingBuffer`：`1 << window_bits` + 566 字节 slack，后者是
+/// 542 字节 write-ahead 余量加 24 字节字典字长），而
+/// `Content-Encoding: br` 的 `window_bits` 由上游流自由声明。
+///
+/// 上界 = 2^30 = **1 GiB**（单次解码，结束即释放）：
+/// - `kBrotliLargeMaxWbits = 30`（`src/decode.rs`），即 large-window 流允许
+///   `window_bits` 取 10..=30；普通流是 9..=24，对应 ≤ 16 MiB
+/// - 要走到 30 需要 large-window 流被接受，而 `brotli::Decompressor` 恰好接受：
+///   `DecompressorCustomIo::new_with_custom_dictionary`（`src/reader.rs`）调
+///   `BrotliState::new_with_custom_dictionary`（`src/state.rs`），后者把
+///   `large_window` 置位
+/// - crate 自带的 canny 收缩救不了：它只在流声明 `ISLAST` 的 metablock 上把
+///   缓冲缩到贴合实际长度，恶意流把首个 metablock 标成非末块即可拿满
+///
+/// 这里如实记录而不额外设防，是因为**没有低成本的限制手段**：
+/// `disallow_large_window_size` 特性只作用于编码器（`src/enc/`，本仓库不使用）；
+/// 解码侧能关掉 large window 的只有 `BrotliState::new_strict`，但
+/// `brotli::Decompressor` 不接受外部 state——要用它就得自己重写
+/// `BrotliDecompressStream` 的输入/输出缓冲循环，为一个「仅用于检查」的副本
+/// 冒这个险不划算。影响面有限：仅当上游主动发这种流时生效，单个 brotli 响应
+/// 最多让进程多占约 1 GiB 且随解码结束释放；上游是用户自己配置的 API 端点。
 const MAX_DECODED: usize = 8 * 1024 * 1024;
 
 /// brotli 解码器的内部窗口缓冲（`Decompressor::new` 的参数，与文件 IO 块同量级）
@@ -48,17 +73,27 @@ const BROTLI_BUF: usize = 4096;
 /// `identity`）、编码不支持/解码无产出（含截断到无法解出任何内容）、输出超上限。
 pub fn for_inspection(content_encoding: Option<&str>, body: &[u8]) -> Option<Vec<u8>> {
     let encoding = content_encoding?.trim();
-    if encoding.is_empty() || encoding.eq_ignore_ascii_case("identity") {
+    if encoding.is_empty() {
         return None;
     }
     // 多层编码按逆序解：`gzip, br` 表示先 gzip 后 br，故先解 br 再解 gzip。
     // 首层直接在原始字节上解——单层是绝对常态，这样能省掉一次整体拷贝
     //（压缩体可达 1 MiB，且首轮判定对**每个**响应都要跑一遍）。
+    //
+    // identity 层在此**当 no-op 跳过**，而不是交给 decode_one 当未知层。
+    // 理由：identity 出现在 Content-Encoding 里自 RFC 2616 起就是 SHOULD NOT，
+    // RFC 9110 更不再把它列为注册的 content-coding，现实中若出现必然只有单值
+    //——单值被过滤成空列表，与旧的入口特判（整串等于 identity 则不解码）等价。
+    // 若交给 decode_one，`identity, gzip` 这类列表会让它落进 `_ => None`，链式
+    // `?` 直接放弃整条链、回退原始压缩字节，三项能力静默失效；而同一个 token
+    // 在入口被当 no-op、在 decode_one 里被当致命未知层，本身也自相矛盾。
+    // decode_one 对其他未知层**保持致命**（整链放弃是有意设计，不在此改动）。
     let mut layers = encoding
         .split(',')
         .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("identity"))
         .rev();
+    // 过滤后为空 = 全部是 identity/空层，等同无需解码
     let mut data = decode_one(layers.next()?, body)?;
     for layer in layers {
         data = decode_one(layer, &data)?;
@@ -80,7 +115,10 @@ fn decode_one(encoding: &str, body: &[u8]) -> Option<Vec<u8>> {
         // 当成 deflate 数据解出垃圾。
         "deflate" => decode_reader(flate2::read::ZlibDecoder::new(body))
             .or_else(|| decode_reader(flate2::read::DeflateDecoder::new(body))),
-        "br" => decode_reader(brotli::Decompressor::new(body, BROTLI_BUF)),
+        // 这里只解不编：依赖直接用 brotli-decompressor，编码器（只在单测里造
+        // 样本用）留在 dev-dependencies，生产构建不编译它。另外 br 的内部窗口
+        // 预分配不受 MAX_DECODED 约束，见该常数的文档。
+        "br" => decode_reader(brotli_decompressor::Decompressor::new(body, BROTLI_BUF)),
         // zstd 帧头解析失败（非 zstd 数据）即无解码器可用
         "zstd" => decode_reader(ruzstd::decoding::StreamingDecoder::new(body).ok()?),
         _ => None,
@@ -205,6 +243,37 @@ mod tests {
             assert!(
                 for_inspection(enc, SAMPLE.as_bytes()).is_none(),
                 "{enc:?} 不应触发解码"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_layer_in_list_is_skipped() {
+        // identity 是 no-op 层：它出现在逗号列表的任意位置都不该让整条链放弃。
+        // 回归锚点——修复前 `identity, gzip` 会因 decode_one 的 `_ => None`
+        // 连带 `?` 一起放弃解码，压缩体上的三项能力静默失效。
+        let raw = gzip(SAMPLE.as_bytes());
+        for enc in [
+            "identity, gzip",
+            "gzip, identity",
+            "identity,gzip",
+            "gzip,identity",
+            "  identity , gzip ",
+        ] {
+            let got = for_inspection(Some(enc), &raw)
+                .unwrap_or_else(|| panic!("{enc} 应可解码（identity 层应被跳过）"));
+            assert_eq!(String::from_utf8(got).unwrap(), SAMPLE, "{enc}");
+        }
+        // 全是 identity（含尾随/前导逗号产生的空层）：等同无需解码，仍回退原始字节
+        for enc in [
+            "identity, identity",
+            "IDENTITY,identity",
+            "identity,",
+            ",identity",
+        ] {
+            assert!(
+                for_inspection(Some(enc), SAMPLE.as_bytes()).is_none(),
+                "{enc} 全是 no-op 层，不应触发解码"
             );
         }
     }

@@ -1,6 +1,11 @@
 [package]
 name = "aproxy"
 version = "0.1.0-alpha.12"
+# edition 2024 本身要 1.85，实际下限由依赖树抬高到 1.88：src/decode.rs 引入的
+# ruzstd 要 1.87，url→idna→idna_adapter 拖进来的 icu_* 一族要 1.88（这些 crate
+# 在依赖图里是实打实被编译的，非可选）。声明出来，旧工具链会得到一条明确的
+# 「rustc 1.88 或更新」报错，而不是一堆看不懂的编译失败。
+rust-version = "1.88"
 edition = "2024"
 description = "Local API proxy with infinite retries for agent workloads"
 license = "MIT"
@@ -49,7 +54,14 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # 日志预览」使用——转发给客户端的字节始终是上游原样，本模块不参与转发路径。
 # 两者均为**纯 Rust**实现（无 C 依赖，故 musl/aarch64 交叉编译与 CI 各平台不受
 # 影响）；gzip/deflate 复用上面的 flate2，不重复引依赖。
-brotli = "9.0.0"
+#
+# br 直接依赖解码器 crate 而非门面包 brotli：门面包把**编码器**和**解码器**编在
+# 同一个库里，没有只留解码器的特性（它的 default = ["std"] 同时控制两者的 std
+# 接口，关掉 default 会让 Decompressor 与 CompressorWriter 一起消失），生产路径
+# 却只用 Decompressor。故常规依赖取纯解码器，编码器只在单测里造样本，放
+# dev-dependencies——二进制不再编译编码器那一半。两者版本有约束关系：brotli
+# 9.0.0 依赖 `brotli-decompressor ~6.0`，升 brotli 时需核对本行。
+brotli-decompressor = "6.0.0"
 ruzstd = "0.9.0"
 
 [target.'cfg(windows)'.dependencies]
@@ -65,6 +77,9 @@ windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Secu
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
 tempfile = "3"
+# 仅测试用：造 brotli 压缩样本需要编码器（CompressorWriter），生产路径不需要。
+# 放在这里既让 `cargo test` 拿得到，又让常规/release 构建完全不编译编码器。
+brotli = "9.0.0"
 
 # release 优化：代理是网络 IO 密集型（转发时间花在等上游/等客户端，CPU 占比
 # 极低），speed 与 size 基本不冲突，可兼得：

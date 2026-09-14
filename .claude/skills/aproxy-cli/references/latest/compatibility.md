@@ -16,9 +16,18 @@ aproxy status               # 每行 v<semver> = 各实例实际运行的守护�
 
 | 项 | 值 |
 |---|---|
-| 文档适用版本 | **0.1.0-alpha.12**（含 alpha.4→alpha.12 引入的全部行为） |
+| 文档适用版本 | **0.1.0-alpha.13**（含 alpha.4→alpha.13 引入的全部行为） |
 | 代码版本坐标 | Cargo.toml `version` 字段；alpha 线于 2026-09 发布 |
 | 大版本线 | 0.1.x（0.1 系列内小版本不另开目录，直接更新 latest/ 文档） |
+
+## alpha.13 关键行为（相对 alpha.12）
+
+**无行为变化**——alpha.13 与 alpha.12 是同一份代码，仅为版本号重发：alpha.12
+发布后发现 crates.io 上它并非可解析的最高版本（同为 `alpha.12` 前缀的早期测试
+版本 `0.1.0-alpha.12t2/t3` 在 semver 里序位更高，数字标识符优先级低于字母数字），
+导致 `cargo install aproxy` 与该下载链的 cargo-binstall 兜底档会解析到旧测试
+构建。两个测试版本已在 crates.io 上 yank（可逆，仅影响新解析，已锁定的 lockfile
+不受影响），并用本版本号给出一个序位明确更高的正式版。
 
 ## alpha.12 关键行为（相对 alpha.10 及更早）
 

@@ -40,6 +40,31 @@ pub fn is_retryable_status(status: u16) -> bool {
     (400..=599).contains(&status)
 }
 
+/// 受限重试路径：客户端请求这些路径（后缀匹配）时，上游失败达到
+/// [`BOUNDED_RETRY_MAX_ATTEMPTS`] 次后不再重试，把最后一次上游响应原样透传。
+///
+/// 背景（2026-09-20 compact 事故）：Claude Code 的 compact 依赖
+/// `/v1/messages/count_tokens` 做上下文记数，大量镜像上游未实现该端点，返回
+/// 确定性 404（HTML/JSON 错误页）。「4xx/5xx 一律无限重试」对它反而致命——
+/// count_tokens 永远等不到终态，compact 挂到客户端超时报错；而直连/仅转发
+/// 模式下 404 秒回，Claude Code 自行处理，compact 一切正常。确定性错误重试到
+/// 天荒地老也不可能成功，快速透传真实响应才是正确行为。后缀而非全路径匹配，
+/// 是因为判定对象是客户端请求路径，与上游 base_url 是否带路径前缀无关。
+pub const BOUNDED_RETRY_PATH_SUFFIXES: &[&str] = &["/count_tokens"];
+
+/// 受限重试路径的最大上游尝试次数（含首轮）。前两次重试零延迟，确定性错误下
+/// 总耗时 ≈ 3×上游 RTT（秒级）；真正的瞬时故障大概率仍能在此窗口内自愈，
+/// 因此不设为 1。
+pub const BOUNDED_RETRY_MAX_ATTEMPTS: u32 = 3;
+
+/// 判断客户端请求路径（可含查询串）是否属于受限重试路径。
+pub fn is_bounded_retry_path(path_and_query: &str) -> bool {
+    let path = path_and_query.split('?').next().unwrap_or(path_and_query);
+    BOUNDED_RETRY_PATH_SUFFIXES
+        .iter()
+        .any(|suffix| path.ends_with(suffix))
+}
+
 /// 判断响应体是否表示“错误内容”而非正常业务响应。
 ///
 /// 启发式：若响应体为 JSON 且包含明确的错误字段，则视为可重试的错误。
@@ -292,6 +317,21 @@ mod tests {
         assert!(!is_retryable_status(600));
         assert!(!is_retryable_status(300));
         assert!(!is_retryable_status(302));
+    }
+
+    #[test]
+    fn bounded_retry_path_matching() {
+        // 典型形态：Claude Code 发出的 count_tokens 调用（带 beta 查询串）
+        assert!(is_bounded_retry_path("/v1/messages/count_tokens"));
+        assert!(is_bounded_retry_path("/v1/messages/count_tokens?beta=true"));
+        // 后缀匹配：上游 base 带路径前缀不影响（判定的是客户端请求路径）
+        assert!(is_bounded_retry_path("/count_tokens"));
+        // 非受限路径：主对话端点与其他路径不受封顶约束
+        assert!(!is_bounded_retry_path("/v1/messages"));
+        assert!(!is_bounded_retry_path("/v1/messages?beta=true"));
+        // 仅前缀相同不算：/count_tokens_extra 不该命中
+        assert!(!is_bounded_retry_path("/v1/messages/count_tokens_extra"));
+        assert!(!is_bounded_retry_path("/api/hello"));
     }
 
     #[test]

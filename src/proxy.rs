@@ -830,6 +830,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
 
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let target_url = upstream_url(&state.config, &uri);
+    let bounded_retry = retry::is_bounded_retry_path(path_and_query);
 
     tracing::info!(method = %method, path = %path_and_query, target = %target_url, "代理请求");
 
@@ -932,6 +933,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
             headers,
             req_body,
             max_spool_bytes,
+            bounded_retry,
         )
         .await;
     }
@@ -942,6 +944,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
         headers,
         req_body,
         max_spool_bytes,
+        bounded_retry,
     )
     .await
 }
@@ -1130,7 +1133,8 @@ fn preview_body(body: &[u8], limit: usize, total_bytes: usize) -> String {
 }
 
 /// 非 SSE 客户端的重试通道：从 attempt 2 起无限重试（attempt 1 已在 proxy_handler 完成），
-/// 响应在成功后一次性返回。
+/// 响应在成功后一次性返回。受限重试路径（`bounded_retry`）例外：有响应的失败
+/// 达到 [`retry::BOUNDED_RETRY_MAX_ATTEMPTS`] 次后透传最后一次失败响应。
 async fn proxy_without_keepalive(
     state: AppState,
     method: http::Method,
@@ -1138,6 +1142,7 @@ async fn proxy_without_keepalive(
     headers: HeaderMap,
     req_body: RequestBody,
     max_spool_bytes: usize,
+    bounded_retry: bool,
 ) -> Response {
     let mut attempt: u32 = 1;
     let max_backoff = state.config.max_retry_backoff_secs;
@@ -1210,19 +1215,36 @@ async fn proxy_without_keepalive(
                 body,
                 disk_scan,
             } => {
-                if needs_retry_response(attempt, &status, &raw_headers, &body, &disk_scan) {
-                    state.note_upstream_failure(&format!("上游返回 {status}（错误内容，重试）"));
-                    continue; // body Drop：磁盘临时文件删除
-                }
-
-                // 成功：按是否流式选择回放方式，保证“原样流式”
+                // 成功与「受限路径透传」都走完整回放，流式判定对两者一致
                 let is_streaming = match &body {
                     SpooledBody::Memory(_) => {
                         retry::is_streaming_response(&raw_headers, body.memory_bytes())
                     }
                     SpooledBody::Disk { .. } => retry::is_streaming_content_type(&raw_headers),
                 };
-                tracing::info!(attempt, status = %status, is_streaming, "重试后成功");
+                if needs_retry_response(attempt, &status, &raw_headers, &body, &disk_scan) {
+                    // 受限重试路径：有响应的失败达到尝试上限后不再重试，把最后
+                    // 一次失败响应原样透传——客户端拿到真实 404 自行处理，好过
+                    // 永远等不到终态（compact 事故）。仅封顶「上游有响应」的失败：
+                    // 网络错误是真正的瞬时类，仍无限重试，且它没有响应可供回放。
+                    if bounded_retry && attempt >= retry::BOUNDED_RETRY_MAX_ATTEMPTS {
+                        tracing::warn!(
+                            attempt,
+                            status = %status,
+                            "受限重试路径达到尝试上限，透传最后一次上游响应"
+                        );
+                        state.note_upstream_failure(&format!(
+                            "上游返回 {status}（受限重试路径，达上限透传）"
+                        ));
+                    } else {
+                        state
+                            .note_upstream_failure(&format!("上游返回 {status}（错误内容，重试）"));
+                        continue; // body Drop：磁盘临时文件删除
+                    }
+                } else {
+                    // 成功：按是否流式选择回放方式，保证“原样流式”
+                    tracing::info!(attempt, status = %status, is_streaming, "重试后成功");
+                }
                 return build_replay_response(
                     status,
                     resp_headers,
@@ -1238,6 +1260,7 @@ async fn proxy_without_keepalive(
 
 /// 带保活的重试通道：仅在上游首轮已失败后进入。立即以 SSE 流响应并在流中发送
 /// `: keepalive\n\n` 注释，后台从 attempt 2 起无限重试，成功后将上游 body 分块转发。
+/// 受限重试路径（`bounded_retry`）达到尝试上限后以终态 SSE error 事件收场。
 ///
 /// 注意：此通道的骨架响应已先行发出（200 + text/event-stream），上游真实 status
 /// 与响应头无法再回放——这是「先保活、后成功」的固有取舍；首轮成功走的是
@@ -1249,6 +1272,7 @@ async fn proxy_with_keepalive(
     headers: HeaderMap,
     req_body: RequestBody,
     max_spool_bytes: usize,
+    bounded_retry: bool,
 ) -> Response {
     let keepalive_dur = state.config.keepalive_interval();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
@@ -1368,6 +1392,25 @@ async fn proxy_with_keepalive(
                     ..
                 } => {
                     if needs_retry_response(attempt, &status, &raw_headers, &body, &disk_scan) {
+                        // 受限重试路径：骨架 200 已发出、状态行不可再改，无法回放
+                        // 真实 status/headers，以终态 error 事件收场（同下方
+                        // TooLarge/SpoolFailed 的处理），客户端明确感知而非永远等
+                        if bounded_retry && attempt >= retry::BOUNDED_RETRY_MAX_ATTEMPTS {
+                            tracing::warn!(
+                                attempt,
+                                status = %status,
+                                "受限重试路径达到尝试上限，终止重试（保活通道）"
+                            );
+                            state_bg.note_upstream_failure(&format!(
+                                "上游返回 {status}（受限重试路径，达上限透传）"
+                            ));
+                            drop(body);
+                            let err_event = Bytes::from(format!(
+                                "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"upstream_error\",\"message\":\"upstream returned {status}; bounded retry path exhausted after {attempt} attempts\"}}}}\n\n"
+                            ));
+                            let _ = tx.send(Ok(err_event)).await;
+                            return;
+                        }
                         state_bg
                             .note_upstream_failure(&format!("上游返回 {status}（错误内容，重试）"));
                         // 发心跳前先丢弃（body Drop 删临时文件，杜绝任何

@@ -4,6 +4,21 @@
 > 2026-09-08 补录 tag 之后一轮（性能优化 + 磁盘缓存 + 重构 + skill），全部已完成。
 > 2026-09-09 第四轮审查修复 + 实测 restart bug + skill 指引优化，全部已完成。
 
+## 受限重试路径补丁（2026-09-20）
+
+- [x] **compact 被 count_tokens 无限重试风暴挂死——定向修复**：用户实测
+  Claude Code compact 总是出错（仅转发/直连正常）。定位：compact 依赖的
+  `POST /v1/messages/count_tokens` 在镜像上游（opencode.ai/zen、hub.oaifree）
+  是确定性 404，「4xx/5xx 一律无限重试」让它永远等不到终态（12233 复现日志：
+  attempt 1→7+、退避封顶 320s）；compact 的总结请求本身是成功的。修复（用户
+  定向：部分上游不支持的 URL 路径失败一定次数后不重试）：`/count_tokens`
+  结尾的客户端路径，有响应的失败达 3 次尝试（含首轮，前两次零延迟）即透传
+  最后一次上游响应；网络错误仍无限重试（真瞬时类，且无响应可回放）；保活
+  通道以终态 SSE error 事件收场。测试 4 集成（透传 / 窗口内自愈 / 保活事件 /
+  非受限路径不受封顶的对照）+ 1 单测，全量 246 项绿 + clippy 零警告。文档
+  同步 behaviors.md（重试判定/不重试/排障速查）+ architecture.md。
+  详见 `.agents/memory/2026-09-20-bounded-retry-paths.md`
+
 ## 仅转发模式 forward_only（2026-09-14）
 
 - [x] **落地 + 独立审查闭环**：代码/测试/文档全部落地（`d357915`/`6daedec`/

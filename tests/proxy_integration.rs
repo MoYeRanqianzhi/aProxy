@@ -165,6 +165,192 @@ async fn retry_on_error_body_then_success() {
 }
 
 // ---------------------------------------------------------------------------
+// 2a. 受限重试路径：失败达上限后透传最后一次响应（count_tokens 补丁）
+//
+// 背景：Claude Code 的 compact 依赖 /v1/messages/count_tokens，大量镜像上游
+// 未实现该端点、确定性 404。无限重试让客户端永远等不到终态（compact 挂到
+// 超时）；直连/仅转发下 404 秒回则一切正常。受限路径达上限即透传真实响应。
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn bounded_retry_path_passes_through_after_cap() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c2 = counter.clone();
+
+    let upstream = Router::new().route(
+        "/v1/messages/count_tokens",
+        any(move |_req: axum::extract::Request| {
+            let c = c2.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(serde_json::json!({
+                        "type": "error",
+                        "error": {"type": "not_found_error", "message": "path not found"}
+                    })),
+                )
+                    .into_response()
+            }
+        }),
+    );
+
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let proxy_state = AppState::new(proxy_config_for(&upstream_url));
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = local_client();
+    let resp = client
+        .post(format!("{proxy_url}/v1/messages/count_tokens?beta=true"))
+        .json(&serde_json::json!({"model": "test"}))
+        .send()
+        .await
+        .unwrap();
+
+    // 上游的 404 原样透传，客户端拿到真实终态
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "not_found_error");
+    // 首轮 + 2 次零延迟重试 = 恰好 BOUNDED_RETRY_MAX_ATTEMPTS 次，不多不少
+    assert_eq!(counter.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn bounded_retry_path_recovers_within_cap() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c2 = counter.clone();
+
+    let upstream = Router::new().route(
+        "/v1/messages/count_tokens",
+        any(move |_req: axum::extract::Request| {
+            let c = c2.clone();
+            async move {
+                let n = c.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    (StatusCode::NOT_FOUND, "not found").into_response()
+                } else {
+                    (
+                        StatusCode::OK,
+                        axum::Json(serde_json::json!({"input_tokens": 42})),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let proxy_state = AppState::new(proxy_config_for(&upstream_url));
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = local_client();
+    let resp = client
+        .post(format!("{proxy_url}/v1/messages/count_tokens"))
+        .json(&serde_json::json!({"model": "test"}))
+        .send()
+        .await
+        .unwrap();
+
+    // 瞬时故障仍能在上限窗口内自愈：第 3 次尝试成功
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["input_tokens"], 42);
+    assert_eq!(counter.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn bounded_retry_path_keepalive_channel_ends_with_error_event() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c2 = counter.clone();
+
+    let upstream = Router::new().route(
+        "/v1/messages/count_tokens",
+        any(move |_req: axum::extract::Request| {
+            let c = c2.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::NOT_FOUND, "not found").into_response()
+            }
+        }),
+    );
+
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    // 默认配置 keepalive_interval_secs = 15 > 0，保活通道可用
+    let proxy_state = AppState::new(proxy_config_for(&upstream_url));
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = local_client();
+    let resp = client
+        .post(format!("{proxy_url}/v1/messages/count_tokens"))
+        .header("accept", "text/event-stream")
+        .json(&serde_json::json!({"stream": true}))
+        .send()
+        .await
+        .unwrap();
+
+    // 骨架 200 SSE 先行；受限路径达上限后流必须终止于终态 error 事件，
+    // 而不是永远只剩心跳
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains(": keepalive"), "应有保活心跳: {text}");
+    assert!(
+        text.contains("event: error"),
+        "应以终态 error 事件收场: {text}"
+    );
+    assert!(
+        text.contains("upstream_error"),
+        "error 事件应携带类型: {text}"
+    );
+    assert!(text.contains("404"), "error 事件应携带上游状态码: {text}");
+    assert_eq!(counter.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn unbounded_path_keeps_retrying_past_bounded_cap() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c2 = counter.clone();
+
+    // 非受限路径上的同样 404：必须继续无限重试（封顶只作用于受限路径，
+    // 这条对照保证封顶没有被错误地全局化——否则违背「无限重试」使命）
+    let upstream = Router::new().route(
+        "/v1/messages",
+        any(move |_req: axum::extract::Request| {
+            let c = c2.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::NOT_FOUND, "not found").into_response()
+            }
+        }),
+    );
+
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.max_retry_backoff_secs = 0; // 零退避，让重试轮次快速推进
+    let proxy_state = AppState::new(cfg);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = local_client();
+    let task = tokio::spawn(async move {
+        client
+            .post(format!("{proxy_url}/v1/messages"))
+            .json(&serde_json::json!({"model": "test"}))
+            .send()
+            .await
+    });
+
+    // 轮询等待上游调用数越过受限上限（> 3 次），证明该路径不受封顶约束
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while counter.load(Ordering::SeqCst) <= 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "非受限路径应在 10s 内重试超过 3 次（实际 {} 次）",
+            counter.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    task.abort();
+}
+
+// ---------------------------------------------------------------------------
 // 2b. 压缩/二进制错误体触发重试，且日志预览不产生乱码
 //
 // 回归：上游（如 Cloudflare）曾返回 zstd 压缩的错误页，错误预览被

@@ -1402,7 +1402,7 @@ async fn proxy_with_keepalive(
                                 "受限重试路径达到尝试上限，终止重试（保活通道）"
                             );
                             state_bg.note_upstream_failure(&format!(
-                                "上游返回 {status}（受限重试路径，达上限透传）"
+                                "上游返回 {status}（受限重试路径，达上限终止）"
                             ));
                             drop(body);
                             let err_event = Bytes::from(format!(

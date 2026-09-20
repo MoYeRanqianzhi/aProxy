@@ -288,9 +288,13 @@ async fn bounded_retry_path_keepalive_channel_ends_with_error_event() {
         .unwrap();
 
     // 骨架 200 SSE 先行；受限路径达上限后流必须终止于终态 error 事件，
-    // 而不是永远只剩心跳
+    // 而不是永远只剩心跳。显式超时包裹：若回归成无限重试，此测试应快速
+    // 失败并给出可读断言，而非挂死到 CI 超时
     assert_eq!(resp.status(), 200);
-    let text = resp.text().await.unwrap();
+    let text = tokio::time::timeout(Duration::from_secs(10), resp.text())
+        .await
+        .expect("SSE 流应在受限路径达上限后以 error 事件终止（10s 内）")
+        .unwrap();
     assert!(text.contains(": keepalive"), "应有保活心跳: {text}");
     assert!(
         text.contains("event: error"),
@@ -344,6 +348,45 @@ async fn unbounded_path_keeps_retrying_past_bounded_cap() {
             std::time::Instant::now() < deadline,
             "非受限路径应在 10s 内重试超过 3 次（实际 {} 次）",
             counter.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn bounded_retry_path_network_errors_not_capped() {
+    // 不变量守护：受限路径上只有「上游有响应的失败」才封顶，网络错误仍无限
+    // 重试（真正的瞬时类，且没有响应可供回放）。指向一个无人监听的端口制造
+    // 确定性连接拒绝；若封顶被误加到 NetworkError 分支，重试会停在
+    // retries_total == 2（通道内 attempt 2、3），永远到不了 4
+    isolate_env_proxy();
+    let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead_listener.local_addr().unwrap();
+    drop(dead_listener); // 拿到端口后立即释放，制造确定性的连接拒绝
+
+    let mut cfg = proxy_config_for(&format!("http://{dead_addr}"));
+    cfg.max_retry_backoff_secs = 0;
+    let proxy_state = AppState::new(cfg);
+    let stats = proxy_state.stats.clone();
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = local_client();
+    let task = tokio::spawn(async move {
+        client
+            .post(format!("{proxy_url}/v1/messages/count_tokens"))
+            .json(&serde_json::json!({"model": "test"}))
+            .send()
+            .await
+    });
+
+    // 重试轮次越过「响应封顶」对应的轮数：retries_total ≥ 4 即总尝试 ≥ 5
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while stats.retries_total.load(Ordering::SeqCst) < 4 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "受限路径的网络错误应继续重试，不受响应封顶约束（retries_total={}）",
+            stats.retries_total.load(Ordering::SeqCst)
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

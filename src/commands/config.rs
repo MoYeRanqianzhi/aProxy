@@ -239,6 +239,23 @@ pub(crate) fn handle_config_cmd(path: PathBuf, args: ConfigArgs) {
                 "forward_only            = （未在 toml 设置，运行时取 settings.json 全局默认）"
             ),
         }
+        // bounded_retry_paths：与上面三个 Option 字段同款的三态展示；空列表
+        // 显式标注「功能关闭」，有值时**原样**列出模式（不能用 {:?}——Debug
+        // 会把 \? 转义成 \\?，用户对照 toml 会被误导）
+        match &cfg.bounded_retry_paths {
+            Some(list) if list.is_empty() => {
+                println!("bounded_retry_paths     = []（功能关闭）")
+            }
+            Some(list) => {
+                println!(
+                    "bounded_retry_paths     = [{}]（命中者失败 3 次即透传）",
+                    list.join(", ")
+                )
+            }
+            None => println!(
+                "bounded_retry_paths     = （未在 toml 设置，运行时取 settings.json 全局默认）"
+            ),
+        }
         // 0 表示不设限，语义特殊，提示出来
         if cfg.connect_timeout_secs == 0 {
             println!("connect_timeout_secs    = 0（不设限）");

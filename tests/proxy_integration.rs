@@ -204,19 +204,27 @@ async fn bounded_retry_path_passes_through_after_cap() {
     );
 
     let (upstream_url, _h1) = bind_random_router(upstream).await;
+    // 双模式配置：顺带钉住「任一命中」语义（.any）——若回归成 .all/.first，
+    // 命中第二个模式时本测试变红
     let proxy_state = AppState::new(proxy_config_with_bounded_paths(
         &upstream_url,
-        &["/v1/messages/count_tokens"],
+        &["/not-this-one", "/v1/messages/count_tokens"],
     ));
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
     let client = local_client();
-    let resp = client
-        .post(format!("{proxy_url}/v1/messages/count_tokens"))
-        .json(&serde_json::json!({"model": "test"}))
-        .send()
-        .await
-        .unwrap();
+    // 显式超时包裹：若封顶回归（标志漏传/模式未命中/构造丢正则），请求会
+    // 无限重试——本测试应快速失败并给出可读断言，而非挂死到 CI 超时
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        client
+            .post(format!("{proxy_url}/v1/messages/count_tokens"))
+            .json(&serde_json::json!({"model": "test"}))
+            .send(),
+    )
+    .await
+    .expect("受限路径应在 10s 内封顶透传（而非无限重试）")
+    .unwrap();
 
     // 上游的 404 原样透传，客户端拿到真实终态
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -412,6 +420,61 @@ async fn bounded_retry_path_network_errors_not_capped() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    task.abort();
+}
+
+#[tokio::test]
+async fn bounded_retry_keepalive_channel_network_errors_not_capped() {
+    // 不变量守护（保活通道侧）：受限路径上网络错误不触发终态 error 事件、
+    // 不封顶。保活通道正是流式主场景——若重构把封顶误加到它的 NetworkError
+    // 分支，客户端会在第 3 次失败后收到 event: error 并断流，与「无限重试、
+    // 不中断」的使命相反（无保活通道侧由 bounded_retry_path_network_errors_
+    // not_capped 钉住，两条通道是独立代码路径）。
+    isolate_env_proxy();
+    let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead_listener.local_addr().unwrap();
+    drop(dead_listener); // 拿到端口后立即释放，制造确定性的连接失败
+
+    let mut cfg = proxy_config_with_bounded_paths(
+        &format!("http://{dead_addr}"),
+        &["/v1/messages/count_tokens"],
+    );
+    cfg.max_retry_backoff_secs = 0;
+    let proxy_state = AppState::new(cfg);
+    let stats = proxy_state.stats.clone();
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = local_client();
+    let task = tokio::spawn(async move {
+        let resp = client
+            .post(format!("{proxy_url}/v1/messages/count_tokens"))
+            .header("accept", "text/event-stream")
+            .json(&serde_json::json!({"stream": true}))
+            .send()
+            .await
+            .unwrap();
+        resp.text().await.unwrap_or_default()
+    });
+
+    // 轮询等待重试轮次越过封顶（retries_total ≥ 4），期间流必须仍然存活：
+    // 若误发终态 error 事件，流终止、任务完成，下方断言立即变红
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while stats.retries_total.load(Ordering::SeqCst) < 4 {
+        assert!(
+            !task.is_finished(),
+            "保活通道在受限路径的网络错误上不应终止流（重试未越过封顶轮数就已结束 = 误发 error 事件）"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "20s 内重试未越过封顶轮数（retries_total={}）：连接失败过慢或封顶被误加",
+            stats.retries_total.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !task.is_finished(),
+        "越过封顶轮数后流仍应存活（网络错误不发 error 事件）"
+    );
     task.abort();
 }
 

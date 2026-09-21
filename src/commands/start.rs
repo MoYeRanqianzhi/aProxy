@@ -26,6 +26,10 @@ pub(crate) fn resolve_runtime_config(
     // settings.json 全局默认注入：toml 显式值 > settings 值 > 内置默认。
     // get_or_insert 只在 toml 未显式配置时写入 settings 值——这正是
     // 「settings 公用默认、toml 按实例覆盖」的优先级实现点。
+    // bounded_retry_paths 是 settings 层第一个能让 start 失败的值（非法正则），
+    // 注入前记录来源：validate 报错时若值来自 settings，下方「位置: toml」
+    // 的指引找不到问题，必须点名真实来源。
+    let bounded_paths_from_settings = cfg.bounded_retry_paths.is_none();
     {
         let s = settings::load();
         cfg.max_body_mb.get_or_insert(s.max_body_mb);
@@ -48,6 +52,11 @@ pub(crate) fn resolve_runtime_config(
         let msg = match cfg.proxy.as_deref() {
             Some(p) => msg.replace(p, &crate::util::mask_proxy_url(p)),
             None => msg,
+        };
+        let msg = if bounded_paths_from_settings && msg.contains("bounded_retry_paths") {
+            format!("{msg}\n（该值来自 settings.json 的 bounded_retry_paths 全局默认，不在上述 toml 中）")
+        } else {
+            msg
         };
         format!(
             "配置错误: {msg}\n位置: {}\n\n请执行以下任一操作后重试:\n  aproxy config --baseurl https://api.anthropic.com\n  或手动编辑 {}",

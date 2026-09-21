@@ -265,8 +265,11 @@ impl Config {
         // 「校验通过 = 运行期编译必成功」），非法模式启动即报明确错误而非
         // 静默不匹配
         for p in self.bounded_retry_paths() {
-            Self::compile_bounded_retry_pattern(p)
-                .map_err(|e| format!("bounded_retry_paths 含非法正则 {p:?}: {e}"))?;
+            Self::compile_bounded_retry_pattern(p).map_err(|e| {
+                // 原样显示模式（不用 {:?}——Debug 会把 \? 转义成 \\?，用户拿
+                // 错误消息回填 toml 会得到语义不同的正则）
+                format!("bounded_retry_paths 含非法正则 \"{p}\": {e}")
+            })?;
         }
         Ok(())
     }
@@ -692,6 +695,14 @@ mod tests {
         assert!(!m("/v1/messages/count_tokens.*", "/v1/messages"));
         // 自动锚定：模式不会作为子串命中其他路径
         assert!(!m("/messages", "/v1/messages/count_tokens"));
+        // 顶层交替依赖包裹的非捕获组 (?:...)：锚定必须罩住整个交替，否则
+        // ^/a|/b$ 的右支会作为子串命中任意以 /b 结尾的路径（误封顶）
+        assert!(m("/a|/b", "/a"));
+        assert!(m("/a|/b", "/b"));
+        assert!(!m("/a|/b", "/x/y/b"));
+        // 用户自带的 ^ $ 锚点在包裹内仍合法且语义不变
+        assert!(m("^/x$", "/x"));
+        assert!(!m("^/x$", "/x/y"));
     }
 
     #[test]
@@ -718,6 +729,38 @@ mod tests {
         let err = bad.validate().unwrap_err();
         assert!(err.contains("bounded_retry_paths"), "错误应指明字段: {err}");
         assert!(err.contains("[unclosed"), "错误应包含非法模式原文: {err}");
+    }
+
+    #[test]
+    fn bounded_retry_paths_toml_roundtrip() {
+        // toml 往返：该字段唯一入口就是手编文件（无 CLI 旗标），单引号字面量
+        // 写法（正则含 \? 时免转义）必须保真；旧配置（无该字段）读出 None 且
+        // 访问器回退空。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.toml");
+        let raw = concat!(
+            "base_url = \"https://api.example.com\"\n",
+            "bounded_retry_paths = ['/v1/messages/count_tokens', '/v1/messages/count_tokens\\?.*']\n",
+        );
+        std::fs::write(&path, raw).unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(
+            loaded.bounded_retry_paths(),
+            [
+                "/v1/messages/count_tokens".to_string(),
+                "/v1/messages/count_tokens\\?.*".to_string()
+            ],
+            "单引号 toml 字面量里的 \\? 必须原样保真（不能被 TOML 转义吃掉）"
+        );
+        // 往返后模式仍可编译且语义不变
+        let re = Config::compile_bounded_retry_pattern(&loaded.bounded_retry_paths()[1]).unwrap();
+        assert!(re.is_match("/v1/messages/count_tokens?beta=true"));
+
+        // 旧配置（无该字段）：None + 访问器回退空
+        std::fs::write(&path, "base_url = \"https://api.example.com\"").unwrap();
+        let legacy = load_from(&path);
+        assert_eq!(legacy.bounded_retry_paths, None);
+        assert!(legacy.bounded_retry_paths().is_empty());
     }
 
     #[test]

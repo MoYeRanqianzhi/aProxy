@@ -128,8 +128,8 @@ magic number，连「这是压缩体」都认不出；2026-09-14 的 Cloudflare 
 
 ## 配置分层
 
-三级优先级（仅 `max_body_mb`/`disk_cache`/`forward_only` 有 settings 层；其余
-字段 toml > 内置默认）：
+三级优先级（仅 `max_body_mb`/`disk_cache`/`forward_only`/`bounded_retry_paths`
+四个字段有 settings 层；其余字段 toml > 内置默认）：
 
 ```
 CLI 覆盖参数（--baseurl 等，仅本次） > config.toml 显式值 > settings.json 全局默认 > 内置默认
@@ -137,7 +137,7 @@ CLI 覆盖参数（--baseurl 等，仅本次） > config.toml 显式值 > settin
 
 `config.toml` 人类可读可写、可多份（多开各自指定）；`settings.json` 程序管理的
 内部配置，**全局唯一**（JSON 原子写，损坏回退默认），存别名表、default_config、
-config_dirs、日志轮转阈值、空闲阈值与上述三个字段的全局默认。
+config_dirs、日志轮转阈值、空闲阈值与上述四个字段的全局默认。
 
 ### 配置别名（settings.json）
 

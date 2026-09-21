@@ -10,9 +10,10 @@ aProxy catches the request locally: on failure it **retries without limit**
 (exponential backoff, capped and configurable), keeps streaming responses
 alive with injected SSE heartbeats, and replays the successful response
 byte-for-byte. Your client never notices the storm upstream; it only notices
-that the request took a little longer. (The one exception is `forward_only`
-mode — it explicitly gives up that retry guarantee for true streaming
-passthrough; see Configuration.)
+that the request took a little longer. (Two explicit exceptions: `forward_only`
+mode gives up that retry guarantee for true streaming passthrough, and
+`bounded_retry_paths` passes through the real response after 3 failures for
+matched paths; see Configuration.)
 
 [中文](README.md)
 
@@ -21,8 +22,11 @@ passthrough; see Configuration.)
 - **Infinite retries** — What stands in the way becomes the way. Network
   errors, 4xx/5xx, error JSON (a 200 carrying an error) all trigger retries;
   when the client disconnects, the upstream request is aborted immediately
-  (billing protection). **The only way out is `forward_only` mode** — an
-  explicit trade that drops retries for streamed request/response passthrough.
+  (billing protection). Two **explicit ways out**: `forward_only` mode (an
+  explicit trade that drops retries for streamed request/response passthrough)
+  and `bounded_retry_paths` (for upstream endpoints that fail deterministically,
+  the real response is passed through after 3 attempts instead of waiting
+  forever).
 - **Total passthrough** — Transparency as a principle. Paths, queries, and
   headers forwarded untouched; control traffic rides a separate named pipe,
   so the proxy port does exactly one thing.
@@ -147,6 +151,7 @@ listen_addr = "127.0.0.1:12345"          # local listener
 # max_body_mb = 128                      # request body cap (MB; 0 = unlimited)
 # disk_cache = true                      # spool large bodies/responses to disk
 # forward_only = false                   # forward-only (gives up retries): stream both ways, no retries/buffering/heartbeats
+# bounded_retry_paths = [ '/v1/x' ]      # bounded retry paths (regex): matched requests pass through after 3 failures
 # connect_timeout_secs = 30              # upstream connect timeout (0 = none)
 # read_timeout_secs = 300                # inter-read timeout (0 = none)
 ```

@@ -413,6 +413,17 @@ pub fn check_settings_errors_in(path: &std::path::Path) -> Vec<String> {
             ));
         }
     }
+    // bounded_retry_paths（settings 全局默认层）：正则合法性在此预检——否则
+    // 只有 start 注入后才被 validate 拦截，出现「doctor 全绿、start 却失败」
+    // 的排障盲区（这是 settings 层第一个能让 start 失败的值，toml 层另有
+    // validate 的调用点把关）
+    for p in &settings.bounded_retry_paths {
+        if let Err(e) = crate::config::Config::compile_bounded_retry_pattern(p) {
+            errors.push(format!(
+                "bounded_retry_paths 含非法正则 \"{p}\": {e}（来源 settings.json；start 该项全局默认的实例会失败）"
+            ));
+        }
+    }
     errors
 }
 
@@ -475,6 +486,54 @@ mod tests {
         std::fs::write(&path, "{corrupted").unwrap();
         let s = load_from(&path);
         assert!(s.aliases.is_empty(), "损坏的 settings 应回退为空别名表");
+    }
+
+    #[test]
+    fn bounded_retry_paths_roundtrip_and_default() {
+        // 与 max_body_mb/forward_only 等同级字段同款的往返钉桩：默认空（=
+        // 功能关闭）、显式值落盘往返保真、旧 settings.json（无字段）读出空。
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path_in(dir.path());
+        let mut s = Settings::default();
+        assert!(s.bounded_retry_paths.is_empty(), "内置默认空 = 关闭");
+        s.bounded_retry_paths = vec![
+            "/v1/messages/count_tokens".to_string(),
+            "/v1/messages/count_tokens\\?.*".to_string(),
+        ];
+        save_to(&path, &s).unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(
+            loaded.bounded_retry_paths, s.bounded_retry_paths,
+            "往返保真"
+        );
+
+        // 旧 settings.json（无该字段）→ serde default 空
+        std::fs::write(&path, "{\"aliases\": {}}").unwrap();
+        let legacy = load_from(&path);
+        assert!(
+            legacy.bounded_retry_paths.is_empty(),
+            "旧文件缺字段读默认空，升级无感"
+        );
+    }
+
+    #[test]
+    fn settings_check_reports_invalid_bounded_pattern() {
+        // doctor 的 settings 预检：非法正则在此报出（而非等 start 注入后才被
+        // validate 拦截——避免「doctor 全绿、start 却失败」的盲区）
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path_in(dir.path());
+        std::fs::write(&path, "{\"bounded_retry_paths\": [\"[unclosed\"]}").unwrap();
+        let errors = check_settings_errors_in(&path);
+        assert_eq!(errors.len(), 1, "应恰好报出一条: {errors:?}");
+        assert!(errors[0].contains("bounded_retry_paths"), "{errors:?}");
+        assert!(
+            errors[0].contains("[unclosed"),
+            "错误应含模式原文: {errors:?}"
+        );
+
+        // 合法模式不报错
+        std::fs::write(&path, "{\"bounded_retry_paths\": [\"/x\"]}").unwrap();
+        assert!(check_settings_errors_in(&path).is_empty());
     }
 
     #[test]

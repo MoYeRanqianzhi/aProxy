@@ -25,6 +25,21 @@
   访问器与校验），全量 250 项绿 + clippy 零警告。skill 四份 references +
   SKILL.md + 架构文档全量同步，含用户要求的排障标注（Claude Code 非官方
   API 的 compact 卡死 → 本配置可解）。
+- [x] **严格实测 + 5 维对抗审查闭环（2026-09-21）**：真实实例 e2e 矩阵 18 项
+  全过（精准/通配/查询串边界、序列自愈、保活 SSE 终态、非法正则拒绝启动、
+  settings/toml 分层、旧版 alpha.13 二进制兼容、网络错误 4698 次/4s 不封顶、
+  交替与自锚点极端正则）；实测挖出并修复 `config --show` 缺展示（2c0e45c）。
+  Workflow 审查（5 维并行 + 逐条对抗复核）：报 13 条、成立 12、驳回 1，
+  成立的全部处置——README/README_EN「唯一出口」表述改为两个出口、
+  architecture.md 分层节补第四字段、compatibility.md 补「未随 alpha.13
+  出厂」条目、校验错误改原样显示模式（Debug 转义误导回填）、settings 层
+  非法正则纳入 doctor 预检 + start 报错点名来源、补 7 项测试（交替/自锚点、
+  toml 往返、settings 往返、doctor 预检、多模式任一命中、封顶超时包裹、
+  保活通道网络错误不封顶）、config-toml.md 匹配语义补「原始未解码 +
+  区分大小写 + $ ^ 字面量转义」。驳回 1 条：「可编译但恒不匹配」死亡模式
+  ——核心例证有误且拟议 validate 判据会误伤正常模式；其文档建议并入
+  语义节。新增 regex 依赖后 install_flow 在整机高负载下偶发 2 例（swapping
+  为既有留档 + restarting 同族新面孔，单跑 7/7 全过），重跑全量 254 项全绿。
   详见 `.agents/memory/2026-09-20-bounded-retry-paths.md`
 
 ## 仅转发模式 forward_only（2026-09-14）

@@ -31,6 +31,8 @@ pub(crate) fn resolve_runtime_config(
         cfg.max_body_mb.get_or_insert(s.max_body_mb);
         cfg.disk_cache.get_or_insert(s.disk_cache);
         cfg.forward_only.get_or_insert(s.forward_only);
+        cfg.bounded_retry_paths
+            .get_or_insert_with(|| s.bounded_retry_paths.clone());
     }
     // listen_addr 必须带端口（port_of 取最后一个 ':' 之后）：缺端口/端口越界的
     // bind 失败不是占用，提前拦截给出明确错误，避免被误诊为「被其他程序占用」

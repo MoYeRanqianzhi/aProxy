@@ -26,4 +26,4 @@
 - [install 三平台实测记录](memory/2026-09-11-install-three-platform-e2e.md) — Windows/Ubuntu/WSL 全量+e2e 全绿；挖出 5 个真 bug（unix 编译面×2、平台硬编码测试、库层 IPC 环境泄漏、有实例 swapping 续作状态机拒绝）；WSL TUN 劫持 TLS 的绕法与 e2e 脚本坑集
 - [仅转发模式](memory/2026-09-14-forward-only.md) — forward_only（alpha.12）：放弃重试/缓冲/心跳换真流式直通（可信上游的显式取舍），config.toml + settings.json 分层；分支点/流式/透传与「不得 unwrap」消费点约束 [[forward-only]] [[alias-settings]] [[disconnect-billing-protection]]
 - [压缩体检查盲区](memory/2026-09-14-compressed-body-inspection.md) — 用户实测：Cloudflare 的 brotli 404 页在日志里只剩 hex；根因是检查路径跑在压缩字节上，连带 is_error_body / is_stream_error_body 静默失效（200+error JSON 不重试）；修法=检查解一份副本、转发不解码；mock 不压缩是 220 项全绿仍漏掉此 bug 的原因；附测试守护泄漏锁 exe 的现场 [[log-mojibake]] [[ci-unix-blindspot]]
-- [受限重试路径](memory/2026-09-20-bounded-retry-paths.md) — compact 事故：镜像上游普遍不实现 count_tokens，确定性 404 被无限重试挂死 compact（仅转发/直连正常即此因）；修复=/count_tokens 结尾路径 3 次尝试即透传，网络错误与非受限路径不封顶；重试行无请求 ID，归因靠相邻 INFO 行交叉比对 [[forward-only]]
+- [受限重试路径](memory/2026-09-20-bounded-retry-paths.md) — compact 事故（镜像上游不实现 count_tokens，确定性 404 被无限重试挂死）；最终设计=bounded_retry_paths 配置项（正则整体匹配 path+query，空=关闭，不内置任何 URL）；含首版硬编码被用户否决的教训：行为差异功能一律配置化、不得内置 URL、查询串不可省略 [[forward-only]]

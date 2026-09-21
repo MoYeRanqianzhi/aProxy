@@ -50,6 +50,10 @@ flate2 = "1"
 semver = "1"
 # skill 更新支线：GitHub skills 资产的 zip 解包
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# 受限重试路径（config.toml bounded_retry_paths）：用户配置的正则模式，
+# 命中的请求失败达尝试上限即透传。纯正则引擎，无 C 依赖，musl/aarch64
+# 交叉编译与 CI 不受影响。
+regex = "1"
 # 响应体检查用解码器（src/decode.rs）：把压缩响应解出一份副本供「错误判定 +
 # 日志预览」使用——转发给客户端的字节始终是上游原样，本模块不参与转发路径。
 # 两者均为**纯 Rust**实现（无 C 依赖，故 musl/aarch64 交叉编译与 CI 各平台不受

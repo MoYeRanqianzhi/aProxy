@@ -4,24 +4,27 @@
 > 2026-09-08 补录 tag 之后一轮（性能优化 + 磁盘缓存 + 重构 + skill），全部已完成。
 > 2026-09-09 第四轮审查修复 + 实测 restart bug + skill 指引优化，全部已完成。
 
-## 受限重试路径补丁（2026-09-20）
+## 受限重试路径（2026-09-20）
 
-- [x] **compact 被 count_tokens 无限重试风暴挂死——定向修复**：用户实测
-  Claude Code compact 总是出错（仅转发/直连正常）。定位：compact 依赖的
-  `POST /v1/messages/count_tokens` 在镜像上游（opencode.ai/zen、hub.oaifree）
-  是确定性 404，「4xx/5xx 一律无限重试」让它永远等不到终态（12233 复现日志：
-  attempt 1→7+、退避封顶 320s）；compact 的总结请求本身是成功的。修复（用户
-  定向：部分上游不支持的 URL 路径失败一定次数后不重试）：`/count_tokens`
-  结尾的客户端路径，从总尝试第 3 次起有响应的失败即透传（确定性 404 场景
-  恰 3 次总尝试，前两次零延迟）；网络错误不封顶，仍无限重试（真瞬时类，
-  且无响应可回放）；保活
-  通道以终态 SSE error 事件收场。测试 5 集成（透传 / 窗口内自愈 / 保活事件 /
-  非受限路径不受封顶的对照 / 网络错误不受封顶的守护）+ 1 单测，全量绿 +
-  clippy 零警告。文档同步 behaviors.md（重试判定/不重试/排障速查）+
-  architecture.md。独立审查（10 项对抗式核对）确认无正确性缺陷，3 条轻微项
-  已全部处置（保活通道 note 文案「透传」→「终止」、keepalive 测试包
-  timeout、文档措辞改为「总尝试第 3 次起的有响应失败」）+ 补网络错误守护
-  测试与 MAX_ATTEMPTS 耦合语义注释。
+- [x] **compact 被 count_tokens 无限重试风暴挂死——bounded_retry_paths 配置
+  项落地（重写版）**：用户实测 Claude Code compact 总是出错（仅转发/直连
+  正常）。定位：compact 依赖的 `POST /v1/messages/count_tokens` 在镜像上游
+  （opencode.ai/zen、hub.oaifree）是确定性 404，「4xx/5xx 一律无限重试」让它
+  永远等不到终态（12233 复现日志：attempt 1→7+、退避封顶 320s）；compact 的
+  总结请求本身是成功的。
+  **首版（1affbc1/423d69b，内置 `/count_tokens` 后缀表 + 剥查询串匹配）被
+  用户否决**——「没有权利内置任何 url」「不能省略 ? 后面的内容」「不能假设
+  只有 count_tokens 这一种问题（用户可能用其他 agent 软件）」。重写为最终
+  形态：`bounded_retry_paths` 配置项（config.toml 每实例 + settings.json
+  全局默认，内置空 = 关闭），正则对「路径?查询串」整体匹配、自动锚定（普通
+  路径即精准匹配，查询串须显式 `\?` 写进模式，通配 `.*`），非法正则启动即
+  拒绝；命中请求总尝试第 3 次起有响应失败即透传终止，网络错误与非命中请求
+  不受影响，保活通道以终态 SSE error 事件收场。新增 regex 依赖（纯 Rust）。
+  测试 8 集成（透传 / 窗口内自愈 / 保活事件 / 非命中对照 / 网络错误守护 /
+  精准不命中带查询串 / 通配命中带查询串 + 既有回归）+ 2 单测（匹配语义 /
+  访问器与校验），全量 250 项绿 + clippy 零警告。skill 四份 references +
+  SKILL.md + 架构文档全量同步，含用户要求的排障标注（Claude Code 非官方
+  API 的 compact 卡死 → 本配置可解）。
   详见 `.agents/memory/2026-09-20-bounded-retry-paths.md`
 
 ## 仅转发模式 forward_only（2026-09-14）

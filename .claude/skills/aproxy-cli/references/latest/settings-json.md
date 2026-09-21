@@ -28,6 +28,7 @@
 | `max_body_mb` | u64 | 128 | 手编（进阶；toml 可按实例覆盖） |
 | `disk_cache` | bool | true | 手编（进阶；toml 可按实例覆盖） |
 | `forward_only` | bool | false | 手编（进阶；toml 可按实例覆盖） |
+| `bounded_retry_paths` | string[] | `[]` | 手编（进阶；toml 可按实例覆盖） |
 | `watchdog` | bool | true | 看门狗总开关 |
 | `watchdog_heartbeat_secs` | u64 | 30 | 看护扫描周期（调优） |
 | `watchdog_stale_after_cycles` | u64 | 1 | 挂死容忍周期数（误杀调节阀） |
@@ -87,6 +88,14 @@
 适合「上游可信 + 要真流式」的实例。完整语义与取舍见 config-toml.md 的
 `forward_only` 节。
 
+### bounded_retry_paths（全局默认层）
+
+`config.toml` 未显式写 `bounded_retry_paths` 的实例取此值（内置默认 `[]` =
+功能关闭）。toml 显式值优先。正则数组，命中的请求上游失败 3 次即透传、不再
+无限重试——给「上游对特定端点确定性报错」的实例兜底。匹配语义与典型场景
+（Claude Code 非官方 API 的 compact 卡死）见 config-toml.md 的
+`bounded_retry_paths` 节。
+
 ### watchdog（及四个 watchdog_* 调优字段）
 
 看门狗是**系统级单例**（一个全局看护进程 `aproxy watchdog` 看护全部实例），
@@ -129,10 +138,11 @@ install 下载专用代理（与 config.toml 的 `proxy` 上游请求代理**绝
 
 ## 与 config.toml 的分层关系
 
-只有 `max_body_mb`、`disk_cache` 与 `forward_only` 存在三层优先级：
+只有 `max_body_mb`、`disk_cache`、`forward_only` 与 `bounded_retry_paths`
+存在三层优先级：
 
 ```
-config.toml 显式值  >  settings.json 值  >  内置默认 (128 / true / false)
+config.toml 显式值  >  settings.json 值  >  内置默认 (128 / true / false / [])
 ```
 
 其余字段是「toml 显式值 > 内置默认」或完全归 settings 管理（本文件全部字段）。

@@ -69,6 +69,13 @@ fn proxy_config_for(upstream: &str) -> Config {
     .normalized()
 }
 
+/// 构建带受限重试路径模式（bounded_retry_paths）的代理配置，其余同 proxy_config_for
+fn proxy_config_with_bounded_paths(upstream: &str, patterns: &[&str]) -> Config {
+    let mut cfg = proxy_config_for(upstream);
+    cfg.bounded_retry_paths = Some(patterns.iter().map(|s| s.to_string()).collect());
+    cfg
+}
+
 // ---------------------------------------------------------------------------
 // 1. 5xx 重试后成功
 // ---------------------------------------------------------------------------
@@ -165,11 +172,13 @@ async fn retry_on_error_body_then_success() {
 }
 
 // ---------------------------------------------------------------------------
-// 2a. 受限重试路径：失败达上限后透传最后一次响应（count_tokens 补丁）
+// 2a. 受限重试路径（bounded_retry_paths 配置项）：命中配置模式的请求，上游
+// 「有响应的失败」达 3 次尝试后不再重试、透传最后一次上游响应。
 //
-// 背景：Claude Code 的 compact 依赖 /v1/messages/count_tokens，大量镜像上游
-// 未实现该端点、确定性 404。无限重试让客户端永远等不到终态（compact 挂到
-// 超时）；直连/仅转发下 404 秒回则一切正常。受限路径达上限即透传真实响应。
+// 动机：部分上游对特定端点确定性报错（如某些聚合/镜像服务未实现客户端依赖
+// 的辅助端点），无限重试让客户端永远等不到终态；直连/不重试模式下错误秒回，
+// 客户端自会处理。哪些路径受限完全由配置决定——测试用 /v1/messages/
+// count_tokens 仅作示例端点。
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn bounded_retry_path_passes_through_after_cap() {
@@ -195,12 +204,15 @@ async fn bounded_retry_path_passes_through_after_cap() {
     );
 
     let (upstream_url, _h1) = bind_random_router(upstream).await;
-    let proxy_state = AppState::new(proxy_config_for(&upstream_url));
+    let proxy_state = AppState::new(proxy_config_with_bounded_paths(
+        &upstream_url,
+        &["/v1/messages/count_tokens"],
+    ));
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
     let client = local_client();
     let resp = client
-        .post(format!("{proxy_url}/v1/messages/count_tokens?beta=true"))
+        .post(format!("{proxy_url}/v1/messages/count_tokens"))
         .json(&serde_json::json!({"model": "test"}))
         .send()
         .await
@@ -239,7 +251,10 @@ async fn bounded_retry_path_recovers_within_cap() {
     );
 
     let (upstream_url, _h1) = bind_random_router(upstream).await;
-    let proxy_state = AppState::new(proxy_config_for(&upstream_url));
+    let proxy_state = AppState::new(proxy_config_with_bounded_paths(
+        &upstream_url,
+        &["/v1/messages/count_tokens"],
+    ));
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
     let client = local_client();
@@ -275,7 +290,10 @@ async fn bounded_retry_path_keepalive_channel_ends_with_error_event() {
 
     let (upstream_url, _h1) = bind_random_router(upstream).await;
     // 默认配置 keepalive_interval_secs = 15 > 0，保活通道可用
-    let proxy_state = AppState::new(proxy_config_for(&upstream_url));
+    let proxy_state = AppState::new(proxy_config_with_bounded_paths(
+        &upstream_url,
+        &["/v1/messages/count_tokens"],
+    ));
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
     let client = local_client();
@@ -313,8 +331,9 @@ async fn unbounded_path_keeps_retrying_past_bounded_cap() {
     let counter = Arc::new(AtomicUsize::new(0));
     let c2 = counter.clone();
 
-    // 非受限路径上的同样 404：必须继续无限重试（封顶只作用于受限路径，
-    // 这条对照保证封顶没有被错误地全局化——否则违背「无限重试」使命）
+    // 配置了受限重试路径、但本请求路径不命中模式：必须继续无限重试。
+    // 这条对照保证封顶只作用于命中配置模式的请求，没有被错误地全局化
+    // （否则违背「无限重试」使命）
     let upstream = Router::new().route(
         "/v1/messages",
         any(move |_req: axum::extract::Request| {
@@ -327,7 +346,7 @@ async fn unbounded_path_keeps_retrying_past_bounded_cap() {
     );
 
     let (upstream_url, _h1) = bind_random_router(upstream).await;
-    let mut cfg = proxy_config_for(&upstream_url);
+    let mut cfg = proxy_config_with_bounded_paths(&upstream_url, &["/v1/messages/count_tokens"]);
     cfg.max_retry_backoff_secs = 0; // 零退避，让重试轮次快速推进
     let proxy_state = AppState::new(cfg);
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
@@ -365,7 +384,10 @@ async fn bounded_retry_path_network_errors_not_capped() {
     let dead_addr = dead_listener.local_addr().unwrap();
     drop(dead_listener); // 拿到端口后立即释放，制造确定性的连接拒绝
 
-    let mut cfg = proxy_config_for(&format!("http://{dead_addr}"));
+    let mut cfg = proxy_config_with_bounded_paths(
+        &format!("http://{dead_addr}"),
+        &["/v1/messages/count_tokens"],
+    );
     cfg.max_retry_backoff_secs = 0;
     let proxy_state = AppState::new(cfg);
     let stats = proxy_state.stats.clone();
@@ -391,6 +413,88 @@ async fn bounded_retry_path_network_errors_not_capped() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     task.abort();
+}
+
+#[tokio::test]
+async fn bounded_retry_exact_match_requires_query_in_pattern() {
+    // 匹配语义：查询串不省略——不带通配的精准模式不命中带查询串的请求，
+    // 该请求照旧无限重试（要命中带查询串的变体须用通配模式，见下一条）
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c2 = counter.clone();
+
+    let upstream = Router::new().route(
+        "/v1/messages/count_tokens",
+        any(move |_req: axum::extract::Request| {
+            let c = c2.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::NOT_FOUND, "not found").into_response()
+            }
+        }),
+    );
+
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let mut cfg = proxy_config_with_bounded_paths(&upstream_url, &["/v1/messages/count_tokens"]);
+    cfg.max_retry_backoff_secs = 0;
+    let proxy_state = AppState::new(cfg);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = local_client();
+    let task = tokio::spawn(async move {
+        client
+            .post(format!("{proxy_url}/v1/messages/count_tokens?beta=true"))
+            .json(&serde_json::json!({"model": "test"}))
+            .send()
+            .await
+    });
+
+    // 轮询等待上游调用数越过封顶（> 3 次）：带查询串的请求未命中精准模式
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while counter.load(Ordering::SeqCst) <= 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "精准模式不应命中带查询串的请求（实际已重试 {} 次）",
+            counter.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn bounded_retry_wildcard_pattern_matches_query() {
+    // 通配模式命中带查询串的请求：`\?.*` 覆盖任意查询串，达上限即透传
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c2 = counter.clone();
+
+    let upstream = Router::new().route(
+        "/v1/messages/count_tokens",
+        any(move |_req: axum::extract::Request| {
+            let c = c2.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::NOT_FOUND, "not found").into_response()
+            }
+        }),
+    );
+
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let proxy_state = AppState::new(proxy_config_with_bounded_paths(
+        &upstream_url,
+        &["/v1/messages/count_tokens\\?.*"],
+    ));
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
+
+    let client = local_client();
+    let resp = client
+        .post(format!("{proxy_url}/v1/messages/count_tokens?beta=true"))
+        .json(&serde_json::json!({"model": "test"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(counter.load(Ordering::SeqCst), 3);
 }
 
 // ---------------------------------------------------------------------------

@@ -33,6 +33,7 @@ listen_addr = "127.0.0.1:12345"
 # max_body_mb = 128
 # disk_cache = true
 # forward_only = false
+# bounded_retry_paths = [ '/v1/messages/count_tokens' ]
 ```
 
 ## 字段总表
@@ -55,9 +56,11 @@ listen_addr = "127.0.0.1:12345"
 | `max_body_mb` | u64? | settings 层 | 请求体上限 MB，超出 413；0=不设限 |
 | `disk_cache` | bool? | settings 层 | 磁盘缓存开关 |
 | `forward_only` | bool? | settings 层 | 仅转发模式：放弃重试/缓冲/心跳，请求体与响应流式直通 |
+| `bounded_retry_paths` | string[]? | settings 层（空） | 受限重试路径（正则）：命中者失败 3 次即透传，不再无限重试 |
 
-**优先级**（`max_body_mb`/`disk_cache`/`forward_only` 三个 Option 字段独有）：
-toml 显式值 > settings.json 全局默认 > 内置默认（128 / true / false）。
+**优先级**（`max_body_mb`/`disk_cache`/`forward_only`/`bounded_retry_paths`
+四个 Option 字段独有）：
+toml 显式值 > settings.json 全局默认 > 内置默认（128 / true / false / 空）。
 其余字段无 settings 层：toml 显式值 > 内置默认。
 
 ## 各字段语义
@@ -172,6 +175,46 @@ override_headers = { "user-agent" = "my-agent/1.0" }
   **无对应 CLI 旗标**，只能写 toml 或 settings.json；改后
   `aproxy restart <端口或别名>` 生效。
 
+### bounded_retry_paths
+
+**受限重试路径**（正则数组，默认空 = 功能关闭）。命中的请求在上游「有响应的
+失败」达到 3 次尝试后不再重试，把最后一次上游响应**原样透传**给客户端。
+
+动机：部分上游对特定端点确定性报错（例如某些 API 聚合/镜像服务未实现客户端
+依赖的辅助端点），无限重试只会让客户端永远等不到终态；错误秒回时客户端反而
+能自行处理。哪些端点属于这一类**完全因上游而异**——因此哪些路径受限由你按
+自己的上游配置，aProxy 不内置任何具体 URL。
+
+匹配语义（每个模式对「`路径?查询串` 整体」做正则匹配，编译时自动锚定两端）：
+
+- 不含元字符的普通路径即**精准匹配**：`"/v1/messages/count_tokens"` 只命中
+  不带查询串的该路径，带任何查询串的请求都不命中
+- **查询串必须显式出现在模式里**：`?` 是正则元字符，字面量写 `\?`（toml 强烈
+  建议用单引号字符串免转义）；带查询串的精准匹配写
+  `'/v1/messages/count_tokens\?beta=true'`
+- 通配用正则语法：`'/v1/messages/count_tokens\?.*'` 命中该路径带任意查询串；
+  `"/v1/messages/.*"` 命中 `/v1/messages/` 下全部路径
+- 非法正则在启动校验时即报错拒绝，不会静默失效
+
+```toml
+# 示例：把记数端点设为「失败 3 次即透传」。单引号字符串内 \ 不需要双写
+bounded_retry_paths = [
+  '/v1/messages/count_tokens',
+  '/v1/messages/count_tokens\?.*',
+]
+```
+
+行为细节：网络错误不受此封顶（仍无限重试）；保活通道（SSE 骨架已发出的请求）
+达上限以 `event: error` 事件收场。未在 toml 显式配置时取 settings.json 的
+`bounded_retry_paths`（全局默认空）。改后 `aproxy restart <端口或别名>` 生效。
+
+> 典型场景：Claude Code 走非官方 API（聚合/镜像上游）时 /compact 无限卡住、
+> 最终超时报错，多半是上游未实现 compact 依赖的
+> `POST /v1/messages/count_tokens`（确定性 404），该请求被无限重试、永远
+> 等不到终态。把该路径加入 `bounded_retry_paths`（如上例）即可解决——失败
+> 3 次即透传真实响应，compact 立即恢复。其他 agent 软件/其他端点的同类问题
+> 同理，按实际路径配置。
+
 ## 校验规则
 
 启动时校验失败即拒绝启动（错误信息含文件位置与修复指引）：
@@ -179,6 +222,8 @@ override_headers = { "user-agent" = "my-agent/1.0" }
 1. `base_url` 非空、http/https 开头、无 `?`/`#`
 2. `proxy` 若设置：URL 可解析、协议受支持、有主机
 3. 配置了 `proxy_username`/`proxy_password` 则必须同时配置 `proxy`
+4. `bounded_retry_paths` 每项必须是能编译的正则（非法模式启动即报错，
+   错误含模式原文）
 
 ## 归一化行为
 

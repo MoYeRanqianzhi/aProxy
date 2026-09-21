@@ -98,6 +98,22 @@ pub struct Config {
     /// None = toml 未显式配置（由 main 启动时注入 settings 值）。
     #[serde(default)]
     pub forward_only: Option<bool>,
+    /// 受限重试路径（正则数组）：命中任一模式的请求，上游「有响应的失败」达到
+    /// `retry::BOUNDED_RETRY_MAX_ATTEMPTS` 次尝试后不再重试，把最后一次上游
+    /// 响应原样透传给客户端。**空 = 功能关闭**（一切路径照旧无限重试）。
+    ///
+    /// 动机：部分上游对特定端点确定性报错，无限重试只会让客户端永远等不到
+    /// 终态。哪些端点属于这一类完全因上游而异——同一软件换个上游结论就翻转，
+    /// 因此哪些路径受限**交由用户按自己的上游配置**，不内置任何具体 URL。
+    ///
+    /// 匹配语义：每个模式是对「`路径?查询串` 整体」的正则，编译时自动锚定
+    /// 两端（`^(?:模式)$`）——不含元字符的普通路径即精准匹配；查询串必须
+    /// 显式出现在模式里（`?` 是正则元字符，字面量写 `\?`；toml 建议用单引号
+    /// 字符串免转义）；通配用 `.*` 等。非法正则在 validate() 即报错，不会
+    /// 静默失效。未设置时用 settings.json 的 `bounded_retry_paths`（全局
+    /// 默认，内置空）。
+    #[serde(default)]
+    pub bounded_retry_paths: Option<Vec<String>>,
     /// spool 临时文件目录覆盖（serde skip，不落盘）。仅测试注入用：集成测试
     /// 进程内构建 AppState 时若无此覆盖，会按端口写入真实 ~/.aproxy/spool/。
     /// 生产路径为 None，实际目录 = ~/.aproxy/spool/<端口>/。
@@ -159,6 +175,7 @@ impl Default for Config {
             max_body_mb: None,
             disk_cache: None,
             forward_only: None,
+            bounded_retry_paths: None,
             spool_dir_override: None,
         }
     }
@@ -244,6 +261,13 @@ impl Config {
             // 仅当显式配置代理 URL 时用户名/密码才有意义，否则是配置遗漏
             return Err("配置了 proxy_username/proxy_password 但未配置 proxy URL".to_string());
         }
+        // 受限重试路径：正则合法性在此把关（编译入口与运行期同一，保证
+        // 「校验通过 = 运行期编译必成功」），非法模式启动即报明确错误而非
+        // 静默不匹配
+        for p in self.bounded_retry_paths() {
+            Self::compile_bounded_retry_pattern(p)
+                .map_err(|e| format!("bounded_retry_paths 含非法正则 {p:?}: {e}"))?;
+        }
         Ok(())
     }
 
@@ -297,6 +321,21 @@ impl Config {
     /// settings 注入，`None` 在这些路径上是常态。
     pub fn forward_only_enabled(&self) -> bool {
         self.forward_only.unwrap_or(DEFAULT_FORWARD_ONLY)
+    }
+
+    /// 受限重试路径模式列表（同 body_limit_bytes 的注入/回退语义：toml 显式
+    /// 值 > settings 注入值 > 内置空 = 功能关闭）。
+    /// 消费点必须走本方法而非 `Option::unwrap()`——不经 settings 注入的构建
+    /// 路径（doctor/find/测试）上 `None` 是常态。
+    pub fn bounded_retry_paths(&self) -> &[String] {
+        self.bounded_retry_paths.as_deref().unwrap_or(&[])
+    }
+
+    /// 编译一个受限重试路径模式：对「`路径?查询串` 整体」匹配，自动锚定两端
+    /// ——不含元字符的普通路径即精准匹配，通配需显式写 `.*`。validate() 与
+    /// AppState::new 共用此入口，两处语义不可能分叉。
+    pub fn compile_bounded_retry_pattern(pattern: &str) -> Result<regex::Regex, regex::Error> {
+        regex::Regex::new(&format!("^(?:{pattern})$"))
     }
 }
 
@@ -609,6 +648,76 @@ mod tests {
             !legacy.forward_only_enabled(),
             "None 回退内置关闭（默认不得启用仅转发模式）"
         );
+    }
+
+    #[test]
+    fn bounded_retry_paths_matching_semantics() {
+        // 匹配语义钉死：模式对「路径?查询串」整体生效且自动锚定——
+        // 普通路径即精准匹配（不含查询串时不命中带查询串的请求），
+        // 通配必须显式写正则。
+        let m = |pattern: &str, target: &str| {
+            Config::compile_bounded_retry_pattern(pattern)
+                .unwrap()
+                .is_match(target)
+        };
+        // 精准匹配：路径本身命中，路径不带查询串的模式不命中带查询串的请求
+        assert!(m("/v1/messages/count_tokens", "/v1/messages/count_tokens"));
+        assert!(!m(
+            "/v1/messages/count_tokens",
+            "/v1/messages/count_tokens?beta=true"
+        ));
+        assert!(!m(
+            "/v1/messages/count_tokens",
+            "/v1/messages/count_tokens_extra"
+        ));
+        assert!(!m("/v1/messages/count_tokens", "/v1/messages"));
+        // 查询串必须显式出现在模式中（`?` 是正则元字符，字面量需转义 `\?`）
+        assert!(m(
+            "/v1/messages/count_tokens\\?.*",
+            "/v1/messages/count_tokens?beta=true"
+        ));
+        assert!(!m(
+            "/v1/messages/count_tokens\\?.*",
+            "/v1/messages/count_tokens"
+        ));
+        // 通配：`.*` 覆盖任意后缀；前缀式模式可同时命中带/不带查询串的请求
+        assert!(m(
+            "/v1/messages/count_tokens.*",
+            "/v1/messages/count_tokens"
+        ));
+        assert!(m(
+            "/v1/messages/count_tokens.*",
+            "/v1/messages/count_tokens?beta=true"
+        ));
+        assert!(!m("/v1/messages/count_tokens.*", "/v1/messages"));
+        // 自动锚定：模式不会作为子串命中其他路径
+        assert!(!m("/messages", "/v1/messages/count_tokens"));
+    }
+
+    #[test]
+    fn bounded_retry_paths_accessor_and_validate() {
+        // 访问器注入/回退语义与 validate 的非法正则拒绝
+        let mut cfg = Config {
+            base_url: "https://api.example.com".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            cfg.bounded_retry_paths().is_empty(),
+            "None 回退空 = 功能关闭"
+        );
+
+        cfg.bounded_retry_paths = Some(vec!["/v1/messages/count_tokens".to_string()]);
+        assert_eq!(cfg.bounded_retry_paths().len(), 1);
+        cfg.validate().expect("合法正则应通过校验");
+
+        let bad = Config {
+            base_url: "https://api.example.com".to_string(),
+            bounded_retry_paths: Some(vec!["[unclosed".to_string()]),
+            ..Default::default()
+        };
+        let err = bad.validate().unwrap_err();
+        assert!(err.contains("bounded_retry_paths"), "错误应指明字段: {err}");
+        assert!(err.contains("[unclosed"), "错误应包含非法模式原文: {err}");
     }
 
     #[test]

@@ -111,6 +111,9 @@ pub struct AppState {
     /// 磁盘缓存的 spool 临时目录；None = disk_cache 关闭（全程纯内存）。
     /// 生产路径 `~/.aproxy/spool/<端口>/`，测试可经 Config::spool_dir_override 注入。
     pub spool_dir: Option<PathBuf>,
+    /// 受限重试路径的预编译正则（源 `config.bounded_retry_paths`，空 = 功能
+    /// 关闭）。启动时编译一次随 AppState 共享，请求热路径只做 is_match。
+    pub bounded_retry_patterns: Arc<Vec<regex::Regex>>,
 }
 
 impl AppState {
@@ -167,6 +170,18 @@ impl AppState {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
         ));
+        // 受限重试路径模式：启动时编译一次（模式已在 validate() 校验过合法性，
+        // 此处 expect 不会失败——与上方 proxy URL 的信任同一来源）
+        let bounded_retry_patterns = Arc::new(
+            config
+                .bounded_retry_paths()
+                .iter()
+                .map(|p| {
+                    Config::compile_bounded_retry_pattern(p)
+                        .expect("受限重试路径模式已在 validate() 校验")
+                })
+                .collect(),
+        );
         Self {
             spool_dir,
             config: Arc::new(config),
@@ -176,7 +191,17 @@ impl AppState {
                 ..Default::default()
             }),
             last_activity_secs,
+            bounded_retry_patterns,
         }
+    }
+
+    /// 请求是否命中受限重试路径：`路径?查询串` 整体匹配任一配置模式
+    /// （模式在 Config::compile_bounded_retry_pattern 自动锚定，普通路径
+    /// 即精准匹配）。
+    pub fn bounded_retry_matches(&self, path_and_query: &str) -> bool {
+        self.bounded_retry_patterns
+            .iter()
+            .any(|re| re.is_match(path_and_query))
     }
 
     /// 记录一次上游失败摘要（覆盖式，只保留最近一次；IPC/status 展示用）
@@ -830,7 +855,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
 
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let target_url = upstream_url(&state.config, &uri);
-    let bounded_retry = retry::is_bounded_retry_path(path_and_query);
+    let bounded_retry = state.bounded_retry_matches(path_and_query);
 
     tracing::info!(method = %method, path = %path_and_query, target = %target_url, "代理请求");
 

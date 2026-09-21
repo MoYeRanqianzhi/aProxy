@@ -75,6 +75,12 @@ pub struct Settings {
     /// `disk_cache` 不同，是放弃产品核心保障的取舍，不该被全局默认打开。
     #[serde(default = "default_forward_only")]
     pub forward_only: bool,
+    /// 受限重试路径（全局默认值，正则数组，语义见 config.toml 同名字段）：
+    /// 命中的请求上游「有响应的失败」达尝试上限后不再重试、透传最后一次
+    /// 响应。默认空 = 关闭。各 config.toml 可用 `bounded_retry_paths` 按
+    /// 实例覆盖（toml > settings > 内置空）。
+    #[serde(default)]
+    pub bounded_retry_paths: Vec<String>,
     /// 看门狗总开关：开启时 `aproxy start`/守护自检会确保存在一个全局看护进程
     /// （`aproxy watchdog`），守护崩溃/挂死时按 .restore 记录自动重拉。
     /// 看门狗是系统级单例（一个看护进程看护全部实例），故只在 settings 配置，
@@ -179,6 +185,7 @@ impl Default for Settings {
             max_body_mb: default_max_body_mb(),
             disk_cache: default_disk_cache(),
             forward_only: default_forward_only(),
+            bounded_retry_paths: Vec::new(),
             watchdog: default_watchdog(),
             watchdog_heartbeat_secs: default_watchdog_heartbeat_secs(),
             watchdog_stale_after_cycles: default_watchdog_stale_after_cycles(),

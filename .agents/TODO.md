@@ -135,7 +135,10 @@
   通过；功能/并发/内存/perf/valgrind/体积全套数据入报告。
   分支 fix/unix-first-test（.worktree/unix-fixes），待合并。
 - [ ] **产品语义决策**（实测发现）：unix 上 APROXY_RUN_DIR 影响 IPC 寻址
-  （UDS 路径在 run_dir 内，Windows 管道全局名不受影响）——是否对齐待定
+  （UDS 路径在 run_dir 内，Windows 管道全局名不受影响）——是否对齐待定。
+  2026-09-22 router 实测补充：logs/status 的注册表读取与 IPC ping 在
+  RUN_DIR 重定向下行为一致（`logs <别名>` 正常连接），当前语义对使用者
+  无坑；对齐与否降为低优先级设计口味问题
 - [ ] **优化候选**：upstream client（reqwest/hyper）开启 TCP_NODELAY——实测与
   无 NODELAY 上游配合时有 40ms Nagle×delayed-ACK 咬合
 - [ ] **测试基建**：看门狗测试子进程清理 RAII 化（panic 路径手写 kill 会跳过）；

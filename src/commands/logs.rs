@@ -1,23 +1,53 @@
-//! `aproxy logs [PORT]`：实时跟踪运行实例的守护日志。
+//! `aproxy logs [PORT|别名]`：实时跟踪运行实例的守护日志。
 
 use aproxy::daemon;
 
-/// `aproxy logs [PORT]`：连接到运行中的实例并实时输出其守护日志。
-/// 语义与 stop 一致：单实例可省略端口；多实例必须指定；不支持 all
-/// （一次只能连接一个实例，传入 all 视为端口解析失败）。
+use crate::commands::{config_path_key, resolve_config_target};
+
+/// `aproxy logs [PORT|别名]`：连接到运行中的实例并实时输出其守护日志。
+/// 语义与 stop 一致：单实例可省略 target；多实例必须指定；别名按配置文件
+/// 匹配运行实例（端口变了别名依然有效）；不支持 all（一次只能连接一个实例，
+/// 传入 all 视为端口解析失败）。
 pub(crate) async fn handle_logs_cmd(target: Option<String>) {
     if target.as_deref() == Some("all") {
-        eprintln!("aproxy logs 不支持 all：一次只能连接一个实例，请指定端口号。");
+        eprintln!("aproxy logs 不支持 all：一次只能连接一个实例，请指定端口号或配置别名。");
         std::process::exit(1);
     }
-    // 指定端口时不依赖注册表：直接按端口 IPC 定位（与 stop 相同）
     let info = if let Some(target) = target.as_deref() {
-        let port = daemon::port_of(target).to_string();
-        match daemon::ipc_ping(&port).await {
-            Ok(info) => info,
-            Err(_) => {
-                println!("端口 {port} 上没有运行中的 aProxy 实例。");
-                std::process::exit(1);
+        // 别名定位：非数字 target 先查别名表/default——按 config_path 匹配
+        // 运行实例（与 stop 同语义：别名不依赖端口号，端口变了别名依然有效）
+        if target.parse::<u16>().is_err() {
+            match resolve_config_target(target) {
+                Some(cfg_path) => {
+                    let key = config_path_key(&cfg_path.display().to_string());
+                    let instances = daemon::list_instances().await;
+                    match instances
+                        .iter()
+                        .find(|i| config_path_key(&i.config_path) == key)
+                    {
+                        Some(info) => info.clone(),
+                        None => {
+                            println!("别名 {target}（配置 {}）当前未在运行。", cfg_path.display());
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "未知的别名或端口号: {target}\n用 aproxy alias list 查看已有别名，或 aproxy alias add {target} <路径> 添加"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            // 指定端口时不依赖注册表：直接按端口 IPC 定位（与 stop 相同）
+            let port = daemon::port_of(target).to_string();
+            match daemon::ipc_ping(&port).await {
+                Ok(info) => info,
+                Err(_) => {
+                    println!("端口 {port} 上没有运行中的 aProxy 实例。");
+                    std::process::exit(1);
+                }
             }
         }
     } else {
@@ -29,7 +59,7 @@ pub(crate) async fn handle_logs_cmd(target: Option<String>) {
             }
             1 => instances.into_iter().next().unwrap(),
             n => {
-                eprintln!("有 {n} 个实例在运行，必须指定端口号（一次只能连接一个）：");
+                eprintln!("有 {n} 个实例在运行，必须指定端口号或配置别名（一次只能连接一个）：");
                 for info in &instances {
                     eprintln!("  aproxy logs {}", daemon::port_of(&info.listen_addr));
                 }

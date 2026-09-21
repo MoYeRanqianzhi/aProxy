@@ -3546,6 +3546,191 @@ fn alias_errors_on_unknown_names() {
 }
 
 // ---------------------------------------------------------------------------
+// 30a. `aproxy logs <别名>`：别名按配置文件定位运行实例（与 stop 同语义，
+// 端口变了别名依然有效）；未知别名明确报错；实例未运行报「未在运行」
+// ---------------------------------------------------------------------------
+#[test]
+fn logs_via_alias_connects_and_follows() {
+    // 偏移 13：0..=12 已被既有测试全部占用；尤其不可与看门狗测试同偏移——
+    // daemon_test_port 的「探测-绑定」之间有窗口，同候选集的两个测试并行时
+    // 会拿到同一端口，输家的 DaemonGuard 按端口 stop 会顺带停掉赢家的实例
+    // （实测：两测试同 offset 9 并行双双失败，「守护未就绪」+「当前未在运行」）
+    let port = daemon_test_port(13);
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+    let alias = format!("alias-logs-{}", std::process::id());
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // 关掉看护者：`start` 会顺带拉起全局看护进程，它带着构建产物的镜像存活到
+    // 空闲自灭——测试早已结束却继续锁着二进制，让随后的 cargo 重新链接失败
+    // （见 alias_start_and_stop_roundtrip 同款注释）
+    std::fs::write(home.join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+    let cfg_file = home.join("logs-aliased.toml");
+    std::fs::write(
+        &cfg_file,
+        format!(
+            "base_url = \"https://logs-alias-test.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"
+        ),
+    )
+    .unwrap();
+    let _guard = DaemonGuard {
+        exe,
+        port,
+        home_dir: Some(home.to_path_buf()),
+    };
+
+    // 未知别名：明确报错（不依赖任何运行实例即应失败）
+    let out = Command::new(exe)
+        .args(["logs", &format!("no-such-logs-{}", std::process::id())])
+        .env("APROXY_HOME", home)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "logs 未知别名应失败");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("未知的别名或端口号"), "实际: {text}");
+
+    // add 别名 → start <别名> → IPC 就绪
+    let out = Command::new(exe)
+        .args(["alias", "add", &alias])
+        .arg(&cfg_file)
+        .env("APROXY_HOME", home)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "alias add 应成功: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(exe)
+        .args(["start", &alias])
+        .env("APROXY_HOME", home)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "start 别名应成功: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // 就绪：隔离 home 的 IPC 寻址（unix UDS 在 home/run/ 下）
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut ready = false;
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+            && ipc_ping_in_dir(&rt, port, home).is_ok()
+        {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ready, "别名启动的守护应就绪 (端口 {port})");
+
+    // logs <别名>：经配置文件匹配到运行实例，首屏输出连接信息与启动日志
+    let mut child = Command::new(exe)
+        .args(["logs", &alias])
+        .env("APROXY_HOME", home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn aproxy logs 失败");
+    let collected = Arc::new(Mutex::new(String::new()));
+    let reader = {
+        let collected = collected.clone();
+        let mut pipe = child.stdout.take().expect("logs stdout 管道");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => collected
+                        .lock()
+                        .unwrap()
+                        .push_str(&String::from_utf8_lossy(&buf[..n])),
+                }
+            }
+        })
+    };
+    let mut saw_startup = false;
+    for _ in 0..100 {
+        let hit = {
+            let c = collected.lock().unwrap();
+            c.contains("正在连接 pid") && c.contains("启动 aProxy")
+        };
+        if hit {
+            saw_startup = true;
+            break;
+        }
+        if child.try_wait().ok().flatten().is_some() {
+            break; // logs 进程提前退出：断言时以已收集内容为准
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        saw_startup,
+        "logs 别名应连接实例并输出启动日志，实际: {}",
+        collected.lock().unwrap()
+    );
+
+    // stop <别名> → logs 感知实例死亡后自动退出（IPC 探活），不挂死
+    let out = Command::new(exe)
+        .args(["stop", &alias])
+        .env("APROXY_HOME", home)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stop 别名应成功: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut exited = false;
+    for _ in 0..150 {
+        if child.try_wait().ok().flatten().is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !exited {
+        // 兜底清理（断言仍会失败，但不能泄漏挂死的 logs 进程）
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(exited, "实例停止后 aproxy logs 应自动退出");
+    let _ = reader.join();
+    let out = collected.lock().unwrap();
+    assert!(
+        out.contains("实例已停止，日志跟踪结束"),
+        "logs 退出前应说明原因，实际: {out}"
+    );
+
+    // 已停止后再 logs 别名：按配置匹配不到运行实例，报「未在运行」
+    let out = Command::new(exe)
+        .args(["logs", &alias])
+        .env("APROXY_HOME", home)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "别名配置未运行时 logs 应失败");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("当前未在运行"), "实际: {text}");
+
+    // 清理别名（隔离 home 内本就随 tempdir 删除，此处对齐既有别名测试的收尾）
+    let _ = Command::new(exe)
+        .args(["alias", "remove", &alias])
+        .env("APROXY_HOME", home)
+        .output();
+}
+
+// ---------------------------------------------------------------------------
 // 17. 看门狗（G2）：全局单看护进程的重拉/放行/补种端到端
 //
 // 隔离：APROXY_HOME 指向 tempdir（守护/看护子进程经 spawn_detached 继承

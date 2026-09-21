@@ -75,7 +75,7 @@ aproxy
 | `aproxy status` | 列出运行中的实例（端口/pid/版本/上游/配置） |
 | `aproxy stop [PORT\|all\|别名]` | 停止实例；多实例必须指定端口、`all` 或别名 |
 | `aproxy restart [PORT\|all\|别名]` | 重启运行中的实例（只重启不启动；改配置生效用）；`--force` 立即强杀重启 |
-| `aproxy logs [PORT]` | 连接实例实时输出日志；不支持 `all` |
+| `aproxy logs [PORT\|别名]` | 连接实例实时输出日志；不支持 `all` |
 | `aproxy restore` | 恢复崩溃/重启前在运行的实例；无实例则静默结束（开机自启友好） |
 | `aproxy alias add\|remove\|list` | 管理配置别名（存于 settings.json） |
 | `aproxy doctor` | 配置体检：settings.json error 级检查 + 别名配置与目录 toml 审查（warning） |

@@ -109,11 +109,11 @@ pub(crate) enum Commands {
     },
 
     /// 连接到运行中的实例并实时输出其守护日志（Ctrl+C 退出）。
-    /// 单个实例时可直接 `aproxy logs`；多实例必须指定端口号。
+    /// 单个实例时可直接 `aproxy logs`；多实例必须指定端口号或配置别名。
     /// 不支持 all：一次只能连接一个实例。
     Logs {
-        /// 端口号
-        #[arg(value_name = "PORT")]
+        /// 端口号或配置别名
+        #[arg(value_name = "PORT|ALIAS")]
         target: Option<String>,
     },
 

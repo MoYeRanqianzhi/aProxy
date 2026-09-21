@@ -107,7 +107,7 @@ pub(crate) async fn resolve_stop_targets(
             }
             1 => vec![instances[0].clone()],
             n => {
-                eprintln!("有 {n} 个实例在运行，必须指定端口号或 all：");
+                eprintln!("有 {n} 个实例在运行，必须指定端口号、别名或 all：");
                 for info in &instances {
                     eprintln!("  aproxy stop {}", daemon::port_of(&info.listen_addr));
                 }

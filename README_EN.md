@@ -98,7 +98,7 @@ aproxy
 | `aproxy status` | List running instances (port/pid/version/upstream/config) |
 | `aproxy stop [PORT\|all\|alias]` | Stop instances; multi-instance requires a port, `all`, or an alias |
 | `aproxy restart [PORT\|all\|alias]` | Restart running instances (restart-only, never starts); `--force` kills instantly |
-| `aproxy logs [PORT]` | Tail an instance's live logs; `all` not supported |
+| `aproxy logs [PORT\|ALIAS]` | Tail an instance's live logs; `all` not supported |
 | `aproxy restore` | Revive instances that were running before a crash/reboot; exits silently if none |
 | `aproxy alias add\|remove\|list` | Manage config aliases (stored in settings.json) |
 | `aproxy doctor` | Config health check: settings.json errors + alias/toml review (warnings) |

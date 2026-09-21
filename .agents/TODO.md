@@ -140,15 +140,16 @@
   无 NODELAY 上游配合时有 40ms Nagle×delayed-ACK 咬合
 - [ ] **测试基建**：看门狗测试子进程清理 RAII 化（panic 路径手写 kill 会跳过）；
   daemon.rs 的 UDS IPC roundtrip 单测（现为 Windows-only）
-- [ ] **测试守护泄漏治理**（2026-09-14 现场实测）：机器上累积过 46 个 aproxy 进程，
-  绝大多数是历史测试遗留的守护（最老 70 小时），其中 `start alias-test-<端口>
-  --daemon-watchdog` 这个**看护进程**锁住 `target/debug/aproxy.exe`，导致后续
-  `cargo test` 无法重新链接（`failed to remove file … 拒绝访问`），并让
-  `restart_integration` 并行跑失败 215 秒（**单跑 4.5 秒通过**，与既有
-  `alias_start_and_stop_roundtrip` 同族的端口/时序竞争）。清理须遵铁则：
-  **绝不按名批量杀**，只走测试守护的 `APROXY_HOME` + `stop <端口>`（看护进程
-  无端口，等其 `watchdog_idle_exit_secs` 空闲自灭）。根因是测试收尾未覆盖
-  panic/超时路径，与上一条 RAII 化同源
+- [ ] **测试守护泄漏治理**（2026-09-14 现场实测；2026-09-21 再度实证并扩大影响面）：
+  机器上累积过 46 个 aproxy 进程（2026-09-14），2026-09-21 又累积 60+
+  （32 守护 + 32 看护者，tempdir 已删但进程存活）。危害升级实证：**残留
+  看护者/守护会干扰并行全量测试**——两轮稳定复现 `logs_via_alias_…` 与
+  `watchdog_respawns_killed_daemon` 双双失败（前者「当前未在运行」、后者
+  「守护未就绪」），清理残留后同款并行组合 9.9s 全过。清理须遵铁则：
+  **绝不按名批量杀**，只走产品优雅路径：`Get-NetTCPConnection` 按
+  Temp 路径 pid 反查监听端口 → 逐端口 `aproxy stop <端口>`（IPC shutdown
+  删 .restore，看护者不 respawn）→ 看护者等 `watchdog_idle_exit_secs`
+  空闲自灭。根因是测试收尾未覆盖 panic/超时路径，与上一条 RAII 化同源
 
 ## 待修（2026-09-10 压力实测审查轮）——已全部修复（a389d40/01978b4/f13bc0a/9cc53c8，详录 .agents/docs/unix-stress-review.md 修复记录节）
 

@@ -16,17 +16,24 @@ aproxy status               # 每行 v<semver> = 各实例实际运行的守护�
 
 | 项 | 值 |
 |---|---|
-| 文档适用版本 | **0.1.0-alpha.13**（含 alpha.4→alpha.13 引入的全部行为；另含开发线未发布行为，见下节） |
+| 文档适用版本 | **0.1.0-alpha.14**（含 alpha.4→alpha.14 引入的全部行为） |
 | 代码版本坐标 | Cargo.toml `version` 字段；alpha 线于 2026-09 发布 |
 | 大版本线 | 0.1.x（0.1 系列内小版本不另开目录，直接更新 latest/ 文档） |
 
-## alpha.13 之后的开发线（未发布）
+## alpha.14 关键行为（相对 alpha.13）
 
-- **受限重试路径 `bounded_retry_paths`（新配置字段）已在开发线落地，未随
-  alpha.13 或任何已发布版本出厂**。alpha.13 及更早的二进制读到该字段会按
-  「未知字段忽略」**静默跳过**——写进 config.toml/settings.json 不报错、
-  也无任何效果（如 compact 卡死等问题照旧）。要使用该功能，请升级到发布
-  它的版本。
+- **受限重试路径 `bounded_retry_paths`（新配置字段，默认空 = 功能关闭）**：
+  config.toml 每实例 + settings.json 全局默认（toml 显式值 > settings > 空）。
+  命中任一正则模式（对「`路径?查询串`」整体匹配、自动锚定，普通路径即精准
+  匹配；查询串须显式 `\?` 写进模式，通配 `.*`）的请求，上游「有响应的失败」
+  达 3 次尝试后不再重试，把最后一次上游响应**原样透传**——确定性报错的上游
+  端点不再让客户端无限等。网络错误与未命中请求照旧无限重试。典型场景：
+  Claude Code 走非官方 API 时 compact 因上游不支持 `count_tokens` 被无限
+  重试卡死，把该路径加入本配置即可解决。写法见 config-toml.md，语义见
+  behaviors.md。**旧版二进制读到该字段静默忽略**（行为不变，升级安全）。
+- **新增依赖**：`regex`（纯 Rust，musl/aarch64 交叉编译与 CI 不受影响）。
+- settings.json 层的非法正则纳入 `aproxy doctor` 预检；start 因该字段失败时
+  错误消息点名来源（toml 或 settings.json）。
 
 ## alpha.13 关键行为（相对 alpha.12）
 

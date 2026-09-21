@@ -1,6 +1,6 @@
 [package]
 name = "aproxy"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 # edition 2024 本身要 1.85，实际下限由依赖树抬高到 1.88：src/decode.rs 引入的
 # ruzstd 要 1.87，url→idna→idna_adapter 拖进来的 icu_* 一族要 1.88（这些 crate
 # 在依赖图里是实打实被编译的，非可选）。声明出来，旧工具链会得到一条明确的

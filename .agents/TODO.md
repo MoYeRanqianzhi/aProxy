@@ -40,6 +40,14 @@
   ——核心例证有误且拟议 validate 判据会误伤正常模式；其文档建议并入
   语义节。新增 regex 依赖后 install_flow 在整机高负载下偶发 2 例（swapping
   为既有留档 + restarting 同族新面孔，单跑 7/7 全过），重跑全量 254 项全绿。
+- [x] **正式发布 v0.1.0-alpha.14**（2026-09-21，用户下令）：annotated tag
+  打于 33ece38，Release workflow 一次全绿（test 门禁本次未撞偶发）。
+  三渠道验证：GitHub 26 资产（11 变体 + sha256 + skill 包）、npm
+  latest=0.1.0-alpha.14（**registry 传播延迟数分钟**——发布后立即查询得
+  404/latest 未动，日志证实 `+ @meowo/…@0.1.0-alpha.14` 已上传，数分钟后
+  全部可见；教训：npm 渠道验证须等传播或以 publish 日志为准）、crates.io
+  max_version=newest=0.1.0-alpha.14。CI：windows/ubuntu 绿，macOS 红为
+  既有未支持项（见 macOS 节）。
   详见 `.agents/memory/2026-09-20-bounded-retry-paths.md`
 
 ## 仅转发模式 forward_only（2026-09-14）

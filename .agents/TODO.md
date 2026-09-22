@@ -4,6 +4,23 @@
 > 2026-09-08 补录 tag 之后一轮（性能优化 + 磁盘缓存 + 重构 + skill），全部已完成。
 > 2026-09-09 第四轮审查修复 + 实测 restart bug + skill 指引优化，全部已完成。
 
+## 正式发布 v0.1.0-alpha.15（2026-09-22，用户下令）
+
+- [x] **发版闭环（含一次门禁卡死与根因修复）**：tag `v0.1.0-alpha.15` 首打于
+  `1a2adc1`，Release run 35725451213 的 test 门禁连续两次失败（既有
+  continue_from_swapping 竞态）→ 定位真正根因是 **HandedOver 交棒语义未被
+  测试跟上**（非超时竞态，304db6c 修复，见下方测试稳定性条目）→ **删 tag
+  重打**于修复提交（publish 未跑过，crates.io/npm 无该版本记录，安全）→
+  新 run 35727417539 一次全绿（test/skills/11 变体 build/publish）。
+  三渠道验证：GitHub Release v0.1.0-alpha.15（prerelease，26 资产）、npm
+  latest=0.1.0-alpha.15（publish 日志 provenance 实证 + 传播后 dist-tags
+  复核）、crates.io max_version=newest=0.1.0-alpha.15。CI：windows/ubuntu
+  绿，macOS 红为既有留档项。
+- [ ] **rustls 依赖升级收口**（发版后事项）：cargo-deny 报
+  RUSTSEC-2026-0285（rustls 0.23.44，TLS 1.3 握手消息跨加密级别边界），
+  Review workflow 因此历史全红——`cargo update -p rustls` 到已修补版即可，
+  下个版本随发版生效
+
 ## 日志随机命名 + IPC 上报（2026-09-22，用户定调三点）
 
 - [x] **守护日志从「端口命名 + 客户端拼路径」改为「随机命名 + IPC 上报真实路径」**：

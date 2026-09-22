@@ -155,7 +155,8 @@
 ## 多开与实例区分
 
 - 每份 config.toml 一个实例，`listen_addr` 端口必须互不相同——**实例按端口号
-  区分**（注册表、IPC 管道名、日志文件名、spool 目录都含端口）。
+  区分**（注册表、IPC 管道名、spool 目录都含端口；守护日志自随机命名起例外，
+  地址经 IPC 向实例询问）。
 - 同端口不同监听地址的两个实例不能并存（会被拒绝启动）。
 - 别名按配置文件路径匹配运行实例（端口变了依然有效）；端口号定位不依赖注册表
   （注册表丢失也能 stop/logs）。
@@ -168,10 +169,20 @@ IPC 通道故障（启动失败）只影响管理命令，代理转发继续（�
 
 ## 日志
 
-- 守护实例：`~/.aproxy/logs/<端口>.log`（UTF-8 无 BOM；`aproxy logs` 跟随）。
+- 守护实例：`~/.aproxy/logs/` 下按启动时刻**随机命名**（十六进制时间戳-pid
+  格式，如 `19ac3f2e8b5d-1a2b.log`；UTF-8 无 BOM；`aproxy logs` 跟随）。
+  **每次启动（含 restart、restore 恢复）都是新文件**——换端口后日志不断档；
+  文件名不含端口，**地址一律经 IPC 向实例询问**（`aproxy status`/`aproxy
+  logs`/start 成功提示均来自实例上报的 log_path，客户端不拼路径），不要按
+  端口猜文件名。自定义日志文件用 toml `log_file` 或 CLI `--log-file`
+  （优先级 CLI > toml > 随机名；相对路径相对 APROXY_HOME 解析）。
 - 启动失败的根因：`~/.aproxy/logs/startup.log`（配置错误、bind 失败写这里）。
 - 截断策略：启动时 >2 MiB 清空（固定）+ 运行期每小时检查超 `log_rotate_mb`
   （默认 8 MB，0=不轮转）清空。
+- 孤儿清理：`status` 时删除「活实例上报的 log_path ∪ `.restore` 记录的
+  log_path」之外的 `*.log`（startup.log 除外，非 .log 文件不动）。推论：
+  实例优雅停止后其日志在下次清理时删除；崩溃实例的日志由 `.restore` 引用
+  保留到恢复成功；旧版按端口命名的日志在升级后视为孤儿清理。
 - 所有日志对凭据打码（api_key/头值前 6 字符 + `***`，代理密码、base_url 内嵌
   密码隐去）——日志可安全粘贴分享。
 - 「错误响应预览」行附带 `content-type` / `content-encoding`，并按
@@ -258,10 +269,10 @@ install.state 的 `skill` 字段可查。`--skills-only` 单独更新。安装�
 |---|---|
 | 启动报「端口被占用」 | 真被其他程序占用；`netstat -ano \| findstr <端口>` 找进程 |
 | 启动报「无权限或被系统保留」 | Hyper-V/WinNAT 排除区间：`netsh interface ipv4 show excludedportrange protocol=tcp` 换端口 |
-| 启动超时「未就绪」 | 读 `~/.aproxy/logs/startup.log`（配置/绑定错误）与 `<端口>.log` |
+| 启动超时「未就绪」 | 读 `~/.aproxy/logs/startup.log`（配置/绑定错误）；实例日志地址经 `aproxy status` 向实例询问（按启动随机命名，不按端口拼路径） |
 | status 看到实例但 stop 说无响应 | 实例已死注册表未清——按提示 taskkill；下次版本会自清 |
 | `stop` 要求指定端口 | 多实例安全机制：先 `aproxy status` 再指定端口/别名/all |
-| 客户端等很久才收到回复 | 正常——上游在重试，心跳在维持连接；查 `<端口>.log` 看重试原因 |
+| 客户端等很久才收到回复 | 正常——上游在重试，心跳在维持连接；`aproxy logs <端口或别名>` 看重试原因 |
 | 客户端非流式请求超时 | 非流式无心跳通道：调大客户端 HTTP 超时或调小 max_retry_backoff_secs |
 | Claude Code /compact 无限卡住/超时（走非官方 API） | 上游（聚合/镜像服务常见）未实现 compact 依赖的 `POST /v1/messages/count_tokens`，确定性 404 被无限重试、客户端永远等不到终态。解决：该实例 toml 的 `bounded_retry_paths` 加 `'/v1/messages/count_tokens\?.*'`（或客户端实际使用的确切路径），`aproxy restart <端口或别名>` 生效——失败 3 次即透传真实响应。其他 agent 软件/其他端点的同类问题同理 |
 | 日志刷「受限重试路径达到尝试上限，透传最后一次上游响应」 | 该请求命中 `bounded_retry_paths`：失败 3 次即透传，属预期行为；不想受限就从配置移除对应模式并 restart |

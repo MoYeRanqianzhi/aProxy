@@ -34,6 +34,7 @@ listen_addr = "127.0.0.1:12345"
 # disk_cache = true
 # forward_only = false
 # bounded_retry_paths = [ '/v1/messages/count_tokens' ]
+# log_file = "D:/aproxy-logs/inst-a.log"
 ```
 
 ## 字段总表
@@ -57,6 +58,7 @@ listen_addr = "127.0.0.1:12345"
 | `disk_cache` | bool? | settings 层 | 磁盘缓存开关 |
 | `forward_only` | bool? | settings 层 | 仅转发模式：放弃重试/缓冲/心跳，请求体与响应流式直通 |
 | `bounded_retry_paths` | string[]? | settings 层（空） | 受限重试路径（正则）：命中者失败 3 次即透传，不再无限重试 |
+| `log_file` | string? | 无（随机命名） | 自定义守护日志文件路径；缺省按启动随机命名（见下） |
 
 **优先级**（`max_body_mb`/`disk_cache`/`forward_only`/`bounded_retry_paths`
 四个 Option 字段独有）：
@@ -219,6 +221,29 @@ bounded_retry_paths = [
 > 等不到终态。把该路径加入 `bounded_retry_paths`（如上例）即可解决——失败
 > 3 次即透传真实响应，compact 立即恢复。其他 agent 软件/其他端点的同类问题
 > 同理，按实际路径配置。
+
+### log_file
+
+自定义守护日志文件路径（字符串，默认无 = 内置随机命名）。未设置时日志落
+`~/.aproxy/logs/`，按启动时刻随机命名（十六进制时间戳-pid 格式，如
+`19ac3f2e8b5d-1a2b.log`）——**每次启动（含 restart、restore 恢复）都是新文件**，
+换端口后日志不断档；代价是文件名不含端口，**不要按端口猜文件名**，日志地址
+一律以实例上报为准（`aproxy status`/`aproxy logs`/start 成功提示经 IPC 向
+实例询问，客户端不拼路径）。
+
+- **优先级**：CLI `--log-file <PATH>` > toml `log_file` > 内置随机名
+  （与 `--baseurl` 等覆盖参数同款：CLI 值仅本次运行生效，不写任何配置文件）。
+- **路径解析**：支持 `~` 展开；**相对路径相对 APROXY_HOME 解析**（守护进程
+  的 cwd 不可靠，不按它解析）。
+- **落盘与轮转**：自定义路径（含父目录创建）由守护进程负责；运行期轮转
+  （settings.json 的 `log_rotate_mb`）对自定义文件同样适用。
+- **有意不设 settings.json 全局默认层**（与 `max_body_mb`/`disk_cache`/
+  `forward_only`/`bounded_retry_paths` 四字段的三层分层形成对照）：
+  日志去向是每实例的运行习惯而非「同一台机器该统一」的全局策略，不存在
+  「所有实例都该默认写同一个文件」的合理语义；toml 每实例显式配置 +
+  CLI 临时覆盖已经覆盖全部场景。
+- 改后 `aproxy restart <端口或别名>` 生效；重启后随机名会变（自定义路径不变），
+  实例停止后旧日志按孤儿清理（见 behaviors.md 日志节）。
 
 ## 校验规则
 

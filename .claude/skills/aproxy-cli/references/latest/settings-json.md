@@ -149,6 +149,11 @@ config.toml 显式值  >  settings.json 值  >  内置默认 (128 / true / false
 `aproxy config --show` 会注明哪些值「未在 toml 设置，运行时取 settings.json
 全局默认」。
 
+config.toml 的 `log_file`（守护日志文件路径）**有意不设 settings.json 全局
+默认层**——这不是漏配：日志去向是每实例的运行习惯，不存在「全机器统一一个
+日志文件」的合理全局策略，toml 每实例配置 + CLI `--log-file` 临时覆盖即可。
+默认（未配置）按启动随机命名，地址经 IPC 向实例询问。
+
 `aproxy doctor` 的 error 级检查覆盖本文件：JSON 语法错误、别名非法、别名指向
 不存在的文件。这些检查在每次 aproxy 运行时都执行（stderr 报出，不退出——
 status/stop 等管理命令不能因内部配置损坏而不可用）。

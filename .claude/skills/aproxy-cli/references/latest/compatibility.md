@@ -20,6 +20,30 @@ aproxy status               # 每行 v<semver> = 各实例实际运行的守护�
 | 代码版本坐标 | Cargo.toml `version` 字段；alpha 线于 2026-09 发布 |
 | 大版本线 | 0.1.x（0.1 系列内小版本不另开目录，直接更新 latest/ 文档） |
 
+## alpha.15 关键行为（未发布，随下次版本出厂）
+
+> 本节描述尚未发布的行为变更：文档适用版本行仍为 0.1.0-alpha.14，
+> 下节（alpha.14）与更早各节描述的是已出厂行为。
+
+- **守护日志随机命名（不再按端口命名）**：日志文件改为启动时刻随机命名
+  （十六进制时间戳-pid 格式，如 `19ac3f2e8b5d-1a2b.log`），每次启动（含
+  restart、restore 恢复）都是新文件——换端口后日志不断档。文件名不含端口，
+  日志地址一律经 IPC 向实例询问（`aproxy status`/`aproxy logs`/start 成功
+  提示来自实例上报的 log_path，客户端不拼路径）；`--foreground` 实例
+  log_path 为空，`aproxy logs` 立即报「日志输出在它的控制台」。
+- **孤儿清理判据重构**：由「按文件名端口归属」改为「活实例上报的 log_path ∪
+  `.restore` 记录的 log_path」之外的 `*.log`（startup.log 除外）。推论：
+  **旧版按端口命名的日志在升级后会被视为孤儿清理**；实例优雅停止后其日志在
+  下次清理时删除；崩溃实例的日志由 `.restore` 引用保留到恢复成功。
+- **新增 `log_file` 配置（config.toml 字段 + CLI `--log-file`）**：自定义
+  守护日志文件路径，优先级 CLI > toml > 内置随机名；相对路径相对 APROXY_HOME
+  解析；运行期轮转同样适用。**有意不设 settings.json 全局默认层**（与
+  `max_body_mb`/`disk_cache`/`forward_only`/`bounded_retry_paths` 四字段
+  形成对照）。
+- **无跨版本兼容层**：alpha 阶段不做「按端口拼日志路径」的回退（serde
+  default 仅作混版本解析容错）。混版本舰队中旧版本实例的日志仍按端口命名
+  存在，但清理器只有一份（最新 CLI）——旧命名的日志会被新判据当孤儿清理。
+
 ## alpha.14 关键行为（相对 alpha.13）
 
 - **受限重试路径 `bounded_retry_paths`（新配置字段，默认空 = 功能关闭）**：

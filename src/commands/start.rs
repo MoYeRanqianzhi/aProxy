@@ -83,6 +83,9 @@ pub(crate) fn load_with_cli_overrides(cli: &Cli, cfg_path: &std::path::Path) -> 
     if let Some(k) = &cli.api_key {
         cfg.api_key = Some(k.clone());
     }
+    if let Some(f) = &cli.log_file {
+        cfg.log_file = Some(f.clone());
+    }
     cfg.normalized()
 }
 
@@ -216,8 +219,8 @@ pub(crate) async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf, target: Optio
     // 就绪判定用 IPC ping 而非 TCP connect：管道名含端口，只有本守护子进程会
     // 创建 `aproxy-<port>`——connect 成功无法区分「我们的子进程」与「任何抢占
     // 端口的监听者」，曾导致对已死子进程/第三方进程误报启动成功。轮询至 8 秒
-    // （子进程冷启动受 Defender 扫描等影响可能偏慢）。
-    let log_path = daemon::logs_dir().join(format!("{port}.log"));
+    // （子进程冷启动受 Defender 扫描等影响可能偏慢）。日志文件按启动随机命名
+    //（或用户自定义），客户端不拼路径——ping 响应携带实例上报的 log_path。
     let startup_log_path = daemon::logs_dir().join("startup.log");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     loop {
@@ -240,16 +243,20 @@ pub(crate) async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf, target: Optio
                 println!("  仅转发模式：不缓冲、不重试");
             }
             println!("  配置: {}", cfg_path.display());
-            println!("  日志: {}", log_path.display());
+            println!("  日志: {}", info.log_path);
             println!("查看实例: aproxy status    停止: aproxy stop {port}");
             break;
         }
         if std::time::Instant::now() > deadline {
-            // 子进程无控制台，失败原因只可能落盘：配置/绑定错误写 startup.log，
-            // 运行日志在端口日志——两个位置都要指给用户
+            // 子进程无控制台，失败原因只可能落盘：配置/绑定错误写 startup.log。
+            // 运行日志按启动随机命名，父进程无法预知具体文件名——指向 logs
+            // 目录（文件名随启动变化，可用 aproxy status 查看实际路径）
             eprintln!("后台进程未在预期时间内就绪（pid {pid}），启动失败的原因通常记录在:");
             eprintln!("  {}", startup_log_path.display());
-            eprintln!("  {}", log_path.display());
+            eprintln!(
+                "  {}（该实例运行日志，按启动随机命名）",
+                daemon::logs_dir().display()
+            );
             std::process::exit(1);
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

@@ -4,6 +4,7 @@
 //! 与 `commands/start.rs` 的分工：start 负责启动预检与后台 spawn 的父进程侧，
 //! server 负责真正「跑起来」的服务进程本身。
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tracing_subscriber::EnvFilter;
@@ -15,6 +16,52 @@ use aproxy::watchdog;
 
 use crate::util::{chrono_like_timestamp, now_unix};
 use aproxy::config::mask_base_url;
+
+/// 本进程守护日志的最终路径（resolve + init 后写入，serve_forever 读取）。
+/// `None` = 前台实例（日志走控制台，无文件，注册表 log_path 落空串）。
+/// OnceLock 保证「进程生命周期内一次解析、处处一致」：随机名在日志初始化时
+/// 生成，注册表/恢复记录/轮转共用同一份，不会各自生成出不同的名字。
+static RESOLVED_DAEMON_LOG: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// 守护日志随机文件名：`<纳秒时间戳hex>-<pid低16位hex>.log`。
+/// 端口是易变标识（换端口重启后按端口命名找不到旧日志），文件名改用启动
+/// 时刻的随机标识；同 pid 同纳秒完成两次启动不可能，无需更强的随机源。
+/// 无 chrono/rand 依赖，std 时间 + pid 即可。
+fn generate_random_log_name() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos:x}-{:04x}.log", std::process::id() & 0xffff)
+}
+
+/// 解析守护日志的最终路径：CLI `--log-file` > config.toml `log_file` >
+/// 内置随机名。`~` 展开（settings::expand_path）；**相对路径相对 APROXY_HOME
+/// 解析**——守护进程的工作目录不可靠（分离 spawn 维持继承 cwd，但终端关闭
+/// 等场景下语义不明），主目录是唯一稳定基准。返回绝对化路径。
+pub(crate) fn resolve_daemon_log_path(
+    cli_log_file: Option<&str>,
+    cfg_log_file: Option<&str>,
+) -> PathBuf {
+    match cli_log_file.or(cfg_log_file) {
+        Some(raw) => {
+            let expanded = aproxy::settings::expand_path(raw);
+            if expanded.is_absolute() {
+                expanded
+            } else {
+                aproxy::settings::home().join(expanded)
+            }
+        }
+        None => aproxy::daemon::logs_dir().join(generate_random_log_name()),
+    }
+}
+
+/// 本进程守护日志的最终路径（serve_forever 消费）。None = 前台实例。
+/// serve_forever 必在日志初始化之后运行（main.rs 的分支顺序保证），未初始化
+/// 的违规调用按前台语义落空串处理（不 panic，与 log_path 空串消费方语义一致）。
+pub(crate) fn resolved_daemon_log() -> Option<PathBuf> {
+    RESOLVED_DAEMON_LOG.get().cloned().flatten()
+}
 
 /// 服务主循环：前台与守护子进程共用。bind、注册实例、启动 IPC 控制通道，
 /// 一直服务到停止信号（Ctrl+C/SIGTERM 或 `aproxy stop` 经 IPC 触发）。
@@ -46,7 +93,14 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
 
     // 注册实例信息（bind 成功后才写，避免留下死记录）。
     // last_activity_secs 落盘的是注册时刻快照（注册表仅供枚举展示），
-    // 实时值由 IPC ping 响应携带。
+    // 实时值由 IPC ping 响应携带。log_path 是本实例守护日志的最终路径
+    // （随机命名或用户自定义；前台实例无文件落空串）——客户端（aproxy
+    // logs/start 提示）一律经 IPC/注册表向实例索取，不按端口拼路径。
+    let daemon_log_path = resolved_daemon_log();
+    let daemon_log_path_str = daemon_log_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     let info = daemon::InstanceInfo {
         pid: std::process::id(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -63,6 +117,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
         last_error: None,
         last_error_at: 0,
         swap_phase: false,
+        log_path: daemon_log_path_str,
     };
     if let Err(e) = daemon::write_instance_file(&info) {
         tracing::warn!(error = %e, "实例注册表写入失败（不影响代理功能）");
@@ -77,7 +132,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
         v.retain(|a| a != "--daemon-child" && a != "--foreground");
         v
     };
-    if let Err(e) = daemon::write_restore_file(&listen_addr, &restore_args) {
+    if let Err(e) = daemon::write_restore_file(&listen_addr, &restore_args, &info.log_path) {
         tracing::warn!(error = %e, "自愈恢复记录写入失败（不影响代理功能）");
     }
 
@@ -164,11 +219,13 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     // （正是本项目的目标形态）仍会无限膨胀。每小时检查一次，超过 settings 的
     // log_rotate_mb（全局治理项，默认 8MB，0=不轮转）即截断；
     // `aproxy logs` 跟随器已有截断检测（文件变小时自动从头重跟），不会被破坏。
+    // 路径是本实例解析出的最终日志路径（随机命名或用户自定义 log_file 均适用）。
     // 仅守护实例执行——前台实例的日志走控制台，无文件可轮转。
     if daemon_child {
         let rotate_limit = settings::load().log_rotate_mb.saturating_mul(1024 * 1024);
-        if rotate_limit > 0 {
-            let rotate_path = daemon::logs_dir().join(format!("{port}.log"));
+        if rotate_limit > 0
+            && let Some(rotate_path) = daemon_log_path
+        {
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
@@ -306,22 +363,28 @@ pub(crate) fn init_stdout_logging() {
         .init();
 }
 
-/// 守护子进程日志：写 `~/.aproxy/logs/<端口>.log`（超过 2 MiB 截断重写，
-/// 保留最近一次运行的日志即可，避免无限膨胀）。UTF-8 无 BOM——历史上曾写过
-/// BOM 后撤销（部分工具链对 BOM 敏感），日志查看依赖终端/编辑器自身的 UTF-8
-/// 解码；Windows 控制台乱码与文件无关（进程入口已切 65001）。
-pub(crate) fn init_daemon_logging(listen_addr: &str) {
-    let _ = std::fs::create_dir_all(daemon::logs_dir());
-    let path = daemon::logs_dir().join(format!("{}.log", daemon::port_of(listen_addr)));
-    if let Ok(meta) = std::fs::metadata(&path)
+/// 守护子进程日志：写解析出的日志文件（随机命名或用户自定义，见
+/// `resolve_daemon_log_path`；超过 2 MiB 截断重写，保留最近一次运行的日志
+/// 即可，避免无限膨胀）。UTF-8 无 BOM——历史上曾写过 BOM 后撤销（部分
+/// 工具链对 BOM 敏感），日志查看依赖终端/编辑器自身的 UTF-8 解码；Windows
+/// 控制台乱码与文件无关（进程入口已切 65001）。路径在此写入 OnceLock，
+/// 供 serve_forever 组装注册表/恢复记录/轮转共用。
+pub(crate) fn init_daemon_logging(log_path: &std::path::Path) {
+    let _ = RESOLVED_DAEMON_LOG.set(Some(log_path.to_path_buf()));
+    if let Some(parent) = log_path.parent() {
+        // 自定义 log_file 的父目录可能不存在（内置随机名已由调用方在
+        // resolve 阶段指向既有 logs 目录，此调用对其是无害的重复创建）
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(meta) = std::fs::metadata(log_path)
         && meta.len() > 2 * 1024 * 1024
     {
-        let _ = std::fs::write(&path, b"");
+        let _ = std::fs::write(log_path, b"");
     }
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(log_path)
     {
         Ok(file) => {
             tracing_subscriber::fmt()
@@ -332,9 +395,18 @@ pub(crate) fn init_daemon_logging(listen_addr: &str) {
                 .with_ansi(false)
                 .init();
         }
-        // 日志文件打不开则回退 stdout（会被 Stdio::null 吞掉，但至少不 panic）
+        // 日志文件打不开则回退 stdout（会被 Stdio::null 吞掉，但至少不 panic）。
+        // OnceLock 保持已写入的 Some：注册表仍指向该路径，logs 命令会以
+        // 「日志文件迟迟未生成」暴露这个极端退化（磁盘满/权限），不静默伪装正常
         Err(_) => init_stdout_logging(),
     }
+}
+
+/// 前台实例的日志初始化：stdout + 标记「本进程无日志文件」（OnceLock 落
+/// None，serve_forever 据此在注册表/恢复记录里写空串 log_path）。
+pub(crate) fn init_foreground_logging() {
+    let _ = RESOLVED_DAEMON_LOG.set(None);
+    init_stdout_logging();
 }
 
 /// 配置错误报告：前台/父进程走 stderr；守护子进程无控制台，错误写

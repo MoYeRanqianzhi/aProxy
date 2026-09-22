@@ -22,7 +22,8 @@ aProxy 原样透传路径/查询/请求头到上游 `base_url`。请求失败（
   唯一，**不手改**，经 `aproxy alias`/`aproxy config --set-default` 管理
 
 配置生效优先级（高 → 低）：
-1. CLI 覆盖参数 `--baseurl/--listen/--proxy/--api-key`（仅本次运行，不落盘）
+1. CLI 覆盖参数 `--baseurl/--listen/--proxy/--api-key/--log-file`（仅本次运行，
+   不落盘）
 2. config.toml 显式配置的值（各实例独立）
 3. settings.json 全局默认（仅 `max_body_mb`、`disk_cache`、`forward_only`、
    `bounded_retry_paths` 四个字段参与此层）
@@ -58,3 +59,5 @@ compatibility.md 确认行为差异（旧版本可能缺字段、语义不同）
   排除区间）」，不要一律当占用处理——详见 behaviors.md 排障节。
 - 守护日志是 UTF-8（无 BOM），终端乱码是控制台代码页问题，进程入口已自动切
   65001，无需 chcp。
+- 日志文件按启动**随机命名**（文件名不含端口），且每次启动都是新文件——地址
+  经 `aproxy status`/`aproxy logs` 向实例询问，**不要按端口猜文件名**。

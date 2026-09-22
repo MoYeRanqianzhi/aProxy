@@ -1514,6 +1514,7 @@ mod tests {
             last_error: None,
             last_error_at: 0,
             swap_phase: false,
+            log_path: String::new(),
         };
         crate::daemon::write_instance_file_in(dir, &info).unwrap();
         // restore 记录（崩溃信号）
@@ -1521,7 +1522,7 @@ mod tests {
             "--config".to_string(),
             "C:/tmp/no-such-config.toml".to_string(),
         ];
-        crate::daemon::write_restore_file_in(dir, port, &args).unwrap();
+        crate::daemon::write_restore_file_in(dir, port, &args, "").unwrap();
     }
 
     #[tokio::test]
@@ -1556,6 +1557,7 @@ mod tests {
             last_error: None,
             last_error_at: 0,
             swap_phase: false,
+            log_path: String::new(),
         };
         crate::daemon::write_instance_file_in(dir.path(), &info).unwrap();
         assert_eq!(st.handle_death("59901").await, DeathOutcome::GracefulExit);

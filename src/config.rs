@@ -114,6 +114,16 @@ pub struct Config {
     /// 默认，内置空）。
     #[serde(default)]
     pub bounded_retry_paths: Option<Vec<String>>,
+    /// 守护日志文件路径（自定义去向）：不设时写入 `~/.aproxy/logs/` 下按启动
+    /// 时刻随机命名的文件（文件名不含端口——端口是易变标识，换端口重启后
+    /// 日志照样按实例连续可查，实际路径由实例经 IPC 上报，客户端不拼路径）。
+    /// 支持 `~` 展开；**相对路径相对 APROXY_HOME 解析**（守护进程的工作目录
+    /// 不可靠，主目录是唯一稳定基准）。CLI `--log-file`（仅本次运行）优先于
+    /// 本字段。**有意不设 settings.json 全局默认层**——日志去向是单实例语义
+    /// （每个实例的配置文件各管各的），与 max_body_mb 等四个全局默认字段
+    /// 形成对照，这是设计决策而非遗漏。
+    #[serde(default)]
+    pub log_file: Option<String>,
     /// spool 临时文件目录覆盖（serde skip，不落盘）。仅测试注入用：集成测试
     /// 进程内构建 AppState 时若无此覆盖，会按端口写入真实 ~/.aproxy/spool/。
     /// 生产路径为 None，实际目录 = ~/.aproxy/spool/<端口>/。
@@ -176,6 +186,7 @@ impl Default for Config {
             disk_cache: None,
             forward_only: None,
             bounded_retry_paths: None,
+            log_file: None,
             spool_dir_override: None,
         }
     }
@@ -761,6 +772,30 @@ mod tests {
         let legacy = load_from(&path);
         assert_eq!(legacy.bounded_retry_paths, None);
         assert!(legacy.bounded_retry_paths().is_empty());
+    }
+
+    #[test]
+    fn log_file_roundtrip_and_default() {
+        // log_file：显式值落盘往返；旧配置文件（无该字段）读出 None
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.toml");
+        let cfg = Config {
+            base_url: "https://api.example.com".to_string(),
+            log_file: Some("/var/log/aproxy/inst-a.log".to_string()),
+            ..Default::default()
+        };
+        save_to(&path, &cfg).unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(
+            loaded.log_file.as_deref(),
+            Some("/var/log/aproxy/inst-a.log"),
+            "显式值应落盘往返"
+        );
+
+        // 旧配置（无该字段）：None = 内置随机命名
+        std::fs::write(&path, "base_url = \"https://api.example.com\"").unwrap();
+        let legacy = load_from(&path);
+        assert_eq!(legacy.log_file, None, "旧配置文件应读出 None");
     }
 
     #[test]

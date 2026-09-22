@@ -60,14 +60,20 @@ async fn main() {
 
     // 日志初始化：守护子进程无控制台，写日志文件；其余走 stdout（RUST_LOG 可覆盖）
     if cli.daemon_child {
-        // 此刻配置尚未严格校验，用宽松 load + CLI 覆盖取监听端口命名日志文件；
-        // 校验失败的错误会写入 startup.log（见 report_config_error）。覆盖必须
-        // 先于端口提取：--listen 改端口时日志名须与实际监听端口一致，否则父进程
-        // 打印的日志路径指向一个永远不会被创建的文件
+        // 此刻配置尚未严格校验，用宽松 load + CLI 覆盖解析日志最终路径
+        // （CLI --log-file > config.toml log_file > 内置随机名）。随机名在此
+        // 一次性生成并写入 OnceLock，注册表/恢复记录/轮转共用同一份路径；
+        // 校验失败的错误会写入 startup.log（见 report_config_error），日志
+        // 初始化必须发生在校验之前——否则失败的启动连 startup.log 都写不出
         let cfg = commands::start::load_with_cli_overrides(&cli, &cfg_path);
-        server::init_daemon_logging(&cfg.listen_addr);
+        let log_path =
+            server::resolve_daemon_log_path(cli.log_file.as_deref(), cfg.log_file.as_deref());
+        server::init_daemon_logging(&log_path);
     } else {
-        server::init_stdout_logging();
+        // 前台实例日志走控制台，无文件——OnceLock 落 None，serve_forever
+        // 据此在注册表/恢复记录里写空串 log_path（logs 命令据此立即报
+        // 「日志输出在它的控制台」，不再间接探测）
+        server::init_foreground_logging();
     }
 
     // 守护子进程只承载服务，忽略转发来的子命令：start 父进程把完整命令行

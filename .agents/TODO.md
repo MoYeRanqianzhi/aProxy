@@ -4,6 +4,26 @@
 > 2026-09-08 补录 tag 之后一轮（性能优化 + 磁盘缓存 + 重构 + skill），全部已完成。
 > 2026-09-09 第四轮审查修复 + 实测 restart bug + skill 指引优化，全部已完成。
 
+## 日志随机命名 + IPC 上报（2026-09-22，用户定调三点）
+
+- [x] **守护日志从「端口命名 + 客户端拼路径」改为「随机命名 + IPC 上报真实路径」**：
+  用户定调——(1) 随机命名（`<纳秒hex>-<pid hex>.log`，无新依赖）；(2) 日志地址
+  经 IPC 上报（InstanceInfo.log_path），客户端一律问实例拿真实路径，**不提供
+  端口拼接回退**（alpha 无兼容承诺）；(3) 自定义位置 = config.toml `log_file` +
+  CLI `--log-file`（优先级 CLI > toml > 随机名；~ 展开；相对路径相对
+  APROXY_HOME；**有意不设 settings.json 全局默认层**）。关键实现：OnceLock 一次
+  解析处处一致（注册表/.restore/轮转共用）；前台实例 log_path 空串（logs 立即
+  报「日志输出在它的控制台」，取代 5 秒间接探测）；**孤儿清理判据重构为引用集**
+  （活实例 log_path ∪ .restore log_path 之外的 .log 删；startup.log 除外；非
+  .log 保留；path_match_key 归一比较防分隔符差异误删）；.restore 文件格式改
+  结构体 `{args, log_path}` 且**读侧宽容旧格式**（否则混版本窗口把用户有效
+  恢复记录当损坏删掉）。IPC 管道/spool/心跳仍按端口标识，只有日志文件脱钩。
+  单测：log_file roundtrip + 孤儿清理引用集（含归一/空串三例）+ .restore 新旧
+  格式往返。详见 `.agents/memory/2026-09-22-random-log-names.md`
+- [ ] **集成测试补强**：随机命名日志的 e2e（自定义 log_file 经 CLI+IPC、
+  换端口 restart 后 log_path 经 IPC 更新、stop 后日志清理/kill -9 后 .restore
+  引用保留）——代码已落地，集成测试待补（Windows 侧 e2e + router 实测）
+
 ## 受限重试路径（2026-09-20）
 
 - [x] **compact 被 count_tokens 无限重试风暴挂死——bounded_retry_paths 配置

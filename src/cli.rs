@@ -33,6 +33,12 @@ pub(crate) struct Cli {
     #[arg(long, value_name = "URL")]
     pub(crate) proxy: Option<String>,
 
+    /// 守护日志文件路径（仅本次运行生效），覆盖配置文件中的 log_file。
+    /// 未指定时写入 ~/.aproxy/logs/ 下按启动时刻随机命名的文件，
+    /// 实际路径以 aproxy status / aproxy logs 经 IPC 获取为准
+    #[arg(long, value_name = "PATH", global = true)]
+    pub(crate) log_file: Option<String>,
+
     /// 快捷 api_key（等效覆盖 Authorization: Bearer <key>，仅本次运行生效），覆盖配置文件中的 api_key
     /// （建议改用配置文件，命令行参数可被本机其他进程枚举）
     #[arg(long, value_name = "KEY")]

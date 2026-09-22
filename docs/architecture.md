@@ -153,8 +153,9 @@ config_dirs、日志轮转阈值、空闲阈值与上述四个字段的全局默
   `spawn_detached` 分离子进程（Windows 手写 `CreateProcessW`，
   `bInheritHandles=FALSE` + `CREATE_NO_WINDOW`）→ 父进程轮询 IPC ping 就绪后返回。
 - 子进程（`--daemon-child`）承载服务：清 spool 目录（bind 前，回收崩溃残留）→
-  bind → 写实例注册表（`run/<端口>.pid`）→ 写恢复记录
-  （`run/<端口>.restore`）→ 启动 IPC 管道 → 创建看门狗心跳节 + 心跳 ticker
+  bind → 写实例注册表（`run/<端口>.pid`，含实例上报的 log_path）→ 写恢复记录
+  （`run/<端口>.restore`，同样携带 log_path——崩溃实例的日志凭此保留）→
+  启动 IPC 管道 → 创建看门狗心跳节 + 心跳 ticker
   （10s）→ 守护侧互保任务（5 分钟自检）→ serve。
 - 停止：IPC `shutdown` → 优雅关闭（10s 宽限强退）→ 清注册表与恢复记录。
 
@@ -212,9 +213,22 @@ config_dirs、日志轮转阈值、空闲阈值与上述四个字段的全局默
 
 ## 日志治理
 
-- 守护日志 `logs/<端口>.log`：启动时 >2MiB 截断；运行期每小时检查，>8MiB 截断
-- `aproxy logs [PORT|别名]`：tail -f 语义（末尾 8KB/30 行 + 增量轮询），实例停止自动退出
-- 孤儿清理：`status` 时删除既无存活实例也无 `.restore` 的端口日志
+- 守护日志 `logs/`：按启动时刻**随机命名**（十六进制时间戳-pid 格式，如
+  `19ac3f2e8b5d-1a2b.log`），每次启动（含 restart、restore）都是新文件——
+  换端口后日志不断档；启动时 >2MiB 截断；运行期每小时检查，>8MiB 截断
+- **路径解析序列**（`main.rs`/`server.rs`）：宽松 load 配置（解析失败不阻断
+  日志初始化）→ resolve（CLI `--log-file` > config.toml `log_file` > 内置
+  随机名；`~` 展开，相对路径相对 APROXY_HOME——守护 cwd 不可靠）→ 日志
+  init → 实例经 IPC 上报 log_path（`InstanceInfo.log_path`），注册表与
+  `.restore` 记录均携带
+- **地址以 IPC 为准**：`aproxy logs [PORT|别名]`（tail -f 语义：末尾 8KB/
+  30 行 + 增量轮询，实例停止自动退出）与 start 成功提示都向实例询问真实
+  路径，客户端不拼路径；`--foreground` 实例 log_path 为空，logs 立即报
+  「日志输出在它的控制台」
+- 孤儿清理：`status` 时删除「活实例上报的 log_path ∪ `.restore` 记录的
+  log_path」之外的 `*.log`（startup.log 除外，非 .log 文件不动）——不再按
+  文件名端口归属判定。推论：优雅停止实例的日志在下次清理时删除；崩溃实例的
+  日志由 `.restore` 引用保留到恢复成功；旧版按端口命名的日志升级后视为孤儿
 - 全部输出对凭据打码（api_key/头值/代理密码/base_url 内嵌密码）——可安全粘贴分享
 
 ## 安装与升级（install）

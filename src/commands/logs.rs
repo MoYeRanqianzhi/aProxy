@@ -7,7 +7,8 @@ use crate::commands::{config_path_key, resolve_config_target};
 /// `aproxy logs [PORT|别名]`：连接到运行中的实例并实时输出其守护日志。
 /// 语义与 stop 一致：单实例可省略 target；多实例必须指定；别名按配置文件
 /// 匹配运行实例（端口变了别名依然有效）；不支持 all（一次只能连接一个实例，
-/// 传入 all 视为端口解析失败）。
+/// 传入 all 视为端口解析失败）。日志文件按启动随机命名（或用户自定义
+/// log_file），文件地址一律经 IPC/注册表向实例索取，不按端口拼路径。
 pub(crate) async fn handle_logs_cmd(target: Option<String>) {
     if target.as_deref() == Some("all") {
         eprintln!("aproxy logs 不支持 all：一次只能连接一个实例，请指定端口号或配置别名。");
@@ -69,7 +70,13 @@ pub(crate) async fn handle_logs_cmd(target: Option<String>) {
     };
 
     let port = daemon::port_of(&info.listen_addr).to_string();
-    let path = daemon::logs_dir().join(format!("{port}.log"));
+    if info.log_path.is_empty() {
+        // 前台实例经 IPC 上报空串 log_path——显式信号，立即报出（原先的
+        // 5 秒文件等待是为前台实例设计的间接探测，现在有权威来源不再需要）
+        println!("该实例以前台模式运行（--foreground），日志输出在它的控制台，无日志文件可跟随。");
+        std::process::exit(1);
+    }
+    let path = std::path::PathBuf::from(&info.log_path);
     println!("正在连接 pid {}（端口 {}）——Ctrl+C 退出。", info.pid, port);
     println!("  日志文件: {}", path.display());
     println!("────────── 最近日志 ──────────");

@@ -267,6 +267,14 @@ pub(crate) fn handle_config_cmd(path: PathBuf, args: ConfigArgs) {
         } else {
             println!("read_timeout_secs       = {}", cfg.read_timeout_secs);
         }
+        match &cfg.log_file {
+            Some(f) => println!(
+                "log_file                = {f}（自定义守护日志文件；CLI --log-file 可覆盖）"
+            ),
+            None => println!(
+                "log_file                = (未设)（内置: ~/.aproxy/logs/ 下按启动随机命名，实际路径以 aproxy status/logs 经 IPC 获取为准）"
+            ),
+        }
         println!(
             "proxy          = {}",
             cfg.proxy

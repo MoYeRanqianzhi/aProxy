@@ -152,12 +152,15 @@ listen_addr = "127.0.0.1:12345"          # local listener
 # disk_cache = true                      # spool large bodies/responses to disk
 # forward_only = false                   # forward-only (gives up retries): stream both ways, no retries/buffering/heartbeats
 # bounded_retry_paths = [ '/v1/x' ]      # bounded retry paths (regex): matched requests pass through after 3 failures
+# log_file = "D:/aproxy-logs/a.log"      # custom log file (~ expanded; relative paths resolve against APROXY_HOME; default is a random per-start name, resolved via IPC)
 # connect_timeout_secs = 30              # upstream connect timeout (0 = none)
 # read_timeout_secs = 300                # inter-read timeout (0 = none)
 ```
 
 Runtime data lives in `~/.aproxy/`: `run/` (registry, restore records,
-watchdog claim), `logs/` (daemon logs, rotated), `spool/<port>/` (disk-cache
+watchdog claim), `logs/` (daemon logs, randomly named per start, rotated and
+orphan-cleaned; paths reported via IPC — customize with `log_file`),
+`spool/<port>/` (disk-cache
 scratch space), `settings.json` (internal state: aliases, defaults, watchdog
 fields — program-managed).
 

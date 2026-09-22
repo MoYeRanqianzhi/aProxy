@@ -131,6 +131,14 @@ pub struct InstanceInfo {
     /// 「二进制更换中」；install 的 ACK 判定 = ping 读到 true。
     #[serde(default)]
     pub swap_phase: bool,
+    /// 本实例守护日志文件的绝对路径（随机命名或用户自定义 log_file）。
+    /// 客户端（aproxy logs / start 成功提示）一律经 IPC/注册表向实例索取，
+    /// **不提供按端口拼路径的回退**（alpha 阶段决策：端口是易变标识，没有
+    /// 兼容旧命名的义务）。空串 = 前台实例（日志走控制台，无文件）。
+    /// serde default 仅作混版本窗口的解析容错（旧守护响应缺字段读空串），
+    /// 旧实例读出的空串会以「无日志路径」明确报出，不静默猜错文件。
+    #[serde(default)]
+    pub log_path: String,
 }
 
 /// 当前 IPC 协议版本。协议变更（增字段/增 op）不递增——serde default/忽略
@@ -521,23 +529,29 @@ pub async fn list_instances() -> Vec<InstanceInfo> {
     live
 }
 
-/// 清理孤儿日志：日志目录中 `<端口>.log` 的端口既无存活实例、也无 .restore
-/// 恢复记录时删除。startup.log 不按端口归属，跳过。
-/// .restore 在此**保留不删**：它的语义是「期望恢复」——崩溃实例恰恰要靠它
-/// 存活到 `aproxy restore` 执行；先跑一次 status 就把记录清掉会让自愈失效。
-/// 崩溃待恢复实例的日志同理保留（排障线索，复活后同端口继续追加）。
-/// 目录与待恢复清单参数化（测试注入用）。
+/// 清理孤儿日志：日志文件名随机化后不再携带归属信息，判据改为「引用集」——
+/// 活实例上报的 log_path ∪ .restore 记录的 log_path 之外的 .log 一律删除。
+/// logs 目录是工具专属目录，目录内 .log 一律视为实例日志（防御保留非 .log
+/// 文件与 startup.log）。两条推论：(a) 旧版按端口命名的日志升级后会被视为
+/// 孤儿清理（alpha 阶段无兼容义务）；(b) 崩溃实例的日志由 .restore 引用
+/// 保留到恢复成功——恢复后记录重写为新实例的路径，旧日志按孤儿收敛。
+/// 自定义 log_file 落在其他目录时，扫描天然不触及。空串 log_path（前台）
+/// 不参与引用集。目录与待恢复清单参数化（测试注入用）。
 fn cleanup_orphan_logs_in(
     logs_dir: &std::path::Path,
     live: &[InstanceInfo],
     pending_restore: &[RestoreEntry],
 ) {
-    let live_ports: std::collections::HashSet<String> = live
+    // 引用集按 path_match_key 归一比较（大小写/分隔符规则与别名匹配共用）：
+    // 注册表存的路径字符串与 read_dir 枚举出的表示在 Windows 上可能有
+    // 分隔符差异，字面比较会漏保活
+    let referenced: std::collections::HashSet<String> = live
         .iter()
-        .map(|i| port_of(&i.listen_addr).to_string())
+        .map(|i| i.log_path.clone())
+        .chain(pending_restore.iter().map(|e| e.log_path.clone()))
+        .filter(|p| !p.is_empty())
+        .map(|p| crate::settings::path_match_key(&p))
         .collect();
-    let pending_ports: std::collections::HashSet<String> =
-        pending_restore.iter().map(|e| e.port.clone()).collect();
 
     let Ok(entries) = std::fs::read_dir(logs_dir) else {
         return;
@@ -550,11 +564,8 @@ fn cleanup_orphan_logs_in(
         if path.extension().and_then(|e| e.to_str()) != Some("log") || stem == "startup" {
             continue;
         }
-        // 只清理端口命名的日志（防御：目录里若有非端口命名文件一律不动）
-        if stem.parse::<u16>().is_err() {
-            continue;
-        }
-        if !live_ports.contains(stem) && !pending_ports.contains(stem) {
+        let key = crate::settings::path_match_key(&path.display().to_string());
+        if !referenced.contains(&key) {
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -650,10 +661,11 @@ pub fn restore_file_path_in(run_dir: &std::path::Path, listen_addr: &str) -> Pat
     run_dir.join(format!("{}.restore", port_of(listen_addr)))
 }
 
-/// 写入恢复记录：`args` 为实例的启动参数（不含 --daemon-child，恢复时统一追加）。
+/// 写入恢复记录：`args` 为实例的启动参数（不含 --daemon-child，恢复时统一追加），
+/// `log_path` 为本次启动的守护日志路径（崩溃后排障线索，前台实例落空串）。
 /// bind 成功后调用；同端口重复启动时覆盖旧记录。
-pub fn write_restore_file(listen_addr: &str, args: &[String]) -> io::Result<()> {
-    write_restore_file_in(&run_dir(), listen_addr, args)
+pub fn write_restore_file(listen_addr: &str, args: &[String], log_path: &str) -> io::Result<()> {
+    write_restore_file_in(&run_dir(), listen_addr, args, log_path)
 }
 
 /// 同上，目录可指定（测试注入用）。原子写语义同 write_instance_file_in。
@@ -661,10 +673,15 @@ pub fn write_restore_file_in(
     run_dir: &std::path::Path,
     listen_addr: &str,
     args: &[String],
+    log_path: &str,
 ) -> io::Result<()> {
     std::fs::create_dir_all(run_dir)?;
     let path = restore_file_path_in(run_dir, listen_addr);
-    let json = serde_json::to_string(args).expect("序列化恢复记录失败");
+    let json = serde_json::to_string(&RestoreRecord {
+        args: args.to_vec(),
+        log_path: log_path.to_string(),
+    })
+    .expect("序列化恢复记录失败");
     let tmp = path.with_extension("restore.tmp");
     std::fs::write(&tmp, json)?;
     match std::fs::rename(&tmp, &path) {
@@ -686,11 +703,25 @@ pub fn remove_restore_file_in(run_dir: &std::path::Path, listen_addr: &str) {
     let _ = std::fs::remove_file(restore_file_path_in(run_dir, listen_addr));
 }
 
-/// 一条恢复记录：端口 + 启动参数
+/// 一条恢复记录：端口 + 启动参数 + 崩溃前那次启动的日志路径。
+/// log_path 供孤儿日志清理引用（崩溃实例的日志保留到恢复成功，作排障线索）；
+/// 前台实例无日志文件，落空串（崩溃恢复后是守护形态，新随机名）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RestoreEntry {
     pub port: String,
     pub args: Vec<String>,
+    pub log_path: String,
+}
+
+/// .restore 文件的落盘格式（结构体 JSON）。旧格式是纯 `Vec<String>`
+///（仅 args）——读侧兼容旧格式（log_path 落空串），**避免升级后首次运行
+/// 把用户有效的恢复记录当损坏删掉**；写侧一律写新格式。
+#[derive(Serialize, Deserialize)]
+struct RestoreRecord {
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    log_path: String,
 }
 
 /// 列出全部恢复记录；损坏记录直接清理。不做存活校验——记录的本义就是
@@ -713,11 +744,26 @@ pub fn list_restore_entries_in(dir: &std::path::Path) -> Vec<RestoreEntry> {
         let Some(port) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
             continue;
         };
-        let args = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|c| serde_json::from_str::<Vec<String>>(&c).ok());
-        match args {
-            Some(args) => out.push(RestoreEntry { port, args }),
+        // 新格式（RestoreRecord）优先；旧格式（纯 args 数组）宽容读出，
+        // log_path 落空串——升级混版本窗口内旧守护写的记录不能被当损坏删掉
+        let parsed = std::fs::read_to_string(&path).ok().and_then(|c| {
+            serde_json::from_str::<RestoreRecord>(&c)
+                .map(|r| RestoreEntry {
+                    port: port.clone(),
+                    args: r.args,
+                    log_path: r.log_path,
+                })
+                .or_else(|_| {
+                    serde_json::from_str::<Vec<String>>(&c).map(|args| RestoreEntry {
+                        port,
+                        args,
+                        log_path: String::new(),
+                    })
+                })
+                .ok()
+        });
+        match parsed {
+            Some(entry) => out.push(entry),
             None => {
                 let _ = std::fs::remove_file(&path);
             }
@@ -1035,6 +1081,7 @@ mod tests {
             last_error: None,
             last_error_at: 0,
             swap_phase: false,
+            log_path: String::new(),
         }
     }
 
@@ -1227,18 +1274,30 @@ mod tests {
             "--api-key".to_string(),
             "sk-test".to_string(),
         ];
-        write_restore_file_in(dir.path(), "127.0.0.1:59805", &args).unwrap();
+        write_restore_file_in(dir.path(), "127.0.0.1:59805", &args, "C:/tmp/old.log").unwrap();
         let path = restore_file_path_in(dir.path(), "127.0.0.1:59805");
         assert_eq!(path.file_name().unwrap(), "59805.restore");
 
-        // 覆盖写：同端口再次启动应以最新参数为准
+        // 覆盖写：同端口再次启动应以最新参数为准（log_path 同步覆盖）
         let args2 = vec!["--config".to_string(), "C:/tmp/new.toml".to_string()];
-        write_restore_file_in(dir.path(), "127.0.0.1:59805", &args2).unwrap();
+        write_restore_file_in(dir.path(), "127.0.0.1:59805", &args2, "C:/tmp/new.log").unwrap();
 
         let entries = list_restore_entries_in(dir.path());
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].port, "59805");
         assert_eq!(entries[0].args, args2);
+        assert_eq!(entries[0].log_path, "C:/tmp/new.log");
+
+        // 旧格式（纯 args 数组，混版本窗口内旧守护写的）宽容读出，log_path 空串
+        std::fs::write(
+            &path,
+            serde_json::to_string(&args2).expect("序列化旧格式失败"),
+        )
+        .unwrap();
+        let legacy = list_restore_entries_in(dir.path());
+        assert_eq!(legacy.len(), 1, "旧格式记录不能被当损坏清理");
+        assert_eq!(legacy[0].args, args2);
+        assert_eq!(legacy[0].log_path, "");
 
         remove_restore_file_in(dir.path(), "127.0.0.1:59805");
         assert!(!path.exists());
@@ -1258,7 +1317,7 @@ mod tests {
     fn restore_entry_without_config_is_listed() {
         // 无 --config 参数的实例（纯默认配置）也应能列出与恢复
         let dir = tempfile::tempdir().unwrap();
-        write_restore_file_in(dir.path(), "127.0.0.1:59807", &[]).unwrap();
+        write_restore_file_in(dir.path(), "127.0.0.1:59807", &[], "").unwrap();
         let entries = list_restore_entries_in(dir.path());
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].port, "59807");
@@ -1266,31 +1325,63 @@ mod tests {
     }
 
     #[test]
-    fn orphan_log_cleanup_keeps_live_pending_and_startup() {
+    fn orphan_log_cleanup_keeps_referenced_and_startup() {
+        // 新判据（引用集）：日志名随机化后不再携带归属，保留 = 活实例上报的
+        // log_path ∪ .restore 记录的 log_path ∪ startup.log；其余 .log 删除；
+        // 非 .log 文件一律不动。
         let logs = tempfile::tempdir().unwrap();
-        // 三个日志：存活实例 59811 / 待恢复（崩溃）59812 / 彻底死亡 59813；
-        // 另有 startup.log（永不按端口清理）与非数字名（防御性跳过）
-        for name in [
-            "59811.log",
-            "59812.log",
-            "59813.log",
-            "startup.log",
-            "weird.log",
-        ] {
-            std::fs::write(logs.path().join(name), "x").unwrap();
+        let live_log = logs.path().join("1f3a2b-00ab.log");
+        let crash_log = logs.path().join("5c6d7e-11cd.log");
+        let stale_log = logs.path().join("9900aa-22ef.log");
+        for path in [&live_log, &crash_log, &stale_log] {
+            std::fs::write(path, "x").unwrap();
         }
-        let live = vec![sample_info("59811")];
+        std::fs::write(logs.path().join("startup.log"), "x").unwrap();
+        std::fs::write(logs.path().join("weird.log"), "x").unwrap();
+        std::fs::write(logs.path().join("not-a-log.txt"), "x").unwrap();
+
+        let mut live = sample_info("59811");
+        live.log_path = live_log.display().to_string();
         let pending = vec![RestoreEntry {
             port: "59812".into(),
             args: vec![],
+            log_path: crash_log.display().to_string(),
         }];
-        cleanup_orphan_logs_in(logs.path(), &live, &pending);
-        for kept in ["59811.log", "59812.log", "startup.log", "weird.log"] {
-            assert!(logs.path().join(kept).exists(), "{kept} 不应被孤儿清理删除");
-        }
+        cleanup_orphan_logs_in(logs.path(), &[live], &pending);
+        assert!(live_log.exists(), "活实例引用的日志不应被删除");
+        assert!(crash_log.exists(), ".restore 引用的崩溃日志不应被删除");
         assert!(
-            !logs.path().join("59813.log").exists(),
-            "彻底死亡实例的孤儿日志应被删除"
+            logs.path().join("startup.log").exists(),
+            "startup.log 不应被孤儿清理删除"
         );
+        assert!(
+            logs.path().join("not-a-log.txt").exists(),
+            "非 .log 文件不应被删除（防御保留）"
+        );
+        assert!(!stale_log.exists(), "无引用的孤儿日志应被删除");
+
+        // 大小写/分隔符差异经 path_match_key 归一后同样引用（Windows 注册表
+        // 路径表示与 read_dir 枚举可能不同形，字面比较会误删活实例日志）
+        let logs2 = tempfile::tempdir().unwrap();
+        let mut live2 = sample_info("59811");
+        live2.log_path = logs2
+            .path()
+            .join("CaseCheck-00aa.log")
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        std::fs::write(logs2.path().join("CaseCheck-00aa.log"), "x").unwrap();
+        cleanup_orphan_logs_in(logs2.path(), &[live2], &[]);
+        assert!(
+            logs2.path().join("CaseCheck-00aa.log").exists(),
+            "归一后同一路径（分隔符差异）不应被误删"
+        );
+
+        // 空串 log_path（前台实例）不参与引用集：其旧日志按无主处理
+        let logs3 = tempfile::tempdir().unwrap();
+        let orphan = logs3.path().join("ff00aa-33ff.log");
+        std::fs::write(&orphan, "x").unwrap();
+        cleanup_orphan_logs_in(logs3.path(), &[sample_info("59811")], &[]);
+        assert!(!orphan.exists(), "空串 log_path 的实例不应保住孤儿日志");
     }
 }

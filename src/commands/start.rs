@@ -22,7 +22,12 @@ pub(crate) fn resolve_runtime_config(
     if cli.config.is_some() && !cfg_path.exists() {
         return Err(format!("指定的配置文件不存在: {}", cfg_path.display()));
     }
-    let mut cfg = load_with_cli_overrides(cli, cfg_path);
+    // 严格加载：TOML 语法错误在此明确报出——宽松版会把解析失败静默回退成
+    // 默认配置（base_url 空），下方的 validate 报错于是变成「base_url 不能
+    // 为空」，用户明明写了却被告知没写，排障方向被带偏（实测实锤）
+    let mut cfg = config::load_from_strict(cfg_path)?;
+    // CLI 覆盖在严格加载之上应用（覆盖参数不需要文件先合法）
+    cfg = apply_cli_overrides(cfg, cli);
     // settings.json 全局默认注入：toml 显式值 > settings 值 > 内置默认。
     // get_or_insert 只在 toml 未显式配置时写入 settings 值——这正是
     // 「settings 公用默认、toml 按实例覆盖」的优先级实现点。
@@ -67,10 +72,19 @@ pub(crate) fn resolve_runtime_config(
     Ok(cfg)
 }
 
-/// 宽松加载配置并应用 CLI 覆盖参数（不做校验）：启动路径与守护子进程日志
-/// 初始化共用，保证两者对 listen_addr 的认知一致（日志文件名 = 实际监听端口）。
+/// 宽松加载配置并应用 CLI 覆盖参数（不做校验）：守护子进程日志初始化共用，
+/// 保证日志解析对 listen_addr 的认知与启动路径一致（优先级 CLI --log-file、
+/// config log_file、内置随机名）。宽松版适用于日志初始化（此刻配置尚未严格
+/// 校验，解析失败仍要能解析出日志路径）；启动的严格校验路径用
+/// `load_from_strict` 加本函数。
 pub(crate) fn load_with_cli_overrides(cli: &Cli, cfg_path: &std::path::Path) -> Config {
-    let mut cfg = config::load_from(cfg_path);
+    let cfg = config::load_from(cfg_path);
+    apply_cli_overrides(cfg, cli)
+}
+
+/// 在已加载的配置上应用 CLI 覆盖参数并 normalize。启动严格路径与宽松日志
+/// 初始化路径共用，保证两者的覆盖语义一致。
+fn apply_cli_overrides(mut cfg: Config, cli: &Cli) -> Config {
     if let Some(u) = &cli.baseurl {
         cfg.base_url = u.clone();
     }

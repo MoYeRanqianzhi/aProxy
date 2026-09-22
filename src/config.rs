@@ -369,6 +369,25 @@ pub fn load() -> Config {
     load_from(&config_path())
 }
 
+/// 严格加载：文件存在但 TOML 解析失败时返回 Err（含解析错误详情），
+/// 其余语义同 `load_from`。启动路径必须用这个——宽松版会把解析失败静默
+/// 回退成默认配置（base_url 空），启动报错于是变成误导性的「base_url 不能
+/// 为空」，而用户文件里明明写了（2026-09-22 大审查实测实锤）；守护模式下
+/// 真相只存在于日志文件里，主报错带偏排障方向。
+pub fn load_from_strict(path: &std::path::Path) -> Result<Config, String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => match toml::from_str::<Config>(&content) {
+            Ok(cfg) => Ok(cfg.normalized()),
+            Err(e) => Err(format!(
+                "配置文件解析失败（TOML 语法错误）: {e}\n文件: {}",
+                path.display()
+            )),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+        Err(e) => Err(format!("读取配置文件失败: {e}\n文件: {}", path.display())),
+    }
+}
+
 /// base_url 展示打码：内嵌 userinfo（`https://user:pass@host`）时隐去密码段。
 /// 无凭据（绝大多数情况）或解析失败时原样返回。
 pub fn mask_base_url(raw: &str) -> String {
@@ -543,6 +562,33 @@ mod tests {
         let cfg = load_from(&path);
         assert!(cfg.base_url.is_empty());
         assert_eq!(cfg.listen_addr, default_listen_addr());
+    }
+
+    #[test]
+    fn strict_load_reports_syntax_error_and_accepts_missing() {
+        // 严格加载：语法错误必须报 Err（含详情）——启动路径依赖它把「toml
+        // 写坏了」与「字段缺失」区分开；文件不存在与宽松版同为默认配置。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.toml");
+        std::fs::write(
+            &path,
+            "base_url = \"https://x.example.com\"\nbroken = {unclosed",
+        )
+        .unwrap();
+        let err = load_from_strict(&path).unwrap_err();
+        assert!(err.contains("解析失败"), "{err}");
+        assert!(err.contains("unclosed"), "错误应含 TOML 解析详情: {err}");
+        assert!(err.contains(&path.display().to_string()), "{err}");
+
+        // 文件不存在：Ok(默认)——「还没写配置」不是错误（validate 再把关）
+        let missing = dir.path().join("absent.toml");
+        let cfg = load_from_strict(&missing).unwrap();
+        assert!(cfg.base_url.is_empty());
+
+        // 合法文件：与宽松版同结果
+        std::fs::write(&path, "base_url = \"https://x.example.com\"").unwrap();
+        let strict = load_from_strict(&path).unwrap();
+        assert_eq!(strict.base_url, "https://x.example.com");
     }
 
     #[test]

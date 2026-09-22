@@ -4,6 +4,36 @@
 > 2026-09-08 补录 tag 之后一轮（性能优化 + 磁盘缓存 + 重构 + skill），全部已完成。
 > 2026-09-09 第四轮审查修复 + 实测 restart bug + skill 指引优化，全部已完成。
 
+## 大审查轮（2026-09-22，用户下令「多角度审查 + 全量实测，主代理进行」）
+
+- [x] **审查 + 实测 + 两项修复闭环**：主代理逐模块亲读全部 src（proxy/server/
+  daemon/config/settings/retry/decode/util/commands 九命令）+ skill SKILL.md
+  一致性抽查。基线：fmt clean / clippy -D warnings 零警告 / 全量测试绿（首跑
+  1 项偶发失败见下条）。实测挖出并修复 2 个真 bug（1040bcc / b462d18）：
+  (1) **端口 0 实例的 .restore 按配置地址命名**——start.rs 明确支持端口 0
+  （系统分配端口），但 .restore 按配置地址写出 `0.restore` 而注册表与优雅
+  退出清理按实际端口，记录永久残留 → `aproxy restore` 把已 stop 的实例复活
+  到另一个随机端口、新实例再写 0.restore 循环残留（隔离 APROXY_HOME 实测
+  实锤：stop 后残留 → restore 复活 pid → 复活实例重写记录）。修复：按
+  actual_addr 命名与 .pid 同键，附带治好 restore 对端口 0 的就绪判定。
+  (2) **toml 语法错误以「base_url 不能为空」误导报出**——load_from 解析
+  失败静默回退默认配置，用户明明写了 base_url 却被告知没写，守护模式下
+  真相只在日志里（实测实锤）。修复：load_from_strict + 启动路径显式报
+  TOML 错误详情与文件路径。修复后：fmt/clippy/全量 258 项绿 + 两场景
+  e2e 复验通过。
+- [ ] **测试隔离债务：restore_recovers 测试写真实 run 目录**（本轮全量测试
+  首跑偶发失败的根因定性）：该测试有意用全局真实 `~/.aproxy/run`（restore
+  命令当时无隔离手段的妥协，注释已写明），守护被**生产看护者收养**
+  （adopt_scan 每 tick 扫描 run_dir 全部 .restore），行为受生产环境干扰；
+  单跑 5/5 过、全量并行首跑失败、复跑全绿。修法：改 APROXY_HOME 子进程级
+  注入隔离（`Command.env` + `restore_file_path_in` 断言，参照
+  port_zero_restore_record_uses_actual_port 的写法），幂等断言在隔离目录内
+  验证。端口 0 新测试已是隔离写法，可作模板
+- [ ] **优化候选（审查观察，非缺陷）**：`commands/mod.rs` 的
+  resolve_config_target 在 stop/logs/start 三处各有同构展开（别名分支约 20
+  行 ×3）；若第四处出现再抽公共函数（现在抽会破坏各命令报错文案的差异化）
+
+
 ## 正式发布 v0.1.0-alpha.15（2026-09-22，用户下令）
 
 - [x] **发版闭环（含一次门禁卡死与根因修复）**：tag `v0.1.0-alpha.15` 首打于

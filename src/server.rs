@@ -126,13 +126,17 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     // 自愈恢复记录：bind 成功即认为「此实例期望在运行」。记录的是启动参数
     // （从当前进程命令行取，即 start 父进程转发来的原始参数），崩溃/断电/
     // 系统重启后 aproxy restore 据此一键拉起；优雅退出时删除。前台实例也写
-    // （前台被终端关闭属非正常退出，恢复合理）。
+    // （前台被终端关闭属非正常退出，恢复合理）。**必须按 actual_addr 命名**
+    // （与注册表 .pid 同键）：listen_addr 配置为端口 0 时实际端口由系统分配，
+    // 按配置地址命名会写出 `<配置端口>.restore`（如 `0.restore`），优雅退出
+    // 按实际端口清理删不到它——记录永久残留，`aproxy restore` 会把用户已
+    // stop 的实例复活到另一个随机端口（2026-09-22 大审查实测实锤）。
     let restore_args: Vec<String> = {
         let mut v: Vec<String> = std::env::args().skip(1).collect();
         v.retain(|a| a != "--daemon-child" && a != "--foreground");
         v
     };
-    if let Err(e) = daemon::write_restore_file(&listen_addr, &restore_args, &info.log_path) {
+    if let Err(e) = daemon::write_restore_file(&actual_addr, &restore_args, &info.log_path) {
         tracing::warn!(error = %e, "自愈恢复记录写入失败（不影响代理功能）");
     }
 

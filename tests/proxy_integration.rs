@@ -3322,6 +3322,92 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     }
 }
 
+/// 端口 0（系统分配端口）的恢复记录必须按**实际端口**命名（与 .pid 同键）。
+/// 曾按配置地址命名写出 `0.restore`：优雅退出按实际端口清理删不到它——
+/// 记录永久残留，`aproxy restore` 会把用户已 stop 的实例复活到另一个随机
+/// 端口（2026-09-22 大审查实测实锤：残留 → restore 复活 → 新实例再写
+/// 0.restore 的循环）。隔离：APROXY_HOME 注入 start 父进程，守护隔代继承
+/// （spawn_detached 走环境继承链），run/logs 全部落在 tempdir。
+#[test]
+fn port_zero_restore_record_uses_actual_port() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let cfg_file = home.join("p0.toml");
+    std::fs::write(
+        &cfg_file,
+        "base_url = \"https://p0-test.example.com\"\nlisten_addr = \"127.0.0.1:0\"\n",
+    )
+    .unwrap();
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+    // 端口 0 时 start 父进程跳过就绪等待（实际端口未知），直接返回
+    let out = Command::new(exe)
+        .env("APROXY_HOME", home)
+        .args(["start", "--config"])
+        .arg(&cfg_file)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "start 应成功: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 实际端口从注册表发现；恢复记录与注册表同键（实际端口）且先后落盘
+    //（先 .pid 后 .restore），轮询 .restore 出现即同时证明两者就位
+    let run_dir = home.join("run");
+    let mut info = None;
+    for _ in 0..100 {
+        if let Ok(entries) = std::fs::read_dir(&run_dir) {
+            let record = entries
+                .flatten()
+                .find(|e| e.path().extension().and_then(|x| x.to_str()) == Some("restore"));
+            if let Some(record) = record {
+                let pid_path = record.path().with_extension("pid");
+                info = Some((
+                    serde_json::from_str::<aproxy::daemon::InstanceInfo>(
+                        &std::fs::read_to_string(&pid_path).unwrap(),
+                    )
+                    .unwrap(),
+                    record.path(),
+                ));
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (info, restore_path) = info.expect("端口 0 实例的恢复记录未出现");
+    let port = aproxy::daemon::port_of(&info.listen_addr).to_string();
+    assert_ne!(port, "0", "实际端口应为系统分配值");
+    assert_eq!(
+        restore_path.file_name().unwrap().to_string_lossy(),
+        format!("{port}.restore"),
+        "恢复记录必须按实际端口 {port} 命名"
+    );
+    assert!(
+        !run_dir.join("0.restore").exists(),
+        "不得按配置端口写出 0.restore"
+    );
+
+    let _guard = DaemonGuard {
+        exe,
+        port: port.parse().unwrap(),
+        home_dir: Some(home.to_path_buf()),
+    };
+
+    // 优雅停止后记录必须消失——「残留 + 复活」缺陷的回归断言
+    let out = Command::new(exe)
+        .env("APROXY_HOME", home)
+        .args(["stop", &port])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stop 应成功: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(!restore_path.exists(), "优雅停止后恢复记录应被删除");
+}
+
 // ---------------------------------------------------------------------------
 // 29. 配置别名：alias add → start <别名> → stop <别名> 端到端
 //

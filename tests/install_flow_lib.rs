@@ -26,6 +26,24 @@ fn free_port() -> u16 {
     panic!("200 次内未找到可用端口");
 }
 
+/// Windows 接力交棒：continue_install 返回 `HandedOver` 时状态文件**留给
+/// 接棒者**继续完成，命令返回 ≠ 完成——轮询等待其收敛（接棒者要做完整
+/// 交换 + 滚动重启，窗口给足 90s）。此前测试在交棒返回后立即断言状态
+/// 文件已删，windows-latest 上高概率走进交棒分支而确定性失败——
+/// alpha.12 / alpha.15 两次发版被它卡住 Release 的 test 门禁（留档预警
+/// 应验后才定位到真正根因：不是超时竞态，是 HandedOver 语义未被测试跟上）。
+async fn wait_handed_over_done(run_dir: &std::path::Path, exit: &aproxy::install::flow::FlowExit) {
+    if matches!(exit, aproxy::install::flow::FlowExit::HandedOver) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        while aproxy::install::state::state_path_in(run_dir).exists() {
+            if std::time::Instant::now() > deadline {
+                panic!("交棒后接棒者 90s 未完成（install.state 仍在）");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn continue_from_restarting_reclaims_instance() {
     let _guard = LIVE_TEST_LOCK.lock().await;
@@ -164,9 +182,12 @@ async fn continue_from_restarting_reclaims_instance() {
                 aproxy::install::state::load_in(&run_dir).map(|s| s.phase)
             );
         }
-        Ok(Ok(exit)) => println!("continue_install 完成: {exit:?}，耗时 {:?}", t0.elapsed()),
+        Ok(Ok(exit)) => {
+            wait_handed_over_done(&run_dir, &exit).await;
+            println!("continue_install 完成: {exit:?}，耗时 {:?}", t0.elapsed());
+        }
     }
-    // 终态：state 清理
+    // 终态：state 清理（Completed 直接删；HandedOver 经上方等待接棒者收敛）
     assert!(
         !aproxy::install::state::state_path_in(&run_dir).exists(),
         "done 后状态文件应删除"
@@ -268,9 +289,10 @@ async fn continue_from_swapping_with_live_instance_redoes_swap() {
         let cur = aproxy::install::state::load_in(&run_dir).map(|s| format!("{:?}", s.phase));
         panic!("swapping 有实例续作 90s 未返回（phase={cur:?}）");
     }
-    result
+    let exit = result
         .expect("swapping 有实例续作应完成")
         .expect("swapping 有实例续作不应报错");
+    wait_handed_over_done(&run_dir, &exit).await;
     assert!(
         !aproxy::install::state::state_path_in(&run_dir).exists(),
         "done 后状态文件应删除"

@@ -256,7 +256,7 @@
   `.agents/docs/environment.md` / 本文件「WSL 无 git/curl/python3 且有 TLS 故障」
 - [ ] **测试稳定性**：proxy_integration 的 alias_start_and_stop_roundtrip
   偶发并行失败（单跑必过——端口/时序竞争，本轮全量跑撞上一次）
-- [ ] **测试稳定性（新，有本机复现）**：`install_flow_lib` 的
+- [x] **测试稳定性（新，有本机复现）**：`install_flow_lib` 的
   `continue_from_swapping_with_live_instance_redoes_swap` 是**既有竞态偶发**——
   2026-09-14 本机隔离重复 5 次**复现 1 次失败**（第 2 次耗时 90.33 秒，撞测试
   内部 90 秒超时；CI 那次是同一测试的 `done 后状态文件应删除` 断言，症状不同但
@@ -264,6 +264,15 @@
   全绿。**注意它会卡住 Release 的 test 门禁（跑在 windows-latest）**，
   值得专项排查：疑似「活实例滚动重启 + 状态文件删除」这条路径在 Windows 上有
   时序/句柄竞争（Windows 上删除被打开的文件会失败）。
+  **2026-09-22 应验并已修复**：alpha.15 发版时 CI 实锤卡门禁——Release run
+  35725451213 连续两次失败于同一断言（2.63s/2.95s 快速失败，非超时），build/
+  publish 全 skipped。定位到真正根因：**不是超时竞态，是 Windows 接力交棒
+  （FlowExit::HandedOver）语义未被测试跟上**——continue_install 交棒返回时
+  状态文件留给接棒者，测试却立即断言「已删除」；windows-latest 高概率走进
+  交棒分支故确定性失败，本机时好时坏（时序决定走不走交棒）。修复：测试对
+  HandedOver 轮询等待接棒者收敛（90s 窗口）。发版后记：正式 tag 发布失败
+  且 publish 未跑时删 tag 重打是安全操作（crates.io/npm 无该版本记录）。
+  **待办消除**（竞态不再是谜，根因闭环）。
 - [x] **渠道 P0 全配 + 可信发布自动化**（2026-09-11，alpha.7~9 三轮发布实测）：
   npm（@meowo/aproxy，esbuild 式多平台包：主包 JS 转发器 + 9 平台子包
   os/cpu/libc 装配）、crates.io（aproxy）、cargo-binstall（零配置命中内置

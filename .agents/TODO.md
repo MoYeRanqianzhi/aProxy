@@ -4,6 +4,21 @@
 > 2026-09-08 补录 tag 之后一轮（性能优化 + 磁盘缓存 + 重构 + skill），全部已完成。
 > 2026-09-09 第四轮审查修复 + 实测 restart bug + skill 指引优化，全部已完成。
 
+## 正式发布 v0.1.0-alpha.16（2026-09-23，用户下令）
+
+- [x] **发版闭环（含 rustls 收口）**：推送 master（大审查第二轮两修复
+  4c5019f/c72499a）→ bump 提交 32ca65a（**rustls 0.23.44 → 0.23.45，
+  RUSTSEC-2026-0285 收口完成**——修补版本 >= 0.23.45，Review workflow 的
+  cargo-deny 随此转绿；compatibility.md 同步 alpha.16 关键行为节）→
+  annotated tag `v0.1.0-alpha.16` 打于 bump 提交 → Release run
+  35827137289 **一次全绿**（test 门禁/skills/11 变体 build/release/publish，
+  共 14 job）。三渠道验证：GitHub Release（prerelease，26 资产：11 变体 +
+  sha256 + skill 双包）、npm latest=0.1.0-alpha.16（publish 日志 provenance
+  实证 sigstore logIndex=2916523006 + dist-tags 复核）、crates.io
+  max_version=newest=0.1.0-alpha.16。CI：windows/ubuntu 绿，macOS 红为既有
+  留档项。rustls 收口待办消除（本条与下方 alpha.15 节的 rustls 待办）。
+- [x] **rustls 依赖升级收口**：见上条——alpha.16 随发版生效。
+
 ## 大审查第二轮（2026-09-23，用户下令同款「多角度审查 + 全量实测，主代理进行」）
 
 - [x] **审查 + 实测 + 一项行为修复 + 五处文档漂移修复**：主代理亲读上轮未
@@ -73,10 +88,7 @@
   latest=0.1.0-alpha.15（publish 日志 provenance 实证 + 传播后 dist-tags
   复核）、crates.io max_version=newest=0.1.0-alpha.15。CI：windows/ubuntu
   绿，macOS 红为既有留档项。
-- [ ] **rustls 依赖升级收口**（发版后事项）：cargo-deny 报
-  RUSTSEC-2026-0285（rustls 0.23.44，TLS 1.3 握手消息跨加密级别边界），
-  Review workflow 因此历史全红——`cargo update -p rustls` 到已修补版即可，
-  下个版本随发版生效
+  （原「rustls 依赖升级收口」待办已在 alpha.16 完成，见上节。）
 
 ## 日志随机命名 + IPC 上报（2026-09-22，用户定调三点）
 

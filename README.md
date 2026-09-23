@@ -136,7 +136,7 @@ listen_addr = "127.0.0.1:12345"          # 本地监听
 ## 开发
 
 ```powershell
-cargo test --locked           # 全量测试（当前基线 232 项：159 lib + 4 bin + 69 集成）
+cargo test --locked           # 全量测试（当前基线 259 项：169 lib + 4 bin + 86 集成）
 cargo clippy --all-targets --locked -- -D warnings   # 必须零警告（项目纪律）
 cargo fmt --all -- --check
 ```

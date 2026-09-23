@@ -167,7 +167,7 @@ fields — program-managed).
 ## Development
 
 ```sh
-cargo test --locked                                # full suite (232 tests: 159 lib + 4 bin + 69 integration)
+cargo test --locked                                # full suite (259 tests: 169 lib + 4 bin + 86 integration)
 cargo clippy --all-targets --locked -- -D warnings # must be warning-free (project rule)
 cargo fmt --all -- --check
 ```

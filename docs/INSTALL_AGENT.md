@@ -124,7 +124,7 @@ troubleshooting — read it before improvising CLI flags.
 | Start fails: permission / reserved range | Hyper-V/WinNAT excluded range — pick another port |
 | Start fails: other | read `~/.aproxy/logs/startup.log` |
 | Client sees timeouts during long retries | non-streaming requests have no keepalive channel; raise client timeout |
-| Everything else | `aproxy status`, instance logs `~/.aproxy/logs/<port>.log` |
+| Everything else | `aproxy status`, then `aproxy logs <port>` — log files are randomly named per start; never guess them by port |
 
 The full reference lives in the skill docs (step 5) or
 [docs/](https://github.com/MoYeRanqianzhi/aProxy/tree/main/docs).

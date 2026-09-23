@@ -17,7 +17,8 @@ pub(crate) struct Cli {
     pub(crate) config: Option<PathBuf>,
 
     /// 前台运行（日志输出到控制台，Ctrl+C 停止）；默认在后台运行，
-    /// 日志写 ~/.aproxy/logs/<端口>.log，用 `aproxy status`/`aproxy stop` 管理
+    /// 日志按启动时刻随机命名写 ~/.aproxy/logs/ 下，实际路径以
+    /// `aproxy status`/`aproxy logs` 经 IPC 获取为准
     #[arg(long)]
     pub(crate) foreground: bool,
 

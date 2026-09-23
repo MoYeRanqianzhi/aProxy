@@ -4,6 +4,33 @@
 > 2026-09-08 补录 tag 之后一轮（性能优化 + 磁盘缓存 + 重构 + skill），全部已完成。
 > 2026-09-09 第四轮审查修复 + 实测 restart bug + skill 指引优化，全部已完成。
 
+## 大审查第二轮（2026-09-23，用户下令同款「多角度审查 + 全量实测，主代理进行」）
+
+- [x] **审查 + 实测 + 一项行为修复 + 五处文档漂移修复**：主代理亲读上轮未
+  深读面——watchdog.rs 全文（选举/收养/挂死/退避/install 差异化全链自洽；
+  上轮端口 0 修复恰好补齐 watchdog respawn 链——死亡事件的 port 本就是
+  actual_addr）、install 全家约 3200 行（state/announce/broadcast/staging/
+  swap/restart/skills/flow/download×4 + commands/install.rs——状态机/续作/
+  校验矩阵/路径穿越防护严密）、cli/main/lib/find、skill 五文件全量、docs
+  文档树全量。基线 fmt/clippy 零警告/全量测试绿。e2e（隔离 APROXY_HOME）：
+  上轮两修复复验通过（toml 语法错误显式报出行号；端口 0 实例 .pid/.restore
+  同键实际端口、stop 后 run 目录全空、restore 幂等）+ 命令面冒烟（status/
+  logs/stop/alias/doctor/find/config --show）。
+  实测挖出并修复：**config 命令对「显式 --config 指向的不存在文件」静默回退
+  默认值**——--show 把内置默认当「当前配置」且抬头是用户给的路径（实测实锤，
+  与 b462d18 同族）。修复为**读写分界**：纯读（--show/无修改参数）报错退出；
+  写操作保留「--config 新路径 + 修改参数 = 创建新配置」的多开工作流（既有
+  测试 cli_config_flag_scopes_config_subcommand 固化的合法场景——首轮修复
+  一概拒绝曾误伤它，被全量测试当场拦下后收敛为分界语义）。新增回归测试
+  cli_config_show_rejects_missing_explicit_file。修复后全量 259 项全绿。
+  文档漂移五处同批修复：cli.rs --foreground 帮助文本仍写「日志写
+  <端口>.log」（随机命名前旧语义，用户可见于 --help）；settings-json.md
+  字段总表把 watchdog_idle_exit_secs/download_chain/skill_auto_update/
+  download_proxy 四字段挤一行（类型/默认值列失真）；README 双语测试基线
+  数字过时（232→259）；architecture.md 模块表「十个子命令」漏 install；
+  INSTALL_AGENT.md 排障表残留「logs/<port>.log」按端口拼路径旧指引。全仓
+  grep 确认无同类残留。
+
 ## 大审查轮（2026-09-22，用户下令「多角度审查 + 全量实测，主代理进行」）
 
 - [x] **审查 + 实测 + 两项修复闭环**：主代理逐模块亲读全部 src（proxy/server/

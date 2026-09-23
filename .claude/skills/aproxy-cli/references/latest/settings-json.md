@@ -33,7 +33,10 @@
 | `watchdog_heartbeat_secs` | u64 | 30 | 看护扫描周期（调优） |
 | `watchdog_stale_after_cycles` | u64 | 1 | 挂死容忍周期数（误杀调节阀） |
 | `watchdog_max_restarts` | u32 | 5 | crashloop 放弃上限 |
-| `watchdog_idle_exit_secs`、`download_chain`、`skill_auto_update`、`download_proxy` | u64 | 300 | 闲置自灭等待；0=常驻 |
+| `watchdog_idle_exit_secs` | u64 | 300 | 闲置自灭等待；0=常驻 |
+| `download_chain` | array | 内置默认链 | install 下载链条（严格数组语义） |
+| `skill_auto_update` | bool | true | install 时并行更新 skill 文档 |
+| `download_proxy` | string? | 无 | install 下载专用代理（≠ 请求代理） |
 
 ## 各字段语义
 

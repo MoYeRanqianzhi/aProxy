@@ -2717,6 +2717,31 @@ fn cli_config_flag_scopes_config_subcommand() {
     );
 }
 
+#[test]
+fn cli_config_show_rejects_missing_explicit_file() {
+    // 与写操作对照：--show / 无修改参数对「显式 --config 指向的不存在文件」
+    // 必须报错——此时展示的只是内置默认值（抬头却是用户给的路径），静默回退
+    // 是纯粹的排障误导（实测：打错路径看到的是默认配置而非报错）。写操作
+    // 不在此限（上一测试固化的「--config 新路径 + 修改参数 = 创建新配置」）。
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("nope.toml");
+    let out = Command::new(env!("CARGO_BIN_EXE_aproxy"))
+        .arg("--config")
+        .arg(&missing)
+        .args(["config", "--show"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "--show 对不存在的显式 --config 必须报错（而非静默展示默认值）"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("不存在"),
+        "stderr 应提示文件不存在，实际: {stderr}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 22-24 守护进程测试公共设施
 //

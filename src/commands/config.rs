@@ -20,7 +20,7 @@ fn warn_if_config_broken(path: &std::path::Path) {
     }
 }
 
-pub(crate) fn handle_config_cmd(path: PathBuf, args: ConfigArgs) {
+pub(crate) fn handle_config_cmd(path: PathBuf, args: ConfigArgs, explicit_config: bool) {
     let ConfigArgs {
         baseurl,
         listen,
@@ -191,6 +191,14 @@ pub(crate) fn handle_config_cmd(path: PathBuf, args: ConfigArgs) {
     }
 
     if show || !changed {
+        // 显式 --config 指向的文件不存在时，展示的只是内置默认值（抬头却是
+        // 用户给的路径）——纯粹的排障误导，报错而非静默回退。写操作不受此限：
+        // --config 指向新路径 + 修改参数是「创建新实例配置」的合法入口（多开
+        // 工作流）；默认路径豁免：首配场景就是在尚不存在的 config.toml 上创建。
+        if explicit_config && !path.is_file() {
+            eprintln!("指定的配置文件不存在: {}", path.display());
+            std::process::exit(1);
+        }
         // 重新加载以展示最终值
         warn_if_config_broken(&path);
         let cfg = config::load_from(&path).normalized();

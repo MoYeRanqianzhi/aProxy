@@ -263,6 +263,22 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
             "仅转发模式已启用：请求体与响应均不缓冲、不重试（上游失败直接 502、响应流中断直接截断）；disk_cache / spool_limit_mb / keepalive_interval_secs / max_retry_backoff_secs 在本模式下不生效"
         );
     }
+    // 外部转换器改变了「原样透传」的承诺，启动时必须显式留痕：请求/响应将
+    // 交给 format 程序改写，两侧失败语义不同（请求 502 不重试、响应透传）
+    for (name, t) in [
+        ("request", &state.config.request_transform),
+        ("response", &state.config.response_transform),
+    ] {
+        if let Some(t) = t {
+            tracing::info!(
+                direction = name,
+                command = %t.command,
+                mode = ?t.mode,
+                pool_max = t.effective_pool_max(),
+                "外部转换器已启用（信封协议交给外部 format 程序改写）"
+            );
+        }
+    }
     if !daemon_child {
         println!("aProxy 已启动（前台）");
         println!("  监听: http://{actual_addr}");

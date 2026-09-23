@@ -21,6 +21,86 @@ pub const DEFAULT_DISK_CACHE: bool = true;
 /// 仅转发模式的内置默认值（关）。语义与代价见 Config::forward_only——
 /// 开启即放弃本产品最核心的重试保障，故默认必须为关。
 pub const DEFAULT_FORWARD_ONLY: bool = false;
+/// 外部转换器持续模式池上限的内置默认值（`pool_max` 未配置时生效）。
+/// 转换是「改 JSON 结构」微秒级操作，小池即可撑高并发；默认 4。
+pub const DEFAULT_TRANSFORM_POOL_MAX: u32 = 4;
+/// 外部转换器持续模式 worker 空闲回收的内置默认值（秒，`idle_timeout_secs`
+/// 未配置时生效）。0 = 永不回收（worker 跟随实例生命周期）。
+pub const DEFAULT_TRANSFORM_IDLE_TIMEOUT_SECS: u64 = 300;
+/// 外部转换器单请求转换超时的内置默认值（秒，`timeout_secs` 未配置时生效）。
+/// 转换耗时极低，30s 已极宽裕；0 = 不限。
+pub const DEFAULT_TRANSFORM_TIMEOUT_SECS: u64 = 30;
+
+/// 外部转换器的运行模式（`request_transform`/`response_transform` 的 `mode`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransformMode {
+    /// 每请求一次性 spawn（默认）：请求时启动进程、写一行信封、读一行回信、
+    /// 进程退出。任何能读写 stdin/stdout 的程序都可用，无需循环支持。
+    #[default]
+    Spawn,
+    /// 持续进程池：worker 进程以 `while` 循环逐行处理（一次一个请求、输入
+    /// 输出有序），按需扩容至 `pool_max`，空闲超时回收。聚合类 format
+    /// （轮换/计数状态在进程内存）必须用本模式。
+    Persistent,
+}
+
+/// 外部转换器配置（`request_transform` / `response_transform` 各一份）。
+/// 指向外部 format 程序：stdin 收一行 JSON 信封、stdout 回一行 JSON 信封。
+/// 信封契约见 aproxy-envelope crate；format 编写指南见 aproxy-format skill。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransformConfig {
+    /// format 程序命令（必填非空，validate 拦截）。不走 shell，直接按
+    /// argv 数组执行——无注入面。相对路径按 PATH/工作目录解析，官方示例
+    /// 推荐写绝对路径（如 `~/.aproxy/bin/aproxy-format`）。
+    pub command: String,
+    /// format 程序参数（如官方示例的 `["run", "--config", "...toml"]`）。
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// 运行模式。默认 spawn（一次性）；聚合类 format 必须 persistent。
+    #[serde(default)]
+    pub mode: TransformMode,
+    /// persistent 模式池上限（并发 worker 数，超限排队）。未配置取
+    /// `DEFAULT_TRANSFORM_POOL_MAX`（4）；spawn 模式无意义。
+    #[serde(default)]
+    pub pool_max: Option<u32>,
+    /// persistent 模式 worker 空闲回收秒数。0 = 永不回收。未配置取
+    /// `DEFAULT_TRANSFORM_IDLE_TIMEOUT_SECS`（300）；spawn 模式无意义。
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+    /// 单请求转换超时秒数。0 = 不限。未配置取
+    /// `DEFAULT_TRANSFORM_TIMEOUT_SECS`（30）。超时的 worker 不可信
+    /// （可能仍在消化旧输入），kill 后剔除。
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// 原样透传进信封 `extra` 字段的字符串（格式无要求，format 自解）。
+    /// 官方示例用它传聚合配置文件路径。
+    #[serde(default)]
+    pub extra: Option<String>,
+}
+
+impl TransformConfig {
+    /// 池上限生效值（persistent 模式；未配置回退内置默认）。
+    pub fn effective_pool_max(&self) -> u32 {
+        self.pool_max.unwrap_or(DEFAULT_TRANSFORM_POOL_MAX).max(1)
+    }
+
+    /// 空闲回收生效值（秒；未配置回退内置默认，0 = 永不）。
+    pub fn effective_idle_timeout_secs(&self) -> u64 {
+        self.idle_timeout_secs
+            .unwrap_or(DEFAULT_TRANSFORM_IDLE_TIMEOUT_SECS)
+    }
+
+    /// 单请求转换超时生效值（秒；未配置回退内置默认，0 = 不限）。
+    pub fn effective_timeout_secs(&self) -> u64 {
+        self.timeout_secs.unwrap_or(DEFAULT_TRANSFORM_TIMEOUT_SECS)
+    }
+
+    /// 信封 `extra` 生效值（未配置 = 空字符串）。
+    pub fn effective_extra(&self) -> &str {
+        self.extra.as_deref().unwrap_or("")
+    }
+}
 
 /// 配置文件内容
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +194,20 @@ pub struct Config {
     /// 默认，内置空）。
     #[serde(default)]
     pub bounded_retry_paths: Option<Vec<String>>,
+    /// 请求转换器（外部 format 程序）：请求体缓冲完成后交给它改写
+    /// （body/headers/url/method），重试全程重放转换后的产物。
+    /// **失败语义**：转换失败（进程崩溃/超时/error 行）→ 502 + 原因，不重试
+    /// （确定性失败）。与 forward_only 互斥（后者不缓冲请求体，转换器需要
+    /// 全量 body）——共存时 validate() 启动报错。仅 toml 每实例配置，无
+    /// settings.json 全局默认层（设计决策：转换是场景特定功能）。
+    #[serde(default)]
+    pub request_transform: Option<TransformConfig>,
+    /// 响应转换器（外部 format 程序）：重试判定为「成功」后、回放前交给它
+    /// 改写响应 body/headers。**失败语义**：转换失败 → 透传上游原始响应 +
+    /// warn（响应已在手，可用性优先）——与请求侧的 502 语义不同，各按其性质。
+    /// 仅 toml 每实例配置。
+    #[serde(default)]
+    pub response_transform: Option<TransformConfig>,
     /// 守护日志文件路径（自定义去向）：不设时写入 `~/.aproxy/logs/` 下按启动
     /// 时刻随机命名的文件（文件名不含端口——端口是易变标识，换端口重启后
     /// 日志照样按实例连续可查，实际路径由实例经 IPC 上报，客户端不拼路径）。
@@ -186,6 +280,8 @@ impl Default for Config {
             disk_cache: None,
             forward_only: None,
             bounded_retry_paths: None,
+            request_transform: None,
+            response_transform: None,
             log_file: None,
             spool_dir_override: None,
         }
@@ -245,6 +341,9 @@ impl Config {
             .take()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        // 转换器：command 统一 trim，trim 后为空视为未配置（与代理空白语义一致）
+        self.request_transform = trim_transform_command(self.request_transform.take());
+        self.response_transform = trim_transform_command(self.response_transform.take());
         self
     }
 
@@ -281,6 +380,31 @@ impl Config {
                 // 错误消息回填 toml 会得到语义不同的正则）
                 format!("bounded_retry_paths 含非法正则 \"{p}\": {e}")
             })?;
+        }
+        // 转换器：command 非空；persistent 模式 pool_max >= 1；与 forward_only
+        // 互斥（后者不缓冲请求体，转换器需要全量 body——两者同开是配置矛盾）
+        for (name, t) in [
+            ("request_transform", &self.request_transform),
+            ("response_transform", &self.response_transform),
+        ] {
+            let Some(t) = t else { continue };
+            if t.command.trim().is_empty() {
+                return Err(format!("{name} 的 command 不能为空"));
+            }
+            if t.mode == TransformMode::Persistent {
+                let pm = t.pool_max.unwrap_or(DEFAULT_TRANSFORM_POOL_MAX);
+                if pm == 0 {
+                    return Err(format!("{name} 的 pool_max 必须 >= 1，当前值: {pm}"));
+                }
+            }
+        }
+        if self.forward_only_enabled()
+            && (self.request_transform.is_some() || self.response_transform.is_some())
+        {
+            return Err(
+                "forward_only 与外部转换器互斥：forward_only 不缓冲请求体，转换器需要全量 body（两者只能留一个）"
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -351,6 +475,15 @@ impl Config {
     pub fn compile_bounded_retry_pattern(pattern: &str) -> Result<regex::Regex, regex::Error> {
         regex::Regex::new(&format!("^(?:{pattern})$"))
     }
+}
+
+/// 转换器 command 归一化：trim；trim 后为空 = 配置视为未设置（None）。
+fn trim_transform_command(t: Option<TransformConfig>) -> Option<TransformConfig> {
+    t.map(|mut t| {
+        t.command = t.command.trim().to_string();
+        t
+    })
+    .filter(|t| !t.command.is_empty())
 }
 
 /// 返回配置文件路径：`~/.aproxy/config.toml`。
@@ -1048,5 +1181,171 @@ mod tests {
         assert_eq!(loaded.proxy, cfg.proxy);
         assert_eq!(loaded.proxy_username, cfg.proxy_username);
         assert_eq!(loaded.proxy_password, cfg.proxy_password);
+    }
+
+    #[test]
+    fn transform_config_defaults_and_effective_values() {
+        // 未配置的池/空闲/超时参数回退 DEFAULT_* 常量；0 值显式配置原样保留
+        // （语义由消费方解释：idle 0=永不回收、timeout 0=不限）
+        let t = TransformConfig {
+            command: "aproxy-format".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(t.mode, TransformMode::Spawn);
+        assert_eq!(t.effective_pool_max(), DEFAULT_TRANSFORM_POOL_MAX);
+        assert_eq!(
+            t.effective_idle_timeout_secs(),
+            DEFAULT_TRANSFORM_IDLE_TIMEOUT_SECS
+        );
+        assert_eq!(t.effective_timeout_secs(), DEFAULT_TRANSFORM_TIMEOUT_SECS);
+        assert_eq!(t.effective_extra(), "");
+
+        let t = TransformConfig {
+            command: "f".to_string(),
+            pool_max: Some(8),
+            idle_timeout_secs: Some(0),
+            timeout_secs: Some(0),
+            extra: Some("{\"keys\":[\"a\"]}".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(t.effective_pool_max(), 8);
+        assert_eq!(t.effective_idle_timeout_secs(), 0);
+        assert_eq!(t.effective_timeout_secs(), 0);
+        assert_eq!(t.effective_extra(), "{\"keys\":[\"a\"]}");
+    }
+
+    #[test]
+    fn transform_config_toml_roundtrip_and_legacy_default() {
+        // toml 往返：mode 字符串、args、extra 均保真；旧配置（无字段）读出 None
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.toml");
+        let raw = concat!(
+            "base_url = \"https://api.example.com\"\n",
+            "[request_transform]\n",
+            "command = \"aproxy-format\"\n",
+            "args = [\"run\", \"--config\", \"agg.toml\"]\n",
+            "mode = \"persistent\"\n",
+            "pool_max = 8\n",
+            "extra = \"{\\\"keys\\\":[\\\"k1\\\"]}\"\n",
+        );
+        std::fs::write(&path, raw).unwrap();
+        let loaded = load_from(&path);
+        let rt = loaded
+            .request_transform
+            .as_ref()
+            .expect("应读出 request_transform");
+        assert_eq!(rt.command, "aproxy-format");
+        assert_eq!(
+            rt.args,
+            vec![
+                "run".to_string(),
+                "--config".to_string(),
+                "agg.toml".to_string()
+            ]
+        );
+        assert_eq!(rt.mode, TransformMode::Persistent);
+        assert_eq!(rt.effective_pool_max(), 8);
+        assert!(rt.extra.as_deref().unwrap_or("").contains("k1"));
+        assert!(
+            loaded.response_transform.is_none(),
+            "未配置的 response_transform 应为 None"
+        );
+
+        // 旧配置文件（无两字段）：读出 None（升级安全）
+        std::fs::write(&path, "base_url = \"https://api.example.com\"").unwrap();
+        let legacy = load_from(&path);
+        assert!(legacy.request_transform.is_none());
+        assert!(legacy.response_transform.is_none());
+    }
+
+    #[test]
+    fn normalized_blank_transform_command_becomes_none() {
+        // command 纯空白 = 配置视为未设置；有值则 trim 保留
+        let cfg = Config {
+            base_url: "https://api.example.com".to_string(),
+            request_transform: Some(TransformConfig {
+                command: "  ".to_string(),
+                ..Default::default()
+            }),
+            response_transform: Some(TransformConfig {
+                command: "  aproxy-format  ".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .normalized();
+        assert!(cfg.request_transform.is_none());
+        assert_eq!(
+            cfg.response_transform.as_ref().unwrap().command,
+            "aproxy-format"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_transform_without_command() {
+        let cfg = Config {
+            base_url: "https://api.example.com".to_string(),
+            request_transform: Some(TransformConfig {
+                command: String::new(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("request_transform"), "错误应指明字段: {err}");
+        assert!(err.contains("command"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_persistent_pool_max_zero() {
+        let cfg = Config {
+            base_url: "https://api.example.com".to_string(),
+            request_transform: Some(TransformConfig {
+                command: "f".to_string(),
+                mode: TransformMode::Persistent,
+                pool_max: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("pool_max"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_forward_only_with_transform() {
+        // 互斥：forward_only 不缓冲请求体，转换器需要全量 body——同开是配置矛盾，
+        // 必须启动即报错而非静默丢弃其一
+        for name in ["request", "response"] {
+            let cfg = Config {
+                base_url: "https://api.example.com".to_string(),
+                forward_only: Some(true),
+                request_transform: (name == "request").then(|| TransformConfig {
+                    command: "f".to_string(),
+                    ..Default::default()
+                }),
+                response_transform: (name == "response").then(|| TransformConfig {
+                    command: "f".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.contains("互斥"),
+                "{name} 转换器 + forward_only 应报互斥: {err}"
+            );
+        }
+
+        // 互不共存单开各侧均合法
+        let cfg = Config {
+            base_url: "https://api.example.com".to_string(),
+            request_transform: Some(TransformConfig {
+                command: "f".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 }

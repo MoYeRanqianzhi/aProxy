@@ -1,3 +1,11 @@
+# workspace 三成员：aproxy（本包）/ aproxy-format（官方示例 format 二进制）/
+# aproxy-envelope（信封契约 crate，两二进制共同类型单源维护）。
+# 三包依赖树完全隔离——aproxy-format 的 switchyard-translation 不会进入 aproxy
+# 的编译闭包，「aproxy 本体体积不受影响」由此保证。
+[workspace]
+members = [".", "aproxy-envelope", "aproxy-format"]
+resolver = "3"
+
 [package]
 name = "aproxy"
 version = "0.1.0-alpha.16"
@@ -54,6 +62,10 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # 命中的请求失败达尝试上限即透传。纯正则引擎，无 C 依赖，musl/aarch64
 # 交叉编译与 CI 不受影响。
 regex = "1"
+# 外部转换器信封契约（src/transform.rs）：与 aproxy-format 二进制共同类型
+# 单源维护（workspace 成员），path 依赖不进 crates.io 发布（publish 时换
+# version 依赖，见 release 说明）
+aproxy-envelope = { version = "0.1.0", path = "aproxy-envelope" }
 # 响应体检查用解码器（src/decode.rs）：把压缩响应解出一份副本供「错误判定 +
 # 日志预览」使用——转发给客户端的字节始终是上游原样，本模块不参与转发路径。
 # 两者均为**纯 Rust**实现（无 C 依赖，故 musl/aarch64 交叉编译与 CI 各平台不受

@@ -1,0 +1,32 @@
+[package]
+name = "aproxy-format"
+version = "0.1.0"
+# 官方示例 format 二进制：协议转换（switchyard-translation）+ apikey 轮询/
+# 加权轮询 + 多模型多渠道聚合。版本独立于 aproxy 的 alpha 线——它稳定后
+# 几乎不更新（只是示例，别的功能用户直接让 agent 配置），单独发 Release
+# （独立 tag 触发 release-format workflow）。
+edition = "2024"
+rust-version = "1.88"
+description = "Official example format program for aproxy: protocol conversion, key rotation, and multi-channel aggregation"
+license = "MIT"
+authors = ["aProxy Contributors"]
+repository = "https://github.com/MoYeRanqianzhi/aProxy"
+keywords = ["aproxy", "format", "llm", "proxy"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+# 协议转换：Pure Rust sans-I/O 的 request/response/stream 翻译
+# （OpenAiChat / AnthropicMessages / OpenAiResponses 三 wire format）
+switchyard-translation = "0.3"
+# 信封契约：与 aproxy 二进制共同类型单源维护
+aproxy-envelope = { path = "../aproxy-envelope" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+base64 = "0.22"
+# 渠道表 models 的 glob 模式匹配
+glob = "0.3"
+tracing = "0.1"
+
+# [profile.release] 不在此声明：profile 属于 workspace root（根 Cargo.toml
+# 的 [profile.release] 对全 workspace 生效，取舍理由见那里的注释）

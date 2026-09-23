@@ -283,6 +283,52 @@ pub(crate) fn handle_config_cmd(path: PathBuf, args: ConfigArgs, explicit_config
                 "log_file                = (未设)（内置: ~/.aproxy/logs/ 下按启动随机命名，实际路径以 aproxy status/logs 经 IPC 获取为准）"
             ),
         }
+        // 外部转换器（request_transform/response_transform）：逐字段展示便于
+        // 排障对照 toml；两字段无 settings 全局默认层，未设置即「(未设置)」
+        for (name, t) in [
+            ("request_transform", &cfg.request_transform),
+            ("response_transform", &cfg.response_transform),
+        ] {
+            let Some(t) = t else {
+                println!("{name} = (未设置)");
+                continue;
+            };
+            println!("{name}:");
+            println!("  command           = \"{}\"", t.command);
+            if !t.args.is_empty() {
+                println!("  args              = [{}]", t.args.join(", "));
+            }
+            match t.mode {
+                aproxy::config::TransformMode::Spawn => {
+                    println!("  mode              = spawn（每请求一次性进程）")
+                }
+                aproxy::config::TransformMode::Persistent => {
+                    println!(
+                        "  mode              = persistent（进程池 pool_max={}，空闲 {}s 后回收{}）",
+                        t.effective_pool_max(),
+                        t.effective_idle_timeout_secs(),
+                        if t.effective_idle_timeout_secs() == 0 {
+                            "（永不回收）"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+            println!(
+                "  timeout_secs      = {}{}",
+                t.effective_timeout_secs(),
+                if t.effective_timeout_secs() == 0 {
+                    "（不限）"
+                } else {
+                    ""
+                }
+            );
+            match &t.extra {
+                Some(e) => println!("  extra             = {e}（原样透传进信封）"),
+                None => println!("  extra             = (未设置)"),
+            }
+        }
         println!(
             "proxy          = {}",
             cfg.proxy

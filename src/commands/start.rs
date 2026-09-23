@@ -256,6 +256,12 @@ pub(crate) async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf, target: Optio
             if cfg.forward_only_enabled() {
                 println!("  仅转发模式：不缓冲、不重试");
             }
+            // 外部转换器改变了「原样透传」的承诺，启动提示必须显式说出来
+            if cfg.request_transform.is_some() || cfg.response_transform.is_some() {
+                println!(
+                    "  外部转换器：请求/响应将交给 format 程序改写（转换失败：请求侧 502 不重试、响应侧透传原样）"
+                );
+            }
             println!("  配置: {}", cfg_path.display());
             println!("  日志: {}", info.log_path);
             println!("查看实例: aproxy status    停止: aproxy stop {port}");

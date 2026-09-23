@@ -1,0 +1,21 @@
+[package]
+name = "aproxy-envelope"
+version = "0.1.0"
+# 信封契约 crate：与 aproxy 同库开发，但版本独立于 aproxy 的 alpha 线——
+# 它随 aproxy-format 的发布节奏走（aproxy-format 单独发 Release，见
+# release-format workflow），信封协议有破坏性变更时才 bump。
+edition = "2024"
+rust-version = "1.88"
+description = "Transform envelope contract shared by aproxy and aproxy-format"
+license = "MIT"
+authors = ["aProxy Contributors"]
+repository = "https://github.com/MoYeRanqianzhi/aProxy"
+keywords = ["aproxy", "envelope", "transform"]
+categories = ["network-programming"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# body_b64 的编码/解码（标准字母表无换行）；与 switchyard-translation 的
+# base64 同版本线，workspace lockfile 收敛为一份
+base64 = "0.22"

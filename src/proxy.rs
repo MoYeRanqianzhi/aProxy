@@ -56,7 +56,7 @@ use crate::{config::Config, retry};
 
 /// 需要过滤的 hop-by-hop 头，避免透传导致协议错误或与 hyper/reqwest 的
 /// 自动管理（content-length / transfer-encoding / host / connection）冲突。
-const HOP_HEADERS: &[&str] = &[
+pub(crate) const HOP_HEADERS: &[&str] = &[
     "connection",
     "keep-alive",
     "proxy-authenticate",
@@ -69,7 +69,7 @@ const HOP_HEADERS: &[&str] = &[
     "content-length",
 ];
 
-fn is_hop_header(name: &str) -> bool {
+pub(crate) fn is_hop_header(name: &str) -> bool {
     HOP_HEADERS.contains(&name.to_ascii_lowercase().as_str())
 }
 
@@ -114,6 +114,11 @@ pub struct AppState {
     /// 受限重试路径的预编译正则（源 `config.bounded_retry_paths`，空 = 功能
     /// 关闭）。启动时编译一次随 AppState 共享，请求热路径只做 is_match。
     pub bounded_retry_patterns: Arc<Vec<regex::Regex>>,
+    /// 外部转换器进程池（request/response 各一，源 `config.request_transform`
+    /// / `response_transform`）；None = 未配置，热路径零开销。pub(crate)：池是
+    /// 内部编排细节（TransformPool 的接口不对外），AppState 虽 pub 但不泄漏它。
+    pub(crate) request_pool: Option<Arc<crate::transform::TransformPool>>,
+    pub(crate) response_pool: Option<Arc<crate::transform::TransformPool>>,
 }
 
 impl AppState {
@@ -182,6 +187,16 @@ impl AppState {
                 })
                 .collect(),
         );
+        // 外部转换器进程池：按配置构造（未配置 = None，热路径零开销）。
+        // 仅 spawn 模式惰性启动了 reaper 之外无任何后台任务，构造本身零开销
+        let request_pool = config
+            .request_transform
+            .as_ref()
+            .map(|t| Arc::new(crate::transform::TransformPool::new(Arc::new(t.clone()))));
+        let response_pool = config
+            .response_transform
+            .as_ref()
+            .map(|t| Arc::new(crate::transform::TransformPool::new(Arc::new(t.clone()))));
         Self {
             spool_dir,
             config: Arc::new(config),
@@ -192,6 +207,8 @@ impl AppState {
             }),
             last_activity_secs,
             bounded_retry_patterns,
+            request_pool,
+            response_pool,
         }
     }
 
@@ -232,7 +249,7 @@ impl AppState {
 /// 内存驻留阈值：缓冲超过即溢写磁盘（disk_cache 开启时）。
 /// 1 MiB：覆盖真实 agent 流量（SSE/JSON 错误体 KB 级）使其零磁盘开销，
 /// 大请求体/大响应才进入磁盘路径。
-const RESIDENT_LIMIT: usize = 1024 * 1024;
+pub(crate) const RESIDENT_LIMIT: usize = 1024 * 1024;
 
 /// 请求体缓冲：支持无限重试的字节重放源。
 ///
@@ -597,7 +614,7 @@ async fn spool_chunk(buf: &mut SpoolBuffer, chunk: &[u8], spool_dir: Option<&Pat
 }
 
 /// 临时文件名唯一序号：进程内单调即可（同进程不重名；跨进程由 pid 区分）
-fn unique_seq() -> u64 {
+pub(crate) fn unique_seq() -> u64 {
     use std::sync::atomic::AtomicU64;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     SEQ.fetch_add(1, AtomicOrdering::Relaxed)
@@ -854,17 +871,60 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
         };
 
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-    let target_url = upstream_url(&state.config, &uri);
     let bounded_retry = state.bounded_retry_matches(path_and_query);
-
-    tracing::info!(method = %method, path = %path_and_query, target = %target_url, "代理请求");
-
-    // 是否启用 SSE 保活心跳（仅当客户端接受 SSE 且配置启用）
+    // 是否启用 SSE 保活心跳（仅当客户端接受 SSE 且配置启用）——在转换前判定，
+    // 转换器改写 headers 后判定语义应保持「客户端视角」（信封不含 accept 的
+    // 改写不影响保活选择）
     let client_wants_sse = headers
         .get(http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_ascii_lowercase().contains("text/event-stream"))
         .unwrap_or(false);
+
+    let mut target_url = upstream_url(&state.config, &uri);
+
+    // 请求转换器：缓冲完成后交给外部 format 程序改写（body/headers/url/method
+    // 全部可变）——转换**一次**，产物被下方三轮 forward_once 自动重放，重试
+    // 循环零分支。位置约束：必须在首轮 forward_once 之前（否则重放的是未转换
+    // 请求）、bounded_retry 匹配之后（bounded 对原始路径判定——路径集合是
+    // 客户端视角，转换是实例级配置，语义不同源）。
+    // 失败 → 502 终态不重试（转换失败是确定性的，重试无意义）。
+    let mut method = method;
+    let mut headers = headers;
+    let mut req_body = req_body;
+    if let Some(pool) = state.request_pool.as_ref() {
+        match crate::transform::transform_request(
+            pool,
+            &method,
+            &target_url,
+            &headers,
+            req_body,
+            state.spool_dir.as_deref(),
+        )
+        .await
+        {
+            Ok(t) => {
+                tracing::info!(url = %t.url, "请求已由外部转换器改写");
+                method = t.method;
+                target_url = t.url;
+                headers = t.headers;
+                req_body = t.body;
+            }
+            Err(e) => {
+                let msg = format!("请求转换失败: {e}");
+                state.note_upstream_failure(&msg);
+                tracing::warn!(error = %e, "请求转换失败，502 终态（确定性失败不重试）");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("{msg}（不重试：转换失败是确定性的）"),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    tracing::info!(method = %method, path = %path_and_query, target = %target_url, "代理请求");
+
     let keepalive_dur = state.config.keepalive_interval();
     let keepalive_enabled = state.config.keepalive_enabled() && keepalive_dur.as_secs() > 0;
 
@@ -932,14 +992,18 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
                 body,
                 ..
             } => {
+                // 成功后交给响应转换器（失败透传原样），再按转换后产物重算
+                // 流式判定（format 可改 content-type/body 形态）
+                let (resp_headers, body) =
+                    transform_response_if_configured(&state, &target_url, resp_headers, body).await;
                 let is_streaming = match &body {
                     // 内存模式：整体判定（含 body 嗅探，与旧行为一致）
                     SpooledBody::Memory(_) => {
-                        retry::is_streaming_response(&raw_headers, body.memory_bytes())
+                        retry::is_streaming_response(&resp_headers, body.memory_bytes())
                     }
                     // 磁盘模式：content-type 判定（全量嗅探需读回整个文件，
                     // 而磁盘回放本就是 chunked 流式）
-                    SpooledBody::Disk { .. } => retry::is_streaming_content_type(&raw_headers),
+                    SpooledBody::Disk { .. } => retry::is_streaming_content_type(&resp_headers),
                 };
                 tracing::info!(attempt = 1, status = %status, is_streaming, "首轮成功");
                 build_replay_response(status, resp_headers, &raw_headers, body, is_streaming).await
@@ -972,6 +1036,38 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
         bounded_retry,
     )
     .await
+}
+
+/// 响应侧转换入口（三出口共用）：未配置时原样返回；转换失败时 warn + 原样
+/// 返回（透传上游原始响应——响应已在手，可用性优先，用户已定语义）。
+/// is_streaming 由调用方按返回值重算（format 可改 content-type/body 形态）。
+async fn transform_response_if_configured(
+    state: &AppState,
+    upstream_url: &str,
+    headers: HeaderMap,
+    body: SpooledBody,
+) -> (HeaderMap, SpooledBody) {
+    let Some(pool) = state.response_pool.as_ref() else {
+        return (headers, body);
+    };
+    let content_encoding = headers
+        .get(http::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok().map(|s| s.to_string()));
+    let out = crate::transform::transform_response(
+        pool,
+        upstream_url,
+        content_encoding.as_deref(),
+        headers,
+        body,
+        state.spool_dir.as_deref(),
+    )
+    .await;
+    if let Some(e) = &out.error {
+        tracing::warn!(error = %e, "响应转换失败，透传上游原始响应");
+    }
+    // 失败时 transform_response 已把 headers/body 还原为原始值（透传语义），
+    // 两分支同构返回
+    (out.headers, out.body)
 }
 
 /// 统一的重试判定入口：内存模式走整体判定（旧行为），磁盘模式走增量扫描
@@ -1269,6 +1365,25 @@ async fn proxy_without_keepalive(
                 } else {
                     // 成功：按是否流式选择回放方式，保证“原样流式”
                     tracing::info!(attempt, status = %status, is_streaming, "重试后成功");
+                    // 成功后交给响应转换器（bounded 透传分支是错误响应，不经
+                    // format——用户已定），再按转换后产物重算流式判定
+                    let (resp_headers, body) =
+                        transform_response_if_configured(&state, &target_url, resp_headers, body)
+                            .await;
+                    let is_streaming = match &body {
+                        SpooledBody::Memory(_) => {
+                            retry::is_streaming_response(&resp_headers, body.memory_bytes())
+                        }
+                        SpooledBody::Disk { .. } => retry::is_streaming_content_type(&resp_headers),
+                    };
+                    return build_replay_response(
+                        status,
+                        resp_headers,
+                        &raw_headers,
+                        body,
+                        is_streaming,
+                    )
+                    .await;
                 }
                 return build_replay_response(
                     status,
@@ -1411,10 +1526,10 @@ async fn proxy_with_keepalive(
                 }
                 ForwardResult::Response {
                     status,
+                    headers: resp_headers,
                     raw_headers,
-                    mut body,
+                    body,
                     disk_scan,
-                    ..
                 } => {
                     if needs_retry_response(attempt, &status, &raw_headers, &body, &disk_scan) {
                         // 受限重试路径：骨架 200 已发出、状态行不可再改，无法回放
@@ -1447,6 +1562,17 @@ async fn proxy_with_keepalive(
                         continue;
                     }
 
+                    // 成功后交给响应转换器：骨架 200 + text/event-stream 已发出，
+                    // 状态行与响应头不可再改——format 对 headers 的改写在保活
+                    // 通道无效，仅 body 转换生效。失败透传原样（不发 error 事件
+                    // ——那是响应不可用的终态模板；此处响应在手仅转换失败）
+                    let (_, mut body) = transform_response_if_configured(
+                        &state_bg,
+                        &target_url,
+                        resp_headers,
+                        body,
+                    )
+                    .await;
                     let is_streaming = match &body {
                         SpooledBody::Memory(_) => {
                             retry::is_streaming_response(&raw_headers, body.memory_bytes())

@@ -205,10 +205,16 @@ impl TransformPool {
         let stdout = child.stdout.take().ok_or(TransformError::WorkerDied)?;
         let worker_id = {
             let mut st = self.state.lock().await;
+            // 自增取模分配槽位，基数与 permits 同源：spawn 模式恒 0（协议契约
+            // 「一次性模式 worker_id 恒 0」——信封文档与 skill 都按此声明，
+            // 轮换类 format 依赖它区分模式语义）；persistent 池内各 worker
+            // 拿到稳定不同的槽位号（0..pool_max）
+            let modulus = match self.cfg.mode {
+                TransformMode::Spawn => 1,
+                TransformMode::Persistent => self.cfg.effective_pool_max(),
+            };
             let id = st.next_worker_id;
-            // 自增取模分配槽位：spawn 模式 pool_max=1 恒 0；persistent 池内
-            // 各 worker 拿到稳定不同的槽位号
-            st.next_worker_id = (st.next_worker_id + 1) % self.cfg.effective_pool_max();
+            st.next_worker_id = (st.next_worker_id + 1) % modulus;
             id
         };
         Ok(Worker {
@@ -628,5 +634,155 @@ mod tests {
         let pool = pool_for("x", &[], TransformMode::Spawn);
         assert_eq!(pool.cfg.effective_pool_max(), 4); // 未配置回退默认
         assert_eq!(pool.permits.available_permits(), 1); // spawn 模式恒 1
+    }
+    /// 定位 examples/format-echo(.exe)（与集成测试同款定位逻辑）。
+    fn format_echo_path() -> std::path::PathBuf {
+        let name = if cfg!(windows) {
+            "format-echo.exe"
+        } else {
+            "format-echo"
+        };
+        let mut dir = std::env::current_exe().unwrap();
+        while let Some(parent) = dir.parent() {
+            let cand = parent.join("examples").join(name);
+            if cand.exists() {
+                return cand;
+            }
+            dir = parent.to_path_buf();
+        }
+        panic!("format-echo 未编译");
+    }
+
+    fn echo_pool(
+        mode: TransformMode,
+        sub: &str,
+        extra_cfg: impl FnOnce(&mut TransformConfig),
+    ) -> TransformPool {
+        let mut cfg = TransformConfig {
+            command: format_echo_path().display().to_string(),
+            args: vec![sub.to_string()],
+            mode,
+            timeout_secs: Some(5),
+            ..Default::default()
+        };
+        extra_cfg(&mut cfg);
+        TransformPool::new(Arc::new(cfg))
+    }
+
+    fn envelope_with(body: &str) -> TransformEnvelope {
+        TransformEnvelope {
+            method: Some("POST".to_string()),
+            headers: BTreeMap::new(),
+            body: Some(body.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_mode_reuses_worker_across_requests() {
+        // echo 原样回显信封（含 aproxy 填的 worker_id）：同 worker_id 复现 =
+        // 复用同一 worker；池槽位稳定（不随请求增长 spawn）
+        let pool = echo_pool(TransformMode::Persistent, "echo", |_| {});
+        let first = pool.convert(envelope_with("r1")).await.unwrap();
+        let second = pool.convert(envelope_with("r2")).await.unwrap();
+        assert_eq!(
+            first.worker_id, second.worker_id,
+            "persistent 应复用同 worker"
+        );
+        assert_eq!(first.body.as_deref(), Some("r1"));
+        assert_eq!(second.body.as_deref(), Some("r2"));
+        assert_eq!(
+            pool.state.lock().await.idle.len(),
+            1,
+            "空闲表恒持一个 worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_worker_is_reaped_after_timeout() {
+        // idle_timeout_secs=1：reaper 周期 min(1/2,5).clamp(1,5)=1s——首个 worker
+        // 回收后下次请求 spawn 新 worker（worker_id 递进）
+        let pool = echo_pool(TransformMode::Persistent, "echo", |c| {
+            c.idle_timeout_secs = Some(1);
+        });
+        let first = pool.convert(envelope_with("a")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2600)).await;
+        let idle_before = pool.state.lock().await.idle.len();
+        assert_eq!(idle_before, 0, "空闲 worker 应被 reaper 回收");
+        let second = pool.convert(envelope_with("b")).await.unwrap();
+        assert_ne!(
+            first.worker_id, second.worker_id,
+            "回收后应 spawn 新 worker（pool_max 默认 4，槽位递进）"
+        );
+    }
+
+    #[tokio::test]
+    async fn crashed_worker_is_evicted_and_next_request_respawns() {
+        // exit1 读行后即退：每次 convert 都是「新 spawn → EOF」——两次错误互不
+        // 干扰且池不残留坏 worker（崩溃剔除路径）
+        let pool = echo_pool(TransformMode::Persistent, "exit1", |_| {});
+        let e1 = pool.convert(envelope_with("x")).await.unwrap_err();
+        assert!(matches!(e1, TransformError::WorkerDied), "{e1:?}");
+        let e2 = pool.convert(envelope_with("y")).await.unwrap_err();
+        assert!(matches!(e2, TransformError::WorkerDied));
+        assert_eq!(
+            pool.state.lock().await.idle.len(),
+            0,
+            "崩溃 worker 不进空闲表"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_request_timeout_evicts_stuck_worker() {
+        // sleep helper 睡 3s > timeout 1s：Err(TimedOut) 且 worker 被剔除
+        let pool = echo_pool(TransformMode::Persistent, "sleep", |c| {
+            c.args = vec!["sleep".to_string(), "3000".to_string()];
+            c.timeout_secs = Some(1);
+        });
+        let err = pool.convert(envelope_with("s")).await.unwrap_err();
+        assert!(matches!(err, TransformError::TimedOut), "{err:?}");
+        assert_eq!(
+            pool.state.lock().await.idle.len(),
+            0,
+            "超时 worker 不得归还"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_within_pool_max() {
+        // pool_max=2：两并发各得一个 worker（spawn 模式恒 0，persistent 下
+        // 槽位分配 0/1 交错），互不阻塞、各自成功
+        let pool = Arc::new(echo_pool(TransformMode::Persistent, "echo", |c| {
+            c.pool_max = Some(2);
+        }));
+        let p1 = Arc::new(&pool);
+        let p2 = Arc::clone(&p1);
+        let (r1, r2) = tokio::join!(async { p1.convert(envelope_with("c1")).await }, async {
+            p2.convert(envelope_with("c2")).await
+        },);
+        let a = r1.unwrap();
+        let b = r2.unwrap();
+        assert_ne!(a.worker_id, b.worker_id, "两并发应各占一个槽位");
+        let ids = [a.worker_id, b.worker_id];
+        assert!(
+            ids.contains(&0) && ids.contains(&1),
+            "槽位应为 0/1: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_mode_borrowed_worker_never_reused() {
+        // spawn 模式同 worker_id 恒 0，但进程是每次新 spawn（用毕即弃）——
+        // 断言两次都成功即可（复用与否由 permits=1 + discard 路径保证）
+        let pool = echo_pool(TransformMode::Spawn, "echo", |_| {});
+        let a = pool.convert(envelope_with("1")).await.unwrap();
+        let b = pool.convert(envelope_with("2")).await.unwrap();
+        assert_eq!(a.worker_id, 0);
+        assert_eq!(b.worker_id, 0);
+        assert_eq!(
+            pool.state.lock().await.idle.len(),
+            0,
+            "spawn 模式 idle 恒空"
+        );
     }
 }

@@ -3253,11 +3253,15 @@ fn logs_reports_missing_instance() {
 //
 // restore 记录（run/<端口>.restore）语义：守护 bind 成功写入、优雅退出删除、
 // 崩溃/系统重启保留。此处以 taskkill /F 模拟崩溃（目标仅为本测试拉起的守护）。
+// **隔离**：APROXY_HOME 注入 start 父进程、守护隔代继承（port_zero 测试同款
+// 模式）——run/ 记录全落 tempdir，与生产看门狗/用户实例的操作零竞争
+// （全量并行下曾因共享全局 run 目录被生产看门狗的重拉流程稳定打断）。
 // ---------------------------------------------------------------------------
 #[test]
 fn restore_recovers_crashed_daemon_and_is_idempotent() {
     let port = daemon_test_port(7);
     let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().to_path_buf();
     let cfg_file = dir.path().join("restore.toml");
     std::fs::write(
         &cfg_file,
@@ -3267,32 +3271,50 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     )
     .unwrap();
     let exe = env!("CARGO_BIN_EXE_aproxy");
-    let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
-    let _guard = DaemonGuard {
-        exe,
-        port,
-        home_dir: None,
-    };
-    let restore_path = aproxy::daemon::restore_file_path(&format!("127.0.0.1:{port}"));
+    let port_str = port.to_string();
+    // 隔离前置清理：上次失败运行可能残留监听同端口的守护（其隔离 tempdir
+    // 已删、注册表不可达）——IPC 管道按端口在系统命名空间、跨 home 可达，
+    // ping 到即按上报 pid 强杀；随后全局默认目录再兜底清一次
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("创建测试 tokio runtime 失败");
+        if let Ok(info) = rt.block_on(aproxy::daemon::ipc_ping(&port_str)) {
+            kill_pid(info.pid);
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    let _ = Command::new(exe).args(["stop", &port_str]).output();
+    let run_dir = home.join("run");
+    let restore_path = aproxy::daemon::restore_file_path_in(&run_dir, &format!("127.0.0.1:{port}"));
 
-    // 正常后台启动：bind 成功即写恢复记录
-    let pid = aproxy::daemon::spawn_detached(
-        std::path::Path::new(exe),
-        &[
-            "--config".to_string(),
-            cfg_file.display().to_string(),
-            "--daemon-child".to_string(),
-        ],
-    )
-    .expect("spawn 守护子进程失败");
-    assert!(wait_daemon_ready(port), "守护未就绪 (pid {pid})");
+    // 隔离启动：start 父进程注入 APROXY_HOME，守护隔代继承（port_zero 同款）。
+    // start 自带就绪轮询，成功返回即守护已在注册表/恢复记录落盘。
+    let out = Command::new(exe)
+        .env("APROXY_HOME", &home)
+        .args(["start", "--config"])
+        .arg(&cfg_file)
+        .output()
+        .unwrap();
     assert!(
-        restore_path.exists(),
-        "守护启动后应写入恢复记录: {}",
-        restore_path.display()
+        out.status.success(),
+        "start 应成功: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    // pid 从注册表读（.pid 与 .restore 同键——注册表键 = port_of(listen_addr)
+    // 即纯端口号——且 .pid 先于 .restore 落盘）
+    let pid_path = run_dir.join(format!("{port}.pid"));
+    let pid: u32 = serde_json::from_str::<aproxy::daemon::InstanceInfo>(
+        &std::fs::read_to_string(&pid_path).unwrap(),
+    )
+    .unwrap()
+    .pid;
+    assert!(restore_path.exists(), "守护启动后应写入恢复记录");
 
-    // 模拟崩溃：强杀守护进程（不经过 IPC 优雅退出），恢复记录应残留
+    // 模拟崩溃：强杀守护进程（不经过 IPC 优雅退出），恢复记录应残留。
+    // 隔离 home 内无看门狗收养（tempdir 的 run 目录没有活跃看护者 claim），
+    // 强杀窗口期的记录状态完全由测试掌控。
     kill_pid(pid);
     let mut gone = false;
     for _ in 0..50 {
@@ -3306,19 +3328,26 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     assert!(restore_path.exists(), "崩溃后恢复记录应保留");
 
     // restore：一键拉起崩溃实例
-    let out = Command::new(exe).arg("restore").output().unwrap();
+    let out = Command::new(exe)
+        .env("APROXY_HOME", &home)
+        .arg("restore")
+        .output()
+        .unwrap();
     assert!(out.status.success(), "restore 应成功");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("已恢复") && stdout.contains(&port.to_string()),
+        stdout.contains("已恢复") && stdout.contains(&port_str),
         "restore 应恢复实例: {stdout}"
     );
     assert!(wait_daemon_ready(port), "恢复后的实例应就绪");
 
-    // 幂等：再次 restore 时已在运行 → 跳过而非报错/重复启动。
-    // restore 作用于全局真实 run 目录（开发机上可能存在用户实例的记录被
-    // 跳过或恢复），只断言本测试端口的跳过行为，不断言其他端口。
-    let out = Command::new(exe).arg("restore").output().unwrap();
+    // 幂等：再次 restore 时已在运行 → 跳过而非报错/重复启动（隔离目录内
+    // 只有本测试实例，断言确定性成立）
+    let out = Command::new(exe)
+        .env("APROXY_HOME", &home)
+        .arg("restore")
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -3328,23 +3357,23 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
 
     // 优雅停止：恢复记录被删除，此后 restore 不再恢复本端口
     let out = Command::new(exe)
-        .args(["stop", &port.to_string()])
+        .env("APROXY_HOME", &home)
+        .args(["stop", &port_str])
         .output()
         .unwrap();
-    assert!(out.status.success(), "stop 恢复实例应成功: {stdout}");
+    assert!(out.status.success(), "stop 恢复实例应成功");
     assert!(!restore_path.exists(), "优雅停止后恢复记录应被删除");
-    let out = Command::new(exe).arg("restore").output().unwrap();
-    assert!(out.status.success(), "restore 应静默成功");
+    let out = Command::new(exe)
+        .env("APROXY_HOME", &home)
+        .arg("restore")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "restore 应静默成功（空目录）");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        !stdout.contains("已恢复") || !stdout.contains(&port.to_string()),
+        !stdout.contains("已恢复") || !stdout.contains(&port_str),
         "本端口已无记录，不应再被恢复: {stdout}"
     );
-    // 若全局为空则明确输出「没有需要恢复的实例」；非空（用户实例在册）则
-    // 输出的是它们的跳过/恢复行——两者都算通过
-    if stdout.contains("没有需要恢复的实例") {
-        // 全局为空的经典路径，已验证
-    }
 }
 
 /// 端口 0（系统分配端口）的恢复记录必须按**实际端口**命名（与 .pid 同键）。

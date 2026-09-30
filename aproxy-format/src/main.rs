@@ -56,10 +56,17 @@ fn print_line(s: &str) {
 }
 
 fn run(args: &[String]) {
+    // --config 双形式：`--config <路径>` 与 `--config=<路径>`（与 aproxy CLI 同款惯例）
     let explicit_config = args
         .iter()
         .position(|a| a == "--config")
-        .and_then(|i| args.get(i + 1));
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .or_else(|| {
+            args.iter()
+                .find(|a| a.starts_with("--config="))
+                .map(|a| a["--config=".len()..].to_string())
+        });
 
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
@@ -79,7 +86,7 @@ fn run(args: &[String]) {
         // 配置惰性加载：--config 优先；缺省回落首个信封的 extra 并缓存
         if state.is_none() {
             let path = explicit_config
-                .cloned()
+                .clone()
                 .or_else(|| (!env.extra.is_empty()).then(|| env.extra.clone()));
             let Some(path) = path else {
                 print_line(&error_envelope(
@@ -297,10 +304,12 @@ fn handle_response(
     env: &TransformEnvelope,
 ) -> Result<TransformEnvelope, String> {
     let upstream_url = env.url.as_deref().ok_or("响应信封缺 url（无法反查渠道）")?;
-    let channel = state
-        .cfg
-        .channels
-        .iter()
+    // 反查按**最长 url 前缀优先**：渠道 A `https://a.com` 与 B `https://a.com.evil.com`
+    // 并存时，指向 B 的请求不得被 A 的短前缀抢先命中
+    let mut channels_by_len: Vec<&config::ChannelConfig> = state.cfg.channels.iter().collect();
+    channels_by_len.sort_by_key(|c| std::cmp::Reverse(c.url.len()));
+    let channel = channels_by_len
+        .into_iter()
         .find(|c| upstream_url == c.url || upstream_url.starts_with(c.url.trim_end_matches('/')))
         .ok_or_else(|| format!("url {upstream_url} 反查不到渠道（检查渠道表的 url 配置）"))?;
 
@@ -370,4 +379,318 @@ fn handle_response(
     }
     out.body = Some(out_v.to_string());
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AggConfig, ChannelConfig, ClientFormat, KeyStrategy};
+    use std::collections::BTreeMap;
+
+    /// 双渠道固定配置：anthropic 渠道（双 key 供轮换断言）+ openai 渠道。
+    fn two_channel_state() -> aggregate::AggState {
+        let cfg = AggConfig {
+            client_format: ClientFormat::Auto,
+            models: BTreeMap::from([(
+                "claude-sonnet".to_string(),
+                "claude-sonnet-4-5".to_string(),
+            )]),
+            channels: vec![
+                ChannelConfig {
+                    name: "ant".to_string(),
+                    format: WireFormat::AnthropicMessages,
+                    url: "https://ant.example.com".to_string(),
+                    keys: vec!["k1".to_string(), "k2".to_string()],
+                    strategy: KeyStrategy::RoundRobin,
+                    weights: vec![],
+                    models: Some(vec!["claude-*".to_string()]),
+                    preserve_path: false,
+                },
+                ChannelConfig {
+                    name: "oai".to_string(),
+                    format: WireFormat::OpenAiChat,
+                    url: "https://oai.example.com/v1/chat/completions".to_string(),
+                    keys: vec!["ok1".to_string()],
+                    strategy: KeyStrategy::RoundRobin,
+                    weights: vec![],
+                    models: None,
+                    preserve_path: false,
+                },
+            ],
+        };
+        aggregate::AggState::new(cfg)
+    }
+
+    fn anthropic_request_env(model: &str) -> TransformEnvelope {
+        TransformEnvelope {
+            method: Some("POST".to_string()),
+            url: Some("https://client-upstream.example.com/v1/messages".to_string()),
+            headers: BTreeMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                (
+                    "authorization".to_string(),
+                    "Bearer client-secret".to_string(),
+                ),
+                ("x-api-key".to_string(), "client-key".to_string()),
+            ]),
+            body: Some(format!(
+                r#"{{"system":"s","messages":[{{"role":"user","content":"hi"}}],"max_tokens":50,"model":"{model}"}}"#
+            )),
+            extra: String::new(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn request_same_format_rewrites_url_and_injects_channel_key() {
+        let state = two_channel_state();
+        let out = handle_request(&state, &anthropic_request_env("claude-3")).unwrap();
+        // url 完整替换为渠道 url
+        assert_eq!(out.url.as_deref(), Some("https://ant.example.com"));
+        // 鉴权：客户端双头被剥，渠道 x-api-key 注入（轮换首 key）
+        assert_eq!(out.headers.get("x-api-key").unwrap(), "k1");
+        assert!(
+            !out.headers.contains_key("authorization"),
+            "客户端 Bearer 头必须剥离"
+        );
+        assert_eq!(out.headers.get("anthropic-version").unwrap(), "2023-06-01");
+        // 同协议不转换：body 保持 anthropic 形态
+        let body: serde_json::Value = serde_json::from_str(out.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["model"], "claude-3");
+        assert!(body.get("max_tokens").is_some());
+    }
+
+    #[test]
+    fn request_rotates_keys_across_calls() {
+        let state = two_channel_state();
+        let k1 = handle_request(&state, &anthropic_request_env("claude-3"))
+            .unwrap()
+            .headers
+            .get("x-api-key")
+            .unwrap()
+            .clone();
+        let k2 = handle_request(&state, &anthropic_request_env("claude-3"))
+            .unwrap()
+            .headers
+            .get("x-api-key")
+            .unwrap()
+            .clone();
+        assert_eq!(k1, "k1");
+        assert_eq!(k2, "k2", "轮换序列钉死：k1 → k2");
+    }
+
+    #[test]
+    fn request_cross_format_translates_to_channel_protocol() {
+        let state = two_channel_state();
+        // openai_chat 请求 → openai_chat 渠道：url 改写 + Bearer 注入；
+        // 渠道协议与请求相同故 body 不转换（跨协议转换由 convert 命令端到端覆盖）
+        let env = TransformEnvelope {
+            method: Some("POST".to_string()),
+            url: Some("https://client-upstream.example.com/v1/chat/completions".to_string()),
+            headers: BTreeMap::new(),
+            body: Some(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"max_tokens":30}"#
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let out = handle_request(&state, &env).unwrap();
+        assert_eq!(
+            out.url.as_deref(),
+            Some("https://oai.example.com/v1/chat/completions")
+        );
+        assert_eq!(out.headers.get("authorization").unwrap(), "Bearer ok1");
+        let body: serde_json::Value = serde_json::from_str(out.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn request_model_alias_maps_to_upstream_name() {
+        let state = two_channel_state();
+        let out = handle_request(&state, &anthropic_request_env("claude-sonnet")).unwrap();
+        let body: serde_json::Value = serde_json::from_str(out.body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body["model"], "claude-sonnet-4-5",
+            "别名表应把客户端名映射为上游名"
+        );
+    }
+
+    #[test]
+    fn request_model_miss_yields_error_reason() {
+        // 两渠道都带 models 过滤（oai 渠道在 two_channel_state 里是全匹配，
+        // 故这里单独构造全过滤配置才能构造「未命中」）
+        let mut state = two_channel_state();
+        state.cfg.channels[1].models = Some(vec!["gpt-*".to_string()]);
+        let err = handle_request(&state, &anthropic_request_env("llama-3")).unwrap_err();
+        assert!(err.contains("未命中任何渠道"), "{err}");
+    }
+
+    #[test]
+    fn request_unknown_shape_yields_detect_error() {
+        let state = two_channel_state();
+        let env = TransformEnvelope {
+            method: Some("POST".to_string()),
+            url: Some("https://x.example.com/".to_string()),
+            headers: BTreeMap::new(),
+            body: Some(r#"{"foo":1,"model":"claude-3"}"#.to_string()),
+            ..Default::default()
+        };
+        let err = handle_request(&state, &env).unwrap_err();
+        assert!(err.contains("检测失败"), "{err}");
+    }
+
+    #[test]
+    fn request_preserve_path_appends_original_path() {
+        let mut state = two_channel_state();
+        state.cfg.channels[0].preserve_path = true;
+        state.cfg.channels[0].url = "https://ant-gw.example.com/anthropic".to_string();
+        let out = handle_request(&state, &anthropic_request_env("claude-3")).unwrap();
+        assert_eq!(
+            out.url.as_deref(),
+            Some("https://ant-gw.example.com/anthropic/v1/messages"),
+            "preserve_path 应拼接原 path"
+        );
+    }
+
+    #[test]
+    fn path_and_query_extracts_path_and_keeps_query() {
+        assert_eq!(
+            path_and_query("https://h.example.com/v1/x?a=1"),
+            "/v1/x?a=1"
+        );
+        assert_eq!(path_and_query("https://h.example.com"), "");
+        assert_eq!(path_and_query("not-a-url"), "");
+    }
+
+    fn response_env(url: &str, body: &str) -> TransformEnvelope {
+        TransformEnvelope {
+            url: Some(url.to_string()),
+            headers: BTreeMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                ("x-api-key".to_string(), "upstream-real-key".to_string()),
+                (
+                    "authorization".to_string(),
+                    "Bearer upstream-real".to_string(),
+                ),
+            ]),
+            body: Some(body.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn response_strips_upstream_auth_headers() {
+        let state = two_channel_state();
+        let body =
+            r#"{"role":"assistant","content":[{"type":"text","text":"hi"}],"model":"claude-3"}"#;
+        let out = handle_response(&state, &response_env("https://ant.example.com", body)).unwrap();
+        assert!(
+            !out.headers.contains_key("x-api-key"),
+            "上游 x-api-key 不得回传客户端"
+        );
+        assert!(
+            !out.headers.contains_key("authorization"),
+            "上游 authorization 不得回传客户端"
+        );
+        assert!(out.headers.contains_key("content-type"));
+    }
+
+    #[test]
+    fn response_translates_back_when_client_format_explicit() {
+        let mut state = two_channel_state();
+        state.cfg.client_format = ClientFormat::Explicit(WireFormat::OpenAiChat);
+        let body =
+            r#"{"role":"assistant","content":[{"type":"text","text":"hi"}],"model":"claude-3"}"#;
+        let out = handle_response(&state, &response_env("https://ant.example.com", body)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(out.body.as_deref().unwrap()).unwrap();
+        assert!(v.get("choices").is_some(), "应转换为 openai_chat 形态: {v}");
+        // served_model：别名表无 claude-3 反查 → 保留上游报告 id
+        assert_eq!(v["model"], "claude-3");
+    }
+
+    #[test]
+    fn response_reverse_maps_model_alias() {
+        let state = two_channel_state();
+        // 上游报 claude-sonnet-4-5 → 客户端别名 claude-sonnet
+        let body = r#"{"role":"assistant","content":[{"type":"text","text":"hi"}],"model":"claude-sonnet-4-5"}"#;
+        let out = handle_response(&state, &response_env("https://ant.example.com", body)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(out.body.as_deref().unwrap()).unwrap();
+        assert_eq!(v["model"], "claude-sonnet");
+    }
+
+    #[test]
+    fn response_url_reverse_lookup_miss_is_error() {
+        let state = two_channel_state();
+        let body = r#"{"role":"assistant","content":[],"model":"m"}"#;
+        let err = handle_response(&state, &response_env("https://unknown.example.com", body))
+            .unwrap_err();
+        assert!(err.contains("反查不到渠道"), "{err}");
+    }
+
+    #[test]
+    fn response_longest_url_prefix_wins() {
+        // 渠道 short `https://a.com` 与 long `https://a.com.evil.com` 并存：
+        // 指向 long 的请求不得被 short 的短前缀抢先命中（最长前缀优先）
+        let cfg = AggConfig {
+            client_format: ClientFormat::Explicit(WireFormat::OpenAiChat),
+            models: BTreeMap::new(),
+            channels: vec![
+                ChannelConfig {
+                    name: "short".to_string(),
+                    format: WireFormat::AnthropicMessages,
+                    url: "https://a.com".to_string(),
+                    keys: vec!["k".to_string()],
+                    strategy: KeyStrategy::RoundRobin,
+                    weights: vec![],
+                    models: None,
+                    preserve_path: false,
+                },
+                ChannelConfig {
+                    name: "long".to_string(),
+                    format: WireFormat::OpenAiChat,
+                    url: "https://a.com.evil.com".to_string(),
+                    keys: vec!["k".to_string()],
+                    strategy: KeyStrategy::RoundRobin,
+                    weights: vec![],
+                    models: None,
+                    preserve_path: false,
+                },
+            ],
+        };
+        let state = aggregate::AggState::new(cfg);
+        // openai_chat 形态响应 + 显式客户端协议 openai_chat：命中 long（同协议
+        // 直通，choices 保留）——若误命中 short（anthropic）会被转成 anthropic 形态
+        let body = r#"{"choices":[],"model":"m"}"#;
+        let out =
+            handle_response(&state, &response_env("https://a.com.evil.com/v1/x", body)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(out.body.as_deref().unwrap()).unwrap();
+        assert!(v.get("choices").is_some(), "应命中 long 渠道且不转换: {v}");
+    }
+
+    #[test]
+    fn response_sse_same_format_passes_through() {
+        let state = two_channel_state();
+        let sse = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n";
+        let out = handle_response(&state, &response_env("https://ant.example.com", sse)).unwrap();
+        assert_eq!(out.body.as_deref(), Some(sse), "同协议 SSE 直通原样");
+    }
+
+    #[test]
+    fn response_sse_cross_format_is_explicit_error() {
+        let mut state = two_channel_state();
+        state.cfg.client_format = ClientFormat::Explicit(WireFormat::OpenAiChat);
+        let sse = "data: {\"choices\":[]}\n\n";
+        let err =
+            handle_response(&state, &response_env("https://ant.example.com", sse)).unwrap_err();
+        assert!(err.contains("尚未支持"), "{err}");
+    }
+
+    #[test]
+    fn response_sse_cross_format_with_auto_client_follows_channel() {
+        // auto 模式下 SSE 按渠道协议直通（不报错）——与显式异协议报错形成对照
+        let state = two_channel_state();
+        let sse = "event: message_start\ndata: {}\n\n";
+        let out = handle_response(&state, &response_env("https://ant.example.com", sse)).unwrap();
+        assert_eq!(out.body.as_deref(), Some(sse));
+    }
 }

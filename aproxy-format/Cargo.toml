@@ -28,5 +28,9 @@ base64 = "0.22"
 glob = "0.3"
 tracing = "0.1"
 
+[dev-dependencies]
+# 端到端测试的临时配置目录
+tempfile = "3"
+
 # [profile.release] 不在此声明：profile 属于 workspace root（根 Cargo.toml
 # 的 [profile.release] 对全 workspace 生效，取舍理由见那里的注释）

@@ -16,11 +16,11 @@ aproxy status               # 每行 v<semver> = 各实例实际运行的守护�
 
 | 项 | 值 |
 |---|---|
-| 文档适用版本 | **0.1.0-alpha.17（开发中）**（含 alpha.4 引入以来的全部行为；上一发行为 alpha.16） |
+| 文档适用版本 | **0.1.0-alpha.17**（含 alpha.4 引入以来的全部行为；上一发行为 alpha.16） |
 | 代码版本坐标 | Cargo.toml `version` 字段；alpha 线于 2026-09 发布 |
 | 大版本线 | 0.1.x（0.1 系列内小版本不另开目录，直接更新 latest/ 文档） |
 
-## alpha.17 关键行为（相对 alpha.16，开发中）
+## alpha.17 关键行为（相对 alpha.16）
 
 - **外部转换器（`request_transform`/`response_transform`，新配置字段）**：
   请求/响应可整流交给外部 format 程序改写（stdin/stdout 一行 JSON 信封，

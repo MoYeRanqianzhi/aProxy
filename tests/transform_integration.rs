@@ -125,6 +125,24 @@ async fn fixed_upstream(
     (url, count, jh)
 }
 
+/// 固定响应上游（带调用计数）——String body 版（大 body 用）
+async fn fixed_upstream_status_body(
+    status: StatusCode,
+    body: &str,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let state_count = count.clone();
+    let body = body.to_string();
+    let app = Router::new().fallback(
+        move |State(c): State<Arc<AtomicUsize>>, _req: Request| async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            (status, body.clone()).into_response()
+        },
+    );
+    let (url, jh) = bind_router(app.with_state(state_count)).await;
+    (url, count, jh)
+}
+
 /// 按调用序返回的序列上游（保活通道测试：首调 500、次调 200）
 async fn sequenced_upstream(
     first: (StatusCode, &'static str),
@@ -380,6 +398,38 @@ async fn response_transform_rewrites_body() {
     assert_eq!(resp.status(), StatusCode::OK);
     let text = resp.text().await.unwrap();
     assert_eq!(text, "PLAIN-PAYLOAD", "响应 body 应被 upper 转换");
+}
+
+#[tokio::test]
+async fn response_transform_large_body_disk_path_byte_fidelity() {
+    isolate_env_proxy();
+    // 2 MiB 上游响应：Disk spool → 全量读出 → 转换 → 新 Disk 落盘 → 分块回放。
+    // spool_dir 注入 tempdir（走真实 Disk 路径且不污染生产目录）
+    let payload: Vec<u8> = (0..(2 * 1024 * 1024))
+        .map(|i| b'a' + (i % 26) as u8)
+        .collect();
+    let payload_str = String::from_utf8(payload.clone()).unwrap();
+    let (upstream, _count, _jh) = fixed_upstream_status_body(StatusCode::OK, &payload_str).await;
+    let mut cfg = proxy_config_for(&upstream);
+    let spool = tempfile::tempdir().unwrap();
+    cfg.spool_dir_override = Some(spool.path().to_path_buf());
+    cfg.response_transform = Some(transform_config("upper", TransformMode::Persistent));
+    let (proxy, _pj) = start_proxy(cfg).await;
+
+    let resp = local_client()
+        .get(format!("{proxy}/v1/x"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.bytes().await.unwrap();
+    let expected: Vec<u8> = payload.iter().map(|b| b.to_ascii_uppercase()).collect();
+    assert_eq!(bytes.len(), expected.len(), "转换后响应长度应与预期一致");
+    assert_eq!(
+        bytes.as_ref(),
+        expected.as_slice(),
+        "大响应经 Disk 路径转换后字节保真"
+    );
 }
 
 #[tokio::test]

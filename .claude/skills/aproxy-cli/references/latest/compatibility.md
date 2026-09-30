@@ -16,9 +16,31 @@ aproxy status               # 每行 v<semver> = 各实例实际运行的守护�
 
 | 项 | 值 |
 |---|---|
-| 文档适用版本 | **0.1.0-alpha.16**（含 alpha.4→alpha.16 引入的全部行为） |
+| 文档适用版本 | **0.1.0-alpha.17（开发中）**（含 alpha.4 引入以来的全部行为；上一发行为 alpha.16） |
 | 代码版本坐标 | Cargo.toml `version` 字段；alpha 线于 2026-09 发布 |
 | 大版本线 | 0.1.x（0.1 系列内小版本不另开目录，直接更新 latest/ 文档） |
+
+## alpha.17 关键行为（相对 alpha.16，开发中）
+
+- **外部转换器（`request_transform`/`response_transform`，新配置字段）**：
+  请求/响应可整流交给外部 format 程序改写（stdin/stdout 一行 JSON 信封，
+  协议见 aproxy-format skill）。仅 toml 每实例配置（无 settings 全局默认层、
+  无 CLI 旗标）。**失败语义两侧不同**：请求侧转换失败 → 502 不重试（确定性
+  失败）；响应侧失败 → 透传上游原始响应。`mode = "persistent"` 启用进程池
+  （`pool_max`/`idle_timeout_secs`/`timeout_secs`/`extra` 子字段见
+  config-toml.md）。**与 `forward_only` 互斥**（同开启动报错）。旧二进制读
+  到该字段静默忽略（行为不变，升级安全）。
+- **workspace 三成员化**：仓库现为 Cargo workspace（aproxy / aproxy-envelope
+  信封契约 crate / aproxy-format 官方示例 format 二进制）。`cargo install
+  aproxy` 语义不变、本体依赖树只新增轻量的 aproxy-envelope。aproxy-format
+  **单独发 Release**（版本独立于 aproxy alpha 线，稳定后几乎不更新），
+  二进制建议落 `~/.aproxy/bin/`。
+- **rustc 下限维持 1.88**；新增依赖：`base64`（aproxy-envelope 侧）。
+- **npm 主包 skill 包形态变更**：`skills/aproxy-cli.zip`（单包）→
+  `skills/aproxy-skills.zip`（多 skill 总包）。**旧二进制经 npm 渠道更新
+  skill 会失败**（找不到旧 inner 文件）——skill 为非强制支线、不影响安装，
+  舰队收敛到新版本后下次 install 自愈；GitHub/cargo 渠道无此问题（总包
+  天然多 skill / 现场打包已泛化）。
 
 ## alpha.16 关键行为（相对 alpha.15）
 

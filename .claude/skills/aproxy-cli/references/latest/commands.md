@@ -199,6 +199,10 @@ aproxy config --clear-default
 注意：修改 toml 的 config 命令**不会重启已运行实例**——用 `aproxy restart <端口>`
 使修改生效。
 
+外部转换器（`request_transform`/`response_transform`）**无 CLI 旗标**——只在
+config.toml 手写，`config --show` 展示生效值（字段写法见 config-toml.md；
+format 程序编写见 aproxy-format skill）。
+
 ## install / upgrade
 
 `aproxy install`（`upgrade` 为别名）：把 aProxy 安全安装/升级到规范位置

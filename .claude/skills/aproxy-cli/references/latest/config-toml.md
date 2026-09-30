@@ -35,6 +35,8 @@ listen_addr = "127.0.0.1:12345"
 # forward_only = false
 # bounded_retry_paths = [ '/v1/messages/count_tokens' ]
 # log_file = "D:/aproxy-logs/inst-a.log"
+# request_transform = { command = "aproxy-format", args = ["run"], mode = "persistent", extra = "agg.toml" }
+# response_transform = { command = "aproxy-format", args = ["run"], mode = "persistent" }
 ```
 
 ## 字段总表
@@ -59,6 +61,8 @@ listen_addr = "127.0.0.1:12345"
 | `forward_only` | bool? | settings 层 | 仅转发模式：放弃重试/缓冲/心跳，请求体与响应流式直通 |
 | `bounded_retry_paths` | string[]? | settings 层（空） | 受限重试路径（正则）：命中者失败 3 次即透传，不再无限重试 |
 | `log_file` | string? | 无（随机命名） | 自定义守护日志文件路径；缺省按启动随机命名（见下） |
+| `request_transform` | table? | 无 | 外部转换器（请求侧）：交给 format 程序改写 body/headers/url/method；失败 502 不重试；与 forward_only 互斥 |
+| `response_transform` | table? | 无 | 外部转换器（响应侧）：改写上游响应后回放；失败透传原样 |
 
 **优先级**（`max_body_mb`/`disk_cache`/`forward_only`/`bounded_retry_paths`
 四个 Option 字段独有）：
@@ -245,6 +249,47 @@ bounded_retry_paths = [
 - 改后 `aproxy restart <端口或别名>` 生效；重启后随机名会变（自定义路径不变），
   实例停止后旧日志按孤儿清理（见 behaviors.md 日志节）。
 
+### request_transform / response_transform
+
+外部转换器（table，默认无 = 功能关闭）：把整个请求/响应装进一行 JSON 信封
+交给外部 format 程序改写后收回——实现 OpenAI ↔ Anthropic 等协议转换、
+多 key 轮换、多模型多渠道聚合（newapi 式）。aproxy 本体不内置任何转换器，
+全部用户配置；写 format 与配置的完整指南见 **aproxy-format skill**。
+
+```toml
+request_transform  = { command = "aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
+response_transform = { command = "aproxy-format", args = ["run"], mode = "persistent" }
+```
+
+子字段：
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `command` | string | （必填） | format 程序命令；不走 shell 按 argv 执行（无注入面）；写绝对路径最稳 |
+| `args` | string[] | `[]` | 程序参数（如官方示例的 `["run"]`） |
+| `mode` | string | `"spawn"` | `spawn`=每请求一次性进程；`persistent`=持续进程池（轮换/计数状态必须用它） |
+| `pool_max` | u32 | 4 | persistent 池上限（并发 worker，超限排队）；0 启动报错 |
+| `idle_timeout_secs` | u64 | 300 | persistent worker 空闲回收秒；0=永不回收 |
+| `timeout_secs` | u64 | 30 | 单请求转换超时秒；0=不限；超时 worker 被剔除 |
+| `extra` | string? | 无 | 原样透传进信封（格式无要求，format 自解；官方示例传聚合配置路径） |
+
+语义要点：
+
+- **失败语义两侧不同**（用户拍板的设计，不要混淆）：请求侧转换失败
+  （进程崩溃/超时/error 行）→ **502 + 原因，不重试**（确定性失败）；
+  响应侧失败 → **透传上游原始响应** + warn（响应已在手，可用性优先）。
+- **与 `forward_only` 互斥**：同开启动即报错（forward_only 不缓冲请求体，
+  转换器需要全量 body）。
+- **仅 toml 每实例配置**：无 settings.json 全局默认层、无 CLI 旗标（转换是
+  场景特定功能，不同实例连不同上游用不同 format——设计决策）。
+- 转换是**整流**的：请求体缓冲完成后转换一次（重试全程重放转换产物）；
+  响应在重试判定成功后、回放前转换。SSE 响应整流转文本交给 format。
+- 重试重放的是转换后的请求（转换不重复执行）；`bounded_retry_paths` 命中
+  的透传路径不进响应转换（错误响应不经 format）。
+- 官方示例二进制 `aproxy-format`（协议转换 + 轮换 + 聚合）单独发 Release，
+  落 `~/.aproxy/bin/`；版本独立于 aproxy alpha 线。
+- 改后 `aproxy restart <端口或别名>` 生效。
+
 ## 校验规则
 
 启动时校验失败即拒绝启动（错误信息含文件位置与修复指引）：
@@ -254,6 +299,9 @@ bounded_retry_paths = [
 3. 配置了 `proxy_username`/`proxy_password` 则必须同时配置 `proxy`
 4. `bounded_retry_paths` 每项必须是能编译的正则（非法模式启动即报错，
    错误含模式原文）
+5. `request_transform`/`response_transform`：`command` 非空；
+   `mode = "persistent"` 时 `pool_max >= 1`；与 `forward_only` 不同存
+   （同开报互斥错误）
 
 ## 归一化行为
 
@@ -262,3 +310,4 @@ bounded_retry_paths = [
 - base_url 末尾 `/` 去除
 - api_key/代理三项：trim；空白视为未设置
 - 头表：键值 trim；空键剔除；同键保留先出现者
+- transform 的 `command` trim；trim 后为空 = 该字段视为未设置

@@ -166,9 +166,9 @@ jobs:
           path: dist
 
   skills:
-    # skill 文档打包：总包（解压得 ~/.aproxy/skills/ 内容）+ 每个 skill 单包
-    # （当前仅 aproxy-cli 一个，内容相同；未来多 skill 时单包只含各自的）。
-    # 顶层目录统一为 aproxy-cli/，解压到 ~/.aproxy/skills/ 即落位。
+    # skill 文档打包：总包（解压得 ~/.aproxy/skills/ 内容）+ 每个 skill 单包。
+    # 泛化遍历 .claude/skills/*/：新增 skill 目录零改动自动进总包与单包。
+    # 单包顶层目录 = skill 名，解压到 ~/.aproxy/skills/ 即落位。
     needs: test
     runs-on: ubuntu-latest
     steps:
@@ -176,13 +176,13 @@ jobs:
       - name: Package skills
         run: |
           mkdir -p stage
-          cp -r .claude/skills/aproxy-cli stage/
-          cd stage
-          zip -r ../aproxy-skills.zip aproxy-cli
-          cp ../aproxy-skills.zip ../aproxy-skill-aproxy-cli.zip
-          cd ..
-          for f in aproxy-skills.zip aproxy-skill-aproxy-cli.zip; do
-            sha256sum "$f" > "$f.sha256"
+          cp -r .claude/skills/* stage/
+          (cd stage && zip -qr ../aproxy-skills.zip */)
+          sha256sum aproxy-skills.zip > aproxy-skills.zip.sha256
+          for d in .claude/skills/*/; do
+            name=$(basename "$d")
+            (cd .claude/skills && zip -qr "../../aproxy-skill-${name}.zip" "$name")
+            sha256sum "aproxy-skill-${name}.zip" > "aproxy-skill-${name}.zip.sha256"
           done
       - uses: actions/upload-artifact@v7.0.1
         with:
@@ -190,8 +190,8 @@ jobs:
           path: |
             aproxy-skills.zip
             aproxy-skills.zip.sha256
-            aproxy-skill-aproxy-cli.zip
-            aproxy-skill-aproxy-cli.zip.sha256
+            aproxy-skill-*.zip
+            aproxy-skill-*.zip.sha256
 
   release:
     needs: [build, skills]
@@ -214,7 +214,7 @@ jobs:
             echo "- **cargo-binstall**：\`cargo binstall aproxy\`（预编译，免编译）"
             echo "- **cargo（源码编译）**：\`cargo install aproxy --root ~/.aproxy\`"
             echo ""
-            echo "- **skill 文档**：\`aproxy-skills.zip\`（总包）/\`aproxy-skill-aproxy-cli.zip\`（单包）——install 自动随版本更新 skill，通常无需手动下载"
+            echo "- **skill 文档**：\`aproxy-skills.zip\`（总包，含全部 skill：aproxy-cli / aproxy-format）/\`aproxy-skill-<名>.zip\`（单包）——install 自动随版本更新 skill，通常无需手动下载"
             echo ""
             echo "安装/升级推荐直接用 install 指令：\`aproxy install\`（自动选变体并滚动重启实例）。"
             echo ""

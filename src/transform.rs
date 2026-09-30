@@ -129,7 +129,11 @@ impl TransformPool {
             .await
             .map_err(|_| TransformError::Closed)?;
 
-        let mut worker = match self.state.lock().await.idle.pop() {
+        // **先释放锁再 spawn**：`match self.state.lock().await.idle.pop()` 的
+        // MutexGuard 会活到整个 match 语句结束，arm 里 spawn_worker() 再拿
+        // 同一把锁就是自死锁（tokio Mutex 不可重入）——pop 结果必须先落变量
+        let popped = self.state.lock().await.idle.pop();
+        let mut worker = match popped {
             Some(w) => w,
             None => self.spawn_worker().await?,
         };
@@ -534,6 +538,49 @@ mod tests {
         };
         let err = pool.convert(env).await.unwrap_err();
         assert!(matches!(err, TransformError::Spawn(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn convert_smoke_real_format_echo_roundtrip() {
+        // 真实 spawn format-echo 的最小往返（不经代理栈，二分定位用）
+        let name = if cfg!(windows) {
+            "format-echo.exe"
+        } else {
+            "format-echo"
+        };
+        let mut dir = std::env::current_exe().unwrap();
+        let mut echo = None;
+        while let Some(parent) = dir.parent() {
+            let cand = parent.join("examples").join(name);
+            if cand.exists() {
+                echo = Some(cand);
+                break;
+            }
+            dir = parent.to_path_buf();
+        }
+        let echo = echo.expect("format-echo 未编译");
+        let pool = TransformPool::new(Arc::new(TransformConfig {
+            command: echo.display().to_string(),
+            args: vec!["echo".to_string()],
+            mode: TransformMode::Spawn,
+            timeout_secs: Some(5),
+            ..Default::default()
+        }));
+        let env = TransformEnvelope {
+            method: Some("POST".to_string()),
+            headers: BTreeMap::new(),
+            body: Some("{\"a\":1}".to_string()),
+            ..Default::default()
+        };
+        let out = tokio::time::timeout(Duration::from_secs(10), pool.convert(env))
+            .await
+            .expect("convert 整体超时（10s）")
+            .expect("convert 失败");
+        assert_eq!(
+            out.body.as_deref(),
+            Some("{\"a\":1}"),
+            "echo 应原样回显 body"
+        );
     }
 
     #[test]

@@ -42,10 +42,13 @@ pub async fn update_skills(
     let result = download::fetch_artifact(ctx, chain, Artifact::Skills, &dl).await;
     let outcome = match result {
         Ok(fetched) => match install_skill_dir(home, &fetched.path) {
-            Ok(()) => SkillOutcome {
-                phase: SkillPhase::Done,
-                attempt,
-            },
+            Ok(installed) => {
+                tracing::info!(skills = ?installed, "skill 文档已随版本落位");
+                SkillOutcome {
+                    phase: SkillPhase::Done,
+                    attempt,
+                }
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "skill 落位失败（下次 install 重试）");
                 SkillOutcome {
@@ -66,46 +69,74 @@ pub async fn update_skills(
     outcome
 }
 
-/// zip 落位为 skill 目录（原子替换）：解包到 .staging/<名>/ → 旧目录 rename
-/// 走 → 新目录 rename 进 → 清理。Windows 上 agent 正读文件导致的 rename
-/// 冲突短重试 3 次，失败放弃（下次 install 再覆盖）。
-fn install_skill_dir(home: &Path, zip: &Path) -> Result<(), String> {
-    // zip 内条目自带 `aproxy-cli/` 顶层前缀（发布组包同款，实测确认）——
-    // 解包到 .staging 本身，incoming 即 .staging/aproxy-cli，rename 进位后
-    // 不产生双层嵌套
+/// zip 落位为 skill 目录（原子替换）：解包到 .staging/ → 遍历顶层目录逐个
+/// 「旧目录 rename 走 → 新目录 rename 进」→ 清理。多 skill 总包（每 skill
+/// 一个顶层目录）与单 skill 单包（历史形态）统一走此入口。Windows 上 agent
+/// 正读文件导致的 rename 冲突短重试 3 次，失败放弃（下次 install 再覆盖）。
+/// 返回落位的 skill 名列表（调用方输出提示用）。
+fn install_skill_dir(home: &Path, zip: &Path) -> Result<Vec<String>, String> {
+    // zip 内条目自带各自的顶层前缀（每 skill 一个，发布组包同款）——
+    // 解包到 .staging 本身，逐个顶层目录 rename 进位，不产生双层嵌套
     let staging = home.join("skills").join(".staging");
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|e| format!("skill staging 创建失败: {e}"))?;
     unpack_zip(zip, &staging)?;
-    let incoming = staging.join("aproxy-cli");
-    if !incoming.is_dir() {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err("skills zip 缺 aproxy-cli/ 顶层目录（组包形态不符）".into());
-    }
 
-    let dir = skill_dir_in(home);
-    std::fs::create_dir_all(dir.parent().unwrap())
-        .map_err(|e| format!("skills 目录创建失败: {e}"))?;
-    // 旧目录 rename 走（Windows 冲突短重试）
-    let old = staging.join("old");
-    if dir.exists() {
-        let mut renamed = false;
-        for attempt in 0..3 {
-            if std::fs::rename(&dir, &old).is_ok() {
-                renamed = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(300 * (attempt as u64 + 1)));
-        }
-        if !renamed {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err("旧 skill 目录被占用（agent 正读？），放弃本次覆盖".into());
+    // 顶层目录清单：staging 下全部非隐藏目录（zip 无顶层目录条目 = 组包形态不符）
+    let mut incoming: Vec<PathBuf> = Vec::new();
+    let entries =
+        std::fs::read_dir(&staging).map_err(|e| format!("skill staging 读取失败: {e}"))?;
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let p = entry.path();
+        if p.is_dir()
+            && p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| !n.starts_with('.'))
+        {
+            incoming.push(p);
         }
     }
-    // 新目录 rename 进（同卷原子）
-    std::fs::rename(&incoming, &dir).map_err(|e| format!("skill 目录落位失败: {e}"))?;
+    if incoming.is_empty() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err("skills zip 缺 skill 顶层目录（组包形态不符）".into());
+    }
+    incoming.sort();
+
+    let skills_root = home.join("skills");
+    std::fs::create_dir_all(&skills_root).map_err(|e| format!("skills 目录创建失败: {e}"))?;
+    let mut installed = Vec::new();
+    for src in incoming {
+        let name = src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("read_dir 条目必有文件名")
+            .to_string();
+        let dir = skills_root.join(&name);
+        // 旧目录 rename 走（Windows 冲突短重试）
+        if dir.exists() {
+            let old = staging.join(format!("old-{name}"));
+            let mut renamed = false;
+            for attempt in 0..3 {
+                if std::fs::rename(&dir, &old).is_ok() {
+                    renamed = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300 * (attempt as u64 + 1)));
+            }
+            if !renamed {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(format!(
+                    "旧 skill 目录被占用（agent 正读 {name}？），放弃本次覆盖"
+                ));
+            }
+        }
+        // 新目录 rename 进（同卷原子）
+        std::fs::rename(&src, &dir).map_err(|e| format!("skill {name} 目录落位失败: {e}"))?;
+        installed.push(name);
+    }
     let _ = std::fs::remove_dir_all(&staging);
-    Ok(())
+    Ok(installed)
 }
 
 /// zip 解包（**路径穿越防护**：entry 名剥盘符/绝对前缀后拼接，`..` 段
@@ -167,7 +198,8 @@ mod tests {
         std::io::Write::write_all(&mut w, b"# commands").unwrap();
         w.finish().unwrap();
 
-        install_skill_dir(home, &zip_path).unwrap();
+        let installed = install_skill_dir(home, &zip_path).unwrap();
+        assert_eq!(installed, vec!["aproxy-cli".to_string()]);
         let dir_out = skill_dir_in(home);
         assert!(dir_out.join("SKILL.md").is_file(), "SKILL.md 应落位一层");
         assert!(
@@ -186,6 +218,76 @@ mod tests {
             !home.join("skills").join(".staging").exists(),
             "staging 应清理"
         );
+    }
+
+    #[test]
+    fn install_skill_dir_places_every_top_level_dir() {
+        // 多 skill 总包（每 skill 一个顶层目录）：全部落位、互不嵌套
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let zip_path = home.join("multi.zip");
+        let f = std::fs::File::create(&zip_path).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        for (skill, file, body) in [
+            ("aproxy-cli", "SKILL.md", "# cli"),
+            ("aproxy-format", "SKILL.md", "# format"),
+        ] {
+            w.start_file(format!("{skill}/{file}"), opts).unwrap();
+            std::io::Write::write_all(&mut w, body.as_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+
+        let mut installed = install_skill_dir(home, &zip_path).unwrap();
+        installed.sort();
+        assert_eq!(
+            installed,
+            vec!["aproxy-cli".to_string(), "aproxy-format".to_string()]
+        );
+        assert!(skill_dir_in(home).join("SKILL.md").is_file());
+        assert!(
+            home.join("skills")
+                .join("aproxy-format")
+                .join("SKILL.md")
+                .is_file(),
+            "第二个 skill 应各自落位"
+        );
+        assert!(!home.join("skills").join(".staging").exists());
+    }
+
+    #[test]
+    fn install_skill_dir_replaces_old_and_rejects_empty() {
+        // 覆盖语义：已有目录被整目录替换；无顶层目录的 zip 拒绝
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let zip_path = home.join("s.zip");
+        let f = std::fs::File::create(&zip_path).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        w.start_file(
+            "aproxy-cli/SKILL.md",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        std::io::Write::write_all(&mut w, b"# v2").unwrap();
+        w.finish().unwrap();
+        install_skill_dir(home, &zip_path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(skill_dir_in(home).join("SKILL.md")).unwrap(),
+            "# v2",
+            "覆盖安装应替换旧内容"
+        );
+
+        // 空包：无任何顶层目录 → 拒绝且 staging 清理
+        let empty = home.join("empty.zip");
+        let f = std::fs::File::create(&empty).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        w.start_file("loose.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut w, b"x").unwrap();
+        w.finish().unwrap();
+        let err = install_skill_dir(home, &empty).unwrap_err();
+        assert!(err.contains("顶层目录"), "{err}");
+        assert!(!home.join("skills").join(".staging").exists());
     }
 
     #[test]

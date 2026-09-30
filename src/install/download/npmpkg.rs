@@ -231,9 +231,11 @@ pub async fn fetch(ctx: &DownloadCtx, artifact: Artifact, dest: &Path) -> Result
                 extract_from_tgz(&tgz_dest, inner, dest)?;
             }
             Artifact::Skills => {
-                // 主包内 skill 目录打的是 zip（组包脚本同款）；单文件场景
-                // 先提取 SKILL.md 供校验，整目录提取随第 8 步
-                let inner = "skills/aproxy-cli.zip";
+                // 主包内 skill 目录打的是**多 skill 总包** aproxy-skills.zip
+                // （与 GH release 总包同形：条目自带各 skill 顶层前缀；alpha.17
+                // 起取代单包 skills/aproxy-cli.zip——消费侧 install_skill_dir
+                // 已泛化为遍历顶层目录落位）。整 zip 提取后走统一落位。
+                let inner = "skills/aproxy-skills.zip";
                 extract_from_tgz(&tgz_dest, inner, dest)?;
             }
         }

@@ -155,6 +155,11 @@ listen_addr = "127.0.0.1:12345"          # local listener
 # log_file = "D:/aproxy-logs/a.log"      # custom log file (~ expanded; relative paths resolve against APROXY_HOME; default is a random per-start name, resolved via IPC)
 # connect_timeout_secs = 30              # upstream connect timeout (0 = none)
 # read_timeout_secs = 300                # inter-read timeout (0 = none)
+# request_transform = { command = "aproxy-format", args = ["run"], mode = "persistent", extra = "agg.toml" }
+                                         # external transformer (request side): hand body/headers/url to a format program
+                                         # (protocol conversion, key rotation, multi-channel aggregation; failure = 502, no retry; exclusive with forward_only)
+# response_transform = { command = "aproxy-format", args = ["run"], mode = "persistent" }
+                                         # external transformer (response side): rewrite upstream responses before replay (failure passes through)
 ```
 
 Runtime data lives in `~/.aproxy/`: `run/` (registry, restore records,
@@ -167,7 +172,7 @@ fields — program-managed).
 ## Development
 
 ```sh
-cargo test --locked                                # full suite (259 tests: 169 lib + 4 bin + 86 integration)
+cargo test --locked                                # full suite (baseline noted in docs/architecture.md; bump when adding tests)
 cargo clippy --all-targets --locked -- -D warnings # must be warning-free (project rule)
 cargo fmt --all -- --check
 ```

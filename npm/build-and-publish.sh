@@ -31,32 +31,67 @@ DRY_RUN=""
 if [ "${1:-}" = "--dry-run" ]; then
   DRY_RUN="--dry-run"
 fi
+# 组名参数化：空 = aproxy 主组（默认）；"format" = aproxy-format 双包组
+# （官方示例 format 二进制，独立发版链 release-format.yml）。$1 是组名时
+# --dry-run 移到 $2。
+GROUP="${1:-}"
+if [ "$GROUP" = "--dry-run" ]; then GROUP=""; fi
+GROUP_ARG="${1:-}"
+shift_arg=0
+case "$GROUP_ARG" in
+  --dry-run) DRY_RUN="--dry-run"; shift_arg=1 ;;
+  format) shift_arg=1 ;;
+esac
+if [ $shift_arg -eq 1 ] && [ "${2:-}" = "--dry-run" ]; then DRY_RUN="--dry-run"; fi
 
-# 版本来源：CI 取 tag（v 前缀剥离），本地取 RELEASE_TAG
+if [ "$GROUP_ARG" = "format" ]; then
+  GROUP="format"
+fi
+
+# 版本来源：CI 取 tag（组前缀剥离），本地取 RELEASE_TAG。format 组的 tag
+# 是 format-v0.1.0（版本独立于 aproxy alpha 线）。
+TAG_PREFIX="v"
+if [ "$GROUP" = "format" ]; then
+  TAG_PREFIX="format-v"
+fi
 VERSION="${GITHUB_REF_NAME:-}"
 if [ -n "${RELEASE_TAG:-}" ]; then
-  VERSION="${RELEASE_TAG#v}"
-elif [ -z "$VERSION" ] || [ "$VERSION" = "master" ] || [ "$VERSION" = "main" ]; then
-  echo "错误：CI 外运行必须设 RELEASE_TAG（如 v0.1.0-alpha.7）" >&2
+  VERSION="${RELEASE_TAG#${TAG_PREFIX}}"
+elif [ -n "$VERSION" ]; then
+  VERSION="${VERSION#${TAG_PREFIX}}"
+fi
+if [ -z "$VERSION" ] || [ "$VERSION" = "master" ] || [ "$VERSION" = "main" ]; then
+  echo "错误：CI 外运行必须设 RELEASE_TAG（如 ${TAG_PREFIX}0.1.0）" >&2
   exit 1
 fi
-VERSION="${VERSION#v}"
 
 REPO_URL="https://github.com/MoYeRanqianzhi/aProxy"
 PKG_SCOPE="@meowo/aproxy"
+ASSET_PREFIX="aproxy-"
+BIN_NAME="aproxy"
+PKG_DESC="Local API proxy with infinite retries for agent workloads"
+SUB_DESC="The aProxy binary for SUB_SUFFIX (local API proxy with infinite retries)"
+WRAPPER_SRC="npm/aproxy/bin/aproxy.js"
+if [ "$GROUP" = "format" ]; then
+  PKG_SCOPE="@meowo/aproxy-format"
+  ASSET_PREFIX="aproxy-format-"
+  BIN_NAME="aproxy-format"
+  PKG_DESC="Official example format program for aProxy (protocol conversion, key rotation, multi-channel aggregation)"
+  SUB_DESC="The aProxy format binary for SUB_SUFFIX (protocol conversion, key rotation, multi-channel aggregation)"
+fi
 
 # 子包后缀 : 资产文件名 : os : cpu
 # npm 分发固定取 baseline 变体（-v3 是 GitHub 资产的安装优化，npm 链不提供）
 MAPPINGS=(
-  "windows-x64:aproxy-x86_64-pc-windows-msvc.exe:win32:x64"
-  "windows-ia32:aproxy-i686-pc-windows-msvc.exe:win32:ia32"
-  "windows-arm64:aproxy-aarch64-pc-windows-msvc.exe:win32:arm64"
-  "linux-x64:aproxy-x86_64-unknown-linux-gnu:linux:x64"
-  "linux-x64-musl:aproxy-x86_64-unknown-linux-musl:linux:x64"
-  "linux-arm64:aproxy-aarch64-unknown-linux-gnu:linux:arm64"
-  "linux-arm64-musl:aproxy-aarch64-unknown-linux-musl:linux:arm64"
-  "darwin-arm64:aproxy-aarch64-apple-darwin:darwin:arm64"
-  "darwin-x64:aproxy-x86_64-apple-darwin:darwin:x64"
+  "windows-x64:${ASSET_PREFIX}x86_64-pc-windows-msvc.exe:win32:x64"
+  "windows-ia32:${ASSET_PREFIX}i686-pc-windows-msvc.exe:win32:ia32"
+  "windows-arm64:${ASSET_PREFIX}aarch64-pc-windows-msvc.exe:win32:arm64"
+  "linux-x64:${ASSET_PREFIX}x86_64-unknown-linux-gnu:linux:x64"
+  "linux-x64-musl:${ASSET_PREFIX}x86_64-unknown-linux-musl:linux:x64"
+  "linux-arm64:${ASSET_PREFIX}aarch64-unknown-linux-gnu:linux:arm64"
+  "linux-arm64-musl:${ASSET_PREFIX}aarch64-unknown-linux-musl:linux:arm64"
+  "darwin-arm64:${ASSET_PREFIX}aarch64-apple-darwin:darwin:arm64"
+  "darwin-x64:${ASSET_PREFIX}x86_64-apple-darwin:darwin:x64"
 )
 
 # 资产就位：CI 从合并的 artifact 目录取；本地从 GitHub Release 下载
@@ -65,7 +100,7 @@ if [ -n "${RELEASE_TAG:-}" ]; then
   echo "== 下载 Release 资产（${RELEASE_TAG}）"
   ASSET_DIR=".npm-assets"
   rm -rf "$ASSET_DIR" && mkdir -p "$ASSET_DIR"
-  gh release download "$RELEASE_TAG" -R MoYeRanqianzhi/aProxy -p "aproxy-*" -D "$ASSET_DIR"
+  gh release download "$RELEASE_TAG" -R MoYeRanqianzhi/aProxy -p "${ASSET_PREFIX}*" -D "$ASSET_DIR"
 else
   ASSET_DIR="artifacts"
 fi
@@ -75,9 +110,9 @@ for m in "${MAPPINGS[@]}"; do
   IFS=: read -r suffix asset os cpu <<<"$m"
   dir="npm/${PKG_SCOPE}-${suffix}"
   mkdir -p "$dir/bin"
-  # 包内 bin 名：win32 平台带 .exe（wrapper 按平台查找 aproxy[.exe]）
-  bin_out="aproxy"
-  [ "$os" = "win32" ] && bin_out="aproxy.exe"
+  # 包内 bin 名：win32 平台带 .exe（wrapper 按平台查找 <BIN>[.exe]）
+  bin_out="$BIN_NAME"
+  [ "$os" = "win32" ] && bin_out="${BIN_NAME}.exe"
   cp "$ASSET_DIR/$asset" "$dir/bin/$bin_out"
   chmod +x "$dir/bin/$bin_out" 2>/dev/null || true
 
@@ -89,7 +124,7 @@ for m in "${MAPPINGS[@]}"; do
 {
   "name": "${PKG_SCOPE}-${suffix}",
   "version": "${VERSION}",
-  "description": "The aProxy binary for ${suffix} (local API proxy with infinite retries)",
+  "description": "${SUB_DESC/SUB_SUFFIX/${suffix}}",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -106,19 +141,31 @@ done
 # ---- 主包：转发器 + README + optionalDependencies 全平台清单 ----
 main_dir="npm/${PKG_SCOPE}"
 mkdir -p "$main_dir/bin"
-cp npm/aproxy/bin/aproxy.js "$main_dir/bin/aproxy.js"
-cp npm/aproxy/README.md "$main_dir/README.md"
+# wrapper 是包名自检测的通用脚本（@meowo/aproxy* 两组通用），format 组
+# 复制同款内容为 <BIN>.js
+cp "$WRAPPER_SRC" "$main_dir/bin/${BIN_NAME}.js"
+if [ -f "npm/aproxy/README.md" ]; then
+  cp "npm/aproxy/README.md" "$main_dir/README.md" 2>/dev/null || true
+fi
 
-# skill 支线：主包附带 skill zip（install 的 npm 通道从这里提取；内容与
-# GH release 的 aproxy-skills.zip 同源同形——条目自带 aproxy-cli/ 顶层前缀，
-# 消费侧 install_skill_dir 按此形态解包）
-mkdir -p "$main_dir/skills"
-(
-  cd .claude/skills
-  # zip 输出走仓库根绝对路径——相对路径会按 cd 后的 cwd 解析（alpha.10
-  # 首跑曾因 "../../" 指到 .claude/skills/npm/ 下而创建失败）
-  zip -qr "$ROOT/$main_dir/skills/aproxy-cli.zip" aproxy-cli -x '*.zip'
-)
+# skill 支线：仅 aproxy 主组（format 组不携带 skill——install 的 npm 通道
+# 只在主包提取）。打**一个多 skill 总包** aproxy-skills.zip（与 GH release
+# 总包同源同形——条目自带各 skill 顶层目录前缀，消费侧 install_skill_dir
+# 泛化后按顶层目录逐个落位）。
+if [ "$GROUP" != "format" ]; then
+  mkdir -p "$main_dir/skills"
+  (
+    cd .claude/skills
+    names=""
+    for d in */; do
+      names="$names $(basename "$d")"
+    done
+    # zip 输出走仓库根绝对路径——相对路径会按 cd 后的 cwd 解析（alpha.10
+    # 首跑曾因 "../../" 指到 .claude/skills/npm/ 下而创建失败）
+    # shellcheck disable=SC2086
+    zip -qr "$ROOT/$main_dir/skills/aproxy-skills.zip" $names -x '*.zip'
+  )
+fi
 
 opt_deps=""
 for m in "${MAPPINGS[@]}"; do
@@ -127,11 +174,17 @@ for m in "${MAPPINGS[@]}"; do
   opt_deps+="    \"${PKG_SCOPE}-${suffix}\": \"${VERSION}\""
 done
 
+# format 组主包不带 README/skills（description 已表意；skill 只随 aproxy 主组）
+files_json='"bin/", "README.md", "skills/"'
+if [ "$GROUP" = "format" ]; then
+  files_json='"bin/"'
+fi
+
 cat >"$main_dir/package.json" <<EOF
 {
   "name": "${PKG_SCOPE}",
   "version": "${VERSION}",
-  "description": "Local API proxy with infinite retries for agent workloads",
+  "description": "${PKG_DESC}",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -139,9 +192,9 @@ cat >"$main_dir/package.json" <<EOF
   },
   "keywords": ["proxy", "retry", "api", "agent", "llm", "claude"],
   "bin": {
-    "aproxy": "bin/aproxy.js"
+    "${BIN_NAME}": "bin/${BIN_NAME}.js"
   },
-  "files": ["bin/", "README.md", "skills/"],
+  "files": [${files_json}],
   "engines": {
     "node": ">=18"
   },
@@ -167,4 +220,4 @@ done
 echo "== npm publish ${PKG_SCOPE}@${VERSION} ${DRY_RUN}"
 (cd "$main_dir" && npm publish --access public --tag latest $DRY_RUN)
 
-echo "== npm 渠道发布完成"
+echo "== npm 渠道发布完成（${PKG_SCOPE} 组）"

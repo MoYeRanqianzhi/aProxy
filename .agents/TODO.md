@@ -4,6 +4,37 @@
 > 2026-09-08 补录 tag 之后一轮（性能优化 + 磁盘缓存 + 重构 + skill），全部已完成。
 > 2026-09-09 第四轮审查修复 + 实测 restart bug + skill 指引优化，全部已完成。
 
+## 外部转换器（format）+ aproxy-format（2026-09-23，用户下令）
+
+- [ ] **实现中（主代理直接开发，分批提交）**：
+  - [x] 批次 0+1+2 代码：workspace 三成员化（aproxy / aproxy-envelope /
+    aproxy-format）+ 信封契约 crate（85aa85d）；TransformConfig 配置链 +
+    validate 互斥 + src/transform.rs 进程池 + proxy.rs 请求/响应两插入点 +
+    examples/format-echo.rs 跨平台测试 helper + tests/transform_integration.rs
+    集成测试（14 项矩阵）+ aproxy-format crate 实现（run/convert 子命令、
+    switchyard-translation 协议转换、轮换/加权轮换、多渠道路由、detect 启发式）
+    + aproxy-format skill（SKILL.md + 4 references）
+  - [ ] **响应侧集成测试挂起待定位**：response_transform_* 与
+    request_transform_timeout_* 测试运行超 60s（工具链重装后需复跑确认——
+    1.96.0→1.98.1 msvc toolchain 曾损坏已重装；可能原因：convert 读行挂/
+    mock 上游问题/Spawn worker 启动慢）
+- [ ] 批次 3：分发链（release.yml skills 泛化 + release-format.yml 独立
+    发布 workflow + npm 双包组 + install skills.rs 多 skill 泛化）
+  - [x] **restore_recovers 测试失败定性（2026-09-30 补充）**：全量并行下
+    `restore_recovers_crashed_daemon_and_is_idempotent` 稳定失败（L3306
+    「崩溃后恢复记录应保留」）、单跑必过——根因是**测试与生产看门狗竞争
+    全局 run 目录**（既有隔离债务，本待办条目所述）；2026-09-23 用户升级
+    生产实例（部分实例现跑 target\debug\aproxy.exe——顺带锁死了 cargo
+    重链）后生产看门狗行为变化，竞争从偶发变稳定。隔离化重写仍待做
+    （测试进程 set_var 会污染并行测试，需全域串行或逐命令 env 注入 +
+    spawn_detached 支持环境覆盖）。**与外部转换器功能无关，不阻塞提交**。
+  - [ ] 文档同步：architecture.md / INSTALL_AGENT.md / aproxy-cli 五
+    references（config-toml/behaviors/compatibility/commands/settings-json）
+    / .agents/DOCS.md + memory 留档
+  - [ ] 行为面实测（隔离 APROXY_HOME）：echo/rotate/error 转换、persistent
+    复用、forward_only 互斥、aproxy-format 聚合路由
+  - [ ] 全量验证：cargo test 全绿 + clippy -D warnings 零警告 + fmt clean
+
 ## 正式发布 v0.1.0-alpha.16（2026-09-23，用户下令）
 
 - [x] **发版闭环（含 rustls 收口）**：推送 master（大审查第二轮两修复

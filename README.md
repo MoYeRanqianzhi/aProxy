@@ -12,6 +12,7 @@
 
 - **无限重试** —— 夫唯不争，故天下莫能与之争。网络错误、4xx/5xx、错误 JSON（200 携带 error）皆触发重试；客户端断开即中止上游请求（计费保护）。两个**显式出口**：`forward_only` 模式（显式放弃重试，换取请求体与响应的流式直通）与 `bounded_retry_paths`（对确定性报错的上游端点，失败 3 次即透传真实响应，不再无限等待）。
 - **完全透传** —— 大音希声，大象无形。路径、查询、请求头原样转发；控制通道走独立命名管道，代理端口只做透传一件事。
+- **外部转换器（可选）** —— 化而欲作，吾将镇之以无名之朴。请求/响应可整流交给外部 format 程序改写（一行 JSON 信封进出，任何能读写 stdin/stdout 的程序都行）：OpenAI ↔ Anthropic 协议转换、多 key 轮换、多模型多渠道聚合。本体只加编排代码，转换逻辑全部外置；官方示例 `aproxy-format` 二进制开箱即用（独立发版）。
 - **守护进程** —— `aproxy` 后台启动（分离子进程，关终端不掉）；`status` / `stop` / `logs` / `restore` 全套实例管理。
 - **看门狗** —— 天网恢恢，疏而不失。全局看护进程自动重拉崩溃/挂死的实例（默认开启；实测 +2.4% 体积、+2.9MB 常驻、转发热路径零损耗）。
 - **多开** —— 万物并育而不相害。每份 config.toml 一实例，端口各自独立，并存不扰。
@@ -127,6 +128,11 @@ listen_addr = "127.0.0.1:12345"          # 本地监听
 # log_file = "D:/aproxy-logs/a.log"      # 自定义日志文件（~ 展开，相对路径相对 APROXY_HOME；缺省按启动随机命名，地址经 IPC 获取）
 # connect_timeout_secs = 30              # 上游连接建立超时（0 = 不设限）
 # read_timeout_secs = 300                # 两次读到数据间隔超时（0 = 不设限）
+# request_transform = { command = "aproxy-format", args = ["run"], mode = "persistent", extra = "agg.toml" }
+                                         # 外部转换器（请求侧）：交给 format 程序改写 body/headers/url（协议转换、
+                                         # 多 key 轮换、多渠道聚合；失败 502 不重试；与 forward_only 互斥）
+# response_transform = { command = "aproxy-format", args = ["run"], mode = "persistent" }
+                                         # 外部转换器（响应侧）：改写上游响应后回放（失败透传原样）
 ```
 
 运行数据在 `~/.aproxy/`：`run/`（实例注册与恢复记录、看护者 claim）、`logs/`（守护日志，按启动随机命名、自动清理与轮转，地址经 IPC 向实例询问；可用 `log_file` 自定义去向）、
@@ -136,7 +142,7 @@ listen_addr = "127.0.0.1:12345"          # 本地监听
 ## 开发
 
 ```powershell
-cargo test --locked           # 全量测试（当前基线 259 项：169 lib + 4 bin + 86 集成）
+cargo test --locked           # 全量测试（当前基线见 docs/architecture.md；新增测试后同步）
 cargo clippy --all-targets --locked -- -D warnings   # 必须零警告（项目纪律）
 cargo fmt --all -- --check
 ```

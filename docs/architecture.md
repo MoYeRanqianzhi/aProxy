@@ -31,6 +31,7 @@ agent 软件 ──HTTP──▶ [代理端口 12345] ──重试循环──�
 | `src/commands/` | 十一个子命令各自一文件（start/status/stop/restart/restore/alias/doctor/find/logs/config/install），共享 target 解析在 `mod.rs` |
 | `src/server.rs` | 服务承载：`serve_forever` 主循环、停止信号、日志初始化、配置错误落盘 startup.log |
 | `src/proxy.rs` | 转发核心：hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、keepalive、断开保护、仅转发模式 |
+| `src/transform.rs` | 外部转换器编排：stdin/stdout 一行 JSON 信封交给外部 format 程序改写（spawn 与 persistent 统一进程池、空闲 reaper、超时/崩溃 worker 剔除）；信封契约在独立 crate `aproxy-envelope` |
 | `src/decode.rs` | 检查用解码：按 `content-encoding`（gzip/deflate/br/zstd，多层逆序）解出一份**仅供检查/预览**的副本，转发字节不受影响 |
 | `src/retry.rs` | 重试判定：状态码、错误 JSON（含流式 NDJSON/SSE 形态） |
 | `src/config.rs` | 代理配置加载/保存/校验（`~/.aproxy/config.toml`，可多份平行并存） |
@@ -38,6 +39,17 @@ agent 软件 ──HTTP──▶ [代理端口 12345] ──重试循环──�
 | `src/daemon.rs` | 守护编排：IPC（ping/shutdown/观测）、实例注册表、恢复记录、孤儿清理 |
 | `src/watchdog.rs` | 看门狗：claim 选举、进程探活/句柄等待、共享内存心跳、重拉退避状态机 |
 | `src/util.rs` | bin 侧共用小工具：时间戳、时长人性化、凭据打码、key=value 解析 |
+
+## workspace 三成员
+
+- **aproxy**（根包）：代理本体。编译闭包不含 switchyard 等转换库——本体
+  体积不受外部转换器功能影响。
+- **aproxy-envelope**：信封契约 crate（一行 JSON 的 serde 类型 + base64
+  携带），aproxy 与 aproxy-format 共同依赖，单源维护防契约漂移。
+- **aproxy-format**：官方示例 format 二进制（协议转换 switchyard-translation
+  + key 轮换/加权轮换 + 多模型多渠道聚合）。版本独立于 aproxy alpha 线，
+  单独发 Release（format tag 触发独立 workflow）；它稳定后几乎不更新——
+  更多功能用户直接让 agent 写 format（见 aproxy-format skill）。
 
 CLI 定义（cli.rs）与子命令处理（commands/）分离；启动父进程逻辑（预检/spawn）
 在 `commands/start.rs`，服务本身在 `server.rs`——守护子进程由前者直接进入后者。

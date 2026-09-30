@@ -172,19 +172,40 @@ pub async fn fetch_build(
     })
 }
 
-/// 从 .crate 提取 skill 文件打包成 zip（统一走 skills 落位）。
+/// 从 .crate 提取全部 skill 打包成 zip（统一走 skills 落位）：遍历
+/// .claude/skills/ 下全部顶层目录，每 skill 自带自身名前缀——与
+/// skills::install_skill_dir 的多顶层落位形态一致。
 async fn fetch_build_skills(ctx: &DownloadCtx, dest: &Path) -> Result<Fetched, String> {
     let work = dest.parent().unwrap().join("cargo-skill");
     let _ = std::fs::remove_dir_all(&work);
     let src = fetch_and_unpack_crate(ctx, &work).await?;
-    let skill_src = src.join(".claude").join("skills").join("aproxy-cli");
-    if !skill_src.is_dir() {
+    let skills_src = src.join(".claude").join("skills");
+    if !skills_src.is_dir() {
         return Err("crate 内未找到 skill 文件（include 白名单未包含？）".to_string());
     }
-    // 目录 → zip
+    // 目录 → zip（每 skill 一个顶层前缀）
     let f = std::fs::File::create(dest).map_err(|e| format!("zip 创建失败: {e}"))?;
     let mut w = zip::ZipWriter::new(f);
-    add_skill_tree(&mut w, &skill_src, &skill_src)?;
+    let mut any = false;
+    for entry in std::fs::read_dir(&skills_src).map_err(|e| format!("skills 目录读取失败: {e}"))?
+    {
+        let p = entry
+            .map_err(|e| format!("skills 目录条目读取失败: {e}"))?
+            .path();
+        if !p.is_dir() {
+            continue;
+        }
+        any = true;
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("skill 目录名非法")?
+            .to_string();
+        add_skill_tree(&mut w, &p, &p, &name)?;
+    }
+    if !any {
+        return Err("crate 内 skills 目录为空（include 白名单未包含？）".to_string());
+    }
     w.finish().map_err(|e| format!("zip 收尾失败: {e}"))?;
     let sum = crate::install::staging::sha256_hex(dest)?;
     Ok(Fetched {
@@ -202,12 +223,13 @@ fn binary_name() -> &'static str {
     }
 }
 
-/// 递归把 skill 目录树写入 zip（条目名带 `aproxy-cli/` 前缀——与
+/// 递归把 skill 目录树写入 zip（条目名带 skill 名前缀——与
 /// skills::install_skill_dir 的解包布局一致）。
 fn add_skill_tree(
     w: &mut zip::ZipWriter<std::fs::File>,
     base: &Path,
     dir: &Path,
+    skill_name: &str,
 ) -> Result<(), String> {
     let rd = std::fs::read_dir(dir).map_err(|e| format!("skill 目录读取失败: {e}"))?;
     for entry in rd.flatten() {
@@ -216,10 +238,10 @@ fn add_skill_tree(
             .strip_prefix(base)
             .map_err(|e| format!("skill 路径处理失败: {e}"))?;
         if p.is_dir() {
-            add_skill_tree(w, base, &p)?;
+            add_skill_tree(w, base, &p, skill_name)?;
         } else {
             w.start_file(
-                format!("aproxy-cli/{}", rel.display()),
+                format!("{skill_name}/{}", rel.display()),
                 zip::write::SimpleFileOptions::default(),
             )
             .map_err(|e| format!("zip 写入失败: {e}"))?;

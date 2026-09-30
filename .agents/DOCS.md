@@ -10,6 +10,10 @@
 
 - `aproxy-cli/` — aProxy CLI 全量参考（SKILL.md 导航 + references/latest/ 五分文件）；
   版本留存策略与持续更新义务见 `.agents/memory/2026-09-07-aproxy-cli-skill-versioning.md`
+- `aproxy-format/` — 外部转换器 format 程序编写指南（SKILL.md + references/
+  protocol/guide/examples/troubleshooting：信封协议逐字段、标准工具结构、
+  配置易错点、官方 aproxy-format 二进制用法）；设计决策见
+  `.agents/memory/2026-09-23-transform-format.md`
 
 ## 面向 agent（./.agents/）
 

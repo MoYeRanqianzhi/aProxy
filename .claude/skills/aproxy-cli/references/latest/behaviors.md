@@ -11,6 +11,7 @@
 - [流式响应处理](#流式响应处理)
 - [磁盘缓存（spool）](#磁盘缓存spool)
 - [仅转发模式（forward_only）](#仅转发模式forward_only)
+- [外部转换器（request_transform / response_transform）](#外部转换器request_transform--response_transform)
 - [多开与实例区分](#多开与实例区分)
 - [控制通道（IPC）](#控制通道ipc)
 - [日志](#日志)
@@ -27,10 +28,13 @@
 默认模式（forward_only = false）：
          1. 读入并缓冲完整请求体（超 max_body_mb 即 413，不转发）
          2. 透传 method/路径/查询/头（extra/override 头在此注入）
+         2.5 配了 request_transform → 整个请求交给 format 程序改写
+             （body/headers/url/method 全可变；改写产物贯穿后续全部重试）
          3. 上游响应缓冲到内存/磁盘 spool
          4. 判定成功/需重试（见下）
             需重试 → 退避后从第 2 步重来（请求体可重放），同时向客户端发心跳
-            成功   → 把缓冲的响应原样回放给客户端
+            成功   → 配了 response_transform 则先交给 format 改写响应，
+                     然后把响应回放给客户端
 
 仅转发模式（forward_only = true）：
          1. 不缓冲——请求体流式直发上游（途中计数，超 max_body_mb 即中止上游 + 413）
@@ -151,6 +155,39 @@
 
 改配置后 `aproxy restart <端口或别名>` 生效（本模式**无 CLI 旗标**，只能写 toml
 或 settings.json）。
+
+## 外部转换器（request_transform / response_transform）
+
+配了转换器（默认关）后，请求/响应在缓冲边界上被交给外部 format 程序改写
+（一行 JSON 信封进出，协议与编写指南见 **aproxy-format skill**——本节只列
+aProxy 侧行为语义）。
+
+```
+请求：缓冲完成 → [请求 format] → 发上游 → 重试重放（转换产物，不重复转换）
+响应：spool + 成功判定 → [响应 format] → 回放客户端
+```
+
+- **可改写面**：请求侧 body/headers/url/method 全部可变（url 改写 = 协议
+  转换的路径/域名迁移）；响应侧 body/headers 可变。
+- **失败语义两侧不同**：
+  - 请求侧转换失败（进程崩溃/超时/输出 error 行）→ **502 + 原因，不发上游、
+    不重试**（转换失败是确定性的），记入 status 的「最近错误」。
+  - 响应侧转换失败 → **透传上游原始响应** + warn 日志（响应已在手，可用性
+    优先）；保活通道同样透传（不发 SSE error 事件）。
+- **persistent 进程池**：`mode = "persistent"` 时 format 进程以 while 循环
+  逐行处理，池按并发扩容至 `pool_max`（超限排队——只加延迟不损吞吐），
+  空闲 `idle_timeout_secs` 后回收（0=永不）；单请求超 `timeout_secs` 未回行
+  则 kill 该 worker。**worker 回收主机制 = stdin EOF**：实例退出时 aProxy
+  关闭管道，format 按协议义务自行退出。
+- **headers 语义**：信封头表键小写、整表替换；hop-by-hop 与 content-length
+  不进信封（aProxy 按实际字节回填）；多值头仅保留首值（warn 留痕）；format
+  输出的非法头名/头值丢弃 + warn。响应侧强制剔除 content-length 与
+  content-encoding（字节已变换，旧声明失真）。
+- **不进转换器**：`bounded_retry_paths` 命中且达到上限的透传路径（错误响应
+  不经 format）；仅转发模式（与转换器互斥，启动报错）。
+- **配置**：仅 toml 每实例字段（无 settings 全局层、无 CLI 旗标），子字段与
+  校验见 config-toml.md；官方示例 aproxy-format 二进制单独发 Release。
+- 改配置后 `aproxy restart <端口或别名>` 生效。
 
 ## 多开与实例区分
 
@@ -283,6 +320,9 @@ install.state 的 `skill` 字段可查。`--skills-only` 单独更新。安装�
 | 实例崩溃后被自动拉起但配置是旧的 | 看门狗按 .restore 记录重拉——改配置后执行 `aproxy restart <端口>`，重启成功即以当前参数重写记录 |
 | status 显示「看护者缺席」相关告警 | 看护者被杀/假死；守护 5 分钟内自动补种，或手动跑一次 `aproxy start <别名>` |
 | 磁盘缓存想关 | toml 或 settings 写 `disk_cache = false`，重启实例 |
+| 请求 502 且错误含「format」 | 外部转换器失败：按文案区分（「启动失败」=command 路径、「报告转换失败」=format 业务判定、「超时」=调 timeout_secs）——详见 aproxy-format skill 排障节 |
+| 配置了转换器但响应没转换 | response_transform 是**独立配置**（忘配 = 响应原样）；或响应转换失败透传了原样（查 `aproxy logs` 的「响应转换失败」warn）；bounded_retry 透传路径本就不进转换器 |
+| 启动报「forward_only 与外部转换器互斥」 | 两配置同开是矛盾（forward_only 不缓冲、转换器要全量 body）——留一个 |
 | 想关掉重试（要真流式直通） | 该实例 toml 或 settings 写 `forward_only = true`，`aproxy restart <端口或别名>` 生效——**代价是放弃重试/缓冲/心跳保障**，仅上游可信时用 |
 | `forward_only` 下上游报错直接 502 / 流中断被截断 | 符合预期：该模式不重试、不注入上游未发出的字节，错误原样暴露给客户端（日志有记录） |
 | settings.json 报「解析失败」 | 修复 JSON 或删除该文件（回退默认，别名需重新 add） |

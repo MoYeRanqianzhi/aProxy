@@ -105,16 +105,18 @@ local endpoint: **`http://127.0.0.1:12345`**.
 
 ## 5. Skill documentation (optional, for agent self-service)
 
-The installer places the full CLI reference at
-`~/.aproxy/skills/aproxy-cli/`. To use it as your own skill documentation, link
-it into your skills directory, e.g. for Claude Code:
+The installer places all skill references under `~/.aproxy/skills/`
+(`aproxy-cli` = CLI/config/behavior reference; `aproxy-format` = guide for
+writing external transformer programs). To use them as your own skill
+documentation, link them into your skills directory, e.g. for Claude Code:
 
 ```sh
 ln -s ~/.aproxy/skills/aproxy-cli ~/.claude/skills/aproxy-cli
+ln -s ~/.aproxy/skills/aproxy-format ~/.claude/skills/aproxy-format
 ```
 
-It covers every command, config field, behavior semantics, and
-troubleshooting — read it before improvising CLI flags.
+They cover every command, config field, behavior semantics, and
+troubleshooting — read them before improvising CLI flags.
 
 ## 6. Troubleshooting quick table
 

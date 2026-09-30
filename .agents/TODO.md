@@ -24,11 +24,14 @@
   - **行为面实测**（隔离 APROXY_HOME）：aproxy-format persistent 双池挂进
     真实实例，anthropic 请求经聚合路由到 mock 上游、SSE 同协议直通回放、
     第二请求复用 worker（恰 2 个 format 进程）
-- [ ] **守护/安装类时序测试的隔离债务（升级为明确待办）**：全量并行下
-  restore_recovers / continue_from_swapping 等用全局 run 目录的测试偶发
-  失败（每次不同、单跑全过）。定性：与生产看门狗/用户生产操作竞争全局
-  run 目录；且用户生产实例现跑 target\debug\aproxy.exe（锁死 cargo 重链，
-  rename .in-use 可规避）。修复需逐命令 env 注入或全域串行。
+- [x] **守护/安装类时序测试的隔离债务——restore 已修复（2026-09-30）**：
+  restore_recovers 隔离化重写完成（APROXY_HOME 注入 start 父进程、守护隔代
+  继承、前置 IPC ping 清残留），全量并行 62 项 proxy_integration 稳定全绿。
+  全量基线升至 **293 项全绿 0 失败**。残余观察项：continue_from_swapping
+  （install_flow，已有 TestEnv 隔离）曾单次偶发、单跑必过，暂留观察。
+- [ ] **其余全局 run 目录测试的隔离化**（低优先）：仍有少数测试走全局
+  run 目录（依赖真实环境语义），生产看门狗活跃时的竞争面已大幅收窄，
+  逐个评估是否需要同款隔离模式。
 
 ## 正式发布 v0.1.0-alpha.16（2026-09-23，用户下令）
 

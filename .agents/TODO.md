@@ -6,6 +6,17 @@
 
 ## 外部转换器（format）+ aproxy-format（2026-09-23 下令，2026-09-30 完成）
 
+- [x] **Workflow 全链审查 + 处置闭环（2026-09-30，用户下令「分配 workflow
+  再进行一轮审查」）**：六维并行（需求符合性/正确性并发/安全/文档一致性/
+  平台分发/测试完整性，32 agents）+ 逐条对抗验证——确认 26 项（0 驳回）
+  全部闭环（cf9874d）：**P0×2**（release-format 缺 download-artifact、
+  aproxy-format path 依赖缺 version——两处发布链断裂）；**P1×7**（command
+  ~ 展开代码化、SSE 能力宣传不实、示例 url/jq/rust-version 修正、两个假
+  覆盖测试重写）；**P2×17**（method warn、鉴权头剥离扩展、安全须知节、
+  spawn 串行化/auto 误判/保活 headers 例外等文档补全、8 项测试覆盖与
+  卫生）。**基线：全量 297 项全绿**。残余观察：install_flow_lib 组内并行
+  偶发（60s 卡死监视器窗口，单跑/重跑必过，非本功能）。
+
 - [x] **全链完成（主代理直接开发，两提交 85aa85d + 6ec95b0）**：
   - workspace 三成员化（aproxy / aproxy-envelope / aproxy-format）+ 信封契约
     crate；TransformConfig 配置链 + validate 互斥 + src/transform.rs 进程池 +

@@ -295,8 +295,13 @@ jobs:
           EOF
       - uses: rust-lang/crates-io-auth-action@v1.0.5
         id: crates-auth
-      - name: Publish to crates.io
+      - name: Publish to crates.io（envelope 先发——aproxy 依赖它）
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
-        # --allow-dirty：工作区被上一步有意改为 tag 版本（对齐产物），非意外
-        run: cargo publish --locked --allow-dirty
+        # --allow-dirty：工作区被上一步有意改为 tag 版本（对齐产物），非意外。
+        # workspace 化后 aproxy 依赖 aproxy-envelope（crates.io 上的 version
+        # 依赖）——envelope 未发布时主包 publish 必失败，故先发 envelope
+        run: |
+          cargo publish --locked --allow-dirty -p aproxy-envelope || \
+            echo "aproxy-envelope 已存在（版本未变时 publish 报错，幂等跳过）"
+          cargo publish --locked --allow-dirty -p aproxy

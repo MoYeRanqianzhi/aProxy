@@ -181,8 +181,14 @@ aProxy 侧行为语义）。
   关闭管道，format 按协议义务自行退出。
 - **headers 语义**：信封头表键小写、整表替换；hop-by-hop 与 content-length
   不进信封（aProxy 按实际字节回填）；多值头仅保留首值（warn 留痕）；format
-  输出的非法头名/头值丢弃 + warn。响应侧强制剔除 content-length 与
-  content-encoding（字节已变换，旧声明失真）。
+  输出的非法头名/头值丢弃 + warn；非法 method 同样 warn + 沿用原方法。
+  响应侧强制剔除 content-length 与 content-encoding（字节已变换，旧声明
+  失真）。**保活通道例外**：SSE 骨架（200 + text/event-stream）先行发出，
+  状态行与响应头不可再改——保活通道下 format 对响应 headers 的改写不生效，
+  仅 body 转换生效。
+- **command 支持 `~/` 展开**：`request_transform`/`response_transform` 的
+  command 在加载时做 `~` 前缀展开（`~/.aproxy/bin/aproxy-format` 可直接
+  使用）。
 - **不进转换器**：`bounded_retry_paths` 命中且达到上限的透传路径（错误响应
   不经 format）；仅转发模式（与转换器互斥，启动报错）。
 - **配置**：仅 toml 每实例字段（无 settings 全局层、无 CLI 旗标），子字段与

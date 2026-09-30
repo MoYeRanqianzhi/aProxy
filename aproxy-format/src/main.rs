@@ -245,10 +245,18 @@ fn handle_request(
         channel.url.clone()
     };
 
-    // 鉴权头：先剥客户端原头，再按渠道协议写（防泄漏 + 防冲突）
+    // 鉴权头：先剥客户端原头，再按渠道协议写（防泄漏 + 防冲突）。
+    // cookie / proxy-authorization 同属凭据面（浏览器会话/代理凭据不应
+    // 跟随转发到渠道上游），一并剥离
     let mut headers = env.headers.clone();
-    headers.remove("authorization");
-    headers.remove("x-api-key");
+    for h in [
+        "authorization",
+        "x-api-key",
+        "cookie",
+        "proxy-authorization",
+    ] {
+        headers.remove(h);
+    }
     match channel.format {
         WireFormat::AnthropicMessages => {
             headers.insert("x-api-key".to_string(), key);
@@ -335,9 +343,15 @@ fn handle_response(
     };
 
     let mut headers = env.headers.clone();
-    // 安全决策：上游真实 key 不回传客户端
-    headers.remove("authorization");
-    headers.remove("x-api-key");
+    // 安全决策：上游真实 key 与凭据面头不回传客户端
+    for h in [
+        "authorization",
+        "x-api-key",
+        "cookie",
+        "proxy-authorization",
+    ] {
+        headers.remove(h);
+    }
 
     let mut out = TransformEnvelope {
         headers,

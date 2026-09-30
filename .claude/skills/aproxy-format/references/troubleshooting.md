@@ -51,6 +51,16 @@ format 的循环没处理 stdin EOF。铁律：**读到 EOF 就 exit**（aProxy 
 - `client_format = "auto"` 检测失败也会报错（错误文案带「检测失败」）——
   请求字段名不像已知协议时改为显式声明格式。
 
+## auto 模式的协议误判（静默走错转换路径）
+
+`client_format = "auto"` 按 body 形态启发式检测：**Anthropic 的 `system`
+是可选字段**——不带 `system` 的标准 Anthropic 请求（`{model, max_tokens,
+messages}`）会被判成 OpenAI Chat，随后的转换或直通方向就是错的且**无报错**
+（表现：上游收到错协议 body / 字段变形如 tool 的 `input_schema` 丢失）。
+规避：**生产实例显式声明 `client_format`**（如 `"openai_chat"`），auto 只
+留给输入协议确实单一明确的场景；已误配的按本节改后
+`aproxy restart <端口或别名>`。
+
 ## 响应侧报「url 反查不到渠道」
 
 请求侧把 url 改写到了渠道表之外的地址（自定义 format 改了 url 但响应侧

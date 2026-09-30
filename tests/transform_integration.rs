@@ -93,6 +93,48 @@ fn format_echo_path() -> PathBuf {
 
 type Captured = Arc<Mutex<Vec<u8>>>;
 
+/// 记录型上游：完整捕获每次请求的 method/path/headers/body（末次快照 +
+/// 调用序列）——url 改写、method 改写、头表替换等改写面的可观测断言面。
+#[derive(Clone, Default)]
+struct CapturedRequest {
+    method: String,
+    path: String,
+    authorization: Option<String>,
+    body: Vec<u8>,
+}
+
+type RequestLog = Arc<Mutex<Vec<CapturedRequest>>>;
+
+/// 全量记录上游：method/path/headers/body 逐请求入列并原样回显 body
+async fn recording_upstream() -> (String, RequestLog, tokio::task::JoinHandle<()>) {
+    let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let state_log = log.clone();
+    let app = Router::new().fallback(move |req: Request| async move {
+        let method = req.method().to_string();
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_default();
+        let authorization = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok().map(String::from));
+        let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        state_log.lock().unwrap().push(CapturedRequest {
+            method,
+            path,
+            authorization,
+            body: bytes.to_vec(),
+        });
+        (StatusCode::OK, Body::from(bytes)).into_response()
+    });
+    let (url, jh) = bind_router(app).await;
+    (url, log, jh)
+}
+
 /// 回显上游：记录收到的 body 并原样返回
 async fn echo_upstream() -> (String, Captured, tokio::task::JoinHandle<()>) {
     let captured: Captured = Arc::new(Mutex::new(Vec::new()));
@@ -119,6 +161,23 @@ async fn fixed_upstream(
         move |State(c): State<Arc<AtomicUsize>>, _req: Request| async move {
             c.fetch_add(1, Ordering::SeqCst);
             (status, body).into_response()
+        },
+    );
+    let (url, jh) = bind_router(app.with_state(state_count)).await;
+    (url, count, jh)
+}
+
+/// 固定字节上游：返回任意（含非 UTF-8）body（带调用计数）
+async fn bytes_upstream(
+    status: StatusCode,
+    body: Vec<u8>,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let state_count = count.clone();
+    let app = Router::new().fallback(
+        move |State(c): State<Arc<AtomicUsize>>, _req: Request| async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            (status, Body::from(body.clone())).into_response()
         },
     );
     let (url, jh) = bind_router(app.with_state(state_count)).await;
@@ -199,18 +258,18 @@ async fn request_spawn_echo_preserves_body_and_target() {
 #[tokio::test]
 async fn request_transform_rewrites_url() {
     isolate_env_proxy();
-    let (upstream, captured, _jh) = echo_upstream().await;
+    // 全量记录上游：断言上游**实际收到的路径**是改写后的——只断言「200」
+    // 没有鉴别力（fallback 路由任意路径都 200，改写被整个移除测试照样绿）
+    let (upstream, log, _jh) = recording_upstream().await;
     let mut cfg = proxy_config_for(&upstream);
     // extra 即新 url：改写到上游的 /rewritten 路径（协议转换核心语义）
     cfg.request_transform = Some(TransformConfig {
         args: vec!["rewrite".to_string()],
-        extra: Some(format!("{upstream}/rewritten")),
+        extra: Some(format!("{upstream}/rewritten?marker=1")),
         ..transform_config("rewrite", TransformMode::Spawn)
     });
     let (proxy, _pj) = start_proxy(cfg).await;
 
-    // mock 上游是 fallback 路由（任意路径命中），url 改写后仍回显成功；
-    // 断言点：请求确实经由改写后的 url 到达（上游收到 body 即证明路径可达）
     let resp = local_client()
         .post(format!("{proxy}/v1/original"))
         .body("hello")
@@ -218,17 +277,47 @@ async fn request_transform_rewrites_url() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let entries = log.lock().unwrap();
+    assert_eq!(entries.len(), 1, "恰好一次上游请求");
     assert_eq!(
-        *captured.lock().unwrap(),
-        b"hello",
-        "改写后 url 仍把 body 送达上游"
+        entries[0].path, "/rewritten?marker=1",
+        "上游收到的必须是改写后的路径+查询串，而非客户端原始 /v1/original"
+    );
+    assert_eq!(entries[0].body, b"hello", "body 照常送达");
+}
+
+#[tokio::test]
+async fn request_transform_scrub_deletes_header_and_rewrites_method() {
+    isolate_env_proxy();
+    // 头表替换的「删头语义」与 method 改写的可观测验证
+    let (upstream, log, _jh) = recording_upstream().await;
+    let mut cfg = proxy_config_for(&upstream);
+    cfg.request_transform = Some(transform_config("scrub", TransformMode::Spawn));
+    let (proxy, _pj) = start_proxy(cfg).await;
+
+    let resp = local_client()
+        .post(format!("{proxy}/v1/x"))
+        .header("authorization", "Bearer client-secret")
+        .body("q")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let entries = log.lock().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].method, "PUT", "format 改写的 method 应到达上游");
+    assert_eq!(
+        entries[0].authorization, None,
+        "format 删掉的 authorization 不得到达上游"
     );
 }
 
 #[tokio::test]
 async fn request_persistent_rotate_rotates_keys_continuously() {
     isolate_env_proxy();
-    let (upstream, captured, _jh) = echo_upstream().await;
+    // 全量记录上游：轮换序列（k1→k2）必须可在**上游实际收到的
+    // authorization 头**上观测——旧版此测试第二次请求零断言（假覆盖）
+    let (upstream, log, _jh) = recording_upstream().await;
     let mut cfg = proxy_config_for(&upstream);
     cfg.request_transform = Some(TransformConfig {
         args: vec!["rotate".to_string()],
@@ -239,24 +328,32 @@ async fn request_persistent_rotate_rotates_keys_continuously() {
     let client = local_client();
 
     // persistent 池内同 worker 复用：轮换计数在进程内存连续 → k1, k2
-    client
+    let r1 = client
         .post(format!("{proxy}/v1/x"))
         .body("r1")
         .send()
         .await
         .unwrap();
-    let first = String::from_utf8(captured.lock().unwrap().clone()).unwrap_or_default();
-    client
+    assert_eq!(r1.status(), StatusCode::OK);
+    let r2 = client
         .post(format!("{proxy}/v1/x"))
         .body("r2")
         .send()
         .await
         .unwrap();
-    // 上游回显的是 body（不含头）——rotate 的头断言经两个不同的请求体回显
-    // 不可见；这里断言 persistent 池确实复用（第二次请求成功即池未崩），
-    // 头轮换语义由 aproxy-format 自身的单测钉死。此测试断言两请求均成功。
-    assert_eq!(first, "r1");
-    let _ = captured.lock().unwrap().clone();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let entries = log.lock().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries[0].authorization.as_deref(),
+        Some("Bearer k1"),
+        "第一请求拿首 key"
+    );
+    assert_eq!(
+        entries[1].authorization.as_deref(),
+        Some("Bearer k2"),
+        "第二请求轮换到次 key（persistent 进程内计数连续的实锤）"
+    );
 }
 
 #[tokio::test]
@@ -360,10 +457,14 @@ async fn request_transform_large_body_disk_path_reaches_upstream() {
     let (upstream, captured, _jh) = echo_upstream().await;
     let mut cfg = proxy_config_for(&upstream);
     cfg.request_transform = Some(transform_config("echo", TransformMode::Spawn));
+    // 2 MiB：超内存驻留阈值（1 MiB），走「Disk 读出 → 转换 → 新 Disk 落盘」
+    // 链路。spool_dir 注入 tempdir——不注入会按端口写真实 ~/.aproxy/spool/
+    // （测试卫生：每次运行约 6MiB 临时文件进生产目录）
+    let spool = tempfile::tempdir().unwrap();
+    cfg.spool_dir_override = Some(spool.path().to_path_buf());
     let (proxy, _pj) = start_proxy(cfg).await;
-
-    // 2 MiB：超内存驻留阈值（1 MiB），走「Disk 读出 → 转换 → 新 Disk 落盘」链路
     let payload: Vec<u8> = (0..(2 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
+
     let resp = local_client()
         .post(format!("{proxy}/v1/large"))
         .body(payload.clone())
@@ -376,6 +477,9 @@ async fn request_transform_large_body_disk_path_reaches_upstream() {
         payload,
         "大 body 经转换后逐字节到达"
     );
+    // spool 临时文件的清理由 RequestBody/SpooledBody 的 Drop 语义保证
+    // （响应返回与 Drop 间存在时序窗口，不做即时目录空断言）
+    drop(spool);
 }
 
 // ---------------------------------------------------------------------------
@@ -466,6 +570,31 @@ async fn response_transform_sse_rewrites_stream() {
     assert_eq!(resp.status(), StatusCode::OK);
     let text = resp.text().await.unwrap();
     assert_eq!(text, "DATA: {\"A\":1}\n\n", "SSE body 整流转文本应被转换");
+}
+
+#[tokio::test]
+async fn response_transform_b64_body_preserved() {
+    isolate_env_proxy();
+    // 非 UTF-8 上游响应：aproxy 侧以 body_b64 喂 format（echo 原样回显）、
+    // 读回后逐字节保真回放——响应侧的 b64 往返此前零覆盖
+    let payload: Vec<u8> = vec![0x1f, 0x8b, 0x00, 0xff, 0xfe, 0x80];
+    let (upstream, _count, _jh) = bytes_upstream(StatusCode::OK, payload.clone()).await;
+    let mut cfg = proxy_config_for(&upstream);
+    cfg.response_transform = Some(transform_config("echo", TransformMode::Spawn));
+    let (proxy, _pj) = start_proxy(cfg).await;
+
+    let resp = local_client()
+        .get(format!("{proxy}/v1/x"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.bytes().await.unwrap();
+    assert_eq!(
+        bytes.as_ref(),
+        payload.as_slice(),
+        "非 UTF-8 响应逐字节保真"
+    );
 }
 
 #[tokio::test]

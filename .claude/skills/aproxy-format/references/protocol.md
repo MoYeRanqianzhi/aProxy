@@ -70,3 +70,15 @@ key 使用不均。spawn 模式恒 0。
 aProxy 配置 `request_transform.extra` / `response_transform.extra` 的原样
 透传（格式无要求，format 自解）。官方 aproxy-format 约定：extra = 聚合配置
 文件的路径。
+
+## 安全须知（写 format 前必读）
+
+- **信封含客户端完整凭据**：`headers` 里有客户端发来的 `authorization` /
+  `x-api-key` 等鉴权头原值。你的 format 进程能读到它们——**不要写入日志、
+  不要转发到信封 url 之外的目的地**。请求侧改写鉴权头时先删旧值再写渠道值。
+- **响应侧输出头表直接回放客户端**：若你在请求侧曾把真实渠道 key 写进
+  上游头，响应侧输出时务必重建干净头表（官方 aproxy-format 自动剔除
+  `authorization` / `x-api-key` / `cookie` / `proxy-authorization`）。
+- **保活通道例外**：客户端走 SSE 保活通道时（上游首轮失败进入重试），
+  响应头表已随 SSE 骨架发出——此通道下 format 对 headers 的改写**不生效**，
+  仅 body 转换生效。

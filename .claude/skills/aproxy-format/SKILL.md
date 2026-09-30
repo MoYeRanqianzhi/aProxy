@@ -13,10 +13,12 @@ headers、body 全部可改写，这就是协议转换与聚合的全部机制�
 
 两种运行模式（`request_transform`/`response_transform` 的 `mode`）：
 - **spawn**（默认）：每请求启动你的进程、一行进出、进程退出。最简单，任何
-  能读写 stdin/stdout 的程序都行。
+  能读写 stdin/stdout 的程序都行。**注意：spawn 模式下转换在单实例内是
+  串行的**（每请求一次进程启动，实例内逐个执行）——高并发场景选 persistent。
 - **persistent**：进程池。你的进程以 `while` 循环逐行处理（一次一个请求、
-  输入输出有序），按需扩容至 `pool_max`，空闲超时被回收。**聚合类 format
-  （轮换计数等状态在进程内存）必须用本模式**。
+  输入输出有序），按需扩容至 `pool_max`（并发上限），空闲超时被回收。
+  **聚合类 format（轮换计数等状态在进程内存）必须用本模式**；高并发场景
+  也用它（进程免重启、池按并发扩容）。
 
 失败语义（两侧不同，写 format 前先想清楚你在哪一侧）：
 - **请求侧转换失败 → 502 不重试**（确定性失败）
@@ -43,7 +45,9 @@ headers、body 全部可改写，这就是协议转换与聚合的全部机制�
    挂成孤儿进程）。一行处理完立即写回，再等下一行。
 4. **headers 键是小写规范名，整表替换**：你收到完整头表，输出的头表**就是**
    发往上游的头表（多 key 轮换 = 改写 `authorization` 即可）。不要输出
-   `content-length`/`content-encoding` 等 hop-by-hop 头（aProxy 会忽略它们）。
+   `content-length` / `transfer-encoding` 等**传输控制头**（aProxy 按实际
+   字节回填，你输出的也会被忽略）；`content-encoding` 在响应侧会被强制
+   剔除（aProxy 交给你的 body 已解码）——不要试图在信封层处理压缩。
 5. **大 body 走 `body_b64`**：body 不是合法 UTF-8 时用 base64 字段，其余场景
    用 `body` 文本字段（两者互斥）。
 6. **不要设 content-length**：aProxy 按实际字节回填，你设了也会被忽略。

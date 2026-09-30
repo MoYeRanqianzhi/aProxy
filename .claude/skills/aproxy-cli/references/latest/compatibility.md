@@ -35,7 +35,10 @@ aproxy status               # 每行 v<semver> = 各实例实际运行的守护�
   aproxy` 语义不变、本体依赖树只新增轻量的 aproxy-envelope。aproxy-format
   **单独发 Release**（版本独立于 aproxy alpha 线，稳定后几乎不更新），
   二进制建议落 `~/.aproxy/bin/`。
-- **rustc 下限维持 1.88**；新增依赖：`base64`（aproxy-envelope 侧）。
+- **rustc 下限**：aproxy 主程序维持 1.88；**aproxy-format 单独要求
+  1.96.1**（其依赖 switchyard 0.3 的真实下限——两包 MSRV 各自声明，旧
+  工具链用户装 aproxy 不受影响，源码编译 aproxy-format 时会得到明确的
+  「rustc 1.96.1 或更新」报错）。新增依赖：`base64`（aproxy-envelope 侧）。
 - **npm 主包 skill 包形态变更**：`skills/aproxy-cli.zip`（单包）→
   `skills/aproxy-skills.zip`（多 skill 总包）。**旧二进制经 npm 渠道更新
   skill 会失败**（找不到旧 inner 文件）——skill 为非强制支线、不影响安装，

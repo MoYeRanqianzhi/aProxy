@@ -51,8 +51,8 @@ pub enum TransformMode {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TransformConfig {
     /// format 程序命令（必填非空，validate 拦截）。不走 shell，直接按
-    /// argv 数组执行——无注入面。相对路径按 PATH/工作目录解析，官方示例
-    /// 推荐写绝对路径（如 `~/.aproxy/bin/aproxy-format`）。
+    /// argv 数组执行——无注入面。`~` 前缀在加载时展开为用户主目录
+    /// （`~/.aproxy/bin/aproxy-format` 可直接使用）；裸文件名走 PATH。
     pub command: String,
     /// format 程序参数（如官方示例的 `["run", "--config", "...toml"]`）。
     #[serde(default)]
@@ -477,13 +477,40 @@ impl Config {
     }
 }
 
-/// 转换器 command 归一化：trim；trim 后为空 = 配置视为未设置（None）。
+/// 转换器 command 归一化：trim + `~` 展开；trim 后为空 = 配置视为未设置。
+///
+/// `~` 展开是**必须的**：transform 的 command 不经 shell 直接 spawn（tokio
+/// Command 不做任何路径展开），而官方文档/skill 推荐的写法恰是
+/// `~/.aproxy/bin/aproxy-format`——不展开的话该字符串按「当前目录下名为
+/// `~` 的相对路径」解析，照抄示例的用户每请求必 502。
 fn trim_transform_command(t: Option<TransformConfig>) -> Option<TransformConfig> {
     t.map(|mut t| {
-        t.command = t.command.trim().to_string();
+        t.command = expand_tilde(t.command.trim());
         t
     })
     .filter(|t| !t.command.is_empty())
+}
+
+/// `~` 前缀展开：`~/x`、`~\x`、裸 `~` → 用户主目录；其余原样。
+/// 展开产物统一用 `/` 分隔（Windows API 同样接受）。
+fn expand_tilde(s: &str) -> String {
+    let home = || {
+        dirs::home_dir()
+            .map(|p| {
+                p.display()
+                    .to_string()
+                    .trim_end_matches(['/', '\\'])
+                    .to_string()
+            })
+            .unwrap_or_default()
+    };
+    if s == "~" {
+        return home();
+    }
+    if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
+        return format!("{}/{}", home(), rest);
+    }
+    s.to_string()
 }
 
 /// 返回配置文件路径：`~/.aproxy/config.toml`。

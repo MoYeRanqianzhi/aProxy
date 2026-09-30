@@ -415,11 +415,25 @@ pub(crate) async fn transform_request(
         .body_bytes()
         .map_err(|e| TransformError::Rejected(e.to_string()))?;
     let new_body = spool_request_body(&resp_bytes, spool_dir).await;
-    let new_method = out
+    let new_method = match out
         .method
         .as_deref()
-        .and_then(|m| m.parse().ok())
-        .unwrap_or_else(|| method.clone());
+        .map(|m| m.parse::<axum::http::Method>())
+    {
+        Some(Ok(m)) => m,
+        // 与本函数族其他「format 输出不合法」路径一致（非法头名/头值逐条
+        // warn）：输出 method 非法 HTTP token 时回退原方法并留痕——静默回退
+        // 会让 format 本意的 DELETE 变成 POST，排障必须能看到这次改写被丢。
+        // 字段缺省（None）= 沿用原方法（信封契约），不告警
+        Some(Err(_)) => {
+            tracing::warn!(
+                method = %out.method.as_deref().unwrap_or(""),
+                "format 输出的 method 非法，沿用原方法"
+            );
+            method.clone()
+        }
+        None => method.clone(),
+    };
     let new_url = out.url.unwrap_or_else(|| url.to_string());
     let new_headers = headers_from_btreemap(&out.headers);
     Ok(TransformedRequest {
@@ -784,5 +798,33 @@ mod tests {
             0,
             "spawn 模式 idle 恒空"
         );
+    }
+    #[tokio::test]
+    async fn idle_zero_means_never_reaped() {
+        // idle_timeout_secs=0（永不回收）：等待超过 reaper 典型周期后空闲表
+        // 仍保有 worker——0 的「永不回收」语义不得被误当成「立即回收」
+        let pool = echo_pool(TransformMode::Persistent, "echo", |c| {
+            c.idle_timeout_secs = Some(0);
+        });
+        pool.convert(envelope_with("keep")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            pool.state.lock().await.idle.len(),
+            1,
+            "idle=0 永不回收：worker 应仍在空闲表"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_max_one_serializes_on_single_worker() {
+        // pool_max=1：两个请求串行复用同一 worker，槽位恒 0，无并发扩容
+        let pool = echo_pool(TransformMode::Persistent, "echo", |c| {
+            c.pool_max = Some(1);
+        });
+        let a = pool.convert(envelope_with("1")).await.unwrap();
+        let b = pool.convert(envelope_with("2")).await.unwrap();
+        assert_eq!(a.worker_id, 0);
+        assert_eq!(b.worker_id, 0);
+        assert_eq!(pool.state.lock().await.idle.len(), 1);
     }
 }

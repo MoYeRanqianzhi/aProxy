@@ -6,7 +6,9 @@ version = "0.1.0"
 # 几乎不更新（只是示例，别的功能用户直接让 agent 配置），单独发 Release
 # （独立 tag 触发 release-format workflow）。
 edition = "2024"
-rust-version = "1.88"
+# 依赖树实际下限：switchyard 0.3 要求 rustc 1.96.1（声明须真实，1.88 会
+# 误导旧工具链用户撞上看不懂的依赖编译错误）
+rust-version = "1.96.1"
 description = "Official example format program for aproxy: protocol conversion, key rotation, and multi-channel aggregation"
 license = "MIT"
 authors = ["aProxy Contributors"]
@@ -18,8 +20,9 @@ categories = ["command-line-utilities", "network-programming"]
 # 协议转换：Pure Rust sans-I/O 的 request/response/stream 翻译
 # （OpenAiChat / AnthropicMessages / OpenAiResponses 三 wire format）
 switchyard-translation = "0.3"
-# 信封契约：与 aproxy 二进制共同类型单源维护
-aproxy-envelope = { path = "../aproxy-envelope" }
+# 信封契约：与 aproxy 二进制共同类型单源维护。version + path 双写——
+# 纯 path 依赖会被 cargo publish 硬性拒绝（crates.io 发布链必需 version）
+aproxy-envelope = { version = "0.1.0", path = "../aproxy-envelope" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

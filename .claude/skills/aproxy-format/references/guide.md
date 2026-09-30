@@ -63,9 +63,11 @@ response_transform = { command = "python", args = ["fmt.py"], mode = "persistent
 
 配置易错点：
 
-- **command 写绝对路径**：相对路径按 PATH 与守护进程工作目录解析，守护的
-  工作目录不可靠。`~` 不被展开（toml 里写完整路径，或 `~/.aproxy/bin/xxx`
-  展开交给 format 自己）。
+- **command 首选绝对路径或 `~/` 前缀**：相对路径按 PATH 与守护进程工作目录
+  解析，守护的工作目录不可靠。`~/` 前缀会被 aProxy 展开为用户主目录
+  （`~/.aproxy/bin/aproxy-format` 可直接用）；裸文件名走 PATH。
+- **spawn 模式下转换在单实例内串行**：每请求一次进程启动、逐个执行——
+  高并发场景选 persistent（池按 `pool_max` 并发扩容）。
 - **请求与响应是两条配置**：只配 `request_transform` = 请求被转换、响应原样
   回放——协议转换场景两头都要配（且指向同一程序同一份逻辑）。
 - **轮换/计数/聚合必须 `mode = "persistent"`**：spawn 每请求新进程，进程内

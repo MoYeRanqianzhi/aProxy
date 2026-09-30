@@ -44,3 +44,56 @@ pub fn resolve_client_format(
         crate::config::ClientFormat::Auto => detect::detect_request(body),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use switchyard_translation::WireFormat;
+
+    /// OpenAiResponses 此前在所有测试层零执行——真实转换往返钉死
+    #[test]
+    fn responses_request_translates_to_anthropic_and_back() {
+        let req: Value = serde_json::from_str(
+            r#"{"model":"gpt-5o","input":"tell me a joke","instructions":"be funny","max_output_tokens":64}"#,
+        )
+        .unwrap();
+        // 请求方向：openai_responses → anthropic_messages（真实 switchyard 解码/编码）
+        let translated = translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::AnthropicMessages,
+            &req,
+        )
+        .expect("responses→anthropic 请求转换失败");
+        assert!(
+            translated.get("messages").is_some(),
+            "anthropic 产物应有 messages: {translated}"
+        );
+        // 响应方向：anthropic 聚合响应 → openai_responses（反向真实转换）
+        let resp: Value = serde_json::from_str(
+            r#"{"role":"assistant","content":[{"type":"text","text":"ha"}],"model":"gpt-5o","stop_reason":"end_turn"}"#,
+        )
+        .unwrap();
+        let back = translate_response(
+            WireFormat::AnthropicMessages,
+            WireFormat::OpenAiResponses,
+            &resp,
+        )
+        .expect("anthropic→responses 响应转换失败");
+        assert!(
+            back.get("output").is_some() || back.get("output_text").is_some(),
+            "responses 产物应有 output 形态: {back}"
+        );
+    }
+
+    #[test]
+    fn same_format_translation_is_identity() {
+        let body: Value = serde_json::from_str(r#"{"input":"x","model":"m"}"#).unwrap();
+        let out = translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiResponses,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out, body, "同格式转换恒等");
+    }
+}

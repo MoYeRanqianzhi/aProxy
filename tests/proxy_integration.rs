@@ -3272,6 +3272,10 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     .unwrap();
     let exe = env!("CARGO_BIN_EXE_aproxy");
     let port_str = port.to_string();
+    // 隔离 home 内关看门狗（settings.json）：start 的出簇逻辑会在 home 里
+    // 拉起看护进程——测试结束后 tempdir 被删，看护者却存活 ~300s 并锁住
+    // CARGO_BIN_EXE 的镜像文件（阻断后续 cargo 重链），必须从源头关闭
+    std::fs::write(home.join("settings.json"), r#"{"watchdog": false}"#).unwrap();
     // 隔离前置清理：上次失败运行可能残留监听同端口的守护（其隔离 tempdir
     // 已删、注册表不可达）——IPC 管道按端口在系统命名空间、跨 home 可达，
     // ping 到即按上报 pid 强杀；随后全局默认目录再兜底清一次
@@ -3311,6 +3315,13 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     .unwrap()
     .pid;
     assert!(restore_path.exists(), "守护启动后应写入恢复记录");
+    // 失败路径兜底：任何断言 panic 时按隔离 home 停掉守护（tempdir 被删后
+    // 无 guard 的守护会带着已删目录的句柄残留成孤儿）
+    let _guard = DaemonGuard {
+        exe,
+        port,
+        home_dir: Some(home.clone()),
+    };
 
     // 模拟崩溃：强杀守护进程（不经过 IPC 优雅退出），恢复记录应残留。
     // 隔离 home 内无看门狗收养（tempdir 的 run 目录没有活跃看护者 claim），

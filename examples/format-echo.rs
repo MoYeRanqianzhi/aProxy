@@ -76,6 +76,16 @@ fn main() {
                     env
                 });
             }
+            "scrub" => {
+                // 头表替换「删头语义」+ method 改写的可观测验证：
+                // 删 authorization 头、method 改写为 PUT（headers/method
+                // 可变性的两条路径都有确定性断言面）
+                respond(&line, |mut env| {
+                    env.headers.remove("authorization");
+                    env.method = Some("PUT".to_string());
+                    env
+                });
+            }
             // echo（默认）：原样回显
             _ => respond(&line, |env| env),
         }

@@ -16,6 +16,101 @@
 | `extra` | string | transform extra 原样 | 不必回传 | 同左 | 不必回传 |
 | `error` | string? | 不出现 | **单请求失败原因**（exit 0） | 不出现 | 同左 |
 
+## JSON 完整规范（任意语言实现以此为准）
+
+本节是信封的**语言无关 wire 规范**——aproxy 侧由 Rust serde 实现，本节把它
+完整翻译成任何 JSON 库都能遵循的规则。按本节实现的 format 与语言无关。
+
+### 必填性（违反 = aproxy 解析失败 → 请求侧 502）
+
+| 字段 | aproxy 发给你 | 你输出回 aproxy |
+|---|---|---|
+| `headers` | 必有（可能为 `{}`） | **必填**（缺这个键 = 解析失败，可为 `{}`） |
+| `worker_id` | 必有（int ≥ 0） | 可省略；给了必须是**非负整数** |
+| `extra` | 必有（string，可能为 `""`） | 可省略；给了必须是 **string** |
+| 其余（url/method/body/body_b64/error） | 缺省时**键不出现** | 可选；给 `null` 等价于省略 |
+
+**最常见死法**：输出 `{"body": "..."}`——缺 `headers` 键，aproxy 解析失败
+502，错误日志为「信封 JSON 解析失败: missing field `headers`」。最小合法输出：
+
+```json
+{"headers": {}, "body": "..."}
+```
+
+### 序列化规则
+
+- **缺省即不出现**：可选字段未设置时，aproxy 写出的行里**没有这个键**（不是
+  `null`）。你的解析代码要按「键可能不存在」处理；你输出时省略与写 `null`
+  两者都合法。
+- **未知字段忽略**：你输出的信封里多余的键（调试字段、内部状态）aproxy
+  静默忽略——不会报错也不会透传到任何地方。
+- **类型严格**：`worker_id` 必须是 0..=4294967295 的整数（负数/小数/字符串
+  = 解析失败）；`extra` 必须是 string；`headers` 的键值都必须是 string。
+- **互斥**：`body` 与 `body_b64` 不能同时出现（两侧都校验）。
+- **error 与正常输出**：`error` 非空时，aproxy 只读 error 文案、忽略信封
+  其余字段——失败输出用 `{"headers": {}, "error": "..."}` 即可。
+
+### base64 精确变体
+
+`body_b64` 用**标准字母表**（`A-Z a-z 0-9 + /`）**带 `=` padding**、无换行：
+- Python：`base64.b64encode` / `base64.b64decode` ✓（不要用 `urlsafe_b64encode`）
+- Go：`base64.StdEncoding`（✗ StdURL/.Raw）
+- Node：`Buffer.from(b64, "base64")` / `buf.toString("base64")` ✓
+- 换行插入（MIME 式 76 列）✗——解码会失败
+
+### 行与编码
+
+- 一行 = 一个紧凑 JSON + `\n`（无 `\r`）；JSON 字符串转义保证 body 内的
+  换行不会破帧——**不要自己再转义一层**。
+- 全程 UTF-8、无 BOM；非 ASCII 字符原样 UTF-8 输出（aproxy 不做 `\uXXXX`
+  转义，你的语言也不必）。**Windows 注意**：脚本语言的 stdout 默认编码可能
+  是系统代码页（如 GBK）——必须显式 UTF-8（见 guide.md 多语言坑表），否则
+  中文 body/文案会乱码或抛编码异常。
+
+### 完整样例
+
+**请求侧输入**（aproxy 发给你的一行，此处为展示加了折行——实际是单行）：
+
+```json
+{
+  "url": "https://api.anthropic.com/v1/messages",
+  "method": "POST",
+  "headers": {
+    "content-type": "application/json",
+    "authorization": "Bearer sk-client-value",
+    "x-api-key": "sk-client-value"
+  },
+  "body": "{\"model\":\"claude-3\",\"messages\":[...],\"max_tokens\":100}",
+  "worker_id": 2,
+  "extra": "~/.aproxy/agg.toml"
+}
+```
+
+**响应侧输入**（无 `method`——这是响应侧的唯一标志；`url` 是请求侧最终
+上游地址）：
+
+```json
+{
+  "url": "https://api.anthropic.com/v1/messages",
+  "headers": {"content-type": "application/json"},
+  "body": "{\"role\":\"assistant\",\"content\":[...]}",
+  "worker_id": 0,
+  "extra": "~/.aproxy/agg.toml"
+}
+```
+
+**成功输出**（只回传你改写的字段，其余省略即可）：
+
+```json
+{"url": "https://relay.example.com/v1/chat/completions", "method": "POST", "headers": {"content-type": "application/json", "authorization": "Bearer sk-relay-1"}, "body": "{...}"}
+```
+
+**失败输出**（error 行，exit 0）：
+
+```json
+{"headers": {}, "error": "model gpt-nope 未命中任何渠道"}
+```
+
 ## 语义细节
 
 ### body 与 body_b64

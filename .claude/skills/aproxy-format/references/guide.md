@@ -10,7 +10,7 @@
 | 2 | 处理完立即写一行信封回 stdout 并 **flush** | 不 flush → aproxy 等到超时（默认 30s）后 kill |
 | 3 | **读到 stdin EOF 即 exit**（persistent 铁律） | 不退出 → aProxy 实例停止后 worker 挂成孤儿进程 |
 | 4 | 单请求失败输出 error 行（exit 0） | 用非零 exit 表达业务失败 → worker 被当崩溃剔除，损失复用 |
-| 5 | 输出信封是完整 JSON（至少 `headers`） | 输出残缺 JSON → 该请求按失败处理 |
+| 5 | 输出信封是完整 JSON，**`headers` 键必填**（可为 `{}`） | 缺 `headers` = aproxy 解析失败，请求侧 502（最高频死法） |
 | 6 | 不输出 `content-length`/hop-by-hop 头 | 输了也被忽略（aProxy 自动管理），徒增困惑 |
 | 7 | 对未知输入走 error 行而不是 panic | panic/崩溃 → 请求侧 502、进程被剔除 |
 
@@ -19,6 +19,12 @@
 ```python
 #!/usr/bin/env python3
 import sys, json
+
+# Windows 必备：脚本语言 stdout 默认编码是系统代码页（GBK 等），信封里的
+# 中文/非 ASCII 会乱码或抛 UnicodeEncodeError——stdin/stdout 必须显式 UTF-8
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdin.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8")
 
 def process(env: dict) -> dict:
     # 你的转换逻辑：改 env["url"] / env["headers"] / env["body"]
@@ -46,6 +52,74 @@ def main():
 
 main()
 ```
+
+Node 最小实现（Node 的 stdout 写入 IPC 管道无编码问题，JSON.stringify 天然
+紧凑单行）：
+
+```javascript
+#!/usr/bin/env node
+'use strict';
+const rl = require('readline').createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const t = line.trim();
+  if (!t) return;
+  let out;
+  try {
+    const env = JSON.parse(t);
+    out = env;                                   // echo 最小例：改这里
+  } catch (e) {
+    out = { headers: {}, error: `信封解析失败: ${e.message}` };
+  }
+  process.stdout.write(JSON.stringify(out) + '\n');
+});
+rl.on('close', () => process.exit(0));           // EOF → exit（义务 #3）
+```
+
+Rust 编译版（直接依赖 `aproxy-envelope` crate——信封解析/序列化/base64
+互斥校验零手写；`cargo build --release` 后的二进制即 format）：
+
+```rust
+// Cargo.toml: aproxy-envelope = "0.1" （crates.io）
+use std::io::{BufRead, Write};
+use aproxy_envelope::TransformEnvelope;
+
+fn main() {
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    while let Some(Ok(line)) = lines.next() {    // EOF → 退出（义务 #3）
+        let t = line.trim_end();
+        if t.is_empty() { continue; }
+        let reply = match TransformEnvelope::from_line(t) {
+            Ok(mut env) => {
+                // 你的转换逻辑：改 env.url / env.headers / env.body
+                env                              // echo 最小例
+            }
+            Err(e) => TransformEnvelope {
+                headers: Default::default(),
+                error: Some(format!("信封解析失败: {e}")),
+                ..Default::default()
+            },
+        };
+        let _ = writeln!(out, "{}", reply.to_line().unwrap_or_else(|_| {
+            r#"{"headers":{},"error":"序列化失败"}"#.to_string()
+        }));                                     // writeln 自带 \n
+        let _ = out.flush();                     // 义务 #2
+    }
+}
+```
+
+多语言高频坑（按「写了但跑不通」频率排序）：
+
+| 语言 | 坑 | 解法 |
+|---|---|---|
+| python（Windows） | stdout 默认 GBK，非 ASCII 抛异常/乱码 | 模板里的 `reconfigure(encoding="utf-8")` |
+| bash+jq | jq 默认 pretty-print 多行输出 | **jq 一律 `-c`**；printf 补 `\n` |
+| Node | `console.log` 与手写 write 混用导致交错 | 统一 `process.stdout.write(json + "\n")` |
+| python | `json.dumps` 默认 `ensure_ascii=True`（\uXXXX 转义） | 两者都合法（JSON 转义不破帧），习惯上 `ensure_ascii=False` |
+| 编译型语言（Go/C/Rust） | bufio writer 忘 flush；读行缓冲按固定长度 | 按行读（bufio.Scanner）+ 每行后 flush |
+| 任意语言 | base64 用了 URL-safe 变体 | 标准字母表 + `=` padding（protocol.md） |
 
 spawn 模式兼容：处理一行后不退出也没关系（aProxy 用毕即杀），上面的循环壳
 两模式通用——**直接按 persistent 写，两种模式都能跑**。

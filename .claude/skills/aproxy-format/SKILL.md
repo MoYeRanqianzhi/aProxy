@@ -48,9 +48,14 @@ headers、body 全部可改写，这就是协议转换与聚合的全部机制�
    `content-length` / `transfer-encoding` 等**传输控制头**（aProxy 按实际
    字节回填，你输出的也会被忽略）；`content-encoding` 在响应侧会被强制
    剔除（aProxy 交给你的 body 已解码）——不要试图在信封层处理压缩。
-5. **大 body 走 `body_b64`**：body 不是合法 UTF-8 时用 base64 字段，其余场景
-   用 `body` 文本字段（两者互斥）。
-6. **不要设 content-length**：aProxy 按实际字节回填，你设了也会被忽略。
-7. **官方示例**：`aproxy-format` 二进制开箱即用（协议转换 + key 轮换 + 多渠道
+5. **输出必须含 `headers` 键（可为 `{}`）**：它是唯一**必填**字段——
+   `{"body": "..."}` 这种自然写法会因缺键解析失败、请求侧直接 502（日志：
+   missing field \`headers\`）。字段级必填性/类型约束/编码规则见
+   [references/protocol.md](references/protocol.md) 的「JSON 完整规范」。
+6. **大 body 走 `body_b64`**：body 不是合法 UTF-8 时用 base64 字段，其余场景
+   用 `body` 文本字段（两者互斥；**标准字母表 + `=` padding**，URL-safe 变体
+   解码会失败）。
+7. **不要设 content-length**：aProxy 按实际字节回填，你设了也会被忽略。
+8. **官方示例**：`aproxy-format` 二进制开箱即用（协议转换 + key 轮换 + 多渠道
    聚合），写自定义 format 前先看它能不能直接满足——见
    [references/examples.md](references/examples.md)。

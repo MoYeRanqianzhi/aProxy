@@ -155,13 +155,23 @@ JSON 解析推荐 cJSON（单文件）或 yyjson（高性能）；写出后 `ffl
 body、把二进制场景透传给 error 行。
 
 联调测试器：`scripts/test_format.py`（本 skill 附带）——模拟
-anthropic / openai-chat / openai-responses 三种格式的请求信封喂给你的
+anthropic / openai-chat / openai-responses 三种格式的**请求侧与响应侧**信封
+（body 均为官方 API 文档核对过的真实形态，含 SSE 流式文本变体）喂给你的
 format、格式化打印回信封，并检查 EOF 退出义务。写完 format 第一件事：
 
 ```bash
+# 请求侧：模拟客户端请求（带 method），测请求转换
 python scripts/test_format.py --format-spec anthropic --command ./fmt
+
+# 响应侧：模拟上游响应（无 method = 响应侧标志），测响应反向转换
+python scripts/test_format.py --side response --format-spec openai-chat --command ./fmt
+
+# 响应侧 SSE：body 为真实流式事件序列文本（aproxy 整缓冲后 format 看到的就是它）
+python scripts/test_format.py --side response --sse --format-spec anthropic --command ./fmt
+
+# 参数透传（-- 之后原样）；--body-file 自定义 body（非 UTF-8 自动走 body_b64）
 python scripts/test_format.py --format-spec openai-chat --command python -- args fmt.py
-python scripts/test_format.py --format-spec openai-responses --command ./fmt --body-file binary-payload.bin   # 非 UTF-8 自动走 body_b64
+python scripts/test_format.py --format-spec anthropic --command ./fmt --body-file binary-payload.bin
 ```
 
 多语言高频坑（按「写了但跑不通」频率排序）：

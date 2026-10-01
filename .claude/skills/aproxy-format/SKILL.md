@@ -32,6 +32,7 @@ headers、body 全部可改写，这就是协议转换与聚合的全部机制�
 | 从零写一个 format（选型、循环模板、测试方法） | [references/guide.md](references/guide.md) |
 | 完整示例：多 key 轮换、协议转换、官方 aproxy-format 用法 | [references/examples.md](references/examples.md) |
 | 502 了、error 行没输出、persistent worker 不退出 | [references/troubleshooting.md](references/troubleshooting.md) |
+| **联调测试器**：不起 aproxy 直接测你的 format（三协议模拟 + 回包检查 + EOF 义务判定） | [scripts/test_format.py](scripts/test_format.py) |
 
 ## 高频守则（最常见的错误，细节全部下放 references）
 

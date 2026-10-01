@@ -110,6 +110,60 @@ fn main() {
 }
 ```
 
+C++ 编译版（高性能场景的**首选**：无解释器、无 GC、进程冷启动毫秒级、
+persistent 下单请求处理微秒级——高频大流量实例把转换开销压到噪声以下）。
+JSON 解析用 nlohmann/json 单头文件（GitHub 下载 `json.hpp` 即可，无链接
+依赖）：
+
+```cpp
+// fmt.cpp — 编译：g++ -O2 -std=c++17 -I<json.hpp所在目录> fmt.cpp -o fmt
+//            (MSVC: cl /O2 /std:c++17 /utf-8 /I<目录> fmt.cpp /Fe:fmt.exe)
+// 源码必须保存为 UTF-8（/utf-8 旗标保证字面量编码正确）
+#include <iostream>
+#include <string>
+#include <nlohmann/json.hpp>
+using json = nlohmann::json;
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::string line;
+    // getline 失败（EOF）→ 循环退出 = 义务 #3
+    while (std::getline(std::cin, line)) {
+        if (line.empty()) continue;
+        json out;
+        try {
+            json env = json::parse(line);
+            // 你的转换逻辑：改 env["url"] / env["headers"] / env["body"]
+            out = env;                             // echo 最小例
+        } catch (const std::exception& e) {
+            out = json{{"headers", json::object()},
+                       {"error", std::string("信封解析失败: ") + e.what()}};
+        }
+        std::cout << out.dump() << "\n" << std::flush;   // 义务 #2：flush 必须
+    }
+    return 0;
+}
+```
+
+C 语言版要点（不引第三方库时的骨架）：`fgets` 读行（缓冲区要给足——信封行
+可达 MB 级，按 `spool_limit_mb` 上界规划或改用 `getline(3)` POSIX 动态分配）；
+JSON 解析推荐 cJSON（单文件）或 yyjson（高性能）；写出后 `fflush(stdout)`。
+其余义务与 C++ 版完全同构。
+
+二进制 body（`body_b64`）：C/C++ 没有 stdlib base64——引加州汤（忽略），
+或用 header-only 实现如 `libbase64`/boost/beast 的 base64，或只处理文本
+body、把二进制场景透传给 error 行。
+
+联调测试器：`scripts/test_format.py`（本 skill 附带）——模拟
+anthropic / openai-chat / openai-responses 三种格式的请求信封喂给你的
+format、格式化打印回信封，并检查 EOF 退出义务。写完 format 第一件事：
+
+```bash
+python scripts/test_format.py --format-spec anthropic --command ./fmt
+python scripts/test_format.py --format-spec openai-chat --command python -- args fmt.py
+python scripts/test_format.py --format-spec openai-responses --command ./fmt --body-file binary-payload.bin   # 非 UTF-8 自动走 body_b64
+```
+
 多语言高频坑（按「写了但跑不通」频率排序）：
 
 | 语言 | 坑 | 解法 |

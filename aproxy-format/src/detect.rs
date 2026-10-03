@@ -1,5 +1,10 @@
-//! 协议检测启发式：switchyard 不提供 detect API（0.3.0 已核实），自动匹配
-//! 由本模块按请求/响应 JSON 形态嗅探。启发式为本仓库自研，用单测钉死语义。
+//! 协议检测启发式：switchyard 不提供 detect API（0.3.0 已核实），auto 模式
+//! 的客户端协议由本模块按**请求** JSON 形态嗅探。启发式为本仓库自研，用单测
+//! 钉死语义。
+//!
+//! 没有响应侧检测：上游按渠道协议回复，检测响应体得到的永远是渠道协议，
+//! 推断不出客户端协议——auto 的响应侧直接取渠道协议，正确性由请求侧「auto
+//! 只放行同协议」保证（见 main.rs 的 handle_request）。
 
 use serde_json::Value;
 use switchyard_translation::WireFormat;
@@ -20,22 +25,6 @@ pub fn detect_request(body: &Value) -> Option<WireFormat> {
     // OpenAI Chat：messages + model（且未被上两者命中）
     if obj.contains_key("messages") {
         return Some(WireFormat::OpenAiChat);
-    }
-    None
-}
-
-/// 响应协议检测：缓冲 JSON 响应的形态判别（响应侧 auto 时的兜底——响应侧
-/// 正常应按渠道表反查协议，检测仅在反查失败时兜底）。
-pub fn detect_response(body: &Value) -> Option<WireFormat> {
-    let obj = body.as_object()?;
-    if obj.contains_key("content") && obj.contains_key("role") {
-        return Some(WireFormat::AnthropicMessages);
-    }
-    if obj.contains_key("choices") {
-        return Some(WireFormat::OpenAiChat);
-    }
-    if obj.contains_key("output") {
-        return Some(WireFormat::OpenAiResponses);
     }
     None
 }
@@ -79,24 +68,6 @@ mod tests {
         assert_eq!(detect_request(&body), None);
         assert_eq!(detect_request(&Value::Null), None);
         assert_eq!(detect_request(&Value::Array(vec![])), None);
-    }
-
-    #[test]
-    fn detects_response_formats() {
-        let anthropic: Value =
-            serde_json::from_str(r#"{"role":"assistant","content":[{"type":"text","text":"hi"}]}"#)
-                .unwrap();
-        assert_eq!(
-            detect_response(&anthropic),
-            Some(WireFormat::AnthropicMessages)
-        );
-        let chat: Value = serde_json::from_str(r#"{"choices":[]}"#).unwrap();
-        assert_eq!(detect_response(&chat), Some(WireFormat::OpenAiChat));
-        let responses: Value = serde_json::from_str(r#"{"output":[]}"#).unwrap();
-        assert_eq!(
-            detect_response(&responses),
-            Some(WireFormat::OpenAiResponses)
-        );
     }
 
     #[test]

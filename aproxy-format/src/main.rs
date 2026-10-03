@@ -222,11 +222,25 @@ fn handle_request(
         .iter()
         .position(|c| c.name == channel.name)
         .expect("渠道来自同一表必有索引");
-    let key = state.pick_key(channel_idx);
 
     // 协议转换：client_format（显式/auto 检测）→ channel.format
     let client_format = translate::resolve_client_format(state.cfg.client_format, &body)
         .ok_or("client_format=auto 检测失败：请求形态不像已知协议（检查字段名）")?;
+    // auto 只支持同协议：响应侧拿不到客户端协议——信封没有请求→响应的上下文
+    // 透传，响应体只能检测出渠道协议——跨协议的响应无法转回，客户端会静默
+    // 收到错协议的 body。所以在请求侧（发往上游之前、不产生计费）拒绝并指明
+    // 改法；同协议（如不同客户端各走同协议渠道、纯 key 轮换）不受影响。
+    // 放在选 key 之前：被拒的请求不占轮换名额
+    if state.cfg.client_format == ClientFormat::Auto && client_format != channel.format {
+        return Err(format!(
+            "client_format = \"auto\" 只支持同协议：本请求检测为 {client_format}，路由到的渠道 {} \
+             是 {}，响应侧无法得知客户端协议、无法转回。请在聚合配置中显式声明 client_format\
+             （如 client_format = \"{client_format}\"）；检测若有误（不带 system 的 Anthropic \
+             请求会被判为 openai_chat），同样以显式声明解决",
+            channel.name, channel.format
+        ));
+    }
+    let key = state.pick_key(channel_idx);
     let translated = if client_format == channel.format {
         body.clone()
     } else {
@@ -326,20 +340,13 @@ fn handle_response(
         .map_err(|e| format!("body 提取失败: {e}"))?;
     let text = String::from_utf8_lossy(&body_bytes);
 
-    // 客户端协议：显式；auto 时按渠道协议的反向不可知——按响应形态检测
+    // 客户端协议：显式声明直接用；auto 时**就是渠道协议**——请求侧已拒绝
+    // auto 下的跨协议路由（见 handle_request），能走到这里的 auto 请求必然
+    // 客户端协议 = 渠道协议，响应原样同协议回放。注意不能靠检测响应体来
+    // 推断客户端协议：上游按渠道协议回复，检测出的永远是渠道协议
     let client_format = match state.cfg.client_format {
         ClientFormat::Explicit(f) => f,
-        ClientFormat::Auto => {
-            if detect::looks_like_sse(&text) {
-                // SSE 流形态无法廉价判别协议——按渠道协议同格式直通
-                // （SSE 的协议检测留待 switchyard 提供权威检测后接入）
-                channel.format
-            } else {
-                let v: serde_json::Value = serde_json::from_str(text.trim())
-                    .map_err(|e| format!("响应 body 非 JSON: {e}"))?;
-                detect::detect_response(&v).ok_or("响应协议检测失败（auto 模式）")?
-            }
-        }
+        ClientFormat::Auto => channel.format,
     };
 
     let mut headers = env.headers.clone();
@@ -383,13 +390,12 @@ fn handle_response(
     let mut out_v = translated;
     if let Some(obj) = out_v.as_object_mut()
         && let Some(m) = obj.get("model").and_then(|m| m.as_str())
+        && let Some((client_name, _)) = state.cfg.models.iter().find(|(_, up)| up.as_str() == m)
     {
-        if let Some((client_name, _)) = state.cfg.models.iter().find(|(_, up)| up.as_str() == m) {
-            obj.insert(
-                "model".to_string(),
-                serde_json::Value::String(client_name.clone()),
-            );
-        }
+        obj.insert(
+            "model".to_string(),
+            serde_json::Value::String(client_name.clone()),
+        );
     }
     out.body = Some(out_v.to_string());
     Ok(out)
@@ -700,11 +706,62 @@ mod tests {
     }
 
     #[test]
-    fn response_sse_cross_format_with_auto_client_follows_channel() {
-        // auto 模式下 SSE 按渠道协议直通（不报错）——与显式异协议报错形成对照
+    fn response_auto_replays_channel_protocol_unchanged() {
+        // auto 的响应侧取渠道协议原样回放（SSE 不报错、不检测）：请求侧已
+        // 保证 auto 只放行「客户端协议 = 渠道协议」的请求，回放渠道协议即
+        // 回放客户端协议。跨协议的 auto 请求根本到不了这里，见
+        // request_auto_rejects_cross_protocol_routing
         let state = two_channel_state();
         let sse = "event: message_start\ndata: {}\n\n";
         let out = handle_response(&state, &response_env("https://ant.example.com", sse)).unwrap();
         assert_eq!(out.body.as_deref(), Some(sse));
+    }
+
+    #[test]
+    fn request_auto_rejects_cross_protocol_routing() {
+        // auto + 跨协议路由：openai_chat 形态的请求（无 system）被路由到
+        // anthropic 渠道。旧版照转不误：请求转成 anthropic 发出，响应侧却
+        // 检测出渠道协议、恒等直通，客户端静默收到错协议的 body。现在请求侧
+        // 当场报错（发上游之前），文案指明显式声明 client_format
+        let state = two_channel_state();
+        let env = TransformEnvelope {
+            method: Some("POST".to_string()),
+            url: Some("https://client.example.com/v1/chat/completions".to_string()),
+            headers: BTreeMap::new(),
+            body: Some(
+                r#"{"model":"claude-3","messages":[{"role":"user","content":"hi"}]}"#.to_string(),
+            ),
+            ..Default::default()
+        };
+        let err = handle_request(&state, &env).unwrap_err();
+        assert!(err.contains("client_format"), "{err}");
+        assert!(
+            err.contains("openai_chat") && err.contains("anthropic_messages"),
+            "文案应点明两侧协议: {err}"
+        );
+        // 被拒的请求不占轮换名额：随后的同协议请求仍拿首 key
+        let ok = handle_request(&state, &anthropic_request_env("claude-3")).unwrap();
+        assert_eq!(ok.headers.get("x-api-key").unwrap(), "k1");
+    }
+
+    #[test]
+    fn request_explicit_client_format_still_translates_cross_protocol() {
+        // 显式声明不受 auto 的同协议约束：openai_chat 客户端 → anthropic 渠道
+        // 照常放行（转换本身的真实执行由 tests/e2e.rs 覆盖）
+        let mut state = two_channel_state();
+        state.cfg.client_format = ClientFormat::Explicit(WireFormat::OpenAiChat);
+        let env = TransformEnvelope {
+            method: Some("POST".to_string()),
+            url: Some("https://client.example.com/v1/chat/completions".to_string()),
+            headers: BTreeMap::new(),
+            body: Some(
+                r#"{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"max_tokens":20}"#
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let out = handle_request(&state, &env).unwrap();
+        assert_eq!(out.url.as_deref(), Some("https://ant.example.com"));
+        assert_eq!(out.headers.get("x-api-key").unwrap(), "k1");
     }
 }

@@ -19,6 +19,10 @@ pub enum KeyStrategy {
 }
 
 /// 客户端协议声明：`"auto"`（逐请求检测）或显式 wire format。
+///
+/// auto **只支持同协议**：检测出的客户端协议必须等于路由到的渠道协议，否则
+/// 请求侧报错——响应侧拿不到客户端协议，跨协议响应无法转回。跨协议转换
+/// 必须显式声明。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientFormat {
     Auto,
@@ -65,7 +69,7 @@ pub struct ChannelConfig {
 /// 聚合配置根。
 #[derive(Debug, Clone, Deserialize)]
 pub struct AggConfig {
-    /// 客户端协议：auto = 逐请求检测。
+    /// 客户端协议：auto = 逐请求检测（仅同协议，见 [`ClientFormat`]）。
     pub client_format: ClientFormat,
     /// 可选模型别名映射（客户端名 → 上游名）。
     #[serde(default)]
@@ -94,7 +98,7 @@ impl AggConfig {
                         c.keys.len()
                     ));
                 }
-                if c.weights.iter().any(|w| *w == 0) {
+                if c.weights.contains(&0) {
                     return Err(format!("渠道 {} 的 weights 不能含 0", c.name));
                 }
             }

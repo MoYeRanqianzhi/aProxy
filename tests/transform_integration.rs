@@ -4,7 +4,8 @@
 //! mock 上游为 axum Router。核心断言面：spawn/persistent 两模式 × 请求/响应
 //! 两方向、url 改写、多 key 轮换（persistent 连续 / spawn 重置）、失败语义
 //! （请求 502 不重试 / 响应透传原样）、超时、b64 保真、大 body 磁盘路径、
-//! forward_only 互斥拦截、保活通道透传。
+//! forward_only 互斥拦截、保活通道透传、进程池加固（format 多写 stdout 时
+//! 不串包 / 复用到死 worker 时换新重试）。
 
 use std::{
     path::PathBuf,
@@ -625,6 +626,202 @@ async fn keepalive_channel_response_transform_failure_passes_through() {
         "保活通道响应转换失败应透传原始成功 body: {text}"
     );
     assert_eq!(count.load(Ordering::SeqCst), 2, "恰好重试一轮后成功");
+}
+
+// ---------------------------------------------------------------------------
+// 进程池加固：stdout 错位不得串包、复用的死 worker 不得让请求失败
+// ---------------------------------------------------------------------------
+
+/// persistent + pool_max=1：所有请求必经同一个 worker 槽位——stdout 一旦
+/// 错位，下一个请求必然踩中，串包若存在一定暴露（多槽位会让错位概率性漏测）。
+fn single_worker_persistent(sub_args: &[&str]) -> TransformConfig {
+    TransformConfig {
+        args: sub_args.iter().map(|s| s.to_string()).collect(),
+        pool_max: Some(1),
+        ..transform_config(sub_args[0], TransformMode::Persistent)
+    }
+}
+
+async fn post_body(client: &Client, proxy: &str, body: &str) -> (StatusCode, String) {
+    let resp = client
+        .post(format!("{proxy}/v1/x"))
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, resp.text().await.unwrap())
+}
+
+/// 串包判据：200 时回显的必须是**本请求自己的** body（recording_upstream 原样
+/// 回显上游收到的 body，所以回显 = 上游实际收到的内容）——绝不允许「200 但
+/// 内容是别的请求的」。失败形态由各测试另行断言。
+fn assert_not_crosswired(status: StatusCode, text: &str, sent: &str) {
+    if status == StatusCode::OK {
+        assert_eq!(
+            text, sent,
+            "串包：本请求发的是 {sent}，上游收到的却是 {text}（读到了上一个请求的输出）"
+        );
+    }
+}
+
+#[tokio::test]
+async fn request_persistent_banner_fails_loudly_and_never_crosswires() {
+    isolate_env_proxy();
+    // 启动横幅让 stdout 永远比请求多一行：每个新 worker 读到的第一行都是
+    // 横幅 → 协议错误 + 剔除。剔除才是关键——留在池里的话，下一个请求会读到
+    // 上一个请求的回显（A 的 body 被当成 B 的发往上游）
+    let (upstream, log, _jh) = recording_upstream().await;
+    let mut cfg = proxy_config_for(&upstream);
+    cfg.request_transform = Some(single_worker_persistent(&["banner"]));
+    let (proxy, _pj) = start_proxy(cfg).await;
+    let client = local_client();
+
+    // 先跑完全部请求、逐个做串包判定，错误归类放到最后断言：串包是首要
+    // 缺陷，归类文案是次要的——断言顺序让串包优先暴露
+    let mut texts = Vec::new();
+    for sent in ["AAA", "BBB", "CCC"] {
+        let (status, text) = post_body(&client, &proxy, sent).await;
+        assert_not_crosswired(status, &text, sent);
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "横幅必定先于回显被读到，每个请求都应失败: {text}"
+        );
+        texts.push(text);
+    }
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "协议错误的请求一个都不得发往上游"
+    );
+    for text in texts {
+        assert!(
+            text.contains("违反信封协议"),
+            "应归类为协议错误（而非 format 自报的失败）: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn request_persistent_multiline_never_crosswires() {
+    isolate_env_proxy();
+    // 每请求回两行**合法**信封：错位后解析照样成功——这是静默串包的形态
+    // （修复前：第二个请求把第一个请求的 body 发往上游，客户端拿到 200）
+    let (upstream, log, _jh) = recording_upstream().await;
+    let mut cfg = proxy_config_for(&upstream);
+    cfg.request_transform = Some(single_worker_persistent(&["multiline"]));
+    let (proxy, _pj) = start_proxy(cfg).await;
+    let client = local_client();
+
+    for sent in ["AAA", "BBB", "CCC", "DDD"] {
+        let (status, text) = post_body(&client, &proxy, sent).await;
+        assert_not_crosswired(status, &text, sent);
+        // 两行同批到达时读完首行即见残行 → 协议错误；残行若分批晚到，则在
+        // 下次取用该 worker 前被探测剔除、本请求成功——两种结局都不串包
+        assert!(
+            status == StatusCode::OK || text.contains("违反信封协议"),
+            "失败只应是协议错误: {status} {text}"
+        );
+    }
+    // 上游视角复核：收到的每个 body 都只出现一次（错位重放会出现重复）
+    let entries = log.lock().unwrap();
+    let mut bodies: Vec<&[u8]> = entries.iter().map(|e| e.body.as_slice()).collect();
+    bodies.sort_unstable();
+    bodies.dedup();
+    assert_eq!(
+        bodies.len(),
+        entries.len(),
+        "上游收到了重复 body（错位重放）"
+    );
+}
+
+#[tokio::test]
+async fn request_persistent_late_stray_line_never_crosswires() {
+    isolate_env_proxy();
+    // 多余的一行（合法信封）晚于回复 100ms 才到：读回复时它还不在，worker
+    // 已归还空闲表——必须在下次取用前探测到并剔除，否则下一个请求静默串包
+    let (upstream, log, _jh) = recording_upstream().await;
+    let mut cfg = proxy_config_for(&upstream);
+    cfg.request_transform = Some(single_worker_persistent(&["late-stray", "100"]));
+    let (proxy, _pj) = start_proxy(cfg).await;
+    let client = local_client();
+
+    for sent in ["AAA", "BBB", "CCC"] {
+        let (status, text) = post_body(&client, &proxy, sent).await;
+        assert_not_crosswired(status, &text, sent);
+        assert_eq!(status, StatusCode::OK, "回复本身合法，请求应成功: {text}");
+        // 等多余行落进管道：下一个请求取 worker 时它已可见
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    }
+    assert_eq!(log.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn response_persistent_multiline_never_crosswires() {
+    isolate_env_proxy();
+    // 响应侧串包 = A 会话的模型回复回放给 B。echo 上游按请求回显各自 body，
+    // 响应转换无论成功（multiline 首行是原样回显）还是失败（透传原始响应），
+    // 客户端拿到的都必须是自己的内容
+    let (upstream, _captured, _jh) = echo_upstream().await;
+    let mut cfg = proxy_config_for(&upstream);
+    cfg.response_transform = Some(single_worker_persistent(&["multiline"]));
+    let (proxy, _pj) = start_proxy(cfg).await;
+    let client = local_client();
+
+    for sent in ["r-one", "r-two", "r-three", "r-four"] {
+        let (status, text) = post_body(&client, &proxy, sent).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            text, sent,
+            "响应串包：本请求应收到自己的回显，却收到了别的请求的响应"
+        );
+    }
+}
+
+#[tokio::test]
+async fn request_persistent_idle_worker_death_respawns() {
+    isolate_env_proxy();
+    // worker 处理完首个请求后空闲 200ms 自行退出：空闲表里留下死 worker。
+    // 下一个请求必须换新 worker 成功，而不是写进死管道后 502
+    let (upstream, log, _jh) = recording_upstream().await;
+    let mut cfg = proxy_config_for(&upstream);
+    cfg.request_transform = Some(single_worker_persistent(&["die-idle", "200"]));
+    let (proxy, _pj) = start_proxy(cfg).await;
+    let client = local_client();
+
+    let (s1, t1) = post_body(&client, &proxy, "AAA").await;
+    assert_eq!((s1, t1.as_str()), (StatusCode::OK, "AAA"));
+    // 远超空闲阈值：确保 worker 已退出（进程退出在 Windows 上也有收尾延迟）
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    let (s2, t2) = post_body(&client, &proxy, "BBB").await;
+    assert_eq!(
+        (s2, t2.as_str()),
+        (StatusCode::OK, "BBB"),
+        "空闲期死掉的 worker 不得让下一个请求失败"
+    );
+    assert_eq!(log.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn request_persistent_reused_worker_dying_on_write_is_retried_once() {
+    isolate_env_proxy();
+    // oneshot：worker 只服务首个请求，之后收到输入即无输出退出——复用它的
+    // 请求「写入成功、读到 EOF」，尚未产生任何输出，换新 worker 重试一次即成功
+    let (upstream, log, _jh) = recording_upstream().await;
+    let mut cfg = proxy_config_for(&upstream);
+    cfg.request_transform = Some(single_worker_persistent(&["oneshot"]));
+    let (proxy, _pj) = start_proxy(cfg).await;
+    let client = local_client();
+
+    for sent in ["AAA", "BBB", "CCC"] {
+        let (status, text) = post_body(&client, &proxy, sent).await;
+        assert_eq!(
+            (status, text.as_str()),
+            (StatusCode::OK, sent),
+            "复用的 worker 死于产出前：应换新 worker 重试成功"
+        );
+    }
+    assert_eq!(log.lock().unwrap().len(), 3);
 }
 
 // ---------------------------------------------------------------------------

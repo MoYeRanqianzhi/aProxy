@@ -4494,7 +4494,7 @@ fn identity_check_tolerates_swapped_binary() {
         .build()
         .unwrap();
 
-    let daemon_child = Command::new(&bin)
+    let mut daemon_child = Command::new(&bin)
         .args([
             "--config",
             cfg_file.display().to_string().as_str(),
@@ -4542,7 +4542,10 @@ fn identity_check_tolerates_swapped_binary() {
         ipc_ping_in_dir(&rt, port, home_dir).is_ok(),
         "替换后守护应继续可 ping"
     );
+    // guard 经 IPC 优雅停掉守护；守护是本测试直接 spawn 的子进程，退出后必须
+    // wait 回收，否则在 unix 上留下僵尸（clippy::zombie_processes 即为此）
     drop(guard);
+    let _ = daemon_child.wait();
 }
 
 #[test]

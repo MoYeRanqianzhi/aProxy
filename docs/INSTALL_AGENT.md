@@ -77,8 +77,9 @@ Notes:
   `pwsh -File scripts/install.ps1`.
 - The sh script needs one of `sha256sum`, `shasum` or `openssl` to verify the
   download; without one it stops before downloading anything.
-- Linux: if glibc is too old or the system is musl-based, the script picks the
-  statically linked musl build automatically. Before placing the binary it runs
+- Linux: the gnu build requires glibc 2.28 or newer. If glibc is older or the
+  system is musl-based, the script picks the statically linked musl build
+  automatically. Before placing the binary it runs
   `--version` as a self-test, and if the gnu build cannot run on the machine it
   switches to the musl build. Nothing is placed unless the self-test passes.
 - If the script reports the download directory is not on `PATH`, follow its
@@ -95,8 +96,29 @@ https://github.com/MoYeRanqianzhi/aProxy.git && cd aProxy && cargo build
 rolling-restarts every running instance automatically:
 
 ```sh
-aproxy install          # latest version; `aproxy upgrade` is an alias
+aproxy install          # latest version in your channel; `aproxy upgrade` is an alias
+aproxy install --pre    # let pre-releases (alpha/beta/rc) compete as well
 ```
+
+**Update channel:** `latest` picks the highest version *inside a channel* (by
+version number, not creation time). If the installed version is a stable release
+only stable releases are considered, so you are never carried onto a pre-release;
+if it is a pre-release (e.g. an alpha) the default is already the pre-release
+channel; `--pre` selects the pre-release channel explicitly. Only `vX.Y.Z` and
+`vX.Y.Z-(alpha|beta|rc).N` releases count (`format-v*` and historical test tags
+do not). If the channel has nothing newer you get "already up to date" or "no
+version available" and nothing changes — it never switches channels on its own.
+A specific version (`aproxy install 0.1.0`) ignores the channel; a target below
+the current version is refused unless `--allow-downgrade` is given.
+
+**Rollback:** if an instance cannot start under the new version during the
+rolling restart, `install` brings it back with the old binary and the original
+arguments, stops the rollout (other instances are left untouched) and exits
+non-zero. Read `~/.aproxy/logs/startup.log`, fix the cause and run `aproxy
+install` again; `~/.aproxy/run/install.state` (phase `failed`, `last_error`)
+keeps the details. On Windows the rolling restart finishes in a background
+process after the command returns, so check `install.state` and `aproxy status`
+rather than the exit code.
 
 **Version gate:** the `install` command exists from 0.1.0-alpha.10 on. Check
 `aproxy --version`; if `install` is not a known command on the installed build,
@@ -136,6 +158,24 @@ local endpoint: **`http://127.0.0.1:12345`**.
   ```
 
 - Start it: `aproxy` (background daemon) or `aproxy --foreground` (debugging).
+- **Claude Code** — set both of these (shell environment variables, or the `env`
+  field of Claude Code's `~/.claude/settings.json`):
+
+  ```sh
+  export ANTHROPIC_BASE_URL=http://127.0.0.1:12345
+  export CLAUDE_STREAM_IDLE_TIMEOUT_MS=86400000
+  ```
+
+  The second one is **required**. To keep "a stream that breaks midway is still
+  retried transparently", aProxy buffers the whole response and replays it only
+  once it checks out; while waiting it sends SSE comment heartbeats. Those cover
+  Claude Code's first-byte timeout (about 360 s) and byte-level idle timeout
+  (300 s) but not its event-level idle timeout (600 s by default; neither
+  comments nor `ping` count as events), so without this variable any retry
+  period or long generation beyond 10 minutes makes Claude Code disconnect and
+  resend. `API_TIMEOUT_MS` does not control this timer. (Measured on Claude Code
+  2.1.288; ordinary `"stream": false` requests have no keepalive channel and
+  need a large client timeout — `API_TIMEOUT_MS` for Claude Code.)
 - Configure your API base URL to the local endpoint; keep the request path
   unchanged (e.g. `https://api.anthropic.com/v1/messages` becomes
   `http://127.0.0.1:12345/v1/messages`).
@@ -179,7 +219,10 @@ troubleshooting — read them before improvising CLI flags.
 | `install.ps1` fails to parse under Windows PowerShell 5.1 | run it via `irm ... \| iex` or `pwsh -File`, not `powershell -File` |
 | Install script: no SHA256 tool | install `sha256sum`, `shasum` or `openssl`, then rerun |
 | Linux binary will not start (glibc errors) | rerun the install script (it falls back to the musl build), or download the `aproxy-<arch>-unknown-linux-musl` asset |
-| Client sees timeouts during long retries | non-streaming requests have no keepalive channel; raise client timeout |
+| Claude Code gives up / resends after about 10 minutes of waiting | `CLAUDE_STREAM_IDLE_TIMEOUT_MS` is not set: Claude Code's event-level idle timeout (600 s) is not reset by aProxy's comment heartbeats. Set it to `86400000` (step 4) |
+| Non-streaming (`"stream": false`) requests time out during long retries | they have no keepalive channel (nothing to inject heartbeats into): raise the client's own timeout |
+| `aproxy install` stopped with an instance rolled back | the new version failed to start for that instance; read `startup.log`, fix, rerun `aproxy install` |
+| `npm i -g @meowo/aproxy` installs an old version | pre-releases are published under the `next` tag: use `@meowo/aproxy@next` |
 | Everything else | `aproxy status`, then `aproxy logs <port>` — log files are randomly named per start; never guess them by port |
 
 The full reference lives in the skill docs (step 5) or

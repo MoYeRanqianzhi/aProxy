@@ -106,7 +106,8 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
         version: env!("CARGO_PKG_VERSION").to_string(),
         listen_addr: actual_addr.clone(),
         config_path: cfg_path.display().to_string(),
-        base_url: base_url.clone(),
+        // 注册表与 IPC ping 都会把它交给 status 展示（只用于展示），脱敏后再登记
+        base_url: mask_base_url(&base_url),
         started_at: now_unix(),
         last_activity_secs: state
             .last_activity_secs

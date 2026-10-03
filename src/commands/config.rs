@@ -7,7 +7,44 @@ use aproxy::config::mask_base_url;
 use aproxy::settings;
 
 use crate::cli::ConfigArgs;
-use crate::util::{mask_proxy_url, mask_secret, parse_kv};
+use crate::util::{mask_secret, parse_kv};
+
+/// 转换器 args 里「后一个参数是密钥」的旗标（比较时大小写不敏感）。format
+/// 程序常见的传 key 写法：`--api-key sk-...` 或 `--api-key=sk-...`。
+const SECRET_ARG_FLAGS: &[&str] = &[
+    "--api-key",
+    "--api_key",
+    "--apikey",
+    "--key",
+    "--token",
+    "--secret",
+    "--password",
+];
+
+/// 转换器 args 的展示打码：密钥旗标之后的值（或 `--flag=值` 的值）走
+/// mask_secret；其余参数走 URL 脱敏出口（参数里出现的 `user:pass@host`、
+/// `?key=` 一并遮掉，普通参数原样）。
+fn mask_transform_args(args: &[String]) -> Vec<String> {
+    let is_secret_flag = |s: &str| SECRET_ARG_FLAGS.iter().any(|f| f.eq_ignore_ascii_case(s));
+    let mut out = Vec::with_capacity(args.len());
+    let mut mask_next = false;
+    for arg in args {
+        if mask_next {
+            out.push(mask_secret(arg));
+            mask_next = false;
+        } else if is_secret_flag(arg) {
+            out.push(arg.clone());
+            mask_next = true;
+        } else if let Some((flag, value)) = arg.split_once('=')
+            && is_secret_flag(flag)
+        {
+            out.push(format!("{flag}={}", mask_secret(value)));
+        } else {
+            out.push(mask_base_url(arg));
+        }
+    }
+    out
+}
 
 /// 展示前守卫：配置文件存在但解析失败时 load() 会静默回退默认值，`--show` 打印的
 /// 「当前配置」并非用户文件的真实内容——至少要警告，避免误导排障。
@@ -178,6 +215,8 @@ pub(crate) fn handle_config_cmd(path: PathBuf, args: ConfigArgs, explicit_config
         if !cfg.base_url.is_empty()
             && let Err(msg) = cfg.validate_base_url()
         {
+            // 错误消息内嵌 base_url 原文（可能带 user:pass），同一脱敏出口
+            let msg = msg.replace(&cfg.base_url, &mask_base_url(&cfg.base_url));
             eprintln!("base_url 无效，未保存: {msg}");
             std::process::exit(1);
         }
@@ -264,6 +303,26 @@ pub(crate) fn handle_config_cmd(path: PathBuf, args: ConfigArgs, explicit_config
                 "bounded_retry_paths     = （未在 toml 设置，运行时取 settings.json 全局默认）"
             ),
         }
+        // 入站白名单：同款三态展示；空列表注明它等于内置默认策略（不是「全拒」
+        // 也不是「全放」，两种误读都会把排障带偏）
+        match &cfg.allowed_hosts {
+            Some(list) if list.is_empty() => println!(
+                "allowed_hosts           = []（内置默认：回环监听只放行 localhost / 127.0.0.1 / [::1]）"
+            ),
+            Some(list) => println!("allowed_hosts           = [{}]", list.join(", ")),
+            None => println!(
+                "allowed_hosts           = （未在 toml 设置，运行时取 settings.json 全局默认）"
+            ),
+        }
+        match &cfg.allowed_origins {
+            Some(list) if list.is_empty() => println!(
+                "allowed_origins         = []（内置默认：拒绝一切携带 Origin 的浏览器请求）"
+            ),
+            Some(list) => println!("allowed_origins         = [{}]", list.join(", ")),
+            None => println!(
+                "allowed_origins         = （未在 toml 设置，运行时取 settings.json 全局默认）"
+            ),
+        }
         // 0 表示不设限，语义特殊，提示出来
         if cfg.connect_timeout_secs == 0 {
             println!("connect_timeout_secs    = 0（不设限）");
@@ -296,7 +355,11 @@ pub(crate) fn handle_config_cmd(path: PathBuf, args: ConfigArgs, explicit_config
             println!("{name}:");
             println!("  command           = \"{}\"", t.command);
             if !t.args.is_empty() {
-                println!("  args              = [{}]", t.args.join(", "));
+                // 多 key 轮换类 format 常把 key 直接写在 args 里
+                println!(
+                    "  args              = [{}]",
+                    mask_transform_args(&t.args).join(", ")
+                );
             }
             match t.mode {
                 aproxy::config::TransformMode::Spawn => {
@@ -324,8 +387,14 @@ pub(crate) fn handle_config_cmd(path: PathBuf, args: ConfigArgs, explicit_config
                     ""
                 }
             );
+            // extra 格式由 format 自定，官方示例就用它内联多个 key（JSON 列表）
+            // ——无法逐字段识别，整体按密钥打码，只留前缀与长度供对照 toml
             match &t.extra {
-                Some(e) => println!("  extra             = {e}（原样透传进信封）"),
+                Some(e) => println!(
+                    "  extra             = {}（已打码，共 {} 字符；原样透传进信封）",
+                    mask_secret(e),
+                    e.chars().count()
+                ),
                 None => println!("  extra             = (未设置)"),
             }
         }
@@ -333,7 +402,7 @@ pub(crate) fn handle_config_cmd(path: PathBuf, args: ConfigArgs, explicit_config
             "proxy          = {}",
             cfg.proxy
                 .as_deref()
-                .map(mask_proxy_url)
+                .map(mask_base_url)
                 .unwrap_or_else(|| "(未设置)".to_string())
         );
         println!(
@@ -369,5 +438,41 @@ pub(crate) fn handle_config_cmd(path: PathBuf, args: ConfigArgs, explicit_config
             println!("提示: base_url 为空，请设置:");
             println!("  aproxy config --baseurl https://api.anthropic.com");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transform_args_mask_values_after_secret_flags() {
+        let args: Vec<String> = [
+            "run",
+            "--api-key",
+            "SUPERSECRET2",
+            "--TOKEN=tok-abcdefgh",
+            "--config",
+            "C:/agg.toml",
+            "https://user:pw@h/x?key=Q",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let masked = mask_transform_args(&args);
+        assert_eq!(
+            masked,
+            [
+                "run",
+                "--api-key",
+                "SUPERS***",
+                "--TOKEN=tok-ab***",
+                "--config",
+                "C:/agg.toml",
+                "https://***@h/x?key=***",
+            ]
+        );
+        // 旗标在末尾（缺值）不越界，原样保留
+        assert_eq!(mask_transform_args(&["--key".to_string()]), ["--key"]);
     }
 }

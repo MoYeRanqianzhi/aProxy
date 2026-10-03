@@ -28,6 +28,9 @@
 //!   SSE 流式骨架，由后台任务从 attempt 2 继续无限重试，并在重试间隙向下游发送
 //!   SSE 注释保活（`: keepalive ...\n\n`），防止客户端因 idle 超时而断开；
 //!   后台任务在客户端断开（channel 关闭）时立即退出，不空转。
+//! - 入站来源校验（handler 第一步）：Host 不在 `allowed_hosts`、或带了不在
+//!   `allowed_origins` 里的 Origin 的请求本地 403——不转发、不注入 api_key、
+//!   不进重试循环（防 DNS 重绑定与网页跨站调用；语义见 `Config` 同名字段）
 //! - 头处理：`api_key` 快捷覆盖 `Authorization: Bearer` 与 `x-api-key`（Anthropic 风格），
 //!   `extra_headers` 追加缺失头，`override_headers` 无条件覆盖（兼容非 Bearer 鉴权与额外头需求）
 //! - 磁盘临时文件生命周期：请求体随请求结束（Drop）删除；响应 spool 在回放流
@@ -119,6 +122,185 @@ pub struct AppState {
     /// 内部编排细节（TransformPool 的接口不对外），AppState 虽 pub 但不泄漏它。
     pub(crate) request_pool: Option<Arc<crate::transform::TransformPool>>,
     pub(crate) response_pool: Option<Arc<crate::transform::TransformPool>>,
+    /// 入站来源校验策略（源 `config.allowed_hosts` / `allowed_origins` 与监听
+    /// 地址）：启动时归一一次，热路径只做小集合比较。
+    inbound: Arc<InboundPolicy>,
+}
+
+/// 入站来源校验策略：Host 白名单（防 DNS 重绑定）与 Origin 白名单（防网页
+/// 跨站调用）。语义的权威说明见 `Config::allowed_hosts` / `allowed_origins`。
+///
+/// 被拒的请求在 handler 第一步就以 403 本地返回：**绝不转发、绝不注入
+/// api_key、绝不进入重试循环**。这是唯一不经上游就终结请求的入口，而它只作用
+/// 于从未转发过的请求，「无限重试」对放行的请求毫无改变。
+struct InboundPolicy {
+    /// None = 不做 Host 校验；Some = 只放行这些主机名（已归一：去端口、小写、
+    /// IPv6 带方括号）
+    hosts: Option<Vec<String>>,
+    /// None = 不做 Origin 校验；Some = 只放行这些 Origin（已归一：去末尾 `/`、
+    /// 小写）。Some(空) = 拒绝一切携带 Origin 的请求（内置默认）
+    origins: Option<Vec<String>>,
+}
+
+/// 被拒请求的拒绝原因（决定 403 文案与日志）
+enum InboundRejection {
+    /// Host 不在白名单（值为请求的 Host，已截断）
+    Host(String),
+    /// Origin 不在白名单（值为请求的 Origin，已截断）
+    Origin(String),
+}
+
+/// 回环名单：Host 校验生效时恒放行。这三者只能指向本机，攻击者的域名无论
+/// 怎样重绑定都不会以它们出现在 Host 头里。
+const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
+
+/// 主机名归一：去端口、小写；IPv6 统一为带方括号形态（Host 头里必然带括号，
+/// 配置条目可能写成裸 `::1`）。Host 头与配置条目走同一函数，比较才对称。
+/// 配置条目误写成 URL（`http://myhost:8080/`）时取其主机部分——Host 头里
+/// 不会出现 `://`，这一步只对配置生效。
+fn normalize_host(raw: &str) -> String {
+    let mut s = raw.trim().to_ascii_lowercase();
+    if let Some((_, rest)) = s.split_once("://") {
+        s = rest.split('/').next().unwrap_or("").to_string();
+    }
+    if let Some(rest) = s.strip_prefix('[') {
+        return match rest.find(']') {
+            Some(end) => format!("[{}]", &rest[..end]),
+            None => s,
+        };
+    }
+    if s.matches(':').count() >= 2 {
+        return format!("[{s}]");
+    }
+    match s.split_once(':') {
+        Some((host, _port)) => host.to_string(),
+        None => s,
+    }
+}
+
+/// Origin 归一：去首尾空白与末尾 `/`、小写（浏览器发出的 Origin 不带末尾
+/// `/`，用户照抄地址栏时常带上）
+fn normalize_origin(raw: &str) -> String {
+    raw.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// 日志/文案里回显攻击者可控的头值：截断到固定长度，防止超长值撑爆日志行。
+/// 调用方只传 `HeaderValue::to_str` 成功的值或 URI authority——两者都只含
+/// 可见 ASCII（无控制字符注入面），按字节截断也不会切断多字节字符。
+fn truncate_for_display(s: &str) -> String {
+    const MAX: usize = 128;
+    if s.len() <= MAX {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..MAX])
+    }
+}
+
+impl InboundPolicy {
+    fn from_config(config: &Config) -> Self {
+        let wildcard = |list: &[String]| list.iter().any(|e| e.trim() == "*");
+        let host_entries = config.allowed_hosts();
+        let loopback = config.listen_is_loopback();
+        let hosts = if wildcard(host_entries) || (!loopback && host_entries.is_empty()) {
+            None
+        } else {
+            let mut set: Vec<String> = LOOPBACK_HOSTS.iter().map(|h| h.to_string()).collect();
+            // 监听地址自身的主机部分：监听 127.0.0.2 / 局域网主机名时，客户端用的
+            // 正是它。通配地址（0.0.0.0、[::]）不是任何客户端会写进 Host 的名字
+            let listen_host = normalize_host(&config.listen_addr);
+            if !listen_host.is_empty() && listen_host != "0.0.0.0" && listen_host != "[::]" {
+                set.push(listen_host);
+            }
+            set.extend(
+                host_entries
+                    .iter()
+                    .map(|h| normalize_host(h))
+                    .filter(|h| !h.is_empty()),
+            );
+            Some(set)
+        };
+        let origin_entries = config.allowed_origins();
+        let origins = if wildcard(origin_entries) {
+            None
+        } else {
+            Some(origin_entries.iter().map(|o| normalize_origin(o)).collect())
+        };
+        Self { hosts, origins }
+    }
+
+    /// 校验一个入站请求；放行返回 None。
+    ///
+    /// Host 取 Host 头（多值时逐个校验，任一不在白名单即拒）；没有 Host 头时
+    /// 退回请求 URI 的 authority（HTTP/2 的 `:authority`）；两者都没有则放行——
+    /// 浏览器发出的每个 HTTP/1.1 请求都带 Host（明文 HTTP 下浏览器不用 h2c，
+    /// 不存在只有 `:authority` 的浏览器请求），无 Host 的请求只可能来自自己
+    /// 拼报文的本机程序，DNS 重绑定这一威胁与它无关。非 ASCII 的 Host 一律拒绝。
+    fn check(&self, headers: &HeaderMap, uri: &http::Uri) -> Option<InboundRejection> {
+        if let Some(allowed) = &self.hosts {
+            let mut values: Vec<&str> = Vec::new();
+            for v in headers.get_all(http::header::HOST) {
+                match v.to_str() {
+                    Ok(s) => values.push(s),
+                    Err(_) => return Some(InboundRejection::Host("<非 ASCII>".to_string())),
+                }
+            }
+            let authority = uri.authority().map(|a| a.as_str());
+            if values.is_empty()
+                && let Some(a) = authority
+            {
+                values.push(a);
+            }
+            for v in values {
+                if !allowed.contains(&normalize_host(v)) {
+                    return Some(InboundRejection::Host(truncate_for_display(v)));
+                }
+            }
+        }
+        if let Some(allowed) = &self.origins {
+            for v in headers.get_all(http::header::ORIGIN) {
+                let Ok(s) = v.to_str() else {
+                    return Some(InboundRejection::Origin("<非 ASCII>".to_string()));
+                };
+                if !allowed.contains(&normalize_origin(s)) {
+                    return Some(InboundRejection::Origin(truncate_for_display(s)));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// 入站拒绝的 403 响应：文案点名对应配置项与修复方法（用户只看得到这一句，
+/// 必须能照着改好）。同时 warn 留痕——路径经脱敏（查询串可能带 key）。
+fn inbound_rejection_response(
+    rejection: InboundRejection,
+    method: &http::Method,
+    uri: &http::Uri,
+) -> Response {
+    let path = crate::config::mask_base_url(uri.path_and_query().map_or("/", |pq| pq.as_str()));
+    let body = match &rejection {
+        InboundRejection::Host(host) => {
+            tracing::warn!(method = %method, path = %path, host = %host, "入站请求被拒绝：Host 不在 allowed_hosts 白名单（未转发上游）");
+            format!(
+                "aProxy 拒绝了该请求（403，未转发上游）：Host「{host}」不在允许列表内。\n\
+                 为防 DNS 重绑定，监听回环地址时默认只放行 localhost / 127.0.0.1 / [::1]。\n\
+                 若这是你信任的客户端，请把该主机名（不含端口）加入 config.toml 的 allowed_hosts\n\
+                 （或 settings.json 的 allowed_hosts 全局默认），例如 allowed_hosts = [\"主机名\"]；\n\
+                 写 allowed_hosts = [\"*\"] 可关闭 Host 校验。\n"
+            )
+        }
+        InboundRejection::Origin(origin) => {
+            tracing::warn!(method = %method, path = %path, origin = %origin, "入站请求被拒绝：Origin 不在 allowed_origins 白名单（未转发上游）");
+            format!(
+                "aProxy 拒绝了该请求（403，未转发上游）：来自浏览器页面的请求（Origin「{origin}」）默认不放行，\n\
+                 以防网页借本机代理调用上游、花费你的额度。\n\
+                 若这是你信任的浏览器/Electron 客户端，请把该 Origin 原样加入 config.toml 的 allowed_origins\n\
+                 （或 settings.json 的 allowed_origins 全局默认），例如 allowed_origins = [\"{origin}\"]；\n\
+                 写 allowed_origins = [\"*\"] 可关闭 Origin 校验。\n"
+            )
+        }
+    };
+    (StatusCode::FORBIDDEN, body).into_response()
 }
 
 impl AppState {
@@ -197,6 +379,7 @@ impl AppState {
             .response_transform
             .as_ref()
             .map(|t| Arc::new(crate::transform::TransformPool::new(Arc::new(t.clone()))));
+        let inbound = Arc::new(InboundPolicy::from_config(&config));
         Self {
             spool_dir,
             config: Arc::new(config),
@@ -209,6 +392,7 @@ impl AppState {
             bounded_retry_patterns,
             request_pool,
             response_pool,
+            inbound,
         }
     }
 
@@ -431,12 +615,35 @@ impl SpoolBuffer {
     }
 
     /// 收集完成：内存 → SpooledBody::Memory（重试判定走整体扫描旧路径，
-    /// disk_scan=None）；磁盘 → 关写句柄产出 SpooledBody::Disk +（增量扫描
-    /// 结论, 头部快照）。消费 scanner。
-    async fn finish(self, scanner: StreamErrorScanner) -> (SpooledBody, Option<(bool, Vec<u8>)>) {
+    /// disk_scan=None）；磁盘 → flush 后关写句柄产出 SpooledBody::Disk +
+    /// （增量扫描结论, 头部快照）。消费 scanner。
+    ///
+    /// Err = 磁盘模式收尾 flush 失败（磁盘满/IO 故障），调用方按 SpoolFailed
+    /// 处理；半截文件已在此删除。
+    async fn finish(
+        self,
+        scanner: StreamErrorScanner,
+    ) -> Result<(SpooledBody, Option<(bool, Vec<u8>)>), String> {
         match self {
-            SpoolBuffer::Memory(mem) => (SpooledBody::Memory(Bytes::from(mem)), None),
-            SpoolBuffer::Disk { file, path, len } => {
+            SpoolBuffer::Memory(mem) => Ok((SpooledBody::Memory(Bytes::from(mem)), None)),
+            SpoolBuffer::Disk {
+                mut file,
+                path,
+                len,
+            } => {
+                // drop 前必须 flush：tokio File 的 poll_write 把写操作派发到阻塞池后
+                // **立刻**报 Ok，真实写入结果只在下一次 write/flush 时浮现——前面
+                // 各块的错误会被后一块的 write_all 捕获（走 Poisoned），但**最后
+                // 一块**之后再没有写操作，不 flush 就 drop 会把它的错误连同未完成
+                // 的写一起吞掉：回放读到比 len 短的文件，DiskSpoolStream 把提前 EOF
+                // 当正常结束，客户端拿到被静默截断的「成功」响应。内存→磁盘切换块
+                // 恰是最后一块时同理——切换后本变体就是 Disk，同样由这里兜住。
+                // flush 只把写推进 OS（不等物理落盘），与 read_request_body 同款。
+                if let Err(e) = file.flush().await {
+                    drop(file); // 先关句柄再删（Windows 要求）
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!("spool 磁盘写入失败（收尾 flush）: {e}"));
+                }
                 drop(file); // 关写句柄，头部快照以只读重新打开
                 let head = match tokio::fs::File::open(&path).await {
                     Ok(mut f) => {
@@ -452,12 +659,14 @@ impl SpoolBuffer {
                     Err(_) => Vec::new(),
                 };
                 let error = scanner.finish();
-                (SpooledBody::Disk { path, len }, Some((error, head)))
+                Ok((SpooledBody::Disk { path, len }, Some((error, head))))
             }
             // 不可达：Poisoned 在 forward_once 收集循环中提前返回。防御性产出
             // 空 body 成功（与磁盘判定缺失同样按不重试处理，服务不因内部
             // 不变量被破坏而失能）
-            SpoolBuffer::Poisoned => (SpooledBody::Memory(Bytes::new()), Some((false, Vec::new()))),
+            SpoolBuffer::Poisoned => {
+                Ok((SpooledBody::Memory(Bytes::new()), Some((false, Vec::new()))))
+            }
         }
     }
 }
@@ -821,6 +1030,15 @@ fn apply_header_overrides(headers: &mut HeaderMap, config: &Config) {
 async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
+
+    // 入站来源校验：必须是第一步——先于请求体读取（被拒请求不值得缓冲/落盘
+    // 任何字节）、先于 apply_header_overrides（绝不给它注入 api_key）、先于
+    // 仅转发分支与重试循环（绝不转发）。也先于活动时间戳与请求计数：被拒的
+    // 请求不是代理流量，不应让探测者把实例「刷」成活跃、也不计入请求数。
+    if let Some(rejection) = state.inbound.check(req.headers(), &uri) {
+        return inbound_rejection_response(rejection, &method, &uri);
+    }
+
     let mut headers = req.headers().clone();
 
     // 活动时间戳：收到请求即更新（stop idle / status 筛选的判定依据）
@@ -848,7 +1066,9 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
     // 判定，也不做响应体解码（本模式不对响应内容做任何检查，无需解码）。
     if state.config.forward_only_enabled() {
         let target_url = upstream_url(&state.config, &uri);
-        tracing::info!(method = %method, target = %target_url, "代理请求（仅转发）");
+        // 日志里的 URL 一律经 mask_base_url：base_url 可能内嵌 user:pass，客户端
+        // 查询串可能带 key（Gemini 式 ?key=），日志常被整段粘贴求助
+        tracing::info!(method = %method, target = %crate::config::mask_base_url(&target_url), "代理请求（仅转发）");
         return forward_only_proxy(state, method, target_url, headers, req.into_body()).await;
     }
 
@@ -904,7 +1124,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
         .await
         {
             Ok(t) => {
-                tracing::info!(url = %t.url, "请求已由外部转换器改写");
+                tracing::info!(url = %crate::config::mask_base_url(&t.url), "请求已由外部转换器改写");
                 method = t.method;
                 target_url = t.url;
                 headers = t.headers;
@@ -923,7 +1143,12 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
         }
     }
 
-    tracing::info!(method = %method, path = %path_and_query, target = %target_url, "代理请求");
+    tracing::info!(
+        method = %method,
+        path = %crate::config::mask_base_url(path_and_query),
+        target = %crate::config::mask_base_url(&target_url),
+        "代理请求"
+    );
 
     let keepalive_dur = state.config.keepalive_interval();
     let keepalive_enabled = state.config.keepalive_enabled() && keepalive_dur.as_secs() > 0;
@@ -1701,7 +1926,8 @@ async fn forward_once(
 
     let resp = match builder.send().await {
         Ok(r) => r,
-        Err(e) => return ForwardResult::NetworkError(e.to_string()),
+        // 在源头脱敏：NetworkError 的文本会流向日志、status 的最近错误与各通道
+        Err(e) => return ForwardResult::NetworkError(redact_reqwest_error(e)),
     };
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -1744,18 +1970,38 @@ async fn forward_once(
             Ok(None) => break,
             Err(e) => {
                 spool.discard();
-                return ForwardResult::NetworkError(format!("读取上游响应体失败: {e}"));
+                return ForwardResult::NetworkError(format!(
+                    "读取上游响应体失败: {}",
+                    redact_reqwest_error(e)
+                ));
             }
         }
     }
 
-    let (body, disk_scan) = spool.finish(scanner).await;
+    // 收尾 flush 失败与收集途中写失败同属本地磁盘故障，走同一条 SpoolFailed 路径
+    let (body, disk_scan) = match spool.finish(scanner).await {
+        Ok(v) => v,
+        Err(e) => return ForwardResult::SpoolFailed(e),
+    };
     ForwardResult::Response {
         status,
         headers: resp_headers,
         raw_headers,
         body,
         disk_scan,
+    }
+}
+
+/// reqwest 错误的脱敏渲染：它的 Display 会把请求 URL 原样拼在末尾
+/// （`error sending request for url (URL)`），URL 的查询串里可能带客户端的 key
+/// （`?key=...`），而这段文本会进日志、status 的最近错误和 502 正文。先剥掉 URL
+/// 再按原有形态附上脱敏版本——保留「for url (...)」便于排障时看出打到了哪里。
+fn redact_reqwest_error(e: reqwest::Error) -> String {
+    let url = e.url().map(|u| crate::config::mask_base_url(u.as_str()));
+    let e = e.without_url();
+    match url {
+        Some(u) => format!("{e} for url ({u})"),
+        None => e.to_string(),
     }
 }
 
@@ -1885,6 +2131,9 @@ async fn forward_only_proxy(
     let resp = match builder.send().await {
         Ok(r) => r,
         Err(e) => {
+            // 错误文本与目标 URL 都会进日志 / 最近错误 / 502 正文，一律先脱敏
+            let e = redact_reqwest_error(e);
+            let masked_target = crate::config::mask_base_url(&target_url);
             // send() 的失败有三种来源：上游真的失败，或请求体适配器产出 Err 令
             // reqwest 主动中止（超限 / 客户端上传中断，各有一个标记）。判定顺序
             // 是刻意的：超限排在最前——它同时也会让适配器产出 Err，而「你的请求体
@@ -1897,7 +2146,7 @@ async fn forward_only_proxy(
             // 也不回 502：发起断开的客户端读不到响应，这里的状态码只是给日志与
             // 中间观测看的，取与缓冲路径同一事件一致的 400。
             if client_gone.load(AtomicOrdering::Relaxed) {
-                tracing::error!(error = %e, target = %target_url, "客户端请求体传输中断，已中止上游请求");
+                tracing::error!(error = %e, target = %masked_target, "客户端请求体传输中断，已中止上游请求");
                 return (
                     StatusCode::BAD_REQUEST,
                     "请求体读取失败（客户端在上传途中断开）",
@@ -1908,7 +2157,7 @@ async fn forward_only_proxy(
             // 否则 status 的「最近错误」对这类实例永久显示「无」
             let reason = format!("上游请求失败: {e}");
             state.note_upstream_failure(&reason);
-            tracing::warn!(error = %e, target = %target_url, "上游请求失败（仅转发模式不重试）");
+            tracing::warn!(error = %e, target = %masked_target, "上游请求失败（仅转发模式不重试）");
             return (
                 StatusCode::BAD_GATEWAY,
                 format!("{reason}（仅转发模式不重试）"),
@@ -1968,6 +2217,7 @@ async fn forward_only_proxy(
             // 是伪造数据），也不重试（本模式已放弃重试能力）。错误记入
             // note_upstream_failure 并带上已转发字节数，便于判断断在了哪里。
             let forwarded_bytes = counter.load(AtomicOrdering::Relaxed);
+            let e = redact_reqwest_error(e);
             let reason = format!("上游响应流中断: {e}");
             state.note_upstream_failure(&reason);
             tracing::warn!(
@@ -2099,6 +2349,83 @@ mod tests {
         // 各块按序还原 == 原 body（切块只分不变）
         let reassembled: Vec<u8> = frames.into_iter().flatten().collect();
         assert_eq!(reassembled, body.as_ref());
+    }
+
+    // ---- 入站 Host 归一：Host 头与配置条目必须归一到同一形态才能比较 ----
+
+    #[test]
+    fn normalize_host_forms() {
+        for (raw, want) in [
+            ("127.0.0.1:12345", "127.0.0.1"),
+            ("LocalHost", "localhost"),
+            ("localhost:1", "localhost"),
+            ("[::1]:12345", "[::1]"),
+            ("[::1]", "[::1]"),
+            ("::1", "[::1]"),
+            ("MyProxy.Local:999", "myproxy.local"),
+            // 配置条目误写成 URL：取主机部分
+            ("http://myhost:8080/", "myhost"),
+            ("https://[::1]:9/x", "[::1]"),
+            ("evil.example.com", "evil.example.com"),
+        ] {
+            assert_eq!(normalize_host(raw), want, "{raw}");
+        }
+        assert_eq!(
+            normalize_origin(" http://LOCALHOST:5173/ "),
+            "http://localhost:5173"
+        );
+    }
+
+    // ---- 响应 spool 收尾 flush：最后一块的写失败不得被吞 ----
+
+    #[tokio::test]
+    async fn spool_finish_surfaces_error_of_last_write() {
+        // 注入写失败：以**只读**句柄充当 spool 写句柄，阻塞池里的真实写入必然
+        // 失败（Windows 拒绝访问 / unix EBADF），而 tokio File 的 poll_write
+        // 派发后立刻报 Ok——这正是缺陷成立的前提：最后一块之后再无写操作，
+        // 只有收尾 flush 能观察到这个错误
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool-flush-test.spooltmp");
+        std::fs::write(&path, b"").unwrap();
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let mut buf = SpoolBuffer::Disk {
+            file,
+            path: path.clone(),
+            len: 0,
+        };
+        spool_chunk(&mut buf, b"final chunk", Some(dir.path())).await;
+        assert!(
+            matches!(buf, SpoolBuffer::Disk { len: 11, .. }),
+            "前提：write_all 本身报 Ok，错误留到下一次 write/flush 才浮现"
+        );
+
+        let result = buf.finish(StreamErrorScanner::new()).await;
+        let err = result.err().expect("收尾 flush 必须暴露最后一块的写失败");
+        assert!(err.contains("spool 磁盘写入失败"), "{err}");
+        assert!(!path.exists(), "失败的 spool 半截文件必须删除");
+    }
+
+    #[tokio::test]
+    async fn spool_finish_disk_success_keeps_full_content() {
+        // 对照组：正常写句柄下 finish 成功，长度与文件内容一致（flush 不改变
+        // 成功路径的语义）
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool-flush-ok.spooltmp");
+        let file = tokio::fs::File::create(&path).await.unwrap();
+        let mut buf = SpoolBuffer::Disk {
+            file,
+            path: path.clone(),
+            len: 0,
+        };
+        spool_chunk(&mut buf, b"hello ", Some(dir.path())).await;
+        spool_chunk(&mut buf, b"world", Some(dir.path())).await;
+        let (body, scan) = buf
+            .finish(StreamErrorScanner::new())
+            .await
+            .expect("正常写入的 finish 应成功");
+        assert_eq!(body.len(), 11);
+        assert!(scan.is_some(), "磁盘模式必带增量扫描结论");
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
     }
 
     // ---- preview_body：二进制/压缩体不污染日志（回归：zstd 错误体曾被

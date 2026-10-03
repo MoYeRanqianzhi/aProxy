@@ -194,6 +194,41 @@ pub struct Config {
     /// 默认，内置空）。
     #[serde(default)]
     pub bounded_retry_paths: Option<Vec<String>>,
+    /// 入站 Host 白名单（防 DNS 重绑定）：Host 校验生效时，额外放行的主机名。
+    ///
+    /// 威胁：恶意网页把自己的域名重绑定到 127.0.0.1 后，浏览器会把它当「同源」
+    /// 请求发到本代理（Host 头是攻击者的域名）——代理照常注入 api_key 转发，
+    /// 攻击者就能花你的额度并读到响应。CLI 类 agent 一律用 localhost /
+    /// 127.0.0.1 访问，Host 校验对它们零影响。
+    ///
+    /// 语义（Host 头去掉端口后，按 ASCII 大小写不敏感全等比较；条目里写的
+    /// 端口同样忽略）：
+    /// - 列表含 `"*"` → 关闭 Host 校验（任何 Host 都放行）
+    /// - 校验生效的条件：监听地址是回环（127.0.0.0/8、::1、localhost），或本
+    ///   列表非空。监听非回环地址（0.0.0.0、局域网 IP）且列表为空时**不做**
+    ///   Host 校验——局域网/容器客户端的 Host 各式各样，默认拦截会破坏现有
+    ///   用法（启动时另有非回环告警）
+    /// - 校验生效时放行：localhost / 127.0.0.1 / [::1]、监听地址自身的主机部分
+    ///   （0.0.0.0、[::] 这类通配地址除外）、以及本列表的条目
+    /// - 空列表 = 与未配置相同（内置默认策略）——toml 写 `allowed_hosts = []`
+    ///   可把 settings.json 的全局列表恢复成内置默认
+    ///
+    /// 未设置时用 settings.json 的 `allowed_hosts`（全局默认，内置空）。
+    #[serde(default)]
+    pub allowed_hosts: Option<Vec<String>>,
+    /// 入站 Origin 白名单（防网页借本机代理调用上游）：默认拒绝**任何**携带
+    /// Origin 头的请求——只有浏览器（及 Electron/WebView 类客户端）会发 Origin，
+    /// CLI 类 agent 不发，拒绝它们对 CLI 零影响，却能挡住网页对本代理的跨站
+    /// 调用（no-cors 的简单 POST 也会带 Origin）。
+    ///
+    /// 语义：条目与请求的 Origin 头按 ASCII 大小写不敏感全等比较（条目末尾的
+    /// `/` 忽略），写法与浏览器发出的完全一致，如 `"http://localhost:5173"`；
+    /// 含 `"*"` → 关闭 Origin 校验。空列表 = 与未配置相同（拒绝一切带 Origin
+    /// 的请求）。与监听地址无关（非回环监听同样生效）。
+    ///
+    /// 未设置时用 settings.json 的 `allowed_origins`（全局默认，内置空）。
+    #[serde(default)]
+    pub allowed_origins: Option<Vec<String>>,
     /// 请求转换器（外部 format 程序）：请求体缓冲完成后交给它改写
     /// （body/headers/url/method），重试全程重放转换后的产物。
     /// **失败语义**：转换失败（进程崩溃/超时/error 行）→ 502 + 原因，不重试
@@ -280,6 +315,8 @@ impl Default for Config {
             disk_cache: None,
             forward_only: None,
             bounded_retry_paths: None,
+            allowed_hosts: None,
+            allowed_origins: None,
             request_transform: None,
             response_transform: None,
             log_file: None,
@@ -475,6 +512,65 @@ impl Config {
     pub fn compile_bounded_retry_pattern(pattern: &str) -> Result<regex::Regex, regex::Error> {
         regex::Regex::new(&format!("^(?:{pattern})$"))
     }
+
+    /// 入站 Host 白名单条目（同 bounded_retry_paths 的注入/回退语义：toml 显式
+    /// 值 > settings 注入值 > 内置空 = 内置默认策略）。消费点必须走本方法而非
+    /// `Option::unwrap()`——不经 settings 注入的构建路径上 `None` 是常态。
+    pub fn allowed_hosts(&self) -> &[String] {
+        self.allowed_hosts.as_deref().unwrap_or(&[])
+    }
+
+    /// 入站 Origin 白名单条目（注入/回退语义同 allowed_hosts；内置空 = 拒绝
+    /// 一切携带 Origin 的请求）。
+    pub fn allowed_origins(&self) -> &[String] {
+        self.allowed_origins.as_deref().unwrap_or(&[])
+    }
+
+    /// 监听地址是否为回环：IP 字面量按 `is_loopback`（127.0.0.0/8、::1）判定；
+    /// 主机名形态只认 `localhost`。其余（0.0.0.0、[::]、局域网 IP、其他主机名）
+    /// 一律视为非回环——判定结果决定 Host 校验的默认开关与启动告警，宁可多告警
+    /// 也不把对外暴露的监听误判为「仅本机」。
+    pub fn listen_is_loopback(&self) -> bool {
+        let addr = self.listen_addr.trim();
+        if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+            return sa.ip().is_loopback();
+        }
+        let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
+        host.eq_ignore_ascii_case("localhost")
+    }
+
+    /// 本实例是否会给入站请求注入凭据：api_key，或 extra/override_headers 里配置
+    /// 了 Authorization / x-api-key。用于非回环监听告警的措辞分级——注入凭据的
+    /// 实例对外监听，等于把 key 交给每一个能连上端口的主机。
+    fn injects_credentials(&self) -> bool {
+        self.api_key.is_some()
+            || self
+                .override_headers
+                .keys()
+                .chain(self.extra_headers.keys())
+                .any(|k| {
+                    k.eq_ignore_ascii_case("authorization") || k.eq_ignore_ascii_case("x-api-key")
+                })
+    }
+
+    /// 非回环监听的告警文案；回环监听返回 None。start 输出、守护的
+    /// startup.log 与 doctor 共用这一份文案，三处口径一致。
+    pub fn listen_exposure_warning(&self) -> Option<String> {
+        if self.listen_is_loopback() {
+            return None;
+        }
+        let addr = &self.listen_addr;
+        let port = addr.rsplit(':').next().unwrap_or("12345");
+        Some(if self.injects_credentials() {
+            format!(
+                "监听地址 {addr} 不是回环地址，且本实例配置了 api_key（或 Authorization / x-api-key 鉴权头）：代理会把它注入每一个入站请求——任何能连到该端口的主机都能用你的 key 调用上游、费用记在你的账上，等于把 key 共享给整个局域网。只给本机用请改回 127.0.0.1:{port}"
+            )
+        } else {
+            format!(
+                "监听地址 {addr} 不是回环地址：局域网/同网段内任何能连到该端口的主机都能经本代理访问上游。只给本机用请改回 127.0.0.1:{port}；确需对外开放请只在可信网络中使用"
+            )
+        })
+    }
 }
 
 /// 转换器 command 归一化：trim + `~` 展开；trim 后为空 = 配置视为未设置。
@@ -548,26 +644,84 @@ pub fn load_from_strict(path: &std::path::Path) -> Result<Config, String> {
     }
 }
 
-/// base_url 展示打码：内嵌 userinfo（`https://user:pass@host`）时隐去密码段。
-/// 无凭据（绝大多数情况）或解析失败时原样返回。
+/// URL 凭据脱敏——所有「可能被粘贴分享」的输出面（守护日志、status 的最近
+/// 错误、start/config 的控制台输出、实例注册表）展示 URL 时的**唯一出口**。
+/// 名称沿用最早只用于 base_url 时的叫法，现在 base_url、代理 URL、上游目标
+/// URL、请求的 `路径?查询串`、reqwest 错误里的 URL 一律走它。
+///
+/// 规则：
+/// - userinfo：用户名或密码任一存在即整体替换为 `***@`——令牌常以用户名形态
+///   出现（`https://TOKEN@host`），只遮密码不够
+/// - 查询串：保留键名，非空值替换为 `***`（`?key=***&beta=***`）——Gemini 式
+///   客户端把 key 放在 `?key=` 里
+/// - 片段：非空即整体替换为 `***`
+/// - 其余部分逐字保留（不经 URL 解析器重新序列化，不会凭空多出尾斜杠等，
+///   展示与用户写的一致）
+///
+/// 输入可以是完整 URL，也可以是以 `/` 开头的 `路径?查询串`。对解析失败的
+/// 畸形 URL（如密码里含未编码的 `/` `?`）退回保守策略：最后一个 `@` 之前的
+/// 内容全部视为 userinfo 遮掉——宁可多遮，也不按「看似合法」的切分把密码
+/// 后半段漏出来。结果幂等（对输出再脱敏不变），下游重复调用安全。
 pub fn mask_base_url(raw: &str) -> String {
-    let Ok(url) = url::Url::parse(raw) else {
-        return raw.to_string();
+    // scheme 必须是合法的 scheme 记号（字母开头，仅字母数字 + - .）——否则
+    // `/v1/x?key=S&r=http://y` 这类查询串里带 `://` 的路径会被误认成 URL，
+    // 整段查询串（含 key 的值）原样漏出
+    let scheme_end = raw.find("://").filter(|&i| {
+        let s = &raw[..i];
+        s.starts_with(|c: char| c.is_ascii_alphabetic())
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    });
+    let (scheme, rest) = match scheme_end {
+        Some(i) => raw.split_at(i + 3),
+        None => ("", raw),
     };
-    if url.password().is_none() {
-        return raw.to_string();
+    // userinfo 的范围：合法 URL 的 authority 止于第一个 `/` `?` `#`（路径里的
+    // `@` 合法且常见，如 Vertex 的 `models/claude-x@20250101`，不能误伤）；
+    // `/` 开头的纯路径没有 authority；其余（解析失败的 URL、无 scheme 的
+    // `user:pass@host`）按最后一个 `@` 保守切分
+    let userinfo_end = if scheme.is_empty() && rest.starts_with('/') {
+        None
+    } else if !scheme.is_empty() && url::Url::parse(raw).is_ok() {
+        let authority_len = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        rest[..authority_len].rfind('@')
+    } else {
+        rest.rfind('@')
+    };
+    let (userinfo_mask, rest) = match userinfo_end {
+        Some(at) => ("***@", &rest[at + 1..]),
+        None => ("", rest),
+    };
+    let (rest, fragment) = match rest.split_once('#') {
+        Some((r, f)) => (r, Some(f)),
+        None => (rest, None),
+    };
+    let (path, query) = match rest.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (rest, None),
+    };
+    let mut out = String::with_capacity(raw.len());
+    out.push_str(scheme);
+    out.push_str(userinfo_mask);
+    out.push_str(path);
+    if let Some(q) = query {
+        out.push('?');
+        let pairs: Vec<String> = q
+            .split('&')
+            .map(|pair| match pair.split_once('=') {
+                Some((k, v)) if !v.is_empty() => format!("{k}=***"),
+                _ => pair.to_string(),
+            })
+            .collect();
+        out.push_str(&pairs.join("&"));
     }
-    let host = url.host_str().unwrap_or("");
-    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
-    let path = url.path();
-    format!(
-        "{}://{}:***@{}{}{}",
-        url.scheme(),
-        url.username(),
-        host,
-        port,
-        path
-    )
+    if let Some(f) = fragment {
+        out.push('#');
+        if !f.is_empty() {
+            out.push_str("***");
+        }
+    }
+    out
 }
 
 /// 加载指定路径的配置：语义同 `load`（不存在/解析失败回退默认配置）。
@@ -978,6 +1132,209 @@ mod tests {
         let legacy = load_from(&path);
         assert_eq!(legacy.bounded_retry_paths, None);
         assert!(legacy.bounded_retry_paths().is_empty());
+    }
+
+    // ---- mask_base_url：URL 凭据脱敏的统一出口 ----
+
+    #[test]
+    fn mask_url_masks_any_userinfo() {
+        // 无凭据：逐字原样（不经解析器重新序列化，不凭空多出尾斜杠）
+        assert_eq!(
+            mask_base_url("https://api.example.com"),
+            "https://api.example.com"
+        );
+        assert_eq!(
+            mask_base_url("http://127.0.0.1:7890"),
+            "http://127.0.0.1:7890"
+        );
+        assert_eq!(mask_base_url(""), "");
+        // 用户名 + 密码
+        assert_eq!(
+            mask_base_url("http://alice:secret@127.0.0.1:7890"),
+            "http://***@127.0.0.1:7890"
+        );
+        // 仅用户名也打码：令牌常以用户名形态出现（https://TOKEN@host）
+        assert_eq!(
+            mask_base_url("https://TOKENUSER@api.example.com/v1"),
+            "https://***@api.example.com/v1"
+        );
+        assert_eq!(
+            mask_base_url("socks5://alice@127.0.0.1:1080"),
+            "socks5://***@127.0.0.1:1080"
+        );
+    }
+
+    #[test]
+    fn mask_url_keeps_query_keys_and_masks_values() {
+        assert_eq!(
+            mask_base_url("http://alice:pw@h:1?p=x"),
+            "http://***@h:1?p=***"
+        );
+        assert_eq!(
+            mask_base_url("http://127.0.0.1:9/v1/models?key=QKEY999&a=1&flag&empty="),
+            "http://127.0.0.1:9/v1/models?key=***&a=***&flag&empty="
+        );
+        // 值里含 `=`：只按第一个 `=` 切分，键名完整保留
+        assert_eq!(mask_base_url("/x?sig=a=b=c"), "/x?sig=***");
+        // 纯路径（日志里的 path 字段）
+        assert_eq!(
+            mask_base_url("/v1/messages?beta=true"),
+            "/v1/messages?beta=***"
+        );
+        assert_eq!(mask_base_url("/v1/messages"), "/v1/messages");
+        // 片段整体遮掉
+        assert_eq!(mask_base_url("https://h/p#tok=abc"), "https://h/p#***");
+    }
+
+    #[test]
+    fn mask_url_does_not_mangle_at_sign_in_path() {
+        // 路径里的 `@` 合法（Vertex 的模型 ID 形如 claude-x@20250101）：不得被
+        // 当成 userinfo 分隔符把主机名遮掉
+        let vertex = "https://us-east5-aiplatform.googleapis.com/v1/projects/p/models/claude-3@20240229:streamRawPredict";
+        assert_eq!(mask_base_url(vertex), vertex);
+        assert_eq!(
+            mask_base_url("/v1/models/claude@2024?key=K"),
+            "/v1/models/claude@2024?key=***"
+        );
+    }
+
+    #[test]
+    fn mask_url_query_containing_scheme_is_still_masked() {
+        // 回归：查询串里出现 `://` 时不得被误认成 URL 的 scheme 分隔，否则整段
+        // 查询串（含 key 的值）原样漏出
+        assert_eq!(
+            mask_base_url("/v1/x?key=SECRET&r=http://y"),
+            "/v1/x?key=***&r=***"
+        );
+    }
+
+    #[test]
+    fn mask_url_malformed_inputs_fail_safe() {
+        // 畸形 URL（密码含未编码的 `/` `?`，解析失败）：最后一个 `@` 之前全部遮掉，
+        // 绝不按「看似合法」的切分漏出密码后半段
+        let out = mask_base_url("http://user:pa/ss@host:7890");
+        assert_eq!(out, "http://***@host:7890");
+        let out = mask_base_url("http://user:pa?ss@host");
+        assert!(!out.contains("pa") && !out.contains("ss@"), "{out}");
+        // 缺 scheme 的 user:pass@host（validate 会拒，但错误消息与 --show 仍要展示）
+        assert_eq!(
+            mask_base_url("user:pass@127.0.0.1:7890"),
+            "***@127.0.0.1:7890"
+        );
+        // scheme 打错（http//）同样不漏
+        let out = mask_base_url("http//user:pass@host");
+        assert!(!out.contains("pass"), "{out}");
+        // 无凭据的非 URL 原样
+        assert_eq!(mask_base_url("not a url"), "not a url");
+    }
+
+    #[test]
+    fn mask_url_is_idempotent() {
+        // 注册表里已是脱敏值，status 展示时会再脱敏一次：结果必须不变
+        for raw in [
+            "http://alice:secret@127.0.0.1:7890/v1?key=K&a=1#frag",
+            "https://TOKEN@api.example.com",
+            "/v1/x?key=SECRET",
+            "user:pass@host",
+        ] {
+            let once = mask_base_url(raw);
+            assert_eq!(mask_base_url(&once), once, "幂等失败: {raw}");
+        }
+    }
+
+    // ---- 监听地址回环判定与非回环告警 ----
+
+    #[test]
+    fn listen_loopback_detection() {
+        let at = |addr: &str| Config {
+            listen_addr: addr.to_string(),
+            ..Default::default()
+        };
+        for addr in [
+            "127.0.0.1:12345",
+            "127.0.0.5:12345",
+            "[::1]:12345",
+            "localhost:12345",
+            "LOCALHOST:1",
+        ] {
+            assert!(at(addr).listen_is_loopback(), "{addr} 应判为回环");
+        }
+        for addr in [
+            "0.0.0.0:12345",
+            "[::]:12345",
+            "192.168.1.10:12345",
+            "myhost.lan:12345",
+            ":12345",
+        ] {
+            assert!(!at(addr).listen_is_loopback(), "{addr} 应判为非回环");
+        }
+    }
+
+    #[test]
+    fn listen_exposure_warning_escalates_with_credentials() {
+        let loopback = Config::default();
+        assert!(
+            loopback.listen_exposure_warning().is_none(),
+            "回环监听不告警"
+        );
+
+        let open = Config {
+            listen_addr: "0.0.0.0:12345".to_string(),
+            ..Default::default()
+        };
+        let w = open.listen_exposure_warning().expect("非回环必须告警");
+        assert!(
+            w.contains("0.0.0.0:12345") && w.contains("127.0.0.1:12345"),
+            "{w}"
+        );
+        assert!(!w.contains("api_key"), "未注入凭据时不应使用 key 措辞: {w}");
+
+        // 配了 api_key：措辞升级，点明「等于把 key 共享给局域网」
+        let with_key = Config {
+            api_key: Some("sk-test".to_string()),
+            ..open.clone()
+        };
+        let w = with_key.listen_exposure_warning().unwrap();
+        assert!(
+            w.contains("api_key") && w.contains("共享给整个局域网"),
+            "{w}"
+        );
+        assert!(!w.contains("sk-test"), "告警文案不得带出 key 本身: {w}");
+
+        // 鉴权头同理（override/extra，大小写不敏感）
+        let with_header = Config {
+            override_headers: HashMap::from([("X-Api-Key".to_string(), "k".to_string())]),
+            ..open
+        };
+        assert!(
+            with_header
+                .listen_exposure_warning()
+                .unwrap()
+                .contains("共享给整个局域网")
+        );
+    }
+
+    #[test]
+    fn allowed_hosts_and_origins_roundtrip_and_default() {
+        // 两个入站白名单：toml 往返保真；旧配置（无字段）读出 None、访问器回退空
+        // （= 内置默认策略）
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.toml");
+        let raw = concat!(
+            "base_url = \"https://api.example.com\"\n",
+            "allowed_hosts = [\"myproxy.local\", \"*\"]\n",
+            "allowed_origins = [\"http://localhost:5173\"]\n",
+        );
+        std::fs::write(&path, raw).unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.allowed_hosts(), ["myproxy.local", "*"]);
+        assert_eq!(loaded.allowed_origins(), ["http://localhost:5173"]);
+
+        std::fs::write(&path, "base_url = \"https://api.example.com\"").unwrap();
+        let legacy = load_from(&path);
+        assert_eq!(legacy.allowed_hosts, None);
+        assert_eq!(legacy.allowed_origins, None);
+        assert!(legacy.allowed_hosts().is_empty() && legacy.allowed_origins().is_empty());
     }
 
     #[test]

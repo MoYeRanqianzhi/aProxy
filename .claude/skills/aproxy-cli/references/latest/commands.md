@@ -96,9 +96,22 @@ aproxy stop --force ...     # 任意 target 组合加 --force：立即 Terminate
   首次启动请用 `aproxy start <别名|路径>`。
 - 重启参数来源：`.restore` 记录的原始启动参数（保 `--api-key`/`--listen` 等
   仅本次参数）；缺失时回退注册表的配置文件路径。
-- `--force`（stop/restart 通用）：跳过 IPC 优雅关闭，立即 `TerminateProcess`
-  ——零等待。终止前验证进程镜像名，非 aProxy 进程（PID 复用）拒绝执行。
-  在途请求会立即中断，仅用于优雅停止失效或需要瞬间重启的场景。
+- `--force`（stop/restart 通用）：跳过 IPC 优雅关闭，立即终止进程——零等待。
+  终止前按 **pid + 进程创建时间**核验身份（与二进制文件名无关，改名部署的
+  实例同样可强杀），pid 已被复用给别的进程则拒绝执行。旧版本实例（注册记录
+  没有创建时间）退回 IPC 确认：终止前再 ping 一次该端口，应答者自报的 pid 与
+  目标一致才动手，不应答或易主一律拒绝。在途请求会立即中断，仅用于优雅停止
+  失效或需要瞬间重启的场景。
+- **`stop --force` 强杀成功后会清理该实例的恢复记录与注册文件**——强杀来不及
+  做优雅退出的自清，残留的恢复记录会被看门狗当成崩溃拉回来、被下次
+  `aproxy restore` 复活。`restart --force` 的强杀路径**保留**恢复记录（新实例
+  起不来时仍可自愈）。
+- **restart 先预检、后停止**：停旧实例之前，先按新守护将走的同一条路径干跑
+  一遍配置（原启动参数 → 配置加载/校验，换监听地址时再探测新地址可否绑定）。
+  预检不通过则**不动旧实例**并报出原因，服务不中断。`restart all`/`idle`
+  逐实例预检，失败的跳过、其余照常重启，最后汇总并以非零退出（退出 1）。
+  旧实例停止后新实例启动即退出的，会直接展示 startup.log 本次新增的内容
+  与恢复命令。
 
 语义细节：
 
@@ -136,7 +149,9 @@ aproxy restore              # 恢复崩溃/断电/重启前在运行的实例
 ```
 
 依据 run/<端口>.restore 恢复记录（守护 bind 成功时写入，优雅退出时删除）。
-幂等：已在运行的跳过；配置文件已删除的记录清理掉。空清单时**静默成功退出 0**
+幂等：已在运行的跳过；配置文件已删除的记录清理掉。就绪判定按新 pid 定位实例
+并报告**实际监听端口**；实例落在不同于记录的端口时（toml 改了端口、listen
+端口为 0），同时清理旧端口的恢复记录。空清单时**静默成功退出 0**
 （专为开机自启设计——任务计划程序登录时运行 `aproxy restore` 即可实现自愈）。
 
 ## alias
@@ -177,7 +192,7 @@ aproxy find [QUERY] [--aliased|--unaliased] [--port <PORT>]
 ## config
 
 ```
-aproxy config --show                          # 打印当前配置（敏感值打码）
+aproxy config --show                          # 打印当前配置（敏感值打码；含 allowed_hosts/allowed_origins）
 aproxy config --baseurl <URL>                 # 设置上游（末尾 / 自动去除）
 aproxy config --listen <ADDR>
 aproxy config --api-key <KEY> | --clear-api-key
@@ -201,7 +216,10 @@ aproxy config --clear-default
 
 外部转换器（`request_transform`/`response_transform`）**无 CLI 旗标**——只在
 config.toml 手写，`config --show` 展示生效值（字段写法见 config-toml.md；
-format 程序编写见 aproxy-format skill）。
+format 程序编写见 aproxy-format skill）。`--show` 对转换器的 `args` 中
+`--api-key`/`--token`/`--key`/`--secret`/`--password` 之后的值与 `extra`
+打码。入站校验字段 `allowed_hosts`/`allowed_origins` 同样只能手写 toml
+（或 settings.json 全局默认），无 CLI 旗标。
 
 ## install / upgrade
 
@@ -268,6 +286,7 @@ CDN 可自行填入；代码不内置任何 CDN 域名）。未配置 = 内置�
 - 成功 0；用户可修复的错误（配置错误、未知别名、多实例未指定 target、端口
   占用等）1。
 - 面向用户的输出全部简体中文；stderr 报错、stdout 出结果。
-- 所有展示输出对 api_key/头值/代理密码/base_url 内嵌凭据打码（前 6 字符 + `***`
-  或 `user:***@host`），日志同理——粘贴分享日志不泄露凭据。
+- 所有展示输出对凭据打码：api_key/头值保留前 6 字符 + `***`；URL 的 userinfo
+  整体 `***@`、查询串值 `***`（`?key=***`），日志与 status 的「最近错误」同理——
+  粘贴分享日志不泄露凭据。
 - Windows 控制台代码页在进程入口自动切 UTF-8（65001），守护日志为 UTF-8（无 BOM）。

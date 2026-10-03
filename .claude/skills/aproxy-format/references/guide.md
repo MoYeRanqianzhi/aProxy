@@ -7,6 +7,7 @@
 | # | 义务 | 违反的后果 |
 |---|---|---|
 | 1 | 按行读 stdin，一行一个信封 JSON | 多行混读 = 帧错乱，转换永久失败 |
+| 1b | **stdout 只写信封行，每个请求恰好回一行**；日志写 stderr | 多出一行 = 协议错误：worker 被剔除、请求 502「format 输出违反信封协议」 |
 | 2 | 处理完立即写一行信封回 stdout 并 **flush** | 不 flush → aproxy 等到超时（默认 30s）后 kill |
 | 3 | **读到 stdin EOF 即 exit**（persistent 铁律） | 不退出 → aProxy 实例停止后 worker 挂成孤儿进程 |
 | 4 | 单请求失败输出 error 行（exit 0） | 用非零 exit 表达业务失败 → worker 被当崩溃剔除，损失复用 |
@@ -179,10 +180,11 @@ python scripts/test_format.py --format-spec anthropic --command ./fmt --body-fil
 | 语言 | 坑 | 解法 |
 |---|---|---|
 | python（Windows） | stdout 默认 GBK，非 ASCII 抛异常/乱码 | 模板里的 `reconfigure(encoding="utf-8")` |
-| bash+jq | jq 默认 pretty-print 多行输出 | **jq 一律 `-c`**；printf 补 `\n` |
+| bash+jq | jq 默认 pretty-print 多行输出；后果：每个请求回多行，被判协议错误、502 | **jq 一律 `-c`**；printf 补 `\n` |
 | Node | `console.log` 与手写 write 混用导致交错 | 统一 `process.stdout.write(json + "\n")` |
 | python | `json.dumps` 默认 `ensure_ascii=True`（\uXXXX 转义） | 两者都合法（JSON 转义不破帧），习惯上 `ensure_ascii=False` |
 | 编译型语言（Go/C/Rust） | bufio writer 忘 flush；读行缓冲按固定长度 | 按行读（bufio.Scanner）+ 每行后 flush |
+| 任意语言 | 往 stdout 打日志/调试输出 | 日志写 stderr（aProxy 丢弃它，要留痕写自己的文件）；stdout 只放信封行 |
 | 任意语言 | base64 用了 URL-safe 变体 | 标准字母表 + `=` padding（protocol.md） |
 
 spawn 模式兼容：处理一行后不退出也没关系（aProxy 用毕即杀），上面的循环壳
@@ -210,10 +212,14 @@ response_transform = { command = "python", args = ["fmt.py"], mode = "persistent
   回放——协议转换场景两头都要配（且指向同一程序同一份逻辑）。
 - **轮换/计数/聚合必须 `mode = "persistent"`**：spawn 每请求新进程，进程内
   状态恒重置（轮换永远第一个 key）。
+- **key 轮换只在请求之间生效**：请求侧转换每个请求只执行一次，同一请求的重试
+  重放同一份转换产物，沿用同一个 key——不要指望重试时换 key。
 - **`forward_only = true` 与转换器互斥**（启动即报错）：forward_only 不缓冲
   请求体，转换器需要全量 body。
 - **`extra` 是唯一传参通道**（原样透传的字符串，格式由 format 自定）：
   传配置路径、传 key 表 JSON、传任何东西；两个 transform 的 extra 各自独立。
+  **aProxy 不展开 extra 里的 `~`**——传路径时写绝对路径，或像官方 aproxy-format
+  那样由 format 自己展开 `~/`；相对路径按守护进程的工作目录解析，不可靠。
 - 改配置后 `aproxy restart <端口或别名>` 生效；`aproxy config --show` 核对
   实际生效值。
 
@@ -271,6 +277,7 @@ printf '%s\n' '{"method":"POST","headers":{},"body":"{}","url":"https://up.examp
 | 错误 | 症状 | 解法 |
 |---|---|---|
 | 忘记 flush | 请求挂到 30s 超时 | 每行写后 flush（义务 #2） |
+| stdout 夹了日志 / jq 漏 `-c` | 502「format 输出违反信封协议」，worker 被剔除 | stdout 只写信封行，日志写 stderr（义务 #1b） |
 | 循环不处理 EOF | 实例停止后 worker 挂孤儿 | EOF 即 exit（义务 #3） |
 | 用 exit 1 表达业务失败 | worker 被剔除、无 error 文案 | error 行 + exit 0（义务 #4） |
 | 输出 `content-length` | 无效且困惑 | 删掉，aProxy 按实际字节回填 |

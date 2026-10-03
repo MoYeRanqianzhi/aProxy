@@ -16,17 +16,69 @@ aproxy status               # 每行 v<semver> = 各实例实际运行的守护�
 
 | 项 | 值 |
 |---|---|
-| 文档适用版本 | **0.1.0-alpha.17**（含 alpha.4 引入以来的全部行为；上一发行为 alpha.16） |
-| 代码版本坐标 | Cargo.toml `version` 字段；alpha 线于 2026-09 发布 |
+| 文档适用版本 | **0.1.0**（正式版；含 alpha.4 引入以来的全部行为，相对上一发行 alpha.17 的差异见下节） |
+| 代码版本坐标 | Cargo.toml `version` 字段；alpha 线于 2026-09 发布，0.1.0 发布前主干仍标 0.1.0-alpha.17 |
 | 大版本线 | 0.1.x（0.1 系列内小版本不另开目录，直接更新 latest/ 文档） |
+| 旧版文档留存 | **0.1.0 不整份留存**（alpha → stable 本是留存时机，维护者决定此次不做）：alpha 线各版本的行为差异集中记录在下面各 alpha 节，操作旧版本实例时查它们 |
+
+## 0.1.0 关键行为（相对 alpha.17）
+
+对持有 alpha.17 或更早二进制的实例操作时，注意这些差异（旧二进制读到新 toml
+字段一律静默忽略，新二进制读旧配置取默认，升级不会因配置报错）：
+
+- **入站来源校验（行为变化，新字段 `allowed_hosts`/`allowed_origins`）**：
+  config.toml 每实例 + settings.json 全局默认（toml 显式值 > settings > 内置
+  空；toml 的 `[]` 等同未配置）。Host 校验在监听回环地址或 `allowed_hosts`
+  非空时生效（放行 localhost / 127.0.0.1 / [::1]、监听地址自身主机名与列表
+  项，忽略端口与大小写）；Origin 校验**默认开启**——任何带 `Origin` 头的
+  请求默认被本地 403，除非精确匹配 `allowed_origins`；`"*"` 关闭对应校验。
+  被拒请求不转发、不注入 api_key、不进重试。**升级注意**：会发 Origin 的
+  浏览器/Electron 类客户端（Cherry Studio、Open WebUI 等）升级后 403，需配置
+  `allowed_origins`；alpha 实例对这类请求是放行的。CLI 类客户端（真实 Claude
+  Code 实测不发 Origin、Host 为 127.0.0.1:端口）不受影响。语义见
+  config-toml.md。
+- **凭据脱敏统一（日志格式变化）**：URL 的 userinfo（用户名或密码）整体打成
+  `***@`；查询串保留键名、值变 `***`（日志与 status「最近错误」里的
+  `?beta=true` 显示为 `?beta=***`——调试 `bounded_retry_paths` 时匹配仍按真实
+  查询串）；`config --show` 对转换器 args 的密钥旗标之后的值与 `extra` 打码。
+  依赖旧日志格式做文本匹配的脚本需要调整。
+- **非回环监听告警**：监听地址不是回环时，start、startup.log、`aproxy doctor`
+  都会告警（配置了 api_key 时措辞更重）；不阻断启动。
+- **本地磁盘 spool flush 失败不再静默**：响应缓冲落盘的收尾写失败，请求 502
+  （保活通道内为 SSE error 事件），不再把被截断的响应当成功回放。
+- **外部转换器进程池加固**：输出必须是恰好一行合法信封，否则该 worker 被剔除、
+  请求 502「format 输出违反信封协议」（防串包）；复用到已死的空闲 worker 时池内
+  自动换新 worker 重试一次；错误文案按成因分类。官方 `aproxy-format` 的
+  `client_format = "auto"` 改为只放行同协议，跨协议路由在请求侧报错并提示显式
+  声明——这一条在 aproxy-format 二进制里，**需 format 新版本发布后才对旧
+  format 二进制用户生效**。
+- **进程身份去名称化（注册表/IPC 新增 `process_start` 字段）**：实例与看护者
+  的身份一律按 pid + 进程创建时间核验，不再看二进制文件名——改名部署的实例
+  受看护，`stop --force` 不再比对镜像名。**旧版本记录没有该字段**（= 0），按
+  保守策略处理：挂死的旧版本实例不被看护者收养；对它们的 `--force` 退回 IPC
+  确认（终止前再 ping 一次、pid 一致才动手）。升级后重启实例即登记新字段。
+- **restart 先预检后停止**：停旧实例前先干跑新配置，预检失败不动旧实例并报因；
+  `restart all` 逐个预检、失败跳过、最后汇总并以非零退出；新实例启动即退出时
+  展示 startup.log 本次新增内容。alpha 版本是先停后验，配置笔误会让服务下线。
+- **stop --force 清理恢复记录**：强杀成功后清理该实例的恢复/注册记录，不会被
+  看门狗或 `aproxy restore` 复活（alpha 版本会复活）。
+- **看门狗重拉换端口**：重拉后实例落在新端口时清理旧端口的恢复记录；`restore`
+  报告实际端口并清理旧端口记录。
+- **一键安装脚本**（scripts/install.sh / install.ps1 / install.cmd）：选版只认
+  `v*` tag 并跳过 draft，默认最新稳定版（仓库尚无稳定版时回退最新预发布并
+  提示），`--pre`/`-Pre`/`APROXY_PRE=1` 取最新预发布；Linux glibc 过低或 musl
+  系统自动用 musl 产物，落位前 `--version` 自检；新装机提示先
+  `aproxy config --baseurl … --api-key …` 再 `aproxy`。
+- **平台**：Windows 与 Linux（x86_64/aarch64，gnu/musl）全功能；macOS 代理转发
+  可用，看门狗与 `aproxy install` 暂不支持。
 
 ## alpha.17 关键行为（相对 alpha.16）
 
 - **外部转换器（`request_transform`/`response_transform`，新配置字段）**：
   请求/响应可整流交给外部 format 程序改写（stdin/stdout 一行 JSON 信封，
   协议见 aproxy-format skill）。仅 toml 每实例配置（无 settings 全局默认层、
-  无 CLI 旗标）。**失败语义两侧不同**：请求侧转换失败 → 502 不重试（确定性
-  失败）；响应侧失败 → 透传上游原始响应。`mode = "persistent"` 启用进程池
+  无 CLI 旗标）。**失败语义两侧不同**：请求侧转换失败 → 502、请求未发往
+  上游且不重试；响应侧失败 → 透传上游原始响应。`mode = "persistent"` 启用进程池
   （`pool_max`/`idle_timeout_secs`/`timeout_secs`/`extra` 子字段见
   config-toml.md）。**与 `forward_only` 互斥**（同开启动报错）。旧二进制读
   到该字段静默忽略（行为不变，升级安全）。
@@ -177,7 +229,9 @@ aproxy status               # 每行 v<semver> = 各实例实际运行的守护�
 ## 版本留存策略（维护者用）
 
 - 小版本（0.1.x 内）：直接修改 `references/latest/` 下文档，不留存。
-- 大版本更替（如 0.1 → 0.2、alpha → stable）：把整个 `latest/` 复制为
+- 大版本更替（如 0.1 → 0.2）：把整个 `latest/` 复制为
   `references/<旧版本号>/` 留存，再重建 latest；旧版本目录内含自己的
   compatibility.md 描述其适用范围。
+- **0.1.0 例外**：alpha → stable 这次不留存 alpha 线的整份文档（维护者决定），
+  alpha 行为差异靠本文件的各 alpha 节与 0.1.0 节承载。
 - `SKILL.md` 的导航相对路径 `references/latest/` 不随版本变化。

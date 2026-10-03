@@ -65,9 +65,10 @@ skill 之外的转换库。**SSE 流式响应的跨协议转换官方二进制�
 聚合配置 `~/.aproxy/agg.toml`：
 
 ```toml
-client_format = "auto"        # auto = 逐请求检测（启发式按 body 形态判别，
-                              # 有歧义形态见 troubleshooting）；生产建议显式声明
-                              # 如 "openai_chat" / "anthropic_messages"
+client_format = "anthropic_messages"  # 客户端协议，跨协议转换必须显式声明
+                              # （"openai_chat" / "anthropic_messages" 等）。
+                              # "auto" = 逐请求检测，但只放行同协议：检测出的
+                              # 客户端协议与渠道协议不同会在请求侧报错
 
 [models]                      # 可选：客户端模型名 → 上游模型名
 "claude-sonnet" = "claude-sonnet-4-5"

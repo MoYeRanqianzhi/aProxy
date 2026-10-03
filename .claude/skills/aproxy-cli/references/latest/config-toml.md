@@ -35,8 +35,10 @@ listen_addr = "127.0.0.1:12345"
 # forward_only = false
 # bounded_retry_paths = [ '/v1/messages/count_tokens' ]
 # log_file = "D:/aproxy-logs/inst-a.log"
-# request_transform = { command = "aproxy-format", args = ["run"], mode = "persistent", extra = "agg.toml" }
-# response_transform = { command = "aproxy-format", args = ["run"], mode = "persistent" }
+# allowed_hosts = ["myproxy.local"]
+# allowed_origins = ["http://localhost:5173"]
+# request_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
+# response_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
 ```
 
 ## 字段总表
@@ -61,13 +63,18 @@ listen_addr = "127.0.0.1:12345"
 | `forward_only` | bool? | settings 层 | 仅转发模式：放弃重试/缓冲/心跳，请求体与响应流式直通 |
 | `bounded_retry_paths` | string[]? | settings 层（空） | 受限重试路径（正则）：命中者失败 3 次即透传，不再无限重试 |
 | `log_file` | string? | 无（随机命名） | 自定义守护日志文件路径；缺省按启动随机命名（见下） |
+| `allowed_hosts` | string[]? | settings 层（空） | 入站 Host 白名单（防 DNS 重绑定）：Host 校验生效时**追加**放行的主机名；含 `"*"` 关闭 Host 校验 |
+| `allowed_origins` | string[]? | settings 层（空） | 入站 Origin 白名单：默认拒绝一切携带 Origin 头的请求，列表项精确放行；含 `"*"` 关闭 Origin 校验 |
 | `request_transform` | table? | 无 | 外部转换器（请求侧）：交给 format 程序改写 body/headers/url/method；失败 502 不重试；与 forward_only 互斥 |
 | `response_transform` | table? | 无 | 外部转换器（响应侧）：改写上游响应后回放；失败透传原样 |
 
-**优先级**（`max_body_mb`/`disk_cache`/`forward_only`/`bounded_retry_paths`
-四个 Option 字段独有）：
-toml 显式值 > settings.json 全局默认 > 内置默认（128 / true / false / 空）。
-其余字段无 settings 层：toml 显式值 > 内置默认。
+**优先级**（`max_body_mb`/`disk_cache`/`forward_only`/`bounded_retry_paths`/
+`allowed_hosts`/`allowed_origins` 六个 Option 字段独有）：
+toml 显式值 > settings.json 全局默认 > 内置默认（128 / true / false / 空 /
+空 / 空）。其余字段无 settings 层：toml 显式值 > 内置默认。
+注意 `allowed_hosts`/`allowed_origins` 在 toml 里写 `[]` 也算「显式值」——
+它等同未配置（内置默认策略），因此可用来把 settings.json 的全局列表在单个
+实例上恢复成内置默认。
 
 ## 各字段语义
 
@@ -215,6 +222,10 @@ bounded_retry_paths = [
 ]
 ```
 
+用日志调试匹配时注意：日志里请求路径的查询串值会被打码显示（`?beta=true`
+显示为 `?beta=***`），这只影响展示——匹配始终针对收到的原始请求目标，模式
+仍按真实查询串书写。
+
 行为细节：网络错误不受此封顶（仍无限重试）；保活通道（SSE 骨架已发出的请求）
 达上限以 `event: error` 事件收场。未在 toml 显式配置时取 settings.json 的
 `bounded_retry_paths`（全局默认空）。改后 `aproxy restart <端口或别名>` 生效。
@@ -225,6 +236,40 @@ bounded_retry_paths = [
 > 等不到终态。把该路径加入 `bounded_retry_paths`（如上例）即可解决——失败
 > 3 次即透传真实响应，compact 立即恢复。其他 agent 软件/其他端点的同类问题
 > 同理，按实际路径配置。
+
+### allowed_hosts / allowed_origins
+
+**入站来源校验**（字符串数组，默认空 = 内置默认策略）。代理会把上游密钥
+注入每个转发请求，而本机浏览器里的任意网页都能向 `127.0.0.1` 发请求——这两
+项防的是网页借本机代理花你的额度。CLI 类客户端（Claude Code 等）既不发
+`Origin`，Host 也恒为 `127.0.0.1:端口`，不受影响。
+
+- **Host 校验**（`allowed_hosts`，防 DNS 重绑定）：监听回环地址（127.0.0.0/8、
+  `::1`、`localhost`），**或** `allowed_hosts` 非空时生效。生效时放行
+  `localhost` / `127.0.0.1` / `[::1]`、监听地址自身的主机部分（`0.0.0.0` /
+  `[::]` 这类通配地址除外）、以及列表条目——列表是**追加**而不是替换。比较时
+  忽略端口（Host 头与条目里写的端口都不参与）、不区分大小写。监听非回环地址
+  且列表为空时**不做** Host 校验（局域网/容器客户端的 Host 五花八门，默认
+  拦截会破坏既有用法；启动时另有非回环告警）。
+- **Origin 校验**（`allowed_origins`）：任何携带 `Origin` 头的请求默认拒绝
+  （只有浏览器与 Electron/WebView 类客户端会发），除非精确匹配列表项——
+  不区分大小写、忽略末尾 `/`，写法与浏览器发出的完全一致
+  （如 `"http://localhost:5173"`）。与监听地址无关，非回环监听同样生效。
+- 两项都支持 `"*"`：含 `"*"` 即关闭对应校验。**空列表 `[]` 等同未配置**
+  （不是「全部拒绝」或「全部放行」）。
+- 被拒请求在本地直接返回 **403**，响应文案点名对应配置项与修法，并写一条
+  warn 日志。它**从未转发上游、不注入 `api_key`、不进入重试循环、不计入
+  请求数**——只作用于从未转发过的请求，对放行的请求「无限重试」毫无改变。
+- 会发 `Origin` 的客户端（Cherry Studio、Open WebUI 等基于 Electron/浏览器的
+  应用）升级后需要配置 `allowed_origins`，否则全部 403；真实 Claude Code
+  实测不发 `Origin`、Host 为 `127.0.0.1:端口`，无需配置。
+- settings.json 同名字段是全局默认；toml 显式值优先。改后
+  `aproxy restart <端口或别名>` 生效。
+
+```toml
+allowed_hosts = ["myproxy.local"]            # 容器内用 myproxy.local 访问本机代理时
+allowed_origins = ["http://localhost:5173"]  # 本机前端页面/Electron 客户端的 Origin
+```
 
 ### log_file
 
@@ -257,33 +302,53 @@ bounded_retry_paths = [
 全部用户配置；写 format 与配置的完整指南见 **aproxy-format skill**。
 
 ```toml
-request_transform  = { command = "aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
-response_transform = { command = "aproxy-format", args = ["run"], mode = "persistent" }
+request_transform  = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
+response_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
 ```
+
+`command` 与 `extra` 请写 `~/` 前缀或绝对路径——守护进程的工作目录不可靠
+（取决于谁在哪个目录执行了 start / restore），相对路径会在换个启动方式后
+找不到。响应侧同样要配 `extra`（官方 aproxy-format 靠它读聚合配置，缺了响应
+侧必失败并透传）。
 
 子字段：
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `command` | string | （必填） | format 程序命令；不走 shell 按 argv 执行（无注入面）；写绝对路径最稳 |
+| `command` | string | （必填） | format 程序命令；不走 shell 按 argv 执行（无注入面）；`~/` 前缀由 aProxy 展开，写 `~/` 或绝对路径最稳 |
 | `args` | string[] | `[]` | 程序参数（如官方示例的 `["run"]`） |
 | `mode` | string | `"spawn"` | `spawn`=每请求一次性进程；`persistent`=持续进程池（轮换/计数状态必须用它） |
 | `pool_max` | u32 | 4 | persistent 池上限（并发 worker，超限排队）；0 启动报错 |
 | `idle_timeout_secs` | u64 | 300 | persistent worker 空闲回收秒；0=永不回收 |
 | `timeout_secs` | u64 | 30 | 单请求转换超时秒；0=不限；超时 worker 被剔除 |
-| `extra` | string? | 无 | 原样透传进信封（格式无要求，format 自解；官方示例传聚合配置路径） |
+| `extra` | string? | 无 | 原样透传进信封（格式无要求，format 自解；官方示例传聚合配置路径，其中的 `~/` 由 aproxy-format 自己展开——aProxy 不展开 extra） |
 
 语义要点：
 
 - **失败语义两侧不同**（用户拍板的设计，不要混淆）：请求侧转换失败
-  （进程崩溃/超时/error 行）→ **502 + 原因，不重试**（确定性失败）；
-  响应侧失败 → **透传上游原始响应** + warn（响应已在手，可用性优先）。
+  （进程崩溃/超时/format 报 error 行/输出违反信封协议）→ **502 + 原因，请求
+  不发往上游、不重试**；响应侧失败 → **透传上游原始响应** + warn（响应已在手，
+  可用性优先）。错误文案按成因分类（进程/管道层故障、format 自报错误、协议
+  违规各不相同），不要把它们都当成「配置错了」。
+- **池内唯一的重试**：persistent 池取到空闲期间已死的 worker（还没产出任何
+  输出就失败）时，池会**自动换新 worker 重试一次**——这是池状态问题，与请求
+  内容无关；看到 502「format 进程意外退出且无输出」说明新开的 worker 也死了
+  （format 本身起不来）。format 自报 error、协议违规、超时一律不重试。
+- **输出必须是恰好一行合法信封**：format 往 stdout 多打了一行（日志/横幅、
+  `jq` 漏了 `-c`）、输出非 UTF-8 或非法 JSON、`body` 与 `body_b64` 并存，都
+  按协议错误处理：该 worker 被剔除，请求 502（错误含「format 输出违反信封
+  协议」）。aProxy 会丢弃 format 的 stderr，排障日志请写进你自己的文件。
+- **key 轮换只在请求之间生效**：请求体只转换一次，同一请求的全部重试重放
+  同一份转换产物——沿用同一个 key，不会在重试时换 key。
 - **与 `forward_only` 互斥**：同开启动即报错（forward_only 不缓冲请求体，
   转换器需要全量 body）。
 - **仅 toml 每实例配置**：无 settings.json 全局默认层、无 CLI 旗标（转换是
   场景特定功能，不同实例连不同上游用不同 format——设计决策）。
 - 转换是**整流**的：请求体缓冲完成后转换一次（重试全程重放转换产物）；
-  响应在重试判定成功后、回放前转换。SSE 响应整流转文本交给 format。
+  响应在重试判定成功后、回放前转换。SSE 响应整流转文本交给 format。官方
+  aproxy-format 的**跨协议转换只支持非流式**：跨协议的 SSE 响应不支持，响应侧
+  报错后按上面的语义透传上游原始响应（客户端收到渠道协议格式的流）；同协议
+  SSE 原样直通。
 - 重试重放的是转换后的请求（转换不重复执行）；`bounded_retry_paths` 命中
   的透传路径不进响应转换（错误响应不经 format）。
 - 官方示例二进制 `aproxy-format`（协议转换 + 轮换 + 聚合）单独发 Release，

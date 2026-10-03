@@ -25,6 +25,9 @@
 ```
 客户端 → aProxy(127.0.0.1:<端口>) → 上游 base_url
 
+入站来源校验（两种模式都先走）：Host 不在白名单、或带了不在 allowed_origins
+         里的 Origin → 本地 403，不转发、不重试（见 config-toml.md）
+
 默认模式（forward_only = false）：
          1. 读入并缓冲完整请求体（超 max_body_mb 即 413，不转发）
          2. 透传 method/路径/查询/头（extra/override 头在此注入）
@@ -170,8 +173,9 @@ aProxy 侧行为语义）。
 - **可改写面**：请求侧 body/headers/url/method 全部可变（url 改写 = 协议
   转换的路径/域名迁移）；响应侧 body/headers 可变。
 - **失败语义两侧不同**：
-  - 请求侧转换失败（进程崩溃/超时/输出 error 行）→ **502 + 原因，不发上游、
-    不重试**（转换失败是确定性的），记入 status 的「最近错误」。
+  - 请求侧转换失败（进程崩溃/超时/输出 error 行/输出违反信封协议）→ **502 +
+    原因，请求不发上游、不重试**，记入 status 的「最近错误」。错误文案按成因
+    分类（进程/管道层故障、format 自报错误、协议违规），按文案区分排障方向。
   - 响应侧转换失败 → **透传上游原始响应** + warn 日志（响应已在手，可用性
     优先）；保活通道同样透传（不发 SSE error 事件）。
 - **persistent 进程池**：`mode = "persistent"` 时 format 进程以 while 循环
@@ -179,6 +183,20 @@ aProxy 侧行为语义）。
   空闲 `idle_timeout_secs` 后回收（0=永不）；单请求超 `timeout_secs` 未回行
   则 kill 该 worker。**worker 回收主机制 = stdin EOF**：实例退出时 aProxy
   关闭管道，format 按协议义务自行退出。
+- **池内自动重试一次**：persistent 池取到空闲期间已死的 worker（尚未产出
+  任何输出就失败）时，自动换新 worker 重做一次——池状态问题，与请求内容
+  无关。新开的 worker 也失败则按上面的请求侧/响应侧语义处理（502「format 进程
+  意外退出且无输出」= 新 worker 同样起不来）。format 自报 error、协议违规、
+  超时不重试。
+- **一请求恰好一行输出**：信封协议没有请求序号，worker 的第 N 行输出只能靠
+  「一请求一行、按序」对应第 N 个请求。format 往 stdout 多打一行（日志、横幅、
+  `jq` 漏 `-c`）、输出非法 JSON 或空闲期间 stdout 冒出输出，该 worker 立即被
+  剔除（否则下一个请求会读到上一个请求的输出，A 会话的 body/key 发往 B），
+  当次请求 502「format 输出违反信封协议」。format 的 stderr 被丢弃。
+- **key 轮换只在请求之间生效**：请求只转换一次，同一请求的所有重试重放同一
+  份转换产物——沿用同一个 key，不会重试时换 key。
+- **跨协议转换仅非流式**（官方 aproxy-format）：跨协议的 SSE 响应不支持，
+  响应侧转换报错后透传上游原始响应；同协议 SSE 原样直通。
 - **headers 语义**：信封头表键小写、整表替换；hop-by-hop 与 content-length
   不进信封（aProxy 按实际字节回填）；多值头仅保留首值（warn 留痕）；format
   输出的非法头名/头值丢弃 + warn；非法 method 同样 warn + 沿用原方法。
@@ -226,8 +244,15 @@ IPC 通道故障（启动失败）只影响管理命令，代理转发继续（�
   log_path」之外的 `*.log`（startup.log 除外，非 .log 文件不动）。推论：
   实例优雅停止后其日志在下次清理时删除；崩溃实例的日志由 `.restore` 引用
   保留到恢复成功；旧版按端口命名的日志在升级后视为孤儿清理。
-- 所有日志对凭据打码（api_key/头值前 6 字符 + `***`，代理密码、base_url 内嵌
-  密码隐去）——日志可安全粘贴分享。
+- 所有日志对凭据打码，日志可安全粘贴分享：api_key/头值保留前 6 字符 + `***`；
+  URL（base_url、代理、上游目标、请求的 `路径?查询串`、reqwest 错误里的 URL）
+  的 userinfo（用户名或密码任一存在）整体打成 `***@`，**查询串保留键名、值变
+  `***`**（`?beta=true` 显示为 `?beta=***`，status 的「最近错误」同理），片段
+  `#…` 整体遮掉。用日志调试 `bounded_retry_paths` 时注意：日志里的查询串值
+  是打码的，匹配仍按真实查询串。入站 403 的 warn 日志同样走此出口。
+- 启动时监听地址不是回环地址会告警（start 的 stderr、守护日志与 startup.log、
+  `aproxy doctor` 都有；配置了 api_key 时措辞更重——任何能连到该端口的主机都能
+  用你的 key）。
 - 「错误响应预览」行附带 `content-type` / `content-encoding`，并按
   `content-encoding` **解压后**展示正文（gzip / deflate / br / zstd）——上游压缩
   的错误页不再只显示一串 hex。**解压只用于日志与错误判定，转发给客户端的字节
@@ -237,7 +262,9 @@ IPC 通道故障（启动失败）只影响管理命令，代理转发继续（�
 
 - 实例 bind 成功即写恢复记录 `run/<端口>.restore`（启动参数快照），优雅退出删除。
 - `aproxy restore` 按记录逐个拉起：幂等（已在运行跳过）、配置文件已删除的记录
-  清理、就绪判定与 start 相同（IPC ping 轮询 8 秒）。
+  清理、就绪判定与 start 相同（按新 pid 定位实例，至多 8 秒）。实例落在**别的
+  端口**时（记录里的端口对应的 toml 已改了端口、或 listen 端口为 0）报告
+  实际端口并清理旧端口的恢复记录。
 - 空清单静默成功退出 0——把 `aproxy restore` 配为任务计划程序登录项即实现
   崩溃/断电/重启后自动恢复。
 
@@ -245,9 +272,15 @@ IPC 通道故障（启动失败）只影响管理命令，代理转发继续（�
 
 ## 看门狗（watchdog）
 
-默认开启的全局看护进程（`aproxy watchdog`，同二进制分离进程，~2-3MB 内存与
-实例数无关），把「进程级死亡 = 永久断流直到人工发现」降级为「约 1 秒自愈空窗」。
+默认开启的全局看护进程（与 aproxy 同一二进制、以内部标记分离启动，没有公开
+子命令；~2-3MB 内存与实例数无关），把「进程级死亡 = 永久断流直到人工发现」降级为「约 1 秒自愈空窗」。
 配置见 settings-json.md 的 watchdog 五字段。
+
+**身份判定**：实例与看护者的「是不是原来那个进程」一律按 **pid + 进程创建时间**
+核验，与二进制文件名无关——改名部署（如官方资产 `aproxy-<target>`）的实例照常
+受看护，`stop --force` 也不再看镜像名。实例在注册表登记创建时间（`process_start`
+字段）；旧版本实例没有该字段，按保守策略处理：挂死的旧版本实例不收养、对它们的
+`--force` 需 IPC 确认（见 commands.md）。
 
 **检测与恢复**：
 
@@ -255,7 +288,8 @@ IPC 通道故障（启动失败）只影响管理命令，代理转发继续（�
   等待死亡信号（零轮询）。死亡后查 `.restore`：在 = 崩溃，立即重拉并等 IPC
   就绪；重拉失败进退避队列，按指数退避（1s→2s→4s…封顶 300s）由看护者主循环
   时间驱动重试（等待不阻塞心跳续写——否则长退避会让看护者被误判假死夺权）；
-  不在 = 优雅退出，摘除看护。
+  不在 = 优雅退出，摘除看护。重拉后若实例落在**不同端口**（toml 改了端口），
+  看护者清理旧端口的恢复/注册记录，并按新端口继续看护。
 - **挂死**（进程活着但 runtime 死锁）：实例每 10s 向共享内存节写心跳
   （`aproxy-heart-<端口>`）；看护者每扫描周期（默认 30s）检查，过期 + IPC ping
   无响应才判定挂死，终止进程后走同一重拉路径。
@@ -266,7 +300,7 @@ IPC 通道故障（启动失败）只影响管理命令，代理转发继续（�
   claim 原子接管裁决，多守护并发发现缺席时由「存活实例 PID 最小者」发起。
   PID 复用冒名被进程创建时间比对拒绝。
 - **互保**：看护者崩溃/假死时守护不受伤（完全解耦）；每个守护每 5 分钟自检，
-  发现缺席即按选举规范补种。
+  发现缺席即按选举规范补种；`aproxy start` 启动新实例时若看护者缺席也会补拉。
 - **闲置自灭**：全部实例清零后看护者等待 `watchdog_idle_exit_secs`（默认
   300s）自动退出并清理 claim，系统回到零常驻。
 
@@ -274,6 +308,7 @@ IPC 通道故障（启动失败）只影响管理命令，代理转发继续（�
 客户端需重发请求——看门狗救的是「之后没人服务的永久断流」，不是在途请求。
 对自带重试的客户端（Claude Code 等）表现为「卡一下」而非「会话死了」。
 升级二进制后请一并重启看护者（旧看护者会用旧 exe 重拉实例）。
+平台：看门狗在 Windows 与 Linux 上可用，macOS 暂不支持。
 
 ## 二进制更换阶段（install 运行期）
 
@@ -291,8 +326,8 @@ IPC 通道故障（启动失败）只影响管理命令，代理转发继续（�
 
 ## skill 文档更新（install 支线）
 
-install 时随二进制**并行**更新 `~/.aproxy/skills/aproxy-cli/`（与二进制同一
-版本 tag）。非强制：下载失败重试后放弃，**安装照常成功**；子状态在
+install 时随二进制**并行**更新 `~/.aproxy/skills/` 下的 skill 文档（aproxy-cli 与
+aproxy-format，同一份总包，与二进制同一版本 tag）。非强制：下载失败重试后放弃，**安装照常成功**；子状态在
 install.state 的 `skill` 字段可查。`--skills-only` 单独更新。安装到 agent 侧
 （如 `~/.claude/skills/`）由用户/agent 自行链接——install 不越界触碰各 agent
 目录。`--continue` 续作时 failed 不自动重试（避免每次续作拖一遍下载）。
@@ -319,14 +354,15 @@ install.state 的 `skill` 字段可查。`--skills-only` 单独更新。安装�
 | 客户端非流式请求超时 | 非流式无心跳通道：调大客户端 HTTP 超时或调小 max_retry_backoff_secs |
 | Claude Code /compact 无限卡住/超时（走非官方 API） | 上游（聚合/镜像服务常见）未实现 compact 依赖的 `POST /v1/messages/count_tokens`，确定性 404 被无限重试、客户端永远等不到终态。解决：该实例 toml 的 `bounded_retry_paths` 加 `'/v1/messages/count_tokens\?.*'`（或客户端实际使用的确切路径），`aproxy restart <端口或别名>` 生效——失败 3 次即透传真实响应。其他 agent 软件/其他端点的同类问题同理 |
 | 日志刷「受限重试路径达到尝试上限，透传最后一次上游响应」 | 该请求命中 `bounded_retry_paths`：失败 3 次即透传，属预期行为；不想受限就从配置移除对应模式并 restart |
+| 客户端收到 403，文案提到 `allowed_origins` / `allowed_hosts` | 入站来源校验拒绝了请求（未转发上游）：浏览器/Electron 类客户端会发 `Origin`，默认全部拒绝。把文案里的 Origin（或主机名）原样加入 toml 的 `allowed_origins`（或 `allowed_hosts`），`aproxy restart <端口或别名>`；信任场景可写 `["*"]` 关闭该项校验。守护日志有「入站请求被拒绝」warn |
 | 413 Request Entity Too Large | 请求体超 `max_body_mb`：调大 toml/settings 的值或设 0 |
 | 中文乱码 | 控制台代码页问题；进程入口已自动切 65001，若仍乱查终端自身设置 |
 | 错误响应预览是一串 hex | 该响应体确实是二进制，或其 `content-encoding` 本地无法解码（未知编码/内容损坏/解压后超 8 MiB）——看同一行的 `content-encoding` 字段判断是什么编码 |
 | spool 目录残留 .spooltmp | 异常退出的残留；重启该端口实例即清理 |
 | 实例崩溃后被自动拉起但配置是旧的 | 看门狗按 .restore 记录重拉——改配置后执行 `aproxy restart <端口>`，重启成功即以当前参数重写记录 |
-| status 显示「看护者缺席」相关告警 | 看护者被杀/假死；守护 5 分钟内自动补种，或手动跑一次 `aproxy start <别名>` |
+| 怀疑看护者没在运行 | `status` 目前不展示看护者状态。看 `~/.aproxy/run/watchdog.claim` 是否存在、其中 pid 是否在世；守护日志会记「看护者缺席，已由守护补种」。看护者缺席时守护 5 分钟内自动补种，启动新实例（`aproxy start`）也会补拉 |
 | 磁盘缓存想关 | toml 或 settings 写 `disk_cache = false`，重启实例 |
-| 请求 502 且错误含「format」 | 外部转换器失败：按文案区分（「启动失败」=command 路径、「报告转换失败」=format 业务判定、「超时」=调 timeout_secs）——详见 aproxy-format skill 排障节 |
+| 请求 502 且错误含「format」 | 外部转换器失败：按文案区分（「启动失败」=command 路径、「报告转换失败」=format 业务判定、「超时」=调 timeout_secs、「违反信封协议」=format 往 stdout 多打了行/输出非法 JSON）——详见 aproxy-format skill 排障节 |
 | 配置了转换器但响应没转换 | response_transform 是**独立配置**（忘配 = 响应原样）；或响应转换失败透传了原样（查 `aproxy logs` 的「响应转换失败」warn）；bounded_retry 透传路径本就不进转换器 |
 | 启动报「forward_only 与外部转换器互斥」 | 两配置同开是矛盾（forward_only 不缓冲、转换器要全量 body）——留一个 |
 | 想关掉重试（要真流式直通） | 该实例 toml 或 settings 写 `forward_only = true`，`aproxy restart <端口或别名>` 生效——**代价是放弃重试/缓冲/心跳保障**，仅上游可信时用 |

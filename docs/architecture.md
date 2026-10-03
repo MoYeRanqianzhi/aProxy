@@ -30,14 +30,14 @@ agent 软件 ──HTTP──▶ [代理端口 12345] ──重试循环──�
 | `src/cli.rs` | clap 命令树定义（`Cli`/`Commands`/`AliasCmd`/`ConfigArgs`），只承载定义不含逻辑 |
 | `src/commands/` | 十一个子命令各自一文件（start/status/stop/restart/restore/alias/doctor/find/logs/config/install），共享 target 解析在 `mod.rs` |
 | `src/server.rs` | 服务承载：`serve_forever` 主循环、停止信号、日志初始化、配置错误落盘 startup.log |
-| `src/proxy.rs` | 转发核心：hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、keepalive、断开保护、仅转发模式 |
+| `src/proxy.rs` | 转发核心：入站来源校验（Host/Origin）、hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、keepalive、断开保护、仅转发模式 |
 | `src/transform.rs` | 外部转换器编排：stdin/stdout 一行 JSON 信封交给外部 format 程序改写（spawn 与 persistent 统一进程池、空闲 reaper、超时/崩溃 worker 剔除）；信封契约在独立 crate `aproxy-envelope` |
 | `src/decode.rs` | 检查用解码：按 `content-encoding`（gzip/deflate/br/zstd，多层逆序）解出一份**仅供检查/预览**的副本，转发字节不受影响 |
 | `src/retry.rs` | 重试判定：状态码、错误 JSON（含流式 NDJSON/SSE 形态） |
 | `src/config.rs` | 代理配置加载/保存/校验（`~/.aproxy/config.toml`，可多份平行并存） |
 | `src/settings.rs` | 内部配置（`~/.aproxy/settings.json`，唯一）：别名表、全局默认等程序管理状态 |
 | `src/daemon.rs` | 守护编排：IPC（ping/shutdown/观测）、实例注册表、恢复记录、孤儿清理 |
-| `src/watchdog.rs` | 看门狗：claim 选举、进程探活/句柄等待、共享内存心跳、重拉退避状态机 |
+| `src/watchdog.rs` | 看门狗：claim 选举、进程身份（pid + 创建时间）核验、进程探活/句柄等待、共享内存心跳、重拉退避状态机 |
 | `src/util.rs` | bin 侧共用小工具：时间戳、时长人性化、凭据打码、key=value 解析 |
 
 ## workspace 三成员
@@ -69,6 +69,26 @@ CLI 定义（cli.rs）与子命令处理（commands/）分离；启动父进程�
 （502 / SSE error 事件），绝不退化成内存堆积。`disk_cache = false`（settings
 全局默认或 toml 覆盖）关闭时回到纯内存行为。`forward_only` 模式下请求体与响应
 均**不缓冲**，本节整节不适用——见「仅转发模式（forward_only）」。
+
+## 入站来源校验（Host / Origin）
+
+代理会把上游密钥注入每个转发请求，而本机浏览器里的任意网页都能向
+`127.0.0.1` 发请求，所以 handler 的**第一步**先做来源校验（`proxy.rs`
+的 `InboundPolicy`，启动时按配置归一一次，热路径只做小集合比较）：
+
+- **Host 校验**（防 DNS 重绑定）：监听回环地址、或 `allowed_hosts` 非空时生效。
+  放行 `localhost` / `127.0.0.1` / `[::1]`、监听地址自身的主机部分（`0.0.0.0` /
+  `[::]` 这类通配地址除外）与 `allowed_hosts` 条目（追加而非替换）；比较时忽略
+  端口、不区分大小写。监听非回环地址且列表为空时不校验——局域网/容器客户端
+  的 Host 各式各样，默认拦截会破坏既有用法（另有非回环监听告警）。
+- **Origin 校验**（防网页跨站调用）：任何带 `Origin` 头的请求默认拒绝，除非
+  精确匹配 `allowed_origins`（不区分大小写、忽略末尾 `/`）；与监听地址无关。
+  CLI 类客户端不发 `Origin`，对它们零影响。
+- 两个列表都支持 `"*"` 关闭对应校验；`[]` 等同未配置。分层同
+  `bounded_retry_paths`（toml 显式值 > settings.json > 内置空）。
+- 被拒请求本地回 403，文案点名配置项与修法：**绝不转发、绝不注入 api_key、
+  绝不进入重试循环、不计入请求数**。这是唯一不经上游就终结请求的入口，而它
+  只作用于从未转发过的请求——「无限重试」对放行的请求毫无改变。
 
 ## 重试与流式回放
 
@@ -140,8 +160,8 @@ magic number，连「这是压缩体」都认不出；2026-09-14 的 Cloudflare 
 
 ## 配置分层
 
-三级优先级（仅 `max_body_mb`/`disk_cache`/`forward_only`/`bounded_retry_paths`
-四个字段有 settings 层；其余字段 toml > 内置默认）：
+三级优先级（仅 `max_body_mb`/`disk_cache`/`forward_only`/`bounded_retry_paths`/
+`allowed_hosts`/`allowed_origins` 六个字段有 settings 层；其余字段 toml > 内置默认）：
 
 ```
 CLI 覆盖参数（--baseurl 等，仅本次） > config.toml 显式值 > settings.json 全局默认 > 内置默认
@@ -149,7 +169,7 @@ CLI 覆盖参数（--baseurl 等，仅本次） > config.toml 显式值 > settin
 
 `config.toml` 人类可读可写、可多份（多开各自指定）；`settings.json` 程序管理的
 内部配置，**全局唯一**（JSON 原子写，损坏回退默认），存别名表、default_config、
-config_dirs、日志轮转阈值、空闲阈值与上述四个字段的全局默认。
+config_dirs、日志轮转阈值、空闲阈值与上述六个字段的全局默认。
 
 ### 配置别名（settings.json）
 
@@ -184,10 +204,16 @@ config_dirs、日志轮转阈值、空闲阈值与上述四个字段的全局默
 
 ## 看门狗（watchdog）
 
-全局单看护进程（`aproxy watchdog`，同二进制 `--daemon-watchdog` 隐藏标记分离
+全局单看护进程（没有公开子命令，同二进制以 `--daemon-watchdog` 隐藏标记分离
 启动），把「进程级死亡/挂死 → 永久断流直到人工发现」降级为「秒级检出 → 退避
 重拉」。实测 +2.4% 体积、+2.9MB 常驻、热路径零损耗（[benchmark-watchdog.md](benchmark-watchdog.md)）。
 
+- **进程身份**：一律按「pid + 进程创建时间」核验，与二进制文件名无关（改名
+  部署的实例同样受看护）。实例在注册表登记 `process_start`（Windows FILETIME /
+  Linux `/proc` starttime；0 = 未登记）；收养、处决、接管假死前任、install 换血
+  停旧看护者、`stop --force` 都走这一判据。旧版本记录（无创建时间）退回
+  「IPC ping 回报的 pid 一致」作归属证明——挂死的旧实例不收养，`--force` 终止前
+  再 ping 一次，保守优先（杀错进程不可逆）。
 - **死亡检测**：收养时 `OpenProcess(SYNCHRONIZE|TERMINATE)` 取进程句柄，
   `spawn_blocking` 内核阻塞等待——死亡信号即时、零轮询线程。
 - **挂死检测**：实例侧独立 ticker 每 10s 向命名共享内存节
@@ -197,11 +223,14 @@ config_dirs、日志轮转阈值、空闲阈值与上述四个字段的全局默
 - **重拉与退避**：`.restore` 残留 = 异常死亡信号；优雅退出（记录已删）摘除
   看护。首次崩溃立即重拉；重拉失败进退避队列，按指数退避 1/2/4/8…封顶 300s
   由主循环时间驱动重试（等待不阻塞 tick——否则长退避会让 claim 心跳停摆、
-  现任被竞争者按「假死」夺权），就绪判定按新 pid 定位；连续失败达
-  `watchdog_max_restarts` 放弃并写 startup.log（`.restore` 保留人工兜底）。
+  现任被竞争者按「假死」夺权），就绪判定按新 pid 定位；重拉后实例落在不同
+  端口（toml 改了端口）时退役旧端口的 `.restore`/`.pid` 并按实际端口续看护；
+  连续失败达 `watchdog_max_restarts` 放弃并写 startup.log（`.restore` 保留
+  人工兜底）。
 - **选举规范**（多守护并发拉起看护者的唯一性保障）：claim 文件
   `run/watchdog.claim`（PID + 进程创建时间 + 心跳）为在任真相源——
-  排序定发起者（存活实例 PID 最小者才有权 spawn）+ `create_new` 原子接管
+  排序定发起者（核验在世的实例中 PID 最小者才有权 spawn；CLI `start` 不在在世
+  集合内，视为有权，多发起由 claim 原子接管兜底）+ `create_new` 原子接管
   定在任者；进程创建时间比对拒绝 PID 复用冒名；假死前任（心跳过期）经验证
   后终止接管。
 - **互保**：守护与看护者完全解耦（看护者死亡实例不受影响）；守护每 5 分钟
@@ -222,6 +251,20 @@ config_dirs、日志轮转阈值、空闲阈值与上述四个字段的全局默
 已在运行跳过（幂等）；空清单静默 exit 0（开机自启友好）。
 
 `.restore` 绝不在 status 清理时删除——崩溃实例恰恰靠它存活到 restore 执行。
+`restore` 按新 pid 定位实例并报告实际端口；实例落在不同于记录的端口时清理旧
+端口记录。`stop --force` 来不及做优雅退出的自清，由 CLI 在强杀成功后按守护自清
+的同一顺序删除 `.restore`/`.pid`/socket/心跳，否则残留的 `.restore` 会被当作
+崩溃信号复活实例；`restart --force` 的强杀路径则保留它作为自愈兜底。
+
+### restart：先预检、后停止
+
+`restart` 的主要用途是「改完 config.toml 让它生效」，而配置笔误恰恰最常出现
+在这一步。先停旧实例再由新守护读配置，配置有错时新守护秒死，旧实例的
+`.restore` 又已随优雅退出删除——健康的服务就此下线。因此 stop 之前先按新守护将
+走的同一条解析路径（`start::resolve_runtime_config`：严格 TOML 加载、CLI 覆盖、
+settings 注入、validate）干跑一遍，换监听地址时再探测新地址可否绑定；预检不通过
+就不碰旧实例。`restart all` 逐实例预检，失败的跳过、其余照常重启，最后汇总并
+以非零退出；新实例启动即退出时展示 startup.log 本次新增内容与恢复命令。
 
 ## 日志治理
 
@@ -241,7 +284,12 @@ config_dirs、日志轮转阈值、空闲阈值与上述四个字段的全局默
   log_path」之外的 `*.log`（startup.log 除外，非 .log 文件不动）——不再按
   文件名端口归属判定。推论：优雅停止实例的日志在下次清理时删除；崩溃实例的
   日志由 `.restore` 引用保留到恢复成功；旧版按端口命名的日志升级后视为孤儿
-- 全部输出对凭据打码（api_key/头值/代理密码/base_url 内嵌密码）——可安全粘贴分享
+- 全部输出对凭据打码——可安全粘贴分享。URL 展示的**唯一出口**是
+  `config::mask_base_url`（名称沿用最早只用于 base_url 的叫法，现在 base_url、
+  代理 URL、上游目标 URL、请求的 `路径?查询串`、reqwest 错误里的 URL 一律走它）：
+  userinfo（用户名或密码任一存在）整体 `***@`，查询串保留键名、值变 `***`，片段
+  整体遮掉，畸形 URL 保守多遮；api_key 与头值走 `util::mask_secret`（前 6 字符 +
+  `***`）。`config --show` 另对转换器 `args` 的密钥旗标之后的值与 `extra` 打码
 
 ## 安装与升级（install）
 
@@ -286,14 +334,25 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
 
 ## 平台
 
-Windows 优先（开发与主测试平台）；unix 分支（UDS IPC、/dev/shm 宣告与心跳、
-单步 rename 交换）已在 Ubuntu 与 WSL Debian 实测（全量测试 + e2e 实测全绿），
-macOS 为编译面覆盖（CI check）。欢迎在 Linux/macOS 上反馈。
+| 平台 | 状态 |
+|---|---|
+| Windows（x64 / x86 / arm64） | 全功能（开发与主测试平台） |
+| Linux（x86_64 / aarch64，glibc 与 musl） | 全功能 |
+| macOS（Apple Silicon / Intel） | 代理转发可用；看门狗与 `aproxy install` 暂不支持 |
+
+unix 分支（UDS IPC、`/dev/shm` 宣告与心跳、`/proc` 进程查询、单步 rename
+交换）按 **Linux** 实现：`#[cfg(unix)]` 路径依赖 `/dev/shm` 与 `/proc`，这两族
+原语在 macOS 上不存在，所以 macOS 上共享内存心跳、进程创建时间读取与 install
+的宣告节无法工作。这部分需要在 macOS 真机上补齐实现与验证（后续贡献者），
+补齐之前 README 的平台矩阵如实标注为暂不支持。macOS 的代理转发路径不依赖它们，
+可用。
 
 ## 版本路线
 
-- **0.1.x**：当前开发线，alpha → beta；无 UI，纯 CLI + 守护。
+- **0.1.x**：当前开发线。0.1.0 是首个稳定版（此前为 `0.1.0-alpha.*` 预发布），
+  之后 0.1 系列内的小版本直接发布；无 UI，纯 CLI + 守护。
 - **0.2.0**：引入 UI（Web 面板形态待定）——前提是基础功能齐备、稳定性经 beta
   期验证；属远期。
-- 正式发布（脱离预发布后缀）起，GitHub CI 构建指令集多版本（baseline +
-  x86-64-v3），见 `.agents/memory/2026-09-07-release-engineering.md`。
+- 发布产物：x86_64 的 Windows 与 Linux gnu 同时提供 baseline 与 x86-64-v3
+  （AVX2）两种指令集变体，`aproxy install` 运行时检测后自动选择（失败回退
+  baseline），一键安装脚本保守地装 baseline；musl 与其他架构只有 baseline。

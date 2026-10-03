@@ -30,11 +30,28 @@ matched paths; see Configuration.)
 - **Total passthrough** — Transparency as a principle. Paths, queries, and
   headers forwarded untouched; control traffic rides a separate named pipe,
   so the proxy port does exactly one thing.
+- **External transformers (optional)** — Requests and responses can be
+  handed whole to an external format program that rewrites them (one JSON
+  envelope line in, one out; any program that reads stdin and writes stdout
+  works): OpenAI ↔ Anthropic protocol conversion, multi-key rotation,
+  multi-model / multi-channel aggregation. The core only adds orchestration;
+  all conversion logic lives outside it, and the official example binary
+  `aproxy-format` works out of the box (released separately). When the
+  persistent pool reuses an idle worker that has died, it transparently
+  retries once with a fresh worker. **Limitation**: `aproxy-format` converts
+  across protocols (e.g. Anthropic ↔ OpenAI) for **non-streaming** requests
+  only; cross-protocol SSE responses are not supported — the response-side
+  conversion fails and the original upstream response is passed through, so
+  the client receives a stream in the channel's protocol. Same-protocol SSE
+  passes through untouched, and key rotation / same-protocol aggregation are
+  unaffected.
 - **Background daemon** — `aproxy` starts detached (survives terminal close);
   `status` / `stop` / `logs` / `restore` for full instance management.
 - **Watchdog** — Nothing slips through. A global supervisor process
   automatically revives crashed or hung instances (on by default; measured at
-  +2.4% binary size, +2.9MB resident, zero hot-path overhead).
+  +2.4% binary size, +2.9MB resident, zero hot-path overhead). Process identity
+  is verified by PID + creation time, independent of the binary's file name.
+  Not supported on macOS yet; see Platform support.
 - **Multi-instance** — Every config.toml is its own instance, each on its own
   port, coexisting without interference.
 - **Self-healing** — After a crash, power loss, or reboot, `aproxy restore`
@@ -51,21 +68,54 @@ Read https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/docs/INSTALL_A
 ```
 
 **Manual install** (first install pulls the binary + skill docs, verifies
-SHA256, places everything under `~/.aproxy/`):
-
-```sh
-# Linux / macOS / Git Bash
-curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.sh | sh
-```
+SHA256, places everything under `~/.aproxy/`). By default it installs the
+latest **stable** release; while the repository has no stable release yet
+(before 0.1.0) it falls back to the newest pre-release and says so. To get the
+newest pre-release, add `--pre` (`-Pre` for PowerShell, or set
+`APROXY_PRE=1`):
 
 ```powershell
 # Windows (PowerShell)
 irm https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.ps1 | iex
 ```
 
-Upgrades: `aproxy install` rolling-restarts running instances after a binary
-swap (shipping in a later release); on current alphas do it manually —
-`aproxy stop all`, replace the binary, `aproxy restore`.
+```sh
+# Linux / macOS / Git Bash (pre-release: curl ... | sh -s -- --pre)
+curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.sh | sh
+```
+
+```bat
+rem Windows (cmd fallback; downloads are delegated to the built-in Windows PowerShell, which must be available)
+curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.cmd -o install.cmd && install.cmd
+```
+
+About the scripts:
+- They never overwrite an existing install; upgrades go through `aproxy
+  install`. The sh script needs one of `sha256sum`, `shasum` or `openssl` for
+  the SHA256 check.
+- Linux: systems with an old glibc, or musl systems, automatically get the
+  statically linked musl build; the binary is self-tested with `--version`
+  before being placed, and if the gnu build cannot run on the machine the
+  script switches to musl.
+- `irm | iex` cannot pass arguments, so the PowerShell script reads
+  environment variables instead: `APROXY_PRE`, `APROXY_NO_SKILLS`,
+  `APROXY_DL_PROXY` (download proxy; unrelated to the upstream request proxy).
+- Windows PowerShell 5.1 fails to parse `install.ps1` when it is run locally
+  with `-File` (the file is UTF-8 without BOM); use the `irm | iex` line
+  above, or `pwsh -File`.
+
+Other channels (afterwards `aproxy install --adopt` moves the install to the
+standard location):
+
+```sh
+npm install -g @meowo/aproxy     # picks the right binary for your platform
+cargo install aproxy             # builds from source; needs rustc 1.88+
+```
+
+Upgrades: `aproxy install` replaces the binary and rolling-restarts running
+instances one by one without client-visible downtime (`--from <path>` installs
+a local binary, `--adopt` takes over an existing install). Manual fallback:
+`aproxy stop all` → replace the binary → `aproxy restore`.
 
 From source:
 
@@ -75,7 +125,18 @@ cd aProxy
 cargo build --release
 ```
 
+## Platform support
+
+| Platform | Status |
+|---|---|
+| Windows (x64 / x86 / arm64) | Full support |
+| Linux (x86_64 / aarch64, glibc and musl) | Full support |
+| macOS (Apple Silicon / Intel) | Proxying works; the watchdog and `aproxy install` are not supported yet (need to be completed on real hardware; contributions welcome) |
+
 ## Quick start
+
+A fresh machine has no upstream configured, so running `aproxy` right away
+fails because `base_url` is empty — configure first, then start:
 
 ```sh
 # 1. Configure the upstream (writes ~/.aproxy/config.toml)
@@ -96,8 +157,8 @@ aproxy
 | `aproxy start <alias\|path>` | Start by alias or config file path |
 | `aproxy --foreground` | Run in the foreground (logs to console, Ctrl+C to stop) |
 | `aproxy status` | List running instances (port/pid/version/upstream/config) |
-| `aproxy stop [PORT\|all\|alias]` | Stop instances; multi-instance requires a port, `all`, or an alias |
-| `aproxy restart [PORT\|all\|alias]` | Restart running instances (restart-only, never starts); `--force` kills instantly |
+| `aproxy stop [PORT\|all\|alias]` | Stop instances; multi-instance requires a port, `all`, or an alias; `--force` kills instantly (the watchdog will not revive it) |
+| `aproxy restart [PORT\|all\|alias]` | Restart running instances (restart-only, never starts); the new config is pre-checked before the old instance is stopped, and a failed check leaves it running; `--force` kills instantly |
 | `aproxy logs [PORT\|ALIAS]` | Tail an instance's live logs; `all` not supported |
 | `aproxy restore` | Revive instances that were running before a crash/reboot; exits silently if none |
 | `aproxy alias add\|remove\|list` | Manage config aliases (stored in settings.json) |
@@ -155,12 +216,19 @@ listen_addr = "127.0.0.1:12345"          # local listener
 # log_file = "D:/aproxy-logs/a.log"      # custom log file (~ expanded; relative paths resolve against APROXY_HOME; default is a random per-start name, resolved via IPC)
 # connect_timeout_secs = 30              # upstream connect timeout (0 = none)
 # read_timeout_secs = 300                # inter-read timeout (0 = none)
-# request_transform = { command = "aproxy-format", args = ["run"], mode = "persistent", extra = "agg.toml" }
+# allowed_hosts = ["myproxy.local"]      # extra Hosts to allow (DNS-rebinding guard; appended to the built-in list, "*" disables the check)
+# allowed_origins = ["http://localhost:5173"] # browser Origins to allow (any request carrying Origin is rejected by default, "*" disables the check)
+# request_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
                                          # external transformer (request side): hand body/headers/url to a format program
                                          # (protocol conversion, key rotation, multi-channel aggregation; failure = 502, no retry; exclusive with forward_only)
-# response_transform = { command = "aproxy-format", args = ["run"], mode = "persistent" }
-                                         # external transformer (response side): rewrite upstream responses before replay (failure passes through)
+# response_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
+                                         # external transformer (response side; use the same extra as the request side): rewrite upstream responses before replay (failure passes through)
+                                         # use ~/ or absolute paths for command/extra: the daemon's working directory is unreliable, so relative paths may not resolve
 ```
+
+Multi-key rotation only takes effect **between requests**: retries of the same
+request keep the same transformed key (a request is transformed once and the
+result is replayed on every retry).
 
 Runtime data lives in `~/.aproxy/`: `run/` (registry, restore records,
 watchdog claim), `logs/` (daemon logs, randomly named per start, rotated and
@@ -169,10 +237,54 @@ orphan-cleaned; paths reported via IPC — customize with `log_file`),
 scratch space), `settings.json` (internal state: aliases, defaults, watchdog
 fields — program-managed).
 
+### Inbound origin checks
+
+The proxy serves local CLI-style clients by default and defends against
+web-page origins (see [SECURITY.md](SECURITY.md)):
+
+- **Host** (DNS-rebinding guard): when listening on a loopback address, only
+  `localhost` / `127.0.0.1` / `[::1]` and the listen address's own host name
+  are accepted; `allowed_hosts` entries are **added** to that set (port
+  ignored, case-insensitive). When listening on a non-loopback address with an
+  empty `allowed_hosts`, no Host check is done.
+- **Origin**: any request carrying an `Origin` header is rejected by default
+  (only browsers and Electron/WebView-style clients send it) unless it exactly
+  matches an `allowed_origins` entry (case-insensitive, trailing `/` ignored);
+  independent of the listen address.
+- Either list may contain `"*"` to disable that check; `[]` is the same as
+  unset. Both can be set per instance in `config.toml` and as global defaults
+  in `settings.json` (toml wins).
+- A rejected request gets a local **403** whose message names the setting to
+  change. It was never forwarded, no `api_key` was injected and no retry
+  happens; requests that pass are unaffected.
+- Affected clients: apps that send `Origin` (Cherry Studio, Open WebUI, ...)
+  need their origin added to `allowed_origins`. CLI clients such as Claude Code
+  send no `Origin` and use `127.0.0.1:<port>` as Host, so they are unaffected.
+
+## Security notes
+
+aProxy is a local single-user proxy: it holds the upstream key and injects it
+into every forwarded request, and the proxy port itself has no authentication.
+
+- It listens on loopback (`127.0.0.1`) by default. **Do not set `listen_addr`
+  to `0.0.0.0` or a LAN address** — that lets any host on the network use your
+  key without authentication; if you do need it, start-up, `startup.log` and
+  `aproxy doctor` will warn you.
+- `api_key` is stored in plain text in `config.toml`; restrict the file's
+  permissions to your own user.
+- External transformers (`request_transform` / `response_transform`) run
+  arbitrary commands from the config; only configure programs you trust and do
+  not let others edit your `config.toml`.
+- Logs and `status` mask URL-embedded credentials and query-string values
+  (`?key=***`), so they are safe to paste.
+
+The full threat model and how to report vulnerabilities are in
+[SECURITY.md](SECURITY.md).
+
 ## Development
 
 ```sh
-cargo test --locked                                # full suite (baseline noted in docs/architecture.md; bump when adding tests)
+cargo test --locked                                # full suite
 cargo clippy --all-targets --locked -- -D warnings # must be warning-free (project rule)
 cargo fmt --all -- --check
 ```

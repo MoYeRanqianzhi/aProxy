@@ -100,8 +100,10 @@ verify_sha256() {
 # 任一假设不成立（键缺失/次序错）时 awk 以非零退出，脚本明确报错而不是猜一个 tag。
 #
 # parse_releases 输入 JSON，输出每行 "<tag> <draft> <prerelease>"，保持列表顺序。
+# 用 ERE（grep -E）写交替：BRE 里的 \| 是 GNU 扩展，musl/busybox 这类严格 POSIX
+# 的正则实现不认——而 Alpine 等 musl 系统恰恰是 musl 回退要服务的对象。
 parse_releases() {
-    grep -o '"\(tag_name\|draft\|prerelease\)": *[^,}]*' | tr -d '" \r' | awk -F: '
+    grep -oE '"(tag_name|draft|prerelease)": *[^,}]*' | tr -d '" \r' | awk -F: '
         $1 == "tag_name"   { if (state != 0) bad = 1; tag = $2; state = 1; next }
         $1 == "draft"      { if (state != 1) bad = 1; draft = $2; state = 2; next }
         $1 == "prerelease" { if (state != 2) bad = 1; print tag, draft, $2; state = 0; next }

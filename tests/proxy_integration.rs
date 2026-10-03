@@ -2906,13 +2906,23 @@ fn daemon_lifecycle_start_status_stop() {
     // 就绪 = TCP 可连且 IPC ping 确认是自家守护（最多 10 秒）
     assert!(wait_daemon_ready(port), "守护子进程未就绪 (pid {pid})");
 
-    // 身份判定：正名运行的守护必须通过 is_aproxy_process（看门狗收养/选举/
-    // 处决关卡的全部前置）。镜像名精确比对的成功路径（Windows aproxy.exe /
-    // unix aproxy）
-    assert!(
-        aproxy::watchdog::is_aproxy_process(pid),
-        "正名运行的守护 (pid {pid}) 应通过进程身份判定"
-    );
+    // 身份判定：守护登记的进程创建时间必须与实测一致（看门狗收养/选举/
+    // 处决关卡与 stop --force 的全部前置；pid + 创建时间，与二进制名无关）。
+    // 无 /proc 的 unix 读不到创建时间，登记为 0，不在此断言
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        let rec =
+            aproxy::daemon::read_instance_file_in(&aproxy::daemon::run_dir(), &port.to_string())
+                .expect("守护应已写注册表");
+        assert!(
+            matches!(
+                aproxy::watchdog::record_identity(pid, rec.process_start),
+                aproxy::watchdog::RecordIdentity::Alive(_)
+            ),
+            "守护 (pid {pid}) 应通过进程身份判定（登记创建时间 {}）",
+            rec.process_start
+        );
+    }
 
     // status 列出该实例（信息来自实例注册表，存活以 IPC 探测为准）
     let out = Command::new(exe).arg("status").output().unwrap();
@@ -3992,8 +4002,9 @@ fn watchdog_respawns_killed_daemon() {
 
 // ---------------------------------------------------------------------------
 // 身份判定对「二进制被原地替换」的容忍（unix swap 升级场景）：运行中的守护
-// 的 exe 链接会被内核附加「 (deleted)」后缀，is_aproxy_process 剥除后比对，
-// 升级动作不得让在运行实例被判为异己（否则收养/选举/处决关卡全体失效）
+// 的 exe 链接会被内核附加「 (deleted)」后缀；身份按 pid + 登记的进程创建
+// 时间判定，与二进制路径/名称无关，升级动作不得让在运行实例被判为异己
+// （否则收养/选举/处决关卡全体失效）
 // ---------------------------------------------------------------------------
 #[test]
 #[cfg(unix)]
@@ -4002,8 +4013,7 @@ fn identity_check_tolerates_swapped_binary() {
 
     let port = daemon_test_port(10);
     let dir = tempfile::tempdir().unwrap();
-    // 守护用副本二进制运行（不碰真实 target 二进制——并行测试共用它）。
-    // 副本必须正名 `aproxy`：身份判定按 basename 精确比对
+    // 守护用副本二进制运行（不碰真实 target 二进制——并行测试共用它）
     let bin = dir.path().join("aproxy");
     std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &bin).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -4048,21 +4058,26 @@ fn identity_check_tolerates_swapped_binary() {
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(ready, "副本守护未就绪");
-    assert!(
-        aproxy::watchdog::is_aproxy_process(pid),
-        "替换前正名守护应通过身份判定"
-    );
+    let identity_alive = || {
+        let rec = aproxy::daemon::read_instance_file_in(&home_dir.join("run"), &port.to_string())
+            .expect("守护应已写注册表");
+        matches!(
+            aproxy::watchdog::record_identity(pid, rec.process_start),
+            aproxy::watchdog::RecordIdentity::Alive(_)
+        )
+    };
+    assert!(identity_alive(), "替换前守护应通过身份判定");
 
     // 原地替换（swap 升级的真实形态）：新文件 rename 原子覆盖原路径 →
     // 旧 inode 失名，内核把运行中进程的 exe 链接标为「... (deleted)」。
-    // 注意不是把运行中二进制 rename 走开——那种场景 exe 跟随新路径名、
-    // 无 (deleted) 后缀，basename 随之改变（精确比对判异己，属 F2 边界）
+    // （把运行中二进制 rename 走开的场景 exe 跟随新路径名，同样不影响
+    // 以创建时间为锚的身份判定）
     let new_bin = dir.path().join("aproxy.new");
     std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &new_bin).unwrap();
     std::fs::rename(&new_bin, &bin).unwrap();
     assert!(
-        aproxy::watchdog::is_aproxy_process(pid),
-        "二进制被覆盖替换后，运行中守护仍应通过身份判定（(deleted) 后缀剥离）"
+        identity_alive(),
+        "二进制被覆盖替换后，运行中守护仍应通过身份判定（创建时间不随文件替换改变）"
     );
 
     // 守护仍在正常服务（IPC 可达）——身份判定未误杀正常实例

@@ -2,6 +2,16 @@
 # aproxy-envelope（信封契约 crate，两二进制共同类型单源维护）。
 # 三包依赖树完全隔离——aproxy-format 的 switchyard-translation 不会进入 aproxy
 # 的编译闭包，「aproxy 本体体积不受影响」由此保证。
+#
+# 有意不设 default-members：根目录本身是 aproxy 包，所以不带 -p/--workspace 的
+# cargo 命令只作用于 aproxy。测试与 lint 必须显式带 --workspace 才覆盖全部
+# 三个成员（CI 与两条发版门禁都这样写）：
+#   cargo test --workspace --locked
+#   cargo clippy --workspace --all-targets --locked -- -D warnings
+# 若把三成员都设成 default-members，裸 `cargo run` 会因存在 aproxy 与
+# aproxy-format 两个二进制而报「could not determine which binary to run」；
+# 源码构建用的裸 `cargo build` 也会连带编译 aproxy-format，并按它的
+# rust-version 1.96.1 拒绝更旧的工具链，而 aproxy 本身只要求 1.88。
 [workspace]
 members = [".", "aproxy-envelope", "aproxy-format"]
 resolver = "3"

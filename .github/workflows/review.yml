@@ -13,6 +13,10 @@ on:
   schedule:
     - cron: "0 3 * * 1" # 每周一 03:00 UTC
 
+# 只读 token：审查只读代码与公开的 RUSTSEC 数据库。显式声明，不依赖仓库默认权限设置。
+permissions:
+  contents: read
+
 concurrency:
   group: review-${{ github.ref }}
   cancel-in-progress: true
@@ -21,6 +25,9 @@ jobs:
   cargo-deny:
     runs-on: ubuntu-latest
     steps:
+      # 不把 token 持久化进 .git/config（后续步骤用不到仓库凭据）
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       # 检查维度与豁免口径见仓库根 deny.toml
       - uses: EmbarkStudios/cargo-deny-action@v2.1.1

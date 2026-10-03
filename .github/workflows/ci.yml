@@ -2,11 +2,22 @@ name: CI
 
 # 每次提交（push / PR）的全量测试与静态门槛。
 # 发布门槛（fmt/clippy/test）在 release.yml 中独立复跑——tag 可能落后 main。
+#
+# 覆盖面：cargo test/clippy 一律带 --workspace。根目录本身是 aproxy 包且
+# [workspace] 未设 default-members，不带 --workspace 时只作用于 aproxy，
+# aproxy-envelope 与 aproxy-format 的测试和 clippy 都不会跑（曾因此 42 项测试
+# 从未进入任何门禁）。不改用 default-members 的理由见 Cargo.toml [workspace] 注释。
+# --no-fail-fast：某个测试二进制失败后仍跑完其余二进制，一次拿到完整失败面
+# （默认行为会在首个失败的二进制处停下，后面的集成测试结论全部缺席）。
 
 on:
   push:
     branches: [main]
   pull_request:
+
+# 只读 token：CI 不发布、不写仓库。显式声明，不依赖仓库默认权限设置。
+permissions:
+  contents: read
 
 # 同一分支的新提交取消进行中的旧跑（省 runner 时间，最新结论才有意义）
 concurrency:
@@ -21,7 +32,11 @@ jobs:
     # 主开发平台：全量验证。零警告（-D warnings）是项目纪律。
     runs-on: windows-latest
     steps:
+      # persist-credentials: false：不把 token 写进 .git/config——后续步骤会执行
+      # 依赖的 build.rs 与测试代码，它们不需要也不应该拿到仓库凭据
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -29,20 +44,40 @@ jobs:
       # --locked：Cargo.lock 是权威解析（windows-sys 精确钉死的历史教训——
       # 无锁重解析曾观察到直接依赖漂移到不兼容的新版本线）
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked --verbose
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # 不带目标过滤的 cargo test 会顺带编译 examples——transform_integration
+      # 依赖已编译的 examples/format-echo，加 --lib/--test 过滤时须另行构建
+      - run: cargo test --workspace --locked --no-fail-fast --verbose
 
-  unix:
+  ubuntu:
     # unix 分支已在 Ubuntu/WSL 实测全绿（2026-09-11，见团队记忆
     # install-three-platform-e2e）——CI 从编译面 check 升级为真实测试门槛，
     # 防止 unix-only 代码的编译/行为回归再次溜进 main。
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    # 与 macOS 拆成独立 job：macOS 已知红（见下）时，ubuntu 的结论仍然单独可读。
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2.9.2
+      # windows 上的 clippy 不编译 #[cfg(unix)] 代码，零警告纪律在这里补上 unix 面
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked --no-fail-fast
+
+  macos:
+    # 已知红：#[cfg(unix)] 的共享内存与进程查询实现是 Linux 专用（/dev/shm、
+    # /proc），macOS 上 3 个 lib 测试失败——待有 macOS 真机的贡献者完成支持，
+    # 见团队记忆 2026-09-12-macos-support-required。不加 skip、不设
+    # continue-on-error：红色就是「未完成」的如实信号；独立成 job 后不再淹没
+    # windows/ubuntu 的结论。
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo test --locked

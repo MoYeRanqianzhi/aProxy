@@ -9,19 +9,30 @@
 //!   请求、输入输出有序、无多路复用），按需扩容至 `pool_max`，空闲超时回收
 //!
 //! 失败语义由调用方（proxy.rs）决定：请求侧 502 不重试、响应侧透传原样。
+//! 池内唯一的重试是「复用的空闲 worker 在产出前就死了 → 换新 worker 重做
+//! 一次」（见 convert）：那是池拿到了死 worker 的状态问题，不是转换失败，
+//! 不改变上述失败语义。
+//!
+//! **stdout 同步不变量**（串包防线）：信封协议没有请求序号，worker 的第 N 行
+//! 输出只能靠「一请求恰一行、按序」对应第 N 个请求。因此 worker 只有在本次
+//! 输出被确认为一行合法信封、且其后没有残留输出时才归还空闲表；任何让对应
+//! 关系存疑的情形（非法行、多行、空闲期冒出的输出）一律剔除 worker——留在池
+//! 里的话，下一个请求会读到上一个请求的输出（A 会话的 body/key 发往 B）。
 
 use std::{
     collections::btree_map::{BTreeMap, Entry},
     path::Path,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
+    task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
 
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
-use tokio::process::{Child, ChildStdin};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, Semaphore};
 
 use aproxy_envelope::TransformEnvelope;
@@ -32,18 +43,33 @@ use crate::{
 };
 
 /// 转换失败分类。Display 文案供 502 响应体与日志直接内插。
+///
+/// 按成因分类，文案各自如实表述（不把瞬时故障说成「确定性」）：
+/// - **format 的输出本身**（同一输入重来大概率同样失败）：`Rejected`
+///   （format 自报 error 行）、`Protocol`（输出违反信封协议）
+/// - **进程/管道层故障**（与输入无关，常为瞬时）：`Spawn`、`Io`、
+///   `WorkerDied`、`TimedOut`
+/// - **其他本地故障**：`Spool`（磁盘）、`Serialize`（aproxy 侧，不发生）、
+///   `Closed`（防御性）
 #[derive(Debug)]
 pub(crate) enum TransformError {
-    /// format 进程启动失败（命令不存在等）。
+    /// format 进程启动失败（命令不存在、二进制正被替换、句柄耗尽等）。
     Spawn(std::io::Error),
-    /// 信封序列化失败（body 含非法字符等，现实中几乎不发生）。
+    /// 信封序列化失败（字段全是字符串/整数，现实中不发生）。
     Serialize(serde_json::Error),
     /// 读写 format 进程的 stdin/stdout 失败（管道断开等）。
     Io(std::io::Error),
+    /// 读取落盘的请求/响应 body 临时文件失败（本地磁盘故障，与 format 无关）。
+    Spool(std::io::Error),
     /// 单请求转换超时（worker 可能仍在消化旧输入，kill 后剔除，绝不能复用）。
     TimedOut,
     /// worker 进程意外退出且无输出（EOF）。
     WorkerDied,
+    /// format 的输出违反信封协议（非 UTF-8、非合法信封 JSON、body 与 body_b64
+    /// 冲突、persistent 下单请求输出多行等）。携带人类可读的细节。
+    /// 与 `Rejected` 的区别：这不是 format 的业务判定，而是 format 程序本身
+    /// 写错了（往 stdout 打日志/横幅、jq 忘加 -c 等），排障方向完全不同。
+    Protocol(String),
     /// format 通过信封 error 行表达的单请求失败（进程未崩）。
     Rejected(String),
     /// 池已关闭（防御性：现实中信号量不会被 close）。
@@ -52,15 +78,77 @@ pub(crate) enum TransformError {
 
 impl std::fmt::Display for TransformError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 各变体文案的**开头短语**被排障文档（aproxy-format skill 的
+        // troubleshooting）按「错误含 xxx」检索，改动开头需同步文档
         match self {
-            TransformError::Spawn(e) => write!(f, "format 进程启动失败: {e}"),
+            TransformError::Spawn(e) => {
+                write!(f, "format 进程启动失败（检查 command 路径）: {e}")
+            }
             TransformError::Serialize(e) => write!(f, "信封序列化失败: {e}"),
-            TransformError::Io(e) => write!(f, "format 进程管道读写失败: {e}"),
-            TransformError::TimedOut => write!(f, "转换超时（format 进程已终止）"),
-            TransformError::WorkerDied => write!(f, "format 进程意外退出且无输出"),
+            TransformError::Io(e) => write!(
+                f,
+                "format 进程管道读写失败（进程/管道层故障，worker 已剔除）: {e}"
+            ),
+            TransformError::Spool(e) => write!(f, "body 临时文件读取失败（本地磁盘故障）: {e}"),
+            TransformError::TimedOut => write!(
+                f,
+                "转换超时（format 进程已终止并剔除；可能是瞬时负载，也可能是 format 卡死）"
+            ),
+            TransformError::WorkerDied => write!(
+                f,
+                "format 进程意外退出且无输出（进程层故障，worker 已剔除）"
+            ),
+            TransformError::Protocol(detail) => {
+                write!(f, "format 输出违反信封协议: {detail}")
+            }
             TransformError::Rejected(msg) => write!(f, "format 报告转换失败: {msg}"),
             TransformError::Closed => write!(f, "转换器已关闭"),
         }
+    }
+}
+
+/// 一次「写一行、读一行」往返的结局。worker 的所有权在往返内部处置完毕
+/// （归还空闲表或剔除），调用方只需按结局决定是否换 worker 重试。
+enum Exchange {
+    /// 往返完成：成功，或不应重试的失败（format 自报 error、协议错误、超时、
+    /// 读到部分输出后才出错）。
+    Done(Result<TransformEnvelope, TransformError>),
+    /// worker 在产出**任何**输出之前就失败（写入失败 / 读到 EOF / 读出错且
+    /// 无字节）：worker 已剔除。此时 format 尚未对本请求产出任何东西，换一个
+    /// worker 重做不会重复或丢失输出——是否重试由调用方按 worker 来源决定。
+    DeadBeforeOutput(TransformError),
+}
+
+/// worker stdout 的「此刻」状态（非阻塞探测，见 [`probe_stdout`]）。
+enum StdoutProbe {
+    /// 暂无可读数据：stdout 与请求的对应关系完好。
+    Quiet,
+    /// 已有未被请求的输出待读：再复用该 worker，下一个请求就会读到它（串包）。
+    Stray,
+    /// EOF 或读错误：进程已退出 / 管道已断。
+    Closed,
+}
+
+/// 非阻塞探测 worker stdout：只 poll 一次、不等待。
+///
+/// 用 noop waker 单次 poll `poll_fill_buf`：BufReader 内部缓冲非空时直接
+/// 返回缓冲（确定性地发现「同批到达的多余行」）；缓冲空时向底层管道要数据——
+/// unix 上是非阻塞读，立刻知道管道里有没有；Windows 上 tokio 的子进程管道是
+/// 「后台阻塞线程读」适配器，首次 poll 只是**发起**一次后台读并返回 Pending，
+/// 读到的数据（或 EOF）由适配器暂存、下次 poll 交付，不会丢失。因此本函数在
+/// 归还空闲表时调用一次（Windows 上顺带发起后台读）、从空闲表取出时再调用一次
+/// （此时空闲期里冒出的输出或进程退出已可见），两个平台都能覆盖空闲期。
+///
+/// 残余窗口（诚实声明）：多余输出若恰好在「取出探测」与「本次读」之间的微秒
+/// 级窗口才到达，仍会被当作本请求的输出——根治需要信封带请求序号由 format
+/// 回显（协议变更），属后续版本议题。
+fn probe_stdout(stdout: &mut BufReader<ChildStdout>) -> StdoutProbe {
+    let mut cx = Context::from_waker(Waker::noop());
+    match Pin::new(stdout).poll_fill_buf(&mut cx) {
+        Poll::Pending => StdoutProbe::Quiet,
+        Poll::Ready(Ok([])) => StdoutProbe::Closed,
+        Poll::Ready(Ok(_)) => StdoutProbe::Stray,
+        Poll::Ready(Err(_)) => StdoutProbe::Closed,
     }
 }
 
@@ -118,6 +206,14 @@ impl TransformPool {
 
     /// 单请求转换：写信封行、读回信封行。worker 取自空闲表（persistent）或
     /// 现场启动（spawn / 无空闲）；用毕归还或按模式丢弃。
+    ///
+    /// 取自空闲表的 worker 若在产出任何输出前就失败（空闲期间崩溃/被杀/自行
+    /// 退出、恰在取出探测之后才死），丢弃并**新 spawn 一个**重试一次：这是池
+    /// 状态问题（拿到了死 worker），与本请求内容无关，format 也尚未对本请求
+    /// 产出任何东西，重做安全。上限 1 次——新 spawn 的 worker 仍失败说明
+    /// format 本身起不来（崩溃型 format），照旧直接返回，避免循环拉起。
+    /// format 自报的 error 行、协议错误、超时一律不重试（同一输入重来大概率
+    /// 同样失败，且超时重试会把等待时间翻倍）。
     pub(crate) async fn convert(
         &self,
         mut env: TransformEnvelope,
@@ -129,61 +225,190 @@ impl TransformPool {
             .await
             .map_err(|_| TransformError::Closed)?;
 
-        // **先释放锁再 spawn**：`match self.state.lock().await.idle.pop()` 的
-        // MutexGuard 会活到整个 match 语句结束，arm 里 spawn_worker() 再拿
-        // 同一把锁就是自死锁（tokio Mutex 不可重入）——pop 结果必须先落变量
-        let popped = self.state.lock().await.idle.pop();
-        let mut worker = match popped {
-            Some(w) => w,
-            None => self.spawn_worker().await?,
+        let (worker, reused) = match self.take_idle_worker().await {
+            Some(w) => (w, true),
+            None => (self.spawn_worker().await?, false),
         };
-        env.worker_id = worker.worker_id;
+        match self.exchange(worker, &mut env).await {
+            Exchange::Done(result) => result,
+            Exchange::DeadBeforeOutput(e) if reused => {
+                tracing::warn!(error = %e, "复用的空闲 worker 已失效（未产出任何输出），换新 worker 重试一次");
+                let fresh = self.spawn_worker().await?;
+                match self.exchange(fresh, &mut env).await {
+                    Exchange::Done(result) => result,
+                    Exchange::DeadBeforeOutput(e) => Err(e),
+                }
+            }
+            Exchange::DeadBeforeOutput(e) => Err(e),
+        }
+    }
 
-        let line = env.to_line().map_err(TransformError::Serialize)?;
-        let timeout_secs = self.cfg.effective_timeout_secs();
-        // 写 + 读一次往返；timeout 包裹读侧——超时的 worker 不可信（可能仍
-        // 在消化旧输入），必须 kill 剔除
-        let io = async {
-            worker.stdin.write_all(line.as_bytes()).await?;
-            worker.stdin.write_all(b"\n").await?;
-            worker.stdin.flush().await?;
-            let mut out = String::new();
-            let n = worker.stdout.read_line(&mut out).await?;
-            Ok::<_, std::io::Error>((n, out))
-        };
-        let result = if timeout_secs == 0 {
-            io.await.map_err(TransformError::Io)
-        } else {
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), io).await {
-                Ok(r) => r.map_err(TransformError::Io),
-                Err(_) => Err(TransformError::TimedOut),
+    /// 从空闲表取一个可用 worker：取出时先剔除已退出的、以及 stdout 冒出了
+    /// 未被请求的输出的（见 [`probe_stdout`]）。全部不可用返回 None（调用方
+    /// 现场 spawn）。
+    ///
+    /// 取出时的存活检查只是低成本前置过滤（省一次往死管道写入的失败往返），
+    /// 有 TOCTOU 竞态——检查后才死的 worker 由 convert 的「产出前失败重试
+    /// 一次」兜底，两者缺一不可。
+    async fn take_idle_worker(&self) -> Option<Worker> {
+        loop {
+            // **先释放锁再做后续**：pop 的 MutexGuard 是本语句的临时值，语句
+            // 结束即释放——若写成 `match self.state.lock().await.idle.pop()`，
+            // guard 会活到整个 match 结束，调用方随后 spawn_worker() 再拿同一
+            // 把锁就是自死锁（tokio Mutex 不可重入）
+            let mut worker = self.state.lock().await.idle.pop()?;
+            if !matches!(worker.child.try_wait(), Ok(None)) {
+                tracing::info!(worker_id = worker.worker_id, "空闲 worker 已退出，剔除");
+                discard_worker(worker);
+                continue;
+            }
+            match probe_stdout(&mut worker.stdout) {
+                StdoutProbe::Quiet => return Some(worker),
+                StdoutProbe::Closed => {
+                    tracing::info!(
+                        worker_id = worker.worker_id,
+                        "空闲 worker 的 stdout 已关闭，剔除"
+                    );
+                }
+                StdoutProbe::Stray => {
+                    // 不记录内容本身：多余输出可能是 format 打出的信封（含鉴权头）
+                    tracing::warn!(
+                        worker_id = worker.worker_id,
+                        "空闲 worker 的 stdout 冒出了未被请求的输出（format 违反「一请求一行」：\
+                         stdout 只能写信封行，日志请写 stderr），剔除以免下一个请求读到错位输出"
+                    );
+                }
+            }
+            discard_worker(worker);
+        }
+    }
+
+    /// 在给定 worker 上做一次往返，并按结局处置 worker：确认 stdout 同步完好
+    /// 才归还空闲表，其余一律剔除（见模块文档「stdout 同步不变量」）。
+    async fn exchange(&self, mut worker: Worker, env: &mut TransformEnvelope) -> Exchange {
+        env.worker_id = worker.worker_id;
+        let line = match env.to_line() {
+            Ok(l) => l,
+            Err(e) => {
+                discard_worker(worker);
+                return Exchange::Done(Err(TransformError::Serialize(e)));
             }
         };
 
-        match result {
-            Ok((0, _)) => {
+        /// 往返进行到哪一步失败——决定「是否已产出输出」。
+        enum Phase {
+            Line(Vec<u8>),
+            Eof,
+            WriteFailed(std::io::Error),
+            ReadFailed { err: std::io::Error, partial: bool },
+        }
+        let timeout_secs = self.cfg.effective_timeout_secs();
+        // 写 + 读一次往返；timeout 包裹整个往返——超时的 worker 不可信（可能
+        // 仍在消化旧输入），必须 kill 剔除。按字节读到 \n（而非 read_line）：
+        // 非 UTF-8 输出要归为协议错误，read_line 会把它混成 IO 错误
+        let io = async {
+            let write = async {
+                worker.stdin.write_all(line.as_bytes()).await?;
+                worker.stdin.write_all(b"\n").await?;
+                worker.stdin.flush().await
+            };
+            if let Err(e) = write.await {
+                return Phase::WriteFailed(e);
+            }
+            let mut buf = Vec::new();
+            match worker.stdout.read_until(b'\n', &mut buf).await {
+                Ok(0) => Phase::Eof,
+                Ok(_) => Phase::Line(buf),
+                Err(err) => Phase::ReadFailed {
+                    err,
+                    partial: !buf.is_empty(),
+                },
+            }
+        };
+        let phase = if timeout_secs == 0 {
+            io.await
+        } else {
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), io).await {
+                Ok(p) => p,
+                Err(_) => {
+                    discard_worker(worker);
+                    return Exchange::Done(Err(TransformError::TimedOut));
+                }
+            }
+        };
+
+        let bytes = match phase {
+            Phase::Line(bytes) => bytes,
+            Phase::Eof => {
                 // EOF：进程退出且无输出（协议义务是遇 EOF 退出，读到 EOF 无输出
                 // 说明进程刚死）
                 discard_worker(worker);
-                Err(TransformError::WorkerDied)
+                return Exchange::DeadBeforeOutput(TransformError::WorkerDied);
             }
-            Ok((_, out)) => {
-                // n > 0：读到一行输出
-                let alive = matches!(worker.child.try_wait(), Ok(None));
-                if alive && self.cfg.mode == TransformMode::Persistent {
-                    worker.last_used = Instant::now();
-                    self.state.lock().await.idle.push(worker);
-                } else {
-                    // spawn 模式（一次性）或进程已退（写完就退）：收尾丢弃
-                    discard_worker(worker);
-                }
-                // 信封行以 \n 结尾；trim 后解析（空行是协议错误）
-                TransformEnvelope::from_line(out.trim_end())
-                    .map_err(|e| TransformError::Rejected(e.to_string()))
-            }
-            Err(e) => {
+            Phase::WriteFailed(e) => {
                 discard_worker(worker);
-                Err(e)
+                return Exchange::DeadBeforeOutput(TransformError::Io(e));
+            }
+            Phase::ReadFailed {
+                err,
+                partial: false,
+            } => {
+                discard_worker(worker);
+                return Exchange::DeadBeforeOutput(TransformError::Io(err));
+            }
+            Phase::ReadFailed { err, partial: true } => {
+                // 已读到半行：format 对本请求产出过东西，不属于「产出前失败」
+                discard_worker(worker);
+                return Exchange::Done(Err(TransformError::Io(err)));
+            }
+        };
+
+        // 信封行以 \n 结尾；trim 后解析（空行是协议错误）。**解析成功之前绝不
+        // 归还**：解析失败说明这一行不是本请求的回复（横幅、日志、多行 JSON
+        // 的碎片），对应关系已断，worker 必须剔除
+        let parsed = std::str::from_utf8(&bytes)
+            .map_err(|e| format!("输出不是 UTF-8（{e}）"))
+            .and_then(|text| {
+                TransformEnvelope::from_line(text.trim_end()).map_err(|e| e.to_string())
+            });
+        let out = match parsed {
+            Ok(out) => out,
+            Err(detail) => {
+                discard_worker(worker);
+                return Exchange::Done(Err(TransformError::Protocol(format!(
+                    "{detail}；stdout 只能写信封行（横幅/日志请写 stderr，JSON 须紧凑单行），\
+                     该 worker 已剔除"
+                ))));
+            }
+        };
+
+        // spawn 模式（一次性）或进程已退（写完就退）：用毕即弃，多余输出随进程
+        // 一并丢弃，不存在错位风险，不必再查
+        let alive = matches!(worker.child.try_wait(), Ok(None));
+        if !alive || self.cfg.mode != TransformMode::Persistent {
+            discard_worker(worker);
+            return Exchange::Done(Ok(out));
+        }
+        match probe_stdout(&mut worker.stdout) {
+            StdoutProbe::Quiet => {
+                worker.last_used = Instant::now();
+                self.state.lock().await.idle.push(worker);
+                Exchange::Done(Ok(out))
+            }
+            StdoutProbe::Closed => {
+                // 写完就退：本行合法照收，进程收尾丢弃
+                discard_worker(worker);
+                Exchange::Done(Ok(out))
+            }
+            StdoutProbe::Stray => {
+                // 一个请求回了不止一行：哪一行才是本请求的回复已无从判定
+                // （多出的可能在前也可能在后），本次结果不可信，按协议错误失败
+                discard_worker(worker);
+                Exchange::Done(Err(TransformError::Protocol(
+                    "对单个请求输出了不止一行（每个请求必须恰好回一行信封；日志请写 stderr，\
+                     JSON 须紧凑单行），该 worker 已剔除"
+                        .to_string(),
+                )))
             }
         }
     }
@@ -396,7 +621,7 @@ pub(crate) async fn transform_request(
     let body_bytes = match &body {
         RequestBody::Memory(b) => b.to_vec(),
         RequestBody::Disk { path, .. } => {
-            tokio::fs::read(path).await.map_err(TransformError::Io)?
+            tokio::fs::read(path).await.map_err(TransformError::Spool)?
         }
     };
     drop(body); // Disk 文件由 Drop 删除（已被读出）
@@ -411,9 +636,12 @@ pub(crate) async fn transform_request(
     if let Some(err) = out.error {
         return Err(TransformError::Rejected(err));
     }
+    // body_b64 解码失败是 format 输出写错（协议错误），不是 format 的业务判定。
+    // worker 已在 convert 内归还：该行本身是一行合法信封，stdout 帧同步未受
+    // 影响，无需剔除
     let resp_bytes = out
         .body_bytes()
-        .map_err(|e| TransformError::Rejected(e.to_string()))?;
+        .map_err(|e| TransformError::Protocol(e.to_string()))?;
     let new_body = spool_request_body(&resp_bytes, spool_dir).await;
     let new_method = match out
         .method
@@ -477,7 +705,7 @@ pub(crate) async fn transform_response(
                 return TransformedResponse {
                     headers,
                     body,
-                    error: Some(TransformError::Io(e)),
+                    error: Some(TransformError::Spool(e)),
                 };
             }
         },
@@ -515,7 +743,8 @@ pub(crate) async fn transform_response(
             return TransformedResponse {
                 headers,
                 body,
-                error: Some(TransformError::Rejected(e.to_string())),
+                // 同请求侧：body_b64 解码失败归协议错误
+                error: Some(TransformError::Protocol(e.to_string())),
             };
         }
     };
@@ -641,6 +870,9 @@ mod tests {
         let e = TransformError::Rejected("model 未命中".to_string());
         assert!(e.to_string().contains("model 未命中"));
         assert!(TransformError::TimedOut.to_string().contains("超时"));
+        let p = TransformError::Protocol("missing field `headers`".to_string());
+        assert!(p.to_string().contains("违反信封协议"), "{p}");
+        assert!(p.to_string().contains("missing field"), "{p}");
     }
 
     #[tokio::test]
@@ -813,6 +1045,125 @@ mod tests {
             1,
             "idle=0 永不回收：worker 应仍在空闲表"
         );
+    }
+
+    #[tokio::test]
+    async fn banner_line_is_protocol_error_and_evicts_worker() {
+        // 横幅先于回复：读到的首行不是信封 → Protocol（不是 Rejected——这不是
+        // format 的业务判定）且 worker 必须剔除：留在池里，下一个请求会读到
+        // 本请求的回复
+        let pool = echo_pool(TransformMode::Persistent, "banner", |_| {});
+        for body in ["b1", "b2"] {
+            let err = pool.convert(envelope_with(body)).await.unwrap_err();
+            assert!(matches!(err, TransformError::Protocol(_)), "{err:?}");
+            assert_eq!(
+                pool.state.lock().await.idle.len(),
+                0,
+                "协议错误的 worker 不得归还"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn multiline_reply_in_one_batch_is_protocol_error() {
+        // 两行同批到达：读完首行时缓冲里还有残行——一个请求回了多行，哪行是
+        // 本请求的回复已无从判定，按协议错误失败并剔除（绝不能归还后让下一个
+        // 请求读到残行）
+        let pool = echo_pool(TransformMode::Persistent, "multiline", |_| {});
+        for body in ["m1", "m2", "m3"] {
+            let err = pool.convert(envelope_with(body)).await.unwrap_err();
+            assert!(matches!(err, TransformError::Protocol(_)), "{err:?}");
+            assert_eq!(pool.state.lock().await.idle.len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn stray_line_arriving_while_idle_is_evicted_before_reuse() {
+        // 多余行晚于回复到达（worker 已在空闲表）：取用前探测到并剔除，换新
+        // worker 处理本请求——本请求拿到的必须是自己的回显
+        let pool = echo_pool(TransformMode::Persistent, "late-stray", |c| {
+            c.args = vec!["late-stray".to_string(), "50".to_string()];
+            c.pool_max = Some(1);
+        });
+        let first = pool.convert(envelope_with("s1")).await.unwrap();
+        assert_eq!(first.body.as_deref(), Some("s1"));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let second = pool.convert(envelope_with("s2")).await.unwrap();
+        assert_eq!(
+            second.body.as_deref(),
+            Some("s2"),
+            "读到了上一个请求的多余行（串包）"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_line_keeps_worker_in_pool() {
+        // format 自报 error 行是一行合法信封：stdout 同步完好，worker 照常
+        // 归还（不能因「本请求失败」误伤健康 worker，否则轮换计数会被重置）
+        let pool = echo_pool(TransformMode::Persistent, "error", |_| {});
+        let out = pool.convert(envelope_with("e")).await.unwrap();
+        assert!(out.error.is_some());
+        assert_eq!(pool.state.lock().await.idle.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_worker_that_exited_is_skipped_on_take() {
+        // die-idle：空闲 100ms 自行退出。取用时剔除死 worker、现场 spawn，
+        // 请求照常成功
+        let pool = echo_pool(TransformMode::Persistent, "die-idle", |c| {
+            c.args = vec!["die-idle".to_string(), "100".to_string()];
+        });
+        pool.convert(envelope_with("d1")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let out = pool.convert(envelope_with("d2")).await.unwrap();
+        assert_eq!(out.body.as_deref(), Some("d2"));
+    }
+
+    #[tokio::test]
+    async fn reused_worker_dead_before_output_retries_on_fresh_worker() {
+        // oneshot：复用的 worker 写入成功后无输出退出（读到 EOF）——取出时它
+        // 还活着，存活检查拦不住，只能靠「产出前失败 → 新 worker 重试一次」
+        let pool = echo_pool(TransformMode::Persistent, "oneshot", |_| {});
+        pool.convert(envelope_with("o1")).await.unwrap();
+        let out = pool.convert(envelope_with("o2")).await.unwrap();
+        assert_eq!(out.body.as_deref(), Some("o2"));
+    }
+
+    #[tokio::test]
+    async fn retry_is_bounded_when_fresh_worker_also_dies() {
+        // marker 已存在时 oneshot 首行即无输出退出：重试用的新 worker 同样
+        // 失败 → 直接返回 WorkerDied，不得再拉起第三个（崩溃型 format 循环）。
+        // marker 行数 = 启动次数；外层 timeout 兜住「无限重试」形态的回归
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("spawned");
+        let pool = echo_pool(TransformMode::Persistent, "oneshot", |c| {
+            c.args = vec!["oneshot".to_string(), marker.display().to_string()];
+        });
+        pool.convert(envelope_with("first")).await.unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(15), pool.convert(envelope_with("x")))
+            .await
+            .expect("重试未收敛（疑似无限重试）")
+            .unwrap_err();
+        assert!(matches!(err, TransformError::WorkerDied), "{err:?}");
+        assert_eq!(pool.state.lock().await.idle.len(), 0);
+        let spawns = std::fs::read_to_string(&marker).unwrap().lines().count();
+        assert_eq!(spawns, 2, "应恰好：首个 worker + 重试用的 1 个新 worker");
+    }
+
+    #[tokio::test]
+    async fn fresh_worker_failure_is_not_retried() {
+        // 新 spawn 的 worker 产出前失败不重试：marker 预先存在 → 首个 worker
+        // 就起不来，直接 WorkerDied（只有「取自空闲表」的 worker 才有重试资格）
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("spawned");
+        std::fs::write(&marker, b"").unwrap();
+        let pool = echo_pool(TransformMode::Persistent, "oneshot", |c| {
+            c.args = vec!["oneshot".to_string(), marker.display().to_string()];
+        });
+        let err = pool.convert(envelope_with("y")).await.unwrap_err();
+        assert!(matches!(err, TransformError::WorkerDied), "{err:?}");
+        let spawns = std::fs::read_to_string(&marker).unwrap().lines().count();
+        assert_eq!(spawns, 1, "新 spawn 的 worker 失败不得再拉起第二个");
     }
 
     #[tokio::test]

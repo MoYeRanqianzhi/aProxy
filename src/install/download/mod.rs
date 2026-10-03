@@ -122,6 +122,95 @@ impl ChainStep {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 更新通道与选版策略（latest 解析的单一真相源：github/npm 两个查询入口与
+// CLI 的「是否需要安装」决策都以这里为准）
+// ---------------------------------------------------------------------------
+
+/// 更新通道：`latest` 在哪个版本集合里取最大。
+///
+/// 为什么要通道：正式版发布后，semver 规则下 `0.2.0-alpha.1 > 0.1.0`——若
+/// latest 不区分预发布，稳定版用户一次 `aproxy install` 就会被带到 alpha。
+/// 二进制内置的选版逻辑随版本发出就收不回，所以「默认只取稳定版」必须
+/// 内置在二进制里，而不能指望发布侧标签永远打对。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    /// 只在正式版（无预发布后缀且 GitHub 未标 prerelease）中取最大
+    Stable,
+    /// 在全部 `v*` 版本（含正式版）中取最大——预发布测试者的通道
+    Pre,
+}
+
+impl Channel {
+    /// 本次生效通道：显式 `--pre` → Pre；否则跟随当前运行版本——当前是
+    /// 预发布（alpha 测试者）默认 Pre，当前是正式版默认 Stable。跟随当前
+    /// 版本的理由：alpha 用户在 0.1.0 正式版之前仓库里没有任何稳定版，
+    /// 默认 Stable 会让他们永远「无可升级」；正式版用户则绝不应被动升到
+    /// 预发布。没有 `--stable` 反向开关：预发布用户想回正式版时显式指定
+    /// 版本号即可（降级防呆会要求 --allow-downgrade，这是有意的确认）。
+    pub fn resolve(pre_flag: bool, current: &semver::Version) -> Self {
+        if pre_flag || !current.pre.is_empty() {
+            Channel::Pre
+        } else {
+            Channel::Stable
+        }
+    }
+
+    /// 用户可见的通道名（提示文案用）
+    pub fn label(self) -> &'static str {
+        match self {
+            Channel::Stable => "stable",
+            Channel::Pre => "pre",
+        }
+    }
+}
+
+/// `latest` 解析后的处置决策（纯函数输出，CLI 据此打印与分派）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LatestDecision {
+    /// 有比当前更新的版本：安装它
+    Install(String),
+    /// 通道内最大版本不高于当前：已是最新，不重装（滚动重启全部实例的
+    /// 代价不该为「什么都没变」付出）。携带候选版本供提示
+    UpToDate(String),
+    /// 通道内一个版本都没有（典型：0.1.0 正式版之前仓库里没有任何稳定版，
+    /// 而用户在 stable 通道）：保持现状，**绝不偷偷改装预发布**——是否
+    /// 接受预发布是用户的显式选择（--pre）
+    NoneInChannel,
+}
+
+/// latest 决策：`candidate` 为通道内选出的最大版本（None = 通道为空）。
+/// 候选解析失败时原样交给安装（后续 semver 校验会给出明确错误，而不是
+/// 在这里静默吞掉一个来源异常的版本号）。
+pub fn decide_latest(current: &semver::Version, candidate: Option<&str>) -> LatestDecision {
+    let Some(c) = candidate else {
+        return LatestDecision::NoneInChannel;
+    };
+    match semver::Version::parse(c) {
+        Ok(v) if v <= *current => LatestDecision::UpToDate(c.to_string()),
+        _ => LatestDecision::Install(c.to_string()),
+    }
+}
+
+/// 降级防呆：目标版本按 semver 低于当前 → 拒绝（`allow_downgrade` 放行）。
+/// semver 预发布排序是关键：`0.1.0-alpha.17 < 0.1.0`（正式版高于同号预发布），
+/// `0.2.0-alpha.1 > 0.1.0`（预发布高于更低号的正式版——这正是 latest 必须
+/// 分通道的原因，防呆本身挡不住它）。返回解析后的目标版本。
+pub fn check_downgrade(
+    target: &str,
+    current: &semver::Version,
+    allow_downgrade: bool,
+) -> Result<semver::Version, String> {
+    let t = semver::Version::parse(target)
+        .map_err(|e| format!("版本号 {target} 非法（semver 解析失败: {e}）"))?;
+    if t < *current && !allow_downgrade {
+        return Err(format!(
+            "目标版本 {target} 低于当前 {current}。确认要降级请加 --allow-downgrade。"
+        ));
+    }
+    Ok(t)
+}
+
 /// 内置默认链（download_chain 未配置时）。
 pub fn default_chain() -> Vec<ChainStep> {
     vec![
@@ -476,6 +565,64 @@ mod tests {
             format!(
                 "https://m/0.1.0-alpha.9/aproxy-x86_64-pc-windows-msvc-v3{exe}/x86_64-pc-windows-msvc/-v3"
             )
+        );
+    }
+
+    fn v(s: &str) -> semver::Version {
+        semver::Version::parse(s).unwrap()
+    }
+
+    #[test]
+    fn channel_defaults_follow_current_version() {
+        // 当前是预发布（alpha 测试者）→ 默认 pre；正式版 → 默认 stable
+        assert_eq!(Channel::resolve(false, &v("0.1.0-alpha.17")), Channel::Pre);
+        assert_eq!(Channel::resolve(false, &v("0.1.0")), Channel::Stable);
+        // 显式 --pre 总是 pre
+        assert_eq!(Channel::resolve(true, &v("0.1.0")), Channel::Pre);
+        assert_eq!(Channel::resolve(true, &v("0.2.0-rc.1")), Channel::Pre);
+    }
+
+    #[test]
+    fn semver_prerelease_ordering_and_downgrade_guard() {
+        // 正式版高于同号预发布：alpha 用户升 0.1.0 不是降级
+        assert!(v("0.1.0") > v("0.1.0-alpha.17"));
+        assert!(check_downgrade("0.1.0", &v("0.1.0-alpha.17"), false).is_ok());
+        // 预发布按数字段比较：alpha.9 < alpha.10（不是字典序）
+        assert!(v("0.1.0-alpha.10") > v("0.1.0-alpha.9"));
+        // 0.2.0-alpha.1 > 0.1.0：防呆放行它（不算降级）——稳定版用户不被带
+        // 到 alpha 只能靠通道过滤，见 github/npm 的 pick 测试
+        assert!(v("0.2.0-alpha.1") > v("0.1.0"));
+        assert!(check_downgrade("0.2.0-alpha.1", &v("0.1.0"), false).is_ok());
+        // 真降级：拒绝，--allow-downgrade 放行
+        let err = check_downgrade("0.1.0-alpha.17", &v("0.1.0"), false).unwrap_err();
+        assert!(err.contains("--allow-downgrade"), "{err}");
+        assert!(check_downgrade("0.1.0-alpha.17", &v("0.1.0"), true).is_ok());
+        // 非法版本号：明确报错（不是 panic）
+        assert!(check_downgrade("latest-ish", &v("0.1.0"), true).is_err());
+    }
+
+    #[test]
+    fn latest_decision_matrix() {
+        let cur = v("0.1.0");
+        assert_eq!(
+            decide_latest(&cur, Some("0.1.1")),
+            LatestDecision::Install("0.1.1".into())
+        );
+        // 同版本/更低版本：已是最新（不重装、不触发降级报错）
+        assert_eq!(
+            decide_latest(&cur, Some("0.1.0")),
+            LatestDecision::UpToDate("0.1.0".into())
+        );
+        assert_eq!(
+            decide_latest(&v("0.2.0-alpha.3"), Some("0.2.0-alpha.2")),
+            LatestDecision::UpToDate("0.2.0-alpha.2".into())
+        );
+        // 通道为空：保持现状
+        assert_eq!(decide_latest(&cur, None), LatestDecision::NoneInChannel);
+        // 来源异常的版本号不静默吞掉：交给后续 semver 校验报错
+        assert_eq!(
+            decide_latest(&cur, Some("garbage")),
+            LatestDecision::Install("garbage".into())
         );
     }
 

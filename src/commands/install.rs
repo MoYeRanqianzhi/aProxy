@@ -103,9 +103,38 @@ fn effective_proxy(args: &InstallArgs) -> Option<String> {
         .or_else(|| aproxy::settings::load().download_proxy)
 }
 
-/// --skills-only：只更新 skill 文档。版本默认 latest（github 列表第一个）；
-/// settings download_chain 与 --download-proxy 与主流程同一语义。
-/// 成功后输出落位位置与「安装到 agent 目录由用户/agent 自行链接」提示。
+/// latest 查询：github（权威来源）→ 不可达/限流时 npm dist-tags 兜底
+/// （跟随 ~/.npmrc 镜像——共享出口 IP 场景 github 不可用是常态）。两级都
+/// 按同一通道选版；Ok(None) = 通道内无版本。两级皆不可达 → Err(github 的
+/// 错误，更具排查价值)。
+async fn query_latest(
+    ctx: &aproxy::install::download::DownloadCtx,
+    channel: aproxy::install::download::Channel,
+    artifact: aproxy::install::download::Artifact,
+) -> Result<Option<String>, String> {
+    println!("查询最新版本（{} 通道）...", channel.label());
+    match aproxy::install::download::github::latest_version(ctx, channel, artifact).await {
+        Ok(v) => Ok(v),
+        Err(gh_err) => {
+            match aproxy::install::download::npmpkg::latest_version(ctx, channel).await {
+                Ok(v) => {
+                    println!(
+                        "github 查询失败（{gh_err}），npm 兜底结果：{}",
+                        v.as_deref().unwrap_or("通道内无版本")
+                    );
+                    Ok(v)
+                }
+                Err(_) => Err(gh_err),
+            }
+        }
+    }
+}
+
+/// --skills-only：只更新 skill 文档。版本默认 latest（按通道取最大，同
+/// 二进制安装）；通道内无版本时取当前运行版本（skill 与在跑的二进制对齐
+/// 是最合理的退路）。settings download_chain 与 --download-proxy 与主流程
+/// 同一语义。成功后输出落位位置与「安装到 agent 目录由用户/agent 自行链接」
+/// 提示。
 async fn run_skills_only(args: &InstallArgs) {
     let home = aproxy::settings::home();
     let settings = aproxy::settings::load();
@@ -126,21 +155,22 @@ async fn run_skills_only(args: &InstallArgs) {
     };
     let version = match args.version.as_deref() {
         None | Some("latest") => {
-            println!("查询最新版本...");
-            match aproxy::install::download::github::latest_version(&ctx).await {
-                Ok(v) => v,
+            let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("内置版本号必为合法 semver");
+            let channel = aproxy::install::download::Channel::resolve(args.pre, &current);
+            match query_latest(&ctx, channel, aproxy::install::download::Artifact::Skills).await {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    println!(
+                        "{} 通道暂无可用版本，skill 按当前版本 {current} 更新。",
+                        channel.label()
+                    );
+                    current.to_string()
+                }
                 Err(gh_err) => {
-                    match aproxy::install::download::npmpkg::latest_version(&ctx).await {
-                        Ok(v) => {
-                            println!("github 查询失败（{gh_err}），npm 兜底命中 {v}");
-                            v
-                        }
-                        Err(_) => {
-                            eprintln!("[ERROR] {gh_err}");
-                            eprintln!("可尝试：--skills-only <具体版本号>（跳过 latest 查询）。");
-                            std::process::exit(1);
-                        }
-                    }
+                    eprintln!("[ERROR] {gh_err}");
+                    eprintln!("可尝试：--skills-only <具体版本号>（跳过 latest 查询）。");
+                    std::process::exit(1);
                 }
             }
         }
@@ -186,28 +216,47 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         }
     };
 
-    // 版本解析：latest = GitHub Releases 最新（列表第一个，<1.0 含
-    // prerelease）；github API 限流/不可达时兜底 npm dist-tags.latest
-    // （跟随 ~/.npmrc 镜像——共享出口 IP 场景 github 不可用是常态）
+    // 版本解析：latest = 通道内 semver 最大的主线版本（stable 只取正式版，
+    // pre 含预发布；默认通道跟随当前版本，见 Channel::resolve）。latest 不
+    // 高于当前 → 已是最新，不重装；通道为空 → 保持现状，绝不跨通道偷装
+    // 预发布（是否接受预发布是用户的显式选择 --pre）
+    let current =
+        semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("内置版本号必为合法 semver");
     let target = match args.version.as_deref() {
         None | Some("latest") => {
-            println!("查询最新版本...");
-            match aproxy::install::download::github::latest_version(&ctx).await {
-                Ok(v) => v,
+            use aproxy::install::download::{Artifact, Channel, LatestDecision, decide_latest};
+            let channel = Channel::resolve(args.pre, &current);
+            let candidate = match query_latest(&ctx, channel, Artifact::Binary).await {
+                Ok(c) => c,
                 Err(gh_err) => {
-                    match aproxy::install::download::npmpkg::latest_version(&ctx).await {
-                        Ok(v) => {
-                            println!("github 查询失败（{gh_err}），npm 兜底命中 {v}");
-                            v
-                        }
-                        Err(_) => {
-                            eprintln!("[ERROR] {gh_err}");
-                            eprintln!(
-                                "可尝试：install <具体版本号>（跳过 latest 查询），或 --download-proxy <URL> 更换出口。"
-                            );
-                            std::process::exit(1);
-                        }
+                    eprintln!("[ERROR] {gh_err}");
+                    eprintln!(
+                        "可尝试：install <具体版本号>（跳过 latest 查询），或 --download-proxy <URL> 更换出口。"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            match decide_latest(&current, candidate.as_deref()) {
+                LatestDecision::Install(v) => v,
+                LatestDecision::UpToDate(latest) => {
+                    println!(
+                        "已是最新：当前 {current}，{} 通道最新为 {latest}，无需安装。",
+                        channel.label()
+                    );
+                    if channel == Channel::Stable {
+                        println!("（如需预发布版本，可加 --pre）");
                     }
+                    return;
+                }
+                LatestDecision::NoneInChannel => {
+                    println!(
+                        "{} 通道暂无可用版本，保持当前 {current} 不变。",
+                        channel.label()
+                    );
+                    if channel == Channel::Stable {
+                        println!("（如需预发布版本，可加 --pre）");
+                    }
+                    return;
                 }
             }
         }
@@ -220,21 +269,12 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     ctx.version = target.clone();
 
     // 降级防呆：target < 当前运行版本 → 拒绝（--allow-downgrade 放行）。
-    // semver 比较：prerelease 语义 alpha.9 < alpha.10 与 0.2.0 > 0.1.0-x
-    let current =
-        semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("内置版本号必为合法 semver");
-    match semver::Version::parse(&target) {
-        Ok(t) if t < current && !args.allow_downgrade => {
-            eprintln!(
-                "[ERROR] 目标版本 {target} 低于当前 {current}。确认要降级请加 --allow-downgrade。"
-            );
-            std::process::exit(1);
-        }
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("[ERROR] 版本号 {target} 非法（semver 解析失败: {e}）");
-            std::process::exit(1);
-        }
+    // latest 路径经 decide_latest 已保证高于当前，这里主要拦显式指定的版本号
+    if let Err(e) =
+        aproxy::install::download::check_downgrade(&target, &current, args.allow_downgrade)
+    {
+        eprintln!("[ERROR] {e}");
+        std::process::exit(1);
     }
 
     // 下载链条：产物落 staging/<版本>/（与 --from 的备料同一位置）

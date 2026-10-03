@@ -161,6 +161,7 @@ pub(crate) enum Commands {
     /// （逐实例滚动重启，任一时刻至多一个实例在重启）。`upgrade` 为其别名。
     /// 在线安装走下载链条（github → npm → cargo-binstall → cargo，可配
     /// settings 的 download_chain/url 模板与 --download-proxy）；中断自动续作。
+    /// 某实例在新版本下起不来时用旧二进制把它拉回并中止滚动（命令返回非零）。
     Install(InstallArgs),
 
     /// `aproxy install` 的别名（可发现性）
@@ -173,9 +174,10 @@ pub(crate) enum Commands {
 /// `aproxy install` 的参数集。
 #[derive(clap::Args, Debug, Clone, PartialEq)]
 pub(crate) struct InstallArgs {
-    /// 安装目标版本：`latest`（默认，GitHub Releases 最新，含 prerelease）
-    /// 或具体版本号（如 0.1.0-alpha.9）。默认拒绝降级（--allow-downgrade
-    /// 放行）。与 --from/--adopt 互斥。
+    /// 安装目标版本：`latest`（默认，按更新通道取最大版本——stable 通道只取
+    /// 正式版，pre 通道含预发布；通道见 --pre）或具体版本号（如
+    /// 0.1.0-alpha.9）。latest 不高于当前版本时提示「已是最新」不重装。
+    /// 默认拒绝降级（--allow-downgrade 放行）。与 --from/--adopt 互斥。
     #[arg(value_name = "VERSION", conflicts_with_all = ["from", "adopt", "abort"])]
     pub(crate) version: Option<String>,
 
@@ -203,6 +205,13 @@ pub(crate) struct InstallArgs {
     /// 允许降级安装（目标版本 < 当前已安装版本时默认拒绝）
     #[arg(long)]
     pub(crate) allow_downgrade: bool,
+
+    /// latest 走预发布通道：在全部版本（含正式版与 alpha/beta/rc 预发布）
+    /// 中取最大。不加时通道跟随当前版本——当前是预发布则默认即为预发布
+    /// 通道，当前是正式版则只取正式版（不会被带到预发布）。只影响 latest
+    /// 解析，指定具体版本号时无作用。
+    #[arg(long, conflicts_with_all = ["from", "adopt", "abort"])]
+    pub(crate) pre: bool,
 
     /// 仅本次下载使用的代理 URL（与 config.toml 的请求代理绝对分离）；
     /// 未指定时用 settings 的 download_proxy，再未配置则走系统环境代理

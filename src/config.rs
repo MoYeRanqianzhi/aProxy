@@ -5,6 +5,7 @@
 //! - `extra_headers`：仅当上游请求未携带该头时追加
 //! - `override_headers`：无条件覆盖（用于非 Bearer 鉴权或额外头）
 //! - `keepalive_interval_secs`：流式重试期间的保活心跳间隔，0 表示关闭
+//! - `keepalive_trigger`：哪些请求走保活通道（看 Accept 头 / 请求体 stream:true / 任一）
 //! - `proxy`：上游请求经配置的代理转发（与常见代理配置一致，支持 http/https/socks5，
 //!   可在 URL 内嵌 user:pass，也可用 `proxy_username`/`proxy_password` 单独指定）；
 //!   未配置时保留 reqwest 默认的系统代理（读取 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 环境变量）

@@ -2236,9 +2236,12 @@ async fn proxy_with_keepalive(
             // 走到这里 = 需要重试（或受限路径达上限）。尚未提交则立即提交骨架：
             // 接下来的退避与重试期间只能靠心跳维持连接（与旧保活通道「首轮失败
             // 即返回骨架」一致）
-            if !sink.is_committed() && !sink.commit_skeleton() {
-                sink.log_client_gone("提交骨架");
-                return;
+            if !sink.is_committed() {
+                tracing::info!(attempt, "需要重试，先提交骨架头（保活通道）");
+                if !sink.commit_skeleton() {
+                    sink.log_client_gone("提交骨架");
+                    return;
+                }
             }
             if let Some(status) = bounded_exhausted {
                 // 终态 error 事件：客户端明确感知代理放弃了这条请求，而非永远等

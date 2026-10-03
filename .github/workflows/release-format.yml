@@ -32,6 +32,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Linux gnu 产物能运行的最低 glibc，含义与约束同 release.yml 的同名变量：
+  # 必须与 scripts/install.sh、npm/aproxy/bin/aproxy.js 的 MIN_GLIBC 一致
+  # （aproxy.js 是 @meowo/aproxy 与 @meowo/aproxy-format 两组共用的转发器）。
+  GNU_GLIBC_FLOOR: "2.28"
 
 jobs:
   test-format:
@@ -86,16 +90,19 @@ jobs:
             variant: ""
             rustflags: ""
             ext: .exe
+          # zigbuild: true：gnu 产物用 cargo-zigbuild 按 GNU_GLIBC_FLOOR 链接
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             variant: ""
             rustflags: ""
             ext: ""
+            zigbuild: true
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             variant: "-v3"
             rustflags: "-C target-cpu=x86-64-v3"
             ext: ""
+            zigbuild: true
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             variant: ""
@@ -107,6 +114,7 @@ jobs:
             variant: ""
             rustflags: ""
             ext: ""
+            zigbuild: true
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             variant: ""
@@ -132,6 +140,14 @@ jobs:
       - name: Install musl toolchain
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # 与 release.yml 同款：zig 当链接器按 glibc 下限链接；版本钉死，升级须重新实测
+      - name: Install cargo-zigbuild
+        if: matrix.zigbuild
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/zigbuild" \
+            cargo-zigbuild==0.23.4 ziglang==0.16.0
+          echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"
+          echo "CARGO_ZIGBUILD_ZIG_PATH=$RUNNER_TEMP/zigbuild/ziglang/zig" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -162,10 +178,49 @@ jobs:
           print("aproxy-format version ->", v)
           EOF
       - name: Build
+        if: ${{ !matrix.zigbuild }}
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         # -p aproxy-format：只构建示例二进制（workspace 内其余成员不进产物）
         run: cargo build --release --locked --target ${{ matrix.target }} -p aproxy-format
+      - name: Build (cargo-zigbuild, glibc floor)
+        if: matrix.zigbuild
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo zigbuild --release --locked --target "${{ matrix.target }}.${GNU_GLIBC_FLOOR}" -p aproxy-format
+      # glibc 断言与 release.yml 的同名步骤是同一段脚本（原理见那里的注释），
+      # 改动须同步。aproxy-format 没有 --version：不带参数运行会打印用法并以 1
+      # 退出，能看到用法文字就说明加载器已正常装载产物。
+      - name: Assert glibc floor
+        if: matrix.zigbuild
+        shell: bash
+        env:
+          BIN: target/${{ matrix.target }}/release/aproxy-format
+        run: |
+          set -euo pipefail
+          names=$(objdump -p "$BIN" | grep -oE 'GLIBC_[A-Za-z0-9_.]+' | sort -u || true)
+          if [ -z "$names" ]; then
+            echo "::error::$BIN 未引用任何 GLIBC_ 符号版本，不像 glibc 动态链接产物"
+            exit 1
+          fi
+          echo "$BIN 的 glibc 版本需求：$(tr '\n' ' ' <<<"$names")"
+          odd=$(printf '%s\n' "$names" | grep -vE '^GLIBC_[0-9]+(\.[0-9]+)*$' || true)
+          if [ -n "$odd" ]; then
+            echo "::error::$BIN 含非数字的 glibc 版本需求：$(tr '\n' ' ' <<<"$odd")"
+            exit 1
+          fi
+          max=$(printf '%s\n' "$names" | sed 's/^GLIBC_//' | sort -V | tail -n 1)
+          top=$(printf '%s\n%s\n' "$max" "$GNU_GLIBC_FLOOR" | sort -V | tail -n 1)
+          if [ "$top" != "$GNU_GLIBC_FLOOR" ]; then
+            echo "::error::$BIN 需要 GLIBC_$max，高于约定下限 GLIBC_$GNU_GLIBC_FLOOR"
+            exit 1
+          fi
+          echo "最高 GLIBC_$max <= 下限 GLIBC_$GNU_GLIBC_FLOOR：通过"
+          out=$("$BIN" 2>&1 < /dev/null || true)
+          case "$out" in
+            *用法*) echo "试跑通过：$out" ;;
+            *) echo "::error::$BIN 试跑失败：$out"; exit 1 ;;
+          esac
       - name: Stage asset
         shell: pwsh
         env:

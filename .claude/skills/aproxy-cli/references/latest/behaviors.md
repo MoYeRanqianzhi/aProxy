@@ -8,6 +8,7 @@
 - [请求生命周期](#请求生命周期)
 - [重试判定](#重试判定)
 - [保活心跳](#保活心跳)
+- [接入 Claude Code](#接入-claude-code)
 - [流式响应处理](#流式响应处理)
 - [磁盘缓存（spool）](#磁盘缓存spool)
 - [仅转发模式（forward_only）](#仅转发模式forward_only)
@@ -35,9 +36,12 @@
              （body/headers/url/method 全可变；改写产物贯穿后续全部重试）
          3. 上游响应缓冲到内存/磁盘 spool
          4. 判定成功/需重试（见下）
-            需重试 → 退避后从第 2 步重来（请求体可重放），同时向客户端发心跳
+            需重试 → 退避后从第 2 步重来（请求体可重放）
             成功   → 配了 response_transform 则先交给 format 改写响应，
                      然后把响应回放给客户端
+         保活适用的请求（见「保活心跳」）在 3~4 全程由保活通道驱动：先提交响应头，
+         等待/缓冲/退避期间向客户端发 SSE 注释心跳；不适用的请求期间不向客户端
+         写任何字节
 
 仅转发模式（forward_only = true）：
          1. 不缓冲——请求体流式直发上游（途中计数，超 max_body_mb 即中止上游 + 413）
@@ -77,7 +81,7 @@
 动机：部分上游对特定端点确定性报错（哪些端点**完全因上游而异**，因此交由
 用户按自己的上游配置，aProxy 不内置任何 URL），重试到天荒地老也不可能成功，
 只会让客户端永远等不到终态——错误秒回时客户端反而能自行处理。保活通道下
-上限触发时以终态 SSE error 事件收场（骨架 200 已发出，真实状态码无法再回放）。
+上限触发时以终态 SSE error 事件收场（响应头已提交，真实状态码无法再回放）。
 
 **不重试**（确定性失败，原样回放）：
 
@@ -94,13 +98,69 @@
 
 ## 保活心跳
 
-上游在重试中时，aProxy 向客户端的**流式**连接按 `keepalive_interval_secs`
-（默认 15s）发送 SSE 注释行（`: keepalive`）——SSE 规范中注释行被客户端忽略，
-但让中间层（Nginx/浏览器/agent 客户端）知道连接活着，不触发读超时。
+保活适用的请求，aProxy 向客户端按 `keepalive_interval_secs`（默认 15s）发送 SSE
+注释行（`: keepalive`）——SSE 规范中注释行被客户端忽略，但让中间层
+（Nginx/浏览器/agent 客户端）知道连接活着，不触发读超时。
 
-- 只对流式响应生效；非流式请求没有可注入的通道——客户端应为此类请求配置
-  足够大的 HTTP 读超时（重试可能长达退避封顶的数倍时间）。
-- 0 = 关闭心跳（不推荐：长退避时客户端/中间层会主动断连）。
+**哪些请求适用**：`keepalive_interval_secs` > 0、非 `forward_only`，且按
+`keepalive_trigger` 命中（`accept`：Accept 含 `text/event-stream`；`body_stream`：
+请求体顶层 `"stream": true`；`any`（默认）：任一）。判定在请求转换之前、按客户端
+视角。
+
+**提交点（三态）**：适用的请求从首轮起由保活通道驱动，响应头的提交只发生一次：
+- 上游 2xx + 未压缩的 `text/event-stream`（且没配 `response_transform`）→ **立即**
+  把上游真实 status 与响应头转给客户端（去掉 content-length 与 hop-by-hop）；
+- 一个保活间隔内上游仍没给出可提交的结果，或首轮就需要重试 → 提交**骨架头**
+  （200 + `text/event-stream`）；配了 `response_transform` 时不提交上游真实头，
+  只走骨架；
+- 提交之前首轮就成功完成 → 走与不保活相同的保真快速路径（status/头原样）。
+
+**心跳全程覆盖**：提交之后，无论在等上游响应头（首字节）、上游请求在途、缓冲上游
+流还是退避，都按间隔发注释心跳。响应体仍是**缓冲完整、校验无误后才回放**成功
+那一次的原样字节——流中途出错就在同一个响应里继续重试，客户端只见到心跳，失败
+尝试的数据不会混入。客户端断开（任一阶段）即中止在途上游请求、不再发起新请求。
+
+- **上游编码**：保活适用的请求发往上游时 `accept-encoding` 一律改为 `identity`
+  （往压缩流里插明文心跳会让客户端解压失败）——对「完全透传」的有意例外；上游
+  无视该要求仍压缩时不提交真实头，等间隔到点提交骨架。不适用保活的请求不改写。
+- **没有保活通道的请求**：`"stream": false` 的普通请求没有可注入心跳的响应流——
+  首字节延迟 = 完整生成时长，客户端需自行配置足够大的 HTTP 超时（重试可能长达
+  退避封顶的数倍时间）；`forward_only` 实例同样没有。
+- 0 = 关闭保活（不推荐：长退避时客户端/中间层会主动断连）。
+- **客户端长等待后断开的日志提示**：已提交的响应等待 ≥590 秒后客户端断开，守护
+  日志会 warn 一条提示「若客户端是 Claude Code，请设置
+  CLAUDE_STREAM_IDLE_TIMEOUT_MS」（只是日志文案，行为对任何客户端都一样）。
+
+## 接入 Claude Code
+
+Claude Code 经 `ANTHROPIC_BASE_URL` 指向 aProxy，且**必须**设置
+`CLAUDE_STREAM_IDLE_TIMEOUT_MS`：
+
+```sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:12345      # aProxy 的监听端口
+export CLAUDE_STREAM_IDLE_TIMEOUT_MS=86400000          # 24 小时，实测可用
+```
+
+PowerShell 用 `$env:ANTHROPIC_BASE_URL = "..."`。也可写进 Claude Code 的
+`~/.claude/settings.json` 的 `env` 字段（Claude Code 官方设置文档支持该字段，
+对每个会话生效）：
+`{"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:12345", "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "86400000"}}`。
+
+**原因**（Claude Code 2.1.288 黑盒实测，2026-10-04）：aProxy 为保证「流中途断开
+也能透明重试」，会缓冲完整响应再回放，等待期间只发 SSE 注释心跳。Claude Code 有
+三层流超时：首字节（约 360s）与字节级空闲（300s）能被注释心跳覆盖；**事件级空闲
+（默认 600s）覆盖不了**——注释与 `event: ping` 都不算事件，只有真实事件会重置它。
+不设该变量，任何超过 10 分钟的重试期或长生成都会被 Claude Code 断开并重发
+（aProxy 随之按计费保护中止上游）。`CLAUDE_STREAM_IDLE_TIMEOUT_MS=86400000` 实测
+有效（780s 仍存活）；`API_TIMEOUT_MS` **不控制**这道闸。伪造协议事件不是 aProxy 的
+做法。其他版本的默认值以 Claude Code 官方文档为准；其他 agent 客户端未测。
+
+- Claude Code 的流式主请求是 `POST /v1/messages?beta=true`，`Accept:
+  application/json` + 请求体 `"stream": true`——默认 `keepalive_trigger = "any"`
+  才能让它进入保活通道（只配 `accept` 会让它失去保活）。
+- `"stream": false` 的请求没有保活通道，客户端需自行调大 `API_TIMEOUT_MS`。
+- aProxy 配了 `api_key` 时会同时覆盖 `Authorization` 与 `x-api-key`。
+- Claude Code 不发 `Origin`、Host 为 `127.0.0.1:端口`，不受入站来源校验影响。
 
 ## 流式响应处理
 
@@ -201,9 +261,9 @@ aProxy 侧行为语义）。
   不进信封（aProxy 按实际字节回填）；多值头仅保留首值（warn 留痕）；format
   输出的非法头名/头值丢弃 + warn；非法 method 同样 warn + 沿用原方法。
   响应侧强制剔除 content-length 与 content-encoding（字节已变换，旧声明
-  失真）。**保活通道例外**：SSE 骨架（200 + text/event-stream）先行发出，
-  状态行与响应头不可再改——保活通道下 format 对响应 headers 的改写不生效，
-  仅 body 转换生效。
+  失真）。**保活通道例外**：响应头一旦提交（保活适用的请求，配了
+  `response_transform` 时提交的是 200 + text/event-stream 骨架）状态行与响应头
+  不可再改——保活通道下 format 对响应 headers 的改写不生效，仅 body 转换生效。
 - **command 支持 `~/` 展开**：`request_transform`/`response_transform` 的
   command 在加载时做 `~` 前缀展开（`~/.aproxy/bin/aproxy-format` 可直接
   使用）。
@@ -323,6 +383,19 @@ IPC 通道故障（启动失败）只影响管理命令，代理转发继续（�
   故障），install 会先按轮次 restart 收敛（顺带拉到安装器版本）；终失败则
   abort 安装并明确指出问题实例——**不强杀**（绝对避免服务中断）。skill 指引：
   将该实例关闭后重试安装
+- **滚动重启失败时的服务回滚**：某实例被优雅停止后，新二进制若起不来（新版本对
+  旧配置校验更严、被杀软拦截、8 秒内没就绪），install 会先把该实例的恢复参数
+  回写进 `.restore`，再用**旧二进制**按原参数把它拉回，并中止滚动——其余实例
+  不再动，install 以非零退出（实例保持旧版本、服务恢复）。回滚的只是这一个
+  实例的服务：bin 里的新二进制与状态机阶段都不回退（阶段落 `failed`，原因在
+  `install.state` 的 `last_error`），自动续作也不会再重试；排除原因（看
+  startup.log）后重新执行 `aproxy install` 继续向前。旧二进制拉回也失败时，
+  实例下线但 `.restore` 已保住，排除原因后 `aproxy restore` 恢复。
+- **旧二进制的位置**：交换前保留的旧二进制是回滚用的——Windows 为
+  `bin/aproxy.old.exe`（也是入口脚本的 fallback），unix 为 `bin/aproxy.old`
+  （交换前硬链接或复制）；安装完成后的清理阶段删除（Windows 上被运行中的
+  镜像锁住时保留到下次）。Windows 上交棒后滚动由续作进程完成，回滚结果看
+  `install.state` 与 `aproxy status`，不看命令的退出码。
 
 ## skill 文档更新（install 支线）
 
@@ -351,7 +424,9 @@ install.state 的 `skill` 字段可查。`--skills-only` 单独更新。安装�
 | status 看到实例但 stop 说无响应 | 实例已死注册表未清——按提示 taskkill；下次版本会自清 |
 | `stop` 要求指定端口 | 多实例安全机制：先 `aproxy status` 再指定端口/别名/all |
 | 客户端等很久才收到回复 | 正常——上游在重试，心跳在维持连接；`aproxy logs <端口或别名>` 看重试原因 |
-| 客户端非流式请求超时 | 非流式无心跳通道：调大客户端 HTTP 超时或调小 max_retry_backoff_secs |
+| 客户端非流式请求超时 | `"stream": false` 的请求没有保活通道（没有可注入心跳的响应流）：调大客户端 HTTP 超时或调小 max_retry_backoff_secs |
+| Claude Code 等待约 10 分钟后自行断开/重发请求（日志有「客户端在已提交的响应上等待约 N 秒后断开」） | 未设 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`：Claude Code 的事件级空闲超时（默认 600s）不被注释心跳重置。设为 `86400000`（shell 环境变量或 `~/.claude/settings.json` 的 `env`），详见本文「接入 Claude Code」；`API_TIMEOUT_MS` 不控制这道闸 |
+| 流式请求没有心跳 / 首字节等很久 | 看 `keepalive_trigger`：只配了 `accept` 时，Accept 不含 `text/event-stream` 的流式请求（如 Claude Code）进不了保活通道；默认 `any` 同时认请求体 `"stream": true`。`aproxy config --show` 核对生效值 |
 | Claude Code /compact 无限卡住/超时（走非官方 API） | 上游（聚合/镜像服务常见）未实现 compact 依赖的 `POST /v1/messages/count_tokens`，确定性 404 被无限重试、客户端永远等不到终态。解决：该实例 toml 的 `bounded_retry_paths` 加 `'/v1/messages/count_tokens\?.*'`（或客户端实际使用的确切路径），`aproxy restart <端口或别名>` 生效——失败 3 次即透传真实响应。其他 agent 软件/其他端点的同类问题同理 |
 | 日志刷「受限重试路径达到尝试上限，透传最后一次上游响应」 | 该请求命中 `bounded_retry_paths`：失败 3 次即透传，属预期行为；不想受限就从配置移除对应模式并 restart |
 | 客户端收到 403，文案提到 `allowed_origins` / `allowed_hosts` | 入站来源校验拒绝了请求（未转发上游）：浏览器/Electron 类客户端会发 `Origin`，默认全部拒绝。把文案里的 Origin（或主机名）原样加入 toml 的 `allowed_origins`（或 `allowed_hosts`），`aproxy restart <端口或别名>`；信任场景可写 `["*"]` 关闭该项校验。守护日志有「入站请求被拒绝」warn |

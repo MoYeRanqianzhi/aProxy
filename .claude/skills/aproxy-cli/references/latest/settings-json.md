@@ -31,6 +31,7 @@
 | `bounded_retry_paths` | string[] | `[]` | 手编（进阶；toml 可按实例覆盖） |
 | `allowed_hosts` | string[] | `[]` | 手编（进阶；toml 可按实例覆盖） |
 | `allowed_origins` | string[] | `[]` | 手编（进阶；toml 可按实例覆盖） |
+| `keepalive_trigger` | string | `"any"` | 手编（进阶；toml 可按实例覆盖） |
 | `watchdog` | bool | true | 看门狗总开关 |
 | `watchdog_heartbeat_secs` | u64 | 30 | 看护扫描周期（调优） |
 | `watchdog_stale_after_cycles` | u64 | 1 | 挂死容忍周期数（误杀调节阀） |
@@ -110,6 +111,14 @@
 请求，`"*"` 关闭校验）。完整语义见 config-toml.md 的
 `allowed_hosts / allowed_origins` 节。
 
+### keepalive_trigger（全局默认层）
+
+`config.toml` 未显式写 `keepalive_trigger` 的实例取此值（内置默认 `"any"`）：
+`"accept"`（Accept 含 `text/event-stream`）/ `"body_stream"`（请求体顶层
+`"stream": true`）/ `"any"`（任一）。toml 显式值优先。非法取值由
+`aproxy doctor` 报 error，以它为全局默认的实例启动失败。语义见 config-toml.md 的
+`keepalive_interval_secs / keepalive_trigger` 节。
+
 ### watchdog（及四个 watchdog_* 调优字段）
 
 看门狗是**系统级单例**（一个全局看护进程看护全部实例），
@@ -153,10 +162,10 @@ install 下载专用代理（与 config.toml 的 `proxy` 上游请求代理**绝
 ## 与 config.toml 的分层关系
 
 只有 `max_body_mb`、`disk_cache`、`forward_only`、`bounded_retry_paths`、
-`allowed_hosts` 与 `allowed_origins` 存在三层优先级：
+`allowed_hosts`、`allowed_origins` 与 `keepalive_trigger` 存在三层优先级：
 
 ```
-config.toml 显式值  >  settings.json 值  >  内置默认 (128 / true / false / [] / [] / [])
+config.toml 显式值  >  settings.json 值  >  内置默认 (128 / true / false / [] / [] / [] / "any")
 ```
 
 其余字段是「toml 显式值 > 内置默认」或完全归 settings 管理（本文件全部字段）。

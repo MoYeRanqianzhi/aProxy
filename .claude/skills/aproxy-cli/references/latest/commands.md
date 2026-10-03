@@ -229,6 +229,7 @@ format 程序编写见 aproxy-format skill）。`--show` 对转换器的 `args` 
 
 ```
 aproxy install [latest|版本]        # 在线安装：下载链条 github→npm→cargo-binstall→cargo
+aproxy install --pre                # latest 走预发布通道（含 alpha/beta/rc）
 aproxy install --from <二进制路径>   # 从本地文件安装（--version 自报版本即目标）
 aproxy install --adopt              # 收编：包管理器/npm 装的 aProxy 迁到标准位置
 aproxy install --abort              # 中止进行中的安装（仅交换开始前可回滚）
@@ -237,12 +238,30 @@ aproxy install --skills-only        # 只更新 skill 文档，不动二进制
 
 参数：
 - `--variant v3|baseline`：手动指定指令集变体（默认运行时检测 AVX2）
+- `--pre`：`latest` 走预发布通道（见下「更新通道」）；只影响 `latest` 解析，指定
+  具体版本号时无作用；与 `--from`/`--adopt`/`--abort` 互斥
 - `--allow-downgrade`：目标版本低于当前时默认拒绝，此开关放行
 - `--download-proxy <URL>`：仅本次下载用的代理（**与 config.toml 的请求代理
   绝对分离**——后者管上游转发，前者只管 install 下载）
 - `--no-skills`：本次跳过 skill 文档更新（全局开关 settings 的 skill_auto_update）
 
-版本语义：`latest` = GitHub Releases 最新（<1.0 时代含 prerelease）。目标版本
+**更新通道**：`latest` 在「通道」内取 semver 最大者（按版本号，不按创建时间）。
+- **stable 通道**只取正式版（无预发布后缀，且 GitHub 未标 prerelease）；**pre 通道**
+  在全部版本（含正式版与 alpha/beta/rc）中取最大。
+- 默认通道**跟随当前版本**：当前是预发布（如 alpha.17）→ 默认即 pre 通道；当前是
+  正式版 → stable 通道，不会被动带到预发布。`--pre` 显式切到 pre 通道；没有
+  `--stable` 反向开关，预发布用户想回正式版时显式指定版本号（降级防呆需
+  `--allow-downgrade`）。
+- 只认项目版本号文法 `vX.Y.Z` 与 `vX.Y.Z-(alpha|beta|rc).N`：`format-v*` 发版线、
+  历史测试 tag（如 `v0.1.0-alpha.12t3`，semver 排序下反而高于 alpha.17）与 draft
+  一律不参与；release 必须已含本平台二进制资产（先建 release 后传资产，资产
+  未齐的跳过）。npm 渠道兜底按 dist-tags：stable 读 `latest`（它本身是预发布时
+  视为无稳定版），pre 取 `latest` 与 `next` 中较大者。
+- 通道内最大版本不高于当前 → 提示「已是最新」不重装（退出 0）；通道内没有任何版本
+  （典型：0.1.0 正式版之前仓库里没有稳定版而用户在 stable 通道）→ 提示「暂无可用
+  版本」保持现状，**绝不偷偷改装预发布**，需要请加 `--pre`。
+
+版本语义：`latest` 按上面的通道解析。目标版本
 经下载链条获取后先 `--version` 试跑自证（自报必须等于目标），再走交换；
 github 渠道另有 `.sha256` 强校验、npm 渠道有 registry integrity 校验。
 
@@ -271,6 +290,10 @@ CDN 可自行填入；代码不内置任何 CDN 域名）。未配置 = 内置�
 
 `--abort` 仅在二进制交换**开始前**可完全回滚；此后只进不退（实例可能已开始
 滚动），中断的安装会自动续作完成。
+
+**滚动重启失败的服务回滚**：某实例在新版本下起不来时，install 用旧二进制按原
+参数把它拉回、中止滚动（其余实例不动）并以非零退出；阶段落 `failed` 保留现场，
+排除原因后重新执行 `aproxy install` 继续。细节见 behaviors.md「二进制更换阶段」。
 
 **手动修复（最后防线，仅 CLI 全失效时）**——swapping 空窗（bin 里只剩
 `aproxy.old.exe`）时所有 aproxy 命令无处可落，按序尝试（全部是文件操作）：

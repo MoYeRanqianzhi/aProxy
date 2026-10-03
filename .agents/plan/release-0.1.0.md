@@ -98,13 +98,22 @@
   让 install.cmd 以 CRLF 入库）；WS-2 已合并（e60de76）；WS-1a、WS-3、WS-4 进行中
   （WS-4 曾因账户并发上限 409 中断，已续跑）
 - [x] WS-1a 已合并（64aeaf2；真实 Claude Code 不发 Origin、Host 为 127.0.0.1:端口，已核对抓包）；WS-3 已合并（5c71f35，进程身份改为 pid + 创建时间，旧记录保守不误杀）
-- [ ] 第 2 波：WS-5a、WS-1b（基于 64aeaf2）进行中；WS-4 进行中
-- 合并后由主代理收尾：cli.rs `--force` 帮助文字仍写「验证镜像名」（WS-4 合并后改）；Linux 专属 clippy 问题 tests/install_flow.rs:11 未使用 Instant、tests/proxy_integration.rs:4030 zombie_processes（WS-5a 加 ubuntu clippy 门禁前必须修）；.agents/memory/2026-09-10-identity-no-name.md 更新为「方案 A 已实施」，stash@{0} 草稿由用户决定是否丢弃
-- 并发纪律：账户级上限 8 个并发请求、跨会话共享，主循环也算一个——后台代理同时
-  最多 4 个
-- 待办（来自代理报告）：doctor 单测在未设 APROXY_HOME 时只读扫描真实 ~/.aproxy
-  （测试隔离漏洞，doctor.rs 归 WS-1a 之后处理）；aproxy-format 需发 format 新版本
-  才能让 transform-03 生效；.agents/memory/2026-09-23-transform-format.md 需按 WS-2
-  报告更新（format-echo 子命令、stdout 同步不变量）
-- [ ] 第 3 波：WS-6 + 全量验证 + 无限重试验收
+- [x] 第 2 波：WS-4（a171cdf）、WS-5a（d5f56b9）、WS-1b（b9b1f7d）已合并；主代理收尾项
+  （--force 帮助文字、Linux clippy 两处、identity-no-name 记忆）已完成。stash@{0} 草稿
+  仍待用户决定是否丢弃
+- [x] 选版只认项目版本号文法（0dc9440）：历史测试 tag alpha.12t3 按 semver 胜过 alpha.17，
+  Rust 侧与三脚本统一修复；脚本在 gawk / dash+mawk / busybox / PS 5.1 / pwsh 7 / cmd 实测
+- [x] install.ps1 不能加 BOM（688bbbd）：BOM 让 irm | iex 的 param 块失效（5.1/7 实测），
+  5.1 本地 -File 解析失败作为已知限制写入文档
+- [x] 第 3 波文档：WS-6 两轮已合并（d481ba7、9c0ba4b），主代理修正选版措辞、macOS 状态、
+  开发命令（b45a399）
+- [x] Windows `cargo test --workspace --locked` 全绿（2026-10-04）：日志脱敏测试并行跑
+  捕获为空是 tracing-core 单 Dispatch 快速路径所致，WS-1a 时就存在，已修（cf81486）
+- [ ] WS-1b 独立对抗审查（ws1b-review 代理进行中）→ 按结论修复
+- [ ] 真实 Claude Code 无限重试验收（>600s）进行中。故障时间线：529 → 断连 →
+  200+error JSON → SSE 半截断开 → SSE error 事件 → 500 → 挂起 120s → 503 → 529… →
+  距首请求 640s 后成功且慢速生成 140s
+- [ ] ssh remote 全新目录全量；Linux gnu 产物 glibc 下限核对
 - [ ] 合并后审查与修复
+- 待办：aproxy-format 需发 format 新版本才能让 transform-03 生效；doctor 测试不隔离
+  主目录（未进 0.1.0，见 TODO）

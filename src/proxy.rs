@@ -431,12 +431,35 @@ impl SpoolBuffer {
     }
 
     /// 收集完成：内存 → SpooledBody::Memory（重试判定走整体扫描旧路径，
-    /// disk_scan=None）；磁盘 → 关写句柄产出 SpooledBody::Disk +（增量扫描
-    /// 结论, 头部快照）。消费 scanner。
-    async fn finish(self, scanner: StreamErrorScanner) -> (SpooledBody, Option<(bool, Vec<u8>)>) {
+    /// disk_scan=None）；磁盘 → flush 后关写句柄产出 SpooledBody::Disk +
+    /// （增量扫描结论, 头部快照）。消费 scanner。
+    ///
+    /// Err = 磁盘模式收尾 flush 失败（磁盘满/IO 故障），调用方按 SpoolFailed
+    /// 处理；半截文件已在此删除。
+    async fn finish(
+        self,
+        scanner: StreamErrorScanner,
+    ) -> Result<(SpooledBody, Option<(bool, Vec<u8>)>), String> {
         match self {
-            SpoolBuffer::Memory(mem) => (SpooledBody::Memory(Bytes::from(mem)), None),
-            SpoolBuffer::Disk { file, path, len } => {
+            SpoolBuffer::Memory(mem) => Ok((SpooledBody::Memory(Bytes::from(mem)), None)),
+            SpoolBuffer::Disk {
+                mut file,
+                path,
+                len,
+            } => {
+                // drop 前必须 flush：tokio File 的 poll_write 把写操作派发到阻塞池后
+                // **立刻**报 Ok，真实写入结果只在下一次 write/flush 时浮现——前面
+                // 各块的错误会被后一块的 write_all 捕获（走 Poisoned），但**最后
+                // 一块**之后再没有写操作，不 flush 就 drop 会把它的错误连同未完成
+                // 的写一起吞掉：回放读到比 len 短的文件，DiskSpoolStream 把提前 EOF
+                // 当正常结束，客户端拿到被静默截断的「成功」响应。内存→磁盘切换块
+                // 恰是最后一块时同理——切换后本变体就是 Disk，同样由这里兜住。
+                // flush 只把写推进 OS（不等物理落盘），与 read_request_body 同款。
+                if let Err(e) = file.flush().await {
+                    drop(file); // 先关句柄再删（Windows 要求）
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!("spool 磁盘写入失败（收尾 flush）: {e}"));
+                }
                 drop(file); // 关写句柄，头部快照以只读重新打开
                 let head = match tokio::fs::File::open(&path).await {
                     Ok(mut f) => {
@@ -452,12 +475,14 @@ impl SpoolBuffer {
                     Err(_) => Vec::new(),
                 };
                 let error = scanner.finish();
-                (SpooledBody::Disk { path, len }, Some((error, head)))
+                Ok((SpooledBody::Disk { path, len }, Some((error, head))))
             }
             // 不可达：Poisoned 在 forward_once 收集循环中提前返回。防御性产出
             // 空 body 成功（与磁盘判定缺失同样按不重试处理，服务不因内部
             // 不变量被破坏而失能）
-            SpoolBuffer::Poisoned => (SpooledBody::Memory(Bytes::new()), Some((false, Vec::new()))),
+            SpoolBuffer::Poisoned => {
+                Ok((SpooledBody::Memory(Bytes::new()), Some((false, Vec::new()))))
+            }
         }
     }
 }
@@ -1749,7 +1774,11 @@ async fn forward_once(
         }
     }
 
-    let (body, disk_scan) = spool.finish(scanner).await;
+    // 收尾 flush 失败与收集途中写失败同属本地磁盘故障，走同一条 SpoolFailed 路径
+    let (body, disk_scan) = match spool.finish(scanner).await {
+        Ok(v) => v,
+        Err(e) => return ForwardResult::SpoolFailed(e),
+    };
     ForwardResult::Response {
         status,
         headers: resp_headers,
@@ -2099,6 +2128,58 @@ mod tests {
         // 各块按序还原 == 原 body（切块只分不变）
         let reassembled: Vec<u8> = frames.into_iter().flatten().collect();
         assert_eq!(reassembled, body.as_ref());
+    }
+
+    // ---- 响应 spool 收尾 flush：最后一块的写失败不得被吞 ----
+
+    #[tokio::test]
+    async fn spool_finish_surfaces_error_of_last_write() {
+        // 注入写失败：以**只读**句柄充当 spool 写句柄，阻塞池里的真实写入必然
+        // 失败（Windows 拒绝访问 / unix EBADF），而 tokio File 的 poll_write
+        // 派发后立刻报 Ok——这正是缺陷成立的前提：最后一块之后再无写操作，
+        // 只有收尾 flush 能观察到这个错误
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool-flush-test.spooltmp");
+        std::fs::write(&path, b"").unwrap();
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let mut buf = SpoolBuffer::Disk {
+            file,
+            path: path.clone(),
+            len: 0,
+        };
+        spool_chunk(&mut buf, b"final chunk", Some(dir.path())).await;
+        assert!(
+            matches!(buf, SpoolBuffer::Disk { len: 11, .. }),
+            "前提：write_all 本身报 Ok，错误留到下一次 write/flush 才浮现"
+        );
+
+        let result = buf.finish(StreamErrorScanner::new()).await;
+        let err = result.err().expect("收尾 flush 必须暴露最后一块的写失败");
+        assert!(err.contains("spool 磁盘写入失败"), "{err}");
+        assert!(!path.exists(), "失败的 spool 半截文件必须删除");
+    }
+
+    #[tokio::test]
+    async fn spool_finish_disk_success_keeps_full_content() {
+        // 对照组：正常写句柄下 finish 成功，长度与文件内容一致（flush 不改变
+        // 成功路径的语义）
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool-flush-ok.spooltmp");
+        let file = tokio::fs::File::create(&path).await.unwrap();
+        let mut buf = SpoolBuffer::Disk {
+            file,
+            path: path.clone(),
+            len: 0,
+        };
+        spool_chunk(&mut buf, b"hello ", Some(dir.path())).await;
+        spool_chunk(&mut buf, b"world", Some(dir.path())).await;
+        let (body, scan) = buf
+            .finish(StreamErrorScanner::new())
+            .await
+            .expect("正常写入的 finish 应成功");
+        assert_eq!(body.len(), 11);
+        assert!(scan.is_some(), "磁盘模式必带增量扫描结论");
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
     }
 
     // ---- preview_body：二进制/压缩体不污染日志（回归：zstd 错误体曾被

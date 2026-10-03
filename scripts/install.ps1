@@ -24,6 +24,11 @@
 #   APROXY_NO_SKILLS=1  跳过 skill 文档（等效 -NoSkills）
 #   APROXY_PRE=1      等效 -Pre
 #   APROXY_DL_PROXY   下载代理（等效 -DownloadProxy；仅本次，与上游请求代理完全无关）
+#
+# 编码：UTF-8 无 BOM，且不能加 BOM。`irm | iex` 会把 BOM 解码成 U+FEFF 字符，这个字符
+# 排在 param() 块之前，param 块随之失效，PowerShell 5.1 与 7 都会解析报错（2026-10-04
+# 用 text/plain; charset=utf-8 响应实测）。代价：Windows PowerShell 5.1 用 -File 本地
+# 运行时按系统 ANSI 码页解码中文而解析失败——本地运行请用 pwsh -File 或 install.cmd。
 
 param(
     [string]$Version = "",      # 指定 tag（如 v0.1.0）；空 = 按上面的选版规则

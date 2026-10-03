@@ -93,7 +93,8 @@ pub struct Settings {
     #[serde(default)]
     pub allowed_origins: Vec<String>,
     /// 看门狗总开关：开启时 `aproxy start`/守护自检会确保存在一个全局看护进程
-    /// （`aproxy watchdog`），守护崩溃/挂死时按 .restore 记录自动重拉。
+    /// （同二进制以隐藏标记 `--daemon-watchdog` 分离启动），守护崩溃/挂死时按
+    /// .restore 记录自动重拉。
     /// 看门狗是系统级单例（一个看护进程看护全部实例），故只在 settings 配置，
     /// config.toml 不参与。默认 true；false 时回到无看护行为（已运行实例不受
     /// 影响——守护与看护者完全解耦）。

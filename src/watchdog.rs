@@ -1,7 +1,7 @@
 //! 看门狗（G2）核心原语：claim 选举、进程探活、共享内存心跳。
 //!
 //! 架构（见 .agents/plan/watchdog-v1.md）：
-//! - **全局单看护进程**（`aproxy watchdog`，同二进制分离进程）看护全部实例，
+//! - **全局单看护进程**（同二进制以隐藏标记 `--daemon-watchdog` 分离启动）看护全部实例，
 //!   内存 ~2-3MB 与实例数无关；等待全部下沉内核（线程池等进程句柄 +
 //!   周期扫描共享内存心跳表），自身零轮询线程。
 //! - **选举规范**：排序定发起者（发现看护者缺席时，存活实例中 PID 最小者
@@ -11,8 +11,8 @@
 //!   claim 文件存在 && PID 探活 && 进程创建时间匹配（防 PID 复用冒名）
 //!   && 心跳新鲜（兼测假死）。
 //!
-//! 模块只放纯逻辑与可注入测试的原语；`aproxy watchdog` 入口在
-//! commands/watchdog.rs。
+//! 看护主循环入口是本模块的 [`serve`]，由 main.rs 在 `--daemon-watchdog` 标记下调用
+//! （没有公开的 `aproxy watchdog` 子命令）。
 
 use crate::settings;
 use serde::{Deserialize, Serialize};

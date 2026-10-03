@@ -70,6 +70,27 @@ aproxy status               # 每行 v<semver> = 各实例实际运行的守护�
   `--pre`/`-Pre`/`APROXY_PRE=1` 让预发布也参与、取版本号最大者；Linux glibc 过低或 musl
   系统自动用 musl 产物，落位前 `--version` 自检；新装机提示先
   `aproxy config --baseurl … --api-key …` 再 `aproxy`。
+- **保活触发条件与首轮提交（新字段 `keepalive_trigger`，行为变化）**：config.toml
+  每实例 + settings.json 全局默认（`"accept"`/`"body_stream"`/`"any"`，默认 `any`；
+  非法值启动报错、doctor 报 settings 里的非法值）。alpha 只看 `Accept` 含
+  `text/event-stream`，真实 Claude Code 的流式请求（`Accept: application/json` +
+  请求体 `"stream": true`）永远进不了保活通道；0.1.0 默认也认请求体 `stream:true`，
+  保活适用的请求从首轮起提交响应头（上游 2xx SSE 时提交真实 status/头，否则约一个
+  间隔后提交骨架）、等首字节/上游在途/缓冲/退避全程发 SSE 注释心跳，响应体仍缓冲
+  完整后回放。**有意例外**：保活适用的请求发往上游时 `accept-encoding` 改为
+  `identity`。`"stream": false` 的请求仍无保活通道。旧二进制读到新字段静默忽略。
+  接入 Claude Code 必须设 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`，见 behaviors.md。
+- **install 更新通道与回滚**：`aproxy install` 的 `latest` 分通道——当前是正式版
+  只取正式版，当前是预发布默认含预发布，`--pre` 显式含预发布；只认
+  `vX.Y.Z[-(alpha|beta|rc).N]`、按版本号选最大，通道为空保持现状；alpha 版本的
+  `latest` 不分通道。滚动重启失败时用旧二进制把
+  该实例拉回并中止滚动，非零退出（alpha 版本无此回滚）。unix 交换前保留
+  `bin/aproxy.old` 供回滚。**旧版本二进制自带的 `install` 仍按它自己的逻辑选版**，
+  通道语义随被执行的二进制版本而定。
+- **发布侧**：Linux gnu 产物按 glibc 2.28 下限用 cargo-zigbuild 构建并在 CI 断言
+  （alpha.17 的 gnu 产物需要 glibc 2.39，Debian 12 / Ubuntu 22.04 上无法启动）；
+  npm 预发布发在 `next` 标签、正式版发 `latest`（`npm i -g @meowo/aproxy` 只会装到
+  正式版，预发布需 `@meowo/aproxy@next`）。
 - **平台**：Windows 与 Linux（x86_64/aarch64，gnu/musl）全功能；macOS 提供
   预构建二进制但未经真机验证，看门狗、`aproxy install` 与依赖进程查询的实例
   管理用到 Linux 专有接口（`/dev/shm`、`/proc`），不可用或退化。

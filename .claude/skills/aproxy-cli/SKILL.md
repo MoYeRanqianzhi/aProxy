@@ -29,7 +29,8 @@ aProxy 原样透传路径/查询/请求头到上游 `base_url`。请求失败（
    不落盘）
 2. config.toml 显式配置的值（各实例独立）
 3. settings.json 全局默认（仅 `max_body_mb`、`disk_cache`、`forward_only`、
-   `bounded_retry_paths`、`allowed_hosts`、`allowed_origins` 六个字段参与此层）
+   `bounded_retry_paths`、`allowed_hosts`、`allowed_origins`、`keepalive_trigger`
+   七个字段参与此层）
 4. 内置默认值
 
 target 参数（start/stop/logs 的 `[目标]`）解析顺序：**别名 → `default` 保留字
@@ -43,6 +44,7 @@ target 参数（start/stop/logs 的 `[目标]`）解析顺序：**别名 → `de
 | 启动/停止/状态/日志/恢复/别名/find/config 的**全部命令与参数** | [references/latest/commands.md](references/latest/commands.md) |
 | 写或改 config.toml（全部字段、类型、默认值、0 值语义） | [references/latest/config-toml.md](references/latest/config-toml.md) |
 | 别名/默认配置/全局默认等 settings.json 字段（一般经命令管理） | [references/latest/settings-json.md](references/latest/settings-json.md) |
+| **把 Claude Code 挂到 aproxy**（`ANTHROPIC_BASE_URL` 与必设的 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`） | [references/latest/behaviors.md](references/latest/behaviors.md) 的「接入 Claude Code」节 |
 | 重试判定、保活、多开、磁盘缓存、外部转换器、日志、自愈恢复等**行为语义与排障** | [references/latest/behaviors.md](references/latest/behaviors.md) |
 | 当前版本是否适用本文档（版本判定、跨版本差异） | [references/latest/compatibility.md](references/latest/compatibility.md) |
 
@@ -64,6 +66,11 @@ compatibility.md 确认行为差异（旧版本可能缺字段、语义不同）
   不启动：目标没在运行会报错退出 1，首次启动用 `aproxy start`。
 - 端口占用排查：bind 失败分「被其他程序占用」与「无权限/被系统保留（Hyper-V
   排除区间）」，不要一律当占用处理——详见 behaviors.md 排障节。
+- **接入 Claude Code 必须设 `CLAUDE_STREAM_IDLE_TIMEOUT_MS=86400000`**（连同
+  `ANTHROPIC_BASE_URL=http://127.0.0.1:<端口>`；shell 环境变量或 Claude Code
+  `~/.claude/settings.json` 的 `env` 字段均可）：否则超过 10 分钟的重试期或长
+  生成会被 Claude Code 的事件级空闲超时断开重发。原因与细节见 behaviors.md
+  「接入 Claude Code」。
 - 客户端收到本地 403 且文案提到 `allowed_origins`/`allowed_hosts`：不是上游
   问题，是入站来源校验拒绝了请求（浏览器/Electron 类客户端会发 `Origin`），
   按文案把对应 Origin/Host 加进配置并 restart，详见 config-toml.md。

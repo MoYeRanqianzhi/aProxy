@@ -30,7 +30,7 @@ agent 软件 ──HTTP──▶ [代理端口 12345] ──重试循环──�
 | `src/cli.rs` | clap 命令树定义（`Cli`/`Commands`/`AliasCmd`/`ConfigArgs`），只承载定义不含逻辑 |
 | `src/commands/` | 十一个子命令各自一文件（start/status/stop/restart/restore/alias/doctor/find/logs/config/install），共享 target 解析在 `mod.rs` |
 | `src/server.rs` | 服务承载：`serve_forever` 主循环、停止信号、日志初始化、配置错误落盘 startup.log |
-| `src/proxy.rs` | 转发核心：入站来源校验（Host/Origin）、hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、keepalive、断开保护、仅转发模式 |
+| `src/proxy.rs` | 转发核心：入站来源校验（Host/Origin）、hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、保活通道与提交点、断开保护、仅转发模式 |
 | `src/transform.rs` | 外部转换器编排：stdin/stdout 一行 JSON 信封交给外部 format 程序改写（spawn 与 persistent 统一进程池、空闲 reaper、超时/崩溃 worker 剔除）；信封契约在独立 crate `aproxy-envelope` |
 | `src/decode.rs` | 检查用解码：按 `content-encoding`（gzip/deflate/br/zstd，多层逆序）解出一份**仅供检查/预览**的副本，转发字节不受影响 |
 | `src/retry.rs` | 重试判定：状态码、错误 JSON（含流式 NDJSON/SSE 形态） |
@@ -95,9 +95,50 @@ CLI 定义（cli.rs）与子命令处理（commands/）分离；启动父进程�
 请求体完整读入（超 `max_body_mb` 即 413，不转发——客户端断开即中止上游请求，
 避免无谓计费）后进入重试循环。响应体**逐块暂存**（spool）到内存/磁盘（上限
 `spool_limit_mb` 256MiB，超限按不可重试终态处理）——只有拿到完整响应才能保证
-「失败即重试」；期间每 `keepalive_interval_secs` 向客户端写一行 SSE 注释
-（`: keepalive`）防超时。响应完成后按原始字节序回放（零拷贝：内存模式用
+「失败即重试」。响应完成后按原始字节序回放（零拷贝：内存模式用
 `Bytes::slice_ref` 共享原分配）。
+
+### 保活通道与提交点
+
+缓冲期间客户端什么也收不到，所以保活适用的请求要靠 SSE 注释心跳（`: keepalive`）
+维持连接。**适用判定**（`keepalive_triggered`，在请求转换之前、按客户端视角）：
+`keepalive_interval_secs` > 0、非 `forward_only`，且按 `keepalive_trigger`
+命中——`accept`（Accept 含 `text/event-stream`，旧判定）/ `body_stream`（请求体
+JSON 对象顶层 `"stream": true`，磁盘溢写的大请求体同样只看顶层键）/ `any`（任一，
+默认）。默认必须把请求体算进来：真实 Claude Code 的流式主请求是
+`Accept: application/json` + `"stream": true`（2026-10-04 实测），只看 Accept
+的旧判定让它永远进不了保活通道。
+
+适用的请求**从首轮起**交给后台任务（`proxy_with_keepalive`）驱动，响应头的
+**提交点**是个只发生一次、不可撤回的三态机：未提交 → 提交上游真实头 / 提交
+骨架头。
+- 上游 2xx + 未压缩的 `text/event-stream`（且未配 `response_transform`）→ 立即
+  把上游真实 status 与响应头转给客户端（去掉 content-length 与 hop-by-hop）；
+- 一个保活间隔内仍无可提交的结果，或首轮就需要重试 → 提交骨架头
+  （200 + `text/event-stream`）；
+- 提交之前首轮就成功完成 → 走与不保活相同的保真快速路径。
+
+提交之后，无论在等上游响应头、缓冲上游流还是退避，都按间隔发心跳——「心跳
+全程覆盖」靠把每次上游尝试/每段退避都放进同一个 select（与心跳节拍、客户端断开
+信号一起）实现。完整缓冲、判定无误后才把成功那一次的字节写进同一个响应；
+期间的重试客户端只见到心跳。
+
+两点取舍：
+- **上游编码改写**：保活适用的请求发往上游时 `accept-encoding` 一律改为
+  `identity`（放在请求转换之后，覆盖 format 可能写入的同名头）——往压缩流里插
+  明文心跳会让客户端解压失败，所以这是对「保真透传」的有意例外；上游无视该要求
+  仍压缩时（`head_is_committable` 兜底）不提交真实头。不适用保活的请求不改写。
+- **提交后失去状态码自由**：状态行与响应头一旦提交就改不了，所以保活通道里的
+  终态失败（`spool_limit_mb` 超限、spool 写盘失败、受限重试路径达上限）只能以
+  SSE `event: error` 事件收场，不能再回 502/真实状态码。
+
+没有保活通道的请求（`"stream": false`、`forward_only`、间隔为 0）沿用首轮快速
+路径 + `proxy_without_keepalive`：成功后一次性回放，期间不向客户端写任何字节。
+
+已提交的响应等待 ≥590 秒后客户端断开时，守护日志会 warn 一条
+`CLAUDE_STREAM_IDLE_TIMEOUT_MS` 提示：Claude Code 的事件级空闲超时（默认 600s）
+重置不了——注释与 ping 都不算事件（见 `.agents/memory/claude-code-stream-watchdogs.md`
+的黑盒实测）。这只是日志文案，行为对任何客户端都一样。
 
 重试退避：前 3 次零延迟，第 4 次起 5s→10s→20s→…封顶 `max_retry_backoff_secs`
 （默认 320s），无限重试。客户端断开立即中止上游请求并停止重试（计费保护）。
@@ -107,6 +148,8 @@ CLI 定义（cli.rs）与子命令处理（commands/）分离；启动父进程�
 请求从总尝试第 3 次起，任何一次有响应的失败立即原样透传并终止重试（第 1、2
 次照常重试；网络错误不触发，继续重试）——部分上游对特定端点确定性报错，
 重试到天荒地老也不可能成功，只会让客户端永远等不到终态。
+保活通道里响应头已提交的请求达上限时无法再透传真实状态码，改以终态 SSE
+`event: error` 事件收场。
 
 `forward_only` 模式整体旁路本节：不缓冲完整请求体、不进重试循环、不发心跳——
 见下一节。
@@ -151,8 +194,8 @@ magic number，连「这是压缩体」都认不出；2026-09-14 的 Cloudflare 
 - **客户端断开**：响应 Body 被 drop，reqwest 连接随之关闭——既有计费保护靠
   Drop 天然成立。
 - **不进入的路径**：重试循环、SSE 保活骨架、错误内容拦截
-  （`is_error_body`/`is_stream_error_body`）、spool、`client_wants_sse` 判定。
-- **本模式下不生效**：`disk_cache`/`spool_limit_mb`/`keepalive_interval_secs`/
+  （`is_error_body`/`is_stream_error_body`）、spool、`keepalive_trigger` 判定。
+- **本模式下不生效**：`disk_cache`/`spool_limit_mb`/`keepalive_interval_secs`/`keepalive_trigger`/
   `max_retry_backoff_secs`（磁盘 spool 完全不参与）。
 - 消费方一律走 `Config::forward_only_enabled()`（`unwrap_or(DEFAULT_FORWARD_ONLY)`），
   **不得 `unwrap()`**——doctor 的 `parse_config_file`、`find::discover` 与大量
@@ -161,7 +204,8 @@ magic number，连「这是压缩体」都认不出；2026-09-14 的 Cloudflare 
 ## 配置分层
 
 三级优先级（仅 `max_body_mb`/`disk_cache`/`forward_only`/`bounded_retry_paths`/
-`allowed_hosts`/`allowed_origins` 六个字段有 settings 层；其余字段 toml > 内置默认）：
+`allowed_hosts`/`allowed_origins`/`keepalive_trigger` 七个字段有 settings 层；其余
+字段 toml > 内置默认）：
 
 ```
 CLI 覆盖参数（--baseurl 等，仅本次） > config.toml 显式值 > settings.json 全局默认 > 内置默认
@@ -169,7 +213,7 @@ CLI 覆盖参数（--baseurl 等，仅本次） > config.toml 显式值 > settin
 
 `config.toml` 人类可读可写、可多份（多开各自指定）；`settings.json` 程序管理的
 内部配置，**全局唯一**（JSON 原子写，损坏回退默认），存别名表、default_config、
-config_dirs、日志轮转阈值、空闲阈值与上述六个字段的全局默认。
+config_dirs、日志轮转阈值、空闲阈值与上述七个字段的全局默认。
 
 ### 配置别名（settings.json）
 
@@ -299,6 +343,17 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
 广播，实例置位自己的可观测状态 swap_phase）、逐个重启最后删除（.old 在
 终验后清理）。模块 `src/install/`：
 
+- **更新通道**（`download::Channel`，`latest` 解析的单一真相源，github/npm 两个
+  查询入口与 CLI 的「是否需要安装」决策都以它为准）：Stable 只在正式版（无预发布
+  后缀且 GitHub 未标 prerelease）中取 semver 最大，Pre 在全部版本中取最大。
+  默认通道跟随当前运行版本（当前是预发布 → Pre，当前是正式版 → Stable），
+  `--pre` 显式切到 Pre。通道内选版（`github::pick_latest`）：非 draft、tag 是
+  `v` + 项目版本号文法（`X.Y.Z` 或 `X.Y.Z-(alpha|beta|rc).N`——`format-v*` 与
+  `alpha.12t3` 这类历史测试 tag 都被排除，后者在 semver 里反而大于 alpha.17）、
+  已含本平台 baseline 资产（先建 release 后传资产）。通道为空 = 保持现状，绝不
+  跨通道偷装预发布；npm 兜底按 dist-tags（Stable 读 `latest` 且其为预发布时视为
+  无稳定版，Pre 取 `latest`/`next` 较大者）。选这个设计的原因：二进制内置的选版
+  逻辑随版本发出就收不回，「默认只取稳定版」不能指望发布侧标签永远打对
 - **state**：状态文件即安装锁（run/ 下，原子重写，updated_at 自动刷新供
   接力存活判据）；阶段状态机线性主线 + failed/aborted 旁路，abort 仅
   swapping 前可回滚
@@ -309,6 +364,15 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
 - **announce**：安装态宣告节（Windows 命名节 / unix /dev/shm，进程退出即
   解除）——看护者/守护的差异化行为全部由它门控：实例死亡复查 5×3s、
   install 保活续作、守护自检补种抑制
+- **restart 与服务回滚**：实例重启原语（`install/restart.rs`）在停止之前把恢复
+  参数记进 install.state 的在途清单，停止之后立即回写 `.restore`；新二进制起不来
+  （bind 前退出、8 秒内没就绪）则用旧二进制按原参数把该实例拉回并置 `halted`，
+  由 flow 中止滚动、剩余实例不动。回滚的只是这一个实例的服务——与 forward-fix
+  铁律（swapping 之后只进不退）兼容：bin 里的新二进制与阶段都不回退（阶段落
+  failed 保留现场），自动续作不再重试。旧二进制的来源：Windows `aproxy.old.exe`
+  （双 rename 的产物）；unix 在单步 rename 覆盖前把旧二进制硬链接（失败则复制）
+  为 `bin/aproxy.old`——覆盖后旧 inode 只挂在运行中进程上，文件系统里已无路径可
+  执行，所以必须先留副本；cleaning 阶段删除
 - **flow**：编排（管辖检查 → 备料 → 广播 ACK → 交换 → Windows 接力交棒 →
   滚动重启 → 终验 → 清理）；任何中断点由 `--continue` 幂等续作
   （恢复矩阵：看护者主责 + CLI 入口兜底，全自动无询问）
@@ -329,6 +393,19 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
   双模缓冲（磁盘 spool 字节保真/EOF 清理/流尾错误重试）、看门狗（强杀重拉/
   优雅停不复活/并发看护者唯一性）、install 流程（恢复矩阵崩溃注入 + CLI
   级完整链路）、交换原语（双 rename 舞 + fallback 脚本）、备料全链
+- **CI**（`.github/workflows/ci.yml`）：windows job 跑 fmt + clippy + test，ubuntu
+  job 跑 clippy + test（windows 的 clippy 不编译 `#[cfg(unix)]` 代码，零警告纪律在
+  ubuntu 补上 unix 面）；clippy 与 test 一律带 `--workspace`（根包是 aproxy 且
+  `[workspace]` 未设 default-members，不带时 aproxy-envelope 与 aproxy-format 的测试
+  从不进入门禁），test 带 `--no-fail-fast` 一次拿到完整失败面。macOS 是独立 job，
+  **已知红**（`/dev/shm`、`/proc` 依赖，见「平台」）：不设 skip 也不设
+  `continue-on-error`，红色就是「未完成」的如实信号，独立成 job 后不淹没其他平台
+  的结论
+- **发布门禁**（`release.yml`）：tag 触发后先在 windows 与 ubuntu 上复跑
+  fmt/clippy/test（tag 可能落后于 main），全绿才进入多平台构建；macOS 不进门禁。
+  渠道发布幂等：npm 与 crates.io 两个 job 都先查询注册表、版本已存在才跳过，所以
+  任一渠道失败后可单独 re-run，已成功的不会重复发布；GitHub Release 的 Latest 标记
+  交给 API 默认值（预发布永不成为 Latest）
 - 测试端口 bind 试探选取（排除区间/占用者自动跳过），绝不触碰用户实例；
   `DaemonGuard` 保证断言失败路径也清理守护
 
@@ -337,7 +414,7 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
 | 平台 | 状态 |
 |---|---|
 | Windows（x64 / x86 / arm64） | 全功能（开发与主测试平台） |
-| Linux（x86_64 / aarch64，glibc 与 musl） | 全功能 |
+| Linux（x86_64 / aarch64，glibc 与 musl） | 全功能；gnu 产物 glibc 下限 2.28，更低的 glibc 与 musl 系统用 musl 产物 |
 | macOS（Apple Silicon / Intel） | 提供预构建二进制，但未经真机验证；看门狗、`aproxy install` 与依赖进程查询的实例管理用到 Linux 专有接口（`/dev/shm`、`/proc`），在 macOS 上不可用或退化 |
 
 unix 分支（UDS IPC、`/dev/shm` 宣告与心跳、`/proc` 进程查询、单步 rename
@@ -346,6 +423,24 @@ unix 分支（UDS IPC、`/dev/shm` 宣告与心跳、`/proc` 进程查询、单�
 的宣告节无法工作。这部分需要在 macOS 真机上补齐实现与验证（后续贡献者），
 补齐之前 README 的平台矩阵如实标注为暂不支持。macOS 的代理转发路径不依赖它们，
 可用。
+
+### Linux gnu 产物的 glibc 下限
+
+在 ubuntu-24.04 runner 上直接构建的 gnu 产物会链接 glibc 2.39，Debian 12、
+Ubuntu 22.04 等系统启动即报 `GLIBC_2.39 not found`（alpha.17 实测如此）。发布流程
+因此用 cargo-zigbuild 按 `GNU_GLIBC_FLOOR`（2.28，`release.yml` 顶部 env）链接，
+并在构建后用 `objdump -p` 断言产物引用的 `GLIBC_` 符号版本都不高于它（非数字的
+需求如 `GLIBC_ABI_DT_RELR` 同样判失败）。这个数字必须与 `scripts/install.sh` 和
+`npm/aproxy/bin/aproxy.js` 里的 `MIN_GLIBC` 保持一致：它们在 glibc 低于下限的
+系统上改选静态链接的 musl 产物（脚本落位前还用 `--version` 自证，gnu 跑不起来
+同样改拉 musl）。musl 产物静态链接，任何 Linux 上都能跑。
+
+### npm dist-tag
+
+预发布（版本含 `-alpha`/`-beta`/`-rc`）发在 `next`，正式版发 `latest`
+（`npm/build-and-publish.sh` 的 `npm_dist_tag()` 与 `release.yml` 里 GitHub Release
+的 `prerelease` 判定是同一条规则，改一处必须同步另一处）。首个正式版发布后
+`npm i -g @meowo/aproxy` 只会装到正式版，预发布需显式 `@meowo/aproxy@next`。
 
 ## 版本路线
 

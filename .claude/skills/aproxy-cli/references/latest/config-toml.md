@@ -23,6 +23,7 @@ listen_addr = "127.0.0.1:12345"
 # extra_headers = { "x-custom" = "v" }
 # override_headers = { "user-agent" = "my-agent/1.0" }
 # keepalive_interval_secs = 15
+# keepalive_trigger = "any"
 # proxy = "http://127.0.0.1:7890"
 # proxy_username = "u"
 # proxy_password = "p"
@@ -47,10 +48,11 @@ listen_addr = "127.0.0.1:12345"
 |---|---|---|---|
 | `base_url` | string | （空，必填） | 上游 API base URL；末尾 `/` 自动去除 |
 | `listen_addr` | string | `"127.0.0.1:12345"` | 本地监听地址，须含端口 |
-| `api_key` | string? | 无 | 快捷鉴权（覆盖 Authorization: Bearer） |
+| `api_key` | string? | 无 | 快捷鉴权（同时覆盖 `Authorization: Bearer` 与 `x-api-key`） |
 | `extra_headers` | map | 空 | 仅当请求未携带该头时追加（大小写不敏感判定） |
 | `override_headers` | map | 空 | 无条件覆盖请求头（大小写不敏感匹配） |
-| `keepalive_interval_secs` | u64 | 15 | 重试期间 SSE 心跳间隔秒；0=关闭 |
+| `keepalive_interval_secs` | u64 | 15 | 保活 SSE 心跳间隔秒（也是首轮提交骨架头的等待上限）；0=关闭保活 |
+| `keepalive_trigger` | string? | settings 层（`"any"`） | 哪些请求走保活通道：`"accept"` / `"body_stream"` / `"any"`；非法值启动报错 |
 | `proxy` | string? | 无 | 上游代理 URL（http/https/socks4/socks4a/socks5/socks5h） |
 | `proxy_username` | string? | 无 | 代理用户名，优先于 URL 内嵌 |
 | `proxy_password` | string? | 无 | 代理密码，优先于 URL 内嵌 |
@@ -69,9 +71,9 @@ listen_addr = "127.0.0.1:12345"
 | `response_transform` | table? | 无 | 外部转换器（响应侧）：改写上游响应后回放；失败透传原样 |
 
 **优先级**（`max_body_mb`/`disk_cache`/`forward_only`/`bounded_retry_paths`/
-`allowed_hosts`/`allowed_origins` 六个 Option 字段独有）：
+`allowed_hosts`/`allowed_origins`/`keepalive_trigger` 七个 Option 字段独有）：
 toml 显式值 > settings.json 全局默认 > 内置默认（128 / true / false / 空 /
-空 / 空）。其余字段无 settings 层：toml 显式值 > 内置默认。
+空 / 空 / `"any"`）。其余字段无 settings 层：toml 显式值 > 内置默认。
 注意 `allowed_hosts`/`allowed_origins` 在 toml 里写 `[]` 也算「显式值」——
 它等同未配置（内置默认策略），因此可用来把 settings.json 的全局列表在单个
 实例上恢复成内置默认。
@@ -93,7 +95,9 @@ toml 显式值 > settings.json 全局默认 > 内置默认（128 / true / false 
 
 ### api_key
 
-设置后等效于把 `Authorization: Bearer <api_key>` 覆盖进每个转发请求。适用场景：
+设置后等效于把 `Authorization: Bearer <api_key>` 覆盖进每个转发请求，并同时用同一个值覆盖
+`x-api-key`（Anthropic 风格上游用它携带原始 key，只覆盖 Authorization 会让客户端
+原带的 x-api-key 漏到上游）。适用场景：
 客户端不便配置鉴权头时集中注入。请求自带 Authorization 头时它作为 override
 参与覆盖逻辑（见下）。空串/纯空白视为未设置（归一化剔除）。
 
@@ -112,10 +116,35 @@ override_headers = { "user-agent" = "my-agent/1.0" }
 - 键 trim 后为空剔除；trim 后同键冲突保留先出现者。
 - `api_key` 的实现等价于一条 override_headers 的 `Authorization` 条目。
 
-### keepalive_interval_secs
+### keepalive_interval_secs / keepalive_trigger
 
-上游未就绪/重试期间，对客户端（流式响应）注入 SSE 注释行心跳的间隔。
-0 = 完全关闭。非流式请求无心跳——客户端超时请自行调大其 HTTP 超时。
+**保活通道**：保活适用的请求从首轮起先向客户端提交响应头，再按
+`keepalive_interval_secs` 间隔发 SSE 注释行（`: keepalive`）心跳，覆盖等首字节、
+上游在途、缓冲上游流与退避的全过程；响应体仍是缓冲完整、校验无误后才回放
+（失败尝试的数据不会混入）。语义细节见 behaviors.md「保活心跳」。
+
+- **适用条件**：`keepalive_interval_secs` > 0、非 `forward_only`，且按
+  `keepalive_trigger` 命中。`0` = 完全关闭保活；`forward_only` 下无效。
+- **`keepalive_trigger`**（字符串，默认 `"any"`，只认小写原文）：
+  - `"accept"`：客户端 `Accept` 头含 `text/event-stream`（0.1.0 之前的唯一判定）
+  - `"body_stream"`：客户端原始请求体是 JSON 对象且顶层 `"stream": true`
+    （只看请求体字段，与 URL 无关；磁盘溢写的大请求体同样只看顶层键）
+  - `"any"`：两者任一。真实 Claude Code 的流式主请求是
+    `Accept: application/json` + 请求体 `"stream": true`，只看 Accept 的旧判定
+    让它永远进不了保活通道，所以默认必须把请求体也算进来
+  - 判定在 `request_transform` **之前**、按客户端视角，转换器改写 Accept/请求体
+    不影响保活选择。
+- 非法取值：toml 里的由 start 校验点名拒绝；settings.json 里的由 `aproxy doctor`
+  报 error，且以它为全局默认的实例启动失败。toml 显式值 > settings.json >
+  内置 `"any"`；`aproxy config --show` 展示生效来源。改后
+  `aproxy restart <端口或别名>` 生效。无 CLI 旗标（`--keepalive-secs` 只管间隔）。
+- **上游编码改写（对「完全透传」的有意例外）**：保活适用的请求发往上游时
+  `accept-encoding` 一律改为 `identity`——往压缩流里插入明文心跳会让客户端解压
+  失败。客户端照旧拿到合法响应，代价只是上游到本机这一段多传一些字节；不适用
+  保活的请求不改写。
+- **没有保活通道的请求**：`"stream": false` 的普通请求（没有可注入心跳的响应
+  流，首字节延迟 = 完整生成时长，客户端需自行调大超时）、`forward_only` 实例、
+  `keepalive_interval_secs = 0`。
 
 ### proxy / proxy_username / proxy_password
 
@@ -227,7 +256,7 @@ bounded_retry_paths = [
 仍按真实查询串书写。
 
 行为细节：网络错误不受此封顶（仍无限重试）；保活通道（SSE 骨架已发出的请求）
-达上限以 `event: error` 事件收场。未在 toml 显式配置时取 settings.json 的
+达上限（响应头已提交，真实状态码无法再回放）以终态 `event: error` 事件收场。未在 toml 显式配置时取 settings.json 的
 `bounded_retry_paths`（全局默认空）。改后 `aproxy restart <端口或别名>` 生效。
 
 > 典型场景：Claude Code 走非官方 API（聚合/镜像上游）时 /compact 无限卡住、

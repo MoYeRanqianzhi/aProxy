@@ -2817,11 +2817,26 @@ impl Drop for DaemonGuard {
     }
 }
 
+/// 等待守护就绪（守护跑在**测试进程自己的默认主目录**里时用）：等价于
+/// `wait_daemon_ready_in(&aproxy::daemon::run_dir(), port)`。守护跑在隔离
+/// APROXY_HOME 里的测试必须改用 `wait_daemon_ready_in` 并传 `<home>/run`，
+/// 理由见该函数说明。
+fn wait_daemon_ready(port: u16) -> bool {
+    wait_daemon_ready_in(&aproxy::daemon::run_dir(), port)
+}
+
 /// 等待守护就绪：TCP 可连只能证明「端口上有监听者」——可能是恰好占用端口的
 /// 其他程序，或并行测试的另一实例，此前的 ready 判定会让这类占用者造成
-/// 误导性假失败。须再经 IPC ping 确认是自家守护（管道名含端口，只有我们的
+/// 误导性假失败。须再经 IPC ping 确认是自家守护（端点名含端口，只有我们的
 /// --daemon-child 子进程会创建它）才算就绪。
-fn wait_daemon_ready(port: u16) -> bool {
+///
+/// `run_dir` 必须是**守护实际使用的** run 目录（隔离测试传 `<home>/run`）：
+/// unix 的 IPC 端点是 `<run_dir>/<端口>.sock`，测试进程自身没有设置
+/// APROXY_HOME（只注入给子进程），无参的 `ipc_ping` 会去测试进程默认主目录
+/// 的 run/ 下找 socket，对隔离 home 里的守护永远 ping 不到（ubuntu CI 上
+/// restore 测试因此恒红）。Windows 管道名全局唯一、忽略 run_dir，所以这个
+/// 错误在 Windows 上被掩盖。
+fn wait_daemon_ready_in(run_dir: &std::path::Path, port: u16) -> bool {
     let port_str = port.to_string();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2829,7 +2844,9 @@ fn wait_daemon_ready(port: u16) -> bool {
         .expect("创建测试 tokio runtime 失败");
     for _ in 0..100 {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
-            && rt.block_on(aproxy::daemon::ipc_ping(&port_str)).is_ok()
+            && rt
+                .block_on(aproxy::daemon::ipc_ping_in(run_dir, &port_str))
+                .is_ok()
         {
             return true;
         }
@@ -3276,21 +3293,28 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     // 拉起看护进程——测试结束后 tempdir 被删，看护者却存活 ~300s 并锁住
     // CARGO_BIN_EXE 的镜像文件（阻断后续 cargo 重链），必须从源头关闭
     std::fs::write(home.join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+    // 本测试守护的 run 目录：IPC 寻址（unix 的 UDS 在其中）与注册表/恢复记录
+    // 都以它为准——测试进程自身没有 APROXY_HOME，任何无参 IPC 调用都会落到
+    // 测试进程的默认主目录，而不是这里
+    let run_dir = home.join("run");
     // 隔离前置清理：上次失败运行可能残留监听同端口的守护（其隔离 tempdir
-    // 已删、注册表不可达）——IPC 管道按端口在系统命名空间、跨 home 可达，
-    // ping 到即按上报 pid 强杀；随后全局默认目录再兜底清一次
+    // 已删、注册表不可达）。**只在 Windows 上能清到**：命名管道按端口落在
+    // 系统全局命名空间、与 home 无关，ping 到即按上报 pid 强杀。unix 的 UDS
+    // 在上次运行的（已删除的）tempdir 里，任何路径都 ping 不到它——此处按
+    // 本次 run_dir 寻址只是保证不会误 ping（继而误杀）默认主目录下同端口的
+    // 其他实例；残留守护仍占着的端口本就会被 daemon_test_port 的可绑定性
+    // 试探跳过。随后全局默认目录再兜底 stop 一次
     {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("创建测试 tokio runtime 失败");
-        if let Ok(info) = rt.block_on(aproxy::daemon::ipc_ping(&port_str)) {
+        if let Ok(info) = rt.block_on(aproxy::daemon::ipc_ping_in(&run_dir, &port_str)) {
             kill_pid(info.pid);
             std::thread::sleep(Duration::from_millis(200));
         }
     }
     let _ = Command::new(exe).args(["stop", &port_str]).output();
-    let run_dir = home.join("run");
     let restore_path = aproxy::daemon::restore_file_path_in(&run_dir, &format!("127.0.0.1:{port}"));
 
     // 隔离启动：start 父进程注入 APROXY_HOME，守护隔代继承（port_zero 同款）。
@@ -3350,7 +3374,9 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
         stdout.contains("已恢复") && stdout.contains(&port_str),
         "restore 应恢复实例: {stdout}"
     );
-    assert!(wait_daemon_ready(port), "恢复后的实例应就绪");
+    // 就绪等待必须按隔离 home 的 run 目录寻址（unix 的 UDS 在其中），见
+    // wait_daemon_ready_in 的说明
+    assert!(wait_daemon_ready_in(&run_dir, port), "恢复后的实例应就绪");
 
     // 幂等：再次 restore 时已在运行 → 跳过而非报错/重复启动（隔离目录内
     // 只有本测试实例，断言确定性成立）

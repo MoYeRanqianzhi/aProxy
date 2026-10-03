@@ -30,3 +30,4 @@
 - [日志随机命名+IPC 上报](memory/2026-09-22-random-log-names.md) — 用户三点定调：日志随机命名（端口是易变标识做永久命名的反模式）/IPC 是日志地址权威（不拼路径）/log_file 自定义不进 settings 层；清理判据重构为引用集；.restore 结构体格式读侧宽容旧格式 [[random-log-names]] [[daemon-model]] [[bounded-retry-paths]]
 - [外部转换器 format](memory/2026-09-23-transform-format.md) — 信封协议（一行 JSON stdin/stdout）+进程池（OJ 多轮式 while 串行，EOF 回收铁律）；两侧失败语义不对称（请求 502 不重试/响应透传）；workspace 三成员体积隔离；aproxy-format 独立发版 format-v* 线；npm skill 包形态变更旧版自愈 [[transform-format]] [[bounded-retry-paths]] [[release-engineering]]
 - [Claude Code 流超时实测](memory/claude-code-stream-watchdogs.md) — 2026-10-04 黑盒实测：Accept: application/json + stream:true；首字节 ~360s / 字节空闲 300s / 事件空闲 600s（注释与 ping 都不算事件，须客户端设 CLAUDE_STREAM_IDLE_TIMEOUT_MS）
+- [共用 target 目录测到旧代码](memory/2026-10-04-shared-target-dir-stale-tests.md) — worktree 与主工作区共用 CARGO_TARGET_DIR 时 cargo 按 mtime 误判新鲜、静默执行旧二进制（实测 73 项冒充 86 项）；各用独立目录，汇报附测试数 [[unix-stress-review]]

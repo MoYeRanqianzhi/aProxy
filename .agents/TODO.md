@@ -4,6 +4,23 @@
 > 2026-09-08 补录 tag 之后一轮（性能优化 + 磁盘缓存 + 重构 + skill），全部已完成。
 > 2026-09-09 第四轮审查修复 + 实测 restart bug + skill 指引优化，全部已完成。
 
+## 0.1.0 正式发布修复（2026-10-04 用户批准审查建议，进行中）
+
+计划与进度：[release-0.1.0](plan/release-0.1.0.md)；依据：
+`.agents/review/2026-10-04-0.1.0发布前-13维审查.md`。硬验收：默认配置下无限重试
+对真实 Claude Code 端到端成立。macOS 不在本轮范围。
+
+- [ ] WS-1a 入站 Host/Origin 校验 + 凭据统一脱敏 + spool flush + ubuntu CI 测试修复
+- [ ] WS-1b 保活触发条件（Claude Code 发 Accept: application/json + stream:true，已实测）+ 首轮提交 + 在途心跳
+- [ ] WS-2 转换器进程池加固 + aproxy-format auto 模式
+- [ ] WS-3 身份判定去名称化 + 重拉换端口残留 + restart 预检 / stop --force 清理
+- [ ] WS-4 更新通道（默认只取稳定版）+ 滚动升级失败回滚
+- [ ] WS-5a CI/发布门禁、发布幂等、GLIBC 构建下限、workflow 权限、format 线隔离、npm dist-tag
+- [ ] WS-5b 一键脚本批量修复 + glibc 探测与 musl 回退
+- [ ] WS-6 文档与 skill 全量对齐、SECURITY.md、发布说明
+- [ ] 全量验证（Windows / ssh remote / WSL）+ 真实 Claude Code 无限重试验收 + 合并后审查
+- [ ] 所有者人工项：Trusted Publisher 绑定核对（aproxy-envelope、aproxy-format、@meowo/aproxy-format*）、release environment 保护规则、分支保护、CARGO_REGISTRY_TOKEN 迁入受保护环境
+
 ## 外部转换器（format）+ aproxy-format（2026-09-23 下令，2026-09-30 完成）
 
 - [x] **Workflow 全链审查 + 处置闭环（2026-09-30，用户下令「分配 workflow

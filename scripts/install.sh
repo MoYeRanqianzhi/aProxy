@@ -22,7 +22,7 @@
 set -eu
 
 REPO="MoYeRanqianzhi/aProxy"
-# glibc 版本下限：Linux gnu 产物按此基线构建，低于它的系统（Debian 11 及更老等）
+# glibc 版本下限：Linux gnu 产物按此基线构建，低于它的系统（如 RHEL/CentOS 7 的 glibc 2.17）
 # 改选静态链接的 musl 产物。必须与 .github/workflows/release.yml 中 gnu 构建的
 # glibc 下限、npm/aproxy/bin/aproxy.js 的 MIN_GLIBC 保持一致。
 MIN_GLIBC="2.28"

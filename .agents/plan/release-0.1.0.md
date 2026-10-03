@@ -97,7 +97,9 @@
 - [ ] 第 1 波：WS-5b 已合并（2e06dce + 主代理补修 069e001：grep -E、.gitattributes
   让 install.cmd 以 CRLF 入库）；WS-2 已合并（e60de76）；WS-1a、WS-3、WS-4 进行中
   （WS-4 曾因账户并发上限 409 中断，已续跑）
-- [ ] 第 2 波：WS-5a 进行中（opus，基于 e60de76）；WS-1b 待 WS-1a 合并后开工
+- [x] WS-1a 已合并（64aeaf2；真实 Claude Code 不发 Origin、Host 为 127.0.0.1:端口，已核对抓包）；WS-3 已合并（5c71f35，进程身份改为 pid + 创建时间，旧记录保守不误杀）
+- [ ] 第 2 波：WS-5a、WS-1b（基于 64aeaf2）进行中；WS-4 进行中
+- 合并后由主代理收尾：cli.rs `--force` 帮助文字仍写「验证镜像名」（WS-4 合并后改）；Linux 专属 clippy 问题 tests/install_flow.rs:11 未使用 Instant、tests/proxy_integration.rs:4030 zombie_processes（WS-5a 加 ubuntu clippy 门禁前必须修）；.agents/memory/2026-09-10-identity-no-name.md 更新为「方案 A 已实施」，stash@{0} 草稿由用户决定是否丢弃
 - 并发纪律：账户级上限 8 个并发请求、跨会话共享，主循环也算一个——后台代理同时
   最多 4 个
 - 待办（来自代理报告）：doctor 单测在未设 APROXY_HOME 时只读扫描真实 ~/.aproxy

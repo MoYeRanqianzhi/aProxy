@@ -25,6 +25,32 @@ format 崩了（非零退出且没输出信封行）。用错误输入手动喂�
 printf '%s\n' '<信封 JSON>' | <command> <args>
 ```
 
+注意：persistent 池复用到**空闲期间已死**的 worker（还没产出任何输出就失败）
+时，池内已自动换新 worker 重试了一次——能看到这个 502，说明新开的 worker 也
+死了，即 format 本身起不来（command 路径对但程序启动即崩、缺运行时依赖、参数
+错等），不是偶发的池状态问题。aProxy 丢弃 format 的 stderr，崩溃原因要手动
+复现才能看到。
+
+## 请求 502 且错误含「format 输出违反信封协议」
+
+format 的 stdout 内容不是「每个请求恰好一行合法信封」。信封协议没有请求序号，
+worker 的第 N 行输出只能靠「一请求一行、按序」对应第 N 个请求，所以任何对应
+关系存疑的输出都会让该 worker 被剔除、当次请求 502（否则下一个请求会读到上一个
+请求的输出）。常见原因：
+
+- **往 stdout 打了日志/横幅/调试输出**：stdout 只能写信封行；日志写 stderr
+  （aProxy 会丢弃 stderr，需要留痕请写你自己的文件）。
+- **`jq` 忘了 `-c`**：默认 pretty-print 输出多行，每个请求回了不止一行。
+- 一个请求回了多行（循环里重复 print）、空闲时 stdout 冒出未被请求的输出
+  （后台线程打印）——这类也会被检出并剔除 worker。
+- 输出不是合法 JSON、含非 UTF-8 字节，或 `body` 与 `body_b64` 同时出现。
+
+排查：用上节命令手动喂一行信封，看 stdout 是否**恰好一行**合法 JSON：
+
+```bash
+printf '%s\n' '<信封 JSON>' | <command> <args> | wc -l   # 期望 1
+```
+
 ## persistent worker 不退出 / 挂成孤儿进程
 
 format 的循环没处理 stdin EOF。铁律：**读到 EOF 就 exit**（aProxy 实例停止
@@ -51,15 +77,30 @@ format 的循环没处理 stdin EOF。铁律：**读到 EOF 就 exit**（aProxy 
 - `client_format = "auto"` 检测失败也会报错（错误文案带「检测失败」）——
   请求字段名不像已知协议时改为显式声明格式。
 
-## auto 模式的协议误判（静默走错转换路径）
+## auto 模式报错「client_format = "auto" 只支持同协议」
 
-`client_format = "auto"` 按 body 形态启发式检测：**Anthropic 的 `system`
-是可选字段**——不带 `system` 的标准 Anthropic 请求（`{model, max_tokens,
-messages}`）会被判成 OpenAI Chat，随后的转换或直通方向就是错的且**无报错**
-（表现：上游收到错协议 body / 字段变形如 tool 的 `input_schema` 丢失）。
-规避：**生产实例显式声明 `client_format`**（如 `"openai_chat"`），auto 只
-留给输入协议确实单一明确的场景；已误配的按本节改后
-`aproxy restart <端口或别名>`。
+`client_format = "auto"` 按 body 形态启发式检测客户端协议，**只放行同协议**：
+检测出的客户端协议与路由到的渠道协议不同时，请求侧直接 502 报错（发往上游
+之前拒绝，不产生计费），文案点名检测结果、渠道协议，并提示显式声明。原因是
+信封没有请求→响应的上下文，响应侧拿不到客户端协议，跨协议的响应无法转回。
+
+解法：在聚合配置里**显式声明 `client_format`**（如 `"anthropic_messages"` /
+`"openai_chat"`），改后 `aproxy restart <端口或别名>`。
+
+另一个相关坑：auto 的检测本身是启发式的——**Anthropic 的 `system` 是可选
+字段**，不带 `system` 的标准 Anthropic 请求（`{model, max_tokens, messages}`）
+会被判成 OpenAI Chat。同协议路由下这不会出错（原样直通），但检测结果与真实
+客户端不符时，若路由到另一协议的渠道就会被上面的规则拒绝——同样用显式声明
+解决。生产实例一律显式声明。
+
+## 跨协议的流式（SSE）响应没有被转换
+
+官方 aproxy-format 的跨协议转换只支持**非流式**。跨协议 + 流式请求
+（如 Claude Code 默认 `stream: true`，渠道是 OpenAI 协议）时，请求侧转换
+成功、上游回 SSE，响应侧报「SSE 流式响应的跨协议转换尚未支持」，aProxy 按
+响应侧失败语义透传上游原始流——客户端收到的是渠道协议格式的流，无法解析。
+同协议 SSE 原样直通，不受影响。需要跨协议流式时：让客户端协议与渠道协议一致，
+或自己实现流式转换的 format。
 
 ## 响应侧报「url 反查不到渠道」
 

@@ -10,11 +10,14 @@ rem
 rem Usage: scripts\install.cmd [--pre] [tag]
 rem   tag like v0.1.0; omitted = pick a release by the rules below.
 rem   --pre (or APROXY_PRE=1) also allows prereleases.
-rem Release selection (no explicit tag): only tags starting with v<digit> are
-rem   considered (the repo also hosts format-v* releases, which are excluded),
-rem   drafts skipped. Default = newest stable (highest version number). If the
-rem   repo has no v* stable release yet, falls back to the newest v* prerelease
-rem   with a note. --pre = the most recently created v* release, prerelease or not.
+rem Release selection (no explicit tag): only tags matching the project version
+rem   grammar vX.Y.Z or vX.Y.Z-(alpha|beta|rc).N are considered (the repo also
+rem   hosts format-v* releases, and historical test tags such as
+rem   v0.1.0-alpha.12t3 would outrank alpha.17 under semver), drafts skipped.
+rem   Default = highest stable version. If the repo has no v* stable release
+rem   yet, falls back to the highest-versioned prerelease with a note.
+rem   --pre = the highest version, prerelease or not (same rule as
+rem   `aproxy install --pre`: by version number, not by creation time).
 rem Env:
 rem   APROXY_HOME       root dir (default %USERPROFILE%\.aproxy)
 rem   APROXY_NO_SKILLS  1 = skip skill docs
@@ -69,13 +72,14 @@ if exist "%BIN_DIR%\aproxy.exe" (
 )
 
 rem ---- Resolve the release tag when none was given. One PowerShell command:
-rem ---- fetch up to 100 releases, drop drafts and non-v<digit> tags (format-v*),
+rem ---- fetch up to 100 releases, drop drafts and tags outside the version
+rem ---- grammar (format-v*, historical test tags), sort by version number,
 rem ---- then apply the selection rules above. usebackq lets the PowerShell code
 rem ---- use single quotes freely. Keep this free of exclamation marks (delayed
 rem ---- expansion is on). The fallback note goes to stderr so only the tag is
 rem ---- captured. ----
 if not defined TAG (
-    for /f "usebackq delims=" %%T in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; try { $raw=@(Invoke-RestMethod -Uri 'https://api.github.com/repos/%REPO%/releases?per_page=100' -Headers @{'User-Agent'='%UA%'}) } catch { [Console]::Error.WriteLine('Cannot list releases: ' + $_); exit 1 }; $a=@(@(foreach($r in $raw){foreach($i in @($r)){$i}}) | Where-Object { $_.tag_name -and -not $_.draft -and $_.tag_name -match '^v[0-9]' }); if ('%WANT_PRE%' -eq '1') { $t=$a | Select-Object -First 1 } else { $t=$a | Where-Object { -not $_.prerelease -and $_.tag_name -match '^v[0-9]+\.[0-9]+\.[0-9]+$' } | Sort-Object { [version]$_.tag_name.Substring(1) } -Descending | Select-Object -First 1; if (-not $t) { $t=$a | Where-Object { $_.prerelease } | Select-Object -First 1; if ($t) { [Console]::Error.WriteLine('NOTE: no stable v* release yet, falling back to the newest prerelease ' + $t.tag_name) } } }; if ($t) { $t.tag_name }"`) do set "TAG=%%T"
+    for /f "usebackq delims=" %%T in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; try { $raw=@(Invoke-RestMethod -Uri 'https://api.github.com/repos/%REPO%/releases?per_page=100' -Headers @{'User-Agent'='%UA%'}) } catch { [Console]::Error.WriteLine('Cannot list releases: ' + $_); exit 1 }; $g='^v(\d+)\.(\d+)\.(\d+)(?:-(alpha|beta|rc)\.(\d+))?$'; $a=@(@(foreach($r in $raw){foreach($i in @($r)){$i}}) | Where-Object { $_.tag_name -and -not $_.draft -and $_.tag_name -match $g }); $k={ $m=[regex]::Match($_.tag_name,$g); $rk=switch($m.Groups[4].Value){'alpha'{0} 'beta'{1} 'rc'{2} default{3}}; $n=0; if ($m.Groups[5].Success) { $n=[long]$m.Groups[5].Value }; '{0:D10}.{1:D10}.{2:D10}.{3}.{4:D10}' -f [long]$m.Groups[1].Value,[long]$m.Groups[2].Value,[long]$m.Groups[3].Value,$rk,$n }; $s=@($a | Sort-Object $k -Descending); if ('%WANT_PRE%' -eq '1') { $t=$s | Select-Object -First 1 } else { $t=$s | Where-Object { -not $_.prerelease -and $_.tag_name -notmatch '-' } | Select-Object -First 1; if (-not $t) { $t=$s | Select-Object -First 1; if ($t) { [Console]::Error.WriteLine('NOTE: no stable v* release yet, falling back to the highest-versioned prerelease ' + $t.tag_name) } } }; if ($t) { $t.tag_name }"`) do set "TAG=%%T"
 )
 if not defined TAG (
     echo Cannot resolve a release ^(no installable v* release, or network unavailable^) 1>&2

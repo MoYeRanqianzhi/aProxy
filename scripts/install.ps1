@@ -11,10 +11,13 @@
 #     $env:APROXY_PRE = "1"; irm https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.ps1 | iex
 #
 # 选版规则（未指定 -Version 时）：
-#   1. 只认 v<数字> 开头的 tag（同仓库的 format-v* 是另一条发版线，必须排除）并跳过 draft；
+#   1. 只认符合项目版本号文法的 tag：vX.Y.Z 或 vX.Y.Z-(alpha|beta|rc).N（同仓库的
+#      format-v* 是另一条发版线；v0.1.0-alpha.12t3 这类历史测试 tag 按 semver 会排在
+#      alpha.17 之上，必须排除），并跳过 draft；
 #   2. 默认取最新的稳定版（非 prerelease，按版本号取最大）；
-#   3. 仓库里一个 v* 稳定版都没有时（0.1.0 发布前）回退到最新的 v* 预发布并打印说明；
-#   4. -Pre（或 APROXY_PRE=1）：取最新创建的 v* release，预发布也可。
+#   3. 仓库里一个 v* 稳定版都没有时（0.1.0 发布前）回退到版本号最大的 v* 预发布并打印说明；
+#   4. -Pre（或 APROXY_PRE=1）：取版本号最大的 v* release，预发布也可（与 `aproxy install
+#      --pre` 同一规则：按版本号而非创建时间，补丁版晚于预发布发布时也不会装到更低版本）。
 #
 # 环境变量：
 #   APROXY_HOME       根目录（默认 ~\.aproxy）——bin/skills/run 全目录的根
@@ -26,7 +29,7 @@ param(
     [string]$Version = "",      # 指定 tag（如 v0.1.0）；空 = 按上面的选版规则
     [switch]$NoSkills,          # 跳过 skill 文档下载
     [string]$DownloadProxy = "", # 下载代理（仅本次；与上游请求代理完全无关）
-    [switch]$Pre                # 允许安装预发布（取最新创建的 v* release）
+    [switch]$Pre                # 允许安装预发布（取版本号最大的 v* release）
 )
 
 # 主体全部放进函数：`irm | iex` 在用户自己的会话里执行，顶层 exit 会直接关掉
@@ -66,19 +69,30 @@ function Install-AProxy {
         # JSON 顶层是数组：PowerShell 7 会把整个数组当作单个对象输出（5.1 则逐项展开），
         # 逐层展平后两个版本得到同样的 release 对象列表
         $all = @(foreach ($r in $raw) { foreach ($i in @($r)) { $i } })
-        # 只留 v<数字> 开头且非 draft 的条目（排除 format-v*）；保持列表（创建时间倒序）顺序
-        $cands = @($all | Where-Object { $_.tag_name -and -not $_.draft -and $_.tag_name -match '^v[0-9]' })
+        # 只留符合项目版本号文法且非 draft 的条目（排除 format-v* 与历史测试 tag）
+        $grammar = '^v(\d+)\.(\d+)\.(\d+)(?:-(alpha|beta|rc)\.(\d+))?$'
+        $cands = @($all | Where-Object { $_.tag_name -and -not $_.draft -and $_.tag_name -match $grammar })
         if ($cands.Count -eq 0) { throw "仓库里没有可安装的 v* release" }
-        if ($AllowPre) { return $cands[0].tag_name }
-
-        # 稳定版之间按版本号取最大；只接受 vX.Y.Z（带后缀的不参与比较）
-        $stable = @($cands | Where-Object { -not $_.prerelease -and $_.tag_name -match '^v[0-9]+\.[0-9]+\.[0-9]+$' })
-        if ($stable.Count -gt 0) {
-            return ($stable | Sort-Object { [version]$_.tag_name.Substring(1) } -Descending | Select-Object -First 1).tag_name
+        # 版本号排序键（定宽字符串，字典序 = 版本序）：主.次.补 → 预发布档位（alpha 0 /
+        # beta 1 / rc 2 / 正式版 3，正式版高于同号的任何预发布）→ 预发布序号
+        $semverKey = {
+            $m = [regex]::Match($_.tag_name, $grammar)
+            $rank = switch ($m.Groups[4].Value) { 'alpha' { 0 } 'beta' { 1 } 'rc' { 2 } default { 3 } }
+            $n = if ($m.Groups[5].Success) { [long]$m.Groups[5].Value } else { 0 }
+            '{0:D10}.{1:D10}.{2:D10}.{3}.{4:D10}' -f [long]$m.Groups[1].Value, [long]$m.Groups[2].Value, [long]$m.Groups[3].Value, $rank, $n
         }
-        $pres = @($cands | Where-Object { $_.prerelease })
-        if ($pres.Count -eq 0) { throw "仓库里没有可安装的 v* release" }
-        Write-Host "说明: 仓库暂无 v* 稳定版，回退到最新预发布 $($pres[0].tag_name)（正式版发布后默认装稳定版）"
+        if ($AllowPre) {
+            return ($cands | Sort-Object $semverKey -Descending | Select-Object -First 1).tag_name
+        }
+
+        # 稳定版：prerelease 标志为 false 且 tag 没有预发布后缀，两个信号都满足才算
+        # （任一处标成预发布都不当稳定版装给默认用户）
+        $stable = @($cands | Where-Object { -not $_.prerelease -and $_.tag_name -notmatch '-' })
+        if ($stable.Count -gt 0) {
+            return ($stable | Sort-Object $semverKey -Descending | Select-Object -First 1).tag_name
+        }
+        $pres = @($cands | Sort-Object $semverKey -Descending)
+        Write-Host "说明: 仓库暂无 v* 稳定版，回退到版本号最大的预发布 $($pres[0].tag_name)（正式版发布后默认装稳定版）"
         return $pres[0].tag_name
     }
 

@@ -10,10 +10,13 @@
 #   curl -fsSL .../install.sh | sh -s -- --pre        # 允许安装预发布
 #   或本地执行：sh scripts/install.sh [--pre] [v0.1.0]
 # 选版规则（无显式 tag 时）：
-#   1. 只认 v<数字> 开头的 tag（同仓库的 format-v* 是另一条发版线，必须排除）并跳过 draft；
+#   1. 只认符合项目版本号文法的 tag：vX.Y.Z 或 vX.Y.Z-(alpha|beta|rc).N（同仓库的
+#      format-v* 是另一条发版线；v0.1.0-alpha.12t3 这类历史测试 tag 按 semver 会排在
+#      alpha.17 之上，必须排除），并跳过 draft；
 #   2. 默认取最新的稳定版（非 prerelease，按版本号取最大）；
-#   3. 仓库里一个 v* 稳定版都没有时（0.1.0 发布前）回退到最新的 v* 预发布并打印说明；
-#   4. --pre（或 APROXY_PRE=1）：取最新创建的 v* release，预发布也可。
+#   3. 仓库里一个 v* 稳定版都没有时（0.1.0 发布前）回退到版本号最大的 v* 预发布并打印说明；
+#   4. --pre（或 APROXY_PRE=1）：取版本号最大的 v* release，预发布也可（与 `aproxy install
+#      --pre` 同一规则：按版本号而非创建时间，补丁版晚于预发布发布时也不会装到更低版本）。
 # 环境变量：
 #   APROXY_HOME     目录根（默认 ~/.aproxy）
 #   APROXY_NO_SKILLS=1   跳过 skill 文档
@@ -111,20 +114,26 @@ parse_releases() {
     '
 }
 
-# max_stable：stdin 为 tag 列表，输出版本号最大者（仅接受 vX.Y.Z）。
-# 用 awk 数值比较而不是 sort -V，避免依赖 sort 的 GNU 扩展（旧 BSD/busybox 不一定有）。
-max_stable() {
+# max_version：stdin 为 tag 列表，输出版本号最大者。只接受项目版本号文法
+# vX.Y.Z 或 vX.Y.Z-(alpha|beta|rc).N，其余行忽略。比较键逐段比：主.次.补 → 预发布
+# 档位（alpha 0 / beta 1 / rc 2 / 正式版 3，正式版高于同号的任何预发布）→ 预发布序号。
+# 用 awk 逐段数值比较而不是 sort -V，避免依赖 sort 的 GNU 扩展（旧 BSD/busybox 不一定有）。
+max_version() {
     awk '
-        /^v[0-9]+\.[0-9]+\.[0-9]+$/ {
-            split(substr($0, 2), p, ".")
-            key = p[1] * 1000000000000 + p[2] * 1000000 + p[3]
-            if (!seen || key > best) { best = key; tag = $0; seen = 1 }
+        /^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$/ {
+            n = split(substr($0, 2), p, /[.-]/)
+            k[1] = p[1] + 0; k[2] = p[2] + 0; k[3] = p[3] + 0
+            if (n == 3) { k[4] = 3; k[5] = 0 }
+            else { k[4] = (p[4] == "alpha") ? 0 : ((p[4] == "beta") ? 1 : 2); k[5] = p[5] + 0 }
+            better = !seen
+            if (seen) for (i = 1; i <= 5; i++) if (k[i] != b[i]) { better = (k[i] > b[i]); break }
+            if (better) { for (i = 1; i <= 5; i++) b[i] = k[i]; tag = $0; seen = 1 }
         }
         END { if (seen) print tag }
     '
 }
 
-# resolve_tag：设置全局 TAG；want_pre=1 时取最新创建的 v* release（含预发布）
+# resolve_tag：设置全局 TAG；want_pre=1 时取版本号最大的 v* release（含预发布）
 resolve_tag() {
     list="$TMP_DIR/releases.json"
     fetch "https://api.github.com/repos/$REPO/releases?per_page=100" "$list" \
@@ -132,19 +141,20 @@ resolve_tag() {
     parsed=$(parse_releases < "$list") \
         || { echo "无法解析 GitHub release 列表（响应格式与预期不符）；请改用显式 tag：sh install.sh v0.1.0" >&2; exit 1; }
     [ -n "$parsed" ] || { echo "release 列表为空或响应格式与预期不符（可能是 API 限流页）；请改用显式 tag：sh install.sh v0.1.0" >&2; exit 1; }
-    # 只留 v<数字> 开头且非 draft 的条目（排除 format-v*）
-    cands=$(printf '%s\n' "$parsed" | awk '$1 ~ /^v[0-9]/ && $2 == "false" { print }')
+    # 只留符合项目版本号文法且非 draft 的条目（排除 format-v* 与历史测试 tag）
+    cands=$(printf '%s\n' "$parsed" | awk '$1 ~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$/ && $2 == "false" { print }')
     [ -n "$cands" ] || { echo "仓库里没有可安装的 v* release" >&2; exit 1; }
 
     if [ "$want_pre" = "1" ]; then
-        TAG=$(printf '%s\n' "$cands" | head -n 1 | cut -d' ' -f1)
+        TAG=$(printf '%s\n' "$cands" | cut -d' ' -f1 | max_version)
         return
     fi
-    TAG=$(printf '%s\n' "$cands" | awk '$3 == "false" { print $1 }' | max_stable)
+    # 稳定版：prerelease 标志为 false 且 tag 没有预发布后缀，两个信号都满足才算
+    # （任一处标成预发布都不当稳定版装给默认用户）
+    TAG=$(printf '%s\n' "$cands" | awk '$3 == "false" && $1 !~ /-/ { print $1 }' | max_version)
     if [ -z "$TAG" ]; then
-        TAG=$(printf '%s\n' "$cands" | awk '$3 == "true" { print $1 }' | head -n 1)
-        [ -n "$TAG" ] || { echo "仓库里没有可安装的 v* release" >&2; exit 1; }
-        echo "说明: 仓库暂无 v* 稳定版，回退到最新预发布 $TAG（正式版发布后默认装稳定版）"
+        TAG=$(printf '%s\n' "$cands" | cut -d' ' -f1 | max_version)
+        echo "说明: 仓库暂无 v* 稳定版，回退到版本号最大的预发布 $TAG（正式版发布后默认装稳定版）"
     fi
 }
 

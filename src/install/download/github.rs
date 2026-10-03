@@ -68,13 +68,38 @@ fn mainline_version(tag: &str) -> Option<&str> {
     rest.chars().next()?.is_ascii_digit().then_some(rest)
 }
 
+/// 项目版本号文法（AGENTS.md：`vMAJOR.MINOR.PATCH`，预发布追加 `-alpha.N` /
+/// `-beta.N` / `-rc.N`）：只有符合这套文法的版本参与选版。
+///
+/// 为什么不能只靠 semver 合法性：仓库里留着历史测试 tag（如 `v0.1.0-alpha.12t3`、
+/// `v0.1.0-alpha.11t1`，2026-10-04 核实均带全套资产）。它们是合法 semver，但预发布
+/// 标识 `12t3` 是字母数字混合段——semver 规定「字母数字标识的优先级高于纯数字标识」，
+/// 于是 `0.1.0-alpha.12t3 > 0.1.0-alpha.17`。若参与选版，pre 通道会把 alpha.17 用户
+/// 「升级」到一个旧的测试构建。build 元数据（`+xxx`）同理不属于发布文法。
+fn is_release_grammar(ver: &semver::Version) -> bool {
+    if !ver.build.is_empty() {
+        return false;
+    }
+    let pre = ver.pre.as_str();
+    if pre.is_empty() {
+        return true;
+    }
+    let Some((kind, n)) = pre.split_once('.') else {
+        return false;
+    };
+    matches!(kind, "alpha" | "beta" | "rc")
+        && !n.is_empty()
+        && n.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// 纯函数选版：在 releases 列表 JSON（GitHub `/releases` 数组）中按通道取
 /// semver 最大的主线版本。过滤规则（逐条，任何一条不满足即跳过）：
 ///
 /// 1. 非 draft（匿名 API 本就看不到 draft，带 token 的环境才可能出现——
 ///    draft 资产不可公开下载）；
 /// 2. tag 匹配 `^v\d` 且去 `v` 后是合法 semver（`format-v*` 等其他发版线、
-///    手打的非版本 tag 一律不认）；
+///    手打的非版本 tag 一律不认），并符合项目版本号文法（见
+///    [`is_release_grammar`]——排除 `alpha.12t3` 这类历史测试 tag）；
 /// 3. 含 `required_asset`（本平台 baseline 二进制或 skill 总包）——发布
 ///    workflow 先建 release 后传资产，选中资产未齐的 release 只会 404；
 /// 4. 通道：Stable 只要正式版——GitHub `prerelease` 标志与 semver 预发布
@@ -99,6 +124,9 @@ pub fn pick_latest(
         let Ok(ver) = semver::Version::parse(ver_str) else {
             continue;
         };
+        if !is_release_grammar(&ver) {
+            continue;
+        }
         let has_asset = item["assets"].as_array().is_some_and(|list| {
             list.iter()
                 .any(|a| a["name"].as_str() == Some(required_asset))
@@ -218,6 +246,38 @@ mod tests {
             // stable 通道：主线只有预发布 → 无可选（不得回退去拿 format 线或预发布）
             assert_eq!(pick_latest(&list, Channel::Stable, ASSET), None);
         }
+    }
+
+    #[test]
+    fn historical_test_tags_never_selected() {
+        // 现网形态（2026-10-04 核实）：v0.1.0-alpha.12t3 / alpha.11t1 测试 release
+        // 带全套资产。按 semver 规则 alpha.12t3 > alpha.17（字母数字段优先级高于
+        // 纯数字段），不按项目文法过滤就会把 alpha.17 用户「升级」到旧测试构建
+        let list = json!([
+            rel("v0.1.0-alpha.17", true),
+            rel("format-v0.1.0", false),
+            rel("v0.1.0-alpha.12t3", true),
+            rel("v0.1.0-alpha.12", true),
+            rel("v0.1.0-alpha.11t1", true),
+        ]);
+        assert_eq!(
+            pick_latest(&list, Channel::Pre, ASSET).as_deref(),
+            Some("0.1.0-alpha.17")
+        );
+        // 文法边界：rc > beta > alpha（字典序恰好成立）；build 元数据与非法后缀排除
+        let list = json!([
+            rel("v0.2.0-beta.3", true),
+            rel("v0.2.0-rc.1", true),
+            rel("v0.2.0-alpha.9", true),
+            rel("v0.2.0-rc.1x", true),
+            rel("v0.2.0+build.5", false),
+            rel("v0.2.0-preview.1", true),
+        ]);
+        assert_eq!(
+            pick_latest(&list, Channel::Pre, ASSET).as_deref(),
+            Some("0.2.0-rc.1")
+        );
+        assert_eq!(pick_latest(&list, Channel::Stable, ASSET), None);
     }
 
     #[test]

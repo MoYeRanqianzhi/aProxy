@@ -253,6 +253,16 @@ pub(crate) fn handle_config_cmd(path: PathBuf, args: ConfigArgs, explicit_config
                 .unwrap_or_else(|| "(未设置)".to_string())
         );
         println!("keepalive_interval_secs = {}", cfg.keepalive_interval_secs);
+        // keepalive_trigger：同 max_body_mb 等的三态来源展示；原值原样打印（含
+        // 非法写法——此处不校验，start/doctor 会点名报错，展示真实内容便于对照）
+        match &cfg.keepalive_trigger {
+            Some(t) => println!(
+                "keepalive_trigger       = {t}（accept=看 Accept 头 / body_stream=看请求体 stream:true / any=任一）"
+            ),
+            None => println!(
+                "keepalive_trigger       = （未在 toml 设置，运行时取 settings.json 全局默认）"
+            ),
+        }
         // 0 表示所有重试零延迟，语义特殊，提示出来
         if cfg.max_retry_backoff_secs == 0 {
             println!("max_retry_backoff_secs = 0（所有重试零延迟）");

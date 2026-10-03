@@ -5,6 +5,7 @@
 //! - `extra_headers`：仅当上游请求未携带该头时追加
 //! - `override_headers`：无条件覆盖（用于非 Bearer 鉴权或额外头）
 //! - `keepalive_interval_secs`：流式重试期间的保活心跳间隔，0 表示关闭
+//! - `keepalive_trigger`：哪些请求走保活通道（看 Accept 头 / 请求体 stream:true / 任一）
 //! - `proxy`：上游请求经配置的代理转发（与常见代理配置一致，支持 http/https/socks5，
 //!   可在 URL 内嵌 user:pass，也可用 `proxy_username`/`proxy_password` 单独指定）；
 //!   未配置时保留 reqwest 默认的系统代理（读取 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 环境变量）
@@ -30,6 +31,51 @@ pub const DEFAULT_TRANSFORM_IDLE_TIMEOUT_SECS: u64 = 300;
 /// 外部转换器单请求转换超时的内置默认值（秒，`timeout_secs` 未配置时生效）。
 /// 转换耗时极低，30s 已极宽裕；0 = 不限。
 pub const DEFAULT_TRANSFORM_TIMEOUT_SECS: u64 = 30;
+
+/// 保活触发条件（`keepalive_trigger` 的取值）：哪些请求在等待上游与重试期间走
+/// 「先向客户端提交响应头、再用 SSE 注释心跳保活」的通道。语义详见
+/// `Config::keepalive_trigger` 字段说明。
+///
+/// 配置层存的是原始字符串（toml / settings.json 都是），由本枚举的 `parse`
+/// 统一解释：非法值要在 validate() 里点名字段报错——若直接让 serde 解析成
+/// 枚举，settings.json 里的一个笔误会让整个文件解析失败、静默回退成全默认
+/// （连别名一起丢），用户看不到是哪个字段错了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepaliveTrigger {
+    /// 客户端 Accept 头含 `text/event-stream`（0.1.0 之前的唯一判定）
+    Accept,
+    /// 客户端原始请求体是 JSON 对象且顶层 `"stream": true`
+    BodyStream,
+    /// 两者任一（内置默认）
+    Any,
+}
+
+impl KeepaliveTrigger {
+    /// 配置里的写法 → 枚举；不认识的写法返回 None（validate 据此报错）。
+    /// 只认小写原文，与 `mode = "persistent"` 等枚举字段的严格程度一致。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "accept" => Some(Self::Accept),
+            "body_stream" => Some(Self::BodyStream),
+            "any" => Some(Self::Any),
+            _ => None,
+        }
+    }
+
+    /// 枚举 → 配置里的写法（`parse` 的逆）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::BodyStream => "body_stream",
+            Self::Any => "any",
+        }
+    }
+}
+
+/// 保活触发条件的内置默认值：`any`。真实 Claude Code 的流式主请求是
+/// `Accept: application/json` + 请求体 `"stream": true`（2026-10-04 实测），
+/// 只看 Accept 的旧判定让它永远进不了保活通道——默认必须把请求体也算进来。
+pub const DEFAULT_KEEPALIVE_TRIGGER: KeepaliveTrigger = KeepaliveTrigger::Any;
 
 /// 外部转换器的运行模式（`request_transform`/`response_transform` 的 `mode`）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +171,28 @@ pub struct Config {
     /// 流式重试保活心跳间隔（秒），0 表示关闭。默认 15 秒。
     #[serde(default = "default_keepalive_secs")]
     pub keepalive_interval_secs: u64,
+    /// 保活触发条件：`"accept"` | `"body_stream"` | `"any"`。命中的请求（且
+    /// keepalive_interval_secs > 0、非 forward_only）在等待上游与重试期间
+    /// 先向客户端提交响应头，再每 keepalive_interval_secs 发一行 SSE 注释
+    /// （`: keepalive`），防止客户端因首字节/空闲超时放弃请求：
+    /// - 上游回 2xx + `text/event-stream`（未压缩）时立即转发上游真实 status
+    ///   与响应头（去掉 content-length 与 hop-by-hop），之后照旧完整缓冲、校验，
+    ///   无误再回放；配置了 response_transform 时不转发上游头
+    /// - 上游一个 keepalive 间隔内没给出可提交的结果、或需要重试时，先提交
+    ///   骨架头（200 + text/event-stream）
+    /// - 提交之后的重试都在同一个响应里进行，客户端只见到心跳
+    ///
+    /// 判定在请求转换（request_transform）**之前**、基于客户端视角：
+    /// - `accept`：客户端 Accept 头含 text/event-stream（旧行为）
+    /// - `body_stream`：客户端原始请求体是 JSON 对象且顶层 `"stream": true`
+    ///   （OpenAI / Anthropic 等协议通用的流式开关；判定只看请求体字段，与
+    ///   URL 无关；溢写到磁盘的大请求体同样流式只看顶层键）
+    /// - `any`：两者任一
+    ///
+    /// 未设置时用 settings.json 的 `keepalive_trigger`（全局默认，内置 `any`）。
+    /// 存原始字符串、由 `KeepaliveTrigger::parse` 解释，非法值 validate() 报错。
+    #[serde(default)]
+    pub keepalive_trigger: Option<String>,
     /// 上游代理 URL，例如 `http://127.0.0.1:7890`、`socks5://user:pass@127.0.0.1:7890`。
     /// 未设置时使用系统/环境变量代理。
     #[serde(default)]
@@ -231,8 +299,9 @@ pub struct Config {
     pub allowed_origins: Option<Vec<String>>,
     /// 请求转换器（外部 format 程序）：请求体缓冲完成后交给它改写
     /// （body/headers/url/method），重试全程重放转换后的产物。
-    /// **失败语义**：转换失败（进程崩溃/超时/error 行）→ 502 + 原因，不重试
-    /// （确定性失败）。与 forward_only 互斥（后者不缓冲请求体，转换器需要
+    /// **失败语义**：转换失败（进程崩溃/超时/error 行/协议错误）→ 502 + 原因，
+    /// 不重试（按约定，请求未发往上游；各类失败的性质见 `transform::TransformError`
+    /// 的分类说明）。与 forward_only 互斥（后者不缓冲请求体，转换器需要
     /// 全量 body）——共存时 validate() 启动报错。仅 toml 每实例配置，无
     /// settings.json 全局默认层（设计决策：转换是场景特定功能）。
     #[serde(default)]
@@ -304,6 +373,7 @@ impl Default for Config {
             extra_headers: HashMap::new(),
             override_headers: HashMap::new(),
             keepalive_interval_secs: default_keepalive_secs(),
+            keepalive_trigger: None,
             proxy: None,
             proxy_username: None,
             proxy_password: None,
@@ -418,6 +488,15 @@ impl Config {
                 format!("bounded_retry_paths 含非法正则 \"{p}\": {e}")
             })?;
         }
+        // 保活触发条件：只认三种写法，其余启动即拒绝并点名字段（错误消息里
+        // 带上用户写的原值，便于对照修改）
+        if let Some(t) = &self.keepalive_trigger
+            && KeepaliveTrigger::parse(t).is_none()
+        {
+            return Err(format!(
+                "keepalive_trigger 取值无效 \"{t}\"：只能是 \"accept\"、\"body_stream\" 或 \"any\""
+            ));
+        }
         // 转换器：command 非空；persistent 模式 pool_max >= 1；与 forward_only
         // 互斥（后者不缓冲请求体，转换器需要全量 body——两者同开是配置矛盾）
         for (name, t) in [
@@ -475,6 +554,17 @@ impl Config {
     /// 保活间隔
     pub fn keepalive_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.keepalive_interval_secs)
+    }
+
+    /// 保活触发条件生效值（同 body_limit_bytes 的注入/回退语义：toml 显式值 >
+    /// settings 注入值 > 内置 `any`）。消费点必须走本方法——不经 settings 注入
+    /// 的构建路径（doctor/find/测试）上 `None` 是常态。非法写法在 validate()
+    /// 拦截；未经 validate 的直连构建（测试）遇到非法值按内置默认处理。
+    pub fn keepalive_trigger(&self) -> KeepaliveTrigger {
+        self.keepalive_trigger
+            .as_deref()
+            .and_then(KeepaliveTrigger::parse)
+            .unwrap_or(DEFAULT_KEEPALIVE_TRIGGER)
     }
 
     /// 请求体大小上限（字节）。max_body_mb 已在启动时注入 settings 值（toml
@@ -1022,6 +1112,50 @@ mod tests {
             !legacy.forward_only_enabled(),
             "None 回退内置关闭（默认不得启用仅转发模式）"
         );
+    }
+
+    #[test]
+    fn keepalive_trigger_override_and_validate() {
+        // 三种合法写法落盘往返、访问器解释一致；未配置回退内置 any（Claude Code
+        // 的流式请求是 Accept: application/json + stream:true，默认必须覆盖它）；
+        // 非法写法 validate 点名字段拒绝
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.toml");
+        for (raw, want) in [
+            ("accept", KeepaliveTrigger::Accept),
+            ("body_stream", KeepaliveTrigger::BodyStream),
+            ("any", KeepaliveTrigger::Any),
+        ] {
+            let cfg = Config {
+                base_url: "https://api.example.com".to_string(),
+                keepalive_trigger: Some(raw.to_string()),
+                ..Default::default()
+            };
+            save_to(&path, &cfg).unwrap();
+            let loaded = load_from(&path);
+            assert_eq!(loaded.keepalive_trigger.as_deref(), Some(raw));
+            assert_eq!(loaded.keepalive_trigger(), want);
+            assert_eq!(want.as_str(), raw, "as_str 必须是 parse 的逆");
+            assert!(loaded.validate().is_ok());
+        }
+
+        std::fs::write(&path, "base_url = \"https://api.example.com\"").unwrap();
+        let legacy = load_from(&path);
+        assert_eq!(legacy.keepalive_trigger, None, "旧配置文件应读出 None");
+        assert_eq!(legacy.keepalive_trigger(), KeepaliveTrigger::Any);
+
+        for bad in ["Any", "stream", "", "accept "] {
+            let cfg = Config {
+                base_url: "https://api.example.com".to_string(),
+                keepalive_trigger: Some(bad.to_string()),
+                ..Default::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.contains("keepalive_trigger") && err.contains(&format!("\"{bad}\"")),
+                "错误应点名字段并带原值: {err}"
+            );
+        }
     }
 
     #[test]

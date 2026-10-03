@@ -92,6 +92,14 @@ pub struct Settings {
     /// Origin 的请求。各 config.toml 可用 `allowed_origins` 按实例覆盖。
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    /// 保活触发条件（全局默认值，语义见 config.toml 同名字段）：`"accept"` |
+    /// `"body_stream"` | `"any"`。默认 `"any"`。各 config.toml 可用
+    /// `keepalive_trigger` 按实例覆盖（toml > settings > 内置 any）。
+    /// 存原始字符串：非法写法由 check_settings_errors_in 与启动时的 validate
+    /// 点名报错——做成 serde 枚举的话，一个笔误会让整份 settings.json 解析
+    /// 失败、静默回退全默认（连别名一起丢）。
+    #[serde(default = "default_keepalive_trigger")]
+    pub keepalive_trigger: String,
     /// 看门狗总开关：开启时 `aproxy start`/守护自检会确保存在一个全局看护进程
     /// （同二进制以隐藏标记 `--daemon-watchdog` 分离启动），守护崩溃/挂死时按
     /// .restore 记录自动重拉。
@@ -159,6 +167,12 @@ fn default_forward_only() -> bool {
     crate::config::DEFAULT_FORWARD_ONLY
 }
 
+fn default_keepalive_trigger() -> String {
+    crate::config::DEFAULT_KEEPALIVE_TRIGGER
+        .as_str()
+        .to_string()
+}
+
 pub(crate) fn default_watchdog() -> bool {
     true
 }
@@ -200,6 +214,7 @@ impl Default for Settings {
             bounded_retry_paths: Vec::new(),
             allowed_hosts: Vec::new(),
             allowed_origins: Vec::new(),
+            keepalive_trigger: default_keepalive_trigger(),
             watchdog: default_watchdog(),
             watchdog_heartbeat_secs: default_watchdog_heartbeat_secs(),
             watchdog_stale_after_cycles: default_watchdog_stale_after_cycles(),
@@ -438,6 +453,14 @@ pub fn check_settings_errors_in(path: &std::path::Path) -> Vec<String> {
             ));
         }
     }
+    // keepalive_trigger（settings 全局默认层）：与 bounded_retry_paths 同理预检，
+    // 非法写法在 start 注入后会被 validate 拒绝启动
+    if crate::config::KeepaliveTrigger::parse(&settings.keepalive_trigger).is_none() {
+        errors.push(format!(
+            "keepalive_trigger 取值无效 \"{}\"：只能是 \"accept\"、\"body_stream\" 或 \"any\"（来源 settings.json；start 该项全局默认的实例会失败）",
+            settings.keepalive_trigger
+        ));
+    }
     errors
 }
 
@@ -548,6 +571,34 @@ mod tests {
         std::fs::write(&path, "{\"aliases\": {}}").unwrap();
         let legacy = load_from(&path);
         assert!(legacy.allowed_hosts.is_empty() && legacy.allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn keepalive_trigger_roundtrip_default_and_check() {
+        // 默认 "any"；显式值落盘往返；旧 settings.json（无字段）读出 "any"——
+        // 升级后 Claude Code 类请求（Accept: application/json + stream:true）
+        // 自动获得保活；非法写法由 doctor 预检点名报出
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path_in(dir.path());
+        assert_eq!(Settings::default().keepalive_trigger, "any");
+        let s = Settings {
+            keepalive_trigger: "accept".to_string(),
+            ..Default::default()
+        };
+        save_to(&path, &s).unwrap();
+        assert_eq!(load_from(&path).keepalive_trigger, "accept");
+        assert!(check_settings_errors_in(&path).is_empty());
+
+        std::fs::write(&path, r#"{"aliases":{}}"#).unwrap();
+        assert_eq!(load_from(&path).keepalive_trigger, "any");
+
+        std::fs::write(&path, r#"{"keepalive_trigger": "sse"}"#).unwrap();
+        let errors = check_settings_errors_in(&path);
+        assert_eq!(errors.len(), 1, "应恰好报出一条: {errors:?}");
+        assert!(
+            errors[0].contains("keepalive_trigger") && errors[0].contains("\"sse\""),
+            "{errors:?}"
+        );
     }
 
     #[test]

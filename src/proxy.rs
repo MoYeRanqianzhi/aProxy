@@ -24,10 +24,22 @@
 //!   溢写磁盘、每次重试重新流式读取。上限 `max_body_mb`（默认 128，0=不限）。
 //! - 首轮快速路径：attempt 1 的结果先做判定，成功则直接原样回放（status 与全部
 //!   响应头保真）；仅当需要重试时才进入重试通道——首轮成功是常态路径，保真优先。
-//! - 重试期间对客户端的保活：仅在「需要重试」且客户端接受 SSE 时，才立即返回
-//!   SSE 流式骨架，由后台任务从 attempt 2 继续无限重试，并在重试间隙向下游发送
-//!   SSE 注释保活（`: keepalive ...\n\n`），防止客户端因 idle 超时而断开；
-//!   后台任务在客户端断开（channel 关闭）时立即退出，不空转。
+//! - 保活通道（`proxy_with_keepalive`）：「保活适用」的请求（`keepalive_trigger`
+//!   判定命中：Accept 含 text/event-stream 和/或客户端原始请求体顶层
+//!   `"stream": true`；且 keepalive 开启、非 forward_only）从首轮起就由后台任务
+//!   驱动。响应的「提交点」是一个三态机——未提交 → 提交上游真实头 / 提交骨架头：
+//!   - 上游回 2xx + 未压缩的 text/event-stream 头 → 立即把上游真实 status 与
+//!     响应头转给客户端（未配置 response_transform 时）
+//!   - 一个 keepalive 间隔内仍无可提交的结果，或需要重试 → 提交骨架头
+//!     （200 + text/event-stream）
+//!   - 未提交前首轮就成功完成 → 走与上面相同的保真快速路径
+//!
+//!   提交之后，无论在等上游响应头、缓冲上游流还是退避，都每
+//!   `keepalive_interval_secs` 发一行 SSE 注释（`: keepalive\n\n`）；完整缓冲、
+//!   判定无误后才把成功那一次的原样字节写进同一个响应，期间的重试客户端只见到
+//!   心跳。客户端断开（任一阶段）即中止在途上游请求、不再发起新请求。
+//!   不适用保活的请求（如 stream:false 的普通 JSON 请求）沿用首轮快速路径 +
+//!   `proxy_without_keepalive`：成功后一次性回放，期间不向客户端写任何字节。
 //! - 入站来源校验（handler 第一步）：Host 不在 `allowed_hosts`、或带了不在
 //!   `allowed_origins` 里的 Origin 的请求本地 403——不转发、不注入 api_key、
 //!   不进重试循环（防 DNS 重绑定与网页跨站调用；语义见 `Config` 同名字段）
@@ -583,6 +595,140 @@ impl Drop for RequestBody {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 保活触发判定（`keepalive_trigger`）
+//
+// 真实 Claude Code 的流式主请求是 `Accept: application/json` + 请求体
+// `"stream": true`（2026-10-04 实测），只看 Accept 判不出它是流式请求。请求体
+// 判定只认 JSON 顶层对象的 `stream` 键为字面量 `true`——OpenAI / Anthropic 等
+// 协议通用的流式开关，与 URL 无关。
+// ---------------------------------------------------------------------------
+
+/// serde 访问器：只读 JSON 顶层对象的 `stream` 键，其余一切值经 `IgnoredAny`
+/// 跳过——**不**把请求体物化成 `serde_json::Value`，内存占用与请求体大小无关
+/// （几十 MB 的上下文 + base64 图片也只是顺序扫一遍）。
+///
+/// `top_level = true` 解释整个请求体：只有对象才可能为真，其他形态（数组、
+/// 字符串……）一律为假；`top_level = false` 解释 `stream` 键的值：只有字面量
+/// `true` 为真（`"true"`、`1` 都不算——上游协议也不认它们）。重复键按最后一次
+/// 出现为准，与主流 JSON 解析器（JS `JSON.parse`、Python `json`）一致。
+struct StreamFlagProbe {
+    top_level: bool,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for StreamFlagProbe {
+    type Value = bool;
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<bool, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for StreamFlagProbe {
+    type Value = bool;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("任意 JSON 值")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<bool, E> {
+        Ok(!self.top_level && v)
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<bool, A::Error> {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(false)
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<bool, A::Error> {
+        use serde::de::IgnoredAny;
+        if !self.top_level {
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            return Ok(false);
+        }
+        let mut stream = false;
+        // 顶层键名逐个分配 String：顶层键只有寥寥几个，嵌套对象的键全走 IgnoredAny
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "stream" {
+                stream = map.next_value_seed(StreamFlagProbe { top_level: false })?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(stream)
+    }
+}
+
+/// 以 `StreamFlagProbe` 扫完整个 JSON 文本；任何解析错误（非 JSON、截断、尾随
+/// 垃圾）都按「不是流式请求」处理——这样的请求体上游本就不会当流式请求处理。
+fn json_requests_stream<'de, R: serde_json::de::Read<'de>>(
+    mut de: serde_json::Deserializer<R>,
+) -> bool {
+    use serde::de::DeserializeSeed as _;
+    matches!(
+        StreamFlagProbe { top_level: true }.deserialize(&mut de),
+        Ok(true)
+    ) && de.end().is_ok()
+}
+
+/// 客户端原始请求体是否为顶层 `"stream": true` 的 JSON 对象。内存请求体
+/// （≤ 1 MiB）就地扫描；溢写磁盘的大请求体在阻塞线程池里从文件流式读——
+/// 几十 MB 的同步解析不能占住 async worker 线程。
+async fn request_body_wants_stream(body: &RequestBody) -> bool {
+    match body {
+        RequestBody::Memory(b) => json_requests_stream(serde_json::Deserializer::from_slice(b)),
+        RequestBody::Disk { path, .. } => {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || {
+                let Ok(file) = std::fs::File::open(&path) else {
+                    return false;
+                };
+                json_requests_stream(serde_json::Deserializer::from_reader(
+                    std::io::BufReader::with_capacity(64 * 1024, file),
+                ))
+            })
+            .await
+            .unwrap_or(false)
+        }
+    }
+}
+
+/// 按 `keepalive_trigger` 判定本请求是否「保活适用」（keepalive 开关与
+/// forward_only 由调用方另行把关）。必须在请求转换之前调用：判定是客户端视角
+/// 的——转换器改写 Accept 或请求体（如协议转换去掉 stream 字段）不应改变
+/// 「客户端在等一个流」这一事实。
+async fn keepalive_triggered(
+    trigger: crate::config::KeepaliveTrigger,
+    headers: &HeaderMap,
+    body: &RequestBody,
+) -> bool {
+    use crate::config::KeepaliveTrigger;
+    let accept_sse = || {
+        headers
+            .get(http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| s.to_ascii_lowercase().contains("text/event-stream"))
+    };
+    match trigger {
+        KeepaliveTrigger::Accept => accept_sse(),
+        KeepaliveTrigger::BodyStream => request_body_wants_stream(body).await,
+        // Accept 命中就不必扫请求体
+        KeepaliveTrigger::Any => accept_sse() || request_body_wants_stream(body).await,
+    }
+}
+
 /// 响应 spool 缓冲：内存累积，超 `RESIDENT_LIMIT` 溢写磁盘。
 /// 完成后统一为 `SpooledBody` 消费（判定/回放）。
 enum SpoolBuffer {
@@ -1062,7 +1208,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
     // 就丢掉了全部意义（内存随负载增长、下游要等请求体读完才见到首字节）；
     // 同时它位于 requests_total.fetch_add 与 apply_header_overrides **之后**，
     // 所以 status 的请求计数与鉴权/头改写行为与常规模式完全一致。
-    // 这条路径整体不进重试循环、保活心跳、错误内容拦截、spool 与 client_wants_sse
+    // 这条路径整体不进重试循环、保活心跳、错误内容拦截、spool 与 keepalive_trigger
     // 判定，也不做响应体解码（本模式不对响应内容做任何检查，无需解码）。
     if state.config.forward_only_enabled() {
         let target_url = upstream_url(&state.config, &uri);
@@ -1092,14 +1238,13 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
 
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let bounded_retry = state.bounded_retry_matches(path_and_query);
-    // 是否启用 SSE 保活心跳（仅当客户端接受 SSE 且配置启用）——在转换前判定，
-    // 转换器改写 headers 后判定语义应保持「客户端视角」（信封不含 accept 的
-    // 改写不影响保活选择）
-    let client_wants_sse = headers
-        .get(http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_ascii_lowercase().contains("text/event-stream"))
-        .unwrap_or(false);
+    // 是否「保活适用」（走保活通道：先提交响应头、再以 SSE 注释心跳维持连接）：
+    // keepalive 开启且 keepalive_trigger 判定命中。必须在请求转换前判定——
+    // 判定语义是「客户端视角」，转换器改写 Accept/请求体不影响保活选择
+    let keepalive_dur = state.config.keepalive_interval();
+    let keepalive_enabled = state.config.keepalive_enabled() && keepalive_dur.as_secs() > 0;
+    let keepalive_applies = keepalive_enabled
+        && keepalive_triggered(state.config.keepalive_trigger(), &headers, &req_body).await;
 
     let mut target_url = upstream_url(&state.config, &uri);
 
@@ -1108,7 +1253,8 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
     // 循环零分支。位置约束：必须在首轮 forward_once 之前（否则重放的是未转换
     // 请求）、bounded_retry 匹配之后（bounded 对原始路径判定——路径集合是
     // 客户端视角，转换是实例级配置，语义不同源）。
-    // 失败 → 502 终态不重试（转换失败是确定性的，重试无意义）。
+    // 失败 → 502 终态不重试，请求未发往上游（失败按成因分类，各类性质见
+    // `transform::TransformError` 的分类说明）。
     let mut method = method;
     let mut headers = headers;
     let mut req_body = req_body;
@@ -1133,10 +1279,10 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
             Err(e) => {
                 let msg = format!("请求转换失败: {e}");
                 state.note_upstream_failure(&msg);
-                tracing::warn!(error = %e, "请求转换失败，502 终态（确定性失败不重试）");
+                tracing::warn!(error = %e, "请求转换失败，502 终态（请求侧转换失败按约定不重试）");
                 return (
                     StatusCode::BAD_GATEWAY,
-                    format!("{msg}（不重试：转换失败是确定性的）"),
+                    format!("{msg}（请求侧转换失败不重试，未发往上游）"),
                 )
                     .into_response();
             }
@@ -1150,20 +1296,42 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
         "代理请求"
     );
 
-    let keepalive_dur = state.config.keepalive_interval();
-    let keepalive_enabled = state.config.keepalive_enabled() && keepalive_dur.as_secs() > 0;
+    let max_spool_bytes = spool_limit_bytes(&state.config);
+
+    // 保活适用：从首轮起交给保活通道（它自己处理首轮快速路径与提交点）。
+    // req_body 所有权移交，随通道结束自动 Drop 删除磁盘临时文件。
+    if keepalive_applies {
+        // 保活通道会往响应体里插 `: keepalive` 注释——只有未压缩的体才能这样
+        // 插入（往 gzip/br 流里插明文，客户端解压必坏）。故对保活适用的请求
+        // 要求上游以 identity 编码回应：客户端照旧拿到合法响应（未压缩永远是
+        // 可接受的编码），代价只是上游到本机这一段多传一些字节。放在请求转换
+        // 之后，覆盖 format 可能写入的同名头。
+        headers.insert(
+            http::header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+        return proxy_with_keepalive(
+            state,
+            method,
+            target_url,
+            headers,
+            req_body,
+            max_spool_bytes,
+            bounded_retry,
+        )
+        .await;
+    }
 
     // 首轮（attempt 1）先行：成功则完整保真回放（status/headers 不失真），
     // 需要重试才进入重试通道——首轮成功是常态路径。
-    let max_spool_bytes = spool_limit_bytes(&state.config);
     let first = forward_once(
-        &state.client,
+        &state,
         &method,
         &target_url,
         &headers,
         &req_body,
         max_spool_bytes,
-        state.spool_dir.as_deref(),
+        None,
     )
     .await;
 
@@ -1200,16 +1368,8 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
 
     if !needs_retry {
         return match first {
-            ForwardResult::TooLarge => (
-                StatusCode::BAD_GATEWAY,
-                "上游响应体超出 spool 上限，无法回放（重试无意义）",
-            )
-                .into_response(),
-            ForwardResult::SpoolFailed(e) => (
-                StatusCode::BAD_GATEWAY,
-                format!("本地磁盘缓存写入失败，无法回放: {e}"),
-            )
-                .into_response(),
+            ForwardResult::TooLarge => too_large_response(),
+            ForwardResult::SpoolFailed(e) => spool_failed_response(&e),
             ForwardResult::Response {
                 status,
                 headers: resp_headers,
@@ -1217,40 +1377,23 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
                 body,
                 ..
             } => {
-                // 成功后交给响应转换器（失败透传原样），再按转换后产物重算
-                // 流式判定（format 可改 content-type/body 形态）
-                let (resp_headers, body) =
-                    transform_response_if_configured(&state, &target_url, resp_headers, body).await;
-                let is_streaming = match &body {
-                    // 内存模式：整体判定（含 body 嗅探，与旧行为一致）
-                    SpooledBody::Memory(_) => {
-                        retry::is_streaming_response(&resp_headers, body.memory_bytes())
-                    }
-                    // 磁盘模式：content-type 判定（全量嗅探需读回整个文件，
-                    // 而磁盘回放本就是 chunked 流式）
-                    SpooledBody::Disk { .. } => retry::is_streaming_content_type(&resp_headers),
-                };
-                tracing::info!(attempt = 1, status = %status, is_streaming, "首轮成功");
-                build_replay_response(status, resp_headers, &raw_headers, body, is_streaming).await
+                replay_success(
+                    &state,
+                    &target_url,
+                    1,
+                    status,
+                    resp_headers,
+                    &raw_headers,
+                    body,
+                )
+                .await
             }
             ForwardResult::NetworkError(_) => unreachable!("NetworkError 必定 needs_retry"),
         };
     }
 
-    // 需要重试：按 keepalive 条件选择通道（req_body 所有权移交，随通道结束
-    // 自动 Drop 删除磁盘临时文件）
-    if keepalive_enabled && client_wants_sse {
-        return proxy_with_keepalive(
-            state,
-            method,
-            target_url,
-            headers,
-            req_body,
-            max_spool_bytes,
-            bounded_retry,
-        )
-        .await;
-    }
+    // 需要重试（不适用保活）：成功后一次性回放（req_body 所有权移交，随通道
+    // 结束自动 Drop 删除磁盘临时文件）
     proxy_without_keepalive(
         state,
         method,
@@ -1261,6 +1404,50 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
         bounded_retry,
     )
     .await
+}
+
+/// 上游响应体超出 spool 上限的 502 终态（尚未向客户端提交任何字节时）
+fn too_large_response() -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        "上游响应体超出 spool 上限，无法回放（重试无意义）",
+    )
+        .into_response()
+}
+
+/// 本地磁盘 spool 故障的 502 终态（尚未向客户端提交任何字节时）
+fn spool_failed_response(e: &str) -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        format!("本地磁盘缓存写入失败，无法回放: {e}"),
+    )
+        .into_response()
+}
+
+/// 成功响应的保真回放（尚未向客户端提交任何字节的出口共用：首轮快速路径、
+/// 非保活重试通道、保活通道里提交前就成功的首轮）：先交响应转换器（失败透传
+/// 原样），再按转换后产物重算流式判定（format 可改 content-type/body 形态），
+/// 最后以上游 status 与响应头原样回放。
+async fn replay_success(
+    state: &AppState,
+    target_url: &str,
+    attempt: u32,
+    status: StatusCode,
+    resp_headers: HeaderMap,
+    raw_headers: &reqwest::header::HeaderMap,
+    body: SpooledBody,
+) -> Response {
+    let (resp_headers, body) =
+        transform_response_if_configured(state, target_url, resp_headers, body).await;
+    let is_streaming = match &body {
+        // 内存模式：整体判定（含 body 嗅探，与旧行为一致）
+        SpooledBody::Memory(_) => retry::is_streaming_response(&resp_headers, body.memory_bytes()),
+        // 磁盘模式：content-type 判定（全量嗅探需读回整个文件，而磁盘回放本就
+        // 是 chunked 流式）
+        SpooledBody::Disk { .. } => retry::is_streaming_content_type(&resp_headers),
+    };
+    tracing::info!(attempt, status = %status, is_streaming, "上游成功，回放响应");
+    build_replay_response(status, resp_headers, raw_headers, body, is_streaming).await
 }
 
 /// 响应侧转换入口（三出口共用）：未配置时原样返回；转换失败时 warn + 原样
@@ -1478,8 +1665,8 @@ fn preview_body(body: &[u8], limit: usize, total_bytes: usize) -> String {
     }
 }
 
-/// 非 SSE 客户端的重试通道：从 attempt 2 起无限重试（attempt 1 已在 proxy_handler 完成），
-/// 响应在成功后一次性返回。受限重试路径（`bounded_retry`）例外：有响应的失败
+/// 不适用保活的请求的重试通道：从 attempt 2 起无限重试（attempt 1 已在 proxy_handler
+/// 完成），响应在成功后一次性返回。受限重试路径（`bounded_retry`）例外：有响应的失败
 /// 达到 [`retry::BOUNDED_RETRY_MAX_ATTEMPTS`] 次后透传最后一次失败响应。
 async fn proxy_without_keepalive(
     state: AppState,
@@ -1520,13 +1707,13 @@ async fn proxy_without_keepalive(
         }
 
         let result = forward_once(
-            &state.client,
+            &state,
             &method,
             &target_url,
             &headers,
             &req_body,
             max_spool_bytes,
-            state.spool_dir.as_deref(),
+            None,
         )
         .await;
 
@@ -1539,20 +1726,12 @@ async fn proxy_without_keepalive(
             ForwardResult::TooLarge => {
                 state.note_upstream_failure("上游响应体超出 spool 上限");
                 tracing::error!(attempt, "上游响应体超出 spool 上限，终止重试");
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    "上游响应体超出 spool 上限，无法回放（重试无意义）",
-                )
-                    .into_response();
+                return too_large_response();
             }
             ForwardResult::SpoolFailed(e) => {
                 state.note_upstream_failure(&format!("本地 spool 故障: {e}"));
                 tracing::error!(attempt, error = %e, "本地 spool 故障，终止重试");
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    format!("本地磁盘缓存写入失败: {e}"),
-                )
-                    .into_response();
+                return spool_failed_response(&e);
             }
             ForwardResult::Response {
                 status,
@@ -1561,45 +1740,38 @@ async fn proxy_without_keepalive(
                 body,
                 disk_scan,
             } => {
-                // 成功与「受限路径透传」都走完整回放，流式判定对两者一致
-                let is_streaming = match &body {
-                    SpooledBody::Memory(_) => {
-                        retry::is_streaming_response(&raw_headers, body.memory_bytes())
-                    }
-                    SpooledBody::Disk { .. } => retry::is_streaming_content_type(&raw_headers),
-                };
-                if needs_retry_response(attempt, &status, &raw_headers, &body, &disk_scan) {
-                    // 受限重试路径：有响应的失败达到尝试上限后不再重试，把最后
-                    // 一次失败响应原样透传——客户端拿到真实 404 自行处理，好过
-                    // 永远等不到终态（compact 事故）。仅封顶「上游有响应」的失败：
-                    // 网络错误是真正的瞬时类，仍无限重试，且它没有响应可供回放。
-                    if bounded_retry && attempt >= retry::BOUNDED_RETRY_MAX_ATTEMPTS {
-                        tracing::warn!(
-                            attempt,
-                            status = %status,
-                            "受限重试路径达到尝试上限，透传最后一次上游响应"
-                        );
-                        state.note_upstream_failure(&format!(
-                            "上游返回 {status}（受限重试路径，达上限透传）"
-                        ));
-                    } else {
-                        state
-                            .note_upstream_failure(&format!("上游返回 {status}（错误内容，重试）"));
-                        continue; // body Drop：磁盘临时文件删除
-                    }
-                } else {
-                    // 成功：按是否流式选择回放方式，保证“原样流式”
-                    tracing::info!(attempt, status = %status, is_streaming, "重试后成功");
-                    // 成功后交给响应转换器（bounded 透传分支是错误响应，不经
-                    // format——用户已定），再按转换后产物重算流式判定
-                    let (resp_headers, body) =
-                        transform_response_if_configured(&state, &target_url, resp_headers, body)
-                            .await;
+                if !needs_retry_response(attempt, &status, &raw_headers, &body, &disk_scan) {
+                    // 成功：交给响应转换器后保真回放（下方 bounded 透传分支是错误
+                    // 响应，不经 format——用户已定）
+                    return replay_success(
+                        &state,
+                        &target_url,
+                        attempt,
+                        status,
+                        resp_headers,
+                        &raw_headers,
+                        body,
+                    )
+                    .await;
+                }
+                // 受限重试路径：有响应的失败达到尝试上限后不再重试，把最后
+                // 一次失败响应原样透传——客户端拿到真实 404 自行处理，好过
+                // 永远等不到终态（compact 事故）。仅封顶「上游有响应」的失败：
+                // 网络错误是真正的瞬时类，仍无限重试，且它没有响应可供回放。
+                if bounded_retry && attempt >= retry::BOUNDED_RETRY_MAX_ATTEMPTS {
+                    tracing::warn!(
+                        attempt,
+                        status = %status,
+                        "受限重试路径达到尝试上限，透传最后一次上游响应"
+                    );
+                    state.note_upstream_failure(&format!(
+                        "上游返回 {status}（受限重试路径，达上限透传）"
+                    ));
                     let is_streaming = match &body {
                         SpooledBody::Memory(_) => {
-                            retry::is_streaming_response(&resp_headers, body.memory_bytes())
+                            retry::is_streaming_response(&raw_headers, body.memory_bytes())
                         }
-                        SpooledBody::Disk { .. } => retry::is_streaming_content_type(&resp_headers),
+                        SpooledBody::Disk { .. } => retry::is_streaming_content_type(&raw_headers),
                     };
                     return build_replay_response(
                         status,
@@ -1610,26 +1782,267 @@ async fn proxy_without_keepalive(
                     )
                     .await;
                 }
-                return build_replay_response(
-                    status,
-                    resp_headers,
-                    &raw_headers,
-                    body,
-                    is_streaming,
-                )
-                .await;
+                state.note_upstream_failure(&format!("上游返回 {status}（错误内容，重试）"));
+                // 进入下一轮时 body Drop：磁盘临时文件删除
             }
         }
     }
 }
 
-/// 带保活的重试通道：仅在上游首轮已失败后进入。立即以 SSE 流响应并在流中发送
-/// `: keepalive\n\n` 注释，后台从 attempt 2 起无限重试，成功后将上游 body 分块转发。
-/// 受限重试路径（`bounded_retry`）达到尝试上限后以终态 SSE error 事件收场。
+/// 心跳：SSE 注释行，合法 SSE 客户端按规范忽略
+const HEARTBEAT: &[u8] = b": keepalive\n\n";
+
+/// 长等待断开提示的阈值：已提交的响应等待这么久之后客户端断开，多半是客户端
+/// 自己的「事件级空闲」看门狗到点——Claude Code 默认 600s，且 aProxy 的注释心跳
+/// 与 SSE ping 都不算事件、重置不了它（2026-10-04 黑盒实测）。取 590 而非 600：
+/// 计时起点（提交时刻）与客户端的起点有差，再留些调度余量，宁可多提示一次。
+const LONG_WAIT_HINT: Duration = Duration::from_secs(590);
+
+/// 保活通道的响应出口——「提交点」状态机的两个状态：
+/// 尚未向客户端写出任何字节（Pending）→ 响应头已发出（Committed）。
+/// 提交只发生一次、不可撤回：之后 status 与响应头再也改不了，只能往 SSE 体里写。
+enum KeepaliveSink {
+    /// handler 正 await 这个 oneshot 等 `Response`。Option 只为提交时能把
+    /// Sender 取走（取走后立刻转为 Committed；send 失败 = 客户端已断开）
+    Pending(Option<tokio::sync::oneshot::Sender<Response>>),
+    Committed {
+        tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+        /// 客户端断开信号：哨兵（`ClientGoneGuard`）随响应 Body 被 hyper drop 时置位
+        gone_rx: tokio::sync::watch::Receiver<bool>,
+        /// 提交时刻：长等待断开提示的计时起点（客户端从这一刻起开始等事件）
+        at: tokio::time::Instant,
+    },
+}
+
+impl KeepaliveSink {
+    fn is_committed(&self) -> bool {
+        matches!(self, Self::Committed { .. })
+    }
+
+    /// 客户端断开时完成。未提交：hyper 因断开 drop 了 handler future，oneshot
+    /// 接收端随之销毁；已提交：响应 Body 被 drop，哨兵置位（或发送端已随哨兵
+    /// 销毁——`wait_for` 返回 Err，同样视为断开）。
+    async fn client_gone(&mut self) {
+        match self {
+            Self::Pending(Some(tx)) => tx.closed().await,
+            // Sender 已被取走只发生在提交失败的瞬间，调用方随即返回，不会再等
+            Self::Pending(None) => std::future::pending().await,
+            Self::Committed { gone_rx, .. } => {
+                let _ = gone_rx.wait_for(|gone| *gone).await;
+            }
+        }
+    }
+
+    /// 提交响应头：把以 mpsc 接收端为体的流式响应交给 handler 返回给 hyper。
+    /// 返回 false = 客户端已断开（handler 已被 drop，没人接收这个 Response）。
+    /// 已提交时调用是空操作（返回 true）。
+    fn commit(&mut self, status: StatusCode, headers: HeaderMap) -> bool {
+        let Self::Pending(slot) = self else {
+            return true;
+        };
+        let Some(resp_tx) = slot.take() else {
+            return false;
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
+        let (gone_tx, gone_rx) = tokio::sync::watch::channel(false);
+        let gone_guard = ClientGoneGuard { tx: gone_tx };
+        // 哨兵 move 进 map 闭包：Body 被客户端断开而 drop 时闭包销毁 → 置位断开信号
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(move |chunk| {
+            let _ = &gone_guard;
+            chunk
+        });
+        let mut resp = Response::builder().status(status);
+        for (name, value) in headers.iter() {
+            resp = resp.header(name, value);
+        }
+        // header 逐条来自已校验的 HeaderMap，body() 的错误态不可能出现
+        let resp = resp
+            .body(Body::from_stream(stream))
+            .unwrap()
+            .into_response();
+        if resp_tx.send(resp).is_err() {
+            return false;
+        }
+        *self = Self::Committed {
+            tx,
+            gone_rx,
+            at: tokio::time::Instant::now(),
+        };
+        true
+    }
+
+    /// 提交骨架头（200 + text/event-stream，不设 connection 头——hyper 按协议
+    /// 自动管理）并立刻发首个心跳：客户端的空闲计时从收到首批字节起算。
+    /// false = 客户端已断开。
+    fn commit_skeleton(&mut self) -> bool {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        );
+        self.commit(StatusCode::OK, headers) && self.heartbeat()
+    }
+
+    /// 发一个心跳。用 try_send 而非 send：通道满说明客户端还有没读走的字节，
+    /// 这一拍可以省；而在这里阻塞会连带停住对上游响应的读取。
+    /// false = 客户端已断开（接收端随响应 Body 销毁）。
+    fn heartbeat(&self) -> bool {
+        match self {
+            Self::Committed { tx, .. } => !matches!(
+                tx.try_send(Ok(Bytes::from_static(HEARTBEAT))),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+            ),
+            Self::Pending(_) => true,
+        }
+    }
+
+    /// 往已提交的响应体里写一块（成功回放 / 终态 error 事件）。
+    /// false = 客户端已断开（或尚未提交——调用方保证只在提交后调用）。
+    async fn send(&self, chunk: Result<Bytes, std::io::Error>) -> bool {
+        match self {
+            Self::Committed { tx, .. } => tx.send(chunk).await.is_ok(),
+            Self::Pending(_) => false,
+        }
+    }
+
+    /// 尚未提交时交出完整响应（首轮快速路径 / 502 终态）。客户端已断开时
+    /// send 失败，响应随之丢弃。
+    fn respond(self, resp: Response) {
+        if let Self::Pending(Some(tx)) = self {
+            let _ = tx.send(resp);
+        }
+    }
+
+    /// 客户端断开的日志（含长等待提示，见 `log_client_gone_after`）
+    fn log_client_gone(&self, during: &str) {
+        let waited = match self {
+            Self::Committed { at, .. } => Some(at.elapsed()),
+            Self::Pending(_) => None,
+        };
+        log_client_gone_after(during, waited);
+    }
+}
+
+/// 客户端断开的日志；`waited` = 已提交的响应等了多久（None = 尚未提交）。等了
+/// 很久（≥ `LONG_WAIT_HINT`）时追加客户端配置提示。只是日志文案：行为对任何
+/// 客户端都一样（断开即中止上游），不做客户端特判。
+fn log_client_gone_after(during: &str, waited: Option<Duration>) {
+    tracing::info!(during, "客户端已断开，中止上游请求（保活通道）");
+    if let Some(waited) = waited
+        && waited >= LONG_WAIT_HINT
+    {
+        tracing::warn!(
+            waited_secs = waited.as_secs(),
+            "客户端在已提交的响应上等待约 {} 秒后断开。若客户端是 Claude Code：其事件级空闲看门狗默认 600 秒，\
+             aProxy 的注释心跳无法重置它——请在 Claude Code 的环境变量中设置 CLAUDE_STREAM_IDLE_TIMEOUT_MS\
+             （毫秒，例如 3600000），否则超过 10 分钟的重试期或长生成都会被客户端断开重发",
+            waited.as_secs()
+        );
+    }
+}
+
+/// 上游响应头能否原样提交给客户端（保活通道首轮）：2xx、`text/event-stream`、
+/// 且未经压缩。未压缩是硬条件——提交后要往体里插 `: keepalive` 注释，压缩流
+/// 里插入明文会让客户端解压失败。保活适用的请求已要求上游以 identity 回应，
+/// 这里兜住无视该要求仍压缩的上游（不提交真实头，等间隔到点提交骨架）。
+fn head_is_committable(status: StatusCode, headers: &HeaderMap) -> bool {
+    let header_str = |name: http::header::HeaderName| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+    };
+    status.is_success()
+        && header_str(http::header::CONTENT_TYPE).contains("text/event-stream")
+        && matches!(
+            header_str(http::header::CONTENT_ENCODING).as_str(),
+            "" | "identity"
+        )
+}
+
+/// 在保活通道里驱动一个 future（一次上游尝试 / 一段退避等待）直到完成，
+/// 与心跳节拍、客户端断开信号一起 select——这正是「心跳全程覆盖」的实现点：
+/// 上游请求进行中（等响应头、缓冲上游流）与退避期间同样按间隔发心跳。
 ///
-/// 注意：此通道的骨架响应已先行发出（200 + text/event-stream），上游真实 status
-/// 与响应头无法再回放——这是「先保活、后成功」的固有取舍；首轮成功走的是
-/// proxy_handler 的保真快速路径，不受影响。
+/// - 每个 tick：尚未提交 → 提交骨架头（一个间隔内上游没给出可提交的结果）；
+///   已提交 → 发一个心跳
+/// - `head_rx`（仅首轮、允许转发上游真实头时传入）收到可提交的上游响应头 →
+///   立即提交上游真实 status 与响应头
+/// - 客户端断开或心跳发送失败 → 返回 None：`fut` 随本函数返回被 drop，在途的
+///   reqwest 连接关闭，上游停止生成（计费保护）
+async fn drive<F: std::future::Future>(
+    sink: &mut KeepaliveSink,
+    ticker: &mut tokio::time::Interval,
+    fut: F,
+    mut head_rx: Option<tokio::sync::oneshot::Receiver<(StatusCode, HeaderMap)>>,
+    during: &str,
+) -> Option<F::Output> {
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            // 结果优先：同一轮里 fut 已完成就不再因并发就绪的 tick/头部通知先行
+            // 提交——未提交时首轮完成即走保真快速路径
+            biased;
+            out = &mut fut => return Some(out),
+            () = sink.client_gone() => {
+                sink.log_client_gone(during);
+                return None;
+            }
+            head = async { head_rx.as_mut().expect("前置条件保证 Some").await }, if head_rx.is_some() => {
+                // 每次尝试只通知一次（Err = forward_once 没拿到响应头就结束了）
+                head_rx = None;
+                if let Ok((status, headers)) = head
+                    && !sink.is_committed()
+                    && head_is_committable(status, &headers)
+                {
+                    if !sink.commit(status, headers) {
+                        sink.log_client_gone(during);
+                        return None;
+                    }
+                    tracing::info!(status = %status, "上游 SSE 响应头已到，先行提交给客户端（保活通道）");
+                }
+            }
+            _ = ticker.tick() => {
+                let alive = if sink.is_committed() {
+                    sink.heartbeat()
+                } else {
+                    tracing::info!("一个保活间隔内上游未给出可提交的结果，先提交骨架头（保活通道）");
+                    sink.commit_skeleton()
+                };
+                if !alive {
+                    sink.log_client_gone(during);
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// 保活通道：「保活适用」的请求（判定见 `keepalive_triggered`）从首轮起都走
+/// 这里。后台任务驱动全部尝试，handler 只等一个 oneshot 交出 `Response`。
+///
+/// 提交点（`KeepaliveSink`）：
+/// - **未提交**（首轮进行中）：
+///   - 上游回 2xx + 未压缩 text/event-stream 头，且未配置 response_transform
+///     （format 可能改写 status/头，不能先发）→ 立即提交上游真实 status 与响应头
+///     （content-length 与 hop-by-hop 已由 forward_once 滤掉）
+///   - 一个 keepalive 间隔到点仍无可提交的结果 → 提交骨架头（200 + SSE）
+///   - 首轮完成且无需重试 → 保真快速路径（与不适用保活的请求同一出口），不提交
+///   - 首轮需要重试 → 立即提交骨架头（退避与重试期间只能靠心跳维持连接）
+/// - **已提交**：此后的尝试与退避都经 `drive` 驱动、按间隔发心跳；完整缓冲并
+///   判定无误后，把成功那一次的原样字节写进同一个响应（response_transform 只有
+///   body 转换生效）。TooLarge / SpoolFailed / 受限重试路径达上限以终态 SSE
+///   error 事件收场——状态行已发出、不可再改，静默结束与「上游成功返回空 body」
+///   在客户端视角不可区分。
+///
+/// 客户端断开在任一阶段（等响应头、缓冲、退避、回放）都立即中止上游请求、
+/// 不再发起新请求：前三者经 `drive` 返回 None，回放经 send 失败。
 async fn proxy_with_keepalive(
     state: AppState,
     method: http::Method,
@@ -1639,114 +2052,109 @@ async fn proxy_with_keepalive(
     max_spool_bytes: usize,
     bounded_retry: bool,
 ) -> Response {
-    let keepalive_dur = state.config.keepalive_interval();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
-
-    // 客户端断开信号：watch(false→true)。哨兵被 move 进响应 Body 的流闭包，
-    // hyper 因客户端断开而 drop Body 时闭包随之销毁，哨兵 Drop 中置位；
-    // 后台任务据此立即中止 in-flight 的上游请求（避免断开后上游继续生成白自计费）。
-    let (gone_tx, mut gone_rx) = tokio::sync::watch::channel(false);
-    let gone_guard = ClientGoneGuard { tx: gone_tx };
-
-    // 心跳为 SSE 注释（": keepalive\n\n"），合法 SSE 客户端按规范忽略
-    let heartbeat = || Bytes::from_static(b": keepalive\n\n");
-
-    // 后台任务：无限重试上游，期间按 keepalive_dur 发送 SSE 注释；成功后将上游响应分块转发。
-    // 所有 send 都检查客户端是否已断开（channel 关闭 → 立即退出，不空转）。
-    let state_bg = state.clone();
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<Response>();
     tokio::spawn(async move {
-        // 骨架发出后立即发首个心跳：客户端 idle 计时从收到字节起算
-        if tx.send(Ok(heartbeat())).await.is_err() {
-            return;
-        }
-
-        let mut attempt: u32 = 1;
+        let keepalive_dur = state.config.keepalive_interval();
         let max_backoff = state.config.max_retry_backoff_secs;
+        let mut sink = KeepaliveSink::Pending(Some(resp_tx));
+        // 整个请求共用一个节拍，首个 tick 在请求开始一个间隔之后：它既是「一个
+        // 间隔内仍无可提交结果就提交骨架」的计时器，也是提交后的心跳节拍。
+        // Delay：被长回放/慢客户端耽搁后不补发积压的 tick
+        let mut ticker =
+            tokio::time::interval_at(tokio::time::Instant::now() + keepalive_dur, keepalive_dur);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let real_head_allowed = state.response_pool.is_none();
+        let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            // 与非保活通道同款：每轮重试刷新活动时间戳（语义 = 仍在处理中），
-            // 防止无限重试中的实例被 stop idle 误判闲置强退（M1）
-            state_bg.last_activity_secs.store(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            state_bg
-                .stats
-                .retries_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let delay = retry::delay_for_attempt(attempt - 1, max_backoff);
-            if !delay.is_zero() {
-                // 在延迟期间按 keepalive_dur 切片发送心跳，避免客户端 idle 超时
-                let mut elapsed = Duration::ZERO;
-                while elapsed < delay {
-                    let slice = std::cmp::min(keepalive_dur, delay - elapsed);
-                    tokio::time::sleep(slice).await;
-                    elapsed += slice;
-                    if elapsed < delay {
-                        // 仅在尚未到下一轮重试时发送心跳
-                        if tx.send(Ok(heartbeat())).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-            } else {
-                tracing::warn!(attempt, "立即重试（保活通道）");
-            }
-
-            // in-flight 期间与客户端断开信号竞速：断开即丢弃 forward_once future，
-            // reqwest 连接随之关闭，上游（如 LLM API）会因连接断开停止生成——
-            // 这是「客户端断开后本条请求立即断开」的关键点，防止计费浪费。
-            let client_gone = async {
-                // 信号置位或哨兵随 Body 提前销毁（channel 关闭）都视为断开
-                let _ = gone_rx.wait_for(|v| *v).await;
-            };
-            let result = tokio::select! {
-                r = forward_once(
-                    &state_bg.client,
-                    &method,
-                    &target_url,
-                    &headers,
-                    &req_body,
-                    max_spool_bytes,
-                    state_bg.spool_dir.as_deref(),
-                ) => r,
-                _ = client_gone => {
-                    tracing::info!("客户端已断开，中止 in-flight 上游请求（保活通道）");
-                    return;
-                }
-            };
-
-            match result {
-                ForwardResult::NetworkError(e) => {
-                    state_bg.note_upstream_failure(&format!("网络错误: {e}"));
-                    tracing::warn!(attempt, error = %e, "上游网络错误，重试（保活通道）");
-                    if tx.send(Ok(heartbeat())).await.is_err() {
+            if attempt > 1 {
+                // 与非保活通道同款：每轮重试刷新活动时间戳（语义 = 仍在处理中），
+                // 防止无限重试中的实例被 stop idle 误判闲置强退（M1）
+                state.last_activity_secs.store(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                state
+                    .stats
+                    .retries_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let delay = retry::delay_for_attempt(attempt - 1, max_backoff);
+                if delay.is_zero() {
+                    tracing::warn!(attempt, "立即重试（保活通道）");
+                } else {
+                    tracing::warn!(
+                        attempt,
+                        delay_ms = delay.as_millis() as u64,
+                        "重试延迟（保活通道）"
+                    );
+                    let backoff = tokio::time::sleep(delay);
+                    if drive(&mut sink, &mut ticker, backoff, None, "退避等待")
+                        .await
+                        .is_none()
+                    {
                         return;
                     }
-                    continue;
+                }
+            }
+
+            // 响应头通知只在首轮（尚未提交）且允许转发上游真实头时需要
+            let (head_tx, head_rx) = if attempt == 1 && real_head_allowed {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            let attempt_fut = forward_once(
+                &state,
+                &method,
+                &target_url,
+                &headers,
+                &req_body,
+                max_spool_bytes,
+                head_tx,
+            );
+            let Some(result) =
+                drive(&mut sink, &mut ticker, attempt_fut, head_rx, "等待上游").await
+            else {
+                return;
+            };
+
+            // 受限重试路径达上限时为 Some(上游 status)：先确保已提交，再以终态
+            // error 事件收场
+            let bounded_exhausted = match result {
+                ForwardResult::NetworkError(e) => {
+                    // 网络错误是真正的瞬时类：受限路径也不封顶，且它没有响应可供回放
+                    state.note_upstream_failure(&format!("网络错误: {e}"));
+                    tracing::warn!(attempt, error = %e, "上游网络错误，重试（保活通道）");
+                    None
                 }
                 ForwardResult::TooLarge => {
-                    state_bg.note_upstream_failure("上游响应体超出 spool 上限");
+                    state.note_upstream_failure("上游响应体超出 spool 上限");
                     tracing::error!(attempt, "上游响应体超出 spool 上限，终止重试（保活通道）");
-                    // 骨架 200 已发出、状态行不可再改：静默结束流与「上游成功返回
-                    // 空 body」在客户端视角不可区分。发一个终态错误事件让客户端
-                    // 明确感知代理放弃了这条请求。
-                    let err_event = Bytes::from_static(
-                        b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"proxy_spool_limit\",\"message\":\"upstream response exceeded proxy spool limit\"}}\n\n",
-                    );
-                    let _ = tx.send(Ok(err_event)).await;
+                    if sink.is_committed() {
+                        let err_event = Bytes::from_static(
+                            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"proxy_spool_limit\",\"message\":\"upstream response exceeded proxy spool limit\"}}\n\n",
+                        );
+                        sink.send(Ok(err_event)).await;
+                    } else {
+                        sink.respond(too_large_response());
+                    }
                     return;
                 }
                 ForwardResult::SpoolFailed(e) => {
-                    state_bg.note_upstream_failure(&format!("本地 spool 故障: {e}"));
+                    state.note_upstream_failure(&format!("本地 spool 故障: {e}"));
                     tracing::error!(attempt, error = %e, "本地 spool 故障，终止重试（保活通道）");
-                    let err_event = Bytes::from_static(
-                        b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"proxy_spool_failed\",\"message\":\"local disk cache write failed\"}}\n\n",
-                    );
-                    let _ = tx.send(Ok(err_event)).await;
+                    if sink.is_committed() {
+                        let err_event = Bytes::from_static(
+                            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"proxy_spool_failed\",\"message\":\"local disk cache write failed\"}}\n\n",
+                        );
+                        sink.send(Ok(err_event)).await;
+                    } else {
+                        sink.respond(spool_failed_response(&e));
+                    }
                     return;
                 }
                 ForwardResult::Response {
@@ -1756,92 +2164,102 @@ async fn proxy_with_keepalive(
                     body,
                     disk_scan,
                 } => {
-                    if needs_retry_response(attempt, &status, &raw_headers, &body, &disk_scan) {
-                        // 受限重试路径：骨架 200 已发出、状态行不可再改，无法回放
-                        // 真实 status/headers，以终态 error 事件收场（同下方
-                        // TooLarge/SpoolFailed 的处理），客户端明确感知而非永远等
-                        if bounded_retry && attempt >= retry::BOUNDED_RETRY_MAX_ATTEMPTS {
-                            tracing::warn!(
+                    if !needs_retry_response(attempt, &status, &raw_headers, &body, &disk_scan) {
+                        if !sink.is_committed() {
+                            // 提交前就成功：保真快速路径（上游 status 与全部响应头）
+                            let resp = replay_success(
+                                &state,
+                                &target_url,
                                 attempt,
-                                status = %status,
-                                "受限重试路径达到尝试上限，终止重试（保活通道）"
-                            );
-                            state_bg.note_upstream_failure(&format!(
-                                "上游返回 {status}（受限重试路径，达上限终止）"
-                            ));
-                            drop(body);
-                            let err_event = Bytes::from(format!(
-                                "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"upstream_error\",\"message\":\"upstream returned {status}; bounded retry path exhausted after {attempt} attempts\"}}}}\n\n"
-                            ));
-                            let _ = tx.send(Ok(err_event)).await;
+                                status,
+                                resp_headers,
+                                &raw_headers,
+                                body,
+                            )
+                            .await;
+                            sink.respond(resp);
                             return;
                         }
-                        state_bg
-                            .note_upstream_failure(&format!("上游返回 {status}（错误内容，重试）"));
-                        // 发心跳前先丢弃（body Drop 删临时文件，杜绝任何
-                        // return 路径上的泄漏）
-                        drop(body);
-                        if tx.send(Ok(heartbeat())).await.is_err() {
+                        // 已提交：状态行与响应头不可再改——format 对 headers 的
+                        // 改写无效，仅 body 转换生效。转换失败透传原样（不发 error
+                        // 事件——那是响应不可用的终态模板；此处响应在手仅转换失败）
+                        let (_, mut body) = transform_response_if_configured(
+                            &state,
+                            &target_url,
+                            resp_headers,
+                            body,
+                        )
+                        .await;
+                        tracing::info!(
+                            attempt,
+                            status = %status,
+                            bytes = body.len(),
+                            "上游成功，回放到已提交的响应（保活通道）"
+                        );
+                        // 空 body 直接结束流，不注入任何上游未发送的字节
+                        if body.is_empty() {
                             return;
                         }
-                        continue;
-                    }
-
-                    // 成功后交给响应转换器：骨架 200 + text/event-stream 已发出，
-                    // 状态行与响应头不可再改——format 对 headers 的改写在保活
-                    // 通道无效，仅 body 转换生效。失败透传原样（不发 error 事件
-                    // ——那是响应不可用的终态模板；此处响应在手仅转换失败）
-                    let (_, mut body) = transform_response_if_configured(
-                        &state_bg,
-                        &target_url,
-                        resp_headers,
-                        body,
-                    )
-                    .await;
-                    let is_streaming = match &body {
-                        SpooledBody::Memory(_) => {
-                            retry::is_streaming_response(&raw_headers, body.memory_bytes())
+                        let mut stream = body.into_stream().await;
+                        while let Some(item) = stream.next().await {
+                            if !sink.send(item).await {
+                                // 客户端在回放中断开：Drop 链负责删临时文件
+                                sink.log_client_gone("回放");
+                                return;
+                            }
                         }
-                        SpooledBody::Disk { .. } => retry::is_streaming_content_type(&raw_headers),
-                    };
-                    tracing::info!(attempt, status = %status, is_streaming, "重试后成功（保活通道）");
-
-                    // 成功：将完整 body 按块转发；若为 SSE，保持 SSE 语义（心跳为注释，不影响解析）。
-                    // 空 body 直接结束流，不注入任何上游未发送的字节。
-                    if body.is_empty() {
                         return;
                     }
-                    let mut stream = body.into_stream().await;
-                    while let Some(item) = stream.next().await {
-                        if tx.send(item).await.is_err() {
-                            return; // 客户端断开：Drop 链负责删临时文件
-                        }
+                    // 需要重试：先丢弃（body Drop 删临时文件，杜绝任何 return
+                    // 路径上的泄漏）
+                    drop(body);
+                    // 受限重试路径：有响应的失败达到尝试上限后不再重试。状态行
+                    // 已发出（或即将以骨架发出），无法回放真实 status/headers
+                    if bounded_retry && attempt >= retry::BOUNDED_RETRY_MAX_ATTEMPTS {
+                        tracing::warn!(
+                            attempt,
+                            status = %status,
+                            "受限重试路径达到尝试上限，终止重试（保活通道）"
+                        );
+                        state.note_upstream_failure(&format!(
+                            "上游返回 {status}（受限重试路径，达上限终止）"
+                        ));
+                        Some(status)
+                    } else {
+                        state
+                            .note_upstream_failure(&format!("上游返回 {status}（错误内容，重试）"));
+                        None
                     }
+                }
+            };
+
+            // 走到这里 = 需要重试（或受限路径达上限）。尚未提交则立即提交骨架：
+            // 接下来的退避与重试期间只能靠心跳维持连接（与旧保活通道「首轮失败
+            // 即返回骨架」一致）
+            if !sink.is_committed() {
+                tracing::info!(attempt, "需要重试，先提交骨架头（保活通道）");
+                if !sink.commit_skeleton() {
+                    sink.log_client_gone("提交骨架");
                     return;
                 }
             }
+            if let Some(status) = bounded_exhausted {
+                // 终态 error 事件：客户端明确感知代理放弃了这条请求，而非永远等
+                let err_event = Bytes::from(format!(
+                    "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"upstream_error\",\"message\":\"upstream returned {status}; bounded retry path exhausted after {attempt} attempts\"}}}}\n\n"
+                ));
+                sink.send(Ok(err_event)).await;
+                return;
+            }
         }
     });
-
-    // SSE 流式骨架；仅在重试间隙注入 ": keepalive\n\n"（SSE 注释，客户端会忽略）。
-    // 哨兵 move 进 map 闭包：Body 被客户端断开而 drop 时闭包销毁 → 置位断开信号。
-    let rx_stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(move |r| {
-        let _ = &gone_guard;
-        r.map_err(|e| std::io::Error::other(e.to_string()))
-    });
-    let body = Body::from_stream(rx_stream);
-
-    let mut resp = Response::builder().status(StatusCode::OK);
-    resp = resp.header(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("text/event-stream"),
-    );
-    resp = resp.header(
-        http::header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache"),
-    );
-    // 不设置 connection 头：hyper 按协议自动管理
-    resp.body(body).unwrap().into_response()
+    // 客户端在提交前断开时 hyper 会 drop 本 future（连同 resp_rx），后台任务经
+    // resp_tx.closed() 感知并中止上游请求。Err 只在后台任务未交出响应就结束时
+    // 出现（panic）——给客户端一个明确的 502 而不是让连接悬空
+    resp_rx.await.unwrap_or_else(|_| {
+        tracing::error!("保活通道后台任务未交出响应即结束");
+        (StatusCode::BAD_GATEWAY, "aProxy 内部错误：保活通道异常结束").into_response()
+    })
 }
 
 /// 客户端断开哨兵：持有 watch 发送端，Drop 时置位断开信号。
@@ -1887,19 +2305,25 @@ fn spool_limit_bytes(config: &Config) -> usize {
     (config.spool_limit_mb.max(1) as usize).saturating_mul(1024 * 1024)
 }
 
+/// 一次上游尝试：发出请求、完整缓冲响应（内存/磁盘 spool）并做增量错误扫描。
+///
+/// `on_head`：拿到上游响应头（status + 已滤 hop-by-hop 的头）时立即通知调用方，
+/// 早于缓冲响应体——保活通道据此在首轮把上游真实头先行提交给客户端。接收方已
+/// 不关心（已提交、已结束）时发送失败，忽略即可。
 async fn forward_once(
-    client: &reqwest::Client,
+    state: &AppState,
     method: &http::Method,
     url: &str,
     headers: &HeaderMap,
     req_body: &RequestBody,
     max_spool_bytes: usize,
-    spool_dir: Option<&Path>,
+    on_head: Option<tokio::sync::oneshot::Sender<(StatusCode, HeaderMap)>>,
 ) -> ForwardResult {
+    let spool_dir = state.spool_dir.as_deref();
     let reqwest_method =
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
 
-    let mut builder = client.request(reqwest_method, url);
+    let mut builder = state.client.request(reqwest_method, url);
 
     // 透传请求头（过滤 hop-by-hop），已在 proxy_handler 中应用了覆盖/追加
     for (name, value) in headers.iter() {
@@ -1946,6 +2370,9 @@ async fn forward_once(
             // append 而非 insert：Set-Cookie 等同名多值头不能坍缩为最后一个
             resp_headers.append(n, v);
         }
+    }
+    if let Some(tx) = on_head {
+        let _ = tx.send((status, resp_headers.clone()));
     }
 
     // 关键：完整 spool（分块累积）——任何流式中断都会在此处以 Err 形式暴露，从而触发重试；
@@ -2043,7 +2470,7 @@ fn body_too_large_response(body_limit: usize) -> Response {
 /// 这是模式的定义而非实现偷懒：任何缓冲都会让内存占用随负载增长，任何重放都
 /// 需要先持有完整 body，两者都与「真·增量流（首字节即转发）」互斥。因此这里
 /// 刻意不进重试循环、SSE 保活骨架、错误内容拦截（`is_error_body` /
-/// `is_stream_error_body`）、spool 与 `client_wants_sse` 判定，并且**不做
+/// `is_stream_error_body`）、spool 与 `keepalive_trigger` 判定，并且**不做
 /// decode 模块的解码**——本模式不对响应体做任何内容检查，没有解码的用武之地。
 ///
 /// 本模式下不生效的配置项：`disk_cache`、`spool_limit_mb`、
@@ -2349,6 +2776,157 @@ mod tests {
         // 各块按序还原 == 原 body（切块只分不变）
         let reassembled: Vec<u8> = frames.into_iter().flatten().collect();
         assert_eq!(reassembled, body.as_ref());
+    }
+
+    // ---- 保活触发：请求体顶层 "stream": true 的流式判定（只看顶层、只认字面
+    // 量 true、解析失败一律为假） ----
+
+    #[test]
+    fn stream_flag_probe_reads_only_top_level_literal_true() {
+        let probe =
+            |s: &str| json_requests_stream(serde_json::Deserializer::from_slice(s.as_bytes()));
+        for yes in [
+            r#"{"stream":true}"#,
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+            " \n{ \"stream\" : true }\r\n ",
+            // 转义写法的键名与字面键名等价
+            r#"{"stream":true}"#,
+            // 重复键以最后一次为准
+            r#"{"stream":false,"stream":true}"#,
+        ] {
+            assert!(probe(yes), "应判为流式: {yes}");
+        }
+        for no in [
+            r#"{"stream":false}"#,
+            r#"{"model":"m"}"#,
+            r#"{"stream":"true"}"#,
+            r#"{"stream":1}"#,
+            r#"{"stream":null}"#,
+            r#"{"stream":[true]}"#,
+            r#"{"stream":{"enabled":true}}"#,
+            r#"{"stream":true,"stream":false}"#,
+            // 嵌套层的 stream 不算
+            r#"{"messages":[{"stream":true}]}"#,
+            r#"{"meta":{"stream":true},"stream":false}"#,
+            // 顶层不是对象
+            r#"[{"stream":true}]"#,
+            r#""stream""#,
+            "true",
+            // 非 JSON / 截断 / 尾随垃圾 / 空体
+            r#"{"stream":true"#,
+            r#"{"stream":true} x"#,
+            "stream=true",
+            "",
+        ] {
+            assert!(!probe(no), "不应判为流式: {no:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_flag_probe_streams_disk_spooled_body() {
+        // 溢写磁盘的大请求体：stream 键排在数 MB 字段之后，从文件流式扫描
+        let dir = tempfile::tempdir().unwrap();
+        let big = "y".repeat(3 * 1024 * 1024);
+        for (stream, want) in [("true", true), ("false", false)] {
+            let path = dir.path().join(format!("req-{stream}.spooltmp"));
+            let json =
+                format!(r#"{{"model":"m","messages":[{{"content":"{big}"}}],"stream":{stream}}}"#);
+            std::fs::write(&path, &json).unwrap();
+            let body = RequestBody::Disk {
+                path,
+                len: json.len() as u64,
+            };
+            assert_eq!(
+                request_body_wants_stream(&body).await,
+                want,
+                "stream={stream}"
+            );
+        }
+    }
+
+    // ---- 保活通道：上游真实头的可提交条件 ----
+
+    #[test]
+    fn head_is_committable_requires_2xx_uncompressed_sse() {
+        let headers = |pairs: &[(&'static str, &'static str)]| {
+            let mut h = HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(*k, HeaderValue::from_static(v));
+            }
+            h
+        };
+        let sse = headers(&[("content-type", "text/event-stream; charset=utf-8")]);
+        assert!(head_is_committable(StatusCode::OK, &sse));
+        assert!(head_is_committable(
+            StatusCode::OK,
+            &headers(&[
+                ("content-type", "text/event-stream"),
+                ("content-encoding", "identity")
+            ])
+        ));
+        // 非 2xx：要重试，不能先提交上游的错误状态行
+        assert!(!head_is_committable(StatusCode::TOO_MANY_REQUESTS, &sse));
+        // 非 SSE：心跳注释只在 SSE 里合法
+        assert!(!head_is_committable(
+            StatusCode::OK,
+            &headers(&[("content-type", "application/json")])
+        ));
+        assert!(!head_is_committable(
+            StatusCode::OK,
+            &headers(&[("content-type", "application/x-ndjson")])
+        ));
+        // 压缩流：往里插明文心跳会让客户端解压失败
+        assert!(!head_is_committable(
+            StatusCode::OK,
+            &headers(&[
+                ("content-type", "text/event-stream"),
+                ("content-encoding", "gzip")
+            ])
+        ));
+    }
+
+    // ---- 长等待断开提示：已提交 ≥590s 后断开才提示 Claude Code 的环境变量 ----
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn long_wait_disconnect_logs_client_hint() {
+        let logs = CapturedLogs::default();
+        let sink_logs = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink_logs.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let text = || String::from_utf8_lossy(&logs.0.lock().unwrap()).to_string();
+
+        // 尚未提交 / 已提交但等待不足：只记断开，不提示
+        KeepaliveSink::Pending(None).log_client_gone("等待上游");
+        log_client_gone_after("等待上游", Some(Duration::from_secs(300)));
+        assert!(text().contains("客户端已断开"), "{}", text());
+        assert!(
+            !text().contains("CLAUDE_STREAM_IDLE_TIMEOUT_MS"),
+            "等待不足 590s 不提示: {}",
+            text()
+        );
+
+        log_client_gone_after("等待上游", Some(Duration::from_secs(600)));
+        let out = text();
+        assert!(
+            out.contains("CLAUDE_STREAM_IDLE_TIMEOUT_MS") && out.contains("Claude Code"),
+            "等待 ≥590s 后断开应提示客户端配置: {out}"
+        );
     }
 
     // ---- 入站 Host 归一：Host 头与配置条目必须归一到同一形态才能比较 ----

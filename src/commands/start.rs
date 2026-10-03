@@ -35,6 +35,7 @@ pub(crate) fn resolve_runtime_config(
     // 注入前记录来源：validate 报错时若值来自 settings，下方「位置: toml」
     // 的指引找不到问题，必须点名真实来源。
     let bounded_paths_from_settings = cfg.bounded_retry_paths.is_none();
+    let keepalive_trigger_from_settings = cfg.keepalive_trigger.is_none();
     {
         let s = settings::load();
         cfg.max_body_mb.get_or_insert(s.max_body_mb);
@@ -46,6 +47,8 @@ pub(crate) fn resolve_runtime_config(
             .get_or_insert_with(|| s.allowed_hosts.clone());
         cfg.allowed_origins
             .get_or_insert_with(|| s.allowed_origins.clone());
+        cfg.keepalive_trigger
+            .get_or_insert_with(|| s.keepalive_trigger.clone());
     }
     // listen_addr 必须带端口（port_of 取最后一个 ':' 之后）：缺端口/端口越界的
     // bind 失败不是占用，提前拦截给出明确错误，避免被误诊为「被其他程序占用」
@@ -69,6 +72,8 @@ pub(crate) fn resolve_runtime_config(
         }
         let msg = if bounded_paths_from_settings && msg.contains("bounded_retry_paths") {
             format!("{msg}\n（该值来自 settings.json 的 bounded_retry_paths 全局默认，不在上述 toml 中）")
+        } else if keepalive_trigger_from_settings && msg.contains("keepalive_trigger") {
+            format!("{msg}\n（该值来自 settings.json 的 keepalive_trigger 全局默认，不在上述 toml 中）")
         } else {
             msg
         };

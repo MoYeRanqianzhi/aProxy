@@ -1,19 +1,26 @@
 name: Release
 
 # tag 推送触发：全量测试门槛 → 多平台构建矩阵 → skill 打包 → GitHub Release
-# → npm + crates.io 渠道发布（trusted publishing / OIDC，见 publish job）。
+# → npm + crates.io 渠道发布（publish-npm / publish-crates 两个独立 job，
+# trusted publishing / OIDC）。
 # 产物命名（文件名不带版本号，版本由 tag 承载，见 install 计划「发布资产命名」）：
 #   aproxy-<target>[-v3][.exe]  +  aproxy-skills.zip  +  aproxy-skill-<名>.zip
 #   每个资产附 .sha256
 # Release 说明自动包含「下载与更新链」说明 + SHA256 清单，
 # 变更记录由 GitHub generate_release_notes 生成，叠在自定义正文之后。
+#
+# 可重跑：两个渠道 job 都先查询注册表、版本已存在才跳过，所以任一渠道失败后
+# 可以在 Actions 页面对失败的 job 单独 re-run，已成功的渠道不会重复发布。
 
 on:
   push:
     tags: ["v*"]
 
+# 默认只读：test/build/skills 会编译并运行全部依赖的 build.rs 与测试代码，
+# 不应持有可写 token。只有 release job（写 GitHub Release）提升为
+# contents: write；两个渠道 job 只额外申请 OIDC 的 id-token。
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -24,17 +31,28 @@ env:
 
 jobs:
   test:
-    # 发布门槛：与 CI 相同的全量验证（fmt/clippy/测试），全绿才进入构建
-    runs-on: windows-latest
+    # 发布门槛：与 CI 相同的全量验证（fmt/clippy/测试），windows 与 ubuntu
+    # 都全绿才进入构建。--workspace 覆盖 aproxy-envelope 与 aproxy-format
+    # （理由见 Cargo.toml [workspace] 注释）。macOS 已知红、支持未完成，不进门禁。
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false # 两个平台各自跑完，一次看到全部失败面
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # 不带目标过滤的 cargo test 会顺带编译 examples——transform_integration
+      # 依赖已编译的 examples/format-echo
+      - run: cargo test --workspace --locked --no-fail-fast
 
   build:
     needs: test
@@ -112,6 +130,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       # musl 目标的 ring（rustls-tls）要编 C 代码，需要 musl-gcc 工具链
       - name: Install musl toolchain
         if: matrix.musl
@@ -173,6 +193,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       - name: Package skills
         run: |
           mkdir -p stage
@@ -196,6 +218,10 @@ jobs:
   release:
     needs: [build, skills]
     runs-on: ubuntu-latest
+    # 全 workflow 唯一需要写仓库的 job：创建 Release 并上传资产。不 checkout
+    # 代码，也不执行任何依赖代码。
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v8.0.1
         with:
@@ -240,15 +266,22 @@ jobs:
           files: artifacts/*
           body_path: release_body.md
           generate_release_notes: true
+          # 预发布判定：tag 含 -alpha/-beta/-rc 即预发布，否则为稳定版。
+          # npm/build-and-publish.sh 的 npm_dist_tag() 是同一条规则（预发布发
+          # npm 的 next，稳定版发 latest），改动任一处必须同步另一处。
           prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
+          # make_latest 有意不写，交给 GitHub API 默认值：新发布的非预发布
+          # Release 自动成为 Latest（format-v0.1.0 就是这样成为 Latest 的），
+          # 预发布永远不会成为 Latest。不写死 true 的原因：re-run 某个旧 tag 的
+          # release job 时，action 会带着 make_latest 更新已有 Release，写死 true
+          # 会把 Latest 从更新的稳定版抢回旧版；不传则不改动现有标记。
+          # format 线（release-format.yml）显式写 false，不参与 Latest。
 
-  publish:
-    # npm + crates.io 渠道发布：GitHub Release 成功落位后才发渠道。
-    # 认证走 trusted publishing（OIDC 免长期 token）：crates.io 侧用
-    # rust-lang/crates-io-auth-action 换短期 token；npm 侧 setup-node +
-    # id-token 由 npm publish 自动走 OIDC（npmjs.com 绑定 Trusted Publisher
-    # 后生效）。绑定前的首发期回退仓库 secrets（CARGO_REGISTRY_TOKEN /
-    # NPM_TOKEN），表达式 || 兜底：OIDC 未配置时 action 输出为空，落回 secrets。
+  publish-npm:
+    # npm 渠道：GitHub Release 成功落位后才发。认证走 trusted publishing：
+    # setup-node + id-token，npm publish 自动走 OIDC（npmjs.com 绑定
+    # Trusted Publisher 后生效）。build-and-publish.sh 逐包先查询版本是否
+    # 已存在，已存在则跳过，所以失败后可以单独 re-run 本 job。
     needs: release
     runs-on: ubuntu-latest
     # environment 名须与 npm/crates.io 网站侧 Trusted Publisher 配置一致
@@ -258,6 +291,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v8.0.1
         with:
           path: artifacts
@@ -268,12 +303,28 @@ jobs:
           node-version: 24
           registry-url: 'https://registry.npmjs.org'
           package-manager-cache: false
-      - name: Publish npm packages（主包 + 5 平台子包）
+      - name: Publish npm packages（主包 + 9 平台子包）
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: bash npm/build-and-publish.sh
+
+  publish-crates:
+    # crates.io 渠道：与 publish-npm 并行、互不依赖，可以单独 re-run。
+    # 认证：rust-lang/crates-io-auth-action 用 OIDC 换短期 token；表达式 ||
+    # 兜底到仓库 secret CARGO_REGISTRY_TOKEN（OIDC 未配置时 action 输出为空）。
+    # 新 crate 的首个版本 OIDC 不能发，必须由所有者本地手动首发。
+    needs: release
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      # publish job 是独立 checkout，Cargo.toml 是原始版本号——crates.io 按
+      # 本 job 是独立 checkout，Cargo.toml 是原始版本号——crates.io 按
       # .crate 内 manifest 注册版本，不对齐会把无后缀正式号被测试 tag 抢注
       # （alpha.10/alpha.11 就这么被占掉的）。与 build job 同款对齐逻辑。
       - name: Align version with tag (publish)
@@ -293,15 +344,52 @@ jobs:
           open('Cargo.lock', 'w', encoding='utf-8', newline='').write(lock)
           print("version ->", v)
           EOF
+      # 幂等判定（与 release-format.yml 的同名步骤同一套逻辑，改动须同步）：
+      # 逐个查询 crates.io API 的 /api/v1/crates/<名>/<版本>。200 = 该版本已存在，
+      # 跳过；404 = 未发布（含 crate 本身不存在），列入待发布；其他状态码或网络
+      # 失败一律硬失败——只有「已存在」这一种情况可以跳过，不再用 || 吞掉错误。
+      # CRATES 按依赖顺序排列：aproxy 依赖 aproxy-envelope（registry 上的
+      # version 依赖），envelope 必须在前。
+      - name: Plan crates to publish
+        id: plan
+        shell: bash
+        env:
+          CRATES: aproxy-envelope aproxy
+        run: |
+          set -euo pipefail
+          meta=$(cargo metadata --no-deps --locked --format-version 1)
+          args=""
+          for c in $CRATES; do
+            v=$(printf '%s' "$meta" | python3 -c 'import json, sys; n = sys.argv[1]; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == n))' "$c")
+            code=$(curl -sS --retry 3 -o crates-io-resp.json -w '%{http_code}' \
+              -A "aProxy-release (https://github.com/MoYeRanqianzhi/aProxy)" \
+              "https://crates.io/api/v1/crates/$c/$v") || {
+              echo "::error::查询 crates.io 上的 $c@$v 失败（网络错误）"
+              exit 1
+            }
+            case "$code" in
+              200) echo "$c@$v 已在 crates.io，跳过" ;;
+              404) echo "$c@$v 尚未发布，列入待发布"; args="$args -p $c" ;;
+              *)
+                echo "::error::查询 crates.io 上的 $c@$v 返回 HTTP $code"
+                cat crates-io-resp.json
+                exit 1
+                ;;
+            esac
+          done
+          echo "args=$args" >> "$GITHUB_OUTPUT"
+          [ -n "$args" ] || echo "全部 crate 的当前版本都已在 crates.io，无需发布"
+      # 多个 -p 时 cargo（1.90+）按依赖顺序打包，并用本地刚打好的包校验后续包，
+      # 所以 envelope 新版本尚未上 crates.io 时，aproxy 的 dry-run 也能通过。
+      # --allow-dirty：工作区被对齐步骤有意改为 tag 版本，非意外。
+      - name: Dry run
+        if: steps.plan.outputs.args != ''
+        run: cargo publish --dry-run --locked --allow-dirty ${{ steps.plan.outputs.args }}
       - uses: rust-lang/crates-io-auth-action@v1.0.5
+        if: steps.plan.outputs.args != ''
         id: crates-auth
-      - name: Publish to crates.io（envelope 先发——aproxy 依赖它）
+      - name: Publish to crates.io
+        if: steps.plan.outputs.args != ''
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
-        # --allow-dirty：工作区被上一步有意改为 tag 版本（对齐产物），非意外。
-        # workspace 化后 aproxy 依赖 aproxy-envelope（crates.io 上的 version
-        # 依赖）——envelope 未发布时主包 publish 必失败，故先发 envelope
-        run: |
-          cargo publish --locked --allow-dirty -p aproxy-envelope || \
-            echo "aproxy-envelope 已存在（版本未变时 publish 报错，幂等跳过）"
-          cargo publish --locked --allow-dirty -p aproxy
+        run: cargo publish --locked --allow-dirty ${{ steps.plan.outputs.args }}

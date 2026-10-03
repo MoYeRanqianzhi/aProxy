@@ -146,8 +146,58 @@ fn swap_lays_out_canonical_layout() {
     assert!(outcome.old_path.is_some());
     #[cfg(not(windows))]
     {
-        // unix：无 .old 概念；staged 被 rename 走（同一 inode 挂到 bin）
-        assert_eq!(outcome.old_path, None);
+        // unix：交换前保留旧二进制为 aproxy.old（实例回滚用）；staged 被
+        // rename 走（同一 inode 挂到 bin）
+        assert_eq!(
+            outcome.old_path,
+            Some(aproxy::install::swap::old_path_in(home.path()))
+        );
         assert!(!staged.exists());
     }
+}
+
+/// unix 回滚副本必须是**交换前**的旧二进制（不是新文件的又一个链接），且
+/// 可执行——滚动重启中实例在新版本下起不来时，就靠它按原参数拉回实例。
+/// 首次安装（bin 里没有旧二进制）不产生副本。
+#[cfg(unix)]
+#[test]
+fn unix_swap_preserves_previous_binary_for_rollback() {
+    use aproxy::install::swap;
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("bin");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 首次安装：无旧二进制 → 无副本
+    let staged = stage(home.path(), "first");
+    assert_eq!(swap::swap_in(home.path(), &staged).unwrap().old_path, None);
+    assert!(!swap::old_path_in(home.path()).exists());
+
+    // 升级：bin 里放一个可辨识的「旧版本」（可执行脚本，内容与新二进制不同）
+    let bin = swap::bin_path_in(home.path());
+    std::fs::write(
+        &bin,
+        b"#!/bin/sh
+echo aproxy 0.0.1-old
+",
+    )
+    .unwrap();
+    make_executable(&bin);
+    let staged = stage(home.path(), "upgrade");
+    let outcome = swap::swap_in(home.path(), &staged).unwrap();
+    let old = swap::old_path_in(home.path());
+    assert_eq!(outcome.old_path, Some(old.clone()));
+    assert_eq!(
+        aproxy::install::staging::probe_version(&old).unwrap(),
+        "0.0.1-old",
+        "副本应是交换前的旧二进制且可执行"
+    );
+    assert!(bin_works(home.path()), "bin 应为新二进制");
+
+    // 连续升级：副本被新一轮的旧二进制覆盖（只保留最近 1 份）
+    let staged = stage(home.path(), "again");
+    swap::swap_in(home.path(), &staged).unwrap();
+    assert_eq!(
+        aproxy::install::staging::probe_version(&old).unwrap(),
+        env!("CARGO_PKG_VERSION")
+    );
 }

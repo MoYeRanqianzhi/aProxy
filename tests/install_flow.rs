@@ -199,10 +199,15 @@ fn install_from_with_instance_rolling_restart_and_relay() {
     let mut output = String::new();
     let _ = installer.stdout.take().unwrap().read_to_string(&mut output);
     let _ = installer.stderr.take().unwrap().read_to_string(&mut output);
-    let _ = installer.wait();
+    let status = installer.wait().unwrap();
     assert!(
         done,
         "安装未在预期时间内完成（状态文件残留）; 输出: {output}"
+    );
+    // 交棒后 CLI 等到接棒者终验通过才退出：退出码 0 + 完成提示即真实结局
+    assert!(
+        status.success() && output.contains("安装完成"),
+        "CLI 应在接棒者完成后以 0 退出并报告完成; 输出: {output}"
     );
 
     // 终态断言：bin 可运行、.old 已删（接管进程跑在新 bin 上，非自镜像）、
@@ -330,13 +335,23 @@ fn adopt_migrates_foreign_instance() {
     assert!(old_pid != 0, "外域实例未就绪");
 
     // --adopt：当前进程（CARGO_BIN_EXE）作为源收编
-    let mut installer = env
+    // CLI 在接力交棒后会等接棒者到达终点（终验通过即 cleaning）才以 0
+    // 退出——退出码即结局；此后只剩接棒者删 .old/staging 与状态文件
+    let out = env
         .install_cmd(&["--adopt", "--no-skills"])
-        .spawn()
+        .output()
         .unwrap();
-    let _ = installer.wait();
-    let done = wait_install_done(&env, Duration::from_secs(90));
-    assert!(done, "收编未完成（状态文件残留）");
+    assert!(
+        out.status.success(),
+        "收编应成功: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let state = aproxy::install::state::state_path_in(&run_dir);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while state.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(!state.exists(), "收编未完成（状态文件残留）");
 
     // 终态：标准位置出现二进制、实例滚动到 bin 二进制
     assert!(bin_works(&env.home()));
@@ -411,6 +426,195 @@ fn abort_rejected_after_swap_phase() {
         aproxy::install::state::state_path_in(&run_dir).exists(),
         "现场保留（续作或人工兜底）"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 6b. 滚动重启实例级失败（审查 install-01 原始复现）：实例运行中配置被改坏
+//     → install 滚动到它时新旧二进制都起不来。修复前：.restore 被守护优雅
+//     退出删除、实例永久丢失；Windows 接力路径打印「交换完成」并以 0 退出。
+//     修复后：CLI（Windows 上等接棒者跑到终点）以非零退出并给出原因与
+//     指引，.restore 以原参数保住，状态 halted（自动续作不再重试）。
+// ---------------------------------------------------------------------------
+#[test]
+fn install_instance_failure_exits_nonzero_and_keeps_restore() {
+    let env = TestEnv::new(8);
+    std::fs::write(env.home().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+    let bin = env.seed_bin();
+    let cfg_file = env.home().join("broken.toml");
+    std::fs::write(
+        &cfg_file,
+        format!(
+            "base_url = \"https://broken.example.com\"\nlisten_addr = \"127.0.0.1:{}\"\n",
+            env.port
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(&bin)
+        .args([
+            "--config",
+            &cfg_file.display().to_string(),
+            "--daemon-child",
+        ])
+        .env("APROXY_HOME", env.home())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let run_dir = env.home().join("run");
+    let mut ready = false;
+    for _ in 0..100 {
+        if aproxy::daemon::registry_pids_in(&run_dir).contains(&child.id()) {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ready, "实例未就绪");
+    let restore_before = std::fs::read_to_string(aproxy::daemon::restore_file_path_in(
+        &run_dir,
+        &env.port.to_string(),
+    ))
+    .unwrap();
+
+    // 运行中改坏配置（在跑的实例不受影响；任何版本按它重启都在 bind 前退出）
+    std::fs::write(
+        &cfg_file,
+        format!(
+            "base_url = \"ftp://bad.example\"\nlisten_addr = \"127.0.0.1:{}\"\n",
+            env.port
+        ),
+    )
+    .unwrap();
+
+    let from = env.source_file("broken");
+    let started = Instant::now();
+    let out = env
+        .install_cmd(&["--from", &from.display().to_string(), "--no-skills"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "实例级失败必须非零退出（Windows 接力路径修复前为 0）; stdout: {stdout} stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("滚动已中止") && stderr.contains("aproxy restore"),
+        "应给出中止说明与 restore 指引: {stderr}"
+    );
+    // Windows 有实例时必经接力交棒：失败由接棒者发生、经 CLI 轮询转告
+    #[cfg(windows)]
+    assert!(
+        stdout.contains("由新版本进程继续"),
+        "应走接力交棒路径: {stdout}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(120),
+        "失败应在有限时间内报告"
+    );
+    let _ = child.wait();
+
+    // .restore 以原参数保住（修复前被删）
+    let restore_after = std::fs::read_to_string(aproxy::daemon::restore_file_path_in(
+        &run_dir,
+        &env.port.to_string(),
+    ))
+    .expect(".restore 必须保住");
+    let args_of = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap()["args"].clone();
+    assert_eq!(args_of(&restore_after), args_of(&restore_before));
+    let st = aproxy::install::state::load_in(&run_dir).expect("failed 现场保留");
+    assert_eq!(st.phase, aproxy::install::state::InstallPhase::Failed);
+    assert!(st.halted, "实例级失败应置 halted");
+}
+
+// ---------------------------------------------------------------------------
+// 6c. unix 端到端回滚：--from 一个「能自报版本、但拉不起实例」的新二进制
+//     → 交换前保留的 bin/aproxy.old 把实例按原参数拉回，CLI 非零退出。
+//     （unix 无接力交棒，滚动在 CLI 进程内执行；Windows 的同一逻辑由
+//     install_flow_lib 的回滚用例覆盖——Windows 上造不出「能答 --version
+//     却拒绝启动」的假 exe）
+// ---------------------------------------------------------------------------
+#[cfg(unix)]
+#[test]
+fn unix_install_rolls_back_instance_to_preserved_old_binary() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = TestEnv::new(9);
+    std::fs::write(env.home().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+    let bin = env.seed_bin();
+    let cfg_file = env.home().join("unixrb.toml");
+    std::fs::write(
+        &cfg_file,
+        format!(
+            "base_url = \"https://unixrb.example.com\"\nlisten_addr = \"127.0.0.1:{}\"\n",
+            env.port
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(&bin)
+        .args([
+            "--config",
+            &cfg_file.display().to_string(),
+            "--daemon-child",
+        ])
+        .env("APROXY_HOME", env.home())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let old_pid = child.id();
+    let run_dir = env.home().join("run");
+    let mut ready = false;
+    for _ in 0..100 {
+        if aproxy::daemon::registry_pids_in(&run_dir).contains(&old_pid) {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ready, "实例未就绪");
+
+    let fake = env.home().join("fake-new");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"aproxy 0.0.0-fake\"; exit 0; fi\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = env
+        .install_cmd(&["--from", &fake.display().to_string(), "--no-skills"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "应非零退出: {stderr}");
+    assert!(
+        stderr.contains("旧二进制"),
+        "应说明已用旧二进制拉回: {stderr}"
+    );
+    let _ = child.wait();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let info = rt
+        .block_on(aproxy::daemon::ipc_ping_in(&run_dir, &env.port.to_string()))
+        .expect("实例应被旧二进制拉回");
+    assert_ne!(info.pid, old_pid);
+    assert_eq!(info.version, env!("CARGO_PKG_VERSION"), "拉回的是旧版本");
+    let image = aproxy::watchdog::process_image_path(info.pid).unwrap();
+    assert_eq!(image, aproxy::install::swap::old_path_in(&env.home()));
+    assert!(
+        aproxy::daemon::restore_file_path_in(&run_dir, &env.port.to_string()).is_file(),
+        ".restore 应在"
+    );
+
+    let _ = rt.block_on(aproxy::install::restart::stop_and_wait(
+        &run_dir,
+        &env.port.to_string(),
+        Duration::from_secs(20),
+    ));
 }
 
 // ---------------------------------------------------------------------------

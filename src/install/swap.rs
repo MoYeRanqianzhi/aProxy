@@ -8,8 +8,11 @@
 //!   （fallback 执行目标，保持 exe 后缀）；入口脚本常驻（防线 0，PATHEXT
 //!   保证 exe 在场时零参与）。
 //! - **unix**：只锁 inode。staging 文件单步 rename 原子覆盖 bin/aproxy——
-//!   不存在空窗（无需 fallback 脚本）、无 `.old`（旧 inode 挂在运行中进程上
-//!   自动消亡）、安装进程无需换镜像（直接续跑，无 relaying）。
+//!   不存在空窗（无需 fallback 脚本）、安装进程无需换镜像（直接续跑，无
+//!   relaying）。交换前先把旧二进制硬链接（失败则复制）为 `bin/aproxy.old`：
+//!   不是为了防空窗，而是滚动重启时某实例在新版本下起不来，要用旧二进制
+//!   按原参数把它拉回——rename 覆盖后旧 inode 只挂在运行中进程上，文件系统
+//!   里已无路径可执行。cleaning 照常删除（unix 删除运行中文件不受限）。
 
 use std::path::{Path, PathBuf};
 
@@ -23,10 +26,16 @@ pub fn bin_path_in(home: &Path) -> PathBuf {
     bin_dir_in(home).join(crate::install::staging::binary_name())
 }
 
-/// Windows：旧二进制固定名（保持 exe 后缀使其可作为 fallback 执行目标；
-/// 镜像锁只禁写删不禁运行）。只保留最近 1 份，连续升级互相覆盖。unix 不存在。
+/// 旧二进制固定名，只保留最近 1 份（连续升级互相覆盖），cleaning 删除。
+/// - Windows `aproxy.old.exe`：保持 exe 后缀使其可作为入口脚本的 fallback
+///   执行目标（镜像锁只禁写删不禁运行），也是实例回滚的旧二进制；
+/// - unix `aproxy.old`：交换前保留的旧二进制副本，只作实例回滚用。
 pub fn old_path_in(home: &Path) -> PathBuf {
-    bin_dir_in(home).join("aproxy.old.exe")
+    bin_dir_in(home).join(if cfg!(windows) {
+        "aproxy.old.exe"
+    } else {
+        "aproxy.old"
+    })
 }
 
 /// Windows：bin 下的临时名（copy 中间态，不占镜像锁；它的存在本身就是
@@ -35,8 +44,9 @@ pub fn new_tmp_path_in(home: &Path) -> PathBuf {
     bin_dir_in(home).join("aproxy.exe.new")
 }
 
-/// 交换结果：旧二进制去向（Windows = `.old` 路径；unix = None，进
-/// install.state.old_path 供 cleaning 删除）。
+/// 交换结果：旧二进制去向（Windows = `.old` 路径；unix = 交换前保留的
+/// `aproxy.old` 副本；首次安装无旧二进制 = None），进 install.state.old_path
+/// 供实例回滚使用与 cleaning 删除。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SwapOutcome {
     pub old_path: Option<PathBuf>,
@@ -132,9 +142,20 @@ fn clear_residual_old(old: &Path) -> Result<(), String> {
 #[cfg(not(windows))]
 fn swap_unix_in(home: &Path, staged: &Path) -> Result<SwapOutcome, String> {
     let bin = bin_path_in(home);
+    let old = old_path_in(home);
     std::fs::create_dir_all(bin_dir_in(home)).map_err(|e| format!("bin 目录创建失败: {e}"))?;
+    // 保留旧二进制（实例回滚用）：硬链接零拷贝且与 bin 同目录必同卷；不支持
+    // 硬链接的文件系统退回复制。保留失败 → 不交换（此刻 bin 未动，现场无损）
+    //——没有旧二进制兜底就进入滚动，实例起不来时只能下线
+    if bin.exists() {
+        let _ = std::fs::remove_file(&old);
+        if std::fs::hard_link(&bin, &old).is_err() {
+            std::fs::copy(&bin, &old).map_err(|e| format!("旧二进制保留失败: {e}"))?;
+            crate::install::staging::ensure_executable(&old);
+        }
+    }
     // staging 与 bin 同在 home 下（同卷），rename 原子覆盖成立；旧 inode 由
-    // 运行中进程挂着自动消亡——无空窗、无 .old、无需清位
+    // 运行中进程挂着——无空窗、无需清位
     std::fs::rename(staged, &bin).map_err(|e| format!("新二进制落位失败: {e}"))?;
     crate::install::staging::ensure_executable(&bin);
     // 落位验证：失败无回滚必要（旧文件已被覆盖，但旧 inode 语义下 bin 内容
@@ -142,7 +163,9 @@ fn swap_unix_in(home: &Path, staged: &Path) -> Result<SwapOutcome, String> {
     if let Err(e) = crate::install::staging::probe_version(&bin) {
         return Err(format!("落位验证失败: {e}"));
     }
-    Ok(SwapOutcome { old_path: None })
+    Ok(SwapOutcome {
+        old_path: old.exists().then_some(old),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +283,7 @@ mod tests {
             );
         } else {
             assert_eq!(bin_path_in(home), home.join("bin").join("aproxy"));
+            assert_eq!(old_path_in(home), home.join("bin").join("aproxy.old"));
         }
     }
 }

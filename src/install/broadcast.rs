@@ -38,10 +38,19 @@ pub async fn ack_one(run_dir: &Path, port: &str) -> Result<(), String> {
 }
 
 /// 全实例广播 + 重试收敛。`ports` 为当前运行实例端口清单（ACK 阶段快照，
-/// 写入 install.state.instance_snapshot）。
-/// 返回 Ok(()) = 全部 ACK；Err(失败端口) = 终失败（调用方 abort）。
-pub async fn broadcast_prepare_swap(run_dir: &Path, ports: &[String]) -> Result<(), Vec<String>> {
-    let exe = std::env::current_exe().map_err(|e| vec![format!("无法定位自身可执行文件: {e}")])?;
+/// 写入 install.state.instance_snapshot）。`state` 为持锁的安装状态——
+/// 收敛 restart 的在途记录与 halted 标记都落在它上面。
+/// 返回 Ok(()) = 全部 ACK；Err(说明) = 终失败（调用方置 failed）。
+///
+/// 收敛 restart 若发生实例级失败（安装器 exe 拉不起该实例、已用实例原
+/// 镜像拉回或拉回失败）→ 立即终止收敛：再来一轮只会让该实例再经历一次
+/// 「停止 → 起不来 → 拉回」的服务中断。
+pub async fn broadcast_prepare_swap(
+    run_dir: &Path,
+    ports: &[String],
+    state: &mut super::state::InstallState,
+) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("无法定位自身可执行文件: {e}"))?;
     let mut unacked: Vec<String> = Vec::new();
     for round in 0..3 {
         unacked.clear();
@@ -58,14 +67,19 @@ pub async fn broadcast_prepare_swap(run_dir: &Path, ports: &[String]) -> Result<
             break;
         }
         // 轮间收敛：未表达 = 旧实例/故障实例，restart 到安装器版本。
-        // restart 自身失败也计入未 ACK（下轮再试）
+        // 「未被动过」类失败计入未 ACK（下轮再试）；实例级失败立即终止。
+        // fallback=None：swap 之前实例镜像文件未变，停止前的镜像路径即旧二进制
         for port in &unacked {
-            if let Err(e) = super::restart::restart_instance(run_dir, port, &exe).await {
-                tracing::warn!(port = %port, error = %e, "ACK 收敛 restart 失败");
+            match super::restart::restart_instance(run_dir, state, port, &exe, None).await {
+                Ok(_) => {}
+                Err(e @ super::restart::RestartError::NotRestarted(_)) => {
+                    tracing::warn!(port = %port, error = %e, "ACK 收敛 restart 失败");
+                }
+                Err(e) => return Err(format!("实例 {port} 收敛重启失败: {e}")),
             }
         }
     }
-    Err(unacked)
+    Err(format!("实例未表达（已按重试/restart 收敛）: {unacked:?}"))
 }
 
 #[cfg(test)]
@@ -82,11 +96,20 @@ mod tests {
     #[tokio::test]
     async fn broadcast_reports_unacked_ports() {
         let dir = tempfile::tempdir().unwrap();
-        // 无任何实例运行：两个端口全部未 ACK → Err 携带完整清单
+        // 无任何实例运行：两个端口全部未 ACK → Err 携带完整清单；收敛
+        // restart 因无恢复记录属「未被动过」，不得置 halted、不留在途记录
         let ports = vec!["59988".to_string(), "59989".to_string()];
-        let err = broadcast_prepare_swap(dir.path(), &ports)
+        let mut state = crate::install::state::InstallState::new_marking(
+            "0.0.0",
+            crate::install::state::InstallSource::From,
+        );
+        let err = broadcast_prepare_swap(dir.path(), &ports, &mut state)
             .await
             .unwrap_err();
-        assert_eq!(err.len(), 2, "全部未 ACK 应逐一上报: {err:?}");
+        assert!(
+            err.contains("59988") && err.contains("59989"),
+            "全部未 ACK 应逐一上报: {err}"
+        );
+        assert!(!state.halted && state.pending_restores.is_empty());
     }
 }

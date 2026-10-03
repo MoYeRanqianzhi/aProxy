@@ -16,11 +16,18 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
     if args.continue_ {
         // 续作模式：静默执行（由看护者/CLI 入口/接力自动拉起）。失败落
         // failed 现场等下次续作，不打扰用户——但首轮失败输出到日志可查。
+        // 硬退理由同 report_outcome：续作在 Windows 上也可能再次交棒，
+        // 后台任务不保证已结束
         match aproxy::install::flow::continue_install(&home, &run_dir).await {
-            Ok(_) => tracing::info!("install 续作完成"),
-            Err(e) => tracing::error!(error = %e, "install 续作失败（现场已保留，等待下次续作）"),
+            Ok(_) => {
+                tracing::info!("install 续作完成");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "install 续作失败（现场已保留，等待下次续作）");
+                std::process::exit(1);
+            }
         }
-        return;
     }
 
     // --skills-only：只更新 skill 文档（不动二进制、不建安装状态机）。
@@ -103,9 +110,38 @@ fn effective_proxy(args: &InstallArgs) -> Option<String> {
         .or_else(|| aproxy::settings::load().download_proxy)
 }
 
-/// --skills-only：只更新 skill 文档。版本默认 latest（github 列表第一个）；
-/// settings download_chain 与 --download-proxy 与主流程同一语义。
-/// 成功后输出落位位置与「安装到 agent 目录由用户/agent 自行链接」提示。
+/// latest 查询：github（权威来源）→ 不可达/限流时 npm dist-tags 兜底
+/// （跟随 ~/.npmrc 镜像——共享出口 IP 场景 github 不可用是常态）。两级都
+/// 按同一通道选版；Ok(None) = 通道内无版本。两级皆不可达 → Err(github 的
+/// 错误，更具排查价值)。
+async fn query_latest(
+    ctx: &aproxy::install::download::DownloadCtx,
+    channel: aproxy::install::download::Channel,
+    artifact: aproxy::install::download::Artifact,
+) -> Result<Option<String>, String> {
+    println!("查询最新版本（{} 通道）...", channel.label());
+    match aproxy::install::download::github::latest_version(ctx, channel, artifact).await {
+        Ok(v) => Ok(v),
+        Err(gh_err) => {
+            match aproxy::install::download::npmpkg::latest_version(ctx, channel).await {
+                Ok(v) => {
+                    println!(
+                        "github 查询失败（{gh_err}），npm 兜底结果：{}",
+                        v.as_deref().unwrap_or("通道内无版本")
+                    );
+                    Ok(v)
+                }
+                Err(_) => Err(gh_err),
+            }
+        }
+    }
+}
+
+/// --skills-only：只更新 skill 文档。版本默认 latest（按通道取最大，同
+/// 二进制安装）；通道内无版本时取当前运行版本（skill 与在跑的二进制对齐
+/// 是最合理的退路）。settings download_chain 与 --download-proxy 与主流程
+/// 同一语义。成功后输出落位位置与「安装到 agent 目录由用户/agent 自行链接」
+/// 提示。
 async fn run_skills_only(args: &InstallArgs) {
     let home = aproxy::settings::home();
     let settings = aproxy::settings::load();
@@ -126,21 +162,22 @@ async fn run_skills_only(args: &InstallArgs) {
     };
     let version = match args.version.as_deref() {
         None | Some("latest") => {
-            println!("查询最新版本...");
-            match aproxy::install::download::github::latest_version(&ctx).await {
-                Ok(v) => v,
+            let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("内置版本号必为合法 semver");
+            let channel = aproxy::install::download::Channel::resolve(args.pre, &current);
+            match query_latest(&ctx, channel, aproxy::install::download::Artifact::Skills).await {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    println!(
+                        "{} 通道暂无可用版本，skill 按当前版本 {current} 更新。",
+                        channel.label()
+                    );
+                    current.to_string()
+                }
                 Err(gh_err) => {
-                    match aproxy::install::download::npmpkg::latest_version(&ctx).await {
-                        Ok(v) => {
-                            println!("github 查询失败（{gh_err}），npm 兜底命中 {v}");
-                            v
-                        }
-                        Err(_) => {
-                            eprintln!("[ERROR] {gh_err}");
-                            eprintln!("可尝试：--skills-only <具体版本号>（跳过 latest 查询）。");
-                            std::process::exit(1);
-                        }
-                    }
+                    eprintln!("[ERROR] {gh_err}");
+                    eprintln!("可尝试：--skills-only <具体版本号>（跳过 latest 查询）。");
+                    std::process::exit(1);
                 }
             }
         }
@@ -186,28 +223,47 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         }
     };
 
-    // 版本解析：latest = GitHub Releases 最新（列表第一个，<1.0 含
-    // prerelease）；github API 限流/不可达时兜底 npm dist-tags.latest
-    // （跟随 ~/.npmrc 镜像——共享出口 IP 场景 github 不可用是常态）
+    // 版本解析：latest = 通道内 semver 最大的主线版本（stable 只取正式版，
+    // pre 含预发布；默认通道跟随当前版本，见 Channel::resolve）。latest 不
+    // 高于当前 → 已是最新，不重装；通道为空 → 保持现状，绝不跨通道偷装
+    // 预发布（是否接受预发布是用户的显式选择 --pre）
+    let current =
+        semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("内置版本号必为合法 semver");
     let target = match args.version.as_deref() {
         None | Some("latest") => {
-            println!("查询最新版本...");
-            match aproxy::install::download::github::latest_version(&ctx).await {
-                Ok(v) => v,
+            use aproxy::install::download::{Artifact, Channel, LatestDecision, decide_latest};
+            let channel = Channel::resolve(args.pre, &current);
+            let candidate = match query_latest(&ctx, channel, Artifact::Binary).await {
+                Ok(c) => c,
                 Err(gh_err) => {
-                    match aproxy::install::download::npmpkg::latest_version(&ctx).await {
-                        Ok(v) => {
-                            println!("github 查询失败（{gh_err}），npm 兜底命中 {v}");
-                            v
-                        }
-                        Err(_) => {
-                            eprintln!("[ERROR] {gh_err}");
-                            eprintln!(
-                                "可尝试：install <具体版本号>（跳过 latest 查询），或 --download-proxy <URL> 更换出口。"
-                            );
-                            std::process::exit(1);
-                        }
+                    eprintln!("[ERROR] {gh_err}");
+                    eprintln!(
+                        "可尝试：install <具体版本号>（跳过 latest 查询），或 --download-proxy <URL> 更换出口。"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            match decide_latest(&current, candidate.as_deref()) {
+                LatestDecision::Install(v) => v,
+                LatestDecision::UpToDate(latest) => {
+                    println!(
+                        "已是最新：当前 {current}，{} 通道最新为 {latest}，无需安装。",
+                        channel.label()
+                    );
+                    if channel == Channel::Stable {
+                        println!("（如需预发布版本，可加 --pre）");
                     }
+                    return;
+                }
+                LatestDecision::NoneInChannel => {
+                    println!(
+                        "{} 通道暂无可用版本，保持当前 {current} 不变。",
+                        channel.label()
+                    );
+                    if channel == Channel::Stable {
+                        println!("（如需预发布版本，可加 --pre）");
+                    }
+                    return;
                 }
             }
         }
@@ -220,21 +276,12 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     ctx.version = target.clone();
 
     // 降级防呆：target < 当前运行版本 → 拒绝（--allow-downgrade 放行）。
-    // semver 比较：prerelease 语义 alpha.9 < alpha.10 与 0.2.0 > 0.1.0-x
-    let current =
-        semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("内置版本号必为合法 semver");
-    match semver::Version::parse(&target) {
-        Ok(t) if t < current && !args.allow_downgrade => {
-            eprintln!(
-                "[ERROR] 目标版本 {target} 低于当前 {current}。确认要降级请加 --allow-downgrade。"
-            );
-            std::process::exit(1);
-        }
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("[ERROR] 版本号 {target} 非法（semver 解析失败: {e}）");
-            std::process::exit(1);
-        }
+    // latest 路径经 decide_latest 已保证高于当前，这里主要拦显式指定的版本号
+    if let Err(e) =
+        aproxy::install::download::check_downgrade(&target, &current, args.allow_downgrade)
+    {
+        eprintln!("[ERROR] {e}");
+        std::process::exit(1);
     }
 
     // 下载链条：产物落 staging/<版本>/（与 --from 的备料同一位置）
@@ -323,7 +370,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         "npm" => aproxy::install::state::InstallSource::Npm,
         _ => aproxy::install::state::InstallSource::Url,
     };
-    match aproxy::install::flow::run_install_online(
+    let result = aproxy::install::flow::run_install_online(
         home,
         run_dir,
         &target,
@@ -332,25 +379,113 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         !args.no_skills,
         proxy,
     )
-    .await
-    {
-        Ok(exit) => {
-            if exit == aproxy::install::flow::FlowExit::HandedOver {
-                println!("交换完成，剩余阶段由新版本继续（接力交棒）。");
-                std::process::exit(0);
+    .await;
+    report_outcome(home, run_dir, result).await;
+}
+
+/// 安装结局的用户可见输出与退出码（三个安装入口共用）。**一律硬退**：
+/// 宣告 ticker 与 skill 支线等后台任务不保证在此刻已结束，走正常 return
+/// 会让 tokio runtime drop 等待它们（实测 27 个交棒进程全体挂死的根源）。
+///
+/// Windows 接力交棒（`HandedOver`）≠ 安装完成：滚动重启/终验由接棒的新
+/// 二进制进程执行，本进程（旧镜像）必须等它跑到终点再报告——否则接棒者
+/// 失败时用户看到的是「交换完成」与退出码 0，agent 会以为升级成功。
+async fn report_outcome(
+    home: &std::path::Path,
+    run_dir: &std::path::Path,
+    result: Result<aproxy::install::flow::FlowExit, String>,
+) -> ! {
+    let done_msg = || {
+        println!(
+            "安装完成：{}（二进制已落位，实例已滚动到新版本）",
+            aproxy::install::swap::bin_path_in(home).display()
+        );
+    };
+    match result {
+        Ok(aproxy::install::flow::FlowExit::Completed) => {
+            done_msg();
+            std::process::exit(0);
+        }
+        Ok(aproxy::install::flow::FlowExit::HandedOver) => {
+            println!("交换完成，剩余阶段（滚动重启/终验）由新版本进程继续，等待其完成...");
+            match await_handover(run_dir).await {
+                Ok(()) => {
+                    done_msg();
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("[ERROR] 安装失败: {e}");
+                    print_failure_guidance(run_dir);
+                    std::process::exit(1);
+                }
             }
-            println!(
-                "安装完成：{}（二进制已落位，实例已滚动到新版本）",
-                aproxy::install::swap::bin_path_in(home).display()
-            );
         }
         Err(e) => {
             eprintln!("[ERROR] 安装失败: {e}");
-            eprintln!(
-                "现场已保留，中断后重试同一命令或任何 aproxy 命令可自动续作；`aproxy install --abort` 可显式回滚。"
-            );
+            print_failure_guidance(run_dir);
             std::process::exit(1);
         }
+    }
+}
+
+/// 接棒者结局等待上限：与安装锁 stale 判定同量级（滚动重启每实例最坏
+/// 约 20s 停止 + 8s 就绪 + 8s 回退，十分钟覆盖数十个实例）。
+const HANDOVER_WAIT_SECS: u64 = aproxy::install::state::STALE_AFTER_SECS;
+
+/// 轮询 install.state 直到接棒者到达终点。成功判据：状态文件消失（done
+/// 清场）或 phase 进入 cleaning（终验已通过——cleaning 只剩删 `.old` 与
+/// staging，而 `.old` 正是本进程的运行镜像，本进程必须先退出它才删得掉，
+/// 所以不能等到 done）。失败判据：phase=failed（带接棒者记下的原因）、
+/// 接棒进程已死而安装未终结、等待超时。
+async fn await_handover(run_dir: &std::path::Path) -> Result<(), String> {
+    use aproxy::install::state::{InstallPhase, is_stale, load_in, state_path_in};
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(HANDOVER_WAIT_SECS);
+    loop {
+        match load_in(run_dir) {
+            None if !state_path_in(run_dir).exists() => return Ok(()),
+            // 文件在但读不出（状态损坏）：不臆断，继续等到超时
+            None => {}
+            Some(s) => match s.phase {
+                InstallPhase::Cleaning | InstallPhase::Done => return Ok(()),
+                InstallPhase::Failed => {
+                    return Err(s
+                        .last_error
+                        .unwrap_or_else(|| "接棒进程报告失败（原因未记录）".to_string()));
+                }
+                InstallPhase::Aborted => return Err("安装已被中止（--abort）".to_string()),
+                _ if s.installer_pid != std::process::id()
+                    && is_stale(&s, aproxy::watchdog::now_secs()) =>
+                {
+                    return Err(format!(
+                        "接棒进程（pid {}）已退出但安装停在 {:?}；现场已保留，任何 aproxy 命令会自动续作",
+                        s.installer_pid, s.phase
+                    ));
+                }
+                _ => {}
+            },
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "{HANDOVER_WAIT_SECS} 秒内未确认安装完成（可能仍在后台进行）；可用 aproxy status 查看实例版本"
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// 失败后的处置指引：实例级失败（halted）与可续作的失败给不同的出路。
+fn print_failure_guidance(run_dir: &std::path::Path) {
+    let halted = aproxy::install::state::load_in(run_dir).is_some_and(|s| s.halted);
+    if halted {
+        eprintln!(
+            "滚动已中止，不会自动重试：出问题的实例已用旧二进制拉回（拉回失败时其恢复记录已保留），\
+             其余实例未动。常见原因是新版本不接受现有配置——按上方原因修正后重新执行 aproxy install 完成升级；\
+             若要留在旧版本，用 `aproxy install <旧版本> --allow-downgrade` 把规范位置的二进制换回。"
+        );
+    } else {
+        eprintln!(
+            "现场已保留，中断后重试同一命令或任何 aproxy 命令可自动续作；`aproxy install --abort` 可显式回滚（仅交换前）。"
+        );
     }
 }
 
@@ -371,32 +506,10 @@ async fn run_plan(
     }
     let target = plan.target_version.clone();
     println!("开始安装 aProxy {target}...");
-    match aproxy::install::flow::run_install(home, run_dir, &plan, skill_enabled, download_proxy)
-        .await
-    {
-        Ok(exit) => {
-            if exit == aproxy::install::flow::FlowExit::HandedOver {
-                // Windows 接力：续作由新二进制进程完成，本进程（旧镜像）
-                // 到此结束——对用户表现为同一条命令装完。**必须硬退**：
-                // 交棒路径刻意不 abort 宣告 ticker（进程退出即节消失），
-                // 走正常 return 会让 tokio runtime drop 永久等待无限循环
-                // 的 ticker 任务（实测 27 个交棒进程全体挂死的根源）
-                println!("交换完成，剩余阶段由新版本继续（接力交棒）。");
-                std::process::exit(0);
-            }
-            println!(
-                "安装完成：{}（二进制已落位，实例已滚动到新版本）",
-                aproxy::install::swap::bin_path_in(home).display()
-            );
-        }
-        Err(e) => {
-            eprintln!("[ERROR] 安装失败: {e}");
-            eprintln!(
-                "现场已保留，中断后重试同一命令或任何 aproxy 命令可自动续作；`aproxy install --abort` 可显式回滚。"
-            );
-            std::process::exit(1);
-        }
-    }
+    let result =
+        aproxy::install::flow::run_install(home, run_dir, &plan, skill_enabled, download_proxy)
+            .await;
+    report_outcome(home, run_dir, result).await;
 }
 
 /// --abort：显式回滚（仅 swapping 前可完全回滚，此后只进不退）。

@@ -173,9 +173,41 @@ fn extract_from_tgz(tgz: &Path, inner_path: &str, dest: &Path) -> Result<(), Str
     Err(format!("tgz 内未找到 {inner_path}"))
 }
 
-/// 主包 dist-tags.latest（latest 查询的 npm 兜底）：github API 限流/不可达
-/// 时，registry 通常可达且跟随 ~/.npmrc 镜像配置。
-pub async fn latest_version(ctx: &DownloadCtx) -> Result<String, String> {
+/// 纯函数选版：从主包 `dist-tags` 按通道取版本。
+///
+/// - Stable：读 `latest`，但**它本身是预发布时视为无稳定版**（返回 None）——
+///   0.1.0 之前所有 alpha 都发在 `latest` 上，发布侧改为「预发布发 `next`」
+///   之前，稳定通道不能信任 `latest` 一定是正式版。
+/// - Pre：`latest` 与 `next` 中 semver 较大者（预发布发 `next`、正式版发
+///   `latest`；正式版发出后 `next` 可能停留在更旧的预发布，取大者即对）。
+///
+/// 不可解析为 semver 的标签值一律忽略（不让来源异常的值参与比较）。
+pub fn pick_from_dist_tags(
+    dist_tags: &serde_json::Value,
+    channel: super::Channel,
+) -> Option<String> {
+    let parsed = |key: &str| {
+        let s = dist_tags[key].as_str()?;
+        semver::Version::parse(s).ok().map(|v| (v, s.to_string()))
+    };
+    match channel {
+        super::Channel::Stable => parsed("latest")
+            .filter(|(v, _)| v.pre.is_empty())
+            .map(|(_, s)| s),
+        super::Channel::Pre => match (parsed("latest"), parsed("next")) {
+            (Some(a), Some(b)) => Some(if b.0 > a.0 { b.1 } else { a.1 }),
+            (a, b) => a.or(b).map(|(_, s)| s),
+        },
+    }
+}
+
+/// 主包 dist-tags 按通道选版（latest 查询的 npm 兜底）：github API 限流/
+/// 不可达时，registry 通常可达且跟随 ~/.npmrc 镜像配置。Ok(None) = 通道
+/// 内无版本（同 github::latest_version 语义）。
+pub async fn latest_version(
+    ctx: &DownloadCtx,
+    channel: super::Channel,
+) -> Result<Option<String>, String> {
     let registry = registry_from_npmrc();
     let url = format!("{registry}/@meowo/aproxy");
     let resp = ctx
@@ -191,10 +223,10 @@ pub async fn latest_version(ctx: &DownloadCtx) -> Result<String, String> {
         .json()
         .await
         .map_err(|e| format!("registry 元数据解析失败: {e}"))?;
-    meta["dist-tags"]["latest"]
-        .as_str()
-        .map(String::from)
-        .ok_or_else(|| "元数据缺 dist-tags.latest".to_string())
+    if !meta["dist-tags"].is_object() {
+        return Err("元数据缺 dist-tags".to_string());
+    }
+    Ok(pick_from_dist_tags(&meta["dist-tags"], channel))
 }
 
 /// npm 通道获取：元数据 → tgz 下载 + integrity 强校验 → 解包提取产物。
@@ -279,6 +311,43 @@ mod tests {
         }
         // 完整形态：@meowo/aproxy-<os>-<arch>[libc]
         assert!(mk("x86_64-any").starts_with("@meowo/aproxy-"));
+    }
+
+    #[test]
+    fn dist_tags_channel_selection() {
+        use super::super::Channel;
+        use serde_json::json;
+        // 现状：alpha 发在 latest 上——stable 通道视为无稳定版，pre 取它
+        let tags = json!({"latest": "0.1.0-alpha.17"});
+        assert_eq!(pick_from_dist_tags(&tags, Channel::Stable), None);
+        assert_eq!(
+            pick_from_dist_tags(&tags, Channel::Pre).as_deref(),
+            Some("0.1.0-alpha.17")
+        );
+        // 正式版后：latest=正式、next=更新的预发布
+        let tags = json!({"latest": "0.1.0", "next": "0.2.0-alpha.1"});
+        assert_eq!(
+            pick_from_dist_tags(&tags, Channel::Stable).as_deref(),
+            Some("0.1.0")
+        );
+        assert_eq!(
+            pick_from_dist_tags(&tags, Channel::Pre).as_deref(),
+            Some("0.2.0-alpha.1")
+        );
+        // next 停在旧预发布：pre 取大者 = 正式版
+        let tags = json!({"latest": "0.1.1", "next": "0.1.0-rc.2"});
+        assert_eq!(
+            pick_from_dist_tags(&tags, Channel::Pre).as_deref(),
+            Some("0.1.1")
+        );
+        // 只有 next / 非法值被忽略
+        let tags = json!({"next": "0.2.0-alpha.1", "latest": "not-semver"});
+        assert_eq!(pick_from_dist_tags(&tags, Channel::Stable), None);
+        assert_eq!(
+            pick_from_dist_tags(&tags, Channel::Pre).as_deref(),
+            Some("0.2.0-alpha.1")
+        );
+        assert_eq!(pick_from_dist_tags(&json!({}), Channel::Pre), None);
     }
 
     #[test]

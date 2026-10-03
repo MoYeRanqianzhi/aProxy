@@ -2643,6 +2643,437 @@ async fn forward_only_client_upload_abort_is_not_an_upstream_failure() {
 }
 
 // ---------------------------------------------------------------------------
+// 33. 入站来源校验（allowed_hosts / allowed_origins）
+//
+// 威胁：DNS 重绑定让恶意网页以「同源」身份调用本代理（Host = 攻击者域名），
+// 或网页直接对 127.0.0.1 发跨站请求（带 Origin）。被拒请求必须在本地 403：
+// **上游零请求**（没转发、没注入 api_key、没进重试循环）——断言一律落在 mock
+// 上游的计数上，而不是只看状态码。
+// ---------------------------------------------------------------------------
+
+/// 计数型 mock 上游：任何路径恒 200，记录收到的请求数
+async fn counting_upstream() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let router = Router::new().fallback(any(move || {
+        let h = h.clone();
+        async move {
+            h.fetch_add(1, Ordering::SeqCst);
+            (StatusCode::OK, "{\"ok\":true}")
+        }
+    }));
+    let (url, handle) = bind_random_router(router).await;
+    (url, hits, handle)
+}
+
+#[tokio::test]
+async fn inbound_forged_host_is_rejected_locally_without_forwarding() {
+    // 常规与仅转发两条路径都覆盖：校验必须先于 forward_only 分支
+    for forward_only in [false, true] {
+        let (upstream_url, hits, _h1) = counting_upstream().await;
+        let mut cfg = proxy_config_for(&upstream_url);
+        cfg.api_key = Some("sk-SECRET-INJECTED".to_string());
+        cfg.forward_only = Some(forward_only);
+        let state = AppState::new(cfg);
+        let probe = state.clone();
+        let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(state)).await;
+
+        let client = local_client();
+        for host in [
+            "evil.example.com",
+            "evil.example.com:12345",
+            "127.0.0.1.evil.example",
+        ] {
+            let resp = client
+                .post(format!("{proxy_url}/v1/messages?key=QSECRET"))
+                .header("host", host)
+                .header("content-type", "text/plain")
+                .body("{\"model\":\"x\"}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                403,
+                "伪造 Host {host} 必须 403（forward_only={forward_only}）"
+            );
+            let body = resp.text().await.unwrap();
+            assert!(
+                body.contains("allowed_hosts") && body.contains("未转发上游"),
+                "403 文案须点名配置项与处置，实际: {body}"
+            );
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "被拒请求绝不能到达上游（forward_only={forward_only}）"
+        );
+        // 被拒请求不是代理流量：不计数、不记最近错误（不进入任何转发/重试路径）
+        assert_eq!(probe.stats.requests_total.load(Ordering::Relaxed), 0);
+        assert!(probe.stats.last_error.lock().unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn inbound_request_with_origin_is_rejected_by_default() {
+    let (upstream_url, hits, _h1) = counting_upstream().await;
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.api_key = Some("sk-SECRET-INJECTED".to_string());
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(cfg))).await;
+    let client = local_client();
+
+    // no-cors 式简单 POST（浏览器也会带 Origin）与 CORS 预检（OPTIONS）都要拒：
+    // 预检若被转发，上游的 4xx 会让它进入无限重试
+    let resp = client
+        .post(format!("{proxy_url}/v1/messages"))
+        .header("origin", "https://evil.example")
+        .header("content-type", "text/plain")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("allowed_origins"),
+        "403 文案须点名配置项: {body}"
+    );
+    assert!(
+        body.contains("https://evil.example"),
+        "文案应回显被拒的 Origin，方便照抄进配置: {body}"
+    );
+
+    let resp = client
+        .request(reqwest::Method::OPTIONS, format!("{proxy_url}/v1/messages"))
+        .header("origin", "https://evil.example")
+        .header("access-control-request-method", "POST")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "CORS 预检同样本地拒绝");
+
+    // 即便是本机页面（localhost 源）也默认不放行——任何浏览器上下文都需显式配置
+    let resp = client
+        .post(format!("{proxy_url}/v1/messages"))
+        .header("origin", "http://localhost:5173")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "被拒请求绝不能到达上游");
+}
+
+#[tokio::test]
+async fn inbound_loopback_hosts_are_allowed_by_default() {
+    // CLI agent 的真实形态：Host 为 127.0.0.1 / localhost / [::1]（带任意端口），
+    // 无 Origin——默认策略对它们必须零影响
+    let (upstream_url, hits, _h1) = counting_upstream().await;
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(
+        proxy_config_for(&upstream_url),
+    )))
+    .await;
+    let client = local_client();
+    let port = proxy_url.rsplit(':').next().unwrap().to_string();
+    // 第一个用 reqwest 自带的 Host（127.0.0.1:端口），其余显式改写
+    let hosts = [
+        None,
+        Some(format!("localhost:{port}")),
+        Some("LocalHost".to_string()),
+        Some(format!("[::1]:{port}")),
+        Some("127.0.0.1".to_string()),
+    ];
+    for host in &hosts {
+        let mut req = client.get(format!("{proxy_url}/v1/models"));
+        if let Some(h) = host {
+            req = req.header("host", h);
+        }
+        let resp = req.send().await.unwrap();
+        assert_eq!(resp.status(), 200, "回环 Host {host:?} 必须放行");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), hosts.len());
+}
+
+#[tokio::test]
+async fn inbound_request_without_host_header_is_allowed() {
+    // 无 Host 头（也无 authority）的请求放行：浏览器的明文 HTTP 请求必带 Host，
+    // 这类请求只可能来自本机自己拼报文的程序，与 DNS 重绑定无关
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (upstream_url, hits, _h1) = counting_upstream().await;
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(
+        proxy_config_for(&upstream_url),
+    )))
+    .await;
+    let addr = proxy_url.trim_start_matches("http://").to_string();
+    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    sock.write_all(b"GET /v1/nohost HTTP/1.1\r\nconnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut raw = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut raw)).await;
+    let text = String::from_utf8_lossy(&raw).to_string();
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "无 Host 请求应放行: {text:?}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn inbound_allowlist_entries_extend_defaults() {
+    let (upstream_url, hits, _h1) = counting_upstream().await;
+    let mut cfg = proxy_config_for(&upstream_url);
+    // 条目写法容错：Host 条目带端口、Origin 条目带末尾斜杠，比较时均忽略；
+    // 大小写不敏感
+    cfg.allowed_hosts = Some(vec!["MyProxy.Local:999".to_string()]);
+    cfg.allowed_origins = Some(vec!["http://localhost:5173/".to_string()]);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(cfg))).await;
+    let client = local_client();
+
+    let ok = client
+        .get(format!("{proxy_url}/v1/models"))
+        .header("host", "myproxy.local:12345")
+        .header("origin", "http://LOCALHOST:5173")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200, "白名单内的 Host + Origin 应放行");
+    // 显式列表是在内置回环名单之上追加，不是替换
+    let ok = client
+        .get(format!("{proxy_url}/v1/models"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        ok.status(),
+        200,
+        "配置了 allowed_hosts 后 127.0.0.1 仍应放行"
+    );
+
+    let denied = client
+        .get(format!("{proxy_url}/v1/models"))
+        .header("origin", "http://localhost:3000")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403, "端口不同的 Origin 不在白名单内");
+    let denied = client
+        .get(format!("{proxy_url}/v1/models"))
+        .header("host", "other.local")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403, "未列出的 Host 仍被拒");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn inbound_wildcards_disable_checks() {
+    // 显式关闭校验的写法：["*"]
+    let (upstream_url, hits, _h1) = counting_upstream().await;
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.allowed_hosts = Some(vec!["*".to_string()]);
+    cfg.allowed_origins = Some(vec!["*".to_string()]);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(cfg))).await;
+    let resp = local_client()
+        .get(format!("{proxy_url}/v1/models"))
+        .header("host", "evil.example.com")
+        .header("origin", "https://evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "[\"*\"] 应关闭对应校验");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn inbound_non_loopback_listen_skips_host_check_but_not_origin() {
+    // 监听非回环地址（配置层面；测试实际仍绑 127.0.0.1，免得在测试机上开放
+    // 局域网端口）：默认不做 Host 校验——局域网/容器客户端的 Host 各式各样；
+    // Origin 校验与监听地址无关，照常生效
+    let (upstream_url, hits, _h1) = counting_upstream().await;
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.listen_addr = "0.0.0.0:0".to_string();
+    let (proxy_url, _h2) =
+        bind_random_router(aproxy::proxy::router(AppState::new(cfg.clone()))).await;
+    let client = local_client();
+    let resp = client
+        .get(format!("{proxy_url}/v1/models"))
+        .header("host", "host.docker.internal:12345")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "非回环监听默认不校验 Host");
+    let resp = client
+        .get(format!("{proxy_url}/v1/models"))
+        .header("origin", "https://evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "Origin 校验不随监听地址关闭");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    // 非回环监听 + 显式 allowed_hosts：Host 校验随之开启（回环名单 + 列表）
+    cfg.allowed_hosts = Some(vec!["lan.example".to_string()]);
+    let (proxy_url, _h3) = bind_random_router(aproxy::proxy::router(AppState::new(cfg))).await;
+    let resp = client
+        .get(format!("{proxy_url}/v1/models"))
+        .header("host", "lan.example:12345")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .get(format!("{proxy_url}/v1/models"))
+        .header("host", "evil.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "显式列表开启 Host 校验后，未列出的 Host 被拒"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+// ---------------------------------------------------------------------------
+// 34. 凭据脱敏：日志 / 最近错误 / 502 正文中不出现 base_url 的 userinfo 与
+// 客户端查询串的值
+//
+// 日志断言走**真实 tracing 输出**：本测试在当前线程装一个捕获型 subscriber
+// （#[tokio::test] 是单线程运行时，mock 上游、代理 handler 与 reqwest 连接任务
+// 都在本线程上执行，事件全部落进捕获缓冲）。每组断言都同时要求「出现了
+// 脱敏后的形态」——否则「日志根本没打这一行」也会让「不含秘密」恒真。
+// ---------------------------------------------------------------------------
+
+/// 捕获型日志写入器：所有事件追加到共享缓冲
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl CapturedLogs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+    }
+}
+
+/// 不可达的上游地址：绑定随机端口后立即释放，之后无人监听（连接被拒）
+async fn dead_port_url() -> String {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    drop(l);
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn credentials_masked_in_logs_last_error_and_502() {
+    let logs = CapturedLogs::default();
+    let sink = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let with_userinfo = |url: &str| url.replacen("http://", "http://alice:BASEPASS123@", 1);
+    let client = local_client();
+
+    // (1) 常规路径成功请求：「代理请求」日志的 path/target 字段
+    let (upstream_url, _hits, _h1) = counting_upstream().await;
+    let state = AppState::new(proxy_config_for(&with_userinfo(&upstream_url)));
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(state)).await;
+    let resp = client
+        .get(format!("{proxy_url}/v1/x?key=QUERYSECRET1&beta=true"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // (2) 常规路径网络错误：上游不可达 → NetworkError 文本进日志与最近错误。
+    // 请求会无限重试，所以放进后台任务、轮询到首轮失败被记录即中止（Windows 上
+    // 连一个无人监听的本机端口要约 2 秒才被拒，不能用固定的短超时去等）
+    let dead = dead_port_url().await;
+    let state = AppState::new(proxy_config_for(&with_userinfo(&dead)));
+    let probe = state.clone();
+    let (proxy_url, _h3) = bind_random_router(aproxy::proxy::router(state)).await;
+    let retrying = tokio::spawn({
+        let client = client.clone();
+        let url = format!("{proxy_url}/v1/y?key=QUERYSECRET2");
+        async move {
+            let _ = client.get(url).send().await;
+        }
+    });
+    let mut recorded = None;
+    for _ in 0..100 {
+        recorded = probe.stats.last_error.lock().unwrap().clone();
+        if recorded.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    retrying.abort();
+    let last_error = recorded.expect("10 秒内应记录首轮网络错误").0;
+    assert!(
+        last_error.contains("网络错误") && last_error.contains("key=***"),
+        "最近错误应保留脱敏后的 URL 形态: {last_error}"
+    );
+    assert!(
+        !last_error.contains("QUERYSECRET2"),
+        "最近错误泄露查询串值: {last_error}"
+    );
+
+    // (3) 仅转发路径上游不可达：502 正文、最近错误、warn 日志
+    let mut cfg = proxy_config_for(&with_userinfo(&dead));
+    cfg.forward_only = Some(true);
+    let state = AppState::new(cfg);
+    let probe = state.clone();
+    let (proxy_url, _h4) = bind_random_router(aproxy::proxy::router(state)).await;
+    let resp = client
+        .get(format!("{proxy_url}/v1/z?key=QUERYSECRET3"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("key=***"), "502 正文应带脱敏 URL: {body}");
+    assert!(
+        !body.contains("QUERYSECRET3"),
+        "502 正文泄露查询串值: {body}"
+    );
+    let last_error = probe.stats.last_error.lock().unwrap().clone().unwrap().0;
+    assert!(!last_error.contains("QUERYSECRET3"), "{last_error}");
+
+    let text = logs.text();
+    for secret in [
+        "BASEPASS123",
+        "QUERYSECRET1",
+        "QUERYSECRET2",
+        "QUERYSECRET3",
+    ] {
+        assert!(!text.contains(secret), "日志泄露 {secret}:\n{text}");
+    }
+    assert!(
+        text.contains("代理请求") && text.contains("key=***") && text.contains("***@127.0.0.1"),
+        "日志应以脱敏形态记录请求（path 与 target）:\n{text}"
+    );
+    assert!(
+        text.contains("代理请求（仅转发）"),
+        "仅转发路径的请求日志缺失:\n{text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 21. CLI 进程级：--config 显式配置文件（多开不同配置的进程）
 //
 // 每个进程一份配置：启动时加载指定文件，config 子命令读写同一文件。
@@ -4472,4 +4903,225 @@ fn ipc_stats_reflect_forward_only_traffic() {
         "最近错误应带发生时刻，实际: {}",
         info.last_error_at
     );
+}
+
+// ---------------------------------------------------------------------------
+// 35. 凭据脱敏（进程级）：start 输出、实例注册表、守护日志
+//
+// 这三处都是「会被整段粘贴求助」的输出面，且都在守护/父进程里产生，进程内
+// 测试覆盖不到。base_url 内嵌 user:pass、客户端查询串带 key，三处都只能出现
+// 脱敏形态。隔离：APROXY_HOME + 关 watchdog（理由见 31）。
+// ---------------------------------------------------------------------------
+#[test]
+fn credentials_masked_in_start_output_registry_and_daemon_log() {
+    isolate_env_proxy(); // 必须在 spawn 前：守护子进程继承 NO_PROXY
+    let port = daemon_test_port(14);
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().to_path_buf();
+    std::fs::write(home.join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (upstream, _handle) = rt.block_on(bind_random_router(
+        Router::new().fallback(any(|| async { (StatusCode::OK, "{\"ok\":true}") })),
+    ));
+    let base_url = upstream.replacen("http://", "http://alice:BASEPASS123@", 1);
+    let cfg_file = home.join("masked.toml");
+    std::fs::write(
+        &cfg_file,
+        format!("base_url = \"{base_url}\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
+    )
+    .unwrap();
+    let _guard = DaemonGuard {
+        exe,
+        port,
+        home_dir: Some(home.clone()),
+    };
+
+    let out = Command::new(exe)
+        .args(["start", "--config"])
+        .arg(&cfg_file)
+        .env("APROXY_HOME", &home)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success(),
+        "start 应成功，stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !stdout.contains("BASEPASS123") && !stdout.contains("alice"),
+        "start 输出泄露 base_url 凭据:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("完整透传到 http://***@127.0.0.1"),
+        "透传提示行应以脱敏形态展示 base_url:\n{stdout}"
+    );
+
+    // 实例注册表：status / IPC 展示的源头，只存脱敏值
+    let run_dir = home.join("run");
+    let registry = std::fs::read_to_string(run_dir.join(format!("{port}.pid"))).unwrap();
+    assert!(
+        !registry.contains("BASEPASS123") && registry.contains("***@127.0.0.1"),
+        "注册表 base_url 必须是脱敏值: {registry}"
+    );
+
+    // 守护日志：一次带 ?key= 的请求，「代理请求」行只能出现脱敏形态
+    let port_str = port.to_string();
+    let resp = rt
+        .block_on(
+            local_client()
+                .get(format!(
+                    "http://127.0.0.1:{port}/v1/masked?key=QUERYSECRET9"
+                ))
+                .send(),
+        )
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let info = rt
+        .block_on(aproxy::daemon::ipc_ping_in(&run_dir, &port_str))
+        .expect("实例应可 ping");
+    assert!(
+        !info.base_url.contains("BASEPASS123"),
+        "IPC 下发的 base_url 未脱敏"
+    );
+    let mut log = String::new();
+    for _ in 0..50 {
+        log = std::fs::read_to_string(&info.log_path).unwrap_or_default();
+        if log.contains("/v1/masked") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        log.contains("/v1/masked?key=***"),
+        "守护日志应记录脱敏后的请求路径:\n{log}"
+    );
+    for secret in ["BASEPASS123", "QUERYSECRET9"] {
+        assert!(!log.contains(secret), "守护日志泄露 {secret}:\n{log}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 36. config --show：URL 凭据、transform 的 args 密钥值与 extra 一律打码
+// ---------------------------------------------------------------------------
+#[test]
+fn config_show_masks_url_credentials_and_transform_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_file = dir.path().join("show.toml");
+    std::fs::write(
+        &cfg_file,
+        concat!(
+            "base_url = \"https://TOKENUSER@api.example.com/v1\"\n",
+            "proxy = \"http://puser:PROXYPASS@127.0.0.1:7890?token=QSECRET\"\n",
+            "[request_transform]\n",
+            "command = \"fmt\"\n",
+            "args = [\"run\", \"--api-key\", \"SUPERSECRET2\", \"--token=TOKSECRET\"]\n",
+            "extra = \"{\\\"keys\\\":[\\\"sk-EXTRASECRET\\\"]}\"\n",
+        ),
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_aproxy"))
+        .env("APROXY_HOME", dir.path())
+        .arg("--config")
+        .arg(&cfg_file)
+        .args(["config", "--show"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    for secret in [
+        "TOKENUSER",
+        "PROXYPASS",
+        "QSECRET",
+        "SUPERSECRET2",
+        "TOKSECRET",
+        "EXTRASECRET",
+    ] {
+        assert!(!stdout.contains(secret), "--show 泄露 {secret}:\n{stdout}");
+    }
+    // 打码后的形态仍可对照 toml（不是整行消失）
+    for shape in [
+        "https://***@api.example.com/v1",
+        "http://***@127.0.0.1:7890?token=***",
+        "--api-key, SUPERS***",
+        "已打码",
+    ] {
+        assert!(
+            stdout.contains(shape),
+            "--show 应含脱敏形态 {shape}:\n{stdout}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 37. 非回环监听告警：start 的控制台输出与守护的 startup.log
+//
+// 用 TEST-NET-1 地址（192.0.2.1，RFC 5737 保留、本机不会拥有）：配置判定为
+// 非回环，而 bind 必然失败——告警路径完整走到，却**不在测试机上打开任何对外
+// 端口**（绑 0.0.0.0 会真的暴露端口，Windows 还可能弹防火墙对话框）。
+// ---------------------------------------------------------------------------
+#[test]
+fn non_loopback_listen_warns_on_start_and_in_startup_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::write(home.join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+    let cfg_file = home.join("lan.toml");
+    std::fs::write(
+        &cfg_file,
+        "base_url = \"https://lan.example.com\"\nlisten_addr = \"192.0.2.1:46123\"\napi_key = \"sk-LANSECRET\"\n",
+    )
+    .unwrap();
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+
+    // start 父进程：告警打在 stderr，随后因无法绑定而失败退出
+    let out = Command::new(exe)
+        .env("APROXY_HOME", home)
+        .args(["start", "--config"])
+        .arg(&cfg_file)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "192.0.2.1 不可绑定，start 应失败");
+    assert!(
+        stderr.contains("不是回环地址") && stderr.contains("共享给整个局域网"),
+        "配了 api_key 的非回环监听应以重措辞告警:\n{stderr}"
+    );
+    assert!(!stderr.contains("sk-LANSECRET"), "告警不得带出 key");
+
+    // 守护子进程（看门狗 / restore 拉起的就是这条路径）：没有控制台，告警必须
+    // 落进 startup.log。bind 失败即退出；万一本机真有该地址，超时后由本测试
+    // 结束自己拉起的这个进程
+    let mut child = Command::new(exe)
+        .env("APROXY_HOME", home)
+        .arg("--config")
+        .arg(&cfg_file)
+        .arg("--daemon-child")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut exited = false;
+    for _ in 0..150 {
+        if child.try_wait().unwrap().is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("守护子进程绑定 192.0.2.1 竟未失败，测试前提不成立");
+    }
+    let startup_log = std::fs::read_to_string(home.join("logs").join("startup.log")).unwrap();
+    assert!(
+        startup_log.contains("警告: 监听地址 192.0.2.1:46123 不是回环地址"),
+        "startup.log 应留下非回环告警:\n{startup_log}"
+    );
+    assert!(!startup_log.contains("sk-LANSECRET"));
 }

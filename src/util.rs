@@ -1,7 +1,8 @@
 //! CLI 侧共用小工具：时间戳、时长人性化、敏感值展示打码、key=value 解析。
 //!
-//! 全部是纯展示/纯解析函数（无 IO、无状态），供各子命令模块共用；
-//! 与 lib 侧 `config::mask_base_url` 的打码策略保持一致（展示绝不泄露凭据）。
+//! 全部是纯展示/纯解析函数（无 IO、无状态），供各子命令模块共用。
+//! URL 形态的凭据（base_url、代理 URL 等）一律走 lib 侧的统一出口
+//! `config::mask_base_url`；本模块只管不透明的密钥值（api_key、头值等）。
 
 /// 当前 Unix 秒（系统时钟早于 epoch 时回退 0——仅用于展示，不影响逻辑）
 pub(crate) fn now_unix() -> u64 {
@@ -40,32 +41,6 @@ pub(crate) fn mask_secret(s: &str) -> String {
     format!("{prefix}***")
 }
 
-/// 对代理 URL 中的密码打码（`http://user:***@host:port`），仅用于展示，绝不输出真实密码。
-pub(crate) fn mask_proxy_url(raw: &str) -> String {
-    // 解析失败时原样返回会泄露内嵌密码，只回显已隐去的安全占位
-    let Ok(url) = url::Url::parse(raw) else {
-        return "<无法解析的代理配置，已隐去>".to_string();
-    };
-    let user = url.username();
-    if user.is_empty() && url.password().is_none() {
-        return raw.to_string();
-    }
-    let host = url.host_str().unwrap_or("");
-    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
-    // 仅用户名无密码时不渲染 ":***@"，避免让人误以为配置了密码
-    let auth = if url.password().is_some() {
-        format!("{user}:***@")
-    } else {
-        format!("{user}@")
-    };
-    let mut masked = format!("{}://{}{}{}", url.scheme(), auth, host, port);
-    if let Some(q) = url.query() {
-        masked.push('?');
-        masked.push_str(q);
-    }
-    masked
-}
-
 /// 解析 `key=value` 形式的命令行参数（--extra-header/--override-header 共用）：
 /// 只按第一个 `=` 切分（值中允许出现 `=`），键去空白且不得为空。
 pub(crate) fn parse_kv(s: &str) -> Option<(String, String)> {
@@ -94,32 +69,6 @@ mod tests {
     fn mask_secret_multibyte_no_panic() {
         // 按 char 截断，多字节字符不会在字节边界 panic
         assert_eq!(mask_secret("你好世界，测试"), "你好世界，测***");
-    }
-
-    #[test]
-    fn mask_proxy_url_variants() {
-        // 无凭据原样返回
-        assert_eq!(
-            mask_proxy_url("http://127.0.0.1:7890"),
-            "http://127.0.0.1:7890"
-        );
-        // 有密码打码
-        assert_eq!(
-            mask_proxy_url("http://alice:secret@127.0.0.1:7890"),
-            "http://alice:***@127.0.0.1:7890"
-        );
-        // 仅用户名不加 ":***@"
-        assert_eq!(
-            mask_proxy_url("socks5://alice@127.0.0.1:1080"),
-            "socks5://alice@127.0.0.1:1080"
-        );
-        // 解析失败回安全占位而非原文（原文可能含密码）
-        assert_eq!(mask_proxy_url("not a url"), "<无法解析的代理配置，已隐去>");
-        // query 保留
-        assert_eq!(
-            mask_proxy_url("http://alice:pw@h:1?p=x"),
-            "http://alice:***@h:1?p=x"
-        );
     }
 
     #[test]

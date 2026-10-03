@@ -3,6 +3,8 @@
 //!   每次软件运行都执行；此处汇总展示）
 //! - warning 级 1：别名指向的配置文件深入审查（toml 语法/校验 + 端口冲突）
 //! - warning 级 2：配置目录下未被别名覆盖的其余 toml 轻量检查
+//! - 非回环监听告警（warning）：上面两类配置与默认配置的 listen_addr 不是回环
+//!   地址时报出（配了 api_key 时措辞升级）——与 start 输出、startup.log 同一文案
 //!
 //! warning 不影响运行（端口冲突是合法的多开前状态，提示即可），仅 doctor 检查。
 
@@ -95,7 +97,37 @@ fn run_with(errors: Vec<String>, settings: Settings) -> Report {
     // 4) 看门狗字段越界检查（error=会造成看护故障；warning=合法但需确认意图）
     report.findings.extend(check_watchdog_settings(&settings));
 
+    // 5) 默认配置的非回环监听告警（别名/目录配置的同项检查在 2/3 里）
     report
+        .findings
+        .extend(check_default_config_exposure(&settings));
+
+    report
+}
+
+/// 默认配置（settings.default_config 或 ~/.aproxy/config.toml）的非回环监听
+/// 告警。单实例用户往往只有这一份配置，而 2/3 两项检查都不覆盖它（别名配置
+/// 另查；目录扫描刻意排除默认配置）——不单独查，最常见的用户就看不到这条
+/// 安全告警。已被别名引用时由别名检查报出，此处跳过避免重复。只做这一项：
+/// 默认配置的全面校验不在本检查的职责内。
+pub fn check_default_config_exposure(settings: &Settings) -> Vec<Finding> {
+    let path = settings::default_config_path_in(settings);
+    let key = settings::path_match_key(&path.display().to_string());
+    if settings
+        .aliases
+        .values()
+        .any(|p| settings::path_match_key(&settings::expand_path(p).display().to_string()) == key)
+    {
+        return Vec::new();
+    }
+    parse_config_file(&path)
+        .and_then(|c| c.listen_exposure_warning())
+        .map(|w| Finding {
+            level: Level::Warn,
+            message: format!("默认配置 {}: {w}", path.display()),
+        })
+        .into_iter()
+        .collect()
 }
 
 /// 看门狗字段的越界检查：
@@ -161,6 +193,12 @@ pub fn check_aliased_configs(settings: &Settings) -> Vec<Finding> {
                     findings.push(Finding {
                         level: Level::Warn,
                         message: format!("别名 \"{name}\" 的配置校验失败: {e}"),
+                    });
+                }
+                if let Some(w) = c.listen_exposure_warning() {
+                    findings.push(Finding {
+                        level: Level::Warn,
+                        message: format!("别名 \"{name}\" 的配置: {w}"),
                     });
                 }
             }
@@ -242,6 +280,12 @@ pub fn check_unaliased_configs(settings: &Settings) -> Vec<Finding> {
                     findings.push(Finding {
                         level: Level::Warn,
                         message: format!("配置校验失败（未被任何别名引用）{}: {e}", path.display()),
+                    });
+                }
+                if let Some(w) = c.listen_exposure_warning() {
+                    findings.push(Finding {
+                        level: Level::Warn,
+                        message: format!("目录配置 {}（未被任何别名引用）: {w}", path.display()),
                     });
                 }
             }
@@ -333,13 +377,16 @@ mod tests {
                 .to_string()
                 .replace(std::path::MAIN_SEPARATOR, "/")
         };
+        // default_config 指向本测试的配置：默认配置检查不去读开发机真实的
+        // ~/.aproxy/config.toml
         std::fs::write(
             settings_path_in_tmp(dir.path()),
             format!(
-                r#"{{"aliases": {{"a": "{}", "b": "{}", "bad": "{}"}}}}"#,
+                r#"{{"aliases": {{"a": "{}", "b": "{}", "bad": "{}"}}, "default_config": "{}"}}"#,
                 esc(&a),
                 esc(&b),
-                esc(&bad)
+                esc(&bad),
+                esc(&a)
             ),
         )
         .unwrap();
@@ -417,18 +464,114 @@ mod tests {
             "127.0.0.1:59844",
             "https://a.example.com",
         );
+        // default_config 指向本测试的配置：默认配置检查不去读开发机真实的
+        // ~/.aproxy/config.toml
+        let a = a
+            .display()
+            .to_string()
+            .replace(std::path::MAIN_SEPARATOR, "/");
         std::fs::write(
             settings_path_in_tmp(dir.path()),
-            format!(
-                r#"{{"aliases": {{"a": "{}"}}}}"#,
-                a.display()
-                    .to_string()
-                    .replace(std::path::MAIN_SEPARATOR, "/")
-            ),
+            format!(r#"{{"aliases": {{"a": "{a}"}}, "default_config": "{a}"}}"#),
         )
         .unwrap();
         let report = run(&settings_path_in_tmp(dir.path()));
         assert!(report.is_clean(), "不应有发现: {:?}", report.findings);
+    }
+
+    #[test]
+    fn doctor_warns_non_loopback_listen() {
+        // 别名配置监听 0.0.0.0 且配了 api_key → warning（措辞升级）；回环的
+        // 别名配置不报。都是 warning 级：对外开放可能是用户的意图，不阻断。
+        let dir = tempfile::tempdir().unwrap();
+        let open = dir.path().join("open.toml");
+        std::fs::write(
+            &open,
+            "base_url = \"https://a.example.com\"\nlisten_addr = \"0.0.0.0:59847\"\napi_key = \"sk-test\"\n",
+        )
+        .unwrap();
+        let local = write_cfg(
+            dir.path(),
+            "local.toml",
+            "127.0.0.1:59848",
+            "https://b.example.com",
+        );
+        let esc = |p: &Path| {
+            p.display()
+                .to_string()
+                .replace(std::path::MAIN_SEPARATOR, "/")
+        };
+        // default_config 指向回环配置：默认配置检查只读这份临时文件
+        std::fs::write(
+            settings_path_in_tmp(dir.path()),
+            format!(
+                r#"{{"aliases": {{"open": "{}", "local": "{}"}}, "default_config": "{}"}}"#,
+                esc(&open),
+                esc(&local),
+                esc(&local)
+            ),
+        )
+        .unwrap();
+        let report = run(&settings_path_in_tmp(dir.path()));
+        // 只统计本测试的配置（目录扫描的默认根是真实 ~/.aproxy/，开发机上可能
+        // 存在其他文件，不在本测试断言范围）
+        let exposure: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| {
+                f.message.contains("不是回环地址")
+                    && (f.message.contains("\"open\"")
+                        || f.message.contains("\"local\"")
+                        || f.message.contains("默认配置"))
+            })
+            .collect();
+        assert_eq!(exposure.len(), 1, "只有 open 应告警: {:?}", report.findings);
+        assert_eq!(exposure[0].level, Level::Warn);
+        assert!(
+            exposure[0].message.contains("\"open\"")
+                && exposure[0].message.contains("共享给整个局域网"),
+            "{:?}",
+            exposure[0]
+        );
+        assert!(!exposure[0].message.contains("sk-test"), "不得带出 key");
+        assert_eq!(report.error_count(), 0);
+    }
+
+    #[test]
+    fn doctor_checks_default_config_exposure_once() {
+        // 单实例用户只有默认配置：目录扫描刻意排除它、别名检查又不覆盖它，
+        // 必须单独检查；已被别名引用时由别名检查报出，这里不重复
+        let dir = tempfile::tempdir().unwrap();
+        let main = write_cfg(
+            dir.path(),
+            "main.toml",
+            "192.168.1.10:59849",
+            "https://m.example.com",
+        );
+        let main_str = main
+            .display()
+            .to_string()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let settings = Settings {
+            default_config: Some(main_str.clone()),
+            ..Default::default()
+        };
+        let findings = check_default_config_exposure(&settings);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0].message.contains("默认配置")
+                && findings[0].message.contains("192.168.1.10:59849"),
+            "{findings:?}"
+        );
+
+        let aliased = Settings {
+            aliases: HashMap::from([("m".to_string(), main_str)]),
+            ..settings
+        };
+        assert!(
+            check_default_config_exposure(&aliased).is_empty(),
+            "已被别名引用的默认配置由别名检查负责"
+        );
     }
 
     #[test]

@@ -42,6 +42,10 @@ pub(crate) fn resolve_runtime_config(
         cfg.forward_only.get_or_insert(s.forward_only);
         cfg.bounded_retry_paths
             .get_or_insert_with(|| s.bounded_retry_paths.clone());
+        cfg.allowed_hosts
+            .get_or_insert_with(|| s.allowed_hosts.clone());
+        cfg.allowed_origins
+            .get_or_insert_with(|| s.allowed_origins.clone());
     }
     // listen_addr 必须带端口（port_of 取最后一个 ':' 之后）：缺端口/端口越界的
     // bind 失败不是占用，提前拦截给出明确错误，避免被误诊为「被其他程序占用」
@@ -51,13 +55,18 @@ pub(crate) fn resolve_runtime_config(
             cfg.listen_addr
         ));
     }
-    // validate 的 proxy 错误消息会内嵌 proxy 原文（URL 里可能带 user:pass），
-    // 转给用户前打码，与日志/展示处的保密策略保持一致
+    // validate 的错误消息会内嵌 proxy / base_url 原文（URL 里可能带 user:pass
+    // 或查询串），转给用户（以及守护的 startup.log）前打码，与日志/展示处的
+    // 保密策略同一出口
     cfg.validate().map_err(|msg| {
-        let msg = match cfg.proxy.as_deref() {
-            Some(p) => msg.replace(p, &crate::util::mask_proxy_url(p)),
-            None => msg,
-        };
+        let mut msg = msg;
+        for raw in [cfg.proxy.as_deref(), Some(cfg.base_url.as_str())]
+            .into_iter()
+            .flatten()
+            .filter(|s| !s.is_empty())
+        {
+            msg = msg.replace(raw, &mask_base_url(raw));
+        }
         let msg = if bounded_paths_from_settings && msg.contains("bounded_retry_paths") {
             format!("{msg}\n（该值来自 settings.json 的 bounded_retry_paths 全局默认，不在上述 toml 中）")
         } else {
@@ -138,6 +147,21 @@ pub(crate) async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf, target: Optio
     };
     let listen_addr = cfg.listen_addr.clone();
     let port = daemon::port_of(&listen_addr).to_string();
+
+    // 非回环监听告警（不阻断启动——对外开放可能正是用户的意图）。三个去向
+    // 各管一种读者：start 父进程 / 前台实例打到 stderr（当场敲命令的人）；
+    // 守护子进程写守护日志与 startup.log——看门狗重拉、restore、install 滚动
+    // 重启拉起的实例没有控制台，startup.log 是这些启动唯一的留痕处。
+    // report_config_error 是 startup.log 的唯一写入口（含 logs 目录不可写时
+    // 的回退），告警复用它而不另起一套落盘逻辑。
+    if let Some(w) = cfg.listen_exposure_warning() {
+        if cli.daemon_child {
+            tracing::warn!("{w}");
+            report_config_error(&format!("警告: {w}"), true);
+        } else {
+            eprintln!("警告: {w}");
+        }
+    }
 
     // 守护子进程：直接承载服务，不再走启动预检/后台 spawn（父进程已做）
     if cli.daemon_child {
@@ -244,7 +268,8 @@ pub(crate) async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf, target: Optio
             println!("  监听: http://{}", info.listen_addr);
             println!("  Base URL: {}", mask_base_url(&cfg.base_url));
             if !cfg.base_url.is_empty() {
-                let base = cfg.base_url.trim_end_matches('/');
+                // 与上一行同一出口：这一行同样会被整段粘贴求助
+                let base = mask_base_url(cfg.base_url.trim_end_matches('/'));
                 println!(
                     "  提示: 将你的 API base URL 指向 http://{}",
                     info.listen_addr

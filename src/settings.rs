@@ -81,6 +81,17 @@ pub struct Settings {
     /// 实例覆盖（toml > settings > 内置空）。
     #[serde(default)]
     pub bounded_retry_paths: Vec<String>,
+    /// 入站 Host 白名单（全局默认值，语义见 config.toml 同名字段）：Host 校验
+    /// 生效时额外放行的主机名，含 `"*"` = 关闭 Host 校验。默认空 = 内置默认
+    /// 策略（回环监听只放行 localhost / 127.0.0.1 / [::1]）。各 config.toml
+    /// 可用 `allowed_hosts` 按实例覆盖（toml > settings > 内置空）。
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// 入站 Origin 白名单（全局默认值，语义见 config.toml 同名字段）：放行的
+    /// 浏览器 Origin，含 `"*"` = 关闭 Origin 校验。默认空 = 拒绝一切携带
+    /// Origin 的请求。各 config.toml 可用 `allowed_origins` 按实例覆盖。
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
     /// 看门狗总开关：开启时 `aproxy start`/守护自检会确保存在一个全局看护进程
     /// （`aproxy watchdog`），守护崩溃/挂死时按 .restore 记录自动重拉。
     /// 看门狗是系统级单例（一个看护进程看护全部实例），故只在 settings 配置，
@@ -186,6 +197,8 @@ impl Default for Settings {
             disk_cache: default_disk_cache(),
             forward_only: default_forward_only(),
             bounded_retry_paths: Vec::new(),
+            allowed_hosts: Vec::new(),
+            allowed_origins: Vec::new(),
             watchdog: default_watchdog(),
             watchdog_heartbeat_secs: default_watchdog_heartbeat_secs(),
             watchdog_stale_after_cycles: default_watchdog_stale_after_cycles(),
@@ -514,6 +527,26 @@ mod tests {
             legacy.bounded_retry_paths.is_empty(),
             "旧文件缺字段读默认空，升级无感"
         );
+    }
+
+    #[test]
+    fn inbound_allowlists_roundtrip_and_default() {
+        // 与 bounded_retry_paths 同款的往返钉桩：默认空（= 内置默认策略）、显式
+        // 值落盘往返保真、旧 settings.json（无字段）读出空——升级不改变行为
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path_in(dir.path());
+        let mut s = Settings::default();
+        assert!(s.allowed_hosts.is_empty() && s.allowed_origins.is_empty());
+        s.allowed_hosts = vec!["host.docker.internal".to_string()];
+        s.allowed_origins = vec!["http://localhost:5173".to_string()];
+        save_to(&path, &s).unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.allowed_hosts, s.allowed_hosts);
+        assert_eq!(loaded.allowed_origins, s.allowed_origins);
+
+        std::fs::write(&path, "{\"aliases\": {}}").unwrap();
+        let legacy = load_from(&path);
+        assert!(legacy.allowed_hosts.is_empty() && legacy.allowed_origins.is_empty());
     }
 
     #[test]

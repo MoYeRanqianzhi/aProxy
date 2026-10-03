@@ -65,12 +65,14 @@ aproxy status               # 每行 v<semver> = 各实例实际运行的守护�
 - **看门狗重拉换端口**：重拉后实例落在新端口时清理旧端口的恢复记录；`restore`
   报告实际端口并清理旧端口记录。
 - **一键安装脚本**（scripts/install.sh / install.ps1 / install.cmd）：选版只认
-  `v*` tag 并跳过 draft，默认最新稳定版（仓库尚无稳定版时回退最新预发布并
-  提示），`--pre`/`-Pre`/`APROXY_PRE=1` 取最新预发布；Linux glibc 过低或 musl
+  `vX.Y.Z` / `vX.Y.Z-(alpha|beta|rc).N` 格式的 tag 并跳过 draft，默认取版本号
+  最大的稳定版（仓库尚无稳定版时回退版本号最大的预发布并提示），
+  `--pre`/`-Pre`/`APROXY_PRE=1` 让预发布也参与、取版本号最大者；Linux glibc 过低或 musl
   系统自动用 musl 产物，落位前 `--version` 自检；新装机提示先
   `aproxy config --baseurl … --api-key …` 再 `aproxy`。
-- **平台**：Windows 与 Linux（x86_64/aarch64，gnu/musl）全功能；macOS 代理转发
-  可用，看门狗与 `aproxy install` 暂不支持。
+- **平台**：Windows 与 Linux（x86_64/aarch64，gnu/musl）全功能；macOS 提供
+  预构建二进制但未经真机验证，看门狗、`aproxy install` 与依赖进程查询的实例
+  管理用到 Linux 专有接口（`/dev/shm`、`/proc`），不可用或退化。
 
 ## alpha.17 关键行为（相对 alpha.16）
 

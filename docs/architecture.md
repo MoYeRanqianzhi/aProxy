@@ -338,7 +338,7 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
 |---|---|
 | Windows（x64 / x86 / arm64） | 全功能（开发与主测试平台） |
 | Linux（x86_64 / aarch64，glibc 与 musl） | 全功能 |
-| macOS（Apple Silicon / Intel） | 代理转发可用；看门狗与 `aproxy install` 暂不支持 |
+| macOS（Apple Silicon / Intel） | 提供预构建二进制，但未经真机验证；看门狗、`aproxy install` 与依赖进程查询的实例管理用到 Linux 专有接口（`/dev/shm`、`/proc`），在 macOS 上不可用或退化 |
 
 unix 分支（UDS IPC、`/dev/shm` 宣告与心跳、`/proc` 进程查询、单步 rename
 交换）按 **Linux** 实现：`#[cfg(unix)]` 路径依赖 `/dev/shm` 与 `/proc`，这两族

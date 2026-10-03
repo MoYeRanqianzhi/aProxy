@@ -26,7 +26,7 @@
 Read https://raw.githubusercontent.com/MoYeRanQianzhi/aProxy/main/docs/INSTALL_AGENT.md and install (or upgrade) aProxy on this machine exactly as it says.
 ```
 
-**人类自装**（首装二进制 + skill 文档，SHA256 校验，落位 `~/.aproxy/`）。默认安装最新**稳定版**；仓库还没有稳定版时（0.1.0 发布前）回退到最新预发布并给出提示；要装最新预发布加 `--pre`（PowerShell 为 `-Pre`，也可设环境变量 `APROXY_PRE=1`）：
+**人类自装**（首装二进制 + skill 文档，SHA256 校验，落位 `~/.aproxy/`）。默认安装最新**稳定版**；仓库还没有稳定版时（0.1.0 发布前）回退到版本号最大的预发布并给出提示；加 `--pre` 则预发布也参与选择，取版本号最大者（PowerShell 为 `-Pre`，也可设环境变量 `APROXY_PRE=1`）。只认 `vX.Y.Z` 与 `vX.Y.Z-(alpha|beta|rc).N` 格式的 tag：
 
 ```powershell
 # Windows (PowerShell)
@@ -72,7 +72,7 @@ cargo build --release
 |---|---|
 | Windows（x64 / x86 / arm64） | 全功能 |
 | Linux（x86_64 / aarch64，glibc 与 musl） | 全功能 |
-| macOS（Apple Silicon / Intel） | 代理转发可用；看门狗与 `aproxy install` 暂不支持（需在真机上补齐，欢迎贡献） |
+| macOS（Apple Silicon / Intel） | 提供预构建二进制，但未经真机验证；看门狗、`aproxy install` 与依赖进程查询的实例管理用到 Linux 专有接口（`/dev/shm`、`/proc`），在 macOS 上不可用或退化（需真机补齐，欢迎贡献） |
 
 ## 起手
 
@@ -191,8 +191,8 @@ aProxy 是本机单用户代理：它持有并向每个转发请求注入上游�
 ## 开发
 
 ```powershell
-cargo test --locked           # 全量测试
-cargo clippy --all-targets --locked -- -D warnings   # 必须零警告（项目纪律）
+cargo test --workspace --locked           # 全量测试（含 aproxy-envelope / aproxy-format）
+cargo clippy --workspace --all-targets --locked -- -D warnings   # 必须零警告（项目纪律）
 cargo fmt --all -- --check
 ```
 

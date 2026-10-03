@@ -70,9 +70,10 @@ Read https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/docs/INSTALL_A
 **Manual install** (first install pulls the binary + skill docs, verifies
 SHA256, places everything under `~/.aproxy/`). By default it installs the
 latest **stable** release; while the repository has no stable release yet
-(before 0.1.0) it falls back to the newest pre-release and says so. To get the
-newest pre-release, add `--pre` (`-Pre` for PowerShell, or set
-`APROXY_PRE=1`):
+(before 0.1.0) it falls back to the highest-versioned pre-release and says so.
+Add `--pre` to let pre-releases compete too and take the highest version
+(`-Pre` for PowerShell, or set `APROXY_PRE=1`). Only tags in the form `vX.Y.Z`
+or `vX.Y.Z-(alpha|beta|rc).N` are considered:
 
 ```powershell
 # Windows (PowerShell)
@@ -131,7 +132,7 @@ cargo build --release
 |---|---|
 | Windows (x64 / x86 / arm64) | Full support |
 | Linux (x86_64 / aarch64, glibc and musl) | Full support |
-| macOS (Apple Silicon / Intel) | Proxying works; the watchdog and `aproxy install` are not supported yet (need to be completed on real hardware; contributions welcome) |
+| macOS (Apple Silicon / Intel) | Pre-built binaries are published but untested on real hardware; the watchdog, `aproxy install` and process-query-based instance management rely on Linux-only interfaces (`/dev/shm`, `/proc`) and are unavailable or degraded on macOS (needs real hardware; contributions welcome) |
 
 ## Quick start
 
@@ -284,8 +285,8 @@ The full threat model and how to report vulnerabilities are in
 ## Development
 
 ```sh
-cargo test --locked                                # full suite
-cargo clippy --all-targets --locked -- -D warnings # must be warning-free (project rule)
+cargo test --workspace --locked                                # full suite (incl. aproxy-envelope / aproxy-format)
+cargo clippy --workspace --all-targets --locked -- -D warnings # must be warning-free (project rule)
 cargo fmt --all -- --check
 ```
 

@@ -9,8 +9,9 @@ aProxy is a local API proxy that gives agent workloads infinite retries. After
 installation, point your API base URL at it (step 4) — that is the whole point.
 
 Platform support: Windows and Linux (x86_64 / aarch64, glibc and musl) are fully
-supported. On macOS the proxy itself works, but the watchdog and `aproxy
-install` are not supported yet.
+supported. On macOS pre-built binaries are published but untested on real
+hardware; the watchdog, `aproxy install` and process-query-based instance
+management rely on Linux-only interfaces and are unavailable or degraded.
 
 ## 0. Check current state first
 
@@ -30,13 +31,14 @@ documentation, verifies SHA256, and places everything under `~/.aproxy/`
 (override with the `APROXY_HOME` environment variable). It never overwrites an
 existing installation.
 
-**Which version it installs:** only `v*` releases are considered (the
-repository also hosts `format-v*` releases for `aproxy-format`; those are
-ignored) and drafts are skipped. By default it installs the newest **stable**
+**Which version it installs:** only releases tagged `vX.Y.Z` or
+`vX.Y.Z-(alpha|beta|rc).N` are considered (the repository also hosts
+`format-v*` releases for `aproxy-format` and a few historical test tags such
+as `v0.1.0-alpha.12t3`; those are ignored) and drafts are skipped. By default it installs the newest **stable**
 release; if the repository has no stable release yet (before 0.1.0) it falls
-back to the newest pre-release and prints a note. Pass `--pre` (`-Pre` for
-PowerShell, or set `APROXY_PRE=1`) to take the most recently created `v*`
-release, pre-release or not. An explicit tag (`sh install.sh v0.1.0`,
+back to the highest-versioned pre-release and prints a note. Pass `--pre`
+(`-Pre` for PowerShell, or set `APROXY_PRE=1`) to take the highest version,
+pre-release or not (by version number, not by creation time). An explicit tag (`sh install.sh v0.1.0`,
 `-Version v0.1.0`) overrides all of this.
 
 **Windows (PowerShell — preferred):**

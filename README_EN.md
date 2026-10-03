@@ -7,8 +7,9 @@
 
 Upstream rate limits, broken streams, timeouts, once-in-a-blue-moon glitches —
 aProxy catches the request locally: on failure it **retries without limit**
-(exponential backoff, capped and configurable), keeps streaming responses
-alive with injected SSE heartbeats, and replays the successful response
+(exponential backoff, capped and configurable), keeps streaming requests
+(`Accept: text/event-stream` or a body with `"stream": true`) alive with
+injected SSE heartbeats, and replays the successful response
 byte-for-byte. Your client never notices the storm upstream; it only notices
 that the request took a little longer. (Two explicit exceptions: `forward_only`
 mode gives up that retry guarantee for true streaming passthrough, and
@@ -109,14 +110,30 @@ Other channels (afterwards `aproxy install --adopt` moves the install to the
 standard location):
 
 ```sh
-npm install -g @meowo/aproxy     # picks the right binary for your platform
+npm install -g @meowo/aproxy     # picks the right binary; stable releases use the latest tag
+npm install -g @meowo/aproxy@next  # pre-releases use the next tag; ask for it explicitly
 cargo install aproxy             # builds from source; needs rustc 1.88+
 ```
 
 Upgrades: `aproxy install` replaces the binary and rolling-restarts running
 instances one by one without client-visible downtime (`--from <path>` installs
-a local binary, `--adopt` takes over an existing install). Manual fallback:
-`aproxy stop all` → replace the binary → `aproxy restore`.
+a local binary, `--adopt` takes over an existing install).
+- **Update channel**: the default `latest` picks the highest version inside a
+  channel. If the current version is a stable release only stable releases are
+  considered (you are never carried onto a pre-release); if it is a
+  pre-release (e.g. an alpha) the default is already the pre-release channel;
+  `--pre` lets pre-releases compete explicitly. Only `vX.Y.Z` /
+  `vX.Y.Z-(alpha|beta|rc).N` are considered, compared by version number rather
+  than creation time; `format-v*` and historical test tags are ignored. When
+  the channel has nothing newer you get "already up to date" or "no version
+  available" and nothing changes — it never switches channels silently. An
+  explicit version (`aproxy install 0.1.0`) ignores the channel; a target below
+  the current version is refused unless `--allow-downgrade` is given.
+- **Rollback on failure**: if an instance cannot start under the new version
+  during the rolling restart, `install` brings it back with the old binary and
+  the original arguments, stops the rollout (the other instances are left
+  alone) and exits non-zero; fix the cause and run `aproxy install` again.
+- Manual fallback: `aproxy stop all` → replace the binary → `aproxy restore`.
 
 From source:
 
@@ -131,7 +148,7 @@ cargo build --release
 | Platform | Status |
 |---|---|
 | Windows (x64 / x86 / arm64) | Full support |
-| Linux (x86_64 / aarch64, glibc and musl) | Full support |
+| Linux (x86_64 / aarch64, glibc and musl) | Full support; the gnu build requires glibc ≥ 2.28 (asserted at build time in the release pipeline), older glibc and musl systems use the statically linked musl build |
 | macOS (Apple Silicon / Intel) | Pre-built binaries are published but untested on real hardware; the watchdog, `aproxy install` and process-query-based instance management rely on Linux-only interfaces (`/dev/shm`, `/proc`) and are unavailable or degraded on macOS (needs real hardware; contributions welcome) |
 
 ## Quick start
@@ -149,6 +166,55 @@ aproxy
 # 3. Point your agent's API base URL at the local proxy
 #    https://api.anthropic.com  →  http://127.0.0.1:12345
 ```
+
+## Using with Claude Code
+
+Point Claude Code at the local proxy and **raise the stream event-idle
+timeout**:
+
+```powershell
+# PowerShell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:12345"
+$env:CLAUDE_STREAM_IDLE_TIMEOUT_MS = "86400000"
+claude
+```
+
+```sh
+# sh / bash / zsh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:12345
+export CLAUDE_STREAM_IDLE_TIMEOUT_MS=86400000
+claude
+```
+
+Or put them in the `env` field of Claude Code's `~/.claude/settings.json`,
+which applies to every session (the field is supported by Claude Code's
+official settings documentation):
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:12345",
+    "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "86400000"
+  }
+}
+```
+
+**Why `CLAUDE_STREAM_IDLE_TIMEOUT_MS` is required**: so that a stream broken
+midway can still be retried transparently, aProxy buffers the whole response
+and only replays it once it checks out; while waiting it sends nothing but SSE
+comment heartbeats. Comment heartbeats cover Claude Code's first-byte timeout
+(about 360 s measured) and its byte-level idle timeout (300 s), but **not** the
+event-level idle timeout (600 s by default) — neither comments nor `ping`
+count as events. Without the variable, any retry period or long generation
+beyond 10 minutes makes Claude Code disconnect and resend. `86400000` (24 h)
+was verified to work; `API_TIMEOUT_MS` does not control this timer. These are
+black-box measurements on Claude Code 2.1.288; for other versions check the
+official documentation for the defaults.
+
+Note: ordinary requests with `"stream": false` have no keepalive channel (there
+is no response stream to inject heartbeats into), so the first-byte delay equals
+the full generation time and the client has to raise its own timeout (for
+Claude Code, `API_TIMEOUT_MS`).
 
 ## Commands
 
@@ -205,7 +271,8 @@ silently.
 base_url = "https://api.anthropic.com"   # upstream address
 listen_addr = "127.0.0.1:12345"          # local listener
 # api_key = "sk-..."                     # quick auth (overrides Authorization: Bearer)
-# keepalive_interval_secs = 15           # SSE heartbeat during retries, 0 disables
+# keepalive_interval_secs = 15           # SSE heartbeat interval, 0 disables keepalive
+# keepalive_trigger = "any"              # which requests get keepalive: accept (Accept has SSE) / body_stream (body "stream": true) / any (either, default)
 # proxy = "http://127.0.0.1:7890"        # forward via proxy (socks5 supported)
 # extra_headers / override_headers       # append/override request headers
 # max_retry_backoff_secs = 320           # retry backoff cap (0 = retry instantly)
@@ -237,6 +304,31 @@ orphan-cleaned; paths reported via IPC — customize with `log_file`),
 `spool/<port>/` (disk-cache
 scratch space), `settings.json` (internal state: aliases, defaults, watchdog
 fields — program-managed).
+
+### Keepalive (SSE heartbeats)
+
+A request is eligible for keepalive when `keepalive_interval_secs` > 0, the
+instance is not `forward_only`, and it matches `keepalive_trigger`: `Accept`
+contains `text/event-stream`, or the body has a top-level `"stream": true`
+(default `any` = either). Eligible requests use the keepalive channel from the
+**first** attempt:
+
+- If the upstream answers 2xx with an uncompressed `text/event-stream`, its real
+  status and headers are forwarded to the client immediately (when no
+  `response_transform` is configured); otherwise, after about one keepalive
+  interval (or as soon as the first attempt needs a retry), skeleton headers
+  (200 + SSE) are committed.
+- Once committed, SSE comment heartbeats go out every
+  `keepalive_interval_secs` while waiting for the first byte, while the
+  upstream is in flight, while its stream is being buffered and during backoff;
+  the body is still replayed only after it is fully buffered and checked, so
+  data from failed attempts never leaks in.
+- To avoid injecting plain-text heartbeats into a compressed stream, eligible
+  requests are sent upstream with `accept-encoding: identity` — a deliberate
+  exception to "total passthrough" that only costs some extra bytes between the
+  upstream and this machine; ineligible requests are not rewritten.
+- Ordinary `"stream": false` requests have no keepalive channel, nor do
+  `forward_only` instances or `keepalive_interval_secs = 0`.
 
 ### Inbound origin checks
 

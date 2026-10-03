@@ -4,7 +4,7 @@
 
 **本地 API 代理，为 agent 软件的每一次请求护道。**
 
-上游限流、断流、超时、五百年一遇的抖动——aProxy 在本地把请求完整接住：失败**无限重试**（指数退避，封顶可配），流式响应期间注入 SSE 心跳保活，成功后按原字节回放。客户端零感知：它以为的那次请求，只是慢了一点。（两个显式例外：`forward_only` 模式显式放弃重试保障，换取真流式直通；`bounded_retry_paths` 命中的请求失败 3 次即透传真实响应——均见「配置文件」。）
+上游限流、断流、超时、五百年一遇的抖动——aProxy 在本地把请求完整接住：失败**无限重试**（指数退避，封顶可配），流式请求（`Accept` 含 `text/event-stream` 或请求体 `"stream": true`）期间注入 SSE 心跳保活，成功后按原字节回放。客户端零感知：它以为的那次请求，只是慢了一点。（两个显式例外：`forward_only` 模式显式放弃重试保障，换取真流式直通；`bounded_retry_paths` 命中的请求失败 3 次即透传真实响应——均见「配置文件」。）
 
 [English](README_EN.md)
 
@@ -52,11 +52,15 @@ curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/
 其他渠道（装好后可用 `aproxy install --adopt` 收编到标准位置）：
 
 ```sh
-npm install -g @meowo/aproxy     # 按平台自动选二进制
+npm install -g @meowo/aproxy     # 按平台自动选二进制；正式版发在 latest 标签
+npm install -g @meowo/aproxy@next  # 预发布发在 next 标签，需显式指定
 cargo install aproxy             # 源码编译，需 rustc 1.88+
 ```
 
-升级：`aproxy install`（在线下载链条自动滚动重启，逐实例无感；`--from <路径>` 本地安装、`--adopt` 收编既有安装）。手动兜底：`aproxy stop all` → 覆盖二进制 → `aproxy restore`。
+升级：`aproxy install`（在线下载链条自动滚动重启，逐实例无感；`--from <路径>` 本地安装、`--adopt` 收编既有安装）。
+- **更新通道**：`install` 默认的 `latest` 在「通道」内取版本号最大者。当前是正式版则只取正式版（不会被带到预发布）；当前是预发布（如 alpha）则默认就在预发布通道；`--pre` 显式让预发布参与选择。只认 `vX.Y.Z` / `vX.Y.Z-(alpha|beta|rc).N`，按版本号而非创建时间比较，`format-v*` 与历史测试 tag 不参与。通道内没有更新版本时提示「已是最新」或「暂无可用版本」并保持现状，不会偷偷换通道。指定具体版本号（`aproxy install 0.1.0`）不受通道影响；低于当前版本的目标默认拒绝，需 `--allow-downgrade`。
+- **失败回滚**：滚动重启时某个实例在新版本下起不来，`install` 会用旧二进制按原参数把它拉回、中止滚动（其余实例不动）并以非零退出；排除原因后重新执行 `aproxy install` 继续。
+- 手动兜底：`aproxy stop all` → 覆盖二进制 → `aproxy restore`。
 
 源码构建：
 
@@ -71,7 +75,7 @@ cargo build --release
 | 平台 | 状态 |
 |---|---|
 | Windows（x64 / x86 / arm64） | 全功能 |
-| Linux（x86_64 / aarch64，glibc 与 musl） | 全功能 |
+| Linux（x86_64 / aarch64，glibc 与 musl） | 全功能；gnu 产物要求 glibc ≥ 2.28（发布流程构建时断言），更低版本的 glibc 与 musl 系统使用静态链接的 musl 产物 |
 | macOS（Apple Silicon / Intel） | 提供预构建二进制，但未经真机验证；看门狗、`aproxy install` 与依赖进程查询的实例管理用到 Linux 专有接口（`/dev/shm`、`/proc`），在 macOS 上不可用或退化（需真机补齐，欢迎贡献） |
 
 ## 起手
@@ -88,6 +92,39 @@ aproxy
 # 3. 把 agent 软件的 API base URL 指向本地代理
 #    https://api.anthropic.com  →  http://127.0.0.1:12345
 ```
+
+## 接入 Claude Code
+
+把 Claude Code 指向本地代理，并**必须**调大流事件空闲超时：
+
+```powershell
+# PowerShell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:12345"
+$env:CLAUDE_STREAM_IDLE_TIMEOUT_MS = "86400000"
+claude
+```
+
+```sh
+# sh / bash / zsh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:12345
+export CLAUDE_STREAM_IDLE_TIMEOUT_MS=86400000
+claude
+```
+
+也可以写进 Claude Code 的 `~/.claude/settings.json` 的 `env` 字段，对每个会话生效（Claude Code 官方设置文档支持该字段）：
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:12345",
+    "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "86400000"
+  }
+}
+```
+
+**为什么必须设 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`**：为了让「流中途断开也能透明重试」，aProxy 会缓冲完整响应、校验无误后才回放，等待期间只向客户端发 SSE 注释心跳。注释心跳能覆盖 Claude Code 的首字节超时（实测约 360 秒）与字节级空闲超时（300 秒），但覆盖不了**事件级空闲超时**（默认 600 秒）——注释与 `ping` 都不算事件。不设这个变量，任何超过 10 分钟的重试期或长生成都会被 Claude Code 断开后重发。`86400000`（24 小时）经实测可用；`API_TIMEOUT_MS` 不控制这道闸。以上为 Claude Code 2.1.288 的黑盒实测，其他版本的默认值请以官方文档为准。
+
+注意：请求体里 `"stream": false` 的普通请求没有保活通道（没有可注入心跳的响应流），首字节延迟等于完整生成时长，客户端需自行调大超时（Claude Code 为 `API_TIMEOUT_MS`）。
 
 ## 命令
 
@@ -139,7 +176,8 @@ aproxy alias list
 base_url = "https://api.anthropic.com"   # 上游地址
 listen_addr = "127.0.0.1:12345"          # 本地监听
 # api_key = "sk-..."                     # 快捷鉴权（等效覆盖 Authorization: Bearer）
-# keepalive_interval_secs = 15           # 重试期间 SSE 心跳间隔，0 关闭
+# keepalive_interval_secs = 15           # SSE 心跳间隔，0 关闭保活
+# keepalive_trigger = "any"              # 哪些请求走保活：accept（Accept 含 SSE）/ body_stream（请求体 "stream": true）/ any（任一，默认）
 # proxy = "http://127.0.0.1:7890"        # 上游经代理转发（支持 socks5，可配用户名密码）
 # extra_headers / override_headers       # 追加/覆盖请求头
 # max_retry_backoff_secs = 320           # 重试退避封顶（0 = 所有重试零延迟）
@@ -166,6 +204,15 @@ listen_addr = "127.0.0.1:12345"          # 本地监听
 运行数据在 `~/.aproxy/`：`run/`（实例注册与恢复记录、看护者 claim）、`logs/`（守护日志，按启动随机命名、自动清理与轮转，地址经 IPC 向实例询问；可用 `log_file` 自定义去向）、
 `spool/<端口>/`（磁盘缓存临时文件，启动时自动清理）、
 `settings.json`（内部配置：别名、默认配置文件、日志轮转阈值、看门狗五字段等，程序管理不建议手改）。
+
+### 保活（SSE 心跳）
+
+保活适用的请求（`keepalive_interval_secs` > 0、非 `forward_only`，且按 `keepalive_trigger` 命中：`Accept` 含 `text/event-stream`，或请求体顶层 `"stream": true`；默认 `any` 任一即可）从**首轮**起就走保活通道：
+
+- 上游回 2xx + 未压缩的 `text/event-stream` 时，立即把上游真实的状态码与响应头转给客户端（未配 `response_transform` 时）；否则约一个保活间隔后（或首轮就需要重试时）先提交骨架头（200 + SSE）。
+- 提交之后，无论是在等首字节、上游在途、缓冲上游流还是退避，都按 `keepalive_interval_secs` 发 SSE 注释心跳；响应体仍是缓冲完整、校验无误后才回放，失败尝试的数据不会混入。
+- 为避免往压缩流里插入明文心跳，保活适用的请求发往上游时 `accept-encoding` 一律改为 `identity`——这是对「完全透传」的一个有意例外，代价只是上游到本机这一段多传一些字节；不适用保活的请求不改写。
+- `"stream": false` 的普通请求没有保活通道；`forward_only` 实例与 `keepalive_interval_secs = 0` 同样没有。
 
 ### 入站来源校验
 

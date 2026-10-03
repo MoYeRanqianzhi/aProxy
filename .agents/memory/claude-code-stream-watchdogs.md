@@ -24,6 +24,7 @@ metadata:
 | 头 + 每 5s 一个 `event: ping` | 正好 600s 断开 | 同上（SDK 丢弃 ping，不算事件） |
 | 头 + 每 5s 一个真实 content_block_delta | 超过 600s 仍存活 | 真实事件会重置事件级看门狗 |
 | 注释心跳 + `CLAUDE_STREAM_IDLE_TIMEOUT_MS=3600000` | 超过 600s 仍存活 | 证实 600s 闸由该变量控制 |
+| 注释心跳 + `CLAUDE_STREAM_IDLE_TIMEOUT_MS=86400000`（24h） | 780s 时仍存活（由测试 timeout 结束） | 大取值不会被截回默认，可作推荐值 |
 | 注释心跳 + `API_TIMEOUT_MS=3600000` | 仍在 600s 断开 | `API_TIMEOUT_MS` 不控制这道闸 |
 
 **对 aProxy 的含义**：注释心跳能覆盖首字节与字节级两层；事件级 600s 闸只能靠

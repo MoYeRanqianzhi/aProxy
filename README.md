@@ -191,7 +191,7 @@ aProxy 是本机单用户代理：它持有并向每个转发请求注入上游�
 ## 开发
 
 ```powershell
-cargo test --locked           # 全量测试（当前基线见 docs/architecture.md；新增测试后同步）
+cargo test --locked           # 全量测试
 cargo clippy --all-targets --locked -- -D warnings   # 必须零警告（项目纪律）
 cargo fmt --all -- --check
 ```

@@ -284,7 +284,7 @@ The full threat model and how to report vulnerabilities are in
 ## Development
 
 ```sh
-cargo test --locked                                # full suite (baseline noted in docs/architecture.md; bump when adding tests)
+cargo test --locked                                # full suite
 cargo clippy --all-targets --locked -- -D warnings # must be warning-free (project rule)
 cargo fmt --all -- --check
 ```

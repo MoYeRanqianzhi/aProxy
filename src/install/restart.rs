@@ -166,6 +166,11 @@ pub async fn stop_and_wait(run_dir: &Path, port: &str, timeout: Duration) -> Res
 struct SpawnFailure {
     /// spawn 成功时的子进程 pid（spawn 本身失败为 None）
     pid: Option<u32>,
+    /// spawn 返回后立刻读到的子进程创建时间（身份锚点，见 watchdog::record_identity）：
+    /// 回收时按「pid + 创建时间」核验再终止——8 秒等待期间子进程若已退出、pid 被系统
+    /// 复用给别的进程，届时现读的创建时间必然不符，绝不误杀。None = 读不到（进程瞬间
+    /// 退出或平台不支持），此时不终止。
+    start: Option<u64>,
     /// 截止时子进程仍存活（启动中但未写注册表 / 挂死）
     alive: bool,
     message: String,
@@ -187,9 +192,11 @@ async fn spawn_and_wait_ready(
     full.push("--daemon-child".to_string());
     let pid = crate::daemon::spawn_detached(exe, &full).map_err(|e| SpawnFailure {
         pid: None,
+        start: None,
         alive: false,
         message: format!("spawn 失败（{}）: {e}", exe.display()),
     })?;
+    let start = crate::watchdog::process_start_time(pid);
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     loop {
         if crate::daemon::registry_contains_pid_in(run_dir, pid) {
@@ -201,6 +208,7 @@ async fn spawn_and_wait_ready(
         if exited && !crate::daemon::registry_contains_pid_in(run_dir, pid) {
             return Err(SpawnFailure {
                 pid: Some(pid),
+                start,
                 alive: false,
                 message: format!("新进程启动即退出（pid {pid}，详见守护日志/startup.log）"),
             });
@@ -209,6 +217,7 @@ async fn spawn_and_wait_ready(
             let alive = crate::watchdog::process_exited(pid) == Some(false);
             return Err(SpawnFailure {
                 pid: Some(pid),
+                start,
                 alive,
                 message: format!(
                     "实例重启后未在预期时间内就绪（pid {pid}，{}）",
@@ -226,10 +235,19 @@ async fn spawn_and_wait_ready(
 
 /// 清掉 8 秒内没就绪、仍存活的子进程（本函数刚 spawn 的、从未写注册表的
 /// 进程——它不承载任何已知流量；不清掉它，回退二进制可能因端口被占而
-/// bind 失败）。pid 是本进程 spawn 返回的锚点，终止原语自带身份校验；
+/// bind 失败）。身份锚点是 spawn 时读到的「pid + 创建时间」：
+/// `terminate_verified_process` 在同一进程句柄上先核对创建时间再终止，pid 已被
+/// 复用时必然拒绝；读不到创建时间就不终止（宁可回退因端口被占而失败，也不误杀）。
 /// 终止失败只记录，回退照常尝试（失败会如实上报为 Down）。
-async fn reap_unready_child(pid: u32) {
-    if let Err(e) = crate::daemon::force_terminate(pid) {
+async fn reap_unready_child(pid: u32, start: Option<u64>) {
+    let Some(start) = start else {
+        tracing::warn!(
+            pid,
+            "未就绪的新进程读不到创建时间，无法核验身份，不终止；回退仍尝试"
+        );
+        return;
+    };
+    if let Err(e) = crate::watchdog::terminate_verified_process(pid, start) {
         tracing::warn!(pid, error = %e, "未就绪的新进程终止失败，回退仍尝试");
         return;
     }
@@ -304,7 +322,7 @@ pub async fn restart_instance(
     if failure.alive
         && let Some(pid) = failure.pid
     {
-        reap_unready_child(pid).await;
+        reap_unready_child(pid, failure.start).await;
     }
     rewrite_restore();
 

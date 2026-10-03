@@ -94,7 +94,7 @@ pub(crate) enum Commands {
         /// idle 模式的空闲阈值（秒），覆盖 settings.json 的 idle_timeout_secs
         #[arg(value_name = "SECS", requires = "target")]
         threshold: Option<u64>,
-        /// 立即强制终止（跳过优雅关闭，零等待；进程终止前验证镜像名防杀错）
+        /// 立即强制终止（跳过优雅关闭，零等待；终止前按 pid + 进程创建时间核验身份防杀错）
         #[arg(long)]
         force: bool,
     },

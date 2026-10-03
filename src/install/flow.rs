@@ -8,7 +8,10 @@
 //!   → verifying（版本+阶段终验）→ cleaning（删 .old/staging）→ done
 //! ```
 //!
-//! - 失败语义：任何一步 Err → phase=failed 落盘（保留现场）后返回。
+//! - 失败语义：任何一步 Err → phase=failed + 原因（last_error）落盘（保留
+//!   现场）后返回。滚动重启中某实例在新版本下起不来 → 用旧二进制按原参数
+//!   把它拉回（只恢复服务，阶段不回退），置 halted 中止滚动，自动续作不再
+//!   重试（见 restart.rs 模块文档）。
 //! - 中断语义：任何时刻崩溃/被杀 → install.state 残留，`continue_install`
 //!   从残留 phase 幂等续作（断电恢复矩阵的执行体）。
 //!
@@ -87,6 +90,40 @@ async fn live_ports(run_dir: &Path) -> Vec<String> {
         out.push(crate::daemon::port_of(&info.listen_addr).to_string());
     }
     out
+}
+
+/// 实例快照 = 存活实例 ∪ 「被本安装停止、尚未恢复」的在途实例。返回
+/// `(live, snapshot)`：广播只对 live（不在跑的实例没有 IPC 可表达）；滚动
+/// 重启按 snapshot（在途实例由 restart 原语用在途记录直接拉起）。
+///
+/// 只靠 IPC 枚举重算快照会把在途实例永久排除——安装进程在「旧实例已停、
+/// 新实例未就绪」的窗口崩溃后续作，该实例既不在跑也已没了 `.restore`，
+/// 续作照常完成而它从此下线。顺手为缺 `.restore` 的在途实例补写一份：
+/// 续作若在拉起它之前再次失败，`aproxy restore` 仍能把它恢复。
+async fn snapshot_with_pending(run_dir: &Path, state: &InstallState) -> (Vec<String>, Vec<String>) {
+    let live = live_ports(run_dir).await;
+    let mut snapshot = live.clone();
+    for p in &state.pending_restores {
+        if snapshot.contains(&p.port) {
+            continue;
+        }
+        if !crate::daemon::restore_file_path_in(run_dir, &p.port).is_file() {
+            let _ = crate::daemon::write_restore_file_in(run_dir, &p.port, &p.args, &p.log_path);
+        }
+        snapshot.push(p.port.clone());
+    }
+    (live, snapshot)
+}
+
+/// 回滚用旧二进制：本次交换记下的 old_path（Windows `.old` / unix 交换前
+/// 保留的副本）。不存在（首次安装、已被清理）→ None，实例起不来时只能
+/// 保住 `.restore` 下线。
+fn rollback_binary(state: &InstallState) -> Option<std::path::PathBuf> {
+    state
+        .old_path
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
 }
 
 /// 宣告句柄：创建节 + 独立 ticker 周期 beat。句柄 Drop（任务 abort 或进程
@@ -196,16 +233,18 @@ pub async fn run_install(
         download_proxy,
         async {
             match run_forward(home, run_dir, &mut state, &plan.from).await {
-                // 接力交棒：本进程即将退出，宣告 ticker 不 abort（随进程消亡）；
-                // 接管者的 --continue 入口创建自己的宣告
-                Ok(FlowExit::HandedOver) => Ok(FlowExit::HandedOver),
+                // 正常完成与接力交棒都撤宣告。交棒时接管者的 --continue 入口
+                // 已创建自己的宣告（接管确认发生在它推进 phase 之后）；本进程
+                // 还要留下来等接管者的结局转告用户，若不撤，两个进程会以不同
+                // pid 交替写同一宣告节，挂死判定（宣告 pid 与 installer_pid
+                // 比对）随之失真
                 Ok(exit) => {
                     stop_announcer(announcer);
                     Ok(exit)
                 }
                 Err(e) => {
                     // failed 保留现场（staging 不清），续作由 --continue 从残留推进
-                    let _ = super::state::advance_in(run_dir, &mut state, InstallPhase::Failed);
+                    super::state::fail_in(run_dir, &mut state, &e);
                     stop_announcer(announcer);
                     Err(e)
                 }
@@ -216,8 +255,8 @@ pub async fn run_install(
 }
 
 /// 正向推进（marking 之后的全部阶段）。`state` 已持锁；失败调用方置 failed。
-/// `announcer` 由调用方持有（接力交棒的路径不 abort——接管者有自己的宣告，
-/// 本进程退出时 ticker 任务随之消亡，节按介质语义自然解除）。
+/// 宣告 ticker 由调用方持有并在任何出口撤销（接力交棒时接管者已有自己的
+/// 宣告，见 run_install）。
 async fn run_forward(
     home: &Path,
     run_dir: &Path,
@@ -234,8 +273,8 @@ async fn run_forward(
     state.sha256 = Some(staged.sha256.clone());
     super::state::advance_in(run_dir, state, InstallPhase::Downloaded)?;
 
-    // ---- 实例快照（ACK 阶段清单）
-    let snapshot = live_ports(run_dir).await;
+    // ---- 实例快照（ACK 阶段清单；failed 重跑时并回在途实例）
+    let (live, snapshot) = snapshot_with_pending(run_dir, state).await;
     state.instance_snapshot = snapshot.clone();
     write_in(run_dir, state).map_err(|e| format!("install.state 写入失败: {e}"))?;
 
@@ -247,9 +286,9 @@ async fn run_forward(
         #[cfg(windows)]
         stop_old_watchdog(run_dir);
         super::state::advance_in(run_dir, state, InstallPhase::Broadcasting)?;
-        if let Err(bad) = super::broadcast::broadcast_prepare_swap(run_dir, &snapshot).await {
+        if let Err(e) = super::broadcast::broadcast_prepare_swap(run_dir, &live, state).await {
             return Err(format!(
-                "PrepareSwap 广播终失败（实例未表达，已按重试/restart 收敛）: {bad:?}。\n\
+                "PrepareSwap 广播终失败（{e}）。\n\
                  问题实例有隐患，处置指引：将其关闭后重试安装（不强杀——避免服务中断）"
             ));
         }
@@ -265,9 +304,9 @@ async fn run_forward(
         .cloned()
         .collect();
     if !fresh.is_empty() {
-        super::broadcast::broadcast_prepare_swap(run_dir, &fresh)
+        super::broadcast::broadcast_prepare_swap(run_dir, &fresh, state)
             .await
-            .map_err(|bad| format!("广播后新启实例 ACK 失败: {bad:?}"))?;
+            .map_err(|e| format!("广播后新启实例 ACK 失败: {e}"))?;
     }
     super::state::advance_in(run_dir, state, InstallPhase::Swapping)?;
     let outcome = swap::swap_in(home, &staged.path).map_err(|e| format!("二进制交换失败: {e}"))?;
@@ -326,7 +365,12 @@ async fn run_tail(
         {
             continue;
         }
-        match super::restart::restart_instance(run_dir, port, new_bin).await {
+        // 任一实例失败即中止滚动、剩余实例不再动（restart 原语已就该实例
+        // 尽力恢复服务并置 halted；不动剩余实例 = 不再扩大影响面）
+        let fallback = rollback_binary(state);
+        match super::restart::restart_instance(run_dir, state, port, new_bin, fallback.as_deref())
+            .await
+        {
             Ok(pid) => {
                 tracing::info!(port = %port, new_pid = pid, "实例已滚动到新版本");
             }
@@ -359,7 +403,21 @@ async fn run_tail(
             ));
         }
         for port in &bad {
-            let _ = super::restart::restart_instance(run_dir, port, new_bin).await;
+            let fallback = rollback_binary(state);
+            // 补 restart 的「未被动过」类失败照旧忽略（下一轮终验如实判定）；
+            // 实例级失败（新版本起不来、已回滚/下线）必须立即中止
+            match super::restart::restart_instance(
+                run_dir,
+                state,
+                port,
+                new_bin,
+                fallback.as_deref(),
+            )
+            .await
+            {
+                Ok(_) | Err(super::restart::RestartError::NotRestarted(_)) => {}
+                Err(e) => return Err(format!("实例 {port} 终验补重启失败: {e}")),
+            }
         }
     }
 
@@ -433,13 +491,13 @@ pub async fn run_install_online(
         download_proxy,
         async {
             match run_forward_from_staged(home, run_dir, &mut state, staged).await {
-                Ok(FlowExit::HandedOver) => Ok(FlowExit::HandedOver),
+                // 交棒同样撤宣告：理由见 run_install
                 Ok(exit) => {
                     stop_announcer(announcer);
                     Ok(exit)
                 }
                 Err(e) => {
-                    let _ = super::state::advance_in(run_dir, &mut state, InstallPhase::Failed);
+                    super::state::fail_in(run_dir, &mut state, &e);
                     stop_announcer(announcer);
                     Err(e)
                 }
@@ -460,6 +518,16 @@ pub async fn continue_install(home: &Path, run_dir: &Path) -> Result<FlowExit, S
         // done/aborted 残留（正常结束但清文件前崩溃）→ 清文件即完成
         super::state::remove_in(run_dir);
         return Ok(FlowExit::Completed);
+    }
+    // 实例级失败后中止的安装不自动重试：原因（多为新版本不接受现有配置）
+    // 不会自己消失，每次续作都会让该实例再经历一次「停止 → 起不来 → 拉回」
+    // 的中断——看护者/CLI 入口会反复拉起续作，这里必须原地拒绝且不碰现场。
+    // 用户排除原因后显式重新执行 install（新安装接管 stale 残留）收尾。
+    if state.phase == InstallPhase::Failed && state.halted {
+        return Err(format!(
+            "上次安装因实例级失败已中止，不自动重试（{}）。排除原因后重新执行 aproxy install",
+            state.last_error.as_deref().unwrap_or("原因未记录")
+        ));
     }
     // 接管判定：常规 stale（超时+原进程死）或宣告心跳过期（runtime 挂死
     // 的即时证据）。**relaying 是接棒约定态**——它只可能由安装者在 spawn
@@ -547,14 +615,13 @@ pub async fn continue_install(home: &Path, run_dir: &Path) -> Result<FlowExit, S
             };
 
             match result {
-                // 接力交棒：同 run_install——本进程即将退出，ticker 不 abort
-                Ok(FlowExit::HandedOver) => Ok(FlowExit::HandedOver),
+                // 交棒（failed 重跑在 Windows 上会再次交棒）同样撤宣告
                 Ok(exit) => {
                     stop_announcer(announcer);
                     Ok(exit)
                 }
                 Err(e) => {
-                    let _ = super::state::advance_in(run_dir, &mut state, InstallPhase::Failed);
+                    super::state::fail_in(run_dir, &mut state, &e);
                     stop_announcer(announcer);
                     Err(e)
                 }
@@ -580,7 +647,8 @@ async fn run_forward_from_staged(
         };
         return run_forward(home, run_dir, state, Path::new(&from)).await;
     }
-    let snapshot = live_ports(run_dir).await;
+    // 续作重算快照必须并回在途实例（见 snapshot_with_pending）
+    let (live, snapshot) = snapshot_with_pending(run_dir, state).await;
     state.instance_snapshot = snapshot.clone();
     write_in(run_dir, state).map_err(|e| format!("install.state 写入失败: {e}"))?;
     if !snapshot.is_empty() {
@@ -592,8 +660,8 @@ async fn run_forward_from_staged(
         if state.phase < InstallPhase::Broadcasting {
             super::state::advance_in(run_dir, state, InstallPhase::Broadcasting)?;
         }
-        if let Err(bad) = super::broadcast::broadcast_prepare_swap(run_dir, &snapshot).await {
-            return Err(format!("PrepareSwap 广播终失败: {bad:?}"));
+        if let Err(e) = super::broadcast::broadcast_prepare_swap(run_dir, &live, state).await {
+            return Err(format!("PrepareSwap 广播终失败: {e}"));
         }
         if state.phase < InstallPhase::Acked {
             super::state::advance_in(run_dir, state, InstallPhase::Acked)?;
@@ -606,9 +674,9 @@ async fn run_forward_from_staged(
         .cloned()
         .collect();
     if !fresh.is_empty() {
-        super::broadcast::broadcast_prepare_swap(run_dir, &fresh)
+        super::broadcast::broadcast_prepare_swap(run_dir, &fresh, state)
             .await
-            .map_err(|bad| format!("广播后新启实例 ACK 失败: {bad:?}"))?;
+            .map_err(|e| format!("广播后新启实例 ACK 失败: {e}"))?;
     }
     super::state::advance_in(run_dir, state, InstallPhase::Swapping)?;
     let outcome = swap::swap_in(home, staged_path).map_err(|e| format!("二进制交换失败: {e}"))?;

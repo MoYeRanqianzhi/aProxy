@@ -16,11 +16,18 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
     if args.continue_ {
         // 续作模式：静默执行（由看护者/CLI 入口/接力自动拉起）。失败落
         // failed 现场等下次续作，不打扰用户——但首轮失败输出到日志可查。
+        // 硬退理由同 report_outcome：续作在 Windows 上也可能再次交棒，
+        // 后台任务不保证已结束
         match aproxy::install::flow::continue_install(&home, &run_dir).await {
-            Ok(_) => tracing::info!("install 续作完成"),
-            Err(e) => tracing::error!(error = %e, "install 续作失败（现场已保留，等待下次续作）"),
+            Ok(_) => {
+                tracing::info!("install 续作完成");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "install 续作失败（现场已保留，等待下次续作）");
+                std::process::exit(1);
+            }
         }
-        return;
     }
 
     // --skills-only：只更新 skill 文档（不动二进制、不建安装状态机）。
@@ -363,7 +370,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         "npm" => aproxy::install::state::InstallSource::Npm,
         _ => aproxy::install::state::InstallSource::Url,
     };
-    match aproxy::install::flow::run_install_online(
+    let result = aproxy::install::flow::run_install_online(
         home,
         run_dir,
         &target,
@@ -372,25 +379,113 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         !args.no_skills,
         proxy,
     )
-    .await
-    {
-        Ok(exit) => {
-            if exit == aproxy::install::flow::FlowExit::HandedOver {
-                println!("交换完成，剩余阶段由新版本继续（接力交棒）。");
-                std::process::exit(0);
+    .await;
+    report_outcome(home, run_dir, result).await;
+}
+
+/// 安装结局的用户可见输出与退出码（三个安装入口共用）。**一律硬退**：
+/// 宣告 ticker 与 skill 支线等后台任务不保证在此刻已结束，走正常 return
+/// 会让 tokio runtime drop 等待它们（实测 27 个交棒进程全体挂死的根源）。
+///
+/// Windows 接力交棒（`HandedOver`）≠ 安装完成：滚动重启/终验由接棒的新
+/// 二进制进程执行，本进程（旧镜像）必须等它跑到终点再报告——否则接棒者
+/// 失败时用户看到的是「交换完成」与退出码 0，agent 会以为升级成功。
+async fn report_outcome(
+    home: &std::path::Path,
+    run_dir: &std::path::Path,
+    result: Result<aproxy::install::flow::FlowExit, String>,
+) -> ! {
+    let done_msg = || {
+        println!(
+            "安装完成：{}（二进制已落位，实例已滚动到新版本）",
+            aproxy::install::swap::bin_path_in(home).display()
+        );
+    };
+    match result {
+        Ok(aproxy::install::flow::FlowExit::Completed) => {
+            done_msg();
+            std::process::exit(0);
+        }
+        Ok(aproxy::install::flow::FlowExit::HandedOver) => {
+            println!("交换完成，剩余阶段（滚动重启/终验）由新版本进程继续，等待其完成...");
+            match await_handover(run_dir).await {
+                Ok(()) => {
+                    done_msg();
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("[ERROR] 安装失败: {e}");
+                    print_failure_guidance(run_dir);
+                    std::process::exit(1);
+                }
             }
-            println!(
-                "安装完成：{}（二进制已落位，实例已滚动到新版本）",
-                aproxy::install::swap::bin_path_in(home).display()
-            );
         }
         Err(e) => {
             eprintln!("[ERROR] 安装失败: {e}");
-            eprintln!(
-                "现场已保留，中断后重试同一命令或任何 aproxy 命令可自动续作；`aproxy install --abort` 可显式回滚。"
-            );
+            print_failure_guidance(run_dir);
             std::process::exit(1);
         }
+    }
+}
+
+/// 接棒者结局等待上限：与安装锁 stale 判定同量级（滚动重启每实例最坏
+/// 约 20s 停止 + 8s 就绪 + 8s 回退，十分钟覆盖数十个实例）。
+const HANDOVER_WAIT_SECS: u64 = aproxy::install::state::STALE_AFTER_SECS;
+
+/// 轮询 install.state 直到接棒者到达终点。成功判据：状态文件消失（done
+/// 清场）或 phase 进入 cleaning（终验已通过——cleaning 只剩删 `.old` 与
+/// staging，而 `.old` 正是本进程的运行镜像，本进程必须先退出它才删得掉，
+/// 所以不能等到 done）。失败判据：phase=failed（带接棒者记下的原因）、
+/// 接棒进程已死而安装未终结、等待超时。
+async fn await_handover(run_dir: &std::path::Path) -> Result<(), String> {
+    use aproxy::install::state::{InstallPhase, is_stale, load_in, state_path_in};
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(HANDOVER_WAIT_SECS);
+    loop {
+        match load_in(run_dir) {
+            None if !state_path_in(run_dir).exists() => return Ok(()),
+            // 文件在但读不出（状态损坏）：不臆断，继续等到超时
+            None => {}
+            Some(s) => match s.phase {
+                InstallPhase::Cleaning | InstallPhase::Done => return Ok(()),
+                InstallPhase::Failed => {
+                    return Err(s
+                        .last_error
+                        .unwrap_or_else(|| "接棒进程报告失败（原因未记录）".to_string()));
+                }
+                InstallPhase::Aborted => return Err("安装已被中止（--abort）".to_string()),
+                _ if s.installer_pid != std::process::id()
+                    && is_stale(&s, aproxy::watchdog::now_secs()) =>
+                {
+                    return Err(format!(
+                        "接棒进程（pid {}）已退出但安装停在 {:?}；现场已保留，任何 aproxy 命令会自动续作",
+                        s.installer_pid, s.phase
+                    ));
+                }
+                _ => {}
+            },
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "{HANDOVER_WAIT_SECS} 秒内未确认安装完成（可能仍在后台进行）；可用 aproxy status 查看实例版本"
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// 失败后的处置指引：实例级失败（halted）与可续作的失败给不同的出路。
+fn print_failure_guidance(run_dir: &std::path::Path) {
+    let halted = aproxy::install::state::load_in(run_dir).is_some_and(|s| s.halted);
+    if halted {
+        eprintln!(
+            "滚动已中止，不会自动重试：出问题的实例已用旧二进制拉回（拉回失败时其恢复记录已保留），\
+             其余实例未动。常见原因是新版本不接受现有配置——按上方原因修正后重新执行 aproxy install 完成升级；\
+             若要留在旧版本，用 `aproxy install <旧版本> --allow-downgrade` 把规范位置的二进制换回。"
+        );
+    } else {
+        eprintln!(
+            "现场已保留，中断后重试同一命令或任何 aproxy 命令可自动续作；`aproxy install --abort` 可显式回滚（仅交换前）。"
+        );
     }
 }
 
@@ -411,32 +506,10 @@ async fn run_plan(
     }
     let target = plan.target_version.clone();
     println!("开始安装 aProxy {target}...");
-    match aproxy::install::flow::run_install(home, run_dir, &plan, skill_enabled, download_proxy)
-        .await
-    {
-        Ok(exit) => {
-            if exit == aproxy::install::flow::FlowExit::HandedOver {
-                // Windows 接力：续作由新二进制进程完成，本进程（旧镜像）
-                // 到此结束——对用户表现为同一条命令装完。**必须硬退**：
-                // 交棒路径刻意不 abort 宣告 ticker（进程退出即节消失），
-                // 走正常 return 会让 tokio runtime drop 永久等待无限循环
-                // 的 ticker 任务（实测 27 个交棒进程全体挂死的根源）
-                println!("交换完成，剩余阶段由新版本继续（接力交棒）。");
-                std::process::exit(0);
-            }
-            println!(
-                "安装完成：{}（二进制已落位，实例已滚动到新版本）",
-                aproxy::install::swap::bin_path_in(home).display()
-            );
-        }
-        Err(e) => {
-            eprintln!("[ERROR] 安装失败: {e}");
-            eprintln!(
-                "现场已保留，中断后重试同一命令或任何 aproxy 命令可自动续作；`aproxy install --abort` 可显式回滚。"
-            );
-            std::process::exit(1);
-        }
-    }
+    let result =
+        aproxy::install::flow::run_install(home, run_dir, &plan, skill_enabled, download_proxy)
+            .await;
+    report_outcome(home, run_dir, result).await;
 }
 
 /// --abort：显式回滚（仅 swapping 前可完全回滚，此后只进不退）。

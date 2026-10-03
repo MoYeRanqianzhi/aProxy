@@ -144,6 +144,22 @@ pub struct SkillState {
     pub version: String,
 }
 
+/// 被 install 停止、但尚未确认已在新进程上就绪的实例（滚动重启的「在途」
+/// 记录）。**停止之前**落盘：守护优雅退出会删掉自己的 `.restore`，若安装
+/// 进程恰在「旧实例已停、新实例未就绪」的窗口崩溃/断电，这里是该实例启动
+/// 参数的唯一留存——续作据此把它拉回，重算实例快照时也据此把它并回去
+/// （它已不在跑，IPC 枚举看不到它）。实例就绪（或被旧二进制拉回）后移除。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PendingRestore {
+    pub port: String,
+    /// 启动参数（与 `.restore` 同形：不含 --daemon-child）
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// 停止前那次启动的守护日志路径（回写 `.restore` 时原样带上）
+    #[serde(default)]
+    pub log_path: String,
+}
+
 /// install.state 全量 schema。全部字段 serde default——旧版本状态文件缺
 /// 字段可读，新字段加入不破坏旧二进制续跑（恢复矩阵「状态文件损坏」之外
 /// 的兼容底线）。
@@ -181,6 +197,20 @@ pub struct InstallState {
     pub updated_at: u64,
     #[serde(default)]
     pub installer_pid: u32,
+    /// 已停止、未确认恢复的实例（见 [`PendingRestore`]）
+    #[serde(default)]
+    pub pending_restores: Vec<PendingRestore>,
+    /// 实例级失败后的「中止」标记：某实例在新二进制下起不来，已用旧二进制
+    /// 拉回（或拉回也失败、只保住了 `.restore`），滚动就此停止。置位后
+    /// **自动续作不再重试**——原因（多为新版本不接受现有配置）不会自己消失，
+    /// 每次续作都会让该实例再经历一次「停止 → 起不来 → 拉回」的服务中断。
+    /// 由用户排除原因后显式重新执行 install 收尾（新安装接管残留状态）。
+    #[serde(default)]
+    pub halted: bool,
+    /// 最近一次失败的原因（与 phase=failed 同次落盘）。Windows 接力交棒后
+    /// 旧 CLI 进程靠它把接棒者的失败原因转告用户。
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 impl InstallState {
@@ -200,6 +230,9 @@ impl InstallState {
             started_at: now,
             updated_at: now,
             installer_pid: std::process::id(),
+            pending_restores: Vec::new(),
+            halted: false,
+            last_error: None,
         }
     }
 }
@@ -327,6 +360,18 @@ pub fn advance_in(
     write_in(run_dir, state)
         .map(|_| ())
         .map_err(|e| format!("install.state 写入失败: {e}"))
+}
+
+/// 失败落盘：记录原因并置 failed（保留现场）。已是 failed（续作重跑再次
+/// 失败）时只刷新原因——failed → failed 不是合法迁移，但原因必须是最新的。
+/// 落盘失败只能放弃（调用方本就在失败路径上，原错误已向上返回）。
+pub fn fail_in(run_dir: &Path, state: &mut InstallState, error: &str) {
+    state.last_error = Some(error.to_string());
+    if state.phase == InstallPhase::Failed {
+        let _ = write_in(run_dir, state);
+    } else {
+        let _ = advance_in(run_dir, state, InstallPhase::Failed);
+    }
 }
 
 /// 删除状态文件（done/aborted 后清场；不存在静默成功）。
@@ -518,6 +563,13 @@ mod tests {
             attempt: 2,
             version: "0.1.0-alpha.9".into(),
         });
+        s.pending_restores = vec![PendingRestore {
+            port: "12345".into(),
+            args: vec!["--config".into(), "C:/h/a.toml".into()],
+            log_path: "C:/h/logs/x.log".into(),
+        }];
+        s.halted = true;
+        s.last_error = Some("实例 12345 滚动重启失败".into());
         let mut cur = s.clone();
         write_in(&run, &mut cur).unwrap();
         assert_eq!(load_in(&run).unwrap(), s);
@@ -531,6 +583,26 @@ mod tests {
         let old = load_in(&run).unwrap();
         assert_eq!(old.phase, InstallPhase::Restarting);
         assert!(old.instance_snapshot.is_empty() && old.skill.is_none());
+        // 新字段缺省：无在途实例、未中止、无失败原因（旧版本写的现场照常续作）
+        assert!(old.pending_restores.is_empty() && !old.halted && old.last_error.is_none());
+    }
+
+    #[test]
+    fn fail_records_reason_and_refreshes_on_repeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        let mut s =
+            create_new_in(&run, InstallState::new_marking("v", InstallSource::From)).unwrap();
+        advance_in(&run, &mut s, InstallPhase::Downloading).unwrap();
+        fail_in(&run, &mut s, "第一次");
+        let loaded = load_in(&run).unwrap();
+        assert_eq!(loaded.phase, InstallPhase::Failed);
+        assert_eq!(loaded.last_error.as_deref(), Some("第一次"));
+        // 已 failed 再失败：phase 不变、原因刷新为最新
+        fail_in(&run, &mut s, "第二次");
+        let loaded = load_in(&run).unwrap();
+        assert_eq!(loaded.phase, InstallPhase::Failed);
+        assert_eq!(loaded.last_error.as_deref(), Some("第二次"));
     }
 
     #[test]

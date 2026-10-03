@@ -18,11 +18,54 @@
 # 包名/仓库/版本约定：trusted publishing 校验 package.json 的 repository
 # 与 OIDC claims 精确匹配（大小写敏感）——改仓库名时必须同步此处模板。
 #
-# --tag latest：npm 11 对 prerelease 版本强制显式 tag。0.1.x 全程预发布、
-# 无 stable，latest 指向最新 alpha 语义正确（`npm i -g @meowo/aproxy`
-# 直接可装）；首个 stable（0.2.0）发布后 latest 自然指向 stable，无需改动。
+# dist-tag：预发布（版本含 -alpha/-beta/-rc）发 next，稳定版发 latest，规则
+# 见下方 npm_dist_tag()。首个稳定版发布后，`npm i -g @meowo/aproxy` 只会装到
+# 稳定版；想用预发布须显式 `npm i -g @meowo/aproxy@next`。
+#
+# 可重跑：每个包发布前先查询该版本是否已在 registry 上，已存在就跳过（见
+# npm_version_exists()）。CI 的 publish job 中途失败后可以直接 re-run，不会在
+# 第一个已发布的包处报 403 退出；查询本身失败则硬失败，不会误当「未发布」。
 
 set -euo pipefail
+
+# npm dist-tag 选择。与 .github/workflows/release.yml、release-format.yml 中
+# softprops/action-gh-release 的 prerelease 表达式是同一条规则：tag 含
+# -alpha/-beta/-rc 即预发布（GitHub 标 prerelease ↔ npm 发 next），否则为
+# 稳定版（GitHub 可成为 Latest ↔ npm 发 latest）。改动任一处必须同步其余两处。
+# GitHub 表达式的 contains() 不区分大小写，这里先转小写再匹配，保持一致。
+# 无论哪种都显式传 --tag：npm 11 对预发布版本不给 --tag 会直接拒发。
+npm_dist_tag() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    *-alpha* | *-beta* | *-rc*) echo next ;;
+    *) echo latest ;;
+  esac
+}
+
+# 判断 <包>@<精确版本> 是否已在 registry 上：已存在返回 0，未发布返回 1。
+# npm view 的三种结果：版本存在时输出该版本号；包存在但没有这个版本时输出为空、
+# 退出码 0；包本身从未发布时报 E404、退出码非 0。其余失败（网络、认证、
+# registry 故障）直接终止脚本——把查询失败当成「未发布」继续 publish，会在
+# 已发布的版本上撞 403，或掩盖真正的问题。
+# --prefer-online：跳过本地缓存的 packument，避免刚发布的版本被旧缓存判为不存在。
+npm_version_exists() {
+  local pkg="$1" ver="$2" out errfile
+  errfile=$(mktemp)
+  if out=$(npm view "${pkg}@${ver}" version --prefer-online 2>"$errfile"); then
+    rm -f "$errfile"
+    [ "$out" = "$ver" ] && return 0
+    [ -z "$out" ] && return 1
+    echo "错误：npm view ${pkg}@${ver} 返回了意外的输出：${out}" >&2
+    exit 1
+  fi
+  if grep -q 'E404' "$errfile"; then
+    rm -f "$errfile"
+    return 1
+  fi
+  echo "错误：查询 ${pkg}@${ver} 是否已发布时失败（不是 404，不能当作未发布继续）：" >&2
+  cat "$errfile" >&2
+  rm -f "$errfile"
+  exit 1
+}
 
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
@@ -211,13 +254,25 @@ if [ -n "${NPM_TOKEN:-}" ]; then
   printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" >>"$HOME/.npmrc"
 fi
 
+DIST_TAG=$(npm_dist_tag "$VERSION")
+echo "== 版本 ${VERSION} → npm dist-tag ${DIST_TAG}"
+
+# $1 = 包目录，$2 = 包名。已存在的版本跳过（re-run 时的预期情况），dry-run 下同样
+# 先查询，输出与真实发布时一致的跳过/发布判断。
+publish_pkg() {
+  if npm_version_exists "$2" "$VERSION"; then
+    echo "== 跳过 $2@${VERSION}：registry 上已存在该版本"
+    return 0
+  fi
+  echo "== npm publish $2@${VERSION} --tag ${DIST_TAG} ${DRY_RUN}"
+  (cd "$1" && npm publish --access public --tag "$DIST_TAG" $DRY_RUN)
+}
+
 for m in "${MAPPINGS[@]}"; do
   IFS=: read -r suffix _ <<<"$m"
-  echo "== npm publish ${PKG_SCOPE}-${suffix}@${VERSION} ${DRY_RUN}"
-  (cd "npm/${PKG_SCOPE}-${suffix}" && npm publish --access public --tag latest $DRY_RUN)
+  publish_pkg "npm/${PKG_SCOPE}-${suffix}" "${PKG_SCOPE}-${suffix}"
 done
 
-echo "== npm publish ${PKG_SCOPE}@${VERSION} ${DRY_RUN}"
-(cd "$main_dir" && npm publish --access public --tag latest $DRY_RUN)
+publish_pkg "$main_dir" "$PKG_SCOPE"
 
 echo "== npm 渠道发布完成（${PKG_SCOPE} 组）"

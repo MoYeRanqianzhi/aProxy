@@ -35,11 +35,31 @@
   `Accept: application/json`，请求体 `"stream": true`，`x-stainless-timeout: 600`。
   → 保活通道只看 Accept（`src/proxy.rs:878`），Claude Code 的流式请求永远进不了
   保活通道：审查项 proxy-core-03 实锤，升级为发布阻断。
-- Claude Code 二进制内含三层流看门狗：`CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS`、
-  `CLAUDE_STREAM_IDLE_TIMEOUT_MS`（报错「no chunks received」）、
-  `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS`；报错文案直指「A proxy or gateway that
-  buffers streaming responses can cause this」。默认值与「SSE 注释心跳能否重置
-  它们」由黑盒实验测定（见下方进度），结论决定 WS-1b 的设计。
+- Claude Code 三层流超时已黑盒实测，结论与实验方法见
+  [[claude-code-stream-watchdogs]]：首字节约 360s、字节级空闲 300s（注释心跳可
+  覆盖）、事件级空闲 600s（注释与 ping 都不算，只能由客户端
+  `CLAUDE_STREAM_IDLE_TIMEOUT_MS` 解除）。实验方法：python mock 上游记录请求到达
+  与连接重置时刻，隔离 `CLAUDE_CONFIG_DIR` + 假 key + `NO_PROXY` 驱动 `claude -p`。
+
+## WS-1b 设计定稿（依据上述实测）
+
+1. 新增 `keepalive_trigger = accept | body_stream | any`（settings 全局默认 +
+   toml 覆盖），默认 `any`：Accept 含 text/event-stream，或客户端原始请求体顶层
+   `"stream": true`（在 request_transform 之前判定；磁盘 spool 的大请求体要流式
+   只看顶层键，不能整体物化）。
+2. 首轮提交：保活适用的请求，上游返回 2xx 且 content-type 为 SSE 时立即把真实
+   status/响应头转给客户端（去掉 content-length 与 hop-by-hop），之后照旧缓冲完整
+   流、校验无误再回放；流中途出错就在同一响应里继续重试（客户端只见过心跳）。
+   上游在 keepalive 间隔内仍没回响应头，就先发骨架头（200 + text/event-stream），
+   与既有保活通道同一取舍。配置了 response_transform 时不提交上游真实头，只走
+   骨架。
+3. 心跳全程覆盖：提交之后无论是在等上游、缓冲上游流还是退避，都按 keepalive
+   间隔发注释（修 proxy-core-02 的在途空窗）。
+4. 客户端在长等待后断开时（接近 600s），日志给出「若客户端是 Claude Code，请设置
+   CLAUDE_STREAM_IDLE_TIMEOUT_MS」的提示。
+5. 文档与 aproxy-cli skill：接入 Claude Code 时写入 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`
+   （推荐值以实测为准）；非流式请求无法心跳，同时建议调大 `API_TIMEOUT_MS`。
+6. 顺带：WS-2 建议的转换失败 502 文案（保留「不重试」字样，测试断言依赖它）。
 
 ## 工作流与文件归属
 
@@ -73,8 +93,16 @@
 
 - [x] 审查记录、CLAUDE.md/AGENTS.md、.gitignore、macOS 决定已提交（04deb86…c188508）
 - [x] Claude Code 请求头实测（见上）
-- [ ] Claude Code 看门狗黑盒实验（静默 / 注释心跳 / ping 事件三组，进行中）
-- [ ] 第 1 波：WS-1a、WS-2、WS-3、WS-4、WS-5b
-- [ ] 第 2 波：WS-1b、WS-5a
+- [x] Claude Code 看门狗黑盒实验（7 组，结论见 [[claude-code-stream-watchdogs]]）
+- [ ] 第 1 波：WS-5b 已合并（2e06dce + 主代理补修 069e001：grep -E、.gitattributes
+  让 install.cmd 以 CRLF 入库）；WS-2 已合并（e60de76）；WS-1a、WS-3、WS-4 进行中
+  （WS-4 曾因账户并发上限 409 中断，已续跑）
+- [ ] 第 2 波：WS-5a 进行中（opus，基于 e60de76）；WS-1b 待 WS-1a 合并后开工
+- 并发纪律：账户级上限 8 个并发请求、跨会话共享，主循环也算一个——后台代理同时
+  最多 4 个
+- 待办（来自代理报告）：doctor 单测在未设 APROXY_HOME 时只读扫描真实 ~/.aproxy
+  （测试隔离漏洞，doctor.rs 归 WS-1a 之后处理）；aproxy-format 需发 format 新版本
+  才能让 transform-03 生效；.agents/memory/2026-09-23-transform-format.md 需按 WS-2
+  报告更新（format-echo 子命令、stdout 同步不变量）
 - [ ] 第 3 波：WS-6 + 全量验证 + 无限重试验收
 - [ ] 合并后审查与修复

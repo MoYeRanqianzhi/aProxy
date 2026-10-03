@@ -29,3 +29,4 @@
 - [受限重试路径](memory/2026-09-20-bounded-retry-paths.md) — compact 事故（镜像上游不实现 count_tokens，确定性 404 被无限重试挂死）；最终设计=bounded_retry_paths 配置项（正则整体匹配 path+query，空=关闭，不内置任何 URL）；含首版硬编码被用户否决的教训：行为差异功能一律配置化、不得内置 URL、查询串不可省略 [[forward-only]]
 - [日志随机命名+IPC 上报](memory/2026-09-22-random-log-names.md) — 用户三点定调：日志随机命名（端口是易变标识做永久命名的反模式）/IPC 是日志地址权威（不拼路径）/log_file 自定义不进 settings 层；清理判据重构为引用集；.restore 结构体格式读侧宽容旧格式 [[random-log-names]] [[daemon-model]] [[bounded-retry-paths]]
 - [外部转换器 format](memory/2026-09-23-transform-format.md) — 信封协议（一行 JSON stdin/stdout）+进程池（OJ 多轮式 while 串行，EOF 回收铁律）；两侧失败语义不对称（请求 502 不重试/响应透传）；workspace 三成员体积隔离；aproxy-format 独立发版 format-v* 线；npm skill 包形态变更旧版自愈 [[transform-format]] [[bounded-retry-paths]] [[release-engineering]]
+- [Claude Code 流超时实测](memory/claude-code-stream-watchdogs.md) — 2026-10-04 黑盒实测：Accept: application/json + stream:true；首字节 ~360s / 字节空闲 300s / 事件空闲 600s（注释与 ping 都不算事件，须客户端设 CLAUDE_STREAM_IDLE_TIMEOUT_MS）

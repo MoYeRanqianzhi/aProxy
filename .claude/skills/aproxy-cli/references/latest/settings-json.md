@@ -29,6 +29,8 @@
 | `disk_cache` | bool | true | 手编（进阶；toml 可按实例覆盖） |
 | `forward_only` | bool | false | 手编（进阶；toml 可按实例覆盖） |
 | `bounded_retry_paths` | string[] | `[]` | 手编（进阶；toml 可按实例覆盖） |
+| `allowed_hosts` | string[] | `[]` | 手编（进阶；toml 可按实例覆盖） |
+| `allowed_origins` | string[] | `[]` | 手编（进阶；toml 可按实例覆盖） |
 | `watchdog` | bool | true | 看门狗总开关 |
 | `watchdog_heartbeat_secs` | u64 | 30 | 看护扫描周期（调优） |
 | `watchdog_stale_after_cycles` | u64 | 1 | 挂死容忍周期数（误杀调节阀） |
@@ -99,9 +101,18 @@
 （Claude Code 非官方 API 的 compact 卡死）见 config-toml.md 的
 `bounded_retry_paths` 节。
 
+### allowed_hosts / allowed_origins（全局默认层）
+
+`config.toml` 未显式写同名字段的实例取此值（内置默认 `[]`）。toml 显式值优先
+（包括 `[]`——它等同未配置，可把全局列表在单实例上恢复为内置默认）。
+`allowed_hosts` 是 Host 校验额外放行的主机名（追加到回环名单，`"*"` 关闭
+校验）；`allowed_origins` 是放行的浏览器 Origin（默认拒绝一切携带 Origin 的
+请求，`"*"` 关闭校验）。完整语义见 config-toml.md 的
+`allowed_hosts / allowed_origins` 节。
+
 ### watchdog（及四个 watchdog_* 调优字段）
 
-看门狗是**系统级单例**（一个全局看护进程 `aproxy watchdog` 看护全部实例），
+看门狗是**系统级单例**（一个全局看护进程看护全部实例），
 故只在 settings 配置、config.toml 不参与（多份 toml 对同一看护者会语义打架）。
 
 - `watchdog`（默认 true）：false 时 `aproxy start` 不拉起看护者，守护自检
@@ -130,7 +141,7 @@
 
 ### skill_auto_update
 
-默认 `true`。install 时随二进制并行更新 `~/.aproxy/skills/aproxy-cli/`；
+默认 `true`。install 时随二进制并行更新 `~/.aproxy/skills/` 下的 skill 文档；
 `false` 时完全跳过（单次跳过用 `--no-skills`，单独更新用 `--skills-only`）。
 
 ### download_proxy
@@ -141,11 +152,11 @@ install 下载专用代理（与 config.toml 的 `proxy` 上游请求代理**绝
 
 ## 与 config.toml 的分层关系
 
-只有 `max_body_mb`、`disk_cache`、`forward_only` 与 `bounded_retry_paths`
-存在三层优先级：
+只有 `max_body_mb`、`disk_cache`、`forward_only`、`bounded_retry_paths`、
+`allowed_hosts` 与 `allowed_origins` 存在三层优先级：
 
 ```
-config.toml 显式值  >  settings.json 值  >  内置默认 (128 / true / false / [])
+config.toml 显式值  >  settings.json 值  >  内置默认 (128 / true / false / [] / [] / [])
 ```
 
 其余字段是「toml 显式值 > 内置默认」或完全归 settings 管理（本文件全部字段）。

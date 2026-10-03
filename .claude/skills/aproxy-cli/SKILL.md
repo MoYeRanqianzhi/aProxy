@@ -15,6 +15,9 @@ aProxy 原样透传路径/查询/请求头到上游 `base_url`。请求失败（
 请求失败 3 次即透传真实响应——Claude Code 走非官方 API 时 /compact 无限卡住
 常因上游不支持 count_tokens，把它加进该配置即可解决，见 behaviors.md。）
 控制通道（status/stop/logs）走命名管道 IPC，**永不占用代理端口**。
+入站来源校验：带 `Origin` 头的请求（浏览器/Electron 类客户端）默认被本地 403
+拒绝，Host 也受校验（防 DNS 重绑定）——见 config-toml.md 的
+`allowed_hosts / allowed_origins`；CLI 类客户端（Claude Code 等）不受影响。
 
 两种配置文件分工（勿混淆）：
 - `config.toml`（~/.aproxy/config.toml）——人类可读可写，可多份平行并存（多开）
@@ -26,7 +29,7 @@ aProxy 原样透传路径/查询/请求头到上游 `base_url`。请求失败（
    不落盘）
 2. config.toml 显式配置的值（各实例独立）
 3. settings.json 全局默认（仅 `max_body_mb`、`disk_cache`、`forward_only`、
-   `bounded_retry_paths` 四个字段参与此层）
+   `bounded_retry_paths`、`allowed_hosts`、`allowed_origins` 六个字段参与此层）
 4. 内置默认值
 
 target 参数（start/stop/logs 的 `[目标]`）解析顺序：**别名 → `default` 保留字
@@ -61,6 +64,9 @@ compatibility.md 确认行为差异（旧版本可能缺字段、语义不同）
   不启动：目标没在运行会报错退出 1，首次启动用 `aproxy start`。
 - 端口占用排查：bind 失败分「被其他程序占用」与「无权限/被系统保留（Hyper-V
   排除区间）」，不要一律当占用处理——详见 behaviors.md 排障节。
+- 客户端收到本地 403 且文案提到 `allowed_origins`/`allowed_hosts`：不是上游
+  问题，是入站来源校验拒绝了请求（浏览器/Electron 类客户端会发 `Origin`），
+  按文案把对应 Origin/Host 加进配置并 restart，详见 config-toml.md。
 - 守护日志是 UTF-8（无 BOM），终端乱码是控制台代码页问题，进程入口已自动切
   65001，无需 chcp。
 - 日志文件按启动**随机命名**（文件名不含端口），且每次启动都是新文件——地址

@@ -1,5 +1,8 @@
 # Rust
-/target/
+# Build output. Besides /target, release builds and parallel agents use their own
+# CARGO_TARGET_DIR (target-rel, target-fix*, target-review, ...) so a production
+# instance locking one binary, or a concurrent cargo lock, does not block the rest.
+/target*/
 /Cargo.lock.bak
 
 # IDE
@@ -19,16 +22,31 @@ desktop.ini
 .env.*
 !.env.example
 
-# Agent memory (optional, keep .agents/ if team uses it)
-# .agents/memory/*.md are committed; ignore scratch files
-.agents/tmp/
-.agents/cache/
-
 # Logs
 *.log
-/target-rel/
 
 # npm 渠道组包产物（npm/build-and-publish.sh 生成，不进 git）
 /npm/@meowo/
 /.npm-assets/
-.worktree/
+
+# Claude Code's per-user settings (permission allowlists and the like) are
+# machine-specific; the skills under .claude/skills/ are shared and stay tracked.
+/.claude/settings.local.json
+
+# Keep user- and machine-specific agent records out of shared history.
+# A `.local` segment in a name marks a record local: MEMORY.local.md,
+# TODO.local.md, memory/<name>.local.md, plan/<name>.local.md.
+# Match the segment exactly. A looser `*.local*` also hides shared files whose
+# names merely contain "local" after a dot, such as i18n.locale.md.
+/.agents/**/*.local.*
+# Extensionless files and directories marked `.local` are local as well.
+/.agents/**/*.local
+
+# Worktrees have their own Git state and must not enter the main checkout's history.
+# Agents create them under .worktrees/ unless a client's worktree tool has its own
+# default location; Claude Code's tool uses .claude/worktrees/.
+/.worktrees/
+/.claude/worktrees/
+# Earlier convention: existing worktrees still live here (e.g. .worktree/unix-fixes on
+# fix/unix-first-test) and may hold unfinished work, so keep ignoring the old location.
+/.worktree/

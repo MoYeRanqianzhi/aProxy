@@ -3954,6 +3954,15 @@ async fn credentials_masked_in_logs_last_error_and_502() {
         .with_max_level(tracing::Level::INFO)
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
+    // 再保活一个空 Dispatch，让全进程已注册的 Dispatch 数 ≥ 2。tracing-core 在只
+    // 注册过一个 Dispatch 时走快速路径（0.1.36 callsite.rs 的 has_just_one /
+    // Rebuilder::JustOne）：某个 callsite 首次被命中时，只询问「命中它的那个线程」
+    // 的默认 subscriber。并行测试的其他线程上默认的是全局 NoSubscriber，于是
+    // Interest::never 被写进全局缓存，本线程之后来自同一 callsite 的事件全部被
+    // 丢弃。整个测试二进制并行跑时（Windows 上稳定复现）本测试因此捕获到空日志；
+    // 单独跑时本线程先命中各 callsite，问题不出现。已注册数 ≥ 2 后，callsite 注册
+    // 改为询问全部已注册的 Dispatch（含本测试的捕获 subscriber）。
+    let _second_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
 
     let with_userinfo = |url: &str| url.replacen("http://", "http://alice:BASEPASS123@", 1);
     let client = local_client();

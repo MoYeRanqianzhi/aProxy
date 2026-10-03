@@ -11,7 +11,7 @@
 - [protect-production-instances](memory/2026-09-07-protect-production-instances.md) — 铁律+教训：绝不 stop 用户生产实例（stop default 曾命中 12345 并实际停掉（已即时恢复））；破坏性测试前备好即时恢复 [[protect-production-instances]] [[daemon-model]]
 - [panic-abort-outlook](memory/2026-09-07-panic-abort-outlook.md) — abort 展望（遥遥无期）：实测省 32% 体积（4.06→2.77MB），待代码足够安全成熟且需更多优势时才考虑，须配看门狗 [[panic-abort-outlook]] [[daemon-model]]
 - [release-engineering](memory/2026-09-07-release-engineering.md) — 发布工程铁则：正式发布起 GitHub 必构建指令集多版本（baseline + x86-64-v3），必然项非展望 [[release-engineering]] [[daemon-model]]
-- [aproxy-cli-skill-versioning](memory/2026-09-07-aproxy-cli-skill-versioning.md) — aproxy-cli skill（.claude/skills/）版本化策略：latest 直改小版本、大版本才留存 references/<版本>/ 每版一 compatibility；CLI/配置/行为变更必须同步更新 skill [[aproxy-cli-skill-versioning]]
+- [aproxy-cli-skill-versioning](memory/2026-09-07-aproxy-cli-skill-versioning.md) — aproxy-cli skill（.claude/skills/）版本化策略：latest 直改小版本、大版本才留存 references/<版本>/ 每版一 compatibility（alpha→0.1.0 经用户同意不留存）；CLI/配置/行为变更必须同步更新 skill [[aproxy-cli-skill-versioning]]
 - [unix-first-test](memory/2026-09-10-unix-first-test.md) — unix 分支首次实机（Ubuntu）：看门狗曾整体失效+extern 符号名两处 P0 已修；mock Content-Length 错标教训；APROXY_RUN_DIR 平台语义待决策 [[daemon-model]] [[review-findings]]
 - [unix-stress-review](memory/2026-09-10-unix-stress-review.md) — 压力实测审查全记录：S1-S6 修复+独立复验+R1/R2 关闭（75afe6b）+纯净性核查（功能稿完整封装于 stash@{0}，HEAD 零残留，双平台复验全绿 p7 7/7）；分支可合并；并行 cargo 竞争假编译错误教训 [[unix-first-test]] [[identity-no-name]] [[daemon-model]]
 - [identity-no-name](memory/2026-09-10-identity-no-name.md) — 用户定调：进程身份判定严禁依赖二进制名称（严重谬误）；正确锚点=spawn 链/IPC 端点归属/创建时间戳；机制替换方案与范围（A 本分支全换/B 独立成支）待批，重构稿在 stash@{0} [[unix-stress-review]] [[criticism-not-authorization]]
@@ -19,9 +19,9 @@
 - [trusted-publishing-p0](memory/2026-09-11-trusted-publishing-p0.md) — 渠道 P0 落地：npm(@meowo 10 包)/crates.io/binstall 全自动 OIDC 发布（tag 即发）；关键坑：npm GAT IP 白名单杀 CI token 路径、npm TP 绑定强制人类 2FA 而 crates.io 有 API、cargo include 前导 / 锚定 [[daemon-model]]
 - [安全铁则：绝不按名杀 aproxy.exe](memory/2026-09-11-never-kill-aproxy-by-name.md) — 2026-09-11 实际事故：记忆 pid 过期+会话经 aproxy 代理，批量杀=断用户会话；测试守护只走 APROXY_HOME+stop <端口>
 - [install 实测深坑集](memory/2026-09-11-install-pitfalls.md) — tokio runtime drop 等无限任务须硬退/IPC 消失≠进程终止（退出码判死）/spawn_detached 只继承父 env（库层测试须 set_var）/测试端口 bind 试探+两段等待
-- [CI unix 编译盲区](memory/2026-09-11-ci-unix-blindspot.md) — 918ea33 的 unix job 红着没人看就报了收尾；push 后必须 gh run list 确认 CI 绿；unix-only 改动本地无法编译验证时交 WSL/CI 裁决
+- [CI unix 编译盲区](memory/2026-09-11-ci-unix-blindspot.md) — 918ea33 的 unix job 红着没人看就报了收尾；push 后必须 gh run list 确认 CI 绿；unix-only 改动本地无法编译验证时交 WSL/CI 裁决；现行 windows/ubuntu 为门禁、macos 已知红
 - [install 在线深度实测](memory/2026-09-12-install-online-deep-test.md) — WSL 3 轮 16 场景全 PASS；挖出在线主路径状态机缺口/skill 下载目录自毁/产物缺 755/版本回写缺失；musl 回退 + npm latest 兜底；测试 tag 发布全坑集
-- [release 版本对齐](memory/2026-09-12-release-version-alignment.md) — build+publish 双 job 对齐 tag 版本（python 显式 utf-8 + \r?\n + --allow-dirty）；alpha.10/11 被 t 标签抢注正式版顺延 alpha.12；测试 tag 一次性（失败必须 bump tN）
+- [release 版本对齐](memory/2026-09-12-release-version-alignment.md) — build+publish 双 job 对齐 tag 版本（python 显式 utf-8 + \r?\n + --allow-dirty）；alpha.10/11 被 t 标签抢注正式版顺延 alpha.12；测试 tag 一次性（失败必须 bump tN）；tN 被选版排除但仍会把 npm next 移到测试构建，演练建议改用 rc.N
 - [macOS 支持必须完成](memory/2026-09-12-macos-support-required.md) — 用户 2026-09-12 定调：后续协作者在 macOS 真机实现（2026-10-04：0.1.0 不处理 macOS，无测试机）；现状看护者/install 在 macOS 坏（/dev/shm 与 /proc 皆为 Linux 专用，is_aproxy_process 对活进程误判 false）；含逐行影响面、libproc 实现方向与验收标准
 - [install 三平台实测记录](memory/2026-09-11-install-three-platform-e2e.md) — Windows/Ubuntu/WSL 全量+e2e 全绿；挖出 5 个真 bug（unix 编译面×2、平台硬编码测试、库层 IPC 环境泄漏、有实例 swapping 续作状态机拒绝）；WSL TUN 劫持 TLS 的绕法与 e2e 脚本坑集
 - [仅转发模式](memory/2026-09-14-forward-only.md) — forward_only（alpha.12）：放弃重试/缓冲/心跳换真流式直通（可信上游的显式取舍），config.toml + settings.json 分层；分支点/流式/透传与「不得 unwrap」消费点约束 [[forward-only]] [[alias-settings]] [[disconnect-billing-protection]]

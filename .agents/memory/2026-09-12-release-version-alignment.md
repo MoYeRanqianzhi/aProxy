@@ -29,4 +29,18 @@ alpha.10 注册 → **正式号永久被占**（crates.io 不可删版本，yank
 - 正式发布前确认：build + publish 双 job 的对齐都在、npm dist-tags 与
   crates.io 版本列表无无后缀号冲突
 
+## 2026-10-04 补充：tN 测试 tag 与选版、npm next
+
+- **选版排除 tN**（0dc9440）：`aproxy install` 与三个安装脚本只认
+  `vX.Y.Z` / `vX.Y.Z-(alpha|beta|rc).N`。原因：semver 规定字母数字标识优先于
+  纯数字标识，`alpha.12t3 > alpha.17`，仓库里带全套资产的 alpha.12t3/11t1 会把
+  pre 通道用户「升级」到旧测试构建。推论：测试 tag 必须保持非文法形式，用文法
+  合法的号做测试会被用户渠道选中。
+- **npm 仍会被 tN 污染**：`npm/build-and-publish.sh` 对含 `-alpha` 的版本发
+  `next` dist-tag，tN 版本同样匹配，于是一次 tN 发布会把 `@next` 移到测试构建，
+  直到下一个真实预发布才移回；crates.io 照旧永久占号。
+- **建议（未经用户定调）**：0.1.0 起的发布演练用 `rc.N`。rc 本身就是演练用的
+  预发布号，文法合法，走 next 通道也正确，而 tN 会造成上面两种污染。
+  Recheck when：用户对演练方式另有决定，或 build-and-publish.sh 的 dist-tag 规则变化。
+
 相关：[[2026-09-12-install-online-deep-test]]、[[release-engineering]]

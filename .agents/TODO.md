@@ -10,16 +10,18 @@
 `.agents/review/2026-10-04-0.1.0发布前-13维审查.md`。硬验收：默认配置下无限重试
 对真实 Claude Code 端到端成立。macOS 不在本轮范围。
 
-- [ ] WS-1a 入站 Host/Origin 校验 + 凭据统一脱敏 + spool flush + ubuntu CI 测试修复
-- [ ] WS-1b 保活触发条件（Claude Code 发 Accept: application/json + stream:true，已实测）+ 首轮提交 + 在途心跳
-- [ ] WS-2 转换器进程池加固 + aproxy-format auto 模式
-- [ ] WS-3 身份判定去名称化 + 重拉换端口残留 + restart 预检 / stop --force 清理
-- [ ] WS-4 更新通道（默认只取稳定版）+ 滚动升级失败回滚
-- [ ] WS-5a CI/发布门禁、发布幂等、GLIBC 构建下限、workflow 权限、format 线隔离、npm dist-tag
-- [ ] WS-5b 一键脚本批量修复 + glibc 探测与 musl 回退
-- [ ] WS-6 文档与 skill 全量对齐、SECURITY.md、发布说明
-- [ ] 全量验证（Windows / ssh remote / WSL）+ 真实 Claude Code 无限重试验收 + 合并后审查
-- [ ] 所有者人工项：Trusted Publisher 绑定核对（aproxy-envelope、aproxy-format、@meowo/aproxy-format*）、release environment 保护规则、分支保护、CARGO_REGISTRY_TOKEN 迁入受保护环境
+- [x] WS-1a 入站 Host/Origin 校验 + 凭据统一脱敏 + spool flush + ubuntu CI 测试修复（已合并）
+- [ ] WS-1b 保活触发条件 + 首轮提交 + 在途心跳：已合并（b9b1f7d），独立对抗审查进行中
+- [x] WS-2 转换器进程池加固 + aproxy-format auto 模式（已合并；aproxy-format 需新的 format-v* 发版才生效）
+- [x] WS-3 身份判定去名称化 + 重拉换端口残留 + restart 预检 / stop --force 清理（已合并）
+- [x] WS-4 更新通道 + 滚动升级失败回滚（已合并；选版只认项目版本号文法，见 0dc9440）
+- [x] WS-5a CI/发布门禁、发布幂等、GLIBC 2.28 下限、workflow 权限、format 线隔离、npm dist-tag（已合并）
+- [x] WS-5b 一键脚本批量修复 + glibc 探测与 musl 回退（已合并；三脚本选版与 Rust 侧统一，0dc9440）
+- [ ] WS-6 文档与 skill 对齐：首轮已合并（d481ba7、b45a399）；补写 WS-1b/WS-4/WS-5a 的文档影响进行中
+- [ ] 全量验证（Windows / ssh remote / WSL）+ 真实 Claude Code 无限重试验收（>600s）+ 合并后审查
+- [ ] 发版前 bump Cargo.toml 版本为 0.1.0（文档已按 0.1.0 写）
+- [ ] 所有者人工项：Trusted Publisher 绑定核对（aproxy-envelope、aproxy-format、@meowo/aproxy-format*）、release environment 保护规则、分支保护、CARGO_REGISTRY_TOKEN 迁入受保护环境、开启私密漏洞报告（SECURITY.md 指向它，当前 enabled:false）
+- [ ] 0.1.0 之后：doctor 测试不隔离主目录——`doctor::run` 的目录扫描、默认配置与运行实例端口检查都从进程环境的 APROXY_HOME（未设 = ~/.aproxy）推导，开发机上 `doctor_clean_when_all_good` 会读到真实配置、可能误报失败。修法方向：从 settings.json 所在目录推导主目录并逐层传参。跑全量测试前先把 APROXY_HOME 指向临时目录可规避
 
 ## 外部转换器（format）+ aproxy-format（2026-09-23 下令，2026-09-30 完成）
 

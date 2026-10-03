@@ -47,5 +47,15 @@ install 功能收尾汇报「204 项测试全绿 + 已推送」时，`main` 分�
 教训：编译面 check 通过 ≠ 平台可用；把 job 从 check 升级为 test 必须当次
 就盯结论，不能默认「升完就绿」。
 
+## 现行 CI 结构（2026-10-04，WS-5a 之后）
+
+上文的「unix matrix」已拆掉。`.github/workflows/ci.yml`（workflow 名仍为 CI）现有
+三个独立 job：`windows`（clippy + test）、`ubuntu`（clippy + test）、`macos`
+（只跑 test，已知红，没有设 continue-on-error，红色就表示 macOS 支持未完成）。
+test 与 clippy 一律带 `--workspace`。判断能否收尾时按 job 看结论：`windows` 与
+`ubuntu` 是门禁，必须绿；`macos` 红属预期，但要确认失败的仍是已知的 3 个测试，
+没有新增失败（`gh run view <id> --job <job-id> --log-failed`）。
+Recheck when：ci.yml 的 job 结构变化，或 macOS 支持完成。
+
 相关：[[2026-09-11-never-kill-aproxy-by-name]]、[[2026-09-11-install-pitfalls]]、
 [[2026-09-12-install-online-deep-test]]

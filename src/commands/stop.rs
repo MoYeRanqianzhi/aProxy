@@ -2,7 +2,8 @@
 //!
 //! 两个命令共享完全相同的 target 语义（省略/PORT/all/ALIAS/idle [SECS]），
 //! 差异仅在「停止后」：stop 到此为止，restart 用原启动参数立即拉起。
-//! `--force` 改变停止方式：跳过 IPC 优雅关闭直接 TerminateProcess（零等待）。
+//! `--force` 改变停止方式：跳过 IPC 优雅关闭直接终止进程（零等待），终止前
+//! 按「pid + 进程创建时间」核验身份防 pid 复用误杀（与二进制名无关）。
 
 use aproxy::daemon;
 use aproxy::settings;
@@ -15,7 +16,7 @@ use crate::util::now_unix;
 pub(crate) enum StopMode {
     /// IPC shutdown + 轮询确认退出（优雅，在途请求 10s 宽限强退）
     Graceful,
-    /// TerminateProcess 立即终止（零等待；镜像名验证防 PID 复用误杀）
+    /// 立即终止进程（零等待；pid + 创建时间核验防 PID 复用误杀）
     Force,
 }
 
@@ -126,14 +127,24 @@ pub(crate) async fn handle_stop_cmd(target: Option<String>, threshold: Option<u6
     };
     let targets = resolve_stop_targets(target, threshold).await;
     for info in &targets {
-        stop_instance(info, mode).await;
+        // stop --force 的收尾：被强杀的守护来不及做优雅退出的自清，.restore
+        // 留着就是「崩溃」信号——默认开启的看门狗会在下一个扫描 tick 把它
+        // 拉回来，下次 aproxy restore 也会复活它，stop 语义落空。强杀成功后
+        // 由 CLI 按守护自清的同一顺序删除（先 .restore 后 .pid，再 socket/
+        // 心跳）。紧跟在终止之后执行：看护者在下一个 tick 才处理死亡事件，
+        // 读到的已是「无恢复记录 = 优雅退出」。只用于 stop——restart 的强杀
+        // 路径保留 .restore 作为新实例起不来时的自愈兜底。
+        if stop_instance(info, mode).await && mode == StopMode::Force {
+            crate::server::remove_registry_files(&info.listen_addr);
+        }
     }
 }
 
 /// 停止单个实例。
 /// Graceful：发 IPC shutdown，轮询确认退出（宽限 10 秒 + 余量）。
-/// Force：立即 TerminateProcess（镜像名验证后），不等任何确认——进程对象
-/// 的销毁是异步的，但信号已发，调用方（restart）由 IPC ping 就绪判定兜底。
+/// Force：立即终止（pid + 创建时间核验后，见 daemon::force_terminate），不等
+/// 任何确认——进程对象的销毁是异步的，但信号已发，调用方（restart）由新实例
+/// 的就绪判定兜底。
 pub(crate) async fn stop_instance(info: &daemon::InstanceInfo, mode: StopMode) -> bool {
     let port = daemon::port_of(&info.listen_addr).to_string();
     match mode {
@@ -156,7 +167,7 @@ pub(crate) async fn stop_instance(info: &daemon::InstanceInfo, mode: StopMode) -
                 false
             }
         },
-        StopMode::Force => match daemon::force_terminate(info.pid) {
+        StopMode::Force => match daemon::force_terminate(info).await {
             Ok(()) => {
                 println!("已强制终止 pid {}（端口 {}）", info.pid, port);
                 true

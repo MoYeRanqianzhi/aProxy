@@ -119,6 +119,10 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
         last_error_at: 0,
         swap_phase: false,
         log_path: daemon_log_path_str,
+        // 身份锚点：守护自查自写的进程创建时间（看门狗收养/处决/选举与
+        // stop --force 按「pid + 本值」防 pid 复用，与二进制名无关）。
+        // 读不到（无 /proc 的平台）落 0，各消费方按「未登记」保守降级
+        process_start: watchdog::process_start_time(std::process::id()).unwrap_or(0),
     };
     if let Err(e) = daemon::write_instance_file(&info) {
         tracing::warn!(error = %e, "实例注册表写入失败（不影响代理功能）");
@@ -310,8 +314,9 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
 /// 死亡事件若恰在两个 unlink 之间触发，读到的状态是「无恢复记录」= 优雅退出；
 /// 反序则会误判为崩溃而重拉一个用户刚停掉的实例。末尾顺带清 IPC 端点文件与
 /// 心跳文件（Windows 侧均为内核回收，这两个调用是 no-op；unix 清 unix socket
-/// 与 /dev/shm 心跳，消除残留）。
-fn remove_registry_files(listen_addr: &str) {
+/// 与 /dev/shm 心跳，消除残留）。`stop --force` 强杀成功后由 CLI 代为执行
+/// 同一清理（被强杀的守护来不及自清），顺序语义相同。
+pub(crate) fn remove_registry_files(listen_addr: &str) {
     daemon::remove_restore_file(listen_addr);
     daemon::remove_instance_file(listen_addr);
     watchdog::remove_heartbeat_file(daemon::port_of(listen_addr));

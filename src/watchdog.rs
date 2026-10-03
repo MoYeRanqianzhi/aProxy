@@ -29,9 +29,9 @@ use std::time::Duration;
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct WatchdogClaim {
     pub pid: u32,
-    /// 看护进程的创建时刻（100ns 单位的 Windows FILETIME；unix 为
-    /// 进程启动的 Unix 秒）。跨平台语义统一为「进程启动时间戳」，
-    /// 比较只在同平台进行。
+    /// 看护进程的创建时刻（100ns 单位的 Windows FILETIME；Linux 为
+    /// /proc/<pid>/stat 的 starttime 时钟滴答）。跨平台语义统一为「进程
+    /// 启动时间戳」，比较只在同平台进行。
     pub created_at_process: u64,
     /// 看护者最近一次心跳续写时刻（Unix 秒）。看护者每周期续写；
     /// 超过 3×心跳周期未更新 = 看护者假死。
@@ -133,23 +133,113 @@ pub fn process_exited(pid: u32) -> Option<bool> {
     imp_process::process_exited(pid)
 }
 
-/// 该 PID 是否为 aProxy 进程（镜像名验证）。
-/// 一切「主动杀」动作（--force、看门狗挂死终止）前的防误杀关卡。
-pub fn is_aproxy_process(pid: u32) -> bool {
-    imp_process::is_aproxy_process(pid)
-}
-
 /// 进程镜像的完整路径（install 管辖检查用：实例 exe 是否在 ~/.aproxy/bin/
 /// 下）。查询失败（进程刚死/权限）→ None——调用方按「不可判 → 不拦」处理
 /// （管辖检查只拦「确认在管辖外」，误拦的代价是安装不可用）。
+/// 注意这是「装在哪」的管辖判断，**不是**进程身份判断——身份一律走
+/// record_identity（pid + 创建时间），与二进制路径/名称无关。
 pub fn process_image_path(pid: u32) -> Option<PathBuf> {
     imp_process::process_image_path(pid)
 }
 
-/// 终止经身份验证的进程（install 换血用：停旧看护者）。防冒名验证内置——
-/// pid 被复用给无关进程时拒绝执行，宁可漏杀不误杀。
-pub fn terminate_verified_process(pid: u32) {
-    imp::terminate_verified(pid);
+// ---------------------------------------------------------------------------
+// 进程身份：pid + 进程创建时间戳（与二进制名称无关）
+// ---------------------------------------------------------------------------
+//
+// 身份问的是「这个 pid 现在是不是写下这条记录的那个进程」，由归属关系决定，
+// 与二进制叫什么无关（用户定调：名称判断是严重谬误——官方 Release 资产名
+// 本身就是 aproxy-<target>(.exe)，改名部署是合法形态；冒名进程改名即可绕过
+// 名称比对，它对安全零贡献）。项目里可用的锚点有三个：
+// 1. spawn 链：看护者亲手 spawn 并等到就绪的 pid 直接可信；
+// 2. IPC 端点归属：应答 `<端口>` 端点 ping、且自报 pid 与记录一致的进程，
+//    就是该端口的实例——协议应答是最强的归属证明，但挂死实例不应答，
+//    所以它只能作为「旧记录无时间戳」时的补充，不能作为唯一判据；
+// 3. 进程创建时间戳：守护注册时把自己的创建时间写进注册表（InstanceInfo.
+//    process_start），看护者 claim 同理（created_at_process）。pid 被复用后
+//    新进程的创建时间必然不同，比对它就能把「同一个进程」钉死，且不需要
+//    对方应答（挂死实例同样可判）。
+
+/// 一条记录（pid + 登记的创建时间）在当前系统上的身份核验结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordIdentity {
+    /// 记录的进程仍在运行：实测创建时间与登记值一致（携带实测值）
+    Alive(u64),
+    /// 记录没有登记创建时间（0：旧版本守护的注册表、或平台读不到），而该
+    /// pid 当前有一个在运行的进程——是不是记录里那个，无从核验（携带实测值）
+    Unverifiable(u64),
+    /// 该 pid 当前有在运行的进程，但创建时间与登记值不符：pid 已被系统
+    /// 回收后复用，记录的进程早已死亡
+    Reused,
+    /// 该 pid 当前没有在运行的进程（不存在、已退出未回收的 zombie、或只剩
+    /// 被句柄维持的已退出进程对象）
+    Gone,
+}
+
+/// 核验记录身份：`recorded_start` 为记录登记的进程创建时间（0 = 未登记）。
+/// 「已退出但进程对象仍在」（unix zombie、Windows 被句柄维持的已退出对象）
+/// 一律算 Gone——它们的创建时间仍查得到且与登记一致，但进程已死，不能计入
+/// 选举的存活集合，也不该被收养或处决。
+pub fn record_identity(pid: u32, recorded_start: u64) -> RecordIdentity {
+    let Some(actual) = process_start_time(pid) else {
+        return RecordIdentity::Gone;
+    };
+    if process_exited(pid) == Some(true) {
+        return RecordIdentity::Gone;
+    }
+    if recorded_start == 0 {
+        RecordIdentity::Unverifiable(actual)
+    } else if actual == recorded_start {
+        RecordIdentity::Alive(actual)
+    } else {
+        RecordIdentity::Reused
+    }
+}
+
+/// 核验后终止：仅当 pid 当前对应进程的创建时间 == `expected_start` 时终止
+/// （SIGKILL / TerminateProcess，不做优雅关闭）。用于 `stop --force`、接管
+/// 假死前任看护者、install 换血停旧看护者——一切「按记录主动杀」的动作。
+///
+/// - Windows：在**同一个进程句柄**上先 GetProcessTimes 核验、后
+///   TerminateProcess。句柄打开后即钉住该进程对象（其 pid 在句柄关闭前不会
+///   被复用），核验与终止之间不存在 pid 复用窗口。
+/// - unix：读 /proc/<pid>/stat 的 starttime 核验后 kill(pid, SIGKILL)。核验与
+///   kill 之间仍有理论窗口（无 pidfd 时的平台固有边界），需要进程恰在这
+///   微秒级窗口内退出、且 pid 恰被回收再分配才会误中。
+///
+/// `expected_start == 0` 不是可比对的锚点，直接拒绝。不符/已退出/终止失败
+/// 均返回 Err（信息已含原因）——宁可漏杀不误杀。
+pub fn terminate_verified_process(pid: u32, expected_start: u64) -> Result<(), String> {
+    if expected_start == 0 {
+        return Err(format!(
+            "pid {pid} 没有登记进程创建时间，无法核验身份，拒绝终止以防误杀"
+        ));
+    }
+    imp::terminate_verified(pid, expected_start)
+}
+
+/// 收养/回归时的注册表记录核验：「该 pid 当前就是写下这条记录的守护」。
+/// 通过返回核验时的实测创建时间（作为 Watched.start_time，后续处决关卡与
+/// 句柄补挂的比对基准），不通过返回 None。
+///
+/// - 登记了创建时间（当前版本守护）：时间戳比对即身份证明，**不要求实例
+///   应答**——挂死实例恰恰最需要被收养（随后由健康扫描判挂死处决重拉）。
+/// - 未登记（旧版本守护）：退回 IPC 端点归属证明——ping 该端口，应答者自报
+///   pid 与记录一致才收养。旧记录挂死时不会被收养，这是升级窗口内的保守
+///   降级（宁可暂不看护，不收编身份不明的 pid）；install/restart 换上新版本
+///   守护后记录自然带上时间戳。
+async fn confirm_registered_instance(
+    run_dir: &Path,
+    port: &str,
+    info: &crate::daemon::InstanceInfo,
+) -> Option<u64> {
+    match record_identity(info.pid, info.process_start) {
+        RecordIdentity::Alive(start) => Some(start),
+        RecordIdentity::Unverifiable(start) => {
+            let live = crate::daemon::ipc_ping_in(run_dir, port).await.ok()?;
+            (live.pid == info.pid).then_some(start)
+        }
+        RecordIdentity::Reused | RecordIdentity::Gone => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -157,22 +247,49 @@ pub fn terminate_verified_process(pid: u32) {
 // ---------------------------------------------------------------------------
 
 /// 选举：本进程是否有权发起 spawn 看护者。
-/// 规范：枚举 run/ 注册表探活得存活实例集合，本进程 PID 是集合最小者
+/// 规范：枚举 run/ 注册表得存活实例集合，本进程 PID 是集合最小者
 /// 才有权（N 个守护同时发现缺席时收敛到 1 个发起者）。无存活实例
-/// （或本进程不在注册表）时视为有权——孤守护（注册表丢失）也要能自保。
+/// （或本进程不在注册表）时视为有权——孤守护（注册表丢失）也要能自保，
+/// `aproxy start` 的 CLI 父进程也据此总能在实例就绪后立即补上看护者。
 pub fn this_process_may_spawn_watchdog_in(run_dir: &Path) -> bool {
-    let my_pid = std::process::id();
-    let mut min_alive: Option<u32> = None;
-    for pid in crate::daemon::registry_pids_in(run_dir) {
-        // 只把「真正存活的 aProxy 实例」计入集合（PID 复用防冒名同款逻辑）
-        if imp_process::is_aproxy_process(pid) && min_alive.is_none_or(|m| pid < m) {
-            min_alive = Some(pid);
-        }
+    may_spawn_watchdog(
+        std::process::id(),
+        &crate::daemon::registry_instances_in(run_dir),
+        |info| record_identity(info.pid, info.process_start),
+    )
+}
+
+/// 选举的纯判定核（身份核验注入，单测可构造任意进程状态）。
+///
+/// 存活集合只收 `Alive`（pid + 登记创建时间核验通过）。不用 IPC ping 判
+/// 存活：挂死实例不应答，却仍是需要看护的在世实例。两个误判方向代价不对称：
+/// - 把死记录/复用 pid 误算「活」：若它的 pid 更小，所有人都让位给一个不
+///   存在的发起者，看护者永远没人拉起——不可接受；
+/// - 把活实例漏算：可能多个守护同时自认最小而并发 spawn，claim 原子接管
+///   保证最终只有一个在任，代价只是几个短命进程。
+///
+/// 所以无从核验的旧版本记录（Unverifiable）与 Reused/Gone 一律不计入，
+/// 宁可多发起、不可无人发起。
+///
+/// 本进程不在在世集合里（`aproxy start` 的 CLI 父进程；注册表丢失的孤守护）
+/// 视为有权：排序只用来收敛「多个在册守护的周期自检同时发现缺席」，CLI 的
+/// pid 与守护 pid 之间的大小毫无意义——若按它让位，start 时有更早启动的
+/// 实例就拉不起看护者，只能干等守护最长 5 分钟一次的自检。多发起的代价由
+/// claim 原子接管兜住。
+fn may_spawn_watchdog(
+    my_pid: u32,
+    records: &[crate::daemon::InstanceInfo],
+    identity: impl Fn(&crate::daemon::InstanceInfo) -> RecordIdentity,
+) -> bool {
+    let alive: Vec<u32> = records
+        .iter()
+        .filter(|info| matches!(identity(info), RecordIdentity::Alive(_)))
+        .map(|info| info.pid)
+        .collect();
+    if !alive.contains(&my_pid) {
+        return true;
     }
-    match min_alive {
-        Some(m) => my_pid <= m,
-        None => true,
-    }
+    alive.iter().all(|&pid| my_pid <= pid)
 }
 
 /// 看护者 spawn 参数：从当前进程命令行还原（与 restore 同思路），
@@ -246,6 +363,10 @@ struct Watched {
     handle: isize,
     /// 本实例连续重拉失败次数（crashloop 防护计数，重拉成功清零）
     consecutive_failures: u32,
+    /// 收养/重拉收编时实测的进程创建时间：处决关卡与句柄补挂据此确认
+    /// 「pid 仍是当初收编的那个进程」（pid 复用后必然不符）。0 = 收编时
+    /// 已测不到（进程刚死），此后任何核验都不会通过——宁可不杀不挂。
+    start_time: u64,
 }
 
 /// 待重试的崩溃实例（重拉失败后的退避队列条目）。
@@ -305,36 +426,58 @@ impl WatchdogState {
             // 已在看护的端口：只处理句柄缺失的条目（respawn 成功但 open 句柄
             // 失败的兜底——原注释「下轮补挂」曾因端口去重永远走不到，H1）。
             // 句柄有效则跳过（死亡 watcher 已挂，重复挂会双发死亡事件）。
-            if let Some(w) = self.watched.iter().find(|w| w.port == entry.port) {
-                if w.handle == 0
-                    && let Some(h) = imp::open_sync_handle(w.pid)
-                {
-                    // 借用拆分：iter 的借用已结束，直接改字段 + spawn
-                    let (port, pid) = (w.port.clone(), w.pid);
-                    let idx = self.watched.iter().position(|w| w.port == port).unwrap();
-                    self.watched[idx].handle = h;
-                    self.spawn_death_watcher(port, pid, h);
+            if let Some(idx) = self.watched.iter().position(|w| w.port == entry.port) {
+                let (port, pid, handle, start) = {
+                    let w = &self.watched[idx];
+                    (w.port.clone(), w.pid, w.handle, w.start_time)
+                };
+                if handle == 0 {
+                    // 补挂前先核验身份：句柄缺失期间进程可能已死、pid 被复用，
+                    // 对复用后的 pid 开句柄等于把无关进程纳入看护（之后还可能
+                    // 被当挂死处决）。核验不过 = 收编的那个进程已不在：没有句柄
+                    // 就永远等不到它的死亡事件，在这里补发一个，让它走常规死亡
+                    // 处置（.restore 在则重拉）而不是悬空占位。
+                    if let RecordIdentity::Alive(_) = record_identity(pid, start) {
+                        if let Some(h) = imp::open_sync_handle(pid) {
+                            self.watched[idx].handle = h;
+                            self.spawn_death_watcher(port, pid, h);
+                        }
+                    } else {
+                        let _ = self.death_tx.send((port, pid));
+                    }
                 }
                 continue;
             }
-            // 实例身份建立：注册 PID 必须是活着的 aProxy 进程（PID 复用防冒名）。
-            // 不通过（刚死/被复用）→ 跳过，下轮再看（restore 记录仍在，等
-            // respawn 路径或真实实例出现）
+            // 实例身份建立（与二进制名称无关）：注册表记录核验为「仍是写下
+            // 它的那个守护」才收养——登记了创建时间的比对时间戳，旧版本记录
+            // 退回 IPC 端点归属证明（见 confirm_registered_instance）。不通过
+            // （刚死/pid 被复用/旧记录不应答）→ 跳过，下轮再看（.restore 仍在，
+            // 等 respawn 路径或真实实例出现）
             let Some(info) = read_registry_info(&self.cfg.run_dir, &entry.port) else {
                 continue;
             };
-            if !imp_process::is_aproxy_process(info.pid) {
+            let Some(start) =
+                confirm_registered_instance(&self.cfg.run_dir, &entry.port, &info).await
+            else {
                 continue;
-            }
+            };
             let Some(handle) = imp::open_sync_handle(info.pid) else {
                 continue;
             };
+            // 开句柄后复核：核验与开句柄之间进程若恰好退出、pid 被复用，句柄
+            // 指向的就是无关进程。Windows 句柄此刻已钉住进程对象，复核通过
+            // 即此后再无复用可能；unix 句柄即 pid，复核把窗口收窄到微秒级
+            if process_start_time(info.pid) != Some(start) {
+                imp::close_handle(handle);
+                continue;
+            }
             tracing::info!(port = %entry.port, pid = info.pid, "看护者收养实例");
             self.watched.push(Watched {
                 port: entry.port.clone(),
                 pid: info.pid,
                 handle,
                 consecutive_failures: 0,
+                start_time: start,
             });
             self.spawn_death_watcher(entry.port.clone(), info.pid, handle);
             adopted.push(entry.port);
@@ -354,8 +497,8 @@ impl WatchdogState {
 
     /// 健康扫描：心跳过期者走 IPC ping 二意见，都失败判挂死 → 杀 → 死亡事件
     /// 走统一 respawn 路径。杀的边界按平台：Windows 句柄绑定原进程，无 PID
-    /// 复用风险；unix 是裸 SIGKILL(pid)，处决前以 is_aproxy_process 做防误杀
-    /// 关卡（见下）——句柄语义差异由该关卡收敛到等效安全性。
+    /// 复用风险；unix 是裸 SIGKILL(pid)，处决前以「pid + 收编时实测的创建
+    /// 时间」做防误杀关卡（见下）——句柄语义差异由该关卡收敛到等效安全性。
     /// 返回被判挂死的端口（测试断言用）。
     pub async fn health_scan(&mut self) -> Vec<String> {
         let stale_ms = self.cfg.scan_secs * 1000 * (self.cfg.stale_after_cycles.max(1) + 1);
@@ -375,11 +518,16 @@ impl WatchdogState {
             }
             // 防误杀关卡：「主动杀」前的既定验证。pid 若被复用给无关进程，
             // 心跳/IPC 失效的表现与「实例挂死」不可区分，但那个进程是无辜的。
-            // unix 的裸 SIGKILL 尤其依赖此关（Windows 侧为冗余的第二道验证）。
-            // 候选已死（zombie/reaped）时关卡判 false → 跳过处决，死亡事件由
+            // 判据是收编时实测的创建时间（与二进制名无关：改名部署的守护
+            // 时间戳不变照常处决，复用 pid 的进程时间戳必然不同）。unix 的
+            // 裸 SIGKILL 尤其依赖此关（Windows 侧为冗余的第二道验证）。
+            // 候选已死（zombie/reaped）时判 Gone → 跳过处决，死亡事件由
             // watcher 兜底
-            if !imp_process::is_aproxy_process(w.pid) {
-                tracing::warn!(port = %w.port, pid = w.pid, "挂死候选的 pid 已非 aProxy 进程（疑似复用），跳过处决");
+            if !matches!(
+                record_identity(w.pid, w.start_time),
+                RecordIdentity::Alive(_)
+            ) {
+                tracing::warn!(port = %w.port, pid = w.pid, "挂死候选的 pid 已不是收编时的进程（已退出或被复用），跳过处决");
                 continue;
             }
             tracing::error!(port = %w.port, pid = w.pid, "实例心跳过期且 IPC 无响应，判定挂死，终止进程");
@@ -450,8 +598,8 @@ impl WatchdogState {
 
         tracing::warn!(port = %port, "实例崩溃，立即重拉");
         match respawn_instance(&self.cfg.run_dir, port).await {
-            Ok(pid) => {
-                self.admit_respawned(port, pid);
+            Ok((pid, actual_port)) => {
+                self.admit_respawned_at(port, &actual_port, pid);
                 DeathOutcome::Respawned(pid)
             }
             Err(e) => self.queue_retry(port, failures, e),
@@ -475,7 +623,7 @@ impl WatchdogState {
             let p = self.pending.remove(i);
             tracing::info!(port = %p.port, attempt = p.failures + 1, "退避到期，重试重拉");
             match respawn_instance(&self.cfg.run_dir, &p.port).await {
-                Ok(pid) => self.admit_respawned(&p.port, pid),
+                Ok((pid, actual_port)) => self.admit_respawned_at(&p.port, &actual_port, pid),
                 Err(e) => {
                     self.queue_retry(&p.port, p.failures, e);
                 }
@@ -489,16 +637,42 @@ impl WatchdogState {
         self.pending.iter().map(|p| p.next_retry).min()
     }
 
-    /// 重拉成功后的重新收养：开句柄挂死亡 watcher；开不出则 handle=0 留给
-    /// adopt_scan 补挂（见 adopt_scan 开头分支）。
+    /// 重拉成功后按**实际端口**收编（watchdog-01）：重拉用的是 .restore 里
+    /// 的原参数，但新守护监听哪个端口由它此刻读到的配置决定——用户改了
+    /// config.toml 端口却没 restart、或 listen 端口为 0，新实例都会落在别的
+    /// 端口。看护键必须是实际端口：若沿用死亡端口，同一 pid 会被死亡端口
+    /// 与（下轮 adopt_scan 收养的）实际端口双重看护；旧端口 .restore 也残留，
+    /// 用户 stop 新端口后看护者凭它把实例无限复活。实际端口与死亡端口不同
+    /// 时，退役死亡端口的记录（旧进程已确认死亡，记录已被新实例取代）。
+    fn admit_respawned_at(&mut self, dead_port: &str, actual_port: &str, pid: u32) {
+        if crate::daemon::retire_moved_port_records_in(&self.cfg.run_dir, dead_port, actual_port) {
+            tracing::warn!(
+                old_port = %dead_port,
+                new_port = %actual_port,
+                pid,
+                "实例重拉后落在新端口（配置已改端口或端口为 0），已清理旧端口的恢复记录"
+            );
+        }
+        self.admit_respawned(actual_port, pid);
+    }
+
+    /// 重拉/回归成功后的重新收养：开句柄挂死亡 watcher；开不出则 handle=0
+    /// 留给 adopt_scan 补挂（见 adopt_scan 开头分支）。pid 来自 spawn 链（看护
+    /// 者亲手拉起并等到就绪）或已核验的回归记录，直接可信——此刻实测的创建
+    /// 时间作为它后续处决/补挂的身份基准。
     fn admit_respawned(&mut self, port: &str, pid: u32) {
         tracing::info!(port = %port, new_pid = pid, "实例已重拉并就绪");
+        // 先开句柄再测创建时间：Windows 句柄一旦打开就钉住进程对象，随后按
+        // pid 测得的必是同一对象的时间（反序则两次调用之间进程若恰好退出、
+        // pid 被复用，基准与句柄会分属两个进程）
         let handle = imp::open_sync_handle(pid).unwrap_or(0);
+        let start_time = process_start_time(pid).unwrap_or(0);
         self.watched.push(Watched {
             port: port.to_string(),
             pid,
             handle,
             consecutive_failures: 0,
+            start_time,
         });
         if handle != 0 {
             self.spawn_death_watcher(port.to_string(), pid, handle);
@@ -622,15 +796,18 @@ impl WatchdogState {
     }
 
     /// 安装态死亡复查：等 install 以新 exe 重新拉起实例（注册表记录重新
-    /// 出现——优雅退出会删文件，回归 = 记录带着新 pid 重现）且新 pid 通过
-    /// 身份判定（防 PID 复用，与 adopt 同关）。5×3s 覆盖 stop+spawn+ready
-    /// 通常 2-3s、上限 10s 的窗口。
+    /// 出现——优雅退出会删文件，回归 = 记录带着新 pid 重现）且新记录通过
+    /// 身份核验（与 adopt 同关：pid + 登记创建时间，旧版本记录退回 IPC 归属
+    /// 证明；与新旧二进制叫什么、是否刚被换掉无关）。5×3s 覆盖
+    /// stop+spawn+ready 通常 2-3s、上限 10s 的窗口。
     async fn wait_for_install_restart(&self, port: &str, old_pid: u32) -> Option<u32> {
         for _ in 0..5 {
             tokio::time::sleep(Duration::from_secs(3)).await;
             if let Some(info) = read_registry_info(&self.cfg.run_dir, port)
                 && info.pid != old_pid
-                && imp_process::is_aproxy_process(info.pid)
+                && confirm_registered_instance(&self.cfg.run_dir, port, &info)
+                    .await
+                    .is_some()
             {
                 tracing::info!(port = %port, new_pid = info.pid, "安装态复查：实例已以新 pid 回归，重新收养");
                 return Some(info.pid);
@@ -693,9 +870,7 @@ pub fn backoff_delay_secs(consecutive_failures: u32) -> u64 {
 
 /// 读注册表文件获取实例信息（收养时的身份基线）
 fn read_registry_info(run_dir: &Path, port: &str) -> Option<crate::daemon::InstanceInfo> {
-    let path = crate::daemon::instance_file_path_in(run_dir, port);
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    crate::daemon::read_instance_file_in(run_dir, port)
 }
 
 /// 当前 Unix 秒
@@ -706,9 +881,11 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// 按 .restore 记录重拉实例并等待 IPC 就绪（8s，与 restore/start 一致）。
-/// 成功返回新 PID；注册表缺失记录的实例恢复（实例文件由守护 bind 后自写）。
-async fn respawn_instance(run_dir: &Path, port: &str) -> Result<u32, String> {
+/// 按 .restore 记录重拉实例并等待就绪（8s，与 restore/start 一致）。
+/// 成功返回 (新 PID, 新实例实际监听的端口)——后者取自新 pid 的注册表记录
+/// （守护按 bind 后的实际地址自写），可能与 `port`（死亡端口）不同，调用方
+/// 据此决定看护键并退役旧端口记录（见 admit_respawned_at）。
+async fn respawn_instance(run_dir: &Path, port: &str) -> Result<(u32, String), String> {
     let entries = crate::daemon::list_restore_entries_in(run_dir);
     let entry = entries
         .iter()
@@ -738,8 +915,8 @@ async fn respawn_instance(run_dir: &Path, port: &str) -> Result<u32, String> {
     // 误判为优雅退出、静默失去自动恢复（P6 死亡风暴实测）。
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     loop {
-        if crate::daemon::registry_contains_pid_in(run_dir, pid) {
-            return Ok(pid);
+        if let Some(info) = crate::daemon::registry_find_pid_in(run_dir, pid) {
+            return Ok((pid, crate::daemon::port_of(&info.listen_addr).to_string()));
         }
         if std::time::Instant::now() > deadline {
             return Err("重拉后 IPC 未在预期时间内就绪".to_string());
@@ -767,17 +944,19 @@ pub async fn serve(cfg: WatchdogConfig) {
             tracing::info!("已有在任的看护者，本进程退出（选举唯一性）");
             return;
         }
-        // 无效 claim：先杀掉「活着但假死」的前任（身份可验证才杀——PID 复用
-        // 防冒名的最后一道关），再原子接管
+        // 无效 claim：先杀掉「活着但假死」的前任，再原子接管。身份 = claim
+        // 里前任自写的 pid + 创建时间（与二进制名无关：改名部署的看护者同样
+        // 该被正常接管；pid 被复用给无关进程则时间必然不符，不会误杀）。
+        // 终止本身也在同一核验下执行（Windows 同句柄先核验后终止）
         if let Some(old) = read_claim_in(&cfg.run_dir) {
-            let old_alive = imp_process::is_aproxy_process(old.pid)
-                && verify_claim_identity(old.pid, old.created_at_process);
-            if old_alive {
+            if verify_claim_identity(old.pid, old.created_at_process) {
                 tracing::error!(
                     pid = old.pid,
                     "前任看护者仍在但心跳过期（假死），终止后接管"
                 );
-                imp::terminate_verified(old.pid);
+                if let Err(e) = terminate_verified_process(old.pid, old.created_at_process) {
+                    tracing::warn!(pid = old.pid, error = %e, "终止假死前任失败");
+                }
             }
             remove_claim_in(&cfg.run_dir);
         }
@@ -974,15 +1153,42 @@ mod imp {
         }
     }
 
-    /// 杀掉经身份验证的假死前任看护者（claim 记录的 PID + 创建时间已验证，
-    /// PID 复用冒名在此被拒绝）。验证失败静默返回——宁可漏杀不误杀。
-    pub fn terminate_verified(pid: u32) {
-        if !super::imp_process::is_aproxy_process(pid) {
-            return;
-        }
-        if let Some(h) = open_sync_handle(pid) {
-            terminate_handle(h);
-            close_handle(h);
+    /// 核验后终止（语义见 super::terminate_verified_process）：同一句柄上
+    /// 先 GetProcessTimes 比对创建时间、再 TerminateProcess——句柄钉住进程
+    /// 对象，两步之间 pid 不可能被复用。已退出的进程（退出码非 STILL_ACTIVE）
+    /// 按「已退出」报错，不当作终止成功。
+    pub fn terminate_verified(pid: u32, expected_start: u64) -> Result<(), String> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+            TerminateProcess,
+        };
+        unsafe {
+            let h = OpenProcess(
+                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                pid,
+            );
+            if h == 0 {
+                return Err(format!("无法打开 pid {pid}（进程可能已退出）"));
+            }
+            let mut code: u32 = 0;
+            let result = if super::imp_process::handle_start_time(h) != Some(expected_start) {
+                Err(format!(
+                    "pid {pid} 的进程创建时间与登记不符（pid 已被复用），拒绝终止以防误杀"
+                ))
+            } else if GetExitCodeProcess(h, &mut code) != 0 && code != 259 {
+                Err(format!("pid {pid} 已退出"))
+            } else if TerminateProcess(h, 1) == 0 {
+                Err(format!(
+                    "终止 pid {pid} 失败（{}）",
+                    std::io::Error::last_os_error()
+                ))
+            } else {
+                Ok(())
+            };
+            let _ = CloseHandle(h);
+            result
         }
     }
 }
@@ -1046,13 +1252,31 @@ mod imp {
         }
     }
     pub fn close_handle(_handle: isize) {}
-    /// 杀掉经身份验证的假死前任看护者：身份由调用方把关（is_aproxy_process
-    /// 的 /proc exe 比对 + verify_claim_identity 的 starttime 比对），此处
-    /// 只负责 SIGKILL。unix 上无句柄对象，直接按 pid 杀——claim 记录到被
-    /// 杀之间的复用窗口由上述双重验证封住。
-    pub fn terminate_verified(pid: u32) {
-        unsafe {
-            kill(pid as i32, 9);
+    /// 核验后终止（语义见 super::terminate_verified_process）：/proc 的
+    /// starttime 比对通过、且进程未退出（非 zombie）才 SIGKILL。unix 无可
+    /// 钉住进程的句柄对象，核验与 kill 之间的微秒级窗口是平台固有边界。
+    /// 无 /proc 的平台读不到创建时间，一律按「已退出/不可核验」拒绝。
+    pub fn terminate_verified(pid: u32, expected_start: u64) -> Result<(), String> {
+        match super::imp_process::process_start_time(pid) {
+            None => return Err(format!("pid {pid} 已退出（或无法读取进程创建时间）")),
+            Some(actual) if actual != expected_start => {
+                return Err(format!(
+                    "pid {pid} 的进程创建时间与登记不符（pid 已被复用），拒绝终止以防误杀"
+                ));
+            }
+            Some(_) => {}
+        }
+        if super::imp_process::process_exited(pid) == Some(true) {
+            return Err(format!("pid {pid} 已退出"));
+        }
+        let r = unsafe { kill(pid as i32, 9) };
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "终止 pid {pid} 失败（{}）",
+                std::io::Error::last_os_error()
+            ))
         }
     }
 }
@@ -1204,41 +1428,40 @@ mod imp_process {
     pub fn process_start_time(pid: u32) -> Option<u64> {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{
-            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if handle == 0 {
                 return None;
             }
-            let mut creation: i64 = 0;
-            let mut exit: i64 = 0;
-            let mut kernel: i64 = 0;
-            let mut user: i64 = 0;
-            let ok = GetProcessTimes(
+            let start = handle_start_time(handle);
+            let _ = CloseHandle(handle);
+            start
+        }
+    }
+
+    /// 已打开进程句柄（需 PROCESS_QUERY_LIMITED_INFORMATION）的创建时间
+    /// （FILETIME 100ns）。核验后终止要在同一句柄上取时间，故单独成函数。
+    pub fn handle_start_time(handle: isize) -> Option<u64> {
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+        let mut creation: i64 = 0;
+        let mut exit: i64 = 0;
+        let mut kernel: i64 = 0;
+        let mut user: i64 = 0;
+        let ok = unsafe {
+            GetProcessTimes(
                 handle,
                 &mut creation as *mut i64 as *mut _,
                 &mut exit as *mut i64 as *mut _,
                 &mut kernel as *mut i64 as *mut _,
                 &mut user as *mut i64 as *mut _,
-            );
-            let _ = CloseHandle(handle);
-            if ok == 0 {
-                return None;
-            }
-            Some(creation as u64)
-        }
-    }
-
-    /// 是否 aProxy 进程：镜像名比对（看门狗对 PID 复用的第二道防线——
-    /// 纯死亡检测不需要它；任何「主动杀」动作前必须过这道验证）。
-    pub fn is_aproxy_process(pid: u32) -> bool {
-        let Some(path) = process_image_path(pid) else {
-            return false;
+            )
         };
-        let name = path.to_string_lossy().to_string();
-        let base = name.rsplit(['\\', '/']).next().unwrap_or("");
-        base.eq_ignore_ascii_case("aproxy.exe")
+        if ok == 0 {
+            return None;
+        }
+        Some(creation as u64)
     }
 
     /// 进程是否已退出：OpenProcess + GetExitCodeProcess。退出后即使进程
@@ -1313,28 +1536,6 @@ mod imp_process {
         fields.get(19)?.parse().ok()
     }
 
-    /// 是否 aProxy 进程：/proc/<pid>/exe 指向实际二进制，比对 basename。
-    /// 判定分三档：
-    /// - readlink 成功：比对 basename（Linux 二进制无 .exe 后缀；二进制被
-    ///   原地替换后内核附加「 (deleted)」后缀，剥除后再比——swap 升级场景下
-    ///   正在运行的进程不该因此被判定为异己）
-    /// - ENOENT：进程已死（含 zombie，exe 随地址空间一并消失）→ false。
-    ///   选举不再被注册表死条目卡住、收养不再收编死条目（与 Windows 的
-    ///   OpenProcess 失败即拒收对齐）
-    /// - 其他失败（跨用户权限等）：不可知 → 保守放行（fail-open）。误放行
-    ///   的最坏结果是多一次 spawn 尝试 / 一次有身份验证前置的杀；误拒绝则
-    ///   会让存活实例失去看护——两个方向上前者代价小得多
-    pub fn is_aproxy_process(pid: u32) -> bool {
-        match std::fs::read_link(format!("/proc/{pid}/exe")) {
-            Ok(target) => {
-                let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let name = name.strip_suffix(" (deleted)").unwrap_or(name);
-                name == "aproxy"
-            }
-            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-        }
-    }
-
     /// 进程是否已退出：/proc/<pid>/stat 的进程态——'Z'（zombie，已退出未
     /// 收割）与文件不存在（已收割）都算已退出。macOS 无 /proc 回退
     /// kill(pid,0)：ESRCH = 已退出；EPERM = 活着（权限拒绝但存在）。
@@ -1354,9 +1555,7 @@ mod imp_process {
     /// 进程镜像完整路径：/proc/<pid>/exe readlink。进程已死（ENOENT，含
     /// zombie）→ None；其他失败（跨用户权限等）→ None（调用方按「不可判
     /// → 不拦」处理）。路径可能带「 (deleted)」后缀（swap 升级场景），
-    /// 调用方按需剥除。与 is_aproxy_process 语义不同处：身份判定对权限
-    /// 失败 fail-open（误放行代价小），管辖检查对一切失败 fail-closed
-    /// （拿不到路径就不拦）。
+    /// 调用方按需剥除。只服务 install 的管辖检查，不参与进程身份判定。
     pub fn process_image_path(pid: u32) -> Option<std::path::PathBuf> {
         std::fs::read_link(format!("/proc/{pid}/exe")).ok()
     }
@@ -1448,27 +1647,260 @@ mod tests {
         assert_eq!(heartbeat_fresh_secs(&s), 3);
     }
 
-    // unix：身份判定对「已死进程」的两种形态都判 false——
-    // 大号未用 pid（/proc 条目不存在）与真实 zombie（已 kill 未收割）
-    #[cfg(unix)]
-    #[test]
-    fn is_aproxy_process_rejects_dead_pids() {
-        // Linux pid_max 上限 4194304，此 pid 不可能存在 → readlink ENOENT → false
-        assert!(!is_aproxy_process(u32::MAX - 1));
+    // ---------------- 进程身份（pid + 创建时间，与二进制名称无关） ----------------
+    //
+    // 下列测试用一个**名字与 aProxy 毫无关系**的子进程（Windows 的 PING.EXE /
+    // unix 的 sleep）当被测对象：旧的名称判定会一律拒绝它，新判定只看
+    // 「pid + 创建时间」——测试通过即证明身份判定已与名称解耦。子进程均由
+    // 测试自己 spawn 并持有句柄，结束前自行回收。macOS 无 /proc 读不到创建
+    // 时间（不在本轮支持范围），相关测试只在 Windows/Linux 编译运行。
 
-        // 真实 zombie：子进程被 SIGKILL 后、父进程收割前，/proc/<pid> 仍在但
-        // exe 语义随地址空间消失（readlink ENOENT）→ false
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
+    /// 拉起一个长时间存活、无副作用、名字与 aProxy 无关的子进程
+    #[cfg(any(windows, target_os = "linux"))]
+    fn spawn_unrelated_child() -> std::process::Child {
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = std::process::Command::new("ping");
+            c.args(["-n", "60", "127.0.0.1"]);
+            c
+        };
+        #[cfg(target_os = "linux")]
+        let mut cmd = {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("60");
+            c
+        };
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("spawn sleep 失败（unix 测试环境必备）");
-        child.kill().expect("SIGKILL 失败");
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        assert!(
-            !is_aproxy_process(child.id()),
-            "zombie 进程不应通过身份判定"
+            .expect("spawn 测试子进程失败")
+    }
+
+    /// 等子进程退出（最多 5s），返回是否已退出。try_wait 在 unix 上会收割。
+    #[cfg(any(windows, target_os = "linux"))]
+    fn wait_child_exit(child: &mut std::process::Child) -> bool {
+        for _ in 0..50 {
+            if child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn record_identity_classifies_alive_reused_legacy_gone() {
+        let mut child = spawn_unrelated_child();
+        let pid = child.id();
+        let start = process_start_time(pid).expect("子进程创建时间可查");
+        assert_eq!(record_identity(pid, start), RecordIdentity::Alive(start));
+        // 登记值不符 = pid 已被复用给别的进程
+        assert_eq!(
+            record_identity(pid, start.wrapping_add(1)),
+            RecordIdentity::Reused
         );
-        child.wait().unwrap(); // 收割，避免测试自身留 zombie
+        // 旧版本记录（未登记创建时间）：在世但无从核验
+        assert_eq!(record_identity(pid, 0), RecordIdentity::Unverifiable(start));
+        // 已退出但未回收（unix zombie / Windows 被 Child 句柄维持的对象）：
+        // 创建时间仍查得到且一致，但必须判 Gone——死进程不得计入存活集合
+        child.kill().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(record_identity(pid, start), RecordIdentity::Gone);
+        child.wait().unwrap();
+        // 不存在的 pid
+        assert_eq!(record_identity(u32::MAX - 7, 1), RecordIdentity::Gone);
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn terminate_verified_refuses_mismatch_and_kills_match() {
+        let mut child = spawn_unrelated_child();
+        let pid = child.id();
+        let start = process_start_time(pid).expect("子进程创建时间可查");
+        // pid 复用模拟：登记时间不符 → 拒绝，进程毫发无损
+        assert!(terminate_verified_process(pid, start.wrapping_add(1)).is_err());
+        // 无锚点（0）→ 拒绝
+        assert!(terminate_verified_process(pid, 0).is_err());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "拒绝后子进程必须仍在运行"
+        );
+        // 时间一致 → 终止（与进程叫什么无关）
+        terminate_verified_process(pid, start).expect("身份一致应终止成功");
+        std::thread::sleep(Duration::from_millis(300));
+        // 已退出（尚未回收）→ 再次终止报「已退出」而非误报成功
+        assert!(terminate_verified_process(pid, start).is_err());
+        assert!(wait_child_exit(&mut child), "终止后子进程应退出");
+    }
+
+    /// 选举纯判定核：用 pid → 身份状态的映射注入，覆盖全部进程状态组合
+    #[test]
+    fn election_counts_only_verified_live_records() {
+        let rec = |pid: u32| crate::daemon::InstanceInfo {
+            pid,
+            version: "t".into(),
+            listen_addr: format!("127.0.0.1:{}", 50000 + pid),
+            config_path: String::new(),
+            base_url: String::new(),
+            started_at: 0,
+            last_activity_secs: 0,
+            proto_version: 2,
+            requests_total: 0,
+            retries_total: 0,
+            last_error: None,
+            last_error_at: 0,
+            swap_phase: false,
+            log_path: String::new(),
+            process_start: pid as u64,
+        };
+        let records = vec![rec(10), rec(20), rec(30)];
+        let with = |map: Vec<(u32, RecordIdentity)>| {
+            move |info: &crate::daemon::InstanceInfo| {
+                map.iter()
+                    .find(|(p, _)| *p == info.pid)
+                    .map(|(_, s)| *s)
+                    .unwrap_or(RecordIdentity::Gone)
+            }
+        };
+        // 本守护（20）在世，更小 pid 的实例（10）也核验在世 → 让位
+        assert!(!may_spawn_watchdog(
+            20,
+            &records,
+            with(vec![
+                (10, RecordIdentity::Alive(10)),
+                (20, RecordIdentity::Alive(20))
+            ])
+        ));
+        // 更小 pid 的记录是死记录/复用 pid/旧版本无从核验 → 一律不计入，
+        // 不能让位给不存在（或无法证明存在）的发起者
+        for stale in [
+            RecordIdentity::Gone,
+            RecordIdentity::Reused,
+            RecordIdentity::Unverifiable(10),
+        ] {
+            assert!(
+                may_spawn_watchdog(
+                    20,
+                    &records,
+                    with(vec![(10, stale), (20, RecordIdentity::Alive(20))])
+                ),
+                "{stale:?} 的更小 pid 不得让本守护让位"
+            );
+        }
+        // 本进程不在在世集合（CLI 父进程 25 / 孤守护）→ 有权，即使有更小 pid
+        // 的在世实例（pid 大小在守护与 CLI 之间无意义，多发起由 claim 兜底）
+        assert!(may_spawn_watchdog(
+            25,
+            &records,
+            with(vec![(10, RecordIdentity::Alive(10))])
+        ));
+        // 无任何在世记录 → 有权
+        assert!(may_spawn_watchdog(20, &records, with(vec![])));
+        // 并发场景唯一性：同一注册表视图下，只有在世集合的最小者有权
+        let all_alive = || {
+            with(vec![
+                (10, RecordIdentity::Alive(10)),
+                (20, RecordIdentity::Alive(20)),
+                (30, RecordIdentity::Alive(30)),
+            ])
+        };
+        let initiators: Vec<u32> = [10, 20, 30]
+            .into_iter()
+            .filter(|me| may_spawn_watchdog(*me, &records, all_alive()))
+            .collect();
+        assert_eq!(initiators, vec![10], "并发发现缺席时恰好一个发起者");
+    }
+
+    /// 收养按「pid + 登记创建时间」核验：名字与 aProxy 无关的进程只要记录
+    /// 时间一致即被收养（改名二进制的单元级等价物）；时间不符（pid 复用）
+    /// 与旧记录且端点不应答的一律不收养；收养后死亡 watcher 挂在正确的进程上
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn adopt_scan_uses_start_time_identity_not_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = spawn_unrelated_child();
+        let pid = child.id();
+        let start = process_start_time(pid).expect("子进程创建时间可查");
+        let write = |port: &str, process_start: u64| {
+            let info = crate::daemon::InstanceInfo {
+                pid,
+                version: "t".into(),
+                listen_addr: format!("127.0.0.1:{port}"),
+                config_path: "C:/tmp/no-such-config.toml".into(),
+                base_url: "https://x".into(),
+                started_at: now_secs(),
+                last_activity_secs: 0,
+                proto_version: 2,
+                requests_total: 0,
+                retries_total: 0,
+                last_error: None,
+                last_error_at: 0,
+                swap_phase: false,
+                log_path: String::new(),
+                process_start,
+            };
+            crate::daemon::write_instance_file_in(dir.path(), &info).unwrap();
+            crate::daemon::write_restore_file_in(dir.path(), port, &[], "").unwrap();
+        };
+        write("59911", start); // 身份一致
+        write("59912", start.wrapping_add(1)); // pid 复用模拟
+        write("59913", 0); // 旧版本记录，端点无人应答
+        let mut st = WatchdogState::new(test_cfg(dir.path()));
+        let adopted = st.adopt_scan().await;
+        assert_eq!(
+            adopted,
+            vec!["59911".to_string()],
+            "只收养身份核验通过的记录"
+        );
+        let w = st.watched.iter().find(|w| w.port == "59911").unwrap();
+        assert_eq!(w.start_time, start, "收养时应记下实测创建时间作为处决基准");
+
+        // 死亡 watcher 挂在被收养的进程上：杀掉它即收到该端口的死亡事件
+        child.kill().unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(5), st.deaths.recv())
+            .await
+            .expect("应在 5s 内收到死亡事件")
+            .unwrap();
+        assert_eq!(ev, ("59911".to_string(), pid));
+        child.wait().unwrap();
+        for w in &st.watched {
+            imp::close_handle(w.handle);
+        }
+    }
+
+    /// 处决关卡按收编时的创建时间：不符（pid 已被复用）不杀，一致即杀——
+    /// 被测进程名字与 aProxy 无关，旧名称关卡会一律跳过处决
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn health_scan_execution_guard_uses_start_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = format!("599{:02}", 20 + std::process::id() % 50);
+        let mut child = spawn_unrelated_child();
+        let pid = child.id();
+        let start = process_start_time(pid).expect("子进程创建时间可查");
+        let handle = imp::open_sync_handle(pid).expect("子进程句柄");
+        // 心跳停在远古时刻（判过期），端点无人应答（ping 二意见也失败）
+        let writer = HeartbeatWriter::create(&port).expect("心跳节创建");
+        imp_heart::heartbeat_store(&writer, 1);
+        let mut st = WatchdogState::new(test_cfg(dir.path()));
+        st.watched.push(Watched {
+            port: port.clone(),
+            pid,
+            handle,
+            consecutive_failures: 0,
+            start_time: start.wrapping_add(1),
+        });
+        assert!(st.health_scan().await.is_empty(), "身份不符不得处决");
+        assert!(child.try_wait().unwrap().is_none(), "无辜进程必须仍在运行");
+
+        st.watched[0].start_time = start;
+        assert_eq!(st.health_scan().await, vec![port.clone()]);
+        assert!(wait_child_exit(&mut child), "身份一致的挂死候选应被处决");
+        imp::close_handle(handle);
+        drop(writer);
+        remove_heartbeat_file(&port);
     }
 
     #[test]
@@ -1498,7 +1930,7 @@ mod tests {
     // ---------------- 看护主循环状态机（纯逻辑，tempdir 注入） ----------------
 
     /// 构造一个伪实例环境：注册表 + 恢复记录齐全（进程身份不真存在——
-    /// adopt_scan 的 is_aproxy_process 探活会拒绝它，测试直接操纵 watched）
+    /// adopt_scan 的身份核验会判 Gone 拒绝它，测试直接操纵 watched）
     fn write_crashed_instance(dir: &Path, port: &str) {
         let info = crate::daemon::InstanceInfo {
             pid: u32::MAX - 777, // 不会存活也不易复用的 PID
@@ -1515,6 +1947,7 @@ mod tests {
             last_error_at: 0,
             swap_phase: false,
             log_path: String::new(),
+            process_start: 0,
         };
         crate::daemon::write_instance_file_in(dir, &info).unwrap();
         // restore 记录（崩溃信号）
@@ -1541,6 +1974,7 @@ mod tests {
             pid: u32::MAX - 777,
             handle: 0,
             consecutive_failures: 0,
+            start_time: 0,
         });
         // 有注册表无 .restore → 优雅退出语义
         let info = crate::daemon::InstanceInfo {
@@ -1558,6 +1992,7 @@ mod tests {
             last_error_at: 0,
             swap_phase: false,
             log_path: String::new(),
+            process_start: 0,
         };
         crate::daemon::write_instance_file_in(dir.path(), &info).unwrap();
         assert_eq!(st.handle_death("59901").await, DeathOutcome::GracefulExit);
@@ -1576,6 +2011,7 @@ mod tests {
             pid: u32::MAX - 777,
             handle: 0,
             consecutive_failures: st.cfg.max_restarts, // 已达上限
+            start_time: 0,
         });
         // 崩溃（restore+registry 都在）但失败计数达上限 → GaveUp，记录保留
         assert_eq!(st.handle_death(port).await, DeathOutcome::GaveUp);
@@ -1605,6 +2041,7 @@ mod tests {
             pid: u32::MAX - 777,
             handle: 0,
             consecutive_failures: 0,
+            start_time: 0,
         });
         // 首次崩溃：立即重拉 → 失败（配置不存在）→ 入队，failures=1
         assert_eq!(st.handle_death(port).await, DeathOutcome::RespawnFailed);
@@ -1666,6 +2103,7 @@ mod tests {
             pid: u32::MAX - 777,
             handle: 0,
             consecutive_failures: 0,
+            start_time: 0,
         });
         let start = std::time::Instant::now();
         let _ = st.handle_death(port).await;

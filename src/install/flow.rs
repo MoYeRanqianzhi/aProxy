@@ -639,13 +639,12 @@ fn stop_old_watchdog(run_dir: &Path) {
         return; // 无看护者，无事
     };
     crate::watchdog::remove_claim_in(run_dir);
-    let alive = crate::watchdog::is_aproxy_process(claim.pid)
-        && crate::watchdog::verify_claim_identity(claim.pid, claim.created_at_process);
+    let alive = crate::watchdog::verify_claim_identity(claim.pid, claim.created_at_process);
     if alive {
         tracing::info!(
             pid = claim.pid,
             "停掉旧看护者（换血：其 respawn 会用旧镜像）"
         );
-        crate::watchdog::terminate_verified_process(claim.pid);
+        let _ = crate::watchdog::terminate_verified_process(claim.pid, claim.created_at_process);
     }
 }

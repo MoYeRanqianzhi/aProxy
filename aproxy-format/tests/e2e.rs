@@ -195,3 +195,70 @@ models = ["claude-*"]
     assert_eq!(a["headers"]["x-api-key"], "k1");
     assert_eq!(b["headers"]["x-api-key"], "k2", "error 行后轮换序列应连续");
 }
+
+#[test]
+fn auto_client_format_rejects_cross_protocol_routing() {
+    // 官方示例曾经的形态：auto + anthropic/openai_chat 混合渠道。Anthropic
+    // 客户端的请求被路由到 openai_chat 渠道 = 跨协议：响应侧无从得知客户端
+    // 协议，旧版会把 OpenAI 响应原样回给 Anthropic 客户端（静默错协议）。
+    // 现在请求侧当场输出 error 行（aproxy 侧 502、不发上游）；同协议路由
+    // 照常放行，进程不退
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("agg.toml");
+    std::fs::write(
+        &cfg_path,
+        r#"
+client_format = "auto"
+
+[[channel]]
+name = "ant"
+format = "anthropic_messages"
+url = "https://ant.example.com/v1/messages"
+keys = ["k-ant"]
+models = ["claude-*"]
+
+[[channel]]
+name = "relay"
+format = "openai_chat"
+url = "https://relay.example.com/v1/chat/completions"
+keys = ["k-relay"]
+models = ["gpt-*"]
+"#,
+    )
+    .unwrap();
+    let cfg_arg = format!("--config={}", cfg_path.display());
+    let mut proc = spawn_run(&[&cfg_arg]);
+
+    let anthropic_body = |model: &str| {
+        format!(
+            r#"{{"system":"s","messages":[{{"role":"user","content":"hi"}}],"max_tokens":8,"model":"{model}"}}"#
+        )
+    };
+    let cross = send_and_read(
+        &mut proc,
+        &envelope_line(
+            &anthropic_body("gpt-4o"),
+            "https://c.example.com/v1/messages",
+        ),
+    );
+    let reason = cross["error"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("client_format") && reason.contains("openai_chat"),
+        "auto 跨协议应报错并指明改法: {cross}"
+    );
+    assert!(
+        cross.get("url").is_none(),
+        "error 行不得携带改写产物: {cross}"
+    );
+
+    let same = send_and_read(
+        &mut proc,
+        &envelope_line(
+            &anthropic_body("claude-3"),
+            "https://c.example.com/v1/messages",
+        ),
+    );
+    assert!(same.get("error").is_none(), "同协议路由应放行: {same}");
+    assert_eq!(same["url"], "https://ant.example.com/v1/messages");
+    assert_eq!(same["headers"]["x-api-key"], "k-ant");
+}

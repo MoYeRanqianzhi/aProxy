@@ -6,8 +6,12 @@ aproxy-format（协议转换 + key 轮换 + 多渠道聚合）。
 
 ## 用户拍板的决策（全部 2026-09-23）
 
-1. **失败语义两侧不对称**：请求侧转换失败 → 502 不重试（确定性失败）；
+1. **失败语义两侧不对称**：请求侧转换失败 → 502 不重试；
    响应侧失败 → 透传上游原始响应 + warn（响应已在手，可用性优先）。
+   2026-10-04 澄清（WS-2，e60de76）：「不重试」不再称作「确定性失败」——错误按成因分类
+   （Rejected/Protocol = format 输出本身的问题；Spawn/Io/WorkerDied/TimedOut = 进程层，常为瞬时），
+   文案如实表述。池内唯一的重试是「复用的空闲 worker 在产出任何输出前就死了 → 换新 worker
+   重做一次」，那是池状态问题，不改变本决策。
 2. **二进制 body 走 body_b64**（base64 进信封），不拒绝不透传。
 3. **配置仅 toml 层**：无 settings.json 全局默认层、无 CLI 旗标（转换是
    场景特定功能）。
@@ -33,6 +37,10 @@ aproxy-format（协议转换 + key 轮换 + 多渠道聚合）。
   while 循环遇 EOF 必须退出——铁律）。
 - **Worker.stdout 必须用同一个 BufReader**（存进 Worker 结构）：每次 convert
   新建 BufReader 会把内部缓冲残留的下一行丢掉——致命 bug 结构上根除。
+- **stdout 同步不变量**（2026-10-04，WS-2 修复跨请求串包）：信封协议没有请求序号，第 N 行
+  只能靠「一请求恰一行、按序」对应第 N 个请求。worker 只有在输出被确认为一行合法信封、
+  且其后无残留时才归还空闲表；归还与取出时各做一次非阻塞探测（probe_stdout），发现多余
+  输出/已关闭即剔除。残余微秒级窗口需「信封带请求序号由 format 回显」根治，属 0.1.x 议题。
 - **空闲回收用单 reaper 任务扫描**（sleep(min(idle/2,5s))），不用每 worker
   sleep 竞速——无任务爆炸与取消簿记。
 - **reaper 惰性启动**（首次 convert 时）：AppState::new 可能不在 tokio
@@ -65,13 +73,17 @@ aproxy-format（协议转换 + key 轮换 + 多渠道聚合）。
 ## 测试
 
 - 跨平台假 format：examples/format-echo.rs（echo/upper/error/exit1/sleep/
-  rotate/rewrite 子命令）——不用系统 python（Windows runner python3 是
-  Store stub）。
-- tests/transform_integration.rs 14 项矩阵（spawn/persistent × 两方向、
-  url 改写、轮换、失败语义、超时、b64、大 body 磁盘、互斥、保活透传）。
+  rotate/rewrite，以及 2026-10-04 新增的 banner/multiline/late-stray/die-idle/oneshot
+  ——用于钉死串包与死 worker 重试）——不用系统 python（Windows runner python3 是
+  Store stub）。干净 target 下 `--lib`/`--test` 单跑不会编译 examples，需先
+  `cargo build --example format-echo`。
+- tests/transform_integration.rs 22 项（spawn/persistent × 两方向、url 改写、轮换、失败
+  语义、超时、b64、大 body 磁盘、互斥、保活透传、串包与死 worker 回归）。
 
 ## 遗留
 
 - 响应侧集成测试挂起问题（见 TODO，工具链 1.96.0→1.98.1 重装后复跑定位）。
 - 响应侧大 body 转换内存峰值 2-3× spool_limit（文档明示；不做流式转换）。
-- SSE 的协议检测（auto 模式）暂按渠道格式直通，等 switchyard 提供权威检测。
+- auto 模式（2026-10-04 起）只放行「客户端协议 = 渠道协议」：跨协议请求在请求侧以 error 行
+  拒绝（aproxy 回 502、不发上游、不计费），提示显式声明 client_format；该修复随 aproxy-format
+  新版本（format-v0.1.1 或之后）生效，需单独发 format 版本。

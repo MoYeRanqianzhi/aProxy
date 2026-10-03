@@ -1,11 +1,19 @@
 ---
 name: identity-no-name
-description: 用户定调：进程身份判定严禁依赖二进制名称（严重谬误）——正确锚点是 spawn 链/IPC 端点归属/进程创建时间戳；机制替换方案与范围决策待定，重构稿在 stash
+description: 用户定调：进程身份判定严禁依赖二进制名称（严重谬误）——正确锚点是 spawn 链/IPC 端点归属/进程创建时间戳；2026-10-04 已按方案 A 实施（pid + 创建时间），改身份/收养/处决逻辑前回想
 metadata:
   type: project
 ---
 
-# 进程身份判定与名称解耦（2026-09-10 用户定调，方案待批）
+# 进程身份判定与名称解耦（2026-09-10 用户定调；2026-10-04 方案 A 已实施）
+
+**现状（2026-10-04，合并提交 5c71f35）**：`is_aproxy_process` 已删除。守护注册时把自身进程创建时间写进
+`InstanceInfo.process_start`；`watchdog::record_identity` 按「pid + 创建时间」判定
+Alive / Unverifiable / Reused / Gone；收养、处决、`--force`、install 换血停旧看护者、选举存活判定
+全部改用它，Windows 终止在同一进程句柄上先核对创建时间再 TerminateProcess（无复用窗口）。
+旧记录（process_start = 0）一律保守：宁可不看护也不误杀（收养需 IPC 回报 pid 一致、选举不计入、
+`--force` 先 ping 确认）。官方 Release 资产名 aproxy-<target>(.exe) 直接运行也受看护。
+主仓库 stash@{0} 的方向稿已被这次实现取代，是否丢弃由用户决定。下文为当初定调的推理，保留供回溯。
 
 **用户原话定性**：「怎么能通过名称来判断呢？？这是严重谬误！！」（针对
 `is_aproxy_process` 的镜像名/exe basename 比对，以及我在 F2 决策里给出的

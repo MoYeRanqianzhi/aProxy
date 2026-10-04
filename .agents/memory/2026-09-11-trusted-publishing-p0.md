@@ -20,3 +20,18 @@
 ## 种子发布模式（未来新渠道复用）
 
 本地 token 首发（build-and-publish.sh --release <tag> / cargo publish）→ 网页/API 绑 trusted publisher → 删 token → CI 纯 OIDC。npm 的 GAT 建议一开始就不要在 CI 用。
+
+## 2026-10-04：format 线的 Trusted Publishing 没配全（format-v0.1.1 实测）
+
+- **crates.io**：可信发布配置按 workflow 文件名匹配。仓库只登记了 `release.yml`，所以
+  `release-format.yml` 换 token 时报 400「does not match the workflow filename
+  release-format.yml … Expected workflow filenames: release.yml」。认证步骤本身失败，
+  `|| secrets.CARGO_REGISTRY_TOKEN` 兜底根本走不到。需要所有者给 `aproxy-format` 与
+  `aproxy-envelope` 各加一条 workflow = `release-format.yml`、environment = `release`
+  的配置（第 3 条的 API 或网页）。
+- **npm**：`@meowo/aproxy-format` 及 10 个平台包没有绑定 Trusted Publisher，OIDC
+  发布返回 PUT 404（与第 1/2 条同一表现）。只能由所有者在网页上 2FA 绑定。
+- **本机凭据**：`~/.cargo/credentials.toml` 里的 crates.io token 已失效（发布返回
+  403 authentication failed），本机 npm 未登录（401）。主代理无法替所有者补发。
+- 补齐后执行 `gh run rerun 37192303424 --failed` 即可：两个发布 job 都按「版本已存在
+  才跳过」幂等，GitHub Release format-v0.1.1 已经建好。

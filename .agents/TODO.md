@@ -23,7 +23,8 @@
 - [x] 全量验证 + 真实 Claude Code 无限重试验收（>600s）+ 合并后审查：302f687 上 Windows 446 / Linux 439 全过，验收两次通过（见计划进度节）
 - [ ] rc 演练（v0.1.0-rc.1，需用户确认推送与打 tag）；Linux gnu 产物 glibc 下限由演练时的构建断言验证
 - [ ] 发版前 bump Cargo.toml 版本为 0.1.0（文档已按 0.1.0 写）
-- [ ] 所有者人工项：Trusted Publisher 绑定核对（aproxy-envelope、aproxy-format、@meowo/aproxy-format*）、release environment 保护规则、分支保护、CARGO_REGISTRY_TOKEN 迁入受保护环境、开启私密漏洞报告（SECURITY.md 指向它，当前 enabled:false）
+- [ ] 所有者人工项（format 线发布受阻）：crates.io 给 aproxy-format、aproxy-envelope 加 `release-format.yml` 可信发布配置；npm 给 @meowo/aproxy-format 及 10 个平台包绑定 Trusted Publisher；之后 `gh run rerun 37192303424 --failed` 补发 format 0.1.1（详见 trusted-publishing-p0 记忆）
+- [x] 仓库设置（2026-10-04，用户授权主代理操作）：私密漏洞报告已开；release 环境只许 v* / format-v* tag 部署；main 禁强推与删除；CARGO_REGISTRY_TOKEN 无法读回原值，留在仓库级（见 github-release-settings 记忆）
 - [ ] 0.1.0 之后：doctor 测试不隔离主目录——`doctor::run` 的目录扫描、默认配置与运行实例端口检查都从进程环境的 APROXY_HOME（未设 = ~/.aproxy）推导，开发机上 `doctor_clean_when_all_good` 会读到真实配置、可能误报失败。修法方向：从 settings.json 所在目录推导主目录并逐层传参。跑全量测试前先把 APROXY_HOME 指向临时目录可规避
 
 ## 外部转换器（format）+ aproxy-format（2026-09-23 下令，2026-09-30 完成）

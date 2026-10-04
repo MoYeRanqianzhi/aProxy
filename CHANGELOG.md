@@ -4,7 +4,7 @@
 `0.1.0-alpha.*` 各预发布版本的行为差异记录在 aproxy-cli skill 的
 `.claude/skills/aproxy-cli/references/latest/compatibility.md`。
 
-## [0.1.0] - 未发布
+## [0.1.0] - 2026-10-04
 
 0.1.0 是首个稳定版，在 `0.1.0-alpha.17` 的基础上收口。
 

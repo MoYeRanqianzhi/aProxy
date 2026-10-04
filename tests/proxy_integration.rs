@@ -291,17 +291,20 @@ async fn bounded_retry_path_keepalive_channel_ends_with_error_event() {
             let c = c2.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
+                // 每次 404 都慢 700ms：三次尝试跨过 1s 的保活间隔，响应头已由
+                // tick 以骨架提交——这时才轮到终态 error 事件（尚未提交时达上限
+                // 是原样透传真实 404，见 bounded_retry_path_passes_through_real_
+                // failure_before_commit）
+                tokio::time::sleep(Duration::from_millis(700)).await;
                 (StatusCode::NOT_FOUND, "not found").into_response()
             }
         }),
     );
 
     let (upstream_url, _h1) = bind_random_router(upstream).await;
-    // 默认配置 keepalive_interval_secs = 15 > 0，保活通道可用
-    let proxy_state = AppState::new(proxy_config_with_bounded_paths(
-        &upstream_url,
-        &["/v1/messages/count_tokens"],
-    ));
+    let mut cfg = proxy_config_with_bounded_paths(&upstream_url, &["/v1/messages/count_tokens"]);
+    cfg.keepalive_interval_secs = 1;
+    let proxy_state = AppState::new(cfg);
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
     let client = local_client();
@@ -313,7 +316,7 @@ async fn bounded_retry_path_keepalive_channel_ends_with_error_event() {
         .await
         .unwrap();
 
-    // 骨架 200 SSE 先行；受限路径达上限后流必须终止于终态 error 事件，
+    // 骨架 200 SSE 已提交；受限路径达上限后流必须终止于终态 error 事件，
     // 而不是永远只剩心跳。显式超时包裹：若回归成无限重试，此测试应快速
     // 失败并给出可读断言，而非挂死到 CI 超时
     assert_eq!(resp.status(), 200);
@@ -850,6 +853,11 @@ async fn keepalive_during_retry() {
             async move {
                 let n = c.fetch_add(1, Ordering::SeqCst);
                 if n < 1 {
+                    // 失败本身慢过一个保活间隔（1s）：响应头在这次尝试期间由 tick
+                    // 以骨架提交，重试才发生在已提交的响应里。（「需要重试」本身
+                    // 不触发提交——失败后下一轮很快成功的请求走保真快速路径，见
+                    // keepalive_quick_retry_success_keeps_real_upstream_head）
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
                     (StatusCode::INTERNAL_SERVER_ERROR, "overloaded").into_response()
                 } else {
                     let mut headers = HeaderMap::new();
@@ -1896,9 +1904,10 @@ async fn read_http_request(sock: &mut tokio::net::TcpStream) -> bool {
     true
 }
 
-// (1) Accept: application/json + stream:true，上游先失败 N 次：客户端立即拿到
-//     200 SSE 骨架头与心跳，最终收到成功那一次的完整原样字节；保活适用的请求
-//     要求上游以 identity 编码回应（往压缩流里插心跳会坏）
+// (1) Accept: application/json + stream:true，上游连续失败到进入退避（前 4 次
+//     零延迟、第 5 次在 5s 退避之后）：约一个保活间隔时提交 200 SSE 骨架头，
+//     退避期间心跳间隔有上界，最终收到成功那一次的完整原样字节；保活适用的
+//     请求要求上游以 identity 编码回应（往压缩流里插心跳会坏）
 #[tokio::test]
 async fn keepalive_body_stream_request_commits_and_retries_in_same_response() {
     let counter = Arc::new(AtomicUsize::new(0));
@@ -1916,7 +1925,7 @@ async fn keepalive_body_stream_request_commits_and_retries_in_same_response() {
                         .unwrap_or("")
                         .to_string(),
                 );
-                if c.fetch_add(1, Ordering::SeqCst) < 2 {
+                if c.fetch_add(1, Ordering::SeqCst) < 4 {
                     (StatusCode::from_u16(529).unwrap(), "overloaded").into_response()
                 } else {
                     sse_upstream_response(SSE_PAYLOAD)
@@ -1940,19 +1949,34 @@ async fn keepalive_body_stream_request_commits_and_retries_in_same_response() {
         .unwrap();
     let head_at = t0.elapsed();
     assert_eq!(resp.status(), 200);
+    // 「需要重试」本身不提交，提交由保活节拍推动：首字节 ≈ 一个间隔
     assert!(
-        head_at < Duration::from_millis(900),
-        "首轮失败即应提交骨架头（不等一个保活间隔），实际 {head_at:?}"
+        head_at >= Duration::from_millis(900) && head_at < Duration::from_millis(2000),
+        "骨架头应在约一个保活间隔（1s）时提交，实际 {head_at:?}"
     );
     assert_eq!(
         header_str(&resp, "content-type").as_deref(),
         Some("text/event-stream")
     );
-    let body = resp.text().await.unwrap();
+    // 退避（5s）期间心跳不断档：相邻字节间隔 ≤ 间隔 + 容差（退避若改成不经
+    // 心跳节拍的裸 sleep，这里会出现约 5s 的空窗）
+    let chunks = collect_timed(resp, t0).await;
+    let mut prev = head_at;
+    let mut max_gap = Duration::ZERO;
+    for (t, _) in &chunks {
+        max_gap = max_gap.max(*t - prev);
+        prev = *t;
+    }
+    assert!(
+        max_gap <= Duration::from_millis(2000),
+        "退避期间相邻字节间隔不得超过 2s（keepalive=1s），实际最大 {max_gap:?}"
+    );
+    let body: Vec<u8> = chunks.iter().flat_map(|(_, c)| c.to_vec()).collect();
+    let body = String::from_utf8(body).unwrap();
     let (beats, rest) = split_leading_keepalives(&body);
-    assert!(beats >= 1, "骨架头之后应立即有心跳: {body:?}");
+    assert!(beats >= 4, "约 5s 的退避应有多个心跳: {body:?}");
     assert_eq!(rest, SSE_PAYLOAD, "心跳之后必须是成功那一次的原样字节");
-    assert_eq!(counter.load(Ordering::SeqCst), 3, "两次 529 + 一次成功");
+    assert_eq!(counter.load(Ordering::SeqCst), 5, "四次 529 + 一次成功");
     assert!(
         encodings.lock().unwrap().iter().all(|e| e == "identity"),
         "保活适用的请求应要求上游 identity 编码: {:?}",
@@ -2318,24 +2342,16 @@ async fn keepalive_applicable_quick_success_keeps_fast_path() {
 }
 
 // (7) keepalive_trigger 各取值：accept 恢复旧行为（只认 Accept 头——Claude Code
-//     式请求不再保活，重试后原样回放）；body_stream 只认请求体（Accept SSE 但
-//     请求体没有 stream:true 不保活）
+//     式请求不再保活，等上游完整响应后原样回放）；body_stream 只认请求体（Accept
+//     SSE 但请求体没有 stream:true 不保活）。上游每次都慢 1.5s 才回头：保活适用
+//     的请求在约 1s 时收到骨架头与心跳，不适用的请求原样收到上游真实头与字节
 #[tokio::test]
 async fn keepalive_trigger_values_select_requests() {
-    let counter = Arc::new(AtomicUsize::new(0));
-    let c2 = counter.clone();
-    // 每个请求序列：奇数次调用 500、偶数次成功——每个客户端请求恰好重试一次
     let upstream = Router::new().route(
         "/v1/messages",
-        any(move || {
-            let c = c2.clone();
-            async move {
-                if c.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
-                } else {
-                    sse_upstream_response(SSE_PAYLOAD)
-                }
-            }
+        any(|| async {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            sse_upstream_response(SSE_PAYLOAD)
         }),
     );
     let (upstream_url, _h1) = bind_random_router(upstream).await;
@@ -2410,11 +2426,13 @@ async fn keepalive_trigger_values_select_requests() {
     );
 }
 
-// (9) 受限重试路径在已提交的响应里以终态 SSE error 事件收场（Claude Code 式
-//     请求同样适用；网络错误不封顶由 bounded_retry_keepalive_channel_network_
-//     errors_not_capped 钉住）
+// (9) 受限重试路径在保活通道里、响应头尚未提交时达上限：与不保活路径一致，原样
+//     回放最后一次失败的真实 status/头/体（客户端拿到真实 404 自行处理）。已提交
+//     后才达上限的终态 SSE error 事件由 bounded_retry_path_keepalive_channel_
+//     ends_with_error_event 钉住；网络错误不封顶由 bounded_retry_keepalive_
+//     channel_network_errors_not_capped 钉住
 #[tokio::test]
-async fn bounded_retry_path_ends_committed_body_stream_response_with_error_event() {
+async fn bounded_retry_path_passes_through_real_failure_before_commit() {
     let counter = Arc::new(AtomicUsize::new(0));
     let c2 = counter.clone();
     let upstream = Router::new().route(
@@ -2423,7 +2441,12 @@ async fn bounded_retry_path_ends_committed_body_stream_response_with_error_event
             let c = c2.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
-                (StatusCode::NOT_FOUND, "not found").into_response()
+                axum::response::Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .header("content-type", "text/html")
+                    .header("x-upstream-marker", "real-head")
+                    .body(axum::body::Body::from("<h1>not found</h1>"))
+                    .unwrap()
             }
         }),
     );
@@ -2432,26 +2455,28 @@ async fn bounded_retry_path_ends_committed_body_stream_response_with_error_event
     cfg.keepalive_interval_secs = 1;
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(cfg))).await;
 
-    let resp = local_client()
-        .post(format!("{proxy_url}/v1/messages/count_tokens"))
-        .header("accept", "application/json")
-        .json(&cc_stream_body())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200, "首轮失败即提交骨架头");
-    let text = tokio::time::timeout(Duration::from_secs(10), resp.text())
-        .await
-        .expect("受限路径达上限后流应以 error 事件终止（10s 内）")
-        .unwrap();
-    let (beats, rest) = split_leading_keepalives(&text);
-    assert!(beats >= 1, "{text:?}");
-    assert!(
-        rest.starts_with("event: error\n")
-            && rest.contains("upstream_error")
-            && rest.contains("404"),
-        "应以终态 error 事件收场: {text:?}"
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        local_client()
+            .post(format!("{proxy_url}/v1/messages/count_tokens"))
+            .header("accept", "application/json")
+            .json(&cc_stream_body())
+            .send(),
+    )
+    .await
+    .expect("受限路径三次零延迟失败后应很快拿到终态（10s 内）")
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "原样透传真实失败状态码"
     );
+    assert_eq!(
+        header_str(&resp, "x-upstream-marker").as_deref(),
+        Some("real-head"),
+        "原样透传上游真实头"
+    );
+    assert_eq!(resp.text().await.unwrap(), "<h1>not found</h1>");
     assert_eq!(counter.load(Ordering::SeqCst), 3);
 }
 
@@ -2579,23 +2604,20 @@ async fn client_disconnect_before_commit_aborts_upstream_request() {
 async fn keepalive_trigger_detects_stream_flag_in_disk_spooled_body() {
     use tempfile::TempDir;
 
-    let counter = Arc::new(AtomicUsize::new(0));
     let sizes = Arc::new(Mutex::new(Vec::<usize>::new()));
-    let (c2, s2) = (counter.clone(), sizes.clone());
+    let s2 = sizes.clone();
     let upstream = Router::new().route(
         "/v1/messages",
         any(move |req: axum::extract::Request| {
-            let (c, s) = (c2.clone(), s2.clone());
+            let s = s2.clone();
             async move {
                 let bytes = axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024)
                     .await
                     .unwrap();
                 s.lock().unwrap().push(bytes.len());
-                if c.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
-                } else {
-                    sse_upstream_response(SSE_PAYLOAD)
-                }
+                // 慢于一个保活间隔才回头：保活适用的请求届时已收到骨架头与心跳
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                sse_upstream_response(SSE_PAYLOAD)
             }
         }),
     );
@@ -2656,8 +2678,8 @@ async fn keepalive_trigger_detects_stream_flag_in_disk_spooled_body() {
 
     assert_eq!(
         *sizes.lock().unwrap(),
-        vec![top.len(), top.len(), nested.len(), nested.len()],
-        "每次尝试上游都收到完整请求体"
+        vec![top.len(), nested.len()],
+        "上游收到完整请求体"
     );
     let leftover: Vec<_> = std::fs::read_dir(spool_dir.path())
         .unwrap()
@@ -2837,6 +2859,332 @@ async fn spool_file_removed_when_client_disconnects_mid_spool() {
     spool_dir_cleared_after_disconnect_mid_spool(false)
         .await
         .unwrap_or_else(|e| panic!("非保活路径: {e}"));
+}
+
+/// 上游：响应头立即发出，体在 `delay` 后一次发完——「2xx 头先到、体慢」的形态
+fn delayed_body_response(
+    status: StatusCode,
+    content_type: &'static str,
+    delay: Duration,
+    body: &'static str,
+) -> axum::response::Response {
+    let stream = futures_util::stream::once(async move {
+        tokio::time::sleep(delay).await;
+        Ok::<Bytes, std::io::Error>(Bytes::from_static(body.as_bytes()))
+    });
+    axum::response::Response::builder()
+        .status(status)
+        .header("content-type", content_type)
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap()
+}
+
+// stream:true 的非 SSE 流（Ollama 原生 /api/chat：application/x-ndjson）在默认
+// keepalive_trigger = any 下：上游 2xx 头已到、体要生成超过一个保活间隔——不得
+// 提交 SSE 骨架（content-type 被改写、正文混入 `: keepalive` 行会让逐行 JSON
+// 解析失败），这次尝试成功就原样直通
+#[tokio::test]
+async fn keepalive_ndjson_stream_true_passes_through_unaltered() {
+    const FIRST: &str = "{\"message\":{\"content\":\"he\"},\"done\":false}\n";
+    const SECOND: &str = "{\"message\":{\"content\":\"llo\"},\"done\":true}\n";
+    let upstream = Router::new().route(
+        "/api/chat",
+        any(|| async {
+            let stream = futures_util::stream::unfold(0u8, |step| async move {
+                match step {
+                    0 => Some((
+                        Ok::<Bytes, std::io::Error>(Bytes::from_static(FIRST.as_bytes())),
+                        1,
+                    )),
+                    1 => {
+                        tokio::time::sleep(Duration::from_millis(2500)).await;
+                        Some((Ok(Bytes::from_static(SECOND.as_bytes())), 2))
+                    }
+                    _ => None,
+                }
+            });
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/x-ndjson")
+                .body(axum::body::Body::from_stream(stream))
+                .unwrap()
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.keepalive_interval_secs = 1;
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(cfg))).await;
+
+    let resp = local_client()
+        .post(format!("{proxy_url}/api/chat"))
+        .header("accept", "application/json")
+        .json(&serde_json::json!({"model": "llama3", "messages": [], "stream": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        header_str(&resp, "content-type").as_deref(),
+        Some("application/x-ndjson"),
+        "非 SSE 的流不得被改写成 text/event-stream"
+    );
+    let body = resp.text().await.unwrap();
+    assert_eq!(body, format!("{FIRST}{SECOND}"), "正文原样，不得混入心跳");
+    assert!(
+        body.lines()
+            .all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok()),
+        "每一行都必须是合法 JSON: {body:?}"
+    );
+}
+
+// 暂停只限那一次尝试：stream:true 请求遇到「200 + error JSON」（Claude Code 的
+// 真实场景），每次的 2xx 头都先到、错误体 1.5s 后才到。第 1 次尝试期间暂停、
+// 跳过了 1s 时的骨架提交；它一判定需要重试，就必须立刻补提交骨架、之后照常
+// 心跳——暂停若延续下去，客户端要到很晚甚至最终成功都收不到保活字节
+#[tokio::test]
+async fn keepalive_pause_for_non_sse_ends_with_the_attempt() {
+    const ERROR_JSON: &str =
+        r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c2 = counter.clone();
+    let upstream = Router::new().route(
+        "/v1/messages",
+        any(move || {
+            let c = c2.clone();
+            async move {
+                if c.fetch_add(1, Ordering::SeqCst) < 2 {
+                    delayed_body_response(
+                        StatusCode::OK,
+                        "application/json",
+                        Duration::from_millis(1500),
+                        ERROR_JSON,
+                    )
+                } else {
+                    sse_upstream_response(SSE_PAYLOAD)
+                }
+            }
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.keepalive_interval_secs = 1;
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(cfg))).await;
+
+    let t0 = std::time::Instant::now();
+    let resp = local_client()
+        .post(format!("{proxy_url}/v1/messages"))
+        .header("accept", "application/json")
+        .json(&cc_stream_body())
+        .send()
+        .await
+        .unwrap();
+    let head_at = t0.elapsed();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        head_at >= Duration::from_millis(1300) && head_at < Duration::from_millis(2500),
+        "第 1 次尝试（1.5s）一结束就应补提交骨架头，实际 {head_at:?}"
+    );
+    assert_eq!(
+        header_str(&resp, "content-type").as_deref(),
+        Some("text/event-stream"),
+        "重试期间应已提交骨架头"
+    );
+    let body = resp.text().await.unwrap();
+    let (beats, rest) = split_leading_keepalives(&body);
+    assert!(beats >= 2, "重试期间心跳应持续: {body:?}");
+    assert_eq!(rest, SSE_PAYLOAD, "最终回放成功那一次的字节");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        3,
+        "两次 200+error JSON + 一次成功"
+    );
+}
+
+// 「需要重试」本身不提交：失败后的零延迟重试很快成功时，客户端拿到的是上游
+// 真实的 status/头/体（无骨架、无心跳）
+#[tokio::test]
+async fn keepalive_quick_retry_success_keeps_real_upstream_head() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c2 = counter.clone();
+    let upstream = Router::new().route(
+        "/v1/messages",
+        any(move || {
+            let c = c2.clone();
+            async move {
+                if c.fetch_add(1, Ordering::SeqCst) < 2 {
+                    (StatusCode::from_u16(529).unwrap(), "overloaded").into_response()
+                } else {
+                    sse_upstream_response(SSE_PAYLOAD)
+                }
+            }
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.keepalive_interval_secs = 1;
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(cfg))).await;
+
+    let resp = local_client()
+        .post(format!("{proxy_url}/v1/messages"))
+        .header("accept", "application/json")
+        .json(&cc_stream_body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        header_str(&resp, "x-upstream-marker").as_deref(),
+        Some("real-head"),
+        "重试后很快成功应回放上游真实头"
+    );
+    assert_eq!(resp.text().await.unwrap(), SSE_PAYLOAD, "原样字节，无心跳");
+    assert_eq!(counter.load(Ordering::SeqCst), 3, "两次 529 + 一次成功");
+}
+
+// 上游无视 accept-encoding: identity 仍以 gzip 回 2xx SSE、且头慢于一个保活间隔
+// （骨架头已提交，不含 content-encoding）：回放前必须完整解码，客户端拿到的是
+// 明文 SSE；压缩体损坏/截断时不能回放半截，以终态 SSE error 事件收场
+#[tokio::test]
+async fn keepalive_committed_replay_decodes_compression_ignoring_identity() {
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(SSE_PAYLOAD.as_bytes()).unwrap();
+    let gz = Bytes::from(enc.finish().unwrap());
+    let truncated = gz.slice(..gz.len() / 2);
+    let gz_response = |body: Bytes| async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .header("content-encoding", "gzip")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    };
+    let upstream = Router::new()
+        .route("/v1/ok", any(move || gz_response(gz.clone())))
+        .route("/v1/bad", any(move || gz_response(truncated.clone())));
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.keepalive_interval_secs = 1;
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(cfg))).await;
+    let client = local_client();
+    let send = |path: &str| {
+        client
+            .post(format!("{proxy_url}{path}"))
+            .header("accept", "application/json")
+            .header("accept-encoding", "gzip, deflate, br, zstd")
+            .json(&cc_stream_body())
+            .send()
+    };
+
+    let resp = send("/v1/ok").await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        header_str(&resp, "content-encoding"),
+        None,
+        "已提交的是骨架头，不声明压缩"
+    );
+    let bytes = resp.bytes().await.unwrap();
+    let body = String::from_utf8(bytes.to_vec()).expect("回放体应是解码后的明文");
+    let (beats, rest) = split_leading_keepalives(&body);
+    assert!(beats >= 1, "{body:?}");
+    assert_eq!(rest, SSE_PAYLOAD, "回放的是完整解码后的上游 SSE");
+
+    let resp = send("/v1/bad").await.unwrap();
+    let body = tokio::time::timeout(Duration::from_secs(10), resp.text())
+        .await
+        .expect("解码失败应以终态事件结束（10s 内）")
+        .unwrap();
+    let (beats, rest) = split_leading_keepalives(&body);
+    assert!(beats >= 1, "{body:?}");
+    assert!(
+        rest.starts_with("event: error\n") && rest.contains("proxy_decode_failed"),
+        "截断的压缩体不得回放半截，应以终态 error 事件收场: {body:?}"
+    );
+}
+
+// 已提交后客户端断开、保活间隔很长（30s）：中止上游不能等到下一次心跳写失败，
+// 必须靠断开信号立即生效（< 1s）
+#[tokio::test]
+async fn client_disconnect_after_commit_aborts_upstream_promptly_with_long_interval() {
+    let (upstream_url, connections, mut closed_rx) = hanging_upstream(true).await;
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.keepalive_interval_secs = 30;
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(cfg))).await;
+
+    let resp = local_client()
+        .post(format!("{proxy_url}/v1/messages"))
+        .header("accept", "application/json")
+        .json(&cc_stream_body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "上游 SSE 头已先行提交");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(resp);
+    let dropped_at = std::time::Instant::now();
+
+    let closed_at = tokio::time::timeout(Duration::from_secs(5), closed_rx.recv())
+        .await
+        .expect("客户端断开后上游连接应很快关闭（不等 30s 的下一次心跳）")
+        .unwrap();
+    assert!(
+        closed_at.duration_since(dropped_at) < Duration::from_secs(1),
+        "断开到中止上游应 < 1s，实际 {:?}",
+        closed_at.duration_since(dropped_at)
+    );
+    assert_eq!(connections.load(Ordering::SeqCst), 1);
+}
+
+// 尚未提交时，每一轮尝试都可以先行提交上游真实头：首次 529（很快）→ 第 2 次
+// 回 2xx SSE 头、体很慢——第 2 次尝试的真实头一到就提交，缓冲期间照常心跳
+#[tokio::test]
+async fn keepalive_forwards_upstream_sse_head_of_a_retry_attempt() {
+    const FIRST: &str = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n";
+    const SECOND: &str = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c2 = counter.clone();
+    let upstream = Router::new().route(
+        "/v1/messages",
+        any(move || {
+            let c = c2.clone();
+            async move {
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (StatusCode::from_u16(529).unwrap(), "overloaded").into_response()
+                } else {
+                    slow_sse_upstream_response(FIRST, Duration::from_millis(2500), SECOND)
+                }
+            }
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.keepalive_interval_secs = 1;
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(cfg))).await;
+
+    let t0 = std::time::Instant::now();
+    let resp = local_client()
+        .post(format!("{proxy_url}/v1/messages"))
+        .header("accept", "application/json")
+        .json(&cc_stream_body())
+        .send()
+        .await
+        .unwrap();
+    let head_at = t0.elapsed();
+    assert!(
+        head_at < Duration::from_millis(800),
+        "第 2 次尝试的上游 SSE 头一到就应提交（早于首个保活 tick），实际 {head_at:?}"
+    );
+    assert_eq!(
+        header_str(&resp, "x-upstream-marker").as_deref(),
+        Some("real-head"),
+        "提交的是重试那次的上游真实头"
+    );
+    let body = resp.text().await.unwrap();
+    let (beats, rest) = split_leading_keepalives(&body);
+    assert!(beats >= 2, "缓冲期间心跳应持续: {body:?}");
+    assert_eq!(rest, format!("{FIRST}{SECOND}"));
+    assert_eq!(counter.load(Ordering::SeqCst), 2);
 }
 
 // ---------------------------------------------------------------------------

@@ -27,6 +27,11 @@
 //! - 解码输出超 [`MAX_DECODED`] 视为失控，返回 `None`（防解压炸弹）
 //! - 返回 `None` 的语义一律是「请用原始字节」，调用方无需区分失败原因
 //!
+//! 唯一的例外是 [`decode_strict`]：保活通道已向客户端提交了不带
+//! content-encoding 的响应头，而上游无视 `accept-encoding: identity` 仍回了压缩体
+//! ——此时原样转发必坏，只能完整解码后回放。它与 `for_inspection` 契约相反：
+//! 截断/损坏即失败、流式处理不封顶 8 MiB（上限由调用方按 spool 上限给出）。
+//!
 //! 已知边界：**磁盘模式（响应 > 1 MiB）的重试判定不做解码**——增量扫描器
 //! （`proxy::StreamErrorScanner`）吃的是原始字节流，为它改造成流式解码的收益与
 //! 风险不成比例（> 1 MiB 的压缩错误体现实中不存在）。该路径只解头部快照用于
@@ -122,6 +127,125 @@ fn decode_one(encoding: &str, body: &[u8]) -> Option<Vec<u8>> {
         // zstd 帧头解析失败（非 zstd 数据）即无解码器可用
         "zstd" => decode_reader(ruzstd::decoding::StreamingDecoder::new(body).ok()?),
         _ => None,
+    }
+}
+
+/// 按 `content-encoding` **完整、严格**地解码一段响应体，边解边写进 `output`，
+/// 返回解出的字节数。与 `for_inspection` 是两种契约：
+///
+/// - `for_inspection` 只为检查/预览：容忍截断（取已解出前缀）、输出封顶 8 MiB、
+///   失败回退原始字节——它的产物绝不进入转发路径
+/// - 本函数产出的是**要回放给客户端的字节**（保活通道已提交的响应头里不带
+///   content-encoding，上游却无视 identity 仍压缩时，只能解码后回放）：任何
+///   截断、损坏、未知编码都必须失败，绝不能把半截内容当成功交给客户端；输出
+///   上限由调用方给出（spool 上限——回放体与缓冲体同一量级约束），超出即失败
+///
+/// 流式解码：`input` 与 `output` 都按块处理，内存占用与 body 大小无关（调用方
+/// 对大 body 传文件读写端）。多层编码按逆序逐层解；identity 与空层跳过。
+/// 返回的 Err 是人类可读的原因，供日志与终态错误事件使用。
+pub fn decode_strict<'a, R: Read + 'a, W: std::io::Write>(
+    content_encoding: &str,
+    input: R,
+    output: &mut W,
+    max_output: u64,
+) -> Result<u64, String> {
+    use std::io::BufRead;
+    let mut reader: Box<dyn BufRead + 'a> = Box::new(std::io::BufReader::new(input));
+    let layers = content_encoding
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("identity"))
+        .rev();
+    for layer in layers {
+        let decoded: Box<dyn Read + 'a> = match layer.to_ascii_lowercase().as_str() {
+            // MultiGz：多个 gzip member 首尾相接也是合法 gzip 流；每个 member 都
+            // 校验尾部 CRC 与长度，截断即报错
+            "gzip" | "x-gzip" => Box::new(flate2::bufread::MultiGzDecoder::new(reader)),
+            // zlib 包装与裸 deflate 只能看头两字节区分（不能像 for_inspection 那样
+            // 「失败再换一种」重试——输入是流，读过就回不去了）
+            "deflate" => {
+                let zlib = looks_like_zlib(reader.fill_buf().map_err(|e| e.to_string())?);
+                Box::new(StrictInflate {
+                    inner: reader,
+                    state: flate2::Decompress::new(zlib),
+                    done: false,
+                })
+            }
+            "br" => Box::new(brotli_decompressor::Decompressor::new(reader, BROTLI_BUF)),
+            "zstd" => Box::new(
+                ruzstd::decoding::StreamingDecoder::new(reader)
+                    .map_err(|e| format!("zstd 帧头无效: {e}"))?,
+            ),
+            other => return Err(format!("不支持的 content-encoding「{other}」")),
+        };
+        reader = Box::new(std::io::BufReader::new(decoded));
+    }
+    // take(max+1)：多读 1 字节才能区分「恰好等于上限」与「已超限」
+    let written = std::io::copy(&mut reader.take(max_output.saturating_add(1)), output)
+        .map_err(|e| format!("解码失败（数据损坏或被截断）: {e}"))?;
+    if written > max_output {
+        return Err(format!("解码输出超过上限 {max_output} 字节"));
+    }
+    Ok(written)
+}
+
+/// zlib 头判定（RFC 1950）：CM = 8（deflate）、CINFO ≤ 7、且 CMF·256 + FLG
+/// 能被 31 整除。裸 deflate 流的头两字节几乎不可能同时满足三条。
+fn looks_like_zlib(head: &[u8]) -> bool {
+    match head {
+        [cmf, flg, ..] => {
+            cmf & 0x0F == 8 && cmf >> 4 <= 7 && (u16::from(*cmf) * 256 + u16::from(*flg)) % 31 == 0
+        }
+        _ => false,
+    }
+}
+
+/// 严格的 deflate/zlib 解码器：flate2 的 Read 包装在输入耗尽时把「流未结束」
+/// 也当成正常 EOF 返回（截断静默成功），这里直接驱动 `Decompress`，没见到
+/// `StreamEnd` 就耗尽输入一律报 UnexpectedEof。
+struct StrictInflate<R> {
+    inner: R,
+    state: flate2::Decompress,
+    done: bool,
+}
+
+impl<R: std::io::BufRead> Read for StrictInflate<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.done || buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let input = self.inner.fill_buf()?;
+            let eof = input.is_empty();
+            let (in_before, out_before) = (self.state.total_in(), self.state.total_out());
+            let status = self
+                .state
+                .decompress(input, buf, flate2::FlushDecompress::None)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let consumed = (self.state.total_in() - in_before) as usize;
+            let produced = (self.state.total_out() - out_before) as usize;
+            self.inner.consume(consumed);
+            if status == flate2::Status::StreamEnd {
+                self.done = true;
+                return Ok(produced);
+            }
+            if produced > 0 {
+                return Ok(produced);
+            }
+            if eof {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "deflate 流被截断",
+                ));
+            }
+            // 有输入却既不消费也不产出：解码器卡死，报错而不是空转
+            if consumed == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "deflate 解码无进展",
+                ));
+            }
+        }
     }
 }
 
@@ -335,6 +459,81 @@ mod tests {
             for_inspection(Some("gzip"), &bomb).is_none(),
             "超过输出上限应拒绝解码"
         );
+    }
+
+    // ---- decode_strict：回放用的完整严格解码 ----
+
+    fn strict(enc: &str, data: &[u8], max: u64) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        let n = decode_strict(enc, data, &mut out, max)?;
+        assert_eq!(n as usize, out.len(), "返回值应等于写出的字节数");
+        Ok(out)
+    }
+
+    fn deflate_variants(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(data).unwrap();
+        let mut d = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        d.write_all(data).unwrap();
+        (z.finish().unwrap(), d.finish().unwrap())
+    }
+
+    #[test]
+    fn strict_decodes_every_supported_encoding_fully() {
+        // 大于任何内部缓冲的样本（跨多个读块），验证流式解码完整无损
+        let long = SAMPLE.repeat(5000);
+        let (zlib, raw_deflate) = deflate_variants(long.as_bytes());
+        let mut two_members = gzip(&long.as_bytes()[..1000]);
+        two_members.extend(gzip(&long.as_bytes()[1000..]));
+        for (enc, data) in [
+            ("gzip", gzip(long.as_bytes())),
+            ("x-gzip", gzip(long.as_bytes())),
+            ("gzip", two_members),
+            ("deflate", zlib),
+            ("deflate", raw_deflate),
+            ("br", brotli(long.as_bytes())),
+            ("zstd", zstd(long.as_bytes())),
+            ("gzip, br", brotli(&gzip(long.as_bytes()))),
+            ("identity, gzip", gzip(long.as_bytes())),
+            ("identity", long.as_bytes().to_vec()),
+        ] {
+            let got = strict(enc, &data, u64::MAX).unwrap_or_else(|e| panic!("{enc}: {e}"));
+            assert!(got == long.as_bytes(), "{enc}: 解码结果与原文不符");
+        }
+    }
+
+    #[test]
+    fn strict_rejects_truncated_streams() {
+        // 回放用解码绝不能把截断流的前缀当成功（for_inspection 恰恰相反）
+        let long = SAMPLE.repeat(400);
+        let (zlib, raw_deflate) = deflate_variants(long.as_bytes());
+        for (enc, data) in [
+            ("gzip", gzip(long.as_bytes())),
+            ("deflate", zlib),
+            ("deflate", raw_deflate),
+            ("br", brotli(long.as_bytes())),
+            ("zstd", zstd(long.as_bytes())),
+        ] {
+            let cut = &data[..data.len() * 3 / 5];
+            assert!(strict(enc, cut, u64::MAX).is_err(), "{enc}: 截断流必须失败");
+        }
+    }
+
+    #[test]
+    fn strict_rejects_garbage_unknown_and_oversized() {
+        for enc in ["gzip", "br", "zstd", "deflate"] {
+            assert!(
+                strict(enc, SAMPLE.as_bytes(), u64::MAX).is_err(),
+                "{enc}: 非压缩数据必须失败"
+            );
+        }
+        let err = strict("compress", SAMPLE.as_bytes(), u64::MAX).unwrap_err();
+        assert!(err.contains("compress"), "{err}");
+        // 输出上限：恰好等于上限通过，超出 1 字节失败
+        let raw = gzip(SAMPLE.as_bytes());
+        let len = SAMPLE.len() as u64;
+        assert!(strict("gzip", &raw, len).is_ok());
+        assert!(strict("gzip", &raw, len - 1).is_err());
     }
 
     #[test]

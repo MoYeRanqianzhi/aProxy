@@ -134,6 +134,10 @@ override_headers = { "user-agent" = "my-agent/1.0" }
     让它永远进不了保活通道，所以默认必须把请求体也算进来
   - 判定在 `request_transform` **之前**、按客户端视角，转换器改写 Accept/请求体
     不影响保活选择。
+  - **`"stream": true` 的非 SSE 流**（如 Ollama 原生 API 的 NDJSON）：上游回 2xx
+    非 SSE 头时该次尝试不提交骨架，不需要重试就原样直通；若上游常需重试（重试
+    期间会提交 SSE 骨架，非 SSE 的成功体只能落进 SSE 响应里），建议该实例设
+    `keepalive_trigger = "accept"`。
 - 非法取值：toml 里的由 start 校验点名拒绝；settings.json 里的由 `aproxy doctor`
   报 error，且以它为全局默认的实例启动失败。toml 显式值 > settings.json >
   内置 `"any"`；`aproxy config --show` 展示生效来源。改后
@@ -255,8 +259,10 @@ bounded_retry_paths = [
 显示为 `?beta=***`），这只影响展示——匹配始终针对收到的原始请求目标，模式
 仍按真实查询串书写。
 
-行为细节：网络错误不受此封顶（仍无限重试）；保活通道（SSE 骨架已发出的请求）
-达上限（响应头已提交，真实状态码无法再回放）以终态 `event: error` 事件收场。未在 toml 显式配置时取 settings.json 的
+行为细节：网络错误不受此封顶（仍无限重试）；保活适用的请求达上限时，若响应头
+尚未提交（失败都很快，常态）同样原样透传真实失败响应，只有响应头已被保活节拍
+以骨架提交（失败本身慢于一个保活间隔）才以终态 `event: error` 事件收场（状态行
+已发出，真实状态码无法再回放）。未在 toml 显式配置时取 settings.json 的
 `bounded_retry_paths`（全局默认空）。改后 `aproxy restart <端口或别名>` 生效。
 
 > 典型场景：Claude Code 走非官方 API（聚合/镜像上游）时 /compact 无限卡住、

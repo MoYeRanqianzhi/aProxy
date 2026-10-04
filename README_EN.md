@@ -14,7 +14,8 @@ byte-for-byte. Your client never notices the storm upstream; it only notices
 that the request took a little longer. (Two explicit exceptions: `forward_only`
 mode gives up that retry guarantee for true streaming passthrough, and
 `bounded_retry_paths` passes through the real response after 3 failures for
-matched paths; see Configuration.)
+matched paths, except that a streaming request whose headers were already
+committed by keepalive ends with a terminal SSE error event; see Configuration.)
 
 [中文](README.md)
 
@@ -27,7 +28,8 @@ matched paths; see Configuration.)
   explicit trade that drops retries for streamed request/response passthrough)
   and `bounded_retry_paths` (for upstream endpoints that fail deterministically,
   the real response is passed through after 3 attempts instead of waiting
-  forever).
+  forever; only a streaming request whose headers keepalive already committed
+  is told via a terminal SSE error event instead).
 - **Total passthrough** — Transparency as a principle. Paths, queries, and
   headers forwarded untouched; control traffic rides a separate named pipe,
   so the proxy port does exactly one thing.
@@ -313,11 +315,17 @@ contains `text/event-stream`, or the body has a top-level `"stream": true`
 (default `any` = either). Eligible requests use the keepalive channel from the
 **first** attempt:
 
-- If the upstream answers 2xx with an uncompressed `text/event-stream`, its real
-  status and headers are forwarded to the client immediately (when no
-  `response_transform` is configured); otherwise, after about one keepalive
-  interval (or as soon as the first attempt needs a retry), skeleton headers
-  (200 + SSE) are committed.
+- If any attempt gets a 2xx with an uncompressed `text/event-stream` from the
+  upstream, its real status and headers are forwarded to the client immediately
+  (when no `response_transform` is configured); otherwise, after about one
+  keepalive interval, skeleton headers (200 + SSE) are committed. Needing a
+  retry does not commit anything by itself, so a request that succeeds after a
+  few quick retries still gets the real upstream response.
+- A `"stream": true` stream that is not SSE (e.g. NDJSON from Ollama's native
+  API) passes through unaltered when no retry is needed; if that upstream often
+  needs retries (a retry lasting past one keepalive interval commits SSE
+  skeleton headers, rewriting the content type and mixing in heartbeats), set
+  `keepalive_trigger = "accept"` for that instance.
 - Once committed, SSE comment heartbeats go out every
   `keepalive_interval_secs` while waiting for the first byte, while the
   upstream is in flight, while its stream is being buffered and during backoff;

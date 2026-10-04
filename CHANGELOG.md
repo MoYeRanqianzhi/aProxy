@@ -12,7 +12,7 @@
 
 - **入站来源校验**：新增配置字段 `allowed_hosts`、`allowed_origins`（每份 `config.toml` 与 `settings.json` 全局默认均可配置，toml 优先）。Host 校验防 DNS 重绑定，Origin 校验防网页借本机代理调用上游；被拒请求在本地返回 403，不转发上游、不注入 `api_key`、不进入重试。用法见 README「入站来源校验」。
 - **保活触发条件 `keepalive_trigger`**：新增配置字段（`config.toml` 与 `settings.json` 全局默认均可配置，toml 优先），取值 `accept`（`Accept` 含 `text/event-stream`）/ `body_stream`（请求体顶层 `"stream": true`）/ `any`（任一，默认）；非法值启动报错、`aproxy doctor` 报 settings 里的非法值，`config --show` 展示。`forward_only` 下无效。
-- **保活首轮提交与全程心跳**：保活适用的请求从首轮起保活——上游 2xx + 未压缩的 `text/event-stream` 时立即转发上游真实状态码与响应头，否则约一个保活间隔后（或首轮就需要重试时）提交骨架头（200 + SSE）；等首字节、上游在途、缓冲、退避全程发 SSE 注释心跳，响应体仍缓冲完整后回放。已提交的响应等待 590 秒以上后客户端断开时，日志会提示 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`。
+- **保活首轮提交与全程心跳**：保活适用的请求从首轮起保活——任一次尝试拿到上游 2xx + 未压缩的 `text/event-stream` 头时立即转发上游真实状态码与响应头，否则约一个保活间隔后提交骨架头（200 + SSE）；「需要重试」本身不提交，重试几次后很快成功的请求仍拿到上游真实头。上游回 2xx 但非 SSE（如 `"stream": true` 的 NDJSON）时该次尝试不提交骨架，成功即原样直通（若该上游常需重试，建议该实例设 `keepalive_trigger = "accept"`）。等首字节、上游在途、缓冲、退避全程发 SSE 注释心跳，响应体仍缓冲完整后回放。已提交的响应等待 590 秒以上后客户端断开时，日志会提示 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`。
 - **`aproxy install --pre` 与更新通道**：`install` 的 `latest` 分通道——当前是正式版只取正式版，当前是预发布默认含预发布，`--pre` 显式含预发布；只认 `vX.Y.Z[-(alpha|beta|rc).N]`、按版本号取最大，通道为空时保持现状。
 - **滚动升级失败回滚**：滚动重启时某实例在新版本下起不来，`install` 用旧二进制按原参数把它拉回、中止滚动并以非零退出；unix 交换前保留旧二进制为 `bin/aproxy.old`。
 - **接入 Claude Code 说明**：README、安装指南与 skill 补充 `ANTHROPIC_BASE_URL` 与必设的 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`（原因与实测依据见 README「接入 Claude Code」）。
@@ -28,7 +28,7 @@
 - **进程身份判定去名称化**：实例与看护者的身份按 pid + 进程创建时间核验，不再依赖二进制文件名——改名部署的实例同样受看门狗看护，`stop --force` 也不再比对镜像名。注册表与 IPC 新增 `process_start` 字段。
 - **restart 先预检后停止**：停旧实例前先校验新配置，预检失败不动旧实例并报告原因；`restart all` 逐个预检、失败的跳过、最后汇总并以非零退出；新实例启动即退出时展示 `startup.log` 的新增内容。
 - **安装脚本选版规则**：只认 `vX.Y.Z` 与 `vX.Y.Z-(alpha|beta|rc).N` 格式的 tag（排除 `format-v*` 与 `v0.1.0-alpha.12t3` 这类历史测试 tag）并跳过 draft；默认安装版本号最大的稳定版，仓库尚无稳定版时（0.1.0 发布前）回退到版本号最大的预发布并提示；`--pre` 让预发布也参与，取版本号最大者（按版本号而非创建时间）。
-- **保活适用的请求发往上游时 `accept-encoding` 改为 `identity`**：往压缩流里插入明文心跳会让客户端解压失败，这是对「完全透传」的有意例外；不适用保活的请求不改写。受限重试路径（`bounded_retry_paths`）在响应头已提交的保活请求上达上限时，改以终态 SSE `event: error` 事件收场，无法再透传真实状态码。
+- **保活适用的请求发往上游时 `accept-encoding` 改为 `identity`**：往压缩流里插入明文心跳会让客户端解压失败，这是对「完全透传」的有意例外；不适用保活的请求不改写。上游无视该要求仍回压缩体、而响应头已以骨架提交时，回放前完整解码（截断/损坏则以终态 SSE `event: error` 事件收场）。受限重试路径（`bounded_retry_paths`）在保活请求上达上限时：响应头尚未提交（常态）照常透传真实失败响应；只有已被保活节拍提交了骨架头的，才改以终态 SSE `event: error` 事件收场。
 - **`npm` 预发布发 `next` 标签**：预发布发在 `next`，正式版发 `latest`；正式版发布后 `npm i -g @meowo/aproxy` 只会装到正式版，预发布需 `@meowo/aproxy@next`。
 - **外部转换器错误按成因表述**：进程/管道层故障、format 自报错误、协议违规的 502 文案各不相同；官方 `aproxy-format` 的 `client_format = "auto"` 改为只放行同协议，跨协议路由在请求侧直接报错并提示显式声明（该项随 `aproxy-format` 新版本生效）。
 - 新装机的安装收尾提示改为先 `aproxy config --baseurl … --api-key …` 再 `aproxy`。

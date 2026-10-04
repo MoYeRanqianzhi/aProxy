@@ -956,26 +956,25 @@ async fn spool_chunk(buf: &mut SpoolBuffer, chunk: &[u8], spool_dir: Option<&Pat
                 mem.extend_from_slice(chunk);
                 return;
             };
-            let path = dir.join(format!(
+            // 文件一创建就交给 SpoolPath 守卫：下面两次 write_all（含 1 MiB 的
+            // 内存前缀）期间本 future 随时可能被 drop（客户端断开），守卫保证
+            // 迁移中途的半截文件同样被删
+            let path = SpoolPath(dir.join(format!(
                 "spool-{}-{}.spooltmp",
                 std::process::id(),
                 unique_seq()
-            ));
-            match tokio::fs::File::create(&path).await {
+            )));
+            match tokio::fs::File::create(&path.0).await {
                 Ok(mut file) => {
                     if file.write_all(mem).await.is_ok() && file.write_all(chunk).await.is_ok() {
                         let len = (mem.len() + chunk.len()) as u64;
-                        *buf = SpoolBuffer::Disk {
-                            file,
-                            path: SpoolPath(path),
-                            len,
-                        };
+                        *buf = SpoolBuffer::Disk { file, path, len };
                         return;
                     }
-                    // 写失败：文件句柄已创建但内容不完整，删除；保持 Memory 退化
+                    // 写失败：文件句柄已创建但内容不完整，删除（关句柄后守卫
+                    // 随作用域结束删文件）；保持 Memory 退化
                     //（create 成功 write 失败极罕见，但半截文件绝不能留下）
                     drop(file);
-                    let _ = std::fs::remove_file(&path);
                     mem.extend_from_slice(chunk);
                 }
                 Err(_) => mem.extend_from_slice(chunk),
@@ -3022,6 +3021,38 @@ mod tests {
             0,
             "被丢弃的 spool 缓冲必须删除自己的临时文件"
         );
+    }
+
+    #[tokio::test]
+    async fn spool_chunk_dropped_mid_disk_transition_leaves_no_file() {
+        // 内存 → 磁盘迁移本身要好几次 await（建文件、写 1 MiB 内存前缀、写本块）；
+        // future 恰在这期间被 drop（客户端断开）时，已建出的文件也必须删除。
+        // 逐次 poll，文件一出现就丢弃 future——正落在迁移中途
+        let dir = tempfile::tempdir().unwrap();
+        let mut buf = SpoolBuffer::Memory(vec![b'x'; RESIDENT_LIMIT]);
+        let chunk = vec![b'y'; 1024];
+        let count = || std::fs::read_dir(dir.path()).unwrap().count();
+        {
+            let fut = spool_chunk(&mut buf, &chunk, Some(dir.path()));
+            tokio::pin!(fut);
+            loop {
+                let polled = std::future::poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await;
+                assert!(polled.is_pending(), "前提：迁移不应在文件出现前就一次完成");
+                if count() > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        // 阻塞池里在途的写操作可能还持着句柄：删除已发出，等它收尾
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while count() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "迁移中途被丢弃的 spool 文件必须删除"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]

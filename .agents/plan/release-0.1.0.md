@@ -122,8 +122,17 @@
   15 分钟、11 次主请求全部 retry-count=0、输出完整）；新语义下第 4 次的 200 SSE 头被先行提交，
   其流断开后重试仍在同一已提交响应内完成
 - [x] ssh remote 全新目录全量（2026-10-04，6216f4b，Ubuntu glibc 2.39）：14 个测试二进制 427 项全过，fmt/clippy 干净。302f687 在新目录重跑：439 项全过，fmt/clippy 干净
-- [ ] Linux gnu 产物 glibc 下限：remote 无 zig，改由 rc 演练时 release.yml 的构建断言验证
+- [x] Linux gnu 产物 glibc 下限：rc.1 发版 run 的 zigbuild 构建与 glibc 断言步骤通过
 - [x] Windows 全量（302f687，独立复核）：446 项全过，clippy 干净
-- [ ] rc 演练（需用户确认后打 tag）：bump 版本 → 推送 → v0.1.0-rc.1 → 核对 release.yml 门禁、glibc 断言、npm next、crates.io 幂等、Latest 标记
+- [x] rc 演练（用户 2026-10-04 授权「全都由你来决定和操作」）：推送 main 后 CI windows/ubuntu 绿、
+  macos 仍是已知 3 个失败；v0.1.0-rc.1 发版 run 37192248986 全部 job 成功（测试门禁、11 个构建含
+  zigbuild glibc 2.28 断言、Release、npm、crates.io）。核对：GitHub 标 Pre-release 且未抢 Latest；
+  npm next=0.1.0-rc.1、latest 仍 alpha.17；crates.io 有 0.1.0-rc.1。实装：remote 上 install.sh
+  默认与 --pre 都装到 rc.1；Windows PS 5.1 `irm | iex`（经 7890 代理，本机直连 GitHub 被重置）装到
+  rc.1；remote 上 alpha.17 官方二进制的隔离实例执行无参 `aproxy install` 滚动升级到 rc.1 成功，
+  rc.1 再执行 install 提示「已是最新」。install.cmd 的真实下载因本机网络未验证
+- [ ] format-v0.1.1：Release 已建，npm 与 crates.io 发布失败（可信发布未配全，本机凭据失效），
+  待所有者补齐后 rerun（见 TODO 与 trusted-publishing-p0 记忆）
+- [ ] rc.1 release 构建的真实 Claude Code 验收（同一时间线）进行中 → 通过后打 v0.1.0
 - 待办：aproxy-format 需发 format 新版本才能让 transform-03 生效；doctor 测试不隔离
   主目录（未进 0.1.0，见 TODO）

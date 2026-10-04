@@ -11,7 +11,8 @@
 对真实 Claude Code 端到端成立。macOS 不在本轮范围。
 
 - [x] WS-1a 入站 Host/Origin 校验 + 凭据统一脱敏 + spool flush + ubuntu CI 测试修复（已合并）
-- [ ] WS-1b 保活触发条件 + 首轮提交 + 在途心跳：已合并（b9b1f7d）；对抗审查无 P0，修复轮进行中（P1 NDJSON 被骨架改写、P2 压缩体回放与 spool 泄漏、受限路径恢复透传真实状态码、两处测试缺口）
+- [x] WS-1b 保活触发条件 + 首轮提交 + 在途心跳：已合并（b9b1f7d）；对抗审查无 P0，修复轮已合并（302f687：P1 NDJSON 被骨架改写、P2 压缩体回放与 spool 泄漏、受限路径未提交时透传真实状态码、两处测试缺口）
+- [ ] 0.1.0 之后：`read_request_body`（src/proxy.rs:472 附近）上传请求体落盘时只在显式错误分支删文件，handler future 写盘中途被 drop 可能残留 req-*.spooltmp 到重启（与已修的响应 spool 同类；仅读代码判断，未复现）
 - [ ] 0.1.0 之后：保活已提交后的 response_transform 与请求转换不在心跳节拍内（transform timeout_secs = 0 时字节间隔无上界）；identity 改写静默覆盖 override_headers 里用户配的 accept-encoding，可考虑打一次日志（WS-1b 审查 P3-5、P3-6）
 - [x] WS-2 转换器进程池加固 + aproxy-format auto 模式（已合并；aproxy-format 需新的 format-v* 发版才生效）
 - [x] WS-3 身份判定去名称化 + 重拉换端口残留 + restart 预检 / stop --force 清理（已合并）

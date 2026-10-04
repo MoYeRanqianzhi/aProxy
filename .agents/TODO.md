@@ -19,8 +19,9 @@
 - [x] WS-4 更新通道 + 滚动升级失败回滚（已合并；选版只认项目版本号文法，见 0dc9440）
 - [x] WS-5a CI/发布门禁、发布幂等、GLIBC 2.28 下限、workflow 权限、format 线隔离、npm dist-tag（已合并）
 - [x] WS-5b 一键脚本批量修复 + glibc 探测与 musl 回退（已合并；三脚本选版与 Rust 侧统一，0dc9440）
-- [ ] WS-6 文档与 skill 对齐：首轮已合并（d481ba7、b45a399）；补写 WS-1b/WS-4/WS-5a 的文档影响进行中
-- [ ] 全量验证（Windows / ssh remote / WSL）+ 真实 Claude Code 无限重试验收（>600s）+ 合并后审查
+- [x] WS-6 文档与 skill 对齐：两轮已合并（d481ba7、9c0ba4b），修复轮文档随 302f687
+- [x] 全量验证 + 真实 Claude Code 无限重试验收（>600s）+ 合并后审查：302f687 上 Windows 446 / Linux 439 全过，验收两次通过（见计划进度节）
+- [ ] rc 演练（v0.1.0-rc.1，需用户确认推送与打 tag）；Linux gnu 产物 glibc 下限由演练时的构建断言验证
 - [ ] 发版前 bump Cargo.toml 版本为 0.1.0（文档已按 0.1.0 写）
 - [ ] 所有者人工项：Trusted Publisher 绑定核对（aproxy-envelope、aproxy-format、@meowo/aproxy-format*）、release environment 保护规则、分支保护、CARGO_REGISTRY_TOKEN 迁入受保护环境、开启私密漏洞报告（SECURITY.md 指向它，当前 enabled:false）
 - [ ] 0.1.0 之后：doctor 测试不隔离主目录——`doctor::run` 的目录扫描、默认配置与运行实例端口检查都从进程环境的 APROXY_HOME（未设 = ~/.aproxy）推导，开发机上 `doctor_clean_when_all_good` 会读到真实配置、可能误报失败。修法方向：从 settings.json 所在目录推导主目录并逐层传参。跑全量测试前先把 APROXY_HOME 指向临时目录可规避

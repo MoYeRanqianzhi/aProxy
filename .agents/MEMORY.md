@@ -31,3 +31,4 @@
 - [外部转换器 format](memory/2026-09-23-transform-format.md) — 信封协议（一行 JSON stdin/stdout）+进程池（OJ 多轮式 while 串行，EOF 回收铁律）；两侧失败语义不对称（请求 502 不重试/响应透传）；workspace 三成员体积隔离；aproxy-format 独立发版 format-v* 线；npm skill 包形态变更旧版自愈 [[transform-format]] [[bounded-retry-paths]] [[release-engineering]]
 - [Claude Code 流超时实测](memory/claude-code-stream-watchdogs.md) — 2026-10-04 黑盒实测：Accept: application/json + stream:true；首字节 ~360s / 字节空闲 300s / 事件空闲 600s（注释与 ping 都不算事件，须客户端设 CLAUDE_STREAM_IDLE_TIMEOUT_MS）
 - [共用 target 目录测到旧代码](memory/2026-10-04-shared-target-dir-stale-tests.md) — worktree 与主工作区共用 CARGO_TARGET_DIR 时 cargo 按 mtime 误判新鲜、静默执行旧二进制（实测 73 项冒充 86 项）；各用独立目录，汇报附测试数 [[unix-stress-review]]
+- [GitHub 发布安全设置](memory/2026-10-04-github-release-settings.md) — 私密漏洞报告开；release 环境只许 v* / format-v* tag 部署（新 tag 格式须加 policy）；main 禁强推删除不强制 PR；CARGO_REGISTRY_TOKEN 留仓库级的原因 [[trusted-publishing-p0]]

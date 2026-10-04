@@ -4,29 +4,20 @@
 > 2026-09-08 补录 tag 之后一轮（性能优化 + 磁盘缓存 + 重构 + skill），全部已完成。
 > 2026-09-09 第四轮审查修复 + 实测 restart bug + skill 指引优化，全部已完成。
 
-## 0.1.0 正式发布修复（2026-10-04 用户批准审查建议，进行中）
+## 0.1.0 已发布（2026-10-04）
 
-计划与进度：[release-0.1.0](plan/release-0.1.0.md)；依据：
-`.agents/review/2026-10-04-0.1.0发布前-13维审查.md`。硬验收：默认配置下无限重试
-对真实 Claude Code 端到端成立。macOS 不在本轮范围。
+v0.1.0 已发布：GitHub Latest、npm `latest`、crates.io 均为 0.1.0（rc.1 演练在先）。硬验收「默认配置下无限重试对真实
+Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）；Codex 经正反黑盒实测确认需调 `stream_idle_timeout_ms`。
+发布计划已结束并删除，最后版本见 `git show 58e62cd:.agents/plan/release-0.1.0.md`；审查依据见
+`.agents/review/2026-10-04-0.1.0发布前-13维审查.md`。
 
-- [x] WS-1a 入站 Host/Origin 校验 + 凭据统一脱敏 + spool flush + ubuntu CI 测试修复（已合并）
-- [x] WS-1b 保活触发条件 + 首轮提交 + 在途心跳：已合并（b9b1f7d）；对抗审查无 P0，修复轮已合并（302f687：P1 NDJSON 被骨架改写、P2 压缩体回放与 spool 泄漏、受限路径未提交时透传真实状态码、两处测试缺口）
+## 0.1.x 后续
+
 - [ ] 0.1.0 之后：`read_request_body`（src/proxy.rs:472 附近）上传请求体落盘时只在显式错误分支删文件，handler future 写盘中途被 drop 可能残留 req-*.spooltmp 到重启（与已修的响应 spool 同类；仅读代码判断，未复现）
 - [ ] 0.1.x 候选：断开提示日志泛化——`src/proxy.rs` 现只在已提交响应等待 ≥590s 后断开时提示 CLAUDE_STREAM_IDLE_TIMEOUT_MS；Codex 默认 300s 就断开，触发不到。改为「客户端在只有心跳的等待中断开」即提示检查客户端的流空闲超时（不点名、不按客户端特判），见 behaviors.md「接入 agent 客户端」
 - [ ] 0.1.x 候选：让 Gemini 流也能保活——可配置的按路径/查询触发保活（正则，参照 bounded_retry_paths，不内置 URL）+ 可选心跳格式（空行而非注释：Gemini CLI 锁定的 @google/genai 1.30.0 遇注释吞掉整段响应，空行实测无害）。需先评估空行心跳对其他客户端的影响（见 gemini-cli-sse-parsing 记忆）
 - [ ] 0.1.0 之后：保活已提交后的 response_transform 与请求转换不在心跳节拍内（transform timeout_secs = 0 时字节间隔无上界）；identity 改写静默覆盖 override_headers 里用户配的 accept-encoding，可考虑打一次日志（WS-1b 审查 P3-5、P3-6）
-- [x] WS-2 转换器进程池加固 + aproxy-format auto 模式（已合并；aproxy-format 需新的 format-v* 发版才生效）
-- [x] WS-3 身份判定去名称化 + 重拉换端口残留 + restart 预检 / stop --force 清理（已合并）
-- [x] WS-4 更新通道 + 滚动升级失败回滚（已合并；选版只认项目版本号文法，见 0dc9440）
-- [x] WS-5a CI/发布门禁、发布幂等、GLIBC 2.28 下限、workflow 权限、format 线隔离、npm dist-tag（已合并）
-- [x] WS-5b 一键脚本批量修复 + glibc 探测与 musl 回退（已合并；三脚本选版与 Rust 侧统一，0dc9440）
-- [x] WS-6 文档与 skill 对齐：两轮已合并（d481ba7、9c0ba4b），修复轮文档随 302f687
-- [x] 全量验证 + 真实 Claude Code 无限重试验收（>600s）+ 合并后审查：302f687 上 Windows 446 / Linux 439 全过，验收两次通过（见计划进度节）
-- [ ] rc 演练（v0.1.0-rc.1，需用户确认推送与打 tag）；Linux gnu 产物 glibc 下限由演练时的构建断言验证
-- [ ] 发版前 bump Cargo.toml 版本为 0.1.0（文档已按 0.1.0 写）
 - [ ] 所有者人工项（format 线发布受阻）：crates.io 给 aproxy-format、aproxy-envelope 加 `release-format.yml` 可信发布配置；npm 给 @meowo/aproxy-format 及 10 个平台包绑定 Trusted Publisher；之后 `gh run rerun 37192303424 --failed` 补发 format 0.1.1（详见 trusted-publishing-p0 记忆）
-- [x] 仓库设置（2026-10-04，用户授权主代理操作）：私密漏洞报告已开；release 环境只许 v* / format-v* tag 部署；main 禁强推与删除；CARGO_REGISTRY_TOKEN 无法读回原值，留在仓库级（见 github-release-settings 记忆）
 - [ ] 0.1.0 之后：doctor 测试不隔离主目录——`doctor::run` 的目录扫描、默认配置与运行实例端口检查都从进程环境的 APROXY_HOME（未设 = ~/.aproxy）推导，开发机上 `doctor_clean_when_all_good` 会读到真实配置、可能误报失败。修法方向：从 settings.json 所在目录推导主目录并逐层传参。跑全量测试前先把 APROXY_HOME 指向临时目录可规避
 
 ## 外部转换器（format）+ aproxy-format（2026-09-23 下令，2026-09-30 完成）

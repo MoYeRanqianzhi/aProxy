@@ -39,7 +39,7 @@ metadata:
 （`claude -p`），mock 记录每次请求到达时刻与连接重置时刻；二进制内报错文案
 「A proxy or gateway that buffers streaming responses can cause this — set
 CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS」与上表一致。实验脚本与方法见
-[release-0.1.0 计划](../plan/release-0.1.0.md) 的证据节。
+release-0.1.0 计划的证据节（计划已删除，见 `git show 58e62cd:.agents/plan/release-0.1.0.md`）。
 
 **附带观察**（2026-10-04 验收时 claude 的 stderr）：请求经 127.0.0.1 网关时，Claude Code 提示 auto mode 的分类器请求无法享受新的免计费方式，需要网关实现 https://code.claude.com/docs/en/auto-mode-classifier-billing 。不影响功能，可作为 0.2.x 的功能候选，未评估。
 

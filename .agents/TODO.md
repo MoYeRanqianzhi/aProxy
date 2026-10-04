@@ -17,7 +17,7 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] 0.1.x 候选：断开提示日志泛化——`src/proxy.rs` 现只在已提交响应等待 ≥590s 后断开时提示 CLAUDE_STREAM_IDLE_TIMEOUT_MS；Codex 默认 300s 就断开，触发不到。改为「客户端在只有心跳的等待中断开」即提示检查客户端的流空闲超时（不点名、不按客户端特判），见 behaviors.md「接入 agent 客户端」
 - [ ] 0.1.x 候选：让 Gemini 流也能保活——可配置的按路径/查询触发保活（正则，参照 bounded_retry_paths，不内置 URL）+ 可选心跳格式（空行而非注释：Gemini CLI 锁定的 @google/genai 1.30.0 遇注释吞掉整段响应，空行实测无害）。需先评估空行心跳对其他客户端的影响（见 gemini-cli-sse-parsing 记忆）
 - [ ] 0.1.0 之后：保活已提交后的 response_transform 与请求转换不在心跳节拍内（transform timeout_secs = 0 时字节间隔无上界）；identity 改写静默覆盖 override_headers 里用户配的 accept-encoding，可考虑打一次日志（WS-1b 审查 P3-5、P3-6）
-- [ ] 所有者人工项（format 线 npm 发布受阻）：npm 给 @meowo/aproxy-format 及 10 个平台包绑定 Trusted Publisher（网页 2FA，代理无法代办），之后 `gh run rerun 37192303424 --failed` 补发 npm 上的 format 0.1.1。crates.io 侧已于 2026-10-04 补齐并发布 0.1.1（详见 trusted-publishing-p0 记忆）
+- [ ] 所有者人工项（format 线 npm 发布受阻）：npm 给 @meowo/aproxy-format 主包及 9 个平台包（共 10 个）绑定 Trusted Publisher（网页 2FA，代理无法代办），之后 `gh run rerun 37192303424 --failed` 补发 npm 上的 format 0.1.1。crates.io 侧已于 2026-10-04 补齐并发布 0.1.1（详见 trusted-publishing-p0 记忆）
 - [ ] 0.1.0 之后：doctor 测试不隔离主目录——`doctor::run` 的目录扫描、默认配置与运行实例端口检查都从进程环境的 APROXY_HOME（未设 = ~/.aproxy）推导，开发机上 `doctor_clean_when_all_good` 会读到真实配置、可能误报失败。修法方向：从 settings.json 所在目录推导主目录并逐层传参。跑全量测试前先把 APROXY_HOME 指向临时目录可规避
 
 ## 外部转换器（format）+ aproxy-format（2026-09-23 下令，2026-09-30 完成）

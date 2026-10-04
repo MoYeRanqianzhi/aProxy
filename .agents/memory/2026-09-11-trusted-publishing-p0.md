@@ -33,7 +33,7 @@
   release-format.yml（#23481）与 release.yml（#23482，主线在 envelope 版本变动时也会发布它）；
   aproxy 仍是 release.yml（#19617）。随后单独重跑 publish-format-crates，aproxy-format 0.1.1
   经 OIDC 发布成功（crates.io 的 trustpub_data 指向 run 37192303424）。
-- **npm**：`@meowo/aproxy-format` 及 10 个平台包没有绑定 Trusted Publisher，OIDC
+- **npm**：`@meowo/aproxy-format` 主包及 9 个平台包（共 10 个）没有绑定 Trusted Publisher，OIDC
   发布返回 PUT 404（与第 1/2 条同一表现）。只能由所有者在网页上 2FA 绑定。
 - **本机凭据**：`~/.cargo/credentials.toml` 里的 crates.io token 已失效（发布返回
   403 authentication failed），本机 npm 未登录（401）。主代理无法替所有者补发。

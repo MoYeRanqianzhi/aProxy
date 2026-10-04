@@ -93,9 +93,11 @@ aproxy
 #    https://api.anthropic.com  →  http://127.0.0.1:12345
 ```
 
-## 接入 Claude Code
+## 接入 agent 客户端
 
-把 Claude Code 指向本地代理，并**必须**调大流事件空闲超时：
+为了让「流中途断开也能透明重试」，aProxy 会缓冲完整响应、校验无误后才回放，等待期间只向客户端发 SSE 注释心跳。注释心跳能续住客户端**按字节计时**的超时，续不住**按 SSE 事件计时**的超时（注释与 `ping` 都不算事件）。客户端若有后一种超时，就**必须**调大它，否则任何超过它的重试期或长生成都会被客户端断开重发。
+
+### Claude Code
 
 ```powershell
 # PowerShell
@@ -111,7 +113,7 @@ export CLAUDE_STREAM_IDLE_TIMEOUT_MS=86400000
 claude
 ```
 
-也可以写进 Claude Code 的 `~/.claude/settings.json` 的 `env` 字段，对每个会话生效（Claude Code 官方设置文档支持该字段）：
+也可以写进 Claude Code 的 `~/.claude/settings.json` 的 `env` 字段，对每个会话生效：
 
 ```json
 {
@@ -122,7 +124,36 @@ claude
 }
 ```
 
-**为什么必须设 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`**：为了让「流中途断开也能透明重试」，aProxy 会缓冲完整响应、校验无误后才回放，等待期间只向客户端发 SSE 注释心跳。注释心跳能覆盖 Claude Code 的首字节超时（实测约 360 秒）与字节级空闲超时（300 秒），但覆盖不了**事件级空闲超时**（默认 600 秒）——注释与 `ping` 都不算事件。不设这个变量，任何超过 10 分钟的重试期或长生成都会被 Claude Code 断开后重发。`86400000`（24 小时）经实测可用；`API_TIMEOUT_MS` 不控制这道闸。以上为 Claude Code 2.1.288 的黑盒实测，其他版本的默认值请以官方文档为准。
+Claude Code 的事件级空闲超时默认 600 秒，由 `CLAUDE_STREAM_IDLE_TIMEOUT_MS` 控制，`86400000`（24 小时）经实测可用；`API_TIMEOUT_MS` 不控制这道闸。首字节（约 360 秒）与字节级空闲（300 秒）两道超时由心跳覆盖。（Claude Code 2.1.288 黑盒实测）
+
+### Codex
+
+在 `~/.codex/config.toml` 里加一个指向 aProxy 的 provider，并**必须**调大 `stream_idle_timeout_ms`：
+
+```toml
+model = "gpt-5"                     # 换成上游提供的模型名
+model_provider = "aproxy"
+
+[model_providers.aproxy]
+name = "aproxy"
+base_url = "http://127.0.0.1:12345/v1"
+env_key = "OPENAI_API_KEY"          # Codex 从该环境变量取 key；aProxy 配了 api_key 时填任意非空值
+wire_api = "responses"
+stream_idle_timeout_ms = 86400000   # 24 小时
+```
+
+Codex 的 `stream_idle_timeout_ms` 默认 300000（5 分钟），按 SSE 事件计时，注释心跳续不住；超时后自动重连，默认 5 次后本轮失败。实测：设为 60 秒时恰好 60 秒断开重连；设为 24 小时后，10 分钟以上的等待正常完成。（codex-cli 0.160.0 源码与黑盒实测）
+
+### 其他客户端
+
+| 客户端 | 接 aProxy 需要做什么 |
+|---|---|
+| Qwen Code | 设环境变量 `QWEN_STREAM_IDLE_TIMEOUT_MS=0` 与 `QWEN_STREAM_MAX_LIFETIME_MS=0`（事件级空闲默认 240 秒，另有 15 分钟流总时长上限，两个都要关） |
+| dsh（DeepSeek Harness） | 经 `llm-pi-ai` 适配器（OpenAI / Anthropic 兼容网关）接入时，给该 provider 设 `streamIdleTimeoutMs`（如 `172800000`）；`llm-deepseek` 适配器默认即可 |
+| Gemini CLI | 用 `GOOGLE_GEMINI_BASE_URL` 与 `GEMINI_API_KEY` 接入，结果正常（实测）。但它的流式请求不进保活通道，而它的响应头超时写死为 300 秒（新版更短），重试期加生成超过这个时长就会失败，没有配置可调 |
+| pi、OpenCode、Aider、Cline、Roo Code、Kimi CLI | 默认即可（只有按字节计时的超时）；OpenCode 1.18 起不要设 `timeout`，它限制的是含等待在内的整请求时长 |
+
+除 Claude Code、Codex、Gemini CLI 外，上表来自源码调研，未逐个实测。各客户端的调研版本、配置位置与依据见 skill 文档 [behaviors.md「接入 agent 客户端」](.claude/skills/aproxy-cli/references/latest/behaviors.md#接入-agent-客户端)。
 
 注意：请求体里 `"stream": false` 的普通请求没有保活通道（没有可注入心跳的响应流），首字节延迟等于完整生成时长，客户端需自行调大超时（Claude Code 为 `API_TIMEOUT_MS`）。
 

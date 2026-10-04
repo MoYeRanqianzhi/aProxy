@@ -169,10 +169,17 @@ aproxy
 #    https://api.anthropic.com  →  http://127.0.0.1:12345
 ```
 
-## Using with Claude Code
+## Using with agent clients
 
-Point Claude Code at the local proxy and **raise the stream event-idle
-timeout**:
+So that a stream which breaks mid-way can still be retried transparently, aProxy
+buffers the whole upstream response, checks it, and only then replays it; while
+it waits, the client receives nothing but SSE comment heartbeats. Heartbeats keep
+alive any client timeout measured **between bytes**, but not one measured
+**between SSE events** (comments and `ping` are not events). If a client has the
+latter, you **must** raise it, or any retry period or long generation longer than
+it makes the client disconnect and resend.
+
+### Claude Code
 
 ```powershell
 # PowerShell
@@ -188,9 +195,8 @@ export CLAUDE_STREAM_IDLE_TIMEOUT_MS=86400000
 claude
 ```
 
-Or put them in the `env` field of Claude Code's `~/.claude/settings.json`,
-which applies to every session (the field is supported by Claude Code's
-official settings documentation):
+Or put them in the `env` field of Claude Code's `~/.claude/settings.json`, which
+applies to every session:
 
 ```json
 {
@@ -201,22 +207,53 @@ official settings documentation):
 }
 ```
 
-**Why `CLAUDE_STREAM_IDLE_TIMEOUT_MS` is required**: so that a stream broken
-midway can still be retried transparently, aProxy buffers the whole response
-and only replays it once it checks out; while waiting it sends nothing but SSE
-comment heartbeats. Comment heartbeats cover Claude Code's first-byte timeout
-(about 360 s measured) and its byte-level idle timeout (300 s), but **not** the
-event-level idle timeout (600 s by default) — neither comments nor `ping`
-count as events. Without the variable, any retry period or long generation
-beyond 10 minutes makes Claude Code disconnect and resend. `86400000` (24 h)
-was verified to work; `API_TIMEOUT_MS` does not control this timer. These are
-black-box measurements on Claude Code 2.1.288; for other versions check the
-official documentation for the defaults.
+Claude Code's event-level idle timeout defaults to 600 s and is controlled by
+`CLAUDE_STREAM_IDLE_TIMEOUT_MS`; `86400000` (24 h) is verified to work.
+`API_TIMEOUT_MS` does not control this timer. The first-byte (about 360 s) and
+byte-level idle (300 s) timeouts are covered by the heartbeats. (Black-box
+measurements on Claude Code 2.1.288.)
 
-Note: ordinary requests with `"stream": false` have no keepalive channel (there
-is no response stream to inject heartbeats into), so the first-byte delay equals
-the full generation time and the client has to raise its own timeout (for
-Claude Code, `API_TIMEOUT_MS`).
+### Codex
+
+Add a provider pointing at aProxy to `~/.codex/config.toml`, and **raise**
+`stream_idle_timeout_ms`:
+
+```toml
+model = "gpt-5"                     # use a model name your upstream serves
+model_provider = "aproxy"
+
+[model_providers.aproxy]
+name = "aproxy"
+base_url = "http://127.0.0.1:12345/v1"
+env_key = "OPENAI_API_KEY"          # Codex reads the key from this variable; any non-empty value works if aProxy sets api_key
+wire_api = "responses"
+stream_idle_timeout_ms = 86400000   # 24 h
+```
+
+Codex's `stream_idle_timeout_ms` defaults to 300000 (5 min) and is measured
+between SSE events, so heartbeats do not reset it; on timeout Codex reconnects,
+and the turn fails after 5 attempts by default. Measured: with 60 s it
+disconnects exactly 60 s after the headers; with 24 h a wait of over 10 minutes
+completes normally. (codex-cli 0.160.0 source and black-box test.)
+
+### Other clients
+
+| Client | What to do with aProxy |
+|---|---|
+| Qwen Code | Set `QWEN_STREAM_IDLE_TIMEOUT_MS=0` and `QWEN_STREAM_MAX_LIFETIME_MS=0` (event-level idle defaults to 240 s, plus a 15-minute stream lifetime cap; turn off both) |
+| dsh (DeepSeek Harness) | Through the `llm-pi-ai` adapter (OpenAI / Anthropic compatible gateways), set `streamIdleTimeoutMs` on that provider (e.g. `172800000`); the `llm-deepseek` adapter works as is |
+| Gemini CLI | Connect with `GOOGLE_GEMINI_BASE_URL` and `GEMINI_API_KEY`; it works (measured). But its streaming requests get no keepalive channel, and its response-header timeout is hard-coded at 300 s (shorter in newer versions), so a retry period plus generation longer than that fails, with no setting to change it |
+| pi, OpenCode, Aider, Cline, Roo Code, Kimi CLI | Defaults are fine (byte-level timeouts only); with OpenCode 1.18+ do not set `timeout`, which caps the whole request including the wait |
+
+Apart from Claude Code, Codex and Gemini CLI, the table comes from reading
+source code and was not tested client by client. Versions, config locations and
+evidence are in the skill document
+[behaviors.md, "接入 agent 客户端"](.claude/skills/aproxy-cli/references/latest/behaviors.md#接入-agent-客户端).
+
+Note: plain requests with `"stream": false` in the body have no keepalive
+channel (there is no response stream to inject heartbeats into), so the first
+byte arrives only after the whole generation; the client must raise its own
+timeout (for Claude Code, `API_TIMEOUT_MS`).
 
 ## Commands
 

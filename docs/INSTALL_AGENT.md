@@ -176,6 +176,32 @@ local endpoint: **`http://127.0.0.1:12345`**.
   resend. `API_TIMEOUT_MS` does not control this timer. (Measured on Claude Code
   2.1.288; ordinary `"stream": false` requests have no keepalive channel and
   need a large client timeout — `API_TIMEOUT_MS` for Claude Code.)
+- **Codex** — add a provider pointing at aProxy to `~/.codex/config.toml` (or
+  `$CODEX_HOME/config.toml`) and raise `stream_idle_timeout_ms` (**required**):
+
+  ```toml
+  [model_providers.aproxy]
+  name = "aproxy"
+  base_url = "http://127.0.0.1:12345/v1"
+  env_key = "OPENAI_API_KEY"   # any non-empty value works if aProxy sets api_key
+  wire_api = "responses"
+  stream_idle_timeout_ms = 86400000
+  ```
+
+  Then select it with `model_provider = "aproxy"` (and a `model` the upstream
+  serves). Merge this into the user's existing config instead of overwriting
+  it, and ask before switching their default `model_provider`. Codex's
+  `stream_idle_timeout_ms` defaults to 300 s and is measured between SSE events,
+  which the heartbeats do not reset: without it any wait beyond 5 minutes makes
+  Codex disconnect and reconnect, and the turn fails after 5 attempts.
+  (Measured on codex-cli 0.160.0.)
+- **Other clients** — see the README section "Using with agent clients". In
+  short: Qwen Code needs `QWEN_STREAM_IDLE_TIMEOUT_MS=0` and
+  `QWEN_STREAM_MAX_LIFETIME_MS=0`; dsh through its `llm-pi-ai` adapter needs
+  `streamIdleTimeoutMs` on that provider; Gemini CLI works with
+  `GOOGLE_GEMINI_BASE_URL` + `GEMINI_API_KEY` but is limited by its hard-coded
+  300 s response-header timeout; pi, OpenCode, Aider, Cline, Roo Code and Kimi
+  CLI work with their defaults.
 - Configure your API base URL to the local endpoint; keep the request path
   unchanged (e.g. `https://api.anthropic.com/v1/messages` becomes
   `http://127.0.0.1:12345/v1/messages`).

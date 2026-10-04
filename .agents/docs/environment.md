@@ -48,8 +48,11 @@
   **教训**：新增依赖后，WSL 不再能靠 `git pull` 直接验证。
 - **远端 `ssh remote`**（Ubuntu，kernel 6.8，x86_64，10 核）：工具链在
   `~/.cargo/bin`（非交互 shell 的 PATH 里没有，须 `export PATH=$HOME/.cargo/bin:$PATH`），
-  有 git 与 curl，网络正常。历史测试克隆散落在 `/root/aproxy-{e2e,fix,test,unixfix}`，
-  **新验证请用全新目录**（如 `/root/aproxy-wfverify`）克隆，别覆盖它们。
+  有 git 与 curl，网络正常，没有 zig（无法本地复现 cargo-zigbuild 的 glibc 下限构建）。
+  历史测试目录与残留守护进程已于 2026-10-04 清空（用户授权）。**新验证用全新目录**
+  （本机 `git archive HEAD` 打包 scp 过去即可，不必联网克隆），结束后删除；长命令用
+  `nohup` + 远端日志文件运行，直连 ssh 的长命令曾因连接静默断开拿不到结果。
+  非交互 shell 加载工具链用 `. $HOME/.cargo/env`。
   glibc 2.39（与 CI ubuntu-24.04 同级）。
 - **CI（GitHub Actions）**：`gh run list --limit 1` 会误抓到并发的 Review workflow，
   **必须 `--workflow=CI` 过滤**（见 [[2026-09-11-ci-unix-blindspot]]）。

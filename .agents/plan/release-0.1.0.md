@@ -133,6 +133,7 @@
   rc.1 再执行 install 提示「已是最新」。install.cmd 的真实下载因本机网络未验证
 - [ ] format-v0.1.1：Release 已建，npm 与 crates.io 发布失败（可信发布未配全，本机凭据失效），
   待所有者补齐后 rerun（见 TODO 与 trusted-publishing-p0 记忆）
-- [ ] rc.1 release 构建的真实 Claude Code 验收（同一时间线）进行中 → 通过后打 v0.1.0
+- [x] rc.1 正式 release 构建（install.ps1 装出的 aproxy.exe）按同一时间线做真实 Claude Code 验收：退出码 0、15 分钟、11 次主请求全部 retry-count=0、输出完整（第三次通过，前两次为 b9b1f7d 与 302f687 的 debug 构建）
+- [ ] 打 v0.1.0 并核对各渠道（Latest、npm latest、crates.io max_stable、脚本默认装稳定版、旧版本 install 升级）
 - 待办：aproxy-format 需发 format 新版本才能让 transform-03 生效；doctor 测试不隔离
   主目录（未进 0.1.0，见 TODO）

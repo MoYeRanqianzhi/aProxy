@@ -100,7 +100,7 @@
 - [x] WS-1a 已合并（64aeaf2；真实 Claude Code 不发 Origin、Host 为 127.0.0.1:端口，已核对抓包）；WS-3 已合并（5c71f35，进程身份改为 pid + 创建时间，旧记录保守不误杀）
 - [x] 第 2 波：WS-4（a171cdf）、WS-5a（d5f56b9）、WS-1b（b9b1f7d）已合并；主代理收尾项
   （--force 帮助文字、Linux clippy 两处、identity-no-name 记忆）已完成。stash@{0} 草稿
-  仍待用户决定是否丢弃
+  已丢弃（被 WS-3 取代，2026-10-04 用户授权）
 - [x] 选版只认项目版本号文法（0dc9440）：历史测试 tag alpha.12t3 按 semver 胜过 alpha.17，
   Rust 侧与三脚本统一修复；脚本在 gawk / dash+mawk / busybox / PS 5.1 / pwsh 7 / cmd 实测
 - [x] install.ps1 不能加 BOM（688bbbd）：BOM 让 irm | iex 的 param 块失效（5.1/7 实测），

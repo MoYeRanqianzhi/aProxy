@@ -37,7 +37,8 @@ claim 单一 pid）。**实测纠正假设**：rename 原子覆盖原路径才�
   **背景（见 identity-no-name）：用户已定调镜像名比对是严重谬误，本稿是定调后
   正确方向的实现尝试**；方向稿本身因「批评 ≠ 授权」被回滚（见
   criticism-not-authorization），方案 A（本分支全换）/ B（独立成支）待用户
-  拍板。保留不 drop。
+  拍板。保留不 drop。（2026-10-04 已丢弃：该方向由 WS-3 以 pid + 进程创建时间实现，草稿被取代；
+  `fix/unix-first-test` 分支与 `.worktree/unix-fixes` 已并入 master 后一并移除）
 - **HEAD 零残留验证法**：精确 grep 特征符号（字段定义/新 API 名/新结构体字段）
   全 0 命中；force_terminate 原签名、is_aproxy_process 健在；amend（980602b→
   75afe6b）树完全相同仅消息调整；3 个 dangling commits 是 2026-08-30 master

@@ -13,7 +13,7 @@ Alive / Unverifiable / Reused / Gone；收养、处决、`--force`、install 换
 全部改用它，Windows 终止在同一进程句柄上先核对创建时间再 TerminateProcess（无复用窗口）。
 旧记录（process_start = 0）一律保守：宁可不看护也不误杀（收养需 IPC 回报 pid 一致、选举不计入、
 `--force` 先 ping 确认）。官方 Release 资产名 aproxy-<target>(.exe) 直接运行也受看护。
-主仓库 stash@{0} 的方向稿已被这次实现取代，是否丢弃由用户决定。下文为当初定调的推理，保留供回溯。
+主仓库 stash@{0} 的方向稿已被这次实现取代，2026-10-04 经用户授权（「全都由你来决定和操作」）丢弃（4627432）。下文为当初定调的推理，保留供回溯。
 
 **用户原话定性**：「怎么能通过名称来判断呢？？这是严重谬误！！」（针对
 `is_aproxy_process` 的镜像名/exe basename 比对，以及我在 F2 决策里给出的
@@ -43,7 +43,7 @@ Alive / Unverifiable / Reused / Gone；收养、处决、`--force`、install 换
 - 未获确认的重构稿在 stash：`stash@{0}`（4627432，message
   「name-free-identity-refactor-draft(未获确认的方向稿)」，约 60% 完成：
   InstanceInfo.process_start 字段 + --force/选举/收养/处决/claim 五处
-  调用点替换）——方向未批准前不得恢复使用
+  调用点替换）——方向未批准前不得恢复使用（2026-10-04 已丢弃，见上文）
 - **待用户拍板的范围决策**：
   A. 本分支做完整替换（Windows 行为随之变化，偏离「零变化」承诺，合并
      说明需明示）

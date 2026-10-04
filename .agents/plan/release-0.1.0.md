@@ -109,7 +109,7 @@
   开发命令（b45a399）
 - [x] Windows `cargo test --workspace --locked` 全绿（2026-10-04）：日志脱敏测试并行跑
   捕获为空是 tracing-core 单 Dispatch 快速路径所致，WS-1a 时就存在，已修（cf81486）
-- [ ] WS-1b 独立对抗审查（ws1b-review 代理进行中）→ 按结论修复
+- [x] WS-1b 独立对抗审查：无 P0；P1（stream:true 的 NDJSON 被骨架改写）、P2（已提交后回放压缩体、spool 中途 drop 泄漏）、受限路径恢复「未提交时透传真实失败」、两处变异未抓到的测试缺口——修复轮已合并（302f687）。P3-5/P3-6 与上传 spool 同类风险记入 TODO（0.1.0 之后）
 - [x] 真实 Claude Code 无限重试验收通过（2026-10-04，master b9b1f7d 的 debug 构建，
   默认配置，隔离 APROXY_HOME；claude 2.1.288，`CLAUDE_STREAM_IDLE_TIMEOUT_MS=86400000`，
   白名单 `env -i` + 隔离 CLAUDE_CONFIG_DIR + 假 key）。mock 按请求序号注入：529 → 断连 →
@@ -118,9 +118,12 @@
   输出完整且不含第 4 次半截流的标记文本；mock 收到 11 次主请求全部 retry-count=0
   （客户端从未自行重发）；aProxy 只记录 1 条 POST /v1/messages 的「代理请求」，末行
   「上游成功，回放到已提交的响应（保活通道） attempt=11」。退避节奏与 retry.rs 一致
-  （0/0/0/5/10/20/40/80/160/320s）。审查若改动保活路径，需按同一时间线重跑
-- [x] ssh remote 全新目录全量（2026-10-04，6216f4b，Ubuntu glibc 2.39）：14 个测试二进制 427 项全过，fmt/clippy 干净。WS-1b 修复轮合并后需在新目录重跑
+  （0/0/0/5/10/20/40/80/160/320s）。修复轮合并后在 302f687 上按同一时间线重跑，结果相同（退出码 0、
+  15 分钟、11 次主请求全部 retry-count=0、输出完整）；新语义下第 4 次的 200 SSE 头被先行提交，
+  其流断开后重试仍在同一已提交响应内完成
+- [x] ssh remote 全新目录全量（2026-10-04，6216f4b，Ubuntu glibc 2.39）：14 个测试二进制 427 项全过，fmt/clippy 干净。302f687 在新目录重跑：439 项全过，fmt/clippy 干净
 - [ ] Linux gnu 产物 glibc 下限：remote 无 zig，改由 rc 演练时 release.yml 的构建断言验证
-- [ ] 合并后审查与修复
+- [x] Windows 全量（302f687，独立复核）：446 项全过，clippy 干净
+- [ ] rc 演练（需用户确认后打 tag）：bump 版本 → 推送 → v0.1.0-rc.1 → 核对 release.yml 门禁、glibc 断言、npm next、crates.io 幂等、Latest 标记
 - 待办：aproxy-format 需发 format 新版本才能让 transform-03 生效；doctor 测试不隔离
   主目录（未进 0.1.0，见 TODO）

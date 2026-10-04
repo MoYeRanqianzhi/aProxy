@@ -32,3 +32,4 @@
 - [Claude Code 流超时实测](memory/claude-code-stream-watchdogs.md) — 2026-10-04 黑盒实测：Accept: application/json + stream:true；首字节 ~360s / 字节空闲 300s / 事件空闲 600s（注释与 ping 都不算事件，须客户端设 CLAUDE_STREAM_IDLE_TIMEOUT_MS）
 - [共用 target 目录测到旧代码](memory/2026-10-04-shared-target-dir-stale-tests.md) — worktree 与主工作区共用 CARGO_TARGET_DIR 时 cargo 按 mtime 误判新鲜、静默执行旧二进制（实测 73 项冒充 86 项）；各用独立目录，汇报附测试数 [[unix-stress-review]]
 - [GitHub 发布安全设置](memory/2026-10-04-github-release-settings.md) — 私密漏洞报告开；release 环境只许 v* / format-v* tag 部署（新 tag 格式须加 policy）；main 禁强推删除不强制 PR；CARGO_REGISTRY_TOKEN 留仓库级的原因 [[trusted-publishing-p0]]
+- [Codex 流空闲超时](memory/2026-10-04-codex-stream-idle-timeout.md) — Codex 按 SSE 事件计 300s 空闲（eventsource-stream 丢弃注释，aProxy 心跳续不了命），超时重连 5 次后失败；provider 须设 stream_idle_timeout_ms=86400000（源码 + 正反黑盒实测）[[claude-code-stream-watchdogs]]

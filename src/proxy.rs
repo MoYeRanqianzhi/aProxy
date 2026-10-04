@@ -2812,13 +2812,22 @@ mod tests {
             r#"{"stream":true}"#,
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
             " \n{ \"stream\" : true }\r\n ",
-            // 转义写法的键名与字面键名等价
-            r#"{"stream":true}"#,
             // 重复键以最后一次为准
             r#"{"stream":false,"stream":true}"#,
         ] {
             assert!(probe(yes), "应判为流式: {yes}");
         }
+        // 转义写法的键名与字面键名等价：键名里的 e 写成 JSON Unicode 转义
+        // （反斜杠 + u0065）。反斜杠在运行时拼出：写成源码字面量时，转义序列
+        // 容易被编辑/生成工具提前还原成字母 e，测试就悄悄退化成与上面第一条
+        // 重复——下方断言守住这个前提
+        let backslash = char::from(92);
+        let escaped = format!("{{\"str{backslash}u0065am\":true}}");
+        assert!(
+            escaped.contains(backslash) && !escaped.contains("stream"),
+            "前提：键名确实是转义写法: {escaped}"
+        );
+        assert!(probe(&escaped), "转义键名应判为流式: {escaped}");
         for no in [
             r#"{"stream":false}"#,
             r#"{"model":"m"}"#,

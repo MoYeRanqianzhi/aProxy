@@ -2667,7 +2667,10 @@ async fn keepalive_trigger_detects_stream_flag_in_disk_spooled_body() {
 }
 
 /// 定位 examples/format-echo(.exe)：current_exe 的祖先目录里找 examples/
-/// （与 transform_integration 同法；cargo test 会先编译全部 example）
+/// （与 transform_integration 同法）。**依赖 example 已编译**：不带过滤的
+/// `cargo test` 会顺带编译全部 example；只跑本文件（`cargo test --test
+/// proxy_integration`）时不会——干净的目标目录下须先 `cargo build --examples`，
+/// 否则这里 panic「format-echo 未找到」
 fn format_echo_path() -> std::path::PathBuf {
     let name = if cfg!(windows) {
         "format-echo.exe"
@@ -2686,7 +2689,8 @@ fn format_echo_path() -> std::path::PathBuf {
 }
 
 // (8) 配置了 response_transform：不提交上游真实头（format 可能改写 status/头），
-//     只在一个保活间隔后提交骨架头；成功后回放转换后的 body
+//     只在一个保活间隔后提交骨架头；成功后回放转换后的 body。需要 format-echo
+//     example（只跑本文件时先 `cargo build --examples`，见 format_echo_path）
 #[tokio::test]
 async fn keepalive_with_response_transform_commits_skeleton_not_upstream_head() {
     const FIRST: &str = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n";

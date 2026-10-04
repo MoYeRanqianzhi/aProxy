@@ -2739,6 +2739,102 @@ async fn keepalive_with_response_transform_commits_skeleton_not_upstream_head() 
     );
 }
 
+/// 客户端在上游大响应正落盘 spool 时断开的场景：上游回 SSE 头后吐 2 MiB（超过
+/// 1 MiB 驻留阈值 → 溢写磁盘）然后挂住不结束。确认临时文件已出现后断开客户端，
+/// 返回断开后 5s 内 spool 目录是否清空
+async fn spool_dir_cleared_after_disconnect_mid_spool(stream_flag: bool) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                if !read_http_request(&mut sock).await {
+                    return;
+                }
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n")
+                    .await;
+                let line = format!("data: {}\n\n", "z".repeat(1000));
+                let mut sent = 0usize;
+                while sent < 2 * 1024 * 1024 {
+                    let chunk = format!("{:x}\r\n{}\r\n", line.len(), line);
+                    if sock.write_all(chunk.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    sent += line.len();
+                }
+                let _ = sock.flush().await;
+                let mut buf = [0u8; 1024];
+                while let Ok(n) = sock.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let spool_dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = proxy_config_for(&format!("http://{addr}"));
+    cfg.keepalive_interval_secs = 1;
+    cfg.spool_dir_override = Some(spool_dir.path().to_path_buf());
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(cfg))).await;
+    let body = if stream_flag {
+        cc_stream_body()
+    } else {
+        serde_json::json!({"model": "m", "stream": false})
+    };
+    let fut = local_client()
+        .post(format!("{proxy_url}/v1/messages"))
+        .header("accept", "application/json")
+        .json(&body)
+        .send();
+    // 后台持有请求（与可能已到的响应）：abort 即断开客户端连接
+    let client_task = tokio::spawn(async move {
+        let resp = fut.await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        drop(resp);
+    });
+    let count = || std::fs::read_dir(spool_dir.path()).unwrap().count();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while count() == 0 {
+        if std::time::Instant::now() > deadline {
+            return Err("前提不成立：10s 内上游的 2 MiB 没有溢写磁盘".to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    client_task.abort();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while count() > 0 {
+        if std::time::Instant::now() > deadline {
+            let left: Vec<_> = std::fs::read_dir(spool_dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name())
+                .collect();
+            return Err(format!("客户端断开 5s 后半截 spool 文件仍残留: {left:?}"));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+// 上游响应正落盘 spool 时客户端断开：半截 .spooltmp 当场删除，不留到下次启动。
+// 保活通道（stream:true，已提交上游真实头）与不保活的缓冲路径都要覆盖——两者
+// 都是「在途 forward_once future 被 drop」，缓冲区的 Drop 必须清理磁盘文件
+#[tokio::test]
+async fn spool_file_removed_when_client_disconnects_mid_spool() {
+    spool_dir_cleared_after_disconnect_mid_spool(true)
+        .await
+        .unwrap_or_else(|e| panic!("保活通道: {e}"));
+    spool_dir_cleared_after_disconnect_mid_spool(false)
+        .await
+        .unwrap_or_else(|e| panic!("非保活路径: {e}"));
+}
+
 // ---------------------------------------------------------------------------
 // 22. 仅转发模式：门控分块 mock（下面 22a/22b 两条对照测试共用）
 //

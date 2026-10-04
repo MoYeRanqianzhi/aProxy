@@ -729,13 +729,40 @@ async fn keepalive_triggered(
     }
 }
 
+/// 尚未交付的 spool 临时文件路径：Drop 时删除文件。缓冲在收集途中被丢弃的
+/// 一切路径——客户端断开让在途的 forward_once future 整体被 drop、TooLarge、
+/// 读取中断、写盘失败——都经此清理，不留半截 `.spooltmp` 等到下次启动才回收；
+/// 正常收尾经 `into_path` 把路径交给 `SpooledBody`（文件从此由它负责）。
+///
+/// 删除时写句柄可能仍在 tokio 阻塞池的在途写操作里持有：Rust 标准库在 Windows
+/// 上以 FILE_SHARE_DELETE 打开文件，删除照样成功（最后一个句柄关闭时文件消失），
+/// unix 上 unlink 本就不受打开句柄影响。
+struct SpoolPath(PathBuf);
+
+impl SpoolPath {
+    /// 交出路径并解除删除责任（取走后自身成空路径，Drop 不再删）
+    fn into_path(mut self) -> PathBuf {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for SpoolPath {
+    fn drop(&mut self) {
+        if !self.0.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+}
+
 /// 响应 spool 缓冲：内存累积，超 `RESIDENT_LIMIT` 溢写磁盘。
-/// 完成后统一为 `SpooledBody` 消费（判定/回放）。
+/// 完成后统一为 `SpooledBody` 消费（判定/回放）；中途丢弃时磁盘文件经
+/// `SpoolPath` 的 Drop 删除。
 enum SpoolBuffer {
     Memory(Vec<u8>),
     Disk {
+        // 字段顺序即 drop 顺序：先关写句柄，再由 SpoolPath 删文件
         file: tokio::fs::File,
-        path: PathBuf,
+        path: SpoolPath,
         len: u64,
     },
     /// 收集中途写盘失败：内部状态不可用，调用方转为可重试的 NetworkError
@@ -748,15 +775,6 @@ impl SpoolBuffer {
             SpoolBuffer::Memory(mem) => mem.len() as u64,
             SpoolBuffer::Disk { len, .. } => *len,
             SpoolBuffer::Poisoned => 0,
-        }
-    }
-
-    /// 丢弃收集结果（TooLarge / 读取中断路径）：磁盘模式删除半截临时文件
-    ///（先关写句柄再删，Windows 要求）。Poisoned 的半截文件已在写失败处删除。
-    fn discard(self) {
-        if let SpoolBuffer::Disk { file, path, .. } = self {
-            drop(file);
-            let _ = std::fs::remove_file(&path);
         }
     }
 
@@ -786,12 +804,12 @@ impl SpoolBuffer {
                 // 恰是最后一块时同理——切换后本变体就是 Disk，同样由这里兜住。
                 // flush 只把写推进 OS（不等物理落盘），与 read_request_body 同款。
                 if let Err(e) = file.flush().await {
-                    drop(file); // 先关句柄再删（Windows 要求）
-                    let _ = std::fs::remove_file(&path);
+                    drop(file); // 先关句柄，再由 SpoolPath 的 Drop 删半截文件
+                    drop(path);
                     return Err(format!("spool 磁盘写入失败（收尾 flush）: {e}"));
                 }
                 drop(file); // 关写句柄，头部快照以只读重新打开
-                let head = match tokio::fs::File::open(&path).await {
+                let head = match tokio::fs::File::open(&path.0).await {
                     Ok(mut f) => {
                         let mut buf = vec![0u8; 1024];
                         match f.read(&mut buf).await {
@@ -805,7 +823,13 @@ impl SpoolBuffer {
                     Err(_) => Vec::new(),
                 };
                 let error = scanner.finish();
-                Ok((SpooledBody::Disk { path, len }, Some((error, head))))
+                Ok((
+                    SpooledBody::Disk {
+                        path: path.into_path(),
+                        len,
+                    },
+                    Some((error, head)),
+                ))
             }
             // 不可达：Poisoned 在 forward_once 收集循环中提前返回。防御性产出
             // 空 body 成功（与磁盘判定缺失同样按不重试处理，服务不因内部
@@ -941,7 +965,11 @@ async fn spool_chunk(buf: &mut SpoolBuffer, chunk: &[u8], spool_dir: Option<&Pat
                 Ok(mut file) => {
                     if file.write_all(mem).await.is_ok() && file.write_all(chunk).await.is_ok() {
                         let len = (mem.len() + chunk.len()) as u64;
-                        *buf = SpoolBuffer::Disk { file, path, len };
+                        *buf = SpoolBuffer::Disk {
+                            file,
+                            path: SpoolPath(path),
+                            len,
+                        };
                         return;
                     }
                     // 写失败：文件句柄已创建但内容不完整，删除；保持 Memory 退化
@@ -953,13 +981,11 @@ async fn spool_chunk(buf: &mut SpoolBuffer, chunk: &[u8], spool_dir: Option<&Pat
                 Err(_) => mem.extend_from_slice(chunk),
             }
         }
-        SpoolBuffer::Disk { file, len, path } => {
+        SpoolBuffer::Disk { file, len, .. } => {
             // 已落盘后写失败：进程内 spool 无法回退（数据已在盘上），只能
-            // Poisoned。半截文件在此删除（先关句柄）。
+            // Poisoned。被替换掉的 Disk 变体随之 drop：先关句柄、再删半截文件
             if file.write_all(chunk).await.is_err() {
-                let p = path.clone();
                 *buf = SpoolBuffer::Poisoned;
-                let _ = std::fs::remove_file(&p);
                 return;
             }
             *len += chunk.len() as u64;
@@ -2383,20 +2409,18 @@ async fn forward_once(
     loop {
         match resp_stream.chunk().await {
             Ok(Some(chunk)) => {
+                // 各提前返回路径上 spool 随之 drop，半截磁盘文件由 SpoolPath 删除
                 if spool.len() + chunk.len() as u64 > max_spool_bytes as u64 {
-                    spool.discard();
                     return ForwardResult::TooLarge;
                 }
                 scanner.feed(&chunk);
                 spool_chunk(&mut spool, &chunk, spool_dir).await;
                 if matches!(spool, SpoolBuffer::Poisoned) {
-                    spool.discard();
                     return ForwardResult::SpoolFailed("spool 磁盘写入失败".to_string());
                 }
             }
             Ok(None) => break,
             Err(e) => {
-                spool.discard();
                 return ForwardResult::NetworkError(format!(
                     "读取上游响应体失败: {}",
                     redact_reqwest_error(e)
@@ -2968,7 +2992,7 @@ mod tests {
         let file = tokio::fs::File::open(&path).await.unwrap();
         let mut buf = SpoolBuffer::Disk {
             file,
-            path: path.clone(),
+            path: SpoolPath(path.clone()),
             len: 0,
         };
         spool_chunk(&mut buf, b"final chunk", Some(dir.path())).await;
@@ -2984,6 +3008,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_disk_spool_buffer_deletes_partial_file() {
+        // 收集途中被整体丢弃（客户端断开让在途 forward_once 被 drop 即此情形）：
+        // 半截 spool 文件必须当场删除，不能留到下次启动才由 clean_spool_dir 回收
+        let dir = tempfile::tempdir().unwrap();
+        let mut buf = SpoolBuffer::Memory(Vec::new());
+        spool_chunk(&mut buf, &vec![b'x'; RESIDENT_LIMIT + 1], Some(dir.path())).await;
+        assert!(matches!(buf, SpoolBuffer::Disk { .. }), "前提：已溢写磁盘");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        drop(buf);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "被丢弃的 spool 缓冲必须删除自己的临时文件"
+        );
+    }
+
+    #[tokio::test]
     async fn spool_finish_disk_success_keeps_full_content() {
         // 对照组：正常写句柄下 finish 成功，长度与文件内容一致（flush 不改变
         // 成功路径的语义）
@@ -2992,7 +3033,7 @@ mod tests {
         let file = tokio::fs::File::create(&path).await.unwrap();
         let mut buf = SpoolBuffer::Disk {
             file,
-            path: path.clone(),
+            path: SpoolPath(path.clone()),
             len: 0,
         };
         spool_chunk(&mut buf, b"hello ", Some(dir.path())).await;

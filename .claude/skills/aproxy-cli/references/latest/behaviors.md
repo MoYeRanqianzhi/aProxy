@@ -8,7 +8,7 @@
 - [请求生命周期](#请求生命周期)
 - [重试判定](#重试判定)
 - [保活心跳](#保活心跳)
-- [接入 Claude Code](#接入-claude-code)
+- [接入 agent 客户端](#接入-agent-客户端)（Claude Code、Codex、Gemini CLI 及其他）
 - [流式响应处理](#流式响应处理)
 - [磁盘缓存（spool）](#磁盘缓存spool)
 - [仅转发模式（forward_only）](#仅转发模式forward_only)
@@ -146,10 +146,23 @@
   日志会 warn 一条提示「若客户端是 Claude Code，请设置
   CLAUDE_STREAM_IDLE_TIMEOUT_MS」（只是日志文案，行为对任何客户端都一样）。
 
-## 接入 Claude Code
+## 接入 agent 客户端
 
-Claude Code 经 `ANTHROPIC_BASE_URL` 指向 aProxy，且**必须**设置
-`CLAUDE_STREAM_IDLE_TIMEOUT_MS`：
+**共同原理**：aProxy 为保证「流中途断开也能透明重试」，会缓冲完整响应、校验无误后
+才回放，等待期间客户端只收到响应头和 SSE 注释心跳（`: keepalive`）。所以要看客户端
+的流超时是按什么计时：
+
+- **按字节计时**（两次收到字节的间隔，如 undici `bodyTimeout`、httpx read timeout、
+  OpenCode `chunkTimeout`）：注释心跳会重置它，无需处理。
+- **按 SSE 事件计时**（计时器在 SSE 解析之后）：注释心跳**重置不了**——主流 SSE 解析
+  库（eventsource-stream、eventsource-parser、各官方 SDK 的解码器）都在解析层丢弃
+  注释行，上层看不到它。这类超时必须调大或关闭，否则任何超过它的重试期或长生成都会
+  被客户端断开重发：aProxy 随之按计费保护中止上游，新请求从头重试；客户端的重发次数
+  用完后整轮失败。
+
+### Claude Code（2.1.288 黑盒实测）
+
+经 `ANTHROPIC_BASE_URL` 指向 aProxy，且**必须**设置 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`：
 
 ```sh
 export ANTHROPIC_BASE_URL=http://127.0.0.1:12345      # aProxy 的监听端口
@@ -161,21 +174,81 @@ PowerShell 用 `$env:ANTHROPIC_BASE_URL = "..."`。也可写进 Claude Code 的
 对每个会话生效）：
 `{"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:12345", "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "86400000"}}`。
 
-**原因**（Claude Code 2.1.288 黑盒实测，2026-10-04）：aProxy 为保证「流中途断开
-也能透明重试」，会缓冲完整响应再回放，等待期间只发 SSE 注释心跳。Claude Code 有
-三层流超时：首字节（约 360s）与字节级空闲（300s）能被注释心跳覆盖；**事件级空闲
-（默认 600s）覆盖不了**——注释与 `event: ping` 都不算事件，只有真实事件会重置它。
-不设该变量，任何超过 10 分钟的重试期或长生成都会被 Claude Code 断开并重发
-（aProxy 随之按计费保护中止上游）。`CLAUDE_STREAM_IDLE_TIMEOUT_MS=86400000` 实测
-有效（780s 仍存活）；`API_TIMEOUT_MS` **不控制**这道闸。伪造协议事件不是 aProxy 的
-做法。其他版本的默认值以 Claude Code 官方文档为准；其他 agent 客户端未测。
+- 三层流超时：首字节（约 360s）与字节级空闲（300s）能被注释心跳覆盖；**事件级空闲
+  （默认 600s）覆盖不了**——注释与 `event: ping` 都不算事件。`86400000` 实测有效；
+  `API_TIMEOUT_MS` **不控制**这道闸。
+- 流式主请求是 `POST /v1/messages?beta=true`，`Accept: application/json` + 请求体
+  `"stream": true`——默认 `keepalive_trigger = "any"` 才能让它进入保活通道（只配
+  `accept` 会让它失去保活）。
+- 2026-10-04 在 v0.1.0 上验收：上游 8 类故障持续 757s 后才成功、再慢速生成 140s，
+  Claude Code 拿到完整结果，全程零重发。
 
-- Claude Code 的流式主请求是 `POST /v1/messages?beta=true`，`Accept:
-  application/json` + 请求体 `"stream": true`——默认 `keepalive_trigger = "any"`
-  才能让它进入保活通道（只配 `accept` 会让它失去保活）。
-- `"stream": false` 的请求没有保活通道，客户端需自行调大 `API_TIMEOUT_MS`。
-- aProxy 配了 `api_key` 时会同时覆盖 `Authorization` 与 `x-api-key`。
-- Claude Code 不发 `Origin`、Host 为 `127.0.0.1:端口`，不受入站来源校验影响。
+### Codex（codex-cli 0.160.0 源码 + 黑盒实测）
+
+用自定义 provider 指向 aProxy，并**必须**调大 `stream_idle_timeout_ms`。写在
+`~/.codex/config.toml`（或 `$CODEX_HOME/config.toml`）：
+
+```toml
+model = "gpt-5"                     # 换成上游提供的模型名
+model_provider = "aproxy"
+
+[model_providers.aproxy]
+name = "aproxy"
+base_url = "http://127.0.0.1:12345/v1"
+env_key = "OPENAI_API_KEY"          # Codex 从该环境变量取 key；aProxy 配了 api_key 时填任意非空值
+wire_api = "responses"
+stream_idle_timeout_ms = 86400000   # 24 小时
+```
+
+- `stream_idle_timeout_ms` 默认 300000（5 分钟），按 **SSE 事件**计时（SSE 解析库
+  eventsource-stream 丢弃注释），注释心跳续不住；超时报 `idle timeout waiting for SSE`，
+  随后自动重连，最多 `stream_max_retries` 次（默认 5，上限 100），用完本轮失败。
+- 实测（aProxy v0.1.0 默认配置，上游持续 529）：设 60000 时，骨架头提交后恰好 60s
+  断开重连，期间的 4 个心跳无效；设 86400000 后，只有心跳的等待持续 620s，最终拿到
+  完整结果，全程 1 次请求。
+- 请求是 `POST <base_url>/responses`，带 `Accept: text/event-stream` 与 `"stream": true`，
+  `keepalive_trigger` 取 `accept` 或 `any` 都能进入保活通道。
+
+### Gemini CLI（0.35.3 黑盒实测 + 源码）
+
+用 API key 认证接入：`GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<端口>` 与
+`GEMINI_API_KEY`（aProxy 配了 `api_key` 时可填任意值）。OAuth / Code Assist 登录
+不走自定义地址，无法经 aProxy。
+
+- 流式请求是 `POST /v1beta/models/<模型>:streamGenerateContent?alt=sse`，`Accept: */*`，
+  请求体**没有** `stream` 字段，所以**不进保活通道**，走缓冲路径——结果正常（实测）。
+- **限制**：缓冲路径要等上游完整成功才回响应头，而 Gemini CLI 的响应头 / 响应体超时是
+  写死的常量（0.35.3 均为 300s，据源码新版响应头超时更短），没有配置可调——重试期加
+  生成超过它就会失败。目前 aProxy 对此无解。
+- **不能强行给它开注释保活**：Gemini CLI 锁定的 `@google/genai 1.30.0` 的 SSE 切分
+  正则遇到开头的注释行后再也匹配不上，整段响应被吞掉、报 `Incomplete JSON segment at
+  the end`（实测：注释前缀 → 4 次请求后失败；空行前缀 → 正常）。aProxy 目前没有按路径
+  触发保活或改用空行心跳的配置。
+
+### 其他客户端（源码调研，未逐个实测）
+
+| 客户端（调研版本） | 流超时类型 | 接 aProxy 需要做什么 |
+|---|---|---|
+| Qwen Code 0.24.7 | 事件级空闲 240s + 流总时长上限 15 分钟 | **两个都要关**：环境变量 `QWEN_STREAM_IDLE_TIMEOUT_MS=0`、`QWEN_STREAM_MAX_LIFETIME_MS=0`（后者只能用环境变量） |
+| dsh（DeepSeek Harness）`llm-pi-ai` 适配器（OpenAI / Anthropic 兼容网关） | 事件级空闲 300s | **必须**给该 provider 设 `streamIdleTimeoutMs`（如 `172800000`），写在 `$DSH_HOME/profiles/<profile>/cordis.patch.yml` |
+| dsh `llm-deepseek` 适配器 | 事件级，但注释会重置（`onComment` 续命） | 默认即可 |
+| pi 1.0.2（`@earendil-works/pi-coding-agent`） | 字节级 300s（`httpIdleTimeoutMs`） | 默认即可；它的 Anthropic 路径发 `Accept: application/json`，靠 `"stream": true` 进保活 |
+| OpenCode 1.18.x | 字节级 `chunkTimeout` 300s、`headerTimeout` 300s | 默认即可；**不要**设 `timeout`（它限制含等待在内的整请求时长） |
+| OpenCode 1.2.x | 无流超时 | 只设 provider 的 `baseURL` |
+| Aider 0.86、Kimi CLI 1.52 | httpx read timeout 600s（字节级） | 默认即可 |
+| Cline 4.1 | 运行时 fetch 默认 5 分钟（字节级） | 默认即可 |
+| Roo Code 3.54 | `roo-cline.apiRequestTimeout` 600s | 默认即可（可设 0） |
+
+另外，各客户端自带的重试会和 aProxy 叠加：客户端每重发一次，对 aProxy 都是一个新
+请求，上一轮的上游请求随之中止。
+
+### 通用注意
+
+- 请求体 `"stream": false` 的普通请求没有保活通道（没有可注入心跳的响应流），首字节
+  延迟等于完整生成时长，客户端需自行调大超时（Claude Code 为 `API_TIMEOUT_MS`）。
+- aProxy 配了 `api_key` 时会同时覆盖 `Authorization` 与 `x-api-key`，客户端里的 key
+  可以随便填。
+- CLI 类客户端不发 `Origin`、Host 为 `127.0.0.1:端口`，不受入站来源校验影响。
 
 ## 流式响应处理
 
@@ -440,7 +513,10 @@ install.state 的 `skill` 字段可查。`--skills-only` 单独更新。安装�
 | `stop` 要求指定端口 | 多实例安全机制：先 `aproxy status` 再指定端口/别名/all |
 | 客户端等很久才收到回复 | 正常——上游在重试，心跳在维持连接；`aproxy logs <端口或别名>` 看重试原因 |
 | 客户端非流式请求超时 | `"stream": false` 的请求没有保活通道（没有可注入心跳的响应流）：调大客户端 HTTP 超时或调小 max_retry_backoff_secs |
-| Claude Code 等待约 10 分钟后自行断开/重发请求（日志有「客户端在已提交的响应上等待约 N 秒后断开」） | 未设 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`：Claude Code 的事件级空闲超时（默认 600s）不被注释心跳重置。设为 `86400000`（shell 环境变量或 `~/.claude/settings.json` 的 `env`），详见本文「接入 Claude Code」；`API_TIMEOUT_MS` 不控制这道闸 |
+| Claude Code 等待约 10 分钟后自行断开/重发请求（日志有「客户端在已提交的响应上等待约 N 秒后断开」） | 未设 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`：Claude Code 的事件级空闲超时（默认 600s）不被注释心跳重置。设为 `86400000`（shell 环境变量或 `~/.claude/settings.json` 的 `env`），详见本文「接入 agent 客户端」；`API_TIMEOUT_MS` 不控制这道闸 |
+| Codex 约 5 分钟后报 `idle timeout waiting for SSE` 并 `Reconnecting...`，几次后本轮失败 | 未调大 Codex provider 的 `stream_idle_timeout_ms`（默认 300000，按 SSE 事件计时，注释心跳续不住）。在 `~/.codex/config.toml` 的 `[model_providers.<id>]` 下设 `stream_idle_timeout_ms = 86400000`，详见「接入 agent 客户端」 |
+| Qwen Code 约 4 分钟后断开、或满 15 分钟必断 | 设环境变量 `QWEN_STREAM_IDLE_TIMEOUT_MS=0` 与 `QWEN_STREAM_MAX_LIFETIME_MS=0`（源码调研，未实测） |
+| Gemini CLI 报 `Incomplete JSON segment at the end` | 响应流里出现了 SSE 注释（Gemini CLI 锁定的 `@google/genai 1.30.0` 解析不了）。aProxy 默认不会给 Gemini 流发注释心跳；若上游或其他中间层插入了注释即会触发 |
 | 流式请求没有心跳 / 首字节等很久 | 看 `keepalive_trigger`：只配了 `accept` 时，Accept 不含 `text/event-stream` 的流式请求（如 Claude Code）进不了保活通道；默认 `any` 同时认请求体 `"stream": true`。`aproxy config --show` 核对生效值 |
 | Claude Code /compact 无限卡住/超时（走非官方 API） | 上游（聚合/镜像服务常见）未实现 compact 依赖的 `POST /v1/messages/count_tokens`，确定性 404 被无限重试、客户端永远等不到终态。解决：该实例 toml 的 `bounded_retry_paths` 加 `'/v1/messages/count_tokens\?.*'`（或客户端实际使用的确切路径），`aproxy restart <端口或别名>` 生效——失败 3 次即透传真实响应。其他 agent 软件/其他端点的同类问题同理 |
 | 日志刷「受限重试路径达到尝试上限，透传最后一次上游响应」 | 该请求命中 `bounded_retry_paths`：失败 3 次即透传，属预期行为；不想受限就从配置移除对应模式并 restart |

@@ -1,6 +1,6 @@
 ---
 name: aproxy-cli
-description: aProxy CLI 完整参考——本地 API 代理（无限重试保障 agent 工作流）的全部命令、参数、config.toml 与 settings.json 配置字段、运行行为语义与版本兼容性。凡涉及 aproxy 的启动/停止/状态/日志/别名/多开/配置修改、排障（端口占用、启动失败、日志乱码）、或为本机 agent 软件配置代理地址时使用本 skill，即使用户没有明说「查文档」——例如"帮我把 Claude Code 挂到 aproxy"、"再加一个 12346 端口的实例"、"stop 之后怎么还占着端口"。外部转换器（request_transform/response_transform，协议转换/多 key 轮换/多渠道聚合）的**配置字段与运行行为**也在本 skill；编写 format 程序本体用 aproxy-format skill。
+description: aProxy CLI 完整参考——本地 API 代理（无限重试保障 agent 工作流）的全部命令、参数、config.toml 与 settings.json 配置字段、运行行为语义与版本兼容性。凡涉及 aproxy 的启动/停止/状态/日志/别名/多开/配置修改、排障（端口占用、启动失败、日志乱码）、或为本机 agent 软件配置代理地址时使用本 skill，即使用户没有明说「查文档」——例如"帮我把 Claude Code / Codex 挂到 aproxy"、"再加一个 12346 端口的实例"、"stop 之后怎么还占着端口"。外部转换器（request_transform/response_transform，协议转换/多 key 轮换/多渠道聚合）的**配置字段与运行行为**也在本 skill；编写 format 程序本体用 aproxy-format skill。
 ---
 
 # aProxy CLI
@@ -44,7 +44,7 @@ target 参数（start/stop/logs 的 `[目标]`）解析顺序：**别名 → `de
 | 启动/停止/状态/日志/恢复/别名/find/config 的**全部命令与参数** | [references/latest/commands.md](references/latest/commands.md) |
 | 写或改 config.toml（全部字段、类型、默认值、0 值语义） | [references/latest/config-toml.md](references/latest/config-toml.md) |
 | 别名/默认配置/全局默认等 settings.json 字段（一般经命令管理） | [references/latest/settings-json.md](references/latest/settings-json.md) |
-| **把 Claude Code 挂到 aproxy**（`ANTHROPIC_BASE_URL` 与必设的 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`） | [references/latest/behaviors.md](references/latest/behaviors.md) 的「接入 Claude Code」节 |
+| **把 Claude Code / Codex / 其他 agent 挂到 aproxy**（各客户端必调的流空闲超时：Claude Code 的 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`、Codex 的 `stream_idle_timeout_ms` 等） | [references/latest/behaviors.md](references/latest/behaviors.md) 的「接入 agent 客户端」节 |
 | 重试判定、保活、多开、磁盘缓存、外部转换器、日志、自愈恢复等**行为语义与排障** | [references/latest/behaviors.md](references/latest/behaviors.md) |
 | 当前版本是否适用本文档（版本判定、跨版本差异） | [references/latest/compatibility.md](references/latest/compatibility.md) |
 
@@ -66,11 +66,15 @@ compatibility.md 确认行为差异（旧版本可能缺字段、语义不同）
   不启动：目标没在运行会报错退出 1，首次启动用 `aproxy start`。
 - 端口占用排查：bind 失败分「被其他程序占用」与「无权限/被系统保留（Hyper-V
   排除区间）」，不要一律当占用处理——详见 behaviors.md 排障节。
-- **接入 Claude Code 必须设 `CLAUDE_STREAM_IDLE_TIMEOUT_MS=86400000`**（连同
-  `ANTHROPIC_BASE_URL=http://127.0.0.1:<端口>`；shell 环境变量或 Claude Code
-  `~/.claude/settings.json` 的 `env` 字段均可）：否则超过 10 分钟的重试期或长
-  生成会被 Claude Code 的事件级空闲超时断开重发。原因与细节见 behaviors.md
-  「接入 Claude Code」。
+- **接入 agent 客户端时，先调大它按 SSE 事件计时的流空闲超时**——aProxy 等待期间
+  只发注释心跳，这类超时续不住：
+  - Claude Code：`CLAUDE_STREAM_IDLE_TIMEOUT_MS=86400000`（连同
+    `ANTHROPIC_BASE_URL=http://127.0.0.1:<端口>`；shell 环境变量或
+    `~/.claude/settings.json` 的 `env` 字段均可），否则超过 10 分钟就会被断开重发；
+  - Codex：`~/.codex/config.toml` 的 `[model_providers.<id>]` 设
+    `stream_idle_timeout_ms = 86400000`，否则超过 5 分钟就会被断开重连；
+  - Qwen Code、dsh 等其他客户端以及 Gemini CLI 的限制见 behaviors.md「接入 agent
+    客户端」。
 - 客户端收到本地 403 且文案提到 `allowed_origins`/`allowed_hosts`：不是上游
   问题，是入站来源校验拒绝了请求（浏览器/Electron 类客户端会发 `Origin`），
   按文案把对应 Origin/Host 加进配置并 restart，详见 config-toml.md。

@@ -79,7 +79,8 @@ aproxy status               # 每行 v<semver> = 各实例实际运行的守护�
   间隔后提交骨架）、等首字节/上游在途/缓冲/退避全程发 SSE 注释心跳，响应体仍缓冲
   完整后回放。**有意例外**：保活适用的请求发往上游时 `accept-encoding` 改为
   `identity`。`"stream": false` 的请求仍无保活通道。旧二进制读到新字段静默忽略。
-  接入 Claude Code 必须设 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`，见 behaviors.md。
+  接入 Claude Code 必须设 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`、接入 Codex 必须调大 provider 的
+  `stream_idle_timeout_ms`，其他客户端见 behaviors.md「接入 agent 客户端」。
 - **install 更新通道与回滚**：`aproxy install` 的 `latest` 分通道——当前是正式版
   只取正式版，当前是预发布默认含预发布，`--pre` 显式含预发布；只认
   `vX.Y.Z[-(alpha|beta|rc).N]`、按版本号选最大，通道为空保持现状；alpha 版本的

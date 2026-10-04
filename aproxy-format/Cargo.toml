@@ -1,6 +1,6 @@
 [package]
 name = "aproxy-format"
-version = "0.1.0"
+version = "0.1.1"
 # 官方示例 format 二进制：协议转换（switchyard-translation）+ apikey 轮询/
 # 加权轮询 + 多模型多渠道聚合。版本独立于 aproxy 的 alpha 线——它稳定后
 # 几乎不更新（只是示例，别的功能用户直接让 agent 配置），单独发 Release

@@ -34,3 +34,4 @@
 - [GitHub 发布安全设置](memory/2026-10-04-github-release-settings.md) — 私密漏洞报告开；release 环境只许 v* / format-v* tag 部署（新 tag 格式须加 policy）；main 禁强推删除不强制 PR；CARGO_REGISTRY_TOKEN 留仓库级的原因 [[trusted-publishing-p0]]
 - [Codex 流空闲超时](memory/2026-10-04-codex-stream-idle-timeout.md) — Codex 按 SSE 事件计 300s 空闲（eventsource-stream 丢弃注释，aProxy 心跳续不了命），超时重连 5 次后失败；provider 须设 stream_idle_timeout_ms=86400000（源码 + 正反黑盒实测）[[claude-code-stream-watchdogs]]
 - [Gemini CLI 与保活](memory/2026-10-04-gemini-cli-sse-parsing.md) — Gemini 流请求不触发保活（默认可用但受写死的 300s 响应头超时限制）；注释心跳会触发 @google/genai 1.30.0 解析 bug 吞掉整段响应，空行前缀无害（真实客户端实测）[[codex-stream-idle-timeout]]
+- [agent 客户端流超时调研](memory/2026-10-04-agent-client-timeouts-survey.md) — 判断法（字节级续得住、事件级续不住）+ Qwen Code / dsh / pi / OpenCode / Aider / Cline / Roo / Kimi 的源码依据与核实程度 [[codex-stream-idle-timeout]] [[gemini-cli-sse-parsing]]

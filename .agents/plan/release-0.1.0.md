@@ -119,7 +119,8 @@
   （客户端从未自行重发）；aProxy 只记录 1 条 POST /v1/messages 的「代理请求」，末行
   「上游成功，回放到已提交的响应（保活通道） attempt=11」。退避节奏与 retry.rs 一致
   （0/0/0/5/10/20/40/80/160/320s）。审查若改动保活路径，需按同一时间线重跑
-- [ ] ssh remote 全新目录全量；Linux gnu 产物 glibc 下限核对
+- [x] ssh remote 全新目录全量（2026-10-04，6216f4b，Ubuntu glibc 2.39）：14 个测试二进制 427 项全过，fmt/clippy 干净。WS-1b 修复轮合并后需在新目录重跑
+- [ ] Linux gnu 产物 glibc 下限：remote 无 zig，改由 rc 演练时 release.yml 的构建断言验证
 - [ ] 合并后审查与修复
 - 待办：aproxy-format 需发 format 新版本才能让 transform-03 生效；doctor 测试不隔离
   主目录（未进 0.1.0，见 TODO）

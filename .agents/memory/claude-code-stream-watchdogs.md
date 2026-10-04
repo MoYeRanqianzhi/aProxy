@@ -26,6 +26,7 @@ metadata:
 | 注释心跳 + `CLAUDE_STREAM_IDLE_TIMEOUT_MS=3600000` | 超过 600s 仍存活 | 证实 600s 闸由该变量控制 |
 | 注释心跳 + `CLAUDE_STREAM_IDLE_TIMEOUT_MS=86400000`（24h） | 780s 时仍存活（由测试 timeout 结束） | 大取值不会被截回默认，可作推荐值 |
 | 注释心跳 + `API_TIMEOUT_MS=3600000` | 仍在 600s 断开 | `API_TIMEOUT_MS` 不控制这道闸 |
+| 经 aProxy（b9b1f7d，默认配置）+ `CLAUDE_STREAM_IDLE_TIMEOUT_MS=86400000`，上游 8 类故障后 757s 才成功、再慢速生成 140s | 约 900s 后拿到完整结果，客户端从未自行重发 | 0.1.0 硬验收，详见 release-0.1.0 计划进度节 |
 
 **对 aProxy 的含义**：注释心跳能覆盖首字节与字节级两层；事件级 600s 闸只能靠
 真实事件或客户端配置解除。aProxy 为保住「流中途断开也能透明重试」会缓冲完整
@@ -39,6 +40,8 @@ metadata:
 「A proxy or gateway that buffers streaming responses can cause this — set
 CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS」与上表一致。实验脚本与方法见
 [release-0.1.0 计划](../plan/release-0.1.0.md) 的证据节。
+
+**附带观察**（2026-10-04 验收时 claude 的 stderr）：请求经 127.0.0.1 网关时，Claude Code 提示 auto mode 的分类器请求无法享受新的免计费方式，需要网关实现 https://code.claude.com/docs/en/auto-mode-classifier-billing 。不影响功能，可作为 0.2.x 的功能候选，未评估。
 
 **Recheck when**：Claude Code 大版本更新、或上述环境变量名/默认值在其文档中变化；
 接入其他 agent 客户端（Codex 等）时需单独实测，不能套用本表。

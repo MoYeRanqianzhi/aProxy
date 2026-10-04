@@ -110,9 +110,15 @@
 - [x] Windows `cargo test --workspace --locked` 全绿（2026-10-04）：日志脱敏测试并行跑
   捕获为空是 tracing-core 单 Dispatch 快速路径所致，WS-1a 时就存在，已修（cf81486）
 - [ ] WS-1b 独立对抗审查（ws1b-review 代理进行中）→ 按结论修复
-- [ ] 真实 Claude Code 无限重试验收（>600s）进行中。故障时间线：529 → 断连 →
-  200+error JSON → SSE 半截断开 → SSE error 事件 → 500 → 挂起 120s → 503 → 529… →
-  距首请求 640s 后成功且慢速生成 140s
+- [x] 真实 Claude Code 无限重试验收通过（2026-10-04，master b9b1f7d 的 debug 构建，
+  默认配置，隔离 APROXY_HOME；claude 2.1.288，`CLAUDE_STREAM_IDLE_TIMEOUT_MS=86400000`，
+  白名单 `env -i` + 隔离 CLAUDE_CONFIG_DIR + 假 key）。mock 按请求序号注入：529 → 断连 →
+  200+error JSON → SSE 半截断开 → SSE error 事件 → 500 → 挂起 120s → 503 → 529 → 529 →
+  第 11 次（首请求后 757s）成功并慢速生成 140s。结果：claude 退出码 0、耗时 15 分钟，
+  输出完整且不含第 4 次半截流的标记文本；mock 收到 11 次主请求全部 retry-count=0
+  （客户端从未自行重发）；aProxy 只记录 1 条 POST /v1/messages 的「代理请求」，末行
+  「上游成功，回放到已提交的响应（保活通道） attempt=11」。退避节奏与 retry.rs 一致
+  （0/0/0/5/10/20/40/80/160/320s）。审查若改动保活路径，需按同一时间线重跑
 - [ ] ssh remote 全新目录全量；Linux gnu 产物 glibc 下限核对
 - [ ] 合并后审查与修复
 - 待办：aproxy-format 需发 format 新版本才能让 transform-03 生效；doctor 测试不隔离

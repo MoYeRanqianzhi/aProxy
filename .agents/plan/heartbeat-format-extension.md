@@ -25,6 +25,17 @@ aproxy 很多配置都可以和 format 搭配，使其实现超高自由度的�
    提交后每拍发一个心跳信封，回信的 `body` 就是这一拍写出的字节（空 = 本拍不写）。失败、超时、
    回信不合 1 的边界规则 → 本拍退回静态心跳并 warn（同一请求只 warn 一次）。心跳转换器慢时不得
    拖住节拍：上一拍的调用没回来就跳过本拍的调用，直接发静态心跳。
+   实现要点（2026-10-06 推敲，未写代码）：
+   - 不能在 `drive()` 的 select 里直接 await 转换：drive 返回时会 drop 在途的 convert future，
+     而 persistent worker 在往返中途被 drop 会被剔除（进程被杀），每拍都可能发生。改为每拍
+     `tokio::spawn` 一个任务跑完整次转换，任务自己把结果写进响应通道。
+   - 顺序保证：心跳任务写通道与「开始回放」必须互斥，否则心跳字节可能插进回放的事件中间。
+     做法：sink 里放一个 `std::sync::Mutex<bool /*已开始回放*/>`；`send()` 写第一块真实字节前在锁内
+     置位，心跳任务在锁内检查未置位才 `try_send`。try_send 不阻塞，持锁时间极短。
+   - state 要在心跳任务与主流程间共享（心跳回信可改 state，响应转换要看到），`ExchangeCtx.state`
+     需改成 `Arc<Mutex<Option<String>>>` 或在 sink 里另存一份、回放前合并。
+   - 心跳专属输入（seq、elapsed_ms、attempt、最近失败摘要）放信封里一个嵌套对象，避免顶层字段
+     越来越多；首拍带请求体，之后不带。
 3. 跨阶段状态：信封加 `stage`（`request` / `heartbeat` / `response`）、`request_id`（按请求唯一）
    与不透明的 `state`（字符串）。任一阶段回信带 `state` 即替换该请求保存的值，缺省 = 不变；
    下一阶段原样收到。心跳信封另带 `seq`（第几拍）、`elapsed_ms`（自提交起）、`attempt`（当前

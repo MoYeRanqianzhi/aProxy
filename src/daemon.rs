@@ -1371,6 +1371,10 @@ mod imp {
     /// 崩溃残留，删掉重建。
     pub async fn bind(endpoint: &str) -> io::Result<Listener> {
         let path = Path::new(endpoint);
+        // 端点先于注册表创建，首次启动时 run 目录可能还不存在
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
         match tokio::net::UnixStream::connect(path).await {
             Ok(_) => {
                 return Err(io::Error::new(

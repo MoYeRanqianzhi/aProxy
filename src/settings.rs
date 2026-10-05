@@ -5,7 +5,10 @@
 //! 但内容与格式随版本演进，不建议手改——别名等请走命令行管理。
 
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 /// aProxy 主目录：`APROXY_HOME` 环境变量优先，未设 = `~/.aproxy`。
 /// config/settings/bin/staging/logs/spool/run 全部相对它派生——测试与
@@ -258,11 +261,17 @@ pub fn default_config_path() -> PathBuf {
 
 /// 同上，Settings 已加载时直接解析（避免重复读文件）
 pub fn default_config_path_in(settings: &Settings) -> PathBuf {
+    default_config_path_for(settings, &crate::config::config_dir())
+}
+
+/// 同上，未指定默认配置时回退到给定主目录下的 `config.toml`（见
+/// `default_config_dirs_in` 为什么要由调用方给出主目录）。
+pub fn default_config_path_for(settings: &Settings, home: &Path) -> PathBuf {
     settings
         .default_config
         .as_deref()
         .map(expand_path)
-        .unwrap_or_else(crate::config::config_path)
+        .unwrap_or_else(|| home.join("config.toml"))
 }
 
 /// 原子保存：同目录 tmp 文件 + rename 覆盖（与实例注册表同思路，
@@ -372,23 +381,35 @@ pub fn resolve_default_target(target: &str) -> Option<PathBuf> {
     }
 }
 
-/// 固定参与检查的两个默认配置目录（始终在列表中，用户重复添加也静默去重）
+/// 固定参与检查的两个默认配置目录（始终在列表中，用户重复添加也静默去重）：
+/// 主目录本身与其下的 `configs/`。
 pub fn default_config_dirs() -> Vec<String> {
-    let root = crate::config::config_dir();
+    default_config_dirs_in(&crate::config::config_dir())
+}
+
+/// 同上，主目录由调用方给出——doctor/find 按「被检查的 settings.json 所在目录」
+/// 推导主目录，而不是读进程环境的 APROXY_HOME：两者在生产中一致，但测试与
+/// 「检查另一个主目录」时不一致，读进程环境会扫到开发机真实的 ~/.aproxy/。
+pub fn default_config_dirs_in(home: &Path) -> Vec<String> {
     vec![
-        root.display().to_string(),
-        root.join("configs").display().to_string(),
+        home.display().to_string(),
+        home.join("configs").display().to_string(),
     ]
 }
 
 /// 生效的配置目录列表：用户配置的 + 两个默认目录，展开路径并去重
 /// （大小写/分隔符归一后比较，Windows 文件系统大小写不敏感）。
 pub fn effective_config_dirs(settings: &Settings) -> Vec<PathBuf> {
+    effective_config_dirs_in(settings, &crate::config::config_dir())
+}
+
+/// 同上，默认目录取自给定主目录（见 `default_config_dirs_in`）。
+pub fn effective_config_dirs_in(settings: &Settings, home: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for raw in settings
         .config_dirs
         .iter()
-        .chain(default_config_dirs().iter())
+        .chain(default_config_dirs_in(home).iter())
     {
         let expanded = expand_path(raw);
         let key = path_match_key(&expanded.display().to_string());

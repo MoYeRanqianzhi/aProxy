@@ -70,14 +70,26 @@ impl Report {
 }
 
 /// 执行完整体检（三个检查函数依次调用并汇总）
+///
+/// 主目录取 settings.json 所在目录，而不是进程环境的 APROXY_HOME：默认配置
+/// （`config.toml`）与两个默认扫描目录都由它推导。生产中两者一致；检查另一个
+/// 主目录（测试的临时目录）时，读进程环境会扫到开发机真实的 ~/.aproxy/。
 pub fn run(settings_path: &Path) -> Report {
     let settings = settings::load_from(settings_path);
-    run_with(settings::check_settings_errors_in(settings_path), settings)
+    let home = settings_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(config::config_dir);
+    run_with(
+        settings::check_settings_errors_in(settings_path),
+        settings,
+        &home,
+    )
 }
 
 /// 同上，Settings 与 error 清单由调用方注入（测试用——注入的 settings 与
 /// 其 config_dirs 必须一致，否则扫描目录会跑偏）
-fn run_with(errors: Vec<String>, settings: Settings) -> Report {
+fn run_with(errors: Vec<String>, settings: Settings, home: &Path) -> Report {
     let mut report = Report::default();
 
     // 1) error 级：settings.json 静态合法性（每次软件运行都查；此处正式汇总）
@@ -92,7 +104,9 @@ fn run_with(errors: Vec<String>, settings: Settings) -> Report {
     report.findings.extend(check_aliased_configs(&settings));
 
     // 3) warning 级：配置目录下未被别名覆盖的其余 toml
-    report.findings.extend(check_unaliased_configs(&settings));
+    report
+        .findings
+        .extend(check_unaliased_configs(&settings, home));
 
     // 4) 看门狗字段越界检查（error=会造成看护故障；warning=合法但需确认意图）
     report.findings.extend(check_watchdog_settings(&settings));
@@ -100,7 +114,7 @@ fn run_with(errors: Vec<String>, settings: Settings) -> Report {
     // 5) 默认配置的非回环监听告警（别名/目录配置的同项检查在 2/3 里）
     report
         .findings
-        .extend(check_default_config_exposure(&settings));
+        .extend(check_default_config_exposure(&settings, home));
 
     report
 }
@@ -110,8 +124,8 @@ fn run_with(errors: Vec<String>, settings: Settings) -> Report {
 /// 另查；目录扫描刻意排除默认配置）——不单独查，最常见的用户就看不到这条
 /// 安全告警。已被别名引用时由别名检查报出，此处跳过避免重复。只做这一项：
 /// 默认配置的全面校验不在本检查的职责内。
-pub fn check_default_config_exposure(settings: &Settings) -> Vec<Finding> {
-    let path = settings::default_config_path_in(settings);
+pub fn check_default_config_exposure(settings: &Settings, home: &Path) -> Vec<Finding> {
+    let path = settings::default_config_path_for(settings, home);
     let key = settings::path_match_key(&path.display().to_string());
     if settings
         .aliases
@@ -216,7 +230,7 @@ pub fn check_aliased_configs(settings: &Settings) -> Vec<Finding> {
 /// 目录 toml 扫描（warning 级）：settings.config_dirs 的全部目录（含两个默认）
 /// 下的 *.toml（只查该层，不递归子目录），排除已被别名覆盖的文件——那些
 /// 由 check_aliased_configs 精查过。
-pub fn check_unaliased_configs(settings: &Settings) -> Vec<Finding> {
+pub fn check_unaliased_configs(settings: &Settings, home: &Path) -> Vec<Finding> {
     let mut findings = Vec::new();
     let aliased: std::collections::HashSet<String> = settings
         .aliases
@@ -234,12 +248,12 @@ pub fn check_unaliased_configs(settings: &Settings) -> Vec<Finding> {
         covered.insert(k);
     }
     covered.insert(settings::path_match_key(
-        &config::config_path().display().to_string(),
+        &home.join("config.toml").display().to_string(),
     ));
 
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut orphans: Vec<(PathBuf, Option<Config>)> = Vec::new();
-    for dir in settings::effective_config_dirs(settings) {
+    for dir in settings::effective_config_dirs_in(settings, home) {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             // 默认目录不存在（全新安装）不算问题；用户自加目录不存在提示
             if !settings.config_dirs.iter().any(|raw| {
@@ -437,7 +451,7 @@ mod tests {
         )
         .unwrap();
         let settings = settings::load_from(&settings_path_in_tmp(root.path()));
-        let findings = check_unaliased_configs(&settings);
+        let findings = check_unaliased_configs(&settings, root.path());
         // x.toml 被别名覆盖 → 不出现；y.toml 是孤儿 → 正常解析无提示；
         // badval.toml（缺端口）→ 校验失败 warning；默认 config.toml 不报
         assert!(
@@ -453,6 +467,32 @@ mod tests {
             findings
         );
         assert!(y.exists());
+    }
+
+    #[test]
+    fn doctor_home_follows_settings_location_not_process_env() {
+        // 主目录取被检查的 settings.json 所在目录：其下未设 default_config 时的
+        // 默认配置（config.toml）由此推导——非回环监听告警应指向临时目录里的
+        // 这份，而不是进程环境 APROXY_HOME（开发机上即真实 ~/.aproxy）里的那份
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_cfg(
+            dir.path(),
+            "config.toml",
+            "192.168.1.10:59851",
+            "https://h.example.com",
+        );
+        std::fs::write(settings_path_in_tmp(dir.path()), "{}").unwrap();
+        let report = run(&settings_path_in_tmp(dir.path()));
+        let exposure: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.message.contains("默认配置"))
+            .collect();
+        assert_eq!(exposure.len(), 1, "{:?}", report.findings);
+        assert!(
+            exposure[0].message.contains(&cfg.display().to_string()),
+            "默认配置应取自 settings.json 所在目录: {exposure:?}"
+        );
     }
 
     #[test]
@@ -556,7 +596,7 @@ mod tests {
             default_config: Some(main_str.clone()),
             ..Default::default()
         };
-        let findings = check_default_config_exposure(&settings);
+        let findings = check_default_config_exposure(&settings, dir.path());
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(
             findings[0].message.contains("默认配置")
@@ -569,7 +609,7 @@ mod tests {
             ..settings
         };
         assert!(
-            check_default_config_exposure(&aliased).is_empty(),
+            check_default_config_exposure(&aliased, dir.path()).is_empty(),
             "已被别名引用的默认配置由别名检查负责"
         );
     }
@@ -636,9 +676,9 @@ mod tests {
         .unwrap();
         let settings = settings::load_from(&settings_path_in_tmp(root.path()));
 
-        // 只统计用户自加目录内的发现（effective_config_dirs 的默认根是真实
-        // ~/.aproxy/，开发机上可能存在其他文件，不在本测试断言范围）
-        let all: Vec<_> = crate::find::discover(&settings)
+        // 主目录取本测试的临时目录（默认扫描根随之落在这里，不碰开发机真实的
+        // ~/.aproxy/）；只统计用户自加目录内的发现
+        let all: Vec<_> = crate::find::discover_in(&settings, root.path())
             .into_iter()
             .filter(|d| d.path.starts_with(&cfgs))
             .collect();

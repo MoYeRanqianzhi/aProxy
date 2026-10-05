@@ -17,6 +17,12 @@ pub struct DiscoveredConfig {
 /// 扫描配置目录列表，发现全部 toml 配置（只查各目录该层，不递归子目录；
 /// 跨目录重复路径按匹配键去重）。
 pub fn discover(settings: &Settings) -> Vec<DiscoveredConfig> {
+    discover_in(settings, &crate::config::config_dir())
+}
+
+/// 同上，默认配置与默认目录取自给定主目录（doctor 按被检查的 settings.json
+/// 所在目录推导，见 `settings::default_config_dirs_in`）。
+pub fn discover_in(settings: &Settings, home: &std::path::Path) -> Vec<DiscoveredConfig> {
     let alias_map: std::collections::HashMap<String, Vec<String>> = {
         let mut m: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
@@ -30,7 +36,7 @@ pub fn discover(settings: &Settings) -> Vec<DiscoveredConfig> {
         m
     };
     let mut default_keys: Vec<String> = vec![settings::path_match_key(
-        &crate::config::config_path().display().to_string(),
+        &home.join("config.toml").display().to_string(),
     )];
     if let Some(p) = &settings.default_config {
         default_keys.push(settings::path_match_key(
@@ -40,7 +46,7 @@ pub fn discover(settings: &Settings) -> Vec<DiscoveredConfig> {
 
     let mut out: Vec<DiscoveredConfig> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for dir in settings::effective_config_dirs(settings) {
+    for dir in settings::effective_config_dirs_in(settings, home) {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };

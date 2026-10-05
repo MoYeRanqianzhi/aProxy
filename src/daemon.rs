@@ -1365,10 +1365,10 @@ mod imp {
 
     pub struct Listener(UnixListener);
 
-    /// 独占创建 socket。路径上已有文件时先探测：连得上说明有进程正在用它
-    /// （同一 home 同端口的另一个实例），拒绝——删掉它的 socket 等于把它的
-    /// 控制通道抢走，它从此 stop/status 不可达；连接被拒（没有进程在听）才是
-    /// 崩溃残留，删掉重建。
+    /// 独占创建 socket。路径上已有文件时先探测：连得上（或积压队列满）说明有
+    /// 进程正在用它（同一 home 同端口的另一个实例），拒绝——删掉它的 socket 等于
+    /// 把它的控制通道抢走，它从此 stop/status 不可达；其余连接失败都说明没有
+    /// 进程在听（崩溃残留），删掉重建。
     pub async fn bind(endpoint: &str) -> io::Result<Listener> {
         let path = Path::new(endpoint);
         // 端点先于注册表创建，首次启动时 run 目录可能还不存在
@@ -1376,17 +1376,16 @@ mod imp {
             std::fs::create_dir_all(dir)?;
         }
         match tokio::net::UnixStream::connect(path).await {
-            Ok(_) => {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() != io::ErrorKind::WouldBlock => {
+                let _ = std::fs::remove_file(path);
+            }
+            _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
                     format!("已有进程在 {endpoint} 上提供控制通道"),
                 ));
             }
-            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
-                let _ = std::fs::remove_file(path);
-            }
-            // 不存在（正常情况）或别的问题（如路径过长）：交给 bind 报真实错误
-            Err(_) => {}
         }
         UnixListener::bind(path).map(Listener)
     }
@@ -1892,7 +1891,8 @@ mod tests {
         let endpoint = test_endpoint(dir.path(), "stale");
         drop(std::os::unix::net::UnixListener::bind(&endpoint).unwrap());
         assert!(std::path::Path::new(&endpoint).exists());
-        assert!(imp::bind(&endpoint).await.is_ok());
+        let bound = imp::bind(&endpoint).await;
+        assert!(bound.is_ok(), "{:?}", bound.err());
     }
 
     #[tokio::test]

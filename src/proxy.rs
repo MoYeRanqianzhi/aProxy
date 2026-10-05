@@ -469,6 +469,11 @@ enum ReadBodyError {
 
 /// 读取请求体：内存缓冲，超 `RESIDENT_LIMIT` 且 disk_cache 可用则溢写磁盘。
 /// `limit` 超出返回 TooLarge；客户端中断或写盘失败返回 Io。
+///
+/// 溢写文件在交给 `RequestBody::Disk` 之前由 `SpoolPath` 持有：显式的出错分支
+/// 之外，客户端在上传途中断开时 hyper 会直接 drop 整个 handler future（本函数
+/// 停在某个 await 上、不会走到任何返回分支），守卫的 Drop 照样删掉半截文件，
+/// 不留 `req-*.spooltmp` 等到下次启动才回收。
 async fn read_request_body(
     body: axum::body::Body,
     limit: usize,
@@ -476,31 +481,23 @@ async fn read_request_body(
 ) -> Result<RequestBody, ReadBodyError> {
     let mut body = body.into_data_stream();
     let mut mem: Vec<u8> = Vec::new();
-    let mut disk: Option<(tokio::fs::File, PathBuf, u64)> = None;
+    // 落盘状态：写句柄 + 删除责任守卫 + 已写字节数。各出错分支直接 return，
+    // 守卫随之 drop 删除文件
+    let mut disk: Option<(tokio::fs::File, SpoolPath, u64)> = None;
     loop {
         let chunk = match body.next().await {
             Some(Ok(c)) => c,
-            Some(Err(e)) => {
-                if let Some((_, path, _)) = disk.take() {
-                    let _ = std::fs::remove_file(&path);
-                }
-                return Err(ReadBodyError::Io(std::io::Error::other(e)));
-            }
+            Some(Err(e)) => return Err(ReadBodyError::Io(std::io::Error::other(e))),
             None => break,
         };
         // 上限判定：磁盘模式下基于累计总量；内存模式基于 Vec 长度
         let total = disk.as_ref().map_or(mem.len(), |(_, _, l)| *l as usize);
         if limit != usize::MAX && total + chunk.len() > limit {
-            if let Some((_, path, _)) = disk.take() {
-                let _ = std::fs::remove_file(&path);
-            }
             return Err(ReadBodyError::TooLarge);
         }
         match &mut disk {
             Some((file, _, len)) => {
                 if file.write_all(&chunk).await.is_err() {
-                    let (_, path, _) = disk.take().expect("disk 存在");
-                    let _ = std::fs::remove_file(&path);
                     return Err(ReadBodyError::Io(std::io::Error::other(
                         "请求体磁盘缓存写入失败",
                     )));
@@ -512,23 +509,20 @@ async fn read_request_body(
                     // 溢写决策：有目录才落盘；无目录（disk_cache 关闭/目录不可用）
                     // 继续内存缓冲（limit 语义不受影响）
                     if let Some(dir) = spool_dir {
-                        let path = dir.join(format!(
+                        let path = SpoolPath(dir.join(format!(
                             "req-{}-{}.spooltmp",
                             std::process::id(),
                             unique_seq()
-                        ));
-                        // 目录不可用（create 失败）：内存退化
-                        if let Ok(mut file) = tokio::fs::File::create(&path).await {
-                            if file.write_all(&mem).await.is_ok()
-                                && file.write_all(&chunk).await.is_ok()
-                            {
-                                disk = Some((file, path, (mem.len() + chunk.len()) as u64));
-                                mem = Vec::new();
-                                continue;
-                            }
-                            // 半截文件必须删除
-                            drop(file);
-                            let _ = std::fs::remove_file(&path);
+                        )));
+                        // 目录不可用（create 失败）：内存退化。写入失败时 file 与
+                        // 守卫一起在本块末尾 drop——半截文件随之删除
+                        if let Ok(mut file) = tokio::fs::File::create(&path.0).await
+                            && file.write_all(&mem).await.is_ok()
+                            && file.write_all(&chunk).await.is_ok()
+                        {
+                            disk = Some((file, path, (mem.len() + chunk.len()) as u64));
+                            mem = Vec::new();
+                            continue;
                         }
                     }
                 }
@@ -541,13 +535,16 @@ async fn read_request_body(
             // 写完整后 flush 确保后续重试读到全量数据（flush 只推缓冲到 OS，
             // 不等待物理落盘——page cache 一致性由 OS 保证）
             if file.flush().await.is_err() {
-                let _ = std::fs::remove_file(&path);
                 return Err(ReadBodyError::Io(std::io::Error::other(
                     "请求体磁盘缓存写入失败",
                 )));
             }
             drop(file);
-            RequestBody::Disk { path, len }
+            // 删除责任从守卫移交给 RequestBody（其 Drop 负责删文件）
+            RequestBody::Disk {
+                path: path.into_path(),
+                len,
+            }
         }
         None => RequestBody::Memory(Bytes::from(mem)),
     })
@@ -3300,6 +3297,45 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "迁移中途被丢弃的 spool 文件必须删除"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn request_body_dropped_mid_upload_leaves_no_file() {
+        // 客户端上传到一半断开：hyper 直接 drop handler future，read_request_body
+        // 停在「等下一块」的 await 上、走不到任何显式出错分支——已溢写的
+        // req-*.spooltmp 也必须当场删除。首块超过驻留阈值触发溢写，之后流
+        // 永远 pending（客户端不再发送）
+        use futures_util::StreamExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let first = Bytes::from(vec![b'x'; RESIDENT_LIMIT + 1]);
+        let stream = futures_util::stream::iter([Ok::<_, std::io::Error>(first)])
+            .chain(futures_util::stream::pending());
+        let count = || std::fs::read_dir(dir.path()).unwrap().count();
+        {
+            let fut = read_request_body(Body::from_stream(stream), usize::MAX, Some(dir.path()));
+            tokio::pin!(fut);
+            // 逐次 poll：文件出现后再推进一段时间，让溢写写完、future 停到
+            // 「等下一块」上（这正是客户端上传中途停住再断开的形态）
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut settled_polls = 0;
+            while settled_polls < 50 {
+                let polled = std::future::poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await;
+                assert!(polled.is_pending(), "前提：请求体流未结束，读取不应完成");
+                assert!(std::time::Instant::now() < deadline, "溢写文件始终未出现");
+                if count() > 0 {
+                    settled_polls += 1;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while count() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "上传中途被丢弃的请求体临时文件必须删除"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

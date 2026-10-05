@@ -38,6 +38,19 @@ IPC 重新整理格式后协议版本从 1 重新计数。随后：「发现的�
   且先建下一实例再丢当前实例（名字不消失）；服务端读请求 5 秒时限、客户端应答 1 MiB 上限（b.4）。
   变异验证：去掉对端核对、普查 pid 守卫、first_pipe_instance 各自让对应测试失败。
   心跳节与安装宣告的命名空间（S5）在第 5 步。
+- CI 教训（提交 B 后连红三次，均已修）：unix 上 `serve_endpoint` 只有 Windows 与测试在用（clippy 死代码）；
+  端点先于注册表创建后 unix 的 run 目录可能还不存在；残留 socket 的探测不能只认 ConnectionRefused
+  （改为「连上或积压满才拒绝，其余失败一律清残留」）。本机无法编译 Linux，unix 路径的改动推送后要等
+  ubuntu 结果再叠加下一步。
+- 第 4 步（提交 C）：线上格式 v1（`IpcOp` + `{"v":1,"op"}`；应答 `InstanceStatus{instance, run_dir, state,
+  activity, ops}` 或 `error{code, message}`；错误码 bad_request/unsupported_version/unknown_op/invalid_state）；
+  `InstanceInfo` 拆成 `InstanceRecord`（`.pid`，全部必填）与 `InstanceStatus`；客户端错误 `IpcError
+  {Unreachable, Transient, Protocol, Remote}`；`wait_until_gone` 与 install 的 `stop_and_wait` 只认 Unreachable；
+  S3（无 `v` 的请求回 0.1.0 形状）与 S4（无 `v` 的应答按 0.1.0 解析）在 `compat_0_1_0.rs`。删除
+  `IpcRequest`/`IpcResponse`/`IPC_PROTO_VERSION`/`IPC_PROTO_V1`/`Stats` op 与 status 的 `proto_version >= 2`。
+  测试：解析与错误码、客户端读未知状态与 0.1.0 应答、真实端点往返（跨平台）、`compat_v0_1_0` 里真实守护
+  按 0.1.0 形状应答（冻结的 0.1.0 `IpcResponse` 解析）。没做 `RunDir` 新类型：CLI 层用进程 home 的便捷函数
+  是正当用法，库层一律走 `_in` 变体，收益不抵改动面。
 - Linux 编译只能靠 CI 的 ubuntu 门禁：本机 WSL（Debian）的 rustup 工具链清单损坏，且 2026-10-06 WSL 内无外网
   （官方源与 rsproxy 均连接超时），修不了；本机也没有 Linux C 交叉编译器（ring 需要）。
 

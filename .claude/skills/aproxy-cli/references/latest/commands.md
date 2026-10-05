@@ -195,17 +195,20 @@ there, the record is kept and listed first, whatever the filter:
 still there but does not answer the control channel"), with port, pid, version, config and the hint
 `aproxy stop <port> --force`. Such an instance is almost always hung; with the watchdog on, its
 hang detection terminates and respawns it on its own. Per answering instance: port, pid, `v<version>`, uptime, idle time, listen address, masked
-upstream, config path, and request and retry counts with the latest error. Two extra lines can
+upstream, config path, and request and retry counts with the latest error. Extra lines can
 appear:
 
 - `二进制更换中（install 滚动重启阶段，请勿手动干预此实例）` ("binary swap in progress; do not
   intervene"): `aproxy install` is about to restart this instance. Leave it alone.
+- `正在退出` ("shutting down"): it received a stop and is finishing open requests (up to 10 s).
+- `状态未知（实例比当前 CLI 新，用同版本的 aproxy 查看）` ("unknown state; the instance is newer
+  than this CLI"): run the same version of aproxy as the instance.
 - `注意: 实例版本 v<x> 与当前 CLI v<y> 不同…` ("instance version differs from this CLI"):
   see compatibility.md.
 
 `--idle` shows only instances idle for at least `idle_timeout_secs` (settings.json, default
-1800); `--busy` the rest. An instance that has not reported activity counts as busy. `status` does
-not print log paths; see [logs](#logs).
+1800); `--busy` the rest. An instance that has served no request yet is idle from its start time.
+`status` does not print log paths; see [logs](#logs).
 
 ## stop
 

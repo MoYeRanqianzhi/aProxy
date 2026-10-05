@@ -54,7 +54,7 @@ pub(crate) async fn handle_restore_cmd() {
                 .await
                 {
                     Ok(live) => {
-                        let actual = daemon::port_of(&live.listen_addr).to_string();
+                        let actual = daemon::port_of(&live.instance.listen_addr).to_string();
                         // 实例落在新端口：原端口的 .restore 是已死旧进程的残留，
                         // 新实例已按实际端口写了自己的记录。不清理的话 stop 新端口
                         // 后下一次 restore（或看护者）会凭它把实例再拉起来

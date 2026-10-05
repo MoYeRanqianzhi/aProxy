@@ -12,7 +12,7 @@ metadata:
 用户实测发现：日志按 `<端口>.log` 命名没有考虑配置改换端口——端口是易变标识，拿它当永久文件名与别名系统「实例不依赖端口」的哲学直接冲突（实测 T4 换端口场景已暴露排障断档）。用户三点定调：
 
 1. **随机命名**：格式 `<纳秒hex>-<pid低16位hex>.log`（如 `19ac3f2e8b5d-1a2b.log`），无新依赖，同 pid 同纳秒不可能碰撞。
-2. **IPC 是日志地址的权威**：InstanceInfo.log_path 经 IPC/注册表上报，`aproxy logs`/`status`/start 成功提示一律问实例拿真实路径，**不提供按端口拼路径的回退**（alpha 阶段无兼容承诺）。
+2. **IPC 是日志地址的权威**：InstanceRecord.log_path 经 IPC/注册表上报，`aproxy logs`/`status`/start 成功提示一律问实例拿真实路径，**不提供按端口拼路径的回退**（alpha 阶段无兼容承诺）。
 3. **语义 B**：自定义日志位置 = config.toml `log_file` 字段 + CLI `--log-file`（仅本次），**有意不进 settings.json 全局默认层**（用户明确：日志去向是每实例语义，不许 settings 默认）。
 
 **Why**：客户端拼接路径 = 重复实现命名规则且端口一变就错；实例自己是自身元数据的权威来源。

@@ -184,18 +184,18 @@ pub(crate) async fn handle_start_cmd(
     // （端口号）无法区分两者，注册表与 IPC 端点会互相顶替（stop 会停错实例），
     // 必须明确拒绝。别的 home 的同端口实例这里看不到，由预检 2 的 bind 失败拦下。
     if let Ok(info) = daemon::ipc_ping(&port).await {
-        if info.listen_addr == listen_addr {
+        if info.instance.listen_addr == listen_addr {
             println!("此端口已有 aProxy 在运行，无需重复启动：");
             println!(
                 "  pid {}  监听 http://{}  v{}",
-                info.pid, info.listen_addr, info.version
+                info.instance.pid, info.instance.listen_addr, info.instance.version
             );
             println!("查看实例: aproxy status    停止: aproxy stop {port}");
             return;
         }
         eprintln!(
             "端口 {port} 已被监听地址 {} 的 aProxy 实例使用（本进程将监听 {listen_addr}），两者不能并存。",
-            info.listen_addr
+            info.instance.listen_addr
         );
         eprintln!("实例按端口号区分，请为其中一个更换监听地址/端口。");
         std::process::exit(1);
@@ -211,7 +211,7 @@ pub(crate) async fn handle_start_cmd(
             println!("此端口已有 aProxy 在运行，无需重复启动：");
             println!(
                 "  pid {}  监听 http://{}  v{}",
-                info.pid, info.listen_addr, info.version
+                info.instance.pid, info.instance.listen_addr, info.instance.version
             );
             println!("查看实例: aproxy status    停止: aproxy stop {port}");
             return;
@@ -275,15 +275,15 @@ pub(crate) async fn handle_start_cmd(
     loop {
         if let Ok(info) = daemon::ipc_ping(&port).await {
             println!("aProxy 已在后台启动");
-            println!("  pid: {}", info.pid);
-            println!("  监听: http://{}", info.listen_addr);
+            println!("  pid: {}", info.instance.pid);
+            println!("  监听: http://{}", info.instance.listen_addr);
             println!("  Base URL: {}", mask_base_url(&cfg.base_url));
             if !cfg.base_url.is_empty() {
                 // 与上一行同一出口：这一行同样会被整段粘贴求助
                 let base = mask_base_url(cfg.base_url.trim_end_matches('/'));
                 println!(
                     "  提示: 将你的 API base URL 指向 http://{}",
-                    info.listen_addr
+                    info.instance.listen_addr
                 );
                 println!("        上游路径与查询参数将完整透传到 {base}/<path>?<query>");
             }
@@ -299,7 +299,7 @@ pub(crate) async fn handle_start_cmd(
                 );
             }
             println!("  配置: {}", cfg_path.display());
-            println!("  日志: {}", info.log_path);
+            println!("  日志: {}", info.instance.log_path);
             println!("查看实例: aproxy status    停止: aproxy stop {port}");
             break;
         }

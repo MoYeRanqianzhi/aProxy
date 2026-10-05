@@ -57,6 +57,20 @@ mod v0_1_0 {
         PrepareSwap,
     }
 
+    /// src/daemon.rs `IpcResponse`（0.1.0 的 `ipc_proto_v1_default` 返回 1）
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+    pub struct IpcResponse {
+        pub ok: bool,
+        #[serde(default)]
+        pub info: Option<InstanceInfo>,
+        #[serde(default = "proto_v1")]
+        pub proto: u32,
+    }
+
+    fn proto_v1() -> u32 {
+        1
+    }
+
     /// src/daemon.rs `RestoreRecord`（`.restore` 文件内容）
     #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
     pub struct RestoreRecord {
@@ -79,23 +93,16 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("读取 {} 失败: {e}", path.display()))
 }
 
-fn new_instance(port: &str) -> aproxy::daemon::InstanceInfo {
-    aproxy::daemon::InstanceInfo {
+fn new_instance(port: &str) -> aproxy::daemon::InstanceRecord {
+    aproxy::daemon::InstanceRecord {
         pid: 4321,
+        process_start: 133_000_000_000_000_000,
         version: "9.9.9".into(),
         listen_addr: format!("127.0.0.1:{port}"),
         config_path: "C:/cfg/config.toml".into(),
         base_url: "https://api.example.com".into(),
         started_at: 1_760_000_000,
-        last_activity_secs: 1_760_000_100,
-        proto_version: aproxy::daemon::IPC_PROTO_VERSION,
-        requests_total: 7,
-        retries_total: 2,
-        last_error: None,
-        last_error_at: 0,
-        swap_phase: false,
         log_path: "C:/home/logs/a.log".into(),
-        process_start: 133_000_000_000_000_000,
     }
 }
 
@@ -216,19 +223,14 @@ fn watchdog_claim_round_trips_with_0_1_0() {
 
 #[test]
 fn ipc_requests_parse_as_0_1_0() {
-    // 新版本的 CLI / 安装器发给 0.1.0 守护的请求行，0.1.0 必须认得出 op
-    for (req, want) in [
-        (aproxy::daemon::IpcRequest::Ping, v0_1_0::IpcRequest::Ping),
-        (
-            aproxy::daemon::IpcRequest::Shutdown,
-            v0_1_0::IpcRequest::Shutdown,
-        ),
-        (
-            aproxy::daemon::IpcRequest::PrepareSwap,
-            v0_1_0::IpcRequest::PrepareSwap,
-        ),
+    // 新版本的 CLI / 安装器发给 0.1.0 守护的请求行（带 v），0.1.0 必须认得出 op
+    use aproxy::daemon::IpcOp;
+    for (op, want) in [
+        (IpcOp::Ping, v0_1_0::IpcRequest::Ping),
+        (IpcOp::Shutdown, v0_1_0::IpcRequest::Shutdown),
+        (IpcOp::PrepareSwap, v0_1_0::IpcRequest::PrepareSwap),
     ] {
-        let line = serde_json::to_string(&req).unwrap();
+        let line = op.request_line();
         let old: v0_1_0::IpcRequest =
             serde_json::from_str(&line).unwrap_or_else(|e| panic!("0.1.0 解析不了 {line}: {e}"));
         assert_eq!(old, want, "{line}");
@@ -238,4 +240,93 @@ fn ipc_requests_parse_as_0_1_0() {
     let old: v0_1_0::IpcRequest =
         serde_json::from_str(r#"{"v":1,"op":"shutdown","args":{}}"#).unwrap();
     assert_eq!(old, v0_1_0::IpcRequest::Shutdown);
+}
+
+/// 0.1.0 的客户端连上新守护：发它那种不带 `v` 的请求行，读回一行应答。
+async fn legacy_exchange(endpoint: &str, request: &str) -> String {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    #[cfg(windows)]
+    let stream = tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(endpoint)
+        .unwrap();
+    #[cfg(unix)]
+    let stream = tokio::net::UnixStream::connect(endpoint).await.unwrap();
+    let (reader, mut writer) = tokio::io::split(stream);
+    writer
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(reader).read_line(&mut line).await.unwrap();
+    line
+}
+
+#[test]
+fn daemon_answers_0_1_0_clients_in_the_0_1_0_shape() {
+    // 0.1.0 的 CLI 与安装器（升级途中它们在驱动）发的是不带 v 的请求，读应答用的
+    // 是 0.1.0 的结构：新守护必须回它们解析得了的形状，prepare_swap 的 ACK 也要
+    // 落在 swap_phase 上
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let cfg = home.path().join("c.toml");
+    std::fs::write(
+        &cfg,
+        format!("base_url = \"https://api.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
+    )
+    .unwrap();
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+    let started = std::process::Command::new(exe)
+        .args(["start", "--config"])
+        .arg(&cfg)
+        .env("APROXY_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    struct Stop<'a>(&'a Path, u16);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new(env!("CARGO_BIN_EXE_aproxy"))
+                .args(["stop", &self.1.to_string()])
+                .env("APROXY_HOME", self.0)
+                .output();
+        }
+    }
+    let _stop = Stop(home.path(), port);
+
+    let endpoint = aproxy::daemon::endpoint_for_in(&home.path().join("run"), &port.to_string());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let ask = |request: &str| -> v0_1_0::IpcResponse {
+        let line = rt.block_on(legacy_exchange(&endpoint, request));
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("0.1.0 解析不了 {line}: {e}"))
+    };
+
+    let ping = ask(r#"{"op":"ping"}"#);
+    assert!(ping.ok);
+    assert_eq!(ping.proto, 2);
+    let info = ping.info.expect("0.1.0 的 ping 应答带实例信息");
+    assert_eq!(info.listen_addr, format!("127.0.0.1:{port}"));
+    assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+    assert!(!info.swap_phase);
+
+    let swap = ask(r#"{"op":"prepare_swap"}"#);
+    assert!(swap.ok && swap.info.is_some_and(|i| i.swap_phase));
+
+    let unknown = ask(r#"{"op":"what"}"#);
+    assert!(!unknown.ok);
+
+    // 0.1.0 的安装器靠 shutdown 停掉新实例
+    let stop = ask(r#"{"op":"shutdown"}"#);
+    assert!(stop.ok);
 }

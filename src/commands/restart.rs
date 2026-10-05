@@ -95,7 +95,7 @@ pub(crate) async fn handle_restart_cmd(
 /// 就绪判定按新 pid 定位（见 daemon::wait_spawned_instance_ready）——配置
 /// 改端口后依然能正确确认。
 async fn restart_instance(
-    info: &daemon::InstanceInfo,
+    info: &daemon::InstanceRecord,
     mode: StopMode,
 ) -> Result<(), RestartFailure> {
     let port = daemon::port_of(&info.listen_addr).to_string();
@@ -143,10 +143,10 @@ async fn restart_instance(
     .await
     {
         Ok(live) => {
-            let new_port = daemon::port_of(&live.listen_addr).to_string();
+            let new_port = daemon::port_of(&live.instance.listen_addr).to_string();
             println!("已重启（端口 {new_port}）");
-            println!("  pid: {}（旧 pid {}）", live.pid, info.pid);
-            println!("  监听: http://{}", live.listen_addr);
+            println!("  pid: {}（旧 pid {}）", live.instance.pid, info.pid);
+            println!("  监听: http://{}", live.instance.listen_addr);
             Ok(())
         }
         Err(daemon::SpawnNotReady::Exited) => Err(RestartFailure::Start(format!(
@@ -167,7 +167,7 @@ async fn restart_instance(
 /// 注入、validate），监听地址变了再探测新地址可否绑定。只读，无副作用
 /// （bind 探测的 listener 随即释放）。通过返回新守护将使用的配置文件路径。
 async fn precheck_restart(
-    info: &daemon::InstanceInfo,
+    info: &daemon::InstanceRecord,
     old_port: &str,
     args: &[String],
 ) -> Result<PathBuf, String> {
@@ -199,7 +199,7 @@ async fn precheck_restart(
         {
             return Err(format!(
                 "新配置的监听端口 {new_port} 上已有 aProxy 实例（pid {}）在运行",
-                other.pid
+                other.instance.pid
             ));
         }
         if let Err(e) = tokio::net::TcpListener::bind(new_addr).await

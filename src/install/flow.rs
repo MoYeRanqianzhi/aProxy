@@ -47,7 +47,7 @@ pub async fn check_jurisdiction(run_dir: &Path, home: &Path, adopt: bool) -> Res
         let Ok(info) = crate::daemon::ipc_ping_in(run_dir, &port).await else {
             continue;
         };
-        let Some(image) = crate::watchdog::process_image_path(info.pid) else {
+        let Some(image) = crate::watchdog::process_image_path(info.instance.pid) else {
             continue;
         };
         if !is_under(&image, &bin_dir) {
@@ -87,7 +87,7 @@ fn is_under(path: &Path, dir: &Path) -> bool {
 async fn live_ports(run_dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
     for info in crate::daemon::list_instances_in(run_dir).await {
-        out.push(crate::daemon::port_of(&info.listen_addr).to_string());
+        out.push(crate::daemon::port_of(&info.instance.listen_addr).to_string());
     }
     out
 }
@@ -360,8 +360,8 @@ async fn run_tail(
         // 跳过已就绪（仅续作：崩溃前已滚动的实例不再动）
         if skip_ready
             && let Ok(info) = crate::daemon::ipc_ping_in(run_dir, port).await
-            && info.version == state.target_version
-            && !info.swap_phase
+            && info.instance.version == state.target_version
+            && info.state == crate::daemon::InstanceState::Serving
         {
             continue;
         }
@@ -390,7 +390,9 @@ async fn run_tail(
         let mut bad = Vec::new();
         for port in &snapshot {
             match crate::daemon::ipc_ping_in(run_dir, port).await {
-                Ok(info) if info.version == state.target_version && !info.swap_phase => {}
+                Ok(info)
+                    if info.instance.version == state.target_version
+                        && info.state == crate::daemon::InstanceState::Serving => {}
                 _ => bad.push(port.clone()),
             }
         }

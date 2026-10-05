@@ -8,11 +8,12 @@ metadata:
 # 进程身份判定与名称解耦（2026-09-10 用户定调；2026-10-04 方案 A 已实施）
 
 **现状（2026-10-04，合并提交 5c71f35）**：`is_aproxy_process` 已删除。守护注册时把自身进程创建时间写进
-`InstanceInfo.process_start`；`watchdog::record_identity` 按「pid + 创建时间」判定
-Alive / Unverifiable / Reused / Gone；收养、处决、`--force`、install 换血停旧看护者、选举存活判定
+`InstanceRecord.process_start`；`watchdog::record_identity` 按「pid + 创建时间」判定
+Alive / Reused / Gone；收养、处决、`--force`、install 换血停旧看护者、选举存活判定
 全部改用它，Windows 终止在同一进程句柄上先核对创建时间再 TerminateProcess（无复用窗口）。
-旧记录（process_start = 0）一律保守：宁可不看护也不误杀（收养需 IPC 回报 pid 一致、选举不计入、
-`--force` 先 ping 确认）。官方 Release 资产名 aproxy-<target>(.exe) 直接运行也受看护。
+登记值 0（读不到创建时间的平台）= 无法核验，按 Gone 处理：不收养、不处决、不强杀（2026-10-06
+db770a0 删掉了「IPC 回报 pid 一致」的退路）。IPC 一侧另有核对：客户端比对应答自报 pid 与连接
+对端进程（faf551d），0.1.0 兼容回退还要求 pid 与非 0 创建时间都和记录一致。官方 Release 资产名 aproxy-<target>(.exe) 直接运行也受看护。
 主仓库 stash@{0} 的方向稿已被这次实现取代，2026-10-04 经用户授权（「全都由你来决定和操作」）丢弃（4627432）。下文为当初定调的推理，保留供回溯。
 
 **用户原话定性**：「怎么能通过名称来判断呢？？这是严重谬误！！」（针对
@@ -42,7 +43,7 @@ Alive / Unverifiable / Reused / Gone；收养、处决、`--force`、install 换
 - 工作区已回滚到 `f5e3a4f`（R1/R2 修复完整保留），HEAD 未动
 - 未获确认的重构稿在 stash：`stash@{0}`（4627432，message
   「name-free-identity-refactor-draft(未获确认的方向稿)」，约 60% 完成：
-  InstanceInfo.process_start 字段 + --force/选举/收养/处决/claim 五处
+  InstanceRecord.process_start 字段 + --force/选举/收养/处决/claim 五处
   调用点替换）——方向未批准前不得恢复使用（2026-10-04 已丢弃，见上文）
 - **待用户拍板的范围决策**：
   A. 本分支做完整替换（Windows 行为随之变化，偏离「零变化」承诺，合并

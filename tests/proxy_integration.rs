@@ -4726,22 +4726,15 @@ fn hung_instance_is_reported_and_only_force_stops_it() {
     let pid = dummy.0.id();
     let start = aproxy::watchdog::process_start_time(pid).expect("读不到哑进程创建时间");
     let run_dir = home.path().join("run");
-    let info = aproxy::daemon::InstanceInfo {
+    let info = aproxy::daemon::InstanceRecord {
         pid,
+        process_start: start,
         version: "0.0.0-test".into(),
         listen_addr: format!("127.0.0.1:{port}"),
         config_path: home.path().join("c.toml").display().to_string(),
         base_url: "https://api.example.com".into(),
         started_at: 1_700_000_000,
-        last_activity_secs: 0,
-        proto_version: aproxy::daemon::IPC_PROTO_VERSION,
-        requests_total: 0,
-        retries_total: 0,
-        last_error: None,
-        last_error_at: 0,
-        swap_phase: false,
         log_path: String::new(),
-        process_start: start,
     };
     aproxy::daemon::write_instance_file_in(&run_dir, &info).unwrap();
     let record = run_dir.join(format!("{port}.pid"));
@@ -5603,7 +5596,7 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     // pid 从注册表读（.pid 与 .restore 同键——注册表键 = port_of(listen_addr)
     // 即纯端口号——且 .pid 先于 .restore 落盘）
     let pid_path = run_dir.join(format!("{port}.pid"));
-    let pid: u32 = serde_json::from_str::<aproxy::daemon::InstanceInfo>(
+    let pid: u32 = serde_json::from_str::<aproxy::daemon::InstanceRecord>(
         &std::fs::read_to_string(&pid_path).unwrap(),
     )
     .unwrap()
@@ -5725,7 +5718,7 @@ fn port_zero_restore_record_uses_actual_port() {
             if let Some(record) = record {
                 let pid_path = record.path().with_extension("pid");
                 info = Some((
-                    serde_json::from_str::<aproxy::daemon::InstanceInfo>(
+                    serde_json::from_str::<aproxy::daemon::InstanceRecord>(
                         &std::fs::read_to_string(&pid_path).unwrap(),
                     )
                     .unwrap(),
@@ -6267,7 +6260,7 @@ fn watchdog_respawns_killed_daemon() {
 
     // 确认是新进程（旧 pid 已死，新 pid 就绪）
     let live = ipc_ping_in_dir(&rt, port, dir.path()).unwrap();
-    assert_ne!(live.pid, orig_pid, "应是被重拉的新进程");
+    assert_ne!(live.instance.pid, orig_pid, "应是被重拉的新进程");
     // 看护者仍在运行（收养新实例继续看护）
     assert!(wd_child.try_wait().unwrap().is_none(), "看护者不应退出");
 
@@ -6353,7 +6346,7 @@ fn watchdog_respawns_on_death_event_and_force_stop_stays_stopped() {
     let _ = daemon_child.kill();
     let _ = daemon_child.wait();
     let respawned = wait_ping(15).expect("看护者应在扫描周期之前（死亡事件到达即）重拉守护");
-    assert_ne!(respawned.pid, orig_pid, "应是被重拉的新进程");
+    assert_ne!(respawned.instance.pid, orig_pid, "应是被重拉的新进程");
 
     // 强停被重拉的实例：看护者即刻收到死亡事件，必须读到「无恢复记录」
     let out = Command::new(exe)
@@ -6520,7 +6513,7 @@ fn ipc_ping_in_dir(
     rt: &tokio::runtime::Runtime,
     port: u16,
     home_dir: &std::path::Path,
-) -> Result<aproxy::daemon::InstanceInfo, String> {
+) -> Result<aproxy::daemon::InstanceStatus, aproxy::daemon::IpcError> {
     rt.block_on(aproxy::daemon::ipc_ping_in(
         &home_dir.join("run"),
         &port.to_string(),
@@ -6649,27 +6642,30 @@ fn ipc_stats_reflect_real_traffic() {
         .block_on(aproxy::daemon::ipc_ping_in(&run_dir, &port_str))
         .expect("实例应可 ping");
     assert_eq!(
-        info.requests_total, 3,
+        info.activity.requests_total, 3,
         "IPC 应报告 3 次请求（回归：曾因统计源不共享而恒为 0）"
     );
     // 鉴别力：3 个请求里第 1 个上游先回 500，必然重试一次后成功。若重试计数
     // 未接线（恒 0）或漏计，这里就是红的——恒 200 的场景抓不到这一点
     assert!(
-        info.retries_total >= 1,
+        info.activity.retries_total >= 1,
         "首个请求上游回 500，必然产生至少一次重试；IPC 报告的重试数为 {}",
-        info.retries_total
+        info.activity.retries_total
     );
     // 重试本身是成功收尾的，但「最近错误」保留覆盖式的最后一次失败记录——
     // 这一半此前完全没断言（接线曾恒为 None）
-    let last_error = info.last_error.clone().unwrap_or_default();
+    let last_error = info
+        .activity
+        .last_error
+        .clone()
+        .expect("重试前的 500 应被记为最近错误（覆盖式保留）");
     assert!(
-        last_error.contains("500"),
+        last_error.message.contains("500"),
         "重试前的 500 应被记为最近错误（覆盖式保留），实际: {last_error:?}"
     );
     assert!(
-        info.last_error_at > 0,
-        "最近错误应带发生时刻，实际: {}",
-        info.last_error_at
+        last_error.at > 0,
+        "最近错误应带发生时刻，实际: {last_error:?}"
     );
 }
 
@@ -6765,7 +6761,7 @@ fn ipc_stats_reflect_forward_only_traffic() {
         .block_on(aproxy::daemon::ipc_ping_in(&run_dir, &port_str))
         .expect("实例应可 ping");
     assert_eq!(
-        info.requests_total, REQUESTS,
+        info.activity.requests_total, REQUESTS,
         "仅转发模式的请求计数必须与常规模式一致（回归：分支点若移到计数之前，这里恒为 0）"
     );
     // 这里刻意**不**断言 retries_total == 0：上游恒 200，连常规模式都不会重试，
@@ -6812,19 +6808,22 @@ fn ipc_stats_reflect_forward_only_traffic() {
         .block_on(aproxy::daemon::ipc_ping_in(&run_dir, &port_str))
         .expect("实例应可 ping");
     assert_eq!(
-        info.requests_total,
+        info.activity.requests_total,
         REQUESTS + 1,
         "失败的请求同样走 forward_only 分支，必须照常计数"
     );
-    let last_error = info.last_error.clone().unwrap_or_default();
+    let last_error = info
+        .activity
+        .last_error
+        .clone()
+        .expect("仅转发模式的上游失败必须经 IPC 可见（status 的「最近错误」）");
     assert!(
-        last_error.contains("上游请求失败"),
+        last_error.message.contains("上游请求失败"),
         "仅转发模式的上游失败必须经 IPC 可见（status 的「最近错误」），实际: {last_error:?}"
     );
     assert!(
-        info.last_error_at > 0,
-        "最近错误应带发生时刻，实际: {}",
-        info.last_error_at
+        last_error.at > 0,
+        "最近错误应带发生时刻，实际: {last_error:?}"
     );
 }
 
@@ -6909,12 +6908,12 @@ fn credentials_masked_in_start_output_registry_and_daemon_log() {
         .block_on(aproxy::daemon::ipc_ping_in(&run_dir, &port_str))
         .expect("实例应可 ping");
     assert!(
-        !info.base_url.contains("BASEPASS123"),
+        !info.instance.base_url.contains("BASEPASS123"),
         "IPC 下发的 base_url 未脱敏"
     );
     let mut log = String::new();
     for _ in 0..50 {
-        log = std::fs::read_to_string(&info.log_path).unwrap_or_default();
+        log = std::fs::read_to_string(&info.instance.log_path).unwrap_or_default();
         if log.contains("/v1/masked") {
             break;
         }

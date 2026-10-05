@@ -27,6 +27,13 @@ home 的实例。新实例同时在 0.1.0 的管道名 `\\.\pipe\aproxy-<端口>
 核对应答者自报的 pid 与连接对端进程（`GetNamedPipeServerProcessId` / `SO_PEERCRED`）：
 端点名可预测，抢先占住它的进程只能报出自己的 pid，普查再拿这个 pid 与注册记录比对。
 
+线上格式（v1，一连接一来回，各一行 JSON）：请求 `{"v":1,"op":"ping|shutdown|prepare_swap"}`
+（可带 `args` 对象）；成功应答 `{"v":1,"ok":true,"result":InstanceStatus}`，所有 op 都回同一份
+状态快照——`instance`（即 `.pid` 记录）、`run_dir`、`state`（`serving`/`swap_prepared`/
+`stopping`，不认识的值读作 `unknown`）、`activity`、`ops`；失败应答
+`{"v":1,"ok":false,"error":{"code","message"}}`。`v` 只在语义不兼容时递增，加 op、加字段、
+加错误码、加状态值都不递增。没有 `v` 的请求与应答属于 0.1.0，由 `src/compat_0_1_0.rs` 应对。
+
 上图的「重试循环 / spool / 回放」是默认模式的主流程；`forward_only` 模式下这两
 环整体旁路（见「仅转发模式（forward_only）」）。
 
@@ -366,7 +373,7 @@ settings 注入、validate）干跑一遍，换监听地址时再探测新地址
 - **路径解析序列**（`main.rs`/`server.rs`）：宽松 load 配置（解析失败不阻断
   日志初始化）→ resolve（CLI `--log-file` > config.toml `log_file` > 内置
   随机名；`~` 展开，相对路径相对 APROXY_HOME——守护 cwd 不可靠）→ 日志
-  init → 实例经 IPC 上报 log_path（`InstanceInfo.log_path`），注册表与
+  init → 实例经 IPC 上报 log_path（`InstanceRecord.log_path`），注册表与
   `.restore` 记录均携带
 - **地址以 IPC 为准**：`aproxy logs [PORT|别名]`（tail -f 语义：末尾 8KB/
   30 行 + 增量轮询，实例停止自动退出）与 start 成功提示都向实例询问真实
@@ -388,7 +395,7 @@ settings 注入、validate）干跑一遍，换监听地址时再探测新地址
 `aproxy install` 把二进制安全落位到 `~/.aproxy/bin/`，对客户端 ≈ 无感。
 四条铁律：先标记（install.state 先于一切动作，崩溃可识别）、先下载后
 rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC PrepareSwap
-广播，实例置位自己的可观测状态 swap_phase）、逐个重启最后删除（.old 在
+广播，实例把自己的可观测状态置为 `swap_prepared`）、逐个重启最后删除（.old 在
 终验后清理）。模块 `src/install/`：
 
 - **更新通道**（`download::Channel`，`latest` 解析的单一真相源，github/npm 两个

@@ -153,7 +153,7 @@ pub fn process_image_path(pid: u32) -> Option<PathBuf> {
 // 1. spawn 链：看护者亲手 spawn 并等到就绪的 pid 直接可信；
 // 2. IPC 端点归属：应答 `<端口>` 端点 ping、且自报 pid 与记录一致的进程，
 //    就是该端口的实例——但挂死实例不应答，所以它不能作为判据；
-// 3. 进程创建时间戳：守护注册时把自己的创建时间写进注册表（InstanceInfo.
+// 3. 进程创建时间戳：守护注册时把自己的创建时间写进注册表（InstanceRecord.
 //    process_start），看护者 claim 同理（created_at_process）。pid 被复用后
 //    新进程的创建时间必然不同，比对它就能把「同一个进程」钉死，且不需要
 //    对方应答（挂死实例同样可判）。
@@ -221,7 +221,7 @@ pub fn terminate_verified_process(pid: u32, expected_start: u64) -> Result<(), S
 /// 时间戳比对即身份证明，**不要求实例应答**——挂死实例恰恰最需要被收养
 /// （随后由健康扫描判挂死处决重拉）。通过返回核验时的实测创建时间（作为
 /// Watched.start_time，后续处决关卡与句柄补挂的比对基准），不通过返回 None。
-fn confirm_registered_instance(info: &crate::daemon::InstanceInfo) -> Option<u64> {
+fn confirm_registered_instance(info: &crate::daemon::InstanceRecord) -> Option<u64> {
     match record_identity(info.pid, info.process_start) {
         RecordIdentity::Alive(start) => Some(start),
         RecordIdentity::Reused | RecordIdentity::Gone => None,
@@ -263,8 +263,8 @@ pub fn this_process_may_spawn_watchdog_in(run_dir: &Path) -> bool {
 /// claim 原子接管兜住。
 fn may_spawn_watchdog(
     my_pid: u32,
-    records: &[crate::daemon::InstanceInfo],
-    identity: impl Fn(&crate::daemon::InstanceInfo) -> RecordIdentity,
+    records: &[crate::daemon::InstanceRecord],
+    identity: impl Fn(&crate::daemon::InstanceRecord) -> RecordIdentity,
 ) -> bool {
     let alive: Vec<u32> = records
         .iter()
@@ -859,7 +859,7 @@ pub fn backoff_delay_secs(consecutive_failures: u32) -> u64 {
 }
 
 /// 读注册表文件获取实例信息（收养时的身份基线）
-fn read_registry_info(run_dir: &Path, port: &str) -> Option<crate::daemon::InstanceInfo> {
+fn read_registry_info(run_dir: &Path, port: &str) -> Option<crate::daemon::InstanceRecord> {
     crate::daemon::read_instance_file_in(run_dir, port)
 }
 
@@ -1739,26 +1739,19 @@ mod tests {
     /// 选举纯判定核：用 pid → 身份状态的映射注入，覆盖全部进程状态组合
     #[test]
     fn election_counts_only_verified_live_records() {
-        let rec = |pid: u32| crate::daemon::InstanceInfo {
+        let rec = |pid: u32| crate::daemon::InstanceRecord {
             pid,
             version: "t".into(),
             listen_addr: format!("127.0.0.1:{}", 50000 + pid),
             config_path: String::new(),
             base_url: String::new(),
             started_at: 0,
-            last_activity_secs: 0,
-            proto_version: 2,
-            requests_total: 0,
-            retries_total: 0,
-            last_error: None,
-            last_error_at: 0,
-            swap_phase: false,
             log_path: String::new(),
             process_start: pid as u64,
         };
         let records = vec![rec(10), rec(20), rec(30)];
         let with = |map: Vec<(u32, RecordIdentity)>| {
-            move |info: &crate::daemon::InstanceInfo| {
+            move |info: &crate::daemon::InstanceRecord| {
                 map.iter()
                     .find(|(p, _)| *p == info.pid)
                     .map(|(_, s)| *s)
@@ -1821,20 +1814,13 @@ mod tests {
         let pid = child.id();
         let start = process_start_time(pid).expect("子进程创建时间可查");
         let write = |port: &str, process_start: u64| {
-            let info = crate::daemon::InstanceInfo {
+            let info = crate::daemon::InstanceRecord {
                 pid,
                 version: "t".into(),
                 listen_addr: format!("127.0.0.1:{port}"),
                 config_path: "C:/tmp/no-such-config.toml".into(),
                 base_url: "https://x".into(),
                 started_at: now_secs(),
-                last_activity_secs: 0,
-                proto_version: 2,
-                requests_total: 0,
-                retries_total: 0,
-                last_error: None,
-                last_error_at: 0,
-                swap_phase: false,
                 log_path: String::new(),
                 process_start,
             };
@@ -1929,20 +1915,13 @@ mod tests {
     /// 构造一个伪实例环境：注册表 + 恢复记录齐全（进程身份不真存在——
     /// adopt_scan 的身份核验会判 Gone 拒绝它，测试直接操纵 watched）
     fn write_crashed_instance(dir: &Path, port: &str) {
-        let info = crate::daemon::InstanceInfo {
+        let info = crate::daemon::InstanceRecord {
             pid: u32::MAX - 777, // 不会存活也不易复用的 PID
             version: "0.0.0-test".into(),
             listen_addr: format!("127.0.0.1:{port}"),
             config_path: "C:/tmp/no-such-config.toml".into(),
             base_url: "https://x".into(),
             started_at: now_secs(),
-            last_activity_secs: 0,
-            proto_version: 2,
-            requests_total: 0,
-            retries_total: 0,
-            last_error: None,
-            last_error_at: 0,
-            swap_phase: false,
             log_path: String::new(),
             process_start: 0,
         };
@@ -1974,20 +1953,13 @@ mod tests {
             start_time: 0,
         });
         // 有注册表无 .restore → 优雅退出语义
-        let info = crate::daemon::InstanceInfo {
+        let info = crate::daemon::InstanceRecord {
             pid: u32::MAX - 777,
             version: "t".into(),
             listen_addr: "127.0.0.1:59901".into(),
             config_path: "C:/tmp/c.toml".into(),
             base_url: "https://x".into(),
             started_at: now_secs(),
-            last_activity_secs: 0,
-            proto_version: 2,
-            requests_total: 0,
-            retries_total: 0,
-            last_error: None,
-            last_error_at: 0,
-            swap_phase: false,
             log_path: String::new(),
             process_start: 0,
         };

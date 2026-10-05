@@ -31,7 +31,7 @@ pub(crate) async fn resolve_stop_targets(
     target: Option<String>,
     threshold: Option<u64>,
     force: bool,
-) -> Vec<daemon::InstanceInfo> {
+) -> Vec<daemon::InstanceRecord> {
     // idle 保留字：停止全部空闲超阈值的实例（阈值可临时覆盖 settings 配置）
     if target
         .as_deref()
@@ -42,7 +42,8 @@ pub(crate) async fn resolve_stop_targets(
         let now = now_unix();
         let idle_targets: Vec<_> = instances
             .into_iter()
-            .filter(|i| now.saturating_sub(i.last_activity_secs) >= idle_secs)
+            .filter(|s| now.saturating_sub(s.activity.last_request_at) >= idle_secs)
+            .map(|s| s.instance)
             .collect();
         if idle_targets.is_empty() {
             println!("没有闲置超过 {idle_secs} 秒的实例。");
@@ -60,8 +61,9 @@ pub(crate) async fn resolve_stop_targets(
             Some(cfg_path) => {
                 let key = config_path_key(&cfg_path.display().to_string());
                 let survey = daemon::survey_instances().await;
-                let matches = |i: &&daemon::InstanceInfo| config_path_key(&i.config_path) == key;
-                if let Some(info) = survey.responsive.iter().find(matches) {
+                let matches = |i: &&daemon::InstanceRecord| config_path_key(&i.config_path) == key;
+                let responsive = survey.responsive.iter().map(|s| &s.instance);
+                if let Some(info) = responsive.clone().find(matches) {
                     return vec![info.clone()];
                 }
                 match survey.unresponsive.iter().find(matches) {
@@ -95,7 +97,7 @@ pub(crate) async fn resolve_stop_targets(
     {
         let port = daemon::port_of(target).to_string();
         return match daemon::ipc_ping(&port).await {
-            Ok(info) => vec![info],
+            Ok(status) => vec![status.instance],
             Err(_) => match unresponsive_record(&port) {
                 Some(info) if force => vec![info],
                 Some(info) => {
@@ -115,7 +117,8 @@ pub(crate) async fn resolve_stop_targets(
     }
 
     let survey = daemon::survey_instances().await;
-    let mut instances = survey.responsive;
+    let mut instances: Vec<daemon::InstanceRecord> =
+        survey.responsive.into_iter().map(|s| s.instance).collect();
     if force {
         instances.extend(survey.unresponsive);
     } else if !survey.unresponsive.is_empty() {
@@ -169,7 +172,7 @@ pub(crate) async fn handle_stop_cmd(target: Option<String>, threshold: Option<u6
 
 /// 按端口读注册表记录，且记录的进程经「pid + 创建时间」核验仍在——不应答
 /// 控制通道的实例（多半挂死）只能这样定位。
-fn unresponsive_record(port: &str) -> Option<daemon::InstanceInfo> {
+fn unresponsive_record(port: &str) -> Option<daemon::InstanceRecord> {
     let info = daemon::read_instance_file_in(&daemon::run_dir(), port)?;
     matches!(
         aproxy::watchdog::record_identity(info.pid, info.process_start),
@@ -183,11 +186,10 @@ fn unresponsive_record(port: &str) -> Option<daemon::InstanceInfo> {
 /// Force：立即终止（pid + 创建时间核验后，见 daemon::force_terminate），不等
 /// 任何确认——进程对象的销毁是异步的，但信号已发，调用方（restart）由新实例
 /// 的就绪判定兜底。
-pub(crate) async fn stop_instance(info: &daemon::InstanceInfo, mode: StopMode) -> bool {
+pub(crate) async fn stop_instance(info: &daemon::InstanceRecord, mode: StopMode) -> bool {
     let port = daemon::port_of(&info.listen_addr).to_string();
     match mode {
-        StopMode::Graceful => match daemon::ipc_request(&port, &daemon::IpcRequest::Shutdown).await
-        {
+        StopMode::Graceful => match daemon::ipc_request(&port, daemon::IpcOp::Shutdown).await {
             Ok(_) => {
                 if daemon::wait_until_gone(&port, std::time::Duration::from_secs(12)).await {
                     println!("已停止 pid {}（端口 {}）", info.pid, port);

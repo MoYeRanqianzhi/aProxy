@@ -66,7 +66,7 @@ fn ipc_ping_in_dir(
     rt: &tokio::runtime::Runtime,
     port: u16,
     home_dir: &std::path::Path,
-) -> Result<aproxy::daemon::InstanceInfo, String> {
+) -> Result<aproxy::daemon::InstanceStatus, aproxy::daemon::IpcError> {
     rt.block_on(aproxy::daemon::ipc_ping_in(
         &home_dir.join("run"),
         &port.to_string(),
@@ -190,7 +190,7 @@ fn restart_after_port_change_reports_new_port() {
     // 路径按原样字符串比对：restore 参数里的值就是初始 spawn 传入的原文。
     let live = ipc_ping_in_dir(&rt, port_b, home_dir).expect("端口 B 实例应可 ping");
     assert_eq!(
-        live.config_path,
+        live.instance.config_path,
         cfg_file.display().to_string(),
         "重启后实例应指向同一配置文件"
     );
@@ -427,7 +427,7 @@ fn restart_with_broken_config_keeps_old_instance() {
         home_dir: home.to_path_buf(),
     };
     assert!(wait_daemon_ready(&rt, port, home), "守护未就绪");
-    let orig = ipc_ping_in_dir(&rt, port, home).unwrap().pid;
+    let orig = ipc_ping_in_dir(&rt, port, home).unwrap().instance.pid;
 
     write_broken_cfg(&cfg, port);
     let out = run_cli(&exe, home, &["restart", &port.to_string()]);
@@ -438,7 +438,7 @@ fn restart_with_broken_config_keeps_old_instance() {
         "应报出预检失败与配置错误原因: {stderr}"
     );
     let live = ipc_ping_in_dir(&rt, port, home).expect("旧实例必须仍在运行");
-    assert_eq!(live.pid, orig, "预检失败不得触碰旧实例");
+    assert_eq!(live.instance.pid, orig, "预检失败不得触碰旧实例");
     assert!(
         has_restore(home, port),
         "旧实例的恢复记录必须保留（崩溃自愈依赖它）"
@@ -466,8 +466,8 @@ fn restart_all_skips_failed_instance_and_exits_nonzero() {
         home_dir: home.to_path_buf(),
     });
     assert!(wait_daemon_ready(&rt, port_a, home) && wait_daemon_ready(&rt, port_b, home));
-    let orig_a = ipc_ping_in_dir(&rt, port_a, home).unwrap().pid;
-    let orig_b = ipc_ping_in_dir(&rt, port_b, home).unwrap().pid;
+    let orig_a = ipc_ping_in_dir(&rt, port_a, home).unwrap().instance.pid;
+    let orig_b = ipc_ping_in_dir(&rt, port_b, home).unwrap().instance.pid;
 
     write_broken_cfg(&cfg_b, port_b);
     let out = run_cli(&exe, home, &["restart", "all"]);
@@ -479,11 +479,11 @@ fn restart_all_skips_failed_instance_and_exits_nonzero() {
     );
     let a = ipc_ping_in_dir(&rt, port_a, home).expect("A 应已重启并运行");
     assert_ne!(
-        a.pid, orig_a,
+        a.instance.pid, orig_a,
         "配置正常的 A 应照常重启（不被 B 的失败中止）"
     );
     let b = ipc_ping_in_dir(&rt, port_b, home).expect("B 旧实例必须仍在运行");
-    assert_eq!(b.pid, orig_b, "预检失败的 B 不得被停止");
+    assert_eq!(b.instance.pid, orig_b, "预检失败的 B 不得被停止");
 }
 
 // ---------------------------------------------------------------------------
@@ -507,7 +507,7 @@ fn restart_refuses_port_change_onto_occupied_port() {
         home_dir: home.to_path_buf(),
     };
     assert!(wait_daemon_ready(&rt, port_a, home), "守护未就绪");
-    let orig = ipc_ping_in_dir(&rt, port_a, home).unwrap().pid;
+    let orig = ipc_ping_in_dir(&rt, port_a, home).unwrap().instance.pid;
 
     write_cfg(&cfg, &format!("127.0.0.1:{port_c}"));
     let out = run_cli(&exe, home, &["restart", &port_a.to_string()]);
@@ -522,7 +522,7 @@ fn restart_refuses_port_change_onto_occupied_port() {
         "应报出新端口不可用: {stderr}"
     );
     let live = ipc_ping_in_dir(&rt, port_a, home).expect("旧实例必须仍在运行");
-    assert_eq!(live.pid, orig, "预检失败不得触碰旧实例");
+    assert_eq!(live.instance.pid, orig, "预检失败不得触碰旧实例");
 }
 
 // ---------------------------------------------------------------------------
@@ -629,12 +629,12 @@ fn release_asset_named_instance_is_adopted_respawned_and_force_stoppable() {
     daemon.0.wait().unwrap();
     assert!(
         wait_for(Duration::from_secs(20), || ipc_ping_in_dir(&rt, port, home)
-            .is_ok_and(|i| i.pid != orig_pid)),
+            .is_ok_and(|i| i.instance.pid != orig_pid)),
         "看护者应重拉资产名运行的实例；看护者日志:\n{}",
         read_text(&wd_log)
     );
     let live = ipc_ping_in_dir(&rt, port, home).unwrap();
-    let image = aproxy::watchdog::process_image_path(live.pid).expect("新实例镜像可查");
+    let image = aproxy::watchdog::process_image_path(live.instance.pid).expect("新实例镜像可查");
     assert!(
         image
             .file_name()
@@ -646,7 +646,7 @@ fn release_asset_named_instance_is_adopted_respawned_and_force_stoppable() {
     );
     #[cfg(any(windows, target_os = "linux"))]
     assert_ne!(
-        live.process_start, 0,
+        live.instance.process_start, 0,
         "新实例应登记进程创建时间（身份锚点）"
     );
 
@@ -1000,13 +1000,13 @@ fn concurrent_start_with_release_asset_name_converges_to_one_watchdog() {
     );
 
     // 唯一的看护者收养了资产名运行的实例：杀掉一个，应被重拉
-    let victim = ipc_ping_in_dir(&rt, ports[0], &home).unwrap().pid;
+    let victim = ipc_ping_in_dir(&rt, ports[0], &home).unwrap().instance.pid;
     kill_own_pid(victim, &home);
     assert!(
         wait_for(Duration::from_secs(20), || ipc_ping_in_dir(
             &rt, ports[0], &home
         )
-        .is_ok_and(|i| i.pid != victim)),
+        .is_ok_and(|i| i.instance.pid != victim)),
         "在任看护者应重拉资产名运行的实例"
     );
 }

@@ -13,7 +13,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-/// 单实例 ACK 判定：PrepareSwap 响应 ok 且 swap_phase == true。
+/// 单实例 ACK 判定：prepare_swap 的应答状态为 swap_prepared。
 /// 内部 3 次探测（间隔 500ms）吸收命名管道瞬时 busy 等瞬态失败。
 /// unix 端点按显式 run_dir 派生（与库层其他 IPC 调用同一纪律）。
 pub async fn ack_one(run_dir: &Path, port: &str) -> Result<(), String> {
@@ -22,15 +22,14 @@ pub async fn ack_one(run_dir: &Path, port: &str) -> Result<(), String> {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        match crate::daemon::ipc_request_in(run_dir, port, &crate::daemon::IpcRequest::PrepareSwap)
-            .await
+        match crate::daemon::ipc_request_in(run_dir, port, crate::daemon::IpcOp::PrepareSwap).await
         {
-            // 响应里的 info 是实例置位后组装的——ok 即 ACK 完成
-            Ok(resp) if resp.ok => {
+            // 应答里的状态是实例置位之后组装的：swap_prepared 即 ACK 完成
+            Ok(status) if status.state == crate::daemon::InstanceState::SwapPrepared => {
                 return Ok(());
             }
-            Ok(_) => last = "实例拒绝了 PrepareSwap（回 ok:false）".to_string(),
-            Err(e) => last = e,
+            Ok(status) => last = format!("实例没有进入更换阶段（状态 {:?}）", status.state),
+            Err(e) => last = e.to_string(),
         }
     }
     Err(last)

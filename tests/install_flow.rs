@@ -222,9 +222,13 @@ fn install_from_with_instance_rolling_restart_and_relay() {
             aproxy::daemon::ipc_ping_in(&env.home().join("run"), &env.port.to_string()).await
         });
     let info = live.expect("滚动后实例应可 ping");
-    assert_ne!(info.pid, old_pid, "实例应已滚动到新 pid");
-    assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
-    assert!(!info.swap_phase, "滚动完成后实例应退出更换阶段");
+    assert_ne!(info.instance.pid, old_pid, "实例应已滚动到新 pid");
+    assert_eq!(info.instance.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        info.state,
+        aproxy::daemon::InstanceState::Serving,
+        "滚动完成后实例应退出更换阶段"
+    );
 
     // 清理实例（测试收尾——同 home 找得到注册表）
     let _ = Command::new(env!("CARGO_BIN_EXE_aproxy"))
@@ -365,9 +369,9 @@ fn adopt_migrates_foreign_instance() {
             aproxy::daemon::ipc_ping_in(&env.home().join("run"), &env.port.to_string()).await
         })
         .expect("收编后实例应可 ping");
-    assert_ne!(live.pid, old_pid);
+    assert_ne!(live.instance.pid, old_pid);
     // 新实例的镜像在 bin 下（收编完成的事实）
-    let image = aproxy::watchdog::process_image_path(live.pid).expect("新实例镜像可查");
+    let image = aproxy::watchdog::process_image_path(live.instance.pid).expect("新实例镜像可查");
     assert!(
         image.starts_with(env.home().join("bin")),
         "收编后实例应跑在标准位置: {image:?}"

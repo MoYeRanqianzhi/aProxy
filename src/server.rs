@@ -110,17 +110,16 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
         }
     };
 
-    // 注册实例信息（bind 成功后才写，避免留下死记录）。
-    // last_activity_secs 落盘的是注册时刻快照（注册表仅供枚举展示），
-    // 实时值由 IPC ping 响应携带。log_path 是本实例守护日志的最终路径
-    // （随机命名或用户自定义；前台实例无文件落空串）——客户端（aproxy
-    // logs/start 提示）一律经 IPC/注册表向实例索取，不按端口拼路径。
+    // 注册实例记录（bind 成功后才写，避免留下死记录）。实时观测值不进记录，
+    // 由 IPC ping 应答携带。log_path 是本实例守护日志的最终路径（随机命名或
+    // 用户自定义；前台实例无文件落空串）——客户端（aproxy logs/start 提示）
+    // 一律经 IPC/注册表向实例索取，不按端口拼路径。
     let daemon_log_path = resolved_daemon_log();
     let daemon_log_path_str = daemon_log_path
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    let info = daemon::InstanceInfo {
+    let info = daemon::InstanceRecord {
         pid: std::process::id(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         listen_addr: actual_addr.clone(),
@@ -128,19 +127,10 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
         // 注册表与 IPC ping 都会把它交给 status 展示（只用于展示），脱敏后再登记
         base_url: mask_base_url(&base_url),
         started_at: now_unix(),
-        last_activity_secs: state
-            .last_activity_secs
-            .load(std::sync::atomic::Ordering::Relaxed),
-        proto_version: daemon::IPC_PROTO_VERSION,
-        requests_total: 0,
-        retries_total: 0,
-        last_error: None,
-        last_error_at: 0,
-        swap_phase: false,
         log_path: daemon_log_path_str,
         // 身份锚点：守护自查自写的进程创建时间（看门狗收养/处决/选举与
         // stop --force 按「pid + 本值」防 pid 复用，与二进制名无关）。
-        // 读不到（无 /proc 的平台）落 0，各消费方按「未登记」保守降级
+        // 读不到（无 /proc 的平台）落 0，这样的记录无法核验身份
         process_start: watchdog::process_start_time(std::process::id()).unwrap_or(0),
     };
     if let Err(e) = daemon::write_instance_file(&info) {
@@ -170,10 +160,14 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     // 时间戳，导致「请求 / 重试 / 最近错误」对任何实例都恒为 0（时间戳正常掩盖了它）。
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let ipc_port = port.clone();
-    let ipc_info = info.clone();
-    let ipc_stats = state.stats.clone();
+    let control = std::sync::Arc::new(daemon::ControlState {
+        record: info.clone(),
+        run_dir: daemon::run_dir().display().to_string(),
+        stats: state.stats.clone(),
+        on_shutdown: stop_tx,
+    });
     tokio::spawn(async move {
-        daemon::serve_ipc(ipc_endpoint, &ipc_port, stop_tx, ipc_info, ipc_stats).await;
+        daemon::serve_ipc(ipc_endpoint, &ipc_port, control).await;
     });
 
     // 看门狗心跳（共享内存节）：独立 ticker 每 10s 写一次毫秒时间戳——挂死的

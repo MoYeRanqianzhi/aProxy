@@ -21,12 +21,13 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
         return;
     }
     let now = now_unix();
-    let is_idle =
-        |info: &daemon::InstanceInfo| now.saturating_sub(info.last_activity_secs) >= threshold;
+    let is_idle = |status: &daemon::InstanceStatus| {
+        now.saturating_sub(status.activity.last_request_at) >= threshold
+    };
     let filtered: Vec<_> = instances
         .into_iter()
-        .filter(|info| !idle_only || is_idle(info))
-        .filter(|info| !busy_only || !is_idle(info))
+        .filter(|status| !idle_only || is_idle(status))
+        .filter(|status| !busy_only || !is_idle(status))
         .collect();
     if filtered.is_empty() {
         let which = if idle_only {
@@ -41,8 +42,10 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
     }
     println!("运行中的 aProxy 实例 ({}):", filtered.len());
     let cli_version = env!("CARGO_PKG_VERSION");
-    for info in &filtered {
-        let idle_secs = now.saturating_sub(info.last_activity_secs);
+    for status in &filtered {
+        let info = &status.instance;
+        let activity = &status.activity;
+        let idle_secs = now.saturating_sub(activity.last_request_at);
         println!(
             "  端口 {}  pid {}  v{}  已运行 {}  闲置 {}",
             daemon::port_of(&info.listen_addr),
@@ -57,29 +60,29 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
             mask_base_url(&info.base_url),
             info.config_path
         );
-        // 观测计数（IPC v2 起 ping 携带；v1 实例读出全 0——展示为「—」而非
-        // 误导性的 0）
-        if info.proto_version >= 2 {
-            let err_text = match (&info.last_error, info.last_error_at) {
-                (Some(msg), at) if at > 0 => {
-                    format!(
-                        "\"{}\"（{} 前）",
-                        msg,
-                        humanize_duration(now.saturating_sub(at))
-                    )
-                }
-                (Some(msg), _) => format!("\"{msg}\""),
-                (None, _) => "无".to_string(),
-            };
-            println!(
-                "    请求 {}  重试 {}  最近错误: {}",
-                info.requests_total, info.retries_total, err_text
-            );
-        }
-        // 二进制更换阶段（install 的 PrepareSwap 广播后置位，IPC v3 观测）：
-        // 滚动重启中该实例随时会被 stop+新 exe 重拉——外部不要在此窗口 stop/kill
-        if info.swap_phase {
-            println!("    二进制更换中（install 滚动重启阶段，请勿手动干预此实例）");
+        let err_text = match &activity.last_error {
+            Some(e) => format!(
+                "\"{}\"（{} 前）",
+                e.message,
+                humanize_duration(now.saturating_sub(e.at))
+            ),
+            None => "无".to_string(),
+        };
+        println!(
+            "    请求 {}  重试 {}  最近错误: {}",
+            activity.requests_total, activity.retries_total, err_text
+        );
+        match status.state {
+            daemon::InstanceState::Serving => {}
+            // install 广播 prepare_swap 之后：滚动重启中该实例随时会被停止、
+            // 用新 exe 重拉——外部不要在此窗口 stop/kill
+            daemon::InstanceState::SwapPrepared => {
+                println!("    二进制更换中（install 滚动重启阶段，请勿手动干预此实例）");
+            }
+            daemon::InstanceState::Stopping => println!("    正在退出"),
+            daemon::InstanceState::Unknown => {
+                println!("    状态未知（实例比当前 CLI 新，用同版本的 aproxy 查看）");
+            }
         }
         // 混版本检测：CLI 与实例版本不一致说明该实例还在跑旧二进制（替换 exe
         // 后重启该实例即升级）——滚动升级的事实源。推荐 restart 而非 stop+start：
@@ -98,7 +101,7 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
 /// 列出「进程仍在、却不应答控制通道」的实例：优雅停止走不通，只能 --force
 /// （终止前核验 pid + 创建时间，不会误杀）。开着看门狗时，挂死检测会自行处决
 /// 并重拉它们。
-fn print_unresponsive(unresponsive: &[daemon::InstanceInfo]) {
+fn print_unresponsive(unresponsive: &[daemon::InstanceRecord]) {
     if unresponsive.is_empty() {
         return;
     }

@@ -192,11 +192,15 @@ async fn continue_from_restarting_reclaims_instance() {
         !aproxy::install::state::state_path_in(&run_dir).exists(),
         "done 后状态文件应删除"
     );
-    // 实例已滚动：新 pid + swap_phase 清除（restart 真跑的证据）
+    // 实例已滚动：新 pid + 退出更换阶段（restart 真跑的证据）
     let ping = aproxy::daemon::ipc_ping(&port.to_string()).await;
     let info = ping.expect("滚动后实例应可 ping");
-    assert_ne!(info.pid, old_pid, "实例应已滚动到新 pid");
-    assert!(!info.swap_phase, "滚动后应退出更换阶段");
+    assert_ne!(info.instance.pid, old_pid, "实例应已滚动到新 pid");
+    assert_eq!(
+        info.state,
+        aproxy::daemon::InstanceState::Serving,
+        "滚动后应退出更换阶段"
+    );
     // 收尾：滚动出的新实例是 detached 守护（不是 child），必须经 IPC 优雅
     // 停掉——只 kill 原 child（早已被滚动停止）会把它泄漏在测试机上
     let _ = aproxy::install::restart::stop_and_wait(
@@ -308,8 +312,12 @@ async fn continue_from_swapping_with_live_instance_redoes_swap() {
     let info = aproxy::daemon::ipc_ping_in(&run_dir, &port.to_string())
         .await
         .expect("滚动后实例应可 ping");
-    assert_ne!(info.pid, old_pid, "实例应已滚动到新 pid");
-    assert!(!info.swap_phase, "滚动后应退出更换阶段");
+    assert_ne!(info.instance.pid, old_pid, "实例应已滚动到新 pid");
+    assert_eq!(
+        info.state,
+        aproxy::daemon::InstanceState::Serving,
+        "滚动后应退出更换阶段"
+    );
     // 收尾：滚动出的新实例是 detached 守护（不是 child），必须经 IPC 优雅
     // 停掉——只 kill 原 child（早已被滚动停止）会把它泄漏在测试机上
     let _ = aproxy::install::restart::stop_and_wait(
@@ -671,8 +679,8 @@ async fn rollback_case(kind: BrokenNew) {
     let info = aproxy::daemon::ipc_ping_in(&run_dir, &port.to_string())
         .await
         .expect("回滚后实例应在线");
-    assert_ne!(info.pid, old_pid, "应是重新拉起的进程");
-    let image = aproxy::watchdog::process_image_path(info.pid).expect("镜像路径可查");
+    assert_ne!(info.instance.pid, old_pid, "应是重新拉起的进程");
+    let image = aproxy::watchdog::process_image_path(info.instance.pid).expect("镜像路径可查");
     assert!(same_path(&image, &old), "实例应跑在旧二进制上: {image:?}");
     assert_eq!(
         restore_args_of(&run_dir, port).as_deref(),
@@ -699,7 +707,10 @@ async fn rollback_case(kind: BrokenNew) {
     let again = aproxy::daemon::ipc_ping_in(&run_dir, &port.to_string())
         .await
         .expect("实例应仍在线");
-    assert_eq!(again.pid, info.pid, "halted 续作不得重启实例");
+    assert_eq!(
+        again.instance.pid, info.instance.pid,
+        "halted 续作不得重启实例"
+    );
 
     // 收尾：优雅停止本测试拉起的实例（隔离 home 内，按端口经 IPC）
     let _ = aproxy::install::restart::stop_and_wait(
@@ -841,7 +852,7 @@ async fn continue_restores_instance_stopped_mid_restart() {
     let info = aproxy::daemon::ipc_ping_in(&run_dir, &port.to_string())
         .await
         .expect("在途实例应被续作拉起");
-    assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(info.instance.version, env!("CARGO_PKG_VERSION"));
     assert!(
         restore_args_of(&run_dir, port).is_some(),
         "拉起后 .restore 应在"

@@ -24,7 +24,7 @@ pub(crate) async fn handle_logs_cmd(target: Option<String>) {
                     let instances = daemon::list_instances().await;
                     match instances
                         .iter()
-                        .find(|i| config_path_key(&i.config_path) == key)
+                        .find(|i| config_path_key(&i.instance.config_path) == key)
                     {
                         Some(info) => info.clone(),
                         None => {
@@ -62,22 +62,28 @@ pub(crate) async fn handle_logs_cmd(target: Option<String>) {
             n => {
                 eprintln!("有 {n} 个实例在运行，必须指定端口号或配置别名（一次只能连接一个）：");
                 for info in &instances {
-                    eprintln!("  aproxy logs {}", daemon::port_of(&info.listen_addr));
+                    eprintln!(
+                        "  aproxy logs {}",
+                        daemon::port_of(&info.instance.listen_addr)
+                    );
                 }
                 std::process::exit(1);
             }
         }
     };
 
-    let port = daemon::port_of(&info.listen_addr).to_string();
-    if info.log_path.is_empty() {
+    let port = daemon::port_of(&info.instance.listen_addr).to_string();
+    if info.instance.log_path.is_empty() {
         // 前台实例经 IPC 上报空串 log_path——显式信号，立即报出（原先的
         // 5 秒文件等待是为前台实例设计的间接探测，现在有权威来源不再需要）
         println!("该实例以前台模式运行（--foreground），日志输出在它的控制台，无日志文件可跟随。");
         std::process::exit(1);
     }
-    let path = std::path::PathBuf::from(&info.log_path);
-    println!("正在连接 pid {}（端口 {}）——Ctrl+C 退出。", info.pid, port);
+    let path = std::path::PathBuf::from(&info.instance.log_path);
+    println!(
+        "正在连接 pid {}（端口 {}）——Ctrl+C 退出。",
+        info.instance.pid, port
+    );
     println!("  日志文件: {}", path.display());
     println!("────────── 最近日志 ──────────");
 

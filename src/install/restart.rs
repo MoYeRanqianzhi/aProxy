@@ -126,12 +126,17 @@ pub async fn stop_and_wait(run_dir: &Path, port: &str, timeout: Duration) -> Res
     let pid = crate::daemon::list_instances_in(run_dir)
         .await
         .iter()
-        .find(|i| crate::daemon::port_of(&i.listen_addr) == port)
-        .map(|i| i.pid);
-    crate::daemon::ipc_request_in(run_dir, port, &crate::daemon::IpcRequest::Shutdown).await?;
+        .find(|i| crate::daemon::port_of(&i.instance.listen_addr) == port)
+        .map(|i| i.instance.pid);
+    crate::daemon::ipc_request_in(run_dir, port, crate::daemon::IpcOp::Shutdown)
+        .await
+        .map_err(|e| e.to_string())?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if crate::daemon::ipc_ping_in(run_dir, port).await.is_err() {
+        // 只有端点消失才算退出：挂死的实例端点还在、只是不应答
+        if let Err(crate::daemon::IpcError::Unreachable(_)) =
+            crate::daemon::ipc_ping_in(run_dir, port).await
+        {
             break;
         }
         if std::time::Instant::now() >= deadline {
@@ -280,7 +285,7 @@ pub async fn restart_instance(
     let live = crate::daemon::ipc_ping_in(run_dir, port).await.ok();
     let image = live
         .as_ref()
-        .and_then(|i| crate::watchdog::process_image_path(i.pid));
+        .and_then(|i| crate::watchdog::process_image_path(i.instance.pid));
 
     // 在途记录先于停止落盘（窗口内崩溃的唯一留存，见模块文档）
     state.pending_restores.retain(|p| p.port != port);
@@ -327,7 +332,7 @@ pub async fn restart_instance(
     if let Ok(info) = crate::daemon::ipc_ping_in(run_dir, port).await {
         state.pending_restores.retain(|p| p.port != port);
         let _ = super::state::write_in(run_dir, state);
-        return Ok(info.pid);
+        return Ok(info.instance.pid);
     }
 
     // 从这里起是实例级失败：无论回退成败，滚动都必须中止（见 halted 字段）

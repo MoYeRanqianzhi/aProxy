@@ -5,6 +5,10 @@
 /target*/
 /Cargo.lock.bak
 
+# Python bytecode, e.g. from running a skill's helper scripts locally
+__pycache__/
+*.pyc
+
 # IDE
 .idea/
 .vscode/

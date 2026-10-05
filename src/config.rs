@@ -153,8 +153,7 @@ impl TransformConfig {
 pub struct Config {
     /// 上游 API 的 base URL，例如 `https://api.anthropic.com`
     /// 末尾斜杠会被自动去除以避免拼接时产生 `//`。
-    /// 旧版字段名 `upstream_url` 仍可读取（alias），保存时写为新名 `base_url`。
-    #[serde(default, alias = "upstream_url")]
+    #[serde(default)]
     pub base_url: String,
     /// 本地代理监听地址，默认 `127.0.0.1:12345`（仅本地可访问，避免局域网暴露）。
     #[serde(default = "default_listen_addr")]
@@ -1708,26 +1707,6 @@ mod tests {
             cfg.override_headers.get("x-b").map(String::as_str),
             Some("")
         );
-    }
-
-    #[test]
-    fn legacy_upstream_url_field_still_loads() {
-        // 旧版配置文件字段名 upstream_url 应经 alias 正常读取，保存时写为新名 base_url
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "upstream_url = \"https://legacy.example.com\"\nlisten_addr = \"127.0.0.1:12345\"\n",
-        )
-        .unwrap();
-        let loaded = load_from(&path);
-        assert_eq!(loaded.base_url, "https://legacy.example.com");
-
-        // roundtrip 后应写为新字段名
-        save_to(&path, &loaded).unwrap();
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("base_url"), "保存后应写新字段名 base_url");
-        assert!(!content.contains("upstream_url"), "保存后不应再写旧字段名");
     }
 
     #[test]

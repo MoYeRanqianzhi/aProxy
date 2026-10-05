@@ -890,14 +890,11 @@ pub struct RestoreEntry {
     pub log_path: String,
 }
 
-/// .restore 文件的落盘格式（结构体 JSON）。旧格式是纯 `Vec<String>`
-///（仅 args）——读侧兼容旧格式（log_path 落空串），**避免升级后首次运行
-/// 把用户有效的恢复记录当损坏删掉**；写侧一律写新格式。
+/// .restore 文件的落盘格式（结构体 JSON）。两个字段都必填：缺字段的记录
+/// 无法忠实恢复实例，按损坏处理（列举时清理）。
 #[derive(Serialize, Deserialize)]
 struct RestoreRecord {
-    #[serde(default)]
     args: Vec<String>,
-    #[serde(default)]
     log_path: String,
 }
 
@@ -921,21 +918,12 @@ pub fn list_restore_entries_in(dir: &std::path::Path) -> Vec<RestoreEntry> {
         let Some(port) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
             continue;
         };
-        // 新格式（RestoreRecord）优先；旧格式（纯 args 数组）宽容读出，
-        // log_path 落空串——升级混版本窗口内旧守护写的记录不能被当损坏删掉
         let parsed = std::fs::read_to_string(&path).ok().and_then(|c| {
             serde_json::from_str::<RestoreRecord>(&c)
                 .map(|r| RestoreEntry {
-                    port: port.clone(),
+                    port,
                     args: r.args,
                     log_path: r.log_path,
-                })
-                .or_else(|_| {
-                    serde_json::from_str::<Vec<String>>(&c).map(|args| RestoreEntry {
-                        port,
-                        args,
-                        log_path: String::new(),
-                    })
                 })
                 .ok()
         });
@@ -1652,17 +1640,6 @@ mod tests {
         assert_eq!(entries[0].args, args2);
         assert_eq!(entries[0].log_path, "C:/tmp/new.log");
 
-        // 旧格式（纯 args 数组，混版本窗口内旧守护写的）宽容读出，log_path 空串
-        std::fs::write(
-            &path,
-            serde_json::to_string(&args2).expect("序列化旧格式失败"),
-        )
-        .unwrap();
-        let legacy = list_restore_entries_in(dir.path());
-        assert_eq!(legacy.len(), 1, "旧格式记录不能被当损坏清理");
-        assert_eq!(legacy[0].args, args2);
-        assert_eq!(legacy[0].log_path, "");
-
         remove_restore_file_in(dir.path(), "127.0.0.1:59805");
         assert!(!path.exists());
         assert!(list_restore_entries_in(dir.path()).is_empty());
@@ -1675,6 +1652,10 @@ mod tests {
         std::fs::write(&path, "{not-json").unwrap();
         assert!(list_restore_entries_in(dir.path()).is_empty());
         assert!(!path.exists(), "损坏的恢复记录应被清理");
+        // 缺字段同样无法忠实恢复：只有 args 的数组形态不是有效记录
+        std::fs::write(&path, r#"["--config","C:/tmp/c.toml"]"#).unwrap();
+        assert!(list_restore_entries_in(dir.path()).is_empty());
+        assert!(!path.exists(), "缺字段的恢复记录应被清理");
     }
 
     #[test]

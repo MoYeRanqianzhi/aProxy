@@ -136,7 +136,6 @@ URL is `http://127.0.0.1:12345/v1` and it calls `/v1/chat/completions`, set
 - Must start with `http://` or `https://` (any case) and must not contain `?` or `#`, which would
   turn the appended path into part of the query.
 - A trailing `/` is removed.
-- `upstream_url` is accepted as another name for this key; `aproxy config` saves it as `base_url`.
 
 ### listen_addr
 

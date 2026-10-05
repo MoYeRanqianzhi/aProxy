@@ -10,6 +10,10 @@
 - **skill 文档改为英文并重写**：aproxy-cli 与 aproxy-format 两个 skill 按 skill-creator 标准重写，面向操作 aProxy 的 agent。每条事实都对照源码核实；程序输出的中文原文照录，并附英文释义。aproxy-cli 新增 `clients.md`（接入各 agent 客户端）与 `troubleshooting.md`（症状 → 原因 → 处理），`compatibility.md` 只讲版本判定以及 0.1.0 与开发线的差异。
 - **断开提示覆盖所有客户端**：客户端在「只收到心跳」的等待中（响应已提交、尚未收到任何上游真实字节）等了至少 60 秒才断开时，日志提示检查客户端的流空闲超时，并带上已等秒数。原来只在等满 590 秒后提示 Claude Code 的 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`，Codex（默认 300 秒）、Qwen Code（240 秒）到点断开时没有任何提示。
 
+### 移除
+
+- 去掉只为 0.1.0 之前的预发布版本保留的兼容：config.toml 不再把 `upstream_url` 当作 `base_url` 读取（仍在用旧名的配置请改名，否则启动报 `base_url` 为空）；不再读取预发布版本写下的纯数组格式恢复记录（`run/<端口>.restore`）。
+
 ### 修复
 
 - 相对路径的 `--config` 在命令行入口展开 `~` 并转成绝对路径后再转发给守护进程、写入恢复记录；此前原样保存，`aproxy restore` 若在别的目录运行会把该实例的恢复记录当失效清掉。

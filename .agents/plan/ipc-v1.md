@@ -22,8 +22,8 @@ IPC 重新整理格式后协议版本从 1 重新计数。随后：「发现的�
   若干「旧版本」注释与对应测试。InstanceInfo 的 serde default、`IPC_PROTO_V1`、`Stats` op、status 的
   `proto_version >= 2` 留给第 3/4 步（拆 InstanceRecord 时一起改）。install.state 的 serde default 不删：
   它同时是「新字段加入」的前向兼容规则，删掉收益小。
-- 本机可用 WSL（Debian）跑 Linux 编译与测试：`wsl -e bash -lc 'cd /mnt/g/ClaudeProjects/aProxy && CARGO_TARGET_DIR=$HOME/aproxy-target cargo clippy --all-targets --locked'`
-  （2026-10-06 WSL 工具链清单损坏，已重装 stable）。
+- Linux 编译只能靠 CI 的 ubuntu 门禁：本机 WSL（Debian）的 rustup 工具链清单损坏，且 2026-10-06 WSL 内无外网
+  （官方源与 rsproxy 均连接超时），修不了；本机也没有 Linux C 交叉编译器（ring 需要）。
 
 ---
 

@@ -152,8 +152,7 @@ pub fn process_image_path(pid: u32) -> Option<PathBuf> {
 // 名称比对，它对安全零贡献）。项目里可用的锚点有三个：
 // 1. spawn 链：看护者亲手 spawn 并等到就绪的 pid 直接可信；
 // 2. IPC 端点归属：应答 `<端口>` 端点 ping、且自报 pid 与记录一致的进程，
-//    就是该端口的实例——协议应答是最强的归属证明，但挂死实例不应答，
-//    所以它只能作为「旧记录无时间戳」时的补充，不能作为唯一判据；
+//    就是该端口的实例——但挂死实例不应答，所以它不能作为判据；
 // 3. 进程创建时间戳：守护注册时把自己的创建时间写进注册表（InstanceInfo.
 //    process_start），看护者 claim 同理（created_at_process）。pid 被复用后
 //    新进程的创建时间必然不同，比对它就能把「同一个进程」钉死，且不需要
@@ -164,9 +163,6 @@ pub fn process_image_path(pid: u32) -> Option<PathBuf> {
 pub enum RecordIdentity {
     /// 记录的进程仍在运行：实测创建时间与登记值一致（携带实测值）
     Alive(u64),
-    /// 记录没有登记创建时间（0：旧版本守护的注册表、或平台读不到），而该
-    /// pid 当前有一个在运行的进程——是不是记录里那个，无从核验（携带实测值）
-    Unverifiable(u64),
     /// 该 pid 当前有在运行的进程，但创建时间与登记值不符：pid 已被系统
     /// 回收后复用，记录的进程早已死亡
     Reused,
@@ -175,20 +171,24 @@ pub enum RecordIdentity {
     Gone,
 }
 
-/// 核验记录身份：`recorded_start` 为记录登记的进程创建时间（0 = 未登记）。
+/// 核验记录身份：`recorded_start` 为记录登记的进程创建时间。
 /// 「已退出但进程对象仍在」（unix zombie、Windows 被句柄维持的已退出对象）
 /// 一律算 Gone——它们的创建时间仍查得到且与登记一致，但进程已死，不能计入
 /// 选举的存活集合，也不该被收养或处决。
+///
+/// 登记值 0 不是可比对的锚点（平台读不到创建时间时守护登记的就是 0）：这样的
+/// 记录证明不了任何进程是它，同样算 Gone——不计入选举、不收养、不处决。
 pub fn record_identity(pid: u32, recorded_start: u64) -> RecordIdentity {
+    if recorded_start == 0 {
+        return RecordIdentity::Gone;
+    }
     let Some(actual) = process_start_time(pid) else {
         return RecordIdentity::Gone;
     };
     if process_exited(pid) == Some(true) {
         return RecordIdentity::Gone;
     }
-    if recorded_start == 0 {
-        RecordIdentity::Unverifiable(actual)
-    } else if actual == recorded_start {
+    if actual == recorded_start {
         RecordIdentity::Alive(actual)
     } else {
         RecordIdentity::Reused
@@ -218,26 +218,12 @@ pub fn terminate_verified_process(pid: u32, expected_start: u64) -> Result<(), S
 }
 
 /// 收养/回归时的注册表记录核验：「该 pid 当前就是写下这条记录的守护」。
-/// 通过返回核验时的实测创建时间（作为 Watched.start_time，后续处决关卡与
-/// 句柄补挂的比对基准），不通过返回 None。
-///
-/// - 登记了创建时间（当前版本守护）：时间戳比对即身份证明，**不要求实例
-///   应答**——挂死实例恰恰最需要被收养（随后由健康扫描判挂死处决重拉）。
-/// - 未登记（旧版本守护）：退回 IPC 端点归属证明——ping 该端口，应答者自报
-///   pid 与记录一致才收养。旧记录挂死时不会被收养，这是升级窗口内的保守
-///   降级（宁可暂不看护，不收编身份不明的 pid）；install/restart 换上新版本
-///   守护后记录自然带上时间戳。
-async fn confirm_registered_instance(
-    run_dir: &Path,
-    port: &str,
-    info: &crate::daemon::InstanceInfo,
-) -> Option<u64> {
+/// 时间戳比对即身份证明，**不要求实例应答**——挂死实例恰恰最需要被收养
+/// （随后由健康扫描判挂死处决重拉）。通过返回核验时的实测创建时间（作为
+/// Watched.start_time，后续处决关卡与句柄补挂的比对基准），不通过返回 None。
+fn confirm_registered_instance(info: &crate::daemon::InstanceInfo) -> Option<u64> {
     match record_identity(info.pid, info.process_start) {
         RecordIdentity::Alive(start) => Some(start),
-        RecordIdentity::Unverifiable(start) => {
-            let live = crate::daemon::ipc_ping_in(run_dir, port).await.ok()?;
-            (live.pid == info.pid).then_some(start)
-        }
         RecordIdentity::Reused | RecordIdentity::Gone => None,
     }
 }
@@ -268,8 +254,7 @@ pub fn this_process_may_spawn_watchdog_in(run_dir: &Path) -> bool {
 /// - 把活实例漏算：可能多个守护同时自认最小而并发 spawn，claim 原子接管
 ///   保证最终只有一个在任，代价只是几个短命进程。
 ///
-/// 所以无从核验的旧版本记录（Unverifiable）与 Reused/Gone 一律不计入，
-/// 宁可多发起、不可无人发起。
+/// 所以 Reused/Gone 一律不计入，宁可多发起、不可无人发起。
 ///
 /// 本进程不在在世集合里（`aproxy start` 的 CLI 父进程；注册表丢失的孤守护）
 /// 视为有权：排序只用来收敛「多个在册守护的周期自检同时发现缺席」，CLI 的
@@ -448,17 +433,14 @@ impl WatchdogState {
                 }
                 continue;
             }
-            // 实例身份建立（与二进制名称无关）：注册表记录核验为「仍是写下
-            // 它的那个守护」才收养——登记了创建时间的比对时间戳，旧版本记录
-            // 退回 IPC 端点归属证明（见 confirm_registered_instance）。不通过
-            // （刚死/pid 被复用/旧记录不应答）→ 跳过，下轮再看（.restore 仍在，
-            // 等 respawn 路径或真实实例出现）
+            // 实例身份建立（与二进制名称无关）：注册表记录按「pid + 登记创建
+            // 时间」核验为「仍是写下它的那个守护」才收养（见
+            // confirm_registered_instance）。不通过（刚死/pid 被复用）→ 跳过，
+            // 下轮再看（.restore 仍在，等 respawn 路径或真实实例出现）
             let Some(info) = read_registry_info(&self.cfg.run_dir, &entry.port) else {
                 continue;
             };
-            let Some(start) =
-                confirm_registered_instance(&self.cfg.run_dir, &entry.port, &info).await
-            else {
+            let Some(start) = confirm_registered_instance(&info) else {
                 continue;
             };
             let Some(handle) = imp::open_sync_handle(info.pid) else {
@@ -506,7 +488,7 @@ impl WatchdogState {
         let mut hung = Vec::new();
         for w in &self.watched {
             match read_heartbeat(&w.port) {
-                // 无心跳数据（旧版本守护/创建失败）：退化为纯死亡检测
+                // 无心跳数据（心跳节创建失败）：退化为纯死亡检测
                 None => continue,
                 Some(ts) if now_ms.saturating_sub(ts) <= stale_ms => continue,
                 Some(_) => {}
@@ -797,17 +779,15 @@ impl WatchdogState {
 
     /// 安装态死亡复查：等 install 以新 exe 重新拉起实例（注册表记录重新
     /// 出现——优雅退出会删文件，回归 = 记录带着新 pid 重现）且新记录通过
-    /// 身份核验（与 adopt 同关：pid + 登记创建时间，旧版本记录退回 IPC 归属
-    /// 证明；与新旧二进制叫什么、是否刚被换掉无关）。5×3s 覆盖
+    /// 身份核验（与 adopt 同关：pid + 登记创建时间；与新旧二进制叫什么、是否
+    /// 刚被换掉无关）。5×3s 覆盖
     /// stop+spawn+ready 通常 2-3s、上限 10s 的窗口。
     async fn wait_for_install_restart(&self, port: &str, old_pid: u32) -> Option<u32> {
         for _ in 0..5 {
             tokio::time::sleep(Duration::from_secs(3)).await;
             if let Some(info) = read_registry_info(&self.cfg.run_dir, port)
                 && info.pid != old_pid
-                && confirm_registered_instance(&self.cfg.run_dir, port, &info)
-                    .await
-                    .is_some()
+                && confirm_registered_instance(&info).is_some()
             {
                 tracing::info!(port = %port, new_pid = info.pid, "安装态复查：实例已以新 pid 回归，重新收养");
                 return Some(info.pid);
@@ -1098,7 +1078,7 @@ impl Drop for HeartbeatWriter {
 }
 
 /// 看护侧读取：实例最近一次心跳的毫秒时间戳；节不存在 = 实例无心跳
-/// （旧版本守护或创建失败）→ None，看护者按「无心跳数据」处理（只做
+/// （心跳节创建失败）→ None，看护者按「无心跳数据」处理（只做
 /// 进程死亡检测，不做挂死判定）。
 pub fn read_heartbeat(port: &str) -> Option<u64> {
     imp_heart::heartbeat_load(port)
@@ -1711,7 +1691,8 @@ mod tests {
             RecordIdentity::Reused
         );
         // 旧版本记录（未登记创建时间）：在世但无从核验
-        assert_eq!(record_identity(pid, 0), RecordIdentity::Unverifiable(start));
+        // 登记值 0 证明不了身份：即便 pid 在世也不算 Alive
+        assert_eq!(record_identity(pid, 0), RecordIdentity::Gone);
         // 已退出但未回收（unix zombie / Windows 被 Child 句柄维持的对象）：
         // 创建时间仍查得到且一致，但必须判 Gone——死进程不得计入存活集合
         child.kill().unwrap();
@@ -1785,11 +1766,7 @@ mod tests {
         ));
         // 更小 pid 的记录是死记录/复用 pid/旧版本无从核验 → 一律不计入，
         // 不能让位给不存在（或无法证明存在）的发起者
-        for stale in [
-            RecordIdentity::Gone,
-            RecordIdentity::Reused,
-            RecordIdentity::Unverifiable(10),
-        ] {
+        for stale in [RecordIdentity::Gone, RecordIdentity::Reused] {
             assert!(
                 may_spawn_watchdog(
                     20,
@@ -1825,7 +1802,7 @@ mod tests {
 
     /// 收养按「pid + 登记创建时间」核验：名字与 aProxy 无关的进程只要记录
     /// 时间一致即被收养（改名二进制的单元级等价物）；时间不符（pid 复用）
-    /// 与旧记录且端点不应答的一律不收养；收养后死亡 watcher 挂在正确的进程上
+    /// 与未登记创建时间的一律不收养；收养后死亡 watcher 挂在正确的进程上
     #[cfg(any(windows, target_os = "linux"))]
     #[tokio::test]
     async fn adopt_scan_uses_start_time_identity_not_name() {
@@ -1856,7 +1833,7 @@ mod tests {
         };
         write("59911", start); // 身份一致
         write("59912", start.wrapping_add(1)); // pid 复用模拟
-        write("59913", 0); // 旧版本记录，端点无人应答
+        write("59913", 0); // 未登记创建时间：证明不了身份
         let mut st = WatchdogState::new(test_cfg(dir.path()));
         let adopted = st.adopt_scan().await;
         assert_eq!(

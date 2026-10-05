@@ -42,10 +42,7 @@ pub(crate) async fn resolve_stop_targets(
         let now = now_unix();
         let idle_targets: Vec<_> = instances
             .into_iter()
-            // last_activity_secs 为 0 = 未上报（旧版本守护），不纳入 idle 停止
-            .filter(|i| {
-                i.last_activity_secs > 0 && now.saturating_sub(i.last_activity_secs) >= idle_secs
-            })
+            .filter(|i| now.saturating_sub(i.last_activity_secs) >= idle_secs)
             .collect();
         if idle_targets.is_empty() {
             println!("没有闲置超过 {idle_secs} 秒的实例。");
@@ -235,7 +232,7 @@ pub(crate) async fn stop_instance(info: &daemon::InstanceInfo, mode: StopMode) -
                 .into_iter()
                 .find(|e| e.port == port);
             daemon::remove_restore_file(&info.listen_addr);
-            match daemon::force_terminate(info).await {
+            match daemon::force_terminate(info) {
                 Ok(()) => {
                     // 其余残留按守护自清的顺序收掉（.pid、socket、心跳）
                     crate::server::remove_registry_files(&info.listen_addr);

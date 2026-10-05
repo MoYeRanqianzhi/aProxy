@@ -353,32 +353,13 @@ pub fn read_instance_file_in(run_dir: &std::path::Path, port: &str) -> Option<In
 /// 应答者自报的 pid 即端点归属证明）。
 ///
 /// 身份判定与二进制名称无关（改名运行的官方资产 `aproxy-<target>` 同样可
-/// 强杀），按记录的创建时间戳分两档：
-/// - `process_start != 0`：「pid + 创建时间」核验后才终止（Windows 在同一
-///   进程句柄上先核验后终止，中间不存在 pid 复用窗口）。不符 = pid 已被
-///   复用给别的进程，拒绝——杀错进程不可逆，宁可拒绝执行。
-/// - `process_start == 0`（旧版本守护不登记该字段，或平台读不到创建时间）：
-///   无时间锚点可比，退回端点归属证明——终止前对该端口**再 ping 一次**，
-///   应答者自报 pid 与待杀 pid 一致才动手，把「归属证明 → 终止」压到毫秒
-///   级窗口；端点不应答或易主一律拒绝（防误杀优先）。
+/// 强杀）：「pid + 创建时间」核验后才终止（Windows 在同一进程句柄上先核验
+/// 后终止，中间不存在 pid 复用窗口）。不符 = pid 已被复用给别的进程；未登记
+/// 创建时间（0）= 证明不了身份——两者都拒绝，杀错进程不可逆。
 ///
 /// 返回 Err 的信息已含原因，调用方直接展示。
-pub async fn force_terminate(info: &InstanceInfo) -> Result<(), String> {
-    if info.process_start != 0 {
-        return crate::watchdog::terminate_verified_process(info.pid, info.process_start);
-    }
-    let port = port_of(&info.listen_addr);
-    match ipc_ping(port).await {
-        Ok(fresh) if fresh.pid == info.pid => imp::terminate_process(info.pid),
-        Ok(fresh) => Err(format!(
-            "端口 {port} 当前由 pid {} 应答，与待终止的 pid {} 不一致（实例已更替），拒绝强制终止以防误杀",
-            fresh.pid, info.pid
-        )),
-        Err(e) => Err(format!(
-            "端口 {port} 的实例已不应答（{e}），无法证明 pid {} 仍是该实例，拒绝强制终止以防误杀",
-            info.pid
-        )),
-    }
+pub fn force_terminate(info: &InstanceInfo) -> Result<(), String> {
+    crate::watchdog::terminate_verified_process(info.pid, info.process_start)
 }
 
 /// 向 startup.log 追加一行（带 unix 时间戳前缀）。看门狗的 crashloop 放弃、
@@ -658,8 +639,8 @@ pub async fn list_instances_in(dir: &std::path::Path) -> Vec<InstanceInfo> {
 /// 进程：仍在 → 记录保留、归入 unresponsive；已退出或 pid 已被复用 → 清理
 /// 残留记录。**不应答 ≠ 已死**：挂死的实例进程还在，看门狗的挂死接管要靠
 /// 这条记录核验身份，`stop --force` 也要靠它定位——因为一次 ping 失败就删掉
-/// 它，实例就从 aproxy 的视野里消失了。未登记创建时间的记录（平台读不到）
-/// 无从核验，按旧语义清理。
+/// 它，实例就从 aproxy 的视野里消失了。未登记创建时间（0）的记录证明不了
+/// 身份，同样清理。
 pub async fn survey_instances_in(dir: &std::path::Path) -> InstanceSurvey {
     let mut out = Vec::new();
     let mut unresponsive = Vec::new();
@@ -780,8 +761,8 @@ pub async fn wait_spawned_instance_ready(
 /// 旧端口的 .pid 是已死旧进程的记录，留着只会让看护者的闲置自灭永远等不到
 /// 「注册表空」。
 ///
-/// 保护：旧端口若已被另一个仍在运行的实例接手（其注册表记录核验为同一进程，
-/// 或旧版本记录无从核验但 pid 在世），记录归它，一律不动。返回是否执行了退役。
+/// 保护：旧端口若已被另一个仍在运行的实例接手（其注册表记录核验为同一
+/// 进程），记录归它，一律不动。返回是否执行了退役。
 pub fn retire_moved_port_records_in(
     run_dir: &std::path::Path,
     old_port: &str,
@@ -794,7 +775,6 @@ pub fn retire_moved_port_records_in(
         && matches!(
             crate::watchdog::record_identity(rec.pid, rec.process_start),
             crate::watchdog::RecordIdentity::Alive(_)
-                | crate::watchdog::RecordIdentity::Unverifiable(_)
         )
     {
         return false;
@@ -1081,31 +1061,6 @@ mod imp {
     use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
     use tokio::sync::watch::Sender;
 
-    /// 按 pid 终止（--force 的旧记录档）：无创建时间锚点可比时使用，身份由
-    /// 调用方 force_terminate 以「终止前再 ping 一次、应答 pid 一致」的端点
-    /// 归属证明把关。有锚点的记录走 watchdog::terminate_verified_process。
-    pub fn terminate_process(pid: u32) -> Result<(), String> {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
-        };
-        unsafe {
-            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-            if handle == 0 {
-                return Err(format!("无法打开 pid {pid}（可能已退出）"));
-            }
-            let ok = TerminateProcess(handle, 1);
-            let _ = CloseHandle(handle);
-            if ok == 0 {
-                return Err(format!(
-                    "终止 pid {pid} 失败（{}）",
-                    io::Error::last_os_error()
-                ));
-            }
-        }
-        Ok(())
-    }
-
     /// 端点不存在（无实例）时返回可读错误。
     ///
     /// ERROR_PIPE_BUSY(231) 重试：serve 循环在 connect() 完成、重建下一个
@@ -1162,26 +1117,6 @@ mod imp {
     use std::{io, path::Path, sync::Arc, time::Duration};
     use tokio::net::UnixListener;
     use tokio::sync::watch::Sender;
-
-    /// 按 pid SIGKILL（--force 的旧记录档）：身份由调用方 force_terminate 以
-    /// 端点归属证明把关，见 Windows 侧同名函数注释。
-    pub fn terminate_process(pid: u32) -> Result<(), String> {
-        // 裸 extern 声明直接指向 libc 的 kill(2) 符号（unix 分支不引 libc crate，
-        // Windows 下整个 imp 模块被 cfg 排除，符号只在 unix 链接）
-        let r = unsafe { kill(pid as i32, 9) };
-        if r == 0 {
-            Ok(())
-        } else {
-            Err(format!(
-                "终止 pid {pid} 失败（{}）",
-                io::Error::last_os_error()
-            ))
-        }
-    }
-
-    unsafe extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
 
     pub async fn exchange(endpoint: &str, req_line: &str) -> Result<String, String> {
         let client = tokio::net::UnixStream::connect(endpoint)
@@ -1307,12 +1242,12 @@ mod tests {
         info.pid = pid;
 
         info.process_start = start.wrapping_add(1);
-        let err = force_terminate(&info).await.unwrap_err();
+        let err = force_terminate(&info).unwrap_err();
         assert!(err.contains("不符"), "pid 复用应以身份不符拒绝: {err}");
 
         info.process_start = 0;
-        let err = force_terminate(&info).await.unwrap_err();
-        assert!(err.contains("不应答"), "旧记录端点无人应答应拒绝: {err}");
+        let err = force_terminate(&info).unwrap_err();
+        assert!(err.contains("核验"), "未登记创建时间应拒绝: {err}");
         std::thread::sleep(Duration::from_millis(200));
         assert!(
             child.try_wait().unwrap().is_none(),
@@ -1320,35 +1255,8 @@ mod tests {
         );
 
         info.process_start = start;
-        force_terminate(&info).await.expect("身份一致应终止成功");
+        force_terminate(&info).expect("身份一致应终止成功");
         assert!(wait_child_exit(&mut child), "终止后子进程应退出");
-    }
-
-    /// 旧版本记录（无创建时间）的 --force：终止前对端点再 ping 一次，应答者
-    /// 自报 pid 与待杀 pid 一致才动手。Windows 管道名全局可直接起假端点；unix
-    /// 的 UDS 落在 run_dir()（默认真实主目录），单测不在那里建 socket
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn force_terminate_legacy_record_uses_fresh_ipc_ownership() {
-        let mut child = spawn_unrelated_child();
-        let pid = child.id();
-        let port = format!("597{:02}", 50 + std::process::id() % 50);
-        let mut info = sample_info(&port);
-        info.pid = pid;
-        info.process_start = 0;
-        let (tx, _rx) = tokio::sync::watch::channel(false);
-        let server = tokio::spawn(imp::serve(
-            endpoint_for(&port),
-            tx,
-            info.clone(),
-            Arc::new(IpcStats::default()),
-        ));
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        force_terminate(&info)
-            .await
-            .expect("端点以同一 pid 应答（归属证明成立）应终止成功");
-        assert!(wait_child_exit(&mut child), "终止后子进程应退出");
-        server.abort();
     }
 
     #[test]
@@ -1401,13 +1309,10 @@ mod tests {
         write("59743", pid, start);
         assert!(!retire_moved_port_records_in(dir.path(), "59743", "59744"));
         assert_eq!(has("59743"), (true, true), "在世实例接手的端口不得退役");
+        // 未登记创建时间：证明不了是哪个进程，按无主记录退役
         write("59745", pid, 0);
-        assert!(!retire_moved_port_records_in(dir.path(), "59745", "59746"));
-        assert_eq!(
-            has("59745"),
-            (true, true),
-            "旧记录 pid 在世（无从核验）保守不动"
-        );
+        assert!(retire_moved_port_records_in(dir.path(), "59745", "59746"));
+        assert_eq!(has("59745"), (false, false));
         // 登记时间不符 = pid 已复用，记录的进程已死 → 退役
         write("59747", pid, start.wrapping_add(1));
         assert!(retire_moved_port_records_in(dir.path(), "59747", "59748"));

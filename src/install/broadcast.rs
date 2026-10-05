@@ -1,13 +1,13 @@
 //! PrepareSwap 广播与 ACK 收敛（铁律 3：ACK 齐了才交换）。
 //!
 //! ACK 判定的本质（用户定调）：实例把「进入二进制更换阶段」写进自己的
-//! 可观测状态（swap_phase），而不是口头 ok。安装器发 PrepareSwap，新实例
-//! 在响应里直接回置位后的状态（一个请求完成表达+确认）；旧实例（无此 op）
-//! serde 反序列化失败回 ok:false = 未表达。
+//! 可观测状态（swap_phase），而不是口头 ok。安装器发 PrepareSwap，实例在
+//! 响应里直接回置位后的状态（一个请求完成表达+确认）；回 ok:false 或不应答
+//! = 未表达。
 //!
 //! 重试收敛策略（用户定调）：3 轮 × 每轮 3 次 ping（间隔 500ms）；轮间对
-//! 未 ACK 实例执行 restart（用安装器自身 exe——顺带把落后实例拉到安装器
-//! 版本，旧实例没有 PrepareSwap op 的兼容问题由此收敛）；终失败 → Err
+//! 未 ACK 实例执行 restart（用安装器自身 exe——表达不了的实例多半处在异常
+//! 状态，重启到安装器版本即收敛）；终失败 → Err
 //! （调用方走 abort——绝不强杀，绝对避免服务中断原则贯穿始终）。
 
 use std::path::Path;
@@ -30,7 +30,7 @@ pub async fn ack_one(run_dir: &Path, port: &str) -> Result<(), String> {
             Ok(resp) if resp.ok => {
                 return Ok(());
             }
-            Ok(_) => last = "实例未表达 PrepareSwap（旧版本？）".to_string(),
+            Ok(_) => last = "实例拒绝了 PrepareSwap（回 ok:false）".to_string(),
             Err(e) => last = e,
         }
     }

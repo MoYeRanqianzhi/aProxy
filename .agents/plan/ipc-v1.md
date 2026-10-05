@@ -15,7 +15,15 @@ IPC 重新整理格式后协议版本从 1 重新计数。随后：「发现的�
 - 设计报告由 Plan 子代理读码写成（未执行代码），标 [hypothesis] 的结论要靠对应测试确认。
 
 ## 进度
-- 尚未开始实施。
+- 第 1 步（部分）：`tests/compat_v0_1_0.rs` 冻结 0.1.0 的 InstanceInfo / IpcRequest / RestoreRecord /
+  WatchdogClaim，双向解析断言（5 项）。install.state 的冻结副本与 T1-E2E 留到第 6 步改 install 时补。
+- 第 2 步（部分）：删掉 `RecordIdentity::Unverifiable`（登记值 0 一律按 Gone）、`force_terminate` 的
+  IPC 归属退路与两个平台的 `imp::terminate_process`、status/stop idle 的 `last_activity_secs > 0` 守卫、
+  若干「旧版本」注释与对应测试。InstanceInfo 的 serde default、`IPC_PROTO_V1`、`Stats` op、status 的
+  `proto_version >= 2` 留给第 3/4 步（拆 InstanceRecord 时一起改）。install.state 的 serde default 不删：
+  它同时是「新字段加入」的前向兼容规则，删掉收益小。
+- 本机可用 WSL（Debian）跑 Linux 编译与测试：`wsl -e bash -lc 'cd /mnt/g/ClaudeProjects/aProxy && CARGO_TARGET_DIR=$HOME/aproxy-target cargo clippy --all-targets --locked'`
+  （2026-10-06 WSL 工具链清单损坏，已重装 stable）。
 
 ---
 

@@ -21,10 +21,8 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
         return;
     }
     let now = now_unix();
-    let is_idle = |info: &daemon::InstanceInfo| {
-        // last_activity_secs 为 0 = 实例未上报活动时间（旧版本守护），视为非闲置
-        info.last_activity_secs > 0 && now.saturating_sub(info.last_activity_secs) >= threshold
-    };
+    let is_idle =
+        |info: &daemon::InstanceInfo| now.saturating_sub(info.last_activity_secs) >= threshold;
     let filtered: Vec<_> = instances
         .into_iter()
         .filter(|info| !idle_only || is_idle(info))
@@ -44,11 +42,7 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
     println!("运行中的 aProxy 实例 ({}):", filtered.len());
     let cli_version = env!("CARGO_PKG_VERSION");
     for info in &filtered {
-        let idle_secs = if info.last_activity_secs > 0 {
-            now.saturating_sub(info.last_activity_secs)
-        } else {
-            0
-        };
+        let idle_secs = now.saturating_sub(info.last_activity_secs);
         println!(
             "  端口 {}  pid {}  v{}  已运行 {}  闲置 {}",
             daemon::port_of(&info.listen_addr),

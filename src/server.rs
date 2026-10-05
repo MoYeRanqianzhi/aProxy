@@ -196,9 +196,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
                 // 安装态宣告有效 → 跳过补种（install 的差异化行为之一）：
                 // restarting 窗口内本守护（尚为旧版本）补种的看护者会把滚动
                 // 重启误判为崩溃、用旧二进制重拉，与 install 拉锯。install
-                // 结束宣告消失 → 自检恢复 → 新看护者出簇（新 exe）。旧版本
-                // 守护不认识宣告节的混版本窗口由 install 的 verifying 版本
-                // 校验兜底收敛（诚实边界，不做全版本兼容 hack）。
+                // 结束宣告消失 → 自检恢复 → 新看护者出簇（新 exe）。
                 if aproxy::install::announce::read().is_some_and(|a| {
                     aproxy::install::announce::is_active(&a, watchdog::now_millis())
                 }) {

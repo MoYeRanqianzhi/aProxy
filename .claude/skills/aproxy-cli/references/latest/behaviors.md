@@ -423,7 +423,7 @@ commands.md. During the run:
   `aproxy status` then shows `二进制更换中（install 滚动重启阶段，请勿手动干预此实例）` ("binary swap in
   progress; do not intervene"). Do not stop, restart or kill such an instance: install is about to
   restart it, and interfering makes the two fight.
-- An instance that does not acknowledge (an older or faulty build) is restarted onto the installer's
+- An instance that does not acknowledge (it is in a faulty state) is restarted onto the installer's
   version, for up to three rounds. If it still fails, install aborts with `实例未表达（已按重试/restart 收敛）`
   ("instances did not acknowledge after retries and restarts") or `实例 <port> 收敛重启失败` ("restarting
   instance <port> failed") and kills nothing. Ask the user whether that instance may be stopped, stop

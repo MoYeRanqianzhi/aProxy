@@ -102,7 +102,7 @@ async fn restart_instance(
 
     // 原始启动参数在 .restore（守护 bind 时写入、优雅退出即删）——必须在
     // stop 之前捕获，否则 --api-key/--listen 等仅本次生效的参数会丢失。
-    // .restore 缺失（旧版本守护/记录异常）回退到注册表的 config_path。
+    // .restore 缺失（记录丢失或损坏后被清理）回退到注册表的 config_path。
     let args: Vec<String> = daemon::list_restore_entries()
         .into_iter()
         .find(|e| e.port == port)

@@ -979,11 +979,17 @@ pub async fn serve(cfg: WatchdogConfig) {
     let scan = Duration::from_secs(state.cfg.scan_secs.max(1));
     let mut last_sweep = std::time::Instant::now();
     loop {
-        // 双源竞速唤醒：常规扫描周期，或退避队列的最早到期时刻——重试时刻
-        // 精确到秒而非被扫描周期拖累。主循环单步耗时预算：handle_death/process
-        // 的 respawn 至多 8s + health_scan 的 ipc_ping 至多 ~9.6s，远小于 claim
-        // 的 90s 新鲜窗口——把退避 sleep 放进 tick 会击穿这个预算（M2），故
-        // 等待一律发生在 tick 之间。
+        // 三源竞速唤醒：常规扫描周期、退避队列的最早到期时刻（重试时刻精确
+        // 到秒而非被扫描周期拖累），或死亡事件到达（崩溃实例立即进入重拉，
+        // 不再等满一个扫描周期——默认 30s 的断流对正在等回复的客户端太长）。
+        // 主循环单步耗时预算：handle_death/process 的 respawn 至多 8s +
+        // health_scan 的 ipc_ping 至多 ~9.6s，远小于 claim 的 90s 新鲜窗口——
+        // 把退避 sleep 放进 tick 会击穿这个预算（M2），故等待一律发生在 tick
+        // 之间。
+        //
+        // 即时处理的前提：主动终止实例的一方（`stop --force` / `restart
+        // --force`）在终止**之前**摘掉 .restore，否则这里会先于它的收尾读到
+        // 「记录在 = 崩溃」，把刚被强停的实例拉回来（见 stop_instance）。
         let next_retry = state.next_pending_deadline();
         tokio::select! {
             _ = tokio::time::sleep(scan) => {},
@@ -993,6 +999,10 @@ pub async fn serve(cfg: WatchdogConfig) {
                     None => std::future::pending::<()>().await,
                 }
             } => {},
+            // 发送端由 state 自身持有，通道永不关闭，recv 不会返回 None
+            Some((port, _pid)) = state.deaths.recv() => {
+                state.handle_death(&port).await;
+            },
         }
         state.tick().await;
         // 每日一次的残留状态文件复查（安装中断后看护者长期存活的场景）

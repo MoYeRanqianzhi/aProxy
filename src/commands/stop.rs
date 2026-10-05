@@ -163,18 +163,7 @@ pub(crate) async fn handle_stop_cmd(target: Option<String>, threshold: Option<u6
     // 报成成功
     let mut all_stopped = true;
     for info in &targets {
-        // stop --force 的收尾：被强杀的守护来不及做优雅退出的自清，.restore
-        // 留着就是「崩溃」信号——默认开启的看门狗会在下一个扫描 tick 把它
-        // 拉回来，下次 aproxy restore 也会复活它，stop 语义落空。强杀成功后
-        // 由 CLI 按守护自清的同一顺序删除（先 .restore 后 .pid，再 socket/
-        // 心跳）。紧跟在终止之后执行：看护者在下一个 tick 才处理死亡事件，
-        // 读到的已是「无恢复记录 = 优雅退出」。只用于 stop——restart 的强杀
-        // 路径保留 .restore 作为新实例起不来时的自愈兜底。
-        let stopped = stop_instance(info, mode).await;
-        if stopped && mode == StopMode::Force {
-            crate::server::remove_registry_files(&info.listen_addr);
-        }
-        all_stopped &= stopped;
+        all_stopped &= stop_instance(info, mode).await;
     }
     if !all_stopped {
         std::process::exit(1);
@@ -234,15 +223,39 @@ pub(crate) async fn stop_instance(info: &daemon::InstanceInfo, mode: StopMode) -
                 }
             },
         },
-        StopMode::Force => match daemon::force_terminate(info).await {
-            Ok(()) => {
-                println!("已强制终止 pid {}（端口 {}）", info.pid, port);
-                true
+        // 被强杀的守护来不及做优雅退出的自清，.restore 留着就是「崩溃」信号：
+        // 看门狗收到死亡事件即刻按它重拉，aproxy restore 也会复活它，stop
+        // 语义落空。所以 .restore 必须在终止**之前**摘掉——看门狗被死亡事件
+        // 即时唤醒，终止之后再删必然与它赛跑。终止失败（身份核验不过、无权
+        // 限）时原样放回，实例照旧受崩溃恢复保护。restart --force 同样摘掉：
+        // 否则看门狗与 restart 会同时拉起新实例争抢端口；新实例起不来时与
+        // 优雅重启的失败同态（无恢复记录），由 restart 的失败提示给出恢复命令。
+        StopMode::Force => {
+            let saved = daemon::list_restore_entries()
+                .into_iter()
+                .find(|e| e.port == port);
+            daemon::remove_restore_file(&info.listen_addr);
+            match daemon::force_terminate(info).await {
+                Ok(()) => {
+                    // 其余残留按守护自清的顺序收掉（.pid、socket、心跳）
+                    crate::server::remove_registry_files(&info.listen_addr);
+                    println!("已强制终止 pid {}（端口 {}）", info.pid, port);
+                    true
+                }
+                Err(e) => {
+                    if let Some(entry) = saved
+                        && let Err(werr) = daemon::write_restore_file(
+                            &info.listen_addr,
+                            &entry.args,
+                            &entry.log_path,
+                        )
+                    {
+                        eprintln!("放回端口 {port} 的恢复记录失败: {werr}");
+                    }
+                    eprintln!("强制终止 pid {} 失败: {e}", info.pid);
+                    false
+                }
             }
-            Err(e) => {
-                eprintln!("强制终止 pid {} 失败: {e}", info.pid);
-                false
-            }
-        },
+        }
     }
 }

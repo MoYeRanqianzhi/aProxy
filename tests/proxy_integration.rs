@@ -4677,16 +4677,8 @@ fn hung_instance_is_reported_and_only_force_stops_it() {
         .spawn();
     #[cfg(unix)]
     let dummy = Command::new("sleep").arg("120").spawn();
-    let mut dummy = dummy.expect("拉起哑进程失败");
-    // 断言失败时也收掉哑进程（它是本测试自己的子进程）
-    struct KillOnDrop<'a>(&'a mut std::process::Child);
-    impl Drop for KillOnDrop<'_> {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let pid = dummy.id();
+    let mut dummy = KillOnDrop(dummy.expect("拉起哑进程失败"));
+    let pid = dummy.0.id();
     let start = aproxy::watchdog::process_start_time(pid).expect("读不到哑进程创建时间");
     let run_dir = home.path().join("run");
     let info = aproxy::daemon::InstanceInfo {
@@ -4708,7 +4700,6 @@ fn hung_instance_is_reported_and_only_force_stops_it() {
     };
     aproxy::daemon::write_instance_file_in(&run_dir, &info).unwrap();
     let record = run_dir.join(format!("{port}.pid"));
-    let guard = KillOnDrop(&mut dummy);
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_aproxy"))
             .args(args)
@@ -4738,7 +4729,7 @@ fn hung_instance_is_reported_and_only_force_stops_it() {
         String::from_utf8_lossy(&graceful.stderr)
     );
     assert!(
-        guard.0.try_wait().unwrap().is_none(),
+        dummy.0.try_wait().unwrap().is_none(),
         "无 --force 不得终止进程"
     );
 
@@ -4751,7 +4742,7 @@ fn hung_instance_is_reported_and_only_force_stops_it() {
     );
     let mut exited = false;
     for _ in 0..50 {
-        if guard.0.try_wait().unwrap().is_some() {
+        if dummy.0.try_wait().unwrap().is_some() {
             exited = true;
             break;
         }
@@ -4897,6 +4888,17 @@ fn wait_daemon_ready_in(run_dir: &std::path::Path, port: u16) -> bool {
         std::thread::sleep(Duration::from_millis(100));
     }
     false
+}
+
+/// 测试自己拉起的子进程（哑进程、看护者）在 drop 时终止并回收：断言失败的
+/// unwind 路径同样执行，不把进程泄漏到测试之外。
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// 进程存活探测：Windows 用 tasklist 按 PID 过滤；无匹配时输出为纯文字
@@ -6067,6 +6069,104 @@ fn watchdog_respawns_killed_daemon() {
         "优雅停止后看护者不得复活实例"
     );
     let _ = wd_child.kill();
+    let _ = std::fs::remove_file(dir.path().join("run").join("watchdog.claim"));
+}
+
+#[test]
+fn watchdog_respawns_on_death_event_and_force_stop_stays_stopped() {
+    // 扫描周期拉到 60s：崩溃实例若在几秒内回来，只能是死亡事件即时唤醒了
+    // 主循环（此前要等下一个扫描 tick，默认最长 30s 断流）。即时唤醒随之
+    // 带来的竞态一并验证：`stop --force` 杀掉实例后，看护者几乎同时处理
+    // 死亡事件，此时 .restore 必须已经摘掉，否则刚强停的实例会被拉回来
+    let port = daemon_test_port(15);
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_file = dir.path().join("wd-fast.toml");
+    std::fs::write(
+        &cfg_file,
+        format!("base_url = \"https://wd-fast.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
+    )
+    .unwrap();
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+    let _guard = DaemonGuard {
+        exe,
+        port,
+        home_dir: Some(dir.path().to_path_buf()),
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let envs = [
+        ("APROXY_HOME", dir.path().display().to_string()),
+        ("APROXY_WATCHDOG_SCAN_SECS", "60".to_string()),
+    ];
+    let mut daemon_child = {
+        let mut cmd = Command::new(exe);
+        cmd.args([
+            "--config",
+            cfg_file.display().to_string().as_str(),
+            "--daemon-child",
+        ]);
+        for (k, v) in &envs {
+            cmd.env(k, v);
+        }
+        cmd.spawn().expect("spawn 守护失败")
+    };
+    let orig_pid = daemon_child.id();
+    let wait_ping = |secs: u64| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            if let Ok(info) = ipc_ping_in_dir(&rt, port, dir.path()) {
+                return Some(info);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        None
+    };
+    assert!(wait_ping(10).is_some(), "守护未就绪");
+
+    // 看护者启动时先做一次收养扫描（不等扫描周期），之后才进入 60s 的循环
+    let mut wd_cmd = Command::new(exe);
+    wd_cmd.arg("--daemon-watchdog");
+    for (k, v) in envs {
+        wd_cmd.env(k, v);
+    }
+    let mut wd_child = KillOnDrop(wd_cmd.spawn().expect("spawn 看护者失败"));
+    std::thread::sleep(Duration::from_secs(2));
+
+    // 模拟崩溃。守护是本测试的直接子进程：unix 上不 wait 就是僵尸，看护者
+    // 的死亡等待要到收割后才触发——kill 后立即 wait
+    let _ = daemon_child.kill();
+    let _ = daemon_child.wait();
+    let respawned = wait_ping(15).expect("看护者应在扫描周期之前（死亡事件到达即）重拉守护");
+    assert_ne!(respawned.pid, orig_pid, "应是被重拉的新进程");
+
+    // 强停被重拉的实例：看护者即刻收到死亡事件，必须读到「无恢复记录」
+    let out = Command::new(exe)
+        .args(["stop", &port.to_string(), "--force"])
+        .env("APROXY_HOME", dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stop --force 应成功: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::thread::sleep(Duration::from_secs(5));
+    assert!(
+        ipc_ping_in_dir(&rt, port, dir.path()).is_err(),
+        "stop --force 之后看护者不得把实例拉回来"
+    );
+    assert!(
+        !dir.path()
+            .join("run")
+            .join(format!("{port}.restore"))
+            .exists(),
+        "强停后不应留下恢复记录"
+    );
+    assert!(wd_child.0.try_wait().unwrap().is_none(), "看护者不应退出");
+    drop(wd_child);
     let _ = std::fs::remove_file(dir.path().join("run").join("watchdog.claim"));
 }
 

@@ -389,10 +389,9 @@ public subcommand), a few MB of memory regardless of instance count. It is on by
 and tuning fields are in settings-json.md (`watchdog`, `watchdog_*`). It works on Windows and Linux and
 is not supported on macOS.
 
-- **Death** (crash, kill by PID): the watchdog sees the process exit at once but acts at its next scan,
-  so the instance comes back within about one `watchdog_heartbeat_secs` interval plus its startup time.
-  With a restore record present it respawns the instance from that record and waits up to 8 s for it
-  to come up; failed respawns are retried with backoff from 1 s doubling to 300 s. Without a record
+- **Death** (crash, kill by PID): the watchdog sees the process exit at once and acts on it at once,
+  so the instance is back within its startup time (typically under a second). With a restore
+  record present it respawns the instance from that record and waits up to 8 s for it to come up; failed respawns are retried with backoff from 1 s doubling to 300 s. Without a record
   (graceful stop) it just stops watching. A respawn that lands on another port moves the watch there
   and removes the old port's records.
 - **Hang** (process alive, runtime stuck): each instance writes a heartbeat to shared memory every

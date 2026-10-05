@@ -282,8 +282,9 @@ and if the new instance fails to start you lose your connection to the model.
   to that binary's version. A `--foreground` instance comes back in the background.
 - Arguments come from the instance's restore record. If the record is missing, `restart` falls
   back to `--config <registered config path>` and one-off options are lost.
-- `--force` keeps the restore record, so the watchdog can still recover the port if the new
-  instance fails.
+- `--force` removes the old instance's restore record before terminating it, as `stop --force`
+  does, so the watchdog does not start a second copy alongside the new one. If the new instance
+  then fails, recover with the `aproxy start` command the failure message prints.
 
 ## logs
 

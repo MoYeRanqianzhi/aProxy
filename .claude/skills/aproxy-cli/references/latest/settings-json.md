@@ -172,7 +172,7 @@ The watchdog reads these when its process starts; a running watchdog keeps its v
 
 | Field | Default | Meaning | Choosing a value |
 |---|---|---|---|
-| `watchdog_heartbeat_secs` | `30` | Scan period. An instance whose heartbeat is older than `watchdog_heartbeat_secs × (watchdog_stale_after_cycles + 1)` (60 s with the defaults) and that does not answer an IPC ping is killed and restarted. | Lower detects hangs sooner at the cost of more wake-ups. `0` is a `doctor` error (it runs as 1 s); above `600` is a `doctor` warning. |
+| `watchdog_heartbeat_secs` | `30` | Scan period for hang detection and adoption (crashes are handled the moment the process exits, not at the next scan). An instance whose heartbeat is older than `watchdog_heartbeat_secs × (watchdog_stale_after_cycles + 1)` (60 s with the defaults) and that does not answer an IPC ping is killed and restarted. | Lower detects hangs sooner at the cost of more wake-ups. `0` is a `doctor` error (it runs as 1 s); above `600` is a `doctor` warning. |
 | `watchdog_stale_after_cycles` | `1` | Extra scan periods a heartbeat may lag before the ping check. | Raise it if healthy instances on a heavily loaded machine get killed. `0` is a `doctor` error (it runs as 1). |
 | `watchdog_max_restarts` | `5` | Failed restarts in a row, for one instance, before the watchdog gives up. The first restart is immediate; after a failure it waits 1 s, 2 s, 4 s ... up to 300 s. After giving up, the instance's restore record is kept, so `aproxy restore` can bring it back. | `0` = never restart, only observe (`doctor` warning). |
 | `watchdog_idle_exit_secs` | `300` | How long the watchdog stays after the last instance is gone before exiting. | `0` = stay resident. |

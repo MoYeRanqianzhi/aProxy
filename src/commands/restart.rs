@@ -255,8 +255,9 @@ fn startup_log_excerpt(mark: u64) -> String {
     out
 }
 
-/// 新实例起不来时的恢复指引：旧实例的 .restore 已随停止删除（强杀路径除外），
-/// 看门狗与 aproxy restore 都不会自动拉起它，必须由用户修正后手动 start。
+/// 新实例起不来时的恢复指引：旧实例的 .restore 已随停止删除（优雅退出时守护
+/// 自删，强杀时 stop_instance 在终止前摘掉），看门狗与 aproxy restore 都不会
+/// 自动拉起它，必须由用户修正后手动 start。
 fn recovery_hint(cfg_path: &std::path::Path) -> String {
     format!(
         "\n修正上述问题后执行以下命令恢复服务:\n  aproxy start --config \"{}\"",

@@ -12,6 +12,9 @@
 
 ### 修复
 
+- `settings.json` 的 `default_config` 指向的文件不存在时，只有要读配置的命令（启动、`aproxy config` 查看或修改内容）报错退出；`status`、`stop`、`doctor`、自动拉起的 `install --continue` 等不再被拦，报错信息推荐的 `aproxy config --clear-default` 也能直接执行（此前所有不带 `--config` 的命令都在分发前退出 1）。
+- `settings.json` 解析失败时，`aproxy alias add/remove` 与 `aproxy config --set-default/--clear-default` 拒绝修改并提示先修复或删除该文件，不再用默认值写回、冲掉原有的全部别名。
+- 相对路径的 `log_file` / `--log-file` 按文档相对 `APROXY_HOME` 解析（此前实际相对当前工作目录）。
 - **外部转换器纳入心跳节拍**：保活适用的请求，请求转换、响应转换与回放前解码期间照常提交骨架头并发心跳。此前 format 慢（`timeout_secs = 0` 时没有上界）时，客户端可能在收到任何字节之前一直干等。请求转换若在骨架头提交之后才失败，以 `proxy_transform_failed` 终态 error 事件收场（提交前失败仍是 502）。
 - `override_headers` 里配置的 `accept-encoding` 对保活适用的请求不生效（这些请求一律以 `identity` 发往上游），启动时 warn 一次说明，不再静默覆盖。
 - 客户端上传大请求体（超过 1 MiB、已溢写到磁盘）途中断开时，`req-*.spooltmp` 临时文件不再残留到下次启动。

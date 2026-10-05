@@ -45,7 +45,7 @@ pub(crate) async fn handle_restart_cmd(
     } else {
         StopMode::Graceful
     };
-    let targets = resolve_stop_targets(target, threshold).await;
+    let targets = resolve_stop_targets(target, threshold, force).await;
     if targets.is_empty() {
         return; // 无运行实例：resolve 已输出提示（restart 不启动新实例）
     }

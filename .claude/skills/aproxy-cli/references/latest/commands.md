@@ -89,7 +89,7 @@ reaches only one of them; use ports.
 |---|---|---|
 | start, bare `aproxy` | started; already running on that port; listen port 0 (not waited for) | the config cannot be resolved, validated or bound, or the instance is not ready in 8 s |
 | status, find | always | never |
-| stop | the target resolved, **even when a stop was not confirmed or `--force` failed**; read the output | several instances and no target; unknown alias or port; target not running |
+| stop | every target confirmed stopped; nothing running for no target, `all` or `idle` | a stop not confirmed or `--force` failed; several instances and no target; unknown alias or port; target not running; target hung and no `--force` |
 | restart | every target restarted; nothing running for no target, `all` or `idle` | any target failed; target cannot be resolved |
 | logs | the followed instance stopped; nothing running | `all`, ambiguous or unknown target, foreground instance, unreadable log |
 | restore | always, even when an instance fails to come back | never |
@@ -186,8 +186,13 @@ What `start` checks, in order:
 aproxy status [--idle | --busy]
 ```
 
-Lists instances in the registry that answer over IPC (records that no longer answer are deleted
-on the way). Per instance: port, pid, `v<version>`, uptime, idle time, listen address, masked
+Lists instances in the registry that answer over IPC. A record that does not answer is deleted
+when its process is gone (or its pid now belongs to another process); when the process is still
+there, the record is kept and listed first, whatever the filter:
+`无响应的 aProxy 实例 (<n>)——进程仍在，但不应答控制通道:` ("unresponsive instances: the process is
+still there but does not answer the control channel"), with port, pid, version, config and the hint
+`aproxy stop <port> --force`. Such an instance is almost always hung; with the watchdog on, its
+hang detection terminates and respawns it on its own. Per answering instance: port, pid, `v<version>`, uptime, idle time, listen address, masked
 upstream, config path, and request and retry counts with the latest error. Two extra lines can
 appear:
 
@@ -221,12 +226,18 @@ asking.
   within 12 s: `已停止 pid <pid>（端口 <port>）` ("stopped"). If it prints
   `pid <pid> 已收到停止请求但尚未退出，可用 aproxy status 稍后确认，或 aproxy stop <port> --force 强制结束`
   ("received the stop request but has not exited; check status later or force it"), check
-  `aproxy status` again shortly; if it is still listed, use `--force`.
+  `aproxy status` again shortly; if it is still listed, use `--force`. `stop` exits 1 whenever a
+  target was not confirmed stopped, so scripts can rely on the exit code.
+- **A hung instance** (process alive, control channel silent) cannot be stopped gracefully.
+  Naming it by port or alias prints
+  `端口 <port> 的实例（pid <pid>）进程仍在，但不应答控制通道，无法优雅停止；用 --force 强制结束`
+  ("the process is still there but does not answer; use --force") and exits 1. `stop all`
+  without `--force` stops the answering instances and says how many hung ones it left out.
 - **`--force`:** terminates the process immediately, without the 10 s grace, after verifying by
   pid plus process start time that the pid still belongs to that instance (a reused pid is
   refused). It then deletes the restore record so neither the watchdog nor `restore` revives the
-  instance. `--force` still locates the instance over IPC, so it cannot reach an instance that no
-  longer answers at all (troubleshooting.md).
+  instance. It finds hung instances through their registry record, so it works when IPC does not;
+  `stop all --force` includes them.
 - **`stop all`** stops every registered instance, including any your own session or the user's
   other sessions depend on. Use it only when the user asked for exactly that.
 - **`stop idle [SECS]`** stops instances idle for at least SECS (default `idle_timeout_secs`).

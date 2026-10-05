@@ -4657,6 +4657,111 @@ fn corrupt_settings_json_is_never_overwritten() {
 }
 
 #[test]
+fn hung_instance_is_reported_and_only_force_stops_it() {
+    // 挂死实例的形态：注册表记录的进程（pid + 创建时间核验得上）还在，控制
+    // 通道却无人应答。用测试自己 spawn 的哑进程冒充，端口上不开 IPC 端点。
+    // 曾经：status 一次 ping 失败就删掉记录（实例从此在 aproxy 视野里消失，
+    // --force 也找不到它），stop 对它报「没有运行中的实例」且退出码含糊
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+
+    #[cfg(windows)]
+    let dummy = Command::new("ping")
+        .args(["-n", "120", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .spawn();
+    #[cfg(unix)]
+    let dummy = Command::new("sleep").arg("120").spawn();
+    let mut dummy = dummy.expect("拉起哑进程失败");
+    // 断言失败时也收掉哑进程（它是本测试自己的子进程）
+    struct KillOnDrop<'a>(&'a mut std::process::Child);
+    impl Drop for KillOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let pid = dummy.id();
+    let start = aproxy::watchdog::process_start_time(pid).expect("读不到哑进程创建时间");
+    let run_dir = home.path().join("run");
+    let info = aproxy::daemon::InstanceInfo {
+        pid,
+        version: "0.0.0-test".into(),
+        listen_addr: format!("127.0.0.1:{port}"),
+        config_path: home.path().join("c.toml").display().to_string(),
+        base_url: "https://api.example.com".into(),
+        started_at: 1_700_000_000,
+        last_activity_secs: 0,
+        proto_version: aproxy::daemon::IPC_PROTO_VERSION,
+        requests_total: 0,
+        retries_total: 0,
+        last_error: None,
+        last_error_at: 0,
+        swap_phase: false,
+        log_path: String::new(),
+        process_start: start,
+    };
+    aproxy::daemon::write_instance_file_in(&run_dir, &info).unwrap();
+    let record = run_dir.join(format!("{port}.pid"));
+    let guard = KillOnDrop(&mut dummy);
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_aproxy"))
+            .args(args)
+            .env("APROXY_HOME", home.path())
+            .output()
+            .unwrap()
+    };
+    let port_s = port.to_string();
+
+    let status = run(&["status"]);
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("无响应") && stdout.contains(&port_s),
+        "{stdout}"
+    );
+    assert!(record.exists(), "status 不得删掉进程仍在的记录");
+
+    let graceful = run(&["stop", &port_s]);
+    assert_eq!(
+        graceful.status.code(),
+        Some(1),
+        "优雅停止走不通必须以 1 退出"
+    );
+    assert!(
+        String::from_utf8_lossy(&graceful.stderr).contains("--force"),
+        "{}",
+        String::from_utf8_lossy(&graceful.stderr)
+    );
+    assert!(
+        guard.0.try_wait().unwrap().is_none(),
+        "无 --force 不得终止进程"
+    );
+
+    let forced = run(&["stop", &port_s, "--force"]);
+    assert!(
+        forced.status.success(),
+        "--force 应核验身份后终止: {}{}",
+        String::from_utf8_lossy(&forced.stdout),
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    let mut exited = false;
+    for _ in 0..50 {
+        if guard.0.try_wait().unwrap().is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(exited, "--force 后进程应已退出");
+    assert!(!record.exists(), "强制终止后注册记录应被清理");
+}
+
+#[test]
 fn cli_config_show_rejects_missing_explicit_file() {
     // 与写操作对照：--show / 无修改参数对「显式 --config 指向的不存在文件」
     // 必须报错——此时展示的只是内置默认值（抬头却是用户给的路径），静默回退

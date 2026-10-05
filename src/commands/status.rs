@@ -10,9 +10,14 @@ use crate::util::{humanize_duration, humanize_uptime, now_unix};
 /// idle/busy 按实例的最近活动时间与 settings.idle_timeout_secs 判定。
 pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
     let threshold = settings::load().idle_timeout_secs;
-    let instances = daemon::list_instances().await;
+    let survey = daemon::survey_instances().await;
+    // 不应答的实例无论 --idle/--busy 都要报：它们多半挂死了，用户最需要知道
+    print_unresponsive(&survey.unresponsive);
+    let instances = survey.responsive;
     if instances.is_empty() {
-        println!("没有运行中的 aProxy 实例。");
+        if survey.unresponsive.is_empty() {
+            println!("没有运行中的 aProxy 实例。");
+        }
         return;
     }
     let now = now_unix();
@@ -93,5 +98,25 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
                 daemon::port_of(&info.listen_addr)
             );
         }
+    }
+}
+
+/// 列出「进程仍在、却不应答控制通道」的实例：优雅停止走不通，只能 --force
+/// （终止前核验 pid + 创建时间，不会误杀）。开着看门狗时，挂死检测会自行处决
+/// 并重拉它们。
+fn print_unresponsive(unresponsive: &[daemon::InstanceInfo]) {
+    if unresponsive.is_empty() {
+        return;
+    }
+    println!(
+        "无响应的 aProxy 实例 ({})——进程仍在，但不应答控制通道:",
+        unresponsive.len()
+    );
+    for info in unresponsive {
+        let port = daemon::port_of(&info.listen_addr);
+        println!(
+            "  端口 {port}  pid {}  v{}  配置 {}\n    可用 aproxy stop {port} --force 结束（或 aproxy restart {port} --force 重启）",
+            info.pid, info.version, info.config_path
+        );
     }
 }

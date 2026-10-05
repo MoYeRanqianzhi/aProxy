@@ -23,9 +23,14 @@ pub(crate) enum StopMode {
 /// stop/restart 的共享 target 解析：枚举出要停止的实例清单。
 /// 空 Vec = 该 target 下没有运行中的实例（提示已输出；restart 据此不启动）。
 /// 错误（未知别名等）直接打印并 exit 1。
+///
+/// `force` 时把「进程仍在、却不应答控制通道」的实例也纳入（按端口指定时回退
+/// 注册表记录；`all` 时并入普查结果）：它们正是只能强制终止的那一类，而
+/// force_terminate 终止前按 pid + 创建时间核验身份，不依赖 IPC。
 pub(crate) async fn resolve_stop_targets(
     target: Option<String>,
     threshold: Option<u64>,
+    force: bool,
 ) -> Vec<daemon::InstanceInfo> {
     // idle 保留字：停止全部空闲超阈值的实例（阈值可临时覆盖 settings 配置）
     if target
@@ -57,12 +62,21 @@ pub(crate) async fn resolve_stop_targets(
         match resolve_config_target(target) {
             Some(cfg_path) => {
                 let key = config_path_key(&cfg_path.display().to_string());
-                let instances = daemon::list_instances().await;
-                match instances
-                    .iter()
-                    .find(|i| config_path_key(&i.config_path) == key)
-                {
-                    Some(info) => return vec![info.clone()],
+                let survey = daemon::survey_instances().await;
+                let matches = |i: &&daemon::InstanceInfo| config_path_key(&i.config_path) == key;
+                if let Some(info) = survey.responsive.iter().find(matches) {
+                    return vec![info.clone()];
+                }
+                match survey.unresponsive.iter().find(matches) {
+                    Some(info) if force => return vec![info.clone()],
+                    Some(info) => {
+                        eprintln!(
+                            "别名 {target} 的实例（端口 {}，pid {}）进程仍在，但不应答控制通道，无法优雅停止；用 --force 强制结束",
+                            daemon::port_of(&info.listen_addr),
+                            info.pid
+                        );
+                        std::process::exit(1);
+                    }
                     None => {
                         println!("别名 {target}（配置 {}）当前未在运行。", cfg_path.display());
                         std::process::exit(1);
@@ -85,15 +99,34 @@ pub(crate) async fn resolve_stop_targets(
         let port = daemon::port_of(target).to_string();
         return match daemon::ipc_ping(&port).await {
             Ok(info) => vec![info],
-            Err(_) => {
-                println!("端口 {port} 上没有运行中的 aProxy 实例。");
-                println!("（若该端口被其他程序占用，与本工具无关）");
-                std::process::exit(1);
-            }
+            Err(_) => match unresponsive_record(&port) {
+                Some(info) if force => vec![info],
+                Some(info) => {
+                    eprintln!(
+                        "端口 {port} 的实例（pid {}）进程仍在，但不应答控制通道，无法优雅停止；用 --force 强制结束",
+                        info.pid
+                    );
+                    std::process::exit(1);
+                }
+                None => {
+                    println!("端口 {port} 上没有运行中的 aProxy 实例。");
+                    println!("（若该端口被其他程序占用，与本工具无关）");
+                    std::process::exit(1);
+                }
+            },
         };
     }
 
-    let instances = daemon::list_instances().await;
+    let survey = daemon::survey_instances().await;
+    let mut instances = survey.responsive;
+    if force {
+        instances.extend(survey.unresponsive);
+    } else if !survey.unresponsive.is_empty() {
+        eprintln!(
+            "另有 {} 个实例进程仍在但不应答控制通道，优雅停止不涉及它们；aproxy status 可查看，加 --force 一并处理",
+            survey.unresponsive.len()
+        );
+    }
     match target.as_deref() {
         Some("all") => {
             if instances.is_empty() {
@@ -125,7 +158,10 @@ pub(crate) async fn handle_stop_cmd(target: Option<String>, threshold: Option<u6
     } else {
         StopMode::Graceful
     };
-    let targets = resolve_stop_targets(target, threshold).await;
+    let targets = resolve_stop_targets(target, threshold, force).await;
+    // 任一目标没能确认停止 → 退出 1：脚本据此判断，不能把「请求已发、进程还在」
+    // 报成成功
+    let mut all_stopped = true;
     for info in &targets {
         // stop --force 的收尾：被强杀的守护来不及做优雅退出的自清，.restore
         // 留着就是「崩溃」信号——默认开启的看门狗会在下一个扫描 tick 把它
@@ -134,10 +170,26 @@ pub(crate) async fn handle_stop_cmd(target: Option<String>, threshold: Option<u6
         // 心跳）。紧跟在终止之后执行：看护者在下一个 tick 才处理死亡事件，
         // 读到的已是「无恢复记录 = 优雅退出」。只用于 stop——restart 的强杀
         // 路径保留 .restore 作为新实例起不来时的自愈兜底。
-        if stop_instance(info, mode).await && mode == StopMode::Force {
+        let stopped = stop_instance(info, mode).await;
+        if stopped && mode == StopMode::Force {
             crate::server::remove_registry_files(&info.listen_addr);
         }
+        all_stopped &= stopped;
     }
+    if !all_stopped {
+        std::process::exit(1);
+    }
+}
+
+/// 按端口读注册表记录，且记录的进程经「pid + 创建时间」核验仍在——不应答
+/// 控制通道的实例（多半挂死）只能这样定位。
+fn unresponsive_record(port: &str) -> Option<daemon::InstanceInfo> {
+    let info = daemon::read_instance_file_in(&daemon::run_dir(), port)?;
+    matches!(
+        aproxy::watchdog::record_identity(info.pid, info.process_start),
+        aproxy::watchdog::RecordIdentity::Alive(_)
+    )
+    .then_some(info)
 }
 
 /// 停止单个实例。
@@ -165,10 +217,22 @@ pub(crate) async fn stop_instance(info: &daemon::InstanceInfo, mode: StopMode) -
                     false
                 }
             }
-            Err(e) => {
-                println!("pid {} 无响应（可能已停止）: {}", info.pid, e);
-                false
-            }
+            // 发不出 shutdown：区分「其间已自行退出」与「进程还在、只是不应答」，
+            // 前者就是停止的结果，后者只能 --force
+            Err(e) => match aproxy::watchdog::record_identity(info.pid, info.process_start) {
+                aproxy::watchdog::RecordIdentity::Gone
+                | aproxy::watchdog::RecordIdentity::Reused => {
+                    println!("pid {}（端口 {}）已不在运行", info.pid, port);
+                    true
+                }
+                _ => {
+                    println!(
+                        "pid {} 不应答停止请求（{e}），可用 aproxy stop {} --force 强制结束",
+                        info.pid, port
+                    );
+                    false
+                }
+            },
         },
         StopMode::Force => match daemon::force_terminate(info).await {
             Ok(()) => {

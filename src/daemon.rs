@@ -205,8 +205,8 @@ fn ipc_proto_v1_default() -> u32 {
 ///
 /// 判死门槛：连续 3 次（间隔 200ms）都拿不到有效响应才算 Err。单次 ping
 /// 可能因 Windows 命名管道瞬时 busy（serve 重建监听实例的零监听窗口）或
-/// 3 秒超时等瞬态原因失败；调用方（list_instances 的注册清理、stop 的
-/// 已停止判定）会把 Err 当作「实例已死」处理，误判会删掉活实例的注册记录。
+/// 3 秒超时等瞬态原因失败；调用方据 Err 下结论（stop 的已停止判定把它当
+/// 「实例已退出」，注册表普查据它转入进程身份核验），单次抖动不该左右结论。
 pub async fn ipc_ping(port: &str) -> Result<InstanceInfo, String> {
     ping_endpoint(&endpoint_for(port)).await
 }
@@ -218,8 +218,8 @@ pub async fn ipc_ping_in(run_dir: &std::path::Path, port: &str) -> Result<Instan
 
 /// 判死门槛：连续 3 次（间隔 200ms）都拿不到有效响应才算 Err。单次 ping
 /// 可能因 Windows 命名管道瞬时 busy（serve 重建监听实例的零监听窗口）或
-/// 3 秒超时等瞬态原因失败；调用方（list_instances 的注册清理、stop 的
-/// 已停止判定）会把 Err 当作「实例已死」处理，误判会删掉活实例的注册记录。
+/// 3 秒超时等瞬态原因失败；调用方据 Err 下结论（stop 的已停止判定把它当
+/// 「实例已退出」，注册表普查据它转入进程身份核验），单次抖动不该左右结论。
 async fn ping_endpoint(endpoint: &str) -> Result<InstanceInfo, String> {
     const DEAD_AFTER: usize = 3;
     const RETRY_INTERVAL: Duration = Duration::from_millis(200);
@@ -577,12 +577,34 @@ pub fn remove_instance_file(listen_addr: &str) {
     let _ = std::fs::remove_file(instance_file_path(listen_addr));
 }
 
-/// 列出注册表中的实例并逐个 IPC ping 验活；已死亡/损坏的记录直接清理残留文件。
+/// 列出注册表中应答控制通道的实例（见 `survey_instances_in`）。
 /// 顺带清理孤儿日志（status 是唯一可靠的清理时机）。
 pub async fn list_instances() -> Vec<InstanceInfo> {
-    let live = list_instances_in(&run_dir()).await;
-    cleanup_orphan_logs_in(&logs_dir(), &live, &list_restore_entries());
-    live
+    survey_instances().await.responsive
+}
+
+/// 注册表普查结果：应答的实例，与「进程仍在、却不应答控制通道」的实例。
+pub struct InstanceSurvey {
+    /// IPC ping 成功：信息取自 ping 响应（实时值）
+    pub responsive: Vec<InstanceInfo>,
+    /// ping 失败但记录的进程经「pid + 创建时间」核验仍在（多为挂死）：信息
+    /// 取自注册表记录（启动时刻的快照）。aproxy 无法经 IPC 优雅停止它们，只能
+    /// `stop --force`（终止前同样核验身份）
+    pub unresponsive: Vec<InstanceInfo>,
+}
+
+/// 普查注册表并顺带清理孤儿日志——不应答实例的日志同样计入引用集（进程还在
+/// 写它），不能当孤儿删掉。
+pub async fn survey_instances() -> InstanceSurvey {
+    let survey = survey_instances_in(&run_dir()).await;
+    let referenced: Vec<InstanceInfo> = survey
+        .responsive
+        .iter()
+        .chain(survey.unresponsive.iter())
+        .cloned()
+        .collect();
+    cleanup_orphan_logs_in(&logs_dir(), &referenced, &list_restore_entries());
+    survey
 }
 
 /// 清理孤儿日志：日志文件名随机化后不再携带归属信息，判据改为「引用集」——
@@ -629,9 +651,23 @@ fn cleanup_orphan_logs_in(
 
 /// 同上，目录可指定（测试注入用）
 pub async fn list_instances_in(dir: &std::path::Path) -> Vec<InstanceInfo> {
+    survey_instances_in(dir).await.responsive
+}
+
+/// 逐条读注册表、IPC ping 验活。ping 失败时按「pid + 创建时间」核验记录的
+/// 进程：仍在 → 记录保留、归入 unresponsive；已退出或 pid 已被复用 → 清理
+/// 残留记录。**不应答 ≠ 已死**：挂死的实例进程还在，看门狗的挂死接管要靠
+/// 这条记录核验身份，`stop --force` 也要靠它定位——因为一次 ping 失败就删掉
+/// 它，实例就从 aproxy 的视野里消失了。未登记创建时间的记录（平台读不到）
+/// 无从核验，按旧语义清理。
+pub async fn survey_instances_in(dir: &std::path::Path) -> InstanceSurvey {
     let mut out = Vec::new();
+    let mut unresponsive = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
+        return InstanceSurvey {
+            responsive: out,
+            unresponsive,
+        };
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -652,14 +688,21 @@ pub async fn list_instances_in(dir: &std::path::Path) -> Vec<InstanceInfo> {
             // .pid 是启动时刻的快照，闲置判定/展示必须用实时值，否则活动
             // 时间永远停留在启动时刻、闲置=运行时长（实测踩坑）
             Ok(live_info) => out.push(live_info),
-            Err(_) => {
-                // 实例不在了：注册已失效，清理
-                let _ = std::fs::remove_file(&path);
-            }
+            Err(_) => match crate::watchdog::record_identity(info.pid, info.process_start) {
+                crate::watchdog::RecordIdentity::Alive(_) => unresponsive.push(info),
+                // 实例不在了（或无从核验）：注册已失效，清理
+                _ => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            },
         }
     }
     out.sort_by(|a, b| a.listen_addr.cmp(&b.listen_addr));
-    out
+    unresponsive.sort_by(|a, b| a.listen_addr.cmp(&b.listen_addr));
+    InstanceSurvey {
+        responsive: out,
+        unresponsive,
+    }
 }
 
 /// 只读检索注册表：是否存在 pid 匹配的实例记录。
@@ -1557,6 +1600,33 @@ mod tests {
         let listed = list_instances_in(dir.path()).await;
         assert!(listed.iter().all(|i| i.listen_addr != "127.0.0.1:59801"));
         assert!(!path.exists(), "死亡实例的注册记录应被清理");
+    }
+
+    #[tokio::test]
+    async fn survey_keeps_records_of_live_but_unresponsive_instances() {
+        // 进程还在、端点却无人应答（挂死的形态）：用本测试进程自身冒充——
+        // pid 与创建时间都核验得上，但 59802 上没有 IPC 端点
+        let dir = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let start = crate::watchdog::process_start_time(pid).expect("读不到自身创建时间");
+        let mut hung = sample_info("59802");
+        hung.pid = pid;
+        hung.process_start = start;
+        write_instance_file_in(dir.path(), &hung).unwrap();
+        let path = instance_file_path_in(dir.path(), "127.0.0.1:59802");
+
+        let survey = survey_instances_in(dir.path()).await;
+        assert!(survey.responsive.is_empty());
+        assert_eq!(survey.unresponsive.len(), 1, "挂死实例应归入 unresponsive");
+        assert_eq!(survey.unresponsive[0].pid, pid);
+        assert!(path.exists(), "进程仍在的记录不能因 ping 失败被删");
+
+        // 同一 pid、创建时间对不上 = pid 已被复用，记录的进程早已死亡 → 清理
+        hung.process_start = start + 1;
+        write_instance_file_in(dir.path(), &hung).unwrap();
+        let survey = survey_instances_in(dir.path()).await;
+        assert!(survey.unresponsive.is_empty());
+        assert!(!path.exists(), "pid 被复用的记录应被清理");
     }
 
     #[test]

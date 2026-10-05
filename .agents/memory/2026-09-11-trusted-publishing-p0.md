@@ -33,9 +33,15 @@
   release-format.yml（#23481）与 release.yml（#23482，主线在 envelope 版本变动时也会发布它）；
   aproxy 仍是 release.yml（#19617）。随后单独重跑 publish-format-crates，aproxy-format 0.1.1
   经 OIDC 发布成功（crates.io 的 trustpub_data 指向 run 37192303424）。
-- **npm**：`@meowo/aproxy-format` 主包及 9 个平台包（共 10 个）没有绑定 Trusted Publisher，OIDC
-  发布返回 PUT 404（与第 1/2 条同一表现）。只能由所有者在网页上 2FA 绑定。
+- **npm**：format 线 10 个包（`@meowo/aproxy-format` 主包 + 9 个平台包）原本没有绑定 Trusted Publisher，
+  OIDC 发布返回 PUT 404。**2026-10-06 所有者在网页上补齐**，0.1.1 经 OIDC 发布成功。**教训**：npm 绑定按
+  workflow 文件名匹配，format 线是 `release-format.yml`，不是主线的 `release.yml`；所有者第一次照着
+  主线包填写，又 404 了一轮。请所有者做绑定时，要逐字段给出取值（Organization `MoYeRanqianzhi`、
+  Repository `aProxy`、Workflow `release-format.yml`、Environment `release`），并点明 10 个包
+  都要绑定（脚本先发平台包，只绑主包也会在第一个平台包失败）。
 - **本机凭据**：`~/.cargo/credentials.toml` 里的 crates.io token 已失效（发布返回
-  403 authentication failed），本机 npm 未登录（401）。主代理无法替所有者补发。
-- npm 绑定补齐后执行 `gh run rerun 37192303424 --failed` 即可（届时只剩 publish-format-npm 失败）：两个发布 job 都按「版本已存在
-  才跳过」幂等，GitHub Release format-v0.1.1 已经建好。
+  403 authentication failed），本机 npm 未登录（401）。发布只能走 CI 的 OIDC。
+- 绑定补齐后用 `gh run rerun <run-id> --failed` 只重跑失败的发布 job 即可：两个发布 job 都按
+  「版本已存在才跳过」幂等。format 0.1.1 的 npm 包就是这样在 run 37192303424 上补发的。
+- npm 的 `+ @meowo/...@x.y.z` 日志出现后，registry 元数据要过几分钟才显示新版本与 dist-tag，
+  马上查到旧值不代表发布失败（主线 0.1.0 与 format 0.1.1 都遇到过）。

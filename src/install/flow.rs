@@ -511,6 +511,33 @@ pub async fn run_install_online(
 /// --continue 续作（隐藏标志，恢复机制的统一入口）：读状态文件 → 判定
 /// 当前 phase → 从该步幂等推进。全自动无人工询问（用户调 install 的期望
 /// 就是「装完」，安装的每一步本就安全/幂等/可回滚，续作无破坏性）。
+/// 快照里的每个实例都在应答、状态为 serving、版本是目标版本，且进程镜像就是
+/// `<home>/bin` 里的二进制。只比版本不够：回滚到旧二进制的实例与目标版本号
+/// 相同时（同版本重装、测试）也会对上。快照为空不下结论。
+async fn fleet_already_on_target(home: &Path, run_dir: &Path, state: &InstallState) -> bool {
+    if state.instance_snapshot.is_empty() {
+        return false;
+    }
+    let canonical = |p: &Path| std::fs::canonicalize(p).ok();
+    let Some(bin) = canonical(&swap::bin_path_in(home)) else {
+        return false;
+    };
+    for port in &state.instance_snapshot {
+        let Ok(status) = crate::daemon::ipc_ping_in(run_dir, port).await else {
+            return false;
+        };
+        let image =
+            crate::watchdog::process_image_path(status.instance.pid).and_then(|p| canonical(&p));
+        if status.instance.version != state.target_version
+            || status.state != crate::daemon::InstanceState::Serving
+            || image.as_ref() != Some(&bin)
+        {
+            return false;
+        }
+    }
+    true
+}
+
 pub async fn continue_install(home: &Path, run_dir: &Path) -> Result<FlowExit, String> {
     let Some(mut state) = super::state::load_in(run_dir) else {
         return Ok(FlowExit::Completed); // 无残留，无事发生
@@ -525,6 +552,15 @@ pub async fn continue_install(home: &Path, run_dir: &Path) -> Result<FlowExit, S
     // 的中断——看护者/CLI 入口会反复拉起续作，这里必须原地拒绝且不碰现场。
     // 用户排除原因后显式重新执行 install（新安装接管 stale 残留）收尾。
     if state.phase == InstallPhase::Failed && state.halted {
+        // 例外：快照里的实例其实都已从规范位置的新二进制、以目标版本正常服务
+        // （例如 0.1.0 的安装器在 Windows 上没等到接棒者确认，自己核验时找不到
+        // 新实例而判了失败）。没有什么可重试的，收尾清场——否则这份现场会让
+        // 看护者每天拉起一次注定被拒的续作，`install latest` 又报「已是最新」
+        if fleet_already_on_target(home, run_dir, &state).await {
+            tracing::info!(target = %state.target_version, "失败现场的实例均已在目标版本上运行，收尾清场");
+            super::state::remove_in(run_dir);
+            return Ok(FlowExit::Completed);
+        }
         return Err(format!(
             "上次安装因实例级失败已中止，不自动重试（{}）。排除原因后重新执行 aproxy install",
             state.last_error.as_deref().unwrap_or("原因未记录")

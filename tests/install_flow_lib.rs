@@ -722,6 +722,52 @@ async fn rollback_case(kind: BrokenNew) {
     let _ = child.wait();
 }
 
+/// 失败现场（failed + halted）里的实例其实都已从 bin 的二进制、以目标版本正常
+/// 服务：续作收尾清场，不碰实例。只比版本不够——上面的回滚用例里实例跑在
+/// 旧二进制上、版本号却相同，那里续作必须照旧拒绝
+#[tokio::test(flavor = "current_thread")]
+async fn halted_failure_is_cleaned_up_when_the_fleet_already_runs_the_target() {
+    let _guard = LIVE_TEST_LOCK.lock().await;
+    let dir = live_home();
+    let home = dir.path();
+    let run_dir = home.join("run");
+    let bin = aproxy::install::swap::bin_path_in(home);
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &bin).unwrap();
+    make_exec(&bin);
+    let (port, _cfg, mut child) = start_instance(home, &bin, "fleet-ok");
+    let pid = child.id();
+
+    let mut state = InstallState::new_marking(env!("CARGO_PKG_VERSION"), InstallSource::From);
+    state.phase = InstallPhase::Failed;
+    state.halted = true;
+    state.last_error = Some("核验时找不到实例".into());
+    state.instance_snapshot = vec![port.to_string()];
+    state.installer_pid = u32::MAX - 7;
+    aproxy::install::state::write_in(&run_dir, &mut state).unwrap();
+
+    let exit = aproxy::install::flow::continue_install(home, &run_dir)
+        .await
+        .expect("实例已在目标上，续作应收尾而不是拒绝");
+    assert!(matches!(exit, aproxy::install::flow::FlowExit::Completed));
+    assert!(
+        aproxy::install::state::load_in(&run_dir).is_none(),
+        "失败现场应已清除"
+    );
+    let live = aproxy::daemon::ipc_ping_in(&run_dir, &port.to_string())
+        .await
+        .expect("实例应仍在线");
+    assert_eq!(live.instance.pid, pid, "收尾不得重启实例");
+
+    let _ = aproxy::install::restart::stop_and_wait(
+        &run_dir,
+        &port.to_string(),
+        Duration::from_secs(20),
+    )
+    .await;
+    let _ = child.wait();
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn rolling_restart_rolls_back_when_new_binary_cannot_spawn() {
     let _guard = LIVE_TEST_LOCK.lock().await;

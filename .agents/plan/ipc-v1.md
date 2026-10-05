@@ -64,8 +64,14 @@ IPC 重新整理格式后协议版本从 1 重新计数。随后：「发现的�
   退役无版本（0.1.0）或更旧的看护者（pid + 创建时间核验、等退出、删 claim），补种走正常自检（install 期间
   宣告有效时不补种，结束后 ≤5 分钟由新二进制补种）；安装器 `stop_old_watchdog` 去掉 `cfg(windows)`（旧注释
   「unix 无此问题」不对：Linux 上 current_exe 指向 `(deleted)`）。T5a 单测 `daemon_startup_retires_only_older_watchdogs`。
-- 下一步：第 6 步 install（在线路径管辖检查、`--continue` 收尾已一致的舰队、早交接、install.state 冻结副本、
-  CI 里的 T1-E2E）。
+- T1-E2E（提交 F）：`tests/upgrade_from_0_1_0.rs`（`#[ignore]`，需要 `APROXY_V010_BIN`）+ CI 任务 upgrade-from-0-1-0
+  （windows + ubuntu，下载 v0.1.0 资产后 `--ignored` 运行）。两边自报版本此刻都是 0.1.0，测试按 bin 内容与
+  v1 应答里非空的 `run_dir` 认出新守护。本机不跑（生产实例）。
+- c.4（提交 F）：`continue_install` 遇 failed + halted 时先查 `fleet_already_on_target`（快照实例全部应答、serving、
+  版本 == 目标、镜像 == `<home>/bin`），满足即清场。只比版本不够：测试与同版本重装里回滚到旧二进制的实例版本号
+  相同（既有回滚用例因此仍拒绝）。测试 `halted_failure_is_cleaned_up_when_the_fleet_already_runs_the_target`。
+- 下一步：第 6 步 install 其余（在线路径管辖检查 T6a、早交接 T6d、install.state 冻结副本）；看 upgrade-from-0-1-0
+  任务的首次结果，按结果修。
 - Linux 编译只能靠 CI 的 ubuntu 门禁：本机 WSL（Debian）的 rustup 工具链清单损坏，且 2026-10-06 WSL 内无外网
   （官方源与 rsproxy 均连接超时），修不了；本机也没有 Linux C 交叉编译器（ring 需要）。
 

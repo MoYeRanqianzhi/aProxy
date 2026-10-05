@@ -67,6 +67,34 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked --no-fail-fast
 
+  upgrade-from-0-1-0:
+    # 真实 v0.1.0 二进制驱动的原地升级（tests/upgrade_from_0_1_0.rs，平时 #[ignore]）。
+    # 只在 CI 跑：开发机上往往有用户正在用的 0.1.0 实例，0.1.0 的 Windows 控制管道
+    # 按端口全机共享，测试里的 0.1.0 二进制可能碰到它们。
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: aproxy-x86_64-pc-windows-msvc.exe
+          - os: ubuntu-latest
+            asset: aproxy-x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+      - name: Download the v0.1.0 release binary
+        shell: bash
+        run: |
+          dest="$RUNNER_TEMP/${{ matrix.asset }}"
+          curl -fsSL -o "$dest" "https://github.com/${{ github.repository }}/releases/download/v0.1.0/${{ matrix.asset }}"
+          chmod +x "$dest"
+          echo "APROXY_V010_BIN=$dest" >> "$GITHUB_ENV"
+      - run: cargo test --locked --test upgrade_from_0_1_0 -- --ignored --nocapture
+
   macos:
     # 已知红：#[cfg(unix)] 的共享内存与进程查询实现是 Linux 专用（/dev/shm、
     # /proc），macOS 上 3 个 lib 测试失败——待有 macOS 真机的贡献者完成支持，

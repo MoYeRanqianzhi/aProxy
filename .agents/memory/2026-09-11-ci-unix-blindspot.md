@@ -53,8 +53,10 @@ install 功能收尾汇报「204 项测试全绿 + 已推送」时，`main` 分�
 三个独立 job：`windows`（clippy + test）、`ubuntu`（clippy + test）、`macos`
 （只跑 test，已知红，没有设 continue-on-error，红色就表示 macOS 支持未完成）。
 test 与 clippy 一律带 `--workspace`。判断能否收尾时按 job 看结论：`windows` 与
-`ubuntu` 是门禁，必须绿；`macos` 红属预期，但要确认失败的仍是已知的 3 个测试，
-没有新增失败（`gh run view <id> --job <job-id> --log-failed`）。
+`ubuntu` 是门禁，必须绿；`macos` 红属预期，但要确认失败的仍是已知的那一类——依赖 `/dev/shm`
+或 `/proc` 的测试（2026-10-06 为 5 个：survey 无响应实例、两个 announce 测试、claim 身份、心跳读写），
+没有新增别的失败（`gh run view <id> --log-failed | grep FAILED`）。2026-10-06 起另有
+`upgrade-from-0-1-0` 任务（windows + ubuntu）跑真实 v0.1.0 驱动的升级。
 Recheck when：ci.yml 的 job 结构变化，或 macOS 支持完成。
 
 ## 复发（2026-10-06，IPC 提交 B faf551d 后 ubuntu 连红三次）

@@ -19,8 +19,6 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] **去掉 alpha 时代的兼容写法**：用户定调——之前是 alpha、几乎零用户，不兼容合情合理；2026-10-06 补充：把 0.1.0 当作真正的第一版，不需要任何更早版本的兼容。已知清单（2026-10-06 grep `旧版|兼容|legacy` 所得，删前逐项确认它只服务 alpha 而非 0.1.0 的格式）：config 的 `upstream_url` 别名（src/config.rs:156 及测试 `legacy_upstream_url_field_still_loads`）；`.restore` 旧格式「纯 args 数组」的读侧兼容（src/daemon.rs:850-881）；注册表/IPC 响应缺 `process_start` / `last_activity_secs` 的「旧版本守护」分支（daemon.rs、watchdog.rs、commands/status.rs、stop.rs、restart.rs）；install/broadcast.rs 对不认识 PrepareSwap 的旧实例的处理；IPC `ipc_proto_v1_default`；保留字 `defult` 笔误别名（算不算兼容需判定）；skill compatibility.md 的 alpha 逐版差异。连同对应测试与文档一起删
 - [ ] **IPC 设计整理与优化**：在下一版发布前通盘审视命名管道 / Unix socket 控制通道——请求/响应模型（src/daemon.rs 的 `IpcRequest`/`IpcResponse`）、协议版本字段、错误模型、端点命名与归属证明、注册表文件（run/ 下的实例记录、.restore、socket）与看门狗/install 的交互。先出设计文档、对齐后再改；与上一条一并做（兼容分支删掉后协议才好收敛）。用户 2026-10-06 定：重新整理格式后协议版本号从 1 重新计数，之前的版本号一律不作数。注意升级路径：`aproxy install` 由新 CLI 经 IPC 通知在跑的旧实例（PrepareSwap 等），若新协议与 0.1.0 实例不通，0.1.0 → 下一版的原地升级会受影响——设计时必须给出这条路径怎么走，并向用户说明
 - [ ] **自定义心跳 + format 扩展（设计中）**：用户要求——默认继续用 `: keepalive` 注释；增加可自定义心跳（静态配置）；format 继续拓展，心跳可由 format 按内容动态生成；深入思考 aProxy 的哪些配置/决策点可以与 format 搭配，实现高自由度扩展。设计要点草稿：信封加 `stage`（request/response/heartbeat…）与按请求唯一的 id；用 format 返回、aProxy 按请求保存并回传的不透明 `state` 解决「请求/心跳/响应转换器是不同进程、无共享状态」；心跳 format 可配合响应 format 发真实协议事件（能重置事件级空闲超时）。设计定稿前先给用户看
-- [ ] 保活已提交后的 response_transform 与请求转换不在心跳节拍内（transform timeout_secs = 0 时字节间隔无上界）；identity 改写静默覆盖 override_headers 里用户配的 accept-encoding，启动时 warn 一次即可（WS-1b 审查 P3-5、P3-6）
-- [ ] doctor 测试不隔离主目录——`doctor::run` 的目录扫描、默认配置与运行实例端口检查都从进程环境的 APROXY_HOME（未设 = ~/.aproxy）推导，开发机上 `doctor_clean_when_all_good` 会读到真实配置、可能误报失败。修法方向：从 settings.json 所在目录推导主目录并逐层传参。跑全量测试前先把 APROXY_HOME 指向临时目录可规避
 
 ## 暂缓（等真实用户反馈）
 

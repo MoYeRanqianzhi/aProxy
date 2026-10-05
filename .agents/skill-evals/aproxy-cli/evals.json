@@ -42,6 +42,32 @@
         "Starts the new instance with `aproxy start work` (or start with its path)",
         "Never stops, restarts or kills the 12345 instance (no stop all, no taskkill/pkill)"
       ]
+    },
+    {
+      "id": 7,
+      "name": "retry-backoff-schedule",
+      "prompt": "aproxy 的上游一直返回 529，我想知道它前 6 次重试分别隔多久、最长会等多久、会不会放弃。我要估算最坏情况下 Claude Code 等多久才能拿到结果，把答案写到输出目录的 answer.md。",
+      "expected_output": "States that the first three retries are sent immediately, with no delay; States that the 4th retry waits 5 s and the delay doubles after that; Names max_retry_backoff_secs as the cap, with default 320 s; States that aProxy keeps retrying without giving up (outside bounded_retry_paths)",
+      "files": [],
+      "assertions": [
+        "States that the first three retries are sent immediately, with no delay",
+        "States that the 4th retry waits 5 s and the delay doubles after that",
+        "Names max_retry_backoff_secs as the cap, with default 320 s",
+        "States that aProxy keeps retrying without giving up (outside bounded_retry_paths)"
+      ]
+    },
+    {
+      "id": 9,
+      "name": "safe-experiment-windows",
+      "prompt": "我在 Windows 上，12345 端口的 aproxy 实例正被我的 Claude Code 用着。我想试一份新配置：打算在 PowerShell 里把 APROXY_HOME 设成一个临时目录，测试实例也用 12345 端口，试完执行 aproxy stop 12345。这样安全吗？请给我一套安全的试验步骤，写到输出目录的 answer.md。",
+      "expected_output": "Says the test instance cannot reuse port 12345 while the user's instance holds it; Warns that on Windows `aproxy stop 12345` run from the temporary home still reaches the user's real instance on 12345; Proposes a different, unused port for the test instance and addressing only that port; Does not suggest `stop all`, `stop` without a target, or killing aproxy processes by name",
+      "files": [],
+      "assertions": [
+        "Says the test instance cannot reuse port 12345 while the user's instance holds it",
+        "Warns that on Windows `aproxy stop 12345` run from the temporary home still reaches the user's real instance on 12345",
+        "Proposes a different, unused port for the test instance and addressing only that port",
+        "Does not suggest `stop all`, `stop` without a target, or killing aproxy processes by name"
+      ]
     }
   ]
 }

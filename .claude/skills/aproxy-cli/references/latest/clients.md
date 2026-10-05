@@ -8,8 +8,12 @@ behaviors.md; symptoms are in troubleshooting.md.
 ## Setup checklist
 
 1. **Find the instance.** Run `aproxy status` and note the port (`监听 http://…`, "listening on") and the
-   upstream (`上游 …`). If no instance serves the upstream this client should use, configure and start
-   one first (commands.md, config-toml.md).
+   upstream (`上游 …`). If the user names an instance, use that one. An instance forwards to a single
+   upstream, so clients that speak different protocols (Claude Code speaks Anthropic Messages, Codex
+   speaks OpenAI Responses) can share it only if that upstream serves both, as many relays do. When
+   you cannot tell, set the clients up as the user asked, say what would break if the upstream lacks a
+   protocol, and offer a second instance as an option instead of switching to one on your own. If no
+   instance exists yet, configure and start one first (commands.md, config-toml.md).
 2. **Point the client at it, with each path prefix in one place.** aProxy forwards to `base_url`
    followed by the client's path exactly as received. Set aProxy's `base_url` to the upstream's root
    and give the client the aProxy address where it would otherwise name that root:

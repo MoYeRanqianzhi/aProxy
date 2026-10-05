@@ -22,10 +22,6 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] 看门狗崩溃恢复延迟（2026-10-06 rw-behaviors 读码发现，未实测）：`watchdog::serve` 只在扫描周期（默认 30s）或待重试截止时醒来（src/watchdog.rs 约 980-1000 行），死亡事件要等下一拍才处理，崩溃实例最长约一个扫描周期后才被拉起，旧文档写的「约 1 秒」不成立。考虑让主循环同时等死亡事件通道；改前先实测确认
 - [ ] **自定义心跳 + format 扩展（设计中）**：用户要求——默认继续用 `: keepalive` 注释；增加可自定义心跳（静态配置）；format 继续拓展，心跳可由 format 按内容动态生成；深入思考 aProxy 的哪些配置/决策点可以与 format 搭配，实现高自由度扩展。设计要点草稿：信封加 `stage`（request/response/heartbeat…）与按请求唯一的 id；用 format 返回、aProxy 按请求保存并回传的不透明 `state` 解决「请求/心跳/响应转换器是不同进程、无共享状态」；心跳 format 可配合响应 format 发真实协议事件（能重置事件级空闲超时）。设计定稿前先给用户看
 
-## 暂缓（等真实用户反馈）
-
-- [ ] 让 Gemini 流也能保活——可配置的按路径/查询触发保活 + 可选心跳格式（空行而非注释）。用户 2026-10-06：Gemini 太小众、问题场景也未确定，等真用户反馈再说。若做「自定义心跳 + format 扩展」，按请求决定是否保活可由 format 承担，届时再评估（见 gemini-cli-sse-parsing 记忆）。2026-10-06 补充（rw-behaviors 读 gemini-cli v0.62.0 源码，未实测）：新版 Gemini CLI 的响应头超时写死为 60s（core/src/utils/fetch.ts:33），而 aProxy 对它的流请求要等完整成功才回响应头——经 aProxy 时重试加生成超过约 1 分钟的请求都会在客户端超时，比 0.35.3 的 300s 更严重；clients.md 已如实写明
-
 ## 外部转换器（format）+ aproxy-format（2026-09-23 下令，2026-09-30 完成）
 
 - [x] **Workflow 全链审查 + 处置闭环（2026-09-30，用户下令「分配 workflow

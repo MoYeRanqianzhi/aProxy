@@ -39,6 +39,18 @@
         "Both request_transform and response_transform run aproxy-format in persistent mode with extra pointing at the aggregation file",
         "States that cross-protocol conversion does not cover streaming responses, so Claude Code's streaming requests will not convert"
       ]
+    },
+    {
+      "id": 11,
+      "name": "reply-without-body",
+      "prompt": "我写了个 aproxy 的 format 程序，只想改请求的 authorization 头，所以回传的信封里只放了 headers（改过的完整头表），没放 body，这样行吗？会有什么后果？答案写到输出目录的 answer.md。",
+      "expected_output": "Says that a reply without body or body_b64 makes aProxy send an empty body upstream; Tells the user to write the whole envelope back, with only authorization changed; Says headers is required and that the headers returned replace the request's headers",
+      "files": [],
+      "assertions": [
+        "Says that a reply without body or body_b64 makes aProxy send an empty body upstream",
+        "Tells the user to write the whole envelope back, with only authorization changed",
+        "Says headers is required and that the headers returned replace the request's headers"
+      ]
     }
   ]
 }

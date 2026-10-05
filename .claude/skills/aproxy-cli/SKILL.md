@@ -57,7 +57,9 @@ instance takes every other session that uses it down too.
 
 ### Connect an agent client
 
-1. Make sure an instance is running and note its port: `aproxy status`.
+1. Make sure an instance is running and note its port: `aproxy status`. Use the instance the user
+   names. One instance has one upstream, so clients with different protocols share it only if that
+   upstream serves both; if unsure, say so and offer a second instance rather than switching.
 2. Point the client's API base URL at `http://127.0.0.1:PORT` (with `/v1` appended where the client
    expects it, as Codex does).
 3. Raise the client's event-level stream idle timeout. Without this, any retry period or long

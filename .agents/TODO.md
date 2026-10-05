@@ -11,13 +11,20 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 发布计划已结束并删除，最后版本见 `git show 58e62cd:.agents/plan/release-0.1.0.md`；审查依据见
 `.agents/review/2026-10-04-0.1.0发布前-13维审查.md`。
 
-## 0.1.x 后续
+## 下一版发布前（2026-10-06 用户下令）
 
-- [ ] 0.1.0 之后：`read_request_body`（src/proxy.rs:472 附近）上传请求体落盘时只在显式错误分支删文件，handler future 写盘中途被 drop 可能残留 req-*.spooltmp 到重启（与已修的响应 spool 同类；仅读代码判断，未复现）
-- [ ] 0.1.x 候选：断开提示日志泛化——`src/proxy.rs` 现只在已提交响应等待 ≥590s 后断开时提示 CLAUDE_STREAM_IDLE_TIMEOUT_MS；Codex 默认 300s 就断开，触发不到。改为「客户端在只有心跳的等待中断开」即提示检查客户端的流空闲超时（不点名、不按客户端特判），见 behaviors.md「接入 agent 客户端」
-- [ ] 0.1.x 候选：让 Gemini 流也能保活——可配置的按路径/查询触发保活（正则，参照 bounded_retry_paths，不内置 URL）+ 可选心跳格式（空行而非注释：Gemini CLI 锁定的 @google/genai 1.30.0 遇注释吞掉整段响应，空行实测无害）。需先评估空行心跳对其他客户端的影响（见 gemini-cli-sse-parsing 记忆）
-- [ ] 0.1.0 之后：保活已提交后的 response_transform 与请求转换不在心跳节拍内（transform timeout_secs = 0 时字节间隔无上界）；identity 改写静默覆盖 override_headers 里用户配的 accept-encoding，可考虑打一次日志（WS-1b 审查 P3-5、P3-6）
-- [ ] 0.1.0 之后：doctor 测试不隔离主目录——`doctor::run` 的目录扫描、默认配置与运行实例端口检查都从进程环境的 APROXY_HOME（未设 = ~/.aproxy）推导，开发机上 `doctor_clean_when_all_good` 会读到真实配置、可能误报失败。修法方向：从 settings.json 所在目录推导主目录并逐层传参。跑全量测试前先把 APROXY_HOME 指向临时目录可规避
+用户原则：发布前每一部分都要做到足够优秀，好的设计能避免发布后才发现问题、再改动带来的连锁问题。
+
+- [ ] **skill 按 skill-creator 标准重写（进行中）**：aproxy-cli 与 aproxy-format 两个 skill 全部改为英文，并按标准重写写法，不是直接翻译——面向操作 aProxy 的 agent 而非维护者；用「说明原因」替代成堆的「必须/铁律」；去掉版本史与维护者内容；补上操作安全（agent 自己的会话可能就经 aproxy 转发，stop/restart/按名杀进程会切断自己）。用 skill-creator 的评测流程验证（新旧 skill 对照）
+- [ ] **去掉 alpha 时代的兼容写法**：用户定调——之前是 alpha、几乎零用户，不兼容合情合理。已知清单（2026-10-06 grep `旧版|兼容|legacy` 所得，删前逐项确认它只服务 alpha 而非 0.1.0 的格式）：config 的 `upstream_url` 别名（src/config.rs:156 及测试 `legacy_upstream_url_field_still_loads`）；`.restore` 旧格式「纯 args 数组」的读侧兼容（src/daemon.rs:850-881）；注册表/IPC 响应缺 `process_start` / `last_activity_secs` 的「旧版本守护」分支（daemon.rs、watchdog.rs、commands/status.rs、stop.rs、restart.rs）；install/broadcast.rs 对不认识 PrepareSwap 的旧实例的处理；IPC `ipc_proto_v1_default`；保留字 `defult` 笔误别名（算不算兼容需判定）；skill compatibility.md 的 alpha 逐版差异。连同对应测试与文档一起删
+- [ ] **IPC 设计整理与优化**：在下一版发布前通盘审视命名管道 / Unix socket 控制通道——请求/响应模型（src/daemon.rs 的 `IpcRequest`/`IpcResponse`）、协议版本字段、错误模型、端点命名与归属证明、注册表文件（run/ 下的实例记录、.restore、socket）与看门狗/install 的交互。先出设计文档、对齐后再改；与上一条一并做（兼容分支删掉后协议才好收敛）
+- [ ] **自定义心跳 + format 扩展（设计中）**：用户要求——默认继续用 `: keepalive` 注释；增加可自定义心跳（静态配置）；format 继续拓展，心跳可由 format 按内容动态生成；深入思考 aProxy 的哪些配置/决策点可以与 format 搭配，实现高自由度扩展。设计要点草稿：信封加 `stage`（request/response/heartbeat…）与按请求唯一的 id；用 format 返回、aProxy 按请求保存并回传的不透明 `state` 解决「请求/心跳/响应转换器是不同进程、无共享状态」；心跳 format 可配合响应 format 发真实协议事件（能重置事件级空闲超时）。设计定稿前先给用户看
+- [ ] 保活已提交后的 response_transform 与请求转换不在心跳节拍内（transform timeout_secs = 0 时字节间隔无上界）；identity 改写静默覆盖 override_headers 里用户配的 accept-encoding，启动时 warn 一次即可（WS-1b 审查 P3-5、P3-6）
+- [ ] doctor 测试不隔离主目录——`doctor::run` 的目录扫描、默认配置与运行实例端口检查都从进程环境的 APROXY_HOME（未设 = ~/.aproxy）推导，开发机上 `doctor_clean_when_all_good` 会读到真实配置、可能误报失败。修法方向：从 settings.json 所在目录推导主目录并逐层传参。跑全量测试前先把 APROXY_HOME 指向临时目录可规避
+
+## 暂缓（等真实用户反馈）
+
+- [ ] 让 Gemini 流也能保活——可配置的按路径/查询触发保活 + 可选心跳格式（空行而非注释）。用户 2026-10-06：Gemini 太小众、问题场景也未确定，等真用户反馈再说。若做「自定义心跳 + format 扩展」，按请求决定是否保活可由 format 承担，届时再评估（见 gemini-cli-sse-parsing 记忆）
 
 ## 外部转换器（format）+ aproxy-format（2026-09-23 下令，2026-09-30 完成）
 

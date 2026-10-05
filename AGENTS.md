@@ -77,6 +77,8 @@ This is an open-source team project whose code is read by contributors' agents a
 
 Tag versions as vMAJOR.MINOR.PATCH, such as v1.0.0, appending -alpha.N, -beta.N, or -rc.N for pre-releases.
 
+Skills under .claude/skills/ ship with every release and are read by the agents that operate aProxy for its users. Write them in English and to the skill-creator standard: progressive disclosure, imperative instructions that explain why rather than stacking MUSTs, and content aimed at the agent using the tool, not at maintainers or at the history of how it was built. Translating writing that misses this standard does not fix it.
+
 Project documentation lives in the README and ./docs/ and serves the people who use and develop the project. Not every project needs it; write it for those readers, never as a record of agent work, and keep it true when a change alters what it describes.
 
 # git_workflow

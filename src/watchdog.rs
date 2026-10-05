@@ -495,7 +495,10 @@ impl WatchdogState {
             }
             // 心跳过期：IPC ping 二意见（3s 超时 ×1——已在 3× 周期容忍之后，
             // ping 内部还有 3 次重试判死语义）
-            if crate::daemon::ipc_ping(&w.port).await.is_ok() {
+            if crate::daemon::ipc_ping_in(&self.cfg.run_dir, &w.port)
+                .await
+                .is_ok()
+            {
                 continue; // runtime 活着（可能调度延迟），下轮再看
             }
             // 防误杀关卡：「主动杀」前的既定验证。pid 若被复用给无关进程，

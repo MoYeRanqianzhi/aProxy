@@ -218,7 +218,9 @@ fn install_from_with_instance_rolling_restart_and_relay() {
         .enable_all()
         .build()
         .unwrap()
-        .block_on(async { aproxy::daemon::ipc_ping(&env.port.to_string()).await });
+        .block_on(async {
+            aproxy::daemon::ipc_ping_in(&env.home().join("run"), &env.port.to_string()).await
+        });
     let info = live.expect("滚动后实例应可 ping");
     assert_ne!(info.pid, old_pid, "实例应已滚动到新 pid");
     assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
@@ -359,7 +361,9 @@ fn adopt_migrates_foreign_instance() {
         .enable_all()
         .build()
         .unwrap()
-        .block_on(async { aproxy::daemon::ipc_ping(&env.port.to_string()).await })
+        .block_on(async {
+            aproxy::daemon::ipc_ping_in(&env.home().join("run"), &env.port.to_string()).await
+        })
         .expect("收编后实例应可 ping");
     assert_ne!(live.pid, old_pid);
     // 新实例的镜像在 bin 下（收编完成的事实）

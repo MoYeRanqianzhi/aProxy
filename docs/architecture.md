@@ -16,8 +16,11 @@ agent 软件 ──HTTP──▶ [代理端口 12345] ──重试循环──�
 ```
 
 **铁律：代理端口完全用于透传。** 所有控制通信（ping/shutdown）走独立命名管道
-`\\.\pipe\aproxy-<端口>`（unix 为 `~/.aproxy/run/<端口>.sock`），杜绝控制路径与
-客户端请求路径重叠。
+`\\.\pipe\aproxy-<home_id>-<端口>`（unix 为 `<run 目录>/<端口>.sock`），杜绝控制路径与
+客户端请求路径重叠。`home_id` 是 run 目录规范化路径的 SHA-256 前 16 位十六进制：
+Windows 的管道名全机共享，带上它，一个 home（`APROXY_HOME`）的命令就只能控制本
+home 的实例。新实例同时在 0.1.0 的管道名 `\\.\pipe\aproxy-<端口>` 上应答，供 0.1.0
+的 CLI 与安装器在升级窗口里找到它（`src/compat_0_1_0.rs`，0.2.0 删除）。
 
 上图的「重试循环 / spool / 回放」是默认模式的主流程；`forward_only` 模式下这两
 环整体旁路（见「仅转发模式（forward_only）」）。

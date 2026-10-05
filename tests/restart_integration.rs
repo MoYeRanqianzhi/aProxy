@@ -59,40 +59,18 @@ impl Drop for RestartGuard {
     }
 }
 
-/// 对运行在隔离主目录里的守护做 IPC ping：unix 的 UDS socket 在 home/run/
-/// 下，测试进程（默认主目录）的 ipc_ping 会找错位置，须显式按守护实际的
-/// socket 路径寻址；Windows 管道名全局唯一，忽略该参数。
+/// 对运行在隔离主目录里的守护做 IPC ping：端点属于 run 目录（unix 的 socket
+/// 在 home/run/ 下，Windows 的管道名带 run 目录标识），测试进程（默认主目录）
+/// 的 ipc_ping 会找错位置，须显式给目录。
 fn ipc_ping_in_dir(
     rt: &tokio::runtime::Runtime,
     port: u16,
-    #[cfg(unix)] home_dir: &std::path::Path,
-    #[cfg(windows)] _home_dir: &std::path::Path,
+    home_dir: &std::path::Path,
 ) -> Result<aproxy::daemon::InstanceInfo, String> {
-    #[cfg(windows)]
-    let endpoint = aproxy::daemon::endpoint_for(&port.to_string());
-    #[cfg(unix)]
-    let endpoint = home_dir
-        .join("run")
-        .join(format!("{}.sock", port))
-        .display()
-        .to_string();
-    rt.block_on(async {
-        let mut last = String::new();
-        for attempt in 0..3 {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            match aproxy::daemon::ipc_request_to(&endpoint, &aproxy::daemon::IpcRequest::Ping).await
-            {
-                Ok(resp) if resp.ok => {
-                    return resp.info.ok_or_else(|| "实例响应缺少信息".to_string());
-                }
-                Ok(_) => last = "实例返回失败".to_string(),
-                Err(e) => last = e,
-            }
-        }
-        Err(last)
-    })
+    rt.block_on(aproxy::daemon::ipc_ping_in(
+        &home_dir.join("run"),
+        &port.to_string(),
+    ))
 }
 
 /// 等待端口就绪：TCP 可连 + IPC ping 确认是自家守护（端点名含端口，

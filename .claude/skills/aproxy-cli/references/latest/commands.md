@@ -46,15 +46,17 @@ aproxy stop 18080
 ```
 
 In PowerShell, set `$env:APROXY_HOME = "$env:TEMP\aproxy-test"` first. A separate home gives the
-experiment its own configs, settings, registry, logs and watchdog, and `status`, `stop all` and
-`stop idle` see only instances registered in it.
+experiment its own configs, settings, registry, logs, watchdog and control channel: `status`,
+`stop`, `restart` and `logs` under it see only instances started under it, so `aproxy stop 12345`
+there cannot stop the user's instance on 12345.
 
-**On Windows the port is still shared.** Each instance's control pipe is named after its port
-(`\\.\pipe\aproxy-<port>`) for the whole machine, so under a test home `aproxy stop 12345`,
-`restart 12345` and `logs 12345` reach the user's instance on port 12345, and `start` on that port
-reports it as already running. Pick an unused port and address test instances only by that port.
-On Linux and macOS the control socket lives in the run directory, so a separate home isolates
-control as well.
+**The port is still shared.** Ports belong to the whole machine, so a test instance on a port
+another instance listens on fails to start with `端口 <port> 被其他程序占用` ("port in use by
+another program"). Pick a port nothing uses.
+
+With a 0.1.0 binary the control channel is not isolated on Windows: its pipe is named after the
+port alone, so under a test home `stop 12345`, `restart 12345` and `logs 12345` reach the user's
+instance on 12345. Address test instances only by their own port there.
 
 ### Targets
 

@@ -179,9 +179,10 @@ pub(crate) async fn handle_start_cmd(
         return;
     }
 
-    // 预检 1：同端口是否已有 aProxy 实例（IPC 探测，不经代理端口）。管道名只含
-    // 端口号，同端口不同监听地址的另一实例也会应答——此时实例键（端口号）无法
-    // 区分两者，注册表与 IPC 管道会互相顶替（stop 会停错实例），必须明确拒绝。
+    // 预检 1：本 home 同端口是否已有 aProxy 实例（IPC 探测，不经代理端口）。
+    // 端点按 home + 端口命名，同端口不同监听地址的另一实例也会应答——此时实例键
+    // （端口号）无法区分两者，注册表与 IPC 端点会互相顶替（stop 会停错实例），
+    // 必须明确拒绝。别的 home 的同端口实例这里看不到，由预检 2 的 bind 失败拦下。
     if let Ok(info) = daemon::ipc_ping(&port).await {
         if info.listen_addr == listen_addr {
             println!("此端口已有 aProxy 在运行，无需重复启动：");

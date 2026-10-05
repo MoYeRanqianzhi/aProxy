@@ -4795,6 +4795,98 @@ fn hung_instance_is_reported_and_only_force_stops_it() {
 }
 
 #[test]
+fn stop_from_another_home_does_not_reach_this_instance() {
+    // 控制端点属于 run 目录：另一个 home 里的 `aproxy stop <同端口>` 必须找不到
+    // 本 home 的实例、以 1 退出，实例照常服务。曾经 Windows 的管道名只含端口、
+    // 全机共享——用隔离 home 做实验时 `stop 12345` 会停掉用户正在用的实例。
+    // 守护同时在 0.1.0 的旧管道名上应答（升级兼容），这里一并确认那条路没有
+    // 把跨 home 的口子重新打开
+    let home_a = tempfile::tempdir().unwrap();
+    let home_b = tempfile::tempdir().unwrap();
+    for home in [&home_a, &home_b] {
+        std::fs::write(home.path().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+    }
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let port_s = port.to_string();
+    let cfg_file = home_a.path().join("a.toml");
+    std::fs::write(
+        &cfg_file,
+        format!("base_url = \"https://home-a.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
+    )
+    .unwrap();
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+    let run_in = |home: &tempfile::TempDir, args: &[&str]| {
+        Command::new(exe)
+            .args(args)
+            .env("APROXY_HOME", home.path())
+            .output()
+            .unwrap()
+    };
+
+    let started = run_in(&home_a, &["start", "--config", cfg_file.to_str().unwrap()]);
+    assert!(
+        started.status.success(),
+        "start 应成功: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let _guard = DaemonGuard {
+        exe,
+        port,
+        home_dir: Some(home_a.path().to_path_buf()),
+    };
+
+    let status_b = run_in(&home_b, &["status"]);
+    assert!(
+        !String::from_utf8_lossy(&status_b.stdout).contains(&port_s),
+        "另一个 home 的 status 不应列出本实例: {}",
+        String::from_utf8_lossy(&status_b.stdout)
+    );
+    let stop_b = run_in(&home_b, &["stop", &port_s]);
+    assert_eq!(
+        stop_b.status.code(),
+        Some(1),
+        "另一个 home 里找不到该端口的实例，应以 1 退出: {}{}",
+        String::from_utf8_lossy(&stop_b.stdout),
+        String::from_utf8_lossy(&stop_b.stderr)
+    );
+    assert!(
+        wait_daemon_ready_in(&home_a.path().join("run"), port),
+        "另一个 home 的 stop 不得停掉本实例"
+    );
+    // 另一个 home 在同端口启动：看不到 A 的实例，只能撞上端口占用而失败
+    let cfg_b = home_b.path().join("b.toml");
+    std::fs::write(
+        &cfg_b,
+        format!("base_url = \"https://home-b.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
+    )
+    .unwrap();
+    let start_b = run_in(&home_b, &["start", "--config", cfg_b.to_str().unwrap()]);
+    assert_eq!(
+        start_b.status.code(),
+        Some(1),
+        "同端口已被另一个 home 的实例占用，启动应失败: {}{}",
+        String::from_utf8_lossy(&start_b.stdout),
+        String::from_utf8_lossy(&start_b.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&start_b.stderr).contains("被其他程序占用"),
+        "{}",
+        String::from_utf8_lossy(&start_b.stderr)
+    );
+
+    let stop_a = run_in(&home_a, &["stop", &port_s]);
+    assert!(
+        stop_a.status.success(),
+        "本 home 的 stop 应停掉实例: {}",
+        String::from_utf8_lossy(&stop_a.stderr)
+    );
+}
+
+#[test]
 fn cli_config_show_rejects_missing_explicit_file() {
     // 与写操作对照：--show / 无修改参数对「显式 --config 指向的不存在文件」
     // 必须报错——此时展示的只是内置默认值（抬头却是用户给的路径），静默回退
@@ -4839,9 +4931,10 @@ fn cli_config_show_rejects_missing_explicit_file() {
 /// 失败。危害不止一个端口：同一进程内所有守护测试共用同一 base，一挂就是一整片，
 /// 实测约一成多的整套运行会因此变红（与实现无关的假失败，最坏时被当成回归）。
 ///
-/// 步长取 16 而非 1：offset 实际只用 0..=14（必须 < 16），故不同 offset 落在不同的模 16 余数
+/// 步长取 16 而非 1：offset 只能取 0..=15（必须 < 16），故不同 offset 落在不同的模 16 余数
 /// 类里，「每个测试用不同端口」的既有约束得以保持——顺带还能跳过正被其他测试的
-/// 残留守护占用的端口。
+/// 残留守护占用的端口。16 个 offset 已全部占用，新测试改向系统要一个空闲端口
+/// （绑定 127.0.0.1:0 再释放，见 `stop_from_another_home_does_not_reach_this_instance`）。
 fn daemon_test_port(offset: u32) -> u16 {
     let base = 25000 + (std::process::id() % 20000) * 2;
     // 96 步 × 16 = 1536 宽的窗口：本机最宽的连续排除块（50000-51059，1060 宽）
@@ -4911,8 +5004,8 @@ fn wait_daemon_ready(port: u16) -> bool {
 /// unix 的 IPC 端点是 `<run_dir>/<端口>.sock`，测试进程自身没有设置
 /// APROXY_HOME（只注入给子进程），无参的 `ipc_ping` 会去测试进程默认主目录
 /// 的 run/ 下找 socket，对隔离 home 里的守护永远 ping 不到（ubuntu CI 上
-/// restore 测试因此恒红）。Windows 管道名全局唯一、忽略 run_dir，所以这个
-/// 错误在 Windows 上被掩盖。
+/// restore 测试因此恒红）。Windows 的管道名同样带 run 目录标识，两个平台
+/// 一致。
 fn wait_daemon_ready_in(run_dir: &std::path::Path, port: u16) -> bool {
     let port_str = port.to_string();
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -5395,24 +5488,9 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     // 都以它为准——测试进程自身没有 APROXY_HOME，任何无参 IPC 调用都会落到
     // 测试进程的默认主目录，而不是这里
     let run_dir = home.join("run");
-    // 隔离前置清理：上次失败运行可能残留监听同端口的守护（其隔离 tempdir
-    // 已删、注册表不可达）。**只在 Windows 上能清到**：命名管道按端口落在
-    // 系统全局命名空间、与 home 无关，ping 到即按上报 pid 强杀。unix 的 UDS
-    // 在上次运行的（已删除的）tempdir 里，任何路径都 ping 不到它——此处按
-    // 本次 run_dir 寻址只是保证不会误 ping（继而误杀）默认主目录下同端口的
-    // 其他实例；残留守护仍占着的端口本就会被 daemon_test_port 的可绑定性
-    // 试探跳过。随后全局默认目录再兜底 stop 一次
-    {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("创建测试 tokio runtime 失败");
-        if let Ok(info) = rt.block_on(aproxy::daemon::ipc_ping_in(&run_dir, &port_str)) {
-            kill_pid(info.pid);
-            std::thread::sleep(Duration::from_millis(200));
-        }
-    }
-    let _ = Command::new(exe).args(["stop", &port_str]).output();
+    // 不做前置清理：上次失败运行残留的守护属于那次的 tempdir home，控制端点
+    // 按 run 目录划分命名空间，本次的 home 寻址不到它（也就不会误停别人的
+    // 实例）；它仍占着的端口已被 daemon_test_port 的可绑定性试探跳过
     let restore_path = aproxy::daemon::restore_file_path_in(&run_dir, &format!("127.0.0.1:{port}"));
 
     // 隔离启动：start 父进程注入 APROXY_HOME，守护隔代继承（port_zero 同款）。
@@ -6341,40 +6419,18 @@ fn watchdog_lease_prevents_duplicate_watchdogs() {
     let _ = std::fs::remove_file(dir.path().join("run").join("watchdog.claim"));
 }
 
-/// 对运行在隔离主目录里的守护做 IPC ping：unix 的 UDS socket 路径在
-/// home/run/ 下（endpoint_for 解析依赖进程环境，库调用方须显式给目录）；
-/// Windows 管道名全局唯一，主目录只影响注册表文件，端点忽略该参数。
+/// 对运行在隔离主目录里的守护做 IPC ping：端点属于 run 目录（unix 的 socket
+/// 在 home/run/ 下，Windows 的管道名带 run 目录标识），测试进程自身没有设置
+/// APROXY_HOME，无参的 ipc_ping 会去默认主目录找，须显式给目录。
 fn ipc_ping_in_dir(
     rt: &tokio::runtime::Runtime,
     port: u16,
-    #[cfg(unix)] home_dir: &std::path::Path,
-    #[cfg(windows)] _home_dir: &std::path::Path,
+    home_dir: &std::path::Path,
 ) -> Result<aproxy::daemon::InstanceInfo, String> {
-    #[cfg(windows)]
-    let endpoint = aproxy::daemon::endpoint_for(&port.to_string());
-    #[cfg(unix)]
-    let endpoint = home_dir
-        .join("run")
-        .join(format!("{}.sock", port))
-        .display()
-        .to_string();
-    rt.block_on(async {
-        let mut last = String::new();
-        for attempt in 0..3 {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            match aproxy::daemon::ipc_request_to(&endpoint, &aproxy::daemon::IpcRequest::Ping).await
-            {
-                Ok(resp) if resp.ok => {
-                    return resp.info.ok_or_else(|| "实例响应缺少信息".to_string());
-                }
-                Ok(_) => last = "实例返回失败".to_string(),
-                Err(e) => last = e,
-            }
-        }
-        Err(last)
-    })
+    rt.block_on(aproxy::daemon::ipc_ping_in(
+        &home_dir.join("run"),
+        &port.to_string(),
+    ))
 }
 
 /// 强杀进程（模拟崩溃）：Windows taskkill /F；unix SIGKILL

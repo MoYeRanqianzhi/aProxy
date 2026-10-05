@@ -299,13 +299,16 @@ response: attempt judged successful -> response transform -> replay
 - An alias resolves to a config file path and finds the running instance by that path, so it keeps
   working after the port changes. A port target goes straight to that port's control endpoint and
   works even if the registry is lost.
-- Control channel: the Windows named pipe `\\.\pipe\aproxy-<port>`, or the Unix socket
-  `<home>/run/<port>.sock`. `status`, `stop`, `restart`, `logs` and `install` use it and never touch
-  the proxy port, which carries only proxied traffic. If the channel fails to start, the instance logs
+- Control channel: on Windows a named pipe whose name carries the port and an identifier of the
+  home's run directory, on Linux and macOS the socket `<home>/run/<port>.sock`. Either way it
+  belongs to one home: commands find only instances started under the same home. `status`, `stop`,
+  `restart`, `logs` and `install` use it and never touch the proxy port, which carries only proxied
+  traffic. If the channel fails to start, the instance logs
   `IPC 控制通道启动失败（aproxy stop/status 将不可用）` ("control channel failed to start; stop/status
   unavailable") and keeps proxying.
-- `aproxy status` lists only instances that answer on their control channel, and deletes registry
-  records of dead ones.
+- `aproxy status` lists instances that answer on their control channel, lists separately those whose
+  process is alive but does not answer (hung), and deletes registry records of processes that are
+  gone.
 
 ### Stopping
 
@@ -326,12 +329,12 @@ response: attempt judged successful -> response transform -> replay
 ### Isolated experiments
 
 `APROXY_HOME` replaces `~/.aproxy` as the home for the default config.toml, settings.json, `run/`,
-`logs/`, `spool/`, `bin/` and `skills/`; `APROXY_RUN_DIR` moves only `run/`. Neither isolates ports.
-On Windows the control pipe is named by port alone, so a test instance on a port that a real instance
-uses collides with it: `aproxy start` reports the real instance as already running, and
-`aproxy stop <port>` stops the real instance even from an isolated home. Run `aproxy status` without
-the override first and pick a port nothing uses. An isolated home also gets its own watchdog, which
-exits by itself some minutes after its last instance stops.
+`logs/`, `spool/`, `bin/` and `skills/`; `APROXY_RUN_DIR` moves only `run/`. The control channel
+follows the run directory, so commands under an isolated home cannot reach the user's instances.
+Neither isolates ports: a test instance on a port a real instance listens on fails to start as
+`被其他程序占用` ("in use by another program"). Run `aproxy status` without the override first and
+pick a port nothing uses. An isolated home also gets its own watchdog, which exits by itself some
+minutes after its last instance stops.
 
 ## Logs
 

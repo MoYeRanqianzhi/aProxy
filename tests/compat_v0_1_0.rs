@@ -105,8 +105,8 @@ fn pid_record_written_now_parses_as_0_1_0() {
     let info = new_instance("59601");
     aproxy::daemon::write_instance_file_in(dir.path(), &info).unwrap();
     let path = aproxy::daemon::instance_file_path_in(dir.path(), &info.listen_addr);
-    let old: v0_1_0::InstanceInfo = serde_json::from_str(&read(&path))
-        .expect("0.1.0 解析不了新版本的 .pid，会把它当损坏删掉");
+    let old: v0_1_0::InstanceInfo =
+        serde_json::from_str(&read(&path)).expect("0.1.0 解析不了新版本的 .pid，会把它当损坏删掉");
     assert_eq!(old.pid, info.pid);
     assert_eq!(old.version, info.version);
     assert_eq!(old.listen_addr, info.listen_addr);
@@ -208,7 +208,10 @@ fn watchdog_claim_round_trips_with_0_1_0() {
     .unwrap();
     let read_back = aproxy::watchdog::read_claim_in(other.path()).expect("应能读出 0.1.0 的 claim");
     assert_eq!(read_back.pid, written_by_old.pid);
-    assert_eq!(read_back.created_at_process, written_by_old.created_at_process);
+    assert_eq!(
+        read_back.created_at_process,
+        written_by_old.created_at_process
+    );
 }
 
 #[test]
@@ -216,7 +219,10 @@ fn ipc_requests_parse_as_0_1_0() {
     // 新版本的 CLI / 安装器发给 0.1.0 守护的请求行，0.1.0 必须认得出 op
     for (req, want) in [
         (aproxy::daemon::IpcRequest::Ping, v0_1_0::IpcRequest::Ping),
-        (aproxy::daemon::IpcRequest::Shutdown, v0_1_0::IpcRequest::Shutdown),
+        (
+            aproxy::daemon::IpcRequest::Shutdown,
+            v0_1_0::IpcRequest::Shutdown,
+        ),
         (
             aproxy::daemon::IpcRequest::PrepareSwap,
             v0_1_0::IpcRequest::PrepareSwap,

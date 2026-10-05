@@ -22,6 +22,18 @@ IPC 重新整理格式后协议版本从 1 重新计数。随后：「发现的�
   若干「旧版本」注释与对应测试。InstanceInfo 的 serde default、`IPC_PROTO_V1`、`Stats` op、status 的
   `proto_version >= 2` 留给第 3/4 步（拆 InstanceRecord 时一起改）。install.state 的 serde default 不删：
   它同时是「新字段加入」的前向兼容规则，删掉收益小。
+- 第 3 步（部分，提交 A）：Windows 管道按 run 目录命名空间 `\\.\pipe\aproxy-<home_id>-<端口>`
+  （`daemon::home_id`：规范化「最近的已存在祖先」再接上其余部分，目录建出前后标识不变）；
+  `ExchangeError {Unreachable, Failed}`；`src/compat_0_1_0.rs` 的 S1（守护同时在旧管道名应答）与 S2
+  （本 run 目录有该端口 `.pid`、旧管道应答者 pid 与非 0 创建时间都一致才回退，0 不认）。测试：T3a
+  （`stop_from_another_home_does_not_reach_this_instance`，含 B 里同端口 start 报占用；变异验证：去掉
+  命名空间后 B 的 stop 停掉了 A 的实例）、T3b（`home_id_separates_homes_and_is_stable_across_spellings`）、
+  T4f（`legacy_pipe_is_reached_only_for_a_matching_local_record`，变异验证 0 值检查）。第 3 步剩余：
+  启动不变式（IPC 先于注册表、IPC 失败致命）、unix 先探测再 unlink、sun_path 检查、普查核对应答者
+  pid、传输层对端 pid、claim 原子写；心跳节与安装宣告的命名空间（S5）在第 5 步。
+- 发现：proxy_integration 里 `home_dir: None` 的 6 个守护测试（daemon_lifecycle 等）跑在测试进程的
+  默认 home，也就是开发者真实的 `~/.aproxy`（注册表、日志、settings 的 watchdog 开关都是真的）。
+  要改成隔离 home + `{"watchdog": false}`，单独提交。
 - Linux 编译只能靠 CI 的 ubuntu 门禁：本机 WSL（Debian）的 rustup 工具链清单损坏，且 2026-10-06 WSL 内无外网
   （官方源与 rsproxy 均连接超时），修不了；本机也没有 Linux C 交叉编译器（ring 需要）。
 

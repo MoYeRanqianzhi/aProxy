@@ -49,10 +49,10 @@ instance takes every other session that uses it down too.
   will not stop, use `aproxy stop PORT --force`, which verifies the process identity first.
 - Ask before stopping or reconfiguring an instance the user did not mention.
 - To experiment, run a separate instance under a temporary `APROXY_HOME` on a port no other
-  instance uses, address it only by that port, and stop it when you are done. `APROXY_HOME` gives
-  the experiment its own configs, settings, logs and registry, but on Windows the control pipe is
-  named after the port for the whole machine: `stop 12345` from a test home still reaches the
-  user's instance on 12345. Details: commands.md, "Experiment in an isolated home".
+  instance uses, and stop it when you are done. `APROXY_HOME` gives the experiment its own configs,
+  settings, logs, registry and control channel, so commands run under it cannot reach the user's
+  instances; ports are still shared by the whole machine. A 0.1.0 binary does not isolate the
+  control channel on Windows. Details: commands.md, "Experiment in an isolated home".
 
 ## Common tasks
 

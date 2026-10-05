@@ -17,13 +17,12 @@ use std::time::Duration;
 /// 内部 3 次探测（间隔 500ms）吸收命名管道瞬时 busy 等瞬态失败。
 /// unix 端点按显式 run_dir 派生（与库层其他 IPC 调用同一纪律）。
 pub async fn ack_one(run_dir: &Path, port: &str) -> Result<(), String> {
-    let endpoint = crate::daemon::endpoint_for_in(run_dir, port);
     let mut last = String::new();
     for attempt in 0..3 {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        match crate::daemon::ipc_request_to(&endpoint, &crate::daemon::IpcRequest::PrepareSwap)
+        match crate::daemon::ipc_request_in(run_dir, port, &crate::daemon::IpcRequest::PrepareSwap)
             .await
         {
             // 响应里的 info 是实例置位后组装的——ok 即 ACK 完成

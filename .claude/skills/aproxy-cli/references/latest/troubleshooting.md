@@ -38,7 +38,7 @@ the aproxy-format skill's troubleshooting.md.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `端口 <addr> 被其他程序占用，无法启动` ("port in use by another program") | Another program listens on the port. An aProxy instance there would be reported differently | Find the owner (`netstat -ano \| findstr :<port>` on Windows, `ss -ltnp \| grep :<port>` on Linux), then pick another port or ask the user about that program |
+| `端口 <addr> 被其他程序占用，无法启动` ("port in use by another program") | Another program listens on the port, or an aProxy instance started under a different `APROXY_HOME` (an instance of this home would be reported as already running) | Find the owner (`netstat -ano \| findstr :<port>` on Windows, `ss -ltnp \| grep :<port>` on Linux), then pick another port or ask the user about that program |
 | `端口 <addr> 无法绑定：无权限或端口被系统保留（如 Hyper-V/WinNAT 排除区间，…）` ("cannot bind: no permission, or the port is reserved by the system") | Windows reserves port ranges for Hyper-V/WinNAT; netstat shows no listener | `netsh interface ipv4 show excludedportrange protocol=tcp`, then choose a port outside every range |
 | `后台进程未在预期时间内就绪（pid N），启动失败的原因通常记录在:` ("background process not ready in time; the cause is usually logged in:") | The daemon exited during startup (config error, bind failure) or started slowly (antivirus scan on a cold start) | Read the end of `<home>/logs/startup.log`. If it shows nothing new, run `aproxy status`: the instance may have come up late |
 | `配置文件解析失败（TOML 语法错误）` ("config parse failed: TOML syntax") or `配置错误: …` ("config error") | The message names the file and field, and says so when the bad value came from settings.json | Fix that field (config-toml.md); `aproxy doctor` checks every config |

@@ -6,8 +6,11 @@
 //!
 //! IPC（铁律：控制通道绝不占用代理端口，代理端口完全用于透传——避免控制
 //! 路径与客户端请求路径巧合重叠造成严重 bug）：每个实例一条 Windows 命名
-//! 管道 `\\.\pipe\aproxy-<port>`（unix 为 `~/.aproxy/run/<port>.sock`），
-//! 承载 `ping`/`shutdown` 控制。端口冲突的两种情况由此区分：
+//! 管道 `\\.\pipe\aproxy-<home_id>-<port>`（unix 为 `<run 目录>/<port>.sock`），
+//! 承载 `ping`/`shutdown` 等控制。端点按 run 目录划分命名空间（见
+//! [`endpoint_for_in`]）：一个 home 的命令只能控制本 home 的实例，测试 home
+//! 里的 `aproxy stop <端口>` 碰不到用户正在用的同端口实例。端口冲突的两种
+//! 情况由此区分：
 //! - 管道 ping 通 → 该端口已有 aProxy 实例在运行；
 //! - 管道不通但 TCP bind 失败 → 端口被其他程序占用。
 //!
@@ -69,25 +72,64 @@ pub fn clean_spool_dir(port: &str) {
 }
 
 /// 实例的 IPC 端点：windows 为命名管道名，unix 为 UDS 路径。
-/// 端口号唯一区分实例（同端口=同实例；多实例的监听端口必然互不相同）。
+/// 端口号在一个 run 目录内唯一区分实例（同端口=同实例）。
 pub fn endpoint_for(port: &str) -> String {
     endpoint_for_in(&run_dir(), port)
 }
 
-/// 同 endpoint_for，但 unix 的 UDS 路径按**显式 run_dir** 派生。库层函数
-/// （install 的 flow/restart）收了 run_dir 参数就必须全程用它——若内部
-/// 回落到进程级 APROXY_HOME 派生，测试进程与多 home 场景下会 ping 到
-/// 别的 home 的端点（unix 实测暴露：jurisdiction 库层测试全 continue）。
+/// 同 endpoint_for，但按**显式 run_dir** 派生。库层函数（install 的
+/// flow/restart、看门狗）收了 run_dir 参数就必须全程用它——若内部回落到
+/// 进程级 APROXY_HOME 派生，测试进程与多 home 场景下会找到别的 home 的端点。
+///
+/// 端点属于 run 目录：unix 的 socket 本来就在 run 目录里；Windows 的命名管道
+/// 是全机共享的名字空间，所以名字里带上 run 目录的标识（`home_id`）。否则
+/// 隔离 home（APROXY_HOME）里的 `aproxy stop <端口>` 会停掉另一个 home 在同一
+/// 端口上的实例——例如用临时 home 做实验时停掉用户正在用的生产实例。
 pub fn endpoint_for_in(run_dir: &std::path::Path, port: &str) -> String {
     #[cfg(windows)]
     {
-        let _ = run_dir;
-        format!(r"\\.\pipe\aproxy-{port}")
+        format!(r"\\.\pipe\aproxy-{}-{port}", home_id(run_dir))
     }
     #[cfg(unix)]
     {
         run_dir.join(format!("{port}.sock")).display().to_string()
     }
+}
+
+/// run 目录的标识：规范化路径的 SHA-256 前 16 个十六进制字符。Windows 的
+/// 全机名字（控制管道）靠它区分 home。规范化让同一目录的不同写法（大小写、
+/// 分隔符、相对路径、subst 盘符、目录联接）得到同一个标识。
+///
+/// 目录还不存在时规范化「最近的已存在祖先」再接上其余部分：守护可能在 run
+/// 目录建出来之前就算端点名（注册表写失败时），客户端在目录存在后再算——
+/// 两边若一个走规范化、一个走字面绝对路径，经联接或 subst 访问的 home 会
+/// 得到两个不同的标识，客户端就再也找不到这个实例。
+pub fn home_id(run_dir: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let absolute = std::path::absolute(run_dir).unwrap_or_else(|_| run_dir.to_path_buf());
+    let mut resolved = None;
+    for ancestor in absolute.ancestors() {
+        if let Ok(real) = std::fs::canonicalize(ancestor) {
+            // ancestors() 产出的都是 absolute 的前缀，strip_prefix 必然成功
+            let rest = absolute
+                .strip_prefix(ancestor)
+                .unwrap_or(std::path::Path::new(""));
+            resolved = Some(if rest.as_os_str().is_empty() {
+                real
+            } else {
+                real.join(rest)
+            });
+            break;
+        }
+    }
+    let text = resolved.unwrap_or(absolute).display().to_string();
+    #[cfg(windows)]
+    let text = {
+        let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+        text.replace('/', r"\").to_lowercase()
+    };
+    let digest = Sha256::digest(text.as_bytes());
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// 从监听地址提取端口（IPC 端点名、日志/注册文件名共用）
@@ -199,28 +241,38 @@ fn ipc_proto_v1_default() -> u32 {
     IPC_PROTO_V1
 }
 
+/// 一次 IPC 往返的失败。「端点不存在」与其他失败分开：前者确定没有实例在
+/// 这个端点上听（不必重试，也是 0.1.0 兼容回退的触发条件）；后者（管道忙、
+/// 超时、读写出错、应答解析不了）说明可能有实例、只是此刻没给出有效应答。
+#[derive(Debug)]
+pub(crate) enum ExchangeError {
+    Unreachable(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for ExchangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreachable(e) | Self::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
 /// 探测端口上是否有 aProxy 实例（纯 IPC，不触碰任何 TCP 端口）。
 /// Ok(info) = 实例在运行；Err = 端点上没有可识别的 aProxy（无实例，
 /// 或该端口被其他程序占用——由调用方结合 TCP bind 结果区分这两种情况）。
-///
-/// 判死门槛：连续 3 次（间隔 200ms）都拿不到有效响应才算 Err。单次 ping
-/// 可能因 Windows 命名管道瞬时 busy（serve 重建监听实例的零监听窗口）或
-/// 3 秒超时等瞬态原因失败；调用方据 Err 下结论（stop 的已停止判定把它当
-/// 「实例已退出」，注册表普查据它转入进程身份核验），单次抖动不该左右结论。
+/// 只找本进程 run 目录里的实例（见 `endpoint_for_in`）。
 pub async fn ipc_ping(port: &str) -> Result<InstanceInfo, String> {
-    ping_endpoint(&endpoint_for(port)).await
+    ipc_ping_in(&run_dir(), port).await
 }
 
-/// 同 ipc_ping，但 unix 的 UDS 端点按显式 run_dir 派生（库层调用者用这个）。
+/// 同 ipc_ping，但按显式 run_dir 寻址（库层调用者用这个）。
+///
+/// 判死门槛：端点不存在立即判 Err（确定没有实例）；其他失败连续 3 次（间隔
+/// 200ms）才算 Err。单次失败可能是 Windows 命名管道瞬时 busy（serve 重建监听
+/// 实例的零监听窗口）或 3 秒超时；调用方据 Err 下结论（stop 的已停止判定把它
+/// 当「实例已退出」，注册表普查据它转入进程身份核验），单次抖动不该左右结论。
 pub async fn ipc_ping_in(run_dir: &std::path::Path, port: &str) -> Result<InstanceInfo, String> {
-    ping_endpoint(&endpoint_for_in(run_dir, port)).await
-}
-
-/// 判死门槛：连续 3 次（间隔 200ms）都拿不到有效响应才算 Err。单次 ping
-/// 可能因 Windows 命名管道瞬时 busy（serve 重建监听实例的零监听窗口）或
-/// 3 秒超时等瞬态原因失败；调用方据 Err 下结论（stop 的已停止判定把它当
-/// 「实例已退出」，注册表普查据它转入进程身份核验），单次抖动不该左右结论。
-async fn ping_endpoint(endpoint: &str) -> Result<InstanceInfo, String> {
     const DEAD_AFTER: usize = 3;
     const RETRY_INTERVAL: Duration = Duration::from_millis(200);
     let mut last_err = String::new();
@@ -228,34 +280,66 @@ async fn ping_endpoint(endpoint: &str) -> Result<InstanceInfo, String> {
         if attempt > 0 {
             tokio::time::sleep(RETRY_INTERVAL).await;
         }
-        match ipc_request_to(endpoint, &IpcRequest::Ping).await {
+        match request_in(run_dir, port, &IpcRequest::Ping).await {
             Ok(resp) if resp.ok => return resp.info.ok_or_else(|| "实例响应缺少信息".to_string()),
             Ok(_) => last_err = "实例返回失败".to_string(),
-            Err(e) => last_err = e,
+            Err(ExchangeError::Unreachable(e)) => return Err(e),
+            Err(ExchangeError::Failed(e)) => last_err = e,
         }
     }
     Err(last_err)
 }
 
-/// 发送 IPC 请求并等待响应（3 秒超时）。
+/// 发送 IPC 请求并等待响应（3 秒超时），找本进程 run 目录里的实例。
 pub async fn ipc_request(port: &str, req: &IpcRequest) -> Result<IpcResponse, String> {
-    ipc_request_to(&endpoint_for(port), req).await
+    ipc_request_in(&run_dir(), port, req).await
 }
 
-/// 按显式端点发送 IPC 请求并等待响应（3 秒超时）。
-/// 供绕过 `endpoint_for` 解析的场景使用：unix 的 UDS 路径在 run_dir 里，
-/// 守护以隔离主目录（`APROXY_HOME`/`APROXY_RUN_DIR`）运行时，同进程的
-/// 库调用方（测试）须按守护实际的 socket 路径寻址；Windows 管道名全局
-/// 唯一，不受 run_dir 影响。
-pub async fn ipc_request_to(endpoint: &str, req: &IpcRequest) -> Result<IpcResponse, String> {
+/// 同 ipc_request，按显式 run_dir 寻址。
+pub async fn ipc_request_in(
+    run_dir: &std::path::Path,
+    port: &str,
+    req: &IpcRequest,
+) -> Result<IpcResponse, String> {
+    request_in(run_dir, port, req)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 按 run 目录与端口寻址：先找命名空间端点；那里没有实例时，按 0.1.0 兼容
+/// 规则试旧端点（条件见 compat_0_1_0::legacy_endpoint_for）。
+async fn request_in(
+    run_dir: &std::path::Path,
+    port: &str,
+    req: &IpcRequest,
+) -> Result<IpcResponse, ExchangeError> {
+    match request_raw(&endpoint_for_in(run_dir, port), req).await {
+        Err(ExchangeError::Unreachable(e)) => {
+            match crate::compat_0_1_0::legacy_endpoint_for(run_dir, port).await {
+                Some(legacy) => request_raw(&legacy, req).await,
+                None => Err(ExchangeError::Unreachable(e)),
+            }
+        }
+        other => other,
+    }
+}
+
+/// 按显式端点发送 IPC 请求并等待响应（3 秒超时）。按实例寻址请用
+/// `ipc_request_in`：它负责端点命名空间与 0.1.0 兼容回退。
+pub(crate) async fn request_raw(
+    endpoint: &str,
+    req: &IpcRequest,
+) -> Result<IpcResponse, ExchangeError> {
     let req_line = serde_json::to_string(req).expect("序列化 IPC 请求失败");
     let fut = imp::exchange(endpoint, &req_line);
     match tokio::time::timeout(Duration::from_secs(3), fut).await {
-        Ok(Ok(line)) => {
-            serde_json::from_str(&line).map_err(|e| format!("{endpoint}: 响应解析失败 {e}"))
+        Ok(Ok(line)) => serde_json::from_str(&line)
+            .map_err(|e| ExchangeError::Failed(format!("{endpoint}: 响应解析失败 {e}"))),
+        Ok(Err(ExchangeError::Unreachable(e))) => {
+            Err(ExchangeError::Unreachable(format!("{endpoint}: {e}")))
         }
-        Ok(Err(e)) => Err(format!("{endpoint}: {e}")),
-        Err(_) => Err(format!("{endpoint}: 请求超时")),
+        Ok(Err(ExchangeError::Failed(e))) => Err(ExchangeError::Failed(format!("{endpoint}: {e}"))),
+        Err(_) => Err(ExchangeError::Failed(format!("{endpoint}: 请求超时"))),
     }
 }
 
@@ -269,7 +353,19 @@ pub async fn serve_ipc(
     info: InstanceInfo,
     stats: Arc<IpcStats>,
 ) -> io::Result<()> {
-    imp::serve(endpoint_for(&port), on_shutdown, info, stats).await
+    #[cfg(windows)]
+    crate::compat_0_1_0::serve_legacy_pipe(&port, on_shutdown.clone(), info.clone(), stats.clone());
+    serve_endpoint(endpoint_for(&port), on_shutdown, info, stats).await
+}
+
+/// 在给定端点上提供控制服务（serve_ipc 与 0.1.0 兼容管道共用）
+pub(crate) async fn serve_endpoint(
+    endpoint: String,
+    on_shutdown: tokio::sync::watch::Sender<bool>,
+    info: InstanceInfo,
+    stats: Arc<IpcStats>,
+) -> io::Result<()> {
+    imp::serve(endpoint, on_shutdown, info, stats).await
 }
 
 /// 实例的实时观测数据源：代理热路径写入，IPC 响应读取。
@@ -923,22 +1019,23 @@ pub fn list_restore_entries_in(dir: &std::path::Path) -> Vec<RestoreEntry> {
 // ---------------------------------------------------------------------------
 
 /// 在已建立的连接上完成一次「发请求行、收响应行」。
-async fn exchange_over<S>(stream: S, req_line: &str) -> Result<String, String>
+async fn exchange_over<S>(stream: S, req_line: &str) -> Result<String, ExchangeError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let failed = |e: io::Error| ExchangeError::Failed(e.to_string());
     let (reader, mut writer) = tokio::io::split(stream);
     writer
         .write_all(req_line.as_bytes())
         .await
-        .map_err(|e| e.to_string())?;
-    writer.write_all(b"\n").await.map_err(|e| e.to_string())?;
+        .map_err(failed)?;
+    writer.write_all(b"\n").await.map_err(failed)?;
     let mut line = String::new();
     BufReader::new(reader)
         .read_line(&mut line)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(failed)?;
     Ok(line)
 }
 
@@ -1056,7 +1153,7 @@ where
 // ---------------------------------------------------------------------------
 #[cfg(windows)]
 mod imp {
-    use super::{InstanceInfo, IpcStats, exchange_over, handle_conn};
+    use super::{ExchangeError, InstanceInfo, IpcStats, exchange_over, handle_conn};
     use std::{io, sync::Arc, time::Duration};
     use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
     use tokio::sync::watch::Sender;
@@ -1067,7 +1164,7 @@ mod imp {
     /// 监听实例之间存在零监听窗口，管道名存在但无空闲实例，此时 CreateFile
     /// 返回 busy 而非「端点不存在」。tokio 文档明确要求客户端对该错误
     /// sleep 后重试；封顶 2 秒（上层 ipc_request 的 3 秒超时之内）。
-    pub async fn exchange(endpoint: &str, req_line: &str) -> Result<String, String> {
+    pub async fn exchange(endpoint: &str, req_line: &str) -> Result<String, ExchangeError> {
         const ERROR_PIPE_BUSY: i32 = 231;
         const BUSY_RETRY_CAP: Duration = Duration::from_secs(2);
         const BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -1077,11 +1174,15 @@ mod imp {
                 Ok(client) => break client,
                 Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
                     if tokio::time::Instant::now() >= deadline {
-                        return Err(format!("无法连接（{e}）"));
+                        return Err(ExchangeError::Failed(format!("无法连接（{e}）")));
                     }
                     tokio::time::sleep(BUSY_RETRY_INTERVAL).await;
                 }
-                Err(e) => return Err(format!("无法连接（{e}）")),
+                // 管道名不存在：确定没有实例在这个端点上听
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return Err(ExchangeError::Unreachable(format!("无法连接（{e}）")));
+                }
+                Err(e) => return Err(ExchangeError::Failed(format!("无法连接（{e}）"))),
             }
         };
         exchange_over(client, req_line).await
@@ -1113,15 +1214,25 @@ mod imp {
 
 #[cfg(unix)]
 mod imp {
-    use super::{InstanceInfo, IpcStats, exchange_over, handle_conn};
+    use super::{ExchangeError, InstanceInfo, IpcStats, exchange_over, handle_conn};
     use std::{io, path::Path, sync::Arc, time::Duration};
     use tokio::net::UnixListener;
     use tokio::sync::watch::Sender;
 
-    pub async fn exchange(endpoint: &str, req_line: &str) -> Result<String, String> {
+    pub async fn exchange(endpoint: &str, req_line: &str) -> Result<String, ExchangeError> {
         let client = tokio::net::UnixStream::connect(endpoint)
             .await
-            .map_err(|e| format!("无法连接（{e}）"))?;
+            .map_err(|e| {
+                // socket 文件不存在，或文件还在但没有进程在听（崩溃残留）：
+                // 确定没有实例在这个端点上
+                let msg = format!("无法连接（{e}）");
+                match e.kind() {
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
+                        ExchangeError::Unreachable(msg)
+                    }
+                    _ => ExchangeError::Failed(msg),
+                }
+            })?;
         exchange_over(client, req_line).await
     }
 
@@ -1481,6 +1592,85 @@ mod tests {
         // 不存在的端点：ping 必须报错（= 端口上没有 aProxy）
         let port = format!("599{:02}", std::process::id() % 100);
         assert!(ipc_ping(&port).await.is_err());
+    }
+
+    #[test]
+    fn home_id_separates_homes_and_is_stable_across_spellings() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        // 两个 home 同一端口的端点必须不同：Windows 管道名全机共享，相同就
+        // 意味着一个 home 的命令能控制另一个 home 的实例
+        assert_ne!(
+            endpoint_for_in(&a.path().join("run"), "12345"),
+            endpoint_for_in(&b.path().join("run"), "12345")
+        );
+        // run 目录建出前后是同一个标识：守护可能先于目录创建算出端点名
+        let run = a.path().join("run");
+        let before = home_id(&run);
+        std::fs::create_dir_all(&run).unwrap();
+        assert_eq!(before, home_id(&run));
+        // 同一目录的另一种写法得到同一个标识
+        assert_eq!(home_id(&run), home_id(&a.path().join(".").join("run")));
+        #[cfg(windows)]
+        {
+            let spelled = run.display().to_string().to_uppercase().replace('\\', "/");
+            assert_eq!(home_id(&run), home_id(std::path::Path::new(&spelled)));
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn legacy_pipe_is_reached_only_for_a_matching_local_record() {
+        // 扮演一个只在 0.1.0 旧管道名上应答的实例。「端口」取非数字的测试名，
+        // 旧管道名就不可能与机器上真实实例的管道重名
+        let run = tempfile::tempdir().unwrap();
+        let port = format!("legacy-test-{}", std::process::id());
+        let legacy = format!(r"\\.\pipe\aproxy-{port}");
+        let serve_legacy = |info: InstanceInfo| {
+            let (tx, _rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(serve_endpoint(
+                legacy.clone(),
+                tx,
+                info,
+                Arc::new(IpcStats::default()),
+            ))
+        };
+        let mut live = sample_info(&port);
+        live.process_start = 1000;
+        let server = serve_legacy(live.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 本 run 目录没登记该端口：旧管道上的应答者可能属于任何 home，不认
+        assert!(ipc_ping_in(run.path(), &port).await.is_err());
+
+        // 登记的是另一个进程（别的 home 在同端口上的实例）：不认
+        let mut other = live.clone();
+        other.pid = live.pid + 1;
+        write_instance_file_in(run.path(), &other).unwrap();
+        assert!(ipc_ping_in(run.path(), &port).await.is_err());
+
+        // pid 相同、创建时间不同（pid 已被复用）：不认
+        let mut reused = live.clone();
+        reused.process_start = 2000;
+        write_instance_file_in(run.path(), &reused).unwrap();
+        assert!(ipc_ping_in(run.path(), &port).await.is_err());
+
+        // 记录与应答者一致：经旧管道找到它（升级窗口里新 CLI 找到本 home
+        // 里还在跑 0.1.0 的实例）
+        write_instance_file_in(run.path(), &live).unwrap();
+        assert_eq!(ipc_ping_in(run.path(), &port).await.unwrap().pid, live.pid);
+
+        // 记录与应答者都没有创建时间：pid 相同也无从排除复用，不认
+        server.abort();
+        let _ = server.await;
+        let mut unverifiable = live.clone();
+        unverifiable.process_start = 0;
+        let server = serve_legacy(unverifiable.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        write_instance_file_in(run.path(), &unverifiable).unwrap();
+        assert!(ipc_ping_in(run.path(), &port).await.is_err());
+
+        server.abort();
     }
 
     #[tokio::test]

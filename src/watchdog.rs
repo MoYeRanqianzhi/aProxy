@@ -36,6 +36,62 @@ pub struct WatchdogClaim {
     /// 看护者最近一次心跳续写时刻（Unix 秒）。看护者每周期续写；
     /// 超过 3×心跳周期未更新 = 看护者假死。
     pub heartbeat_secs: u64,
+    /// 看护者自己的版本。0.1.0 的 claim 没有这个字段（读作 None），0.1.0 读
+    /// 新 claim 时忽略它。守护启动时据此退役更旧的看护者，见
+    /// `retire_older_watchdog_in`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// R1：守护启动时（创建控制端点之前）退役比自己旧的看护者。claim 没有
+/// version（0.1.0）或版本更低、且 claim 里的进程经 pid + 创建时间核验仍在，
+/// 就终止它、等它退出、删掉 claim，补种交给守护的自检。为什么要这样：0.1.0
+/// 的安装器在 unix 上不停旧看护者，它会留着有效的 claim 继续看护新实例——
+/// 用已被替换的二进制重拉崩溃实例（Linux 上 current_exe 指向 `(deleted)`，
+/// 重拉必然失败），处理死亡事件时还会删掉新实例的控制 socket。「新版本胜出」：
+/// 同版本或更新的看护者不动，混版本的 home 不会来回拉锯。返回是否退役了一个。
+pub async fn retire_older_watchdog_in(run_dir: &Path) -> bool {
+    let Some(claim) = read_claim_in(run_dir) else {
+        return false;
+    };
+    let older = match &claim.version {
+        None => true,
+        Some(theirs) => matches!(
+            (
+                semver::Version::parse(theirs),
+                semver::Version::parse(env!("CARGO_PKG_VERSION")),
+            ),
+            (Ok(theirs), Ok(ours)) if theirs < ours
+        ),
+    };
+    if !older || claim.pid == std::process::id() {
+        return false;
+    }
+    // 进程已不在（或 pid 被复用）：claim 自然失效，补种照常进行
+    if !matches!(
+        record_identity(claim.pid, claim.created_at_process),
+        RecordIdentity::Alive(_)
+    ) {
+        return false;
+    }
+    if let Err(e) = terminate_verified_process(claim.pid, claim.created_at_process) {
+        tracing::warn!(pid = claim.pid, error = %e, "旧版本看护者退役失败");
+        return false;
+    }
+    // 等它真正退出再删 claim：它退出前的最后一次续写不能把 claim 写回来
+    for _ in 0..50 {
+        if process_exited(claim.pid) == Some(true) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    remove_claim_in(run_dir);
+    tracing::info!(
+        pid = claim.pid,
+        version = claim.version.as_deref().unwrap_or("0.1.0"),
+        "已退役旧版本看护者，由守护自检补种新的"
+    );
+    true
 }
 
 /// claim 文件路径（run_dir 注入，测试绝不读写真实 run/）
@@ -737,6 +793,7 @@ impl WatchdogState {
             pid: std::process::id(),
             created_at_process: process_start_time(std::process::id()).unwrap_or(0),
             heartbeat_secs: now_secs(),
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
         };
         // 先写临时文件再 rename 覆盖：原地写时，并发读到的可能是截断到一半的
         // claim，读者把它当「无 claim」，随即补种出第二个看护者。临时文件名带
@@ -923,6 +980,7 @@ pub async fn serve(cfg: WatchdogConfig) {
         pid: std::process::id(),
         created_at_process: process_start_time(std::process::id()).unwrap_or(0),
         heartbeat_secs: now_secs(),
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
     if acquire_claim_in(&cfg.run_dir, &my_claim).is_none() {
         // 已有 claim：验证其有效性；无效则清理重试（前任死亡/假死/残留）
@@ -1587,6 +1645,7 @@ mod tests {
             pid: 42,
             created_at_process: 133_000_000_000,
             heartbeat_secs: 1_700_000_000,
+            version: Some("9.9.9".into()),
         };
         acquire_claim_in(dir.path(), &claim).expect("空目录首次接管应成功");
         let read = read_claim_in(dir.path()).unwrap();
@@ -1613,6 +1672,7 @@ mod tests {
             pid: 1,
             created_at_process: 1,
             heartbeat_secs: 1,
+            version: None,
         };
         assert!(acquire_claim_in(dir.path(), &claim).is_none());
     }
@@ -1690,6 +1750,47 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         false
+    }
+
+    /// R1：旧版本（或没有版本的 0.1.0）看护者被守护启动时退役；同版本、更新
+    /// 版本的不动。被测进程名字与 aProxy 无关——身份只认 pid + 创建时间
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn daemon_startup_retires_only_older_watchdogs() {
+        let dir = tempfile::tempdir().unwrap();
+        let claim_for = |child: &std::process::Child, version: Option<&str>| WatchdogClaim {
+            pid: child.id(),
+            created_at_process: process_start_time(child.id()).expect("子进程创建时间可查"),
+            heartbeat_secs: now_secs(),
+            version: version.map(str::to_string),
+        };
+        let put = |claim: &WatchdogClaim| {
+            remove_claim_in(dir.path());
+            acquire_claim_in(dir.path(), claim).expect("写 claim");
+        };
+
+        // 同版本、更新版本：不动
+        let mut keeper = spawn_unrelated_child();
+        for version in [env!("CARGO_PKG_VERSION"), "999.0.0"] {
+            put(&claim_for(&keeper, Some(version)));
+            assert!(!retire_older_watchdog_in(dir.path()).await, "{version}");
+            assert!(
+                keeper.try_wait().unwrap().is_none(),
+                "{version} 的看护者不得被退役"
+            );
+            assert!(read_claim_in(dir.path()).is_some());
+        }
+        let _ = keeper.kill();
+        let _ = keeper.wait();
+
+        // 没有版本（0.1.0）与更旧的版本：终止并删 claim
+        for version in [None, Some("0.0.1")] {
+            let mut old = spawn_unrelated_child();
+            put(&claim_for(&old, version));
+            assert!(retire_older_watchdog_in(dir.path()).await, "{version:?}");
+            assert!(wait_child_exit(&mut old), "{version:?} 的看护者应被退役");
+            assert!(read_claim_in(dir.path()).is_none());
+        }
     }
 
     #[cfg(any(windows, target_os = "linux"))]

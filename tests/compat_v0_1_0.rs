@@ -195,6 +195,7 @@ fn watchdog_claim_round_trips_with_0_1_0() {
         pid: 777,
         created_at_process: 133_000_000_000_000_002,
         heartbeat_secs: 1_760_000_200,
+        version: Some(env!("CARGO_PKG_VERSION").into()),
     };
     assert!(aproxy::watchdog::acquire_claim_in(dir.path(), &claim).is_some());
     let old: v0_1_0::WatchdogClaim =
@@ -219,6 +220,8 @@ fn watchdog_claim_round_trips_with_0_1_0() {
         read_back.created_at_process,
         written_by_old.created_at_process
     );
+    // 0.1.0 的 claim 没有版本：新守护据此判定它更旧、该退役（R1）
+    assert_eq!(read_back.version, None);
 }
 
 #[test]

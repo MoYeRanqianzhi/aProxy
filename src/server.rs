@@ -93,6 +93,10 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     let actual_addr = listener.local_addr().expect("获取监听地址失败").to_string();
     let port = daemon::port_of(&actual_addr).to_string();
 
+    // R1：先退役比自己旧的看护者，再创建控制端点——旧看护者处理死亡事件时会
+    // 删掉同一路径上的 socket（见 watchdog::retire_older_watchdog_in）
+    watchdog::retire_older_watchdog_in(&daemon::run_dir()).await;
+
     // 控制端点紧接 TCP 之后、注册表之前创建：失败就不登记、不写恢复记录、
     // 直接退出。带着一个 stop/status 都找不到的实例跑下去比启动失败更糟——
     // 它占着端口，用户只能按 pid 去杀；它的 .pid 还会覆盖同端口实例的记录。

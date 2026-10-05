@@ -60,7 +60,12 @@ IPC 重新整理格式后协议版本从 1 重新计数。随后：「发现的�
 - 第 5 步（提交 E1）：unix 接受循环每秒检查 socket 文件，被删就在原路径重建（c.3 第 1 条的缓解）；收到
   shutdown 或本进程退出流程删过 socket（`SOCKET_RETIRED`）后不重建。测试 `deleted_socket_file_is_recreated_while_serving`
   只在 CI 的 ubuntu 跑。
-- 下一步：R1 claim version 与安装器停旧看护者（第 5 步其余），然后第 6 步 install。
+- 第 5 步其余（提交 E2）：claim 加可选 `version`；`watchdog::retire_older_watchdog_in` 在守护创建控制端点之前
+  退役无版本（0.1.0）或更旧的看护者（pid + 创建时间核验、等退出、删 claim），补种走正常自检（install 期间
+  宣告有效时不补种，结束后 ≤5 分钟由新二进制补种）；安装器 `stop_old_watchdog` 去掉 `cfg(windows)`（旧注释
+  「unix 无此问题」不对：Linux 上 current_exe 指向 `(deleted)`）。T5a 单测 `daemon_startup_retires_only_older_watchdogs`。
+- 下一步：第 6 步 install（在线路径管辖检查、`--continue` 收尾已一致的舰队、早交接、install.state 冻结副本、
+  CI 里的 T1-E2E）。
 - Linux 编译只能靠 CI 的 ubuntu 门禁：本机 WSL（Debian）的 rustup 工具链清单损坏，且 2026-10-06 WSL 内无外网
   （官方源与 rsproxy 均连接超时），修不了；本机也没有 Linux C 交叉编译器（ring 需要）。
 

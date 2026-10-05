@@ -280,10 +280,9 @@ async fn run_forward(
 
     // ---- broadcasting：ACK 齐了才交换（铁律 3）。无实例 → 跳过（快路径）
     if !snapshot.is_empty() {
-        // 换血（Windows 专属顺序）：广播之前停掉旧看护者——它的 respawn
-        // 会用旧镜像（current_exe 指向 rename 后的 .old）拉起旧二进制，
-        // 升级永不完成。unix 无此问题（exec 按路径解析自动新二进制）。
-        #[cfg(windows)]
+        // 换血：广播之前停掉旧看护者——它的 respawn 用 current_exe 拉实例，
+        // 换血后那条路径已不是新二进制（Windows 指向 rename 后的 .old，升级
+        // 永不完成；Linux 读到的是 `… (deleted)`，重拉必然失败）。
         stop_old_watchdog(run_dir);
         super::state::advance_in(run_dir, state, InstallPhase::Broadcasting)?;
         if let Err(e) = super::broadcast::broadcast_prepare_swap(run_dir, &live, state).await {
@@ -654,7 +653,6 @@ async fn run_forward_from_staged(
     state.instance_snapshot = snapshot.clone();
     write_in(run_dir, state).map_err(|e| format!("install.state 写入失败: {e}"))?;
     if !snapshot.is_empty() {
-        #[cfg(windows)]
         stop_old_watchdog(run_dir);
         // 相位守卫（与 run_tail 同款）：Acked/Swapping 残留的续作重入时
         // phase 已高于 Broadcasting/Acked——逆向迁移非法，保留高位重做即可
@@ -700,10 +698,9 @@ async fn run_forward_from_staged(
     Ok(FlowExit::Completed)
 }
 
-/// 停掉旧看护者（Windows 换血，广播之前）：身份验证 + 终止 + 删 claim。
+/// 停掉旧看护者（换血，广播之前）：身份验证 + 终止 + 删 claim。
 /// 看护者不承载流量，零服务影响；换血窗口内实例崩溃 = 短时失去自动重拉，
-/// 可接受微窗（新看护者由 relaying 后的新二进制 ensure 逻辑重新出簇）。
-#[cfg(windows)]
+/// 可接受微窗（install 结束、宣告消失后，新实例的自检用新二进制补种）。
 fn stop_old_watchdog(run_dir: &Path) {
     let Some(claim) = crate::watchdog::read_claim_in(run_dir) else {
         return; // 无看护者，无事

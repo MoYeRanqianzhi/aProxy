@@ -6,21 +6,42 @@
       "name": "connect-claude-code-and-codex",
       "prompt": "我在 Windows 上同时用 Claude Code 和 Codex，想让它们都走本机的 aproxy（已经在 12345 端口跑着，我自己现在也在用它）。帮我把两边需要改的配置写出来，存成文件放到输出目录，并告诉我怎么确认它们真的走了 aproxy。",
       "expected_output": "Claude Code: ANTHROPIC_BASE_URL=http://127.0.0.1:12345 plus CLAUDE_STREAM_IDLE_TIMEOUT_MS set to a large value (e.g. 86400000), via env or ~/.claude/settings.json env block. Codex: a model provider in ~/.codex/config.toml with base_url http://127.0.0.1:12345/v1, wire_api = \"responses\", stream_idle_timeout_ms large, selected via model_provider. Verification through aproxy logs / status. Does not stop or restart the running instance.",
-      "files": []
+      "files": [],
+      "assertions": [
+        "Claude Code is pointed at http://127.0.0.1:12345 through ANTHROPIC_BASE_URL",
+        "CLAUDE_STREAM_IDLE_TIMEOUT_MS is set to at least 3600000 (an hour)",
+        "The Codex provider's base_url is http://127.0.0.1:12345/v1",
+        "The Codex provider sets stream_idle_timeout_ms to at least 3600000",
+        "The Codex config selects the custom provider via model_provider and uses wire_api = \"responses\"",
+        "Gives a concrete way to confirm traffic goes through aProxy (status request count or log lines)",
+        "Does not tell the user to stop, restart or kill the running 12345 instance"
+      ]
     },
     {
       "id": 2,
       "name": "compact-hangs-count-tokens-404",
       "prompt": "Claude Code 接的是一个中转站 API，经过 aproxy 之后每次 /compact 都卡住一直转圈。aproxy 日志里看到 POST /v1/messages/count_tokens?beta=true 一直返回 404 然后在重试。我的配置文件是 ~/.aproxy/config.toml，这个实例的别名是 relay。应该怎么改？把要改的配置片段和要执行的命令写到输出目录的 answer.md 里。",
       "expected_output": "Add bounded_retry_paths to the instance config with a pattern that matches the path including the query string (e.g. '/v1/messages/count_tokens(\\?.*)?' or an explicit '\\?beta=true' variant), explain that the match covers path+query and is anchored, then apply with aproxy restart relay. Does not suggest forward_only or disabling retries globally.",
-      "files": []
+      "files": [],
+      "assertions": [
+        "Adds bounded_retry_paths to the relay instance's config.toml",
+        "The pattern fully matches '/v1/messages/count_tokens?beta=true' under anchored path+query matching",
+        "Applies the change with `aproxy restart relay`",
+        "Does not propose forward_only or disabling retries for the whole instance as the fix"
+      ]
     },
     {
       "id": 3,
       "name": "add-second-instance-with-alias",
       "prompt": "我想再开一个 aproxy 实例：监听 12346，上游是 https://api.example.com，用单独的配置文件，别名叫 work，以后用 aproxy stop work 就能停它。现有的 12345 实例正在被我用着，别动它。把完整步骤（配置文件内容 + 要执行的命令）写到输出目录的 answer.md 里。",
       "expected_output": "A separate config file (e.g. ~/.aproxy/work.toml) with base_url = \"https://api.example.com\" and listen_addr = \"127.0.0.1:12346\"; aproxy alias add work <path>; aproxy start work; verify with aproxy status; never stop all / restart / touch 12345.",
-      "files": []
+      "files": [],
+      "assertions": [
+        "Creates a separate config with base_url https://api.example.com and listen_addr 127.0.0.1:12346",
+        "Registers the alias with `aproxy alias add work <path>`",
+        "Starts the new instance with `aproxy start work` (or start with its path)",
+        "Never stops, restarts or kills the 12345 instance (no stop all, no taskkill/pkill)"
+      ]
     }
   ]
 }

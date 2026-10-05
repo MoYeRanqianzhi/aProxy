@@ -16,14 +16,20 @@
 - 评测用例：`.agents/skill-evals/<skill>/evals.json`（每个 skill 3 个，含可区分优劣的陷阱：
   count_tokens 带 `?beta=true` 查询串、Claude Code 走流式而跨协议 SSE 不支持等）。
 
+## 进度（2026-10-06）
+- 重写已提交（0608f93）；子代理报出的代码问题已修（fc18505、4a6eeaa、be1101c），其余入 TODO。
+- 第一轮评测（iteration-1，工作区 `.agents/skill-eval.local/`，sonnet 各跑一次）：新 97.7% / 旧 100%。
+  6 个常见任务新旧都能做对，区分度低；唯一失分是新版回归——用例 1 里新版按 clients.md「一个实例
+  一个上游」自行把 Codex 改接新开的 12346，违背用户指定的 12345。评审页面
+  `.agents/skill-eval.local/review-iteration-1.html`，已请用户查看。
+
 ## 接下来
-1. 子代理交付后逐份审阅（核对上报的「旧文档与代码不符」清单，必要时修代码或文档）。
-2. 同步仓库内对 skill 的外部引用：README.md:156、README_EN.md:251（链接改指 clients.md），
-   记忆 agent-client-timeouts-survey、aproxy-cli-skill-versioning 中的文件与章节名。
-3. 按 skill-creator 跑评测：每个用例「新 skill / 旧快照」各一次（sonnet，并发 ≤4，禁止运行
-   aproxy 与触碰 ~/.aproxy），写断言、评分、`eval-viewer/generate_review.py` 出报告给用户看。
-4. 按用户反馈迭代；最后可选做 description 触发优化（run_loop）。
-5. 提交；CHANGELOG [Unreleased] 记一笔「skill 改为英文并重写」。
+1. 读用户反馈（评审页面导出的 feedback.json）。
+2. 修回归：用户指定的实例照用；上游协议可能不合时说明风险、把另开实例作为可选方案。
+3. 第二轮评测补「旧文档写错」的区分性用例：重试退避（0/0/0/5 s）、Gemini 的 x-goog-api-key、
+   看门狗恢复延迟、Windows 临时 APROXY_HOME 下 `stop <端口>` 会打到生产实例、format 回信不带 body
+   会清空请求体。
+4. 可选：description 触发优化（run_loop）。
 
 ## 并行中的其他事（见 TODO「下一版发布前」）
 修复 4（b46a15f）、修复 5（3ce26e9）已提交。skill 文档需体现的新行为已转告子代理：转换器纳入

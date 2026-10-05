@@ -6,21 +6,39 @@
       "name": "python-key-rotation-format",
       "prompt": "帮我写一个 format 程序（Python），让 aproxy 在三个 key（sk-a、sk-b、sk-c）之间轮换请求的 Authorization 头，再给出 config.toml 里对应的配置。程序存为输出目录的 rotate.py，配置片段和说明写到 answer.md。",
       "expected_output": "rotate.py: persistent-mode loop reading stdin line by line, UTF-8 safe on Windows, exits on EOF, writes exactly one compact JSON line per request with headers present, flushes, logs only to stderr, rotates authorization (ideally offset by worker_id); config: request_transform with mode = \"persistent\", command/args pointing at python and the script.",
-      "files": []
+      "files": [],
+      "assertions": [
+        "rotate.py passes the skill's test harness in persistent mode, including exit on EOF",
+        "Consecutive requests carry Bearer sk-a, sk-b, sk-c in rotation",
+        "rotate.py writes nothing but one compact JSON line per request to stdout",
+        "The config uses request_transform with mode = \"persistent\""
+      ]
     },
     {
       "id": 5,
       "name": "debug-bash-format-502",
       "prompt": "我的 aproxy 实例所有请求都 502，返回体里有「format 输出违反信封协议」。我的 format 是这个 bash 脚本：\n\n```bash\n#!/bin/bash\nwhile read -r line; do\n  echo \"processing request\"\n  echo \"$line\" | jq '.headers.authorization = \"Bearer sk-x\"'\ndone\n```\n\n帮我找出原因并修好，修好的脚本存为输出目录的 fixed.sh，原因写到 answer.md。",
       "expected_output": "Two causes: the 'processing request' echo goes to stdout (must go to stderr), and jq pretty-prints multi-line JSON (needs -c). fixed.sh uses >&2 for the log line and jq -c, keeps one line per request; the while-read loop already exits on EOF.",
-      "files": []
+      "files": [],
+      "assertions": [
+        "Identifies the stdout 'processing request' echo as a cause",
+        "Identifies jq pretty-printing (missing -c) as a cause",
+        "fixed.sh sends the log line to stderr and calls jq with -c",
+        "fixed.sh answers each input line with exactly one JSON line"
+      ]
     },
     {
       "id": 6,
       "name": "official-binary-anthropic-to-openai",
       "prompt": "用官方 aproxy-format，把 Claude Code（Anthropic 协议）发来的请求转到一个 OpenAI 兼容的端点 https://llm.example.com/v1/chat/completions，key 是 sk-test，模型 claude-sonnet 映射成 gpt-4.1。把聚合配置文件和 aproxy 的 config.toml 片段写到输出目录，并在 answer.md 里说明有什么限制。",
       "expected_output": "Aggregation TOML with explicit client_format = \"anthropic_messages\", a channel with format openai_chat, the full endpoint URL, the key, and the model mapping; config.toml with request_transform and response_transform both pointing at aproxy-format run in persistent mode with extra = the aggregation file. States that cross-protocol conversion is non-streaming only, so Claude Code's streaming requests will not convert.",
-      "files": []
+      "files": [],
+      "assertions": [
+        "The aggregation config declares client_format = \"anthropic_messages\" explicitly",
+        "The aggregation config is accepted by aproxy-format and routes a sample Anthropic request to https://llm.example.com/v1/chat/completions with model gpt-4.1 and Bearer sk-test",
+        "Both request_transform and response_transform run aproxy-format in persistent mode with extra pointing at the aggregation file",
+        "States that cross-protocol conversion does not cover streaming responses, so Claude Code's streaming requests will not convert"
+      ]
     }
   ]
 }

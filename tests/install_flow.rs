@@ -609,9 +609,13 @@ fn unix_install_rolls_back_instance_to_preserved_old_binary() {
     let info = rt
         .block_on(aproxy::daemon::ipc_ping_in(&run_dir, &env.port.to_string()))
         .expect("实例应被旧二进制拉回");
-    assert_ne!(info.pid, old_pid);
-    assert_eq!(info.version, env!("CARGO_PKG_VERSION"), "拉回的是旧版本");
-    let image = aproxy::watchdog::process_image_path(info.pid).unwrap();
+    assert_ne!(info.instance.pid, old_pid);
+    assert_eq!(
+        info.instance.version,
+        env!("CARGO_PKG_VERSION"),
+        "拉回的是旧版本"
+    );
+    let image = aproxy::watchdog::process_image_path(info.instance.pid).unwrap();
     assert_eq!(image, aproxy::install::swap::old_path_in(&env.home()));
     assert!(
         aproxy::daemon::restore_file_path_in(&run_dir, &env.port.to_string()).is_file(),

@@ -1,292 +1,294 @@
-# format 编写指南：写出标准 format 工具并正确配置
+# Writing a format program
 
-## 一、标准 format 工具的结构（协议义务清单）
+How to build a format program that aProxy can run: choosing spawn or persistent mode, the duties
+every program has, loop templates, testing without aProxy, and wiring the program into an
+instance. Read it before writing a new program or when adapting one to aProxy. Field-level rules
+for the envelope are in protocol.md; complete working programs are in examples.md.
 
-一个合格的 format 工具 = **单行处理函数 + 循环壳**。必须同时满足：
+## Contents
 
-| # | 义务 | 违反的后果 |
+- [Choose a mode](#choose-a-mode)
+- [Protocol duties](#protocol-duties)
+- [Loop templates](#loop-templates)
+- [Language pitfalls](#language-pitfalls)
+- [Techniques](#techniques)
+- [Test without aProxy](#test-without-aproxy)
+- [Configure it in aProxy](#configure-it-in-aproxy)
+
+## Choose a mode
+
+| | `spawn` (default) | `persistent` |
 |---|---|---|
-| 1 | 按行读 stdin，一行一个信封 JSON | 多行混读 = 帧错乱，转换永久失败 |
-| 1b | **stdout 只写信封行，每个请求恰好回一行**；日志写 stderr | 多出一行 = 协议错误：worker 被剔除、请求 502「format 输出违反信封协议」 |
-| 2 | 处理完立即写一行信封回 stdout 并 **flush** | 不 flush → aproxy 等到超时（默认 30s）后 kill |
-| 3 | **读到 stdin EOF 即 exit**（persistent 铁律） | 不退出 → aProxy 实例停止后 worker 挂成孤儿进程 |
-| 4 | 单请求失败输出 error 行（exit 0） | 用非零 exit 表达业务失败 → worker 被当崩溃剔除，损失复用 |
-| 5 | 输出信封是完整 JSON，**`headers` 键必填**（可为 `{}`） | 缺 `headers` = aproxy 解析失败，请求侧 502（最高频死法） |
-| 6 | 不输出 `content-length`/hop-by-hop 头 | 输了也被忽略（aProxy 自动管理），徒增困惑 |
-| 7 | 对未知输入走 error 行而不是 panic | panic/崩溃 → 请求侧 502、进程被剔除 |
+| Process lifetime | One process per conversion; aProxy kills it after reading the reply | A pool of long-lived workers, each looping over lines |
+| Concurrency | One conversion at a time per transform (request and response each) | Up to `pool_max` (default 4) at once; further requests wait for a free worker |
+| State between requests | None: every request sees a fresh process | Kept in each worker's memory |
+| `worker_id` | Always `0` | Slot number `0 .. pool_max - 1` |
+| Cost per request | A process start | A pipe round trip |
 
-最小合格实现（python，persistent 就绪）：
+Use `persistent` when the program keeps state (a rotation counter, a loaded config file, a cache)
+or when the instance serves concurrent requests; use `spawn` for a quick stateless script on a
+lightly used instance.
+
+How the persistent pool behaves, so you can reason about your program's lifetime:
+
+- Workers start on demand, not at instance start, and an idle worker is reused before a new one is
+  started. Requests beyond `pool_max` queue; the time spent queueing does not count toward
+  `timeout_secs`.
+- A worker idle for `idle_timeout_secs` (default 300; `0` = never) is killed. State held in
+  memory is lost with it, so a rotation counter restarts from the beginning.
+- A worker that times out, breaks the protocol, or dies is killed and removed; the next request
+  starts a fresh one.
+- If an idle worker turns out to be dead when reused (it exited while idle), aProxy retries that
+  request once on a fresh worker. If the fresh worker also dies without replying, the request
+  fails; aProxy does not keep restarting a program that cannot start.
+
+Write the loop form regardless of mode. A program that loops until EOF also works in spawn mode,
+where aProxy simply kills it after one reply.
+
+## Protocol duties
+
+| Duty | If you break it |
+|---|---|
+| Read stdin one line at a time; one line is one envelope | aProxy keeps stdin open between requests, so a program that reads all of stdin (`sys.stdin.read()`, `json.load(sys.stdin)`) never gets past the read; the request times out. |
+| Write exactly one envelope line per request, and nothing else, to stdout | Protocol error: the worker is evicted and the request fails. |
+| Flush stdout after every reply | aProxy waits until `timeout_secs` (default 30), kills the worker, and the request fails with a timeout. |
+| Send logs and diagnostics to stderr | aProxy discards stderr, so this is safe; on stdout they break the pairing. |
+| Always include `headers` in a reply, and write the body back even if unchanged | A missing `headers` fails the parse; a missing body sends an empty body. |
+| Report a per-request failure as `{"headers":{},"error":"..."}` and keep running | A crash or exit without a reply fails the request with no reason and costs a process restart. |
+| Exit when stdin reaches EOF | aProxy normally kills its workers itself, but if the aProxy process dies without cleaning up (crash, forced stop), EOF is the only signal your worker gets; a program that ignores it keeps running as an orphan. |
+| Catch errors around the conversion, not just around parsing | An unhandled exception is a crash (see above). |
+
+The exact messages each violation produces are in troubleshooting.md.
+
+## Loop templates
+
+Each template echoes the envelope unchanged. Put your conversion in `transform`; the presence of
+`method` tells you which side you are on (see protocol.md).
+
+### Python
 
 ```python
 #!/usr/bin/env python3
-import sys, json
+import json
+import sys
 
-# Windows 必备：脚本语言 stdout 默认编码是系统代码页（GBK 等），信封里的
-# 中文/非 ASCII 会乱码或抛 UnicodeEncodeError——stdin/stdout 必须显式 UTF-8
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdin.reconfigure(encoding="utf-8")
-    sys.stdout.reconfigure(encoding="utf-8")
+# Windows pipes default to the system code page; force UTF-8 both ways.
+sys.stdin.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8")
 
-def process(env: dict) -> dict:
-    # 你的转换逻辑：改 env["url"] / env["headers"] / env["body"]
-    return env                                     # echo 最小例
 
-def main():
-    while True:
-        line = sys.stdin.readline()
-        if not line:                               # EOF → exit（义务 #3）
-            return
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            env = json.loads(line)
-        except Exception as e:
-            out = {"headers": {}, "error": f"信封解析失败: {e}"}
-        else:
-            try:
-                out = process(env)
-            except Exception as e:                 # 义务 #4：error 行不是崩溃
-                out = {"headers": {}, "error": f"转换失败: {e}"}
-        sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
-        sys.stdout.flush()                         # 义务 #2
+def transform(env: dict) -> dict:
+    return env
 
-main()
+
+for line in sys.stdin:  # the loop ends at EOF and the program exits
+    try:
+        reply = transform(json.loads(line))
+    except Exception as e:
+        reply = {"headers": {}, "error": f"{type(e).__name__}: {e}"}
+    sys.stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
 ```
 
-Node 最小实现（Node 的 stdout 写入 IPC 管道无编码问题，JSON.stringify 天然
-紧凑单行）：
+### Node.js
 
 ```javascript
 #!/usr/bin/env node
-'use strict';
-const rl = require('readline').createInterface({ input: process.stdin });
+const readline = require('readline');
+
+function transform(env) {
+  return env;
+}
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 rl.on('line', (line) => {
-  const t = line.trim();
-  if (!t) return;
-  let out;
+  let reply;
   try {
-    const env = JSON.parse(t);
-    out = env;                                   // echo 最小例：改这里
+    reply = transform(JSON.parse(line));
   } catch (e) {
-    out = { headers: {}, error: `信封解析失败: ${e.message}` };
+    reply = { headers: {}, error: String(e) };
   }
-  process.stdout.write(JSON.stringify(out) + '\n');
+  process.stdout.write(JSON.stringify(reply) + '\n');
 });
-rl.on('close', () => process.exit(0));           // EOF → exit（义务 #3）
+// No exit handler needed: when stdin closes, Node exits after pending writes drain.
 ```
 
-Rust 编译版（直接依赖 `aproxy-envelope` crate——信封解析/序列化/base64
-互斥校验零手写；`cargo build --release` 后的二进制即 format）：
+Both templates pass `scripts/test_format.py`, including the EOF check.
+
+### Rust
+
+The `aproxy-envelope` crate (crates.io) is the envelope type aProxy itself uses, so parsing,
+serialization and the `body`/`body_b64` checks match aProxy exactly.
 
 ```rust
-// Cargo.toml: aproxy-envelope = "0.1" （crates.io）
+// Cargo.toml: aproxy-envelope = "0.1"
 use std::io::{BufRead, Write};
+
 use aproxy_envelope::TransformEnvelope;
+
+fn transform(env: TransformEnvelope) -> Result<TransformEnvelope, String> {
+    // body_bytes() decodes body or body_b64; set env.body or env.body_b64 on the way out.
+    Ok(env)
+}
 
 fn main() {
     let stdin = std::io::stdin();
-    let mut lines = stdin.lock().lines();
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    while let Some(Ok(line)) = lines.next() {    // EOF → 退出（义务 #3）
-        let t = line.trim_end();
-        if t.is_empty() { continue; }
-        let reply = match TransformEnvelope::from_line(t) {
-            Ok(mut env) => {
-                // 你的转换逻辑：改 env.url / env.headers / env.body
-                env                              // echo 最小例
-            }
-            Err(e) => TransformEnvelope {
-                headers: Default::default(),
-                error: Some(format!("信封解析失败: {e}")),
+    let mut out = std::io::stdout().lock();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break }; // EOF or a broken pipe ends the loop
+        let reply = TransformEnvelope::from_line(line.trim_end())
+            .map_err(|e| e.to_string())
+            .and_then(transform)
+            .unwrap_or_else(|reason| TransformEnvelope {
+                error: Some(reason),
                 ..Default::default()
-            },
-        };
-        let _ = writeln!(out, "{}", reply.to_line().unwrap_or_else(|_| {
-            r#"{"headers":{},"error":"序列化失败"}"#.to_string()
-        }));                                     // writeln 自带 \n
-        let _ = out.flush();                     // 义务 #2
+            });
+        let text = reply
+            .to_line()
+            .unwrap_or_else(|_| r#"{"headers":{},"error":"serialize failed"}"#.to_string());
+        let _ = writeln!(out, "{text}");
+        let _ = out.flush();
     }
 }
 ```
 
-C++ 编译版（高性能场景的**首选**：无解释器、无 GC、进程冷启动毫秒级、
-persistent 下单请求处理微秒级——高频大流量实例把转换开销压到噪声以下）。
-JSON 解析用 nlohmann/json 单头文件（GitHub 下载 `json.hpp` 即可，无链接
-依赖）：
+### Other languages
 
-```cpp
-// fmt.cpp — 编译：g++ -O2 -std=c++17 -I<json.hpp所在目录> fmt.cpp -o fmt
-//            (MSVC: cl /O2 /std:c++17 /utf-8 /I<目录> fmt.cpp /Fe:fmt.exe)
-// 源码必须保存为 UTF-8（/utf-8 旗标保证字面量编码正确）
-#include <iostream>
-#include <string>
-#include <nlohmann/json.hpp>
-using json = nlohmann::json;
+Any language works the same way: read a line with a growable buffer (envelope lines can be many
+megabytes), parse it with a JSON library, write one compact line, flush. In C or C++ use
+`getline` rather than a fixed `fgets` buffer, and remember that C/C++ have no standard base64 for
+`body_b64`.
 
-int main() {
-    std::ios::sync_with_stdio(false);
-    std::string line;
-    // getline 失败（EOF）→ 循环退出 = 义务 #3
-    while (std::getline(std::cin, line)) {
-        if (line.empty()) continue;
-        json out;
-        try {
-            json env = json::parse(line);
-            // 你的转换逻辑：改 env["url"] / env["headers"] / env["body"]
-            out = env;                             // echo 最小例
-        } catch (const std::exception& e) {
-            out = json{{"headers", json::object()},
-                       {"error", std::string("信封解析失败: ") + e.what()}};
-        }
-        std::cout << out.dump() << "\n" << std::flush;   // 义务 #2：flush 必须
-    }
-    return 0;
-}
-```
+## Language pitfalls
 
-C 语言版要点（不引第三方库时的骨架）：`fgets` 读行（缓冲区要给足——信封行
-可达 MB 级，按 `spool_limit_mb` 上界规划或改用 `getline(3)` POSIX 动态分配）；
-JSON 解析推荐 cJSON（单文件）或 yyjson（高性能）；写出后 `fflush(stdout)`。
-其余义务与 C++ 版完全同构。
+| Language | Pitfall | Fix |
+|---|---|---|
+| Python on Windows | Pipes use the system code page (GBK and the like): non-ASCII text is garbled or raises `UnicodeEncodeError` | `reconfigure(encoding="utf-8")` on stdin and stdout, as in the template |
+| Python | `print` without `flush=True`, or `sys.stdout.write` without `flush()` | Flush after each reply |
+| bash + jq | `jq` pretty-prints over several lines by default | Always `jq -c` |
+| Node.js | Mixing `console.log` debugging with replies on stdout | `console.error` for diagnostics |
+| Go | `bufio.Scanner` stops at lines over 64 KiB | `scanner.Buffer(make([]byte, 0, 1<<20), 512<<20)` or `bufio.Reader.ReadString('\n')` |
+| Go, Rust, C | Buffered writer never flushed | Flush after each line |
+| PowerShell | `ConvertTo-Json` is multi-line by default and truncates nesting at depth 2 | `ConvertTo-Json -Compress -Depth 100`; set `[Console]::OutputEncoding` to UTF-8 |
+| Any | A library or runtime prints a banner or warning on stdout at startup | Silence it or redirect it to stderr; the first line aProxy reads must be your reply |
 
-二进制 body（`body_b64`）：C/C++ 没有 stdlib base64——引加州汤（忽略），
-或用 header-only 实现如 `libbase64`/boost/beast 的 base64，或只处理文本
-body、把二进制场景透传给 error 行。
+## Techniques
 
-联调测试器：`scripts/test_format.py`（本 skill 附带）——模拟
-anthropic / openai-chat / openai-responses 三种格式的**请求侧与响应侧**信封
-（body 均为官方 API 文档核对过的真实形态，含 SSE 流式文本变体）喂给你的
-format、格式化打印回信封，并检查 EOF 退出义务。写完 format 第一件事：
+**One program for both sides.** Branch on whether `method` is present and configure the same
+command for `request_transform` and `response_transform`. Each side still runs in its own process
+pool, so the two halves cannot share memory; carry anything the response side needs in the URL
+(the response envelope's `url` is your request-side URL) or derive it from configuration.
+
+**Pass settings through `extra`.** JSON is the most flexible encoding. In TOML, a single-quoted
+literal string avoids escaping: `extra = '{"keys": ["sk-a", "sk-b"]}'`. For anything long or
+secret, put a file path in `extra` and read the file once per worker. Keep secrets out of `args`:
+command lines are visible to other processes on the machine.
+
+**Rewrite the URL, keep the path when it matters.** To change only the host, replace the scheme
+and host and keep the rest of `url`, so every endpoint the client calls (for example
+`/v1/messages/count_tokens` beside `/v1/messages`) keeps its own path. Replacing the whole URL
+sends every request to the same endpoint.
+
+**Spread rotation across workers.** Start each worker's key index at `worker_id` (examples.md, Key
+rotation).
+
+**SSE bodies.** A streaming response arrives as the complete event text. Split it on blank lines
+into events, convert each `data:` payload, and join the result with the same framing. Keep the
+`content-type: text/event-stream` header.
+
+**Binary bodies.** Check for `body_b64` before assuming `body` exists. Return binary output in
+`body_b64`.
+
+## Test without aProxy
+
+`scripts/test_format.py` (in this skill) starts your program, sends one mock envelope, prints the
+reply, then closes stdin and checks that the program exits. The mock bodies are realistic
+Anthropic Messages, OpenAI Chat and OpenAI Responses payloads with non-ASCII text, so encoding
+problems show up immediately.
 
 ```bash
-# 请求侧：模拟客户端请求（带 method），测请求转换
-python scripts/test_format.py --format-spec anthropic --command ./fmt
+# request side: a client request envelope
+python scripts/test_format.py --format-spec anthropic --command python -- my_format.py
 
-# 响应侧：模拟上游响应（无 method = 响应侧标志），测响应反向转换
-python scripts/test_format.py --side response --format-spec openai-chat --command ./fmt
+# response side: an upstream response envelope (no method)
+python scripts/test_format.py --side response --format-spec openai-chat --command python -- my_format.py
 
-# 响应侧 SSE：body 为真实流式事件序列文本（aproxy 整缓冲后 format 看到的就是它）
-python scripts/test_format.py --side response --sse --format-spec anthropic --command ./fmt
+# response side, streaming: the body is a complete SSE event sequence
+python scripts/test_format.py --side response --sse --format-spec anthropic --command ./my-format
 
-# 参数透传（-- 之后原样）；--body-file 自定义 body（非 UTF-8 自动走 body_b64）
-python scripts/test_format.py --format-spec openai-chat --command python -- args fmt.py
-python scripts/test_format.py --format-spec anthropic --command ./fmt --body-file binary-payload.bin
+# pass the same extra your config will use; supply your own body
+python scripts/test_format.py --format-spec anthropic --extra '{"keys":["sk-a"]}' --command ./my-format
+python scripts/test_format.py --format-spec anthropic --body-file payload.bin --command ./my-format
 ```
 
-多语言高频坑（按「写了但跑不通」频率排序）：
+| Flag | Meaning |
+|---|---|
+| `--format-spec` | `anthropic`, `openai-chat` or `openai-responses`: protocol of the mock body (required) |
+| `--side` | `request` (default) or `response` |
+| `--sse` | Response side only: an SSE body instead of JSON |
+| `--command` | Program to run (required); its arguments go after `--` |
+| `--url` | Envelope `url` (default: the protocol's usual endpoint) |
+| `--extra` | Envelope `extra` (default empty) |
+| `--worker-id` | Envelope `worker_id` (default 0) |
+| `--body-file` | Use a file as the body; non-UTF-8 content is sent as `body_b64` |
+| `--raw` | Print the reply as received instead of pretty-printing it |
+| `--timeout` | Seconds to wait for the reply (default 10) |
 
-| 语言 | 坑 | 解法 |
-|---|---|---|
-| python（Windows） | stdout 默认 GBK，非 ASCII 抛异常/乱码 | 模板里的 `reconfigure(encoding="utf-8")` |
-| bash+jq | jq 默认 pretty-print 多行输出；后果：每个请求回多行，被判协议错误、502 | **jq 一律 `-c`**；printf 补 `\n` |
-| Node | `console.log` 与手写 write 混用导致交错 | 统一 `process.stdout.write(json + "\n")` |
-| python | `json.dumps` 默认 `ensure_ascii=True`（\uXXXX 转义） | 两者都合法（JSON 转义不破帧），习惯上 `ensure_ascii=False` |
-| 编译型语言（Go/C/Rust） | bufio writer 忘 flush；读行缓冲按固定长度 | 按行读（bufio.Scanner）+ 每行后 flush |
-| 任意语言 | 往 stdout 打日志/调试输出 | 日志写 stderr（aProxy 丢弃它，要留痕写自己的文件）；stdout 只放信封行 |
-| 任意语言 | base64 用了 URL-safe 变体 | 标准字母表 + `=` padding（protocol.md） |
+The harness reports `[FAIL]` when the program cannot start, never replies, dies, or replies with
+invalid JSON, and `[WARN]` for an `error` reply or a program that ignores EOF. It prints a
+checklist for the rest but does not verify it: confirm by eye that `headers` is present, the body
+is there, and nothing else was printed.
 
-spawn 模式兼容：处理一行后不退出也没关系（aProxy 用毕即杀），上面的循环壳
-两模式通用——**直接按 persistent 写，两种模式都能跑**。
-
-## 二、正确配置（aproxy 侧最高频错误区）
-
-config.toml 每实例字段（无 settings 全局层、无 CLI 旗标）：
-
-```toml
-# 请求侧：body/headers/url/method 改写后发上游
-request_transform = { command = "python", args = ["fmt.py"], mode = "persistent", pool_max = 4, idle_timeout_secs = 300, timeout_secs = 30, extra = "任意字符串" }
-# 响应侧：上游响应改写后回放（**独立配置**，忘配 = 响应不被转换）
-response_transform = { command = "python", args = ["fmt.py"], mode = "persistent" }
-```
-
-配置易错点：
-
-- **command 首选绝对路径或 `~/` 前缀**：相对路径按 PATH 与守护进程工作目录
-  解析，守护的工作目录不可靠。`~/` 前缀会被 aProxy 展开为用户主目录
-  （`~/.aproxy/bin/aproxy-format` 可直接用）；裸文件名走 PATH。
-- **spawn 模式下转换在单实例内串行**：每请求一次进程启动、逐个执行——
-  高并发场景选 persistent（池按 `pool_max` 并发扩容）。
-- **请求与响应是两条配置**：只配 `request_transform` = 请求被转换、响应原样
-  回放——协议转换场景两头都要配（且指向同一程序同一份逻辑）。
-- **轮换/计数/聚合必须 `mode = "persistent"`**：spawn 每请求新进程，进程内
-  状态恒重置（轮换永远第一个 key）。
-- **key 轮换只在请求之间生效**：请求侧转换每个请求只执行一次，同一请求的重试
-  重放同一份转换产物，沿用同一个 key——不要指望重试时换 key。
-- **`forward_only = true` 与转换器互斥**（启动即报错）：forward_only 不缓冲
-  请求体，转换器需要全量 body。
-- **`extra` 是唯一传参通道**（原样透传的字符串，格式由 format 自定）：
-  传配置路径、传 key 表 JSON、传任何东西；两个 transform 的 extra 各自独立。
-  **aProxy 不展开 extra 里的 `~`**——传路径时写绝对路径，或像官方 aproxy-format
-  那样由 format 自己展开 `~/`；相对路径按守护进程的工作目录解析，不可靠。
-- 改配置后 `aproxy restart <端口或别名>` 生效；`aproxy config --show` 核对
-  实际生效值。
-
-## 三、常用技巧
-
-### worker_id 做池内错位（轮换不均的解法）
-
-persistent 池内各 worker 独立计数，各自从首 key 起会集中打前几个 key。
-信封的 `worker_id`（0..pool_max）就是给这个的：
-
-```python
-start = env.get("worker_id", 0) % len(keys)
-idx = (start + n_local) % len(keys)   # n_local = 本 worker 内请求计数
-```
-
-### extra 传结构化参数
-
-extra 是原样透传的字符串——传 JSON 最通用（format 自解析），不限制格式：
-
-```toml
-extra = '{"keys":["sk-a","sk-b"],"model_map":{"gpt":"gpt-4o"}}'
-```
-
-### 请求侧/响应侧一套代码两用
-
-信封**有没有 `method`** 是 aproxy 的方向约定：请求侧信封带 method，响应侧
-不带。一个程序里按此分派，两个 transform 配同一文件。
-
-### url 改写是协议转换的核心
-
-请求侧改 `env["url"]` 实现端点/路径迁移；**响应侧信封 url 是你改写后的最终
-地址**——多渠道场景用它反查渠道（两侧进程无共享状态，这是唯一对齐线索）。
-
-### 二进制 body 用 body_b64
-
-body 非 UTF-8（图片、压缩包）时 aproxy 自动走 `body_b64`；你的二进制输出
-同理。处理逻辑开头先看 `body` 缺不缺、`body_b64` 有没有。
-
-### SSE/大响应是整流转文本
-
-信封模型下 aproxy 把整条响应缓冲后整体交给你——SSE 文本也是文本，逐行
-转换后拼回即可（无需流式 API）。转换期间客户端拿不到增量（本就等全量）。
-
-### 手动喂数据测试（不经 aproxy）
+To check the one-line rule directly, pipe two envelopes in and count the lines out:
 
 ```bash
-printf '%s\n' '{"method":"POST","headers":{},"body":"{}","url":"https://up.example.com/v1/x","worker_id":0,"extra":""}' \
-  | python fmt.py
+E='{"method":"POST","url":"https://up.example.com/v1/x","headers":{},"body":"{}","worker_id":0,"extra":""}'
+printf '%s\n' "$E" "$E" | python my_format.py | wc -l   # expect 2
 ```
 
-期望一行信封回显。error 场景单独喂一遍确认输出 `{"headers":{},"error":...}`。
+Also feed an input that should fail and confirm you get an `error` reply rather than a crash.
 
-## 四、易错点速查
+## Configure it in aProxy
 
-| 错误 | 症状 | 解法 |
-|---|---|---|
-| 忘记 flush | 请求挂到 30s 超时 | 每行写后 flush（义务 #2） |
-| stdout 夹了日志 / jq 漏 `-c` | 502「format 输出违反信封协议」，worker 被剔除 | stdout 只写信封行，日志写 stderr（义务 #1b） |
-| 循环不处理 EOF | 实例停止后 worker 挂孤儿 | EOF 即 exit（义务 #3） |
-| 用 exit 1 表达业务失败 | worker 被剔除、无 error 文案 | error 行 + exit 0（义务 #4） |
-| 输出 `content-length` | 无效且困惑 | 删掉，aProxy 按实际字节回填 |
-| 轮换用了 spawn | 永远第一个 key | `mode = "persistent"` |
-| 只配 request 没配 response | 响应没转换 | 两条独立配置都要配 |
-| 改了配置没重启 | 行为没变 | `aproxy restart <端口或别名>` |
-| 响应侧回传了上游鉴权头 | key 泄漏给客户端 | 响应侧重建干净头表 |
-| 假设 body 一定是 UTF-8 文本 | 二进制 body 时崩 | 先判 `body_b64` |
-| 头表键写大写 | 能用但不可移植 | 统一小写键 |
+Transformers are per instance, set in that instance's config.toml (there is no global default and
+no command-line flag):
 
-更多排障（502 文案对照、日志位置）见 [troubleshooting.md](troubleshooting.md)；
-字段级语义见 [protocol.md](protocol.md)。
+```toml
+request_transform  = { command = "/usr/bin/python3", args = ["/home/me/formats/convert.py"], mode = "persistent", pool_max = 4, idle_timeout_secs = 300, timeout_secs = 30, extra = '{"model": "gpt-4o"}' }
+response_transform = { command = "/usr/bin/python3", args = ["/home/me/formats/convert.py"], mode = "persistent" }
+```
+
+`pool_max`, `idle_timeout_secs` and `timeout_secs` are shown at their defaults; the full field
+reference is in the aproxy-cli skill, config-toml.md. Points that trip up format authors:
+
+- **Two independent settings.** A protocol converter needs both; with only `request_transform`,
+  responses reach the client unconverted. `extra` and every other field are set per side.
+- **Use absolute paths.** aProxy runs `command` directly, without a shell. A bare name is looked
+  up on PATH; a relative path resolves against the daemon's working directory, which is wherever
+  the instance happened to be started. `~/` at the start of `command` expands to the user's home
+  directory, but `args` and `extra` are passed untouched, so a script path in `args` must be
+  absolute. On Windows, write paths with forward slashes or in single-quoted TOML strings
+  (`'C:\fmt\convert.py'`); a bare command name is found on PATH only as an `.exe`.
+- **Stateful programs need `persistent`.** In spawn mode every request starts a fresh process, so
+  a rotation counter is always zero.
+- **Not with `forward_only`.** An instance with `forward_only` enabled (in config.toml, or
+  inherited from settings.json) refuses to start with a transformer, because it never buffers the
+  body.
+- **Every request on the instance goes through the transformer**, including requests your
+  program was not written for (model listing, token counting, `GET` requests with an empty body).
+  Pass those through unchanged or reply with a clear `error`.
+
+Apply the change with `aproxy restart <port|alias>`. Restarting cuts every connection through that
+instance. If you are an agent whose own model traffic goes through it, that includes your session
+and the user's other sessions; ask before restarting it, or try the transformer first on a
+separate instance with its own config file and a spare port (`aproxy start <config path>`).
+
+Confirm it is active:
+
+- `aproxy start` prints a line beginning `外部转换器：请求/响应将交给 format 程序改写` ("external
+  transformer: requests/responses will be rewritten by the format program").
+- The daemon log (`aproxy logs <port|alias>`) records `外部转换器已启用（信封协议交给外部 format 程序改写）`
+  ("external transformer enabled") once per configured side at startup, and
+  `请求已由外部转换器改写` ("request rewritten by the external transformer") with the new URL for
+  every converted request.
+- `aproxy config --show` prints the transformer settings as aProxy parsed them (`extra` masked).

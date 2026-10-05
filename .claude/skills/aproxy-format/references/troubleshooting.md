@@ -1,115 +1,100 @@
-# 排障
+# Troubleshooting transformers
 
-## 请求 502 且错误含「format 进程启动失败」
+Error messages and symptoms caused by a format program, with their causes and fixes. Read it when
+a request fails with a 502 that mentions the transformer, when a log line names it, or when
+conversion silently does not happen. The messages are quoted exactly as aProxy and aproxy-format
+print them, so search for the Chinese text in real output.
 
-`request_transform.command` 找不到。检查：
-- 命令存在（写绝对路径最稳：`~/.aproxy/bin/aproxy-format`）；
-- 相对路径按 PATH 与工作目录解析——守护进程的工作目录不可靠，别依赖；
-- Windows 上带空格的路径在 toml 里正常写（不走 shell，按 argv 数组执行）。
+## Where the messages appear
 
-## 请求 502 且错误含「format 报告转换失败」
-
-format 输出了 error 行——这是 format 的**业务判定**（如 model 未命中渠道）。
-错误文案来自 format 的 error 字段，去 format 的逻辑里找原因。
-
-## 请求 502 且错误含「转换超时」
-
-`timeout_secs`（默认 30s）内没等到回行。慢转换调大它；persistent worker
-可能卡在上一请求（超时的 worker 会被 kill 剔除，下次请求起新的）。
-
-## 请求 502 且错误含「format 进程意外退出且无输出」
-
-format 崩了（非零退出且没输出信封行）。用错误输入手动喂数据复现：
-
-```bash
-printf '%s\n' '<信封 JSON>' | <command> <args>
-```
-
-注意：persistent 池复用到**空闲期间已死**的 worker（还没产出任何输出就失败）
-时，池内已自动换新 worker 重试了一次——能看到这个 502，说明新开的 worker 也
-死了，即 format 本身起不来（command 路径对但程序启动即崩、缺运行时依赖、参数
-错等），不是偶发的池状态问题。aProxy 丢弃 format 的 stderr，崩溃原因要手动
-复现才能看到。
-
-## 请求 502 且错误含「format 输出违反信封协议」
-
-format 的 stdout 内容不是「每个请求恰好一行合法信封」。信封协议没有请求序号，
-worker 的第 N 行输出只能靠「一请求一行、按序」对应第 N 个请求，所以任何对应
-关系存疑的输出都会让该 worker 被剔除、当次请求 502（否则下一个请求会读到上一个
-请求的输出）。常见原因：
-
-- **往 stdout 打了日志/横幅/调试输出**：stdout 只能写信封行；日志写 stderr
-  （aProxy 会丢弃 stderr，需要留痕请写你自己的文件）。
-- **`jq` 忘了 `-c`**：默认 pretty-print 输出多行，每个请求回了不止一行。
-- 一个请求回了多行（循环里重复 print）、空闲时 stdout 冒出未被请求的输出
-  （后台线程打印）——这类也会被检出并剔除 worker。
-- 输出不是合法 JSON、含非 UTF-8 字节，或 `body` 与 `body_b64` 同时出现。
-
-排查：用上节命令手动喂一行信封，看 stdout 是否**恰好一行**合法 JSON：
+- **The client** receives HTTP 502 when the request side fails, with the body
+  `请求转换失败: <reason>（请求侧转换失败不重试，未发往上游）` ("request transform failed: <reason>
+  (not retried, not sent upstream)"). Nothing was sent upstream. A streaming client that had
+  already received keepalive headers gets an SSE `error` event of type `proxy_transform_failed`
+  with `请求转换失败: <reason>` as its message instead.
+- **The daemon log** (`aproxy logs <port|alias>`) records request-side failures as
+  `请求转换失败，终态返回（请求侧转换失败按约定不重试）` ("request transform failed; final
+  response returned, not retried") and response-side failures as `响应转换失败，透传上游原始响应`
+  ("response transform failed; passing the upstream response through"), each with an `error`
+  field holding the reason. `aproxy status` shows the latest
+  request-side failure as the instance's last error.
+- **Your program's stderr** is discarded by aProxy. To see a crash, run the configured command by
+  hand with one envelope on stdin (stderr then goes to your terminal):
 
 ```bash
-printf '%s\n' '<信封 JSON>' | <command> <args> | wc -l   # 期望 1
+E='{"method":"POST","url":"https://api.anthropic.com/v1/messages","headers":{"content-type":"application/json"},"body":"{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":16,\"system\":\"s\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}","worker_id":0,"extra":""}'
+printf '%s\n' "$E" | <command> <args...>          # expect exactly one JSON line
+printf '%s\n' "$E" "$E" | <command> <args...> | wc -l   # expect 2
 ```
 
-## persistent worker 不退出 / 挂成孤儿进程
+Use the same `extra` as the config. `scripts/test_format.py` (guide.md, Test without aProxy) checks
+more but hides stderr.
 
-format 的循环没处理 stdin EOF。铁律：**读到 EOF 就 exit**（aProxy 实例停止
-时靠关闭管道回收 worker）。while 循环模板见 guide.md。
+## Reasons reported by aProxy
 
-## 响应看起来没转换
+The `<reason>` starts with one of these:
 
-- `response_transform` 配置了吗（请求/响应是**两条独立配置**）；
-- 转换失败时会**透传原始响应**（响应侧失败语义）——查
-  `aproxy logs <端口>` 里的「响应转换失败」warn 行看原因；
-- bounded_retry_paths 命中的透传路径**不进响应转换**（错误响应不经 format）。
+| Message begins with | Meaning | Fix |
+|---|---|---|
+| `format 进程启动失败（检查 command 路径）` ("format process failed to start; check the command path") | The program could not be started: not found, not executable, or a relative path that does not resolve from the daemon's working directory | Use an absolute path in `command`. On Windows a bare name is found only as an `.exe`, so npm `.cmd` shims and scripts need their interpreter as `command`. |
+| `format 进程意外退出且无输出` ("format process exited unexpectedly without output") | The program exited or crashed before writing a reply. A worker that merely died while idle is not the cause: aProxy retries that case once on a fresh process | Run the command by hand (above). Usual causes: a wrong script path in `args` (not `~`-expanded), a missing runtime or module, an unhandled exception, the official binary started without `args = ["run"]` (it prints usage and exits). |
+| `format 进程管道读写失败` ("format process pipe read/write failed") | The process died or closed its pipes mid-exchange | Same as above. |
+| `转换超时` ("conversion timed out") | No reply line within `timeout_secs` (default 30). The worker is killed | Flush after each reply; read one line at a time (a program that reads all of stdin, like `json.load(sys.stdin)`, waits forever); raise `timeout_secs` only if the conversion is slow by nature. |
+| `format 输出违反信封协议:` ("format output violates the envelope protocol") | Your stdout was not exactly one valid envelope line (the worker is evicted), or its `body_b64` did not decode. The detail follows the colon; see the next table | Fix the output. |
+| `format 报告转换失败: ` ("format reported a conversion failure") | Your program replied with `error`; the rest is its own text | For the official binary, see Errors from aproxy-format below. |
+| `body 临时文件读取失败（本地磁盘故障）` ("could not read the body temp file; local disk fault") | aProxy could not read its own spooled body from disk | Not a format problem: check free space and permissions in the aProxy home directory. |
 
-## 多 key 轮换不生效（永远同一个 key）
+Details after `format 输出违反信封协议:`:
 
-轮换计数在进程内存——**spawn 模式每请求新进程，计数恒 0**。改为
-`mode = "persistent"`。池内各 worker 各自独立计数（各从首 key 起）——
-轮换不均时用信封 `worker_id` 做起始偏移（官方 aproxy-format 已处理）。
+| Detail begins with | Cause | Fix |
+|---|---|---|
+| `输出不是 UTF-8` ("output is not UTF-8") | stdout uses a legacy code page | Set stdout to UTF-8 (guide.md, Language pitfalls). |
+| `信封 JSON 解析失败:` ("envelope JSON parse failed") | The line is not a valid envelope: a banner or log line came first, a blank line, a BOM, pretty-printed JSON, a wrong type, or ``missing field `headers` `` | Write only compact envelopes to stdout; always include `headers`. |
+| `body 与 body_b64 互斥，不能同时出现` ("body and body_b64 are mutually exclusive") | Both fields in one reply | Send one of them. |
+| `body_b64 解码失败:` ("body_b64 decode failed") | Not standard padded base64 (URL-safe alphabet, line breaks) | Use the standard encoder (protocol.md, body and body_b64). |
+| `对单个请求输出了不止一行` ("more than one line for a single request") | Extra output after the reply: debug prints, `jq` without `-c`, a reply written twice | One line per request; diagnostics to stderr. |
 
-## 聚合路由报「model 未命中任何渠道」
+A related warning without a failed request: `空闲 worker 的 stdout 冒出了未被请求的输出`
+("an idle worker printed output nobody asked for"). The worker printed something between
+requests, typically from a background thread; aProxy evicted it and used a fresh worker. Remove
+the stray output.
 
-渠道表的 `models` glob 不匹配请求的 model 名。检查：
-- 模型别名表 `[models]` 是否需要映射；
-- glob 语法（`claude-*` 匹配前缀；无 `models` 字段 = 匹配全部）；
-- `client_format = "auto"` 检测失败也会报错（错误文案带「检测失败」）——
-  请求字段名不像已知协议时改为显式声明格式。
+## Errors from aproxy-format
 
-## auto 模式报错「client_format = "auto" 只支持同协议」
+On the request side these follow `format 报告转换失败: ` in the 502; on the response side they
+appear in the `响应转换失败` log line while the client gets the unconverted response.
 
-`client_format = "auto"` 按 body 形态启发式检测客户端协议，**只放行同协议**：
-检测出的客户端协议与路由到的渠道协议不同时，请求侧直接 502 报错（发往上游
-之前拒绝，不产生计费），文案点名检测结果、渠道协议，并提示显式声明。原因是
-信封没有请求→响应的上下文，响应侧拿不到客户端协议，跨协议的响应无法转回。
+| Message | Cause | Fix |
+|---|---|---|
+| `未提供聚合配置（--config 或 transform extra 均为空）` ("no aggregation config: --config and extra are both empty") | `extra` not set on this side | Set `extra` to the config path on both transforms. |
+| `聚合配置加载失败: 读取 <path>: ...` ("failed to load aggregation config: reading <path>") | File missing or unreadable | Use an absolute path or one starting with `~/`. |
+| `聚合配置加载失败: 解析失败: ...` ("... parse failed") | TOML syntax error, missing `client_format`, or an unknown protocol name (`unknown variant`) | Protocol names are `anthropic_messages`, `openai_chat`, `openai_responses` (and `auto` for `client_format`). |
+| `聚合配置加载失败: 至少需要一个 [[channel]]` | No channels | Add a `[[channel]]` table. |
+| `聚合配置加载失败: 渠道 <name> 的 keys 不能为空` | Empty `keys` | Give the channel at least one key. |
+| `聚合配置加载失败: 渠道 <name> 的 weights 长度 (N) 必须与 keys (M) 一致` | `strategy = "weighted"` without one weight per key | Add `weights` of the same length, or drop `strategy`. |
+| `聚合配置加载失败: 渠道 <name> 的 weights 不能含 0` | A zero weight | Use positive weights; remove the key instead. |
+| `body 非 JSON` / `body 缺少 model 字段` ("body is not JSON" / "body has no model field") | A request without a JSON body naming a model, such as `GET /v1/models` | Expected for such requests on an aggregating instance; point clients that need them at another instance. |
+| `model <name> 未命中任何渠道（检查渠道表的 models 模式）` ("model matches no channel") | No channel's `models` pattern matches the model after `[models]` mapping | Fix the patterns (case-sensitive, matched against the upstream name), add a catch-all channel without `models`, or check for a misspelled key. |
+| `client_format=auto 检测失败：请求形态不像已知协议（检查字段名）` ("auto detection failed") | The body does not look like any supported protocol | Declare `client_format` explicitly. |
+| `client_format = "auto" 只支持同协议：...` ("auto supports same-protocol only") | Under `auto`, the request was routed to a channel of another protocol; rejected before reaching the upstream. Also happens when an Anthropic request without `system` is detected as `openai_chat` | Declare `client_format` explicitly. |
+| `协议转换失败: ...` ("protocol conversion failed") | The converter could not express this request or response in the other protocol | Route this model to a same-protocol channel. |
+| `url <url> 反查不到渠道（检查渠道表的 url 配置）` ("url matches no channel") | Response side: the request went to a URL no channel `url` prefixes, usually because the two sides use different `extra` files | Give both transforms the same `extra`, and restart after editing the config. |
+| `SSE 流式响应的跨协议转换尚未支持（渠道协议 <a> ≠ 客户端协议 <b>）` ("cross-protocol SSE conversion is not supported") | A streaming response from a channel of another protocol; the client receives the upstream stream unchanged and cannot parse it | Route streaming clients to a channel of their own protocol (examples.md, Limits). |
+| `响应 body 非 JSON` ("response body is not JSON") | The upstream answered with a non-JSON, non-SSE body that aProxy accepted as success | Check the channel URL; it may point at a web page rather than the API. |
 
-解法：在聚合配置里**显式声明 `client_format`**（如 `"anthropic_messages"` /
-`"openai_chat"`），改后 `aproxy restart <端口或别名>`。
+## Symptoms without an error
 
-另一个相关坑：auto 的检测本身是启发式的——**Anthropic 的 `system` 是可选
-字段**，不带 `system` 的标准 Anthropic 请求（`{model, max_tokens, messages}`）
-会被判成 OpenAI Chat。同协议路由下这不会出错（原样直通），但检测结果与真实
-客户端不符时，若路由到另一协议的渠道就会被上面的规则拒绝——同样用显式声明
-解决。生产实例一律显式声明。
-
-## 跨协议的流式（SSE）响应没有被转换
-
-官方 aproxy-format 的跨协议转换只支持**非流式**。跨协议 + 流式请求
-（如 Claude Code 默认 `stream: true`，渠道是 OpenAI 协议）时，请求侧转换
-成功、上游回 SSE，响应侧报「SSE 流式响应的跨协议转换尚未支持」，aProxy 按
-响应侧失败语义透传上游原始流——客户端收到的是渠道协议格式的流，无法解析。
-同协议 SSE 原样直通，不受影响。需要跨协议流式时：让客户端协议与渠道协议一致，
-或自己实现流式转换的 format。
-
-## 响应侧报「url 反查不到渠道」
-
-请求侧把 url 改写到了渠道表之外的地址（自定义 format 改了 url 但响应侧
-不认识）。渠道表的 `url` 必须与请求侧实际发出的地址一致（preserve_path
-场景按前缀匹配）。
-
-## 日志在哪
-
-`aproxy logs <端口>`（日志按启动随机命名，地址经 IPC 查询，不要拼路径）。
-转换相关日志：请求侧「请求已由外部转换器改写」/「请求转换失败」、响应侧
-「响应转换失败」、启动时「外部转换器已启用」。
+| Symptom | Cause | Fix |
+|---|---|---|
+| Responses reach the client unconverted | No `response_transform`; or the response transform failed (look for `响应转换失败` in the log); or the response was an upstream error, which is never transformed | Configure both sides; read the logged reason. |
+| A response header change takes effect only sometimes | When aProxy has already sent keepalive headers to a waiting client, only the body change applies | Expected; do not rely on response headers for keepalive-eligible streaming requests. |
+| Requests hang after enabling a transformer, and the log repeats `上游返回可重试状态码，重试` ("upstream returned a retryable status; retrying") or `上游返回错误内容，重试` ("upstream returned an error body; retrying") | The upstream rejects the transformed request (bad key, wrong model name, malformed body, wrong path). aProxy retries 4xx like any failure, always with the same transformed request | Read the upstream error preview logged next to that line, fix the conversion, and test it with `scripts/test_format.py`. A malformed `url` shows up as repeated network errors instead. |
+| Rotation always uses the first key | `mode` is not `persistent` (also check its spelling: an unknown key is ignored and the default `spawn` applies) | `mode = "persistent"`. |
+| Some keys are used more than others | Each persistent worker counts from the first key on its own; idle reaping restarts counters | Offset by `worker_id` in your own program (examples.md, Key rotation); the official binary does not. |
+| Conversions are slow under load, one at a time | `spawn` mode runs one conversion at a time per side | Switch to `persistent`; raise `pool_max` if requests queue. |
+| A transformer you configured never runs, and startup prints no transformer line | `command` is blank, which aProxy treats as not configured | Set `command`. |
+| The instance refuses to start: `forward_only 与外部转换器互斥：...` ("forward_only and external transformers are mutually exclusive") | `forward_only` is enabled for the instance, possibly inherited from settings.json | Set `forward_only = false` in this instance's config.toml, or remove the transformer. |
+| The instance refuses to start: `request_transform 的 pool_max 必须 >= 1，当前值: 0` (or `response_transform`) | `pool_max = 0` | Use 1 or more. |
+| Non-ASCII text arrives garbled, or the program raises `UnicodeEncodeError` | The program's pipes use the system code page | Set UTF-8 on stdin and stdout (guide.md, Language pitfalls). |
+| Format processes keep running after the instance stopped | The program ignores EOF, and aProxy exited without cleaning up (crash or forced stop) | Make the loop exit on EOF. End the leftovers by PID after confirming they are the format program; never kill by image name, which would also hit `aproxy` instances that agent sessions depend on. |
+| The client receives an upstream key in a response header | The response side copied headers that contain credentials | Rebuild or allow-list response headers (protocol.md, Security). |

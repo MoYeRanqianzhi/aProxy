@@ -1,84 +1,130 @@
 ---
 name: aproxy-cli
-description: aProxy CLI 完整参考——本地 API 代理（无限重试保障 agent 工作流）的全部命令、参数、config.toml 与 settings.json 配置字段、运行行为语义与版本兼容性。凡涉及 aproxy 的启动/停止/状态/日志/别名/多开/配置修改、排障（端口占用、启动失败、日志乱码）、或为本机 agent 软件配置代理地址时使用本 skill，即使用户没有明说「查文档」——例如"帮我把 Claude Code / Codex 挂到 aproxy"、"再加一个 12346 端口的实例"、"stop 之后怎么还占着端口"。外部转换器（request_transform/response_transform，协议转换/多 key 轮换/多渠道聚合）的**配置字段与运行行为**也在本 skill；编写 format 程序本体用 aproxy-format skill。
+description: Operate and configure aProxy, the local API proxy that retries failed LLM API requests indefinitely so agent workflows keep running. Covers every aproxy command (start, status, stop, restart, logs, restore, alias, find, doctor, config, install/upgrade), the config.toml and settings.json fields, runtime behavior (retries, keepalive heartbeats, multiple instances, logs, watchdog), connecting agent clients such as Claude Code and Codex, and troubleshooting. Use this skill whenever the user mentions aproxy or wants an agent client routed through a local retrying proxy, even if they do not ask for documentation - for example "point Claude Code at aproxy", "add a second instance on port 12346", "why is the port still in use after stop", "/compact hangs behind my relay API", "aproxy logs are garbled". Configuring request_transform / response_transform on the aProxy side is covered here; writing the format program itself belongs to the aproxy-format skill.
 ---
 
-# aProxy CLI
+# aProxy
 
-## 一分钟心智模型
+aProxy sits between an agent client and its LLM API. The client sends requests to
+`http://127.0.0.1:PORT`; aProxy forwards the path, query and headers unchanged to the upstream
+`base_url` from its config, and retries every failure until the upstream answers with a usable
+response. The client sees a slow answer instead of an error, so long agent runs survive overloaded
+or flaky upstreams.
 
-aProxy 是本地 HTTP 代理：客户端把 API base URL 指向 `http://127.0.0.1:<端口>`，
-aProxy 原样透传路径/查询/请求头到上游 `base_url`。请求失败（网络错误、4xx、5xx、
-错误 JSON）时**无限重试**（指数退避，封顶 `max_retry_backoff_secs`），流式响应期间
-向客户端发 SSE 心跳注释保活，成功后原样回放——客户端零感知。（两个例外：
-`forward_only` 模式放弃重试与缓冲、真流式直通；`bounded_retry_paths` 命中的
-请求失败 3 次即透传真实响应——Claude Code 走非官方 API 时 /compact 无限卡住
-常因上游不支持 count_tokens，把它加进该配置即可解决，见 behaviors.md。）
-控制通道（status/stop/logs）走命名管道 IPC，**永不占用代理端口**。
-入站来源校验：带 `Origin` 头的请求（浏览器/Electron 类客户端）默认被本地 403
-拒绝，Host 也受校验（防 DNS 重绑定）——见 config-toml.md 的
-`allowed_hosts / allowed_origins`；CLI 类客户端（Claude Code 等）不受影响。
+## How it works, in enough detail to reason about it
 
-两种配置文件分工（勿混淆）：
-- `config.toml`（~/.aproxy/config.toml）——人类可读可写，可多份平行并存（多开）
-- `settings.json`（~/.aproxy/settings.json）——程序管理的内部状态（别名、全局默认），
-  唯一，**不手改**，经 `aproxy alias`/`aproxy config --set-default` 管理
+- **It buffers, then replays.** aProxy reads the whole upstream response before sending anything
+  back. That is what lets it retry failures the client would otherwise see half-way: network
+  errors, 4xx, 5xx, `200` with an error JSON body, streams that break mid-way. Retries wait
+  0, 0, 0, 5, 10, 20 ... seconds, capped at `max_retry_backoff_secs` (default 320), forever.
+- **Heartbeats keep streaming requests alive.** While it retries a streaming request, aProxy sends
+  the client response headers early and then an SSE comment (`: keepalive`) every 15 s. That
+  defeats byte-level timeouts, but SSE parsers drop comments, so a client that times out on
+  *events* (Claude Code, Codex and others) still gives up unless its stream idle timeout is raised.
+  This is the most common integration mistake; see "Connect an agent client" below.
+- **Two deliberate exceptions to infinite retry:** `forward_only = true` streams straight through
+  with no buffering and no retries, and paths matched by `bounded_retry_paths` give up after 3
+  attempts and pass the real upstream response through (the fix when an upstream never supports
+  an endpoint, such as `count_tokens` behind some relay APIs).
+- **Each instance is one config.toml with its own `listen_addr`.** Instances run in the background
+  and are controlled over a local IPC channel (named pipe / Unix socket), never over the proxy
+  port, so `status`, `stop` and `logs` work even when the proxy port is busy.
+- **Browser-originated requests are refused.** Requests carrying an `Origin` header get a local
+  403, and the `Host` header is checked, so a web page cannot spend the user's API key through the
+  proxy. CLI agents are unaffected; Electron or web clients need `allowed_origins`.
 
-配置生效优先级（高 → 低）：
-1. CLI 覆盖参数 `--baseurl/--listen/--proxy/--api-key/--log-file`（仅本次运行，
-   不落盘）
-2. config.toml 显式配置的值（各实例独立）
-3. settings.json 全局默认（仅 `max_body_mb`、`disk_cache`、`forward_only`、
-   `bounded_retry_paths`、`allowed_hosts`、`allowed_origins`、`keepalive_trigger`
-   七个字段参与此层）
-4. 内置默认值
+## Before you touch a running instance
 
-target 参数（start/stop/logs 的 `[目标]`）解析顺序：**别名 → `default` 保留字
-（settings 的 default_config，含笔误 `defult`）→ 配置文件路径**。纯数字一律按
-端口号解析。别名不得为纯数字或保留字 `all`/`idle`/`default`/`defult`。
+The agent reading this may itself be talking to its model through aProxy. Check where your own
+client points (for example `ANTHROPIC_BASE_URL`, or `base_url` in `~/.codex/config.toml`). If it is
+`127.0.0.1:PORT` of an instance you are about to stop or restart, that request is your own
+lifeline: `stop` and `restart` give in-flight requests 10 seconds and then drop them, and a stopped
+instance takes every other session that uses it down too.
 
-## 按需查阅（读前先看这里，不要盲猜）
+- Run `aproxy status` first and act on a specific port or alias. Use `stop all` only when the
+  user asked for exactly that.
+- Never kill aProxy processes by name (`taskkill /IM aproxy.exe`, `pkill aproxy`): that takes down
+  every instance and its watchdog at once, including the one you may be using. If an instance
+  will not stop, use `aproxy stop PORT --force`, which verifies the process identity first.
+- Ask before stopping or reconfiguring an instance the user did not mention.
+- To experiment, run a separate instance under a temporary `APROXY_HOME` on a port no other
+  instance uses, address it only by that port, and stop it when you are done. `APROXY_HOME` gives
+  the experiment its own configs, settings, logs and registry, but on Windows the control pipe is
+  named after the port for the whole machine: `stop 12345` from a test home still reaches the
+  user's instance on 12345. Details: commands.md, "Experiment in an isolated home".
 
-| 任务 | 读 |
+## Common tasks
+
+### Connect an agent client
+
+1. Make sure an instance is running and note its port: `aproxy status`.
+2. Point the client's API base URL at `http://127.0.0.1:PORT` (with `/v1` appended where the client
+   expects it, as Codex does).
+3. Raise the client's event-level stream idle timeout. Without this, any retry period or long
+   generation beyond the client's default (Claude Code 600 s, Codex 300 s) makes the client
+   disconnect and resend, which restarts the work from scratch.
+
+| Client | Settings |
 |---|---|
-| 启动/停止/状态/日志/恢复/别名/find/config 的**全部命令与参数** | [references/latest/commands.md](references/latest/commands.md) |
-| 写或改 config.toml（全部字段、类型、默认值、0 值语义） | [references/latest/config-toml.md](references/latest/config-toml.md) |
-| 别名/默认配置/全局默认等 settings.json 字段（一般经命令管理） | [references/latest/settings-json.md](references/latest/settings-json.md) |
-| **把 Claude Code / Codex / 其他 agent 挂到 aproxy**（各客户端必调的流空闲超时：Claude Code 的 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`、Codex 的 `stream_idle_timeout_ms` 等） | [references/latest/behaviors.md](references/latest/behaviors.md) 的「接入 agent 客户端」节 |
-| 重试判定、保活、多开、磁盘缓存、外部转换器、日志、自愈恢复等**行为语义与排障** | [references/latest/behaviors.md](references/latest/behaviors.md) |
-| 当前版本是否适用本文档（版本判定、跨版本差异） | [references/latest/compatibility.md](references/latest/compatibility.md) |
+| Claude Code | `ANTHROPIC_BASE_URL=http://127.0.0.1:PORT` and `CLAUDE_STREAM_IDLE_TIMEOUT_MS=86400000` (shell environment or the `env` block of `~/.claude/settings.json`) |
+| Codex | a provider in `~/.codex/config.toml` with `base_url = "http://127.0.0.1:PORT/v1"`, `wire_api = "responses"` and `stream_idle_timeout_ms = 86400000` |
 
-**外部转换器分工**：`request_transform`/`response_transform` 的 aProxy 侧
-配置与行为语义在本 skill（config-toml.md / behaviors.md）；**写 format 程序
-本体与官方 aproxy-format 二进制的用法**在 aproxy-format skill。
+Every other client, the reasoning behind the timeouts, and how to verify the setup are in
+[clients.md](references/latest/clients.md).
 
-**版本注意**：`references/latest/` 描述当前开发线。操作旧版本实例前先读
-compatibility.md 确认行为差异（旧版本可能缺字段、语义不同）。
+### Start, inspect and stop instances
 
-## 高频守则（细节都在 references，此处仅防最常见的错）
+- `aproxy` or `aproxy start [ALIAS|PATH]` starts an instance in the background; it keeps running
+  after the terminal closes. Add `--foreground` to watch it in the console while debugging.
+- `aproxy status` lists running instances. When more than one runs, `stop`, `restart` and `logs`
+  need a port or alias, because guessing the target would hit the wrong instance.
+- A target is resolved as: alias, then the reserved word `default` (the default config), then a
+  config file path. A bare number is always a port.
+- `aproxy restart PORT|ALIAS` applies config changes: it stops the instance and starts it again
+  with its original arguments. It does not start an instance that is not running; use `start`.
 
-- `aproxy` 不带子命令 = 后台启动代理（分离子进程，关终端不掉）。前台调试用
-  `aproxy --foreground`。
-- 多实例必须先 `aproxy status` 再操作：`stop`/`logs` 在多实例时不接受省略参数，
-  需要端口号或别名。`stop all` 停全部；`stop idle [秒]` 只停空闲实例。
-- **改配置（toml 或 `aproxy config`）后用 `aproxy restart <端口或别名>` 使其
-  生效**——一条命令完成停止+按原参数拉起+等就绪，改端口也适用。它只重启
-  不启动：目标没在运行会报错退出 1，首次启动用 `aproxy start`。
-- 端口占用排查：bind 失败分「被其他程序占用」与「无权限/被系统保留（Hyper-V
-  排除区间）」，不要一律当占用处理——详见 behaviors.md 排障节。
-- **接入 agent 客户端时，先调大它按 SSE 事件计时的流空闲超时**——aProxy 等待期间
-  只发注释心跳，这类超时续不住：
-  - Claude Code：`CLAUDE_STREAM_IDLE_TIMEOUT_MS=86400000`（连同
-    `ANTHROPIC_BASE_URL=http://127.0.0.1:<端口>`；shell 环境变量或
-    `~/.claude/settings.json` 的 `env` 字段均可），否则超过 10 分钟就会被断开重发；
-  - Codex：`~/.codex/config.toml` 的 `[model_providers.<id>]` 设
-    `stream_idle_timeout_ms = 86400000`，否则超过 5 分钟就会被断开重连；
-  - Qwen Code、dsh 等其他客户端以及 Gemini CLI 的限制见 behaviors.md「接入 agent
-    客户端」。
-- 客户端收到本地 403 且文案提到 `allowed_origins`/`allowed_hosts`：不是上游
-  问题，是入站来源校验拒绝了请求（浏览器/Electron 类客户端会发 `Origin`），
-  按文案把对应 Origin/Host 加进配置并 restart，详见 config-toml.md。
-- 守护日志是 UTF-8（无 BOM），终端乱码是控制台代码页问题，进程入口已自动切
-  65001，无需 chcp。
-- 日志文件按启动**随机命名**（文件名不含端口），且每次启动都是新文件——地址
-  经 `aproxy status`/`aproxy logs` 向实例询问，**不要按端口猜文件名**。
+### Change configuration
+
+- `config.toml` is the per-instance file people edit; several can coexist, one per instance.
+  `settings.json` is aProxy's own state (aliases, the default config, global defaults); change it
+  through `aproxy alias ...` and `aproxy config ...` rather than by hand: if the file stops
+  parsing, aProxy prints a warning and runs on built-in defaults, losing every alias.
+- Precedence, highest first: CLI flags (this run only, never saved), config.toml, the global
+  defaults in settings.json (only a few fields have one), built-in defaults.
+- Apply an edit with `aproxy restart PORT|ALIAS`. It parses and validates the edited config, and
+  checks that a changed listen address can be bound, before it stops anything, so a bad edit is
+  reported while the old instance keeps serving. `aproxy doctor` is the wider check: aliased
+  configs and the files in the config directories, including port conflicts between them.
+
+### Investigate a problem
+
+- `aproxy logs PORT|ALIAS` follows an instance's log and starts by printing the log file's path.
+  It never returns on its own, so from a non-interactive tool call run it under a timeout, take the
+  path, and read the file. Log files get a random name at each start; never guess the name from
+  the port. Details: commands.md, logs.
+- Log lines are in Chinese. [troubleshooting.md](references/latest/troubleshooting.md) maps
+  symptoms and the exact log strings to causes and fixes.
+- A bind failure can mean "port taken by another program" or "port reserved by the system"
+  (Hyper-V/WinNAT on Windows); the fixes differ, so read the error before choosing one.
+
+### Install or upgrade
+
+`aproxy install` (alias `aproxy upgrade`) installs the newest version into `~/.aproxy/bin/` and
+restarts running instances one at a time, so clients barely notice. Options, channels and
+recovery from an interrupted install are in [commands.md](references/latest/commands.md).
+
+## Where to look
+
+| You need | Read |
+|---|---|
+| A command's exact syntax, flags, exit codes | [commands.md](references/latest/commands.md) |
+| A config.toml field: type, default, what 0 or empty means | [config-toml.md](references/latest/config-toml.md) |
+| Aliases, the default config, global defaults in settings.json | [settings-json.md](references/latest/settings-json.md) |
+| Setting up Claude Code, Codex, Gemini CLI or another client | [clients.md](references/latest/clients.md) |
+| How retries, heartbeats, streaming, disk cache, forward-only mode, transformers, IPC, logs, watchdog and install work | [behaviors.md](references/latest/behaviors.md) |
+| A symptom or log message to explain | [troubleshooting.md](references/latest/troubleshooting.md) |
+| Whether these docs match the installed version | [compatibility.md](references/latest/compatibility.md) |
+
+These references describe aProxy 0.1.x and the current development line. Check
+`aproxy --version` (and the versions `aproxy status` reports for running instances) before relying
+on a detail; compatibility.md explains what to do on a mismatch.

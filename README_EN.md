@@ -248,7 +248,7 @@ completes normally. (codex-cli 0.160.0 source and black-box test.)
 Apart from Claude Code, Codex and Gemini CLI, the table comes from reading
 source code and was not tested client by client. Versions, config locations and
 evidence are in the skill document
-[behaviors.md, "接入 agent 客户端"](.claude/skills/aproxy-cli/references/latest/behaviors.md#接入-agent-客户端).
+[clients.md](.claude/skills/aproxy-cli/references/latest/clients.md).
 
 Note: plain requests with `"stream": false` in the body have no keepalive
 channel (there is no response stream to inject heartbeats into), so the first

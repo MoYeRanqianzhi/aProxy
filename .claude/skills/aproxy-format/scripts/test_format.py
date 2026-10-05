@@ -1,25 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""format 联调测试器：不经 aproxy，直接把模拟信封喂给被测 format，格式化打印
-回信封——写完 format 第一件事就是跑它。
+"""Test harness for aProxy format programs, no aProxy needed.
 
-六种模拟（三协议 × 请求/响应侧，body 均为官方 API 文档核对过的真实形态）：
+Sends one mock envelope to the format program under test, pretty-prints the
+envelope it writes back, then closes the program's stdin and checks that it
+exits (the EOF duty of persistent mode). Run it first thing after writing a
+format program.
 
-  # 请求侧：模拟客户端请求信封（带 method），测请求转换
+Six mock envelopes: three protocols x request/response side. The bodies follow
+the shapes in each provider's API reference.
+
+  # Request side: a client request envelope (has "method")
   python test_format.py --format-spec anthropic --command ./my-format
 
-  # 响应侧：模拟上游响应信封（无 method——响应侧标志），测响应反向转换
+  # Response side: an upstream response envelope (no "method")
   python test_format.py --side response --format-spec openai-chat --command ./my-format
 
-  # 响应侧 SSE：body 为真实流式事件序列文本（aproxy 整缓冲后 format 看到的就是它）
+  # Response side, streaming: the body is a complete SSE event sequence, which
+  # is what a format program sees after aProxy has buffered the whole stream
   python test_format.py --side response --sse --format-spec anthropic --command ./my-format
 
-  # 参数透传给被测程序（-- 之后原样），--body-file 自定义 body（非 UTF-8 自动走 body_b64）
+  # Arguments after "--" go to the program verbatim; --body-file supplies a
+  # custom body (non-UTF-8 content is sent as body_b64)
   python test_format.py --format-spec openai-chat --command node -- format-node.js
   python test_format.py --format-spec anthropic --command ./fmt --body-file payload.bin
 
-注意（Windows）：本脚本强制 UTF-8 stdin/stdout；被测 format 也必须按
-guide.md 处理自身编码（脚本语言的 stdout 默认代码页是高频死法）。
+Windows: this script forces UTF-8 on its own stdin/stdout. The program under
+test must set UTF-8 on its own pipes as well (see guide.md); a script whose
+stdout uses the system code page garbles or rejects non-ASCII text.
 """
 
 import argparse
@@ -34,7 +42,9 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-# ---- 模拟请求体（对齐各协议官方文档的真实请求形态） -------------------------
+# ---- Mock request bodies (shapes from each protocol's API reference) ---------
+# The Chinese message text is deliberate: it makes every run exercise non-ASCII
+# UTF-8 round trips, the most common encoding failure on Windows.
 
 MOCK_REQUESTS = {
     "anthropic": {
@@ -72,7 +82,7 @@ MOCK_REQUESTS = {
     },
 }
 
-# ---- 模拟响应体（对齐各协议官方文档的真实响应形态） -------------------------
+# ---- Mock response bodies (shapes from each protocol's API reference) --------
 
 MOCK_RESPONSES = {
     "anthropic": {
@@ -117,7 +127,8 @@ MOCK_RESPONSES = {
     },
 }
 
-# ---- 模拟 SSE 流式响应文本（真实事件序列；aproxy 整缓冲后 format 收到的整段文本） ---
+# ---- Mock SSE response text: a complete event sequence, as a format program ---
+# ---- receives it after aProxy has buffered the whole stream -----------------
 
 MOCK_SSE = {
     "anthropic": "\n".join(
@@ -188,7 +199,8 @@ DEFAULT_URLS = {
     "openai-responses": "https://api.openai.com/v1/responses",
 }
 
-# 真实上游响应头（响应侧信封 headers；SSE 场景 content-type 为 event-stream）
+# Typical upstream response headers for the response-side envelope; with --sse
+# the content-type becomes text/event-stream.
 RESPONSE_HEADERS = {
     "anthropic": {
         "content-type": "application/json",
@@ -217,9 +229,10 @@ def build_body(spec: str, side: str, sse: bool) -> str:
 
 def build_envelope(spec: str, side: str, url: str, extra: str, body_file: str | None,
                    worker_id: int, sse: bool) -> dict:
-    """按 skill protocol.md 的 JSON 完整规范组装信封。
+    """Build an envelope as specified in references/protocol.md.
 
-    请求侧带 method；响应侧无 method（协议约定的响应侧标志）。
+    A request-side envelope carries "method"; a response-side envelope has no
+    "method", which is how a format program tells the two sides apart.
     """
     if body_file:
         with open(body_file, "rb") as f:
@@ -228,7 +241,7 @@ def build_envelope(spec: str, side: str, url: str, extra: str, body_file: str | 
             body: str = raw.decode("utf-8")
             envelope: dict = {"body": body}
         except UnicodeDecodeError:
-            # 非 UTF-8：标准字母表 + padding 的 base64（URL-safe 变体不行）
+            # Not UTF-8: standard-alphabet base64 with padding (not URL-safe)
             envelope = {"body_b64": base64.b64encode(raw).decode("ascii")}
     else:
         envelope = {"body": build_body(spec, side, sse)}
@@ -250,12 +263,13 @@ def build_envelope(spec: str, side: str, url: str, extra: str, body_file: str | 
 
 
 def read_reply(stdout, timeout_secs: float) -> str | None:
-    """带超时读一行回信（persistent format 不退出，不能等 EOF）。"""
+    """Read one reply line with a timeout (a persistent program never exits on
+    its own, so waiting for EOF is not an option)."""
     box: list[str] = []
 
     def reader():
         line = stdout.readline()
-        box.append(line)  # EOF 时为空串
+        box.append(line)  # empty string on EOF
 
     t = threading.Thread(target=reader, daemon=True)
     t.start()
@@ -268,64 +282,73 @@ def read_reply(stdout, timeout_secs: float) -> str | None:
 def checkpoints(spec: str, side: str, sse: bool) -> list[str]:
     if side == "request":
         return [
-            "headers 必含（缺键 = 解析失败 502）",
-            "url 是否按预期改写（缺省 = 沿用输入 url）",
-            "body 转换产物是否符合目标渠道协议（字段名/形态逐项核对）",
-            "鉴权头：客户端原头是否剥离、渠道头是否正确注入",
+            '"headers" is present (without it aProxy cannot parse the reply: 502)',
+            "url is rewritten as intended (omitted = the input url is kept)",
+            "the body matches the target channel's protocol (check field names and shape)",
+            "auth headers: the client's originals removed, the channel's injected correctly",
         ]
     checks = [
-        "headers 必含（缺键 = 解析失败 502）",
-        "body 反向转换产物是否对齐客户端协议"
-        + ("（SSE 事件序列逐帧核对，终止事件必须完整）" if sse else "（字段名/形态逐项核对）"),
-        "鉴权/凭据类头是否剥离（响应头表直接回放客户端；官方 aproxy-format 自动"
-        "剔除 authorization/x-api-key/cookie/proxy-authorization，遥测头无害可留）",
-        "content-type 是否与 body 形态一致"
-        + ("（SSE 应保持 text/event-stream）" if sse else "（JSON 应为 application/json）"),
+        '"headers" is present (without it aProxy cannot parse the reply)',
+        "the body is converted back to the client's protocol"
+        + (" (check every SSE event; the terminating events must be intact)" if sse
+           else " (check field names and shape)"),
+        "credential headers are removed (these headers go straight to the client; the "
+        "official aproxy-format drops authorization/x-api-key/cookie/proxy-authorization; "
+        "telemetry headers are harmless)",
+        "content-type matches the body"
+        + (" (SSE stays text/event-stream)" if sse else " (JSON is application/json)"),
     ]
     return checks
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="format 联调测试器：模拟三协议格式的请求/响应信封喂给被测 format"
+        description="Feed a mock request- or response-side envelope (Anthropic, OpenAI "
+        "Chat or OpenAI Responses) to a format program and check its reply."
     )
     ap.add_argument(
         "--format-spec",
         choices=sorted(MOCK_REQUESTS),
         required=True,
-        help="模拟的协议格式",
+        help="protocol of the mock body",
     )
     ap.add_argument(
         "--side",
         choices=["request", "response"],
         default="request",
-        help="信封方向：request=客户端请求（带 method）；response=上游响应（无 method）",
+        help="envelope side: request = client request (has method); "
+        "response = upstream response (no method). Default: request",
     )
     ap.add_argument(
         "--sse",
         action="store_true",
-        help="响应侧专用：body 用真实 SSE 流式事件序列文本（替代 JSON 响应）",
+        help="response side only: use an SSE event sequence as the body instead of JSON",
     )
-    ap.add_argument("--command", required=True, help="被测 format 程序命令")
+    ap.add_argument("--command", required=True, help="format program to run")
     ap.add_argument(
-        "args", nargs="*", default=[], help="format 程序参数（-- 之后的原样透传）"
+        "args", nargs="*", default=[],
+        help="arguments for the format program (put them after --)",
     )
-    ap.add_argument("--url", default=None, help="信封 url（缺省按协议给典型端点）")
-    ap.add_argument("--extra", default="", help="信封 extra 原样透传")
-    ap.add_argument("--worker-id", type=int, default=0, help="池槽位号（默认 0）")
+    ap.add_argument("--url", default=None,
+                    help="envelope url (default: the protocol's usual endpoint)")
+    ap.add_argument("--extra", default="", help="envelope extra string, passed verbatim")
+    ap.add_argument("--worker-id", type=int, default=0,
+                    help="envelope worker_id (default 0)")
     ap.add_argument(
-        "--body-file", default=None, help="自定义 body 文件（非 UTF-8 自动走 body_b64）"
+        "--body-file", default=None,
+        help="use this file as the body (non-UTF-8 content is sent as body_b64)",
     )
     ap.add_argument(
-        "--raw", action="store_true", help="只打印回行原文（不格式化）"
+        "--raw", action="store_true", help="print the reply line as is, without parsing"
     )
     ap.add_argument(
-        "--timeout", type=float, default=10.0, help="等待回行秒数（默认 10）"
+        "--timeout", type=float, default=10.0,
+        help="seconds to wait for the reply (default 10)",
     )
     ns = ap.parse_args()
 
     if ns.sse and ns.side != "response":
-        ap.error("--sse 仅用于 --side response（请求侧不存在流式模拟）")
+        ap.error("--sse applies only to --side response (there is no streaming request mock)")
 
     url = ns.url or DEFAULT_URLS[ns.format_spec]
     envelope = build_envelope(
@@ -334,10 +357,12 @@ def main() -> None:
     line = json.dumps(envelope, ensure_ascii=False)
 
     side_label = (
-        "请求侧（客户端请求）" if ns.side == "request" else "响应侧（上游响应）"
+        "request side (client request)" if ns.side == "request"
+        else "response side (upstream response)"
     ) + (" [SSE]" if ns.sse else "")
-    print(f"[test] {side_label}  协议格式: {ns.format_spec}  被测: {ns.command} {' '.join(ns.args)}")
-    print(f"[test] 信封输入（{len(line)} 字节）：")
+    print(f"[test] {side_label}  protocol: {ns.format_spec}  "
+          f"program: {ns.command} {' '.join(ns.args)}")
+    print(f"[test] envelope sent ({len(line)} characters):")
     print(json.dumps(envelope, ensure_ascii=False, indent=2))
     print("-" * 60)
 
@@ -347,57 +372,61 @@ def main() -> None:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            encoding="utf-8",  # 文本管道：stdin/stdout 全程 str，编码显式 UTF-8
+            encoding="utf-8",  # text pipes with explicit UTF-8 on both ends
         )
     except OSError as e:
-        print(f"[FAIL] format 进程启动失败: {e}")
+        print(f"[FAIL] could not start the format program: {e}")
         sys.exit(1)
 
     try:
         proc.stdin.write(line + "\n")
         proc.stdin.flush()
     except BrokenPipeError:
-        print("[FAIL] format 进程在收到输入前就退出了（检查命令/参数）")
+        print("[FAIL] the program exited before reading its input "
+              "(check the command and arguments)")
         sys.exit(1)
 
     reply = read_reply(proc.stdout, ns.timeout)
     if reply is None:
-        print(f"[FAIL] {ns.timeout:.0f}s 内无回行——format 挂死或没写 stdout/忘了 flush")
+        print(f"[FAIL] no reply within {ns.timeout:.0f}s: the program hangs, writes nothing "
+              "to stdout, or does not flush")
         proc.kill()
         sys.exit(1)
     if not reply.strip():
-        print("[FAIL] format 输出 EOF 且无回行（进程刚死，检查崩溃）")
+        print("[FAIL] stdout closed without a reply line (the program died; look for a crash)")
         sys.exit(1)
 
     if ns.raw:
         print(reply.rstrip("\n"))
     else:
-        print("[test] format 回信（格式化）：")
+        print("[test] reply (pretty-printed):")
         try:
             parsed = json.loads(reply)
             print(json.dumps(parsed, ensure_ascii=False, indent=2))
             if parsed.get("error"):
-                print(f'\n[WARN] error 行：{parsed["error"]}（请求侧将 502 / 响应侧透传）')
+                print(f'\n[WARN] error reply: {parsed["error"]} (aProxy would answer 502 on '
+                      'the request side, or pass the upstream response through on the '
+                      'response side)')
             else:
-                print(f"\n[OK] 回信是合法信封。检查点（{side_label}）：")
+                print(f"\n[OK] the reply is valid JSON. Check by hand ({side_label}):")
                 for c in checkpoints(ns.format_spec, ns.side, ns.sse):
                     print(f"  - {c}")
         except json.JSONDecodeError as e:
-            print(f"[FAIL] 回行不是合法 JSON: {e}\n原文: {reply.rstrip()}")
+            print(f"[FAIL] the reply is not valid JSON: {e}\nraw line: {reply.rstrip()}")
             sys.exit(1)
 
-    # persistent 语义联调：进程还活着说明它按循环语义等待下一行（脚本退出关闭
-    # stdin，format 应按协议义务自行退出）
+    # Persistent-mode check: a program that is still running is waiting for the
+    # next line, as a loop should. Closing its stdin must make it exit.
     if proc.poll() is None:
-        print("[test] format 进程仍存活（persistent 语义正确；脚本退出将关闭其 stdin，"
-              "合格 format 应随之退出）")
+        print("[test] the program is still running (correct for persistent mode); "
+              "closing its stdin now, it should exit")
     proc.stdin.close()
     try:
         proc.wait(timeout=5)
-        print(f"[test] format 已随 stdin EOF 退出（exit={proc.returncode}）——EOF 义务 ✓")
+        print(f"[test] the program exited on stdin EOF (exit={proc.returncode}): EOF duty met")
     except subprocess.TimeoutExpired:
-        print("[WARN] stdin 已关闭 5s 仍未退出——persistent 协议义务（EOF 即退）不达标，"
-              "实例停止时它会挂成孤儿进程")
+        print("[WARN] still running 5s after stdin closed: the program ignores EOF, so a "
+              "persistent worker would be left behind if aProxy exits without cleaning up")
         proc.kill()
 
 

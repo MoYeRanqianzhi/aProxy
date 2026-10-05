@@ -10,7 +10,7 @@ metadata:
 
 # agent 客户端流超时调研（2026-10-04）
 
-用户面向的结论与配置写法只放在 skill 的 `references/latest/behaviors.md`「接入 agent 客户端」
+用户面向的结论与配置写法只放在 skill 的 `references/latest/clients.md`（2026-10-06 skill 英文重写时从 behaviors.md 拆出）
 （README 双语有摘要）；本条只记**依据**，方便日后复查。实测过的三个客户端各有独立条目：
 [[claude-code-stream-watchdogs]]、[[codex-stream-idle-timeout]]、[[gemini-cli-sse-parsing]]。
 

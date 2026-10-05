@@ -1,69 +1,98 @@
 ---
 name: aproxy-format
-description: aProxy 外部转换器（format 程序）的完整参考——信封协议逐字段、编写指南、示例集与排障。凡涉及为 aProxy 的 request_transform/response_transform 编写或配置 format 程序、实现 OpenAI ↔ Anthropic 等协议转换、多 key 轮换、多渠道聚合（newapi 式）、或使用官方 aproxy-format 二进制时使用本 skill，即使用户没有明说「写 format」——例如"帮我把这个实例挂到 OpenAI 兼容端点"、"转换 anthropic 到 openai 协议"、"加几个 key 轮换着用"、"多渠道聚合不同模型"。
+description: Write, test and configure format programs - the external transformers aProxy runs for request_transform and response_transform - and use the official aproxy-format binary. Covers the one-line JSON envelope protocol field by field, spawn vs persistent mode, protocol conversion between OpenAI Chat, OpenAI Responses and Anthropic Messages, API key rotation, multi-channel aggregation by model (newapi style), testing a format without aProxy, and diagnosing 502s caused by a transformer. Use this skill whenever a request must be rewritten on its way through aProxy or a response rewritten on its way back, even if the user never says "format" - for example "point this instance at an OpenAI-compatible endpoint", "convert Anthropic requests to OpenAI", "rotate between these three keys", "route claude models to one channel and gpt models to another", "my transformer makes every request 502". For aProxy commands and the rest of config.toml use the aproxy-cli skill.
 ---
 
-# aproxy-format skill
+# aProxy format programs
 
-## 一分钟心智模型
+A format program is a filter that aProxy runs as a child process. For each request (or each
+successful upstream response) aProxy writes **one line of JSON**, the envelope, to the program's
+stdin; the program writes **one envelope line** back to stdout. The envelope carries the method,
+URL, headers and body, and everything the program writes back replaces what aProxy sends. That
+one mechanism is enough for protocol conversion, key rotation and multi-channel routing.
 
-aProxy 把整个请求（或上游响应）装进**一行 JSON 信封**，写到你的 format 程序的
-stdin；你的程序改写后**写一行信封回 stdout**。信封是唯一接口——url、method、
-headers、body 全部可改写，这就是协议转换与聚合的全部机制。
+- `request_transform` runs once per client request, after aProxy has buffered the body and before
+  the first upstream attempt. Every retry replays the transformed request, so a rotated key stays
+  the same across that request's retries and changes only on the next request.
+- `response_transform` runs on the upstream response aProxy has judged successful, just before
+  replaying it to the client. Its envelope `url` is the final upstream URL from the request side;
+  the two transformers are separate processes with no shared memory, so that URL is how a response
+  transformer knows which channel answered.
 
-两种运行模式（`request_transform`/`response_transform` 的 `mode`）：
-- **spawn**（默认）：每请求启动你的进程、一行进出、进程退出。最简单，任何
-  能读写 stdin/stdout 的程序都行。**注意：spawn 模式下转换在单实例内是
-  串行的**（每请求一次进程启动，实例内逐个执行）——高并发场景选 persistent。
-- **persistent**：进程池。你的进程以 `while` 循环逐行处理（一次一个请求、
-  输入输出有序），按需扩容至 `pool_max`（并发上限），空闲超时被回收。
-  **聚合类 format（轮换计数等状态在进程内存）必须用本模式**；高并发场景
-  也用它（进程免重启、池按并发扩容）。
+## First, check whether the official binary already does it
 
-失败语义（两侧不同，写 format 前先想清楚你在哪一侧）：
-- **请求侧转换失败 → 502，请求不发往上游、不重试**（含 format 自报 error、
-  超时、崩溃、输出违反信封协议）
-- **响应侧转换失败 → 透传上游原始响应**（响应已在手，可用性优先）
-- **key 轮换只在请求之间生效**：请求只转换一次，同一请求的重试重放同一份转换
-  产物（沿用同一个 key）
+`aproxy-format` converts between OpenAI Chat, OpenAI Responses and Anthropic Messages, rotates
+keys, and routes models to channels from a TOML file passed in `extra`. It is a separate download
+with its own version line (not installed by `aproxy install`); installation and configuration are
+in [references/examples.md](references/examples.md). Reach for it before writing code. Its limits
+decide whether it fits:
 
-## 按需查阅（读前先看这里，不要盲猜）
+- Cross-protocol conversion works for non-streaming responses only. A streaming (SSE) response
+  from a channel with a different protocol cannot be converted; the response transform fails and
+  aProxy passes the upstream stream through unchanged, which the client will not understand.
+- With `client_format = "auto"` it only routes a request to a channel of the same protocol. To
+  convert across protocols, declare the client's protocol explicitly.
 
-| 任务 | 文件 |
+## Writing your own
+
+1. **Pick a mode.** `spawn` (the default) starts a fresh process per request: any script that reads
+   a line and prints a line works, but transformations on one instance then run one at a time.
+   `persistent` keeps a pool of worker processes (up to `pool_max`, default 4) that loop over
+   lines. Use `persistent` whenever the program keeps state between requests (a rotation counter,
+   a cache) or the instance handles concurrent traffic.
+2. **Start from a loop template** in [references/guide.md](references/guide.md) for your language,
+   and keep to the protocol duties below.
+3. **Test it without aProxy:** `python scripts/test_format.py` feeds your program request- and
+   response-side envelopes for each protocol, checks the replies, and checks that a persistent
+   program exits on EOF. See [references/guide.md](references/guide.md) for usage.
+4. **Configure it** in the instance's config.toml (`request_transform` / `response_transform`;
+   field reference in the aproxy-cli skill, config-toml.md) and `aproxy restart` the instance.
+
+## Protocol duties and why they matter
+
+aProxy matches each reply to its request purely by order: the Nth line out answers the Nth line
+in, and it judges a worker only by whether a valid reply line arrives (it never reads exit codes).
+Most rules follow from that; guide.md, "Protocol duties", lists what each violation costs.
+
+- **Read stdin one line at a time.** aProxy keeps stdin open between requests, so reading all of
+  stdin (`sys.stdin.read()`, `json.load(sys.stdin)`) never returns and the request times out.
+- **Write exactly one line per request, then flush.** An extra line (a banner, a debug print,
+  pretty-printed JSON, `jq` without `-c`) breaks the pairing, so aProxy treats it as a protocol
+  error: the worker is evicted and, on the request side, the request fails. Unflushed output
+  makes aProxy wait until the transform timeout (default 30 s).
+- **Log to stderr.** aProxy discards it, which is exactly why stdout must carry nothing else.
+- **Write the whole envelope back.** `headers` is the only required field (a reply like
+  `{"body": "..."}` fails to parse), but whatever you omit is not "unchanged": a reply without
+  `body` or `body_b64` sends an empty body. Start from the envelope you received and modify it.
+- **The headers you return are the headers sent.** aProxy hands you the full table with lowercase
+  names and replaces it with yours, so rotating a key is just rewriting `authorization`. Leave out
+  `content-length` and `transfer-encoding`; aProxy computes framing itself and ignores yours.
+- **Use `body` for UTF-8 text and `body_b64` otherwise** (standard alphabet with `=` padding; the
+  URL-safe variant fails to decode). Never both. Response bodies arrive already decompressed.
+- **Report a per-request failure as `{"headers":{},"error":"reason"}` and keep running.** A program
+  that crashes or exits instead fails the request without a reason and costs a process restart.
+- **In persistent mode, exit when stdin reaches EOF.** aProxy kills the workers it retires, but if
+  the aProxy process itself ends without cleaning up, the closed stdin is the only signal your
+  worker gets; a program that ignores it keeps running as an orphan.
+
+What a failure costs differs by side, so know which side you are on:
+
+| Side | When the transform fails (error reply, crash, timeout, bad output) |
 |---|---|
-| 信封每个字段的确切语义（进/出、互斥、必填性） | [references/protocol.md](references/protocol.md) |
-| 从零写一个 format（选型、循环模板、测试方法） | [references/guide.md](references/guide.md) |
-| 完整示例：多 key 轮换、协议转换、官方 aproxy-format 用法 | [references/examples.md](references/examples.md) |
-| 502 了、error 行没输出、persistent worker 不退出 | [references/troubleshooting.md](references/troubleshooting.md) |
-| **联调测试器**：不起 aproxy 直接测你的 format（三协议 × 请求/响应双侧模拟、SSE 变体、回包检查、EOF 义务判定） | [scripts/test_format.py](scripts/test_format.py) |
+| Request | Nothing is sent upstream and the request is not retried. The client gets a 502 with the reason, or, on a streaming request that has already received heartbeat headers, a final SSE error event of type `proxy_transform_failed`. |
+| Response | aProxy replays the original upstream response unchanged and logs a warning. |
 
-## 高频守则（最常见的错误，细节全部下放 references）
+A transform that succeeds but produces a request the upstream rejects (a wrong conversion, a revoked
+key) is a different story: aProxy retries upstream errors indefinitely, with the same transformed
+request each time, so the client just waits. Check conversions with the test harness and one real
+request before relying on them.
 
-1. **单行进出**：信封是一行 JSON（JSON 序列化天然转义换行，body 再长不破帧）。
-   读 stdin 按行读、写 stdout 按行写、**写后必须 flush**。**stdout 只能写信封
-   行**——每个请求恰好回一行，多打日志/横幅、`jq` 漏 `-c` 多出的行都会被判为
-   协议错误（该 worker 被剔除、请求 502）；日志写 stderr（aProxy 会丢弃它）。
-2. **error 行表达单请求失败，exit 0**：输出 `{"headers":{},"error":"原因"}`
-   后正常退出（exit 0）。非零 exit code = 进程级失败（崩溃/挂死），会触发
-   请求侧 502 / 响应侧透传——不要用非零 exit 表达单请求失败。
-3. **persistent 必须 `while` 循环 + EOF 退出**：读到 stdin EOF 就 exit（这是
-   铁律——aProxy 实例停止时靠关闭管道回收 worker；不吃 EOF 的 format 会
-   挂成孤儿进程）。一行处理完立即写回，再等下一行。
-4. **headers 键是小写规范名，整表替换**：你收到完整头表，输出的头表**就是**
-   发往上游的头表（多 key 轮换 = 改写 `authorization` 即可）。不要输出
-   `content-length` / `transfer-encoding` 等**传输控制头**（aProxy 按实际
-   字节回填，你输出的也会被忽略）；`content-encoding` 在响应侧会被强制
-   剔除（aProxy 交给你的 body 已解码）——不要试图在信封层处理压缩。
-5. **输出必须含 `headers` 键（可为 `{}`）**：它是唯一**必填**字段——
-   `{"body": "..."}` 这种自然写法会因缺键解析失败、请求侧直接 502（日志：
-   missing field \`headers\`）。字段级必填性/类型约束/编码规则见
-   [references/protocol.md](references/protocol.md) 的「JSON 完整规范」。
-6. **大 body 走 `body_b64`**：body 不是合法 UTF-8 时用 base64 字段，其余场景
-   用 `body` 文本字段（两者互斥；**标准字母表 + `=` padding**，URL-safe 变体
-   解码会失败）。
-7. **不要设 content-length**：aProxy 按实际字节回填，你设了也会被忽略。
-8. **官方示例**：`aproxy-format` 二进制开箱即用（协议转换 + key 轮换 + 多渠道
-   聚合），写自定义 format 前先看它能不能直接满足——见
-   [references/examples.md](references/examples.md)。**限制**：跨协议转换只支持
-   **非流式**；跨协议 SSE 不支持（响应侧报错后透传上游原始流）。聚合配置的
-   `client_format = "auto"` 只放行同协议，跨协议请显式声明。
+## Where to look
+
+| You need | Read |
+|---|---|
+| Exact envelope fields: direction, required, encoding, samples, security notes | [references/protocol.md](references/protocol.md) |
+| Loop templates, mode choice, testing, wiring it into aProxy | [references/guide.md](references/guide.md) |
+| Complete key-rotation, protocol-conversion and aggregation setups | [references/examples.md](references/examples.md) |
+| A 502 or log message that names the transformer | [references/troubleshooting.md](references/troubleshooting.md) |
+| The test harness | [scripts/test_format.py](scripts/test_format.py) |

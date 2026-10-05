@@ -1,182 +1,226 @@
-# settings.json 配置参考
+# settings.json reference
 
-位置：`~/.aproxy/settings.json`。程序管理的**全局唯一内部配置**，与可多份并存、
-人类手写的 config.toml 平行分工。格式与字段随版本演进，**不建议手改**——
-一切修改走命令：别名用 `aproxy alias add/remove`，默认配置用
-`aproxy config --set-default/--clear-default`；数值字段（本文件）通常保持默认。
+`settings.json` holds aProxy's machine-wide state: aliases, the default config, global defaults
+that seven config.toml fields fall back to, and settings for log rotation, idle detection, the
+watchdog and `aproxy install`. Read it to add or repair an alias or the default config, to set a
+default for every instance, or to tune the watchdog or install downloads. Fields shared with
+config.toml are explained in config-toml.md.
 
-文件损坏（JSON 语法错误）不会阻断启动：回退为默认空配置并向 stderr 报 error
-（别名丢失可重新 add）。
+## Contents
 
-## 目录
+- [Location and editing](#location-and-editing)
+- [Field summary](#field-summary)
+- [aliases](#aliases) · [default_config](#default_config) · [config_dirs](#config_dirs)
+- [Global defaults for config.toml fields](#global-defaults-for-configtoml-fields)
+- [log_rotate_mb](#log_rotate_mb) · [idle_timeout_secs](#idle_timeout_secs)
+- [watchdog](#watchdog) · [Watchdog tuning](#watchdog-tuning)
+- [download_chain](#download_chain) · [download_proxy](#download_proxy) ·
+  [skill_auto_update](#skill_auto_update)
 
-- [字段总表](#字段总表)
-- [各字段语义](#各字段语义)
-- [与 config.toml 的分层关系](#与-configtoml-的分层关系)
+## Location and editing
 
----
+- One file per aProxy home, `<APROXY_HOME>/settings.json` (`~/.aproxy/settings.json` unless
+  `APROXY_HOME` is set), shared by every instance under that home.
+- Two fields have commands: `aliases` (`aproxy alias add|remove|list`) and `default_config`
+  (`aproxy config --set-default PATH` / `--clear-default`). Edit the others by hand; a field left
+  out takes its default.
+- Edit by hand with care, because the file is read as a whole. A JSON syntax error, a value of the
+  wrong type (`"watchdog": "false"`) or an unknown name in `download_chain` makes the entire file
+  unreadable. Read-only commands then print
+  `警告: settings.json 解析失败（…），别名等内部配置已回退为空` ("warning: settings.json failed to parse
+  (…); aliases and other internal settings fell back to empty") and run on built-in defaults, so no
+  alias resolves. Commands that write the file (`alias add|remove`,
+  `config --set-default|--clear-default`) refuse and exit 1 with
+  `settings.json 解析失败（…），为免覆盖其中的别名等内容，本次不做修改。请先修复或删除该文件: <path>`
+  ("settings.json failed to parse (…); not modified, to avoid overwriting the aliases and other
+  content in it. Fix or delete the file first").
+- Run `aproxy doctor` right after a hand edit. Every other aproxy command also checks the JSON, the
+  aliases, `bounded_retry_paths` and `keepalive_trigger`, printing problems to stderr as `[ERROR] …`
+  lines without stopping, so `status` and `stop` stay usable; only `doctor` checks the watchdog
+  fields.
+- A command that writes the file saves every field at its current value and drops keys it does not
+  know. A file listing fields you never set is normal.
 
-## 字段总表
+## Field summary
 
-| 字段 | 类型 | 默认值 | 管理方式 |
+The last column says when a change takes effect. "Instance start" means running instances keep the
+old value until `aproxy restart PORT|ALIAS`.
+
+| Field | Type | Default | Changed by | Takes effect |
+|---|---|---|---|---|
+| `aliases` | object, name to path | `{}` | `aproxy alias` | next command |
+| `default_config` | string or `null` | `null` | `aproxy config --set-default` / `--clear-default` | next command |
+| `config_dirs` | array of paths | `[]` | hand | next `find` / `doctor` |
+| `max_body_mb` | integer | `128` | hand | instance start |
+| `disk_cache` | boolean | `true` | hand | instance start |
+| `forward_only` | boolean | `false` | hand | instance start |
+| `bounded_retry_paths` | array of regex strings | `[]` | hand | instance start |
+| `allowed_hosts` | array of strings | `[]` | hand | instance start |
+| `allowed_origins` | array of strings | `[]` | hand | instance start |
+| `keepalive_trigger` | string | `"any"` | hand | instance start |
+| `log_rotate_mb` | integer | `8` | hand | instance start |
+| `idle_timeout_secs` | integer | `1800` | hand | next `status` / `stop` / `restart` |
+| `watchdog` | boolean | `true` | hand | see [watchdog](#watchdog) |
+| `watchdog_heartbeat_secs` | integer | `30` | hand | watchdog start |
+| `watchdog_stale_after_cycles` | integer | `1` | hand | watchdog start |
+| `watchdog_max_restarts` | integer | `5` | hand | watchdog start |
+| `watchdog_idle_exit_secs` | integer | `300` | hand | watchdog start |
+| `download_chain` | array or `null` | `null` (built-in chain) | hand | next install |
+| `download_proxy` | string or `null` | `null` | hand | next install |
+| `skill_auto_update` | boolean | `true` | hand | next install |
+
+## aliases
+
+Names for config files, so `aproxy start|stop|restart|logs NAME` work without a path or port.
+
+```json
+"aliases": { "work": "C:\\Users\\me\\.aproxy\\configs\\work.toml" }
+```
+
+- Add with `aproxy alias add NAME [PATH]`: the file must exist, `~` is expanded and the path is
+  stored absolute. Without `PATH` the alias points to `<APROXY_HOME>/config.toml`.
+- An alias finds its running instance by config path, not by port, so it keeps working after the
+  port in that config changes.
+- Not allowed as names: a port number (0 to 65535), and the reserved words `all`, `idle`, `default`
+  and its misspelling `defult`, in any case, because `start`/`stop` would read them as a port or a
+  reserved target. `alias add` refuses them; one written by hand is reported as an error on every
+  run.
+- An alias whose file has gone is reported as `别名 "NAME" 指向的配置文件不存在` ("alias NAME points to a
+  config file that does not exist").
+
+## default_config
+
+The config used when a command is given neither `--config` nor a target: `aproxy`,
+`aproxy start`, `aproxy config`, and the reserved target `default`. Unset, it is
+`<APROXY_HOME>/config.toml`. Set it with `aproxy config --set-default PATH` (the file must exist; the
+absolute path is stored) to make another file your everyday config.
+
+If the file it names is deleted or moved, the commands that would read it (`aproxy` or
+`aproxy start` without a target, and `aproxy config` when showing or editing the toml) exit with
+`settings.json 指定的默认配置文件不存在: <path>` ("the default config named in settings.json does not
+exist") instead of silently using a different file. Other commands are unaffected. Restore the file,
+point the setting elsewhere with `aproxy config --set-default PATH`, or remove it with
+`aproxy config --clear-default`.
+
+## config_dirs
+
+Extra directories that `aproxy find` and `aproxy doctor` scan for `*.toml` files (top level only,
+not subdirectories). `<APROXY_HOME>` and `<APROXY_HOME>/configs/` are always scanned; listing them
+again is harmless. `~` is expanded. A listed directory that does not exist is a `doctor` warning,
+`配置目录不存在` ("config directory does not exist").
+
+## Global defaults for config.toml fields
+
+`max_body_mb`, `disk_cache`, `forward_only`, `bounded_retry_paths`, `allowed_hosts`,
+`allowed_origins` and `keepalive_trigger` apply to every instance whose config.toml does not set the
+same key. A key present in config.toml always wins (config-toml.md, Precedence). Values and meaning
+are the same as the config.toml fields of the same name; see config-toml.md for each.
+
+```json
+{
+  "allowed_origins": ["http://localhost:5173"],
+  "bounded_retry_paths": ["/v1/messages/count_tokens", "/v1/messages/count_tokens\\?.*"]
+}
+```
+
+- In JSON, double every backslash: the regex `\?` is written `"\\?"`.
+- Use this layer for policies that should hold on every instance, such as the Origin of a desktop
+  client used with all of them. Leave `forward_only` false here: `true` would remove retries from
+  every instance that does not set it back.
+- An invalid `bounded_retry_paths` regex or `keepalive_trigger` value here stops every instance that
+  inherits it from starting. `aproxy doctor` and the per-command check report it as `[ERROR]`, with
+  `（来源 settings.json；start 该项全局默认的实例会失败）` ("source settings.json; instances that use this
+  global default will fail to start").
+- `aproxy config --show` does not print the settings.json values; for a field the toml leaves unset
+  it prints
+  `（未在 toml 设置，运行时取 settings.json 全局默认）` ("not set in the toml; the settings.json global
+  default applies at runtime").
+
+## log_rotate_mb
+
+Size limit for each instance's daemon log, in MB (default 8). Each instance checks its log every
+hour and empties it once it is larger; no rotated copies are kept, and `aproxy logs` keeps
+following the emptied file. `0` = never. Applies to custom `log_file` paths too (config-toml.md,
+log_file).
+
+## idle_timeout_secs
+
+How long an instance must go without activity to count as idle, in seconds (default 1800). Used by
+`aproxy status --idle` / `--busy` and `aproxy stop idle` / `aproxy restart idle`; a number after
+`idle` overrides it for that one command.
+
+Activity is a new client request, the start of each retry, and in `forward_only` mode each relayed
+chunk. A single upstream attempt that runs longer than the threshold without a retry, such as a very
+long generation, counts as idle, and `stop idle` would cut it off. Keep the threshold above your
+longest single generation before using `stop idle`.
+
+## watchdog
+
+`true` (the default) keeps one watchdog process per aProxy home. It watches every instance and
+restarts one that crashes or hangs, with that instance's original start arguments. `aproxy start`
+launches the watchdog if none is running, and every instance checks every 5 minutes and relaunches
+it if it has gone.
+
+`false` stops new launches by `aproxy start` and by instances started after the change. It does
+not stop a watchdog that is already running: that one keeps working until it exits by itself
+(`watchdog_idle_exit_secs` after the last instance is gone), and instances started while the field
+was `true` keep relaunching it until they are restarted. Behavior: behaviors.md, "Crash recovery and the watchdog".
+
+## Watchdog tuning
+
+The watchdog reads these when its process starts; a running watchdog keeps its values.
+
+| Field | Default | Meaning | Choosing a value |
 |---|---|---|---|
-| `aliases` | map\<name, path\> | 空 | `aproxy alias` 命令 |
-| `default_config` | string? | 无 | `aproxy config --set-default/--clear-default` |
-| `config_dirs` | string[] | `[]` | 手编（进阶） |
-| `log_rotate_mb` | u64 | 8 | 手编（进阶） |
-| `idle_timeout_secs` | u64 | 1800 | 手编（进阶） |
-| `max_body_mb` | u64 | 128 | 手编（进阶；toml 可按实例覆盖） |
-| `disk_cache` | bool | true | 手编（进阶；toml 可按实例覆盖） |
-| `forward_only` | bool | false | 手编（进阶；toml 可按实例覆盖） |
-| `bounded_retry_paths` | string[] | `[]` | 手编（进阶；toml 可按实例覆盖） |
-| `allowed_hosts` | string[] | `[]` | 手编（进阶；toml 可按实例覆盖） |
-| `allowed_origins` | string[] | `[]` | 手编（进阶；toml 可按实例覆盖） |
-| `keepalive_trigger` | string | `"any"` | 手编（进阶；toml 可按实例覆盖） |
-| `watchdog` | bool | true | 看门狗总开关 |
-| `watchdog_heartbeat_secs` | u64 | 30 | 看护扫描周期（调优） |
-| `watchdog_stale_after_cycles` | u64 | 1 | 挂死容忍周期数（误杀调节阀） |
-| `watchdog_max_restarts` | u32 | 5 | crashloop 放弃上限 |
-| `watchdog_idle_exit_secs` | u64 | 300 | 闲置自灭等待；0=常驻 |
-| `download_chain` | array | 内置默认链 | install 下载链条（严格数组语义） |
-| `skill_auto_update` | bool | true | install 时并行更新 skill 文档 |
-| `download_proxy` | string? | 无 | install 下载专用代理（≠ 请求代理） |
+| `watchdog_heartbeat_secs` | `30` | Scan period. An instance whose heartbeat is older than `watchdog_heartbeat_secs × (watchdog_stale_after_cycles + 1)` (60 s with the defaults) and that does not answer an IPC ping is killed and restarted. | Lower detects hangs sooner at the cost of more wake-ups. `0` is a `doctor` error (it runs as 1 s); above `600` is a `doctor` warning. |
+| `watchdog_stale_after_cycles` | `1` | Extra scan periods a heartbeat may lag before the ping check. | Raise it if healthy instances on a heavily loaded machine get killed. `0` is a `doctor` error (it runs as 1). |
+| `watchdog_max_restarts` | `5` | Failed restarts in a row, for one instance, before the watchdog gives up. The first restart is immediate; after a failure it waits 1 s, 2 s, 4 s ... up to 300 s. After giving up, the instance's restore record is kept, so `aproxy restore` can bring it back. | `0` = never restart, only observe (`doctor` warning). |
+| `watchdog_idle_exit_secs` | `300` | How long the watchdog stays after the last instance is gone before exiting. | `0` = stay resident. |
 
-## 各字段语义
+## download_chain
 
-### aliases
+The ordered sources `aproxy install` tries for the binary and the skill files. Each source gets 3
+attempts before the next is tried. `null` (the default) means
+`["github", "npm", "cargo-binstall", "cargo"]`. A configured list is used exactly as written, with
+nothing appended, so include every source you want as a fallback.
 
-别名 → config.toml 绝对路径 的映射。供 `aproxy start/stop <别名>` 快捷定位。
-保存时路径已绝对化（`~` 展开）；运行实例匹配按归一化路径键（大小写/分隔符
-不敏感，剥 Windows verbatim 前缀），端口改变不影响别名有效性。
-非法名（纯数字、`all`/`idle`/`default`/`defult`）被 add 拒绝；手写进去的非法名
-会在每次运行时与 doctor 报 error。
+| Element | Source |
+|---|---|
+| `"github"` | GitHub Releases, verified against the published SHA-256 |
+| `"npm"` | The npm registry configured in `~/.npmrc`, so a configured mirror is used; Node.js is not required |
+| `"cargo-binstall"` | The crate's cargo-binstall template, which usually points to GitHub; cannot fetch the skill files |
+| `"cargo"` | Builds from crates.io; needs a Rust toolchain, so keep it last |
+| `{"url": "TEMPLATE"}` | A mirror of your choice |
 
-### default_config
+URL template placeholders: `{version}` (the bare version, such as `0.1.0`, no `v`), `{asset}` (the
+release file name, such as `aproxy-x86_64-pc-windows-msvc-v3.exe`, or `aproxy-skills.zip` for the
+skill files), `{target}` (the Rust target triple) and `{variant}` (`-v3` or empty). When
+`<url>.sha256` exists the download is checked against it; otherwise it is accepted with
+`[警告] 来源为非官方镜像（url 模板），产物未经独立校验` ("warning: unofficial mirror (URL template);
+artifact not independently verified").
 
-默认配置文件路径（支持 `~`，存绝对路径）。未指定时回退 `~/.aproxy/config.toml`。
-指向的文件被删/移动时：启动明确报错退出 1（不静默回退，防在错误配置上排障）；
-`default` 保留字（start/stop target）也解析到它。
-
-### config_dirs
-
-配置目录列表：`aproxy find`/`aproxy doctor` 扫描这些目录下的 `*.toml`
-（只查该层，不递归）。**默认两个目录 `~/.aproxy/` 与 `~/.aproxy/configs/`
-始终参与**（手写重复也静默去重）；此字段用于追加第三方的配置存放目录。
-路径支持 `~` 展开。
-
-### log_rotate_mb
-
-守护日志运行期轮转阈值（MB）：每小时检查，端口日志超过即**截断清空**
-（非 rename 轮转，不产生轮转文件堆；`aproxy logs` 跟随器检测到变小会自动从头
-重跟）。0 = 不轮转。启动时另有独立的 2 MiB 检查（与旧实例兼容，不受此项控制）。
-全局治理项，所有实例共用，故放 settings 而非各 toml。
-
-### idle_timeout_secs
-
-实例「空闲」判定阈值（秒）：距最近一次收到客户端请求的时长。作用于
-`aproxy status --idle/--busy` 与 `aproxy stop idle [SECS]`（后者显式给秒数时
-临时覆盖此值）。默认 1800（30 分钟）。
-
-### max_body_mb（全局默认层）
-
-`config.toml` 未显式写 `max_body_mb` 的实例取此值（内置默认 128）。toml 显式值
-优先——分层实现于启动时 get_or_insert 注入。0 = 不设限。
-
-### disk_cache（全局默认层）
-
-`config.toml` 未显式写 `disk_cache` 的实例取此值（内置默认 true）。toml 显式值
-优先。语义见 config-toml.md。
-
-### forward_only（全局默认层）
-
-`config.toml` 未显式写 `forward_only` 的实例取此值（内置默认 false）。toml 显式值
-优先。**开启即放弃重试保障**：请求体与响应流式直通、不缓冲不重试不发心跳——
-适合「上游可信 + 要真流式」的实例。完整语义与取舍见 config-toml.md 的
-`forward_only` 节。
-
-### bounded_retry_paths（全局默认层）
-
-`config.toml` 未显式写 `bounded_retry_paths` 的实例取此值（内置默认 `[]` =
-功能关闭）。toml 显式值优先。正则数组，命中的请求上游失败 3 次即透传、不再
-无限重试——给「上游对特定端点确定性报错」的实例兜底。匹配语义与典型场景
-（Claude Code 非官方 API 的 compact 卡死）见 config-toml.md 的
-`bounded_retry_paths` 节。
-
-### allowed_hosts / allowed_origins（全局默认层）
-
-`config.toml` 未显式写同名字段的实例取此值（内置默认 `[]`）。toml 显式值优先
-（包括 `[]`——它等同未配置，可把全局列表在单实例上恢复为内置默认）。
-`allowed_hosts` 是 Host 校验额外放行的主机名（追加到回环名单，`"*"` 关闭
-校验）；`allowed_origins` 是放行的浏览器 Origin（默认拒绝一切携带 Origin 的
-请求，`"*"` 关闭校验）。完整语义见 config-toml.md 的
-`allowed_hosts / allowed_origins` 节。
-
-### keepalive_trigger（全局默认层）
-
-`config.toml` 未显式写 `keepalive_trigger` 的实例取此值（内置默认 `"any"`）：
-`"accept"`（Accept 含 `text/event-stream`）/ `"body_stream"`（请求体顶层
-`"stream": true`）/ `"any"`（任一）。toml 显式值优先。非法取值由
-`aproxy doctor` 报 error，以它为全局默认的实例启动失败。语义见 config-toml.md 的
-`keepalive_interval_secs / keepalive_trigger` 节。
-
-### watchdog（及四个 watchdog_* 调优字段）
-
-看门狗是**系统级单例**（一个全局看护进程看护全部实例），
-故只在 settings 配置、config.toml 不参与（多份 toml 对同一看护者会语义打架）。
-
-- `watchdog`（默认 true）：false 时 `aproxy start` 不拉起看护者，守护自检
-  补种停用；已在运行的看护者继续工作（实例与看护者完全解耦）。
-- `watchdog_heartbeat_secs`（默认 30）：看护者扫描周期；实例挂死检测延迟
-  ≈ 周期×(1+容忍周期数)。设 0 会被 doctor 报 error（空转烧 CPU）。
-- `watchdog_stale_after_cycles`（默认 1）：心跳过期（阈值 = 扫描周期×(N+1)，
-  N 倍容忍已被过期窗口吸收）且一轮 IPC ping（内含 3 次探测）无响应，才判定
-  挂死杀进程。
-- `watchdog_max_restarts`（默认 5）：同一实例连续重拉失败达上限即放弃
-  （指数退避 1s→2s→4s…封顶 300s），保留 `.restore` 供 `aproxy restore`
-  人工恢复；放弃事件写 startup.log。0 = 只观测不重拉（doctor 报 warning）。
-- `watchdog_idle_exit_secs`（默认 300）：全部实例清零后看护者闲置自灭的
-  等待秒数；0 = 永不自灭（常驻）。
-
-行为细节见 behaviors.md 看门狗节。
-
-### download_chain（下载链条，install 用）
-
-`aproxy install` 获取产物的有序尝试链。**未配置 = 内置默认链**
-`["github", "npm", "cargo-binstall", "cargo"]`；**配置后完全按数组执行，
-绝不自动追加默认项**（严格数组语义，与 config_dirs 相反）——写少了会增加
-失败概率，建议写全。元素为渠道名字符串或 url 模板对象（占位符
-`{version}/{asset}/{target}/{variant}`）；jsDelivr 等国内可达 CDN 自行填入，
-代码不内置任何 CDN 域名。
-
-### skill_auto_update
-
-默认 `true`。install 时随二进制并行更新 `~/.aproxy/skills/` 下的 skill 文档；
-`false` 时完全跳过（单次跳过用 `--no-skills`，单独更新用 `--skills-only`）。
-
-### download_proxy
-
-install 下载专用代理（与 config.toml 的 `proxy` 上游请求代理**绝对分离**）。
-未配置回退环境代理；单次覆盖用 `aproxy install --download-proxy <URL>`。
-含凭据的 URL 在错误信息中打码。
-
-## 与 config.toml 的分层关系
-
-只有 `max_body_mb`、`disk_cache`、`forward_only`、`bounded_retry_paths`、
-`allowed_hosts`、`allowed_origins` 与 `keepalive_trigger` 存在三层优先级：
-
-```
-config.toml 显式值  >  settings.json 值  >  内置默认 (128 / true / false / [] / [] / [] / "any")
+```json
+"download_chain": [
+  { "url": "https://mirror.example.com/aproxy/v{version}/{asset}" },
+  "github",
+  "npm"
+]
 ```
 
-其余字段是「toml 显式值 > 内置默认」或完全归 settings 管理（本文件全部字段）。
-`aproxy config --show` 会注明哪些值「未在 toml 设置，运行时取 settings.json
-全局默认」。
+A misspelled source name makes the whole file unreadable (see
+[Location and editing](#location-and-editing)).
 
-config.toml 的 `log_file`（守护日志文件路径）**有意不设 settings.json 全局
-默认层**——这不是漏配：日志去向是每实例的运行习惯，不存在「全机器统一一个
-日志文件」的合理全局策略，toml 每实例配置 + CLI `--log-file` 临时覆盖即可。
-默认（未配置）按启动随机命名，地址经 IPC 向实例询问。
+## download_proxy
 
-`aproxy doctor` 的 error 级检查覆盖本文件：JSON 语法错误、别名非法、别名指向
-不存在的文件。这些检查在每次 aproxy 运行时都执行（stderr 报出，不退出——
-status/stop 等管理命令不能因内部配置损坏而不可用）。
+Proxy URL for `aproxy install` downloads only; proxied API traffic uses config.toml `proxy`
+instead. Precedence: `aproxy install --download-proxy URL` > this field > the environment's proxy
+variables. Credentials in the URL are masked in error output. An install that resumes by itself
+after an interruption has no command line and uses only this field, so set it here when downloads
+always need a proxy.
+
+## skill_auto_update
+
+`true` (the default): `aproxy install` also updates the skill files under `<APROXY_HOME>/skills/`,
+in parallel with the binary; a failed skill update does not fail the install. `false`: skip them.
+For one run, `aproxy install --no-skills` skips them and `aproxy install --skills-only` updates only
+them, even when this field is `false`.

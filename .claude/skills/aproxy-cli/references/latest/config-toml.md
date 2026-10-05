@@ -1,413 +1,487 @@
-# config.toml 配置参考
+# config.toml reference
 
-配置文件位置：默认 `~/.aproxy/config.toml`；多开时每份 toml 独立（`--config`
-或别名指向）。所有字段可省略——省略即取默认（有 settings.json 全局默认层的
-字段见「优先级」标注）。
+Every field of an instance's `config.toml`: type, default, what 0 or an empty value means, and how
+to choose a value; then how values combine with CLI flags and `settings.json`, what is checked at
+start, and how values are normalized. Read it before writing or editing a config, or when a start
+fails with `配置错误` ("configuration error"). How each feature works at runtime is in
+behaviors.md; this file keeps only what you need to pick a value.
 
-## 目录
+## Contents
 
-- [完整示例](#完整示例)
-- [字段总表](#字段总表)
-- [各字段语义](#各字段语义)
-- [校验规则](#校验规则)
-- [归一化行为](#归一化行为)
+- [Working with config files](#working-with-config-files)
+- [Example](#example)
+- [Field summary](#field-summary)
+- [Precedence](#precedence)
+- [Fields](#fields): [base_url](#base_url) · [listen_addr](#listen_addr) · [api_key](#api_key) ·
+  [extra_headers / override_headers](#extra_headers--override_headers) ·
+  [proxy / proxy_username / proxy_password](#proxy--proxy_username--proxy_password) ·
+  [max_retry_backoff_secs](#max_retry_backoff_secs) ·
+  [connect_timeout_secs / read_timeout_secs](#connect_timeout_secs--read_timeout_secs) ·
+  [bounded_retry_paths](#bounded_retry_paths) ·
+  [keepalive_interval_secs / keepalive_trigger](#keepalive_interval_secs--keepalive_trigger) ·
+  [max_body_mb](#max_body_mb) · [spool_limit_mb](#spool_limit_mb) · [disk_cache](#disk_cache) ·
+  [forward_only](#forward_only) · [allowed_hosts / allowed_origins](#allowed_hosts--allowed_origins) ·
+  [log_file](#log_file) · [request_transform / response_transform](#request_transform--response_transform)
+- [Checks at start](#checks-at-start)
+- [Normalization](#normalization)
 
----
+## Working with config files
 
-## 完整示例
+- **One file per instance.** The default config is `config.toml` in the aProxy home (`~/.aproxy/`,
+  or the directory in `APROXY_HOME` when that is set), unless settings.json `default_config` names
+  another file. Each further instance has its own file, selected with `--config PATH`,
+  `aproxy start PATH` or an alias, and needs its own port in `listen_addr`, because instances are
+  identified by port. Keep extra configs in `~/.aproxy/configs/`: `aproxy find` and `aproxy doctor`
+  scan it without setup (other directories: settings-json.md, `config_dirs`).
+- **Create or change a file with `aproxy config`, or by hand.**
+  `aproxy config [--config PATH] --baseurl URL --listen ADDR ...` writes the file and creates it if
+  needed (all flags: commands.md, `config`). Flags exist only for `base_url`, `listen_addr`,
+  `api_key`, `extra_headers`, `override_headers`, `keepalive_interval_secs` and the three proxy
+  fields; edit the rest by hand. The command rewrites the whole file in its own layout, dropping
+  comments and unknown keys, so edit by hand any file whose comments matter. It will not touch a
+  file it cannot parse: `现有配置文件解析失败，拒绝覆盖` ("existing config fails to parse; refusing to
+  overwrite").
+- **Misspelled keys are ignored silently.** aProxy does not reject unknown keys, so a typo in a key
+  name simply has no effect. After editing, run `aproxy config --show [--config PATH]` and confirm
+  each field shows the value you wrote. A wrong value type (a string where a number belongs,
+  `mode = "Persistent"`) is different: it fails the whole file. Start then reports
+  `配置文件解析失败（TOML 语法错误）` ("config file failed to parse (TOML syntax error)"), and `--show`
+  warns `警告: 配置文件解析失败，以下展示的是回退默认值而非文件内容` ("the config failed to parse; the
+  values below are fallback defaults, not the file's contents").
+- **Apply a change with a restart.** An instance reads its config only when it starts. Run
+  `aproxy restart PORT|ALIAS`: it checks the edited config first and leaves the old instance
+  running if the check fails, so a typo does not take the instance down.
+- **Check without applying.** `aproxy doctor` validates every config an alias points to and every
+  other `*.toml` in the config directories, but not the default config unless an alias points to
+  it. For the default config, `aproxy restart` or `aproxy start` is the check.
+
+## Example
 
 ```toml
-base_url = "https://api.anthropic.com"   # 必填（唯一无默认的字段）
+base_url = "https://api.anthropic.com"   # required
 listen_addr = "127.0.0.1:12345"
-# api_key = "sk-..."
-# extra_headers = { "x-custom" = "v" }
-# override_headers = { "user-agent" = "my-agent/1.0" }
-# keepalive_interval_secs = 15
-# keepalive_trigger = "any"
+# api_key = "sk-..."                      # inject the key here instead of in the client
+
+# Optional, uncomment as needed
 # proxy = "http://127.0.0.1:7890"
-# proxy_username = "u"
-# proxy_password = "p"
-# max_retry_backoff_secs = 320
-# spool_limit_mb = 256
-# connect_timeout_secs = 30
-# read_timeout_secs = 300
-# max_body_mb = 128
-# disk_cache = true
-# forward_only = false
-# bounded_retry_paths = [ '/v1/messages/count_tokens' ]
-# log_file = "D:/aproxy-logs/inst-a.log"
-# allowed_hosts = ["myproxy.local"]
+# read_timeout_secs = 600
+# bounded_retry_paths = ['/v1/messages/count_tokens', '/v1/messages/count_tokens\?.*']
 # allowed_origins = ["http://localhost:5173"]
-# request_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
-# response_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
+# extra_headers = { "x-title" = "my-agent" }
 ```
 
-## 字段总表
+## Field summary
 
-| 字段 | 类型 | 默认值 | 说明 |
+"settings.json" in the Default column means the field falls back to the settings.json global
+default, whose built-in value is shown (see [Precedence](#precedence)). Integers are non-negative.
+
+| Field | Type | Default | 0 / empty means |
 |---|---|---|---|
-| `base_url` | string | （空，必填） | 上游 API base URL；末尾 `/` 自动去除 |
-| `listen_addr` | string | `"127.0.0.1:12345"` | 本地监听地址，须含端口 |
-| `api_key` | string? | 无 | 快捷鉴权（同时覆盖 `Authorization: Bearer` 与 `x-api-key`） |
-| `extra_headers` | map | 空 | 仅当请求未携带该头时追加（大小写不敏感判定） |
-| `override_headers` | map | 空 | 无条件覆盖请求头（大小写不敏感匹配） |
-| `keepalive_interval_secs` | u64 | 15 | 保活 SSE 心跳间隔秒（也是首轮提交骨架头的等待上限）；0=关闭保活 |
-| `keepalive_trigger` | string? | settings 层（`"any"`） | 哪些请求走保活通道：`"accept"` / `"body_stream"` / `"any"`；非法值启动报错 |
-| `proxy` | string? | 无 | 上游代理 URL（http/https/socks4/socks4a/socks5/socks5h） |
-| `proxy_username` | string? | 无 | 代理用户名，优先于 URL 内嵌 |
-| `proxy_password` | string? | 无 | 代理密码，优先于 URL 内嵌 |
-| `max_retry_backoff_secs` | u64 | 320 | 重试指数退避封顶秒；0=所有重试零延迟 |
-| `spool_limit_mb` | u64 | 256 | 响应缓冲上限 MB，超出判确定性失败（不可重试） |
-| `connect_timeout_secs` | u64 | 30 | 上游连接建立超时秒；0=不设限 |
-| `read_timeout_secs` | u64 | 300 | 两次读到数据间隔超时秒（钳制首字节等待）；0=不设限 |
-| `max_body_mb` | u64? | settings 层 | 请求体上限 MB，超出 413；0=不设限 |
-| `disk_cache` | bool? | settings 层 | 磁盘缓存开关 |
-| `forward_only` | bool? | settings 层 | 仅转发模式：放弃重试/缓冲/心跳，请求体与响应流式直通 |
-| `bounded_retry_paths` | string[]? | settings 层（空） | 受限重试路径（正则）：命中者失败 3 次即透传，不再无限重试 |
-| `log_file` | string? | 无（随机命名） | 自定义守护日志文件路径；缺省按启动随机命名（见下） |
-| `allowed_hosts` | string[]? | settings 层（空） | 入站 Host 白名单（防 DNS 重绑定）：Host 校验生效时**追加**放行的主机名；含 `"*"` 关闭 Host 校验 |
-| `allowed_origins` | string[]? | settings 层（空） | 入站 Origin 白名单：默认拒绝一切携带 Origin 头的请求，列表项精确放行；含 `"*"` 关闭 Origin 校验 |
-| `request_transform` | table? | 无 | 外部转换器（请求侧）：交给 format 程序改写 body/headers/url/method；失败 502 不重试；与 forward_only 互斥 |
-| `response_transform` | table? | 无 | 外部转换器（响应侧）：改写上游响应后回放；失败透传原样 |
+| `base_url` | string | none, required | start fails |
+| `listen_addr` | string `host:port` | `"127.0.0.1:12345"` | port 0: the OS picks one |
+| `api_key` | string | unset | blank = unset |
+| `extra_headers` | table of strings | `{}` | |
+| `override_headers` | table of strings | `{}` | |
+| `proxy` | string (URL) | unset: environment proxy variables apply | blank = unset |
+| `proxy_username` | string | unset | blank = unset |
+| `proxy_password` | string | unset | blank = unset |
+| `max_retry_backoff_secs` | integer | `320` | 0 = every retry immediate |
+| `connect_timeout_secs` | integer | `30` | 0 = no limit |
+| `read_timeout_secs` | integer | `300` | 0 = no limit |
+| `bounded_retry_paths` | array of regex strings | settings.json, `[]` | empty = off |
+| `keepalive_interval_secs` | integer | `15` | 0 = keepalive off |
+| `keepalive_trigger` | `"accept"` \| `"body_stream"` \| `"any"` | settings.json, `"any"` | |
+| `max_body_mb` | integer | settings.json, `128` | 0 = no limit |
+| `spool_limit_mb` | integer | `256` | 0 is treated as 1 |
+| `disk_cache` | boolean | settings.json, `true` | |
+| `forward_only` | boolean | settings.json, `false` | |
+| `allowed_hosts` | array of strings | settings.json, `[]` | empty = built-in policy; `["*"]` = check off |
+| `allowed_origins` | array of strings | settings.json, `[]` | empty = built-in policy; `["*"]` = check off |
+| `log_file` | string (path) | unset: random name in `<APROXY_HOME>/logs/` | |
+| `request_transform` | table | unset | |
+| `response_transform` | table | unset | |
 
-**优先级**（`max_body_mb`/`disk_cache`/`forward_only`/`bounded_retry_paths`/
-`allowed_hosts`/`allowed_origins`/`keepalive_trigger` 七个 Option 字段独有）：
-toml 显式值 > settings.json 全局默认 > 内置默认（128 / true / false / 空 /
-空 / 空 / `"any"`）。其余字段无 settings 层：toml 显式值 > 内置默认。
-注意 `allowed_hosts`/`allowed_origins` 在 toml 里写 `[]` 也算「显式值」——
-它等同未配置（内置默认策略），因此可用来把 settings.json 的全局列表在单个
-实例上恢复成内置默认。
+## Precedence
 
-## 各字段语义
+Highest first:
+
+1. **Run-only CLI flags** `--baseurl`, `--listen`, `--proxy`, `--api-key` and `--log-file`, given
+   to `aproxy` before any subcommand, as in `aproxy --listen 127.0.0.1:12399 start work` (syntax:
+   commands.md). They are never written to a file, but they become part of the instance's recorded
+   start arguments, so `aproxy restart`, `aproxy restore` and watchdog restarts keep applying them.
+   To drop one, stop the instance and start it again without the flag. Prefer the file over
+   `--api-key`: command lines are visible to other processes on the machine.
+2. **config.toml.**
+3. **The settings.json global default**, which exists only for `max_body_mb`, `disk_cache`,
+   `forward_only`, `bounded_retry_paths`, `allowed_hosts`, `allowed_origins` and
+   `keepalive_trigger` (settings-json.md, "Global defaults for config.toml fields").
+4. **The built-in default.**
+
+A key present in config.toml always wins over settings.json, even when its value equals the
+built-in default. So `allowed_hosts = []`, `allowed_origins = []` or `bounded_retry_paths = []` in
+one config restores the built-in behavior for that instance even if settings.json sets a list.
+When one of these seven fields is not in the toml, `aproxy config --show` prints
+`（未在 toml 设置，运行时取 settings.json 全局默认）` ("not set in the toml; the settings.json global
+default applies at runtime") instead of the effective value; read settings.json for that.
+
+## Fields
 
 ### base_url
 
-上游的根地址。请求转发 = `<base_url>/<原路径>?<原查询>`，路径与查询完整透传。
-校验：必须 `http://` 或 `https://` 开头（大小写不敏感）；**不得含 `?` 或 `#`**
-（拼接会错路由）。末尾斜杠自动去除。旧字段名 `upstream_url` 仍可读取（兼容别名），
-保存时写为新名 `base_url`。
+The upstream API root. aProxy appends the client's full request path and query unchanged, so
+`base_url` plus the path the client sends must form the real upstream URL: if the client's base
+URL is `http://127.0.0.1:12345/v1` and it calls `/v1/chat/completions`, set
+`base_url = "https://api.example.com"`, not `.../v1`.
+
+- Must start with `http://` or `https://` (any case) and must not contain `?` or `#`, which would
+  turn the appended path into part of the query.
+- A trailing `/` is removed.
+- `upstream_url` is accepted as another name for this key; `aproxy config` saves it as `base_url`.
 
 ### listen_addr
 
-监听地址。必须带端口（缺失/越界在启动时拦截报错，不会误诊为端口占用）。
-默认仅绑定 127.0.0.1（不暴露局域网）。端口 0 = 系统随机分配（status 查实际值）。
-多开实例的 listen_addr 必须互不相同（实例按端口号区分）。
+The `host:port` the instance listens on. The default `127.0.0.1:12345` is reachable only from this
+machine.
+
+- The port is required; without one, start fails with `listen_addr 缺少端口或端口无效` ("listen_addr
+  lacks a port or the port is invalid").
+- Every instance needs its own port. A second instance on a port that another aProxy instance
+  already uses is refused, even with a different host part.
+- Port `0` lets the OS choose; read the port from `aproxy status`. Clients need a fixed address, so
+  use it only for throwaway tests.
+- A non-loopback address (`0.0.0.0`, a LAN IP) lets every host that can reach the port use the
+  upstream through the proxy, with any key the instance injects. `aproxy start`, the startup log and
+  `aproxy doctor` warn with a message containing `不是回环地址` ("is not a loopback address"). It
+  also switches off the default Host check (see [allowed_hosts](#allowed_hosts--allowed_origins)).
 
 ### api_key
 
-设置后等效于把 `Authorization: Bearer <api_key>` 覆盖进每个转发请求，并同时用同一个值覆盖
-`x-api-key`（Anthropic 风格上游用它携带原始 key，只覆盖 Authorization 会让客户端
-原带的 x-api-key 漏到上游）。适用场景：
-客户端不便配置鉴权头时集中注入。请求自带 Authorization 头时它作为 override
-参与覆盖逻辑（见下）。空串/纯空白视为未设置（归一化剔除）。
+Injects a key into every forwarded request: sets `Authorization: Bearer <key>` and
+`x-api-key: <key>`, replacing whatever the client sent in those headers. Setting both serves
+OpenAI-style and Anthropic-style upstreams and keeps a stale client key from reaching the upstream
+through the other header. Use it when the client cannot hold the key or you want one place to
+change it. For an upstream that expects the key in another header, such as Gemini's
+`x-goog-api-key`, use `override_headers` instead.
 
 ### extra_headers / override_headers
 
-TOML 内联表，键值均为字符串：
+Tables of header name to value.
 
 ```toml
-extra_headers = { "x-title" = "my-app", "http-referer" = "https://example.com" }
+extra_headers    = { "http-referer" = "https://example.com", "x-title" = "my-agent" }
 override_headers = { "user-agent" = "my-agent/1.0" }
 ```
 
-- `extra_headers`：请求**未携带**同名头（大小写不敏感）时才追加——适合补默认头。
-- `override_headers`：**无条件覆盖**同名头——适合强制改写（含覆盖客户端的
-  Authorization）。
-- 键 trim 后为空剔除；trim 后同键冲突保留先出现者。
-- `api_key` 的实现等价于一条 override_headers 的 `Authorization` 条目。
-
-### keepalive_interval_secs / keepalive_trigger
-
-**保活通道**：保活适用的请求从首轮起先向客户端提交响应头，再按
-`keepalive_interval_secs` 间隔发 SSE 注释行（`: keepalive`）心跳，覆盖等首字节、
-上游在途、缓冲上游流与退避的全过程；响应体仍是缓冲完整、校验无误后才回放
-（失败尝试的数据不会混入）。语义细节见 behaviors.md「保活心跳」。
-
-- **适用条件**：`keepalive_interval_secs` > 0、非 `forward_only`，且按
-  `keepalive_trigger` 命中。`0` = 完全关闭保活；`forward_only` 下无效。
-- **`keepalive_trigger`**（字符串，默认 `"any"`，只认小写原文）：
-  - `"accept"`：客户端 `Accept` 头含 `text/event-stream`（0.1.0 之前的唯一判定）
-  - `"body_stream"`：客户端原始请求体是 JSON 对象且顶层 `"stream": true`
-    （只看请求体字段，与 URL 无关；磁盘溢写的大请求体同样只看顶层键）
-  - `"any"`：两者任一。真实 Claude Code 的流式主请求是
-    `Accept: application/json` + 请求体 `"stream": true`，只看 Accept 的旧判定
-    让它永远进不了保活通道，所以默认必须把请求体也算进来
-  - 判定在 `request_transform` **之前**、按客户端视角，转换器改写 Accept/请求体
-    不影响保活选择。
-  - **`"stream": true` 的非 SSE 流**（如 Ollama 原生 API 的 NDJSON）：上游回 2xx
-    非 SSE 头时该次尝试不提交骨架，不需要重试就原样直通；若上游常需重试（重试
-    期间会提交 SSE 骨架，非 SSE 的成功体只能落进 SSE 响应里），建议该实例设
-    `keepalive_trigger = "accept"`。
-- 非法取值：toml 里的由 start 校验点名拒绝；settings.json 里的由 `aproxy doctor`
-  报 error，且以它为全局默认的实例启动失败。toml 显式值 > settings.json >
-  内置 `"any"`；`aproxy config --show` 展示生效来源。改后
-  `aproxy restart <端口或别名>` 生效。无 CLI 旗标（`--keepalive-secs` 只管间隔）。
-- **上游编码改写（对「完全透传」的有意例外）**：保活适用的请求发往上游时
-  `accept-encoding` 一律改为 `identity`——往压缩流里插入明文心跳会让客户端解压
-  失败。客户端照旧拿到合法响应，代价只是上游到本机这一段多传一些字节；不适用
-  保活的请求不改写。
-- **没有保活通道的请求**：`"stream": false` 的普通请求（没有可注入心跳的响应
-  流，首字节延迟 = 完整生成时长，客户端需自行调大超时）、`forward_only` 实例、
-  `keepalive_interval_secs = 0`。
+- `extra_headers` adds a header only when the client did not send it (names compare
+  case-insensitively): use it for defaults the client may override.
+- `override_headers` always sets the header, replacing the client's value: use it to force a value.
+- Order of application: `api_key`, then `override_headers`, then `extra_headers`. An
+  `Authorization` entry in `override_headers` therefore beats `api_key`, and `extra_headers` never
+  replaces a header that `api_key` set.
+- An `accept-encoding` entry in `override_headers` reaches the upstream only on requests that get
+  no keepalive. Keepalive requests always go upstream with `accept-encoding: identity`, because
+  heartbeats cannot be inserted into a compressed stream. When your entry is shadowed this way, the
+  log shows a warn at start: `override_headers 里的 accept-encoding 对保活适用的请求不生效`
+  ("accept-encoding in override_headers does not apply to keepalive requests").
+- An entry whose name or value is not a legal HTTP header (a space in the name, a line break in the
+  value) is skipped without any message; verify the upstream receives a header that matters. Do not
+  list one header twice with different capitalization: which entry wins is unspecified.
+- CLI: `aproxy config --extra-header KEY=VALUE` and `--override-header KEY=VALUE` (repeatable) add
+  entries; `--clear-headers` empties both tables.
 
 ### proxy / proxy_username / proxy_password
 
-上游出口代理。`proxy` 未设置时走系统/环境变量代理；设为具体 URL 后仅经该代理。
-支持 `http`/`https`/`socks4`/`socks4a`/`socks5`/`socks5h`；URL 可内嵌
-`user:pass@`。`proxy_username`/`proxy_password` 显式给出时优先于 URL 内嵌凭据。
-**配置了用户名/密码但未配置 proxy URL 是校验错误**。三者由 `--clear-proxy`
-一并清空。
+The outbound proxy for requests to the upstream. Unset, aProxy honors the proxy variables the
+daemon inherited from the shell that started it (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+`NO_PROXY`). Set, every upstream request goes through this proxy and those variables are ignored.
+
+- Schemes: `http`, `https`, `socks4`, `socks4a`, `socks5`, `socks5h`. Use `socks5h` when host names
+  must be resolved by the proxy.
+- Credentials can be embedded (`socks5://user:pass@127.0.0.1:1080`) or given separately.
+  `proxy_username` (with `proxy_password`) replaces embedded credentials; `proxy_password` without
+  `proxy_username` is ignored. Username or password without `proxy` fails start.
+- Downloads by `aproxy install` do not use this; they use settings.json `download_proxy`.
+- `aproxy config --clear-proxy` clears all three fields.
 
 ### max_retry_backoff_secs
 
-指数退避序列 5s→10s→20s→… 增长到该值后封顶继续重试。**0 = 所有重试零延迟**
-（立即重试——对快速切换上游的场景有用，但对持续故障的上游会高频打点，慎用）。
-
-### spool_limit_mb
-
-上游响应缓冲上限（MB）。响应超过此大小视为**确定性失败，不重试**（重试注定
-再次超限）——**直接回 502，不向客户端转发任何字节**（已缓冲的部分一并丢弃）。
-若该请求已进入重试保活的 SSE 通道（HTTP 200 骨架已发出、状态行不可再改），
-则以 `event: error` 事件（`error.type = proxy_spool_limit`）收尾替代 502。
-转发超大文件（模型权重下载等）时调大。
+The longest wait between retries. The first three retries are immediate; from the fourth the wait
+is 5 s and doubles (10, 20, 40 ...) until it reaches this cap, then stays there; a cap below 5
+makes every delayed retry wait exactly the cap. Retries never stop;
+the cap only sets how often aProxy tries. Default 320. `0` makes every retry immediate, which hammers
+an upstream that is down; for fast recovery prefer a small cap such as 10. Retry rules: behaviors.md,
+"Retry decisions".
 
 ### connect_timeout_secs / read_timeout_secs
 
-- connect：与上游建立 TCP/TLS 连接的超时。
-- read：**两次读到数据之间**的最大间隔（同样钳制首字节等待 TTFB）。
-  LLM 上游排队久（TTFB 数十秒）应调大；调过小会把「慢但活着」的上游变成
-  确定性无限重试。
-- 两者的 0 = 不设限。仅影响上游侧，客户端侧超时由客户端自己管理。
+Limits on the connection to the upstream. A timeout counts as a network error and is retried.
 
-### max_body_mb
-
-请求体大小上限（MB）。超出直接返回 413（带配置指引），**不转发**（客户端断开
-时上游请求即中止，避免无谓计费）。0 = 不设限（慎用：内存/磁盘随负载无上界）。
-未在 toml 显式配置时取 settings.json 的 `max_body_mb`（全局默认 128）。
-50 万 token 会话/带图会话的请求体可达数十 MB——默认 128 已覆盖。
-
-### disk_cache
-
-磁盘缓存开关。开启时：请求体与上游响应超过内存驻留阈值（1 MiB）即溢写
-`~/.aproxy/spool/<端口>/*.spooltmp` 临时文件，重试重放与响应回放流式读文件——
-**进程内存与负载大小解耦**（实测每并发内存成本 -77%，SSD 上吞吐无损；
-见 docs/benchmark-memory.md）。关闭 = 全内存旧行为。临时文件在请求结束/回放
-完成/实例启动时清理，磁盘写失败按 SpoolFailed 终态处理（不打爆内存）。
-未在 toml 显式配置时取 settings.json 的 `disk_cache`（全局默认开）。
-低并发小流量实例可关（<1 MiB 的负载本就全程内存，不产生磁盘 IO）。
-
-### forward_only
-
-**仅转发模式开关**（默认 `false`）。开启后实例**放弃本产品最核心的重试保障**，
-换取请求体与响应的真流式直通：请求体边收边发上游、响应边收边回客户端——
-**不缓冲、不重试、不落盘、不发心跳**。这是给「上游可信 + 客户端要真流式」场景
-的**显式取舍**，不是普通开关：开启前请确认上游无需重试兜底，且客户端自己能
-处理上游的错误与断流。
-
-- **仍然强制**：`max_body_mb`——流式途中计数，超限即中止上游请求并回 413
-  （复用既有文案）。这是本模式下唯一仍生效的限制。
-- **不生效**：`disk_cache`/`spool_limit_mb`/`keepalive_interval_secs`/
-  `max_retry_backoff_secs`——磁盘 spool 完全不参与（无缓冲可 spool）。
-- **不再有**：无限重试、SSE 保活心跳、错误内容拦截（HTTP 200 携带 error 不再
-  判失败）、缓冲后的原字节回放。
-- **上游请求失败**：502 + 原因，**不重试**（同时记入 status 的「最近错误」）。
-- **响应流中途中断**：**直接截断**——不注入任何上游未发出的字节，日志留痕
-  （tracing 以 warn 记录错误与已转发字节数）。
-- **客户端断开**：连接随之关闭（计费保护行为不变）。
-- **`content-length` 仅响应侧保留**：响应字节未经变换，上游声明的长度仍精确
-  （其余 hop-by-hop 头照旧过滤）。**请求侧不保留**——请求体不再整体持有，没有
-  精确长度可回填，一律以 `chunked` 发往上游。
-- 未在 toml 显式配置时取 settings.json 的 `forward_only`（全局默认 false）。
-  **无对应 CLI 旗标**，只能写 toml 或 settings.json；改后
-  `aproxy restart <端口或别名>` 生效。
+- `connect_timeout_secs` (default 30): time allowed to establish the TCP/TLS connection.
+- `read_timeout_secs` (default 300): the longest gap between two reads from the upstream, including
+  the wait for the first byte. Set it above the longest time the upstream can stay silent while
+  healthy: queueing before the first token, or a `"stream": false` request that sends nothing until
+  the whole answer is ready. Too small, and a slow but healthy upstream times out on every attempt,
+  so the request retries forever.
+- `0` = no limit. There is no limit on total request time. Neither field affects the client's own
+  timeouts (clients.md).
 
 ### bounded_retry_paths
 
-**受限重试路径**（正则数组，默认空 = 功能关闭）。命中的请求在上游「有响应的
-失败」达到 3 次尝试后不再重试，把最后一次上游响应**原样透传**给客户端。
+Regex patterns for requests that should stop retrying. When a matching request keeps getting
+failure responses (an error status, or `200` with an error body), aProxy stops after 3 attempts in
+total and passes the last upstream response to the client unchanged. Network errors are still
+retried without limit. Empty (the default) = off.
 
-动机：部分上游对特定端点确定性报错（例如某些 API 聚合/镜像服务未实现客户端
-依赖的辅助端点），无限重试只会让客户端永远等不到终态；错误秒回时客户端反而
-能自行处理。哪些端点属于这一类**完全因上游而异**——因此哪些路径受限由你按
-自己的上游配置，aProxy 不内置任何具体 URL。
-
-匹配语义（每个模式对「`路径?查询串` 整体」做正则匹配，编译时自动锚定两端）：
-
-- 不含元字符的普通路径即**精准匹配**：`"/v1/messages/count_tokens"` 只命中
-  不带查询串的该路径，带任何查询串的请求都不命中
-- **查询串必须显式出现在模式里**：`?` 是正则元字符，字面量写 `\?`（toml 强烈
-  建议用单引号字符串免转义）；带查询串的精准匹配写
-  `'/v1/messages/count_tokens\?beta=true'`
-- **匹配的是收到的原始请求目标**（percent-encoded 原样、不解码）且**区分
-  大小写**：查询串按客户端实际发送的编码形态书写——空格是 `%20`，模式里写
-  字面空格不会命中 `/c?a=%20`
-- `$` 与 `^` 是正则锚点**不是字面量**：查询串里真有 `$`/`^` 字符时写 `\$`/`\^`
-  （写错的模式能通过校验但永不命中——这类「合法但死掉」的正则不会报错）
-- 通配用正则语法：`'/v1/messages/count_tokens\?.*'` 命中该路径带任意查询串；
-  `"/v1/messages/.*"` 命中 `/v1/messages/` 下全部路径
-- 非法正则在启动校验时即报错拒绝，不会静默失效
+Use it when an upstream deterministically fails an endpoint the client depends on, so the client
+gets the real error instead of waiting forever. The typical case: Claude Code behind a relay or
+mirror API that does not implement `POST /v1/messages/count_tokens`, so `/compact` hangs until the
+client times out. Which endpoints need this depends entirely on the upstream, so aProxy ships no
+patterns.
 
 ```toml
-# 示例：把记数端点设为「失败 3 次即透传」。单引号字符串内 \ 不需要双写
+# Single quotes: TOML keeps backslashes literally, so \? needs no doubling
 bounded_retry_paths = [
-  '/v1/messages/count_tokens',
-  '/v1/messages/count_tokens\?.*',
+  '/v1/messages/count_tokens',       # this path with no query string
+  '/v1/messages/count_tokens\?.*',   # this path with any query string (Claude Code sends ?beta=true)
 ]
 ```
 
-用日志调试匹配时注意：日志里请求路径的查询串值会被打码显示（`?beta=true`
-显示为 `?beta=***`），这只影响展示——匹配始终针对收到的原始请求目标，模式
-仍按真实查询串书写。
+- Each pattern must match the whole request target, `path?query`; patterns are anchored at both
+  ends. A plain path therefore matches only that path without a query string.
+- Patterns are regular expressions. Write a literal `?` as `\?`, and escape `.`, `+`, `(`, `[`,
+  `$`, `^` when you mean the character. A stray `$` or `^` gives a valid pattern that never matches,
+  and nothing reports it.
+- Matching is case-sensitive and sees the target exactly as the client sent it, percent-encoding
+  included: write a space in a query as `%20`.
+- Logs mask query values (`?beta=***`), but matching uses the real query, so write real values.
+- Matching uses the client's original path, before any request transformer rewrites it.
+- An invalid regex fails start, and the error quotes the pattern.
 
-行为细节：网络错误不受此封顶（仍无限重试）；保活适用的请求达上限时，若响应头
-尚未提交（失败都很快，常态）同样原样透传真实失败响应，只有响应头已被保活节拍
-以骨架提交（失败本身慢于一个保活间隔）才以终态 `event: error` 事件收场（状态行
-已发出，真实状态码无法再回放）。未在 toml 显式配置时取 settings.json 的
-`bounded_retry_paths`（全局默认空）。改后 `aproxy restart <端口或别名>` 生效。
+When the cap is reached, the log shows the warn line
+`受限重试路径达到尝试上限，透传最后一次上游响应` ("bounded-retry path reached its attempt cap; passing
+the last upstream response through"); look for it to confirm a pattern matches. If heartbeat headers
+had already been sent to the client, the request ends with an SSE `event: error` instead of the
+upstream status (behaviors.md, "Keepalive heartbeats").
 
-> 典型场景：Claude Code 走非官方 API（聚合/镜像上游）时 /compact 无限卡住、
-> 最终超时报错，多半是上游未实现 compact 依赖的
-> `POST /v1/messages/count_tokens`（确定性 404），该请求被无限重试、永远
-> 等不到终态。把该路径加入 `bounded_retry_paths`（如上例）即可解决——失败
-> 3 次即透传真实响应，compact 立即恢复。其他 agent 软件/其他端点的同类问题
-> 同理，按实际路径配置。
+### keepalive_interval_secs / keepalive_trigger
+
+While aProxy waits for and retries a request that qualifies for keepalive, it sends the client
+response headers early and then an SSE comment (`: keepalive`) every `keepalive_interval_secs`; the
+body is still buffered and replayed only after a successful attempt (behaviors.md, "Keepalive
+heartbeats").
+
+- `keepalive_interval_secs` (default 15): the heartbeat period, and also how long aProxy waits for
+  upstream headers before sending its own. Keep it below the shortest byte-level idle timeout
+  between client and aProxy. `0` turns keepalive off for the instance. CLI:
+  `aproxy config --keepalive-secs N`.
+- `keepalive_trigger` (default `"any"`): which requests qualify. No CLI flag.
+
+| Value | A request qualifies when |
+|---|---|
+| `"accept"` | the client's `Accept` header contains `text/event-stream` |
+| `"body_stream"` | the client's body is a JSON object with top-level `"stream": true` |
+| `"any"` | either holds |
+
+Keep `"any"`. Claude Code's streaming requests send `Accept: application/json` with
+`"stream": true`, so `"accept"` alone would leave them without heartbeats. Switch an instance to
+`"accept"` when its upstream answers `"stream": true` with something other than SSE (Ollama's native
+API streams NDJSON, for example) and often needs retries: once aProxy has sent SSE headers during a
+retry, a non-SSE body no longer fits the response. Only the three lowercase values are accepted.
+
+- The decision uses what the client sent, before any request transformer.
+- No keepalive for requests that do not qualify (notably `"stream": false`: the client's own
+  timeout must cover the whole generation), for `forward_only` instances, and when
+  `keepalive_interval_secs = 0`.
+- Heartbeats defeat byte-level idle timeouts only. Clients that time out on SSE events need their
+  own timeout raised (clients.md).
+
+### max_body_mb
+
+The largest request body accepted, in MB. A larger body gets 413
+`请求体超出上限（…），可在 settings.json 的 max_body_mb 或 config.toml 的 max_body_mb 调整` ("request body
+exceeds the limit (…); adjust max_body_mb in settings.json or config.toml") and is not forwarded.
+`0` = no limit, which lets one request grow memory or disk use without bound. The default 128 covers
+long agent sessions with images; raise it only if you see that 413. Also enforced with
+`forward_only`.
+
+### spool_limit_mb
+
+The largest upstream response aProxy buffers, in MB (default 256). A larger response is a
+deterministic failure and is not retried: the client gets 502
+`上游响应体超出 spool 上限，无法回放（重试无意义）` ("upstream response exceeds the spool limit; cannot
+replay (retrying is pointless)"), or an SSE `event: error` of type `proxy_spool_limit` if heartbeat
+headers were already sent. Raise it for instances that relay large files. `0` is treated as 1 MB,
+not as unlimited. No effect with `forward_only`.
+
+### disk_cache
+
+Whether request and response bodies larger than 1 MiB spill to temporary files under
+`<APROXY_HOME>/spool/<port>/` instead of staying in memory. On (the built-in default), memory per
+request stays flat whatever the body size; off, every body is held in RAM. Bodies under 1 MiB stay in
+memory either way, so leave it on unless disk writes are unwanted. When a disk write fails, the
+request ends with 502 `本地磁盘缓存写入失败，无法回放` ("local disk cache write failed; cannot replay"),
+or an SSE `event: error` if heartbeat headers were already sent, rather than falling back to memory.
+No effect with `forward_only` (behaviors.md, "Disk cache (spool)").
+
+### forward_only
+
+`true` turns the instance into a plain streaming pass-through: request and response bytes are
+relayed as they arrive, with no buffering, no retries, no heartbeats and no error-body detection.
+This gives up aProxy's core guarantee: an upstream failure becomes a 502 to the client, and a stream
+that breaks mid-way is cut off where it broke. Enable it only for a trusted upstream when the client
+needs true incremental streaming, and keep the settings.json default `false` so other instances
+keep retrying.
+
+- Still applied: `api_key`, `extra_headers`, `override_headers`, the inbound checks, and
+  `max_body_mb` (counted while streaming).
+- Ignored: `disk_cache`, `spool_limit_mb`, `keepalive_interval_secs`, `keepalive_trigger`,
+  `max_retry_backoff_secs`, `bounded_retry_paths`.
+- Cannot be combined with `request_transform` or `response_transform`, which need the whole body;
+  start fails, also when `forward_only` comes from settings.json.
+- No CLI flag. When it is on, `aproxy start` prints `仅转发模式：不缓冲、不重试` ("forward-only mode: no
+  buffering, no retries").
+
+Runtime details: behaviors.md, "Forward-only mode".
 
 ### allowed_hosts / allowed_origins
 
-**入站来源校验**（字符串数组，默认空 = 内置默认策略）。代理会把上游密钥
-注入每个转发请求，而本机浏览器里的任意网页都能向 `127.0.0.1` 发请求——这两
-项防的是网页借本机代理花你的额度。CLI 类客户端（Claude Code 等）既不发
-`Origin`，Host 也恒为 `127.0.0.1:端口`，不受影响。
+Inbound checks that stop web pages in a local browser from using the proxy, and the key it injects.
+CLI clients send no `Origin` header and reach the proxy as `127.0.0.1:PORT`, so they need neither
+field. A refused request gets a local 403 that names the field to change and is logged as warn; it
+is never forwarded, never gets a key injected and is never retried.
 
-- **Host 校验**（`allowed_hosts`，防 DNS 重绑定）：监听回环地址（127.0.0.0/8、
-  `::1`、`localhost`），**或** `allowed_hosts` 非空时生效。生效时放行
-  `localhost` / `127.0.0.1` / `[::1]`、监听地址自身的主机部分（`0.0.0.0` /
-  `[::]` 这类通配地址除外）、以及列表条目——列表是**追加**而不是替换。比较时
-  忽略端口（Host 头与条目里写的端口都不参与）、不区分大小写。监听非回环地址
-  且列表为空时**不做** Host 校验（局域网/容器客户端的 Host 五花八门，默认
-  拦截会破坏既有用法；启动时另有非回环告警）。
-- **Origin 校验**（`allowed_origins`）：任何携带 `Origin` 头的请求默认拒绝
-  （只有浏览器与 Electron/WebView 类客户端会发），除非精确匹配列表项——
-  不区分大小写、忽略末尾 `/`，写法与浏览器发出的完全一致
-  （如 `"http://localhost:5173"`）。与监听地址无关，非回环监听同样生效。
-- 两项都支持 `"*"`：含 `"*"` 即关闭对应校验。**空列表 `[]` 等同未配置**
-  （不是「全部拒绝」或「全部放行」）。
-- 被拒请求在本地直接返回 **403**，响应文案点名对应配置项与修法，并写一条
-  warn 日志。它**从未转发上游、不注入 `api_key`、不进入重试循环、不计入
-  请求数**——只作用于从未转发过的请求，对放行的请求「无限重试」毫无改变。
-- 会发 `Origin` 的客户端（Cherry Studio、Open WebUI 等基于 Electron/浏览器的
-  应用）升级后需要配置 `allowed_origins`，否则全部 403；真实 Claude Code
-  实测不发 `Origin`、Host 为 `127.0.0.1:端口`，无需配置。
-- settings.json 同名字段是全局默认；toml 显式值优先。改后
-  `aproxy restart <端口或别名>` 生效。
+`allowed_hosts`, a Host header check against DNS rebinding:
+
+- Active when `listen_addr` is a loopback address (`127.0.0.0/8`, `::1`, `localhost`) or when the
+  list is non-empty. A non-loopback listener with an empty list does no Host check, because LAN and
+  container clients use many different names.
+- When active, it accepts `localhost`, `127.0.0.1`, `[::1]`, the host part of `listen_addr`
+  (except `0.0.0.0` and `[::]`), and the list entries. Entries add to these names; they do not
+  replace them.
+- Compared case-insensitively, ignoring ports on both sides. Write host names only
+  (`"host.docker.internal"`); a URL entry is reduced to its host.
+- Add the name a container or another machine uses to reach the proxy.
+
+`allowed_origins`, an Origin header check:
+
+- A request carrying an `Origin` header is refused unless it matches an entry. Only browsers and
+  Electron or WebView apps send `Origin`.
+- Entries match case-insensitively and ignore a trailing `/`; write them as the browser sends them,
+  scheme and port included: `"http://localhost:5173"`.
+- Applies whatever `listen_addr` is.
+- Desktop or web clients such as Cherry Studio or Open WebUI send `Origin`; add theirs, which the
+  403 body quotes.
+
+For both: an entry `"*"` turns that check off. An empty list means the built-in policy, not "allow
+all" or "deny all".
 
 ```toml
-allowed_hosts = ["myproxy.local"]            # 容器内用 myproxy.local 访问本机代理时
-allowed_origins = ["http://localhost:5173"]  # 本机前端页面/Electron 客户端的 Origin
+allowed_hosts   = ["host.docker.internal"]
+allowed_origins = ["http://localhost:5173"]
 ```
+
+403 bodies start with `aProxy 拒绝了该请求（403，未转发上游）` ("aProxy refused the request (403, not
+forwarded upstream)"), followed by `Host「…」不在允许列表内` ("Host … is not in the allowed list") or
+`来自浏览器页面的请求（Origin「…」）默认不放行` ("requests from browser pages (Origin …) are refused by
+default").
 
 ### log_file
 
-自定义守护日志文件路径（字符串，默认无 = 内置随机命名）。未设置时日志落
-`~/.aproxy/logs/`，按启动时刻随机命名（十六进制时间戳-pid 格式，如
-`19ac3f2e8b5d-1a2b.log`）——**每次启动（含 restart、restore 恢复）都是新文件**，
-换端口后日志不断档；代价是文件名不含端口，**不要按端口猜文件名**，日志地址
-一律以实例上报为准（`aproxy status`/`aproxy logs`/start 成功提示经 IPC 向
-实例询问，客户端不拼路径）。
+The path of the instance's daemon log. Unset (the default), every start, restarts included, writes
+a new file with a random name in `<APROXY_HOME>/logs/`. The name carries no port, so get the path
+from `aproxy status` or `aproxy logs` rather than guessing it.
 
-- **优先级**：CLI `--log-file <PATH>` > toml `log_file` > 内置随机名
-  （与 `--baseurl` 等覆盖参数同款：CLI 值仅本次运行生效，不写任何配置文件）。
-- **路径解析**：支持 `~` 展开；**相对路径相对 APROXY_HOME 解析**（守护进程
-  的 cwd 不可靠，不按它解析）。
-- **落盘与轮转**：自定义路径（含父目录创建）由守护进程负责；运行期轮转
-  （settings.json 的 `log_rotate_mb`）对自定义文件同样适用。
-- **有意不设 settings.json 全局默认层**（与 `max_body_mb`/`disk_cache`/
-  `forward_only`/`bounded_retry_paths` 四字段的三层分层形成对照）：
-  日志去向是每实例的运行习惯而非「同一台机器该统一」的全局策略，不存在
-  「所有实例都该默认写同一个文件」的合理语义；toml 每实例显式配置 +
-  CLI 临时覆盖已经覆盖全部场景。
-- 改后 `aproxy restart <端口或别名>` 生效；重启后随机名会变（自定义路径不变），
-  实例停止后旧日志按孤儿清理（见 behaviors.md 日志节）。
+- Precedence: `--log-file PATH` (that run) > `log_file` > random name. There is no settings.json
+  default; each instance chooses its own.
+- `~` expands to the user's home directory; a relative path is resolved against `<APROXY_HOME>`,
+  never against the working directory, which differs between `start`, `restart` and watchdog
+  restarts. Missing parent directories are created.
+- Set it for a stable path, or to keep a log after the instance stops: aProxy deletes `.log` files
+  in `<APROXY_HOME>/logs/` that no running or restorable instance refers to whenever it lists
+  instances. Files outside that directory are never deleted by aProxy.
+- A custom file is appended to across restarts, but emptied at start when it is over 2 MiB, and
+  while running when it grows past settings.json `log_rotate_mb`.
+- Foreground instances (`--foreground`) log to the console and ignore it.
 
 ### request_transform / response_transform
 
-外部转换器（table，默认无 = 功能关闭）：把整个请求/响应装进一行 JSON 信封
-交给外部 format 程序改写后收回——实现 OpenAI ↔ Anthropic 等协议转换、
-多 key 轮换、多模型多渠道聚合（newapi 式）。aproxy 本体不内置任何转换器，
-全部用户配置；写 format 与配置的完整指南见 **aproxy-format skill**。
+Hand each request before forwarding, or each successful response before replay, to an external
+"format" program that rewrites it: protocol conversion (OpenAI to Anthropic and back), key
+rotation, routing models to different channels. aProxy has no transformer built in. The official
+`aproxy-format` binary, the envelope protocol and how to write your own program are in the
+aproxy-format skill; this section covers only the aProxy side. Default: unset.
 
 ```toml
 request_transform  = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
 response_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
 ```
 
-`command` 与 `extra` 请写 `~/` 前缀或绝对路径——守护进程的工作目录不可靠
-（取决于谁在哪个目录执行了 start / restore），相对路径会在换个启动方式后
-找不到。响应侧同样要配 `extra`（官方 aproxy-format 靠它读聚合配置，缺了响应
-侧必失败并透传）。
-
-子字段：
-
-| 字段 | 类型 | 默认 | 说明 |
+| Key | Type | Default | Meaning |
 |---|---|---|---|
-| `command` | string | （必填） | format 程序命令；不走 shell 按 argv 执行（无注入面）；`~/` 前缀由 aProxy 展开，写 `~/` 或绝对路径最稳 |
-| `args` | string[] | `[]` | 程序参数（如官方示例的 `["run"]`） |
-| `mode` | string | `"spawn"` | `spawn`=每请求一次性进程；`persistent`=持续进程池（轮换/计数状态必须用它） |
-| `pool_max` | u32 | 4 | persistent 池上限（并发 worker，超限排队）；0 启动报错 |
-| `idle_timeout_secs` | u64 | 300 | persistent worker 空闲回收秒；0=永不回收 |
-| `timeout_secs` | u64 | 30 | 单请求转换超时秒；0=不限；超时 worker 被剔除 |
-| `extra` | string? | 无 | 原样透传进信封（格式无要求，format 自解；官方示例传聚合配置路径，其中的 `~/` 由 aproxy-format 自己展开——aProxy 不展开 extra） |
+| `command` | string | required | The program. Run directly, not through a shell. A leading `~` expands to the user's home directory; a bare name is looked up on `PATH`. |
+| `args` | array of strings | `[]` | Arguments, passed verbatim (no `~` expansion). |
+| `mode` | `"spawn"` \| `"persistent"` | `"spawn"` | `spawn`: a new process per request. `persistent`: a pool of long-running workers; required when the program keeps state between requests (key rotation, counters). |
+| `pool_max` | integer | `4` | Most workers in `persistent` mode; further requests queue. `0` fails start. Unused in `spawn` mode. |
+| `idle_timeout_secs` | integer | `300` | A `persistent` worker idle this long is stopped. `0` = never. |
+| `timeout_secs` | integer | `30` | Limit for one transformation. `0` = none. A worker that times out is killed and replaced, and that transformation counts as failed. |
+| `extra` | string | unset | Copied verbatim into every envelope's `extra` field; its meaning is up to the program. The official binary expects the path of its config here and expands `~/` itself. |
 
-语义要点：
+- Write `command` with `~/` or an absolute path. A relative path resolves against the daemon's
+  working directory, which depends on where `start` or `restore` happened to run.
+- `~` means the user's home directory even under another `APROXY_HOME`; in an isolated test home,
+  use absolute paths.
+- With the official binary, give the response side the same `extra` as the request side: it reads
+  its config from `extra`, and without it every response transformation fails.
+- The two sides fail differently. A request-side failure returns 502 to the client, or an SSE
+  `event: error` of type `proxy_transform_failed` if heartbeat headers were already sent; the
+  request is not sent upstream and not retried. A response-side failure logs a warn and passes the
+  upstream response through untransformed.
+- Choose `timeout_secs` by how long a stuck program may hold one request, not by client timeouts:
+  keepalive requests keep receiving heartbeats while a transformation runs. With `0`, a program
+  that hangs holds that request indefinitely and its worker is never replaced.
+- A request is transformed once and every retry replays the result, so a rotating key changes
+  between requests, not between retries. Responses passed through by `bounded_retry_paths` are not
+  transformed.
+- aProxy discards the program's stderr; have the program write its own log file.
+- Cannot be combined with `forward_only`.
+- A table whose `command` is blank is ignored as if absent; a table without a `command` key fails
+  to parse.
 
-- **失败语义两侧不同**（用户拍板的设计，不要混淆）：请求侧转换失败
-  （进程崩溃/超时/format 报 error 行/输出违反信封协议）→ **502 + 原因，请求
-  不发往上游、不重试**；响应侧失败 → **透传上游原始响应** + warn（响应已在手，
-  可用性优先）。错误文案按成因分类（进程/管道层故障、format 自报错误、协议
-  违规各不相同），不要把它们都当成「配置错了」。
-- **池内唯一的重试**：persistent 池取到空闲期间已死的 worker（还没产出任何
-  输出就失败）时，池会**自动换新 worker 重试一次**——这是池状态问题，与请求
-  内容无关；看到 502「format 进程意外退出且无输出」说明新开的 worker 也死了
-  （format 本身起不来）。format 自报 error、协议违规、超时一律不重试。
-- **输出必须是恰好一行合法信封**：format 往 stdout 多打了一行（日志/横幅、
-  `jq` 漏了 `-c`）、输出非 UTF-8 或非法 JSON、`body` 与 `body_b64` 并存，都
-  按协议错误处理：该 worker 被剔除，请求 502（错误含「format 输出违反信封
-  协议」）。aProxy 会丢弃 format 的 stderr，排障日志请写进你自己的文件。
-- **key 轮换只在请求之间生效**：请求体只转换一次，同一请求的全部重试重放
-  同一份转换产物——沿用同一个 key，不会在重试时换 key。
-- **与 `forward_only` 互斥**：同开启动即报错（forward_only 不缓冲请求体，
-  转换器需要全量 body）。
-- **仅 toml 每实例配置**：无 settings.json 全局默认层、无 CLI 旗标（转换是
-  场景特定功能，不同实例连不同上游用不同 format——设计决策）。
-- 转换是**整流**的：请求体缓冲完成后转换一次（重试全程重放转换产物）；
-  响应在重试判定成功后、回放前转换。SSE 响应整流转文本交给 format。官方
-  aproxy-format 的**跨协议转换只支持非流式**：跨协议的 SSE 响应不支持，响应侧
-  报错后按上面的语义透传上游原始响应（客户端收到渠道协议格式的流）；同协议
-  SSE 原样直通。
-- 重试重放的是转换后的请求（转换不重复执行）；`bounded_retry_paths` 命中
-  的透传路径不进响应转换（错误响应不经 format）。
-- 官方示例二进制 `aproxy-format`（协议转换 + 轮换 + 聚合）单独发 Release，
-  落 `~/.aproxy/bin/`；版本独立于 aproxy alpha 线。
-- 改后 `aproxy restart <端口或别名>` 生效。
+Runtime behavior and the 502 texts: behaviors.md, "External transformers"; aproxy-format skill,
+troubleshooting.md.
 
-## 校验规则
+## Checks at start
 
-启动时校验失败即拒绝启动（错误信息含文件位置与修复指引）：
+`aproxy start`, and the precheck of `aproxy restart`, load the file, apply CLI flags and settings.json
+defaults, and check the result. On failure the instance does not start, and the error reads
+`配置错误: <reason>` ("configuration error") followed by `位置: <file>` ("location"). A daemon that
+fails during its own startup writes the error to `<APROXY_HOME>/logs/startup.log`. When the bad value
+came from settings.json, the message adds `（该值来自 settings.json 的 … 全局默认，不在上述 toml 中）`
+("the value comes from the settings.json global default, not from the toml above").
 
-1. `base_url` 非空、http/https 开头、无 `?`/`#`
-2. `proxy` 若设置：URL 可解析、协议受支持、有主机
-3. 配置了 `proxy_username`/`proxy_password` 则必须同时配置 `proxy`
-4. `bounded_retry_paths` 每项必须是能编译的正则（非法模式启动即报错，
-   错误含模式原文）
-5. `request_transform`/`response_transform`：`command` 非空；
-   `mode = "persistent"` 时 `pool_max >= 1`；与 `forward_only` 不同存
-   （同开报互斥错误）
+| Reason (verbatim prefix) | Meaning and fix |
+|---|---|
+| `配置文件解析失败（TOML 语法错误）` | Not valid TOML, a value of the wrong type, an invalid `mode`, or a transformer table without `command`. The message includes the parser's location. |
+| `指定的配置文件不存在` | The file given with `--config` does not exist. |
+| `base_url 不能为空` | `base_url` is missing or blank. This is also what you get when the default config file does not exist yet. |
+| `base_url 必须以 http:// 或 https:// 开头` | "must start with http:// or https://". |
+| `base_url 不应包含 ? 或 #` | "must not contain ? or #": move query parameters out of `base_url`. |
+| `listen_addr 缺少端口或端口无效` | "lacks a port or the port is invalid". |
+| `proxy 配置无效` | "proxy is invalid": the URL does not parse. |
+| `proxy 仅支持 http/https/socks4/socks5 协议` | "proxy supports only http/https/socks4/socks5": unsupported scheme. |
+| `proxy 缺少主机地址` | "proxy lacks a host". |
+| `配置了 proxy_username/proxy_password 但未配置 proxy URL` | Credentials without `proxy`. |
+| `bounded_retry_paths 含非法正则` | "contains an invalid regex"; the pattern is quoted. |
+| `keepalive_trigger 取值无效` | "invalid value": use `accept`, `body_stream` or `any`. |
+| `request_transform 的 pool_max 必须 >= 1` (or `response_transform …`) | `pool_max = 0` with `mode = "persistent"`. |
+| `forward_only 与外部转换器互斥` | "forward_only and external transformers are mutually exclusive": keep one. |
 
-## 归一化行为
+## Normalization
 
-加载后自动执行（保存时同样应用）：
+Applied every time the file is loaded:
 
-- base_url 末尾 `/` 去除
-- api_key/代理三项：trim；空白视为未设置
-- 头表：键值 trim；空键剔除；同键保留先出现者
-- transform 的 `command` trim；trim 后为空 = 该字段视为未设置
+- A trailing `/` is removed from `base_url`.
+- `api_key`, `proxy`, `proxy_username` and `proxy_password` are trimmed; blank means unset.
+- Header names and values are trimmed; entries with a blank name are dropped.
+- A transformer's `command` is trimmed and a leading `~` expanded; blank means the transformer is
+  unset.

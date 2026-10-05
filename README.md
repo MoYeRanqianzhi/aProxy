@@ -153,7 +153,7 @@ Codex 的 `stream_idle_timeout_ms` 默认 300000（5 分钟），按 SSE 事件�
 | Gemini CLI | 用 `GOOGLE_GEMINI_BASE_URL` 与 `GEMINI_API_KEY` 接入，结果正常（实测）。但它的流式请求不进保活通道，而它的响应头超时写死为 300 秒（新版更短），重试期加生成超过这个时长就会失败，没有配置可调 |
 | pi、OpenCode、Aider、Cline、Roo Code、Kimi CLI | 默认即可（只有按字节计时的超时）；OpenCode 1.18 起不要设 `timeout`，它限制的是含等待在内的整请求时长 |
 
-除 Claude Code、Codex、Gemini CLI 外，上表来自源码调研，未逐个实测。各客户端的调研版本、配置位置与依据见 skill 文档 [behaviors.md「接入 agent 客户端」](.claude/skills/aproxy-cli/references/latest/behaviors.md#接入-agent-客户端)。
+除 Claude Code、Codex、Gemini CLI 外，上表来自源码调研，未逐个实测。各客户端的调研版本、配置位置与依据见 skill 文档 [clients.md](.claude/skills/aproxy-cli/references/latest/clients.md)。
 
 注意：请求体里 `"stream": false` 的普通请求没有保活通道（没有可注入心跳的响应流），首字节延迟等于完整生成时长，客户端需自行调大超时（Claude Code 为 `API_TIMEOUT_MS`）。
 

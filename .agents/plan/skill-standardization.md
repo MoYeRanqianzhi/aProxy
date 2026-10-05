@@ -22,14 +22,19 @@
   6 个常见任务新旧都能做对，区分度低；唯一失分是新版回归——用例 1 里新版按 clients.md「一个实例
   一个上游」自行把 Codex 改接新开的 12346，违背用户指定的 12345。评审页面
   `.agents/skill-eval.local/review-iteration-1.html`，已请用户查看。
+- 回归已修（51b0fea）：clients.md 与 SKILL.md 改为「用户指定的实例照用；上游可能不支持某协议时说明
+  风险，另起实例只作建议」。
+- 第二轮评测（iteration-2，sonnet 各跑一次；用例 1 复测 + 新增 7/9/11）：新 100% / 旧 87.5%。
+  用例 1 新版 7/7（回归消失，旧版沿用第一轮评分）；用例 7（退避节奏）旧版 2/4——旧文档没写前三次
+  零延迟，执行者标为未核实；用例 9（Windows 临时 home 下 stop 打到生产实例）与 11（信封缺 body）
+  新旧都满分，旧文档的信息已足够推断，区分度低。评分由主代理逐条读输出写入各 run 的 grading.json；
+  未记录耗时与 token（后台通知未带这两项）。评审页面 `.agents/skill-eval.local/review-iteration-2.html`。
 
 ## 接下来
-1. 读用户反馈（评审页面导出的 feedback.json）。
-2. 修回归：用户指定的实例照用；上游协议可能不合时说明风险、把另开实例作为可选方案。
-3. 第二轮评测补「旧文档写错」的区分性用例：重试退避（0/0/0/5 s）、Gemini 的 x-goog-api-key、
-   看门狗恢复延迟、Windows 临时 APROXY_HOME 下 `stop <端口>` 会打到生产实例、format 回信不带 body
-   会清空请求体。
-4. 可选：description 触发优化（run_loop）。
+1. 若用户看过评审页面并导出 feedback.json，按反馈改。
+2. 可选：description 触发优化（skill-creator 的 run_loop）。
+3. 每次代码行为变化同步改 skill（英文；程序输出的中文原文照录，改完核对每段引用的中文都能在
+   src/ 里逐字找到）；无后续评测需求时本计划可删。
 
 ## 并行中的其他事（见 TODO「下一版发布前」）
 修复 4（b46a15f）、修复 5（3ce26e9）已提交。skill 文档需体现的新行为已转告子代理：转换器纳入

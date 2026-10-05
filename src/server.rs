@@ -268,6 +268,19 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
             "仅转发模式已启用：请求体与响应均不缓冲、不重试（上游失败直接 502、响应流中断直接截断）；disk_cache / spool_limit_mb / keepalive_interval_secs / max_retry_backoff_secs 在本模式下不生效"
         );
     }
+    // 保活适用的请求发往上游时 accept-encoding 一律改为 identity（往压缩流里插
+    // 明文心跳会让客户端解压失败，见 proxy.rs 保活通道）。override_headers 里
+    // 用户显式配的 accept-encoding 因此只对不走保活的请求生效——这条覆盖是
+    // 静默的，启动时说一次，免得用户以为配置被无视了却查不到原因
+    if let Some(value) = state
+        .config
+        .accept_encoding_override_shadowed_by_keepalive()
+    {
+        tracing::warn!(
+            configured = %value,
+            "override_headers 里的 accept-encoding 对保活适用的请求不生效：这些请求发往上游时一律改为 identity（压缩流里无法插入心跳），只有不走保活的请求按配置值发送"
+        );
+    }
     // 外部转换器改变了「原样透传」的承诺，启动时必须显式留痕：请求/响应将
     // 交给 format 程序改写，两侧失败语义不同（请求 502 不重试、响应透传）
     for (name, t) in [

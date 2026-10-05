@@ -551,6 +551,23 @@ impl Config {
         self.keepalive_interval_secs > 0
     }
 
+    /// `override_headers` 里显式配置、却会被保活通道覆盖掉的 accept-encoding 值。
+    ///
+    /// 保活适用的请求发往上游时 accept-encoding 一律改为 `identity`（往压缩流里
+    /// 插明文心跳会让客户端解压失败），所以这里配的非 identity 值只对不走保活的
+    /// 请求生效。返回 Some(配置值) 供启动时 warn 一次；保活关闭、仅转发模式
+    /// （不走保活通道）、或本就配的 identity 时返回 None。
+    pub fn accept_encoding_override_shadowed_by_keepalive(&self) -> Option<&str> {
+        if self.forward_only_enabled() || !self.keepalive_enabled() {
+            return None;
+        }
+        self.override_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.trim().eq_ignore_ascii_case("identity"))
+    }
+
     /// 保活间隔
     pub fn keepalive_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.keepalive_interval_secs)
@@ -993,6 +1010,36 @@ mod tests {
         std::fs::write(&path, "base_url = \"https://x.example.com\"").unwrap();
         let strict = load_from_strict(&path).unwrap();
         assert_eq!(strict.base_url, "https://x.example.com");
+    }
+
+    #[test]
+    fn accept_encoding_override_shadowed_only_when_keepalive_rewrites_it() {
+        let with = |value: &str| Config {
+            override_headers: HashMap::from([("Accept-Encoding".to_string(), value.to_string())]),
+            ..Default::default()
+        };
+        // 保活开启（默认 15s）+ 非 identity：被覆盖，名字大小写不敏感
+        assert_eq!(
+            with("gzip, br").accept_encoding_override_shadowed_by_keepalive(),
+            Some("gzip, br")
+        );
+        // 本就配 identity：与改写结果一致，无需提示
+        assert_eq!(
+            with(" Identity ").accept_encoding_override_shadowed_by_keepalive(),
+            None
+        );
+        // 保活关闭 / 仅转发模式：不走保活通道，配置值照常生效
+        let mut off = with("gzip");
+        off.keepalive_interval_secs = 0;
+        assert_eq!(off.accept_encoding_override_shadowed_by_keepalive(), None);
+        let mut fwd = with("gzip");
+        fwd.forward_only = Some(true);
+        assert_eq!(fwd.accept_encoding_override_shadowed_by_keepalive(), None);
+        // 未配置该头
+        assert_eq!(
+            Config::default().accept_encoding_override_shadowed_by_keepalive(),
+            None
+        );
     }
 
     #[test]

@@ -628,6 +628,114 @@ async fn keepalive_channel_response_transform_failure_passes_through() {
     assert_eq!(count.load(Ordering::SeqCst), 2, "恰好重试一轮后成功");
 }
 
+/// 保活间隔 1s 的实例配置（转换慢于一个间隔时，骨架头与心跳应先于转换完成到达）
+fn keepalive_1s_config_for(upstream: &str) -> Config {
+    Config {
+        keepalive_interval_secs: 1,
+        ..proxy_config_for(upstream)
+    }
+}
+
+/// 发一个走保活通道的请求，返回（拿到响应头的耗时、状态、完整 body）
+async fn timed_sse_post(proxy: &str) -> (std::time::Duration, StatusCode, String) {
+    let started = std::time::Instant::now();
+    let resp = local_client()
+        .post(format!("{proxy}/v1/x"))
+        .header("accept", "text/event-stream")
+        .body("q")
+        .send()
+        .await
+        .unwrap();
+    let head_after = started.elapsed();
+    let status = resp.status();
+    (head_after, status, resp.text().await.unwrap())
+}
+
+#[tokio::test]
+async fn keepalive_covers_slow_request_transform() {
+    // 请求转换耗时 2.5s、保活间隔 1s：请求转换在保活通道内经心跳节拍驱动，
+    // 骨架头约 1s 到达、早于转换完成，之后照常心跳——而不是让客户端在拿到任何
+    // 字节之前干等转换（timeout_secs = 0 时这段等待没有上界）
+    isolate_env_proxy();
+    let (upstream, count, _jh) = fixed_upstream(StatusCode::OK, "ok-payload").await;
+    let mut cfg = keepalive_1s_config_for(&upstream);
+    cfg.request_transform = Some(TransformConfig {
+        args: vec!["sleep".to_string(), "2500".to_string()],
+        ..transform_config("sleep", TransformMode::Spawn)
+    });
+    let (proxy, _pj) = start_proxy(cfg).await;
+
+    let (head_after, status, text) = timed_sse_post(&proxy).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        head_after < std::time::Duration::from_millis(2200),
+        "骨架头应在约一个保活间隔后到达、早于请求转换完成（2.5s）: {head_after:?}"
+    );
+    assert!(text.contains(": keepalive"), "转换期间应有心跳: {text}");
+    assert!(
+        text.contains("ok-payload"),
+        "转换完成后应照常转发并回放: {text}"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn keepalive_request_transform_failure_after_commit_ends_with_error_event() {
+    // 请求转换在骨架头提交之后才失败（超时 2s > 保活间隔 1s）：状态行已发出，
+    // 不能再回 502，以终态 SSE error 事件收场；请求未发往上游
+    isolate_env_proxy();
+    let (upstream, count, _jh) = fixed_upstream(StatusCode::OK, "never").await;
+    let mut cfg = keepalive_1s_config_for(&upstream);
+    cfg.request_transform = Some(TransformConfig {
+        args: vec!["sleep".to_string(), "5000".to_string()],
+        timeout_secs: Some(2),
+        ..transform_config("sleep", TransformMode::Spawn)
+    });
+    let (proxy, _pj) = start_proxy(cfg).await;
+
+    let (_, status, text) = timed_sse_post(&proxy).await;
+    assert_eq!(status, StatusCode::OK, "骨架头已提交");
+    assert!(
+        text.contains("event: error") && text.contains("proxy_transform_failed"),
+        "已提交后请求转换失败应以终态 error 事件收场: {text}"
+    );
+    assert!(
+        text.contains("请求转换失败"),
+        "error 事件应带失败原因: {text}"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 0, "请求转换失败不得发往上游");
+}
+
+#[tokio::test]
+async fn keepalive_covers_slow_response_transform() {
+    // 上游很快回 SSE 成功、响应转换耗时 2.5s：转换经心跳节拍驱动，骨架头约 1s
+    // 到达、之后心跳，转换完成后回放转换后的 body
+    isolate_env_proxy();
+    let app = Router::new().fallback(|| async {
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            "data: ok\n\n",
+        )
+            .into_response()
+    });
+    let (upstream, _jh) = bind_router(app).await;
+    let mut cfg = keepalive_1s_config_for(&upstream);
+    cfg.response_transform = Some(TransformConfig {
+        args: vec!["sleep".to_string(), "2500".to_string()],
+        ..transform_config("sleep", TransformMode::Spawn)
+    });
+    let (proxy, _pj) = start_proxy(cfg).await;
+
+    let (head_after, status, text) = timed_sse_post(&proxy).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        head_after < std::time::Duration::from_millis(2200),
+        "骨架头应在约一个保活间隔后到达、早于响应转换完成（2.5s）: {head_after:?}"
+    );
+    assert!(text.contains(": keepalive"), "转换期间应有心跳: {text}");
+    assert!(text.contains("data: ok"), "应回放转换后的 body: {text}");
+}
+
 // ---------------------------------------------------------------------------
 // 进程池加固：stdout 错位不得串包、复用的死 worker 不得让请求失败
 // ---------------------------------------------------------------------------

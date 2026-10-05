@@ -1268,81 +1268,40 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
     let keepalive_applies = keepalive_enabled
         && keepalive_triggered(state.config.keepalive_trigger(), &headers, &req_body).await;
 
-    let mut target_url = upstream_url(&state.config, &uri);
-
-    // 请求转换器：缓冲完成后交给外部 format 程序改写（body/headers/url/method
-    // 全部可变）——转换**一次**，产物被下方三轮 forward_once 自动重放，重试
-    // 循环零分支。位置约束：必须在首轮 forward_once 之前（否则重放的是未转换
-    // 请求）、bounded_retry 匹配之后（bounded 对原始路径判定——路径集合是
-    // 客户端视角，转换是实例级配置，语义不同源）。
-    // 失败 → 502 终态不重试，请求未发往上游（失败按成因分类，各类性质见
-    // `transform::TransformError` 的分类说明）。
-    let mut method = method;
-    let mut headers = headers;
-    let mut req_body = req_body;
-    if let Some(pool) = state.request_pool.as_ref() {
-        match crate::transform::transform_request(
-            pool,
-            &method,
-            &target_url,
-            &headers,
-            req_body,
-            state.spool_dir.as_deref(),
-        )
-        .await
-        {
-            Ok(t) => {
-                tracing::info!(url = %crate::config::mask_base_url(&t.url), "请求已由外部转换器改写");
-                method = t.method;
-                target_url = t.url;
-                headers = t.headers;
-                req_body = t.body;
-            }
-            Err(e) => {
-                let msg = format!("请求转换失败: {e}");
-                state.note_upstream_failure(&msg);
-                tracing::warn!(error = %e, "请求转换失败，502 终态（请求侧转换失败按约定不重试）");
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    format!("{msg}（请求侧转换失败不重试，未发往上游）"),
-                )
-                    .into_response();
-            }
-        }
-    }
-
-    tracing::info!(
-        method = %method,
-        path = %crate::config::mask_base_url(path_and_query),
-        target = %crate::config::mask_base_url(&target_url),
-        "代理请求"
-    );
-
+    let req = OutboundRequest {
+        method,
+        target_url: upstream_url(&state.config, &uri),
+        headers,
+        body: req_body,
+    };
     let max_spool_bytes = spool_limit_bytes(&state.config);
 
-    // 保活适用：从首轮起交给保活通道（它自己处理首轮快速路径与提交点）。
-    // req_body 所有权移交，随通道结束自动 Drop 删除磁盘临时文件。
+    // 保活适用：从请求转换起就交给保活通道（它自己处理请求转换、首轮快速路径
+    // 与提交点）。请求转换放进通道里做，是为了让它同样处在心跳节拍内——format
+    // 慢（timeout_secs = 0 时没有上界）时客户端照样在一个间隔后收到骨架头与
+    // 心跳，而不是在拿到任何字节之前干等。req 所有权移交，请求体随通道结束
+    // 自动 Drop 删除磁盘临时文件。
     if keepalive_applies {
-        // 保活通道会往响应体里插 `: keepalive` 注释——只有未压缩的体才能这样
-        // 插入（往 gzip/br 流里插明文，客户端解压必坏）。故对保活适用的请求
-        // 要求上游以 identity 编码回应：客户端照旧拿到合法响应（未压缩永远是
-        // 可接受的编码），代价只是上游到本机这一段多传一些字节。放在请求转换
-        // 之后，覆盖 format 可能写入的同名头。
-        headers.insert(
-            http::header::ACCEPT_ENCODING,
-            HeaderValue::from_static("identity"),
-        );
         return proxy_with_keepalive(
             state,
-            method,
-            target_url,
-            headers,
-            req_body,
+            req,
+            path_and_query.to_string(),
             max_spool_bytes,
             bounded_retry,
         )
         .await;
     }
+
+    let OutboundRequest {
+        method,
+        target_url,
+        headers,
+        body: req_body,
+    } = match apply_request_transform(&state, req).await {
+        Ok(req) => req,
+        Err(msg) => return request_transform_failed_response(&msg),
+    };
+    log_proxied_request(&method, path_and_query, &target_url);
 
     // 首轮（attempt 1）先行：成功则完整保真回放（status/headers 不失真），
     // 需要重试才进入重试通道——首轮成功是常态路径。
@@ -1428,6 +1387,95 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
     .await
 }
 
+/// 发往上游的请求：请求转换（若配置）之后的最终形态，重试循环的每一轮原样重放。
+struct OutboundRequest {
+    method: http::Method,
+    target_url: String,
+    headers: HeaderMap,
+    body: RequestBody,
+}
+
+/// 请求转换器：缓冲完成后交给外部 format 程序改写（body/headers/url/method
+/// 全部可变）——转换**一次**，产物被重试循环的每一轮 forward_once 原样重放，
+/// 重试循环零分支。位置约束：必须在首轮 forward_once 之前（否则重放的是未
+/// 转换请求）、bounded_retry 匹配之后（bounded 对原始路径判定——路径集合是
+/// 客户端视角，转换是实例级配置，语义不同源）。未配置时原样返回。
+///
+/// 失败返回给客户端看的原因（已记日志与最近一次失败）：请求未发往上游，按约定
+/// 不重试（失败按成因分类，各类性质见 `transform::TransformError` 的分类说明）。
+/// 调用方按响应是否已提交决定回 502 还是写终态 error 事件。
+async fn apply_request_transform(
+    state: &AppState,
+    req: OutboundRequest,
+) -> Result<OutboundRequest, String> {
+    let Some(pool) = state.request_pool.as_ref() else {
+        return Ok(req);
+    };
+    let OutboundRequest {
+        method,
+        target_url,
+        headers,
+        body,
+    } = req;
+    match crate::transform::transform_request(
+        pool,
+        &method,
+        &target_url,
+        &headers,
+        body,
+        state.spool_dir.as_deref(),
+    )
+    .await
+    {
+        Ok(t) => {
+            tracing::info!(url = %crate::config::mask_base_url(&t.url), "请求已由外部转换器改写");
+            Ok(OutboundRequest {
+                method: t.method,
+                target_url: t.url,
+                headers: t.headers,
+                body: t.body,
+            })
+        }
+        Err(e) => {
+            let msg = format!("请求转换失败: {e}");
+            state.note_upstream_failure(&msg);
+            tracing::warn!(error = %e, "请求转换失败，终态返回（请求侧转换失败按约定不重试）");
+            Err(msg)
+        }
+    }
+}
+
+/// 请求转换失败的 502 终态（尚未向客户端提交任何字节时）
+fn request_transform_failed_response(msg: &str) -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        format!("{msg}（请求侧转换失败不重试，未发往上游）"),
+    )
+        .into_response()
+}
+
+/// 已提交的保活响应以终态 SSE error 事件收场（状态行已发出、不可再改）。
+/// message 经 JSON 序列化，任意文案（含引号、换行、中文）都不会破坏事件帧。
+fn terminal_error_event(error_type: &str, message: &str) -> Bytes {
+    let data = serde_json::json!({
+        "type": "error",
+        "error": { "type": error_type, "message": message },
+    });
+    Bytes::from(format!("event: error\ndata: {data}\n\n"))
+}
+
+/// 「代理请求」日志：请求转换之后、首轮之前各通道各记一次。URL 一律经
+/// mask_base_url：base_url 可能内嵌 user:pass，查询串可能带 key（Gemini 式
+/// ?key=），日志常被整段粘贴求助
+fn log_proxied_request(method: &http::Method, path_and_query: &str, target_url: &str) {
+    tracing::info!(
+        method = %method,
+        path = %crate::config::mask_base_url(path_and_query),
+        target = %crate::config::mask_base_url(target_url),
+        "代理请求"
+    );
+}
+
 /// 上游响应体超出 spool 上限的 502 终态（尚未向客户端提交任何字节时）
 fn too_large_response() -> Response {
     (
@@ -1461,6 +1509,19 @@ async fn replay_success(
 ) -> Response {
     let (resp_headers, body) =
         transform_response_if_configured(state, target_url, resp_headers, body).await;
+    replay_transformed(attempt, status, resp_headers, raw_headers, body).await
+}
+
+/// 成功响应的保真回放（响应转换已做完）：按转换后的头与体重算是否流式，
+/// 原样回放 status/头/体。format 可能改写 content-type 与 body 形态，所以
+/// 流式判定必须在转换之后。
+async fn replay_transformed(
+    attempt: u32,
+    status: StatusCode,
+    resp_headers: HeaderMap,
+    raw_headers: &reqwest::header::HeaderMap,
+    body: SpooledBody,
+) -> Response {
     let is_streaming = match &body {
         // 内存模式：整体判定（含 body 嗅探，与旧行为一致）
         SpooledBody::Memory(_) => retry::is_streaming_response(&resp_headers, body.memory_bytes()),
@@ -2269,10 +2330,8 @@ async fn replay_failure_as_is(
 /// 不再发起新请求：前三者经 `drive` 返回 None，回放经 send 失败。
 async fn proxy_with_keepalive(
     state: AppState,
-    method: http::Method,
-    target_url: String,
-    headers: HeaderMap,
-    req_body: RequestBody,
+    req: OutboundRequest,
+    path_and_query: String,
     max_spool_bytes: usize,
     bounded_retry: bool,
 ) -> Response {
@@ -2291,6 +2350,48 @@ async fn proxy_with_keepalive(
             tokio::time::interval_at(tokio::time::Instant::now() + keepalive_dur, keepalive_dur);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let real_head_allowed = state.response_pool.is_none();
+
+        // 请求转换同样经 drive 驱动：一个间隔内没转完就先提交骨架头、此后照常
+        // 心跳。失败时尚未提交 → 与不保活路径一致回 502；已提交 → 终态 error 事件
+        let transformed = drive(
+            &mut sink,
+            &mut ticker,
+            apply_request_transform(&state, req),
+            None,
+            false,
+            "请求转换",
+        )
+        .await;
+        let OutboundRequest {
+            method,
+            target_url,
+            mut headers,
+            body: req_body,
+        } = match transformed {
+            None => return,
+            Some(Ok(req)) => req,
+            Some(Err(msg)) => {
+                if sink.is_committed() {
+                    sink.send(Ok(terminal_error_event("proxy_transform_failed", &msg)))
+                        .await;
+                } else {
+                    sink.respond(request_transform_failed_response(&msg));
+                }
+                return;
+            }
+        };
+        // 保活通道会往响应体里插 `: keepalive` 注释——只有未压缩的体才能这样
+        // 插入（往 gzip/br 流里插明文，客户端解压必坏）。故对保活适用的请求
+        // 要求上游以 identity 编码回应：客户端照旧拿到合法响应（未压缩永远是
+        // 可接受的编码），代价只是上游到本机这一段多传一些字节。放在请求转换
+        // 之后，覆盖 format 可能写入的同名头（override_headers 里配的同名头也被
+        // 覆盖，启动时 server.rs 会 warn 一次）。
+        headers.insert(
+            http::header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+        log_proxied_request(&method, &path_and_query, &target_url);
+
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
@@ -2396,12 +2497,33 @@ async fn proxy_with_keepalive(
                     body,
                     disk_scan,
                 } => {
+                    let upstream_sse = is_event_stream(&resp_headers);
                     if !needs_retry_response(attempt, &status, &raw_headers, &body, &disk_scan) {
+                        // 响应转换（若配置）放在提交判定之前，并尽量经 drive 驱动：
+                        // format 转换期间照常心跳、一个间隔到点仍未提交就先提交骨架头
+                        // （timeout_secs = 0 时转换耗时没有上界，不能让客户端在这段
+                        // 时间收不到任何字节）。例外是「尚未提交 + 上游回的是 2xx 非
+                        // SSE」：骨架是 SSE、心跳是 SSE 注释，此时提交会把非 SSE 的
+                        // 响应改坏（与 drive 的「2xx 非 SSE 暂停骨架提交」同一道理），
+                        // 只能直接等转换完成。转换失败时透传原样（不发 error 事件——
+                        // 那是响应不可用的终态模板；此处响应在手，仅转换失败）
+                        let transform = transform_response_if_configured(
+                            &state,
+                            &target_url,
+                            resp_headers,
+                            body,
+                        );
+                        let transformed = if !sink.is_committed() && !upstream_sse {
+                            Some(transform.await)
+                        } else {
+                            drive(&mut sink, &mut ticker, transform, None, false, "响应转换").await
+                        };
+                        let Some((resp_headers, body)) = transformed else {
+                            return;
+                        };
                         if !sink.is_committed() {
-                            // 提交前就成功：保真快速路径（上游 status 与全部响应头）
-                            let resp = replay_success(
-                                &state,
-                                &target_url,
+                            // 提交前就成功：保真快速路径（上游 status 与转换后的响应头）
+                            let resp = replay_transformed(
                                 attempt,
                                 status,
                                 resp_headers,
@@ -2412,16 +2534,8 @@ async fn proxy_with_keepalive(
                             sink.respond(resp);
                             return;
                         }
-                        // 已提交：状态行与响应头不可再改——format 对 headers 的
-                        // 改写无效，仅 body 转换生效。转换失败透传原样（不发 error
-                        // 事件——那是响应不可用的终态模板；此处响应在手仅转换失败）
-                        let (resp_headers, body) = transform_response_if_configured(
-                            &state,
-                            &target_url,
-                            resp_headers,
-                            body,
-                        )
-                        .await;
+                        // 已提交：状态行与响应头不可再改——format 对 headers 的改写
+                        // 无效，仅 body 转换生效
                         if !is_event_stream(&resp_headers) {
                             // 不撤回、照常回放：客户端已在等这个响应，丢掉成功结果
                             // 只会更糟。日志给出可行动的配置建议
@@ -2439,14 +2553,25 @@ async fn proxy_with_keepalive(
                         let mut body = match encoding_to_undo(&resp_headers) {
                             None => body,
                             Some(encoding) => {
-                                match decode_for_committed_replay(
-                                    body,
-                                    encoding.clone(),
-                                    state.spool_dir.clone(),
-                                    max_spool_bytes,
+                                // 解码大体可能耗时，同样在心跳节拍内进行
+                                let decoded = drive(
+                                    &mut sink,
+                                    &mut ticker,
+                                    decode_for_committed_replay(
+                                        body,
+                                        encoding.clone(),
+                                        state.spool_dir.clone(),
+                                        max_spool_bytes,
+                                    ),
+                                    None,
+                                    false,
+                                    "回放前解码",
                                 )
-                                .await
-                                {
+                                .await;
+                                let Some(decoded) = decoded else {
+                                    return;
+                                };
+                                match decoded {
                                     Ok(decoded) => {
                                         tracing::info!(
                                             attempt,

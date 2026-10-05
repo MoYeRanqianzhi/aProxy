@@ -18,7 +18,7 @@ pub(crate) struct Cli {
 
     /// 前台运行（日志输出到控制台，Ctrl+C 停止）；默认在后台运行，
     /// 日志按启动时刻随机命名写 ~/.aproxy/logs/ 下，实际路径以
-    /// `aproxy status`/`aproxy logs` 经 IPC 获取为准
+    /// `aproxy logs` 经 IPC 向实例询问到的为准
     #[arg(long)]
     pub(crate) foreground: bool,
 
@@ -36,7 +36,7 @@ pub(crate) struct Cli {
 
     /// 守护日志文件路径（仅本次运行生效），覆盖配置文件中的 log_file。
     /// 未指定时写入 ~/.aproxy/logs/ 下按启动时刻随机命名的文件，
-    /// 实际路径以 aproxy status / aproxy logs 经 IPC 获取为准
+    /// 实际路径以 aproxy logs 经 IPC 向实例询问到的为准
     #[arg(long, value_name = "PATH", global = true)]
     pub(crate) log_file: Option<String>,
 
@@ -224,8 +224,9 @@ pub(crate) struct InstallArgs {
     pub(crate) no_skills: bool,
 
     /// 只更新 skill 文档，不动二进制（跳过整个安装状态机；skill 上次
-    /// failed 后的单独重试入口）
-    #[arg(long, conflicts_with_all = ["from", "adopt", "abort", "version"])]
+    /// failed 后的单独重试入口）。可同时给出 VERSION 指定 skill 版本
+    /// （默认 latest，查询失败时报错提示改用具体版本号）
+    #[arg(long, conflicts_with_all = ["from", "adopt", "abort"])]
     pub(crate) skills_only: bool,
 
     /// [内部] 续作模式：从 install.state 残留的 phase 幂等推进（看门狗/

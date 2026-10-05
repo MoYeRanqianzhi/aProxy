@@ -31,9 +31,16 @@ use aproxy::settings;
 /// stop、doctor、自动拉起的 `install --continue` 等与配置文件无关的命令不能被
 /// 一个失效的 default_config 拦住，报错里推荐的 `aproxy config --clear-default`
 /// 自己更必须能执行。
+///
+/// 显式 `--config` 在此展开 `~` 并按当前工作目录绝对化：这个路径会被转发给
+/// 守护子进程、写进注册表与 .restore，日后可能在别的工作目录被读取（restore
+/// 会把找不到配置文件的记录当失效清理掉）。
 pub(crate) fn resolve_cfg_path(cli: &crate::cli::Cli) -> Result<PathBuf, String> {
     if let Some(p) = &cli.config {
-        return Ok(p.clone());
+        return Ok(match p.to_str() {
+            Some(s) => settings::expand_path(s),
+            None => std::path::absolute(p).unwrap_or_else(|_| p.clone()),
+        });
     }
     match settings::load().default_config {
         Some(p) => {
@@ -74,3 +81,40 @@ pub(crate) fn resolve_config_target(target: &str) -> Option<PathBuf> {
 }
 
 pub(crate) use settings::path_match_key as config_path_key;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser as _;
+
+    #[test]
+    fn explicit_config_path_is_made_absolute() {
+        // 相对 --config 必须在 CLI 边界绝对化：它会被写进 .restore，restore 若在
+        // 别的工作目录运行，相对路径会被当成「配置已不存在」而清掉记录
+        let cli =
+            crate::cli::Cli::try_parse_from(["aproxy", "--config", "rel.toml", "status"]).unwrap();
+        let path = resolve_cfg_path(&cli).unwrap();
+        assert!(path.is_absolute(), "{}", path.display());
+        assert_eq!(path, std::env::current_dir().unwrap().join("rel.toml"));
+
+        let cli =
+            crate::cli::Cli::try_parse_from(["aproxy", "--config", "~/x.toml", "status"]).unwrap();
+        let path = resolve_cfg_path(&cli).unwrap();
+        assert_eq!(path, dirs::home_dir().unwrap().join("x.toml"));
+    }
+
+    #[test]
+    fn skills_only_accepts_a_version() {
+        // latest 查询失败时的提示让用户改用「--skills-only <具体版本号>」，
+        // 解析层必须接受这种写法
+        assert!(
+            crate::cli::Cli::try_parse_from(["aproxy", "install", "0.1.0", "--skills-only"])
+                .is_ok()
+        );
+        assert!(
+            crate::cli::Cli::try_parse_from(["aproxy", "install", "--skills-only", "--abort"])
+                .is_err(),
+            "与 --abort 等仍互斥"
+        );
+    }
+}

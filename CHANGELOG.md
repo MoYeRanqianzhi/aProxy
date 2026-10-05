@@ -1,8 +1,7 @@
 # 更新日志
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
-`0.1.0-alpha.*` 各预发布版本的行为差异记录在 aproxy-cli skill 的
-`.claude/skills/aproxy-cli/references/latest/compatibility.md`。
+0.1.0 是第一个正式版本；此前的 `0.1.0-alpha.*` 预发布版本不再维护，也不在此记录。
 
 ## [Unreleased]
 
@@ -12,6 +11,9 @@
 
 ### 修复
 
+- 相对路径的 `--config` 在命令行入口展开 `~` 并转成绝对路径后再转发给守护进程、写入恢复记录；此前原样保存，`aproxy restore` 若在别的目录运行会把该实例的恢复记录当失效清掉。
+- `aproxy install --skills-only` 可以同时指定版本（`aproxy install <版本> --skills-only`），与 latest 查询失败时的提示一致。
+- `aproxy stop` 等不到实例退出时，提示改为跨平台、会核验进程身份的 `aproxy stop <端口> --force`（此前在所有平台都建议 `taskkill`）。
 - `settings.json` 的 `default_config` 指向的文件不存在时，只有要读配置的命令（启动、`aproxy config` 查看或修改内容）报错退出；`status`、`stop`、`doctor`、自动拉起的 `install --continue` 等不再被拦，报错信息推荐的 `aproxy config --clear-default` 也能直接执行（此前所有不带 `--config` 的命令都在分发前退出 1）。
 - `settings.json` 解析失败时，`aproxy alias add/remove` 与 `aproxy config --set-default/--clear-default` 拒绝修改并提示先修复或删除该文件，不再用默认值写回、冲掉原有的全部别名。
 - 相对路径的 `log_file` / `--log-file` 按文档相对 `APROXY_HOME` 解析（此前实际相对当前工作目录）。

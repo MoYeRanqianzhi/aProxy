@@ -155,9 +155,12 @@ pub(crate) async fn stop_instance(info: &daemon::InstanceInfo, mode: StopMode) -
                     println!("已停止 pid {}（端口 {}）", info.pid, port);
                     true
                 } else {
+                    // 强制结束指向 `stop --force`：跨平台，且终止前按 pid + 创建
+                    // 时间核验身份，不会像手敲 taskkill/kill 那样误杀复用了该 pid
+                    // 的其他进程
                     println!(
-                        "pid {} 已收到停止请求但尚未退出，可用 aproxy status 稍后确认，或 taskkill /PID {} /F 强制结束",
-                        info.pid, info.pid
+                        "pid {} 已收到停止请求但尚未退出，可用 aproxy status 稍后确认，或 aproxy stop {} --force 强制结束",
+                        info.pid, port
                     );
                     false
                 }

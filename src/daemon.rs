@@ -1000,12 +1000,17 @@ pub fn retire_moved_port_records_in(
     true
 }
 
+/// 本进程删过控制 socket（退出流程）：unix 的接受循环据此不再把它重建出来。
+#[cfg(unix)]
+static SOCKET_RETIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// 删除实例的 IPC 端点文件（优雅退出/看护摘除时调用）。
 /// Windows 命名管道由内核回收（no-op）；unix 的 UDS socket 是真实文件，
 /// bind 前的 remove_file 已自愈残留，此处显式清理让 run/ 目录不留死端点。
 pub fn remove_socket_file(port: &str) {
     #[cfg(unix)]
     {
+        SOCKET_RETIRED.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = std::fs::remove_file(endpoint_for(port));
     }
     #[cfg(windows)]
@@ -1487,7 +1492,10 @@ mod imp {
         Ok((exchange_over(client, req_line).await?, peer))
     }
 
-    pub struct Listener(UnixListener);
+    pub struct Listener {
+        listener: UnixListener,
+        path: std::path::PathBuf,
+    }
 
     /// 独占创建 socket。路径上已有文件时先探测：连得上（或积压队列满）说明有
     /// 进程正在用它（同一 home 同端口的另一个实例），拒绝——删掉它的 socket 等于
@@ -1511,25 +1519,59 @@ mod imp {
                 ));
             }
         }
-        UnixListener::bind(path).map(Listener)
+        UnixListener::bind(path).map(|listener| Listener {
+            listener,
+            path: path.to_path_buf(),
+        })
     }
 
+    /// 接受循环，兼管 socket 文件。文件被别的进程删掉时，监听还在、名字没了，
+    /// 客户端从此找不到本实例。升级窗口里 0.1.0 的看护者就会这么做：它处理旧
+    /// 实例的死亡事件时删 `run/<端口>.sock`，而安装器那时多半已在同一路径上
+    /// 拉起了新实例（见 .agents/plan/ipc-v1.md c.3）。所以每秒看一眼，名字没了
+    /// 就在原路径重建；本进程自己在退出（已收到 shutdown，或退出流程删了
+    /// socket）时不重建。
     pub async fn accept_loop(listener: Listener, state: Arc<ControlState>) {
-        let Listener(listener) = listener;
+        let Listener { mut listener, path } = listener;
+        let mut check = tokio::time::interval(Duration::from_secs(1));
+        check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(conn) => conn,
-                Err(_) => {
-                    // 持续性 accept 错误（如 fd 耗尽的 EMFILE）不会自行恢复，
-                    // 立即重试会形成占满 CPU 的紧死循环；睡一拍给错误源恢复机会。
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let stream = match accepted {
+                        Ok((stream, _)) => stream,
+                        Err(_) => {
+                            // 持续性 accept 错误（如 fd 耗尽的 EMFILE）不会自行恢复，
+                            // 立即重试会形成占满 CPU 的紧死循环；睡一拍给错误源恢复机会。
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    };
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        let _ = handle_conn(stream, state).await;
+                    });
                 }
-            };
-            let state = state.clone();
-            tokio::spawn(async move {
-                let _ = handle_conn(stream, state).await;
-            });
+                _ = check.tick() => {
+                    let retiring = *state.on_shutdown.borrow()
+                        || super::SOCKET_RETIRED.load(std::sync::atomic::Ordering::Relaxed);
+                    let missing = matches!(
+                        std::fs::symlink_metadata(&path),
+                        Err(e) if e.kind() == io::ErrorKind::NotFound
+                    );
+                    if missing && !retiring {
+                        match UnixListener::bind(&path) {
+                            Ok(fresh) => {
+                                listener = fresh;
+                                tracing::warn!(path = %path.display(), "控制 socket 文件被删除，已在原路径重建");
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "控制 socket 文件被删除，重建失败，1 秒后再试");
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -2046,6 +2088,30 @@ mod tests {
         );
         let bound = imp::bind(&endpoint).await;
         assert!(bound.is_ok(), "{:?}", bound.err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deleted_socket_file_is_recreated_while_serving() {
+        // 别的进程删了本实例的 socket 文件（升级窗口里 0.1.0 的看护者会这么做）：
+        // 一两秒内在原路径重建，客户端照常连得上
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = test_endpoint(dir.path(), "heal");
+        let mut record = sample_info("0");
+        record.pid = std::process::id();
+        let server = tokio::spawn(serve_endpoint(endpoint.clone(), control(record).0));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::fs::remove_file(&endpoint).unwrap();
+        let mut healed = false;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if request_raw(&endpoint, IpcOp::Ping).await.is_ok() {
+                healed = true;
+                break;
+            }
+        }
+        assert!(healed, "被删的控制 socket 应在原路径重建");
+        server.abort();
     }
 
     #[tokio::test]

@@ -57,8 +57,10 @@ IPC 重新整理格式后协议版本从 1 重新计数。随后：「发现的�
   规则退化为纯死亡检测（v0.1.0 watchdog.rs health_scan 的 `None => continue`），所以心跳不需要兼容。
   `handle_death` 不再删 socket；unix 心跳写入在文件被删后自行重建。单测里 `Announcer` 只建本 home 的节，
   免得让机器上 0.1.0 的看护者看到一场不存在的安装。
-- 下一步（第 5 步其余）：unix 守护每秒检查自己的 socket 文件，被删（0.1.0 看护者在升级窗口里会删，见
-  c.3 第 1 条）就在原路径重建，退出流程里不重建；随后 R1 claim version、安装器停旧看护者。
+- 第 5 步（提交 E1）：unix 接受循环每秒检查 socket 文件，被删就在原路径重建（c.3 第 1 条的缓解）；收到
+  shutdown 或本进程退出流程删过 socket（`SOCKET_RETIRED`）后不重建。测试 `deleted_socket_file_is_recreated_while_serving`
+  只在 CI 的 ubuntu 跑。
+- 下一步：R1 claim version 与安装器停旧看护者（第 5 步其余），然后第 6 步 install。
 - Linux 编译只能靠 CI 的 ubuntu 门禁：本机 WSL（Debian）的 rustup 工具链清单损坏，且 2026-10-06 WSL 内无外网
   （官方源与 rsproxy 均连接超时），修不了；本机也没有 Linux C 交叉编译器（ring 需要）。
 

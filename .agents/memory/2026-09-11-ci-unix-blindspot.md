@@ -57,5 +57,19 @@ test 与 clippy 一律带 `--workspace`。判断能否收尾时按 job 看结论
 没有新增失败（`gh run view <id> --job <job-id> --log-failed`）。
 Recheck when：ci.yml 的 job 结构变化，或 macOS 支持完成。
 
+## 复发（2026-10-06，IPC 提交 B faf551d 后 ubuntu 连红三次）
+
+本机仍无法编译 Linux（WSL 工具链坏、无交叉 gcc）。三个坑，每个都是「Windows 上不存在的路径」：
+1. 只被 `cfg(windows)` 代码与测试调用的函数，在 unix 非测试构建里是死代码——clippy `-D warnings`
+   报错。写跨平台模块时，凡调用方带平台门控，被调函数也要 `#[cfg(any(windows, test))]` 之类。
+2. 调整启动顺序（控制端点先于注册表）后，unix socket 所在的 run 目录可能还没被任何人创建。
+   Windows 管道不落盘，这类顺序依赖只在 unix 暴露。
+3. 对 Linux errno 的假设（残留 socket 的 connect 只会是 ConnectionRefused）没有验证手段时，
+   判定条件要写成「只在确有证据时拒绝，其余一律按安全默认处理」，并让测试把实际错误打出来。
+
+**How to apply**：改了 unix 路径（`cfg(unix)`、socket、/proc、/dev/shm、文件顺序）的提交推送后，
+先等 ubuntu job 结论再叠加下一步；手上有半成品时用 `git stash` 先单独提交修复（本次三次都这样处理，
+未丢工作）。
+
 相关：[[2026-09-11-never-kill-aproxy-by-name]]、[[2026-09-11-install-pitfalls]]、
 [[2026-09-12-install-online-deep-test]]

@@ -487,7 +487,7 @@ impl WatchdogState {
         let now_ms = now_millis();
         let mut hung = Vec::new();
         for w in &self.watched {
-            match read_heartbeat(&w.port) {
+            match read_heartbeat(&self.cfg.run_dir, &w.port) {
                 // 无心跳数据（心跳节创建失败）：退化为纯死亡检测
                 None => continue,
                 Some(ts) if now_ms.saturating_sub(ts) <= stale_ms => continue,
@@ -536,12 +536,12 @@ impl WatchdogState {
         };
         let w = self.watched.swap_remove(idx);
         imp::close_handle(w.handle);
-        // 看护关系终止即清理实例的 IPC 端点与心跳残留：优雅退出路径守护会
-        // 自清，崩溃/强杀路径靠这里兜底（Windows 管道/节对象由内核回收，
-        // 两个清理在 Windows 上均为 no-op；unix 的 .sock 靠 respawn 前
-        // remove_file 自愈，但清掉更干净，/dev/shm 心跳文件则无人自愈）
-        remove_heartbeat_file(port);
-        crate::daemon::remove_socket_file(port);
+        // 看护关系终止即清理心跳残留：优雅退出路径守护会自清，崩溃/强杀路径
+        // 靠这里兜底（Windows 节对象由内核回收，这里是 no-op；unix 的
+        // /dev/shm 文件无人自愈）。删到同端口刚起来的新实例也只丢一拍，它的
+        // 下一拍会重建文件。控制 socket 不在这里删：此刻端口上可能已有新实例，
+        // 删掉就是抢走它的控制通道；残留 socket 由下一个实例 bind 前探测清理
+        remove_heartbeat_file(&self.cfg.run_dir, port);
 
         // 安装态差异化（宣告有效时）：死亡事件可能是 install 滚动重启的
         // 预期内 stop（stop→新 exe spawn→IPC 就绪通常 2-3s、上限 10s）——
@@ -783,7 +783,7 @@ impl WatchdogState {
     /// 安装态宣告是否有效（看护者只认易失介质的显式宣告，绝不解读
     /// install.state 残留——分工原则）。无效/无宣告 → false，常态零改变。
     fn install_announcement_active(&self) -> bool {
-        crate::install::announce::read()
+        crate::install::announce::read(&self.cfg.run_dir)
             .is_some_and(|a| crate::install::announce::is_active(&a, now_millis()))
     }
 
@@ -812,7 +812,7 @@ impl WatchdogState {
     /// 由 --continue 的接管判定收敛（未 stale 即退出；接管后宣告刷新），
     /// 最坏情况是每周期一个短命进程直到 updated_at 过 stale 阈值。
     fn check_install_keepalive(&self) {
-        let Some(ann) = crate::install::announce::read() else {
+        let Some(ann) = crate::install::announce::read_own(&self.cfg.run_dir) else {
             return;
         };
         if crate::install::announce::is_active(&ann, now_millis()) {
@@ -1023,7 +1023,8 @@ fn sweep_local_states(run_dir: &Path) {
 // ---------------------------------------------------------------------------
 //
 // 设计要点：
-// - 节名 `aproxy-heart-<端口>`（与 IPC 管道命名同款规则，端口唯一区分实例）。
+// - 节名 `aproxy-<home_id>-heart-<端口>`（与控制管道同一套命名空间规则：一个 run
+//   目录内端口唯一区分实例，home_id 把不同 home 隔开，见 daemon::home_id）。
 // - 8 字节 = 毫秒级 Unix 时间戳（Windows FILETIME 换算），原子 u64 读写。
 // - **守护侧由独立 ticker 任务每 10s 写一次，不经请求热路径**：挂死的定义是
 //   「tokio runtime 无法调度」，ticker 停摆与 runtime 死锁等价；零热路径成本
@@ -1034,15 +1035,18 @@ fn sweep_local_states(run_dir: &Path) {
 /// 保证任何一次扫描都能读到新鲜值。
 pub const HEARTBEAT_WRITE_INTERVAL_SECS: u64 = 10;
 
-/// 共享内存节的命名（与 IPC 端点同款端口规则）
-pub fn heartbeat_section_name(port: &str) -> String {
+/// 共享内存节的命名（与控制端点同一套命名空间规则）。0.1.0 用的是不带
+/// home_id 的 `aproxy-heart-<端口>`：升级窗口里 0.1.0 的看护者读不到新实例的
+/// 心跳，按它自己的规则退化为纯进程死亡检测，不会误判挂死。
+pub fn heartbeat_section_name(run_dir: &Path, port: &str) -> String {
+    let home_id = crate::daemon::home_id(run_dir);
     #[cfg(windows)]
     {
-        format!(r"Local\aproxy-heart-{port}")
+        format!(r"Local\aproxy-{home_id}-heart-{port}")
     }
     #[cfg(unix)]
     {
-        format!("aproxy-heart-{port}")
+        format!("aproxy-{home_id}-heart-{port}")
     }
 }
 
@@ -1057,7 +1061,7 @@ pub struct HeartbeatWriter {
     view: *mut std::ffi::c_void,
     /// unix 实现按路径写 /dev/shm 文件，beat() 需要知道写入目标
     #[cfg(unix)]
-    port: String,
+    path: String,
     #[cfg(unix)]
     _shm_fd: std::fs::File,
 }
@@ -1071,8 +1075,8 @@ unsafe impl Sync for HeartbeatWriter {}
 impl HeartbeatWriter {
     /// 创建/打开本实例的心跳节并写入初始时间戳。实例 bind 成功后调用；
     /// 失败只降级（看护者对该实例退化为纯进程死亡检测），绝不能阻断启动。
-    pub fn create(port: &str) -> Option<Self> {
-        imp_heart::create_heartbeat(port)
+    pub fn create(run_dir: &Path, port: &str) -> Option<Self> {
+        imp_heart::create_heartbeat(&heartbeat_section_name(run_dir, port))
     }
 
     /// 写入当前毫秒时间戳（原子 store，无锁）
@@ -1090,15 +1094,15 @@ impl Drop for HeartbeatWriter {
 /// 看护侧读取：实例最近一次心跳的毫秒时间戳；节不存在 = 实例无心跳
 /// （心跳节创建失败）→ None，看护者按「无心跳数据」处理（只做
 /// 进程死亡检测，不做挂死判定）。
-pub fn read_heartbeat(port: &str) -> Option<u64> {
-    imp_heart::heartbeat_load(port)
+pub fn read_heartbeat(run_dir: &Path, port: &str) -> Option<u64> {
+    imp_heart::heartbeat_load(&heartbeat_section_name(run_dir, port))
 }
 
 /// 清理实例的心跳文件（守护优雅退出/看护摘除时调用）。
 /// Windows 节对象由内核回收（no-op）；unix 删除 /dev/shm 下的文件，
 /// 消除崩溃/强杀后的 tmpfs 残留（实测一轮测试曾留 13 个）。
-pub fn remove_heartbeat_file(port: &str) {
-    imp_heart::remove_heartbeat_file(port)
+pub fn remove_heartbeat_file(run_dir: &Path, port: &str) {
+    imp_heart::remove_heartbeat_file(&heartbeat_section_name(run_dir, port))
 }
 
 /// 当前 Unix 毫秒（系统时钟早于 epoch 回退 0——仅用于新鲜度比较，
@@ -1284,11 +1288,10 @@ mod imp {
 #[cfg(windows)]
 mod imp_heart {
     /// 创建命名节并映射视图（守护侧）
-    pub fn create_heartbeat(port: &str) -> Option<super::HeartbeatWriter> {
+    pub fn create_heartbeat(name: &str) -> Option<super::HeartbeatWriter> {
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
         };
-        let name = super::heartbeat_section_name(port);
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
             // 8 字节节：一个 u64 毫秒时间戳。INVALID_HANDLE_VALUE = 由页面
@@ -1327,9 +1330,8 @@ mod imp_heart {
     }
 
     /// 读侧：打开命名节映射只读视图并读首 8 字节
-    pub fn heartbeat_load(port: &str) -> Option<u64> {
+    pub fn heartbeat_load(name: &str) -> Option<u64> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_READ, MapViewOfFile, OpenFileMappingW};
-        let name = super::heartbeat_section_name(port);
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
             let mapping = OpenFileMappingW(FILE_MAP_READ, 0, wide.as_ptr());
@@ -1359,40 +1361,42 @@ mod imp_heart {
     }
 
     /// 节对象由内核在最后一个句柄关闭时回收，无文件系统残留可清
-    pub fn remove_heartbeat_file(_port: &str) {}
+    pub fn remove_heartbeat_file(_name: &str) {}
 }
 
 #[cfg(unix)]
 mod imp_heart {
-    pub fn create_heartbeat(port: &str) -> Option<super::HeartbeatWriter> {
-        // posix shm：/dev/shm/aproxy-heart-<port>；写透文件实现同一语义
-        // （unix 未实测，与 UDS IPC 同批处理）
-        let path = format!("/dev/shm/{}", super::heartbeat_section_name(port));
+    pub fn create_heartbeat(name: &str) -> Option<super::HeartbeatWriter> {
+        // posix shm：/dev/shm/<节名>；写透文件实现同一语义
+        let path = format!("/dev/shm/{name}");
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(path)
+            .open(&path)
             .ok()?;
         use std::io::Write;
         f.write_all(&super::now_millis().to_le_bytes()).ok()?;
-        Some(super::HeartbeatWriter {
-            port: port.to_string(),
-            _shm_fd: f,
-        })
+        Some(super::HeartbeatWriter { path, _shm_fd: f })
     }
 
     pub fn heartbeat_store(writer: &super::HeartbeatWriter, millis: u64) {
-        let path = format!("/dev/shm/{}", super::heartbeat_section_name(&writer.port));
-        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) {
+        // 按路径打开、不存在就重建：文件被删（看护者清理崩溃残留时恰好删到
+        // 同端口刚起来的新实例）也只丢一拍，下一拍就恢复
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&writer.path)
+        {
             use std::io::{Seek, SeekFrom, Write};
             let _ = f.seek(SeekFrom::Start(0));
             let _ = f.write_all(&millis.to_le_bytes());
         }
     }
 
-    pub fn heartbeat_load(port: &str) -> Option<u64> {
-        let path = format!("/dev/shm/{}", super::heartbeat_section_name(port));
+    pub fn heartbeat_load(name: &str) -> Option<u64> {
+        let path = format!("/dev/shm/{name}");
         let data = std::fs::read(path).ok()?;
         if data.len() < 8 {
             return None;
@@ -1407,8 +1411,8 @@ mod imp_heart {
     /// 删除心跳文件。Windows 的节对象随进程退出由内核回收，unix 是 /dev/shm
     /// 下的真实文件（tmpfs 内存计费），守护优雅退出/看护摘除时清掉，崩溃残留
     /// 由下次同端口 create 的 truncate 覆盖 + 人工/治理路径兜底
-    pub fn remove_heartbeat_file(port: &str) {
-        let path = format!("/dev/shm/{}", super::heartbeat_section_name(port));
+    pub fn remove_heartbeat_file(name: &str) {
+        let path = format!("/dev/shm/{name}");
         // 写侧仍持有打开句柄时 unlink 合法（句柄继续可写直至关闭），
         // 残留仅出现在「创建后未到优雅退出就崩溃」的场景
         let _ = std::fs::remove_file(path);
@@ -1865,7 +1869,7 @@ mod tests {
         let start = process_start_time(pid).expect("子进程创建时间可查");
         let handle = imp::open_sync_handle(pid).expect("子进程句柄");
         // 心跳停在远古时刻（判过期），端点无人应答（ping 二意见也失败）
-        let writer = HeartbeatWriter::create(&port).expect("心跳节创建");
+        let writer = HeartbeatWriter::create(dir.path(), &port).expect("心跳节创建");
         imp_heart::heartbeat_store(&writer, 1);
         let mut st = WatchdogState::new(test_cfg(dir.path()));
         st.watched.push(Watched {
@@ -1883,31 +1887,46 @@ mod tests {
         assert!(wait_child_exit(&mut child), "身份一致的挂死候选应被处决");
         imp::close_handle(handle);
         drop(writer);
-        remove_heartbeat_file(&port);
+        remove_heartbeat_file(dir.path(), &port);
     }
 
     #[test]
-    fn heartbeat_section_name_uses_port() {
-        // 节名含端口：实例唯一区分（同 IPC 管道命名规则）
-        let n = heartbeat_section_name("12345");
-        assert!(n.contains("12345"), "{n}");
-        assert!(n.contains("aproxy-heart"), "{n}");
+    fn heartbeat_section_name_carries_home_and_port() {
+        // 节名含端口（一个 home 内唯一区分实例）与 home 标识（不同 home 同端口
+        // 的实例互不相干，同控制端点的命名空间规则）
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let n = heartbeat_section_name(a.path(), "12345");
+        assert!(n.contains("12345") && n.contains("heart"), "{n}");
+        assert_ne!(n, heartbeat_section_name(b.path(), "12345"));
     }
 
     #[test]
     fn heartbeat_write_and_read_same_process() {
         // 同进程内写读往返：节创建 → beat → 读取值非 0 且随时间推进增长。
         // （跨进程读由集成测试覆盖——看护进程场景）
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path();
         let port = format!("598{:02}", std::process::id() % 100);
-        let writer = HeartbeatWriter::create(&port).expect("心跳节创建");
-        let first = read_heartbeat(&port).expect("写入后立即可读");
+        let writer = HeartbeatWriter::create(run, &port).expect("心跳节创建");
+        let first = read_heartbeat(run, &port).expect("写入后立即可读");
         assert!(first > 0, "初始时间戳应为正毫秒值");
         std::thread::sleep(std::time::Duration::from_millis(15));
         writer.beat();
-        let second = read_heartbeat(&port).expect("二次读取");
+        let second = read_heartbeat(run, &port).expect("二次读取");
         assert!(second >= first, "时间戳应单调不减");
         // 另一个端口没有节：读 None（看护者按「无心跳数据」处理）
-        assert!(read_heartbeat(&format!("{port}-absent")).is_none());
+        assert!(read_heartbeat(run, &format!("{port}-absent")).is_none());
+        // 心跳文件被删（看护者清理崩溃残留时删到了它）：下一拍重建
+        remove_heartbeat_file(run, &port);
+        writer.beat();
+        #[cfg(unix)]
+        assert!(
+            read_heartbeat(run, &port).is_some(),
+            "被删的心跳文件应在下一拍重建"
+        );
+        drop(writer);
+        remove_heartbeat_file(run, &port);
     }
 
     // ---------------- 看护主循环状态机（纯逻辑，tempdir 注入） ----------------

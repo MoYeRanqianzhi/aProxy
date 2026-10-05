@@ -2036,6 +2036,14 @@ mod tests {
         let endpoint = test_endpoint(dir.path(), "stale");
         drop(std::os::unix::net::UnixListener::bind(&endpoint).unwrap());
         assert!(std::path::Path::new(&endpoint).exists());
+        // 客户端眼里，崩溃实例留下的 socket 就是「这里没有实例」：stop 据此确认
+        // 已退出，普查据此转入进程身份核验
+        let probe = request_raw(&endpoint, IpcOp::Ping).await;
+        assert!(
+            matches!(probe, Err(IpcError::Unreachable(_))),
+            "{:?}",
+            probe.err()
+        );
         let bound = imp::bind(&endpoint).await;
         assert!(bound.is_ok(), "{:?}", bound.err());
     }

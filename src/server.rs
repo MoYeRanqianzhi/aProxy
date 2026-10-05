@@ -174,7 +174,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     // 定义是「runtime 无法调度」，ticker 停摆与 runtime 死锁等价；不经请求
     // 热路径（零请求成本）。创建失败只降级（看护者对该实例退化为纯进程死亡
     // 检测），绝不阻断启动。句柄存活于整个服务生命周期（随进程退出由系统回收）。
-    if let Some(writer) = watchdog::HeartbeatWriter::create(&port) {
+    if let Some(writer) = watchdog::HeartbeatWriter::create(&daemon::run_dir(), &port) {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(
@@ -206,7 +206,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
                 // restarting 窗口内本守护（尚为旧版本）补种的看护者会把滚动
                 // 重启误判为崩溃、用旧二进制重拉，与 install 拉锯。install
                 // 结束宣告消失 → 自检恢复 → 新看护者出簇（新 exe）。
-                if aproxy::install::announce::read().is_some_and(|a| {
+                if aproxy::install::announce::read(&run_dir).is_some_and(|a| {
                     aproxy::install::announce::is_active(&a, watchdog::now_millis())
                 }) {
                     continue;
@@ -342,7 +342,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
 pub(crate) fn remove_registry_files(listen_addr: &str) {
     daemon::remove_restore_file(listen_addr);
     daemon::remove_instance_file(listen_addr);
-    watchdog::remove_heartbeat_file(daemon::port_of(listen_addr));
+    watchdog::remove_heartbeat_file(&daemon::run_dir(), daemon::port_of(listen_addr));
     daemon::remove_socket_file(daemon::port_of(listen_addr));
 }
 

@@ -293,11 +293,11 @@ pub fn is_stale(state: &InstallState, now_secs: u64) -> bool {
 /// 抓不住它；宣告心跳停摆（独立 ticker 停止）与 runtime 死锁等价，接管
 /// 无需等满 10 分钟。接管后原挂死进程若恢复，写状态文件前的归属校验
 /// （refresh 同款）会让它让位退出。
-pub fn is_takeable(state: &InstallState, now_secs: u64) -> bool {
+pub fn is_takeable(run_dir: &Path, state: &InstallState, now_secs: u64) -> bool {
     if is_stale(state, now_secs) {
         return true;
     }
-    match crate::install::announce::read() {
+    match crate::install::announce::read(run_dir) {
         Some(ann) if ann.installer_pid == state.installer_pid => {
             crate::watchdog::now_millis().saturating_sub(ann.heartbeat_ms)
                 > crate::install::announce::FRESH_MS

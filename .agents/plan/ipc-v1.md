@@ -51,6 +51,14 @@ IPC 重新整理格式后协议版本从 1 重新计数。随后：「发现的�
   测试：解析与错误码、客户端读未知状态与 0.1.0 应答、真实端点往返（跨平台）、`compat_v0_1_0` 里真实守护
   按 0.1.0 形状应答（冻结的 0.1.0 `IpcResponse` 解析）。没做 `RunDir` 新类型：CLI 层用进程 home 的便捷函数
   是正当用法，库层一律走 `_in` 变体，收益不抵改动面。
+- 第 5 步（部分，提交 D）：心跳节 `aproxy-<home_id>-heart-<端口>`、宣告 `aproxy-<home_id>-install`，函数
+  显式收 run_dir；S5 = 安装器同时发布 0.1.0 全局宣告名、`announce::read` 本 home 没有时回看全局名、
+  会动手的 `check_install_keepalive` 只看本 home（`read_own`）。0.1.0 看护者读不到新心跳时按它自己的
+  规则退化为纯死亡检测（v0.1.0 watchdog.rs health_scan 的 `None => continue`），所以心跳不需要兼容。
+  `handle_death` 不再删 socket；unix 心跳写入在文件被删后自行重建。单测里 `Announcer` 只建本 home 的节，
+  免得让机器上 0.1.0 的看护者看到一场不存在的安装。
+- 下一步（第 5 步其余）：unix 守护每秒检查自己的 socket 文件，被删（0.1.0 看护者在升级窗口里会删，见
+  c.3 第 1 条）就在原路径重建，退出流程里不重建；随后 R1 claim version、安装器停旧看护者。
 - Linux 编译只能靠 CI 的 ubuntu 门禁：本机 WSL（Debian）的 rustup 工具链清单损坏，且 2026-10-06 WSL 内无外网
   （官方源与 rsproxy 均连接超时），修不了；本机也没有 Linux C 交叉编译器（ring 需要）。
 

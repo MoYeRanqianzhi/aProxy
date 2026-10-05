@@ -128,8 +128,8 @@ fn rollback_binary(state: &InstallState) -> Option<std::path::PathBuf> {
 
 /// 宣告句柄：创建节 + 独立 ticker 周期 beat。句柄 Drop（任务 abort 或进程
 /// 退出）= 宣告解除。创建失败只降级（None = 无宣告，差异化行为退化为常态）。
-fn spawn_announcer() -> Option<tokio::task::JoinHandle<()>> {
-    super::announce::Announcer::create().map(|a| {
+fn spawn_announcer(run_dir: &Path) -> Option<tokio::task::JoinHandle<()>> {
+    super::announce::Announcer::create(run_dir).map(|a| {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(super::announce::BEAT_INTERVAL).await;
@@ -223,7 +223,7 @@ pub async fn run_install(
     let mut state = InstallState::new_marking(plan.target_version.clone(), plan.source);
     state.from_path = Some(plan.from.display().to_string());
     let mut state = super::state::create_new_in(run_dir, state)?;
-    let announcer = spawn_announcer();
+    let announcer = spawn_announcer(run_dir);
 
     drive_with_skill(
         home,
@@ -483,7 +483,7 @@ pub async fn run_install_online(
     state.staged_path = Some(staged.display().to_string());
     state.sha256 = Some(crate::install::staging::sha256_hex(staged)?);
     super::state::advance_in(run_dir, &mut state, InstallPhase::Downloaded)?;
-    let announcer = spawn_announcer();
+    let announcer = spawn_announcer(run_dir);
 
     drive_with_skill(
         home,
@@ -537,7 +537,7 @@ pub async fn continue_install(home: &Path, run_dir: &Path) -> Result<FlowExit, S
     // 此刻必然活着且在等接管确认）。其余 phase 原安装进程健康 → 不动
     // （并发防重；误触发的 --continue 与健康安装并存时拒绝是正确行为）。
     if state.phase != InstallPhase::Relaying
-        && !super::state::is_takeable(&state, crate::watchdog::now_secs())
+        && !super::state::is_takeable(run_dir, &state, crate::watchdog::now_secs())
     {
         return Err(format!(
             "安装仍在进行（phase {:?}，pid {}），不重复接管",
@@ -547,7 +547,7 @@ pub async fn continue_install(home: &Path, run_dir: &Path) -> Result<FlowExit, S
     tracing::info!(phase = ?state.phase, target = %state.target_version, "install 续作接管");
     state.installer_pid = std::process::id();
     write_in(run_dir, &mut state).map_err(|e| format!("install.state 写入失败: {e}"))?;
-    let announcer = spawn_announcer();
+    let announcer = spawn_announcer(run_dir);
     // skill 续作语义：failed **不自动重试**（避免每次续作都拖一遍下载），
     // --skills-only 手动重试；其余状态（Downloading 中断等）照常跑
     let skill_should_run = !matches!(

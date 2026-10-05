@@ -13,12 +13,22 @@
 //!   守护对没有 `v` 的请求回 0.1.0 形状的应答（S3）；客户端把没有 `v` 的应答
 //!   按 0.1.0 形状解析（S4）。新客户端发出的 v1 请求，0.1.0 的守护照样认得
 //!   （它按 `op` 解析、忽略多出的 `v`），所以客户端不需要另一套请求格式。
+//! - 安装宣告：0.1.0 用全局名字，新版本按 home 加了命名空间。新安装器两个名字
+//!   都发布（0.1.0 的守护与看护者只读全局名），新读者本 home 没有宣告时再看
+//!   全局名（驱动安装的可能是 0.1.0 的安装器）（S5）。代价是 0.1.x 期间别的
+//!   home 的安装仍可能让本 home 的看护者短暂进入安装模式，与 0.1.0 相同。
 //!
 //! 完整分析见 .agents/plan/ipc-v1.md 的 (c) 节。
 
 use crate::daemon::{
     Activity, InstanceRecord, InstanceState, InstanceStatus, IpcError, IpcOp, LastError,
 };
+
+/// S5：0.1.0 的安装宣告名（全机共享）
+#[cfg(windows)]
+pub(crate) const LEGACY_ANNOUNCEMENT: &str = r"Localproxy-install";
+#[cfg(not(windows))]
+pub(crate) const LEGACY_ANNOUNCEMENT: &str = "aproxy-install";
 
 /// 0.1.0 的 IPC 协议号（它的应答里 `proto` 字段的值）
 const LEGACY_PROTO: u32 = 2;

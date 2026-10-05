@@ -12,18 +12,25 @@
 //! unix 残留区分**正靠心跳过期**（Windows 节随进程死消失、只有挂死路径；
 //! unix /dev/shm 持久文件崩溃残留也节在心跳旧）——同一判定路径，介质差异
 //! 不影响语义。
+//!
+//! 宣告属于一个 home：节名带 run 目录的标识（与控制端点同一套命名空间规则），
+//! 一个 home 的 install 不会让别的 home 的看护者进入安装模式；unix 上也不再
+//! 与别的用户的 /dev/shm 文件撞名。0.1.0 用的是全局名字，升级窗口内两边都要
+//! 照顾到，见 compat_0_1_0 的 S5。
 
+use std::path::Path;
 use std::time::Duration;
 
 /// Windows 命名节名 / unix 文件名（/dev/shm 下）。
-pub fn announcement_name() -> &'static str {
+pub fn announcement_name(run_dir: &Path) -> String {
+    let home_id = crate::daemon::home_id(run_dir);
     #[cfg(windows)]
     {
-        r"Local\aproxy-install"
+        format!(r"Local\aproxy-{home_id}-install")
     }
     #[cfg(not(windows))]
     {
-        "aproxy-install"
+        format!("aproxy-{home_id}-install")
     }
 }
 
@@ -41,35 +48,52 @@ pub struct Announcement {
 }
 
 /// install 侧宣告句柄：创建即宣告，Drop/进程退出即解除（Windows 节随最后
-/// 句柄消失；unix 主动 unlink——见 [`remove`]，Drop 里做）。
+/// 句柄消失；unix 主动 unlink，在 Drop 里做）。持有本 home 的节，以及 0.1.0
+/// 读的全局节（S5，尽力而为）。
 pub struct Announcer {
+    sections: Vec<Section>,
+}
+
+/// 一个宣告节
+struct Section {
     #[cfg(windows)]
     mapping: isize,
     #[cfg(windows)]
     view: *mut std::ffi::c_void,
     #[cfg(not(windows))]
-    _keepalive: std::sync::Mutex<std::fs::File>,
+    file: std::sync::Mutex<std::fs::File>,
+    #[cfg(not(windows))]
+    path: String,
 }
 
 // Windows 视图指针跨线程（beat 是原子 store）；unix 无共享字段
 #[cfg(windows)]
-unsafe impl Send for Announcer {}
+unsafe impl Send for Section {}
 #[cfg(windows)]
-unsafe impl Sync for Announcer {}
+unsafe impl Sync for Section {}
 
 impl Announcer {
-    /// 创建宣告节并写入初始内容。失败只降级（看护者/守护按「无宣告」处理，
-    /// 常态行为），绝不阻断安装。
-    pub fn create() -> Option<Self> {
-        imp::create_announcement(Announcement {
+    /// 创建本 home 的宣告节并写入初始内容。失败只降级（看护者/守护按「无宣告」
+    /// 处理，常态行为），绝不阻断安装。
+    pub fn create(run_dir: &Path) -> Option<Self> {
+        let ann = Announcement {
             installer_pid: std::process::id(),
             heartbeat_ms: crate::watchdog::now_millis(),
-        })
+        };
+        let mut sections = vec![imp::create_section(&announcement_name(run_dir), ann)?];
+        sections.extend(imp::create_section(
+            crate::compat_0_1_0::LEGACY_ANNOUNCEMENT,
+            ann,
+        ));
+        Some(Self { sections })
     }
 
     /// 刷新心跳（install 侧独立 ticker 周期调用）。
     pub fn beat(&self) {
-        imp::store_announcement(self, crate::watchdog::now_millis());
+        let ms = crate::watchdog::now_millis();
+        for section in &self.sections {
+            imp::store_section(section, ms);
+        }
     }
 }
 
@@ -77,13 +101,22 @@ impl Drop for Announcer {
     fn drop(&mut self) {
         // Windows：unmap + close → 节消失；unix：unlink 持久文件（done/abort
         // 的主动解除路径；崩溃残留靠心跳过期自然失效）
-        imp::destroy_announcement(self);
+        for section in &mut self.sections {
+            imp::destroy_section(section);
+        }
     }
 }
 
-/// 读宣告节。节不存在 → None（无安装宣告——常态）。
-pub fn read() -> Option<Announcement> {
-    imp::load_announcement()
+/// 读本 home 的宣告。节不存在 → None（无安装宣告——常态）。本 home 没有
+/// 宣告时再看 0.1.0 的全局节：升级窗口里驱动安装的可能是 0.1.0 的安装器。
+pub fn read(run_dir: &Path) -> Option<Announcement> {
+    read_own(run_dir).or_else(|| imp::load_section(crate::compat_0_1_0::LEGACY_ANNOUNCEMENT))
+}
+
+/// 只读本 home 的宣告，不看 0.1.0 的全局节。会据此动手的判断（拉起续作）用它：
+/// 全局节可能是别的 home 的安装留下的残留。
+pub fn read_own(run_dir: &Path) -> Option<Announcement> {
+    imp::load_section(&announcement_name(run_dir))
 }
 
 /// 宣告有效性判定（看护者/守护的唯一入口）：节存在 + 心跳新鲜 + pid 存活。
@@ -99,20 +132,17 @@ pub fn is_active(ann: &Announcement, now_ms: u64) -> bool {
 
 #[cfg(windows)]
 mod imp {
-    use super::Announcement;
+    use super::{Announcement, Section};
 
-    fn wide_name() -> Vec<u16> {
-        super::announcement_name()
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect()
+    fn wide(name: &str) -> Vec<u16> {
+        name.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    pub fn create_announcement(ann: Announcement) -> Option<super::Announcer> {
+    pub fn create_section(name: &str, ann: Announcement) -> Option<Section> {
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
         };
-        let name = wide_name();
+        let name = wide(name);
         unsafe {
             // 16 字节节：pid(u32) + 心跳(u64)。页面文件支撑，随最后句柄消失
             let mapping = CreateFileMappingW(
@@ -131,12 +161,11 @@ mod imp {
                 let _ = windows_sys::Win32::Foundation::CloseHandle(mapping);
                 return None;
             }
-            let a = super::Announcer {
+            store_view(view.Value, ann.installer_pid, ann.heartbeat_ms);
+            Some(Section {
                 mapping,
                 view: view.Value,
-            };
-            store_view(view.Value, ann.installer_pid, ann.heartbeat_ms);
-            Some(a)
+            })
         }
     }
 
@@ -149,15 +178,15 @@ mod imp {
         }
     }
 
-    pub fn store_announcement(a: &super::Announcer, ms: u64) {
+    pub fn store_section(section: &Section, ms: u64) {
         unsafe {
-            store_view(a.view, std::process::id(), ms);
+            store_view(section.view, std::process::id(), ms);
         }
     }
 
-    pub fn load_announcement() -> Option<Announcement> {
+    pub fn load_section(name: &str) -> Option<Announcement> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_READ, MapViewOfFile, OpenFileMappingW};
-        let name = wide_name();
+        let name = wide(name);
         unsafe {
             let mapping = OpenFileMappingW(FILE_MAP_READ, 0, name.as_ptr());
             if mapping == 0 {
@@ -184,33 +213,37 @@ mod imp {
         }
     }
 
-    pub fn destroy_announcement(a: &mut super::Announcer) {
-        let view = windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: a.view };
+    pub fn destroy_section(section: &mut Section) {
+        let view = windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+            Value: section.view,
+        };
         unsafe {
             let _ = windows_sys::Win32::System::Memory::UnmapViewOfFile(view);
-            let _ = windows_sys::Win32::Foundation::CloseHandle(a.mapping);
+            let _ = windows_sys::Win32::Foundation::CloseHandle(section.mapping);
         }
     }
 }
 
 #[cfg(not(windows))]
 mod imp {
-    use super::Announcement;
+    use super::{Announcement, Section};
 
-    fn shm_path() -> String {
-        format!("/dev/shm/{}", super::announcement_name())
+    fn shm_path(name: &str) -> String {
+        format!("/dev/shm/{name}")
     }
 
-    pub fn create_announcement(ann: Announcement) -> Option<super::Announcer> {
+    pub fn create_section(name: &str, ann: Announcement) -> Option<Section> {
+        let path = shm_path(name);
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(shm_path())
+            .open(&path)
             .ok()?;
         write_content(&mut f, &ann);
-        Some(super::Announcer {
-            _keepalive: std::sync::Mutex::new(f),
+        Some(Section {
+            file: std::sync::Mutex::new(f),
+            path,
         })
     }
 
@@ -224,9 +257,9 @@ mod imp {
         let _ = f.write_all(&buf);
     }
 
-    pub fn store_announcement(a: &super::Announcer, ms: u64) {
-        // 心跳写已打开的 fd（锁内短临界区；&Announcer 共享引用不可变借用）
-        if let Ok(mut f) = a._keepalive.lock() {
+    pub fn store_section(section: &Section, ms: u64) {
+        // 心跳写已打开的 fd（锁内短临界区；&Section 共享引用不可变借用）
+        if let Ok(mut f) = section.file.lock() {
             write_content(
                 &mut f,
                 &Announcement {
@@ -237,8 +270,8 @@ mod imp {
         }
     }
 
-    pub fn load_announcement() -> Option<Announcement> {
-        let data = std::fs::read(shm_path()).ok()?;
+    pub fn load_section(name: &str) -> Option<Announcement> {
+        let data = std::fs::read(shm_path(name)).ok()?;
         if data.len() < 16 {
             return None;
         }
@@ -248,10 +281,10 @@ mod imp {
         })
     }
 
-    pub fn destroy_announcement(_a: &mut super::Announcer) {
+    pub fn destroy_section(section: &mut Section) {
         // unix 主动 unlink：done/abort 正常退出路径的宣告解除；崩溃残留由
         // 心跳过期自然失效（与 Windows「节消失」殊途同归）
-        let _ = std::fs::remove_file(shm_path());
+        let _ = std::fs::remove_file(&section.path);
     }
 }
 
@@ -261,12 +294,23 @@ mod tests {
 
     #[test]
     fn announce_roundtrip_and_active_judgement() {
-        // create → beat → read：同进程内内容一致
-        let Some(a) = Announcer::create() else {
-            panic!("宣告节创建失败");
+        // create → beat → read：同进程内内容一致。只建本 home 的节——
+        // `Announcer::create` 还会发布 0.1.0 的全局节，测试不该让机器上别的
+        // home（包括正在用的 0.1.0 实例的看护者）看到一场并不存在的安装
+        let run = tempfile::tempdir().unwrap();
+        let section = imp::create_section(
+            &announcement_name(run.path()),
+            Announcement {
+                installer_pid: std::process::id(),
+                heartbeat_ms: crate::watchdog::now_millis(),
+            },
+        )
+        .expect("宣告节创建失败");
+        let a = Announcer {
+            sections: vec![section],
         };
         a.beat();
-        let ann = read().expect("宣告节应可读");
+        let ann = read(run.path()).expect("宣告节应可读");
         assert_eq!(ann.installer_pid, std::process::id());
         // 心跳新鲜 + pid 存活 = 有效
         assert!(is_active(&ann, crate::watchdog::now_millis()));
@@ -276,8 +320,27 @@ mod tests {
         // Windows：进程内节句柄关闭 → 节消失（读不到）；unix：Drop unlink
         // （测试进程未崩，主动解除路径生效）
         assert!(
-            read().is_none(),
+            imp::load_section(&announcement_name(run.path())).is_none(),
             "Drop 后宣告应解除（Windows 节消失 / unix unlink）"
         );
+    }
+
+    #[test]
+    fn announcement_belongs_to_its_home() {
+        // 另一个 home 的 install 不得让本 home 的看护者进入安装模式
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        assert_ne!(announcement_name(a.path()), announcement_name(b.path()));
+        let section = imp::create_section(
+            &announcement_name(a.path()),
+            Announcement {
+                installer_pid: std::process::id(),
+                heartbeat_ms: crate::watchdog::now_millis(),
+            },
+        )
+        .expect("宣告节创建失败");
+        assert!(imp::load_section(&announcement_name(b.path())).is_none());
+        let mut section = section;
+        imp::destroy_section(&mut section);
     }
 }

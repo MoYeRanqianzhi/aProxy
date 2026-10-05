@@ -1590,8 +1590,9 @@ mod tests {
     #[tokio::test]
     async fn ipc_ping_fails_when_no_instance() {
         // 不存在的端点：ping 必须报错（= 端口上没有 aProxy）
+        let run = tempfile::tempdir().unwrap();
         let port = format!("599{:02}", std::process::id() % 100);
-        assert!(ipc_ping(&port).await.is_err());
+        assert!(ipc_ping_in(run.path(), &port).await.is_err());
     }
 
     #[test]

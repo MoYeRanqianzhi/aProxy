@@ -1103,6 +1103,7 @@ fn forward_only_with_transform_start_fails() {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_aproxy"))
         .arg("--config")
         .arg(&cfg_path)
+        .env("APROXY_HOME", dir.path())
         .env("NO_PROXY", "127.0.0.1,localhost")
         .output()
         .unwrap();

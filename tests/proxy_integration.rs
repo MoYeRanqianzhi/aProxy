@@ -4555,6 +4555,7 @@ fn cli_config_flag_rejects_missing_file_on_start() {
     let out = Command::new(env!("CARGO_BIN_EXE_aproxy"))
         .arg("--config")
         .arg(&missing)
+        .env("APROXY_HOME", dir.path())
         .output()
         .unwrap();
     assert!(
@@ -4577,6 +4578,7 @@ fn cli_config_flag_scopes_config_subcommand() {
     let out = Command::new(env!("CARGO_BIN_EXE_aproxy"))
         .arg("--config")
         .arg(&cfg_file)
+        .env("APROXY_HOME", dir.path())
         .args([
             "config",
             "--baseurl",
@@ -4605,6 +4607,7 @@ fn cli_config_flag_scopes_config_subcommand() {
     let out = Command::new(env!("CARGO_BIN_EXE_aproxy"))
         .arg("--config")
         .arg(&cfg_file)
+        .env("APROXY_HOME", dir.path())
         .args(["config", "--show"])
         .output()
         .unwrap();
@@ -4836,7 +4839,7 @@ fn stop_from_another_home_does_not_reach_this_instance() {
     let _guard = DaemonGuard {
         exe,
         port,
-        home_dir: Some(home_a.path().to_path_buf()),
+        home_dir: home_a.path().to_path_buf(),
     };
 
     let status_b = run_in(&home_b, &["status"]);
@@ -4897,6 +4900,7 @@ fn cli_config_show_rejects_missing_explicit_file() {
     let out = Command::new(env!("CARGO_BIN_EXE_aproxy"))
         .arg("--config")
         .arg(&missing)
+        .env("APROXY_HOME", dir.path())
         .args(["config", "--show"])
         .output()
         .unwrap();
@@ -4918,8 +4922,9 @@ fn cli_config_show_rejects_missing_explicit_file() {
 // `aproxy stop`——stop 按端口 IPC 定位、不区分实例身份，开发者若恰好把日常
 // 实例跑在这两个端口，cargo test 会静默关掉它（生产代理中断且无任何提示）。
 // 改为从测试进程 pid 派生专属高位端口：与用户实例、跨 worktree 并行测试撞
-// 端口的概率都降到可忽略；预清理 stop 也只针对派生端口，永远不会触碰
-// 12345 等用户可能使用的端口。
+// 端口的概率都降到可忽略。守护测试如今都跑在各自的隔离 home 里（见
+// `isolated_home`），stop 只寻址得到本测试 home 的实例；端口仍是全机共享的，
+// 派生端口依旧必要。
 // ---------------------------------------------------------------------------
 
 /// 从测试进程 pid 派生第 offset 个互不相同的守护测试端口（25000..=65535 区间，
@@ -4962,37 +4967,53 @@ fn daemon_test_ports() -> (u16, u16, u16) {
     )
 }
 
-/// 守护清理守卫：Drop 时对测试派生端口执行 `aproxy stop`。
+/// 守护清理守卫：Drop 时在守护的 home 里对测试端口执行 `aproxy stop`。
 /// 守护以分离进程运行（不随测试进程退出），此前 stop 只在全部断言通过后才
-/// 执行——任何一处断言失败都会把携带假上游的守护泄漏在真实 ~/.aproxy
-/// 注册表/日志里，直到手工清理。Drop 在断言失败的 unwind 路径同样运行，
-/// 杜绝泄漏。
+/// 执行——任何一处断言失败都会把携带假上游的守护泄漏下来，直到手工清理。
+/// Drop 在断言失败的 unwind 路径同样运行，杜绝泄漏。
 struct DaemonGuard {
     exe: &'static str,
     port: u16,
-    /// 守护的隔离主目录（APROXY_HOME）：注册表在 home/run/ 下，unix 的
-    /// UDS socket 也在其中，stop 须看到同一 APROXY_HOME 才找得到守护；
-    /// None = 默认主目录 ~/.aproxy
-    home_dir: Option<std::path::PathBuf>,
+    /// 守护的隔离主目录（APROXY_HOME）：控制端点按 run 目录划分命名空间，
+    /// stop 须看到同一 APROXY_HOME 才找得到守护
+    home_dir: std::path::PathBuf,
 }
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
-        let mut cmd = Command::new(self.exe);
-        cmd.args(["stop", &self.port.to_string()]);
-        if let Some(dir) = &self.home_dir {
-            cmd.env("APROXY_HOME", dir);
-        }
-        let _ = cmd.output();
+        let _ = Command::new(self.exe)
+            .args(["stop", &self.port.to_string()])
+            .env("APROXY_HOME", &self.home_dir)
+            .output();
     }
 }
 
-/// 等待守护就绪（守护跑在**测试进程自己的默认主目录**里时用）：等价于
-/// `wait_daemon_ready_in(&aproxy::daemon::run_dir(), port)`。守护跑在隔离
-/// APROXY_HOME 里的测试必须改用 `wait_daemon_ready_in` 并传 `<home>/run`，
-/// 理由见该函数说明。
-fn wait_daemon_ready(port: u16) -> bool {
-    wait_daemon_ready_in(&aproxy::daemon::run_dir(), port)
+/// 守护测试用的隔离 home，并关掉其中的看门狗。测试进程自己没有
+/// APROXY_HOME，不隔离的守护会跑在开发者真实的 `~/.aproxy` 里：写真实的
+/// 注册表与日志，读真实的 settings.json——看门狗开着时还会被那里的看护者
+/// 收养，测试模拟崩溃时被拉回来。关看门狗也免得守护拉起的看护进程在
+/// tempdir 删掉之后残留（它会锁住 CARGO_BIN_EXE 的镜像文件，阻断重链）。
+fn isolated_home() -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+    home
+}
+
+/// 在 `home` 里直接以 `--daemon-child` 拉起守护（不经 start 父进程），返回 pid。
+/// 不用 `aproxy::daemon::spawn_detached`：它继承测试进程的环境，没法给单个
+/// 子进程注入 APROXY_HOME。分离启动那条路径由经 `aproxy start` 的测试覆盖。
+fn spawn_daemon_in(home: &std::path::Path, cfg: &std::path::Path) -> u32 {
+    Command::new(env!("CARGO_BIN_EXE_aproxy"))
+        .arg("--config")
+        .arg(cfg)
+        .arg("--daemon-child")
+        .env("APROXY_HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn 守护子进程失败")
+        .id()
 }
 
 /// 等待守护就绪：TCP 可连只能证明「端口上有监听者」——可能是恰好占用端口的
@@ -5066,14 +5087,15 @@ fn process_alive(pid: u32) -> bool {
 // 22. 守护进程生命周期：守护子进程承载服务 → status 列出 → stop 优雅停止
 //
 // 控制通道走 IPC（命名管道），代理端口完全用于透传，此处一并验证互不干扰。
-// 注意：直接以 --daemon-child 拉起守护（与 `aproxy start` 的 spawn_detached
-// 同一路径），不在测试进程树里再嵌套一层 start 父进程（该路径由测试 24 覆盖）。
+// 注意：直接以 --daemon-child 拉起守护，不在测试进程树里再嵌套一层 start
+// 父进程（该路径由测试 24 覆盖）。
 // ---------------------------------------------------------------------------
 #[test]
 fn daemon_lifecycle_start_status_stop() {
     let (port, _port_b, _port_c) = daemon_test_ports();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg_file = dir.path().join("daemon.toml");
+    let home = isolated_home();
+    let run_dir = home.path().join("run");
+    let cfg_file = home.path().join("daemon.toml");
     std::fs::write(
         &cfg_file,
         format!(
@@ -5082,36 +5104,34 @@ fn daemon_lifecycle_start_status_stop() {
     )
     .unwrap();
     let exe = env!("CARGO_BIN_EXE_aproxy");
-
-    // 预清理：仅针对派生端口，清掉同端口残留（不影响任何其他端口上的实例）
-    let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
+    let run = |args: &[&str]| {
+        Command::new(exe)
+            .args(args)
+            .env("APROXY_HOME", home.path())
+            .output()
+            .unwrap()
+    };
     let _guard = DaemonGuard {
         exe,
         port,
-        home_dir: None,
+        home_dir: home.path().to_path_buf(),
     };
 
-    let pid = aproxy::daemon::spawn_detached(
-        std::path::Path::new(exe),
-        &[
-            "--config".to_string(),
-            cfg_file.display().to_string(),
-            "--daemon-child".to_string(),
-        ],
-    )
-    .expect("spawn 守护子进程失败");
+    let pid = spawn_daemon_in(home.path(), &cfg_file);
 
     // 就绪 = TCP 可连且 IPC ping 确认是自家守护（最多 10 秒）
-    assert!(wait_daemon_ready(port), "守护子进程未就绪 (pid {pid})");
+    assert!(
+        wait_daemon_ready_in(&run_dir, port),
+        "守护子进程未就绪 (pid {pid})"
+    );
 
     // 身份判定：守护登记的进程创建时间必须与实测一致（看门狗收养/选举/
     // 处决关卡与 stop --force 的全部前置；pid + 创建时间，与二进制名无关）。
     // 无 /proc 的 unix 读不到创建时间，登记为 0，不在此断言
     #[cfg(any(windows, target_os = "linux"))]
     {
-        let rec =
-            aproxy::daemon::read_instance_file_in(&aproxy::daemon::run_dir(), &port.to_string())
-                .expect("守护应已写注册表");
+        let rec = aproxy::daemon::read_instance_file_in(&run_dir, &port.to_string())
+            .expect("守护应已写注册表");
         assert!(
             matches!(
                 aproxy::watchdog::record_identity(pid, rec.process_start),
@@ -5123,7 +5143,7 @@ fn daemon_lifecycle_start_status_stop() {
     }
 
     // status 列出该实例（信息来自实例注册表，存活以 IPC 探测为准）
-    let out = Command::new(exe).arg("status").output().unwrap();
+    let out = run(&["status"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -5136,16 +5156,13 @@ fn daemon_lifecycle_start_status_stop() {
     );
 
     // stop 指定端口：经 IPC 优雅停止并确认退出
-    let out = Command::new(exe)
-        .args(["stop", &port.to_string()])
-        .output()
-        .unwrap();
+    let out = run(&["stop", &port.to_string()]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("已停止"), "实际: {stdout}");
 
-    // status 不再列出本实例（其他端口上可能还有并行测试的实例，不全局断言为空）
-    let out = Command::new(exe).arg("status").output().unwrap();
+    // status 不再列出本实例
+    let out = run(&["status"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         !stdout.contains(&port.to_string()),
@@ -5159,8 +5176,9 @@ fn daemon_lifecycle_start_status_stop() {
 #[test]
 fn daemon_second_instance_on_same_port_exits() {
     let (_port_a, port, _port_c) = daemon_test_ports();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg_file = dir.path().join("twice.toml");
+    let home = isolated_home();
+    let run_dir = home.path().join("run");
+    let cfg_file = home.path().join("twice.toml");
     std::fs::write(
         &cfg_file,
         format!(
@@ -5169,29 +5187,21 @@ fn daemon_second_instance_on_same_port_exits() {
     )
     .unwrap();
     let exe = env!("CARGO_BIN_EXE_aproxy");
-    let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
     let _guard = DaemonGuard {
         exe,
         port,
-        home_dir: None,
-    };
-
-    let args = |file: &std::path::Path| {
-        vec![
-            "--config".to_string(),
-            file.display().to_string(),
-            "--daemon-child".to_string(),
-        ]
+        home_dir: home.path().to_path_buf(),
     };
 
     // 第一个守护：正常承载服务
-    let pid1 = aproxy::daemon::spawn_detached(std::path::Path::new(exe), &args(&cfg_file))
-        .expect("spawn 第一个守护失败");
-    assert!(wait_daemon_ready(port), "第一个守护未就绪 (pid {pid1})");
+    let pid1 = spawn_daemon_in(home.path(), &cfg_file);
+    assert!(
+        wait_daemon_ready_in(&run_dir, port),
+        "第一个守护未就绪 (pid {pid1})"
+    );
 
     // 第二个守护：同端口 bind 失败 → 快速退出（不挂、不影响原实例）
-    let pid2 = aproxy::daemon::spawn_detached(std::path::Path::new(exe), &args(&cfg_file))
-        .expect("spawn 第二个守护失败");
+    let pid2 = spawn_daemon_in(home.path(), &cfg_file);
 
     // 必须真正验证「第二个守护退出」：轮询 pid2 进程消失（最多 15 秒），
     // 不能只靠固定 sleep——回归成「第二实例滞留」时测试必须失败
@@ -5206,8 +5216,15 @@ fn daemon_second_instance_on_same_port_exits() {
     assert!(exited, "第二个守护 (pid {pid2}) 应在 bind 失败后退出");
 
     // 原实例仍在服务（IPC ping 可达 + status 仍列出）
-    assert!(wait_daemon_ready(port), "原实例应仍在运行 (pid {pid1})");
-    let out = Command::new(exe).arg("status").output().unwrap();
+    assert!(
+        wait_daemon_ready_in(&run_dir, port),
+        "原实例应仍在运行 (pid {pid1})"
+    );
+    let out = Command::new(exe)
+        .arg("status")
+        .env("APROXY_HOME", home.path())
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains(&port.to_string()),
@@ -5228,8 +5245,8 @@ fn daemon_second_instance_on_same_port_exits() {
 #[test]
 fn start_parent_command_output_returns() {
     let (_port_a, _port_b, port) = daemon_test_ports();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg_file = dir.path().join("start.toml");
+    let home = isolated_home();
+    let cfg_file = home.path().join("start.toml");
     std::fs::write(
         &cfg_file,
         format!(
@@ -5238,12 +5255,10 @@ fn start_parent_command_output_returns() {
     )
     .unwrap();
     let exe = env!("CARGO_BIN_EXE_aproxy");
-
-    let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
     let _guard = DaemonGuard {
         exe,
         port,
-        home_dir: None,
+        home_dir: home.path().to_path_buf(),
     };
 
     // 无子命令 = 后台启动：真实 start 父进程做预检、spawn 分离守护、
@@ -5251,6 +5266,7 @@ fn start_parent_command_output_returns() {
     let out = Command::new(exe)
         .arg("--config")
         .arg(&cfg_file)
+        .env("APROXY_HOME", home.path())
         .output()
         .expect("start 父进程执行失败");
     assert!(
@@ -5272,8 +5288,8 @@ fn start_parent_command_output_returns() {
 fn logs_follows_daemon_and_exits_on_stop() {
     // 独立派生端口：既有测试占用 daemon_test_ports() 的前三个，这里从偏移 3 起
     let port = daemon_test_port(3);
-    let dir = tempfile::tempdir().unwrap();
-    let cfg_file = dir.path().join("logs.toml");
+    let home = isolated_home();
+    let cfg_file = home.path().join("logs.toml");
     std::fs::write(
         &cfg_file,
         format!(
@@ -5282,27 +5298,22 @@ fn logs_follows_daemon_and_exits_on_stop() {
     )
     .unwrap();
     let exe = env!("CARGO_BIN_EXE_aproxy");
-    let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
     let _guard = DaemonGuard {
         exe,
         port,
-        home_dir: None,
+        home_dir: home.path().to_path_buf(),
     };
 
-    let pid = aproxy::daemon::spawn_detached(
-        std::path::Path::new(exe),
-        &[
-            "--config".to_string(),
-            cfg_file.display().to_string(),
-            "--daemon-child".to_string(),
-        ],
-    )
-    .expect("spawn 守护子进程失败");
-    assert!(wait_daemon_ready(port), "守护子进程未就绪 (pid {pid})");
+    let pid = spawn_daemon_in(home.path(), &cfg_file);
+    assert!(
+        wait_daemon_ready_in(&home.path().join("run"), port),
+        "守护子进程未就绪 (pid {pid})"
+    );
 
     // 连接 logs（stdout 管道捕获；logs 进程为单层 spawn，无句柄继承问题）
     let mut child = Command::new(exe)
         .args(["logs", &port.to_string()])
+        .env("APROXY_HOME", home.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -5344,7 +5355,10 @@ fn logs_follows_daemon_and_exits_on_stop() {
     );
 
     // stop 实例 → logs 感知实例死亡后自动退出（IPC 探活），不挂死
-    let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
+    let _ = Command::new(exe)
+        .args(["stop", &port.to_string()])
+        .env("APROXY_HOME", home.path())
+        .output();
     let mut exited = false;
     for _ in 0..150 {
         if child.try_wait().ok().flatten().is_some() {
@@ -5375,10 +5389,17 @@ fn logs_requires_port_when_multiple_instances() {
     let port_a = daemon_test_port(4);
     let port_b = daemon_test_port(5);
     let exe = env!("CARGO_BIN_EXE_aproxy");
-
-    let spawn_daemon = |port: u16, name: &str| {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg_file = dir.path().join(name);
+    let home = isolated_home();
+    let run_dir = home.path().join("run");
+    let run = |args: &[&str]| {
+        Command::new(exe)
+            .args(args)
+            .env("APROXY_HOME", home.path())
+            .output()
+            .unwrap()
+    };
+    let start_daemon = |port: u16, name: &str| {
+        let cfg_file = home.path().join(name);
         std::fs::write(
             &cfg_file,
             format!(
@@ -5386,36 +5407,31 @@ fn logs_requires_port_when_multiple_instances() {
             ),
         )
         .unwrap();
-        let _ = Command::new(exe).args(["stop", &port.to_string()]).output();
-        let pid = aproxy::daemon::spawn_detached(
-            std::path::Path::new(exe),
-            &[
-                "--config".to_string(),
-                cfg_file.display().to_string(),
-                "--daemon-child".to_string(),
-            ],
-        )
-        .expect("spawn 守护子进程失败");
-        (pid, dir)
+        spawn_daemon_in(home.path(), &cfg_file)
     };
-    // dir 须存活到测试结束（注册表里 config_path 引用它，无需实际存在，但保持干净）
-    let (pid_a, _dir_a) = spawn_daemon(port_a, "logs-multi-a.toml");
-    let (pid_b, _dir_b) = spawn_daemon(port_b, "logs-multi-b.toml");
     let _guard_a = DaemonGuard {
         exe,
         port: port_a,
-        home_dir: None,
+        home_dir: home.path().to_path_buf(),
     };
     let _guard_b = DaemonGuard {
         exe,
         port: port_b,
-        home_dir: None,
+        home_dir: home.path().to_path_buf(),
     };
-    assert!(wait_daemon_ready(port_a), "守护 a 未就绪 (pid {pid_a})");
-    assert!(wait_daemon_ready(port_b), "守护 b 未就绪 (pid {pid_b})");
+    let pid_a = start_daemon(port_a, "logs-multi-a.toml");
+    let pid_b = start_daemon(port_b, "logs-multi-b.toml");
+    assert!(
+        wait_daemon_ready_in(&run_dir, port_a),
+        "守护 a 未就绪 (pid {pid_a})"
+    );
+    assert!(
+        wait_daemon_ready_in(&run_dir, port_b),
+        "守护 b 未就绪 (pid {pid_b})"
+    );
 
     // 无参：报错列出两个端口
-    let out = Command::new(exe).arg("logs").output().unwrap();
+    let out = run(&["logs"]);
     assert!(!out.status.success(), "多实例时无参 logs 应失败");
     let text = format!(
         "{}{}",
@@ -5427,7 +5443,7 @@ fn logs_requires_port_when_multiple_instances() {
     assert!(text.contains(&port_b.to_string()), "应列出端口 b: {text}");
 
     // all：明确拒绝（一次只能连接一个）
-    let out = Command::new(exe).args(["logs", "all"]).output().unwrap();
+    let out = run(&["logs", "all"]);
     assert!(!out.status.success(), "logs all 应失败");
     let text = format!(
         "{}{}",
@@ -5443,9 +5459,11 @@ fn logs_requires_port_when_multiple_instances() {
 #[test]
 fn logs_reports_missing_instance() {
     let port = daemon_test_port(6); // 从未在该端口启动守护
+    let home = isolated_home();
     let exe = env!("CARGO_BIN_EXE_aproxy");
     let out = Command::new(exe)
         .args(["logs", &port.to_string()])
+        .env("APROXY_HOME", home.path())
         .output()
         .unwrap();
     assert!(!out.status.success(), "无实例时 logs 应失败");
@@ -5520,7 +5538,7 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     let _guard = DaemonGuard {
         exe,
         port,
-        home_dir: Some(home.clone()),
+        home_dir: home.clone(),
     };
 
     // 模拟崩溃：强杀守护进程（不经过 IPC 优雅退出），恢复记录应残留。
@@ -5658,7 +5676,7 @@ fn port_zero_restore_record_uses_actual_port() {
     let _guard = DaemonGuard {
         exe,
         port: port.parse().unwrap(),
-        home_dir: Some(home.to_path_buf()),
+        home_dir: home.to_path_buf(),
     };
 
     // 优雅停止后记录必须消失——「残留 + 复活」缺陷的回归断言
@@ -5706,7 +5724,7 @@ fn alias_start_and_stop_roundtrip() {
     let _guard = DaemonGuard {
         exe,
         port,
-        home_dir: Some(home.to_path_buf()),
+        home_dir: home.to_path_buf(),
     };
 
     // add 别名（指向临时配置）
@@ -5928,7 +5946,7 @@ fn logs_via_alias_connects_and_follows() {
     let _guard = DaemonGuard {
         exe,
         port,
-        home_dir: Some(home.to_path_buf()),
+        home_dir: home.to_path_buf(),
     };
 
     // 未知别名：明确报错（不依赖任何运行实例即应失败）
@@ -6106,7 +6124,7 @@ fn watchdog_respawns_killed_daemon() {
     let _guard = DaemonGuard {
         exe,
         port,
-        home_dir: Some(dir.path().to_path_buf()),
+        home_dir: dir.path().to_path_buf(),
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -6210,7 +6228,7 @@ fn watchdog_respawns_on_death_event_and_force_stop_stays_stopped() {
     let _guard = DaemonGuard {
         exe,
         port,
-        home_dir: Some(dir.path().to_path_buf()),
+        home_dir: dir.path().to_path_buf(),
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -6320,7 +6338,7 @@ fn identity_check_tolerates_swapped_binary() {
     let guard = DaemonGuard {
         exe: leaked_bin,
         port,
-        home_dir: Some(home_dir.to_path_buf()),
+        home_dir: home_dir.to_path_buf(),
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -6506,7 +6524,7 @@ fn ipc_stats_reflect_real_traffic() {
     let _guard = DaemonGuard {
         exe,
         port,
-        home_dir: Some(home.clone()),
+        home_dir: home.clone(),
     };
 
     let out = Command::new(exe)
@@ -6628,7 +6646,7 @@ fn ipc_stats_reflect_forward_only_traffic() {
     let _guard = DaemonGuard {
         exe,
         port,
-        home_dir: Some(home.clone()),
+        home_dir: home.clone(),
     };
 
     let out = Command::new(exe)
@@ -6767,7 +6785,7 @@ fn credentials_masked_in_start_output_registry_and_daemon_log() {
     let _guard = DaemonGuard {
         exe,
         port,
-        home_dir: Some(home.clone()),
+        home_dir: home.clone(),
     };
 
     let out = Command::new(exe)

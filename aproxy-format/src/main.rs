@@ -151,7 +151,7 @@ fn convert(args: &[String]) {
     }
     let (Some(from), Some(to)) = (from, to) else {
         eprintln!(
-            "用法: aproxy-format convert --from <fmt> --to <fmt>（fmt 如 AnthropicMessages / OpenAiChat / OpenAiResponses）"
+            "用法: aproxy-format convert --from <fmt> --to <fmt>（fmt 为 anthropic_messages / openai_chat / openai_responses）"
         );
         std::process::exit(1);
     };

@@ -403,8 +403,14 @@ def main() -> None:
         try:
             parsed = json.loads(reply)
             print(json.dumps(parsed, ensure_ascii=False, indent=2))
-            if parsed.get("error"):
-                print(f'\n[WARN] error reply: {parsed["error"]} (aProxy would answer 502 on '
+            problems = envelope_problems(parsed)
+            if problems:
+                for problem in problems:
+                    print(f"[FAIL] aProxy would reject this reply: {problem}")
+                sys.exit(1)
+            if parsed.get("error") is not None:
+                # aProxy treats any non-null `error`, even an empty string, as a failure
+                print(f'\n[WARN] error reply: {parsed["error"]!r} (aProxy would answer 502 on '
                       'the request side, or pass the upstream response through on the '
                       'response side)')
             else:
@@ -428,6 +434,32 @@ def main() -> None:
         print("[WARN] still running 5s after stdin closed: the program ignores EOF, so a "
               "persistent worker would be left behind if aProxy exits without cleaning up")
         proc.kill()
+
+
+def envelope_problems(env) -> list:
+    """Reasons aProxy would reject this reply line, mirroring its envelope parser
+    (aproxy-envelope): an object with a `headers` map of strings, `body` and
+    `body_b64` not both present, `body_b64` in standard base64."""
+    if not isinstance(env, dict):
+        return ["the reply must be a JSON object (an envelope), not "
+                f"{type(env).__name__}"]
+    problems = []
+    headers = env.get("headers")
+    if headers is None:
+        problems.append("missing `headers` (the only required field; send {} if empty)")
+    elif not isinstance(headers, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in headers.items()):
+        problems.append("`headers` must map header names to string values")
+    if env.get("body") is not None and env.get("body_b64") is not None:
+        problems.append("`body` and `body_b64` are mutually exclusive")
+    if env.get("body") is not None and not isinstance(env["body"], str):
+        problems.append("`body` must be a string")
+    if env.get("body_b64") is not None:
+        try:
+            base64.b64decode(env["body_b64"], validate=True)
+        except (ValueError, TypeError):
+            problems.append("`body_b64` is not standard base64 with padding")
+    return problems
 
 
 if __name__ == "__main__":

@@ -762,7 +762,8 @@ enum SpoolBuffer {
         path: SpoolPath,
         len: u64,
     },
-    /// 收集中途写盘失败：内部状态不可用，调用方转为可重试的 NetworkError
+    /// 收集中途写盘失败：内部状态不可用，forward_once 以 SpoolFailed 终态返回
+    /// （本地磁盘故障与上游无关，重试无意义）
     Poisoned,
 }
 

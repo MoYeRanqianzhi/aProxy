@@ -28,9 +28,16 @@ IPC 重新整理格式后协议版本从 1 重新计数。随后：「发现的�
   （本 run 目录有该端口 `.pid`、旧管道应答者 pid 与非 0 创建时间都一致才回退，0 不认）。测试：T3a
   （`stop_from_another_home_does_not_reach_this_instance`，含 B 里同端口 start 报占用；变异验证：去掉
   命名空间后 B 的 stop 停掉了 A 的实例）、T3b（`home_id_separates_homes_and_is_stable_across_spellings`）、
-  T4f（`legacy_pipe_is_reached_only_for_a_matching_local_record`，变异验证 0 值检查）。第 3 步剩余：
-  启动不变式（IPC 先于注册表、IPC 失败致命）、unix 先探测再 unlink、sun_path 检查、普查核对应答者
-  pid、传输层对端 pid、claim 原子写；心跳节与安装宣告的命名空间（S5）在第 5 步。
+  T4f（`legacy_pipe_is_reached_only_for_a_matching_local_record`，变异验证 0 值检查）。
+- 第 3 步其余（提交 B）：`bind_ipc` 在 TCP 之后、注册表之前独占创建端点，失败写 startup.log 并退出 1
+  （T3d `daemon_without_its_control_endpoint_exits_without_registering`）；unix 先探测再 unlink（T3e 跨平台版
+  `binding_a_live_endpoint_fails_and_leaves_its_owner_answering`，unix 残留 socket 测试只在 CI 跑）；
+  sun_path 不单独检查，bind 的原错误进 startup.log 并提示路径过长；普查核对应答者 pid，对不上重读一次，
+  仍不符不列出、不删（T3c）；客户端核对对端 pid（Windows `GetNamedPipeServerProcessId`，unix
+  `peer_cred`，T3g）；claim 续写 tmp+rename。顺带：Windows 接受循环单个连接出错不再终止整条管道，
+  且先建下一实例再丢当前实例（名字不消失）；服务端读请求 5 秒时限、客户端应答 1 MiB 上限（b.4）。
+  变异验证：去掉对端核对、普查 pid 守卫、first_pipe_instance 各自让对应测试失败。
+  心跳节与安装宣告的命名空间（S5）在第 5 步。
 - Linux 编译只能靠 CI 的 ubuntu 门禁：本机 WSL（Debian）的 rustup 工具链清单损坏，且 2026-10-06 WSL 内无外网
   （官方源与 rsproxy 均连接超时），修不了；本机也没有 Linux C 交叉编译器（ring 需要）。
 

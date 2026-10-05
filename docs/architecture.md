@@ -22,6 +22,11 @@ Windows 的管道名全机共享，带上它，一个 home（`APROXY_HOME`）的
 home 的实例。新实例同时在 0.1.0 的管道名 `\\.\pipe\aproxy-<端口>` 上应答，供 0.1.0
 的 CLI 与安装器在升级窗口里找到它（`src/compat_0_1_0.rs`，0.2.0 删除）。
 
+启动顺序：bind TCP → 独占创建控制端点（失败即退出，写 startup.log）→ 写 `.pid` →
+写 `.restore` → 心跳 → 服务。由此「有 `.pid` 记录 ⇒ 端点在应答」（挂死除外）。客户端
+核对应答者自报的 pid 与连接对端进程（`GetNamedPipeServerProcessId` / `SO_PEERCRED`）：
+端点名可预测，抢先占住它的进程只能报出自己的 pid，普查再拿这个 pid 与注册记录比对。
+
 上图的「重试循环 / spool / 回放」是默认模式的主流程；`forward_only` 模式下这两
 环整体旁路（见「仅转发模式（forward_only）」）。
 

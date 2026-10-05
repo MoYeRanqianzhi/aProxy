@@ -738,10 +738,17 @@ impl WatchdogState {
             created_at_process: process_start_time(std::process::id()).unwrap_or(0),
             heartbeat_secs: now_secs(),
         };
+        // 先写临时文件再 rename 覆盖：原地写时，并发读到的可能是截断到一半的
+        // claim，读者把它当「无 claim」，随即补种出第二个看护者。临时文件名带
+        // pid，两个看护者短暂并存时不会互踩
         let path = claim_path_in(&self.cfg.run_dir);
-        if let Ok(json) = serde_json::to_string(&claim)
-            && let Err(e) = std::fs::write(&path, json + "\n")
-        {
+        let tmp = path.with_extension(format!("claim.{}.tmp", std::process::id()));
+        let Ok(json) = serde_json::to_string(&claim) else {
+            return;
+        };
+        let written = std::fs::write(&tmp, json + "\n").and_then(|()| std::fs::rename(&tmp, &path));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
             tracing::warn!(error = %e, "claim 心跳续写失败");
         }
     }

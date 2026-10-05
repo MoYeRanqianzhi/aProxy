@@ -93,6 +93,23 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     let actual_addr = listener.local_addr().expect("获取监听地址失败").to_string();
     let port = daemon::port_of(&actual_addr).to_string();
 
+    // 控制端点紧接 TCP 之后、注册表之前创建：失败就不登记、不写恢复记录、
+    // 直接退出。带着一个 stop/status 都找不到的实例跑下去比启动失败更糟——
+    // 它占着端口，用户只能按 pid 去杀；它的 .pid 还会覆盖同端口实例的记录。
+    let ipc_endpoint = match daemon::bind_ipc(&port).await {
+        Ok(endpoint) => endpoint,
+        Err(e) => {
+            report_config_error(
+                &format!(
+                    "控制通道 {} 创建失败：{e}。同一 APROXY_HOME 里可能已有使用端口 {port} 的 aProxy 实例（监听地址不同）；unix 上 run 目录路径过长也会导致失败",
+                    daemon::endpoint_for(&port)
+                ),
+                daemon_child,
+            );
+            std::process::exit(1);
+        }
+    };
+
     // 注册实例信息（bind 成功后才写，避免留下死记录）。
     // last_activity_secs 落盘的是注册时刻快照（注册表仅供枚举展示），
     // 实时值由 IPC ping 响应携带。log_path 是本实例守护日志的最终路径
@@ -147,8 +164,8 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
         tracing::warn!(error = %e, "自愈恢复记录写入失败（不影响代理功能）");
     }
 
-    // IPC 控制通道：ping/shutdown 走命名管道，与代理端口完全隔离。
-    // 活动时间戳与观测计数由 AppState 持有（请求热路径更新），IPC ping 实时读取——
+    // IPC 控制通道（端点已在注册前创建好）：ping/shutdown 走命名管道，与代理
+    // 端口完全隔离。活动时间戳与观测计数由 AppState 持有（请求热路径更新），IPC ping 实时读取——
     // 直接复用 `state.stats` 这**同一份**：此处曾另建一个 IpcStats 只共享活动
     // 时间戳，导致「请求 / 重试 / 最近错误」对任何实例都恒为 0（时间戳正常掩盖了它）。
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -156,9 +173,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     let ipc_info = info.clone();
     let ipc_stats = state.stats.clone();
     tokio::spawn(async move {
-        if let Err(e) = daemon::serve_ipc(ipc_port, stop_tx, ipc_info, ipc_stats).await {
-            tracing::error!(error = %e, "IPC 控制通道启动失败（aproxy stop/status 将不可用）");
-        }
+        daemon::serve_ipc(ipc_endpoint, &ipc_port, stop_tx, ipc_info, ipc_stats).await;
     });
 
     // 看门狗心跳（共享内存节）：独立 ticker 每 10s 写一次毫秒时间戳——挂死的

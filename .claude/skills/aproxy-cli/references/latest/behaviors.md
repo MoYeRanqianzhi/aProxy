@@ -303,9 +303,9 @@ response: attempt judged successful -> response transform -> replay
   home's run directory, on Linux and macOS the socket `<home>/run/<port>.sock`. Either way it
   belongs to one home: commands find only instances started under the same home. `status`, `stop`,
   `restart`, `logs` and `install` use it and never touch the proxy port, which carries only proxied
-  traffic. If the channel fails to start, the instance logs
-  `IPC 控制通道启动失败（aproxy stop/status 将不可用）` ("control channel failed to start; stop/status
-  unavailable") and keeps proxying.
+  traffic. An instance creates its channel before it registers, and refuses to start if it cannot:
+  startup.log gets `控制通道 <endpoint> 创建失败：…` ("control channel could not be created"). So a
+  registered instance is always reachable unless it hung.
 - `aproxy status` lists instances that answer on their control channel, lists separately those whose
   process is alive but does not answer (hung), and deletes registry records of processes that are
   gone.

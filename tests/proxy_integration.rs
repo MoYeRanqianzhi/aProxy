@@ -4890,6 +4890,82 @@ fn stop_from_another_home_does_not_reach_this_instance() {
 }
 
 #[test]
+fn daemon_without_its_control_endpoint_exits_without_registering() {
+    // 同一 home 里已有实例占着端口 P 的控制端点；后来者监听 127.0.0.2:P，
+    // TCP 绑得上，控制端点却建不成。它必须启动失败、在 startup.log 说明原因，
+    // 不登记、不覆盖前者的注册与恢复记录。曾经它不带控制通道跑下去——stop、
+    // status 都找不到它，它的 .pid 还盖掉了前者的记录
+    let home = isolated_home();
+    let run_dir = home.path().join("run");
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let cfg = |name: &str, ip: &str| {
+        let path = home.path().join(name);
+        std::fs::write(
+            &path,
+            format!("base_url = \"https://{ip}.example.com\"\nlisten_addr = \"{ip}:{port}\"\n"),
+        )
+        .unwrap();
+        path
+    };
+    let cfg_a = cfg("a.toml", "127.0.0.1");
+    let cfg_b = cfg("b.toml", "127.0.0.2");
+    let exe = env!("CARGO_BIN_EXE_aproxy");
+    let _guard = DaemonGuard {
+        exe,
+        port,
+        home_dir: home.path().to_path_buf(),
+    };
+    let pid_a = spawn_daemon_in(home.path(), &cfg_a);
+    assert!(
+        wait_daemon_ready_in(&run_dir, port),
+        "守护 a 未就绪 (pid {pid_a})"
+    );
+
+    let mut late = KillOnDrop(
+        Command::new(exe)
+            .arg("--config")
+            .arg(&cfg_b)
+            .arg("--daemon-child")
+            .env("APROXY_HOME", home.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut exit = None;
+    for _ in 0..100 {
+        if let Some(status) = late.0.try_wait().unwrap() {
+            exit = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let exit = exit.expect("建不成控制端点的守护应当退出，而不是继续运行");
+    assert!(!exit.success());
+    let startup =
+        std::fs::read_to_string(home.path().join("logs").join("startup.log")).unwrap_or_default();
+    assert!(startup.contains("控制通道"), "startup.log: {startup}");
+    let record = aproxy::daemon::read_instance_file_in(&run_dir, &port.to_string())
+        .expect("前者的注册记录应还在");
+    assert_eq!(record.pid, pid_a, "后来者不得覆盖前者的注册记录");
+    let restore = std::fs::read_to_string(aproxy::daemon::restore_file_path_in(
+        &run_dir,
+        &format!("127.0.0.1:{port}"),
+    ))
+    .unwrap();
+    assert!(
+        restore.contains("a.toml"),
+        "后来者不得覆盖前者的恢复记录: {restore}"
+    );
+    assert!(wait_daemon_ready_in(&run_dir, port), "前者应照常应答");
+}
+
+#[test]
 fn cli_config_show_rejects_missing_explicit_file() {
     // 与写操作对照：--show / 无修改参数对「显式 --config 指向的不存在文件」
     // 必须报错——此时展示的只是内置默认值（抬头却是用户给的路径），静默回退

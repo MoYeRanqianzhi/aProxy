@@ -333,8 +333,22 @@ pub(crate) async fn request_raw(
     let req_line = serde_json::to_string(req).expect("序列化 IPC 请求失败");
     let fut = imp::exchange(endpoint, &req_line);
     match tokio::time::timeout(Duration::from_secs(3), fut).await {
-        Ok(Ok(line)) => serde_json::from_str(&line)
-            .map_err(|e| ExchangeError::Failed(format!("{endpoint}: 响应解析失败 {e}"))),
+        Ok(Ok((line, peer))) => {
+            let resp: IpcResponse = serde_json::from_str(&line)
+                .map_err(|e| ExchangeError::Failed(format!("{endpoint}: 响应解析失败 {e}")))?;
+            // 应答者自报的 pid 必须就是连接对端的进程：普查、0.1.0 兼容回退与
+            // stop 都按这个 pid 认实例，而端点名可以预测，任何本机进程都可能
+            // 抢先占住它、冒充实例应答
+            if let (Some(peer), Some(info)) = (peer, resp.info.as_ref())
+                && info.pid != peer
+            {
+                return Err(ExchangeError::Failed(format!(
+                    "{endpoint}: 应答者自报 pid {} 与连接对端进程 {peer} 不一致",
+                    info.pid
+                )));
+            }
+            Ok(resp)
+        }
         Ok(Err(ExchangeError::Unreachable(e))) => {
             Err(ExchangeError::Unreachable(format!("{endpoint}: {e}")))
         }
@@ -343,29 +357,46 @@ pub(crate) async fn request_raw(
     }
 }
 
-/// 启动实例的 IPC 控制服务（每实例一条独立端点，随进程退出而终止）。
-/// 收到 shutdown 时置位 `on_shutdown`（watch bool），由服务主循环执行优雅退出。
-/// `port` 收 owned 值：调用方以 tokio::spawn 运行本 future，参数不能借用。
-/// `last_activity_secs`：代理层的活动时间戳共享原子，ping 实时读取。
+/// 本实例已独占创建、尚未开始接受连接的控制端点。守护先创建它、再写注册表
+/// 与恢复记录（见 server::serve_forever）：有 `.pid` 记录就意味着端点在应答
+/// （挂死除外）。创建失败时守护直接启动失败，不带着一个谁也控制不了的实例
+/// 继续跑。
+pub struct IpcEndpoint(imp::Listener);
+
+/// 创建本实例的控制端点。端点已被占用（同一 home 同端口的另一个实例，或抢先
+/// 占住名字的其他进程）时报错，不与对方分摊或抢夺。
+pub async fn bind_ipc(port: &str) -> io::Result<IpcEndpoint> {
+    imp::bind(&endpoint_for(port)).await.map(IpcEndpoint)
+}
+
+/// 在已创建的端点上提供控制服务，直到进程退出。收到 shutdown 时置位
+/// `on_shutdown`（watch bool），由服务主循环执行优雅退出；`stats` 是代理层
+/// 的实时观测源，ping 实时读取。
 pub async fn serve_ipc(
-    port: String,
+    endpoint: IpcEndpoint,
+    port: &str,
     on_shutdown: tokio::sync::watch::Sender<bool>,
     info: InstanceInfo,
     stats: Arc<IpcStats>,
-) -> io::Result<()> {
+) {
     #[cfg(windows)]
-    crate::compat_0_1_0::serve_legacy_pipe(&port, on_shutdown.clone(), info.clone(), stats.clone());
-    serve_endpoint(endpoint_for(&port), on_shutdown, info, stats).await
+    crate::compat_0_1_0::serve_legacy_pipe(port, on_shutdown.clone(), info.clone(), stats.clone());
+    #[cfg(unix)]
+    let _ = port;
+    imp::accept_loop(endpoint.0, on_shutdown, info, stats).await
 }
 
-/// 在给定端点上提供控制服务（serve_ipc 与 0.1.0 兼容管道共用）
+/// 在给定端点名上创建并提供控制服务（0.1.0 兼容管道与测试用）。只有创建
+/// 失败会返回。
 pub(crate) async fn serve_endpoint(
     endpoint: String,
     on_shutdown: tokio::sync::watch::Sender<bool>,
     info: InstanceInfo,
     stats: Arc<IpcStats>,
 ) -> io::Result<()> {
-    imp::serve(endpoint, on_shutdown, info, stats).await
+    let listener = imp::bind(&endpoint).await?;
+    imp::accept_loop(listener, on_shutdown, info, stats).await;
+    Ok(())
 }
 
 /// 实例的实时观测数据源：代理热路径写入，IPC 响应读取。
@@ -764,7 +795,21 @@ pub async fn survey_instances_in(dir: &std::path::Path) -> InstanceSurvey {
             // ping 响应携带实例的实时信息（含 last_activity_secs）——注册表
             // .pid 是启动时刻的快照，闲置判定/展示必须用实时值，否则活动
             // 时间永远停留在启动时刻、闲置=运行时长（实测踩坑）
-            Ok(live_info) => out.push(live_info),
+            Ok(live_info) if live_info.pid == info.pid => out.push(live_info),
+            // 应答的不是记录里的进程。新实例先建端点、后写记录，记录可能正被
+            // 重写——重读一次再比。仍对不上时，记录的进程若还在就按无响应
+            // 列出（它不在自己的端点上应答）；否则不列出、也不删：此刻删除
+            // 可能恰好删掉应答者刚写下的记录
+            Ok(live_info) => {
+                if read_instance_file_in(dir, &port).is_some_and(|f| f.pid == live_info.pid) {
+                    out.push(live_info);
+                } else if matches!(
+                    crate::watchdog::record_identity(info.pid, info.process_start),
+                    crate::watchdog::RecordIdentity::Alive(_)
+                ) {
+                    unresponsive.push(info);
+                }
+            }
             Err(_) => match crate::watchdog::record_identity(info.pid, info.process_start) {
                 crate::watchdog::RecordIdentity::Alive(_) => unresponsive.push(info),
                 // 实例不在了（或无从核验）：注册已失效，清理
@@ -1023,7 +1068,10 @@ async fn exchange_over<S>(stream: S, req_line: &str) -> Result<String, ExchangeE
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    // 应答行长度上限：端点名可以预测，应答者未必是 aProxy，不能让它把客户端
+    // 内存撑爆。真实应答只有几百字节
+    const MAX_RESPONSE_LINE: u64 = 1024 * 1024;
     let failed = |e: io::Error| ExchangeError::Failed(e.to_string());
     let (reader, mut writer) = tokio::io::split(stream);
     writer
@@ -1033,9 +1081,15 @@ where
     writer.write_all(b"\n").await.map_err(failed)?;
     let mut line = String::new();
     BufReader::new(reader)
+        .take(MAX_RESPONSE_LINE)
         .read_line(&mut line)
         .await
         .map_err(failed)?;
+    if !line.ends_with('\n') {
+        return Err(ExchangeError::Failed(
+            "应答不完整（连接提前关闭或超过长度上限）".to_string(),
+        ));
+    }
     Ok(line)
 }
 
@@ -1058,8 +1112,17 @@ where
     // read_line 会无界累积直到遇到 \n，恶意/异常客户端可借此把守护进程内存
     // 吃到 OOM。超过上限即按无效请求回 ok:false 后断开。
     const MAX_REQUEST_LINE: u64 = 64 * 1024;
+    // 读请求的时限：连上却迟迟不发完一行的客户端会一直占着这个处理任务
+    // （Windows 上还占着一个管道实例，实例数有上限，占满后新连接全部失败）。
+    // 正常客户端连上即发，几毫秒内完成
+    const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
     let mut limited = BufReader::new(reader).take(MAX_REQUEST_LINE);
-    limited.read_line(&mut line).await?;
+    match tokio::time::timeout(REQUEST_READ_TIMEOUT, limited.read_line(&mut line)).await {
+        Ok(read) => {
+            read?;
+        }
+        Err(_) => return Ok(()),
+    }
     if !line.ends_with('\n') {
         // 行未正常终止：超过长度上限被截断，或对端在发完整请求前就断开——
         // 两种情况都不再继续累积，直接以无效请求收尾。
@@ -1155,16 +1218,22 @@ where
 mod imp {
     use super::{ExchangeError, InstanceInfo, IpcStats, exchange_over, handle_conn};
     use std::{io, sync::Arc, time::Duration};
-    use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+    use tokio::net::windows::named_pipe::{
+        ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
+    };
     use tokio::sync::watch::Sender;
 
-    /// 端点不存在（无实例）时返回可读错误。
+    /// 端点不存在（无实例）时返回可读错误。成功时一并返回管道服务端的进程
+    /// pid（取不到为 None），供调用方核对应答者自报的 pid。
     ///
     /// ERROR_PIPE_BUSY(231) 重试：serve 循环在 connect() 完成、重建下一个
     /// 监听实例之间存在零监听窗口，管道名存在但无空闲实例，此时 CreateFile
     /// 返回 busy 而非「端点不存在」。tokio 文档明确要求客户端对该错误
     /// sleep 后重试；封顶 2 秒（上层 ipc_request 的 3 秒超时之内）。
-    pub async fn exchange(endpoint: &str, req_line: &str) -> Result<String, ExchangeError> {
+    pub async fn exchange(
+        endpoint: &str,
+        req_line: &str,
+    ) -> Result<(String, Option<u32>), ExchangeError> {
         const ERROR_PIPE_BUSY: i32 = 231;
         const BUSY_RETRY_CAP: Duration = Duration::from_secs(2);
         const BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -1185,29 +1254,75 @@ mod imp {
                 Err(e) => return Err(ExchangeError::Failed(format!("无法连接（{e}）"))),
             }
         };
-        exchange_over(client, req_line).await
+        let peer = server_pid(&client);
+        Ok((exchange_over(client, req_line).await?, peer))
     }
 
-    /// 接受循环：为每个连接 spawn 处理任务；始终重建监听实例以接受后续连接。
-    pub async fn serve(
+    fn server_pid(client: &NamedPipeClient) -> Option<u32> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+        let mut pid = 0u32;
+        // SAFETY: 句柄来自仍存活的 client，pid 指向本栈上的 u32
+        let ok = unsafe { GetNamedPipeServerProcessId(client.as_raw_handle() as isize, &mut pid) };
+        (ok != 0 && pid != 0).then_some(pid)
+    }
+
+    /// 已独占创建的端点：第一个管道实例在手，名字从此归本进程。
+    pub struct Listener {
         endpoint: String,
+        first: NamedPipeServer,
+    }
+
+    /// `first_pipe_instance`：名字已被别的进程占着就失败，而不是加入它、和它
+    /// 分摊连接——那样一半的 stop/ping 会落到别人手里。
+    pub async fn bind(endpoint: &str) -> io::Result<Listener> {
+        let first = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(endpoint)?;
+        Ok(Listener {
+            endpoint: endpoint.to_string(),
+            first,
+        })
+    }
+
+    /// 接受循环：为每个连接 spawn 处理任务，并始终备好下一个监听实例。不会
+    /// 返回——单个连接出错只丢掉那一个实例，控制通道本身要一直在。
+    pub async fn accept_loop(
+        listener: Listener,
         on_shutdown: Sender<bool>,
         info: InstanceInfo,
         stats: Arc<IpcStats>,
-    ) -> io::Result<()> {
-        let mut server = ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(&endpoint)?;
+    ) {
+        let Listener {
+            endpoint,
+            first: mut server,
+        } = listener;
         loop {
-            server.connect().await?;
-            let client = server;
-            server = ServerOptions::new().create(&endpoint)?;
-            let shutdown = on_shutdown.clone();
-            let info = info.clone();
-            let stats = stats.clone();
-            tokio::spawn(async move {
-                let _ = handle_conn(client, shutdown, info, stats).await;
-            });
+            let connected = server.connect().await;
+            // 先建好下一个实例，再交出（或丢掉）当前这个：管道名只在至少还有
+            // 一个实例时存在，名字一消失，客户端就会把「找不到」当成实例已退出
+            let next = loop {
+                match ServerOptions::new().create(&endpoint) {
+                    Ok(next) => break next,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "控制管道新建监听实例失败，1 秒后重试");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            };
+            let current = std::mem::replace(&mut server, next);
+            match connected {
+                Ok(()) => {
+                    let shutdown = on_shutdown.clone();
+                    let info = info.clone();
+                    let stats = stats.clone();
+                    tokio::spawn(async move {
+                        let _ = handle_conn(current, shutdown, info, stats).await;
+                    });
+                }
+                // 客户端在服务端接上之前就断开等：只影响这一个连接
+                Err(e) => tracing::debug!(error = %e, "控制管道连接未建立，换一个监听实例继续"),
+            }
         }
     }
 }
@@ -1219,7 +1334,12 @@ mod imp {
     use tokio::net::UnixListener;
     use tokio::sync::watch::Sender;
 
-    pub async fn exchange(endpoint: &str, req_line: &str) -> Result<String, ExchangeError> {
+    /// 成功时一并返回对端进程 pid（SO_PEERCRED 一类机制；取不到为 None），
+    /// 供调用方核对应答者自报的 pid。
+    pub async fn exchange(
+        endpoint: &str,
+        req_line: &str,
+    ) -> Result<(String, Option<u32>), ExchangeError> {
         let client = tokio::net::UnixStream::connect(endpoint)
             .await
             .map_err(|e| {
@@ -1233,19 +1353,46 @@ mod imp {
                     _ => ExchangeError::Failed(msg),
                 }
             })?;
-        exchange_over(client, req_line).await
+        let peer = client
+            .peer_cred()
+            .ok()
+            .and_then(|cred| cred.pid())
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|&pid| pid != 0);
+        Ok((exchange_over(client, req_line).await?, peer))
     }
 
-    pub async fn serve(
-        endpoint: String,
+    pub struct Listener(UnixListener);
+
+    /// 独占创建 socket。路径上已有文件时先探测：连得上说明有进程正在用它
+    /// （同一 home 同端口的另一个实例），拒绝——删掉它的 socket 等于把它的
+    /// 控制通道抢走，它从此 stop/status 不可达；连接被拒（没有进程在听）才是
+    /// 崩溃残留，删掉重建。
+    pub async fn bind(endpoint: &str) -> io::Result<Listener> {
+        let path = Path::new(endpoint);
+        match tokio::net::UnixStream::connect(path).await {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!("已有进程在 {endpoint} 上提供控制通道"),
+                ));
+            }
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                let _ = std::fs::remove_file(path);
+            }
+            // 不存在（正常情况）或别的问题（如路径过长）：交给 bind 报真实错误
+            Err(_) => {}
+        }
+        UnixListener::bind(path).map(Listener)
+    }
+
+    pub async fn accept_loop(
+        listener: Listener,
         on_shutdown: Sender<bool>,
         info: InstanceInfo,
         stats: Arc<IpcStats>,
-    ) -> io::Result<()> {
-        let path = Path::new(&endpoint);
-        // 残留 socket 文件会令 bind 失败，先清理
-        let _ = std::fs::remove_file(path);
-        let listener = UnixListener::bind(path)?;
+    ) {
+        let Listener(listener) = listener;
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(conn) => conn,
@@ -1494,12 +1641,14 @@ mod tests {
         stats.requests_total.store(7, Ordering::Relaxed);
         stats.retries_total.store(2, Ordering::Relaxed);
         stats.record_error("上游返回 502 Bad Gateway（错误内容，重试）");
-        let server = tokio::spawn(imp::serve(endpoint.clone(), tx, info.clone(), stats));
+        let server = tokio::spawn(serve_endpoint(endpoint.clone(), tx, info.clone(), stats));
         // 等待服务端监听实例建好
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // ping：响应携带实例信息 + 实时观测值 + v2 协议号
-        let line = imp::exchange(&endpoint, r#"{"op":"ping"}"#).await.unwrap();
+        // ping：响应携带实例信息 + 实时观测值 + v2 协议号；客户端拿得到管道
+        // 服务端的真实 pid（本测试进程），供核对应答者自报的 pid
+        let (line, peer) = imp::exchange(&endpoint, r#"{"op":"ping"}"#).await.unwrap();
+        assert_eq!(peer, Some(std::process::id()));
         let resp: IpcResponse = serde_json::from_str(&line).unwrap();
         assert!(resp.ok);
         assert_eq!(resp.proto, IPC_PROTO_VERSION, "新实例应报 v2 协议");
@@ -1517,7 +1666,7 @@ mod tests {
 
         // PrepareSwap：置位 swap_phase 并在响应里立即反映（一个请求完成
         // 表达+确认——install 的 ACK 判定）
-        let line = imp::exchange(&endpoint, r#"{"op":"prepare_swap"}"#)
+        let (line, _) = imp::exchange(&endpoint, r#"{"op":"prepare_swap"}"#)
             .await
             .unwrap();
         let resp: IpcResponse = serde_json::from_str(&line).unwrap();
@@ -1527,12 +1676,12 @@ mod tests {
             "PrepareSwap 响应应携带置位后的 swap_phase"
         );
         // 后续 ping 持续反映该状态（重启前不消失——内存态由滚动重启清除）
-        let line = imp::exchange(&endpoint, r#"{"op":"ping"}"#).await.unwrap();
+        let (line, _) = imp::exchange(&endpoint, r#"{"op":"ping"}"#).await.unwrap();
         let resp: IpcResponse = serde_json::from_str(&line).unwrap();
         assert!(resp.info.as_ref().map(|i| i.swap_phase).unwrap_or(false));
 
         // shutdown：响应确认后置位停止信号
-        let line = imp::exchange(&endpoint, r#"{"op":"shutdown"}"#)
+        let (line, _) = imp::exchange(&endpoint, r#"{"op":"shutdown"}"#)
             .await
             .unwrap();
         let resp: IpcResponse = serde_json::from_str(&line).unwrap();
@@ -1542,7 +1691,7 @@ mod tests {
 
         // 未知请求：ok=false 而非崩溃（新 CLI 对旧实例发未知 op 的降级依据：
         // 旧实例同样回 ok:false，客户端以此感知「op 不被支持」）
-        let line = imp::exchange(&endpoint, r#"{"op":"what"}"#).await.unwrap();
+        let (line, _) = imp::exchange(&endpoint, r#"{"op":"what"}"#).await.unwrap();
         let resp: IpcResponse = serde_json::from_str(&line).unwrap();
         assert!(!resp.ok);
 
@@ -1636,7 +1785,9 @@ mod tests {
                 Arc::new(IpcStats::default()),
             ))
         };
+        // pid 必须是本测试进程：客户端会核对应答者自报的 pid 与管道服务端进程
         let mut live = sample_info(&port);
+        live.pid = std::process::id();
         live.process_start = 1000;
         let server = serve_legacy(live.clone());
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1671,6 +1822,105 @@ mod tests {
         write_instance_file_in(run.path(), &unverifiable).unwrap();
         assert!(ipc_ping_in(run.path(), &port).await.is_err());
 
+        server.abort();
+    }
+
+    /// 测试专用端点：Windows 管道名带测试名与进程号（不会与真实实例重名），
+    /// unix 的 socket 放在测试目录里
+    fn test_endpoint(dir: &std::path::Path, name: &str) -> String {
+        #[cfg(windows)]
+        {
+            let _ = dir;
+            format!(r"\\.\pipe\aproxy-test-{name}-{}", std::process::id())
+        }
+        #[cfg(unix)]
+        {
+            dir.join(format!("{name}.sock")).display().to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn client_rejects_a_responder_whose_pid_is_not_the_peer() {
+        // 冒充者：在端点上应答，自报的 pid（42）却不是它自己。客户端必须拒收——
+        // 普查、stop 与 0.1.0 回退都按应答里的 pid 认实例
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = test_endpoint(dir.path(), "peer");
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(serve_endpoint(
+            endpoint.clone(),
+            tx,
+            sample_info("0"),
+            Arc::new(IpcStats::default()),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let err = request_raw(&endpoint, &IpcRequest::Ping).await.unwrap_err();
+        assert!(err.to_string().contains("不一致"), "{err}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn binding_a_live_endpoint_fails_and_leaves_its_owner_answering() {
+        // 同一 home 同端口的第二个实例：不得与第一个分摊连接（Windows），也不得
+        // 删掉它的 socket 抢过来（unix），只能创建失败；第一个照常应答
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = test_endpoint(dir.path(), "dup");
+        let mut info = sample_info("0");
+        info.pid = std::process::id();
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(serve_endpoint(
+            endpoint.clone(),
+            tx,
+            info,
+            Arc::new(IpcStats::default()),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(imp::bind(&endpoint).await.is_err());
+        assert!(request_raw(&endpoint, &IpcRequest::Ping).await.unwrap().ok);
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binding_over_a_stale_socket_file_succeeds() {
+        // 崩溃残留：socket 文件还在，但没有进程在听——清掉重建
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = test_endpoint(dir.path(), "stale");
+        drop(std::os::unix::net::UnixListener::bind(&endpoint).unwrap());
+        assert!(std::path::Path::new(&endpoint).exists());
+        assert!(imp::bind(&endpoint).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn survey_does_not_credit_a_record_with_another_processs_answer() {
+        // 记录说端口上是进程 X，端点上应答的却是另一个进程：不能把应答者当成
+        // 这条记录的实例列出，也不能删记录（它可能正被应答者重写）
+        let dir = tempfile::tempdir().unwrap();
+        let port = format!("survey-{}", std::process::id());
+        let mut live = sample_info(&port);
+        live.pid = std::process::id();
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(serve_endpoint(
+            endpoint_for_in(dir.path(), &port),
+            tx,
+            live.clone(),
+            Arc::new(IpcStats::default()),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut stale = live.clone();
+        stale.pid = u32::MAX - 778;
+        stale.process_start = 123;
+        write_instance_file_in(dir.path(), &stale).unwrap();
+        let survey = survey_instances_in(dir.path()).await;
+        assert!(survey.responsive.is_empty(), "{:?}", survey.responsive);
+        assert!(survey.unresponsive.is_empty(), "{:?}", survey.unresponsive);
+        assert!(read_instance_file_in(dir.path(), &port).is_some());
+
+        // 记录与应答者一致：照常列出
+        write_instance_file_in(dir.path(), &live).unwrap();
+        let survey = survey_instances_in(dir.path()).await;
+        assert_eq!(survey.responsive.len(), 1);
+        assert_eq!(survey.responsive[0].pid, live.pid);
         server.abort();
     }
 

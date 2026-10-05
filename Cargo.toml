@@ -97,7 +97,8 @@ ruzstd = "0.9.0"
 # ^0.52 被解析为 0.61.2（本地同款 lock 解析 0.52.0 正常，机制未定位），
 # 精确钉死 + CI --locked 双保险根除解析漂移。
 # Win32_System_Memory：看门狗共享内存心跳节（CreateFileMappingW/MapViewOfFile）。
-windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Memory"] }
+# Win32_System_Pipes：控制管道客户端核对服务端进程（GetNamedPipeServerProcessId）。
+windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Pipes"] }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,7 +1,7 @@
 # Memory Index
 - [502 via 7890](memory/2026-08-28-502-via-7890.md) — 502 回透说明重试未生效而非 7890 代理问题，已更正归因与排查方向 [[502-via-7890]]
 - [proxy-config](memory/2026-08-29-proxy-config.md) — 配置文件代理功能已落地（含可选用户名密码），reqwest 代理机制关键事实与 7890 实测结论 [[proxy-config]] [[502-via-7890]]
-- [baseurl-rename](memory/2026-08-29-baseurl-rename.md) — upstream 已更名为 baseurl/base_url（alias 兼容旧配置），顶层 --api-key 已修复接线；生产实例以 aproxy-using.exe 运行锁 release exe [[baseurl-rename]] [[proxy-config]]
+- [baseurl-rename](memory/2026-08-29-baseurl-rename.md) — upstream 已更名为 baseurl/base_url（旧名兼容已于 2026-10-06 删除），顶层 --api-key 已修复接线；生产实例以 aproxy-using.exe 运行锁 release exe [[baseurl-rename]] [[proxy-config]]
 - [review-findings](memory/2026-08-29-review-findings.md) — 首轮审查确认 66 项：总超时掐断长流、keepalive 保真缺陷群、生命周期泄漏等；含修复分派与主动跳过项基线 [[review-findings]]
 - [disconnect-billing-protection](memory/2026-08-30-disconnect-billing.md) — 客户端断开即中止上游请求的三层机制（计费保护）；流中断 mock 须用 chunked 半截的教训 [[disconnect-billing-protection]] [[review-findings]]
 - [daemon-model](memory/2026-08-30-daemon-model.md) — 守护进程运行模型（alpha.3）：后台启动+命名管道 IPC（不占代理端口铁律）+status/stop 多实例；start 挂起之谜已解（句柄泄漏，b31461c） [[daemon-model]] [[review-findings]]
@@ -27,7 +27,7 @@
 - [仅转发模式](memory/2026-09-14-forward-only.md) — forward_only（alpha.12）：放弃重试/缓冲/心跳换真流式直通（可信上游的显式取舍），config.toml + settings.json 分层；分支点/流式/透传与「不得 unwrap」消费点约束 [[forward-only]] [[alias-settings]] [[disconnect-billing-protection]]
 - [压缩体检查盲区](memory/2026-09-14-compressed-body-inspection.md) — 用户实测：Cloudflare 的 brotli 404 页在日志里只剩 hex；根因是检查路径跑在压缩字节上，连带 is_error_body / is_stream_error_body 静默失效（200+error JSON 不重试）；修法=检查解一份副本、转发不解码；mock 不压缩是 220 项全绿仍漏掉此 bug 的原因；附测试守护泄漏锁 exe 的现场 [[log-mojibake]] [[ci-unix-blindspot]]
 - [受限重试路径](memory/2026-09-20-bounded-retry-paths.md) — compact 事故（镜像上游不实现 count_tokens，确定性 404 被无限重试挂死）；最终设计=bounded_retry_paths 配置项（正则整体匹配 path+query，空=关闭，不内置任何 URL）；含首版硬编码被用户否决的教训：行为差异功能一律配置化、不得内置 URL、查询串不可省略 [[forward-only]]
-- [日志随机命名+IPC 上报](memory/2026-09-22-random-log-names.md) — 用户三点定调：日志随机命名（端口是易变标识做永久命名的反模式）/IPC 是日志地址权威（不拼路径）/log_file 自定义不进 settings 层；清理判据重构为引用集；.restore 结构体格式读侧宽容旧格式 [[random-log-names]] [[daemon-model]] [[bounded-retry-paths]]
+- [日志随机命名+IPC 上报](memory/2026-09-22-random-log-names.md) — 用户三点定调：日志随机命名（端口是易变标识做永久命名的反模式）/IPC 是日志地址权威（不拼路径）/log_file 自定义不进 settings 层；清理判据重构为引用集；.restore 为结构体格式（旧数组格式的兼容已删） [[random-log-names]] [[daemon-model]] [[bounded-retry-paths]]
 - [外部转换器 format](memory/2026-09-23-transform-format.md) — 信封协议（一行 JSON stdin/stdout）+进程池（OJ 多轮式 while 串行，EOF 回收铁律）；两侧失败语义不对称（请求 502 不重试/响应透传）；workspace 三成员体积隔离；aproxy-format 独立发版 format-v* 线；npm skill 包形态变更旧版自愈 [[transform-format]] [[bounded-retry-paths]] [[release-engineering]]
 - [Claude Code 流超时实测](memory/claude-code-stream-watchdogs.md) — 2026-10-04 黑盒实测：Accept: application/json + stream:true；首字节 ~360s / 字节空闲 300s / 事件空闲 600s（注释与 ping 都不算事件，须客户端设 CLAUDE_STREAM_IDLE_TIMEOUT_MS）
 - [共用 target 目录测到旧代码](memory/2026-10-04-shared-target-dir-stale-tests.md) — worktree 与主工作区共用 CARGO_TARGET_DIR 时 cargo 按 mtime 误判新鲜、静默执行旧二进制（实测 73 项冒充 86 项）；各用独立目录，汇报附测试数 [[unix-stress-review]]

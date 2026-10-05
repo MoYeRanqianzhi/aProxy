@@ -23,7 +23,7 @@ metadata:
 - **OnceLock 传递**：随机名在 main.rs 日志初始化时一次性生成写入 `RESOLVED_DAEMON_LOG`，serve_forever 的注册表/恢复记录/轮转共用同一份——再解析一次会生成不同的随机名。
 - **前台实例 log_path 空串**：显式信号，`aproxy logs` 立即报「日志输出在它的控制台」（取代原 5 秒文件等待的间接探测）。
 - **孤儿清理判据重构**（最大隐性代价）：文件名随机化后不再携带归属，判据改为「活实例 log_path ∪ .restore 记录的 log_path」之外的 .log 删除（startup.log 除外、非 .log 保留、空串不参与引用集、比较经 path_match_key 归一防 Windows 分隔符差异误删）。推论：旧端口命名日志升级后按孤儿清理；优雅停止的日志随清；崩溃日志由 .restore 引用保留到恢复成功。
-- **.restore 文件格式改为结构体**（`{args, log_path}`）：**读侧宽容旧格式（纯 args 数组，log_path 空串）**——否则升级混版本窗口会把用户有效恢复记录当损坏删掉；写侧只写新格式。
+- **.restore 文件格式改为结构体**（`{args, log_path}`）。当时读侧宽容旧格式（纯 args 数组）；2026-10-06 删除了这层兼容（535efaa），两个字段都必填，缺字段或数组形态按损坏清理——0.1.0 写的就是结构体，只有预发布版本写过数组。
 - serde default 仅作混版本解析容错，`IPC_PROTO_VERSION` 不 bump（字段级兼容，与 last_activity_secs 先例一致）。
 
 ## 测试基建教训（同日）

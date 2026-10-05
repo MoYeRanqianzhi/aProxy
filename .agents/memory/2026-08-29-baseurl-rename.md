@@ -1,6 +1,6 @@
 ---
 name: baseurl-rename
-description: upstream 术语已更名为 baseurl（CLI）/ base_url（配置字段），旧字段名经 serde alias 兼容
+description: upstream 术语已更名为 baseurl（CLI）/ base_url（配置字段）；旧字段名 upstream_url 的兼容已于 2026-10-06 删除
 metadata:
   type: project
 ---
@@ -8,7 +8,7 @@ metadata:
 2026-08-29 提交 `0964d22`：应用户要求，upstream 术语统一更名为 baseurl。
 
 - CLI：顶层与 `config` 子命令的 `--upstream` → `--baseurl`；顶层同时新增 `--api-key`（修复了此前只有声明未应用的半成品状态）与已有 `--proxy`/`--listen` 对称
-- 配置字段：`upstream_url` → `base_url`，`#[serde(default, alias = "upstream_url")]` 保证旧 `~/.aproxy/config.toml` 无需迁移；保存时写新名
+- 配置字段：`upstream_url` → `base_url`。当时用 serde alias 兼容旧名；2026-10-06 按用户「0.1.0 才是第一版、不兼容更早版本」删除了该 alias（535efaa），开发线只认 `base_url`，用旧名的配置启动时报 base_url 为空
 - 顶层覆盖参数族现为：`--baseurl`/`--listen`/`--proxy`/`--api-key`（均仅本次运行生效，不写配置）
 
 同日实机验证（hub.oaifree.com，OpenAI 风格中转）：

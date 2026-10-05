@@ -150,10 +150,12 @@ JSON 对象顶层 `"stream": true`，磁盘溢写的大请求体同样只看顶�
 没有保活通道的请求（`"stream": false`、`forward_only`、间隔为 0）沿用首轮快速
 路径 + `proxy_without_keepalive`：成功后一次性回放，期间不向客户端写任何字节。
 
-已提交的响应等待 ≥590 秒后客户端断开时，守护日志会 warn 一条
-`CLAUDE_STREAM_IDLE_TIMEOUT_MS` 提示：Claude Code 的事件级空闲超时（默认 600s）
-重置不了——注释与 ping 都不算事件（见 `.agents/memory/claude-code-stream-watchdogs.md`
-的黑盒实测）。这只是日志文案，行为对任何客户端都一样。
+客户端在「只收到心跳」的等待中（已提交、尚未写出任何上游真实字节）等了至少
+60 秒才断开时，守护日志会 warn 一条提示：请检查客户端的流空闲超时，并带上已等
+秒数。不少 agent 客户端按 SSE 事件计时（Claude Code 600s、Codex 300s、Qwen Code
+240s），注释与 ping 都不算事件，重置不了它（见 `.agents/memory/claude-code-stream-watchdogs.md`
+与 `codex-stream-idle-timeout` 的黑盒实测）。提示不点名客户端，行为对任何客户端
+都一样；开始回放之后的断开、以及 60 秒以内的断开（多为主动取消）不提示。
 
 重试退避：前 3 次零延迟，第 4 次起 5s→10s→20s→…封顶 `max_retry_backoff_secs`
 （默认 320s），无限重试。客户端断开立即中止上游请求并停止重试（计费保护）。

@@ -4,6 +4,16 @@
 `0.1.0-alpha.*` 各预发布版本的行为差异记录在 aproxy-cli skill 的
 `.claude/skills/aproxy-cli/references/latest/compatibility.md`。
 
+## [Unreleased]
+
+### 变更
+
+- **断开提示覆盖所有客户端**：客户端在「只收到心跳」的等待中（响应已提交、尚未收到任何上游真实字节）等了至少 60 秒才断开时，日志提示检查客户端的流空闲超时，并带上已等秒数。原来只在等满 590 秒后提示 Claude Code 的 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`，Codex（默认 300 秒）、Qwen Code（240 秒）到点断开时没有任何提示。
+
+### 修复
+
+- 客户端上传大请求体（超过 1 MiB、已溢写到磁盘）途中断开时，`req-*.spooltmp` 临时文件不再残留到下次启动。
+
 ## [0.1.0] - 2026-10-04
 
 0.1.0 是首个稳定版，在 `0.1.0-alpha.17` 的基础上收口。

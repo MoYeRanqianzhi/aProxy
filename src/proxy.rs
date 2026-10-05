@@ -1801,11 +1801,13 @@ async fn proxy_without_keepalive(
 /// 心跳：SSE 注释行，合法 SSE 客户端按规范忽略
 const HEARTBEAT: &[u8] = b": keepalive\n\n";
 
-/// 长等待断开提示的阈值：已提交的响应等待这么久之后客户端断开，多半是客户端
-/// 自己的「事件级空闲」看门狗到点——Claude Code 默认 600s，且 aProxy 的注释心跳
-/// 与 SSE ping 都不算事件、重置不了它（2026-10-04 黑盒实测）。取 590 而非 600：
-/// 计时起点（提交时刻）与客户端的起点有差，再留些调度余量，宁可多提示一次。
-const LONG_WAIT_HINT: Duration = Duration::from_secs(590);
+/// 「只收到心跳的等待中断开」提示的下限：客户端在已提交、但还没收到任何上游
+/// 真实字节的响应上等了至少这么久才断开，多半是它自己的流空闲超时到点——不少
+/// agent 客户端按 SSE **事件**计时，而注释心跳在 SSE 解析层就被丢弃、重置不了它
+/// （Claude Code 600s、Codex 300s、Qwen Code 240s，前两者黑盒实测）。下限只为
+/// 滤掉开头几十秒内的主动取消；已知的事件级超时都远高于它，各客户端到点断开时
+/// 都能提示到，而不像旧阈值（590s）那样只覆盖 Claude Code 一家。
+const HEARTBEAT_ONLY_HINT_MIN: Duration = Duration::from_secs(60);
 
 /// 保活通道的响应出口——「提交点」状态机的两个状态：
 /// 尚未向客户端写出任何字节（Pending）→ 响应头已发出（Committed）。
@@ -1824,8 +1826,12 @@ enum KeepaliveSink {
         tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
         /// 客户端断开信号：哨兵（`ClientGoneGuard`）随响应 Body 被 hyper drop 时置位
         gone_rx: tokio::sync::watch::Receiver<bool>,
-        /// 提交时刻：长等待断开提示的计时起点（客户端从这一刻起开始等事件）
+        /// 提交时刻：断开提示的计时起点（客户端从这一刻起开始等事件）
         at: tokio::time::Instant,
+        /// 至今只发过响应头与心跳、还没写出任何上游真实字节（回放 / 终态 error
+        /// 事件都算真实字节）。只有这种等待中的断开才可能是客户端的流空闲超时
+        /// 到点，断开提示据此判定
+        heartbeats_only: bool,
     },
 }
 
@@ -1884,6 +1890,7 @@ impl KeepaliveSink {
             tx,
             gone_rx,
             at: tokio::time::Instant::now(),
+            heartbeats_only: true,
         };
         true
     }
@@ -1919,9 +1926,16 @@ impl KeepaliveSink {
 
     /// 往已提交的响应体里写一块（成功回放 / 终态 error 事件）。
     /// false = 客户端已断开（或尚未提交——调用方保证只在提交后调用）。
-    async fn send(&self, chunk: Result<Bytes, std::io::Error>) -> bool {
+    async fn send(&mut self, chunk: Result<Bytes, std::io::Error>) -> bool {
         match self {
-            Self::Committed { tx, .. } => tx.send(chunk).await.is_ok(),
+            Self::Committed {
+                tx,
+                heartbeats_only,
+                ..
+            } => {
+                *heartbeats_only = false;
+                tx.send(chunk).await.is_ok()
+            }
             Self::Pending { .. } => false,
         }
     }
@@ -1952,29 +1966,36 @@ impl KeepaliveSink {
         }
     }
 
-    /// 客户端断开的日志（含长等待提示，见 `log_client_gone_after`）
+    /// 客户端断开的日志（含流空闲超时提示，见 `log_client_gone_after`）
     fn log_client_gone(&self, during: &str) {
-        let waited = match self {
-            Self::Committed { at, .. } => Some(at.elapsed()),
-            Self::Pending { .. } => None,
+        let heartbeat_only_wait = match self {
+            Self::Committed {
+                at,
+                heartbeats_only: true,
+                ..
+            } => Some(at.elapsed()),
+            _ => None,
         };
-        log_client_gone_after(during, waited);
+        log_client_gone_after(during, heartbeat_only_wait);
     }
 }
 
-/// 客户端断开的日志；`waited` = 已提交的响应等了多久（None = 尚未提交）。等了
-/// 很久（≥ `LONG_WAIT_HINT`）时追加客户端配置提示。只是日志文案：行为对任何
-/// 客户端都一样（断开即中止上游），不做客户端特判。
-fn log_client_gone_after(during: &str, waited: Option<Duration>) {
+/// 客户端断开的日志。`heartbeat_only_wait` = 客户端在「只收到心跳」的状态下
+/// 等了多久（None = 尚未提交，或已经开始收到上游真实字节）；等了至少
+/// `HEARTBEAT_ONLY_HINT_MIN` 时追加一条 warn，提示检查客户端的流空闲超时。
+/// 只是日志文案：行为对任何客户端都一样（断开即中止上游），不点名、不按客户端
+/// 特判——各客户端的具体写法放在用户文档里；等待秒数一并打出，便于用户对照
+/// 自己客户端的超时取值。
+fn log_client_gone_after(during: &str, heartbeat_only_wait: Option<Duration>) {
     tracing::info!(during, "客户端已断开，中止上游请求（保活通道）");
-    if let Some(waited) = waited
-        && waited >= LONG_WAIT_HINT
+    if let Some(waited) = heartbeat_only_wait
+        && waited >= HEARTBEAT_ONLY_HINT_MIN
     {
         tracing::warn!(
             waited_secs = waited.as_secs(),
-            "客户端在已提交的响应上等待约 {} 秒后断开。若客户端是 Claude Code：其事件级空闲看门狗默认 600 秒，\
-             aProxy 的注释心跳无法重置它——请在 Claude Code 的环境变量中设置 CLAUDE_STREAM_IDLE_TIMEOUT_MS\
-             （毫秒，例如 3600000），否则超过 10 分钟的重试期或长生成都会被客户端断开重发",
+            "客户端在只收到心跳的等待中断开（已等约 {} 秒）。若不是主动取消，多半是客户端的流空闲超时到点：\
+             不少客户端按 SSE 事件计时，aProxy 的注释心跳不算事件、重置不了它，超过该超时的重试期或长生成\
+             都会被客户端断开重发。请调大或关闭客户端的流空闲超时，常见客户端的写法见 README「接入 agent 客户端」",
             waited.as_secs()
         );
     }
@@ -3151,7 +3172,7 @@ mod tests {
         ));
     }
 
-    // ---- 长等待断开提示：已提交 ≥590s 后断开才提示 Claude Code 的环境变量 ----
+    // ---- 断开提示：只收到心跳的等待 ≥60s 后断开才提示检查客户端的流空闲超时 ----
 
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -3166,8 +3187,28 @@ mod tests {
         }
     }
 
+    /// 已提交、提交于 `waited` 之前的保活出口（测试构造用；通道两端随返回值存活）
+    fn committed_sink(
+        waited: Duration,
+        heartbeats_only: bool,
+    ) -> (
+        KeepaliveSink,
+        tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (gone_tx, gone_rx) = tokio::sync::watch::channel(false);
+        let sink = KeepaliveSink::Committed {
+            tx,
+            gone_rx,
+            at: tokio::time::Instant::now() - waited,
+            heartbeats_only,
+        };
+        (sink, rx, gone_tx)
+    }
+
     #[test]
-    fn long_wait_disconnect_logs_client_hint() {
+    fn heartbeat_only_disconnect_logs_generic_client_hint() {
         let logs = CapturedLogs::default();
         let sink_logs = logs.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -3176,27 +3217,57 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
         let text = || String::from_utf8_lossy(&logs.0.lock().unwrap()).to_string();
+        const HINT: &str = "流空闲超时";
 
-        // 尚未提交 / 已提交但等待不足：只记断开，不提示
+        // 尚未提交 / 只收心跳但等待不足 60s（多为主动取消）/ 已开始回放真实字节：
+        // 只记断开，不提示
         KeepaliveSink::Pending {
             resp_tx: None,
             skeleton_due: false,
         }
         .log_client_gone("等待上游");
-        log_client_gone_after("等待上游", Some(Duration::from_secs(300)));
+        let (short, _rx1, _g1) = committed_sink(Duration::from_secs(30), true);
+        short.log_client_gone("等待上游");
+        let (replaying, _rx2, _g2) = committed_sink(Duration::from_secs(900), false);
+        replaying.log_client_gone("回放");
         assert!(text().contains("客户端已断开"), "{}", text());
-        assert!(
-            !text().contains("CLAUDE_STREAM_IDLE_TIMEOUT_MS"),
-            "等待不足 590s 不提示: {}",
-            text()
-        );
+        assert!(!text().contains(HINT), "以上三种都不应提示: {}", text());
 
-        log_client_gone_after("等待上游", Some(Duration::from_secs(600)));
+        // 只收心跳等了 300s（Codex 的默认事件级超时）后断开：提示，且不点名客户端
+        let (codex_like, _rx3, _g3) = committed_sink(Duration::from_secs(300), true);
+        codex_like.log_client_gone("退避等待");
         let out = text();
         assert!(
-            out.contains("CLAUDE_STREAM_IDLE_TIMEOUT_MS") && out.contains("Claude Code"),
-            "等待 ≥590s 后断开应提示客户端配置: {out}"
+            out.contains(HINT) && out.contains("300"),
+            "只收心跳 ≥60s 后断开应提示并带上等待秒数: {out}"
         );
+        assert!(
+            !out.contains("Claude Code") && !out.contains("CLAUDE_STREAM_IDLE_TIMEOUT_MS"),
+            "提示不点名具体客户端: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sink_send_ends_heartbeat_only_state() {
+        // 写出任何真实字节（回放 / 终态 error 事件）后不再是「只收心跳」：此后的
+        // 断开与客户端流空闲超时无关
+        let (mut sink, mut rx, _gone) = committed_sink(Duration::ZERO, true);
+        assert!(
+            sink.send(Ok(Bytes::from_static(
+                b"data: x
+
+"
+            )))
+            .await
+        );
+        assert!(rx.recv().await.is_some());
+        assert!(matches!(
+            sink,
+            KeepaliveSink::Committed {
+                heartbeats_only: false,
+                ..
+            }
+        ));
     }
 
     // ---- 入站 Host 归一：Host 头与配置条目必须归一到同一形态才能比较 ----

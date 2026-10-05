@@ -312,6 +312,7 @@ listen_addr = "127.0.0.1:12345"          # local listener
 # api_key = "sk-..."                     # quick auth (overrides Authorization: Bearer)
 # keepalive_interval_secs = 15           # SSE heartbeat interval, 0 disables keepalive
 # keepalive_trigger = "any"              # which requests get keepalive: accept (Accept has SSE) / body_stream (body "stream": true) / any (either, default)
+# keepalive_heartbeat = ": keepalive\n\n" # heartbeat bytes per tick (default SSE comment; e.g. "\n" for clients that choke on comments)
 # proxy = "http://127.0.0.1:7890"        # forward via proxy (socks5 supported)
 # extra_headers / override_headers       # append/override request headers
 # max_retry_backoff_secs = 320           # retry backoff cap (0 = retry instantly)

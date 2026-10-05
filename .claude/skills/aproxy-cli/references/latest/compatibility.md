@@ -53,6 +53,7 @@ does not have. These development-line changes alter what you see or do on 0.1.0:
 | `status` deletes the record of an instance that does not answer even if its process is alive (hung), after which `stop --force` cannot find it; `stop` exits 0 even when a stop was not confirmed | hung instances are listed as unresponsive and `stop --force` reaches them; `stop` exits 1 when a target was not confirmed stopped (commands.md, status and stop) |
 | The watchdog respawns a crashed instance at its next scan, up to `watchdog_heartbeat_secs` (30 s) later | it respawns at once (behaviors.md) |
 | `upstream_url` is accepted as another name for `base_url` | only `base_url` is read; rename the key |
+| `keepalive_heartbeat` is ignored; heartbeats are always `: keepalive` | the heartbeat is configurable (config-toml.md) |
 
 For a version newer than these docs, refresh them: `aproxy install` updates the skill documents in
 `<home>/skills/` together with the binary, and `aproxy install --skills-only` updates only the

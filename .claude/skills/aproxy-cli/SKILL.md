@@ -18,9 +18,10 @@ or flaky upstreams.
   errors, 4xx, 5xx, `200` with an error JSON body, streams that break mid-way. Retries wait
   0, 0, 0, 5, 10, 20 ... seconds, capped at `max_retry_backoff_secs` (default 320), forever.
 - **Heartbeats keep streaming requests alive.** While it retries a streaming request, aProxy sends
-  the client response headers early and then an SSE comment (`: keepalive`) every 15 s. That
-  defeats byte-level timeouts, but SSE parsers drop comments, so a client that times out on
-  *events* (Claude Code, Codex and others) still gives up unless its stream idle timeout is raised.
+  the client response headers early and then a heartbeat, by default the SSE comment
+  `: keepalive`, every 15 s. That defeats byte-level timeouts, but SSE parsers drop comments, so a
+  client that times out on *events* (Claude Code, Codex and others) still gives up unless its
+  stream idle timeout is raised.
   This is the most common integration mistake; see "Connect an agent client" below.
 - **Two deliberate exceptions to infinite retry:** `forward_only = true` streams straight through
   with no buffering and no retries, and paths matched by `bounded_retry_paths` give up after 3

@@ -36,6 +36,9 @@ aproxy 很多配置都可以和 format 搭配，使其实现超高自由度的�
    失败时的安全回退、与「无限重试」核心目标是否冲突。
 
 ## 状态
-- 设计草案，未实现。IPC 整理（见 TODO）优先，之后按 1 → 3 → 2 → 4 的顺序做，每步带测试。
+- 第 1 步（静态 `keepalive_heartbeat`）已实现：校验规则 `config::heartbeat_problem`，心跳字节随
+  `KeepaliveSink` 从 Pending 带进 Committed；单测 `keepalive_heartbeat_default_and_boundary_rule`、
+  集成测试 `keepalive_heartbeat_is_configurable`，`config --show`/`doctor`/启动校验手工核对过。
+- 其余未实现。IPC 整理（见 TODO）优先，之后按 3 → 2 → 4 的顺序做，每步带测试。
 - 待定：`state` 的大小上限；`request_id` 的格式；envelope 协议是否需要版本字段（aproxy-format
   旧版本收到新字段会怎样——serde 默认忽略未知字段，需核实 aproxy-format 是否 deny_unknown_fields）。

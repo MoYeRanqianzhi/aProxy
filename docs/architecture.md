@@ -100,8 +100,9 @@ CLI 定义（cli.rs）与子命令处理（commands/）分离；启动父进程�
 
 ### 保活通道与提交点
 
-缓冲期间客户端什么也收不到，所以保活适用的请求要靠 SSE 注释心跳（`: keepalive`）
-维持连接。**适用判定**（`keepalive_triggered`，在请求转换之前、按客户端视角）：
+缓冲期间客户端什么也收不到，所以保活适用的请求要靠心跳维持连接：默认是 SSE 注释
+（`: keepalive`），`keepalive_heartbeat` 可换成任意字节（aProxy 不认识协议，心跳的形态
+由用户按客户端决定；`heartbeat_problem` 只把关「写完后 SSE 解析器停在事件边界」）。**适用判定**（`keepalive_triggered`，在请求转换之前、按客户端视角）：
 `keepalive_interval_secs` > 0、非 `forward_only`，且按 `keepalive_trigger`
 命中——`accept`（Accept 含 `text/event-stream`，旧判定）/ `body_stream`（请求体
 JSON 对象顶层 `"stream": true`，磁盘溢写的大请求体同样只看顶层键）/ `any`（任一，
@@ -221,7 +222,7 @@ magic number，连「这是压缩体」都认不出；2026-09-14 的 Cloudflare 
   Drop 天然成立。
 - **不进入的路径**：重试循环、SSE 保活骨架、错误内容拦截
   （`is_error_body`/`is_stream_error_body`）、spool、`keepalive_trigger` 判定。
-- **本模式下不生效**：`disk_cache`/`spool_limit_mb`/`keepalive_interval_secs`/`keepalive_trigger`/
+- **本模式下不生效**：`disk_cache`/`spool_limit_mb`/`keepalive_interval_secs`/`keepalive_trigger`/`keepalive_heartbeat`/
   `max_retry_backoff_secs`（磁盘 spool 完全不参与）。
 - 消费方一律走 `Config::forward_only_enabled()`（`unwrap_or(DEFAULT_FORWARD_ONLY)`），
   **不得 `unwrap()`**——doctor 的 `parse_config_file`、`find::discover` 与大量

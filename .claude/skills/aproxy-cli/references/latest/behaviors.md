@@ -111,7 +111,9 @@ for endpoints a particular upstream never supports; troubleshooting.md has the C
 
 A streaming request can spend minutes in retries before any upstream byte is usable. Keepalive keeps
 the client's connection visibly alive meanwhile: aProxy commits a response head early and then writes
-SSE comment lines, `: keepalive`, which SSE parsers discard by specification.
+a heartbeat every `keepalive_interval_secs`. By default that is the SSE comment line `: keepalive`,
+which SSE parsers discard by specification; `keepalive_heartbeat` replaces it with any bytes that end
+at an event boundary (config-toml.md).
 
 ### Which requests get heartbeats
 

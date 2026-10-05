@@ -906,6 +906,48 @@ async fn keepalive_during_retry() {
     );
 }
 
+#[tokio::test]
+async fn keepalive_heartbeat_is_configurable() {
+    // 心跳字节按 keepalive_heartbeat 原样写出（这里是一个完整的 ping 事件），
+    // 默认注释不再出现；回放的上游事件紧跟在心跳之后、各自独立
+    let upstream = Router::new().route(
+        "/v1/slow",
+        any(|| async {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            (StatusCode::OK, headers, "data: {\"ok\":true}\n\n").into_response()
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.keepalive_interval_secs = 1;
+    cfg.keepalive_heartbeat = Some("event: ping\ndata: {}\n\n".to_string());
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(cfg))).await;
+
+    let body = local_client()
+        .get(format!("{}/v1/slow", proxy_url))
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.starts_with("event: ping\ndata: {}\n\n"),
+        "提交骨架后的首个心跳应是配置的字节: {body:?}"
+    );
+    assert!(!body.contains(": keepalive"), "默认注释不应出现: {body:?}");
+    assert!(
+        body.ends_with("\n\ndata: {\"ok\":true}\n\n"),
+        "上游事件应在心跳之后独立回放: {body:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 9. 头覆盖：api_key 快捷 + override/extra
 // ---------------------------------------------------------------------------

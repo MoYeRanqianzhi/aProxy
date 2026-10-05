@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+### 新增
+
+- **可自定义心跳**：config.toml 的 `keepalive_heartbeat` 指定每个保活间隔写给客户端的字节，默认仍是 SSE 注释 `: keepalive`。aProxy 不认识协议，心跳的形态由用户按客户端决定，例如解析器容不下注释的客户端可改成空行 `"\n"`。启动与 `aproxy doctor` 校验它写完后客户端的 SSE 解析器停在事件边界（非空、以换行结尾、含 `event:`/`data:` 等字段行时以空行收尾），否则心跳会和回放的第一个上游事件拼在一起。
+
 ### 变更
 
 - **skill 文档改为英文并重写**：aproxy-cli 与 aproxy-format 两个 skill 按 skill-creator 标准重写，面向操作 aProxy 的 agent。每条事实都对照源码核实；程序输出的中文原文照录，并附英文释义。aproxy-cli 新增 `clients.md`（接入各 agent 客户端）与 `troubleshooting.md`（症状 → 原因 → 处理），`compatibility.md` 只讲版本判定以及 0.1.0 与开发线的差异。

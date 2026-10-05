@@ -6,6 +6,7 @@
 //! - `override_headers`：无条件覆盖（用于非 Bearer 鉴权或额外头）
 //! - `keepalive_interval_secs`：流式重试期间的保活心跳间隔，0 表示关闭
 //! - `keepalive_trigger`：哪些请求走保活通道（看 Accept 头 / 请求体 stream:true / 任一）
+//! - `keepalive_heartbeat`：每个保活间隔写给客户端的心跳字节（默认 SSE 注释）
 //! - `proxy`：上游请求经配置的代理转发（与常见代理配置一致，支持 http/https/socks5，
 //!   可在 URL 内嵌 user:pass，也可用 `proxy_username`/`proxy_password` 单独指定）；
 //!   未配置时保留 reqwest 默认的系统代理（读取 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 环境变量）
@@ -13,6 +14,37 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+/// 心跳的内置默认值：SSE 注释，合法 SSE 客户端按规范忽略。
+pub const DEFAULT_KEEPALIVE_HEARTBEAT: &str = ": keepalive\n\n";
+
+/// 心跳写完后客户端 SSE 解析器必须停在事件边界，否则心跳会和随后回放的
+/// 第一个上游事件拼在一起（例如心跳 `data: x\n` 没有空行收尾，解析器会把它
+/// 并进下一个事件的 data）。SSE 的行尾可以是 CRLF、LF 或单独的 CR。规则：
+/// - 非空（不想要心跳字节请把 keepalive_interval_secs 设为 0）；
+/// - 以行尾结束（半行会粘到回放的第一行上）；
+/// - 含字段行（不以 `:` 开头的非空行，如 `event:`、`data:`）时以空行收尾，
+///   让解析器把这个事件派发掉、清空缓冲。只含注释行与空行时无此要求。
+///
+/// 返回违反的规则（人类可读），合法时 None。
+pub fn heartbeat_problem(hb: &str) -> Option<&'static str> {
+    if hb.is_empty() {
+        return Some("不能为空（不需要心跳时把 keepalive_interval_secs 设为 0）");
+    }
+    let normalized = hb.replace("\r\n", "\n").replace('\r', "\n");
+    if !normalized.ends_with('\n') {
+        return Some("必须以换行结尾，否则半行会和回放的第一行拼在一起");
+    }
+    let has_field = normalized
+        .split('\n')
+        .any(|line| !line.is_empty() && !line.starts_with(':'));
+    if has_field && !normalized.ends_with("\n\n") {
+        return Some(
+            "含 event:/data: 等字段行时必须以空行结尾，否则会和回放的第一个事件拼成一个事件",
+        );
+    }
+    None
+}
 
 /// 请求体大小上限的内置默认值（MB）。settings.json 与 config.toml 均可覆盖
 /// （toml > settings > 本值）。
@@ -192,6 +224,14 @@ pub struct Config {
     /// 存原始字符串、由 `KeepaliveTrigger::parse` 解释，非法值 validate() 报错。
     #[serde(default)]
     pub keepalive_trigger: Option<String>,
+    /// 保活心跳：每个 keepalive 间隔原样写给客户端的字节。未设置时为 SSE 注释
+    /// `": keepalive\n\n"`（合法 SSE 客户端按规范忽略）。aProxy 不认识任何协议，
+    /// 心跳该长什么样由用户按客户端决定：例如某些客户端的 SSE 解析器遇注释会
+    /// 出错、只容得下空行（`"\n"`）；也可以写成一个完整事件。validate() 只把关
+    /// 一条与协议无关的规则：写完心跳后客户端的 SSE 解析器必须停在事件边界，
+    /// 否则它会和随后回放的第一个上游事件拼成一个事件（见 `heartbeat_problem`）。
+    #[serde(default)]
+    pub keepalive_heartbeat: Option<String>,
     /// 上游代理 URL，例如 `http://127.0.0.1:7890`、`socks5://user:pass@127.0.0.1:7890`。
     /// 未设置时使用系统/环境变量代理。
     #[serde(default)]
@@ -373,6 +413,7 @@ impl Default for Config {
             override_headers: HashMap::new(),
             keepalive_interval_secs: default_keepalive_secs(),
             keepalive_trigger: None,
+            keepalive_heartbeat: None,
             proxy: None,
             proxy_username: None,
             proxy_password: None,
@@ -496,6 +537,11 @@ impl Config {
                 "keepalive_trigger 取值无效 \"{t}\"：只能是 \"accept\"、\"body_stream\" 或 \"any\""
             ));
         }
+        if let Some(hb) = &self.keepalive_heartbeat
+            && let Some(why) = heartbeat_problem(hb)
+        {
+            return Err(format!("keepalive_heartbeat 无效：{why}"));
+        }
         // 转换器：command 非空；persistent 模式 pool_max >= 1；与 forward_only
         // 互斥（后者不缓冲请求体，转换器需要全量 body——两者同开是配置矛盾）
         for (name, t) in [
@@ -581,6 +627,15 @@ impl Config {
             .as_deref()
             .and_then(KeepaliveTrigger::parse)
             .unwrap_or(DEFAULT_KEEPALIVE_TRIGGER)
+    }
+
+    /// 心跳字节生效值：toml 显式值，否则内置的 SSE 注释。非法写法在 validate()
+    /// 拦截，消费点直接取用。
+    pub fn keepalive_heartbeat(&self) -> &[u8] {
+        self.keepalive_heartbeat
+            .as_deref()
+            .unwrap_or(DEFAULT_KEEPALIVE_HEARTBEAT)
+            .as_bytes()
     }
 
     /// 请求体大小上限（字节）。max_body_mb 已在启动时注入 settings 值（toml
@@ -1158,6 +1213,40 @@ mod tests {
             !legacy.forward_only_enabled(),
             "None 回退内置关闭（默认不得启用仅转发模式）"
         );
+    }
+
+    #[test]
+    fn keepalive_heartbeat_default_and_boundary_rule() {
+        let base = || Config {
+            base_url: "https://x.example.com".into(),
+            ..Config::default()
+        };
+        assert_eq!(base().keepalive_heartbeat(), b": keepalive\n\n");
+        // 合法：空行、注释、CRLF 收尾、完整事件
+        for ok in [
+            "\n",
+            ": ping\n",
+            ": a\r\n\r\n",
+            "event: ping\ndata: {}\n\n",
+            "data: x\r\n\r\n",
+        ] {
+            let cfg = Config {
+                keepalive_heartbeat: Some(ok.to_string()),
+                ..base()
+            };
+            assert!(cfg.validate().is_ok(), "{ok:?} 应合法");
+            assert_eq!(cfg.keepalive_heartbeat(), ok.as_bytes());
+        }
+        // 非法：空、半行、字段行缺空行收尾（会和回放的第一个事件拼在一起）
+        for bad in ["", ": keepalive", "data: x\n", "event: ping\ndata: {}\n"] {
+            let err = Config {
+                keepalive_heartbeat: Some(bad.to_string()),
+                ..base()
+            }
+            .validate()
+            .unwrap_err();
+            assert!(err.contains("keepalive_heartbeat"), "{bad:?}: {err}");
+        }
     }
 
     #[test]

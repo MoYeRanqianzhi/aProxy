@@ -1860,9 +1860,6 @@ async fn proxy_without_keepalive(
     }
 }
 
-/// 心跳：SSE 注释行，合法 SSE 客户端按规范忽略
-const HEARTBEAT: &[u8] = b": keepalive\n\n";
-
 /// 「只收到心跳的等待中断开」提示的下限：客户端在已提交、但还没收到任何上游
 /// 真实字节的响应上等了至少这么久才断开，多半是它自己的流空闲超时到点——不少
 /// agent 客户端按 SSE **事件**计时，而注释心跳在 SSE 解析层就被丢弃、重置不了它
@@ -1883,6 +1880,9 @@ enum KeepaliveSink {
         /// 暂停跳过了（见 `drive`）。暂停只限那一次尝试：它若需要重试，下一段
         /// 驱动一开始就补提交，绝不把「首字节 ≤ 一个保活间隔」再往后拖一整拍
         skeleton_due: bool,
+        /// 每拍写出的心跳字节（config 的 keepalive_heartbeat 生效值），提交时
+        /// 带进 Committed
+        heartbeat: Bytes,
     },
     Committed {
         tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
@@ -1894,6 +1894,7 @@ enum KeepaliveSink {
         /// 事件都算真实字节）。只有这种等待中的断开才可能是客户端的流空闲超时
         /// 到点，断开提示据此判定
         heartbeats_only: bool,
+        heartbeat: Bytes,
     },
 }
 
@@ -1922,9 +1923,15 @@ impl KeepaliveSink {
     /// 返回 false = 客户端已断开（handler 已被 drop，没人接收这个 Response）。
     /// 已提交时调用是空操作（返回 true）。
     fn commit(&mut self, status: StatusCode, headers: HeaderMap) -> bool {
-        let Self::Pending { resp_tx: slot, .. } = self else {
+        let Self::Pending {
+            resp_tx: slot,
+            heartbeat,
+            ..
+        } = self
+        else {
             return true;
         };
+        let heartbeat = heartbeat.clone();
         let Some(resp_tx) = slot.take() else {
             return false;
         };
@@ -1953,6 +1960,7 @@ impl KeepaliveSink {
             gone_rx,
             at: tokio::time::Instant::now(),
             heartbeats_only: true,
+            heartbeat,
         };
         true
     }
@@ -1978,8 +1986,8 @@ impl KeepaliveSink {
     /// false = 客户端已断开（接收端随响应 Body 销毁）。
     fn heartbeat(&self) -> bool {
         match self {
-            Self::Committed { tx, .. } => !matches!(
-                tx.try_send(Ok(Bytes::from_static(HEARTBEAT))),
+            Self::Committed { tx, heartbeat, .. } => !matches!(
+                tx.try_send(Ok(heartbeat.clone())),
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
             ),
             Self::Pending { .. } => true,
@@ -2343,6 +2351,7 @@ async fn proxy_with_keepalive(
         let mut sink = KeepaliveSink::Pending {
             resp_tx: Some(resp_tx),
             skeleton_due: false,
+            heartbeat: Bytes::copy_from_slice(state.config.keepalive_heartbeat()),
         };
         // 整个请求共用一个节拍，首个 tick 在请求开始一个间隔之后：它既是「一个
         // 间隔内仍无可提交结果就提交骨架」的计时器，也是提交后的心跳节拍。
@@ -3329,6 +3338,7 @@ mod tests {
             gone_rx,
             at: tokio::time::Instant::now() - waited,
             heartbeats_only,
+            heartbeat: Bytes::from_static(b": keepalive\n\n"),
         };
         (sink, rx, gone_tx)
     }
@@ -3350,6 +3360,7 @@ mod tests {
         KeepaliveSink::Pending {
             resp_tx: None,
             skeleton_due: false,
+            heartbeat: Bytes::new(),
         }
         .log_client_gone("等待上游");
         let (short, _rx1, _g1) = committed_sink(Duration::from_secs(30), true);

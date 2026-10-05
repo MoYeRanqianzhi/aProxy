@@ -209,6 +209,7 @@ listen_addr = "127.0.0.1:12345"          # 本地监听
 # api_key = "sk-..."                     # 快捷鉴权（等效覆盖 Authorization: Bearer）
 # keepalive_interval_secs = 15           # SSE 心跳间隔，0 关闭保活
 # keepalive_trigger = "any"              # 哪些请求走保活：accept（Accept 含 SSE）/ body_stream（请求体 "stream": true）/ any（任一，默认）
+# keepalive_heartbeat = ": keepalive\n\n" # 每拍写给客户端的心跳字节（默认 SSE 注释；如客户端容不下注释可改成 "\n"）
 # proxy = "http://127.0.0.1:7890"        # 上游经代理转发（支持 socks5，可配用户名密码）
 # extra_headers / override_headers       # 追加/覆盖请求头
 # max_retry_backoff_secs = 320           # 重试退避封顶（0 = 所有重试零延迟）

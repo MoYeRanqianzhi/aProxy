@@ -18,7 +18,7 @@ behaviors.md; this file keeps only what you need to pick a value.
   [max_retry_backoff_secs](#max_retry_backoff_secs) ·
   [connect_timeout_secs / read_timeout_secs](#connect_timeout_secs--read_timeout_secs) ·
   [bounded_retry_paths](#bounded_retry_paths) ·
-  [keepalive_interval_secs / keepalive_trigger](#keepalive_interval_secs--keepalive_trigger) ·
+  [keepalive_interval_secs / keepalive_trigger / keepalive_heartbeat](#keepalive_interval_secs--keepalive_trigger--keepalive_heartbeat) ·
   [max_body_mb](#max_body_mb) · [spool_limit_mb](#spool_limit_mb) · [disk_cache](#disk_cache) ·
   [forward_only](#forward_only) · [allowed_hosts / allowed_origins](#allowed_hosts--allowed_origins) ·
   [log_file](#log_file) · [request_transform / response_transform](#request_transform--response_transform)
@@ -91,6 +91,7 @@ default, whose built-in value is shown (see [Precedence](#precedence)). Integers
 | `bounded_retry_paths` | array of regex strings | settings.json, `[]` | empty = off |
 | `keepalive_interval_secs` | integer | `15` | 0 = keepalive off |
 | `keepalive_trigger` | `"accept"` \| `"body_stream"` \| `"any"` | settings.json, `"any"` | |
+| `keepalive_heartbeat` | string | `": keepalive\n\n"` | must end at an SSE event boundary |
 | `max_body_mb` | integer | settings.json, `128` | 0 = no limit |
 | `spool_limit_mb` | integer | `256` | 0 is treated as 1 |
 | `disk_cache` | boolean | settings.json, `true` | |
@@ -262,12 +263,12 @@ the last upstream response through"); look for it to confirm a pattern matches. 
 had already been sent to the client, the request ends with an SSE `event: error` instead of the
 upstream status (behaviors.md, "Keepalive heartbeats").
 
-### keepalive_interval_secs / keepalive_trigger
+### keepalive_interval_secs / keepalive_trigger / keepalive_heartbeat
 
 While aProxy waits for and retries a request that qualifies for keepalive, it sends the client
-response headers early and then an SSE comment (`: keepalive`) every `keepalive_interval_secs`; the
-body is still buffered and replayed only after a successful attempt (behaviors.md, "Keepalive
-heartbeats").
+response headers early and then a heartbeat (by default the SSE comment `: keepalive`) every
+`keepalive_interval_secs`; the body is still buffered and replayed only after a successful attempt
+(behaviors.md, "Keepalive heartbeats").
 
 - `keepalive_interval_secs` (default 15): the heartbeat period, and also how long aProxy waits for
   upstream headers before sending its own. Keep it below the shortest byte-level idle timeout
@@ -288,6 +289,15 @@ API streams NDJSON, for example) and often needs retries: once aProxy has sent S
 retry, a non-SSE body no longer fits the response. Only the three lowercase values are accepted.
 
 - The decision uses what the client sent, before any request transformer.
+- `keepalive_heartbeat` (default `": keepalive\n\n"`): the bytes written on every tick, as they
+  are. aProxy knows no protocol, so pick what the client tolerates: a blank line (`"\n"`) for a
+  client whose SSE parser chokes on comments, or a whole event such as
+  `"event: ping\ndata: {}\n\n"`. A heartbeat does not reset an event-level idle timeout unless the
+  client counts it as an event; Claude Code drops both comments and `ping` events, so raise its
+  timeout instead (clients.md). The value must leave the client's SSE parser at an event boundary,
+  or the heartbeat merges with the first replayed event: it must be non-empty, end with a line
+  break, and, if it has any field line (`event:`, `data:` and so on), end with a blank line.
+  `aproxy config --show` prints it with `\n` escapes. No CLI flag.
 - No keepalive for requests that do not qualify (notably `"stream": false`: the client's own
   timeout must cover the whole generation), for `forward_only` instances, and when
   `keepalive_interval_secs = 0`.
@@ -333,7 +343,7 @@ keep retrying.
 
 - Still applied: `api_key`, `extra_headers`, `override_headers`, the inbound checks, and
   `max_body_mb` (counted while streaming).
-- Ignored: `disk_cache`, `spool_limit_mb`, `keepalive_interval_secs`, `keepalive_trigger`,
+- Ignored: `disk_cache`, `spool_limit_mb`, `keepalive_interval_secs`, `keepalive_trigger`, `keepalive_heartbeat`,
   `max_retry_backoff_secs`, `bounded_retry_paths`.
 - Cannot be combined with `request_transform` or `response_transform`, which need the whole body;
   start fails, also when `forward_only` comes from settings.json.
@@ -472,6 +482,7 @@ came from settings.json, the message adds `（该值来自 settings.json 的 …
 | `配置了 proxy_username/proxy_password 但未配置 proxy URL` | Credentials without `proxy`. |
 | `bounded_retry_paths 含非法正则` | "contains an invalid regex"; the pattern is quoted. |
 | `keepalive_trigger 取值无效` | "invalid value": use `accept`, `body_stream` or `any`. |
+| `keepalive_heartbeat 无效：…` | "invalid": the reason follows, one of: empty (set `keepalive_interval_secs = 0` instead), not ending with a line break, or field lines without a closing blank line. |
 | `request_transform 的 pool_max 必须 >= 1` (or `response_transform …`) | `pool_max = 0` with `mode = "persistent"`. |
 | `forward_only 与外部转换器互斥` | "forward_only and external transformers are mutually exclusive": keep one. |
 

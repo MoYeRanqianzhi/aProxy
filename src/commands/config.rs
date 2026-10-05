@@ -272,6 +272,14 @@ pub(crate) fn handle_config_cmd(
                 "keepalive_trigger       = （未在 toml 设置，运行时取 settings.json 全局默认）"
             ),
         }
+        // 心跳字节通常含换行：按字符串字面量形式（{:?}）打印，换行显示为 `\n`，
+        // 与 toml 里的写法一一对应
+        match &cfg.keepalive_heartbeat {
+            Some(hb) => println!("keepalive_heartbeat     = {hb:?}"),
+            None => println!(
+                "keepalive_heartbeat     = （未设置，用内置的 \": keepalive\\n\\n\" 注释）"
+            ),
+        }
         // 0 表示所有重试零延迟，语义特殊，提示出来
         if cfg.max_retry_backoff_secs == 0 {
             println!("max_retry_backoff_secs = 0（所有重试零延迟）");

@@ -388,6 +388,7 @@ pub async fn serve_ipc(
 
 /// 在给定端点名上创建并提供控制服务（0.1.0 兼容管道与测试用）。只有创建
 /// 失败会返回。
+#[cfg(any(windows, test))]
 pub(crate) async fn serve_endpoint(
     endpoint: String,
     on_shutdown: tokio::sync::watch::Sender<bool>,

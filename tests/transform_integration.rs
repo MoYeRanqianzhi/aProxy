@@ -488,6 +488,68 @@ async fn request_transform_large_body_disk_path_reaches_upstream() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn transform_stages_share_request_id_and_state() {
+    // 请求转换回信的 state 经 aProxy 转交给响应转换（两者是不同进程）；两阶段
+    // 收到同一个 request_id 与各自的 stage。保活通道与非保活通道各走一次
+    isolate_env_proxy();
+    let app = Router::new().fallback(|req: Request| async move {
+        let seen = req
+            .headers()
+            .get("x-stage-seen")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        (
+            StatusCode::OK,
+            [
+                ("content-type", "text/event-stream".to_string()),
+                ("x-upstream-saw", seen),
+            ],
+            "data: {}\n\n",
+        )
+            .into_response()
+    });
+    let (upstream, _jh) = bind_router(app).await;
+    let mut cfg = proxy_config_for(&upstream);
+    cfg.request_transform = Some(transform_config("stateful", TransformMode::Persistent));
+    cfg.response_transform = Some(transform_config("stateful", TransformMode::Spawn));
+    let (proxy, _pj) = start_proxy(cfg).await;
+
+    let mut ids = Vec::new();
+    for accept in ["application/json", "text/event-stream"] {
+        let resp = local_client()
+            .post(format!("{proxy}/v1/messages"))
+            .header("accept", accept)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+        let upstream_saw = header("x-upstream-saw");
+        let id = upstream_saw
+            .strip_prefix("request|")
+            .and_then(|rest| rest.strip_suffix("|-"))
+            .unwrap_or_else(|| panic!("请求阶段应收到 stage=request、尚无 state: {upstream_saw:?}"))
+            .to_string();
+        assert!(id.parse::<u64>().is_ok(), "request_id 应是请求序号: {id:?}");
+        assert_eq!(
+            header("x-stage-seen"),
+            format!("response|{id}|from-request-{id}"),
+            "响应阶段应收到同一 request_id 与请求阶段留下的 state（accept={accept}）"
+        );
+        ids.push(id);
+    }
+    assert_ne!(ids[0], ids[1], "不同请求的 request_id 不同");
+}
+
+#[tokio::test]
 async fn response_transform_rewrites_body() {
     isolate_env_proxy();
     let (upstream, _count, _jh) = fixed_upstream(StatusCode::OK, "plain-payload").await;

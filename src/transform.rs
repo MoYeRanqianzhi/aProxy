@@ -109,6 +109,9 @@ impl std::fmt::Display for TransformError {
 
 /// 一次「写一行、读一行」往返的结局。worker 的所有权在往返内部处置完毕
 /// （归还空闲表或剔除），调用方只需按结局决定是否换 worker 重试。
+// Done 携带整个信封、比 DeadBeforeOutput 大得多：本枚举每次转换只按值返回
+// 一次、随即被拆开，装箱省下的栈空间不值一次堆分配，保持扁平匹配
+#[allow(clippy::large_enum_variant)]
 enum Exchange {
     /// 往返完成：成功，或不应重试的失败（format 自报 error、协议错误、超时、
     /// 读到部分输出后才出错）。
@@ -603,6 +606,26 @@ pub(crate) struct TransformedRequest {
     pub url: String,
     pub headers: axum::http::HeaderMap,
     pub body: RequestBody,
+    /// format 回信里的跨阶段状态；None = 回信未带，调用方保留原值
+    pub state: Option<String>,
+}
+
+/// 一个客户端请求交给各转换阶段的标识与跨阶段状态（见信封的 `request_id` /
+/// `state`）。随请求在代理通道里传递：请求转换回信的 state 替换这里的值，
+/// 响应转换收到的就是它。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExchangeCtx {
+    pub request_id: String,
+    pub state: Option<String>,
+}
+
+impl ExchangeCtx {
+    /// 填信封的阶段字段
+    fn stamp(&self, env: &mut TransformEnvelope, stage: &str) {
+        env.stage = Some(stage.to_string());
+        env.request_id = Some(self.request_id.clone());
+        env.state = self.state.clone();
+    }
 }
 
 /// 请求侧转换：body 缓冲完成后交给 format 改写。转换**一次**，产物被重试
@@ -612,6 +635,7 @@ pub(crate) struct TransformedRequest {
 /// 落盘成新 Disk 形态（内存与负载解耦的语义保持）。
 pub(crate) async fn transform_request(
     pool: &Arc<TransformPool>,
+    ctx: &ExchangeCtx,
     method: &axum::http::Method,
     url: &str,
     headers: &axum::http::HeaderMap,
@@ -631,6 +655,7 @@ pub(crate) async fn transform_request(
     env.url = Some(url.to_string());
     env.headers = headers_to_btreemap(headers);
     env.extra = pool.cfg.effective_extra().to_string();
+    ctx.stamp(&mut env, "request");
 
     let out = pool.convert(env).await?;
     if let Some(err) = out.error {
@@ -669,6 +694,7 @@ pub(crate) async fn transform_request(
         url: new_url,
         headers: new_headers,
         body: new_body,
+        state: out.state,
     })
 }
 
@@ -688,6 +714,7 @@ pub(crate) struct TransformedResponse {
 /// content-length 由回放路径按新长度回填或由 hyper 按实际字节自行分帧。
 pub(crate) async fn transform_response(
     pool: &Arc<TransformPool>,
+    ctx: &ExchangeCtx,
     upstream_url: &str,
     content_encoding: Option<&str>,
     headers: axum::http::HeaderMap,
@@ -714,11 +741,13 @@ pub(crate) async fn transform_response(
     let feed = decoded.as_deref().unwrap_or(&raw);
 
     let mut env = TransformEnvelope::from_body_bytes(feed);
-    // 响应侧信封 url = 请求侧最终上游地址：多渠道聚合按它反查渠道表
-    // （响应转换器与请求转换器是不同进程，无共享状态——设计铁律）
+    // 响应侧信封 url = 请求侧最终上游地址：多渠道聚合可按它反查渠道表。响应
+    // 转换器与请求转换器是不同进程、无共享内存（设计铁律）；需要请求侧的更多
+    // 信息时由请求转换器写进 state，经 ctx 转交到这里
     env.url = Some(upstream_url.to_string());
     env.headers = headers_to_btreemap(&headers);
     env.extra = pool.cfg.effective_extra().to_string();
+    ctx.stamp(&mut env, "response");
 
     let out = match pool.convert(env).await {
         Ok(o) => o,

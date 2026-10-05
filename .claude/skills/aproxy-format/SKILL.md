@@ -15,9 +15,10 @@ one mechanism is enough for protocol conversion, key rotation and multi-channel 
   the first upstream attempt. Every retry replays the transformed request, so a rotated key stays
   the same across that request's retries and changes only on the next request.
 - `response_transform` runs on the upstream response aProxy has judged successful, just before
-  replaying it to the client. Its envelope `url` is the final upstream URL from the request side;
-  the two transformers are separate processes with no shared memory, so that URL is how a response
-  transformer knows which channel answered.
+  replaying it to the client. Its envelope `url` is the final upstream URL from the request side.
+  The two transformers are separate processes with no shared memory: the URL tells a response
+  transformer which channel answered, and anything else the request side decided can be handed
+  over in the envelope's `state` field (references/protocol.md).
 
 ## First, check whether the official binary already does it
 

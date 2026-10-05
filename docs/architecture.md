@@ -45,7 +45,12 @@ agent 软件 ──HTTP──▶ [代理端口 12345] ──重试循环──�
 - **aproxy**（根包）：代理本体。编译闭包不含 switchyard 等转换库——本体
   体积不受外部转换器功能影响。
 - **aproxy-envelope**：信封契约 crate（一行 JSON 的 serde 类型 + base64
-  携带），aproxy 与 aproxy-format 共同依赖，单源维护防契约漂移。
+  携带），aproxy 与 aproxy-format 共同依赖，单源维护防契约漂移。信封带
+  `stage`（`request`/`response`，字符串而非枚举——新增阶段时旧 format 照样
+  能解析）、`request_id`（实例内第 N 个请求，即 status 的请求计数）与不透明的
+  `state`：请求与响应转换器是不同进程、无共享内存，跨阶段的信息由 aproxy
+  按请求保存（`transform::ExchangeCtx`，随 `OutboundRequest` 走完各通道）并
+  转交，回信缺省 `state` = 不变。
 - **aproxy-format**：官方示例 format 二进制（协议转换 switchyard-translation
   + key 轮换/加权轮换 + 多模型多渠道聚合）。版本独立于 aproxy alpha 线，
   单独发 Release（format tag 触发独立 workflow）；它稳定后几乎不更新——

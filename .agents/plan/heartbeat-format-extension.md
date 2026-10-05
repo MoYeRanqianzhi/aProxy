@@ -39,6 +39,12 @@ aproxy 很多配置都可以和 format 搭配，使其实现超高自由度的�
 - 第 1 步（静态 `keepalive_heartbeat`）已实现：校验规则 `config::heartbeat_problem`，心跳字节随
   `KeepaliveSink` 从 Pending 带进 Committed；单测 `keepalive_heartbeat_default_and_boundary_rule`、
   集成测试 `keepalive_heartbeat_is_configurable`，`config --show`/`doctor`/启动校验手工核对过。
-- 其余未实现。IPC 整理（见 TODO）优先，之后按 3 → 2 → 4 的顺序做，每步带测试。
-- 待定：`state` 的大小上限；`request_id` 的格式；envelope 协议是否需要版本字段（aproxy-format
-  旧版本收到新字段会怎样——serde 默认忽略未知字段，需核实 aproxy-format 是否 deny_unknown_fields）。
+- 第 3 步（`stage`/`request_id`/`state`）已实现，目前只有 request/response 两个阶段：
+  `transform::ExchangeCtx` 随 `OutboundRequest` 走完三条通道；`request_id` 取 status 的请求计数
+  （实例内第 N 个，1 起）；`stage` 用字符串而非枚举，旧版 format 遇到新阶段名照样能解析。
+  验证：envelope 单测 `stage_request_id_and_state_roundtrip_and_stay_optional`、集成测试
+  `transform_stages_share_request_id_and_state`（保活与非保活通道各一次，format-echo 的 `stateful`
+  子命令）；aproxy-format 二进制经 test_format.py 喂新字段无异常（全仓库无 deny_unknown_fields）。
+- 下一步：第 2 步心跳转换器（`stage = "heartbeat"`，每拍调用、慢则退回静态心跳），再评估第 4 步。
+  IPC 整理（见 TODO）优先级更高，两者不共享文件，可交错进行。
+- 待定：`state` 的大小上限（目前不限，文档建议保持很小）。

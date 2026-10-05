@@ -32,9 +32,13 @@ you implement a format program in any language or need to know exactly what a fi
 | `worker_id` | integer | Pool slot of this worker | Ignored | Same | Ignored |
 | `extra` | string | The transform's `extra` setting, verbatim | Ignored | Same | Ignored |
 | `error` | string | Never present | Marks this request as failed | Never present | Marks this conversion as failed |
+| `stage` | string | `"request"` | Ignored | `"response"` | Ignored |
+| `request_id` | string | Identifies the client request | Ignored | Same value as on the request side | Ignored |
+| `state` | string | Absent (nothing earlier sets it) | Saved for the response side; omitted = keep | What the request side left, if anything | Ignored |
 
-The presence of `method` is how one program tells the sides apart: request envelopes always carry
-it, response envelopes never do.
+`stage` names the side. The presence of `method` tells them apart too (request envelopes always
+carry it, response envelopes never do), and it is the only signal on aProxy 0.1.0, which sends
+neither `stage`, `request_id` nor `state`; check for `method` if your program must also run there.
 
 ### Rules for your reply
 
@@ -43,9 +47,9 @@ it, response envelopes never do.
 | `headers` is required | A reply without it fails to parse: ``信封 JSON 解析失败: missing field `headers` `` ("envelope JSON parse failed"). `{}` is valid. |
 | An omitted body means an empty body | `url` and `method` fall back to the originals when omitted, but if neither `body` nor `body_b64` is present the body becomes empty. To change only headers, write the received envelope back with your edits. |
 | `body` and `body_b64` are mutually exclusive | Both present is a protocol error. |
-| Types are strict | Header names and values are strings; `extra` is a string; `worker_id` is a non-negative integer that fits in 32 bits. A wrong type fails the parse. |
-| `null` | Allowed for `url`, `method`, `body`, `body_b64` and `error` (same as omitting). Not allowed for `headers`, `extra` or `worker_id`. |
-| Unknown keys | Ignored. Echoing back `worker_id` and `extra` is harmless. |
+| Types are strict | Header names and values are strings; `extra`, `stage`, `request_id` and `state` are strings; `worker_id` is a non-negative integer that fits in 32 bits. A wrong type fails the parse. |
+| `null` | Allowed for `url`, `method`, `body`, `body_b64`, `error`, `stage`, `request_id` and `state` (same as omitting). Not allowed for `headers`, `extra` or `worker_id`. |
+| Unknown keys | Ignored. Echoing back `worker_id`, `extra`, `stage`, `request_id` and `state` is harmless (an echoed `state` keeps the saved value). |
 | `error` wins | If `error` is present (any string, even empty), aProxy ignores every other field and treats the request as failed. |
 
 The simplest correct strategy is to modify the envelope you received and write it back whole.
@@ -60,8 +64,9 @@ absolute `http`/`https` URL. A malformed or unreachable URL is not caught at tra
 fails like a network error, and aProxy retries network errors indefinitely.
 
 On the response side `url` is the URL the request was actually sent to, after your request-side
-rewrite. The request and response transformers are separate processes with no shared state, so
-this is the only way a response transformer can tell which upstream answered.
+rewrite. The request and response transformers are separate processes with no shared memory; the
+URL tells a response transformer which upstream answered, and `state` (below) can carry anything
+else the request side decided.
 
 ### method
 
@@ -130,6 +135,24 @@ set). It is the only configuration channel into your program besides `args`. aPr
 interpret it and does not expand `~` in it; if you pass a path, use an absolute one or expand `~`
 in your program. Request and response transforms each have their own `extra`.
 
+### stage, request_id and state
+
+aProxy versions after 0.1.0 add these three fields so that the two sides of one client request can
+cooperate.
+
+- `stage` is `"request"` or `"response"`. Treat any other value as a stage you do not handle and
+  reply with the envelope unchanged: later aProxy versions may add stages.
+- `request_id` is the same string on both sides of one client request and differs between
+  requests. It counts the instance's requests from 1 and restarts when the instance restarts, so
+  it is unique only within one instance run. Use it to correlate your logs; it is not a secret and
+  carries no meaning beyond identity.
+- `state` is an opaque string aProxy keeps for the request without reading it. A request-side reply
+  that includes `state` sets it; the response side then receives it. Omitting it, or replying with
+  `null`, leaves the saved value unchanged. Typical use: the request side records which channel or
+  key it picked (for example as a small JSON string), and the response side reads it instead of
+  looking the channel up again by `url`. It travels on every envelope line of that request, so keep
+  it small, and do not put credentials in it if your program logs envelopes.
+
 ### error
 
 Reply `{"headers": {}, "error": "<reason>"}` to fail one request without failing the process. Keep
@@ -175,13 +198,14 @@ Request side, in (shown wrapped; on the wire it is one line):
 {"url":"https://api.anthropic.com/v1/messages","method":"POST",
  "headers":{"anthropic-version":"2023-06-01","content-type":"application/json","x-api-key":"sk-client"},
  "body":"{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":100,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
- "worker_id":2,"extra":"/home/me/.aproxy/agg.toml"}
+ "worker_id":2,"extra":"/home/me/.aproxy/agg.toml","stage":"request","request_id":"42"}
 ```
 
-Request side, out (moved to another endpoint with a channel key; body rewritten):
+Request side, out (moved to another endpoint with a channel key; body rewritten; the chosen channel
+saved for the response side):
 
 ```json
-{"url":"https://relay.example.com/v1/chat/completions","method":"POST","headers":{"authorization":"Bearer sk-relay-1","content-type":"application/json"},"body":"{\"model\":\"gpt-4o\",\"max_tokens\":100,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"}
+{"url":"https://relay.example.com/v1/chat/completions","method":"POST","headers":{"authorization":"Bearer sk-relay-1","content-type":"application/json"},"body":"{\"model\":\"gpt-4o\",\"max_tokens\":100,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}","state":"{\"channel\":\"relay\"}"}
 ```
 
 Response side, in (no `method`; `url` is the rewritten request URL):
@@ -190,7 +214,8 @@ Response side, in (no `method`; `url` is the rewritten request URL):
 {"url":"https://relay.example.com/v1/chat/completions",
  "headers":{"content-type":"application/json","x-request-id":"req_1"},
  "body":"{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"choices\":[...]}",
- "worker_id":0,"extra":"/home/me/.aproxy/agg.toml"}
+ "worker_id":0,"extra":"/home/me/.aproxy/agg.toml",
+ "stage":"response","request_id":"42","state":"{\"channel\":\"relay\"}"}
 ```
 
 Failure, either side:

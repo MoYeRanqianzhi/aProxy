@@ -87,3 +87,13 @@ aproxy-format（协议转换 + key 轮换 + 多渠道聚合）。
 - auto 模式（2026-10-04 起）只放行「客户端协议 = 渠道协议」：跨协议请求在请求侧以 error 行
   拒绝（aproxy 回 502、不发上游、不计费），提示显式声明 client_format；该修复随 aproxy-format
   新版本（format-v0.1.1 或之后）生效，需单独发 format 版本。
+
+## 改信封 crate 必须同时升它的版本（2026-10-06）
+
+aproxy-envelope 的版本号不随 tag 对齐：release.yml / release-format.yml 按 Cargo.toml 里的版本
+查 crates.io，已存在就跳过发布。改了它的公开 API（例如 2026-10-06 给 TransformEnvelope 加
+`stage`/`request_id`/`state`）却不升版本，主线 release 会跳过 envelope、照常发布 aproxy，而
+crates.io 上的 aproxy 依赖的是旧 envelope，`cargo install aproxy` 编译失败。给结构体加 pub 字段对
+0.x 是破坏性变更，升次版本（当时 0.1.0 → 0.2.0），根包与 aproxy-format 的依赖声明一起改。
+**Evidence:** release.yml 的「Plan crates to publish」步骤（200 = 已存在即跳过）；Cargo.toml
+`aproxy-envelope = { version = ..., path = ... }`。**Recheck when:** 发布流程改为按 tag 对齐 envelope 版本。

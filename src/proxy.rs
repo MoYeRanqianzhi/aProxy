@@ -67,7 +67,7 @@ use std::{
 use tokio::io::{AsyncRead as _, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::io::ReaderStream;
 
-use crate::{config::Config, retry};
+use crate::{config::Config, retry, transform::ExchangeCtx};
 
 /// 需要过滤的 hop-by-hop 头，避免透传导致协议错误或与 hyper/reqwest 的
 /// 自动管理（content-length / transfer-encoding / host / connection）冲突。
@@ -1218,11 +1218,13 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
             .unwrap_or(0),
         std::sync::atomic::Ordering::Relaxed,
     );
-    // IPC 观测计数（一条 Relaxed fetch_add，与上面 store 同量级）
-    state
+    // IPC 观测计数（一条 Relaxed fetch_add，与上面 store 同量级）；计数顺带
+    // 充当转换信封的 request_id（实例内第 N 个请求，唯一且与 status 的计数一致）
+    let request_seq = state
         .stats
         .requests_total
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
 
     // 在本地侧先应用覆盖/追加，避免重试间重复计算
     apply_header_overrides(&mut headers, &state.config);
@@ -1274,6 +1276,10 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
         target_url: upstream_url(&state.config, &uri),
         headers,
         body: req_body,
+        ctx: ExchangeCtx {
+            request_id: request_seq.to_string(),
+            state: None,
+        },
     };
     let max_spool_bytes = spool_limit_bytes(&state.config);
 
@@ -1298,6 +1304,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
         target_url,
         headers,
         body: req_body,
+        ctx,
     } = match apply_request_transform(&state, req).await {
         Ok(req) => req,
         Err(msg) => return request_transform_failed_response(&msg),
@@ -1362,6 +1369,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
                 replay_success(
                     &state,
                     &target_url,
+                    &ctx,
                     1,
                     status,
                     resp_headers,
@@ -1376,24 +1384,24 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
 
     // 需要重试（不适用保活）：成功后一次性回放（req_body 所有权移交，随通道
     // 结束自动 Drop 删除磁盘临时文件）
-    proxy_without_keepalive(
-        state,
+    let req = OutboundRequest {
         method,
         target_url,
         headers,
-        req_body,
-        max_spool_bytes,
-        bounded_retry,
-    )
-    .await
+        body: req_body,
+        ctx,
+    };
+    proxy_without_keepalive(state, req, max_spool_bytes, bounded_retry).await
 }
 
 /// 发往上游的请求：请求转换（若配置）之后的最终形态，重试循环的每一轮原样重放。
+/// `ctx` 随请求带到响应转换（同一 request_id、请求转换留下的 state）。
 struct OutboundRequest {
     method: http::Method,
     target_url: String,
     headers: HeaderMap,
     body: RequestBody,
+    ctx: ExchangeCtx,
 }
 
 /// 请求转换器：缓冲完成后交给外部 format 程序改写（body/headers/url/method
@@ -1417,9 +1425,11 @@ async fn apply_request_transform(
         target_url,
         headers,
         body,
+        mut ctx,
     } = req;
     match crate::transform::transform_request(
         pool,
+        &ctx,
         &method,
         &target_url,
         &headers,
@@ -1430,11 +1440,15 @@ async fn apply_request_transform(
     {
         Ok(t) => {
             tracing::info!(url = %crate::config::mask_base_url(&t.url), "请求已由外部转换器改写");
+            if t.state.is_some() {
+                ctx.state = t.state;
+            }
             Ok(OutboundRequest {
                 method: t.method,
                 target_url: t.url,
                 headers: t.headers,
                 body: t.body,
+                ctx,
             })
         }
         Err(e) => {
@@ -1499,9 +1513,14 @@ fn spool_failed_response(e: &str) -> Response {
 /// 非保活重试通道、保活通道里提交前就成功的首轮）：先交响应转换器（失败透传
 /// 原样），再按转换后产物重算流式判定（format 可改 content-type/body 形态），
 /// 最后以上游 status 与响应头原样回放。
+// 参数分两组：请求侧（target_url + ctx，响应转换要用）与本次尝试的成功响应
+// （attempt/status/头/体，来自 ForwardResult::Response 的拆解）。两个调用点
+// 都是刚拆开 ForwardResult 就调用，再包一层结构体只是把拆开的字段原样装回去
+#[allow(clippy::too_many_arguments)]
 async fn replay_success(
     state: &AppState,
     target_url: &str,
+    ctx: &ExchangeCtx,
     attempt: u32,
     status: StatusCode,
     resp_headers: HeaderMap,
@@ -1509,7 +1528,7 @@ async fn replay_success(
     body: SpooledBody,
 ) -> Response {
     let (resp_headers, body) =
-        transform_response_if_configured(state, target_url, resp_headers, body).await;
+        transform_response_if_configured(state, target_url, ctx, resp_headers, body).await;
     replay_transformed(attempt, status, resp_headers, raw_headers, body).await
 }
 
@@ -1540,6 +1559,7 @@ async fn replay_transformed(
 async fn transform_response_if_configured(
     state: &AppState,
     upstream_url: &str,
+    ctx: &ExchangeCtx,
     headers: HeaderMap,
     body: SpooledBody,
 ) -> (HeaderMap, SpooledBody) {
@@ -1551,6 +1571,7 @@ async fn transform_response_if_configured(
         .and_then(|v| v.to_str().ok().map(|s| s.to_string()));
     let out = crate::transform::transform_response(
         pool,
+        ctx,
         upstream_url,
         content_encoding.as_deref(),
         headers,
@@ -1754,13 +1775,17 @@ fn preview_body(body: &[u8], limit: usize, total_bytes: usize) -> String {
 /// 达到 [`retry::BOUNDED_RETRY_MAX_ATTEMPTS`] 次后透传最后一次失败响应。
 async fn proxy_without_keepalive(
     state: AppState,
-    method: http::Method,
-    target_url: String,
-    headers: HeaderMap,
-    req_body: RequestBody,
+    req: OutboundRequest,
     max_spool_bytes: usize,
     bounded_retry: bool,
 ) -> Response {
+    let OutboundRequest {
+        method,
+        target_url,
+        headers,
+        body: req_body,
+        ctx,
+    } = req;
     let mut attempt: u32 = 1;
     let max_backoff = state.config.max_retry_backoff_secs;
     loop {
@@ -1830,6 +1855,7 @@ async fn proxy_without_keepalive(
                     return replay_success(
                         &state,
                         &target_url,
+                        &ctx,
                         attempt,
                         status,
                         resp_headers,
@@ -2377,6 +2403,7 @@ async fn proxy_with_keepalive(
             target_url,
             mut headers,
             body: req_body,
+            ctx,
         } = match transformed {
             None => return,
             Some(Ok(req)) => req,
@@ -2520,6 +2547,7 @@ async fn proxy_with_keepalive(
                         let transform = transform_response_if_configured(
                             &state,
                             &target_url,
+                            &ctx,
                             resp_headers,
                             body,
                         );

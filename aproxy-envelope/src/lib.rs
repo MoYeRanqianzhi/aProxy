@@ -9,6 +9,9 @@
 //! - `body` 与 `body_b64` 互斥（[`TransformEnvelope::from_line`] 校验）
 //! - `error` 字段非空 = format 表达「该请求转换失败」（进程不崩，exit 0）
 //! - 非零 exit code = 进程级失败（崩溃/挂死），由 aproxy 侧按失败语义处理
+//! - 同一客户端请求的各阶段（`stage`）收到同一个 `request_id`；format 回信里的
+//!   `state` 由 aproxy 按请求保存、交给后续阶段——请求与响应转换器是不同进程，
+//!   跨阶段只能经 aproxy 转交
 
 use std::collections::BTreeMap;
 
@@ -56,6 +59,21 @@ pub struct TransformEnvelope {
     /// 非空 error = 该请求转换失败（进程必须仍 exit 0，否则按进程失败处理）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// 输入侧：本次转换所处的阶段——`"request"`（发往上游之前）或
+    /// `"response"`（成功响应回放之前）。format 回信不必回填（被忽略）。
+    /// 用字符串而非枚举：将来新增阶段时，旧版 format 仍能解析信封（枚举遇到
+    /// 不认识的值会让整行反序列化失败）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    /// 输入侧：客户端请求的标识，实例内唯一（同一实例收到的第 N 个请求）。
+    /// 同一请求的各阶段收到同一个值，可用来关联日志或按请求缓存。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// 跨阶段状态，aproxy 不解读的不透明字符串。输入侧是该请求此前阶段留下的
+    /// 值（没有则缺省）；回信带上即替换保存的值，缺省 = 不变。例如请求转换器
+    /// 记下选中的渠道，响应转换器直接读出，不必按 `url` 反查。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
 }
 
 /// 信封解析/取值错误。
@@ -131,6 +149,26 @@ impl TransformEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_request_id_and_state_roundtrip_and_stay_optional() {
+        // 缺省时不出现在输出行里（旧 format 看到的信封形态不变）
+        let line = TransformEnvelope::default().to_line().unwrap();
+        for key in ["stage", "request_id", "state"] {
+            assert!(!line.contains(key), "{key} 缺省时不应输出: {line}");
+        }
+        let env = TransformEnvelope {
+            stage: Some("request".into()),
+            request_id: Some("7".into()),
+            state: Some("{\"channel\":\"b\"}".into()),
+            ..Default::default()
+        };
+        let back = TransformEnvelope::from_line(&env.to_line().unwrap()).unwrap();
+        assert_eq!(back, env);
+        // 将来的阶段名同样能解析（字符串而非枚举）
+        let future = TransformEnvelope::from_line(r#"{"headers":{},"stage":"heartbeat"}"#).unwrap();
+        assert_eq!(future.stage.as_deref(), Some("heartbeat"));
+    }
 
     #[test]
     fn roundtrip_preserves_all_fields() {

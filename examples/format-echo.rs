@@ -12,6 +12,9 @@
 //! - `sleep <ms>` 睡指定毫秒后回显（超时测试）
 //! - `rotate`  从 extra 解析 {"keys":[...]}，按请求计数轮换 authorization 头
 //!   （多 key 轮换场景验证；计数在进程内存——persistent 模式下复现）
+//! - `stateful` 跨阶段状态验证：把收到的 `stage|request_id|state` 写进
+//!   `x-stage-seen` 头（请求侧进发往上游的请求头，响应侧进回给客户端的响应
+//!   头）；请求阶段回信带 `state = "from-request-<request_id>"`
 //!
 //! 违反协议 / 进程生命周期类（进程池加固的回归面）：
 //! - `banner`  启动时先往 stdout 打一行非信封横幅，之后照常回显——模拟
@@ -106,6 +109,20 @@ fn main() {
                         env.headers
                             .insert("authorization".to_string(), format!("Bearer {}", keys[idx]));
                     }
+                    env
+                });
+            }
+            "stateful" => {
+                respond(&line, |mut env| {
+                    let id = env.request_id.clone().unwrap_or_default();
+                    let seen = format!(
+                        "{}|{id}|{}",
+                        env.stage.as_deref().unwrap_or("-"),
+                        env.state.as_deref().unwrap_or("-")
+                    );
+                    env.headers.insert("x-stage-seen".to_string(), seen);
+                    env.state = (env.stage.as_deref() == Some("request"))
+                        .then(|| format!("from-request-{id}"));
                     env
                 });
             }

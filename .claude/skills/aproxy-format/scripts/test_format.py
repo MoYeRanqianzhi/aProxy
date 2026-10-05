@@ -228,7 +228,7 @@ def build_body(spec: str, side: str, sse: bool) -> str:
 
 
 def build_envelope(spec: str, side: str, url: str, extra: str, body_file: str | None,
-                   worker_id: int, sse: bool) -> dict:
+                   worker_id: int, sse: bool, state: str | None) -> dict:
     """Build an envelope as specified in references/protocol.md.
 
     A request-side envelope carries "method"; a response-side envelope has no
@@ -259,6 +259,12 @@ def build_envelope(spec: str, side: str, url: str, extra: str, body_file: str | 
         envelope["headers"] = headers
     envelope["worker_id"] = worker_id
     envelope["extra"] = extra
+    # aProxy after 0.1.0 also names the stage and the request; `state` is what
+    # the request side left for the response side (absent until one is set)
+    envelope["stage"] = side
+    envelope["request_id"] = "1"
+    if state is not None:
+        envelope["state"] = state
     return envelope
 
 
@@ -334,6 +340,9 @@ def main() -> None:
     ap.add_argument("--extra", default="", help="envelope extra string, passed verbatim")
     ap.add_argument("--worker-id", type=int, default=0,
                     help="envelope worker_id (default 0)")
+    ap.add_argument("--state", default=None,
+                    help="envelope state, as the request side would have left it "
+                         "(default: absent)")
     ap.add_argument(
         "--body-file", default=None,
         help="use this file as the body (non-UTF-8 content is sent as body_b64)",
@@ -352,7 +361,8 @@ def main() -> None:
 
     url = ns.url or DEFAULT_URLS[ns.format_spec]
     envelope = build_envelope(
-        ns.format_spec, ns.side, url, ns.extra, ns.body_file, ns.worker_id, ns.sse
+        ns.format_spec, ns.side, url, ns.extra, ns.body_file, ns.worker_id, ns.sse,
+        ns.state,
     )
     line = json.dumps(envelope, ensure_ascii=False)
 
@@ -454,6 +464,9 @@ def envelope_problems(env) -> list:
         problems.append("`body` and `body_b64` are mutually exclusive")
     if env.get("body") is not None and not isinstance(env["body"], str):
         problems.append("`body` must be a string")
+    for key in ("stage", "request_id", "state"):
+        if env.get(key) is not None and not isinstance(env[key], str):
+            problems.append(f"`{key}` must be a string or null")
     if env.get("body_b64") is not None:
         try:
             base64.b64decode(env["body_b64"], validate=True)

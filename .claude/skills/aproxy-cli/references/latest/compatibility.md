@@ -54,6 +54,7 @@ does not have. These development-line changes alter what you see or do on 0.1.0:
 | The watchdog respawns a crashed instance at its next scan, up to `watchdog_heartbeat_secs` (30 s) later | it respawns at once (behaviors.md) |
 | `upstream_url` is accepted as another name for `base_url` | only `base_url` is read; rename the key |
 | `keepalive_heartbeat` is ignored; heartbeats are always `: keepalive` | the heartbeat is configurable (config-toml.md) |
+| `heartbeat_transform` is ignored, and transformer envelopes carry no `stage`, `request_id` or `state` | heartbeats can come from a format program, and both transformer sides of a request share `request_id` and `state` (aproxy-format skill) |
 
 For a version newer than these docs, refresh them: `aproxy install` updates the skill documents in
 `<home>/skills/` together with the binary, and `aproxy install --skills-only` updates only the

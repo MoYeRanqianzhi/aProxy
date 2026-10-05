@@ -21,7 +21,8 @@ behaviors.md; this file keeps only what you need to pick a value.
   [keepalive_interval_secs / keepalive_trigger / keepalive_heartbeat](#keepalive_interval_secs--keepalive_trigger--keepalive_heartbeat) ·
   [max_body_mb](#max_body_mb) · [spool_limit_mb](#spool_limit_mb) · [disk_cache](#disk_cache) ·
   [forward_only](#forward_only) · [allowed_hosts / allowed_origins](#allowed_hosts--allowed_origins) ·
-  [log_file](#log_file) · [request_transform / response_transform](#request_transform--response_transform)
+  [log_file](#log_file) ·
+  [request_transform / response_transform / heartbeat_transform](#request_transform--response_transform--heartbeat_transform)
 - [Checks at start](#checks-at-start)
 - [Normalization](#normalization)
 
@@ -412,13 +413,18 @@ from `aproxy status` or `aproxy logs` rather than guessing it.
   while running when it grows past settings.json `log_rotate_mb`.
 - Foreground instances (`--foreground`) log to the console and ignore it.
 
-### request_transform / response_transform
+### request_transform / response_transform / heartbeat_transform
 
 Hand each request before forwarding, or each successful response before replay, to an external
 "format" program that rewrites it: protocol conversion (OpenAI to Anthropic and back), key
 rotation, routing models to different channels. aProxy has no transformer built in. The official
 `aproxy-format` binary, the envelope protocol and how to write your own program are in the
 aproxy-format skill; this section covers only the aProxy side. Default: unset.
+
+`heartbeat_transform` is the third kind: while a keepalive response waits for a usable upstream
+result, aProxy asks the program for each heartbeat instead of writing `keepalive_heartbeat`, so a
+program that knows the client's protocol can send something the client accepts, chosen from the
+request's content. Its rules are below the table.
 
 ```toml
 request_transform  = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
@@ -453,6 +459,23 @@ response_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], 
   transformed.
 - aProxy discards the program's stderr; have the program write its own log file.
 - Cannot be combined with `forward_only`.
+
+`heartbeat_transform` takes the same keys and differs in when it runs and how it fails:
+
+- It runs once per keepalive tick after aProxy has committed the response head and until the first
+  real byte is replayed, but only once the request side is done (earlier ticks, while a slow
+  request transform runs, send `keepalive_heartbeat`). The reply's body is written to the client
+  as that tick's heartbeat; an empty body writes nothing.
+- It never delays a heartbeat. If the previous call has not returned, that tick sends
+  `keepalive_heartbeat` without calling again. A call that fails, times out or returns bytes that
+  are not UTF-8 or break the event-boundary rule of `keepalive_heartbeat` also sends
+  `keepalive_heartbeat`, with one warn per request: `心跳转换失败，这一拍改发固定心跳（本请求之后的失败不再重复告警）`
+  ("heartbeat transform failed; sending the fixed heartbeat").
+- Prefer `mode = "persistent"`: it is called every `keepalive_interval_secs` for every waiting
+  request, and `spawn` starts a process each time.
+- Heartbeats that look like protocol events (for example an Anthropic `message_start`) are on the
+  program: when the real response arrives, aProxy replays it unchanged, so pair it with a
+  `response_transform` that uses the envelope `state` to drop what the heartbeats already sent.
 - A table whose `command` is blank is ignored as if absent; a table without a `command` key fails
   to parse.
 

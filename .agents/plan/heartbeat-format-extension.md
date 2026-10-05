@@ -56,6 +56,12 @@ aproxy 很多配置都可以和 format 搭配，使其实现超高自由度的�
   验证：envelope 单测 `stage_request_id_and_state_roundtrip_and_stay_optional`、集成测试
   `transform_stages_share_request_id_and_state`（保活与非保活通道各一次，format-echo 的 `stateful`
   子命令）；aproxy-format 二进制经 test_format.py 喂新字段无异常（全仓库无 deny_unknown_fields）。
-- 下一步：第 2 步心跳转换器（`stage = "heartbeat"`，每拍调用、慢则退回静态心跳），再评估第 4 步。
-  IPC 整理（见 TODO）优先级更高，两者不共享文件，可交错进行。
+- 第 2 步（`heartbeat_transform`）已实现，按上面「实现要点」：每拍 spawn 独立任务、`in_flight` 防排队、
+  `replay_gate` 闸门、state 改为 `ExchangeCtx` 内共享的锁。信封加 `heartbeat {seq, elapsed_ms, attempt}`；
+  首拍带请求体。验证：集成测试 `heartbeat_transform_generates_heartbeats_and_hands_state_to_response`、
+  `heartbeat_transform_failure_falls_back_to_fixed_heartbeat`；单测
+  `dynamic_heartbeat_arriving_after_replay_started_is_dropped`（临时关掉闸门时失败，已核对）；
+  test_format.py 新增 `--side heartbeat`。未做：每请求的「最近一次上游失败」摘要（重试循环里没有
+  按请求保存的错误串，需要时再加）；真实客户端（Claude Code 等）对 format 生成的协议事件的反应未实测。
+- 下一步：评估第 4 步各决策点；IPC 整理（见 TODO）优先级更高。
 - 待定：`state` 的大小上限（目前不限，文档建议保持很小）。

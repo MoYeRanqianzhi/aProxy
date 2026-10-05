@@ -107,7 +107,12 @@ CLI 定义（cli.rs）与子命令处理（commands/）分离；启动父进程�
 
 缓冲期间客户端什么也收不到，所以保活适用的请求要靠心跳维持连接：默认是 SSE 注释
 （`: keepalive`），`keepalive_heartbeat` 可换成任意字节（aProxy 不认识协议，心跳的形态
-由用户按客户端决定；`heartbeat_problem` 只把关「写完后 SSE 解析器停在事件边界」）。**适用判定**（`keepalive_triggered`，在请求转换之前、按客户端视角）：
+由用户按客户端决定；`heartbeat_problem` 只把关「写完后 SSE 解析器停在事件边界」）。
+配置了 `heartbeat_transform` 时，请求转换完成后的每一拍交给心跳转换器生成（信封
+`stage = "heartbeat"`）：每拍 `tokio::spawn` 一个任务跑完整次转换（drive 返回时不会
+drop 在途转换，persistent worker 不会因此被剔除），上一拍未回来就发固定心跳；任务写
+通道前在 `replay_gate` 锁内确认回放尚未开始，`send` 写第一块真实字节前在同一把锁内
+关闸——迟到的动态心跳一律丢弃，不会插进回放的事件中间。**适用判定**（`keepalive_triggered`，在请求转换之前、按客户端视角）：
 `keepalive_interval_secs` > 0、非 `forward_only`，且按 `keepalive_trigger`
 命中——`accept`（Accept 含 `text/event-stream`，旧判定）/ `body_stream`（请求体
 JSON 对象顶层 `"stream": true`，磁盘溢写的大请求体同样只看顶层键）/ `any`（任一，

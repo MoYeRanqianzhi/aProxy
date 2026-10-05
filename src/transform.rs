@@ -35,7 +35,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWriteExt as _, BufReade
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, Semaphore};
 
-use aproxy_envelope::TransformEnvelope;
+use aproxy_envelope::{HeartbeatInfo, TransformEnvelope};
 
 use crate::{
     config::{TransformConfig, TransformMode},
@@ -606,26 +606,124 @@ pub(crate) struct TransformedRequest {
     pub url: String,
     pub headers: axum::http::HeaderMap,
     pub body: RequestBody,
-    /// format 回信里的跨阶段状态；None = 回信未带，调用方保留原值
-    pub state: Option<String>,
 }
 
 /// 一个客户端请求交给各转换阶段的标识与跨阶段状态（见信封的 `request_id` /
-/// `state`）。随请求在代理通道里传递：请求转换回信的 state 替换这里的值，
-/// 响应转换收到的就是它。
+/// `state`）。随请求在代理通道里传递。state 放在共享的锁里：心跳转换在独立
+/// 任务里跑，它回信改的 state 必须让之后的响应转换看到。克隆共享同一份 state。
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ExchangeCtx {
     pub request_id: String,
-    pub state: Option<String>,
+    state: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl ExchangeCtx {
+    pub(crate) fn new(request_id: String) -> Self {
+        Self {
+            request_id,
+            state: Arc::default(),
+        }
+    }
+
+    /// 锁中毒（持锁处 panic）不该连累代理：state 只是一个字符串，照常取用
+    fn state_slot(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// 填信封的阶段字段
     fn stamp(&self, env: &mut TransformEnvelope, stage: &str) {
         env.stage = Some(stage.to_string());
         env.request_id = Some(self.request_id.clone());
-        env.state = self.state.clone();
+        env.state = self.state_slot().clone();
     }
+
+    /// 回信带了 state 就替换保存的值；缺省 = 不变
+    fn absorb(&self, reply: Option<String>) {
+        if let Some(state) = reply {
+            *self.state_slot() = Some(state);
+        }
+    }
+}
+
+/// 心跳转换要看到的请求（请求转换之后、真正发往上游的那一份）。请求体只在
+/// 首拍随信封交出：内存体共享同一份 Bytes，磁盘体记下路径、首拍时现读——
+/// 文件归请求所有，请求结束被删后读失败，这一拍按失败退回固定心跳。
+pub(crate) struct HeartbeatSource {
+    method: axum::http::Method,
+    url: String,
+    headers: BTreeMap<String, String>,
+    body: HeartbeatBody,
+}
+
+enum HeartbeatBody {
+    Memory(bytes::Bytes),
+    Disk(std::path::PathBuf),
+}
+
+impl HeartbeatSource {
+    pub(crate) fn new(
+        method: &axum::http::Method,
+        url: &str,
+        headers: &axum::http::HeaderMap,
+        body: &RequestBody,
+    ) -> Self {
+        Self {
+            method: method.clone(),
+            url: url.to_string(),
+            headers: headers_to_btreemap(headers),
+            body: match body {
+                RequestBody::Memory(b) => HeartbeatBody::Memory(b.clone()),
+                RequestBody::Disk { path, .. } => HeartbeatBody::Disk(path.clone()),
+            },
+        }
+    }
+}
+
+/// 心跳转换：交出这一拍的上下文，返回要写给客户端的字节。Ok(None) = format
+/// 决定这一拍什么都不写（回信 body 为空）；Err = 这一拍失败（原因供日志），
+/// 调用方改发固定心跳。回信必须是 UTF-8，且满足固定心跳同一条事件边界规则
+/// （`config::heartbeat_problem`），否则会和之后回放的事件拼在一起。
+pub(crate) async fn transform_heartbeat(
+    pool: &Arc<TransformPool>,
+    ctx: &ExchangeCtx,
+    source: &HeartbeatSource,
+    info: HeartbeatInfo,
+) -> Result<Option<bytes::Bytes>, String> {
+    let mut env = if info.seq == 1 {
+        let body = match &source.body {
+            HeartbeatBody::Memory(b) => b.to_vec(),
+            HeartbeatBody::Disk(path) => tokio::fs::read(path)
+                .await
+                .map_err(|e| format!("读取请求体失败: {e}"))?,
+        };
+        TransformEnvelope::from_body_bytes(&body)
+    } else {
+        TransformEnvelope::default()
+    };
+    env.method = Some(source.method.as_str().to_string());
+    env.url = Some(source.url.clone());
+    env.headers = source.headers.clone();
+    env.extra = pool.cfg.effective_extra().to_string();
+    env.heartbeat = Some(info);
+    ctx.stamp(&mut env, "heartbeat");
+
+    let out = pool.convert(env).await.map_err(|e| e.to_string())?;
+    if let Some(err) = out.error {
+        return Err(format!("format 回报失败: {err}"));
+    }
+    let bytes = out.body_bytes().map_err(|e| e.to_string())?;
+    if bytes.is_empty() {
+        ctx.absorb(out.state);
+        return Ok(None);
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| "心跳字节不是 UTF-8".to_string())?;
+    if let Some(why) = crate::config::heartbeat_problem(text) {
+        return Err(format!("心跳字节不合事件边界规则：{why}"));
+    }
+    ctx.absorb(out.state);
+    Ok(Some(bytes::Bytes::from(bytes)))
 }
 
 /// 请求侧转换：body 缓冲完成后交给 format 改写。转换**一次**，产物被重试
@@ -661,6 +759,7 @@ pub(crate) async fn transform_request(
     if let Some(err) = out.error {
         return Err(TransformError::Rejected(err));
     }
+    ctx.absorb(out.state.clone());
     // body_b64 解码失败是 format 输出写错（协议错误），不是 format 的业务判定。
     // worker 已在 convert 内归还：该行本身是一行合法信封，stdout 帧同步未受
     // 影响，无需剔除
@@ -694,7 +793,6 @@ pub(crate) async fn transform_request(
         url: new_url,
         headers: new_headers,
         body: new_body,
-        state: out.state,
     })
 }
 

@@ -34,7 +34,10 @@ you implement a format program in any language or need to know exactly what a fi
 | `error` | string | Never present | Marks this request as failed | Never present | Marks this conversion as failed |
 | `stage` | string | `"request"` | Ignored | `"response"` | Ignored |
 | `request_id` | string | Identifies the client request | Ignored | Same value as on the request side | Ignored |
-| `state` | string | Absent (nothing earlier sets it) | Saved for the response side; omitted = keep | What the request side left, if anything | Ignored |
+| `state` | string | Absent (nothing earlier sets it) | Saved for later stages; omitted = keep | The latest value a request or heartbeat reply left, if any | Ignored |
+
+A third stage, `"heartbeat"`, exists when the instance configures `heartbeat_transform`; its
+envelope and reply are described under "Heartbeat stage" below.
 
 `stage` names the side. The presence of `method` tells them apart too (request envelopes always
 carry it, response envelopes never do), and it is the only signal on aProxy 0.1.0, which sends
@@ -140,18 +143,48 @@ in your program. Request and response transforms each have their own `extra`.
 aProxy versions after 0.1.0 add these three fields so that the two sides of one client request can
 cooperate.
 
-- `stage` is `"request"` or `"response"`. Treat any other value as a stage you do not handle and
-  reply with the envelope unchanged: later aProxy versions may add stages.
+- `stage` is `"request"`, `"response"` or `"heartbeat"`. Treat any other value as a stage you do
+  not handle and reply with the envelope unchanged: later aProxy versions may add stages.
 - `request_id` is the same string on both sides of one client request and differs between
   requests. It counts the instance's requests from 1 and restarts when the instance restarts, so
   it is unique only within one instance run. Use it to correlate your logs; it is not a secret and
   carries no meaning beyond identity.
-- `state` is an opaque string aProxy keeps for the request without reading it. A request-side reply
-  that includes `state` sets it; the response side then receives it. Omitting it, or replying with
+- `state` is an opaque string aProxy keeps for the request without reading it. A request-side or
+  heartbeat reply that includes `state` sets it; every later stage receives the latest value. Omitting it, or replying with
   `null`, leaves the saved value unchanged. Typical use: the request side records which channel or
   key it picked (for example as a small JSON string), and the response side reads it instead of
   looking the channel up again by `url`. It travels on every envelope line of that request, so keep
   it small, and do not put credentials in it if your program logs envelopes.
+
+### Heartbeat stage
+
+Configured with `heartbeat_transform` (aproxy-cli skill, config-toml.md). While a keepalive response
+waits for a usable upstream result, aProxy calls the program once per keepalive tick, after the
+response head is committed and the request side is done, until the first real byte is replayed.
+
+| Field | In | Reply |
+|---|---|---|
+| `stage` | `"heartbeat"` | Ignored |
+| `method`, `url`, `headers` | The request as sent upstream (after any request transform) | Ignored |
+| `body` / `body_b64` | The request body, **only when `heartbeat.seq` is 1**; absent afterwards | The bytes to write to the client as this tick's heartbeat; empty or absent = write nothing this tick |
+| `heartbeat` | Object: `seq` (1 for the first call of this request), `elapsed_ms` (since the response head was committed), `attempt` (current upstream attempt, above 1 while aProxy retries) | Ignored |
+| `request_id`, `state`, `worker_id`, `extra` | As on the other stages | `state` sets the saved value, as on the request side |
+| `error` | Never present | This tick fails |
+
+- The reply body must be UTF-8 and must leave the client's SSE parser at an event boundary, the same
+  rule as `keepalive_heartbeat`: end with a line break, and end with a blank line if it has any
+  field line (`event:`, `data:`). Otherwise the heartbeat would merge with the first replayed
+  event, so aProxy rejects it.
+- A failed tick (error reply, timeout, bad bytes, crash) sends the fixed `keepalive_heartbeat`
+  instead and logs one warn per request. The request itself is unaffected.
+- aProxy does not wait for you: if the previous call has not returned when the next tick comes,
+  that tick sends the fixed heartbeat. A reply that arrives after the real response has started is
+  dropped.
+- Read what you need from the body on `seq` 1 and keep it in `state`; later ticks do not carry
+  the body.
+- If your heartbeats are protocol events rather than comments, the client sees them before the
+  real response, which aProxy replays unchanged. Configure a `response_transform` that reads
+  `state` and removes what the heartbeats already sent (for example a duplicate `message_start`).
 
 ### error
 
@@ -182,6 +215,8 @@ unexpectedly without output"), and your reason is lost.
 - **Response side:** only for the upstream response aProxy accepts as successful, just before it
   is replayed to the client. Error responses never reach you, including a final error that
   `bounded_retry_paths` passes through.
+- **Heartbeat side:** only with `heartbeat_transform`, once per keepalive tick while a keepalive
+  response waits (see "Heartbeat stage").
 - **Keepalive:** for a request that uses the keepalive channel (a streaming request, by default),
   aProxy sends the client skeleton headers (`200`, `text/event-stream`) and heartbeats whenever a
   keepalive interval (default 15 s) passes without a result, including time spent in your request

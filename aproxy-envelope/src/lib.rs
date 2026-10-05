@@ -59,8 +59,9 @@ pub struct TransformEnvelope {
     /// 非空 error = 该请求转换失败（进程必须仍 exit 0，否则按进程失败处理）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// 输入侧：本次转换所处的阶段——`"request"`（发往上游之前）或
-    /// `"response"`（成功响应回放之前）。format 回信不必回填（被忽略）。
+    /// 输入侧：本次转换所处的阶段——`"request"`（发往上游之前）、
+    /// `"response"`（成功响应回放之前）或 `"heartbeat"`（保活等待中的一拍，
+    /// 回信的 body 就是这一拍写给客户端的字节）。format 回信不必回填（被忽略）。
     /// 用字符串而非枚举：将来新增阶段时，旧版 format 仍能解析信封（枚举遇到
     /// 不认识的值会让整行反序列化失败）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,6 +75,21 @@ pub struct TransformEnvelope {
     /// 记下选中的渠道，响应转换器直接读出，不必按 `url` 反查。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// 输入侧，仅心跳阶段：这一拍的上下文（见 [`HeartbeatInfo`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat: Option<HeartbeatInfo>,
+}
+
+/// 心跳阶段的上下文：aproxy 每个保活间隔调用一次心跳转换器时附带。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HeartbeatInfo {
+    /// 本请求的第几次心跳调用（1 起）。只有 seq 为 1 的那次信封带请求体——
+    /// 体可能很大，之后各拍不再重复携带，需要的信息请在首拍写进 `state`。
+    pub seq: u64,
+    /// 自响应头提交给客户端（客户端开始等待）起经过的毫秒数。
+    pub elapsed_ms: u64,
+    /// 当前是第几次上游尝试（1 起）：大于 1 说明 aproxy 正在重试。
+    pub attempt: u32,
 }
 
 /// 信封解析/取值错误。
@@ -166,8 +182,20 @@ mod tests {
         let back = TransformEnvelope::from_line(&env.to_line().unwrap()).unwrap();
         assert_eq!(back, env);
         // 将来的阶段名同样能解析（字符串而非枚举）
-        let future = TransformEnvelope::from_line(r#"{"headers":{},"stage":"heartbeat"}"#).unwrap();
-        assert_eq!(future.stage.as_deref(), Some("heartbeat"));
+        let future = TransformEnvelope::from_line(r#"{"headers":{},"stage":"later"}"#).unwrap();
+        assert_eq!(future.stage.as_deref(), Some("later"));
+        // 心跳上下文往返
+        let hb = TransformEnvelope {
+            stage: Some("heartbeat".into()),
+            heartbeat: Some(HeartbeatInfo {
+                seq: 3,
+                elapsed_ms: 45_000,
+                attempt: 2,
+            }),
+            ..Default::default()
+        };
+        let back = TransformEnvelope::from_line(&hb.to_line().unwrap()).unwrap();
+        assert_eq!(back, hb);
     }
 
     #[test]

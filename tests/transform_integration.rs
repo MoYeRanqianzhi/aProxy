@@ -549,6 +549,87 @@ async fn transform_stages_share_request_id_and_state() {
     assert_ne!(ids[0], ids[1], "不同请求的 request_id 不同");
 }
 
+/// 慢上游：等 `delay_ms` 后回一个 SSE 事件（保活通道在等待期间提交骨架、发心跳）
+async fn slow_sse_upstream(delay_ms: u64) -> (String, tokio::task::JoinHandle<()>) {
+    let app = Router::new().fallback(move || async move {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "data: {\"ok\":true}\n\n",
+        )
+            .into_response()
+    });
+    bind_router(app).await
+}
+
+#[tokio::test]
+async fn heartbeat_transform_generates_heartbeats_and_hands_state_to_response() {
+    // 心跳转换器逐拍生成心跳字节；首拍带请求体、之后不带；它回信的 state 经
+    // aProxy 交给响应转换（响应转换把收到的 state 追加成一行注释）。回放的上游
+    // 事件完整出现在所有心跳之后
+    isolate_env_proxy();
+    let (upstream, _jh) = slow_sse_upstream(2500).await;
+    let mut cfg = keepalive_1s_config_for(&upstream);
+    cfg.heartbeat_transform = Some(transform_config("heartbeat", TransformMode::Persistent));
+    cfg.response_transform = Some(transform_config("heartbeat", TransformMode::Spawn));
+    let (proxy, _pj) = start_proxy(cfg).await;
+
+    let body = local_client()
+        .post(format!("{proxy}/v1/messages"))
+        .header("accept", "text/event-stream")
+        .body(r#"{"stream":true}"#)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains(": hb seq=1 attempt=1 body=true\n\n"),
+        "首拍应由心跳转换器生成且带请求体: {body:?}"
+    );
+    assert!(
+        body.contains(": hb seq=2 attempt=1 body=false\n\n"),
+        "之后各拍不再带请求体: {body:?}"
+    );
+    let replay = body.find("data: {\"ok\":true}").expect("应回放上游事件");
+    assert!(
+        body.rfind(": hb seq=").unwrap() < replay,
+        "心跳只出现在回放之前: {body:?}"
+    );
+    // 最后一拍是第几拍取决于时序，只断言 state 来自心跳回信
+    assert!(
+        body[replay..].contains("\n\n: state=hb-"),
+        "响应转换应收到心跳回信留下的 state: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn heartbeat_transform_failure_falls_back_to_fixed_heartbeat() {
+    // 心跳转换器每拍都回 error：照常发固定心跳，请求本身不受影响
+    isolate_env_proxy();
+    let (upstream, _jh) = slow_sse_upstream(2500).await;
+    let mut cfg = keepalive_1s_config_for(&upstream);
+    cfg.heartbeat_transform = Some(transform_config("error", TransformMode::Persistent));
+    let (proxy, _pj) = start_proxy(cfg).await;
+
+    let resp = local_client()
+        .post(format!("{proxy}/v1/messages"))
+        .header("accept", "text/event-stream")
+        .body(r#"{"stream":true}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(": keepalive\n\n"), "应退回固定心跳: {body:?}");
+    assert!(
+        body.ends_with("data: {\"ok\":true}\n\n"),
+        "上游事件照常回放: {body:?}"
+    );
+}
+
 #[tokio::test]
 async fn response_transform_rewrites_body() {
     isolate_env_proxy();

@@ -20,6 +20,11 @@ the shapes in each provider's API reference.
   # is what a format program sees after aProxy has buffered the whole stream
   python test_format.py --side response --sse --format-spec anthropic --command ./my-format
 
+  # Heartbeat stage (heartbeat_transform): the first call of a request, which
+  # carries the request body; the reply body is checked against the SSE
+  # event-boundary rule aProxy enforces
+  python test_format.py --side heartbeat --format-spec anthropic --command ./my-format
+
   # Arguments after "--" go to the program verbatim; --body-file supplies a
   # custom body (non-UTF-8 content is sent as body_b64)
   python test_format.py --format-spec openai-chat --command node -- format-node.js
@@ -220,7 +225,7 @@ RESPONSE_HEADERS = {
 
 
 def build_body(spec: str, side: str, sse: bool) -> str:
-    if side == "request":
+    if side in ("request", "heartbeat"):
         return json.dumps(MOCK_REQUESTS[spec], ensure_ascii=False)
     if sse:
         return MOCK_SSE[spec]
@@ -246,7 +251,7 @@ def build_envelope(spec: str, side: str, url: str, extra: str, body_file: str | 
     else:
         envelope = {"body": build_body(spec, side, sse)}
     envelope["url"] = url
-    if side == "request":
+    if side in ("request", "heartbeat"):
         envelope["method"] = "POST"
         envelope["headers"] = {
             "content-type": "application/json",
@@ -265,6 +270,9 @@ def build_envelope(spec: str, side: str, url: str, extra: str, body_file: str | 
     envelope["request_id"] = "1"
     if state is not None:
         envelope["state"] = state
+    if side == "heartbeat":
+        # First heartbeat of a request: seq 1 is the only call that carries the body
+        envelope["heartbeat"] = {"seq": 1, "elapsed_ms": 15000, "attempt": 1}
     return envelope
 
 
@@ -286,6 +294,15 @@ def read_reply(stdout, timeout_secs: float) -> str | None:
 
 
 def checkpoints(spec: str, side: str, sse: bool) -> list[str]:
+    if side == "heartbeat":
+        return [
+            "the body is exactly what the client should receive this tick "
+            "(empty = nothing is written)",
+            "the client's SSE parser accepts it; comments and blank lines are safe, "
+            "protocol events must be valid for the client's protocol",
+            "if the heartbeats are protocol events, a response_transform removes what the "
+            "real response would duplicate (keep the bookkeeping in `state`)",
+        ]
     if side == "request":
         return [
             '"headers" is present (without it aProxy cannot parse the reply: 502)',
@@ -320,10 +337,11 @@ def main() -> None:
     )
     ap.add_argument(
         "--side",
-        choices=["request", "response"],
+        choices=["request", "response", "heartbeat"],
         default="request",
         help="envelope side: request = client request (has method); "
-        "response = upstream response (no method). Default: request",
+        "response = upstream response (no method); heartbeat = one keepalive tick "
+        "(heartbeat_transform). Default: request",
     )
     ap.add_argument(
         "--sse",
@@ -366,10 +384,11 @@ def main() -> None:
     )
     line = json.dumps(envelope, ensure_ascii=False)
 
-    side_label = (
-        "request side (client request)" if ns.side == "request"
-        else "response side (upstream response)"
-    ) + (" [SSE]" if ns.sse else "")
+    side_label = {
+        "request": "request side (client request)",
+        "response": "response side (upstream response)",
+        "heartbeat": "heartbeat stage (first tick)",
+    }[ns.side] + (" [SSE]" if ns.sse else "")
     print(f"[test] {side_label}  protocol: {ns.format_spec}  "
           f"program: {ns.command} {' '.join(ns.args)}")
     print(f"[test] envelope sent ({len(line)} characters):")
@@ -414,6 +433,8 @@ def main() -> None:
             parsed = json.loads(reply)
             print(json.dumps(parsed, ensure_ascii=False, indent=2))
             problems = envelope_problems(parsed)
+            if ns.side == "heartbeat" and not problems and parsed.get("error") is None:
+                problems = heartbeat_problems(parsed)
             if problems:
                 for problem in problems:
                     print(f"[FAIL] aProxy would reject this reply: {problem}")
@@ -421,8 +442,8 @@ def main() -> None:
             if parsed.get("error") is not None:
                 # aProxy treats any non-null `error`, even an empty string, as a failure
                 print(f'\n[WARN] error reply: {parsed["error"]!r} (aProxy would answer 502 on '
-                      'the request side, or pass the upstream response through on the '
-                      'response side)')
+                      'the request side, pass the upstream response through on the '
+                      'response side, or send its fixed heartbeat on the heartbeat stage)')
             else:
                 print(f"\n[OK] the reply is valid JSON. Check by hand ({side_label}):")
                 for c in checkpoints(ns.format_spec, ns.side, ns.sse):
@@ -444,6 +465,31 @@ def main() -> None:
         print("[WARN] still running 5s after stdin closed: the program ignores EOF, so a "
               "persistent worker would be left behind if aProxy exits without cleaning up")
         proc.kill()
+
+
+def heartbeat_problems(env: dict) -> list:
+    """Why aProxy would discard this heartbeat reply and send its fixed heartbeat
+    instead, mirroring config::heartbeat_problem: the bytes must be UTF-8 and
+    leave the client's SSE parser at an event boundary."""
+    if env.get("body_b64") is not None:
+        try:
+            raw = base64.b64decode(env["body_b64"], validate=True)
+            text = raw.decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return ["heartbeat bytes must be UTF-8"]
+    else:
+        text = env.get("body") or ""
+    if not text:
+        return []  # empty = write nothing this tick
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized.endswith("\n"):
+        return ["the heartbeat must end with a line break, or it merges with the first "
+                "replayed line"]
+    has_field = any(line and not line.startswith(":") for line in normalized.split("\n"))
+    if has_field and not normalized.endswith("\n\n"):
+        return ["a heartbeat with field lines (event:, data:) must end with a blank line, "
+                "or it merges with the first replayed event"]
+    return []
 
 
 def envelope_problems(env) -> list:

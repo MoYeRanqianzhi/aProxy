@@ -288,6 +288,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     for (name, t) in [
         ("request", &state.config.request_transform),
         ("response", &state.config.response_transform),
+        ("heartbeat", &state.config.heartbeat_transform),
     ] {
         if let Some(t) = t {
             tracing::info!(

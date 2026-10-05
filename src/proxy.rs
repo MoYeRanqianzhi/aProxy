@@ -67,7 +67,11 @@ use std::{
 use tokio::io::{AsyncRead as _, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::io::ReaderStream;
 
-use crate::{config::Config, retry, transform::ExchangeCtx};
+use crate::{
+    config::Config,
+    retry,
+    transform::{ExchangeCtx, HeartbeatSource},
+};
 
 /// 需要过滤的 hop-by-hop 头，避免透传导致协议错误或与 hyper/reqwest 的
 /// 自动管理（content-length / transfer-encoding / host / connection）冲突。
@@ -134,6 +138,8 @@ pub struct AppState {
     /// 内部编排细节（TransformPool 的接口不对外），AppState 虽 pub 但不泄漏它。
     pub(crate) request_pool: Option<Arc<crate::transform::TransformPool>>,
     pub(crate) response_pool: Option<Arc<crate::transform::TransformPool>>,
+    /// 心跳转换器进程池（`heartbeat_transform`）；None = 只发固定心跳
+    pub(crate) heartbeat_pool: Option<Arc<crate::transform::TransformPool>>,
     /// 入站来源校验策略（源 `config.allowed_hosts` / `allowed_origins` 与监听
     /// 地址）：启动时归一一次，热路径只做小集合比较。
     inbound: Arc<InboundPolicy>,
@@ -391,6 +397,10 @@ impl AppState {
             .response_transform
             .as_ref()
             .map(|t| Arc::new(crate::transform::TransformPool::new(Arc::new(t.clone()))));
+        let heartbeat_pool = config
+            .heartbeat_transform
+            .as_ref()
+            .map(|t| Arc::new(crate::transform::TransformPool::new(Arc::new(t.clone()))));
         let inbound = Arc::new(InboundPolicy::from_config(&config));
         Self {
             spool_dir,
@@ -404,6 +414,7 @@ impl AppState {
             bounded_retry_patterns,
             request_pool,
             response_pool,
+            heartbeat_pool,
             inbound,
         }
     }
@@ -1276,10 +1287,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
         target_url: upstream_url(&state.config, &uri),
         headers,
         body: req_body,
-        ctx: ExchangeCtx {
-            request_id: request_seq.to_string(),
-            state: None,
-        },
+        ctx: ExchangeCtx::new(request_seq.to_string()),
     };
     let max_spool_bytes = spool_limit_bytes(&state.config);
 
@@ -1425,7 +1433,7 @@ async fn apply_request_transform(
         target_url,
         headers,
         body,
-        mut ctx,
+        ctx,
     } = req;
     match crate::transform::transform_request(
         pool,
@@ -1440,9 +1448,6 @@ async fn apply_request_transform(
     {
         Ok(t) => {
             tracing::info!(url = %crate::config::mask_base_url(&t.url), "请求已由外部转换器改写");
-            if t.state.is_some() {
-                ctx.state = t.state;
-            }
             Ok(OutboundRequest {
                 method: t.method,
                 target_url: t.url,
@@ -1906,9 +1911,8 @@ enum KeepaliveSink {
         /// 暂停跳过了（见 `drive`）。暂停只限那一次尝试：它若需要重试，下一段
         /// 驱动一开始就补提交，绝不把「首字节 ≤ 一个保活间隔」再往后拖一整拍
         skeleton_due: bool,
-        /// 每拍写出的心跳字节（config 的 keepalive_heartbeat 生效值），提交时
-        /// 带进 Committed
-        heartbeat: Bytes,
+        /// 心跳来源，提交时带进 Committed
+        beat: Heartbeat,
     },
     Committed {
         tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
@@ -1920,8 +1924,77 @@ enum KeepaliveSink {
         /// 事件都算真实字节）。只有这种等待中的断开才可能是客户端的流空闲超时
         /// 到点，断开提示据此判定
         heartbeats_only: bool,
-        heartbeat: Bytes,
+        beat: Heartbeat,
+        /// 「真实字节已开始写出」闸门：动态心跳在独立任务里写通道，必须与回放
+        /// 互斥，否则心跳可能插进回放的事件中间。`send` 写第一块真实字节前在
+        /// 锁内置位；心跳任务在锁内确认未置位才写（try_send 不阻塞，持锁极短）
+        replay_gate: Arc<std::sync::Mutex<bool>>,
     },
+}
+
+/// 心跳的来源：config 的固定字节（keepalive_heartbeat 生效值），以及配置了
+/// heartbeat_transform、且请求转换已完成时由心跳转换器逐拍生成的动态心跳。
+#[derive(Clone)]
+struct Heartbeat {
+    fixed: Bytes,
+    dynamic: Option<Arc<DynamicHeartbeat>>,
+}
+
+/// 一个请求的动态心跳生成器（在各拍的独立任务间共享）。
+struct DynamicHeartbeat {
+    pool: Arc<crate::transform::TransformPool>,
+    ctx: ExchangeCtx,
+    source: HeartbeatSource,
+    /// 已发起的心跳调用次数（信封 heartbeat.seq）
+    seq: std::sync::atomic::AtomicU64,
+    /// 当前第几次上游尝试，重试循环每轮更新
+    attempt: std::sync::atomic::AtomicU32,
+    /// 有一次调用还没回来：这一拍不再排队调用，直接发固定心跳
+    in_flight: std::sync::atomic::AtomicBool,
+    /// 本请求已就心跳转换失败 warn 过（只 warn 一次，免得每拍刷屏）
+    warned: std::sync::atomic::AtomicBool,
+}
+
+/// 在独立任务里跑完一次心跳转换并写出结果。不在 drive 的 select 里直接
+/// await：drive 一返回就会 drop 在途的转换，persistent worker 在往返中途被
+/// drop 会被剔除（进程被杀），每拍都可能发生。
+fn spawn_dynamic_heartbeat(
+    d: Arc<DynamicHeartbeat>,
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    gate: Arc<std::sync::Mutex<bool>>,
+    fixed: Bytes,
+    elapsed: Duration,
+) {
+    tokio::spawn(async move {
+        let info = aproxy_envelope::HeartbeatInfo {
+            seq: d.seq.fetch_add(1, AtomicOrdering::Relaxed) + 1,
+            elapsed_ms: elapsed.as_millis() as u64,
+            attempt: d.attempt.load(AtomicOrdering::Relaxed),
+        };
+        let bytes =
+            match crate::transform::transform_heartbeat(&d.pool, &d.ctx, &d.source, info).await {
+                Ok(b) => b,
+                Err(why) => {
+                    if !d.warned.swap(true, AtomicOrdering::Relaxed) {
+                        tracing::warn!(
+                            request_id = %d.ctx.request_id,
+                            error = %why,
+                            "心跳转换失败，这一拍改发固定心跳（本请求之后的失败不再重复告警）"
+                        );
+                    }
+                    Some(fixed)
+                }
+            };
+        if let Some(bytes) = bytes {
+            let replaying = gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !*replaying {
+                let _ = tx.try_send(Ok(bytes));
+            }
+        }
+        d.in_flight.store(false, AtomicOrdering::Release);
+    });
 }
 
 impl KeepaliveSink {
@@ -1951,13 +2024,13 @@ impl KeepaliveSink {
     fn commit(&mut self, status: StatusCode, headers: HeaderMap) -> bool {
         let Self::Pending {
             resp_tx: slot,
-            heartbeat,
+            beat,
             ..
         } = self
         else {
             return true;
         };
-        let heartbeat = heartbeat.clone();
+        let beat = beat.clone();
         let Some(resp_tx) = slot.take() else {
             return false;
         };
@@ -1986,7 +2059,8 @@ impl KeepaliveSink {
             gone_rx,
             at: tokio::time::Instant::now(),
             heartbeats_only: true,
-            heartbeat,
+            beat,
+            replay_gate: Arc::default(),
         };
         true
     }
@@ -2008,15 +2082,54 @@ impl KeepaliveSink {
     }
 
     /// 发一个心跳。用 try_send 而非 send：通道满说明客户端还有没读走的字节，
-    /// 这一拍可以省；而在这里阻塞会连带停住对上游响应的读取。
-    /// false = 客户端已断开（接收端随响应 Body 销毁）。
+    /// 这一拍可以省；而在这里阻塞会连带停住对上游响应的读取。配置了心跳转换器
+    /// 且上一次调用已回来时，这一拍交给它生成（独立任务，结果稍后写出）；否则
+    /// 发固定心跳。false = 客户端已断开（接收端随响应 Body 销毁）。
     fn heartbeat(&self) -> bool {
         match self {
-            Self::Committed { tx, heartbeat, .. } => !matches!(
-                tx.try_send(Ok(heartbeat.clone())),
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
-            ),
+            Self::Committed {
+                tx,
+                beat,
+                at,
+                replay_gate,
+                ..
+            } => {
+                if tx.is_closed() {
+                    return false;
+                }
+                if let Some(d) = &beat.dynamic
+                    && !d.in_flight.swap(true, AtomicOrdering::AcqRel)
+                {
+                    spawn_dynamic_heartbeat(
+                        d.clone(),
+                        tx.clone(),
+                        replay_gate.clone(),
+                        beat.fixed.clone(),
+                        at.elapsed(),
+                    );
+                    return true;
+                }
+                !matches!(
+                    tx.try_send(Ok(beat.fixed.clone())),
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+                )
+            }
             Self::Pending { .. } => true,
+        }
+    }
+
+    /// 请求转换完成后启用动态心跳（之前各拍不知道最终请求，只发固定心跳）
+    fn arm_dynamic_heartbeat(&mut self, d: Arc<DynamicHeartbeat>) {
+        match self {
+            Self::Pending { beat, .. } | Self::Committed { beat, .. } => beat.dynamic = Some(d),
+        }
+    }
+
+    /// 告诉动态心跳当前是第几次上游尝试
+    fn note_attempt(&self, attempt: u32) {
+        let (Self::Pending { beat, .. } | Self::Committed { beat, .. }) = self;
+        if let Some(d) = &beat.dynamic {
+            d.attempt.store(attempt, AtomicOrdering::Relaxed);
         }
     }
 
@@ -2027,8 +2140,15 @@ impl KeepaliveSink {
             Self::Committed {
                 tx,
                 heartbeats_only,
+                replay_gate,
                 ..
             } => {
+                if *heartbeats_only {
+                    // 第一块真实字节：先关闸，之后到达的动态心跳一律丢弃
+                    *replay_gate
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                }
                 *heartbeats_only = false;
                 tx.send(chunk).await.is_ok()
             }
@@ -2377,7 +2497,10 @@ async fn proxy_with_keepalive(
         let mut sink = KeepaliveSink::Pending {
             resp_tx: Some(resp_tx),
             skeleton_due: false,
-            heartbeat: Bytes::copy_from_slice(state.config.keepalive_heartbeat()),
+            beat: Heartbeat {
+                fixed: Bytes::copy_from_slice(state.config.keepalive_heartbeat()),
+                dynamic: None,
+            },
         };
         // 整个请求共用一个节拍，首个 tick 在请求开始一个间隔之后：它既是「一个
         // 间隔内仍无可提交结果就提交骨架」的计时器，也是提交后的心跳节拍。
@@ -2428,10 +2551,22 @@ async fn proxy_with_keepalive(
             HeaderValue::from_static("identity"),
         );
         log_proxied_request(&method, &path_and_query, &target_url);
+        if let Some(pool) = &state.heartbeat_pool {
+            sink.arm_dynamic_heartbeat(Arc::new(DynamicHeartbeat {
+                pool: pool.clone(),
+                ctx: ctx.clone(),
+                source: HeartbeatSource::new(&method, &target_url, &headers, &req_body),
+                seq: Default::default(),
+                attempt: Default::default(),
+                in_flight: Default::default(),
+                warned: Default::default(),
+            }));
+        }
 
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
+            sink.note_attempt(attempt);
             if attempt > 1 {
                 // 与非保活通道同款：每轮重试刷新活动时间戳（语义 = 仍在处理中），
                 // 防止无限重试中的实例被 stop idle 误判闲置强退（M1）
@@ -3366,7 +3501,11 @@ mod tests {
             gone_rx,
             at: tokio::time::Instant::now() - waited,
             heartbeats_only,
-            heartbeat: Bytes::from_static(b": keepalive\n\n"),
+            beat: Heartbeat {
+                fixed: Bytes::from_static(b": keepalive\n\n"),
+                dynamic: None,
+            },
+            replay_gate: Arc::default(),
         };
         (sink, rx, gone_tx)
     }
@@ -3388,7 +3527,10 @@ mod tests {
         KeepaliveSink::Pending {
             resp_tx: None,
             skeleton_due: false,
-            heartbeat: Bytes::new(),
+            beat: Heartbeat {
+                fixed: Bytes::new(),
+                dynamic: None,
+            },
         }
         .log_client_gone("等待上游");
         let (short, _rx1, _g1) = committed_sink(Duration::from_secs(30), true);
@@ -3410,6 +3552,55 @@ mod tests {
             !out.contains("Claude Code") && !out.contains("CLAUDE_STREAM_IDLE_TIMEOUT_MS"),
             "提示不点名具体客户端: {out}"
         );
+    }
+
+    #[tokio::test]
+    async fn dynamic_heartbeat_arriving_after_replay_started_is_dropped() {
+        // 心跳转换器慢（400ms）：这一拍的调用还没回来，回放已写出第一块真实
+        // 字节。迟到的动态心跳必须丢弃——写出去就插进了回放的事件中间
+        let name = if cfg!(windows) {
+            "format-echo.exe"
+        } else {
+            "format-echo"
+        };
+        let mut dir = std::env::current_exe().unwrap();
+        let echo = loop {
+            let parent = dir.parent().expect("format-echo 未编译").to_path_buf();
+            if parent.join("examples").join(name).exists() {
+                break parent.join("examples").join(name);
+            }
+            dir = parent;
+        };
+        let pool = Arc::new(crate::transform::TransformPool::new(Arc::new(
+            crate::config::TransformConfig {
+                command: echo.display().to_string(),
+                args: vec!["heartbeat".to_string(), "400".to_string()],
+                timeout_secs: Some(10),
+                ..Default::default()
+            },
+        )));
+        let (mut sink, mut rx, _gone) = committed_sink(Duration::ZERO, true);
+        sink.arm_dynamic_heartbeat(Arc::new(DynamicHeartbeat {
+            pool,
+            ctx: ExchangeCtx::new("1".to_string()),
+            source: HeartbeatSource::new(
+                &http::Method::POST,
+                "http://upstream.invalid/v1/messages",
+                &HeaderMap::new(),
+                &RequestBody::Memory(Bytes::new()),
+            ),
+            seq: Default::default(),
+            attempt: Default::default(),
+            in_flight: Default::default(),
+            warned: Default::default(),
+        }));
+        assert!(sink.heartbeat(), "发起这一拍的动态心跳（在途）");
+        let real = Bytes::from_static(b"data: real\n\n");
+        assert!(sink.send(Ok(real.clone())).await);
+        assert_eq!(rx.recv().await.unwrap().unwrap(), real);
+        // 等心跳转换回来（400ms + 进程启动）后，通道里不应再出现任何字节
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        assert!(rx.try_recv().is_err(), "回放开始后到达的心跳不应写出");
     }
 
     #[tokio::test]

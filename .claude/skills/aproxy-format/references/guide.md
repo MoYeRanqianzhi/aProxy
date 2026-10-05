@@ -224,7 +224,7 @@ python scripts/test_format.py --format-spec anthropic --body-file payload.bin --
 | Flag | Meaning |
 |---|---|
 | `--format-spec` | `anthropic`, `openai-chat` or `openai-responses`: protocol of the mock body (required) |
-| `--side` | `request` (default) or `response` |
+| `--side` | `request` (default), `response`, or `heartbeat` (the first tick of `heartbeat_transform`, body included; the reply body is checked against the event-boundary rule) |
 | `--sse` | Response side only: an SSE body instead of JSON |
 | `--command` | Program to run (required); its arguments go after `--` |
 | `--url` | Envelope `url` (default: the protocol's usual endpoint) |

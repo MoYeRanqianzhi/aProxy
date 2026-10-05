@@ -228,6 +228,8 @@ listen_addr = "127.0.0.1:12345"          # 本地监听
                                          # 多 key 轮换、多渠道聚合；失败 502 不重试；与 forward_only 互斥）
 # response_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
                                          # 外部转换器（响应侧，须与请求侧配同一份 extra）：改写上游响应后回放（失败透传原样）
+# heartbeat_transform = { command = "...", mode = "persistent" }
+                                         # 心跳转换器：保活等待中每拍由 format 按请求内容生成心跳（失败或慢则改发固定心跳）
                                          # command/extra 用 ~/ 或绝对路径：守护进程的工作目录不可靠，相对路径会找不到
 ```
 
@@ -263,7 +265,7 @@ aProxy 是本机单用户代理：它持有并向每个转发请求注入上游�
 
 - 默认只监听回环地址（`127.0.0.1`）。**不要把 `listen_addr` 改成 `0.0.0.0` 或局域网地址**——那等于让同网段的任何主机免鉴权使用你的密钥；确需对外开放时，启动、`startup.log` 与 `aproxy doctor` 会给出警告。
 - `api_key` 以明文存放在 `config.toml`，请收紧文件权限（仅当前用户可读）。
-- 外部转换器（`request_transform` / `response_transform`）会按配置执行任意命令；只配置你信任的程序，且不要让他人能修改你的 `config.toml`。
+- 外部转换器（`request_transform` / `response_transform` / `heartbeat_transform`）会按配置执行任意命令；只配置你信任的程序，且不要让他人能修改你的 `config.toml`。
 - 日志与 `status` 对 URL 内嵌凭据与查询串的值打码（`?key=***`），可安全粘贴分享。
 
 完整的威胁模型与漏洞报告方式见 [SECURITY.md](SECURITY.md)。

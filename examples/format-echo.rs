@@ -15,6 +15,10 @@
 //! - `stateful` 跨阶段状态验证：把收到的 `stage|request_id|state` 写进
 //!   `x-stage-seen` 头（请求侧进发往上游的请求头，响应侧进回给客户端的响应
 //!   头）；请求阶段回信带 `state = "from-request-<request_id>"`
+//! - `heartbeat [<ms>]` 心跳阶段（先睡 <ms> 毫秒，缺省不睡）回一条 SSE 注释
+//!   `: hb seq=<n> attempt=<n> body=<有无请求体>` 并把 state 设为 `hb-<seq>`；
+//!   响应阶段在 body 末尾追加注释 `: state=<state>`（验证心跳回信的 state 能到达
+//!   响应转换）；请求阶段原样回显
 //!
 //! 违反协议 / 进程生命周期类（进程池加固的回归面）：
 //! - `banner`  启动时先往 stdout 打一行非信封横幅，之后照常回显——模拟
@@ -124,6 +128,33 @@ fn main() {
                     env.state = (env.stage.as_deref() == Some("request"))
                         .then(|| format!("from-request-{id}"));
                     env
+                });
+            }
+            "heartbeat" => {
+                respond(&line, |mut env| match env.stage.as_deref() {
+                    Some("heartbeat") => {
+                        if let Some(ms) = args.get(1).and_then(|s| s.parse().ok()) {
+                            std::thread::sleep(std::time::Duration::from_millis(ms));
+                        }
+                        let hb = env.heartbeat.clone().unwrap_or_default();
+                        let has_body = env.body.is_some() || env.body_b64.is_some();
+                        env.body = Some(format!(
+                            ": hb seq={} attempt={} body={has_body}\n\n",
+                            hb.seq, hb.attempt
+                        ));
+                        env.body_b64 = None;
+                        env.state = Some(format!("hb-{}", hb.seq));
+                        env
+                    }
+                    Some("response") => {
+                        let state = env.state.clone().unwrap_or_else(|| "-".to_string());
+                        env.body = Some(format!(
+                            "{}: state={state}\n\n",
+                            env.body.take().unwrap_or_default()
+                        ));
+                        env
+                    }
+                    _ => env,
                 });
             }
             "rewrite" => {

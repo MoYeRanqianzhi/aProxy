@@ -374,6 +374,7 @@ pub(crate) fn handle_config_cmd(
         for (name, t) in [
             ("request_transform", &cfg.request_transform),
             ("response_transform", &cfg.response_transform),
+            ("heartbeat_transform", &cfg.heartbeat_transform),
         ] {
             let Some(t) = t else {
                 println!("{name} = (未设置)");

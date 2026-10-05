@@ -351,6 +351,16 @@ pub struct Config {
     /// 仅 toml 每实例配置。
     #[serde(default)]
     pub response_transform: Option<TransformConfig>,
+    /// 心跳转换器（外部 format 程序）：保活响应提交之后、真实字节回放之前，
+    /// 每个 keepalive 间隔调用一次（信封 `stage = "heartbeat"`），回信的 body
+    /// 就是这一拍写给客户端的字节（空 = 本拍不写）。用于按请求内容生成心跳：
+    /// aProxy 不认识协议，能被客户端当作「事件」的心跳只能由懂协议的 format 生成。
+    /// **失败语义**：调用失败、超时、回信不合 keepalive_heartbeat 的事件边界规则
+    /// → 这一拍改发固定心跳（同一请求只 warn 一次）；上一拍的调用还没回来时，
+    /// 这一拍直接发固定心跳而不排队——心跳不得被慢 format 拖住。请求转换完成
+    /// 之前的各拍同样发固定心跳（此时还不知道最终请求）。仅 toml 每实例配置。
+    #[serde(default)]
+    pub heartbeat_transform: Option<TransformConfig>,
     /// 守护日志文件路径（自定义去向）：不设时写入 `~/.aproxy/logs/` 下按启动
     /// 时刻随机命名的文件（文件名不含端口——端口是易变标识，换端口重启后
     /// 日志照样按实例连续可查，实际路径由实例经 IPC 上报，客户端不拼路径）。
@@ -429,6 +439,7 @@ impl Default for Config {
             allowed_origins: None,
             request_transform: None,
             response_transform: None,
+            heartbeat_transform: None,
             log_file: None,
             spool_dir_override: None,
         }
@@ -491,6 +502,7 @@ impl Config {
         // 转换器：command 统一 trim，trim 后为空视为未配置（与代理空白语义一致）
         self.request_transform = trim_transform_command(self.request_transform.take());
         self.response_transform = trim_transform_command(self.response_transform.take());
+        self.heartbeat_transform = trim_transform_command(self.heartbeat_transform.take());
         self
     }
 
@@ -547,6 +559,7 @@ impl Config {
         for (name, t) in [
             ("request_transform", &self.request_transform),
             ("response_transform", &self.response_transform),
+            ("heartbeat_transform", &self.heartbeat_transform),
         ] {
             let Some(t) = t else { continue };
             if t.command.trim().is_empty() {
@@ -560,7 +573,9 @@ impl Config {
             }
         }
         if self.forward_only_enabled()
-            && (self.request_transform.is_some() || self.response_transform.is_some())
+            && (self.request_transform.is_some()
+                || self.response_transform.is_some()
+                || self.heartbeat_transform.is_some())
         {
             return Err(
                 "forward_only 与外部转换器互斥：forward_only 不缓冲请求体，转换器需要全量 body（两者只能留一个）"
@@ -1949,18 +1964,17 @@ mod tests {
     fn validate_rejects_forward_only_with_transform() {
         // 互斥：forward_only 不缓冲请求体，转换器需要全量 body——同开是配置矛盾，
         // 必须启动即报错而非静默丢弃其一
-        for name in ["request", "response"] {
+        for name in ["request", "response", "heartbeat"] {
+            let t = || TransformConfig {
+                command: "f".to_string(),
+                ..Default::default()
+            };
             let cfg = Config {
                 base_url: "https://api.example.com".to_string(),
                 forward_only: Some(true),
-                request_transform: (name == "request").then(|| TransformConfig {
-                    command: "f".to_string(),
-                    ..Default::default()
-                }),
-                response_transform: (name == "response").then(|| TransformConfig {
-                    command: "f".to_string(),
-                    ..Default::default()
-                }),
+                request_transform: (name == "request").then(t),
+                response_transform: (name == "response").then(t),
+                heartbeat_transform: (name == "heartbeat").then(t),
                 ..Default::default()
             };
             let err = cfg.validate().unwrap_err();

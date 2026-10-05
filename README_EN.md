@@ -331,6 +331,8 @@ listen_addr = "127.0.0.1:12345"          # local listener
                                          # (protocol conversion, key rotation, multi-channel aggregation; failure = 502, no retry; exclusive with forward_only)
 # response_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
                                          # external transformer (response side; use the same extra as the request side): rewrite upstream responses before replay (failure passes through)
+# heartbeat_transform = { command = "...", mode = "persistent" }
+                                         # heartbeat transformer: a format program generates each keepalive heartbeat from the request (fixed heartbeat on failure or when slow)
                                          # use ~/ or absolute paths for command/extra: the daemon's working directory is unreliable, so relative paths may not resolve
 ```
 
@@ -411,7 +413,7 @@ into every forwarded request, and the proxy port itself has no authentication.
   `aproxy doctor` will warn you.
 - `api_key` is stored in plain text in `config.toml`; restrict the file's
   permissions to your own user.
-- External transformers (`request_transform` / `response_transform`) run
+- External transformers (`request_transform` / `response_transform` / `heartbeat_transform`) run
   arbitrary commands from the config; only configure programs you trust and do
   not let others edit your `config.toml`.
 - Logs and `status` mask URL-embedded credentials and query-string values

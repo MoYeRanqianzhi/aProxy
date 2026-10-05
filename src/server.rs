@@ -45,7 +45,9 @@ pub(crate) fn resolve_daemon_log_path(
 ) -> PathBuf {
     match cli_log_file.or(cfg_log_file) {
         Some(raw) => {
-            let expanded = aproxy::settings::expand_path(raw);
+            // 只展开 `~`，不用 settings::expand_path：后者按当前工作目录绝对化，
+            // 而守护进程的工作目录不可靠——相对路径一律相对 APROXY_HOME
+            let expanded = PathBuf::from(aproxy::config::expand_tilde(raw));
             if expanded.is_absolute() {
                 expanded
             } else {
@@ -472,4 +474,35 @@ pub(crate) fn report_config_error(msg: &str, daemon_child: bool) {
         }
     }
     eprintln!("{msg}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_log_file_resolves_against_aproxy_home() {
+        // 相对路径一律相对 APROXY_HOME，与当前工作目录无关（守护进程的工作
+        // 目录不可靠）；CLI --log-file 优先于配置；绝对路径原样；`~` 展开
+        let home = settings::home();
+        assert_eq!(
+            resolve_daemon_log_path(None, Some("logs/a.log")),
+            home.join("logs/a.log")
+        );
+        assert_eq!(
+            resolve_daemon_log_path(Some("b.log"), Some("logs/a.log")),
+            home.join("b.log")
+        );
+        let abs = std::env::temp_dir().join("aproxy-abs.log");
+        assert_eq!(
+            resolve_daemon_log_path(None, Some(&abs.display().to_string())),
+            abs
+        );
+        let tilde = resolve_daemon_log_path(None, Some("~/aproxy-tilde.log"));
+        assert!(
+            tilde.is_absolute() && tilde.ends_with("aproxy-tilde.log"),
+            "{}",
+            tilde.display()
+        );
+    }
 }

@@ -696,7 +696,7 @@ fn trim_transform_command(t: Option<TransformConfig>) -> Option<TransformConfig>
 
 /// `~` 前缀展开：`~/x`、`~\x`、裸 `~` → 用户主目录；其余原样。
 /// 展开产物统一用 `/` 分隔（Windows API 同样接受）。
-fn expand_tilde(s: &str) -> String {
+pub fn expand_tilde(s: &str) -> String {
     let home = || {
         dirs::home_dir()
             .map(|p| {

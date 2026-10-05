@@ -57,7 +57,11 @@ fn warn_if_config_broken(path: &std::path::Path) {
     }
 }
 
-pub(crate) fn handle_config_cmd(path: PathBuf, args: ConfigArgs, explicit_config: bool) {
+pub(crate) fn handle_config_cmd(
+    path: Result<PathBuf, String>,
+    args: ConfigArgs,
+    explicit_config: bool,
+) {
     let ConfigArgs {
         baseurl,
         listen,
@@ -83,7 +87,10 @@ pub(crate) fn handle_config_cmd(path: PathBuf, args: ConfigArgs, explicit_config
             eprintln!("--set-default 与 --clear-default 不能同时使用");
             std::process::exit(1);
         }
-        let mut s = settings::load();
+        let mut s = settings::load_for_update().unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        });
         if let Some(p) = set_default {
             let abs = settings::expand_path(&p);
             if !abs.is_file() {
@@ -111,6 +118,8 @@ pub(crate) fn handle_config_cmd(path: PathBuf, args: ConfigArgs, explicit_config
         return;
     }
 
+    // 以下编辑/查看 toml 内容，才真正需要配置文件路径
+    let path = super::require_cfg_path(path);
     let mut cfg = config::load_from(&path);
 
     let mut changed = false;

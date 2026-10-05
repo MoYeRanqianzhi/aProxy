@@ -4575,6 +4575,88 @@ fn cli_config_flag_scopes_config_subcommand() {
 }
 
 #[test]
+fn stale_default_config_blocks_only_commands_that_read_it() {
+    // settings.json 的 default_config 指向已删除的文件：要读配置的命令（这里用
+    // config --show，不用启动以免拉起守护）照旧报错；status 与报错信息里推荐的
+    // `config --clear-default` 不得被拦住——曾经所有不带 --config 的命令都在
+    // 分发前退出 1，连修复命令本身都跑不了
+    let home = tempfile::tempdir().unwrap();
+    let gone = home
+        .path()
+        .join("gone.toml")
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    let settings_path = home.path().join("settings.json");
+    std::fs::write(&settings_path, format!(r#"{{"default_config": "{gone}"}}"#)).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_aproxy"))
+            .args(args)
+            .env("APROXY_HOME", home.path())
+            .output()
+            .unwrap()
+    };
+
+    let show = run(&["config", "--show"]);
+    assert_eq!(show.status.code(), Some(1), "要读配置的命令应报错");
+    let stderr = String::from_utf8_lossy(&show.stderr);
+    assert!(stderr.contains("默认配置文件不存在"), "{stderr}");
+
+    let status = run(&["status"]);
+    assert!(
+        status.status.success(),
+        "status 不读配置文件，不应被失效的 default_config 拦住: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    let clear = run(&["config", "--clear-default"]);
+    assert!(
+        clear.status.success(),
+        "报错信息推荐的修复命令必须能执行: {}",
+        String::from_utf8_lossy(&clear.stderr)
+    );
+    let saved = std::fs::read_to_string(&settings_path).unwrap();
+    assert!(
+        !saved.contains("gone.toml"),
+        "default_config 应已清除: {saved}"
+    );
+}
+
+#[test]
+fn corrupt_settings_json_is_never_overwritten() {
+    // settings.json 解析失败时宽松加载回退全默认；写回型命令若照此保存，文件
+    // 里原有的别名会被整体冲掉。必须拒绝修改、原样保留文件
+    let home = tempfile::tempdir().unwrap();
+    let settings_path = home.path().join("settings.json");
+    let corrupt = r#"{"aliases": {"keep": "/keep.toml"}"#;
+    std::fs::write(&settings_path, corrupt).unwrap();
+    let cfg = home.path().join("x.toml");
+    std::fs::write(&cfg, "base_url = \"https://x.example.com\"\n").unwrap();
+
+    for args in [
+        vec!["alias", "add", "x", cfg.to_str().unwrap()],
+        vec!["config", "--clear-default"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_aproxy"))
+            .args(&args)
+            .env("APROXY_HOME", home.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?} 应拒绝修改");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("不做修改"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&settings_path).unwrap(),
+            corrupt,
+            "{args:?} 不得改写损坏的 settings.json"
+        );
+    }
+}
+
+#[test]
 fn cli_config_show_rejects_missing_explicit_file() {
     // 与写操作对照：--show / 无修改参数对「显式 --config 指向的不存在文件」
     // 必须报错——此时展示的只是内置默认值（抬头却是用户给的路径），静默回退

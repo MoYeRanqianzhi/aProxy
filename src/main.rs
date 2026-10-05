@@ -16,8 +16,7 @@ use clap::Parser;
 
 use cli::{Cli, Commands};
 
-use aproxy::config;
-use aproxy::settings::{self, expand_path};
+use aproxy::settings;
 
 #[tokio::main]
 async fn main() {
@@ -33,30 +32,9 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    // 实际生效的配置文件路径：--config 显式指定 > settings.json 的 default_config
-    // （用户可把日常主力配置换成任意文件）> 默认 ~/.aproxy/config.toml。
-    // default_config 失效（文件被删/移动）必须在此明确报错：静默回退默认配置会让
-    // 用户在错误的配置文件上排障（报错信息指向 config.toml，而他配置的是另一个文件）
-    let cfg_path = match cli.config.clone() {
-        Some(p) => p,
-        None => {
-            let s = settings::load();
-            match &s.default_config {
-                Some(p) => {
-                    let path = expand_path(p);
-                    if !path.is_file() {
-                        eprintln!(
-                            "settings.json 指定的默认配置文件不存在: {}\n用 aproxy config --set-default <路径> 重新指定，或 aproxy config --clear-default 取消",
-                            path.display()
-                        );
-                        std::process::exit(1);
-                    }
-                    path
-                }
-                None => config::config_path(),
-            }
-        }
-    };
+    // 实际生效的配置文件路径（default_config 失效时为 Err）。只在真正要读配置
+    // 的命令里兑现，见 commands::resolve_cfg_path
+    let cfg_path = commands::resolve_cfg_path(&cli);
 
     // 日志初始化：守护子进程无控制台，写日志文件；其余走 stdout（RUST_LOG 可覆盖）
     if cli.daemon_child {
@@ -65,7 +43,10 @@ async fn main() {
         // 一次性生成并写入 OnceLock，注册表/恢复记录/轮转共用同一份路径；
         // 校验失败的错误会写入 startup.log（见 report_config_error），日志
         // 初始化必须发生在校验之前——否则失败的启动连 startup.log 都写不出
-        let cfg = commands::start::load_with_cli_overrides(&cli, &cfg_path);
+        let cfg = commands::start::load_with_cli_overrides(
+            &cli,
+            &commands::require_cfg_path(cfg_path.clone()),
+        );
         let log_path =
             server::resolve_daemon_log_path(cli.log_file.as_deref(), cfg.log_file.as_deref());
         server::init_daemon_logging(&log_path);

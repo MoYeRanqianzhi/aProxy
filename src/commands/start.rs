@@ -128,11 +128,16 @@ fn apply_cli_overrides(mut cfg: Config, cli: &Cli) -> Config {
 /// - IPC ping 通但监听地址不同 → 同端口不同地址的另一实例，实例键（端口号）
 ///   无法区分，明确拒绝启动；
 /// - TCP bind 失败 → 按错误类别区分「被其他程序占用」/「无权限或被系统保留」。
-pub(crate) async fn handle_start_cmd(cli: &Cli, cfg_path: PathBuf, target: Option<String>) {
+pub(crate) async fn handle_start_cmd(
+    cli: &Cli,
+    cfg_path: Result<PathBuf, String>,
+    target: Option<String>,
+) {
     // start <别名|路径>：别名解析出的路径只在本进程可见，守护子进程的命令行
-    // 里必须显式带上 --config（见下方转发参数构造），否则子进程会回退默认配置
+    // 里必须显式带上 --config（见下方转发参数构造），否则子进程会回退默认配置。
+    // 给了 target 就不需要默认配置——失效的 default_config 只拦无 target 的启动
     let cfg_path = match target.as_deref() {
-        None => cfg_path,
+        None => super::require_cfg_path(cfg_path),
         Some(t) => match resolve_config_target(t) {
             Some(p) => p,
             None => {

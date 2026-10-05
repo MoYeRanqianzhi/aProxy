@@ -253,6 +253,28 @@ pub fn load_from(path: &std::path::Path) -> Settings {
     }
 }
 
+/// 供「读后写回」的命令（alias add/remove、config --set-default/--clear-default）
+/// 使用的严格加载：文件不存在 → 默认空配置；读不出或解析失败 → Err（给用户的
+/// 报错）。宽松的 `load` 在解析失败时回退全默认，若据此写回，文件里原有的别名
+/// 等内容会被整体冲掉——内部配置损坏时宁可拒绝修改，让用户先修复或删除文件。
+pub fn load_for_update() -> Result<Settings, String> {
+    load_for_update_from(&settings_path())
+}
+
+/// 同上，路径可指定（测试注入用）
+pub fn load_for_update_from(path: &Path) -> Result<Settings, String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str::<Settings>(&content).map_err(|e| {
+            format!(
+                "settings.json 解析失败（{e}），为免覆盖其中的别名等内容，本次不做修改。请先修复或删除该文件: {}",
+                path.display()
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
+        Err(e) => Err(format!("读取 settings.json 失败（{e}）: {}", path.display())),
+    }
+}
+
 /// 解析默认配置文件路径：settings.json 的 `default_config` 优先（`~` 展开），
 /// 未指定/指定失效时回退 `~/.aproxy/config.toml`。
 pub fn default_config_path() -> PathBuf {
@@ -535,6 +557,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = load_from(&settings_path_in(dir.path()));
         assert!(s.aliases.is_empty());
+    }
+
+    #[test]
+    fn load_for_update_refuses_corrupted_file() {
+        // 损坏的 settings.json 不得被「回退默认 → 写回」冲掉：严格加载报错，
+        // 文件原样保留；不存在则视为空配置，正常文件照常读出
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        assert!(load_for_update_from(&path).unwrap().aliases.is_empty());
+
+        std::fs::write(&path, r#"{"aliases": {"a": "/x.toml"}"#).unwrap();
+        let err = load_for_update_from(&path).unwrap_err();
+        assert!(
+            err.contains("解析失败") && err.contains("不做修改"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"aliases": {"a": "/x.toml"}"#,
+            "严格加载不得改动文件"
+        );
+
+        std::fs::write(&path, r#"{"aliases": {"a": "/x.toml"}}"#).unwrap();
+        assert_eq!(load_for_update_from(&path).unwrap().aliases.len(), 1);
     }
 
     #[test]

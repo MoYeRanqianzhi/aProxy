@@ -22,7 +22,10 @@ pub(crate) fn handle_alias_cmd(cmd: AliasCmd) {
                 eprintln!("配置文件不存在: {}", path.display());
                 std::process::exit(1);
             }
-            let mut s = settings::load();
+            let mut s = settings::load_for_update().unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(1);
+            });
             let replacing = s.aliases.contains_key(&name);
             s.aliases.insert(name.clone(), path.display().to_string());
             match settings::save(&s) {
@@ -41,7 +44,10 @@ pub(crate) fn handle_alias_cmd(cmd: AliasCmd) {
             }
         }
         AliasCmd::Remove { name } => {
-            let mut s = settings::load();
+            let mut s = settings::load_for_update().unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(1);
+            });
             match s.aliases.remove(&name) {
                 Some(path) => match settings::save(&s) {
                     Ok(()) => println!("已删除别名 {name}（原指向 {path}）"),

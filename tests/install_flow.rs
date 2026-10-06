@@ -665,7 +665,7 @@ fn start_bin_instance(env: &TestEnv, name: &str) -> std::process::Child {
         ),
     )
     .unwrap();
-    let child = Command::new(aproxy::install::swap::bin_path_in(&env.home()))
+    let mut child = Command::new(aproxy::install::swap::bin_path_in(&env.home()))
         .args([
             "--config",
             &cfg_file.display().to_string(),
@@ -683,6 +683,8 @@ fn start_bin_instance(env: &TestEnv, name: &str) -> std::process::Child {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    let _ = child.kill();
+    let _ = child.wait();
     panic!("实例未就绪");
 }
 

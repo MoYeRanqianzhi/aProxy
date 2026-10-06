@@ -34,7 +34,8 @@ CHANGELOG 写明升级下限（先装到 0.1.x 的某个版本）。
 
 **How to apply:** 动上面任何一项前，先跑 `tests/compat_v0_1_0.rs`（冻结的 0.1.0 结构，双向解析），想清楚
 更旧的读者会怎样；新字段用 serde default。改 install 流程要让 `tests/upgrade_from_0_1_0.rs`（CI 的
-upgrade-from-0-1-0 任务）保持通过。设计全文与逐条依据见 `.agents/plan/ipc-v1.md`。
+upgrade-from-0-1-0 任务）保持通过。设计全文与逐条依据（含 0.1.0 → 新版本每一步由谁执行的分析）在计划的最后版本：
+`git show 9e91a95:.agents/plan/ipc-v1.md`。
 
 **Evidence:** CI 88cf50c（2026-10-06）upgrade-from-0-1-0 在 windows 与 ubuntu 上用真实 v0.1.0 二进制驱动升级
 通过；早交接由 install_flow 的 6d/6e 与 install_flow_lib 的 `only_the_named_successor_takes_over_a_live_install`

@@ -1,7 +1,8 @@
 //! 0.1.0 兼容基线。0.1.0 已经发布：用户用 0.1.0 的 `aproxy install` 升级到之后的
 //! 版本时，0.1.0 的代码会读新版本写下的注册表（`run/<端口>.pid`）、恢复记录
-//! （`.restore`）与看护者 claim，新版本也要读 0.1.0 留下的同一批文件，并经 IPC 与
-//! 对方的守护对话（谁在哪一步运行，见 .agents/plan/ipc-v1.md 的 (c) 节）。
+//! （`.restore`）、看护者 claim 与安装状态（`run/install.state`），新版本也要读
+//! 0.1.0 留下的同一批文件，并经 IPC 与对方的守护对话（谁在哪一步运行，见
+//! .agents/plan/ipc-v1.md 的 (c) 节）。
 //!
 //! 这里冻结 0.1.0 的 serde 结构——逐字段照抄 v0.1.0 tag 的源码，**不要随新版本
 //! 修改**——并断言两个方向都能解析：
@@ -86,6 +87,104 @@ mod v0_1_0 {
         pub pid: u32,
         pub created_at_process: u64,
         pub heartbeat_secs: u64,
+    }
+
+    /// src/install/state.rs `InstallPhase`
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum InstallPhase {
+        Marking,
+        Downloading,
+        Downloaded,
+        Broadcasting,
+        Acked,
+        Swapping,
+        Swapped,
+        Relaying,
+        Restarting,
+        Verifying,
+        Cleaning,
+        Done,
+        Failed,
+        Aborted,
+    }
+
+    /// src/install/state.rs `InstallSource`
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum InstallSource {
+        #[default]
+        Github,
+        From,
+        Cargo,
+        Npm,
+        Binstall,
+        Url,
+    }
+
+    /// src/install/state.rs `SkillPhase`
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum SkillPhase {
+        Pending,
+        Downloading,
+        Done,
+        Failed,
+        Skipped,
+    }
+
+    /// src/install/state.rs `SkillState`
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct SkillState {
+        pub status: SkillPhase,
+        #[serde(default)]
+        pub attempt: u32,
+        #[serde(default)]
+        pub version: String,
+    }
+
+    /// src/install/state.rs `PendingRestore`
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct PendingRestore {
+        pub port: String,
+        #[serde(default)]
+        pub args: Vec<String>,
+        #[serde(default)]
+        pub log_path: String,
+    }
+
+    /// src/install/state.rs `InstallState`（`run/install.state` 内容）
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct InstallState {
+        pub phase: InstallPhase,
+        #[serde(default)]
+        pub target_version: String,
+        #[serde(default)]
+        pub source: InstallSource,
+        #[serde(default)]
+        pub staged_path: Option<String>,
+        #[serde(default)]
+        pub from_path: Option<String>,
+        #[serde(default)]
+        pub sha256: Option<String>,
+        #[serde(default)]
+        pub old_path: Option<String>,
+        #[serde(default)]
+        pub instance_snapshot: Vec<String>,
+        #[serde(default)]
+        pub skill: Option<SkillState>,
+        #[serde(default)]
+        pub started_at: u64,
+        #[serde(default)]
+        pub updated_at: u64,
+        #[serde(default)]
+        pub installer_pid: u32,
+        #[serde(default)]
+        pub pending_restores: Vec<PendingRestore>,
+        #[serde(default)]
+        pub halted: bool,
+        #[serde(default)]
+        pub last_error: Option<String>,
     }
 }
 
@@ -222,6 +321,113 @@ fn watchdog_claim_round_trips_with_0_1_0() {
     );
     // 0.1.0 的 claim 没有版本：新守护据此判定它更旧、该退役（R1）
     assert_eq!(read_back.version, None);
+}
+
+#[test]
+fn install_state_written_now_parses_as_0_1_0() {
+    // 0.1.0 的安装器在 Windows 上接力给新版本后，靠读新版本写下的状态报告结局
+    //（await_handover）；读不出来它就把损坏当「还在进行」，干等到超时。新版本
+    // 可能在任何阶段写状态（续作接手 relaying 现场时，阶段仍是 relaying），
+    // 所以每个阶段都要验
+    use aproxy::install::state::{InstallPhase, InstallSource, InstallState, SkillPhase};
+    let dir = tempfile::tempdir().unwrap();
+    for &phase in InstallPhase::RUN_ORDER.iter().chain(&[
+        InstallPhase::Done,
+        InstallPhase::Failed,
+        InstallPhase::Aborted,
+    ]) {
+        let mut state = InstallState::new_marking("9.9.9", InstallSource::From);
+        state.phase = phase;
+        state.staged_path = Some("C:/home/staging/9.9.9/aproxy.exe".into());
+        state.from_path = Some("C:/download/aproxy.exe".into());
+        state.sha256 = Some("ab".repeat(32));
+        state.old_path = Some("C:/home/bin/aproxy.old.exe".into());
+        state.instance_snapshot = vec!["12345".into(), "12346".into()];
+        state.skill = Some(aproxy::install::state::SkillState {
+            status: SkillPhase::Skipped,
+            attempt: 0,
+            version: "9.9.9".into(),
+        });
+        state.pending_restores = vec![aproxy::install::state::PendingRestore {
+            port: "12346".into(),
+            args: vec!["--config".into(), "C:/cfg/b.toml".into()],
+            log_path: "C:/home/logs/b.log".into(),
+        }];
+        state.halted = phase == InstallPhase::Failed;
+        state.last_error = Some("实例 12346 滚动重启失败".into());
+        aproxy::install::state::write_in(dir.path(), &mut state).unwrap();
+
+        let old: v0_1_0::InstallState =
+            serde_json::from_str(&read(&aproxy::install::state::state_path_in(dir.path())))
+                .unwrap_or_else(|e| panic!("0.1.0 读不出阶段 {phase:?} 的状态: {e}"));
+        assert_eq!(
+            serde_json::to_value(old.phase).unwrap(),
+            serde_json::to_value(phase).unwrap()
+        );
+        assert_eq!(old.installer_pid, state.installer_pid);
+        assert_eq!(old.halted, state.halted);
+        assert_eq!(old.last_error, state.last_error);
+        assert_eq!(old.instance_snapshot, state.instance_snapshot);
+    }
+}
+
+#[test]
+fn install_state_written_by_0_1_0_is_read() {
+    // 新版本接手 0.1.0 留下的现场：Windows 上 0.1.0 写好 relaying 再拉起新二进制
+    // 的 `install --continue`；0.1.0 中途死掉留下 restarting；实例级失败留下
+    // failed + halted（交给 install --continue 判断能否收尾）
+    use aproxy::install::state::InstallPhase;
+    for (old_phase, phase) in [
+        (v0_1_0::InstallPhase::Relaying, InstallPhase::Relaying),
+        (v0_1_0::InstallPhase::Restarting, InstallPhase::Restarting),
+        (v0_1_0::InstallPhase::Failed, InstallPhase::Failed),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let written_by_old = v0_1_0::InstallState {
+            phase: old_phase,
+            target_version: "9.9.9".into(),
+            source: v0_1_0::InstallSource::Github,
+            staged_path: Some("/home/u/.aproxy/staging/9.9.9/aproxy".into()),
+            from_path: None,
+            sha256: Some("cd".repeat(32)),
+            old_path: Some("/home/u/.aproxy/bin/aproxy.old".into()),
+            instance_snapshot: vec!["12345".into()],
+            skill: Some(v0_1_0::SkillState {
+                status: v0_1_0::SkillPhase::Downloading,
+                attempt: 1,
+                version: "9.9.9".into(),
+            }),
+            started_at: 1_760_000_000,
+            updated_at: 1_760_000_100,
+            installer_pid: 4242,
+            pending_restores: vec![v0_1_0::PendingRestore {
+                port: "12345".into(),
+                args: vec!["--config".into(), "/cfg/a.toml".into()],
+                log_path: "/home/u/.aproxy/logs/a.log".into(),
+            }],
+            halted: old_phase == v0_1_0::InstallPhase::Failed,
+            last_error: Some("核验时找不到实例".into()),
+        };
+        std::fs::write(
+            aproxy::install::state::state_path_in(dir.path()),
+            serde_json::to_string_pretty(&written_by_old).unwrap(),
+        )
+        .unwrap();
+        let st = aproxy::install::state::load_in(dir.path())
+            .unwrap_or_else(|| panic!("应能读出 0.1.0 写下的 {old_phase:?} 现场"));
+        assert_eq!(st.phase, phase);
+        assert_eq!(st.installer_pid, 4242);
+        assert_eq!(st.staged_path, written_by_old.staged_path);
+        assert_eq!(st.old_path, written_by_old.old_path);
+        assert_eq!(st.instance_snapshot, written_by_old.instance_snapshot);
+        assert_eq!(st.pending_restores.len(), 1);
+        assert_eq!(
+            st.pending_restores[0].args,
+            written_by_old.pending_restores[0].args
+        );
+        assert_eq!(st.halted, written_by_old.halted);
+        assert_eq!(st.last_error, written_by_old.last_error);
+    }
 }
 
 #[test]

@@ -97,3 +97,25 @@ crates.io 上的 aproxy 依赖的是旧 envelope，`cargo install aproxy` 编译
 0.x 是破坏性变更，升次版本（当时 0.1.0 → 0.2.0），根包与 aproxy-format 的依赖声明一起改。
 **Evidence:** release.yml 的「Plan crates to publish」步骤（200 = 已存在即跳过）；Cargo.toml
 `aproxy-envelope = { version = ..., path = ... }`。**Recheck when:** 发布流程改为按 tag 对齐 envelope 版本。
+
+## 跨阶段扩展：心跳、stage/state、every_attempt（2026-10-06）
+
+用户 2026-10-06 要求心跳可自定义、format 继续扩展、深入想清哪些决策点能交给 format。落地与取舍
+（设计推敲过程见 git 历史里的 `.agents/plan/heartbeat-format-extension.md`，最后版本在删除它的提交之前）：
+
+- 静态心跳 `keepalive_heartbeat` 只在 toml 层（协议相关、按实例）；校验规则 `config::heartbeat_problem`
+  保证回放开始时客户端的 SSE 解析器停在事件边界，否则心跳会和第一个回放事件拼在一起。
+- 信封加 `stage`（字符串，不用枚举：旧 format 遇到新阶段名照样能解析）、`request_id`、不透明 `state`
+  （回信带上即替换，缺省 = 不变）。请求/心跳/响应转换器是不同进程，跨阶段状态只能经 aProxy 转交。
+- `heartbeat_transform`：每拍 spawn 独立任务（drive 返回时会 drop 在途 future，persistent worker 被
+  中途 drop 会被剔除）；上一拍没回来就发固定心跳（`in_flight`）；回放闸门 `replay_gate` 保证心跳不插进
+  回放事件中间；回放开始后才回来的心跳丢弃。
+- `[request_transform] every_attempt`：每次重试前用客户端原始请求再转换一次（`stage = "retry"` +
+  `retry {attempt, status, error}`）。做成请求转换的开关而不是独立的 `retry_transform`：同一个程序处理
+  两个阶段，官方 aproxy-format 按 `method` 区分请求/响应，零改动就会在每次重试换下一个 key。这次转换
+  失败只沿用上一次的请求、不终止请求。
+- 评估后**不做**的决策点：重试判定（format 能让请求停止重试 = 核心承诺取决于外部程序；确定性失败已有
+  bounded_retry_paths）；按请求决定是否保活（唯一需求是 Gemini，用户定「gemini 不管」）；终态 error 事件
+  渲染（极少发生，真需要时用静态模板，不为它拉起 format 进程）。
+- 信封 crate 0.2.0（含 stage/request_id/state/heartbeat/retry）截至 2026-10-06 未发布：发布前的改动留在
+  0.2.0 内，发布后再改公开 API 就要按上一节升版本。

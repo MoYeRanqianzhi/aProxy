@@ -25,7 +25,8 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   请求体超限就回 413 并关连接，客户端还在上传，连接被复位，读不到 413（请求体放大到 32 MiB 后缓冲路径与
   forward_only 在 Windows 上都 3/3 必现）。修法：回 413 前读掉剩余请求体（总 10 秒、空闲 2 秒为限）；两个 413 用例
   改用 32 MiB 请求体以保持区分力，另加停住的客户端照样拿到 413 的用例
-- [ ] **自定义心跳 + format 扩展（第 1–3 步完成，第 4 步待评估）**：用户要求——默认继续用 `: keepalive` 注释；增加可自定义心跳（静态配置）；format 继续拓展，心跳可由 format 按内容动态生成；深入思考 aProxy 的哪些配置/决策点可以与 format 搭配，实现高自由度扩展。设计要点草稿：信封加 `stage`（request/response/heartbeat…）与按请求唯一的 id；用 format 返回、aProxy 按请求保存并回传的不透明 `state` 解决「请求/心跳/响应转换器是不同进程、无共享状态」；心跳 format 可配合响应 format 发真实协议事件（能重置事件级空闲超时）。设计与顺序见 [plan/heartbeat-format-extension.md](plan/heartbeat-format-extension.md)
+- [x] **自定义心跳 + format 扩展（2026-10-06 完成）**：静态 `keepalive_heartbeat`、信封 `stage`/`request_id`/`state`、`heartbeat_transform`、`[request_transform] every_attempt`（重试前用原始请求重新转换，故障转移）；另三个决策点评估后不做。决策与理由见记忆 [transform-format](memory/2026-09-23-transform-format.md) 的「跨阶段扩展」一节
+- [ ] **format 扩展的开放问题**（低优先）：（1）`state` 不设大小上限，文档只建议保持很小——若有人塞大对象，它随该请求的每行信封往返；（2）format 生成的协议事件当心跳时，真实客户端（Claude Code 等）的反应未实测；（3）心跳信封没有「最近一次上游失败」摘要（every_attempt 的 retry 信封有）
 
 ## 外部转换器（format）+ aproxy-format（2026-09-23 下令，2026-09-30 完成）
 

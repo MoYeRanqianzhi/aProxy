@@ -54,7 +54,8 @@ install 功能收尾汇报「204 项测试全绿 + 已推送」时，`main` 分�
 （只跑 test，已知红，没有设 continue-on-error，红色就表示 macOS 支持未完成）。
 test 与 clippy 一律带 `--workspace`。判断能否收尾时按 job 看结论：`windows` 与
 `ubuntu` 是门禁，必须绿；`macos` 红属预期，但要确认失败的仍是已知的那一类——依赖 `/dev/shm`
-或 `/proc` 的测试（2026-10-06 为 5 个：survey 无响应实例、两个 announce 测试、claim 身份、心跳读写），
+或 `/proc` 的测试（2026-10-06 为 6 个：survey 无响应实例、三个 announce 测试、claim 身份、心跳读写；
+macOS job 不带 `--no-fail-fast`，lib 失败后集成测试根本没跑，所以只看得到 lib 的失败），
 没有新增别的失败（`gh run view <id> --log-failed | grep FAILED`）。2026-10-06 起另有
 `upgrade-from-0-1-0` 任务（windows + ubuntu）跑真实 v0.1.0 驱动的升级。
 Recheck when：ci.yml 的 job 结构变化，或 macOS 支持完成。
@@ -68,6 +69,9 @@ Recheck when：ci.yml 的 job 结构变化，或 macOS 支持完成。
    Windows 管道不落盘，这类顺序依赖只在 unix 暴露。
 3. 对 Linux errno 的假设（残留 socket 的 connect 只会是 ConnectionRefused）没有验证手段时，
    判定条件要写成「只在确有证据时拒绝，其余一律按安全默认处理」，并让测试把实际错误打出来。
+4. （同日早交接提交 9e91a95）`#[cfg(unix)]` 的测试辅助函数触发 clippy `zombie_processes`：spawn 出的
+   Child 在 panic 分支上没 wait。本机 clippy 编译不到 unix 测试代码；写 unix 专属测试时，spawn 的子进程
+   在每条路径（含超时 panic）上都要 kill + wait。clippy 先红时同 job 的测试根本没跑，unix 用例要等下一轮。
 
 **How to apply**：改了 unix 路径（`cfg(unix)`、socket、/proc、/dev/shm、文件顺序）的提交推送后，
 先等 ubuntu job 结论再叠加下一步；手上有半成品时用 `git stash` 先单独提交修复（本次三次都这样处理，

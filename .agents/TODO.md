@@ -21,10 +21,10 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] **IPC 整理时一并决定的问题**（2026-10-06 skill 重写子代理读代码发现，未实测）：（1）已修（7def3bf，端点按 home 命名空间）：Windows 命名管道按端口全机共享（`\\.\pipe\aproxy-<端口>`，src/daemon.rs `endpoint_for_in`），临时 APROXY_HOME 下的 `stop/restart/logs <端口>` 会打到同端口的生产实例——unix 的 socket 在 run 目录里，天然随主目录隔离，两平台语义不一致；（2）（3）已修（f4210aa）：挂死实例单列为无响应、`stop --force` 经注册记录核验后终止；`stop` 未确认停止时退出 1；（4）已修（c992af2）：在线 install 在下载前做管辖检查
 - [x] 看门狗崩溃恢复延迟（2026-10-06 修复）：主循环加死亡事件唤醒分支，崩溃实例即时重拉（集成测试 `watchdog_respawns_on_death_event_and_force_stop_stays_stopped` 以 60s 扫描周期验证，实测约 0.2s 回来；旧代码上该测试失败）。随之暴露的竞态一并处理：`stop/restart --force` 改为终止前摘掉 `.restore`、失败再放回
 - [x] **install 测试依赖外网**（2026-10-06 发现并处理）：根因有二——Windows 接力进程无视 `--no-skills` 照常下载 skill（随早交接修掉：接手者不跑 skill 支线，续作认 skipped 记录），以及快路径测试没传 `--no-skills`（已补）。代价：skill 下载经 install 的端到端路径不再有自动化测试（此前也只是顺带、且不稳定地覆盖），skill 解包与替换仍由 install::skills 的单测覆盖
-- [ ] **`forward_only_enforces_max_body_mb` 偶发失败**（2026-10-06 全量并行跑时 1 次，单跑 5/5 通过）：失败在
-  `tests/proxy_integration.rs:3768` 的 `.send().await.unwrap()`——客户端没拿到 413，拿到的是发送错误。假说（未验证）：
-  代理在客户端还在上传 2 MiB 请求体时就回 413 并关连接，未读完的数据让连接被重置，客户端读不到已发出的应答。若属实，
-  真实客户端也可能看不到 413（缓冲路径的超限是否同样如此也要查）；修法可能是回 413 前把请求体读掉有限的一段再关
+- [x] **`forward_only_enforces_max_body_mb` 偶发失败（2026-10-06 查明并修复）**：不是测试问题，是真缺陷——代理一发现
+  请求体超限就回 413 并关连接，客户端还在上传，连接被复位，读不到 413（请求体放大到 32 MiB 后缓冲路径与
+  forward_only 在 Windows 上都 3/3 必现）。修法：回 413 前读掉剩余请求体（总 10 秒、空闲 2 秒为限）；两个 413 用例
+  改用 32 MiB 请求体以保持区分力，另加停住的客户端照样拿到 413 的用例
 - [ ] **自定义心跳 + format 扩展（第 1–3 步完成，第 4 步待评估）**：用户要求——默认继续用 `: keepalive` 注释；增加可自定义心跳（静态配置）；format 继续拓展，心跳可由 format 按内容动态生成；深入思考 aProxy 的哪些配置/决策点可以与 format 搭配，实现高自由度扩展。设计要点草稿：信封加 `stage`（request/response/heartbeat…）与按请求唯一的 id；用 format 返回、aProxy 按请求保存并回传的不透明 `state` 解决「请求/心跳/响应转换器是不同进程、无共享状态」；心跳 format 可配合响应 format 发真实协议事件（能重置事件级空闲超时）。设计与顺序见 [plan/heartbeat-format-extension.md](plan/heartbeat-format-extension.md)
 
 ## 外部转换器（format）+ aproxy-format（2026-09-23 下令，2026-09-30 完成）

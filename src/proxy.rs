@@ -472,6 +472,36 @@ pub enum RequestBody {
     },
 }
 
+/// 请求体超限后「读完再拒」的时长上限：总时长，与两次读到数据之间的空闲时长。
+///
+/// 为什么要读完：一发现超限就回 413、关掉一个还有未读请求数据的连接，对端 TCP
+/// 会收到复位（Windows 上必然，Linux 上取决于时机），客户端接收缓冲里已经到达的
+/// 413 随之被丢弃——它看到的是「连接被中止」，看不到该去调 max_body_mb，还可能
+/// 原样重发。所以先把剩余的请求体读掉丢弃，客户端发完再回 413（HTTP 服务器常见
+/// 的 lingering close）。读多久有上限：到了照常回 413，不为一个注定被拒的请求
+/// 无限期占着连接。
+const REJECTED_BODY_DRAIN_TOTAL: Duration = Duration::from_secs(10);
+const REJECTED_BODY_DRAIN_IDLE: Duration = Duration::from_secs(2);
+
+/// 把被拒请求体的剩余部分读掉丢弃，直到读完、出错或到了上限
+/// （见 [`REJECTED_BODY_DRAIN_TOTAL`]）。只读不存，内存占用与剩余大小无关。
+async fn drain_rejected_body<S, E>(stream: &mut S)
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + REJECTED_BODY_DRAIN_TOTAL;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        match tokio::time::timeout(left.min(REJECTED_BODY_DRAIN_IDLE), stream.next()).await {
+            Ok(Some(Ok(_))) => {}
+            _ => return,
+        }
+    }
+}
+
 /// 读取请求体错误：TooLarge=超出上限（413）；Io=连接中断/磁盘写入失败
 enum ReadBodyError {
     TooLarge,
@@ -504,6 +534,7 @@ async fn read_request_body(
         // 上限判定：磁盘模式下基于累计总量；内存模式基于 Vec 长度
         let total = disk.as_ref().map_or(mem.len(), |(_, _, l)| *l as usize);
         if limit != usize::MAX && total + chunk.len() > limit {
+            drain_rejected_body(&mut body).await;
             return Err(ReadBodyError::TooLarge);
         }
         match &mut disk {
@@ -3114,6 +3145,10 @@ async fn forward_only_proxy(
                 let seen = seen.saturating_add(chunk.len());
                 if seen > limit {
                     flag.store(true, AtomicOrdering::Relaxed);
+                    // 先把客户端剩下的请求体读掉，再用 Err 中止上游请求、回 413：
+                    // 理由见 REJECTED_BODY_DRAIN_TOTAL。此间上游请求停在等下一块
+                    // 数据上，不会多发任何字节
+                    drain_rejected_body(&mut stream).await;
                     // axum::Error 满足 wrap_stream 的错误约束（Into<BoxError>），
                     // 无需 map_err；真实原因由 too_large 标记承载
                     return Some((

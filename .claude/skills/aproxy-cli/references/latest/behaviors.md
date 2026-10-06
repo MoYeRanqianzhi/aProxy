@@ -36,7 +36,9 @@ through these steps:
    them. Hop-by-hop headers (`Connection`, `Upgrade`, `Transfer-Encoding`, `Host`, ...) are dropped, so
    WebSocket upgrades do not pass through. Method, path, query and all other headers are unchanged.
 3. **Body buffering.** The whole request body is read before anything goes upstream, so every retry
-   can replay it. A body over `max_body_mb` gets 413 at once.
+   can replay it. A body over `max_body_mb` is not sent upstream and gets 413; aProxy first reads and
+   discards the rest of the upload (for at most 10 s) so that the client can read the 413 instead of a
+   reset connection.
 4. **Keepalive decision**, made on the request as the client sent it (see Keepalive heartbeats).
 5. **Request transform**, if configured, runs once; every retry replays its output.
 6. **Upstream URL** = `base_url` without a trailing `/`, followed by the client's path and query

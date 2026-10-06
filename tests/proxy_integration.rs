@@ -1379,7 +1379,9 @@ async fn oversized_request_returns_413() {
     let proxy_state = AppState::new(cfg);
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
-    let big = vec![b'a'; 1024 * 1024 + 1];
+    // 远大于上限：客户端在代理判定超限时还在上传。代理若不先读完剩余请求体就回
+    // 413 并关连接，客户端收到的是连接复位，读不到 413（修复前 Windows 上必现）
+    let big = vec![b'a'; 32 * 1024 * 1024];
     let client = local_client();
     let resp = client
         .post(format!("{proxy_url}/v1/x"))
@@ -1388,6 +1390,44 @@ async fn oversized_request_returns_413() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 413, "超过 max_body_mb 上限应返回 413");
+}
+
+// ---------------------------------------------------------------------------
+// 16a. 超限后「读完再拒」有上限：客户端声明 32 MiB、发了 2 MiB 就停住（连接不关）
+//      ——代理不能一直等剩下的请求体，空闲上限一到照常回 413
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn oversized_request_from_a_stalled_client_still_gets_413() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let upstream = Router::new().route("/v1/x", any(|| async { "ok" }));
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.max_body_mb = Some(1);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(cfg))).await;
+
+    let addr = proxy_url.trim_start_matches("http://").to_string();
+    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let head = format!(
+        "POST /v1/x HTTP/1.1\r\nhost: {addr}\r\ncontent-length: {}\r\n\r\n",
+        32 * 1024 * 1024
+    );
+    sock.write_all(head.as_bytes()).await.unwrap();
+    sock.write_all(&vec![b'a'; 2 * 1024 * 1024]).await.unwrap();
+    sock.flush().await.unwrap();
+
+    let started = std::time::Instant::now();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(8), sock.read(&mut buf))
+        .await
+        .expect("停住的客户端也应在读完上限到了之后收到响应")
+        .unwrap();
+    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+    assert!(text.starts_with("HTTP/1.1 413"), "实际响应: {text:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "应在空闲上限（2 秒）附近回应，实际等了 {:?}",
+        started.elapsed()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3758,7 +3798,9 @@ async fn forward_only_enforces_max_body_mb() {
     let proxy_state = AppState::new(cfg);
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(proxy_state)).await;
 
-    let big = vec![b'a'; 2 * 1024 * 1024];
+    // 远大于上限，理由同 oversized_request_returns_413：客户端得在上传途中照样
+    // 读到 413，而不是连接复位
+    let big = vec![b'a'; 32 * 1024 * 1024];
     let client = local_client();
     let resp = client
         .post(format!("{proxy_url}/v1/upload"))

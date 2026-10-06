@@ -32,12 +32,13 @@ you implement a format program in any language or need to know exactly what a fi
 | `worker_id` | integer | Pool slot of this worker | Ignored | Same | Ignored |
 | `extra` | string | The transform's `extra` setting, verbatim | Ignored | Same | Ignored |
 | `error` | string | Never present | Marks this request as failed | Never present | Marks this conversion as failed |
-| `stage` | string | `"request"` | Ignored | `"response"` | Ignored |
+| `stage` | string | `"request"` (`"retry"` before a retry, see "Retry stage") | Ignored | `"response"` | Ignored |
 | `request_id` | string | Identifies the client request | Ignored | Same value as on the request side | Ignored |
 | `state` | string | Absent (nothing earlier sets it) | Saved for later stages; omitted = keep | The latest value a request or heartbeat reply left, if any | Ignored |
 
 A third stage, `"heartbeat"`, exists when the instance configures `heartbeat_transform`; its
-envelope and reply are described under "Heartbeat stage" below.
+envelope and reply are described under "Heartbeat stage" below. A fourth, `"retry"`, reaches the
+request transform before each retry when it sets `every_attempt = true` ("Retry stage" below).
 
 `stage` names the side. The presence of `method` tells them apart too (request envelopes always
 carry it, response envelopes never do), and it is the only signal on aProxy 0.1.0, which sends
@@ -143,14 +144,15 @@ in your program. Request and response transforms each have their own `extra`.
 aProxy versions after 0.1.0 add these three fields so that the two sides of one client request can
 cooperate.
 
-- `stage` is `"request"`, `"response"` or `"heartbeat"`. Treat any other value as a stage you do
-  not handle and reply with the envelope unchanged: later aProxy versions may add stages.
+- `stage` is `"request"`, `"retry"`, `"response"` or `"heartbeat"`. Treat any other value as a
+  stage you do not handle and reply with the envelope unchanged: later aProxy versions may add
+  stages.
 - `request_id` is the same string on both sides of one client request and differs between
   requests. It counts the instance's requests from 1 and restarts when the instance restarts, so
   it is unique only within one instance run. Use it to correlate your logs; it is not a secret and
   carries no meaning beyond identity.
-- `state` is an opaque string aProxy keeps for the request without reading it. A request-side or
-  heartbeat reply that includes `state` sets it; every later stage receives the latest value. Omitting it, or replying with
+- `state` is an opaque string aProxy keeps for the request without reading it. A request-side,
+  retry or heartbeat reply that includes `state` sets it; every later stage receives the latest value. Omitting it, or replying with
   `null`, leaves the saved value unchanged. Typical use: the request side records which channel or
   key it picked (for example as a small JSON string), and the response side reads it instead of
   looking the channel up again by `url`. It travels on every envelope line of that request, so keep
@@ -185,6 +187,34 @@ response head is committed and the request side is done, until the first real by
 - If your heartbeats are protocol events rather than comments, the client sees them before the
   real response, which aProxy replays unchanged. Configure a `response_transform` that reads
   `state` and removes what the heartbeats already sent (for example a duplicate `message_start`).
+
+### Retry stage
+
+Sent to the request transform when it is configured with `every_attempt = true` (aproxy-cli skill,
+config-toml.md). Before every retry, from the second upstream attempt on, aProxy calls the program
+again with the client's original request and sends your reply upstream as that attempt.
+
+| Field | In | Reply |
+|---|---|---|
+| `stage` | `"retry"` | Ignored |
+| `method`, `url`, `headers`, `body` / `body_b64` | The client's original request, exactly what the `"request"` stage received (not your earlier output) | The request for this attempt, with the same rules as the request side |
+| `retry` | Object: `attempt` (the attempt about to be made, 2 or more), `status` (the previous attempt's upstream status; absent after a network error), `error` (a short reason the previous attempt failed) | Ignored |
+| `request_id`, `state`, `worker_id`, `extra` | As on the other stages | `state` sets the saved value |
+| `error` | Never present | aProxy keeps the previous attempt's request |
+
+- Use it for failover: after a failure, pick another key or channel. Keep what you need across
+  attempts in `state` (for example the keys already tried); in `persistent` mode the worker's own
+  memory works too.
+- A failed call (error reply, timeout, bad output, crash) does not end the request, because aProxy
+  never gives up retrying: it sends the request it sent last time and logs one warn per request.
+  Only the `"request"` stage can fail a request.
+- The official binary handles a retry envelope exactly like a request (it carries `method`), so with
+  `every_attempt` each retry goes through its routing and key rotation again.
+- Replying with the envelope unchanged sends the client's untransformed request, so only enable
+  `every_attempt` for a program that handles this stage.
+- The whole original body travels to you on every retry. Retries back off up to
+  `max_retry_backoff_secs`, so the rate is bounded, but a large body costs a large envelope each
+  time.
 
 ### error
 

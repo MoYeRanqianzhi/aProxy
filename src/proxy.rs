@@ -1319,6 +1319,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
         headers,
         body: req_body,
         ctx: ExchangeCtx::new(request_seq.to_string()),
+        retransform: None,
     };
     let max_spool_bytes = spool_limit_bytes(&state.config);
 
@@ -1344,6 +1345,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
         headers,
         body: req_body,
         ctx,
+        mut retransform,
     } = match apply_request_transform(&state, req).await {
         Ok(req) => req,
         Err(msg) => return request_transform_failed_response(&msg),
@@ -1393,6 +1395,9 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
             retry
         }
     };
+    if needs_retry && let Some(rt) = retransform.as_mut() {
+        rt.record(&first);
+    }
 
     if !needs_retry {
         return match first {
@@ -1429,6 +1434,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
         headers,
         body: req_body,
         ctx,
+        retransform,
     };
     proxy_without_keepalive(state, req, max_spool_bytes, bounded_retry).await
 }
@@ -1441,11 +1447,94 @@ struct OutboundRequest {
     headers: HeaderMap,
     body: RequestBody,
     ctx: ExchangeCtx,
+    /// 请求转换开了 `every_attempt` 时由 [`apply_request_transform`] 填上：每次重试
+    /// 之前据此重新转换（见 [`PerAttemptTransform`]）
+    retransform: Option<PerAttemptTransform>,
+}
+
+/// 请求转换的「每次尝试」模式（`[request_transform] every_attempt = true`）：留着客户端
+/// 的原始请求，每次重试之前用它再跑一次请求转换（信封 `stage = "retry"`，附上一次
+/// 失败的状态码或原因），回信替换这次尝试发出的请求。用途是故障转移：format 换
+/// key、换渠道，无限重试就不会一直打同一个坏掉的上游。
+///
+/// 这一次的转换失败（format 拒绝、超时、输出不合法）不终止请求——那会违背无限重试；
+/// 沿用上一次发出的请求，每个请求只告警一次。代价：原始请求体在请求的整个生命期
+/// 留在内存里（转换本来就要整份 body）。
+struct PerAttemptTransform {
+    method: http::Method,
+    url: String,
+    headers: HeaderMap,
+    body: Bytes,
+    /// 上一次尝试的失败（`attempt` 在调用时填）
+    last: aproxy_envelope::RetryInfo,
+    warned: bool,
+}
+
+impl PerAttemptTransform {
+    /// 记下一次尝试的结果；下一次重新转换时随信封交给 format。成功的结果也会记，
+    /// 无妨：成功之后不会再有重试。
+    fn record(&mut self, result: &ForwardResult) {
+        let (status, error) = match result {
+            ForwardResult::NetworkError(e) => (None, e.clone()),
+            ForwardResult::Response { status, .. } => {
+                (Some(status.as_u16()), format!("上游返回 {status}"))
+            }
+            ForwardResult::TooLarge | ForwardResult::SpoolFailed(_) => return,
+        };
+        self.last.status = status;
+        self.last.error = Some(error);
+    }
+
+    /// 第 `attempt` 次尝试（2 起）之前重新转换。返回这次要发的请求；失败返回 None，
+    /// 调用方沿用上一次的。
+    async fn next(
+        &mut self,
+        state: &AppState,
+        ctx: &ExchangeCtx,
+        attempt: u32,
+    ) -> Option<crate::transform::TransformedRequest> {
+        let pool = state.request_pool.as_ref()?;
+        let mut retry = self.last.clone();
+        retry.attempt = attempt;
+        match crate::transform::transform_request(
+            pool,
+            ctx,
+            &self.method,
+            &self.url,
+            &self.headers,
+            RequestBody::Memory(self.body.clone()),
+            Some(retry),
+            state.spool_dir.as_deref(),
+        )
+        .await
+        {
+            Ok(t) => {
+                tracing::info!(
+                    attempt,
+                    url = %crate::config::mask_base_url(&t.url),
+                    "重试前请求已由外部转换器重新改写"
+                );
+                Some(t)
+            }
+            Err(e) => {
+                if !self.warned {
+                    self.warned = true;
+                    tracing::warn!(
+                        attempt,
+                        error = %e,
+                        "重试前的请求转换失败，沿用上一次发出的请求（本请求只告警这一次）"
+                    );
+                }
+                None
+            }
+        }
+    }
 }
 
 /// 请求转换器：缓冲完成后交给外部 format 程序改写（body/headers/url/method
-/// 全部可变）——转换**一次**，产物被重试循环的每一轮 forward_once 原样重放，
-/// 重试循环零分支。位置约束：必须在首轮 forward_once 之前（否则重放的是未
+/// 全部可变）——默认转换**一次**，产物被重试循环的每一轮 forward_once 原样重放；
+/// `every_attempt` 打开时顺带留下原始请求，供每次重试前重新转换（见
+/// [`PerAttemptTransform`]）。位置约束：必须在首轮 forward_once 之前（否则重放的是未
 /// 转换请求）、bounded_retry 匹配之后（bounded 对原始路径判定——路径集合是
 /// 客户端视角，转换是实例级配置，语义不同源）。未配置时原样返回。
 ///
@@ -1465,7 +1554,39 @@ async fn apply_request_transform(
         headers,
         body,
         ctx,
+        ..
     } = req;
+    // every_attempt：原始请求留一份给每次重试重新转换。磁盘上的体读进内存（转换
+    // 本来就要整份 body），首次转换也改用内存这份，不必再读一遍
+    let every_attempt = state
+        .config
+        .request_transform
+        .as_ref()
+        .is_some_and(|t| t.every_attempt);
+    let (body, retransform) = if every_attempt {
+        let bytes = match &body {
+            RequestBody::Memory(b) => b.clone(),
+            RequestBody::Disk { path, .. } => match tokio::fs::read(path).await {
+                Ok(v) => Bytes::from(v),
+                Err(e) => {
+                    let msg = format!("请求转换失败: 读取请求体失败: {e}");
+                    state.note_upstream_failure(&msg);
+                    return Err(msg);
+                }
+            },
+        };
+        let original = PerAttemptTransform {
+            method: method.clone(),
+            url: target_url.clone(),
+            headers: headers.clone(),
+            body: bytes.clone(),
+            last: Default::default(),
+            warned: false,
+        };
+        (RequestBody::Memory(bytes), Some(original))
+    } else {
+        (body, None)
+    };
     match crate::transform::transform_request(
         pool,
         &ctx,
@@ -1473,6 +1594,7 @@ async fn apply_request_transform(
         &target_url,
         &headers,
         body,
+        None,
         state.spool_dir.as_deref(),
     )
     .await
@@ -1485,6 +1607,7 @@ async fn apply_request_transform(
                 headers: t.headers,
                 body: t.body,
                 ctx,
+                retransform,
             })
         }
         Err(e) => {
@@ -1816,11 +1939,12 @@ async fn proxy_without_keepalive(
     bounded_retry: bool,
 ) -> Response {
     let OutboundRequest {
-        method,
-        target_url,
-        headers,
-        body: req_body,
+        mut method,
+        mut target_url,
+        mut headers,
+        body: mut req_body,
         ctx,
+        mut retransform,
     } = req;
     let mut attempt: u32 = 1;
     let max_backoff = state.config.max_retry_backoff_secs;
@@ -1851,6 +1975,16 @@ async fn proxy_without_keepalive(
             tracing::warn!(attempt, "立即重试");
         }
 
+        // every_attempt：用客户端的原始请求重新转换出这次要发的请求（失败沿用上一次的）
+        if let Some(rt) = retransform.as_mut()
+            && let Some(t) = rt.next(&state, &ctx, attempt).await
+        {
+            method = t.method;
+            target_url = t.url;
+            headers = t.headers;
+            req_body = t.body;
+        }
+
         let result = forward_once(
             &state,
             &method,
@@ -1861,6 +1995,9 @@ async fn proxy_without_keepalive(
             None,
         )
         .await;
+        if let Some(rt) = retransform.as_mut() {
+            rt.record(&result);
+        }
 
         match result {
             ForwardResult::NetworkError(e) => {
@@ -2553,11 +2690,12 @@ async fn proxy_with_keepalive(
         )
         .await;
         let OutboundRequest {
-            method,
-            target_url,
+            mut method,
+            mut target_url,
             mut headers,
-            body: req_body,
+            body: mut req_body,
             ctx,
+            mut retransform,
         } = match transformed {
             None => return,
             Some(Ok(req)) => req,
@@ -2631,6 +2769,37 @@ async fn proxy_with_keepalive(
                 }
             }
 
+            // every_attempt：重试前用客户端的原始请求重新转换（同样经 drive 驱动，转换
+            // 期间心跳照常）。失败沿用上一次的请求
+            if attempt > 1
+                && let Some(rt) = retransform.as_mut()
+            {
+                match drive(
+                    &mut sink,
+                    &mut ticker,
+                    rt.next(&state, &ctx, attempt),
+                    None,
+                    false,
+                    "请求转换（重试前）",
+                )
+                .await
+                {
+                    None => return,
+                    Some(Some(t)) => {
+                        method = t.method;
+                        target_url = t.url;
+                        headers = t.headers;
+                        // 与首次转换之后同理：保活通道要求上游以 identity 编码回应
+                        headers.insert(
+                            http::header::ACCEPT_ENCODING,
+                            HeaderValue::from_static("identity"),
+                        );
+                        req_body = t.body;
+                    }
+                    Some(None) => {}
+                }
+            }
+
             // 尚未提交时每次尝试都要响应头通知：可提交的上游真实头先行提交、
             // 「2xx 非 SSE」暂停骨架提交（见 drive）；已提交后不再需要
             let (head_tx, head_rx) = if sink.is_committed() {
@@ -2660,6 +2829,9 @@ async fn proxy_with_keepalive(
             else {
                 return;
             };
+            if let Some(rt) = retransform.as_mut() {
+                rt.record(&result);
+            }
 
             match result {
                 ForwardResult::NetworkError(e) => {

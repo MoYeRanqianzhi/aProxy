@@ -425,6 +425,9 @@ pub(crate) fn handle_config_cmd(
                 ),
                 None => println!("  extra             = (未设置)"),
             }
+            if t.every_attempt {
+                println!("  every_attempt     = true（每次重试前用原始请求重新转换）");
+            }
         }
         println!(
             "proxy          = {}",

@@ -60,8 +60,10 @@ pub struct TransformEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// 输入侧：本次转换所处的阶段——`"request"`（发往上游之前）、
-    /// `"response"`（成功响应回放之前）或 `"heartbeat"`（保活等待中的一拍，
-    /// 回信的 body 就是这一拍写给客户端的字节）。format 回信不必回填（被忽略）。
+    /// `"retry"`（重试之前再次改写请求，只在请求转换开了 `every_attempt` 时出现，
+    /// 见 [`RetryInfo`]）、`"response"`（成功响应回放之前）或 `"heartbeat"`（保活
+    /// 等待中的一拍，回信的 body 就是这一拍写给客户端的字节）。format 回信不必
+    /// 回填（被忽略）。
     /// 用字符串而非枚举：将来新增阶段时，旧版 format 仍能解析信封（枚举遇到
     /// 不认识的值会让整行反序列化失败）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,6 +80,25 @@ pub struct TransformEnvelope {
     /// 输入侧，仅心跳阶段：这一拍的上下文（见 [`HeartbeatInfo`]）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heartbeat: Option<HeartbeatInfo>,
+    /// 输入侧，仅重试阶段：这次重试的上下文（见 [`RetryInfo`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryInfo>,
+}
+
+/// 重试阶段的上下文。请求转换开了 `every_attempt` 时，aproxy 在每次重试之前用
+/// 客户端的**原始请求**（与 `"request"` 阶段收到的同一份 method/url/headers/body）
+/// 再调用一次请求转换器，附带这一项；回信就是这次尝试发往上游的请求。format 可以
+/// 据此换 key、换渠道，让无限重试不会一直打同一个坏掉的上游。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RetryInfo {
+    /// 即将进行的是第几次上游尝试（2 起）。
+    pub attempt: u32,
+    /// 上一次尝试收到的上游状态码；上一次没拿到响应（网络错误）时缺省。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// 上一次尝试为什么失败（简短说明，如网络错误的原因）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// 心跳阶段的上下文：aproxy 每个保活间隔调用一次心跳转换器时附带。
@@ -196,6 +217,25 @@ mod tests {
         };
         let back = TransformEnvelope::from_line(&hb.to_line().unwrap()).unwrap();
         assert_eq!(back, hb);
+        // 重试上下文往返；网络错误没有状态码，status 缺省时不输出
+        let retry = TransformEnvelope {
+            stage: Some("retry".into()),
+            retry: Some(RetryInfo {
+                attempt: 2,
+                status: None,
+                error: Some("connection refused".into()),
+            }),
+            ..Default::default()
+        };
+        let line = retry.to_line().unwrap();
+        assert!(!line.contains("status"), "{line}");
+        assert_eq!(TransformEnvelope::from_line(&line).unwrap(), retry);
+        assert!(
+            !TransformEnvelope::default()
+                .to_line()
+                .unwrap()
+                .contains("retry")
+        );
     }
 
     #[test]

@@ -81,12 +81,14 @@ What a failure costs differs by side, so know which side you are on:
 | Side | When the transform fails (error reply, crash, timeout, bad output) |
 |---|---|
 | Request | Nothing is sent upstream and the request is not retried. The client gets a 502 with the reason, or, on a streaming request that has already received heartbeat headers, a final SSE error event of type `proxy_transform_failed`. |
+| Retry (request transform with `every_attempt`) | The request goes on: aProxy resends what it sent on the previous attempt and logs one warning per request. |
 | Response | aProxy replays the original upstream response unchanged and logs a warning. |
 
 A transform that succeeds but produces a request the upstream rejects (a wrong conversion, a revoked
 key) is a different story: aProxy retries upstream errors indefinitely, with the same transformed
-request each time, so the client just waits. Check conversions with the test harness and one real
-request before relying on them.
+request each time, so the client just waits. With `every_attempt = true` your program is asked again
+before each retry and can switch to another key or channel (references/protocol.md, "Retry stage").
+Check conversions with the test harness and one real request before relying on them.
 
 ## Where to look
 

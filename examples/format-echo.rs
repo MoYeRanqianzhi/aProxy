@@ -157,6 +157,35 @@ fn main() {
                     _ => env,
                 });
             }
+            "failover" | "failover-reject" => {
+                // every_attempt 的故障转移：request 阶段原样放行、给发出的请求打标记；
+                // retry 阶段把 url 换成 extra 指定的备用上游，并把看到的重试上下文写
+                // 进请求头（第几次、上次的状态码、收到的是否是未经转换的原始请求）。
+                // failover-reject 在 retry 阶段回 error——aproxy 应沿用上一次的请求
+                respond(&line, |mut env| {
+                    if env.stage.as_deref() != Some("retry") {
+                        env.headers
+                            .insert("x-transformed".to_string(), "1".to_string());
+                        return env;
+                    }
+                    if cmd == "failover-reject" {
+                        return aproxy_envelope::TransformEnvelope {
+                            error: Some("no backup".to_string()),
+                            ..Default::default()
+                        };
+                    }
+                    let r = env.retry.clone().unwrap_or_default();
+                    let seen = format!(
+                        "attempt={} status={} original={}",
+                        r.attempt,
+                        r.status.map_or("-".to_string(), |s| s.to_string()),
+                        !env.headers.contains_key("x-transformed")
+                    );
+                    env.headers.insert("x-retry-seen".to_string(), seen);
+                    env.url = Some(env.extra.clone());
+                    env
+                });
+            }
             "rewrite" => {
                 // url 改写验证：extra 即新的完整 url（协议转换的核心语义）
                 respond(&line, |mut env| {

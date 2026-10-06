@@ -61,8 +61,8 @@ home 的实例。新实例同时在 0.1.0 的管道名 `\\.\pipe\aproxy-<端口>
   体积不受外部转换器功能影响。
 - **aproxy-envelope**：信封契约 crate（一行 JSON 的 serde 类型 + base64
   携带），aproxy 与 aproxy-format 共同依赖，单源维护防契约漂移。信封带
-  `stage`（`request`/`response`，字符串而非枚举——新增阶段时旧 format 照样
-  能解析）、`request_id`（实例内第 N 个请求，即 status 的请求计数）与不透明的
+  `stage`（`request`/`retry`/`response`/`heartbeat`，字符串而非枚举——新增阶段时
+  旧 format 照样能解析）、`request_id`（实例内第 N 个请求，即 status 的请求计数）与不透明的
   `state`：请求与响应转换器是不同进程、无共享内存，跨阶段的信息由 aproxy
   按请求保存（`transform::ExchangeCtx`，随 `OutboundRequest` 走完各通道）并
   转交，回信缺省 `state` = 不变。
@@ -158,6 +158,12 @@ JSON 对象顶层 `"stream": true`，磁盘溢写的大请求体同样只看顶�
 全程覆盖」靠把每次上游尝试/每段退避都放进同一个 select（与心跳节拍、客户端断开
 信号一起）实现。完整缓冲、判定无误后才把成功那一次的字节写进同一个响应；
 期间的重试客户端只见到心跳。
+
+请求转换默认每个请求只做一次、各次重试重放产物；`[request_transform]` 设
+`every_attempt = true` 时（`proxy::PerAttemptTransform`），客户端的原始请求留在内存里，
+每次重试之前再转换一次（`stage = "retry"`，附上一次的状态码或失败原因），用于故障
+转移。这次转换失败只沿用上一次的请求、不终止——format 没有让请求停止重试的途径，
+这是有意的：重试判定交给 format 会让核心承诺取决于外部程序。
 
 外部转换器同样在这个节拍内：请求转换在保活通道的后台任务里、首轮之前进行，
 响应转换与「上游无视 identity 的压缩体」的回放前解码也经同一个 select 驱动。

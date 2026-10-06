@@ -25,6 +25,10 @@ the shapes in each provider's API reference.
   # event-boundary rule aProxy enforces
   python test_format.py --side heartbeat --format-spec anthropic --command ./my-format
 
+  # Retry stage (request_transform with every_attempt = true): the client's
+  # original request again, plus what happened on the previous attempt
+  python test_format.py --side retry --format-spec anthropic --command ./my-format
+
   # Arguments after "--" go to the program verbatim; --body-file supplies a
   # custom body (non-UTF-8 content is sent as body_b64)
   python test_format.py --format-spec openai-chat --command node -- format-node.js
@@ -225,7 +229,7 @@ RESPONSE_HEADERS = {
 
 
 def build_body(spec: str, side: str, sse: bool) -> str:
-    if side in ("request", "heartbeat"):
+    if side in ("request", "retry", "heartbeat"):
         return json.dumps(MOCK_REQUESTS[spec], ensure_ascii=False)
     if sse:
         return MOCK_SSE[spec]
@@ -251,7 +255,7 @@ def build_envelope(spec: str, side: str, url: str, extra: str, body_file: str | 
     else:
         envelope = {"body": build_body(spec, side, sse)}
     envelope["url"] = url
-    if side in ("request", "heartbeat"):
+    if side in ("request", "retry", "heartbeat"):
         envelope["method"] = "POST"
         envelope["headers"] = {
             "content-type": "application/json",
@@ -273,6 +277,10 @@ def build_envelope(spec: str, side: str, url: str, extra: str, body_file: str | 
     if side == "heartbeat":
         # First heartbeat of a request: seq 1 is the only call that carries the body
         envelope["heartbeat"] = {"seq": 1, "elapsed_ms": 15000, "attempt": 1}
+    if side == "retry":
+        # Before the second attempt, after the first one got a 503
+        envelope["retry"] = {"attempt": 2, "status": 503,
+                             "error": "upstream returned 503 Service Unavailable"}
     return envelope
 
 
@@ -302,6 +310,14 @@ def checkpoints(spec: str, side: str, sse: bool) -> list[str]:
             "protocol events must be valid for the client's protocol",
             "if the heartbeats are protocol events, a response_transform removes what the "
             "real response would duplicate (keep the bookkeeping in `state`)",
+        ]
+    if side == "retry":
+        return [
+            '"headers" is present (without it aProxy cannot parse the reply)',
+            "the request goes where this attempt should go (another key or channel after "
+            "the failure in `retry`), still in the target channel's protocol",
+            "the envelope came in untransformed: replying with it unchanged would send the "
+            "client's original request upstream",
         ]
     if side == "request":
         return [
@@ -337,9 +353,10 @@ def main() -> None:
     )
     ap.add_argument(
         "--side",
-        choices=["request", "response", "heartbeat"],
+        choices=["request", "retry", "response", "heartbeat"],
         default="request",
         help="envelope side: request = client request (has method); "
+        "retry = the same request before a retry (request_transform with every_attempt); "
         "response = upstream response (no method); heartbeat = one keepalive tick "
         "(heartbeat_transform). Default: request",
     )
@@ -386,6 +403,7 @@ def main() -> None:
 
     side_label = {
         "request": "request side (client request)",
+        "retry": "retry stage (before attempt 2)",
         "response": "response side (upstream response)",
         "heartbeat": "heartbeat stage (first tick)",
     }[ns.side] + (" [SSE]" if ns.sse else "")
@@ -442,8 +460,9 @@ def main() -> None:
             if parsed.get("error") is not None:
                 # aProxy treats any non-null `error`, even an empty string, as a failure
                 print(f'\n[WARN] error reply: {parsed["error"]!r} (aProxy would answer 502 on '
-                      'the request side, pass the upstream response through on the '
-                      'response side, or send its fixed heartbeat on the heartbeat stage)')
+                      'the request side, resend the previous attempt\'s request on the retry '
+                      'stage, pass the upstream response through on the response side, or '
+                      'send its fixed heartbeat on the heartbeat stage)')
             else:
                 print(f"\n[OK] the reply is valid JSON. Check by hand ({side_label}):")
                 for c in checkpoints(ns.format_spec, ns.side, ns.sse):

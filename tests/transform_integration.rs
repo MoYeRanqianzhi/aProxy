@@ -794,6 +794,110 @@ async fn timed_sse_post(proxy: &str) -> (std::time::Duration, StatusCode, String
     (head_after, status, resp.text().await.unwrap())
 }
 
+/// 记录收到的 `x-retry-seen` 头的上游（every_attempt 故障转移的备用上游）
+async fn backup_upstream(
+    reply: &'static str,
+) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let state_seen = seen.clone();
+    let app = Router::new().fallback(move |req: Request| async move {
+        let header = req
+            .headers()
+            .get("x-retry-seen")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("(none)")
+            .to_string();
+        state_seen.lock().unwrap().push(header);
+        (StatusCode::OK, reply).into_response()
+    });
+    let (url, jh) = bind_router(app).await;
+    (url, seen, jh)
+}
+
+fn failover_config(sub: &str, primary: &str, backup: &str, keepalive: bool) -> Config {
+    let mut cfg = if keepalive {
+        keepalive_1s_config_for(primary)
+    } else {
+        proxy_config_for(primary)
+    };
+    cfg.request_transform = Some(TransformConfig {
+        extra: Some(format!("{backup}/v1/x")),
+        every_attempt: true,
+        ..transform_config(sub, TransformMode::Spawn)
+    });
+    cfg
+}
+
+#[tokio::test]
+async fn every_attempt_retransforms_the_original_request_before_each_retry() {
+    // 主上游一直 500；every_attempt 让重试前的那次转换把请求改发备用上游。备用
+    // 上游看到的重试上下文：第 2 次尝试、上次 500、转换器收到的是原始请求
+    //（不是首次转换后的产物）。保活与非保活两条重试循环各走一遍
+    isolate_env_proxy();
+    for keepalive in [false, true] {
+        let (primary, primary_hits, _h1) =
+            fixed_upstream(StatusCode::INTERNAL_SERVER_ERROR, "down").await;
+        let (backup, seen, _h2) = backup_upstream("ok-from-backup").await;
+        let (proxy, _h3) =
+            start_proxy(failover_config("failover", &primary, &backup, keepalive)).await;
+        let mut req = local_client().post(format!("{proxy}/v1/x")).body("q");
+        if keepalive {
+            req = req.header("accept", "text/event-stream");
+        }
+        // 限时：转换没把请求改发备用上游时，主上游一直 500，请求会无限重试——
+        // 要的是失败，不是挂住
+        let (status, text) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let resp = req.send().await.unwrap();
+            (resp.status(), resp.text().await.unwrap())
+        })
+        .await
+        .expect("30 秒内应由备用上游应答");
+        assert_eq!(status, StatusCode::OK, "keepalive={keepalive}");
+        assert!(
+            text.contains("ok-from-backup"),
+            "keepalive={keepalive}: {text}"
+        );
+        assert_eq!(
+            primary_hits.load(Ordering::SeqCst),
+            1,
+            "只有第一次尝试打到主上游（keepalive={keepalive}）"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["attempt=2 status=500 original=true".to_string()],
+            "keepalive={keepalive}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_attempt_transform_failure_keeps_retrying_the_previous_request() {
+    // 重试前的转换失败不能让请求终止（那会违背无限重试）：沿用上一次发出的请求，
+    // 主上游第二次就好了，客户端照样拿到 200
+    isolate_env_proxy();
+    let (primary, hits, _h1) = sequenced_upstream(
+        (StatusCode::INTERNAL_SERVER_ERROR, "down"),
+        (StatusCode::OK, "recovered"),
+    )
+    .await;
+    let (proxy, _h2) = start_proxy(failover_config(
+        "failover-reject",
+        &primary,
+        "http://127.0.0.1:1",
+        false,
+    ))
+    .await;
+    let resp = local_client()
+        .post(format!("{proxy}/v1/x"))
+        .body("q")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.text().await.unwrap(), "recovered");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
 #[tokio::test]
 async fn keepalive_covers_slow_request_transform() {
     // 请求转换耗时 2.5s、保活间隔 1s：请求转换在保活通道内经心跳节拍驱动，

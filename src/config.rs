@@ -155,6 +155,12 @@ pub struct TransformConfig {
     /// 官方示例用它传聚合配置文件路径。
     #[serde(default)]
     pub extra: Option<String>,
+    /// 只对 request_transform 有意义：每次重试之前用客户端的原始请求再跑一次
+    /// 请求转换（信封 `stage = "retry"`，附上一次失败的状态码或原因），回信就是
+    /// 这次尝试发往上游的请求。默认 false = 每个请求只转换一次、各次重试复用。
+    /// 这一次的转换失败不会让请求终止（那会违背无限重试），沿用上一次发出的请求。
+    #[serde(default)]
+    pub every_attempt: bool,
 }
 
 impl TransformConfig {
@@ -570,6 +576,11 @@ impl Config {
                 if pm == 0 {
                     return Err(format!("{name} 的 pool_max 必须 >= 1，当前值: {pm}"));
                 }
+            }
+            if t.every_attempt && name != "request_transform" {
+                return Err(format!(
+                    "every_attempt 只能用于 request_transform（{name} 每个请求只在固定时机调用）"
+                ));
             }
         }
         if self.forward_only_enabled()
@@ -1994,5 +2005,40 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn every_attempt_is_only_for_the_request_transform() {
+        // 响应与心跳转换器的调用时机是固定的，写上 every_attempt 是配错了地方：
+        // 启动即报错，而不是静默无效
+        let t = || TransformConfig {
+            command: "f".to_string(),
+            every_attempt: true,
+            ..Default::default()
+        };
+        for name in ["response", "heartbeat"] {
+            let cfg = Config {
+                base_url: "https://api.example.com".to_string(),
+                response_transform: (name == "response").then(t),
+                heartbeat_transform: (name == "heartbeat").then(t),
+                ..Default::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(err.contains("every_attempt"), "{name}: {err}");
+        }
+        let cfg = Config {
+            base_url: "https://api.example.com".to_string(),
+            request_transform: Some(t()),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+        // toml 里的写法
+        let parsed: TransformConfig = toml::from_str(
+            "command = \"f\"
+every_attempt = true
+",
+        )
+        .unwrap();
+        assert!(parsed.every_attempt);
     }
 }

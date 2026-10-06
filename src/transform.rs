@@ -35,7 +35,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWriteExt as _, BufReade
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, Semaphore};
 
-use aproxy_envelope::{HeartbeatInfo, TransformEnvelope};
+use aproxy_envelope::{HeartbeatInfo, RetryInfo, TransformEnvelope};
 
 use crate::{
     config::{TransformConfig, TransformMode},
@@ -726,11 +726,14 @@ pub(crate) async fn transform_heartbeat(
     Ok(Some(bytes::Bytes::from(bytes)))
 }
 
-/// 请求侧转换：body 缓冲完成后交给 format 改写。转换**一次**，产物被重试
-/// 循环的每一轮 forward_once 自动重放（调用侧零分支）。
+/// 请求侧转换：body 缓冲完成后交给 format 改写。默认每个请求转换**一次**，
+/// 产物被重试循环的每一轮 forward_once 重放；`every_attempt` 打开时，每次重试
+/// 之前还会用客户端的原始请求再调用一次，`retry` 带上这次重试的上下文
+/// （信封 `stage = "retry"`）。
 ///
 /// `body` 所有权接管（Disk 形态读毕由 Drop 自删临时文件）；输出超大时重新
 /// 落盘成新 Disk 形态（内存与负载解耦的语义保持）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn transform_request(
     pool: &Arc<TransformPool>,
     ctx: &ExchangeCtx,
@@ -738,6 +741,7 @@ pub(crate) async fn transform_request(
     url: &str,
     headers: &axum::http::HeaderMap,
     body: RequestBody,
+    retry: Option<RetryInfo>,
     spool_dir: Option<&Path>,
 ) -> Result<TransformedRequest, TransformError> {
     let body_bytes = match &body {
@@ -753,7 +757,8 @@ pub(crate) async fn transform_request(
     env.url = Some(url.to_string());
     env.headers = headers_to_btreemap(headers);
     env.extra = pool.cfg.effective_extra().to_string();
-    ctx.stamp(&mut env, "request");
+    ctx.stamp(&mut env, if retry.is_some() { "retry" } else { "request" });
+    env.retry = retry;
 
     let out = pool.convert(env).await?;
     if let Some(err) = out.error {

@@ -440,6 +440,7 @@ response_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], 
 | `idle_timeout_secs` | integer | `300` | A `persistent` worker idle this long is stopped. `0` = never. |
 | `timeout_secs` | integer | `30` | Limit for one transformation. `0` = none. A worker that times out is killed and replaced, and that transformation counts as failed. |
 | `extra` | string | unset | Copied verbatim into every envelope's `extra` field; its meaning is up to the program. The official binary expects the path of its config here and expands `~/` itself. |
+| `every_attempt` | boolean | `false` | `request_transform` only (on the other two it fails start): run the request transform again before every retry. See below. |
 
 - Write `command` with `~/` or an absolute path. A relative path resolves against the daemon's
   working directory, which depends on where `start` or `restore` happened to run.
@@ -454,9 +455,16 @@ response_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], 
 - Choose `timeout_secs` by how long a stuck program may hold one request, not by client timeouts:
   keepalive requests keep receiving heartbeats while a transformation runs. With `0`, a program
   that hangs holds that request indefinitely and its worker is never replaced.
-- A request is transformed once and every retry replays the result, so a rotating key changes
-  between requests, not between retries. Responses passed through by `bounded_retry_paths` are not
-  transformed.
+- By default a request is transformed once and every retry replays the result, so a rotating key
+  changes between requests, not between retries. With `every_attempt = true`, aProxy calls the
+  request transform again before each retry with the client's original request (envelope
+  `stage = "retry"`, plus the previous attempt's status) and sends what it returns, so the program
+  can move to another key or channel after a failure; the official binary in `persistent` mode then
+  takes the next key on every retry. A failed call at that point does not end the request: aProxy
+  retries with the request it sent last time. The original body stays in memory for the whole
+  request. Only enable it for a program that handles `stage = "retry"` (the aproxy-format skill,
+  protocol.md); one that echoes unknown stages back would send the untransformed request.
+- Responses passed through by `bounded_retry_paths` are not transformed.
 - aProxy discards the program's stderr; have the program write its own log file.
 - Cannot be combined with `forward_only`.
 

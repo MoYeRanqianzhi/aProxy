@@ -496,11 +496,11 @@ to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running anot
   cargo-binstall, cargo. On Linux, a gnu build that cannot run is replaced by the musl build
   automatically.
 
-**Which instances move.** `--from` refuses while a running instance's binary lives outside
-`<home>/bin/` (`实例 <port> 的二进制不在安装管辖目录（…）下`, "instance binary outside the managed
-directory"): upgrade that copy through its own channel (npm, cargo, a package manager) or run
-`aproxy install --adopt`. Online installs skip this check and move every running instance onto
-`<home>/bin/`.
+**Which instances move.** Online installs and `--from` refuse while a running instance's binary
+lives outside `<home>/bin/` (`实例 <port> 的二进制不在安装管辖目录（…）下`, "instance binary outside
+the managed directory"); an online install refuses before downloading anything. Upgrade that copy
+through its own channel (npm, cargo, a package manager) or run `aproxy install --adopt`, which moves
+every running instance onto `<home>/bin/`.
 
 **Reading the result.**
 

@@ -203,8 +203,8 @@ async fn run_skills_only(args: &InstallArgs) {
     }
 }
 
-/// 在线安装：版本解析（latest → GitHub 查询）→ 降级防呆 → 下载链条 →
-/// staged 校验 → 主流程。
+/// 在线安装：版本解析（latest → GitHub 查询）→ 降级防呆 → 管辖检查 →
+/// 下载链条 → staged 校验 → 主流程。
 async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &InstallArgs) {
     let settings = aproxy::settings::load();
     let proxy = args
@@ -280,6 +280,14 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     if let Err(e) =
         aproxy::install::download::check_downgrade(&target, &current, args.allow_downgrade)
     {
+        eprintln!("[ERROR] {e}");
+        std::process::exit(1);
+    }
+
+    // 管辖检查与 --from 同一道（见 run_plan），放在下载之前：bin 外的实例本就
+    // 不该被滚动到 `<home>/bin`，没必要先下载一个注定装不上的产物。放在版本
+    // 决议之后：已是最新时什么都不会发生，不必拦
+    if let Err(e) = aproxy::install::flow::check_jurisdiction(run_dir, home, false).await {
         eprintln!("[ERROR] {e}");
         std::process::exit(1);
     }

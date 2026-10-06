@@ -70,8 +70,11 @@ IPC 重新整理格式后协议版本从 1 重新计数。随后：「发现的�
 - c.4（提交 F）：`continue_install` 遇 failed + halted 时先查 `fleet_already_on_target`（快照实例全部应答、serving、
   版本 == 目标、镜像 == `<home>/bin`），满足即清场。只比版本不够：测试与同版本重装里回滚到旧二进制的实例版本号
   相同（既有回滚用例因此仍拒绝）。测试 `halted_failure_is_cleaned_up_when_the_fleet_already_runs_the_target`。
-- 下一步：第 6 步 install 其余（在线路径管辖检查 T6a、早交接 T6d、install.state 冻结副本）；看 upgrade-from-0-1-0
-  任务的首次结果，按结果修。
+- CI 88cf50c：upgrade-from-0-1-0 两个平台首跑即绿（各约 4 秒，1 个用例实际执行），c.3 的 Linux 假说在 R1 + socket
+  自愈之后不再复现。E2E 没做「kill -9 后看新看护者重拉」：补种要等自检周期（≤5 分钟），只断言 claim 已不属 0.1.0。
+- T6a（提交 G）：在线安装在版本决议之后、下载之前跑 `check_jurisdiction`；`jurisdiction_check_rejects_foreign_binary`
+  加了 CLI 在线路径断言（下载链指向 127.0.0.1:1，修前报下载失败，修后报管辖错误）。
+- 下一步：T6d 早交接、install.state 冻结副本。
 - Linux 编译只能靠 CI 的 ubuntu 门禁：本机 WSL（Debian）的 rustup 工具链清单损坏，且 2026-10-06 WSL 内无外网
   （官方源与 rsproxy 均连接超时），修不了；本机也没有 Linux C 交叉编译器（ring 需要）。
 

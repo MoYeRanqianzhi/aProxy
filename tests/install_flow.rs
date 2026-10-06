@@ -243,6 +243,13 @@ fn install_from_with_instance_rolling_restart_and_relay() {
 #[tokio::test]
 async fn jurisdiction_check_rejects_foreign_binary() {
     let env = TestEnv::new(3);
+    // 下载链指向一个必然连不上的地址：在线安装若在管辖检查之前就开始下载，
+    // 报的会是下载失败而不是管辖错误
+    std::fs::write(
+        env.home().join("settings.json"),
+        r#"{"watchdog": false, "download_chain": [{"url": "http://127.0.0.1:1/{asset}"}]}"#,
+    )
+    .unwrap();
     // 不 seed_bin：实例将跑在 from 源（bin 外）
     let cfg_file = env.home().join("foreign.toml");
     std::fs::write(
@@ -288,6 +295,16 @@ async fn jurisdiction_check_rejects_foreign_binary() {
             .await
             .is_ok()
     );
+    // 在线路径同样拒绝，且在任何下载之前（显式版本号跳过 latest 查询）
+    let out = env.install_cmd(&["9.9.9", "--no-skills"]).output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "在线安装应被拒绝: {text}");
+    assert!(text.contains("--adopt"), "在线安装应报管辖错误: {text}");
+    assert!(!text.contains("开始下载"), "管辖检查应先于下载: {text}");
 
     let _ = Command::new(env!("CARGO_BIN_EXE_aproxy"))
         .args(["stop", &env.port.to_string()])

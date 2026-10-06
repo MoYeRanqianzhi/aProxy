@@ -8,8 +8,9 @@
 //!   （fallback 执行目标，保持 exe 后缀）；入口脚本常驻（防线 0，PATHEXT
 //!   保证 exe 在场时零参与）。
 //! - **unix**：只锁 inode。staging 文件单步 rename 原子覆盖 bin/aproxy——
-//!   不存在空窗（无需 fallback 脚本）、安装进程无需换镜像（直接续跑，无
-//!   relaying）。交换前先把旧二进制硬链接（失败则复制）为 `bin/aproxy.old`：
+//!   不存在空窗（无需 fallback 脚本），交换之后驱动安装的进程不必换到 bin
+//!   （Windows 要换，见 flow.rs 的 run_forward_from_staged）。交换前先把旧
+//!   二进制硬链接（失败则复制）为 `bin/aproxy.old`：
 //!   不是为了防空窗，而是滚动重启时某实例在新版本下起不来，要用旧二进制
 //!   按原参数把它拉回——rename 覆盖后旧 inode 只挂在运行中进程上，文件系统
 //!   里已无路径可执行。cleaning 照常删除（unix 删除运行中文件不受限）。
@@ -217,54 +218,6 @@ else
   exit 1
 fi
 "#;
-
-// ---------------------------------------------------------------------------
-// 接力（Windows 无 exec 的替代；unix 跳过 relaying 直接续跑）
-// ---------------------------------------------------------------------------
-
-/// 旧安装进程（跑在 .old 镜像上）spawn 新二进制 `install --continue` 续跑，
-/// 返回新进程 pid。环境经 spawn 继承——APROXY_HOME 重定向自动传播，
-/// 新进程定位到同一份 install.state。
-#[cfg(windows)]
-pub fn spawn_continuator(new_bin: &Path) -> std::io::Result<u32> {
-    crate::daemon::spawn_detached(new_bin, &["install".to_string(), "--continue".to_string()])
-}
-
-/// 旧进程确认接管：轮询状态文件 phase 已**越过** relaying（推进到
-/// restarting 及以后 = 接管者 run_tail 的 advance，与 updated_at 刷新是
-/// 同一次原子写——推进本身就是接管者自证存活）。注意不能判 `>= relaying`
-/// ：安装者自己在 spawn 接棒者前就写了 relaying，读到相等值不代表有人接管。
-/// 确认后旧进程自行退出（=「旧二进制自动停止」）。接管者始终不出现属于
-/// 「relaying 中断」恢复场景——超时返回 false，安装者兜底继续或看护者
-/// 拉起 --continue。
-#[cfg(windows)]
-pub fn wait_for_takeover(run_dir: &Path, deadline: std::time::Instant) -> bool {
-    use crate::install::state::{InstallPhase, load_in};
-    let takeover_reached = |p: InstallPhase| {
-        matches!(
-            p,
-            InstallPhase::Restarting
-                | InstallPhase::Verifying
-                | InstallPhase::Cleaning
-                | InstallPhase::Done
-        )
-    };
-    loop {
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        // 状态文件消失 = done 清场（接管者极快完成的场景）
-        if !crate::install::state::state_path_in(run_dir).exists() {
-            return true;
-        }
-        if let Some(s) = load_in(run_dir)
-            && takeover_reached(s.phase)
-        {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-}
 
 #[cfg(test)]
 mod tests {

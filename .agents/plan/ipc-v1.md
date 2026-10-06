@@ -74,7 +74,26 @@ IPC 重新整理格式后协议版本从 1 重新计数。随后：「发现的�
   自愈之后不再复现。E2E 没做「kill -9 后看新看护者重拉」：补种要等自检周期（≤5 分钟），只断言 claim 已不属 0.1.0。
 - T6a（提交 G）：在线安装在版本决议之后、下载之前跑 `check_jurisdiction`；`jurisdiction_check_rejects_foreign_binary`
   加了 CLI 在线路径断言（下载链指向 127.0.0.1:1，修前报下载失败，修后报管辖错误）。
-- 下一步：T6d 早交接、install.state 冻结副本。
+- T6d（提交 H）：早交接。备料校验后安装者以 `install --continue --handover-from <pid>` 拉起 staging 里的目标二进制，
+  之后由它执行；Windows 上它交换后再把剩余阶段交给 bin 里的同一个二进制（cleaning 要删 staging）。取舍：
+  - 接手者靠隐藏参数指名，不加 install.state 字段（旧解析器不受影响）；没被指名的续作（main.rs 对任何命令都会
+    拉起 `--continue`）在安装者健在时一律拒绝——旧的 relaying 豁免对它们也放行，交棒窗口里会有两个进程同时滚动。
+  - 降级不交（`target_drives`：目标 ≥ 本进程才交），否则装不回 0.1.0（它不认 `--handover-from`）。
+  - 接手者继承环境重新推导 home，推导结果与参数不一致时不交（`successor_sees_same_home`），库层 crash_* 测试据此
+    仍在进程内跑完。
+  - unix 上留着 Child 判活与收割（僵尸会让按 pid 判活失灵；macOS 的 process_exited 不可用）；交棒成功后起线程收割。
+  - 宣告：交出者 release（停 beat、不撤节），否则 unix 上会 unlink 接手者的宣告；skill 支线归交出者，接手者不跑；
+    `--no-skills` 记成 skipped，续作也认。drive_with_skill 只在状态仍归本进程时补写 skill 结果。
+  - 删掉 N 自己的 relaying 接力代码（swap::spawn_continuator / wait_for_takeover）；relaying 豁免只为 0.1.0 保留。
+  - 测试：install_flow 6d（目标不接手 → 失败、可续作、实例与 bin 不动，unix）、6e（包装脚本证明以
+    `--handover-from` 拉起、接手者的失败经 last_error 转告，unix）、滚动测试改为跨平台并断言交棒文案、6b 两平台
+    断言交棒；install_flow_lib `only_the_named_successor_takes_over_a_live_install`；announce
+    `released_announcement_is_left_to_the_successor`（unix 才有区分力）；flow `the_newer_side_drives_the_install`。
+    变异验证：去掉 Windows 那一跳，快路径因 staging 删不掉而失败。
+- install.state 冻结副本（T6d 之前的单独提交）：compat_v0_1_0 加 0.1.0 的 InstallState 等结构，新版本每个阶段写的状态 0.1.0 都能解析，
+  0.1.0 留下的 relaying/restarting/failed 现场新版本都能读。
+- 第 7 步：文档随各提交同步；记忆 `2026-10-06-ipc-v1-upgrade-contract.md` 记下永久接口与兼容窗口。
+- 下一步：推送后看 ubuntu（6d/6e 与宣告释放测试只在 unix 跑）；绿了之后本计划只剩 0.2.0 删兼容时回看，可删除计划。
 - Linux 编译只能靠 CI 的 ubuntu 门禁：本机 WSL（Debian）的 rustup 工具链清单损坏，且 2026-10-06 WSL 内无外网
   （官方源与 rsproxy 均连接超时），修不了；本机也没有 Linux C 交叉编译器（ring 需要）。
 

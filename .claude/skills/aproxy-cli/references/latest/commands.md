@@ -506,10 +506,12 @@ every running instance onto `<home>/bin/`.
 
 - Exit 0 with `安装完成：<path>（二进制已落位，实例已滚动到新版本）` ("installed; binary in place,
   instances rolled to the new version") means every running instance was verified on the new
-  version. On Windows with running instances, `交换完成，剩余阶段（滚动重启/终验）由新版本进程继续，等待其完成...`
-  appears first: the new binary finishes the job in a separate process while the command waits
-  (up to 600 s) and then reports. `install.state` may linger a moment afterwards while the old
-  binary is deleted.
+  version. Before it, `新版本进程已接手安装（广播、交换、滚动重启、终验），等待其完成...` ("the new
+  version's process has taken over the install; waiting for it") appears: once the download is
+  verified, the downloaded binary runs the rest in a separate process while the command waits (up
+  to 600 s) and then reports. A downgrade is run by the command itself and skips this line.
+  `install.state` may linger a moment afterwards while the old binary and the staging copy are
+  deleted.
 - While instances roll, `status` marks them `二进制更换中…`; do not stop or restart those.
 - Skill documents are updated alongside into `<home>/skills/<name>/`; a skill failure does not
   fail the install. They are not linked into any agent's skill directory.
@@ -526,7 +528,9 @@ every running instance onto `<home>/bin/`.
   already in `<home>/bin/` at this point, so the CLI and some instances run different versions
   until you finish.
 - `现场已保留，中断后重试同一命令或任何 aproxy 命令可自动续作…` ("state kept; rerun, or any aproxy
-  command resumes"): run the same command again.
+  command resumes"): run the same command again. When the error reads `目标版本没有接手安装（…）`
+  ("the target version did not take over"), the downloaded binary exited or hung before starting;
+  no instance and no file in `<home>/bin/` was changed.
 
 An install interrupted by a crash, kill or power loss leaves `<home>/run/install.state`; the
 watchdog and every other `aproxy` command resume it in the background. Do not delete that file by

@@ -52,6 +52,8 @@ pub struct Announcement {
 /// 读的全局节（S5，尽力而为）。
 pub struct Announcer {
     sections: Vec<Section>,
+    /// 已交棒：Drop 时只放下自己的句柄，不撤节（见 [`Announcer::release`]）
+    released: std::sync::atomic::AtomicBool,
 }
 
 /// 一个宣告节
@@ -85,7 +87,10 @@ impl Announcer {
             crate::compat_0_1_0::LEGACY_ANNOUNCEMENT,
             ann,
         ));
-        Some(Self { sections })
+        Some(Self {
+            sections,
+            released: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     /// 刷新心跳（install 侧独立 ticker 周期调用）。
@@ -97,12 +102,28 @@ impl Announcer {
     }
 }
 
+impl Announcer {
+    /// 交棒：安装交给了另一个进程，它已在同一个节名上宣告。此后 Drop 只放下本
+    /// 进程的句柄，不撤节——unix 上两边是同一个 /dev/shm 文件，unlink 会把接手
+    /// 者的宣告一起删掉；Windows 的命名节本就随最后一个句柄消失，接手者的句柄
+    /// 让它留下。
+    pub fn release(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl Drop for Announcer {
     fn drop(&mut self) {
         // Windows：unmap + close → 节消失；unix：unlink 持久文件（done/abort
         // 的主动解除路径；崩溃残留靠心跳过期自然失效）
+        let released = self.released.load(std::sync::atomic::Ordering::Relaxed);
         for section in &mut self.sections {
-            imp::destroy_section(section);
+            if released {
+                imp::release_section(section);
+            } else {
+                imp::destroy_section(section);
+            }
         }
     }
 }
@@ -222,6 +243,12 @@ mod imp {
             let _ = windows_sys::Win32::Foundation::CloseHandle(section.mapping);
         }
     }
+
+    /// 只放下本进程的句柄：命名节还被别的进程持有时留下，否则随之消失——
+    /// 与撤销是同一个动作
+    pub fn release_section(section: &mut Section) {
+        destroy_section(section);
+    }
 }
 
 #[cfg(not(windows))]
@@ -286,6 +313,9 @@ mod imp {
         // 心跳过期自然失效（与 Windows「节消失」殊途同归）
         let _ = std::fs::remove_file(&section.path);
     }
+
+    /// 只放下本进程的句柄：fd 随 Section 一起关闭，文件留给接手者
+    pub fn release_section(_section: &mut Section) {}
 }
 
 #[cfg(test)]
@@ -308,6 +338,7 @@ mod tests {
         .expect("宣告节创建失败");
         let a = Announcer {
             sections: vec![section],
+            released: std::sync::atomic::AtomicBool::new(false),
         };
         a.beat();
         let ann = read(run.path()).expect("宣告节应可读");
@@ -342,5 +373,35 @@ mod tests {
         assert!(imp::load_section(&announcement_name(b.path())).is_none());
         let mut section = section;
         imp::destroy_section(&mut section);
+    }
+
+    #[test]
+    fn released_announcement_is_left_to_the_successor() {
+        // 交棒：接手者在同一个节名上宣告之后，交出者的 Drop 不得撤掉它
+        //（unix 上两边是同一个文件，撤销 = unlink 接手者的宣告）
+        let run = tempfile::tempdir().unwrap();
+        let name = announcement_name(run.path());
+        let owner = |pid: u32| Announcer {
+            sections: vec![
+                imp::create_section(
+                    &name,
+                    Announcement {
+                        installer_pid: pid,
+                        heartbeat_ms: crate::watchdog::now_millis(),
+                    },
+                )
+                .expect("宣告节创建失败"),
+            ],
+            released: std::sync::atomic::AtomicBool::new(false),
+        };
+        let handing_over = owner(u32::MAX - 1);
+        let successor = owner(std::process::id());
+        handing_over.release();
+        drop(handing_over);
+        successor.beat();
+        let ann = imp::load_section(&name).expect("交棒后接手者的宣告应仍在");
+        assert_eq!(ann.installer_pid, std::process::id());
+        drop(successor);
+        assert!(imp::load_section(&name).is_none(), "接手者撤宣告后节应解除");
     }
 }

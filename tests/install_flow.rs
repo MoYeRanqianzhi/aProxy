@@ -1,5 +1,6 @@
-//! install 主流程端到端：--from 全流程（无实例快路径 / 有实例滚动重启 +
-//! Windows 接力）、管辖检查、--adopt 收编、--abort 回滚窗口。
+//! install 主流程端到端：--from 全流程（无实例快路径 / 有实例滚动重启，都经
+//! 早交接由 staging 里的目标二进制驱动）、交棒失败与失败转告、管辖检查、
+//! --adopt 收编、--abort 回滚窗口。
 //!
 //! 隔离：每个测试独立 tempdir 作为 APROXY_HOME，实例与安装进程都注入同一
 //! 环境变量；端口从测试进程 pid 派生，绝不触碰生产实例（12345/12349）。
@@ -77,8 +78,6 @@ impl TestEnv {
 /// 轮询安装完成标志：状态文件**先出现（installer 抢锁）后消失（done 清场）**。
 /// 两段缺一不可——直接等「消失」有启动竞态：installer 尚未 create_new 时
 /// state 也不存在，会被误判为已完成（实测三轮 1.6s 假通过的根源）。
-/// 调用方均为 Windows 滚动升级测试（unix 无实例滚动路径待实测项）
-#[cfg(windows)]
 fn wait_install_done(env: &TestEnv, timeout: Duration) -> bool {
     let state = aproxy::install::state::state_path_in(&env.home().join("run"));
     let deadline = Instant::now() + timeout;
@@ -109,7 +108,7 @@ fn bin_works(home: &std::path::Path) -> bool {
 
 // ---------------------------------------------------------------------------
 // 1. 无实例快路径：bin 预放旧二进制 → install --from → 落位 + .old 清理 +
-//    状态文件删除（broadcasting/relaying/restarting 全部跳过）
+//    状态文件删除（broadcasting/restarting 全部跳过）
 // ---------------------------------------------------------------------------
 #[test]
 fn install_from_without_instances_fast_path() {
@@ -117,8 +116,9 @@ fn install_from_without_instances_fast_path() {
     env.seed_bin();
     let from = env.source_file("fast");
 
+    // --no-skills：skill 支线会去 GitHub/npm 下载，测试不依赖外网
     let out = env
-        .install_cmd(&["--from", &from.display().to_string()])
+        .install_cmd(&["--from", &from.display().to_string(), "--no-skills"])
         .output()
         .unwrap();
     assert!(
@@ -126,8 +126,16 @@ fn install_from_without_instances_fast_path() {
         "install 应成功: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // 终态：bin 可运行、.old 已删（安装进程不在 bin 内，无镜像锁）、
-    // staging 清理、状态文件删除（done 的完成语义）
+    // 安装者在接手者进入 cleaning 时就以 0 退出（Windows 上 .old 是它自己的
+    // 镜像，它不退出就删不掉），状态文件稍后由接手者清掉
+    let state = aproxy::install::state::state_path_in(&env.home().join("run"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while state.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // 终态：bin 可运行、.old 已删、staging 清理（Windows 上接手者交换后把剩余
+    // 阶段交给了 bin 里的二进制，staging 里的副本已不在运行）、状态文件删除
+    //（done 的完成语义）
     assert!(bin_works(&env.home()));
     assert!(
         !aproxy::install::swap::old_path_in(&env.home()).exists(),
@@ -143,12 +151,12 @@ fn install_from_without_instances_fast_path() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. 有实例滚动重启：实例跑在规范 bin → install --from → 广播 ACK → swap →
-//    Windows 接力 → 接管者滚动重启实例 → 终验 → 清理 → done
+// 2. 有实例滚动重启：实例跑在规范 bin → install --from → 交给 staging 里的
+//    目标二进制 → 广播 ACK → swap →（Windows 再交给 bin 里的二进制）→ 滚动
+//    重启实例 → 终验 → 清理 → done
 // ---------------------------------------------------------------------------
 #[test]
-#[cfg(windows)]
-fn install_from_with_instance_rolling_restart_and_relay() {
+fn install_from_with_instance_rolling_restart() {
     use std::io::Read;
 
     let env = TestEnv::new(2);
@@ -194,7 +202,7 @@ fn install_from_with_instance_rolling_restart_and_relay() {
         .install_cmd(&["--from", &from.display().to_string(), "--no-skills"])
         .spawn()
         .unwrap();
-    // 安装含 relay（等接管最多 30s）+ 滚动重启 + 终验，给 120s
+    // 安装含两次交棒（各等接手最多 30s）+ 滚动重启 + 终验，给 120s
     let done = wait_install_done(&env, Duration::from_secs(120));
     let mut output = String::new();
     let _ = installer.stdout.take().unwrap().read_to_string(&mut output);
@@ -204,13 +212,13 @@ fn install_from_with_instance_rolling_restart_and_relay() {
         done,
         "安装未在预期时间内完成（状态文件残留）; 输出: {output}"
     );
-    // 交棒后 CLI 等到接棒者终验通过才退出：退出码 0 + 完成提示即真实结局
+    // 交棒后 CLI 等到接手者终验通过才退出：退出码 0 + 完成提示即真实结局
     assert!(
-        status.success() && output.contains("安装完成"),
-        "CLI 应在接棒者完成后以 0 退出并报告完成; 输出: {output}"
+        status.success() && output.contains("新版本进程已接手安装") && output.contains("安装完成"),
+        "CLI 应交棒、在接手者完成后以 0 退出并报告完成; 输出: {output}"
     );
 
-    // 终态断言：bin 可运行、.old 已删（接管进程跑在新 bin 上，非自镜像）、
+    // 终态断言：bin 可运行、.old 已删（尾部由 bin 里的二进制执行，非自镜像）、
     // 实例已滚动到新 pid（旧实例被优雅停止后用新二进制拉起）
     assert!(bin_works(&env.home()));
     assert!(!aproxy::install::swap::old_path_in(&env.home()).exists());
@@ -358,8 +366,8 @@ fn adopt_migrates_foreign_instance() {
     assert!(old_pid != 0, "外域实例未就绪");
 
     // --adopt：当前进程（CARGO_BIN_EXE）作为源收编
-    // CLI 在接力交棒后会等接棒者到达终点（终验通过即 cleaning）才以 0
-    // 退出——退出码即结局；此后只剩接棒者删 .old/staging 与状态文件
+    // CLI 交棒后会等接手者到达终点（终验通过即 cleaning）才以 0 退出——
+    // 退出码即结局；此后只剩接手者删 .old/staging 与状态文件
     let out = env
         .install_cmd(&["--adopt", "--no-skills"])
         .output()
@@ -457,8 +465,8 @@ fn abort_rejected_after_swap_phase() {
 // 6b. 滚动重启实例级失败（审查 install-01 原始复现）：实例运行中配置被改坏
 //     → install 滚动到它时新旧二进制都起不来。修复前：.restore 被守护优雅
 //     退出删除、实例永久丢失；Windows 接力路径打印「交换完成」并以 0 退出。
-//     修复后：CLI（Windows 上等接棒者跑到终点）以非零退出并给出原因与
-//     指引，.restore 以原参数保住，状态 halted（自动续作不再重试）。
+//     修复后：CLI（等接手者跑到终点）以非零退出并给出原因与指引，
+//     .restore 以原参数保住，状态 halted（自动续作不再重试）。
 // ---------------------------------------------------------------------------
 #[test]
 fn install_instance_failure_exits_nonzero_and_keeps_restore() {
@@ -528,11 +536,10 @@ fn install_instance_failure_exits_nonzero_and_keeps_restore() {
         stderr.contains("滚动已中止") && stderr.contains("aproxy restore"),
         "应给出中止说明与 restore 指引: {stderr}"
     );
-    // Windows 有实例时必经接力交棒：失败由接棒者发生、经 CLI 轮询转告
-    #[cfg(windows)]
+    // 失败发生在接手的目标版本进程里，经 CLI 轮询 install.state 转告
     assert!(
-        stdout.contains("由新版本进程继续"),
-        "应走接力交棒路径: {stdout}"
+        stdout.contains("新版本进程已接手安装"),
+        "应交给目标版本驱动: {stdout}"
     );
     assert!(
         started.elapsed() < Duration::from_secs(120),
@@ -556,9 +563,9 @@ fn install_instance_failure_exits_nonzero_and_keeps_restore() {
 // ---------------------------------------------------------------------------
 // 6c. unix 端到端回滚：--from 一个「能自报版本、但拉不起实例」的新二进制
 //     → 交换前保留的 bin/aproxy.old 把实例按原参数拉回，CLI 非零退出。
-//     （unix 无接力交棒，滚动在 CLI 进程内执行；Windows 的同一逻辑由
-//     install_flow_lib 的回滚用例覆盖——Windows 上造不出「能答 --version
-//     却拒绝启动」的假 exe）
+//     假二进制自报的版本比当前低，是降级：不交棒，滚动在 CLI 进程内执行
+//     （交棒路径上的同一失败见 6d；Windows 的同一逻辑由 install_flow_lib 的
+//     回滚用例覆盖——Windows 上造不出「能答 --version 却拒绝启动」的假 exe）
 // ---------------------------------------------------------------------------
 #[cfg(unix)]
 #[test]
@@ -644,6 +651,184 @@ fn unix_install_rolls_back_instance_to_preserved_old_binary() {
         &env.port.to_string(),
         Duration::from_secs(20),
     ));
+}
+
+/// unix 上起一个跑在规范 bin 上的实例，等它就绪
+#[cfg(unix)]
+fn start_bin_instance(env: &TestEnv, name: &str) -> std::process::Child {
+    let cfg_file = env.home().join(format!("{name}.toml"));
+    std::fs::write(
+        &cfg_file,
+        format!(
+            "base_url = \"https://{name}.example.com\"\nlisten_addr = \"127.0.0.1:{}\"\n",
+            env.port
+        ),
+    )
+    .unwrap();
+    let child = Command::new(aproxy::install::swap::bin_path_in(&env.home()))
+        .args([
+            "--config",
+            &cfg_file.display().to_string(),
+            "--daemon-child",
+        ])
+        .env("APROXY_HOME", env.home())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let run_dir = env.home().join("run");
+    for _ in 0..100 {
+        if aproxy::daemon::registry_pids_in(&run_dir).contains(&child.id()) {
+            return child;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("实例未就绪");
+}
+
+/// unix 上把 `body` 写成可执行脚本
+#[cfg(unix)]
+fn write_script(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, body).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 6d. 交棒失败：目标二进制自报同一版本（会交给它），但不接手安装就退出 →
+//     安装以失败收场，失败说清楚且可续作（不是 halted），实例与 bin 都没动。
+// ---------------------------------------------------------------------------
+#[cfg(unix)]
+#[test]
+fn handover_to_a_target_that_never_takes_over_fails_without_touching_anything() {
+    let env = TestEnv::new(10);
+    std::fs::write(env.home().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+    env.seed_bin();
+    let mut child = start_bin_instance(&env, "refuse");
+    let pid = child.id();
+
+    let fake = env.home().join("fake-refuse");
+    write_script(
+        &fake,
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"aproxy {}\"; exit 0; fi\nexit 1\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    );
+    let started = Instant::now();
+    let out = env
+        .install_cmd(&["--from", &fake.display().to_string(), "--no-skills"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "应非零退出: {stderr}");
+    assert!(stderr.contains("没有接手"), "应说明目标没有接手: {stderr}");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "接手者退出应被立即发现，而不是等满超时"
+    );
+
+    let run_dir = env.home().join("run");
+    let st = aproxy::install::state::load_in(&run_dir).expect("failed 现场保留");
+    assert_eq!(st.phase, aproxy::install::state::InstallPhase::Failed);
+    assert!(!st.halted, "交棒失败可续作，不是实例级失败");
+    assert_eq!(
+        std::fs::read(aproxy::install::swap::bin_path_in(&env.home())).unwrap(),
+        std::fs::read(env!("CARGO_BIN_EXE_aproxy")).unwrap(),
+        "bin 不应被换"
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let info = rt
+        .block_on(aproxy::daemon::ipc_ping_in(&run_dir, &env.port.to_string()))
+        .expect("实例应仍在线");
+    assert_eq!(info.instance.pid, pid, "实例不应被重启");
+    assert_eq!(info.state, aproxy::daemon::InstanceState::Serving);
+
+    let _ = rt.block_on(aproxy::install::restart::stop_and_wait(
+        &run_dir,
+        &env.port.to_string(),
+        Duration::from_secs(20),
+    ));
+    let _ = child.wait();
+}
+
+// ---------------------------------------------------------------------------
+// 6e. 早交接的证据与失败转告：目标二进制是一层包装（记下自己被怎样调用，
+//     install 交给真二进制，其余一律失败）。安装者应以 `install --continue
+//     --handover-from <pid>` 拉起它；接手者滚动时新二进制拉不起实例 → 用
+//     旧二进制拉回、halted；安装者把接手者记下的原因转告用户并非零退出。
+// ---------------------------------------------------------------------------
+#[cfg(unix)]
+#[test]
+fn staged_target_drives_the_install_and_its_failure_reaches_the_installer() {
+    let env = TestEnv::new(11);
+    std::fs::write(env.home().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+    env.seed_bin();
+    let mut child = start_bin_instance(&env, "wrapped");
+
+    let calls = env.home().join("wrapper-calls.log");
+    let wrapper = env.home().join("wrapper");
+    write_script(
+        &wrapper,
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> '{calls}'\n\
+             if [ \"$1\" = \"--version\" ]; then echo \"aproxy {version}\"; exit 0; fi\n\
+             if [ \"$1\" = \"install\" ]; then exec '{real}' \"$@\"; fi\n\
+             exit 1\n",
+            calls = calls.display(),
+            version = env!("CARGO_PKG_VERSION"),
+            real = env!("CARGO_BIN_EXE_aproxy"),
+        ),
+    );
+    let out = env
+        .install_cmd(&["--from", &wrapper.display().to_string(), "--no-skills"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {stdout} stderr: {stderr}"
+    );
+    assert!(stdout.contains("新版本进程已接手安装"), "{stdout}");
+    // 「实例 <端口> 滚动重启失败」只出现在接手者记下的 last_error 里（中止指引
+    // 是安装者自己的文案），据此确认原因是从接手者转告过来的
+    assert!(
+        stderr.contains(&format!("实例 {} 滚动重启失败", env.port))
+            && stderr.contains("滚动已中止"),
+        "应转告接手者的失败原因与中止指引: {stderr}"
+    );
+    let log = std::fs::read_to_string(&calls).unwrap();
+    assert!(
+        log.lines()
+            .any(|l| l.starts_with("install --continue --handover-from ")),
+        "安装者应指名交给目标二进制: {log}"
+    );
+
+    let run_dir = env.home().join("run");
+    let st = aproxy::install::state::load_in(&run_dir).expect("failed 现场保留");
+    assert_eq!(st.phase, aproxy::install::state::InstallPhase::Failed);
+    assert!(st.halted);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let info = rt
+        .block_on(aproxy::daemon::ipc_ping_in(&run_dir, &env.port.to_string()))
+        .expect("实例应被旧二进制拉回");
+    let image = aproxy::watchdog::process_image_path(info.instance.pid).unwrap();
+    assert_eq!(image, aproxy::install::swap::old_path_in(&env.home()));
+
+    let _ = rt.block_on(aproxy::install::restart::stop_and_wait(
+        &run_dir,
+        &env.port.to_string(),
+        Duration::from_secs(20),
+    ));
+    let _ = child.wait();
 }
 
 // ---------------------------------------------------------------------------

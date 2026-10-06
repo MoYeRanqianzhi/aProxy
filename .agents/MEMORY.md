@@ -35,3 +35,4 @@
 - [Codex 流空闲超时](memory/2026-10-04-codex-stream-idle-timeout.md) — Codex 按 SSE 事件计 300s 空闲（eventsource-stream 丢弃注释，aProxy 心跳续不了命），超时重连 5 次后失败；provider 须设 stream_idle_timeout_ms=86400000（源码 + 正反黑盒实测）[[claude-code-stream-watchdogs]]
 - [Gemini CLI 与保活](memory/2026-10-04-gemini-cli-sse-parsing.md) — Gemini 流请求不触发保活（默认可用但受写死的 300s 响应头超时限制）；注释心跳会触发 @google/genai 1.30.0 解析 bug 吞掉整段响应，空行前缀无害（真实客户端实测）[[codex-stream-idle-timeout]]
 - [agent 客户端流超时调研](memory/2026-10-04-agent-client-timeouts-survey.md) — 判断法（字节级续得住、事件级续不住）+ Qwen Code / dsh / pi / OpenCode / Aider / Cline / Roo / Kimi 的源码依据与核实程度 [[codex-stream-idle-timeout]] [[gemini-cli-sse-parsing]]
+- [IPC v1 与升级契约](memory/2026-10-06-ipc-v1-upgrade-contract.md) — 跨版本永久接口清单（.pid/.restore/claim/install.state 词表/socket 路径/CLI 含 --handover-from）、早交接由目标版本驱动、0.1.x 兼容窗口 0.2.0 删除；改这些前先跑 compat_v0_1_0 [[install-pitfalls]] [[ci-unix-blindspot]]

@@ -410,8 +410,9 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
   无稳定版，Pre 取 `latest`/`next` 较大者）。选这个设计的原因：二进制内置的选版
   逻辑随版本发出就收不回，「默认只取稳定版」不能指望发布侧标签永远打对
 - **state**：状态文件即安装锁（run/ 下，原子重写，updated_at 自动刷新供
-  接力存活判据）；阶段状态机线性主线 + failed/aborted 旁路，abort 仅
-  swapping 前可回滚
+  stale 判定）；阶段状态机线性主线 + failed/aborted 旁路，abort 仅
+  swapping 前可回滚。交棒后等待结局的往往是较旧的二进制，所以阶段词表与
+  字段名冻结、新字段一律可选
 - **staging**：备料区（复制/chmod/sha256/`--version` 试跑自证）
 - **swap**：平台收口点——Windows copy+双 rename 舞（bin 永不空窗 + .old
   固定名 + PATHEXT fallback 入口脚本常驻）；unix 单步 rename 原子覆盖
@@ -428,9 +429,15 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
   （双 rename 的产物）；unix 在单步 rename 覆盖前把旧二进制硬链接（失败则复制）
   为 `bin/aproxy.old`——覆盖后旧 inode 只挂在运行中进程上，文件系统里已无路径可
   执行，所以必须先留副本；cleaning 阶段删除
-- **flow**：编排（管辖检查 → 备料 → 广播 ACK → 交换 → Windows 接力交棒 →
-  滚动重启 → 终验 → 清理）；任何中断点由 `--continue` 幂等续作
-  （恢复矩阵：看护者主责 + CLI 入口兜底，全自动无询问）
+- **flow**：编排（管辖检查 → 备料 → 早交接 → 广播 ACK → 交换 → 滚动重启 →
+  终验 → 清理）；任何中断点由 `--continue` 幂等续作（恢复矩阵：看护者主责 +
+  CLI 入口兜底，全自动无询问）。早交接：备料校验通过后，安装者以
+  `install --continue --handover-from <自己的 pid>` 拉起 staging 里的目标二进制，
+  之后的一切由它执行，安装者只等待并转告结局；Windows 上它交换后再把剩余阶段
+  交给 bin 里的同一个二进制（cleaning 要删 staging，运行中的镜像删不掉）。选这个
+  设计的原因：每次升级都由新版本驱动，新版本能修旧安装器的缺陷，兼容只需要
+  「新读旧」。降级由较新的安装者自己执行（旧版本不认交棒参数）。没被指名的续作
+  （CLI 入口、看护者拉起的）在安装者健在时一律不接手
 - **download**：有序下载链条 github → npm → cargo-binstall → cargo
   （settings download_chain 严格数组可配 + url 模板通道，CDN 域名不硬
   编码）；github=.sha256 强校验、npm=integrity 强校验（跟随 ~/.npmrc

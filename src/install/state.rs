@@ -8,7 +8,10 @@
 //! - **create_new = 安装锁**：已存在且新鲜 → 并发安装拒绝；stale（updated_at
 //!   超时且原安装进程已死）→ 视为残留，不询问直接接管续跑。
 //! - **原子重写**：每次阶段推进整文件重写（tmp + rename），updated_at 自动
-//!   刷新——接力协议靠「updated_at 持续刷新」自证存活。
+//!   刷新（stale 判定的基准）。
+//! - **旧版本也要读得懂**：交棒之后，等待结局的是交出安装的那个（往往更旧的）
+//!   二进制，它读接手者写下的状态来报告结局。所以阶段词表与字段名冻结，新字段
+//!   一律可选。
 //! - **无 .json 后缀**：与 `.pid`/`.restore` 注册表惯例一致，按内容而非
 //!   扩展名识别。
 //! - 状态文件删除 = 安装完成。任何非终态残留都意味着未完成（恢复机制的
@@ -34,6 +37,9 @@ pub enum InstallPhase {
     Acked,
     Swapping,
     Swapped,
+    /// 只由 0.1.0 的安装器写入：它在 Windows 交换后接力给 bin 里的新二进制。
+    /// 本版本改为指名交棒（`--handover-from`），不再进入这个阶段；词表冻结，
+    /// 续作照常认它
     Relaying,
     Restarting,
     Verifying,
@@ -192,7 +198,7 @@ pub struct InstallState {
     pub skill: Option<SkillState>,
     #[serde(default)]
     pub started_at: u64,
-    /// 每次保存自动刷新（接力存活判据 + stale 判定的基准）
+    /// 每次保存自动刷新（stale 判定的基准）
     #[serde(default)]
     pub updated_at: u64,
     #[serde(default)]
@@ -207,8 +213,8 @@ pub struct InstallState {
     /// 由用户排除原因后显式重新执行 install 收尾（新安装接管残留状态）。
     #[serde(default)]
     pub halted: bool,
-    /// 最近一次失败的原因（与 phase=failed 同次落盘）。Windows 接力交棒后
-    /// 旧 CLI 进程靠它把接棒者的失败原因转告用户。
+    /// 最近一次失败的原因（与 phase=failed 同次落盘）。交棒之后，等待结局
+    /// 的安装者靠它把接手者的失败原因转告用户。
     #[serde(default)]
     pub last_error: Option<String>,
 }
@@ -272,7 +278,7 @@ pub fn load() -> Option<InstallState> {
 }
 
 /// stale 判定（锁失效 = 可接管）：**原安装进程已死即残留**（进程死亡后
-/// 现场不再变化，接管安全——不必等超时；典型场景：接力接管者失败退出后
+/// 现场不再变化，接管安全——不必等超时；典型场景：交棒的接手者失败退出后
 /// 留下的 failed 现场）；进程存活则 updated_at 超时（卡死兜底——活着的
 /// 挂死另有宣告心跳过期判据，见 is_takeable）。pid = 0（未填/损坏）直接
 /// 视为死；pid 为当前进程（同一进程重入）视为活。

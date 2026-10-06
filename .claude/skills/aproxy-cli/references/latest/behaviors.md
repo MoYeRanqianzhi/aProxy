@@ -441,8 +441,9 @@ commands.md. During the run:
   `aproxy restore` brings it back after the fix.
 - The old binary is kept as `bin/aproxy.old.exe` (Windows) or `bin/aproxy.old` (Unix) for that
   rollback and removed at the end; on Windows it stays until the next install if it is still locked.
-- On Windows the installer hands the rollout to a relay process and waits for it. If that wait times
-  out (`… 秒内未确认安装完成（可能仍在后台进行）…`, "completion not confirmed in time; may still be running"),
+- After the download is verified, the installer hands the install to the downloaded binary and waits
+  for it (a downgrade is run by the installer itself). If that wait times out
+  (`… 秒内未确认安装完成（可能仍在后台进行）…`, "completion not confirmed in time; may still be running"),
   check instance versions with `aproxy status`.
 - An interrupted install (crash, power loss) resumes by itself: any later `aproxy` command, or the
   watchdog, starts `install --continue` when `install.state` is left over.

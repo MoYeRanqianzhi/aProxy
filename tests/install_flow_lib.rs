@@ -145,7 +145,7 @@ async fn continue_from_restarting_reclaims_instance() {
     let t0 = Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(60),
-        aproxy::install::flow::continue_install(home, &run_dir),
+        aproxy::install::flow::continue_install(home, &run_dir, None),
     )
     .await;
     match result {
@@ -294,7 +294,7 @@ async fn continue_from_swapping_with_live_instance_redoes_swap() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(90),
-        aproxy::install::flow::continue_install(home, &run_dir),
+        aproxy::install::flow::continue_install(home, &run_dir, None),
     )
     .await;
     if result.is_err() {
@@ -376,7 +376,7 @@ async fn crash_during_downloading_redownloads() {
     let state = crash_state(InstallPhase::Downloading, &from, Some(&staged));
     aproxy::install::state::write_in(&run_dir, &mut state.clone()).unwrap();
 
-    aproxy::install::flow::continue_install(home, &run_dir)
+    aproxy::install::flow::continue_install(home, &run_dir, None)
         .await
         .expect("downloading 中断续作应完成");
     assert!(
@@ -417,7 +417,7 @@ async fn crash_during_swapping_recovers_from_staging() {
     let state = crash_state(InstallPhase::Swapping, &from, Some(&staged));
     aproxy::install::state::write_in(&run_dir, &mut state.clone()).unwrap();
 
-    aproxy::install::flow::continue_install(home, &run_dir)
+    aproxy::install::flow::continue_install(home, &run_dir, None)
         .await
         .expect("swapping 空窗续作应完成");
     // 终态：bin 恢复可用、.new 消费、.old 清理（无实例 → cleaning 可删）
@@ -451,7 +451,7 @@ async fn crash_after_swap_finishes_tail() {
     state.old_path = Some(old.display().to_string());
     aproxy::install::state::write_in(&run_dir, &mut state).unwrap();
 
-    aproxy::install::flow::continue_install(home, &run_dir)
+    aproxy::install::flow::continue_install(home, &run_dir, None)
         .await
         .expect("swapped 残留续作应完成");
     assert!(bin_works(home));
@@ -473,7 +473,7 @@ async fn corrupted_state_file_is_handled_cleanly() {
     )
     .unwrap();
     // 静默退出：无残留、无 panic（库层返回 Ok——无有效状态即无事发生）
-    aproxy::install::flow::continue_install(home, &run_dir)
+    aproxy::install::flow::continue_install(home, &run_dir, None)
         .await
         .expect("损坏状态文件应被静默处置");
 }
@@ -502,7 +502,7 @@ async fn crash_during_cleaning_resumes_without_backward_move() {
     state.old_path = Some(old.display().to_string());
     aproxy::install::state::write_in(&run_dir, &mut state).unwrap();
 
-    aproxy::install::flow::continue_install(home, &run_dir)
+    aproxy::install::flow::continue_install(home, &run_dir, None)
         .await
         .expect("cleaning 残留续作应完成");
     assert!(bin_works(home));
@@ -519,10 +519,54 @@ async fn done_residue_is_cleared() {
     std::fs::create_dir_all(&run_dir).unwrap();
     let state = crash_state(InstallPhase::Done, &usable_from(home), None);
     aproxy::install::state::write_in(&run_dir, &mut state.clone()).unwrap();
-    aproxy::install::flow::continue_install(home, &run_dir)
+    aproxy::install::flow::continue_install(home, &run_dir, None)
         .await
         .expect("done 残留应被清理");
     assert!(!aproxy::install::state::state_path_in(&run_dir).exists());
+}
+
+/// 交棒的接手判定：安装者健在（宣告、进度都正常）时，只有它指名的续作
+/// （`--handover-from <它的 pid>`）能接手。CLI 入口与看护者随手拉起的续作不带
+/// 这个参数，指名别人的也不算——它们都得原地拒绝，否则会与指名的接手者同时
+/// 推进同一个安装。指名接手者不再往下交：这里它在进程内把安装做完。
+#[tokio::test(flavor = "current_thread")]
+async fn only_the_named_successor_takes_over_a_live_install() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let run_dir = home.join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let from = usable_from(home);
+    let staged = aproxy::install::staging::staging_dir_in(home, env!("CARGO_PKG_VERSION"))
+        .join(aproxy::install::staging::binary_name());
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &staged).unwrap();
+    make_exec(&staged);
+    // 健在的安装者 = 本测试进程，状态刚写过（不 stale）
+    let mut state = InstallState::new_marking(env!("CARGO_PKG_VERSION"), InstallSource::From);
+    state.phase = InstallPhase::Downloaded;
+    state.from_path = Some(from.display().to_string());
+    state.staged_path = Some(staged.display().to_string());
+    aproxy::install::state::write_in(&run_dir, &mut state).unwrap();
+
+    for handover_from in [None, Some(u32::MAX - 3)] {
+        let err = aproxy::install::flow::continue_install(home, &run_dir, handover_from)
+            .await
+            .expect_err("未被指名的续作不得接手");
+        assert!(err.contains("安装仍在进行"), "{handover_from:?}: {err}");
+    }
+    let untouched = aproxy::install::state::load_in(&run_dir).unwrap();
+    assert_eq!(
+        untouched.phase,
+        InstallPhase::Downloaded,
+        "拒绝时不得改动现场"
+    );
+
+    let exit = aproxy::install::flow::continue_install(home, &run_dir, Some(std::process::id()))
+        .await
+        .expect("指名的接手者应接手并完成");
+    assert!(matches!(exit, aproxy::install::flow::FlowExit::Completed));
+    assert!(!aproxy::install::state::state_path_in(&run_dir).exists());
+    assert!(bin_works(home));
 }
 
 // ---------------------------------------------------------------------------
@@ -665,7 +709,7 @@ async fn rollback_case(kind: BrokenNew) {
 
     let err = tokio::time::timeout(
         Duration::from_secs(90),
-        aproxy::install::flow::continue_install(home, &run_dir),
+        aproxy::install::flow::continue_install(home, &run_dir, None),
     )
     .await
     .expect("续作不应挂死")
@@ -700,7 +744,7 @@ async fn rollback_case(kind: BrokenNew) {
     assert!(st.pending_restores.is_empty(), "实例已拉回，在途记录应清除");
 
     // 自动续作不再重试：原地拒绝且不碰实例
-    let err2 = aproxy::install::flow::continue_install(home, &run_dir)
+    let err2 = aproxy::install::flow::continue_install(home, &run_dir, None)
         .await
         .expect_err("halted 后续作应拒绝");
     assert!(err2.contains("不自动重试"), "{err2}");
@@ -746,7 +790,7 @@ async fn halted_failure_is_cleaned_up_when_the_fleet_already_runs_the_target() {
     state.installer_pid = u32::MAX - 7;
     aproxy::install::state::write_in(&run_dir, &mut state).unwrap();
 
-    let exit = aproxy::install::flow::continue_install(home, &run_dir)
+    let exit = aproxy::install::flow::continue_install(home, &run_dir, None)
         .await
         .expect("实例已在目标上，续作应收尾而不是拒绝");
     assert!(matches!(exit, aproxy::install::flow::FlowExit::Completed));
@@ -813,7 +857,7 @@ async fn rolling_restart_keeps_restore_when_rollback_also_fails() {
 
     let err = tokio::time::timeout(
         Duration::from_secs(90),
-        aproxy::install::flow::continue_install(home, &run_dir),
+        aproxy::install::flow::continue_install(home, &run_dir, None),
     )
     .await
     .expect("续作不应挂死")
@@ -887,7 +931,7 @@ async fn continue_restores_instance_stopped_mid_restart() {
 
     let exit = tokio::time::timeout(
         Duration::from_secs(120),
-        aproxy::install::flow::continue_install(home, &run_dir),
+        aproxy::install::flow::continue_install(home, &run_dir, None),
     )
     .await
     .expect("续作不应挂死")

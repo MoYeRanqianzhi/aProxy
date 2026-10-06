@@ -230,9 +230,15 @@ pub(crate) struct InstallArgs {
     pub(crate) skills_only: bool,
 
     /// [内部] 续作模式：从 install.state 残留的 phase 幂等推进（看门狗/
-    /// CLI 入口/接力自动拉起，全自动无人工询问）。勿手动使用。
+    /// CLI 入口/交棒自动拉起，全自动无人工询问）。勿手动使用。
     #[arg(long, hide = true)]
     pub(crate) continue_: bool,
+
+    /// [内部] 交棒：拉起本进程的安装者的 pid。带着它（且它仍是 install.state
+    /// 的主人）的续作进程可以接手一个安装者健在的安装。旧版本的安装者会这样
+    /// 拉起新版本，是永久接口，见 install::flow 模块文档。勿手动使用。
+    #[arg(long, hide = true, value_name = "PID", requires = "continue_")]
+    pub(crate) handover_from: Option<u32>,
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]

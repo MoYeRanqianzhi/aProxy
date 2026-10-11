@@ -32,10 +32,10 @@ fn free_port() -> u16 {
 /// 文件已删，windows-latest 上高概率走进交棒分支而确定性失败——
 /// alpha.12 / alpha.15 两次发版被它卡住 Release 的 test 门禁（留档预警
 /// 应验后才定位到真正根因：不是超时竞态，是 HandedOver 语义未被测试跟上）。
-async fn wait_handed_over_done(run_dir: &std::path::Path, exit: &aproxy::install::flow::FlowExit) {
+async fn wait_handed_over_done(home: &std::path::Path, exit: &aproxy::install::flow::FlowExit) {
     if matches!(exit, aproxy::install::flow::FlowExit::HandedOver) {
         let deadline = std::time::Instant::now() + Duration::from_secs(90);
-        while aproxy::install::state::state_path_in(run_dir).exists() {
+        while aproxy::install::state::state_path_in(home).exists() {
             if std::time::Instant::now() > deadline {
                 panic!("交棒后接棒者 90s 未完成（install.state 仍在）");
             }
@@ -140,7 +140,7 @@ async fn continue_from_restarting_reclaims_instance() {
     state.installer_pid = u32::MAX - 7; // 不存在的 pid（原安装者已死）
     state.updated_at =
         aproxy::watchdog::now_secs().saturating_sub(aproxy::install::state::STALE_AFTER_SECS + 60);
-    aproxy::install::state::write_in(&run_dir, &mut state).unwrap();
+    aproxy::install::state::write_in(home, &mut state).unwrap();
 
     let t0 = Instant::now();
     let result = tokio::time::timeout(
@@ -151,7 +151,7 @@ async fn continue_from_restarting_reclaims_instance() {
     match result {
         Err(_) => panic!(
             "continue_install 60s 未返回——卡死复现（phase={:?}）",
-            aproxy::install::state::load_in(&run_dir).map(|s| s.phase)
+            aproxy::install::state::load_in(home).map(|s| s.phase)
         ),
         Ok(Err(e)) => {
             // 失败诊断：dump 守护日志与启动错误
@@ -179,17 +179,17 @@ async fn continue_from_restarting_reclaims_instance() {
             );
             panic!(
                 "continue_install 失败: {e}（phase={:?}）",
-                aproxy::install::state::load_in(&run_dir).map(|s| s.phase)
+                aproxy::install::state::load_in(home).map(|s| s.phase)
             );
         }
         Ok(Ok(exit)) => {
-            wait_handed_over_done(&run_dir, &exit).await;
+            wait_handed_over_done(home, &exit).await;
             println!("continue_install 完成: {exit:?}，耗时 {:?}", t0.elapsed());
         }
     }
     // 终态：state 清理（Completed 直接删；HandedOver 经上方等待接棒者收敛）
     assert!(
-        !aproxy::install::state::state_path_in(&run_dir).exists(),
+        !aproxy::install::state::state_path_in(home).exists(),
         "done 后状态文件应删除"
     );
     // 实例已滚动：新 pid + 退出更换阶段（restart 真跑的证据）
@@ -290,7 +290,7 @@ async fn continue_from_swapping_with_live_instance_redoes_swap() {
     state.installer_pid = u32::MAX - 7;
     state.updated_at =
         aproxy::watchdog::now_secs().saturating_sub(aproxy::install::state::STALE_AFTER_SECS + 60);
-    aproxy::install::state::write_in(&run_dir, &mut state).unwrap();
+    aproxy::install::state::write_in(home, &mut state).unwrap();
 
     let result = tokio::time::timeout(
         Duration::from_secs(90),
@@ -298,15 +298,15 @@ async fn continue_from_swapping_with_live_instance_redoes_swap() {
     )
     .await;
     if result.is_err() {
-        let cur = aproxy::install::state::load_in(&run_dir).map(|s| format!("{:?}", s.phase));
+        let cur = aproxy::install::state::load_in(home).map(|s| format!("{:?}", s.phase));
         panic!("swapping 有实例续作 90s 未返回（phase={cur:?}）");
     }
     let exit = result
         .expect("swapping 有实例续作应完成")
         .expect("swapping 有实例续作不应报错");
-    wait_handed_over_done(&run_dir, &exit).await;
+    wait_handed_over_done(home, &exit).await;
     assert!(
-        !aproxy::install::state::state_path_in(&run_dir).exists(),
+        !aproxy::install::state::state_path_in(home).exists(),
         "done 后状态文件应删除"
     );
     let info = aproxy::daemon::ipc_ping_in(&run_dir, &port.to_string())
@@ -374,13 +374,13 @@ async fn crash_during_downloading_redownloads() {
     std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
     std::fs::write(&staged, b"truncated").unwrap();
     let state = crash_state(InstallPhase::Downloading, &from, Some(&staged));
-    aproxy::install::state::write_in(&run_dir, &mut state.clone()).unwrap();
+    aproxy::install::state::write_in(home, &mut state.clone()).unwrap();
 
     aproxy::install::flow::continue_install(home, &run_dir, None)
         .await
         .expect("downloading 中断续作应完成");
     assert!(
-        !aproxy::install::state::state_path_in(&run_dir).exists(),
+        !aproxy::install::state::state_path_in(home).exists(),
         "续作应走到 done 清状态"
     );
     assert!(bin_works(home), "重备料后规范位置应有可用二进制");
@@ -415,7 +415,7 @@ async fn crash_during_swapping_recovers_from_staging() {
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let state = crash_state(InstallPhase::Swapping, &from, Some(&staged));
-    aproxy::install::state::write_in(&run_dir, &mut state.clone()).unwrap();
+    aproxy::install::state::write_in(home, &mut state.clone()).unwrap();
 
     aproxy::install::flow::continue_install(home, &run_dir, None)
         .await
@@ -424,7 +424,7 @@ async fn crash_during_swapping_recovers_from_staging() {
     assert!(bin_works(home), "空窗后 bin 应从 staging 恢复");
     assert!(!new_tmp.exists(), "残留 .new 应被 swap 舞消费");
     assert!(!old.exists(), ".old 应在 cleaning 删除（无实例无镜像锁）");
-    assert!(!aproxy::install::state::state_path_in(&run_dir).exists());
+    assert!(!aproxy::install::state::state_path_in(home).exists());
 }
 
 /// 恢复矩阵行「swapped」：bin=新、.old 残留 → 续作直接进尾部（滚动/终验/
@@ -449,14 +449,14 @@ async fn crash_after_swap_finishes_tail() {
     std::fs::write(&old, b"old-binary").unwrap();
     let mut state = crash_state(InstallPhase::Swapped, &from, None);
     state.old_path = Some(old.display().to_string());
-    aproxy::install::state::write_in(&run_dir, &mut state).unwrap();
+    aproxy::install::state::write_in(home, &mut state).unwrap();
 
     aproxy::install::flow::continue_install(home, &run_dir, None)
         .await
         .expect("swapped 残留续作应完成");
     assert!(bin_works(home));
     assert!(!old.exists(), "尾部 cleaning 应删除 .old");
-    assert!(!aproxy::install::state::state_path_in(&run_dir).exists());
+    assert!(!aproxy::install::state::state_path_in(home).exists());
 }
 
 /// 恢复矩阵行「任何阶段：状态文件损坏」→ 按无/失效处理，continue 静默退出
@@ -466,12 +466,9 @@ async fn corrupted_state_file_is_handled_cleanly() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     let run_dir = home.join("run");
-    std::fs::create_dir_all(&run_dir).unwrap();
-    std::fs::write(
-        aproxy::install::state::state_path_in(&run_dir),
-        "{corrupted",
-    )
-    .unwrap();
+    let state = aproxy::install::state::state_path_in(home);
+    std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+    std::fs::write(&state, "{corrupted").unwrap();
     // 静默退出：无残留、无 panic（库层返回 Ok——无有效状态即无事发生）
     aproxy::install::flow::continue_install(home, &run_dir, None)
         .await
@@ -500,14 +497,14 @@ async fn crash_during_cleaning_resumes_without_backward_move() {
     std::fs::write(&old, b"old-binary-residual").unwrap();
     let mut state = crash_state(InstallPhase::Cleaning, &from, None);
     state.old_path = Some(old.display().to_string());
-    aproxy::install::state::write_in(&run_dir, &mut state).unwrap();
+    aproxy::install::state::write_in(home, &mut state).unwrap();
 
     aproxy::install::flow::continue_install(home, &run_dir, None)
         .await
         .expect("cleaning 残留续作应完成");
     assert!(bin_works(home));
     assert!(!old.exists(), ".old 应重做清理");
-    assert!(!aproxy::install::state::state_path_in(&run_dir).exists());
+    assert!(!aproxy::install::state::state_path_in(home).exists());
 }
 
 /// 恢复矩阵行「done 残留（清文件前崩溃）」→ 清文件即完成。
@@ -518,11 +515,11 @@ async fn done_residue_is_cleared() {
     let run_dir = home.join("run");
     std::fs::create_dir_all(&run_dir).unwrap();
     let state = crash_state(InstallPhase::Done, &usable_from(home), None);
-    aproxy::install::state::write_in(&run_dir, &mut state.clone()).unwrap();
+    aproxy::install::state::write_in(home, &mut state.clone()).unwrap();
     aproxy::install::flow::continue_install(home, &run_dir, None)
         .await
         .expect("done 残留应被清理");
-    assert!(!aproxy::install::state::state_path_in(&run_dir).exists());
+    assert!(!aproxy::install::state::state_path_in(home).exists());
 }
 
 /// 交棒的接手判定：安装者健在（宣告、进度都正常）时，只有它指名的续作
@@ -546,7 +543,7 @@ async fn only_the_named_successor_takes_over_a_live_install() {
     state.phase = InstallPhase::Downloaded;
     state.from_path = Some(from.display().to_string());
     state.staged_path = Some(staged.display().to_string());
-    aproxy::install::state::write_in(&run_dir, &mut state).unwrap();
+    aproxy::install::state::write_in(home, &mut state).unwrap();
 
     for handover_from in [None, Some(u32::MAX - 3)] {
         let err = aproxy::install::flow::continue_install(home, &run_dir, handover_from)
@@ -554,7 +551,7 @@ async fn only_the_named_successor_takes_over_a_live_install() {
             .expect_err("未被指名的续作不得接手");
         assert!(err.contains("安装仍在进行"), "{handover_from:?}: {err}");
     }
-    let untouched = aproxy::install::state::load_in(&run_dir).unwrap();
+    let untouched = aproxy::install::state::load_in(home).unwrap();
     assert_eq!(
         untouched.phase,
         InstallPhase::Downloaded,
@@ -565,7 +562,7 @@ async fn only_the_named_successor_takes_over_a_live_install() {
         .await
         .expect("指名的接手者应接手并完成");
     assert!(matches!(exit, aproxy::install::flow::FlowExit::Completed));
-    assert!(!aproxy::install::state::state_path_in(&run_dir).exists());
+    assert!(!aproxy::install::state::state_path_in(home).exists());
     assert!(bin_works(home));
 }
 
@@ -642,7 +639,7 @@ fn simulate_swap(home: &Path, new_bin: impl FnOnce(&Path)) -> std::path::PathBuf
 
 /// swapped 残局：续作直接进滚动尾部。target 取一个与在跑实例都不同的
 /// 版本，保证「跳过已就绪」不会误跳。
-fn swapped_state(run_dir: &Path, port: u16, old: &Path, bin: &Path) {
+fn swapped_state(home: &Path, port: u16, old: &Path, bin: &Path) {
     let mut state = InstallState::new_marking("99.0.0", InstallSource::From);
     state.phase = InstallPhase::Swapped;
     state.instance_snapshot = vec![port.to_string()];
@@ -651,7 +648,7 @@ fn swapped_state(run_dir: &Path, port: u16, old: &Path, bin: &Path) {
     state.installer_pid = u32::MAX - 7;
     state.updated_at =
         aproxy::watchdog::now_secs().saturating_sub(aproxy::install::state::STALE_AFTER_SECS + 60);
-    aproxy::install::state::write_in(run_dir, &mut state).unwrap();
+    aproxy::install::state::write_in(home, &mut state).unwrap();
 }
 
 fn restore_args_of(run_dir: &Path, port: u16) -> Option<Vec<String>> {
@@ -705,7 +702,7 @@ async fn rollback_case(kind: BrokenNew) {
         .await
         .expect("PrepareSwap 广播应成功");
     let old = simulate_swap(home, |b| write_broken(kind, b));
-    swapped_state(&run_dir, port, &old, &bin);
+    swapped_state(home, port, &old, &bin);
 
     let err = tokio::time::timeout(
         Duration::from_secs(90),
@@ -737,7 +734,7 @@ async fn rollback_case(kind: BrokenNew) {
     );
 
     // 状态：failed + halted + 原因；在途清单已清（实例已恢复）
-    let st = aproxy::install::state::load_in(&run_dir).expect("failed 现场保留");
+    let st = aproxy::install::state::load_in(home).expect("failed 现场保留");
     assert_eq!(st.phase, InstallPhase::Failed);
     assert!(st.halted, "实例级失败应置 halted");
     assert!(st.last_error.is_some_and(|e| e.contains("旧二进制")));
@@ -788,14 +785,14 @@ async fn halted_failure_is_cleaned_up_when_the_fleet_already_runs_the_target() {
     state.last_error = Some("核验时找不到实例".into());
     state.instance_snapshot = vec![port.to_string()];
     state.installer_pid = u32::MAX - 7;
-    aproxy::install::state::write_in(&run_dir, &mut state).unwrap();
+    aproxy::install::state::write_in(home, &mut state).unwrap();
 
     let exit = aproxy::install::flow::continue_install(home, &run_dir, None)
         .await
         .expect("实例已在目标上，续作应收尾而不是拒绝");
     assert!(matches!(exit, aproxy::install::flow::FlowExit::Completed));
     assert!(
-        aproxy::install::state::load_in(&run_dir).is_none(),
+        aproxy::install::state::load_in(home).is_none(),
         "失败现场应已清除"
     );
     let live = aproxy::daemon::ipc_ping_in(&run_dir, &port.to_string())
@@ -853,7 +850,7 @@ async fn rolling_restart_keeps_restore_when_rollback_also_fails() {
     let old = simulate_swap(home, |b| {
         std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), b).unwrap();
     });
-    swapped_state(&run_dir, port, &old, &bin);
+    swapped_state(home, port, &old, &bin);
 
     let err = tokio::time::timeout(
         Duration::from_secs(90),
@@ -876,7 +873,7 @@ async fn rolling_restart_keeps_restore_when_rollback_also_fails() {
         Some(args_before.as_slice()),
         ".restore 必须以原参数保住（修复前此处为空）"
     );
-    let st = aproxy::install::state::load_in(&run_dir).unwrap();
+    let st = aproxy::install::state::load_in(home).unwrap();
     assert_eq!(st.phase, InstallPhase::Failed);
     assert!(st.halted);
     assert_eq!(
@@ -927,7 +924,7 @@ async fn continue_restores_instance_stopped_mid_restart() {
         args,
         log_path: String::new(),
     }];
-    aproxy::install::state::write_in(&run_dir, &mut state).unwrap();
+    aproxy::install::state::write_in(home, &mut state).unwrap();
 
     let exit = tokio::time::timeout(
         Duration::from_secs(120),
@@ -936,8 +933,8 @@ async fn continue_restores_instance_stopped_mid_restart() {
     .await
     .expect("续作不应挂死")
     .expect("续作应完成");
-    wait_handed_over_done(&run_dir, &exit).await;
-    assert!(!aproxy::install::state::state_path_in(&run_dir).exists());
+    wait_handed_over_done(home, &exit).await;
+    assert!(!aproxy::install::state::state_path_in(home).exists());
 
     let info = aproxy::daemon::ipc_ping_in(&run_dir, &port.to_string())
         .await

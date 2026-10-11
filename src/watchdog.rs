@@ -1021,7 +1021,7 @@ pub async fn serve(cfg: WatchdogConfig) {
     // 扩展更多）；职责仅为「发现残留 → spawn」，处于哪一步、续跑还是清理
     // 全部由处理者自己判断——看护者绝不解读状态文件语义（分工原则）。
     // 启动时一次 + 运行中每日一次（防常态浪费）。
-    sweep_local_states(&cfg.run_dir);
+    sweep_local_states(&crate::settings::home());
 
     let mut state = WatchdogState::new(cfg);
     state.adopt_scan().await;
@@ -1057,16 +1057,18 @@ pub async fn serve(cfg: WatchdogConfig) {
         // 每日一次的残留状态文件复查（安装中断后看护者长期存活的场景）
         if last_sweep.elapsed() >= Duration::from_secs(24 * 3600) {
             last_sweep = std::time::Instant::now();
-            sweep_local_states(&state.cfg.run_dir);
+            sweep_local_states(&crate::settings::home());
         }
     }
 }
 
 /// 本地状态文件残留全量检查（当前只有 install.state）：存在即拉起
 /// `install --continue`（detached，短命进程——已正常结束的场景由续作进程
-/// 自行清文件退出，幂等收敛）。
-fn sweep_local_states(run_dir: &Path) {
-    if crate::install::state::load_in(run_dir).is_some() {
+/// 自行清文件退出，幂等收敛）。安装状态属于 home 而不是 run 目录（见
+/// install::install_dir_in），续作也按继承来的环境找 home，所以这里查的是
+/// 进程的 home。
+fn sweep_local_states(home: &Path) {
+    if crate::install::state::load_in(home).is_some() {
         tracing::info!("发现 install 状态文件残留，拉起 install --continue 续作");
         if let Ok(exe) = std::env::current_exe() {
             let _ = crate::daemon::spawn_detached(

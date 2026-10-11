@@ -32,7 +32,7 @@ MIN_GLIBC="2.28"
 APROXY_HOME="${APROXY_HOME:-$HOME/.aproxy}"
 BIN_DIR="$APROXY_HOME/bin"
 SKILLS_DIR="$APROXY_HOME/skills"
-TMP_DIR="$APROXY_HOME/staging/bootstrap"
+TMP_DIR="$APROXY_HOME/install/bootstrap"
 UA="aproxy-install-script"
 
 # ---- 下载函数：优先 curl，回退 wget ----

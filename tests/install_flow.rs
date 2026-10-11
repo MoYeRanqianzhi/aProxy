@@ -79,7 +79,7 @@ impl TestEnv {
 /// 两段缺一不可——直接等「消失」有启动竞态：installer 尚未 create_new 时
 /// state 也不存在，会被误判为已完成（实测三轮 1.6s 假通过的根源）。
 fn wait_install_done(env: &TestEnv, timeout: Duration) -> bool {
-    let state = aproxy::install::state::state_path_in(&env.home().join("run"));
+    let state = aproxy::install::state::state_path_in(&env.home());
     let deadline = Instant::now() + timeout;
     // 段 1：等抢锁（state 出现）
     while !state.exists() {
@@ -128,7 +128,7 @@ fn install_from_without_instances_fast_path() {
     );
     // 安装者在接手者进入 cleaning 时就以 0 退出（Windows 上 .old 是它自己的
     // 镜像，它不退出就删不掉），状态文件稍后由接手者清掉
-    let state = aproxy::install::state::state_path_in(&env.home().join("run"));
+    let state = aproxy::install::state::state_path_in(&env.home());
     let deadline = Instant::now() + Duration::from_secs(30);
     while state.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
@@ -141,7 +141,7 @@ fn install_from_without_instances_fast_path() {
         !aproxy::install::swap::old_path_in(&env.home()).exists(),
         "无实例快路径下 .old 应在 cleaning 删除（无镜像锁）"
     );
-    assert!(!aproxy::install::state::state_path_in(&env.home().join("run")).exists());
+    assert!(!aproxy::install::state::state_path_in(&env.home()).exists());
     assert!(
         !aproxy::install::staging::staging_dir_in(&env.home(), env!("CARGO_PKG_VERSION")).exists(),
         "staging 应在 done 清理"
@@ -377,7 +377,7 @@ fn adopt_migrates_foreign_instance() {
         "收编应成功: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let state = aproxy::install::state::state_path_in(&run_dir);
+    let state = aproxy::install::state::state_path_in(&env.home());
     let deadline = Instant::now() + Duration::from_secs(30);
     while state.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
@@ -414,8 +414,7 @@ fn adopt_migrates_foreign_instance() {
 #[test]
 fn abort_rolls_back_cleanly_before_swap() {
     let env = TestEnv::new(5);
-    let run_dir = env.home().join("run");
-    std::fs::create_dir_all(&run_dir).unwrap();
+    let home = env.home();
     // 伪造 downloaded 现场：状态文件 + staging 完整副本（二进制未动的形态）
     let mut state = aproxy::install::state::InstallState::new_marking(
         env!("CARGO_PKG_VERSION"),
@@ -427,12 +426,12 @@ fn abort_rolls_back_cleanly_before_swap() {
     std::fs::write(&staged, b"staged-content").unwrap();
     state.phase = aproxy::install::state::InstallPhase::Downloaded;
     state.staged_path = Some(staged.display().to_string());
-    aproxy::install::state::write_in(&run_dir, &mut state).unwrap();
+    aproxy::install::state::write_in(&home, &mut state).unwrap();
 
     let out = env.install_cmd(&["--abort"]).output().unwrap();
     assert!(out.status.success(), "abort 应成功");
     assert!(
-        !aproxy::install::state::state_path_in(&run_dir).exists(),
+        !aproxy::install::state::state_path_in(&home).exists(),
         "状态文件应删除"
     );
     assert!(!staged.exists(), "staged 副本应清理");
@@ -444,19 +443,18 @@ fn abort_rolls_back_cleanly_before_swap() {
 #[test]
 fn abort_rejected_after_swap_phase() {
     let env = TestEnv::new(6);
-    let run_dir = env.home().join("run");
-    std::fs::create_dir_all(&run_dir).unwrap();
+    let home = env.home();
     let mut state = aproxy::install::state::InstallState::new_marking(
         env!("CARGO_PKG_VERSION"),
         aproxy::install::state::InstallSource::From,
     );
     state.phase = aproxy::install::state::InstallPhase::Swapped;
-    aproxy::install::state::write_in(&run_dir, &mut state).unwrap();
+    aproxy::install::state::write_in(&home, &mut state).unwrap();
 
     let out = env.install_cmd(&["--abort"]).output().unwrap();
     assert_eq!(out.status.code(), Some(1), "swapping 后 abort 应拒绝");
     assert!(
-        aproxy::install::state::state_path_in(&run_dir).exists(),
+        aproxy::install::state::state_path_in(&home).exists(),
         "现场保留（续作或人工兜底）"
     );
 }
@@ -555,7 +553,7 @@ fn install_instance_failure_exits_nonzero_and_keeps_restore() {
     .expect(".restore 必须保住");
     let args_of = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap()["args"].clone();
     assert_eq!(args_of(&restore_after), args_of(&restore_before));
-    let st = aproxy::install::state::load_in(&run_dir).expect("failed 现场保留");
+    let st = aproxy::install::state::load_in(&env.home()).expect("failed 现场保留");
     assert_eq!(st.phase, aproxy::install::state::InstallPhase::Failed);
     assert!(st.halted, "实例级失败应置 halted");
 }
@@ -731,7 +729,7 @@ fn handover_to_a_target_that_never_takes_over_fails_without_touching_anything() 
     );
 
     let run_dir = env.home().join("run");
-    let st = aproxy::install::state::load_in(&run_dir).expect("failed 现场保留");
+    let st = aproxy::install::state::load_in(&env.home()).expect("failed 现场保留");
     assert_eq!(st.phase, aproxy::install::state::InstallPhase::Failed);
     assert!(!st.halted, "交棒失败可续作，不是实例级失败");
     assert_eq!(
@@ -812,7 +810,7 @@ fn staged_target_drives_the_install_and_its_failure_reaches_the_installer() {
     );
 
     let run_dir = env.home().join("run");
-    let st = aproxy::install::state::load_in(&run_dir).expect("failed 现场保留");
+    let st = aproxy::install::state::load_in(&env.home()).expect("failed 现场保留");
     assert_eq!(st.phase, aproxy::install::state::InstallPhase::Failed);
     assert!(st.halted);
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -840,14 +838,12 @@ fn staged_target_drives_the_install_and_its_failure_reaches_the_installer() {
 fn concurrent_install_rejected_by_lock() {
     let env = TestEnv::new(7);
     env.seed_bin();
-    let run_dir = env.home().join("run");
-    std::fs::create_dir_all(&run_dir).unwrap();
     // 新鲜锁（installer_pid = 本进程 = 活着的 pid）
     let state = aproxy::install::state::InstallState::new_marking(
         env!("CARGO_PKG_VERSION"),
         aproxy::install::state::InstallSource::From,
     );
-    aproxy::install::state::create_new_in(&run_dir, state).unwrap();
+    aproxy::install::state::create_new_in(&env.home(), state).unwrap();
 
     let from = env.source_file("lock");
     let out = env
@@ -867,7 +863,7 @@ fn concurrent_install_rejected_by_lock() {
 #[test]
 fn version_flag_does_not_resume_a_leftover_install() {
     let env = TestEnv::new(12);
-    let state = aproxy::install::state::state_path_in(&env.home().join("run"));
+    let state = aproxy::install::state::state_path_in(&env.home());
     std::fs::create_dir_all(state.parent().unwrap()).unwrap();
     std::fs::write(&state, r#"{"phase":"aborted","target_version":"0.2.0"}"#).unwrap();
     let run = |arg: &str| {

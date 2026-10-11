@@ -31,11 +31,11 @@ fn stage_from_real_binary_end_to_end() {
     let staged = aproxy::install::staging::stage_from_in(home.path(), &from, target).unwrap();
 
     // staged 副本落在规范 staging 布局下且内容完整
-    let expected_dir = home.path().join("staging").join(target);
+    let expected_dir = home.path().join("install").join("staging").join(target);
     assert_eq!(
         staged.path.parent().unwrap(),
         expected_dir,
-        "staged 应落在 <home>/staging/<版本>/"
+        "staged 应落在 <home>/install/staging/<版本>/"
     );
     assert!(staged.path.is_file());
     // 摘要与磁盘内容一致（防 TOCTOU 式的记录与实体脱节）
@@ -63,6 +63,7 @@ fn stage_from_rejects_version_mismatch_and_cleans_up() {
     // 不带病留在 staging：拒绝时已清理 staged 副本
     let leftover = home
         .path()
+        .join("install")
         .join("staging")
         .join("0.0.0-definitely-not")
         .join(aproxy::install::staging::binary_name());

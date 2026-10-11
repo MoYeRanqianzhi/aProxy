@@ -11,7 +11,7 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
     let run_dir = aproxy::daemon::run_dir();
 
     if args.abort {
-        return handle_abort(&home, &run_dir);
+        return handle_abort(&home);
     }
     if args.continue_ {
         // 续作模式：静默执行（由看护者/CLI 入口/交棒自动拉起）。失败落
@@ -291,7 +291,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         std::process::exit(1);
     }
 
-    // 下载链条：产物落 staging/<版本>/（与 --from 的备料同一位置）
+    // 下载链条：产物落 install/staging/<版本>/（与 --from 的备料同一位置）
     println!(
         "开始下载 aProxy {target}（渠道链：{}）...",
         aproxy::install::download::effective_chain(&settings)
@@ -387,7 +387,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         proxy,
     )
     .await;
-    report_outcome(home, run_dir, result).await;
+    report_outcome(home, result).await;
 }
 
 /// 安装结局的用户可见输出与退出码（三个安装入口共用）。**一律硬退**：
@@ -399,7 +399,6 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
 /// 是退出码 0，agent 会以为升级成功。
 async fn report_outcome(
     home: &std::path::Path,
-    run_dir: &std::path::Path,
     result: Result<aproxy::install::flow::FlowExit, String>,
 ) -> ! {
     let done_msg = || {
@@ -415,21 +414,21 @@ async fn report_outcome(
         }
         Ok(aproxy::install::flow::FlowExit::HandedOver) => {
             println!("新版本进程已接手安装（广播、交换、滚动重启、终验），等待其完成...");
-            match await_handover(run_dir).await {
+            match await_handover(home).await {
                 Ok(()) => {
                     done_msg();
                     std::process::exit(0);
                 }
                 Err(e) => {
                     eprintln!("[ERROR] 安装失败: {e}");
-                    print_failure_guidance(run_dir);
+                    print_failure_guidance(home);
                     std::process::exit(1);
                 }
             }
         }
         Err(e) => {
             eprintln!("[ERROR] 安装失败: {e}");
-            print_failure_guidance(run_dir);
+            print_failure_guidance(home);
             std::process::exit(1);
         }
     }
@@ -444,12 +443,12 @@ const HANDOVER_WAIT_SECS: u64 = aproxy::install::state::STALE_AFTER_SECS;
 /// staging，而 `.old` 正是本进程的运行镜像，Windows 上本进程必须先退出它才
 /// 删得掉，所以不能等到 done）。失败判据：phase=failed（带接手者记下的原因）、
 /// 接手进程已死而安装未终结、等待超时。
-async fn await_handover(run_dir: &std::path::Path) -> Result<(), String> {
+async fn await_handover(home: &std::path::Path) -> Result<(), String> {
     use aproxy::install::state::{InstallPhase, is_stale, load_in, state_path_in};
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(HANDOVER_WAIT_SECS);
     loop {
-        match load_in(run_dir) {
-            None if !state_path_in(run_dir).exists() => return Ok(()),
+        match load_in(home) {
+            None if !state_path_in(home).exists() => return Ok(()),
             // 文件在但读不出（状态损坏）：不臆断，继续等到超时
             None => {}
             Some(s) => match s.phase {
@@ -481,8 +480,8 @@ async fn await_handover(run_dir: &std::path::Path) -> Result<(), String> {
 }
 
 /// 失败后的处置指引：实例级失败（halted）与可续作的失败给不同的出路。
-fn print_failure_guidance(run_dir: &std::path::Path) {
-    let halted = aproxy::install::state::load_in(run_dir).is_some_and(|s| s.halted);
+fn print_failure_guidance(home: &std::path::Path) {
+    let halted = aproxy::install::state::load_in(home).is_some_and(|s| s.halted);
     if halted {
         eprintln!(
             "滚动已中止，不会自动重试：出问题的实例已用旧二进制拉回（拉回失败时其恢复记录已保留），\
@@ -516,12 +515,12 @@ async fn run_plan(
     let result =
         aproxy::install::flow::run_install(home, run_dir, &plan, skill_enabled, download_proxy)
             .await;
-    report_outcome(home, run_dir, result).await;
+    report_outcome(home, result).await;
 }
 
 /// --abort：显式回滚（仅 swapping 前可完全回滚，此后只进不退）。
-fn handle_abort(home: &std::path::Path, run_dir: &std::path::Path) {
-    let Some(state) = aproxy::install::state::load_in(run_dir) else {
+fn handle_abort(home: &std::path::Path) {
+    let Some(state) = aproxy::install::state::load_in(home) else {
         println!("没有进行中的安装。");
         return;
     };
@@ -540,6 +539,6 @@ fn handle_abort(home: &std::path::Path, run_dir: &std::path::Path) {
     if let Some(v) = Some(state.target_version.clone()) {
         let _ = std::fs::remove_dir_all(aproxy::install::staging::staging_dir_in(home, &v));
     }
-    aproxy::install::state::remove_in(run_dir);
+    aproxy::install::state::remove_in(home);
     println!("安装已中止，现场已清理（二进制与实例未受影响）。");
 }

@@ -44,6 +44,7 @@ pub async fn ack_one(run_dir: &Path, port: &str) -> Result<(), String> {
 /// 镜像拉回或拉回失败）→ 立即终止收敛：再来一轮只会让该实例再经历一次
 /// 「停止 → 起不来 → 拉回」的服务中断。
 pub async fn broadcast_prepare_swap(
+    home: &Path,
     run_dir: &Path,
     ports: &[String],
     state: &mut super::state::InstallState,
@@ -68,7 +69,7 @@ pub async fn broadcast_prepare_swap(
         // 「未被动过」类失败计入未 ACK（下轮再试）；实例级失败立即终止。
         // fallback=None：swap 之前实例镜像文件未变，停止前的镜像路径即旧二进制
         for port in &unacked {
-            match super::restart::restart_instance(run_dir, state, port, &exe, None).await {
+            match super::restart::restart_instance(home, run_dir, state, port, &exe, None).await {
                 Ok(_) => {}
                 Err(e @ super::restart::RestartError::NotRestarted(_)) => {
                     tracing::warn!(port = %port, error = %e, "ACK 收敛 restart 失败");
@@ -101,7 +102,7 @@ mod tests {
             "0.0.0",
             crate::install::state::InstallSource::From,
         );
-        let err = broadcast_prepare_swap(dir.path(), &ports, &mut state)
+        let err = broadcast_prepare_swap(dir.path(), dir.path(), &ports, &mut state)
             .await
             .unwrap_err();
         assert!(

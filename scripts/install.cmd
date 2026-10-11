@@ -34,7 +34,7 @@ set "HOME_DIR=%USERPROFILE%"
 if defined APROXY_HOME set "HOME_DIR=%APROXY_HOME%"
 set "BIN_DIR=%HOME_DIR%\bin"
 set "SKILLS_DIR=%HOME_DIR%\skills"
-set "TMP_DIR=%HOME_DIR%\staging\bootstrap"
+set "TMP_DIR=%HOME_DIR%\install\bootstrap"
 set "UA=aproxy-install-script"
 
 rem ---- Arguments: [--pre] [tag] ----

@@ -7,14 +7,17 @@
 
 use std::path::{Path, PathBuf};
 
-/// staging 备料目录：`<home>/staging/<目标版本>/`。
+/// staging 备料目录：`<home>/install/staging/<目标版本>/`。在线渠道的下载暂存
+/// （`.dl` 半截文件、cargo 渠道的构建目录）也落在这里，见 download::fetch_artifact。
 pub fn staging_dir(target_version: &str) -> PathBuf {
     staging_dir_in(&crate::settings::home(), target_version)
 }
 
 /// 同上，主目录可指定（测试注入用）。
 pub fn staging_dir_in(home: &Path, target_version: &str) -> PathBuf {
-    home.join("staging").join(target_version)
+    super::install_dir_in(home)
+        .join("staging")
+        .join(target_version)
 }
 
 /// 目标平台的二进制文件名（unix 无 .exe 后缀）。
@@ -140,8 +143,8 @@ mod tests {
     fn staging_paths_are_home_derived() {
         let home = Path::new("/tmp/fake-home");
         assert_eq!(
-            staging_dir_in(home, "0.1.0-alpha.9"),
-            home.join("staging").join("0.1.0-alpha.9")
+            staging_dir_in(home, "0.2.0-alpha.9"),
+            home.join("install").join("staging").join("0.2.0-alpha.9")
         );
         // 目标平台二进制名（两平台各自断言期望值）
         if cfg!(windows) {

@@ -1,4 +1,5 @@
-//! install 状态文件（`<home>/run/install.state`）：安装的真相源 + 安装锁。
+//! 安装状态文件 `<home>/install/state.json`（代码与文档里习称 install.state）：
+//! 安装的真相源 + 安装锁。位置见 [`super::install_dir_in`]。
 //!
 //! 分工原则（用户定调）：状态文件**只有 install 自己读**——残留 ≠ 在安装，
 //! 看护者/守护绝不解读它的语义（它们只认共享内存宣告节）；处于哪一步、
@@ -12,8 +13,6 @@
 //! - **旧版本也要读得懂**：交棒之后，等待结局的是交出安装的那个（往往更旧的）
 //!   二进制，它读接手者写下的状态来报告结局。所以阶段词表与字段名冻结，新字段
 //!   一律可选。
-//! - **无 .json 后缀**：与 `.pid`/`.restore` 注册表惯例一致，按内容而非
-//!   扩展名识别。
 //! - 状态文件删除 = 安装完成。任何非终态残留都意味着未完成（恢复机制的
 //!   触发依据）。
 
@@ -241,15 +240,15 @@ impl InstallState {
 /// 残留（双条件——长阶段本身不慢到 10 分钟，pid 判活兜住误判）。
 pub const STALE_AFTER_SECS: u64 = 600;
 
-/// 状态文件路径：`<home>/run/install.state`（run/ 子目录放状态类文件——
-/// 根目录只放长期稳定件；run/ 经 APROXY_RUN_DIR 重定向，测试隔离白送）。
+/// 状态文件路径：`<home>/install/state.json`。它属于 home，不随 APROXY_RUN_DIR
+/// 搬走——安装者的一切状态都收在 `<home>/install/` 下（见 [`super::install_dir_in`]）。
 pub fn state_path() -> PathBuf {
-    state_path_in(&crate::daemon::run_dir())
+    state_path_in(&crate::settings::home())
 }
 
-/// 同上，run 目录可指定（测试注入用）。
-pub fn state_path_in(run_dir: &Path) -> PathBuf {
-    run_dir.join("install.state")
+/// 同上，home 可指定（测试注入用）。
+pub fn state_path_in(home: &Path) -> PathBuf {
+    super::install_dir_in(home).join("state.json")
 }
 
 fn now_secs() -> u64 {
@@ -261,14 +260,14 @@ fn now_secs() -> u64 {
 
 /// 读取状态文件。不存在 → None（无安装）；损坏 → None（调用方按恢复矩阵
 /// 「状态文件损坏」处置：按 aborted 处理 + 审计日志）。
-pub fn load_in(run_dir: &Path) -> Option<InstallState> {
-    let content = std::fs::read_to_string(state_path_in(run_dir)).ok()?;
+pub fn load_in(home: &Path) -> Option<InstallState> {
+    let content = std::fs::read_to_string(state_path_in(home)).ok()?;
     serde_json::from_str(&content).ok()
 }
 
 /// 同上，真实位置。
 pub fn load() -> Option<InstallState> {
-    load_in(&crate::daemon::run_dir())
+    load_in(&crate::settings::home())
 }
 
 /// stale 判定（锁失效 = 可接管）：**原安装进程已死即残留**（进程死亡后
@@ -308,8 +307,8 @@ pub fn is_takeable(run_dir: &Path, state: &InstallState, now_secs: u64) -> bool 
 
 /// 安装锁下的新建：状态文件不存在或已 stale 才成功（stale 即接管续跑），
 /// 存在且新鲜 → Err（并发安装拒绝）。成功返回带锁信息（pid/时间戳）的状态。
-pub fn create_new_in(run_dir: &Path, mut state: InstallState) -> Result<InstallState, String> {
-    if let Some(existing) = load_in(run_dir)
+pub fn create_new_in(home: &Path, mut state: InstallState) -> Result<InstallState, String> {
+    if let Some(existing) = load_in(home)
         && !is_stale(&existing, now_secs())
     {
         return Err(format!(
@@ -320,19 +319,19 @@ pub fn create_new_in(run_dir: &Path, mut state: InstallState) -> Result<InstallS
     }
     // 走到这里的残留（stale/不存在）即接管：不询问直接续跑（用户调 install
     // 的期望就是装完）
-    write_in(run_dir, &mut state).map_err(|e| format!("install.state 写入失败: {e}"))?;
+    write_in(home, &mut state).map_err(|e| format!("install/state.json 写入失败: {e}"))?;
     Ok(state)
 }
 
 /// 原子重写（tmp + rename，与实例注册表/settings 同思路）并刷新 updated_at。
-pub fn write_in(run_dir: &Path, state: &mut InstallState) -> std::io::Result<()> {
+pub fn write_in(home: &Path, state: &mut InstallState) -> std::io::Result<()> {
     state.updated_at = now_secs();
-    let path = state_path_in(run_dir);
+    let path = state_path_in(home);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(state).expect("序列化 install.state 失败");
-    let tmp = path.with_extension("state.tmp");
+    let json = serde_json::to_string_pretty(state).expect("序列化安装状态失败");
+    let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, json)?;
     match std::fs::rename(&tmp, &path) {
         Ok(()) => Ok(()),
@@ -345,11 +344,7 @@ pub fn write_in(run_dir: &Path, state: &mut InstallState) -> std::io::Result<()>
 
 /// 阶段推进：校验迁移合法性后原子落盘。非法迁移是编程错误（状态机被绕过
 /// 的信号），返回 Err 拒绝落盘。
-pub fn advance_in(
-    run_dir: &Path,
-    state: &mut InstallState,
-    to: InstallPhase,
-) -> Result<(), String> {
+pub fn advance_in(home: &Path, state: &mut InstallState, to: InstallPhase) -> Result<(), String> {
     if !can_transition(state.phase, to) {
         return Err(format!(
             "非法状态迁移 {:?} → {to:?}（状态机被绕过？）",
@@ -357,26 +352,26 @@ pub fn advance_in(
         ));
     }
     state.phase = to;
-    write_in(run_dir, state)
+    write_in(home, state)
         .map(|_| ())
-        .map_err(|e| format!("install.state 写入失败: {e}"))
+        .map_err(|e| format!("install/state.json 写入失败: {e}"))
 }
 
 /// 失败落盘：记录原因并置 failed（保留现场）。已是 failed（续作重跑再次
 /// 失败）时只刷新原因——failed → failed 不是合法迁移，但原因必须是最新的。
 /// 落盘失败只能放弃（调用方本就在失败路径上，原错误已向上返回）。
-pub fn fail_in(run_dir: &Path, state: &mut InstallState, error: &str) {
+pub fn fail_in(home: &Path, state: &mut InstallState, error: &str) {
     state.last_error = Some(error.to_string());
     if state.phase == InstallPhase::Failed {
-        let _ = write_in(run_dir, state);
+        let _ = write_in(home, state);
     } else {
-        let _ = advance_in(run_dir, state, InstallPhase::Failed);
+        let _ = advance_in(home, state, InstallPhase::Failed);
     }
 }
 
 /// 删除状态文件（done/aborted 后清场；不存在静默成功）。
-pub fn remove_in(run_dir: &Path) {
-    let _ = std::fs::remove_file(state_path_in(run_dir));
+pub fn remove_in(home: &Path) {
+    let _ = std::fs::remove_file(state_path_in(home));
 }
 
 #[cfg(test)]
@@ -452,11 +447,11 @@ mod tests {
     #[test]
     fn create_new_lock_and_stale_takeover() {
         let dir = tempfile::tempdir().unwrap();
-        let run = dir.path().join("run");
+        let home = dir.path();
 
         // 空目录：创建成功，写入 marking 初始态
         let s = create_new_in(
-            &run,
+            home,
             InstallState::new_marking("0.1.0-alpha.9", InstallSource::Github),
         )
         .unwrap();
@@ -465,7 +460,7 @@ mod tests {
 
         // 新鲜锁：并发安装拒绝
         let err = create_new_in(
-            &run,
+            home,
             InstallState::new_marking("0.1.0-alpha.8", InstallSource::From),
         )
         .unwrap_err();
@@ -474,16 +469,16 @@ mod tests {
         // 残留接管：updated_at 过期 + pid 已死。直接写文件构造（write_in 会
         // 刷新 updated_at，无法用它伪造过期的锁——这正是它自动刷新的意义）
         let write_raw = |s: &InstallState| {
-            std::fs::write(state_path_in(&run), serde_json::to_string(s).unwrap()).unwrap();
+            std::fs::write(state_path_in(home), serde_json::to_string(s).unwrap()).unwrap();
         };
-        let mut stale = load_in(&run).unwrap();
+        let mut stale = load_in(home).unwrap();
         stale.updated_at = now_secs().saturating_sub(STALE_AFTER_SECS + 60);
         // 双条件验证一：时间过期但 pid 存活（本进程）→ 不算 stale，仍拒
         let mut fresh_alive = stale.clone();
         fresh_alive.installer_pid = std::process::id();
         write_raw(&fresh_alive);
         assert!(
-            create_new_in(&run, InstallState::new_marking("x", InstallSource::Github)).is_err(),
+            create_new_in(home, InstallState::new_marking("x", InstallSource::Github)).is_err(),
             "时间过期但 pid 存活 → 仍是有效锁"
         );
         // 双条件验证二：pid 为确定不存在的值（watchdog 同款哨兵，已验证
@@ -491,7 +486,7 @@ mod tests {
         stale.installer_pid = u32::MAX - 7;
         write_raw(&stale);
         let taken = create_new_in(
-            &run,
+            home,
             InstallState::new_marking("0.1.0-alpha.9", InstallSource::Github),
         )
         .unwrap();
@@ -505,13 +500,13 @@ mod tests {
     #[test]
     fn save_refreshes_updated_at_and_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
-        let run = dir.path().join("run");
+        let home = dir.path();
         let mut s = InstallState::new_marking("0.1.0-alpha.9", InstallSource::Npm);
         s.updated_at = 0;
-        write_in(&run, &mut s).unwrap();
+        write_in(home, &mut s).unwrap();
         assert!(s.updated_at > 0, "每次写入应自动刷新 updated_at");
 
-        let loaded = load_in(&run).unwrap();
+        let loaded = load_in(home).unwrap();
         assert_eq!(loaded.phase, InstallPhase::Marking);
         assert_eq!(loaded.target_version, "0.1.0-alpha.9");
         assert_eq!(loaded.source, InstallSource::Npm);
@@ -521,27 +516,27 @@ mod tests {
     #[test]
     fn advance_validates_and_persists() {
         let dir = tempfile::tempdir().unwrap();
-        let run = dir.path().join("run");
+        let home = dir.path();
         let mut s =
-            create_new_in(&run, InstallState::new_marking("v", InstallSource::Github)).unwrap();
+            create_new_in(home, InstallState::new_marking("v", InstallSource::Github)).unwrap();
 
         // 非法迁移被拒且不落盘
-        assert!(advance_in(&run, &mut s, InstallPhase::Swapping).is_err());
-        assert_eq!(load_in(&run).unwrap().phase, InstallPhase::Marking);
+        assert!(advance_in(home, &mut s, InstallPhase::Swapping).is_err());
+        assert_eq!(load_in(home).unwrap().phase, InstallPhase::Marking);
 
         // 合法迁移落盘
-        advance_in(&run, &mut s, InstallPhase::Downloading).unwrap();
-        assert_eq!(load_in(&run).unwrap().phase, InstallPhase::Downloading);
+        advance_in(home, &mut s, InstallPhase::Downloading).unwrap();
+        assert_eq!(load_in(home).unwrap().phase, InstallPhase::Downloading);
     }
 
     #[test]
     fn corrupted_state_file_loads_none() {
         let dir = tempfile::tempdir().unwrap();
-        let run = dir.path().join("run");
-        std::fs::create_dir_all(&run).unwrap();
-        std::fs::write(state_path_in(&run), "{corrupted").unwrap();
+        let home = dir.path();
+        std::fs::create_dir_all(state_path_in(home).parent().unwrap()).unwrap();
+        std::fs::write(state_path_in(home), "{corrupted").unwrap();
         assert!(
-            load_in(&run).is_none(),
+            load_in(home).is_none(),
             "损坏状态按无/失效处理（调用方走恢复矩阵）"
         );
     }
@@ -549,11 +544,11 @@ mod tests {
     #[test]
     fn state_file_roundtrips_full_schema_and_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        let run = dir.path().join("run");
+        let home = dir.path();
         // 全字段状态落盘往返
         let mut s = InstallState::new_marking("0.1.0-alpha.9", InstallSource::From);
         s.phase = InstallPhase::Swapped;
-        s.staged_path = Some("C:/h/staging/0.1.0-alpha.9/aproxy.exe".into());
+        s.staged_path = Some("C:/h/install/staging/0.1.0-alpha.9/aproxy.exe".into());
         s.sha256 = Some("abc123".into());
         s.old_path = Some("C:/h/bin/aproxy.old.exe".into());
         s.instance_snapshot = vec!["12345".into(), "12349".into()];
@@ -570,16 +565,16 @@ mod tests {
         s.halted = true;
         s.last_error = Some("实例 12345 滚动重启失败".into());
         let mut cur = s.clone();
-        write_in(&run, &mut cur).unwrap();
-        assert_eq!(load_in(&run).unwrap(), s);
+        write_in(home, &mut cur).unwrap();
+        assert_eq!(load_in(home).unwrap(), s);
 
         // 旧版本状态文件（缺新字段）serde default 兼容
         std::fs::write(
-            state_path_in(&run),
+            state_path_in(home),
             r#"{"phase":"restarting","target_version":"0.1.0-alpha.8"}"#,
         )
         .unwrap();
-        let old = load_in(&run).unwrap();
+        let old = load_in(home).unwrap();
         assert_eq!(old.phase, InstallPhase::Restarting);
         assert!(old.instance_snapshot.is_empty() && old.skill.is_none());
         // 新字段缺省：无在途实例、未中止、无失败原因（旧版本写的现场照常续作）
@@ -589,17 +584,17 @@ mod tests {
     #[test]
     fn fail_records_reason_and_refreshes_on_repeat() {
         let dir = tempfile::tempdir().unwrap();
-        let run = dir.path().join("run");
+        let home = dir.path();
         let mut s =
-            create_new_in(&run, InstallState::new_marking("v", InstallSource::From)).unwrap();
-        advance_in(&run, &mut s, InstallPhase::Downloading).unwrap();
-        fail_in(&run, &mut s, "第一次");
-        let loaded = load_in(&run).unwrap();
+            create_new_in(home, InstallState::new_marking("v", InstallSource::From)).unwrap();
+        advance_in(home, &mut s, InstallPhase::Downloading).unwrap();
+        fail_in(home, &mut s, "第一次");
+        let loaded = load_in(home).unwrap();
         assert_eq!(loaded.phase, InstallPhase::Failed);
         assert_eq!(loaded.last_error.as_deref(), Some("第一次"));
         // 已 failed 再失败：phase 不变、原因刷新为最新
-        fail_in(&run, &mut s, "第二次");
-        let loaded = load_in(&run).unwrap();
+        fail_in(home, &mut s, "第二次");
+        let loaded = load_in(home).unwrap();
         assert_eq!(loaded.phase, InstallPhase::Failed);
         assert_eq!(loaded.last_error.as_deref(), Some("第二次"));
     }
@@ -607,11 +602,11 @@ mod tests {
     #[test]
     fn remove_clears_lock() {
         let dir = tempfile::tempdir().unwrap();
-        let run = dir.path().join("run");
-        create_new_in(&run, InstallState::new_marking("v", InstallSource::Github)).unwrap();
-        remove_in(&run);
-        assert!(load_in(&run).is_none());
+        let home = dir.path();
+        create_new_in(home, InstallState::new_marking("v", InstallSource::Github)).unwrap();
+        remove_in(home);
+        assert!(load_in(home).is_none());
         // 幂等：不存在再删不报错
-        remove_in(&run);
+        remove_in(home);
     }
 }

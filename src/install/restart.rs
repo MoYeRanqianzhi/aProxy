@@ -263,7 +263,8 @@ async fn reap_unready_child(pid: u32, start: Option<u64>) {
 }
 
 /// 一步到位：取恢复参数（停止前！）→ 记在途 → 优雅停止（等进程终止）→
-/// 回写 `.restore` → 用 `exe` 重启。返回新 pid。
+/// 回写 `.restore` → 用 `exe` 重启。返回新 pid。在途记录与 halted 写进 `home`
+/// 的安装状态文件，实例的注册表与 `.restore` 在 `run_dir`。
 ///
 /// `fallback`：新二进制起不来时拉回实例用的旧二进制。None = 用实例停止前
 /// 的进程镜像路径——只在镜像文件**尚未被交换**时准确（swap 前的 ACK 收敛
@@ -276,6 +277,7 @@ async fn reap_unready_child(pid: u32, start: Option<u64>) {
 /// 双臂——在途连接挂起时 10s 后 process::exit），进程终止等待必须覆盖它
 /// 并留余量，否则 rolling 阶段每一步都在与宽限计时竞速。
 pub async fn restart_instance(
+    home: &Path,
     run_dir: &Path,
     state: &mut InstallState,
     port: &str,
@@ -296,8 +298,8 @@ pub async fn restart_instance(
         args: args.clone(),
         log_path: log_path.clone(),
     });
-    super::state::write_in(run_dir, state)
-        .map_err(|e| RestartError::NotRestarted(format!("install.state 写入失败: {e}")))?;
+    super::state::write_in(home, state)
+        .map_err(|e| RestartError::NotRestarted(format!("install/state.json 写入失败: {e}")))?;
 
     if live.is_some() {
         stop_and_wait(run_dir, port, Duration::from_secs(20))
@@ -316,7 +318,7 @@ pub async fn restart_instance(
     let failure = match spawn_and_wait_ready(run_dir, exe, &args).await {
         Ok(pid) => {
             state.pending_restores.retain(|p| p.port != port);
-            let _ = super::state::write_in(run_dir, state);
+            let _ = super::state::write_in(home, state);
             return Ok(pid);
         }
         Err(f) => f,
@@ -333,7 +335,7 @@ pub async fn restart_instance(
     // 起来了）：服务已在，不再叠加回退——verifying 会核对版本
     if let Ok(info) = crate::daemon::ipc_ping_in(run_dir, port).await {
         state.pending_restores.retain(|p| p.port != port);
-        let _ = super::state::write_in(run_dir, state);
+        let _ = super::state::write_in(home, state);
         return Ok(info.instance.pid);
     }
 
@@ -364,6 +366,6 @@ pub async fn restart_instance(
             }
         },
     };
-    let _ = super::state::write_in(run_dir, state);
+    let _ = super::state::write_in(home, state);
     result
 }

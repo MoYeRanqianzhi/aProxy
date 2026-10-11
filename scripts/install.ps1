@@ -60,7 +60,7 @@ function Install-AProxy {
     $Home_ = if ($env:APROXY_HOME) { $env:APROXY_HOME } else { Join-Path $HOME ".aproxy" }
     $BinDir = Join-Path $Home_ "bin"
     $SkillsDir = Join-Path $Home_ "skills"
-    $TmpDir = Join-Path $Home_ "staging\bootstrap"
+    $TmpDir = Join-Path $Home_ "install\bootstrap"
 
     function Get-ReleaseTag([bool]$AllowPre) {
         # 取一整页（上限 100）自己过滤：/releases/latest 可能指向 format-v*，列表首项

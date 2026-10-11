@@ -4,7 +4,9 @@
 > 四路审查与综合已完成：`.agents/review/2026-10-11-0.2.0-audit/`（dataplane、control-plane、config-cli-install、
 > release-tests-docs，综合稿 synthesis.md：合并后 P0 16 条、工作流归属、待拍板决策 D-1…D-11、主代理可自定的
 > 设计点 §3.12）。综合稿的 D-10（alpha 不公开发布）被用户「先发 alpha.1 验证可信发布」的定调取代；§3.12 里
-> 「不建 aproxy-ipc / aproxy-ui crate」被用户「新增两个 crate」的提议取代（见 W5）。W1 实现中。
+> 「不建 aproxy-ipc / aproxy-ui crate」被用户「新增两个 crate」的提议取代（见 W5）。
+> 2026-10-12：alpha.1 第 1 步（W1）完成并推送（fbcc738）；第 2 步（台账 + 强制安装）由子代理实现中；UI 原型按用户
+> 第一轮风格反馈返工中（第一版仍带偏移硬阴影，未达要求）。
 
 ## 目标
 

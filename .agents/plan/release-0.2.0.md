@@ -166,7 +166,19 @@
     skill 原样不动。预发布版不受影响（0.1.0 的稳定通道不选预发布）。
 
 ### W5 UI（Tauri 2，编进本体）
-- 构建：cargo feature `ui` 进 default features；`--no-default-features` 出无 UI 版本，不得多出任何依赖。
+- 构建：cargo feature `desktop` 进 default features（与 `aproxy desktop` 命令、`--version` 的变体词一致）；
+  `--no-default-features` 出无 UI 版本，不得多出任何依赖（CI 用 `cargo tree` 断言依赖树里没有 tauri）。
+- **crate 布局（用户 2026-10-11 提议「新增两个 crate」，主代理细化切法，用户未反对）**：
+  - `aproxy-ipc`：控制协议类型、客户端、实例发现、日志与事件流——「读数据、转给界面」。不依赖 Tauri，可完整测试；
+    守护（服务端）、命令行、桌面三方共用这一份，协议契约测试放这里。
+  - `aproxy-desktop`：Tauri 外壳 + 嵌入的前端，读数据只经 `aproxy-ipc`。主二进制依赖它，所以它**不能**依赖主 crate
+    （否则成环）：改配置、拉起实例、安装与强制安装等需要核心逻辑的操作，由它定义一个接口，主 crate 实现后在
+    `aproxy desktop` 启动时注入。不放单元测试（Tauri 链进测试程序会让 Windows 上的 `cargo test` 崩溃，RT-05），
+    逻辑尽量放进 `aproxy-ipc` 测。
+  - `aproxy`：核心 + 命令行 + 可执行文件；`desktop` 特性 = 对 `aproxy-desktop` 的可选依赖。
+  - 发布：crates.io 发布顺序 ipc → desktop → aproxy，版本与主线同步（同 aproxy-envelope 的做法）；两个新 crate 首发要用
+    所有者给的 token 先发一次，再经 API 绑定可信发布（release.yml / release）；desktop 包带上 CI 里构建好的前端产物，
+    用 `cargo package --list` 核对。综合稿 §3.12 与 RT-05「不建新 crate」的建议被这个切法取代。
 - 进程模型：`aproxy desktop`（用户定的启动方式）起独立的 GUI 进程（窗口 + 托盘），守护进程永不加载 GUI；无 UI 版本也认得 `desktop`（帮助里隐藏），执行时说明这个版本没有桌面界面、该装哪个版本，非零退出——不让用户看到 clap 的「unrecognized subcommand」；GUI 只经 IPC 与实例通信、
   按显式 home 寻址，不开新网络端口。
 - 窗口外观按两个 skill 的做法（实现时用 Skill 工具调用它们，照 recipe 复制 assets）：

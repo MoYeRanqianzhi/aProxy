@@ -2,7 +2,8 @@
 //!
 //! lib 单测覆盖纯逻辑（sha256 向量/路径派生/缺失源拒绝）；此处用
 //! CARGO_BIN_EXE_aproxy 走完整 `--from` 备料链：复制 → chmod（unix）→
-//! sha256 → 试跑校验，版本不匹配必须拒绝且清理 staged 副本。
+//! sha256 → 试跑校验，版本不匹配必须拒绝且清理 staged 副本。试跑读的
+//! `--version` 输出是永久格式（C5），这里也钉住它的形状与「不碰 home」。
 //!
 //! 隔离：APROXY_HOME 相关函数全部显式传 tempdir，绝不触碰真实 ~/.aproxy。
 
@@ -66,4 +67,60 @@ fn stage_from_rejects_version_mismatch_and_cleans_up() {
         .join("0.0.0-definitely-not")
         .join(aproxy::install::staging::binary_name());
     assert!(!leftover.exists(), "被拒的 staged 副本应已清理");
+}
+
+/// 永久兼容契约 C5：`--version` 与 `-V` 的全部输出就是 `aproxy::VERSION_LINE` 这一行，
+/// 退出码 0，且不碰 home——APROXY_HOME 指向的目录事后仍不存在。
+#[test]
+fn version_flag_prints_the_permanent_line_and_touches_no_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    for flag in ["--version", "-V"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_aproxy"))
+            .arg(flag)
+            .env("APROXY_HOME", &home)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{flag}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{}\n", aproxy::VERSION_LINE),
+            "{flag}"
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "{flag}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(!home.exists(), "--version 不得创建或写入 home");
+
+    // 形状：aproxy v<本包版本> (<变体>; <目标三元组>[; x86-64-v3])
+    let line = aproxy::VERSION_LINE;
+    let inner = line
+        .strip_prefix(&format!("aproxy v{} (", env!("CARGO_PKG_VERSION")))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("{line}"));
+    let parts: Vec<&str> = inner.split("; ").collect();
+    let variant = if cfg!(feature = "desktop") {
+        "desktop"
+    } else {
+        "headless"
+    };
+    assert_eq!(parts[0], variant, "{line}");
+    assert!(
+        !parts[1].is_empty() && !parts[1].contains(char::is_whitespace),
+        "{line}"
+    );
+    let v3 = cfg!(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "fma",
+        target_feature = "bmi2"
+    ));
+    let expected_len = if v3 { 3 } else { 2 };
+    assert_eq!(parts.len(), expected_len, "{line}");
+    if v3 {
+        assert_eq!(parts[2], "x86-64-v3", "{line}");
+    }
 }

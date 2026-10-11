@@ -609,7 +609,7 @@ fn unix_install_rolls_back_instance_to_preserved_old_binary() {
     let fake = env.home().join("fake-new");
     std::fs::write(
         &fake,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"aproxy 0.0.0-fake\"; exit 0; fi\nexit 1\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"aproxy v0.0.0-fake\"; exit 0; fi\nexit 1\n",
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -713,7 +713,7 @@ fn handover_to_a_target_that_never_takes_over_fails_without_touching_anything() 
     write_script(
         &fake,
         &format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"aproxy {}\"; exit 0; fi\nexit 1\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"aproxy v{}\"; exit 0; fi\nexit 1\n",
             env!("CARGO_PKG_VERSION")
         ),
     );
@@ -777,7 +777,7 @@ fn staged_target_drives_the_install_and_its_failure_reaches_the_installer() {
         &wrapper,
         &format!(
             "#!/bin/sh\necho \"$*\" >> '{calls}'\n\
-             if [ \"$1\" = \"--version\" ]; then echo \"aproxy {version}\"; exit 0; fi\n\
+             if [ \"$1\" = \"--version\" ]; then echo \"aproxy v{version}\"; exit 0; fi\n\
              if [ \"$1\" = \"install\" ]; then exec '{real}' \"$@\"; fi\n\
              exit 1\n",
             calls = calls.display(),
@@ -857,4 +857,41 @@ fn concurrent_install_rejected_by_lock() {
     assert_eq!(out.status.code(), Some(1), "并发安装应被锁拒绝");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("已有安装进行中"), "{stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// 8. `--version` 先于一切副作用（永久兼容契约 C5）：安装状态残留时，别的命令
+//    会顺带拉起续作，`--version`/`-V` 不会。对照组 status 证明这个测试看得见
+//    续作——终态残留一被续作接手就会删掉
+// ---------------------------------------------------------------------------
+#[test]
+fn version_flag_does_not_resume_a_leftover_install() {
+    let env = TestEnv::new(12);
+    let state = aproxy::install::state::state_path_in(&env.home().join("run"));
+    std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+    std::fs::write(&state, r#"{"phase":"aborted","target_version":"0.2.0"}"#).unwrap();
+    let run = |arg: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_aproxy"))
+            .arg(arg)
+            .env("APROXY_HOME", env.home())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{arg}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    run("--version");
+    run("-V");
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(state.exists(), "--version 不得拉起续作");
+
+    run("status");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while state.exists() {
+        assert!(Instant::now() < deadline, "status 应拉起续作并清掉终态残留");
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }

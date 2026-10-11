@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "aproxy", version, about = "Local API proxy with infinite retries", long_about = None)]
+#[command(name = "aproxy", about = "Local API proxy with infinite retries", long_about = None)]
 pub(crate) struct Cli {
     /// 配置文件路径（默认 ~/.aproxy/config.toml）。
     /// 多开不同配置的进程时各自指定，例如：
@@ -55,6 +55,14 @@ pub(crate) struct Cli {
     /// 本进程据此进入看护主循环。勿手动使用。
     #[arg(long, hide = true, global = true)]
     pub(crate) daemon_watchdog: bool,
+
+    // 不用 clap 自带的版本参数：输出的那一行是安装器认版本的永久格式
+    // （aproxy::VERSION_LINE），由 main 自己打印；单独的 `aproxy --version` /
+    // `aproxy -V` 在解析参数之前就已短路返回，这里只为帮助里列出它、并接住
+    // 与别的参数写在一起的情形
+    /// 打印版本（`aproxy v<版本> (<变体>; <目标三元组>…)`）
+    #[arg(short = 'V', long)]
+    pub(crate) version: bool,
 
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,

@@ -20,6 +20,15 @@ use aproxy::settings;
 
 #[tokio::main]
 async fn main() {
+    // 永久兼容契约 C5（见 aproxy::VERSION_LINE）：安装器以 `<二进制> --version` 认
+    // 版本，这一行必须先于一切副作用输出——不切控制台代码页、不读 settings 与
+    // home、不拉起续作，以后解析参数之前要读的任何东西（例如按 settings 判定界面
+    // 语言）也都排在它后面。
+    if version_requested() {
+        println!("{}", aproxy::VERSION_LINE);
+        return;
+    }
+
     // Windows 控制台默认代码页（如 936/GBK）会把 Rust 输出的 UTF-8 中文显示为
     // 乱码——status/stop/logs 等所有面向用户的输出都是中文。切换到 UTF-8
     // （65001）；无控制台的守护子进程上调用失败被忽略，无副作用。
@@ -31,6 +40,11 @@ async fn main() {
     }
 
     let cli = Cli::parse();
+    // `-V`/`--version` 与别的参数写在一起（`aproxy -V start`）时走到这里，输出同一行
+    if cli.version {
+        println!("{}", aproxy::VERSION_LINE);
+        return;
+    }
 
     // 实际生效的配置文件路径（default_config 失效时为 Err）。只在真正要读配置
     // 的命令里兑现，见 commands::resolve_cfg_path
@@ -137,4 +151,15 @@ async fn main() {
         }
         None => commands::start::handle_start_cmd(&cli, cfg_path, None).await,
     }
+}
+
+/// 命令行恰好是 `aproxy --version` 或 `aproxy -V`（安装器探测版本就是这样调用的）。
+/// 只认这两种整行写法：与别的参数写在一起时交给 clap，它分得清 `-V` 是版本参数
+/// 还是另一个参数的取值。
+fn version_requested() -> bool {
+    let mut args = std::env::args_os().skip(1);
+    matches!(
+        (args.next(), args.next()),
+        (Some(flag), None) if flag == "--version" || flag == "-V"
+    )
 }

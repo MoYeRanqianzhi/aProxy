@@ -34,11 +34,21 @@ categories = ["network-programming", "web-programming"]
 # crates.io 白名单：crate 只装代码与文档，仓库其余（bench/文档树/工作流）不进包。
 # 前导 / 锚定仓库根——不带 / 的模式（如 README.md）会按 gitignore 语义匹配
 # 任意层级（实测 npm/ 子目录的 README 混进过包）
-include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/.claude/skills/aproxy-cli/**", "/.claude/skills/aproxy-format/**"]
+# build.rs 必须在白名单里：它导出的编译期常量（目标三元组）是代码的一部分，
+# 缺了它 crates.io 上的包（以及 install 的 cargo 渠道）编译不过。
+include = ["/src/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/.claude/skills/aproxy-cli/**", "/.claude/skills/aproxy-format/**"]
 
 [[bin]]
 name = "aproxy"
 path = "src/main.rs"
+
+# 发布变体：desktop = 带桌面界面的版本（默认），`--no-default-features` 出无界面的
+# headless 版本。现在还是空 feature，Tauri 依赖以后挂在它下面；`aproxy --version`
+# 的变体段按它输出 desktop 或 headless（src/lib.rs 的 VERSION_LINE），安装器升级时
+# 靠这一段保持变体不变。
+[features]
+default = ["desktop"]
+desktop = []
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

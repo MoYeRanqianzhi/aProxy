@@ -39,9 +39,9 @@ pub fn sha256_hex(path: &Path) -> Result<String, String> {
     Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// 读取二进制自报版本（`--version` 输出中第一个以数字开头的 token，
-/// 如 `aproxy 0.1.0-alpha.9` → `0.1.0-alpha.9`）。不能运行或无版本输出
-/// → Err——它不配作为安装源。
+/// 读取二进制自报版本：在本机执行它的 `--version`，按永久格式（C5，见
+/// `crate::VERSION_LINE`）取版本号。不能运行、或输出不是这一格式 → Err——它
+/// 不配作为安装源。
 pub fn probe_version(bin: &Path) -> Result<String, String> {
     let out = std::process::Command::new(bin)
         .arg("--version")
@@ -51,11 +51,21 @@ pub fn probe_version(bin: &Path) -> Result<String, String> {
         return Err(format!("{} --version 退出非零", bin.display()));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    stdout
-        .split_whitespace()
-        .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
-        .map(String::from)
-        .ok_or_else(|| format!("{} --version 输出无版本号: {stdout:?}", bin.display()))
+    parse_version_line(&stdout).ok_or_else(|| {
+        format!(
+            "{} --version 的输出不是 `aproxy v<版本> (…)`（0.2.0 起每个版本都这样输出，0.1.x 输出的是 `aproxy <版本>`）: {stdout:?}",
+            bin.display()
+        )
+    })
+}
+
+/// 从 `--version` 的输出里取版本号（永久兼容契约 C5）：首行 `aproxy v` 之后、
+/// 到空白或行尾为止，且必须是合法的 semver。不是这一格式 → None。
+pub fn parse_version_line(output: &str) -> Option<String> {
+    let rest = output.lines().next()?.strip_prefix("aproxy v")?;
+    let version = rest.split(char::is_whitespace).next()?;
+    semver::Version::parse(version).ok()?;
+    Some(version.to_string())
 }
 
 /// 备料结果：staging 里的新二进制 + 完整性摘要（进 install.state）。
@@ -139,6 +149,52 @@ mod tests {
         } else {
             assert_eq!(binary_name(), "aproxy");
         }
+    }
+
+    #[test]
+    fn version_line_parses_only_the_permanent_format() {
+        assert_eq!(
+            parse_version_line("aproxy v0.2.0 (desktop; x86_64-pc-windows-msvc; x86-64-v3)\n")
+                .as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(
+            parse_version_line("aproxy v0.2.0-alpha.1 (headless; aarch64-unknown-linux-musl)\r\n")
+                .as_deref(),
+            Some("0.2.0-alpha.1")
+        );
+        // 后面的括号段可有可无，版本到行尾为止也行
+        assert_eq!(
+            parse_version_line("aproxy v1.0.0").as_deref(),
+            Some("1.0.0")
+        );
+        // 0.1.x 的格式（没有 v）、版本不是 semver、不在首行、v 后面先有空白：都不认
+        for bad in [
+            "aproxy 0.1.0\n",
+            "aproxy vnext (desktop; x)\n",
+            "\naproxy v0.2.0\n",
+            "aproxy v 0.2.0\n",
+            "",
+        ] {
+            assert_eq!(parse_version_line(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn own_version_line_round_trips_and_stops_0_1_0_probes() {
+        assert_eq!(
+            parse_version_line(crate::VERSION_LINE).as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        // 0.1.0 的安装器取第一个以数字开头的词当版本：一个都没有，它才会在
+        // 交换二进制之前失败（C5 的保证，见 crate::VERSION_LINE）
+        assert!(
+            crate::VERSION_LINE
+                .split_whitespace()
+                .all(|word| !word.starts_with(|c: char| c.is_ascii_digit())),
+            "{}",
+            crate::VERSION_LINE
+        );
     }
 
     #[test]

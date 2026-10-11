@@ -65,10 +65,16 @@
   护栏：决策阶段超时很短，format 崩溃、超时、答非所问一律回落到静态配置（规则表 + 默认无限重试）；优先级 format 决策 >
   规则表 > 默认；不启用该阶段时行为与现在完全一样；每个决策与理由进日志并在界面可见。基础设施类设置（监听地址、日志文件、
   安全、format 命令本身、看护者）保持静态。与 D-6 的「约定失败结构」统一成同一套决策回信。
-- **配置合并为一个 `[format]`**（用户问「上传和下载的 format 要不要合并」）：一个程序、一个进程池，`stages` 声明接管哪些阶段
-  （request、retry、decide、response、stream、heartbeat），阶段专属设置放 `[format.stage.<名>]`；`[request_transform]`、
-  `[response_transform]`、`[heartbeat_transform]` 与 `every_attempt` 一并取消（0.2.0 不兼容旧键，未知键告警里提示）。将来
-  需要多程序串联时再只加不改地扩展。
+- **一种配置形状、可挂多个程序**（用户 2026-10-12 指出：只允许一个程序会让「协议转换用别人开源的 C++ 实现、其他功能
+  各用 Rust/Python/PowerShell 写」的组合没法同时使用，而它们各司其职并不冲突）：`[[format]]` 是程序列表，每个程序有自己的
+  `name`、`command`/`args`、`mode`（spawn/persistent）、进程池、超时，并用 `stages` 声明接管哪些阶段（request、retry、
+  decide、response、stream、heartbeat）。同一阶段有多个程序时按「洋葱」中间件组合：请求方向按列表顺序（离客户端最近的
+  写在前面），响应与流方向按相反顺序；决策阶段按列表顺序，第一个给出明确决定的生效，都不表态就回落到规则表与默认行为。
+  `state` 按程序隔离（各自只看到自己的），`request_id` 全链共享；每个程序可设 `required = false`，它出错时跳过而不影响
+  请求（适合审计、记录类工具）。新阶段只是 `stages` 里多一个词，不新增配置段；`[request_transform]`、
+  `[response_transform]`、`[heartbeat_transform]` 与 `every_attempt` 一并取消（0.2.0 不兼容旧键，未知键告警里提示）。
+  握手时每个程序报告自己支持的阶段与协议版本，配置里声明了它不支持的阶段就在启动时报错。链上每多一个程序，该阶段就
+  多一次本机往返，文档写明。以后可再加只观察、不阻塞请求的「旁路」程序，属于只加不改。
 - **仅转发模式的协议转换 + 实时流式转换**（用户：「这个是需要的，并且仅中转下需要实时的流式转换」）：
   - 现状：配置校验拒绝「仅转发 + 转换器」（`src/config.rs:592`）；aproxy-format 连缓冲模式下的 SSE 也原样透传、不做转换
     （`aproxy-format/src/translate.rs:7-9`）——跨协议的流式请求在任何模式下都不可用。

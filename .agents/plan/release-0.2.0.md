@@ -72,8 +72,18 @@
     （切换系统主题、透明效果）交给用户。skill 验证于 tauri 2.12.0 / wry 0.57.0 / tao 0.37.1，升级 Tauri 后重跑。
 - UI 文本走 i18n（与命令行同一套语言判定）。
 - 待定：
-  - Linux 的 UI 版本动态链接 webkit2gtk / GTK，缺库的机器上连代理都起不来——Linux 要同时发 UI 版与无 UI 版，
-    install 与一键脚本要选对并在升级时保持；musl 与 aarch64 Linux 只出无 UI 版。
+  - **所有平台都发两个版本（用户定）**：现有 11 个构建（Windows x64 / x64-v3 / x86 / arm64，Linux gnu x64 /
+    x64-v3 / arm64，musl x64 / arm64，macOS arm64 / x64）各出带 UI 与无 UI 两份，共 22 个。由此带来的事：
+    - Linux 的 UI 版动态链接 webkit2gtk / GTK，缺库的机器上连代理都起不来；install 与一键脚本要选对版本，
+      升级时保持原版本（二进制要能报告自己是哪个版本，例如 `--version` 带上变体）。
+    - gnu 的 UI 版不能沿用 cargo-zigbuild 压低 glibc 下限，glibc 下限由 webkit2gtk 决定，拟在 ubuntu-22.04
+      （及其 arm runner）上构建。
+    - musl 的 UI 版不可能静态链接：要在 Alpine 容器里对 musl 版 webkit2gtk 动态链接，只能跑在装了 webkit2gtk
+      的 musl 发行版上。发布说明要写清。
+    - 资产命名要能区分两个版本（默认名给哪个、后缀叫什么随 W2/W7 定；命名也可能是让 0.1.0 安装器找不到 0.2.0
+      资产、从而在改动前干净失败的办法之一）。
+    - npm 平台子包从 9 个变 18 个：新包首发 OIDC 做不了，要所有者本地首发一次（记忆 trusted-publishing-new-crate-limit）。
+    - 发布流水线时长与产物体积显著增加。
   - aproxy.exe 是控制台程序，从快捷方式启动 `aproxy ui` 会闪控制台窗口：拟让 `ui` 分离出自身后父进程退出，
     或在独占控制台时释放它，实现时实测。
   - crates.io：默认 feature 含 UI，`cargo install aproxy` 需要包里带构建好的前端，Linux 还要 GTK 开发库；

@@ -80,9 +80,18 @@
       （及其 arm runner）上构建。
     - musl 的 UI 版不可能静态链接：要在 Alpine 容器里对 musl 版 webkit2gtk 动态链接，只能跑在装了 webkit2gtk
       的 musl 发行版上。发布说明要写清。
-    - 资产命名要能区分两个版本（默认名给哪个、后缀叫什么随 W2/W7 定；命名也可能是让 0.1.0 安装器找不到 0.2.0
-      资产、从而在改动前干净失败的办法之一）。
-    - npm 平台子包从 9 个变 18 个：新包首发 OIDC 做不了，要所有者本地首发一次（记忆 trusted-publishing-new-crate-limit）。
+    - **命名（用户 2026-10-11 选定 headless）**：带 UI 的沿用现有名字——GitHub 资产 `aproxy-<target>[-v3][.exe]`、
+      npm `@meowo/aproxy` 与 9 个 `@meowo/aproxy-<平台>`、crates.io `aproxy`（feature `desktop` 默认开，binstall
+      的默认命名正好对应它）；无 UI 的叫 headless——资产 `aproxy-headless-<target>[-v3][.exe]`、npm
+      `@meowo/aproxy-headless` 与 9 个 `@meowo/aproxy-headless-<平台>`、cargo 用 `--no-default-features`，不另建 crate。
+      `npm/build-and-publish.sh` 已有按组切换包名与资产前缀的结构（format 组），headless 加一组即可；JS 转发器按主包
+      名推导子包前缀，不用改。两个主包都提供 `aproxy` 命令，不能同时全局安装。
+    - **npm 种子已发（2026-10-11）**：10 个 headless 包以 0.0.0 占位版本发布；**可信发布绑定待所有者完成**
+      （GAT 做不了，见记忆 trusted-publishing-p0 的 2026-10-11 一节）。crates.io 不需要新配置，已核对现有绑定都在。
+    - 0.1.0 安装器的干净失败另有一条与命名无关的路：0.1.0 的 `probe_version` 取 `--version` 输出里第一个以数字
+      开头的词，且必须与目标版本完全相等，否则在交换前中止（`git show v0.1.0:src/install/staging.rs`）。0.2.0 的
+      `--version` 本来就要带上变体（install 升级时保持变体），若格式写成 `aproxy v0.2.0 (desktop)` 之类，0.1.0
+      的四条下载渠道都会在交换前失败。待审查 config-cli-install 的断点分析印证后定。
     - 发布流水线时长与产物体积显著增加。
   - aproxy.exe 是控制台程序，从快捷方式启动 `aproxy desktop` 会闪控制台窗口：拟让 `desktop` 分离出自身后父进程退出，
     或在独占控制台时释放它，实现时实测。

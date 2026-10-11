@@ -45,3 +45,18 @@
   「版本已存在才跳过」幂等。format 0.1.1 的 npm 包就是这样在 run 37192303424 上补发的。
 - npm 的 `+ @meowo/...@x.y.z` 日志出现后，registry 元数据要过几分钟才显示新版本与 dist-tag，
   马上查到旧值不代表发布失败（主线 0.1.0 与 format 0.1.1 都遇到过）。
+
+## 2026-10-11：0.2.0 无 UI 版本的 npm 种子发布（npm 11.17 实测）
+
+- 所有者给了一个 GAT（带「跳过 2FA」），主代理用它把 `@meowo/aproxy-headless` 与 9 个
+  `@meowo/aproxy-headless-<平台>` 以 0.0.0 占位版本（只有 README 与 package.json，不含二进制）发布成功。
+- **用同一个 GAT 做 `npm trust github` 返回 403，`npm trust list` 也 403**——与 npm 文档一致：信任命令要求
+  账号级 2FA，不接受跳过 2FA 的 GAT，所以绑定与查看都只能由所有者在自己的终端或网页完成。文档要点：
+  包必须已存在；必须显式给 `--allow-publish`（默认 false，不给就没有发布权限）；第一次 2FA 时网页上可勾选
+  「5 分钟内跳过 2FA」，之后的 `npm trust` 批量执行不再要求验证。
+- **本机陷阱**：在 `C:/Users/MoYeR` 之下、没有 package.json 的目录里运行 npm，会把用户目录下的 `.npmrc`（里面是
+  失效的旧 token）当作 project 配置，覆盖 `--userconfig` 里的 token，表现为 401。在包目录里运行即可。
+  `npm trust` 的参数要写成 `--userconfig=<路径>`（带等号），分开写会报「Unknown positional argument」。
+- 不把 token 写进任何文件：`--userconfig` 指向的临时文件里只写 `${NPM_TOKEN}` 占位，token 只在当条命令的
+  环境变量里出现。crates.io 的 token 只用于只读核对（`GET /api/v1/trusted_publishing/github_configs?crate=`）：
+  aproxy #19617、aproxy-envelope #23481/#23482、aproxy-format #23480 均在。

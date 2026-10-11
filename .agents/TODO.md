@@ -18,6 +18,7 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] **四路审查收口**：报告在 `.agents/review/2026-10-11-0.2.0-audit/`，汇总后更新计划
 - [ ] **W1 去除兼容**：含 0.1.0 原地升级兼容（`src/compat_0_1_0.rs`、relaying 豁免、compat 测试、upgrade-from-0-1-0 任务）；0.1.0 的 upgrade 遇到 0.2.0 必须在改动前失败；CHANGELOG 写迁移步骤
 - [ ] **W2 契约重审与定稿**（IPC、磁盘布局、config/settings、CLI、错误体、信封），定稿后重写永久接口清单
+- [ ] **W2b `install --force`**（强制关进程后安装，不走交接；设计见计划）
 - [ ] **W3 i18n**（给用户看的 en/zh-CN，给 agent 或不可见的固定英文）
 - [ ] **W4 `aproxy skill` 命令**（install/upgrade/list/show，show 的安全设计，`--help` 末尾提示行）
 - [ ] **W5 UI**（Tauri 2 编进本体、`ui` feature 默认开、无 UI 版本；自定义标题栏；Mica 默认关可开）

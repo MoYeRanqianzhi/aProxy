@@ -97,6 +97,7 @@ dependencies = [
  "futures-util",
  "http",
  "http-body-util",
+ "libc",
  "regex",
  "reqwest",
  "ruzstd",

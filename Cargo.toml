@@ -11,7 +11,7 @@
 # 若把三成员都设成 default-members，裸 `cargo run` 会因存在 aproxy 与
 # aproxy-format 两个二进制而报「could not determine which binary to run」；
 # 源码构建用的裸 `cargo build` 也会连带编译 aproxy-format，并按它的
-# rust-version 1.96.1 拒绝更旧的工具链，而 aproxy 本身只要求 1.88。
+# rust-version 1.96.1 拒绝更旧的工具链，而 aproxy 本身只要求 1.89。
 [workspace]
 members = [".", "aproxy-envelope", "aproxy-format"]
 resolver = "3"
@@ -19,11 +19,14 @@ resolver = "3"
 [package]
 name = "aproxy"
 version = "0.2.0-alpha.0"
-# edition 2024 本身要 1.85，实际下限由依赖树抬高到 1.88：src/decode.rs 引入的
-# ruzstd 要 1.87，url→idna→idna_adapter 拖进来的 icu_* 一族要 1.88（这些 crate
-# 在依赖图里是实打实被编译的，非可选）。声明出来，旧工具链会得到一条明确的
-# 「rustc 1.88 或更新」报错，而不是一堆看不懂的编译失败。
-rust-version = "1.88"
+# edition 2024 本身要 1.85，依赖树把下限抬到 1.88：src/decode.rs 引入的 ruzstd
+# 要 1.87，url→idna→idna_adapter 拖进来的 icu_* 一族要 1.88（这些 crate 在依赖图里
+# 是实打实被编译的，非可选）。本包自己再抬到 1.89：安装锁（永久兼容契约 C4 的
+# `<home>/install/lock`）用标准库的 File::lock / try_lock，它们在 1.89 稳定——Windows
+# 上是 LockFileEx，unix 上是 flock，进程死亡时由操作系统自动释放，不需要自己写平台
+# 代码。声明出来，旧工具链会得到一条明确的「rustc 1.89 或更新」报错，而不是一堆
+# 看不懂的编译失败。
+rust-version = "1.89"
 edition = "2024"
 description = "Local API proxy with infinite retries for agent workloads"
 license = "MIT"
@@ -108,7 +111,20 @@ ruzstd = "0.9.0"
 # 精确钉死 + CI --locked 双保险根除解析漂移。
 # Win32_System_Memory：看门狗共享内存心跳节（CreateFileMappingW/MapViewOfFile）。
 # Win32_System_Pipes：控制管道客户端核对服务端进程（GetNamedPipeServerProcessId）。
-windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Pipes"] }
+# Win32_Storage_FileSystem：交换时旧二进制让位用 MoveFileExW 且不带
+# MOVEFILE_REPLACE_EXISTING——std::fs::rename 在 Windows 上会覆盖已存在的目标，
+# 唯一中间名（永久兼容契约 C2）要的是「目标已存在就失败」。
+# Win32_System_Diagnostics_ToolHelp：强制安装最后报告「从 bin 运行、却不在台账里」
+# 的进程时枚举全部进程（CreateToolhelp32Snapshot）。
+windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp"] }
+
+[target.'cfg(unix)'.dependencies]
+# 进程台账（src/ledger.rs）结束进程时要用的系统调用：Linux 的 pidfd_open /
+# pidfd_send_signal（经 libc::syscall 与 SYS_* 常量）、macOS 的 proc_pidinfo（读
+# proc_bsdinfo 的启动时刻）。用 libc 而不是像别处那样手写 extern "C"：proc_bsdinfo
+# 的结构体布局与各架构的系统调用号手抄容易抄错，而 libc 已经经 tokio 在依赖图里，
+# 不增加编译闭包。
+libc = "0.2"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

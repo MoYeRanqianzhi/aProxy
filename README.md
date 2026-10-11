@@ -54,7 +54,7 @@ curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/
 ```sh
 npm install -g @meowo/aproxy     # 按平台自动选二进制；正式版发在 latest 标签
 npm install -g @meowo/aproxy@next  # 预发布发在 next 标签，需显式指定
-cargo install aproxy             # 源码编译，需 rustc 1.88+
+cargo install aproxy             # 源码编译，需 rustc 1.89+
 ```
 
 升级：`aproxy install`（在线下载链条自动滚动重启，逐实例无感；`--from <路径>` 本地安装、`--adopt` 收编既有安装）。

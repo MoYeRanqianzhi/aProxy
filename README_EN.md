@@ -114,7 +114,7 @@ standard location):
 ```sh
 npm install -g @meowo/aproxy     # picks the right binary; stable releases use the latest tag
 npm install -g @meowo/aproxy@next  # pre-releases use the next tag; ask for it explicitly
-cargo install aproxy             # builds from source; needs rustc 1.88+
+cargo install aproxy             # builds from source; needs rustc 1.89+
 ```
 
 Upgrades: `aproxy install` replaces the binary and rolling-restarts running

@@ -1,8 +1,10 @@
 # 0.2.0 计划
 
 > 状态（2026-10-11）：方向已由用户定下（见记忆 [0.2.0-direction](../memory/2026-10-11-0.2.0-direction.md)）；
-> 四路只读审查进行中，报告写到 `.agents/review/2026-10-11-0.2.0-audit/`（dataplane、control-plane、
-> config-cli-install、release-tests-docs）；实现尚未开始。审查收齐后先汇总、排序，再更新本计划。
+> 四路审查与综合已完成：`.agents/review/2026-10-11-0.2.0-audit/`（dataplane、control-plane、config-cli-install、
+> release-tests-docs，综合稿 synthesis.md：合并后 P0 16 条、工作流归属、待拍板决策 D-1…D-11、主代理可自定的
+> 设计点 §3.12）。综合稿的 D-10（alpha 不公开发布）被用户「先发 alpha.1 验证可信发布」的定调取代；§3.12 里
+> 「不建 aproxy-ipc / aproxy-ui crate」被用户「新增两个 crate」的提议取代（见 W5）。W1 实现中。
 
 ## 目标
 
@@ -67,14 +69,17 @@
   照样结束，排在最后。读者跳过解析不了的文件。写台账失败时告警但照常运行。
 - C4 安装状态收拢：一切安装者状态（状态文件、备料、下载临时文件）只能放在 `<home>/install/` 下，强制安装可随时整目录清空；
   `<home>/install/lock` 是操作系统级排他锁（进程死亡自动释放），任何版本修改 `bin/` 期间都要持有它。
-- C5 `--version`：标准输出第一行 `aproxy v<semver>`，后面可以跟 ` (…)`（如变体与目标三元组）；退出码 0；不读写 home、
-  不联网、不拉起任何进程。（这也让 0.1.0 的升级在交换前失败，见 W1。）
+- C5 `--version`：标准输出第一行 `aproxy v<semver> (<variant>; <target>[; x86-64-v3])`；退出码 0；不读写 home、
+  不联网、不拉起任何进程，并且在一切副作用之前短路——将来 i18n 在解析参数前读 settings.json 判定语言，`--version`
+  必须排在它前面（G2）。输出里任何以空白分隔的词都不得以数字开头（G6）：0.1.0 的安装器取「第一个以数字开头的词」
+  当版本，这条保证它在交换前失败（见 W1）。
 - C6 发布清单：每个主线 GitHub Release（tag `v<semver>`）都附 `aproxy-manifest.json`：
   `{"manifest":1,"version":"…","assets":[{"target":"<Rust 目标三元组>","variant":"desktop|headless","cpu":"baseline|x86-64-v3","file":"…","sha256":"…"}]}`。
   强制安装只靠它找资产，所以以后资产怎么改名都不影响旧版本的强制安装。
 - C7 命令行：`aproxy install --force [<版本>|latest] [--from <文件>] [--variant desktop|headless] [--yes]`，
   `aproxy upgrade --force` 等同 `install --force latest`；`aproxy restore` 子命令永远存在（强制安装后尽力调用它拉回实例）。
-  退出码冻结：0 完成；10 未做任何改动就中止；11 进程已停但二进制未替换；12 已替换但实例未全部拉回。
+  退出码冻结：0 完成；10 未做任何改动就中止；11 进程已停但二进制未替换；12 已替换但实例未全部拉回。通用退出码只用
+  0–5（G5，见 W2 的退出码表），10 起留给强制安装，互不重叠。
 - C8 流程顺序：
   1. 取得目标（C6 清单或 `--from`）放进 `<home>/install/force/`，校验 sha256，在本机执行 `--version` 并核对版本；
      失败即退出码 10，什么都没动（例如 Linux 上缺 webkit2gtk 跑不了带 UI 的版本，就在这里挡住并提示 `--variant headless`）。
@@ -91,6 +96,9 @@
   7. 另外报告不在台账里、但从 `<home>/bin/` 运行的进程（例如 0.1.0 留下的），只报告、不结束。
 - 强制安装从不读写配置、settings、日志、注册表，也不走 IPC。由桌面界面发起时，界面先把强制安装作为独立进程拉起再退出
   （它自己也在被结束之列）。
+
+**两层表述（G4）**：C1–C8 里，结构与语义「绝对冻结」（永不改动）；JSON 格式「只增不改」（可追加可选字段，读者忽略
+未知字段）。台账与实例注册记录分开（G3）：注册记录可随意演进，台账只承担「找到并结束这个进程」。
 
 **不冻结**：IPC、注册表与 `.restore` 格式、install.state 的内容、配置文件、日志、下载渠道与资产命名（C6 之外）、`restore`
 的具体语义——这些都可以随意演进。

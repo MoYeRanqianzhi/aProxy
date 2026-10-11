@@ -16,7 +16,8 @@
 use super::{Artifact, Channel, DownloadCtx, Fetched, download_to};
 use std::path::Path;
 
-const REPO: &str = "MoYeRanqianzhi/aProxy";
+/// 发布所在的 GitHub 仓库（owner/name）。
+pub const REPO: &str = "MoYeRanqianzhi/aProxy";
 
 /// release 的资产（name → browser_download_url）。
 #[derive(Debug)]

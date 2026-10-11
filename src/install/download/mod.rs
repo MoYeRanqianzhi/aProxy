@@ -240,32 +240,38 @@ pub struct DownloadCtx {
     pub variant: &'static str,
 }
 
+/// 本机是否选 x86-64-v3 档的产物（发布的 -v3 产物以 `-C target-cpu=x86-64-v3` 构建）：
+/// CPU 支持 AVX2 就选。普通在线安装与强制安装共用这一条规则。AVX2 检测只在 x86 目标上
+/// 可用（aarch64 等目标上 is_x86_feature_detected! 编译不过——CI unix job 曾因此全红），
+/// 其余目标恒为 false。
+pub fn prefers_x86_64_v3() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
 impl DownloadCtx {
-    /// 组装：target 取构建三元组；变体按运行时指令集自动选择（AVX2 →
-    /// -v3，失败回退 baseline；`--variant` 手动覆盖）；代理按
-    /// download_proxy（显式）→ 环境变量（reqwest 默认）两级。
+    /// 组装：target 取构建三元组；指令集档按运行时检测（见 [`prefers_x86_64_v3`]，
+    /// `--cpu` 手动覆盖，取值 `x86-64-v3` | `baseline`）；代理按 download_proxy（显式）
+    /// → 环境变量（reqwest 默认）两级。
     pub fn build(
         version: &str,
         download_proxy: Option<&str>,
-        variant_override: Option<&str>,
+        cpu_override: Option<&str>,
     ) -> Result<Self, String> {
-        let variant = match variant_override {
-            Some("v3") => "-v3",
+        let variant = match cpu_override {
+            Some("x86-64-v3") => "-v3",
             Some("baseline") => "",
-            Some(other) => return Err(format!("未知变体 {other}（取值 v3 | baseline）")),
-            None => {
-                // AVX2 检测仅 x86 可用（aarch64 等 target 上该宏编译失败——
-                // CI unix job 曾因此全红）；非 x86 目标恒 baseline
-                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-                let variant = if std::arch::is_x86_feature_detected!("avx2") {
-                    "-v3"
-                } else {
-                    ""
-                };
-                #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-                let variant = "";
-                variant
+            Some(other) => {
+                return Err(format!("未知指令集档 {other}（取值 x86-64-v3 | baseline）"));
             }
+            None if prefers_x86_64_v3() => "-v3",
+            None => "",
         };
         let mut builder = reqwest::Client::builder()
             .user_agent(format!("aproxy-install/{version}"))

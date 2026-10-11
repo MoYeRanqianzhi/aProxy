@@ -53,8 +53,13 @@ pub fn probe_version(bin: &Path) -> Result<String, String> {
     if !out.status.success() {
         return Err(format!("{} --version 退出非零", bin.display()));
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    if let Some(version) = parse_version_line(&stdout) {
+    version_of(bin, &String::from_utf8_lossy(&out.stdout))
+}
+
+/// 从 `bin --version` 的输出里取版本号：首行是永久格式（C5）就取出来；是 0.1.x 的
+/// 格式就按版本下限说明它为什么装不了、怎样回到 0.1.x；其余的报格式不对。
+pub fn version_of(bin: &Path, stdout: &str) -> Result<String, String> {
+    if let Some(version) = parse_version_line(stdout) {
         return Ok(version);
     }
     // 0.1.x 输出 `aproxy <版本>`（没有 v）。`--from` 指向 0.1.x 的二进制时，按版本

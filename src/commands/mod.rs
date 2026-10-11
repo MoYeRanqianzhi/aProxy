@@ -117,4 +117,46 @@ mod tests {
             "与 --abort 等仍互斥"
         );
     }
+
+    #[test]
+    fn force_install_flags_parse() {
+        let parse = |args: &[&str]| {
+            crate::cli::Cli::try_parse_from(std::iter::once("aproxy").chain(args.iter().copied()))
+        };
+        let install = |args: &[&str]| match parse(args).unwrap().command {
+            Some(crate::cli::Commands::Install(a) | crate::cli::Commands::Upgrade(a)) => a,
+            other => panic!("{args:?} 解析成了 {other:?}"),
+        };
+        let a = install(&[
+            "upgrade",
+            "--force",
+            "latest",
+            "--yes",
+            "--variant",
+            "headless",
+        ]);
+        assert!(a.force && a.yes);
+        assert_eq!(a.version.as_deref(), Some("latest"));
+        assert_eq!(a.variant.as_deref(), Some("headless"));
+        let a = install(&["install", "--force", "--from", "x", "--yes"]);
+        assert_eq!(a.from.as_deref(), Some("x"));
+        let a = install(&["install", "--cpu", "x86-64-v3"]);
+        assert!(!a.force);
+        assert_eq!(a.cpu.as_deref(), Some("x86-64-v3"));
+        // 只属于强制安装的参数离不开 --force；--force 与普通安装的特殊模式互斥；
+        // VERSION 与 --from 互斥；变体与指令集档只认列出的取值
+        for args in [
+            &["install", "--yes"][..],
+            &["install", "--variant", "headless"],
+            &["install", "--force", "--skills-only"],
+            &["install", "--force", "--adopt"],
+            &["install", "--force", "--abort"],
+            &["install", "--force", "0.2.0", "--from", "x"],
+            &["install", "--force", "--variant", "gui"],
+            &["install", "--force", "--cpu", "x86-64-v4"],
+            &["install", "--force", "--from", "x", "--cpu", "baseline"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
+    }
 }

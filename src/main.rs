@@ -48,6 +48,17 @@ async fn main() {
         return;
     }
 
+    // 强制安装（永久兼容契约 C7、C8，见 aproxy::install::force）在这里分流，排在定位
+    // 配置文件、settings 检查与拉起续作之前：它不读配置与 settings.json——要修的
+    // 可能正是它们，损坏的 settings.json 不能挡住修复它的手段；它也不能拉起续作，
+    // 续作要推进的那个安装正是它要清掉的
+    if let Some(Commands::Install(args) | Commands::Upgrade(args)) = &cli.command
+        && args.force
+    {
+        server::init_foreground_logging();
+        commands::install::handle_force_cmd(args).await;
+    }
+
     // 实际生效的配置文件路径（default_config 失效时为 Err）。只在真正要读配置
     // 的命令里兑现，见 commands::resolve_cfg_path
     let cfg_path = commands::resolve_cfg_path(&cli);

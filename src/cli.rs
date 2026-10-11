@@ -170,6 +170,7 @@ pub(crate) enum Commands {
     /// 在线安装走下载链条（github → npm → cargo-binstall → cargo，可配
     /// settings 的 download_chain/url 模板与 --download-proxy）；中断自动续作。
     /// 某实例在新版本下起不来时用旧二进制把它拉回并中止滚动（命令返回非零）。
+    /// 普通安装失败或卡住时，`install --force` 结束全部 aproxy 进程后直接换二进制。
     Install(InstallArgs),
 
     /// `aproxy install` 的别名（可发现性）
@@ -186,7 +187,7 @@ pub(crate) struct InstallArgs {
     /// 正式版，pre 通道含预发布；通道见 --pre）或具体版本号（如
     /// 0.2.0-alpha.1）。latest 不高于当前版本时提示「已是最新」不重装。
     /// 默认拒绝降级（--allow-downgrade 放行）；低于 0.2.0 的版本一律拒绝。
-    /// 与 --from/--adopt 互斥。
+    /// 加 --force 时不与当前版本比较，总是安装。与 --from/--adopt 互斥。
     #[arg(value_name = "VERSION", conflicts_with_all = ["from", "adopt", "abort"])]
     pub(crate) version: Option<String>,
 
@@ -206,10 +207,30 @@ pub(crate) struct InstallArgs {
     #[arg(long, conflicts_with_all = ["from", "adopt", "version"])]
     pub(crate) abort: bool,
 
-    /// 手动指定指令集变体（默认按运行时检测：AVX2 → -v3，否则 baseline）。
-    /// 取值 `v3` 或 `baseline`。
-    #[arg(long, value_name = "VARIANT", value_parser = ["v3", "baseline"])]
+    /// 强制安装：不走交接，按进程台账结束这个 home 下全部 aproxy 进程（实例、看护者、
+    /// 安装者、桌面界面），换上新二进制，再用新版本的 restore 按原参数恢复实例。普通
+    /// 安装失败、卡住，或装着的版本坏了时用；会中断所有经 aproxy 的在途请求，先确认
+    /// （非交互环境加 --yes）。目标取 VERSION（默认 latest）或 --from；隐含允许降级，
+    /// 低于 0.2.0 的版本仍不装；不更新 skill 文档。退出码：0 完成；10 什么都没改；
+    /// 11 进程已停、二进制没换；12 二进制已换、有实例没恢复
+    #[arg(long, conflicts_with_all = ["adopt", "abort", "skills_only", "continue_"])]
+    pub(crate) force: bool,
+
+    /// 强制安装不再询问确认（非交互环境必须加）。加之前先向用户确认可以中断经
+    /// aproxy 的在途请求
+    #[arg(long, requires = "force")]
+    pub(crate) yes: bool,
+
+    /// 强制安装的变体：desktop（带桌面界面）或 headless（无界面）；默认与正在运行的
+    /// 这个 aproxy 相同。带界面的版本在缺少界面系统库的 Linux 上跑不起来，这时用
+    /// headless
+    #[arg(long, value_name = "VARIANT", value_parser = ["desktop", "headless"], requires = "force")]
     pub(crate) variant: Option<String>,
+
+    /// 指令集档：x86-64-v3 或 baseline（默认按本机 CPU：支持 AVX2 → x86-64-v3，否则
+    /// baseline；只有 x86_64 的部分目标发布 x86-64-v3 档）
+    #[arg(long, value_name = "CPU", value_parser = ["x86-64-v3", "baseline"], conflicts_with_all = ["from", "adopt", "abort"])]
+    pub(crate) cpu: Option<String>,
 
     /// 允许降级安装（目标版本 < 当前已安装版本时默认拒绝）；低于 0.2.0 的版本
     /// 仍然拒绝
@@ -225,6 +246,7 @@ pub(crate) struct InstallArgs {
 
     /// 仅本次下载使用的代理 URL（与 config.toml 的请求代理绝对分离）；
     /// 未指定时用 settings 的 download_proxy，再未配置则走系统环境代理
+    /// （--force 不读 settings：只用这个参数，没给就走系统环境代理）
     #[arg(long, value_name = "URL")]
     pub(crate) download_proxy: Option<String>,
 

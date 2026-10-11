@@ -5,6 +5,36 @@
 
 use crate::cli::InstallArgs;
 
+/// `install --force` / `upgrade --force`（永久兼容契约 C7、C8，流程见
+/// aproxy::install::force）。main 在读配置与 settings.json 之前就分流到这里。
+///
+/// 先把本进程作为安装者登记进台账：另一个强制安装据此结束它（后来的结束先来的），
+/// 本进程结束安装者时跳过自己的 pid。退出走 ledger::exit，删掉自己的条目。
+pub(crate) async fn handle_force_cmd(args: &InstallArgs) -> ! {
+    use aproxy::install::force;
+    let home = aproxy::settings::home();
+    let _ledger = aproxy::ledger::register(
+        &home,
+        aproxy::ledger::ROLE_INSTALLER,
+        None,
+        Some("install --force"),
+    );
+    let source = match &args.from {
+        Some(from) => force::ForceSource::File(aproxy::settings::expand_path(from)),
+        None => force::ForceSource::Online(args.version.clone()),
+    };
+    let request = force::ForceRequest {
+        source,
+        variant: args.variant.clone(),
+        cpu: args.cpu.clone(),
+        pre: args.pre,
+        yes: args.yes,
+        download_proxy: args.download_proxy.clone(),
+    };
+    let code = force::run(&home, &request).await;
+    aproxy::ledger::exit(code)
+}
+
 /// 入口分派：--abort / --from / --adopt / --continue（续作）/ 无参提示。
 pub(crate) async fn handle_install_cmd(args: InstallArgs) {
     let home = aproxy::settings::home();
@@ -173,7 +203,7 @@ async fn run_skills_only(args: &InstallArgs) {
     let ctx = match aproxy::install::download::DownloadCtx::build(
         env!("CARGO_PKG_VERSION"),
         proxy,
-        args.variant.as_deref(),
+        args.cpu.as_deref(),
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -235,7 +265,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     let ctx = match aproxy::install::download::DownloadCtx::build(
         env!("CARGO_PKG_VERSION"),
         proxy,
-        args.variant.as_deref(),
+        args.cpu.as_deref(),
     ) {
         Ok(c) => c,
         Err(e) => {

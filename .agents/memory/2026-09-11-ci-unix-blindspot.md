@@ -62,7 +62,7 @@ Recheck when：ci.yml 的 job 结构变化，或 macOS 支持完成。
 
 ## 复发（2026-10-06，IPC 提交 B faf551d 后 ubuntu 连红三次）
 
-本机仍无法编译 Linux（WSL 工具链坏、无交叉 gcc）。三个坑，每个都是「Windows 上不存在的路径」：
+本机当时无法编译 Linux（WSL 工具链坏、无交叉 gcc；2026-10-12 起编译面可在本机检查，见文末）。三个坑，每个都是「Windows 上不存在的路径」：
 1. 只被 `cfg(windows)` 代码与测试调用的函数，在 unix 非测试构建里是死代码——clippy `-D warnings`
    报错。写跨平台模块时，凡调用方带平台门控，被调函数也要 `#[cfg(any(windows, test))]` 之类。
 2. 调整启动顺序（控制端点先于注册表）后，unix socket 所在的 run 目录可能还没被任何人创建。
@@ -76,6 +76,19 @@ Recheck when：ci.yml 的 job 结构变化，或 macOS 支持完成。
 **How to apply**：改了 unix 路径（`cfg(unix)`、socket、/proc、/dev/shm、文件顺序）的提交推送后，
 先等 ubuntu job 结论再叠加下一步；手上有半成品时用 `git stash` 先单独提交修复（本次三次都这样处理，
 未丢工作）。
+
+## 2026-10-12：Linux 的编译面可以在 Windows 上先查
+
+`cargo check` / `cargo clippy --target x86_64-unknown-linux-gnu --workspace --all-targets --no-default-features --locked`
+在 Windows 开发机上能跑通：需要 rustup 装了 `x86_64-unknown-linux-gnu` 目标的 rust-std，以及一个 clang 当 C 编译器
+（`CC_x86_64_unknown_linux_gnu=clang`、`AR_x86_64_unknown_linux_gnu=llvm-ar`）。唯一要编 C 的依赖 ring 只缺三个系统头文件：
+`assert.h`（`#define assert(x) ((void)0)`）、`string.h`（memcpy/memset/memmove/memcmp/strlen 的声明）、`stdlib.h`
+（malloc/free/posix_memalign/abort 的声明），写成桩放进一个目录，用 `CFLAGS_x86_64_unknown_linux_gnu="-isystem <目录>"`
+指过去即可——check 不链接，桩够用。它只验证 unix 分支的编译与 clippy（上面第 1、4 类坑在这一步就能暴露），
+不运行测试；带 desktop 特性的构建要 GTK/WebKit 的 pkg-config，macOS 目标也查不了，这两样仍靠 CI。
+
+**Evidence:** W2b（2026-10-12）推送前用它把台账、交换、强制安装与新测试的 unix 分支查到 check、clippy 全过。
+**Recheck when:** ring 换版本或换掉 ring（缺的头文件可能变）、改用带 desktop 特性检查。
 
 相关：[[2026-09-11-never-kill-aproxy-by-name]]、[[2026-09-11-install-pitfalls]]、
 [[2026-09-12-install-online-deep-test]]

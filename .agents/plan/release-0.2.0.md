@@ -88,6 +88,21 @@
     不懂的消息。这是信封冻结后仍能演进的关键。
   - aproxy-format 用 switchyard 的流式接口，按 Anthropic、OpenAI Chat、OpenAI Responses 各自分帧实现真正的流式转换。
 
+### W2 的 format 定稿补充（用户 2026-10-12）
+- **回信带结构化说明 `report`**（可选、推荐）：`summary` 一句给人看的话 + `actions` 列表；`actions` 用一张只增不改的标准
+  类型表（如 protocol_convert{from,to}、key_select{key_id}、route{channel,model_from,model_to}、custom{label}），界面按类型
+  显示图标并做多语言渲染，不认识的类型显示 `label`。aproxy 每个请求记一行日志列出链上各程序的说明，界面日志详情的「转换」
+  页签按步展示。说明里不得出现明文 key，只写编号或打码尾号（协议文档写明）。
+- **准入阶段 `admit`（并发限制与排队）**：每次发往上游之前（含重试）问 format「现在能发吗」；能就发，不能就进队列，可附原因
+  与建议多久后再问。有请求完成腾出位置、或建议时间到了，只问队首，放一个再问下一个。排队不算失败，客户端心跳照发；队列
+  长度、等待时长、原因在 status 与界面可见。**生命周期通知**：尝试开始/结束、用量、上游的限流响应头都通知 format（不等回复），
+  format 据此实现每分钟/同时在线/每小时、订阅 5 小时与每周额度等任意规则，或自己查上游状态接口；用量统计、按 key 限速、
+  预算上限也建在这条通知上。护栏：配置里的静态并发上限是默认值，format 动态覆盖；format 崩溃或超时回落到静态上限，没配
+  上限就放行，绝不因 format 坏了卡死队列；format 可一次批准「接下来 N 个 / T 时间内」以减少询问。跨实例共用一把 key 时，
+  需要 format 自己共享状态（协议不拦）。订阅额度的读法先实测真实响应头再定，不靠猜。
+- 排期：`report`、`admit`、生命周期通知的形状写进 0.2.0 协议定稿；aproxy 的排队放行与官方 aproxy-format 的规则实现放 0.2.0
+  之后紧接着（握手保证以后只加不改）。
+
 ### W2c 官方 aproxy-format 的能力（用户 2026-10-12：不必全支持，但大部分功能要有可用的官方实现，让大多数情况直接用官方程序）
 - 现状：协议转换（Anthropic Messages / OpenAI Chat / OpenAI Responses）只支持非流式，SSE 原样透传；key 轮换（轮流、加权）；
   按模型把请求路由到渠道（newapi 式聚合）；`client_format = "auto"` 只能路由到同协议渠道。只认旧的三段信封。
@@ -108,7 +123,8 @@
 - **易用性**：`aproxy-format init` 按常见场景生成起步配置（Claude Code 接 OpenAI 兼容中转、多 key 轮换、OpenRouter 等）；
   `aproxy-format check` 校验配置；`aproxy-format try` 用一条样例请求干跑整条处理链、打印每步结果。常见错误模式与渠道写法
   作为配置片段放在文档与 skill 里，不做隐藏的内置特例（记忆 features-are-config）。
-- **以后再说**：用量与费用统计（JSONL）、按 key 限速、预算上限、Gemini 协议、embeddings/图片等非对话接口。
+- 近期（0.2.0 之后紧接着，见 TODO）：用量与费用统计、按 key 限速、预算上限、Gemini 协议、并发限制与排队。以后可能会做
+  （低优先级）：embeddings、图片等非对话接口。
 - aproxy-format skill 随之重写配方。format 线版本：协议改为新信封后发 aproxy-format 0.2.0，与 aproxy 0.2.0 同期。
 
 ### W2b 强制安装：永久兼容契约（用户 2026-10-11 要求「从现在开始保持绝对兼容」；设计稿，待用户确认）

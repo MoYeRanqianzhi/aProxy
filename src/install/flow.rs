@@ -23,8 +23,7 @@
 //! - 中断语义：任何时刻崩溃/被杀 → install.state 残留，`continue_install`
 //!   从残留 phase 幂等续作（断电恢复矩阵的执行体）。
 //!
-//! 无实例快路径：broadcasting 直接跳过（restarting 为空）。relaying 阶段只由
-//! 0.1.0 的安装器写入（它在 Windows 交换后接力），本版本不再进入。
+//! 无实例快路径：broadcasting 直接跳过（restarting 为空）。
 
 use std::path::Path;
 
@@ -320,7 +319,7 @@ async fn run_forward(
 
 /// 谁来驱动交换及之后的一切：目标不比本进程旧（升级、同版本重装）就交给目标
 /// 二进制；降级由本进程驱动——较新的一方认得较旧一方的记录与方言，反过来不
-/// 成立（0.1.0 就不认 `--handover-from`）。版本号解析不了时不交，本进程自己驱动。
+/// 成立。版本号解析不了时不交，本进程自己驱动。
 fn target_drives(target: &str) -> bool {
     match (
         semver::Version::parse(target),
@@ -716,9 +715,9 @@ pub async fn continue_install(
     // 用户排除原因后显式重新执行 install（新安装接管 stale 残留）收尾。
     if state.phase == InstallPhase::Failed && state.halted {
         // 例外：快照里的实例其实都已从规范位置的新二进制、以目标版本正常服务
-        // （例如 0.1.0 的安装器在 Windows 上没等到接力者确认，自己核验时找不到
-        // 新实例而判了失败）。没有什么可重试的，收尾清场——否则这份现场会让
-        // 看护者每天拉起一次注定被拒的续作，`install latest` 又报「已是最新」
+        // （例如用户排除原因后用 `aproxy restore` 把下线的实例从新二进制拉了
+        // 起来）。没有什么可重试的，收尾清场——否则这份现场会让看护者每天拉起
+        // 一次注定被拒的续作，`install latest` 又报「已是最新」
         if fleet_already_on_target(home, run_dir, &state).await {
             tracing::info!(target = %state.target_version, "失败现场的实例均已在目标版本上运行，收尾清场");
             super::state::remove_in(run_dir);
@@ -731,19 +730,12 @@ pub async fn continue_install(
     }
     // 接管判定：常规 stale（超时+原进程死）或宣告心跳过期（runtime 挂死
     // 的即时证据）。原安装进程健康 → 不动（并发防重；误触发的 --continue 与
-    // 健康安装并存时拒绝是正确行为）。两条豁免，安装者此刻都活着、在等接手：
-    // - 指名接手：安装者以 `--handover-from <它的 pid>` 拉起本进程，且状态文件
-    //   仍归它（installer_pid 相同）。CLI 入口与看护者拉起的续作不带这个参数，
-    //   不会与指名的接手者抢同一个安装。
-    // - relaying：0.1.0 的安装器在 Windows 交换后写下它、再拉起 bin 里的
-    //   `install --continue`（不带参数）。只为从 0.1.0 原地升级保留，0.2.0 随
-    //   compat_0_1_0 一起删除。
+    // 健康安装并存时拒绝是正确行为）。豁免指名接手：安装者此刻活着、在等接手，
+    // 它以 `--handover-from <它的 pid>` 拉起本进程，且状态文件仍归它
+    // （installer_pid 相同）。CLI 入口与看护者拉起的续作不带这个参数，不会与
+    // 指名的接手者抢同一个安装。
     let named = handover_from.is_some_and(|pid| pid == state.installer_pid);
-    let relayed_by_0_1_0 = state.phase == InstallPhase::Relaying;
-    if !named
-        && !relayed_by_0_1_0
-        && !super::state::is_takeable(run_dir, &state, crate::watchdog::now_secs())
-    {
+    if !named && !super::state::is_takeable(run_dir, &state, crate::watchdog::now_secs()) {
         return Err(format!(
             "安装仍在进行（phase {:?}，pid {}），不重复接管",
             state.phase, state.installer_pid
@@ -758,7 +750,6 @@ pub async fn continue_install(
     // 安装时，failed 与 skipped 都不自动重跑（failed 避免每次续作都拖一遍
     // 下载，--skills-only 手动重试；skipped 是用户的 --no-skills）
     let skill_should_run = !named
-        && !relayed_by_0_1_0
         && !matches!(
             state.skill.as_ref().map(|s| s.status),
             Some(SkillPhase::Failed | SkillPhase::Skipped)
@@ -813,7 +804,6 @@ pub async fn continue_install(
                 }
                 // 交换完成及以后：新 bin 已在规范位置——直接进尾部（滚动/终验/清理）
                 InstallPhase::Swapped
-                | InstallPhase::Relaying
                 | InstallPhase::Restarting
                 | InstallPhase::Verifying
                 | InstallPhase::Cleaning => {

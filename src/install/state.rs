@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 ///
 /// ```text
 /// marking → downloading → downloaded → broadcasting → acked
-///         → swapping → swapped → relaying → restarting → verifying → cleaning → done
+///         → swapping → swapped → restarting → verifying → cleaning → done
 /// 失败/中止：failed（保留现场，续跑重试）| aborted（干净回滚，终态）
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -37,10 +37,6 @@ pub enum InstallPhase {
     Acked,
     Swapping,
     Swapped,
-    /// 只由 0.1.0 的安装器写入：它在 Windows 交换后接力给 bin 里的新二进制。
-    /// 本版本改为指名交棒（`--handover-from`），不再进入这个阶段；词表冻结，
-    /// 续作照常认它
-    Relaying,
     Restarting,
     Verifying,
     Cleaning,
@@ -59,7 +55,6 @@ impl InstallPhase {
         InstallPhase::Acked,
         InstallPhase::Swapping,
         InstallPhase::Swapped,
-        InstallPhase::Relaying,
         InstallPhase::Restarting,
         InstallPhase::Verifying,
         InstallPhase::Cleaning,
@@ -75,9 +70,9 @@ impl InstallPhase {
     }
 }
 
-/// 迁移合法性：线性主线只允许前进一格；三条**快路径跨段**显式白名单
-/// （无实例时 broadcasting/restarting 为空操作、续作接管从 swapped 重入，
-/// 跳过的是空操作段而非逻辑）；任意运行阶段可转 failed（保留现场）；
+/// 迁移合法性：线性主线只允许前进一格；两条**快路径跨段**显式白名单
+/// （无实例时 broadcasting/restarting 为空操作，跳过的是空操作段而非逻辑）；
+/// 任意运行阶段可转 failed（保留现场）；
 /// --abort 仅 swapping 前可完全回滚（ack 及之前）——此后只进不退；
 /// failed 续跑从 downloading 重来（幂等重下）。终态无出边（重装 = 删状态
 /// 文件重新 create_new）。
@@ -88,10 +83,9 @@ pub fn can_transition(from: InstallPhase, to: InstallPhase) -> bool {
             || j == i + 1
             || matches!(
                 (from, to),
-                // 无实例快路径：广播空集合是 no-op，跳过 Broadcasting/Acked
+                // 无实例快路径：广播空集合是 no-op，跳过 Broadcasting/Acked；
+                // 滚动空集合同理，跳过 Restarting
                 (Downloaded, Swapping)
-                // 续作接管（swapped 残留）：跳过空 relaying 直进滚动/终验
-                | (Swapped, Restarting)
                 | (Swapped, Verifying)
             );
     }
@@ -407,7 +401,6 @@ mod tests {
         // 隔行跳跃全部拒绝（快路径白名单对与重入对角线除外）
         let skips = [
             (InstallPhase::Downloaded, InstallPhase::Swapping),
-            (InstallPhase::Swapped, InstallPhase::Restarting),
             (InstallPhase::Swapped, InstallPhase::Verifying),
         ];
         for i in 0..InstallPhase::RUN_ORDER.len() {
@@ -438,7 +431,7 @@ mod tests {
         for p in [Marking, Downloading, Downloaded, Broadcasting, Acked] {
             assert!(can_transition(p, Aborted), "{p:?} → aborted 应合法");
         }
-        for p in [Swapping, Swapped, Relaying, Restarting, Verifying, Cleaning] {
+        for p in [Swapping, Swapped, Restarting, Verifying, Cleaning] {
             assert!(!can_transition(p, Aborted), "{p:?} → aborted 应非法");
         }
         // failed 续跑从 downloading 重来

@@ -163,7 +163,6 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     // 直接复用 `state.stats` 这**同一份**：此处曾另建一个 IpcStats 只共享活动
     // 时间戳，导致「请求 / 重试 / 最近错误」对任何实例都恒为 0（时间戳正常掩盖了它）。
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let ipc_port = port.clone();
     let control = std::sync::Arc::new(daemon::ControlState {
         record: info.clone(),
         run_dir: daemon::run_dir().display().to_string(),
@@ -171,7 +170,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
         on_shutdown: stop_tx,
     });
     tokio::spawn(async move {
-        daemon::serve_ipc(ipc_endpoint, &ipc_port, control).await;
+        daemon::serve_ipc(ipc_endpoint, control).await;
     });
 
     // 看门狗心跳（共享内存节）：独立 ticker 每 10s 写一次毫秒时间戳——挂死的

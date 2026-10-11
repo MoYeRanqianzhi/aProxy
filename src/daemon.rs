@@ -139,11 +139,8 @@ pub fn port_of(listen_addr: &str) -> &str {
 
 /// 实例的注册记录：`run/<端口>.pid` 的内容，也是 IPC 状态快照里的 `instance`。
 ///
-/// 字段名与 0.1.0 写下的逐字一致，且全部必填：0.1.0 在原地升级途中会读新版本
-/// 的记录（它要求 pid/version/listen_addr/config_path/base_url/started_at 都在，
-/// 解析不了就把文件删掉），新版本也直接读 0.1.0 的记录（0.1.0 写的字段是这里的
-/// 超集，多出来的被忽略）。改名、删字段或新增必填字段都会破坏其中一个方向，
-/// 见 tests/compat_v0_1_0.rs；新字段只能是可缺省的。
+/// 字段全部必填。原地升级时新旧两个版本同时在跑，会读对方写下的记录：改名、
+/// 删字段或新增必填字段，另一个版本就读不懂这份记录了，所以新字段只能是可缺省的。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct InstanceRecord {
     pub pid: u32,
@@ -220,8 +217,7 @@ pub struct LastError {
 
 /// 控制协议版本，请求与应答都带它（字段 `v`）。只有语义不兼容的变更才递增；
 /// 加 op、加可选参数、加应答字段、加错误码、加状态值都不递增——双方都忽略
-/// 不认识的字段，不认识的状态读作 `Unknown`。0.1.0 的格式没有 `v` 字段，
-/// 由 compat_0_1_0 单独应对。
+/// 不认识的字段，不认识的状态读作 `Unknown`。
 pub const IPC_VERSION: u32 = 1;
 
 /// 控制操作。线上是一行 JSON：`{"v":1,"op":"<snake_case 名>"}`，可带
@@ -362,27 +358,18 @@ pub async fn ipc_request_in(
     request_in(run_dir, port, op).await
 }
 
-/// 按 run 目录与端口寻址：先找命名空间端点；那里没有实例时，按 0.1.0 兼容
-/// 规则试旧端点（条件见 compat_0_1_0::legacy_endpoint_for）。
+/// 按 run 目录与端口寻址：端点带 run 目录的命名空间（见 `endpoint_for_in`）。
 async fn request_in(
     run_dir: &std::path::Path,
     port: &str,
     op: IpcOp,
 ) -> Result<InstanceStatus, IpcError> {
-    match request_raw(&endpoint_for_in(run_dir, port), op).await {
-        Err(IpcError::Unreachable(e)) => {
-            match crate::compat_0_1_0::legacy_endpoint_for(run_dir, port).await {
-                Some(legacy) => request_raw(&legacy, op).await,
-                None => Err(IpcError::Unreachable(e)),
-            }
-        }
-        other => other,
-    }
+    request_raw(&endpoint_for_in(run_dir, port), op).await
 }
 
 /// 按显式端点发送 IPC 请求并等待应答（3 秒超时）。按实例寻址请用
-/// `ipc_request_in`：它负责端点命名空间与 0.1.0 兼容回退。
-pub(crate) async fn request_raw(endpoint: &str, op: IpcOp) -> Result<InstanceStatus, IpcError> {
+/// `ipc_request_in`：它负责端点命名空间。
+async fn request_raw(endpoint: &str, op: IpcOp) -> Result<InstanceStatus, IpcError> {
     let request = op.request_line();
     let fut = imp::exchange(endpoint, &request);
     let (line, peer) = match tokio::time::timeout(Duration::from_secs(3), fut).await {
@@ -400,9 +387,8 @@ pub(crate) async fn request_raw(endpoint: &str, op: IpcOp) -> Result<InstanceSta
         IpcError::Protocol(m) => IpcError::Protocol(format!("{endpoint}: {m}")),
         other => other,
     })?;
-    // 应答者自报的 pid 必须就是连接对端的进程：普查、0.1.0 兼容回退与 stop
-    // 都按这个 pid 认实例，而端点名可以预测，任何本机进程都可能抢先占住它、
-    // 冒充实例应答
+    // 应答者自报的 pid 必须就是连接对端的进程：普查与 stop 都按这个 pid 认
+    // 实例，而端点名可以预测，任何本机进程都可能抢先占住它、冒充实例应答
     if let Some(peer) = peer
         && status.instance.pid != peer
     {
@@ -414,13 +400,10 @@ pub(crate) async fn request_raw(endpoint: &str, op: IpcOp) -> Result<InstanceSta
     Ok(status)
 }
 
-/// 解析一行应答。带 `v` 的是 v1；不带的来自 0.1.0 的守护（S4）。
+/// 解析一行 v1 应答。
 fn parse_reply(line: &str) -> Result<InstanceStatus, IpcError> {
     let value: serde_json::Value = serde_json::from_str(line)
         .map_err(|e| IpcError::Protocol(format!("应答不是 JSON：{e}")))?;
-    if value.get("v").is_none() {
-        return crate::compat_0_1_0::parse_legacy_reply(value);
-    }
     let reply: WireResponse = serde_json::from_value(value)
         .map_err(|e| IpcError::Protocol(format!("应答格式不符：{e}")))?;
     if reply.v != IPC_VERSION {
@@ -464,18 +447,13 @@ pub struct ControlState {
 }
 
 /// 在已创建的端点上提供控制服务，直到进程退出。
-pub async fn serve_ipc(endpoint: IpcEndpoint, port: &str, state: Arc<ControlState>) {
-    #[cfg(windows)]
-    crate::compat_0_1_0::serve_legacy_pipe(port, state.clone());
-    #[cfg(unix)]
-    let _ = port;
+pub async fn serve_ipc(endpoint: IpcEndpoint, state: Arc<ControlState>) {
     imp::accept_loop(endpoint.0, state).await
 }
 
-/// 在给定端点名上创建并提供控制服务（0.1.0 兼容管道与测试用）。只有创建
-/// 失败会返回。
-#[cfg(any(windows, test))]
-pub(crate) async fn serve_endpoint(endpoint: String, state: Arc<ControlState>) -> io::Result<()> {
+/// 在给定端点名上创建并提供控制服务（测试用）。只有创建失败会返回。
+#[cfg(test)]
+async fn serve_endpoint(endpoint: String, state: Arc<ControlState>) -> io::Result<()> {
     let listener = imp::bind(&endpoint).await?;
     imp::accept_loop(listener, state).await;
     Ok(())
@@ -1175,14 +1153,6 @@ where
     Ok(line)
 }
 
-/// 请求用的是哪种格式，应答就回哪种。
-#[derive(Clone, Copy, Debug)]
-enum Dialect {
-    V1,
-    /// 0.1.0 的 CLI 与安装器（请求没有 `v`），见 compat_0_1_0
-    Legacy,
-}
-
 /// 处理一条 IPC 连接：读请求行 → 执行 → 回应答行。
 async fn handle_conn<S>(stream: S, state: Arc<ControlState>) -> io::Result<()>
 where
@@ -1206,18 +1176,13 @@ where
         }
         Err(_) => return Ok(()),
     }
-    let (dialect, op) = match parse_request(&line) {
-        Ok(parsed) => parsed,
+    let op = match parse_request(&line) {
+        Ok(op) => op,
         Err(reply) => return write_line(&mut writer, &reply).await,
     };
     if op == IpcOp::PrepareSwap {
         if *state.on_shutdown.borrow() {
-            let reply = match dialect {
-                Dialect::V1 => {
-                    error_reply(error_code::INVALID_STATE, "实例正在退出，不再进入更换阶段")
-                }
-                Dialect::Legacy => crate::compat_0_1_0::legacy_reply(None),
-            };
+            let reply = error_reply(error_code::INVALID_STATE, "实例正在退出，不再进入更换阶段");
             return write_line(&mut writer, &reply).await;
         }
         // 先置位再组装应答：应答里立即是 swap_prepared，安装器拿这一个应答
@@ -1231,16 +1196,13 @@ where
     if op == IpcOp::Shutdown {
         status.state = InstanceState::Stopping;
     }
-    let reply = match dialect {
-        Dialect::V1 => serde_json::to_string(&WireResponse {
-            v: IPC_VERSION,
-            ok: true,
-            result: Some(status),
-            error: None,
-        })
-        .expect("序列化 IPC 应答失败"),
-        Dialect::Legacy => crate::compat_0_1_0::legacy_reply(Some(&status)),
-    };
+    let reply = serde_json::to_string(&WireResponse {
+        v: IPC_VERSION,
+        ok: true,
+        result: Some(status),
+        error: None,
+    })
+    .expect("序列化 IPC 应答失败");
     write_line(&mut writer, &reply).await?;
     // 应答先发出去再触发停止：客户端立刻拿到确认，服务随后优雅退出
     if op == IpcOp::Shutdown {
@@ -1250,7 +1212,7 @@ where
 }
 
 /// 解析请求行。Err 里是要直接回给客户端的拒绝应答。
-fn parse_request(line: &str) -> Result<(Dialect, IpcOp), String> {
+fn parse_request(line: &str) -> Result<IpcOp, String> {
     // 行未正常终止：超过长度上限被截断，或对端在发完整请求前就断开
     if !line.ends_with('\n') {
         return Err(error_reply(error_code::BAD_REQUEST, "请求行过长或不完整"));
@@ -1259,10 +1221,7 @@ fn parse_request(line: &str) -> Result<(Dialect, IpcOp), String> {
         return Err(error_reply(error_code::BAD_REQUEST, "请求不是 JSON"));
     };
     let Some(v) = request.get("v") else {
-        return match crate::compat_0_1_0::legacy_op(&request) {
-            Some(op) => Ok((Dialect::Legacy, op)),
-            None => Err(crate::compat_0_1_0::legacy_reply(None)),
-        };
+        return Err(error_reply(error_code::BAD_REQUEST, "请求缺少 v"));
     };
     if v.as_u64() != Some(u64::from(IPC_VERSION)) {
         let reply = WireResponse {
@@ -1284,7 +1243,7 @@ fn parse_request(line: &str) -> Result<(Dialect, IpcOp), String> {
         return Err(error_reply(error_code::BAD_REQUEST, "args 必须是对象"));
     }
     match IpcOp::from_name(name) {
-        Some(op) => Ok((Dialect::V1, op)),
+        Some(op) => Ok(op),
         None => Err(error_reply(
             error_code::UNKNOWN_OP,
             &format!("实例没有 op \"{name}\""),
@@ -1526,11 +1485,10 @@ mod imp {
     }
 
     /// 接受循环，兼管 socket 文件。文件被别的进程删掉时，监听还在、名字没了，
-    /// 客户端从此找不到本实例。升级窗口里 0.1.0 的看护者就会这么做：它处理旧
-    /// 实例的死亡事件时删 `run/<端口>.sock`，而安装器那时多半已在同一路径上
-    /// 拉起了新实例（见 .agents/plan/ipc-v1.md c.3）。所以每秒看一眼，名字没了
-    /// 就在原路径重建；本进程自己在退出（已收到 shutdown，或退出流程删了
-    /// socket）时不重建。
+    /// 客户端从此找不到本实例。0.1.0 的看护者就会这么做：它处理实例的死亡事件
+    /// 时删 `run/<端口>.sock`，迁移到新版本时它若还没退役，那条路径上可能已是
+    /// 新实例的 socket。所以每秒看一眼，名字没了就在原路径重建；本进程自己在
+    /// 退出（已收到 shutdown，或退出流程删了 socket）时不重建。
     pub async fn accept_loop(listener: Listener, state: Arc<ControlState>) {
         let Listener { mut listener, path } = listener;
         let mut check = tokio::time::interval(Duration::from_secs(1));
@@ -1775,14 +1733,8 @@ mod tests {
     #[test]
     fn request_lines_round_trip_through_the_server_parser() {
         for op in IpcOp::ALL {
-            let (dialect, parsed) = parse_request(&(op.request_line() + "\n")).unwrap();
-            assert!(matches!(dialect, Dialect::V1));
-            assert_eq!(parsed, op);
+            assert_eq!(parse_request(&(op.request_line() + "\n")).unwrap(), op);
         }
-        // 0.1.0 的请求没有 v：按 0.1.0 的格式应答，它的 stats 等同 ping
-        let (dialect, op) = parse_request("{\"op\":\"stats\"}\n").unwrap();
-        assert!(matches!(dialect, Dialect::Legacy));
-        assert_eq!(op, IpcOp::Ping);
     }
 
     #[test]
@@ -1810,14 +1762,12 @@ mod tests {
         );
         // 行没有正常结束（超长被截断，或对端提前断开）
         assert_eq!(code("{\"v\":1,\"op\":\"ping\"}"), "bad_request");
-        // 0.1.0 请求里认不出的 op：回 0.1.0 形状的拒绝
-        let legacy = reply("{\"op\":\"what\"}\n");
-        assert_eq!(legacy["ok"], false);
-        assert!(legacy.get("v").is_none(), "{legacy}");
+        // 没有 v 的请求（例如 0.1.0 的 CLI 发来的）一样按 v1 拒绝
+        assert_eq!(code("{\"op\":\"ping\"}\n"), "bad_request");
     }
 
     #[test]
-    fn client_reads_v1_errors_unknown_states_and_0_1_0_replies() {
+    fn client_reads_v1_errors_and_unknown_states() {
         let err = parse_reply(r#"{"v":1,"ok":false,"error":{"code":"unknown_op","message":"x"}}"#)
             .unwrap_err();
         assert!(
@@ -1836,14 +1786,10 @@ mod tests {
             "ops": ["ping"], "future_field": true}});
         let status = parse_reply(&newer.to_string()).unwrap();
         assert_eq!(status.state, InstanceState::Unknown);
-        // 0.1.0 的应答（没有 v）：swap_phase 映射成状态，身份字段原样带回
-        let legacy = r#"{"ok":true,"info":{"pid":7,"version":"0.1.0","listen_addr":"127.0.0.1:1","config_path":"c","base_url":"b","started_at":5,"swap_phase":true,"process_start":9},"proto":2}"#;
-        let status = parse_reply(legacy).unwrap();
-        assert_eq!((status.instance.pid, status.instance.process_start), (7, 9));
-        assert_eq!(status.state, InstanceState::SwapPrepared);
+        // 没有 v 的应答（0.1.0 守护的形状）无法采信
         assert!(matches!(
-            parse_reply(r#"{"ok":false,"info":null,"proto":2}"#),
-            Err(IpcError::Remote { .. })
+            parse_reply(r#"{"ok":true,"info":{"pid":7},"proto":2}"#),
+            Err(IpcError::Protocol(_))
         ));
     }
 
@@ -1893,16 +1839,6 @@ mod tests {
         assert_eq!(swap.state, InstanceState::SwapPrepared);
         let again = request_raw(&endpoint, IpcOp::Ping).await.unwrap();
         assert_eq!(again.state, InstanceState::SwapPrepared);
-
-        // 0.1.0 客户端（请求不带 v）拿到 0.1.0 形状的应答，swap_phase 即 ACK
-        let (line, _) = imp::exchange(&endpoint, r#"{"op":"ping"}"#).await.unwrap();
-        let legacy: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert!(legacy.get("v").is_none(), "{line}");
-        assert_eq!(legacy["ok"], true);
-        assert_eq!(legacy["proto"], 2);
-        assert_eq!(legacy["info"]["pid"], std::process::id());
-        assert_eq!(legacy["info"]["swap_phase"], true);
-        assert_eq!(legacy["info"]["requests_total"], 7);
 
         // shutdown：应答先到（状态 stopping），随后置位停止信号
         let stopping = request_raw(&endpoint, IpcOp::Shutdown).await.unwrap();
@@ -1972,59 +1908,6 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn legacy_pipe_is_reached_only_for_a_matching_local_record() {
-        // 扮演一个只在 0.1.0 旧管道名上应答的实例。「端口」取非数字的测试名，
-        // 旧管道名就不可能与机器上真实实例的管道重名
-        let run = tempfile::tempdir().unwrap();
-        let port = format!("legacy-test-{}", std::process::id());
-        let legacy = format!(r"\\.\pipe\aproxy-{port}");
-        let serve_legacy =
-            |info: InstanceRecord| tokio::spawn(serve_endpoint(legacy.clone(), control(info).0));
-        // pid 必须是本测试进程：客户端会核对应答者自报的 pid 与管道服务端进程
-        let mut live = sample_info(&port);
-        live.pid = std::process::id();
-        live.process_start = 1000;
-        let server = serve_legacy(live.clone());
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // 本 run 目录没登记该端口：旧管道上的应答者可能属于任何 home，不认
-        assert!(ipc_ping_in(run.path(), &port).await.is_err());
-
-        // 登记的是另一个进程（别的 home 在同端口上的实例）：不认
-        let mut other = live.clone();
-        other.pid = live.pid + 1;
-        write_instance_file_in(run.path(), &other).unwrap();
-        assert!(ipc_ping_in(run.path(), &port).await.is_err());
-
-        // pid 相同、创建时间不同（pid 已被复用）：不认
-        let mut reused = live.clone();
-        reused.process_start = 2000;
-        write_instance_file_in(run.path(), &reused).unwrap();
-        assert!(ipc_ping_in(run.path(), &port).await.is_err());
-
-        // 记录与应答者一致：经旧管道找到它（升级窗口里新 CLI 找到本 home
-        // 里还在跑 0.1.0 的实例）
-        write_instance_file_in(run.path(), &live).unwrap();
-        assert_eq!(
-            ipc_ping_in(run.path(), &port).await.unwrap().instance.pid,
-            live.pid
-        );
-
-        // 记录与应答者都没有创建时间：pid 相同也无从排除复用，不认
-        server.abort();
-        let _ = server.await;
-        let mut unverifiable = live.clone();
-        unverifiable.process_start = 0;
-        let server = serve_legacy(unverifiable.clone());
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        write_instance_file_in(run.path(), &unverifiable).unwrap();
-        assert!(ipc_ping_in(run.path(), &port).await.is_err());
-
-        server.abort();
-    }
-
     /// 测试专用端点：Windows 管道名带测试名与进程号（不会与真实实例重名），
     /// unix 的 socket 放在测试目录里
     fn test_endpoint(dir: &std::path::Path, name: &str) -> String {
@@ -2042,7 +1925,7 @@ mod tests {
     #[tokio::test]
     async fn client_rejects_a_responder_whose_pid_is_not_the_peer() {
         // 冒充者：在端点上应答，自报的 pid（42）却不是它自己。客户端必须拒收——
-        // 普查、stop 与 0.1.0 回退都按应答里的 pid 认实例
+        // 普查与 stop 都按应答里的 pid 认实例
         let dir = tempfile::tempdir().unwrap();
         let endpoint = test_endpoint(dir.path(), "peer");
         let server = tokio::spawn(serve_endpoint(
@@ -2093,7 +1976,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn deleted_socket_file_is_recreated_while_serving() {
-        // 别的进程删了本实例的 socket 文件（升级窗口里 0.1.0 的看护者会这么做）：
+        // 别的进程删了本实例的 socket 文件（还没退役的 0.1.0 看护者会这么做）：
         // 一两秒内在原路径重建，客户端照常连得上
         let dir = tempfile::tempdir().unwrap();
         let endpoint = test_endpoint(dir.path(), "heal");

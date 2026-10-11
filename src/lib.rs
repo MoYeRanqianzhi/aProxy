@@ -1,4 +1,3 @@
-mod compat_0_1_0;
 pub mod config;
 pub mod daemon;
 pub mod decode;

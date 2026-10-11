@@ -14,9 +14,8 @@
 //! 不影响语义。
 //!
 //! 宣告属于一个 home：节名带 run 目录的标识（与控制端点同一套命名空间规则），
-//! 一个 home 的 install 不会让别的 home 的看护者进入安装模式；unix 上也不再
-//! 与别的用户的 /dev/shm 文件撞名。0.1.0 用的是全局名字，升级窗口内两边都要
-//! 照顾到，见 compat_0_1_0 的 S5。
+//! 一个 home 的 install 不会让别的 home 的看护者进入安装模式；unix 上也不会
+//! 与别的用户的 /dev/shm 文件撞名。
 
 use std::path::Path;
 use std::time::Duration;
@@ -48,15 +47,14 @@ pub struct Announcement {
 }
 
 /// install 侧宣告句柄：创建即宣告，Drop/进程退出即解除（Windows 节随最后
-/// 句柄消失；unix 主动 unlink，在 Drop 里做）。持有本 home 的节，以及 0.1.0
-/// 读的全局节（S5，尽力而为）。
+/// 句柄消失；unix 主动 unlink，在 Drop 里做）。
 pub struct Announcer {
-    sections: Vec<Section>,
+    section: Section,
     /// 已交棒：Drop 时只放下自己的句柄，不撤节（见 [`Announcer::release`]）
     released: std::sync::atomic::AtomicBool,
 }
 
-/// 一个宣告节
+/// 宣告节
 struct Section {
     #[cfg(windows)]
     mapping: isize,
@@ -82,23 +80,15 @@ impl Announcer {
             installer_pid: std::process::id(),
             heartbeat_ms: crate::watchdog::now_millis(),
         };
-        let mut sections = vec![imp::create_section(&announcement_name(run_dir), ann)?];
-        sections.extend(imp::create_section(
-            crate::compat_0_1_0::LEGACY_ANNOUNCEMENT,
-            ann,
-        ));
         Some(Self {
-            sections,
+            section: imp::create_section(&announcement_name(run_dir), ann)?,
             released: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     /// 刷新心跳（install 侧独立 ticker 周期调用）。
     pub fn beat(&self) {
-        let ms = crate::watchdog::now_millis();
-        for section in &self.sections {
-            imp::store_section(section, ms);
-        }
+        imp::store_section(&self.section, crate::watchdog::now_millis());
     }
 }
 
@@ -117,26 +107,16 @@ impl Drop for Announcer {
     fn drop(&mut self) {
         // Windows：unmap + close → 节消失；unix：unlink 持久文件（done/abort
         // 的主动解除路径；崩溃残留靠心跳过期自然失效）
-        let released = self.released.load(std::sync::atomic::Ordering::Relaxed);
-        for section in &mut self.sections {
-            if released {
-                imp::release_section(section);
-            } else {
-                imp::destroy_section(section);
-            }
+        if self.released.load(std::sync::atomic::Ordering::Relaxed) {
+            imp::release_section(&mut self.section);
+        } else {
+            imp::destroy_section(&mut self.section);
         }
     }
 }
 
-/// 读本 home 的宣告。节不存在 → None（无安装宣告——常态）。本 home 没有
-/// 宣告时再看 0.1.0 的全局节：升级窗口里驱动安装的可能是 0.1.0 的安装器。
+/// 读本 home 的宣告。节不存在 → None（无安装宣告——常态）。
 pub fn read(run_dir: &Path) -> Option<Announcement> {
-    read_own(run_dir).or_else(|| imp::load_section(crate::compat_0_1_0::LEGACY_ANNOUNCEMENT))
-}
-
-/// 只读本 home 的宣告，不看 0.1.0 的全局节。会据此动手的判断（拉起续作）用它：
-/// 全局节可能是别的 home 的安装留下的残留。
-pub fn read_own(run_dir: &Path) -> Option<Announcement> {
     imp::load_section(&announcement_name(run_dir))
 }
 
@@ -324,22 +304,9 @@ mod tests {
 
     #[test]
     fn announce_roundtrip_and_active_judgement() {
-        // create → beat → read：同进程内内容一致。只建本 home 的节——
-        // `Announcer::create` 还会发布 0.1.0 的全局节，测试不该让机器上别的
-        // home（包括正在用的 0.1.0 实例的看护者）看到一场并不存在的安装
+        // create → beat → read：同进程内内容一致
         let run = tempfile::tempdir().unwrap();
-        let section = imp::create_section(
-            &announcement_name(run.path()),
-            Announcement {
-                installer_pid: std::process::id(),
-                heartbeat_ms: crate::watchdog::now_millis(),
-            },
-        )
-        .expect("宣告节创建失败");
-        let a = Announcer {
-            sections: vec![section],
-            released: std::sync::atomic::AtomicBool::new(false),
-        };
+        let a = Announcer::create(run.path()).expect("宣告节创建失败");
         a.beat();
         let ann = read(run.path()).expect("宣告节应可读");
         assert_eq!(ann.installer_pid, std::process::id());
@@ -382,16 +349,14 @@ mod tests {
         let run = tempfile::tempdir().unwrap();
         let name = announcement_name(run.path());
         let owner = |pid: u32| Announcer {
-            sections: vec![
-                imp::create_section(
-                    &name,
-                    Announcement {
-                        installer_pid: pid,
-                        heartbeat_ms: crate::watchdog::now_millis(),
-                    },
-                )
-                .expect("宣告节创建失败"),
-            ],
+            section: imp::create_section(
+                &name,
+                Announcement {
+                    installer_pid: pid,
+                    heartbeat_ms: crate::watchdog::now_millis(),
+                },
+            )
+            .expect("宣告节创建失败"),
             released: std::sync::atomic::AtomicBool::new(false),
         };
         let handing_over = owner(u32::MAX - 1);

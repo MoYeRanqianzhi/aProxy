@@ -45,10 +45,11 @@ pub struct WatchdogClaim {
 
 /// R1：守护启动时（创建控制端点之前）退役比自己旧的看护者。claim 没有
 /// version（0.1.0）或版本更低、且 claim 里的进程经 pid + 创建时间核验仍在，
-/// 就终止它、等它退出、删掉 claim，补种交给守护的自检。为什么要这样：0.1.0
-/// 的安装器在 unix 上不停旧看护者，它会留着有效的 claim 继续看护新实例——
-/// 用已被替换的二进制重拉崩溃实例（Linux 上 current_exe 指向 `(deleted)`，
-/// 重拉必然失败），处理死亡事件时还会删掉新实例的控制 socket。「新版本胜出」：
+/// 就终止它、等它退出、删掉 claim，补种交给守护的自检。为什么要这样：换了
+/// 二进制之后旧看护者可能还在任（从 0.1.0 迁移时，0.1.0 的看护者在实例清零后
+/// 最多 5 分钟才自行退出），它会留着有效的 claim 继续看护新实例——用旧的或
+/// 已被替换的二进制重拉崩溃实例（Linux 上 current_exe 指向 `(deleted)`，重拉
+/// 必然失败），处理死亡事件时还会删掉新实例的控制 socket。「新版本胜出」：
 /// 同版本或更新的看护者不动，混版本的 home 不会来回拉锯。返回是否退役了一个。
 pub async fn retire_older_watchdog_in(run_dir: &Path) -> bool {
     let Some(claim) = read_claim_in(run_dir) else {
@@ -869,7 +870,7 @@ impl WatchdogState {
     /// 由 --continue 的接管判定收敛（未 stale 即退出；接管后宣告刷新），
     /// 最坏情况是每周期一个短命进程直到 updated_at 过 stale 阈值。
     fn check_install_keepalive(&self) {
-        let Some(ann) = crate::install::announce::read_own(&self.cfg.run_dir) else {
+        let Some(ann) = crate::install::announce::read(&self.cfg.run_dir) else {
             return;
         };
         if crate::install::announce::is_active(&ann, now_millis()) {

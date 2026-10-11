@@ -4,9 +4,9 @@
 //! ```text
 //! 管辖检查 → marking（锁+宣告）→ downloading（备料校验）
 //!   → 早交接（交给 staging 里的目标二进制，本进程只等结局）→ 快照
-//!   → broadcasting（换血+广播 ACK）→ swapping（双 rename/原子覆盖）
+//!   → broadcasting（换血+广播 ACK）→ swapping（旧二进制让位到唯一名、新二进制到位）
 //!   → （Windows）交给 bin 里刚落位的二进制 → restarting（逐实例滚动）
-//!   → verifying（版本+阶段终验）→ cleaning（删 .old/staging）→ done
+//!   → verifying（版本+阶段终验）→ cleaning（删让位的旧二进制/staging）→ done
 //! ```
 //!
 //! - 早交接：备料校验通过后，广播、交换、滚动、终验、清理一律由**目标版本**
@@ -122,9 +122,9 @@ async fn snapshot_with_pending(run_dir: &Path, state: &InstallState) -> (Vec<Str
     (live, snapshot)
 }
 
-/// 回滚用旧二进制：本次交换记下的 old_path（Windows `.old` / unix 交换前
-/// 保留的副本）。不存在（首次安装、已被清理）→ None，实例起不来时只能
-/// 保住 `.restore` 下线。
+/// 回滚用旧二进制：本次交换记下的 old_path（`aproxy.old-…`：Windows 是让位的原文件，
+/// unix 是交换前保留的硬链接或副本）。不存在（首次安装、已被清理）→ None，实例起不来
+/// 时只能保住 `.restore` 下线。
 fn rollback_binary(state: &InstallState) -> Option<std::path::PathBuf> {
     state
         .old_path
@@ -350,6 +350,11 @@ fn is_current_exe(path: &Path) -> bool {
 /// 等接手者确认的上限。接手只是读写一次 install.state，正常不到一秒；余量留给
 /// 杀毒软件对新下载二进制的首次扫描。
 const TAKEOVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 等安装锁的上限。普通安装之间已由 install.state 互斥，会来争这把锁的只有强制安装
+/// ——而它先结束全部安装者再拿锁，本进程多半等不到它放手就已被结束。拿不到就落
+/// failed 现场，交给续作。
+const BIN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 被拉起的接手者进程。unix 留着 Child：它是本进程的子进程，没接手就退出时会
 /// 变成僵尸，按 pid 查进程态认不出（macOS 上更是查不了），try_wait 判活并顺带
@@ -581,15 +586,17 @@ async fn run_tail(
         }
     }
 
-    // ---- cleaning：删 .old 与本次的 staging（它是 swapping 中断的恢复源，done
-    // 后即无用）；入口脚本常驻不删（防线 0 是基础设施）。两者在 Windows 上都可能
-    // 暂时被镜像锁住：.old 是等待结局的安装者的镜像，它看到 cleaning 才退出；
+    // ---- cleaning：删让位的旧二进制与本次的 staging（它是 swapping 中断的恢复源，
+    // done 后即无用）；入口脚本常驻不删（防线 0 是基础设施）。两者在 Windows 上都可能
+    // 暂时被镜像锁住：旧二进制是等待结局的安装者的镜像，它看到 cleaning 才退出；
     // staging 里的副本可能是刚把剩余阶段交出来的那个进程的镜像。短重试吸收这段
-    // 退出窗口，仍删不掉就保留待下次，绝不强杀。
+    // 退出窗口，仍删不掉就保留待下次（唯一名的残留挡不住以后的安装），绝不强杀。
+    // 删 bin/ 里的文件也是改 bin/，持有安装锁（永久兼容契约 C4）。
     // 相位守卫：Cleaning 残留的续作重入不重复迁移
     if state.phase < InstallPhase::Cleaning {
         super::state::advance_in(home, state, InstallPhase::Cleaning)?;
     }
+    let _lock = super::lock_install_in(home, BIN_LOCK_WAIT)?;
     let staging = super::staging::staging_dir_in(home, &state.target_version);
     let gone = |result: std::io::Result<()>| match result {
         Ok(()) => true,
@@ -614,6 +621,8 @@ async fn run_tail(
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
+    // 顺带清掉以前留下、此刻删得掉的中间文件残留
+    swap::sweep_residue_in(home, None);
     super::state::advance_in(home, state, InstallPhase::Done)?;
     // 状态文件删除 = 安装完成（恢复机制的触发依据：任何残留都意味着未完成）
     super::state::remove_in(home);
@@ -777,9 +786,10 @@ pub async fn continue_install(
                     run_forward(home, run_dir, &mut state, Path::new(&from), !named).await
                 }
                 // 备料完成、交换前：staging 完整在盘——直接从广播重入。
-                // swapping 中断：Windows bin 可能空窗（旧已改名新未落位）——swap 原语
-                // 对「bin 缺失」幂等（首次安装同款路径），重新执行交换即恢复；
-                // unix 两态（rename 前中断 = 原文件完好 / rename 后 = 新文件已就位）
+                // swapping 中断：Windows bin 可能空窗（旧二进制已让位到 aproxy.old-…、
+                // 新的未落位）——swap 原语对「bin 缺失」幂等（首次安装同款路径），重新
+                // 执行交换即恢复；让位的旧二进制在让位之前就记进了 old_path，回滚照样
+                // 用它。unix 两态（rename 前中断 = 原文件完好 / rename 后 = 新文件已就位）
                 // 都无需修复。重入走广播（ACK 是幂等置位）+ 交换。
                 InstallPhase::Downloaded
                 | InstallPhase::Broadcasting
@@ -878,7 +888,7 @@ async fn run_forward_from_staged(
     // ---- broadcasting：ACK 齐了才交换（铁律 3）。无实例 → 跳过（快路径）
     if !snapshot.is_empty() {
         // 换血：广播之前停掉旧看护者——它的 respawn 用 current_exe 拉实例，
-        // 换血后那条路径已不是新二进制（Windows 指向 rename 后的 .old，升级
+        // 换血后那条路径已不是新二进制（Windows 指向让位后的 aproxy.old-…，升级
         // 永不完成；Linux 读到的是 `… (deleted)`，重拉必然失败）。
         stop_old_watchdog(run_dir);
         // 相位守卫（与 run_tail 同款）：Acked/Swapping 残留的续作重入时
@@ -913,8 +923,20 @@ async fn run_forward_from_staged(
             .map_err(|e| format!("广播后新启实例 ACK 失败: {e}"))?;
     }
     super::state::advance_in(home, state, InstallPhase::Swapping)?;
-    let outcome = swap::swap_in(home, staged_path).map_err(|e| format!("二进制交换失败: {e}"))?;
-    state.old_path = outcome.old_path.map(|p| p.display().to_string());
+    // 改 bin/ 期间持有安装锁（永久兼容契约 C4）：强制安装先结束全部安装者再拿这把锁，
+    // 拿到之后才动 bin/，两边不会同时改。交换一完就放：之后的滚动重启只读 bin
+    let lock = super::lock_install_in(home, BIN_LOCK_WAIT)?;
+    // 续作时上一次尝试可能已让旧二进制让位（bin 此刻缺失），它的唯一名记在状态里，是
+    // 回滚要用的旧二进制：清残留时保留它，这一次也不会再产生新的让位
+    let keep = state.old_path.as_ref().map(std::path::PathBuf::from);
+    let target = state.target_version.clone();
+    swap::swap_in(home, staged_path, &target, keep.as_deref(), |old| {
+        // 让位之前落盘：让位之后、写状态之前崩溃，续作就找不到回滚用的旧二进制
+        state.old_path = Some(old.display().to_string());
+        write_in(home, state).map_err(|e| format!("install/state.json 写入失败: {e}"))
+    })
+    .map_err(|e| format!("二进制交换失败: {e}"))?;
+    drop(lock);
     super::state::advance_in(home, state, InstallPhase::Swapped)?;
 
     // Windows：本进程就是 staging 里那份副本（早交接的接手者）时，把剩余阶段

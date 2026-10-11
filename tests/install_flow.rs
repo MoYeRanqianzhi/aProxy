@@ -106,8 +106,34 @@ fn bin_works(home: &std::path::Path) -> bool {
             .unwrap_or(false)
 }
 
+/// bin 里交换留下的中间文件（`aproxy.old-…`、`aproxy.tmp-…`）
+fn residues(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(aproxy::install::swap::bin_dir_in(home))
+        .map(|dir| {
+            dir.flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(aproxy::install::swap::is_residue_name)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 路径是 bin 里一个让位的旧二进制（`aproxy.old-…`）
+#[cfg(unix)]
+fn is_retired_old(home: &std::path::Path, path: &std::path::Path) -> bool {
+    path.parent() == Some(aproxy::install::swap::bin_dir_in(home).as_path())
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(aproxy::install::swap::OLD_PREFIX))
+}
+
 // ---------------------------------------------------------------------------
-// 1. 无实例快路径：bin 预放旧二进制 → install --from → 落位 + .old 清理 +
+// 1. 无实例快路径：bin 预放旧二进制 → install --from → 落位 + 旧二进制清理 +
 //    状态文件删除（broadcasting/restarting 全部跳过）
 // ---------------------------------------------------------------------------
 #[test]
@@ -126,20 +152,21 @@ fn install_from_without_instances_fast_path() {
         "install 应成功: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // 安装者在接手者进入 cleaning 时就以 0 退出（Windows 上 .old 是它自己的
-    // 镜像，它不退出就删不掉），状态文件稍后由接手者清掉
+    // 安装者在接手者进入 cleaning 时就以 0 退出（Windows 上让位的旧二进制可能是它
+    // 自己的镜像，它不退出就删不掉），状态文件稍后由接手者清掉
     let state = aproxy::install::state::state_path_in(&env.home());
     let deadline = Instant::now() + Duration::from_secs(30);
     while state.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
     }
-    // 终态：bin 可运行、.old 已删、staging 清理（Windows 上接手者交换后把剩余
-    // 阶段交给了 bin 里的二进制，staging 里的副本已不在运行）、状态文件删除
+    // 终态：bin 可运行、让位的旧二进制已删、staging 清理（Windows 上接手者交换后
+    // 把剩余阶段交给了 bin 里的二进制，staging 里的副本已不在运行）、状态文件删除
     //（done 的完成语义）
     assert!(bin_works(&env.home()));
     assert!(
-        !aproxy::install::swap::old_path_in(&env.home()).exists(),
-        "无实例快路径下 .old 应在 cleaning 删除（无镜像锁）"
+        residues(&env.home()).is_empty(),
+        "无实例快路径下让位的旧二进制应在 cleaning 删除（无镜像锁）: {:?}",
+        residues(&env.home())
     );
     assert!(!aproxy::install::state::state_path_in(&env.home()).exists());
     assert!(
@@ -218,10 +245,14 @@ fn install_from_with_instance_rolling_restart() {
         "CLI 应交棒、在接手者完成后以 0 退出并报告完成; 输出: {output}"
     );
 
-    // 终态断言：bin 可运行、.old 已删（尾部由 bin 里的二进制执行，非自镜像）、
-    // 实例已滚动到新 pid（旧实例被优雅停止后用新二进制拉起）
+    // 终态断言：bin 可运行、让位的旧二进制已删（尾部由 bin 里的二进制执行，非自
+    // 镜像）、实例已滚动到新 pid（旧实例被优雅停止后用新二进制拉起）
     assert!(bin_works(&env.home()));
-    assert!(!aproxy::install::swap::old_path_in(&env.home()).exists());
+    assert!(
+        residues(&env.home()).is_empty(),
+        "{:?}",
+        residues(&env.home())
+    );
     let live = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -560,7 +591,7 @@ fn install_instance_failure_exits_nonzero_and_keeps_restore() {
 
 // ---------------------------------------------------------------------------
 // 6c. unix 端到端回滚：--from 一个「能自报版本、但拉不起实例」的新二进制
-//     → 交换前保留的 bin/aproxy.old 把实例按原参数拉回，CLI 非零退出。
+//     → 交换前保留的 bin/aproxy.old-… 把实例按原参数拉回，CLI 非零退出。
 //     假二进制自报 0.2.0-0：不低于版本下限，又比当前低（semver 里 0.2.0 线上
 //     最小的版本），是降级：不交棒，滚动在 CLI 进程内执行
 //     （交棒路径上的同一失败见 6d；Windows 的同一逻辑由 install_flow_lib 的
@@ -639,7 +670,10 @@ fn unix_install_rolls_back_instance_to_preserved_old_binary() {
         "拉回的是旧版本"
     );
     let image = aproxy::watchdog::process_image_path(info.instance.pid).unwrap();
-    assert_eq!(image, aproxy::install::swap::old_path_in(&env.home()));
+    assert!(
+        is_retired_old(&env.home(), &image),
+        "实例应跑在让位的旧二进制上: {image:?}"
+    );
     assert!(
         aproxy::daemon::restore_file_path_in(&run_dir, &env.port.to_string()).is_file(),
         ".restore 应在"
@@ -822,7 +856,10 @@ fn staged_target_drives_the_install_and_its_failure_reaches_the_installer() {
         .block_on(aproxy::daemon::ipc_ping_in(&run_dir, &env.port.to_string()))
         .expect("实例应被旧二进制拉回");
     let image = aproxy::watchdog::process_image_path(info.instance.pid).unwrap();
-    assert_eq!(image, aproxy::install::swap::old_path_in(&env.home()));
+    assert!(
+        is_retired_old(&env.home(), &image),
+        "实例应跑在让位的旧二进制上: {image:?}"
+    );
 
     let _ = rt.block_on(aproxy::install::restart::stop_and_wait(
         &run_dir,

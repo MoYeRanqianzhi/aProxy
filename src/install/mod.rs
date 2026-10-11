@@ -30,6 +30,70 @@ pub fn install_dir_in(home: &Path) -> PathBuf {
     home.join("install")
 }
 
+/// 安装锁的文件名：`<home>/install/lock`。
+///
+/// 永久兼容契约 C4：位置、文件名与「操作系统级排他锁」的语义无论如何都不得改动。
+/// 任何版本修改 `<home>/bin/` 期间（换二进制、删让位的旧二进制、写入口兜底脚本）都
+/// 持有它；强制安装先按台账结束全部安装者、再拿这把锁，然后才动 bin/。某个版本换了
+/// 锁的位置或方式，它与别的版本就会同时改 bin/，互相踩坏对方的交换。
+pub const LOCK_FILE: &str = "lock";
+
+/// 安装锁文件：`<home>/install/lock`（见 [`LOCK_FILE`]）。
+pub fn lock_path_in(home: &Path) -> PathBuf {
+    install_dir_in(home).join(LOCK_FILE)
+}
+
+/// 持有中的安装锁，析构即释放。锁是文件句柄上的操作系统锁（Windows 的 LockFileEx、
+/// unix 的 flock），持有者进程死亡时由系统自动释放，所以崩溃不会留下打不开的死锁。
+#[must_use = "锁在析构时释放，要让它活到 bin/ 改完"]
+pub struct InstallLock {
+    _file: std::fs::File,
+}
+
+/// 拿安装锁，最多等 `wait`：别人持有时每 100 毫秒再试一次，到时仍拿不到 → Err（谁也
+/// 不许无限等——强制安装要按退出码规则结束，普通安装落 failed 现场等续作）。
+///
+/// 同一个进程只能持有一份：锁绑在打开的文件上，同一进程再开一次、再锁一次，会被自己
+/// 先前那份挡住。
+///
+/// Windows 上打开时不给 FILE_SHARE_DELETE：持锁期间别人删不掉这个文件。否则删掉之后
+/// 有人新建一个同名文件再锁上，就会有两个持有者。unix 没有对应的办法，靠所有版本都
+/// 不删它（强制安装清空 `<home>/install/` 时也跳过它）。
+pub fn lock_install_in(home: &Path, wait: std::time::Duration) -> Result<InstallLock, String> {
+    let path = lock_path_in(home);
+    std::fs::create_dir_all(install_dir_in(home))
+        .map_err(|e| format!("{} 创建失败: {e}", install_dir_in(home).display()))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ | FILE_SHARE_WRITE：别人照样能打开来试锁，但删不掉
+        options.share_mode(0x1 | 0x2);
+    }
+    let file = options
+        .open(&path)
+        .map_err(|e| format!("安装锁 {} 打开失败: {e}", path.display()))?;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(InstallLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("安装锁 {} 加锁失败: {e}", path.display()));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "安装锁 {} 被别的进程持有，{} 秒内没有等到（另一个安装正在修改 bin/？）",
+                path.display(),
+                wait.as_secs()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// 可安装版本的下限。0.1.x 与 0.2.0 起的版本互不兼容（控制协议、安装状态的位置、
 /// `--version` 的格式都变了）：0.2.0 起的安装器驱动不了 0.1.x 的二进制，也联系不上
 /// 0.1.x 的实例，装回 0.1.x 只会在交换二进制之后半途坏掉。所以在线安装与 `--from`

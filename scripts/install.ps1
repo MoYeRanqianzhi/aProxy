@@ -151,16 +151,8 @@ function Install-AProxy {
         Test-Sha256 $binTmp $shaTmp
         Move-Item $binTmp $exePath -Force
 
-        # ---- fallback 入口脚本（aproxy.bat：exe 缺席时重定向旧二进制，见 install 计划）----
-        $batPath = Join-Path $BinDir "aproxy.bat"
-        @"
-@echo off
-if exist "%~dp0aproxy.exe" (
-  "%~dp0aproxy.exe" %*
-) else if exist "%~dp0aproxy.old.exe" (
-  "%~dp0aproxy.old.exe" %*
-)
-"@ | Out-File -Encoding ascii $batPath
+        # 入口兜底脚本（aproxy.bat）不在这里写：本脚本只做首装，`aproxy install` 每次
+        # 交换二进制之前都会自己写好它——只有交换期间 aproxy.exe 才可能短暂缺席
 
         # ---- skill 文档（非强制：失败不影响安装）----
         if (-not $NoSkills) {

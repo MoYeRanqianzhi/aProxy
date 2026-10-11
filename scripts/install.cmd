@@ -122,16 +122,9 @@ if /i not "%ACTUAL%"=="%EXPECTED%" (
 
 move /y "%TMP_DIR%\aproxy.exe" "%BIN_DIR%\aproxy.exe" >nul
 
-rem ---- Fallback entry script (aproxy.bat redirects to old binary when the
-rem ---- new exe is absent mid-swap; PATHEXT mechanism, see install plan) ----
-> "%BIN_DIR%\aproxy.bat" (
-    echo @echo off
-    echo if exist "%%~dp0aproxy.exe" ^(
-    echo   "%%~dp0aproxy.exe" %%*
-    echo ^) else if exist "%%~dp0aproxy.old.exe" ^(
-    echo   "%%~dp0aproxy.old.exe" %%*
-    echo ^)
-)
+rem No fallback entry script (aproxy.bat) here: this script only does first
+rem installs, and `aproxy install` writes bin\aproxy.bat itself before every
+rem binary swap - the only time aproxy.exe can be briefly missing.
 
 rem ---- Skill docs (optional: failure does not affect the install) ----
 if "%APROXY_NO_SKILLS%"=="1" goto :done

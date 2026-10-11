@@ -386,9 +386,10 @@ async fn crash_during_downloading_redownloads() {
     assert!(bin_works(home), "重备料后规范位置应有可用二进制");
 }
 
-/// 恢复矩阵行「swapping 中（Windows bin 空窗：旧已改名、新未落位）」——
-/// 计划标注的最要命失败态：bin 只有 .old（+残留 .new），staging 完整。
-/// 续作从 staging 重新落位 → bin 恢复 → done。
+/// 恢复矩阵行「swapping 中（Windows bin 空窗：旧已让位、新未落位）」——
+/// 计划标注的最要命失败态：bin 只有让位的 aproxy.old-…（+半截的 aproxy.tmp-…），
+/// staging 完整。让位之前 old_path 已记进状态。续作从 staging 重新落位 → bin 恢复
+/// → done。
 #[cfg(windows)]
 #[tokio::test(flavor = "current_thread")]
 async fn crash_during_swapping_recovers_from_staging() {
@@ -398,11 +399,16 @@ async fn crash_during_swapping_recovers_from_staging() {
     std::fs::create_dir_all(&run_dir).unwrap();
     let from = usable_from(home);
 
-    // 空窗现场：bin 缺失、.old 在场（可用旧版）、.new 半成品、staging 完整
-    let bin = aproxy::install::swap::bin_path_in(home);
-    let old = aproxy::install::swap::old_path_in(home);
-    let new_tmp = aproxy::install::swap::new_tmp_path_in(home);
-    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    // 空窗现场：bin 缺失、让位的旧二进制在场（可用旧版）、临时名半成品、staging 完整
+    let bin_dir = aproxy::install::swap::bin_dir_in(home);
+    let old = bin_dir.join(aproxy::install::swap::unique_name(
+        aproxy::install::swap::OLD_PREFIX,
+    ));
+    let new_tmp = bin_dir.join(aproxy::install::swap::unique_name(
+        aproxy::install::swap::TMP_PREFIX,
+    ));
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    assert!(!aproxy::install::swap::bin_path_in(home).exists());
     std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &old).unwrap();
     std::fs::write(&new_tmp, b"half-written-new").unwrap();
     let staged = aproxy::install::staging::staging_dir_in(home, env!("CARGO_PKG_VERSION"))
@@ -414,21 +420,22 @@ async fn crash_during_swapping_recovers_from_staging() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let state = crash_state(InstallPhase::Swapping, &from, Some(&staged));
-    aproxy::install::state::write_in(home, &mut state.clone()).unwrap();
+    let mut state = crash_state(InstallPhase::Swapping, &from, Some(&staged));
+    state.old_path = Some(old.display().to_string());
+    aproxy::install::state::write_in(home, &mut state).unwrap();
 
     aproxy::install::flow::continue_install(home, &run_dir, None)
         .await
         .expect("swapping 空窗续作应完成");
-    // 终态：bin 恢复可用、.new 消费、.old 清理（无实例 → cleaning 可删）
+    // 终态：bin 恢复可用、半截的临时名被清掉、旧二进制在 cleaning 删除（无实例无镜像锁）
     assert!(bin_works(home), "空窗后 bin 应从 staging 恢复");
-    assert!(!new_tmp.exists(), "残留 .new 应被 swap 舞消费");
-    assert!(!old.exists(), ".old 应在 cleaning 删除（无实例无镜像锁）");
+    assert!(!new_tmp.exists(), "半截的临时名应被清掉");
+    assert!(!old.exists(), "让位的旧二进制应在 cleaning 删除");
     assert!(!aproxy::install::state::state_path_in(home).exists());
 }
 
-/// 恢复矩阵行「swapped」：bin=新、.old 残留 → 续作直接进尾部（滚动/终验/
-/// 清理）→ done。
+/// 恢复矩阵行「swapped」：bin=新、让位的旧二进制在场 → 续作直接进尾部（滚动/
+/// 终验/清理）→ done。
 #[tokio::test(flavor = "current_thread")]
 async fn crash_after_swap_finishes_tail() {
     let dir = tempfile::tempdir().unwrap();
@@ -436,9 +443,11 @@ async fn crash_after_swap_finishes_tail() {
     let run_dir = home.join("run");
     std::fs::create_dir_all(&run_dir).unwrap();
     let from = usable_from(home);
-    // swapped 现场：bin=新（可用）、.old 残留
+    // swapped 现场：bin=新（可用）、让位的旧二进制在场
     let bin = aproxy::install::swap::bin_path_in(home);
-    let old = aproxy::install::swap::old_path_in(home);
+    let old = aproxy::install::swap::bin_dir_in(home).join(aproxy::install::swap::unique_name(
+        aproxy::install::swap::OLD_PREFIX,
+    ));
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
     std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &bin).unwrap();
     #[cfg(unix)]
@@ -455,7 +464,7 @@ async fn crash_after_swap_finishes_tail() {
         .await
         .expect("swapped 残留续作应完成");
     assert!(bin_works(home));
-    assert!(!old.exists(), "尾部 cleaning 应删除 .old");
+    assert!(!old.exists(), "尾部 cleaning 应删除让位的旧二进制");
     assert!(!aproxy::install::state::state_path_in(home).exists());
 }
 
@@ -475,7 +484,7 @@ async fn corrupted_state_file_is_handled_cleanly() {
         .expect("损坏状态文件应被静默处置");
 }
 
-/// 恢复矩阵行「cleaning 残留（删除 .old 中崩溃）」→ 重入不回退重验
+/// 恢复矩阵行「cleaning 残留（删除旧二进制中崩溃）」→ 重入不回退重验
 /// （Cleaning → Verifying 逆向迁移会被状态机拒绝——相位守卫修复的回归），
 /// 重做清理即 done。
 #[tokio::test(flavor = "current_thread")]
@@ -486,7 +495,9 @@ async fn crash_during_cleaning_resumes_without_backward_move() {
     std::fs::create_dir_all(&run_dir).unwrap();
     let from = usable_from(home);
     let bin = aproxy::install::swap::bin_path_in(home);
-    let old = aproxy::install::swap::old_path_in(home);
+    let old = aproxy::install::swap::bin_dir_in(home).join(aproxy::install::swap::unique_name(
+        aproxy::install::swap::OLD_PREFIX,
+    ));
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
     std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &bin).unwrap();
     #[cfg(unix)]
@@ -503,7 +514,7 @@ async fn crash_during_cleaning_resumes_without_backward_move() {
         .await
         .expect("cleaning 残留续作应完成");
     assert!(bin_works(home));
-    assert!(!old.exists(), ".old 应重做清理");
+    assert!(!old.exists(), "让位的旧二进制应重做清理");
     assert!(!aproxy::install::state::state_path_in(home).exists());
 }
 
@@ -626,11 +637,13 @@ fn start_instance(
     (port, cfg, child)
 }
 
-/// 模拟 swap 之后的现场：运行中的规范 bin 改名为旧二进制（Windows 允许
-/// rename 运行中镜像；unix 同理），bin 换成 `new_bin` 的内容。返回旧路径。
+/// 模拟 swap 之后的现场：运行中的规范 bin 改名为一个唯一的旧二进制名（Windows
+/// 允许 rename 运行中镜像；unix 同理），bin 换成 `new_bin` 的内容。返回旧路径。
 fn simulate_swap(home: &Path, new_bin: impl FnOnce(&Path)) -> std::path::PathBuf {
     let bin = aproxy::install::swap::bin_path_in(home);
-    let old = aproxy::install::swap::old_path_in(home);
+    let old = aproxy::install::swap::bin_dir_in(home).join(aproxy::install::swap::unique_name(
+        aproxy::install::swap::OLD_PREFIX,
+    ));
     std::fs::rename(&bin, &old).unwrap();
     new_bin(&bin);
     make_exec(&bin);

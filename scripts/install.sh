@@ -226,15 +226,15 @@ main() {
 
     # ---- 平台解析（先于已安装检测：Windows 落位 aproxy.exe，检测名随平台）----
     OS="$(uname -s)"; ARCH="$(uname -m)"
-    # EXE_SUFFIX/BAT_FALLBACK：Windows 侧（含 Git Bash/MSYS）二进制带 .exe 且需要
-    # aproxy.bat fallback 入口（PATHEXT 机制，见 install 计划 swapping 专节）
+    # EXE_SUFFIX：Windows 侧（含 Git Bash/MSYS）二进制带 .exe。入口兜底脚本
+    # （aproxy.bat）不在这里写：本脚本只做首装，`aproxy install` 每次交换二进制之前
+    # 都会自己写好它——只有交换期间 aproxy.exe 才可能短暂缺席
     EXE_SUFFIX=""
-    BAT_FALLBACK=0
     libc=""
     case "$OS" in
         Linux) platform="unknown-linux-gnu"; libc="$(detect_linux_libc)" ;;
         Darwin) platform="apple-darwin" ;;
-        MINGW*|MSYS*|CYGWIN*) platform="pc-windows-msvc"; EXE_SUFFIX=".exe"; BAT_FALLBACK=1 ;;
+        MINGW*|MSYS*|CYGWIN*) platform="pc-windows-msvc"; EXE_SUFFIX=".exe" ;;
         *) echo "不支持的平台: $OS" >&2; exit 1 ;;
     esac
     case "$ARCH" in
@@ -286,12 +286,6 @@ main() {
     fi
     # 自证通过才落位：bin 目录里永远不会出现跑不起来的二进制
     mv "$STAGED" "$BIN_DIR/$BIN_NAME"
-
-    # ---- Windows：fallback 入口脚本（exe 缺席时重定向旧二进制）----
-    if [ "$BAT_FALLBACK" = "1" ]; then
-        printf '@echo off\r\nif exist "%%~dp0aproxy.exe" (\r\n  "%%~dp0aproxy.exe" %%*\r\n) else if exist "%%~dp0aproxy.old.exe" (\r\n  "%%~dp0aproxy.old.exe" %%*\r\n)\r\n' \
-            > "$BIN_DIR/aproxy.bat"
-    fi
 
     # ---- skill 文档（非强制：失败不影响安装）----
     if [ "${APROXY_NO_SKILLS:-}" != "1" ]; then

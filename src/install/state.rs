@@ -180,7 +180,10 @@ pub struct InstallState {
     /// 新二进制 sha256（github 渠道强校验值；--from 为计算值）
     #[serde(default)]
     pub sha256: Option<String>,
-    /// swap 后旧二进制的去向（Windows 为 .old 路径；unix 无 .old 不填）
+    /// 交换时旧二进制让位到的唯一名 `<home>/bin/aproxy.old-<纳秒>-<pid>[.exe]`（Windows 是
+    /// 改名让位的原文件，unix 是交换前留的硬链接或副本），实例回滚用、cleaning 删。让位
+    /// **之前**写入（见 swap::swap_in 的 before_retire）：让位之后崩溃，续作照样知道它在哪。
+    /// bin 里原本没有二进制时不填
     #[serde(default)]
     pub old_path: Option<String>,
     /// ACK 阶段的实例清单（swapping 前快照 diff 比对 + restarting 进度记录）
@@ -550,7 +553,7 @@ mod tests {
         s.phase = InstallPhase::Swapped;
         s.staged_path = Some("C:/h/install/staging/0.1.0-alpha.9/aproxy.exe".into());
         s.sha256 = Some("abc123".into());
-        s.old_path = Some("C:/h/bin/aproxy.old.exe".into());
+        s.old_path = Some("C:/h/bin/aproxy.old-1760256000123456789-4242.exe".into());
         s.instance_snapshot = vec!["12345".into(), "12349".into()];
         s.skill = Some(SkillState {
             status: SkillPhase::Downloading,

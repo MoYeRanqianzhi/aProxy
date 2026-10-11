@@ -461,8 +461,8 @@ async fn report_outcome(
 const HANDOVER_WAIT_SECS: u64 = aproxy::install::state::STALE_AFTER_SECS;
 
 /// 轮询 install.state 直到接手者到达终点。成功判据：状态文件消失（done
-/// 清场）或 phase 进入 cleaning（终验已通过——cleaning 只剩删 `.old` 与
-/// staging，而 `.old` 正是本进程的运行镜像，Windows 上本进程必须先退出它才
+/// 清场）或 phase 进入 cleaning（终验已通过——cleaning 只剩删让位的旧二进制与
+/// staging，而那个旧二进制正是本进程的运行镜像，Windows 上本进程必须先退出它才
 /// 删得掉，所以不能等到 done）。失败判据：phase=failed（带接手者记下的原因）、
 /// 接手进程已死而安装未终结、等待超时。
 async fn await_handover(home: &std::path::Path) -> Result<(), String> {

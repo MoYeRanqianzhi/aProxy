@@ -125,7 +125,21 @@
 - 不把 skill 嵌进二进制；本地没有就提示 `aproxy skill install`，非零退出。
 - 所有 `--help` 末尾加一行固定英文提示（给 agent 看），指向 `aproxy skill list` / `show`。
 - SKILL.md 里写明打不开 references 时用 `aproxy skill show`。
-- 待审查补充：release.yml 组 skills 包的方式、清单生成、版本对应。
+- 审查补充（config-cli-install.md §8，主代理采纳）：
+  - 版本：`skill install` 严格取正在运行的二进制的版本，`skill upgrade` 是它的别名；想要新 skill 就升级二进制。
+  - 白名单：安装时写下本地记录 `<home>/skills/manifest.json`（版本、文件、大小、sha256，兼作「装完」标记）；发布的 skills
+    包自带同格式清单，解包改为按清单白名单进行，并限制大小与条目数。
+  - `show` 的决定性一步：把文件读进内存，核对大小与 sha256，再输出同一块内存——符号链接、junction、硬链接、ADS、
+    竞争都绕不过它。另加：名字与路径逐字节精确匹配清单键、用户输入不拼进路径、严格字符集、逐级拒绝 reparse point、
+    打开时不跟随链接、上限 1 MiB、必须 UTF-8。
+  - `--help` 提示行：构建命令后递归给所有子命令设 after_help，配一个遍历全部子命令的测试；文案例如
+    `Agents: run 'aproxy skill list' and 'aproxy skill show <name>' for full docs.`
+  - 打包：一个脚本（输入取 `git ls-files`）打出一个带清单的可复现 zip，GitHub、npm、crate 三个渠道共用；删掉没有消费者的单
+    skill 包；校验规则只在 Rust 里写一份；`.gitattributes` 给 skill 文件定 `eol=lf`。
+  - 现有缺陷：`--skills-only` 与安装的 skill 支线之间没有锁，共用 `.dl`/`.staging`，并发时互删半成品。
+  - **0.1.0 的 skill 支线**：0.1.0 的 `upgrade` 一开始就并行下载目标版本的 skill，结局与二进制无关，C5 只拦得住二进制。
+    0.2.0 正式版之前，skills 资产要换名、npm 包内路径要换、crate 不再带 `.claude/skills/`，让 0.1.0 的三条渠道都找不到，
+    skill 原样不动。预发布版不受影响（0.1.0 的稳定通道不选预发布）。
 
 ### W5 UI（Tauri 2，编进本体）
 - 构建：cargo feature `ui` 进 default features；`--no-default-features` 出无 UI 版本，不得多出任何依赖。

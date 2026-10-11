@@ -70,6 +70,16 @@ pub(crate) fn resolved_daemon_log() -> Option<PathBuf> {
 pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemon_child: bool) {
     let listen_addr = cfg.listen_addr.clone();
     let base_url = cfg.base_url.clone();
+    // 进程台账（永久兼容契约 C3）：占用端口之前登记，`aproxy install --force` 靠它找到并
+    // 结束本实例；端口取配置里的监听端口（强制安装据此核对 restore 有没有把实例拉回来，
+    // 拉不回的按它列给用户），label 是配置文件路径（用户手动重启时要用）。正常退出由
+    // 守卫删除；下面经 process::exit 的路径一律改走 ledger::exit，同样会删
+    let _ledger = aproxy::ledger::register(
+        &settings::home(),
+        aproxy::ledger::ROLE_INSTANCE,
+        daemon::port_of(&listen_addr).parse().ok(),
+        Some(&cfg_path.display().to_string()),
+    );
     // spool 残留清理（disk_cache）：bind 前清空本端口的 spool 目录——目录
     // 归本进程独占，启动时清空即可回收崩溃/强杀残留的临时文件。
     // 仅转发模式下 spool 链路整体不进，本实例永不产生 spool 文件；但这里**不是**
@@ -87,7 +97,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
             // 走 report_config_error 落盘（startup.log），否则父进程超时提示指向
             // 的日志里查不到任何线索
             report_config_error(&bind_error_message(&listen_addr, &e), daemon_child);
-            std::process::exit(1);
+            aproxy::ledger::exit(1);
         }
     };
     let actual_addr = listener.local_addr().expect("获取监听地址失败").to_string();
@@ -110,7 +120,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
                 ),
                 daemon_child,
             );
-            std::process::exit(1);
+            aproxy::ledger::exit(1);
         }
     };
 
@@ -329,7 +339,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
             tracing::info!("10 秒后强制退出（在途请求将中断）");
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             remove_registry_files(&actual_addr);
-            std::process::exit(0);
+            aproxy::ledger::exit(0);
         } => {}
     }
     remove_registry_files(&actual_addr);

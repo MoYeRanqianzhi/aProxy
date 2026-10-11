@@ -788,7 +788,7 @@ impl WatchdogState {
                 claim_pid = existing.pid,
                 "claim 已被其他看护者接管，本进程让位退出"
             );
-            std::process::exit(0);
+            crate::ledger::exit(0);
         }
         let claim = WatchdogClaim {
             pid: std::process::id(),
@@ -825,7 +825,7 @@ impl WatchdogState {
             if since.elapsed().as_secs() >= self.cfg.idle_exit_secs {
                 tracing::info!("无任何实例需要看护，看护者退出（闲置自灭）");
                 remove_claim_in(&self.cfg.run_dir);
-                std::process::exit(0);
+                crate::ledger::exit(0);
             }
         } else {
             self.empty_since = None;

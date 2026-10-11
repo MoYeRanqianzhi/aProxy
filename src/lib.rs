@@ -4,6 +4,7 @@ pub mod decode;
 pub mod doctor;
 pub mod find;
 pub mod install;
+pub mod ledger;
 pub mod proxy;
 pub mod retry;
 pub mod settings;

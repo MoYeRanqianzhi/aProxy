@@ -84,6 +84,10 @@ async fn main() {
     // 看护进程：进入看护主循环（claim 接管 + 收养 + 健康扫描 + 重拉）。
     // 同样忽略一切子命令（转发来的参数对看护者无意义）。
     if cli.daemon_watchdog {
+        // 进程台账（永久兼容契约 C3）：看护者在拉起任何子进程（重拉实例、续作安装）之前
+        // 登记，强制安装据此先于实例结束它，免得它把刚结束的实例当成崩溃重新拉起
+        let _ledger =
+            aproxy::ledger::register(&settings::home(), aproxy::ledger::ROLE_WATCHDOG, None, None);
         let cfg = aproxy::watchdog::WatchdogConfig::from_settings();
         aproxy::watchdog::serve(cfg).await;
         return;

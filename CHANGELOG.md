@@ -5,6 +5,31 @@
 
 ## [Unreleased]
 
+### 破坏性变更
+
+0.2.0 不能从 0.1.x 原地升级，请按下面的「从 0.1.x 迁移」重新安装。
+
+- **0.1.x 的 `aproxy install` / `aproxy upgrade` 装不上 0.2.0**：它下载 0.2.0 之后先运行一次新二进制的 `--version` 自证版本，这一步报 `--version 输出无版本号` 并以 1 退出（下载本身是成功的，随后那句下载代理的建议不用理会）。它不建安装状态、不动实例、不换二进制，也不更新 skill 文档；在线安装只在 `~/.aproxy/staging/` 下留着下载的文件，可以删掉。`--from` 同样在这一步失败。
+- **删除与 0.1.0 互通的兼容层**：0.1.0 的 CLI 与安装器联系不上 0.2.0 的实例，0.2.0 的 CLI 也联系不上 0.1.0 的实例。Windows 上不再在 0.1.0 的控制管道名 `\\.\pipe\aproxy-<端口>` 上应答，控制协议只认 v1（不带 `v` 的请求按 `bad_request` 拒绝），安装宣告只用本 home 的名字，安装状态机去掉只由 0.1.0 写入的 `relaying` 阶段。0.2.0 的实例启动时仍会退役比自己旧的看门狗，迁移时没来得及退出的 0.1.0 看门狗不会留着。
+- **`--version` 输出改为永久格式** `aproxy v<版本> (<变体>; <目标三元组>[; x86-64-v3])`，例如 `aproxy v0.2.0 (desktop; x86_64-pc-windows-msvc; x86-64-v3)`：变体是 `desktop`（带桌面界面的版本）或 `headless`（无界面版本），最后一段只在 x86-64-v3 构建上出现。之后的每个版本都按这一格式输出、安装器也按它认版本，格式不再改动。解析过 `aproxy <版本>` 的脚本请改为取首行 `aproxy v` 之后、到空格为止的部分。`aproxy --version` 与 `aproxy -V` 不读写 `APROXY_HOME`、不联网、不拉起任何进程。
+- **安装状态挪到 `<home>/install/`**：状态文件由 `run/install.state` 改为 `install/state.json`，备料与下载暂存由 `staging/<版本>/` 改为 `install/staging/<版本>/`，一键安装脚本的下载暂存由 `staging/bootstrap` 改为 `install/bootstrap`。0.1.0 留下的 `run/install.state` 与 `staging/` 不再被读取。
+- **`aproxy install` 拒绝低于 0.2.0 的版本**：在线安装指定的版本号与 `--from` 的二进制都一样，`--allow-downgrade` 也不行，报 `目标版本 <版本> 低于 0.2.0，不能安装：…` 并说明怎样回到 0.1.x。0.2.0 的预发布（alpha、beta、rc）不受影响。
+
+#### 从 0.1.x 迁移
+
+1. 用 0.1.0 记下现有实例：`aproxy status`（端口与配置文件）、`aproxy alias list`；备份 `~/.aproxy/` 下的 `*.toml` 与 `settings.json`。
+2. 用 0.1.0 停掉全部实例：`aproxy stop all`，再执行 `aproxy status` 确认已经没有实例。必须在换二进制之前做：之后的 0.2.0 联系不上 0.1.0 的实例。0.1.0 的看门狗在实例清零后默认 5 分钟自行退出，0.2.0 的实例启动时也会退役它。
+3. 换二进制：
+   - 用一键脚本或 `aproxy install` 装的：删除 `~/.aproxy/bin/` 下的 `aproxy`（Windows 为 `aproxy.exe`，以及可能残留的 `aproxy.old.exe`），再重新运行一键安装脚本（已有二进制时脚本不覆盖）。Windows 上删不掉，是 0.1.0 的看门狗还在用这个文件，等它退出再删。
+   - npm 装的：`npm i -g @meowo/aproxy@latest`（预发布用 `@next`）。
+   - cargo 装的：`cargo install aproxy --force`（预发布加 `--version <版本>`）。
+4. 清理 0.1.0 的残留：`~/.aproxy/run/install.state`（如果有）、`~/.aproxy/staging/`，以及 `~/.aproxy/run/*.restore`（第 2 步之前崩溃过的实例会留下，留着的话 `aproxy restore` 会按 0.1.0 记下的参数拉起它们）。
+5. 配置文件 `config.toml` 与 `settings.json` 沿用，按本节其余条目修改用到的旧写法（例如 `upstream_url` 须改名为 `base_url`），然后运行 `aproxy doctor` 检查。
+6. 用 0.2.0 逐个启动：`aproxy start <别名|配置路径>`。端口不变，agent 客户端的 base URL 不用改。
+7. 更新 skill 文档：`aproxy install --skills-only`，再确认 agent 的 skills 目录链接或复制的是 `~/.aproxy/skills/` 里的新文档。
+
+要回到 0.1.x：先用 0.2.0 执行 `aproxy stop all`，删除 `~/.aproxy/bin/` 下的 aproxy 二进制，再用 0.1.x 的一键安装脚本指定版本重新安装（例如 `sh install.sh v0.1.0`、`install.ps1 -Version v0.1.0`）；0.2.0 的 `aproxy install` 不会装回 0.1.x。
+
 ### 新增
 
 - **可自定义心跳**：config.toml 的 `keepalive_heartbeat` 指定每个保活间隔写给客户端的字节，默认仍是 SSE 注释 `: keepalive`。aProxy 不认识协议，心跳的形态由用户按客户端决定，例如解析器容不下注释的客户端可改成空行 `"\n"`。启动与 `aproxy doctor` 校验它写完后客户端的 SSE 解析器停在事件边界（非空、以换行结尾、含 `event:`/`data:` 等字段行时以空行收尾），否则心跳会和回放的第一个上游事件拼在一起。
@@ -14,8 +39,8 @@
 
 ### 变更
 
-- **控制协议整理为 v1**：请求是 `{"v":1,"op":"ping|shutdown|prepare_swap"}`，成功应答是 `{"v":1,"ok":true,"result":{…}}`，`result` 含注册记录 `instance`、所属 `run_dir`、状态 `state`（`serving` / `swap_prepared` / `stopping`，取代原来的 `swap_phase` 布尔值）、观测值 `activity` 与支持的 `ops`；失败应答带稳定的错误码（`bad_request`、`unsupported_version`、`unknown_op`、`invalid_state`）与说明。注册记录 `run/<端口>.pid` 只保存实例身份字段，请求数、重试数、最近错误等实时值只经控制通道提供。0.1.0 的 CLI、安装器与守护仍能与新版本互通（0.1.0 不带 `v` 的请求与应答由兼容层处理，0.2.0 删除）。
-- **skill 文档改为英文并重写**：aproxy-cli 与 aproxy-format 两个 skill 按 skill-creator 标准重写，面向操作 aProxy 的 agent。每条事实都对照源码核实；程序输出的中文原文照录，并附英文释义。aproxy-cli 新增 `clients.md`（接入各 agent 客户端）与 `troubleshooting.md`（症状 → 原因 → 处理），`compatibility.md` 只讲版本判定以及 0.1.0 与开发线的差异。
+- **控制协议整理为 v1**：请求是 `{"v":1,"op":"ping|shutdown|prepare_swap"}`，成功应答是 `{"v":1,"ok":true,"result":{…}}`，`result` 含注册记录 `instance`、所属 `run_dir`、状态 `state`（`serving` / `swap_prepared` / `stopping`，取代原来的 `swap_phase` 布尔值）、观测值 `activity` 与支持的 `ops`；失败应答带稳定的错误码（`bad_request`、`unsupported_version`、`unknown_op`、`invalid_state`）与说明。注册记录 `run/<端口>.pid` 只保存实例身份字段，请求数、重试数、最近错误等实时值只经控制通道提供。0.1.0 不带 `v` 的请求与应答不再被认，见「破坏性变更」。
+- **skill 文档改为英文并重写**：aproxy-cli 与 aproxy-format 两个 skill 按 skill-creator 标准重写，面向操作 aProxy 的 agent。每条事实都对照源码核实；程序输出的中文原文照录，并附英文释义。aproxy-cli 新增 `clients.md`（接入各 agent 客户端）与 `troubleshooting.md`（症状 → 原因 → 处理），`compatibility.md` 讲版本判定、0.1.0 与开发线的差异，以及怎样从 0.1.x 迁到 0.2.0、怎样退回 0.1.x。
 - **安装由目标版本执行**：`aproxy install` 下载并校验目标版本后，把广播、交换、滚动重启、终验与清理交给这个新二进制执行（所有平台），发起安装的进程只等待并转告结局，输出 `新版本进程已接手安装（广播、交换、滚动重启、终验），等待其完成...`。从这一版起，每次升级都由新版本驱动，新版本能修掉旧安装器的缺陷。降级仍由发起安装的进程自己执行。新二进制没能接手时，安装以 `目标版本没有接手安装（…）；实例与 bin 里的二进制都未改动` 失败收场。
 - **断开提示覆盖所有客户端**：客户端在「只收到心跳」的等待中（响应已提交、尚未收到任何上游真实字节）等了至少 60 秒才断开时，日志提示检查客户端的流空闲超时，并带上已等秒数。原来只在等满 590 秒后提示 Claude Code 的 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`，Codex（默认 300 秒）、Qwen Code（240 秒）到点断开时没有任何提示。
 
@@ -37,13 +62,13 @@
 - 客户端上传大请求体（超过 1 MiB、已溢写到磁盘）途中断开时，`req-*.spooltmp` 临时文件不再残留到下次启动。
 - **挂死实例不再从视野里消失**：进程还在、却不应答控制通道的实例（按 pid + 创建时间核验），`aproxy status` 不再删掉它的注册记录与日志，而是单列为「无响应」并提示 `aproxy stop <端口> --force`；`stop`/`restart` 的 `--force` 经注册记录找到它并核验后终止，`stop all --force` 一并处理。此前一次 status 就会删掉记录，`--force` 随即找不到它，尚未被看门狗收养的挂死实例也失去了被收养、处决重拉的依据。
 - `aproxy stop` 有目标未能确认停止（等不到退出、`--force` 失败、目标挂死而未加 `--force`）时以 1 退出，脚本可据此判断；此前一律退出 0。
-- **控制通道按 home 隔离（Windows）**：控制管道名加上 run 目录的标识（`\\.\pipe\aproxy-<home_id>-<端口>`），`aproxy` 命令只能控制同一个 `APROXY_HOME` 下启动的实例。此前管道名只含端口、全机共享，在临时 home 里做实验时 `aproxy stop 12345` 会停掉用户正在用的 12345 实例。为了 0.1.0 原地升级，新实例同时在 0.1.0 的管道名上应答（0.1.0 的 CLI 与安装器借此找到它）；新 CLI 也只在本 home 登记了该端口、且旧管道上的应答者与登记的 pid 与进程创建时间一致时，才经旧管道联系还在跑 0.1.0 的实例。这两条兼容在 0.2.0 删除。Linux/macOS 的控制 socket 本就在 run 目录里，行为不变。
+- **控制通道按 home 隔离（Windows）**：控制管道名加上 run 目录的标识（`\\.\pipe\aproxy-<home_id>-<端口>`），`aproxy` 命令只能控制同一个 `APROXY_HOME` 下启动的实例。此前管道名只含端口、全机共享，在临时 home 里做实验时 `aproxy stop 12345` 会停掉用户正在用的 12345 实例。Linux/macOS 的控制 socket 本就在 run 目录里，行为不变。
 - **控制通道建不成时实例拒绝启动**：实例先创建控制端点，再写注册表与恢复记录；端点创建失败（同一 home 里另一个实例以不同监听地址占着同一端口，或 unix 上 run 目录路径过长）时在 startup.log 写明 `控制通道 … 创建失败` 并以 1 退出。此前它不带控制通道继续代理，`stop`、`status` 都找不到它，它的注册记录还会盖掉同端口那个实例的记录。unix 上也不再删掉一个仍有进程在听的 socket（此前同端口的第二个守护会把第一个的控制通道抢走）。
 - `aproxy stop`、`restart` 与 install 的滚动重启只在实例的控制端点消失后才确认它已退出。此前连续两次探测失败（包括超时、管道忙）就算已退出，挂死、仍占着端口的实例会被报成「已停止」。
 - **控制通道更稳、更难冒充**：Windows 上一个连接在建立前断开，不再让整条控制管道停止服务；守护读请求限时 5 秒，客户端读应答限长 1 MiB；客户端核对应答者自报的 pid 与连接对端的进程，对不上即拒收，`status` 也不再把别的进程的应答算到一条注册记录名下。看门狗续写 claim 改为先写临时文件再改名，并发读者不会读到半截 claim、误以为没有看护者。
-- **心跳节与安装宣告也按 home 隔离**：看门狗读的心跳节（`aproxy-<home_id>-heart-<端口>`）与安装宣告（`aproxy-<home_id>-install`）带上 run 目录的标识，一个 home 的安装不再让别的 home 的看门狗进入安装模式，unix 上也不再与别的用户的 `/dev/shm` 文件撞名。0.1.x 期间安装器同时发布 0.1.0 的全局宣告名，供 0.1.0 的守护与看门狗识别。看门狗处理实例死亡时不再删除它的控制 socket（此刻端口上可能已有新实例，删掉就是抢走它的控制通道），残留 socket 由下一个实例启动时清理；unix 上被删的心跳文件会在下一拍重建。
-- unix 上实例的控制 socket 文件被别的进程删掉时，实例在一秒内于原路径重建，`stop`、`status` 照常找得到它。从 0.1.0 原地升级的过程中，0.1.0 的看门狗处理旧实例退出时会删掉同一路径上的 socket，而那时新实例往往已经启动。
-- **升级后不再留着旧版本的看门狗**：install 在所有平台上都先停掉旧看门狗（此前只在 Windows 上停；Linux 上留下的旧看门狗会用已被替换的二进制重拉崩溃实例，重拉必然失败）。看门狗的 claim 记录自己的版本，实例启动时退役比自己旧的看门狗（包括从 0.1.0 升级时 0.1.0 的安装器留下的那个），再由实例的自检补种新的；同版本或更新的看门狗不受影响。
+- **心跳节与安装宣告也按 home 隔离**：看门狗读的心跳节（`aproxy-<home_id>-heart-<端口>`）与安装宣告（`aproxy-<home_id>-install`）带上 run 目录的标识，一个 home 的安装不再让别的 home 的看门狗进入安装模式，unix 上也不再与别的用户的 `/dev/shm` 文件撞名。看门狗处理实例死亡时不再删除它的控制 socket（此刻端口上可能已有新实例，删掉就是抢走它的控制通道），残留 socket 由下一个实例启动时清理；unix 上被删的心跳文件会在下一拍重建。
+- unix 上实例的控制 socket 文件被别的进程删掉时，实例在一秒内于原路径重建，`stop`、`status` 照常找得到它。从 0.1.0 迁移时还没退出的 0.1.0 看门狗，处理实例退出时就会删掉同一路径上的 socket。
+- **升级后不再留着旧版本的看门狗**：install 在所有平台上都先停掉旧看门狗（此前只在 Windows 上停；Linux 上留下的旧看门狗会用已被替换的二进制重拉崩溃实例，重拉必然失败）。看门狗的 claim 记录自己的版本，实例启动时退役比自己旧的看门狗（包括从 0.1.0 迁移时还没退出的 0.1.0 看门狗），再由实例的自检补种新的；同版本或更新的看门狗不受影响。
 - 在线 `aproxy install` 也做管辖检查：有实例从 `<home>/bin` 之外的副本（npm、cargo、包管理器）启动时拒绝安装，并指向对应渠道或 `aproxy install --adopt`，检查在下载之前。此前只有 `--from` 检查，在线安装会把这些实例悄悄换到 `<home>/bin` 的二进制上。
 - `install --continue` 遇到「实例级失败已中止」的现场时，若快照里的实例其实都已从 `<home>/bin` 的新二进制、以目标版本正常服务，就收尾清场，不再报错拒绝；此前这份现场会让看门狗每天拉起一次注定被拒的续作，而 `install latest` 又报「已是最新」。
 - 安装进行中运行的 `aproxy` 命令（它们会顺带拉起 `install --continue`）不再可能与正在接手的进程同时推进同一个安装。此前在 Windows 交换后的接力窗口里，这样一个续作也能接手，两个进程同时滚动重启实例。

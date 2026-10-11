@@ -27,9 +27,10 @@ aProxy keeps everything under one home directory, written `<home>` below: the va
 | `<home>/config.toml` | the default instance config |
 | `<home>/configs/` | the conventional place for further instance configs (`find` and `doctor` scan it) |
 | `<home>/settings.json` | aliases, the default config, global defaults (settings-json.md) |
-| `<home>/run/` | instance registry `<port>.pid`, restore records `<port>.restore`, `install.state`; `APROXY_RUN_DIR` relocates this directory alone |
+| `<home>/run/` | instance registry `<port>.pid`, restore records `<port>.restore`; `APROXY_RUN_DIR` relocates this directory alone |
 | `<home>/logs/` | instance logs (random file names) and `startup.log` |
-| `<home>/bin/`, `<home>/staging/` | the binary managed by `aproxy install`, and its download area |
+| `<home>/bin/` | the binary managed by `aproxy install` |
+| `<home>/install/` | `aproxy install`'s own files: the progress record `state.json` while an install runs, downloads and staged binaries in `staging/<version>/`, the install script's downloads in `bootstrap/` |
 | `<home>/skills/` | skill documents placed by `aproxy install` |
 
 ### Experiment in an isolated home
@@ -124,7 +125,7 @@ These flags are internal; never pass them yourself.
 | `--listen ADDR` | before the subcommand | overrides `listen_addr` |
 | `--proxy URL` | before the subcommand | overrides `proxy` |
 | `--api-key KEY` | before the subcommand | overrides `api_key` |
-| `-h, --help` / `-V, --version` | | help / print `aproxy <version>` |
+| `-h, --help` / `-V, --version` | | help / print `aproxy v<version> (<variant>; <target>[; x86-64-v3])` (compatibility.md) |
 
 - Only `--config` and `--log-file` may follow a subcommand. Write
   `aproxy --listen 127.0.0.1:12346 start work`; `aproxy start work --listen …` is rejected.
@@ -458,7 +459,7 @@ aproxy install --abort
 ```
 
 `aproxy upgrade` is the same command. `install` downloads (or copies) the binary into
-`<home>/staging/`, checks that it runs and reports the expected version, swaps it into
+`<home>/install/staging/`, checks that it runs and reports the expected version, swaps it into
 `<home>/bin/`, restarts running instances one at a time on the new binary, verifies that each
 reports the new version, and cleans up; each instance is restarted once, one at a time. How the
 swap and rollback work: behaviors.md, "Upgrades with aproxy install". `install` does not edit `PATH`; check that `aproxy` resolves
@@ -466,13 +467,13 @@ to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running anot
 
 | Option | Effect |
 |---|---|
-| `VERSION` | a version without the `v`, e.g. `0.1.0`; default `latest` |
+| `VERSION` | a version without the `v`, e.g. `0.2.0`; default `latest` |
 | `--pre` | resolve `latest` in the pre-release channel |
-| `--allow-downgrade` | allow a VERSION lower than the running CLI's version |
+| `--allow-downgrade` | allow a VERSION lower than the running CLI's version, but never below 0.2.0 |
 | `--variant v3\|baseline` | x86-64 build variant; default `v3` when the CPU has AVX2 |
 | `--download-proxy URL` | proxy for downloads only; default `download_proxy` in settings.json, then the environment's proxy settings. Unrelated to config.toml's `proxy` |
 | `--no-skills` | skip the skill update this time (permanently: `skill_auto_update` in settings.json) |
-| `--from PATH` | install a local binary; its `--version` output decides the version, with no downgrade check |
+| `--from PATH` | install a local binary; its `--version` output decides the version, with no downgrade check (below 0.2.0 is still refused) |
 | `--adopt` | copy the binary you are running into `<home>/bin/` and move running instances onto it |
 | `--skills-only` | update only the skill documents, to VERSION or, by default, the channel's latest version (the running version if the channel is empty) |
 | `--abort` | cancel an install that has not reached the swap |
@@ -492,6 +493,11 @@ to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running anot
 - An explicit VERSION below the running CLI's version stops with
   `目标版本 <v> 低于当前 <v>。确认要降级请加 --allow-downgrade。` ("target below current; add
   --allow-downgrade to confirm").
+- Nothing below 0.2.0 is installed, `--allow-downgrade` and `--from` included:
+  `目标版本 <v> 低于 0.2.0，不能安装：0.1.x 与 0.2.0 起的版本互不兼容…` ("target below 0.2.0
+  cannot be installed: 0.1.x and 0.2.0 or later are incompatible"). compatibility.md, "Going back to
+  0.1.x", explains the way back. Likewise a 0.1.x `aproxy install` cannot reach 0.2.0; see
+  "Moving from 0.1.x to 0.2.0" there.
 - Downloads try the channels in `download_chain` (settings-json.md), by default github, npm,
   cargo-binstall, cargo. On Linux, a gnu build that cannot run is replaced by the musl build
   automatically.
@@ -510,8 +516,8 @@ every running instance onto `<home>/bin/`.
   version's process has taken over the install; waiting for it") appears: once the download is
   verified, the downloaded binary runs the rest in a separate process while the command waits (up
   to 600 s) and then reports. A downgrade is run by the command itself and skips this line.
-  `install.state` may linger a moment afterwards while the old binary and the staging copy are
-  deleted.
+  `<home>/install/state.json` may linger a moment afterwards while the old binary and the staging
+  copy are deleted.
 - While instances roll, `status` marks them `二进制更换中…`; do not stop or restart those.
 - Skill documents are updated alongside into `<home>/skills/<name>/`; a skill failure does not
   fail the install. They are not linked into any agent's skill directory.
@@ -532,7 +538,7 @@ every running instance onto `<home>/bin/`.
   ("the target version did not take over"), the downloaded binary exited or hung before starting;
   no instance and no file in `<home>/bin/` was changed.
 
-An install interrupted by a crash, kill or power loss leaves `<home>/run/install.state`; the
+An install interrupted by a crash, kill or power loss leaves `<home>/install/state.json`; the
 watchdog and every other `aproxy` command resume it in the background. Do not delete that file by
 hand: it is what lets the install finish. `--abort` works only before the swap
 (`安装已中止，现场已清理（二进制与实例未受影响）。`, "aborted; binary and instances untouched");
@@ -543,7 +549,7 @@ after it, the install can only be completed.
 `aproxy.old.exe` whenever `aproxy.exe` is missing, so the command keeps working from cmd and
 PowerShell through the swap. If neither binary runs, repair by hand, in this order:
 
-1. If `<home>/staging/<version>/aproxy.exe` exists, copy it to `<home>/bin/aproxy.exe`.
+1. If `<home>/install/staging/<version>/aproxy.exe` exists, copy it to `<home>/bin/aproxy.exe`.
 2. Otherwise rename `<home>/bin/aproxy.old.exe` to `aproxy.exe` and run `aproxy install` again.
 3. Otherwise download a release binary and run `<downloaded binary> install --adopt`.
 

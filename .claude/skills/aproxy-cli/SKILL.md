@@ -115,6 +115,10 @@ Every other client, the reasoning behind the timeouts, and how to verify the set
 `aproxy install` (alias `aproxy upgrade`) installs the newest version into `~/.aproxy/bin/` and
 restarts running instances one at a time, so clients barely notice. Options, channels and
 recovery from an interrupted install are in [commands.md](references/latest/commands.md).
+0.1.x cannot upgrade to 0.2.0 in place: its `aproxy install` stops with `--version 输出无版本号`
+("no version number in the --version output") before changing anything, and the two lines cannot
+control each other's instances. Move by reinstalling, as
+[compatibility.md](references/latest/compatibility.md) describes.
 
 ## Where to look
 
@@ -126,7 +130,7 @@ recovery from an interrupted install are in [commands.md](references/latest/comm
 | Setting up Claude Code, Codex, Gemini CLI or another client | [clients.md](references/latest/clients.md) |
 | How retries, heartbeats, streaming, disk cache, forward-only mode, transformers, IPC, logs, watchdog and install work | [behaviors.md](references/latest/behaviors.md) |
 | A symptom or log message to explain | [troubleshooting.md](references/latest/troubleshooting.md) |
-| Whether these docs match the installed version | [compatibility.md](references/latest/compatibility.md) |
+| Whether these docs match the installed version; moving from 0.1.x to 0.2.0 | [compatibility.md](references/latest/compatibility.md) |
 
 These references describe aProxy 0.1.x and the current development line. Check
 `aproxy --version` (and the versions `aproxy status` reports for running instances) before relying

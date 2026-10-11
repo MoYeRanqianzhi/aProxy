@@ -437,7 +437,7 @@ commands.md. During the run:
   antivirus, not ready within 8 s), install restarts that instance from the old binary with its
   original arguments, halts the rollout (remaining instances stay on the old version), prints
   `滚动已中止，不会自动重试：…` ("rollout halted, will not retry automatically") and exits non-zero. The
-  binary in `bin/` and the install phase are not rolled back: `<home>/run/install.state` holds phase
+  binary in `bin/` and the install phase are not rolled back: `<home>/install/state.json` holds phase
   `failed` and the cause in `last_error`. Read startup.log, fix the cause, run `aproxy install` again.
   If the old binary cannot start the instance either, it is down but its restore record is kept, and
   `aproxy restore` brings it back after the fix.
@@ -448,7 +448,7 @@ commands.md. During the run:
   (`… 秒内未确认安装完成（可能仍在后台进行）…`, "completion not confirmed in time; may still be running"),
   check instance versions with `aproxy status`.
 - An interrupted install (crash, power loss) resumes by itself: any later `aproxy` command, or the
-  watchdog, starts `install --continue` when `install.state` is left over.
+  watchdog, starts `install --continue` when `<home>/install/state.json` is left over.
 - Inside the swap window the watchdog gives a dying instance up to 5 × 3 s to come back on its own
   before respawning it, and instances do not relaunch a missing watchdog.
 
@@ -456,7 +456,7 @@ commands.md. During the run:
 
 Alongside the binary, install downloads the skill bundle (aproxy-cli and aproxy-format) of the same
 version into `<home>/skills/<name>/`, replacing each directory atomically. A failed download does not
-fail the install; its result is in the `skill` field of install.state, `aproxy install --skills-only`
+fail the install; its result is in the `skill` field of `<home>/install/state.json`, `aproxy install --skills-only`
 retries it, and `install --continue` does not. `--no-skills`, or `skill_auto_update = false` in
 settings.json, skips it. Install never writes into an agent's own skills directory; link or copy
 `<home>/skills/aproxy-cli` there yourself, for example to `~/.claude/skills/aproxy-cli` for Claude Code.

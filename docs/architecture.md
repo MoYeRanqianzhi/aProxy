@@ -19,8 +19,7 @@ agent 软件 ──HTTP──▶ [代理端口 12345] ──重试循环──�
 `\\.\pipe\aproxy-<home_id>-<端口>`（unix 为 `<run 目录>/<端口>.sock`），杜绝控制路径与
 客户端请求路径重叠。`home_id` 是 run 目录规范化路径的 SHA-256 前 16 位十六进制：
 Windows 的管道名全机共享，带上它，一个 home（`APROXY_HOME`）的命令就只能控制本
-home 的实例。新实例同时在 0.1.0 的管道名 `\\.\pipe\aproxy-<端口>` 上应答，供 0.1.0
-的 CLI 与安装器在升级窗口里找到它（`src/compat_0_1_0.rs`，0.2.0 删除）。
+home 的实例。
 
 启动顺序：bind TCP → 独占创建控制端点（失败即退出，写 startup.log）→ 写 `.pid` →
 写 `.restore` → 心跳 → 服务。由此「有 `.pid` 记录 ⇒ 端点在应答」（挂死除外）。客户端
@@ -32,7 +31,8 @@ home 的实例。新实例同时在 0.1.0 的管道名 `\\.\pipe\aproxy-<端口>
 状态快照——`instance`（即 `.pid` 记录）、`run_dir`、`state`（`serving`/`swap_prepared`/
 `stopping`，不认识的值读作 `unknown`）、`activity`、`ops`；失败应答
 `{"v":1,"ok":false,"error":{"code","message"}}`。`v` 只在语义不兼容时递增，加 op、加字段、
-加错误码、加状态值都不递增。没有 `v` 的请求与应答属于 0.1.0，由 `src/compat_0_1_0.rs` 应对。
+加错误码、加状态值都不递增。没有 `v` 的请求按 `bad_request` 拒绝，没有 `v` 的应答不予
+采信（0.1.0 的格式就是这样，0.2.0 起与它不再互通）。
 
 上图的「重试循环 / spool / 回放」是默认模式的主流程；`forward_only` 模式下这两
 环整体旁路（见「仅转发模式（forward_only）」）。
@@ -418,7 +418,17 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
   跨通道偷装预发布；npm 兜底按 dist-tags（Stable 读 `latest` 且其为预发布时视为
   无稳定版，Pre 取 `latest`/`next` 较大者）。选这个设计的原因：二进制内置的选版
   逻辑随版本发出就收不回，「默认只取稳定版」不能指望发布侧标签永远打对
-- **state**：状态文件即安装锁（run/ 下，原子重写，updated_at 自动刷新供
+- **安装者状态收在 `<home>/install/`**（`install::install_dir_in`）：状态文件
+  `state.json`、备料与下载暂存 `staging/<版本>/`、一键脚本的下载暂存 `bootstrap/`，
+  别处一律不写（skill 目录自己的 `.dl`、`.staging` 除外，要与目标同卷原子替换）。
+  这是强制安装的永久兼容契约 C4 的路径部分：它可以整目录清空而不必认识内容。
+  0.1.0 写在 `run/install.state` 与 `staging/` 的现场因此读不到，与新安装器自然隔离
+- **版本**：`--version` 首行是永久格式 `aproxy v<semver> (<变体>; <目标三元组>[; x86-64-v3])`
+  （`aproxy::VERSION_LINE`，契约 C5），在一切副作用之前输出；安装器靠它认版本
+  （`staging::parse_version_line`），也靠它让 0.1.0 的安装器在交换前失败——0.1.0 取第一个
+  以数字开头的词当版本，这一行没有。可安装版本的下限是 0.2.0（`install::INSTALL_FLOOR`，
+  按主.次.修订比较），在线安装与 `--from` 都查，`--allow-downgrade` 越不过
+- **state**：状态文件即安装锁（原子重写，updated_at 自动刷新供
   stale 判定）；阶段状态机线性主线 + failed/aborted 旁路，abort 仅
   swapping 前可回滚。交棒后等待结局的往往是较旧的二进制，所以阶段词表与
   字段名冻结、新字段一律可选
@@ -515,10 +525,9 @@ Ubuntu 22.04 等系统启动即报 `GLIBC_2.39 not found`（alpha.17 实测如�
 
 ## 版本路线
 
-- **0.1.x**：当前开发线。0.1.0 是首个稳定版（此前为 `0.1.0-alpha.*` 预发布），
-  之后 0.1 系列内的小版本直接发布；无 UI，纯 CLI + 守护。
-- **0.2.0**：引入 UI（Web 面板形态待定）——前提是基础功能齐备、稳定性经 beta
-  期验证；属远期。
+- **0.1.x**：0.1.0 是首个稳定版（此前为 `0.1.0-alpha.*` 预发布）；无 UI，纯 CLI + 守护。
+- **0.2.0**：当前开发线（`0.2.0-alpha.*` 预发布）。与 0.1.x 互不兼容、不能原地升级
+  （迁移步骤见 CHANGELOG），可安装版本的下限是 0.2.0；引入 UI。
 - 发布产物：x86_64 的 Windows 与 Linux gnu 同时提供 baseline 与 x86-64-v3
   （AVX2）两种指令集变体，`aproxy install` 运行时检测后自动选择（失败回退
   baseline），一键安装脚本保守地装 baseline；musl 与其他架构只有 baseline。

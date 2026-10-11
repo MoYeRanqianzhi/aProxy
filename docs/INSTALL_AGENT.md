@@ -108,17 +108,22 @@ channel; `--pre` selects the pre-release channel explicitly. Only `vX.Y.Z` and
 `vX.Y.Z-(alpha|beta|rc).N` releases count (`format-v*` and historical test tags
 do not). If the channel has nothing newer you get "already up to date" or "no
 version available" and nothing changes — it never switches channels on its own.
-A specific version (`aproxy install 0.1.0`) ignores the channel; a target below
-the current version is refused unless `--allow-downgrade` is given.
+A specific version (`aproxy install 0.2.0`) ignores the channel; a target below
+the current version is refused unless `--allow-downgrade` is given, and nothing
+below 0.2.0 is installed at all.
 
 **Rollback:** if an instance cannot start under the new version during the
 rolling restart, `install` brings it back with the old binary and the original
 arguments, stops the rollout (other instances are left untouched) and exits
 non-zero. Read `~/.aproxy/logs/startup.log`, fix the cause and run `aproxy
-install` again; `~/.aproxy/run/install.state` (phase `failed`, `last_error`)
-keeps the details. On Windows the rolling restart finishes in a background
-process after the command returns, so check `install.state` and `aproxy status`
-rather than the exit code.
+install` again; `~/.aproxy/install/state.json` (phase `failed`, `last_error`)
+keeps the details.
+
+**From 0.1.x to 0.2.0:** not possible with `install`. 0.1.x and 0.2.0 cannot
+control each other's instances, so a 0.1.x `aproxy install` stops before
+changing anything, with an error containing `--version 输出无版本号`. Stop the
+instances with 0.1.x and reinstall, following "Moving from 0.1.x to 0.2.0" in
+the aproxy-cli skill's [compatibility.md](https://github.com/MoYeRanqianzhi/aProxy/blob/main/.claude/skills/aproxy-cli/references/latest/compatibility.md#moving-from-01x-to-020).
 
 **Version gate:** the `install` command exists from 0.1.0-alpha.10 on. Check
 `aproxy --version`; if `install` is not a known command on the installed build,
@@ -248,6 +253,7 @@ troubleshooting — read them before improvising CLI flags.
 | Claude Code gives up / resends after about 10 minutes of waiting | `CLAUDE_STREAM_IDLE_TIMEOUT_MS` is not set: Claude Code's event-level idle timeout (600 s) is not reset by aProxy's comment heartbeats. Set it to `86400000` (step 4) |
 | Non-streaming (`"stream": false`) requests time out during long retries | they have no keepalive channel (nothing to inject heartbeats into): raise the client's own timeout |
 | `aproxy install` stopped with an instance rolled back | the new version failed to start for that instance; read `startup.log`, fix, rerun `aproxy install` |
+| `aproxy install` on 0.1.x fails with `--version 输出无版本号` | 0.1.x cannot install 0.2.0 or later; nothing was changed. Reinstall as described in "From 0.1.x to 0.2.0" (step 2) |
 | `npm i -g @meowo/aproxy` installs an old version | pre-releases are published under the `next` tag: use `@meowo/aproxy@next` |
 | Everything else | `aproxy status`, then `aproxy logs <port>` — log files are randomly named per start; never guess them by port |
 

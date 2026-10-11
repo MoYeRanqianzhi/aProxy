@@ -129,8 +129,14 @@ a local binary, `--adopt` takes over an existing install).
   than creation time; `format-v*` and historical test tags are ignored. When
   the channel has nothing newer you get "already up to date" or "no version
   available" and nothing changes — it never switches channels silently. An
-  explicit version (`aproxy install 0.1.0`) ignores the channel; a target below
-  the current version is refused unless `--allow-downgrade` is given.
+  explicit version (`aproxy install 0.2.0`) ignores the channel; a target below
+  the current version is refused unless `--allow-downgrade` is given, and
+  nothing below 0.2.0 is installed at all.
+- **Upgrading from 0.1.x**: 0.1.x and 0.2.0 or later cannot control each
+  other's instances, so a 0.1.x `aproxy install` cannot install 0.2.0 (it exits
+  with `--version 输出无版本号` after the download and changes nothing). Stop the
+  instances and reinstall as described under "从 0.1.x 迁移" (migrating from
+  0.1.x) in the [CHANGELOG](CHANGELOG.md).
 - **Rollback on failure**: if an instance cannot start under the new version
   during the rolling restart, `install` brings it back with the old binary and
   the original arguments, stops the rollout (the other instances are left

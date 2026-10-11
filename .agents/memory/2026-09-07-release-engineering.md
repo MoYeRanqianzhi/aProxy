@@ -17,7 +17,7 @@ metadata:
 
 版本路线（用户定调 2026-09-08）：
 - **前期全部保持 0.1.0**（alpha/beta/rc 预发布后缀演进，0.1.x 内小版本直发）
-- **0.2.0 起引入 UI**——前提：基础功能齐备、稳定性经 beta 期验证；当前属远期规划
+- **0.2.0 起引入 UI**——2026-10-11 用户定为下一版的工作，形态见 [[0.2.0-direction]]
 - 已录入 docs/architecture.md「版本路线」节
 
 相关：[[daemon-model]] [[aproxy-cli-skill-versioning]]

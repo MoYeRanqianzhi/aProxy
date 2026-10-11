@@ -11,6 +11,19 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 发布计划已结束并删除，最后版本见 `git show 58e62cd:.agents/plan/release-0.1.0.md`；审查依据见
 `.agents/review/2026-10-04-0.1.0发布前-13维审查.md`。
 
+## 0.2.0（2026-10-11 用户下令）
+
+计划：[plan/release-0.2.0.md](plan/release-0.2.0.md)；定调：[0.2.0-direction](memory/2026-10-11-0.2.0-direction.md)。
+
+- [ ] **四路审查收口**：报告在 `.agents/review/2026-10-11-0.2.0-audit/`，汇总后更新计划
+- [ ] **W1 去除兼容**：含 0.1.0 原地升级兼容（`src/compat_0_1_0.rs`、relaying 豁免、compat 测试、upgrade-from-0-1-0 任务）；0.1.0 的 upgrade 遇到 0.2.0 必须在改动前失败；CHANGELOG 写迁移步骤
+- [ ] **W2 契约重审与定稿**（IPC、磁盘布局、config/settings、CLI、错误体、信封），定稿后重写永久接口清单
+- [ ] **W3 i18n**（给用户看的 en/zh-CN，给 agent 或不可见的固定英文）
+- [ ] **W4 `aproxy skill` 命令**（install/upgrade/list/show，show 的安全设计，`--help` 末尾提示行）
+- [ ] **W5 UI**（Tauri 2 编进本体、`ui` feature 默认开、无 UI 版本；自定义标题栏；Mica 默认关可开）
+- [ ] **W6 审查发现的修复与重构**
+- [ ] **W7 发布 0.2.0**
+
 ## 下一版发布前（2026-10-06 用户下令）
 
 用户原则：发布前每一部分都要做到足够优秀，好的设计能避免发布后才发现问题、再改动带来的连锁问题。
@@ -18,7 +31,6 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [x] **skill 按 skill-creator 标准重写（2026-10-06 完成，评测新 100% / 旧 87.5%，见 [plan/skill-standardization.md](plan/skill-standardization.md)）**：aproxy-cli 与 aproxy-format 两个 skill 全部改为英文，并按标准重写写法，不是直接翻译——面向操作 aProxy 的 agent 而非维护者；用「说明原因」替代成堆的「必须/铁律」；去掉版本史与维护者内容；补上操作安全（agent 自己的会话可能就经 aproxy 转发，stop/restart/按名杀进程会切断自己）。用 skill-creator 的评测流程验证（新旧 skill 对照）
 - [x] **去掉 alpha 时代的兼容写法**：用户定调——之前是 alpha、几乎零用户，不兼容合情合理；2026-10-06 补充：把 0.1.0 当作真正的第一版，不需要任何更早版本的兼容。已知清单（2026-10-06 grep `旧版|兼容|legacy` 所得，删前逐项确认它只服务 alpha 而非 0.1.0 的格式）：config 的 `upstream_url` 别名（src/config.rs:156 及测试 `legacy_upstream_url_field_still_loads`）；`.restore` 旧格式「纯 args 数组」的读侧兼容（src/daemon.rs:850-881）；注册表/IPC 响应缺 `process_start` / `last_activity_secs` 的「旧版本守护」分支（daemon.rs、watchdog.rs、commands/status.rs、stop.rs、restart.rs）；install/broadcast.rs 对不认识 PrepareSwap 的旧实例的处理；IPC `ipc_proto_v1_default`；保留字 `defult` 笔误别名（算不算兼容需判定）；skill compatibility.md 的 alpha 逐版差异。连同对应测试与文档一起删。进度：`upstream_url` 别名与 `.restore` 旧格式已删（2026-10-06）；`defult` 判定为 alpha.5 有意加的笔误容错（13598b3），不是版本兼容，保留；其余与 IPC/注册表格式相关的项（`IPC_PROTO_V1`、`ipc_proto_v1_default`、`Stats` op、status/stop 的旧协议与 `last_activity_secs > 0` 守卫、无创建时间记录的身份退路）已随 IPC v1 删除（db770a0、4018555）。剩余：无
 - [x] **IPC 设计整理与优化（2026-10-06 完成，CI windows/ubuntu 验证）**：端点按 home 命名空间、启动不变式、对端 pid 核对、线上格式 v1（协议版本从 1 重新计数）、心跳/宣告命名空间、R1 退役旧看门狗、unix socket 自愈、在线安装管辖检查、halted 现场收尾、早交接（安装由目标版本执行）；真实 v0.1.0 驱动的升级在 CI 的 upgrade-from-0-1-0 任务里跑。永久接口与兼容窗口见记忆 [ipc-v1-upgrade-contract](memory/2026-10-06-ipc-v1-upgrade-contract.md)；计划最后版本 `git show 9e91a95:.agents/plan/ipc-v1.md`
-- [ ] **0.2.0 时删掉 0.1.0 升级兼容**：删 `src/compat_0_1_0.rs`（S1–S5）与 `continue_install` 里的 relaying 豁免，CHANGELOG 写明升级下限（先装到某个 0.1.x 再升 0.2.0）；`tests/compat_v0_1_0.rs` 与 upgrade-from-0-1-0 任务随之改为以最低支持版本为基线。理由见上述记忆
 - [x] **IPC 整理时一并决定的问题**（2026-10-06 skill 重写子代理读代码发现，未实测）：（1）已修（7def3bf，端点按 home 命名空间）：Windows 命名管道按端口全机共享（`\\.\pipe\aproxy-<端口>`，src/daemon.rs `endpoint_for_in`），临时 APROXY_HOME 下的 `stop/restart/logs <端口>` 会打到同端口的生产实例——unix 的 socket 在 run 目录里，天然随主目录隔离，两平台语义不一致；（2）（3）已修（f4210aa）：挂死实例单列为无响应、`stop --force` 经注册记录核验后终止；`stop` 未确认停止时退出 1；（4）已修（c992af2）：在线 install 在下载前做管辖检查
 - [x] 看门狗崩溃恢复延迟（2026-10-06 修复）：主循环加死亡事件唤醒分支，崩溃实例即时重拉（集成测试 `watchdog_respawns_on_death_event_and_force_stop_stays_stopped` 以 60s 扫描周期验证，实测约 0.2s 回来；旧代码上该测试失败）。随之暴露的竞态一并处理：`stop/restart --force` 改为终止前摘掉 `.restore`、失败再放回
 - [x] **install 测试依赖外网**（2026-10-06 发现并处理）：根因有二——Windows 接力进程无视 `--no-skills` 照常下载 skill（随早交接修掉：接手者不跑 skill 支线，续作认 skipped 记录），以及快路径测试没传 `--no-skills`（已补）。代价：skill 下载经 install 的端到端路径不再有自动化测试（此前也只是顺带、且不稳定地覆盖），skill 解包与替换仍由 install::skills 的单测覆盖

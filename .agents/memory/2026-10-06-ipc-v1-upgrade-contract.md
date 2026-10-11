@@ -30,7 +30,8 @@ metadata:
 
 **0.1.x 兼容窗口**：0.1.0 的安装器能直接跳到任何后续版本，且那一跳由 0.1.0 的代码驱动，所以
 `src/compat_0_1_0.rs` 的 S1–S5 与 `continue_install` 里的 relaying 豁免要保留整个 0.1.x 线，0.2.0 一起删，
-CHANGELOG 写明升级下限（先装到 0.1.x 的某个版本）。
+CHANGELOG 写明升级下限（先装到 0.1.x 的某个版本）。2026-10-11 用户改为：0.2.0 不留 0.1.0 原地升级，0.1.0
+用户重新安装（[[0.2.0-direction]]）；本清单在 0.2.0 重新设计后整份重写，0.2.0 发布时冻结。
 
 **How to apply:** 动上面任何一项前，先跑 `tests/compat_v0_1_0.rs`（冻结的 0.1.0 结构，双向解析），想清楚
 更旧的读者会怎样；新字段用 serde default。改 install 流程要让 `tests/upgrade_from_0_1_0.rs`（CI 的

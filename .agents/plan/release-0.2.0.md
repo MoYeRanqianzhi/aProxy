@@ -296,15 +296,49 @@
   再做：默认只监听回环、`aproxy webui` 显式开启、启动时打印一次性令牌。
 - 前端栈：Vite + Svelte 5 + TypeScript（产物嵌进二进制，Svelte 编译后运行时小、自带过渡与弹簧动效；不用大型组件库
   与图表库，字体本地打包）。这是主代理的选择，用户可改。
+- **Tauri 嵌入调研结论（2026-10-12，证据与来源见 [tauri-embedding-research](tauri-embedding-research.md)；未实际构建，
+  §9 的实验 U1–U13 在第 3、4 步做）**。主代理据此定下：
+  - Windows：`tauri.conf.json` 写 `build.windows.staticVCRuntime: false`。tauri-build 2.7.x 的默认值会让依赖它的包在
+    x64/x86 MSVC 上链接失败（tauri#16238，修复 PR 未合）；aproxy 本来就是动态 CRT，关掉与现状一致。
+  - Common-Controls v6：tauri 默认特性 `common-controls-v6` 会静态导入只有 v6 才有的 `TaskDialogIndirect`，exe 没有 v6
+    清单就在 main 之前以 0xC0000139 退出——连 `--version`（C5）都跑不了，而清单只经 `rustc-link-arg-bins` 嵌给声明它的包
+    自己的 bin，到不了依赖它的 aproxy.exe（tauri#13948）。采用「关掉 v6」：tauri `default-features = false`，特性只开
+    `wry`、`compression`、`x11`、`custom-protocol`（About 与「缺 WebView2」对话框降级为 MessageBox）。不依赖清单传递，
+    也就不怕以后谁给 aproxy-desktop 加个 bin 让清单悄悄消失。U1 实测确认。
+  - RT-05：aproxy 的 lib 永不引用 aproxy_desktop；aproxy-desktop 设 `[lib] test = false`、`doctest = false`；bin 里引用它的
+    代码加 `#[cfg(all(feature = "desktop", not(test)))]`。CI 门：每个产物（两种变体）跑 `--version` 冒烟并按 C5 解析；
+    `cargo tree -e normal --no-default-features` 里没有 tauri。
+  - MSRV：tauri 一族要 1.90，根包 `rust-version` 第 3 步提到 1.90（第 2 步为 `File::lock` 先提到 1.89）。
+  - 进程与线程：`aproxy desktop` 在进入 tokio 运行时之前分派（main 改为手建运行时：先 C5 的 `--version`，再 `desktop`，
+    其余命令 `block_on`）；desktop 路径 `rt.enter()` 后 `tauri::async_runtime::set(handle)` 一次，事件循环占主线程，
+    不在 setup 里 `block_on`。
+  - 运行期失败多是 panic（无显示时 tao `expect`，setup 失败 `panic!`），所以建窗口前自己预检：Windows 查 WebView2
+    （`tauri::webview_version()`），Linux 查 `DISPLAY`/`WAYLAND_DISPLAY` 与 webkit；不过就友好报错、非零退出。
+    `app.windows` 留空，预检通过后用 `WebviewWindowBuilder` 建窗口；Mica 的 `visible:false` 另加 Rust 侧超时兜底 `show()`；
+    titlebar 的 `install` 失败降级为原生标题栏，不让 setup 失败。webview 数据目录设到 `<home>/desktop/` 下。
+  - 目录：新成员 `aproxy-desktop/`（与 aproxy-envelope、aproxy-format 并列），前端从 `desktop/` 挪到 `aproxy-desktop/ui/`，
+    Vite 产物出到 `aproxy-desktop/dist/`；crate 的 `include` 带 `dist/**`、`tauri.conf.json`、`capabilities/**`、`icons/**`，
+    不带 `ui/**`；`gen/` 忽略。`tauri-build` 校验时往包根写 `gen/schemas`，`cargo publish` 的校验可能报「Source directory
+    was modified by build.rs」，第 4 步用 U2 决定预生成并纳入包，还是 `--no-verify` 加单独的解包构建验证。
+  - 安全：CSP 按「不联网」写（草案见附件 §7），原型产物里 6 处内联 `style="animation-delay:…"` 改成 CSS 变量或类，
+    不开 `style-src-attr 'unsafe-inline'`（U8 确认）；单一 capability、自定义命令用 app manifest 收紧。**扩展与界面同一
+    JS 域时能直接调 invoke，「写操作需同意」只能在 Rust 侧强制**，JS 层的同意包装拦不住——扩展系统（W5 后续）按这个设计。
+  - Mica：直接调用钉死版本的 window-vibrancy（`=0.8.1`，cfg(windows)）拿到支持与否（Tauri 会吞掉错误）。
+  - CI：ubuntu-22.04 runner 2026-09-17 起弃用、2027-04-17 退役，Linux gnu 带界面版改用 `container: ubuntu:22.04` 跑在
+    ubuntu-24.04 与 24.04-arm 上；该变体 glibc 下限约 2.35、运行期要 WebKitGTK ≥ 2.40（headless 仍用 zigbuild 压到 2.28）。
+    Alpine 的 arm64 不能用 job container，要宿主 checkout 后 `docker run`。
+  - crate 名 `aproxy-desktop`、`aproxy-ipc` 在 crates.io 未被占（2026-10-12）。
 - 待定：
   - **所有平台都发两个版本（用户定）**：现有 11 个构建（Windows x64 / x64-v3 / x86 / arm64，Linux gnu x64 /
     x64-v3 / arm64，musl x64 / arm64，macOS arm64 / x64）各出带 UI 与无 UI 两份，共 22 个。由此带来的事：
-    - Linux 的 UI 版动态链接 webkit2gtk / GTK，缺库的机器上连代理都起不来；install 与一键脚本要选对版本，
-      升级时保持原版本（二进制要能报告自己是哪个版本，例如 `--version` 带上变体）。
-    - gnu 的 UI 版不能沿用 cargo-zigbuild 压低 glibc 下限，glibc 下限由 webkit2gtk 决定，拟在 ubuntu-22.04
-      （及其 arm runner）上构建。
-    - musl 的 UI 版不可能静态链接：要在 Alpine 容器里对 musl 版 webkit2gtk 动态链接，只能跑在装了 webkit2gtk
-      的 musl 发行版上。发布说明要写清。
+    - Linux 的 UI 版动态链接 webkit2gtk / GTK：缺库时 ld.so 在 main 之前就失败，连 `--version` 与代理都起不来；
+      wry/tao 没有延迟加载 webkit 的机制（附件 §5 列了 L1–L5 五种做法）。`cargo install aproxy` 默认编带界面版，
+      没装 webkit 开发包的 Linux 服务器上会编译失败。**怎么处理待用户拍板（2026-10-12 提问）**。升级时保持原变体
+      （`--version` 的变体段，W1 已实现）。
+    - gnu 的 UI 版不能沿用 cargo-zigbuild 压低 glibc 下限，glibc 下限由 webkit2gtk 决定（构建方式见上一节的 CI 一条）。
+    - musl 的 UI 版不可能静态链接：要关 `crt-static`、在 Alpine 里对 musl 版 webkit2gtk 动态链接（rustup 的 musl 工具链
+      默认 crt-static，GTK 程序启动即段错误，gtk-rs-core#387），只能跑在装了 webkit2gtk 的 musl 发行版上；没找到任何
+      公开的 Tauri 2 musl 预编译先例（tauri#12296 未解决）。**是否照出待用户拍板（2026-10-12 提问）**。
     - **命名（用户 2026-10-11 选定 headless）**：带 UI 的沿用现有名字——GitHub 资产 `aproxy-<target>[-v3][.exe]`、
       npm `@meowo/aproxy` 与 9 个 `@meowo/aproxy-<平台>`、crates.io `aproxy`（feature `desktop` 默认开，binstall
       的默认命名正好对应它）；无 UI 的叫 headless——资产 `aproxy-headless-<target>[-v3][.exe]`、npm
@@ -313,10 +347,6 @@
       名推导子包前缀，不用改。两个主包都提供 `aproxy` 命令，不能同时全局安装。
     - **npm 种子已发（2026-10-11）**：10 个 headless 包以 0.0.0 占位版本发布；**可信发布绑定待所有者完成**
       （GAT 做不了，见记忆 trusted-publishing-p0 的 2026-10-11 一节）。crates.io 不需要新配置，已核对现有绑定都在。
-    - 0.1.0 安装器的干净失败另有一条与命名无关的路：0.1.0 的 `probe_version` 取 `--version` 输出里第一个以数字
-      开头的词，且必须与目标版本完全相等，否则在交换前中止（`git show v0.1.0:src/install/staging.rs`）。0.2.0 的
-      `--version` 本来就要带上变体（install 升级时保持变体），若格式写成 `aproxy v0.2.0 (desktop)` 之类，0.1.0
-      的四条下载渠道都会在交换前失败。待审查 config-cli-install 的断点分析印证后定。
     - 发布流水线时长与产物体积显著增加。
   - aproxy.exe 是控制台程序，从快捷方式启动 `aproxy desktop` 会闪控制台窗口：拟让 `desktop` 分离出自身后父进程退出，
     或在独占控制台时释放它，实现时实测。

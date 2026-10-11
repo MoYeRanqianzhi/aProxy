@@ -54,12 +54,24 @@ pub fn probe_version(bin: &Path) -> Result<String, String> {
         return Err(format!("{} --version 退出非零", bin.display()));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    parse_version_line(&stdout).ok_or_else(|| {
-        format!(
-            "{} --version 的输出不是 `aproxy v<版本> (…)`（0.2.0 起每个版本都这样输出，0.1.x 输出的是 `aproxy <版本>`）: {stdout:?}",
-            bin.display()
-        )
-    })
+    if let Some(version) = parse_version_line(&stdout) {
+        return Ok(version);
+    }
+    // 0.1.x 输出 `aproxy <版本>`（没有 v）。`--from` 指向 0.1.x 的二进制时，按版本
+    // 下限说明它为什么装不了、怎样回到 0.1.x，而不只是报格式不对
+    let legacy = stdout
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("aproxy "))
+        .and_then(|rest| rest.split(char::is_whitespace).next())
+        .and_then(|version| semver::Version::parse(version).ok());
+    if let Some(Err(e)) = legacy.map(|version| super::check_floor(&version)) {
+        return Err(format!("{}：{e}", bin.display()));
+    }
+    Err(format!(
+        "{} --version 的输出不是 `aproxy v<版本> (…)`（0.2.0 起每个版本都这样输出）: {stdout:?}",
+        bin.display()
+    ))
 }
 
 /// 从 `--version` 的输出里取版本号（永久兼容契约 C5）：首行 `aproxy v` 之后、

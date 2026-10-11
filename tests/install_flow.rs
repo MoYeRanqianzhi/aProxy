@@ -561,7 +561,8 @@ fn install_instance_failure_exits_nonzero_and_keeps_restore() {
 // ---------------------------------------------------------------------------
 // 6c. unix 端到端回滚：--from 一个「能自报版本、但拉不起实例」的新二进制
 //     → 交换前保留的 bin/aproxy.old 把实例按原参数拉回，CLI 非零退出。
-//     假二进制自报的版本比当前低，是降级：不交棒，滚动在 CLI 进程内执行
+//     假二进制自报 0.2.0-0：不低于版本下限，又比当前低（semver 里 0.2.0 线上
+//     最小的版本），是降级：不交棒，滚动在 CLI 进程内执行
 //     （交棒路径上的同一失败见 6d；Windows 的同一逻辑由 install_flow_lib 的
 //     回滚用例覆盖——Windows 上造不出「能答 --version 却拒绝启动」的假 exe）
 // ---------------------------------------------------------------------------
@@ -607,7 +608,7 @@ fn unix_install_rolls_back_instance_to_preserved_old_binary() {
     let fake = env.home().join("fake-new");
     std::fs::write(
         &fake,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"aproxy v0.0.0-fake\"; exit 0; fi\nexit 1\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"aproxy v0.2.0-0\"; exit 0; fi\nexit 1\n",
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -890,4 +891,62 @@ fn version_flag_does_not_resume_a_leftover_install() {
         assert!(Instant::now() < deadline, "status 应拉起续作并清掉终态残留");
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// 写一个只会回答 `--version` 的假二进制（Windows 为 .cmd，unix 为 sh 脚本），
+/// 输出给定的一行
+fn fake_version_binary(env: &TestEnv, name: &str, line: &str) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let path = env.home().join(format!("{name}.cmd"));
+        std::fs::write(&path, format!("@echo {line}\r\n")).unwrap();
+        path
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = env.home().join(name);
+        std::fs::write(&path, format!("#!/bin/sh\necho \"{line}\"\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 9. 版本下限：低于 0.2.0 的目标一律拒绝，--allow-downgrade 也放不过去，什么都
+//    不动。--from 两种来源：0.1.x 的二进制（输出 `aproxy 0.1.0`）、新格式里自报
+//    低于下限的；在线安装指定版本号时在下载之前就拒绝（这里不联网）
+// ---------------------------------------------------------------------------
+#[test]
+fn install_refuses_versions_below_0_2_0() {
+    let env = TestEnv::new(13);
+    let bin = env.seed_bin();
+    let before = std::fs::read(&bin).unwrap();
+    let legacy = fake_version_binary(&env, "legacy", "aproxy 0.1.0");
+    let below = fake_version_binary(&env, "below", "aproxy v0.1.5 (desktop; fake)");
+    let legacy = legacy.display().to_string();
+    let below = below.display().to_string();
+    for args in [
+        vec![
+            "--from",
+            legacy.as_str(),
+            "--allow-downgrade",
+            "--no-skills",
+        ],
+        vec!["--from", below.as_str(), "--allow-downgrade", "--no-skills"],
+        vec!["0.1.0", "--allow-downgrade", "--no-skills"],
+    ] {
+        let out = env.install_cmd(&args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("低于 0.2.0") && stderr.contains("0.1.x"),
+            "{args:?}: {stderr}"
+        );
+    }
+    assert_eq!(std::fs::read(&bin).unwrap(), before, "bin 不应被动");
+    assert!(
+        !aproxy::install::install_dir_in(&env.home()).exists(),
+        "拒绝发生在建安装状态与备料之前"
+    );
 }

@@ -29,3 +29,55 @@ use std::path::{Path, PathBuf};
 pub fn install_dir_in(home: &Path) -> PathBuf {
     home.join("install")
 }
+
+/// 可安装版本的下限。0.1.x 与 0.2.0 起的版本互不兼容（控制协议、安装状态的位置、
+/// `--version` 的格式都变了）：0.2.0 起的安装器驱动不了 0.1.x 的二进制，也联系不上
+/// 0.1.x 的实例，装回 0.1.x 只会在交换二进制之后半途坏掉。所以在线安装与 `--from`
+/// 都拒绝低于它的目标，`--allow-downgrade` 也越不过它。
+///
+/// 按「主.次.修订」比较：0.2.0 的预发布（alpha/beta/rc，以及开发构建自报的
+/// 0.2.0-alpha.0）属于 0.2.0 这条线。按 semver 它们低于 0.2.0，直接比较 Version
+/// 会把它们一起拒掉。
+pub const INSTALL_FLOOR: semver::Version = semver::Version::new(0, 2, 0);
+
+/// 目标版本不低于 [`INSTALL_FLOOR`]；低于时的错误说明为什么、怎样回到 0.1.x。
+pub fn check_floor(target: &semver::Version) -> Result<(), String> {
+    let floor = &INSTALL_FLOOR;
+    if (target.major, target.minor, target.patch) >= (floor.major, floor.minor, floor.patch) {
+        return Ok(());
+    }
+    Err(format!(
+        "目标版本 {target} 低于 {floor}，不能安装：0.1.x 与 0.2.0 起的版本互不兼容（控制协议与磁盘布局都变了），\
+         --allow-downgrade 也越不过这条下限。要回到 0.1.x：先用当前版本执行 `aproxy stop all` 停掉全部实例，\
+         删掉 bin 目录里的 aproxy 二进制，再用 0.1.x 的安装脚本重新安装"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn floor_rejects_0_1_x_and_admits_the_whole_0_2_0_line() {
+        let v = |s: &str| semver::Version::parse(s).unwrap();
+        for below in ["0.1.0", "0.1.99", "0.1.0-alpha.17", "0.0.1"] {
+            let err = check_floor(&v(below)).unwrap_err();
+            assert!(
+                err.contains("0.1.x") && err.contains("--allow-downgrade"),
+                "{err}"
+            );
+        }
+        // 0.2.0 的预发布（含开发构建的 alpha.0 与最小的 0.2.0-0）都在线内
+        for ok in [
+            "0.2.0-0",
+            "0.2.0-alpha.0",
+            "0.2.0-rc.1",
+            "0.2.0",
+            "0.3.0",
+            "1.0.0",
+        ] {
+            assert!(check_floor(&v(ok)).is_ok(), "{ok}");
+        }
+        assert!(check_floor(&v(env!("CARGO_PKG_VERSION"))).is_ok());
+    }
+}

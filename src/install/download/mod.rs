@@ -195,7 +195,8 @@ pub fn decide_latest(current: &semver::Version, candidate: Option<&str>) -> Late
 /// 降级防呆：目标版本按 semver 低于当前 → 拒绝（`allow_downgrade` 放行）。
 /// semver 预发布排序是关键：`0.1.0-alpha.17 < 0.1.0`（正式版高于同号预发布），
 /// `0.2.0-alpha.1 > 0.1.0`（预发布高于更低号的正式版——这正是 latest 必须
-/// 分通道的原因，防呆本身挡不住它）。返回解析后的目标版本。
+/// 分通道的原因，防呆本身挡不住它）。版本下限先于降级判断，`allow_downgrade`
+/// 越不过它（见 [`super::INSTALL_FLOOR`]）。返回解析后的目标版本。
 pub fn check_downgrade(
     target: &str,
     current: &semver::Version,
@@ -203,6 +204,7 @@ pub fn check_downgrade(
 ) -> Result<semver::Version, String> {
     let t = semver::Version::parse(target)
         .map_err(|e| format!("版本号 {target} 非法（semver 解析失败: {e}）"))?;
+    super::check_floor(&t)?;
     if t < *current && !allow_downgrade {
         return Err(format!(
             "目标版本 {target} 低于当前 {current}。确认要降级请加 --allow-downgrade。"
@@ -584,21 +586,24 @@ mod tests {
 
     #[test]
     fn semver_prerelease_ordering_and_downgrade_guard() {
-        // 正式版高于同号预发布：alpha 用户升 0.1.0 不是降级
-        assert!(v("0.1.0") > v("0.1.0-alpha.17"));
-        assert!(check_downgrade("0.1.0", &v("0.1.0-alpha.17"), false).is_ok());
+        // 正式版高于同号预发布：alpha 用户升 0.2.0 不是降级
+        assert!(v("0.2.0") > v("0.2.0-alpha.17"));
+        assert!(check_downgrade("0.2.0", &v("0.2.0-alpha.17"), false).is_ok());
         // 预发布按数字段比较：alpha.9 < alpha.10（不是字典序）
-        assert!(v("0.1.0-alpha.10") > v("0.1.0-alpha.9"));
-        // 0.2.0-alpha.1 > 0.1.0：防呆放行它（不算降级）——稳定版用户不被带
+        assert!(v("0.2.0-alpha.10") > v("0.2.0-alpha.9"));
+        // 0.3.0-alpha.1 > 0.2.0：防呆放行它（不算降级）——稳定版用户不被带
         // 到 alpha 只能靠通道过滤，见 github/npm 的 pick 测试
-        assert!(v("0.2.0-alpha.1") > v("0.1.0"));
-        assert!(check_downgrade("0.2.0-alpha.1", &v("0.1.0"), false).is_ok());
+        assert!(v("0.3.0-alpha.1") > v("0.2.0"));
+        assert!(check_downgrade("0.3.0-alpha.1", &v("0.2.0"), false).is_ok());
         // 真降级：拒绝，--allow-downgrade 放行
-        let err = check_downgrade("0.1.0-alpha.17", &v("0.1.0"), false).unwrap_err();
+        let err = check_downgrade("0.2.0-alpha.17", &v("0.2.0"), false).unwrap_err();
         assert!(err.contains("--allow-downgrade"), "{err}");
-        assert!(check_downgrade("0.1.0-alpha.17", &v("0.1.0"), true).is_ok());
+        assert!(check_downgrade("0.2.0-alpha.17", &v("0.2.0"), true).is_ok());
+        // 低于 0.2.0 的下限：--allow-downgrade 也放不过去
+        let err = check_downgrade("0.1.0", &v("0.2.0"), true).unwrap_err();
+        assert!(err.contains("0.1.x"), "{err}");
         // 非法版本号：明确报错（不是 panic）
-        assert!(check_downgrade("latest-ish", &v("0.1.0"), true).is_err());
+        assert!(check_downgrade("latest-ish", &v("0.2.0"), true).is_err());
     }
 
     #[test]

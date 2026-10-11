@@ -35,7 +35,8 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
         return run_skills_only(&args).await;
     }
 
-    // --from <路径>：目标版本 = 源二进制自报版本
+    // --from <路径>：目标版本 = 源二进制自报版本；版本下限与在线安装同一道
+    // （见 aproxy::install::INSTALL_FLOOR）
     if let Some(from) = &args.from {
         let from_path = aproxy::settings::expand_path(from);
         let target = match aproxy::install::staging::probe_version(&from_path) {
@@ -45,6 +46,11 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
                 std::process::exit(1);
             }
         };
+        let version = semver::Version::parse(&target).expect("probe_version 只返回合法的 semver");
+        if let Err(e) = aproxy::install::check_floor(&version) {
+            eprintln!("[ERROR] {e}");
+            std::process::exit(1);
+        }
         let plan = aproxy::install::flow::InstallPlan {
             target_version: target,
             source: aproxy::install::state::InstallSource::From,

@@ -184,13 +184,14 @@ pub(crate) enum Commands {
 pub(crate) struct InstallArgs {
     /// 安装目标版本：`latest`（默认，按更新通道取最大版本——stable 通道只取
     /// 正式版，pre 通道含预发布；通道见 --pre）或具体版本号（如
-    /// 0.1.0-alpha.9）。latest 不高于当前版本时提示「已是最新」不重装。
-    /// 默认拒绝降级（--allow-downgrade 放行）。与 --from/--adopt 互斥。
+    /// 0.2.0-alpha.1）。latest 不高于当前版本时提示「已是最新」不重装。
+    /// 默认拒绝降级（--allow-downgrade 放行）；低于 0.2.0 的版本一律拒绝。
+    /// 与 --from/--adopt 互斥。
     #[arg(value_name = "VERSION", conflicts_with_all = ["from", "adopt", "abort"])]
     pub(crate) version: Option<String>,
 
     /// 从本地二进制文件安装（复制 → 校验 → 原子落位 → 滚动重启实例）。
-    /// 二进制的 `--version` 自报版本即安装目标版本。
+    /// 二进制的 `--version` 自报版本即安装目标版本（低于 0.2.0 的拒绝）。
     #[arg(long, value_name = "PATH", conflicts_with_all = ["adopt", "abort", "version"])]
     pub(crate) from: Option<String>,
 
@@ -210,7 +211,8 @@ pub(crate) struct InstallArgs {
     #[arg(long, value_name = "VARIANT", value_parser = ["v3", "baseline"])]
     pub(crate) variant: Option<String>,
 
-    /// 允许降级安装（目标版本 < 当前已安装版本时默认拒绝）
+    /// 允许降级安装（目标版本 < 当前已安装版本时默认拒绝）；低于 0.2.0 的版本
+    /// 仍然拒绝
     #[arg(long)]
     pub(crate) allow_downgrade: bool,
 

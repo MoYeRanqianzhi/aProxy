@@ -52,7 +52,7 @@
 
 ### W5 UI（Tauri 2，编进本体）
 - 构建：cargo feature `ui` 进 default features；`--no-default-features` 出无 UI 版本，不得多出任何依赖。
-- 进程模型：`aproxy ui` 起独立的 GUI 进程（窗口 + 托盘），守护进程永不加载 GUI；GUI 只经 IPC 与实例通信、
+- 进程模型：`aproxy desktop`（用户定的启动方式）起独立的 GUI 进程（窗口 + 托盘），守护进程永不加载 GUI；无 UI 版本也认得 `desktop`（帮助里隐藏），执行时说明这个版本没有桌面界面、该装哪个版本，非零退出——不让用户看到 clap 的「unrecognized subcommand」；GUI 只经 IPC 与实例通信、
   按显式 home 寻址，不开新网络端口。
 - 窗口外观按两个 skill 的做法（实现时用 Skill 工具调用它们，照 recipe 复制 assets）：
   - tauri-custom-titlebar：Windows 保留原生框架与标题栏按钮（Snap Layouts、系统菜单），`windows_titlebar.rs`
@@ -84,7 +84,7 @@
       资产、从而在改动前干净失败的办法之一）。
     - npm 平台子包从 9 个变 18 个：新包首发 OIDC 做不了，要所有者本地首发一次（记忆 trusted-publishing-new-crate-limit）。
     - 发布流水线时长与产物体积显著增加。
-  - aproxy.exe 是控制台程序，从快捷方式启动 `aproxy ui` 会闪控制台窗口：拟让 `ui` 分离出自身后父进程退出，
+  - aproxy.exe 是控制台程序，从快捷方式启动 `aproxy desktop` 会闪控制台窗口：拟让 `desktop` 分离出自身后父进程退出，
     或在独占控制台时释放它，实现时实测。
   - crates.io：默认 feature 含 UI，`cargo install aproxy` 需要包里带构建好的前端，Linux 还要 GTK 开发库；
     无 UI 用 `--no-default-features`。

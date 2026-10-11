@@ -30,7 +30,7 @@ rem Invoke-WebRequest (system built-in); all logic stays here in cmd.
 setlocal enabledelayedexpansion
 
 set "REPO=MoYeRanqianzhi/aProxy"
-set "HOME_DIR=%USERPROFILE%"
+set "HOME_DIR=%USERPROFILE%\.aproxy"
 if defined APROXY_HOME set "HOME_DIR=%APROXY_HOME%"
 set "BIN_DIR=%HOME_DIR%\bin"
 set "SKILLS_DIR=%HOME_DIR%\skills"

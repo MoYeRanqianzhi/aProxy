@@ -74,6 +74,7 @@
 - 安装进行中运行的 `aproxy` 命令（它们会顺带拉起 `install --continue`）不再可能与正在接手的进程同时推进同一个安装。此前在 Windows 交换后的接力窗口里，这样一个续作也能接手，两个进程同时滚动重启实例。
 - `--no-skills` 对安装的后续进程同样有效：Windows 上接力的进程、以及安装中断后的续作不再自行下载 skill 文档（此前会忽略这个选项照常下载）。
 - **看门狗即时重拉崩溃实例**：进程退出的事件一到就处理，崩溃实例在启动耗时内（通常不到 1 秒）回来；此前要等下一个扫描周期，默认最长约 30 秒断流。`stop --force` / `restart --force` 相应改为终止前先摘掉恢复记录（终止失败再放回），强停的实例不会被看门狗拉回；`restart --force` 也不再与看门狗同时拉起新实例争抢端口。
+- Windows 的 cmd 一键安装脚本（`scripts/install.cmd`）在没有设 `APROXY_HOME` 时，把二进制装到 `%USERPROFILE%\bin`、skill 文档装到 `%USERPROFILE%\skills`，而不是 aproxy 自己默认的 `%USERPROFILE%\.aproxy` 下；之后 `aproxy install` 管理的是 `.aproxy\bin`，两份二进制各管各的。现在默认装到 `%USERPROFILE%\.aproxy`，与 `install.ps1`、`install.sh` 一致。
 
 ## [0.1.0] - 2026-10-04
 

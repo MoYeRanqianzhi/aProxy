@@ -57,6 +57,8 @@
 - **本机陷阱**：在 `C:/Users/MoYeR` 之下、没有 package.json 的目录里运行 npm，会把用户目录下的 `.npmrc`（里面是
   失效的旧 token）当作 project 配置，覆盖 `--userconfig` 里的 token，表现为 401。在包目录里运行即可。
   `npm trust` 的参数要写成 `--userconfig=<路径>`（带等号），分开写会报「Unknown positional argument」。
+- 所有者 2026-10-11 告知 10 个包的绑定已完成（release.yml / release）。主代理用 GAT 看不了信任配置，没有独立核验；
+  0.2.0 第一次由 CI 发布 headless 包时若返回 404，先查这 10 个包的绑定。
 - 不把 token 写进任何文件：`--userconfig` 指向的临时文件里只写 `${NPM_TOKEN}` 占位，token 只在当条命令的
   环境变量里出现。crates.io 的 token 只用于只读核对（`GET /api/v1/trusted_publishing/github_configs?crate=`）：
   aproxy #19617、aproxy-envelope #23481/#23482、aproxy-format #23480 均在。

@@ -141,7 +141,19 @@ a local binary, `--adopt` takes over an existing install).
   during the rolling restart, `install` brings it back with the old binary and
   the original arguments, stops the rollout (the other instances are left
   alone) and exits non-zero; fix the cause and run `aproxy install` again.
-- Manual fallback: `aproxy stop all` → replace the binary → `aproxy restore`.
+- **Force install**: when a normal install fails or hangs, or the installed
+  version is too broken to run, use `aproxy install --force [VERSION|latest]`
+  (or `--from <downloaded binary>`). It skips the hand-over: it stops every
+  aproxy process of this home through the process ledger, swaps in the new
+  binary, and brings the instances back with the new version's `restore` and
+  their original arguments. That cuts every request in flight through aproxy at
+  once, so it asks for confirmation (add `--yes` when not interactive). If the
+  installed version does not run at all, download the new version yourself and
+  run `<new binary> install --force --from <new binary>`. Exit codes: 0 done;
+  10 nothing changed; 11 processes stopped but the binary not replaced (run it
+  again); 12 binary replaced but some instances did not come back (listed by
+  port; start them by hand). It does not update the skill documents; run
+  `aproxy install --skills-only` afterwards.
 
 From source:
 

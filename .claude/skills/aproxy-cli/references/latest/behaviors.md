@@ -441,8 +441,10 @@ commands.md. During the run:
   `failed` and the cause in `last_error`. Read startup.log, fix the cause, run `aproxy install` again.
   If the old binary cannot start the instance either, it is down but its restore record is kept, and
   `aproxy restore` brings it back after the fix.
-- The old binary is kept as `bin/aproxy.old.exe` (Windows) or `bin/aproxy.old` (Unix) for that
-  rollback and removed at the end; on Windows it stays until the next install if it is still locked.
+- The old binary is kept under a unique name, `bin/aproxy.old-<nanoseconds>-<pid>[.exe]`, for that
+  rollback and removed at the end. One that is still locked (Windows) stays until a later install
+  can delete it, and never blocks one. While `bin/` changes, the installer holds the lock
+  `<home>/install/lock`.
 - After the download is verified, the installer hands the install to the downloaded binary and waits
   for it (a downgrade is run by the installer itself). If that wait times out
   (`… 秒内未确认安装完成（可能仍在后台进行）…`, "completion not confirmed in time; may still be running"),
@@ -451,6 +453,9 @@ commands.md. During the run:
   watchdog, starts `install --continue` when `<home>/install/state.json` is left over.
 - Inside the swap window the watchdog gives a dying instance up to 5 × 3 s to come back on its own
   before respawning it, and instances do not relaunch a missing watchdog.
+
+None of this applies to `aproxy install --force`, which stops every process of the home, replaces
+the binary and then restores the instances (commands.md, Force install).
 
 ### Skill documentation
 

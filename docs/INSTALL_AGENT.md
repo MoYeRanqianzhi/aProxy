@@ -125,22 +125,41 @@ changing anything, with an error containing `--version 输出无版本号`. Stop
 instances with 0.1.x and reinstall, following "Moving from 0.1.x to 0.2.0" in
 the aproxy-cli skill's [compatibility.md](https://github.com/MoYeRanqianzhi/aProxy/blob/main/.claude/skills/aproxy-cli/references/latest/compatibility.md#moving-from-01x-to-020).
 
-**Version gate:** the `install` command exists from 0.1.0-alpha.10 on. Check
-`aproxy --version`; if `install` is not a known command on the installed build,
-upgrade manually (on macOS, where `aproxy install` is not supported yet, use
-this manual route as well):
+**Force install (0.2.0 and later), when the normal install fails or hangs, or
+the installed version is broken:** `aproxy install --force` skips the
+hand-over. It stops every aproxy process of this home (instances, watchdog,
+installers) through the process ledger, replaces the binary, and runs the new
+version's `restore` to bring the instances back with their original arguments.
+It is also the route on macOS, where the rolling `aproxy install` is not
+supported yet (neither is verified on real macOS hardware).
 
-1. `aproxy status` — list running instances.
-2. `aproxy stop all` — stop them (on Windows the running exe locks the binary;
-   stopping releases the lock).
-3. Replace the binary at `~/.aproxy/bin/aproxy[.exe]` with the new one
-   (download the matching `aproxy-<target>` asset from
-   <https://github.com/MoYeRanqianzhi/aProxy/releases> and verify its
-   `.sha256`).
-4. `aproxy restore` — bring the instances back.
+- It cuts every request in flight through aproxy at once, including your own
+  if your client goes through aproxy. Ask the user first. The command asks too,
+  and stops with exit code 10 when stdin is not a terminal and `--yes` is
+  missing; add `--yes` only after the user agreed.
+- Target: `aproxy install --force [VERSION|latest]` (online, chosen through the
+  release's `aproxy-manifest.json`) or `aproxy install --force --from <file>`.
+  Downgrades are allowed; nothing below 0.2.0 is installed. `--variant
+  desktop|headless` switches the build, e.g. to headless on a Linux machine
+  without the desktop libraries.
+- If the installed binary does not run at all, download the asset for this
+  platform from <https://github.com/MoYeRanqianzhi/aProxy/releases>, verify its
+  `.sha256`, and run the download itself:
+  `<downloaded binary> install --force --from <downloaded binary> --yes`.
+- Exit codes: `0` done. `10` nothing was changed; the `[ERROR]` line says why;
+  fix it and rerun. `11` processes were stopped but the binary was not
+  replaced; fix the reported cause and rerun the same command, or run
+  `aproxy restore` to bring the instances back on the old binary. `12` the
+  binary was replaced but the listed instances did not come back; start each
+  with `aproxy start <alias|config path>` and read `~/.aproxy/logs/startup.log`.
+- It does not update the skill documents; run `aproxy install --skills-only`
+  afterwards.
+- It stops only processes recorded in the ledger. Processes started by 0.1.x
+  (which keeps no ledger) are listed, not stopped; stop them with that 0.1.x
+  CLI as in "From 0.1.x to 0.2.0" above.
 
-Caution: only stop aProxy processes that belong to this installation
-(verified via `aproxy status`). Never kill unknown processes.
+Never kill aproxy processes by name: the user's own sessions may go through
+them.
 
 ## 3. Verify
 
@@ -254,6 +273,7 @@ troubleshooting — read them before improvising CLI flags.
 | Non-streaming (`"stream": false`) requests time out during long retries | they have no keepalive channel (nothing to inject heartbeats into): raise the client's own timeout |
 | `aproxy install` stopped with an instance rolled back | the new version failed to start for that instance; read `startup.log`, fix, rerun `aproxy install` |
 | `aproxy install` on 0.1.x fails with `--version 输出无版本号` | 0.1.x cannot install 0.2.0 or later; nothing was changed. Reinstall as described in "From 0.1.x to 0.2.0" (step 2) |
+| `aproxy install` keeps failing or hangs, or `aproxy` itself no longer runs | after the user agrees to cut in-flight requests: `aproxy install --force` (step 2, "Force install"); with a broken binary, run a downloaded release binary as `<it> install --force --from <it> --yes` |
 | `npm i -g @meowo/aproxy` installs an old version | pre-releases are published under the `next` tag: use `@meowo/aproxy@next` |
 | Everything else | `aproxy status`, then `aproxy logs <port>` — log files are randomly named per start; never guess them by port |
 

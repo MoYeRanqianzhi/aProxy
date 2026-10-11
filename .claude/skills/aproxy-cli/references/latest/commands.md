@@ -13,7 +13,8 @@ troubleshooting.md.
 - [start](#start) · [status](#status) · [stop](#stop) · [restart](#restart) · [logs](#logs) ·
   [restore](#restore)
 - [alias](#alias) · [find](#find) · [doctor](#doctor) · [config](#config)
-- [install / upgrade](#install--upgrade), including recovery from a failed install
+- [install / upgrade](#install--upgrade), including recovery from a failed install and
+  [force install](#force-install)
 
 ## Before you run commands
 
@@ -29,8 +30,9 @@ aProxy keeps everything under one home directory, written `<home>` below: the va
 | `<home>/settings.json` | aliases, the default config, global defaults (settings-json.md) |
 | `<home>/run/` | instance registry `<port>.pid`, restore records `<port>.restore`; `APROXY_RUN_DIR` relocates this directory alone |
 | `<home>/logs/` | instance logs (random file names) and `startup.log` |
-| `<home>/bin/` | the binary managed by `aproxy install` |
-| `<home>/install/` | `aproxy install`'s own files: the progress record `state.json` while an install runs, downloads and staged binaries in `staging/<version>/`, the install script's downloads in `bootstrap/` |
+| `<home>/bin/` | the binary managed by `aproxy install`; on Windows also `aproxy.bat` (see install / upgrade). Files named `aproxy.old-…` and `aproxy.tmp-…` are left by binary swaps; installs delete the ones they can |
+| `<home>/install/` | `aproxy install`'s own files: the progress record `state.json` while an install runs, downloads and staged binaries in `staging/<version>/`, the install script's downloads in `bootstrap/`, force install's download in `force/`, and `lock`, held while `bin/` changes |
+| `<home>/ledger/` | one `<pid>.json` per running aproxy process (instances, the watchdog, installers), written at start and deleted at exit. `aproxy install --force` finds the processes to stop here. Leave these files alone |
 | `<home>/skills/` | skill documents placed by `aproxy install` |
 
 ### Experiment in an isolated home
@@ -101,6 +103,8 @@ reaches only one of them; use ports.
 | config | success | invalid value, unparsable existing toml or settings.json, missing config file on read, write failure |
 | install | installed; already latest; channel empty; nothing to abort | any failure |
 
+`install --force` exits 0, 10, 11 or 12 instead; see install / upgrade, Force install.
+
 ### Processes you may see
 
 Instances, the watchdog and background install steps all run the same executable, which is why
@@ -111,6 +115,7 @@ killing `aproxy` by image name takes everything down at once. Tell them apart by
 | `--daemon-child` | a background instance; `aproxy status` maps its pid to a port |
 | `--daemon-watchdog` | the watchdog that restarts crashed or hung instances (behaviors.md, "Crash recovery and the watchdog") |
 | `install --continue` | a background step of an install that is finishing or resuming |
+| `install --force` | a force install in progress; it stops every other aproxy process of its home |
 
 These flags are internal; never pass them yourself.
 
@@ -450,12 +455,15 @@ aproxy start work
 ## install / upgrade
 
 ```
-aproxy install [latest|VERSION] [--pre] [--allow-downgrade] [--variant v3|baseline]
+aproxy install [latest|VERSION] [--pre] [--allow-downgrade] [--cpu x86-64-v3|baseline]
                [--download-proxy URL] [--no-skills]
 aproxy install --from PATH [--no-skills] [--download-proxy URL]
 aproxy install --adopt [--no-skills]
 aproxy install [latest|VERSION] --skills-only [--pre] [--download-proxy URL]
 aproxy install --abort
+aproxy install --force [latest|VERSION] [--pre] [--variant desktop|headless]
+               [--cpu x86-64-v3|baseline] [--download-proxy URL] [--yes]
+aproxy install --force --from PATH [--variant desktop|headless] [--yes]
 ```
 
 `aproxy upgrade` is the same command. `install` downloads (or copies) the binary into
@@ -464,19 +472,24 @@ aproxy install --abort
 reports the new version, and cleans up; each instance is restarted once, one at a time. How the
 swap and rollback work: behaviors.md, "Upgrades with aproxy install". `install` does not edit `PATH`; check that `aproxy` resolves
 to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running another copy.
+`--force` replaces the binary another way, for when this one fails: see
+[Force install](#force-install).
 
 | Option | Effect |
 |---|---|
 | `VERSION` | a version without the `v`, e.g. `0.2.0`; default `latest` |
 | `--pre` | resolve `latest` in the pre-release channel |
 | `--allow-downgrade` | allow a VERSION lower than the running CLI's version, but never below 0.2.0 |
-| `--variant v3\|baseline` | x86-64 build variant; default `v3` when the CPU has AVX2 |
-| `--download-proxy URL` | proxy for downloads only; default `download_proxy` in settings.json, then the environment's proxy settings. Unrelated to config.toml's `proxy` |
+| `--cpu x86-64-v3\|baseline` | which x86-64 build to download; default `x86-64-v3` when the CPU has AVX2. Only some targets publish an x86-64-v3 build |
+| `--download-proxy URL` | proxy for downloads only; default `download_proxy` in settings.json (not read by `--force`), then the environment's proxy settings. Unrelated to config.toml's `proxy` |
 | `--no-skills` | skip the skill update this time (permanently: `skill_auto_update` in settings.json) |
 | `--from PATH` | install a local binary; its `--version` output decides the version, with no downgrade check (below 0.2.0 is still refused) |
 | `--adopt` | copy the binary you are running into `<home>/bin/` and move running instances onto it |
 | `--skills-only` | update only the skill documents, to VERSION or, by default, the channel's latest version (the running version if the channel is empty) |
 | `--abort` | cancel an install that has not reached the swap |
+| `--force` | stop every aproxy process of this home and replace the binary without the hand-over ([Force install](#force-install)) |
+| `--yes` | with `--force`: do not ask for confirmation; required when stdin is not a terminal |
+| `--variant desktop\|headless` | with `--force`: the build to install, with or without the desktop interface; default the build you run |
 
 **Choosing the version.**
 
@@ -542,22 +555,71 @@ An install interrupted by a crash, kill or power loss leaves `<home>/install/sta
 watchdog and every other `aproxy` command resume it in the background. Do not delete that file by
 hand: it is what lets the install finish. `--abort` works only before the swap
 (`安装已中止，现场已清理（二进制与实例未受影响）。`, "aborted; binary and instances untouched");
-after it, the install can only be completed.
+after it, the install can only be completed. When none of this gets the install through, use
+[Force install](#force-install).
 
-**If `aproxy` itself will not run (Windows).** The swap renames the old binary to
-`<home>/bin/aproxy.old.exe` before moving the new one in, and `<home>/bin/aproxy.bat` runs
-`aproxy.old.exe` whenever `aproxy.exe` is missing, so the command keeps working from cmd and
-PowerShell through the swap. If neither binary runs, repair by hand, in this order:
+**If `aproxy` itself will not run.** On Windows the swap renames the old binary to a unique
+`<home>/bin/aproxy.old-<nanoseconds>-<pid>.exe` before moving the new one in, and
+`<home>/bin/aproxy.bat` runs the newest of those whenever `aproxy.exe` is missing, so the command
+keeps working from cmd and PowerShell through the swap. On Linux and macOS the swap is a single
+atomic rename, so there is no such gap. If no copy runs, force-install from a downloaded release
+binary, as the end of the next section describes.
 
-1. If `<home>/install/staging/<version>/aproxy.exe` exists, copy it to `<home>/bin/aproxy.exe`.
-2. Otherwise rename `<home>/bin/aproxy.old.exe` to `aproxy.exe` and run `aproxy install` again.
-3. Otherwise download a release binary and run `<downloaded binary> install --adopt`.
+Do not replace the binary by hand with `stop all` followed by `restore`: a graceful stop deletes the
+restore records, so `restore` finds nothing to start. Force install keeps those records and runs
+`restore` itself.
 
-On Linux and macOS the swap is a single atomic rename, so there is no such gap.
+### Force install
 
-**Replacing the binary without `install`** (last resort, one restart per instance): put the new
-binary at `<home>/bin/aproxy(.exe)` (on Windows rename the old file aside first; a running
-executable can be renamed but not overwritten), then run `aproxy restart <port>` for each instance
-in `aproxy status`. `restart` launches the binary you invoke it with and keeps each instance's
-arguments. Do not use `stop all` followed by `restore` for this: a graceful stop deletes the
-restore records, so `restore` finds nothing to start.
+`aproxy install --force` (0.2.0 and later) is the fallback for when a normal install keeps failing
+or hangs, or when the installed version is too broken to run. It does not hand the install over to
+the new version or restart instances one at a time. It:
+
+1. gets the target and checks it on this machine before changing anything: online through the
+   `aproxy-manifest.json` attached to the release (asset picked by platform, variant and CPU, then
+   its sha256 checked), or the file given with `--from`; then it runs the target's `--version`;
+2. asks for confirmation;
+3. stops every process recorded in `<home>/ledger/`: installers first, then the watchdog, the
+   instances and anything else. It checks each process's start time before stopping it, so a pid
+   that now belongs to another program is never hit, and it never stops processes by name;
+4. empties `<home>/install/`, discarding any unfinished normal install;
+5. replaces the binary in `<home>/bin/`;
+6. runs the new binary's `aproxy restore`, which starts the stopped instances with their original
+   arguments, and checks the ledger for an instance on each of their ports;
+7. lists processes that run from `<home>/bin/` but are not in the ledger, without stopping them.
+
+**Before you run it.** It cuts every request in flight through aProxy at once, including your own
+when your client points at one of these instances, and it stops instances the user may be using in
+other sessions. Tell the user that and get their agreement first. The command lists the processes
+it will stop and asks `确认强制安装？输入 y 继续 [y/N]:` ("confirm the force install? type y to
+continue"). When stdin is not a terminal, as in an agent's tool call, it does not wait: it exits 10
+and asks for `--yes`. Add `--yes` only once the user has agreed.
+
+**Choosing the target.** `latest` (the default) and VERSION follow the normal channel rules, `--pre`
+included, but only releases that carry `aproxy-manifest.json` count, which means 0.2.0 and later.
+The version is not compared with the current one, so downgrades need no flag; nothing below 0.2.0
+is installed. `--variant` defaults to the variant of the binary you run, the first word in the
+parentheses of `aproxy --version`; on Linux without the desktop libraries (WebKitGTK), install
+`--variant headless`. Force install reads no config file and no settings.json, so pass
+`--download-proxy URL` if downloads need a proxy. It does not update the skill documents; run
+`aproxy install --skills-only` afterwards.
+
+**Reading the result.**
+
+| Exit | Meaning | Next step |
+|---|---|---|
+| 0 | done: binary replaced, every stopped instance back on its port (`强制安装完成`, "force install complete") | none; `aproxy install --skills-only` for matching skill documents |
+| 10 | stopped before changing anything: the download, checksum or `--version` check failed, the target is below 0.2.0 or of the wrong variant, or there was no confirmation (`什么都没有改动`, "nothing was changed") | fix what the `[ERROR]` line names and run it again |
+| 11 | processes were stopped but the binary was not replaced: another process holds the install lock or the binary file, a process could not be stopped (another user's, or an elevated one), or a file could not be written | fix the reported cause and run the same command again; every step can be repeated. To give up for now, `aproxy restore` starts the stopped instances on the old binary |
+| 12 | the binary was replaced, but the instances listed after `二进制已换好，但下面这些被结束的实例没有回来` ("binary replaced, but these stopped instances did not come back") are down | start each with `aproxy start <alias or config path>`; `<home>/logs/startup.log` has the reason, often a config file that was moved or deleted |
+
+Two more notes can appear. `看护者已被结束…` ("the watchdog was stopped") is expected: a restored
+instance relaunches it within 5 minutes, and so does the next `aproxy start`.
+`注意：下面这些进程从 <dir> 运行，但不在台账里…` ("these processes run from `<dir>` but are not in the
+ledger") lists processes force install did not stop, usually 0.1.x instances or watchdogs, which
+keep no ledger. Stop those with the 0.1.x CLI (compatibility.md, "Moving from 0.1.x to 0.2.0").
+
+**When the installed `aproxy` does not run at all.** Download the release asset for this platform
+from https://github.com/MoYeRanqianzhi/aProxy/releases, check it against its `.sha256`, and, once the
+user has agreed, run the downloaded file itself:
+`<downloaded binary> install --force --from <downloaded binary> --yes`.

@@ -53,6 +53,7 @@ home 的实例。
 | `src/settings.rs` | 内部配置（`~/.aproxy/settings.json`，唯一）：别名表、全局默认等程序管理状态 |
 | `src/daemon.rs` | 守护编排：IPC（ping/shutdown/观测）、实例注册表、恢复记录、孤儿清理 |
 | `src/watchdog.rs` | 看门狗：claim 选举、进程身份（pid + 创建时间）核验、进程探活/句柄等待、共享内存心跳、重拉退避状态机 |
+| `src/ledger.rs` | 进程台账 `<home>/ledger/`（永久兼容契约 C3）：长期运行的进程登记 pid、启动标记与角色，强制安装据此核验后结束进程 |
 | `src/util.rs` | bin 侧共用小工具：时间戳、时长人性化、凭据打码、key=value 解析 |
 
 ## workspace 三成员
@@ -404,8 +405,9 @@ settings 注入、validate）干跑一遍，换监听地址时再探测新地址
 `aproxy install` 把二进制安全落位到 `~/.aproxy/bin/`，对客户端 ≈ 无感。
 四条铁律：先标记（install.state 先于一切动作，崩溃可识别）、先下载后
 rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC PrepareSwap
-广播，实例把自己的可观测状态置为 `swap_prepared`）、逐个重启最后删除（.old 在
-终验后清理）。模块 `src/install/`：
+广播，实例把自己的可观测状态置为 `swap_prepared`）、逐个重启最后删除（让位的旧二进制
+`aproxy.old-…` 在终验后清理）。普通安装走不通时另有强制安装（见下文 force）。模块
+`src/install/`：
 
 - **更新通道**（`download::Channel`，`latest` 解析的单一真相源，github/npm 两个
   查询入口与 CLI 的「是否需要安装」决策都以它为准）：Stable 只在正式版（无预发布
@@ -422,6 +424,9 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
   `state.json`、备料与下载暂存 `staging/<版本>/`、一键脚本的下载暂存 `bootstrap/`，
   别处一律不写（skill 目录自己的 `.dl`、`.staging` 除外，要与目标同卷原子替换）。
   这是强制安装的永久兼容契约 C4 的路径部分：它可以整目录清空而不必认识内容。
+  其中 `lock` 是操作系统级排他锁（`install::lock_install_in`，标准库文件锁，进程死亡
+  即释放），任何版本修改 `bin/` 期间都持有它——state 文件管「同一时刻只有一个安装」，
+  锁管「改 bin 的那一刻没有别人在改」，强制安装不读 state，只认锁。
   0.1.0 写在 `run/install.state` 与 `staging/` 的现场因此读不到，与新安装器自然隔离
 - **版本**：`--version` 首行是永久格式 `aproxy v<semver> (<变体>; <目标三元组>[; x86-64-v3])`
   （`aproxy::VERSION_LINE`，契约 C5），在一切副作用之前输出；安装器靠它认版本
@@ -433,9 +438,14 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
   swapping 前可回滚。交棒后等待结局的往往是较旧的二进制，所以阶段词表与
   字段名冻结、新字段一律可选
 - **staging**：备料区（复制/chmod/sha256/`--version` 试跑自证）
-- **swap**：平台收口点——Windows copy+双 rename 舞（bin 永不空窗 + .old
-  固定名 + PATHEXT fallback 入口脚本常驻）；unix 单步 rename 原子覆盖
-  （无空窗无 .old）
+- **swap**：平台收口点（契约 C2）。新文件先以唯一名 `aproxy.tmp-<纳秒>-<pid>` 落进
+  bin，旧二进制让位为唯一名 `aproxy.old-<纳秒>-<pid>`（Windows 用不覆盖的
+  MoveFileExW 改名——`std::fs::rename` 在 Windows 上会替换已存在的目标；unix 留一个
+  硬链接，不支持时复制），再把新文件改名到位；落位后在新位置跑一次 `--version`
+  核对，不符就换回。从不用固定的中间名：上一次让位的旧文件还被占着时，固定名必然
+  撞名。删得掉的 `aproxy.old-*`、`aproxy.tmp-*` 残留在每次交换前清掉，删不掉的跳过。
+  Windows 另有 PATHEXT 兜底入口 `aproxy.bat`（`aproxy.exe` 缺席的空窗里运行最新的
+  `aproxy.old-*.exe`），由 swap 在每次交换前写入
 - **announce**：安装态宣告节（Windows 命名节 / unix /dev/shm，进程退出即
   解除）——看护者/守护的差异化行为全部由它门控：实例死亡复查 5×3s、
   install 保活续作、守护自检补种抑制
@@ -444,10 +454,10 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
   （bind 前退出、8 秒内没就绪）则用旧二进制按原参数把该实例拉回并置 `halted`，
   由 flow 中止滚动、剩余实例不动。回滚的只是这一个实例的服务——与 forward-fix
   铁律（swapping 之后只进不退）兼容：bin 里的新二进制与阶段都不回退（阶段落
-  failed 保留现场），自动续作不再重试。旧二进制的来源：Windows `aproxy.old.exe`
-  （双 rename 的产物）；unix 在单步 rename 覆盖前把旧二进制硬链接（失败则复制）
-  为 `bin/aproxy.old`——覆盖后旧 inode 只挂在运行中进程上，文件系统里已无路径可
-  执行，所以必须先留副本；cleaning 阶段删除
+  failed 保留现场），自动续作不再重试。旧二进制的来源：交换让位之前记进 install.state
+  的 `old_path`（`aproxy.old-…`：Windows 是改名让位的原文件；unix 是单步 rename 覆盖前
+  留下的硬链接或副本——覆盖后旧 inode 只挂在运行中进程上，文件系统里已无路径可
+  执行，所以必须先留）；cleaning 阶段删除
 - **flow**：编排（管辖检查 → 备料 → 早交接 → 广播 ACK → 交换 → 滚动重启 →
   终验 → 清理）；任何中断点由 `--continue` 幂等续作（恢复矩阵：看护者主责 +
   CLI 入口兜底，全自动无询问）。早交接：备料校验通过后，安装者以
@@ -463,9 +473,27 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
   镜像）、cargo=本地编译自证；下载代理（download_proxy/--download-proxy）
   与上游请求代理绝对分离
 - **skills**：skill 文档支线（并行下载、失败不影响安装、原子目录替换）
+- **force**（`aproxy install --force`，契约 C6–C8）：普通安装失败、卡住或装着的版本坏了
+  时的兜底。从 0.2.0 起，任意版本的强制安装都要能装任意版本、结束任意版本启动的进程，
+  所以它只依赖冻结的 C1–C8，不走 IPC、不读注册表与 install.state、不读写配置与
+  settings（main 在读它们之前就分流）。先验证、后破坏：目标取进 `install/force/<pid>/`
+  （在线读 release 附带的发布清单 `aproxy-manifest.json` 选资产并比对 sha256，或
+  `--from`），在本机跑通 `--version` 之前什么都不停；确认（非终端要 `--yes`）→ 按台账
+  结束安装者 → 拿锁 → 结束其余角色（连续两轮没有存活条目为止，有上限）→ 清空
+  `install/` → swap → 用新二进制的 `restore` 拉回实例（被强制结束的实例留着
+  `.restore`），按台账看被结束实例的端口上有没有新的 instance 条目 → 报告台账外、从
+  bin 运行的进程（只报告）。退出码冻结：0 完成；10 什么都没动；11 进程已停、二进制没
+  换；12 二进制已换、有实例没回来。契约样本钉在 `tests/force_contract.rs`
+- **台账**（`src/ledger.rs`，契约 C3）：实例、看护者与安装者在占端口或拉子进程之前原子
+  写入 `<home>/ledger/<pid>.json`（pid、启动标记、角色、版本，可选端口与说明），正常
+  退出删除，`process::exit` 一律经 `ledger::exit`。启动标记按平台冻结（Windows 创建时间
+  FILETIME、Linux boot_id + starttime、macOS proc_bsdinfo 的启动秒与微秒）；结束前在
+  同一个进程句柄（Windows）或 pidfd（Linux）上核验，pid 复用不会误杀。台账与实例
+  注册表分开（G3）：注册表可以随版本演进，台账只回答「这个 home 有哪些 aproxy 进程、
+  怎样确认 pid 仍是它」
 
 跨平台分工：状态机/IPC/恢复全部平台无关，平台分支只收口在交换原语、
-宣告节介质、可执行位三处。
+宣告节介质、可执行位，以及台账的启动标记与核验后结束（`ledger::imp`）。
 
 ## 测试
 

@@ -14,6 +14,7 @@
 - **`--version` 输出改为永久格式** `aproxy v<版本> (<变体>; <目标三元组>[; x86-64-v3])`，例如 `aproxy v0.2.0 (desktop; x86_64-pc-windows-msvc; x86-64-v3)`：变体是 `desktop`（带桌面界面的版本）或 `headless`（无界面版本），最后一段只在 x86-64-v3 构建上出现。之后的每个版本都按这一格式输出、安装器也按它认版本，格式不再改动。解析过 `aproxy <版本>` 的脚本请改为取首行 `aproxy v` 之后、到空格为止的部分。`aproxy --version` 与 `aproxy -V` 不读写 `APROXY_HOME`、不联网、不拉起任何进程。
 - **安装状态挪到 `<home>/install/`**：状态文件由 `run/install.state` 改为 `install/state.json`，备料与下载暂存由 `staging/<版本>/` 改为 `install/staging/<版本>/`，一键安装脚本的下载暂存由 `staging/bootstrap` 改为 `install/bootstrap`。0.1.0 留下的 `run/install.state` 与 `staging/` 不再被读取。
 - **`aproxy install` 拒绝低于 0.2.0 的版本**：在线安装指定的版本号与 `--from` 的二进制都一样，`--allow-downgrade` 也不行，报 `目标版本 <版本> 低于 0.2.0，不能安装：…` 并说明怎样回到 0.1.x。0.2.0 的预发布（alpha、beta、rc）不受影响。
+- **`aproxy install` 的指令集档参数改名为 `--cpu`**：原来的 `--variant v3|baseline` 改为 `--cpu x86-64-v3|baseline`（与 `--version` 末段的写法一致）。`--variant` 改为只与 `--force` 搭配，取 `desktop|headless`；单独使用报命令行用法错误。
 
 #### 从 0.1.x 迁移
 
@@ -32,6 +33,8 @@
 
 ### 新增
 
+- **强制安装 `aproxy install --force`**：普通安装失败、卡住，或装着的版本坏到跑不起来时使用。它不走交接：先取得并核对目标（在线时读 release 附带的发布清单 `aproxy-manifest.json` 选资产、比对 sha256，或用 `--from <文件>`），在本机跑通它的 `--version`；确认之后按进程台账结束这个 home 下的全部 aproxy 进程（安装者、看护者、实例），清空 `<home>/install/`，换上新二进制，再用新版本的 `aproxy restore` 按原参数拉回实例。这会立即中断所有经 aproxy 的在途请求，所以先确认；标准输入不是终端时必须加 `--yes`。可以降级，但不装低于 0.2.0 的版本；`--variant desktop|headless` 选变体，默认与当前相同。它不读配置与 `settings.json`（损坏的配置挡不住它），也不更新 skill 文档（之后执行 `aproxy install --skills-only`）。退出码：0 完成；10 什么都没改；11 进程已停、二进制没换（再执行一次即可，或 `aproxy restore` 用原来的二进制拉回实例）；12 二进制已换、有实例没回来（按端口列出）。装着的版本连运行都不行时，手动下载新版本，执行 `<新版本> install --force --from <新版本>`。从 0.2.0 起，任何版本的强制安装都能安装任何版本、结束任何版本启动的进程，这套约定（目录布局、台账、发布清单、命令行与退出码）不再改动。
+- **进程台账 `<home>/ledger/`**：实例（后台与前台）、看护者与安装者在占用端口或拉起子进程之前写一条 `<pid>.json`（pid、进程启动标记、角色、版本，实例另记端口与配置文件），正常退出时删除；写失败只告警、照常运行。强制安装只按台账找进程，结束前核验启动标记，pid 已被别的进程复用时只删条目、不结束。0.1.x 不写台账，它启动的进程由强制安装列出、不结束。
 - **可自定义心跳**：config.toml 的 `keepalive_heartbeat` 指定每个保活间隔写给客户端的字节，默认仍是 SSE 注释 `: keepalive`。aProxy 不认识协议，心跳的形态由用户按客户端决定，例如解析器容不下注释的客户端可改成空行 `"\n"`。启动与 `aproxy doctor` 校验它写完后客户端的 SSE 解析器停在事件边界（非空、以换行结尾、含 `event:`/`data:` 等字段行时以空行收尾），否则心跳会和回放的第一个上游事件拼在一起。
 - **转换器信封加 `stage`、`request_id`、`state`**：同一客户端请求的请求转换与响应转换收到同一个 `request_id`；请求转换回信里的 `state`（不透明字符串）由 aProxy 按请求保存、交给响应转换，两个转换器不必再只靠 `url` 反查当初的决定。字段都是可选的，不读它们的 format 程序不受影响。信封契约 crate `aproxy-envelope` 随之升到 0.2.0。
 - **心跳转换器 `heartbeat_transform`**：保活响应等待期间，每一拍交给 format 程序按请求内容生成心跳（信封 `stage = "heartbeat"`，首拍带请求体，另附第几拍、已等待毫秒数与当前第几次上游尝试），能按协议发出客户端认可的内容。它不会拖住心跳：上一拍没回来、调用失败或回信不合事件边界规则时，这一拍改发固定心跳（每个请求只告警一次）；回放开始后才回来的心跳直接丢弃。心跳回信的 `state` 同样交给之后的响应转换。
@@ -39,6 +42,8 @@
 
 ### 变更
 
+- **交换二进制改用唯一的中间名，并持有安装锁**：旧二进制让位为 `aproxy.old-<纳秒时间戳>-<pid>[.exe]`，新文件先落在 `aproxy.tmp-<纳秒时间戳>-<pid>[.exe]`，名字已存在就换一个。此前的固定名 `aproxy.old(.exe)` 在短时间内连续安装两次、上一次的旧文件还被占着时必然改名失败。删得掉的 `aproxy.old-*`、`aproxy.tmp-*` 残留在每次交换前清掉，删不掉的（仍被占用）跳过，不再挡住安装。修改 `bin/` 期间持有操作系统级排他锁 `<home>/install/lock`（进程退出即释放）。unix 上让位的旧二进制同样以 `aproxy.old-…` 保留到终验之后。Windows 的入口兜底脚本 `bin/aproxy.bat` 在 `aproxy.exe` 缺席时运行最新的 `aproxy.old-*.exe`，改由 `aproxy install` 在每次交换前写入，一键安装脚本不再写它。
+- 源码编译（`cargo install aproxy`）需要 rustc 1.89 或更新的版本（此前 1.88）：安装锁用到 1.89 起稳定的标准库文件锁。
 - **控制协议整理为 v1**：请求是 `{"v":1,"op":"ping|shutdown|prepare_swap"}`，成功应答是 `{"v":1,"ok":true,"result":{…}}`，`result` 含注册记录 `instance`、所属 `run_dir`、状态 `state`（`serving` / `swap_prepared` / `stopping`，取代原来的 `swap_phase` 布尔值）、观测值 `activity` 与支持的 `ops`；失败应答带稳定的错误码（`bad_request`、`unsupported_version`、`unknown_op`、`invalid_state`）与说明。注册记录 `run/<端口>.pid` 只保存实例身份字段，请求数、重试数、最近错误等实时值只经控制通道提供。0.1.0 不带 `v` 的请求与应答不再被认，见「破坏性变更」。
 - **skill 文档改为英文并重写**：aproxy-cli 与 aproxy-format 两个 skill 按 skill-creator 标准重写，面向操作 aProxy 的 agent。每条事实都对照源码核实；程序输出的中文原文照录，并附英文释义。aproxy-cli 新增 `clients.md`（接入各 agent 客户端）与 `troubleshooting.md`（症状 → 原因 → 处理），`compatibility.md` 讲版本判定、0.1.0 与开发线的差异，以及怎样从 0.1.x 迁到 0.2.0、怎样退回 0.1.x。
 - **安装由目标版本执行**：`aproxy install` 下载并校验目标版本后，把广播、交换、滚动重启、终验与清理交给这个新二进制执行（所有平台），发起安装的进程只等待并转告结局，输出 `新版本进程已接手安装（广播、交换、滚动重启、终验），等待其完成...`。从这一版起，每次升级都由新版本驱动，新版本能修掉旧安装器的缺陷。降级仍由发起安装的进程自己执行。新二进制没能接手时，安装以 `目标版本没有接手安装（…）；实例与 bin 里的二进制都未改动` 失败收场。

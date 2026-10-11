@@ -1,6 +1,6 @@
 ---
 name: aproxy-cli
-description: Operate and configure aProxy, the local API proxy that retries failed LLM API requests indefinitely so agent workflows keep running. Covers every aproxy command (start, status, stop, restart, logs, restore, alias, find, doctor, config, install/upgrade), the config.toml and settings.json fields, runtime behavior (retries, keepalive heartbeats, multiple instances, logs, watchdog), connecting agent clients such as Claude Code and Codex, and troubleshooting. Use this skill whenever the user mentions aproxy or wants an agent client routed through a local retrying proxy, even if they do not ask for documentation - for example "point Claude Code at aproxy", "add a second instance on port 12346", "why is the port still in use after stop", "/compact hangs behind my relay API", "aproxy logs are garbled". Configuring request_transform / response_transform on the aProxy side is covered here; writing the format program itself belongs to the aproxy-format skill.
+description: Operate and configure aProxy, the local API proxy that retries failed LLM API requests indefinitely so agent workflows keep running. Covers every aproxy command (start, status, stop, restart, logs, restore, alias, find, doctor, config, install/upgrade, and install --force when an upgrade fails or the binary is broken), the config.toml and settings.json fields, runtime behavior (retries, keepalive heartbeats, multiple instances, logs, watchdog), connecting agent clients such as Claude Code and Codex, and troubleshooting. Use this skill whenever the user mentions aproxy or wants an agent client routed through a local retrying proxy, even if they do not ask for documentation - for example "point Claude Code at aproxy", "add a second instance on port 12346", "why is the port still in use after stop", "/compact hangs behind my relay API", "aproxy logs are garbled". Configuring request_transform / response_transform on the aProxy side is covered here; writing the format program itself belongs to the aproxy-format skill.
 ---
 
 # aProxy
@@ -119,6 +119,12 @@ recovery from an interrupted install are in [commands.md](references/latest/comm
 ("no version number in the --version output") before changing anything, and the two lines cannot
 control each other's instances. Move by reinstalling, as
 [compatibility.md](references/latest/compatibility.md) describes.
+
+When an install keeps failing or hangs, or the installed binary is broken, `aproxy install --force`
+stops every aProxy process of the home, replaces the binary and restores the instances. It cuts
+every request in flight, your own included if your client goes through aProxy, so get the user's
+agreement first; in a tool call it does not prompt and needs `--yes`. Exit codes 10, 11 and 12 each
+call for a different next step: commands.md, "Force install".
 
 ## Where to look
 

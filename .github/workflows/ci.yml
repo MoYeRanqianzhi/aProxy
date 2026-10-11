@@ -68,7 +68,9 @@ jobs:
       - run: cargo test --workspace --locked --no-fail-fast
 
   upgrade-from-0-1-0:
-    # 真实 v0.1.0 二进制驱动的原地升级（tests/upgrade_from_0_1_0.rs，平时 #[ignore]）。
+    # 0.1.0 的安装器碰到当前构建必须在改动任何东西之前失败（0.2.0 起不支持原地升级，
+    # 靠 --version 的永久格式挡住 0.1.0 的版本探测）：真实 v0.1.0 二进制起实例、用它的
+    # install --from 装当前构建，断言干净拒绝（tests/upgrade_from_0_1_0.rs，平时 #[ignore]）。
     # 只在 CI 跑：开发机上往往有用户正在用的 0.1.0 实例，0.1.0 的 Windows 控制管道
     # 按端口全机共享，测试里的 0.1.0 二进制可能碰到它们。
     strategy:

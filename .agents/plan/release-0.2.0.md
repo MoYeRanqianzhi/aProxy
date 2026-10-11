@@ -9,6 +9,21 @@
 0.2.0 是去兼容、改契约的最后一次廉价机会：发布后 IPC、磁盘布局、config.toml / settings.json、CLI、HTTP
 错误体、信封都要长期稳定。所以先把这些契约重新设计到满意，再在上面做 i18n、skill 命令与 UI。
 
+## 发版节奏（用户 2026-10-11）
+
+功能很多，所以先发一个测试版 **v0.2.0-alpha.1**，内容是早期 UI 原型 + 强制安装，同时验证可信发布（10 个 headless npm
+包第一次经 OIDC 发布、crates.io、带 UI/无 UI 双矩阵、发布清单）。之后剩余内容逐项完成，主代理在值得的节点自行打 tag 发版。
+
+**alpha.1 的范围与顺序**（本机空闲内存约 3 GB，任何时刻只跑一个 cargo 重编译；不编译的工作可并行）：
+1. W1 去兼容 + 版本号改 0.2.0-alpha.0 + `--version` 新格式（C5）+ 安装状态迁到 `<home>/install/`（C4 的路径部分）+
+   版本下限 0.2.0 + CI 的 upgrade-from-0-1-0 改为断言「0.1.0 干净拒绝」。
+2. 进程台账 + 强制安装（C1–C8 全部，含锁、唯一中间名、契约测试、注释、AGENTS.md 一句）。
+3. Tauri 外壳：`desktop` feature（默认开）、`aproxy desktop` 打开原型界面（假数据）、无 UI 版的 `desktop` 提示、build.rs、
+   Tauri 只进 bin 不进 lib 与测试（RT-05）、自定义标题栏与 Mica（默认关）按两个 skill 落地。
+4. 发布流水线：22 个产物双矩阵（Linux 带 UI 版在 ubuntu-22.04 原生构建，musl 带 UI 版在 Alpine 容器）、前端构建步骤、
+   发布清单 `aproxy-manifest.json`、npm headless 组、crates.io 带前端产物发布；CI 先在推送时构建两种变体验证。
+5. CHANGELOG、skill（强制安装用法、迁移步骤）、文档的最小更新 → 打 `v0.2.0-alpha.1` → 盯 Release 与发布结果。
+
 ## 工作流（顺序暂定，审查结果回来后细化）
 
 ### W1 去除兼容

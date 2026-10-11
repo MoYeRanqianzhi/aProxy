@@ -22,6 +22,8 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] **W3 i18n**（给用户看的 en/zh-CN，给 agent 或不可见的固定英文）
 - [ ] **W4 `aproxy skill` 命令**（install/upgrade/list/show，show 的安全设计，`--help` 末尾提示行）
 - [ ] **W5 UI**（Tauri 2 编进本体、`desktop` feature 默认开、headless 版本；自定义标题栏；Mica 默认关可开）
+- [ ] **README 截图**（用户 2026-10-12）：UI 完成后构造演示数据，拍中英两套截图，中文版用于 README.md，英文版用于
+  README_EN.md。演示数据里不能出现真实的 key、上游地址或个人信息
 - [ ] **W6 审查发现的修复与重构**；另含 W1 留下的：`install --from` 不做降级检查（审查 CI-06）
 - [ ] **W7 发布 0.2.0**
 

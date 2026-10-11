@@ -36,4 +36,5 @@
 - [Gemini CLI 与保活](memory/2026-10-04-gemini-cli-sse-parsing.md) — Gemini 流请求不触发保活（默认可用但受写死的 300s 响应头超时限制）；注释心跳会触发 @google/genai 1.30.0 解析 bug 吞掉整段响应，空行前缀无害（真实客户端实测）[[codex-stream-idle-timeout]]
 - [agent 客户端流超时调研](memory/2026-10-04-agent-client-timeouts-survey.md) — 判断法（字节级续得住、事件级续不住）+ Qwen Code / dsh / pi / OpenCode / Aider / Cline / Roo / Kimi 的源码依据与核实程度 [[codex-stream-idle-timeout]] [[gemini-cli-sse-parsing]]
 - [0.2.0 定调](memory/2026-10-11-0.2.0-direction.md) — 用户 2026-10-11：去掉全部兼容（含 0.1.0 原地升级）、前瞻稳定优先、给人看的 i18n 给 agent 的固定英文、注释文档仍中文、Tauri 编进本体默认启用（另出无 UI 版）、Mica 默认关、新增 aproxy skill 命令 [[ipc-v1-upgrade-contract]]
+- [桌面界面风格](memory/2026-10-11-ui-design-style.md) — 用户要求：新颖、略高对比、鲜艳不刺眼、柔和圆润可爱、有动效；先浏览器原型审风格，通过后再接入与做日志性能 [[0.2.0-direction]]
 - [IPC v1 与升级契约](memory/2026-10-06-ipc-v1-upgrade-contract.md) — 跨版本永久接口清单（.pid/.restore/claim/install.state 词表/socket 路径/CLI 含 --handover-from）、早交接由目标版本驱动、0.1.x 兼容窗口 0.2.0 删除；改这些前先跑 compat_v0_1_0 [[install-pitfalls]] [[ci-unix-blindspot]]

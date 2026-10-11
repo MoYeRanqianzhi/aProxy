@@ -3,7 +3,7 @@ name: ipc-v1-upgrade-contract
 description: 改控制协议、.pid/.restore/claim/install.state 格式、install 流程或 CLI 参数之前读——哪些是跨版本永久接口、0.1.x 兼容窗口何时结束、为什么
 metadata:
   type: project
-  scope: src/daemon.rs、src/compat_0_1_0.rs、src/install/、src/watchdog.rs 的 claim、src/cli.rs 的隐藏参数
+  scope: src/daemon.rs、src/install/、src/watchdog.rs 的 claim、src/cli.rs 的隐藏参数
   status: active
   last_verified: 2026-10-06
 ---
@@ -31,11 +31,13 @@ metadata:
 **0.1.x 兼容窗口**：0.1.0 的安装器能直接跳到任何后续版本，且那一跳由 0.1.0 的代码驱动，所以
 `src/compat_0_1_0.rs` 的 S1–S5 与 `continue_install` 里的 relaying 豁免要保留整个 0.1.x 线，0.2.0 一起删，
 CHANGELOG 写明升级下限（先装到 0.1.x 的某个版本）。2026-10-11 用户改为：0.2.0 不留 0.1.0 原地升级，0.1.0
-用户重新安装（[[0.2.0-direction]]）；本清单在 0.2.0 重新设计后整份重写，0.2.0 发布时冻结。
+用户重新安装（[[0.2.0-direction]]）；本清单在 0.2.0 重新设计后整份重写，0.2.0 发布时冻结。2026-10-12 W1 已删除
+兼容层（af70c56，连同 `tests/compat_v0_1_0.rs`）：0.1.0 的安装器碰到 0.2.0 起的构建，会因 `--version` 的新格式
+在交换之前失败；install.state 挪到 `<home>/install/state.json`，可安装版本下限 0.2.0。
 
-**How to apply:** 动上面任何一项前，先跑 `tests/compat_v0_1_0.rs`（冻结的 0.1.0 结构，双向解析），想清楚
-更旧的读者会怎样；新字段用 serde default。改 install 流程要让 `tests/upgrade_from_0_1_0.rs`（CI 的
-upgrade-from-0-1-0 任务）保持通过。设计全文与逐条依据（含 0.1.0 → 新版本每一步由谁执行的分析）在计划的最后版本：
+**How to apply:** 动上面任何一项前，想清楚更旧的读者（0.2.0 起的旧版本）会怎样；新字段用 serde default。
+改 install 流程要让 `tests/upgrade_from_0_1_0.rs`（CI 的 upgrade-from-0-1-0 任务，现在断言 0.1.0 干净拒绝）
+保持通过。设计全文与逐条依据（含 0.1.0 → 新版本每一步由谁执行的分析）在计划的最后版本：
 `git show 9e91a95:.agents/plan/ipc-v1.md`。
 
 **Evidence:** CI 88cf50c（2026-10-06）upgrade-from-0-1-0 在 windows 与 ubuntu 上用真实 v0.1.0 二进制驱动升级

@@ -135,6 +135,8 @@ pub(crate) enum Commands {
     /// 一键恢复先前在运行、因崩溃/断电/系统重启而消失的实例。
     /// 无可恢复实例时静默结束（适合配置为开机自启）。
     /// 已在运行的实例自动跳过；配置文件已不存在的记录被清理。
+    // 永久兼容契约 C7：restore 子命令永远存在、名字不变——任何版本的强制安装换好二进制
+    // 之后，都执行新二进制的 `restore` 把被结束的实例拉回来（见 aproxy::install::force）
     Restore,
 
     /// 管理配置别名（存于 ~/.aproxy/settings.json，内部配置不建议手改）。
@@ -213,6 +215,10 @@ pub(crate) struct InstallArgs {
     /// （非交互环境加 --yes）。目标取 VERSION（默认 latest）或 --from；隐含允许降级，
     /// 低于 0.2.0 的版本仍不装；不更新 skill 文档。退出码：0 完成；10 什么都没改；
     /// 11 进程已停、二进制没换；12 二进制已换、有实例没恢复
+    // 永久兼容契约 C7：`install --force [VERSION|latest] [--from <文件>] [--variant
+    // desktop|headless] [--yes]` 与 `upgrade --force` 的写法、退出码 0/10/11/12 无论如何
+    // 都不得改动，只许追加可选参数——agent 与脚本照着写在各处的命令行修复坏掉的安装，
+    // 任何版本都要认得（样本钉在 tests/force_contract.rs）
     #[arg(long, conflicts_with_all = ["adopt", "abort", "skills_only", "continue_"])]
     pub(crate) force: bool,
 

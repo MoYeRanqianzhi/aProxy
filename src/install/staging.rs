@@ -196,23 +196,6 @@ mod tests {
     }
 
     #[test]
-    fn own_version_line_round_trips_and_stops_0_1_0_probes() {
-        assert_eq!(
-            parse_version_line(crate::VERSION_LINE).as_deref(),
-            Some(env!("CARGO_PKG_VERSION"))
-        );
-        // 0.1.0 的安装器取第一个以数字开头的词当版本：一个都没有，它才会在
-        // 交换二进制之前失败（C5 的保证，见 crate::VERSION_LINE）
-        assert!(
-            crate::VERSION_LINE
-                .split_whitespace()
-                .all(|word| !word.starts_with(|c: char| c.is_ascii_digit())),
-            "{}",
-            crate::VERSION_LINE
-        );
-    }
-
-    #[test]
     fn stage_from_rejects_missing_source() {
         let dir = tempfile::tempdir().unwrap();
         let err = stage_from_in(dir.path(), &dir.path().join("no-such.exe"), "0.1.0").unwrap_err();

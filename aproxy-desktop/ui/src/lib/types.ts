@@ -250,6 +250,11 @@ export interface ThemeSpec {
   font?: 'rounded' | 'system' | 'mono';
   /** 动效强度：位移与回弹幅度的倍数。0 等于减少动效（只留淡入淡出），最大 1.5 */
   motion?: number;
+  /**
+   * 标题栏至少多高，CSS 像素，36 – 64，内置 44（app.css 的 --titlebar-min）。Windows 原生的窗口按钮不跟着变，
+   * 保持系统高度贴在顶部
+   */
+  titlebarMin?: number;
   /** 浅色与深色两个变体；只给一个时，另一种模式沿用内置配色 */
   light?: ThemeColors;
   dark?: ThemeColors;

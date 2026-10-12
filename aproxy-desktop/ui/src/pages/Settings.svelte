@@ -55,7 +55,7 @@
     return t(`theme.err.${e.key}`, { field: e.field ?? '', detail: e.detail ?? '' });
   }
 
-  /** 解析结果里值得告诉用户的几件事：变体、圆角、字体、动效、对比度 */
+  /** 解析结果里值得告诉用户的几件事：变体、圆角、字体、动效、标题栏高度、对比度 */
   function facts(spec: ThemeSpec): string[] {
     const out: string[] = [];
     if (spec.light && spec.dark) out.push(t('set.theme.both'));
@@ -66,6 +66,8 @@
     if (spec.font && spec.font !== 'rounded') out.push(t(`set.theme.font.${spec.font}`));
     if (spec.motion === 0) out.push(t('set.theme.noMotion'));
     else if (spec.motion !== undefined && spec.motion !== 1) out.push(t('set.theme.motion', { n: spec.motion }));
+    if (spec.titlebarMin !== undefined && spec.titlebarMin !== BUILTIN_THEME.titlebarMin)
+      out.push(t('set.theme.titlebar', { n: spec.titlebarMin }));
     if (spec.contrast === 'more') out.push(t('set.theme.contrast'));
     return out;
   }

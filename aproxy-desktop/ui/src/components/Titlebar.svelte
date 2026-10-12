@@ -1,7 +1,12 @@
 <!--
-  自定义标题栏，布局约定与 tauri-custom-titlebar 一致：
-  - 高度 = --titlebar-height（Windows 上由 titlebar.js 写入，最大化时会变矮，所以控件高度跟着 --bar 缩放）；
-  - 右侧 --titlebar-right 宽的矩形归 Windows 原生按钮，页面在那里画什么都看不见，这里用 padding 让出来；
+  自定义标题栏，布局约定与 tauri-custom-titlebar 一致，用的是它的「最小高度变体」：
+  - 栏高 --bar = max(--titlebar-height, --titlebar-min)。--titlebar-height 是 Windows 原生按钮的高度（titlebar.js
+    写入，150% 缩放时约 29px，最大化时约 22px），照它的高度，搜索框会被压扁；--titlebar-min 默认 44px（app.css，
+    主题可改），所以标题栏至少有这么高，最大化时也不变矮。栏里的控件都按 --bar 取高度，栏高随主题变了也不溢出；
+  - 原生按钮保持系统的高度、贴在顶部，比标题栏矮出来的那一截露出页面自己的底色，所以按钮的悬停高亮只盖住
+    上半部分。这是这个变体有意接受的取舍；
+  - 右侧 --titlebar-right 宽的矩形归 Windows 原生按钮，页面在那里画什么都看不见，这里用 padding 让出来
+    （让出整个栏高：按钮下面那一截只露底色，不放内容）；
   - 顶部 --titlebar-top 是最大化时被屏幕吃掉的部分；
   - 整条 app-region: drag（拖动、双击最大化、右键系统菜单、Aero Snap 都由 Windows 提供），
     可交互的子元素 app-region: no-drag。
@@ -41,7 +46,8 @@
 
 <style>
   .titlebar {
-    --bar: var(--titlebar-height, 32px);
+    /* 最小高度变体（见上）。浏览器里与非 Windows 上没有 --titlebar-height，按 32px 算 */
+    --bar: max(var(--titlebar-height, 32px), var(--titlebar-min, 44px));
     /* content-box：底边不会侵入原生按钮那块区域 */
     box-sizing: content-box;
     flex: none;
@@ -85,7 +91,8 @@
     align-items: center;
     gap: 8px;
     width: min(380px, 42%);
-    height: min(26px, calc(var(--bar) - 7px));
+    /* 默认 44px 的栏里是 32px；主题把栏压到 36px 时跟着降到 26px */
+    height: min(32px, calc(var(--bar) - 10px));
     padding: 0 4px 0 11px;
     border-radius: var(--r-pill);
     border: var(--line-w-thin) solid var(--line-soft);
@@ -109,14 +116,14 @@
     text-overflow: ellipsis;
   }
   .search .kbd {
-    height: 18px;
+    height: min(20px, calc(var(--bar) - 22px));
     font-size: 10.5px;
   }
-  /* 奶黄是「提醒」的语义色；高度跟着标题栏缩放（最大化时标题栏会变矮） */
+  /* 奶黄是「提醒」的语义色；高度跟着栏高走，比搜索框矮一档 */
   .demo {
     margin-left: auto;
     flex: none;
-    height: min(24px, calc(var(--bar) - 7px));
+    height: min(26px, calc(var(--bar) - 14px));
     font-weight: 600;
     cursor: help;
   }

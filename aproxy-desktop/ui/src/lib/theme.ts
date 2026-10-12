@@ -215,6 +215,7 @@ export const BUILTIN_THEME: ThemeSpec = {
   radius: 1,
   font: 'rounded',
   motion: 1,
+  titlebarMin: 44,
   light: {
     primary: 'oklch(0.78 0.13 295)',
     text: 'oklch(0.27 0.07 285)',
@@ -332,6 +333,12 @@ export function parseTheme(text: string): ThemeParse {
     if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 1.5) return fail('range', key, '0 – 1.5');
     spec[key] = Math.round(v * 100) / 100;
   }
+  // 标题栏的最小高度（像素）：低于 36 搜索框就挤得没法看，高于 64 白占内容的地方
+  if (raw.titlebarMin !== undefined) {
+    const v = raw.titlebarMin;
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 36 || v > 64) return fail('range', 'titlebarMin', '36 – 64');
+    spec.titlebarMin = Math.round(v);
+  }
   if (raw.font !== undefined) {
     if (!(FONTS as readonly unknown[]).includes(raw.font)) return fail('enum', 'font', FONTS.join(' | '));
     spec.font = raw.font as ThemeSpec['font'];
@@ -382,6 +389,7 @@ export function themeCss(spec: ThemeSpec): string {
   const root: string[] = [];
   if (spec.radius !== undefined) root.push(`--radius: ${spec.radius};`);
   if (spec.motion !== undefined) root.push(`--motion: ${spec.motion};`);
+  if (spec.titlebarMin !== undefined) root.push(`--titlebar-min: ${spec.titlebarMin}px;`);
   if (spec.font && spec.font !== 'rounded') root.push(`--font-ui: ${FONT_STACKS[spec.font]};`);
   return [
     `:root { ${root.join(' ')} }`,

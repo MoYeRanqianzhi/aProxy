@@ -88,6 +88,11 @@
   --row-h: 40px;
 
   --nav-w: 212px;
+
+  /* 标题栏至少多高。Windows 原生按钮的高度（--titlebar-height，由 lib/titlebar.js 写入，150% 缩放时约
+     29px，最大化时约 22px）放不下舒展的搜索框，所以标题栏取二者中大的那个（tauri-custom-titlebar 的
+     「最小高度变体」，见 components/Titlebar.svelte）。主题可以改它（主题字符串的 titlebarMin，36 – 64） */
+  --titlebar-min: 44px;
 }
 
 /* ---------- 浅色主题（默认） ---------- */

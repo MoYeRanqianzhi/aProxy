@@ -117,8 +117,10 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 regex = "1"
 # 外部转换器信封契约（src/transform.rs）：与 aproxy-format 二进制共同类型
 # 单源维护（workspace 成员），path 依赖不进 crates.io 发布（publish 时换
-# version 依赖，见 release 说明）
-aproxy-envelope = { version = "0.2.0", path = "aproxy-envelope" }
+# version 依赖，见 release 说明）。0.2.0 正式版之前它与本包同号发预发布版，要求
+# 同样用 `=` 精确钉住：预发布版之间的接口不守 semver。发布前 align-version.py 按正则
+# 把这一行与版本一起改成 tag 版本，改这一行的写法要同步改那个脚本（同下）。
+aproxy-envelope = { version = "=0.2.0-alpha.0", path = "aproxy-envelope" }
 # 桌面界面（desktop 特性）：Tauri 外壳与嵌入的前端。version + path 双写，理由同上；
 # 版本与本包同步。它不依赖本包（否则成环），需要的东西（home、运行时）由 bin 在启动
 # 界面时传进去。版本要求用 `=` 精确钉住：两者总是同号一起发布，aproxy-desktop 的接口

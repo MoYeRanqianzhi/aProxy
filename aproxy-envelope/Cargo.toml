@@ -1,9 +1,10 @@
 [package]
 name = "aproxy-envelope"
-version = "0.2.0"
-# 信封契约 crate：与 aproxy 同库开发，但版本独立于 aproxy 的 alpha 线——
-# 它随 aproxy-format 的发布节奏走（aproxy-format 单独发 Release，见
-# release-format workflow），信封协议有破坏性变更时才 bump。
+version = "0.2.0-alpha.0"
+# 信封契约 crate：与 aproxy 同库开发。aproxy 0.2.0 正式版之前，它随主线与 aproxy、
+# aproxy-desktop 同号发预发布版（0.2.0-alpha.N 等），发布前由 .github/scripts/align-version.py
+# 一起对齐；到 aproxy 0.2.0 正式版时才发 0.2.0（W2 设计稿 §10.13）。正式版号一经发布就永久
+# 占用，而 0.2.0 定稿之前信封还要改（加 #[non_exhaustive]、改类型），所以预发布期间不能用它。
 edition = "2024"
 rust-version = "1.88"
 description = "Transform envelope contract shared by aproxy and aproxy-format"

@@ -66,7 +66,9 @@ home 的实例。
   旧 format 照样能解析）、`request_id`（实例内第 N 个请求，即 status 的请求计数）与不透明的
   `state`：请求与响应转换器是不同进程、无共享内存，跨阶段的信息由 aproxy
   按请求保存（`transform::ExchangeCtx`，随 `OutboundRequest` 走完各通道）并
-  转交，回信缺省 `state` = 不变。
+  转交，回信缺省 `state` = 不变。aproxy 0.2.0 正式版之前，它与 aproxy、aproxy-desktop
+  同号发预发布版（发布前 `.github/scripts/align-version.py` 一起对齐），正式版时才发
+  0.2.0：正式版号一经发布就永久占用，而信封在 0.2.0 定稿之前还要改。
 - **aproxy-format**：官方示例 format 二进制（协议转换 switchyard-translation
   + key 轮换/加权轮换 + 多模型多渠道聚合）。版本独立于 aproxy alpha 线，
   单独发 Release（format tag 触发独立 workflow）；它稳定后几乎不更新——

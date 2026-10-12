@@ -158,8 +158,10 @@ jobs:
         with:
           key: format-${{ matrix.target }}${{ matrix.variant }}
       # 版本对齐：format-v0.1.0 → aproxy-format/Cargo.toml 与 Cargo.lock 的
-      # aproxy-format 行改为 0.1.0（只动 format 成员，aproxy/envelope 不动——
-      # 三成员版本线相互独立）
+      # aproxy-format 行改为 0.1.0（只动 format 成员，aproxy/envelope 不动）。
+      # aproxy-envelope 在 aproxy 0.2.0 正式版之前随主线发预发布版（见
+      # .github/scripts/align-version.py）：这条线若在那之前发版，会按仓库里的开发
+      # 版本号把 envelope 发出去，发之前要先定 envelope 怎么办
       - name: Align version with tag
         shell: bash
         run: |

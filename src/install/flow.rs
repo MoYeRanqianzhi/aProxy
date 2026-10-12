@@ -336,6 +336,16 @@ const TAKEOVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30)
 /// failed 现场，交给续作。
 const BIN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// 在 async 流程里拿安装锁（最多等 [`BIN_LOCK_WAIT`]）。`lock_install_in` 是阻塞的轮询
+/// （每 100 毫秒一次），放到 blocking 线程上去等，不占着 tokio 的工作线程——同一个运行时
+/// 上还跑着宣告心跳等任务，被阻塞 30 秒，心跳就会过期。
+async fn lock_install(home: &Path) -> Result<super::InstallLock, String> {
+    let home = home.to_path_buf();
+    tokio::task::spawn_blocking(move || super::lock_install_in(&home, BIN_LOCK_WAIT))
+        .await
+        .map_err(|e| format!("等安装锁的任务异常结束: {e}"))?
+}
+
 /// 被拉起的接手者进程。unix 留着 Child：它是本进程的子进程，没接手就退出时会
 /// 变成僵尸，按 pid 查进程态认不出（macOS 上更是查不了），try_wait 判活并顺带
 /// 收割。Windows 经 spawn_detached 拉起：不继承句柄，接手者不会捏着本进程的
@@ -576,7 +586,7 @@ async fn run_tail(
     if state.phase < InstallPhase::Cleaning {
         super::state::advance_in(home, state, InstallPhase::Cleaning)?;
     }
-    let _lock = super::lock_install_in(home, BIN_LOCK_WAIT)?;
+    let _lock = lock_install(home).await?;
     let staging = super::staging::staging_dir_in(home, &state.target_version);
     let gone = |result: std::io::Result<()>| match result {
         Ok(()) => true,
@@ -905,7 +915,7 @@ async fn run_forward_from_staged(
     super::state::advance_in(home, state, InstallPhase::Swapping)?;
     // 改 bin/ 期间持有安装锁（永久兼容契约 C4）：强制安装先结束全部安装者再拿这把锁，
     // 拿到之后才动 bin/，两边不会同时改。交换一完就放：之后的滚动重启只读 bin
-    let lock = super::lock_install_in(home, BIN_LOCK_WAIT)?;
+    let lock = lock_install(home).await?;
     // 续作时上一次尝试可能已让旧二进制让位（Windows 上 bin 此刻缺失，unix 上 bin 可能已是
     // 新二进制），它的唯一名记在状态里，是回滚要用的旧二进制：清残留时保留它，swap_in 认出
     // 这是续作重入，不再让位——否则落位之后中断的那一次，新二进制会被当成旧的记下来

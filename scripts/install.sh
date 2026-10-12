@@ -8,7 +8,13 @@
 # 用法：
 #   curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.sh | sh
 #   curl -fsSL .../install.sh | sh -s -- --pre        # 允许安装预发布
-#   或本地执行：sh scripts/install.sh [--pre] [v0.1.0]
+#   curl -fsSL .../install.sh | sh -s -- --variant headless   # 指定变体
+#   或本地执行：sh scripts/install.sh [--pre] [--variant desktop|headless] [v0.1.0]
+# 变体：带桌面界面的 desktop（`aproxy desktop` 打开窗口）与无界面的 headless，代理与命令行
+# 完全相同。没指定时 Windows 与 macOS 装 desktop；Linux 先看本机能不能跑带界面的版本（它动态
+# 链接 GTK 与 WebKitGTK，缺库或库太旧时连 --version 都起不来）：musl、glibc 低于
+# DESKTOP_MIN_GLIBC、找不到 libwebkit2gtk-4.1 的装 headless 并说明原因；下载后带界面的版本
+# 自检跑不起来（例如 WebKitGTK 低于 2.40）也改装 headless。指定了 desktop 而本机跑不了就报错退出。
 # 选版规则（无显式 tag 时）：
 #   1. 只认符合项目版本号文法的 tag：vX.Y.Z 或 vX.Y.Z-(alpha|beta|rc).N（同仓库的
 #      format-v* 是另一条发版线；v0.1.0-alpha.12t3 这类历史测试 tag 按 semver 会排在
@@ -21,6 +27,7 @@
 #   APROXY_HOME     目录根（默认 ~/.aproxy；空或只含空白视为未设，否则必须是绝对路径）
 #   APROXY_NO_SKILLS=1   跳过 skill 文档
 #   APROXY_PRE=1    等效 --pre
+#   APROXY_VARIANT  等效 --variant（desktop 或 headless）
 #   APROXY_DL_PROXY 下载代理（仅本次；与上游请求代理完全无关）
 set -eu
 
@@ -29,6 +36,10 @@ REPO="MoYeRanqianzhi/aProxy"
 # 改选静态链接的 musl 产物。必须与 .github/workflows/release.yml 中 gnu 构建的
 # glibc 下限、npm/aproxy/bin/aproxy.js 的 MIN_GLIBC 保持一致。
 MIN_GLIBC="2.28"
+# 带界面的 Linux gnu 产物能运行的最低 glibc。它链接构建系统里的 GTK 与 WebKitGTK，下限由构建
+# 系统决定；必须与 release.yml 的 DESKTOP_GLIBC_FLOOR、src/install/variant.rs 的
+# DESKTOP_GLIBC_FLOOR、npm/aproxy/bin/aproxy.js 的 DESKTOP_MIN_GLIBC 保持一致。
+DESKTOP_MIN_GLIBC="2.35"
 UA="aproxy-install-script"
 
 # ---- aProxy 主目录（永久兼容契约 C1，与 aproxy 二进制同一规则）----
@@ -201,20 +212,29 @@ version_lt() {
     }'
 }
 
-detect_linux_libc() {
+# 本机 glibc 的「主.次」版本（如 2.35）；musl 系统或读不出时输出空
+glibc_version() {
     # musl 的 ldd 把版本信息打到 stderr 且退出码非零，所以合并输出并忽略退出码
     ldd_out=$(ldd --version 2>&1 || true)
     case "$ldd_out" in
+        *musl*) return ;;
+    esac
+    v=""
+    if command -v getconf >/dev/null 2>&1; then
+        v=$(getconf GNU_LIBC_VERSION 2>/dev/null | sed -n 's/^glibc \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+    fi
+    if [ -z "$v" ]; then
+        # ldd 首行形如 "ldd (Debian GLIBC 2.36-9+deb12u14) 2.36" / "ldd (GNU libc) 2.35"
+        v=$(printf '%s\n' "$ldd_out" | head -n 1 | grep -o '[0-9][0-9]*\.[0-9][0-9]*' | tail -n 1 || true)
+    fi
+    printf '%s\n' "$v"
+}
+
+detect_linux_libc() {
+    case "$(ldd --version 2>&1 || true)" in
         *musl*) echo musl; return ;;
     esac
-    glibc_ver=""
-    if command -v getconf >/dev/null 2>&1; then
-        glibc_ver=$(getconf GNU_LIBC_VERSION 2>/dev/null | sed -n 's/^glibc \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
-    fi
-    if [ -z "$glibc_ver" ]; then
-        # ldd 首行形如 "ldd (Debian GLIBC 2.36-9+deb12u14) 2.36" / "ldd (GNU libc) 2.35"
-        glibc_ver=$(printf '%s\n' "$ldd_out" | head -n 1 | grep -o '[0-9][0-9]*\.[0-9][0-9]*' | tail -n 1 || true)
-    fi
+    glibc_ver=$(glibc_version)
     if [ -n "$glibc_ver" ]; then
         if version_lt "$glibc_ver" "$MIN_GLIBC"; then echo musl; else echo gnu; fi
         return
@@ -224,6 +244,50 @@ detect_linux_libc() {
         [ -e "$f" ] && { echo musl; return; }
     done
     echo gnu
+}
+
+# ---- 变体：本机能不能跑带界面的版本 ----
+# 找得到 WebKitGTK 4.1 的运行库（libwebkit2gtk-4.1.so.0）就成功返回。先问动态加载器的缓存：
+# ldconfig 在不少发行版的普通用户 PATH 之外（/sbin），所以连同常见路径都试；都没有就看常见的库目录。
+# 版本够不够（2.40+）这里查不了，下载后 --version 自检会挡住太旧的。
+find_webkit() {
+    for ldc in ldconfig /sbin/ldconfig /usr/sbin/ldconfig; do
+        if command -v "$ldc" >/dev/null 2>&1; then
+            "$ldc" -p 2>/dev/null | grep -q 'libwebkit2gtk-4\.1\.so\.0'
+            return
+        fi
+    done
+    for f in /usr/lib/libwebkit2gtk-4.1.so.0 /usr/lib64/libwebkit2gtk-4.1.so.0 /usr/lib/*-linux-gnu/libwebkit2gtk-4.1.so.0; do
+        [ -e "$f" ] && return 0
+    done
+    return 1
+}
+
+# 带界面的版本在本机跑不了时成功返回，原因写进 $blocker。只看 Linux（Windows、macOS 上它随处能跑，
+# 缺 WebView2 只影响 aproxy desktop 本身）。调用前 OS 与 libc 已经确定。
+desktop_blocker() {
+    [ "$OS" = Linux ] || return 1
+    if [ "$libc" = musl ]; then
+        blocker="这台 Linux 用的是 musl 或 glibc 低于 $MIN_GLIBC，只有无界面的版本能用"
+        return 0
+    fi
+    glibc_now=$(glibc_version)
+    if [ -n "$glibc_now" ] && version_lt "$glibc_now" "$DESKTOP_MIN_GLIBC"; then
+        blocker="本机 glibc $glibc_now 低于带界面版本要求的 $DESKTOP_MIN_GLIBC"
+        return 0
+    fi
+    if ! find_webkit; then
+        blocker="没有找到 WebKitGTK 4.1（libwebkit2gtk-4.1.so.0；Debian / Ubuntu 上装 libwebkit2gtk-4.1-0）"
+        return 0
+    fi
+    return 1
+}
+
+# asset_for <desktop|headless> <目标三元组去掉架构的部分，如 unknown-linux-gnu>：发布资产名
+asset_for() {
+    prefix="aproxy-"
+    [ "$1" = headless ] && prefix="aproxy-headless-"
+    echo "${prefix}${rust_arch}-$2${EXE_SUFFIX}"
 }
 
 # self_test <二进制>：--version 能正常退出才算可运行。
@@ -243,14 +307,22 @@ download_binary() {
 
 main() {
     want_pre="${APROXY_PRE:-0}"
+    VARIANT="${APROXY_VARIANT:-}"
     TAG=""
-    for arg in "$@"; do
-        case "$arg" in
+    while [ $# -gt 0 ]; do
+        case "$1" in
             --pre) want_pre=1 ;;
-            -*) echo "未知参数: $arg（可用: --pre、tag）" >&2; exit 1 ;;
-            *) TAG="$arg" ;;
+            --variant) shift; VARIANT="${1:-}" ;;
+            --variant=*) VARIANT="${1#--variant=}" ;;
+            -*) echo "未知参数: $1（可用: --pre、--variant desktop|headless、tag）" >&2; exit 1 ;;
+            *) TAG="$1" ;;
         esac
+        shift
     done
+    case "$VARIANT" in
+        ""|desktop|headless) ;;
+        *) echo "未知变体: $VARIANT（可用: desktop、headless）" >&2; exit 1 ;;
+    esac
     # tag 会拼进下载 URL，限定字符集
     case "$TAG" in
         *[!A-Za-z0-9._-]*) echo "非法的 tag: $TAG" >&2; exit 1 ;;
@@ -277,6 +349,25 @@ main() {
     [ "$libc" = "musl" ] && platform="unknown-linux-musl"
     BIN_NAME="aproxy${EXE_SUFFIX}"
 
+    # ---- 变体（先于下载：要装哪个文件取决于它）----
+    # variant_auto=1：没指定变体、选了 desktop，下载后跑不起来时可以改装 headless；
+    # headless_reason：最后装的是 headless 而不是用户指定的，向用户说明原因
+    variant_auto=0
+    headless_reason=""
+    blocker=""
+    if [ -z "$VARIANT" ]; then
+        if desktop_blocker; then
+            VARIANT=headless
+            headless_reason="$blocker"
+        else
+            VARIANT=desktop
+            variant_auto=1
+        fi
+    elif [ "$VARIANT" = desktop ] && desktop_blocker; then
+        echo "本机跑不了带桌面界面的版本：$blocker。装好所需的系统库后重试，或改装无界面版本：--variant headless" >&2
+        exit 1
+    fi
+
     resolve_home
     BIN_DIR="$APROXY_HOME/bin"
     SKILLS_DIR="$APROXY_HOME/skills"
@@ -298,6 +389,7 @@ main() {
     [ -n "$TAG" ] || resolve_tag
     echo "安装 aProxy $TAG"
     [ "$libc" = "musl" ] && echo "检测到 musl 或 glibc < $MIN_GLIBC 的 Linux，选用静态链接的 musl 产物"
+    [ -n "$headless_reason" ] && echo "安装无界面的 headless 版本：$headless_reason"
 
     # 本脚本不探测 AVX2（保守拉 baseline）；指令集变体选择由 `aproxy install` 做
     BASE="https://github.com/$REPO/releases/download/$TAG"
@@ -305,13 +397,22 @@ main() {
     STAGED="$TMP_DIR/aproxy${EXE_SUFFIX}"
 
     # ---- 下载二进制 + 校验 + 自证 + 落位 ----
-    ASSET="aproxy-${rust_arch}-${platform}${EXE_SUFFIX}"
+    ASSET=$(asset_for "$VARIANT" "$platform")
     download_binary "$ASSET"
+    if ! self_test "$STAGED" && [ "$variant_auto" = 1 ]; then
+        # 没指定变体时，带界面的版本跑不起来（WebKitGTK 低于 2.40、缺别的界面库）就改装无界面的
+        why=$("$STAGED" --version </dev/null 2>&1 | head -n 1 || true)
+        echo "带桌面界面的版本在本机起不来（${why:-原因未知}），改装无界面的 headless 版本 ..." >&2
+        VARIANT=headless
+        headless_reason="带界面的版本在本机起不来（${why:-原因未知}）"
+        ASSET=$(asset_for headless "$platform")
+        download_binary "$ASSET"
+    fi
     if ! self_test "$STAGED"; then
-        if [ "$libc" = "gnu" ]; then
+        if [ "$libc" = "gnu" ] && [ "$VARIANT" = headless ]; then
             # 版本探测可能误判（如 glibc 满足下限但缺别的系统库）：静态 musl 产物兜底
             echo "gnu 产物在本机无法运行，改用 musl 产物重试 ..." >&2
-            ASSET="aproxy-${rust_arch}-unknown-linux-musl"
+            ASSET=$(asset_for headless unknown-linux-musl)
             download_binary "$ASSET"
         fi
         if ! self_test "$STAGED"; then
@@ -353,7 +454,11 @@ main() {
 
     # ---- 提示 ----
     echo ""
-    echo "aProxy 已安装: $BIN_DIR/$BIN_NAME"
+    echo "aProxy 已安装: $BIN_DIR/$BIN_NAME（$VARIANT）"
+    if [ -n "$headless_reason" ]; then
+        echo "装的是无界面的 headless 版本（$headless_reason）：代理与命令行完全相同，只是没有 aproxy desktop 窗口。"
+        echo "  装好所需的系统库之后，可用 aproxy install --variant desktop 换成带界面的版本。"
+    fi
     case ":$PATH:" in
         *":$BIN_DIR:"*) ;;
         *)

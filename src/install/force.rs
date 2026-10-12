@@ -787,14 +787,12 @@ fn restore_and_check(home: &Path, stopped: &[LedgerEntry]) -> Vec<LedgerEntry> {
     }
 }
 
-/// 从 `dir` 里的文件运行的进程（pid，镜像路径）：枚举全部进程（见 [`process_ids`]），
-/// 逐个查镜像路径（`watchdog::process_image_path`），比较所在目录。查不到镜像路径的
-/// 进程（别的用户的、刚退出的）跳过；macOS 上镜像路径查不到，结果恒为空。只供第 7 步
-/// 报告，不参与结束任何进程——结束只认台账。
+/// 从 `dir` 里（或其下）的文件运行的进程（pid，镜像路径）：枚举全部进程（见
+/// [`process_ids`]），逐个查镜像路径（`watchdog::process_image_path`），用
+/// [`super::file_is_within`] 比较所在目录——镜像路径保留启动时的写法（例如 8.3 短名），
+/// 要解析成真实路径再比。查不到镜像路径的进程（别的用户的、刚退出的）跳过；macOS 上
+/// 镜像路径查不到，结果恒为空。只供第 7 步报告，不参与结束任何进程——结束只认台账。
 pub fn processes_running_from(dir: &Path) -> Vec<(u32, PathBuf)> {
-    // 镜像路径是解析过符号链接的真实路径，目录也先解析成真实路径再比
-    let key = |p: &Path| crate::settings::path_match_key(&p.display().to_string());
-    let dir_key = key(&std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
     process_ids()
         .into_iter()
         .filter_map(|pid| {
@@ -802,10 +800,7 @@ pub fn processes_running_from(dir: &Path) -> Vec<(u32, PathBuf)> {
             // Linux：文件被 rename 换掉之后，还在运行的旧镜像显示为「<路径> (deleted)」
             let text = image.to_string_lossy();
             let image = PathBuf::from(text.strip_suffix(" (deleted)").unwrap_or(&text));
-            image
-                .parent()
-                .is_some_and(|parent| key(parent) == dir_key)
-                .then_some((pid, image))
+            super::file_is_within(&image, dir).then_some((pid, image))
         })
         .collect()
 }

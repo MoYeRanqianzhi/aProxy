@@ -31,6 +31,35 @@ pub fn install_dir_in(home: &Path) -> PathBuf {
     home.join("install")
 }
 
+/// 文件 `file` 是否在目录 `dir` 里或其下。安装的管辖检查（实例的二进制是否在
+/// `<home>/bin/` 下）与强制安装第 7 步的报告（哪些进程从 bin 运行）都用它判断。
+///
+/// 比较的是解析后的真实路径：两边都先 canonicalize，再按 settings::path_match_key 归一
+/// （去 `\\?\` 前缀；Windows 上统一分隔符并转小写）。同一个目录可以有好几种写法——
+/// Windows 的 8.3 短名（`C:\Users\RUNNER~1\…` 与 `C:\Users\runneradmin\…`）、符号链接与
+/// junction、`\\?\` 前缀。进程的镜像路径（QueryFullProcessImageNameW）保留的是启动时
+/// 用的写法，经短名启动的进程报出来就带着短名（本机实测）；`<home>` 可能来自展开成长名
+/// 的用户目录，也可能来自写着短名的 APROXY_HOME。不解析，两边就会对不上：管辖检查把
+/// bin 里的实例当成管辖外而拒绝安装，第 7 步漏报。
+///
+/// 解析的是 `file` 所在的目录而不是文件本身：镜像文件可能已被改名或删除（交换时让位、
+/// unix 上被 rename 覆盖），它所在的目录还在。解析不了的（已不存在、没有权限）退回原样。
+pub fn file_is_within(file: &Path, dir: &Path) -> bool {
+    let Some(parent) = file.parent() else {
+        return false;
+    };
+    let key = |p: &Path| {
+        let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let mut key = crate::settings::path_match_key(&real.display().to_string());
+        // 以分隔符收尾再比前缀：`…\bin2` 不能算在 `…\bin` 下
+        if !key.ends_with(std::path::MAIN_SEPARATOR) {
+            key.push(std::path::MAIN_SEPARATOR);
+        }
+        key
+    };
+    key(parent).starts_with(&key(dir))
+}
+
 /// 安装锁的文件名：`<home>/install/lock`。
 ///
 /// 永久兼容契约 C4：位置、文件名与「操作系统级排他锁」的语义无论如何都不得改动。
@@ -144,5 +173,96 @@ mod tests {
             assert!(check_floor(&v(ok)).is_ok(), "{ok}");
         }
         assert!(check_floor(&v(env!("CARGO_PKG_VERSION"))).is_ok());
+    }
+
+    #[test]
+    fn file_is_within_compares_directories_not_spellings() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        let bin2 = home.path().join("bin2");
+        std::fs::create_dir_all(bin.join("nested")).unwrap();
+        std::fs::create_dir_all(&bin2).unwrap();
+        // 文件本身不必存在：比较的是它所在的目录
+        assert!(file_is_within(&bin.join("aproxy.exe"), &bin));
+        assert!(file_is_within(&bin.join("nested").join("x"), &bin));
+        assert!(
+            !file_is_within(&bin2.join("aproxy.exe"), &bin),
+            "bin2 不在 bin 下"
+        );
+        assert!(!file_is_within(&home.path().join("aproxy.exe"), &bin));
+        // `..` 绕一圈回来仍是同一个目录
+        let detour = bin.join("..").join("bin").join("aproxy.exe");
+        assert!(file_is_within(&detour, &bin), "{}", detour.display());
+        // 目录不存在时按原样比较
+        let gone = home.path().join("gone");
+        assert!(file_is_within(&gone.join("x"), &gone));
+    }
+
+    /// Windows 的 8.3 短名：同一个目录的短名写法与长名写法必须判成同一个目录（CI 的临时
+    /// 目录就是 `C:\Users\RUNNER~1\…`，经短名启动的进程镜像路径也带着短名）。
+    #[cfg(windows)]
+    #[test]
+    fn file_is_within_treats_8dot3_short_names_as_the_same_directory() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let short = |p: &Path| -> PathBuf {
+            let wide: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+            let mut buf = vec![0u16; 1024];
+            let len = unsafe {
+                windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+                    wide.as_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                )
+            } as usize;
+            assert!(
+                len > 0 && len < buf.len(),
+                "GetShortPathNameW 失败: {}",
+                p.display()
+            );
+            PathBuf::from(std::ffi::OsString::from_wide(&buf[..len]))
+        };
+        let home = tempfile::tempdir().unwrap();
+        // 名字长于 8 个字符、带连字符：卷上开着 8.3 短名生成时，它会得到 `APROXY~1` 式的短名
+        let long_bin = home.path().join("aproxy-managed-bin");
+        let long_other = home.path().join("aproxy-managed-bin-other");
+        std::fs::create_dir_all(&long_bin).unwrap();
+        std::fs::create_dir_all(&long_other).unwrap();
+        let short_bin = short(&long_bin);
+        let short_other = short(&long_other);
+        if short_bin
+            .as_os_str()
+            .eq_ignore_ascii_case(long_bin.as_os_str())
+        {
+            eprintln!(
+                "跳过：{} 所在的卷没有生成 8.3 短名（GetShortPathNameW 返回的就是长名），造不出短名写法",
+                long_bin.display()
+            );
+            return;
+        }
+        let ctx = format!(
+            "长名 {}，短名 {}；另一个目录 长名 {}，短名 {}",
+            long_bin.display(),
+            short_bin.display(),
+            long_other.display(),
+            short_other.display()
+        );
+        for file_dir in [&long_bin, &short_bin] {
+            for dir in [&long_bin, &short_bin] {
+                assert!(
+                    file_is_within(&file_dir.join("aproxy.exe"), dir),
+                    "{} 应在 {} 里（{ctx}）",
+                    file_dir.display(),
+                    dir.display()
+                );
+            }
+            for other in [&long_other, &short_other] {
+                assert!(
+                    !file_is_within(&other.join("aproxy.exe"), file_dir),
+                    "{} 不应在 {} 里（{ctx}）",
+                    other.display(),
+                    file_dir.display()
+                );
+            }
+        }
     }
 }

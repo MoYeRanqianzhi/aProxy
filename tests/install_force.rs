@@ -216,6 +216,29 @@ fn make_executable(path: &Path) {
     let _ = path;
 }
 
+/// Windows：路径的 8.3 短名写法（GetShortPathNameW）。卷上没有生成短名时，返回的与
+/// 原路径相同。经短名启动的进程，镜像路径也带着短名——CI 的临时目录就是
+/// `C:\Users\RUNNER~1\…`，测试要能在本机造出同样的情形。
+#[cfg(windows)]
+fn short_path(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut buf = vec![0u16; 1024];
+    let len = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+            wide.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+        )
+    } as usize;
+    assert!(
+        len > 0 && len < buf.len(),
+        "GetShortPathNameW 失败: {}",
+        path.display()
+    );
+    PathBuf::from(std::ffi::OsString::from_wide(&buf[..len]))
+}
+
 /// 一个测试自己启动、持有句柄的长时间运行的进程（结束它只用这个句柄）
 fn sleeper() -> Child {
     #[cfg(windows)]
@@ -407,7 +430,12 @@ fn only_verified_ledger_processes_are_stopped() {
     let stray_exe = bin_dir_in(home.path()).join(format!("stray{}", std::env::consts::EXE_SUFFIX));
     std::fs::copy(std::env::current_exe().unwrap(), &stray_exe).unwrap();
     make_executable(&stray_exe);
-    let mut stray = Command::new(&stray_exe)
+    // Windows 上经 8.3 短名启动（卷上有短名时）：它的镜像路径带着短名，报告仍须认得它
+    #[cfg(windows)]
+    let stray_launch = short_path(&stray_exe);
+    #[cfg(not(windows))]
+    let stray_launch = stray_exe.clone();
+    let mut stray = Command::new(&stray_launch)
         .args(["--ignored", "--exact", "stray_helper_sleeps"])
         .env("APROXY_TEST_STRAY", "1")
         .stdin(Stdio::null())

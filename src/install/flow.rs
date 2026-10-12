@@ -57,7 +57,7 @@ pub async fn check_jurisdiction(run_dir: &Path, home: &Path, adopt: bool) -> Res
         let Some(image) = crate::watchdog::process_image_path(info.instance.pid) else {
             continue;
         };
-        if !is_under(&image, &bin_dir) {
+        if !super::file_is_within(&image, &bin_dir) {
             return Err(format!(
                 "实例 {port} 的二进制不在安装管辖目录（{}）下：{}。\n\
                  该实例由其他渠道安装（包管理器/npm/cargo），请用对应渠道升级，\
@@ -68,26 +68,6 @@ pub async fn check_jurisdiction(run_dir: &Path, home: &Path, adopt: bool) -> Res
         }
     }
     Ok(())
-}
-
-/// 路径祖先判断（归一：绝对化 + 小写 + 分隔符统一——Windows 文件系统
-/// 大小写不敏感，与 settings::path_match_key 同一比较纪律）。
-fn is_under(path: &Path, dir: &Path) -> bool {
-    let norm = |p: &Path| {
-        std::path::absolute(p)
-            .unwrap_or_else(|_| p.to_path_buf())
-            .to_string_lossy()
-            .replace('/', "\\")
-            .to_lowercase()
-    };
-    let (mut p, mut d) = (norm(path), norm(dir));
-    if !d.ends_with('\\') {
-        d.push('\\');
-    }
-    if !p.ends_with('\\') {
-        p.push('\\');
-    }
-    p.starts_with(&d)
 }
 
 /// 当前存活实例端口（IPC 探活过滤后的真实清单）

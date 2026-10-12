@@ -351,6 +351,101 @@ async fn jurisdiction_check_rejects_foreign_binary() {
         .output();
 }
 
+/// Windows：路径的 8.3 短名写法（GetShortPathNameW）。卷上没有生成短名时，返回的与
+/// 原路径相同。
+#[cfg(windows)]
+fn short_path(path: &std::path::Path) -> std::path::PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut buf = vec![0u16; 1024];
+    let len = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+            wide.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+        )
+    } as usize;
+    assert!(
+        len > 0 && len < buf.len(),
+        "GetShortPathNameW 失败: {}",
+        path.display()
+    );
+    std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..len]))
+}
+
+// ---------------------------------------------------------------------------
+// 3b. 管辖检查认得 8.3 短名：实例经 bin 的短名写法启动，镜像路径带着短名，仍算在
+//     管辖内（CI 的临时目录就是 `C:\Users\RUNNER~1\…`）
+// ---------------------------------------------------------------------------
+#[cfg(windows)]
+#[tokio::test]
+async fn jurisdiction_accepts_an_instance_started_through_a_short_path() {
+    let env = TestEnv::new(14);
+    std::fs::write(env.home().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+    let bin = env.seed_bin();
+    let short_bin = short_path(&bin);
+    if short_bin.as_os_str().eq_ignore_ascii_case(bin.as_os_str()) {
+        eprintln!(
+            "跳过：{} 所在的卷没有生成 8.3 短名（GetShortPathNameW 返回的就是长名），造不出短名写法",
+            bin.display()
+        );
+        return;
+    }
+    let cfg_file = env.home().join("short.toml");
+    std::fs::write(
+        &cfg_file,
+        format!(
+            "base_url = \"https://short.example.com\"\nlisten_addr = \"127.0.0.1:{}\"\n",
+            env.port
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(&short_bin)
+        .args([
+            "--config",
+            &cfg_file.display().to_string(),
+            "--daemon-child",
+        ])
+        .env("APROXY_HOME", env.home())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let run_dir = env.home().join("run");
+    let mut ready = false;
+    for _ in 0..100 {
+        if aproxy::daemon::registry_pids_in(&run_dir).contains(&child.id()) {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let image = aproxy::watchdog::process_image_path(child.id());
+    let verdict = aproxy::install::flow::check_jurisdiction(&run_dir, &env.home(), false).await;
+    // 收尾放在断言之前：断言失败也不留下实例
+    let _ = Command::new(env!("CARGO_BIN_EXE_aproxy"))
+        .args(["stop", &env.port.to_string()])
+        .env("APROXY_HOME", env.home())
+        .output();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(ready, "实例未就绪");
+    assert!(
+        image
+            .as_ref()
+            .is_some_and(|i| i.to_string_lossy().contains('~')),
+        "镜像路径应带着短名（{} 经 {} 启动）: {image:?}",
+        bin.display(),
+        short_bin.display()
+    );
+    assert!(
+        verdict.is_ok(),
+        "经短名启动的 bin 实例应算在管辖内: {verdict:?}（镜像 {image:?}，bin {}）",
+        bin.display()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 4. --adopt：bin 外安装的实例收编到标准位置（管辖检查豁免 + 完整流水线）
 // ---------------------------------------------------------------------------

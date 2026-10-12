@@ -195,3 +195,11 @@ lto = "fat"
 codegen-units = 1
 opt-level = "z"
 strip = true
+
+# 调试构建（cargo build、cargo test）只带行号表：回溯照样有文件与行号，调试器里看不到局部
+# 变量（要看就临时设 CARGO_PROFILE_DEV_DEBUG=full）。强制安装的集成测试把调试版的 aproxy 当作
+# 发布资产来下载，它得小于资产的大小上限（src/install/force.rs 的 ASSET_LIMIT，256 MiB）；带着
+# 完整调试信息时，Linux 上带界面的调试版（Tauri 与 GTK 一族）超过了它。调试信息少了，链接也更快、
+# 更省内存。
+[profile.dev]
+debug = "line-tables-only"

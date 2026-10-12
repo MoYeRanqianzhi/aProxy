@@ -3,9 +3,9 @@
 # 退出码 0；首行是 `aproxy v<版本> (<变体>; <目标三元组>[; x86-64-v3])`，版本等于 Cargo.toml
 # 里 aproxy 的版本，变体等于期望的那一种，目标三元组等于本机 rustc 的 host（CI 不交叉编译）。
 #
-# 带界面的 exe 在 Windows 上缺 Common-Controls v6 清单时于 main 之前就以 0xC0000139 退出，
-# Linux 上缺 WebKitGTK 时 ld.so 在 main 之前就报错——这一步就是为挡住这类「连 --version 都
-# 起不来」的构建（RT-05）。
+# 带界面的 exe 在 Windows 上若导入了 Common-Controls v6 专有的函数而又没带上 v6 清单，于 main
+# 之前就以 0xC0000139 退出；Linux 上缺 WebKitGTK 时 ld.so 在 main 之前就报错——这一步就是为
+# 挡住这类「连 --version 都起不来」的构建（RT-05）。
 #
 # 用法：version-smoke.sh <二进制> <desktop|headless>
 set -euo pipefail

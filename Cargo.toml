@@ -58,9 +58,9 @@ path = "src/main.rs"
 #
 # 只有 bin 引用 aproxy_desktop，而且只在非测试构建里（main.rs 与 commands/desktop.rs
 # 的 #[cfg(all(feature = "desktop", not(test)))]）；lib 永不引用它。rustc 不链接没被
-# 引用的依赖，所以 lib 与 bin 的单元测试、tests/ 下的集成测试都不链接 Tauri——链进
-# Tauri 的测试程序在 Windows 上缺 Common-Controls 清单时于 main 之前就退出（RT-05，
-# 理由见 aproxy-desktop/Cargo.toml）。
+# 引用的依赖，所以 lib 与 bin 的单元测试、tests/ 下的集成测试都不链接 Tauri，测试在
+# Windows 上能不能启动就不取决于 Common-Controls 清单怎样传递（RT-05，见
+# aproxy-desktop/Cargo.toml）。
 [features]
 default = ["desktop"]
 desktop = ["dep:aproxy-desktop"]

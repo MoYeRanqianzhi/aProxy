@@ -17,7 +17,8 @@ name: CI
 #   成员，--workspace 会把它当作选中的包编译，--no-default-features 管不到它。这一路
 #   不装 Node、不装 WebKitGTK，顺带证明无界面版本不需要它们。
 # 两种变体都对构建出的 aproxy 跑 --version 冒烟（永久兼容契约 C5）：带界面的 exe 在
-# Windows 上缺 Common-Controls v6 清单时会在 main 之前就退出（RT-05），这一步挡住它。
+# Windows 上若导入了 Common-Controls v6 专有的函数而又没带上 v6 清单，会在 main 之前就退出
+# （RT-05），这一步挡住它。
 
 on:
   push:

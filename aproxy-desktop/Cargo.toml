@@ -34,10 +34,10 @@ include = [
     "/dist/**",
 ]
 
-# 不跑单元测试与文档测试（RT-05，tauri#13419）：tauri-build 只给本包的 bin 嵌 Common-Controls
-# 清单，测试程序拿不到；链进 Tauri 的测试程序在 Windows 上缺清单时于 main 之前就以
-# 0xC0000139 退出，`cargo test --workspace` 随之失败。默认 test = true 时，即使一个测试都
-# 没有，cargo 也会构建并运行这个空的测试程序。逻辑尽量放在不链接 Tauri 的地方测试。
+# 不跑单元测试与文档测试：本包没有测试。默认 test = true 时，即使一个测试都没有，cargo 也会
+# 构建并运行一个链接 Tauri 的空测试程序；关掉它，`cargo test --workspace` 在 Windows 上就不必
+# 依赖 Common-Controls 清单怎样传给测试程序（RT-05，tauri#13419：缺清单而又静态导入了 v6 专有
+# 函数的测试程序在 main 之前以 0xC0000139 退出）。逻辑尽量放在不链接 Tauri 的地方测试。
 [lib]
 test = false
 doctest = false
@@ -45,10 +45,13 @@ doctest = false
 [dependencies]
 # default-features = false 是为了关掉 common-controls-v6：它让 exe 静态导入只有 Common
 # Controls v6 才有的 TaskDialogIndirect，没有 v6 清单的 exe 在 main 之前就以 0xC0000139
-# 退出——连 `aproxy --version`（永久兼容契约 C5）都跑不了。清单只经 tauri-build 的
-# rustc-link-arg-bins 嵌给声明它的包自己的 bin，到不了依赖本包的 aproxy.exe
-# （tauri#13948）。关掉之后 About 与「缺 WebView2」对话框降级为普通 MessageBox，
-# 不依赖清单怎样传递。dynamic-acl（运行时增加 capability）也随之关掉，用不到。
+# 退出——连 `aproxy --version`（永久兼容契约 C5）都跑不了。清单在 tauri-build 编出的 Windows
+# 资源里：本包只有 lib，embed-resource 退而经 `rustc-link-lib` 发布资源，链接本包的 exe 都
+# 带上它，所以 aproxy.exe 现在有清单、图标与版本信息（2026-10-12 核对过）。可本包一旦有了
+# bin，资源就改为经 rustc-link-arg-bins 只给那个 bin（tauri#13948），aproxy.exe 随之悄悄失去
+# 清单。关掉之后 exe 不依赖清单也能启动（系统目录里 v5.82 的 comctl32 照样导出 Tauri 与自定义
+# 标题栏用到的 SetWindowSubclass 一族），About 与「缺 WebView2」对话框降级为普通 MessageBox。
+# dynamic-acl（运行时增加 capability）也随之关掉，用不到。
 # - wry：webview 运行时；
 # - compression：嵌入的前端资源用 brotli 压缩；
 # - custom-protocol：从嵌入的资源加载界面（generate_context! 的 dev 标志取它的反面），

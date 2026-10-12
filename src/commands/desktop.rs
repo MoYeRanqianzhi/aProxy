@@ -9,9 +9,9 @@
 //! 没有界面、怎样换装，不让用户看到 clap 的「unrecognized subcommand」。
 //!
 //! 只有非测试构建引用 aproxy_desktop（`#[cfg(all(feature = "desktop", not(test)))]`）：
-//! bin 的单元测试程序一旦链接 Tauri，在 Windows 上缺 Common-Controls 清单时于 main 之前就
-//! 退出（RT-05，见 aproxy-desktop/Cargo.toml）。单元测试从不执行 main，测试构建里这个子命令
-//! 用的是 headless 的那份实现，只为编译通过。
+//! bin 的单元测试程序因此不链接 Tauri，在 Windows 上能不能启动不取决于 Common-Controls 清单
+//! 怎样传递（RT-05，见 aproxy-desktop/Cargo.toml）。单元测试从不执行 main，测试构建里这个
+//! 子命令用的是 headless 的那份实现，只为编译通过。
 
 use std::io::Write as _;
 

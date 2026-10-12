@@ -514,13 +514,15 @@ TypeScript）。0.2.0-alpha.1 的界面是预览版，数据全部来自前端�
 `cargo tree` 断言）。`--version` 的变体段按特性输出（C5）。headless 版本也认得 `desktop`
 子命令（帮助里隐藏），执行时只说明怎样换装，不让用户看到 clap 的「unrecognized subcommand」。
 
-**测试程序不链接 Tauri（RT-05）。** 链进 Tauri 的 Windows 程序可能在 main 之前就退出：
-Common-Controls v6 清单只经 tauri-build 嵌给声明它的包自己的 bin，到不了依赖它的 aproxy.exe
-与各个测试程序。对策有三层：tauri 关掉默认特性 `common-controls-v6`，exe 不再静态导入只有
-v6 才有的 `TaskDialogIndirect`，没有清单也能启动（`aproxy --version` 由此不受影响）；aproxy
-的 lib 永不引用 aproxy_desktop，bin 里引用它的代码只在 `#[cfg(all(feature = "desktop",
-not(test)))]` 下编译，rustc 不链接没被引用的依赖，所以单元测试与 `tests/` 的集成测试都不含
-Tauri；aproxy-desktop 自己 `[lib] test = false`。理由的细节在 `aproxy-desktop/Cargo.toml`。
+**不依赖 Common-Controls 清单（RT-05）。** Tauri 默认静态导入只有 Common-Controls v6 才有的
+`TaskDialogIndirect`，没有 v6 清单的 exe 在 main 之前就退出，连 `aproxy --version` 都跑不了。
+清单在 tauri-build 编出的 Windows 资源里：aproxy-desktop 只有 lib，资源经 `rustc-link-lib`
+跟着它进入链接它的 exe，所以 aproxy.exe 现在带着清单；可它一旦有了 bin，资源就只给那个 bin，
+aproxy.exe 随之悄悄失去清单。所以不靠清单：tauri 关掉默认特性 `common-controls-v6`，exe 不再
+导入 `TaskDialogIndirect`，没有清单也能启动；aproxy 的 lib 永不引用 aproxy_desktop，bin 里
+引用它的代码只在 `#[cfg(all(feature = "desktop", not(test)))]` 下编译，rustc 不链接没被引用的
+依赖，所以单元测试与 `tests/` 的集成测试都不含 Tauri；aproxy-desktop 自己 `[lib] test = false`。
+细节在 `aproxy-desktop/Cargo.toml`。
 
 **进程与线程。** `main` 先兑现 C5 的 `--version`，解析参数后在建 tokio 运行时之前分派
 `desktop`：Tauri 的事件循环要占住主线程（macOS 硬性要求），而 `block_on` 里的主线程处在

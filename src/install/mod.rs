@@ -73,54 +73,151 @@ pub fn lock_path_in(home: &Path) -> PathBuf {
     install_dir_in(home).join(LOCK_FILE)
 }
 
-/// 持有中的安装锁，析构即释放。锁是文件句柄上的操作系统锁（Windows 的 LockFileEx、
-/// unix 的 flock），持有者进程死亡时由系统自动释放，所以崩溃不会留下打不开的死锁。
+/// 持有中的安装锁，析构即释放。锁是文件句柄上的操作系统锁（见 [`lock_install_in`]），
+/// 持有者进程死亡时由系统自动释放，所以崩溃不会留下打不开的死锁。
 #[must_use = "锁在析构时释放，要让它活到 bin/ 改完"]
 pub struct InstallLock {
-    _file: std::fs::File,
+    file: std::fs::File,
 }
 
-/// 拿安装锁，最多等 `wait`：别人持有时每 100 毫秒再试一次，到时仍拿不到 → Err（谁也
-/// 不许无限等——强制安装要按退出码规则结束，普通安装落 failed 现场等续作）。
+/// 析构时先显式解锁，再随 File 关闭句柄。只关句柄系统也会解锁，但：Windows 上
+/// LockFileEx 的文档说那种解锁何时发生「取决于可用的系统资源」，建议显式解锁；unix 上
+/// flock 跟着打开的文件走，本进程恰好 fork 出、还没 exec 的子进程手里那份副本会让锁
+/// 多留一会儿。显式解锁之后，等着拿锁的下一个安装者不必多等。
+impl Drop for InstallLock {
+    #[cfg(unix)]
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+
+    #[cfg(windows)]
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+        // OVERLAPPED 全零即从第 0 字节起，范围与加锁时相同
+        let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED =
+            unsafe { std::mem::zeroed() };
+        unsafe {
+            UnlockFileEx(
+                self.file.as_raw_handle() as isize,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            );
+        }
+    }
+}
+
+/// 拿安装锁，最多等 `wait`：打开锁文件、加锁，任何一步不成都每 100 毫秒从头再试一次，
+/// 到时仍不成 → Err（谁也不许无限等——强制安装要按退出码规则结束，普通安装落 failed
+/// 现场等续作）。
+///
+/// 永久兼容契约 C4：锁原语无论如何都不得改动——
+/// - unix：`flock(fd, LOCK_EX|LOCK_NB)`；
+/// - Windows：`LockFileEx(LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY)`，从第 0 字节
+///   起、长度 u64::MAX；CreateFile 的共享模式为 FILE_SHARE_READ|FILE_SHARE_WRITE，不带
+///   FILE_SHARE_DELETE。
+///
+/// 两个版本只有用同一种锁、锁同一段字节，才互相看得见。所以直接调用系统接口，不用 std
+/// 的 `File::try_lock`：std 文档明说它「目前」对应 flock 与 LockFileEx、以后可能改变，
+/// 也没写明 Windows 上锁哪一段。某天它在 unix 上换成 fcntl/OFD 锁（在 Linux 上与 flock
+/// 互不排斥），或在 Windows 上换了锁的范围，新旧版本就会同时修改 bin/，踩坏对方的交换。
+///
+/// 打开也在重试里：Windows 上别的进程（杀毒软件、另一个版本）以不兼容的共享模式开着
+/// 这个文件时，打开会暂时失败，那也是「等一会儿」而不是「立即放弃」。
 ///
 /// 同一个进程只能持有一份：锁绑在打开的文件上，同一进程再开一次、再锁一次，会被自己
 /// 先前那份挡住。
 ///
-/// Windows 上打开时不给 FILE_SHARE_DELETE：持锁期间别人删不掉这个文件。否则删掉之后
-/// 有人新建一个同名文件再锁上，就会有两个持有者。unix 没有对应的办法，靠所有版本都
-/// 不删它（强制安装清空 `<home>/install/` 时也跳过它）。
+/// Windows 上不给 FILE_SHARE_DELETE：持锁期间别人删不掉这个文件。否则删掉之后有人新建
+/// 一个同名文件再锁上，就会有两个持有者。unix 没有对应的办法，靠所有版本都不删它
+/// （强制安装清空 `<home>/install/` 时也跳过它）。
 pub fn lock_install_in(home: &Path, wait: std::time::Duration) -> Result<InstallLock, String> {
+    let dir = install_dir_in(home);
     let path = lock_path_in(home);
-    std::fs::create_dir_all(install_dir_in(home))
-        .map_err(|e| format!("{} 创建失败: {e}", install_dir_in(home).display()))?;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let failure = match std::fs::create_dir_all(&dir).and_then(|()| open_lock_file(&path)) {
+            Err(e) => format!("安装锁 {} 打开失败: {e}", path.display()),
+            Ok(file) => match try_lock_exclusive(&file) {
+                Ok(true) => return Ok(InstallLock { file }),
+                Ok(false) => format!(
+                    "安装锁 {} 被别的进程持有，{} 秒内没有等到（另一个安装正在修改 bin/？）",
+                    path.display(),
+                    wait.as_secs()
+                ),
+                Err(e) => format!("安装锁 {} 加锁失败: {e}", path.display()),
+            },
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err(failure);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// 打开（必要时新建）锁文件，读写；Windows 上共享模式见 [`lock_install_in`]。
+fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        // FILE_SHARE_READ | FILE_SHARE_WRITE：别人照样能打开来试锁，但删不掉
-        options.share_mode(0x1 | 0x2);
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
     }
-    let file = options
-        .open(&path)
-        .map_err(|e| format!("安装锁 {} 打开失败: {e}", path.display()))?;
-    let deadline = std::time::Instant::now() + wait;
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(InstallLock { _file: file }),
-            Err(std::fs::TryLockError::WouldBlock) => {}
-            Err(std::fs::TryLockError::Error(e)) => {
-                return Err(format!("安装锁 {} 加锁失败: {e}", path.display()));
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "安装锁 {} 被别的进程持有，{} 秒内没有等到（另一个安装正在修改 bin/？）",
-                path.display(),
-                wait.as_secs()
-            ));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    options.open(path)
+}
+
+/// 不等待地加排他锁（永久兼容契约 C4 的 unix 原语）：Ok(true) 拿到了，Ok(false) 别人
+/// 持有（或被信号打断，下一轮再试），Err 是加锁本身出错。
+#[cfg(unix)]
+fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EWOULDBLOCK) | Some(libc::EINTR) => Ok(false),
+        _ => Err(err),
+    }
+}
+
+/// 不等待地加排他锁（永久兼容契约 C4 的 Windows 原语）：Ok(true) 拿到了，Ok(false) 别人
+/// 持有，Err 是加锁本身出错。
+#[cfg(windows)]
+fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    // OVERLAPPED 全零：Offset 与 OffsetHigh 为 0，即从第 0 字节锁起；长度 u64::MAX 拆成
+    // 低 32 位与高 32 位两个参数
+    let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
+    let locked = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as isize,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if locked != 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        Ok(false)
+    } else {
+        Err(err)
     }
 }
 

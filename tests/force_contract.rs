@@ -112,6 +112,154 @@ fn c2_unique_intermediate_names() {
 }
 
 // ---------------------------------------------------------------------------
+// C4：安装锁的原语。测试自己用系统接口加锁、与 `lock_install_in` 互相试探：两个版本只有
+// 用同一种锁、锁同一段字节，才互相看得见
+// ---------------------------------------------------------------------------
+
+/// 测试自己打开锁文件，读写；Windows 上共享模式与契约相同（READ|WRITE）。
+fn open_lock_natively(path: &Path) -> std::fs::File {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0x1 | 0x2);
+    }
+    options.open(path).unwrap()
+}
+
+/// unix：不等待地 `flock`，`shared` 为 LOCK_SH，否则 LOCK_EX。返回是否拿到。
+#[cfg(unix)]
+fn flock_natively(file: &std::fs::File, shared: bool) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let kind = if shared { libc::LOCK_SH } else { libc::LOCK_EX };
+    unsafe { libc::flock(file.as_raw_fd(), kind | libc::LOCK_NB) == 0 }
+}
+
+/// Windows：不等待地 `LockFileEx` 锁 `[offset, offset + len)`，`shared` 时不带
+/// LOCKFILE_EXCLUSIVE_LOCK。返回是否拿到。
+#[cfg(windows)]
+fn lock_file_ex_natively(file: &std::fs::File, shared: bool, offset: u64, len: u64) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
+    let mut overlapped = OVERLAPPED {
+        Internal: 0,
+        InternalHigh: 0,
+        Anonymous: OVERLAPPED_0 {
+            Anonymous: OVERLAPPED_0_0 {
+                Offset: offset as u32,
+                OffsetHigh: (offset >> 32) as u32,
+            },
+        },
+        hEvent: 0,
+    };
+    let flags = if shared { 0 } else { LOCKFILE_EXCLUSIVE_LOCK };
+    unsafe {
+        LockFileEx(
+            file.as_raw_handle() as isize,
+            flags | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            len as u32,
+            (len >> 32) as u32,
+            &mut overlapped,
+        ) != 0
+    }
+}
+
+/// C4：原生持锁时 `lock_install_in` 拿不到；`lock_install_in` 持锁时原生拿不到。试探用
+/// 共享锁：实现若不是排他锁，就会与共享锁共存。Windows 上分别只试第 0 个字节与最后一个
+/// 字节：实现锁的范围必须从 0 起、长到 u64::MAX，两头都覆盖到。
+#[test]
+fn c4_lock_primitive_is_flock_or_lock_file_ex() {
+    use aproxy::install::{lock_install_in, lock_path_in};
+    let home = temp_home();
+    let home = home.path();
+    let path = lock_path_in(home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let briefly = std::time::Duration::from_millis(300);
+    let surely = std::time::Duration::from_secs(5);
+
+    // 原生持锁 → lock_install_in 拿不到
+    #[cfg(unix)]
+    {
+        let native = open_lock_natively(&path);
+        assert!(flock_natively(&native, true));
+        assert!(
+            lock_install_in(home, briefly).is_err(),
+            "原生 flock(LOCK_SH) 持锁时，lock_install_in 不得拿到锁"
+        );
+    }
+    #[cfg(windows)]
+    for (offset, len) in [(0, 1), (u64::MAX - 1, 1)] {
+        let native = open_lock_natively(&path);
+        assert!(lock_file_ex_natively(&native, true, offset, len));
+        assert!(
+            lock_install_in(home, briefly).is_err(),
+            "原生 LockFileEx 共享锁住第 {offset} 字节时，lock_install_in 不得拿到锁"
+        );
+    }
+
+    // lock_install_in 持锁 → 原生拿不到
+    let held = lock_install_in(home, surely).expect("没人持锁时应拿到");
+    // Windows：共享模式不带 FILE_SHARE_DELETE，持锁期间删不掉锁文件
+    #[cfg(windows)]
+    assert!(
+        std::fs::remove_file(&path).is_err(),
+        "持锁期间锁文件不得被删"
+    );
+    // 共享模式带 READ|WRITE：别的版本照样打得开、能来试锁
+    let native = open_lock_natively(&path);
+    #[cfg(unix)]
+    assert!(
+        !flock_natively(&native, true),
+        "lock_install_in 持锁时，原生 flock(LOCK_SH) 不得拿到锁"
+    );
+    #[cfg(windows)]
+    for (offset, len) in [(0, 1), (u64::MAX - 1, 1)] {
+        assert!(
+            !lock_file_ex_natively(&native, true, offset, len),
+            "lock_install_in 持锁时，原生 LockFileEx 不得锁住第 {offset} 字节"
+        );
+    }
+    drop(held);
+
+    // 释放之后原生排他锁拿得到
+    #[cfg(unix)]
+    assert!(flock_natively(&native, false));
+    #[cfg(windows)]
+    assert!(lock_file_ex_natively(&native, false, 0, u64::MAX));
+}
+
+/// C4：打开锁文件也在重试里。Windows 上别的进程（杀毒软件、另一个版本）以不共享的方式
+/// 开着它时，打开会失败——那也要等，不能立即放弃。
+#[cfg(windows)]
+#[test]
+fn c4_lock_waits_while_the_lock_file_is_opened_without_sharing() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let home = temp_home();
+    let path = aproxy::install::lock_path_in(home.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let unshared = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(&path)
+        .unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        drop(unshared);
+    });
+    let lock = aproxy::install::lock_install_in(home.path(), std::time::Duration::from_secs(10));
+    release.join().unwrap();
+    assert!(lock.is_ok(), "{:?}", lock.err());
+}
+
+// ---------------------------------------------------------------------------
 // C3：台账
 // ---------------------------------------------------------------------------
 

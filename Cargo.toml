@@ -116,7 +116,9 @@ ruzstd = "0.9.0"
 # 唯一中间名（永久兼容契约 C2）要的是「目标已存在就失败」。
 # Win32_System_Diagnostics_ToolHelp：强制安装最后报告「从 bin 运行、却不在台账里」
 # 的进程时枚举全部进程（CreateToolhelp32Snapshot）。
-windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp"] }
+# Win32_System_IO：安装锁直接调用 LockFileEx / UnlockFileEx（它们的 OVERLAPPED 参数在
+# 这个 feature 里）——锁原语是永久兼容契约 C4，不经 std 的 File::try_lock。
+windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO"] }
 
 [target.'cfg(unix)'.dependencies]
 # 进程台账（src/ledger.rs）结束进程时要用的系统调用：Linux 的 pidfd_open /

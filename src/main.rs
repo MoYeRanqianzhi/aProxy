@@ -25,7 +25,7 @@ async fn main() {
     // home、不拉起续作，以后解析参数之前要读的任何东西（例如按 settings 判定界面
     // 语言）也都排在它后面。
     if version_requested() {
-        println!("{}", aproxy::VERSION_LINE);
+        print_version_line();
         return;
     }
 
@@ -44,7 +44,7 @@ async fn main() {
     // 这种写法要靠 clap 才分得清 `-V` 是版本参数还是别的参数的取值，所以排在解析之后；
     // 安装器只用单独的 `--version`，由上面第一句兑现「先于一切副作用」
     if cli.version {
-        println!("{}", aproxy::VERSION_LINE);
+        print_version_line();
         return;
     }
 
@@ -182,6 +182,14 @@ async fn main() {
         }
         None => commands::start::handle_start_cmd(&cli, cfg_path, None).await,
     }
+}
+
+/// 输出版本行（永久兼容契约 C5，见 aproxy::VERSION_LINE）。写失败（管道已关闭、终端已
+/// 断开）一律忽略：C5 规定退出码是 0，而 `println!` 写失败会 panic、退出码变成 101。读够
+/// 首行就关掉管道（`| head -n 1`）的安装器与脚本是常态，不是意外。
+fn print_version_line() {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stdout(), "{}", aproxy::VERSION_LINE);
 }
 
 /// 命令行恰好是 `aproxy --version` 或 `aproxy -V`（安装器探测版本就是这样调用的）。

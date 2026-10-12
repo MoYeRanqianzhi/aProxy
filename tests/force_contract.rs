@@ -702,6 +702,21 @@ fn c5_version_line() {
         assert_eq!(line.target, VersionLine::own().target, "{stdout}");
         assert!(!home.exists(), "{flag} 不得建出 home");
     }
+    // 写输出失败不改变退出码：标准输出接到读端已经关掉的管道（读的一方读够首行就关），
+    // 退出码仍是 0——`println!` 写失败会 panic，退出码变成 101
+    for flag in ["--version", "-V"] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let status = Command::new(env!("CARGO_BIN_EXE_aproxy"))
+            .arg(flag)
+            .env("APROXY_HOME", &home)
+            .stdin(Stdio::null())
+            .stdout(writer)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(0), "{flag}");
+        assert!(!home.exists(), "{flag} 不得建出 home");
+    }
 }
 
 // ---------------------------------------------------------------------------

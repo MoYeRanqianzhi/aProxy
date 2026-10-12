@@ -150,14 +150,19 @@ const RETURN_WAIT: Duration = Duration::from_secs(15);
 /// `aproxy v<semver> (<变体>; <目标三元组>[; x86-64-v3])`。
 ///
 /// 版本就用普通安装的取法（`staging::parse_version_line`：`aproxy v` 之后、到空白为止，
-/// 必须是合法 semver），两条路认版本的口径因此不会分叉；括号段缺失或不是这个形状时，
-/// 变体与目标为 None——只靠版本也认得出它。
+/// 必须是合法 semver），两条路认版本的口径因此不会分叉。
+///
+/// 读者容错（C5）：只取版本号之后的第一个括号组，`)` 之后的任何内容都不看；组内按 `;`
+/// 分段、去掉两端空白。写者在 `)` 之后不得追加任何内容——这里的容忍是容错，不是许可：
+/// 冻结的读者过严，以后哪个版本在 `)` 后多写一点东西，所有旧版本就都认不出它的变体，
+/// 在线路径与 `--variant` 核对都会判成「变体不符」而退出 10。没有括号组时变体与目标为
+/// None——只靠版本也认得出它。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionLine {
     pub version: String,
     pub variant: Option<String>,
     pub target: Option<String>,
-    /// 末段是 `x86-64-v3`
+    /// 括号组的第三段起有 `x86-64-v3`
     pub x86_64_v3: bool,
 }
 
@@ -165,18 +170,23 @@ impl VersionLine {
     pub fn parse(output: &str) -> Option<Self> {
         let version = super::staging::parse_version_line(output)?;
         // 版本是首行 `aproxy v` 之后的第一段（semver 只含 ASCII，按字节长度切不会切坏字符）
-        let tail = output.lines().next()?["aproxy v".len() + version.len()..].trim();
+        let tail = &output.lines().next()?["aproxy v".len() + version.len()..];
         let mut line = Self {
             version,
             variant: None,
             target: None,
             x86_64_v3: false,
         };
-        if let Some(inner) = tail.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
-            let mut parts = inner.split("; ");
-            line.variant = parts.next().map(str::to_string);
-            line.target = parts.next().map(str::to_string);
-            line.x86_64_v3 = parts.next() == Some(CPU_X86_64_V3);
+        let group = tail
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(inner, _)| inner);
+        if let Some(inner) = group {
+            let mut parts = inner.split(';').map(str::trim);
+            let mut next_word = || parts.next().filter(|p| !p.is_empty()).map(str::to_string);
+            line.variant = next_word();
+            line.target = next_word();
+            line.x86_64_v3 = parts.any(|p| p == CPU_X86_64_V3);
         }
         Some(line)
     }
@@ -198,16 +208,38 @@ impl VersionLine {
 /// {"manifest":1,"version":"0.2.0","assets":[{"target":"x86_64-pc-windows-msvc","variant":"desktop","cpu":"x86-64-v3","file":"aproxy-x86_64-pc-windows-msvc-v3.exe","sha256":"<64 位小写十六进制>"}]}
 /// ```
 ///
-/// 永久兼容契约 C6：字段的名字、类型、含义无论如何都不得改动，只许追加可选字段；读者
-/// 忽略不认识的字段，资产里不认识的 `variant`、`cpu` 取值不参与选择（所以以后加新的
-/// 变体与指令集档，旧版本照样能读、只是选不到它们）。
+/// 永久兼容契约 C6：字段的名字、类型、含义无论如何都不得改动，只许追加可选字段。
+///
+/// 写者：不带 BOM 的 UTF-8；`version` 等于 tag 去掉 `v`；`file` 永远是同一 release 里的裸
+/// 可执行文件（不是压缩包），每个 release 都为它发布的每个目标保留旧版本能运行的裸二进制
+/// 条目；assets 的每个元素都带齐五个字段。
+///
+/// 读者（这里）比写者宽：忽略不认识的字段；容忍开头的 BOM；assets 逐个元素解析，缺字段、
+/// 类型不对、不是对象的元素跳过；不认识的 `variant`、`cpu` 取值不参与选择。宽是为了
+/// 「只增」真能成立——以后清单里加一种非二进制的资产、换一种写法，旧版本的强制安装照样
+/// 读得懂其余部分，只是选不到新东西；读者严一点，所有旧版本就会因为一个元素读不了整份清单。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     /// 恒为 [`MANIFEST_FORMAT`]
     pub manifest: u32,
     /// 这份清单所属的版本（不带 v），必须等于 release 的 tag 去掉 v
     pub version: String,
+    /// 读得懂的资产；读不懂的元素在解析时已跳过（见 [`assets_skipping_bad`]）
+    #[serde(deserialize_with = "assets_skipping_bad")]
     pub assets: Vec<ManifestAsset>,
+}
+
+/// assets 先按任意 JSON 值的数组读，再逐个元素解析成 [`ManifestAsset`]，解析不了的跳过。
+/// assets 本身不是数组时整份清单不成立。
+fn assets_skipping_bad<'de, D>(deserializer: D) -> Result<Vec<ManifestAsset>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Vec<serde_json::Value> = Vec::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|item| serde_json::from_value(item).ok())
+        .collect())
 }
 
 /// 清单里的一个二进制资产。
@@ -226,7 +258,9 @@ pub struct ManifestAsset {
 }
 
 impl Manifest {
+    /// 解析清单文本；开头的 UTF-8 BOM 先去掉（读者容错，见上）。
     pub fn parse(text: &str) -> Result<Self, String> {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         serde_json::from_str(text).map_err(|e| format!("{MANIFEST_ASSET} 解析失败: {e}"))
     }
 

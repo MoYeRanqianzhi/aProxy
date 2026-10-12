@@ -425,6 +425,36 @@ fn c5_version_line() {
         parse("aproxy v1.2.3 (desktop; x86_64-apple-darwin)\nsomething else").map(|l| l.version),
         Some("1.2.3".into())
     );
+    // 读者容错：只取版本号之后的第一个括号组，`)` 之后的内容一概不看（写者不得在那里
+    // 追加，但哪天有版本追加了，旧读者照样认得出它的变体与目标）；组内各段两端的空白
+    // 不影响；没有括号组时只有版本
+    assert_eq!(
+        parse("aproxy v0.9.0 (headless; x86_64-unknown-linux-gnu; x86-64-v3) [lts] (extra; words)"),
+        Some(VersionLine {
+            version: "0.9.0".into(),
+            variant: Some("headless".into()),
+            target: Some("x86_64-unknown-linux-gnu".into()),
+            x86_64_v3: true,
+        })
+    );
+    assert_eq!(
+        parse("aproxy v0.9.0 (desktop;x86_64-apple-darwin ) build-a1b2c3"),
+        Some(VersionLine {
+            version: "0.9.0".into(),
+            variant: Some("desktop".into()),
+            target: Some("x86_64-apple-darwin".into()),
+            x86_64_v3: false,
+        })
+    );
+    assert_eq!(
+        parse("aproxy v0.9.0"),
+        Some(VersionLine {
+            version: "0.9.0".into(),
+            variant: None,
+            target: None,
+            x86_64_v3: false,
+        })
+    );
     assert_eq!(
         aproxy::install::staging::parse_version_line("aproxy v1.2.3 (desktop; t)").as_deref(),
         Some("1.2.3")
@@ -510,11 +540,32 @@ fn c6_release_manifest() {
     assert_eq!(pick("x86_64-unknown-linux-gnu", "desktop", true), None);
     assert_eq!(pick("x86_64-pc-windows-msvc", "headless", true), None);
 
-    // 必填字段缺了就不是清单
+    // 读者容错：开头的 UTF-8 BOM 去掉；assets 里读不懂的元素（别种资产、缺字段、类型
+    // 不对、不是对象）逐个跳过，其余照读。以后清单里多了什么，旧版本都只是选不到它
+    let tolerant = format!(
+        "\u{feff}{}",
+        r#"{"manifest":1,"version":"0.3.0","assets":[
+            {"target":"t","variant":"headless","cpu":"baseline","file":"first","sha256":"SHA"},
+            {"kind":"skills","file":"aproxy-skills.zip","sha256":"SHA"},
+            {"target":"t","variant":"desktop","cpu":"baseline","file":"no-sha"},
+            {"target":"t","variant":"desktop","cpu":"baseline","file":7,"sha256":"SHA"},
+            "aproxy-format.zip",
+            null,
+            {"target":"t","variant":"desktop","cpu":"baseline","file":"last","sha256":"SHA","signature":{"alg":"x"}}
+        ]}"#
+        .replace("SHA", sha)
+    );
+    let manifest = Manifest::parse(&tolerant).expect("带 BOM、含读不懂元素的清单照样可读");
+    assert_eq!(manifest.version, "0.3.0");
+    let files: Vec<&str> = manifest.assets.iter().map(|a| a.file.as_str()).collect();
+    assert_eq!(files, ["first", "last"]);
+
+    // 清单本身的必填字段缺了、assets 不是数组，就不是清单
     for bad in [
         r#"{"version":"0.2.0","assets":[]}"#,
         r#"{"manifest":1,"assets":[]}"#,
-        r#"{"manifest":1,"version":"0.2.0","assets":[{"target":"t","variant":"desktop","cpu":"baseline","file":"f"}]}"#,
+        r#"{"manifest":1,"version":"0.2.0"}"#,
+        r#"{"manifest":1,"version":"0.2.0","assets":{}}"#,
     ] {
         assert!(Manifest::parse(bad).is_err(), "{bad}");
     }

@@ -237,15 +237,19 @@ struct DesktopInfo {
     windows_build: Option<u32>,
 }
 
-/// 这台电脑上 Mica 的情形，取值与前端 `MicaSupport` 一致。
+/// 这台电脑上 Mica 的情形，取值与前端 `MicaSupport` 一致。只有 Windows 上的 `mica` 模块
+/// 会判定出支持，其余平台只有 `Unsupported`（不写 cfg 的话那两个变体在别的平台上是死代码，
+/// `-D warnings` 下编译失败）。
 #[derive(Clone, Copy, Default, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum MicaSupport {
+    #[cfg(windows)]
     Available,
-    /// 不是 Windows，或者 Windows 版本没有文档化的背景材质接口（见 [`mica`]）
+    /// 不是 Windows，或者 Windows 版本没有文档化的背景材质接口（见 Windows 上的 `mica` 模块）
     #[default]
     Unsupported,
     /// 支持，但系统的「透明效果」关着：Mica 会显示为纯色
+    #[cfg(windows)]
     TransparencyOff,
 }
 

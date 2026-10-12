@@ -18,9 +18,14 @@ categories = ["gui"]
 # 按 gitignore 排除文件，所以照样进包——发布前必须先构建前端（build.rs 在 dist 缺失时报错，
 # 不会拿空界面凑数）。用 `cargo package --list -p aproxy-desktop` 核对。
 #
-# gen/（tauri-build 每次构建都在包根写出的 ACL schema）不进包。代价：`cargo package` 与
-# `cargo publish` 的校验构建在解包目录里把它写出来，cargo 随即以「Source directory was
-# modified by build.rs」拒绝（2026-10-12 实测），发布本包要另行处理这一步。
+# gen/schemas/ 也进包，它同样被 .gitignore 忽略：tauri-build 每次构建都往包根写这几个 ACL
+# schema（acl-manifests.json、capabilities.json、desktop-schema.json、<平台>-schema.json，
+# 平台是 windows、linux、macOS 之一），`cargo package` 与 `cargo publish` 的校验构建在解包目录
+# 里也写。包里没有它们时，cargo 以「Source directory was modified by build.rs」拒绝
+# （2026-10-12 实测）；包里带着同一平台上构建出来的这几个文件，校验构建写出的内容逐字节
+# 相同（tauri-utils 内容不变就不重写，cargo 比的是内容哈希），就不算改动（2026-10-12 在
+# Windows 上实测通过）。所以打包之前，要先在执行打包的这个平台上构建一次本包，让
+# gen/schemas/ 里有这个平台的文件——release.yml 的 publish-crates 就是这样做的。
 include = [
     "/src/**",
     "/build.rs",
@@ -32,6 +37,8 @@ include = [
     "/permissions/**",
     "/icons/**",
     "/dist/**",
+    # 见上面的说明：在打包的平台上先构建一次本包才有这个平台的文件
+    "/gen/schemas/**",
 ]
 
 # 不跑单元测试与文档测试：本包没有测试。默认 test = true 时，即使一个测试都没有，cargo 也会

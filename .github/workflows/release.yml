@@ -1,24 +1,40 @@
 name: Release
 
-# tag 推送触发：全量测试门槛 → 多平台构建矩阵 → skill 打包 → GitHub Release
-# → npm + crates.io 渠道发布（publish-npm / publish-crates 两个独立 job，
-# trusted publishing / OIDC）。
-# 产物命名（文件名不带版本号，版本由 tag 承载，见 install 计划「发布资产命名」）：
-#   aproxy-<target>[-v3][.exe]  +  aproxy-skills.zip  +  aproxy-skill-<名>.zip
-#   每个资产附 .sha256
-# Release 说明自动包含「下载与更新链」说明 + SHA256 清单，
-# 变更记录由 GitHub generate_release_notes 生成，叠在自定义正文之后。
+# 主线（tag v*）的发布：前端构建 → 发布门槛（两种变体的全量验证）→ 20 个产物的构建矩阵 → skill
+# 打包 → 发布清单（生成并核对）→ GitHub Release → npm 与 crates.io 两个渠道（publish-npm /
+# publish-crates，trusted publishing / OIDC）。
 #
-# 可重跑：两个渠道 job 都先查询注册表、版本已存在才跳过，所以任一渠道失败后
-# 可以在 Actions 页面对失败的 job 单独 re-run，已成功的渠道不会重复发布。
+# 产物（文件名不带版本号，版本由 tag 承载，见 install 计划「发布资产命名」）：
+#   带桌面界面的 desktop  aproxy-<target>[-v3][.exe]           9 个（musl 没有带界面版）
+#   无界面的 headless     aproxy-headless-<target>[-v3][.exe]  11 个
+#   aproxy-manifest.json  发布清单（永久兼容契约 C6）：强制安装靠它找资产
+#   aproxy-skills.zip + aproxy-skill-<名>.zip
+#   每个二进制与 skill 包附 .sha256
+# Release 说明由 .github/scripts/release-body.sh 生成（下载与更新链 + SHA256 表），变更记录由
+# GitHub generate_release_notes 叠在后面。
+#
+# 可重跑：两个渠道 job 都先查询注册表、版本已存在才跳过，所以任一渠道失败后可以在 Actions 页面
+# 对失败的 job 单独 re-run，已成功的渠道不会重复发布。
+#
+# 演练（workflow_dispatch，在任意分支上手动触发）：跑完同样的门槛、构建与清单核对，再对 npm 与
+# crates.io 只做 --dry-run（rehearse-npm / rehearse-crates：不上传、不拿 OIDC 凭据、不进 release
+# 环境），Release 只把资产清单与说明正文写进 job 摘要（rehearse-release），不建 Release、不打
+# tag。没有「真发布」开关，发布只由 tag 触发。打 tag 之前用它确认流水线本身没问题：测试 tag 会在
+# npm 与 crates.io 上永久占号（团队记忆 release-version-alignment）。
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "演练用的版本号（不带 v，如 0.2.0-alpha.1）；留空用 Cargo.toml 里的版本"
+        required: false
+        default: ""
+        type: string
 
-# 默认只读：test/build/skills 会编译并运行全部依赖的 build.rs 与测试代码，
-# 不应持有可写 token。只有 release job（写 GitHub Release）提升为
-# contents: write；两个渠道 job 只额外申请 OIDC 的 id-token。
+# 默认只读：门槛与构建会编译并运行全部依赖的 build.rs 与测试代码，不应持有可写 token。只有
+# release job（写 GitHub Release）提升为 contents: write；两个渠道 job 只额外申请 OIDC 的 id-token。
 permissions:
   contents: read
 
@@ -28,25 +44,64 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Linux gnu 产物能运行的最低 glibc。build 矩阵里 zigbuild: true 的条目按此
-  # 版本链接（cargo zigbuild --target <triple>.<下限>），构建后断言产物引用的
-  # GLIBC_ 符号版本都不高于它。必须与 scripts/install.sh 和
-  # npm/aproxy/bin/aproxy.js 中的 MIN_GLIBC 保持一致：两者在 glibc 低于此值的
-  # 系统上改装 musl 产物。若在 runner 上用系统 gcc 链接，产物会继承 runner 的
-  # glibc（ubuntu-24.04 为 2.39），Debian 12、Ubuntu 22.04 等系统会报
-  # `GLIBC_2.39 not found` 而无法启动（alpha.17 实测如此）。
+  # headless 的 Linux gnu 产物能运行的最低 glibc。build 矩阵里 zigbuild: true 的条目按此版本链接
+  # （cargo zigbuild --target <triple>.<下限>），构建后断言产物引用的 GLIBC_ 符号版本都不高于它。
+  # 必须与 scripts/install.sh 和 npm/aproxy/bin/aproxy.js 中的 MIN_GLIBC 保持一致：两者在 glibc
+  # 低于此值的系统上改装 musl 产物。若在 runner 上用系统 gcc 链接，产物会继承 runner 的 glibc
+  # （ubuntu-24.04 为 2.39），Debian 12、Ubuntu 22.04 等系统会报 `GLIBC_2.39 not found` 而无法
+  # 启动（alpha.17 实测如此）。
   GNU_GLIBC_FLOOR: "2.28"
+  # 带界面的 Linux gnu 产物能运行的最低 glibc：它链接 ubuntu:22.04 容器里的 GTK 与 WebKitGTK，
+  # 下限由构建系统决定（见 build-linux-desktop），构建后同样断言不高于它。必须与安装脚本、npm
+  # 启动器、安装器判断「本机能不能跑带界面版」用的数一致。
+  DESKTOP_GLIBC_FLOOR: "2.35"
+  # 演练的版本号（tag 推送时为空、不用），.github/scripts/align-version.py 读它
+  DRY_RUN_VERSION: ${{ inputs.version }}
 
 jobs:
+  frontend:
+    # 桌面界面的前端只构建一次：带界面的门槛、构建与 crates.io 打包都用这一份产物
+    # （aproxy-desktop 的 build.rs 在 aproxy-desktop/dist 缺失时报错，crate 包也要带着它）。
+    # 发布流水线不用 npm 缓存，依赖每次按 package-lock.json 从 registry 取。
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      # npm run build 先跑 svelte-check（--fail-on-warnings），再由 Vite 输出到 aproxy-desktop/dist
+      - name: Build the desktop front end
+        working-directory: aproxy-desktop/ui
+        run: |
+          npm ci
+          npm run build
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: frontend-dist
+          path: aproxy-desktop/dist
+          if-no-files-found: error
+
   test:
-    # 发布门槛：与 CI 相同的全量验证（fmt/clippy/测试），windows 与 ubuntu
-    # 都全绿才进入构建。--workspace 覆盖 aproxy-envelope 与 aproxy-format
-    # （理由见 Cargo.toml [workspace] 注释）。macOS 已知红、支持未完成，不进门禁。
-    name: test (${{ matrix.os }})
+    # 发布门槛：与 CI 相同的全量验证（fmt/clippy/测试/--version 冒烟），windows 与 ubuntu、带界面
+    # 与无界面四路都全绿才进入构建。--workspace 覆盖 aproxy-envelope 与 aproxy-format（理由见
+    # Cargo.toml [workspace] 注释）；headless 再排除 aproxy-desktop（它是 workspace 成员，
+    # --workspace 会把它当作选中的包编译，--no-default-features 管不到它）。macOS 已知红、支持未
+    # 完成，不进门禁。
+    needs: frontend
+    name: test (${{ matrix.os }}, ${{ matrix.variant }})
     strategy:
-      fail-fast: false # 两个平台各自跑完，一次看到全部失败面
+      fail-fast: false # 各路各自跑完，一次看到全部失败面
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-24.04]
+        variant: [desktop, headless]
+        include:
+          - variant: desktop
+            flags: ""
+          - variant: headless
+            flags: --exclude aproxy-desktop --no-default-features
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7.0.1
@@ -55,91 +110,69 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      # 两种变体的编译产物不同，缓存分开存（rust-cache 的自动键不含 matrix 取值）
       - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: ${{ matrix.variant }}
+      - uses: actions/download-artifact@v8.0.1
+        if: matrix.variant == 'desktop'
+        with:
+          name: frontend-dist
+          path: aproxy-desktop/dist
+      # 只装 webkit2gtk-4.1 的开发包（它带进 GTK3、libsoup3、JavaScriptCore 的开发包），理由见 ci.yml
+      - name: Install WebKitGTK
+        if: matrix.variant == 'desktop' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace ${{ matrix.flags }} --all-targets --locked -- -D warnings
       # 不带目标过滤的 cargo test 会顺带编译 examples——transform_integration
       # 依赖已编译的 examples/format-echo
-      - run: cargo test --workspace --locked --no-fail-fast
+      - run: cargo test --workspace ${{ matrix.flags }} --locked --no-fail-fast
+      - name: Smoke-test --version (C5)
+        shell: bash
+        run: bash .github/scripts/version-smoke.sh target/debug/aproxy${{ runner.os == 'Windows' && '.exe' || '' }} ${{ matrix.variant }}
 
   build:
+    # 在 runner 宿主机上构建的 17 个产物：Windows 与 macOS 的两个变体，Linux 的 headless（gnu 用
+    # cargo-zigbuild 压低 glibc 下限，musl 静态链接，两者都只出 headless）。Linux gnu 的带界面版要在
+    # 老系统里链接 WebKitGTK，另见 build-linux-desktop。
+    #
+    # x86-64-v3（AVX2，约 2013 年后主流 CPU）只给 x64 的 Windows 与 Linux gnu 出；install 按
+    # is_x86_feature_detected 自动选档，失败回退 baseline。Windows x86（32 位）在 x64 runner 上
+    # 交叉编译（MSVC 自带 x86 交叉工具链），Windows 与 Linux 的 ARM64 用原生 arm runner（ring 要
+    # 编 C），macOS 在 Apple Silicon runner 上原生出 arm64、交叉出 x86_64。
     needs: test
+    name: build (${{ matrix.target }}, ${{ matrix.ui }}${{ matrix.cpu == 'x86-64-v3' && ', x86-64-v3' || '' }})
     strategy:
-      fail-fast: false # 单平台失败不连坐其他平台的产物
+      fail-fast: false # 单个产物失败不连坐其他产物
       matrix:
         include:
-          # Windows 主平台 x64：baseline + x86-64-v3（AVX2，约 2013 年后主流
-          # CPU；install 按 is_x86_feature_detected 自动选变体，失败回退 baseline）
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            variant: ""
-            rustflags: ""
-            ext: .exe
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            variant: "-v3"
-            rustflags: "-C target-cpu=x86-64-v3"
-            ext: .exe
-          # Windows x86（32 位）与 ARM64：x64 runner 交叉编 x86（MSVC 自带
-          # x86 交叉工具链）；ARM64 用原生 arm runner（ring 要编 C）
-          - os: windows-latest
-            target: i686-pc-windows-msvc
-            variant: ""
-            rustflags: ""
-            ext: .exe
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            variant: ""
-            rustflags: ""
-            ext: .exe
-          # Linux x64：gnu（常规发行版）双变体 + musl（静态链接，无 glibc 环境
-          # 可用；musl 不出 v3——变体组合收益低）。
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ui: desktop, cpu: baseline, ext: .exe }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ui: desktop, cpu: x86-64-v3, ext: .exe }
+          - { os: windows-latest, target: i686-pc-windows-msvc, ui: desktop, cpu: baseline, ext: .exe }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc, ui: desktop, cpu: baseline, ext: .exe }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ui: headless, cpu: baseline, ext: .exe }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ui: headless, cpu: x86-64-v3, ext: .exe }
+          - { os: windows-latest, target: i686-pc-windows-msvc, ui: headless, cpu: baseline, ext: .exe }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc, ui: headless, cpu: baseline, ext: .exe }
+          - { os: macos-latest, target: aarch64-apple-darwin, ui: desktop, cpu: baseline, ext: "" }
+          - { os: macos-latest, target: x86_64-apple-darwin, ui: desktop, cpu: baseline, ext: "" }
+          - { os: macos-latest, target: aarch64-apple-darwin, ui: headless, cpu: baseline, ext: "" }
+          - { os: macos-latest, target: x86_64-apple-darwin, ui: headless, cpu: baseline, ext: "" }
           # zigbuild: true：用 cargo-zigbuild 按 GNU_GLIBC_FLOOR 链接（见顶部 env）
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            variant: ""
-            rustflags: ""
-            ext: ""
-            zigbuild: true
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            variant: "-v3"
-            rustflags: "-C target-cpu=x86-64-v3"
-            ext: ""
-            zigbuild: true
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            variant: ""
-            rustflags: ""
-            ext: ""
-            musl: true
-          # Linux ARM64：Graviton/Ampere 服务器 + M 系列 Mac 的 Docker arm64
-          # 容器（刚需场景）；gnu + musl 双库，原生 arm runner
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            variant: ""
-            rustflags: ""
-            ext: ""
-            zigbuild: true
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-            variant: ""
-            rustflags: ""
-            ext: ""
-            musl: true
-          # macOS：Apple Silicon 原生 + Intel 交叉编译（arm runner 可交叉出 x86_64）
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            variant: ""
-            rustflags: ""
-            ext: ""
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            variant: ""
-            rustflags: ""
-            ext: ""
-    name: build (${{ matrix.target }}${{ matrix.variant }})
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, ui: headless, cpu: baseline, ext: "", zigbuild: true }
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, ui: headless, cpu: x86-64-v3, ext: "", zigbuild: true }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, ui: headless, cpu: baseline, ext: "", zigbuild: true }
+          # musl：静态链接，任何 Linux 都能跑（glibc 过老时的退路）；不出 x86-64-v3，收益低
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-musl, ui: headless, cpu: baseline, ext: "", musl: true }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, ui: headless, cpu: baseline, ext: "", musl: true }
     runs-on: ${{ matrix.os }}
+    env:
+      ASSET: aproxy-${{ matrix.ui == 'headless' && 'headless-' || '' }}${{ matrix.target }}${{ matrix.cpu == 'x86-64-v3' && '-v3' || '' }}${{ matrix.ext }}
+      FEATURES: ${{ matrix.ui == 'headless' && '--no-default-features' || '' }}
+      RUSTFLAGS: ${{ matrix.cpu == 'x86-64-v3' && '-C target-cpu=x86-64-v3' || '' }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -148,12 +181,11 @@ jobs:
       - name: Install musl toolchain
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      # zig 自带各 glibc 版本的符号桩，cargo-zigbuild 用它当链接器即可按指定 glibc
-      # 下限链接，不依赖 runner 自身的 glibc。依赖树里唯一的 C 代码是 ring（无
-      # aws-lc/openssl），zig cc 可直接编译。两者都是 PyPI 上的预编译 wheel，
-      # 版本钉死：升级时须重新实测产物（构建 + 下方 glibc 断言 + 低 glibc 系统试跑）。
-      # pip --target 装进临时目录：不碰 runner 的系统 Python 环境（Ubuntu 24.04 的
-      # 系统 Python 受 PEP 668 保护，--target 安装不受该限制）。
+      # zig 自带各 glibc 版本的符号桩，cargo-zigbuild 用它当链接器即可按指定 glibc 下限链接，不依赖
+      # runner 自身的 glibc。headless 的依赖树里唯一的 C 代码是 ring（无 aws-lc/openssl），zig cc 可
+      # 直接编译。两者都是 PyPI 上的预编译 wheel，版本钉死：升级时须重新实测产物（构建 + glibc 断言
+      # + 低 glibc 系统试跑）。pip --target 装进临时目录：不碰 runner 的系统 Python 环境（Ubuntu
+      # 24.04 的系统 Python 受 PEP 668 保护，--target 安装不受该限制）。
       - name: Install cargo-zigbuild
         if: matrix.zigbuild
         run: |
@@ -164,91 +196,106 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      # RUSTFLAGS 参与 rust-cache 的缓存键——变体间缓存互不污染
       - uses: Swatinem/rust-cache@v2.9.2
         with:
-          key: ${{ matrix.target }}${{ matrix.variant }}
-      # 版本对齐（测试 tag 与正式 tag 同样生效）：产物自报版本必须等于
-      # tag 版本——staged 自证（install 的 --version 校验）、npm 包 version、
-      # crates.io 注册版本全部以此为准。缺失此步时 tag v…t1 发布的产物
-      # 仍是 Cargo.toml 里的旧版本号，install 特定版本的全渠道自证全炸
-      # （实测暴露），且 crates.io 会按旧版本号注册、污染正式版号。
-      - name: Align version with tag
+          key: ${{ env.ASSET }}
+      - uses: actions/download-artifact@v8.0.1
+        if: matrix.ui == 'desktop'
+        with:
+          name: frontend-dist
+          path: aproxy-desktop/dist
+      - name: Align version with the release
         shell: bash
-        run: |
-          python3 - <<'EOF'
-          import re, os
-          v = os.environ.get('GITHUB_REF_NAME', '')[1:]
-          assert v, "GITHUB_REF_NAME 为空（非 tag 触发？）"
-          # encoding 显式 utf-8（Windows runner 默认 cp1252 解码会崩）；
-          # \r?\n 兼容 CRLF 行尾；不用 sed（BSD/GNU 的 -i 语法分裂）
-          toml = open('Cargo.toml', encoding='utf-8', newline='').read()
-          toml, n1 = re.subn(r'(^version = )"[^"]*"', r'\g<1>"%s"' % v, toml, count=1, flags=re.M)
-          assert n1 == 1, "Cargo.toml 中未找到 [package] version 行"
-          open('Cargo.toml', 'w', encoding='utf-8', newline='').write(toml)
-          lock = open('Cargo.lock', encoding='utf-8', newline='').read()
-          lock, n2 = re.subn(r'(name = "aproxy"\r?\nversion = )"[^"]*"', r'\g<1>"%s"' % v, lock)
-          assert n2 == 1, "Cargo.lock 中未找到唯一的 aproxy 版本行"
-          open('Cargo.lock', 'w', encoding='utf-8', newline='').write(lock)
-          print("version ->", v)
-          EOF
+        run: python3 .github/scripts/align-version.py
       - name: Build
         if: ${{ !matrix.zigbuild }}
-        env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo build --release --locked --target ${{ matrix.target }}
-      # <triple>.<glibc> 是 cargo-zigbuild 的目标写法：传给 cargo 的仍是 <triple>，
-      # 产物照常落在 target/<triple>/release/，下游 Stage asset 不用区分两种构建
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }} $FEATURES
+      # <triple>.<glibc> 是 cargo-zigbuild 的目标写法：传给 cargo 的仍是 <triple>，产物照常落在
+      # target/<triple>/release/，后面的步骤不用区分两种构建
       - name: Build (cargo-zigbuild, glibc floor)
         if: matrix.zigbuild
-        env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo zigbuild --release --locked --target "${{ matrix.target }}.${GNU_GLIBC_FLOOR}"
-      # 动态加载器启动时逐条核对 ELF 的 .gnu.version_r（verneed）版本需求，缺任何
-      # 一条都直接拒绝启动——哪怕引用它的符号是弱符号（alpha.17 实证：std 对
-      # pidfd_spawnp 的弱引用仍带出非弱的 GLIBC_2.39 需求）。objdump -p 输出的
-      # "Version References" 就是 verneed。非数字的 GLIBC_ 需求（如链接器打开
-      # DT_RELR 时出现的 GLIBC_ABI_DT_RELR，要求 glibc 2.36+）同样判失败。
-      # 最后在 runner 上试跑一次，确认 zig 链接出的产物能被加载器正常装载。
+        run: cargo zigbuild --release --locked --target "${{ matrix.target }}.${GNU_GLIBC_FLOOR}" $FEATURES
       - name: Assert glibc floor
         if: matrix.zigbuild
-        shell: bash
-        env:
-          BIN: target/${{ matrix.target }}/release/aproxy
-        run: |
-          set -euo pipefail
-          names=$(objdump -p "$BIN" | grep -oE 'GLIBC_[A-Za-z0-9_.]+' | sort -u || true)
-          if [ -z "$names" ]; then
-            echo "::error::$BIN 未引用任何 GLIBC_ 符号版本，不像 glibc 动态链接产物"
-            exit 1
-          fi
-          echo "$BIN 的 glibc 版本需求：$(tr '\n' ' ' <<<"$names")"
-          odd=$(printf '%s\n' "$names" | grep -vE '^GLIBC_[0-9]+(\.[0-9]+)*$' || true)
-          if [ -n "$odd" ]; then
-            echo "::error::$BIN 含非数字的 glibc 版本需求：$(tr '\n' ' ' <<<"$odd")"
-            exit 1
-          fi
-          max=$(printf '%s\n' "$names" | sed 's/^GLIBC_//' | sort -V | tail -n 1)
-          top=$(printf '%s\n%s\n' "$max" "$GNU_GLIBC_FLOOR" | sort -V | tail -n 1)
-          if [ "$top" != "$GNU_GLIBC_FLOOR" ]; then
-            echo "::error::$BIN 需要 GLIBC_$max，高于约定下限 GLIBC_$GNU_GLIBC_FLOOR"
-            exit 1
-          fi
-          echo "最高 GLIBC_$max <= 下限 GLIBC_$GNU_GLIBC_FLOOR：通过"
-          "$BIN" --version
+        run: bash .github/scripts/assert-glibc-floor.sh target/${{ matrix.target }}/release/aproxy "$GNU_GLIBC_FLOOR"
       - name: Stage asset
-        shell: pwsh
-        env:
-          ASSET: aproxy-${{ matrix.target }}${{ matrix.variant }}${{ matrix.ext }}
-        run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/aproxy${{ matrix.ext }}" "dist/$env:ASSET"
-          $hash = (Get-FileHash "dist/$env:ASSET" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $env:ASSET" | Out-File -NoNewline -Encoding ascii "dist/$env:ASSET.sha256"
+        shell: bash
+        run: python3 .github/scripts/stage-asset.py target/${{ matrix.target }}/release/aproxy${{ matrix.ext }} dist "$ASSET"
+      - name: Smoke-test --version (C5)
+        shell: bash
+        run: bash .github/scripts/version-smoke.sh "dist/$ASSET" ${{ matrix.ui }} ${{ matrix.target }} ${{ matrix.cpu }}
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: bin-${{ matrix.target }}${{ matrix.variant }}
+          name: release-bin-${{ env.ASSET }}
           path: dist
+          if-no-files-found: error
+
+  build-linux-desktop:
+    # Linux gnu 的带界面版（3 个产物）：动态链接 GTK 与 WebKitGTK，glibc 下限由链接到的系统库决定，
+    # 不能像 headless 那样用 cargo-zigbuild 压低。于是在想支持的最老基线系统里构建（Tauri 文档的
+    # 建议）：container: ubuntu:22.04 跑在 ubuntu-24.04 与 24.04-arm 上（ubuntu-22.04 runner
+    # 2026-09-17 起弃用、2027-04-17 退役）。产物要求 glibc ≥ DESKTOP_GLIBC_FLOOR、WebKitGTK ≥ 2.40
+    # （tauri 打开了 webkit2gtk 的 v2_40 特性）；冒烟在容器里真的执行 --version，确认 22.04 上的
+    # 动态加载器装得上它。
+    needs: test
+    name: build (${{ matrix.target }}, desktop${{ matrix.cpu == 'x86-64-v3' && ', x86-64-v3' || '' }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, cpu: baseline }
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, cpu: x86-64-v3 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, cpu: baseline }
+    runs-on: ${{ matrix.os }}
+    container: ubuntu:22.04
+    env:
+      ASSET: aproxy-${{ matrix.target }}${{ matrix.cpu == 'x86-64-v3' && '-v3' || '' }}
+      RUSTFLAGS: ${{ matrix.cpu == 'x86-64-v3' && '-C target-cpu=x86-64-v3' || '' }}
+    steps:
+      # 容器是精简镜像，缺的都在这里装：git（有它 checkout 才是真正的仓库，而不是 REST API 下载的
+      # 源码包）、curl 与 ca-certificates（rustup 安装）、build-essential（cc、ld、objdump）、
+      # pkg-config 与 WebKitGTK 的开发包（链接用，同时带进运行库，冒烟能真的执行）、python3（版本
+      # 对齐与暂存脚本）
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config python3 libwebkit2gtk-4.1-dev
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: ${{ env.ASSET }}
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: frontend-dist
+          path: aproxy-desktop/dist
+      - name: Align version with the release
+        shell: bash
+        run: python3 .github/scripts/align-version.py
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Assert glibc floor
+        shell: bash
+        run: bash .github/scripts/assert-glibc-floor.sh target/${{ matrix.target }}/release/aproxy "$DESKTOP_GLIBC_FLOOR"
+      - name: Stage asset
+        shell: bash
+        run: python3 .github/scripts/stage-asset.py target/${{ matrix.target }}/release/aproxy dist "$ASSET"
+      - name: Smoke-test --version (C5)
+        shell: bash
+        run: bash .github/scripts/version-smoke.sh "dist/$ASSET" desktop ${{ matrix.target }} ${{ matrix.cpu }}
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-bin-${{ env.ASSET }}
+          path: dist
+          if-no-files-found: error
 
   skills:
     # skill 文档打包：总包（解压得 ~/.aproxy/skills/ 内容）+ 每个 skill 单包。
@@ -273,58 +320,60 @@ jobs:
           done
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: skills
+          name: release-skills
           path: |
             aproxy-skills.zip
             aproxy-skills.zip.sha256
             aproxy-skill-*.zip
             aproxy-skill-*.zip.sha256
 
+  manifest:
+    # 发布清单（永久兼容契约 C6）：从 20 个二进制生成 aproxy-manifest.json，并用强制安装读清单的
+    # 同一段代码读回核对，做法见 examples/release-manifest.rs 的模块文档。要编译并运行仓库代码，
+    # 所以与写仓库的 release job 分开，只有只读权限。--no-default-features：清单代码在 lib 里，
+    # 用不着编译桌面界面。
+    needs: [build, build-linux-desktop]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: release-bin-*
+          path: artifacts
+          merge-multiple: true
+      - name: Align version with the release
+        run: python3 .github/scripts/align-version.py
+      - name: Generate and verify aproxy-manifest.json
+        run: cargo run --locked --no-default-features --example release-manifest -- "$RELEASE_VERSION" artifacts aproxy-manifest.json
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-manifest
+          path: aproxy-manifest.json
+          if-no-files-found: error
+
   release:
-    needs: [build, skills]
+    # 全 workflow 唯一需要写仓库的 job：创建 Release 并上传资产。只运行仓库里的 release-body.sh，
+    # 不编译、不执行任何依赖代码。演练时跳过（它的依赖者 publish-npm、publish-crates 随之跳过）。
+    if: github.event_name == 'push'
+    needs: [manifest, skills]
     runs-on: ubuntu-latest
-    # 全 workflow 唯一需要写仓库的 job：创建 Release 并上传资产。不 checkout
-    # 代码，也不执行任何依赖代码。
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v8.0.1
         with:
+          pattern: release-*
           path: artifacts
           merge-multiple: true
-      - name: Assemble release body（更新链 + 基础信息 + SHA256 清单）
-        run: |
-          cd artifacts
-          {
-            echo "## 下载与更新链"
-            echo ""
-            echo "\`aproxy install\` 自动按默认链条尝试：**github → npm → cargo-binstall → cargo**。"
-            echo ""
-            echo "- **GitHub（本页 assets）**：按平台选择 \`aproxy-<target>[-v3]\`；\`-v3\` 需要 AVX2（约 2013 年后的主流 x86_64 CPU），不确定就选无后缀的 baseline 版本"
-            echo "- **npm**：\`npm install -g @meowo/aproxy\`（含全平台预编译包）"
-            echo "- **cargo-binstall**：\`cargo binstall aproxy\`（预编译，免编译）"
-            echo "- **cargo（源码编译）**：\`cargo install aproxy --root ~/.aproxy\`"
-            echo ""
-            echo "- **skill 文档**：\`aproxy-skills.zip\`（总包，含全部 skill：aproxy-cli / aproxy-format）/\`aproxy-skill-<名>.zip\`（单包）——install 自动随版本更新 skill，通常无需手动下载"
-            echo ""
-            echo "安装/升级推荐直接用 install 指令：\`aproxy install\`（自动选变体并滚动重启实例）。"
-            echo ""
-            echo "## 基础信息"
-            echo ""
-            echo "- 版本：\`${GITHUB_REF_NAME}\`"
-            echo "- 平台产物：windows（x64/x86/arm64）/ linux（x64+arm64，gnu+musl）/ macOS（arm64+x64），x86_64 提供 baseline 与 AVX2（-v3）两种指令集变体"
-            echo "- 变更记录：见下方 Automatic release notes"
-            echo ""
-            echo "## SHA256"
-            echo ""
-            echo "| 文件 | SHA256 |"
-            echo "|---|---|"
-            for f in *.sha256; do
-              h=$(cut -d' ' -f1 "$f")
-              a=$(cut -d' ' -f2- "$f" | sed 's/^ *//')
-              echo "| \`$a\` | \`$h\` |"
-            done
-          } > ../release_body.md
+      - name: Assemble release body
+        run: bash .github/scripts/release-body.sh artifacts "$GITHUB_REF_NAME" > release_body.md
       - name: Publish release
         uses: softprops/action-gh-release@v3.0.3
         with:
@@ -342,11 +391,40 @@ jobs:
           # 会把 Latest 从更新的稳定版抢回旧版；不传则不改动现有标记。
           # format 线（release-format.yml）显式写 false，不参与 Latest。
 
+  rehearse-release:
+    # 演练：把 Release 会带的资产与说明正文写进 job 摘要，不建 Release
+    if: github.event_name == 'workflow_dispatch'
+    needs: [manifest, skills]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: release-*
+          path: artifacts
+          merge-multiple: true
+      - name: Show what the release would carry
+        run: |
+          version=$(python3 -c 'import json; print(json.load(open("artifacts/aproxy-manifest.json"))["version"])')
+          {
+            echo "# 演练：v$version 的 Release 会带这些资产"
+            echo ""
+            echo '```'
+            ls -l artifacts
+            echo '```'
+            echo ""
+            bash .github/scripts/release-body.sh artifacts "v$version"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat artifacts/aproxy-manifest.json
+
   publish-npm:
-    # npm 渠道：GitHub Release 成功落位后才发。认证走 trusted publishing：
-    # setup-node + id-token，npm publish 自动走 OIDC（npmjs.com 绑定
-    # Trusted Publisher 后生效）。build-and-publish.sh 逐包先查询版本是否
-    # 已存在，已存在则跳过，所以失败后可以单独 re-run 本 job。
+    # npm 渠道：GitHub Release 成功落位后才发。认证走 trusted publishing：setup-node + id-token，
+    # npm publish 自动走 OIDC。两组包：带界面的 @meowo/aproxy 与无界面的 @meowo/aproxy-headless，
+    # 各一个主包加 9 个平台子包，20 个包都要在 npmjs.com 绑定 Trusted Publisher（workflow
+    # release.yml、environment release），缺绑定的包发布时返回 404。
+    # build-and-publish.sh 逐包先查询版本是否已存在，已存在则跳过，所以失败后可以单独 re-run 本 job。
     needs: release
     runs-on: ubuntu-latest
     # environment 名须与 npm/crates.io 网站侧 Trusted Publisher 配置一致
@@ -360,26 +438,55 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v8.0.1
         with:
+          pattern: release-bin-*
           path: artifacts
           merge-multiple: true
       # npm 要求 Node ≥22.14 / npm CLI ≥11.5.1（trusted publishing 门槛）
-      - uses: actions/setup-node@v7.0.0
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: 24
           registry-url: 'https://registry.npmjs.org'
           package-manager-cache: false
-      - name: Publish npm packages（主包 + 9 平台子包）
+      - name: Publish npm packages (desktop group, then headless group)
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: bash npm/build-and-publish.sh
+        run: |
+          bash npm/build-and-publish.sh
+          bash npm/build-and-publish.sh headless
+
+  rehearse-npm:
+    # 演练：两组 npm 包照常组包，npm publish 只带 --dry-run（不上传）。没有 id-token 权限、不进
+    # release 环境，拿不到任何发布凭据。
+    if: github.event_name == 'workflow_dispatch'
+    needs: manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: release-bin-*
+          path: artifacts
+          merge-multiple: true
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Align version with the release
+        run: python3 .github/scripts/align-version.py
+      - name: Pack npm packages (dry run)
+        run: |
+          bash npm/build-and-publish.sh --dry-run
+          bash npm/build-and-publish.sh headless --dry-run
 
   publish-crates:
     # crates.io 渠道：与 publish-npm 并行、互不依赖，可以单独 re-run。
     # 认证：rust-lang/crates-io-auth-action 用 OIDC 换短期 token；表达式 ||
     # 兜底到仓库 secret CARGO_REGISTRY_TOKEN（OIDC 未配置时 action 输出为空）。
-    # 新 crate 的首个版本 OIDC 不能发，必须由所有者本地手动首发。
+    # 新 crate 的首个版本 OIDC 不能发，必须由所有者本地手动首发（aproxy-desktop 也是这样）。
     needs: release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: release
     permissions:
       contents: read
@@ -389,63 +496,32 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      # 本 job 是独立 checkout，Cargo.toml 是原始版本号——crates.io 按
-      # .crate 内 manifest 注册版本，不对齐会把无后缀正式号被测试 tag 抢注
-      # （alpha.10/alpha.11 就这么被占掉的）。与 build job 同款对齐逻辑。
-      - name: Align version with tag (publish)
-        shell: bash
+      # aproxy-desktop 的包要带构建好的前端；校验构建会编译它（Linux 上链接 WebKitGTK），
+      # 也会以默认的 desktop 特性编译 aproxy
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: frontend-dist
+          path: aproxy-desktop/dist
+      - name: Install WebKitGTK
         run: |
-          python3 - <<'EOF'
-          import re, os
-          v = os.environ.get('GITHUB_REF_NAME', '')[1:]
-          assert v, "GITHUB_REF_NAME 为空（非 tag 触发？）"
-          toml = open('Cargo.toml', encoding='utf-8', newline='').read()
-          toml, n1 = re.subn(r'(^version = )"[^"]*"', r'\g<1>"%s"' % v, toml, count=1, flags=re.M)
-          assert n1 == 1, "Cargo.toml 中未找到 [package] version 行"
-          open('Cargo.toml', 'w', encoding='utf-8', newline='').write(toml)
-          lock = open('Cargo.lock', encoding='utf-8', newline='').read()
-          lock, n2 = re.subn(r'(name = "aproxy"\r?\nversion = )"[^"]*"', r'\g<1>"%s"' % v, lock)
-          assert n2 == 1, "Cargo.lock 中未找到唯一的 aproxy 版本行"
-          open('Cargo.lock', 'w', encoding='utf-8', newline='').write(lock)
-          print("version ->", v)
-          EOF
-      # 幂等判定（与 release-format.yml 的同名步骤同一套逻辑，改动须同步）：
-      # 逐个查询 crates.io API 的 /api/v1/crates/<名>/<版本>。200 = 该版本已存在，
-      # 跳过；404 = 未发布（含 crate 本身不存在），列入待发布；其他状态码或网络
-      # 失败一律硬失败——只有「已存在」这一种情况可以跳过，不再用 || 吞掉错误。
-      # CRATES 按依赖顺序排列：aproxy 依赖 aproxy-envelope（registry 上的
-      # version 依赖），envelope 必须在前。
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev
+      # 本 job 是独立 checkout：crates.io 按 .crate 内 manifest 登记版本，不对齐会让测试 tag 抢注
+      # 正式版号（alpha.10/alpha.11 就这么被占掉的）
+      - name: Align version with the release
+        run: python3 .github/scripts/align-version.py
+      # 按依赖顺序：aproxy 依赖 aproxy-envelope 与 aproxy-desktop 的 registry 版本
       - name: Plan crates to publish
         id: plan
-        shell: bash
-        env:
-          CRATES: aproxy-envelope aproxy
-        run: |
-          set -euo pipefail
-          meta=$(cargo metadata --no-deps --locked --format-version 1)
-          args=""
-          for c in $CRATES; do
-            v=$(printf '%s' "$meta" | python3 -c 'import json, sys; n = sys.argv[1]; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == n))' "$c")
-            code=$(curl -sS --retry 3 -o crates-io-resp.json -w '%{http_code}' \
-              -A "aProxy-release (https://github.com/MoYeRanqianzhi/aProxy)" \
-              "https://crates.io/api/v1/crates/$c/$v") || {
-              echo "::error::查询 crates.io 上的 $c@$v 失败（网络错误）"
-              exit 1
-            }
-            case "$code" in
-              200) echo "$c@$v 已在 crates.io，跳过" ;;
-              404) echo "$c@$v 尚未发布，列入待发布"; args="$args -p $c" ;;
-              *)
-                echo "::error::查询 crates.io 上的 $c@$v 返回 HTTP $code"
-                cat crates-io-resp.json
-                exit 1
-                ;;
-            esac
-          done
-          echo "args=$args" >> "$GITHUB_OUTPUT"
-          [ -n "$args" ] || echo "全部 crate 的当前版本都已在 crates.io，无需发布"
-      # 多个 -p 时 cargo（1.90+）按依赖顺序打包，并用本地刚打好的包校验后续包，
-      # 所以 envelope 新版本尚未上 crates.io 时，aproxy 的 dry-run 也能通过。
+        run: bash .github/scripts/plan-crates.sh aproxy-envelope aproxy-desktop aproxy
+      # tauri-build 往包根写 gen/schemas/，包里要带着本平台的那几个文件，校验构建才不会被判为
+      # 「改动了源码目录」（见 aproxy-desktop/Cargo.toml 的 include 说明）。这次构建的依赖产物
+      # 校验构建接着用
+      - name: Generate the ACL schemas of aproxy-desktop
+        if: contains(steps.plan.outputs.args, 'aproxy-desktop')
+        run: cargo build -p aproxy-desktop --locked
+      # 多个 -p 时 cargo（1.90+）按依赖顺序打包，并用本地刚打好的包校验后续包，所以
+      # envelope、desktop 的新版本尚未上 crates.io 时，aproxy 的 dry-run 也能通过。
       # --allow-dirty：工作区被对齐步骤有意改为 tag 版本，非意外。
       - name: Dry run
         if: steps.plan.outputs.args != ''
@@ -458,3 +534,34 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked --allow-dirty ${{ steps.plan.outputs.args }}
+
+  rehearse-crates:
+    # 演练：与 publish-crates 相同的打包与校验构建，只跑 cargo publish --dry-run（不上传）。没有
+    # id-token 权限、不进 release 环境，拿不到任何发布凭据。
+    if: github.event_name == 'workflow_dispatch'
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: frontend-dist
+          path: aproxy-desktop/dist
+      - name: Install WebKitGTK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev
+      - name: Align version with the release
+        run: python3 .github/scripts/align-version.py
+      - name: Plan crates to publish
+        id: plan
+        run: bash .github/scripts/plan-crates.sh aproxy-envelope aproxy-desktop aproxy
+      - name: Generate the ACL schemas of aproxy-desktop
+        if: contains(steps.plan.outputs.args, 'aproxy-desktop')
+        run: cargo build -p aproxy-desktop --locked
+      - name: Dry run
+        if: steps.plan.outputs.args != ''
+        run: cargo publish --dry-run --locked --allow-dirty ${{ steps.plan.outputs.args }}

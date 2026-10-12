@@ -51,6 +51,19 @@ include = ["/src/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "
 name = "aproxy"
 path = "src/main.rs"
 
+# cargo-binstall：发布资产的命名（带界面的 `aproxy-<target>[.exe]`，裸二进制）正好命中它内置的
+# 默认地址，主体不用配置。musl 目标没有带界面的版本，只发布 `aproxy-headless-<target>`，这里按
+# 目标给它指路（逐个写目标名而不用 cfg 表达式：旧版 cargo-binstall 不认 cfg）。其余平台要无界面
+# 版本时，用户在命令行给 --pkg-url（见 README）。install 的 cargo-binstall 渠道只读
+# [package.metadata.binstall] 本身、不读 overrides，无界面版本的地址由它自己拼。
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-headless-{ target }{ binary-ext }"
+pkg-fmt = "bin"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-headless-{ target }{ binary-ext }"
+pkg-fmt = "bin"
+
 # 发布变体：desktop = 带桌面界面的版本（默认），`--no-default-features` 出无界面的
 # headless 版本，不多出任何依赖（CI 用 cargo tree 断言依赖树里没有 tauri）。
 # `aproxy --version` 的变体段按它输出 desktop 或 headless（src/lib.rs 的
@@ -106,8 +119,11 @@ regex = "1"
 aproxy-envelope = { version = "0.2.0", path = "aproxy-envelope" }
 # 桌面界面（desktop 特性）：Tauri 外壳与嵌入的前端。version + path 双写，理由同上；
 # 版本与本包同步。它不依赖本包（否则成环），需要的东西（home、运行时）由 bin 在启动
-# 界面时传进去。
-aproxy-desktop = { version = "0.2.0-alpha.0", path = "aproxy-desktop", optional = true }
+# 界面时传进去。版本要求用 `=` 精确钉住：两者总是同号一起发布，aproxy-desktop 的接口
+# 只为同号的 aproxy 服务、不守 semver，不带 --locked 的 `cargo install aproxy` 不能挑到
+# 别的版本。发布前 .github/scripts/align-version.py 按正则把这一行与两边的版本一起改成
+# tag 版本：改这一行的写法（换行、调换键的顺序）要同步改那个脚本，否则发布在对齐这步失败。
+aproxy-desktop = { version = "=0.2.0-alpha.0", path = "aproxy-desktop", optional = true }
 # 响应体检查用解码器（src/decode.rs）：把压缩响应解出一份副本供「错误判定 +
 # 日志预览」使用——转发给客户端的字节始终是上游原样，本模块不参与转发路径。
 # 两者均为**纯 Rust**实现（无 C 依赖，故 musl/aarch64 交叉编译与 CI 各平台不受

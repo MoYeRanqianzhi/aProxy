@@ -191,9 +191,9 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo zigbuild --release --locked --target "${{ matrix.target }}.${GNU_GLIBC_FLOOR}" -p aproxy-format
-      # glibc 断言与 release.yml 的同名步骤是同一段脚本（原理见那里的注释），
-      # 改动须同步。aproxy-format 没有 --version：不带参数运行会打印用法并以 1
-      # 退出，能看到用法文字就说明加载器已正常装载产物。
+      # glibc 断言与主线共用 .github/scripts/assert-glibc-floor.sh（原理见那里的注释）。
+      # aproxy-format 没有 --version：不带参数运行会打印用法并以 1 退出，能看到用法文字
+      # 就说明加载器已正常装载产物。
       - name: Assert glibc floor
         if: matrix.zigbuild
         shell: bash
@@ -201,24 +201,7 @@ jobs:
           BIN: target/${{ matrix.target }}/release/aproxy-format
         run: |
           set -euo pipefail
-          names=$(objdump -p "$BIN" | grep -oE 'GLIBC_[A-Za-z0-9_.]+' | sort -u || true)
-          if [ -z "$names" ]; then
-            echo "::error::$BIN 未引用任何 GLIBC_ 符号版本，不像 glibc 动态链接产物"
-            exit 1
-          fi
-          echo "$BIN 的 glibc 版本需求：$(tr '\n' ' ' <<<"$names")"
-          odd=$(printf '%s\n' "$names" | grep -vE '^GLIBC_[0-9]+(\.[0-9]+)*$' || true)
-          if [ -n "$odd" ]; then
-            echo "::error::$BIN 含非数字的 glibc 版本需求：$(tr '\n' ' ' <<<"$odd")"
-            exit 1
-          fi
-          max=$(printf '%s\n' "$names" | sed 's/^GLIBC_//' | sort -V | tail -n 1)
-          top=$(printf '%s\n%s\n' "$max" "$GNU_GLIBC_FLOOR" | sort -V | tail -n 1)
-          if [ "$top" != "$GNU_GLIBC_FLOOR" ]; then
-            echo "::error::$BIN 需要 GLIBC_$max，高于约定下限 GLIBC_$GNU_GLIBC_FLOOR"
-            exit 1
-          fi
-          echo "最高 GLIBC_$max <= 下限 GLIBC_$GNU_GLIBC_FLOOR：通过"
+          bash .github/scripts/assert-glibc-floor.sh "$BIN" "$GNU_GLIBC_FLOOR"
           out=$("$BIN" 2>&1 < /dev/null || true)
           case "$out" in
             *用法*) echo "试跑通过：$out" ;;
@@ -348,38 +331,12 @@ jobs:
           open('Cargo.lock', 'w', encoding='utf-8', newline='').write(lock)
           print("aproxy-format version ->", v)
           EOF
-      # 幂等判定与 release.yml 的 publish-crates 同一套逻辑（原理见那里的注释），
-      # 改动须同步。envelope 版本独立于 format：format 发新版而 envelope 未变时
-      # （常态），envelope 查得 200 被跳过，只发 aproxy-format。
+      # 幂等判定与主线共用 .github/scripts/plan-crates.sh（原理见那里的注释）。envelope 版本
+      # 独立于 format：format 发新版而 envelope 未变时（常态），envelope 查得 200 被跳过，只发
+      # aproxy-format。
       - name: Plan crates to publish
         id: plan
-        shell: bash
-        env:
-          CRATES: aproxy-envelope aproxy-format
-        run: |
-          set -euo pipefail
-          meta=$(cargo metadata --no-deps --locked --format-version 1)
-          args=""
-          for c in $CRATES; do
-            v=$(printf '%s' "$meta" | python3 -c 'import json, sys; n = sys.argv[1]; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == n))' "$c")
-            code=$(curl -sS --retry 3 -o crates-io-resp.json -w '%{http_code}' \
-              -A "aProxy-release (https://github.com/MoYeRanqianzhi/aProxy)" \
-              "https://crates.io/api/v1/crates/$c/$v") || {
-              echo "::error::查询 crates.io 上的 $c@$v 失败（网络错误）"
-              exit 1
-            }
-            case "$code" in
-              200) echo "$c@$v 已在 crates.io，跳过" ;;
-              404) echo "$c@$v 尚未发布，列入待发布"; args="$args -p $c" ;;
-              *)
-                echo "::error::查询 crates.io 上的 $c@$v 返回 HTTP $code"
-                cat crates-io-resp.json
-                exit 1
-                ;;
-            esac
-          done
-          echo "args=$args" >> "$GITHUB_OUTPUT"
-          [ -n "$args" ] || echo "全部 crate 的当前版本都已在 crates.io，无需发布"
+        run: bash .github/scripts/plan-crates.sh aproxy-envelope aproxy-format
       # 多个 -p 时 cargo（1.90+）按依赖顺序打包，并用本地刚打好的包校验后续包
       - name: Dry run
         if: steps.plan.outputs.args != ''

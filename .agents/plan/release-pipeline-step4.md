@@ -32,6 +32,14 @@ aproxy-desktop、Linux 自动选择变体、release-format 门禁、binstall 选
   没写 `--variant` 的带界面版跑不起来就换同目标 headless，再换 musl headless（`DownloadCtx::attempts` /
   `force::fallbacks`）；写明了的不换。主代理 2026-10-12 按第 4 步审查定的：预检会把这一版的系统要求冻进永久的
   强制安装路径，`src/install/variant.rs` 已删。只有 install.sh（每次从 main 现取）在首装、没指定变体时先看本机。
+- **普通安装不跟 N5**（主代理 2026-10-13 定）：release 里缺本变体的资产时，普通安装的下载链逐个渠道失败、以 1 结束，
+  不回退 headless——下载链分不清 404 与网络暂时出错，失败就回退会让一次网络抖动把用户悄悄换成 headless。没写
+  `--variant`、要的是带界面版时，只在失败提示里指出 `--variant headless` 与 `install --force`。强制安装按发布清单
+  判断，确定没有才回退，所以安全。
+- **aproxy-envelope 随主线同号**（主代理 2026-10-13 定，W2 设计稿 §10.13、审查 RT-06）：0.2.0 正式版之前它与
+  aproxy、aproxy-desktop 同号发预发布版，align-version.py 一起对齐，根包用 `=` 钉住，aproxy-format 用同号的 caret
+  要求；正式版时才发 0.2.0。仓库里原来的 0.2.0（677f671）照旧不对齐的话，alpha.1 会把正式版号配给 W2 之前的接口
+  永久占掉。
 
 ## 进度
 
@@ -47,9 +55,9 @@ aproxy-desktop、Linux 自动选择变体、release-format 门禁、binstall 选
 - [x] 主代理首推 5928fcb 后 ci.yml 的 ubuntu (desktop) 红在 tests/install_force.rs 的 4 个 online_* 测试（调试版超过
   256 MiB 的资产上限）：be3893e 改调试构建只带行号表，fd622cd 的 CI（run 38273956900）里转绿。macOS 红是既有的
   （fad48c7 上就是同样 4 个 lib 测试，daemon 那个读不到自身进程的创建时间），不归第 4 步
-- [ ] fd622cd 的 CI 里 ubuntu (headless) 偶发一次 ETXTBSY（install_swap 落位后核对「Text file busy」）：127dafa 让
-  run_version 退避重试（03ec68a 收紧到合计约 1.6 秒、算在 VERSION_TIMEOUT 之内）。之后 65dd651、8b02a31 两次
-  ubuntu CI 都没再出现，再看一两次再下结论
+- [x] fd622cd 的 CI 里 ubuntu (headless) 偶发一次 ETXTBSY（install_swap 落位后核对「Text file busy」）：127dafa 让
+  run_version 退避重试（03ec68a 收紧到合计约 1.6 秒、算在 VERSION_TIMEOUT 之内）。之后 65dd651、8b02a31、11ca06f
+  三次 CI 的两个 ubuntu job 都没再出现（`unix_swap_keeps_the_previous_binary_for_rollback` 都是 ok）
 - [x] 第 4 步审查（`.agents/review/2026-10-12-release-pipeline-review.md`，主代理的处理决定在文末）：8296a02（暂存件
   补 x 位）、d9d1fc1（install.sh 写明 desktop 照装、--variant 缺值报错）、96d014f（删掉安装前的探测与 variant.rs，
   回退链 DownloadCtx::attempts / force::fallbacks 带测试，通道为空也能换变体，命名只留一处，v3 只在发布它的目标上选）、
@@ -62,5 +70,10 @@ aproxy-desktop、Linux 自动选择变体、release-format 门禁、binstall 选
   加载器报错时提示装库，普通安装同样收紧，提示不再写死库与版本；N5 没写 `--variant` 而清单里没有本变体时也回退）、
   ac6ce9d（N6 install.sh 在 glibc 太旧时说明是 glibc）；N2 随 05efe7b 提交；N3 在 03ec68a 里已经成立。Windows 上两种
   变体的 fmt、clippy（含 Linux 交叉 clippy）与 lib / install_flow / install_force 测试通过；Linux 上的测试等推送后的 CI
-- [ ] 推送 05efe7b..（含本条）之后看 ci.yml 门槛与 ubuntu (headless) 有没有再撞 ETXTBSY
+- [x] 推送 8b02a31..11ca06f 后的 CI（run 38284908914）过门槛：windows 与 ubuntu 两种变体、两路 upgrade、macos-build
+  全绿，macos 只红那 4 个已知的 lib 测试；Review（38284908856）绿。新加的两个集成测试在两个 ubuntu job 里都是 ok
+- [x] aproxy-envelope 随主线对齐（见「已定的做法」，d03dfea）与普通安装缺带界面资产时的提示（5bdb585）。Windows 上
+  两种变体的 workspace clippy 与 install_flow（含新测试）通过；对齐脚本在临时 worktree 里用 0.2.0-alpha.1 核对过
+- [ ] 在要打 tag 的提交上再跑一次完整演练，确认全绿，且 rehearse-crates 打包的是 aproxy-envelope 0.2.0-alpha.1。
+  主代理之后还要做文档终审与版本号提交；那之后的提交若不只是版本号，就要在最终的提交上再演练一次
 - [ ] 所有者：aproxy-desktop 在 crates.io 的首发与可信发布配置（步骤在给主代理的报告里）

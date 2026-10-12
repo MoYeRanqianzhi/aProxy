@@ -69,9 +69,10 @@ aproxy-format（协议转换 + key 轮换 + 多渠道聚合）。
   decode/encode_request + decode/encode_aggregated_response + decode/
   encode_stream）。**无 detect API**——自动检测是自研启发式（aproxy-format
   的 detect.rs，单测钉死）。
-- **版本对齐脚本兼容性**：release.yml 的 lock 断言正则 `name = "aproxy"\n
-  version =` 对 `name = "aproxy-format"` 不匹配（引号后是 `-` 不是换行）——
-  三个成员版本线独立，无需改脚本。
+- **版本对齐**：`.github/scripts/align-version.py` 的 lock 正则 `name = "aproxy"\r?\n
+  version =` 对 `name = "aproxy-format"` 不匹配（引号后是 `-` 不是换行）。2026-10-13 起它把
+  aproxy、aproxy-desktop、aproxy-envelope 一起对齐成 tag 版本（envelope 见下文「信封 crate 的
+  版本」），aproxy-format 的版本线照旧独立，脚本只改它对 envelope 的要求。
 - **npm skill 包形态变更**（alpha.17 起）：主包 skills/aproxy-cli.zip 单包
   → skills/aproxy-skills.zip 多 skill 总包。旧二进制的 npmpkg.rs 找不到新
   inner → skill 支线失败（非强制不影响安装），舰队收敛到新版本后自愈。
@@ -97,15 +98,21 @@ aproxy-format（协议转换 + key 轮换 + 多渠道聚合）。
   拒绝（aproxy 回 502、不发上游、不计费），提示显式声明 client_format；该修复随 aproxy-format
   新版本（format-v0.1.1 或之后）生效，需单独发 format 版本。
 
-## 改信封 crate 必须同时升它的版本（2026-10-06）
+## 信封 crate 的版本（2026-10-06 定，2026-10-13 改）
 
-aproxy-envelope 的版本号不随 tag 对齐：release.yml / release-format.yml 按 Cargo.toml 里的版本
-查 crates.io，已存在就跳过发布。改了它的公开 API（例如 2026-10-06 给 TransformEnvelope 加
-`stage`/`request_id`/`state`）却不升版本，主线 release 会跳过 envelope、照常发布 aproxy，而
-crates.io 上的 aproxy 依赖的是旧 envelope，`cargo install aproxy` 编译失败。给结构体加 pub 字段对
-0.x 是破坏性变更，升次版本（当时 0.1.0 → 0.2.0），根包与 aproxy-format 的依赖声明一起改。
-**Evidence:** release.yml 的「Plan crates to publish」步骤（200 = 已存在即跳过）；Cargo.toml
-`aproxy-envelope = { version = ..., path = ... }`。**Recheck when:** 发布流程改为按 tag 对齐 envelope 版本。
+- **现行（2026-10-13 起）**：aproxy 0.2.0 正式版之前，aproxy-envelope 随主线与 aproxy、aproxy-desktop
+  同号发预发布版（0.2.0-alpha.N 等），由 `.github/scripts/align-version.py` 对齐；根包用 `=` 钉住、
+  aproxy-format 用同号的 caret 要求。到 aproxy 0.2.0 正式版才发 0.2.0。
+- **Why:** 正式版号一经发布就永久占用。仓库里 envelope 原是 0.2.0（677f671 升的），照旧不对齐的话，
+  alpha.1 会把 0.2.0 发出去，配的却是 W2 之前的接口，而 W2 还要加 `#[non_exhaustive]`、改类型
+  （W2 设计稿 §10.13、审查 RT-06；主代理 2026-10-13 定）。
+- **How to apply:** 预发布期间改信封的公开 API 不必再手动升版本，每个 alpha 都带一个新的 envelope 预发布版。
+  正式版之后若改回独立的版本线，2026-10-06 的教训又成立：plan-crates 按「版本已存在即跳过」，改了公开 API
+  却不升版本，主线会跳过 envelope、照常发布 aproxy，crates.io 上的 aproxy 依赖旧 envelope，
+  `cargo install aproxy` 编译失败。format-v* 在正式版之前发布的隐患记在 TODO。
+- **Evidence:** align-version.py 与三个 Cargo.toml 的依赖行；2026-10-13 在临时 worktree 里用 0.2.0-alpha.1
+  跑对齐脚本，`cargo metadata --locked` 通过、`cargo package -p aproxy-envelope` 打出 0.2.0-alpha.1。
+  **Recheck when:** aproxy 0.2.0 正式版发布，或发布流程改变 envelope 的对齐方式。
 
 ## 跨阶段扩展：心跳、stage/state、every_attempt（2026-10-06）
 
@@ -126,5 +133,5 @@ crates.io 上的 aproxy 依赖的是旧 envelope，`cargo install aproxy` 编译
 - 评估后**不做**的决策点：重试判定（format 能让请求停止重试 = 核心承诺取决于外部程序；确定性失败已有
   bounded_retry_paths）；按请求决定是否保活（唯一需求是 Gemini，用户定「gemini 不管」）；终态 error 事件
   渲染（极少发生，真需要时用静态模板，不为它拉起 format 进程）。
-- 信封 crate 0.2.0（含 stage/request_id/state/heartbeat/retry）截至 2026-10-06 未发布：发布前的改动留在
-  0.2.0 内，发布后再改公开 API 就要按上一节升版本。
+- 这些字段（stage/request_id/state/heartbeat/retry）随信封的 0.2.0 预发布版发布，版本规则见上文「信封
+  crate 的版本」。

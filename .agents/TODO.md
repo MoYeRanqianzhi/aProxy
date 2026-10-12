@@ -35,9 +35,14 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] **alpha.1 第 4 步：发布流水线**（release.yml 与 release-format.yml 在默认带界面后会坏：没有前端产物、没有 WebKitGTK、
   musl 与交叉编译要 `--no-default-features`；aproxy-desktop 首发 crates.io 要所有者种子发布）。2026-10-12 提交
   f1f463d、7a8882a…62223c6，第 4 步审查的修复 8296a02…a86e2c0；workflow_dispatch 演练 2026-10-12 全绿（run
-  38279211569），带界面版 glibc 下限按实测改 2.34；修复核对的 N1–N6 已提交（4468243、ac6ce9d）。剩推送后的 CI 与
-  所有者的种子发布，交接记录见
+  38279211569），带界面版 glibc 下限按实测改 2.34；修复核对的 N1–N6 已提交（4468243、ac6ce9d），CI 过了门槛。剩
+  aproxy-envelope 随主线对齐、tag 前的再次演练与所有者的种子发布，交接记录见
   [release-pipeline-step4](plan/release-pipeline-step4.md)
+- [ ] **format-v* 线在 aproxy 0.2.0 正式版之前发布前，先定 envelope 怎么办**：envelope 现在随主线同号发预发布版
+  （align-version.py），release-format.yml 只对齐 aproxy-format 自己，于是会按仓库里的开发版本号（例如
+  0.2.0-alpha.0，不对应任何 aproxy 发布）把 envelope 发出去，aproxy-format 也依赖一个预发布版。现在不发 format
+  就不用解决。另外 0.2.0 正式版之后 envelope 是继续随主线同号，还是改回只在改动时升版本，届时再定（改回的话，
+  改公开 API 必须手动升版本，见记忆 transform-format）
 - [ ] **W3 i18n**（给用户看的 en/zh-CN，给 agent 或不可见的固定英文）
 - [ ] **W4 `aproxy skill` 命令**（install/upgrade/list/show，show 的安全设计，`--help` 末尾提示行）
 - [ ] **W5 UI**（Tauri 2 编进本体、`desktop` feature 默认开、headless 版本；自定义标题栏；Mica 默认关可开）

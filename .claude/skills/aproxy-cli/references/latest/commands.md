@@ -537,7 +537,7 @@ to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running anot
 | `VERSION` | a version without the `v`, e.g. `0.2.0`; default `latest` |
 | `--pre` | resolve `latest` in the pre-release channel |
 | `--allow-downgrade` | allow a VERSION lower than the running CLI's version, but never below 0.2.0. Not with `--force`, which installs a named VERSION regardless |
-| `--cpu x86-64-v3\|baseline` | which x86-64 build to download; default `x86-64-v3` when the CPU has AVX2. Only some targets publish an x86-64-v3 build |
+| `--cpu x86-64-v3\|baseline` | which x86-64 build to download; default `x86-64-v3` when the CPU has AVX2 and the target publishes one (x86_64 Windows and x86_64 Linux gnu), baseline otherwise |
 | `--download-proxy URL` | proxy for downloads only; default `download_proxy` in settings.json (not read by `--force`), then the environment's proxy settings. Unrelated to config.toml's `proxy` |
 | `--no-skills` | skip the skill update this time (permanently: `skill_auto_update` in settings.json). Not with `--force`, which never updates skills |
 | `--from PATH` | install a local binary; its `--version` output decides the version, with no downgrade check (below 0.2.0 is still refused) |
@@ -558,8 +558,10 @@ to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running anot
 - Versions come from GitHub releases, or npm dist-tags when GitHub is unreachable. Only tags of the
   form `vX.Y.Z` or `vX.Y.Z-(alpha|beta|rc).N` with this platform's binary attached count.
 - Nothing newer: `已是最新：当前 <v>，<channel> 通道最新为 <v>，无需安装。` ("already up to date"),
-  exit 0, nothing restarted. Empty channel: `<channel> 通道暂无可用版本，保持当前 <v> 不变。`
-  ("no version in this channel; keeping the current one"), exit 0.
+  exit 0, nothing restarted. Empty channel: `<channel> 通道暂无可用的 <variant> 版本，保持当前 <v> 不变。`
+  ("no <variant> version in this channel; keeping the current one"), exit 0. With `--variant`
+  naming the other build, neither message appears: the current version is reinstalled in that
+  variant ("Choosing the variant" below).
 - An explicit VERSION below the running CLI's version stops with
   `目标版本 <v> 低于当前 <v>。确认要降级请加 --allow-downgrade。` ("target below current; add
   --allow-downgrade to confirm").
@@ -577,16 +579,19 @@ to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running anot
 **Choosing the variant.** Every platform has two builds with the same proxy and commands: `desktop`,
 with the window of `aproxy desktop`, and `headless`, without it. The first word in the parentheses
 of `aproxy --version` tells which one runs. Upgrades keep it; `--variant` switches. When nothing
-newer is available, switching reinstalls the current version in the other variant.
+newer is available (or the channel is empty), switching reinstalls the current version in the
+other variant.
 
-On Linux the desktop build links GTK and WebKitGTK, so before an online install of it, aproxy checks
-this machine: glibc 2.35 or later and WebKitGTK 4.1 at version 2.40 or later; musl targets have no
-desktop build at all. When the check fails without `--variant`, the install switches to headless
-and prints `本机跑不了带桌面界面的版本（<reason>），改装无界面的 headless 版本…` ("this machine
-cannot run the desktop build (reason); installing the headless build"). With `--variant desktop`
-it stops instead, exit 1, with `[ERROR] 本机跑不了带桌面界面的版本：<reason>…` ("this machine cannot
-run the desktop build"); installing the system package named in the reason and running the command
-again is the fix, or install `--variant headless`.
+On Linux the desktop build links GTK and WebKitGTK and cannot even print `--version` without them.
+aproxy does not inspect the machine beforehand; the downloaded binary's own `--version` decides,
+because what a build needs changes from release to release. Without `--variant`, a desktop build
+that does not run is replaced by the headless build of the same target, and the output says
+`改装的是无界面的 headless 版本…` ("installing the headless build instead") with how to switch
+back once the libraries are there. With `--variant desktop` nothing is replaced: the install stops,
+exit 1, after the loader's error and `带桌面界面的版本需要 WebKitGTK 2.40 或更新等系统库…` ("the
+desktop build needs WebKitGTK 2.40 or later"). Install the package it names
+(`libwebkit2gtk-4.1-0` on Debian and Ubuntu) and run the command again, or use
+`--variant headless`.
 
 **Which instances move.** Online installs and `--from` refuse while a running instance's binary
 lives outside `<home>/bin/` (`实例 <port> 的二进制不在安装管辖目录（…）下`, "instance binary outside
@@ -691,10 +696,11 @@ flag; nothing below 0.2.0 is installed. `latest`, however, never downgrades: whe
 version below the running one (a newer release that is missing its manifest), force install exits
 10 and says so; name the version to install it anyway. Downloads use HTTPS only and give up after
 60 s without data. `--variant` defaults to the variant of the binary you run, the first word in the
-parentheses of `aproxy --version`. On Linux, an online force install of the desktop build first
-checks this machine the same way a normal install does ("Choosing the variant" above): without
-`--variant` it switches to headless and says so; with `--variant desktop` it exits 10 with
-`本机跑不了带桌面界面的版本：<reason>` before changing anything. Without `--cpu`, the x86-64-v3 build is taken on CPUs with AVX2 when the
+parentheses of `aproxy --version`. Like a normal install ("Choosing the variant" above), it judges a
+build only by running the downloaded binary's `--version`: without `--variant`, a desktop build that
+does not run is replaced by the headless build of the same target, then on Linux by the musl one,
+and the output says so before the confirmation; with `--variant desktop` it exits 10 instead,
+before changing anything. Without `--cpu`, the x86-64-v3 build is taken on CPUs with AVX2 when the
 release has one, and the baseline build otherwise; an explicit `--cpu` must exist as named. When
 the manifest has no build for this platform in the requested variant (and CPU level), force install
 exits 10 and the error lists what the platform does have, for example

@@ -164,9 +164,11 @@ supported yet (neither is verified on real macOS hardware).
 - Target: `aproxy install --force [VERSION|latest]` (online, chosen through the
   release's `aproxy-manifest.json`) or `aproxy install --force --from <file>`.
   Downgrades are allowed; nothing below 0.2.0 is installed. `--variant
-  desktop|headless` switches the build; on Linux an online force install of
-  the desktop build checks the machine first, like a normal install, and
-  without `--variant` takes headless when the desktop libraries are missing.
+  desktop|headless` switches the build. Like a normal install, an online force
+  install judges a build only by running the downloaded binary's `--version`:
+  without `--variant`, a desktop build that cannot run (on Linux usually for
+  lack of WebKitGTK) is replaced by the headless build of the same target, then
+  on Linux by the musl one; with `--variant desktop` it exits 10 instead.
   With `--from` it only checks that the file is that build. `--no-skills` and
   `--allow-downgrade` are usage errors with `--force` (exit 2, nothing done).
 - A second force install on the same home stops the first one, which then

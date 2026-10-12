@@ -169,10 +169,13 @@ a local binary, `--adopt` takes over an existing install).
 - **Variants**: upgrades keep the installed variant (the first word in the
   parentheses of `aproxy --version`); `aproxy install --variant desktop|headless`
   switches, reinstalling the current version in the other variant when
-  nothing newer is available. When the desktop build cannot run on a Linux
-  machine (same rules as the sh script above), an install without `--variant`
-  switches to headless and says why, and `--variant desktop` stops with an
-  error; `install --force` behaves the same.
+  nothing newer is available. The installer does not guess what the machine
+  lacks; it trusts only the downloaded binary's `--version` self-test. Without
+  `--variant`, a desktop build that cannot run (on Linux usually for lack of
+  WebKitGTK) is replaced by the headless build of the same target, with the
+  reason printed, and on Linux by the musl build after that; with
+  `--variant desktop` the install stops with an error and changes nothing.
+  `install --force` behaves the same.
 - **Rollback on failure**: if an instance cannot start under the new version
   during the rolling restart, `install` brings it back with the old binary and
   the original arguments, stops the rollout (the other instances are left

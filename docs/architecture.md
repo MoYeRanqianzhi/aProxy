@@ -629,10 +629,14 @@ unix 分支（UDS IPC、`/dev/shm` 心跳、`/proc` 进程查询、单步 rename
 
 桌面界面另有平台前提：Windows 要 WebView2 运行时（Windows 11 自带）；Linux 的带界面构建
 动态链接 WebKitGTK 4.1，缺库时整个二进制都起不来，所以 musl 只有 headless，没有图形界面的
-机器也该用 headless；macOS 只保证两种变体都编得过。Linux 上的安装因此先看本机再选变体：
-`install::variant::desktop_blocker` 查 glibc 版本，并 dlopen `libwebkit2gtk-4.1.so.0` 读它的
-版本；`aproxy install` 与 `install --force` 没写 `--variant` 时据此改装 headless，写了
-`--variant desktop` 就报错；一键安装脚本用同样的下限，查的是动态加载器缓存里有没有这个库。
+机器也该用 headless；macOS 只保证两种变体都编得过。`aproxy install` 与 `install --force`
+不预先猜本机缺什么，只看下载下来的二进制自己的 `--version` 能不能跑：系统要求属于目标版本的
+构建，会随以后的发布变化（换构建基线、换 WebKitGTK 的 API 与 soname），而安装器的代码随正在
+运行的旧版本永远不变——强制安装尤其要能装以后任何一版。没写 `--variant` 时按
+`DownloadCtx::attempts` / `force::fallbacks` 回退：带界面的版本跑不起来就换同一目标的
+headless，linux-gnu 再换 musl 的 headless 基线；写了 `--variant desktop` 就不换。只有一键安装
+脚本（每次从 main 现取，跟得上最新的构建）在首装、没指定变体时先看本机：musl、glibc 低于下限、
+动态加载器缓存里找不到 `libwebkit2gtk-4.1.so.0` 的装 headless。
 
 ### Linux gnu 产物的 glibc 下限
 
@@ -647,8 +651,8 @@ Ubuntu 22.04 等系统启动即报 `GLIBC_2.39 not found`（alpha.17 实测如�
 
 带界面的 gnu 产物链接系统的 GTK 与 WebKitGTK，不能用 zigbuild 压低 glibc：它在
 `ubuntu:22.04` 容器里构建（跑在 ubuntu-24.04 与 24.04-arm 上），下限 `DESKTOP_GLIBC_FLOOR`
-（2.35）同样在构建后断言。这个数与 `src/install/variant.rs`、`scripts/install.sh`、
-`npm/aproxy/bin/aproxy.js` 判断「本机能不能跑带界面版」用的数必须一致。
+（2.35）同样在构建后断言。这个数与 `scripts/install.sh`、`npm/aproxy/bin/aproxy.js` 判断
+「本机能不能跑带界面版」用的数必须一致。
 
 ### npm dist-tag
 
@@ -666,5 +670,6 @@ Ubuntu 22.04 等系统启动即报 `GLIBC_2.39 not found`（alpha.17 实测如�
   （迁移步骤见 CHANGELOG），可安装版本的下限是 0.2.0；引入桌面界面（alpha.1 是显示演示
   数据的预览版，见「桌面界面」）。
 - 发布产物：x86_64 的 Windows 与 Linux gnu 同时提供 baseline 与 x86-64-v3
-  （AVX2）两种指令集变体，`aproxy install` 运行时检测后自动选择（失败回退
-  baseline），一键安装脚本保守地装 baseline；musl 与其他架构只有 baseline。
+  （AVX2）两种指令集变体。`aproxy install` 运行时检测 AVX2，只在这两个目标上选 v3
+  （它按名字找资产，别的目标取 `-v3` 只会 404）；强制安装按发布清单选，清单里没有 v3
+  档就用 baseline；一键安装脚本保守地装 baseline；musl 与其他架构只有 baseline。

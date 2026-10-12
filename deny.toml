@@ -12,6 +12,18 @@ unknown-git = "deny"
 [advisories]
 version = 2
 yanked = "deny"
+# 豁免只按编号逐条写、附理由；依赖升级后不再命中的条目随即删掉。
+# 下面两条都来自桌面界面（aproxy-desktop → tauri）在 Linux/BSD 上的 GTK3 一族：webkit2gtk 4.1
+# 的绑定固定在 gtk-rs 0.18，没有带修复的 0.18.x，要等 Tauri 换到 GTK4 才会消失。它们只进
+# Linux/BSD 的带界面构建，headless 与 Windows 构建都不含；cargo-deny 默认按全部目标平台检查，
+# 所以照样命中。
+ignore = [
+    # glib 0.18 的 VariantStrIter 迭代器不健全（0.20 修复）。它只经 Variant::array_iter_str() 得到，
+    # 依赖 glib 0.18 的 crate（tauri、tao、wry、muda、webkit2gtk 与 gtk-rs 各绑定）都没有调用（2026-10-12 检索源码）
+    { id = "RUSTSEC-2024-0429", reason = "glib 0.18 from Tauri's GTK3 stack (Linux desktop build only); no crate in the tree uses VariantStrIter" },
+    # proc-macro-error 不再维护：它是 glib-macros 0.18 的过程宏依赖，只在编译期运行，不进二进制
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro dependency of glib-macros 0.18 from Tauri's GTK3 stack; compile-time only" },
+]
 
 # 许可证合规：项目 MIT，依赖白名单为开源常见宽松许可集合。
 # ring 0.17（rustls-tls 依赖）的 SPDX 为 "ISC AND MIT AND OpenSSL"，

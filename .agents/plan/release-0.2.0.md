@@ -163,7 +163,8 @@
   前缀属于本平台的条目，其余既不结束也不删除；删除条目之前重读文件，`start` 一致才删；只结束属主与自己相同的进程（Windows
   比较 token 的 user SID，Linux 比较 uid）。Windows 创建时间的精度是时钟滴答，同一 pid 在同一滴答内被复用理论上可能，接受。
   写台账失败时告警但照常运行（Windows 上写入与删除先短暂重试几次）。
-- C4 安装状态收拢：一切安装者状态（状态文件、备料、下载临时文件）只能放在 `<home>/install/` 下，强制安装可随时整目录清空；
+- C4 安装状态收拢：二进制安装的一切状态（状态文件、备料、下载临时文件、安装宣告）只能放在 `<home>/install/` 下，强制安装可随时
+  整目录清空（skill 文档的下载暂存在 `<home>/skills/` 下，要与目标目录同卷才能原子替换；强制安装不碰 skill，所以不受影响）；
   `<home>/install/lock` 是操作系统级排他锁（进程死亡自动释放），任何版本修改 `bin/` 期间都要持有它。锁原语冻结：unix
   `flock(fd, LOCK_EX|LOCK_NB)`；Windows `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY)`，offset 0、长度
   u64::MAX，CreateFile 的共享模式为 READ|WRITE、不带 DELETE（不用 std 的 `try_lock`：std 声明其实现可能改变）。打开与加锁
@@ -202,7 +203,8 @@
   4. 先删 `install/state.json`，再清空 `<home>/install/`（保留锁与本次的工作目录；unix 的安装宣告随之清掉）。
   5. 替换 `bin/` 下的二进制：先尽力清掉删得掉的旧残留；unix 把 `aproxy.tmp-…` 直接 rename 覆盖到位（原子）；Windows 先把
      现文件改名为唯一的 `aproxy.old-…`，再把 `aproxy.tmp-…` 改名到位，第二步失败立即改回。现文件被不带共享删除权限的句柄
-     占着（例如杀毒软件正在扫描）导致改名失败时，短暂退避重试，仍失败则退出码 11（进程已停、二进制未动，可再跑一次）。
+     占着（例如杀毒软件正在扫描）导致改名失败时，短暂退避重试；仍失败就停下，按第 3 步的规则给退出码：一个进程都没结束是 10，
+     否则 11（二进制未动，可再跑一次）。
   6. 用新位置的二进制再跑一次 `--version` 核对（有时限）；尽力调用新版本的 `restore`；按台账判断被结束的实例是否回来：同一
      `port` 上出现 `version` 等于目标版本的 instance 条目。没回来的按条目的 `port` 与 `config` 列出来，告诉用户怎样启动
      （退出码 12）。

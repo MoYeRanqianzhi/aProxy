@@ -148,7 +148,7 @@ pub fn pick_latest(
 
 /// github 通道获取：下载 asset + `<asset>.sha256` 比对（强校验，不匹配即拒）。
 pub async fn fetch(ctx: &DownloadCtx, artifact: Artifact, dest: &Path) -> Result<Fetched, String> {
-    let asset = artifact.asset_name(ctx.target, ctx.variant);
+    let asset = artifact.asset_name(ctx.target, ctx.variant, ctx.cpu_suffix);
     let release = release_by_version(ctx, &ctx.version).await?;
     let url = release
         .assets
@@ -188,8 +188,9 @@ pub async fn fetch(ctx: &DownloadCtx, artifact: Artifact, dest: &Path) -> Result
 }
 
 /// 查询通道内最新版本（供 `install latest` / `--skills-only` 无参）。
-/// `artifact` 决定「资产已齐」的判据：二进制取本平台 **baseline** 资产名
-/// （每个 target 都发布 baseline；-v3 只覆盖部分 target，不能作必备判据）。
+/// `artifact` 决定「资产已齐」的判据：二进制取本平台、要装的变体的 **baseline**
+/// 资产名（每个 target 都发布 baseline；-v3 只覆盖部分 target，不能作必备判据）。
+/// 没发布这个变体的 release（0.2.0 之前的版本没有 headless 资产）因此不会被选中。
 ///
 /// Ok(None) = GitHub 可达但通道内无版本（调用方保持现状，不转 npm——GitHub
 /// 是发版的权威来源）；Err = API 不可达/限流（调用方转 npm 兜底）。
@@ -211,7 +212,7 @@ pub async fn latest_version(
     Ok(pick_latest(
         &body,
         channel,
-        &artifact.asset_name(ctx.target, ""),
+        &artifact.asset_name(ctx.target, ctx.variant, ""),
     ))
 }
 

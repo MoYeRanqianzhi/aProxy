@@ -14,6 +14,7 @@ pub mod skills;
 pub mod staging;
 pub mod state;
 pub mod swap;
+pub mod variant;
 
 use std::path::{Path, PathBuf};
 

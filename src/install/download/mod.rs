@@ -5,7 +5,12 @@
 //!   与 config_dirs 的自动补默认相反），文档提醒链条写全。
 //! - url 模板通道（可选）：占位符 `{version}/{asset}/{target}/{variant}`
 //!   由通用填充器替换——具体 CDN 域名绝不硬编码进二进制（用户定调），
-//!   jsDelivr 等常见 CDN 只在文档/skill 中作为可填示例提及。
+//!   jsDelivr 等常见 CDN 只在文档/skill 中作为可填示例提及。`{variant}` 是
+//!   指令集档的后缀（`-v3` 或空），不是 desktop / headless；后者体现在
+//!   `{asset}` 的文件名里。
+//! - 变体（desktop / headless）：每个渠道都按 [`DownloadCtx::variant`] 取对应的
+//!   产物——GitHub 资产与 binstall 地址用 `aproxy-headless-` 前缀，npm 用
+//!   `@meowo/aproxy-headless-<平台>` 包，cargo 编译加 `--no-default-features`。
 //! - 校验矩阵（信任锚）：github=sha256 强校验（release 附 .sha256）；
 //!   npm=registry integrity（sha512）强校验；url 模板=弱档（能拼出
 //!   `.sha256` 则验，否则提示「非官方镜像、未校验」后接受）；
@@ -26,7 +31,8 @@ use std::path::{Path, PathBuf};
 /// 产物类型：二进制与 skill 各自独立跑链（skill 支线并行，失败不影响安装）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Artifact {
-    /// 平台二进制 `aproxy-<target>[-v3][.exe]`
+    /// 平台二进制：带界面的 `aproxy-<target>[-v3][.exe]`，无界面的
+    /// `aproxy-headless-<target>[-v3][.exe]`
     Binary,
     /// skill 总包 `aproxy-skills.zip`（第 8 步接线）
     Skills,
@@ -34,12 +40,18 @@ pub enum Artifact {
 
 impl Artifact {
     /// GitHub Release 资产名（发布资产命名用户定调：文件名不带版本号，
-    /// 版本由 release tag 承载）。
-    pub fn asset_name(self, target: &str, variant: &str) -> String {
+    /// 版本由 release tag 承载；无界面版本加 `headless-`，用户 2026-10-11 定）。
+    /// `variant` 是 desktop / headless，`cpu_suffix` 是指令集档的后缀（`-v3` 或空）。
+    pub fn asset_name(self, target: &str, variant: &str, cpu_suffix: &str) -> String {
         match self {
             Artifact::Binary => {
                 let exe = if cfg!(windows) { ".exe" } else { "" };
-                format!("aproxy-{target}{variant}{exe}")
+                let headless = if variant == super::force::VARIANT_HEADLESS {
+                    "headless-"
+                } else {
+                    ""
+                };
+                format!("aproxy-{headless}{target}{cpu_suffix}{exe}")
             }
             Artifact::Skills => "aproxy-skills.zip".to_string(),
         }
@@ -231,13 +243,18 @@ pub fn effective_chain(settings: &crate::settings::Settings) -> Vec<ChainStep> {
         .unwrap_or_else(default_chain)
 }
 
-/// 下载上下文：target 三元组（构建时烙进二进制）、指令集变体、HTTP 客户端
+/// 下载上下文：target 三元组（构建时烙进二进制）、变体、指令集档、HTTP 客户端
 /// （含下载代理装配）。
 pub struct DownloadCtx {
     pub client: reqwest::Client,
     pub version: String,
     pub target: &'static str,
+    /// 要装的变体：[`VARIANT_DESKTOP`](super::force::VARIANT_DESKTOP) 或
+    /// [`VARIANT_HEADLESS`](super::force::VARIANT_HEADLESS)。[`DownloadCtx::build`] 取正在
+    /// 运行的这个二进制的变体（升级保持原变体），调用方按 `--variant` 与本机情况改写
     pub variant: &'static str,
+    /// 指令集档的资产名后缀：`-v3` 或空
+    pub cpu_suffix: &'static str,
 }
 
 /// 本机是否选 x86-64-v3 档的产物（发布的 -v3 产物以 `-C target-cpu=x86-64-v3` 构建）：
@@ -256,15 +273,15 @@ pub fn prefers_x86_64_v3() -> bool {
 }
 
 impl DownloadCtx {
-    /// 组装：target 取构建三元组；指令集档按运行时检测（见 [`prefers_x86_64_v3`]，
-    /// `--cpu` 手动覆盖，取值 `x86-64-v3` | `baseline`）；代理按 download_proxy（显式）
-    /// → 环境变量（reqwest 默认）两级。
+    /// 组装：target 取构建三元组；变体取正在运行的这个二进制的；指令集档按运行时检测
+    /// （见 [`prefers_x86_64_v3`]，`--cpu` 手动覆盖，取值 `x86-64-v3` | `baseline`）；代理按
+    /// download_proxy（显式）→ 环境变量（reqwest 默认）两级。
     pub fn build(
         version: &str,
         download_proxy: Option<&str>,
         cpu_override: Option<&str>,
     ) -> Result<Self, String> {
-        let variant = match cpu_override {
+        let cpu_suffix = match cpu_override {
             Some("x86-64-v3") => "-v3",
             Some("baseline") => "",
             Some(other) => {
@@ -293,24 +310,45 @@ impl DownloadCtx {
             client,
             version: version.to_string(),
             target: runtime_target(),
-            variant,
+            variant: if cfg!(feature = "desktop") {
+                super::force::VARIANT_DESKTOP
+            } else {
+                super::force::VARIANT_HEADLESS
+            },
+            cpu_suffix,
         })
     }
 
-    /// url 模板填充：{version}/{asset}/{target}/{variant} 占位符替换。
+    /// 本平台二进制的资产名（变体与指令集档取自本上下文）。
+    pub fn binary_asset(&self) -> String {
+        Artifact::Binary.asset_name(self.target, self.variant, self.cpu_suffix)
+    }
+
+    /// url 模板填充：{version}/{asset}/{target}/{variant} 占位符替换（`{variant}` 填
+    /// 指令集档的后缀，见模块文档）。
     pub fn fill_template(&self, template: &str, artifact: Artifact) -> String {
-        let asset = artifact.asset_name(self.target, self.variant);
+        let asset = artifact.asset_name(self.target, self.variant, self.cpu_suffix);
         template
             .replace("{version}", &self.version)
             .replace("{asset}", &asset)
             .replace("{target}", self.target)
-            .replace("{variant}", self.variant)
+            .replace("{variant}", self.cpu_suffix)
     }
 
-    /// linux-gnu 产物的 musl 回退：gnu 产物按构建机的 glibc 链接（CI 是
-    /// ubuntu 24.04 = glibc 2.39），老发行版（Debian 12 = 2.36 等）试跑即
-    /// 失败——musl 静态产物无 glibc 要求，任何 linux 可跑。musl 不发布 -v3
-    /// 变体，回退时恒 baseline。
+    /// 同一版本、同一目标的无界面版本：带界面的版本在本机跑不起来时改装它。
+    pub fn headless(&self) -> DownloadCtx {
+        DownloadCtx {
+            client: self.client.clone(),
+            version: self.version.clone(),
+            target: self.target,
+            variant: super::force::VARIANT_HEADLESS,
+            cpu_suffix: self.cpu_suffix,
+        }
+    }
+
+    /// linux-gnu 产物的 musl 回退：gnu 产物按构建机的 glibc 链接，老发行版
+    /// 试跑即失败——musl 静态产物无 glibc 要求，任何 linux 可跑。musl 只发布
+    /// 无界面的 baseline 产物，回退时恒为 headless、baseline。
     pub fn musl_fallback(&self) -> Option<DownloadCtx> {
         let musl = match self.target {
             "x86_64-unknown-linux-gnu" => "x86_64-unknown-linux-musl",
@@ -321,7 +359,8 @@ impl DownloadCtx {
             client: self.client.clone(),
             version: self.version.clone(),
             target: musl,
-            variant: "",
+            variant: super::force::VARIANT_HEADLESS,
+            cpu_suffix: "",
         })
     }
 }
@@ -418,7 +457,7 @@ pub async fn fetch_artifact(
     dest_dir: &Path,
 ) -> Result<Fetched, String> {
     std::fs::create_dir_all(dest_dir).map_err(|e| format!("下载目录创建失败: {e}"))?;
-    let asset = artifact.asset_name(ctx.target, ctx.variant);
+    let asset = artifact.asset_name(ctx.target, ctx.variant, ctx.cpu_suffix);
     let mut errors = Vec::new();
     for step in chain {
         for attempt in 0..3 {
@@ -478,7 +517,7 @@ async fn fetch_url_template(
     let url = ctx.fill_template(template, artifact);
     download_to(&ctx.client, &url, dest).await?;
     // 弱档校验尝试：<url>.sha256 拼得出且下载成功 → 比对
-    let asset = artifact.asset_name(ctx.target, ctx.variant);
+    let asset = artifact.asset_name(ctx.target, ctx.variant, ctx.cpu_suffix);
     let sum = crate::install::staging::sha256_hex(dest)?;
     match ctx
         .client
@@ -559,10 +598,11 @@ mod tests {
             client: reqwest::Client::new(),
             version: "0.1.0-alpha.9".into(),
             target: "x86_64-pc-windows-msvc",
-            variant: "-v3",
+            variant: crate::install::force::VARIANT_DESKTOP,
+            cpu_suffix: "-v3",
         };
         assert_eq!(
-            Artifact::Binary.asset_name(ctx.target, ctx.variant),
+            ctx.binary_asset(),
             format!("aproxy-x86_64-pc-windows-msvc-v3{exe}")
         );
         assert_eq!(
@@ -574,6 +614,42 @@ mod tests {
                 "https://m/0.1.0-alpha.9/aproxy-x86_64-pc-windows-msvc-v3{exe}/x86_64-pc-windows-msvc/-v3"
             )
         );
+        // 无界面版本：资产名带 headless-，`{variant}` 仍是指令集档的后缀
+        let headless = ctx.headless();
+        assert_eq!(
+            headless.binary_asset(),
+            format!("aproxy-headless-x86_64-pc-windows-msvc-v3{exe}")
+        );
+        assert_eq!(
+            headless.fill_template("https://m/{asset}/{variant}", Artifact::Binary),
+            format!("https://m/aproxy-headless-x86_64-pc-windows-msvc-v3{exe}/-v3")
+        );
+        // skill 总包与变体无关
+        assert_eq!(
+            Artifact::Skills.asset_name(ctx.target, ctx.variant, ctx.cpu_suffix),
+            "aproxy-skills.zip"
+        );
+    }
+
+    #[test]
+    fn musl_fallback_is_headless_baseline() {
+        let ctx = DownloadCtx {
+            client: reqwest::Client::new(),
+            version: "0.2.0".into(),
+            target: "x86_64-unknown-linux-gnu",
+            variant: crate::install::force::VARIANT_DESKTOP,
+            cpu_suffix: "-v3",
+        };
+        let musl = ctx.musl_fallback().unwrap();
+        assert_eq!(musl.target, "x86_64-unknown-linux-musl");
+        assert_eq!(musl.variant, crate::install::force::VARIANT_HEADLESS);
+        assert_eq!(musl.cpu_suffix, "");
+        // 不是 linux-gnu 的目标没有 musl 回退
+        let windows = DownloadCtx {
+            target: "x86_64-pc-windows-msvc",
+            ..ctx.headless()
+        };
+        assert!(windows.musl_fallback().is_none());
     }
 
     fn v(s: &str) -> semver::Version {
@@ -643,7 +719,8 @@ mod tests {
             client: reqwest::Client::new(),
             version: "x".into(),
             target: "x86_64-pc-windows-msvc",
-            variant: "",
+            variant: crate::install::force::VARIANT_DESKTOP,
+            cpu_suffix: "",
         };
         // github/npm 走真实网络（不可达即失败）+ url 模板指向本地不存在的
         // 端口——链条全失败时错误应汇总各级

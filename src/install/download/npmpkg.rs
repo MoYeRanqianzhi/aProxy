@@ -9,8 +9,14 @@ use super::{Artifact, DownloadCtx, Fetched, download_to};
 use std::path::Path;
 
 /// 平台包名（与 npm/aproxy/bin/aproxy.js 的 platformPackage 及组包脚本
-/// MAPPINGS 同一规则）。
+/// MAPPINGS 同一规则）。无界面版本在 `@meowo/aproxy-headless-<平台>` 包里，带界面的在
+/// `@meowo/aproxy-<平台>` 包里（其中两个 musl 包装的也是无界面的二进制，musl 只有它）。
 fn platform_package(ctx: &DownloadCtx) -> String {
+    let scope = if ctx.variant == super::super::force::VARIANT_HEADLESS {
+        "@meowo/aproxy-headless"
+    } else {
+        "@meowo/aproxy"
+    };
     #[cfg(windows)]
     {
         let arch = match ctx.target {
@@ -18,7 +24,7 @@ fn platform_package(ctx: &DownloadCtx) -> String {
             t if t.starts_with("i686") => "ia32",
             _ => "arm64",
         };
-        format!("@meowo/aproxy-windows-{arch}")
+        format!("{scope}-windows-{arch}")
     }
     #[cfg(target_os = "macos")]
     {
@@ -27,7 +33,7 @@ fn platform_package(ctx: &DownloadCtx) -> String {
         } else {
             "arm64"
         };
-        format!("@meowo/aproxy-darwin-{arch}")
+        format!("{scope}-darwin-{arch}")
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -41,7 +47,7 @@ fn platform_package(ctx: &DownloadCtx) -> String {
         } else {
             ""
         };
-        format!("@meowo/aproxy-linux-{arch}{libc}")
+        format!("{scope}-linux-{arch}{libc}")
     }
 }
 
@@ -294,14 +300,16 @@ mod tests {
         // platform_package 的 OS 段由编译期平台决定（下载总是当前平台），
         // arch/libc 段由 ctx.target 解析——测试只断言 target 驱动的部分，
         // 跨平台编译均成立
-        let mk = |target: &'static str| {
+        let mk_variant = |target: &'static str, variant: &'static str| {
             platform_package(&DownloadCtx {
                 client: reqwest::Client::new(),
                 version: "x".into(),
                 target,
-                variant: "",
+                variant,
+                cpu_suffix: "",
             })
         };
+        let mk = |target: &'static str| mk_variant(target, crate::install::force::VARIANT_DESKTOP);
         // arch 段随 target 前缀变化，与 OS 段无关
         assert_eq!(mk("x86_64-foo"), mk("x86_64-bar"));
         assert_ne!(mk("x86_64-foo"), mk("aarch64-foo"));
@@ -311,8 +319,14 @@ mod tests {
             assert!(mk("x86_64-unknown-linux-musl").ends_with("-musl"));
             assert!(!mk("x86_64-unknown-linux-gnu").ends_with("-musl"));
         }
-        // 完整形态：@meowo/aproxy-<os>-<arch>[libc]
+        // 完整形态：@meowo/aproxy-<os>-<arch>[libc]；无界面版本是 @meowo/aproxy-headless-…
         assert!(mk("x86_64-any").starts_with("@meowo/aproxy-"));
+        assert!(!mk("x86_64-any").starts_with("@meowo/aproxy-headless-"));
+        let headless = mk_variant("x86_64-any", crate::install::force::VARIANT_HEADLESS);
+        assert_eq!(
+            headless,
+            mk("x86_64-any").replacen("@meowo/aproxy-", "@meowo/aproxy-headless-", 1)
+        );
     }
 
     #[test]

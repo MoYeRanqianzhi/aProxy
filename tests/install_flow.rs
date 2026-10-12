@@ -618,20 +618,21 @@ fn install_instance_failure_exits_nonzero_and_keeps_restore() {
         .spawn()
         .unwrap();
     let run_dir = env.home().join("run");
+    let restore_file = aproxy::daemon::restore_file_path_in(&run_dir, &env.port.to_string());
     let mut ready = false;
     for _ in 0..100 {
-        if aproxy::daemon::registry_pids_in(&run_dir).contains(&child.id()) {
+        // 实例先写注册记录、再写恢复记录（src/server.rs），两个都在才算就绪：只等注册记录，
+        // 紧接着读恢复记录在负载高时会扑空
+        if aproxy::daemon::registry_pids_in(&run_dir).contains(&child.id())
+            && restore_file.is_file()
+        {
             ready = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(ready, "实例未就绪");
-    let restore_before = std::fs::read_to_string(aproxy::daemon::restore_file_path_in(
-        &run_dir,
-        &env.port.to_string(),
-    ))
-    .unwrap();
+    let restore_before = std::fs::read_to_string(&restore_file).unwrap();
 
     // 运行中改坏配置（在跑的实例不受影响；任何版本按它重启都在 bind 前退出）
     std::fs::write(
@@ -1076,6 +1077,40 @@ fn install_refuses_versions_below_0_2_0() {
             "{args:?}: {stderr}"
         );
     }
+    assert_eq!(std::fs::read(&bin).unwrap(), before, "bin 不应被动");
+    assert!(
+        !aproxy::install::install_dir_in(&env.home()).exists(),
+        "拒绝发生在建安装状态与备料之前"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. --from 与 --variant 同用是核对（与 install --force --from --variant 同一语义）：
+//     文件的变体（--version 的变体段）不是写的那一个就拒绝，什么都不动
+// ---------------------------------------------------------------------------
+#[test]
+fn install_from_checks_the_variant() {
+    let env = TestEnv::new(14);
+    let bin = env.seed_bin();
+    let before = std::fs::read(&bin).unwrap();
+    let own = aproxy::install::force::VersionLine::own().variant.unwrap();
+    let other = if own == aproxy::install::force::VARIANT_DESKTOP {
+        aproxy::install::force::VARIANT_HEADLESS
+    } else {
+        aproxy::install::force::VARIANT_DESKTOP
+    };
+    let from = env.source_file("other-variant");
+    let from = from.display().to_string();
+    let out = env
+        .install_cmd(&["--from", from.as_str(), "--variant", other, "--no-skills"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!("是 {own} 版本，与 --variant {other} 不符")),
+        "{stderr}"
+    );
     assert_eq!(std::fs::read(&bin).unwrap(), before, "bin 不应被动");
     assert!(
         !aproxy::install::install_dir_in(&env.home()).exists(),

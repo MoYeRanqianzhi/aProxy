@@ -49,6 +49,8 @@ use std::path::PathBuf;
 /// binstall 通道：.crate → 读 binstall 模板 → 下载预编译二进制。
 /// 本仓库资产命名「不带版本号」（用户定调）——显式配置的模板优先；
 /// 无模板时按本仓库命名兜底（`aproxy-<target><binary-ext>`，pkg-fmt=bin）。
+/// 模板只描述带界面的默认产物：装无界面版本时一律按本仓库命名取
+/// `aproxy-headless-<target><binary-ext>`。
 pub async fn fetch(ctx: &DownloadCtx, artifact: Artifact, dest: &Path) -> Result<Fetched, String> {
     if artifact != Artifact::Binary {
         return Err("cargo-binstall 通道不支持 skill（该级跳过）".to_string());
@@ -63,17 +65,18 @@ pub async fn fetch(ctx: &DownloadCtx, artifact: Artifact, dest: &Path) -> Result
     let (pkg_url, _pkg_fmt) = parse_binstall_template(&manifest);
     let binary_ext = if cfg!(windows) { ".exe" } else { "" };
     let url = match pkg_url {
-        Some(t) => t
+        Some(t) if ctx.variant != crate::install::force::VARIANT_HEADLESS => t
             .replace("{name}", "aproxy")
             .replace("{repo}", "MoYeRanqianzhi/aProxy")
             .replace("{version}", &ctx.version)
             .replace("{target}", ctx.target)
             .replace("{binary-ext}", binary_ext)
             .replace("{format}", "bin"),
-        // 无显式模板：本仓库发布资产命名（不带版本号，bin 格式）
-        None => format!(
-            "https://github.com/MoYeRanqianzhi/aProxy/releases/download/v{}/aproxy-{}{}",
-            ctx.version, ctx.target, binary_ext
+        // 无显式模板或无界面版本：本仓库发布资产命名（不带版本号，bin 格式，baseline 档）
+        _ => format!(
+            "https://github.com/MoYeRanqianzhi/aProxy/releases/download/v{}/{}",
+            ctx.version,
+            Artifact::Binary.asset_name(ctx.target, ctx.variant, "")
         ),
     };
     super::download_to(&ctx.client, &url, dest).await?;
@@ -116,7 +119,8 @@ fn quoted(after_key: &str) -> Option<String> {
 
 /// cargo 通道：.crate 解包 → cargo build --release → 产物提取。
 /// 跟随 ~/.cargo 的 source replacement（rsproxy 等镜像自动生效——
-/// cargo 工具链自身行为）；产物 = 本地编译自证。
+/// cargo 工具链自身行为）；产物 = 本地编译自证。无界面版本加
+/// `--no-default-features`；带界面的版本在 Linux 上要 WebKitGTK 的开发包才编得过。
 pub async fn fetch_build(
     ctx: &DownloadCtx,
     artifact: Artifact,
@@ -139,9 +143,11 @@ pub async fn fetch_build(
     // 阻塞编译放 blocking 线程（tokio worker 不可久占）
     let src_buf = src.clone();
     let target_buf = target_dir.clone();
+    let headless = ctx.variant == crate::install::force::VARIANT_HEADLESS;
     let build = tokio::task::spawn_blocking(move || {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "--locked"])
+            .args(headless.then_some("--no-default-features"))
             .arg("--manifest-path")
             .arg(src_buf.join("Cargo.toml"))
             .env("CARGO_TARGET_DIR", &target_buf)
@@ -250,4 +256,40 @@ fn add_skill_tree(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 只认 [package.metadata.binstall] 本身的 pkg-url / pkg-fmt。按目标的 overrides（根
+    /// Cargo.toml 给 musl 目标指向无界面资产的那两段）不在其中：它们给的是用户手里的
+    /// cargo-binstall，本渠道的无界面地址由 fetch 自己拼
+    #[test]
+    fn binstall_template_ignores_target_overrides() {
+        let overrides_only = r#"
+[package]
+name = "aproxy"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-headless-{ target }{ binary-ext }"
+pkg-fmt = "bin"
+"#;
+        assert_eq!(parse_binstall_template(overrides_only), (None, None));
+        let main_section = r#"
+[package.metadata.binstall]
+pkg-url = "https://example.invalid/{version}/{target}"
+pkg-fmt = "bin"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-musl]
+pkg-url = "https://example.invalid/musl"
+"#;
+        assert_eq!(
+            parse_binstall_template(main_section),
+            (
+                Some("https://example.invalid/{version}/{target}".to_string()),
+                Some("bin".to_string())
+            )
+        );
+    }
 }

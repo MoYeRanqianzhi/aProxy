@@ -144,11 +144,21 @@ mod tests {
         let a = install(&["install", "--cpu", "x86-64-v3"]);
         assert!(!a.force);
         assert_eq!(a.cpu.as_deref(), Some("x86-64-v3"));
+        // 普通安装也能选变体：在线安装装它，与 --from 同用时是核对
+        let a = install(&["install", "--variant", "headless"]);
+        assert!(!a.force);
+        assert_eq!(a.variant.as_deref(), Some("headless"));
+        let a = install(&["install", "--from", "x", "--variant", "desktop"]);
+        assert_eq!(a.variant.as_deref(), Some("desktop"));
         // 只属于强制安装的参数离不开 --force；--force 与普通安装的特殊模式、与对它不起
-        // 作用的选项互斥；VERSION 与 --from 互斥；变体与指令集档只认列出的取值
+        // 作用的选项互斥；变体与收编、中止、只更新 skill 互斥；VERSION 与 --from 互斥；
+        // 变体与指令集档只认列出的取值
         for args in [
             &["install", "--yes"][..],
-            &["install", "--variant", "headless"],
+            &["install", "--variant", "headless", "--adopt"],
+            &["install", "--variant", "headless", "--abort"],
+            &["install", "--variant", "desktop", "--skills-only"],
+            &["install", "--variant", "gui"],
             &["install", "--force", "--skills-only"],
             &["install", "--force", "--adopt"],
             &["install", "--force", "--abort"],

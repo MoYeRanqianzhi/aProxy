@@ -24,8 +24,9 @@ fn headless_message() -> &'static str {
          在 glibc 的 Linux 发行版上，可以改装 gnu 构建的带界面版本。"
     } else {
         "这是无界面的 headless 版本的 aproxy，没有桌面界面。要用桌面界面，换装带界面的版本：\n  \
-         aproxy install --force --variant desktop\n\
-         强制安装会结束这个 home 下的全部 aproxy 进程（经它转发的在途请求会中断），装好后按原参数恢复实例。"
+         aproxy install --variant desktop\n\
+         它和升级一样逐个重启实例，不中断服务。Linux 上带界面的版本还需要 WebKitGTK 2.40 或更新\
+         （Debian / Ubuntu：libwebkit2gtk-4.1-0），缺了它安装会报错并说明。"
     }
 }
 
@@ -215,10 +216,7 @@ mod tests {
         let text = super::headless_message();
         assert!(text.contains("headless"), "{text}");
         if !cfg!(target_env = "musl") {
-            assert!(
-                text.contains("aproxy install --force --variant desktop"),
-                "{text}"
-            );
+            assert!(text.contains("aproxy install --variant desktop"), "{text}");
         }
     }
 }

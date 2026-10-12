@@ -98,17 +98,34 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
     }
 
     // --from <路径>：目标版本 = 源二进制自报版本；版本下限与在线安装同一道
-    // （见 aproxy::install::INSTALL_FLOOR）
+    // （见 aproxy::install::INSTALL_FLOOR）。同时给了 --variant 时是核对：文件必须正是
+    // 这个变体（与 install --force --from 同一语义）
     if let Some(from) = &args.from {
         let from_path = aproxy::settings::expand_path(from);
-        let target = match aproxy::install::staging::probe_version(&from_path) {
-            Ok(v) => v,
+        let probed = aproxy::install::staging::run_version(&from_path).and_then(|output| {
+            let target = aproxy::install::staging::version_of(&from_path, &output)?;
+            Ok((target, output))
+        });
+        let (target, output) = match probed {
+            Ok(probed) => probed,
             Err(e) => {
                 eprintln!("[ERROR] {e}");
                 aproxy::ledger::exit(1);
             }
         };
-        let version = semver::Version::parse(&target).expect("probe_version 只返回合法的 semver");
+        if let Some(want) = args.variant.as_deref() {
+            let line = aproxy::install::force::VersionLine::parse(&output)
+                .expect("version_of 认得的输出 VersionLine 也认得");
+            if line.variant.as_deref() != Some(want) {
+                eprintln!(
+                    "[ERROR] {} 是 {} 版本，与 --variant {want} 不符",
+                    from_path.display(),
+                    line.variant.as_deref().unwrap_or("未知变体")
+                );
+                aproxy::ledger::exit(1);
+            }
+        }
+        let version = semver::Version::parse(&target).expect("version_of 只返回合法的 semver");
         if let Err(e) = aproxy::install::check_floor(&version) {
             eprintln!("[ERROR] {e}");
             aproxy::ledger::exit(1);
@@ -272,13 +289,19 @@ async fn run_skills_only(args: &InstallArgs) {
 
 /// 在线安装：版本解析（latest → GitHub 查询）→ 降级防呆 → 管辖检查 →
 /// 下载链条 → staged 校验 → 主流程。
+///
+/// 变体（desktop / headless）：写了 `--variant` 就装它，否则沿用正在运行的这个二进制的
+/// （升级保持原变体）。要装带界面的版本而本机跑不了它（Linux 缺 WebKitGTK、glibc 太旧，
+/// 或 musl 目标，见 aproxy::install::variant）时：没写 `--variant` 就改装 headless 并说明，
+/// 写了就报错。换变体而没有更新的版本时，重装当前版本的另一个变体。
 async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &InstallArgs) {
+    use aproxy::install::force::{VARIANT_DESKTOP, VARIANT_HEADLESS};
     let settings = aproxy::settings::load();
     let proxy = args
         .download_proxy
         .as_deref()
         .or(settings.download_proxy.as_deref());
-    let ctx = match aproxy::install::download::DownloadCtx::build(
+    let mut ctx = match aproxy::install::download::DownloadCtx::build(
         env!("CARGO_PKG_VERSION"),
         proxy,
         args.cpu.as_deref(),
@@ -289,6 +312,28 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
             aproxy::ledger::exit(1);
         }
     };
+    let own_variant = ctx.variant;
+    let explicit_variant = args.variant.is_some();
+    match args.variant.as_deref() {
+        Some(VARIANT_HEADLESS) => ctx.variant = VARIANT_HEADLESS,
+        Some(_) => ctx.variant = VARIANT_DESKTOP,
+        None => {}
+    }
+    if ctx.variant == VARIANT_DESKTOP
+        && let Some(reason) = aproxy::install::variant::desktop_blocker(ctx.target)
+    {
+        if explicit_variant {
+            eprintln!(
+                "[ERROR] 本机跑不了带桌面界面的版本：{reason}。装好所需的系统库后重试，或改装无界面版本：aproxy install --variant headless"
+            );
+            aproxy::ledger::exit(1);
+        }
+        println!(
+            "本机跑不了带桌面界面的版本（{reason}），改装无界面的 headless 版本：代理与命令行完全相同，只是没有 aproxy desktop 窗口。装好所需的系统库之后，可用 aproxy install --variant desktop 换回。"
+        );
+        ctx.variant = VARIANT_HEADLESS;
+    }
+    let switching = ctx.variant != own_variant;
 
     // 版本解析：latest = 通道内 semver 最大的主线版本（stable 只取正式版，
     // pre 含预发布；默认通道跟随当前版本，见 Channel::resolve）。latest 不
@@ -312,6 +357,8 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
             };
             match decide_latest(&current, candidate.as_deref()) {
                 LatestDecision::Install(v) => v,
+                // 换变体而没有更新的版本：重装当前版本的另一个变体
+                LatestDecision::UpToDate(_) if switching => current.to_string(),
                 LatestDecision::UpToDate(latest) => {
                     println!(
                         "已是最新：当前 {current}，{} 通道最新为 {latest}，无需安装。",
@@ -324,8 +371,9 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
                 }
                 LatestDecision::NoneInChannel => {
                     println!(
-                        "{} 通道暂无可用版本，保持当前 {current} 不变。",
-                        channel.label()
+                        "{} 通道暂无可用的 {} 版本，保持当前 {current} 不变。",
+                        channel.label(),
+                        ctx.variant
                     );
                     if channel == Channel::Stable {
                         println!("（如需预发布版本，可加 --pre）");
@@ -339,7 +387,6 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     // ctx 初建用编译版本仅够 latest 查询用；目标版本确定后必须回写——
     // 各渠道（github tag/npm registry/crates.io）都按 ctx.version 定位产物，
     // 漏回写会让 `install <特定版本>` 全渠道查错版本（实测暴露）
-    let mut ctx = ctx;
     ctx.version = target.clone();
 
     // 降级防呆：target < 当前运行版本 → 拒绝（--allow-downgrade 放行）。
@@ -360,20 +407,33 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     }
 
     // 下载链条：产物落 install/staging/<版本>/（与 --from 的备料同一位置）
+    let chain = aproxy::install::download::effective_chain(&settings);
     println!(
-        "开始下载 aProxy {target}（渠道链：{}）...",
-        aproxy::install::download::effective_chain(&settings)
+        "开始下载 aProxy {target}（{}；渠道链：{}）...",
+        ctx.variant,
+        chain
             .iter()
             .map(|s| s.name())
             .collect::<Vec<_>>()
             .join(" → ")
     );
-    let chain = aproxy::install::download::effective_chain(&settings);
     let staged_dir = aproxy::install::staging::staging_dir_in(home, &target);
 
-    // 下载 + 自证（能运行且自报版本 == 目标——与 --from 的信任锚同级）。
-    // gnu 产物**试跑失败**（构建机 glibc 高于本机）→ musl 静态产物回退；
-    // 下载链条本身失败（网络/404）不回退——musl 重跑只会重复同一网络错误。
+    // 依次尝试的产物。下载之后在本机执行 `--version` 自证（能运行、自报版本 == 目标、变体
+    // 对得上——与 --from 的信任锚同级），跑不起来就换下一个：没写 --variant 的带界面版本
+    // 改装同一目标的 headless（缺 WebKitGTK 等系统库时就是这样）；linux-gnu 产物再不行改装
+    // musl 静态产物（gnu 产物按构建机的 glibc 链接，老发行版跑不了；musl 只有 headless）。
+    // 写了 --variant desktop 的不换。下载链条本身失败（网络/404）不换——重跑只会重复同一错误。
+    let mut attempts = vec![ctx];
+    if attempts[0].variant == VARIANT_DESKTOP && !explicit_variant {
+        let headless = attempts[0].headless();
+        attempts.push(headless);
+    }
+    if (attempts[0].variant == VARIANT_HEADLESS || !explicit_variant)
+        && let Some(musl) = attempts[0].musl_fallback()
+    {
+        attempts.push(musl);
+    }
     enum DownloadOutcome {
         Ok(aproxy::install::download::Fetched),
         VerifyFailed(String),
@@ -396,49 +456,70 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
             Ok(f) => f,
             Err(e) => return DownloadOutcome::ChainFailed(e),
         };
-        match aproxy::install::staging::probe_version(&fetched.path) {
-            Ok(v) if v == target => DownloadOutcome::Ok(fetched),
-            Ok(v) => {
-                DownloadOutcome::VerifyFailed(format!("下载产物自报 {v}，与目标版本 {target} 不符"))
+        let output = match aproxy::install::staging::run_version(&fetched.path) {
+            Ok(output) => output,
+            Err(e) => {
+                return DownloadOutcome::VerifyFailed(format!("下载产物不可运行: {e}"));
             }
-            Err(e) => DownloadOutcome::VerifyFailed(format!("下载产物校验失败（不可运行）: {e}")),
+        };
+        let line = match aproxy::install::staging::version_of(&fetched.path, &output) {
+            Ok(_) => aproxy::install::force::VersionLine::parse(&output)
+                .expect("version_of 认得的输出 VersionLine 也认得"),
+            Err(e) => return DownloadOutcome::VerifyFailed(format!("下载产物校验失败: {e}")),
+        };
+        if line.version != target {
+            return DownloadOutcome::VerifyFailed(format!(
+                "下载产物自报 {}，与目标版本 {target} 不符",
+                line.version
+            ));
+        }
+        // 变体不符是产物与名字对不上（例如 url 模板指错了文件），换一个产物也不会好
+        if line.variant.as_deref() != Some(ctx.variant) {
+            return DownloadOutcome::ChainFailed(format!(
+                "下载的 {} 自报变体 {}，不是要装的 {}",
+                ctx.binary_asset(),
+                line.variant.as_deref().unwrap_or("未知"),
+                ctx.variant
+            ));
+        }
+        DownloadOutcome::Ok(fetched)
+    }
+    let mut failures: Vec<String> = Vec::new();
+    let mut installed = None;
+    for attempt in &attempts {
+        if let Some(previous) = failures.last() {
+            println!("{previous}，改用 {}...", attempt.binary_asset());
+        }
+        match download_verified(attempt, &chain, &target, &staged_dir).await {
+            DownloadOutcome::Ok(f) => {
+                installed = Some((f, attempt.variant));
+                break;
+            }
+            DownloadOutcome::VerifyFailed(e) => {
+                failures.push(format!("{} 在本机不可运行（{e}）", attempt.binary_asset()));
+            }
+            DownloadOutcome::ChainFailed(e) => {
+                failures.push(e);
+                break;
+            }
         }
     }
-    let fetched = match download_verified(&ctx, &chain, &target, &staged_dir).await {
-        DownloadOutcome::Ok(f) => f,
-        DownloadOutcome::VerifyFailed(e) => match ctx.musl_fallback() {
-            Some(mctx) => {
-                println!("gnu 产物在本机不可运行（{e}），回退 musl 静态产物...");
-                match download_verified(&mctx, &chain, &target, &staged_dir).await {
-                    DownloadOutcome::Ok(f) => f,
-                    other => {
-                        let e2 = match other {
-                            DownloadOutcome::VerifyFailed(e) | DownloadOutcome::ChainFailed(e) => e,
-                            DownloadOutcome::Ok(_) => unreachable!(),
-                        };
-                        eprintln!("[ERROR] musl 回退仍失败: {e2}");
-                        aproxy::ledger::exit(1);
-                    }
-                }
-            }
-            None => {
-                eprintln!("[ERROR] {e}");
-                eprintln!(
-                    "可尝试：--download-proxy <URL> 配置下载代理，或在 settings.json 配置 download_chain（含 url 模板 CDN 通道，文档见 README）。"
-                );
-                aproxy::ledger::exit(1);
-            }
-        },
-        DownloadOutcome::ChainFailed(e) => {
-            eprintln!("[ERROR] {e}");
-            eprintln!(
-                "可尝试：--download-proxy <URL> 配置下载代理，或在 settings.json 配置 download_chain（含 url 模板 CDN 通道，文档见 README）。"
-            );
-            aproxy::ledger::exit(1);
+    let Some((fetched, installed_variant)) = installed else {
+        for failure in &failures {
+            eprintln!("[ERROR] {failure}");
         }
+        eprintln!(
+            "可尝试：--download-proxy <URL> 配置下载代理，或在 settings.json 配置 download_chain（含 url 模板 CDN 通道，文档见 README）。"
+        );
+        aproxy::ledger::exit(1);
     };
+    if installed_variant != attempts[0].variant {
+        println!(
+            "改装的是无界面的 headless 版本：代理与命令行完全相同，只是没有 aproxy desktop 窗口。带界面的版本起不来的原因见上（Linux 上多半是缺 WebKitGTK 2.40+），解决之后可用 aproxy install --variant desktop 换回。"
+        );
+    }
 
-    println!("开始安装 aProxy {target}...");
+    println!("开始安装 aProxy {target}（{installed_variant}）...");
     // source 记录实际命中的链条级（status/排查用）
     let source = match fetched.source {
         "github" => aproxy::install::state::InstallSource::Github,

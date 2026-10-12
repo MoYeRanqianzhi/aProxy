@@ -146,9 +146,9 @@ const DOWNLOAD_TOTAL: Duration = Duration::from_secs(30 * 60);
 /// 连接的时限。
 const DOWNLOAD_CONNECT: Duration = Duration::from_secs(15);
 /// 发布清单的大小上限（C6 读者）：一份清单只有几十条资产，几 KB；超过就不是清单。
-const MANIFEST_LIMIT: u64 = 1024 * 1024;
+pub const MANIFEST_LIMIT: u64 = 1024 * 1024;
 /// 资产的大小上限（C6 读者）：一个 aproxy 二进制几十 MB，留足余量；超过就不是它。
-const ASSET_LIMIT: u64 = 256 * 1024 * 1024;
+pub const ASSET_LIMIT: u64 = 256 * 1024 * 1024;
 /// 等新版本的 `restore` 结束的上限：基数加每个被结束的实例一份（restore 逐个等实例就绪，
 /// 每个最多 8 秒）。
 const RESTORE_WAIT_BASE: Duration = Duration::from_secs(30);
@@ -1146,11 +1146,30 @@ pub enum ForceSource {
 /// [`EXIT_NOT_RESTORED`]）。调用方先把本进程以 installer 登记进台账（第 3 步结束安装者
 /// 时跳过自己的 pid；两个强制安装并发时，后来的会结束先来的）。
 pub async fn run(home: &Path, request: &ForceRequest) -> i32 {
-    let variant = request.variant.clone().unwrap_or_else(|| {
+    let mut variant = request.variant.clone().unwrap_or_else(|| {
         VersionLine::own()
             .variant
             .expect("VERSION_LINE 恒带变体段（lib.rs 的单元测试钉死）")
     });
+    // 在线取带界面的版本之前先看本机跑不跑得了它（Linux 缺 WebKitGTK、glibc 太旧，或 musl
+    // 目标，见 install::variant）：没写 --variant 就改装 headless，写了就以 10 结束。这一步
+    // 属于第 1 步「取得目标」，在动任何东西之前
+    if matches!(request.source, ForceSource::Online(_))
+        && variant == VARIANT_DESKTOP
+        && let Some(reason) = super::variant::desktop_blocker(env!("APROXY_BUILD_TARGET"))
+    {
+        if request.variant.is_some() {
+            errln!(
+                "[ERROR] 本机跑不了带桌面界面的版本：{reason}。装好所需的系统库后重试，或改用 --variant headless。"
+            );
+            errln!("什么都没有改动（退出码 {EXIT_UNCHANGED}）。");
+            return EXIT_UNCHANGED;
+        }
+        outln!(
+            "本机跑不了带桌面界面的版本（{reason}），改装无界面的 headless 版本。装好所需的系统库之后，可用 aproxy install --variant desktop 换回。"
+        );
+        variant = VARIANT_HEADLESS.to_string();
+    }
     // 本次的工作目录按 pid 命名：同一时刻一个 pid 只属于一个进程；同名目录只可能是
     // 早先一个同 pid、已经死掉的强制安装留下的，里面的东西直接覆盖
     let work = super::install_dir_in(home)

@@ -485,9 +485,10 @@ tell the user that what it shows is real; use `aproxy status` and `aproxy logs`.
   screen, never in your terminal, so ask the user whether the window appeared before you rely on
   it. Started from a shortcut, Explorer or a process without a console, its messages appear in a
   dialog box instead.
-- **Linux and macOS:** the command stays in the foreground until the window is closed. When you
-  open the window for the user, start it in the background (for example `aproxy desktop &`, or your
-  tool's background option); waiting for it would block you until the user closes the window.
+- **Linux and macOS:** the command stays in the foreground until the window is closed (on macOS
+  the window has not been tried on real hardware). When you open the window for the user, start it
+  in the background (for example `aproxy desktop &`, or your tool's background option); waiting for
+  it would block you until the user closes the window.
 - **One window per home.** A second `aproxy desktop` under the same `<home>` prints
   `aProxy 桌面界面已经在运行（pid <pid>）。这个版本还不会把它切到前台，请在任务栏里找到它。`
   ("already running; this version cannot bring it to the front, find it in the taskbar") and exits

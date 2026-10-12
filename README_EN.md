@@ -390,6 +390,8 @@ may restart instances one at a time.
   even `aproxy --version`); use the headless build on machines without a graphical interface. The
   install script and `aproxy install` pick it on their own when the libraries are missing. musl
   builds come only as headless.
+- On macOS the build with the interface is only guaranteed to compile; the window has not been tried on real
+  hardware (like macOS support as a whole, see Platform support).
 - One window per home; running it again says it is already open.
 - Headless builds (`headless` as the first word in the parentheses of `aproxy --version`) have no
   window; `aproxy desktop` there explains how to switch to the build with the interface

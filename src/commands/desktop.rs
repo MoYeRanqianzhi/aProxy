@@ -22,11 +22,17 @@ fn headless_message() -> &'static str {
         // musl 只发布 headless：带界面的版本要动态链接 webkit2gtk，跑不了 musl 版的意义
         "这是无界面的 headless 版本的 aproxy，没有桌面界面。musl 构建只发布 headless 版本；\
          在 glibc 的 Linux 发行版上，可以改装 gnu 构建的带界面版本。"
+    } else if cfg!(target_os = "linux") {
+        // 照着换装也安全：本机跑不了带界面的版本时，安装在动任何东西之前报错并说明原因
+        "这是无界面的 headless 版本的 aproxy，没有桌面界面。要用桌面界面，换装带界面的版本：\n  \
+         aproxy install --variant desktop\n\
+         它和升级一样逐个重启实例，不中断服务。带界面的版本需要 WebKitGTK 2.40 或更新\
+         （Debian / Ubuntu：libwebkit2gtk-4.1-0），打开窗口还要图形会话；本机跑不了带界面的版本\
+         时，安装会报错并说明原因。"
     } else {
         "这是无界面的 headless 版本的 aproxy，没有桌面界面。要用桌面界面，换装带界面的版本：\n  \
          aproxy install --variant desktop\n\
-         它和升级一样逐个重启实例，不中断服务。Linux 上带界面的版本还需要 WebKitGTK 2.40 或更新\
-         （Debian / Ubuntu：libwebkit2gtk-4.1-0），缺了它安装会报错并说明。"
+         它和升级一样逐个重启实例，不中断服务。"
     }
 }
 
@@ -55,30 +61,66 @@ pub(crate) fn handle_desktop_cmd() -> ! {
     // 整个 aproxy.exe：以 CREATE_NO_WINDOW 拉起的守护进程可能也就拿不到现在那个看不见的
     // 控制台，那样它拉起的控制台程序（转换器 worker）会各自弹出一个可见的控制台窗口。这一点
     // 没有验证过，所以不用。彻底不闪要给快捷方式另配一个 GUI 子系统的启动器。
+    //
+    // 没有控制台（父进程以 DETACHED_PROCESS 拉起）时，写到标准错误的说明多半也没人看得见（除非
+    // 父进程接了管道），所以同样加上对话框；标准输出与标准错误照写。
     #[cfg(windows)]
     let attached = console::state();
     #[cfg(windows)]
-    let dialogs = attached == console::Console::Exclusive && console::free();
+    let dialogs = match attached {
+        console::Console::Exclusive => console::free(),
+        console::Console::Absent => true,
+        console::Console::Shared => false,
+    };
     #[cfg(not(windows))]
     let dialogs = false;
+    // 登记台账之后的失败也走这里，所以经 ledger::exit 退出（守住它的写者约定）；还没登记时
+    // 它只是 process::exit
     let fail = |text: &str| -> ! {
         report(text, true, dialogs);
-        std::process::exit(1)
+        ledger::exit(1)
     };
+
+    // 主线程上的 panic（事件循环里的回调出错）没人接：Tauri 在事件循环里跑 setup，
+    // aproxy_desktop::run 只接得住建应用那一小段。控制台已经释放时默认钩子打出的说明无处可见，
+    // 所以照常交给默认钩子之后再弹框，进程随后照常展开、以 101 退出，台账条目随守卫删掉。别的
+    // 线程不弹：tokio 的任务、兜底显示窗口的线程 panic 了，界面照常运行。
+    #[cfg(windows)]
+    if dialogs {
+        let main_thread = std::thread::current().id();
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            default_hook(info);
+            if std::thread::current().id() == main_thread {
+                aproxy_desktop::message_box(
+                    &format!("桌面界面遇到内部错误，即将关闭（代理实例不受影响）。\n\n{info}"),
+                    true,
+                );
+            }
+        }));
+    }
 
     let home = settings::resolve_home().unwrap_or_else(|e| fail(&e));
 
-    // 同一个 home 只开一个界面。alpha 还不会把已开的窗口切到前台，只说明一下
+    // 同一个 home 只开一个界面。alpha 还不会把已开的窗口切到前台，只说明一下。被杀、崩溃的
+    // 界面留下的死条目顺手删掉（删之前重读，确认文件仍是读到的那一条），不必等强制安装来清
     let me = std::process::id();
-    if let Some(running) = ledger::read_all_in(&home)
-        .into_iter()
-        .map(|found| found.entry)
-        .find(|e| e.role == ledger::ROLE_DESKTOP && e.pid != me && ledger::is_alive(e))
-    {
+    let mut running = None;
+    for found in ledger::read_all_in(&home) {
+        let entry = &found.entry;
+        if entry.role != ledger::ROLE_DESKTOP || entry.pid == me {
+            continue;
+        }
+        if !ledger::is_alive(entry) {
+            ledger::remove_if_unchanged(&found);
+        } else if running.is_none() {
+            running = Some(entry.pid);
+        }
+    }
+    if let Some(pid) = running {
         report(
             &format!(
-                "aProxy 桌面界面已经在运行（pid {}）。这个版本还不会把它切到前台，请在任务栏里找到它。",
-                running.pid
+                "aProxy 桌面界面已经在运行（pid {pid}）。这个版本还不会把它切到前台，请在任务栏里找到它。"
             ),
             false,
             dialogs,
@@ -160,7 +202,10 @@ fn report(text: &str, error: bool, dialog: bool) {
 /// 本进程与控制台的关系（Windows）。
 #[cfg(all(windows, feature = "desktop", not(test)))]
 mod console {
-    use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+    use windows_sys::Win32::System::Console::{
+        FreeConsole, GetConsoleProcessList, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        SetStdHandle,
+    };
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub(super) enum Console {
@@ -182,10 +227,21 @@ mod console {
         }
     }
 
-    /// 释放控制台（只有本进程用它时，它的窗口随之关闭）。之后写标准输出与标准错误都静默
-    /// 成功（std 在 Windows 上把无效句柄的写入当作成功）。
+    /// 释放控制台（只有本进程用它时，它的窗口随之关闭），再把三个标准句柄都置空。
+    ///
+    /// 释放之后，进程记着的标准句柄仍是原来的数值：那些句柄已经关闭的话，数值可能被之后打开
+    /// 的句柄复用（台账的临时文件、WebView2 的管道），写到标准输出的日志就落进不相干的对象；
+    /// 没关闭的话，写入失败时的错误码也不一定是 ERROR_INVALID_HANDLE。置空之后由构造保证静默：
+    /// std 在 Windows 上把空的标准句柄当作 ERROR_INVALID_HANDLE，写入一律当作成功，读取读到
+    /// 结尾。置空失败不影响释放本身，忽略。
     pub(super) fn free() -> bool {
-        unsafe { FreeConsole() != 0 }
+        if unsafe { FreeConsole() } == 0 {
+            return false;
+        }
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            unsafe { SetStdHandle(which, 0) };
+        }
+        true
     }
 }
 
@@ -210,7 +266,8 @@ mod tests {
         assert_eq!(listed, cfg!(feature = "desktop"), "{help}");
     }
 
-    /// headless 构建的说明要给出能照着执行的换装命令（musl 没有带界面的版本，不给）
+    /// headless 构建的说明要给出能照着执行的换装命令（musl 没有带界面的版本，不给）；glibc 的
+    /// Linux 上还要说出带界面的版本要的 WebKitGTK，别的平台不提
     #[test]
     fn headless_message_names_the_way_out() {
         let text = super::headless_message();
@@ -218,5 +275,31 @@ mod tests {
         if !cfg!(target_env = "musl") {
             assert!(text.contains("aproxy install --variant desktop"), "{text}");
         }
+        assert_eq!(
+            text.contains("WebKitGTK"),
+            cfg!(all(target_os = "linux", not(target_env = "musl"))),
+            "{text}"
+        );
+    }
+
+    /// `aproxy desktop --help` 说的是这个构建自己：headless 构建没有界面，不说「打开桌面界面」
+    #[test]
+    fn desktop_help_matches_the_build() {
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("desktop")
+            .expect("desktop 子命令")
+            .render_long_help()
+            .to_string();
+        assert_eq!(
+            help.contains("打开桌面界面"),
+            cfg!(feature = "desktop"),
+            "{help}"
+        );
+        assert_eq!(
+            help.contains("headless"),
+            !cfg!(feature = "desktop"),
+            "{help}"
+        );
     }
 }

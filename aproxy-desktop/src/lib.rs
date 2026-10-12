@@ -202,10 +202,13 @@ pub fn run(options: Options) -> Result<i32, Error> {
 
 /// 弹出系统对话框（Windows）。从快捷方式启动时控制台已经释放，打不开界面的原因只能这样
 /// 告诉用户。阻塞到用户关掉它。
+///
+/// 对话框没有属主窗口，所以带上 MB_SETFOREGROUND 请系统把它放到前台：从终端拉起的子进程
+/// 不在前台，不带的话对话框可能落在终端窗口后面，用户看不见它、只觉得命令没反应。
 #[cfg(windows)]
 pub fn message_box(text: &str, error: bool) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MessageBoxW,
+        MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MessageBoxW,
     };
     let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
     let (text, title) = (wide(text), wide("aProxy"));
@@ -219,7 +222,7 @@ pub fn message_box(text: &str, error: bool) {
             None,
             windows::core::PCWSTR(text.as_ptr()),
             windows::core::PCWSTR(title.as_ptr()),
-            MB_OK | icon,
+            MB_OK | icon | MB_SETFOREGROUND,
         );
     }
 }
@@ -335,14 +338,18 @@ fn fit_to_monitor(window: &WebviewWindow) {
     }
 }
 
-/// 窗口只许停在嵌入的页面上。嵌入页面的地址：Windows 是 `http://tauri.localhost`（WebView2
-/// 用 http 冒充自定义协议），其余平台是 `tauri://localhost`。
+/// 窗口只许停在嵌入的页面上：按平台精确比对源（协议、主机、端口）。嵌入页面的地址在 Windows
+/// 上是 `http://tauri.localhost`（WebView2 用 http 冒充自定义协议，本包不开 https 那一种），
+/// 其余平台是 `tauri://localhost`。只比主机是不够的：Linux 与 macOS 上
+/// `http(s)://tauri.localhost[:端口]` 是真实的回环网络地址，Windows 上带了端口或换成 https
+/// 也不再是嵌入的页面。CSP 不管顶层导航，「窗口只显示嵌入的页面、webview 不联网」全靠这里把关。
 fn is_app_url(url: &tauri::Url) -> bool {
-    match url.scheme() {
-        "tauri" => url.host_str() == Some("localhost"),
-        "http" | "https" => url.host_str() == Some("tauri.localhost"),
-        _ => false,
-    }
+    let (scheme, host) = if cfg!(windows) {
+        ("http", "tauri.localhost")
+    } else {
+        ("tauri", "localhost")
+    };
+    url.scheme() == scheme && url.host_str() == Some(host) && url.port().is_none()
 }
 
 /// 给一个 HTML 响应的 CSP 加上 `script-src blob:`（只用于吉祥物沙箱页）。Tauri 已经按

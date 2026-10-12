@@ -184,8 +184,17 @@ pub(crate) enum Commands {
     /// 打开桌面界面：独立的窗口进程，关掉窗口就退出，不影响运行中的代理实例。
     /// 这个版本的界面是预览版，显示的是演示数据，不是本机实例的真实状态。
     // 无界面的 headless 构建也认得这个子命令（帮助里隐藏），执行时说明这个版本没有界面、
-    // 怎样换装，而不是让用户看到 clap 的「unrecognized subcommand」（见 commands::desktop）
+    // 怎样换装，而不是让用户看到 clap 的「unrecognized subcommand」（见 commands::desktop）。
+    // 那里的 `aproxy desktop --help` 也换一段说明：上面的文档注释说的是带界面的构建（显式的
+    // about 排在文档注释之后，覆盖它）
     #[command(hide = cfg!(not(feature = "desktop")))]
+    #[cfg_attr(
+        not(feature = "desktop"),
+        command(
+            about = "这是无界面的 headless 版本，没有桌面界面：运行它会说明怎样换装带界面的版本",
+            long_about = None
+        )
+    )]
     Desktop,
 }
 

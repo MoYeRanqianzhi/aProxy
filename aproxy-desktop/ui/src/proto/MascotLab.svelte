@@ -4,7 +4,8 @@
   不在导航里，从审核工具条的「跳转」或地址栏进入。
 
   和界面其它地方一样，只通过注册表与 MascotView 使用吉祥物；图标部分直接调用定义的 icon()，
-  拼上底板后转成图片——这正是将来生成 .ico / 托盘图标时会走的路，所以这里看到的就是实际像素。
+  拼上底板后转成图片——scripts/icons.mjs 生成软件图标文件用的是同一个拼法（lib/mascot/app-icon.ts），
+  所以这里看到的就是实际像素。
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
@@ -12,7 +13,9 @@
   import { t, type MessageKey } from '../lib/i18n';
   import { mascots, mascotName } from '../lib/mascot/registry.svelte';
   import { mascotPalette } from '../lib/mascot/palette.svelte';
-  import { MASCOT_MOODS, type MascotDefinition, type MascotMood, type MascotPalette } from '../lib/mascot/types';
+  import { MASCOT_MOODS, type MascotDefinition, type MascotMood } from '../lib/mascot/types';
+  // 软件图标的拼法与 scripts/icons.mjs 生成图标文件时是同一个函数，这里看到的就是图标文件的样子
+  import { appIcon, PLATES } from '../lib/mascot/app-icon';
   import MascotView from '../components/MascotView.svelte';
   import Segmented from '../components/Segmented.svelte';
 
@@ -44,55 +47,11 @@
   ];
 
   /* ---------- 图标 ---------- */
-  type Plate = 'squircle' | 'circle' | 'sticker';
-  const PLATES: Plate[] = ['squircle', 'circle', 'sticker'];
   const APP_SIZES = [16, 32, 48, 256];
   const TRAY_SIZES = [16, 24, 32];
   // 仿 Windows 11 任务栏的两种底色：托盘图标的状态点外圈要和它一致
   const TASKBAR = { light: '#f3f3f3', dark: '#202020' } as const;
   const BARS = ['light', 'dark'] as const;
-
-  /** 把吉祥物返回的独立 <svg> 改成可以嵌进另一张 SVG 的子元素（设位置与大小） */
-  function nest(svg: string, x: number, y: number, size: number): string {
-    const el = new DOMParser().parseFromString(svg, 'image/svg+xml').documentElement;
-    el.setAttribute('x', String(x));
-    el.setAttribute('y', String(y));
-    el.setAttribute('width', String(size));
-    el.setAttribute('height', String(size));
-    return new XMLSerializer().serializeToString(el);
-  }
-
-  /**
-   * 底板 + 吉祥物拼成一张软件图标。底板画在 100×100 的画布上；吉祥物按它最终会占多少像素去挑细节档位，
-   * 所以 16px 的方底图标里，吉祥物用的是 16 格那一档。
-   * 方底用奶黄（与丁香色的身体互为补色，在两种任务栏上都跳得出来）；圆底用浅丁香加深色细圈；
-   * 无底贴纸用一圈白色「裁切边」，在深色任务栏上也有轮廓。
-   */
-  function appIcon(d: MascotDefinition, plate: Plate, px: number, pal: MascotPalette): string {
-    // 16px 时底板会吃掉太多像素，吉祥物放大一些，让它压到底板边缘也比缩成一团强
-    const inset = plate === 'sticker' ? 7 : px <= 16 ? 8 : 14;
-    const inner = 100 - inset * 2;
-    // 三种底（奶黄、浅丁香、白色裁切边）都是浅色，所以按浅底取图标细节的颜色，与界面主题无关
-    const glyph = nest(d.icon({ px: Math.round((px * inner) / 100), mood: null, theme: 'light', palette: pal }), inset, inset, inner);
-    let body = '';
-    if (plate === 'squircle') {
-      body = `<rect x="3" y="3" width="94" height="94" rx="25" fill="${pal.star}"/>${glyph}`;
-    } else if (plate === 'circle') {
-      const ring = Math.max(1.2, 100 / px);
-      body = `<circle cx="50" cy="50" r="${48 - ring / 2}" fill="${pal.primarySoft}" stroke="${pal.primaryDeep}" stroke-width="${ring}"/>${glyph}`;
-    } else {
-      // 裁切边：把吉祥物的不透明区域向外膨胀，填白，垫在它下面。宽度按像素算：16px 时 1px，大图 4px
-      const cutPx = px <= 16 ? 1 : px <= 48 ? 1.5 : 4;
-      const r = (cutPx * 100) / px;
-      body =
-        `<defs><filter id="cut" x="-20%" y="-20%" width="140%" height="140%">` +
-        `<feMorphology in="SourceAlpha" operator="dilate" radius="${r}" result="grow"/>` +
-        `<feFlood flood-color="#ffffff"/><feComposite in2="grow" operator="in" result="edge"/>` +
-        `<feMerge><feMergeNode in="edge"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>` +
-        `<g filter="url(#cut)">${glyph}</g>`;
-    }
-    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="${px}" height="${px}">${body}</svg>`;
-  }
 
   function trayIcon(d: MascotDefinition, mood: MascotMood, px: number, bar: 'light' | 'dark'): string {
     return d.icon({ px, mood, theme: bar, palette: { ...mascotPalette.current, surface: TASKBAR[bar] } });

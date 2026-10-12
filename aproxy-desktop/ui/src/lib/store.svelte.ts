@@ -31,6 +31,8 @@ const SLEEP_AFTER_MS = 10 * 60_000;
 const FRESH_MS = 1_600;
 
 class Store {
+  /** 数据是不是演示用的假数据（预览版）：标题栏据此常驻「预览版 · 演示数据」 */
+  readonly demo = backend.demo;
   /** 界面自己的时钟：倒计时、「几秒前」都按它算，250ms 一拍 */
   now = $state(Date.now());
   connected = $state(false);

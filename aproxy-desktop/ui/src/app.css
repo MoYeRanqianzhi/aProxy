@@ -364,7 +364,7 @@ button:disabled {
   app-region: drag;
   -webkit-app-region: drag;
 }
-.titlebar :is(button, input, a, [role='button']) {
+.titlebar :is(button, input, a, [role='button'], .demo) {
   app-region: no-drag;
   -webkit-app-region: no-drag;
 }

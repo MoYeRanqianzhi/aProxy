@@ -1,7 +1,9 @@
 <!--
   窗口外壳：标题栏 + 左侧导航 + 内容纸面，以及全局浮层（确认框、命令面板、轻提示）。
-  模式、主题、配色强度、Mica、动效偏好全部落到 <html> 的 data-* 与令牌上，样式只读令牌。
-  proto/ 下的三个组件只属于原型（仿原生标题栏按钮、Mica 壁纸模拟、审核工具条），接入 Tauri 时删除。
+  模式、主题、配色强度、Mica、动效偏好全部落到 <html> 的 data-* 与令牌上，样式只读令牌；
+  在桌面窗口里，同样的状态再经 lib/shell.ts 交给窗口（窗口主题、Mica 材质、标题栏按钮后面的底色）。
+  proto/ 下的组件只属于原型（仿原生标题栏按钮、Mica 壁纸模拟、审核工具条、吉祥物预览页）：只在浏览器开发
+  模式里动态加载，桌面窗口里由真窗口提供这些，生产构建里它们整个不进产物。
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
@@ -25,10 +27,14 @@
   import Config from './pages/Config.svelte';
   import Update from './pages/Update.svelte';
   import Settings from './pages/Settings.svelte';
-  import ProtoFrame from './proto/ProtoFrame.svelte';
-  import ProtoBackdrop from './proto/ProtoBackdrop.svelte';
-  import ReviewToolbar from './proto/ReviewToolbar.svelte';
-  import MascotLab from './proto/MascotLab.svelte';
+  import { inTauri, syncWindow } from './lib/shell';
+
+  // 原型件只在浏览器开发模式里加载。生产构建里 import.meta.env.DEV 是常量 false，整个分支连同
+  // 动态导入一起被删掉，产物里没有 proto/ 的代码（也就没有审核工具条与它暴露的 window.__aproxyProto）
+  let proto = $state.raw<typeof import('./proto/parts') | null>(null);
+  if (import.meta.env.DEV && !inTauri) {
+    import('./proto/parts').then((parts) => (proto = parts));
+  }
 
   $effect(() => {
     const root = document.documentElement;
@@ -42,6 +48,8 @@
     root.lang = ui.lang;
     // 吉祥物不读 CSS 变量，主题一变就在这里重新解析它的调色板（必须在上面的样式表与属性都写完之后）
     mascotPalette.refresh();
+    // 窗口这一侧同理：标题栏按钮后面的底色读的是刚算好的页面底色
+    syncWindow();
   });
 
   // 已装的自定义吉祥物来自扩展列表（kind 为 mascot）。注册表只记名字和位置，代码由 MascotFrame 交给沙箱运行
@@ -112,7 +120,9 @@
 
 <svelte:window onkeydown={onKey} />
 
-<ProtoBackdrop />
+{#if proto}
+  <proto.ProtoBackdrop />
+{/if}
 
 <div class="window">
   <Titlebar />
@@ -133,7 +143,9 @@
           {:else if ui.page === 'update'}
             <Update />
           {:else if ui.page === 'mascots'}
-            <MascotLab />
+            {#if proto}
+              <proto.MascotLab />
+            {/if}
           {:else}
             <Settings />
           {/if}
@@ -147,8 +159,10 @@
 <ConsentDialog />
 <CommandPalette />
 <Toasts />
-<ProtoFrame />
-<ReviewToolbar />
+{#if proto}
+  <proto.ProtoFrame />
+  <proto.ReviewToolbar />
+{/if}
 
 <style>
   .window {

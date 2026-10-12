@@ -2,7 +2,8 @@
   设置：外观（语言、模式、配色强度、吉祥物、Mica）、后台（看护者、开机自启）、扩展（主题 / 吉祥物 / 扩展包三层）、关于。
 
   Mica 的开关有三种样子：可用（开或关）；系统不支持（禁用并写明原因）；
-  系统关了透明效果（可以开，但提示会显示为纯色）。能力由系统给出，原型里从审核工具条切换。
+  系统关了透明效果（可以开，但提示会显示为纯色）。桌面窗口里能力由 Rust 判定（见 lib/shell.ts），
+  开关真的切换窗口材质；浏览器里从审核工具条切换。
 
   扩展按能做的事分三层，由少到多：
     主题：一段可以复制分享的字符串（lib/theme.ts），只改 CSS 变量。粘贴后当场校验并说明它改了什么，
@@ -254,7 +255,11 @@
       <span class="name"><Icon name="layers" size={15} />{t('set.mica')}</span>
       <span class="desc">{t('set.mica.desc')}</span>
       {#if micaUnsupported}
-        <span class="note muted" in:pop={{ y: -4, scale: 1, duration: 320 }}><Icon name="info" size={14} />{t('set.mica.unsupported')}</span>
+        <span class="note muted" in:pop={{ y: -4, scale: 1, duration: 320 }}
+          ><Icon name="info" size={14} />{ui.windowsBuild === null
+            ? t('set.mica.notWindows')
+            : t('set.mica.unsupported', { build: ui.windowsBuild })}</span
+        >
       {:else if ui.micaSupport === 'transparency-off'}
         <span class="note warn" in:pop={{ y: -4, scale: 1, duration: 320 }}><Icon name="alert" size={14} />{t('set.mica.transparencyOff')}</span>
       {/if}

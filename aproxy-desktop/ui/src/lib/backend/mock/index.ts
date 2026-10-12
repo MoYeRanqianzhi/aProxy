@@ -321,6 +321,7 @@ function extensionWrite(): 'asked' | 'all-granted' {
 // ---------------------------------------------------------------------------
 
 export const mockBackend: Backend = {
+  demo: true,
   snapshot: () => later(engine.snapshot()),
   subscribe: (listener) => engine.subscribe(listener),
 

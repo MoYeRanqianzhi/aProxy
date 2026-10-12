@@ -3,13 +3,13 @@
  *
  * 用户偏好（语言、模式、主题、Mica…）与「系统给出的事实」（系统语言、深浅色、减少动效偏好、
  * Mica 能力）分开存：偏好可以是「跟随系统」，最终生效值由 getter 推导。
- * 正式接入 Tauri 后，系统事实由 Rust 端提供（例如 Mica 是否支持由 Rust 按系统 build 判定），
- * 偏好持久化到 settings.json 的 ui 段；原型里两者都是本地假值。
+ * 在桌面窗口里，Mica 能力与系统版本由 Rust 端判定后经 lib/shell.ts 写进来；浏览器里是审核工具条可切换的假值。
+ * 偏好以后持久化到 settings.json 的 ui 段，现在只在内存里。
  */
 
 import type { ThemeSpec } from './types';
 
-/** mascots 是原型专用的吉祥物预览页，不在导航里，只能从审核工具条或地址栏 #/mascots 进入 */
+/** mascots 是原型专用的吉祥物预览页，不在导航里，只在浏览器开发模式里从审核工具条或地址栏 #/mascots 进入 */
 export type Page = 'overview' | 'instance' | 'logs' | 'config' | 'update' | 'settings' | 'mascots';
 export type Lang = 'zh-CN' | 'en';
 export type LangPref = 'system' | Lang;
@@ -48,6 +48,14 @@ class UiState {
   systemDark = $state(false);
   systemReducedMotion = $state(false);
   micaSupport = $state<MicaSupport>('available');
+  /** Windows 的系统 build（Mica 不可用时设置页据此说明原因）；不是 Windows 为 null。浏览器里是一个 Windows 10 的假值 */
+  windowsBuild = $state<number | null>(19045);
+  /**
+   * 窗口此刻是否真的铺着 Mica 材质。只有桌面窗口里才有这件事（见 lib/shell.ts）：打开时先换上材质、
+   * 再让页面透明，关闭时反过来，所以页面的 data-mica 要跟着它走，而不是直接跟着开关。
+   * 浏览器里为 null：没有真材质，开关一动页面就切（壁纸由原型件模拟）。
+   */
+  micaWindow = $state<boolean | null>(null);
 
   // 原型审核工具条（scenario 只是显示用，真正的场景在 mock 后端里）
   reducedMotionOverride = $state<boolean | null>(null);
@@ -77,9 +85,9 @@ class UiState {
     return this.reducedMotionOverride ?? (this.systemReducedMotion || this.activeTheme?.motion === 0);
   }
 
-  /** <html data-mica>：只有用户开启且系统支持时才进入半透明表面 */
+  /** <html data-mica>：用户开启、系统支持，并且（桌面窗口里）材质已经铺上时，才进入半透明表面 */
   get micaActive(): boolean {
-    return this.micaEnabled && this.micaSupport !== 'unsupported';
+    return this.micaEnabled && this.micaSupport !== 'unsupported' && this.micaWindow !== false;
   }
 
   go(page: Page, port?: number) {

@@ -9,6 +9,8 @@ import { ui } from './state.svelte';
 
 const zh = {
   'brand.tagline': '本地 API 代理',
+  'demo.label': '预览版 · 演示数据',
+  'demo.explain': '这是 aProxy 桌面界面的预览版：这里的实例、请求日志与统计都是演示数据，不是这台电脑上正在运行的 aProxy。真实数据会在之后的版本接入。',
 
   'nav.overview': '总览',
   'nav.instances': '实例',
@@ -387,7 +389,8 @@ const zh = {
   'set.dark': '深色',
   'set.mica': 'Mica 背景',
   'set.mica.desc': '让窗口透出桌面壁纸的色调。',
-  'set.mica.unsupported': '这台电脑是 Windows 10（build 19045），不支持 Mica。需要 Windows 11 build 22523 或更高版本。',
+  'set.mica.unsupported': '这台电脑的 Windows（build {build}）不支持 Mica，需要 Windows 11 build 22523 或更高版本。',
+  'set.mica.notWindows': 'Mica 是 Windows 11 的窗口材质，这个系统上没有。',
   'set.mica.transparencyOff': '系统的「透明效果」关着，Mica 会显示为纯色。可以在 Windows 设置 › 个性化 › 颜色 里打开；节电模式与高对比度主题也会让它变成纯色。',
   'set.background': '后台',
   'set.watchdog': '看护者',
@@ -619,6 +622,8 @@ type Key = keyof typeof zh;
 
 const en: Record<Key, string> = {
   'brand.tagline': 'Local API proxy',
+  'demo.label': 'Preview · demo data',
+  'demo.explain': 'This is a preview of the aProxy desktop app. The instances, request logs and stats here are demo data, not the aProxy running on this computer. Real data comes in a later release.',
 
   'nav.overview': 'Overview',
   'nav.instances': 'Instances',
@@ -997,7 +1002,8 @@ const en: Record<Key, string> = {
   'set.dark': 'Dark',
   'set.mica': 'Mica backdrop',
   'set.mica.desc': 'Let the desktop wallpaper tint the window.',
-  'set.mica.unsupported': 'This PC runs Windows 10 (build 19045), which has no Mica. It needs Windows 11 build 22523 or later.',
+  'set.mica.unsupported': 'This PC runs Windows build {build}, which has no Mica. It needs Windows 11 build 22523 or later.',
+  'set.mica.notWindows': 'Mica is a Windows 11 window material; this system does not have it.',
   'set.mica.transparencyOff': 'Transparency effects are off in Windows, so Mica shows as a solid color. Turn them on in Settings › Personalization › Colors; battery saver and high-contrast themes also make it solid.',
   'set.background': 'Background',
   'set.watchdog': 'Watchdog',

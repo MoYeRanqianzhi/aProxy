@@ -5,6 +5,8 @@
   - 顶部 --titlebar-top 是最大化时被屏幕吃掉的部分；
   - 整条 app-region: drag（拖动、双击最大化、右键系统菜单、Aero Snap 都由 Windows 提供），
     可交互的子元素 app-region: no-drag。
+  后端给的是演示数据时（预览版），右侧常驻一个「预览版 · 演示数据」标签：标题栏在每一页都看得见，
+  用户不会把假的实例当成自己电脑上正在跑的。悬停有完整说明，所以它也不参与拖动（no-drag 写在 app.css）。
 -->
 <script lang="ts">
   import { t } from '../lib/i18n';
@@ -30,6 +32,11 @@
     <span class="ph">{t('search.placeholder')}</span>
     <span class="kbd">Ctrl K</span>
   </button>
+  {#if store.demo}
+    <span class="demo chip solid butter" role="note" title={t('demo.explain')}>
+      <Icon name="info" size={13} stroke={2.4} />{t('demo.label')}
+    </span>
+  {/if}
 </header>
 
 <style>
@@ -104,5 +111,13 @@
   .search .kbd {
     height: 18px;
     font-size: 10.5px;
+  }
+  /* 奶黄是「提醒」的语义色；高度跟着标题栏缩放（最大化时标题栏会变矮） */
+  .demo {
+    margin-left: auto;
+    flex: none;
+    height: min(24px, calc(var(--bar) - 7px));
+    font-weight: 600;
+    cursor: help;
   }
 </style>

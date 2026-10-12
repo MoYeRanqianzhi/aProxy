@@ -72,6 +72,12 @@ export interface LogPage {
 }
 
 export interface Backend {
+  /**
+   * 数据是不是演示用的假数据。界面据此在显眼处常驻标明「预览版 · 演示数据」，免得用户把假的实例
+   * 当成自己电脑上正在跑的。接上真实数据的实现给 false，标签随之消失。
+   */
+  readonly demo: boolean;
+
   snapshot(): Promise<Snapshot>;
   /** 返回取消订阅的函数 */
   subscribe(listener: (event: BackendEvent) => void): () => void;

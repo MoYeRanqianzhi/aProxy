@@ -6,29 +6,8 @@
  * 再画到 1×1 的画布上读回 sRGB 像素，得到 #rrggbb。
  * 统一成十六进制是为了让吉祥物输出的 SVG 在任何地方都能用：存成图标文件、交给不认识 oklch() 的图标工具链也不出错。
  */
+import { PALETTE_SOURCES } from './palette-sources';
 import type { MascotPalette } from './types';
-
-/**
- * 每个角色取自界面的哪个令牌。这张表属于界面而不属于契约：界面改版换变量名时只改这里，吉祥物不受影响。
- * 浅/深两档用 color-mix 从主色推出来，而不是直接用 --lilac-soft / --lilac-deep：
- * 那两个令牌在深色主题里是反过来的（soft 变暗、deep 变亮，因为它们是「文字配底色」的一对），
- * 而吉祥物的肚皮必须永远比身体浅、描边必须永远比身体深。
- */
-const SOURCES: Record<keyof MascotPalette, string> = {
-  primary: 'var(--lilac)',
-  primarySoft: 'color-mix(in oklab, var(--lilac) 42%, white)',
-  primaryDeep: 'color-mix(in oklab, var(--lilac) 48%, var(--on-fill))',
-  ink: 'var(--on-fill)',
-  blush: 'var(--pink)',
-  cream: 'var(--mascot-body)',
-  surface: 'var(--card)',
-  ok: 'var(--mint)',
-  retry: 'var(--sky)',
-  error: 'var(--coral)',
-  idle: 'var(--text-3)',
-  star: 'var(--butter)',
-  shadow: 'var(--on-fill)',
-};
 
 /** 首次解析之前的占位（浅色主题、标准配色的近似值），只在挂载前的一瞬间用得到 */
 const FALLBACK: MascotPalette = {
@@ -67,8 +46,8 @@ class MascotPaletteState {
       this.ctx = canvas.getContext('2d', { willReadFrequently: true });
     }
     const next = {} as MascotPalette;
-    for (const key of Object.keys(SOURCES) as (keyof MascotPalette)[]) {
-      this.probe.style.color = SOURCES[key];
+    for (const key of Object.keys(PALETTE_SOURCES) as (keyof MascotPalette)[]) {
+      this.probe.style.color = PALETTE_SOURCES[key];
       next[key] = this.toHex(getComputedStyle(this.probe).color) ?? FALLBACK[key];
     }
     // 颜色没变就不换对象，免得所有吉祥物白白重新挂载、动画从头播

@@ -120,8 +120,8 @@ struct AnnounceGuard {
 }
 
 /// 创建宣告并开始 beat。创建失败只降级（None = 无宣告，差异化行为退化为常态）。
-fn spawn_announcer(run_dir: &Path) -> Option<AnnounceGuard> {
-    let announcer = std::sync::Arc::new(super::announce::Announcer::create(run_dir)?);
+fn spawn_announcer(home: &Path, run_dir: &Path) -> Option<AnnounceGuard> {
+    let announcer = std::sync::Arc::new(super::announce::Announcer::create(home, run_dir)?);
     let beating = announcer.clone();
     let ticker = tokio::spawn(async move {
         loop {
@@ -239,7 +239,7 @@ pub async fn run_install(
     state.from_path = Some(plan.from.display().to_string());
     note_skill_choice(&mut state, skill_enabled);
     let mut state = super::state::create_new_in(home, state)?;
-    let announcer = spawn_announcer(run_dir);
+    let announcer = spawn_announcer(home, run_dir);
 
     drive_with_skill(
         home,
@@ -643,7 +643,7 @@ pub async fn run_install_online(
     state.staged_path = Some(staged.display().to_string());
     state.sha256 = Some(crate::install::staging::sha256_hex(staged)?);
     super::state::advance_in(home, &mut state, InstallPhase::Downloaded)?;
-    let announcer = spawn_announcer(run_dir);
+    let announcer = spawn_announcer(home, run_dir);
 
     drive_with_skill(home, version, skill_enabled, download_proxy, async {
         match run_forward_from_staged(home, run_dir, &mut state, staged, true).await {
@@ -733,7 +733,7 @@ pub async fn continue_install(
     // （installer_pid 相同）。CLI 入口与看护者拉起的续作不带这个参数，不会与
     // 指名的接手者抢同一个安装。
     let named = handover_from.is_some_and(|pid| pid == state.installer_pid);
-    if !named && !super::state::is_takeable(run_dir, &state, crate::watchdog::now_secs()) {
+    if !named && !super::state::is_takeable(home, run_dir, &state, crate::watchdog::now_secs()) {
         return Err(format!(
             "安装仍在进行（phase {:?}，pid {}），不重复接管",
             state.phase, state.installer_pid
@@ -742,7 +742,7 @@ pub async fn continue_install(
     tracing::info!(phase = ?state.phase, target = %state.target_version, named, "install 续作接管");
     state.installer_pid = std::process::id();
     write_in(home, &mut state).map_err(|e| format!("install/state.json 写入失败: {e}"))?;
-    let announcer = spawn_announcer(run_dir);
+    let announcer = spawn_announcer(home, run_dir);
     // skill 支线：交到手里的安装，skill 归交出它的那个进程（它还活着、带着
     // 用户的 --no-skills/--download-proxy 在跑），这里不再跑一遍；接管死掉的
     // 安装时，failed 与 skipped 都不自动重跑（failed 避免每次续作都拖一遍

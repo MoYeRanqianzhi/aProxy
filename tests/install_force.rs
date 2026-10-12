@@ -451,6 +451,9 @@ fn only_verified_ledger_processes_are_stopped() {
     std::fs::write(aproxy::install::state::state_path_in(home.path()), b"{}").unwrap();
     std::fs::create_dir_all(install_dir.join("force").join("1")).unwrap();
     std::fs::write(install_dir.join("force").join("1").join("aproxy"), b"x").unwrap();
+    // 被结束的安装者留下的过期宣告（unix 上宣告就是这个文件，见契约测试的 C4）：留着它，
+    // 看护者会反复拉起续作；它与 install/ 里的别的残留一起清掉
+    std::fs::write(install_dir.join("announce"), [0u8; 16]).unwrap();
     // 从 bin 运行、不在台账里的进程（0.1.x 留下的那种）：本测试程序自己的副本，睡着
     let stray_exe = bin_dir_in(home.path()).join(format!("stray{}", std::env::consts::EXE_SUFFIX));
     std::fs::copy(std::env::current_exe().unwrap(), &stray_exe).unwrap();

@@ -446,9 +446,10 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
   撞名。删得掉的 `aproxy.old-*`、`aproxy.tmp-*` 残留在每次交换前清掉，删不掉的跳过。
   Windows 另有 PATHEXT 兜底入口 `aproxy.bat`（`aproxy.exe` 缺席的空窗里运行最新的
   `aproxy.old-*.exe`），由 swap 在每次交换前写入
-- **announce**：安装态宣告节（Windows 命名节 / unix /dev/shm，进程退出即
-  解除）——看护者/守护的差异化行为全部由它门控：实例死亡复查 5×3s、
-  install 保活续作、守护自检补种抑制
+- **announce**：安装态宣告（Windows 是命名节，进程退出即解除；unix 是
+  `<home>/install/announce` 文件，正常结束时删掉，崩溃残留靠心跳过期失效，强制
+  安装清空 `install/` 时一并清掉）——看护者/守护的差异化行为全部由它门控：实例
+  死亡复查 5×3s、install 保活续作、守护自检补种抑制
 - **restart 与服务回滚**：实例重启原语（`install/restart.rs`）在停止之前把恢复
   参数记进 install.state 的在途清单，停止之后立即回写 `.restore`；新二进制起不来
   （bind 前退出、8 秒内没就绪）则用旧二进制按原参数把该实例拉回并置 `halted`，
@@ -530,10 +531,10 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
 | Linux（x86_64 / aarch64，glibc 与 musl） | 全功能；gnu 产物 glibc 下限 2.28，更低的 glibc 与 musl 系统用 musl 产物 |
 | macOS（Apple Silicon / Intel） | 提供预构建二进制，但未经真机验证；看门狗、`aproxy install` 与依赖进程查询的实例管理用到 Linux 专有接口（`/dev/shm`、`/proc`），在 macOS 上不可用或退化 |
 
-unix 分支（UDS IPC、`/dev/shm` 宣告与心跳、`/proc` 进程查询、单步 rename
-交换）按 **Linux** 实现：`#[cfg(unix)]` 路径依赖 `/dev/shm` 与 `/proc`，这两族
-原语在 macOS 上不存在，所以 macOS 上共享内存心跳、进程创建时间读取与 install
-的宣告节无法工作。这部分需要在 macOS 真机上补齐实现与验证（后续贡献者），
+unix 分支（UDS IPC、`/dev/shm` 心跳、`/proc` 进程查询、单步 rename 交换）按
+**Linux** 实现：`#[cfg(unix)]` 路径依赖 `/dev/shm` 与 `/proc`，这两族原语在 macOS
+上不存在，所以 macOS 上共享内存心跳、进程创建时间读取，以及靠创建时间判定安装者
+存活的 install 宣告无法工作。这部分需要在 macOS 真机上补齐实现与验证（后续贡献者），
 补齐之前 README 的平台矩阵如实标注为暂不支持。macOS 的代理转发路径不依赖它们，
 可用。
 

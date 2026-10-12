@@ -10,26 +10,38 @@
 //!
 //! 看护者/守护读节判定：节存在 + 心跳新鲜 + pid 存活 = 宣告有效。挂死与
 //! unix 残留区分**正靠心跳过期**（Windows 节随进程死消失、只有挂死路径；
-//! unix /dev/shm 持久文件崩溃残留也节在心跳旧）——同一判定路径，介质差异
-//! 不影响语义。
+//! unix 的宣告文件崩溃残留也在、心跳旧）——同一判定路径，介质差异不影响语义。
 //!
-//! 宣告属于一个 home：节名带 run 目录的标识（与控制端点同一套命名空间规则），
-//! 一个 home 的 install 不会让别的 home 的看护者进入安装模式；unix 上也不会
-//! 与别的用户的 /dev/shm 文件撞名。
+//! 宣告属于一个 home（位置见 [`location`]），一个 home 的 install 不会让别的 home 的
+//! 看护者进入安装模式。
 
 use std::path::Path;
 use std::time::Duration;
 
-/// Windows 命名节名 / unix 文件名（/dev/shm 下）。
-pub fn announcement_name(run_dir: &Path) -> String {
-    let home_id = crate::daemon::home_id(run_dir);
+/// 宣告的位置：Windows 上是命名共享内存节的名字，unix 上是文件路径（见 [`location`]）。
+#[cfg(windows)]
+pub type Location = String;
+/// 宣告的位置：Windows 上是命名共享内存节的名字，unix 上是文件路径（见 [`location`]）。
+#[cfg(not(windows))]
+pub type Location = std::path::PathBuf;
+
+/// 本 home 的宣告在哪里。
+///
+/// - Windows：命名共享内存节 `Local\aproxy-<run 目录标识>-install`（与控制端点同一套
+///   命名空间规则），随持有它的进程消失，不落盘。
+/// - unix：`<home>/install/announce` 文件。永久兼容契约 C4 没有例外：安装者的一切状态
+///   都只放在 `<home>/install/` 下，强制安装清空它时一并清掉——否则被强制结束的安装者
+///   留下的宣告会让看护者反复拉起续作。早期开发构建曾放在 /dev/shm，alpha.1 起挪进来。
+pub fn location(home: &Path, run_dir: &Path) -> Location {
     #[cfg(windows)]
     {
-        format!(r"Local\aproxy-{home_id}-install")
+        let _ = home;
+        format!(r"Local\aproxy-{}-install", crate::daemon::home_id(run_dir))
     }
     #[cfg(not(windows))]
     {
-        format!("aproxy-{home_id}-install")
+        let _ = run_dir;
+        super::install_dir_in(home).join("announce")
     }
 }
 
@@ -63,7 +75,7 @@ struct Section {
     #[cfg(not(windows))]
     file: std::sync::Mutex<std::fs::File>,
     #[cfg(not(windows))]
-    path: String,
+    path: std::path::PathBuf,
 }
 
 // Windows 视图指针跨线程（beat 是原子 store）；unix 无共享字段
@@ -75,13 +87,13 @@ unsafe impl Sync for Section {}
 impl Announcer {
     /// 创建本 home 的宣告节并写入初始内容。失败只降级（看护者/守护按「无宣告」
     /// 处理，常态行为），绝不阻断安装。
-    pub fn create(run_dir: &Path) -> Option<Self> {
+    pub fn create(home: &Path, run_dir: &Path) -> Option<Self> {
         let ann = Announcement {
             installer_pid: std::process::id(),
             heartbeat_ms: crate::watchdog::now_millis(),
         };
         Some(Self {
-            section: imp::create_section(&announcement_name(run_dir), ann)?,
+            section: imp::create_section(&location(home, run_dir), ann)?,
             released: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -94,9 +106,8 @@ impl Announcer {
 
 impl Announcer {
     /// 交棒：安装交给了另一个进程，它已在同一个节名上宣告。此后 Drop 只放下本
-    /// 进程的句柄，不撤节——unix 上两边是同一个 /dev/shm 文件，unlink 会把接手
-    /// 者的宣告一起删掉；Windows 的命名节本就随最后一个句柄消失，接手者的句柄
-    /// 让它留下。
+    /// 进程的句柄，不撤节——unix 上两边是同一个宣告文件，删掉会把接手者的宣告
+    /// 一起删掉；Windows 的命名节本就随最后一个句柄消失，接手者的句柄让它留下。
     pub fn release(&self) {
         self.released
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -105,8 +116,8 @@ impl Announcer {
 
 impl Drop for Announcer {
     fn drop(&mut self) {
-        // Windows：unmap + close → 节消失；unix：unlink 持久文件（done/abort
-        // 的主动解除路径；崩溃残留靠心跳过期自然失效）
+        // Windows：unmap + close → 节消失；unix：删掉宣告文件（done/abort 的主动
+        // 解除路径；崩溃残留靠心跳过期自然失效，强制安装清空 install/ 时也会删掉）
         if self.released.load(std::sync::atomic::Ordering::Relaxed) {
             imp::release_section(&mut self.section);
         } else {
@@ -116,23 +127,8 @@ impl Drop for Announcer {
 }
 
 /// 读本 home 的宣告。节不存在 → None（无安装宣告——常态）。
-pub fn read(run_dir: &Path) -> Option<Announcement> {
-    imp::load_section(&announcement_name(run_dir))
-}
-
-/// 清掉本 home 已过期的宣告（强制安装结束全部安装者之后调用）。unix 的宣告是 /dev/shm
-/// 里按 home 命名的持久文件，安装者被强制结束时来不及删；留着它，看护者每轮都会因为
-/// 「宣告在、心跳过期」拉起一个短命的 `install --continue`，直到重启。仍然有效的宣告
-/// （心跳新鲜、安装者还活着）不动。Windows 的宣告节随持有它的进程一起消失，无事可做。
-pub fn clear_stale(run_dir: &Path) {
-    #[cfg(not(windows))]
-    if let Some(ann) = read(run_dir)
-        && !is_active(&ann, crate::watchdog::now_millis())
-    {
-        let _ = std::fs::remove_file(imp::shm_path(&announcement_name(run_dir)));
-    }
-    #[cfg(windows)]
-    let _ = run_dir;
+pub fn read(home: &Path, run_dir: &Path) -> Option<Announcement> {
+    imp::load_section(&location(home, run_dir))
 }
 
 /// 宣告有效性判定（看护者/守护的唯一入口）：节存在 + 心跳新鲜 + pid 存活。
@@ -143,7 +139,7 @@ pub fn is_active(ann: &Announcement, now_ms: u64) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// 平台实现：Windows 命名节 / unix /dev/shm 文件
+// 平台实现：Windows 命名节 / unix 的 `<home>/install/announce` 文件
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
@@ -249,23 +245,20 @@ mod imp {
 #[cfg(not(windows))]
 mod imp {
     use super::{Announcement, Section};
+    use std::path::Path;
 
-    pub fn shm_path(name: &str) -> String {
-        format!("/dev/shm/{name}")
-    }
-
-    pub fn create_section(name: &str, ann: Announcement) -> Option<Section> {
-        let path = shm_path(name);
+    pub fn create_section(path: &Path, ann: Announcement) -> Option<Section> {
+        std::fs::create_dir_all(path.parent()?).ok()?;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&path)
+            .open(path)
             .ok()?;
         write_content(&mut f, &ann);
         Some(Section {
             file: std::sync::Mutex::new(f),
-            path,
+            path: path.to_path_buf(),
         })
     }
 
@@ -292,8 +285,8 @@ mod imp {
         }
     }
 
-    pub fn load_section(name: &str) -> Option<Announcement> {
-        let data = std::fs::read(shm_path(name)).ok()?;
+    pub fn load_section(path: &Path) -> Option<Announcement> {
+        let data = std::fs::read(path).ok()?;
         if data.len() < 16 {
             return None;
         }
@@ -304,8 +297,8 @@ mod imp {
     }
 
     pub fn destroy_section(section: &mut Section) {
-        // unix 主动 unlink：done/abort 正常退出路径的宣告解除；崩溃残留由
-        // 心跳过期自然失效（与 Windows「节消失」殊途同归）
+        // unix 主动删除：done/abort 正常退出路径的宣告解除；崩溃残留由心跳过期自然
+        // 失效（与 Windows「节消失」殊途同归），强制安装清空 install/ 时也会删掉
         let _ = std::fs::remove_file(&section.path);
     }
 
@@ -320,10 +313,11 @@ mod tests {
     #[test]
     fn announce_roundtrip_and_active_judgement() {
         // create → beat → read：同进程内内容一致
+        let home = tempfile::tempdir().unwrap();
         let run = tempfile::tempdir().unwrap();
-        let a = Announcer::create(run.path()).expect("宣告节创建失败");
+        let a = Announcer::create(home.path(), run.path()).expect("宣告节创建失败");
         a.beat();
-        let ann = read(run.path()).expect("宣告节应可读");
+        let ann = read(home.path(), run.path()).expect("宣告节应可读");
         assert_eq!(ann.installer_pid, std::process::id());
         // 心跳新鲜 + pid 存活 = 有效
         assert!(is_active(&ann, crate::watchdog::now_millis()));
@@ -333,55 +327,43 @@ mod tests {
         // Windows：进程内节句柄关闭 → 节消失（读不到）；unix：Drop unlink
         // （测试进程未崩，主动解除路径生效）
         assert!(
-            imp::load_section(&announcement_name(run.path())).is_none(),
-            "Drop 后宣告应解除（Windows 节消失 / unix unlink）"
+            imp::load_section(&location(home.path(), run.path())).is_none(),
+            "Drop 后宣告应解除（Windows 节消失 / unix 删文件）"
         );
     }
 
-    /// 强制安装结束安装者之后清过期宣告：仍有效的（心跳新鲜、安装者活着）不动；unix 上
-    /// 心跳过期的持久文件删掉（Windows 的节随进程消失，没有这种残留）。
+    /// unix：宣告是 `<home>/install/announce` 文件（C4 没有例外），强制安装清空 install/
+    /// 时一并清掉。
+    #[cfg(not(windows))]
     #[test]
-    fn clearing_stale_announcements_keeps_the_active_one() {
+    fn the_unix_announcement_lives_in_the_install_dir() {
+        let home = tempfile::tempdir().unwrap();
         let run = tempfile::tempdir().unwrap();
-        let active = Announcer::create(run.path()).expect("宣告节创建失败");
-        active.beat();
-        clear_stale(run.path());
-        assert!(read(run.path()).is_some(), "有效的宣告不得被清掉");
-        drop(active);
-        #[cfg(not(windows))]
-        {
-            // 崩溃残留：安装者早已不在、心跳很旧
-            let name = announcement_name(run.path());
-            let stale = imp::create_section(
-                &name,
-                Announcement {
-                    installer_pid: u32::MAX - 7,
-                    heartbeat_ms: 1,
-                },
-            )
-            .expect("宣告文件创建失败");
-            drop(stale);
-            assert!(read(run.path()).is_some());
-            clear_stale(run.path());
-            assert!(read(run.path()).is_none(), "过期的宣告应已清掉");
-        }
+        let a = Announcer::create(home.path(), run.path()).expect("宣告文件创建失败");
+        let file = home.path().join("install").join("announce");
+        assert_eq!(location(home.path(), run.path()), file);
+        assert!(file.is_file());
+        drop(a);
+        assert!(!file.exists());
     }
 
     #[test]
     fn announcement_belongs_to_its_home() {
         // 另一个 home 的 install 不得让本 home 的看护者进入安装模式
-        let a = tempfile::tempdir().unwrap();
-        let b = tempfile::tempdir().unwrap();
-        assert_ne!(announcement_name(a.path()), announcement_name(b.path()));
+        let (a_home, a_run) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (b_home, b_run) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let a = location(a_home.path(), a_run.path());
+        let b = location(b_home.path(), b_run.path());
+        assert_ne!(a, b);
         let section = imp::create_section(
-            &announcement_name(a.path()),
+            &a,
             Announcement {
                 installer_pid: std::process::id(),
                 heartbeat_ms: crate::watchdog::now_millis(),
             },
         )
         .expect("宣告节创建失败");
-        assert!(imp::load_section(&announcement_name(b.path())).is_none());
+        assert!(imp::load_section(&b).is_none());
         let mut section = section;
         imp::destroy_section(&mut section);
     }
@@ -389,9 +371,10 @@ mod tests {
     #[test]
     fn released_announcement_is_left_to_the_successor() {
         // 交棒：接手者在同一个节名上宣告之后，交出者的 Drop 不得撤掉它
-        //（unix 上两边是同一个文件，撤销 = unlink 接手者的宣告）
+        //（unix 上两边是同一个文件，撤销 = 删掉接手者的宣告）
+        let home = tempfile::tempdir().unwrap();
         let run = tempfile::tempdir().unwrap();
-        let name = announcement_name(run.path());
+        let name = location(home.path(), run.path());
         let owner = |pid: u32| Announcer {
             section: imp::create_section(
                 &name,

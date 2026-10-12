@@ -222,7 +222,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
                 // restarting 窗口内本守护（尚为旧版本）补种的看护者会把滚动
                 // 重启误判为崩溃、用旧二进制重拉，与 install 拉锯。install
                 // 结束宣告消失 → 自检恢复 → 新看护者出簇（新 exe）。
-                if aproxy::install::announce::read(&run_dir).is_some_and(|a| {
+                if aproxy::install::announce::read(&settings::home(), &run_dir).is_some_and(|a| {
                     aproxy::install::announce::is_active(&a, watchdog::now_millis())
                 }) {
                     continue;

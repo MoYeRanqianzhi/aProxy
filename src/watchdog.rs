@@ -360,6 +360,8 @@ pub fn heartbeat_fresh_secs(settings: &settings::Settings) -> u64 {
 /// 看护者配置（测试注入友好——settings 只在 CLI 层读取一次转成本结构）
 #[derive(Debug, Clone)]
 pub struct WatchdogConfig {
+    /// aProxy 主目录（读安装宣告用；测试注入 tempdir，绝不触碰真实 home）
+    pub home: PathBuf,
     /// 实例注册表/run 目录（测试注入 tempdir，绝不触碰真实 run/）
     pub run_dir: PathBuf,
     /// 心跳扫描周期（秒）：每此间隔执行一次 adopt/health/claim 续写
@@ -384,6 +386,7 @@ impl WatchdogConfig {
             .filter(|v| *v > 0)
             .unwrap_or_else(|| s.watchdog_heartbeat_secs.max(1));
         Self {
+            home: settings::home(),
             run_dir: crate::daemon::run_dir(),
             scan_secs,
             stale_after_cycles: s.watchdog_stale_after_cycles.max(1),
@@ -841,7 +844,7 @@ impl WatchdogState {
     /// 安装态宣告是否有效（看护者只认易失介质的显式宣告，绝不解读
     /// install.state 残留——分工原则）。无效/无宣告 → false，常态零改变。
     fn install_announcement_active(&self) -> bool {
-        crate::install::announce::read(&self.cfg.run_dir)
+        crate::install::announce::read(&self.cfg.home, &self.cfg.run_dir)
             .is_some_and(|a| crate::install::announce::is_active(&a, now_millis()))
     }
 
@@ -870,7 +873,7 @@ impl WatchdogState {
     /// 由 --continue 的接管判定收敛（未 stale 即退出；接管后宣告刷新），
     /// 最坏情况是每周期一个短命进程直到 updated_at 过 stale 阈值。
     fn check_install_keepalive(&self) {
-        let Some(ann) = crate::install::announce::read(&self.cfg.run_dir) else {
+        let Some(ann) = crate::install::announce::read(&self.cfg.home, &self.cfg.run_dir) else {
             return;
         };
         if crate::install::announce::is_active(&ann, now_millis()) {
@@ -1632,6 +1635,7 @@ mod tests {
 
     fn test_cfg(dir: &Path) -> WatchdogConfig {
         WatchdogConfig {
+            home: dir.to_path_buf(),
             run_dir: dir.to_path_buf(),
             scan_secs: 1,
             stale_after_cycles: 1,

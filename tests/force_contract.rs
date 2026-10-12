@@ -71,6 +71,13 @@ fn c1_c2_c4_locations_and_names() {
         aproxy::install::lock_path_in(home),
         home.join("install").join("lock")
     );
+    // C4 没有例外：unix 的安装宣告也在 install/ 下，强制安装清空 install/ 时一并清掉
+    //（Windows 的宣告是随进程消失的命名节，不落盘）
+    #[cfg(unix)]
+    assert_eq!(
+        aproxy::install::announce::location(home, Path::new("/h/run")),
+        home.join("install").join("announce")
+    );
     // C3：台账的位置与文件名
     assert_eq!(ledger::LEDGER_DIR, "ledger");
     assert_eq!(ledger::ledger_dir_in(home), home.join("ledger"));

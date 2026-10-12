@@ -29,8 +29,8 @@
 //!    的角色；反复扫描直到连续两轮没有存活条目（有上限）。结束前核验启动标记与属主（只
 //!    结束当前用户的进程，见 `ledger::terminate`）。从这一步起，二进制换好之前的任何失败
 //!    按实际发生的事给退出码：一个进程都没结束是 10，否则 11。
-//! 4. 先删 `install/state.json`，再清空 `<home>/install/`（保留锁与本次的目标文件），
-//!    再清掉本 home 过期的安装宣告：留下的状态文件会让续作在强制安装之后接着推进一个
+//! 4. 先删 `install/state.json`，再清空 `<home>/install/`（保留锁与本次的工作目录；unix
+//!    的安装宣告也在这里，随之清掉）：留下的状态文件会让续作在强制安装之后接着推进一个
 //!    旧的安装，过期的宣告会让看护者反复拉起续作。
 //! 5. 换 `bin/` 里的二进制（先尽力清掉删得掉的旧残留；唯一中间名，见 `super::swap`），
 //!    落位后在新位置再跑一次 `--version` 核对（有时限），不符就换回原来的。
@@ -1351,7 +1351,6 @@ fn replace(home: &Path, target: &Acquired, work: &Path) -> i32 {
     if let Err(e) = clear_install_dir(home, work) {
         return fail_stopped(&stopped, &e);
     }
-    super::announce::clear_stale(&crate::daemon::run_dir());
 
     // ---- 第 5 步：换二进制。落位后在新位置核对版本，不符就换回原来的
     let outcome = match swap::swap_in(home, &target.path, &target.line.version, None, |_| Ok(())) {

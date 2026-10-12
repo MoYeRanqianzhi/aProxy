@@ -19,7 +19,8 @@ rem   yet, falls back to the highest-versioned prerelease with a note.
 rem   --pre = the highest version, prerelease or not (same rule as
 rem   `aproxy install --pre`: by version number, not by creation time).
 rem Env:
-rem   APROXY_HOME       root dir (default %USERPROFILE%\.aproxy)
+rem   APROXY_HOME       root dir (default %USERPROFILE%\.aproxy); a value of only
+rem                     spaces counts as unset, any other must be an absolute path
 rem   APROXY_NO_SKILLS  1 = skip skill docs
 rem   APROXY_PRE        1 = same as --pre
 rem
@@ -30,8 +31,45 @@ rem Invoke-WebRequest (system built-in); all logic stays here in cmd.
 setlocal enabledelayedexpansion
 
 set "REPO=MoYeRanqianzhi/aProxy"
-set "HOME_DIR=%USERPROFILE%\.aproxy"
-if defined APROXY_HOME set "HOME_DIR=%APROXY_HOME%"
+
+rem ---- aProxy home: permanent compatibility contract C1, the same rule as the
+rem ---- aproxy binary (with a different rule this script would install into a
+rem ---- directory the binary does not treat as its home).
+rem ---- APROXY_HOME unset or only spaces counts as unset: the home is
+rem ---- %USERPROFILE%\.aproxy. With USERPROFILE empty the binary asks the system
+rem ---- for the profile folder; cmd cannot, so it asks for APROXY_HOME instead.
+rem ---- Any other value is used as-is (not trimmed) and must be an absolute
+rem ---- path - a drive letter followed by :\ or :/, or \\ or // (UNC) - else
+rem ---- refuse and install nothing: a relative path resolves to a different
+rem ---- directory from each working directory. Only spaces count as blank here;
+rem ---- a value of tabs or other blanks fails the absolute-path check and is
+rem ---- refused, never installed somewhere else. Delayed expansion (!VAR!)
+rem ---- keeps quotes and metacharacters in the value inert. Every exit /b
+rem ---- here sits at the top level: `cmd /c install.cmd` reports exit code 0
+rem ---- for an exit /b 1 run inside a parenthesized block that still has
+rem ---- commands after it, even after an inner block (observed on Win11
+rem ---- 26200). ----
+set "HOME_DIR="
+set "HOME_TEST="
+if defined APROXY_HOME set "HOME_TEST=!APROXY_HOME: =!"
+if defined HOME_TEST goto :home_given
+if not defined USERPROFILE goto :home_no_profile
+set "HOME_DIR=!USERPROFILE!\.aproxy"
+goto :home_ok
+:home_no_profile
+echo USERPROFILE is empty, so the default home cannot be determined. Set APROXY_HOME to an absolute path and retry. Nothing was installed. 1>&2
+exit /b 1
+:home_given
+set "HOME_DIR=!APROXY_HOME!"
+if "!HOME_DIR:~0,2!"=="\\" goto :home_ok
+if "!HOME_DIR:~0,2!"=="//" goto :home_ok
+for %%D in (A B C D E F G H I J K L M N O P Q R S T U V W X Y Z) do (
+    if /i "!HOME_DIR:~0,3!"=="%%D:\" goto :home_ok
+    if /i "!HOME_DIR:~0,3!"=="%%D:/" goto :home_ok
+)
+echo APROXY_HOME must be an absolute path such as C:\aproxy, got "!HOME_DIR!". A relative path resolves to a different directory from each working directory. Fix it or unset it (default: %%USERPROFILE%%\.aproxy). Nothing was installed. 1>&2
+exit /b 1
+:home_ok
 set "BIN_DIR=%HOME_DIR%\bin"
 set "SKILLS_DIR=%HOME_DIR%\skills"
 set "TMP_DIR=%HOME_DIR%\install\bootstrap"

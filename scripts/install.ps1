@@ -20,7 +20,8 @@
 #      --pre` 同一规则：按版本号而非创建时间，补丁版晚于预发布发布时也不会装到更低版本）。
 #
 # 环境变量：
-#   APROXY_HOME       根目录（默认 ~\.aproxy）——bin/skills/run 全目录的根
+#   APROXY_HOME       根目录（默认 ~\.aproxy）——bin/skills/run 全目录的根；空或只含空白
+#                     视为未设，否则必须是绝对路径
 #   APROXY_NO_SKILLS=1  跳过 skill 文档（等效 -NoSkills）
 #   APROXY_PRE=1      等效 -Pre
 #   APROXY_DL_PROXY   下载代理（等效 -DownloadProxy；仅本次，与上游请求代理完全无关）
@@ -57,7 +58,22 @@ function Install-AProxy {
     [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
     $Repo = "MoYeRanqianzhi/aProxy"
-    $Home_ = if ($env:APROXY_HOME) { $env:APROXY_HOME } else { Join-Path $HOME ".aproxy" }
+    # aProxy 主目录（永久兼容契约 C1，与 aproxy 二进制同一规则；规则不一致，脚本装进去的
+    # 目录就不是二进制认的 home）：
+    # - APROXY_HOME 为空或只含空白视为未设，用 <用户目录>\.aproxy。用户目录取 USERPROFILE，
+    #   为空时取系统记录的用户目录，与二进制一致（$HOME 跟着 USERPROFILE，USERPROFILE 为空时
+    #   它也是空的）。
+    # - 否则原样使用（不 trim），必须是绝对路径：盘符加 :\ 或 :/，或者 \\ 开头（UNC），不是就
+    #   报错、什么都不装——相对路径会随工作目录变成不同的目录。不单用 [IO.Path]::IsPathRooted：
+    #   \foo（当前盘的根下）与 C:foo（C 盘的当前目录下）它也算有根，这两种都随当前目录变。
+    if ([string]::IsNullOrWhiteSpace($env:APROXY_HOME)) {
+        $userDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
+        $Home_ = Join-Path $userDir ".aproxy"
+    } elseif ($env:APROXY_HOME -match '^([A-Za-z]:[\\/]|[\\/]{2})') {
+        $Home_ = $env:APROXY_HOME
+    } else {
+        throw "APROXY_HOME 必须是绝对路径，现在是 `"$($env:APROXY_HOME)`"：相对路径会随工作目录变成不同的目录。改成绝对路径，或者删掉这个环境变量（默认 <用户目录>\.aproxy）。什么都没有安装。"
+    }
     $BinDir = Join-Path $Home_ "bin"
     $SkillsDir = Join-Path $Home_ "skills"
     $TmpDir = Join-Path $Home_ "install\bootstrap"

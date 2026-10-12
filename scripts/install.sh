@@ -18,7 +18,7 @@
 #   4. --pre（或 APROXY_PRE=1）：取版本号最大的 v* release，预发布也可（与 `aproxy install
 #      --pre` 同一规则：按版本号而非创建时间，补丁版晚于预发布发布时也不会装到更低版本）。
 # 环境变量：
-#   APROXY_HOME     目录根（默认 ~/.aproxy）
+#   APROXY_HOME     目录根（默认 ~/.aproxy；空或只含空白视为未设，否则必须是绝对路径）
 #   APROXY_NO_SKILLS=1   跳过 skill 文档
 #   APROXY_PRE=1    等效 --pre
 #   APROXY_DL_PROXY 下载代理（仅本次；与上游请求代理完全无关）
@@ -29,11 +29,43 @@ REPO="MoYeRanqianzhi/aProxy"
 # 改选静态链接的 musl 产物。必须与 .github/workflows/release.yml 中 gnu 构建的
 # glibc 下限、npm/aproxy/bin/aproxy.js 的 MIN_GLIBC 保持一致。
 MIN_GLIBC="2.28"
-APROXY_HOME="${APROXY_HOME:-$HOME/.aproxy}"
-BIN_DIR="$APROXY_HOME/bin"
-SKILLS_DIR="$APROXY_HOME/skills"
-TMP_DIR="$APROXY_HOME/install/bootstrap"
 UA="aproxy-install-script"
+
+# ---- aProxy 主目录（永久兼容契约 C1，与 aproxy 二进制同一规则）----
+# 规则不一致，脚本装进去的目录就不是二进制认的 home：
+# - APROXY_HOME 为空或只含空白视为未设，用 $HOME/.aproxy。$HOME 也为空时二进制改查系统的
+#   用户数据库，脚本做不到同样的事，只能请用户设 APROXY_HOME。
+# - 否则原样使用（不 trim），必须是绝对路径，不是就报错退出、什么都不装：相对路径会随工作
+#   目录变成不同的目录。绝对路径以 / 开头；Windows 侧（Git Bash/MSYS/Cygwin）装的是 Windows
+#   二进制，它还认 C:\…、C:/… 与 \\…——从 Windows 环境继承来的 APROXY_HOME 就是这种写法。
+# - 空白按 [:space:] 判断。二进制认的是 Unicode 空白：全角空格之类的值在这里不算空白，会在
+#   绝对路径检查处被拒——拒绝安装，不会装错地方。
+# 调用前 OS 已经确定。
+resolve_home() {
+    case "${APROXY_HOME:-}" in
+        *[![:space:]]*) ;;
+        *)
+            [ -n "${HOME:-}" ] || {
+                echo "HOME 为空，确定不了默认的 aProxy 目录；请把 APROXY_HOME 设为绝对路径后重试。什么都没有安装。" >&2
+                exit 1
+            }
+            APROXY_HOME="$HOME/.aproxy"
+            return
+            ;;
+    esac
+    case "$APROXY_HOME" in
+        /*) return ;;
+    esac
+    case "$OS" in
+        MINGW*|MSYS*|CYGWIN*)
+            case "$APROXY_HOME" in
+                [A-Za-z]:/*|[A-Za-z]:\\*|\\\\*) return ;;
+            esac
+            ;;
+    esac
+    echo "APROXY_HOME 必须是绝对路径，现在是 \"$APROXY_HOME\"：相对路径会随工作目录变成不同的目录。改成绝对路径，或者删掉这个环境变量（默认 \$HOME/.aproxy）。什么都没有安装。" >&2
+    exit 1
+}
 
 # ---- 下载函数：优先 curl，回退 wget ----
 fetch() {
@@ -244,6 +276,11 @@ main() {
     esac
     [ "$libc" = "musl" ] && platform="unknown-linux-musl"
     BIN_NAME="aproxy${EXE_SUFFIX}"
+
+    resolve_home
+    BIN_DIR="$APROXY_HOME/bin"
+    SKILLS_DIR="$APROXY_HOME/skills"
+    TMP_DIR="$APROXY_HOME/install/bootstrap"
 
     # ---- 已安装检测：装机后的升级归 install 管，本脚本只做首装 ----
     if [ -f "$BIN_DIR/$BIN_NAME" ]; then

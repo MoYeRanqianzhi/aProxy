@@ -29,7 +29,11 @@ aproxy --version 2>/dev/null || echo "not installed"
 One command per platform. The script downloads the binary and the skill
 documentation, verifies SHA256, and places everything under `~/.aproxy/`
 (override with the `APROXY_HOME` environment variable). It never overwrites an
-existing installation.
+existing installation. `APROXY_HOME` follows the same rule as the aproxy binary:
+a value of only spaces counts as unset, anything else is used as written and
+must be an absolute path. With a relative path the script stops before
+installing anything, because each working directory would turn it into a
+different directory.
 
 **Which version it installs:** only releases tagged `vX.Y.Z` or
 `vX.Y.Z-(alpha|beta|rc).N` are considered (the repository also hosts

@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 # npm 渠道组包与发布。
 #
-# 结构（esbuild/rollup 同款多平台包模式）：主包 @meowo/aproxy 只含
-# JS 转发器；5 个平台子包各携带一份对应平台二进制，经 optionalDependencies
-# 的 os/cpu/libc 字段由 npm 自动按平台装配——全程 registry 内分发，无二次下载。
+# 结构（esbuild/rollup 同款多平台包模式）：主包只含 JS 转发器；9 个平台子包各携带一份对应
+# 平台二进制，经 optionalDependencies 的 os/cpu/libc 字段由 npm 自动按平台装配——全程
+# registry 内分发，无二次下载。
+#
+# 三组包，组名是第一个参数：
+#   （省略）  @meowo/aproxy：带桌面界面的 aproxy（资产 aproxy-<target>）。musl 没有带界面版，
+#             这一组的两个 musl 平台包装的是无界面的 musl 二进制（资产 aproxy-headless-<musl
+#             target>），Alpine 上 npm i -g @meowo/aproxy 照样能用
+#   headless  @meowo/aproxy-headless：无界面的 aproxy（资产 aproxy-headless-<target>），给服务器
+#             与缺 WebKitGTK 的 Linux。两组的主包都提供 aproxy 命令，只能装其中一个
+#   format    @meowo/aproxy-format：官方示例 format 二进制（独立发版链 release-format.yml）
 #
 # 用法：
-#   CI 模式（build 矩阵 artifact 已合并到 ./artifacts/）：
-#     bash npm/build-and-publish.sh
+#   CI 模式（build 矩阵 artifact 已合并到 ./artifacts/，版本取 tag，或 RELEASE_VERSION）：
+#     bash npm/build-and-publish.sh [headless|format] [--dry-run]
 #   本地模式（从 GitHub Release 拉资产组包，首发/补发用）：
-#     RELEASE_TAG=v0.1.0-alpha.7 bash npm/build-and-publish.sh [--dry-run]
+#     RELEASE_TAG=v0.1.0-alpha.7 bash npm/build-and-publish.sh [headless|format] [--dry-run]
 #
 # 认证：设置 NPM_TOKEN 环境变量走 token（trusted publishing 绑定前的首发期）；
 # 不设置时依赖 setup-node 的 OIDC（npmjs.com 绑定 Trusted Publisher 后）。
@@ -70,29 +78,23 @@ npm_version_exists() {
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
 
+# 组名（空 = 带界面的 aproxy 主组）与 --dry-run，顺序不限
+GROUP=""
 DRY_RUN=""
-if [ "${1:-}" = "--dry-run" ]; then
-  DRY_RUN="--dry-run"
-fi
-# 组名参数化：空 = aproxy 主组（默认）；"format" = aproxy-format 双包组
-# （官方示例 format 二进制，独立发版链 release-format.yml）。$1 是组名时
-# --dry-run 移到 $2。
-GROUP="${1:-}"
-if [ "$GROUP" = "--dry-run" ]; then GROUP=""; fi
-GROUP_ARG="${1:-}"
-shift_arg=0
-case "$GROUP_ARG" in
-  --dry-run) DRY_RUN="--dry-run"; shift_arg=1 ;;
-  format) shift_arg=1 ;;
-esac
-if [ $shift_arg -eq 1 ] && [ "${2:-}" = "--dry-run" ]; then DRY_RUN="--dry-run"; fi
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN="--dry-run" ;;
+    headless | format) GROUP="$arg" ;;
+    *)
+      echo "错误：未知参数 $arg（可用：headless、format、--dry-run）" >&2
+      exit 1
+      ;;
+  esac
+done
 
-if [ "$GROUP_ARG" = "format" ]; then
-  GROUP="format"
-fi
-
-# 版本来源：CI 取 tag（组前缀剥离），本地取 RELEASE_TAG。format 组的 tag
-# 是 format-v0.1.0（版本独立于 aproxy alpha 线）。
+# 版本来源：本地取 RELEASE_TAG；CI 取 RELEASE_VERSION（.github/scripts/align-version.py 导出，
+# 手动演练时 GITHUB_REF_NAME 是分支名，只能靠它），再不然取触发的 tag（剥掉组前缀）。format 组
+# 的 tag 是 format-v0.1.0（版本独立于 aproxy 主线）。
 TAG_PREFIX="v"
 if [ "$GROUP" = "format" ]; then
   TAG_PREFIX="format-v"
@@ -100,6 +102,8 @@ fi
 VERSION="${GITHUB_REF_NAME:-}"
 if [ -n "${RELEASE_TAG:-}" ]; then
   VERSION="${RELEASE_TAG#${TAG_PREFIX}}"
+elif [ -n "${RELEASE_VERSION:-}" ]; then
+  VERSION="$RELEASE_VERSION"
 elif [ -n "$VERSION" ]; then
   VERSION="${VERSION#${TAG_PREFIX}}"
 fi
@@ -115,24 +119,33 @@ BIN_NAME="aproxy"
 PKG_DESC="Local API proxy with infinite retries for agent workloads"
 SUB_DESC="The aProxy binary for SUB_SUFFIX (local API proxy with infinite retries)"
 WRAPPER_SRC="npm/aproxy/bin/aproxy.js"
+# musl 平台包的资产前缀：带界面的主组没有 musl 产物，装无界面的那一个
+MUSL_ASSET_PREFIX="aproxy-headless-"
+if [ "$GROUP" = "headless" ]; then
+  PKG_SCOPE="@meowo/aproxy-headless"
+  ASSET_PREFIX="aproxy-headless-"
+  PKG_DESC="Local API proxy with infinite retries for agent workloads (headless build: no desktop window)"
+  SUB_DESC="The headless aProxy binary for SUB_SUFFIX (local API proxy with infinite retries, no desktop window)"
+fi
 if [ "$GROUP" = "format" ]; then
   PKG_SCOPE="@meowo/aproxy-format"
   ASSET_PREFIX="aproxy-format-"
+  MUSL_ASSET_PREFIX="aproxy-format-"
   BIN_NAME="aproxy-format"
   PKG_DESC="Official example format program for aProxy (protocol conversion, key rotation, multi-channel aggregation)"
   SUB_DESC="The aProxy format binary for SUB_SUFFIX (protocol conversion, key rotation, multi-channel aggregation)"
 fi
 
 # 子包后缀 : 资产文件名 : os : cpu
-# npm 分发固定取 baseline 变体（-v3 是 GitHub 资产的安装优化，npm 链不提供）
+# npm 分发固定取 baseline 档（-v3 是 GitHub 资产的安装优化，npm 链不提供）
 MAPPINGS=(
   "windows-x64:${ASSET_PREFIX}x86_64-pc-windows-msvc.exe:win32:x64"
   "windows-ia32:${ASSET_PREFIX}i686-pc-windows-msvc.exe:win32:ia32"
   "windows-arm64:${ASSET_PREFIX}aarch64-pc-windows-msvc.exe:win32:arm64"
   "linux-x64:${ASSET_PREFIX}x86_64-unknown-linux-gnu:linux:x64"
-  "linux-x64-musl:${ASSET_PREFIX}x86_64-unknown-linux-musl:linux:x64"
+  "linux-x64-musl:${MUSL_ASSET_PREFIX}x86_64-unknown-linux-musl:linux:x64"
   "linux-arm64:${ASSET_PREFIX}aarch64-unknown-linux-gnu:linux:arm64"
-  "linux-arm64-musl:${ASSET_PREFIX}aarch64-unknown-linux-musl:linux:arm64"
+  "linux-arm64-musl:${MUSL_ASSET_PREFIX}aarch64-unknown-linux-musl:linux:arm64"
   "darwin-arm64:${ASSET_PREFIX}aarch64-apple-darwin:darwin:arm64"
   "darwin-x64:${ASSET_PREFIX}x86_64-apple-darwin:darwin:x64"
 )
@@ -184,17 +197,17 @@ done
 # ---- 主包：转发器 + README + optionalDependencies 全平台清单 ----
 main_dir="npm/${PKG_SCOPE}"
 mkdir -p "$main_dir/bin"
-# wrapper 是包名自检测的通用脚本（@meowo/aproxy* 两组通用），format 组
-# 复制同款内容为 <BIN>.js
+# wrapper 是按主包 package.json 自检测的通用脚本（三组通用），复制为 <BIN>.js
 cp "$WRAPPER_SRC" "$main_dir/bin/${BIN_NAME}.js"
-if [ -f "npm/aproxy/README.md" ]; then
-  cp "npm/aproxy/README.md" "$main_dir/README.md" 2>/dev/null || true
+# README 两个 aproxy 组共用，标题换成本组的包名
+if [ "$GROUP" != "format" ] && [ -f "npm/aproxy/README.md" ]; then
+  sed "1s|.*|# ${PKG_SCOPE}|" "npm/aproxy/README.md" >"$main_dir/README.md"
 fi
 
-# skill 支线：仅 aproxy 主组（format 组不携带 skill——install 的 npm 通道
-# 只在主包提取）。打**一个多 skill 总包** aproxy-skills.zip（与 GH release
-# 总包同源同形——条目自带各 skill 顶层目录前缀，消费侧 install_skill_dir
-# 泛化后按顶层目录逐个落位）。
+# skill 支线：两个 aproxy 组都带（format 组不携带 skill；install 的 npm 通道只从
+# @meowo/aproxy 主包提取，headless 组带着是给装了它的用户本地翻看）。打**一个多 skill 总包**
+# aproxy-skills.zip（与 GH release 总包同源同形——条目自带各 skill 顶层目录前缀，消费侧
+# install_skill_dir 泛化后按顶层目录逐个落位）。
 if [ "$GROUP" != "format" ]; then
   mkdir -p "$main_dir/skills"
   (
@@ -217,7 +230,7 @@ for m in "${MAPPINGS[@]}"; do
   opt_deps+="    \"${PKG_SCOPE}-${suffix}\": \"${VERSION}\""
 done
 
-# format 组主包不带 README/skills（description 已表意；skill 只随 aproxy 主组）
+# format 组主包不带 README/skills（description 已表意；skill 只随两个 aproxy 组）
 files_json='"bin/", "README.md", "skills/"'
 if [ "$GROUP" = "format" ]; then
   files_json='"bin/"'

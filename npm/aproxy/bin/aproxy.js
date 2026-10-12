@@ -9,19 +9,33 @@
 // 网络下载。本脚本运行时解析出平台子包内的二进制路径，spawn 并透传参数/
 // stdio/退出码。
 //
-// 包名自检测：wrapper 由主包 package.json 的 name 推导子包前缀与二进制名
-// （@meowo/aproxy → 子包 @meowo/aproxy-*、二进制 aproxy；@meowo/aproxy-format
-// → 同理）——一份脚本两组通用，改包名时无需同步此处。
+// 包名自检测：wrapper 由主包 package.json 推导子包前缀（name 加 -）与二进制名（bin 的命令名）
+// ——@meowo/aproxy → 子包 @meowo/aproxy-*、二进制 aproxy；@meowo/aproxy-headless →
+// 子包 @meowo/aproxy-headless-*、二进制同样是 aproxy；@meowo/aproxy-format 同理。一份脚本
+// 三组通用，改包名时无需同步此处。
 
 const { spawnSync } = require('child_process');
 const path = require('path');
 
-const SELF_NAME = path.basename(require('../package.json').name); // aproxy | aproxy-format
-const PKG_PREFIX = require('../package.json').name + '-';
+const PKG = require('../package.json');
+const SELF_NAME = Object.keys(PKG.bin)[0]; // aproxy | aproxy-format
+const PKG_PREFIX = PKG.name + '-';
+// 带桌面界面的那一组：Linux 上它的 gnu 二进制动态链接 GTK 与 WebKitGTK
+const DESKTOP_GROUP = PKG.name === '@meowo/aproxy';
 
-// gnu 产物能运行的 glibc 下限。必须与 .github/workflows/release.yml 里 gnu 构建的
-// glibc 下限、scripts/install.sh 的 MIN_GLIBC 保持一致；低于它的系统改用 musl 产物。
+// gnu 产物能运行的 glibc 下限。必须与 .github/workflows/release.yml 的 GNU_GLIBC_FLOOR、
+// scripts/install.sh 的 MIN_GLIBC 保持一致；低于它的系统改用 musl 产物。
 const MIN_GLIBC = '2.28';
+// 带界面的 gnu 产物能运行的 glibc 下限，必须与 release.yml 的 DESKTOP_GLIBC_FLOOR、
+// scripts/install.sh 的 DESKTOP_MIN_GLIBC 保持一致。它还要 WebKitGTK 2.40+，那一项这里查不了，
+// 缺库时由动态加载器报错（见文件末尾）。
+const DESKTOP_MIN_GLIBC = '2.35';
+const HEADLESS_HINT = [
+  '改装无界面的 headless 版本（代理与命令行完全相同，只是没有 aproxy desktop 窗口）：',
+  '  npm uninstall -g @meowo/aproxy && npm install -g @meowo/aproxy-headless',
+  '想留着带界面的版本，就装上 WebKitGTK 2.40+（Debian / Ubuntu：sudo apt install libwebkit2gtk-4.1-0），',
+  '它还需要 glibc ' + DESKTOP_MIN_GLIBC + ' 或更新。',
+].join('\n');
 
 // 平台 → 子包后缀。linux 需区分 glibc/musl（两套产物）；forceMusl 用于 glibc 过老的系统。
 function platformPackage(forceMusl) {
@@ -65,6 +79,16 @@ function versionLt(a, b) {
 
 const glibc = process.platform === 'linux' ? glibcRuntime() : undefined;
 const glibcTooOld = typeof glibc === 'string' && versionLt(glibc, MIN_GLIBC);
+
+// 带界面的 gnu 二进制在这里注定起不来（glibc 够 headless、不够带界面版）：不 spawn 一个必然在
+// 动态加载阶段失败的进程，直接说清原因与改装办法。glibc 低于 MIN_GLIBC 的走下面的 musl 分支。
+if (DESKTOP_GROUP && typeof glibc === 'string' && !glibcTooOld && versionLt(glibc, DESKTOP_MIN_GLIBC)) {
+  console.error(
+    `${SELF_NAME}: 本机 glibc ${glibc} 低于带桌面界面的版本要求的 ${DESKTOP_MIN_GLIBC}，它在这里起不来。\n` +
+      HEADLESS_HINT
+  );
+  process.exit(1);
+}
 
 const pkg = platformPackage(glibc === null || glibcTooOld);
 if (!pkg) {
@@ -113,5 +137,18 @@ const result = spawnSync(bin, process.argv.slice(2), { stdio: 'inherit' });
 if (result.error) {
   console.error(`${SELF_NAME}: 无法启动二进制：` + result.error.message);
   process.exit(1);
+}
+// 动态加载器在 main 之前失败（缺库、库太旧、glibc 太旧）时退出码是 127，它的报错已经打在终端上。
+// aproxy 自己不用 127，但要确认是加载失败才提示：再跑一次 --version 把 stderr 收下来看（只在
+// 这种失败时多花这一次）。带界面的版本在缺 WebKitGTK 的 Linux 上就是这样起不来的。
+if (result.status === 127 && DESKTOP_GROUP && process.platform === 'linux') {
+  const probe = spawnSync(bin, ['--version'], { encoding: 'utf8', timeout: 10000 });
+  const loaderError =
+    /error while loading shared libraries|symbol lookup error|version `GLIBC_[^']*' not found/;
+  if (probe.status === 127 && loaderError.test(probe.stderr || '')) {
+    console.error(
+      `${SELF_NAME}: 带桌面界面的版本在本机缺系统库，起不来（见上面动态加载器的报错）。\n` + HEADLESS_HINT
+    );
+  }
 }
 process.exit(result.status === null ? 1 : result.status);

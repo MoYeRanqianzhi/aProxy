@@ -66,25 +66,29 @@ pub fn run_version(bin: &Path) -> Result<String, String> {
             .stderr(std::process::Stdio::piped())
             .spawn()
     };
+    // 时限从第一次尝试算起，下面因 ETXTBSY 等待重试的时间也算在里面
+    let deadline = std::time::Instant::now() + VERSION_TIMEOUT;
     // Linux 上 execve 遇到「这个文件正被以写方式打开」就以 ETXTBSY 失败。二进制刚写完、刚
     // 复制完时，同一进程里别的线程若恰好在拉起子进程，fork 出来的子进程在 exec 之前会短暂
-    // 握着那个写句柄（O_CLOEXEC 要到 exec 才生效），这一刻转瞬即逝：稍等重试，而不是把一个
-    // 好好的二进制判成跑不起来（交换落位后的核对会因此回滚）。2026-10-12 CI 的 ubuntu job
-    // 在 tests/install_swap.rs 里撞上过一次。
-    let mut busy_waits = [20u64, 50, 100, 200, 500].into_iter();
+    // 握着那个写句柄（O_CLOEXEC 要到 exec 才生效）。这是 std 自己的已知竞态
+    // （rust-lang/rust#114554），这一刻转瞬即逝：只对这一种错误退避重试，从几十毫秒起、
+    // 合计约 1.6 秒，而不是把一个好好的二进制判成跑不起来（交换落位后的核对会因此回滚）。
+    // 别的错误照旧立即失败。2026-10-12 CI 的 ubuntu job 在 tests/install_swap.rs 里撞上过一次。
+    let mut busy_waits = [25u64, 50, 100, 200, 400, 800].into_iter();
     let mut child = loop {
         match spawn() {
             Ok(child) => break child,
             Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                match busy_waits.next() {
-                    Some(millis) => std::thread::sleep(std::time::Duration::from_millis(millis)),
-                    None => return Err(format!("{} 无法执行: {e}", bin.display())),
+                match busy_waits.next().map(std::time::Duration::from_millis) {
+                    Some(wait) if std::time::Instant::now() + wait < deadline => {
+                        std::thread::sleep(wait)
+                    }
+                    _ => return Err(format!("{} 无法执行: {e}", bin.display())),
                 }
             }
             Err(e) => return Err(format!("{} 无法执行: {e}", bin.display())),
         }
     };
-    let deadline = std::time::Instant::now() + VERSION_TIMEOUT;
     // --version 只输出一行，管道写不满，等它退出再读不会互相卡住
     let status = loop {
         match child.try_wait() {

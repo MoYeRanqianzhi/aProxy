@@ -25,7 +25,7 @@ switchyard-translation = "0.3"
 # envelope 在 0.2.0 正式版之前随 aproxy 主线发预发布版：这里写与它同号的普通（caret）
 # 要求，工作区才解析得了，将来的 0.2.0 正式版也满足；发布前 .github/scripts/align-version.py
 # 按正则把它与 envelope 的版本一起改，改这一行的写法要同步改那个脚本。
-aproxy-envelope = { version = "0.2.0-alpha.0", path = "../aproxy-envelope" }
+aproxy-envelope = { version = "0.2.0-alpha.1", path = "../aproxy-envelope" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

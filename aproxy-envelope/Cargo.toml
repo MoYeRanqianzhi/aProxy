@@ -1,6 +1,6 @@
 [package]
 name = "aproxy-envelope"
-version = "0.2.0-alpha.0"
+version = "0.2.0-alpha.1"
 # 信封契约 crate：与 aproxy 同库开发。aproxy 0.2.0 正式版之前，它随主线与 aproxy、
 # aproxy-desktop 同号发预发布版（0.2.0-alpha.N 等），发布前由 .github/scripts/align-version.py
 # 一起对齐；到 aproxy 0.2.0 正式版时才发 0.2.0（W2 设计稿 §10.13）。正式版号一经发布就永久

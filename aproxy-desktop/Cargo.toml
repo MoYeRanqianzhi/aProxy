@@ -2,7 +2,7 @@
 name = "aproxy-desktop"
 # 与 aproxy 主线同步发版：aproxy 的 `desktop` 特性就是对本包的可选依赖（path + version），
 # 两者总是一起改版本号、一起发布（发布顺序本包在前）。
-version = "0.2.0-alpha.0"
+version = "0.2.0-alpha.1"
 edition = "2024"
 # tauri 一族（tauri、tauri-build、codegen、macros、utils、runtime-wry，以及 muda、tray-icon）
 # 都声明 rust-version 1.90，本包的实际下限就是它。

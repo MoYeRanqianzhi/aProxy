@@ -22,7 +22,7 @@ resolver = "3"
 
 [package]
 name = "aproxy"
-version = "0.2.0-alpha.0"
+version = "0.2.0-alpha.1"
 # edition 2024 本身要 1.85，依赖树把下限抬到 1.88：src/decode.rs 引入的 ruzstd
 # 要 1.87，url→idna→idna_adapter 拖进来的 icu_* 一族要 1.88（这些 crate 在依赖图里
 # 是实打实被编译的，非可选）。本包自己再抬到 1.89：安装锁（永久兼容契约 C4 的
@@ -120,14 +120,14 @@ regex = "1"
 # version 依赖，见 release 说明）。0.2.0 正式版之前它与本包同号发预发布版，要求
 # 同样用 `=` 精确钉住：预发布版之间的接口不守 semver。发布前 align-version.py 按正则
 # 把这一行与版本一起改成 tag 版本，改这一行的写法要同步改那个脚本（同下）。
-aproxy-envelope = { version = "=0.2.0-alpha.0", path = "aproxy-envelope" }
+aproxy-envelope = { version = "=0.2.0-alpha.1", path = "aproxy-envelope" }
 # 桌面界面（desktop 特性）：Tauri 外壳与嵌入的前端。version + path 双写，理由同上；
 # 版本与本包同步。它不依赖本包（否则成环），需要的东西（home、运行时）由 bin 在启动
 # 界面时传进去。版本要求用 `=` 精确钉住：两者总是同号一起发布，aproxy-desktop 的接口
 # 只为同号的 aproxy 服务、不守 semver，不带 --locked 的 `cargo install aproxy` 不能挑到
 # 别的版本。发布前 .github/scripts/align-version.py 按正则把这一行与两边的版本一起改成
 # tag 版本：改这一行的写法（换行、调换键的顺序）要同步改那个脚本，否则发布在对齐这步失败。
-aproxy-desktop = { version = "=0.2.0-alpha.0", path = "aproxy-desktop", optional = true }
+aproxy-desktop = { version = "=0.2.0-alpha.1", path = "aproxy-desktop", optional = true }
 # 响应体检查用解码器（src/decode.rs）：把压缩响应解出一份副本供「错误判定 +
 # 日志预览」使用——转发给客户端的字节始终是上游原样，本模块不参与转发路径。
 # 两者均为**纯 Rust**实现（无 C 依赖，故 musl/aarch64 交叉编译与 CI 各平台不受

@@ -99,7 +99,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "aproxy"
-version = "0.2.0-alpha.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "aproxy-desktop",
  "aproxy-envelope",
@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "aproxy-desktop"
-version = "0.2.0-alpha.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "serde",
  "tauri",
@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "aproxy-envelope"
-version = "0.2.0-alpha.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "base64 0.22.1",
  "serde",

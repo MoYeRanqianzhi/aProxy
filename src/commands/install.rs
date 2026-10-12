@@ -467,7 +467,8 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     }
     let mut failures: Vec<String> = Vec::new();
     let mut installed = None;
-    // 有带界面的产物下载下来了、却在本机用不了（多半是缺系统库）
+    // 有带界面的产物下载下来了、却被动态加载器挡在 main 之前（本机缺系统库，见
+    // staging::is_loader_failure）；超时、输出不对之类的失败与系统库无关，不算
     let mut desktop_unusable = false;
     for attempt in &attempts {
         if let Some(previous) = failures.last() {
@@ -479,7 +480,8 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
                 break;
             }
             DownloadOutcome::VerifyFailed(e) => {
-                desktop_unusable |= attempt.variant == VARIANT_DESKTOP;
+                desktop_unusable |= attempt.variant == VARIANT_DESKTOP
+                    && aproxy::install::staging::is_loader_failure(&e);
                 failures.push(format!("{} 在本机不可运行（{e}）", attempt.binary_asset()));
             }
             DownloadOutcome::ChainFailed(e) => {
@@ -492,10 +494,11 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         for failure in &failures {
             eprintln!("[ERROR] {failure}");
         }
-        // 没写 --variant 时 headless 已经试过了（见 DownloadCtx::attempts），这句只给写明了 desktop 的
+        // 没写 --variant 时 headless 已经试过了（见 DownloadCtx::attempts），这句只给写明了 desktop 的。
+        // 不写具体的库与版本：要求属于目标版本的构建，这里的文字却随正在运行的旧版本永远不变
         if explicit_variant && desktop_unusable && cfg!(target_os = "linux") {
             eprintln!(
-                "带桌面界面的版本需要 WebKitGTK 2.40 或更新等系统库（Debian / Ubuntu：libwebkit2gtk-4.1-0）；本机缺这些库时，改装无界面版本：aproxy install --variant headless"
+                "带桌面界面的版本在本机起不来：动态加载器的报错见上，多半是缺 WebKitGTK 等系统库、这些库太旧，或者 glibc 太旧。不需要窗口，就改装无界面版本：aproxy install --variant headless"
             );
         }
         eprintln!(
@@ -505,7 +508,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     };
     if installed_variant != attempts[0].variant {
         println!(
-            "改装的是无界面的 headless 版本：代理与命令行完全相同，只是没有 aproxy desktop 窗口。带界面的版本起不来的原因见上（Linux 上多半是缺 WebKitGTK 2.40+），解决之后可用 aproxy install --variant desktop 换回。"
+            "改装的是无界面的 headless 版本：代理与命令行完全相同，只是没有 aproxy desktop 窗口。带界面的版本起不来的原因见上（Linux 上多半是缺 WebKitGTK 等系统库，或者 glibc 太旧），解决之后可用 aproxy install --variant desktop 换回。"
         );
     }
 

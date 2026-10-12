@@ -506,8 +506,8 @@ tell the user that what it shows is real; use `aproxy status` and `aproxy logs`.
   explains that and exits 1; the command is also missing from `aproxy --help` there. The way to
   the desktop build is `aproxy install --variant desktop`, a normal install that restarts the
   instances one at a time. musl builds come only as headless; on a glibc Linux the desktop build
-  needs WebKitGTK 2.40 or later (Debian and Ubuntu package it as `libwebkit2gtk-4.1-0`), and the
-  install stops with an error when it is missing.
+  needs glibc 2.34 or later and WebKitGTK 2.40 or later (Debian and Ubuntu package it as
+  `libwebkit2gtk-4.1-0`), and the install stops with an error when either is missing.
 
 ## install / upgrade
 
@@ -588,10 +588,12 @@ because what a build needs changes from release to release. Without `--variant`,
 that does not run is replaced by the headless build of the same target, and the output says
 `改装的是无界面的 headless 版本…` ("installing the headless build instead") with how to switch
 back once the libraries are there. With `--variant desktop` nothing is replaced: the install stops,
-exit 1, after the loader's error and `带桌面界面的版本需要 WebKitGTK 2.40 或更新等系统库…` ("the
-desktop build needs WebKitGTK 2.40 or later"). Install the package it names
-(`libwebkit2gtk-4.1-0` on Debian and Ubuntu) and run the command again, or use
-`--variant headless`.
+exit 1, after the loader's error and, when the system loader refused the binary,
+`带桌面界面的版本在本机起不来：动态加载器的报错见上…` ("the desktop build cannot start here; see
+the loader's error above"). The loader's error names what is missing: a library such as
+`libwebkit2gtk-4.1.so.0` (Debian and Ubuntu ship it in `libwebkit2gtk-4.1-0`), an undefined symbol
+(the library is too old), or `GLIBC_2.xx not found` (glibc is too old, which only a newer system
+fixes). Install what it names and run the command again, or use `--variant headless`.
 
 **Which instances move.** Online installs and `--from` refuse while a running instance's binary
 lives outside `<home>/bin/` (`实例 <port> 的二进制不在安装管辖目录（…）下`, "instance binary outside
@@ -698,14 +700,17 @@ version below the running one (a newer release that is missing its manifest), fo
 60 s without data. `--variant` defaults to the variant of the binary you run, the first word in the
 parentheses of `aproxy --version`. Like a normal install ("Choosing the variant" above), it judges a
 build only by running the downloaded binary's `--version`: without `--variant`, a desktop build that
-does not run is replaced by the headless build of the same target, then on Linux by the musl one,
-and the output says so before the confirmation; with `--variant desktop` it exits 10 instead,
-before changing anything. Without `--cpu`, the x86-64-v3 build is taken on CPUs with AVX2 when the
-release has one, and the baseline build otherwise; an explicit `--cpu` must exist as named. When
-the manifest has no build for this platform in the requested variant (and CPU level), force install
-exits 10 and the error lists what the platform does have, for example
-`这个目标只有 headless（baseline）` ("this target only has headless (baseline)"): musl builds, for
-one, come only without the desktop interface. Rerun with a combination from that list. Force install reads no config file and no settings.json, so pass
+does not run, or that the release does not publish for this platform at all, is replaced by the
+headless build of the same target, then on Linux by the musl one, and the output says so before the
+confirmation; with `--variant desktop` it exits 10 instead, before changing anything, and when the
+system loader refused the binary it adds the same `带桌面界面的版本在本机起不来…` hint. Without
+`--cpu`, the x86-64-v3 build is taken on CPUs with AVX2 when the release has one, and the baseline
+build otherwise; an explicit `--cpu` must exist as named, for the headless build it falls back to
+as well (the musl build is always baseline). When you named the variant or the CPU level and the
+manifest has no such build for this platform, force install exits 10 and the error lists what the
+platform does have, for example `这个目标只有 headless（baseline）` ("this target only has headless
+(baseline)"): musl builds, for one, come only without the desktop interface. Rerun with a
+combination from that list. Force install reads no config file and no settings.json, so pass
 `--download-proxy URL` if downloads need a proxy. It does not update the skill documents; run
 `aproxy install --skills-only` afterwards.
 

@@ -1150,7 +1150,7 @@ async fn online_falls_back_in_order_when_the_selected_asset_does_not_run() {
 }
 
 /// 清单里找不到要的「目标三元组 + 变体 [+ 指令集档]」时，错误如实列出这个目标有什么——
-/// 例如 musl 目标只发布 headless，要 desktop 时提示「这个目标只有 headless」；显式的
+/// 例如 musl 目标只发布 headless，写明要 desktop 时提示「这个目标只有 headless」；显式的
 /// `--cpu` 不退回别的档；产物跑不起来之后要改试的组合清单里没有时，也这样说明。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn online_reports_what_a_target_offers_when_the_combination_is_missing() {
@@ -1213,7 +1213,12 @@ async fn online_reports_what_a_target_offers_when_the_combination_is_missing() {
         }
     };
 
-    let e = attempt(online_spec(Some(version), musl, force::VARIANT_DESKTOP)).await;
+    // 没写 --variant 时清单里没有本变体会改试 headless（见下一个测试），这里是写明了的
+    let e = attempt(OnlineSpec {
+        explicit_variant: true,
+        ..online_spec(Some(version), musl, force::VARIANT_DESKTOP)
+    })
+    .await;
     assert!(
         e.contains(musl) && e.contains("这个目标只有 headless（baseline）"),
         "{e}"
@@ -1237,6 +1242,161 @@ async fn online_reports_what_a_target_offers_when_the_combination_is_missing() {
             && e.contains("清单里有的目标：x86_64-unknown-linux-gnu"),
         "{e}"
     );
+}
+
+/// 没写 `--variant` 而清单里这个目标根本没有本变体（以后某一版不再为它出带界面版）：与跑不
+/// 起来一样改试同目标的 headless，并说明原因；写明了 `--variant desktop` 的照旧报告这个目标
+/// 有什么，什么都不下载。
+///
+/// 与上面的测试一样，能跑起来的只有本测试程序的 aproxy：headless 构建里回退成功；带界面的
+/// 构建里它自报 desktop，回退以「变体不符」结束，错误里记着改试过 headless。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn online_falls_back_when_the_release_has_no_build_of_the_variant() {
+    let home = TestHome::new();
+    let files = home.path().join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    let real = PathBuf::from(env!("CARGO_BIN_EXE_aproxy"));
+    let version = env!("CARGO_PKG_VERSION");
+    let windows = "x86_64-pc-windows-msvc";
+    let manifest = manifest_file(
+        &files,
+        "m.json",
+        version,
+        vec![asset(windows, force::VARIANT_HEADLESS, "headless", &real)],
+    );
+    let api = serve_fake_github(vec![(
+        format!("v{version}"),
+        true,
+        vec![
+            (force::MANIFEST_ASSET.into(), manifest),
+            ("headless".into(), real.clone()),
+        ],
+    )])
+    .await;
+    let client = local_client();
+    let dest = home
+        .path()
+        .join(format!("got{}", std::env::consts::EXE_SUFFIX));
+    let implicit = online_spec(Some(version), windows, force::VARIANT_DESKTOP);
+    let result = force::acquire_online(&client, &api, &implicit, &dest).await;
+    let missing = "没有 x86_64-pc-windows-msvc 的 desktop 版本，这个目标只有 headless（baseline）";
+    if own_variant() == force::VARIANT_HEADLESS {
+        let got = result.unwrap();
+        assert!(got.origin.ends_with("的 headless"), "{}", got.origin);
+        let skipped = got.skipped.expect("改装 headless 时说明原因");
+        assert!(skipped.contains(missing), "{skipped}");
+        assert_eq!(std::fs::read(&dest).unwrap(), std::fs::read(&real).unwrap());
+    } else {
+        let e = result.unwrap_err();
+        assert!(
+            e.contains(missing) && e.contains("改用 headless 时出错"),
+            "{e}"
+        );
+    }
+
+    let explicit_dest = home
+        .path()
+        .join(format!("explicit{}", std::env::consts::EXE_SUFFIX));
+    let explicit = OnlineSpec {
+        explicit_variant: true,
+        ..implicit
+    };
+    let e = force::acquire_online(&client, &api, &explicit, &explicit_dest)
+        .await
+        .unwrap_err();
+    assert!(e.contains(missing) && !e.contains("改用"), "{e}");
+    assert!(!explicit_dest.exists(), "写明了变体时什么都不下载");
+}
+
+/// 写了 `--cpu` 时，回退到的同目标 headless 守这一档，不按本机 CPU 另选：本机的偏好
+/// （`prefer_v3`）故意与写明的档相反，回退若按本机选，取到的就是另一档。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn online_fallback_keeps_an_explicit_cpu() {
+    let home = TestHome::new();
+    let files = home.path().join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    let real = PathBuf::from(env!("CARGO_BIN_EXE_aproxy"));
+    let broken = files.join("broken");
+    std::fs::write(&broken, b"not an executable").unwrap();
+    let version = env!("CARGO_PKG_VERSION");
+    let windows = "x86_64-pc-windows-msvc";
+    let v3 = |asset: ManifestAsset| ManifestAsset {
+        cpu: force::CPU_X86_64_V3.into(),
+        ..asset
+    };
+    let manifest = manifest_file(
+        &files,
+        "m.json",
+        version,
+        vec![
+            asset(windows, force::VARIANT_DESKTOP, "desktop-baseline", &broken),
+            v3(asset(
+                windows,
+                force::VARIANT_DESKTOP,
+                "desktop-v3",
+                &broken,
+            )),
+            asset(windows, force::VARIANT_HEADLESS, "headless-baseline", &real),
+            v3(asset(
+                windows,
+                force::VARIANT_HEADLESS,
+                "headless-v3",
+                &real,
+            )),
+        ],
+    );
+    let api = serve_fake_github(vec![(
+        format!("v{version}"),
+        true,
+        vec![
+            (force::MANIFEST_ASSET.into(), manifest),
+            ("desktop-baseline".into(), broken.clone()),
+            ("desktop-v3".into(), broken),
+            ("headless-baseline".into(), real.clone()),
+            ("headless-v3".into(), real),
+        ],
+    )])
+    .await;
+    let client = local_client();
+    for (cpu, prefer_v3, wanted, other) in [
+        (
+            force::CPU_BASELINE,
+            true,
+            "headless-baseline",
+            "headless-v3",
+        ),
+        (
+            force::CPU_X86_64_V3,
+            false,
+            "headless-v3",
+            "headless-baseline",
+        ),
+    ] {
+        let dest = home
+            .path()
+            .join(format!("got-{cpu}{}", std::env::consts::EXE_SUFFIX));
+        let spec = OnlineSpec {
+            cpu: Some(cpu.into()),
+            prefer_v3,
+            ..online_spec(Some(version), windows, force::VARIANT_DESKTOP)
+        };
+        let result = force::acquire_online(&client, &api, &spec, &dest).await;
+        if own_variant() == force::VARIANT_HEADLESS {
+            let got = result.unwrap();
+            assert!(
+                got.origin.ends_with(&format!("的 {wanted}")),
+                "{}",
+                got.origin
+            );
+        } else {
+            // 本测试程序自报 desktop，与回退要装的 headless 对不上：错误里记着回退取的是哪一个
+            let e = result.unwrap_err();
+            assert!(
+                e.contains(&format!("改用 {wanted} 时出错")) && !e.contains(other),
+                "{e}"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

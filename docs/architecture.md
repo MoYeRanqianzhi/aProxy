@@ -634,7 +634,9 @@ unix 分支（UDS IPC、`/dev/shm` 心跳、`/proc` 进程查询、单步 rename
 构建，会随以后的发布变化（换构建基线、换 WebKitGTK 的 API 与 soname），而安装器的代码随正在
 运行的旧版本永远不变——强制安装尤其要能装以后任何一版。没写 `--variant` 时按
 `DownloadCtx::attempts` / `force::fallbacks` 回退：带界面的版本跑不起来就换同一目标的
-headless，linux-gnu 再换 musl 的 headless 基线；写了 `--variant desktop` 就不换。只有一键安装
+headless（写了 `--cpu` 就守同一档），linux-gnu 再换 musl 的 headless 基线；强制安装在发布清单里
+这个目标根本没有本变体时也这样回退。写了 `--variant desktop` 就不换，失败时只有被动态加载器挡在
+main 之前（`staging::is_loader_failure`）才提示装库或改装 headless，提示里不写具体的库与版本。只有一键安装
 脚本（每次从 main 现取，跟得上最新的构建）在首装、没指定变体时先看本机：musl、glibc 低于下限、
 动态加载器缓存里找不到 `libwebkit2gtk-4.1.so.0` 的装 headless。
 

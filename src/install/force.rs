@@ -361,8 +361,8 @@ pub struct Acquired {
     pub line: VersionLine,
     /// 给人看的来源说明
     pub origin: String,
-    /// 在线取目标时，先选中的产物在本机跑不起来、改试别的组合才取到这一个（见
-    /// [`fallbacks`]）：前面那些为什么跑不起来，给人看
+    /// 在线取目标时，先选中的产物用不上（在本机跑不起来，或清单里没有）、改试别的组合才
+    /// 取到这一个（见 [`fallbacks`]）：前面那些为什么用不上，给人看
     pub skipped: Option<String>,
 }
 
@@ -620,10 +620,11 @@ pub struct OnlineSpec {
     pub target: String,
     /// 变体，默认是正在运行的这个二进制的
     pub variant: String,
-    /// `variant` 是用户用 `--variant` 写明的：写明了就只装这个变体，带界面的版本跑不起来
-    /// 也不换成 headless（见 [`fallbacks`]）
+    /// `variant` 是用户用 `--variant` 写明的：写明了就只装这个变体，带界面的版本跑不起来、
+    /// 清单里没有，都不换成 headless（见 [`fallbacks`]）
     pub explicit_variant: bool,
-    /// `--cpu` 显式指定的指令集档：清单里必须正好有这一档，没有就报告这个目标有什么
+    /// `--cpu` 显式指定的指令集档：第一个产物、以及回退到的同目标 headless，都必须正好是
+    /// 这一档，没有就报告这个目标有什么
     pub cpu: Option<String>,
     /// 没有显式指定指令集档时按本机 CPU 选：true = 先找 x86-64-v3 档，没有就退回基线档
     pub prefer_v3: bool,
@@ -641,9 +642,11 @@ pub struct OnlineSpec {
 /// 选中的产物在本机跑不起来（执行 `--version` 失败）时，按 [`fallbacks`] 依次改试同一份
 /// 清单里的别的组合。跑不跑得起来只看下载下来的二进制自己，不预先猜本机缺什么：系统要求
 /// 属于目标版本的构建、会随以后的发布变化，而这里的代码随正在运行的旧版本永远不变——强制
-/// 安装要能装以后任何一版。清单里找不到要的组合时（例如 musl 目标只发布 headless），错误里
-/// 列出这个目标实际有的变体与指令集档。下载失败、sha256 不符、跑起来了却自报的版本或变体
-/// 不对，都直接报错、不再改试：换一个产物也不会好。
+/// 安装要能装以后任何一版。同样的道理，没写 `--variant` 而清单里这个目标根本没有本变体时
+/// （以后某一版不再为它出带界面版），也照样改试。写明了变体、或者写了 `--cpu` 而本变体没有
+/// 那一档时，清单里找不到要的组合就报错（例如 musl 目标只发布 headless），错误里列出这个
+/// 目标实际有的变体与指令集档。下载失败、sha256 不符、跑起来了却自报的版本或变体不对，都
+/// 直接报错、不再改试：换一个产物也不会好。
 pub async fn acquire_online(
     client: &reqwest::Client,
     api: &str,
@@ -664,26 +667,36 @@ pub async fn acquire_online(
         }
     }
     let manifest = fetch_manifest(client, &release).await?;
-    let first = match &spec.cpu {
-        Some(cpu) => manifest.find(&spec.target, &spec.variant, cpu),
-        None => manifest.select(&spec.target, &spec.variant, spec.prefer_v3),
-    }
-    .ok_or_else(|| manifest.missing(&spec.target, &spec.variant, spec.cpu.as_deref()))?;
-    let mut failure = match acquire_asset(client, &release, first, &spec.variant, dest).await? {
-        Ok(acquired) => return Ok(acquired),
-        Err(e) => format!("{} 在本机跑不起来（{e}）", first.file),
+    // 指令集档：给了就只要这一档（显式的 `--cpu`、musl 的基线档），否则按本机 CPU 选
+    let pick = |target: &str, variant: &str, cpu: Option<&str>| match cpu {
+        Some(cpu) => manifest.find(target, variant, cpu),
+        None => manifest.select(target, variant, spec.prefer_v3),
+    };
+    let mut failure = match pick(&spec.target, &spec.variant, spec.cpu.as_deref()) {
+        Some(first) => match acquire_asset(client, &release, first, &spec.variant, dest).await? {
+            Ok(acquired) => return Ok(acquired),
+            Err(e) => format!("{} 在本机跑不起来（{e}）", first.file),
+        },
+        // 没写 --variant，而这个目标在清单里根本没有本变体（例如以后某一版不再为它出带界面版）：
+        // 与跑不起来一样改试回退的组合——强制安装要能装以后的任何一版。写明了变体的，或者
+        // 本变体有、只是没有要的那一档（显式 `--cpu`），如实报告这个目标有什么，不改试
+        None if !spec.explicit_variant
+            && !manifest
+                .assets
+                .iter()
+                .any(|a| a.target == spec.target && a.variant == spec.variant) =>
+        {
+            manifest.missing(&spec.target, &spec.variant, spec.cpu.as_deref())
+        }
+        None => return Err(manifest.missing(&spec.target, &spec.variant, spec.cpu.as_deref())),
     };
     for fallback in fallbacks(spec) {
-        let asset = match fallback.cpu {
-            Some(cpu) => manifest.find(&fallback.target, fallback.variant, cpu),
-            None => manifest.select(&fallback.target, fallback.variant, spec.prefer_v3),
-        };
-        let Some(asset) = asset else {
+        let Some(asset) = pick(&fallback.target, fallback.variant, fallback.cpu.as_deref()) else {
             failure = format!(
                 "{failure}；改用 {} 的 {} 版本也不行：{}",
                 fallback.target,
                 fallback.variant,
-                manifest.missing(&fallback.target, fallback.variant, fallback.cpu)
+                manifest.missing(&fallback.target, fallback.variant, fallback.cpu.as_deref())
             );
             continue;
         };
@@ -701,17 +714,18 @@ pub async fn acquire_online(
     Err(failure)
 }
 
-/// 选中的产物在本机跑不起来时改试的一个组合（见 [`fallbacks`]）。
+/// 选中的产物用不上时改试的一个组合（见 [`fallbacks`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fallback {
     pub target: String,
     pub variant: &'static str,
-    /// 指令集档：Some = 只要这一档（musl 只发布基线档）；None = 与第一个产物同样按本机选
-    pub cpu: Option<&'static str>,
+    /// 指令集档：Some = 只要这一档；None = 按本机 CPU 选。同目标的 headless 与第一个产物
+    /// 同一档（写了 `--cpu` 就是它，否则按本机选）；musl 恒为基线档（只发布这一档）
+    pub cpu: Option<String>,
 }
 
-/// 第一个产物在本机跑不起来时依次改试的组合，次序与普通在线安装相同
-/// （`download::DownloadCtx::attempts`）：
+/// 第一个产物用不上（在本机跑不起来，或者没写 `--variant` 而清单里这个目标根本没有本变体）
+/// 时依次改试的组合，次序与普通在线安装相同（`download::DownloadCtx::attempts`）：
 /// - 没写 `--variant` 的带界面版本先换同目标的 headless：缺 WebKitGTK 等系统库时带界面的
 ///   版本连 `--version` 都起不来，代理与命令行在 headless 里完全一样；
 /// - linux-gnu 再换 musl 的 headless 基线产物：gnu 产物按构建机的 glibc 链接，老发行版上
@@ -723,7 +737,7 @@ pub fn fallbacks(spec: &OnlineSpec) -> Vec<Fallback> {
         out.push(Fallback {
             target: spec.target.clone(),
             variant: VARIANT_HEADLESS,
-            cpu: None,
+            cpu: spec.cpu.clone(),
         });
     }
     if (spec.variant == VARIANT_HEADLESS || implicit)
@@ -732,7 +746,7 @@ pub fn fallbacks(spec: &OnlineSpec) -> Vec<Fallback> {
         out.push(Fallback {
             target: format!("{arch}-linux-musl"),
             variant: VARIANT_HEADLESS,
-            cpu: Some(CPU_BASELINE),
+            cpu: Some(CPU_BASELINE.to_string()),
         });
     }
     out
@@ -1251,11 +1265,21 @@ pub async fn run(home: &Path, request: &ForceRequest) -> i32 {
         Ok(target) => target,
         Err(e) => {
             errln!("[ERROR] {e}");
-            // 没写 --variant 时 headless 已经试过了（见 fallbacks），这句只给写明了 desktop 的
-            if request.variant.is_some() && variant == VARIANT_DESKTOP && cfg!(target_os = "linux")
+            // 没写 --variant 时 headless 已经试过了（见 fallbacks），这句只给写明了 desktop 的；
+            // 而且只在它确实是被动态加载器挡在 main 之前时才说——网络不通、清单里没有、`--from`
+            // 的文件变体不符，都与本机的系统库无关。不写具体的库与版本：要求属于目标版本的构建，
+            // 这里的文字却随正在运行的旧版本永远不变
+            if request.variant.is_some()
+                && variant == VARIANT_DESKTOP
+                && cfg!(target_os = "linux")
+                && super::staging::is_loader_failure(&e)
             {
                 errln!(
-                    "带桌面界面的版本需要 WebKitGTK 等系统库；本机缺这些库时，加 --variant headless 改装无界面版本。"
+                    "带桌面界面的版本在本机起不来：动态加载器的报错见上，多半是缺 WebKitGTK 等系统库、这些库太旧，或者 glibc 太旧。不需要窗口，就{}",
+                    match request.source {
+                        ForceSource::Online(_) => "加 --variant headless 改装无界面版本。",
+                        ForceSource::File(_) => "改用无界面（headless）版本的二进制。",
+                    }
                 );
             }
             if matches!(request.source, ForceSource::Online(_)) {
@@ -1268,7 +1292,8 @@ pub async fn run(home: &Path, request: &ForceRequest) -> i32 {
             return EXIT_UNCHANGED;
         }
     };
-    // 先选中的产物在本机跑不起来、改试别的组合才取到（见 fallbacks）：先说明为什么
+    // 先选中的产物用不上（在本机跑不起来，或清单里没有）、改试别的组合才取到（见 fallbacks）：
+    // 先说明为什么
     if let Some(skipped) = &target.skipped {
         outln!("{skipped}。");
     }
@@ -1286,7 +1311,7 @@ pub async fn run(home: &Path, request: &ForceRequest) -> i32 {
     );
     if target.skipped.is_some() && target.line.variant.as_deref() != Some(variant.as_str()) {
         outln!(
-            "带桌面界面的版本在本机跑不起来（原因见上），改装的是无界面的 headless 版本：代理与命令行完全相同，只是没有 aproxy desktop 窗口。装好所需的系统库之后，可用 aproxy install --variant desktop 换回。"
+            "没能装上带桌面界面的版本（原因见上），改装的是无界面的 headless 版本：代理与命令行完全相同，只是没有 aproxy desktop 窗口。原因解决之后（例如装好所需的系统库），可用 aproxy install --variant desktop 换回。"
         );
     }
 
@@ -1619,7 +1644,8 @@ mod tests {
     }
 
     /// 跑不起来时的改试次序：没写 --variant 的带界面版本先换同目标的 headless，linux-gnu 再换
-    /// musl 的 headless 基线；写明了 desktop 的一个都不换；headless 只在 linux-gnu 上换 musl
+    /// musl 的 headless 基线；写明了 desktop 的一个都不换；headless 只在 linux-gnu 上换 musl。
+    /// 写了 --cpu 时同目标的 headless 守同一档，musl 照旧只要基线档
     #[test]
     fn fallbacks_follow_the_variant_rule() {
         let spec = |target: &str, variant: &str, explicit_variant: bool| OnlineSpec {
@@ -1632,10 +1658,10 @@ mod tests {
             prefer_v3: false,
             running: "0.2.0".into(),
         };
-        let fallback = |target: &str, variant: &'static str, cpu: Option<&'static str>| Fallback {
+        let fallback = |target: &str, variant: &'static str, cpu: Option<&str>| Fallback {
             target: target.into(),
             variant,
-            cpu,
+            cpu: cpu.map(str::to_string),
         };
         let (gnu, arm_gnu, musl, windows) = (
             "x86_64-unknown-linux-gnu",
@@ -1673,5 +1699,19 @@ mod tests {
         assert_eq!(fallbacks(&spec(windows, VARIANT_DESKTOP, true)), vec![]);
         assert_eq!(fallbacks(&spec(windows, VARIANT_HEADLESS, false)), vec![]);
         assert_eq!(fallbacks(&spec(musl, VARIANT_HEADLESS, false)), vec![]);
+
+        for cpu in [CPU_BASELINE, CPU_X86_64_V3] {
+            let with_cpu = OnlineSpec {
+                cpu: Some(cpu.into()),
+                ..spec(gnu, VARIANT_DESKTOP, false)
+            };
+            assert_eq!(
+                fallbacks(&with_cpu),
+                vec![
+                    fallback(gnu, VARIANT_HEADLESS, Some(cpu)),
+                    fallback(musl, VARIANT_HEADLESS, Some(CPU_BASELINE))
+                ]
+            );
+        }
     }
 }

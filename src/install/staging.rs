@@ -124,6 +124,17 @@ pub fn run_version(bin: &Path) -> Result<String, String> {
     Ok(stdout)
 }
 
+/// [`run_version`] 的错误是不是 glibc 的动态加载器在 main 之前报的：缺共享库（`error while
+/// loading shared libraries`）、库里缺符号（`symbol lookup error`，库太旧）、符号版本不够
+/// （``version `GLIBC_2.34' not found (required by …)``，glibc 太旧）。只有这一类才说明是本机缺
+/// 系统库：带界面的版本在 Linux 上起不来时据此提示装库或改装 headless；下载坏了、输出格式
+/// 不对、超时都不是这一类，提示装库只会误导。只认措辞里稳定的部分，不认引号的样式。
+pub fn is_loader_failure(error: &str) -> bool {
+    error.contains("error while loading shared libraries")
+        || error.contains("symbol lookup error")
+        || error.contains("not found (required by ")
+}
+
 /// 从 `bin --version` 的输出里取版本号：首行是永久格式（C5）就取出来；是 0.1.x 的
 /// 格式就按版本下限说明它为什么装不了、怎样回到 0.1.x；其余的报格式不对。
 pub fn version_of(bin: &Path, stdout: &str) -> Result<String, String> {
@@ -273,5 +284,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = stage_from_in(dir.path(), &dir.path().join("no-such.exe"), "0.1.0").unwrap_err();
         assert!(err.contains("不存在"), "{err}");
+    }
+
+    /// 动态加载器的三种报错（glibc 的 ld.so 原样输出，经 run_version 包进错误里）才算缺系统库
+    #[test]
+    fn loader_failures_are_told_apart() {
+        let wrap =
+            |stderr: &str| format!("/tmp/x/aproxy --version 失败（exit status: 127）: {stderr}");
+        for loader in [
+            "/tmp/x/aproxy: error while loading shared libraries: libwebkit2gtk-4.1.so.0: cannot open shared object file: No such file or directory",
+            "/tmp/x/aproxy: symbol lookup error: /tmp/x/aproxy: undefined symbol: webkit_web_view_evaluate_javascript",
+            "/tmp/x/aproxy: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.34' not found (required by /tmp/x/aproxy)",
+            "/tmp/x/aproxy: /lib/x86_64-linux-gnu/libc.so.6: version 'GLIBC_2.34' not found (required by /tmp/x/aproxy)",
+        ] {
+            assert!(is_loader_failure(&wrap(loader)), "{loader}");
+        }
+        for other in [
+            "/tmp/x/aproxy --version 在 60 秒内没有结束".to_string(),
+            "/tmp/x/aproxy 无法执行: Permission denied (os error 13)".to_string(),
+            wrap("thread 'main' panicked at src/main.rs:1:1"),
+            "aproxy-x86_64-unknown-linux-gnu 自报变体 headless，与要装的 desktop 不符".to_string(),
+            "GitHub API 请求失败: error sending request".to_string(),
+        ] {
+            assert!(!is_loader_failure(&other), "{other}");
+        }
     }
 }

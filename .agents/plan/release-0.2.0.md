@@ -353,6 +353,11 @@
     ubuntu-24.04 与 24.04-arm 上；该变体 glibc 下限约 2.35、运行期要 WebKitGTK ≥ 2.40（headless 仍用 zigbuild 压到 2.28）。
     Alpine 的 arm64 不能用 job container，要宿主 checkout 后 `docker run`。
   - crate 名 `aproxy-desktop`、`aproxy-ipc` 在 crates.io 未被占（2026-10-12）。
+- **原型交接给第 3 步的事项（UI 原型代理 2026-10-12）**：原型已提交（60c1924，`desktop/`）；接 Tauri 时删掉 `src/proto/`（审核
+  工具条、仿系统窗口与壁纸、模拟 Mica 的 blur）与开发态的 `window.__aproxyProto`。自定义吉祥物在 `<iframe sandbox="allow-scripts">`
+  里经 blob URL 导入，CSP 只给 `mascot-sandbox.html` 放行 `script-src blob:`。在 WebView2 里实测总览横幅的 `.rain`（重试时出现，
+  动画改 background-position 且带 mask-image，每帧重绘整个横幅），开销明显就改成 transform 移动大图层。图表数据色有意不随
+  主题变（按色盲可区分度校验过）。哪些配置项「实时生效 / 需重启」是原型的提议，接入时对照真实的热重载行为改准。
 - 待定：
   - **所有平台都发两个版本（用户定）**：现有 11 个构建（Windows x64 / x64-v3 / x86 / arm64，Linux gnu x64 /
     x64-v3 / arm64，musl x64 / arm64，macOS arm64 / x64）各出带 UI 与无 UI 两份，共 22 个；2026-10-12 用户改为 musl 只出 headless，实为 20 个（见下）。由此带来的事：

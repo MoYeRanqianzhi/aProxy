@@ -418,6 +418,9 @@ pub fn acquire_file(from: &Path, variant: Option<&str>, dest: &Path) -> Result<A
 }
 
 /// GitHub 上本仓库的 API 基址（`<基址>/releases…`）。测试换成本地假服务器的地址。
+///
+/// 在线路径依赖 GitHub API 的形状与仓库名，是尽力而为；永久保证的是 `--from`（C6）：
+/// 哪天 API 变了、仓库搬了，手动下载二进制再 `--from` 照样能装。
 pub fn github_api() -> String {
     format!(
         "https://api.github.com/repos/{}",

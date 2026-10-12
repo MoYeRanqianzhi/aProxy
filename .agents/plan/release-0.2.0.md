@@ -38,10 +38,12 @@
 - CHANGELOG 写清 0.1.0 → 0.2.0 的迁移步骤（停实例、重新安装）。
 
 ### W2 契约重审与定稿
+- **状态（2026-10-12）**：设计稿定稿，见 [w2-contracts](w2-contracts.md)，经四轮对抗式审查，记录在
+  `.agents/review/2026-10-12-w2-contracts-review.md`。实现排在 alpha.1 之后，按它的 §14 切分。
 - 依据审查报告逐项决定：IPC（UI 要的只读枚举、事件订阅、日志流、能力声明、错误码、写类 op 的访问控制）、
   `~/.aproxy` 磁盘布局、config.toml 与 settings.json 字段、CLI 子命令与参数、退出码与 `--json`、发给客户端的
   错误体形态、信封协议。
-- 定稿后重写记忆 ipc-v1-upgrade-contract 的永久接口清单（0.2.0 发布时冻结）。
+- W2 实现落地后重写记忆 ipc-v1-upgrade-contract 的永久接口清单（0.2.0 发布时冻结）；在那之前，它描述的仍是现有代码。
 
 ### W2 的用户决策（2026-10-11，依据综合稿 §3）
 - D-1 重试配置：规则表。`[retry]` 下放退避上限、抖动、是否读 Retry-After；`[[retry.rules]]` 每条可写 `path`（整体匹配、含

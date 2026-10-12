@@ -72,11 +72,18 @@ Read https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/docs/INSTALL_A
 
 **Manual install** (first install pulls the binary + skill docs, verifies
 SHA256, places everything under `~/.aproxy/`). By default it installs the
-latest **stable** release; while the repository has no stable release yet
-(before 0.1.0) it falls back to the highest-versioned pre-release and says so.
+latest **stable** release; if the repository has no stable release at all it
+falls back to the highest-versioned pre-release and says so.
 Add `--pre` to let pre-releases compete too and take the highest version
 (`-Pre` for PowerShell, or set `APROXY_PRE=1`). Only tags in the form `vX.Y.Z`
-or `vX.Y.Z-(alpha|beta|rc).N` are considered:
+or `vX.Y.Z-(alpha|beta|rc).N` are considered.
+
+> **0.2.0 is currently available as a pre-release only.** Unless you ask for
+> it, every channel below installs the stable 0.1.0, which has none of the
+> desktop window, the two variants or `install --force` described here. To
+> install 0.2.0: add `--pre` to the install script, use `@next` with npm, and
+> name the version with cargo. 0.1.x cannot be upgraded to 0.2.0 in place; see
+> "Upgrading from 0.1.x" below.
 
 ```powershell
 # Windows (PowerShell)
@@ -123,15 +130,21 @@ Other channels (afterwards `aproxy install --adopt` moves the install to the
 standard location):
 
 ```sh
-npm install -g @meowo/aproxy            # with the desktop interface; picks the right binary; stable releases use the latest tag
-npm install -g @meowo/aproxy-headless   # without it (servers, Linux without WebKitGTK); both provide the aproxy command, install one
-npm install -g @meowo/aproxy@next       # pre-releases use the next tag; ask for it explicitly (same for headless)
-cargo install aproxy --locked           # builds from source; needs rustc 1.90+
+npm install -g @meowo/aproxy@next            # with the desktop interface; picks the right binary
+npm install -g @meowo/aproxy-headless@next   # without it (servers, Linux without WebKitGTK); both provide the aproxy command, install one
+cargo install aproxy --locked --version 0.2.0-alpha.1   # builds from source; needs rustc 1.90+
 ```
+
+Pre-releases go to npm's `next` tag and the `latest` tag is kept for stable releases; cargo
+without a version also takes only stable releases. 0.2.0 is a pre-release for now, so the
+commands above carry the tag or the version (the `latest` tag of `@meowo/aproxy-headless` is only a
+placeholder and must not be used). Once 0.2.0 is released as a stable version, drop `@next` and
+`--version`.
 
 `cargo install` builds the version with the desktop interface by default; on Linux, install the
 WebKitGTK 4.1 development package first (Debian/Ubuntu: `libwebkit2gtk-4.1-dev`). On Linux
-servers use `cargo install aproxy --locked --no-default-features` for the headless build.
+servers use `cargo install aproxy --locked --no-default-features` (with `--version` as well) for
+the headless build.
 `--locked` builds with the dependency versions in the package's Cargo.lock, the ones tested
 before the release; without it cargo picks the newest compatible version of each dependency.
 `cargo binstall aproxy` fetches the prebuilt desktop build (headless on musl systems); for the
@@ -164,8 +177,20 @@ a local binary, `--adopt` takes over an existing install).
 - **Upgrading from 0.1.x**: 0.1.x and 0.2.0 or later cannot control each
   other's instances, so a 0.1.x `aproxy install` cannot install 0.2.0 (it exits
   with `--version 输出无版本号` after the download and changes nothing). Stop the
-  instances and reinstall as described under "从 0.1.x 迁移" (migrating from
-  0.1.x) in the [CHANGELOG](CHANGELOG.md).
+  instances and reinstall, following
+  [Moving from 0.1.x to 0.2.0](.claude/skills/aproxy-cli/references/latest/compatibility.md#moving-from-01x-to-020)
+  (the Chinese version is "从 0.1.x 迁移" in the [CHANGELOG](CHANGELOG.md)). While
+  0.2.0 is a pre-release, add `--pre` to the install script when reinstalling,
+  or it installs 0.1.x again.
+- **Download channels and proxy**: online installs try github → npm →
+  cargo-binstall → cargo in that order; `download_chain` in settings.json
+  reorders them or adds a mirror (URL template). Use `--download-proxy <URL>`
+  or `download_proxy` in settings.json to download through a proxy; it is
+  unrelated to the upstream request proxy. The fields are described in the skill
+  document
+  [settings-json.md](.claude/skills/aproxy-cli/references/latest/settings-json.md).
+  Force install reads no settings.json and uses only the command line's
+  `--download-proxy` (the system's proxy environment otherwise).
 - **Variants**: upgrades keep the installed variant (the first word in the
   parentheses of `aproxy --version`); `aproxy install --variant desktop|headless`
   switches, reinstalling the current version in the other variant when
@@ -339,6 +364,7 @@ timeout (for Claude Code, `API_TIMEOUT_MS`).
 | `aproxy doctor` | Config health check: settings.json errors + alias/toml review (warnings) |
 | `aproxy find [keyword]` | Discover all configs in configured directories; `--aliased/--unaliased --port PORT` filters |
 | `aproxy config [options]` | View or modify the config (`--show` prints it) |
+| `aproxy install [VERSION]` | Install or upgrade (alias `upgrade`), rolling-restarting instances; `--variant` switches the build, `--force` forces an install; see the upgrade notes under Getting started |
 | `aproxy desktop` | Open the desktop window (a preview showing demo data; see below) |
 
 Global flags: `--config <PATH>` (multi-instance), `--listen <ADDR>`,
@@ -354,7 +380,8 @@ may restart instances one at a time.
 - **In 0.2.0-alpha.1 the window is a preview**: the instances, request logs and statistics in it
   are demo data, not the aProxy running on your computer, and a "Preview · demo data" label stays
   at the top of the window. Real data comes in a later version; until then `aproxy status` and
-  `aproxy logs` are the source of truth.
+  `aproxy logs` are the source of truth. Interface preferences (theme, language, the Mica switch)
+  are not saved in this version either: a reopened window starts with the defaults.
 - Windows needs the Microsoft Edge WebView2 runtime (built into Windows 11; on Windows 10, install
   it when told to). Run from a terminal, the command returns at once and the window runs on its
   own.

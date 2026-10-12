@@ -18,6 +18,10 @@ npm install -g @meowo/aproxy            # with the desktop window (aproxy deskto
 npm install -g @meowo/aproxy-headless   # without it: servers, containers
 ```
 
+Stable versions install with the commands above. Pre-releases (alpha, beta, rc)
+are published under the `next` tag, so ask for them explicitly:
+`npm install -g @meowo/aproxy@next` or `npm install -g @meowo/aproxy-headless@next`.
+
 The right platform binary (windows x64/x86/arm64, linux x64/arm64 with glibc
 or musl, macOS arm64/x64) is installed automatically via
 `optionalDependencies` — no postinstall downloads, everything comes from the
@@ -27,6 +31,10 @@ On Linux the desktop build links WebKitGTK: it needs WebKitGTK 2.40 or later
 (`libwebkit2gtk-4.1-0` on Debian/Ubuntu) and glibc 2.34 or later, and without
 them it cannot start at all — use `@meowo/aproxy-headless` there. On musl
 systems (Alpine) both packages carry the same headless binary.
+
+In the 0.2.0 pre-releases `aproxy desktop` is a preview: the window shows demo
+data, not your running instances. Use `aproxy status` and `aproxy logs` for the
+real state.
 
 ## Quick start
 

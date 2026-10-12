@@ -26,7 +26,9 @@
 Read https://raw.githubusercontent.com/MoYeRanQianzhi/aProxy/main/docs/INSTALL_AGENT.md and install (or upgrade) aProxy on this machine exactly as it says.
 ```
 
-**人类自装**（首装二进制 + skill 文档，SHA256 校验，落位 `~/.aproxy/`）。默认安装最新**稳定版**；仓库还没有稳定版时（0.1.0 发布前）回退到版本号最大的预发布并给出提示；加 `--pre` 则预发布也参与选择，取版本号最大者（PowerShell 为 `-Pre`，也可设环境变量 `APROXY_PRE=1`）。只认 `vX.Y.Z` 与 `vX.Y.Z-(alpha|beta|rc).N` 格式的 tag：
+**人类自装**（首装二进制 + skill 文档，SHA256 校验，落位 `~/.aproxy/`）。默认安装最新**稳定版**；仓库里一个稳定版都没有时，回退到版本号最大的预发布并给出提示；加 `--pre` 则预发布也参与选择，取版本号最大者（PowerShell 为 `-Pre`，也可设环境变量 `APROXY_PRE=1`）。只认 `vX.Y.Z` 与 `vX.Y.Z-(alpha|beta|rc).N` 格式的 tag。
+
+> **0.2.0 目前只有预发布版本。** 各渠道不特别指定时装到的都是稳定版 0.1.0，它没有下文说的桌面界面、两个变体与 `install --force`。要装 0.2.0：一键脚本加 `--pre`，npm 带 `@next`，cargo 写明版本号。0.1.x 不能原地升级到 0.2.0，见下文「从 0.1.x 升级」。
 
 ```powershell
 # Windows (PowerShell)
@@ -53,13 +55,14 @@ curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/
 其他渠道（装好后可用 `aproxy install --adopt` 收编到标准位置）：
 
 ```sh
-npm install -g @meowo/aproxy            # 带桌面界面，按平台自动选二进制；正式版发在 latest 标签
-npm install -g @meowo/aproxy-headless   # 无界面（服务器、缺 WebKitGTK 的 Linux）；两个包都提供 aproxy 命令，只装其一
-npm install -g @meowo/aproxy@next       # 预发布发在 next 标签，需显式指定（headless 同理）
-cargo install aproxy --locked           # 源码编译，需 rustc 1.90+
+npm install -g @meowo/aproxy@next            # 带桌面界面，按平台自动选二进制
+npm install -g @meowo/aproxy-headless@next   # 无界面（服务器、缺 WebKitGTK 的 Linux）；两个包都提供 aproxy 命令，只装其一
+cargo install aproxy --locked --version 0.2.0-alpha.1   # 源码编译，需 rustc 1.90+
 ```
 
-`cargo install` 默认编带桌面界面的版本，Linux 上要先装 WebKitGTK 4.1 的开发包（Debian/Ubuntu：`libwebkit2gtk-4.1-dev`）；Linux 服务器上用 `cargo install aproxy --locked --no-default-features` 编无界面的 headless 版本。`--locked` 让依赖取包里 Cargo.lock 记的、发布前测过的版本；不加时 cargo 会改用各依赖当下的最新兼容版本。`cargo binstall aproxy` 取带界面的预编译产物（musl 系统上取 headless）；要无界面的版本，指定资产地址：
+预发布发在 npm 的 `next` 标签，`latest` 标签留给正式版；cargo 不写版本号时也只取稳定版。0.2.0 现在只有预发布，所以上面的命令都带着标签或版本号（`@meowo/aproxy-headless` 的 `latest` 只是占位版本，不能用）。0.2.0 正式版发布后，去掉 `@next` 与 `--version` 即可。
+
+`cargo install` 默认编带桌面界面的版本，Linux 上要先装 WebKitGTK 4.1 的开发包（Debian/Ubuntu：`libwebkit2gtk-4.1-dev`）；Linux 服务器上用 `cargo install aproxy --locked --no-default-features`（同样要写明 `--version`）编无界面的 headless 版本。`--locked` 让依赖取包里 Cargo.lock 记的、发布前测过的版本；不加时 cargo 会改用各依赖当下的最新兼容版本。`cargo binstall aproxy` 取带界面的预编译产物（musl 系统上取 headless）；要无界面的版本，指定资产地址：
 
 ```sh
 cargo binstall aproxy --pkg-url '{ repo }/releases/download/v{ version }/{ name }-headless-{ target }{ binary-ext }' --pkg-fmt bin
@@ -69,7 +72,8 @@ cargo binstall aproxy --pkg-url '{ repo }/releases/download/v{ version }/{ name 
 
 升级：`aproxy install`（在线下载链条自动滚动重启，逐实例无感；`--from <路径>` 本地安装、`--adopt` 收编既有安装）。
 - **更新通道**：`install` 默认的 `latest` 在「通道」内取版本号最大者。当前是正式版则只取正式版（不会被带到预发布）；当前是预发布（如 alpha）则默认就在预发布通道；`--pre` 显式让预发布参与选择。只认 `vX.Y.Z` / `vX.Y.Z-(alpha|beta|rc).N`，按版本号而非创建时间比较，`format-v*` 与历史测试 tag 不参与。通道内没有更新版本时提示「已是最新」或「暂无可用版本」并保持现状，不会偷偷换通道。指定具体版本号（`aproxy install 0.2.0`）不受通道影响；低于当前版本的目标默认拒绝，需 `--allow-downgrade`；低于 0.2.0 的版本一律不装。
-- **从 0.1.x 升级**：0.1.x 与 0.2.0 起的版本互相控制不了对方的实例，0.1.x 的 `aproxy install` 装不上 0.2.0（下载后报 `--version 输出无版本号` 退出，什么都不改）。按 [CHANGELOG](CHANGELOG.md) 的「从 0.1.x 迁移」停掉实例、重新安装。
+- **从 0.1.x 升级**：0.1.x 与 0.2.0 起的版本互相控制不了对方的实例，0.1.x 的 `aproxy install` 装不上 0.2.0（下载后报 `--version 输出无版本号` 退出，什么都不改）。按 [CHANGELOG](CHANGELOG.md) 的「从 0.1.x 迁移」停掉实例、重新安装；0.2.0 现在只有预发布，重装时一键脚本要加 `--pre`，否则装回的还是 0.1.x。
+- **下载渠道与代理**：在线安装按 github → npm → cargo-binstall → cargo 的顺序尝试，settings.json 的 `download_chain` 可以调整次序、加镜像（url 模板）；下载走代理用 `--download-proxy <URL>` 或 settings.json 的 `download_proxy`，与上游请求代理无关。字段说明见 skill 文档 [settings-json.md](.claude/skills/aproxy-cli/references/latest/settings-json.md)。强制安装不读 settings.json，只用命令行的 `--download-proxy`（没给就走系统环境代理）。
 - **变体**：升级保持已装的变体（`aproxy --version` 括号里的第一段）；`aproxy install --variant desktop|headless` 换变体，通道里没有更新的版本时重装当前版本的另一个变体。安装器不预先猜本机缺什么，只看下载下来的二进制自检（`--version`）能不能跑：没写 `--variant` 时，带界面的版本跑不起来（Linux 上多半是缺 WebKitGTK）就改装同一目标的 headless 并说明，Linux 上再不行换 musl 产物；写了 `--variant desktop` 就报错退出，什么都不改。`install --force` 也一样。
 - **失败回滚**：滚动重启时某个实例在新版本下起不来，`install` 会用旧二进制按原参数把它拉回、中止滚动（其余实例不动）并以非零退出；排除原因后重新执行 `aproxy install` 继续。
 - **强制安装**：普通安装失败、卡住，或装着的版本坏到跑不起来时，用 `aproxy install --force [版本|latest]`（或 `--from <下载好的二进制>`）。它不走交接：按进程台账结束这个 home 下当前用户的全部 aproxy 进程，换上新二进制，再用新版本的 `restore` 按原参数拉回实例。这会立即中断所有经 aproxy 的在途请求，所以先确认（非交互环境加 `--yes`）。装着的版本连运行都不行时，手动下载新版本，执行 `<新版本> install --force --from <新版本>`。退出码：0 完成；10 一个进程都没结束、二进制没换；11 结束过进程、二进制没换（再执行一次即可）；12 二进制已换、有实例没回来（输出里按端口列出启动命令）。它不更新 skill 文档，之后执行 `aproxy install --skills-only`。
@@ -190,6 +194,7 @@ Codex 的 `stream_idle_timeout_ms` 默认 300000（5 分钟），按 SSE 事件�
 | `aproxy doctor` | 配置体检：settings.json error 级检查 + 别名配置与目录 toml 审查（warning） |
 | `aproxy find [关键字]` | 从配置目录发现全部配置；`--aliased/--unaliased --port PORT` 过滤 |
 | `aproxy config [选项]` | 查看或修改配置（`--show` 打印当前配置） |
+| `aproxy install [版本]` | 安装或升级（别名 `upgrade`），逐实例滚动重启；`--variant` 换变体，`--force` 强制安装；见「入门」里的升级说明 |
 | `aproxy desktop` | 打开桌面界面（预览版，显示的是演示数据，见下） |
 
 通用参数：`--config <PATH>`（指定配置文件，多开用）、`--listen <ADDR>`、`--proxy <URL>`、`--api-key <KEY>`（启动路径仅本次生效）。
@@ -198,7 +203,7 @@ Codex 的 `stream_idle_timeout_ms` 默认 300000（5 分钟），按 SSE 事件�
 
 `aproxy desktop` 打开桌面界面。它是一个独立的窗口进程，关掉窗口就退出。窗口本身不启停、不改动任何实例；和其余 aproxy 命令一样，它发现上次的安装没做完时会在后台把安装续完，续作可能逐个重启实例。
 
-- **0.2.0-alpha.1 的界面是预览版**：里面的实例、请求日志与统计都是演示数据，不是这台电脑上正在运行的 aProxy，界面顶部常驻「预览版 · 演示数据」标签。真实数据在之后的版本接入，在那之前以 `aproxy status`、`aproxy logs` 为准。
+- **0.2.0-alpha.1 的界面是预览版**：里面的实例、请求日志与统计都是演示数据，不是这台电脑上正在运行的 aProxy，界面顶部常驻「预览版 · 演示数据」标签。真实数据在之后的版本接入，在那之前以 `aproxy status`、`aproxy logs` 为准。界面偏好（主题、语言、Mica 开关）这个版本也不保存：关掉窗口再打开，恢复默认。
 - Windows 需要 Microsoft Edge WebView2 运行时（Windows 11 自带，Windows 10 没有时按提示安装）。从终端运行时命令立即返回，窗口独立运行。
 - Linux 需要图形会话与 WebKitGTK 4.1（2.40 或更新）。带界面的版本动态链接 WebKitGTK，缺这些库时整个程序都起不来（连 `aproxy --version` 也不行），没有图形界面的机器请用无界面的 headless 版本——一键安装脚本与 `aproxy install` 在缺库的机器上会自动装它；musl 构建只有 headless 版本。
 - 同一个 home 只开一个窗口，再次运行会提示已经在运行。

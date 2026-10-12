@@ -1,9 +1,12 @@
 # Installing / Upgrading aProxy — Agent Instructions
 
 You are an AI agent (Claude Code, Codex, or similar) asked to install or
-upgrade aProxy on this machine. Follow this guide exactly, in order. Every
-command is safe to run as written; none of them will touch processes or files
-you did not create.
+upgrade aProxy on this machine. Follow this guide exactly, in order. The checks
+in step 0 and the install scripts in step 1 only create files under
+`~/.aproxy/` and touch no running process. Upgrading (step 2) restarts the
+user's running aProxy instances, and `aproxy install --force` stops all of
+them and cuts every request in flight, possibly your own: read the warnings in
+step 2 before you run either.
 
 aProxy is a local API proxy that gives agent workloads infinite retries. After
 installation, point your API base URL at it (step 4) — that is the whole point.
@@ -22,7 +25,10 @@ aproxy --version 2>/dev/null || echo "not installed"
 - **Command not found** and `~/.aproxy/bin/` does not exist → fresh install, go
   to step 1.
 - **A version prints** → aProxy is installed; go to step 2 (upgrade) only if
-  the user asked for an upgrade, otherwise skip to step 4.
+  the user asked for an upgrade, otherwise skip to step 4. From 0.2.0 on the
+  first line reads `aproxy v<version> (<variant>; <target>)`, where the variant
+  is `desktop` or `headless`; 0.1.x prints `aproxy <version>` and cannot be
+  upgraded in place (step 2).
 
 ## 1. Fresh install — bootstrap script (preferred)
 
@@ -39,11 +45,17 @@ different directory.
 `vX.Y.Z-(alpha|beta|rc).N` are considered (the repository also hosts
 `format-v*` releases for `aproxy-format` and a few historical test tags such
 as `v0.1.0-alpha.12t3`; those are ignored) and drafts are skipped. By default it installs the newest **stable**
-release; if the repository has no stable release yet (before 0.1.0) it falls
-back to the highest-versioned pre-release and prints a note. Pass `--pre`
+release; if the repository has no stable release at all it falls back to the
+highest-versioned pre-release and prints a note. Pass `--pre`
 (`-Pre` for PowerShell, or set `APROXY_PRE=1`) to take the highest version,
-pre-release or not (by version number, not by creation time). An explicit tag (`sh install.sh v0.1.0`,
-`-Version v0.1.0`) overrides all of this.
+pre-release or not (by version number, not by creation time). An explicit tag (`sh install.sh v0.2.0-alpha.1`,
+`-Version v0.2.0-alpha.1`) overrides all of this.
+
+**0.2.0 is currently available as a pre-release only**, so without `--pre` the
+scripts install the stable 0.1.x, which has no desktop window, no variants and
+no `install --force`. To install 0.2.0 pass `--pre` (for `irm | iex`, set
+`$env:APROXY_PRE = "1"` first) or name the tag, and check `aproxy --version`
+afterwards.
 
 **Windows (PowerShell — preferred):**
 
@@ -81,9 +93,9 @@ Notes:
   `pwsh -File scripts/install.ps1`.
 - The sh script needs one of `sha256sum`, `shasum` or `openssl` to verify the
   download; without one it stops before downloading anything.
-- Linux: the gnu build requires glibc 2.28 or newer. If glibc is older or the
-  system is musl-based, the script picks the statically linked musl build
-  automatically. Before placing the binary it runs
+- Linux: the headless gnu build requires glibc 2.28 or newer (the desktop gnu
+  build 2.34, see the next note). If glibc is older or the system is
+  musl-based, the script picks the statically linked musl build automatically. Before placing the binary it runs
   `--version` as a self-test, and if the gnu build cannot run on the machine it
   switches to the musl build. Nothing is placed unless the self-test passes.
 - Every platform has two builds with the same proxy and commands: `desktop`,
@@ -141,6 +153,8 @@ control each other's instances, so a 0.1.x `aproxy install` stops before
 changing anything, with an error containing `--version 输出无版本号`. Stop the
 instances with 0.1.x and reinstall, following "Moving from 0.1.x to 0.2.0" in
 the aproxy-cli skill's [compatibility.md](https://github.com/MoYeRanqianzhi/aProxy/blob/main/.claude/skills/aproxy-cli/references/latest/compatibility.md#moving-from-01x-to-020).
+While 0.2.0 is a pre-release, the reinstall needs `--pre` (step 1), or the
+script installs 0.1.x again.
 
 **Force install (0.2.0 and later), when the normal install fails or hangs, or
 the installed version is broken:** `aproxy install --force` skips the
@@ -200,9 +214,13 @@ them.
 ## 3. Verify
 
 ```sh
-aproxy --version   # prints the installed version
+aproxy --version   # e.g. aproxy v0.2.0-alpha.1 (desktop; x86_64-unknown-linux-gnu)
 aproxy status      # lists running instances (empty is fine after install)
 ```
+
+Check that the version is the one you meant to install: a `0.1.x` here after
+you wanted 0.2.0 means the script or the npm tag picked the stable release
+(step 1).
 
 ## 4. Point agent traffic at aProxy
 
@@ -304,7 +322,7 @@ troubleshooting — read them before improvising CLI flags.
 | Client gets a local 403 mentioning `allowed_origins` / `allowed_hosts` | the inbound origin check rejected it (never forwarded upstream): add the Origin / host name from the message to `config.toml`, then `aproxy restart <port>` |
 | `install.ps1` fails to parse under Windows PowerShell 5.1 | run it via `irm ... \| iex` or `pwsh -File`, not `powershell -File` |
 | Install script: no SHA256 tool | install `sha256sum`, `shasum` or `openssl`, then rerun |
-| Linux binary will not start (glibc errors) | rerun the install script (it falls back to the musl build), or download the `aproxy-<arch>-unknown-linux-musl` asset |
+| Linux binary will not start (glibc errors, or `error while loading shared libraries: libwebkit2gtk-4.1.so.0`) | rerun the install script (it falls back to the musl or headless build), or download the `aproxy-headless-<arch>-unknown-linux-musl` asset; a desktop build needs glibc 2.34 and WebKitGTK 2.40 |
 | Claude Code gives up / resends after about 10 minutes of waiting | `CLAUDE_STREAM_IDLE_TIMEOUT_MS` is not set: Claude Code's event-level idle timeout (600 s) is not reset by aProxy's comment heartbeats. Set it to `86400000` (step 4) |
 | Non-streaming (`"stream": false`) requests time out during long retries | they have no keepalive channel (nothing to inject heartbeats into): raise the client's own timeout |
 | `aproxy install` stopped with an instance rolled back | the new version failed to start for that instance; read `startup.log`, fix, rerun `aproxy install` |

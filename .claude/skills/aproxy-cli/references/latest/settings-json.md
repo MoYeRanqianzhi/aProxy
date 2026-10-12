@@ -192,9 +192,13 @@ nothing appended, so include every source you want as a fallback.
 | `"cargo"` | Builds from crates.io; needs a Rust toolchain, so keep it last |
 | `{"url": "TEMPLATE"}` | A mirror of your choice |
 
-URL template placeholders: `{version}` (the bare version, such as `0.1.0`, no `v`), `{asset}` (the
-release file name, such as `aproxy-x86_64-pc-windows-msvc-v3.exe`, or `aproxy-skills.zip` for the
-skill files), `{target}` (the Rust target triple) and `{variant}` (`-v3` or empty). When
+URL template placeholders: `{version}` (the bare version, such as `0.2.0`, no `v`), `{asset}` (the
+release file name: `aproxy-x86_64-pc-windows-msvc-v3.exe` for the desktop build,
+`aproxy-headless-x86_64-pc-windows-msvc-v3.exe` for the headless build, or `aproxy-skills.zip` for
+the skill files), `{target}` (the Rust target triple) and `{variant}` (the CPU suffix `-v3` or
+empty; it says nothing about desktop or headless, which `{asset}` already carries). A mirror should
+host both builds of a release: an install can fall back from the desktop build to the headless one
+when the desktop build does not run. When
 `<url>.sha256` exists the download is checked against it; otherwise it is accepted with
 `[警告] 来源为非官方镜像（url 模板），产物未经独立校验` ("warning: unofficial mirror (URL template);
 artifact not independently verified").

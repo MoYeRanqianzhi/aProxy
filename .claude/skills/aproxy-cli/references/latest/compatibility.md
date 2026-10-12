@@ -102,14 +102,21 @@ moment with the user first.
    `aproxy alias list`. Back up `settings.json` and the `*.toml` files under `<home>`.
 2. With the 0.1.x CLI, run `aproxy stop all`, then `aproxy status` until it lists no instance. Do
    this before the binary changes: afterwards no command can stop these instances gracefully.
-3. Replace the binary through the channel that installed it:
+3. Replace the binary through the channel that installed it. Every channel picks the newest
+   stable version unless told otherwise, and while 0.2.0 exists only as a pre-release that is
+   still 0.1.x, so ask for the pre-release explicitly or you reinstall what you just removed:
    - install script or `aproxy install`: delete `<home>/bin/aproxy` (`aproxy.exe` on Windows, and
-     `aproxy.old.exe` if present), then run the install script again; it does not overwrite an
-     existing binary. If Windows refuses the delete, the 0.1.x watchdog is still running from the
-     file; it exits by itself, by default 5 minutes after the last instance stopped.
-   - npm: `npm i -g @meowo/aproxy@latest` (`@next` for a pre-release).
-   - cargo: `cargo install aproxy --locked --force` (add `--version <version>` for a pre-release).
-     `--locked` builds with the dependency versions tested for the release.
+     `aproxy.old.exe` if present), then run the install script again with `--pre` (the PowerShell
+     script reads `APROXY_PRE=1`); it does not overwrite an existing binary. If Windows refuses the
+     delete, the 0.1.x watchdog is still running from the file; it exits by itself, by default 5
+     minutes after the last instance stopped.
+   - npm: `npm i -g @meowo/aproxy@next` (`@meowo/aproxy-headless@next` for the headless build); once
+     0.2.0 is released as a stable version, `@latest`.
+   - cargo: `cargo install aproxy --locked --force --version <version>`; once 0.2.0 is released as
+     a stable version, `--version` can go. `--locked` builds with the dependency versions tested
+     for the release.
+   Then run `aproxy --version`: the first line must read `aproxy v0.2…` (0.1.x prints
+   `aproxy 0.1.0`).
 4. Delete what 0.1.x leaves behind: `<home>/run/install.state` and `<home>/staging/`, which 0.2.0
    never reads, and any `<home>/run/*.restore`. A restore record that survived step 2 belongs to an
    instance that had crashed, and `aproxy restore` would start it with 0.1.x's command line.

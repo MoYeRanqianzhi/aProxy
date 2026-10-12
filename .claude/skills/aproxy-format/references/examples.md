@@ -192,7 +192,7 @@ download.
 |---|---|---|
 | GitHub Releases | Release tagged `format-v<version>`, asset `aproxy-format-<target>[-v3][.exe]` with a `.sha256` beside it | Save it as `~/.aproxy/bin/aproxy-format` (`aproxy-format.exe` on Windows); on Unix `chmod +x` it. `-v3` builds need an x86-64-v3 CPU (AVX2); take the plain build if unsure. |
 | npm | `npm install -g @meowo/aproxy-format` | Installs a Node.js (18+) launcher on PATH that runs the platform binary. On Windows the launcher is a `.cmd` shim, which aProxy cannot start by bare name; use the release binary there. |
-| crates.io | `cargo install aproxy-format` | Builds from source; needs Rust 1.96.1 or later. |
+| crates.io | `cargo install aproxy-format --locked` | Builds from source; needs Rust 1.96.1 or later. `--locked` builds with the dependency versions tested for the release. |
 
 Release targets: `x86_64-pc-windows-msvc` (also `-v3`), `i686-pc-windows-msvc`,
 `aarch64-pc-windows-msvc`, `x86_64-unknown-linux-gnu` (also `-v3`), `x86_64-unknown-linux-musl`,

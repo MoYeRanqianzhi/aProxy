@@ -123,6 +123,15 @@ recovery from an interrupted install are in [commands.md](references/latest/comm
 control each other's instances. Move by reinstalling, as
 [compatibility.md](references/latest/compatibility.md) describes.
 
+Every release has two builds with the same proxy and commands: `desktop`, which adds the
+`aproxy desktop` window, and `headless`, which has none and is the only one for musl Linux. The
+first word in the parentheses of `aproxy --version` says which one runs. Upgrades keep it; switch
+with `aproxy install --variant headless|desktop`. Choose headless for a server or any machine
+without a display: on Linux the desktop build needs WebKitGTK and a recent glibc and cannot even
+print `--version` without them, which is why the install script and `aproxy install` fall back to
+headless on their own when the desktop build does not run. Details: commands.md, "Choosing the
+variant".
+
 When an install keeps failing or hangs, or the installed binary is broken, `aproxy install --force`
 stops every aProxy process of the home, replaces the binary and restores the instances. It cuts
 every request in flight, your own included if your client goes through aProxy, so get the user's
@@ -143,6 +152,6 @@ own session included. Exit codes 10, 11 and 12 each call for a different next st
 | A symptom or log message to explain | [troubleshooting.md](references/latest/troubleshooting.md) |
 | Whether these docs match the installed version; moving from 0.1.x to 0.2.0 | [compatibility.md](references/latest/compatibility.md) |
 
-These references describe aProxy 0.1.x and the current development line. Check
-`aproxy --version` (and the versions `aproxy status` reports for running instances) before relying
-on a detail; compatibility.md explains what to do on a mismatch.
+These references describe aProxy 0.2.0, pre-releases included; compatibility.md lists where 0.1.0
+behaves differently. Check `aproxy --version` (and the versions `aproxy status` reports for running
+instances) before relying on a detail; compatibility.md explains what to do on a mismatch.

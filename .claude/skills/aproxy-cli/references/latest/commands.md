@@ -36,7 +36,8 @@ directory, and `install --force` ends with 10.
 | `<home>/run/` | instance registry `<port>.pid`, restore records `<port>.restore`; `APROXY_RUN_DIR` relocates this directory alone |
 | `<home>/logs/` | instance logs (random file names) and `startup.log` |
 | `<home>/bin/` | the binary managed by `aproxy install`; on Windows also `aproxy.bat` (see install / upgrade). Files named `aproxy.old-…` and `aproxy.tmp-…` are left by binary swaps; installs delete the ones they can |
-| `<home>/install/` | `aproxy install`'s own files: the progress record `state.json` while an install runs, downloads and staged binaries in `staging/<version>/`, the install script's downloads in `bootstrap/`, force install's download in `force/`, and `lock`, held while `bin/` changes |
+| `<home>/install/` | `aproxy install`'s own files: the progress record `state.json` while an install runs, downloads and staged binaries in `staging/<version>/`, the install script's downloads in `bootstrap/`, force install's download in `force/`, on Linux and macOS the install announcement `announce`, and `lock`, held while `bin/` changes |
+| `<home>/spool/<port>/` | an instance's disk-cache scratch files (behaviors.md, Disk cache); deleted when an instance starts on that port |
 | `<home>/ledger/` | one `<pid>.json` per running aproxy process (instances, the watchdog, installers, the desktop window), written at start and deleted at exit. `aproxy install --force` finds the processes to stop here. Leave these files alone |
 | `<home>/desktop/` | the desktop window's web view data (see desktop) |
 | `<home>/skills/` | skill documents placed by `aproxy install` |
@@ -475,7 +476,8 @@ install / upgrade). It opens on the user's screen, so run it only when the user 
 **In 0.2.0-alpha.1 the window is a preview filled with demo data.** The instances, logs and counts
 it shows are made up, not the ones on this machine, and a label `预览版 · 演示数据` ("preview · demo
 data") stays on screen to say so. Never read the state of the user's proxies from it, and never
-tell the user that what it shows is real; use `aproxy status` and `aproxy logs`.
+tell the user that what it shows is real; use `aproxy status` and `aproxy logs`. Its preferences
+(theme, language, Mica) are not saved either: a reopened window starts with the defaults.
 
 - **Windows, from a terminal:** the command returns at once with `已打开 aProxy 桌面界面（pid <pid>）。`
   ("desktop window opened") and the window runs on its own. Exit code 0 here only means the window

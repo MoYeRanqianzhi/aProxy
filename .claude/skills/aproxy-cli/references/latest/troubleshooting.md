@@ -17,6 +17,7 @@ the aproxy-format skill's troubleshooting.md.
 - [Transformers and forward-only mode](#transformers-and-forward-only-mode)
 - [Logs and files](#logs-and-files)
 - [Crash recovery, watchdog and upgrades](#crash-recovery-watchdog-and-upgrades)
+- [Desktop window and variants](#desktop-window-and-variants)
 - [Configuration files](#configuration-files)
 
 ## Before you change anything
@@ -137,6 +138,23 @@ the aproxy-format skill's troubleshooting.md.
 | `aproxy install --force` exits 12 | The binary was replaced; the instances it lists did not come back | Run the command printed for each (`aproxy start --config "<path>"`); `<home>/logs/startup.log` has the reason |
 | `aproxy install --force` exits 1 or 137 | Another force install on the same home started later and stopped this one | Read the later run's exit code instead |
 | Force install lists processes under `…但不在台账里…` ("…but not in the ledger") | They run from `<home>/bin/` but keep no ledger (0.1.x), so force install left them running | Stop them with the 0.1.x CLI (compatibility.md, "Moving from 0.1.x to 0.2.0") |
+
+## Desktop window and variants
+
+`aproxy --version` says which build runs: `desktop` or `headless`, the first word in the
+parentheses. A failing window never affects the proxy or the other commands. In 0.2.0-alpha.1 the
+window shows demo data only (commands.md, desktop).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `aproxy desktop` exits 1 with `这是无界面的 headless 版本的 aproxy，没有桌面界面。…` ("this is the headless build; it has no desktop window") | The running binary is the headless build | Only if the user wants the window: `aproxy install --variant desktop`, a normal install that restarts instances one at a time. musl systems have no desktop build |
+| `aproxy desktop` exits 1 with `[ERROR] 没有找到 Microsoft Edge WebView2 运行时，桌面界面要靠它显示（…）` ("WebView2 runtime not found") | Windows without the WebView2 runtime, or `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` names a directory that has none | Install the runtime (the message links the download), or unset the variable |
+| `aproxy desktop` exits 1 with `[ERROR] 没有可用的图形界面：DISPLAY 与 WAYLAND_DISPLAY 都没有设置…` ("no graphical session") | Linux session without a display, such as ssh or a server | Run it in a desktop session, or do not run it: nothing else needs the window |
+| `aproxy desktop` exits 1 with `[ERROR] 读不到 WebKitGTK 的版本，打不开桌面界面（…）` ("cannot read the WebKitGTK version") | The web view library did not report a version: older than 2.40, or not working | Install WebKitGTK 4.1 (2.40 or later), or use the headless build |
+| `aproxy desktop` prints `aProxy 桌面界面已经在运行（pid N）…` ("the desktop window is already running") and exits 0 | One window per home; this version cannot bring it to the front | Nothing to fix; ask the user to find the window in the taskbar |
+| On Linux every `aproxy` command, `--version` included, fails with `error while loading shared libraries: libwebkit2gtk-4.1.so.0` or ``version `GLIBC_2.34' not found`` (printed by the system loader, in English) | A desktop build on a machine without WebKitGTK 4.1, or with a glibc older than 2.34 | Install the libraries the loader names, or switch to the headless build: with the binary unusable, download the `aproxy-headless-<target>` asset from the Releases page and, once the user agrees, run `<it> install --force --from <it> --yes` (commands.md, Force install) |
+| `aproxy install` prints `改装的是无界面的 headless 版本…` ("installing the headless build instead") | Without `--variant`, the downloaded desktop build did not run here, so the installer took the headless build of the same target | Expected on servers. To get the window later, install the libraries the earlier lines name and run `aproxy install --variant desktop` |
+| `aproxy install` exits 1 with `没写 --variant，要装的是带桌面界面的版本。若这一版没有为本机发布它…` ("--variant not given; the desktop build was wanted…") | No download channel delivered the desktop build: this release may not publish one for this machine, or the network failed briefly | Add `--variant headless` if the window is not needed. `aproxy install --force` reads the release manifest instead and installs headless only when the desktop build is really missing; it stops every aProxy process, so get the user's agreement first |
 
 ## Configuration files
 

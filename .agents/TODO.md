@@ -18,7 +18,12 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [x] **四路审查收口**（2026-10-11）：报告与综合稿在 `.agents/review/2026-10-11-0.2.0-audit/`，结论已并入计划
 - [x] **W1 去除兼容**（2026-10-12，a54896b…7537128 + fbcc738；Windows 全量 490 通过，ubuntu 看推送后的 CI）：兼容层与 relaying 删除、`--version` 永久格式（C5）、安装状态迁到 `<home>/install/`、版本下限 0.2.0、upgrade-from-0-1-0 改为断言 0.1.0 干净拒绝、迁移文档
 - [ ] **W2 契约重审与定稿**（IPC、磁盘布局、config/settings、CLI、错误体、信封），定稿后重写永久接口清单
-- [ ] **W2b `install --force` + 进程台账**（alpha.1 第 2 步，2026-10-12 起由子代理实现；规格见计划 C1–C8）
+- [x] **W2b `install --force` + 进程台账**（alpha.1 第 2 步，2026-10-12 完成：2f1df42…fad48c7；独立审查
+  `.agents/review/2026-10-12-force-install-review.md` 无 P0，P1 与选定的 P2 全部修完；Windows 全量 549 通过，CI 三平台核过）。
+  剩余：release.yml 生成并校验 `aproxy-manifest.json`（第 4 步）；有两个带强制安装的版本后加跨版本强制安装的 CI 测试；
+  桌面界面拉起强制安装时 stdio 为 null（W5）
+- [ ] **alpha.1 第 3 步：Tauri 桌面外壳**（2026-10-12 起由子代理实现，见计划 W5「Tauri 嵌入调研结论」）
+- [ ] **W2 设计稿**（`.agents/plan/w2-contracts.md`，2026-10-12 起草完成，对抗式审查中；之后整理 §13 的问题给用户拍板）
 - [ ] **W3 i18n**（给用户看的 en/zh-CN，给 agent 或不可见的固定英文）
 - [ ] **W4 `aproxy skill` 命令**（install/upgrade/list/show，show 的安全设计，`--help` 末尾提示行）
 - [ ] **W5 UI**（Tauri 2 编进本体、`desktop` feature 默认开、headless 版本；自定义标题栏；Mica 默认关可开）

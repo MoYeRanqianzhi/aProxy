@@ -93,7 +93,7 @@ url = "2"
 # 2.0.2、把这里的 toml 退回 0.8.2，一个从没测过的组合；有了这条下限，解析器只能改挑
 # proc-macro-crate 2.0.0（它只要求 toml_edit ^0.20.2）。锁文件级的解析按全部特性、全部目标
 # 平台进行，所以 Windows 与 headless 的安装同样受它保护。
-toml = "0.8.23"
+toml = "1.1.8"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

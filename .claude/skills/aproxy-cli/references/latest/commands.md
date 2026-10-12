@@ -600,7 +600,12 @@ included, but only releases that carry `aproxy-manifest.json` count, which means
 The version is not compared with the current one, so downgrades need no flag; nothing below 0.2.0
 is installed. `--variant` defaults to the variant of the binary you run, the first word in the
 parentheses of `aproxy --version`; on Linux without the desktop libraries (WebKitGTK), install
-`--variant headless`. Force install reads no config file and no settings.json, so pass
+`--variant headless`. Without `--cpu`, the x86-64-v3 build is taken on CPUs with AVX2 when the
+release has one, and the baseline build otherwise; an explicit `--cpu` must exist as named. When
+the manifest has no build for this platform in the requested variant (and CPU level), force install
+exits 10 and the error lists what the platform does have, for example
+`这个目标只有 headless（baseline）` ("this target only has headless (baseline)"): musl builds, for
+one, come only without the desktop interface. Rerun with a combination from that list. Force install reads no config file and no settings.json, so pass
 `--download-proxy URL` if downloads need a proxy. It does not update the skill documents; run
 `aproxy install --skills-only` afterwards.
 

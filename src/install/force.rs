@@ -206,18 +206,73 @@ impl Manifest {
         serde_json::from_str(text).map_err(|e| format!("{MANIFEST_ASSET} 解析失败: {e}"))
     }
 
-    /// 选本机要装的资产：目标三元组与变体都得对上；`prefer_v3` 时先找 x86-64-v3 档、
-    /// 没有就退回基线档（不是每个目标都发布 v3）。不认识的 cpu 取值不参与。
+    /// 精确查找：目标三元组、变体、指令集档三者都对上的资产（显式 `--cpu` 走这里）。
+    pub fn find(&self, target: &str, variant: &str, cpu: &str) -> Option<&ManifestAsset> {
+        self.assets
+            .iter()
+            .find(|a| a.target == target && a.variant == variant && a.cpu == cpu)
+    }
+
+    /// 按本机自动选档：目标三元组与变体都得对上；`prefer_v3` 时先找 x86-64-v3 档、没有
+    /// 就退回基线档（不是每个目标都发布 v3）。不认识的 cpu 取值不参与。
     pub fn select(&self, target: &str, variant: &str, prefer_v3: bool) -> Option<&ManifestAsset> {
-        let find = |cpu: &str| {
-            self.assets
-                .iter()
-                .find(|a| a.target == target && a.variant == variant && a.cpu == cpu)
-        };
         prefer_v3
-            .then(|| find(CPU_X86_64_V3))
+            .then(|| self.find(target, variant, CPU_X86_64_V3))
             .flatten()
-            .or_else(|| find(CPU_BASELINE))
+            .or_else(|| self.find(target, variant, CPU_BASELINE))
+    }
+
+    /// 清单为 `target` 实际提供的变体与指令集档，给人看，按清单里出现的先后列出，例如
+    /// `headless（baseline）` 或 `desktop（baseline、x86-64-v3）；headless（baseline）`。
+    /// 清单里没有这个目标时为 None。
+    ///
+    /// 找不到要的组合时据此如实报告，而不是为某个目标写特例：例如 musl 目标只发布无界面
+    /// 版本，`--variant desktop` 碰上它，用户看到的就是「这个目标只有 headless」。
+    pub fn offered(&self, target: &str) -> Option<String> {
+        let mut variants: Vec<(&str, Vec<&str>)> = Vec::new();
+        for asset in self.assets.iter().filter(|a| a.target == target) {
+            match variants.iter_mut().find(|(v, _)| *v == asset.variant) {
+                Some((_, cpus)) if !cpus.contains(&asset.cpu.as_str()) => {
+                    cpus.push(asset.cpu.as_str())
+                }
+                Some(_) => {}
+                None => variants.push((asset.variant.as_str(), vec![asset.cpu.as_str()])),
+            }
+        }
+        (!variants.is_empty()).then(|| {
+            variants
+                .iter()
+                .map(|(variant, cpus)| format!("{variant}（{}）", cpus.join("、")))
+                .collect::<Vec<_>>()
+                .join("；")
+        })
+    }
+
+    /// 清单里找不到「目标三元组 + 变体 [+ 指令集档]」时的说明：列出这个目标实际有哪些
+    /// 变体与指令集档；清单里根本没有这个目标时，列出清单里有的目标。
+    fn missing(&self, target: &str, variant: &str, cpu: Option<&str>) -> String {
+        // 全角括号后面不再空格：「desktop 版本」「headless（x86-64-v3）版本」
+        let wanted = match cpu {
+            Some(cpu) => format!("{variant}（{cpu}）"),
+            None => format!("{variant} "),
+        };
+        match self.offered(target) {
+            Some(offered) => format!(
+                "release v{} 的发布清单里没有 {target} 的 {wanted}版本，这个目标只有 {offered}",
+                self.version
+            ),
+            None => {
+                let mut targets: Vec<&str> =
+                    self.assets.iter().map(|a| a.target.as_str()).collect();
+                targets.sort_unstable();
+                targets.dedup();
+                format!(
+                    "release v{} 的发布清单里没有 {target} 的资产（清单里有的目标：{}）",
+                    self.version,
+                    targets.join("、")
+                )
+            }
+        }
     }
 }
 
@@ -484,14 +539,17 @@ pub struct OnlineSpec {
     pub target: String,
     /// 变体，默认是正在运行的这个二进制的
     pub variant: String,
-    /// 选 x86-64-v3 档（没有就退回基线档）
+    /// `--cpu` 显式指定的指令集档：清单里必须正好有这一档，没有就报告这个目标有什么
+    pub cpu: Option<String>,
+    /// 没有显式指定指令集档时按本机 CPU 选：true = 先找 x86-64-v3 档，没有就退回基线档
     pub prefer_v3: bool,
 }
 
 /// 在线取目标：找 release → 读发布清单 → 选资产 → 下载并比对 sha256 → 在本机执行
 /// `--version`，核对版本与变体。linux-gnu 的产物跑不起来时（它按构建机的 glibc 链接，
-/// 老发行版上跑不了），改用同一份清单里同变体的 musl 产物再试一次——普通在线安装也是
-/// 这样回退的。
+/// 老发行版上跑不了；带界面的版本还要 WebKitGTK 等系统库），改用同一份清单里同变体的
+/// musl 基线产物再试一次——普通在线安装也是这样回退的。清单里找不到要的组合时（例如
+/// musl 目标只发布 headless），错误里列出这个目标实际有的变体与指令集档。
 pub async fn acquire_online(
     client: &reqwest::Client,
     api: &str,
@@ -500,25 +558,28 @@ pub async fn acquire_online(
 ) -> Result<Acquired, String> {
     let release = find_release(client, api, spec.version.as_deref(), spec.channel).await?;
     let manifest = fetch_manifest(client, &release).await?;
-    let asset = manifest
-        .select(&spec.target, &spec.variant, spec.prefer_v3)
-        .ok_or_else(|| {
-            format!(
-                "release v{} 的发布清单里没有 {} 的 {} 版本",
-                release.version, spec.target, spec.variant
-            )
-        })?;
+    let asset = match &spec.cpu {
+        Some(cpu) => manifest.find(&spec.target, &spec.variant, cpu),
+        None => manifest.select(&spec.target, &spec.variant, spec.prefer_v3),
+    }
+    .ok_or_else(|| manifest.missing(&spec.target, &spec.variant, spec.cpu.as_deref()))?;
     download_asset(client, &release, asset, dest).await?;
     let (asset, line) = match probe(dest) {
         Ok(line) => (asset, line),
         Err(gnu_err) => {
-            let musl = spec
+            let Some(musl_target) = spec
                 .target
                 .strip_suffix("-linux-gnu")
                 .map(|arch| format!("{arch}-linux-musl"))
-                .and_then(|t| manifest.select(&t, &spec.variant, false));
-            let Some(musl) = musl else {
+            else {
                 return Err(gnu_err);
+            };
+            // musl 产物恒为基线档（不发布 x86-64-v3）
+            let Some(musl) = manifest.find(&musl_target, &spec.variant, CPU_BASELINE) else {
+                return Err(format!(
+                    "{gnu_err}；改用 musl 产物也不行：{}",
+                    manifest.missing(&musl_target, &spec.variant, Some(CPU_BASELINE))
+                ));
             };
             download_asset(client, &release, musl, dest).await?;
             let line = probe(dest)
@@ -998,16 +1059,13 @@ async fn acquire_from_github(
     )?;
     let current =
         semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("内置版本号必为合法 semver");
-    let prefer_v3 = match request.cpu.as_deref() {
-        Some(cpu) => cpu == CPU_X86_64_V3,
-        None => super::download::prefers_x86_64_v3(),
-    };
     let spec = OnlineSpec {
         version,
         channel: Channel::resolve(request.pre, &current),
         target: env!("APROXY_BUILD_TARGET").to_string(),
         variant: variant.to_string(),
-        prefer_v3,
+        cpu: request.cpu.clone(),
+        prefer_v3: super::download::prefers_x86_64_v3(),
     };
     match &spec.version {
         Some(v) => println!("从 GitHub 取 v{v} 的发布清单……"),
@@ -1151,5 +1209,52 @@ mod tests {
         // 没有 v3 档就退回基线档；不认识的 cpu 取值不参与
         assert_eq!(pick(VARIANT_HEADLESS, true), Some("h-base"));
         assert_eq!(manifest.select("other", VARIANT_DESKTOP, true), None);
+        // 精确查找不退回别的档
+        assert_eq!(manifest.find("t", VARIANT_HEADLESS, CPU_X86_64_V3), None);
+        assert_eq!(
+            manifest
+                .find("t", VARIANT_DESKTOP, CPU_X86_64_V3)
+                .map(|a| a.file.as_str()),
+            Some("d-v3")
+        );
+    }
+
+    #[test]
+    fn a_missing_combination_lists_what_the_target_offers() {
+        let asset = |target: &str, variant: &str, cpu: &str| ManifestAsset {
+            target: target.into(),
+            variant: variant.into(),
+            cpu: cpu.into(),
+            file: format!("{target}-{variant}-{cpu}"),
+            sha256: "00".into(),
+        };
+        let gnu = "x86_64-unknown-linux-gnu";
+        let musl = "x86_64-unknown-linux-musl";
+        let manifest = Manifest {
+            manifest: 1,
+            version: "0.2.0".into(),
+            assets: vec![
+                asset(gnu, VARIANT_DESKTOP, CPU_BASELINE),
+                asset(gnu, VARIANT_DESKTOP, CPU_X86_64_V3),
+                asset(gnu, VARIANT_HEADLESS, CPU_BASELINE),
+                asset(musl, VARIANT_HEADLESS, CPU_BASELINE),
+            ],
+        };
+        assert_eq!(
+            manifest.offered(gnu).as_deref(),
+            Some("desktop（baseline、x86-64-v3）；headless（baseline）")
+        );
+        assert_eq!(
+            manifest.missing(musl, VARIANT_DESKTOP, None),
+            "release v0.2.0 的发布清单里没有 x86_64-unknown-linux-musl 的 desktop 版本，这个目标只有 headless（baseline）"
+        );
+        assert_eq!(
+            manifest.missing(gnu, VARIANT_HEADLESS, Some(CPU_X86_64_V3)),
+            "release v0.2.0 的发布清单里没有 x86_64-unknown-linux-gnu 的 headless（x86-64-v3）版本，这个目标只有 desktop（baseline、x86-64-v3）；headless（baseline）"
+        );
+        assert_eq!(
+            manifest.missing("riscv64gc-unknown-linux-gnu", VARIANT_HEADLESS, None),
+            "release v0.2.0 的发布清单里没有 riscv64gc-unknown-linux-gnu 的资产（清单里有的目标：x86_64-unknown-linux-gnu、x86_64-unknown-linux-musl）"
+        );
     }
 }

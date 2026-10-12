@@ -727,6 +727,7 @@ fn online_spec(version: Option<&str>, target: &str, variant: &str) -> OnlineSpec
         channel: aproxy::install::download::Channel::Pre,
         target: target.into(),
         variant: variant.into(),
+        cpu: None,
         prefer_v3: false,
     }
 }
@@ -847,6 +848,77 @@ async fn online_falls_back_to_musl_when_the_gnu_asset_does_not_run() {
     .unwrap();
     assert!(got.origin.contains("musl-bin"), "{}", got.origin);
     assert_eq!(std::fs::read(&dest).unwrap(), std::fs::read(&real).unwrap());
+}
+
+/// 清单里找不到要的「目标三元组 + 变体 [+ 指令集档]」时，错误如实列出这个目标有什么——
+/// 例如 musl 目标只发布 headless，要 desktop 时提示「这个目标只有 headless」；显式的
+/// `--cpu` 不退回别的档；linux-gnu 产物跑不起来、musl 又没有同变体时也这样说明。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn online_reports_what_a_target_offers_when_the_combination_is_missing() {
+    let home = TestHome::new();
+    let files = home.path().join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    let broken = files.join("broken");
+    std::fs::write(&broken, b"not an executable").unwrap();
+    let version = env!("CARGO_PKG_VERSION");
+    let gnu = "x86_64-unknown-linux-gnu";
+    let musl = "x86_64-unknown-linux-musl";
+    let manifest = manifest_file(
+        &files,
+        "m.json",
+        version,
+        vec![
+            asset(gnu, force::VARIANT_DESKTOP, "gnu-desktop", &broken),
+            asset(gnu, force::VARIANT_HEADLESS, "gnu-headless", &broken),
+            asset(musl, force::VARIANT_HEADLESS, "musl-headless", &broken),
+        ],
+    );
+    let api = serve_fake_github(vec![(
+        format!("v{version}"),
+        true,
+        vec![
+            (force::MANIFEST_ASSET.into(), manifest),
+            ("gnu-desktop".into(), broken.clone()),
+            ("gnu-headless".into(), broken.clone()),
+            ("musl-headless".into(), broken),
+        ],
+    )])
+    .await;
+    let dest = home
+        .path()
+        .join(format!("got{}", std::env::consts::EXE_SUFFIX));
+    let client = local_client();
+    let attempt = |spec: OnlineSpec| {
+        let (client, api, dest) = (client.clone(), api.clone(), dest.clone());
+        async move {
+            force::acquire_online(&client, &api, &spec, &dest)
+                .await
+                .unwrap_err()
+        }
+    };
+
+    let e = attempt(online_spec(Some(version), musl, force::VARIANT_DESKTOP)).await;
+    assert!(
+        e.contains(musl) && e.contains("这个目标只有 headless（baseline）"),
+        "{e}"
+    );
+    assert!(!dest.exists(), "找不到资产时什么都不下载");
+
+    let mut explicit_v3 = online_spec(Some(version), gnu, force::VARIANT_HEADLESS);
+    explicit_v3.cpu = Some(force::CPU_X86_64_V3.into());
+    let e = attempt(explicit_v3).await;
+    assert!(
+        e.contains("headless（x86-64-v3）")
+            && e.contains("这个目标只有 desktop（baseline）；headless（baseline）"),
+        "{e}"
+    );
+
+    // gnu 的 desktop 产物跑不起来，musl 又只有 headless
+    let e = attempt(online_spec(Some(version), gnu, force::VARIANT_DESKTOP)).await;
+    assert!(
+        e.contains("改用 musl 产物也不行") && e.contains("这个目标只有 headless（baseline）"),
+        "{e}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

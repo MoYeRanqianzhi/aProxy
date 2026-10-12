@@ -481,14 +481,16 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
   `--from`），在本机跑通 `--version` 之前什么都不停；确认（非终端要 `--yes`）→ 按台账
   结束安装者 → 拿锁 → 结束其余角色（连续两轮没有存活条目为止，有上限）→ 清空
   `install/` → swap → 用新二进制的 `restore` 拉回实例（被强制结束的实例留着
-  `.restore`），按台账看被结束实例的端口上有没有新的 instance 条目 → 报告台账外、从
+  `.restore`），按台账看被结束实例的端口上有没有新版本的 instance 条目 → 报告台账外、从
   bin 运行的进程（只报告）。退出码冻结：0 完成；10 什么都没动；11 进程已停、二进制没
   换；12 二进制已换、有实例没回来。契约样本钉在 `tests/force_contract.rs`
 - **台账**（`src/ledger.rs`，契约 C3）：实例、看护者与安装者在占端口或拉子进程之前原子
-  写入 `<home>/ledger/<pid>.json`（pid、启动标记、角色、版本，可选端口与说明），正常
-  退出删除，`process::exit` 一律经 `ledger::exit`。启动标记按平台冻结（Windows 创建时间
-  FILETIME、Linux boot_id + starttime、macOS proc_bsdinfo 的启动秒与微秒）；结束前在
-  同一个进程句柄（Windows）或 pidfd（Linux）上核验，pid 复用不会误杀。台账与实例
+  写入 `<home>/ledger/<pid>.json`（pid、启动标记、角色、版本，可选端口、说明与实例配置
+  文件的绝对路径 `config`），正常退出删除（Windows 上写入与删除短暂重试），
+  `process::exit` 一律经 `ledger::exit`。启动标记按平台冻结（Windows 创建时间
+  FILETIME、Linux boot_id + starttime、macOS proc_bsdinfo 的启动秒与微秒）；读者只处理
+  本平台前缀的条目，结束前在同一个进程句柄（Windows）或 pidfd（Linux）上核验启动标记
+  与属主（只结束当前用户的进程），pid 复用不会误杀；删条目前重读，`start` 仍一致才删。台账与实例
   注册表分开（G3）：注册表可以随版本演进，台账只回答「这个 home 有哪些 aproxy 进程、
   怎样确认 pid 仍是它」
 

@@ -22,9 +22,12 @@
 //! status/stop/IPC，可以随版本自由演进；台账只回答「这个 home 下有哪些 aproxy 进程、
 //! 怎样确认 pid 仍是它」，所以冻结得越少越好。
 //!
-//! 谁来读、读者的义务：强制安装。读者跳过解析不了的文件；忽略不认识的字段；不认识的
-//! `role` 照样结束，只是排在最后；条目对应的进程已死（pid 不在、或启动标记对不上——
-//! pid 已被复用给别的进程）时删掉条目；结束某个进程之后也删掉它的条目。
+//! 谁来读、读者的义务：强制安装。读者跳过解析不了的文件；忽略不认识的字段；只处理
+//! `start` 前缀属于本平台的条目，别的平台写的既不结束也不删除（见 [`read_all_in`]）；
+//! 不认识的 `role` 照样结束，只是排在最后；只结束属主与自己相同的进程（Windows 比较
+//! token 的 user SID，unix 比较 uid，见 [`terminate`]）；条目对应的进程已死（pid 不在、
+//! 或启动标记对不上——pid 已被复用给别的进程）时删掉条目，结束某个进程之后也删掉它的
+//! 条目，删除之前都要重读文件、`start` 仍一致才删（见 [`remove_if_unchanged`]）。
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -124,12 +127,21 @@ pub struct LedgerEntry {
     /// 写下条目时进程镜像的完整路径（可选），只供展示与排查
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exe: Option<String>,
+    /// 实例配置文件的绝对路径（可选；实例才有）。强制安装拉不回实例时据此告诉用户怎样
+    /// 启动它——`label` 是自由文本，不能拿来拼命令
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
 }
 
 impl LedgerEntry {
     /// 本进程的条目：pid 与启动标记现取，版本取本构建的版本。读不到启动标记（不支持的
     /// 平台）→ None。
-    pub fn for_current_process(role: &str, port: Option<u16>, label: Option<&str>) -> Option<Self> {
+    pub fn for_current_process(
+        role: &str,
+        port: Option<u16>,
+        label: Option<&str>,
+        config: Option<&Path>,
+    ) -> Option<Self> {
         let pid = std::process::id();
         Some(Self {
             ledger: LEDGER_FORMAT,
@@ -142,6 +154,7 @@ impl LedgerEntry {
             exe: std::env::current_exe()
                 .ok()
                 .map(|p| p.display().to_string()),
+            config: config.map(|p| p.display().to_string()),
         })
     }
 
@@ -200,9 +213,15 @@ impl Drop for Registration {
 
 /// 把本进程登记进 `home` 的台账：必须在占用端口或拉起任何子进程之前调用。写失败
 /// （目录不可写、平台读不到启动标记）只告警，照常返回守卫——台账只服务强制安装这条
-/// 兜底路径，不能挡住正常服务。
-pub fn register(home: &Path, role: &str, port: Option<u16>, label: Option<&str>) -> Registration {
-    match LedgerEntry::for_current_process(role, port, label) {
+/// 兜底路径，不能挡住正常服务。`config` 只有实例给（配置文件的绝对路径）。
+pub fn register(
+    home: &Path,
+    role: &str,
+    port: Option<u16>,
+    label: Option<&str>,
+    config: Option<&Path>,
+) -> Registration {
+    match LedgerEntry::for_current_process(role, port, label, config) {
         Some(entry) => match write_entry_in(home, &entry) {
             Ok(path) => *own_entry() = Some(path),
             Err(e) => tracing::warn!(
@@ -223,13 +242,17 @@ pub fn register(home: &Path, role: &str, port: Option<u16>, label: Option<&str>)
 /// 目标文件时，并发的读者可能读到写到一半的 JSON 而跳过它——强制安装恰好在这一刻扫描，
 /// 就会漏掉这个进程。同一个 pid 同一时刻只可能属于一个进程，临时文件名不会互踩；死去的
 /// 同 pid 进程留下的旧条目被直接覆盖（Windows 上 std::fs::rename 也会替换已存在的目标）。
+/// Windows 上失败时短暂重试几次（见 [`retrying`]）。
 pub fn write_entry_in(home: &Path, entry: &LedgerEntry) -> std::io::Result<PathBuf> {
     let dir = ledger_dir_in(home);
     std::fs::create_dir_all(&dir)?;
     let path = entry_path_in(home, entry.pid);
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, entry.to_json() + "\n")?;
-    match std::fs::rename(&tmp, &path) {
+    let written = retrying(|| {
+        std::fs::write(&tmp, entry.to_json() + "\n")?;
+        std::fs::rename(&tmp, &path)
+    });
+    match written {
         Ok(()) => Ok(path),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
@@ -238,10 +261,33 @@ pub fn write_entry_in(home: &Path, entry: &LedgerEntry) -> std::io::Result<PathB
     }
 }
 
+/// 删除一个台账文件；文件已经不在也算删掉了。Windows 上失败时短暂重试几次。
+fn remove_entry_file(path: &Path) -> std::io::Result<()> {
+    retrying(|| match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    })
+}
+
+/// Windows 上台账文件的写入、改名与删除失败时，隔几十到几百毫秒再试，共 5 次：杀毒软件、
+/// 索引服务可能正以不带共享删除权限的句柄开着目标文件，改名与删除会暂时失败；不重试，
+/// 这个进程就不进台账（强制安装看不见它），或者留下一条死条目。unix 没有这种占用，只做
+/// 一次。
+fn retrying<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    #[cfg(windows)]
+    for millis in [20, 50, 100, 200] {
+        if let Ok(value) = op() {
+            return Ok(value);
+        }
+        std::thread::sleep(Duration::from_millis(millis));
+    }
+    op()
+}
+
 /// 删掉本进程登记的条目（没登记过就什么都不做）。
 pub fn remove_own() {
     if let Some(path) = own_entry().take() {
-        let _ = std::fs::remove_file(path);
+        let _ = remove_entry_file(&path);
     }
 }
 
@@ -265,6 +311,11 @@ pub struct Found {
 
 /// 枚举 `home` 的台账：只看扩展名为 `json` 的文件，解析不了的跳过（不删——它可能是
 /// 别的版本按以后的格式写的，留给写它的进程自己收拾）。目录不存在 = 没有条目。
+///
+/// 只返回本平台写下的条目（`start` 的前缀是本平台的，见 [`own_platform`]）：别的系统写的
+/// 条目——WSL 与 Windows、容器与宿主共用了一个 home——里的 pid 在这边没有意义，按它核验
+/// 只会「标记对不上」，进而把那边仍在运行的进程的条目当成死条目删掉。所以它们在这里
+/// 看不见：既不结束，也不删除。一个 home 本就不支持跨操作系统或跨 pid 命名空间共用（C1）。
 pub fn read_all_in(home: &Path) -> Vec<Found> {
     let Ok(dir) = std::fs::read_dir(ledger_dir_in(home)) else {
         return Vec::new();
@@ -278,6 +329,7 @@ pub fn read_all_in(home: &Path) -> Vec<Found> {
         let Some(entry) = std::fs::read_to_string(&path)
             .ok()
             .and_then(|text| LedgerEntry::parse(&text))
+            .filter(own_platform)
         else {
             continue;
         };
@@ -285,6 +337,38 @@ pub fn read_all_in(home: &Path) -> Vec<Found> {
     }
     out.sort_by_key(|f| (f.entry.stop_order(), f.entry.pid));
     out
+}
+
+/// 条目是不是本平台写下的：`start` 以本平台的前缀（[`START_WINDOWS`]、[`START_LINUX`]、
+/// [`START_MACOS`]）开头。契约没有为其余平台定义前缀，那里任何条目都不算。
+pub fn own_platform(entry: &LedgerEntry) -> bool {
+    let prefix = if cfg!(windows) {
+        Some(START_WINDOWS)
+    } else if cfg!(target_os = "linux") {
+        Some(START_LINUX)
+    } else if cfg!(target_os = "macos") {
+        Some(START_MACOS)
+    } else {
+        None
+    };
+    prefix.is_some_and(|prefix| entry.start.starts_with(prefix))
+}
+
+/// 删掉读者读到的一条条目，前提是文件此刻仍是那一条：重读，pid 与 `start` 都一致才删
+/// （文件已经不在也算删掉了）。返回是否删掉。
+///
+/// 从读到条目到删除之间可能隔了好几秒——强制安装逐个结束进程，每个最多等十秒。这期间
+/// pid 若被复用给一个新的 aproxy 进程、它写下了自己的条目，盲删就会让它从台账里消失，
+/// 之后再也没有哪个强制安装看得见它。
+pub fn remove_if_unchanged(found: &Found) -> bool {
+    let current = match std::fs::read_to_string(&found.path) {
+        Ok(text) => LedgerEntry::parse(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    let unchanged =
+        current.is_some_and(|now| now.pid == found.entry.pid && now.start == found.entry.start);
+    unchanged && remove_entry_file(&found.path).is_ok()
 }
 
 /// `pid` 当前那个进程的启动标记，按冻结的推导方式（见 `START_*`）现算。进程不存在、
@@ -308,12 +392,20 @@ pub enum Termination {
     /// 进程已经不在（pid 不存在、启动标记对不上——pid 已被复用、或已经退出）：
     /// 条目作废，什么都没结束
     AlreadyGone,
-    /// 确认是条目里的进程，却结束不了（权限不足），或结束后在时限内没有退出
+    /// 确认是条目里的进程，属主却不是本进程的用户：不结束，条目也不删（它不归这里管）
+    NotOwned(String),
+    /// 确认是条目里的进程，却结束不了（权限不足、核对不了属主），或结束后在时限内没有退出
     Failed(String),
 }
 
 /// 核验后强制结束条目对应的进程，并等它真正退出（最多 `wait`）。只认 pid + 启动标记，
 /// 与进程叫什么、从哪里运行无关；核验不过就什么都不做（宁可漏杀，不可误杀）。
+///
+/// 只结束属主与本进程相同的进程（永久兼容契约 C3 的读者义务）：Windows 比较两边 token 的
+/// user SID，unix 比较 uid。台账在用户自己可写的目录里，谁都能往里写一条带着正确启动
+/// 标记的条目；以更高权限运行的强制安装若照单全收，就成了替低权限进程结束别人进程的
+/// 工具。属主不同 → [`Termination::NotOwned`]；属主核对不了 → [`Termination::Failed`]
+/// （分不清是不是自己的，就既不结束、也不当它不存在）。
 ///
 /// - Windows：打开进程句柄，在**同一个句柄**上用 GetProcessTimes 现算启动标记、比对，
 ///   通过才 TerminateProcess，然后在这个句柄上等它退出。句柄钉住了进程对象，句柄关闭
@@ -328,6 +420,20 @@ pub enum Termination {
 /// 阻塞调用（内部按毫秒级间隔等待）。
 pub fn terminate(entry: &LedgerEntry, wait: Duration) -> Termination {
     imp::terminate(entry.pid, &entry.start, wait)
+}
+
+/// unix：`owner` 是不是本进程的有效 uid。比的是有效 uid：sudo 运行的强制安装（有效 uid
+/// 为 0）不会结束普通用户的进程，反之亦然。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn owned_by_me(pid: u32, owner: u32) -> Result<(), String> {
+    let me = unsafe { libc::geteuid() };
+    if owner == me {
+        Ok(())
+    } else {
+        Err(format!(
+            "pid {pid} 属于 uid {owner}，不是当前用户（uid {me}）"
+        ))
+    }
 }
 
 /// unix 上等进程退出：轮询到标记不再一致（进程已被收割、pid 被复用）或成了 zombie。
@@ -357,9 +463,13 @@ mod imp {
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, GetLastError, WAIT_OBJECT_0,
     };
+    use windows_sys::Win32::Security::{
+        EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+        GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenProcessToken,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        TerminateProcess, WaitForSingleObject,
     };
 
     /// GetExitCodeProcess 对仍在运行的进程报告的值。退出码恰为 259 的进程无从区分
@@ -413,6 +523,54 @@ mod imp {
             let mut code = 0u32;
             unsafe { GetExitCodeProcess(self.0, &mut code) != 0 && code != STILL_ACTIVE }
         }
+
+        /// 它的属主（token 的 user SID）是否与本进程相同。Ok(true) 相同，Ok(false) 不同，
+        /// Err 是核对不了（打不开它的 token：以管理员身份运行的进程、别的用户的进程）。
+        fn same_owner(&self) -> Result<bool, String> {
+            let theirs = token_user(self.0)?;
+            let ours = token_user(unsafe { GetCurrentProcess() })?;
+            Ok(unsafe { EqualSid(theirs.sid(), ours.sid()) } != 0)
+        }
+    }
+
+    /// 一个进程 token 的 TOKEN_USER（变长结构，按 8 字节对齐存放）。
+    struct TokenUserBuf(Vec<u64>);
+
+    impl TokenUserBuf {
+        fn sid(&self) -> *mut std::ffi::c_void {
+            // 缓冲区由 GetTokenInformation(TokenUser) 填好，开头就是 TOKEN_USER
+            unsafe { (*(self.0.as_ptr() as *const TOKEN_USER)).User.Sid }
+        }
+    }
+
+    /// 读进程的 TOKEN_USER：先问长度，再按长度取。
+    fn token_user(process: isize) -> Result<TokenUserBuf, String> {
+        let mut token = 0isize;
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+            return Err(format!("打不开它的 token（Windows 错误码 {}）", unsafe {
+                GetLastError()
+            }));
+        }
+        // 借 Process 的析构关闭 token 句柄（CloseHandle 对任何内核对象句柄都适用）
+        let token = Process(token);
+        let mut len = 0u32;
+        unsafe { GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut len) };
+        let mut buf = TokenUserBuf(vec![0u64; (len as usize).div_ceil(8).max(1)]);
+        let ok = unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                buf.0.as_mut_ptr().cast(),
+                (buf.0.len() * 8) as u32,
+                &mut len,
+            )
+        };
+        if ok == 0 {
+            return Err(format!("读不到它的属主（Windows 错误码 {}）", unsafe {
+                GetLastError()
+            }));
+        }
+        Ok(buf)
     }
 
     pub fn start_marker(pid: u32) -> Option<String> {
@@ -434,20 +592,36 @@ mod imp {
             Ok(process) => process,
             Err(ERROR_INVALID_PARAMETER) => return Termination::AlreadyGone,
             Err(code) => {
-                // 多半是权限不足（例如进程以管理员身份运行，而强制安装没有）。用最小权限
-                // 再看一眼它是不是条目里的进程：是就如实报告结束不了；不是（pid 已被复用、
-                // 或已经退出）就作废条目
-                return if is_alive(pid, start) {
-                    Termination::Failed(format!(
-                        "无法以结束权限打开 pid {pid}（Windows 错误码 {code}，多半是权限不足：该进程以更高权限运行时，强制安装也要以同样的权限运行）"
-                    ))
-                } else {
-                    Termination::AlreadyGone
+                // 多半是权限不足：以管理员身份运行的进程、别的用户的进程。用最小权限再看一眼
+                // 它是不是条目里的进程：不是（pid 已被复用、已经退出，或者连查都查不了——本
+                // 用户的进程哪怕以管理员身份运行也查得到）就作废条目；是的话，属主不同就
+                // 不归这里管，否则如实报告结束不了。不建议提权重跑：提权的强制安装会结束
+                // 任何人写进台账的进程
+                let Ok(limited) = open(pid, PROCESS_QUERY_LIMITED_INFORMATION) else {
+                    return Termination::AlreadyGone;
+                };
+                if limited.marker().as_deref() != Some(start) || limited.exited() {
+                    return Termination::AlreadyGone;
+                }
+                return match limited.same_owner() {
+                    Ok(false) => Termination::NotOwned(format!("pid {pid} 不是当前用户的进程")),
+                    _ => Termination::Failed(format!(
+                        "无法结束 pid {pid}（Windows 错误码 {code}，权限不足：它可能以管理员身份运行）"
+                    )),
                 };
             }
         };
         if process.marker().as_deref() != Some(start) || process.exited() {
             return Termination::AlreadyGone;
+        }
+        match process.same_owner() {
+            Ok(true) => {}
+            Ok(false) => {
+                return Termination::NotOwned(format!("pid {pid} 不是当前用户的进程"));
+            }
+            Err(e) => {
+                return Termination::Failed(format!("无法核对 pid {pid} 的属主：{e}"));
+            }
         }
         if unsafe { TerminateProcess(process.0, 1) } == 0 {
             let err = std::io::Error::last_os_error();
@@ -470,6 +644,25 @@ mod imp {
                 "pid {pid} 已被结束，但 {} 秒内没有退出",
                 wait.as_secs()
             ))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// 本进程的属主就是本进程的用户；系统进程（pid 4）不是——打不开它时跳过那一侧。
+        #[test]
+        fn own_process_is_owned_by_the_current_user() {
+            let me =
+                open(std::process::id(), PROCESS_QUERY_LIMITED_INFORMATION).expect("本进程打得开");
+            assert_eq!(me.same_owner(), Ok(true));
+            match open(4, PROCESS_QUERY_LIMITED_INFORMATION) {
+                Ok(system) => assert_ne!(system.same_owner(), Ok(true)),
+                Err(code) => {
+                    eprintln!("打不开系统进程 pid 4（错误码 {code}），跳过「不是本用户」一侧")
+                }
+            }
         }
     }
 }
@@ -539,9 +732,23 @@ mod imp {
                 _ => None,
             }
         };
-        // 2. 核验：启动标记一致、且还没退出
+        // 2. 核验：启动标记一致、且还没退出；属主是本进程的用户（/proc/<pid> 目录的属主
+        //    就是进程的有效 uid）
         if !is_alive(pid, start) {
             return Termination::AlreadyGone;
+        }
+        let owner = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(format!("/proc/{pid}")).map(|meta| meta.uid())
+        };
+        match owner {
+            Ok(owner) => {
+                if let Err(e) = super::owned_by_me(pid, owner) {
+                    return Termination::NotOwned(e);
+                }
+            }
+            Err(_) if !is_alive(pid, start) => return Termination::AlreadyGone,
+            Err(e) => return Termination::Failed(format!("无法核对 pid {pid} 的属主：{e}")),
         }
         // 3. 发 SIGKILL：有 pidfd 走 pidfd_send_signal，否则 kill
         let sent = match &pidfd {
@@ -616,8 +823,15 @@ mod imp {
             Ok(raw) if raw > 0 => raw,
             _ => return Termination::AlreadyGone,
         };
-        if !is_alive(pid, start) {
+        // 核验：启动标记一致、且还没退出；属主（pbi_uid，有效 uid）是本进程的用户
+        let Some(info) = bsdinfo(pid) else {
             return Termination::AlreadyGone;
+        };
+        if info.pbi_status == libc::SZOMB || marker(&info) != start {
+            return Termination::AlreadyGone;
+        }
+        if let Err(e) = super::owned_by_me(pid, info.pbi_uid) {
+            return Termination::NotOwned(e);
         }
         // macOS 没有 pidfd：核验与 kill 之间的理论窗口同 Linux 的退路（见那里的说明）
         if unsafe { libc::kill(raw, libc::SIGKILL) } != 0 {
@@ -667,6 +881,7 @@ mod tests {
             port: None,
             label: None,
             exe: None,
+            config: None,
         };
         // 可选字段缺省时不写出
         assert_eq!(
@@ -687,6 +902,7 @@ mod tests {
             port: None,
             label: None,
             exe: None,
+            config: None,
         };
         let order: Vec<u8> = [
             ROLE_INSTALLER,
@@ -706,7 +922,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let path = entry_path_in(home.path(), std::process::id());
         {
-            let _guard = register(home.path(), ROLE_INSTALLER, None, Some("test"));
+            let _guard = register(home.path(), ROLE_INSTALLER, None, Some("test"), None);
             // 不支持的平台读不到启动标记，不写条目
             if start_marker(std::process::id()).is_none() {
                 assert!(!path.exists());
@@ -749,5 +965,113 @@ mod tests {
         }
         // 不存在的 pid 没有标记
         assert_eq!(start_marker(u32::MAX - 7), None);
+    }
+
+    fn entry_with(pid: u32, start: &str) -> LedgerEntry {
+        LedgerEntry {
+            ledger: LEDGER_FORMAT,
+            pid,
+            start: start.into(),
+            role: ROLE_INSTANCE.into(),
+            version: "0.2.0".into(),
+            port: None,
+            label: None,
+            exe: None,
+            config: None,
+        }
+    }
+
+    /// 本平台的启动标记前缀，与别的平台的一个前缀
+    fn prefixes() -> (&'static str, &'static str) {
+        if cfg!(windows) {
+            (START_WINDOWS, START_LINUX)
+        } else {
+            (START_LINUX, START_WINDOWS)
+        }
+    }
+
+    /// 读者只看本平台写下的条目：别的系统写的（共用 home 的 WSL 与 Windows）看不见，也就
+    /// 既不结束、也不删除。
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn readers_only_see_entries_of_their_own_platform() {
+        let home = tempfile::tempdir().unwrap();
+        let (own, foreign) = prefixes();
+        write_entry_in(home.path(), &entry_with(11, &format!("{own}1"))).unwrap();
+        write_entry_in(home.path(), &entry_with(12, &format!("{foreign}1"))).unwrap();
+        write_entry_in(home.path(), &entry_with(13, "x:1")).unwrap();
+        let pids: Vec<u32> = read_all_in(home.path())
+            .iter()
+            .map(|f| f.entry.pid)
+            .collect();
+        assert_eq!(pids, vec![11]);
+        assert!(entry_path_in(home.path(), 12).exists());
+    }
+
+    /// 删条目之前重读：文件已换成同 pid 的新条目（pid 被复用给了新的 aproxy 进程）就不删。
+    #[test]
+    fn an_entry_is_removed_only_while_it_is_still_the_one_read() {
+        let home = tempfile::tempdir().unwrap();
+        let (own, _) = prefixes();
+        let path = write_entry_in(home.path(), &entry_with(21, &format!("{own}1"))).unwrap();
+        let found = Found {
+            path: path.clone(),
+            entry: entry_with(21, &format!("{own}1")),
+        };
+        // 同一个 pid 换了一个进程：新条目留着
+        write_entry_in(home.path(), &entry_with(21, &format!("{own}2"))).unwrap();
+        assert!(!remove_if_unchanged(&found));
+        assert!(path.exists());
+        // 还是读到的那一条：删掉
+        write_entry_in(home.path(), &entry_with(21, &format!("{own}1"))).unwrap();
+        assert!(remove_if_unchanged(&found));
+        assert!(!path.exists());
+        // 已经不在：也算删掉了
+        assert!(remove_if_unchanged(&found));
+    }
+
+    /// Windows：目标文件正被不带共享删除权限的句柄开着（杀毒软件、索引服务）时，写台账
+    /// 短暂重试，句柄一放开就写成；删除同样。
+    #[cfg(windows)]
+    #[test]
+    fn ledger_writes_and_removals_retry_while_the_file_is_held() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let entry = entry_with(31, "w:1");
+        let path = write_entry_in(home.path(), &entry).unwrap();
+        let hold = |path: &Path| {
+            // FILE_SHARE_READ | FILE_SHARE_WRITE，不带 FILE_SHARE_DELETE：改名覆盖与删除都会失败
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x1 | 0x2)
+                .open(path)
+                .unwrap();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                drop(held);
+            })
+        };
+        let release = hold(&path);
+        let rewritten = write_entry_in(home.path(), &entry_with(31, "w:2"));
+        release.join().unwrap();
+        rewritten.unwrap();
+        assert_eq!(
+            LedgerEntry::parse(&std::fs::read_to_string(&path).unwrap()).map(|e| e.start),
+            Some("w:2".into())
+        );
+        let release = hold(&path);
+        let removed = remove_entry_file(&path);
+        release.join().unwrap();
+        removed.unwrap();
+        assert!(!path.exists());
+    }
+
+    /// unix：只认有效 uid 相同的进程。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn only_processes_of_the_effective_uid_are_owned() {
+        let me = unsafe { libc::geteuid() };
+        assert!(owned_by_me(1, me).is_ok());
+        assert!(owned_by_me(1, me.wrapping_add(1)).is_err());
     }
 }

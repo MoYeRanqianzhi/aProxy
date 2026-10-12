@@ -71,14 +71,17 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     let listen_addr = cfg.listen_addr.clone();
     let base_url = cfg.base_url.clone();
     // 进程台账（永久兼容契约 C3）：占用端口之前登记，`aproxy install --force` 靠它找到并
-    // 结束本实例；端口取配置里的监听端口（强制安装据此核对 restore 有没有把实例拉回来，
-    // 拉不回的按它列给用户），label 是配置文件路径（用户手动重启时要用）。正常退出由
-    // 守卫删除；下面经 process::exit 的路径一律改走 ledger::exit，同样会删
+    // 结束本实例；端口取配置里的监听端口（强制安装据此核对 restore 有没有把实例拉回来），
+    // config 是配置文件的绝对路径（拉不回的实例，强制安装据此告诉用户怎样启动），label
+    // 是给人看的同一路径。正常退出由守卫删除；下面经 process::exit 的路径一律改走
+    // ledger::exit，同样会删
+    let cfg_abs = std::path::absolute(cfg_path).unwrap_or_else(|_| cfg_path.to_path_buf());
     let _ledger = aproxy::ledger::register(
         &settings::home(),
         aproxy::ledger::ROLE_INSTANCE,
         daemon::port_of(&listen_addr).parse().ok(),
         Some(&cfg_path.display().to_string()),
+        Some(&cfg_abs),
     );
     // spool 残留清理（disk_cache）：bind 前清空本端口的 spool 目录——目录
     // 归本进程独占，启动时清空即可回收崩溃/强杀残留的临时文件。

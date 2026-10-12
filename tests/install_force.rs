@@ -273,6 +273,7 @@ fn write_entry(home: &Path, pid: u32, start: String, role: &str) -> PathBuf {
             port: None,
             label: Some("test".into()),
             exe: None,
+            config: None,
         },
     )
     .unwrap()
@@ -376,7 +377,12 @@ fn an_instance_that_does_not_come_back_is_listed_with_12() {
 
     let (code, output) = home.force_install(&["--from", next.to_str().unwrap()]);
     assert_eq!(code, Some(force::EXIT_NOT_RESTORED), "{output}");
-    assert!(output.contains(&format!("端口 {port}")), "{output}");
+    // 按台账条目的 config（配置文件的绝对路径）告诉用户怎样启动
+    assert!(
+        output.contains(&format!("端口 {port}：aproxy start --config"))
+            && output.contains("gone.toml"),
+        "{output}"
+    );
     assert!(!ledger::is_alive(&instance));
     assert_eq!(
         std::fs::read(bin_path_in(home.path())).unwrap(),
@@ -386,8 +392,9 @@ fn an_instance_that_does_not_come_back_is_listed_with_12() {
 
 // ---------------------------------------------------------------------------
 // 3. 台账：安装者与不认识的角色都按台账结束；pid 对得上、启动标记对不上的进程（pid
-//    已被复用给别人）不结束、只删条目；进程已不在的条目删掉；解析不了的文件不动。
-//    install/ 里旧安装留下的一切被清空，锁留下。从 bin 运行、不在台账里的进程只报告
+//    已被复用给别人）不结束、只删条目；进程已不在的条目删掉；解析不了的文件不动；别的
+//    平台写的条目（WSL 与 Windows 共用 home）既不结束也不删。install/ 里旧安装留下的
+//    一切被清空，锁留下。从 bin 运行、不在台账里的进程只报告
 // ---------------------------------------------------------------------------
 #[test]
 fn only_verified_ledger_processes_are_stopped() {
@@ -396,6 +403,7 @@ fn only_verified_ledger_processes_are_stopped() {
     let mut installer = sleeper();
     let mut future = sleeper();
     let mut stranger = sleeper();
+    let mut foreigner = sleeper();
     let marker = |child: &Child| ledger::start_marker(child.id()).expect("子进程的启动标记可查");
     let installer_entry = write_entry(
         home.path(),
@@ -417,6 +425,18 @@ fn only_verified_ledger_processes_are_stopped() {
         u32::MAX - 7,
         marker(&installer),
         ledger::ROLE_WATCHDOG,
+    );
+    // 别的平台写的条目：pid 恰好是一个正在运行的进程，前缀却不是本平台的
+    let foreign_prefix = if cfg!(windows) {
+        ledger::START_LINUX
+    } else {
+        ledger::START_WINDOWS
+    };
+    let foreign_entry = write_entry(
+        home.path(),
+        foreigner.id(),
+        format!("{foreign_prefix}1"),
+        ledger::ROLE_INSTANCE,
     );
     let garbage = ledger::ledger_dir_in(home.path()).join("garbage.json");
     std::fs::write(&garbage, "{ not a ledger entry").unwrap();
@@ -455,8 +475,15 @@ fn only_verified_ledger_processes_are_stopped() {
     let installer_gone = exited_within(&mut installer, Duration::from_secs(5));
     let future_gone = exited_within(&mut future, Duration::from_secs(5));
     let stranger_alive = stranger.try_wait().unwrap().is_none();
+    let foreigner_alive = foreigner.try_wait().unwrap().is_none();
     let stray_alive = stray.try_wait().unwrap().is_none();
-    for child in [&mut installer, &mut future, &mut stranger, &mut stray] {
+    for child in [
+        &mut installer,
+        &mut future,
+        &mut stranger,
+        &mut foreigner,
+        &mut stray,
+    ] {
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -465,6 +492,8 @@ fn only_verified_ledger_processes_are_stopped() {
     assert!(installer_gone, "安装者应按台账被结束: {output}");
     assert!(future_gone, "不认识的角色也应被结束: {output}");
     assert!(stranger_alive, "启动标记对不上的进程绝不能被结束: {output}");
+    assert!(foreigner_alive, "别的平台写的条目不归这里管: {output}");
+    assert!(foreign_entry.exists(), "别的平台写的条目不删");
     assert!(stray_alive, "不在台账里的进程只报告、不结束: {output}");
     for entry in [
         &installer_entry,

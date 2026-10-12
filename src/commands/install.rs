@@ -31,6 +31,7 @@ pub(crate) async fn handle_force_cmd(args: &InstallArgs) -> ! {
         aproxy::ledger::ROLE_INSTALLER,
         None,
         Some("install --force"),
+        None,
     );
     let source = match &args.from {
         Some(from) => force::ForceSource::File(aproxy::settings::expand_path(from)),
@@ -70,6 +71,7 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
             } else {
                 "install"
             }),
+            None,
         )
     });
     if args.continue_ {

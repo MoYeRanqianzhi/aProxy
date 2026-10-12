@@ -433,9 +433,19 @@ fn c3_ledger_entry_json() {
             port: Some(12345),
             label: Some(r"C:\Users\me\.aproxy\config.toml".into()),
             exe: Some(r"C:\Users\me\.aproxy\bin\aproxy.exe".into()),
+            config: None,
         }
     );
     assert_eq!(entry.to_json(), full);
+
+    // 追加的可选字段 config（2026-10-12，实例配置文件的绝对路径）：写在 exe 之后
+    let with_config = r#"{"ledger":1,"pid":4242,"start":"w:133730123456789012","role":"instance","version":"0.2.0","port":12345,"label":"main","config":"C:\\Users\\me\\.aproxy\\config.toml"}"#;
+    let entry = LedgerEntry::parse(with_config).expect("带 config 的条目可解析");
+    assert_eq!(
+        entry.config.as_deref(),
+        Some(r"C:\Users\me\.aproxy\config.toml")
+    );
+    assert_eq!(entry.to_json(), with_config);
 
     // 可选字段缺省时不写出，也能读
     let minimal = r#"{"ledger":1,"pid":7,"start":"l:6f1c2d3e-0000-4000-8000-000000000001:123456","role":"watchdog","version":"0.2.0"}"#;
@@ -443,6 +453,7 @@ fn c3_ledger_entry_json() {
     assert_eq!(entry.port, None);
     assert_eq!(entry.label, None);
     assert_eq!(entry.exe, None);
+    assert_eq!(entry.config, None);
     assert_eq!(entry.to_json(), minimal);
 }
 
@@ -476,21 +487,42 @@ fn c3_readers_tolerate_the_future_and_skip_garbage() {
         assert_eq!(LedgerEntry::parse(bad), None, "{bad}");
     }
 
-    // 读者只看 `*.json`：写到一半的 `<pid>.json.tmp` 与解析不了的文件都跳过，且不删
+    // 读者只看 `*.json`、只看本平台写下的条目（`start` 的前缀是本平台的）：写到一半的
+    // `<pid>.json.tmp`、解析不了的文件、别的平台写的条目（WSL 与 Windows 共用了 home）
+    // 都跳过，且不删——那边的 pid 在这边没有意义，按它核验只会把那边活着的进程当成死的
+    let own = if cfg!(windows) {
+        ledger::START_WINDOWS
+    } else if cfg!(target_os = "macos") {
+        ledger::START_MACOS
+    } else {
+        ledger::START_LINUX
+    };
+    let foreign = [
+        ledger::START_WINDOWS,
+        ledger::START_LINUX,
+        ledger::START_MACOS,
+    ]
+    .into_iter()
+    .find(|p| *p != own)
+    .unwrap();
+    let with_start = |pid: u32, start: &str| {
+        future
+            .replace("\"pid\":9", &format!("\"pid\":{pid}"))
+            .replace("m:1760256000.5", start)
+    };
     let home = temp_home();
     let dir = ledger::ledger_dir_in(home.path());
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("9.json"), future).unwrap();
-    std::fs::write(
-        dir.join("10.json.tmp"),
-        future.replace("\"pid\":9", "\"pid\":10"),
-    )
-    .unwrap();
+    std::fs::write(dir.join("9.json"), with_start(9, &format!("{own}1"))).unwrap();
+    std::fs::write(dir.join("10.json.tmp"), with_start(10, &format!("{own}1"))).unwrap();
     std::fs::write(dir.join("11.json"), "{ half").unwrap();
+    std::fs::write(dir.join("12.json"), with_start(12, &format!("{foreign}1"))).unwrap();
     let found = ledger::read_all_in(home.path());
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].entry.pid, 9);
-    assert!(dir.join("11.json").exists() && dir.join("10.json.tmp").exists());
+    for kept in ["10.json.tmp", "11.json", "12.json"] {
+        assert!(dir.join(kept).exists(), "{kept}");
+    }
 }
 
 #[test]
@@ -560,7 +592,8 @@ fn c3_start_marker_formats() {
             assert!(usec.parse::<u32>().unwrap() < 1_000_000, "{marker}");
         }
         // 自己的条目判为在运行；同一个 pid 配上别的标记，就不是它
-        let mine = LedgerEntry::for_current_process(ledger::ROLE_INSTALLER, None, None).unwrap();
+        let mine =
+            LedgerEntry::for_current_process(ledger::ROLE_INSTALLER, None, None, None).unwrap();
         assert!(ledger::is_alive(&mine));
         let stranger = LedgerEntry {
             start: format!("{marker}0"),
@@ -948,7 +981,13 @@ fn c8_lock_holding_installer_helper() {
         "持锁的安装者只在临时目录里的 home 运行: {}",
         home.display()
     );
-    let _entry = ledger::register(&home, ledger::ROLE_INSTALLER, None, Some("lock holder"));
+    let _entry = ledger::register(
+        &home,
+        ledger::ROLE_INSTALLER,
+        None,
+        Some("lock holder"),
+        None,
+    );
     let _lock = aproxy::install::lock_install_in(&home, std::time::Duration::from_secs(5)).unwrap();
     std::fs::write(home.join("holder-ready"), b"").unwrap();
     std::thread::sleep(std::time::Duration::from_secs(120));

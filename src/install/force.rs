@@ -24,16 +24,17 @@
 //! 2. 确认（提示写到标准错误）：会中断所有经 aproxy 的在途请求，包括 agent 自己经 aproxy
 //!    的会话。`--yes` 跳过；标准输入不是终端又没有 `--yes` → 10，不卡着等输入。
 //! 3. 按台账结束安装者（本进程除外）→ 拿安装锁 → 结束看护者、实例、桌面界面与不认识
-//!    的角色；反复扫描直到连续两轮没有存活条目（有上限）。从这一步起，二进制换好之前的
-//!    任何失败 → 11。
+//!    的角色；反复扫描直到连续两轮没有存活条目（有上限）。结束前核验启动标记与属主（只
+//!    结束当前用户的进程，见 `ledger::terminate`）。从这一步起，二进制换好之前的任何失败
+//!    → 11。
 //! 4. 清空 `<home>/install/`（保留锁与本次的目标文件）：留下的 install.state 会让续作在
 //!    强制安装之后接着推进一个旧的安装。
 //! 5. 换 `bin/` 里的二进制（唯一中间名，见 `super::swap`），落位后在新位置再跑一次
 //!    `--version` 核对。
 //! 6. 尽力调用新版本的 `restore`。被强制结束的实例留下了 `.restore` 记录，restore 正是
 //!    凭它把实例拉回来，所以强制安装不删 `.restore`（`stop --force` 会删，两者不同）。
-//!    是否拉回只按台账判断：被结束实例的端口上出现了新的 instance 条目才算；没回来的按
-//!    端口与说明列出 → 12。
+//!    是否拉回只按台账判断：被结束实例的端口上出现了新的、版本等于目标版本的 instance
+//!    条目才算；没回来的按端口与配置文件（条目的 `config`）列出怎样启动 → 12。
 //! 7. 报告不在台账里、却从 `<home>/bin/` 运行的进程（例如 0.1.x 留下的），只报告、
 //!    不结束。
 //!
@@ -693,34 +694,48 @@ fn describe(entry: &LedgerEntry) -> String {
     text
 }
 
+/// 第 3 步的进度：结束了哪些、因属主不同跳过了哪些（两次扫描共用）。
+#[derive(Default)]
+struct Stops {
+    stopped: Vec<LedgerEntry>,
+    /// 属主不是当前用户的进程：不结束、条目不删，每个只报告一次
+    skipped: Vec<LedgerEntry>,
+}
+
 /// 按台账结束进程，本进程除外：`only_installers` 时只结束安装者（第 3 步拿锁之前），
 /// 否则全部角色，先后见 `LedgerEntry::stop_order`（不认识的角色排在最后）。条目对应的
-/// 进程已经不在就删掉条目；结束之后也删掉。反复扫描，直到连续两轮没有存活的条目：
-/// 结束看护者与实例的同时，别的进程可能正在拉起新的（实例的自检补种看护者、正在
-/// 启动的实例），它们都在占端口或拉子进程之前登记，下一轮就会被看到。
-fn stop_by_ledger(
-    home: &Path,
-    only_installers: bool,
-    stopped: &mut Vec<LedgerEntry>,
-) -> Result<(), String> {
+/// 进程已经不在就删掉条目；结束之后也删掉——删之前都重读一遍，确认还是那一条
+/// （`ledger::remove_if_unchanged`）。属主不是当前用户的跳过并报告。反复扫描，直到连续
+/// 两轮没有新结束的进程：结束看护者与实例的同时，别的进程可能正在拉起新的（实例的
+/// 自检补种看护者、正在启动的实例），它们都在占端口或拉子进程之前登记，下一轮就会被
+/// 看到。
+fn stop_by_ledger(home: &Path, only_installers: bool, stops: &mut Stops) -> Result<(), String> {
     let me = std::process::id();
     let mut quiet_rounds = 0;
     for _ in 0..MAX_STOP_ROUNDS {
         let mut stopped_any = false;
         for found in ledger::read_all_in(home) {
             let entry = &found.entry;
-            if entry.pid == me || (only_installers && entry.role != ROLE_INSTALLER) {
+            let skipped = stops
+                .skipped
+                .iter()
+                .any(|s| s.pid == entry.pid && s.start == entry.start);
+            if entry.pid == me || skipped || (only_installers && entry.role != ROLE_INSTALLER) {
                 continue;
             }
             match ledger::terminate(entry, KILL_WAIT) {
                 ledger::Termination::Terminated => {
                     outln!("  已结束 {}", describe(entry));
-                    let _ = std::fs::remove_file(&found.path);
+                    ledger::remove_if_unchanged(&found);
                     stopped_any = true;
-                    stopped.push(entry.clone());
+                    stops.stopped.push(entry.clone());
                 }
                 ledger::Termination::AlreadyGone => {
-                    let _ = std::fs::remove_file(&found.path);
+                    ledger::remove_if_unchanged(&found);
+                }
+                ledger::Termination::NotOwned(e) => {
+                    outln!("  跳过 {}：{e}（只结束当前用户的进程）", describe(entry));
+                    stops.skipped.push(entry.clone());
                 }
                 ledger::Termination::Failed(e) => {
                     return Err(format!("无法结束 {}：{e}", describe(entry)));
@@ -826,10 +841,28 @@ impl Relay {
     }
 }
 
+/// 被结束的实例 `killed` 有没有回来：`live`（仍在运行的条目）里有同一个端口、pid 不同、
+/// 版本等于目标版本的 instance 条目。版本也要对：同一个端口上若是别人用旧二进制拉起的
+/// 实例，它不是这次恢复的结果，算「回来了」就会掩盖新版本起不来的问题。
+fn came_back(killed: &LedgerEntry, live: &[LedgerEntry], target_version: &str) -> bool {
+    killed.port.is_some_and(|port| {
+        live.iter().any(|e| {
+            e.role == ROLE_INSTANCE
+                && e.port == Some(port)
+                && e.pid != killed.pid
+                && e.version == target_version
+        })
+    })
+}
+
 /// 第 6 步：用新位置的二进制执行 `restore`（继承本进程的环境，输出经 [`Relay`] 转写，有
-/// 上限），然后按台账核对被结束的实例有没有回来：同一个端口上出现了 pid 不同、仍在运行的
-/// instance 条目才算。返回没回来的那些。
-fn restore_and_check(home: &Path, work: &Path, stopped: &[LedgerEntry]) -> Vec<LedgerEntry> {
+/// 上限），然后按台账核对被结束的实例有没有回来（[`came_back`]）。返回没回来的那些。
+fn restore_and_check(
+    home: &Path,
+    work: &Path,
+    stopped: &[LedgerEntry],
+    target_version: &str,
+) -> Vec<LedgerEntry> {
     let killed: Vec<&LedgerEntry> = stopped.iter().filter(|e| e.role == ROLE_INSTANCE).collect();
     let bin = swap::bin_path_in(home);
     outln!("用新版本恢复实例（{} restore）……", bin.display());
@@ -876,17 +909,14 @@ fn restore_and_check(home: &Path, work: &Path, stopped: &[LedgerEntry]) -> Vec<L
     }
     let deadline = Instant::now() + RETURN_WAIT;
     loop {
-        let back: Vec<LedgerEntry> = ledger::read_all_in(home)
+        let live: Vec<LedgerEntry> = ledger::read_all_in(home)
             .into_iter()
             .map(|found| found.entry)
-            .filter(|e| e.role == ROLE_INSTANCE && ledger::is_alive(e))
+            .filter(ledger::is_alive)
             .collect();
         let missing: Vec<LedgerEntry> = killed
             .iter()
-            .filter(|k| {
-                !k.port
-                    .is_some_and(|port| back.iter().any(|b| b.port == Some(port) && b.pid != k.pid))
-            })
+            .filter(|k| !came_back(k, &live, target_version))
             .map(|k| (*k).clone())
             .collect();
         if missing.is_empty() || Instant::now() >= deadline {
@@ -1187,7 +1217,7 @@ async fn acquire_from_github(
 /// 第 3–7 步。从这里起出错就不再是「什么都没动」：二进制换好之前的失败是 11，换好之后
 /// 有实例没回来是 12。
 fn replace(home: &Path, target: &Acquired, work: &Path) -> i32 {
-    let mut stopped = Vec::new();
+    let mut stops = Stops::default();
     let fail_stopped = |stopped: &[LedgerEntry], e: &str| {
         errln!("[ERROR] {e}");
         if stopped.is_empty() {
@@ -1203,16 +1233,17 @@ fn replace(home: &Path, target: &Acquired, work: &Path) -> i32 {
 
     // ---- 第 3 步：先结束安装者（它们可能持有安装锁、正在改 bin/），再拿锁，再结束其余
     outln!("结束 aproxy 进程……");
-    if let Err(e) = stop_by_ledger(home, true, &mut stopped) {
-        return fail_stopped(&stopped, &e);
+    if let Err(e) = stop_by_ledger(home, true, &mut stops) {
+        return fail_stopped(&stops.stopped, &e);
     }
     let lock = match super::lock_install_in(home, LOCK_WAIT) {
         Ok(lock) => lock,
-        Err(e) => return fail_stopped(&stopped, &e),
+        Err(e) => return fail_stopped(&stops.stopped, &e),
     };
-    if let Err(e) = stop_by_ledger(home, false, &mut stopped) {
-        return fail_stopped(&stopped, &e);
+    if let Err(e) = stop_by_ledger(home, false, &mut stops) {
+        return fail_stopped(&stops.stopped, &e);
     }
+    let Stops { stopped, skipped } = stops;
 
     // ---- 第 4 步
     if let Err(e) = clear_install_dir(home, work) {
@@ -1234,7 +1265,7 @@ fn replace(home: &Path, target: &Acquired, work: &Path) -> i32 {
     }
 
     // ---- 第 6 步
-    let missing = restore_and_check(home, work, &stopped);
+    let missing = restore_and_check(home, work, &stopped, &target.line.version);
 
     // ---- 第 7 步
     report_strays(home);
@@ -1248,6 +1279,12 @@ fn replace(home: &Path, target: &Acquired, work: &Path) -> i32 {
     if stopped.iter().any(|e| e.role == ROLE_DESKTOP) {
         outln!("桌面界面已被结束，需要时重新打开。");
     }
+    if !skipped.is_empty() {
+        outln!(
+            "注意：上面跳过的 {} 个进程不属于当前用户，强制安装没有结束它们，它们仍在运行原来的版本。",
+            skipped.len()
+        );
+    }
     outln!(
         "skill 文档没有更新（强制安装不碰它们）：之后执行 `aproxy install --skills-only` 更新到与新版本一致。"
     );
@@ -1256,14 +1293,19 @@ fn replace(home: &Path, target: &Acquired, work: &Path) -> i32 {
         return EXIT_DONE;
     }
     errln!(
-        "[ERROR] 二进制已换好，但下面这些被结束的实例没有回来（退出码 {EXIT_NOT_RESTORED}），请手动启动（aproxy start <别名|配置文件路径>）："
+        "[ERROR] 二进制已换好，但下面这些被结束的实例没有回来（退出码 {EXIT_NOT_RESTORED}），请手动启动："
     );
     for entry in &missing {
-        match (entry.port, &entry.label) {
-            (Some(port), Some(label)) => errln!("  端口 {port}（{label}）"),
-            (Some(port), None) => errln!("  端口 {port}"),
-            (None, Some(label)) => errln!("  {label}（pid {}）", entry.pid),
-            (None, None) => errln!("  pid {}", entry.pid),
+        let which = match entry.port {
+            Some(port) => format!("端口 {port}"),
+            None => format!("pid {}", entry.pid),
+        };
+        // 条目的 config 是配置文件的绝对路径，能直接拼出启动命令；label 是自由文本，只
+        // 能照抄给人看（没有 config 的条目来自更早的版本）
+        match (&entry.config, &entry.label) {
+            (Some(config), _) => errln!("  {which}：aproxy start --config \"{config}\""),
+            (None, Some(label)) => errln!("  {which}（{label}）：aproxy start <别名|配置文件路径>"),
+            (None, None) => errln!("  {which}：aproxy start <别名|配置文件路径>"),
         }
     }
     errln!(
@@ -1322,6 +1364,37 @@ mod tests {
                 .map(|a| a.file.as_str()),
             Some("d-v3")
         );
+    }
+
+    #[test]
+    fn an_instance_comes_back_only_on_its_port_with_the_target_version() {
+        let entry = |pid: u32, role: &str, port: Option<u16>, version: &str| LedgerEntry {
+            ledger: ledger::LEDGER_FORMAT,
+            pid,
+            start: format!("w:{pid}"),
+            role: role.into(),
+            version: version.into(),
+            port,
+            label: None,
+            exe: None,
+            config: None,
+        };
+        let killed = entry(10, ROLE_INSTANCE, Some(12345), "0.2.0");
+        let back = |live: Vec<LedgerEntry>| came_back(&killed, &live, "0.3.0");
+        assert!(back(vec![entry(11, ROLE_INSTANCE, Some(12345), "0.3.0")]));
+        // 同一端口上是旧版本的实例：别人拉起的，不是这次恢复的结果
+        assert!(!back(vec![entry(11, ROLE_INSTANCE, Some(12345), "0.2.0")]));
+        // 别的端口、同一个 pid（还是被结束的那个）、不是实例：都不算
+        assert!(!back(vec![entry(11, ROLE_INSTANCE, Some(12346), "0.3.0")]));
+        assert!(!back(vec![entry(10, ROLE_INSTANCE, Some(12345), "0.3.0")]));
+        assert!(!back(vec![entry(11, ROLE_WATCHDOG, Some(12345), "0.3.0")]));
+        // 没有端口的被结束实例无从核对，算没回来
+        let portless = entry(10, ROLE_INSTANCE, None, "0.2.0");
+        assert!(!came_back(
+            &portless,
+            &[entry(11, ROLE_INSTANCE, None, "0.3.0")],
+            "0.3.0"
+        ));
     }
 
     #[test]

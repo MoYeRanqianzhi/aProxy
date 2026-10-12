@@ -39,7 +39,7 @@
 - **Q3** 0.1.x 旧键里「承载行为」的四个，是告警还是拒绝启动。
 
 与 W2b 的接缝：
-- unix 的安装宣告挪进 `<home>/install/announce`，C4 的 /dev/shm 例外从此不再被写（§4.1）。
+- unix 的安装宣告挪进 `<home>/install/announce`，C4 不再有例外（alpha.1 已落地，§4.1）。
 - 台账与实例记录分开（G3）。
 - `--version` 先于语言判定短路（G2，§9.2）。
 - 通用退出码只用 0–5（G5）。
@@ -463,8 +463,9 @@ Windows 内核对象（A）：
 - 心跳：节或文件的前 8 字节是小端 u64 毫秒时间戳（A）。
 - 安装宣告：沿用现行的 16 字节布局 `{installer_pid, heartbeat_ms}`（announce.rs:41-45，A）；unix 上的文件挪到 `<home>/install/announce`。
 - **与 W2b 的协调**：
-  - C4 的例外是「Linux 的安装宣告在 /dev/shm」，从 0.2.0 起不再有版本写它。新位置在 `install/` 下，强制安装第 4 步清空 `install/` 时就清掉了；
-    旧位置照旧清理。C4 的文字不必改，它描述的清理义务仍然成立。请 W2b 负责人确认。
+  - 已在 alpha.1 落地（6671ff2、bc18fda，W2b 负责人确认）：unix 的安装宣告是 `<home>/install/announce`，C4 随之改为「没有例外」，
+    强制安装第 4 步清空 `install/` 时就清掉了；没有 state.json 时续作删掉过期的宣告。旧的 /dev/shm 位置只有早期开发构建写过
+    （tmpfs，重启即无），不读也不清理。
   - 台账（C3）与实例记录分开（G3）：台账只回答「这个 home 里有哪些 aproxy 进程、怎样结束它们」；实例记录服务 status 与界面，可以演进。
 
 ### 4.2 记录

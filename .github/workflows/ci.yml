@@ -9,6 +9,15 @@ name: CI
 # 从未进入任何门禁）。不改用 default-members 的理由见 Cargo.toml [workspace] 注释。
 # --no-fail-fast：某个测试二进制失败后仍跑完其余二进制，一次拿到完整失败面
 # （默认行为会在首个失败的二进制处停下，后面的集成测试结论全部缺席）。
+#
+# 两种变体各跑一遍（matrix.variant）：
+# - desktop（默认特性，带桌面界面）：先用 Node 构建前端——aproxy-desktop 的 build.rs
+#   在 aproxy-desktop/dist 缺失时报错，不拿占位页面凑数；Linux 另装 WebKitGTK 开发包。
+# - headless（--no-default-features）：同时 --exclude aproxy-desktop——它是 workspace
+#   成员，--workspace 会把它当作选中的包编译，--no-default-features 管不到它。这一路
+#   不装 Node、不装 WebKitGTK，顺带证明无界面版本不需要它们。
+# 两种变体都对构建出的 aproxy 跑 --version 冒烟（永久兼容契约 C5）：带界面的 exe 在
+# Windows 上缺 Common-Controls v6 清单时会在 main 之前就退出（RT-05），这一步挡住它。
 
 on:
   push:
@@ -30,6 +39,15 @@ env:
 jobs:
   windows:
     # 主开发平台：全量验证。零警告（-D warnings）是项目纪律。
+    name: windows (${{ matrix.variant }})
+    strategy:
+      fail-fast: false # 两种变体各自跑完，一次看到全部失败面
+      matrix:
+        include:
+          - variant: desktop
+            flags: ""
+          - variant: headless
+            flags: --exclude aproxy-desktop --no-default-features
     runs-on: windows-latest
     steps:
       # persist-credentials: false：不把 token 写进 .git/config——后续步骤会执行
@@ -40,21 +58,53 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      # 两种变体的编译产物不同，缓存分开存（rust-cache 的自动键不含 matrix 取值）
       - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: ${{ matrix.variant }}
+      - uses: actions/setup-node@v7.1.0
+        if: matrix.variant == 'desktop'
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: aproxy-desktop/ui/package-lock.json
+      # npm run build 先跑 svelte-check（--fail-on-warnings），再由 Vite 输出到 aproxy-desktop/dist
+      - name: Build the desktop front end
+        if: matrix.variant == 'desktop'
+        working-directory: aproxy-desktop/ui
+        run: |
+          npm ci
+          npm run build
+      # 格式与特性无关，跑一遍就够
+      - if: matrix.variant == 'desktop'
+        run: cargo fmt --all -- --check
       # --locked：Cargo.lock 是权威解析（windows-sys 精确钉死的历史教训——
       # 无锁重解析曾观察到直接依赖漂移到不兼容的新版本线）
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace ${{ matrix.flags }} --all-targets --locked -- -D warnings
       # 不带目标过滤的 cargo test 会顺带编译 examples——transform_integration
       # 依赖已编译的 examples/format-echo，加 --lib/--test 过滤时须另行构建
-      - run: cargo test --workspace --locked --no-fail-fast --verbose
+      - run: cargo test --workspace ${{ matrix.flags }} --locked --no-fail-fast --verbose
+      - name: Smoke-test --version (C5)
+        shell: bash
+        run: bash .github/scripts/version-smoke.sh target/debug/aproxy.exe ${{ matrix.variant }}
 
   ubuntu:
     # unix 分支已在 Ubuntu/WSL 实测全绿（2026-09-11，见团队记忆
     # install-three-platform-e2e）——CI 从编译面 check 升级为真实测试门槛，
     # 防止 unix-only 代码的编译/行为回归再次溜进 main。
     # 与 macOS 拆成独立 job：macOS 已知红（见下）时，ubuntu 的结论仍然单独可读。
-    runs-on: ubuntu-latest
+    # 钉 24.04 而不跟 ubuntu-latest：带界面的变体编译要系统的 libwebkit2gtk-4.1-dev，
+    # 镜像换代时包名与版本可能跟着变，换镜像要当作一次有意的改动。
+    name: ubuntu (${{ matrix.variant }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: desktop
+            flags: ""
+          - variant: headless
+            flags: --exclude aproxy-desktop --no-default-features
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -63,9 +113,43 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: ${{ matrix.variant }}
+      # 只装 webkit2gtk-4.1 的开发包（它带进 GTK3、libsoup3、JavaScriptCore 的开发包）。Tauri
+      # 文档列的其余几项这里用不到：libssl-dev（aproxy 走 rustls）、libxdo-dev（没开
+      # linux-libxdo）、libayatana-appindicator3-dev 与 librsvg2-dev（没开托盘），build-essential
+      # 与 pkg-config 镜像自带
+      - name: Install WebKitGTK
+        if: matrix.variant == 'desktop'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev
+      - uses: actions/setup-node@v7.1.0
+        if: matrix.variant == 'desktop'
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: aproxy-desktop/ui/package-lock.json
+      - name: Build the desktop front end
+        if: matrix.variant == 'desktop'
+        working-directory: aproxy-desktop/ui
+        run: |
+          npm ci
+          npm run build
+      # 无界面版本不得多出任何依赖：依赖树（全部目标平台）里不能出现桌面界面那一族
+      - name: Assert the headless dependency tree has no UI crates
+        if: matrix.variant == 'headless'
+        run: |
+          tree=$(cargo tree -p aproxy --no-default-features -e normal --target all --prefix none --locked)
+          if grep -E '^(aproxy-desktop|tauri|tauri-[a-z-]+|wry|tao|webview2-com|webkit2gtk) ' <<<"$tree"; then
+            echo "::error::headless 的依赖树里出现了桌面界面的依赖（见上面列出的包）"
+            exit 1
+          fi
       # windows 上的 clippy 不编译 #[cfg(unix)] 代码，零警告纪律在这里补上 unix 面
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked --no-fail-fast
+      - run: cargo clippy --workspace ${{ matrix.flags }} --all-targets --locked -- -D warnings
+      - run: cargo test --workspace ${{ matrix.flags }} --locked --no-fail-fast
+      - name: Smoke-test --version (C5)
+        run: bash .github/scripts/version-smoke.sh target/debug/aproxy ${{ matrix.variant }}
 
   upgrade-from-0-1-0:
     # 0.1.0 的安装器碰到当前构建必须在改动任何东西之前失败（0.2.0 起不支持原地升级，
@@ -73,6 +157,8 @@ jobs:
     # install --from 装当前构建，断言干净拒绝（tests/upgrade_from_0_1_0.rs，平时 #[ignore]）。
     # 只在 CI 跑：开发机上往往有用户正在用的 0.1.0 实例，0.1.0 的 Windows 控制管道
     # 按端口全机共享，测试里的 0.1.0 二进制可能碰到它们。
+    # 用 headless 变体构建：拒绝只取决于 --version 的格式，两种变体相同，这样省掉前端与
+    # WebKitGTK 的准备。
     strategy:
       fail-fast: false
       matrix:
@@ -95,14 +181,11 @@ jobs:
           curl -fsSL -o "$dest" "https://github.com/${{ github.repository }}/releases/download/v0.1.0/${{ matrix.asset }}"
           chmod +x "$dest"
           echo "APROXY_V010_BIN=$dest" >> "$GITHUB_ENV"
-      - run: cargo test --locked --test upgrade_from_0_1_0 -- --ignored --nocapture
+      - run: cargo test --locked --no-default-features --test upgrade_from_0_1_0 -- --ignored --nocapture
 
-  macos:
-    # 已知红：#[cfg(unix)] 的共享内存与进程查询实现是 Linux 专用（/dev/shm、
-    # /proc），macOS 上 3 个 lib 测试失败——待有 macOS 真机的贡献者完成支持，
-    # 见团队记忆 2026-09-12-macos-support-required。不加 skip、不设
-    # continue-on-error：红色就是「未完成」的如实信号；独立成 job 后不再淹没
-    # windows/ubuntu 的结论。
+  macos-build:
+    # macOS 不在 0.2.0 的支持范围（测试见下面的 macos 任务，已知红），但两种变体都必须编得过：
+    # 带界面的变体在 macOS 上链接 WebKit 与 AppKit，任何平台分支写错都在这里暴露。
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7.0.1
@@ -110,4 +193,45 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: aproxy-desktop/ui/package-lock.json
+      - name: Build the desktop front end
+        working-directory: aproxy-desktop/ui
+        run: |
+          npm ci
+          npm run build
+      - run: cargo build --workspace --all-targets --locked
+      - name: Smoke-test --version (C5, desktop)
+        run: bash .github/scripts/version-smoke.sh target/debug/aproxy desktop
+      # 无界面变体会重新链接同一个 target/debug/aproxy，所以紧接着冒烟
+      - run: cargo build --workspace --exclude aproxy-desktop --no-default-features --all-targets --locked
+      - name: Smoke-test --version (C5, headless)
+        run: bash .github/scripts/version-smoke.sh target/debug/aproxy headless
+
+  macos:
+    # 已知红：#[cfg(unix)] 的共享内存与进程查询实现是 Linux 专用（/dev/shm、
+    # /proc），macOS 上 3 个 lib 测试失败——待有 macOS 真机的贡献者完成支持，
+    # 见团队记忆 2026-09-12-macos-support-required。不加 skip、不设
+    # continue-on-error：红色就是「未完成」的如实信号；独立成 job 后不再淹没
+    # windows/ubuntu 的结论。能否编译由上面的 macos-build 单独给出结论。
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: aproxy-desktop/ui/package-lock.json
+      - name: Build the desktop front end
+        working-directory: aproxy-desktop/ui
+        run: |
+          npm ci
+          npm run build
       - run: cargo test --locked

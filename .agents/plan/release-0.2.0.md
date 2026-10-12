@@ -76,6 +76,18 @@
     即：默认无限重试不变；等多久、要不要停，以 format 的结构化指令（decide 阶段与按请求覆盖）为主要机制；aproxy 自身只保留
     简单、确定的静态兜底（D-1 的规则表、现行退避），不内置任何「读上游脸色」的智能。D-12 的熔断只处理 format 自身坏掉、给不出
     指令的情形。
+  - D-16 **settings 的 `defaults` 收哪些键**（第二版设计稿的 Q4；用户原话「不同情况得有不同做法，listen_addr显然不可能相同，
+    直接不要。url和key有可能一样，可以放默认。extra_headers、override_headers是多条的，用合并策略。proxy也可以默认，因为也
+    很常见……毕竟默认值本身也是为了方便」）：
+    - `listen_addr` 不进 `defaults`（transform、`log_file` 照旧不进）；
+    - `base_url`、`api_key`、`proxy` 与代理口令可以设默认；
+    - `extra_headers`、`override_headers` 与配置里的同名表按头名合并（不区分大小写，同名以配置为准）。
+    - 主代理补的约束，用户同意（「可以」）：凭据只发给它所属的目标。
+      - 默认的 `api_key` 与默认头里的鉴权头，只在配置最终的 `base_url` 等于默认 `base_url` 时继承；
+      - 默认的代理口令只跟默认 `proxy` 一起继承。
+      - 防的是审查 S2-7 的风险：指向别家上游的配置悄悄继承全局 key，把 A 家的 key 发给 B 家。
+    - 代价：settings.json 会含密钥，按 config.toml 同一套打码与文件权限处理。
+    - 细化 D-5：`defaults` 不再是与 config.toml 字面同构。
 
 ### W2 的 format 定稿（用户 2026-10-11/12 提出，主代理设计，用户未反对）
 - **format 决定一切按请求的行为**（用户：「是否重试、重试几次等几乎绝大多数配置都可以通过 format 变成动态的」）：原则是

@@ -240,7 +240,10 @@ fn c2_unique_intermediate_names() {
             rest
         };
         let (nanos, pid) = rest.split_once('-').expect(&name);
-        assert!(nanos.parse::<u64>().is_ok(), "{name}");
+        // 19 位十进制纳秒：位数固定，字典序就是时间序——入口兜底脚本（aproxy.bat 与 sh）
+        // 跨版本按字典序挑最新的 aproxy.old-*，改成微秒或不补齐位数都会挑错
+        assert_eq!(nanos.len(), 19, "{name}");
+        assert!(nanos.bytes().all(|b| b.is_ascii_digit()), "{name}");
         assert_eq!(pid, std::process::id().to_string(), "{name}");
         assert!(is_residue_name(&name), "{name}");
     }
@@ -504,19 +507,46 @@ fn c3_start_marker_formats() {
             Some(marker.as_str())
         );
         let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-        // Windows：`w:<创建时间 FILETIME 的 64 位无符号十进制>`
+        // Windows：`w:<创建时间 FILETIME 的 64 位无符号十进制>`。测试自己调用
+        // GetProcessTimes 拼出期望值：换成 Unix 毫秒、高低位颠倒，都过不了这里
         #[cfg(windows)]
-        assert!(marker.strip_prefix("w:").is_some_and(digits), "{marker}");
-        // Linux：`l:<boot_id 原文>:<stat 第 22 字段>`，boot_id 是带连字符的小写 UUID
+        {
+            use windows_sys::Win32::Foundation::FILETIME;
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+            assert!(marker.strip_prefix("w:").is_some_and(digits), "{marker}");
+            let zero = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
+            let (mut creation, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+            let ok = unsafe {
+                GetProcessTimes(
+                    GetCurrentProcess(),
+                    &mut creation,
+                    &mut exit,
+                    &mut kernel,
+                    &mut user,
+                )
+            };
+            assert_ne!(ok, 0, "GetProcessTimes 失败");
+            let filetime =
+                (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+            assert_eq!(marker, format!("w:{filetime}"));
+        }
+        // Linux：`l:<boot_id 原文>:<stat 第 22 字段>`，boot_id 是带连字符的小写 UUID。测试
+        // 自己解析 /proc/self/stat 拼出期望值：换成第 21 字段、除以 CLK_TCK，都过不了这里
         #[cfg(target_os = "linux")]
         {
-            let (boot_id, starttime) = marker
-                .strip_prefix("l:")
-                .and_then(|rest| rest.rsplit_once(':'))
-                .expect(&marker);
-            let expected = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
-            assert_eq!(boot_id, expected.trim(), "{marker}");
-            assert!(digits(starttime), "{marker}");
+            let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+            let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+            // 第 2 字段 comm 在括号里、可能含空格与括号：从最后一个 `)` 之后切分，切出来的
+            // 第一个是第 3 字段，第 22 字段就是其后第 19 个（从 0 数）
+            let fields: Vec<&str> = stat[stat.rfind(')').unwrap() + 1..]
+                .split_whitespace()
+                .collect();
+            let starttime = fields[22 - 3];
+            assert!(digits(starttime), "{stat}");
+            assert_eq!(marker, format!("l:{}:{starttime}", boot_id.trim()));
         }
         // macOS：`m:<pbi_start_tvsec>.<pbi_start_tvusec>`，两段都是不补零的十进制
         #[cfg(target_os = "macos")]
@@ -609,20 +639,29 @@ fn c5_version_line() {
         assert_eq!(parse(line), None, "{line:?}");
     }
 
-    // 本构建自己的输出：正是这个格式，变体与目标是本构建的
-    let out = Command::new(env!("CARGO_BIN_EXE_aproxy"))
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = parse(&stdout).expect(&stdout);
-    assert_eq!(line.version, env!("CARGO_PKG_VERSION"));
-    assert!(
-        matches!(line.variant.as_deref(), Some("desktop" | "headless")),
-        "{stdout}"
-    );
-    assert_eq!(line.target, VersionLine::own().target, "{stdout}");
+    // 本构建自己的输出：正是这个格式，变体与目标是本构建的；退出码 0；不读写 home——
+    // APROXY_HOME 指向一个还不存在的目录，跑完它仍不存在（`--version` 有了副作用，这里
+    // 就会看到它建出来的东西，也不会碰到用户真正在用的 home）
+    let parent = temp_home();
+    let home = parent.path().join("home-that-must-not-appear");
+    for flag in ["--version", "-V"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_aproxy"))
+            .arg(flag)
+            .env("APROXY_HOME", &home)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "{flag}: {stdout}");
+        let line = parse(&stdout).expect(&stdout);
+        assert_eq!(line.version, env!("CARGO_PKG_VERSION"));
+        assert!(
+            matches!(line.variant.as_deref(), Some("desktop" | "headless")),
+            "{stdout}"
+        );
+        assert_eq!(line.target, VersionLine::own().target, "{stdout}");
+        assert!(!home.exists(), "{flag} 不得建出 home");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -728,6 +767,22 @@ fn c7_exit_codes() {
     assert_eq!(force::EXIT_NOT_RESTORED, 12);
 }
 
+/// C7：`aproxy restore` 子命令永远存在——任何版本的强制安装换好二进制之后，都调用新版本的
+/// `restore` 拉回实例。空的 home 里没有可恢复的实例，它以 0 结束；改了名或删掉了，这里
+/// 就是 clap 的用法错误 2。
+#[test]
+fn c7_restore_always_exists() {
+    let home = temp_home();
+    let out = aproxy_in(home.path(), &["restore"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// 这些写法都被接受（参数解析通过，用法错误的退出码是 2），并且在动任何东西之前
 /// 就以 10 结束：源文件不存在、版本低于 0.2.0、下载代理连不上。
 #[test]
@@ -809,4 +864,92 @@ fn c7_confirmation_needs_yes_when_not_interactive() {
     assert_eq!(out.status.code(), Some(10), "{stderr}");
     assert!(stderr.contains("--yes"), "{stderr}");
     assert!(!aproxy::install::swap::bin_dir_in(home.path()).exists());
+}
+
+// ---------------------------------------------------------------------------
+// C8：流程顺序
+// ---------------------------------------------------------------------------
+
+/// C8 第 3 步「先按台账结束安装者，再拿安装锁」：台账里有一个正持有安装锁的安装者时，强制
+/// 安装先结束它（锁随进程死亡释放），再拿到锁、照常完成。顺序反过来，就会一直等这把锁、
+/// 等满之后以失败结束。
+#[test]
+fn c8_installers_are_stopped_before_the_lock_is_taken() {
+    let home = temp_home();
+    let home = home.path();
+    // bin 里装着当前构建；要换上的是它的副本，末尾追加一段内容以便区分（PE 与 ELF 都容忍
+    // 文件末尾的附加数据）
+    let bin = aproxy::install::swap::bin_path_in(home);
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &bin).unwrap();
+    let next = home.join(format!("aproxy-next{}", std::env::consts::EXE_SUFFIX));
+    let mut bytes = std::fs::read(env!("CARGO_BIN_EXE_aproxy")).unwrap();
+    bytes.extend_from_slice(b"\nC8-NEXT-BINARY\n");
+    std::fs::write(&next, &bytes).unwrap();
+    std::fs::set_permissions(&next, std::fs::metadata(&bin).unwrap().permissions()).unwrap();
+
+    // 持锁的安装者：本测试程序自己，只运行下面那个辅助函数
+    let ready = home.join("holder-ready");
+    let mut holder = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "c8_lock_holding_installer_helper"])
+        .env("APROXY_TEST_LOCK_HOLDER", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let holder_ready = ready.exists();
+
+    let out = holder_ready.then(|| {
+        aproxy_in(
+            home,
+            &[
+                "install",
+                "--force",
+                "--from",
+                next.to_str().unwrap(),
+                "--yes",
+            ],
+        )
+    });
+    // 结束测试自己的子进程放在断言之前：断言失败也不留下进程
+    let holder_stopped = holder.try_wait().unwrap().is_some();
+    let _ = holder.kill();
+    let _ = holder.wait();
+
+    assert!(holder_ready, "持锁的安装者没有就绪");
+    let out = out.unwrap();
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(force::EXIT_DONE), "{output}");
+    assert!(holder_stopped, "持锁的安装者应已被结束: {output}");
+    assert_eq!(std::fs::read(&bin).unwrap(), bytes);
+}
+
+/// 上一个测试的「持锁的安装者」：以安装者身份登记进给定 home 的台账、拿住安装锁、通知
+/// 就绪，然后睡着等被结束。平时（没有那个环境变量）立即返回。
+#[test]
+#[ignore = "只作为子进程运行，见 c8_installers_are_stopped_before_the_lock_is_taken"]
+fn c8_lock_holding_installer_helper() {
+    let Some(home) = std::env::var_os("APROXY_TEST_LOCK_HOLDER") else {
+        return;
+    };
+    let home = PathBuf::from(home);
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    assert!(
+        real(&home).starts_with(real(&std::env::temp_dir())),
+        "持锁的安装者只在临时目录里的 home 运行: {}",
+        home.display()
+    );
+    let _entry = ledger::register(&home, ledger::ROLE_INSTALLER, None, Some("lock holder"));
+    let _lock = aproxy::install::lock_install_in(&home, std::time::Duration::from_secs(5)).unwrap();
+    std::fs::write(home.join("holder-ready"), b"").unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(120));
 }

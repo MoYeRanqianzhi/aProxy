@@ -1,9 +1,9 @@
 # W2 契约定稿（0.2.0，第二版）
 
-> 状态：第二版设计稿（2026-10-12），已按第二轮复审修订，待用户过目。它在第一版（d43ddc9）之上依据：
-> - 对抗式审查 `.agents/review/2026-10-12-w2-contracts-review.md`，含第二轮复审（第 665 行起）；
+> 状态：第二版设计稿（2026-10-12），已按第二轮复审与第三轮核对修订，待用户过目。它在第一版（d43ddc9）之上依据：
+> - 对抗式审查 `.agents/review/2026-10-12-w2-contracts-review.md`，含第二轮复审（第 665 行起）与第三轮核对（第 968 行起）；
 > - 用户随后的决策 D-12…D-16（计划 `release-0.2.0.md`「W2 设计稿审查后的用户决策」），以及 W2c 的用户追加（9e39930）；
-> - 主会话按用户授权对复审各条的决定（§13.3）。
+> - 主会话按用户授权对复审与核对各条的决定（§13.3）。
 >
 > 写法：只读代码写成，没有改代码；现状行号对应 `73b7863`。
 >
@@ -21,7 +21,7 @@
 > 编号约定：
 > - C1–C8 指 W2b 的冻结项；
 > - 「综C1」…「综C13」指综合稿 §1.4 的正确性条目；
-> - S1-n、S2-n、S3-n 指第二轮审查的条目；R-S1-n、R-S2-n、R-S3-n 指它的复审。
+> - S1-n、S2-n、S3-n 指第二轮审查的条目；R-S1-n、R-S2-n、R-S3-n 指它的复审；T-S2-n、T-S3-n 指第三轮核对。
 
 ---
 
@@ -33,7 +33,7 @@
    - IPC 应答、持久记录、format 回信是宽容的读者（§1.1）。
 2. **错误码单源**，放在新 crate aproxy-ipc。aproxy 自产的 HTTP 错误一律是 JSON：`error.type = "aproxy_<code>"`，并带
    `x-aproxy-error`、`x-aproxy-request-id` 两个头；SSE 终态事件用同一个 JSON（§2、§3）。
-3. **home 是唯一的根**，删掉 APROXY_RUN_DIR。期望状态记录改为结构化的 spec，只有 stop 能删它。
+3. **home 是唯一的根**，删掉 APROXY_RUN_DIR。期望状态记录改为结构化的 spec，只有 stop 能删它（被新端口的记录接替时由拉起方删）。
    restart 先预检，停旧实例时保留记录（§4、§5）。
 4. **IPC v1**：未知参数报错；只读 op 有 requests、request、body、subscribe；请求记录有界，事件限频；实例启动期间以 `starting` 应答（§6）。
 5. **config.toml**：新增 `[timeouts]`、`[keepalive]`、`[retry]` 与 `[[retry.rules]]`、`[history]`、`[[format]]`。
@@ -54,7 +54,7 @@
     - 投递方式 `delivery` 取 `forward`（仅转发）或 `retry`（无限重试）；配置里的是默认值，默认 `retry`；request 阶段的回信可以按请求改。
       推荐配方仍默认 retry，由 adaptive 对没失败过的请求回 forward，它不可用时一切回到 retry；
     - forward 请求在向客户端写出任何字节之前失败，decide 可以让它当场转入 retry，此后与一开始就用 retry 一样；
-    - 请求结束时向声明了 notify 的程序发完成通知，只发不等，处理不过来就丢弃并计数；
+    - 请求结束时向声明了 notify 的程序发完成通知，只发不等，处理不过来就丢弃并计数；notify 有自己的熔断器与固定时限，不拖累数据通路；
     - forward 与 format 可以共存；官方 aproxy-format 按角色拆成子命令（§10.14）。
 
 与 W2b 及 alpha.1 的接缝：
@@ -62,7 +62,7 @@
 - 台账（C3）与实例记录分开（G3）。C3 的读者与启动标记推导迁进 aproxy-ipc，算法不变（§6.6、§14 B0）。
 - `--version` 先于语言判定短路（G2，§9.2）；通用退出码只用 0–5（G5）。
 - 安装的续作与早交接入口 `install --continue --handover-from` 保持原样，它已是永久接口（§5）。
-  W2 以续作接手时，在广播之前检查管不了的实例，查到就以失败结束（§4.3 第 7 条，R-S2-4）。
+  W2 以续作接手时，在广播之前检查管不了的实例，查到就以失败结束，并置 `halted`，免得 alpha.1 的续作反复接管（§4.3 第 7 条，R-S2-4、T-S3-2）。
   W2 之前的版本启动的实例，经强制安装迁移（§4.3）。
 
 ---
@@ -147,7 +147,7 @@ C1–C8 保证任何版本都能装上任何版本；它也是 settings.json 被
 | 实例标识 | `instance_id`，16 位十六进制 | 由启动时刻毫秒的低 48 位加 pid 的低 16 位组成，跨重启可以区分（O1） |
 | 错误码 | `code` | HTTP 里写成 `error.type = "aproxy_<code>"` 与头 `x-aproxy-error`，其余出口用裸码 |
 | 尝试 | `attempt` 是序号，从 1 起；`attempts` 是总数；请求记录里的尝试明细列表叫 `tries` | S2-13：列表不能与总数同名 |
-| 状态码 | 上游的叫 `upstream_status`；回给客户端的叫 `client_status`；format 消息的响应对象里叫 `status` | |
+| 状态码 | 上游的叫 `upstream_status`；回给客户端的叫 `client_status`；format 消息的响应对象里叫 `status` | `client_status` 是已经写给客户端的状态码，响应头提交之前为 null；保活提交的骨架头也算（T-S3-5） |
 | 地址 | `listen_addr`（`--listen-addr`）、`base_url`（`--base-url`） | 取代 `--listen`、`--baseurl`（D-4） |
 | 日志 | 要求的位置叫 `log_file`；实际的位置叫 `log_path` | 两个概念 |
 | 配置文件 | `config_path`；台账沿用 C3 的 `config` | |
@@ -402,7 +402,7 @@ C1–C8 保证任何版本都能装上任何版本；它也是 settings.json 被
 **配置诊断**：
 - 每条诊断是一个对象 `{"code","severity","file","key"?,"line"?,"column"?,"message","details"}`。
 - 它们出现在 `config_invalid` 的 `details.diagnostics`、doctor、`config show` 与 start 的输出里。
-- `severity` 取 `error`、`warning` 或 `info`；兜底按 `warning` 显示。只有 `error` 影响退出码；`info` 是 doctor 的提示。
+- `severity` 取 `error`、`warning` 或 `info`；兜底按 `warning` 显示。只有 `error` 影响退出码；`info` 是 doctor 的提示，不计入 doctor `--json` 的 `summary`（T-S3-8 ②）。
 
 | 码 | 级别 | 何时 |
 |---|---|---|
@@ -416,7 +416,7 @@ C1–C8 保证任何版本都能装上任何版本；它也是 settings.json 被
 | `secret_placeholder_unmatched` | error | 写回的占位对象对不上原值 |
 | `default_credential_withheld` | warning | settings `defaults` 里的凭据因目标不同没有继承，而这个配置自己也没有这一项（D-16，§7.5），带 `key`、`reason` |
 | `default_header_shared` | info | `defaults` 的头表里有不属于密钥头的头，它们会发给所有目标；若其中有凭据（名字少见的凭据头），应移进配置（§7.5） |
-| `forward_default_unguarded` | warning | 默认 `delivery = "forward"`，而能让请求转入 retry 的程序（声明了 request 或 decide 的）都是可选的：它们不可用期间请求一律不重试（§10.10） |
+| `forward_default_unguarded` | warning | 默认 `delivery = "forward"`，且链上有声明 decide 的程序，或有声明 request 的可选程序：它们不可用时请求不会转入 retry，一律不重试（§10.9，T-S3-1）。required 的 request 程序不算，它不可用时请求以 503 结束，看得见；一个 format 都没有时不告警 |
 | `settings_schema_too_new` | error | settings.json 的 schema 高于本版本 |
 | `format_handshake_failed` | 见 §10.2 | 启动时握手失败，带 `format`、`kind` |
 | `format_stage_unsupported` | error | 程序不支持配置声明的阶段，带 `format`、`stages` |
@@ -426,7 +426,7 @@ C1–C8 保证任何版本都能装上任何版本；它也是 settings.json 被
 
 **安装码**用 `install_*` 一族，例如 `install_in_progress`、`install_version_not_found`（退出码 4）、`install_below_floor`、
 `install_download_failed`、`install_checksum_mismatch`、`install_probe_failed`、`install_swap_failed`、`install_rolled_back`、
-`install_unmanaged_instances`（退出码 1，§4.3 第 7 条）。
+`install_unmanaged_instances`（退出码 1，§4.3 第 7 条）、`install_precheck_failed`（退出码 3，滚动重启之前的预检不通过，带 `port` 与 `diagnostics`，§5）。
 - install 的实现者做 `--json` 时补齐；install.state 的 `error_code` 与 NDJSON 用同一套码。
 - 强制安装只承诺 C7 的退出码。
 
@@ -450,7 +450,7 @@ C1–C8 保证任何版本都能装上任何版本；它也是 settings.json 被
 响应体用 `content-type: application/json`：
 
 ```json
-{"type":"error","error":{"type":"aproxy_retry_exhausted","message":"upstream returned 404 on all 3 attempts allowed by retry rule 1","aproxy":{"code":"retry_exhausted","request_id":"19ac3f2e8b5d1a2b-42","attempts":3,"upstream_status":404,"details":{"by":"rule:1","last_code":"upstream_status"}}}}
+{"type":"error","error":{"type":"aproxy_retry_exhausted","message":"upstream returned 404 on all 3 attempts allowed by retry rule 1","aproxy":{"code":"retry_exhausted","request_id":"19ac3f2e8b5d1a2b-41","attempts":3,"upstream_status":404,"details":{"by":"rule:1","last_code":"upstream_status"}}}}
 ```
 
 - `type` 恒为 `"error"`；`error.type` 等于 `"aproxy_"` 加码；`error.message` 是一句英文，不是契约。
@@ -549,6 +549,8 @@ Windows 内核对象（A）：
 - 实例在 bind 之后写，正常退出时删。实例每 30 秒核对一次，记录丢了就补写（CP-24）。
 - `base_url` 已打码。`foreground` 为 true 表示前台实例：日志写在控制台，`log_path` 为 null，也没有期望状态记录。
 - IPC 快照里的 `instance`，就是这个对象去掉 `schema`。
+- `config_path` 与 spec 的一样可以是 null：没有配置文件、只靠覆盖参数与 settings `defaults` 启动的实例（R-S3-13、T-S3-7）。
+  显示端据此显示「没有配置文件」。
 
 ```json
 {"schema":1,"pid":4321,"start":"w:133712345678901234","instance_id":"19ac3f2e8b5d1a2b","version":"0.2.0","listen_addr":"127.0.0.1:12345","config_path":"C:\\Users\\u\\.aproxy\\config.toml","base_url":"https://api.example.com","started_at":1760190000123,"log_path":"C:\\Users\\u\\.aproxy\\logs\\19ac3f2e8b5d-1a2b.log","foreground":false}
@@ -557,14 +559,16 @@ Windows 内核对象（A）：
 **拉起规格 InstanceSpec**：它是 spec 文件的全部内容，也内嵌在期望状态记录里。
 
 ```json
-{"schema":1,"config_path":"C:\\Users\\u\\.aproxy\\configs\\work.toml","overrides":{"listen_addr":"127.0.0.1:12346","api_key":"sk-ant-…"},"env":{"HTTPS_PROXY":"http://127.0.0.1:7890","HTTP_PROXY":null,"ALL_PROXY":null,"NO_PROXY":"localhost,127.0.0.1","PATH":"C:\\Windows\\system32;…"},"log_path":"C:\\Users\\u\\.aproxy\\logs\\19ac3f2e8b5d-1a2b.log"}
+{"schema":1,"config_path":"C:\\Users\\u\\.aproxy\\configs\\work.toml","overrides":{"listen_addr":"127.0.0.1:12346","api_key":"sk-ant-…"},"pinned_port":null,"env":{"HTTPS_PROXY":"http://127.0.0.1:7890","HTTP_PROXY":null,"ALL_PROXY":null,"NO_PROXY":"localhost,127.0.0.1","PATH":"C:\\Windows\\system32;…"},"log_path":"C:\\Users\\u\\.aproxy\\logs\\19ac3f2e8b5d-1a2b.log"}
 ```
 
 - **`config_path`**：没有配置文件、只靠覆盖参数与 settings `defaults` 启动的实例，记 null；restore 与看护者对它不做存在检查
   （R-S3-13）。现行允许这种用法：文件不在就用默认配置（config.rs:831），D-8 不能因此失效。
 - **`overrides`**：键就是 config.toml 的键，只含 start 的覆盖旗标实际给过的。0.2.0 有五个：`base_url`、`listen_addr`、`proxy`、`api_key`、`log_file`。
-  例外：配置的端口为 0 时，实例写期望状态记录时把实际地址钉进 `overrides.listen_addr`（§5 第 7 步，R-S2-3）。
-  客户端配的是这个端口，恢复时要回到同一个端口；端口被占，就按固定端口的常规失败处理。
+- **`pinned_port`**：解析出的端口为 0 的实例，写期望状态记录时把实际端口记在这里（§5 第 7 步，R-S2-3）；其余为 null。
+  - 拉起时，配置（含覆盖）解析出的端口仍是 0 才用它；配置已改成固定端口，就以配置为准（T-S3-6）。
+    所以它不放进 `overrides`：覆盖的优先级高于配置（§7.5），放在那里，用户以后改的端口永远不生效，也不会被察觉。
+  - 客户端配的是这个端口，恢复时要回到同一个端口；端口被占，就按固定端口的常规失败处理。
 - **`env`**：启动者环境里的代理变量与 `PATH`（D-2）；null 表示没设，拉起时在子进程里删掉它。
   - Windows 上变量名不分大小写：每个变量只记一个大写的名字，快照时不分大小写地查找（S2-2）。
     样例就是 Windows 的形状：4 个代理变量加 `PATH`。
@@ -577,6 +581,8 @@ Windows 内核对象（A）：
 **期望状态记录** `run/<port>.restore.json`：`{"schema":1,"spec":{…InstanceSpec…},"written_at":1760190000456}`。
 - 实例启动时写，前台实例不写。
 - 只有 stop 删它：不带 `keep_restore` 的 `shutdown`、`stop all`，以及 stop 一个已停的目标。
+- 唯一的例外是被接替：用它拉起的实例落在了别的端口（配置里的端口改了），新实例就绪之后（或那个端口上已有同一配置的实例在跑），
+  拉起方删掉这份旧记录，那个端口的记录接替了它（T-S3-6）。不删的话，看护者会一直按旧记录去拉一个已经搬走的实例。
 - 配置文件暂时找不到时，restore 与看护者都保留它（S1-4、§5）；`config_path` 为 null 的不检查。
 
 **看护者记录** `run/watchdog.json`：看护者每轮扫描时整份重写。
@@ -593,6 +599,8 @@ Windows 内核对象（A）：
 - 不存 spec，滚动重启靠 `keep_restore`（§5），所以它不含密钥。
 - 现有的 `pending_restores[].args` 是启动参数，可能含 `--api-key`（state.rs:152-160）。W2 写出的 `pending_restores` 恒为空数组，
   只为旧版本的读者保留这个字段，W2 自己也不读（R-S3-11）。
+- 现有的 `halted` 为 true，表示失败的原因不会自己消失：续作不再自动接管这个现场，用户排除原因后重新执行 install，由新的 install 接管它
+  （alpha.1 的 flow.rs:713-731 已是这个语义）。W2 在 §4.3 第 7 条与 §5 的预检失败时都置它（T-S3-2、T-S2-2）。
 
 **skill 本地清单** `skills/manifest.json`（W4 的跨版本文件）：`{"schema":1,"version":"0.2.0","files":[{"path","bytes","sha256"}]}`。
 - 读者遇到解析失败或 schema 更高时，按「已安装、版本未知」处理，不删除。
@@ -602,7 +610,7 @@ Windows 内核对象（A）：
 
 1. **读不懂的记录**：解析失败，或 `schema` 高于自己认识的，就跳过，并在 status 与 `--json` 的 `unreadable` 里报告；绝不删除。
 2. **实例记录与看护者记录**：只在同时满足两个条件时清理：本版本的 schema；写者经 `pid` 加 `start` 核验已经不在。
-   期望状态记录不归清理管，只有 stop 能删；`stop all` 也只删本版本 schema 的，其余的报告出来（S3-13）。
+   期望状态记录不归清理管，只有 stop 能删（被新端口的记录接替时例外，见 §4.2）；`stop all` 也只删本版本 schema 的，其余的报告出来（S3-13）。
 3. **spec 文件**：拉起方在子进程就绪或失败之后立即删（S3-15）。临时文件与遗留的 spec 文件，在写者 pid 已不在、且早于 10 分钟时由清理删除。
 4. **读路径不删任何文件**：status、enumerate、界面轮询都是读路径。清理只在实例进入 `serving` 之后与看护者的周期里做（综C1）。
 5. **日志 GC**：
@@ -614,12 +622,17 @@ Windows 内核对象（A）：
    以及 /dev/shm 下的心跳文件，0.2.0 不读也不清（与 D-14 同一原则：不写识别旧格式的代码）。
    - 这些预发布版启动的进程都登记在台账（C3）里。强制安装按台账结束它们，并按台账的 `port` 与 `config` 告诉用户怎样重新启动（C8 第 6 步）。
      0.1.x 不写台账，C8 第 7 步只报告它们。
-   - 普通 install 与续作（`install --continue`，包括从 alpha.1 交棒过来的）都在广播之前检查（R-S2-4）：台账里有活着的 instance，
-     而 run/ 里没有这个端口的本 schema 实例记录时，就以失败结束，实例与 bin 都不动：
-     - 置 `phase = failed`、`error_code = install_unmanaged_instances`；`last_error` 写英文原因，alpha.1 的等待者只读这个字段；
-     - 释放锁与宣告，不动 bin；
-     - 提示用户先用当前版本执行 `aproxy stop all` 再安装，或改用 `install --force`。
-   - 检查放在广播之前，而不只在入口：从 alpha.1 升级时，管辖检查、加锁、下载与校验都由 alpha.1 的安装者做完，
+   - 检查管不了的实例：台账里有活着的 instance，而 run/ 里没有这个端口的本 schema 实例记录。查两次（R-S2-4、T-S3-3）：
+     - 普通 install 在入口查，加锁与下载之前。查到就报错退出，不加锁、不下载、不写 install 状态，真正做到在改动任何东西之前失败。
+     - 所有路径（含续作 `install --continue`，包括从 alpha.1 交棒过来的）在广播之前再查一次，也覆盖这段时间里新起的实例。
+       查到就以失败结束，实例与 bin 都不动：
+       - 置 `phase = failed`、`halted = true`、`error_code = install_unmanaged_instances`；`last_error` 写英文原因，alpha.1 的等待者只读这个字段；
+       - 释放锁与宣告；
+       - 提示用户先用当前版本执行 `aproxy stop all` 再安装，或改用 `install --force`。
+   - 要置 `halted`（T-S3-2）：alpha.1 的任何非 install 命令看见 install/state.json，都会静默拉起续作，
+     而它的续作只拒绝「failed 且 halted」的现场（73b7863 的 main.rs:128-146、flow.rs:713-731）。不置的话，用户照提示执行
+     `aproxy stop all` 时，这条命令本身就会拉起一个续作去接管失败的现场。W2 自己的自动续作同样不接管它（§9.2 第 6 步）。
+   - 只在入口查不够：从 alpha.1 升级时，管辖检查、加锁、下载与校验都由 alpha.1 的安装者做完，
      W2 以续作接手时入口早已过去。不检查的话，alpha.1 的实例会失去看护者，又不在 W2 的枚举里，成了没人管的孤儿。
    - 迁移文档（W7）写明怎样手动删除残留。
 
@@ -668,14 +681,14 @@ Windows 内核对象（A）：
    - 失败时摘录 startup.log 里本次写下的行。
 
 **实例的启动顺序**：
-1. 读 spec，解析配置（§7.5）并校验。
+1. 读 spec，解析配置（§7.5）并校验。解析出的端口为 0、而 spec 带 `pinned_port` 时，改用它（§4.2）。
 2. 写台账。C3 要求在占用端口或拉起子进程之前写。
 3. bind 代理端口，先不接受连接。端口为 0 时，用实际端口原子重写台账条目（S3-16）。
 4. bind 控制端点，以 `state:"starting"` 应答。
 5. 写实例记录。
 6. 与各 format 程序并行握手（§10.2）。
 7. 写期望状态记录（S2-5）：它与 shutdown 的删除在同一把进程内锁下进行；收到不带 `keep_restore` 的 shutdown 之后，不再写它。
-   配置的端口为 0 时，把实际地址钉进记录里 spec 的 `overrides.listen_addr`（R-S2-3）。否则记录按实际端口命名、spec 却还是端口 0，
+   解析出的端口为 0 时，把实际端口记进记录里 spec 的 `pinned_port`（R-S2-3、T-S3-6）。否则记录按实际端口命名、spec 却还是端口 0，
    每次恢复都换一个端口、多留一份拉不回的记录，看护者会越拉越多。
 8. 开始接受代理连接，状态转为 `serving`；之后做清理（§4.3）。
 
@@ -688,22 +701,31 @@ Windows 内核对象（A）：
 
 **restart**（S1-4）：
 1. 读目标的期望状态记录。前台实例没有这份记录，报 `restart_unsupported`。
-2. 预检：用记录里的 spec 走 §7.5 的管线；`listen_addr` 变了，就探测新端口能否绑定。预检不通过就不碰旧实例（退出码 3 或 1）。
+2. 预检：用记录里的 spec 走 §7.5 的管线（端口仍为 0 时用 `pinned_port`）；得出的地址与旧实例的不同，就探测新端口能否绑定。预检不通过就不碰旧实例（退出码 3 或 1）。
 3. 先按 §6.2 第 5 条查旧实例快照的 `features`（R-S3-14）：
    - 有 `shutdown.keep_restore`：发 `shutdown{keep_restore:true}`，等旧实例退出，记录保留；
    - 没有：发不带参数的 shutdown（它会删掉记录），等旧实例退出后，立即用同一份 spec 回写记录。
    不能靠 `unsupported_arg` 判断：W2 之前的实例静默忽略未知参数（daemon.rs:1215），而 op 被拒时实例也不会退出。
-4. `spawn_from_spec`。成功时，新实例覆盖记录。失败时记录还在：看护者按 D-8 继续拉，`aproxy restore` 也能拉回。
+4. `spawn_from_spec`。成功时，新实例覆盖记录；端口变了时，按 §4.2 删掉旧端口的记录。失败时记录还在：看护者按 D-8 继续拉，`aproxy restore` 也能拉回。
 5. 拉起时端口已被同 home、同一配置的实例占着（看护者抢先拉起了），计为成功。
 
 **install**：
 - 滚动重启用同一套原语；install/state.json 只记端口。
 - 换二进制之前，按台账（role 为 watchdog）找到并结束旧看护者，不读看护者记录，所以对任何版本的看护者都有效。
-- 台账里有本版本管不了的活实例时，在广播之前以失败结束，实例与 bin 都不动；续作入口也做这项检查（§4.3 第 7 条）。
+- 管不了的活实例：普通 install 在入口查一次，所有路径在广播之前再查一次，查到就以失败结束，实例与 bin 都不动（§4.3 第 7 条）。
+- **预检**（T-S2-2）：执行续作的目标版本在广播之前，用自己的 §7.5 管线预检每个要滚动重启的实例，即它的 spec 加上当前的 settings.json。
+  - 任何一个不过，就以失败结束，什么都不动：不广播、不换 bin、不停实例。置 `phase = failed`、`halted = true`、
+    `error_code = install_precheck_failed`，`error_details` 带端口与诊断（哪个文件、哪个键），`last_error` 写英文原因。
+  - 否则用户手改 settings.json 打错一处之后执行 install（R-S3-17 让它照常运行），健康的实例会被停掉，
+    新旧二进制又都因 settings 无效起不来，看护者也已被结束，实例就此下线。
+  - 这也覆盖「新版本不接受现有配置」的老情形：以前是先停、起不来再回退，中断一下；现在一个实例都不停。
+  - 放在广播之前，而不是停每个实例之前：广播里的 ACK 收敛本身就可能重启实例（install/restart.rs:4-6）；
+    换了 bin 之后再失败，又会留下「新 bin、旧实例」的现场。
 
 **restore 与看护者**：
 - 遇到配置文件暂时不在时，保留记录：restore 的结局为 `config_missing`，看护者照常慢速重试（D-8 原文的动机正是网络盘挂载得晚）。
   spec 的 `config_path` 为 null 时不做这项检查（§4.2）。
+- 按记录拉起的实例落在了别的端口（配置里的端口改了）时，就绪之后删掉旧记录（§4.2，T-S3-6）。
 - 看护者的命令行只有 `__watchdog --home`；每个 tick 重读 settings，开关关闭就退出，保留记录（CP-18）。
 - settings.json 变得读不了时，看护者沿用上一次读到的有效值，并在日志里报错，限频（§8.2）。
 - 实例存活满 60 秒，才清零它的失败计数。
@@ -784,7 +806,8 @@ Windows 内核对象（A）：
  "state":"serving",
  "behavior":{"delivery":"retry","disk_cache":true,"keepalive":{"trigger":"any","interval_secs":15},"retry_rules":1,"history":{"body_budget_mb":64}},
  "formats":[{"name":"adaptive","stages":["request","decide","notify"],"process":"persistent","required":false,"protocol":1,"version":"0.2.0","notify_dropped_total":0,
-             "breaker":{"state":"open","failures":5,"opened_at":1760190000000,"probe_at":1760190030000,"last_failure":{"code":"format_error","details":{"kind":"died"},"at":1760189999000}}}],
+             "breaker":{"state":"open","failures":5,"opened_at":1760190000000,"probe_at":1760190030000,"last_failure":{"code":"format_error","details":{"kind":"died"},"at":1760189999000}},
+             "notify_breaker":{"state":"closed","failures":0}}],
  "activity":{"last_request_at":1760190100000,"requests_total":120,"retries_total":7,"rescued_total":3,"upgraded_total":2,"in_flight":2,"retrying":1,
              "by_code":{"upstream_status":5,"format_error":5},
              "buckets":{"width_secs":120,"requests":[0,3,5],"retries":[0,0,2],"failures":[0,0,7]},
@@ -798,6 +821,8 @@ Windows 内核对象（A）：
 - `behavior` 是实例的行为摘要：默认的投递方式与缓存、保活、规则、历史预算等开关。单个请求实际的投递方式，见请求记录的 `delivery`（§6.5）。
 - `formats[].breaker.state`：`closed`、`open`、`half_open`（§10.9）；`opened_at`、`probe_at`、`last_failure` 没有时省略。
 - `formats[].notify_dropped_total`：只在声明了 notify 的程序上出现（§10.11）。
+- `formats[].notify_breaker`：notify 自己的熔断器（§10.9，T-S2-1），形状同 `breaker`，也只在声明了 notify 的程序上出现。
+  只声明 notify 的程序没有数据通路的消息，它的 `breaker` 恒为 `closed`。
 - `activity.upgraded_total`：从 forward 升级为 retry 的请求数（§10.10）。
 - `buckets`：最近 30 个桶，每桶 120 秒，旧的在前；样例只画了 3 个。
 - `rescued_total`：经过至少一次重试、最终成功的请求数。「今日救回」是界面侧的统计，W5 决定保留与否。
@@ -810,13 +835,14 @@ Windows 内核对象（A）：
 ```json
 {"request_id":"19ac3f2e8b5d1a2b-42","request_seq":42,"started_at":1760190000123,"ended_at":null,"method":"POST","path":"/v1/messages?beta=***","model":"claude-sonnet-4-5","stream":true,"user_agent":"claude-cli/2.1.0",
  "delivery":"retry","upgraded":true,
- "outcome":"in_flight","code":null,"client_status":null,"phase":"attempting","next_attempt_at":null,
+ "outcome":"in_flight","code":null,"client_status":200,"phase":"attempting","next_attempt_at":null,
  "attempts":2,"tries_omitted":0,
  "tries":[{"attempt":1,"started_at":1760190000200,"duration_ms":812,"upstream_status":529,"code":"upstream_status","response_bytes":96,
            "decision":{"by":"format:adaptive","decision":"retry","delay_ms":0},"reports":[]},
           {"attempt":2,"started_at":1760190001013,"duration_ms":null,"upstream_status":null,"code":null,"response_bytes":0,"decision":null,"reports":[]}],
  "keepalive":true,"heartbeats":3,"request_bytes":20480,"response_bytes":0,
- "reports":[{"format":"convert","stage":"request","summary":"anthropic_messages -> openai_chat","actions":[{"type":"protocol_convert","from":"anthropic_messages","to":"openai_chat"}]},
+ "reports":[{"format":"adaptive","stage":"request","summary":"no recent failure for this request; delivering forward","actions":[{"type":"custom","label":"deliver forward"}]},
+            {"format":"convert","stage":"request","summary":"anthropic_messages -> openai_chat","actions":[{"type":"protocol_convert","from":"anthropic_messages","to":"openai_chat"}]},
             {"format":"keys","stage":"request","summary":"key k2","actions":[{"type":"key_select","key_id":"k2"}]}]}
 ```
 
@@ -824,10 +850,11 @@ Windows 内核对象（A）：
   - `tries` 只保留前 3 次与最近 20 次尝试，中间省略的个数记在 `tries_omitted`；
   - 每次尝试的决定（`decision`）与这次 retry、decide 阶段的报告（`tries[].reports`）随这次尝试一起保存，也就一起截断；
   - 顶层 `reports` 只放 request、response、stream 阶段的报告，条数受链长限制；
-  - 单条记录序列化后不超过 64 KiB。超出时依次截短，截过的记录带 `"truncated":true`（R-S3-4）：
+  - 单条记录序列化后不超过 64 KiB。超出时依次处理，处理过的记录带 `"truncated":true`（R-S3-4、T-S3-8 ①）：
     1. 从最旧的尝试起删掉 `tries[].reports`；
-    2. 把剩下各处 report 的 `summary` 截短；
-    3. 把 `path`、`user_agent` 截短。截短后的长度是 E 级常量。
+    2. 把 `path`、`user_agent`、`model` 截短，截短后的长度是 E 级常量；
+    3. 仍超出就删掉顶层 `reports`。
+    大小不受控的只有客户端给的这三个串和 format 给的报告，三步之后剩下的字段都有上限。
   - 被省略的尝试（计入 `tries_omitted` 的那些）的 `sent` 与 `response` 体随之丢弃，不再占预算。
     用 `body` 取它们，回 `not_found`，`reason` 为 `no_such_part`（R-S3-5）。
 - **`delivery`**：请求此刻的投递方式，`forward` 或 `retry`；`upgraded` 表示它中途从 forward 转成了 retry（§10.10）。
@@ -851,7 +878,10 @@ Windows 内核对象（A）：
  "tries":[{"attempt":1,
            "sent":{"method":"POST","url":"https://relay.example.com/v1/chat/completions","headers":[{"name":"authorization","value":{"secret":true}}],"body":{"bytes":18200,"state":"retained"}},
            "response":{"upstream_status":529,"headers":[{"name":"content-type","value":"application/json"}],"body":{"bytes":96,"state":"retained"}},
-           "error":null}]}
+           "error":null},
+          {"attempt":2,
+           "sent":{"method":"POST","url":"https://relay.example.com/v1/chat/completions","headers":[{"name":"authorization","value":{"secret":true}}],"body":{"bytes":18200,"state":"same_as_previous"}},
+           "response":null,"error":null}]}
 ```
 
 - 体对象是 `{"bytes","state","cause"?,"encoding"?}`。`state` 取 `retained`、`same_as_previous`、`evicted`、`not_retained`，兜底 `unknown`。
@@ -859,7 +889,7 @@ Windows 内核对象（A）：
     用 `body` 取这样的体，返回的就是那一份。
   - `not_retained` 时 `cause` 说明原因：`budget_disabled`（预算为 0）、`exceeds_budget`（这一个体就比整个预算大）或 `decode_failed`。
   - `encoding` 是线上原来的 content-encoding（例如 `br`），没有编码时省略。
-- 没有上游响应的那次尝试，`response` 为 null，`error` 给出 `{code, details, message}`。
+- 没有上游响应的那次尝试，`response` 为 null，`error` 给出 `{code, details, message}`；进行中、还没拿到响应头的尝试，两者都为 null。
 
 **体的保留**（D-13，用户原话「全部暂留在储存中，但是需要上限，上限有默认值，并且可配置」）：
 - **保留哪些**：全部请求的客户端请求体、每次尝试发出的体，以及每次尝试的上游响应体。
@@ -875,7 +905,9 @@ Windows 内核对象（A）：
   - 解码失败也不保留：`not_retained`，`cause` 为 `decode_failed`，`encoding` 照记。
   - 解码沿用现行检查路径的做法（decode.rs），只作用于副本；转发给客户端的字节始终是上游原样。
 - **入库时**按流做已知密钥替换，留一段重叠的尾巴（§1.5）。
-- **口径**：体对象的 `bytes` 与 `body` 的 `total_bytes` 是入库后的字节数，即解码、替换之后的；记录里的 `request_bytes`、`response_bytes` 是线上的字节数。
+- **口径**：体对象的 `bytes` 与 `body` 的 `total_bytes` 是入库后的字节数，即解码、替换之后的。记录里的字节数都按线上的字节算（T-S3-5 ③）：
+  `request_bytes` 是客户端发来的请求体；`tries[].response_bytes` 是这次尝试从上游收到的响应体；顶层的 `response_bytes` 是写给客户端的响应体，
+  不含心跳，也不含 aproxy 自产的错误体与终态事件。
 - **分块读取**：`body` 一次返回一块，所以体再大，应答行也不变大。
 
 ```json
@@ -913,9 +945,15 @@ Windows 内核对象（A）：
 - **`processes`**：台账里有、但不属于任何实例或看护者的进程，包括 W2 之前的版本启动的实例（§4.3 第 7 条）。
 - **不删任何文件**。
 - **界面怎样发现实例增减**：窗口可见时最多每 2 秒枚举一次；可以用文件系统通知优化（E）。0.2.0 没有 home 级的端点（审查 §7-8）。
-- **枚举放在 aproxy-ipc**，所以 C3 的台账读者与启动标记推导，从主 crate 的 `src/ledger.rs` 迁进 aproxy-ipc（S2-16 b）。
-  算法不变；强制安装改为引用新位置。契约测试里的 `use` 路径不算契约：`tests/force_contract.rs` 只改 `use` 行，断言逐字不变，
-  文件头那句同步写明这一点；AGENTS.md 与 CLAUDE.md 一起改路径，两份是独立副本（R-S3-15）。不在两处各写一份冻结算法。
+- **枚举放在 aproxy-ipc**，所以 C3 的代码整体从主 crate 的 `src/ledger.rs` 迁进 aproxy-ipc 的一个文件（S2-16 b、T-S2-3）：
+  条目结构与写者，读者与它的义务（`terminate`、`remove_if_unchanged`），启动标记推导。写者一起迁，读写两边才共用同一份启动标记推导；
+  退出前删掉自己的条目、再 `process::exit` 的便利函数不在冻结范围内，按 P5 留在二进制一侧。
+  - 算法不变；强制安装改为引用新位置。不在两处各写一份冻结算法。
+  - 契约测试冻结的是断言，`use` 路径可以随代码移动：`tests/force_contract.rs` 只改 `use` 行，断言逐字不变（R-S3-15）。
+  - AGENTS.md 与 CLAUDE.md（两份是独立副本）讲永久契约的那段逐字一致：列出 C3 冻结代码迁移后的全部文件，
+    末句补上「契约测试冻结的是断言，`use` 路径可以随代码移动」。
+  - P4 与 B0 都要改这个测试的 `use` 行：谁先落地，谁就同时改测试的文件头那句与 AGENTS.md、CLAUDE.md 的那半句；
+    文件清单随 B0 改（T-S3-8 ③）。
 
 ### 6.7 事件
 
@@ -1063,7 +1101,7 @@ stages = ["request", "retry"]
 | `required` | 布尔 | true | 只管程序出错与熔断时怎么办，见 §10 |
 | `pool_max` | 整数 | 4 | persistent 的进程池上限；进行中的流不计入（§10.6）；需要跨请求共享内存状态的程序配 1（§10.3） |
 | `worker_idle_secs` | 整数 | 300 | |
-| `timeout_secs` | 整数 | 30 | 每条消息的回信时限 |
+| `timeout_secs` | 整数 | 30 | 每条消息的回信时限；notify 不用它，用固定的 2 秒（§10.11） |
 | `decide_timeout_secs` | 整数 | 2 | |
 | `breaker_failures` | 整数 | 5 | 连续进程级失败达到这个数就熔断；0 表示不熔断（D-12） |
 | `breaker_cooldown_secs` | 整数 | 30 | 熔断之后，过多久放一条消息试探；不许为 0 |
@@ -1189,6 +1227,7 @@ forward 与 format 可以共存（§10.10）：链上有程序要请求体或摘
   - `settings` 的各个子命令与 `doctor`：用来查看与修复它。JSON 语法错误时只能手工修。
   - `stop`、`status`、`install`：任何时候都要能停实例、看状态、装上能修好问题的版本（R-S3-17）。它们用内置默认运行，并把错误作为告警打印出来：
     stop 与 status 按端口或 `all` 寻址（别名不可用）；install 用内置的下载链与代理。
+    install 要滚动重启实例时，目标版本照样按 settings 预检，过不了就以 `install_precheck_failed` 结束、一个实例都不停（§5，T-S2-2）。
   - 其余命令（例如 start）的报错说清怎样修：指出文件与键，给出 `aproxy settings unset <键>` 或删除这个文件的做法。
 - **0.1.x 留下的 settings.json** 是平铺字段、没有 schema，按 schema 1 读必然报错。迁移文档（W7）写明要删除或重写它；
   install 照常可用，所以升级本身不会被它挡住。
@@ -1261,6 +1300,7 @@ aproxy desktop                  W5
 5. clap 解析，帮助按语言注入；`desktop` 在建运行时之前分派（W5）。
 6. 按 C1 校验 home，失败报 `home_invalid`、退出码 2；然后分派。
    只有变更类命令、并且 install 状态可以接管时，才拉起续作 `install --continue`（A5）。
+   install 状态的 `halted` 为 true 时不拉起：失败的原因不会自己消失，要用户排除之后重新执行 install（§4.2，T-S3-2）。
 
 ### 9.3 config 与 settings 命令（D-4）
 
@@ -1324,7 +1364,7 @@ aproxy desktop                  W5
 | config、settings | 完成 | 写冲突 | 用法 | 结果无效、未知键、文件无效 | `config get` 时文件不存在 | — |
 | doctor | 没有 error | — | — | 有 error | — | — |
 | find | 完成 | — | — | — | — | — |
-| install | 已安装或已是最新 | 失败（含回滚、管不了的实例） | 用法 | —（settings 无效时用内置默认，只告警） | 版本不存在 | — |
+| install | 已安装或已是最新 | 失败（含回滚、管不了的实例） | 用法 | 滚动重启之前的预检不通过（`install_precheck_failed`，§5）；settings 无效本身只告警 | 版本不存在 | — |
 | skill | 完成 | 下载或读写失败 | 用法 | — | 没装，或文件不在清单里 | — |
 | desktop | 正常退出 | headless 版本、起不来 | — | — | — | — |
 
@@ -1362,7 +1402,7 @@ aproxy desktop                  W5
   - 一条消息从写到 worker 的 stdin 起，到读到它的回信为止，这个 worker 算忙；notify 也一样。
   - 每条消息的时限从写到 worker 的那一刻起算，在 aproxy 里排队的时间不计入。
   - 派发顺序：数据通路的消息（notify 以外的一切）优先；notify 只在有空闲 worker、且没有数据通路的消息排队时才派发（§10.11）。
-    所以数据通路的消息最多等一条已经写出的 notify。
+    所以数据通路的消息最多等一条已经写出的 notify：等它回信，或等它超过固定时限（2 秒，§10.11）之后换上的新 worker。
   - 消息超时的 worker 一律换掉：它可能还在处理那条消息，之后的回信会错位。是否计入熔断见 §10.9。
 - **会话**：
   - 每个进程的第一行都是 `hello`（§10.2），spawn 模式也一样（S3-34 ①）。
@@ -1410,7 +1450,7 @@ aproxy desktop                  W5
 |---|---|---|
 | 配置声明的阶段不在回信里 | 实例不启动，`format_stage_unsupported`，退出码 3 | 同左 |
 | 协议版本不符、hello 回信不合法 | 实例不启动，`format_handshake_failed`，退出码 3 | 同左 |
-| 起不来、10 秒内没回、中途退出 | 实例不启动，`format_handshake_failed`，退出码 1 | 告警；熔断器以 `open` 起步，冷却后试探（§10.9） |
+| 起不来、10 秒内没回、中途退出 | 实例不启动，`format_handshake_failed`，退出码 1 | 告警；它的熔断器以 `open` 起步，冷却后试探（§10.9；只声明 notify 的程序是 notify 的熔断器） |
 
 - **跨版本**：新阶段、新能力只在双方都声明时才使用，旧的 format 永远收不到它不懂的消息。
 
@@ -1484,7 +1524,7 @@ aproxy desktop                  W5
 ### 10.5 decide
 
 ```json
-→ {"v":1,"seq":12,"stage":"decide","request_id":"19ac3f2e8b5d1a2b-42","state":"…",
+→ {"v":1,"seq":12,"stage":"decide","request_id":"19ac3f2e8b5d1a2b-44","state":"…",
    "attempt":6,"elapsed_ms":42000,"delivery":"retry","outcome":"failure",
    "failure":{"code":"upstream_status","details":{"status":429}},
    "request":{"method":"POST","url":"https://relay.example.com/v1/chat/completions"},
@@ -1495,6 +1535,7 @@ aproxy desktop                  W5
 
 样例里第 6 次尝试失败，下一次是第 6 次重试，现行退避给 20 秒（retry.rs:14-32），所以 `fallback.delay_ms` 是 20000，与上游的
 `retry-after: 60` 无关。尊重 Retry-After 的是 format：它回了 60000（D-15，R-S3-1）。
+这是另一个请求（`-44`）。§6.5、§10.4、§10.6 的前一段、§10.7、§10.11 的样例讲的是同一个请求 `-42`，时间线互相对得上；其余样例各用别的 `request_id`（T-S3-5 ④）。
 
 - **时机**：retry 请求的每次尝试失败之后。声明了 `decide.success` 的程序，在尝试成功之后也会收到：`outcome` 为 `success`，没有 `failure`。
   这用来把「200 但内容是错误」判为失败。
@@ -1532,15 +1573,17 @@ aproxy desktop                  W5
 **stream 阶段**：逐块处理，只能由 `persistent` 程序声明。
 
 ```json
-→ {"v":1,"seq":20,"stage":"stream","event":"open","stream_id":"19ac3f2e8b5d1a2b-42/1","request_id":"…","state":"…","request":{"method":"POST","url":"…"},"response":{"status":200,"headers":{"content-type":"text/event-stream"}}}
+→ {"v":1,"seq":20,"stage":"stream","event":"open","stream_id":"19ac3f2e8b5d1a2b-42/2","request_id":"…","state":"…","request":{"method":"POST","url":"…"},"response":{"status":200,"headers":{"content-type":"text/event-stream"}}}
 ← {"v":1,"seq":20,"response":{"headers":{"content-type":"text/event-stream"}},"abort_tail":"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"stream conversion aborted\"}}\n\n"}
-→ {"v":1,"seq":21,"stage":"stream","event":"data","stream_id":"19ac3f2e8b5d1a2b-42/1","data":"data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n"}
+→ {"v":1,"seq":21,"stage":"stream","event":"data","stream_id":"19ac3f2e8b5d1a2b-42/2","data":"data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n"}
 ← {"v":1,"seq":21,"data":"event: content_block_delta\ndata: {…}\n\n"}
-→ {"v":1,"seq":30,"stage":"stream","event":"close","stream_id":"19ac3f2e8b5d1a2b-42/1"}
+→ {"v":1,"seq":30,"stage":"stream","event":"close","stream_id":"19ac3f2e8b5d1a2b-42/2"}
 ← {"v":1,"seq":30,"data":"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"}
-→ {"v":1,"seq":31,"stage":"stream","event":"abort","stream_id":"19ac3f2e8b5d1a2b-42/2","reason":{"code":"upstream_body_interrupted"}}
+→ {"v":1,"seq":31,"stage":"stream","event":"abort","stream_id":"19ac3f2e8b5d1a2b-45/1","reason":{"code":"upstream_body_interrupted"}}
 ← {"v":1,"seq":31,"data":"…"}
 ```
+
+前三组是请求 `-42` 第 2 次尝试的流（升级为 retry 之后，回放时转换）；最后一组是另一个 forward 请求 `-45` 的流，上游中途断开。
 
 - **四种事件**：
   - open 的回信可以改状态与头，可以给出 `abort_tail`（format 中途失败时，aproxy 按客户端协议写出的收尾），也可以带初始的 `data`；
@@ -1591,16 +1634,17 @@ aproxy desktop                  W5
 
 ### 10.9 熔断（D-12）
 
-- **范围**：每个运行中的实例、每个 `[[format]]` 条目各有一个熔断器，只在内存里，重启即复位。
+- **范围**：每个运行中的实例、每个 `[[format]]` 条目各有一个熔断器（声明了 notify 的另有一个 notify 的熔断器，见下），只在内存里，重启即复位。
 - **计数**：
-  - 这个程序的进程级失败，跨请求、跨阶段按完成顺序连续计数：起不来、I/O 错误、中途退出、超时（含 decide 与 hello）、协议错误、输出不合法。
+  - 这个程序在数据通路的消息（notify 以外）上的进程级失败，跨请求、跨阶段按完成顺序连续计数：起不来、I/O 错误、中途退出、
+    超时（含 decide 与 hello）、协议错误、输出不合法。
   - 任何一个合法回信都把计数清零；`fail` 回信与「不表态」都算合法回信。客户端断开不计。
-  - notify 例外（R-S2-1）：只有写不进 stdin 与进程退出计入。notify 的回信超时或不合法都不计入，那个 worker 照样换掉（§10.1）；
-    notify 的合法回信也不清零计数，否则一个数据通路坏掉、却还能应答通知的程序永远熔断不了。
+  - notify 不计入这个熔断器，它的回信也不清零这里的计数：notify 有自己的熔断器（见下，T-S2-1）。
+    否则一个数据通路坏掉、却还能应答通知的程序永远熔断不了；反过来，通知这条路出了问题，也不该把判断路径一起关掉。
 - **熔断**：计数达到 `breaker_failures`（默认 5，0 表示永不熔断），状态转为 `open`：
   - 杀掉这个程序的空闲 worker；
   - 记下 `opened_at`，`probe_at` 等于 `opened_at` 加上 `breaker_cooldown_secs`（默认 30）。
-- **熔断期间**，新的阶段入口都不再发给这个程序：
+- **熔断期间**，新的阶段入口都不再发给这个程序；熔断那一刻已在排队、还没写出的消息也一样（T-S3-8 ④）：
 
 | 阶段 | required 程序 | 可选程序 |
 |---|---|---|
@@ -1614,18 +1658,27 @@ aproxy desktop                  W5
   定稿要求 decide 出错一律回落，用户 09-23 也定过响应侧失败就透传。
 - 可选程序熔断时，请求走配置的默认投递方式（R-S1-1）：
   - 默认 `retry`：照常无限重试，规则表与现行退避就是静态兜底；
-  - 默认 `forward`：能让请求转入 retry 的程序全都不可用期间，请求一律不重试。doctor 对这种配置给出 `forward_default_unguarded`。
+  - 默认 `forward`：请求转入 retry，靠 decide 程序升级，或 request 程序回 `delivery`。decide 程序不可用时视为不表态，不论 required 与否都不升级；
+    可选的 request 程序被跳过，也给不出 retry。这期间请求一律不重试，doctor 对这种配置给出 `forward_default_unguarded`（§2.4，T-S3-1）。
 - **半开**：到了 `probe_at`，下一条要发给这个程序的数据通路消息作为试探放行（同一时刻只放一条），状态为 `half_open`；其余消息仍按熔断处理，
-  notify 不作试探，熔断与半开期间一律丢弃并计数。
+  notify 不作这个熔断器的试探，熔断与半开期间一律丢弃并计数。
   - persistent 程序的试探用新起的 worker，先握手。
   - 试探成功：转为 `closed`，计数清零。
   - 试探失败：重新 `open`，冷却重新计时，时长不翻倍。试探所在的请求按单次故障处理；它的下一次尝试遇到熔断，就立即结束。
+- **notify 的熔断器**（T-S2-1）：声明了 notify 的程序另有一个，只管 notify。规则与上面相同，沿用同样的 `breaker_failures` 与 `breaker_cooldown_secs`：
+  - 计数：notify 的失败按完成顺序连续计数，包括为它起的 worker 起不来、写不进 stdin、进程退出、超时（§10.11 的固定时限）、回信不合法；
+    notify 的合法回信清零。
+  - 熔断：暂停派发 notify，排队的与新到的通知丢弃并计数；不杀 worker，数据通路照常。
+  - 半开：冷却之后放一条 notify 试探（其余的仍丢弃），成功就恢复，失败就重新熔断。
+  - 数据通路的熔断器打开期间，notify 照上表丢弃，这些丢弃不计入 notify 的熔断器。
+  - 只声明 notify 的程序只有这一个熔断器起作用：启动握手失败时由它以 `open` 起步，冷却后用 notify 试探，所以能恢复；
+    其余程序握手失败时，是数据通路的熔断器以 `open` 起步。
 - **单次故障仍按 D-6 应重试**，只有连续故障才熔断。网络类失败从不触发熔断：上游永远连不上时，仍然无限重试。
 - **可见性**：
-  - 快照的 `formats[].breaker` 给出状态、计数、`opened_at`、`probe_at` 与最近一次失败；
+  - 快照的 `formats[].breaker` 给出状态、计数、`opened_at`、`probe_at` 与最近一次失败；notify 的熔断器在 `formats[].notify_breaker`，形状相同；
   - 状态变化立即发 `state` 事件，界面据此显示「不可用、试探中」。
 - **日志**：
-  - 熔断写一行 WARN，带 `format=`、`failures=`、`cooldown_secs=`；半开与恢复各写一行 INFO；
+  - 熔断写一行 WARN，带 `format=`、`failures=`、`cooldown_secs=`；半开与恢复各写一行 INFO；notify 的熔断器另带 `stage=notify`；
   - 因熔断而结束的请求，日志带 `code=format_unavailable`。
 
 ### 10.10 投递方式：按请求在 forward 与 retry 之间选（用户追加 2026-10-12）
@@ -1660,9 +1713,12 @@ aproxy desktop                  W5
   记录的终态码为 `upstream_failed`，完成通知的 `stream_completed` 为 false。
 
 **forward 请求的「200 但内容是错误」**（R-S3-8）：
-- 转发的字节一个不改。aproxy 在历史副本上被动地做 retry 请求用的同一套判定（`is_error_body`、`is_stream_error_body`）；
-  体没有入库时（预算为 0 或超出），就在一份旁路副本上做。
-- 压缩体先解码一份副本再查（记忆 2026-09-14）；旁路副本的解码上限沿用现行检查路径的 8 MiB，超出就不判。
+- 转发的字节一个不改。aproxy 在旁边被动地做 retry 请求现行的那套判定，做法也一样，与历史是否保留了体无关（T-S3-4）：
+  - 响应不超过 1 MiB（`RESIDENT_LIMIT`，proxy.rs:459）时，留一份原始字节的副本；压缩体先解码（输出上限 8 MiB，记忆 2026-09-14），
+    再用 `is_error_body`、`is_stream_error_body` 判定；
+  - 超过 1 MiB 的不留副本，改用现行磁盘模式的增量行扫描（`StreamErrorScanner`，proxy.rs:891），只看原始字节、不解码
+    （decode.rs:35-38 记的已知边界）。
+  - 所以判定不在预算之外占内存：几百 MB 的下载也只多占这 1 MiB。
 - 判定为错误时，这次尝试的码记为 `upstream_error_body`，记录的 `outcome` 为 `upstream_error`、`code` 为 `upstream_failed`，
   完成通知也这样报。否则 adaptive 靠完成通知判断成败时，对这类常见故障是盲的，界面也会把它显示为成功。
 
@@ -1692,13 +1748,18 @@ aproxy desktop                  W5
   - `stream_completed`：流式响应是否正常结束，不是流式响应时为 null；
   - `outcome`、`code` 与请求记录相同（§6.5）；
   - `digest` 只给在 notify 上声明了 digest 的程序（§10.2）；请求体不完整时为 null。
-- **只发不等，绝不拖慢数据通路**（R-S2-1）：
+- **只发不等，绝不拖慢数据通路**（R-S2-1、T-S2-1）：
   - format 照常回空回信 `{v, seq}`，保持一问一答；aproxy 不在数据通路上等它。
-  - 派发：notify 只在这个程序有空闲 worker、且没有数据通路的消息排队时才写出（§10.1）。数据通路的消息最多等一条已经写出的 notify。
-  - 时限：notify 的回信时限等于 `decide_timeout_secs`，从写出时起算。超时或回信不合法时，那个 worker 被换掉，但不计入熔断。
-  - 熔断：只有写不进 stdin 与进程退出计入（§10.9）。所以观察路径变慢，不会把判断路径一起关掉。
+  - 派发：notify 只在这个程序有空闲 worker、且没有数据通路的消息排队时才写出（§10.1）。数据通路的消息最多等一条已经写出的 notify，
+    上限是下面的固定时限，加上超时之后换 worker 的时间。
+  - 时限：固定 2 秒（E 级常量），从写出时起算，不随 `timeout_secs`、`decide_timeout_secs` 变。所以它们取 0（不限）时，
+    一条卡住的 notify 也不会让请求永久挂起。超时或回信不合法时，那个 worker 被换掉。
+  - 熔断：notify 的失败只计入 notify 自己的熔断器（§10.9），连续达到 `breaker_failures` 就暂停派发 notify，冷却后放一条 notify 试探。
+    数据通路的熔断器不受影响，所以观察路径出问题，不会把判断路径一起关掉；一个总是超时的 notify，也不会让数据通路每次都等。
   - 队列：每个程序一个，按条数与字节都设上限（E 级常量：1024 条、16 MiB，`state` 计入字节，R-S3-7 ②③）。
-    超出时丢弃最旧的并计数；熔断期间的通知直接丢弃并计数。计数在快照的 `formats[].notify_dropped_total`，日志里限频告警。
+    超出时丢弃最旧的并计数；任一熔断器打开期间的通知直接丢弃并计数。计数在快照的 `formats[].notify_dropped_total`，日志里限频告警。
+  - 高负载：数据通路一直有消息排队时，notify 可能一直派发不出去，只能丢弃并计数。协议文档写明：判断类程序可以把
+    「同一个摘要再次出现」当作补充信号，客户端重发往往说明上次失败了（T-S3-8 ⑤）。
 - **约束**：声明 notify 的程序必须是 `persistent`（§7.4）。
 - **以后（加性）**：hello 的 `features` 可以协商「一个 worker 上同时有多条在途消息」。`seq` 已经能把回信对上，
   单进程的程序可以自己开线程，`pool_max = 1` 也就不再是瓶颈。
@@ -1713,7 +1774,10 @@ aproxy desktop                  W5
 - 完成通知让 format 在请求之外积累判断，例如 adaptive 按摘要统计失败（用户 2026-10-12）。只发不等、处理不过来就丢，
   它拖累数据通路的上限是一条在途的 notify。
 - 保留空回信：一问一答是串包检测的根基（§10.1），通知也不例外（S3-33）。aproxy 不在数据通路上等它。
-- notify 与熔断解耦：观察路径慢了或乱了，不该把同一个程序的判断路径也关掉（R-S2-1）；只有进程级失败说明程序真的坏了。
+- notify 有自己的熔断器：观察路径慢了或乱了，不该把同一个程序的判断路径也关掉（R-S2-1）；可它自己也要有保护，
+  否则一个总是卡住的 notify 会让每条通知都换一次 worker，只声明 notify 的程序熔断之后也永远等不到试探（T-S2-1）。
+- 时限是固定常量：借用 `decide_timeout_secs` 的话，它取 0（不限）时一条卡住的 notify 会让 worker 一直忙着，
+  排在后面的请求就此挂起（T-S2-1）。记一笔账用不了 2 秒，这一项也不需要用户来调。
 - 不给 notify 单独开 worker：adaptive 在 request 阶段查、在 notify 时记的是同一张表，拆到两个进程里，判断就看不到结果了。
 - 丢最旧的：判断类程序更需要新近的结果。
 - 只许 persistent：spawn 模式每条通知都要起一个进程，代价不成比例，也存不住跨请求的状态。
@@ -1782,15 +1846,15 @@ aproxy-format 是官方单元的合集：`aproxy-format <角色>` 只启用一�
 | 错误码表及其 HTTP 状态、退出码、`details` 的键与类型；IPC 结果到 CLI 的对应 | A | §2 |
 | HTTP 错误体、两个 `x-aproxy-*` 头、SSE 终态事件 | A | §3 |
 | `request_id`、`request_seq`、`instance_id` | A | §1.3 |
-| 布局与文件名；记录 schema 1（instance、restore、spec、watchdog、skills manifest）；spec 的 `config_path` 可为 null、端口 0 钉成实际端口；心跳与宣告的布局；`home_id` 与端点名；清理规则；一个端口一个实例 | A | §4 |
-| 内部入口 `__serve`、`__watchdog`、`install --continue --handover-from` 及其参数；`starting` 状态与就绪判定 | A | §5 |
+| 布局与文件名；记录 schema 1（instance、restore、spec、watchdog、skills manifest）；spec 与实例记录的 `config_path` 可为 null；spec 的 `pinned_port`（端口 0 钉成的实际端口，配置改成固定端口后不用）；被新端口的记录接替的期望状态记录由拉起方删；install.state 的 `halted`；心跳与宣告的布局；`home_id` 与端点名；清理规则；一个端口一个实例 | A | §4 |
+| 内部入口 `__serve`、`__watchdog`、`install --continue --handover-from` 及其参数；`starting` 状态与就绪判定；install 在广播之前的检查与预检 | A | §5 |
 | IPC v1：帧、规则、op 与参数、结果形状、错误码、事件、`features`、记录的上界（前 3 加后 20、单条 64 KiB 与截短顺序）、`body` 的分块读取与体的口径（解码、替换之后的字节） | A | §6 |
 | config.toml 的键、类型、默认值、0 的含义、层级；严格解析；头表按名合并与凭据只发给所属目标（D-16） | A | §7 |
 | settings.json schema 1；`defaults` 的范围（D-16）；`ui` 归桌面所有 | A | §8 |
 | 命令树、旗标、退出码、`--json`、install 的 NDJSON、stdout 纪律 | A | §9 |
 | format 协议 1：hello（含 `request_body` 粒度与摘要算法）、`seq`、各阶段的消息、补丁语义、fail、overrides、`delivery` 与请求内升级、notify 的 `request_end` 事件与丢弃语义、worker 的占用与计时、notify 的派发与熔断规则、report、熔断的语义与配置键、hello 至少等 10 秒 | A | §10 |
 | 日志里的 `code=`、`request_id=` 字段 | A | §1.1 |
-| 文案与 `message`、调参常量（30 秒就绪时限、1000 条记录、`body` 单块 1 MiB、notify 队列 1024 条与 16 MiB、10 分钟宽限、流式连接上限 8 等）、doctor 的检查项 | E | — |
+| 文案与 `message`、调参常量（30 秒就绪时限、1000 条记录、`body` 单块 1 MiB、notify 队列 1024 条与 16 MiB、notify 时限 2 秒、10 分钟宽限、流式连接上限 8 等）、doctor 的检查项 | E | — |
 | 规则的 `body` 匹配器；format 的 admit 阶段；notify 的 attempt 事件 | R | §7.3、§10.11、§10.12 |
 
 ---
@@ -1900,16 +1964,18 @@ aproxy-format 是官方单元的合集：`aproxy-format <角色>` 只启用一�
 细化（R-S3-9 ④）：「代理口令只跟默认 proxy」实现为「最终的 proxy 与 `defaults.proxy` 指向同一个代理」，比较 scheme、主机与端口，
 不比 userinfo，比字面略宽。它满足用户同意的原则「凭据只发给它所属的目标」，主会话已定（§13.3），不再请用户过目。
 
-### 13.3 主会话按用户授权定下的（第二轮复审，2026-10-12）
+### 13.3 主会话按用户授权定下的（第二轮复审与第三轮核对，2026-10-12）
 
 用户授权主会话在已有原话的范围内决定复审各条。下表记下依据；没有直接用户原话的，写明实际依据。
+
+**第二轮复审**（R-S1-1…R-S3-18）。其中 R-S2-1、R-S2-3 的一部分被第三轮的决定取代，见下一张表。
 
 | 复审条目 | 决定 | 依据 | 落点 |
 |---|---|---|---|
 | R-S1-1 | 推荐配方与 `init` 沿用默认 `delivery = "retry"`，adaptive 对没失败过的请求回 forward；不加「跳过就按 retry 投递」的 A 级覆盖（会推翻用户显式写的 forward）；doctor 对「默认 forward、能升级的程序都可选」告警 | 用户：「对于无限重试依旧保持默认」（计划 D-15 后的补充） | §2.4、§7.2、§10.9、§10.10、§10.14 |
-| R-S2-1 | 数据通路的消息优先，notify 只在有空闲 worker、且没有数据通路的消息排队时派发；计时从写出起；notify 除写不进去与进程退出外，一律不计入熔断 | 用户拆单元的理由：「消息处理有先后顺序，全靠单个进程在超高频时容易阻塞」；完成通知「只发不等回信」（计划 W2c，主代理细化、用户同意） | §10.1、§10.9、§10.11 |
+| R-S2-1 | 数据通路的消息优先，notify 只在有空闲 worker、且没有数据通路的消息排队时派发；计时从写出起；notify 除写不进去与进程退出外，一律不计入熔断（第三轮改为 notify 一切失败都只计入它自己的熔断器，见 T-S2-1） | 用户拆单元的理由：「消息处理有先后顺序，全靠单个进程在超高频时容易阻塞」；完成通知「只发不等回信」（计划 W2c，主代理细化、用户同意） | §10.1、§10.9、§10.11 |
 | R-S2-2 | 历史存解码后的字节并记下原来的 content-encoding；解码到超出预算就停，记为 `not_retained`；按流替换已知密钥，重叠窗口不短于最长密钥减一 | 用户：「全部暂留在储存中」（D-13）；「aproxy的ui只是ui而已，实际看不到任何东西，敏感内容全在aproxy其他实例中」（2026-10-11，记忆 0.2.0-direction），由此有「IPC 永不返回明文密钥」 | §1.5、§6.5 |
-| R-S2-3 | 端口为 0 时把实际端口钉进 spec；恢复时回到同一个端口，被占就按固定端口的常规失败处理 | 无直接原话。主会话的理由：客户端配的是这个端口，恢复时要回到同一个端口；对应项目的核心目标（AGENTS.md：「Enable infinite retries (and uninterrupted operation) for the agent program's requests」） | §4.2、§5 |
+| R-S2-3 | 端口为 0 时把实际端口钉进 spec；恢复时回到同一个端口，被占就按固定端口的常规失败处理（第三轮补充：配置改成固定端口后以配置为准，见 T-S3-6） | 无直接原话。主会话的理由：客户端配的是这个端口，恢复时要回到同一个端口；对应项目的核心目标（AGENTS.md：「Enable infinite retries (and uninterrupted operation) for the agent program's requests」） | §4.2、§5 |
 | R-S2-4 | 续作入口在广播之前检查管不了的实例，查到就以 failed 加 `last_error` 结束 | 无直接原话；依据计划 W1 对升级路径的要求：「必须在改动任何东西之前失败，不能半途坏掉（实例失联、二进制已换）」 | §4.2、§4.3、§5 |
 | R-S3-8 | forward 请求的「200 但内容是错误」在副本上被动判定，写进记录与完成通知，不改动转发的字节 | 用户提出的「先仅转发、失败多次再无限重试」（2026-10-12）：要数失败，就得先看得见失败 | §6.5、§10.10 |
 | R-S3-9 ③④⑤ | ③ URL 内嵌的 userinfo 随 URL 值整体以配置为准，不拼接；④ 按「同一个代理」比较；⑤ base_url 连路径一起比较 | 「凭据只发给它所属的目标」（D-16，主代理补、用户「可以」） | §7.5、§13.2 |
@@ -1918,6 +1984,18 @@ aproxy-format 是官方单元的合集：`aproxy-format <角色>` 只启用一�
 | R-S3-15 | 契约测试里的 `use` 路径不算契约：B0、P4 只许改 `use` 行，断言逐字不变；AGENTS.md 与 CLAUDE.md 一起改 | 用户：「从现在开始保持绝对兼容」（W2b，2026-10-11）：契约测试的断言一个字都不能动 | §6.6、§14 |
 | R-S3-16 | 标为对 D-12 的细化：required 程序只在 request、retry 阶段让请求快速失败，其余阶段回落或跳过（按复审建议） | D-12 的用户决定，以及用户 2026-09-23 拍板的「响应侧失败 → 透传上游原始响应 + warn」（记忆 transform-format 的记载） | §10.9 |
 | R-S3-17 | install 与 stop、status 一样，settings.json 读不了时用内置默认运行并告警；start 的报错说清怎样修；迁移文档写明 0.1.x 的 settings.json 要删除或重写 | 用户：「直接报错表示参数错误，不做任何兼容检测」（D-14）。用内置默认运行不是兼容代码，只保证用户总有修复的路 | §8.2、§9.5 |
+
+**第三轮核对**（T-S2-1…T-S3-8）。主会话定的原则：用最简单、最少新机制的改法收口；能用一个固定常量或一句明确规定解决的，就不加可配置项。
+其余各条按复审建议改，见 §15。
+
+| 核对条目 | 决定 | 依据 | 落点 |
+|---|---|---|---|
+| T-S2-1 | notify 单独计数、单独暂停派发，相当于 notify 自己的熔断，不影响数据通路；只声明 notify 的程序用 notify 做半开试探；notify 的时限改为固定常量，不借用 `decide_timeout_secs` | D-12 的用户决定（计划的记载：连续故障才熔断，冷却后试探）；完成通知「只发不等回信」（计划 W2c）；项目目标的 uninterrupted operation（AGENTS.md）：请求不能因为一条通知卡住而永久挂起 | §6.4、§10.1、§10.9、§10.11 |
+| T-S2-2 | 滚动重启停掉实例之前，先用目标版本的 §7.5 管线预检（含 settings），不过就不停，并给出原因 | 无直接原话；依据计划 W1 对升级路径的要求「必须在改动任何东西之前失败，不能半途坏掉（实例失联、二进制已换）」，以及 install/restart.rs 模块文档的「升级是『不中断运行』使命里最脆弱的一环」 | §2.4、§5、§8.2、§9.5 |
+| T-S2-3 | B0 的验收改为：AGENTS.md 与 CLAUDE.md 讲永久契约的那段逐字一致，列出 C3 冻结代码所在的全部文件；同一句补上「冻结的是断言，`use` 路径可以随代码移动」 | 用户：「从现在开始保持绝对兼容」（W2b，2026-10-11）：讲永久契约的那段必须一直指向全部冻结代码 | §6.6、B0 |
+| T-S3-1 | 改正 `forward_default_unguarded` 的条件，让「默认 forward，adaptive 可选，convert 与 keys 是 required」的配置能报出来 | 用户：「对于无限重试依旧保持默认」 | §2.4、§10.9 |
+| T-S3-2 | R-S2-4 的失败现场置 `halted = true` | 无直接原话；alpha.1 已发布的续作只拒绝「failed 且 halted」的现场（flow.rs:713-731），不置就会被反复接管 | §4.2、§4.3、§9.2 |
+| T-S3-6 | 钉进 spec 的端口只在配置解析出的端口仍是 0 时生效；配置改成固定端口后以配置为准 | 无直接原话；R-S2-3 只在端口 0 时钉的理由（不让旧端口盖掉用户后来改的配置），对钉过之后的修改同样成立 | §4.2、§5 |
 
 没有待用户拍板的问题。
 
@@ -1937,7 +2015,7 @@ aproxy-format 是官方单元的合集：`aproxy-format <角色>` 只启用一�
 | P1 | R1：`tests/common` 的 TestHome。所有 CLI 子进程经它拉起，统一注入 `APROXY_HOME` 与 `APROXY_LANG=en`，清掉代理变量；守卫合一 | 无 | 全仓测试里没有绕过 `TestHome::cmd()` 直接拉起 aproxy 的地方（有 grep 检查）；Windows 与 ubuntu 全绿 |
 | P2 | S1：proxy.rs 拆进 `src/proxy/`，抽出 `classify`，合并成单一的尝试循环 | P1 | 拆分前后测试数一致（用独立的 target 目录核对）；`classify` 有单测；源码里只剩一个尝试循环 |
 | P3 | R2b：reqwest、axum 先升，toml、zip、sha2 随后；每个升级单独提交 | P2 | `cargo tree` 显示新版本；每个提交全量测试通过 |
-| P4 | S2：平台原语移出 watchdog.rs；`home.rs`、`fsx.rs`；四处「拉起并等就绪」合一。home 的解析若移出 settings.rs，`tests/force_contract.rs` 的 `use aproxy::settings::{HOME_ENV, …}` 只改 `use` 行（R-S3-15） | P1 | 四处调用同一个函数；start 有早退检测：子进程因配置错误退出时，1 秒内报错；force_contract 除 `use` 行外逐字不变并通过 |
+| P4 | S2：平台原语移出 watchdog.rs；`home.rs`、`fsx.rs`；四处「拉起并等就绪」合一。home 的解析若移出 settings.rs，`tests/force_contract.rs` 的 `use aproxy::settings::{HOME_ENV, …}` 只改 `use` 行（R-S3-15）；比 B0 先落地时，同时改测试的文件头那句与 AGENTS.md、CLAUDE.md 的那半句（§6.6，T-S3-8 ③） | P1 | 四处调用同一个函数；start 有早退检测：子进程因配置错误退出时，1 秒内报错；force_contract 除 `use` 行与文件头那句外逐字不变并通过 |
 | P5 | S3：操作层，lib 不打印、不 `process::exit` | P4 | lib 里没有 `println!` 与 `process::exit`（有 grep 检查）；CLI 只负责渲染 |
 
 顺序：P1 → P2 与 P4 并行 → P3 跟在 P2 之后，P5 跟在 P4 之后。
@@ -1946,20 +2024,20 @@ aproxy-format 是官方单元的合集：`aproxy-format <角色>` 只启用一�
 
 | 块 | 内容 | 依赖 | 验收 |
 |---|---|---|---|
-| B0 | 新建 aproxy-ipc：码表（含 `details` 的键与类型，并导出 JSON）、`redact`、端点名与 `home_id`；C3 的读者与启动标记推导从 `src/ledger.rs` 迁入。`tests/force_contract.rs` 只改 `use` 行，断言逐字不变，文件头那句同步写明「`use` 路径不算契约」；AGENTS.md 与 CLAUDE.md 一起改路径（两份是独立副本，R-S3-15） | P1 | 依赖只有 serde、serde_json、tokio、sha2、钉版的 windows-sys，以及 unix 上的 libc；码唯一且是 snake_case，每个码都按族带有 HTTP 状态或退出码；渲染出的文档与仓库一致；force_contract 除 `use` 行与文件头那句外逐字不变并通过；AGENTS.md 与 CLAUDE.md 里都不再出现 `src/ledger.rs` |
+| B0 | 新建 aproxy-ipc：码表（含 `details` 的键与类型，并导出 JSON）、`redact`、端点名与 `home_id`；C3 的代码整体从 `src/ledger.rs` 迁入一个文件：条目结构与写者、读者与它的义务（`terminate`、`remove_if_unchanged`）、启动标记推导（§6.6，T-S2-3）。`tests/force_contract.rs` 只改 `use` 行，断言逐字不变；文件头那句与 AGENTS.md、CLAUDE.md 讲永久契约的那段同步改（两份是独立副本，R-S3-15） | P1 | 依赖只有 serde、serde_json、tokio、sha2、钉版的 windows-sys，以及 unix 上的 libc；码唯一且是 snake_case，每个码都按族带有 HTTP 状态或退出码；渲染出的文档与仓库一致；force_contract 除 `use` 行与文件头那句外逐字不变并通过；AGENTS.md 与 CLAUDE.md 讲永久契约的那段逐字一致，列出 C3 冻结代码迁移后的全部文件，列出的文件都存在，末句写明「契约测试冻结的是断言，`use` 路径可以随代码移动」（T-S2-3） |
 | B1 | 数据面的错误出口：§2.1、§2.2、§3、`request_id` | P2、P3、B0 | 每个能触发的自产 4xx/5xx 都有集成测试：体是 JSON、带两个头；源码里只有一个 `event: error` 构造函数；同一请求在头、体、日志里的 `request_id` 相同；真实 SDK 各解析一次，结果记进计划 |
 | B2 | config.toml：§7 的键、严格解析、`resolve`、写回 | P3、B0 | §7.2 的样例能解析；任何未知键（含规则与 `[[format]]` 条目里的）都让启动失败，并指出文件与键；四层 `sources` 正确；写回保留注释；两个写者并发 `set` 不丢更新；`unset` 能删未知键 |
 | B3 | settings.json：§8，含 D-16 的继承规则（§7.5） | B2 | 未知键报错并指出键路径；schema 2 被拒，提示出路；无效时 stop 与 status 仍能按端口工作，`settings set` 能逐项修复；`ui` 里任意内容都不报错。D-16：头表按名合并（只差大小写的算同名，配置优先）；最终 `base_url` 与默认不同时，默认 key 与密钥头不继承，`withheld` 列出它们，配置自己也没有 key 时报 `default_credential_withheld`；`https://API.example.com/` 与 `https://api.example.com` 算同一目标；`defaults` 有 `api_key` 却没有 `base_url` 时报 `config_missing_key`；`settings show` 对密钥给占位，占位写回不改原值；Windows 上 settings.json 的 DACL 只有当前用户、SYSTEM、Administrators。先设 `defaults.api_key` 被拒，报错提示先设 `defaults.base_url`，按这个顺序再设就成功（R-S3-10）；`defaults.proxy` 带 userinfo、配置写了不带 userinfo 的同一个代理时，用配置的值，不拼接 |
 | B4 | 重试与超时：§7.3、K13、K14 | P2、B2 | 规则第一条命中、`max_attempts = 0` 豁免、按尝试序号计数；不读 Retry-After（上游给 `retry-after: 600` 时，第 2 次尝试仍立即发出）；首字节超时与读空闲超时各报各的码；`max_response_mb = 0` 表示不限 |
-| B5 | 持久层与拉起：§4、§5 | P4、B0、B3 | `tests/contract_v0_2.rs` 钉住全部记录；读不懂的记录不被删除；两个平台上守护与看护者的命令行里都没有密钥；Windows 上只设大写 `HTTPS_PROXY` 时，restart 之后仍走代理；ubuntu 上对启动者的进程组发 SIGINT，实例仍在；restart 遇到写错的配置时不动旧实例；restore 遇到暂时缺失的配置时保留记录；`start && stop` 之后实例不会被拉回；启动要 9 秒的 format 不被判为就绪超时；端口为 0 的后台实例崩溃后，被拉回到同一个端口，run/ 里始终只有一份期望状态记录（R-S2-3）；没有配置文件、只靠 `defaults` 启动的实例能被 restore 拉回（R-S3-13）；restart 对快照里没有 `shutdown.keep_restore` 的旧实例发不带参数的 shutdown，之后记录仍在（R-S3-14） |
-| B6 | IPC v1：§6.1–§6.4、§6.6 | B5、B1 | 每个 op 的请求、成功、每种错误都有 golden；未知参数回 `unsupported_arg`；模拟新旧客户端与服务端互连，多出的字段被忽略；`base_url` 带 userinfo 时快照里已打码；四种 liveness 都能区分出来 |
+| B5 | 持久层与拉起：§4、§5 | P4、B0、B3 | `tests/contract_v0_2.rs` 钉住全部记录；读不懂的记录不被删除；两个平台上守护与看护者的命令行里都没有密钥；Windows 上只设大写 `HTTPS_PROXY` 时，restart 之后仍走代理；ubuntu 上对启动者的进程组发 SIGINT，实例仍在；restart 遇到写错的配置时不动旧实例；restore 遇到暂时缺失的配置时保留记录；`start && stop` 之后实例不会被拉回；启动要 9 秒的 format 不被判为就绪超时；端口为 0 的后台实例崩溃后，被拉回到同一个端口，run/ 里始终只有一份期望状态记录（R-S2-3）；这样钉过端口的配置改成固定端口之后，restart 与看护者都用新端口，旧端口的记录被删掉（T-S3-6）；没有配置文件、只靠 `defaults` 启动的实例能被 restore 拉回（R-S3-13）；restart 对快照里没有 `shutdown.keep_restore` 的旧实例发不带参数的 shutdown，之后记录仍在（R-S3-14） |
+| B6 | IPC v1：§6.1–§6.4、§6.6 | B5、B1 | 每个 op 的请求、成功、每种错误都有 golden；未知参数回 `unsupported_arg`；模拟新旧客户端与服务端互连，多出的字段被忽略；`base_url` 带 userinfo 时快照里已打码；没有配置文件的实例，快照的 `instance.config_path` 为 null（T-S3-7）；四种 liveness 都能区分出来 |
 | B7 | 访问控制：§1.6 | B6 | Windows 上读回管道的 DACL，只有当前用户与 SYSTEM；ubuntu 的 CI 里建第二个用户（runner 有免密 sudo），断言它连不上、root 能连上；home 为 0700；权限过宽的既有 home 在第一次写配置后被收紧；临时文件一创建就是 0600，rename 之前不可被他人读取（R-S3-12）；`body` 只在这一块之后出现在 `ops` 里 |
 | B8 | 请求历史、`body`、`subscribe`、事件：§6.3、§6.5、§6.7 | P2、B1、B3、B6、B7（B3：已知密钥包括 settings `defaults` 里的） | 见下面的阈值 |
-| B9 | 命令行：§9（含 install 的 `--json`、`--check`、A5 的四个字段，以及 §4.3 第 7 条的拒绝） | P5、B2、B3、B5、B6 | §9.5 的每一格都有测试；每个命令的 `--json` 都有 golden；带 `RUST_LOG=info` 运行时 stdout 里没有日志行；`install --force --json` 退出 2；遍历命令树的帮助测试；以 `install --continue --handover-from` 接手的路径有测试；台账里登记为 instance、却没有实例记录的活进程在场时，普通安装在改动任何东西之前失败（`install_unmanaged_instances`）；模拟 alpha.1 的安装者交棒、同时 home 里有 alpha.1 启动的活实例时，续作在广播之前以 failed 结束，`error_code` 为 `install_unmanaged_instances`，`last_error` 为英文，bin 与实例都没动（R-S2-4）；W2 写出的 `pending_restores` 恒为空（R-S3-11）；settings.json 无效时 install 仍能运行并告警（R-S3-17） |
+| B9 | 命令行：§9（含 install 的 `--json`、`--check`、A5 的四个字段，§4.3 第 7 条的拒绝，以及 §5 的预检） | P5、B2、B3、B5、B6 | §9.5 的每一格都有测试；每个命令的 `--json` 都有 golden；带 `RUST_LOG=info` 运行时 stdout 里没有日志行；`install --force --json` 退出 2；遍历命令树的帮助测试；以 `install --continue --handover-from` 接手的路径有测试；台账里登记为 instance、却没有实例记录的活进程在场时，普通安装在加锁与下载之前就失败（`install_unmanaged_instances`，T-S3-3）；模拟 alpha.1 的安装者交棒、同时 home 里有 alpha.1 启动的活实例时，续作在广播之前以 failed 结束，`halted` 为 true，`error_code` 为 `install_unmanaged_instances`，`last_error` 为英文，bin 与实例都没动；之后在这个 home 里执行 alpha.1 的 `aproxy stop all`，它拉起的续作不接管这个现场（R-S2-4、T-S3-2）；W2 写出的 `pending_restores` 恒为空（R-S3-11）；settings.json 无效、没有活实例时 install 照常完成并告警（R-S3-17）；settings.json 无效、有活实例时 install 以 `install_precheck_failed` 结束，退出码 3，`halted` 为 true，实例没被停、bin 没换（T-S2-2）；`halted` 的现场在场时，W2 的变更类命令不拉起续作（T-S3-2） |
 | B10a | format 协议核心：hello（含 spawn）、`seq`、链与重试段、request、retry、response、heartbeat、fail、overrides、report、熔断 | P2、B1、B4 | format-echo 升级到协议 1，覆盖坏 `seq`、缺 hello、中途崩溃；链的顺序；配置违反「retry 在后段」时启动失败；没声明 retry 的程序成功之后，重试时收不到消息；熔断：连续 5 次失败之后返回 503，冷却后的试探成功就恢复；网络失败不触发熔断；心跳回信改不了 state |
 | B10b | decide：`decide.success`、`reroute`、体上限 | B10a | 第一个表态者生效；`reroute:false` 时重用上一次的请求；decide 超时回落，并计入熔断 |
 | B10c | stream：retry 的回放转换与 forward 的实时转换 | B10a | forward 下的流式转换端到端通过；中途失败时写出 `abort_tail`；流结束后 worker 的回收符合 §10.6 |
-| B10d | 按请求选投递方式与 notify：§10.2 的 `request_body` 与摘要、§10.10、§10.11；删掉 config.rs:586-592 的互斥 | B10b、B10c | `delivery = "forward"` 与 `[[format]]` 同配能启动；两个程序先后给 `delivery` 时第一个生效；forward 请求遇上游 503、一个字节都没写出时，decide 回 retry 就升级，客户端只收到重试成功的响应，记录的 `upgraded` 为 true；2xx 的流中途断开不升级；只要摘要的程序收到正确的 SHA-256，它的 stdin 上没有正文（4 MiB 的请求体，统计写进管道的字节数）；一个从不读 stdin 的 notify 程序在场时，吞吐与 p99 仍满足 B8「没有订阅者」的阈值，`notify_dropped_total` 增长；forward 下经 stream 转换不攒块：上游每 100 毫秒发一块时，客户端在上游首块之后 200 毫秒内收到首块；§7.2 那种 adaptive 同时声明 request、decide、notify 的链，在 64 个并发连接下吞吐与 p99 满足 B8「没有订阅者」的阈值（R-S2-1）；notify 回信超时不改变熔断计数；forward 请求拿到「200 但内容是错误」时，记录与完成通知的 `outcome` 为 `upstream_error`，客户端收到的字节与上游逐字节一致（R-S3-8）；被 403、413 拒绝的请求不发 notify（R-S3-7） |
+| B10d | 按请求选投递方式与 notify：§10.2 的 `request_body` 与摘要、§10.10、§10.11；删掉 config.rs:586-592 的互斥 | B10b、B10c | `delivery = "forward"` 与 `[[format]]` 同配能启动；两个程序先后给 `delivery` 时第一个生效；forward 请求遇上游 503、一个字节都没写出时，decide 回 retry 就升级，客户端只收到重试成功的响应，记录的 `upgraded` 为 true；2xx 的流中途断开不升级；只要摘要的程序收到正确的 SHA-256，它的 stdin 上没有正文（4 MiB 的请求体，统计写进管道的字节数）；一个从不读 stdin 的 notify 程序在场时，吞吐与 p99 仍满足 B8「没有订阅者」的阈值，`notify_dropped_total` 增长；forward 下经 stream 转换不攒块：上游每 100 毫秒发一块时，客户端在上游首块之后 200 毫秒内收到首块；§7.2 那种 adaptive 同时声明 request、decide、notify 的链，在 64 个并发连接下吞吐与 p99 满足 B8「没有订阅者」的阈值（R-S2-1）；notify 回信超时不改变数据通路的熔断计数；一个 notify 总是超时的程序，连续 5 次之后 notify 暂停派发、数据通路不再等它，冷却后放一条 notify 试探；只声明 notify 的程序熔断之后（含握手失败、起步即 open）能恢复；`decide_timeout_secs = 0` 时，卡住的 notify 在 2 秒后被换掉，排在后面的请求照常完成（T-S2-1）；forward 请求拿到「200 但内容是错误」时，记录与完成通知的 `outcome` 为 `upstream_error`，客户端收到的字节与上游逐字节一致（R-S3-8）；预算为 0 时，一个 200 MiB 的 forward 响应让常驻内存的增长不超过 32 MiB（T-S3-4）；被 403、413 拒绝的请求不发 notify（R-S3-7） |
 | B11 | aproxy-format 接到协议 1，按角色拆成子命令（convert、keys、route、policy、adaptive、rewrite、heartbeat）与工具（init、check、try、translate），去掉 `run` | B10a–B10d | 每个角色单独挂进链都能握手，只声明自己用到的阶段与粒度；adaptive 只要摘要，测试断言它的管道里没有正文；§7.2 的三单元链端到端通过；adaptive 握手失败或熔断时，请求按默认的 retry 照常重试成功（R-S1-1）；`check` 拒绝 route 之后没声明 retry 的 convert、rewrite（R-S3-2）；转换的正确性，以及客户端重试时请求体是否逐字不变的实测，属于 W2c 的验收 |
 | B12 | 文档、skill、记忆 | 随各块 | 码表与 CLI 写进 skill，SK3 的校验脚本进 CI；0.2.0 发布时按 §11 重写 ipc-v1-upgrade-contract |
 
@@ -1976,7 +2054,7 @@ aproxy-format 是官方单元的合集：`aproxy-format <角色>` 只启用一�
 - 解码与替换（R-S2-2）：密钥被块边界切开时也被替换；gzip 与 br 的响应体以解码后的文本保留，其中的密钥被替换，`encoding` 照记；
   解码后超过预算的压缩体为 `not_retained`（`exceeds_budget`），解码失败的为 `decode_failed`。
 - 边界（R-S3-4、R-S3-6）：`offset` 等于 `total_bytes` 时回空块；`limit` 为 0 或大于 1 MiB 时回 `bad_request`；取被省略的尝试的体回
-  `no_such_part`；超过 64 KiB 的记录按 §6.5 的顺序截短，并标 `truncated`。
+  `no_such_part`；超过 64 KiB 的记录（含 `actions` 很长的报告）按 §6.5 的顺序处理之后不超过 64 KiB，并标 `truncated`（T-S3-8 ①）。
 
 **并行编排**（总并发不超过 5）：
 - 先做 P1，再并行 P2 与 P4；B0 可以与 P2、P4 并行。
@@ -2144,37 +2222,59 @@ D-12…D-15 不变，与这批设计共存。
 
 | 编号 | 处理 |
 |---|---|
-| R-S1-1 | 按主会话的决定（即复审的推荐）：§7.2 的样例与 `init` 沿用默认 retry，adaptive 对没失败过的请求回 forward；改正 §10.9、§10.14 里「走默认模式与静态兜底」的说法；不加 A 级覆盖。另按主会话要求加 doctor 告警 `forward_default_unguarded`（§2.4）。B11 加 adaptive 不可用时的用例 |
-| R-S2-1 | 主会话把「同一 worker 上数据通路优先」与「notify 单独开 worker」交由本稿选，选前者：adaptive 在 request 阶段查、在 notify 时记的是同一张表，拆到两个进程里判断就看不到结果。占用、计时、派发写进 §10.1；notify 的时限等于 `decide_timeout_secs`（照建议）。留下的余量照实写明：notify 一旦写出，之后到的数据通路消息要等它这一条，最长是它的时限；彻底消除要靠多条在途消息。超出建议的三处：notify 回信超时或不合法时换掉 worker（不然后面的回信会错位），但不计入熔断；notify 的合法回信也不清零熔断计数（不然一个数据通路坏掉、却能应答通知的程序永远熔断不了）；半开试探只用数据通路的消息。跨请求状态与 `worker_idle_secs = 0` 照建议；B10d 加共用 worker 的链的吞吐用例；多条在途消息列为以后加性补的 |
+| R-S1-1 | 按主会话的决定（即复审的推荐）：§7.2 的样例与 `init` 沿用默认 retry，adaptive 对没失败过的请求回 forward；改正 §10.9、§10.14 里「走默认模式与静态兜底」的说法；不加 A 级覆盖。另按主会话要求加 doctor 告警 `forward_default_unguarded`（§2.4）。B11 加 adaptive 不可用时的用例。告警的条件第三轮改正，见 T-S3-1 |
+| R-S2-1 | 主会话把「同一 worker 上数据通路优先」与「notify 单独开 worker」交由本稿选，选前者：adaptive 在 request 阶段查、在 notify 时记的是同一张表，拆到两个进程里判断就看不到结果。占用、计时、派发写进 §10.1；notify 的时限等于 `decide_timeout_secs`（照建议）。留下的余量照实写明：notify 一旦写出，之后到的数据通路消息要等它这一条，最长是它的时限；彻底消除要靠多条在途消息。超出建议的三处：notify 回信超时或不合法时换掉 worker（不然后面的回信会错位），但不计入熔断；notify 的合法回信也不清零熔断计数（不然一个数据通路坏掉、却能应答通知的程序永远熔断不了）；半开试探只用数据通路的消息。跨请求状态与 `worker_idle_secs = 0` 照建议；B10d 加共用 worker 的链的吞吐用例；多条在途消息列为以后加性补的。notify 的时限与熔断第三轮已改，见 T-S2-1 |
 | R-S2-2 | 照主会话的决定与复审的建议：存解码后的字节并记 `encoding`；解码超出预算就停（`exceeds_budget`）；解码失败为 `decode_failed`；按流替换，尾巴为最长密钥减一；口径写明（§6.5）。B8 加跨块与 gzip、br 的用例 |
-| R-S2-3 | 按主会话的决定，选「把实际端口钉进 spec」。只在配置的端口为 0 时钉：一律钉的话，用户以后改了配置里的端口，restart 也会被旧端口盖掉 |
-| R-S2-4 | 照建议：普通 install 与续作都在广播之前检查，以 failed、`install_unmanaged_instances` 与英文 `last_error` 结束，释放锁与宣告；§4.2 补「有 skill 目录、没有清单」；B9 加交棒叠加活实例的用例 |
+| R-S2-3 | 按主会话的决定，选「把实际端口钉进 spec」。只在配置的端口为 0 时钉：一律钉的话，用户以后改了配置里的端口，restart 也会被旧端口盖掉。钉的位置第三轮改为 `pinned_port`，见 T-S3-6 |
+| R-S2-4 | 照建议：普通 install 与续作都在广播之前检查，以 failed、`install_unmanaged_instances` 与英文 `last_error` 结束，释放锁与宣告；§4.2 补「有 skill 目录、没有清单」；B9 加交棒叠加活实例的用例。第三轮补上入口那次检查与 `halted`，见 T-S3-2、T-S3-3 |
 | R-S3-1 | 照主会话「与现行退避一致」：样例改为第 6 次尝试失败、`fallback.delay_ms` 为 20000（retry.rs:14-32 的第 6 次重试）。另把上游的 `retry-after` 从 20 改为 60，免得 20 秒与 20000 碰巧相同、被读成 aproxy 尊重了 Retry-After；format 的回信原本就是 60000，现在正好表明尊重它的是 format，report 的 summary 随之写明 |
 | R-S3-2 | 照建议：§7.4 与 §10.14 写明 route 之后的 convert、rewrite 也声明 retry；`init` 照此生成，`check` 照此校验 |
 | R-S3-3 | 照建议：以 §10.10 为准改 §10.2；notify 的摘要边转发边算，请求体不完整时为 null |
-| R-S3-4 | 照建议：写明截短顺序（旧尝试的 reports、summary、path 与 user_agent），标 `truncated`；截短长度为 E 级常量 |
+| R-S3-4 | 照建议：写明截短顺序（旧尝试的 reports、summary、path 与 user_agent），标 `truncated`；截短长度为 E 级常量。第三轮改为三步，见 T-S3-8 ① |
 | R-S3-5 | 照建议：被省略的尝试的体随之丢弃，取它们回 `no_such_part` |
 | R-S3-6 | 照建议：`offset` 等于 `total_bytes` 回空块；`limit` 为 0 或大于 1 MiB 回 `bad_request`；复制途中变成 `not_retained` 的，下一块回 `not_found` 并带 `cause` |
 | R-S3-7 | ① 照建议，进链之前就被拒绝的请求不发；② 选按字节设上限（16 MiB，`state` 计入），而不是「发送时再取 `state`」：等着发送的通知总要留着 `state`，只有字节上限才真正约束内存；③ 改为「上限」，写明是 E 级常量 |
-| R-S3-8 | 按主会话的决定：在历史副本上被动判定，体没入库时用旁路副本，解码上限沿用现行检查路径的 8 MiB；这次尝试记 `upstream_error_body`，记录与通知的 `outcome` 为 `upstream_error`、`code` 为 `upstream_failed` |
+| R-S3-8 | 按主会话的决定：在历史副本上被动判定，体没入库时用旁路副本，解码上限沿用现行检查路径的 8 MiB；这次尝试记 `upstream_error_body`，记录与通知的 `outcome` 为 `upstream_error`、`code` 为 `upstream_failed`。判定的做法第三轮改为与 retry 请求现行的完全相同，见 T-S3-4 |
 | R-S3-9 | ①②⑤ 写进 §7.5，并由协议文档写明；② 的 doctor 提示定为 `default_header_shared`，为此加了诊断级别 `info`（只影响显示，不影响退出码）。③ 按主会话的决定，URL 内嵌的 userinfo 随 URL 值整体以配置为准、不拼接；没有照建议列进 `withheld`，因为这是普通的上层覆盖，不是因目标不同而扣下的凭据。④ 在 §13.2 标为细化，按主会话的决定不再请用户过目。⑤ 保持连路径比较，理由写进 §7.5 |
 | R-S3-10 | 按主会话的决定保留报错；写入时的报错直接说「先设 defaults.base_url」，文档与 skill 写明顺序；B3 加这个顺序的用例 |
 | R-S3-11 | 照建议：W2 写出的 `pending_restores` 恒为空，只为旧读者保留，W2 不读 |
 | R-S3-12 | 照建议：install 与第一次写配置时收紧属于当前用户的既有 home；临时文件以最终权限创建；B7 加用例 |
 | R-S3-13 | 按主会话的决定：spec 的 `config_path` 可为 null，restore 与看护者不检查它；B5 加用例 |
 | R-S3-14 | 照建议：先查 `features`，没有 `shutdown.keep_restore` 就发不带参数的 shutdown，退出后回写记录 |
-| R-S3-15 | 按主会话的决定：`use` 路径不算契约，B0 与 P4 只改 `use` 行，断言逐字不变，文件头那句同步；AGENTS.md 与 CLAUDE.md 一起改 |
+| R-S3-15 | 按主会话的决定：`use` 路径不算契约，B0 与 P4 只改 `use` 行，断言逐字不变，文件头那句同步；AGENTS.md 与 CLAUDE.md 一起改。B0 的验收第三轮改写，见 T-S2-3 |
 | R-S3-16 | 照建议：在 §13.3 与 §10.9 标为对 D-12 的细化 |
-| R-S3-17 | 按主会话的决定：install 与 stop、status 一样，settings.json 读不了时用内置默认并告警；start 的报错说清怎样修；迁移文档写明 0.1.x 的 settings.json 要删除或重写。§9.5 里 install 的退出码 3 随之去掉 |
+| R-S3-17 | 按主会话的决定：install 与 stop、status 一样，settings.json 读不了时用内置默认并告警；start 的报错说清怎样修；迁移文档写明 0.1.x 的 settings.json 要删除或重写。§9.5 里 install 的退出码 3 随之去掉；第三轮又以「预检不通过」的含义加回，见 T-S2-2 |
 | R-S3-18 | ① 改为「带 `x-aproxy-error` 的非 2xx」；② 改为按条目名引用 TODO；③ 稿首补上 D-16、W2c 与复审；④ 样例里的 report 文本改了，adaptive 现在回 forward（随 R-S1-1）；⑤ 主会话已改计划；⑥ B8 的依赖加上 B3 |
 
 §12 随之改了两处 TODO 引用，在 K5 一行注明全局 `--home` 没有采纳，并在「不在 0.2.0 做的」里加了「一个 worker 上多条在途消息」。
+
+**第三轮核对（T-S2-1…T-S3-8，2026-10-12）**
+
+依据：`.agents/review/2026-10-12-w2-contracts-review.md` 第 968–1150 行，以及主会话的决定与原则（§13.3）：用最简单、最少新机制的改法收口。
+「照建议」指按核对的改法做；与建议不同的，写明理由。
+
+| 编号 | 处理 |
+|---|---|
+| T-S2-1 | 照建议与主会话的决定。notify 有自己的熔断器（§10.9），沿用 `breaker_failures` 与 `breaker_cooldown_secs`，不加配置键：超时、回信不合法、起不来、写不进 stdin、进程退出都计入；熔断时只暂停派发 notify，不杀 worker、不影响数据通路；冷却后用 notify 试探。只声明 notify 的程序只有这一个熔断器起作用，握手失败时由它以 open 起步，所以能恢复。时限固定 2 秒（E 级，§10.11）。与建议不同的两处：可见性用 `formats[].notify_breaker`（形状同 `breaker`），不另加 `notify_failed_total`，因为机制就是一个熔断器，沿用现成的形状，界面还能看到「暂停中」；notify 的进程级失败原先计入数据通路的熔断器，现在只计入 notify 的，因为主会话要的是「不影响数据通路」，程序真坏了，数据通路的下一条消息自己就会数到。B10d 加了对应的用例 |
+| T-S2-2 | 照建议与主会话的决定，位置更早：预检放在广播之前，由执行续作的目标版本对每个要滚动重启的实例做；任何一个不过就什么都不动（不广播、不换 bin、不停实例），以 `install_precheck_failed`（退出码 3，带端口与诊断）加 `halted` 结束（§5）。没放在「停每个实例之前」：广播里的 ACK 收敛本身就可能重启实例；换了 bin 之后再失败，又会留下「新 bin、旧实例」的现场。§2.4、§8.2、§9.5 同步；B9 加用例 |
+| T-S2-3 | 照建议与主会话的决定。C3 的代码整体迁进 aproxy-ipc 的一个文件，写者也迁，读写两边共用同一份启动标记推导；退出前删自己条目、再 `process::exit` 的便利函数按 P5 留在二进制一侧（§6.6）。B0 的验收改为：AGENTS.md 与 CLAUDE.md 讲永久契约的那段逐字一致，列出迁移后的全部文件且都存在，末句补上「契约测试冻结的是断言，`use` 路径可以随代码移动」 |
+| T-S3-1 | 照建议：条件改为「默认 forward，且有 decide 程序，或有可选的 request 程序」；required 的 request 程序不算，它不可用时请求以 503 结束，看得见；一个 format 都没有时不告警（§2.4、§10.9） |
+| T-S3-2 | 照建议：失败现场置 `halted = true`；§4.2 写明 `halted` 的语义（alpha.1 已是如此）；§9.2 第 6 步写明 W2 的自动续作遇到它不拉起；B9 加「alpha.1 的 `stop all` 拉起的续作不接管」的用例 |
+| T-S3-3 | 照建议：普通 install 在入口（加锁与下载之前）查一次，查到就报错退出，什么都没写；所有路径在广播之前再查一次（§4.3 第 7 条、§5）；B9 改为「加锁与下载之前就失败」 |
+| T-S3-4 | 照建议，写法更简单：不再分「历史副本」与「旁路副本」，判定一律与 retry 请求现行的做法相同（1 MiB 以内留副本，解码后判定；超出就用现行的增量行扫描，只看原始字节），与历史是否保留了体无关（§10.10）。B10d 加大响应的内存用例 |
+| T-S3-5 | ①②③ 照建议：`client_status` 定义为已经写给客户端的状态码，样例改为 200（§1.3）；顶层 `reports` 补上 adaptive 的那份；字节数的口径写明（§6.5）。④ decide 样例改用 `-44`，不用建议的 `-43`：`-43` 已被 §3 的 SSE 终态样例用作另一条时间线。同类问题一并改了：§3 的 HTTP 错误样例（第 3 次尝试后 `retry_exhausted`）改用 `-41`；§10.6 的流样例原是 `-42/1` 正常结束、`-42/2` 中断，与「第 1 次 529、第 2 次成功」对不上，改为 `-42/2` 正常结束、另一个请求 `-45/1` 中断；RequestDetail 样例补上进行中的第 2 次尝试，并写明进行中的尝试 `response` 与 `error` 都为 null（原规则「没有响应就给 error」不适用于还没结束的尝试）；§10.5 写明哪些样例讲同一个请求 |
+| T-S3-6 | 照建议，取「单独记一个字段」：spec 加 `pinned_port`，不再写进 `overrides`；解析出的端口仍是 0 才用它（§4.2、§5）。连带补了一条规则：用期望状态记录拉起的实例落在了别的端口（配置里的端口改了），新实例就绪之后，拉起方删掉旧记录；否则看护者会一直按旧记录去拉一个已经搬走的实例。这个缺口对固定端口的配置本来就有，T-S3-6 让钉过的端口也走到这里。§0 与 §4.3 第 2 条的「只有 stop 能删」随之注明这个例外；B5 加用例 |
+| T-S3-7 | 照建议：实例记录与快照的 `config_path` 同样可以是 null（§4.2）；B6 加一例 |
+| T-S3-8 | ① 换了更简单的做法：截短改为三步，即删旧尝试的 reports、截短 `path`、`user_agent`、`model`、仍超出就删掉顶层 reports；不去逐个截 `actions` 里的字符串，删整份报告就能收住上限，实现也简单。② 写明 info 不计入 `summary`，不加 `infos` 字段。③ 写明 P4、B0 谁先落地，谁就同时改测试的文件头与 AGENTS.md、CLAUDE.md 的那半句（§6.6、P4）。④ 熔断那一刻已在排队的消息，与新到的一样按熔断表处理（§10.9）。⑤ 协议文档写明「同一个摘要再次出现」可作补充信号（§10.11） |
+
+核对里 R-S3-9 ③ 的可选补充（doctor 提示「配置的代理与默认代理是同一个，却没带默认值里的 userinfo」）没有做：按本轮的原则，不加检查项。
+§11 随之加上 `pinned_port`、被接替的记录、install.state 的 `halted`、install 在广播之前的检查与预检，以及 notify 的固定时限。
 
 **审查之外的自查**：
 - **安装的续作入口**：第一版把 `install --continue --handover-from` 改名为 `__install-resume`，第二版撤回。
   install/flow.rs:12-18 已声明它是永久接口：早交接由旧版本的安装者以这个命令行拉起目标版本，alpha.1 也这样做；
   改名会让从 alpha.1 起的普通升级在交棒处失败（§5）。
-- **W2 之前的运行期记录**：新版本不读它们；普通 install 与续作都在广播之前检查，遇到这些版本启动的活实例就以失败结束（R-S2-4），迁移走强制安装（§4.3 第 7 条）。
+- **W2 之前的运行期记录**：新版本不读它们；普通 install 在入口、所有路径在广播之前检查，遇到这些版本启动的活实例就以失败结束（R-S2-4、T-S3-3），迁移走强制安装（§4.3 第 7 条）。
   旧看护者按台账结束，不读看护者记录（§5）。
 - **期望状态记录不归清理管**：第一版「写者已死就清理」会删掉崩溃实例的记录，正与 D-8 冲突（§4.3 第 2 条）。
 - **端口 0**：S2-4 的方案 ②「先 bind 控制端点」与端口 0 冲突，改为先 bind 代理端口（§5）。

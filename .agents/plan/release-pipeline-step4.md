@@ -20,7 +20,8 @@ aproxy-desktop、Linux 自动选择变体、release-format 门禁、binstall 选
   用 `VersionLine::parse` 取变体、目标、指令集档，文件名必须与命名规则一致，`.sha256` 必须相符；写完用
   `Manifest::parse` 读回逐条核对。在只读权限的独立 job 里跑，release job 只上传。
 - **Linux gnu 带界面版**在 `container: ubuntu:22.04` 里构建（ubuntu-24.04 / 24.04-arm），断言 GLIBC_ 需求不高于
-  `DESKTOP_GLIBC_FLOOR`（取值待演练实测 objdump 后定；install.sh 与 npm 启动器用同一个数）。headless gnu 照旧 zigbuild 到 2.28。
+  `DESKTOP_GLIBC_FLOOR`（演练实测三个带界面 gnu 产物最高都是 GLIBC_2.34，05efe7b 定为 2.34；install.sh 与 npm 启动器
+  用同一个数）。headless gnu 照旧 zigbuild 到 2.28（实测最高 GLIBC_2.28）。
 - **npm**：加 headless 组（`@meowo/aproxy-headless` + 9 个平台包）；带界面组的两个 musl 平台包装 headless 的 musl
   二进制（musl 只有它）。启动器：带界面组在 glibc 低于带界面版下限时直接提示改装 headless；退出码 127 时重跑一次
   `--version` 抓 stderr，含 `error while loading shared libraries` 等加载失败字样就提示。
@@ -47,14 +48,19 @@ aproxy-desktop、Linux 自动选择变体、release-format 门禁、binstall 选
   256 MiB 的资产上限）：be3893e 改调试构建只带行号表，fd622cd 的 CI（run 38273956900）里转绿。macOS 红是既有的
   （fad48c7 上就是同样 4 个 lib 测试，daemon 那个读不到自身进程的创建时间），不归第 4 步
 - [ ] fd622cd 的 CI 里 ubuntu (headless) 偶发一次 ETXTBSY（install_swap 落位后核对「Text file busy」）：127dafa 让
-  run_version 退避重试，要看之后几次 ubuntu CI 不再出现
+  run_version 退避重试（03ec68a 收紧到合计约 1.6 秒、算在 VERSION_TIMEOUT 之内）。之后 65dd651、8b02a31 两次
+  ubuntu CI 都没再出现，再看一两次再下结论
 - [x] 第 4 步审查（`.agents/review/2026-10-12-release-pipeline-review.md`，主代理的处理决定在文末）：8296a02（暂存件
   补 x 位）、d9d1fc1（install.sh 写明 desktop 照装、--variant 缺值报错）、96d014f（删掉安装前的探测与 variant.rs，
   回退链 DownloadCtx::attempts / force::fallbacks 带测试，通道为空也能换变体，命名只留一处，v3 只在发布它的目标上选）、
   a86e2c0（文档与 skill）。两种变体全量测试各 559 通过
-- [ ] 演练的前提：be3893e 与 8296a02 都在 main 上（否则停在 test 门槛或冒烟上）
-- [ ] 主代理推送后跑演练：量 DESKTOP_GLIBC_FLOOR（objdump 的实际最高需求，低于 2.35 就一起改小：release.yml、
-  scripts/install.sh、npm/aproxy/bin/aproxy.js，以及 README、README_EN、CHANGELOG、docs、skill、
-  npm README 里写的 2.35）、
-  看 i686 / arm64 Windows 与 macOS x86_64 的带界面构建、容器 job、macOS fat LTO 内存、总时长
+- [x] 演练 run 38279211569（65dd651，2026-10-12 16:41–17:04 UTC，约 23 分钟）全绿：20 个构建（含 i686 / arm64
+  Windows、macOS x86_64 的带界面版与 3 个容器 job）、清单（20 个资产读回核对通过）、Release 预览、npm 两组 20 个包与
+  crates 三个包的 dry-run 都过。冒烟 18 个真的执行了 `--version`（容器里的 3 个带界面版与 Linux 暂存件都在内），
+  x86_64-apple-darwin 两个是交叉编译，只核对嵌着的版本行。带界面版 glibc 下限按实测改成 2.34（05efe7b）
+- [x] 第 4 步修复核对（审查文件「修复核对（2026-10-13）」）的 N1–N6：4468243（N1 回退守显式 `--cpu`；N4 只在动态
+  加载器报错时提示装库，普通安装同样收紧，提示不再写死库与版本；N5 没写 `--variant` 而清单里没有本变体时也回退）、
+  ac6ce9d（N6 install.sh 在 glibc 太旧时说明是 glibc）；N2 随 05efe7b 提交；N3 在 03ec68a 里已经成立。Windows 上两种
+  变体的 fmt、clippy（含 Linux 交叉 clippy）与 lib / install_flow / install_force 测试通过；Linux 上的测试等推送后的 CI
+- [ ] 推送 05efe7b..（含本条）之后看 ci.yml 门槛与 ubuntu (headless) 有没有再撞 ETXTBSY
 - [ ] 所有者：aproxy-desktop 在 crates.io 的首发与可信发布配置（步骤在给主代理的报告里）

@@ -70,7 +70,7 @@ home 的实例。
   同号发预发布版（发布前 `.github/scripts/align-version.py` 一起对齐），正式版时才发
   0.2.0：正式版号一经发布就永久占用，而信封在 0.2.0 定稿之前还要改。
 - **aproxy-format**：官方示例 format 二进制（协议转换 switchyard-translation
-  + key 轮换/加权轮换 + 多模型多渠道聚合）。版本独立于 aproxy alpha 线，
+  + key 轮换/加权轮换 + 多模型多渠道聚合）。版本独立于 aproxy 主线，
   单独发 Release（format tag 触发独立 workflow）；它稳定后几乎不更新——
   更多功能用户直接让 agent 写 format（见 aproxy-format skill）。
 - **aproxy-desktop**：桌面界面（Tauri 2 外壳与嵌入的前端），aproxy 的 `desktop` 特性引入它，
@@ -330,7 +330,8 @@ config_dirs、日志轮转阈值、空闲阈值与上述七个字段的全局默
   （终止失败再放回），否则看护者会先于它的收尾读到「记录在 = 崩溃」，把刚
   强停的实例拉回来。
 - **挂死检测**：实例侧独立 ticker 每 10s 向命名共享内存节
-  （`Local\aproxy-heart-<端口>`，8 字节原子 u64 毫秒时间戳）写心跳——挂死 =
+  （Windows 为 `Local\aproxy-<home_id>-heart-<端口>`，unix 为 `/dev/shm/aproxy-<home_id>-heart-<端口>`
+  文件，`home_id` 同控制管道；8 字节原子 u64 毫秒时间戳）写心跳——挂死 =
   runtime 无法调度 = ticker 停摆，与请求热路径零耦合。看护侧扫描过期 +
   IPC ping 二意见都失败才终止进程（句柄绑定原进程，PID 复用免疫）。
 - **重拉与退避**：`.restore` 残留 = 异常死亡信号；优雅退出（记录已删）摘除
@@ -407,7 +408,8 @@ settings 注入、validate）干跑一遍，换监听地址时再探测新地址
 ## 安装与升级（install）
 
 `aproxy install` 把二进制安全落位到 `~/.aproxy/bin/`，对客户端 ≈ 无感。
-四条铁律：先标记（install.state 先于一切动作，崩溃可识别）、先下载后
+四条铁律：先标记（状态文件先于一切动作，崩溃可识别；它是 `<home>/install/state.json`，
+代码与文档里习称 install.state）、先下载后
 rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC PrepareSwap
 广播，实例把自己的可观测状态置为 `swap_prepared`）、逐个重启最后删除（让位的旧二进制
 `aproxy.old-…` 在终验后清理）。普通安装走不通时另有强制安装（见下文 force）。模块

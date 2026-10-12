@@ -24,7 +24,7 @@
 2. 进程台账 + 强制安装（C1–C8 全部，含锁、唯一中间名、契约测试、注释、AGENTS.md 一句）。
 3. Tauri 外壳：`desktop` feature（默认开）、`aproxy desktop` 打开原型界面（假数据）、无 UI 版的 `desktop` 提示、build.rs、
    Tauri 只进 bin 不进 lib 与测试（RT-05）、自定义标题栏与 Mica（默认关）按两个 skill 落地。
-4. 发布流水线：22 个产物双矩阵（Linux 带 UI 版在 ubuntu-22.04 原生构建，musl 带 UI 版在 Alpine 容器）、前端构建步骤、
+4. 发布流水线：20 个产物双矩阵（musl 只出 headless；Linux gnu 带 UI 版在 ubuntu-24.04 / 24.04-arm 上用 `container: ubuntu:22.04` 构建）、前端构建步骤、
    发布清单 `aproxy-manifest.json`、npm headless 组、crates.io 带前端产物发布；CI 先在推送时构建两种变体验证。
 5. CHANGELOG、skill（强制安装用法、迁移步骤）、文档的最小更新 → 打 `v0.2.0-alpha.1` → 盯 Release 与发布结果。
 
@@ -330,15 +330,21 @@
   - crate 名 `aproxy-desktop`、`aproxy-ipc` 在 crates.io 未被占（2026-10-12）。
 - 待定：
   - **所有平台都发两个版本（用户定）**：现有 11 个构建（Windows x64 / x64-v3 / x86 / arm64，Linux gnu x64 /
-    x64-v3 / arm64，musl x64 / arm64，macOS arm64 / x64）各出带 UI 与无 UI 两份，共 22 个。由此带来的事：
+    x64-v3 / arm64，musl x64 / arm64，macOS arm64 / x64）各出带 UI 与无 UI 两份，共 22 个；2026-10-12 用户改为 musl 只出 headless，实为 20 个（见下）。由此带来的事：
     - Linux 的 UI 版动态链接 webkit2gtk / GTK：缺库时 ld.so 在 main 之前就失败，连 `--version` 与代理都起不来；
       wry/tao 没有延迟加载 webkit 的机制（附件 §5 列了 L1–L5 五种做法）。`cargo install aproxy` 默认编带界面版，
-      没装 webkit 开发包的 Linux 服务器上会编译失败。**怎么处理待用户拍板（2026-10-12 提问）**。升级时保持原变体
-      （`--version` 的变体段，W1 已实现）。
+      没装 webkit 开发包的 Linux 服务器上会编译失败。**用户 2026-10-12 选定「自动选择变体」**：命名不变、两种都发；
+      一键脚本（install.sh）与 `aproxy install` / `install --force` 在 Linux 上探测 webkit2gtk-4.1（≥ 2.40）与 glibc
+      （≥ 带界面版的下限），满足才装带界面版，否则装 headless 并说明原因与之后怎样切换（`--variant desktop`）；npm 的 JS
+      启动器认出这种加载失败（退出码 127、stderr 含 `error while loading shared libraries`）时提示改装
+      `@meowo/aproxy-headless`；README 与 skill 写明 Linux 服务器上 `cargo install aproxy --no-default-features`、binstall
+      与手动下载选 `aproxy-headless-<target>`。升级时保持原变体（`--version` 的变体段，W1 已实现）。
     - gnu 的 UI 版不能沿用 cargo-zigbuild 压低 glibc 下限，glibc 下限由 webkit2gtk 决定（构建方式见上一节的 CI 一条）。
     - musl 的 UI 版不可能静态链接：要关 `crt-static`、在 Alpine 里对 musl 版 webkit2gtk 动态链接（rustup 的 musl 工具链
       默认 crt-static，GTK 程序启动即段错误，gtk-rs-core#387），只能跑在装了 webkit2gtk 的 musl 发行版上；没找到任何
-      公开的 Tauri 2 musl 预编译先例（tauri#12296 未解决）。**是否照出待用户拍板（2026-10-12 提问）**。
+      公开的 Tauri 2 musl 预编译先例（tauri#12296 未解决）。**用户 2026-10-12 选定 musl 只出 headless**：产物共
+      20 个（9 个带界面 + 11 个 headless）；musl 目标的 `install` / `install --force` 默认且只能选 headless，指定
+      `--variant desktop` 时说明 musl 没有带界面版（清单 C6 里也就没有这一项）。
     - **命名（用户 2026-10-11 选定 headless）**：带 UI 的沿用现有名字——GitHub 资产 `aproxy-<target>[-v3][.exe]`、
       npm `@meowo/aproxy` 与 9 个 `@meowo/aproxy-<平台>`、crates.io `aproxy`（feature `desktop` 默认开，binstall
       的默认命名正好对应它）；无 UI 的叫 headless——资产 `aproxy-headless-<target>[-v3][.exe]`、npm

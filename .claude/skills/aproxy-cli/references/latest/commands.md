@@ -467,9 +467,10 @@ aproxy start work
 aproxy desktop
 ```
 
-Opens the desktop window. It is a separate process that runs until its window is closed; it starts,
-stops and reconfigures nothing, so opening or closing it never affects running instances. It opens
-on the user's screen, so run it only when the user asks for the window.
+Opens the desktop window. It is a separate process that runs until its window is closed. The window
+itself starts, stops and reconfigures nothing, so opening or closing it never affects running
+instances; like every other `aproxy` command, it only resumes an install that was interrupted (see
+install / upgrade). It opens on the user's screen, so run it only when the user asks for the window.
 
 **In 0.2.0-alpha.1 the window is a preview filled with demo data.** The instances, logs and counts
 it shows are made up, not the ones on this machine, and a label `预览版 · 演示数据` ("preview · demo
@@ -477,9 +478,14 @@ data") stays on screen to say so. Never read the state of the user's proxies fro
 tell the user that what it shows is real; use `aproxy status` and `aproxy logs`.
 
 - **Windows, from a terminal:** the command returns at once with `已打开 aProxy 桌面界面（pid <pid>）。`
-  ("desktop window opened") and the window runs on its own. Started from a shortcut or Explorer,
-  its messages appear in a dialog box instead. **Linux and macOS:** the command stays in the
-  foreground until the window is closed.
+  ("desktop window opened") and the window runs on its own. Exit code 0 here only means the window
+  process was started: anything that goes wrong after that is shown in a dialog box on the user's
+  screen, never in your terminal, so ask the user whether the window appeared before you rely on
+  it. Started from a shortcut, Explorer or a process without a console, its messages appear in a
+  dialog box instead.
+- **Linux and macOS:** the command stays in the foreground until the window is closed. When you
+  open the window for the user, start it in the background (for example `aproxy desktop &`, or your
+  tool's background option); waiting for it would block you until the user closes the window.
 - **One window per home.** A second `aproxy desktop` under the same `<home>` prints
   `aProxy 桌面界面已经在运行（pid <pid>）。这个版本还不会把它切到前台，请在任务栏里找到它。`
   ("already running; this version cannot bring it to the front, find it in the taskbar") and exits

@@ -344,7 +344,9 @@ Global flags: `--config <PATH>` (multi-instance), `--listen <ADDR>`,
 ## Desktop window (preview)
 
 `aproxy desktop` opens the desktop window. It is a separate process that exits when its window is
-closed; it starts, stops and changes no instance.
+closed. The window itself starts, stops and changes no instance; like every other aproxy command,
+it resumes an interrupted install in the background when it finds one, and finishing that install
+may restart instances one at a time.
 
 - **In 0.2.0-alpha.1 the window is a preview**: the instances, request logs and statistics in it
   are demo data, not the aProxy running on your computer, and a "Preview · demo data" label stays

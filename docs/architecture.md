@@ -531,18 +531,23 @@ aproxy.exe 随之悄悄失去清单。所以不靠清单：tauri 关掉默认特
 与原先的 `#[tokio::main]` 等价。
 
 **启动与退出**（`src/commands/desktop.rs`）：解析 home（C1）→ 同一个 home 已有存活的界面
-（台账角色 `desktop`）就提示并以 0 退出 → 预检（Windows 问 WebView2 的版本，没装或
-`WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` 指错时报错；Linux 先看 `DISPLAY`/`WAYLAND_DISPLAY`）→
-登记台账（C3）→ 建窗口、进事件循环 → 窗口关掉后删台账条目，按事件循环的退出码退出。
+（台账角色 `desktop`）就提示并以 0 退出，读到的死条目顺手删掉 → 预检（Windows 问 WebView2
+的版本，没装或 `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` 指错时报错；Linux 先看
+`DISPLAY`/`WAYLAND_DISPLAY`）→ 登记台账（C3）→ 建窗口、进事件循环 → 窗口关掉后删台账条目，
+按事件循环的退出码退出；登记之后的失败也经 `ledger::exit` 删掉条目再退出。
 Tauri 在许多运行期失败上直接 panic，所以预检放在前面，setup 里的失败记下来、请事件循环以
 非零退出码结束，图形后端初始化时的 panic 被接住换成说明。webview 的数据目录是
 `<home>/desktop/webview`：不显式指定时 Tauri 用按 identifier 建的应用数据目录，跑到
 `APROXY_HOME` 之外，测试与多份部署就隔离不了。
 
 **Windows 的控制台。** aproxy.exe 是控制台程序。从终端启动时控制台与 shell 共用：检查都在
-终端里做完，再分离出一个不带控制台的子进程承载窗口，本进程立即退出，终端随即可用。从
-快捷方式或资源管理器启动时控制台是系统专为它新建的：立刻 `FreeConsole`，控制台窗口只闪
-一下，之后的说明改用对话框。两种情形由 `GetConsoleProcessList` 区分。
+终端里做完，再拉起一个与终端分离的子进程承载窗口（`CREATE_NO_WINDOW`：它有一个自己的、
+看不见的控制台，随即按下面快捷方式的情形释放），本进程立即退出，终端随即可用。从快捷方式
+或资源管理器启动时控制台是系统专为它新建的：立刻 `FreeConsole`，控制台窗口只闪一下，再把
+三个标准句柄置空（释放后进程记着的旧句柄值可能被之后打开的句柄复用，置空后 std 的写入一律
+静默成功），之后的说明改用对话框；没有控制台（父进程以 `DETACHED_PROCESS` 拉起）时说明也用
+对话框。几种情形由 `GetConsoleProcessList` 区分。改用对话框时还装一个 panic 钩子：主线程上的
+panic（事件循环里的回调出错）照常交给默认钩子后再弹框说明。
 
 **窗口。** 主窗口由 Rust 建（`tauri.conf.json` 的 `app.windows` 为空），以 `visible: false`
 创建，页面脚本跑起来后自己 `show()`，启动时不先闪白底；3 秒内没显示由 Rust 兜底显示。
@@ -553,8 +558,11 @@ Layouts 留在右上角，页面画标题栏的其余部分；`src/titlebar.rs` 
 系统的「透明效果」关着时设置页标明 Mica 会显示为纯色。
 
 **不联网、权限最小。** CSP 只放行嵌入的资源与 IPC，吉祥物的沙箱页单独加 `script-src
-blob:`；窗口只许停在嵌入的页面上；权限（`capabilities/main.json`）只授权页面用到的窗口接口
-与本包的三个命令，自定义命令经 app manifest 纳入权限检查。各项取舍写在
+blob:`；窗口只许停在嵌入的页面上，按平台精确比对源（Windows 只认 `http://tauri.localhost`，
+其余平台只认 `tauri://localhost`，带端口的都不认：Linux 与 macOS 上
+`http(s)://tauri.localhost` 是真实的回环地址），CSP 不管顶层导航，这一条就是闸门；权限
+（`capabilities/main.json`）只授权页面用到的窗口接口与本包的三个命令，自定义命令经 app
+manifest 纳入权限检查。各项取舍写在
 `aproxy-desktop/src/lib.rs` 的开头（`tauri.conf.json` 写不了注释）。
 
 **前端产物。** `generate_context!` 在编译期把 `aproxy-desktop/dist/` 嵌进二进制。dist 不进
@@ -570,7 +578,7 @@ tauri-build 每次构建都在包根写 `gen/schemas/`，包里没有这些文�
 用的是 mock 实现；接真实数据时换成 IPC 实现，aproxy-desktop 里加相应的命令。aproxy-desktop
 需要的 home 与运行时由 bin 经 `Options` 交进去。浏览器开发模式（`npm run dev`）里另有原型件
 （`ui/src/proto/`：审核工具条、模拟的窗口按钮与 Mica、吉祥物预览页），只在开发服务器里动态
-加载，生产构建不含它们。
+加载，生产构建不含它们；它们的文案与吉祥物预览页的 `#/mascots` 路由也只在开发构建里。
 
 ## 测试
 

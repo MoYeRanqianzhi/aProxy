@@ -21,8 +21,9 @@ ignore = [
     # glib 0.18 的 VariantStrIter 迭代器不健全（0.20 修复）。它只经 Variant::array_iter_str() 得到，
     # 依赖 glib 0.18 的 crate（tauri、tao、wry、muda、webkit2gtk 与 gtk-rs 各绑定）都没有调用（2026-10-12 检索源码）
     { id = "RUSTSEC-2024-0429", reason = "glib 0.18 from Tauri's GTK3 stack (Linux desktop build only); no crate in the tree uses VariantStrIter" },
-    # proc-macro-error 不再维护：它是 glib-macros 0.18 的过程宏依赖，只在编译期运行，不进二进制
-    { id = "RUSTSEC-2024-0370", reason = "proc-macro dependency of glib-macros 0.18 from Tauri's GTK3 stack; compile-time only" },
+    # proc-macro-error 不再维护：它是 glib-macros 0.18.5 与 gtk3-macros 0.18.2 的过程宏依赖，只在
+    # 编译期运行，不进二进制
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro dependency of glib-macros 0.18 and gtk3-macros 0.18 from Tauri's GTK3 stack; compile-time only" },
 ]
 
 # 许可证合规：项目 MIT，依赖白名单为开源常见宽松许可集合。

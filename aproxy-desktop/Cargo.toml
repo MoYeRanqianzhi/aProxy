@@ -90,8 +90,9 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 # 判定这台电脑有没有 Mica：Tauri 应用窗口效果时会丢掉 window-vibrancy 返回的错误，只有直接
-# 调用它才拿得到结果。钉死成 tauri 2.12 依赖的那个版本：版本不同时 macOS 上会与 Tauri 带的
-# 那份重复定义符号（tauri#15478），本包也只在 Windows 上用它。
+# 调用它才拿得到结果。钉死成 tauri 2.12.3 依赖的那个版本，与 Tauri 用同一份：这里试出来的
+# 结果才代表页面经 Tauri 打开 Mica 时会怎样（见 src/lib.rs 的 mica 模块），也不多编一份。
+# 升级 tauri 时跟着改成它依赖的版本。
 window-vibrancy = "=0.8.1"
 # 系统 build 号（经 RtlGetVersion，不受清单里兼容性声明的影响）。window-vibrancy 用它决定
 # 走哪条 Mica 接口，本包按同一个数判定支持与否；它已经在依赖树里，不多出 crate。

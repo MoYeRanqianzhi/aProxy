@@ -29,7 +29,7 @@ const MIN_GLIBC = '2.28';
 // 带界面的 gnu 产物能运行的 glibc 下限，必须与 release.yml 的 DESKTOP_GLIBC_FLOOR、
 // scripts/install.sh 的 DESKTOP_MIN_GLIBC 保持一致。它还要 WebKitGTK 2.40+，那一项这里查不了，
 // 缺库时由动态加载器报错（见文件末尾）。
-const DESKTOP_MIN_GLIBC = '2.35';
+const DESKTOP_MIN_GLIBC = '2.34';
 const HEADLESS_HINT = [
   '改装无界面的 headless 版本（代理与命令行完全相同，只是没有 aproxy desktop 窗口）：',
   '  npm uninstall -g @meowo/aproxy && npm install -g @meowo/aproxy-headless',

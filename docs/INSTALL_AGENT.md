@@ -90,7 +90,7 @@ Notes:
   with the window of `aproxy desktop`, and `headless`, without it (musl comes
   only as headless). Windows and macOS get desktop. On Linux the desktop build
   links GTK and WebKitGTK and cannot even run `--version` without them, so the
-  sh script installs headless when the system is musl, glibc is below 2.35, or
+  sh script installs headless when the system is musl, glibc is below 2.34, or
   WebKitGTK 4.1 is missing (`libwebkit2gtk-4.1-0` on Debian/Ubuntu), and also
   when the downloaded desktop build fails its self-test; it prints why. To
   choose, pass `--variant desktop|headless` to the sh script (or set

@@ -40,7 +40,7 @@ MIN_GLIBC="2.28"
 # 系统决定；必须与 release.yml 的 DESKTOP_GLIBC_FLOOR、npm/aproxy/bin/aproxy.js 的
 # DESKTOP_MIN_GLIBC 保持一致。只用于没指定变体时替用户挑一个：本脚本每次都从 main 现取，
 # 跟得上最新的构建；aproxy 自己的安装器不预先猜，只看下载下来的二进制能不能跑。
-DESKTOP_MIN_GLIBC="2.35"
+DESKTOP_MIN_GLIBC="2.34"
 UA="aproxy-install-script"
 
 # ---- aProxy 主目录（永久兼容契约 C1，与 aproxy 二进制同一规则）----

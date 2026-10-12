@@ -24,7 +24,7 @@ or musl, macOS arm64/x64) is installed automatically via
 npm registry.
 
 On Linux the desktop build links WebKitGTK: it needs WebKitGTK 2.40 or later
-(`libwebkit2gtk-4.1-0` on Debian/Ubuntu) and glibc 2.35 or later, and without
+(`libwebkit2gtk-4.1-0` on Debian/Ubuntu) and glibc 2.34 or later, and without
 them it cannot start at all — use `@meowo/aproxy-headless` there. On musl
 systems (Alpine) both packages carry the same headless binary.
 

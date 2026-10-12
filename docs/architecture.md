@@ -617,7 +617,7 @@ tauri-build 每次构建都在包根写 `gen/schemas/`，包里没有这些文�
 | 平台 | 状态 |
 |---|---|
 | Windows（x64 / x86 / arm64） | 全功能（开发与主测试平台） |
-| Linux（x86_64 / aarch64，glibc 与 musl） | 全功能；headless 的 gnu 产物 glibc 下限 2.28，带界面的 gnu 产物要 glibc 2.35 与 WebKitGTK 2.40；更低的 glibc 与 musl 系统用 musl 产物（只有 headless） |
+| Linux（x86_64 / aarch64，glibc 与 musl） | 全功能；headless 的 gnu 产物 glibc 下限 2.28，带界面的 gnu 产物要 glibc 2.34 与 WebKitGTK 2.40；更低的 glibc 与 musl 系统用 musl 产物（只有 headless） |
 | macOS（Apple Silicon / Intel） | 提供预构建二进制，但未经真机验证；看门狗、`aproxy install` 与依赖进程查询的实例管理用到 Linux 专有接口（`/dev/shm`、`/proc`），在 macOS 上不可用或退化 |
 
 unix 分支（UDS IPC、`/dev/shm` 心跳、`/proc` 进程查询、单步 rename 交换）按
@@ -651,7 +651,7 @@ Ubuntu 22.04 等系统启动即报 `GLIBC_2.39 not found`（alpha.17 实测如�
 
 带界面的 gnu 产物链接系统的 GTK 与 WebKitGTK，不能用 zigbuild 压低 glibc：它在
 `ubuntu:22.04` 容器里构建（跑在 ubuntu-24.04 与 24.04-arm 上），下限 `DESKTOP_GLIBC_FLOOR`
-（2.35）同样在构建后断言。这个数与 `scripts/install.sh`、`npm/aproxy/bin/aproxy.js` 判断
+（2.34）同样在构建后断言。这个数与 `scripts/install.sh`、`npm/aproxy/bin/aproxy.js` 判断
 「本机能不能跑带界面版」用的数必须一致。
 
 ### npm dist-tag

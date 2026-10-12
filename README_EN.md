@@ -106,7 +106,7 @@ About the scripts:
   commands are the same. musl comes only as headless. Windows and macOS get
   desktop. On Linux the desktop build links GTK and WebKitGTK and cannot even
   run `--version` without them, so the sh script checks the machine first:
-  musl, glibc below 2.35, or no WebKitGTK 4.1 (`libwebkit2gtk-4.1-0` on
+  musl, glibc below 2.34, or no WebKitGTK 4.1 (`libwebkit2gtk-4.1-0` on
   Debian/Ubuntu) gets headless with the reason printed, and so does a desktop
   build that fails its self-test after the download (WebKitGTK older than
   2.40, for example). To choose, pass `--variant desktop|headless` to the sh
@@ -218,7 +218,7 @@ development package (see above).
 | Platform | Status |
 |---|---|
 | Windows (x64 / x86 / arm64) | Full support |
-| Linux (x86_64 / aarch64, glibc and musl) | Full support; the headless gnu build requires glibc ≥ 2.28, the desktop gnu build glibc ≥ 2.35 and WebKitGTK ≥ 2.40 (glibc floors asserted at build time in the release pipeline); older glibc and musl systems use the statically linked musl build (headless only) |
+| Linux (x86_64 / aarch64, glibc and musl) | Full support; the headless gnu build requires glibc ≥ 2.28, the desktop gnu build glibc ≥ 2.34 and WebKitGTK ≥ 2.40 (glibc floors asserted at build time in the release pipeline); older glibc and musl systems use the statically linked musl build (headless only) |
 | macOS (Apple Silicon / Intel) | Pre-built binaries are published but untested on real hardware; the watchdog, `aproxy install` and process-query-based instance management rely on Linux-only interfaces (`/dev/shm`, `/proc`) and are unavailable or degraded on macOS (needs real hardware; contributions welcome) |
 
 ## Quick start

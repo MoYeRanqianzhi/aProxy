@@ -46,7 +46,7 @@ curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/
 脚本说明：
 - 已安装则不覆盖，升级走 `aproxy install`；sh 脚本需要 `sha256sum`、`shasum` 或 `openssl` 之一做 SHA256 校验。
 - Linux：glibc 过低或 musl 系统自动改用静态链接的 musl 产物；落位前先 `--version` 自检，gnu 产物在本机跑不起来会自动改拉 musl。
-- **两个变体**：每个平台都有带桌面界面的 desktop（`aproxy desktop` 打开窗口）与无界面的 headless 两个版本，代理与命令行完全相同；musl 只有 headless。Windows 与 macOS 装 desktop。Linux 上带界面的版本动态链接 GTK 与 WebKitGTK，缺库或库太旧时连 `--version` 都起不来，所以 sh 脚本先看本机：musl、glibc 低于 2.35、找不到 WebKitGTK 4.1（Debian/Ubuntu 的 `libwebkit2gtk-4.1-0`）的装 headless 并说明原因，带界面的版本下载后自检跑不起来（例如 WebKitGTK 低于 2.40）也改装 headless。要指定变体：sh 脚本加 `--variant desktop|headless`（或设 `APROXY_VARIANT`）；装好之后换变体用 `aproxy install --variant desktop`（或 `headless`）。
+- **两个变体**：每个平台都有带桌面界面的 desktop（`aproxy desktop` 打开窗口）与无界面的 headless 两个版本，代理与命令行完全相同；musl 只有 headless。Windows 与 macOS 装 desktop。Linux 上带界面的版本动态链接 GTK 与 WebKitGTK，缺库或库太旧时连 `--version` 都起不来，所以 sh 脚本先看本机：musl、glibc 低于 2.34、找不到 WebKitGTK 4.1（Debian/Ubuntu 的 `libwebkit2gtk-4.1-0`）的装 headless 并说明原因，带界面的版本下载后自检跑不起来（例如 WebKitGTK 低于 2.40）也改装 headless。要指定变体：sh 脚本加 `--variant desktop|headless`（或设 `APROXY_VARIANT`）；装好之后换变体用 `aproxy install --variant desktop`（或 `headless`）。
 - `irm | iex` 无法传参，PowerShell 脚本可用环境变量代替：`APROXY_PRE`、`APROXY_NO_SKILLS`、`APROXY_DL_PROXY`（下载代理，与上游请求代理无关）。
 - Windows PowerShell 5.1 用 `-File` 本地运行 `install.ps1` 会解析失败（文件为 UTF-8 无 BOM）；请用上面的 `irm | iex`，或 `pwsh -File`。
 
@@ -92,7 +92,7 @@ cargo build --release
 | 平台 | 状态 |
 |---|---|
 | Windows（x64 / x86 / arm64） | 全功能 |
-| Linux（x86_64 / aarch64，glibc 与 musl） | 全功能；headless 的 gnu 产物要求 glibc ≥ 2.28，带界面的 gnu 产物要求 glibc ≥ 2.35 与 WebKitGTK ≥ 2.40（glibc 下限由发布流程构建时断言）；更低版本的 glibc 与 musl 系统使用静态链接的 musl 产物（只有 headless） |
+| Linux（x86_64 / aarch64，glibc 与 musl） | 全功能；headless 的 gnu 产物要求 glibc ≥ 2.28，带界面的 gnu 产物要求 glibc ≥ 2.34 与 WebKitGTK ≥ 2.40（glibc 下限由发布流程构建时断言）；更低版本的 glibc 与 musl 系统使用静态链接的 musl 产物（只有 headless） |
 | macOS（Apple Silicon / Intel） | 提供预构建二进制，但未经真机验证；看门狗、`aproxy install` 与依赖进程查询的实例管理用到 Linux 专有接口（`/dev/shm`、`/proc`），在 macOS 上不可用或退化（需真机补齐，欢迎贡献） |
 
 ## 起手

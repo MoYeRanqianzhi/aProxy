@@ -11,11 +11,11 @@
 
 - **0.1.x 的 `aproxy install` / `aproxy upgrade` 装不上 0.2.0**：它下载 0.2.0 之后先运行一次新二进制的 `--version` 自证版本，这一步报 `--version 输出无版本号` 并以 1 退出（下载本身是成功的，随后那句下载代理的建议不用理会）。它不建安装状态、不动实例、不换二进制，也不更新 skill 文档；在线安装只在 `~/.aproxy/staging/` 下留着下载的文件，可以删掉。`--from` 同样在这一步失败。
 - **删除与 0.1.0 互通的兼容层**：0.1.0 的 CLI 与安装器联系不上 0.2.0 的实例，0.2.0 的 CLI 也联系不上 0.1.0 的实例。Windows 上不再在 0.1.0 的控制管道名 `\\.\pipe\aproxy-<端口>` 上应答，控制协议只认 v1（不带 `v` 的请求按 `bad_request` 拒绝），安装宣告只用本 home 的名字，安装状态机去掉只由 0.1.0 写入的 `relaying` 阶段。0.2.0 的实例启动时仍会退役比自己旧的看门狗，迁移时没来得及退出的 0.1.0 看门狗不会留着。
-- **`--version` 输出改为永久格式** `aproxy v<版本> (<变体>; <目标三元组>[; x86-64-v3])`，例如 `aproxy v0.2.0 (desktop; x86_64-pc-windows-msvc; x86-64-v3)`：变体是 `desktop`（带桌面界面的版本）或 `headless`（无界面版本），最后一段只在 x86-64-v3 构建上出现。之后的每个版本都按这一格式输出、安装器也按它认版本，格式不再改动。解析过 `aproxy <版本>` 的脚本请改为取首行 `aproxy v` 之后、到空格为止的部分。`aproxy --version` 与 `aproxy -V` 不读写 `APROXY_HOME`、不联网、不拉起任何进程。
+- **`--version` 输出改为永久格式** `aproxy v<版本> (<变体>; <目标三元组>[; x86-64-v3])`，例如 `aproxy v0.2.0 (desktop; x86_64-pc-windows-msvc; x86-64-v3)`：变体是 `desktop`（带桌面界面的版本）或 `headless`（无界面版本），最后一段只在 x86-64-v3 构建上出现。之后的每个版本都按这一格式输出、安装器也按它认版本，格式不再改动。解析过 `aproxy <版本>` 的脚本请改为取首行 `aproxy v` 之后、到空格为止的部分。`aproxy --version` 与 `aproxy -V` 不读写 `APROXY_HOME`、不联网、不拉起任何进程，输出写不出去（例如接到已经关闭的管道）时退出码仍是 0。
 - **安装状态挪到 `<home>/install/`**：状态文件由 `run/install.state` 改为 `install/state.json`，备料与下载暂存由 `staging/<版本>/` 改为 `install/staging/<版本>/`，一键安装脚本的下载暂存由 `staging/bootstrap` 改为 `install/bootstrap`。0.1.0 留下的 `run/install.state` 与 `staging/` 不再被读取。
 - **`aproxy install` 拒绝低于 0.2.0 的版本**：在线安装指定的版本号与 `--from` 的二进制都一样，`--allow-downgrade` 也不行，报 `目标版本 <版本> 低于 0.2.0，不能安装：…` 并说明怎样回到 0.1.x。0.2.0 的预发布（alpha、beta、rc）不受影响。
 - **`aproxy install` 的指令集档参数改名为 `--cpu`**：原来的 `--variant v3|baseline` 改为 `--cpu x86-64-v3|baseline`（与 `--version` 末段的写法一致）。`--variant` 改为只与 `--force` 搭配，取 `desktop|headless`；单独使用报命令行用法错误。
-- **`APROXY_HOME` 必须是绝对路径**：设成相对路径时，除 `--version`、`--help` 外的命令一律报错退出，`install --force` 以 10 结束（此前相对当前工作目录解析，在不同目录下执行的命令会用到不同的 home）。值原样使用、不再去掉首尾空白，为空或只含空白视同未设；不是合法 UTF-8 的值也照用（此前会静默退回 `~/.aproxy`）。未设时的用户目录与一键安装脚本一致：Windows 取 `USERPROFILE`，其他平台取 `HOME`，为空时才向系统查询。
+- **`APROXY_HOME` 必须是绝对路径**：设成相对路径时，除 `--version`、`--help` 外的命令一律报错退出，`install --force` 以 10 结束（此前相对当前工作目录解析，在不同目录下执行的命令会用到不同的 home）。值原样使用、不再去掉首尾空白，为空或只含空白视同未设；不是合法 UTF-8 的值也照用（此前会静默退回 `~/.aproxy`）。未设时的用户目录与一键安装脚本一致：Windows 取 `USERPROFILE`，其他平台取 `HOME`，为空时才向系统查询；命令行路径参数、配置（`log_file`、变换的 `command`）里的 `~` 与读 `~/.npmrc` 也都用这个用户目录。三个一键安装脚本按同一规则处理 `APROXY_HOME`：只含空白视同未设，不是绝对路径就报错退出、什么都不装。
 
 #### 从 0.1.x 迁移
 

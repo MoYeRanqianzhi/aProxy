@@ -774,11 +774,13 @@ fn trim_transform_command(t: Option<TransformConfig>) -> Option<TransformConfig>
     .filter(|t| !t.command.is_empty())
 }
 
-/// `~` 前缀展开：`~/x`、`~\x`、裸 `~` → 用户主目录；其余原样。
+/// `~` 前缀展开：`~/x`、`~\x`、裸 `~` → 用户目录；其余原样。用户目录是 C1 的那一个
+/// （见 `settings::user_dir`）：`~` 在 aproxy 里处处指同一个目录，配置里的 `~` 与命令行
+/// 路径参数里的 `~`、home 的默认位置 `~/.aproxy` 不会落在两个地方。
 /// 展开产物统一用 `/` 分隔（Windows API 同样接受）。
 pub fn expand_tilde(s: &str) -> String {
     let home = || {
-        dirs::home_dir()
+        crate::settings::user_dir()
             .map(|p| {
                 p.display()
                     .to_string()
@@ -947,6 +949,18 @@ pub fn save_to(path: &std::path::Path, cfg: &Config) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tilde_expands_to_the_c1_user_dir() {
+        // 与路径参数、home 的默认位置同一来源；产物用 `/` 分隔，只认开头的 `~`
+        let user = crate::settings::user_dir().unwrap().display().to_string();
+        let user = user.trim_end_matches(['/', '\\']);
+        assert_eq!(expand_tilde("~"), user);
+        assert_eq!(expand_tilde("~/bin/x"), format!("{user}/bin/x"));
+        assert_eq!(expand_tilde(r"~\bin"), format!("{user}/bin"));
+        assert_eq!(expand_tilde("~user/x"), "~user/x");
+        assert_eq!(expand_tilde("/opt/~/x"), "/opt/~/x");
+    }
 
     #[test]
     fn validate_rejects_empty() {

@@ -49,7 +49,7 @@ impl TestHome {
             "测试 home 必须在临时目录里: {}",
             home.display()
         );
-        if let Some(user_home) = dirs::home_dir() {
+        if let Some(user_home) = aproxy::settings::user_dir() {
             assert!(
                 !home.starts_with(real(&user_home.join(".aproxy"))),
                 "测试 home 绝不能是用户的 ~/.aproxy: {}",

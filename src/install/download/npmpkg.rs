@@ -47,9 +47,11 @@ fn platform_package(ctx: &DownloadCtx) -> String {
 
 /// 读 ~/.npmrc 的 registry= 行（缺省官方 registry）。逐行扫 `registry=`
 /// 前缀（npmrc 是 INI 风格键值，value 可能带引号——strip 引号）。
+/// `~` 是 C1 的用户目录（见 `settings::user_dir`），npm 自己的 os.homedir() 也是先读
+/// USERPROFILE / HOME，两边找的是同一个 .npmrc。
 fn registry_from_npmrc() -> String {
     let default = "https://registry.npmjs.org".to_string();
-    let Some(path) = dirs::home_dir().map(|h| h.join(".npmrc")) else {
+    let Some(path) = crate::settings::user_dir().map(|h| h.join(".npmrc")) else {
         return default;
     };
     std::fs::read_to_string(path)

@@ -21,7 +21,11 @@ troubleshooting.md.
 ### Home directory
 
 aProxy keeps everything under one home directory, written `<home>` below: the value of
-`APROXY_HOME` when it is set and non-empty, otherwise `~/.aproxy`.
+`APROXY_HOME` when it is set to anything but blanks, otherwise `~/.aproxy` (`~` is `USERPROFILE`
+on Windows and `HOME` elsewhere, the same directories the install scripts use). `APROXY_HOME` is
+used exactly as written, so it must be an absolute path: with a relative one every command except
+`--version` and `--help` stops with an error instead of guessing a directory from the working
+directory, and `install --force` ends with 10.
 
 | Path | Holds |
 |---|---|

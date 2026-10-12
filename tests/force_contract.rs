@@ -80,6 +80,151 @@ fn c1_c2_c4_locations_and_names() {
     );
 }
 
+/// C1：home 的解析规则（纯函数 `home_from`、`user_dir_from`，环境变量由测试直接给值——
+/// 不改本进程的环境，也就不可能把 home 指到用户真正在用的目录）。
+#[test]
+fn c1_home_resolution_rules() {
+    use aproxy::settings::{HOME_ENV, USER_DIR_ENV, home_from, user_dir_from};
+    use std::ffi::OsStr;
+    assert_eq!(HOME_ENV, "APROXY_HOME");
+    assert_eq!(
+        USER_DIR_ENV,
+        if cfg!(windows) { "USERPROFILE" } else { "HOME" }
+    );
+
+    let abs = if cfg!(windows) {
+        r"C:\aproxy-home"
+    } else {
+        "/aproxy-home"
+    };
+    let user = PathBuf::from(if cfg!(windows) {
+        r"C:\Users\someone"
+    } else {
+        "/home/someone"
+    });
+    let default = user.join(".aproxy");
+    let resolve = |value: Option<&str>| home_from(value.map(OsStr::new), || Some(user.clone()));
+    // APROXY_HOME 设了就不该去取用户目录
+    let never = || -> Option<PathBuf> { panic!("APROXY_HOME 设了就不该去取用户目录") };
+
+    // 设了：原样使用，不 trim（尾随的空白也是路径的一部分）
+    assert_eq!(
+        home_from(Some(OsStr::new(abs)), never),
+        Ok(PathBuf::from(abs))
+    );
+    let trailing = format!("{abs} ");
+    assert_eq!(
+        home_from(Some(OsStr::new(&trailing)), never),
+        Ok(PathBuf::from(&trailing))
+    );
+    // 按原始字节读：不是合法 UTF-8 也照用
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = OsStr::from_bytes(b"/aproxy-\xff-home");
+        assert_eq!(home_from(Some(raw), never), Ok(PathBuf::from(raw)));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        // 落单的代理项 0xD800：合法的 Windows 文件名字符，却不是合法的 UTF-16/UTF-8
+        let mut wide: Vec<u16> = r"C:\aproxy-".encode_utf16().collect();
+        wide.push(0xD800);
+        let raw = std::ffi::OsString::from_wide(&wide);
+        assert!(raw.to_str().is_none());
+        assert_eq!(home_from(Some(&raw), never), Ok(PathBuf::from(&raw)));
+    }
+
+    // 没设、为空、只含空白：视为未设 → <用户目录>/.aproxy
+    for unset in [None, Some(""), Some(" "), Some("\t \n"), Some("\u{3000}")] {
+        assert_eq!(resolve(unset), Ok(default.clone()), "{unset:?}");
+    }
+    // 不是绝对路径：报错（要读 home 的命令一律拒绝运行）。`~` 不展开；开头的空白让它成了
+    // 相对路径
+    let leading = format!(" {abs}");
+    let mut relative = vec!["aproxy-home", "./aproxy-home", ".", "~/.aproxy", &leading];
+    // Windows 上有根无盘符、有盘符无根都不是绝对路径
+    if cfg!(windows) {
+        relative.extend([r"\aproxy-home", "C:aproxy-home"]);
+    }
+    for value in relative {
+        let err = resolve(Some(value)).expect_err(value);
+        assert!(err.contains(HOME_ENV), "{err}");
+    }
+    // 用户目录也取不到：报错
+    assert!(home_from(None, || None).is_err());
+
+    // 用户目录：环境变量非空就原样用它（只含空白也算非空），否则问系统
+    let system = PathBuf::from(if cfg!(windows) {
+        r"C:\Users\from-system"
+    } else {
+        "/home/from-system"
+    });
+    let ask_system = || Some(system.clone());
+    let refuse = || -> Option<PathBuf> { panic!("环境变量非空时不该去问系统") };
+    assert_eq!(
+        user_dir_from(Some(user.as_os_str()), refuse),
+        Some(user.clone())
+    );
+    assert_eq!(
+        user_dir_from(Some(OsStr::new(" ")), refuse),
+        Some(PathBuf::from(" "))
+    );
+    assert_eq!(
+        user_dir_from(Some(OsStr::new("")), ask_system),
+        Some(system.clone())
+    );
+    assert_eq!(user_dir_from(None, ask_system), Some(system.clone()));
+}
+
+/// C1：APROXY_HOME 不是绝对路径时，要读 home 的命令一律拒绝运行、什么都不建；`--version`
+/// 不受影响；强制安装以 10 结束（什么都没动）。在一个空的临时目录里运行：一旦哪个命令把
+/// 相对路径当成了 home，就会在这里建出东西来。用户目录的环境变量也指向这个临时目录，
+/// 即使实现错把它当成「未设」，落脚的也是临时目录，碰不到用户真正在用的 home。
+#[test]
+fn c1_a_relative_aproxy_home_is_refused() {
+    let cwd = temp_home();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_aproxy"))
+            .args(args)
+            .current_dir(cwd.path())
+            .env("APROXY_HOME", "relative-home")
+            .env("USERPROFILE", cwd.path())
+            .env("HOME", cwd.path())
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+
+    let version = run(&["--version"]);
+    assert_eq!(version.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&version.stdout).starts_with("aproxy v"));
+
+    // 报错退出，而不是崩溃（进程入口就核对，不等到第一次读 home 时 panic）
+    let status = run(&["status"]);
+    let status_err = String::from_utf8_lossy(&status.stderr);
+    assert_ne!(status.status.code(), Some(0), "{status_err}");
+    assert!(status_err.contains("APROXY_HOME"), "{status_err}");
+    assert!(!status_err.contains("panicked"), "{status_err}");
+
+    let forced = run(&["install", "--force", "--from", "no-such-file", "--yes"]);
+    let forced_err = String::from_utf8_lossy(&forced.stderr);
+    assert_eq!(
+        forced.status.code(),
+        Some(force::EXIT_UNCHANGED),
+        "{forced_err}"
+    );
+    assert!(forced_err.contains("APROXY_HOME"), "{forced_err}");
+
+    let created: Vec<_> = std::fs::read_dir(cwd.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert!(created.is_empty(), "相对路径不得被当成 home: {created:?}");
+}
+
 #[test]
 fn c2_unique_intermediate_names() {
     use aproxy::install::swap::{OLD_PREFIX, TMP_PREFIX, is_residue_name, unique_name};

@@ -59,6 +59,15 @@ async fn main() {
         commands::install::handle_force_cmd(args).await;
     }
 
+    // 永久兼容契约 C1：APROXY_HOME 设了却不是绝对路径（或者连用户目录都取不到）时，一切
+    // 要读 home 的命令都拒绝运行——相对路径随工作目录解析成不同的 home，在这里报错比在
+    // 错误的目录里读写强。`--version`、`--help` 不读 home，在上面已经结束；强制安装在
+    // 上面自己报告（退出码 10）
+    if let Err(e) = settings::resolve_home() {
+        eprintln!("[ERROR] {e}");
+        std::process::exit(1);
+    }
+
     // 实际生效的配置文件路径（default_config 失效时为 Err）。只在真正要读配置
     // 的命令里兑现，见 commands::resolve_cfg_path
     let cfg_path = commands::resolve_cfg_path(&cli);

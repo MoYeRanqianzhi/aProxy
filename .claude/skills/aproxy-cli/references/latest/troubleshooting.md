@@ -38,6 +38,7 @@ the aproxy-format skill's troubleshooting.md.
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| Every command except `--version` and `--help` stops with `APROXY_HOME 必须是绝对路径…` ("APROXY_HOME must be an absolute path") | `APROXY_HOME` is set to a relative path; aProxy does not resolve it against the working directory | Set `APROXY_HOME` to an absolute path, or unset it to use `~/.aproxy` |
 | `端口 <addr> 被其他程序占用，无法启动` ("port in use by another program") | Another program listens on the port, or an aProxy instance started under a different `APROXY_HOME` (an instance of this home would be reported as already running) | Find the owner (`netstat -ano \| findstr :<port>` on Windows, `ss -ltnp \| grep :<port>` on Linux), then pick another port or ask the user about that program |
 | `端口 <addr> 无法绑定：无权限或端口被系统保留（如 Hyper-V/WinNAT 排除区间，…）` ("cannot bind: no permission, or the port is reserved by the system") | Windows reserves port ranges for Hyper-V/WinNAT; netstat shows no listener | `netsh interface ipv4 show excludedportrange protocol=tcp`, then choose a port outside every range |
 | startup.log has `控制通道 <endpoint> 创建失败：…` ("control channel could not be created") and the instance did not start | Another aProxy instance in the same home already uses that port on a different listen address (both can bind TCP, only one can own the control channel), or on Linux/macOS the run directory path is too long for a socket | Give one of the two configs another port; for a long path, use a shorter `APROXY_HOME` or `APROXY_RUN_DIR` |

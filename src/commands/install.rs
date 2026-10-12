@@ -12,7 +12,20 @@ use crate::cli::InstallArgs;
 /// 本进程结束安装者时跳过自己的 pid。退出走 ledger::exit，删掉自己的条目。
 pub(crate) async fn handle_force_cmd(args: &InstallArgs) -> ! {
     use aproxy::install::force;
-    let home = aproxy::settings::home();
+    use std::io::Write;
+    // home 解析不了（永久兼容契约 C1：APROXY_HOME 不是绝对路径）就什么都不做：还没登记
+    // 台账，直接以 10 退出。写失败忽略（C7：写输出失败不得改变退出码）
+    let home = match aproxy::settings::resolve_home() {
+        Ok(home) => home,
+        Err(e) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "[ERROR] {e}\n什么都没有改动（退出码 {}）。",
+                force::EXIT_UNCHANGED
+            );
+            std::process::exit(force::EXIT_UNCHANGED);
+        }
+    };
     let _ledger = aproxy::ledger::register(
         &home,
         aproxy::ledger::ROLE_INSTALLER,

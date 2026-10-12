@@ -15,6 +15,7 @@
 - **安装状态挪到 `<home>/install/`**：状态文件由 `run/install.state` 改为 `install/state.json`，备料与下载暂存由 `staging/<版本>/` 改为 `install/staging/<版本>/`，一键安装脚本的下载暂存由 `staging/bootstrap` 改为 `install/bootstrap`。0.1.0 留下的 `run/install.state` 与 `staging/` 不再被读取。
 - **`aproxy install` 拒绝低于 0.2.0 的版本**：在线安装指定的版本号与 `--from` 的二进制都一样，`--allow-downgrade` 也不行，报 `目标版本 <版本> 低于 0.2.0，不能安装：…` 并说明怎样回到 0.1.x。0.2.0 的预发布（alpha、beta、rc）不受影响。
 - **`aproxy install` 的指令集档参数改名为 `--cpu`**：原来的 `--variant v3|baseline` 改为 `--cpu x86-64-v3|baseline`（与 `--version` 末段的写法一致）。`--variant` 改为只与 `--force` 搭配，取 `desktop|headless`；单独使用报命令行用法错误。
+- **`APROXY_HOME` 必须是绝对路径**：设成相对路径时，除 `--version`、`--help` 外的命令一律报错退出，`install --force` 以 10 结束（此前相对当前工作目录解析，在不同目录下执行的命令会用到不同的 home）。值原样使用、不再去掉首尾空白，为空或只含空白视同未设；不是合法 UTF-8 的值也照用（此前会静默退回 `~/.aproxy`）。未设时的用户目录与一键安装脚本一致：Windows 取 `USERPROFILE`，其他平台取 `HOME`，为空时才向系统查询。
 
 #### 从 0.1.x 迁移
 

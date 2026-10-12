@@ -118,7 +118,9 @@ ruzstd = "0.9.0"
 # 的进程时枚举全部进程（CreateToolhelp32Snapshot）。
 # Win32_System_IO：安装锁直接调用 LockFileEx / UnlockFileEx（它们的 OVERLAPPED 参数在
 # 这个 feature 里）——锁原语是永久兼容契约 C4，不经 std 的 File::try_lock。
-windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO"] }
+# Win32_UI_Shell、Win32_System_Com：USERPROFILE 为空时按 FOLDERID_Profile 取用户目录
+# （SHGetKnownFolderPath，结果用 CoTaskMemFree 释放）——home 的算法是永久兼容契约 C1。
+windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_UI_Shell", "Win32_System_Com"] }
 
 [target.'cfg(unix)'.dependencies]
 # 进程台账（src/ledger.rs）结束进程时要用的系统调用：Linux 的 pidfd_open /

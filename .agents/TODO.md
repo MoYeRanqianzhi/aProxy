@@ -22,8 +22,15 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   `.agents/review/2026-10-12-force-install-review.md` 无 P0，P1 与选定的 P2 全部修完；Windows 全量 549 通过，CI 三平台核过）。
   剩余：release.yml 生成并校验 `aproxy-manifest.json`（第 4 步）；有两个带强制安装的版本后加跨版本强制安装的 CI 测试；
   桌面界面拉起强制安装时 stdio 为 null（W5）
-- [ ] **alpha.1 第 3 步：Tauri 桌面外壳**（2026-10-12 起由子代理实现，见计划 W5「Tauri 嵌入调研结论」）
-- [ ] **W2 设计稿**（`.agents/plan/w2-contracts.md`，2026-10-12 起草完成，对抗式审查中；之后整理 §13 的问题给用户拍板）
+- [ ] **alpha.1 第 3 步：Tauri 桌面外壳**（2026-10-12 提交 58c1518…a7cf72f，Windows 两种变体各 552 通过、实机验过；推送前
+  代码审查中，Linux 带界面版的链接与运行等推送后的 CI）。留到以后的：从快捷方式启动会闪一下终端（要 GUI 子系统的启动器，
+  或清单的 consoleAllocationPolicy=detached——后者作用于整个 exe，守护进程拉起的 worker 会不会弹窗未验证）；Linux 上
+  「跟随系统」读不到深浅色（要开 tauri 的 dbus 特性、CI 装 libdbus-1-dev，W5）；界面偏好（含 Mica 开关）只在内存里，
+  重启恢复默认（随 W2 的 settings 与 W5 持久化）
+- [ ] **alpha.1 第 4 步：发布流水线**（release.yml 与 release-format.yml 在默认带界面后会坏：没有前端产物、没有 WebKitGTK、
+  musl 与交叉编译要 `--no-default-features`；aproxy-desktop 首发 crates.io 要所有者种子发布）
+- [ ] **W2 设计稿**（`.agents/plan/w2-contracts.md`，2026-10-12 第二版改完：D-16、请求体整份保留、`mode` 改名；第二轮复审中，
+  通过后提交）
 - [ ] **W3 i18n**（给用户看的 en/zh-CN，给 agent 或不可见的固定英文）
 - [ ] **W4 `aproxy skill` 命令**（install/upgrade/list/show，show 的安全设计，`--help` 末尾提示行）
 - [ ] **W5 UI**（Tauri 2 编进本体、`desktop` feature 默认开、headless 版本；自定义标题栏；Mica 默认关可开）

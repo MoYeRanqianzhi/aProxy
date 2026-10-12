@@ -49,7 +49,12 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] **README 截图**（用户 2026-10-12）：UI 完成后构造演示数据，拍中英两套截图，中文版用于 README.md，英文版用于
   README_EN.md。演示数据里不能出现真实的 key、上游地址或个人信息
 - [ ] **W6 审查发现的修复与重构**；另含 W1 留下的：`install --from` 不做降级检查（审查 CI-06）
-- [ ] **W7 发布 0.2.0**
+- [ ] **W7 发布 0.2.0**。另外两件：
+  - 撤回预发布期的措辞（`--pre` / `@next` / `--version`、「目前只有预发布」）。2026-10-13 文档终审列的位置：README.md 31、60–63，
+    README_EN.md 81、135–142、183，docs/INSTALL_AGENT.md 54–58、156，compatibility.md 步骤 3，CHANGELOG.md 24；
+    带「alpha.1」字样、等有真实数据要改的：README.md 206，README_EN.md 380，SKILL.md 88，commands.md 476，troubleshooting.md 145，
+    architecture.md 513、678，aproxy-format 的 guide.md（envelope 钉 `=0.2.0-alpha.1` 改回 `"0.2"`）。行号会漂，按内容找。
+  - 重写 SECURITY.md：支持的版本改为 0.2.x，威胁模型补上桌面窗口与强制安装。
 
 ### 0.2.0 之后紧接着（近期，用户 2026-10-12）
 - [ ] **并发限制与排队**：aproxy 的排队放行 + 官方 aproxy-format 的并发/限速/额度规则（协议形状在 0.2.0 定稿，见计划 W2 的 format 定稿补充）

@@ -1117,3 +1117,53 @@ fn install_from_checks_the_variant() {
         "拒绝发生在建安装状态与备料之前"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 11. 带界面的产物在下载链的哪个渠道都没拿到：以 1 结束、不改装 headless（下载链分不清
+//     「这一版没有它」与网络暂时出错）；没写 --variant 时提示 --variant headless 与
+//     install --force，写了 --variant 的不提示
+// ---------------------------------------------------------------------------
+#[test]
+fn a_desktop_build_no_channel_delivers_is_not_replaced() {
+    let env = TestEnv::new(15);
+    // 下载链只有一个必然连不上的地址：渠道全部失败，与 404 一样走「下载链失败」
+    std::fs::write(
+        env.home().join("settings.json"),
+        r#"{"watchdog": false, "download_chain": [{"url": "http://127.0.0.1:1/{asset}"}]}"#,
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let out = env
+            .install_cmd(args)
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code(), text)
+    };
+    let hint = "要装的是带桌面界面的版本";
+    let own = aproxy::install::force::VersionLine::own().variant.unwrap();
+
+    // 没写 --variant：要装的就是本构建的变体，带界面的构建才提示
+    let (code, text) = run(&["9.9.9", "--no-skills"]);
+    assert_eq!(code, Some(1), "{text}");
+    assert!(!text.contains("改用"), "下载链失败不改试别的产物: {text}");
+    assert_eq!(
+        text.contains(hint),
+        own == aproxy::install::force::VARIANT_DESKTOP,
+        "{text}"
+    );
+    for variant in ["desktop", "headless"] {
+        let (code, text) = run(&["9.9.9", "--no-skills", "--variant", variant]);
+        assert_eq!(code, Some(1), "{text}");
+        assert!(!text.contains(hint), "写了 --variant 不提示: {text}");
+    }
+    assert!(
+        !aproxy::install::swap::bin_path_in(&env.home()).exists(),
+        "什么都没装"
+    );
+}

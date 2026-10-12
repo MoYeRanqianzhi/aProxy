@@ -470,6 +470,10 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     // 有带界面的产物下载下来了、却被动态加载器挡在 main 之前（本机缺系统库，见
     // staging::is_loader_failure）；超时、输出不对之类的失败与系统库无关，不算
     let mut desktop_unusable = false;
+    // 带界面的产物在下载链的哪个渠道都没拿到。下载链分不清「这一版没有为本机发布它」（404）
+    // 与网络暂时出错，所以不像跑不起来那样自动改装 headless——一次网络抖动就会把用户悄悄
+    // 换成 headless；只在失败时指出两条出路。强制安装按发布清单判断，确定没有才改装
+    let mut desktop_not_fetched = false;
     for attempt in &attempts {
         if let Some(previous) = failures.last() {
             println!("{previous}，改用 {}...", attempt.binary_asset());
@@ -485,6 +489,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
                 failures.push(format!("{} 在本机不可运行（{e}）", attempt.binary_asset()));
             }
             DownloadOutcome::ChainFailed(e) => {
+                desktop_not_fetched = attempt.variant == VARIANT_DESKTOP;
                 failures.push(e);
                 break;
             }
@@ -493,6 +498,11 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     let Some((fetched, installed_variant)) = installed else {
         for failure in &failures {
             eprintln!("[ERROR] {failure}");
+        }
+        if !explicit_variant && desktop_not_fetched {
+            eprintln!(
+                "没写 --variant，要装的是带桌面界面的版本。若这一版没有为本机发布它，可加 --variant headless 改装无界面版本；或者用 aproxy install --force（会先结束全部 aproxy 进程、中断在途请求），它按发布清单判断，确实没有带界面的版本时改装 headless。"
+            );
         }
         // 没写 --variant 时 headless 已经试过了（见 DownloadCtx::attempts），这句只给写明了 desktop 的。
         // 不写具体的库与版本：要求属于目标版本的构建，这里的文字却随正在运行的旧版本永远不变

@@ -574,7 +574,11 @@ to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running anot
   cargo-binstall, cargo. Each downloaded binary must run its `--version` on this machine and report
   the target version and variant. When it does not run: a desktop build is replaced by the headless
   build of the same target, unless you gave `--variant desktop`; on Linux a gnu build is then
-  replaced by the musl build, which comes only as headless.
+  replaced by the musl build, which comes only as headless. A desktop build that no channel
+  delivers is not replaced, because a release without that file and a passing network failure look
+  the same to the channels: the install stops with exit 1 and, without `--variant`, suggests
+  `--variant headless`, or `install --force`, which reads the release manifest and installs the
+  headless build only when the desktop build is really missing.
 
 **Choosing the variant.** Every platform has two builds with the same proxy and commands: `desktop`,
 with the window of `aproxy desktop`, and `headless`, without it. The first word in the parentheses

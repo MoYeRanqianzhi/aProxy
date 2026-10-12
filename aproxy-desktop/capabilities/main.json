@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "The aProxy window: show itself once the page runs, switch the Mica backdrop and the window theme, read the window's capabilities, and size and color the custom title bar. Nothing else; no core:default.",
+  "windows": ["main"],
+  "permissions": [
+    "core:window:allow-show",
+    "core:window:allow-set-effects",
+    "core:window:allow-set-theme",
+    "allow-desktop-info",
+    "allow-titlebar-insets",
+    "allow-set-caption-color"
+  ]
+}

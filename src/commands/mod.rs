@@ -8,6 +8,7 @@
 
 pub(crate) mod alias;
 pub(crate) mod config;
+pub(crate) mod desktop;
 pub(crate) mod doctor;
 pub(crate) mod find;
 pub(crate) mod install;

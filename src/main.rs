@@ -3,6 +3,10 @@
 //! 本文件只是进程入口：控制台代码页设置、配置文件定位、日志初始化与子命令分派。
 //! CLI 定义在 `cli.rs`，各子命令处理在 `commands/`，服务主循环在 `server.rs`，
 //! 共用小工具在 `util.rs`。
+//!
+//! 入口的顺序：先兑现永久兼容契约 C5 的单独 `--version`，再解析参数、在建 tokio 运行时
+//! 之前分派 `desktop`（桌面界面的事件循环要占住主线程，而且不能处在异步上下文里），其余
+//! 命令都在手建的多线程运行时里 `block_on` 执行（与原先的 `#[tokio::main]` 等价）。
 
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{GetConsoleOutputCP, SetConsoleOutputCP};
@@ -18,12 +22,11 @@ use cli::{Cli, Commands};
 
 use aproxy::settings;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // 永久兼容契约 C5（见 aproxy::VERSION_LINE）：安装器以 `<二进制> --version` 认
     // 版本，这一行必须先于一切副作用输出——不切控制台代码页、不读 settings 与
-    // home、不拉起续作，以后解析参数之前要读的任何东西（例如按 settings 判定界面
-    // 语言）也都排在它后面。
+    // home、不建运行时、不拉起续作，以后解析参数之前要读的任何东西（例如按 settings
+    // 判定界面语言）也都排在它后面。
     if version_requested() {
         print_version_line();
         return;
@@ -48,6 +51,23 @@ async fn main() {
         return;
     }
 
+    // 桌面界面在建 tokio 运行时之前分派：Tauri 的事件循环要占住主线程（macOS 硬性要求），
+    // 而在 block_on 里的主线程处于异步上下文，Tauri 回调里任何 block_on 都会 panic。它自己
+    // 建运行时、交给 Tauri 后再进事件循环，见 commands::desktop。不读配置与 settings，界面
+    // 自己按 home 寻址
+    if cli.command == Some(Commands::Desktop) {
+        commands::desktop::handle_desktop_cmd();
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("无法建立 tokio 运行时")
+        .block_on(run(cli));
+}
+
+/// 除 `--version` 与 `desktop` 之外的一切命令，在 tokio 运行时里执行。
+async fn run(cli: Cli) {
     // 强制安装（永久兼容契约 C7、C8，见 aproxy::install::force）在这里分流，排在定位
     // 配置文件、settings 检查与拉起续作之前：它不读配置与 settings.json——要修的
     // 可能正是它们，损坏的 settings.json 不能挡住修复它的手段；它也不能拉起续作，
@@ -180,6 +200,7 @@ async fn main() {
         Some(Commands::Install(args) | Commands::Upgrade(args)) => {
             commands::install::handle_install_cmd(args).await
         }
+        Some(Commands::Desktop) => unreachable!("desktop 在 main 里、建运行时之前已经分派"),
         None => commands::start::handle_start_cmd(&cli, cfg_path, None).await,
     }
 }

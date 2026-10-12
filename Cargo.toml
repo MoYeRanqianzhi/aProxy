@@ -1,19 +1,23 @@
-# workspace 三成员：aproxy（本包）/ aproxy-format（官方示例 format 二进制）/
-# aproxy-envelope（信封契约 crate，两二进制共同类型单源维护）。
-# 三包依赖树完全隔离——aproxy-format 的 switchyard-translation 不会进入 aproxy
+# workspace 四成员：aproxy（本包）/ aproxy-format（官方示例 format 二进制）/
+# aproxy-envelope（信封契约 crate，两二进制共同类型单源维护）/ aproxy-desktop
+# （桌面界面：Tauri 2 外壳与嵌入的前端，aproxy 的 desktop 特性引入它）。
+# aproxy-format 与 aproxy 的依赖树完全隔离——switchyard-translation 不会进入 aproxy
 # 的编译闭包，「aproxy 本体体积不受影响」由此保证。
 #
 # 有意不设 default-members：根目录本身是 aproxy 包，所以不带 -p/--workspace 的
 # cargo 命令只作用于 aproxy。测试与 lint 必须显式带 --workspace 才覆盖全部
-# 三个成员（CI 与两条发版门禁都这样写）：
+# 成员（CI 与两条发版门禁都这样写）：
 #   cargo test --workspace --locked
 #   cargo clippy --workspace --all-targets --locked -- -D warnings
-# 若把三成员都设成 default-members，裸 `cargo run` 会因存在 aproxy 与
+# 无界面的 headless 变体再排除 aproxy-desktop——它是成员，--workspace 会把它当作
+# 选中的包编译，--no-default-features 管不到它：
+#   cargo test --workspace --exclude aproxy-desktop --no-default-features --locked
+# 若把成员都设成 default-members，裸 `cargo run` 会因存在 aproxy 与
 # aproxy-format 两个二进制而报「could not determine which binary to run」；
 # 源码构建用的裸 `cargo build` 也会连带编译 aproxy-format，并按它的
-# rust-version 1.96.1 拒绝更旧的工具链，而 aproxy 本身只要求 1.89。
+# rust-version 1.96.1 拒绝更旧的工具链，而 aproxy 本身只要求 1.90。
 [workspace]
-members = [".", "aproxy-envelope", "aproxy-format"]
+members = [".", "aproxy-envelope", "aproxy-format", "aproxy-desktop"]
 resolver = "3"
 
 [package]
@@ -24,9 +28,11 @@ version = "0.2.0-alpha.0"
 # 是实打实被编译的，非可选）。本包自己再抬到 1.89：安装锁（永久兼容契约 C4 的
 # `<home>/install/lock`）用标准库的 File::lock / try_lock，它们在 1.89 稳定——Windows
 # 上是 LockFileEx，unix 上是 flock，进程死亡时由操作系统自动释放，不需要自己写平台
-# 代码。声明出来，旧工具链会得到一条明确的「rustc 1.89 或更新」报错，而不是一堆
-# 看不懂的编译失败。
-rust-version = "1.89"
+# 代码。默认的 desktop 特性再抬到 1.90：tauri 一族都声明 rust-version 1.90（见
+# aproxy-desktop/Cargo.toml）。headless（--no-default-features）实际 1.89 就能编，但
+# rust-version 只能写一个值，按默认构建写。声明出来，旧工具链会得到一条明确的
+# 「rustc 1.90 或更新」报错，而不是一堆看不懂的编译失败。
+rust-version = "1.90"
 edition = "2024"
 description = "Local API proxy with infinite retries for agent workloads"
 license = "MIT"
@@ -46,12 +52,18 @@ name = "aproxy"
 path = "src/main.rs"
 
 # 发布变体：desktop = 带桌面界面的版本（默认），`--no-default-features` 出无界面的
-# headless 版本。现在还是空 feature，Tauri 依赖以后挂在它下面；`aproxy --version`
-# 的变体段按它输出 desktop 或 headless（src/lib.rs 的 VERSION_LINE），安装器升级时
-# 靠这一段保持变体不变。
+# headless 版本，不多出任何依赖（CI 用 cargo tree 断言依赖树里没有 tauri）。
+# `aproxy --version` 的变体段按它输出 desktop 或 headless（src/lib.rs 的
+# VERSION_LINE），安装器升级时靠这一段保持变体不变。
+#
+# 只有 bin 引用 aproxy_desktop，而且只在非测试构建里（main.rs 与 commands/desktop.rs
+# 的 #[cfg(all(feature = "desktop", not(test)))]）；lib 永不引用它。rustc 不链接没被
+# 引用的依赖，所以 lib 与 bin 的单元测试、tests/ 下的集成测试都不链接 Tauri——链进
+# Tauri 的测试程序在 Windows 上缺 Common-Controls 清单时于 main 之前就退出（RT-05，
+# 理由见 aproxy-desktop/Cargo.toml）。
 [features]
 default = ["desktop"]
-desktop = []
+desktop = ["dep:aproxy-desktop"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -62,6 +74,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
+# Cargo.lock 把 proc-macro-crate 钉在 2.0.0（Linux 上 tauri 的 GTK3 一族经 glib-macros 引入）：
+# 2.0.2 精确依赖 toml_datetime =0.6.3，与之共存时解析器会把这里的 toml 退回 0.8.2。
+# `cargo update` 之后核对 toml 仍是 0.8 的最新版，退回了就
+# `cargo update -p proc-macro-crate@2.0.2 --precise 2.0.0` 再把 toml 升回去。
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
@@ -88,6 +104,10 @@ regex = "1"
 # 单源维护（workspace 成员），path 依赖不进 crates.io 发布（publish 时换
 # version 依赖，见 release 说明）
 aproxy-envelope = { version = "0.2.0", path = "aproxy-envelope" }
+# 桌面界面（desktop 特性）：Tauri 外壳与嵌入的前端。version + path 双写，理由同上；
+# 版本与本包同步。它不依赖本包（否则成环），需要的东西（home、运行时）由 bin 在启动
+# 界面时传进去。
+aproxy-desktop = { version = "0.2.0-alpha.0", path = "aproxy-desktop", optional = true }
 # 响应体检查用解码器（src/decode.rs）：把压缩响应解出一份副本供「错误判定 +
 # 日志预览」使用——转发给客户端的字节始终是上游原样，本模块不参与转发路径。
 # 两者均为**纯 Rust**实现（无 C 依赖，故 musl/aarch64 交叉编译与 CI 各平台不受

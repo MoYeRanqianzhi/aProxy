@@ -180,6 +180,13 @@ pub(crate) enum Commands {
 
     /// 查看或修改配置（配置文件位于 ~/.aproxy/config.toml）
     Config(ConfigArgs),
+
+    /// 打开桌面界面：独立的窗口进程，关掉窗口就退出，不影响运行中的代理实例。
+    /// 这个版本的界面是预览版，显示的是演示数据，不是本机实例的真实状态。
+    // 无界面的 headless 构建也认得这个子命令（帮助里隐藏），执行时说明这个版本没有界面、
+    // 怎样换装，而不是让用户看到 clap 的「unrecognized subcommand」（见 commands::desktop）
+    #[command(hide = cfg!(not(feature = "desktop")))]
+    Desktop,
 }
 
 /// `aproxy install` 的参数集。

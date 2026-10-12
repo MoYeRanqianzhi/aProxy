@@ -232,3 +232,153 @@ Cargo.toml、src/cli.rs 等），没有看。
   这仍然兑现用户定的「Linux 自动选择变体」：首装靠 install.sh 的探测，npm 启动器认出缺库并提示，升级保持原变体，
   下载后起不来就回退。机制由主代理按授权定。
 - 可以不修中，a、b、c、d、f 修；e、h 接受；g 在删掉探测后不再适用；i 等演练量出 glibc 实测值后与其他几处一起改。
+
+## 修复核对（2026-10-13）
+
+核对对象：be3893e（必须修 2，提交在 fd622cd 之前），以及 `git diff fd622cd..65dd651` 里的 8296a02、d9d1fc1、96d014f、
+127dafa、a86e2c0、65dd651，按上一节的处理决定逐条核对。方式同前：只读，没有编译、没有跑测试；CI 与演练用
+`gh run view` 看。核对时演练 run 38279211569（workflow_dispatch，65dd651）还在跑。
+
+### 原条目的状态
+
+必须修：
+
+- **1 暂存件丢可执行位：已改，效果待演练。** `.github/scripts/stage-asset.py:22` 在 copyfile 之后、算哈希之前
+  `os.chmod(dest, 0o755)`。Windows 上 chmod 只认写位，0o755 带写位，文件不会被设成只读。演练的构建还没开始，冒烟能不能
+  执行暂存件要等它。读代码。
+- **2 debug 二进制超过资产上限：已修。** be3893e 在根 Cargo.toml:199-205 加 `[profile.dev] debug = "line-tables-only"`，
+  `ASSET_LIMIT` 没动。CI run 38273956900（fd622cd）与 38279106661（65dd651）的 ubuntu (desktop) 都绿，四个 `online_*`
+  测试都是 ok；演练的 `test (ubuntu-24.04, desktop)` 也已通过。命令验证。
+- **3 强制安装的预检：已改。** 预检删掉，`src/install/variant.rs` 整个删除；改成探测驱动的回退（force.rs:672-701 的
+  `acquire_online`、:719-739 的 `fallbacks`）。冻结项见下面「问题 2」。读代码。
+
+应该修：
+
+- **4 普通安装的预检：已改。** install.rs 不再探测（:317-324），变体只在写了 `--variant` 时才会变，`switching` 不再可能
+  由误判产生；回退次序抽成 `DownloadCtx::attempts`（download/mod.rs:379）；dlopen 随 variant.rs 一起没了。读代码。
+- **5 CHANGELOG：已改。** CHANGELOG.md:37 改成「在线安装（含 `--force`）……没写 `--variant` 时……改装同一目标的
+  headless……Linux 上再不行换 musl 产物；写了 `--variant desktop` 就报错」，与 `force::fallbacks` 一致。读代码。
+- **6 skill 引文：已改。** commands.md 的「通道为空」引文带上了 `<variant>`，并补了「`--variant` 指向另一个变体时两条提示
+  都不出现、直接重装当前版本的另一个变体」；变体一节与强制安装一节改成「只看下载下来的二进制」，引用的两条提示与
+  install.rs:496-499、:508 一致；README、README_EN、INSTALL_AGENT、architecture 同步。读代码。
+- **7 测试：已加。** 见下面「问题 4」。
+
+可以不修（决定要修的）：
+
+- **a：已改。** install.rs:351 `LatestDecision::UpToDate(_) | LatestDecision::NoneInChannel if switching` 重装当前版本。
+- **b：已改。** install.sh:375-378 只在 musl（含 glibc 低于 2.28）时拒绝写明的 desktop，其余照装交给自检；自检失败时
+  :432 补 WebKitGTK 与 `--variant headless` 的提示。
+- **c：已改。** install.sh:319 先查 `$# -ge 2`，缺值时报「--variant 需要一个值」。提交说明说在 bash 与 dash 下用桩核对过，
+  我没有运行。
+- **d：已改。** `Artifact::asset_name` 的 `.exe` 改按目标串判断（download/mod.rs:52），清单示例直接调用它
+  （examples/release-manifest.rs:92-95），单元测试补了在非 Windows 上给 Windows 产物起名的断言。
+- **f：已改。** `publishes_v3`（download/mod.rs:287）只放行 x86_64 的 Windows 与 linux-gnu，`DownloadCtx::build` 在 :310
+  用它；显式 `--cpu` 不受影响。
+
+以上 a–f 均为读代码。e、h 按决定接受；g 随探测删除不再适用；i 等演练实测。
+
+### 问题 2：强制安装的新回退链与冻结项
+
+- `tests/force_contract.rs`、`src/ledger.rs`、`src/lib.rs` 在 5dfc8d6..65dd651 里没有改动。force.rs 的 diff 只落在
+  `Acquired`（加 `skipped`）、`OnlineSpec`（加 `explicit_variant`）、`acquire_online` 与新增的 `Fallback` / `fallbacks` /
+  `acquire_asset`、`run()` 第 1 步的错误分支和取得目标后的两条说明、`acquire_from_github` 的传参（:1380）、单元测试。
+  `Manifest` / `ManifestAsset` 及其 `parse` / `select` / `find` / `missing`、`MANIFEST_FORMAT`、各 `EXIT_*` 都没动。
+- 回退全部发生在第 1 步「取得目标」之内（run() :1240-1270），失败仍以 `EXIT_UNCHANGED`（10）结束、什么都没动；`skipped`
+  与「改装的是 headless」两条说明（:1272、:1289）在第 2 步确认（:1293）之前打印。`Acquired` 与 `OnlineSpec` 是进程内的
+  结构，不落盘、不上线，不属于 C1–C8。
+- 写明了变体时不跨变体：`explicit_variant` 为真时，desktop 的 `fallbacks` 是空表（不换 headless，也不换 musl）；写明
+  headless 只保留 linux-gnu → musl headless 这一步，变体不变，与普通安装的 `attempts`、以及第 4 步之前就有的 gnu → musl
+  回退一致。单元测试 `fallbacks_follow_the_variant_rule` 与集成测试里「写明了 --variant desktop」那一段都钉住了这一点。
+- 结论：冻结项没有改动（读代码）；写明变体时不回退（读代码，且相关测试在 CI 的四个 job 里都通过，命令验证）。
+
+### 问题 3：ETXTBSY 重试
+
+- 只在 `ErrorKind::ExecutableFileBusy` 时重试（staging.rs:78），其余 spawn 错误立即返回（:84）；按 20、50、100、200、500 ms
+  退避，最多再试 5 次、共睡 870 ms，用完仍忙才报错（:79-81）。
+- 不在 `VERSION_TIMEOUT` 之内：deadline 在 spawn 成功之后才起算（:87），最坏是 0.87 秒的重试加 60 秒的运行上限。量小、有
+  上界，不会让持锁的调用方卡住；只是 :55 的文档「最多 VERSION_TIMEOUT」不再严格成立（下面 N3）。
+- 覆盖面够：凡是「刚写完就第一次执行」的地方都经过 `run_version`——普通在线安装的下载自证（install.rs:440）、`--from` 的
+  暂存件（staging.rs:180）、强制安装的 probe（force.rs:372）、交换后的核对（swap.rs:210）。
+- 效果：fd622cd 的 ubuntu (headless) 撞过一次（run 38273956900，`unix_swap_keeps_the_previous_binary_for_rollback`，
+  「Text file busy (os error 26)」）；65dd651 的 CI 里这个测试在两个 ubuntu job 都通过，但只有一次运行，证明不了偶发问题
+  已经消失，交接记录 :49-50 已列为待观察。读代码 + 命令验证。
+
+### 问题 4：新测试能不能抓住回退次序的错误
+
+- 两个纯函数的单元测试（force.rs:1624 起的 `fallbacks_follow_the_variant_rule`、download/mod.rs:716 起的
+  `attempts_follow_the_variant_rule`）用整表相等断言：次序颠倒、多一步、少一步、变体或指令集档写错都会失败。它们也覆盖了
+  反例（写明 desktop → 空表；Windows 的 headless → 空表；musl → 空表）。
+- 集成测试 `online_falls_back_in_order_when_the_selected_asset_does_not_run`（tests/install_force.rs）在两种构建里走不同
+  分支，CI 的四个 job 正好各覆盖一种。带界面构建里，它断言三段失败按「gnu-desktop 跑不起来 → 改用 gnu-headless 也跑不
+  起来 → 改用 musl-headless 时出错（自报变体 desktop）」的次序出现：次序颠倒、跳过 headless、在内层失败后没有继续，都会
+  缺段或乱序而失败。headless 构建里，它断言回退成功、`skipped` 记着 gnu-headless。写明 desktop 的那一段断言错误里没有
+  gnu-headless 与 musl。所以不只是快乐路径。命令验证：这些测试在 run 38279106661 的 ubuntu / windows × desktop /
+  headless 四个 job 里都是 ok。
+- 抓不住的有三处：(1) 写了 `--cpu` 时回退选错档（下面 N1）；(2) `explicit_variant` 从命令行接进来的那几行（force.rs:1380、
+  install.rs:317、:417）——测试都直接构造 `OnlineSpec`，而 `github_api()` 不能指向假服务器，CLI 层的在线强制安装测不了；
+  (3) run() 打印 `skipped` 与改装说明。(2)(3) 各只有一两行，风险低。
+
+### 新问题
+
+必须修：无。
+
+应该修：
+
+- **N1. 强制安装的回退在用户写了 `--cpu` 时不守这一档。**
+  - 位置：`src/install/force.rs:677-680`。`fallbacks` 给同目标 headless 的 `cpu` 是 None（:726），于是走
+    `manifest.select(.., spec.prefer_v3)`，不看 `spec.cpu`。
+  - 后果：`aproxy install --force --cpu baseline`（没写 `--variant`，装着带界面版）在支持 AVX2 的机器上，带界面的
+    baseline 跑不起来时会改装 headless 的 x86-64-v3；反过来写 `--cpu x86-64-v3` 而 CPU 没有 AVX2 时，会改装 baseline。
+    这与 `OnlineSpec.cpu` 的文档（:626「清单里必须正好有这一档」）不一致，也与普通安装不一致（`headless()` 保留
+    `cpu_suffix`）。这段代码会随 0.2.0 永久带着。
+  - 怎么修：`None => match spec.cpu.as_deref() { Some(cpu) => manifest.find(&fallback.target, fallback.variant, cpu), None => manifest.select(&fallback.target, fallback.variant, spec.prefer_v3) }`，
+    `missing` 传同一档；`Fallback.cpu` 的注释「与第一个产物同样按本机选」改成「与第一个产物同一档：写了 `--cpu` 就是它，
+    否则按本机选」；集成测试加一个写了 `--cpu` 的回退用例。
+  - 证据：读代码。
+
+可以不修：
+
+- **N2.** 两处注释还说安装器会探测本机：release.yml:54-56（「必须与安装脚本、npm 启动器、安装器判断『本机能不能跑带界面
+  版』用的数一致」）与 .github/scripts/assert-glibc-floor.sh:7-8（「……安装器探测本机 glibc 时用的数一致」）。安装器已经
+  不用这些数，去掉「安装器」即可；architecture.md:653-655 已经改对。读代码。
+- **N3.** `run_version` 的文档（staging.rs:55「最多 VERSION_TIMEOUT」）与实际差一个不到 1 秒的 ETXTBSY 重试。要么把 deadline
+  挪到重试循环之前，要么在文档里写明。读代码。
+- **N4.** 强制安装失败时那句 WebKitGTK 提示（force.rs:1255-1260）只看「写了 `--variant desktop` 且在 Linux 上」，不看失败
+  原因：网络不通、清单缺失、`--from` 的文件变体不符、musl 目标没有带界面版时也会打出来。普通安装用 `desktop_unusable`，
+  只在带界面的产物确实跑不起来时才提示（install.rs:471-499），可以照那样收紧。读代码。
+- **N5.** 没写 `--variant` 时，若清单里根本没有本变体的产物（比如以后某一版不再为某个目标出带界面版），`acquire_online` 在
+  :671 直接以 10 结束，不走回退；回退只在「下载了、跑不起来」时触发。今天的 20 个产物里不会发生。按决定的字面
+  （下载后起不来才回退），现在的做法是对的；若想让强制安装对以后的清单更宽容，可以把「清单里没有这个组合」也当作改试
+  的理由。读代码 + 推断。
+- **N6.** install.sh 写明 desktop、而 glibc 在 2.28–2.34 之间时，自检失败后的补充提示（:432）只说 WebKitGTK；真正的原因
+  在上面打出的动态加载器报错里（`GLIBC_2.3x not found`）。可以顺带提一句 glibc 2.35。读代码。
+- **N7.** `publishes_v3`（download/mod.rs:287）按今天的构建矩阵写死了两个目标，也是「旧二进制带着发布时的事实」：以后若
+  某个目标不再出 v3，旧版本普通安装的 github 渠道会 404，再落到后面的渠道。github 渠道本来就拿得到 release 的资产列表
+  （github.rs 的 `release_by_version`），v3 的名字不在列表里就退回基线，这样就与版本无关。今天没有影响。读代码。
+
+### 核对时 CI 与演练的状态
+
+- CI run 38279106661（push，65dd651）：ubuntu (desktop)、ubuntu (headless)、windows (desktop)、windows (headless)、
+  macos-build、两个 upgrade-from-0-1-0 都绿。macos 红，失败的是与 fd622cd 相同的 4 个 lib 测试（daemon、announce、
+  watchdog ×2），是既有问题，不在发布门槛里。新加或改过的 5 个测试在四个 job 里都是 ok（Linux 上另有
+  `unix_swap_keeps_the_previous_binary_for_rollback` 也是 ok）。命令验证。
+- 演练 run 38279211569（workflow_dispatch，65dd651）核对时还在跑：frontend 与 test 的三路（ubuntu desktop、ubuntu headless、
+  windows headless）已通过，windows desktop 还在跑，构建尚未开始。必须修 1 的实际效果、清单 job、两个 dry-run 都要等它。
+
+### 本轮没能验证的
+
+- 演练没有跑完：x 位修复的效果、ubuntu:22.04 容器 job、清单生成与核对、npm 与 crates 的 dry-run、`DESKTOP_GLIBC_FLOOR`
+  的实测值都还没有结果。
+- ETXTBSY 是偶发的，一次绿不能说明它不再出现。
+- install.sh 的改动没有运行。
+- 没有编译；CI 是我拿到的全部运行证据。
+
+### 后续（主代理补记，2026-10-13）
+
+- 演练 run 38279211569（65dd651）全绿。18 个产物真的执行了 `--version`，含 ubuntu:22.04 容器里的 3 个 Linux 带界面版，必须修 1 的可执行位修复生效。x86_64-apple-darwin 的两个是交叉编译的，只核对了嵌着的版本行。清单 20 个资产读回核对通过；npm dry-run 两组共 20 个包；crates dry-run 三个包都过了校验构建。
+- glibc 实测：带界面 gnu 三个产物最高 GLIBC_2.34，headless 最高 2.28。带界面版的下限由暂定的 2.35 改为 2.34（05efe7b）。
+- ETXTBSY：65dd651、8b02a31、11ca06f 连续三次 ubuntu 都没再出现。
+- N1、N2、N4、N5、N6 已修（05efe7b、ac6ce9d、4468243）。N3 在 03ec68a 里已成立。N7 接受，因为失败方向是安全的。
+- 主代理另定两条：
+  - 普通安装缺本变体资产时不回退，只改提示（5bdb585）。普通安装的下载链分不清 404 与网络暂时出错，失败就回退会让一次网络抖动把用户悄悄换成 headless。
+  - aproxy-envelope 随主线发预发布版（d03dfea），不再以 0.2.0 发出，依据 W2 设计稿 §10.13 的 RT-06。这一条是演练查不出的。

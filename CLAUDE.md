@@ -77,6 +77,8 @@ This is an open-source team project whose code is read by contributors' agents a
 
 Tag versions as vMAJOR.MINOR.PATCH, such as v1.0.0, appending -alpha.N, -beta.N, or -rc.N for pre-releases.
 
+The force-install contract (C1-C8, frozen in `src/ledger.rs`, `src/install/force.rs` and `tests/force_contract.rs`) is permanent: every release from 0.2.0 on must be able to force-install every other release and stop the processes it started, long after both have shipped. Its frozen items -- the home and `bin/` layout, the swap's intermediate names, the process ledger, the install lock, the `--version` line, the release manifest, and the `install --force` command line, exit codes and step order -- may gain optional fields but are never renamed, removed or retyped; a contract test that blocks a change means the change is wrong.
+
 Skills under .claude/skills/ ship with every release and are read by the agents that operate aProxy for its users. Write them in English and to the skill-creator standard: progressive disclosure, imperative instructions that explain why rather than stacking MUSTs, and content aimed at the agent using the tool, not at maintainers or at the history of how it was built. Translating writing that misses this standard does not fix it.
 
 Project documentation lives in the README and ./docs/ and serves the people who use and develop the project. Not every project needs it; write it for those readers, never as a record of agent work, and keep it true when a change alters what it describes.

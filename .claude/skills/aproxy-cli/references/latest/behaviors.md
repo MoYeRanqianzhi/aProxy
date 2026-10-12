@@ -331,7 +331,8 @@ response: attempt judged successful -> response transform -> replay
 ### Isolated experiments
 
 `APROXY_HOME` replaces `~/.aproxy` as the home for the default config.toml, settings.json, `run/`,
-`logs/`, `spool/`, `bin/` and `skills/`; `APROXY_RUN_DIR` moves only `run/`. The control channel
+`logs/`, `spool/`, `bin/`, `install/`, `ledger/`, `desktop/` and `skills/`; `APROXY_RUN_DIR` moves only
+`run/`. The control channel
 follows the run directory, so commands under an isolated home cannot reach the user's instances.
 Neither isolates ports: a test instance on a port a real instance listens on fails to start as
 `被其他程序占用` ("in use by another program"). Run `aproxy status` without the override first and

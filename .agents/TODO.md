@@ -26,7 +26,9 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   剩余：release.yml 生成并校验 `aproxy-manifest.json`（第 4 步）；有两个带强制安装的版本后加跨版本强制安装的 CI 测试；
   桌面界面拉起强制安装时 stdio 为 null（W5）
 - [ ] **alpha.1 第 3 步：Tauri 桌面外壳**（2026-10-12 提交 58c1518…a7cf72f，Windows 两种变体各 552 通过、实机验过；推送前
-  代码审查中，Linux 带界面版的链接与运行等推送后的 CI）。留到以后的：从快捷方式启动会闪一下终端（要 GUI 子系统的启动器，
+  审查 `.agents/review/2026-10-12-desktop-shell-review.md` 的应该修 1–4 与可以不修里定下要修的 a、b、d–l 已在 fbb65ee…267e712 落实；
+  推送后 ubuntu (desktop) 的 4 个 install_force 测试因调试版超过资产上限失败，be3893e 改调试构建只带行号表，待 CI 确认；
+  Linux 带界面版的链接与运行等推送后的 CI）。留到以后的：从快捷方式启动会闪一下终端（要 GUI 子系统的启动器，
   或清单的 consoleAllocationPolicy=detached——后者作用于整个 exe，守护进程拉起的 worker 会不会弹窗未验证）；Linux 上
   「跟随系统」读不到深浅色（要开 tauri 的 dbus 特性、CI 装 libdbus-1-dev，W5）；界面偏好（含 Mica 开关）只在内存里，
   重启恢复默认（随 W2 的 settings 与 W5 持久化）

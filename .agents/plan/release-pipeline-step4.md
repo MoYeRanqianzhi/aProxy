@@ -39,6 +39,12 @@ aproxy-desktop、Linux 自动选择变体、release-format 门禁、binstall 选
 - [x] 安装器（Rust）变体感知与 Linux 自动选择；install.sh（假 ldd / getconf / ldconfig 六种系统核对过）。
   install.ps1 / install.cmd 没改：Windows 上带界面版随处能跑，装好后 `aproxy install --variant headless` 可换
 - [x] 文档与 skill；binstall 给两个 musl 目标加了 overrides（逐个目标名，旧版 binstall 不认 cfg）
+- [x] 第 3 步审查转来的「普通安装不区分变体」已由 7a8882a 覆盖：变体取正在运行的构建（就是它 `--version` 的
+  变体段），github 资产名、npm 包名、binstall 地址、cargo 的 `--no-default-features` 都随它；Linux 首装按探测选
+- [ ] 主代理首推 5928fcb 后的 ci.yml：ubuntu (desktop) 红在 tests/install_force.rs 的 4 个 online_* 测试（调试版
+  超过 256 MiB 的资产上限），be3893e 改调试构建只带行号表，待推送后确认；macOS 红是既有的（fad48c7 上就是同样 4 个 lib
+  测试，daemon 那个读不到自身进程的创建时间），不归第 4 步。release.yml 的 test job 同样跑 ubuntu (desktop) 的 cargo test，所以演练要等
+  be3893e 上了 main 再发起
 - [ ] 主代理推送后跑演练：量 DESKTOP_GLIBC_FLOOR（objdump 的实际最高需求，低于 2.35 就一起改小：release.yml、
   src/install/variant.rs、scripts/install.sh、npm/aproxy/bin/aproxy.js，以及 README、README_EN、CHANGELOG、docs、skill、
   npm README 里写的 2.35）、

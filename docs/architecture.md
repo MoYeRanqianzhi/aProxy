@@ -561,8 +561,10 @@ blob:`；窗口只许停在嵌入的页面上；权限（`capabilities/main.json
 git，缺失时 build.rs 报错并给出构建步骤，不拿占位页面凑数——凑出来的二进制看起来正常、
 界面却是空的，发布时也认不出来。CI 带界面的任务先 `npm ci && npm run build`。crates.io 上的
 aproxy-desktop 带着构建好的 dist、不带 `ui/` 的源码，`cargo install aproxy` 不需要 Node.js。
-tauri-build 每次构建都在包根写 `gen/schemas/`，`cargo package` 的校验构建因此报
-「Source directory was modified by build.rs」（2026-10-12 实测），发布这个包要另行处理。
+tauri-build 每次构建都在包根写 `gen/schemas/`，包里没有这些文件时 `cargo package` 的校验
+构建报「Source directory was modified by build.rs」；所以包里也带着它们，发布前先在同一平台上
+构建一次本包，校验构建写出的内容逐字节相同，就不算改动（2026-10-12 在 Windows 上实测，做法
+见 `aproxy-desktop/Cargo.toml` 的 include 说明）。
 
 **接缝。** 界面组件只经 Backend 接口（`ui/src/lib/backend/types.ts`）取数据、发命令，预览版
 用的是 mock 实现；接真实数据时换成 IPC 实现，aproxy-desktop 里加相应的命令。aproxy-desktop
@@ -589,11 +591,16 @@ tauri-build 每次构建都在包根写 `gen/schemas/`，`cargo package` 的校�
   编得过。macOS 测试是独立 job，**已知红**（`/dev/shm`、`/proc` 依赖，见「平台」）：不设
   skip 也不设 `continue-on-error`，红色就是「未完成」的如实信号，独立成 job 后不淹没其他
   平台的结论
-- **发布门禁**（`release.yml`）：tag 触发后先在 windows 与 ubuntu 上复跑
-  fmt/clippy/test（tag 可能落后于 main），全绿才进入多平台构建；macOS 不进门禁。
-  渠道发布幂等：npm 与 crates.io 两个 job 都先查询注册表、版本已存在才跳过，所以
-  任一渠道失败后可单独 re-run，已成功的不会重复发布；GitHub Release 的 Latest 标记
-  交给 API 默认值（预发布永不成为 Latest）
+- **发布门禁**（`release.yml`）：tag 触发后先构建一次前端，再在 windows 与 ubuntu 上按
+  两种变体复跑 fmt/clippy/test/`--version` 冒烟（tag 可能落后于 main），全绿才进入构建；
+  macOS 不进门禁。构建出 20 个二进制（每个平台 desktop 与 headless 各一份，musl 只有
+  headless；Linux gnu 的带界面版在 `ubuntu:22.04` 容器里构建），每个都核对嵌着的 C5 版本行、
+  能跑的再真的执行 `--version`；之后由 `examples/release-manifest.rs` 生成发布清单
+  `aproxy-manifest.json` 并用强制安装读清单的代码读回核对。渠道发布幂等：npm 与 crates.io
+  两个 job 都先查询注册表、版本已存在才跳过，所以任一渠道失败后可单独 re-run，已成功的不会
+  重复发布；GitHub Release 的 Latest 标记交给 API 默认值（预发布永不成为 Latest）。手动触发
+  （workflow_dispatch）是演练：同样的门槛、构建与清单核对，npm 与 crates.io 只跑
+  `--dry-run`，不建 Release、不打 tag
 - 测试端口 bind 试探选取（排除区间/占用者自动跳过），绝不触碰用户实例；
   `DaemonGuard` 保证断言失败路径也清理守护
 
@@ -602,7 +609,7 @@ tauri-build 每次构建都在包根写 `gen/schemas/`，`cargo package` 的校�
 | 平台 | 状态 |
 |---|---|
 | Windows（x64 / x86 / arm64） | 全功能（开发与主测试平台） |
-| Linux（x86_64 / aarch64，glibc 与 musl） | 全功能；gnu 产物 glibc 下限 2.28，更低的 glibc 与 musl 系统用 musl 产物 |
+| Linux（x86_64 / aarch64，glibc 与 musl） | 全功能；headless 的 gnu 产物 glibc 下限 2.28，带界面的 gnu 产物要 glibc 2.35 与 WebKitGTK 2.40；更低的 glibc 与 musl 系统用 musl 产物（只有 headless） |
 | macOS（Apple Silicon / Intel） | 提供预构建二进制，但未经真机验证；看门狗、`aproxy install` 与依赖进程查询的实例管理用到 Linux 专有接口（`/dev/shm`、`/proc`），在 macOS 上不可用或退化 |
 
 unix 分支（UDS IPC、`/dev/shm` 心跳、`/proc` 进程查询、单步 rename 交换）按
@@ -614,7 +621,10 @@ unix 分支（UDS IPC、`/dev/shm` 心跳、`/proc` 进程查询、单步 rename
 
 桌面界面另有平台前提：Windows 要 WebView2 运行时（Windows 11 自带）；Linux 的带界面构建
 动态链接 WebKitGTK 4.1，缺库时整个二进制都起不来，所以 musl 只有 headless，没有图形界面的
-机器也该用 headless；macOS 只保证两种变体都编得过。
+机器也该用 headless；macOS 只保证两种变体都编得过。Linux 上的安装因此先看本机再选变体：
+`install::variant::desktop_blocker` 查 glibc 版本，并 dlopen `libwebkit2gtk-4.1.so.0` 读它的
+版本；`aproxy install` 与 `install --force` 没写 `--variant` 时据此改装 headless，写了
+`--variant desktop` 就报错；一键安装脚本用同样的下限，查的是动态加载器缓存里有没有这个库。
 
 ### Linux gnu 产物的 glibc 下限
 
@@ -627,12 +637,19 @@ Ubuntu 22.04 等系统启动即报 `GLIBC_2.39 not found`（alpha.17 实测如�
 系统上改选静态链接的 musl 产物（脚本落位前还用 `--version` 自证，gnu 跑不起来
 同样改拉 musl）。musl 产物静态链接，任何 Linux 上都能跑。
 
+带界面的 gnu 产物链接系统的 GTK 与 WebKitGTK，不能用 zigbuild 压低 glibc：它在
+`ubuntu:22.04` 容器里构建（跑在 ubuntu-24.04 与 24.04-arm 上），下限 `DESKTOP_GLIBC_FLOOR`
+（2.35）同样在构建后断言。这个数与 `src/install/variant.rs`、`scripts/install.sh`、
+`npm/aproxy/bin/aproxy.js` 判断「本机能不能跑带界面版」用的数必须一致。
+
 ### npm dist-tag
 
 预发布（版本含 `-alpha`/`-beta`/`-rc`）发在 `next`，正式版发 `latest`
 （`npm/build-and-publish.sh` 的 `npm_dist_tag()` 与 `release.yml` 里 GitHub Release
 的 `prerelease` 判定是同一条规则，改一处必须同步另一处）。首个正式版发布后
 `npm i -g @meowo/aproxy` 只会装到正式版，预发布需显式 `@meowo/aproxy@next`。
+带界面与无界面各一组包（`@meowo/aproxy` 与 `@meowo/aproxy-headless`，各一个主包加 9 个
+平台包），dist-tag 规则相同。
 
 ## 版本路线
 

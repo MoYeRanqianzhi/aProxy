@@ -101,6 +101,17 @@ About the scripts:
   statically linked musl build; the binary is self-tested with `--version`
   before being placed, and if the gnu build cannot run on the machine the
   script switches to musl.
+- **Two variants**: every platform has a `desktop` build (with the window of
+  `aproxy desktop`) and a `headless` build without it; the proxy and the
+  commands are the same. musl comes only as headless. Windows and macOS get
+  desktop. On Linux the desktop build links GTK and WebKitGTK and cannot even
+  run `--version` without them, so the sh script checks the machine first:
+  musl, glibc below 2.35, or no WebKitGTK 4.1 (`libwebkit2gtk-4.1-0` on
+  Debian/Ubuntu) gets headless with the reason printed, and so does a desktop
+  build that fails its self-test after the download (WebKitGTK older than
+  2.40, for example). To choose, pass `--variant desktop|headless` to the sh
+  script (or set `APROXY_VARIANT`); once installed, switch with
+  `aproxy install --variant desktop` (or `headless`).
 - `irm | iex` cannot pass arguments, so the PowerShell script reads
   environment variables instead: `APROXY_PRE`, `APROXY_NO_SKILLS`,
   `APROXY_DL_PROXY` (download proxy; unrelated to the upstream request proxy).
@@ -112,14 +123,26 @@ Other channels (afterwards `aproxy install --adopt` moves the install to the
 standard location):
 
 ```sh
-npm install -g @meowo/aproxy     # picks the right binary; stable releases use the latest tag
-npm install -g @meowo/aproxy@next  # pre-releases use the next tag; ask for it explicitly
-cargo install aproxy             # builds from source; needs rustc 1.90+
+npm install -g @meowo/aproxy            # with the desktop interface; picks the right binary; stable releases use the latest tag
+npm install -g @meowo/aproxy-headless   # without it (servers, Linux without WebKitGTK); both provide the aproxy command, install one
+npm install -g @meowo/aproxy@next       # pre-releases use the next tag; ask for it explicitly (same for headless)
+cargo install aproxy                    # builds from source; needs rustc 1.90+
 ```
 
 `cargo install` builds the version with the desktop interface by default; on Linux, install the
-WebKitGTK 4.1 development package first (Debian/Ubuntu: `libwebkit2gtk-4.1-dev`). Add
-`--no-default-features` for the headless build without an interface.
+WebKitGTK 4.1 development package first (Debian/Ubuntu: `libwebkit2gtk-4.1-dev`). On Linux
+servers use `cargo install aproxy --no-default-features` for the headless build.
+`cargo binstall aproxy` fetches the prebuilt desktop build (headless on musl systems); for the
+headless build, give the asset address:
+
+```sh
+cargo binstall aproxy --pkg-url '{ repo }/releases/download/v{ version }/{ name }-headless-{ target }{ binary-ext }' --pkg-fmt bin
+```
+
+Manual downloads: `aproxy-<target>[-v3]` is the desktop build, `aproxy-headless-<target>[-v3]`
+the headless one; check them against their `.sha256` or the release manifest
+`aproxy-manifest.json`. When the npm desktop build cannot start on Linux for missing libraries,
+its launcher suggests `@meowo/aproxy-headless` instead.
 
 Upgrades: `aproxy install` replaces the binary and rolling-restarts running
 instances one by one without client-visible downtime (`--from <path>` installs
@@ -141,6 +164,13 @@ a local binary, `--adopt` takes over an existing install).
   with `--version 输出无版本号` after the download and changes nothing). Stop the
   instances and reinstall as described under "从 0.1.x 迁移" (migrating from
   0.1.x) in the [CHANGELOG](CHANGELOG.md).
+- **Variants**: upgrades keep the installed variant (the first word in the
+  parentheses of `aproxy --version`); `aproxy install --variant desktop|headless`
+  switches, reinstalling the current version in the other variant when
+  nothing newer is available. When the desktop build cannot run on a Linux
+  machine (same rules as the sh script above), an install without `--variant`
+  switches to headless and says why, and `--variant desktop` stops with an
+  error; `install --force` behaves the same.
 - **Rollback on failure**: if an instance cannot start under the new version
   during the rolling restart, `install` brings it back with the old binary and
   the original arguments, stops the rollout (the other instances are left
@@ -183,7 +213,7 @@ development package (see above).
 | Platform | Status |
 |---|---|
 | Windows (x64 / x86 / arm64) | Full support |
-| Linux (x86_64 / aarch64, glibc and musl) | Full support; the gnu build requires glibc ≥ 2.28 (asserted at build time in the release pipeline), older glibc and musl systems use the statically linked musl build |
+| Linux (x86_64 / aarch64, glibc and musl) | Full support; the headless gnu build requires glibc ≥ 2.28, the desktop gnu build glibc ≥ 2.35 and WebKitGTK ≥ 2.40 (glibc floors asserted at build time in the release pipeline); older glibc and musl systems use the statically linked musl build (headless only) |
 | macOS (Apple Silicon / Intel) | Pre-built binaries are published but untested on real hardware; the watchdog, `aproxy install` and process-query-based instance management rely on Linux-only interfaces (`/dev/shm`, `/proc`) and are unavailable or degraded on macOS (needs real hardware; contributions welcome) |
 
 ## Quick start
@@ -321,13 +351,15 @@ closed; it starts, stops and changes no instance.
 - Windows needs the Microsoft Edge WebView2 runtime (built into Windows 11; on Windows 10, install
   it when told to). Run from a terminal, the command returns at once and the window runs on its
   own.
-- Linux needs a graphical session and WebKitGTK 4.1. The build with the interface links WebKitGTK
-  dynamically, so without those libraries the program does not start at all (not even
-  `aproxy --version`); use the headless build on machines without a graphical interface. musl
+- Linux needs a graphical session and WebKitGTK 4.1 (2.40 or later). The build with the interface
+  links WebKitGTK dynamically, so without those libraries the program does not start at all (not
+  even `aproxy --version`); use the headless build on machines without a graphical interface. The
+  install script and `aproxy install` pick it on their own when the libraries are missing. musl
   builds come only as headless.
 - One window per home; running it again says it is already open.
 - Headless builds (`headless` as the first word in the parentheses of `aproxy --version`) have no
-  window; `aproxy desktop` there explains how to switch to the build with the interface.
+  window; `aproxy desktop` there explains how to switch to the build with the interface
+  (`aproxy install --variant desktop`).
 
 ## Multi-instance & aliases
 

@@ -86,13 +86,26 @@ Notes:
   automatically. Before placing the binary it runs
   `--version` as a self-test, and if the gnu build cannot run on the machine it
   switches to the musl build. Nothing is placed unless the self-test passes.
+- Every platform has two builds with the same proxy and commands: `desktop`,
+  with the window of `aproxy desktop`, and `headless`, without it (musl comes
+  only as headless). Windows and macOS get desktop. On Linux the desktop build
+  links GTK and WebKitGTK and cannot even run `--version` without them, so the
+  sh script installs headless when the system is musl, glibc is below 2.35, or
+  WebKitGTK 4.1 is missing (`libwebkit2gtk-4.1-0` on Debian/Ubuntu), and also
+  when the downloaded desktop build fails its self-test; it prints why. To
+  choose, pass `--variant desktop|headless` to the sh script (or set
+  `APROXY_VARIANT`). Servers want headless. After installing, switch with
+  `aproxy install --variant desktop` (or `headless`).
 - If the script reports the download directory is not on `PATH`, follow its
   printed instruction (it differs per platform) or invoke the binary by full
   path `~/.aproxy/bin/aproxy`.
 
 Source build instead (only if scripts are blocked): `git clone
 https://github.com/MoYeRanqianzhi/aProxy.git && cd aProxy && cargo build
---release` — the binary lands in `target/release/`.
+--release --no-default-features` — the headless binary lands in
+`target/release/`. The desktop build (`cargo build --release` without the flag)
+needs the front end built first with Node.js, and on Linux the WebKitGTK 4.1
+development package (README, source build).
 
 ## 2. Upgrade
 
@@ -151,10 +164,11 @@ supported yet (neither is verified on real macOS hardware).
 - Target: `aproxy install --force [VERSION|latest]` (online, chosen through the
   release's `aproxy-manifest.json`) or `aproxy install --force --from <file>`.
   Downgrades are allowed; nothing below 0.2.0 is installed. `--variant
-  desktop|headless` switches the build, e.g. to headless on a Linux machine
-  without the desktop libraries; with `--from` it only checks that the file is
-  that build. `--no-skills` and `--allow-downgrade` are usage errors with
-  `--force` (exit 2, nothing done).
+  desktop|headless` switches the build; on Linux an online force install of
+  the desktop build checks the machine first, like a normal install, and
+  without `--variant` takes headless when the desktop libraries are missing.
+  With `--from` it only checks that the file is that build. `--no-skills` and
+  `--allow-downgrade` are usage errors with `--force` (exit 2, nothing done).
 - A second force install on the same home stops the first one, which then
   exits with 1 (Windows) or 137 (Linux, macOS); only the later one's exit code
   counts.

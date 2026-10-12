@@ -493,19 +493,22 @@ tell the user that what it shows is real; use `aproxy status` and `aproxy logs`.
   is never a reason to touch the instances.
 - **On Linux a desktop build needs the WebKitGTK 4.1 libraries to run at all.** Without them the
   system loader refuses to start the binary, so even `aproxy --version` fails, naming a missing
-  library such as `libwebkit2gtk-4.1.so.0`. Such machines need the headless build.
+  library such as `libwebkit2gtk-4.1.so.0`. Such machines need the headless build; the install
+  script and `aproxy install` pick it there on their own (install / upgrade, "Choosing the
+  variant").
 - **Headless builds have no window.** When `aproxy --version` says `headless`, `aproxy desktop`
   explains that and exits 1; the command is also missing from `aproxy --help` there. The way to
-  the desktop build is `aproxy install --force --variant desktop`, which stops every aproxy process
-  of the home and cuts requests in flight (Force install), so ask the user first. musl builds come
-  only as headless; on a glibc Linux, the gnu build has the desktop variant.
+  the desktop build is `aproxy install --variant desktop`, a normal install that restarts the
+  instances one at a time. musl builds come only as headless; on a glibc Linux the desktop build
+  needs WebKitGTK 2.40 or later (Debian and Ubuntu package it as `libwebkit2gtk-4.1-0`), and the
+  install stops with an error when it is missing.
 
 ## install / upgrade
 
 ```
 aproxy install [latest|VERSION] [--pre] [--allow-downgrade] [--cpu x86-64-v3|baseline]
-               [--download-proxy URL] [--no-skills]
-aproxy install --from PATH [--no-skills] [--download-proxy URL]
+               [--variant desktop|headless] [--download-proxy URL] [--no-skills]
+aproxy install --from PATH [--variant desktop|headless] [--no-skills] [--download-proxy URL]
 aproxy install --adopt [--no-skills]
 aproxy install [latest|VERSION] --skills-only [--pre] [--download-proxy URL]
 aproxy install --abort
@@ -537,7 +540,7 @@ to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running anot
 | `--abort` | cancel an install that has not reached the swap |
 | `--force` | stop every aproxy process of this home and replace the binary without the hand-over ([Force install](#force-install)). `--adopt`, `--abort`, `--skills-only`, `--no-skills` and `--allow-downgrade` cannot be combined with it: the command stops with a usage error (exit 2) and does nothing |
 | `--yes` | with `--force`: do not ask for confirmation; required when stdin is not a terminal |
-| `--variant desktop\|headless` | with `--force`: the build to install, with or without the desktop interface; default the build you run. With `--from` it is a check, not a choice: the file must be that build, or nothing is installed |
+| `--variant desktop\|headless` | the build to install, with or without the desktop interface; default the build you run, so upgrades keep it ("Choosing the variant" below). With `--from` it is a check, not a choice: the file must be that build, or nothing is installed. Not with `--adopt`, `--abort` or `--skills-only` |
 
 **Choosing the version.**
 
@@ -560,8 +563,24 @@ to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running anot
   0.1.x", explains the way back. Likewise a 0.1.x `aproxy install` cannot reach 0.2.0; see
   "Moving from 0.1.x to 0.2.0" there.
 - Downloads try the channels in `download_chain` (settings-json.md), by default github, npm,
-  cargo-binstall, cargo. On Linux, a gnu build that cannot run is replaced by the musl build
-  automatically.
+  cargo-binstall, cargo. Each downloaded binary must run its `--version` on this machine and report
+  the target version and variant. When it does not run: a desktop build is replaced by the headless
+  build of the same target, unless you gave `--variant desktop`; on Linux a gnu build is then
+  replaced by the musl build, which comes only as headless.
+
+**Choosing the variant.** Every platform has two builds with the same proxy and commands: `desktop`,
+with the window of `aproxy desktop`, and `headless`, without it. The first word in the parentheses
+of `aproxy --version` tells which one runs. Upgrades keep it; `--variant` switches. When nothing
+newer is available, switching reinstalls the current version in the other variant.
+
+On Linux the desktop build links GTK and WebKitGTK, so before an online install of it, aproxy checks
+this machine: glibc 2.35 or later and WebKitGTK 4.1 at version 2.40 or later; musl targets have no
+desktop build at all. When the check fails without `--variant`, the install switches to headless
+and prints `本机跑不了带桌面界面的版本（<reason>），改装无界面的 headless 版本…` ("this machine
+cannot run the desktop build (reason); installing the headless build"). With `--variant desktop`
+it stops instead, exit 1, with `[ERROR] 本机跑不了带桌面界面的版本：<reason>…` ("this machine cannot
+run the desktop build"); installing the system package named in the reason and running the command
+again is the fix, or install `--variant headless`.
 
 **Which instances move.** Online installs and `--from` refuse while a running instance's binary
 lives outside `<home>/bin/` (`实例 <port> 的二进制不在安装管辖目录（…）下`, "instance binary outside
@@ -666,8 +685,10 @@ flag; nothing below 0.2.0 is installed. `latest`, however, never downgrades: whe
 version below the running one (a newer release that is missing its manifest), force install exits
 10 and says so; name the version to install it anyway. Downloads use HTTPS only and give up after
 60 s without data. `--variant` defaults to the variant of the binary you run, the first word in the
-parentheses of `aproxy --version`; on Linux without the desktop libraries (WebKitGTK), install
-`--variant headless`. Without `--cpu`, the x86-64-v3 build is taken on CPUs with AVX2 when the
+parentheses of `aproxy --version`. On Linux, an online force install of the desktop build first
+checks this machine the same way a normal install does ("Choosing the variant" above): without
+`--variant` it switches to headless and says so; with `--variant desktop` it exits 10 with
+`本机跑不了带桌面界面的版本：<reason>` before changing anything. Without `--cpu`, the x86-64-v3 build is taken on CPUs with AVX2 when the
 release has one, and the baseline build otherwise; an explicit `--cpu` must exist as named. When
 the manifest has no build for this platform in the requested variant (and CPU level), force install
 exits 10 and the error lists what the platform does have, for example

@@ -46,22 +46,31 @@ curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/
 脚本说明：
 - 已安装则不覆盖，升级走 `aproxy install`；sh 脚本需要 `sha256sum`、`shasum` 或 `openssl` 之一做 SHA256 校验。
 - Linux：glibc 过低或 musl 系统自动改用静态链接的 musl 产物；落位前先 `--version` 自检，gnu 产物在本机跑不起来会自动改拉 musl。
+- **两个变体**：每个平台都有带桌面界面的 desktop（`aproxy desktop` 打开窗口）与无界面的 headless 两个版本，代理与命令行完全相同；musl 只有 headless。Windows 与 macOS 装 desktop。Linux 上带界面的版本动态链接 GTK 与 WebKitGTK，缺库或库太旧时连 `--version` 都起不来，所以 sh 脚本先看本机：musl、glibc 低于 2.35、找不到 WebKitGTK 4.1（Debian/Ubuntu 的 `libwebkit2gtk-4.1-0`）的装 headless 并说明原因，带界面的版本下载后自检跑不起来（例如 WebKitGTK 低于 2.40）也改装 headless。要指定变体：sh 脚本加 `--variant desktop|headless`（或设 `APROXY_VARIANT`）；装好之后换变体用 `aproxy install --variant desktop`（或 `headless`）。
 - `irm | iex` 无法传参，PowerShell 脚本可用环境变量代替：`APROXY_PRE`、`APROXY_NO_SKILLS`、`APROXY_DL_PROXY`（下载代理，与上游请求代理无关）。
 - Windows PowerShell 5.1 用 `-File` 本地运行 `install.ps1` 会解析失败（文件为 UTF-8 无 BOM）；请用上面的 `irm | iex`，或 `pwsh -File`。
 
 其他渠道（装好后可用 `aproxy install --adopt` 收编到标准位置）：
 
 ```sh
-npm install -g @meowo/aproxy     # 按平台自动选二进制；正式版发在 latest 标签
-npm install -g @meowo/aproxy@next  # 预发布发在 next 标签，需显式指定
-cargo install aproxy             # 源码编译，需 rustc 1.90+
+npm install -g @meowo/aproxy            # 带桌面界面，按平台自动选二进制；正式版发在 latest 标签
+npm install -g @meowo/aproxy-headless   # 无界面（服务器、缺 WebKitGTK 的 Linux）；两个包都提供 aproxy 命令，只装其一
+npm install -g @meowo/aproxy@next       # 预发布发在 next 标签，需显式指定（headless 同理）
+cargo install aproxy                    # 源码编译，需 rustc 1.90+
 ```
 
-`cargo install` 默认编带桌面界面的版本，Linux 上要先装 WebKitGTK 4.1 的开发包（Debian/Ubuntu：`libwebkit2gtk-4.1-dev`）；不要界面就加 `--no-default-features`，编出无界面的 headless 版本。
+`cargo install` 默认编带桌面界面的版本，Linux 上要先装 WebKitGTK 4.1 的开发包（Debian/Ubuntu：`libwebkit2gtk-4.1-dev`）；Linux 服务器上用 `cargo install aproxy --no-default-features` 编无界面的 headless 版本。`cargo binstall aproxy` 取带界面的预编译产物（musl 系统上取 headless）；要无界面的版本，指定资产地址：
+
+```sh
+cargo binstall aproxy --pkg-url '{ repo }/releases/download/v{ version }/{ name }-headless-{ target }{ binary-ext }' --pkg-fmt bin
+```
+
+手动下载：带界面的是 `aproxy-<target>[-v3]`，无界面的是 `aproxy-headless-<target>[-v3]`，Releases 页的 `.sha256` 与发布清单 `aproxy-manifest.json` 可供核对。npm 装的带界面版本在 Linux 上缺库起不来时，启动器会提示改装 `@meowo/aproxy-headless`。
 
 升级：`aproxy install`（在线下载链条自动滚动重启，逐实例无感；`--from <路径>` 本地安装、`--adopt` 收编既有安装）。
 - **更新通道**：`install` 默认的 `latest` 在「通道」内取版本号最大者。当前是正式版则只取正式版（不会被带到预发布）；当前是预发布（如 alpha）则默认就在预发布通道；`--pre` 显式让预发布参与选择。只认 `vX.Y.Z` / `vX.Y.Z-(alpha|beta|rc).N`，按版本号而非创建时间比较，`format-v*` 与历史测试 tag 不参与。通道内没有更新版本时提示「已是最新」或「暂无可用版本」并保持现状，不会偷偷换通道。指定具体版本号（`aproxy install 0.2.0`）不受通道影响；低于当前版本的目标默认拒绝，需 `--allow-downgrade`；低于 0.2.0 的版本一律不装。
 - **从 0.1.x 升级**：0.1.x 与 0.2.0 起的版本互相控制不了对方的实例，0.1.x 的 `aproxy install` 装不上 0.2.0（下载后报 `--version 输出无版本号` 退出，什么都不改）。按 [CHANGELOG](CHANGELOG.md) 的「从 0.1.x 迁移」停掉实例、重新安装。
+- **变体**：升级保持已装的变体（`aproxy --version` 括号里的第一段）；`aproxy install --variant desktop|headless` 换变体，没有更新的版本时重装当前版本的另一个变体。Linux 上要装带界面的版本而本机跑不了时（规则同上面的 sh 脚本），没写 `--variant` 就改装 headless 并说明，写了 `--variant desktop` 就报错退出；`install --force` 也一样。
 - **失败回滚**：滚动重启时某个实例在新版本下起不来，`install` 会用旧二进制按原参数把它拉回、中止滚动（其余实例不动）并以非零退出；排除原因后重新执行 `aproxy install` 继续。
 - **强制安装**：普通安装失败、卡住，或装着的版本坏到跑不起来时，用 `aproxy install --force [版本|latest]`（或 `--from <下载好的二进制>`）。它不走交接：按进程台账结束这个 home 下当前用户的全部 aproxy 进程，换上新二进制，再用新版本的 `restore` 按原参数拉回实例。这会立即中断所有经 aproxy 的在途请求，所以先确认（非交互环境加 `--yes`）。装着的版本连运行都不行时，手动下载新版本，执行 `<新版本> install --force --from <新版本>`。退出码：0 完成；10 一个进程都没结束、二进制没换；11 结束过进程、二进制没换（再执行一次即可）；12 二进制已换、有实例没回来（输出里按端口列出启动命令）。它不更新 skill 文档，之后执行 `aproxy install --skills-only`。
 
@@ -83,7 +92,7 @@ cargo build --release
 | 平台 | 状态 |
 |---|---|
 | Windows（x64 / x86 / arm64） | 全功能 |
-| Linux（x86_64 / aarch64，glibc 与 musl） | 全功能；gnu 产物要求 glibc ≥ 2.28（发布流程构建时断言），更低版本的 glibc 与 musl 系统使用静态链接的 musl 产物 |
+| Linux（x86_64 / aarch64，glibc 与 musl） | 全功能；headless 的 gnu 产物要求 glibc ≥ 2.28，带界面的 gnu 产物要求 glibc ≥ 2.35 与 WebKitGTK ≥ 2.40（glibc 下限由发布流程构建时断言）；更低版本的 glibc 与 musl 系统使用静态链接的 musl 产物（只有 headless） |
 | macOS（Apple Silicon / Intel） | 提供预构建二进制，但未经真机验证；看门狗、`aproxy install` 与依赖进程查询的实例管理用到 Linux 专有接口（`/dev/shm`、`/proc`），在 macOS 上不可用或退化（需真机补齐，欢迎贡献） |
 
 ## 起手
@@ -191,9 +200,9 @@ Codex 的 `stream_idle_timeout_ms` 默认 300000（5 分钟），按 SSE 事件�
 
 - **0.2.0-alpha.1 的界面是预览版**：里面的实例、请求日志与统计都是演示数据，不是这台电脑上正在运行的 aProxy，界面顶部常驻「预览版 · 演示数据」标签。真实数据在之后的版本接入，在那之前以 `aproxy status`、`aproxy logs` 为准。
 - Windows 需要 Microsoft Edge WebView2 运行时（Windows 11 自带，Windows 10 没有时按提示安装）。从终端运行时命令立即返回，窗口独立运行。
-- Linux 需要图形会话与 WebKitGTK 4.1。带界面的版本动态链接 WebKitGTK，缺这些库时整个程序都起不来（连 `aproxy --version` 也不行），没有图形界面的机器请用无界面的 headless 版本；musl 构建只有 headless 版本。
+- Linux 需要图形会话与 WebKitGTK 4.1（2.40 或更新）。带界面的版本动态链接 WebKitGTK，缺这些库时整个程序都起不来（连 `aproxy --version` 也不行），没有图形界面的机器请用无界面的 headless 版本——一键安装脚本与 `aproxy install` 在缺库的机器上会自动装它；musl 构建只有 headless 版本。
 - 同一个 home 只开一个窗口，再次运行会提示已经在运行。
-- headless 版本（`aproxy --version` 括号里的第一段是 `headless`）没有界面，运行 `aproxy desktop` 会说明怎样换装带界面的版本。
+- headless 版本（`aproxy --version` 括号里的第一段是 `headless`）没有界面，运行 `aproxy desktop` 会说明怎样换装带界面的版本（`aproxy install --variant desktop`）。
 
 ## 多开与别名
 

@@ -906,8 +906,9 @@ async fn run_forward_from_staged(
     // 改 bin/ 期间持有安装锁（永久兼容契约 C4）：强制安装先结束全部安装者再拿这把锁，
     // 拿到之后才动 bin/，两边不会同时改。交换一完就放：之后的滚动重启只读 bin
     let lock = super::lock_install_in(home, BIN_LOCK_WAIT)?;
-    // 续作时上一次尝试可能已让旧二进制让位（bin 此刻缺失），它的唯一名记在状态里，是
-    // 回滚要用的旧二进制：清残留时保留它，这一次也不会再产生新的让位
+    // 续作时上一次尝试可能已让旧二进制让位（Windows 上 bin 此刻缺失，unix 上 bin 可能已是
+    // 新二进制），它的唯一名记在状态里，是回滚要用的旧二进制：清残留时保留它，swap_in 认出
+    // 这是续作重入，不再让位——否则落位之后中断的那一次，新二进制会被当成旧的记下来
     let keep = state.old_path.as_ref().map(std::path::PathBuf::from);
     let target = state.target_version.clone();
     swap::swap_in(home, staged_path, &target, keep.as_deref(), |old| {

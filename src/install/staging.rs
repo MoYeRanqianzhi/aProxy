@@ -42,18 +42,63 @@ pub fn sha256_hex(path: &Path) -> Result<String, String> {
     Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// 读取二进制自报版本：在本机执行它的 `--version`，按永久格式（C5，见
-/// `crate::VERSION_LINE`）取版本号。不能运行、或输出不是这一格式 → Err——它
+/// 执行 `--version` 的上限，余量留给杀毒软件对新文件的首次扫描。
+pub const VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 读取二进制自报版本：在本机执行它的 `--version`（[`run_version`]），按永久格式（C5，
+/// 见 `crate::VERSION_LINE`）取版本号。不能运行、超时、或输出不是这一格式 → Err——它
 /// 不配作为安装源。
 pub fn probe_version(bin: &Path) -> Result<String, String> {
-    let out = std::process::Command::new(bin)
+    version_of(bin, &run_version(bin)?)
+}
+
+/// 在本机执行 `bin --version`（最多 [`VERSION_TIMEOUT`]），返回它的标准输出。跑不起来、
+/// 超时、退出码非零都算失败，错误里带上它的标准错误（缺系统库时，动态链接器的报错就在
+/// 那里）。有时限，是因为调用方往往正持着安装锁（交换落位后的核对），而强制安装是最后的
+/// 手段：一个卡住的 `--version` 不能把它们也卡住。
+pub fn run_version(bin: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(bin)
         .arg("--version")
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| format!("{} 无法执行: {e}", bin.display()))?;
-    if !out.status.success() {
-        return Err(format!("{} --version 退出非零", bin.display()));
+    let deadline = std::time::Instant::now() + VERSION_TIMEOUT;
+    // --version 只输出一行，管道写不满，等它退出再读不会互相卡住
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{} --version 在 {} 秒内没有结束",
+                    bin.display(),
+                    VERSION_TIMEOUT.as_secs()
+                ));
+            }
+        }
+    };
+    let (mut stdout, mut stderr) = (String::new(), String::new());
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
     }
-    version_of(bin, &String::from_utf8_lossy(&out.stdout))
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+    if !status.success() {
+        return Err(format!(
+            "{} --version 失败（{status}）: {}",
+            bin.display(),
+            stderr.trim()
+        ));
+    }
+    Ok(stdout)
 }
 
 /// 从 `bin --version` 的输出里取版本号：首行是永久格式（C5）就取出来；是 0.1.x 的

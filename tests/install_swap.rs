@@ -172,33 +172,86 @@ fn version_mismatch_after_placing_rolls_back() {
     );
 }
 
-/// 上一次留下的残留：删得掉的清掉，keep 指名的保留（续作时回滚要用的旧二进制）。
+/// 上一次留下的残留：删得掉的清掉，keep 指名的保留（续作时回滚要用的旧二进制）。keep 在
+/// 就是续作重入：旧二进制已经让位到 keep（unix 上 bin 仍是旧二进制、keep 是它的硬链接），
+/// 不再让位出新的旧名，before_retire 也不再调用。
 #[test]
 fn residues_are_swept_except_the_kept_one() {
     let home = tempfile::tempdir().unwrap();
-    seed_marked_bin(home.path());
+    let old_bytes = seed_marked_bin(home.path());
     let dir = swap::bin_dir_in(home.path());
     let stale_old = dir.join(swap::unique_name(swap::OLD_PREFIX));
     let stale_tmp = dir.join(swap::unique_name(swap::TMP_PREFIX));
     let kept = dir.join(swap::unique_name(swap::OLD_PREFIX));
-    for p in [&stale_old, &stale_tmp, &kept] {
+    for p in [&stale_old, &stale_tmp] {
         std::fs::write(p, b"residue").unwrap();
     }
+    std::fs::write(&kept, &old_bytes).unwrap();
     let staged = stage(home.path(), "sweep");
     let outcome = swap::swap_in(
         home.path(),
         &staged,
         env!("CARGO_PKG_VERSION"),
         Some(&kept),
-        |_| Ok(()),
+        |_| -> Result<(), String> { panic!("续作重入不该再让位") },
     )
     .unwrap();
     assert!(bin_works(home.path()));
     assert!(!stale_old.exists() && !stale_tmp.exists(), "残留应被清掉");
-    assert!(kept.exists(), "keep 指名的不删");
-    let new_old = outcome.old_path.unwrap();
-    assert_ne!(new_old, kept);
-    assert!(new_old.exists());
+    assert_eq!(outcome.old_path.as_deref(), Some(kept.as_path()));
+    assert_eq!(std::fs::read(&kept).unwrap(), old_bytes, "keep 指名的不删");
+    assert_eq!(residues(home.path()), vec![kept]);
+}
+
+/// 续作重入：上一次已经落位、只差推进相位时中断——bin 里已是新二进制，keep 是上一次让位
+/// 的旧二进制。这一次不能再让位：那会把新二进制当成旧的记下来，之后的回滚拉起的仍是新
+/// 版本。只核对，旧二进制仍是 keep。
+#[test]
+fn a_resumed_swap_after_placing_does_not_retire_the_new_binary() {
+    let home = tempfile::tempdir().unwrap();
+    let old_bytes = seed_marked_bin(home.path());
+    let staged = stage(home.path(), "resume");
+    let first = swap_ok(home.path(), &staged);
+    let kept = first.old_path.expect("bin 里原有二进制，应有让位的旧名");
+    let again = swap::swap_in(
+        home.path(),
+        &staged,
+        env!("CARGO_PKG_VERSION"),
+        Some(&kept),
+        |_| -> Result<(), String> { panic!("续作重入不该再让位") },
+    )
+    .unwrap();
+    assert_eq!(again.old_path.as_deref(), Some(kept.as_path()));
+    assert_eq!(
+        std::fs::read(&kept).unwrap(),
+        old_bytes,
+        "旧名里仍是交换前的二进制"
+    );
+    assert!(bin_works(home.path()));
+    assert_eq!(residues(home.path()), vec![kept]);
+}
+
+/// 续作重入（Windows 的形态）：上一次让位之后、落位之前中断——bin 缺失，旧二进制在 keep。
+/// 直接落位，旧二进制仍是 keep。
+#[test]
+fn a_resumed_swap_with_bin_missing_places_the_new_binary() {
+    let home = tempfile::tempdir().unwrap();
+    let old_bytes = seed_marked_bin(home.path());
+    let bin = swap::bin_path_in(home.path());
+    let kept = swap::bin_dir_in(home.path()).join(swap::unique_name(swap::OLD_PREFIX));
+    std::fs::rename(&bin, &kept).unwrap();
+    let staged = stage(home.path(), "resume-missing");
+    let outcome = swap::swap_in(
+        home.path(),
+        &staged,
+        env!("CARGO_PKG_VERSION"),
+        Some(&kept),
+        |_| -> Result<(), String> { panic!("续作重入不该再让位") },
+    )
+    .unwrap();
+    assert!(bin_works(home.path()));
+    assert_eq!(outcome.old_path.as_deref(), Some(kept.as_path()));
+    assert_eq!(std::fs::read(&kept).unwrap(), old_bytes);
 }
 
 /// 唯一名的格式（永久兼容契约 C2）：`<前缀><纳秒>-<pid>[.exe]`，同一进程内不重复。
@@ -291,23 +344,16 @@ mod windows_swap {
         let home = tempfile::tempdir().unwrap();
         seed_marked_bin(home.path());
         let dir = swap::bin_dir_in(home.path());
-        // 一个更早让位、已经坏掉的旧二进制（时间戳更小）
+        let staged = stage(home.path(), "fallback");
+        swap_ok(home.path(), &staged);
+        assert!(dir.join("aproxy.bat").is_file() && dir.join("aproxy").is_file());
+        // 一个更早让位、已经坏掉的旧二进制（时间戳更小）。交换之后才放进来，免得被清残留
+        // 顺手删掉
         std::fs::write(
             dir.join(format!("{}1000000000000000000-1.exe", swap::OLD_PREFIX)),
             b"not an executable",
         )
         .unwrap();
-        let staged = stage(home.path(), "fallback");
-        swap::swap_in(
-            home.path(),
-            &staged,
-            env!("CARGO_PKG_VERSION"),
-            // 坏文件当作要保留的，免得被清残留顺手删掉
-            Some(&dir.join(format!("{}1000000000000000000-1.exe", swap::OLD_PREFIX))),
-            |_| Ok(()),
-        )
-        .unwrap();
-        assert!(dir.join("aproxy.bat").is_file() && dir.join("aproxy").is_file());
 
         // 模拟交换空窗：aproxy.exe 暂时缺席
         std::fs::rename(dir.join("aproxy.exe"), dir.join("aproxy.exe.away")).unwrap();

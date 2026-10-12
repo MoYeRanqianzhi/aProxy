@@ -141,11 +141,28 @@ pub fn swap_in(
 
     sweep_residue_in(home, keep);
 
+    // 续作重入：上一次尝试已让旧二进制让位到 keep（让位之前就记进了安装状态，见
+    // before_retire）。不能再让位一次：上一次若已经落位、只差推进相位（unix 的 rename、
+    // Windows 的第二次改名之后中断），bin 里此刻是新二进制，再让位就会把它当成「旧的」
+    // 记下来，之后的回滚拉起的仍是新版本。所以：bin 已经是新二进制 → 只核对；否则直接
+    // 落位，旧二进制就是 keep——Windows 上 bin 此刻缺失，unix 上 bin 仍是旧二进制（keep
+    // 是它的硬链接或副本），下面的 rename 原子地替换它
+    let resumed = keep.filter(|k| k.is_file()).map(Path::to_path_buf);
+    if let Some(old) = &resumed
+        && bin.is_file()
+        && same_contents(&bin, source)
+    {
+        verify_placed(&bin, &dir, expected_version, Some(old))?;
+        return Ok(SwapOutcome { old_path: resumed });
+    }
+
     // 1. 新文件以唯一临时名落进 bin：与 bin 同目录，最后一步改名必然在同一个卷上
     let tmp = copy_to_unique(source, &dir, TMP_PREFIX)?;
 
-    // 2. 旧二进制让位（bin 里没有二进制：首次安装，或续作时上一次已经让位）
-    let old = if bin.is_file() {
+    // 2. 旧二进制让位（bin 里没有二进制：首次安装；续作重入：旧二进制已在 keep，见上）
+    let old = if resumed.is_some() {
+        resumed
+    } else if bin.is_file() {
         match retire(&bin, &dir, before_retire) {
             Ok(old) => Some(old),
             Err(e) => {
@@ -174,20 +191,35 @@ pub fn swap_in(
     }
     crate::install::staging::ensure_executable(&bin);
 
-    // 4. 在新位置核对：source 已校验过同样的内容，这里防的是复制、改名环节的意外（杀毒
-    //    软件隔离了刚落位的文件等）。核对不过就换回旧二进制
-    let verified = match crate::install::staging::probe_version(&bin) {
+    // 4. 在新位置核对
+    verify_placed(&bin, &dir, expected_version, old.as_deref())?;
+    Ok(SwapOutcome { old_path: old })
+}
+
+/// 落位后在新位置执行一次 `--version`（有时限，见 `staging::run_version`），核对版本。
+/// source 已校验过同样的内容，这里防的是复制、改名环节的意外（杀毒软件隔离了刚落位的
+/// 文件等）。核对不过就换回旧二进制 `old`。
+fn verify_placed(
+    bin: &Path,
+    dir: &Path,
+    expected_version: &str,
+    old: Option<&Path>,
+) -> Result<(), String> {
+    let verified = match crate::install::staging::probe_version(bin) {
         Ok(v) if v == expected_version => Ok(()),
         Ok(v) => Err(format!("自报版本 {v}，应为 {expected_version}")),
         Err(e) => Err(e),
     };
-    if let Err(e) = verified {
-        return Err(match roll_back(&bin, &dir, old.as_deref()) {
-            Ok(()) => format!("落位后核对失败，已换回原来的二进制: {e}"),
-            Err(back) => format!("落位后核对失败（{e}），换回原来的二进制也失败: {back}"),
-        });
-    }
-    Ok(SwapOutcome { old_path: old })
+    verified.map_err(|e| match roll_back(bin, dir, old) {
+        Ok(()) => format!("落位后核对失败，已换回原来的二进制: {e}"),
+        Err(back) => format!("落位后核对失败（{e}），换回原来的二进制也失败: {back}"),
+    })
+}
+
+/// 两个文件的内容是否相同（比 sha256；读不了的算不同）。
+fn same_contents(a: &Path, b: &Path) -> bool {
+    let hash = crate::install::staging::sha256_hex;
+    matches!((hash(a), hash(b)), (Ok(x), Ok(y)) if x == y)
 }
 
 /// 把 `source` 复制成 `dir` 里的唯一中间文件（[`unique_name`]，目标已存在就换一个名字
@@ -205,8 +237,11 @@ fn copy_to_unique(source: &Path, dir: &Path, prefix: &str) -> Result<PathBuf, St
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(format!("{} 创建失败: {e}", path.display())),
         };
-        let copied =
-            std::fs::File::open(source).and_then(|mut src| std::io::copy(&mut src, &mut out));
+        // 改名到位之前先落盘（sync_all）：交换刚完成几秒内断电，没落盘的新文件可能只剩一个
+        // 全零的空壳——它占着 aproxy(.exe) 的名字，入口兜底脚本也就不会去找让位的旧二进制
+        let copied = std::fs::File::open(source)
+            .and_then(|mut src| std::io::copy(&mut src, &mut out))
+            .and_then(|_| out.sync_all());
         drop(out);
         if let Err(e) = copied {
             let _ = std::fs::remove_file(&path);

@@ -138,8 +138,6 @@ const KILL_WAIT: Duration = Duration::from_secs(10);
 const STOP_ROUND_GAP: Duration = Duration::from_millis(500);
 /// 台账扫描的轮数上限：一直有新进程冒出来（例如有人在反复启动实例）就放弃，退出码 11。
 const MAX_STOP_ROUNDS: usize = 20;
-/// 执行目标二进制 `--version` 的上限，余量留给杀毒软件对新文件的首次扫描。
-const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// 等新版本的 `restore` 结束的上限：基数加每个被结束的实例一份（restore 逐个等实例就绪，
 /// 每个最多 8 秒）。
 const RESTORE_WAIT_BASE: Duration = Duration::from_secs(30);
@@ -354,50 +352,10 @@ pub struct Acquired {
     pub origin: String,
 }
 
-/// 在本机执行 `bin --version`（最多 [`PROBE_TIMEOUT`]），按 C5 拆开首行。跑不起来、
-/// 超时、输出不是永久格式都算失败，错误里带上它的标准错误（缺系统库时，动态链接器的
-/// 报错就在那里）。与 `staging::probe_version` 的区别只在有时限、带标准错误：强制安装是
-/// 最后的手段，一个卡住的 `--version` 不能把它也卡住。
+/// 在本机执行 `bin --version`（有时限，见 `staging::run_version`），按 C5 拆开首行。跑不
+/// 起来、超时、输出不是永久格式都算失败，错误里带上它的标准错误。
 pub fn probe(bin: &Path) -> Result<VersionLine, String> {
-    use std::io::Read;
-    let mut child = std::process::Command::new(bin)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{} 无法执行: {e}", bin.display()))?;
-    let deadline = Instant::now() + PROBE_TIMEOUT;
-    // --version 只输出一行，管道写不满，等它退出再读不会互相卡住
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "{} --version 在 {} 秒内没有结束",
-                    bin.display(),
-                    PROBE_TIMEOUT.as_secs()
-                ));
-            }
-        }
-    };
-    let (mut stdout, mut stderr) = (String::new(), String::new());
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
-    }
-    if !status.success() {
-        return Err(format!(
-            "{} --version 失败（{status}）: {}",
-            bin.display(),
-            stderr.trim()
-        ));
-    }
+    let stdout = super::staging::run_version(bin)?;
     // 认不出版本时用普通安装的说明（0.1.x 的二进制会得到「低于 0.2.0、怎样回到 0.1.x」）
     super::staging::version_of(bin, &stdout)?;
     Ok(VersionLine::parse(&stdout).expect("version_of 认得出版本，首行就是永久格式"))

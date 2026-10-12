@@ -47,6 +47,13 @@ pub(crate) fn handle_desktop_cmd() -> ! {
     // 控制台是与终端共用的：检查都在这里做完（出错就在终端里说明），再分离出一个不带控制台
     // 的子进程承载界面，本进程退出，终端立即可用——分离出的子进程自己有一个看不见的控制台，
     // 走的是前一种情形。
+    //
+    // 那一闪发生在 main 之前（系统建控制台时），这里释放得再早也免不了：默认终端是 Windows
+    // Terminal 时，它的窗口会出现约 0.2 秒（2026-10-12 在 build 26200 上测得）。清单里的
+    // consoleAllocationPolicy=detached（Windows 11 24H2 起）能让系统不建控制台，但它管的是
+    // 整个 aproxy.exe：以 CREATE_NO_WINDOW 拉起的守护进程可能也就拿不到现在那个看不见的
+    // 控制台，那样它拉起的控制台程序（转换器 worker）会各自弹出一个可见的控制台窗口。这一点
+    // 没有验证过，所以不用。彻底不闪要给快捷方式另配一个 GUI 子系统的启动器。
     #[cfg(windows)]
     let attached = console::state();
     #[cfg(windows)]

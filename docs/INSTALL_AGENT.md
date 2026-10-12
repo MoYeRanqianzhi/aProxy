@@ -137,6 +137,13 @@ supported yet (neither is verified on real macOS hardware).
   if your client goes through aproxy. Ask the user first. The command asks too,
   and stops with exit code 10 when stdin is not a terminal and `--yes` is
   missing; add `--yes` only after the user agreed.
+- Give the command a timeout of at least 10 minutes, do not pipe it into
+  `head` or anything else that stops reading early, and read its exit code
+  when it ends. A download and the wait for every instance to come back can
+  take minutes; killed halfway, it can leave the instances stopped and not
+  brought back, and if your own client goes through aproxy your session drops
+  too, before you can tell the user. Behind a pipe the shell reports the exit
+  code of the last command, not force install's.
 - Target: `aproxy install --force [VERSION|latest]` (online, chosen through the
   release's `aproxy-manifest.json`) or `aproxy install --force --from <file>`.
   Downgrades are allowed; nothing below 0.2.0 is installed. `--variant

@@ -599,6 +599,15 @@ it will stop and asks `确认强制安装？输入 y 继续 [y/N]:` ("confirm th
 continue"). When stdin is not a terminal, as in an agent's tool call, it does not wait: it exits 10
 and asks for `--yes`. Add `--yes` only once the user has agreed.
 
+**Running it from a tool call.** Give the command a timeout of at least 10 minutes. A slow download
+plus waiting for every instance to come back can take several minutes, and a tool timeout that
+kills it halfway can leave the instances stopped and not restored; when your own client goes
+through aProxy, your session drops with them, and you can no longer tell the user what happened.
+Do not pipe it into `head` or anything else that stops reading early: the shell then reports the
+exit code of the last command in the pipe instead of force install's, and you lose the lines that
+say what happened. Let it run to the end and read its exit code; the table below says what each
+one means.
+
 **Choosing the target.** `latest` (the default) and VERSION follow the normal channel rules, `--pre`
 included, but only releases that carry `aproxy-manifest.json` count, which means 0.2.0 and later.
 The version is not compared with the current one, so downgrades need no flag; nothing below 0.2.0

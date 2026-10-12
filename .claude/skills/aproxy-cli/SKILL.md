@@ -123,8 +123,10 @@ control each other's instances. Move by reinstalling, as
 When an install keeps failing or hangs, or the installed binary is broken, `aproxy install --force`
 stops every aProxy process of the home, replaces the binary and restores the instances. It cuts
 every request in flight, your own included if your client goes through aProxy, so get the user's
-agreement first; in a tool call it does not prompt and needs `--yes`. Exit codes 10, 11 and 12 each
-call for a different next step: commands.md, "Force install".
+agreement first; in a tool call it does not prompt and needs `--yes`. Give it a timeout of at least
+10 minutes and do not pipe it into `head`: killed halfway, it can leave the instances stopped, your
+own session included. Exit codes 10, 11 and 12 each call for a different next step: commands.md,
+"Force install".
 
 ## Where to look
 

@@ -209,17 +209,23 @@ pub(crate) struct InstallArgs {
     #[arg(long, conflicts_with_all = ["from", "adopt", "version"])]
     pub(crate) abort: bool,
 
-    /// 强制安装：不走交接，按进程台账结束这个 home 下全部 aproxy 进程（实例、看护者、
-    /// 安装者、桌面界面），换上新二进制，再用新版本的 restore 按原参数恢复实例。普通
-    /// 安装失败、卡住，或装着的版本坏了时用；会中断所有经 aproxy 的在途请求，先确认
-    /// （非交互环境加 --yes）。目标取 VERSION（默认 latest）或 --from；隐含允许降级，
-    /// 低于 0.2.0 的版本仍不装；不更新 skill 文档。退出码：0 完成；10 什么都没改；
-    /// 11 进程已停、二进制没换；12 二进制已换、有实例没恢复
-    // 永久兼容契约 C7：`install --force [VERSION|latest] [--from <文件>] [--variant
-    // desktop|headless] [--yes]` 与 `upgrade --force` 的写法、退出码 0/10/11/12 无论如何
-    // 都不得改动，只许追加可选参数——agent 与脚本照着写在各处的命令行修复坏掉的安装，
-    // 任何版本都要认得（样本钉在 tests/force_contract.rs）
-    #[arg(long, conflicts_with_all = ["adopt", "abort", "skills_only", "continue_"])]
+    /// 强制安装：不走交接，按进程台账结束这个 home 下当前用户的全部 aproxy 进程（实例、
+    /// 看护者、安装者、桌面界面），换上新二进制，再用新版本的 restore 按原参数恢复实例。
+    /// 普通安装失败、卡住，或装着的版本坏了时用；会中断所有经 aproxy 的在途请求，先确认
+    /// （非交互环境加 --yes）。目标取 VERSION（默认 latest，不低于当前版本）或 --from；
+    /// 写明的版本号可以降级，低于 0.2.0 的版本仍不装；不更新 skill 文档。退出码：0 完成；
+    /// 10 一个进程都没结束；11 结束过进程、二进制没换；12 二进制已换、有实例没恢复
+    // 永久兼容契约 C7：`install --force [<版本>|latest] [--from <文件>] [--variant
+    // desktop|headless] [--cpu baseline|x86-64-v3] [--pre] [--download-proxy <地址>]
+    // [--yes]` 与 `upgrade --force`（等同 `install --force latest`）的写法、退出码
+    // 0/10/11/12 无论如何都不得改动，只许追加可选参数——agent 与脚本照着写在各处的命令行
+    // 修复坏掉的安装，任何版本都要认得（样本钉在 tests/force_contract.rs）。与 --force
+    // 冲突的选项由参数解析拒绝（用法错误，退出码 2，什么都不做），而不是「接受但不起
+    // 作用」：以后要放宽不破坏调用方，收紧才会
+    #[arg(
+        long,
+        conflicts_with_all = ["adopt", "abort", "skills_only", "continue_", "no_skills", "allow_downgrade"]
+    )]
     pub(crate) force: bool,
 
     /// 强制安装不再询问确认（非交互环境必须加）。加之前先向用户确认可以中断经
@@ -229,7 +235,7 @@ pub(crate) struct InstallArgs {
 
     /// 强制安装的变体：desktop（带桌面界面）或 headless（无界面）；默认与正在运行的
     /// 这个 aproxy 相同。带界面的版本在缺少界面系统库的 Linux 上跑不起来，这时用
-    /// headless
+    /// headless。与 --from 同用时是核对：文件必须正是这个变体，否则不装
     #[arg(long, value_name = "VARIANT", value_parser = ["desktop", "headless"], requires = "force")]
     pub(crate) variant: Option<String>,
 

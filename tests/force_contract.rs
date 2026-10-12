@@ -882,6 +882,34 @@ fn c7_accepted_command_lines_end_with_10_before_touching_anything() {
 }
 
 /// 没有 --yes、标准输入又不是终端：不卡着等输入，以 10 结束，并提示加 --yes。
+/// C7：与 --force 冲突的选项由参数解析拒绝——用法错误，退出码 2，什么都不做（不是「接受但
+/// 不起作用」）。以后放宽不破坏调用方，收紧才会，所以这张表只许删行、不许加行。
+#[test]
+fn c7_conflicting_options_are_usage_errors() {
+    let home = temp_home();
+    for args in [
+        &["install", "--force", "--no-skills", "--yes"][..],
+        &["upgrade", "--force", "--allow-downgrade", "--yes"],
+        &["install", "--force", "--skills-only", "--yes"],
+        &["install", "--force", "--adopt", "--yes"],
+        &["install", "--force", "--abort", "--yes"],
+    ] {
+        let out = aproxy_in(home.path(), args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let left: Vec<_> = std::fs::read_dir(home.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert!(left.is_empty(), "用法错误什么都不做: {left:?}");
+}
+
 #[test]
 fn c7_confirmation_needs_yes_when_not_interactive() {
     let home = temp_home();

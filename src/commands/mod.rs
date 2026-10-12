@@ -143,14 +143,16 @@ mod tests {
         let a = install(&["install", "--cpu", "x86-64-v3"]);
         assert!(!a.force);
         assert_eq!(a.cpu.as_deref(), Some("x86-64-v3"));
-        // 只属于强制安装的参数离不开 --force；--force 与普通安装的特殊模式互斥；
-        // VERSION 与 --from 互斥；变体与指令集档只认列出的取值
+        // 只属于强制安装的参数离不开 --force；--force 与普通安装的特殊模式、与对它不起
+        // 作用的选项互斥；VERSION 与 --from 互斥；变体与指令集档只认列出的取值
         for args in [
             &["install", "--yes"][..],
             &["install", "--variant", "headless"],
             &["install", "--force", "--skills-only"],
             &["install", "--force", "--adopt"],
             &["install", "--force", "--abort"],
+            &["install", "--force", "--no-skills"],
+            &["upgrade", "--force", "--allow-downgrade"],
             &["install", "--force", "0.2.0", "--from", "x"],
             &["install", "--force", "--variant", "gui"],
             &["install", "--force", "--cpu", "x86-64-v4"],

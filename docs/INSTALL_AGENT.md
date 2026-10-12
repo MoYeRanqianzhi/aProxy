@@ -148,7 +148,12 @@ supported yet (neither is verified on real macOS hardware).
   release's `aproxy-manifest.json`) or `aproxy install --force --from <file>`.
   Downgrades are allowed; nothing below 0.2.0 is installed. `--variant
   desktop|headless` switches the build, e.g. to headless on a Linux machine
-  without the desktop libraries.
+  without the desktop libraries; with `--from` it only checks that the file is
+  that build. `--no-skills` and `--allow-downgrade` are usage errors with
+  `--force` (exit 2, nothing done).
+- A second force install on the same home stops the first one, which then
+  exits with 1 (Windows) or 137 (Linux, macOS); only the later one's exit code
+  counts.
 - If the installed binary does not run at all, download the asset for this
   platform from <https://github.com/MoYeRanqianzhi/aProxy/releases>, verify its
   `.sha256`, and run the download itself:

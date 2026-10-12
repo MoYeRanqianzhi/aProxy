@@ -483,17 +483,17 @@ to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running anot
 |---|---|
 | `VERSION` | a version without the `v`, e.g. `0.2.0`; default `latest` |
 | `--pre` | resolve `latest` in the pre-release channel |
-| `--allow-downgrade` | allow a VERSION lower than the running CLI's version, but never below 0.2.0 |
+| `--allow-downgrade` | allow a VERSION lower than the running CLI's version, but never below 0.2.0. Not with `--force`, which installs a named VERSION regardless |
 | `--cpu x86-64-v3\|baseline` | which x86-64 build to download; default `x86-64-v3` when the CPU has AVX2. Only some targets publish an x86-64-v3 build |
 | `--download-proxy URL` | proxy for downloads only; default `download_proxy` in settings.json (not read by `--force`), then the environment's proxy settings. Unrelated to config.toml's `proxy` |
-| `--no-skills` | skip the skill update this time (permanently: `skill_auto_update` in settings.json) |
+| `--no-skills` | skip the skill update this time (permanently: `skill_auto_update` in settings.json). Not with `--force`, which never updates skills |
 | `--from PATH` | install a local binary; its `--version` output decides the version, with no downgrade check (below 0.2.0 is still refused) |
 | `--adopt` | copy the binary you are running into `<home>/bin/` and move running instances onto it |
 | `--skills-only` | update only the skill documents, to VERSION or, by default, the channel's latest version (the running version if the channel is empty) |
 | `--abort` | cancel an install that has not reached the swap |
-| `--force` | stop every aproxy process of this home and replace the binary without the hand-over ([Force install](#force-install)) |
+| `--force` | stop every aproxy process of this home and replace the binary without the hand-over ([Force install](#force-install)). `--adopt`, `--abort`, `--skills-only`, `--no-skills` and `--allow-downgrade` cannot be combined with it: the command stops with a usage error (exit 2) and does nothing |
 | `--yes` | with `--force`: do not ask for confirmation; required when stdin is not a terminal |
-| `--variant desktop\|headless` | with `--force`: the build to install, with or without the desktop interface; default the build you run |
+| `--variant desktop\|headless` | with `--force`: the build to install, with or without the desktop interface; default the build you run. With `--from` it is a check, not a choice: the file must be that build, or nothing is installed |
 
 **Choosing the version.**
 
@@ -640,6 +640,10 @@ one, come only without the desktop interface. Rerun with a combination from that
 | 10 | nothing was stopped: the home does not exist, the download, checksum or `--version` check failed, the target is below 0.2.0 or of the wrong variant, there was no confirmation (`什么都没有改动`, "nothing was changed"), or a later step failed before any process had been stopped (`一个进程都没有结束`, "no process was stopped") | fix what the `[ERROR]` line names and run it again |
 | 11 | at least one process was stopped, but the binary was not replaced: another process holds the install lock or the binary file, a process could not be stopped (for example one running as administrator), or a file could not be written | fix the reported cause and run the same command again; every step can be repeated. To give up for now, `aproxy restore` starts the stopped instances on the old binary |
 | 12 | the binary was replaced, but the instances listed after `二进制已换好，但下面这些被结束的实例没有回来` ("binary replaced, but these stopped instances did not come back") are down | each line gives the port and the command to start it, `aproxy start --config "<config path>"`; `<home>/logs/startup.log` has the reason, often a config file that was moved or deleted |
+
+Two force installs on the same home stop each other: the later one ends the earlier, which then
+exits with 1 (Windows) or 137 (killed by a signal on Linux and macOS) instead of one of the codes
+above; read the later one's result.
 
 Two more notes can appear. `看护者已被结束…` ("the watchdog was stopped") is expected: a restored
 instance relaunches it within 5 minutes, and so does the next `aproxy start`.

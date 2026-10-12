@@ -6,7 +6,7 @@
 #
 # 用法：
 #   irm https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.ps1 | iex
-#   或本地执行：pwsh -File scripts/install.ps1 [-Version v0.1.0] [-Pre] [-NoSkills]
+#   或本地执行：pwsh -File scripts/install.ps1 [-Version <tag>] [-Pre] [-NoSkills]
 #   irm | iex 无法传参，用环境变量代替：
 #     $env:APROXY_PRE = "1"; irm https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.ps1 | iex
 #
@@ -15,7 +15,8 @@
 #      format-v* 是另一条发版线；v0.1.0-alpha.12t3 这类历史测试 tag 按 semver 会排在
 #      alpha.17 之上，必须排除），并跳过 draft；
 #   2. 默认取最新的稳定版（非 prerelease，按版本号取最大）；
-#   3. 仓库里一个 v* 稳定版都没有时（0.1.0 发布前）回退到版本号最大的 v* 预发布并打印说明；
+#   3. 仓库里一个 v* 稳定版都没有时回退到版本号最大的 v* 预发布并打印说明（v0.1.0 起仓库里
+#      已有稳定版，这一条只是兜底）；
 #   4. -Pre（或 APROXY_PRE=1）：取版本号最大的 v* release，预发布也可（与 `aproxy install
 #      --pre` 同一规则：按版本号而非创建时间，补丁版晚于预发布发布时也不会装到更低版本）。
 #
@@ -32,7 +33,7 @@
 # 运行时按系统 ANSI 码页解码中文而解析失败——本地运行请用 pwsh -File 或 install.cmd。
 
 param(
-    [string]$Version = "",      # 指定 tag（如 v0.1.0）；空 = 按上面的选版规则
+    [string]$Version = "",      # 指定 tag（Releases 页上的版本号，形如 vX.Y.Z 或 vX.Y.Z-alpha.N）；空 = 按上面的选版规则
     [switch]$NoSkills,          # 跳过 skill 文档下载
     [string]$DownloadProxy = "", # 下载代理（仅本次；与上游请求代理完全无关）
     [switch]$Pre                # 允许安装预发布（取版本号最大的 v* release）

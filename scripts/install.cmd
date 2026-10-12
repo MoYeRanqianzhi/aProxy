@@ -8,14 +8,16 @@ rem primary installers with localized output are scripts/install.ps1 and
 rem scripts/install.sh - use those unless PowerShell is unavailable.
 rem
 rem Usage: scripts\install.cmd [--pre] [tag]
-rem   tag like v0.1.0; omitted = pick a release by the rules below.
+rem   tag = a version from the Releases page, vX.Y.Z or vX.Y.Z-alpha.N;
+rem   omitted = pick a release by the rules below.
 rem   --pre (or APROXY_PRE=1) also allows prereleases.
 rem Release selection (no explicit tag): only tags matching the project version
 rem   grammar vX.Y.Z or vX.Y.Z-(alpha|beta|rc).N are considered (the repo also
 rem   hosts format-v* releases, and historical test tags such as
 rem   v0.1.0-alpha.12t3 would outrank alpha.17 under semver), drafts skipped.
-rem   Default = highest stable version. If the repo has no v* stable release
-rem   yet, falls back to the highest-versioned prerelease with a note.
+rem   Default = highest stable version. Were there no v* stable release at
+rem   all, it would fall back to the highest-versioned prerelease with a note
+rem   (only a safety net: stable releases exist since v0.1.0).
 rem   --pre = the highest version, prerelease or not (same rule as
 rem   `aproxy install --pre`: by version number, not by creation time).
 rem Env:

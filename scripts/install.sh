@@ -9,7 +9,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/install.sh | sh
 #   curl -fsSL .../install.sh | sh -s -- --pre        # 允许安装预发布
 #   curl -fsSL .../install.sh | sh -s -- --variant headless   # 指定变体
-#   或本地执行：sh scripts/install.sh [--pre] [--variant desktop|headless] [v0.1.0]
+#   或本地执行：sh scripts/install.sh [--pre] [--variant desktop|headless] [<tag>]
+#   <tag> 是 Releases 页上的版本号，形如 vX.Y.Z 或 vX.Y.Z-alpha.N；写了就不查 release 列表
 # 变体：带桌面界面的 desktop（`aproxy desktop` 打开窗口）与无界面的 headless，代理与命令行
 # 完全相同。没指定时 Windows 与 macOS 装 desktop；Linux 先看本机能不能跑带界面的版本（它动态
 # 链接 GTK 与 WebKitGTK，缺库或库太旧时连 --version 都起不来）：musl、glibc 低于
@@ -20,7 +21,8 @@
 #      format-v* 是另一条发版线；v0.1.0-alpha.12t3 这类历史测试 tag 按 semver 会排在
 #      alpha.17 之上，必须排除），并跳过 draft；
 #   2. 默认取最新的稳定版（非 prerelease，按版本号取最大）；
-#   3. 仓库里一个 v* 稳定版都没有时（0.1.0 发布前）回退到版本号最大的 v* 预发布并打印说明；
+#   3. 仓库里一个 v* 稳定版都没有时回退到版本号最大的 v* 预发布并打印说明（v0.1.0 起仓库里
+#      已有稳定版，这一条只是兜底）；
 #   4. --pre（或 APROXY_PRE=1）：取版本号最大的 v* release，预发布也可（与 `aproxy install
 #      --pre` 同一规则：按版本号而非创建时间，补丁版晚于预发布发布时也不会装到更低版本）。
 # 环境变量：
@@ -183,8 +185,8 @@ resolve_tag() {
     fetch "https://api.github.com/repos/$REPO/releases?per_page=100" "$list" \
         || { echo "无法获取 release 列表（网络不可达或 GitHub API 限流）" >&2; exit 1; }
     parsed=$(parse_releases < "$list") \
-        || { echo "无法解析 GitHub release 列表（响应格式与预期不符）；请改用显式 tag：sh install.sh v0.1.0" >&2; exit 1; }
-    [ -n "$parsed" ] || { echo "release 列表为空或响应格式与预期不符（可能是 API 限流页）；请改用显式 tag：sh install.sh v0.1.0" >&2; exit 1; }
+        || { echo "无法解析 GitHub release 列表（响应格式与预期不符）；可以写明要装的 tag，跳过列表查询：sh install.sh <tag>（经 curl 管道时是 sh -s -- <tag>），tag 取 Releases 页上的版本号，形如 vX.Y.Z 或 vX.Y.Z-alpha.N" >&2; exit 1; }
+    [ -n "$parsed" ] || { echo "release 列表为空或响应格式与预期不符（可能是 API 限流页）；可以写明要装的 tag，跳过列表查询：sh install.sh <tag>（经 curl 管道时是 sh -s -- <tag>），tag 取 Releases 页上的版本号，形如 vX.Y.Z 或 vX.Y.Z-alpha.N" >&2; exit 1; }
     # 只留符合项目版本号文法且非 draft 的条目（排除 format-v* 与历史测试 tag）
     cands=$(printf '%s\n' "$parsed" | awk '$1 ~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$/ && $2 == "false" { print }')
     [ -n "$cands" ] || { echo "仓库里没有可安装的 v* release" >&2; exit 1; }

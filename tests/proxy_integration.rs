@@ -6028,6 +6028,30 @@ fn alias_errors_on_unknown_names() {
 }
 
 // ---------------------------------------------------------------------------
+// 29b. 路径参数里的 `~` 按 C1 的用户目录展开（USERPROFILE / HOME 非空就用它），与 home 的
+// 默认位置同一来源。Windows 上系统记录的用户目录（FOLDERID_Profile）不看 USERPROFILE：
+// 这里把 USERPROFILE 指到别处，`~` 若改问系统，展开结果就不在这个目录下
+// ---------------------------------------------------------------------------
+#[test]
+fn tilde_expands_to_the_c1_user_dir() {
+    let home = tempfile::tempdir().unwrap();
+    let user = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_aproxy"))
+        .args(["alias", "add", "tilde", "~/no-such-config.toml"])
+        .env("APROXY_HOME", home.path())
+        .env(aproxy::settings::USER_DIR_ENV, user.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    let expected = user.path().join("no-such-config.toml");
+    assert!(
+        stderr.contains(&format!("配置文件不存在: {}", expected.display())),
+        "实际: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 30a. `aproxy logs <别名>`：别名按配置文件定位运行实例（与 stop 同语义，
 // 端口变了别名依然有效）；未知别名明确报错；实例未运行报「未在运行」
 // ---------------------------------------------------------------------------

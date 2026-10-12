@@ -100,7 +100,7 @@ mod tests {
         let cli =
             crate::cli::Cli::try_parse_from(["aproxy", "--config", "~/x.toml", "status"]).unwrap();
         let path = resolve_cfg_path(&cli).unwrap();
-        assert_eq!(path, dirs::home_dir().unwrap().join("x.toml"));
+        assert_eq!(path, settings::user_dir().unwrap().join("x.toml"));
     }
 
     #[test]

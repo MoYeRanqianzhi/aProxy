@@ -43,9 +43,14 @@ pub fn home() -> PathBuf {
 /// 一个 home 不支持跨操作系统或跨 pid 命名空间共用（WSL 与 Windows、容器与宿主）：台账
 /// 按 pid 记进程，pid 只在同一个系统、同一个命名空间里有意义。
 pub fn resolve_home() -> Result<PathBuf, String> {
-    home_from(std::env::var_os(HOME_ENV).as_deref(), || {
-        user_dir_from(std::env::var_os(USER_DIR_ENV).as_deref(), system_user_dir)
-    })
+    home_from(std::env::var_os(HOME_ENV).as_deref(), user_dir)
+}
+
+/// C1 的用户目录（规则见 [`user_dir_from`]）。home 的默认位置与路径参数里 `~` 的展开（见
+/// [`expand_path`]）都只从这里取：两处各问各的（例如一处读 USERPROFILE、一处问系统），在
+/// 两者不同的机器上，`--config ~/a.toml` 与默认的 `~/.aproxy` 就落在不同的用户目录下。
+pub fn user_dir() -> Option<PathBuf> {
+    user_dir_from(std::env::var_os(USER_DIR_ENV).as_deref(), system_user_dir)
 }
 
 /// C1 的 home 规则。`env_home` 是 APROXY_HOME 的原始值（按原始字节读，不要求 UTF-8）：
@@ -440,11 +445,11 @@ pub fn resolve_alias(name: &str) -> Option<String> {
     load().aliases.get(name).cloned()
 }
 
-/// 别名参数路径的展开与归一：`~` 开头展开为用户主目录，再转绝对路径
-/// （不用 canonicalize，避免 Windows \\?\ verbatim 前缀混进 settings）。
+/// 别名参数路径的展开与归一：`~` 开头展开为用户目录（C1 的用户目录，见 [`user_dir`]），
+/// 再转绝对路径（不用 canonicalize，避免 Windows \\?\ verbatim 前缀混进 settings）。
 pub fn expand_path(path: &str) -> PathBuf {
     let p = if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = user_dir() {
             home.join(path.trim_start_matches('~').trim_start_matches(['/', '\\']))
         } else {
             PathBuf::from(path)
@@ -799,7 +804,7 @@ mod tests {
 
     #[test]
     fn expand_path_tilde_and_absolute() {
-        let home = dirs::home_dir().unwrap();
+        let home = user_dir().unwrap();
         let expanded = expand_path("~/x/a.toml");
         assert!(expanded.starts_with(&home));
         assert!(expanded.is_absolute());

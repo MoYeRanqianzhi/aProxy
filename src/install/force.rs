@@ -361,6 +361,9 @@ pub struct Acquired {
     pub line: VersionLine,
     /// 给人看的来源说明
     pub origin: String,
+    /// 在线取目标时，先选中的产物在本机跑不起来、改试别的组合才取到这一个（见
+    /// [`fallbacks`]）：前面那些为什么跑不起来，给人看
+    pub skipped: Option<String>,
 }
 
 /// 在本机执行 `bin --version`（有时限，见 `staging::run_version`），按 C5 拆开首行。跑不
@@ -414,6 +417,7 @@ pub fn acquire_file(from: &Path, variant: Option<&str>, dest: &Path) -> Result<A
         path: dest.to_path_buf(),
         line,
         origin: format!("本地文件 {}", from.display()),
+        skipped: None,
     })
 }
 
@@ -616,6 +620,9 @@ pub struct OnlineSpec {
     pub target: String,
     /// 变体，默认是正在运行的这个二进制的
     pub variant: String,
+    /// `variant` 是用户用 `--variant` 写明的：写明了就只装这个变体，带界面的版本跑不起来
+    /// 也不换成 headless（见 [`fallbacks`]）
+    pub explicit_variant: bool,
     /// `--cpu` 显式指定的指令集档：清单里必须正好有这一档，没有就报告这个目标有什么
     pub cpu: Option<String>,
     /// 没有显式指定指令集档时按本机 CPU 选：true = 先找 x86-64-v3 档，没有就退回基线档
@@ -631,10 +638,12 @@ pub struct OnlineSpec {
 /// latest 只认带发布清单的 release，新版本若漏传了清单，latest 就会落到更旧的版本上，
 /// `--force --yes` 会悄悄降级。明确写出版本号的不受影响——那是用户自己选的。
 ///
-/// linux-gnu 的产物跑不起来时（它按构建机的 glibc 链接，
-/// 老发行版上跑不了；带界面的版本还要 WebKitGTK 等系统库），改用同一份清单里同变体的
-/// musl 基线产物再试一次——普通在线安装也是这样回退的。清单里找不到要的组合时（例如
-/// musl 目标只发布 headless），错误里列出这个目标实际有的变体与指令集档。
+/// 选中的产物在本机跑不起来（执行 `--version` 失败）时，按 [`fallbacks`] 依次改试同一份
+/// 清单里的别的组合。跑不跑得起来只看下载下来的二进制自己，不预先猜本机缺什么：系统要求
+/// 属于目标版本的构建、会随以后的发布变化，而这里的代码随正在运行的旧版本永远不变——强制
+/// 安装要能装以后任何一版。清单里找不到要的组合时（例如 musl 目标只发布 headless），错误里
+/// 列出这个目标实际有的变体与指令集档。下载失败、sha256 不符、跑起来了却自报的版本或变体
+/// 不对，都直接报错、不再改试：换一个产物也不会好。
 pub async fn acquire_online(
     client: &reqwest::Client,
     api: &str,
@@ -655,34 +664,93 @@ pub async fn acquire_online(
         }
     }
     let manifest = fetch_manifest(client, &release).await?;
-    let asset = match &spec.cpu {
+    let first = match &spec.cpu {
         Some(cpu) => manifest.find(&spec.target, &spec.variant, cpu),
         None => manifest.select(&spec.target, &spec.variant, spec.prefer_v3),
     }
     .ok_or_else(|| manifest.missing(&spec.target, &spec.variant, spec.cpu.as_deref()))?;
-    download_asset(client, &release, asset, dest).await?;
-    let (asset, line) = match probe(dest) {
-        Ok(line) => (asset, line),
-        Err(gnu_err) => {
-            let Some(musl_target) = spec
-                .target
-                .strip_suffix("-linux-gnu")
-                .map(|arch| format!("{arch}-linux-musl"))
-            else {
-                return Err(gnu_err);
-            };
-            // musl 产物恒为基线档（不发布 x86-64-v3）
-            let Some(musl) = manifest.find(&musl_target, &spec.variant, CPU_BASELINE) else {
-                return Err(format!(
-                    "{gnu_err}；改用 musl 产物也不行：{}",
-                    manifest.missing(&musl_target, &spec.variant, Some(CPU_BASELINE))
-                ));
-            };
-            download_asset(client, &release, musl, dest).await?;
-            let line = probe(dest)
-                .map_err(|musl_err| format!("{gnu_err}；改用 musl 产物也不行：{musl_err}"))?;
-            (musl, line)
+    let mut failure = match acquire_asset(client, &release, first, &spec.variant, dest).await? {
+        Ok(acquired) => return Ok(acquired),
+        Err(e) => format!("{} 在本机跑不起来（{e}）", first.file),
+    };
+    for fallback in fallbacks(spec) {
+        let asset = match fallback.cpu {
+            Some(cpu) => manifest.find(&fallback.target, fallback.variant, cpu),
+            None => manifest.select(&fallback.target, fallback.variant, spec.prefer_v3),
+        };
+        let Some(asset) = asset else {
+            failure = format!(
+                "{failure}；改用 {} 的 {} 版本也不行：{}",
+                fallback.target,
+                fallback.variant,
+                manifest.missing(&fallback.target, fallback.variant, fallback.cpu)
+            );
+            continue;
+        };
+        match acquire_asset(client, &release, asset, fallback.variant, dest).await {
+            Ok(Ok(acquired)) => {
+                return Ok(Acquired {
+                    skipped: Some(failure),
+                    ..acquired
+                });
+            }
+            Ok(Err(e)) => failure = format!("{failure}；改用 {} 也跑不起来（{e}）", asset.file),
+            Err(e) => return Err(format!("{failure}；改用 {} 时出错：{e}", asset.file)),
         }
+    }
+    Err(failure)
+}
+
+/// 选中的产物在本机跑不起来时改试的一个组合（见 [`fallbacks`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fallback {
+    pub target: String,
+    pub variant: &'static str,
+    /// 指令集档：Some = 只要这一档（musl 只发布基线档）；None = 与第一个产物同样按本机选
+    pub cpu: Option<&'static str>,
+}
+
+/// 第一个产物在本机跑不起来时依次改试的组合，次序与普通在线安装相同
+/// （`download::DownloadCtx::attempts`）：
+/// - 没写 `--variant` 的带界面版本先换同目标的 headless：缺 WebKitGTK 等系统库时带界面的
+///   版本连 `--version` 都起不来，代理与命令行在 headless 里完全一样；
+/// - linux-gnu 再换 musl 的 headless 基线产物：gnu 产物按构建机的 glibc 链接，老发行版上
+///   跑不了；musl 只发布 headless 基线，所以写明了 `--variant desktop` 的不换。
+pub fn fallbacks(spec: &OnlineSpec) -> Vec<Fallback> {
+    let mut out = Vec::new();
+    let implicit = !spec.explicit_variant;
+    if spec.variant == VARIANT_DESKTOP && implicit {
+        out.push(Fallback {
+            target: spec.target.clone(),
+            variant: VARIANT_HEADLESS,
+            cpu: None,
+        });
+    }
+    if (spec.variant == VARIANT_HEADLESS || implicit)
+        && let Some(arch) = spec.target.strip_suffix("-linux-gnu")
+    {
+        out.push(Fallback {
+            target: format!("{arch}-linux-musl"),
+            variant: VARIANT_HEADLESS,
+            cpu: Some(CPU_BASELINE),
+        });
+    }
+    out
+}
+
+/// 下载一个资产、在本机执行它的 `--version` 并核对。外层的 Err 是不必再改试的失败（下载、
+/// sha256 不符、跑起来了却自报的版本或变体不对）；内层的 Err 是这个产物在本机跑不起来。
+async fn acquire_asset(
+    client: &reqwest::Client,
+    release: &Release,
+    asset: &ManifestAsset,
+    variant: &str,
+    dest: &Path,
+) -> Result<Result<Acquired, String>, String> {
+    download_asset(client, release, asset, dest).await?;
+    let line = match probe(dest) {
+        Ok(line) => line,
+        Err(e) => return Ok(Err(e)),
     };
     if line.version != release.version {
         return Err(format!(
@@ -690,19 +758,19 @@ pub async fn acquire_online(
             asset.file, line.version, release.version
         ));
     }
-    if line.variant.as_deref() != Some(spec.variant.as_str()) {
+    if line.variant.as_deref() != Some(variant) {
         return Err(format!(
-            "{} 自报变体 {}，与要装的 {} 不符",
+            "{} 自报变体 {}，与要装的 {variant} 不符",
             asset.file,
             line.variant.as_deref().unwrap_or("未知"),
-            spec.variant
         ));
     }
-    Ok(Acquired {
+    Ok(Ok(Acquired {
         path: dest.to_path_buf(),
         line,
         origin: format!("GitHub Release v{} 的 {}", release.version, asset.file),
-    })
+        skipped: None,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1146,30 +1214,11 @@ pub enum ForceSource {
 /// [`EXIT_NOT_RESTORED`]）。调用方先把本进程以 installer 登记进台账（第 3 步结束安装者
 /// 时跳过自己的 pid；两个强制安装并发时，后来的会结束先来的）。
 pub async fn run(home: &Path, request: &ForceRequest) -> i32 {
-    let mut variant = request.variant.clone().unwrap_or_else(|| {
+    let variant = request.variant.clone().unwrap_or_else(|| {
         VersionLine::own()
             .variant
             .expect("VERSION_LINE 恒带变体段（lib.rs 的单元测试钉死）")
     });
-    // 在线取带界面的版本之前先看本机跑不跑得了它（Linux 缺 WebKitGTK、glibc 太旧，或 musl
-    // 目标，见 install::variant）：没写 --variant 就改装 headless，写了就以 10 结束。这一步
-    // 属于第 1 步「取得目标」，在动任何东西之前
-    if matches!(request.source, ForceSource::Online(_))
-        && variant == VARIANT_DESKTOP
-        && let Some(reason) = super::variant::desktop_blocker(env!("APROXY_BUILD_TARGET"))
-    {
-        if request.variant.is_some() {
-            errln!(
-                "[ERROR] 本机跑不了带桌面界面的版本：{reason}。装好所需的系统库后重试，或改用 --variant headless。"
-            );
-            errln!("什么都没有改动（退出码 {EXIT_UNCHANGED}）。");
-            return EXIT_UNCHANGED;
-        }
-        outln!(
-            "本机跑不了带桌面界面的版本（{reason}），改装无界面的 headless 版本。装好所需的系统库之后，可用 aproxy install --variant desktop 换回。"
-        );
-        variant = VARIANT_HEADLESS.to_string();
-    }
     // 本次的工作目录按 pid 命名：同一时刻一个 pid 只属于一个进程；同名目录只可能是
     // 早先一个同 pid、已经死掉的强制安装留下的，里面的东西直接覆盖
     let work = super::install_dir_in(home)
@@ -1202,7 +1251,9 @@ pub async fn run(home: &Path, request: &ForceRequest) -> i32 {
         Ok(target) => target,
         Err(e) => {
             errln!("[ERROR] {e}");
-            if variant == VARIANT_DESKTOP && cfg!(target_os = "linux") {
+            // 没写 --variant 时 headless 已经试过了（见 fallbacks），这句只给写明了 desktop 的
+            if request.variant.is_some() && variant == VARIANT_DESKTOP && cfg!(target_os = "linux")
+            {
                 errln!(
                     "带桌面界面的版本需要 WebKitGTK 等系统库；本机缺这些库时，加 --variant headless 改装无界面版本。"
                 );
@@ -1217,6 +1268,10 @@ pub async fn run(home: &Path, request: &ForceRequest) -> i32 {
             return EXIT_UNCHANGED;
         }
     };
+    // 先选中的产物在本机跑不起来、改试别的组合才取到（见 fallbacks）：先说明为什么
+    if let Some(skipped) = &target.skipped {
+        outln!("{skipped}。");
+    }
     outln!(
         "目标：aproxy v{}（{}；{}{}），来自{}",
         target.line.version,
@@ -1229,6 +1284,11 @@ pub async fn run(home: &Path, request: &ForceRequest) -> i32 {
         },
         target.origin
     );
+    if target.skipped.is_some() && target.line.variant.as_deref() != Some(variant.as_str()) {
+        outln!(
+            "带桌面界面的版本在本机跑不起来（原因见上），改装的是无界面的 headless 版本：代理与命令行完全相同，只是没有 aproxy desktop 窗口。装好所需的系统库之后，可用 aproxy install --variant desktop 换回。"
+        );
+    }
 
     // ---- 第 2 步：确认
     let me = std::process::id();
@@ -1317,6 +1377,7 @@ async fn acquire_from_github(
         channel: Channel::resolve(request.pre, &current),
         target: env!("APROXY_BUILD_TARGET").to_string(),
         variant: variant.to_string(),
+        explicit_variant: request.variant.is_some(),
         cpu: request.cpu.clone(),
         prefer_v3: super::download::prefers_x86_64_v3(),
         running: env!("CARGO_PKG_VERSION").to_string(),
@@ -1555,5 +1616,62 @@ mod tests {
             manifest.missing("riscv64gc-unknown-linux-gnu", VARIANT_HEADLESS, None),
             "release v0.2.0 的发布清单里没有 riscv64gc-unknown-linux-gnu 的资产（清单里有的目标：x86_64-unknown-linux-gnu、x86_64-unknown-linux-musl）"
         );
+    }
+
+    /// 跑不起来时的改试次序：没写 --variant 的带界面版本先换同目标的 headless，linux-gnu 再换
+    /// musl 的 headless 基线；写明了 desktop 的一个都不换；headless 只在 linux-gnu 上换 musl
+    #[test]
+    fn fallbacks_follow_the_variant_rule() {
+        let spec = |target: &str, variant: &str, explicit_variant: bool| OnlineSpec {
+            version: None,
+            channel: Channel::Pre,
+            target: target.into(),
+            variant: variant.into(),
+            explicit_variant,
+            cpu: None,
+            prefer_v3: false,
+            running: "0.2.0".into(),
+        };
+        let fallback = |target: &str, variant: &'static str, cpu: Option<&'static str>| Fallback {
+            target: target.into(),
+            variant,
+            cpu,
+        };
+        let (gnu, arm_gnu, musl, windows) = (
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-unknown-linux-musl",
+            "x86_64-pc-windows-msvc",
+        );
+        let musl_headless = fallback(musl, VARIANT_HEADLESS, Some(CPU_BASELINE));
+
+        assert_eq!(
+            fallbacks(&spec(gnu, VARIANT_DESKTOP, false)),
+            vec![fallback(gnu, VARIANT_HEADLESS, None), musl_headless.clone()]
+        );
+        assert_eq!(fallbacks(&spec(gnu, VARIANT_DESKTOP, true)), vec![]);
+        assert_eq!(
+            fallbacks(&spec(gnu, VARIANT_HEADLESS, true)),
+            vec![musl_headless.clone()]
+        );
+        assert_eq!(
+            fallbacks(&spec(gnu, VARIANT_HEADLESS, false)),
+            vec![musl_headless]
+        );
+        assert_eq!(
+            fallbacks(&spec(arm_gnu, VARIANT_HEADLESS, false)),
+            vec![fallback(
+                "aarch64-unknown-linux-musl",
+                VARIANT_HEADLESS,
+                Some(CPU_BASELINE)
+            )]
+        );
+        assert_eq!(
+            fallbacks(&spec(windows, VARIANT_DESKTOP, false)),
+            vec![fallback(windows, VARIANT_HEADLESS, None)]
+        );
+        assert_eq!(fallbacks(&spec(windows, VARIANT_DESKTOP, true)), vec![]);
+        assert_eq!(fallbacks(&spec(windows, VARIANT_HEADLESS, false)), vec![]);
+        assert_eq!(fallbacks(&spec(musl, VARIANT_HEADLESS, false)), vec![]);
     }
 }

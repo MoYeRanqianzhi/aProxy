@@ -42,10 +42,18 @@ impl Artifact {
     /// GitHub Release 资产名（发布资产命名用户定调：文件名不带版本号，
     /// 版本由 release tag 承载；无界面版本加 `headless-`，用户 2026-10-11 定）。
     /// `variant` 是 desktop / headless，`cpu_suffix` 是指令集档的后缀（`-v3` 或空）。
+    ///
+    /// 命名规则只有这一处：发布清单的生成与核对（examples/release-manifest.rs）也调用它，
+    /// 在别的平台上给 Windows 产物起名，所以 `.exe` 按目标三元组判断，不按本机平台。已发布的
+    /// 二进制按自己的这份规则找资产，规则改不得。
     pub fn asset_name(self, target: &str, variant: &str, cpu_suffix: &str) -> String {
         match self {
             Artifact::Binary => {
-                let exe = if cfg!(windows) { ".exe" } else { "" };
+                let exe = if target.contains("-windows-") {
+                    ".exe"
+                } else {
+                    ""
+                };
                 let headless = if variant == super::force::VARIANT_HEADLESS {
                     "headless-"
                 } else {
@@ -272,10 +280,22 @@ pub fn prefers_x86_64_v3() -> bool {
     }
 }
 
+/// 发布 x86-64-v3 档产物的目标：只有 x86_64 的 Windows 与 linux-gnu（release.yml 的构建
+/// 矩阵）。别的 x86 目标（macOS x86_64、i686 Windows、musl）只有基线档，CPU 支持 AVX2 也
+/// 不能去取 `-v3`：普通在线安装按名字找资产，取不到就 404、落到后面的渠道。强制安装读发布
+/// 清单，清单里没有 v3 档就自己退回基线档（`Manifest::select`），用不着这一条。
+fn publishes_v3(target: &str) -> bool {
+    matches!(
+        target,
+        "x86_64-pc-windows-msvc" | "x86_64-unknown-linux-gnu"
+    )
+}
+
 impl DownloadCtx {
     /// 组装：target 取构建三元组；变体取正在运行的这个二进制的；指令集档按运行时检测
-    /// （见 [`prefers_x86_64_v3`]，`--cpu` 手动覆盖，取值 `x86-64-v3` | `baseline`）；代理按
-    /// download_proxy（显式）→ 环境变量（reqwest 默认）两级。
+    /// （见 [`prefers_x86_64_v3`]，只在发布 v3 档的目标上选它，见 [`publishes_v3`]；`--cpu`
+    /// 手动覆盖，取值 `x86-64-v3` | `baseline`）；代理按 download_proxy（显式）→ 环境变量
+    /// （reqwest 默认）两级。
     pub fn build(
         version: &str,
         download_proxy: Option<&str>,
@@ -287,7 +307,7 @@ impl DownloadCtx {
             Some(other) => {
                 return Err(format!("未知指令集档 {other}（取值 x86-64-v3 | baseline）"));
             }
-            None if prefers_x86_64_v3() => "-v3",
+            None if prefers_x86_64_v3() && publishes_v3(runtime_target()) => "-v3",
             None => "",
         };
         let mut builder = reqwest::Client::builder()
@@ -344,6 +364,31 @@ impl DownloadCtx {
             variant: super::force::VARIANT_HEADLESS,
             cpu_suffix: self.cpu_suffix,
         }
+    }
+
+    /// 普通在线安装依次尝试的产物，第一个就是本上下文：下载之后在本机执行 `--version`
+    /// 自证，跑不起来就换下一个。次序与强制安装相同（`force::fallbacks`）：
+    /// - 没写 `--variant`（`explicit_variant` 为 false）的带界面版本，换同一目标的 headless：
+    ///   缺 WebKitGTK 等系统库时带界面的版本连 `--version` 都起不来，代理与命令行在 headless
+    ///   里完全一样；
+    /// - linux-gnu 再换 musl 的 headless 基线产物（[`DownloadCtx::musl_fallback`]）；musl 没有
+    ///   带界面的版本，所以写明了 `--variant desktop` 的一个都不换。
+    ///
+    /// 跑不跑得起来只看下载下来的二进制自己，不预先猜本机缺什么：系统要求属于目标版本的构建，
+    /// 会随以后的发布变化。
+    pub fn attempts(self, explicit_variant: bool) -> Vec<DownloadCtx> {
+        let implicit = !explicit_variant;
+        let headless =
+            (self.variant == super::force::VARIANT_DESKTOP && implicit).then(|| self.headless());
+        let musl = if self.variant == super::force::VARIANT_HEADLESS || implicit {
+            self.musl_fallback()
+        } else {
+            None
+        };
+        let mut out = vec![self];
+        out.extend(headless);
+        out.extend(musl);
+        out
     }
 
     /// linux-gnu 产物的 musl 回退：gnu 产物按构建机的 glibc 链接，老发行版
@@ -592,8 +637,20 @@ mod tests {
 
     #[test]
     fn asset_names_and_template_fill() {
-        // .exe 后缀由编译期平台决定（asset_name 的契约），断言随之动态拼
-        let exe = if cfg!(windows) { ".exe" } else { "" };
+        // .exe 后缀按目标三元组定，与本机平台无关（发布清单要在别的平台上给 Windows 产物起名）
+        let exe = ".exe";
+        assert_eq!(
+            Artifact::Binary.asset_name("x86_64-unknown-linux-gnu", "desktop", "-v3"),
+            "aproxy-x86_64-unknown-linux-gnu-v3"
+        );
+        assert_eq!(
+            Artifact::Binary.asset_name("aarch64-apple-darwin", "headless", ""),
+            "aproxy-headless-aarch64-apple-darwin"
+        );
+        assert_eq!(
+            Artifact::Binary.asset_name("i686-pc-windows-msvc", "headless", ""),
+            "aproxy-headless-i686-pc-windows-msvc.exe"
+        );
         let ctx = DownloadCtx {
             client: reqwest::Client::new(),
             version: "0.1.0-alpha.9".into(),
@@ -650,6 +707,81 @@ mod tests {
             ..ctx.headless()
         };
         assert!(windows.musl_fallback().is_none());
+    }
+
+    /// 普通在线安装依次尝试的产物（与强制安装的 force::fallbacks 同一条规则）：没写
+    /// --variant 的带界面版本先换同目标的 headless，linux-gnu 再换 musl 的 headless 基线；
+    /// 写明了 desktop 的一个都不换；headless 只在 linux-gnu 上换 musl
+    #[test]
+    fn attempts_follow_the_variant_rule() {
+        use crate::install::force::{VARIANT_DESKTOP, VARIANT_HEADLESS};
+        let ctx = |target: &'static str, variant: &'static str| DownloadCtx {
+            client: reqwest::Client::new(),
+            version: "0.2.0".into(),
+            target,
+            variant,
+            cpu_suffix: "-v3",
+        };
+        let names = |attempts: Vec<DownloadCtx>| {
+            attempts
+                .iter()
+                .map(DownloadCtx::binary_asset)
+                .collect::<Vec<_>>()
+        };
+        let gnu = "x86_64-unknown-linux-gnu";
+        assert_eq!(
+            names(ctx(gnu, VARIANT_DESKTOP).attempts(false)),
+            [
+                "aproxy-x86_64-unknown-linux-gnu-v3",
+                "aproxy-headless-x86_64-unknown-linux-gnu-v3",
+                "aproxy-headless-x86_64-unknown-linux-musl",
+            ]
+        );
+        assert_eq!(
+            names(ctx(gnu, VARIANT_DESKTOP).attempts(true)),
+            ["aproxy-x86_64-unknown-linux-gnu-v3"]
+        );
+        for explicit in [false, true] {
+            assert_eq!(
+                names(ctx(gnu, VARIANT_HEADLESS).attempts(explicit)),
+                [
+                    "aproxy-headless-x86_64-unknown-linux-gnu-v3",
+                    "aproxy-headless-x86_64-unknown-linux-musl",
+                ]
+            );
+        }
+        let windows = "x86_64-pc-windows-msvc";
+        assert_eq!(
+            names(ctx(windows, VARIANT_DESKTOP).attempts(false)),
+            [
+                "aproxy-x86_64-pc-windows-msvc-v3.exe",
+                "aproxy-headless-x86_64-pc-windows-msvc-v3.exe",
+            ]
+        );
+        assert_eq!(
+            names(ctx(windows, VARIANT_DESKTOP).attempts(true)),
+            ["aproxy-x86_64-pc-windows-msvc-v3.exe"]
+        );
+        assert_eq!(
+            names(ctx(windows, VARIANT_HEADLESS).attempts(false)),
+            ["aproxy-headless-x86_64-pc-windows-msvc-v3.exe"]
+        );
+    }
+
+    /// 只有发布了 v3 档的目标才会按 CPU 选 `-v3`
+    #[test]
+    fn v3_is_only_picked_where_it_is_published() {
+        assert!(publishes_v3("x86_64-pc-windows-msvc"));
+        assert!(publishes_v3("x86_64-unknown-linux-gnu"));
+        for target in [
+            "x86_64-apple-darwin",
+            "i686-pc-windows-msvc",
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-pc-windows-msvc",
+        ] {
+            assert!(!publishes_v3(target), "{target}");
+        }
     }
 
     fn v(s: &str) -> semver::Version {

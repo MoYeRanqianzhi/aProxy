@@ -291,9 +291,10 @@ async fn run_skills_only(args: &InstallArgs) {
 /// 下载链条 → staged 校验 → 主流程。
 ///
 /// 变体（desktop / headless）：写了 `--variant` 就装它，否则沿用正在运行的这个二进制的
-/// （升级保持原变体）。要装带界面的版本而本机跑不了它（Linux 缺 WebKitGTK、glibc 太旧，
-/// 或 musl 目标，见 aproxy::install::variant）时：没写 `--variant` 就改装 headless 并说明，
-/// 写了就报错。换变体而没有更新的版本时，重装当前版本的另一个变体。
+/// （升级保持原变体）。本机跑不跑得了只看下载下来的二进制自己的 `--version`，不预先猜：
+/// 没写 `--variant` 的带界面版本跑不起来就改装同目标的 headless，再不行换 musl（见
+/// `DownloadCtx::attempts`）；写了的不换变体。换变体而通道里没有更新的版本（已是最新，或
+/// 通道为空）时，重装当前版本的另一个变体。
 async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &InstallArgs) {
     use aproxy::install::force::{VARIANT_DESKTOP, VARIANT_HEADLESS};
     let settings = aproxy::settings::load();
@@ -319,20 +320,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         Some(_) => ctx.variant = VARIANT_DESKTOP,
         None => {}
     }
-    if ctx.variant == VARIANT_DESKTOP
-        && let Some(reason) = aproxy::install::variant::desktop_blocker(ctx.target)
-    {
-        if explicit_variant {
-            eprintln!(
-                "[ERROR] 本机跑不了带桌面界面的版本：{reason}。装好所需的系统库后重试，或改装无界面版本：aproxy install --variant headless"
-            );
-            aproxy::ledger::exit(1);
-        }
-        println!(
-            "本机跑不了带桌面界面的版本（{reason}），改装无界面的 headless 版本：代理与命令行完全相同，只是没有 aproxy desktop 窗口。装好所需的系统库之后，可用 aproxy install --variant desktop 换回。"
-        );
-        ctx.variant = VARIANT_HEADLESS;
-    }
+    // 只有写了 --variant 才会换变体
     let switching = ctx.variant != own_variant;
 
     // 版本解析：latest = 通道内 semver 最大的主线版本（stable 只取正式版，
@@ -357,8 +345,12 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
             };
             match decide_latest(&current, candidate.as_deref()) {
                 LatestDecision::Install(v) => v,
-                // 换变体而没有更新的版本：重装当前版本的另一个变体
-                LatestDecision::UpToDate(_) if switching => current.to_string(),
+                // 换变体而通道里没有更新的版本：重装当前版本的另一个变体。通道为空也一样
+                // （例如 stable 通道还没有正式版，当前版本是预发布）：用户要的是换变体，以 0
+                // 结束却什么都没换，脚本与 agent 会以为换好了
+                LatestDecision::UpToDate(_) | LatestDecision::NoneInChannel if switching => {
+                    current.to_string()
+                }
                 LatestDecision::UpToDate(latest) => {
                     println!(
                         "已是最新：当前 {current}，{} 通道最新为 {latest}，无需安装。",
@@ -419,21 +411,10 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     );
     let staged_dir = aproxy::install::staging::staging_dir_in(home, &target);
 
-    // 依次尝试的产物。下载之后在本机执行 `--version` 自证（能运行、自报版本 == 目标、变体
-    // 对得上——与 --from 的信任锚同级），跑不起来就换下一个：没写 --variant 的带界面版本
-    // 改装同一目标的 headless（缺 WebKitGTK 等系统库时就是这样）；linux-gnu 产物再不行改装
-    // musl 静态产物（gnu 产物按构建机的 glibc 链接，老发行版跑不了；musl 只有 headless）。
-    // 写了 --variant desktop 的不换。下载链条本身失败（网络/404）不换——重跑只会重复同一错误。
-    let mut attempts = vec![ctx];
-    if attempts[0].variant == VARIANT_DESKTOP && !explicit_variant {
-        let headless = attempts[0].headless();
-        attempts.push(headless);
-    }
-    if (attempts[0].variant == VARIANT_HEADLESS || !explicit_variant)
-        && let Some(musl) = attempts[0].musl_fallback()
-    {
-        attempts.push(musl);
-    }
+    // 依次尝试的产物（次序见 DownloadCtx::attempts）。下载之后在本机执行 `--version` 自证
+    // （能运行、自报版本 == 目标、变体对得上——与 --from 的信任锚同级），跑不起来就换下一个。
+    // 下载链条本身失败（网络/404）不换——重跑只会重复同一错误。
+    let attempts = ctx.attempts(explicit_variant);
     enum DownloadOutcome {
         Ok(aproxy::install::download::Fetched),
         VerifyFailed(String),
@@ -486,6 +467,8 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     }
     let mut failures: Vec<String> = Vec::new();
     let mut installed = None;
+    // 有带界面的产物下载下来了、却在本机用不了（多半是缺系统库）
+    let mut desktop_unusable = false;
     for attempt in &attempts {
         if let Some(previous) = failures.last() {
             println!("{previous}，改用 {}...", attempt.binary_asset());
@@ -496,6 +479,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
                 break;
             }
             DownloadOutcome::VerifyFailed(e) => {
+                desktop_unusable |= attempt.variant == VARIANT_DESKTOP;
                 failures.push(format!("{} 在本机不可运行（{e}）", attempt.binary_asset()));
             }
             DownloadOutcome::ChainFailed(e) => {
@@ -507,6 +491,12 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     let Some((fetched, installed_variant)) = installed else {
         for failure in &failures {
             eprintln!("[ERROR] {failure}");
+        }
+        // 没写 --variant 时 headless 已经试过了（见 DownloadCtx::attempts），这句只给写明了 desktop 的
+        if explicit_variant && desktop_unusable && cfg!(target_os = "linux") {
+            eprintln!(
+                "带桌面界面的版本需要 WebKitGTK 2.40 或更新等系统库（Debian / Ubuntu：libwebkit2gtk-4.1-0）；本机缺这些库时，改装无界面版本：aproxy install --variant headless"
+            );
         }
         eprintln!(
             "可尝试：--download-proxy <URL> 配置下载代理，或在 settings.json 配置 download_chain（含 url 模板 CDN 通道，文档见 README）。"

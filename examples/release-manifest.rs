@@ -17,6 +17,7 @@
 //! 有基线档、目录里的每个二进制都在清单里、清单与资产都在读者的大小上限之内。任何一条不满足就以
 //! 非零退出，release 不会带着一份旧版本读不懂或指错文件的清单发出去。
 
+use aproxy::install::download::Artifact;
 use aproxy::install::force::{
     ASSET_LIMIT, CPU_BASELINE, CPU_X86_64_V3, MANIFEST_ASSET, MANIFEST_FORMAT, MANIFEST_LIMIT,
     Manifest, ManifestAsset, VARIANT_DESKTOP, VARIANT_HEADLESS, VersionLine,
@@ -86,23 +87,11 @@ fn embedded_version_line(bytes: &[u8], version: &str) -> Result<String, String> 
     }
 }
 
-/// 发布资产的命名规则：带界面的版本 `aproxy-<目标>`，无界面的 `aproxy-headless-<目标>`，
-/// x86-64-v3 档加 `-v3`，Windows 目标加 `.exe`。
+/// 发布资产的命名规则只有一处：普通在线安装按名字找资产用的 `Artifact::asset_name`。这里
+/// 直接调用它，两边不会各写一份、悄悄走样（名字不对，普通安装就 404，而这里看不出来）。
 fn asset_name(target: &str, variant: &str, cpu: &str) -> String {
-    format!(
-        "aproxy-{}{target}{}{}",
-        if variant == VARIANT_HEADLESS {
-            "headless-"
-        } else {
-            ""
-        },
-        if cpu == CPU_X86_64_V3 { "-v3" } else { "" },
-        if target.contains("-windows-") {
-            ".exe"
-        } else {
-            ""
-        },
-    )
+    let cpu_suffix = if cpu == CPU_X86_64_V3 { "-v3" } else { "" };
+    Artifact::Binary.asset_name(target, variant, cpu_suffix)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

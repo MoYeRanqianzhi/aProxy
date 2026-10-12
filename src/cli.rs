@@ -251,8 +251,8 @@ pub(crate) struct InstallArgs {
 
     /// 要装的变体：desktop（带桌面界面）或 headless（无界面）；默认与正在运行的这个
     /// aproxy 相同。带界面的版本在缺 WebKitGTK 等系统库的 Linux 上跑不起来：没写这个
-    /// 参数时，在线安装在那样的系统上改装 headless 并说明原因，写了 desktop 就报错。
-    /// 与 --from 同用时是核对：文件必须正是这个变体，否则不装
+    /// 参数时，在线安装下载的带界面版本跑不起来就改装 headless 并说明原因，写了 desktop
+    /// 就报错。与 --from 同用时是核对：文件必须正是这个变体，否则不装
     // 它在 --force 下的写法属于永久兼容契约 C7；普通安装也接受它是放宽，C7 允许放宽
     #[arg(
         long,
@@ -262,8 +262,8 @@ pub(crate) struct InstallArgs {
     )]
     pub(crate) variant: Option<String>,
 
-    /// 指令集档：x86-64-v3 或 baseline（默认按本机 CPU：支持 AVX2 → x86-64-v3，否则
-    /// baseline；只有 x86_64 的部分目标发布 x86-64-v3 档）
+    /// 指令集档：x86-64-v3 或 baseline（默认按本机 CPU：支持 AVX2、且这个目标发布了
+    /// x86-64-v3 档（x86_64 的 Windows 与 Linux gnu）→ x86-64-v3，否则 baseline）
     #[arg(long, value_name = "CPU", value_parser = ["x86-64-v3", "baseline"], conflicts_with_all = ["from", "adopt", "abort"])]
     pub(crate) cpu: Option<String>,
 

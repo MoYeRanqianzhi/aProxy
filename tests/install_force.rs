@@ -882,12 +882,14 @@ fn own_variant() -> String {
     force::VersionLine::own().variant.unwrap()
 }
 
+/// 与不写 `--variant` 的 `aproxy install --force` 一样：变体不是用户写明的
 fn online_spec(version: Option<&str>, target: &str, variant: &str) -> OnlineSpec {
     OnlineSpec {
         version: version.map(str::to_string),
         channel: aproxy::install::download::Channel::Pre,
         target: target.into(),
         variant: variant.into(),
+        explicit_variant: false,
         cpu: None,
         prefer_v3: false,
         running: env!("CARGO_PKG_VERSION").into(),
@@ -1064,8 +1066,15 @@ async fn online_latest_takes_the_newest_release_that_carries_a_manifest() {
     assert_eq!(std::fs::read(&dest).unwrap(), std::fs::read(&real).unwrap());
 }
 
+/// 选中的产物跑不起来时按 `force::fallbacks` 依次改试：没写 `--variant` 的带界面版本先换
+/// 同目标的 headless，linux-gnu 再换 musl 的 headless 基线；写明了 `--variant desktop` 的
+/// 一个都不换。跑不跑得起来只看下载下来的文件自己。
+///
+/// 能跑起来的只有本测试程序的 aproxy，它自报的是本构建的变体：headless 构建里 musl 那一个
+/// 就是它，回退成功；带界面的构建里走到 musl 时它自报 desktop、与要装的 headless 对不上，
+/// 以「变体不符」结束——错误按次序记着前面每一个产物为什么没用上。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn online_falls_back_to_musl_when_the_gnu_asset_does_not_run() {
+async fn online_falls_back_in_order_when_the_selected_asset_does_not_run() {
     let home = TestHome::new();
     let files = home.path().join("files");
     std::fs::create_dir_all(&files).unwrap();
@@ -1073,14 +1082,15 @@ async fn online_falls_back_to_musl_when_the_gnu_asset_does_not_run() {
     let broken = files.join("broken");
     std::fs::write(&broken, b"not an executable").unwrap();
     let version = env!("CARGO_PKG_VERSION");
-    let variant = own_variant();
+    let (gnu, musl) = ("x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl");
     let manifest = manifest_file(
         &files,
         "m.json",
         version,
         vec![
-            asset("x86_64-unknown-linux-gnu", &variant, "gnu-bin", &broken),
-            asset("x86_64-unknown-linux-musl", &variant, "musl-bin", &real),
+            asset(gnu, force::VARIANT_DESKTOP, "gnu-desktop", &broken),
+            asset(gnu, force::VARIANT_HEADLESS, "gnu-headless", &broken),
+            asset(musl, force::VARIANT_HEADLESS, "musl-headless", &real),
         ],
     );
     let api = serve_fake_github(vec![(
@@ -1088,29 +1098,60 @@ async fn online_falls_back_to_musl_when_the_gnu_asset_does_not_run() {
         true,
         vec![
             (force::MANIFEST_ASSET.into(), manifest),
-            ("gnu-bin".into(), broken),
-            ("musl-bin".into(), real.clone()),
+            ("gnu-desktop".into(), broken.clone()),
+            ("gnu-headless".into(), broken),
+            ("musl-headless".into(), real.clone()),
         ],
     )])
     .await;
     let dest = home
         .path()
         .join(format!("got{}", std::env::consts::EXE_SUFFIX));
-    let got = force::acquire_online(
-        &local_client(),
+    let client = local_client();
+    let variant = own_variant();
+    let result = force::acquire_online(
+        &client,
         &api,
-        &online_spec(Some(version), "x86_64-unknown-linux-gnu", &variant),
+        &online_spec(Some(version), gnu, &variant),
         &dest,
     )
-    .await
-    .unwrap();
-    assert!(got.origin.contains("musl-bin"), "{}", got.origin);
-    assert_eq!(std::fs::read(&dest).unwrap(), std::fs::read(&real).unwrap());
+    .await;
+    if variant == force::VARIANT_HEADLESS {
+        let got = result.unwrap();
+        assert!(got.origin.contains("musl-headless"), "{}", got.origin);
+        let skipped = got.skipped.expect("回退成功时说明前面的产物为什么没用上");
+        assert!(skipped.contains("gnu-headless 在本机跑不起来"), "{skipped}");
+        assert_eq!(std::fs::read(&dest).unwrap(), std::fs::read(&real).unwrap());
+    } else {
+        let e = result.unwrap_err();
+        let order = [
+            "gnu-desktop 在本机跑不起来",
+            "改用 gnu-headless 也跑不起来",
+            "改用 musl-headless 时出错",
+        ];
+        let positions: Vec<usize> = order
+            .iter()
+            .map(|part| e.find(part).unwrap_or_else(|| panic!("缺「{part}」：{e}")))
+            .collect();
+        assert!(positions.is_sorted(), "{e}");
+        assert!(e.contains("自报变体 desktop"), "{e}");
+    }
+
+    // 写明了 --variant desktop：不换成 headless，也不换 musl
+    let explicit = OnlineSpec {
+        explicit_variant: true,
+        ..online_spec(Some(version), gnu, force::VARIANT_DESKTOP)
+    };
+    let e = force::acquire_online(&client, &api, &explicit, &dest)
+        .await
+        .unwrap_err();
+    assert!(e.contains("gnu-desktop 在本机跑不起来"), "{e}");
+    assert!(!e.contains("gnu-headless") && !e.contains("musl"), "{e}");
 }
 
 /// 清单里找不到要的「目标三元组 + 变体 [+ 指令集档]」时，错误如实列出这个目标有什么——
 /// 例如 musl 目标只发布 headless，要 desktop 时提示「这个目标只有 headless」；显式的
-/// `--cpu` 不退回别的档；linux-gnu 产物跑不起来、musl 又没有同变体时也这样说明。
+/// `--cpu` 不退回别的档；产物跑不起来之后要改试的组合清单里没有时，也这样说明。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn online_reports_what_a_target_offers_when_the_combination_is_missing() {
     let home = TestHome::new();
@@ -1131,16 +1172,33 @@ async fn online_reports_what_a_target_offers_when_the_combination_is_missing() {
             asset(musl, force::VARIANT_HEADLESS, "musl-headless", &broken),
         ],
     );
-    let api = serve_fake_github(vec![(
-        format!("v{version}"),
-        true,
-        vec![
-            (force::MANIFEST_ASSET.into(), manifest),
-            ("gnu-desktop".into(), broken.clone()),
-            ("gnu-headless".into(), broken.clone()),
-            ("musl-headless".into(), broken),
-        ],
-    )])
+    // 另一个 release 只有 gnu 的 headless：它跑不起来时要改试的 musl 清单里没有
+    let gnu_only = manifest_file(
+        &files,
+        "gnu-only.json",
+        "0.2.9",
+        vec![asset(gnu, force::VARIANT_HEADLESS, "gnu-headless", &broken)],
+    );
+    let api = serve_fake_github(vec![
+        (
+            format!("v{version}"),
+            true,
+            vec![
+                (force::MANIFEST_ASSET.into(), manifest),
+                ("gnu-desktop".into(), broken.clone()),
+                ("gnu-headless".into(), broken.clone()),
+                ("musl-headless".into(), broken.clone()),
+            ],
+        ),
+        (
+            "v0.2.9".into(),
+            false,
+            vec![
+                (force::MANIFEST_ASSET.into(), gnu_only),
+                ("gnu-headless".into(), broken),
+            ],
+        ),
+    ])
     .await;
     let dest = home
         .path()
@@ -1171,10 +1229,12 @@ async fn online_reports_what_a_target_offers_when_the_combination_is_missing() {
         "{e}"
     );
 
-    // gnu 的 desktop 产物跑不起来，musl 又只有 headless
-    let e = attempt(online_spec(Some(version), gnu, force::VARIANT_DESKTOP)).await;
+    // gnu 的 headless 产物跑不起来，要改试的 musl 清单里没有
+    let e = attempt(online_spec(Some("0.2.9"), gnu, force::VARIANT_HEADLESS)).await;
     assert!(
-        e.contains("改用 musl 产物也不行") && e.contains("这个目标只有 headless（baseline）"),
+        e.contains("gnu-headless 在本机跑不起来")
+            && e.contains("改用 x86_64-unknown-linux-musl 的 headless 版本也不行")
+            && e.contains("清单里有的目标：x86_64-unknown-linux-gnu"),
         "{e}"
     );
 }

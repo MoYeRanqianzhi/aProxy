@@ -55,7 +55,7 @@ async fn main() {
     if let Some(Commands::Install(args) | Commands::Upgrade(args)) = &cli.command
         && args.force
     {
-        server::init_foreground_logging();
+        server::init_force_logging();
         commands::install::handle_force_cmd(args).await;
     }
 

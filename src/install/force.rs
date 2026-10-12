@@ -4,7 +4,8 @@
 //! `.agents/plan/release-0.2.0.md` 的「W2b 强制安装：永久兼容契约」一节。
 //!
 //! **永久兼容契约：本文件里标明冻结的东西——发布清单的资产名与 JSON 格式、退出码 10/11/12、
-//! 命令行写法、流程的先后顺序——无论如何都不得改动，只许追加可选字段。**
+//! 命令行写法、流程的先后顺序——无论如何都不得改动，只许追加可选字段。** 写输出失败（例如
+//! 管道已关闭）不得改变退出码，所以这里的一切输出都经 `outln!`、`errln!`。
 //!
 //! 为什么：强制安装是普通安装失败之后的兜底，它保证从 0.2.0 起，任意版本 X 的
 //! `install --force` 都能把任意版本 Y 装进同一个 home，并停掉这个 home 下由任意版本启动
@@ -20,8 +21,8 @@
 //!
 //! 1. 取得目标（发布清单 C6 或 `--from`），校验 sha256，在本机执行 `--version` 核对；
 //!    失败 → 退出码 10，什么都没动。
-//! 2. 确认：会中断所有经 aproxy 的在途请求，包括 agent 自己经 aproxy 的会话。`--yes`
-//!    跳过；标准输入不是终端又没有 `--yes` → 10，不卡着等输入。
+//! 2. 确认（提示写到标准错误）：会中断所有经 aproxy 的在途请求，包括 agent 自己经 aproxy
+//!    的会话。`--yes` 跳过；标准输入不是终端又没有 `--yes` → 10，不卡着等输入。
 //! 3. 按台账结束安装者（本进程除外）→ 拿安装锁 → 结束看护者、实例、桌面界面与不认识
 //!    的角色；反复扫描直到连续两轮没有存活条目（有上限）。从这一步起，二进制换好之前的
 //!    任何失败 → 11。
@@ -47,6 +48,29 @@ use super::swap;
 use crate::ledger::{
     self, LedgerEntry, ROLE_DESKTOP, ROLE_INSTALLER, ROLE_INSTANCE, ROLE_WATCHDOG,
 };
+
+/// 写一行到标准输出，写失败（管道已关闭、终端已断开）一律忽略。强制安装的一切输出都经它
+/// 与 `errln!`，不用 `println!`/`eprintln!`。
+///
+/// 永久兼容契约 C7：写输出失败不得改变退出码。`println!` 写失败会 panic：退出码变成 101、
+/// 跳过清理（留下 `install/force/<pid>/`），接了 `| head` 时 shell 报的甚至是 head 的 0；
+/// panic 若发生在第 3 步之后，进程已停、二进制没换、实例没拉回，调用方却拿不到 11。输出
+/// 接到提前退出的读者是常态而不是意外：`| head`、agent 的工具超时后只杀了 shell、将来
+/// 桌面界面读着输出就按规格先退出了。
+macro_rules! outln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
+/// 写一行到标准错误，写失败一律忽略。理由同 `outln!`。
+macro_rules! errln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
 
 /// 退出码 0：完成——二进制已换好，被结束的实例都已按台账确认回来。
 ///
@@ -656,7 +680,7 @@ fn stop_by_ledger(
             }
             match ledger::terminate(entry, KILL_WAIT) {
                 ledger::Termination::Terminated => {
-                    println!("  已结束 {}", describe(entry));
+                    outln!("  已结束 {}", describe(entry));
                     let _ = std::fs::remove_file(&found.path);
                     stopped_any = true;
                     stopped.push(entry.clone());
@@ -727,40 +751,91 @@ fn clear_install_dir(home: &Path, keep_work: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// 第 6 步：用新位置的二进制执行 `restore`（继承本进程的环境与输出，有上限），然后按
-/// 台账核对被结束的实例有没有回来：同一个端口上出现了 pid 不同、仍在运行的 instance
-/// 条目才算。返回没回来的那些。
-fn restore_and_check(home: &Path, stopped: &[LedgerEntry]) -> Vec<LedgerEntry> {
+/// 子进程的一路输出：子进程写进工作目录里的一个文件，本进程边等边读出新增的部分，转写到
+/// 自己的标准输出或标准错误（写失败忽略）。
+///
+/// 不让子进程直接继承本进程的输出：输出端已关闭时，子进程自己会因写失败而 panic——
+/// restore 死在半路，实例就拉不回来，写输出失败因此改变了结果（违反 C7）。也不用管道：
+/// 读管道要等写端全部关闭，而写端可能被子进程再拉起的进程继承下去，一直等不到。文件
+/// 没有这两个问题，被继承了也只是多一个句柄。
+struct Relay {
+    reader: std::fs::File,
+    to_stderr: bool,
+}
+
+impl Relay {
+    /// 子进程这一路输出的去处：`path` 处新建的文件，配一个读它的 Relay。文件建不起来就
+    /// 丢弃这一路输出（Stdio::null），子进程照样运行。
+    fn capture(path: &Path, to_stderr: bool) -> (std::process::Stdio, Option<Self>) {
+        let opened =
+            std::fs::File::create(path).and_then(|writer| Ok((writer, std::fs::File::open(path)?)));
+        match opened {
+            Ok((writer, reader)) => (writer.into(), Some(Self { reader, to_stderr })),
+            Err(_) => (std::process::Stdio::null(), None),
+        }
+    }
+
+    /// 把文件里自上次以来新增的内容转写出去。普通文件读到末尾之后，再读会接着读到新写入的
+    /// 部分，所以反复调用就能跟上子进程的输出。
+    fn pump(&mut self) {
+        use std::io::{Read, Write};
+        let mut buf = Vec::new();
+        let _ = self.reader.read_to_end(&mut buf);
+        if buf.is_empty() {
+            return;
+        }
+        let _ = if self.to_stderr {
+            std::io::stderr().write_all(&buf)
+        } else {
+            std::io::stdout().write_all(&buf)
+        };
+    }
+}
+
+/// 第 6 步：用新位置的二进制执行 `restore`（继承本进程的环境，输出经 [`Relay`] 转写，有
+/// 上限），然后按台账核对被结束的实例有没有回来：同一个端口上出现了 pid 不同、仍在运行的
+/// instance 条目才算。返回没回来的那些。
+fn restore_and_check(home: &Path, work: &Path, stopped: &[LedgerEntry]) -> Vec<LedgerEntry> {
     let killed: Vec<&LedgerEntry> = stopped.iter().filter(|e| e.role == ROLE_INSTANCE).collect();
     let bin = swap::bin_path_in(home);
-    println!("用新版本恢复实例（{} restore）……", bin.display());
+    outln!("用新版本恢复实例（{} restore）……", bin.display());
     let wait = RESTORE_WAIT_BASE + RESTORE_WAIT_PER_INSTANCE * killed.len() as u32;
+    let (stdout, out_relay) = Relay::capture(&work.join("restore.out"), false);
+    let (stderr, err_relay) = Relay::capture(&work.join("restore.err"), true);
+    let mut relays: Vec<Relay> = out_relay.into_iter().chain(err_relay).collect();
     match std::process::Command::new(&bin)
         .arg("restore")
         .stdin(std::process::Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
         .spawn()
     {
         Ok(mut child) => {
             let deadline = Instant::now() + wait;
-            loop {
+            let finished = loop {
+                relays.iter_mut().for_each(Relay::pump);
                 match child.try_wait() {
-                    Ok(Some(_)) => break,
+                    Ok(Some(_)) => break true,
                     Ok(None) if Instant::now() < deadline => {
                         std::thread::sleep(Duration::from_millis(100))
                     }
                     _ => {
-                        eprintln!(
-                            "[警告] restore 在 {} 秒内没有结束，已终止它",
-                            wait.as_secs()
-                        );
                         let _ = child.kill();
                         let _ = child.wait();
-                        break;
+                        break false;
                     }
                 }
+            };
+            // 子进程退出之前写下的最后一段
+            relays.iter_mut().for_each(Relay::pump);
+            if !finished {
+                errln!(
+                    "[警告] restore 在 {} 秒内没有结束，已终止它",
+                    wait.as_secs()
+                );
             }
         }
-        Err(e) => eprintln!("[ERROR] 无法执行 {} restore: {e}", bin.display()),
+        Err(e) => errln!("[ERROR] 无法执行 {} restore: {e}", bin.display()),
     }
     if killed.is_empty() {
         return Vec::new();
@@ -867,17 +942,19 @@ fn report_strays(home: &Path) {
     if strays.is_empty() {
         return;
     }
-    println!(
+    outln!(
         "注意：下面这些进程从 {} 运行，但不在台账里（多半是 0.1.x 留下的，0.1.x 不写台账），强制安装没有结束它们：",
         bin_dir.display()
     );
     for (pid, image) in &strays {
-        println!("  pid {pid}  {}", image.display());
+        outln!("  pid {pid}  {}", image.display());
     }
-    println!("  确认它们属于这个 home 之后，用当初启动它们的那个 aproxy 版本执行 stop 停掉。");
+    outln!("  确认它们属于这个 home 之后，用当初启动它们的那个 aproxy 版本执行 stop 停掉。");
 }
 
-/// 第 2 步：问一句。标准输入不是终端时不卡着等输入，直接返回 Err（退出码 10）。
+/// 第 2 步：问一句。标准输入不是终端时不卡着等输入，直接返回 Err（退出码 10）。提示写到
+/// 标准错误（C8）：标准输出被重定向进文件、标准输入仍是终端时，写到标准输出的提示用户
+/// 看不见，命令就像卡住了一样。
 fn confirm() -> Result<bool, String> {
     use std::io::{BufRead, IsTerminal, Write};
     if !std::io::stdin().is_terminal() {
@@ -886,8 +963,9 @@ fn confirm() -> Result<bool, String> {
                 .to_string(),
         );
     }
-    print!("确认强制安装？输入 y 继续 [y/N]: ");
-    let _ = std::io::stdout().flush();
+    let mut stderr = std::io::stderr();
+    let _ = write!(stderr, "确认强制安装？输入 y 继续 [y/N]: ");
+    let _ = stderr.flush();
     let mut answer = String::new();
     std::io::stdin()
         .lock()
@@ -960,23 +1038,23 @@ pub async fn run(home: &Path, request: &ForceRequest) -> i32 {
     let target = match acquired {
         Ok(target) => target,
         Err(e) => {
-            eprintln!("[ERROR] {e}");
+            errln!("[ERROR] {e}");
             if variant == VARIANT_DESKTOP && cfg!(target_os = "linux") {
-                eprintln!(
+                errln!(
                     "带桌面界面的版本需要 WebKitGTK 等系统库；本机缺这些库时，加 --variant headless 改装无界面版本。"
                 );
             }
             if matches!(request.source, ForceSource::Online(_)) {
-                eprintln!(
+                errln!(
                     "连不上 GitHub 时可加 --download-proxy <URL>，或手动下载二进制后用 --from <文件> 安装。"
                 );
             }
-            eprintln!("什么都没有改动（退出码 {EXIT_UNCHANGED}）。");
+            errln!("什么都没有改动（退出码 {EXIT_UNCHANGED}）。");
             discard_work();
             return EXIT_UNCHANGED;
         }
     };
-    println!(
+    outln!(
         "目标：aproxy v{}（{}；{}{}），来自{}",
         target.line.version,
         target.line.variant.as_deref().unwrap_or("未知变体"),
@@ -997,32 +1075,32 @@ pub async fn run(home: &Path, request: &ForceRequest) -> i32 {
         .filter(|e| e.pid != me && ledger::is_alive(e))
         .collect();
     if live.is_empty() {
-        println!(
+        outln!(
             "台账里没有正在运行的 aproxy 进程（home：{}）。",
             home.display()
         );
     } else {
-        println!(
+        outln!(
             "将结束这个 home（{}）下台账里的全部 aproxy 进程：",
             home.display()
         );
         for entry in &live {
-            println!("  {}", describe(entry));
+            outln!("  {}", describe(entry));
         }
     }
-    println!(
+    outln!(
         "这会立即中断经这些实例转发的全部在途请求——如果你（或正在执行本命令的 agent 会话）正经 aproxy 访问模型，这次请求也会断开。换好二进制之后会用新版本按原参数恢复实例。"
     );
     if !request.yes {
         match confirm() {
             Ok(true) => {}
             Ok(false) => {
-                println!("已取消，什么都没有改动（退出码 {EXIT_UNCHANGED}）。");
+                outln!("已取消，什么都没有改动（退出码 {EXIT_UNCHANGED}）。");
                 discard_work();
                 return EXIT_UNCHANGED;
             }
             Err(e) => {
-                eprintln!("[ERROR] {e}");
+                errln!("[ERROR] {e}");
                 discard_work();
                 return EXIT_UNCHANGED;
             }
@@ -1063,8 +1141,8 @@ async fn acquire_from_github(
         prefer_v3: super::download::prefers_x86_64_v3(),
     };
     match &spec.version {
-        Some(v) => println!("从 GitHub 取 v{v} 的发布清单……"),
-        None => println!(
+        Some(v) => outln!("从 GitHub 取 v{v} 的发布清单……"),
+        None => outln!(
             "查询 {} 通道最新的、带发布清单的版本……",
             spec.channel.label()
         ),
@@ -1077,22 +1155,20 @@ async fn acquire_from_github(
 fn replace(home: &Path, target: &Acquired, work: &Path) -> i32 {
     let mut stopped = Vec::new();
     let fail_stopped = |stopped: &[LedgerEntry], e: &str| {
-        eprintln!("[ERROR] {e}");
+        errln!("[ERROR] {e}");
         if stopped.is_empty() {
-            eprintln!("bin 里的二进制没有换（退出码 {EXIT_STOPPED}）。");
+            errln!("bin 里的二进制没有换（退出码 {EXIT_STOPPED}）。");
         } else {
-            eprintln!(
-                "已经结束了上面列出的进程，但 bin 里的二进制没有换（退出码 {EXIT_STOPPED}）。"
-            );
+            errln!("已经结束了上面列出的进程，但 bin 里的二进制没有换（退出码 {EXIT_STOPPED}）。");
         }
-        eprintln!(
+        errln!(
             "排除原因后再执行一次同一条命令即可（每一步都可重入）。暂时不再重试的话，`aproxy restore` 会用原来的二进制把被结束的实例拉回来。"
         );
         EXIT_STOPPED
     };
 
     // ---- 第 3 步：先结束安装者（它们可能持有安装锁、正在改 bin/），再拿锁，再结束其余
-    println!("结束 aproxy 进程……");
+    outln!("结束 aproxy 进程……");
     if let Err(e) = stop_by_ledger(home, true, &mut stopped) {
         return fail_stopped(&stopped, &e);
     }
@@ -1114,49 +1190,49 @@ fn replace(home: &Path, target: &Acquired, work: &Path) -> i32 {
         Ok(outcome) => outcome,
         Err(e) => return fail_stopped(&stopped, &format!("二进制交换失败: {e}")),
     };
-    println!(
+    outln!(
         "二进制已换好：{}（v{}）",
         swap::bin_path_in(home).display(),
         target.line.version
     );
     if let Some(old) = &outcome.old_path {
-        println!("  原来的二进制让位到 {}（下次安装时清理）", old.display());
+        outln!("  原来的二进制让位到 {}（下次安装时清理）", old.display());
     }
 
     // ---- 第 6 步
-    let missing = restore_and_check(home, &stopped);
+    let missing = restore_and_check(home, work, &stopped);
 
     // ---- 第 7 步
     report_strays(home);
     drop(lock);
 
     if stopped.iter().any(|e| e.role == ROLE_WATCHDOG) {
-        println!(
+        outln!(
             "看护者已被结束：实例在 5 分钟内的自检里会用新版本把它拉起来，下次 aproxy start 也会。"
         );
     }
     if stopped.iter().any(|e| e.role == ROLE_DESKTOP) {
-        println!("桌面界面已被结束，需要时重新打开。");
+        outln!("桌面界面已被结束，需要时重新打开。");
     }
-    println!(
+    outln!(
         "skill 文档没有更新（强制安装不碰它们）：之后执行 `aproxy install --skills-only` 更新到与新版本一致。"
     );
     if missing.is_empty() {
-        println!("强制安装完成（退出码 {EXIT_DONE}）。");
+        outln!("强制安装完成（退出码 {EXIT_DONE}）。");
         return EXIT_DONE;
     }
-    eprintln!(
+    errln!(
         "[ERROR] 二进制已换好，但下面这些被结束的实例没有回来（退出码 {EXIT_NOT_RESTORED}），请手动启动（aproxy start <别名|配置文件路径>）："
     );
     for entry in &missing {
         match (entry.port, &entry.label) {
-            (Some(port), Some(label)) => eprintln!("  端口 {port}（{label}）"),
-            (Some(port), None) => eprintln!("  端口 {port}"),
-            (None, Some(label)) => eprintln!("  {label}（pid {}）", entry.pid),
-            (None, None) => eprintln!("  pid {}", entry.pid),
+            (Some(port), Some(label)) => errln!("  端口 {port}（{label}）"),
+            (Some(port), None) => errln!("  端口 {port}"),
+            (None, Some(label)) => errln!("  {label}（pid {}）", entry.pid),
+            (None, None) => errln!("  pid {}", entry.pid),
         }
     }
-    eprintln!(
+    errln!(
         "没回来的原因多半记在 {} 里。",
         home.join("logs").join("startup.log").display()
     );

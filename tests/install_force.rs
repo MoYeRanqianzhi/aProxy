@@ -345,6 +345,11 @@ fn force_install_stops_everything_swaps_and_restores() {
         })
         .expect("实例应已由 restore 拉回");
     assert_ne!(back.pid, instance.pid);
+    // restore 的输出经文件转写到强制安装自己的输出里
+    assert!(
+        output.contains(&format!("已恢复 pid {}", back.pid)),
+        "{output}"
+    );
     let image = aproxy::watchdog::process_image_path(back.pid).expect("新实例的镜像路径可查");
     assert_eq!(
         std::fs::canonicalize(image).unwrap(),
@@ -639,7 +644,75 @@ fn a_held_retired_binary_does_not_block_the_next_force_install() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. 在线取目标（本地假 GitHub）：latest 只认带发布清单的主线版本；资产按清单选、
+// 7. 输出接到读端已经关闭的管道（`| head` 读够就走、调用方先退出）：写失败一律忽略，
+//    退出码照样按实际发生的事给（永久兼容契约 C7）。第 1 步失败仍是 10、不留目录；
+//    完整的一次仍是 0——restore 的输出经文件转写，它自己不会因写失败死在半路，实例照样
+//    回来。要两个实例：restore 拉起第一个之后才第一次输出，只有一个实例的话，它就算
+//    死在那次输出上，实例也已经回来了，测不出差别
+// ---------------------------------------------------------------------------
+#[test]
+fn a_closed_output_pipe_does_not_change_the_exit_code() {
+    let home = TestHome::new();
+    home.settings(r#"{"watchdog": false}"#);
+    home.seed_bin();
+    let ports = [free_port(), free_port()];
+    let instances = [
+        home.start_instance("first", ports[0]),
+        home.start_instance("second", ports[1]),
+    ];
+    let next = home.next_binary();
+    let exe = Path::new(env!("CARGO_BIN_EXE_aproxy"));
+    // 标准输出与标准错误都接到读端先关掉的管道：子进程的第一次写就失败
+    let run = |args: &[&str]| {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        home.command(exe, args)
+            .stdout(writer.try_clone().unwrap())
+            .stderr(writer)
+            .status()
+            .unwrap()
+            .code()
+    };
+
+    let missing = home.path().join("no-such-binary");
+    let missing = missing.to_str().unwrap();
+    assert_eq!(
+        run(&["install", "--force", "--from", missing, "--yes"]),
+        Some(force::EXIT_UNCHANGED)
+    );
+    assert!(
+        !aproxy::install::install_dir_in(home.path()).exists(),
+        "退出码 10 不留目录: {:?}",
+        home.install_dir_names()
+    );
+    for instance in &instances {
+        assert!(ledger::is_alive(instance), "退出码 10 不结束任何进程");
+    }
+
+    assert_eq!(
+        run(&[
+            "install",
+            "--force",
+            "--from",
+            next.to_str().unwrap(),
+            "--yes"
+        ]),
+        Some(force::EXIT_DONE)
+    );
+    for (instance, port) in instances.iter().zip(ports) {
+        assert!(!ledger::is_alive(instance));
+        let back = home
+            .wait_for(Duration::from_secs(5), |e| {
+                e.role == ledger::ROLE_INSTANCE && e.port == Some(port)
+            })
+            .unwrap_or_else(|| panic!("端口 {port} 的实例应已由 restore 拉回"));
+        assert_ne!(back.pid, instance.pid);
+    }
+    assert_eq!(home.install_dir_names(), vec!["lock"]);
+}
+
+// ---------------------------------------------------------------------------
+// 8. 在线取目标（本地假 GitHub）：latest 只认带发布清单的主线版本；资产按清单选、
 //    sha256 比对；linux-gnu 产物跑不起来改用 musl；各种不符都拒绝
 // ---------------------------------------------------------------------------
 

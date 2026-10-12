@@ -464,6 +464,18 @@ pub(crate) fn init_daemon_logging(log_path: &std::path::Path) {
     }
 }
 
+/// 强制安装的日志：与前台命令一样走 stdout，但写失败一律忽略——永久兼容契约 C7：写输出
+/// 失败不得改变退出码。`tracing_subscriber::fmt()` 默认在写失败时改用 `eprintln!` 报告，
+/// 标准错误也断了的话 `eprintln!` 会 panic（退出码 101）。
+pub(crate) fn init_force_logging() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .log_internal_errors(false)
+        .init();
+}
+
 /// 前台实例的日志初始化：stdout + 标记「本进程无日志文件」（OnceLock 落
 /// None，serve_forever 据此在注册表/恢复记录里写空串 log_path）。
 pub(crate) fn init_foreground_logging() {

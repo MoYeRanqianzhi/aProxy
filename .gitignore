@@ -33,9 +33,11 @@ desktop.ini
 /npm/@meowo/
 /.npm-assets/
 
-# 桌面界面前端（desktop/）的依赖与构建产物
-/desktop/node_modules/
-/desktop/dist/
+# 桌面界面（aproxy-desktop/）：前端（ui/）的依赖、Vite 的构建产物（dist/，嵌进二进制、随 crate
+# 发布，但不进 git），以及 tauri-build 每次构建都会在包根重写的 ACL schema（gen/）
+/aproxy-desktop/ui/node_modules/
+/aproxy-desktop/dist/
+/aproxy-desktop/gen/
 
 # Playwright MCP 浏览器工具在仓库根目录留下的页面快照与控制台日志
 /.playwright-mcp/

@@ -28,7 +28,9 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   「跟随系统」读不到深浅色（要开 tauri 的 dbus 特性、CI 装 libdbus-1-dev，W5）；界面偏好（含 Mica 开关）只在内存里，
   重启恢复默认（随 W2 的 settings 与 W5 持久化）
 - [ ] **alpha.1 第 4 步：发布流水线**（release.yml 与 release-format.yml 在默认带界面后会坏：没有前端产物、没有 WebKitGTK、
-  musl 与交叉编译要 `--no-default-features`；aproxy-desktop 首发 crates.io 要所有者种子发布）
+  musl 与交叉编译要 `--no-default-features`；aproxy-desktop 首发 crates.io 要所有者种子发布）。2026-10-12 提交
+  f1f463d、7a8882a…62223c6；剩推送后的 workflow_dispatch 演练与所有者的种子发布，交接记录见
+  [release-pipeline-step4](plan/release-pipeline-step4.md)
 - [ ] **W2 设计稿**（`.agents/plan/w2-contracts.md`，2026-10-12 第二版改完：D-16、请求体整份保留、`mode` 改名；第二轮复审中，
   通过后提交）
 - [ ] **W3 i18n**（给用户看的 en/zh-CN，给 agent 或不可见的固定英文）

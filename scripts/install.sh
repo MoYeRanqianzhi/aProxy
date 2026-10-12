@@ -428,8 +428,15 @@ main() {
             echo "安装失败: 下载的二进制（$ASSET）在本机无法运行（--version 自检未通过）。未做任何落位。" >&2
             # 暂存文件随后会被 EXIT trap 删除：趁它还在，把系统给出的原因打出来
             "$STAGED" --version </dev/null 2>&1 | head -n 5 >&2 || true
+            # 走到这里的 desktop 都是用户写明的（没写明的上面已改装 headless）；写明时不按 glibc
+            # 拦（见变体选择），所以 glibc 太旧也会落到这里，那时只提 WebKitGTK 会误导
             if [ "$VARIANT" = desktop ] && [ "$OS" = Linux ]; then
-                echo "带桌面界面的版本需要 WebKitGTK 2.40 或更新（Debian / Ubuntu：libwebkit2gtk-4.1-0）；不需要窗口就改装无界面版本：--variant headless" >&2
+                glibc_now=$(glibc_version)
+                if [ -n "$glibc_now" ] && version_lt "$glibc_now" "$DESKTOP_MIN_GLIBC"; then
+                    echo "本机 glibc $glibc_now 太旧：带桌面界面的版本要 glibc $DESKTOP_MIN_GLIBC 或更新，还要 WebKitGTK 2.40 或更新；不需要窗口就改装无界面版本：--variant headless" >&2
+                else
+                    echo "带桌面界面的版本需要 WebKitGTK 2.40 或更新（Debian / Ubuntu：libwebkit2gtk-4.1-0）；不需要窗口就改装无界面版本：--variant headless" >&2
+                fi
             fi
             exit 1
         fi

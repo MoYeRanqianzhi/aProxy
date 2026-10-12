@@ -181,6 +181,34 @@ mod tests {
         );
     }
 
+    /// 随发布出去的每个 skill（仓库的 `.claude/skills/*/SKILL.md`），description 都不超过
+    /// 1024 个字符：这是 Agent Skills 规范与 skill-creator 校验的上限，按上限校验的客户端
+    /// 会拒收或截断，整份 skill 可能加载失败。description 只写成单行（`description: …`）。
+    #[test]
+    fn shipped_skill_descriptions_fit_the_1024_character_limit() {
+        let skills = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".claude")
+            .join("skills");
+        let mut checked = 0;
+        for dir in std::fs::read_dir(&skills).unwrap().flatten() {
+            let doc_path = dir.path().join("SKILL.md");
+            let doc = std::fs::read_to_string(&doc_path).unwrap();
+            let description = doc
+                .lines()
+                .find_map(|line| line.strip_prefix("description:"))
+                .unwrap_or_else(|| panic!("{} 没有单行的 description", doc_path.display()))
+                .trim();
+            let chars = description.chars().count();
+            assert!(
+                chars <= 1024,
+                "{} 的 description 有 {chars} 个字符，超过 1024",
+                doc_path.display()
+            );
+            checked += 1;
+        }
+        assert!(checked >= 2, "应至少检查 aproxy-cli 与 aproxy-format");
+    }
+
     #[test]
     fn install_skill_dir_consumes_zip_top_prefix() {
         // 真实发布 zip 的形态：条目自带 aproxy-cli/ 顶层前缀（alpha.9

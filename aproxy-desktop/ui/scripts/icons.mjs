@@ -6,7 +6,7 @@
  * 图标就是吉祥物预览页里的「软件图标」：吉祥物的 icon({ px, mood: null }) 拼上一种底（src/lib/mascot/app-icon.ts），
  * 颜色取浅色主题、标准配色强度下的令牌（src/app.css 与 src/lib/mascot/palette-sources.ts）。换形象、换底、改配色
  * 之后重跑即可，生成的文件随仓库提交：
- *   npm run icons                                        默认：不倒翁 + 无底贴纸
+ *   npm run icons                                        默认就是定下的软件图标：不倒翁 + 无底贴纸
  *   npm run icons -- --mascot courier --plate squircle   形象：tumbler | courier | orb；底：squircle | circle | sticker
  *
  * 每个尺寸单独渲染（吉祥物按像素尺寸挑细节档位，不是把大图缩小）。栅格化用 resvg：贴纸的白色裁切边是 SVG 滤镜。

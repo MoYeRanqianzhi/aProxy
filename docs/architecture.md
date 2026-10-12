@@ -397,7 +397,7 @@ settings 注入、validate）干跑一遍，换监听地址时再探测新地址
 - 孤儿清理：`status` 时删除「活实例上报的 log_path ∪ `.restore` 记录的
   log_path」之外的 `*.log`（startup.log 除外，非 .log 文件不动）——不再按
   文件名端口归属判定。推论：优雅停止实例的日志在下次清理时删除；崩溃实例的
-  日志由 `.restore` 引用保留到恢复成功；旧版按端口命名的日志升级后视为孤儿
+  日志由 `.restore` 引用保留到恢复成功
 - 全部输出对凭据打码——可安全粘贴分享。URL 展示的**唯一出口**是
   `config::mask_base_url`（名称沿用最早只用于 base_url 的叫法，现在 base_url、
   代理 URL、上游目标 URL、请求的 `路径?查询串`、reqwest 错误里的 URL 一律走它）：
@@ -599,7 +599,9 @@ tauri-build 每次构建都在包根写 `gen/schemas/`，包里没有这些文�
   带界面（desktop，先用 Node 构建前端，ubuntu 另装 `libwebkit2gtk-4.1-dev`）与 headless
   （`--no-default-features --exclude aproxy-desktop`）两种变体各跑一遍，每种都对构建出的
   aproxy 跑 `--version` 冒烟（`.github/scripts/version-smoke.sh`，按 C5 核对版本、变体与
-  目标三元组）；headless 另断言依赖树里没有任何界面 crate。macos-build 只要求两种变体都
+  目标三元组）；headless 另断言依赖树里没有任何界面 crate。`upgrade-from-0-1-0` 任务下载
+  真实的 v0.1.0 二进制（windows 与 ubuntu），断言它的 `install --from` 装当前构建时在改动任何
+  东西之前失败（`tests/upgrade_from_0_1_0.rs`，平时 `#[ignore]`，只在 CI 跑）。macos-build 只要求两种变体都
   编得过。macOS 测试是独立 job，**已知红**（`/dev/shm`、`/proc` 依赖，见「平台」）：不设
   skip 也不设 `continue-on-error`，红色就是「未完成」的如实信号，独立成 job 后不淹没其他
   平台的结论

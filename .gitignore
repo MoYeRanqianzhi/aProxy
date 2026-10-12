@@ -33,6 +33,13 @@ desktop.ini
 /npm/@meowo/
 /.npm-assets/
 
+# 桌面界面前端（desktop/）的依赖与构建产物
+/desktop/node_modules/
+/desktop/dist/
+
+# Playwright MCP 浏览器工具在仓库根目录留下的页面快照与控制台日志
+/.playwright-mcp/
+
 # Claude Code's per-user settings (permission allowlists and the like) are
 # machine-specific; the skills under .claude/skills/ are shared and stay tracked.
 /.claude/settings.local.json

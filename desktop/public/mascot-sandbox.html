@@ -1,0 +1,16 @@
+<!doctype html>
+<!--
+  自定义吉祥物的沙箱页。由 MascotFrame 以 <iframe sandbox="allow-scripts"> 加载（没有 allow-same-origin），
+  所以这一页的源是不透明的：碰不到界面的 DOM、存储与 IPC。别人写的吉祥物代码只在这里运行，
+  它画错、抛异常或者卡死，坏的只是这一块——隔离是为了稳定。协议见 mascot-sandbox.js。
+  放在 public/ 下原样输出，不经构建：它只需要一个经典脚本，不能引入界面的任何代码。
+-->
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>mascot sandbox</title>
+  </head>
+  <body>
+    <script src="mascot-sandbox.js"></script>
+  </body>
+</html>

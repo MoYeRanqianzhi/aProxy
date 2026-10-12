@@ -1,0 +1,647 @@
+/*
+ * aProxy 桌面界面的全局令牌与基础样式。
+ *
+ * 设计语言「柔和可爱、高对比」：饱和而不刺眼的色块 + 柔和的扩散阴影 + 1px 浅色细边 + 大圆角。
+ * 层次靠填充色、阴影与间距区分，不靠粗描边；对比度靠深墨色正文与关键色块保证。
+ * 小色块（状态点、时间线节点等）若需要轮廓，用它自身颜色的深色调，不用墨色。
+ * 颜色、圆角、字体、阴影、动效强度都是令牌：主题字符串（lib/theme.ts）只改这些变量，不必知道组件结构。
+ * 颜色只承担语义，不做装饰：
+ *   薄荷 mint   = 成功、健康、活跃
+ *   天蓝 sky    = 正在重试（雨天打伞：上游在下雨，aProxy 撑着伞等它停）
+ *   珊瑚 coral  = 失败、危险操作、无响应
+ *   奶黄 butter = 提醒：仅转发（不重试）、需重启、校验警告
+ *   丁香 lilac  = 品牌、选中、主要按钮
+ *   粉 pink     = 吉祥物腮红、固定/收藏
+ *
+ * 状态都落在 <html> 的 data-* 上，组件只读令牌，切换时不需要任何组件重新计算样式。
+ * 这些属性也是给主题与扩展的稳定挂钩，它们不必依赖内部 DOM 结构：
+ *   data-variant  light | dark：当前的浅色/深色变体（每个主题都有这两个变体）
+ *   data-theme    aproxy | custom：内置主题，还是导入的主题
+ *   data-mood     idle | working | retrying | rescued | worried | sleeping：整体状态，也就是吉祥物的心情
+ *   data-palette  soft | standard | vivid：配色强度
+ *   data-motion   full | reduced：减少动效
+ *   data-mica     on | off：窗口是否透出 Mica 材质
+ */
+
+/* ---------- 字体：只打包拉丁子集，中文回退到系统字体 ---------- */
+/* 直接引用 fontsource 的单个子集文件，而不是导入它的 css：
+   官方 css 会把 hebrew、latin-ext 等子集一并带进产物，而产物最终要嵌进 aproxy 二进制。 */
+@font-face {
+  font-family: 'Fredoka';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 300 700;
+  src: url('@fontsource-variable/fredoka/files/fredoka-latin-wght-normal.woff2') format('woff2-variations');
+}
+@font-face {
+  font-family: 'Maple Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url('@fontsource/maple-mono/files/maple-mono-latin-400-normal.woff2') format('woff2');
+}
+
+:root {
+  /* 配色强度：审核工具条的三套预设只改这一个系数，所有彩色的色度按它缩放 */
+  --vivid: 1;
+
+  --font-ui: 'Fredoka', 'Microsoft YaHei UI', 'PingFang SC', 'Noto Sans CJK SC', 'Noto Sans SC', system-ui, sans-serif;
+  --font-mono: 'Maple Mono', ui-monospace, 'Cascadia Mono', Consolas, 'Microsoft YaHei UI', 'PingFang SC', monospace;
+
+  /* 字号：桌面应用以 14px 为正文，层级比约 1.2 */
+  --fs-xs: 11.5px;
+  --fs-sm: 12.5px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+  --fs-2xl: 26px;
+  --fs-3xl: 34px;
+
+  /* 圆角按层级递增：越外层越圆，避免「所有东西一个圆角」的模板感。
+     --radius 是主题给的倍数（0 直角 – 1.5）；胶囊是按钮与标签的身份，不随它变 */
+  --radius: 1;
+  --r-xs: calc(7px * var(--radius));
+  --r-sm: calc(11px * var(--radius));
+  --r-md: calc(16px * var(--radius));
+  --r-lg: calc(22px * var(--radius));
+  --r-xl: calc(28px * var(--radius));
+  --r-pill: 999px;
+
+  /* 描边只有 1px：分层交给阴影与填充，细边只负责在浅底上勾出边界 */
+  --line-w: 1px;
+  --line-w-thin: 1px;
+  /* 动效强度：位移与回弹幅度的倍数，由主题给出（0 – 1.5）。
+     它只改「动多远、弹多少」，不改快慢；JS 里的过渡（lib/motion.ts）也读这个变量 */
+  --motion: 1;
+  /* 悬停上浮的距离：配合阴影加深，表示「可以点」 */
+  --lift: calc(-2px * var(--motion));
+
+  /* 动效曲线：spring 有约 6% 的轻微回弹（随动效强度增减）；soft 用于淡入淡出与颜色变化 */
+  --ease-spring: cubic-bezier(0.34, calc(1 + 0.4 * var(--motion)), 0.64, 1);
+  --ease-soft: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-squish: cubic-bezier(0.5, calc(1 + 0.8 * var(--motion)), 0.4, 0.8);
+  --dur-fast: 140ms;
+  --dur-mid: 280ms;
+  --dur-slow: 480ms;
+
+  /* 日志行高：统一行高是将来虚拟滚动的前提，任何行内容都不得撑高它 */
+  --row-h: 40px;
+
+  --nav-w: 212px;
+}
+
+/* ---------- 浅色主题（默认） ---------- */
+:root,
+:root[data-variant='light'] {
+  color-scheme: light;
+
+  --paper: oklch(0.965 0.016 295);          /* 窗口底色：标题栏与导航（淡丁香奶色） */
+  --sheet: oklch(0.988 0.007 295);          /* 内容区纸面 */
+  --card: oklch(1 0 0);                     /* 卡片、输入框 */
+  --card-2: oklch(0.975 0.01 295);          /* 卡片内的次级面（代码块、表头） */
+  --hover: oklch(0.93 0.02 295);            /* 列表项悬停 */
+
+  --text: oklch(0.27 0.07 285);             /* 墨紫：正文 */
+  --text-2: oklch(0.44 0.05 285);
+  --text-3: oklch(0.53 0.045 285);          /* 在最深的底色（paper）上也保持 ≥ 4.5:1 */
+  --line: oklch(0.885 0.02 290);            /* 卡片、面板、浮层的 1px 浅色细边 */
+  --line-soft: oklch(0.91 0.016 290);       /* 分隔线、表格行线 */
+  /* 输入框、开关这类控件的边界要让人认出「这里能填/能拨」：对白底 ≥ 3:1（WCAG 1.4.11） */
+  --line-strong: oklch(0.66 0.035 290);
+  /* 虚线占位框（已停止的实例、「暂无」空位）：1px 虚线断开后会显得更淡，所以比细边深一档，
+     但仍明显浅于控件边界——它表示「这里空着」，不该像一个能点的控件 */
+  --line-dash: oklch(0.78 0.03 290);
+  --on-fill: oklch(0.25 0.07 285);          /* 粉彩填充上的文字：一律墨紫，深浅主题都一样 */
+
+  /* 柔和阴影：两层叠加（贴近的一层勾出边缘、扩散的一层给出高度），略带丁香色相，
+     比纯黑阴影更干净。1 = 按钮与小控件，2 = 卡片，2-hover = 卡片悬停，3 = 浮层 */
+  --shadow-1: 0 1px 2px oklch(0.35 0.06 290 / 0.08), 0 2px 8px -2px oklch(0.35 0.06 290 / 0.12);
+  --shadow-2: 0 1px 2px oklch(0.35 0.06 290 / 0.06), 0 8px 24px -6px oklch(0.4 0.08 290 / 0.16);
+  --shadow-2-hover: 0 2px 4px oklch(0.35 0.06 290 / 0.08), 0 14px 32px -8px oklch(0.4 0.08 290 / 0.24);
+  --shadow-3: 0 4px 12px oklch(0.3 0.06 290 / 0.1), 0 24px 60px -12px oklch(0.3 0.08 290 / 0.3);
+
+  /* 关键色块比之前略提饱和：去掉描边后靠色块本身撑住对比，不能发灰 */
+  --lilac: oklch(0.78 calc(0.13 * var(--vivid)) 295);
+  --mint: oklch(0.85 calc(0.14 * var(--vivid)) 165);
+  --sky: oklch(0.83 calc(0.12 * var(--vivid)) 232);
+  --coral: oklch(0.76 calc(0.15 * var(--vivid)) 25);
+  --butter: oklch(0.9 calc(0.15 * var(--vivid)) 95);
+  --pink: oklch(0.85 calc(0.11 * var(--vivid)) 355);
+
+  --lilac-soft: oklch(0.95 calc(0.04 * var(--vivid)) 295);
+  --mint-soft: oklch(0.95 calc(0.055 * var(--vivid)) 165);
+  --sky-soft: oklch(0.95 calc(0.04 * var(--vivid)) 232);
+  --coral-soft: oklch(0.95 calc(0.04 * var(--vivid)) 25);
+  --butter-soft: oklch(0.97 calc(0.06 * var(--vivid)) 95);
+  --pink-soft: oklch(0.96 calc(0.035 * var(--vivid)) 355);
+
+  /* deep：在 soft 底或纸面上当文字用的同色相深色，对比度 ≥ 4.5:1 */
+  --lilac-deep: oklch(0.47 calc(0.14 * var(--vivid)) 295);
+  --mint-deep: oklch(0.47 calc(0.1 * var(--vivid)) 165);
+  --sky-deep: oklch(0.47 calc(0.11 * var(--vivid)) 240);
+  --coral-deep: oklch(0.52 calc(0.15 * var(--vivid)) 25);
+  --butter-deep: oklch(0.5 calc(0.09 * var(--vivid)) 75);
+  --pink-deep: oklch(0.52 calc(0.14 * var(--vivid)) 355);
+
+  /* 图表专用的两色：经 dataviz 校验脚本核过亮度带、色度与色盲区分度，
+     不随配色强度缩放——图表的可读性不该因为调了「鲜艳程度」而变差 */
+  --chart-req: oklch(0.5 0.15 295);
+  --chart-retry: oklch(0.68 0.13 215);
+
+  --mascot-body: oklch(0.995 0.004 95);
+  --focus: oklch(0.55 calc(0.17 * var(--vivid)) 295);
+  --scrim: oklch(0.27 0.07 285 / 0.28);
+
+  /* 原型外框里仿 Windows 11 标题栏按钮的颜色（DWM 会按标题栏底色自动选深浅，这里照着模拟） */
+  --caption-fg: oklch(0.25 0.02 285);
+  --caption-hover: oklch(0 0 0 / 0.06);
+}
+
+/* ---------- 深色主题：从同一组色相取另一套台阶，而不是机械反色 ---------- */
+:root[data-variant='dark'] {
+  color-scheme: dark;
+
+  --paper: oklch(0.19 0.032 285);
+  --sheet: oklch(0.225 0.036 285);
+  --card: oklch(0.265 0.04 285);
+  --card-2: oklch(0.24 0.038 285);
+  --hover: oklch(0.31 0.045 285);
+
+  --text: oklch(0.96 0.012 290);
+  --text-2: oklch(0.83 0.03 290);
+  --text-3: oklch(0.72 0.035 290);
+  /* 深色下的细边比卡片亮一档即可；阴影在暗底上几乎看不见，靠这条边和面色差分层 */
+  --line: oklch(0.36 0.04 286);
+  --line-soft: oklch(0.31 0.035 285);
+  --line-strong: oklch(0.56 0.04 288);      /* 对卡片 ≥ 3:1 */
+  --line-dash: oklch(0.46 0.04 287);
+  --on-fill: oklch(0.22 0.06 285);
+
+  --shadow-1: 0 1px 2px oklch(0 0 0 / 0.35), 0 2px 8px -2px oklch(0 0 0 / 0.3);
+  --shadow-2: 0 1px 2px oklch(0 0 0 / 0.3), 0 8px 24px -6px oklch(0 0 0 / 0.45);
+  --shadow-2-hover: 0 2px 4px oklch(0 0 0 / 0.35), 0 14px 32px -8px oklch(0 0 0 / 0.55);
+  --shadow-3: 0 4px 12px oklch(0 0 0 / 0.35), 0 24px 60px -12px oklch(0 0 0 / 0.6);
+
+  --lilac: oklch(0.75 calc(0.12 * var(--vivid)) 295);
+  --mint: oklch(0.79 calc(0.12 * var(--vivid)) 165);
+  --sky: oklch(0.78 calc(0.105 * var(--vivid)) 232);
+  --coral: oklch(0.73 calc(0.13 * var(--vivid)) 25);
+  --butter: oklch(0.86 calc(0.125 * var(--vivid)) 95);
+  --pink: oklch(0.8 calc(0.095 * var(--vivid)) 355);
+
+  --lilac-soft: oklch(0.32 calc(0.06 * var(--vivid)) 295);
+  --mint-soft: oklch(0.31 calc(0.05 * var(--vivid)) 165);
+  --sky-soft: oklch(0.31 calc(0.05 * var(--vivid)) 240);
+  --coral-soft: oklch(0.31 calc(0.055 * var(--vivid)) 25);
+  --butter-soft: oklch(0.32 calc(0.05 * var(--vivid)) 85);
+  --pink-soft: oklch(0.31 calc(0.05 * var(--vivid)) 355);
+
+  --lilac-deep: oklch(0.84 calc(0.09 * var(--vivid)) 295);
+  --mint-deep: oklch(0.86 calc(0.1 * var(--vivid)) 165);
+  --sky-deep: oklch(0.85 calc(0.08 * var(--vivid)) 232);
+  --coral-deep: oklch(0.83 calc(0.09 * var(--vivid)) 25);
+  --butter-deep: oklch(0.88 calc(0.1 * var(--vivid)) 92);
+  --pink-deep: oklch(0.85 calc(0.08 * var(--vivid)) 355);
+
+  --chart-req: oklch(0.66 0.15 300);
+  --chart-retry: oklch(0.64 0.11 200);
+
+  --mascot-body: oklch(0.96 0.01 95);
+  --focus: oklch(0.8 calc(0.12 * var(--vivid)) 295);
+  --scrim: oklch(0.08 0.02 285 / 0.55);
+
+  --caption-fg: oklch(0.95 0.01 285);
+  --caption-hover: oklch(1 0 0 / 0.08);
+}
+
+/* ---------- 配色强度预设 ---------- */
+:root[data-palette='soft'] { --vivid: 0.7; }
+:root[data-palette='standard'] { --vivid: 1; }
+:root[data-palette='vivid'] { --vivid: 1.28; }
+
+/* ---------- 表面令牌：默认不透明；Mica 开启时换成半透明 ---------- */
+:root {
+  --chrome-bg: var(--paper);   /* 标题栏 + 导航 */
+  --sheet-bg: var(--sheet);    /* 内容区 */
+  --card-bg: var(--card);
+  --card-2-bg: var(--card-2);
+  --overlay-bg: var(--card);   /* 抽屉、弹窗、菜单：始终不透明，浮层上的文字要稳 */
+}
+/* Mica 的规则：页面留透明的像素透出材质，不透明的像素挡住它。
+   所以标题栏与导航裸露（transparent），内容区与卡片用半透明填充，
+   填充在本色上混入透明，保留「淡丁香」的品牌色调而不是变成系统灰。 */
+:root[data-mica='on'] {
+  --chrome-bg: transparent;
+  --sheet-bg: color-mix(in oklab, var(--sheet) 58%, transparent);
+  --card-bg: color-mix(in oklab, var(--card) 72%, transparent);
+  --card-2-bg: color-mix(in oklab, var(--card-2) 60%, transparent);
+}
+:root[data-mica='on'][data-variant='dark'] {
+  --sheet-bg: color-mix(in oklab, var(--sheet) 52%, transparent);
+  --card-bg: color-mix(in oklab, var(--card) 62%, transparent);
+  --card-2-bg: color-mix(in oklab, var(--card-2) 55%, transparent);
+}
+
+/* ---------- 基础 ---------- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+html {
+  background: var(--paper);
+}
+/* Mica 开启时根节点必须透明，材质才能透出来（原型里由 ProtoBackdrop 画壁纸模拟） */
+:root[data-mica='on'] {
+  background: transparent;
+}
+
+body {
+  font-family: var(--font-ui);
+  font-size: var(--fs-md);
+  font-weight: 450;
+  line-height: 1.45;
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-synthesis: none;
+}
+
+#app {
+  height: 100%;
+}
+
+/* 中文段落末尾常剩一个孤字，让浏览器挑更好的断行 */
+p {
+  text-wrap: pretty;
+}
+h1,
+h2,
+h3 {
+  text-wrap: balance;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+::selection {
+  background: var(--lilac);
+  color: var(--on-fill);
+}
+
+/* 键盘焦点：一圈与描边分开的丁香色环，深浅主题都清楚 */
+:focus-visible {
+  outline: 2.5px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  letter-spacing: -0.01em;
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* 圆胖的滚动条，滑块与底色留 3px 间隙 */
+::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: color-mix(in oklab, var(--text) 22%, transparent);
+  border-radius: var(--r-pill);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in oklab, var(--text) 38%, transparent);
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ---------- 标题栏拖动区 ---------- */
+/* 整条标题栏交给 Windows 处理拖动、双击最大化、右键系统菜单与 Aero Snap（WebView2 的非客户区支持），
+   其中可交互的子元素必须声明 no-drag，否则点不到。放在全局样式里是因为组件样式的 CSS 检查不认识
+   app-region；WebView2 两种写法都认，带前缀的那份给旧版内核兜底。 */
+.titlebar {
+  app-region: drag;
+  -webkit-app-region: drag;
+}
+.titlebar :is(button, input, a, [role='button']) {
+  app-region: no-drag;
+  -webkit-app-region: no-drag;
+}
+
+/* ---------- 按钮 ---------- */
+/* 白底按钮有一圈浅细边和贴身的小阴影；彩色按钮不要边，阴影染上自己的颜色，像色块微微浮起。
+   悬停上浮、阴影加深；按下时回落并轻轻一缩。 */
+.btn {
+  --btn-bg: var(--card-bg);
+  --btn-fg: var(--text);
+  --btn-border: var(--line);
+  --btn-shadow: var(--shadow-1);
+  --btn-shadow-hover: var(--shadow-2-hover);
+  --btn-h: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  height: var(--btn-h);
+  padding: 0 15px;
+  border-radius: var(--r-pill);
+  border: var(--line-w) solid var(--btn-border);
+  background: var(--btn-bg);
+  color: var(--btn-fg);
+  font-size: var(--fs-md);
+  font-weight: 550;
+  white-space: nowrap;
+  box-shadow: var(--btn-shadow);
+  transition:
+    transform var(--dur-mid) var(--ease-spring),
+    box-shadow var(--dur-mid) var(--ease-soft),
+    background-color var(--dur-fast) linear;
+}
+.btn:hover:not(:disabled) {
+  transform: translateY(calc(-1px * var(--motion)));
+  box-shadow: var(--btn-shadow-hover);
+}
+.btn:active:not(:disabled) {
+  transform: translateY(0) scale(0.97);
+  box-shadow: var(--btn-shadow);
+  transition-duration: 70ms;
+}
+.btn:disabled {
+  opacity: 0.5;
+  box-shadow: none;
+}
+.btn.sm {
+  --btn-h: 28px;
+  padding: 0 11px;
+  font-size: var(--fs-sm);
+  gap: 5px;
+}
+.btn.icon {
+  width: var(--btn-h);
+  padding: 0;
+}
+/* 彩色按钮：阴影取自身颜色，色块像是自己在发光，而不是压着一块灰影 */
+.btn.primary,
+.btn.mint,
+.btn.danger {
+  --btn-border: transparent;
+  --btn-fg: var(--on-fill);
+  --btn-shadow: 0 1px 2px color-mix(in oklab, var(--btn-bg) 40%, transparent),
+    0 4px 12px -4px color-mix(in oklab, var(--btn-bg) 85%, transparent);
+  --btn-shadow-hover: 0 2px 4px color-mix(in oklab, var(--btn-bg) 45%, transparent),
+    0 10px 22px -6px color-mix(in oklab, var(--btn-bg) 95%, transparent);
+}
+.btn.primary { --btn-bg: var(--lilac); }
+.btn.mint { --btn-bg: var(--mint); }
+.btn.danger { --btn-bg: var(--coral); }
+/* 幽灵按钮：没有边与阴影，用在工具栏等密集处，避免满屏都是浮起的按钮 */
+.btn.ghost {
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+.btn.ghost:hover:not(:disabled) {
+  background: var(--hover);
+  box-shadow: none;
+  transform: none;
+}
+.btn.ghost:active:not(:disabled) {
+  transform: scale(0.94);
+}
+
+/* ---------- 胶囊标签 ---------- */
+.chip {
+  --chip-bg: var(--card-2-bg);
+  --chip-fg: var(--text-2);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: var(--r-pill);
+  background: var(--chip-bg);
+  color: var(--chip-fg);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  white-space: nowrap;
+  line-height: 1;
+}
+.chip.outlined {
+  border: var(--line-w-thin) solid var(--line-strong);
+  color: var(--text);
+}
+.chip.lilac { --chip-bg: var(--lilac-soft); --chip-fg: var(--lilac-deep); }
+.chip.mint { --chip-bg: var(--mint-soft); --chip-fg: var(--mint-deep); }
+.chip.sky { --chip-bg: var(--sky-soft); --chip-fg: var(--sky-deep); }
+.chip.coral { --chip-bg: var(--coral-soft); --chip-fg: var(--coral-deep); }
+.chip.butter { --chip-bg: var(--butter-soft); --chip-fg: var(--butter-deep); }
+.chip.pink { --chip-bg: var(--pink-soft); --chip-fg: var(--pink-deep); }
+/* 实心标签：饱和色块 + 墨紫字，用在必须一眼看到的状态上；不描边，靠色块本身和一点贴身阴影 */
+.chip.solid {
+  color: var(--on-fill);
+  box-shadow: var(--shadow-1);
+}
+.chip.solid.lilac { background: var(--lilac); }
+.chip.solid.mint { background: var(--mint); }
+.chip.solid.sky { background: var(--sky); }
+.chip.solid.coral { background: var(--coral); }
+.chip.solid.butter { background: var(--butter); }
+
+/* 「仅转发 / 不重试」专用的警示胶带：奶黄与墨紫的斜条纹，任何主题下都醒目。
+   胶带是这里唯一保留墨色的图形——它本来就是「警示」，要的就是扎眼 */
+.hazard {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px 0 4px;
+  border-radius: var(--r-pill);
+  background: var(--butter);
+  color: var(--on-fill);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  white-space: nowrap;
+  box-shadow: 0 1px 2px color-mix(in oklab, var(--butter) 50%, transparent),
+    0 4px 12px -4px color-mix(in oklab, var(--butter-deep) 45%, transparent);
+}
+.hazard .tape {
+  width: 22px;
+  height: 18px;
+  border-radius: var(--r-pill);
+  background: repeating-linear-gradient(-45deg, var(--on-fill) 0 4px, var(--butter) 4px 8px);
+}
+
+.kbd {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: var(--r-xs);
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  background: var(--card-bg);
+  color: var(--text-2);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  line-height: 1;
+}
+
+/* ---------- 卡片 ---------- */
+/* 只有可点或重要的面才浮起（阴影）；被动的信息面板只有细边，贴在纸面上。结构即信息。 */
+.card {
+  background: var(--card-bg);
+  border: var(--line-w) solid var(--line);
+  border-radius: var(--r-md);
+}
+.card.raised {
+  box-shadow: var(--shadow-2);
+}
+.panel {
+  background: var(--card-bg);
+  border: var(--line-w-thin) solid var(--line);
+  border-radius: var(--r-md);
+}
+
+.section-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  color: var(--text);
+}
+.section-title .count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: var(--r-pill);
+  background: var(--lilac-soft);
+  color: var(--lilac-deep);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+
+/* ---------- 输入框 ---------- */
+.input {
+  height: 36px;
+  width: 100%;
+  padding: 0 14px;
+  border-radius: var(--r-pill);
+  border: var(--line-w) solid var(--line-strong);
+  background: var(--card-bg);
+  color: var(--text);
+  font-size: var(--fs-md);
+  outline: none;
+  transition:
+    box-shadow var(--dur-mid) var(--ease-spring),
+    border-color var(--dur-fast) linear;
+}
+.input::placeholder {
+  color: var(--text-3);
+}
+.input:focus {
+  border-color: var(--lilac-deep);
+  box-shadow: 0 0 0 3.5px color-mix(in oklab, var(--lilac) 55%, transparent);
+}
+.input.invalid {
+  border-color: var(--coral-deep);
+  box-shadow: 0 0 0 3.5px color-mix(in oklab, var(--coral) 45%, transparent);
+}
+
+/* ---------- 状态点：活跃时缓慢呼吸，表示「它活着」 ---------- */
+.dot {
+  --dot: var(--text-3);
+  position: relative;
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--dot);
+  /* 轮廓用点自己颜色的深色调：浅底上也认得出，又不会像墨线那样生硬 */
+  box-shadow: 0 0 0 1.5px color-mix(in oklab, var(--dot) 55%, var(--text));
+}
+.dot.mint { --dot: var(--mint); }
+.dot.sky { --dot: var(--sky); }
+.dot.coral { --dot: var(--coral); }
+.dot.butter { --dot: var(--butter); }
+.dot.gray { --dot: transparent; box-shadow: 0 0 0 1.5px var(--text-3); }
+.dot.breathe::after {
+  content: '';
+  position: absolute;
+  inset: -1.5px;
+  border-radius: 50%;
+  background: var(--dot);
+  /* 不播动画时（减少动效会把动画缩成 1ms 后回到这里的基础样式）光晕必须是隐形的，
+     否则它会以不透明的实心圆盖住状态点的描边 */
+  opacity: 0;
+  animation: breathe 2.4s var(--ease-soft) infinite;
+}
+@keyframes breathe {
+  0% { transform: scale(1); opacity: 0.75; }
+  70%, 100% { transform: scale(2.6); opacity: 0; }
+}
+
+/* ---------- 减少动效 ---------- */
+/* 系统偏好或审核工具条打开时，由 JS 在 <html> 上设置 data-motion="reduced"。
+   位移、缩放、循环动画一律取消，只保留短促的颜色与透明度过渡（淡入淡出）。 */
+:root[data-motion='reduced'] *,
+:root[data-motion='reduced'] *::before,
+:root[data-motion='reduced'] *::after {
+  animation-duration: 1ms !important;
+  animation-delay: 0ms !important;
+  animation-iteration-count: 1 !important;
+  transition-property: opacity, color, background-color, border-color, box-shadow !important;
+  transition-duration: 120ms !important;
+  transition-delay: 0ms !important;
+  scroll-behavior: auto !important;
+}
+:root[data-motion='reduced'] .btn:hover:not(:disabled),
+:root[data-motion='reduced'] .btn:active:not(:disabled) {
+  transform: none;
+}

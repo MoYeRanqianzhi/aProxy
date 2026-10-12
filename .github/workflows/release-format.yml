@@ -44,6 +44,9 @@ jobs:
     # 是 aproxy 包，不带它时 clippy 与测试只覆盖 aproxy，aproxy-format 与
     # aproxy-envelope 自己的测试一项都不跑（理由见 Cargo.toml [workspace] 注释）。
     # windows 与 ubuntu 都全绿才进入构建；macOS 已知红、支持未完成，不进门禁。
+    # 按无界面的 headless 变体验证（--exclude aproxy-desktop --no-default-features）：
+    # format 与桌面界面无关，带界面的变体要先构建前端、Linux 上还要 WebKitGTK 开发包，
+    # 它由 ci.yml 与主线 release.yml 的门禁负责；本线的构建只编 -p aproxy-format，碰不到它。
     name: test-format (${{ matrix.os }})
     strategy:
       fail-fast: false # 两个平台各自跑完，一次看到全部失败面
@@ -59,10 +62,10 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --exclude aproxy-desktop --no-default-features --all-targets --locked -- -D warnings
       # 不带目标过滤的 cargo test 会顺带编译 examples——transform_integration
       # 依赖已编译的 examples/format-echo
-      - run: cargo test --workspace --locked --no-fail-fast
+      - run: cargo test --workspace --exclude aproxy-desktop --no-default-features --locked --no-fail-fast
 
   build-format:
     needs: test-format

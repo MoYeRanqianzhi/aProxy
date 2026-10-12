@@ -24,7 +24,7 @@
 3. 换二进制：
    - 用一键脚本或 `aproxy install` 装的：删除 `~/.aproxy/bin/` 下的 `aproxy`（Windows 为 `aproxy.exe`，以及可能残留的 `aproxy.old.exe`），再重新运行一键安装脚本（已有二进制时脚本不覆盖）。Windows 上删不掉，是 0.1.0 的看门狗还在用这个文件，等它退出再删。
    - npm 装的：`npm i -g @meowo/aproxy@latest`（预发布用 `@next`）。
-   - cargo 装的：`cargo install aproxy --force`（预发布加 `--version <版本>`）。
+   - cargo 装的：`cargo install aproxy --locked --force`（预发布加 `--version <版本>`）。
 4. 清理 0.1.0 的残留：`~/.aproxy/run/install.state`（如果有）、`~/.aproxy/staging/`，以及 `~/.aproxy/run/*.restore`（第 2 步之前崩溃过的实例会留下，留着的话 `aproxy restore` 会按 0.1.0 记下的参数拉起它们）。
 5. 配置文件 `config.toml` 与 `settings.json` 沿用，按本节其余条目修改用到的旧写法（例如 `upstream_url` 须改名为 `base_url`），然后运行 `aproxy doctor` 检查。
 6. 用 0.2.0 逐个启动：`aproxy start <别名|配置路径>`。端口不变，agent 客户端的 base URL 不用改。
@@ -46,7 +46,7 @@
 ### 变更
 
 - **交换二进制改用唯一的中间名，并持有安装锁**：旧二进制让位为 `aproxy.old-<纳秒时间戳>-<pid>[.exe]`，新文件先落在 `aproxy.tmp-<纳秒时间戳>-<pid>[.exe]`，名字已存在就换一个。此前的固定名 `aproxy.old(.exe)` 在短时间内连续安装两次、上一次的旧文件还被占着时必然改名失败。删得掉的 `aproxy.old-*`、`aproxy.tmp-*` 残留在每次交换前清掉，删不掉的（仍被占用）跳过，不再挡住安装。修改 `bin/` 期间持有操作系统级排他锁 `<home>/install/lock`（进程退出即释放）。unix 上让位的旧二进制同样以 `aproxy.old-…` 保留到终验之后。Windows 的入口兜底脚本 `bin/aproxy.bat` 在 `aproxy.exe` 缺席时运行最新的 `aproxy.old-*.exe`，改由 `aproxy install` 在每次交换前写入，一键安装脚本不再写它。
-- 源码编译（`cargo install aproxy`）需要 rustc 1.90 或更新的版本（此前 1.88）：安装锁用到 1.89 起稳定的标准库文件锁，默认带上的桌面界面（Tauri 2）要 1.90。默认编带界面的版本，Linux 上要先装 WebKitGTK 4.1 的开发包（Debian/Ubuntu：`libwebkit2gtk-4.1-dev`）；加 `--no-default-features` 编无界面的 headless 版本。从源码仓库构建带界面的版本要先构建前端（Node.js 20.19+ 或 22.12+，步骤见 README）。
+- 源码编译（`cargo install aproxy --locked`）需要 rustc 1.90 或更新的版本（此前 1.88）：安装锁用到 1.89 起稳定的标准库文件锁，默认带上的桌面界面（Tauri 2）要 1.90。默认编带界面的版本，Linux 上要先装 WebKitGTK 4.1 的开发包（Debian/Ubuntu：`libwebkit2gtk-4.1-dev`）；加 `--no-default-features` 编无界面的 headless 版本。从源码仓库构建带界面的版本要先构建前端（Node.js 20.19+ 或 22.12+，步骤见 README）。
 - **控制协议整理为 v1**：请求是 `{"v":1,"op":"ping|shutdown|prepare_swap"}`，成功应答是 `{"v":1,"ok":true,"result":{…}}`，`result` 含注册记录 `instance`、所属 `run_dir`、状态 `state`（`serving` / `swap_prepared` / `stopping`，取代原来的 `swap_phase` 布尔值）、观测值 `activity` 与支持的 `ops`；失败应答带稳定的错误码（`bad_request`、`unsupported_version`、`unknown_op`、`invalid_state`）与说明。注册记录 `run/<端口>.pid` 只保存实例身份字段，请求数、重试数、最近错误等实时值只经控制通道提供。0.1.0 不带 `v` 的请求与应答不再被认，见「破坏性变更」。
 - **skill 文档改为英文并重写**：aproxy-cli 与 aproxy-format 两个 skill 按 skill-creator 标准重写，面向操作 aProxy 的 agent。每条事实都对照源码核实；程序输出的中文原文照录，并附英文释义。aproxy-cli 新增 `clients.md`（接入各 agent 客户端）与 `troubleshooting.md`（症状 → 原因 → 处理），`compatibility.md` 讲版本判定、0.1.0 与开发线的差异，以及怎样从 0.1.x 迁到 0.2.0、怎样退回 0.1.x。
 - **安装由目标版本执行**：`aproxy install` 下载并校验目标版本后，把广播、交换、滚动重启、终验与清理交给这个新二进制执行（所有平台），发起安装的进程只等待并转告结局，输出 `新版本进程已接手安装（广播、交换、滚动重启、终验），等待其完成...`。从这一版起，每次升级都由新版本驱动，新版本能修掉旧安装器的缺陷。降级仍由发起安装的进程自己执行。新二进制没能接手时，安装以 `目标版本没有接手安装（…）；实例与 bin 里的二进制都未改动` 失败收场。

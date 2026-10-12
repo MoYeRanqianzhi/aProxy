@@ -126,12 +126,14 @@ standard location):
 npm install -g @meowo/aproxy            # with the desktop interface; picks the right binary; stable releases use the latest tag
 npm install -g @meowo/aproxy-headless   # without it (servers, Linux without WebKitGTK); both provide the aproxy command, install one
 npm install -g @meowo/aproxy@next       # pre-releases use the next tag; ask for it explicitly (same for headless)
-cargo install aproxy                    # builds from source; needs rustc 1.90+
+cargo install aproxy --locked           # builds from source; needs rustc 1.90+
 ```
 
 `cargo install` builds the version with the desktop interface by default; on Linux, install the
 WebKitGTK 4.1 development package first (Debian/Ubuntu: `libwebkit2gtk-4.1-dev`). On Linux
-servers use `cargo install aproxy --no-default-features` for the headless build.
+servers use `cargo install aproxy --locked --no-default-features` for the headless build.
+`--locked` builds with the dependency versions in the package's Cargo.lock, the ones tested
+before the release; without it cargo picks the newest compatible version of each dependency.
 `cargo binstall aproxy` fetches the prebuilt desktop build (headless on musl systems); for the
 headless build, give the asset address:
 

@@ -19,7 +19,7 @@ cat <<EOF
 - **GitHub（本页 assets）**：带界面 \`aproxy-<target>[-v3]\`，无界面 \`aproxy-headless-<target>[-v3]\`；\`-v3\` 需要 AVX2（约 2013 年后的主流 x86_64 CPU），不确定就选无后缀的 baseline 版本
 - **npm**：\`npm install -g @meowo/aproxy\`（带界面）或 \`npm install -g @meowo/aproxy-headless\`（无界面）；两个包都提供 \`aproxy\` 命令，只装其中一个
 - **cargo-binstall**：\`cargo binstall aproxy\`（带界面的预编译产物）
-- **cargo（源码编译）**：\`cargo install aproxy --root ~/.aproxy\`（带界面，Linux 先装 \`libwebkit2gtk-4.1-dev\`）；无界面加 \`--no-default-features\`
+- **cargo（源码编译）**：\`cargo install aproxy --locked --root ~/.aproxy\`（带界面，Linux 先装 \`libwebkit2gtk-4.1-dev\`）；无界面加 \`--no-default-features\`
 - **发布清单**：\`aproxy-manifest.json\` 列出每个二进制的目标、变体、指令集档与 SHA256，\`aproxy install --force\` 按它挑选资产
 - **skill 文档**：\`aproxy-skills.zip\`（总包，含全部 skill：aproxy-cli / aproxy-format）/\`aproxy-skill-<名>.zip\`（单包）——install 自动随版本更新 skill，通常无需手动下载
 

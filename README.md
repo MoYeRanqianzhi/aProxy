@@ -56,10 +56,10 @@ curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/
 npm install -g @meowo/aproxy            # 带桌面界面，按平台自动选二进制；正式版发在 latest 标签
 npm install -g @meowo/aproxy-headless   # 无界面（服务器、缺 WebKitGTK 的 Linux）；两个包都提供 aproxy 命令，只装其一
 npm install -g @meowo/aproxy@next       # 预发布发在 next 标签，需显式指定（headless 同理）
-cargo install aproxy                    # 源码编译，需 rustc 1.90+
+cargo install aproxy --locked           # 源码编译，需 rustc 1.90+
 ```
 
-`cargo install` 默认编带桌面界面的版本，Linux 上要先装 WebKitGTK 4.1 的开发包（Debian/Ubuntu：`libwebkit2gtk-4.1-dev`）；Linux 服务器上用 `cargo install aproxy --no-default-features` 编无界面的 headless 版本。`cargo binstall aproxy` 取带界面的预编译产物（musl 系统上取 headless）；要无界面的版本，指定资产地址：
+`cargo install` 默认编带桌面界面的版本，Linux 上要先装 WebKitGTK 4.1 的开发包（Debian/Ubuntu：`libwebkit2gtk-4.1-dev`）；Linux 服务器上用 `cargo install aproxy --locked --no-default-features` 编无界面的 headless 版本。`--locked` 让依赖取包里 Cargo.lock 记的、发布前测过的版本；不加时 cargo 会改用各依赖当下的最新兼容版本。`cargo binstall aproxy` 取带界面的预编译产物（musl 系统上取 headless）；要无界面的版本，指定资产地址：
 
 ```sh
 cargo binstall aproxy --pkg-url '{ repo }/releases/download/v{ version }/{ name }-headless-{ target }{ binary-ext }' --pkg-fmt bin

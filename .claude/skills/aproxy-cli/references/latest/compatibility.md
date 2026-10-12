@@ -108,7 +108,8 @@ moment with the user first.
      existing binary. If Windows refuses the delete, the 0.1.x watchdog is still running from the
      file; it exits by itself, by default 5 minutes after the last instance stopped.
    - npm: `npm i -g @meowo/aproxy@latest` (`@next` for a pre-release).
-   - cargo: `cargo install aproxy --force` (add `--version <version>` for a pre-release).
+   - cargo: `cargo install aproxy --locked --force` (add `--version <version>` for a pre-release).
+     `--locked` builds with the dependency versions tested for the release.
 4. Delete what 0.1.x leaves behind: `<home>/run/install.state` and `<home>/staging/`, which 0.2.0
    never reads, and any `<home>/run/*.restore`. A restore record that survived step 2 belongs to an
    instance that had crashed, and `aproxy restore` would start it with 0.1.x's command line.

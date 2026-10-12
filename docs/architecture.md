@@ -477,7 +477,8 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
   时的兜底。从 0.2.0 起，任意版本的强制安装都要能装任意版本、结束任意版本启动的进程，
   所以它只依赖冻结的 C1–C8，不走 IPC、不读注册表与 install.state、不读写配置与
   settings（main 在读它们之前就分流）。先验证、后破坏：目标取进 `install/force/<pid>/`
-  （在线读 release 附带的发布清单 `aproxy-manifest.json` 选资产并比对 sha256，或
+  （在线读 release 附带的发布清单 `aproxy-manifest.json` 选资产并比对 sha256，只走 HTTPS、
+  空闲 60 秒超时、清单 1 MiB 与资产 256 MiB 上限，latest 不低于正在运行的版本；或
   `--from`），在本机跑通 `--version` 之前什么都不停；确认（非终端要 `--yes`）→ 按台账
   结束安装者 → 拿锁 → 结束其余角色（连续两轮没有存活条目为止，有上限）→ 清空
   `install/` → swap → 用新二进制的 `restore` 拉回实例（被强制结束的实例留着

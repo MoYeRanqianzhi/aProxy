@@ -887,11 +887,108 @@ fn online_spec(version: Option<&str>, target: &str, variant: &str) -> OnlineSpec
         variant: variant.into(),
         cpu: None,
         prefer_v3: false,
+        running: env!("CARGO_PKG_VERSION").into(),
     }
 }
 
+/// 测试用的客户端：假 GitHub 只有 http，强制安装自己的客户端只走 https（见
+/// `force_downloads_only_speak_https`）
 fn local_client() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
+/// 强制安装的下载客户端只走 HTTPS：http 地址在发出请求之前就被拒绝，连接都不建立。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn force_downloads_only_speak_https() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/releases", listener.local_addr().unwrap());
+    let client = force::http_client(None).unwrap();
+    assert!(client.get(&url).send().await.is_err());
+    assert!(
+        matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "http 请求不该建立连接"
+    );
+    // 对照：普通客户端会连上来，说明上面的「没连上」不是因为监听本身有问题
+    let plain = local_client();
+    let _ = tokio::time::timeout(Duration::from_secs(2), plain.get(&url).send()).await;
+    assert!(listener.accept().is_ok());
+}
+
+/// latest 解析出的版本低于正在运行的版本：不装（退出码 10），说明可能漏了清单；明确写出
+/// 同一个版本号则照装——那是用户自己选的。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn online_latest_never_downgrades_silently() {
+    let home = TestHome::new();
+    let files = home.path().join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    let real = PathBuf::from(env!("CARGO_BIN_EXE_aproxy"));
+    let version = env!("CARGO_PKG_VERSION");
+    let target = env!("APROXY_BUILD_TARGET");
+    let variant = own_variant();
+    let manifest = manifest_file(
+        &files,
+        "m.json",
+        version,
+        vec![asset(target, &variant, "aproxy-bin", &real)],
+    );
+    let api = serve_fake_github(vec![(
+        format!("v{version}"),
+        true,
+        vec![
+            (force::MANIFEST_ASSET.into(), manifest),
+            ("aproxy-bin".into(), real.clone()),
+        ],
+    )])
+    .await;
+    let dest = home
+        .path()
+        .join(format!("got{}", std::env::consts::EXE_SUFFIX));
+    let newer_running = |version: Option<&str>| OnlineSpec {
+        running: "99.0.0".into(),
+        ..online_spec(version, target, &variant)
+    };
+    let err = force::acquire_online(&local_client(), &api, &newer_running(None), &dest)
+        .await
+        .unwrap_err();
+    assert!(err.contains("低于正在运行的 v99.0.0"), "{err}");
+    assert!(!dest.exists(), "不装就不下载");
+    let got = force::acquire_online(&local_client(), &api, &newer_running(Some(version)), &dest)
+        .await
+        .unwrap();
+    assert_eq!(got.line.version, version);
+}
+
+/// 发布清单超过 1 MiB 就不是清单：不读、报上限。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn online_rejects_an_oversized_manifest() {
+    let home = TestHome::new();
+    let files = home.path().join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    let version = env!("CARGO_PKG_VERSION");
+    let huge = files.join("huge.json");
+    let padding = "x".repeat(1024 * 1024);
+    std::fs::write(
+        &huge,
+        format!(r#"{{"manifest":1,"version":"{version}","assets":[],"padding":"{padding}"}}"#),
+    )
+    .unwrap();
+    let api = serve_fake_github(vec![(
+        format!("v{version}"),
+        true,
+        vec![(force::MANIFEST_ASSET.into(), huge)],
+    )])
+    .await;
+    let dest = home.path().join("got");
+    let err = force::acquire_online(
+        &local_client(),
+        &api,
+        &online_spec(Some(version), env!("APROXY_BUILD_TARGET"), &own_variant()),
+        &dest,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("上限"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

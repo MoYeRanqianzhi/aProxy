@@ -617,8 +617,11 @@ one means.
 
 **Choosing the target.** `latest` (the default) and VERSION follow the normal channel rules, `--pre`
 included, but only releases that carry `aproxy-manifest.json` count, which means 0.2.0 and later.
-The version is not compared with the current one, so downgrades need no flag; nothing below 0.2.0
-is installed. `--variant` defaults to the variant of the binary you run, the first word in the
+A named VERSION is installed even when it is older than the running one, so downgrades need no
+flag; nothing below 0.2.0 is installed. `latest`, however, never downgrades: when it resolves to a
+version below the running one (a newer release that is missing its manifest), force install exits
+10 and says so; name the version to install it anyway. Downloads use HTTPS only and give up after
+60 s without data. `--variant` defaults to the variant of the binary you run, the first word in the
 parentheses of `aproxy --version`; on Linux without the desktop libraries (WebKitGTK), install
 `--variant headless`. Without `--cpu`, the x86-64-v3 build is taken on CPUs with AVX2 when the
 release has one, and the baseline build otherwise; an explicit `--cpu` must exist as named. When

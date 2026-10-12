@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::download::{Channel, DownloadCtx};
+use super::download::Channel;
 use super::swap;
 use crate::ledger::{
     self, LedgerEntry, ROLE_DESKTOP, ROLE_INSTALLER, ROLE_INSTANCE, ROLE_WATCHDOG,
@@ -138,6 +138,17 @@ const KILL_WAIT: Duration = Duration::from_secs(10);
 const STOP_ROUND_GAP: Duration = Duration::from_millis(500);
 /// 台账扫描的轮数上限：一直有新进程冒出来（例如有人在反复启动实例）就放弃，退出码 11。
 const MAX_STOP_ROUNDS: usize = 20;
+/// 下载时两次收到数据之间的最长间隔：超过就算这条连接卡死了。按空闲而不是按总长算：
+/// 慢链路上下载带界面的版本可能要好几分钟，只要数据还在来就不该放弃。
+const DOWNLOAD_IDLE: Duration = Duration::from_secs(60);
+/// 一次请求（含读完整个资产）的总时限，防的是数据一直在来、却慢到没有尽头。
+const DOWNLOAD_TOTAL: Duration = Duration::from_secs(30 * 60);
+/// 连接的时限。
+const DOWNLOAD_CONNECT: Duration = Duration::from_secs(15);
+/// 发布清单的大小上限（C6 读者）：一份清单只有几十条资产，几 KB；超过就不是清单。
+const MANIFEST_LIMIT: u64 = 1024 * 1024;
+/// 资产的大小上限（C6 读者）：一个 aproxy 二进制几十 MB，留足余量；超过就不是它。
+const ASSET_LIMIT: u64 = 256 * 1024 * 1024;
 /// 等新版本的 `restore` 结束的上限：基数加每个被结束的实例一份（restore 逐个等实例就绪，
 /// 每个最多 8 秒）。
 const RESTORE_WAIT_BASE: Duration = Duration::from_secs(30);
@@ -507,11 +518,26 @@ pub async fn fetch_manifest(
             release.version
         )
     })?;
-    let text = get(client, url, false)
-        .await?
-        .text()
+    let too_big = || format!("{MANIFEST_ASSET} 超过 {} KiB 的上限", MANIFEST_LIMIT >> 10);
+    let mut response = get(client, url, false).await?;
+    if response
+        .content_length()
+        .is_some_and(|n| n > MANIFEST_LIMIT)
+    {
+        return Err(too_big());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| format!("{MANIFEST_ASSET} 下载失败: {e}"))?;
+        .map_err(|e| format!("{MANIFEST_ASSET} 下载失败: {e}"))?
+    {
+        body.extend_from_slice(&chunk);
+        if body.len() as u64 > MANIFEST_LIMIT {
+            return Err(too_big());
+        }
+    }
+    let text = String::from_utf8(body).map_err(|_| format!("{MANIFEST_ASSET} 不是 UTF-8"))?;
     let manifest = Manifest::parse(&text)?;
     if manifest.version != release.version {
         return Err(format!(
@@ -522,7 +548,8 @@ pub async fn fetch_manifest(
     Ok(manifest)
 }
 
-/// 下载清单里的一个资产到 `dest`，比对清单写的 sha256。不符就删掉并报错。
+/// 下载清单里的一个资产到 `dest`（超过 [`ASSET_LIMIT`] 就放弃），比对清单写的 sha256。
+/// 不符就删掉并报错。
 pub async fn download_asset(
     client: &reqwest::Client,
     release: &Release,
@@ -535,9 +562,35 @@ pub async fn download_asset(
             asset.file, release.version
         )
     })?;
-    super::download::download_to(client, url, dest)
-        .await
-        .map_err(|e| format!("{} 下载失败: {e}", asset.file))?;
+    let streamed = async {
+        use std::io::Write;
+        let too_big = || format!("超过 {} MiB 的上限", ASSET_LIMIT >> 20);
+        let mut response = get(client, url, false).await?;
+        if response.content_length().is_some_and(|n| n > ASSET_LIMIT) {
+            return Err(too_big());
+        }
+        let mut file =
+            std::fs::File::create(dest).map_err(|e| format!("{} 创建失败: {e}", dest.display()))?;
+        let mut total = 0u64;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| format!("下载中断: {e}"))?
+        {
+            total += chunk.len() as u64;
+            if total > ASSET_LIMIT {
+                return Err(too_big());
+            }
+            file.write_all(&chunk)
+                .map_err(|e| format!("写入失败: {e}"))?;
+        }
+        file.flush().map_err(|e| format!("写入失败: {e}"))
+    }
+    .await;
+    if let Err(e) = streamed {
+        let _ = std::fs::remove_file(dest);
+        return Err(format!("{} 下载失败: {e}", asset.file));
+    }
     let actual = super::staging::sha256_hex(dest)?;
     if !actual.eq_ignore_ascii_case(&asset.sha256) {
         let _ = std::fs::remove_file(dest);
@@ -564,10 +617,18 @@ pub struct OnlineSpec {
     pub cpu: Option<String>,
     /// 没有显式指定指令集档时按本机 CPU 选：true = 先找 x86-64-v3 档，没有就退回基线档
     pub prefer_v3: bool,
+    /// 正在运行的这个二进制的版本：`latest` 解析出更低的版本时不装（见 [`acquire_online`]）
+    pub running: String,
 }
 
 /// 在线取目标：找 release → 读发布清单 → 选资产 → 下载并比对 sha256 → 在本机执行
-/// `--version`，核对版本与变体。linux-gnu 的产物跑不起来时（它按构建机的 glibc 链接，
+/// `--version`，核对版本与变体。
+///
+/// `latest`（没有指定版本）解析出的版本低于正在运行的版本时不装，报错（退出码 10）：
+/// latest 只认带发布清单的 release，新版本若漏传了清单，latest 就会落到更旧的版本上，
+/// `--force --yes` 会悄悄降级。明确写出版本号的不受影响——那是用户自己选的。
+///
+/// linux-gnu 的产物跑不起来时（它按构建机的 glibc 链接，
 /// 老发行版上跑不了；带界面的版本还要 WebKitGTK 等系统库），改用同一份清单里同变体的
 /// musl 基线产物再试一次——普通在线安装也是这样回退的。清单里找不到要的组合时（例如
 /// musl 目标只发布 headless），错误里列出这个目标实际有的变体与指令集档。
@@ -578,6 +639,18 @@ pub async fn acquire_online(
     dest: &Path,
 ) -> Result<Acquired, String> {
     let release = find_release(client, api, spec.version.as_deref(), spec.channel).await?;
+    if spec.version.is_none() {
+        let picked = semver::Version::parse(&release.version);
+        let running = semver::Version::parse(&spec.running);
+        if let (Ok(picked), Ok(running)) = (picked, running)
+            && picked < running
+        {
+            return Err(format!(
+                "{} 通道里最新的、带发布清单的版本是 v{picked}，低于正在运行的 v{running}（新版本的发布可能漏了 {MANIFEST_ASSET}）。强制安装不会悄悄降级；确实要装 v{picked}，就写明版本号：aproxy install --force {picked}",
+                spec.channel.label()
+            ));
+        }
+    }
     let manifest = fetch_manifest(client, &release).await?;
     let asset = match &spec.cpu {
         Some(cpu) => manifest.find(&spec.target, &spec.variant, cpu),
@@ -1181,8 +1254,29 @@ pub async fn run(home: &Path, request: &ForceRequest) -> i32 {
     code
 }
 
-/// 在线来源：组装下载客户端（代理只用命令行给的），按通道与本机挑资产。目标三元组取
-/// 正在运行的这个二进制的（构建时的 TARGET，也就是它 `--version` 的目标段）。
+/// 强制安装下载用的 HTTP 客户端：只走 HTTPS（重定向也一样，`https_only`）；连接
+/// [`DOWNLOAD_CONNECT`]、空闲 [`DOWNLOAD_IDLE`]、总长 [`DOWNLOAD_TOTAL`]；代理只用命令行
+/// 给的 `--download-proxy`（外加 reqwest 默认认的代理环境变量），不读 settings.json。
+pub fn http_client(download_proxy: Option<&str>) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(format!("aproxy-install/{}", env!("CARGO_PKG_VERSION")))
+        .https_only(true)
+        .connect_timeout(DOWNLOAD_CONNECT)
+        .read_timeout(DOWNLOAD_IDLE)
+        .timeout(DOWNLOAD_TOTAL);
+    if let Some(proxy) = download_proxy {
+        // 代理 URL 可能内嵌凭据（user:pass@host），错误里不复述它
+        let proxy = reqwest::Proxy::all(proxy)
+            .map_err(|_| "下载代理 URL 非法（凭据已隐去）".to_string())?;
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("HTTP 客户端构建失败: {e}"))
+}
+
+/// 在线来源：组装下载客户端（[`http_client`]），按通道与本机挑资产。目标三元组取正在
+/// 运行的这个二进制的（构建时的 TARGET，也就是它 `--version` 的目标段）。
 async fn acquire_from_github(
     request: &ForceRequest,
     version: Option<&str>,
@@ -1193,11 +1287,7 @@ async fn acquire_from_github(
         None | Some("latest") => None,
         Some(v) => Some(v.to_string()),
     };
-    let ctx = DownloadCtx::build(
-        env!("CARGO_PKG_VERSION"),
-        request.download_proxy.as_deref(),
-        None,
-    )?;
+    let client = http_client(request.download_proxy.as_deref())?;
     let current =
         semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("内置版本号必为合法 semver");
     let spec = OnlineSpec {
@@ -1207,6 +1297,7 @@ async fn acquire_from_github(
         variant: variant.to_string(),
         cpu: request.cpu.clone(),
         prefer_v3: super::download::prefers_x86_64_v3(),
+        running: env!("CARGO_PKG_VERSION").to_string(),
     };
     match &spec.version {
         Some(v) => outln!("从 GitHub 取 v{v} 的发布清单……"),
@@ -1215,7 +1306,7 @@ async fn acquire_from_github(
             spec.channel.label()
         ),
     }
-    acquire_online(&ctx.client, &github_api(), &spec, dest).await
+    acquire_online(&client, &github_api(), &spec, dest).await
 }
 
 /// 第 3–7 步。从这里起出错就不再是「什么都没动」：二进制换好之前的失败是 11，换好之后

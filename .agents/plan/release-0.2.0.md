@@ -129,7 +129,7 @@
   （低优先级）：embeddings、图片等非对话接口。
 - aproxy-format skill 随之重写配方。format 线版本：协议改为新信封后发 aproxy-format 0.2.0，与 aproxy 0.2.0 同期。
 
-### W2b 强制安装：永久兼容契约（用户 2026-10-11 要求「从现在开始保持绝对兼容」；设计稿，待用户确认）
+### W2b 强制安装：永久兼容契约（用户 2026-10-11 要求「从现在开始保持绝对兼容」；alpha.1 第 2 步实现，2026-10-12 按独立审查修订）
 
 **保证**：从 0.2.0 起，任意版本 X（≥0.2.0）的 `aproxy install --force` 都能把任意版本 Y（≥0.2.0）装进同一个 home，
 并停掉这个 home 下由任意版本（≥0.2.0）启动的全部 aproxy 进程；**不依赖除下面 C1–C8 之外的任何东西兼容**。
@@ -140,50 +140,75 @@
 每一步可重入，中途被打断就再跑一次，最终收敛；只按台账里的 pid + 进程启动标记结束进程，绝不按名称；冻结格式只许
 追加可选字段，读者忽略不认识的字段，永远不删、不改名、不改类型；万一将来非改不可，只能另立并行的新格式，旧格式继续写。
 
-**冻结项**
-- C1 home：`APROXY_HOME`（绝对路径），否则 `<用户目录>/.aproxy`。
+**冻结项**（2026-10-12 按独立审查 `.agents/review/2026-10-12-force-install-review.md` 修订；实现见 `src/ledger.rs`、
+`src/install/force.rs`，样本钉在 `tests/force_contract.rs`）
+- C1 home：`APROXY_HOME` 按原始字节读（不要求 UTF-8），为空或只含空白视为未设；设了就原样使用（不 trim），必须是绝对
+  路径，否则一切要读 home 的命令报错退出（`--version` 不受影响）。未设时为 `<用户目录>/.aproxy`。用户目录：Windows 取
+  非空的 `USERPROFILE`，否则 `FOLDERID_Profile`；unix 取非空的 `HOME`，否则 `getpwuid_r` 的家目录——与三个安装脚本用的
+  `%USERPROFILE%`、`$HOME` 一致。一个 home 不支持跨操作系统或跨 pid 命名空间共用（WSL 与 Windows、容器与宿主）。
 - C2 二进制位置：`<home>/bin/aproxy`（Windows 为 `aproxy.exe`）。**交换过程从不使用固定的中间文件名**（用户 2026-10-11
   指出：短时间内连续更新两次，上一次的 `.old` 还被进程占着删不掉，固定名必然改名失败）：旧二进制改名为
-  `aproxy.old-<纳秒时间戳>-<pid>[.exe]`，新文件先落在 `aproxy.tmp-<纳秒时间戳>-<pid>[.exe]`；目标名已存在就换一个后缀重试
-  （Windows 的改名在目标存在时失败而不覆盖，正好用来判断）。`bin/` 下以 `aproxy.old-`、`aproxy.tmp-` 开头的文件，任何版本
-  都可在删得掉时删除；删不掉（仍被占用）就跳过，残留永远不会挡住下一次安装。普通安装（W2）也改用同一套命名，现在的
-  固定名 `aproxy.old(.exe)` 加秒级时间戳让位的做法在同一秒内两次让位时仍会撞名。
+  `aproxy.old-<纳秒时间戳>-<pid>[.exe]`，新文件先落在 `aproxy.tmp-<纳秒时间戳>-<pid>[.exe]`。时间戳是 19 位十进制纳秒，
+  字典序就是时间序（入口兜底脚本据此挑最新的 old）。临时文件用 create_new 建、改名到位之前 `sync_all`；Windows 的改名
+  用不覆盖的 `MoveFileExW(flags=0)`——`std::fs::rename` 在 Windows 上会覆盖已有目标，不能用来判断撞名——目标名已存在就
+  换一个名字重试。`bin/` 下以 `aproxy.old-`、`aproxy.tmp-` 开头的文件，任何版本都可在删得掉时删除；删不掉（仍被占用）
+  就跳过，残留永远不会挡住下一次安装。普通安装也用同一套命名。
 - C3 进程台账 `<home>/ledger/`：每个长期运行的 aproxy 进程（后台实例、前台实例、看护者、续作中的安装者、桌面界面）
-  启动时、在占用端口或拉起子进程之前，原子写入 `<pid>.json`，正常退出时删除。内容是一行 JSON：
-  `{"ledger":1,"pid":…,"start":"…","role":"…","version":"…"}`，可选 `port`、`label`、`exe`。`start` 是进程启动标记，
-  推导方式冻结：Windows `w:<GetProcessTimes 创建时间的 FILETIME 十进制>`；Linux
-  `l:<boot_id>:<stat 第 22 字段 starttime>`（带 boot_id，重启后 pid 与滴答巧合重复也不会认错）；macOS
-  `m:<pbi_start_tvsec>.<pbi_start_tvusec>`。`role` 词表只增不减：installer、watchdog、instance、desktop；不认识的角色
-  照样结束，排在最后。读者跳过解析不了的文件。写台账失败时告警但照常运行。
+  启动时、在占用端口或拉起子进程之前，原子写入 `<pid>.json`（先写 `<pid>.json.tmp` 再改名），正常退出时删除。内容是一行
+  JSON：`{"ledger":1,"pid":…,"start":"…","role":"…","version":"…"}`，可选 `port`、`label`（自由文本，不可依赖）、`exe`、
+  `config`（实例配置文件的绝对路径，拉不回的实例据此告诉用户怎样启动）。`start` 是进程启动标记，推导方式冻结：Windows
+  `w:<GetProcessTimes 创建时间的 FILETIME，64 位十进制>`；Linux `l:<boot_id>:<stat 第 22 字段 starttime>`（带 boot_id，
+  重启后 pid 与滴答巧合重复也不会认错）；macOS `m:<pbi_start_tvsec>.<pbi_start_tvusec>`（不补零）。`role` 词表只增不减：
+  installer、watchdog、instance、desktop；不认识的角色照样结束，排在最后。读者的义务：跳过解析不了的文件；只处理 `start`
+  前缀属于本平台的条目，其余既不结束也不删除；删除条目之前重读文件，`start` 一致才删；只结束属主与自己相同的进程（Windows
+  比较 token 的 user SID，Linux 比较 uid）。Windows 创建时间的精度是时钟滴答，同一 pid 在同一滴答内被复用理论上可能，接受。
+  写台账失败时告警但照常运行（Windows 上写入与删除先短暂重试几次）。
 - C4 安装状态收拢：一切安装者状态（状态文件、备料、下载临时文件）只能放在 `<home>/install/` 下，强制安装可随时整目录清空；
-  `<home>/install/lock` 是操作系统级排他锁（进程死亡自动释放），任何版本修改 `bin/` 期间都要持有它。
+  `<home>/install/lock` 是操作系统级排他锁（进程死亡自动释放），任何版本修改 `bin/` 期间都要持有它。锁原语冻结：unix
+  `flock(fd, LOCK_EX|LOCK_NB)`；Windows `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY)`，offset 0、长度
+  u64::MAX，CreateFile 的共享模式为 READ|WRITE、不带 DELETE（不用 std 的 `try_lock`：std 声明其实现可能改变）。打开与加锁
+  都在有上限的重试循环里。例外：Linux 的安装宣告是 `/dev/shm` 里按 home 命名的共享内存节，不在 `install/` 下；强制安装结束
+  安装者之后清掉本 home 的过期宣告。
 - C5 `--version`：标准输出第一行 `aproxy v<semver> (<variant>; <target>[; x86-64-v3])`；退出码 0；不读写 home、
   不联网、不拉起任何进程，并且在一切副作用之前短路——将来 i18n 在解析参数前读 settings.json 判定语言，`--version`
   必须排在它前面（G2）。输出里任何以空白分隔的词都不得以数字开头（G6）：0.1.0 的安装器取「第一个以数字开头的词」
-  当版本，这条保证它在交换前失败（见 W1）。
+  当版本，这条保证它在交换前失败（见 W1）。写者在 `)` 之后不得追加任何内容；读者只取版本号之后的第一个括号组、忽略其后
+  内容（这是容错，不是许可）。
 - C6 发布清单：每个主线 GitHub Release（tag `v<semver>`）都附 `aproxy-manifest.json`：
   `{"manifest":1,"version":"…","assets":[{"target":"<Rust 目标三元组>","variant":"desktop|headless","cpu":"baseline|x86-64-v3","file":"…","sha256":"…"}]}`。
-  强制安装只靠它找资产，所以以后资产怎么改名都不影响旧版本的强制安装。
-- C7 命令行：`aproxy install --force [<版本>|latest] [--from <文件>] [--variant desktop|headless] [--yes]`，
-  `aproxy upgrade --force` 等同 `install --force latest`；`aproxy restore` 子命令永远存在（强制安装后尽力调用它拉回实例）。
-  退出码冻结：0 完成；10 未做任何改动就中止；11 进程已停但二进制未替换；12 已替换但实例未全部拉回。通用退出码只用
-  0–5（G5，见 W2 的退出码表），10 起留给强制安装，互不重叠。
+  强制安装只靠它找资产，所以以后资产怎么改名都不影响旧版本的强制安装。写者：不带 BOM 的 UTF-8；`version` 等于 tag 去掉
+  `v`；`file` 永远是同一 release 里的裸可执行文件（不是压缩包），每个 release 都为它发布的每个目标保留旧版本能运行的裸
+  二进制条目；assets 的每个元素都带齐五个字段。读者：容忍 BOM；assets 逐个元素解析、跳过坏元素与不认识的 variant/cpu；
+  清单上限 1 MiB、资产 256 MiB、只走 HTTPS；sha256 在执行之前比对（不分大小写）。永久保证的是 `--from`；在线路径依赖
+  GitHub API 的形状与仓库名，是尽力而为。`latest` 只认带清单的 release；解析出的版本低于正在运行的版本时退出 10，不悄悄
+  降级。
+- C7 命令行：`aproxy install --force [<版本>|latest] [--from <文件>] [--variant desktop|headless]
+  [--cpu baseline|x86-64-v3] [--pre] [--download-proxy <地址>] [--yes]`，`aproxy upgrade --force` 等同
+  `install --force latest`；`aproxy restore` 子命令永远存在（强制安装后尽力调用它拉回实例）。`--variant` 与 `--from` 同用时
+  是核对（目标必须是这个变体），不是选择；显式的 `--cpu` 精确匹配。与 `--force` 冲突的选项（`--no-skills`、
+  `--allow-downgrade` 等）由参数解析拒绝（用法错误，退出码 2，什么都不做）；以后放宽不破坏调用方，收紧才会。
+  退出码冻结：0 完成；10 什么都没动（一个进程都没结束；非交互且没给 `--yes` 也是 10）；11 至少结束了一个进程，但二进制
+  没有替换；12 二进制已替换，但实例没有全部拉回。写输出失败（例如管道已关闭）不得改变退出码。被另一个强制安装结束时退出码
+  是 1 或 137，不在契约内。通用退出码只用 0–5（G5，见 W2 的退出码表），10 起留给强制安装，互不重叠。
 - C8 流程顺序：
-  1. 取得目标（C6 清单或 `--from`）放进 `<home>/install/force/`，校验 sha256，在本机执行 `--version` 并核对版本；
-     失败即退出码 10，什么都没动（例如 Linux 上缺 webkit2gtk 跑不了带 UI 的版本，就在这里挡住并提示 `--variant headless`）。
-  2. 确认（会中断所有经 aproxy 的在途请求，包括 agent 自己的会话；`--yes` 跳过）。
+  1. home 不存在就退出 10（多半是 APROXY_HOME 写错了；首次安装用一键脚本）。清掉 pid 已不在的旧 `install/force/<pid>/`。
+     取得目标（C6 清单或 `--from`）放进 `<home>/install/force/<本进程 pid>/`，校验 sha256，在本机执行 `--version`（有时限）
+     并核对版本；失败即退出码 10，什么都没动（例如 Linux 上缺 webkit2gtk 跑不了带 UI 的版本，就在这里挡住并提示
+     `--variant headless`）。
+  2. 确认（提示写到 stderr；会中断所有经 aproxy 的在途请求，包括 agent 自己的会话；`--yes` 跳过；非交互且没给 `--yes` 退出 10）。
   3. 按台账结束 installer → 取得 C4 的锁 → 结束 watchdog、instance、desktop 与未知角色；反复扫描直到连续两轮没有存活
-     条目（有上限）。结束前在同一进程句柄（Windows）或 pidfd（Linux）上核验启动标记，杜绝 pid 复用的竞态。结束不掉
-     （例如权限不足）就停在这里，退出码 11。
-  4. 清空 `<home>/install/`（保留锁与本次的目标文件）。
+     条目（有上限）。结束前在同一进程句柄（Windows）或 pidfd（Linux）上核验启动标记与属主，杜绝 pid 复用的竞态。结束不掉
+     就停在这里：一个都没结束是 10，否则 11。
+  4. 先删 `install/state.json`，再清空 `<home>/install/`（保留锁与本次的工作目录）；清掉本 home 的过期安装宣告。
   5. 替换 `bin/` 下的二进制：先尽力清掉删得掉的旧残留；unix 把 `aproxy.tmp-…` 直接 rename 覆盖到位（原子）；Windows 先把
      现文件改名为唯一的 `aproxy.old-…`，再把 `aproxy.tmp-…` 改名到位，第二步失败立即改回。现文件被不带共享删除权限的句柄
      占着（例如杀毒软件正在扫描）导致改名失败时，短暂退避重试，仍失败则退出码 11（进程已停、二进制未动，可再跑一次）。
-  6. 用新位置的二进制再跑一次 `--version` 核对；尽力调用新版本的 `restore`；拉不回的实例按台账里的 `port`、`label` 列出来，
-     请用户手动启动（退出码 12）。
-  7. 另外报告不在台账里、但从 `<home>/bin/` 运行的进程（例如 0.1.0 留下的），只报告、不结束。
+  6. 用新位置的二进制再跑一次 `--version` 核对（有时限）；尽力调用新版本的 `restore`；按台账判断被结束的实例是否回来：同一
+     `port` 上出现 `version` 等于目标版本的 instance 条目。没回来的按条目的 `port` 与 `config` 列出来，告诉用户怎样启动
+     （退出码 12）。
+  7. 另外报告不在台账里、但从 `<home>/bin/` 运行的进程（例如 0.1.x 留下的，但不断言），只报告、不结束；macOS 上不做。
 - 强制安装从不读写配置、settings、日志、注册表，也不走 IPC。由桌面界面发起时，界面先把强制安装作为独立进程拉起再退出
-  （它自己也在被结束之列）。
+  （它自己也在被结束之列），拉起时 stdio 一律为 null 或分离——写输出失败虽不改变退出码，也不该让它写进一个已关闭的管道。
 
 **两层表述（G4）**：C1–C8 里，结构与语义「绝对冻结」（永不改动）；JSON 格式「只增不改」（可追加可选字段，读者忽略
 未知字段）。台账与实例注册记录分开（G3）：注册记录可随意演进，台账只承担「找到并结束这个进程」。

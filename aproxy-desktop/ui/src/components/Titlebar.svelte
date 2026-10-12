@@ -46,7 +46,8 @@
 
 <style>
   .titlebar {
-    /* 最小高度变体（见上）。浏览器里与非 Windows 上没有 --titlebar-height，按 32px 算 */
+    /* 最小高度变体（见上）。浏览器里与非 Windows 上没有 --titlebar-height，栏高就是 --titlebar-min：
+       原生标题栏下面的这一行工具栏默认也是 44px，有意与 Windows 一致，给搜索框留够高度 */
     --bar: max(var(--titlebar-height, 32px), var(--titlebar-min, 44px));
     /* content-box：底边不会侵入原生按钮那块区域 */
     box-sizing: content-box;

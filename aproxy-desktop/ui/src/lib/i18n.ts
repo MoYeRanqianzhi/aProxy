@@ -1,11 +1,12 @@
 /*
  * 界面文字字典：zh-CN 与 en 两份，所有可见文字都经 t() 取。
  *
- * en 的类型是 Record<Key, string>，少翻一条或多出一条 key 都会编译失败，两份字典不会悄悄走样。
+ * en 与 enProto 的类型按对应的中文字典（zh、zhProto）的 key 写死，少翻一条或多出一条 key 都会
+ * 编译失败，两份字典不会悄悄走样。
  * 占位符写作 {name}；英文复数写作 {n:request|requests}，n 为 1 时取前者。
  * 将来与命令行共用一套目录文件（见 .agents/plan/release-0.2.0.md 的 W3），这里先用 TS 对象。
  */
-import { ui } from './state.svelte';
+import { ui, type Lang } from './state.svelte';
 
 const zh = {
   'brand.tagline': '本地 API 代理',
@@ -544,7 +545,10 @@ const zh = {
   'dur.dayHour': '{d} 天 {h} 小时',
   'dur.hourMin': '{h} 小时 {m} 分',
   'dur.min': '{m} 分钟',
+} as const;
 
+/** 原型件（src/proto/：审核工具条、模拟的窗口按钮、吉祥物预览页）的文案，只在开发构建里并入字典（见 tables） */
+const zhProto = {
   'proto.title': '原型审核',
   'proto.note': '只属于原型，不是应用的一部分',
   'proto.theme': '模式',
@@ -619,9 +623,9 @@ const zh = {
   'lab.zoom': '16px 放大 ×8',
 } as const;
 
-type Key = keyof typeof zh;
+type Key = keyof typeof zh | keyof typeof zhProto;
 
-const en: Record<Key, string> = {
+const en: Record<keyof typeof zh, string> = {
   'brand.tagline': 'Local API proxy',
   'demo.label': 'Preview · demo data',
   'demo.explain': 'This is a preview of the aProxy desktop app. The instances, request logs and stats here are demo data, not the aProxy running on this computer. Real data comes in a later release.',
@@ -1158,7 +1162,9 @@ const en: Record<Key, string> = {
   'dur.dayHour': '{d}d {h}h',
   'dur.hourMin': '{h}h {m}m',
   'dur.min': '{m} min',
+};
 
+const enProto: Record<keyof typeof zhProto, string> = {
   'proto.title': 'Prototype review',
   'proto.note': 'Prototype only, not part of the app',
   'proto.theme': 'Mode',
@@ -1233,7 +1239,14 @@ const en: Record<Key, string> = {
   'lab.zoom': '16 px at ×8',
 };
 
-const tables = { 'zh-CN': zh as Record<Key, string>, en };
+// 原型件的文案只在开发构建里并入字典：生产构建里 import.meta.env.DEV 是常量 false，这一支连同
+// zhProto、enProto 一起被删掉，产物里不带。生产里没有谁取这些 key（原型件只在开发服务器里加载），
+// 所以那里按 Record<Key, string> 断言不会在运行时落空。
+const tables = (
+  import.meta.env.DEV
+    ? { 'zh-CN': { ...zh, ...zhProto }, en: { ...en, ...enProto } }
+    : { 'zh-CN': zh, en }
+) as Record<Lang, Record<Key, string>>;
 
 export type MessageKey = Key;
 

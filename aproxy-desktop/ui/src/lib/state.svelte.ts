@@ -9,7 +9,7 @@
 
 import type { ThemeSpec } from './types';
 
-/** mascots 是原型专用的吉祥物预览页，不在导航里，只在浏览器开发模式里从审核工具条或地址栏 #/mascots 进入 */
+/** mascots 是原型专用的吉祥物预览页，不在导航里，只在浏览器开发模式里从审核工具条或地址栏 #/mascots 进入（见 PAGES） */
 export type Page = 'overview' | 'instance' | 'logs' | 'config' | 'update' | 'settings' | 'mascots';
 export type Lang = 'zh-CN' | 'en';
 export type LangPref = 'system' | Lang;
@@ -21,7 +21,17 @@ export type MicaSupport = 'available' | 'unsupported' | 'transparency-off';
 /** 原型专用的场景切换：正常数据、没有实例（空状态）、实例无响应（错误状态） */
 export type Scenario = 'normal' | 'empty' | 'error';
 
-const PAGES: Page[] = ['overview', 'instance', 'logs', 'config', 'update', 'settings', 'mascots'];
+// 生产构建里没有原型件，mascots 不进路由表：地址栏里的 #/mascots 按认不出的页面处理（启动时
+// 停在总览，运行中留在当前页），不会落到一张空白页上（import.meta.env.DEV 在生产构建里是常量 false）
+const PAGES: Page[] = [
+  'overview',
+  'instance',
+  'logs',
+  'config',
+  'update',
+  'settings',
+  ...(import.meta.env.DEV ? (['mascots'] as const) : []),
+];
 
 class UiState {
   page = $state<Page>('overview');

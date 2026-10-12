@@ -118,10 +118,12 @@ Both templates pass `scripts/test_format.py`, including the EOF check.
 ### Rust
 
 The `aproxy-envelope` crate (crates.io) is the envelope type aProxy itself uses, so parsing,
-serialization and the `body`/`body_b64` checks match aProxy exactly.
+serialization and the `body`/`body_b64` checks match aProxy exactly. While 0.2.0 is in
+pre-release the crate's interface can still change, so pin it exactly, as the `Cargo.toml` line
+below does; once 0.2.0 is released, switch to `"0.2"`.
 
 ```rust
-// Cargo.toml: aproxy-envelope = "0.1"
+// Cargo.toml: aproxy-envelope = "=0.2.0-alpha.1"
 use std::io::{BufRead, Write};
 
 use aproxy_envelope::TransformEnvelope;

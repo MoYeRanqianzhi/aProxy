@@ -37,8 +37,9 @@ REPO="MoYeRanqianzhi/aProxy"
 # glibc 下限、npm/aproxy/bin/aproxy.js 的 MIN_GLIBC 保持一致。
 MIN_GLIBC="2.28"
 # 带界面的 Linux gnu 产物能运行的最低 glibc。它链接构建系统里的 GTK 与 WebKitGTK，下限由构建
-# 系统决定；必须与 release.yml 的 DESKTOP_GLIBC_FLOOR、src/install/variant.rs 的
-# DESKTOP_GLIBC_FLOOR、npm/aproxy/bin/aproxy.js 的 DESKTOP_MIN_GLIBC 保持一致。
+# 系统决定；必须与 release.yml 的 DESKTOP_GLIBC_FLOOR、npm/aproxy/bin/aproxy.js 的
+# DESKTOP_MIN_GLIBC 保持一致。只用于没指定变体时替用户挑一个：本脚本每次都从 main 现取，
+# 跟得上最新的构建；aproxy 自己的安装器不预先猜，只看下载下来的二进制能不能跑。
 DESKTOP_MIN_GLIBC="2.35"
 UA="aproxy-install-script"
 
@@ -312,7 +313,11 @@ main() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --pre) want_pre=1 ;;
-            --variant) shift; VARIANT="${1:-}" ;;
+            --variant)
+                # 放在最后又没给值：先报错，不然下面的 shift 在 dash 里报「can't shift」、
+                # 在 bash 的 sh 模式下静默以 1 退出，用户看不出原因
+                [ $# -ge 2 ] || { echo "--variant 需要一个值（desktop 或 headless）" >&2; exit 1; }
+                shift; VARIANT="$1" ;;
             --variant=*) VARIANT="${1#--variant=}" ;;
             -*) echo "未知参数: $1（可用: --pre、--variant desktop|headless、tag）" >&2; exit 1 ;;
             *) TAG="$1" ;;
@@ -350,6 +355,10 @@ main() {
     BIN_NAME="aproxy${EXE_SUFFIX}"
 
     # ---- 变体（先于下载：要装哪个文件取决于它）----
+    # 没指定变体时按本机情况挑：看起来跑不了带界面的版本就装 headless 并说明原因。
+    # 指定了 desktop 就照装，跑不跑得起来交给下载后的 --version 自检（它会打出动态加载器的
+    # 报错）：这里的探测可能误判（库装在动态加载器缓存之外、只靠 LD_LIBRARY_PATH 等），
+    # 用户写明了就不能拦。只有 musl 例外：它没有带界面的产物，下载只会 404。
     # variant_auto=1：没指定变体、选了 desktop，下载后跑不起来时可以改装 headless；
     # headless_reason：最后装的是 headless 而不是用户指定的，向用户说明原因
     variant_auto=0
@@ -363,8 +372,8 @@ main() {
             VARIANT=desktop
             variant_auto=1
         fi
-    elif [ "$VARIANT" = desktop ] && desktop_blocker; then
-        echo "本机跑不了带桌面界面的版本：$blocker。装好所需的系统库后重试，或改装无界面版本：--variant headless" >&2
+    elif [ "$VARIANT" = desktop ] && [ "$libc" = musl ]; then
+        echo "这台 Linux 用的是 musl 或 glibc 低于 $MIN_GLIBC，带桌面界面的版本只有 glibc 的构建；改装无界面版本：--variant headless" >&2
         exit 1
     fi
 
@@ -419,6 +428,9 @@ main() {
             echo "安装失败: 下载的二进制（$ASSET）在本机无法运行（--version 自检未通过）。未做任何落位。" >&2
             # 暂存文件随后会被 EXIT trap 删除：趁它还在，把系统给出的原因打出来
             "$STAGED" --version </dev/null 2>&1 | head -n 5 >&2 || true
+            if [ "$VARIANT" = desktop ] && [ "$OS" = Linux ]; then
+                echo "带桌面界面的版本需要 WebKitGTK 2.40 或更新（Debian / Ubuntu：libwebkit2gtk-4.1-0）；不需要窗口就改装无界面版本：--variant headless" >&2
+            fi
             exit 1
         fi
     fi

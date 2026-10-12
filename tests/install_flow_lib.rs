@@ -484,6 +484,37 @@ async fn corrupted_state_file_is_handled_cleanly() {
         .expect("损坏状态文件应被静默处置");
 }
 
+/// 恢复矩阵行「没有状态文件，宣告却还在」：有效的宣告（安装者健在）不动；unix 上过期的
+/// 宣告（安装者崩溃时来不及删的文件）由续作删掉——看护者见到过期宣告就拉起续作，不删就
+/// 每轮拉起一个立即退出的续作，一直循环下去。Windows 的宣告节随进程消失，只验前一半。
+#[tokio::test(flavor = "current_thread")]
+async fn without_state_only_an_expired_announcement_is_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let run_dir = home.join("run");
+    let active =
+        aproxy::install::announce::Announcer::create(home, &run_dir).expect("宣告创建失败");
+    aproxy::install::flow::continue_install(home, &run_dir, None)
+        .await
+        .expect("没有状态文件时续作应静默完成");
+    assert!(
+        aproxy::install::announce::read(home, &run_dir).is_some(),
+        "有效的宣告不得被删"
+    );
+    drop(active);
+    #[cfg(unix)]
+    {
+        let file = aproxy::install::announce::location(home, &run_dir);
+        // 16 个零字节：安装者 pid 0、心跳停在 1970 年——崩溃留下的过期宣告
+        std::fs::write(&file, [0u8; 16]).unwrap();
+        assert!(aproxy::install::announce::read(home, &run_dir).is_some());
+        aproxy::install::flow::continue_install(home, &run_dir, None)
+            .await
+            .expect("没有状态文件时续作应静默完成");
+        assert!(!file.exists(), "过期的宣告应已删掉");
+    }
+}
+
 /// 恢复矩阵行「cleaning 残留（删除旧二进制中崩溃）」→ 重入不回退重验
 /// （Cleaning → Verifying 逆向迁移会被状态机拒绝——相位守卫修复的回归），
 /// 重做清理即 done。

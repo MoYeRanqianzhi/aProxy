@@ -700,7 +700,11 @@ pub async fn continue_install(
     handover_from: Option<u32>,
 ) -> Result<FlowExit, String> {
     let Some(mut state) = super::state::load_in(home) else {
-        return Ok(FlowExit::Completed); // 无残留，无事发生
+        // 没有状态文件 = 没有要续作的安装。本进程却可能正是看护者因为过期的宣告拉起的
+        //（unix 上宣告是文件，安装者崩溃时来不及删）：删掉它，否则看护者每轮都拉起一个
+        // 立即退出的续作，一直循环下去
+        super::announce::clear_expired(home, run_dir);
+        return Ok(FlowExit::Completed);
     };
     if state.phase.is_terminal() {
         // done/aborted 残留（正常结束但清文件前崩溃）→ 清文件即完成

@@ -871,7 +871,8 @@ impl WatchdogState {
     /// Windows 节随进程死消失，此态即挂死；unix 崩溃残留文件同判定路径）
     /// → 拉起 `install --continue` 续作。常态无宣告 = 零成本跳过。重复拉起
     /// 由 --continue 的接管判定收敛（未 stale 即退出；接管后宣告刷新），
-    /// 最坏情况是每周期一个短命进程直到 updated_at 过 stale 阈值。
+    /// 最坏情况是每周期一个短命进程直到 updated_at 过 stale 阈值。没有状态
+    /// 文件可续时，续作删掉过期的宣告（unix），下一轮就不再拉起。
     fn check_install_keepalive(&self) {
         let Some(ann) = crate::install::announce::read(&self.cfg.home, &self.cfg.run_dir) else {
             return;

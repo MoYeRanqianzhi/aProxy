@@ -5,8 +5,9 @@
 //!   残留 ≠ 在安装——看护者/守护不做语义解读。
 //! - **易失介质 = 本模块的宣告节**：install 启动时创建并持有，内容
 //!   `{installer_pid, 心跳毫秒}`（独立 ticker 周期 beat）。**install 进程
-//!   退出（done/abort/崩溃）节即消失 = 宣告自然解除**，零清理逻辑。
-//!   这是运行时「安装进行中」的唯一真相源。
+//!   退出（done/abort/崩溃）宣告即解除**：Windows 的节随进程消失；unix 的宣告是
+//!   文件，正常结束时删掉，崩溃残留的心跳不再走、自然失效，之后由续作或强制安装
+//!   删掉（见 [`clear_expired`]）。这是运行时「安装进行中」的唯一真相源。
 //!
 //! 看护者/守护读节判定：节存在 + 心跳新鲜 + pid 存活 = 宣告有效。挂死与
 //! unix 残留区分**正靠心跳过期**（Windows 节随进程死消失、只有挂死路径；
@@ -29,9 +30,10 @@ pub type Location = std::path::PathBuf;
 ///
 /// - Windows：命名共享内存节 `Local\aproxy-<run 目录标识>-install`（与控制端点同一套
 ///   命名空间规则），随持有它的进程消失，不落盘。
-/// - unix：`<home>/install/announce` 文件。永久兼容契约 C4 没有例外：安装者的一切状态
-///   都只放在 `<home>/install/` 下，强制安装清空它时一并清掉——否则被强制结束的安装者
-///   留下的宣告会让看护者反复拉起续作。早期开发构建曾放在 /dev/shm，alpha.1 起挪进来。
+/// - unix：`<home>/install/announce` 文件。永久兼容契约 C4：二进制安装的一切状态（状态
+///   文件、备料、下载临时文件、安装宣告）只放在 `<home>/install/` 下，没有例外；强制安装
+///   清空它时一并清掉，否则被强制结束的安装者留下的宣告会让看护者反复拉起续作。早期开发
+///   构建曾放在 /dev/shm，alpha.1 起挪进来，旧位置不再读。
 pub fn location(home: &Path, run_dir: &Path) -> Location {
     #[cfg(windows)]
     {
@@ -117,7 +119,7 @@ impl Announcer {
 impl Drop for Announcer {
     fn drop(&mut self) {
         // Windows：unmap + close → 节消失；unix：删掉宣告文件（done/abort 的主动
-        // 解除路径；崩溃残留靠心跳过期自然失效，强制安装清空 install/ 时也会删掉）
+        // 解除路径；崩溃残留靠心跳过期自然失效，之后由续作或强制安装删掉）
         if self.released.load(std::sync::atomic::Ordering::Relaxed) {
             imp::release_section(&mut self.section);
         } else {
@@ -129,6 +131,32 @@ impl Drop for Announcer {
 /// 读本 home 的宣告。节不存在 → None（无安装宣告——常态）。
 pub fn read(home: &Path, run_dir: &Path) -> Option<Announcement> {
     imp::load_section(&location(home, run_dir))
+}
+
+/// 删掉本 home 已过期的宣告。只在确认没有要续作的安装时调用（`install --continue` 发现
+/// 没有状态文件）：看护者见到过期的宣告就拉起续作，而 unix 的宣告是安装者崩溃时来不及删、
+/// 重启也不会消失的文件；留着它，看护者每轮都会拉起一个立即退出的续作，一直循环下去。
+/// 仍然有效的宣告（心跳新鲜、安装者还活着）不动；安装者挂死（进程还在、心跳停了）时也删：
+/// 没有状态文件，就没有它要推进的安装。
+///
+/// 判定与删除之间恰好有新的安装开始时（它先写状态文件、再在同一路径建宣告），新的宣告会
+/// 被一起删掉；窗口只有读一次文件、查一次进程的工夫，接受。丢了宣告的安装照常推进，只是
+/// 看护者与守护不知道它在安装；续作的接管判定读不到宣告时不接管，不会抢它的安装。
+///
+/// Windows 的宣告节随持有它的进程消失，节还在而心跳过期只可能是安装者挂死；节删不掉，
+/// 这里什么都不做。
+pub fn clear_expired(home: &Path, run_dir: &Path) {
+    #[cfg(not(windows))]
+    {
+        let path = location(home, run_dir);
+        if imp::load_section(&path)
+            .is_some_and(|ann| !is_active(&ann, crate::watchdog::now_millis()))
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    #[cfg(windows)]
+    let _ = (home, run_dir);
 }
 
 /// 宣告有效性判定（看护者/守护的唯一入口）：节存在 + 心跳新鲜 + pid 存活。
@@ -298,7 +326,8 @@ mod imp {
 
     pub fn destroy_section(section: &mut Section) {
         // unix 主动删除：done/abort 正常退出路径的宣告解除；崩溃残留由心跳过期自然
-        // 失效（与 Windows「节消失」殊途同归），强制安装清空 install/ 时也会删掉
+        // 失效（与 Windows「节消失」殊途同归），之后由续作（见 clear_expired）或强制
+        // 安装删掉
         let _ = std::fs::remove_file(&section.path);
     }
 

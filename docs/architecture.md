@@ -447,9 +447,10 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
   Windows 另有 PATHEXT 兜底入口 `aproxy.bat`（`aproxy.exe` 缺席的空窗里运行最新的
   `aproxy.old-*.exe`），由 swap 在每次交换前写入
 - **announce**：安装态宣告（Windows 是命名节，进程退出即解除；unix 是
-  `<home>/install/announce` 文件，正常结束时删掉，崩溃残留靠心跳过期失效，强制
-  安装清空 `install/` 时一并清掉）——看护者/守护的差异化行为全部由它门控：实例
-  死亡复查 5×3s、install 保活续作、守护自检补种抑制
+  `<home>/install/announce` 文件，正常结束时删掉，崩溃残留靠心跳过期失效，之后由
+  发现没有状态文件可续的 `install --continue` 删掉，强制安装清空 `install/` 时也一并
+  清掉）——看护者/守护的差异化行为全部由它门控：实例死亡复查 5×3s、install 保活
+  续作、守护自检补种抑制
 - **restart 与服务回滚**：实例重启原语（`install/restart.rs`）在停止之前把恢复
   参数记进 install.state 的在途清单，停止之后立即回写 `.restore`；新二进制起不来
   （bind 前退出、8 秒内没就绪）则用旧二进制按原参数把该实例拉回并置 `halted`，

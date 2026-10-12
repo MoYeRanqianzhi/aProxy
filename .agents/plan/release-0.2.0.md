@@ -167,8 +167,8 @@
   `<home>/install/lock` 是操作系统级排他锁（进程死亡自动释放），任何版本修改 `bin/` 期间都要持有它。锁原语冻结：unix
   `flock(fd, LOCK_EX|LOCK_NB)`；Windows `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY)`，offset 0、长度
   u64::MAX，CreateFile 的共享模式为 READ|WRITE、不带 DELETE（不用 std 的 `try_lock`：std 声明其实现可能改变）。打开与加锁
-  都在有上限的重试循环里。例外：Linux 的安装宣告是 `/dev/shm` 里按 home 命名的共享内存节，不在 `install/` 下；强制安装结束
-  安装者之后清掉本 home 的过期宣告。
+  都在有上限的重试循环里。没有例外：unix 的安装宣告是 `<home>/install/announce`（早期开发构建曾放在 `/dev/shm`，alpha.1
+  起挪进来），强制安装清空 `install/` 时一并清掉；Windows 的宣告是随进程消失的命名共享内存节，不落盘。
 - C5 `--version`：标准输出第一行 `aproxy v<semver> (<variant>; <target>[; x86-64-v3])`；退出码 0；不读写 home、
   不联网、不拉起任何进程，并且在一切副作用之前短路——将来 i18n 在解析参数前读 settings.json 判定语言，`--version`
   必须排在它前面（G2）。输出里任何以空白分隔的词都不得以数字开头（G6）：0.1.0 的安装器取「第一个以数字开头的词」
@@ -199,7 +199,7 @@
   3. 按台账结束 installer → 取得 C4 的锁 → 结束 watchdog、instance、desktop 与未知角色；反复扫描直到连续两轮没有存活
      条目（有上限）。结束前在同一进程句柄（Windows）或 pidfd（Linux）上核验启动标记与属主，杜绝 pid 复用的竞态。结束不掉
      就停在这里：一个都没结束是 10，否则 11。
-  4. 先删 `install/state.json`，再清空 `<home>/install/`（保留锁与本次的工作目录）；清掉本 home 的过期安装宣告。
+  4. 先删 `install/state.json`，再清空 `<home>/install/`（保留锁与本次的工作目录；unix 的安装宣告随之清掉）。
   5. 替换 `bin/` 下的二进制：先尽力清掉删得掉的旧残留；unix 把 `aproxy.tmp-…` 直接 rename 覆盖到位（原子）；Windows 先把
      现文件改名为唯一的 `aproxy.old-…`，再把 `aproxy.tmp-…` 改名到位，第二步失败立即改回。现文件被不带共享删除权限的句柄
      占着（例如杀毒软件正在扫描）导致改名失败时，短暂退避重试，仍失败则退出码 11（进程已停、二进制未动，可再跑一次）。

@@ -20,15 +20,17 @@ aproxy-desktop、Linux 自动选择变体、release-format 门禁、binstall 选
   用 `VersionLine::parse` 取变体、目标、指令集档，文件名必须与命名规则一致，`.sha256` 必须相符；写完用
   `Manifest::parse` 读回逐条核对。在只读权限的独立 job 里跑，release job 只上传。
 - **Linux gnu 带界面版**在 `container: ubuntu:22.04` 里构建（ubuntu-24.04 / 24.04-arm），断言 GLIBC_ 需求不高于
-  `DESKTOP_GLIBC_FLOOR`（取值待演练实测 objdump 后定；安装器探测用同一个数）。headless gnu 照旧 zigbuild 到 2.28。
+  `DESKTOP_GLIBC_FLOOR`（取值待演练实测 objdump 后定；install.sh 与 npm 启动器用同一个数）。headless gnu 照旧 zigbuild 到 2.28。
 - **npm**：加 headless 组（`@meowo/aproxy-headless` + 9 个平台包）；带界面组的两个 musl 平台包装 headless 的 musl
   二进制（musl 只有它）。启动器：带界面组在 glibc 低于带界面版下限时直接提示改装 headless；退出码 127 时重跑一次
   `--version` 抓 stderr，含 `error while loading shared libraries` 等加载失败字样就提示。
 - **crates.io 首发**：aproxy-desktop 是新 crate，可信发布做不了首发。拟请所有者本地发一个 0.0.0 占位版，再给它加
   release.yml / release 环境的可信发布配置，之后 CI 经 OIDC 发真版本（待主代理与所有者确认）。
 - **安装器选变体**：DownloadCtx 增加变体，资产名、npm 包名、binstall 地址、cargo `--no-default-features` 都随它；
-  普通安装也接受 `--variant`；Linux gnu 上要装带界面版时先探测（glibc 版本、dlopen webkit2gtk-4.1 读版本 ≥ 2.40），
-  不满足就装 headless 并说明；下载后 `--version` 起不来、变体又不是用户写明的，就改装 headless。
+  普通安装也接受 `--variant`。安装器（普通与 `--force`）不预先探测本机，只看下载下来的二进制 `--version` 能不能跑：
+  没写 `--variant` 的带界面版跑不起来就换同目标 headless，再换 musl headless（`DownloadCtx::attempts` /
+  `force::fallbacks`）；写明了的不换。主代理 2026-10-12 按第 4 步审查定的：预检会把这一版的系统要求冻进永久的
+  强制安装路径，`src/install/variant.rs` 已删。只有 install.sh（每次从 main 现取）在首装、没指定变体时先看本机。
 
 ## 进度
 
@@ -41,12 +43,18 @@ aproxy-desktop、Linux 自动选择变体、release-format 门禁、binstall 选
 - [x] 文档与 skill；binstall 给两个 musl 目标加了 overrides（逐个目标名，旧版 binstall 不认 cfg）
 - [x] 第 3 步审查转来的「普通安装不区分变体」已由 7a8882a 覆盖：变体取正在运行的构建（就是它 `--version` 的
   变体段），github 资产名、npm 包名、binstall 地址、cargo 的 `--no-default-features` 都随它；Linux 首装按探测选
-- [ ] 主代理首推 5928fcb 后的 ci.yml：ubuntu (desktop) 红在 tests/install_force.rs 的 4 个 online_* 测试（调试版
-  超过 256 MiB 的资产上限），be3893e 改调试构建只带行号表，待推送后确认；macOS 红是既有的（fad48c7 上就是同样 4 个 lib
-  测试，daemon 那个读不到自身进程的创建时间），不归第 4 步。release.yml 的 test job 同样跑 ubuntu (desktop) 的 cargo test，所以演练要等
-  be3893e 上了 main 再发起
+- [x] 主代理首推 5928fcb 后 ci.yml 的 ubuntu (desktop) 红在 tests/install_force.rs 的 4 个 online_* 测试（调试版超过
+  256 MiB 的资产上限）：be3893e 改调试构建只带行号表，fd622cd 的 CI（run 38273956900）里转绿。macOS 红是既有的
+  （fad48c7 上就是同样 4 个 lib 测试，daemon 那个读不到自身进程的创建时间），不归第 4 步
+- [ ] fd622cd 的 CI 里 ubuntu (headless) 偶发一次 ETXTBSY（install_swap 落位后核对「Text file busy」）：127dafa 让
+  run_version 退避重试，要看之后几次 ubuntu CI 不再出现
+- [x] 第 4 步审查（`.agents/review/2026-10-12-release-pipeline-review.md`，主代理的处理决定在文末）：8296a02（暂存件
+  补 x 位）、d9d1fc1（install.sh 写明 desktop 照装、--variant 缺值报错）、96d014f（删掉安装前的探测与 variant.rs，
+  回退链 DownloadCtx::attempts / force::fallbacks 带测试，通道为空也能换变体，命名只留一处，v3 只在发布它的目标上选）、
+  a86e2c0（文档与 skill）。两种变体全量测试各 559 通过
+- [ ] 演练的前提：be3893e 与 8296a02 都在 main 上（否则停在 test 门槛或冒烟上）
 - [ ] 主代理推送后跑演练：量 DESKTOP_GLIBC_FLOOR（objdump 的实际最高需求，低于 2.35 就一起改小：release.yml、
-  src/install/variant.rs、scripts/install.sh、npm/aproxy/bin/aproxy.js，以及 README、README_EN、CHANGELOG、docs、skill、
+  scripts/install.sh、npm/aproxy/bin/aproxy.js，以及 README、README_EN、CHANGELOG、docs、skill、
   npm README 里写的 2.35）、
   看 i686 / arm64 Windows 与 macOS x86_64 的带界面构建、容器 job、macOS fat LTO 内存、总时长
 - [ ] 所有者：aproxy-desktop 在 crates.io 的首发与可信发布配置（步骤在给主代理的报告里）

@@ -557,6 +557,12 @@ fn refusals_end_with_10_and_change_nothing() {
         Some(force::VARIANT_DESKTOP) => force::VARIANT_HEADLESS,
         _ => force::VARIANT_DESKTOP,
     };
+    // 一个 pid 已经不在的强制安装在第 1、2 步被打断时留下的工作目录：下一次开头就清掉
+    let stale_work = aproxy::install::install_dir_in(home.path())
+        .join("force")
+        .join((u32::MAX - 7).to_string());
+    std::fs::create_dir_all(&stale_work).unwrap();
+    std::fs::write(stale_work.join("aproxy"), b"x").unwrap();
 
     let exe = Path::new(env!("CARGO_BIN_EXE_aproxy"));
     let no_confirmation = home
@@ -596,12 +602,21 @@ fn refusals_end_with_10_and_change_nothing() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. 二进制换不成 → 退出码 11，bin 原样。Windows：bin 被不带共享删除权限的句柄占着；
-//    unix：bin 目录只读
+// 5. 二进制换不成，bin 原样。退出码按实际发生的事给：一个进程都没结束是 10，结束过才是
+//    11。Windows：bin 被不带共享删除权限的句柄占着；unix：bin 目录只读
 // ---------------------------------------------------------------------------
+
+/// 台账里登记一个测试自己的长时间运行的进程（实例角色），返回它：强制安装会结束它
+fn running_entry(home: &TestHome) -> Child {
+    let child = sleeper();
+    let marker = ledger::start_marker(child.id()).expect("子进程的启动标记可查");
+    write_entry(home.path(), child.id(), marker, ledger::ROLE_INSTANCE);
+    child
+}
+
 #[cfg(windows)]
 #[test]
-fn a_held_bin_ends_with_11_and_keeps_the_old_binary() {
+fn a_held_bin_ends_with_10_or_11_and_keeps_the_old_binary() {
     use std::os::windows::fs::OpenOptionsExt;
     let home = TestHome::new();
     let bin = home.seed_bin();
@@ -613,8 +628,15 @@ fn a_held_bin_ends_with_11_and_keeps_the_old_binary() {
         .share_mode(0x1)
         .open(&bin)
         .unwrap();
+    // 没有要结束的进程：什么都没动，10
+    let (idle_code, idle_output) = home.force_install(&["--from", next.to_str().unwrap()]);
+    // 结束了一个进程：11
+    let mut running = running_entry(&home);
     let (code, output) = home.force_install(&["--from", next.to_str().unwrap()]);
     drop(held);
+    let _ = running.kill();
+    let _ = running.wait();
+    assert_eq!(idle_code, Some(force::EXIT_UNCHANGED), "{idle_output}");
     assert_eq!(code, Some(force::EXIT_STOPPED), "{output}");
     assert_eq!(std::fs::read(&bin).unwrap(), original);
     assert!(home.retired().is_empty(), "{:?}", home.retired());
@@ -622,7 +644,7 @@ fn a_held_bin_ends_with_11_and_keeps_the_old_binary() {
 
 #[cfg(unix)]
 #[test]
-fn a_read_only_bin_dir_ends_with_11_and_keeps_the_old_binary() {
+fn a_read_only_bin_dir_ends_with_10_or_11_and_keeps_the_old_binary() {
     use std::os::unix::fs::PermissionsExt;
     let home = TestHome::new();
     let bin = home.seed_bin();
@@ -638,8 +660,14 @@ fn a_read_only_bin_dir_ends_with_11_and_keeps_the_old_binary() {
         eprintln!("以 root 运行：只读目录拦不住写入，跳过");
         return;
     }
+    // 没有要结束的进程：什么都没动，10；结束了一个进程：11
+    let (idle_code, idle_output) = home.force_install(&["--from", next.to_str().unwrap()]);
+    let mut running = running_entry(&home);
     let (code, output) = home.force_install(&["--from", next.to_str().unwrap()]);
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _ = running.kill();
+    let _ = running.wait();
+    assert_eq!(idle_code, Some(force::EXIT_UNCHANGED), "{idle_output}");
     assert_eq!(code, Some(force::EXIT_STOPPED), "{output}");
     assert_eq!(std::fs::read(&bin).unwrap(), original);
 }

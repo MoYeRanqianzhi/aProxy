@@ -13,9 +13,10 @@ use crate::cli::InstallArgs;
 pub(crate) async fn handle_force_cmd(args: &InstallArgs) -> ! {
     use aproxy::install::force;
     use std::io::Write;
-    // home 解析不了（永久兼容契约 C1：APROXY_HOME 不是绝对路径）就什么都不做：还没登记
-    // 台账，直接以 10 退出。写失败忽略（C7：写输出失败不得改变退出码）
-    let home = match aproxy::settings::resolve_home() {
+    // home 解析不了（永久兼容契约 C1：APROXY_HOME 不是绝对路径）或不存在，就什么都不做：
+    // 还没登记台账（登记会把 home 建出来），直接以 10 退出。写失败忽略（C7：写输出失败不得
+    // 改变退出码）
+    let home = match force::locate_home() {
         Ok(home) => home,
         Err(e) => {
             let _ = writeln!(

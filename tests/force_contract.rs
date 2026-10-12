@@ -903,6 +903,22 @@ fn c7_confirmation_needs_yes_when_not_interactive() {
 // C8：流程顺序
 // ---------------------------------------------------------------------------
 
+/// C8 第 1 步：home 不存在就以 10 结束（多半是 APROXY_HOME 写错了），也不把它建出来——
+/// 强制安装只修已经装着的 home，照样装下去只会在一个新目录里「成功」。
+#[test]
+fn c8_a_missing_home_ends_with_10_and_is_not_created() {
+    let parent = temp_home();
+    let home = parent.path().join("no-such-home");
+    let out = aproxy_in(
+        &home,
+        &["install", "--force", "--from", "no-such-file", "--yes"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(force::EXIT_UNCHANGED), "{stderr}");
+    assert!(stderr.contains("APROXY_HOME"), "{stderr}");
+    assert!(!home.exists(), "不存在的 home 不得被建出来");
+}
+
 /// C8 第 3 步「先按台账结束安装者，再拿安装锁」：台账里有一个正持有安装锁的安装者时，强制
 /// 安装先结束它（锁随进程死亡释放），再拿到锁、照常完成。顺序反过来，就会一直等这把锁、
 /// 等满之后以失败结束。

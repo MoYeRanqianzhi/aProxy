@@ -153,12 +153,16 @@ supported yet (neither is verified on real macOS hardware).
   platform from <https://github.com/MoYeRanqianzhi/aProxy/releases>, verify its
   `.sha256`, and run the download itself:
   `<downloaded binary> install --force --from <downloaded binary> --yes`.
-- Exit codes: `0` done. `10` nothing was changed; the `[ERROR]` line says why;
-  fix it and rerun. `11` processes were stopped but the binary was not
-  replaced; fix the reported cause and rerun the same command, or run
-  `aproxy restore` to bring the instances back on the old binary. `12` the
-  binary was replaced but the listed instances did not come back; start each
-  with `aproxy start <alias|config path>` and read `~/.aproxy/logs/startup.log`.
+- Exit codes: `0` done. `10` no process was stopped and the binary was not
+  replaced; the `[ERROR]` line says why; fix it and rerun. `11` at least one
+  process was stopped but the binary was not replaced; fix the reported cause
+  and rerun the same command, or run `aproxy restore` to bring the instances
+  back on the old binary. `12` the binary was replaced but the listed
+  instances did not come back; each line gives the command that starts it,
+  and `~/.aproxy/logs/startup.log` says why it failed.
+- It only repairs an existing installation: when the home directory does not
+  exist (usually a mistyped `APROXY_HOME`) it ends with `10`; install with the
+  bootstrap script first.
 - It does not update the skill documents; run `aproxy install --skills-only`
   afterwards.
 - It stops only processes recorded in the ledger. Processes started by 0.1.x

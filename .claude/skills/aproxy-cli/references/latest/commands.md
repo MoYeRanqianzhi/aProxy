@@ -581,7 +581,9 @@ the new version or restart instances one at a time. It:
 
 1. gets the target and checks it on this machine before changing anything: online through the
    `aproxy-manifest.json` attached to the release (asset picked by platform, variant and CPU, then
-   its sha256 checked), or the file given with `--from`; then it runs the target's `--version`;
+   its sha256 checked), or the file given with `--from`; then it runs the target's `--version`.
+   It only repairs an existing installation: when the home directory does not exist, usually a
+   mistyped `APROXY_HOME`, it ends with 10 (use the install script for a first install);
 2. asks for confirmation;
 3. stops every process recorded in `<home>/ledger/`: installers first, then the watchdog, the
    instances and anything else. It checks each process's start time before stopping it, so a pid
@@ -589,11 +591,13 @@ the new version or restart instances one at a time. It:
    stops only processes of the user running it: one owned by another user is skipped and
    reported (`跳过 …（只结束当前用户的进程）`, "skipped (only the current user's processes are
    stopped)"), and keeps running the old binary;
-4. empties `<home>/install/`, discarding any unfinished normal install;
+4. empties `<home>/install/`, discarding any unfinished normal install (its progress record
+   first);
 5. replaces the binary in `<home>/bin/`;
 6. runs the new binary's `aproxy restore`, which starts the stopped instances with their original
    arguments, and checks the ledger for an instance of the new version on each of their ports;
-7. lists processes that run from `<home>/bin/` but are not in the ledger, without stopping them.
+7. lists processes that run from `<home>/bin/` but are not in the ledger, without stopping them
+   (not on macOS, where the paths of other processes cannot be read).
 
 **Before you run it.** It cuts every request in flight through aProxy at once, including your own
 when your client points at one of these instances, and it stops instances the user may be using in
@@ -630,15 +634,16 @@ one, come only without the desktop interface. Rerun with a combination from that
 | Exit | Meaning | Next step |
 |---|---|---|
 | 0 | done: binary replaced, every stopped instance back on its port (`强制安装完成`, "force install complete") | none; `aproxy install --skills-only` for matching skill documents |
-| 10 | stopped before changing anything: the download, checksum or `--version` check failed, the target is below 0.2.0 or of the wrong variant, or there was no confirmation (`什么都没有改动`, "nothing was changed") | fix what the `[ERROR]` line names and run it again |
-| 11 | processes were stopped but the binary was not replaced: another process holds the install lock or the binary file, a process could not be stopped (another user's, or an elevated one), or a file could not be written | fix the reported cause and run the same command again; every step can be repeated. To give up for now, `aproxy restore` starts the stopped instances on the old binary |
+| 10 | nothing was stopped: the home does not exist, the download, checksum or `--version` check failed, the target is below 0.2.0 or of the wrong variant, there was no confirmation (`什么都没有改动`, "nothing was changed"), or a later step failed before any process had been stopped (`一个进程都没有结束`, "no process was stopped") | fix what the `[ERROR]` line names and run it again |
+| 11 | at least one process was stopped, but the binary was not replaced: another process holds the install lock or the binary file, a process could not be stopped (for example one running as administrator), or a file could not be written | fix the reported cause and run the same command again; every step can be repeated. To give up for now, `aproxy restore` starts the stopped instances on the old binary |
 | 12 | the binary was replaced, but the instances listed after `二进制已换好，但下面这些被结束的实例没有回来` ("binary replaced, but these stopped instances did not come back") are down | each line gives the port and the command to start it, `aproxy start --config "<config path>"`; `<home>/logs/startup.log` has the reason, often a config file that was moved or deleted |
 
 Two more notes can appear. `看护者已被结束…` ("the watchdog was stopped") is expected: a restored
 instance relaunches it within 5 minutes, and so does the next `aproxy start`.
 `注意：下面这些进程从 <dir> 运行，但不在台账里…` ("these processes run from `<dir>` but are not in the
-ledger") lists processes force install did not stop, usually 0.1.x instances or watchdogs, which
-keep no ledger. Stop those with the 0.1.x CLI (compatibility.md, "Moving from 0.1.x to 0.2.0").
+ledger") lists processes force install did not stop. They may be 0.1.x instances or watchdogs, which
+keep no ledger, or other programs placed in `bin/`; find out which before acting. Stop 0.1.x ones
+with the 0.1.x CLI (compatibility.md, "Moving from 0.1.x to 0.2.0").
 
 **When the installed `aproxy` does not run at all.** Download the release asset for this platform
 from https://github.com/MoYeRanqianzhi/aProxy/releases, check it against its `.sha256`, and, once the

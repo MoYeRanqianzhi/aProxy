@@ -19,24 +19,27 @@
 //! 流程（C8）：先验证、后破坏——新二进制取到 `<home>/install/force/` 下、校验、在本机
 //! 跑通 `--version` 之前，什么都不停；每一步可重入，中途被打断就再跑一次，最终收敛。
 //!
-//! 1. 取得目标（发布清单 C6 或 `--from`），校验 sha256，在本机执行 `--version` 核对；
-//!    失败 → 退出码 10，什么都没动。
+//! 1. home 不存在 → 10（多半是 APROXY_HOME 写错了，首次安装用一键脚本，见
+//!    [`locate_home`]）。清掉 pid 已经不在的旧 `install/force/<pid>/`。取得目标（发布清单
+//!    C6 或 `--from`），校验 sha256，在本机执行 `--version` 核对；失败 → 退出码 10，什么
+//!    都没动。
 //! 2. 确认（提示写到标准错误）：会中断所有经 aproxy 的在途请求，包括 agent 自己经 aproxy
 //!    的会话。`--yes` 跳过；标准输入不是终端又没有 `--yes` → 10，不卡着等输入。
 //! 3. 按台账结束安装者（本进程除外）→ 拿安装锁 → 结束看护者、实例、桌面界面与不认识
 //!    的角色；反复扫描直到连续两轮没有存活条目（有上限）。结束前核验启动标记与属主（只
 //!    结束当前用户的进程，见 `ledger::terminate`）。从这一步起，二进制换好之前的任何失败
-//!    → 11。
-//! 4. 清空 `<home>/install/`（保留锁与本次的目标文件）：留下的 install.state 会让续作在
-//!    强制安装之后接着推进一个旧的安装。
+//!    按实际发生的事给退出码：一个进程都没结束是 10，否则 11。
+//! 4. 先删 `install/state.json`，再清空 `<home>/install/`（保留锁与本次的目标文件），
+//!    再清掉本 home 过期的安装宣告：留下的状态文件会让续作在强制安装之后接着推进一个
+//!    旧的安装，过期的宣告会让看护者反复拉起续作。
 //! 5. 换 `bin/` 里的二进制（唯一中间名，见 `super::swap`），落位后在新位置再跑一次
 //!    `--version` 核对。
 //! 6. 尽力调用新版本的 `restore`。被强制结束的实例留下了 `.restore` 记录，restore 正是
 //!    凭它把实例拉回来，所以强制安装不删 `.restore`（`stop --force` 会删，两者不同）。
 //!    是否拉回只按台账判断：被结束实例的端口上出现了新的、版本等于目标版本的 instance
 //!    条目才算；没回来的按端口与配置文件（条目的 `config`）列出怎样启动 → 12。
-//! 7. 报告不在台账里、却从 `<home>/bin/` 运行的进程（例如 0.1.x 留下的），只报告、
-//!    不结束。
+//! 7. 报告不在台账里、却从 `<home>/bin/` 运行的进程（例如 0.1.x 留下的，但不一定是），
+//!    只报告、不结束。macOS 上查不到别的进程的镜像路径，这一步不做。
 //!
 //! 强制安装不更新 skill 文档，结束时提示怎样更新。
 
@@ -78,16 +81,17 @@ macro_rules! errln {
 /// 永久兼容契约 C7：无论如何都不得改动（理由见文件头）。
 pub const EXIT_DONE: i32 = 0;
 
-/// 退出码 10：在动任何东西之前就中止了——目标取不到、校验或 `--version` 不过、版本低于
-/// 0.2.0、没有得到确认。进程、二进制、`<home>/install/` 都没动，可以排除原因后重来。
+/// 退出码 10：什么都没动——一个进程都没结束。在第 1、2 步中止（home 不存在、目标取不到、
+/// 校验或 `--version` 不过、版本低于 0.2.0、没有得到确认），或者第 3 步起失败时还没有
+/// 结束任何进程（锁等不到、第一个进程就结束不了）。二进制没换，可以排除原因后重来。
 ///
 /// 永久兼容契约 C7：无论如何都不得改动。通用退出码只用 0–5（2 是命令行用法错误），
 /// 10 起留给强制安装，互不重叠。
 pub const EXIT_UNCHANGED: i32 = 10;
 
-/// 退出码 11：已经开始结束进程（第 3 步起），但 `bin/` 里的二进制没有换成。被结束的
-/// 进程不会自己回来；再执行一次同一条命令即可（每一步都可重入），放弃的话
-/// `aproxy restore` 会用原来的二进制把实例拉回来。
+/// 退出码 11：至少结束了一个进程，但 `bin/` 里的二进制没有换成。被结束的进程不会自己
+/// 回来；再执行一次同一条命令即可（每一步都可重入），放弃的话 `aproxy restore` 会用
+/// 原来的二进制把实例拉回来。
 ///
 /// 永久兼容契约 C7：无论如何都不得改动。
 pub const EXIT_STOPPED: i32 = 11;
@@ -757,10 +761,20 @@ fn stop_by_ledger(home: &Path, only_installers: bool, stops: &mut Stops) -> Resu
     ))
 }
 
-/// 第 4 步：清空 `<home>/install/`，保留锁与本次的目标目录。删不掉的跳过，但
-/// install.state 必须删掉——留着它，任何 aproxy 命令都会拉起续作，在强制安装之后接着
-/// 推进那个旧的安装（把它备好的旧版本换进 bin、把实例滚到它的目标版本）。
+/// 第 4 步：先删 install/state.json，再清空 `<home>/install/`（保留锁与本次的目标
+/// 目录）。状态文件必须删掉——留着它，任何 aproxy 命令都会拉起续作，在强制安装之后接着
+/// 推进那个旧的安装（把它备好的旧版本换进 bin、把实例滚到它的目标版本）；先删它，是
+/// 因为清空到一半被打断时，最要紧的这一件已经做完。其余删不掉的跳过。
 fn clear_install_dir(home: &Path, keep_work: &Path) -> Result<(), String> {
+    let state = super::state::state_path_in(home);
+    if let Err(e) = std::fs::remove_file(&state)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(format!(
+            "{} 删不掉（{e}）：留着它，之后的 aproxy 命令会接着推进那个未完成的普通安装",
+            state.display()
+        ));
+    }
     let dir = super::install_dir_in(home);
     let remove = |path: &Path| {
         let removed = if path.is_dir() {
@@ -790,14 +804,42 @@ fn clear_install_dir(home: &Path, keep_work: &Path) -> Result<(), String> {
             remove(&path);
         }
     }
-    let state = super::state::state_path_in(home);
-    if state.exists() {
+    Ok(())
+}
+
+/// 第 1 步之前：清掉 pid 已经不在的旧 `install/force/<pid>/`——在第 1、2 步被打断
+/// （Ctrl+C、确认时选了否之外的退出）的强制安装留下的已下载二进制。pid 还在的不动：
+/// 那可能是另一个正在进行的强制安装（它会在第 3 步被本次结束，工作目录在第 4 步清掉）。
+fn clear_stale_work_dirs(home: &Path) {
+    let force_dir = super::install_dir_in(home).join("force");
+    for item in std::fs::read_dir(&force_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let gone = item
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .is_some_and(|pid| crate::watchdog::process_start_time(pid).is_none());
+        if gone {
+            let _ = std::fs::remove_dir_all(item.path());
+        }
+    }
+}
+
+/// 解析并确认 home（永久兼容契约 C1）：APROXY_HOME 不是绝对路径、或 home 不存在 → Err，
+/// 调用方以 10 结束（什么都没动）。强制安装只修已经装着的 home：home 不存在多半是
+/// APROXY_HOME 写错了，照样装下去只会在一个新目录里「成功」，真正要修的那个原封不动。
+pub fn locate_home() -> Result<PathBuf, String> {
+    let home = crate::settings::resolve_home()?;
+    if !home.is_dir() {
         return Err(format!(
-            "{} 删不掉：留着它，之后的 aproxy 命令会接着推进那个未完成的普通安装",
-            state.display()
+            "aproxy 的主目录 {} 不存在：强制安装只修已经装着的 aproxy，多半是 APROXY_HOME 写错了；首次安装请用一键安装脚本。",
+            home.display()
         ));
     }
-    Ok(())
+    Ok(home)
 }
 
 /// 子进程的一路输出：子进程写进工作目录里的一个文件，本进程边等边读出新增的部分，转写到
@@ -989,8 +1031,9 @@ fn process_ids() -> Vec<u32> {
     Vec::new()
 }
 
-/// 第 7 步：报告不在台账里、却从 `<home>/bin/` 运行的进程（例如 0.1.x 留下的——0.1.x
-/// 不写台账）。只报告，不结束：结束进程只认台账里核验过的条目。
+/// 第 7 步：报告不在台账里、却从 `<home>/bin/` 运行的进程。它们可能是 0.1.x 留下的（0.1.x
+/// 不写台账），也可能是放在 bin 里的别的程序，所以措辞不下结论。只报告，不结束：结束
+/// 进程只认台账里核验过的条目。macOS 上查不到别的进程的镜像路径，结果恒为空。
 fn report_strays(home: &Path) {
     let me = std::process::id();
     let known: Vec<u32> = ledger::read_all_in(home)
@@ -1007,13 +1050,15 @@ fn report_strays(home: &Path) {
         return;
     }
     outln!(
-        "注意：下面这些进程从 {} 运行，但不在台账里（多半是 0.1.x 留下的，0.1.x 不写台账），强制安装没有结束它们：",
+        "注意：下面这些进程从 {} 运行，但不在台账里，强制安装没有结束它们（例如 0.1.x 启动的 aproxy——0.1.x 不写台账；也可能是放在 bin 里的别的程序）：",
         bin_dir.display()
     );
     for (pid, image) in &strays {
         outln!("  pid {pid}  {}", image.display());
     }
-    outln!("  确认它们属于这个 home 之后，用当初启动它们的那个 aproxy 版本执行 stop 停掉。");
+    outln!(
+        "  先确认它们是什么再处理：0.1.x 的 aproxy 用当初启动它们的 0.1.x 执行 aproxy stop 停掉。"
+    );
 }
 
 /// 第 2 步：问一句。标准输入不是终端时不卡着等输入，直接返回 Err（退出码 10）。提示写到
@@ -1078,6 +1123,7 @@ pub async fn run(home: &Path, request: &ForceRequest) -> i32 {
         .join("force")
         .join(std::process::id().to_string());
     let dest = work.join(super::staging::binary_name());
+    clear_stale_work_dirs(home);
     // 用完丢掉工作目录。force/ 与 install/ 因此变空时（多半是本次才建的）一并删掉：退出码
     // 10 说「什么都没动」，就连空目录也不留；install/ 里还有别的东西（安装锁、进行中的
     // 普通安装）时 remove_dir 失败，什么都不删
@@ -1218,13 +1264,17 @@ async fn acquire_from_github(
 /// 有实例没回来是 12。
 fn replace(home: &Path, target: &Acquired, work: &Path) -> i32 {
     let mut stops = Stops::default();
+    // 退出码按实际发生的事给（C7）：一个进程都没结束是 10——即便 install/ 已被清掉一部分，
+    // 也没有任何东西需要恢复；结束过进程才是 11，它们不会自己回来
     let fail_stopped = |stopped: &[LedgerEntry], e: &str| {
         errln!("[ERROR] {e}");
         if stopped.is_empty() {
-            errln!("bin 里的二进制没有换（退出码 {EXIT_STOPPED}）。");
-        } else {
-            errln!("已经结束了上面列出的进程，但 bin 里的二进制没有换（退出码 {EXIT_STOPPED}）。");
+            errln!(
+                "一个进程都没有结束，bin 里的二进制也没有换（退出码 {EXIT_UNCHANGED}）。排除原因后再执行一次即可。"
+            );
+            return EXIT_UNCHANGED;
         }
+        errln!("已经结束了上面列出的进程，但 bin 里的二进制没有换（退出码 {EXIT_STOPPED}）。");
         errln!(
             "排除原因后再执行一次同一条命令即可（每一步都可重入）。暂时不再重试的话，`aproxy restore` 会用原来的二进制把被结束的实例拉回来。"
         );
@@ -1249,6 +1299,7 @@ fn replace(home: &Path, target: &Acquired, work: &Path) -> i32 {
     if let Err(e) = clear_install_dir(home, work) {
         return fail_stopped(&stopped, &e);
     }
+    super::announce::clear_stale(&crate::daemon::run_dir());
 
     // ---- 第 5 步：换二进制。落位后在新位置核对版本，不符就换回原来的
     let outcome = match swap::swap_in(home, &target.path, &target.line.version, None, |_| Ok(())) {

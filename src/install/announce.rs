@@ -120,6 +120,21 @@ pub fn read(run_dir: &Path) -> Option<Announcement> {
     imp::load_section(&announcement_name(run_dir))
 }
 
+/// 清掉本 home 已过期的宣告（强制安装结束全部安装者之后调用）。unix 的宣告是 /dev/shm
+/// 里按 home 命名的持久文件，安装者被强制结束时来不及删；留着它，看护者每轮都会因为
+/// 「宣告在、心跳过期」拉起一个短命的 `install --continue`，直到重启。仍然有效的宣告
+/// （心跳新鲜、安装者还活着）不动。Windows 的宣告节随持有它的进程一起消失，无事可做。
+pub fn clear_stale(run_dir: &Path) {
+    #[cfg(not(windows))]
+    if let Some(ann) = read(run_dir)
+        && !is_active(&ann, crate::watchdog::now_millis())
+    {
+        let _ = std::fs::remove_file(imp::shm_path(&announcement_name(run_dir)));
+    }
+    #[cfg(windows)]
+    let _ = run_dir;
+}
+
 /// 宣告有效性判定（看护者/守护的唯一入口）：节存在 + 心跳新鲜 + pid 存活。
 /// 心跳旧 = install 挂死/unix 残留 → 无效（走保活续作路径，不是「在安装」）。
 pub fn is_active(ann: &Announcement, now_ms: u64) -> bool {
@@ -235,7 +250,7 @@ mod imp {
 mod imp {
     use super::{Announcement, Section};
 
-    fn shm_path(name: &str) -> String {
+    pub fn shm_path(name: &str) -> String {
         format!("/dev/shm/{name}")
     }
 
@@ -321,6 +336,35 @@ mod tests {
             imp::load_section(&announcement_name(run.path())).is_none(),
             "Drop 后宣告应解除（Windows 节消失 / unix unlink）"
         );
+    }
+
+    /// 强制安装结束安装者之后清过期宣告：仍有效的（心跳新鲜、安装者活着）不动；unix 上
+    /// 心跳过期的持久文件删掉（Windows 的节随进程消失，没有这种残留）。
+    #[test]
+    fn clearing_stale_announcements_keeps_the_active_one() {
+        let run = tempfile::tempdir().unwrap();
+        let active = Announcer::create(run.path()).expect("宣告节创建失败");
+        active.beat();
+        clear_stale(run.path());
+        assert!(read(run.path()).is_some(), "有效的宣告不得被清掉");
+        drop(active);
+        #[cfg(not(windows))]
+        {
+            // 崩溃残留：安装者早已不在、心跳很旧
+            let name = announcement_name(run.path());
+            let stale = imp::create_section(
+                &name,
+                Announcement {
+                    installer_pid: u32::MAX - 7,
+                    heartbeat_ms: 1,
+                },
+            )
+            .expect("宣告文件创建失败");
+            drop(stale);
+            assert!(read(run.path()).is_some());
+            clear_stale(run.path());
+            assert!(read(run.path()).is_none(), "过期的宣告应已清掉");
+        }
     }
 
     #[test]

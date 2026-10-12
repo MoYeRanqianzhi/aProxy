@@ -1,6 +1,6 @@
 ---
 name: aproxy-cli
-description: Operate and configure aProxy, the local API proxy that retries failed LLM API requests indefinitely so agent workflows keep running. Covers every aproxy command (start, status, stop, restart, logs, restore, alias, find, doctor, config, install/upgrade, and install --force for a failed upgrade or a broken binary), the config.toml and settings.json fields, runtime behavior (retries, keepalive heartbeats, multiple instances, logs, watchdog), connecting agent clients such as Claude Code and Codex, and troubleshooting. Use this skill whenever the user mentions aproxy or wants an agent client routed through a local retrying proxy, even if they do not ask for documentation - for example "point Claude Code at aproxy", "add a second instance on port 12346", "why is the port still in use after stop", "/compact hangs behind my relay API". Configuring request_transform / response_transform on the aProxy side is covered here; writing the format program itself belongs to the aproxy-format skill.
+description: Operate and configure aProxy, the local API proxy that retries failed LLM API requests indefinitely so agent workflows keep running. Covers every aproxy command (start, status, stop, restart, logs, restore, alias, find, doctor, config, desktop, install/upgrade, and install --force for a failed upgrade or a broken binary), the config.toml and settings.json fields, runtime behavior (retries, keepalive heartbeats, multiple instances, logs, watchdog), connecting agent clients such as Claude Code and Codex, and troubleshooting. Use this skill whenever the user mentions aproxy or wants an agent client routed through a local retrying proxy, even if they do not ask for documentation - for example "point Claude Code at aproxy", "add a second instance on port 12346", "why is the port still in use after stop", "/compact hangs behind my relay API". Configuring request_transform / response_transform on the aProxy side is covered here; writing the format program itself belongs to the aproxy-format skill.
 ---
 
 # aProxy
@@ -85,6 +85,9 @@ Every other client, the reasoning behind the timeouts, and how to verify the set
   config file path. A bare number is always a port.
 - `aproxy restart PORT|ALIAS` applies config changes: it stops the instance and starts it again
   with its original arguments. It does not start an instance that is not running; use `start`.
+- `aproxy desktop` opens the desktop window. In 0.2.0-alpha.1 it is a preview that shows demo
+  data, not this machine's instances, so never take the state of the proxies from it; the CLI is
+  the source of truth. Details: commands.md, desktop.
 
 ### Change configuration
 

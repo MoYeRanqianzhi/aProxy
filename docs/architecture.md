@@ -41,9 +41,9 @@ home 的实例。
 
 | 模块 | 职责 |
 |---|---|
-| `src/main.rs` | 进程入口：控制台代码页、配置文件定位、日志初始化、子命令分派（仅 ~110 行） |
+| `src/main.rs` | 进程入口：C5 的 `--version`、控制台代码页、在建 tokio 运行时之前分派 `desktop`、其余子命令在手建的运行时里分派（配置文件定位、日志初始化） |
 | `src/cli.rs` | clap 命令树定义（`Cli`/`Commands`/`AliasCmd`/`ConfigArgs`），只承载定义不含逻辑 |
-| `src/commands/` | 十一个子命令各自一文件（start/status/stop/restart/restore/alias/doctor/find/logs/config/install），共享 target 解析在 `mod.rs` |
+| `src/commands/` | 十二个子命令各自一文件（start/status/stop/restart/restore/alias/doctor/find/logs/config/install/desktop），共享 target 解析在 `mod.rs` |
 | `src/server.rs` | 服务承载：`serve_forever` 主循环、停止信号、日志初始化、配置错误落盘 startup.log |
 | `src/proxy.rs` | 转发核心：入站来源校验（Host/Origin）、hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、保活通道与提交点、断开保护、仅转发模式 |
 | `src/transform.rs` | 外部转换器编排：stdin/stdout 一行 JSON 信封交给外部 format 程序改写（spawn 与 persistent 统一进程池、空闲 reaper、超时/崩溃 worker 剔除）；信封契约在独立 crate `aproxy-envelope` |
@@ -56,7 +56,7 @@ home 的实例。
 | `src/ledger.rs` | 进程台账 `<home>/ledger/`（永久兼容契约 C3）：长期运行的进程登记 pid、启动标记与角色，强制安装据此核验后结束进程 |
 | `src/util.rs` | bin 侧共用小工具：时间戳、时长人性化、凭据打码、key=value 解析 |
 
-## workspace 三成员
+## workspace 四成员
 
 - **aproxy**（根包）：代理本体。编译闭包不含 switchyard 等转换库——本体
   体积不受外部转换器功能影响。
@@ -71,6 +71,8 @@ home 的实例。
   + key 轮换/加权轮换 + 多模型多渠道聚合）。版本独立于 aproxy alpha 线，
   单独发 Release（format tag 触发独立 workflow）；它稳定后几乎不更新——
   更多功能用户直接让 agent 写 format（见 aproxy-format skill）。
+- **aproxy-desktop**：桌面界面（Tauri 2 外壳与嵌入的前端），aproxy 的 `desktop` 特性引入它，
+  版本与 aproxy 同步。它不依赖 aproxy（否则成环）。见「桌面界面」。
 
 CLI 定义（cli.rs）与子命令处理（commands/）分离；启动父进程逻辑（预检/spawn）
 在 `commands/start.rs`，服务本身在 `server.rs`——守护子进程由前者直接进入后者。
@@ -501,6 +503,71 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
 跨平台分工：状态机/IPC/恢复全部平台无关，平台分支只收口在交换原语、
 宣告节介质、可执行位，以及台账的启动标记与核验后结束（`ledger::imp`）。
 
+## 桌面界面（aproxy-desktop）
+
+`aproxy desktop` 打开的窗口：Tauri 2 外壳加嵌入的前端（`aproxy-desktop/ui/`，Vite + Svelte 5 +
+TypeScript）。0.2.0-alpha.1 的界面是预览版，数据全部来自前端的 mock 后端，界面顶部常驻
+「预览版 · 演示数据」标签。
+
+**两种变体。** 根包的 `desktop` 特性（默认开）就是对 aproxy-desktop 的可选依赖；
+`--no-default-features` 出无界面的 headless 版本，依赖树里没有任何界面 crate（CI 用
+`cargo tree` 断言）。`--version` 的变体段按特性输出（C5）。headless 版本也认得 `desktop`
+子命令（帮助里隐藏），执行时只说明怎样换装，不让用户看到 clap 的「unrecognized subcommand」。
+
+**测试程序不链接 Tauri（RT-05）。** 链进 Tauri 的 Windows 程序可能在 main 之前就退出：
+Common-Controls v6 清单只经 tauri-build 嵌给声明它的包自己的 bin，到不了依赖它的 aproxy.exe
+与各个测试程序。对策有三层：tauri 关掉默认特性 `common-controls-v6`，exe 不再静态导入只有
+v6 才有的 `TaskDialogIndirect`，没有清单也能启动（`aproxy --version` 由此不受影响）；aproxy
+的 lib 永不引用 aproxy_desktop，bin 里引用它的代码只在 `#[cfg(all(feature = "desktop",
+not(test)))]` 下编译，rustc 不链接没被引用的依赖，所以单元测试与 `tests/` 的集成测试都不含
+Tauri；aproxy-desktop 自己 `[lib] test = false`。理由的细节在 `aproxy-desktop/Cargo.toml`。
+
+**进程与线程。** `main` 先兑现 C5 的 `--version`，解析参数后在建 tokio 运行时之前分派
+`desktop`：Tauri 的事件循环要占住主线程（macOS 硬性要求），而 `block_on` 里的主线程处在
+异步上下文，Tauri 回调里再 `block_on` 会 panic。`desktop` 自己建多线程运行时，`enter` 之后经
+`tauri::async_runtime::set` 交给 Tauri，再进事件循环；其余命令在手建的运行时里 `block_on`，
+与原先的 `#[tokio::main]` 等价。
+
+**启动与退出**（`src/commands/desktop.rs`）：解析 home（C1）→ 同一个 home 已有存活的界面
+（台账角色 `desktop`）就提示并以 0 退出 → 预检（Windows 问 WebView2 的版本，没装或
+`WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` 指错时报错；Linux 先看 `DISPLAY`/`WAYLAND_DISPLAY`）→
+登记台账（C3）→ 建窗口、进事件循环 → 窗口关掉后删台账条目，按事件循环的退出码退出。
+Tauri 在许多运行期失败上直接 panic，所以预检放在前面，setup 里的失败记下来、请事件循环以
+非零退出码结束，图形后端初始化时的 panic 被接住换成说明。webview 的数据目录是
+`<home>/desktop/webview`：不显式指定时 Tauri 用按 identifier 建的应用数据目录，跑到
+`APROXY_HOME` 之外，测试与多份部署就隔离不了。
+
+**Windows 的控制台。** aproxy.exe 是控制台程序。从终端启动时控制台与 shell 共用：检查都在
+终端里做完，再分离出一个不带控制台的子进程承载窗口，本进程立即退出，终端随即可用。从
+快捷方式或资源管理器启动时控制台是系统专为它新建的：立刻 `FreeConsole`，控制台窗口只闪
+一下，之后的说明改用对话框。两种情形由 `GetConsoleProcessList` 区分。
+
+**窗口。** 主窗口由 Rust 建（`tauri.conf.json` 的 `app.windows` 为空），以 `visible: false`
+创建，页面脚本跑起来后自己 `show()`，启动时不先闪白底；3 秒内没显示由 Rust 兜底显示。
+Windows 上装 tauri-custom-titlebar 的自定义标题栏：原生的最小化/最大化/关闭按钮与 Snap
+Layouts 留在右上角，页面画标题栏的其余部分；`src/titlebar.rs` 是那个 skill 的原样文件，
+装不上时退回原生标题栏，不让界面因此打不开。Mica 默认关，设置页的开关经 Tauri 的窗口接口
+切换；支持与否由 Rust 判定（build ≥ 22523，且 window-vibrancy 在隐藏的窗口上试用成功），
+系统的「透明效果」关着时设置页标明 Mica 会显示为纯色。
+
+**不联网、权限最小。** CSP 只放行嵌入的资源与 IPC，吉祥物的沙箱页单独加 `script-src
+blob:`；窗口只许停在嵌入的页面上；权限（`capabilities/main.json`）只授权页面用到的窗口接口
+与本包的三个命令，自定义命令经 app manifest 纳入权限检查。各项取舍写在
+`aproxy-desktop/src/lib.rs` 的开头（`tauri.conf.json` 写不了注释）。
+
+**前端产物。** `generate_context!` 在编译期把 `aproxy-desktop/dist/` 嵌进二进制。dist 不进
+git，缺失时 build.rs 报错并给出构建步骤，不拿占位页面凑数——凑出来的二进制看起来正常、
+界面却是空的，发布时也认不出来。CI 带界面的任务先 `npm ci && npm run build`。crates.io 上的
+aproxy-desktop 带着构建好的 dist、不带 `ui/` 的源码，`cargo install aproxy` 不需要 Node.js。
+tauri-build 每次构建都在包根写 `gen/schemas/`，`cargo package` 的校验构建因此报
+「Source directory was modified by build.rs」（2026-10-12 实测），发布这个包要另行处理。
+
+**接缝。** 界面组件只经 Backend 接口（`ui/src/lib/backend/types.ts`）取数据、发命令，预览版
+用的是 mock 实现；接真实数据时换成 IPC 实现，aproxy-desktop 里加相应的命令。aproxy-desktop
+需要的 home 与运行时由 bin 经 `Options` 交进去。浏览器开发模式（`npm run dev`）里另有原型件
+（`ui/src/proto/`：审核工具条、模拟的窗口按钮与 Mica、吉祥物预览页），只在开发服务器里动态
+加载，生产构建不含它们。
+
 ## 测试
 
 - 单元测试（lib + bin）：重试判定、配置分层、IPC 协议、注册表/恢复记录、打码、claim 选举、退避状态机、安装状态机/下载链条/zip 安全
@@ -512,10 +579,14 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
   job 跑 clippy + test（windows 的 clippy 不编译 `#[cfg(unix)]` 代码，零警告纪律在
   ubuntu 补上 unix 面）；clippy 与 test 一律带 `--workspace`（根包是 aproxy 且
   `[workspace]` 未设 default-members，不带时 aproxy-envelope 与 aproxy-format 的测试
-  从不进入门禁），test 带 `--no-fail-fast` 一次拿到完整失败面。macOS 是独立 job，
-  **已知红**（`/dev/shm`、`/proc` 依赖，见「平台」）：不设 skip 也不设
-  `continue-on-error`，红色就是「未完成」的如实信号，独立成 job 后不淹没其他平台
-  的结论
+  从不进入门禁），test 带 `--no-fail-fast` 一次拿到完整失败面。windows 与 ubuntu 都按
+  带界面（desktop，先用 Node 构建前端，ubuntu 另装 `libwebkit2gtk-4.1-dev`）与 headless
+  （`--no-default-features --exclude aproxy-desktop`）两种变体各跑一遍，每种都对构建出的
+  aproxy 跑 `--version` 冒烟（`.github/scripts/version-smoke.sh`，按 C5 核对版本、变体与
+  目标三元组）；headless 另断言依赖树里没有任何界面 crate。macos-build 只要求两种变体都
+  编得过。macOS 测试是独立 job，**已知红**（`/dev/shm`、`/proc` 依赖，见「平台」）：不设
+  skip 也不设 `continue-on-error`，红色就是「未完成」的如实信号，独立成 job 后不淹没其他
+  平台的结论
 - **发布门禁**（`release.yml`）：tag 触发后先在 windows 与 ubuntu 上复跑
   fmt/clippy/test（tag 可能落后于 main），全绿才进入多平台构建；macOS 不进门禁。
   渠道发布幂等：npm 与 crates.io 两个 job 都先查询注册表、版本已存在才跳过，所以
@@ -539,6 +610,10 @@ unix 分支（UDS IPC、`/dev/shm` 心跳、`/proc` 进程查询、单步 rename
 补齐之前 README 的平台矩阵如实标注为暂不支持。macOS 的代理转发路径不依赖它们，
 可用。
 
+桌面界面另有平台前提：Windows 要 WebView2 运行时（Windows 11 自带）；Linux 的带界面构建
+动态链接 WebKitGTK 4.1，缺库时整个二进制都起不来，所以 musl 只有 headless，没有图形界面的
+机器也该用 headless；macOS 只保证两种变体都编得过。
+
 ### Linux gnu 产物的 glibc 下限
 
 在 ubuntu-24.04 runner 上直接构建的 gnu 产物会链接 glibc 2.39，Debian 12、
@@ -561,7 +636,8 @@ Ubuntu 22.04 等系统启动即报 `GLIBC_2.39 not found`（alpha.17 实测如�
 
 - **0.1.x**：0.1.0 是首个稳定版（此前为 `0.1.0-alpha.*` 预发布）；无 UI，纯 CLI + 守护。
 - **0.2.0**：当前开发线（`0.2.0-alpha.*` 预发布）。与 0.1.x 互不兼容、不能原地升级
-  （迁移步骤见 CHANGELOG），可安装版本的下限是 0.2.0；引入 UI。
+  （迁移步骤见 CHANGELOG），可安装版本的下限是 0.2.0；引入桌面界面（alpha.1 是显示演示
+  数据的预览版，见「桌面界面」）。
 - 发布产物：x86_64 的 Windows 与 Linux gnu 同时提供 baseline 与 x86-64-v3
   （AVX2）两种指令集变体，`aproxy install` 运行时检测后自动选择（失败回退
   baseline），一键安装脚本保守地装 baseline；musl 与其他架构只有 baseline。

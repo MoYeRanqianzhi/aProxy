@@ -13,6 +13,7 @@ troubleshooting.md.
 - [start](#start) · [status](#status) · [stop](#stop) · [restart](#restart) · [logs](#logs) ·
   [restore](#restore)
 - [alias](#alias) · [find](#find) · [doctor](#doctor) · [config](#config)
+- [desktop](#desktop): the desktop window
 - [install / upgrade](#install--upgrade), including recovery from a failed install and
   [force install](#force-install)
 
@@ -36,7 +37,8 @@ directory, and `install --force` ends with 10.
 | `<home>/logs/` | instance logs (random file names) and `startup.log` |
 | `<home>/bin/` | the binary managed by `aproxy install`; on Windows also `aproxy.bat` (see install / upgrade). Files named `aproxy.old-…` and `aproxy.tmp-…` are left by binary swaps; installs delete the ones they can |
 | `<home>/install/` | `aproxy install`'s own files: the progress record `state.json` while an install runs, downloads and staged binaries in `staging/<version>/`, the install script's downloads in `bootstrap/`, force install's download in `force/`, and `lock`, held while `bin/` changes |
-| `<home>/ledger/` | one `<pid>.json` per running aproxy process (instances, the watchdog, installers), written at start and deleted at exit. `aproxy install --force` finds the processes to stop here. Leave these files alone |
+| `<home>/ledger/` | one `<pid>.json` per running aproxy process (instances, the watchdog, installers, the desktop window), written at start and deleted at exit. `aproxy install --force` finds the processes to stop here. Leave these files alone |
+| `<home>/desktop/` | the desktop window's web view data (see desktop) |
 | `<home>/skills/` | skill documents placed by `aproxy install` |
 
 ### Experiment in an isolated home
@@ -105,6 +107,7 @@ reaches only one of them; use ports.
 | alias | success | invalid name, missing file, unknown alias, unparsable settings.json, write failure |
 | doctor | always, **even when it reports errors** | never |
 | config | success | invalid value, unparsable existing toml or settings.json, missing config file on read, write failure |
+| desktop | the window was closed; a window is already open for this home; on Windows from a terminal, the window was opened | headless build; no web view runtime or no display; the window failed to start |
 | install | installed; already latest; channel empty; nothing to abort | any failure |
 
 `install --force` exits 0, 10, 11 or 12 instead; see install / upgrade, Force install.
@@ -120,8 +123,10 @@ killing `aproxy` by image name takes everything down at once. Tell them apart by
 | `--daemon-watchdog` | the watchdog that restarts crashed or hung instances (behaviors.md, "Crash recovery and the watchdog") |
 | `install --continue` | a background step of an install that is finishing or resuming |
 | `install --force` | a force install in progress; it stops every other aproxy process of its home |
+| `desktop` | the desktop window; it holds no port and closes with its window |
 
-These flags are internal; never pass them yourself.
+`--daemon-child`, `--daemon-watchdog` and `install --continue` are internal; never pass them
+yourself.
 
 ## Global options
 
@@ -455,6 +460,45 @@ aproxy --config "~/.aproxy/configs/work.toml" config --baseurl https://api.examp
 aproxy alias add work "~/.aproxy/configs/work.toml"
 aproxy start work
 ```
+
+## desktop
+
+```
+aproxy desktop
+```
+
+Opens the desktop window. It is a separate process that runs until its window is closed; it starts,
+stops and reconfigures nothing, so opening or closing it never affects running instances. It opens
+on the user's screen, so run it only when the user asks for the window.
+
+**In 0.2.0-alpha.1 the window is a preview filled with demo data.** The instances, logs and counts
+it shows are made up, not the ones on this machine, and a label `预览版 · 演示数据` ("preview · demo
+data") stays on screen to say so. Never read the state of the user's proxies from it, and never
+tell the user that what it shows is real; use `aproxy status` and `aproxy logs`.
+
+- **Windows, from a terminal:** the command returns at once with `已打开 aProxy 桌面界面（pid <pid>）。`
+  ("desktop window opened") and the window runs on its own. Started from a shortcut or Explorer,
+  its messages appear in a dialog box instead. **Linux and macOS:** the command stays in the
+  foreground until the window is closed.
+- **One window per home.** A second `aproxy desktop` under the same `<home>` prints
+  `aProxy 桌面界面已经在运行（pid <pid>）。这个版本还不会把它切到前台，请在任务栏里找到它。`
+  ("already running; this version cannot bring it to the front, find it in the taskbar") and exits
+  0. Under another `APROXY_HOME` it opens a separate window, with its own web view data in that
+  home's `desktop/`.
+- **When it cannot open**, it prints `[ERROR] …` on stderr and exits 1 without a window: no
+  Microsoft Edge WebView2 runtime on Windows (Windows 11 ships it; Windows 10 may need it
+  installed, and `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` pointing at the wrong directory has the
+  same effect), or on Linux no graphical session (`DISPLAY` and `WAYLAND_DISPLAY` both unset, as
+  in an ssh session). The proxy and every other command work without these, so a failing window
+  is never a reason to touch the instances.
+- **On Linux a desktop build needs the WebKitGTK 4.1 libraries to run at all.** Without them the
+  system loader refuses to start the binary, so even `aproxy --version` fails, naming a missing
+  library such as `libwebkit2gtk-4.1.so.0`. Such machines need the headless build.
+- **Headless builds have no window.** When `aproxy --version` says `headless`, `aproxy desktop`
+  explains that and exits 1; the command is also missing from `aproxy --help` there. The way to
+  the desktop build is `aproxy install --force --variant desktop`, which stops every aproxy process
+  of the home and cuts requests in flight (Force install), so ask the user first. musl builds come
+  only as headless; on a glibc Linux, the gnu build has the desktop variant.
 
 ## install / upgrade
 

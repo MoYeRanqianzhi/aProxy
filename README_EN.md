@@ -114,8 +114,12 @@ standard location):
 ```sh
 npm install -g @meowo/aproxy     # picks the right binary; stable releases use the latest tag
 npm install -g @meowo/aproxy@next  # pre-releases use the next tag; ask for it explicitly
-cargo install aproxy             # builds from source; needs rustc 1.89+
+cargo install aproxy             # builds from source; needs rustc 1.90+
 ```
+
+`cargo install` builds the version with the desktop interface by default; on Linux, install the
+WebKitGTK 4.1 development package first (Debian/Ubuntu: `libwebkit2gtk-4.1-dev`). Add
+`--no-default-features` for the headless build without an interface.
 
 Upgrades: `aproxy install` replaces the binary and rolling-restarts running
 instances one by one without client-visible downtime (`--from <path>` installs
@@ -161,9 +165,18 @@ From source:
 
 ```powershell
 git clone https://github.com/MoYeRanqianzhi/aProxy.git
-cd aProxy
+cd aProxy/aproxy-desktop/ui
+npm ci
+npm run build          # the desktop front end, written to aproxy-desktop/dist; needs Node.js 20.19+ or 22.12+
+cd ../..
 cargo build --release
 ```
+
+The desktop front end is compiled into the binary, so the build with the interface needs it built
+first; without it, compilation stops with an error that says what to do. Without the interface,
+skip the front end and run `cargo build --release --no-default-features` for the headless build,
+which needs no Node.js. On Linux the build with the interface also needs the WebKitGTK 4.1
+development package (see above).
 
 ## Platform support
 
@@ -291,9 +304,30 @@ timeout (for Claude Code, `API_TIMEOUT_MS`).
 | `aproxy doctor` | Config health check: settings.json errors + alias/toml review (warnings) |
 | `aproxy find [keyword]` | Discover all configs in configured directories; `--aliased/--unaliased --port PORT` filters |
 | `aproxy config [options]` | View or modify the config (`--show` prints it) |
+| `aproxy desktop` | Open the desktop window (a preview showing demo data; see below) |
 
 Global flags: `--config <PATH>` (multi-instance), `--listen <ADDR>`,
 `--proxy <URL>`, `--api-key <KEY>` (current launch only).
+
+## Desktop window (preview)
+
+`aproxy desktop` opens the desktop window. It is a separate process that exits when its window is
+closed; it starts, stops and changes no instance.
+
+- **In 0.2.0-alpha.1 the window is a preview**: the instances, request logs and statistics in it
+  are demo data, not the aProxy running on your computer, and a "Preview · demo data" label stays
+  at the top of the window. Real data comes in a later version; until then `aproxy status` and
+  `aproxy logs` are the source of truth.
+- Windows needs the Microsoft Edge WebView2 runtime (built into Windows 11; on Windows 10, install
+  it when told to). Run from a terminal, the command returns at once and the window runs on its
+  own.
+- Linux needs a graphical session and WebKitGTK 4.1. The build with the interface links WebKitGTK
+  dynamically, so without those libraries the program does not start at all (not even
+  `aproxy --version`); use the headless build on machines without a graphical interface. musl
+  builds come only as headless.
+- One window per home; running it again says it is already open.
+- Headless builds (`headless` as the first word in the parentheses of `aproxy --version`) have no
+  window; `aproxy desktop` there explains how to switch to the build with the interface.
 
 ## Multi-instance & aliases
 
@@ -449,6 +483,19 @@ cargo test --workspace --locked                                # full suite (inc
 cargo clippy --workspace --all-targets --locked -- -D warnings # must be warning-free (project rule)
 cargo fmt --all -- --check
 ```
+
+The default features include the desktop interface, so build the front end once before compiling
+(see "From source"). Check the headless build too, excluding `aproxy-desktop` (it is a workspace
+member, and `--no-default-features` does not reach it):
+
+```sh
+cargo test --workspace --exclude aproxy-desktop --no-default-features --locked
+cargo clippy --workspace --exclude aproxy-desktop --all-targets --no-default-features --locked -- -D warnings
+```
+
+Interface work: `npm run dev` in `aproxy-desktop/ui` opens the prototype in a browser, with its
+review toolbar and simulated window; afterwards `npm run build` (svelte-check first, zero
+warnings) and compile aproxy.
 
 Architecture docs in [`docs/`](docs/); agent-facing development docs in
 `.agents/docs/`.

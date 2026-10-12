@@ -54,8 +54,10 @@ curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/
 ```sh
 npm install -g @meowo/aproxy     # 按平台自动选二进制；正式版发在 latest 标签
 npm install -g @meowo/aproxy@next  # 预发布发在 next 标签，需显式指定
-cargo install aproxy             # 源码编译，需 rustc 1.89+
+cargo install aproxy             # 源码编译，需 rustc 1.90+
 ```
+
+`cargo install` 默认编带桌面界面的版本，Linux 上要先装 WebKitGTK 4.1 的开发包（Debian/Ubuntu：`libwebkit2gtk-4.1-dev`）；不要界面就加 `--no-default-features`，编出无界面的 headless 版本。
 
 升级：`aproxy install`（在线下载链条自动滚动重启，逐实例无感；`--from <路径>` 本地安装、`--adopt` 收编既有安装）。
 - **更新通道**：`install` 默认的 `latest` 在「通道」内取版本号最大者。当前是正式版则只取正式版（不会被带到预发布）；当前是预发布（如 alpha）则默认就在预发布通道；`--pre` 显式让预发布参与选择。只认 `vX.Y.Z` / `vX.Y.Z-(alpha|beta|rc).N`，按版本号而非创建时间比较，`format-v*` 与历史测试 tag 不参与。通道内没有更新版本时提示「已是最新」或「暂无可用版本」并保持现状，不会偷偷换通道。指定具体版本号（`aproxy install 0.2.0`）不受通道影响；低于当前版本的目标默认拒绝，需 `--allow-downgrade`；低于 0.2.0 的版本一律不装。
@@ -67,9 +69,14 @@ cargo install aproxy             # 源码编译，需 rustc 1.89+
 
 ```powershell
 git clone https://github.com/MoYeRanqianzhi/aProxy.git
-cd aProxy
+cd aProxy/aproxy-desktop/ui
+npm ci
+npm run build          # 桌面界面的前端，输出到 aproxy-desktop/dist；需要 Node.js 20.19+ 或 22.12+
+cd ../..
 cargo build --release
 ```
+
+桌面界面的前端编进二进制，所以带界面的版本要先构建前端，缺了它编译会报错并说明做法。不要界面时跳过前端，用 `cargo build --release --no-default-features` 编无界面的 headless 版本，不需要 Node.js。Linux 编带界面的版本还要 WebKitGTK 4.1 的开发包（见上）。
 
 ## 平台支持
 
@@ -174,8 +181,19 @@ Codex 的 `stream_idle_timeout_ms` 默认 300000（5 分钟），按 SSE 事件�
 | `aproxy doctor` | 配置体检：settings.json error 级检查 + 别名配置与目录 toml 审查（warning） |
 | `aproxy find [关键字]` | 从配置目录发现全部配置；`--aliased/--unaliased --port PORT` 过滤 |
 | `aproxy config [选项]` | 查看或修改配置（`--show` 打印当前配置） |
+| `aproxy desktop` | 打开桌面界面（预览版，显示的是演示数据，见下） |
 
 通用参数：`--config <PATH>`（指定配置文件，多开用）、`--listen <ADDR>`、`--proxy <URL>`、`--api-key <KEY>`（启动路径仅本次生效）。
+
+## 桌面界面（预览）
+
+`aproxy desktop` 打开桌面界面。它是一个独立的窗口进程，关掉窗口就退出，不启停、不改动任何实例。
+
+- **0.2.0-alpha.1 的界面是预览版**：里面的实例、请求日志与统计都是演示数据，不是这台电脑上正在运行的 aProxy，界面顶部常驻「预览版 · 演示数据」标签。真实数据在之后的版本接入，在那之前以 `aproxy status`、`aproxy logs` 为准。
+- Windows 需要 Microsoft Edge WebView2 运行时（Windows 11 自带，Windows 10 没有时按提示安装）。从终端运行时命令立即返回，窗口独立运行。
+- Linux 需要图形会话与 WebKitGTK 4.1。带界面的版本动态链接 WebKitGTK，缺这些库时整个程序都起不来（连 `aproxy --version` 也不行），没有图形界面的机器请用无界面的 headless 版本；musl 构建只有 headless 版本。
+- 同一个 home 只开一个窗口，再次运行会提示已经在运行。
+- headless 版本（`aproxy --version` 括号里的第一段是 `headless`）没有界面，运行 `aproxy desktop` 会说明怎样换装带界面的版本。
 
 ## 多开与别名
 
@@ -278,6 +296,15 @@ cargo test --workspace --locked           # 全量测试（含 aproxy-envelope /
 cargo clippy --workspace --all-targets --locked -- -D warnings   # 必须零警告（项目纪律）
 cargo fmt --all -- --check
 ```
+
+默认特性带桌面界面，编译之前先构建一次前端（见「源码构建」）。无界面的 headless 版本同样要过一遍，排除 `aproxy-desktop`（它是 workspace 成员，`--no-default-features` 管不到它）：
+
+```powershell
+cargo test --workspace --exclude aproxy-desktop --no-default-features --locked
+cargo clippy --workspace --exclude aproxy-desktop --all-targets --no-default-features --locked -- -D warnings
+```
+
+界面开发：在 `aproxy-desktop/ui` 里 `npm run dev`，浏览器里打开的是带审核工具条与模拟窗口的原型；改完 `npm run build`（先跑 svelte-check，零警告），再编译 aproxy。
 
 架构与开发文档见 [`docs/`](docs/)；面向 agent 的开发文档在 `.agents/docs/`。
 

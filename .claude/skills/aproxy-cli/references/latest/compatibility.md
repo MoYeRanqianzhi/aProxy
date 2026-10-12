@@ -71,6 +71,7 @@ does not have. These development-line changes alter what you see or do on 0.1.0:
 | `upstream_url` is accepted as another name for `base_url` | only `base_url` is read; rename the key |
 | `keepalive_heartbeat` is ignored; heartbeats are always `: keepalive` | the heartbeat is configurable (config-toml.md) |
 | `heartbeat_transform` is ignored, and transformer envelopes carry no `stage`, `request_id` or `state` | heartbeats can come from a format program, and both transformer sides of a request share `request_id` and `state` (aproxy-format skill) |
+| There is no `aproxy desktop` | builds with the desktop interface open a window with it; in 0.2.0-alpha.1 it shows demo data only (commands.md, desktop) |
 | There is no `aproxy install --force` and no process ledger | force install stops every process of the home through `<home>/ledger/` and replaces the binary (commands.md, Force install) |
 | The CPU build option is `--variant v3\|baseline`, and the swap renames the old binary to the fixed name `aproxy.old(.exe)` | the option is `--cpu x86-64-v3\|baseline` (`--variant` belongs to `--force`), and the swap uses unique names `aproxy.old-<nanoseconds>-<pid>[.exe]` (commands.md, install / upgrade) |
 

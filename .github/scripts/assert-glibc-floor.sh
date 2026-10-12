@@ -5,7 +5,7 @@
 # 哪怕引用它的符号是弱符号（alpha.17 实证：std 对 pidfd_spawnp 的弱引用仍带出非弱的 GLIBC_2.39
 # 需求）。objdump -p 输出的 "Version References" 就是 verneed。非数字的 GLIBC_ 需求（如链接器打开
 # DT_RELR 时出现的 GLIBC_ABI_DT_RELR，要求 glibc 2.36+）同样判失败。下限必须与安装脚本、npm
-# 启动器、安装器探测本机 glibc 时用的数一致，否则它们会把产物装到跑不起来的系统上。
+# 启动器判断本机 glibc 时用的数一致，否则它们会把产物装到跑不起来的系统上。
 #
 # 用法：assert-glibc-floor.sh <二进制> <glibc 下限，如 2.28>
 set -euo pipefail

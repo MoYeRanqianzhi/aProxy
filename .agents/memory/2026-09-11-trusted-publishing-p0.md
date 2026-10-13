@@ -62,3 +62,13 @@
 - 不把 token 写进任何文件：`--userconfig` 指向的临时文件里只写 `${NPM_TOKEN}` 占位，token 只在当条命令的
   环境变量里出现。crates.io 的 token 只用于只读核对（`GET /api/v1/trusted_publishing/github_configs?crate=`）：
   aproxy #19617、aproxy-envelope #23481/#23482、aproxy-format #23480 均在。
+
+## 2026-10-13：aproxy-desktop 的 crates.io 种子发布（0.2.0-alpha.1 之前）
+
+- 新 crate 做不了可信发布首发。用户在会话里明确授权主代理用他 2026-10-11 给的 crates.io token 代办（「这件事你自己在终端做，之前的token还有效，等做完我再撤销权限」）。
+- 做法：在仓库之外的临时目录建只有一行 crate 文档的占位包，`aproxy-desktop 0.0.0`，edition 2024，带 description、license、repository。
+  - 本机 cargo 配了 rsproxy 镜像，要 `cargo publish --registry crates-io`。
+  - token 只放在当条命令的 `CARGO_REGISTRY_TOKEN` 里，不进任何文件；临时目录用完即删。
+- 随后用第 3 条的 API 创建可信发布配置 #25198（MoYeRanqianzhi/aProxy、release.yml、release），回读一致。字段照 aproxy 的 #19617 填写。
+- 同一个 token 有 publish-new 与可信发布读写的权限。用户说做完就撤销，之后要用 token 得重新向所有者要。
+- `GET /api/v1/me` 用 token 访问会回「只能在网站上操作」，不能拿它判断 token 是否有效；用可信发布配置的只读查询判断。

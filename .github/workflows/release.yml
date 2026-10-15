@@ -79,7 +79,7 @@ jobs:
         run: |
           npm ci
           npm run build
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: frontend-dist
           path: aproxy-desktop/dist
@@ -226,7 +226,7 @@ jobs:
       - name: Smoke-test --version (C5)
         shell: bash
         run: bash .github/scripts/version-smoke.sh "dist/$ASSET" ${{ matrix.ui }} ${{ matrix.target }} ${{ matrix.cpu }}
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: release-bin-${{ env.ASSET }}
           path: dist
@@ -292,7 +292,7 @@ jobs:
       - name: Smoke-test --version (C5)
         shell: bash
         run: bash .github/scripts/version-smoke.sh "dist/$ASSET" desktop ${{ matrix.target }} ${{ matrix.cpu }}
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: release-bin-${{ env.ASSET }}
           path: dist
@@ -319,7 +319,7 @@ jobs:
             (cd .claude/skills && zip -qr "../../aproxy-skill-${name}.zip" "$name")
             sha256sum "aproxy-skill-${name}.zip" > "aproxy-skill-${name}.zip.sha256"
           done
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: release-skills
           path: |
@@ -350,7 +350,7 @@ jobs:
         run: python3 .github/scripts/align-version.py
       - name: Generate and verify aproxy-manifest.json
         run: cargo run --locked --no-default-features --example release-manifest -- "$RELEASE_VERSION" artifacts aproxy-manifest.json
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: release-manifest
           path: aproxy-manifest.json

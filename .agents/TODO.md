@@ -32,7 +32,7 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   或清单的 consoleAllocationPolicy=detached——后者作用于整个 exe，守护进程拉起的 worker 会不会弹窗未验证）；Linux 上
   「跟随系统」读不到深浅色（要开 tauri 的 dbus 特性、CI 装 libdbus-1-dev，W5）；界面偏好（含 Mica 开关）只在内存里，
   重启恢复默认（随 W2 的 settings 与 W5 持久化）
-- [ ] **alpha.1 第 4 步：发布流水线**（release.yml 与 release-format.yml 在默认带界面后会坏：没有前端产物、没有 WebKitGTK、
+- [x] **alpha.1 第 4 步：发布流水线**（release.yml 与 release-format.yml 在默认带界面后会坏：没有前端产物、没有 WebKitGTK、
   musl 与交叉编译要 `--no-default-features`；aproxy-desktop 首发 crates.io 要所有者种子发布）。2026-10-12 提交
   f1f463d、7a8882a…62223c6，第 4 步审查的修复 8296a02…a86e2c0；workflow_dispatch 演练 2026-10-12 全绿（run
   38279211569），带界面版 glibc 下限按实测改 2.34；修复核对的 N1–N6 已提交（4468243、ac6ce9d），CI 过了门槛。剩
@@ -48,7 +48,10 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] **W5 UI**（Tauri 2 编进本体、`desktop` feature 默认开、headless 版本；自定义标题栏；Mica 默认关可开）
 - [ ] **README 截图**（用户 2026-10-12）：UI 完成后构造演示数据，拍中英两套截图，中文版用于 README.md，英文版用于
   README_EN.md。演示数据里不能出现真实的 key、上游地址或个人信息
-- [ ] **W6 审查发现的修复与重构**；另含 W1 留下的：`install --from` 不做降级检查（审查 CI-06）
+- [ ] **W6 审查发现的修复与重构**；另含 W1 留下的：`install --from` 不做降级检查（审查 CI-06）；以及
+  `tests/restart_integration.rs:170`（`restart_after_port_change_reports_new_port`）断言失败时打印 restart 的 stdout 与
+  stderr，再查 2026-10-12 演练 38291736162 的 test (windows-latest, desktop) 里那次偶发（现在只有「restart 应成功，实际
+  exit 非零」，查不了原因；同一提交 458900f 的 ci.yml 里 windows 是绿的）
 - [ ] **W7 发布 0.2.0**。另外两件：
   - 撤回预发布期的措辞（`--pre` / `@next` / `--version`、「目前只有预发布」）。2026-10-13 文档终审列的位置：README.md 31、60–63，
     README_EN.md 81、135–142、183，docs/INSTALL_AGENT.md 54–58、156，compatibility.md 步骤 3，CHANGELOG.md 24；

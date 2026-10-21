@@ -218,7 +218,7 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/aproxy-format${{ matrix.ext }}" "dist/$env:ASSET"
           $hash = (Get-FileHash "dist/$env:ASSET" -Algorithm SHA256).Hash.ToLower()
           "$hash  $env:ASSET" | Out-File -NoNewline -Encoding ascii "dist/$env:ASSET.sha256"
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: format-bin-${{ matrix.target }}${{ matrix.variant }}
           path: dist

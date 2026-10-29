@@ -60,7 +60,7 @@ jobs:
         with:
           components: clippy, rustfmt
       # 两种变体的编译产物不同，缓存分开存（rust-cache 的自动键不含 matrix 取值）
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: ${{ matrix.variant }}
       - uses: actions/setup-node@v7.1.0
@@ -113,7 +113,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: ${{ matrix.variant }}
       # 只装 webkit2gtk-4.1 的开发包（它带进 GTK3、libsoup3、JavaScriptCore 的开发包）。Tauri
@@ -174,7 +174,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - name: Download the v0.1.0 release binary
         shell: bash
         run: |
@@ -193,7 +193,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - uses: actions/setup-node@v7.1.0
         with:
           node-version: 24
@@ -224,7 +224,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - uses: actions/setup-node@v7.1.0
         with:
           node-version: 24

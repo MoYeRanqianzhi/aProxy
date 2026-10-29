@@ -60,7 +60,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --exclude aproxy-desktop --no-default-features --all-targets --locked -- -D warnings
       # 不带目标过滤的 cargo test 会顺带编译 examples——transform_integration
@@ -154,7 +154,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: format-${{ matrix.target }}${{ matrix.variant }}
       # 版本对齐：format-v0.1.0 → aproxy-format/Cargo.toml 与 Cargo.lock 的

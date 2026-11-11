@@ -13,7 +13,8 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 
 ## 0.2.0（2026-10-11 用户下令）
 
-计划：[plan/release-0.2.0.md](plan/release-0.2.0.md)；定调：[0.2.0-direction](memory/2026-10-11-0.2.0-direction.md)。
+计划：[plan/release-0.2.0.md](plan/release-0.2.0.md)，执行顺序、tag 节点与进度在它的「执行顺序与进度」一节（2026-11-11 用户：
+做完 0.2.0、过程中持续提交与打 tag）；定调：[0.2.0-direction](memory/2026-10-11-0.2.0-direction.md)。
 
 - [x] **四路审查收口**（2026-10-11）：报告与综合稿在 `.agents/review/2026-10-11-0.2.0-audit/`，结论已并入计划
 - [x] **W1 去除兼容**（2026-10-12，a54896b…7537128 + fbcc738；Windows 全量 490 通过，ubuntu 看推送后的 CI）：兼容层与 relaying 删除、`--version` 永久格式（C5）、安装状态迁到 `<home>/install/`、版本下限 0.2.0、upgrade-from-0-1-0 改为断言 0.1.0 干净拒绝、迁移文档
@@ -23,21 +24,17 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   实现落地后重写永久接口清单
 - [x] **W2b `install --force` + 进程台账**（alpha.1 第 2 步，2026-10-12 完成：2f1df42…fad48c7；独立审查
   `.agents/review/2026-10-12-force-install-review.md` 无 P0，P1 与选定的 P2 全部修完；Windows 全量 549 通过，CI 三平台核过）。
-  剩余：release.yml 生成并校验 `aproxy-manifest.json`（第 4 步）；有两个带强制安装的版本后加跨版本强制安装的 CI 测试；
-  桌面界面拉起强制安装时 stdio 为 null（W5）
-- [ ] **alpha.1 第 3 步：Tauri 桌面外壳**（2026-10-12 提交 58c1518…a7cf72f，Windows 两种变体各 552 通过、实机验过；推送前
+  发布清单的生成与校验已随第 4 步落地。剩余：有两个带强制安装的版本（alpha.1 之后的下一个 tag）后加跨版本强制安装的
+  CI 测试；桌面界面拉起强制安装时 stdio 为 null（W5）
+- [x] **alpha.1 第 3 步：Tauri 桌面外壳**（2026-10-12 提交 58c1518…a7cf72f，Windows 两种变体各 552 通过、实机验过；推送前
   审查 `.agents/review/2026-10-12-desktop-shell-review.md` 的应该修 1–4 与可以不修里定下要修的 a、b、d–l 已在 fbb65ee…267e712 落实；
-  推送后 ubuntu (desktop) 的 4 个 install_force 测试因调试版超过资产上限失败，be3893e 改调试构建只带行号表，待 CI 确认；
-  Linux 带界面版的链接与运行等推送后的 CI）。留到以后的：从快捷方式启动会闪一下终端（要 GUI 子系统的启动器，
-  或清单的 consoleAllocationPolicy=detached——后者作用于整个 exe，守护进程拉起的 worker 会不会弹窗未验证）；Linux 上
-  「跟随系统」读不到深浅色（要开 tauri 的 dbus 特性、CI 装 libdbus-1-dev，W5）；界面偏好（含 Mica 开关）只在内存里，
-  重启恢复默认（随 W2 的 settings 与 W5 持久化）
+  be3893e 改调试构建只带行号表之后，ubuntu (desktop) 的 install_force 测试在 CI 转绿（run 38273956900）；Linux 带界面版的
+  链接与运行由 alpha.1 的发布构建与容器里的 `--version` 冒烟证实）。留下的三件并入 W5
 - [x] **alpha.1 第 4 步：发布流水线**（release.yml 与 release-format.yml 在默认带界面后会坏：没有前端产物、没有 WebKitGTK、
   musl 与交叉编译要 `--no-default-features`；aproxy-desktop 首发 crates.io 要所有者种子发布）。2026-10-12 提交
   f1f463d、7a8882a…62223c6，第 4 步审查的修复 8296a02…a86e2c0；workflow_dispatch 演练 2026-10-12 全绿（run
-  38279211569），带界面版 glibc 下限按实测改 2.34；修复核对的 N1–N6 已提交（4468243、ac6ce9d），CI 过了门槛。剩
-  aproxy-envelope 随主线对齐、tag 前的再次演练与所有者的种子发布，交接记录见
-  [release-pipeline-step4](plan/release-pipeline-step4.md)
+  38279211569），带界面版 glibc 下限按实测改 2.34；修复核对的 N1–N6 已提交（4468243、ac6ce9d），CI 过了门槛。
+  2026-10-13 发布 run 38331800678 成功。交接记录已关闭，最后版本 `git show 7b52641^:.agents/plan/release-pipeline-step4.md`
 - [ ] **format-v* 线在 aproxy 0.2.0 正式版之前发布前，先定 envelope 怎么办**：envelope 现在随主线同号发预发布版
   （align-version.py），release-format.yml 只对齐 aproxy-format 自己，于是会按仓库里的开发版本号（例如
   0.2.0-alpha.0，不对应任何 aproxy 发布）把 envelope 发出去，aproxy-format 也依赖一个预发布版。现在不发 format
@@ -45,7 +42,10 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   改公开 API 必须手动升版本，见记忆 transform-format）
 - [ ] **W3 i18n**（给用户看的 en/zh-CN，给 agent 或不可见的固定英文）
 - [ ] **W4 `aproxy skill` 命令**（install/upgrade/list/show，show 的安全设计，`--help` 末尾提示行）
-- [ ] **W5 UI**（Tauri 2 编进本体、`desktop` feature 默认开、headless 版本；自定义标题栏；Mica 默认关可开）
+- [ ] **W5 UI**（Tauri 2 编进本体、`desktop` feature 默认开、headless 版本；自定义标题栏；Mica 默认关可开）。第 3 步留下的：
+  从快捷方式启动会闪一下终端（要 GUI 子系统的启动器，或清单的 consoleAllocationPolicy=detached——后者作用于整个 exe，
+  守护进程拉起的 worker 会不会弹窗未验证）；Linux 上「跟随系统」读不到深浅色（要开 tauri 的 dbus 特性、CI 装
+  libdbus-1-dev）；界面偏好（含 Mica 开关）只在内存里，重启恢复默认（随 W2 的 settings `ui` 段持久化）
 - [ ] **README 截图**（用户 2026-10-12）：UI 完成后构造演示数据，拍中英两套截图，中文版用于 README.md，英文版用于
   README_EN.md。演示数据里不能出现真实的 key、上游地址或个人信息
 - [ ] **W6 审查发现的修复与重构**；另含 W1 留下的：`install --from` 不做降级检查（审查 CI-06）；以及
@@ -66,7 +66,8 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 
 ### 以后可能会做（低优先级，暂不做）
 - [ ] embeddings、图片等非对话接口的转换
-- [x] **（所有者）给 10 个 headless npm 包绑定可信发布**：包已于 2026-10-11 以 0.0.0 占位发布，所有者同日告知绑定完成（主代理无权查看信任配置，未独立核验；第一次 CI 发布 headless 包时才算验证）
+- [x] **（所有者）给 10 个 headless npm 包绑定可信发布**：包已于 2026-10-11 以 0.0.0 占位发布，所有者同日告知绑定完成。
+  已验证：alpha.1 的发布 run 38331800678 把 `@meowo/aproxy-headless` 发成 0.2.0-alpha.1（`next`），带 provenance（2026-11-11 `npm view` 核对）
 
 ## 下一版发布前（2026-10-06 用户下令）
 

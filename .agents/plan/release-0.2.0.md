@@ -7,6 +7,7 @@
 > 「不建 aproxy-ipc / aproxy-ui crate」被用户「新增两个 crate」的提议取代（见 W5）。
 > 2026-10-12：alpha.1 第 1 步（W1）完成并推送（fbcc738）；第 2 步（台账 + 强制安装）由子代理实现中；UI 原型按用户
 > 第一轮风格反馈返工中（第一版仍带偏移硬阴影，未达要求）。
+> 2026-11-11：v0.2.0-alpha.1 已于 10-13 发布（五步全部完成）；余下工作的顺序、tag 节点与进度见文末「执行顺序与进度」。
 
 ## 目标
 
@@ -458,8 +459,37 @@
 - 版本 0.2.0（是否先发预发布版待定）、CHANGELOG、README / docs / skill 同步、skill references 是否留存
   0.1.0 份（按 aproxy-cli-skill-versioning 记忆判断）、CI 与发版矩阵。
 
-## 下一步
+## 执行顺序与进度（2026-11-11 起）
 
-1. 收齐四份审查报告，汇总成一张发现清单（P0 / P1 / P2），与本计划的工作流对齐、排序。
-2. 先做 W1（独立、确定），同时出 W2 的契约设计稿。
-3. W2 定稿后再动 W3 基础设施、W4、W5。
+用户 2026-11-11：「不需要单独发版。处理以上问题。完成0.2.0的核心功能，现在发的版本功能还缺很多，需要发出真正功能完备、
+可以使用、有精美UI的0.2.0版本。过程中持续提交和设置tag」。据此：提交与推送 main、在里程碑处打预发布 tag 都已授权；安全修复
+不单独发版，随下一个 tag 发出。
+
+**做法**（每个后来接手的会话照此执行）：
+- 主代理编排，按块派子代理实现。本机空闲内存约 4 GB（15.6 GB 总量，2026-11-11），同一时刻只跑一个 cargo 重编译，所以 Rust
+  的块一个接一个做；不编译的工作（前端对 mock 开发、文档、skill）可以并行，前端代理用独立 worktree（它的 `npm run build`
+  会改 `aproxy-desktop/dist/`，与 cargo 构建带界面版冲突）。
+- 每块的验收按 [w2-contracts](w2-contracts.md) §14 的表；提交用 `git commit -- <路径>`；两个变体 clippy `-D warnings`
+  零输出；推送后看 CI（windows、ubuntu 两种变体与 upgrade 任务是门槛，macOS 那 4 个 lib 测试是已知红）和 Review
+  （cargo-deny 也要绿，它会因新公告变红而与代码无关）。
+- 打 tag 的步骤：用 `.github/scripts/align-version.py` 的规则改版本号（根包、aproxy-desktop、aproxy-envelope 同号，
+  见 fe88cdf）→ 推送、CI 绿 → 自上次成功发布以来 release.yml 或打包有改动就先跑一次 workflow_dispatch 演练 →
+  打 tag 推送 → 盯发布 run → 核对 GitHub Release、npm 两组的 `next`、crates.io。
+- **新 crate 的首发**：B0 新建的 aproxy-ipc 要在下一个 tag 之前在 crates.io 种子发布 0.0.0 并绑定可信发布，需要所有者的
+  token 或所有者自己发（做法见记忆 trusted-publishing-p0 的 2026-10-13 一节）。
+
+**阶段与 tag**（✓ 为已完成）：
+- 阶段 0（2026-11-11）：✓ 依赖安全修复 9e45495（12 条 RUSTSEC，zip 升 9）；✓ Actions 升级 9087969；✓ TODO 整理。
+  dependabot：#8、#9、#11–#15 由这两个提交覆盖；#10（base64 0.23）关闭——headless 构建里 base64 只有一份 0.22，
+  envelope 单独升会多一份重复，等 reqwest、hyper-util 换版本时再看；#6（toml 1.x）、#7（sha2 0.11）归 P3。
+- 阶段 1，前置重构：P1 → P2 → P4 → P3 → P5（§14.1；内存所限不并行）。
+- 阶段 2，契约块：B0 → B1 → B2 → B3 → B4 → **tag alpha.2** → B5 → B6 → B7 → B8 → B9 → **tag alpha.3** →
+  B10a → B10b、B10c → B10d → B11 与 W2c → **tag alpha.4**。B12（文档、skill、记忆）随各块。alpha.2 之后补跨版本强制安装
+  的 CI 测试（TODO 的 W2b 一条）。
+- 阶段 3：W4 `aproxy skill`、W3 i18n、W5 界面接入真实数据（前端可提前对 §6 的形状做 mock 侧的工作）→ **tag beta.1**。
+- 阶段 4：W6 修复（含 restart 偶发、`install --from` 降级检查）、0.1.0 skill 支线的防护（W4 一节最后一条：skills 资产换名、
+  npm 包内路径换、crate 不再带 `.claude/skills/`）、文档与 README 截图、W7 撤回预发布措辞与重写 SECURITY.md →
+  **tag rc.1** → **v0.2.0**（aproxy-envelope 同时发 0.2.0；aproxy-format 0.2.0 随后走 format-v* 线，见 TODO 的 envelope 一条）。
+
+**进度记录**（每块完成时追加一行：块、提交、验证）：
+- （空）

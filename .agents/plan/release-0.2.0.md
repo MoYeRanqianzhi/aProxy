@@ -466,9 +466,10 @@
 不单独发版，随下一个 tag 发出。
 
 **做法**（每个后来接手的会话照此执行）：
-- 主代理编排，按块派子代理实现。本机空闲内存约 4 GB（15.6 GB 总量，2026-11-11），同一时刻只跑一个 cargo 重编译，所以 Rust
-  的块一个接一个做；不编译的工作（前端对 mock 开发、文档、skill）可以并行，前端代理用独立 worktree（它的 `npm run build`
-  会改 `aproxy-desktop/dist/`，与 cargo 构建带界面版冲突）。
+- 主代理直接实现各块（P1 已派出的子代理除外），少用子代理；只把边界清楚的小任务交出去。本机可用内存约 4.4 GB
+  （15.6 GB 总量，2026-11-11），同一时刻只跑一个 cargo 重编译，所以 Rust 的块一个接一个做；不编译的工作（前端对 mock
+  开发、文档、skill）可以并行，并行改前端时用独立 worktree（`npm run build` 会改 `aproxy-desktop/dist/`，与 cargo 构建带
+  界面版冲突）。
 - 每块的验收按 [w2-contracts](w2-contracts.md) §14 的表；提交用 `git commit -- <路径>`；两个变体 clippy `-D warnings`
   零输出；推送后看 CI（windows、ubuntu 两种变体与 upgrade 任务是门槛，macOS 那 4 个 lib 测试是已知红）和 Review
   （cargo-deny 也要绿，它会因新公告变红而与代码无关）。

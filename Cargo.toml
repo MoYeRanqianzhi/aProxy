@@ -109,8 +109,11 @@ sha2 = "0.10"
 tar = "0.4"
 flate2 = "1"
 semver = "1"
-# skill 更新支线：GitHub skills 资产的 zip 解包
-zip = { version = "2", default-features = false, features = ["deflate"] }
+# skill 更新支线：GitHub skills 资产的 zip 解包。9.0 起修掉了 extract() 的
+# 符号链接与 SUID 系列公告（RUSTSEC-2026-0367/0368/0369/0429）；解包走的是
+# install::skills 自己逐条写文件的循环，不调 extract()，升级是为了不带着有公告的
+# 版本发布。
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # 受限重试路径（config.toml bounded_retry_paths）：用户配置的正则模式，
 # 命中的请求失败达尝试上限即透传。纯正则引擎，无 C 依赖，musl/aarch64
 # 交叉编译与 CI 不受影响。

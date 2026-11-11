@@ -148,7 +148,11 @@ fn unpack_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| format!("zip 条目读取失败: {e}"))?;
-        let raw = entry.name().to_string();
+        // zip 9 起 name() 会校验条目名（非法编码等）并返回 Result，校验失败按坏包处理
+        let raw = entry
+            .name()
+            .map_err(|e| format!("zip 条目名无效: {e}"))?
+            .into_owned();
         // 归一路径：拒绝绝对路径与 ..
         let rel = raw.replace('\\', "/");
         if rel.starts_with('/') || rel.contains(':') || rel.split('/').any(|seg| seg == "..") {

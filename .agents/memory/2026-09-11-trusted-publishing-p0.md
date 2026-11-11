@@ -1,3 +1,13 @@
+---
+name: trusted-publishing-p0
+description: 打 tag 发布、给新包做种子发布、配置或排查 npm 与 crates.io 的可信发布之前读——各渠道的发布方式、可信发布配置的编号与踩过的坑
+metadata:
+  type: project
+  scope: release.yml 与 release-format.yml 的发布，以及 npm、crates.io 上的每一个新包
+  status: active
+  last_verified: 2026-11-11
+---
+
 # 2026-09-11 渠道 P0 与可信发布落地（npm/crates.io/binstall）
 
 ## 终态
@@ -72,3 +82,11 @@
 - 随后用第 3 条的 API 创建可信发布配置 #25198（MoYeRanqianzhi/aProxy、release.yml、release），回读一致。字段照 aproxy 的 #19617 填写。
 - 同一个 token 有 publish-new 与可信发布读写的权限。用户说做完就撤销，之后要用 token 得重新向所有者要。
 - `GET /api/v1/me` 用 token 访问会回「只能在网站上操作」，不能拿它判断 token 是否有效；用可信发布配置的只读查询判断。
+
+## 2026-11-11：aproxy-ipc 的 crates.io 种子发布（W2 的 B0 之前）
+
+- B0 新建的 aproxy-ipc 要随主线发到 crates.io（aproxy 与 aproxy-desktop 都会依赖它），新 crate 做不了可信发布首发。所有者 2026-11-11
+  在会话里给了一个 crates.io token（回应主代理「打 alpha.2 之前要种子发布 aproxy-ipc」的提醒），主代理照 2026-10-13 的做法代办：
+  仓库外临时目录里的占位包 `aproxy-ipc 0.0.0`（description 写明只占名、真版本由 CI 发布），token 只在当条命令的环境变量里。
+- 可信发布配置 #33128（MoYeRanqianzhi/aProxy、release.yml、release），回读与 aproxy 的 #19617 字段一致。
+- 这个 token 同样有 publish-new 与可信发布读写的权限；用完应由所有者撤销，之后要用 token 再向所有者要。

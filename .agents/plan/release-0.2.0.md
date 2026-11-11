@@ -476,8 +476,9 @@
 - 打 tag 的步骤：用 `.github/scripts/align-version.py` 的规则改版本号（根包、aproxy-desktop、aproxy-envelope 同号，
   见 fe88cdf）→ 推送、CI 绿 → 自上次成功发布以来 release.yml 或打包有改动就先跑一次 workflow_dispatch 演练 →
   打 tag 推送 → 盯发布 run → 核对 GitHub Release、npm 两组的 `next`、crates.io。
-- **新 crate 的首发**：B0 新建的 aproxy-ipc 要在下一个 tag 之前在 crates.io 种子发布 0.0.0 并绑定可信发布，需要所有者的
-  token 或所有者自己发（做法见记忆 trusted-publishing-p0 的 2026-10-13 一节）。
+- **新 crate 的首发**：✓ aproxy-ipc 0.0.0 已于 2026-11-11 种子发布，可信发布配置 #33128（release.yml / release）。B0 落地时
+  还要：release.yml 的 crates 发布顺序改为 aproxy-envelope、aproxy-ipc → aproxy-desktop → aproxy；align-version.py 一并对齐
+  aproxy-ipc 的版本与根包、aproxy-desktop 对它的 `=` 要求；`rehearse-crates` 打包它。
 
 **阶段与 tag**（✓ 为已完成）：
 - 阶段 0（2026-11-11）：✓ 依赖安全修复 9e45495（12 条 RUSTSEC，zip 升 9）；✓ Actions 升级 9087969；✓ TODO 整理。

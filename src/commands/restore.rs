@@ -36,51 +36,39 @@ pub(crate) async fn handle_restore_cmd() {
             daemon::remove_restore_file(&entry.port);
             continue;
         }
-        let mut args = entry.args.clone();
-        args.push("--daemon-child".to_string());
-        match daemon::spawn_detached(&exe, &args) {
-            Ok(pid) => {
-                // 就绪判定按新 pid 在注册表定位实际端口、再 IPC ping 确认（8 秒，
-                // 冷启动受 Defender 扫描等影响可能偏慢）。不能 ping 记录里的端口：
-                // 恢复用的是记录里的原参数，但实例监听哪个端口由它此刻读到的配置
-                // 决定——用户改了 config.toml 端口却没 restart、或 listen 端口为 0，
-                // 新实例都落在别的端口，ping 原端口只会误报「未就绪」
-                let run_dir = daemon::run_dir();
-                match daemon::wait_spawned_instance_ready(
-                    &run_dir,
-                    pid,
-                    std::time::Duration::from_secs(8),
-                )
-                .await
-                {
-                    Ok(live) => {
-                        let actual = daemon::port_of(&live.instance.listen_addr).to_string();
-                        // 实例落在新端口：原端口的 .restore 是已死旧进程的残留，
-                        // 新实例已按实际端口写了自己的记录。不清理的话 stop 新端口
-                        // 后下一次 restore（或看护者）会凭它把实例再拉起来
-                        if daemon::retire_moved_port_records_in(&run_dir, &entry.port, &actual) {
-                            println!(
-                                "已恢复 pid {pid}（端口 {actual}；配置的端口已从 {} 变更，原端口的恢复记录已清理）",
-                                entry.port
-                            );
-                        } else {
-                            println!("已恢复 pid {pid}（端口 {actual}）");
-                        }
-                    }
-                    Err(why) => {
-                        let what = match why {
-                            daemon::SpawnNotReady::Exited => "启动后立即退出",
-                            daemon::SpawnNotReady::TimedOut => "未在预期时间内就绪",
-                        };
-                        eprintln!(
-                            "端口 {} 的实例（pid {pid}）{what}，原因通常记录在 {}",
-                            entry.port,
-                            daemon::logs_dir().join("startup.log").display()
-                        );
-                    }
+        // 就绪的判定按新 pid 在注册表里定位实际端口（见 aproxy::spawn）。不能 ping 记录里的
+        // 端口：恢复用的是记录里的原参数，但实例监听哪个端口由它此刻读到的配置决定——用户改了
+        // config.toml 端口却没 restart、或 listen 端口为 0，新实例都落在别的端口，ping 原端口
+        // 只会误报「未就绪」
+        let run_dir = daemon::run_dir();
+        match aproxy::spawn::spawn_instance(
+            &run_dir,
+            &exe,
+            &entry.args,
+            aproxy::spawn::READY_TIMEOUT,
+        )
+        .await
+        {
+            Ok(live) => {
+                let pid = live.instance.pid;
+                let actual = daemon::port_of(&live.instance.listen_addr).to_string();
+                // 实例落在新端口：原端口的 .restore 是已死旧进程的残留，新实例已按实际端口写了
+                // 自己的记录。不清理的话 stop 新端口后下一次 restore（或看护者）会凭它把实例
+                // 再拉起来
+                if daemon::retire_moved_port_records_in(&run_dir, &entry.port, &actual) {
+                    println!(
+                        "已恢复 pid {pid}（端口 {actual}；配置的端口已从 {} 变更，原端口的恢复记录已清理）",
+                        entry.port
+                    );
+                } else {
+                    println!("已恢复 pid {pid}（端口 {actual}）");
                 }
             }
-            Err(e) => eprintln!("端口 {} 恢复失败: {e}", entry.port),
+            Err(e) => eprintln!(
+                "端口 {} 恢复失败：{e}{}",
+                entry.port,
+                e.startup_log().map(|l| l.excerpt()).unwrap_or_default()
+            ),
         }
     }
 }

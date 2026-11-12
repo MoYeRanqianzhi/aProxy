@@ -31,6 +31,12 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "拉起的是本测试程序自己的副本（模拟从 bin 运行、不在台账里的进程），不是 aproxy",
     ),
     (
+        "spawn_instance.rs",
+        "std::env::set_var(\"APROXY_HOME\"",
+        "直接调用 aproxy::spawn::spawn_instance：它分离拉起的守护只继承测试进程的环境；\
+         文件里只有一个测试，值是 TestHome 的路径",
+    ),
+    (
         "install_flow_lib.rs",
         "std::env::set_var(\"APROXY_HOME\"",
         "库层测试在进程内调用安装流程，库函数分离拉起的守护只继承测试进程的环境，\

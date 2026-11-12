@@ -92,7 +92,7 @@ pub(crate) async fn handle_restart_cmd(
 }
 
 /// 重启单个实例：捕获原始启动参数 → 预检 → stop → spawn → 就绪判定。
-/// 就绪判定按新 pid 定位（见 daemon::wait_spawned_instance_ready）——配置
+/// 就绪判定按新 pid 定位（见 aproxy::spawn）——配置
 /// 改端口后依然能正确确认。
 async fn restart_instance(
     info: &daemon::InstanceRecord,
@@ -117,28 +117,16 @@ async fn restart_instance(
         return Err(RestartFailure::Stop);
     }
 
-    // 记下 startup.log 当前长度：新实例若启动即死，只展示它这次写下的内容
-    // （startup.log 是全部实例共用的追加文件，整段尾部可能是陈年旧账）
-    let log_mark = startup_log_len();
+    // 就绪的判定按新 pid 在注册表里定位（见 aproxy::spawn）：restart 的用途之一就是「改了
+    // config.toml（含换端口）后让新配置生效」，新守护监听哪个端口由它读到的配置决定（实测
+    // 踩坑：改端口重启误报「未就绪」而实例已在新端口运行）；顺带覆盖 --listen 0。新实例提前
+    // 退出时立即报告并展示 startup.log 的新增内容，不空等到时限。
     let exe = std::env::current_exe().expect("无法定位自身可执行文件");
-    let mut child_args = args;
-    child_args.push("--daemon-child".to_string());
-    let new_pid = daemon::spawn_detached(&exe, &child_args).map_err(|e| {
-        RestartFailure::Start(format!(
-            "spawn 守护进程失败: {e}{}",
-            recovery_hint(&cfg_path)
-        ))
-    })?;
-
-    // 就绪等待 8 秒（同 start/看门狗重拉）。按新 pid 在注册表定位而非 ping
-    // 旧端口：restart 的用途之一就是「改了 config.toml（含换端口）后让新配置
-    // 生效」，新守护监听哪个端口由它读到的配置决定（实测踩坑：改端口重启
-    // 误报「未就绪」而实例已在新端口运行）；顺带覆盖 --listen 0。新实例提前
-    // 退出时立即报告并展示 startup.log 的新增内容，不再空等满 8 秒。
-    match daemon::wait_spawned_instance_ready(
+    match aproxy::spawn::spawn_instance(
         &daemon::run_dir(),
-        new_pid,
-        std::time::Duration::from_secs(8),
+        &exe,
+        &args,
+        aproxy::spawn::READY_TIMEOUT,
     )
     .await
     {
@@ -149,14 +137,9 @@ async fn restart_instance(
             println!("  监听: http://{}", live.instance.listen_addr);
             Ok(())
         }
-        Err(daemon::SpawnNotReady::Exited) => Err(RestartFailure::Start(format!(
-            "新实例（pid {new_pid}）启动后立即退出{}{}",
-            startup_log_excerpt(log_mark),
-            recovery_hint(&cfg_path)
-        ))),
-        Err(daemon::SpawnNotReady::TimedOut) => Err(RestartFailure::Start(format!(
-            "新实例（pid {new_pid}）未在预期时间内就绪{}{}",
-            startup_log_excerpt(log_mark),
+        Err(e) => Err(RestartFailure::Start(format!(
+            "{e}{}{}",
+            e.startup_log().map(|l| l.excerpt()).unwrap_or_default(),
             recovery_hint(&cfg_path)
         ))),
     }
@@ -212,47 +195,6 @@ async fn precheck_restart(
         }
     }
     Ok(cfg_path)
-}
-
-/// startup.log 当前字节长度（不存在 = 0）
-fn startup_log_len() -> u64 {
-    std::fs::metadata(daemon::logs_dir().join("startup.log"))
-        .map(|m| m.len())
-        .unwrap_or(0)
-}
-
-/// startup.log 自 `mark` 以来新增的内容（最多末尾 20 行），格式化为可直接
-/// 拼进错误信息的片段。没有新增内容时退回指路（运行日志按启动随机命名，
-/// 父进程无法预知文件名，只能指向目录）。文件比 mark 还短（被截断/重建）
-/// 时从头读。
-fn startup_log_excerpt(mark: u64) -> String {
-    use std::io::{Read, Seek, SeekFrom};
-    let path = daemon::logs_dir().join("startup.log");
-    let mut fresh = String::new();
-    if let Ok(mut f) = std::fs::File::open(&path) {
-        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-        let from = if len >= mark { mark } else { 0 };
-        if f.seek(SeekFrom::Start(from)).is_ok() {
-            let mut buf = Vec::new();
-            let _ = f.read_to_end(&mut buf);
-            fresh = String::from_utf8_lossy(&buf).into_owned();
-        }
-    }
-    let lines: Vec<&str> = fresh.lines().filter(|l| !l.trim().is_empty()).collect();
-    if lines.is_empty() {
-        return format!(
-            "，原因通常记录在:\n  {}\n  {}",
-            path.display(),
-            daemon::logs_dir().display()
-        );
-    }
-    let tail = &lines[lines.len().saturating_sub(20)..];
-    let mut out = format!("。{} 本次新增内容:", path.display());
-    for line in tail {
-        out.push_str("\n  ");
-        out.push_str(line);
-    }
-    out
 }
 
 /// 新实例起不来时的恢复指引：旧实例的 .restore 已随停止删除（优雅退出时守护

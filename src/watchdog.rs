@@ -799,17 +799,13 @@ impl WatchdogState {
             heartbeat_secs: now_secs(),
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
         };
-        // 先写临时文件再 rename 覆盖：原地写时，并发读到的可能是截断到一半的
-        // claim，读者把它当「无 claim」，随即补种出第二个看护者。临时文件名带
-        // pid，两个看护者短暂并存时不会互踩
-        let path = claim_path_in(&self.cfg.run_dir);
-        let tmp = path.with_extension(format!("claim.{}.tmp", std::process::id()));
+        // 原子写（crate::fsx::write_atomic）：原地写时，并发读到的可能是截断到一半的
+        // claim，读者把它当「无 claim」，随即补种出第二个看护者
         let Ok(json) = serde_json::to_string(&claim) else {
             return;
         };
-        let written = std::fs::write(&tmp, json + "\n").and_then(|()| std::fs::rename(&tmp, &path));
-        if let Err(e) = written {
-            let _ = std::fs::remove_file(&tmp);
+        let path = claim_path_in(&self.cfg.run_dir);
+        if let Err(e) = crate::fsx::write_atomic(&path, (json + "\n").as_bytes()) {
             tracing::warn!(error = %e, "claim 心跳续写失败");
         }
     }
@@ -954,26 +950,23 @@ async fn respawn_instance(run_dir: &Path, port: &str) -> Result<(u32, String), S
         crate::daemon::remove_restore_file_in(run_dir, port);
         return Err(format!("配置文件已不存在: {cfg}"));
     }
-    let mut args = entry.args.clone();
-    args.push("--daemon-child".to_string());
     let exe = std::env::current_exe().map_err(|e| format!("无法定位自身可执行文件: {e}"))?;
-    let pid = crate::daemon::spawn_detached(&exe, &args).map_err(|e| format!("spawn 失败: {e}"))?;
-    // 就绪判定按新 pid 在注册表定位（8s，与 start/restore 一致）：重拉用
-    // .restore 原参数，但配置可能已被用户改动（换端口）——新守护监听新端口
-    // 时 ping 旧端口永远不通（与 restart 同款实测坑）。pid 是 spawn 返回值，
-    // 唯一可靠锚点；新守护 bind 成功才写注册表，出现即就绪。
-    // 用只读检索而非 list_instances_in：后者的验活清理副作用会在本循环的
-    // 200ms 轮询里顺带删掉同注册表其他死实例的记录，其死亡事件随后被混合态
-    // 误判为优雅退出、静默失去自动恢复（P6 死亡风暴实测）。
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
-    loop {
-        if let Some(info) = crate::daemon::registry_find_pid_in(run_dir, pid) {
-            return Ok((pid, crate::daemon::port_of(&info.listen_addr).to_string()));
-        }
-        if std::time::Instant::now() > deadline {
-            return Err("重拉后 IPC 未在预期时间内就绪".to_string());
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    // 就绪的判定按新 pid 在注册表里定位（见 crate::spawn）：重拉用 .restore 原参数，但配置
+    // 可能已被用户改动（换端口）——新守护监听新端口时 ping 旧端口永远不通（与 restart 同款
+    // 实测坑）。spawn_instance 只读注册表、不做 list_instances_in 那种验活清理：后者的副作用
+    // 会在轮询里顺带删掉同注册表其他死实例的记录，其死亡事件随后被混合态误判为优雅退出、静默
+    // 失去自动恢复（P6 死亡风暴实测）。新实例启动即死时立即返回，不空等到时限，退避照常推进。
+    match crate::spawn::spawn_instance(run_dir, &exe, &entry.args, crate::spawn::READY_TIMEOUT)
+        .await
+    {
+        Ok(live) => Ok((
+            live.instance.pid,
+            crate::daemon::port_of(&live.instance.listen_addr).to_string(),
+        )),
+        Err(e) => Err(format!(
+            "{e}{}",
+            e.startup_log().map(|l| l.excerpt()).unwrap_or_default()
+        )),
     }
 }
 

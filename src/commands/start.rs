@@ -246,77 +246,54 @@ pub(crate) async fn handle_start_cmd(
             }
         },
     }
-    args.push("--daemon-child".to_string());
     let exe = std::env::current_exe().expect("无法定位自身可执行文件");
-    let pid = match daemon::spawn_detached(&exe, &args) {
-        Ok(p) => p,
+    // 就绪判定与「启动即死」的报告见 aproxy::spawn：按新 pid 在注册表里定位实际端口（监听端口
+    // 0 由系统分配时同样等到就绪、报出实际地址），子进程提前退出时立即报告，附上 startup.log
+    // 本次新增的内容（子进程没有控制台，配置错误、绑定失败的原因只写在那里）。日志文件按启动
+    // 随机命名（或用户自定义），客户端不拼路径——ping 应答里带着实例上报的 log_path。
+    let info = match aproxy::spawn::spawn_instance(
+        &daemon::run_dir(),
+        &exe,
+        &args,
+        aproxy::spawn::READY_TIMEOUT,
+    )
+    .await
+    {
+        Ok(info) => info,
         Err(e) => {
-            eprintln!("启动后台进程失败: {e}");
+            let excerpt = e.startup_log().map(|l| l.excerpt()).unwrap_or_default();
+            eprintln!("{e}{excerpt}");
             std::process::exit(1);
         }
     };
-
-    // 端口 0：实际端口由子进程绑定时才确定，父进程无从按已知端口轮询就绪——
-    // 跳过等待（注册表会记录 actual_addr），提示用户用 status 查看真实地址
-    if port == "0" {
-        println!("aProxy 正在后台启动（listen 端口为 0，实际端口由系统分配）");
-        println!("  pid: {pid}");
-        println!("请稍后执行 aproxy status 查看实际监听地址。");
-        return;
+    let actual_port = daemon::port_of(&info.instance.listen_addr).to_string();
+    println!("aProxy 已在后台启动");
+    println!("  pid: {}", info.instance.pid);
+    println!("  监听: http://{}", info.instance.listen_addr);
+    println!("  Base URL: {}", mask_base_url(&cfg.base_url));
+    if !cfg.base_url.is_empty() {
+        // 与上一行同一出口：这一行同样会被整段粘贴求助
+        let base = mask_base_url(cfg.base_url.trim_end_matches('/'));
+        println!(
+            "  提示: 将你的 API base URL 指向 http://{}",
+            info.instance.listen_addr
+        );
+        println!("        上游路径与查询参数将完整透传到 {base}/<path>?<query>");
     }
-
-    // 就绪判定用 IPC ping 而非 TCP connect：管道名含端口，只有本守护子进程会
-    // 创建 `aproxy-<port>`——connect 成功无法区分「我们的子进程」与「任何抢占
-    // 端口的监听者」，曾导致对已死子进程/第三方进程误报启动成功。轮询至 8 秒
-    // （子进程冷启动受 Defender 扫描等影响可能偏慢）。日志文件按启动随机命名
-    //（或用户自定义），客户端不拼路径——ping 响应携带实例上报的 log_path。
-    let startup_log_path = daemon::logs_dir().join("startup.log");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-    loop {
-        if let Ok(info) = daemon::ipc_ping(&port).await {
-            println!("aProxy 已在后台启动");
-            println!("  pid: {}", info.instance.pid);
-            println!("  监听: http://{}", info.instance.listen_addr);
-            println!("  Base URL: {}", mask_base_url(&cfg.base_url));
-            if !cfg.base_url.is_empty() {
-                // 与上一行同一出口：这一行同样会被整段粘贴求助
-                let base = mask_base_url(cfg.base_url.trim_end_matches('/'));
-                println!(
-                    "  提示: 将你的 API base URL 指向 http://{}",
-                    info.instance.listen_addr
-                );
-                println!("        上游路径与查询参数将完整透传到 {base}/<path>?<query>");
-            }
-            // 仅转发模式是放弃重试保障的取舍，启动提示里必须显式说出来
-            // （父进程的 cfg 已完成 settings 注入，取值与守护子进程一致）
-            if cfg.forward_only_enabled() {
-                println!("  仅转发模式：不缓冲、不重试");
-            }
-            // 外部转换器改变了「原样透传」的承诺，启动提示必须显式说出来
-            if cfg.request_transform.is_some() || cfg.response_transform.is_some() {
-                println!(
-                    "  外部转换器：请求/响应将交给 format 程序改写（转换失败：请求侧 502 不重试、响应侧透传原样）"
-                );
-            }
-            println!("  配置: {}", cfg_path.display());
-            println!("  日志: {}", info.instance.log_path);
-            println!("查看实例: aproxy status    停止: aproxy stop {port}");
-            break;
-        }
-        if std::time::Instant::now() > deadline {
-            // 子进程无控制台，失败原因只可能落盘：配置/绑定错误写 startup.log。
-            // 运行日志按启动随机命名，父进程无法预知具体文件名——指向 logs
-            // 目录（文件名随启动变化，可用 aproxy status 查看实际路径）
-            eprintln!("后台进程未在预期时间内就绪（pid {pid}），启动失败的原因通常记录在:");
-            eprintln!("  {}", startup_log_path.display());
-            eprintln!(
-                "  {}（该实例运行日志，按启动随机命名）",
-                daemon::logs_dir().display()
-            );
-            std::process::exit(1);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // 仅转发模式是放弃重试保障的取舍，启动提示里必须显式说出来
+    // （父进程的 cfg 已完成 settings 注入，取值与守护子进程一致）
+    if cfg.forward_only_enabled() {
+        println!("  仅转发模式：不缓冲、不重试");
     }
+    // 外部转换器改变了「原样透传」的承诺，启动提示必须显式说出来
+    if cfg.request_transform.is_some() || cfg.response_transform.is_some() {
+        println!(
+            "  外部转换器：请求/响应将交给 format 程序改写（转换失败：请求侧 502 不重试、响应侧透传原样）"
+        );
+    }
+    println!("  配置: {}", cfg_path.display());
+    println!("  日志: {}", info.instance.log_path);
+    println!("查看实例: aproxy status    停止: aproxy stop {actual_port}");
 
     // 看护者出簇（watchdog 总开关，settings 层）：实例就绪后确保存在看护者。
     // 选举规范防止多实例并发 start 时的重复拉起：claim 有效让位；缺席时仅

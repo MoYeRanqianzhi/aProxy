@@ -326,23 +326,11 @@ pub fn create_new_in(home: &Path, mut state: InstallState) -> Result<InstallStat
     Ok(state)
 }
 
-/// 原子重写（tmp + rename，与实例注册表/settings 同思路）并刷新 updated_at。
+/// 原子重写（crate::fsx::write_atomic）并刷新 updated_at。
 pub fn write_in(home: &Path, state: &mut InstallState) -> std::io::Result<()> {
     state.updated_at = now_secs();
-    let path = state_path_in(home);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let json = serde_json::to_string_pretty(state).expect("序列化安装状态失败");
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
-    match std::fs::rename(&tmp, &path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    crate::fsx::write_atomic(&state_path_in(home), json.as_bytes())
 }
 
 /// 阶段推进：校验迁移合法性后原子落盘。非法迁移是编程错误（状态机被绕过

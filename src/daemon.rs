@@ -714,24 +714,12 @@ pub fn write_instance_file(info: &InstanceRecord) -> io::Result<()> {
 
 /// 同上，目录可指定（测试注入用）
 ///
-/// 原子写：先写同目录临时文件再 rename 覆盖目标。直接写目标文件时，
-/// 并发的 list_instances 可能读到写到一半的 JSON，把记录当损坏清理掉。
-/// rename 在同卷内是原子操作（Windows 上经 MoveFileEx 的替换语义覆盖
-/// 已存在文件）；临时文件名按端口隔离，实例间不会互踩。
+/// 原子写（crate::fsx::write_atomic）：直接写目标文件时，并发的 list_instances 可能读到
+/// 写到一半的 JSON，把记录当损坏清理掉。
 pub fn write_instance_file_in(run_dir: &std::path::Path, info: &InstanceRecord) -> io::Result<()> {
-    std::fs::create_dir_all(run_dir)?;
     let path = instance_file_path_in(run_dir, &info.listen_addr);
     let json = serde_json::to_string_pretty(info).expect("序列化实例信息失败");
-    let tmp = path.with_extension("pid.tmp");
-    std::fs::write(&tmp, json)?;
-    match std::fs::rename(&tmp, &path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // rename 失败时清掉残留临时文件，避免堆积成永久垃圾
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    crate::fsx::write_atomic(&path, json.as_bytes())
 }
 
 /// 删除实例注册（服务退出时调用）
@@ -908,43 +896,6 @@ pub fn registry_find_pid_in(dir: &std::path::Path, pid: u32) -> Option<InstanceR
     })
 }
 
-/// 新 spawn 的守护实例未能就绪的原因
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpawnNotReady {
-    /// 进程在就绪前已退出（配置错误、bind 失败等，原因落在 startup.log）
-    Exited,
-    /// 超时：进程仍在但未就绪（或进程状态不可判）
-    TimedOut,
-}
-
-/// 等待 spawn 出的守护（pid 来自 spawn 返回值，唯一可靠锚点）就绪：按 pid
-/// 在注册表定位实际端口（配置可能已换端口/端口 0），再 IPC ping 实际端口
-/// 确认应答者就是它。成功返回 ping 到的实时状态（`instance.listen_addr`
-/// 即实际监听地址）。进程提前退出立即返回 Exited，不空等
-/// 到超时。只读检索注册表，无 list_instances_in 的删除副作用。
-pub async fn wait_spawned_instance_ready(
-    run_dir: &std::path::Path,
-    pid: u32,
-    timeout: Duration,
-) -> Result<InstanceStatus, SpawnNotReady> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if let Some(rec) = registry_find_pid_in(run_dir, pid)
-            && let Ok(live) = ipc_ping_in(run_dir, port_of(&rec.listen_addr)).await
-            && live.instance.pid == pid
-        {
-            return Ok(live);
-        }
-        if crate::watchdog::process_exited(pid) == Some(true) {
-            return Err(SpawnNotReady::Exited);
-        }
-        if std::time::Instant::now() > deadline {
-            return Err(SpawnNotReady::TimedOut);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
 /// 实例重拉/恢复后实际落在了另一个端口（用户改了 config.toml 的端口却没
 /// restart，或 listen 端口为 0 每次由系统分配）时，退役旧端口的残留记录：
 /// 删除 `<旧端口>.restore` 与 `<旧端口>.pid`。
@@ -1031,22 +982,13 @@ pub fn write_restore_file_in(
     args: &[String],
     log_path: &str,
 ) -> io::Result<()> {
-    std::fs::create_dir_all(run_dir)?;
     let path = restore_file_path_in(run_dir, listen_addr);
     let json = serde_json::to_string(&RestoreRecord {
         args: args.to_vec(),
         log_path: log_path.to_string(),
     })
     .expect("序列化恢复记录失败");
-    let tmp = path.with_extension("restore.tmp");
-    std::fs::write(&tmp, json)?;
-    match std::fs::rename(&tmp, &path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    crate::fsx::write_atomic(&path, json.as_bytes())
 }
 
 /// 删除恢复记录（实例优雅退出时调用；无记录时静默）

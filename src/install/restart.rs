@@ -179,60 +179,44 @@ struct SpawnFailure {
     message: String,
 }
 
-/// spawn `exe` 按 `args` 启动守护（追加 --daemon-child）并等待注册表就绪
-/// （8s，与 start/restore/看门狗 respawn 同一判定：新守护 bind 成功才写
-/// 注册表，出现 = 就绪）。返回新 pid。子进程提前退出即刻判失败（不空等
-/// 满 8 秒——配置校验失败这类确定性错误在毫秒级就会退出）。
-///
-/// 就绪判定按注册表定位而非 ping 端口：配置可能已被用户改动（换端口），
-/// 新守护监听新端口时 ping 旧端口永远不通；spawn 返回的 pid 是唯一可靠锚点。
+/// 以 `exe` 按 `args` 拉起守护并等它就绪（见 crate::spawn：按新 pid 在注册表里定位、ping
+/// 确认；子进程提前退出即刻判失败，不空等到时限）。返回新 pid。
 async fn spawn_and_wait_ready(
     run_dir: &Path,
     exe: &Path,
     args: &[String],
 ) -> Result<u32, SpawnFailure> {
-    let mut full = args.to_vec();
-    full.push("--daemon-child".to_string());
-    let pid = crate::daemon::spawn_detached(exe, &full).map_err(|e| SpawnFailure {
-        pid: None,
-        start: None,
-        alive: false,
-        message: format!("spawn 失败（{}）: {e}", exe.display()),
-    })?;
-    let start = crate::watchdog::process_start_time(pid);
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
-    loop {
-        if crate::daemon::registry_contains_pid_in(run_dir, pid) {
-            return Ok(pid);
+    use crate::spawn::SpawnError;
+    match crate::spawn::spawn_instance(run_dir, exe, args, crate::spawn::READY_TIMEOUT).await {
+        Ok(live) => Ok(live.instance.pid),
+        Err(e) => {
+            let message = format!(
+                "{e}{}",
+                e.startup_log().map(|l| l.excerpt()).unwrap_or_default()
+            );
+            Err(match e {
+                SpawnError::Spawn(_) => SpawnFailure {
+                    pid: None,
+                    start: None,
+                    alive: false,
+                    message: format!("{message}（{}）", exe.display()),
+                },
+                SpawnError::Exited { pid, .. } => SpawnFailure {
+                    pid: Some(pid),
+                    start: None,
+                    alive: false,
+                    message,
+                },
+                SpawnError::TimedOut {
+                    pid, start, alive, ..
+                } => SpawnFailure {
+                    pid: Some(pid),
+                    start,
+                    alive,
+                    message,
+                },
+            })
         }
-        let exited = crate::watchdog::process_exited(pid) == Some(true);
-        // 退出后再读一次注册表：bind 成功 → 写注册表 → 随即退出的极端时序
-        // 不该被误判（虽然随后的 ping 会暴露它，判定口径保持与就绪一致）
-        if exited && !crate::daemon::registry_contains_pid_in(run_dir, pid) {
-            return Err(SpawnFailure {
-                pid: Some(pid),
-                start,
-                alive: false,
-                message: format!("新进程启动即退出（pid {pid}，详见守护日志/startup.log）"),
-            });
-        }
-        if std::time::Instant::now() >= deadline {
-            let alive = crate::watchdog::process_exited(pid) == Some(false);
-            return Err(SpawnFailure {
-                pid: Some(pid),
-                start,
-                alive,
-                message: format!(
-                    "实例重启后未在预期时间内就绪（pid {pid}，{}）",
-                    if alive {
-                        "进程存活"
-                    } else {
-                        "进程状态不可判"
-                    }
-                ),
-            });
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 

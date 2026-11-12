@@ -417,27 +417,15 @@ pub fn default_config_path_for(settings: &Settings, home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join("config.toml"))
 }
 
-/// 原子保存：同目录 tmp 文件 + rename 覆盖（与实例注册表同思路，
-/// 避免并发读到半截 JSON）。
+/// 原子保存（crate::fsx::write_atomic，避免并发读到半截 JSON）。
 pub fn save(settings: &Settings) -> std::io::Result<()> {
     save_to(&settings_path(), settings)
 }
 
 /// 同上，路径可指定（测试注入用）
 pub fn save_to(path: &std::path::Path, settings: &Settings) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let json = serde_json::to_string_pretty(settings).expect("序列化 settings 失败");
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    crate::fsx::write_atomic(path, json.as_bytes())
 }
 
 /// 解析别名 → 配置文件路径；无此别名返回 None。

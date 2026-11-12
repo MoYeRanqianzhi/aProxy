@@ -23,13 +23,7 @@ pub(super) async fn proxy_handler(State(state): State<AppState>, req: Request) -
     let mut headers = req.headers().clone();
 
     // 活动时间戳：收到请求即更新（stop idle / status 筛选的判定依据）
-    state.last_activity_secs.store(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    state.touch_activity();
     // IPC 观测计数（一条 Relaxed fetch_add，与上面 store 同量级）；计数顺带
     // 充当转换信封的 request_id（实例内第 N 个请求，唯一且与 status 的计数一致）
     let request_seq = state
@@ -93,118 +87,45 @@ pub(super) async fn proxy_handler(State(state): State<AppState>, req: Request) -
     };
     let max_spool_bytes = spool_limit_bytes(&state.config);
 
-    // 保活适用：从请求转换起就交给保活通道（它自己处理请求转换、首轮快速路径
-    // 与提交点）。请求转换放进通道里做，是为了让它同样处在心跳节拍内——format
-    // 慢（timeout_secs = 0 时没有上界）时客户端照样在一个间隔后收到骨架头与
-    // 心跳，而不是在拿到任何字节之前干等。req 所有权移交，请求体随通道结束
+    // 保活适用：整个尝试循环（从请求转换起）交给后台任务，经保活出口交付——请求转换也
+    // 处在心跳节拍内，format 慢（timeout_secs = 0 时没有上界）时客户端照样在一个间隔后
+    // 收到骨架头与心跳，而不是在拿到任何字节之前干等。req 所有权移交，请求体随任务结束
     // 自动 Drop 删除磁盘临时文件。
     if keepalive_applies {
-        return proxy_with_keepalive(
-            state,
-            req,
-            path_and_query.to_string(),
-            max_spool_bytes,
-            bounded_retry,
-        )
-        .await;
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<Response>();
+        let path_and_query = path_and_query.to_string();
+        tokio::spawn(async move {
+            let mut r = Responder::keepalive(&state, resp_tx);
+            run_attempts(
+                &state,
+                req,
+                &path_and_query,
+                max_spool_bytes,
+                bounded_retry,
+                &mut r,
+            )
+            .await;
+        });
+        // 客户端在提交前断开时 hyper 会 drop 本 future（连同 resp_rx），后台任务经
+        // resp_tx.closed() 感知并中止上游请求。Err 只在后台任务未交出响应就结束时
+        // 出现（panic）——给客户端一个明确的 502 而不是让连接悬空
+        return resp_rx.await.unwrap_or_else(|_| {
+            tracing::error!("保活通道后台任务未交出响应即结束");
+            (StatusCode::BAD_GATEWAY, "aProxy 内部错误：保活通道异常结束").into_response()
+        });
     }
 
-    let OutboundRequest {
-        method,
-        target_url,
-        headers,
-        body: req_body,
-        ctx,
-        mut retransform,
-    } = match apply_request_transform(&state, req).await {
-        Ok(req) => req,
-        Err(msg) => return request_transform_failed_response(&msg),
-    };
-    log_proxied_request(&method, path_and_query, &target_url);
-
-    // 首轮（attempt 1）先行：成功则完整保真回放（status/headers 不失真），
-    // 需要重试才进入重试通道——首轮成功是常态路径。
-    let first = forward_once(
+    // 不保活：尝试循环就在本 future 里跑，成功后一次性回放。客户端断开时 hyper drop
+    // 整个 future，在途的上游请求随之中止
+    let mut r = Responder::buffered();
+    run_attempts(
         &state,
-        &method,
-        &target_url,
-        &headers,
-        &req_body,
+        req,
+        path_and_query,
         max_spool_bytes,
-        None,
+        bounded_retry,
+        &mut r,
     )
     .await;
-
-    let needs_retry = match &first {
-        ForwardResult::NetworkError(e) => {
-            state.note_upstream_failure(&format!("网络错误: {e}"));
-            tracing::warn!(error = %e, "首轮上游网络错误，进入重试");
-            true
-        }
-        // spool 上限 / 本地磁盘故障重试无意义（确定性失败），直接终态回放 502
-        ForwardResult::TooLarge => {
-            state.note_upstream_failure("上游响应体超出 spool 上限");
-            false
-        }
-        ForwardResult::SpoolFailed(e) => {
-            state.note_upstream_failure(&format!("本地 spool 故障: {e}"));
-            tracing::error!(error = %e, "首轮本地 spool 故障，终态返回");
-            false
-        }
-        ForwardResult::Response {
-            status,
-            raw_headers,
-            body,
-            disk_scan,
-            ..
-        } => {
-            let retry = needs_retry_response(1, status, raw_headers, body, disk_scan);
-            if retry {
-                state.note_upstream_failure(&format!("上游返回 {status}（错误内容，重试）"));
-            }
-            retry
-        }
-    };
-    if needs_retry && let Some(rt) = retransform.as_mut() {
-        rt.record(&first);
-    }
-
-    if !needs_retry {
-        return match first {
-            ForwardResult::TooLarge => too_large_response(),
-            ForwardResult::SpoolFailed(e) => spool_failed_response(&e),
-            ForwardResult::Response {
-                status,
-                headers: resp_headers,
-                raw_headers,
-                body,
-                ..
-            } => {
-                replay_success(
-                    &state,
-                    &target_url,
-                    &ctx,
-                    1,
-                    status,
-                    resp_headers,
-                    &raw_headers,
-                    body,
-                )
-                .await
-            }
-            ForwardResult::NetworkError(_) => unreachable!("NetworkError 必定 needs_retry"),
-        };
-    }
-
-    // 需要重试（不适用保活）：成功后一次性回放（req_body 所有权移交，随通道
-    // 结束自动 Drop 删除磁盘临时文件）
-    let req = OutboundRequest {
-        method,
-        target_url,
-        headers,
-        body: req_body,
-        ctx,
-        retransform,
-    };
-    proxy_without_keepalive(state, req, max_spool_bytes, bounded_retry).await
+    r.into_response()
 }

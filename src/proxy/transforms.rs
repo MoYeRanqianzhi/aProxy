@@ -191,7 +191,7 @@ pub(super) fn request_transform_failed_response(msg: &str) -> Response {
         .into_response()
 }
 
-/// 响应侧转换入口（三出口共用）：未配置时原样返回；转换失败时 warn + 原样
+/// 响应侧转换入口（尝试循环交付成功响应时调用）：未配置时原样返回；转换失败时 warn + 原样
 /// 返回（透传上游原始响应——响应已在手，可用性优先，用户已定语义）。
 /// is_streaming 由调用方按返回值重算（format 可改 content-type/body 形态）。
 pub(super) async fn transform_response_if_configured(

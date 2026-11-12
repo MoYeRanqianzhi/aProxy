@@ -22,12 +22,14 @@
 //!      上游字节完全一致，SSE 解析器语义不受影响。
 //! - 请求体同样双模：小请求体驻留内存（Bytes 零拷贝重试共享），大请求体
 //!   溢写磁盘、每次重试重新流式读取。上限 `max_body_mb`（默认 128，0=不限）。
-//! - 首轮快速路径：attempt 1 的结果先做判定，成功则直接原样回放（status 与全部
-//!   响应头保真）；仅当需要重试时才进入重试通道——首轮成功是常态路径，保真优先。
-//! - 保活通道（`proxy_with_keepalive`）：「保活适用」的请求（`keepalive_trigger`
+//! - 一个尝试循环（`attempts::run_attempts`）：每次尝试的结果由 `classify` 归成成功、
+//!   重试、受限路径用尽或本地失败，两种出口（`attempts::Responder`）按结果收场。
+//!   提交之前就成功的尝试（首轮成功是常态）一律走保真快速路径：status 与全部
+//!   响应头原样回放。
+//! - 保活出口：「保活适用」的请求（`keepalive_trigger`
 //!   判定命中：Accept 含 text/event-stream 和/或客户端原始请求体顶层
-//!   `"stream": true`；且 keepalive 开启、非 forward_only）从首轮起就由后台任务
-//!   驱动。响应的「提交点」是一个三态机——未提交 → 提交上游真实头 / 提交骨架头：
+//!   `"stream": true`；且 keepalive 开启、非 forward_only）的尝试循环整个由后台
+//!   任务驱动。响应的「提交点」是一个三态机——未提交 → 提交上游真实头 / 提交骨架头：
 //!   - 上游回 2xx + 未压缩的 text/event-stream 头 → 立即把上游真实 status 与
 //!     响应头转给客户端（未配置 response_transform 时）
 //!   - 一个 keepalive 间隔内仍无可提交的结果，或需要重试 → 提交骨架头
@@ -38,8 +40,8 @@
 //!   `keepalive_interval_secs` 发一行 SSE 注释（`: keepalive\n\n`）；完整缓冲、
 //!   判定无误后才把成功那一次的原样字节写进同一个响应，期间的重试客户端只见到
 //!   心跳。客户端断开（任一阶段）即中止在途上游请求、不再发起新请求。
-//!   不适用保活的请求（如 stream:false 的普通 JSON 请求）沿用首轮快速路径 +
-//!   `proxy_without_keepalive`：成功后一次性回放，期间不向客户端写任何字节。
+//!   不适用保活的请求（如 stream:false 的普通 JSON 请求）走不保活出口：尝试循环
+//!   就在 handler 的 future 里跑，成功后一次性回放，期间不向客户端写任何字节。
 //! - 入站来源校验（handler 第一步）：Host 不在 `allowed_hosts`、或带了不在
 //!   `allowed_origins` 里的 Origin 的请求本地 403——不转发、不注入 api_key、
 //!   不进重试循环（防 DNS 重绑定与网页跨站调用；语义见 `Config` 同名字段）

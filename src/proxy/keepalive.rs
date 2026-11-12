@@ -282,12 +282,11 @@ impl KeepaliveSink {
         }
     }
 
-    /// 尚未提交时交出完整响应（首轮快速路径 / 502 终态）。客户端已断开时
+    /// 尚未提交时交出完整响应（保真快速路径 / 终态错误响应）。客户端已断开时
     /// send 失败，响应随之丢弃。
-    pub(super) fn respond(self, resp: Response) {
-        if let Self::Pending {
-            resp_tx: Some(tx), ..
-        } = self
+    pub(super) fn respond(&mut self, resp: Response) {
+        if let Self::Pending { resp_tx, .. } = self
+            && let Some(tx) = resp_tx.take()
         {
             let _ = tx.send(resp);
         }

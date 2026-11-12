@@ -2,29 +2,6 @@
 
 use super::*;
 
-/// 成功响应的保真回放（尚未向客户端提交任何字节的出口共用：首轮快速路径、
-/// 非保活重试通道、保活通道里提交前就成功的首轮）：先交响应转换器（失败透传
-/// 原样），再按转换后产物重算流式判定（format 可改 content-type/body 形态），
-/// 最后以上游 status 与响应头原样回放。
-// 参数分两组：请求侧（target_url + ctx，响应转换要用）与本次尝试的成功响应
-// （attempt/status/头/体，来自 ForwardResult::Response 的拆解）。两个调用点
-// 都是刚拆开 ForwardResult 就调用，再包一层结构体只是把拆开的字段原样装回去
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn replay_success(
-    state: &AppState,
-    target_url: &str,
-    ctx: &ExchangeCtx,
-    attempt: u32,
-    status: StatusCode,
-    resp_headers: HeaderMap,
-    raw_headers: &reqwest::header::HeaderMap,
-    body: SpooledBody,
-) -> Response {
-    let (resp_headers, body) =
-        transform_response_if_configured(state, target_url, ctx, resp_headers, body).await;
-    replay_transformed(attempt, status, resp_headers, raw_headers, body).await
-}
-
 /// 成功响应的保真回放（响应转换已做完）：按转换后的头与体重算是否流式，
 /// 原样回放 status/头/体。format 可能改写 content-type 与 body 形态，所以
 /// 流式判定必须在转换之后。

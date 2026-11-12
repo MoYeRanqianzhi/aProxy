@@ -33,6 +33,19 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// 刷新活动时间戳（stop idle 与 status 的闲置判定依据）：收到请求时、每轮重试开头、
+    /// 仅转发模式每转发一块时各刷新一次。一条 Relaxed store：只用于粗粒度的空闲判定，
+    /// 不需要跨线程的因果序
+    pub(super) fn touch_activity(&self) {
+        self.last_activity_secs.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     pub fn new(config: Config) -> Self {
         // 超时策略：不设总时限（会掐断超过时限的慢流式生成，导致无限重试永不成功），
         // 只限制连接建立与两次读到数据之间的间隔（均可经 config.toml 调整）。

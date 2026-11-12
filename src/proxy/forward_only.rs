@@ -172,13 +172,7 @@ pub(super) async fn forward_only_proxy(
     let stream = resp.bytes_stream().map(move |chunk| match chunk {
         Ok(c) => {
             counter.fetch_add(c.len() as u64, AtomicOrdering::Relaxed);
-            state.last_activity_secs.store(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-                AtomicOrdering::Relaxed,
-            );
+            state.touch_activity();
             Ok(c)
         }
         Err(e) => {

@@ -45,14 +45,17 @@ home 的实例。
 | `src/cli.rs` | clap 命令树定义（`Cli`/`Commands`/`AliasCmd`/`ConfigArgs`），只承载定义不含逻辑 |
 | `src/commands/` | 十二个子命令各自一文件（start/status/stop/restart/restore/alias/doctor/find/logs/config/install/desktop），共享 target 解析在 `mod.rs` |
 | `src/server.rs` | 服务承载：`serve_forever` 主循环、停止信号、日志初始化、配置错误落盘 startup.log |
-| `src/proxy.rs` | 转发核心：入站来源校验（Host/Origin）、hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、保活通道与提交点、断开保护、仅转发模式 |
+| `src/proxy/` | 转发核心，按职责分文件：入站来源校验（Host/Origin）、hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、尝试结局分类（`attempts::classify`）与唯一的尝试循环（`attempts::run_attempts`）、保活通道与提交点、断开保护、仅转发模式 |
 | `src/transform.rs` | 外部转换器编排：stdin/stdout 一行 JSON 信封交给外部 format 程序改写（spawn 与 persistent 统一进程池、空闲 reaper、超时/崩溃 worker 剔除）；信封契约在独立 crate `aproxy-envelope` |
 | `src/decode.rs` | 检查用解码：按 `content-encoding`（gzip/deflate/br/zstd，多层逆序）解出一份**仅供检查/预览**的副本，转发字节不受影响 |
 | `src/retry.rs` | 重试判定：状态码、错误 JSON（含流式 NDJSON/SSE 形态） |
 | `src/config.rs` | 代理配置加载/保存/校验（`~/.aproxy/config.toml`，可多份平行并存） |
 | `src/settings.rs` | 内部配置（`~/.aproxy/settings.json`，唯一）：别名表、全局默认等程序管理状态 |
 | `src/daemon.rs` | 守护编排：IPC（ping/shutdown/观测）、实例注册表、恢复记录、孤儿清理 |
-| `src/watchdog.rs` | 看门狗：claim 选举、进程身份（pid + 创建时间）核验、进程探活/句柄等待、共享内存心跳、重拉退避状态机 |
+| `src/spawn.rs` | 拉起守护并等就绪（`spawn_instance`）：start、restart、restore、安装的滚动重启、看护者重拉共用；按新 pid 认就绪，启动即死时立即返回并附上 startup.log 的新增内容 |
+| `src/process.rs` | 进程原语（平台层）：创建时间、存活与退出、镜像路径、按 pid + 创建时间核验身份（`record_identity`）与核验后终止、看护者等待进程死亡用的同步句柄 |
+| `src/watchdog.rs` | 看门狗：claim 选举、共享内存心跳、收养与处决、重拉退避状态机 |
+| `src/fsx.rs` | 原子写（`write_atomic`）：注册表、恢复记录、安装状态、settings.json、看护者 claim 共用 |
 | `src/ledger.rs` | 进程台账 `<home>/ledger/`（永久兼容契约 C3）：长期运行的进程登记 pid、启动标记与角色，强制安装据此核验后结束进程 |
 | `src/util.rs` | bin 侧共用小工具：时间戳、时长人性化、凭据打码、key=value 解析 |
 

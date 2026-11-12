@@ -937,7 +937,7 @@ fn clear_stale_work_dirs(home: &Path) {
             .file_name()
             .to_str()
             .and_then(|name| name.parse::<u32>().ok())
-            .is_some_and(|pid| crate::watchdog::process_start_time(pid).is_none());
+            .is_some_and(|pid| crate::process::process_start_time(pid).is_none());
         if gone {
             let _ = std::fs::remove_dir_all(item.path());
         }
@@ -1085,7 +1085,7 @@ fn restore_and_check(
 }
 
 /// 从 `dir` 里（或其下）的文件运行的进程（pid，镜像路径）：枚举全部进程（见
-/// [`process_ids`]），逐个查镜像路径（`watchdog::process_image_path`），用
+/// [`process_ids`]），逐个查镜像路径（`process::process_image_path`），用
 /// [`super::file_is_within`] 比较所在目录——镜像路径保留启动时的写法（例如 8.3 短名），
 /// 要解析成真实路径再比。查不到镜像路径的进程（别的用户的、刚退出的）跳过；macOS 上
 /// 镜像路径查不到，结果恒为空。只供第 7 步报告，不参与结束任何进程——结束只认台账。
@@ -1093,7 +1093,7 @@ pub fn processes_running_from(dir: &Path) -> Vec<(u32, PathBuf)> {
     process_ids()
         .into_iter()
         .filter_map(|pid| {
-            let image = crate::watchdog::process_image_path(pid)?;
+            let image = crate::process::process_image_path(pid)?;
             // Linux：文件被 rename 换掉之后，还在运行的旧镜像显示为「<路径> (deleted)」
             let text = image.to_string_lossy();
             let image = PathBuf::from(text.strip_suffix(" (deleted)").unwrap_or(&text));
@@ -1140,7 +1140,7 @@ fn process_ids() -> Vec<u32> {
         .collect()
 }
 
-/// 全部进程的 pid。其余平台不枚举（`watchdog::process_image_path` 在这些平台上也查不到
+/// 全部进程的 pid。其余平台不枚举（`process::process_image_path` 在这些平台上也查不到
 /// 镜像路径），第 7 步的报告因此为空。
 #[cfg(not(any(windows, target_os = "linux")))]
 fn process_ids() -> Vec<u32> {

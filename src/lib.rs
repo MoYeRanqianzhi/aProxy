@@ -6,6 +6,7 @@ pub mod find;
 pub mod fsx;
 pub mod install;
 pub mod ledger;
+pub mod process;
 pub mod proxy;
 pub mod retry;
 pub mod settings;

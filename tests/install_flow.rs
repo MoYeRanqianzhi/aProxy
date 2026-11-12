@@ -412,7 +412,7 @@ async fn jurisdiction_accepts_an_instance_started_through_a_short_path() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let image = aproxy::watchdog::process_image_path(child.id());
+    let image = aproxy::process::process_image_path(child.id());
     let verdict = aproxy::install::flow::check_jurisdiction(&run_dir, &env.home(), false).await;
     // 收尾放在断言之前：断言失败也不留下实例
     let _ = env
@@ -516,7 +516,7 @@ fn adopt_migrates_foreign_instance() {
         .expect("收编后实例应可 ping");
     assert_ne!(live.instance.pid, old_pid);
     // 新实例的镜像在 bin 下（收编完成的事实）
-    let image = aproxy::watchdog::process_image_path(live.instance.pid).expect("新实例镜像可查");
+    let image = aproxy::process::process_image_path(live.instance.pid).expect("新实例镜像可查");
     assert!(
         image.starts_with(env.home().join("bin")),
         "收编后实例应跑在标准位置: {image:?}"
@@ -762,7 +762,7 @@ fn unix_install_rolls_back_instance_to_preserved_old_binary() {
         env!("CARGO_PKG_VERSION"),
         "拉回的是旧版本"
     );
-    let image = aproxy::watchdog::process_image_path(info.instance.pid).unwrap();
+    let image = aproxy::process::process_image_path(info.instance.pid).unwrap();
     assert!(
         is_retired_old(&env.home(), &image),
         "实例应跑在让位的旧二进制上: {image:?}"
@@ -949,7 +949,7 @@ fn staged_target_drives_the_install_and_its_failure_reaches_the_installer() {
     let info = rt
         .block_on(aproxy::daemon::ipc_ping_in(&run_dir, &env.port.to_string()))
         .expect("实例应被旧二进制拉回");
-    let image = aproxy::watchdog::process_image_path(info.instance.pid).unwrap();
+    let image = aproxy::process::process_image_path(info.instance.pid).unwrap();
     assert!(
         is_retired_old(&env.home(), &image),
         "实例应跑在让位的旧二进制上: {image:?}"

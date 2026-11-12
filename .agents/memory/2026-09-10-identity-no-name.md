@@ -3,12 +3,15 @@ name: identity-no-name
 description: 用户定调：进程身份判定严禁依赖二进制名称（严重谬误）——正确锚点是 spawn 链/IPC 端点归属/进程创建时间戳；2026-10-04 已按方案 A 实施（pid + 创建时间），改身份/收养/处决逻辑前回想
 metadata:
   type: project
+  scope: 一切判断「这个 pid 是不是某条记录的进程」的代码：收养、处决、stop --force、安装器停旧进程、选举
+  status: active
+  last_verified: 2026-11-12
 ---
 
 # 进程身份判定与名称解耦（2026-09-10 用户定调；2026-10-04 方案 A 已实施）
 
 **现状（2026-10-04，合并提交 5c71f35）**：`is_aproxy_process` 已删除。守护注册时把自身进程创建时间写进
-`InstanceRecord.process_start`；`watchdog::record_identity` 按「pid + 创建时间」判定
+`InstanceRecord.process_start`；`process::record_identity`（2026-11-12 随 P4 从 watchdog.rs 搬进 `src/process.rs`）按「pid + 创建时间」判定
 Alive / Reused / Gone；收养、处决、`--force`、install 换血停旧看护者、选举存活判定
 全部改用它，Windows 终止在同一进程句柄上先核对创建时间再 TerminateProcess（无复用窗口）。
 登记值 0（读不到创建时间的平台）= 无法核验，按 Gone 处理：不收养、不处决、不强杀（2026-10-06
@@ -51,5 +54,9 @@ db770a0 删掉了「IPC 回报 pid 一致」的退路）。IPC 一侧另有核�
   B. 本分支只撤 unix 侧名称实装（回退到已有原语），机制替换独立成支评审
 - F2 的旧选项（「接受改名不受看护」/「放宽比对」）全部作废——两者都以
   名称判断为前提
+
+**Evidence:** 实施提交 5c71f35；现行代码 `src/process.rs` 的 `record_identity`、`terminate_verified_process` 及其单测
+（2026-11-12 Windows 全量通过）。
+**Recheck when:** 身份锚点改变（例如改用 pidfd，或把 IPC 端点归属当作判据）。
 
 相关：[[unix-first-test]] [[unix-stress-review]] [[criticism-not-authorization]]

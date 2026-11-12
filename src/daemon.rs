@@ -151,7 +151,7 @@ pub struct InstanceRecord {
     /// 进程身份 = 「这个 pid 现在是不是写下这条记录的那个守护」，与二进制
     /// 叫什么无关：pid 被系统回收再分配给任何进程后，新进程的创建时间必然
     /// 不同。看门狗的收养/处决/选举与 `stop --force` 都以「pid + 本字段」
-    /// 比对防 pid 复用误杀（见 watchdog::record_identity）。0 = 平台读不到
+    /// 比对防 pid 复用误杀（见 process::record_identity）。0 = 平台读不到
     /// 创建时间（无 /proc 的 unix），这样的记录无法核验身份，一律不据它动手。
     pub process_start: u64,
     pub version: String,
@@ -546,7 +546,7 @@ pub fn read_instance_file_in(run_dir: &std::path::Path, port: &str) -> Option<In
 ///
 /// 返回 Err 的信息已含原因，调用方直接展示。
 pub fn force_terminate(info: &InstanceRecord) -> Result<(), String> {
-    crate::watchdog::terminate_verified_process(info.pid, info.process_start)
+    crate::process::terminate_verified_process(info.pid, info.process_start)
 }
 
 /// 向 startup.log 追加一行（带 unix 时间戳前缀）。看门狗的 crashloop 放弃、
@@ -846,14 +846,14 @@ pub async fn survey_instances_in(dir: &std::path::Path) -> InstanceSurvey {
                 if read_instance_file_in(dir, &port).is_some_and(|f| f.pid == live.instance.pid) {
                     out.push(live);
                 } else if matches!(
-                    crate::watchdog::record_identity(info.pid, info.process_start),
-                    crate::watchdog::RecordIdentity::Alive(_)
+                    crate::process::record_identity(info.pid, info.process_start),
+                    crate::process::RecordIdentity::Alive(_)
                 ) {
                     unresponsive.push(info);
                 }
             }
-            Err(_) => match crate::watchdog::record_identity(info.pid, info.process_start) {
-                crate::watchdog::RecordIdentity::Alive(_) => unresponsive.push(info),
+            Err(_) => match crate::process::record_identity(info.pid, info.process_start) {
+                crate::process::RecordIdentity::Alive(_) => unresponsive.push(info),
                 // 实例不在了（或无从核验）：注册已失效，清理
                 _ => {
                     let _ = std::fs::remove_file(&path);
@@ -918,8 +918,8 @@ pub fn retire_moved_port_records_in(
     }
     if let Some(rec) = read_instance_file_in(run_dir, old_port)
         && matches!(
-            crate::watchdog::record_identity(rec.pid, rec.process_start),
-            crate::watchdog::RecordIdentity::Alive(_)
+            crate::process::record_identity(rec.pid, rec.process_start),
+            crate::process::RecordIdentity::Alive(_)
         )
     {
         return false;
@@ -1522,35 +1522,7 @@ mod tests {
     // 的测试（59xxx）互相干扰。
 
     #[cfg(any(windows, target_os = "linux"))]
-    fn spawn_unrelated_child() -> std::process::Child {
-        #[cfg(windows)]
-        let mut cmd = {
-            let mut c = std::process::Command::new("ping");
-            c.args(["-n", "60", "127.0.0.1"]);
-            c
-        };
-        #[cfg(target_os = "linux")]
-        let mut cmd = {
-            let mut c = std::process::Command::new("sleep");
-            c.arg("60");
-            c
-        };
-        cmd.stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn 测试子进程失败")
-    }
-
-    #[cfg(any(windows, target_os = "linux"))]
-    fn wait_child_exit(child: &mut std::process::Child) -> bool {
-        for _ in 0..50 {
-            if child.try_wait().unwrap().is_some() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        false
-    }
+    use crate::process::tests::{spawn_unrelated_child, wait_child_exit};
 
     /// stop --force 的身份策略：登记时间不符（pid 复用）拒绝；无时间戳的旧
     /// 记录且端点无人应答（归属无从证明）拒绝；身份一致即终止——被杀的进程
@@ -1560,7 +1532,7 @@ mod tests {
     async fn force_terminate_checks_identity_not_name() {
         let mut child = spawn_unrelated_child();
         let pid = child.id();
-        let start = crate::watchdog::process_start_time(pid).expect("子进程创建时间可查");
+        let start = crate::process::process_start_time(pid).expect("子进程创建时间可查");
         let mut info = sample_info(&format!("597{:02}", std::process::id() % 50));
         info.pid = pid;
 
@@ -1628,7 +1600,7 @@ mod tests {
 
         let mut child = spawn_unrelated_child();
         let pid = child.id();
-        let start = crate::watchdog::process_start_time(pid).expect("子进程创建时间可查");
+        let start = crate::process::process_start_time(pid).expect("子进程创建时间可查");
         write("59743", pid, start);
         assert!(!retire_moved_port_records_in(dir.path(), "59743", "59744"));
         assert_eq!(has("59743"), (true, true), "在世实例接手的端口不得退役");
@@ -1992,7 +1964,7 @@ mod tests {
         // pid 与创建时间都核验得上，但 59802 上没有 IPC 端点
         let dir = tempfile::tempdir().unwrap();
         let pid = std::process::id();
-        let start = crate::watchdog::process_start_time(pid).expect("读不到自身创建时间");
+        let start = crate::process::process_start_time(pid).expect("读不到自身创建时间");
         let mut hung = sample_info("59802");
         hung.pid = pid;
         hung.process_start = start;

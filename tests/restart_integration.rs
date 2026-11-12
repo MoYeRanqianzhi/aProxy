@@ -333,16 +333,16 @@ fn restore_ports(home: &Path) -> Vec<String> {
 /// 最后按「pid + 创建时间」核验后终止——路径核对与终止之间 pid 若被复用，
 /// 创建时间对不上，终止被拒。
 fn kill_own_pid(pid: u32, home: &Path) {
-    let start = aproxy::watchdog::process_start_time(pid).expect("进程创建时间可查");
+    let start = aproxy::process::process_start_time(pid).expect("进程创建时间可查");
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let image = canon(&aproxy::watchdog::process_image_path(pid).expect("进程镜像可查"));
+    let image = canon(&aproxy::process::process_image_path(pid).expect("进程镜像可查"));
     let allowed = [canon(home), canon(built_exe().parent().unwrap())];
     assert!(
         allowed.iter().any(|d| image.starts_with(d)),
         "拒绝终止镜像不在测试目录下的进程 pid {pid}: {}",
         image.display()
     );
-    aproxy::watchdog::terminate_verified_process(pid, start).expect("终止测试进程失败");
+    aproxy::process::terminate_verified_process(pid, start).expect("终止测试进程失败");
 }
 
 // ---------------------------------------------------------------------------
@@ -553,7 +553,7 @@ fn release_asset_named_instance_is_adopted_respawned_and_force_stoppable() {
         read_text(&wd_log)
     );
     let live = ipc_ping_in_dir(&rt, port, home).unwrap();
-    let image = aproxy::watchdog::process_image_path(live.instance.pid).expect("新实例镜像可查");
+    let image = aproxy::process::process_image_path(live.instance.pid).expect("新实例镜像可查");
     assert!(
         image
             .file_name()
@@ -888,7 +888,7 @@ fn concurrent_start_with_release_asset_name_converges_to_one_watchdog() {
     let alive: Vec<u32> = spawned
         .iter()
         .copied()
-        .filter(|pid| aproxy::watchdog::process_exited(*pid) == Some(false))
+        .filter(|pid| aproxy::process::process_exited(*pid) == Some(false))
         .collect();
     assert_eq!(
         alive,

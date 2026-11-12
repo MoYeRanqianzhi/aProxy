@@ -175,8 +175,8 @@ pub(crate) async fn handle_stop_cmd(target: Option<String>, threshold: Option<u6
 fn unresponsive_record(port: &str) -> Option<daemon::InstanceRecord> {
     let info = daemon::read_instance_file_in(&daemon::run_dir(), port)?;
     matches!(
-        aproxy::watchdog::record_identity(info.pid, info.process_start),
-        aproxy::watchdog::RecordIdentity::Alive(_)
+        aproxy::process::record_identity(info.pid, info.process_start),
+        aproxy::process::RecordIdentity::Alive(_)
     )
     .then_some(info)
 }
@@ -207,9 +207,8 @@ pub(crate) async fn stop_instance(info: &daemon::InstanceRecord, mode: StopMode)
             }
             // 发不出 shutdown：区分「其间已自行退出」与「进程还在、只是不应答」，
             // 前者就是停止的结果，后者只能 --force
-            Err(e) => match aproxy::watchdog::record_identity(info.pid, info.process_start) {
-                aproxy::watchdog::RecordIdentity::Gone
-                | aproxy::watchdog::RecordIdentity::Reused => {
+            Err(e) => match aproxy::process::record_identity(info.pid, info.process_start) {
+                aproxy::process::RecordIdentity::Gone | aproxy::process::RecordIdentity::Reused => {
                     println!("pid {}（端口 {}）已不在运行", info.pid, port);
                     true
                 }

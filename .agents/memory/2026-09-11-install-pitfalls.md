@@ -1,3 +1,13 @@
+---
+name: install-pitfalls
+description: 改安装流程、进程退出路径、等进程终止的逻辑，或写在进程内调用库函数并拉起守护的测试之前读——tokio 运行时退不出、IPC 消失不等于进程终止、分离拉起只继承父进程环境、测试端口与状态文件的竞态
+metadata:
+  type: project
+  scope: install 滚动重启、守护与看护者的退出路径、库层集成测试
+  status: active
+  last_verified: 2026-11-12
+---
+
 # 2026-09-11 install 实测深坑集（滚动重启轮）
 
 四个测试驱动逐层挖出的坑，前两个已入 commit message，这里补全通用教训：
@@ -11,7 +21,7 @@
 
 2. **IPC 消失 ≠ 进程终止**：守护 shutdown 先关 IPC 再清理最后退出，
    「ping 失败」只能证明服务停止。等进程终止要用退出码
-   （`GetExitCodeProcess != STILL_ACTIVE`，新原语 `watchdog::process_exited`）；
+   （`GetExitCodeProcess != STILL_ACTIVE`，原语 `process::process_exited`，在 `src/process.rs`）；
    `process_start_time(pid).is_none()` 在进程对象被任何句柄（Rust Child、
    看护 sync handle）维持时**永远误报存活**。另外终止等待预算必须覆盖
    守护的 10s 宽限强退（server.rs select 双臂）。
@@ -26,6 +36,9 @@
    被系统保留」）——一律 bind 试探选端口；「等状态文件消失」有启动竞态
    （还没创建 ≠ 已完成）——两段式先等出现再等消失；守护优雅退出会删
    `.restore`——restart 必须**先取恢复参数再 stop**。
+
+**Evidence:** 2026-09-11 滚动重启实测轮（四个测试驱动）；第 2 条的原语与说明在 `src/process.rs` 的 `process_exited`。
+**Recheck when:** 退出路径不再硬退、分离拉起改为显式传环境，或测试改用别的端口分配方式。
 
 关联：[[never-kill-aproxy-by-name]]（本轮测试泄漏 33 个进程曾致系统
 内存不足，全部按 pid 精确清理，生产实例分毫不碰）

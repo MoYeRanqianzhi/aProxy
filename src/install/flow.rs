@@ -54,7 +54,7 @@ pub async fn check_jurisdiction(run_dir: &Path, home: &Path, adopt: bool) -> Res
         let Ok(info) = crate::daemon::ipc_ping_in(run_dir, &port).await else {
             continue;
         };
-        let Some(image) = crate::watchdog::process_image_path(info.instance.pid) else {
+        let Some(image) = crate::process::process_image_path(info.instance.pid) else {
             continue;
         };
         if !super::file_is_within(&image, &bin_dir) {
@@ -385,7 +385,7 @@ impl Successor {
             let pid = crate::daemon::spawn_detached(exe, &args)?;
             Ok(Self {
                 pid,
-                start: crate::watchdog::process_start_time(pid),
+                start: crate::process::process_start_time(pid),
             })
         }
     }
@@ -397,7 +397,7 @@ impl Successor {
         }
         #[cfg(windows)]
         {
-            crate::watchdog::process_exited(self.pid) == Some(true)
+            crate::process::process_exited(self.pid) == Some(true)
         }
     }
 
@@ -424,7 +424,7 @@ impl Successor {
         #[cfg(windows)]
         {
             if let Some(start) = self.start {
-                let _ = crate::watchdog::terminate_verified_process(self.pid, start);
+                let _ = crate::process::terminate_verified_process(self.pid, start);
             }
             for _ in 0..50 {
                 if self.exited() {
@@ -677,7 +677,7 @@ async fn fleet_already_on_target(home: &Path, run_dir: &Path, state: &InstallSta
             return false;
         };
         let image =
-            crate::watchdog::process_image_path(status.instance.pid).and_then(|p| canonical(&p));
+            crate::process::process_image_path(status.instance.pid).and_then(|p| canonical(&p));
         if status.instance.version != state.target_version
             || status.state != crate::daemon::InstanceState::Serving
             || image.as_ref() != Some(&bin)
@@ -966,7 +966,7 @@ fn stop_old_watchdog(run_dir: &Path) {
             pid = claim.pid,
             "停掉旧看护者（换血：其 respawn 会用旧镜像）"
         );
-        let _ = crate::watchdog::terminate_verified_process(claim.pid, claim.created_at_process);
+        let _ = crate::process::terminate_verified_process(claim.pid, claim.created_at_process);
     }
 }
 

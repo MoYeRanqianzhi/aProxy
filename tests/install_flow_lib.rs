@@ -753,7 +753,7 @@ async fn rollback_case(kind: BrokenNew) {
         .await
         .expect("回滚后实例应在线");
     assert_ne!(info.instance.pid, old_pid, "应是重新拉起的进程");
-    let image = aproxy::watchdog::process_image_path(info.instance.pid).expect("镜像路径可查");
+    let image = aproxy::process::process_image_path(info.instance.pid).expect("镜像路径可查");
     assert!(same_path(&image, &old), "实例应跑在旧二进制上: {image:?}");
     assert_eq!(
         restore_args_of(&run_dir, port).as_deref(),

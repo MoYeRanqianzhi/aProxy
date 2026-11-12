@@ -314,7 +314,7 @@ fn force_install_stops_everything_swaps_and_restores() {
         output.contains(&format!("已恢复 pid {}", back.pid)),
         "{output}"
     );
-    let image = aproxy::watchdog::process_image_path(back.pid).expect("新实例的镜像路径可查");
+    let image = aproxy::process::process_image_path(back.pid).expect("新实例的镜像路径可查");
     assert_eq!(
         std::fs::canonicalize(image).unwrap(),
         std::fs::canonicalize(&bin).unwrap()

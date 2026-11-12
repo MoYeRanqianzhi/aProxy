@@ -143,7 +143,7 @@ pub async fn spawn_instance(
     let mut full = args.to_vec();
     full.push("--daemon-child".to_string());
     let pid = daemon::spawn_detached(exe, &full).map_err(SpawnError::Spawn)?;
-    let start = crate::watchdog::process_start_time(pid);
+    let start = crate::process::process_start_time(pid);
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let Some(rec) = daemon::registry_find_pid_in(run_dir, pid)
@@ -152,7 +152,7 @@ pub async fn spawn_instance(
         {
             return Ok(live);
         }
-        if crate::watchdog::process_exited(pid) == Some(true) {
+        if crate::process::process_exited(pid) == Some(true) {
             return Err(SpawnError::Exited {
                 pid,
                 startup_log: StartupLog::since(mark),
@@ -162,7 +162,7 @@ pub async fn spawn_instance(
             return Err(SpawnError::TimedOut {
                 pid,
                 start,
-                alive: crate::watchdog::process_exited(pid) == Some(false),
+                alive: crate::process::process_exited(pid) == Some(false),
                 startup_log: StartupLog::since(mark),
             });
         }

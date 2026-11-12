@@ -148,7 +148,7 @@ pub async fn stop_and_wait(run_dir: &Path, port: &str, timeout: Duration) -> Res
     }
     if let Some(pid) = pid {
         loop {
-            match crate::watchdog::process_exited(pid) {
+            match crate::process::process_exited(pid) {
                 Some(true) => break,
                 Some(false) => {}
                 None => break, // 不可判（权限等）——保守放行，后续步骤自会暴露
@@ -169,7 +169,7 @@ pub async fn stop_and_wait(run_dir: &Path, port: &str, timeout: Duration) -> Res
 struct SpawnFailure {
     /// spawn 成功时的子进程 pid（spawn 本身失败为 None）
     pid: Option<u32>,
-    /// spawn 返回后立刻读到的子进程创建时间（身份锚点，见 watchdog::record_identity）：
+    /// spawn 返回后立刻读到的子进程创建时间（身份锚点，见 process::record_identity）：
     /// 回收时按「pid + 创建时间」核验再终止——8 秒等待期间子进程若已退出、pid 被系统
     /// 复用给别的进程，届时现读的创建时间必然不符，绝不误杀。None = 读不到（进程瞬间
     /// 退出或平台不支持），此时不终止。
@@ -234,12 +234,12 @@ async fn reap_unready_child(pid: u32, start: Option<u64>) {
         );
         return;
     };
-    if let Err(e) = crate::watchdog::terminate_verified_process(pid, start) {
+    if let Err(e) = crate::process::terminate_verified_process(pid, start) {
         tracing::warn!(pid, error = %e, "未就绪的新进程终止失败，回退仍尝试");
         return;
     }
     for _ in 0..50 {
-        if crate::watchdog::process_exited(pid) != Some(false) {
+        if crate::process::process_exited(pid) != Some(false) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -274,7 +274,7 @@ pub async fn restart_instance(
     let live = crate::daemon::ipc_ping_in(run_dir, port).await.ok();
     let image = live
         .as_ref()
-        .and_then(|i| crate::watchdog::process_image_path(i.instance.pid));
+        .and_then(|i| crate::process::process_image_path(i.instance.pid));
 
     // 在途记录先于停止落盘（窗口内崩溃的唯一留存，见模块文档）
     state.pending_restores.retain(|p| p.port != port);

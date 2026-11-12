@@ -4734,7 +4734,7 @@ fn hung_instance_is_reported_and_only_force_stops_it() {
     let dummy = Command::new("sleep").arg("120").spawn();
     let mut dummy = ChildGuard(dummy.expect("拉起哑进程失败"));
     let pid = dummy.0.id();
-    let start = aproxy::watchdog::process_start_time(pid).expect("读不到哑进程创建时间");
+    let start = aproxy::process::process_start_time(pid).expect("读不到哑进程创建时间");
     let run_dir = home.path().join("run");
     let info = aproxy::daemon::InstanceRecord {
         pid,
@@ -5085,8 +5085,8 @@ fn daemon_lifecycle_start_status_stop() {
             .expect("守护应已写注册表");
         assert!(
             matches!(
-                aproxy::watchdog::record_identity(pid, rec.process_start),
-                aproxy::watchdog::RecordIdentity::Alive(_)
+                aproxy::process::record_identity(pid, rec.process_start),
+                aproxy::process::RecordIdentity::Alive(_)
             ),
             "守护 (pid {pid}) 应通过进程身份判定（登记创建时间 {}）",
             rec.process_start
@@ -6171,8 +6171,8 @@ fn identity_check_tolerates_swapped_binary() {
         let rec = aproxy::daemon::read_instance_file_in(&home_dir.join("run"), &port.to_string())
             .expect("守护应已写注册表");
         matches!(
-            aproxy::watchdog::record_identity(pid, rec.process_start),
-            aproxy::watchdog::RecordIdentity::Alive(_)
+            aproxy::process::record_identity(pid, rec.process_start),
+            aproxy::process::RecordIdentity::Alive(_)
         )
     };
     assert!(identity_alive(), "替换前守护应通过身份判定");

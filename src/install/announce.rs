@@ -163,7 +163,7 @@ pub fn clear_expired(home: &Path, run_dir: &Path) {
 /// 心跳旧 = install 挂死/unix 残留 → 无效（走保活续作路径，不是「在安装」）。
 pub fn is_active(ann: &Announcement, now_ms: u64) -> bool {
     now_ms.saturating_sub(ann.heartbeat_ms) <= FRESH_MS
-        && crate::watchdog::process_start_time(ann.installer_pid).is_some()
+        && crate::process::process_start_time(ann.installer_pid).is_some()
 }
 
 // ---------------------------------------------------------------------------

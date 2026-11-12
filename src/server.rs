@@ -148,7 +148,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
         // 身份锚点：守护自查自写的进程创建时间（看门狗收养/处决/选举与
         // stop --force 按「pid + 本值」防 pid 复用，与二进制名无关）。
         // 读不到（无 /proc 的平台）落 0，这样的记录无法核验身份
-        process_start: watchdog::process_start_time(std::process::id()).unwrap_or(0),
+        process_start: aproxy::process::process_start_time(std::process::id()).unwrap_or(0),
     };
     if let Err(e) = daemon::write_instance_file(&info) {
         tracing::warn!(error = %e, "实例注册表写入失败（不影响代理功能）");

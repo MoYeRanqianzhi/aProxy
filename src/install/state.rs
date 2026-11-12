@@ -282,7 +282,7 @@ pub fn is_stale(state: &InstallState, now_secs: u64) -> bool {
     match state.installer_pid {
         0 => true,
         pid if pid == std::process::id() => false,
-        pid => match crate::watchdog::process_start_time(pid) {
+        pid => match crate::process::process_start_time(pid) {
             None => true,
             Some(_) => state.updated_at.saturating_add(STALE_AFTER_SECS) <= now_secs,
         },

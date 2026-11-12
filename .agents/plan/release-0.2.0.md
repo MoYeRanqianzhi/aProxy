@@ -508,3 +508,13 @@
   更麻烦）并固定带上系统信任库校验器，要保住现在「内置 webpki 根证书」的行为得自己用 `use_preconfigured_tls` 拼 rustls
   配置；系统代理的读取方式也变了，需要对着记忆 proxy-config 的 7890 场景重新实测。收益很小：tauri 带入的 0.13 只开
   json、stream，不带 TLS，不构成两套 TLS 栈。0.12.28 目前没有安全公告。
+- P4（2026-11-12）：516b4c9 拉起并等就绪合成 `spawn::spawn_instance`（start、restart、restore、安装的滚动重启、看护者
+  重拉五处共用；start 有了早退检测，`tests/spawn_instance.rs` 钉住「启动即死 1 秒内报告并附 startup.log」）与原子写合成
+  `fsx::write_atomic`（临时名带纳秒、create_new、sync_all，unix 0600）；e55c660 进程原语从 watchdog.rs 搬进
+  `src/process.rs`（纯搬移，相关单测随行）。Windows headless 全量通过（库单测 295），两个变体 clippy 与 Linux 交叉 clippy
+  零输出。sync_all 拉长了守护「写注册表 → 写恢复记录」之间的窗口，暴露了 install_flow_lib 测试只等注册表就读 .restore
+  的竞态（ubuntu 带界面变体失败），5af8b39 修。
+  **`home.rs` 改随 B0 做**（主代理 2026-11-12 定）：B0 本来就要改 force_contract 的 `use` 行、文件头那句与 AGENTS.md、
+  CLAUDE.md 的契约段，home 的解析放到那时一起搬，这几处只改一次；home 的解析也可能该进 aproxy-ipc（`home_id` 与端点名在
+  那里），先搬进主 crate 会白搬一次。注意 force_contract 第 28 行 `aproxy::settings::user_dir()` 是函数体里的全路径、不是
+  `use` 行，搬 home 时它也得改——同属「`use` 路径随代码移动」（R-S3-15），B0 的提交说明里写明。

@@ -494,4 +494,11 @@
   **tag rc.1** → **v0.2.0**（aproxy-envelope 同时发 0.2.0；aproxy-format 0.2.0 随后走 format-v* 线，见 TODO 的 envelope 一条）。
 
 **进度记录**（每块完成时追加一行：块、提交、验证）：
-- （空）
+- 2026-11-11 CI 卡死修复 8e97317：依赖升级后 `interrupted_stream_is_retried` 在 Windows 上必现卡死，是 mock 不读请求就关闭
+  （RST 吞响应），见记忆 disconnect-billing-protection 的 2026-11-11 一节。
+- P1 c8b2ac9（tests/common 的 TestHome、源码检查 tests/test_home_check.rs）：Windows headless 全量通过（lib 287、
+  proxy_integration 102 等，各文件测试数与改动前一致）；带界面变体与 ubuntu 看 CI。观察项 `alias_start_and_stop_roundtrip`
+  没有单独循环复测（子代理中途停了），全量里通过。
+- P2 第 1 步 a5995d6（proxy.rs 拆成 src/proxy/ 15 个模块，纯搬移）：库单测 287、proxy_integration 102、
+  transform_integration 30 与拆分前一致。第 2、3 步：`attempts::classify` + 唯一的尝试循环 `run_attempts`（两种出口
+  `Responder::Buffered / Keepalive`），557f748；Windows headless 全量通过（库单测 292 = 287 + classify 的 5 个，其余各组数目不变）。

@@ -620,8 +620,12 @@ fn make_exec(p: &Path) {
     let _ = p;
 }
 
-/// 在 `exe` 上起一个守护实例（配置写入 home），等注册表就绪，返回
+/// 在 `exe` 上起一个守护实例（配置写入 home），等注册表与恢复记录都写好，返回
 /// (端口, 配置路径, 子进程)。
+///
+/// 只等注册表不够：守护先写注册表（.pid）、再写恢复记录（.restore），两次都是带 sync_all
+/// 的原子写，中间有毫秒级的窗口（Linux 上尤其明显）。调用方紧接着就读 .restore，所以两样
+/// 都要等到。
 fn start_instance(
     test_home: &TestHome,
     exe: &Path,
@@ -646,7 +650,9 @@ fn start_instance(
     let pid = child.id();
     let mut ready = false;
     for _ in 0..100 {
-        if aproxy::daemon::registry_pids_in(&run_dir).contains(&pid) {
+        if aproxy::daemon::registry_pids_in(&run_dir).contains(&pid)
+            && restore_args_of(&run_dir, port).is_some()
+        {
             ready = true;
             break;
         }

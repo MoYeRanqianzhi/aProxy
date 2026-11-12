@@ -787,7 +787,7 @@ async fn serve_fake_github(releases: Vec<FakeRelease>) -> String {
             }),
         )
         .route(
-            "/repos/test/releases/tags/:tag",
+            "/repos/test/releases/tags/{tag}",
             get(move |UrlPath(tag): UrlPath<String>| {
                 let items = by_tag.clone();
                 async move {
@@ -800,7 +800,7 @@ async fn serve_fake_github(releases: Vec<FakeRelease>) -> String {
             }),
         )
         .route(
-            "/dl/:index/:name",
+            "/dl/{index}/{name}",
             get(move |UrlPath((index, name)): UrlPath<(String, String)>| {
                 let files = files.clone();
                 async move {

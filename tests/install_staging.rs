@@ -7,6 +7,9 @@
 //!
 //! 隔离：APROXY_HOME 相关函数全部显式传 tempdir，绝不触碰真实 ~/.aproxy。
 
+mod common;
+use common::TestHome;
+
 use std::path::Path;
 
 #[cfg(unix)]
@@ -74,14 +77,9 @@ fn stage_from_rejects_version_mismatch_and_cleans_up() {
 /// 退出码 0，且不碰 home——APROXY_HOME 指向的目录事后仍不存在。
 #[test]
 fn version_flag_prints_the_permanent_line_and_touches_no_home() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path().join("home");
+    let home = TestHome::unborn();
     for flag in ["--version", "-V"] {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_aproxy"))
-            .arg(flag)
-            .env("APROXY_HOME", &home)
-            .output()
-            .unwrap();
+        let out = home.cmd().arg(flag).output().unwrap();
         assert!(out.status.success(), "{flag}");
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
@@ -94,7 +92,7 @@ fn version_flag_prints_the_permanent_line_and_touches_no_home() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    assert!(!home.exists(), "--version 不得创建或写入 home");
+    assert!(!home.path().exists(), "--version 不得创建或写入 home");
 
     // 形状：aproxy v<本包版本> (<变体>; <目标三元组>[; x86-64-v3])
     let line = aproxy::VERSION_LINE;

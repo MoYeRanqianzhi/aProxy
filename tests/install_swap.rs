@@ -4,9 +4,9 @@
 //! 全程在 tempdir 当 home 里演练：旧/新二进制都用 CARGO_BIN_EXE 副本（同版本无妨——
 //! 测的是文件布局与改名步骤，不是版本差异）。
 
+mod common;
+
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
-use std::process::Command;
 
 use aproxy::install::swap;
 
@@ -341,7 +341,8 @@ mod windows_swap {
     /// （名字倒序第一个）——更早的那个是坏文件，选错就跑不起来。
     #[test]
     fn fallback_bat_runs_the_newest_retired_binary() {
-        let home = tempfile::tempdir().unwrap();
+        // 要经 cmd 拉起 aproxy，所以用 TestHome：bat 转调的 aproxy 继承它注入的隔离环境
+        let home = common::TestHome::new();
         seed_marked_bin(home.path());
         let dir = swap::bin_dir_in(home.path());
         let staged = stage(home.path(), "fallback");
@@ -357,7 +358,8 @@ mod windows_swap {
 
         // 模拟交换空窗：aproxy.exe 暂时缺席
         std::fs::rename(dir.join("aproxy.exe"), dir.join("aproxy.exe.away")).unwrap();
-        let out = Command::new("cmd")
+        let out = home
+            .cmd_with("cmd")
             .args([
                 "/c",
                 &dir.join("aproxy.bat").display().to_string(),

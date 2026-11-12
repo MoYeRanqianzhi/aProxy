@@ -3765,19 +3765,7 @@ mod tests {
     async fn dynamic_heartbeat_arriving_after_replay_started_is_dropped() {
         // 心跳转换器慢（400ms）：这一拍的调用还没回来，回放已写出第一块真实
         // 字节。迟到的动态心跳必须丢弃——写出去就插进了回放的事件中间
-        let name = if cfg!(windows) {
-            "format-echo.exe"
-        } else {
-            "format-echo"
-        };
-        let mut dir = std::env::current_exe().unwrap();
-        let echo = loop {
-            let parent = dir.parent().expect("format-echo 未编译").to_path_buf();
-            if parent.join("examples").join(name).exists() {
-                break parent.join("examples").join(name);
-            }
-            dir = parent;
-        };
+        let echo = crate::transform::format_echo_path();
         let pool = Arc::new(crate::transform::TransformPool::new(Arc::new(
             crate::config::TransformConfig {
                 command: echo.display().to_string(),

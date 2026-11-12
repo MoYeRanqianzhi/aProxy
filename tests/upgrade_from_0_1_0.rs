@@ -14,8 +14,10 @@
 //! 0.1.0 实例，而 0.1.0 的 Windows 控制管道按端口全机共享，测试里的 0.1.0 二进制
 //! 可能碰到它们。
 
+mod common;
+use common::{TestHome, free_port};
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 fn exe_name() -> &'static str {
     if cfg!(windows) {
@@ -35,47 +37,19 @@ fn copy_exe(from: &Path, to: &Path) {
     }
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-/// 测试结束（含断言失败）时用 bin 里的 0.1.0 停掉本 home 的全部实例
-struct StopAll<'a> {
-    bin: &'a Path,
-    home: &'a Path,
-}
-
-impl Drop for StopAll<'_> {
-    fn drop(&mut self) {
-        let _ = Command::new(self.bin)
-            .args(["stop", "all"])
-            .env("APROXY_HOME", self.home)
-            .output();
-    }
-}
-
 #[test]
 #[ignore = "需要 APROXY_V010_BIN 指向 v0.1.0 的发布资产；CI 的 upgrade-from-0.1.0 任务下载后运行"]
 fn installer_of_0_1_0_refuses_this_build_before_touching_anything() {
     let old_bin = PathBuf::from(std::env::var("APROXY_V010_BIN").expect("APROXY_V010_BIN 未设置"));
-    let home_dir = tempfile::tempdir().unwrap();
-    let home = home_dir.path();
+    let test_home = TestHome::new();
+    // 看门狗保持 0.1.0 的默认（开启），与用户的现场一致；TestHome 默认写的是关闭
+    test_home.settings(r#"{"watchdog": true}"#);
+    let home = test_home.path();
     let bin = home.join("bin").join(exe_name());
     copy_exe(&old_bin, &bin);
     let new_bin = home.join(format!("download-{}", exe_name()));
     copy_exe(Path::new(env!("CARGO_BIN_EXE_aproxy")), &new_bin);
-    let run = |args: &[&str]| {
-        Command::new(&bin)
-            .args(args)
-            .env("APROXY_HOME", home)
-            .env("NO_PROXY", "127.0.0.1,localhost")
-            .output()
-            .unwrap()
-    };
+    let run = |args: &[&str]| test_home.cmd_with(&bin).args(args).output().unwrap();
     let text = |out: &std::process::Output| {
         format!(
             "{}{}",
@@ -84,9 +58,10 @@ fn installer_of_0_1_0_refuses_this_build_before_touching_anything() {
         )
     };
 
-    // 一个 0.1.0 实例；看门狗保持默认开启，与用户的现场一致
+    // 一个 0.1.0 实例。测试结束（含断言失败）时用 bin 里的 0.1.0 按端口停掉它：0.2.0 起的
+    // CLI 联系不上 0.1.0 的实例
     let port = free_port();
-    let _stop = StopAll { bin: &bin, home };
+    test_home.stop_on_drop_with(&bin, port);
     let cfg = home.join("c.toml");
     std::fs::write(
         &cfg,

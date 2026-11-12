@@ -1,8 +1,11 @@
 //! install 库层诊断：continue_install 从 restarting 残局续作（接管者视角，
 //! 进程内直接跑——子进程黑盒链路里看不到的卡点在此暴露）。
 
+mod common;
+use common::{TestHome, free_port};
+
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// live 测试（起真实守护 + 进程级 set_var APROXY_HOME）互斥：env 是进程级
@@ -10,21 +13,6 @@ use std::time::{Duration, Instant};
 /// 90s 超时的根源）。async Mutex——guard 跨 await 持有整个测试期，串行执行
 /// 所有 live 测试。
 static LIVE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// bind 试探选取可用端口（排除区间/占用者自动跳过；原子计数保证同进程
-/// 并发测试不互撞）
-fn free_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static SEQ: AtomicU16 = AtomicU16::new(0);
-    let base = 28000u16 + (std::process::id() % 500) as u16 * 20;
-    for i in 0..200u16 {
-        let candidate = base + SEQ.fetch_add(1, Ordering::Relaxed) + i * 300;
-        if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
-            return candidate;
-        }
-    }
-    panic!("200 次内未找到可用端口");
-}
 
 /// Windows 接力交棒：continue_install 返回 `HandedOver` 时状态文件**留给
 /// 接棒者**继续完成，命令返回 ≠ 完成——轮询等待其收敛（接棒者要做完整
@@ -52,14 +40,14 @@ async fn continue_from_restarting_reclaims_instance() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
-    let dir = tempfile::tempdir().unwrap();
+    let test_home = TestHome::new();
     // 进程级注入 APROXY_HOME：本文件独占测试进程（cargo test 每 target 一
     // 进程），可安全 set_var。必须设在进程 env 上——spawn_detached 只继承
     // 父进程环境，仅给直接子进程 cmd.env 注入管不到隔代 spawn（实测教训：
     // 新守护把注册表写进真实 ~/.aproxy/run，测试轮询 tempdir 永远落空）。
     // edition 2024 下 set_var 为 unsafe（本测试单线程且无并发读 env，安全）。
-    unsafe { std::env::set_var("APROXY_HOME", dir.path()) };
-    let home = dir.path();
+    unsafe { std::env::set_var("APROXY_HOME", test_home.path()) };
+    let home = test_home.path();
     let run_dir = home.join("run");
     std::fs::create_dir_all(&run_dir).unwrap();
 
@@ -82,13 +70,13 @@ async fn continue_from_restarting_reclaims_instance() {
     )
     .unwrap();
     let dbg_err = std::fs::File::create(home.join("daemon-stderr.log")).unwrap();
-    let mut child = Command::new(&bin)
+    let mut child = test_home
+        .cmd_with(&bin)
         .args([
             "--config",
             &cfg_file.display().to_string(),
             "--daemon-child",
         ])
-        .env("APROXY_HOME", home)
         .stdout(Stdio::null())
         .stderr(dbg_err)
         .spawn()
@@ -221,9 +209,9 @@ async fn continue_from_restarting_reclaims_instance() {
 #[tokio::test(flavor = "current_thread")]
 async fn continue_from_swapping_with_live_instance_redoes_swap() {
     let _guard = LIVE_TEST_LOCK.lock().await;
-    let dir = tempfile::tempdir().unwrap();
-    unsafe { std::env::set_var("APROXY_HOME", dir.path()) };
-    let home = dir.path();
+    let test_home = TestHome::new();
+    unsafe { std::env::set_var("APROXY_HOME", test_home.path()) };
+    let home = test_home.path();
     let run_dir = home.join("run");
     std::fs::create_dir_all(&run_dir).unwrap();
 
@@ -243,13 +231,13 @@ async fn continue_from_swapping_with_live_instance_redoes_swap() {
         format!("base_url = \"https://libdiag.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
     )
     .unwrap();
-    let mut child = Command::new(&bin)
+    let mut child = test_home
+        .cmd_with(&bin)
         .args([
             "--config",
             &cfg_file.display().to_string(),
             "--daemon-child",
         ])
-        .env("APROXY_HOME", home)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -613,14 +601,13 @@ async fn only_the_named_successor_takes_over_a_live_install() {
 // 二进制按原参数拉回、.restore 完好、滚动中止且自动续作不再重试。
 // ---------------------------------------------------------------------------
 
-/// 隔离 home + 进程级 APROXY_HOME（restart 原语 spawn 的隔代守护只继承进程
-/// env）+ 关看护者（settings 总开关，实验期间不让守护补种看护者）。
-fn live_home() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    unsafe { std::env::set_var("APROXY_HOME", dir.path()) };
-    std::fs::create_dir_all(dir.path().join("run")).unwrap();
-    std::fs::write(dir.path().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
-    dir
+/// 隔离 home（TestHome，已关看护者：实验期间不让守护补种看护者）+ 进程级
+/// APROXY_HOME（restart 原语 spawn 的隔代守护只继承进程 env）。
+fn live_home() -> TestHome {
+    let home = TestHome::new();
+    unsafe { std::env::set_var("APROXY_HOME", home.path()) };
+    std::fs::create_dir_all(home.path().join("run")).unwrap();
+    home
 }
 
 fn make_exec(p: &Path) {
@@ -636,10 +623,11 @@ fn make_exec(p: &Path) {
 /// 在 `exe` 上起一个守护实例（配置写入 home），等注册表就绪，返回
 /// (端口, 配置路径, 子进程)。
 fn start_instance(
-    home: &Path,
+    test_home: &TestHome,
     exe: &Path,
     name: &str,
 ) -> (u16, std::path::PathBuf, std::process::Child) {
+    let home = test_home.path();
     let port = free_port();
     let cfg = home.join(format!("{name}.toml"));
     std::fs::write(
@@ -647,9 +635,9 @@ fn start_instance(
         format!("base_url = \"https://{name}.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
     )
     .unwrap();
-    let child = Command::new(exe)
+    let child = test_home
+        .cmd_with(exe)
         .args(["--config", &cfg.display().to_string(), "--daemon-child"])
-        .env("APROXY_HOME", home)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -739,7 +727,7 @@ async fn rollback_case(kind: BrokenNew) {
     std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &bin).unwrap();
     make_exec(&bin);
 
-    let (port, cfg, mut child) = start_instance(home, &bin, "rollback");
+    let (port, cfg, mut child) = start_instance(&dir, &bin, "rollback");
     let old_pid = child.id();
     let args_before = restore_args_of(&run_dir, port).expect("在跑实例应有 .restore");
     aproxy::install::broadcast::ack_one(&run_dir, &port.to_string())
@@ -820,7 +808,7 @@ async fn halted_failure_is_cleaned_up_when_the_fleet_already_runs_the_target() {
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
     std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &bin).unwrap();
     make_exec(&bin);
-    let (port, _cfg, mut child) = start_instance(home, &bin, "fleet-ok");
+    let (port, _cfg, mut child) = start_instance(&dir, &bin, "fleet-ok");
     let pid = child.id();
 
     let mut state = InstallState::new_marking(env!("CARGO_PKG_VERSION"), InstallSource::From);
@@ -880,7 +868,7 @@ async fn rolling_restart_keeps_restore_when_rollback_also_fails() {
     std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &bin).unwrap();
     make_exec(&bin);
 
-    let (port, cfg, mut child) = start_instance(home, &bin, "down");
+    let (port, cfg, mut child) = start_instance(&dir, &bin, "down");
     let args_before = restore_args_of(&run_dir, port).unwrap();
     aproxy::install::broadcast::ack_one(&run_dir, &port.to_string())
         .await
@@ -946,7 +934,7 @@ async fn continue_restores_instance_stopped_mid_restart() {
     make_exec(&bin);
 
     // 实例跑起来再优雅停掉：.restore 随之删除，复刻窗口内的现场
-    let (port, _cfg, mut child) = start_instance(home, &bin, "pending");
+    let (port, _cfg, mut child) = start_instance(&dir, &bin, "pending");
     let args = restore_args_of(&run_dir, port).unwrap();
     aproxy::install::restart::stop_and_wait(&run_dir, &port.to_string(), Duration::from_secs(20))
         .await

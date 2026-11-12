@@ -2,41 +2,30 @@
 //! 早交接由 staging 里的目标二进制驱动）、交棒失败与失败转告、管辖检查、
 //! --adopt 收编、--abort 回滚窗口。
 //!
-//! 隔离：每个测试独立 tempdir 作为 APROXY_HOME，实例与安装进程都注入同一
-//! 环境变量；端口从测试进程 pid 派生，绝不触碰生产实例（12345/12349）。
+//! 隔离：每个测试一个 common::TestHome 作为 APROXY_HOME，实例与安装进程都经它拉起、
+//! 注入同一环境；端口向系统要（common::free_port），绝不触碰生产实例（12345/12349）。
 //!
 //! 形态说明：旧/新二进制都是 CARGO_BIN_EXE 副本（同版本——测的是舞步与
 //! 状态机推进，不是版本差异；verifying 的 version==target 对同版本成立）。
 
+mod common;
+use common::{TestHome, free_port};
+
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// bind 试探选取可用端口（pid 派生可能撞上 Windows 动态端口排除区间——
-/// Hyper-V/WinNAT 保留块；原子计数保证同进程并发测试不互撞）
-fn free_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static SEQ: AtomicU16 = AtomicU16::new(0);
-    let base = 27000u16 + (std::process::id() % 500) as u16 * 20;
-    for i in 0..200u16 {
-        let candidate = base + SEQ.fetch_add(1, Ordering::Relaxed) + i * 300;
-        if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
-            return candidate;
-        }
-    }
-    panic!("200 次内未找到可用端口");
-}
-
 struct TestEnv {
-    home: tempfile::TempDir,
+    home: TestHome,
     port: u16,
 }
 
 impl TestEnv {
-    fn new(_port_offset: u32) -> Self {
-        Self {
-            home: tempfile::tempdir().unwrap(),
-            port: free_port(),
-        }
+    fn new() -> Self {
+        let home = TestHome::new();
+        let port = free_port();
+        // 实例都起在这个端口上：测试结束（含断言失败）时按端口停掉它
+        home.stop_on_drop(port);
+        Self { home, port }
     }
     fn home(&self) -> std::path::PathBuf {
         self.home.path().to_path_buf()
@@ -64,12 +53,10 @@ impl TestEnv {
         }
         from
     }
-    /// install 子进程（APROXY_HOME 注入）
+    /// install 子进程（经 TestHome 拉起，带着它注入的环境）
     fn install_cmd(&self, args: &[&str]) -> Command {
-        let exe = env!("CARGO_BIN_EXE_aproxy");
-        let mut cmd = Command::new(exe);
+        let mut cmd = self.home.cmd();
         cmd.arg("install").args(args);
-        cmd.env("APROXY_HOME", self.home());
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd
     }
@@ -138,7 +125,7 @@ fn is_retired_old(home: &std::path::Path, path: &std::path::Path) -> bool {
 // ---------------------------------------------------------------------------
 #[test]
 fn install_from_without_instances_fast_path() {
-    let env = TestEnv::new(1);
+    let env = TestEnv::new();
     env.seed_bin();
     let from = env.source_file("fast");
 
@@ -186,7 +173,7 @@ fn install_from_without_instances_fast_path() {
 fn install_from_with_instance_rolling_restart() {
     use std::io::Read;
 
-    let env = TestEnv::new(2);
+    let env = TestEnv::new();
     let bin = env.seed_bin();
     let cfg_file = env.home().join("inst.toml");
     std::fs::write(
@@ -199,13 +186,14 @@ fn install_from_with_instance_rolling_restart() {
     .unwrap();
 
     // 实例跑在规范 bin 二进制上（管辖内的真实升级形态）
-    let child = Command::new(&bin)
+    let child = env
+        .home
+        .cmd_with(&bin)
         .args([
             "--config",
             &cfg_file.display().to_string(),
             "--daemon-child",
         ])
-        .env("APROXY_HOME", env.home())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -270,9 +258,10 @@ fn install_from_with_instance_rolling_restart() {
     );
 
     // 清理实例（测试收尾——同 home 找得到注册表）
-    let _ = Command::new(env!("CARGO_BIN_EXE_aproxy"))
+    let _ = env
+        .home
+        .cmd()
         .args(["stop", &env.port.to_string()])
-        .env("APROXY_HOME", env.home())
         .output();
 }
 
@@ -281,7 +270,7 @@ fn install_from_with_instance_rolling_restart() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn jurisdiction_check_rejects_foreign_binary() {
-    let env = TestEnv::new(3);
+    let env = TestEnv::new();
     // 下载链指向一个必然连不上的地址：在线安装若在管辖检查之前就开始下载，
     // 报的会是下载失败而不是管辖错误
     std::fs::write(
@@ -300,13 +289,14 @@ async fn jurisdiction_check_rejects_foreign_binary() {
     )
     .unwrap();
     let foreign_bin = env.source_file("foreign");
-    let child = Command::new(&foreign_bin)
+    let child = env
+        .home
+        .cmd_with(&foreign_bin)
         .args([
             "--config",
             &cfg_file.display().to_string(),
             "--daemon-child",
         ])
-        .env("APROXY_HOME", env.home())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -345,9 +335,10 @@ async fn jurisdiction_check_rejects_foreign_binary() {
     assert!(text.contains("--adopt"), "在线安装应报管辖错误: {text}");
     assert!(!text.contains("开始下载"), "管辖检查应先于下载: {text}");
 
-    let _ = Command::new(env!("CARGO_BIN_EXE_aproxy"))
+    let _ = env
+        .home
+        .cmd()
         .args(["stop", &env.port.to_string()])
-        .env("APROXY_HOME", env.home())
         .output();
 }
 
@@ -380,7 +371,7 @@ fn short_path(path: &std::path::Path) -> std::path::PathBuf {
 #[cfg(windows)]
 #[tokio::test]
 async fn jurisdiction_accepts_an_instance_started_through_a_short_path() {
-    let env = TestEnv::new(14);
+    let env = TestEnv::new();
     std::fs::write(env.home().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
     let bin = env.seed_bin();
     let short_bin = short_path(&bin);
@@ -400,13 +391,14 @@ async fn jurisdiction_accepts_an_instance_started_through_a_short_path() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(&short_bin)
+    let mut child = env
+        .home
+        .cmd_with(&short_bin)
         .args([
             "--config",
             &cfg_file.display().to_string(),
             "--daemon-child",
         ])
-        .env("APROXY_HOME", env.home())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -423,9 +415,10 @@ async fn jurisdiction_accepts_an_instance_started_through_a_short_path() {
     let image = aproxy::watchdog::process_image_path(child.id());
     let verdict = aproxy::install::flow::check_jurisdiction(&run_dir, &env.home(), false).await;
     // 收尾放在断言之前：断言失败也不留下实例
-    let _ = Command::new(env!("CARGO_BIN_EXE_aproxy"))
+    let _ = env
+        .home
+        .cmd()
         .args(["stop", &env.port.to_string()])
-        .env("APROXY_HOME", env.home())
         .output();
     let _ = child.kill();
     let _ = child.wait();
@@ -452,7 +445,7 @@ async fn jurisdiction_accepts_an_instance_started_through_a_short_path() {
 #[test]
 #[cfg(windows)]
 fn adopt_migrates_foreign_instance() {
-    let env = TestEnv::new(4);
+    let env = TestEnv::new();
     // 实例跑在 bin 外的「npm 安装形态」
     let cfg_file = env.home().join("adopted.toml");
     std::fs::write(
@@ -464,13 +457,14 @@ fn adopt_migrates_foreign_instance() {
     )
     .unwrap();
     let foreign_bin = env.source_file("adopt");
-    let child = Command::new(&foreign_bin)
+    let child = env
+        .home
+        .cmd_with(&foreign_bin)
         .args([
             "--config",
             &cfg_file.display().to_string(),
             "--daemon-child",
         ])
-        .env("APROXY_HOME", env.home())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -528,9 +522,10 @@ fn adopt_migrates_foreign_instance() {
         "收编后实例应跑在标准位置: {image:?}"
     );
 
-    let _ = Command::new(env!("CARGO_BIN_EXE_aproxy"))
+    let _ = env
+        .home
+        .cmd()
         .args(["stop", &env.port.to_string()])
-        .env("APROXY_HOME", env.home())
         .output();
 }
 
@@ -539,7 +534,7 @@ fn adopt_migrates_foreign_instance() {
 // ---------------------------------------------------------------------------
 #[test]
 fn abort_rolls_back_cleanly_before_swap() {
-    let env = TestEnv::new(5);
+    let env = TestEnv::new();
     let home = env.home();
     // 伪造 downloaded 现场：状态文件 + staging 完整副本（二进制未动的形态）
     let mut state = aproxy::install::state::InstallState::new_marking(
@@ -568,7 +563,7 @@ fn abort_rolls_back_cleanly_before_swap() {
 // ---------------------------------------------------------------------------
 #[test]
 fn abort_rejected_after_swap_phase() {
-    let env = TestEnv::new(6);
+    let env = TestEnv::new();
     let home = env.home();
     let mut state = aproxy::install::state::InstallState::new_marking(
         env!("CARGO_PKG_VERSION"),
@@ -594,7 +589,7 @@ fn abort_rejected_after_swap_phase() {
 // ---------------------------------------------------------------------------
 #[test]
 fn install_instance_failure_exits_nonzero_and_keeps_restore() {
-    let env = TestEnv::new(8);
+    let env = TestEnv::new();
     std::fs::write(env.home().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
     let bin = env.seed_bin();
     let cfg_file = env.home().join("broken.toml");
@@ -606,13 +601,14 @@ fn install_instance_failure_exits_nonzero_and_keeps_restore() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(&bin)
+    let mut child = env
+        .home
+        .cmd_with(&bin)
         .args([
             "--config",
             &cfg_file.display().to_string(),
             "--daemon-child",
         ])
-        .env("APROXY_HOME", env.home())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -697,7 +693,7 @@ fn install_instance_failure_exits_nonzero_and_keeps_restore() {
 #[test]
 fn unix_install_rolls_back_instance_to_preserved_old_binary() {
     use std::os::unix::fs::PermissionsExt;
-    let env = TestEnv::new(9);
+    let env = TestEnv::new();
     std::fs::write(env.home().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
     let bin = env.seed_bin();
     let cfg_file = env.home().join("unixrb.toml");
@@ -709,13 +705,14 @@ fn unix_install_rolls_back_instance_to_preserved_old_binary() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(&bin)
+    let mut child = env
+        .home
+        .cmd_with(&bin)
         .args([
             "--config",
             &cfg_file.display().to_string(),
             "--daemon-child",
         ])
-        .env("APROXY_HOME", env.home())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -794,13 +791,14 @@ fn start_bin_instance(env: &TestEnv, name: &str) -> std::process::Child {
         ),
     )
     .unwrap();
-    let mut child = Command::new(aproxy::install::swap::bin_path_in(&env.home()))
+    let mut child = env
+        .home
+        .cmd_with(aproxy::install::swap::bin_path_in(&env.home()))
         .args([
             "--config",
             &cfg_file.display().to_string(),
             "--daemon-child",
         ])
-        .env("APROXY_HOME", env.home())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -832,7 +830,7 @@ fn write_script(path: &std::path::Path, body: &str) {
 #[cfg(unix)]
 #[test]
 fn handover_to_a_target_that_never_takes_over_fails_without_touching_anything() {
-    let env = TestEnv::new(10);
+    let env = TestEnv::new();
     std::fs::write(env.home().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
     env.seed_bin();
     let mut child = start_bin_instance(&env, "refuse");
@@ -895,7 +893,7 @@ fn handover_to_a_target_that_never_takes_over_fails_without_touching_anything() 
 #[cfg(unix)]
 #[test]
 fn staged_target_drives_the_install_and_its_failure_reaches_the_installer() {
-    let env = TestEnv::new(11);
+    let env = TestEnv::new();
     std::fs::write(env.home().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
     env.seed_bin();
     let mut child = start_bin_instance(&env, "wrapped");
@@ -970,7 +968,7 @@ fn staged_target_drives_the_install_and_its_failure_reaches_the_installer() {
 // ---------------------------------------------------------------------------
 #[test]
 fn concurrent_install_rejected_by_lock() {
-    let env = TestEnv::new(7);
+    let env = TestEnv::new();
     env.seed_bin();
     // 新鲜锁（installer_pid = 本进程 = 活着的 pid）
     let state = aproxy::install::state::InstallState::new_marking(
@@ -996,16 +994,12 @@ fn concurrent_install_rejected_by_lock() {
 // ---------------------------------------------------------------------------
 #[test]
 fn version_flag_does_not_resume_a_leftover_install() {
-    let env = TestEnv::new(12);
+    let env = TestEnv::new();
     let state = aproxy::install::state::state_path_in(&env.home());
     std::fs::create_dir_all(state.parent().unwrap()).unwrap();
     std::fs::write(&state, r#"{"phase":"aborted","target_version":"0.2.0"}"#).unwrap();
     let run = |arg: &str| {
-        let out = Command::new(env!("CARGO_BIN_EXE_aproxy"))
-            .arg(arg)
-            .env("APROXY_HOME", env.home())
-            .output()
-            .unwrap();
+        let out = env.home.cmd().arg(arg).output().unwrap();
         assert!(
             out.status.success(),
             "{arg}: {}",
@@ -1052,7 +1046,7 @@ fn fake_version_binary(env: &TestEnv, name: &str, line: &str) -> std::path::Path
 // ---------------------------------------------------------------------------
 #[test]
 fn install_refuses_versions_below_0_2_0() {
-    let env = TestEnv::new(13);
+    let env = TestEnv::new();
     let bin = env.seed_bin();
     let before = std::fs::read(&bin).unwrap();
     let legacy = fake_version_binary(&env, "legacy", "aproxy 0.1.0");
@@ -1090,7 +1084,7 @@ fn install_refuses_versions_below_0_2_0() {
 // ---------------------------------------------------------------------------
 #[test]
 fn install_from_checks_the_variant() {
-    let env = TestEnv::new(14);
+    let env = TestEnv::new();
     let bin = env.seed_bin();
     let before = std::fs::read(&bin).unwrap();
     let own = aproxy::install::force::VersionLine::own().variant.unwrap();
@@ -1125,7 +1119,7 @@ fn install_from_checks_the_variant() {
 // ---------------------------------------------------------------------------
 #[test]
 fn a_desktop_build_no_channel_delivers_is_not_replaced() {
-    let env = TestEnv::new(15);
+    let env = TestEnv::new();
     // 下载链只有一个必然连不上的地址：渠道全部失败，与 404 一样走「下载链失败」
     std::fs::write(
         env.home().join("settings.json"),
@@ -1133,11 +1127,7 @@ fn a_desktop_build_no_channel_delivers_is_not_replaced() {
     )
     .unwrap();
     let run = |args: &[&str]| {
-        let out = env
-            .install_cmd(args)
-            .env("NO_PROXY", "127.0.0.1,localhost")
-            .output()
-            .unwrap();
+        let out = env.install_cmd(args).output().unwrap();
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),

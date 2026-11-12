@@ -891,6 +891,30 @@ pub(crate) async fn transform_response(
     }
 }
 
+/// 库内单测用的 examples/format-echo(.exe)：跨平台的假 format 程序（不依赖系统里的 python），
+/// 本模块与 proxy 的单测共用这一处。库的单测程序在 `target/<profile>/deps/` 里，example 在同一
+/// profile 的 `examples/` 里，所以从单测程序自己的路径直接推出来，不靠逐级往上找。
+///
+/// 它是 example，不是单测的依赖：只跑 `cargo test --lib` 时 cargo 不编译它，干净的构建目录下
+/// 要先 `cargo build --example format-echo`，否则这里 panic 并给出这条命令。
+#[cfg(test)]
+pub(crate) fn format_echo_path() -> std::path::PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let profile_dir = exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("单测程序应在 target/<profile>/deps/ 里");
+    let path = profile_dir
+        .join("examples")
+        .join(format!("format-echo{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        path.is_file(),
+        "找不到 {}：只跑库的单测时 cargo 不编译 example，先执行 `cargo build --example format-echo`",
+        path.display()
+    );
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,22 +948,7 @@ mod tests {
     #[tokio::test]
     async fn convert_smoke_real_format_echo_roundtrip() {
         // 真实 spawn format-echo 的最小往返（不经代理栈，二分定位用）
-        let name = if cfg!(windows) {
-            "format-echo.exe"
-        } else {
-            "format-echo"
-        };
-        let mut dir = std::env::current_exe().unwrap();
-        let mut echo = None;
-        while let Some(parent) = dir.parent() {
-            let cand = parent.join("examples").join(name);
-            if cand.exists() {
-                echo = Some(cand);
-                break;
-            }
-            dir = parent.to_path_buf();
-        }
-        let echo = echo.expect("format-echo 未编译");
+        let echo = format_echo_path();
         let pool = TransformPool::new(Arc::new(TransformConfig {
             command: echo.display().to_string(),
             args: vec!["echo".to_string()],
@@ -1013,24 +1022,6 @@ mod tests {
         assert_eq!(pool.cfg.effective_pool_max(), 4); // 未配置回退默认
         assert_eq!(pool.permits.available_permits(), 1); // spawn 模式恒 1
     }
-    /// 定位 examples/format-echo(.exe)（与集成测试同款定位逻辑）。
-    fn format_echo_path() -> std::path::PathBuf {
-        let name = if cfg!(windows) {
-            "format-echo.exe"
-        } else {
-            "format-echo"
-        };
-        let mut dir = std::env::current_exe().unwrap();
-        while let Some(parent) = dir.parent() {
-            let cand = parent.join("examples").join(name);
-            if cand.exists() {
-                return cand;
-            }
-            dir = parent.to_path_buf();
-        }
-        panic!("format-echo 未编译");
-    }
-
     fn echo_pool(
         mode: TransformMode,
         sub: &str,

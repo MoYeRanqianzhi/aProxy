@@ -7,10 +7,10 @@
 //! forward_only 互斥拦截、保活通道透传、进程池加固（format 多写 stdout 时
 //! 不串包 / 复用到死 worker 时换新重试）。
 
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex, atomic::AtomicUsize, atomic::Ordering},
-};
+mod common;
+use common::{TestHome, format_echo_path};
+
+use std::sync::{Arc, Mutex, atomic::AtomicUsize, atomic::Ordering};
 
 use aproxy::config::{Config, TransformConfig, TransformMode};
 use aproxy::proxy::{AppState, router};
@@ -72,24 +72,6 @@ fn transform_config(cmd_sub: &str, mode: TransformMode) -> TransformConfig {
         timeout_secs: Some(10),
         ..Default::default()
     }
-}
-
-/// 定位 examples/format-echo(.exe)：current_exe 的祖先目录里找 examples/
-fn format_echo_path() -> PathBuf {
-    let name = if cfg!(windows) {
-        "format-echo.exe"
-    } else {
-        "format-echo"
-    };
-    let mut dir = std::env::current_exe().unwrap();
-    while let Some(parent) = dir.parent() {
-        let cand = parent.join("examples").join(name);
-        if cand.exists() {
-            return cand;
-        }
-        dir = parent.to_path_buf();
-    }
-    panic!("format-echo 未找到——cargo test 应已编译全部 example");
 }
 
 type Captured = Arc<Mutex<Vec<u8>>>;
@@ -1186,8 +1168,8 @@ async fn request_persistent_reused_worker_dying_on_write_is_retried_once() {
 #[test]
 fn forward_only_with_transform_start_fails() {
     isolate_env_proxy();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg_path = dir.path().join("mutual.toml");
+    let home = TestHome::new();
+    let cfg_path = home.path().join("mutual.toml");
     let raw = format!(
         concat!(
             "base_url = \"https://api.example.com\"\n",
@@ -1204,13 +1186,7 @@ fn forward_only_with_transform_start_fails() {
     std::fs::write(&cfg_path, raw).unwrap();
 
     // 无子命令 = start：validate 在预检之前，报互斥错误退出且不产生任何进程
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_aproxy"))
-        .arg("--config")
-        .arg(&cfg_path)
-        .env("APROXY_HOME", dir.path())
-        .env("NO_PROXY", "127.0.0.1,localhost")
-        .output()
-        .unwrap();
+    let out = home.cmd().arg("--config").arg(&cfg_path).output().unwrap();
     assert!(!out.status.success(), "互斥配置应启动失败");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("互斥"), "错误应说明互斥语义: {stderr}");

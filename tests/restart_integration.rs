@@ -12,52 +12,18 @@
 //! - 重拉/恢复后端口变化（改配置端口未 restart、端口 0）：旧端口恢复记录
 //!   被清理，stop 新端口后实例不再被复活。
 //!
-//! 隔离：APROXY_HOME 指向 tempdir（守护/看护子进程经 spawn 继承环境，注册表/
-//! 日志/spool 全部落在 home 下的对应子目录，看护者只看得到本测试的 run/），
-//! 端口从测试进程 pid 派生（独立偏移），绝不触碰生产端口。按 pid 终止进程前
-//! 一律核对其镜像路径在本测试的临时目录或 cargo target 目录下。
+//! 隔离：每个测试一个 common::TestHome（APROXY_HOME 指向临时目录，守护/看护子进程经
+//! spawn 继承环境，注册表/日志/spool 全部落在 home 下的对应子目录，看护者只看得到本测试
+//! 的 run/；看门狗开关默认关，要测 start 拉起看护者的测试显式打开），测试结束时它按端口
+//! stop 登记过的实例。端口向系统要（common::free_port），绝不触碰生产端口。按 pid 终止
+//! 进程前一律核对其镜像路径在本测试的临时目录或 cargo target 目录下。
+
+mod common;
+use common::{ChildGuard, TestHome, free_port};
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
-
-/// 从测试进程 pid 派生守护测试端口（与 proxy_integration.rs 同思路），并跳过
-/// 当前不可绑定的候选：Windows 会把成片端口划进 Hyper-V/WinNAT 排除区间，落进
-/// 去时守护「无法绑定」，与实现无关的假失败。步长 32 且本文件 offset 取
-/// 20..=39（模 32 互不相同），保证「每个测试用不同端口」的约束在跳步后依然成立。
-fn restart_test_port(offset: u32) -> u16 {
-    let base = 25000 + (std::process::id() % 20000) * 2;
-    for step in 0..64u32 {
-        let candidate = base + offset + step * 32;
-        if candidate > u16::MAX as u32 {
-            break;
-        }
-        if std::net::TcpListener::bind(("127.0.0.1", candidate as u16)).is_ok() {
-            return candidate as u16;
-        }
-    }
-    (base + offset) as u16
-}
-
-/// 测试收尾守卫：Drop 时对测试派生端口执行 `aproxy stop`（断言失败路径也
-/// 运行，杜绝守护泄漏在真实注册表）。两个端口都可能被拉起，分别守卫。
-/// 本文件守护一律跑在隔离主目录：unix 的 UDS socket（home/run/ 下）与
-/// 注册表都在其中，stop 须带同一 APROXY_HOME 才找得到守护（Windows 管道名
-/// 全局唯一，不受影响）。
-struct RestartGuard {
-    exe: &'static str,
-    port: u16,
-    home_dir: std::path::PathBuf,
-}
-
-impl Drop for RestartGuard {
-    fn drop(&mut self) {
-        let _ = Command::new(self.exe)
-            .args(["stop", &self.port.to_string()])
-            .env("APROXY_HOME", &self.home_dir)
-            .output();
-    }
-}
 
 /// 对运行在隔离主目录里的守护做 IPC ping：端点属于 run 目录（unix 的 socket
 /// 在 home/run/ 下，Windows 的管道名带 run 目录标识），测试进程（默认主目录）
@@ -87,21 +53,15 @@ fn wait_daemon_ready(rt: &tokio::runtime::Runtime, port: u16, home_dir: &std::pa
     false
 }
 
-/// 用隔离主目录启动守护子进程（直接 --daemon-child，与 start 的 spawn
-/// 同一路径）；返回进程句柄。环境注入必须用 Command::env——直接 spawn 的
-/// 子进程继承测试进程环境，无法逐子进程指定 APROXY_HOME。
-fn spawn_daemon(
-    exe: &str,
-    cfg_file: &std::path::Path,
-    home_dir: &std::path::Path,
-) -> std::process::Child {
-    Command::new(exe)
+/// 在隔离主目录里直接启动守护子进程（--daemon-child，与 start 的 spawn 同一路径）；
+/// 返回进程句柄。
+fn spawn_daemon(home: &TestHome, cfg_file: &std::path::Path) -> std::process::Child {
+    home.cmd()
         .args([
             "--config",
             cfg_file.display().to_string().as_str(),
             "--daemon-child",
         ])
-        .env("APROXY_HOME", home_dir.display().to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -113,27 +73,18 @@ fn spawn_daemon(
 // ---------------------------------------------------------------------------
 #[test]
 fn restart_after_port_change_reports_new_port() {
-    let port_a = restart_test_port(20);
-    let port_b = restart_test_port(21);
-    let dir = tempfile::tempdir().unwrap();
-    let home_dir = dir.path();
-    let cfg_file = dir.path().join("restart.toml");
+    let port_a = free_port();
+    let port_b = free_port();
+    let home = TestHome::new();
+    let home_dir = home.path();
+    let cfg_file = home_dir.join("restart.toml");
     std::fs::write(
         &cfg_file,
         format!("base_url = \"https://restart-test.example.com\"\nlisten_addr = \"127.0.0.1:{port_a}\"\n"),
     )
     .unwrap();
-    let exe = env!("CARGO_BIN_EXE_aproxy");
-    let guard_a = RestartGuard {
-        exe,
-        port: port_a,
-        home_dir: home_dir.to_path_buf(),
-    };
-    let guard_b = RestartGuard {
-        exe,
-        port: port_b,
-        home_dir: home_dir.to_path_buf(),
-    };
+    home.stop_on_drop(port_a);
+    home.stop_on_drop(port_b);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -141,7 +92,7 @@ fn restart_after_port_change_reports_new_port() {
 
     // 启动实例（端口 A）并等就绪。守护是分离进程语义（后续 restart 会停掉
     // 它再拉起新进程），句柄立即泄漏（forget）——wait 会阻塞且无意义
-    let child = spawn_daemon(exe, &cfg_file, home_dir);
+    let child = spawn_daemon(&home, &cfg_file);
     std::mem::forget(child);
     assert!(
         wait_daemon_ready(&rt, port_a, home_dir),
@@ -157,14 +108,14 @@ fn restart_after_port_change_reports_new_port() {
 
     // restart 旧端口 A：必须成功，且输出指向新端口 B。--config 显式给出
     // （避免 CLI 进程读取真实 settings.json 的 default_config）
-    let out = Command::new(exe)
+    let out = home
+        .cmd()
         .args([
             "restart",
             &port_a.to_string(),
             "--config",
             &cfg_file.display().to_string(),
         ])
-        .env("APROXY_HOME", home_dir.display().to_string())
         .output()
         .unwrap();
     assert!(out.status.success(), "restart 应成功，实际 exit 非零");
@@ -194,9 +145,6 @@ fn restart_after_port_change_reports_new_port() {
         cfg_file.display().to_string(),
         "重启后实例应指向同一配置文件"
     );
-
-    drop(guard_a);
-    drop(guard_b);
 }
 
 // ---------------------------------------------------------------------------
@@ -204,20 +152,19 @@ fn restart_after_port_change_reports_new_port() {
 // ---------------------------------------------------------------------------
 #[test]
 fn restart_not_running_port_fails() {
-    let port = restart_test_port(22);
-    let dir = tempfile::tempdir().unwrap();
-    let cfg_file = dir.path().join("dummy.toml");
+    let port = free_port();
+    let home = TestHome::new();
+    let cfg_file = home.path().join("dummy.toml");
     std::fs::write(&cfg_file, "base_url = \"https://x.example.com\"\n").unwrap();
-    let exe = env!("CARGO_BIN_EXE_aproxy");
 
-    let out = Command::new(exe)
+    let out = home
+        .cmd()
         .args([
             "restart",
             &port.to_string(),
             "--config",
             &cfg_file.display().to_string(),
         ])
-        .env("APROXY_HOME", dir.path().display().to_string())
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1), "未启动的 target 应退出 1");
@@ -256,11 +203,6 @@ fn release_asset_copy(dir: &Path) -> PathBuf {
     bin
 }
 
-/// RestartGuard 需要 &'static str 形态的可执行文件路径
-fn leak_str(p: &Path) -> &'static str {
-    Box::leak(p.display().to_string().into_boxed_str())
-}
-
 fn write_cfg(path: &Path, listen: &str) {
     std::fs::write(
         path,
@@ -280,17 +222,6 @@ fn write_broken_cfg(path: &Path, port: u16) {
     .unwrap();
 }
 
-/// 子进程守卫：Drop 时强杀并回收（测试自己 spawn 的进程，句柄即身份，不会
-/// 误伤他人；已退出的进程 kill 失败无害，wait 负责回收 unix zombie）
-struct ChildGuard(std::process::Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -298,16 +229,16 @@ fn runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-/// 以隔离主目录直接启动守护子进程（--daemon-child，与 start 的 spawn 同一路径）
-fn spawn_daemon_with(exe: &Path, cfg: &Path, home: &Path) -> ChildGuard {
+/// 以 exe（构建产物或它的资产名副本）在隔离主目录里直接启动守护子进程
+/// （--daemon-child，与 start 的 spawn 同一路径）
+fn spawn_daemon_with(home: &TestHome, exe: &Path, cfg: &Path) -> ChildGuard {
     ChildGuard(
-        Command::new(exe)
+        home.cmd_with(exe)
             .args([
                 "--config",
                 cfg.display().to_string().as_str(),
                 "--daemon-child",
             ])
-            .env("APROXY_HOME", home)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -317,12 +248,11 @@ fn spawn_daemon_with(exe: &Path, cfg: &Path, home: &Path) -> ChildGuard {
 
 /// 启动看护者（--daemon-watchdog，扫描周期 1s，只看得到隔离主目录的 run/），
 /// stdout 落文件供断言它的处置日志
-fn spawn_watchdog(exe: &Path, home: &Path, log: &Path) -> ChildGuard {
+fn spawn_watchdog(home: &TestHome, exe: &Path, log: &Path) -> ChildGuard {
     let out = std::fs::File::create(log).unwrap();
     ChildGuard(
-        Command::new(exe)
+        home.cmd_with(exe)
             .arg("--daemon-watchdog")
-            .env("APROXY_HOME", home)
             .env("APROXY_WATCHDOG_SCAN_SECS", "1")
             .env("NO_COLOR", "1")
             .stdout(Stdio::from(out))
@@ -356,13 +286,15 @@ fn log_has(log: &Path, parts: &[&str]) -> bool {
         .any(|l| parts.iter().all(|p| l.contains(p)))
 }
 
-fn run_cli(exe: &Path, home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(exe)
-        .args(args)
-        .env("APROXY_HOME", home)
-        .env("NO_COLOR", "1")
-        .output()
-        .expect("运行 aproxy CLI 失败")
+/// 以 exe 在隔离主目录里运行一条 aproxy 命令（不带颜色，便于断言输出）
+fn cli(home: &TestHome, exe: &Path, args: &[&str]) -> std::process::Command {
+    let mut cmd = home.cmd_with(exe);
+    cmd.args(args).env("NO_COLOR", "1");
+    cmd
+}
+
+fn run_cli(home: &TestHome, exe: &Path, args: &[&str]) -> std::process::Output {
+    cli(home, exe, args).output().expect("运行 aproxy CLI 失败")
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -413,24 +345,20 @@ fn kill_own_pid(pid: u32, home: &Path) {
 // ---------------------------------------------------------------------------
 #[test]
 fn restart_with_broken_config_keeps_old_instance() {
-    let port = restart_test_port(23);
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path();
+    let port = free_port();
+    let test_home = TestHome::new();
+    let home = test_home.path();
     let cfg = home.join("c.toml");
     write_cfg(&cfg, &format!("127.0.0.1:{port}"));
     let exe = built_exe();
     let rt = runtime();
-    let _daemon = spawn_daemon_with(&exe, &cfg, home);
-    let _guard = RestartGuard {
-        exe: env!("CARGO_BIN_EXE_aproxy"),
-        port,
-        home_dir: home.to_path_buf(),
-    };
+    let _daemon = spawn_daemon_with(&test_home, &exe, &cfg);
+    test_home.stop_on_drop(port);
     assert!(wait_daemon_ready(&rt, port, home), "守护未就绪");
     let orig = ipc_ping_in_dir(&rt, port, home).unwrap().instance.pid;
 
     write_broken_cfg(&cfg, port);
-    let out = run_cli(&exe, home, &["restart", &port.to_string()]);
+    let out = run_cli(&test_home, &exe, &["restart", &port.to_string()]);
     let stderr = text(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "预检失败应退出 1: {stderr}");
     assert!(
@@ -450,27 +378,24 @@ fn restart_with_broken_config_keeps_old_instance() {
 // ---------------------------------------------------------------------------
 #[test]
 fn restart_all_skips_failed_instance_and_exits_nonzero() {
-    let (port_a, port_b) = (restart_test_port(24), restart_test_port(25));
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path();
+    let (port_a, port_b) = (free_port(), free_port());
+    let test_home = TestHome::new();
+    let home = test_home.path();
     let (cfg_a, cfg_b) = (home.join("a.toml"), home.join("b.toml"));
     write_cfg(&cfg_a, &format!("127.0.0.1:{port_a}"));
     write_cfg(&cfg_b, &format!("127.0.0.1:{port_b}"));
     let exe = built_exe();
     let rt = runtime();
-    let _daemon_a = spawn_daemon_with(&exe, &cfg_a, home);
-    let _daemon_b = spawn_daemon_with(&exe, &cfg_b, home);
-    let _guards = [port_a, port_b].map(|port| RestartGuard {
-        exe: env!("CARGO_BIN_EXE_aproxy"),
-        port,
-        home_dir: home.to_path_buf(),
-    });
+    let _daemon_a = spawn_daemon_with(&test_home, &exe, &cfg_a);
+    let _daemon_b = spawn_daemon_with(&test_home, &exe, &cfg_b);
+    test_home.stop_on_drop(port_a);
+    test_home.stop_on_drop(port_b);
     assert!(wait_daemon_ready(&rt, port_a, home) && wait_daemon_ready(&rt, port_b, home));
     let orig_a = ipc_ping_in_dir(&rt, port_a, home).unwrap().instance.pid;
     let orig_b = ipc_ping_in_dir(&rt, port_b, home).unwrap().instance.pid;
 
     write_broken_cfg(&cfg_b, port_b);
-    let out = run_cli(&exe, home, &["restart", "all"]);
+    let out = run_cli(&test_home, &exe, &["restart", "all"]);
     let stderr = text(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "有失败者时应非零退出: {stderr}");
     assert!(
@@ -491,26 +416,22 @@ fn restart_all_skips_failed_instance_and_exits_nonzero() {
 // ---------------------------------------------------------------------------
 #[test]
 fn restart_refuses_port_change_onto_occupied_port() {
-    let (port_a, port_c) = (restart_test_port(26), restart_test_port(27));
+    let (port_a, port_c) = (free_port(), free_port());
     // 本测试自己占住目标端口（模拟被其他程序占用）
     let _hold = std::net::TcpListener::bind(("127.0.0.1", port_c)).expect("占位端口绑定失败");
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path();
+    let test_home = TestHome::new();
+    let home = test_home.path();
     let cfg = home.join("c.toml");
     write_cfg(&cfg, &format!("127.0.0.1:{port_a}"));
     let exe = built_exe();
     let rt = runtime();
-    let _daemon = spawn_daemon_with(&exe, &cfg, home);
-    let _guard = RestartGuard {
-        exe: env!("CARGO_BIN_EXE_aproxy"),
-        port: port_a,
-        home_dir: home.to_path_buf(),
-    };
+    let _daemon = spawn_daemon_with(&test_home, &exe, &cfg);
+    test_home.stop_on_drop(port_a);
     assert!(wait_daemon_ready(&rt, port_a, home), "守护未就绪");
     let orig = ipc_ping_in_dir(&rt, port_a, home).unwrap().instance.pid;
 
     write_cfg(&cfg, &format!("127.0.0.1:{port_c}"));
-    let out = run_cli(&exe, home, &["restart", &port_a.to_string()]);
+    let out = run_cli(&test_home, &exe, &["restart", &port_a.to_string()]);
     let stderr = text(&out.stderr);
     assert_eq!(
         out.status.code(),
@@ -536,19 +457,15 @@ fn restart_refuses_port_change_onto_occupied_port() {
 fn restart_early_exit_shows_startup_log_excerpt() {
     use std::io::Write;
 
-    let port = restart_test_port(28);
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path().to_path_buf();
+    let port = free_port();
+    let test_home = TestHome::new();
+    let home = test_home.path().to_path_buf();
     let cfg = home.join("c.toml");
     write_cfg(&cfg, &format!("127.0.0.1:{port}"));
     let exe = built_exe();
     let rt = runtime();
-    let _daemon = spawn_daemon_with(&exe, &cfg, &home);
-    let _guard = RestartGuard {
-        exe: env!("CARGO_BIN_EXE_aproxy"),
-        port,
-        home_dir: home.clone(),
-    };
+    let _daemon = spawn_daemon_with(&test_home, &exe, &cfg);
+    test_home.stop_on_drop(port);
     assert!(wait_daemon_ready(&rt, port, &home), "守护未就绪");
 
     let mut conn = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -562,8 +479,9 @@ fn restart_early_exit_shows_startup_log_excerpt() {
     std::thread::sleep(Duration::from_millis(300));
 
     let restart = {
-        let (exe, home) = (exe.clone(), home.clone());
-        std::thread::spawn(move || run_cli(&exe, &home, &["restart", &port.to_string()]))
+        // Command 在本线程里建好再交给子线程：它带着 TestHome 注入的环境
+        let mut cmd = cli(&test_home, &exe, &["restart", &port.to_string()]);
+        std::thread::spawn(move || cmd.output().expect("运行 aproxy CLI 失败"))
     };
     // 预检是毫秒级的；此刻旧实例正在等在途连接，新实例尚未 spawn
     std::thread::sleep(Duration::from_millis(1500));
@@ -597,22 +515,18 @@ fn restart_early_exit_shows_startup_log_excerpt() {
 // ---------------------------------------------------------------------------
 #[test]
 fn release_asset_named_instance_is_adopted_respawned_and_force_stoppable() {
-    let port = restart_test_port(29);
+    let port = free_port();
     let port_s = port.to_string();
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path();
+    let test_home = TestHome::new();
+    let home = test_home.path();
     let bin = release_asset_copy(home);
     let cfg = home.join("c.toml");
     write_cfg(&cfg, &format!("127.0.0.1:{port}"));
     let rt = runtime();
     let wd_log = home.join("watchdog.log");
-    let mut daemon = spawn_daemon_with(&bin, &cfg, home);
-    let _wd = spawn_watchdog(&bin, home, &wd_log);
-    let _guard = RestartGuard {
-        exe: leak_str(&bin),
-        port,
-        home_dir: home.to_path_buf(),
-    };
+    let mut daemon = spawn_daemon_with(&test_home, &bin, &cfg);
+    let _wd = spawn_watchdog(&test_home, &bin, &wd_log);
+    test_home.stop_on_drop_with(&bin, port);
     assert!(wait_daemon_ready(&rt, port, home), "守护未就绪");
     let orig_pid = daemon.0.id();
     assert!(
@@ -664,7 +578,7 @@ fn release_asset_named_instance_is_adopted_respawned_and_force_stoppable() {
     );
 
     // --force 对资产名运行的实例可用（不再因镜像名拒绝）
-    let out = run_cli(&bin, home, &["stop", &port_s, "--force"]);
+    let out = run_cli(&test_home, &bin, &["stop", &port_s, "--force"]);
     let stdout = text(&out.stdout);
     assert!(
         out.status.success() && stdout.contains("已强制终止"),
@@ -695,21 +609,18 @@ fn release_asset_named_instance_is_adopted_respawned_and_force_stoppable() {
 // ---------------------------------------------------------------------------
 #[test]
 fn watchdog_respawn_onto_changed_port_retires_old_record() {
-    let (port_a, port_b) = (restart_test_port(30), restart_test_port(31));
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path();
+    let (port_a, port_b) = (free_port(), free_port());
+    let test_home = TestHome::new();
+    let home = test_home.path();
     let cfg = home.join("c.toml");
     write_cfg(&cfg, &format!("127.0.0.1:{port_a}"));
     let exe = built_exe();
     let rt = runtime();
     let wd_log = home.join("watchdog.log");
-    let mut daemon = spawn_daemon_with(&exe, &cfg, home);
-    let _wd = spawn_watchdog(&exe, home, &wd_log);
-    let _guards = [port_a, port_b].map(|port| RestartGuard {
-        exe: env!("CARGO_BIN_EXE_aproxy"),
-        port,
-        home_dir: home.to_path_buf(),
-    });
+    let mut daemon = spawn_daemon_with(&test_home, &exe, &cfg);
+    let _wd = spawn_watchdog(&test_home, &exe, &wd_log);
+    test_home.stop_on_drop(port_a);
+    test_home.stop_on_drop(port_b);
     assert!(wait_daemon_ready(&rt, port_a, home), "守护未就绪");
     assert!(
         wait_for(Duration::from_secs(15), || log_has(
@@ -739,7 +650,7 @@ fn watchdog_respawn_onto_changed_port_retires_old_record() {
     assert!(!has_registry(home, port_a), "旧端口的死注册记录应被清理");
 
     // 修复前：看护者凭旧端口残留的 .restore 把 stop 掉的实例再拉起来
-    let out = run_cli(&exe, home, &["stop", &port_b.to_string()]);
+    let out = run_cli(&test_home, &exe, &["stop", &port_b.to_string()]);
     assert!(out.status.success(), "stop 新端口应成功");
     std::thread::sleep(Duration::from_secs(4));
     assert!(
@@ -759,18 +670,17 @@ fn watchdog_respawn_onto_changed_port_retires_old_record() {
 // ---------------------------------------------------------------------------
 #[test]
 fn watchdog_respawn_with_port_zero_retires_old_record() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path();
+    let test_home = TestHome::new();
+    let home = test_home.path();
     let run = home.join("run");
     let cfg = home.join("c.toml");
     write_cfg(&cfg, "127.0.0.1:0");
     let exe = built_exe();
     let rt = runtime();
     let wd_log = home.join("watchdog.log");
-    let mut daemon = spawn_daemon_with(&exe, &cfg, home);
-    let _wd = spawn_watchdog(&exe, home, &wd_log);
+    let mut daemon = spawn_daemon_with(&test_home, &exe, &cfg);
+    let _wd = spawn_watchdog(&test_home, &exe, &wd_log);
     let orig_pid = daemon.0.id();
-    let mut guards = Vec::new();
     let mut port_1 = 0u16;
     assert!(
         wait_for(Duration::from_secs(10), || {
@@ -784,11 +694,7 @@ fn watchdog_respawn_with_port_zero_retires_old_record() {
         }),
         "守护未登记"
     );
-    guards.push(RestartGuard {
-        exe: env!("CARGO_BIN_EXE_aproxy"),
-        port: port_1,
-        home_dir: home.to_path_buf(),
-    });
+    test_home.stop_on_drop(port_1);
     assert!(wait_daemon_ready(&rt, port_1, home), "守护未就绪");
     assert!(
         wait_for(Duration::from_secs(15), || log_has(
@@ -815,11 +721,7 @@ fn watchdog_respawn_with_port_zero_retires_old_record() {
         "看护者应重拉实例；看护者日志:\n{}",
         read_text(&wd_log)
     );
-    guards.push(RestartGuard {
-        exe: env!("CARGO_BIN_EXE_aproxy"),
-        port: port_2,
-        home_dir: home.to_path_buf(),
-    });
+    test_home.stop_on_drop(port_2);
     assert_ne!(port_1, port_2, "端口 0 重拉应由系统分配到新端口");
     assert!(
         wait_for(Duration::from_secs(5), || !has_restore(home, port_1)),
@@ -827,7 +729,7 @@ fn watchdog_respawn_with_port_zero_retires_old_record() {
     );
     assert!(has_restore(home, port_2), "新端口应有自己的恢复记录");
 
-    let out = run_cli(&exe, home, &["stop", &port_2.to_string()]);
+    let out = run_cli(&test_home, &exe, &["stop", &port_2.to_string()]);
     assert!(out.status.success(), "stop 新端口应成功");
     std::thread::sleep(Duration::from_secs(4));
     assert!(
@@ -842,28 +744,24 @@ fn watchdog_respawn_with_port_zero_retires_old_record() {
 // ---------------------------------------------------------------------------
 #[test]
 fn restore_onto_changed_port_retires_old_record() {
-    let (port_a, port_b) = (restart_test_port(32), restart_test_port(33));
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path();
-    // 本测试不需要看护者：显式关掉，排除它参与重拉的干扰
-    std::fs::write(home.join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+    let (port_a, port_b) = (free_port(), free_port());
+    let test_home = TestHome::new();
+    let home = test_home.path();
+    // 本测试不需要看护者：TestHome 默认已关看门狗，排除它参与重拉的干扰
     let cfg = home.join("c.toml");
     write_cfg(&cfg, &format!("127.0.0.1:{port_a}"));
     let exe = built_exe();
     let rt = runtime();
-    let mut daemon = spawn_daemon_with(&exe, &cfg, home);
-    let _guards = [port_a, port_b].map(|port| RestartGuard {
-        exe: env!("CARGO_BIN_EXE_aproxy"),
-        port,
-        home_dir: home.to_path_buf(),
-    });
+    let mut daemon = spawn_daemon_with(&test_home, &exe, &cfg);
+    test_home.stop_on_drop(port_a);
+    test_home.stop_on_drop(port_b);
     assert!(wait_daemon_ready(&rt, port_a, home), "守护未就绪");
     daemon.0.kill().unwrap();
     daemon.0.wait().unwrap();
     assert!(has_restore(home, port_a), "崩溃应留下恢复记录");
 
     write_cfg(&cfg, &format!("127.0.0.1:{port_b}"));
-    let out = run_cli(&exe, home, &["restore"]);
+    let out = run_cli(&test_home, &exe, &["restore"]);
     let stdout = text(&out.stdout);
     assert!(
         stdout.contains("已恢复")
@@ -880,9 +778,9 @@ fn restore_onto_changed_port_retires_old_record() {
     );
 
     // 修复前：stop 新端口后，下一次 restore 会凭旧端口记录把它复活
-    let out = run_cli(&exe, home, &["stop", &port_b.to_string()]);
+    let out = run_cli(&test_home, &exe, &["stop", &port_b.to_string()]);
     assert!(out.status.success(), "stop 新端口应成功");
-    let out = run_cli(&exe, home, &["restore"]);
+    let out = run_cli(&test_home, &exe, &["restore"]);
     assert!(
         text(&out.stdout).contains("没有需要恢复的实例"),
         "stop 后不应再有可恢复的实例: {}",
@@ -910,35 +808,35 @@ impl Drop for WatchdogCleanup {
 // ---------------------------------------------------------------------------
 #[test]
 fn concurrent_start_with_release_asset_name_converges_to_one_watchdog() {
-    let ports = [34, 35, 36].map(restart_test_port);
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path().to_path_buf();
+    let ports = [(); 3].map(|_| free_port());
+    let test_home = TestHome::new();
+    let home = test_home.path().to_path_buf();
     let run = home.join("run");
+    // 本测试要 start 按看门狗开关拉起看护者：显式打开（TestHome 默认关）
+    test_home.settings(r#"{"watchdog": true}"#);
     let bin = release_asset_copy(&home);
     let rt = runtime();
-    // Drop 逆序：先停实例（RestartGuard），再终止看护者
+    for port in ports {
+        test_home.stop_on_drop_with(&bin, port);
+    }
+    // 收尾顺序：先终止看护者（本守卫比 test_home 后声明，先析构），再由 test_home 按端口
+    // 停实例。stop 会删掉实例的恢复记录，看护者在不在都不会把它们拉回来；实例的自检要
+    // 300 秒才补种看护者，测试收尾期间不会发生
     let _wd_cleanup = WatchdogCleanup(home.clone());
-    let _guards = ports.map(|port| RestartGuard {
-        exe: leak_str(&bin),
-        port,
-        home_dir: home.clone(),
-    });
 
     let starts: Vec<_> = ports
         .iter()
         .map(|port| {
             let cfg = home.join(format!("c{port}.toml"));
             write_cfg(&cfg, &format!("127.0.0.1:{port}"));
-            let (bin, home) = (bin.clone(), home.clone());
-            std::thread::spawn(move || {
-                Command::new(&bin)
-                    .args(["start", "--config", cfg.display().to_string().as_str()])
-                    .env("APROXY_HOME", &home)
-                    .env("APROXY_WATCHDOG_SCAN_SECS", "1")
-                    .env("NO_COLOR", "1")
-                    .output()
-                    .unwrap()
-            })
+            // Command 在本线程里建好再交给子线程：它带着 TestHome 注入的环境
+            let mut cmd = cli(
+                &test_home,
+                &bin,
+                &["start", "--config", cfg.display().to_string().as_str()],
+            );
+            cmd.env("APROXY_WATCHDOG_SCAN_SECS", "1");
+            std::thread::spawn(move || cmd.output().unwrap())
         })
         .collect();
     // start CLI 拉起看护者时打印「看护者已随实例启动拉起 … pid=N」：收集全部

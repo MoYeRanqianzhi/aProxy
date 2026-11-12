@@ -3,13 +3,17 @@
 //! 二进制换不成（11）；台账里只结束核验通过的进程；install/ 被清空而锁留下；在线取
 //! 目标走发布清单（本地假 GitHub）。契约本身的钉子在 `force_contract.rs`。
 //!
-//! 隔离：每个测试一个临时 home（[`TestHome::new`] 核对它在临时目录里、不是用户的
-//! `~/.aproxy`），所有 aproxy 进程都带着它的 APROXY_HOME 运行。结束进程只按这个临时
-//! home 的台账（核验启动标记）或测试自己持有的子进程句柄，绝不按名字。
+//! 隔离：每个测试一个 [`ForceHome`]，即 common::TestHome（核对它在临时目录里、不是用户的
+//! `~/.aproxy`）加上本文件的辅助；所有 aproxy 进程都经它带着它的 APROXY_HOME 运行。结束
+//! 进程只按这个临时 home 的台账（核验启动标记）或测试自己持有的子进程句柄，绝不按名字。
+
+mod common;
+use common::{TestHome, free_port};
 
 use aproxy::install::force::{self, Manifest, ManifestAsset, OnlineSpec};
 use aproxy::install::swap::{OLD_PREFIX, bin_dir_in, bin_path_in};
 use aproxy::ledger::{self, LedgerEntry};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -18,63 +22,29 @@ use std::time::{Duration, Instant};
 /// 能跑，而内容与原来的不同——由此判断 bin 里换上的是哪一个。
 const NEXT_MARKER: &[u8] = b"\nFORCE-INSTALL-NEXT-BINARY\n";
 
-/// bind 试探选可用端口（与别的测试文件错开基址；原子计数让同一进程里并发的测试不互撞）
-fn free_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static SEQ: AtomicU16 = AtomicU16::new(0);
-    let base = 29000u16 + (std::process::id() % 400) as u16 * 20;
-    for i in 0..200u16 {
-        let candidate = base + SEQ.fetch_add(1, Ordering::Relaxed) + i * 200;
-        if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
-            return candidate;
-        }
+/// 一个隔离的 aproxy home：common::TestHome（看门狗默认关；析构时按端口 stop 登记过的实例，
+/// 再结束台账里仍在运行的进程——测试拉起的实例、看护者，以及被 restore 拉回来的实例）加上
+/// 强制安装测试的辅助。经 Deref 直接使用 TestHome 的 `path`、`settings`、`cmd_with` 等。
+struct ForceHome(TestHome);
+
+impl Deref for ForceHome {
+    type Target = TestHome;
+
+    fn deref(&self) -> &TestHome {
+        &self.0
     }
-    panic!("200 次内没有找到可用端口");
 }
 
-/// 一个隔离的 aproxy home。析构时结束它台账里仍在运行的进程（测试拉起的实例、看护者，
-/// 以及被 restore 拉回来的实例）：台账条目只可能来自带着这个 APROXY_HOME 运行的进程，
-/// 结束前还要核验启动标记。
-struct TestHome {
-    dir: tempfile::TempDir,
-}
-
-impl TestHome {
+impl ForceHome {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-        let home = real(dir.path());
-        assert!(
-            home.starts_with(real(&std::env::temp_dir())),
-            "测试 home 必须在临时目录里: {}",
-            home.display()
-        );
-        if let Some(user_home) = aproxy::settings::user_dir() {
-            assert!(
-                !home.starts_with(real(&user_home.join(".aproxy"))),
-                "测试 home 绝不能是用户的 ~/.aproxy: {}",
-                home.display()
-            );
-        }
-        Self { dir }
-    }
-
-    fn path(&self) -> &Path {
-        self.dir.path()
+        Self(TestHome::new())
     }
 
     /// 在这个 home 里运行 `exe`（标准输入为空、不是终端）
     fn command(&self, exe: &Path, args: &[&str]) -> Command {
-        let mut cmd = Command::new(exe);
-        cmd.args(args)
-            .env("APROXY_HOME", self.path())
-            .env("NO_PROXY", "127.0.0.1,localhost")
-            .stdin(Stdio::null());
+        let mut cmd = self.cmd_with(exe);
+        cmd.args(args).stdin(Stdio::null());
         cmd
-    }
-
-    fn settings(&self, json: &str) {
-        std::fs::write(self.path().join("settings.json"), json).unwrap();
     }
 
     /// 把当前构建放进 `<home>/bin/`（已安装的形态），返回它的路径
@@ -122,6 +92,7 @@ impl TestHome {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+        self.stop_on_drop(port);
         self.wait_for(Duration::from_secs(10), |e| {
             e.role == ledger::ROLE_INSTANCE && e.port == Some(port)
         })
@@ -195,14 +166,6 @@ impl TestHome {
                     .collect()
             })
             .unwrap_or_default()
-    }
-}
-
-impl Drop for TestHome {
-    fn drop(&mut self) {
-        for found in ledger::read_all_in(self.path()) {
-            let _ = ledger::terminate(&found.entry, Duration::from_secs(5));
-        }
     }
 }
 
@@ -311,7 +274,7 @@ fn ping_instance(home: &Path, port: u16) -> Option<aproxy::daemon::InstanceStatu
 // ---------------------------------------------------------------------------
 #[test]
 fn force_install_stops_everything_swaps_and_restores() {
-    let home = TestHome::new();
+    let home = ForceHome::new();
     home.settings(r#"{"watchdog": true}"#);
     home.seed_bin();
     let port = free_port();
@@ -367,7 +330,7 @@ fn force_install_stops_everything_swaps_and_restores() {
 // ---------------------------------------------------------------------------
 #[test]
 fn an_instance_that_does_not_come_back_is_listed_with_12() {
-    let home = TestHome::new();
+    let home = ForceHome::new();
     home.settings(r#"{"watchdog": false}"#);
     home.seed_bin();
     let port = free_port();
@@ -398,7 +361,7 @@ fn an_instance_that_does_not_come_back_is_listed_with_12() {
 // ---------------------------------------------------------------------------
 #[test]
 fn only_verified_ledger_processes_are_stopped() {
-    let home = TestHome::new();
+    let home = ForceHome::new();
     home.seed_bin();
     let mut installer = sleeper();
     let mut future = sleeper();
@@ -537,7 +500,7 @@ fn stray_helper_sleeps() {
 // ---------------------------------------------------------------------------
 #[test]
 fn refusals_end_with_10_and_change_nothing() {
-    let home = TestHome::new();
+    let home = ForceHome::new();
     let bin = home.seed_bin();
     let original = std::fs::read(&bin).unwrap();
     let mut running = sleeper();
@@ -610,7 +573,7 @@ fn refusals_end_with_10_and_change_nothing() {
 // ---------------------------------------------------------------------------
 
 /// 台账里登记一个测试自己的长时间运行的进程（实例角色），返回它：强制安装会结束它
-fn running_entry(home: &TestHome) -> Child {
+fn running_entry(home: &ForceHome) -> Child {
     let child = sleeper();
     let marker = ledger::start_marker(child.id()).expect("子进程的启动标记可查");
     write_entry(home.path(), child.id(), marker, ledger::ROLE_INSTANCE);
@@ -621,7 +584,7 @@ fn running_entry(home: &TestHome) -> Child {
 #[test]
 fn a_held_bin_ends_with_10_or_11_and_keeps_the_old_binary() {
     use std::os::windows::fs::OpenOptionsExt;
-    let home = TestHome::new();
+    let home = ForceHome::new();
     let bin = home.seed_bin();
     let original = std::fs::read(&bin).unwrap();
     let next = home.next_binary();
@@ -649,7 +612,7 @@ fn a_held_bin_ends_with_10_or_11_and_keeps_the_old_binary() {
 #[test]
 fn a_read_only_bin_dir_ends_with_10_or_11_and_keeps_the_old_binary() {
     use std::os::unix::fs::PermissionsExt;
-    let home = TestHome::new();
+    let home = ForceHome::new();
     let bin = home.seed_bin();
     let original = std::fs::read(&bin).unwrap();
     let next = home.next_binary();
@@ -683,7 +646,7 @@ fn a_read_only_bin_dir_ends_with_10_or_11_and_keeps_the_old_binary() {
 #[test]
 fn a_held_retired_binary_does_not_block_the_next_force_install() {
     use std::os::windows::fs::OpenOptionsExt;
-    let home = TestHome::new();
+    let home = ForceHome::new();
     home.seed_bin();
     let residue = bin_dir_in(home.path()).join("aproxy.old-1760256000123456789-4242.exe");
     std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &residue).unwrap();
@@ -712,7 +675,7 @@ fn a_held_retired_binary_does_not_block_the_next_force_install() {
 // ---------------------------------------------------------------------------
 #[test]
 fn a_closed_output_pipe_does_not_change_the_exit_code() {
-    let home = TestHome::new();
+    let home = ForceHome::new();
     home.settings(r#"{"watchdog": false}"#);
     home.seed_bin();
     let ports = [free_port(), free_port()];
@@ -924,7 +887,7 @@ async fn force_downloads_only_speak_https() {
 /// 同一个版本号则照装——那是用户自己选的。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn online_latest_never_downgrades_silently() {
-    let home = TestHome::new();
+    let home = ForceHome::new();
     let files = home.path().join("files");
     std::fs::create_dir_all(&files).unwrap();
     let real = PathBuf::from(env!("CARGO_BIN_EXE_aproxy"));
@@ -967,7 +930,7 @@ async fn online_latest_never_downgrades_silently() {
 /// 发布清单超过 1 MiB 就不是清单：不读、报上限。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn online_rejects_an_oversized_manifest() {
-    let home = TestHome::new();
+    let home = ForceHome::new();
     let files = home.path().join("files");
     std::fs::create_dir_all(&files).unwrap();
     let version = env!("CARGO_PKG_VERSION");
@@ -998,7 +961,7 @@ async fn online_rejects_an_oversized_manifest() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn online_latest_takes_the_newest_release_that_carries_a_manifest() {
-    let home = TestHome::new();
+    let home = ForceHome::new();
     let files = home.path().join("files");
     std::fs::create_dir_all(&files).unwrap();
     let real = PathBuf::from(env!("CARGO_BIN_EXE_aproxy"));
@@ -1075,7 +1038,7 @@ async fn online_latest_takes_the_newest_release_that_carries_a_manifest() {
 /// 以「变体不符」结束——错误按次序记着前面每一个产物为什么没用上。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn online_falls_back_in_order_when_the_selected_asset_does_not_run() {
-    let home = TestHome::new();
+    let home = ForceHome::new();
     let files = home.path().join("files");
     std::fs::create_dir_all(&files).unwrap();
     let real = PathBuf::from(env!("CARGO_BIN_EXE_aproxy"));
@@ -1154,7 +1117,7 @@ async fn online_falls_back_in_order_when_the_selected_asset_does_not_run() {
 /// `--cpu` 不退回别的档；产物跑不起来之后要改试的组合清单里没有时，也这样说明。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn online_reports_what_a_target_offers_when_the_combination_is_missing() {
-    let home = TestHome::new();
+    let home = ForceHome::new();
     let files = home.path().join("files");
     std::fs::create_dir_all(&files).unwrap();
     let broken = files.join("broken");
@@ -1252,7 +1215,7 @@ async fn online_reports_what_a_target_offers_when_the_combination_is_missing() {
 /// 构建里它自报 desktop，回退以「变体不符」结束，错误里记着改试过 headless。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn online_falls_back_when_the_release_has_no_build_of_the_variant() {
-    let home = TestHome::new();
+    let home = ForceHome::new();
     let files = home.path().join("files");
     std::fs::create_dir_all(&files).unwrap();
     let real = PathBuf::from(env!("CARGO_BIN_EXE_aproxy"));
@@ -1312,7 +1275,7 @@ async fn online_falls_back_when_the_release_has_no_build_of_the_variant() {
 /// （`prefer_v3`）故意与写明的档相反，回退若按本机选，取到的就是另一档。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn online_fallback_keeps_an_explicit_cpu() {
-    let home = TestHome::new();
+    let home = ForceHome::new();
     let files = home.path().join("files");
     std::fs::create_dir_all(&files).unwrap();
     let real = PathBuf::from(env!("CARGO_BIN_EXE_aproxy"));
@@ -1401,7 +1364,7 @@ async fn online_fallback_keeps_an_explicit_cpu() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn online_rejects_what_does_not_match() {
-    let home = TestHome::new();
+    let home = ForceHome::new();
     let files = home.path().join("files");
     std::fs::create_dir_all(&files).unwrap();
     let real = PathBuf::from(env!("CARGO_BIN_EXE_aproxy"));

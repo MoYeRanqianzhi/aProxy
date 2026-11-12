@@ -502,3 +502,9 @@
 - P2 第 1 步 a5995d6（proxy.rs 拆成 src/proxy/ 15 个模块，纯搬移）：库单测 287、proxy_integration 102、
   transform_integration 30 与拆分前一致。第 2、3 步：`attempts::classify` + 唯一的尝试循环 `run_attempts`（两种出口
   `Responder::Buffered / Keepalive`），557f748；Windows headless 全量通过（库单测 292 = 287 + classify 的 5 个，其余各组数目不变）。
+- P3（2026-11-12）：4a181e2 删 tower / tower-http（R2a），452afec axum 0.8（测试里假 GitHub 服务的路由参数语法随之改），
+  0ddfd17 toml 1.x（aproxy 与 aproxy-format，与 tauri-utils 共用一份），43ddda8 sha2 0.11；zip 9 已在阶段 0。
+  **reqwest 0.13 推迟到 0.2.0 之后**（主代理 2026-11-12 定）：0.13 的 `rustls` 特性改用 aws-lc-rs（musl、aarch64 交叉编译
+  更麻烦）并固定带上系统信任库校验器，要保住现在「内置 webpki 根证书」的行为得自己用 `use_preconfigured_tls` 拼 rustls
+  配置；系统代理的读取方式也变了，需要对着记忆 proxy-config 的 7890 场景重新实测。收益很小：tauri 带入的 0.13 只开
+  json、stream，不带 TLS，不构成两套 TLS 栈。0.12.28 目前没有安全公告。

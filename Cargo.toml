@@ -85,13 +85,12 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
-# 下限写到实测过的 0.8.23，不只写 0.8：Linux 上 tauri 的 GTK3 一族经 glib-macros 引入
-# proc-macro-crate 2.0，它的 2.0.1、2.0.2 精确依赖 toml_datetime =0.6.3 与 toml_edit =0.20.2。
-# 只写 0.8 时，不带锁文件的解析（不加 --locked 的 `cargo install aproxy`）会挑 proc-macro-crate
-# 2.0.2、把这里的 toml 退回 0.8.2，一个从没测过的组合；有了这条下限，解析器只能改挑
-# proc-macro-crate 2.0.0（它只要求 toml_edit ^0.20.2）。锁文件级的解析按全部特性、全部目标
-# 平台进行，所以 Windows 与 headless 的安装同样受它保护。
-toml = "0.8.23"
+# config.toml 的解析。1.x 与 tauri-utils 等共用一份；依赖树里另有一份 0.8，只在 Linux 带界面版
+# 构建期经 system-deps 用到。0.8 时代这里写过下限 0.8.23：Linux 上 tauri 的 GTK3 一族经
+# glib-macros 引入 proc-macro-crate 2.0，它的 2.0.1、2.0.2 精确钉住 toml_edit =0.20.2，不带锁
+# 文件的 `cargo install aproxy` 会把同属 0.8 线的这里退回从没测过的 0.8.2。换到 1.x 之后两条
+# 版本线互不统一，这个问题不再波及 config 的解析。
+toml = "1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1736,6 +1736,13 @@ async fn interrupted_stream_is_retried() {
             let Ok((mut sock, _)) = listener.accept().await else {
                 return;
             };
+            // 先读完请求再响应：不读就关闭，接收缓冲里留着未读的请求，Windows 会以 RST 而不是
+            // FIN 关闭连接，RST 连同对端还没读的响应一起丢掉——客户端只看到「发送请求失败」，
+            // 测到的就不再是「流中途中断」（tokio 1.54 让 accept 出来的套接字一开始就可写之后，
+            // mock 的写与关闭抢在客户端发完请求之前，必现）
+            if !read_http_request(&mut sock).await {
+                continue;
+            }
             let n = c2.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
                 // 首次：chunked 响应写出部分数据后不发终止块直接断开

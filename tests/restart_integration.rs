@@ -118,8 +118,13 @@ fn restart_after_port_change_reports_new_port() {
         ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "restart 应成功，实际 exit 非零");
     let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "restart 应成功，实际 {:?}；stdout: {stdout}；stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
         stdout.contains(&port_b.to_string()),
         "restart 输出应指向新端口 {port_b}，实际: {stdout}"

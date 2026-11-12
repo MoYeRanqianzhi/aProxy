@@ -33,11 +33,22 @@ pub fn binary_name() -> &'static str {
 /// npm integrity（sha512 另算）换算的底座、`--from` 的完整性记录。
 pub fn sha256_hex(path: &Path) -> Result<String, String> {
     use sha2::{Digest, Sha256};
+    use std::io::Read;
     let mut file =
         std::fs::File::open(path).map_err(|e| format!("{} 无法读取: {e}", path.display()))?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)
-        .map_err(|e| format!("{} 读取失败: {e}", path.display()))?;
+    // 分块读入（sha2 0.11 起哈希器不再实现 io::Write，不能直接 io::copy 进去）；二进制可达
+    // 数十 MB，不整个读进内存
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("{} 读取失败: {e}", path.display())),
+        };
+        hasher.update(&buf[..n]);
+    }
     let digest = hasher.finalize();
     Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }

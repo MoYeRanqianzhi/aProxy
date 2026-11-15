@@ -531,3 +531,23 @@
   config 与 logs 留到 B9 随 `config get/set/unset` 与 `--json` 一起做。
 - f9ff451（2026-11-16）：本机与 CI 的 stable 升到 Rust 1.100。cargo 1.100 把单测程序放到
   `target/<profile>/build/<包名>/<hash>/out/`，`transform::format_echo_path` 改为逐级往上找；clippy 新报的 needless_bool 一处。
+- B0（2026-11-16）：新 crate aproxy-ipc，直接依赖只有 serde、serde_json、sha2，Windows 上钉版的 windows-sys，unix 上 libc
+  （没有 tokio：这一步迁入的东西都不做异步 IO，B6 做 IPC 客户端时再看要不要）。
+  - 1607caa：home 的解析（C1）进 `aproxy-ipc/src/home.rs`，台账（C3）进 `aproxy-ipc/src/ledger.rs`，算法逐字不变。
+    `tests/force_contract.rs` 只改三处 `use` 路径与文件头一句，断言不变并通过。AGENTS.md 与 CLAUDE.md 的契约段同步改，
+    `tests/contract_docs.rs` 守着两份逐字一致、列出的四个文件都存在、末句在。发布侧：align-version.py 对齐 aproxy-ipc
+    （本机用 DRY_RUN_VERSION 试跑过，四个包与 Cargo.lock 的四个条目都改到），release.yml 的 crates 顺序加入它。
+    **release.yml 改过，打 alpha.2 之前要先跑一次 workflow_dispatch 演练。**
+  - 41b604d：端点名与 `home_id` 进 `aproxy_ipc::endpoint`。
+  - 3b34cc8：码表 `aproxy_ipc::code`（§2 的全部码，带族、`details` 的键与类型、HTTP 状态、退出码、诊断级别；
+    `table_json()` 导出），`docs/error-codes.md` 由它生成、`tests/code_table.rs` 比对；打码 `aproxy_ipc::redact`
+    （`url` 由 `config::mask_base_url` 迁入并改掉全部调用点；密钥头规则、占位对象、已知密钥替换与流式替换是新写的，
+    还没有调用方）。
+  - 验证：Windows headless 全量通过（库单测 280 + aproxy-ipc 28），两个变体 clippy 与 Linux 交叉 clippy 零输出。
+  - **与设计稿的出入，接手时注意**：
+    1. `redact::url` 判断 authority 是否规整不再用 url crate，用自己的检查，比 URL 标准严（国际化域名、带 `%` 的主机、
+       非四段点分十进制的数字主机按畸形处理）。迁移时拿旧实现在 23520 个输入上差分过：不同的 972 个都等于「按最后一个
+       @ 保守切分」的结果，没有露得更多的。
+    2. 安装码（`install_*`）只登记了设计稿点了名的十个，`details` 多数留空：§2.4 写明由 install 的 `--json`（B9）补齐。
+    3. 码表目前只是登记，没有出口在用：B1 接数据面，B2/B3 接诊断，B6 接 IPC，B9 接操作码与退出码。
+    4. `ledger::register` 不再自己告警（aproxy-ipc 不带 tracing），原因放在返回的守卫里，由 `util::register_in_ledger` 告警。

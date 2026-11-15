@@ -1001,6 +1001,19 @@ pub fn remove_restore_file_in(run_dir: &std::path::Path, listen_addr: &str) {
     let _ = std::fs::remove_file(restore_file_path_in(run_dir, listen_addr));
 }
 
+/// 优雅退出的注册表清理。顺序是刻意的：先删 .restore 再删 .pid——看门狗的
+/// 死亡事件若恰在两个 unlink 之间触发，读到的状态是「无恢复记录」= 优雅退出；
+/// 反序则会误判为崩溃而重拉一个用户刚停掉的实例。末尾顺带清 IPC 端点文件与
+/// 心跳文件（Windows 侧均为内核回收，这两个调用是 no-op；unix 清 unix socket
+/// 与 /dev/shm 心跳，消除残留）。`stop --force` 强杀成功后由停止它的一方代为执行
+/// 同一清理（被强杀的守护来不及自清），顺序语义相同。
+pub fn remove_registry_files(listen_addr: &str) {
+    remove_restore_file(listen_addr);
+    remove_instance_file(listen_addr);
+    crate::watchdog::remove_heartbeat_file(&run_dir(), port_of(listen_addr));
+    remove_socket_file(port_of(listen_addr));
+}
+
 /// 一条恢复记录：端口 + 启动参数 + 崩溃前那次启动的日志路径。
 /// log_path 供孤儿日志清理引用（崩溃实例的日志保留到恢复成功，作排障线索）；
 /// 前台实例无日志文件，落空串（崩溃恢复后是守护形态，新随机名）。

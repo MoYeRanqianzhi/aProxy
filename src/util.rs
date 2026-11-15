@@ -4,6 +4,14 @@
 //! URL 形态的凭据（base_url、代理 URL 等）一律走 lib 侧的统一出口
 //! `config::mask_base_url`；本模块只管不透明的密钥值（api_key、头值等）。
 
+/// 删掉本进程的台账条目（永久兼容契约 C3）后退出进程。`std::process::exit` 不跑析构，
+/// `aproxy::ledger::Registration` 管不到这条路，所以登记过台账的进程一律经这里退出；没登记过
+/// 的进程调用它也无妨（没有条目可删）。
+pub(crate) fn exit(code: i32) -> ! {
+    aproxy::ledger::remove_own();
+    std::process::exit(code)
+}
+
 /// 当前 Unix 秒（系统时钟早于 epoch 时回退 0——仅用于展示，不影响逻辑）
 pub(crate) fn now_unix() -> u64 {
     std::time::SystemTime::now()

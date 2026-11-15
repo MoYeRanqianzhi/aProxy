@@ -322,6 +322,15 @@ struct PendingRetry {
     next_retry: std::time::Instant,
 }
 
+/// 一个步进周期之后，看护者是否继续。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tick {
+    /// 继续看护
+    Continue,
+    /// 本看护者到此为止：主循环返回，由调用方结束进程
+    Retire,
+}
+
 /// 一个步进周期的完整看护状态
 pub struct WatchdogState {
     pub cfg: WatchdogConfig,
@@ -655,8 +664,11 @@ impl WatchdogState {
     }
 
     /// 一个完整步进周期：claim 续写 + 收养 + 健康 + 挂死事件处理 + 退避重试
-    /// + 闲置自灭判定 + install 保活
-    pub async fn tick(&mut self) {
+    /// + 闲置自灭判定 + install 保活。
+    ///
+    /// 返回 [`Tick::Retire`] 表示本看护者到此为止（claim 已易主，或闲置自灭的条件满足）：
+    /// 主循环随即返回，进程由二进制一侧结束。库里不调用 `process::exit`。
+    pub async fn tick(&mut self) -> Tick {
         // 消化本周期内累积的死亡事件
         let mut deaths = Vec::new();
         while let Ok((port, _pid)) = self.deaths.try_recv() {
@@ -668,9 +680,11 @@ impl WatchdogState {
         self.process_pending_retries().await;
         self.adopt_scan().await;
         self.health_scan().await;
-        self.refresh_claim();
-        self.maybe_idle_exit().await;
+        if self.refresh_claim() == Tick::Retire || self.maybe_idle_exit().await == Tick::Retire {
+            return Tick::Retire;
+        }
         self.check_install_keepalive();
+        Tick::Continue
     }
 
     /// claim 续写：心跳时间戳刷新（其他进程据此刻定本看护者是否在任/假死）。
@@ -679,7 +693,7 @@ impl WatchdogState {
     /// 正常路径接管者已把前任杀掉（terminate_verified），这里只是杀失败/
     /// 竞态窗口的确定性收尾：让位退出，claim 文件留给新任（勿动，动了会被
     /// 新任按「心跳停滞」再次夺权）。
-    fn refresh_claim(&mut self) {
+    fn refresh_claim(&mut self) -> Tick {
         if let Some(existing) = read_claim_in(&self.cfg.run_dir)
             && existing.pid != std::process::id()
         {
@@ -687,7 +701,7 @@ impl WatchdogState {
                 claim_pid = existing.pid,
                 "claim 已被其他看护者接管，本进程让位退出"
             );
-            crate::ledger::exit(0);
+            return Tick::Retire;
         }
         let claim = WatchdogClaim {
             pid: std::process::id(),
@@ -698,21 +712,22 @@ impl WatchdogState {
         // 原子写（crate::fsx::write_atomic）：原地写时，并发读到的可能是截断到一半的
         // claim，读者把它当「无 claim」，随即补种出第二个看护者
         let Ok(json) = serde_json::to_string(&claim) else {
-            return;
+            return Tick::Continue;
         };
         let path = claim_path_in(&self.cfg.run_dir);
         if let Err(e) = crate::fsx::write_atomic(&path, (json + "\n").as_bytes()) {
             tracing::warn!(error = %e, "claim 心跳续写失败");
         }
+        Tick::Continue
     }
 
     /// 闲置自灭：全部实例清零（收养表空、退避队列空且注册表空）持续
     /// idle_exit_secs 后删除 claim 退出，系统回到零常驻。pending 非空 = 还有
     /// 待重试的崩溃实例（.restore 在，期望恢复）——不算空闲，否则看护者会在
     /// 长退避中自灭、崩溃实例失去重试（历史上 respawn 失败路径曾造成此态）。
-    async fn maybe_idle_exit(&mut self) {
+    async fn maybe_idle_exit(&mut self) -> Tick {
         if self.cfg.idle_exit_secs == 0 {
-            return;
+            return Tick::Continue;
         }
         let registry_empty = crate::daemon::registry_pids_in(&self.cfg.run_dir).is_empty();
         if self.watched.is_empty() && self.pending.is_empty() && registry_empty {
@@ -720,11 +735,12 @@ impl WatchdogState {
             if since.elapsed().as_secs() >= self.cfg.idle_exit_secs {
                 tracing::info!("无任何实例需要看护，看护者退出（闲置自灭）");
                 remove_claim_in(&self.cfg.run_dir);
-                crate::ledger::exit(0);
+                return Tick::Retire;
             }
         } else {
             self.empty_since = None;
         }
+        Tick::Continue
     }
 
     fn after_watch_removal(&mut self) {
@@ -946,7 +962,9 @@ pub async fn serve(cfg: WatchdogConfig) {
                 state.handle_death(&port).await;
             },
         }
-        state.tick().await;
+        if state.tick().await == Tick::Retire {
+            return;
+        }
         // 每日一次的残留状态文件复查（安装中断后看护者长期存活的场景）
         if last_sweep.elapsed() >= Duration::from_secs(24 * 3600) {
             last_sweep = std::time::Instant::now();
@@ -1715,15 +1733,11 @@ mod tests {
             failures: 1,
             next_retry: std::time::Instant::now() + Duration::from_secs(3600), // 远期
         });
-        // 队列非空：即使空置超过 idle_exit_secs 也不自灭（此处只验证判定路径
-        // 不触发退出——退出是 std::process::exit，触发即测试进程死亡 = 失败）
-        st.maybe_idle_exit().await;
+        // 队列非空：即使空置超过 idle_exit_secs 也不自灭
+        assert_eq!(st.maybe_idle_exit().await, Tick::Continue);
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        st.maybe_idle_exit().await;
-        assert!(
-            !st.pending.is_empty(),
-            "pending 应保持（测试进程仍活着即通过）"
-        );
+        assert_eq!(st.maybe_idle_exit().await, Tick::Continue);
+        assert!(!st.pending.is_empty(), "pending 应保持");
     }
 
     #[test]

@@ -42,8 +42,9 @@ home 的实例。
 | 模块 | 职责 |
 |---|---|
 | `src/main.rs` | 进程入口：C5 的 `--version`、控制台代码页、在建 tokio 运行时之前分派 `desktop`、其余子命令在手建的运行时里分派（配置文件定位、日志初始化） |
-| `src/cli.rs` | clap 命令树定义（`Cli`/`Commands`/`AliasCmd`/`ConfigArgs`），只承载定义不含逻辑 |
-| `src/commands/` | 十二个子命令各自一文件（start/status/stop/restart/restore/alias/doctor/find/logs/config/install/desktop），共享 target 解析在 `mod.rs` |
+| `src/cli.rs` | clap 命令树定义（`Cli`/`Commands`/`AliasCmd`/`ConfigArgs`），只承载定义不含逻辑；在库里，操作层按原启动参数预检重启时要解析它 |
+| `src/commands/` | 十二个子命令各自一文件（start/status/stop/restart/restore/alias/doctor/find/logs/config/install/desktop）：调用操作层拿到结果，渲染成给人看的文字、决定退出码 |
+| `src/ops/` | 操作层：选目标（`target`）、启动（`start`）、停止（`stop`）、重启（`restart`）、恢复（`restore`）、别名（`alias`）、列举（`list`）。每个动作把带数据的结果交回调用方，自己不打印、不结束进程——命令行与桌面界面共用；`tests/lib_is_quiet.rs` 守着「库里没有 `println!` 与 `process::exit`」 |
 | `src/server.rs` | 服务承载：`serve_forever` 主循环、停止信号、日志初始化、配置错误落盘 startup.log |
 | `src/proxy/` | 转发核心，按职责分文件：入站来源校验（Host/Origin）、hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、尝试结局分类（`attempts::classify`）与唯一的尝试循环（`attempts::run_attempts`）、保活通道与提交点、断开保护、仅转发模式 |
 | `src/transform.rs` | 外部转换器编排：stdin/stdout 一行 JSON 信封交给外部 format 程序改写（spawn 与 persistent 统一进程池、空闲 reaper、超时/崩溃 worker 剔除）；信封契约在独立 crate `aproxy-envelope` |
@@ -79,8 +80,10 @@ home 的实例。
 - **aproxy-desktop**：桌面界面（Tauri 2 外壳与嵌入的前端），aproxy 的 `desktop` 特性引入它，
   版本与 aproxy 同步。它不依赖 aproxy（否则成环）。见「桌面界面」。
 
-CLI 定义（cli.rs）与子命令处理（commands/）分离；启动父进程逻辑（预检/spawn）
-在 `commands/start.rs`，服务本身在 `server.rs`——守护子进程由前者直接进入后者。
+CLI 定义（cli.rs）、动作本身（ops/）与子命令的渲染（commands/）分离；启动的父进程逻辑
+（配置解析、端口预检、后台拉起）在 `ops/start.rs`，由 `commands/start.rs` 串起来，服务本身在
+`server.rs`——守护子进程由 `commands/start.rs` 直接进入它。库不打印、不结束进程：看护者
+主循环返回后由 `main.rs` 结束进程，「删台账条目再退出」的便利函数是二进制一侧的 `util::exit`。
 
 ## 内存+磁盘双模缓冲（disk_cache）
 
@@ -500,7 +503,7 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
 - **台账**（`src/ledger.rs`，契约 C3）：实例、看护者与安装者在占端口或拉子进程之前原子
   写入 `<home>/ledger/<pid>.json`（pid、启动标记、角色、版本，可选端口、说明与实例配置
   文件的绝对路径 `config`），正常退出删除（Windows 上写入与删除短暂重试），
-  `process::exit` 一律经 `ledger::exit`。启动标记按平台冻结（Windows 创建时间
+  `process::exit` 之前一律先删自己的条目（二进制一侧的 `util::exit`）。启动标记按平台冻结（Windows 创建时间
   FILETIME、Linux boot_id + starttime、macOS proc_bsdinfo 的启动秒与微秒）；读者只处理
   本平台前缀的条目，结束前在同一个进程句柄（Windows）或 pidfd（Linux）上核验启动标记
   与属主（只结束当前用户的进程），pid 复用不会误杀；删条目前重读，`start` 仍一致才删。台账与实例
@@ -541,7 +544,7 @@ aproxy.exe 随之悄悄失去清单。所以不靠清单：tauri 关掉默认特
 （台账角色 `desktop`）就提示并以 0 退出，读到的死条目顺手删掉 → 预检（Windows 问 WebView2
 的版本，没装或 `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` 指错时报错；Linux 先看
 `DISPLAY`/`WAYLAND_DISPLAY`）→ 登记台账（C3）→ 建窗口、进事件循环 → 窗口关掉后删台账条目，
-按事件循环的退出码退出；登记之后的失败也经 `ledger::exit` 删掉条目再退出。
+按事件循环的退出码退出；登记之后的失败也经 `util::exit` 删掉条目再退出。
 Tauri 在许多运行期失败上直接 panic，所以预检放在前面，setup 里的失败记下来、请事件循环以
 非零退出码结束，图形后端初始化时的 panic 被接住换成说明。webview 的数据目录是
 `<home>/desktop/webview`：不显式指定时 Tauri 用按 identifier 建的应用数据目录，跑到

@@ -1,3 +1,4 @@
+pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod decode;
@@ -6,6 +7,7 @@ pub mod find;
 pub mod fsx;
 pub mod install;
 pub mod ledger;
+pub mod ops;
 pub mod process;
 pub mod proxy;
 pub mod retry;

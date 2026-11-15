@@ -74,7 +74,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     // 结束本实例；端口取配置里的监听端口（强制安装据此核对 restore 有没有把实例拉回来），
     // config 是配置文件的绝对路径（拉不回的实例，强制安装据此告诉用户怎样启动），label
     // 是给人看的同一路径。正常退出由守卫删除；下面经 process::exit 的路径一律改走
-    // ledger::exit，同样会删
+    // util::exit，同样会删
     let cfg_abs = std::path::absolute(cfg_path).unwrap_or_else(|_| cfg_path.to_path_buf());
     let _ledger = aproxy::ledger::register(
         &settings::home(),
@@ -100,7 +100,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
             // 走 report_config_error 落盘（startup.log），否则父进程超时提示指向
             // 的日志里查不到任何线索
             report_config_error(&bind_error_message(&listen_addr, &e), daemon_child);
-            aproxy::ledger::exit(1);
+            crate::util::exit(1);
         }
     };
     let actual_addr = listener.local_addr().expect("获取监听地址失败").to_string();
@@ -123,7 +123,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
                 ),
                 daemon_child,
             );
-            aproxy::ledger::exit(1);
+            crate::util::exit(1);
         }
     };
 
@@ -341,25 +341,12 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
             stop_signal(stop_rx).await;
             tracing::info!("10 秒后强制退出（在途请求将中断）");
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            remove_registry_files(&actual_addr);
-            aproxy::ledger::exit(0);
+            daemon::remove_registry_files(&actual_addr);
+            crate::util::exit(0);
         } => {}
     }
-    remove_registry_files(&actual_addr);
+    daemon::remove_registry_files(&actual_addr);
     tracing::info!("aProxy 已停止");
-}
-
-/// 优雅退出的注册表清理。顺序是刻意的：先删 .restore 再删 .pid——看门狗的
-/// 死亡事件若恰在两个 unlink 之间触发，读到的状态是「无恢复记录」= 优雅退出；
-/// 反序则会误判为崩溃而重拉一个用户刚停掉的实例。末尾顺带清 IPC 端点文件与
-/// 心跳文件（Windows 侧均为内核回收，这两个调用是 no-op；unix 清 unix socket
-/// 与 /dev/shm 心跳，消除残留）。`stop --force` 强杀成功后由 CLI 代为执行
-/// 同一清理（被强杀的守护来不及自清），顺序语义相同。
-pub(crate) fn remove_registry_files(listen_addr: &str) {
-    daemon::remove_restore_file(listen_addr);
-    daemon::remove_instance_file(listen_addr);
-    watchdog::remove_heartbeat_file(&daemon::run_dir(), daemon::port_of(listen_addr));
-    daemon::remove_socket_file(daemon::port_of(listen_addr));
 }
 
 /// bind 失败分类：「地址被占用」/「权限不足或被系统保留」（Windows 上常见于

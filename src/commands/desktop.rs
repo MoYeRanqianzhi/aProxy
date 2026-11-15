@@ -74,11 +74,11 @@ pub(crate) fn handle_desktop_cmd() -> ! {
     };
     #[cfg(not(windows))]
     let dialogs = false;
-    // 登记台账之后的失败也走这里，所以经 ledger::exit 退出（守住它的写者约定）；还没登记时
+    // 登记台账之后的失败也走这里，所以经 util::exit 退出（守住它的写者约定）；还没登记时
     // 它只是 process::exit
     let fail = |text: &str| -> ! {
         report(text, true, dialogs);
-        ledger::exit(1)
+        crate::util::exit(1)
     };
 
     // 主线程上的 panic（事件循环里的回调出错）没人接：Tauri 在事件循环里跑 setup，
@@ -180,7 +180,7 @@ pub(crate) fn handle_desktop_cmd() -> ! {
         }
     };
     // 删掉台账条目再退出（std::process::exit 不跑析构，守卫管不到这条路）
-    ledger::exit(code)
+    crate::util::exit(code)
 }
 
 /// 告诉用户一件事：打到终端（错误到 stderr），控制台已经释放时再弹对话框。写失败一律忽略。
@@ -247,7 +247,7 @@ mod console {
 
 #[cfg(test)]
 mod tests {
-    use crate::cli::{Cli, Commands};
+    use aproxy::cli::{Cli, Commands};
     use clap::{CommandFactory, Parser};
 
     #[test]

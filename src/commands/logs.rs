@@ -2,7 +2,7 @@
 
 use aproxy::daemon;
 
-use crate::commands::{config_path_key, resolve_config_target};
+use aproxy::ops::target::{config_path_key, resolve_config_target};
 
 /// `aproxy logs [PORT|别名]`：连接到运行中的实例并实时输出其守护日志。
 /// 语义与 stop 一致：单实例可省略 target；多实例必须指定；别名按配置文件

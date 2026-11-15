@@ -31,5 +31,38 @@ pub(crate) fn handle_find_cmd(
         // 必为 false，无需特判
         .filter(|d| port.is_none_or(|p| d.matches_port(p)))
         .collect();
-    find::print_list(&items);
+    print_list(&items);
+}
+
+/// 列出发现的配置（人类可读）。空结果时也明确提示。
+fn print_list(items: &[find::DiscoveredConfig]) {
+    if items.is_empty() {
+        println!(
+            "没有找到配置文件。配置目录列表见 settings.json 的 config_dirs（默认 ~/.aproxy/ 与 ~/.aproxy/configs/）。"
+        );
+        return;
+    }
+    println!("找到 {} 个配置:", items.len());
+    for d in items {
+        let alias_part = if d.aliases.is_empty() {
+            String::new()
+        } else {
+            format!("  别名: {}", d.aliases.join(", "))
+        };
+        let default_part = if d.is_default { "  [默认]" } else { "" };
+        match &d.config {
+            Some(c) => println!(
+                "  {}  端口 {}  上游 {}{}{}",
+                d.path.display(),
+                aproxy::daemon::port_of(&c.listen_addr),
+                aproxy::config::mask_base_url(&c.base_url),
+                alias_part,
+                default_part
+            ),
+            None => println!(
+                "  {}  （无法解析为有效 aProxy 配置）{alias_part}{default_part}",
+                d.path.display()
+            ),
+        }
+    }
 }

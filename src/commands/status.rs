@@ -2,50 +2,49 @@
 
 use aproxy::config::mask_base_url;
 use aproxy::daemon;
-use aproxy::settings;
+use aproxy::ops::list::{ActivityFilter, enumerate};
 
-use crate::util::{humanize_duration, humanize_uptime, now_unix};
+use crate::util::{humanize_duration, humanize_uptime};
 
 /// `aproxy status [--idle|--busy]`：列出注册表中的实例（存活以 IPC 探测为准）。
 /// idle/busy 按实例的最近活动时间与 settings.idle_timeout_secs 判定。
 pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
-    let threshold = settings::load().idle_timeout_secs;
-    let survey = daemon::survey_instances().await;
+    let filter = if idle_only {
+        ActivityFilter::Idle
+    } else if busy_only {
+        ActivityFilter::Busy
+    } else {
+        ActivityFilter::All
+    };
+    let listing = enumerate(filter).await;
     // 不应答的实例无论 --idle/--busy 都要报：它们多半挂死了，用户最需要知道
-    print_unresponsive(&survey.unresponsive);
-    let instances = survey.responsive;
-    if instances.is_empty() {
-        if survey.unresponsive.is_empty() {
+    print_unresponsive(&listing.unresponsive);
+    if listing.responsive_total == 0 {
+        if listing.unresponsive.is_empty() {
             println!("没有运行中的 aProxy 实例。");
         }
         return;
     }
-    let now = now_unix();
-    let is_idle = |status: &daemon::InstanceStatus| {
-        now.saturating_sub(status.activity.last_request_at) >= threshold
-    };
-    let filtered: Vec<_> = instances
-        .into_iter()
-        .filter(|status| !idle_only || is_idle(status))
-        .filter(|status| !busy_only || !is_idle(status))
-        .collect();
+    let now = listing.now;
+    let filtered = &listing.instances;
     if filtered.is_empty() {
-        let which = if idle_only {
-            "闲置"
-        } else if busy_only {
-            "活跃"
-        } else {
-            unreachable!("idle 与 busy 互斥，二者必有一为假");
+        let which = match filter {
+            ActivityFilter::Idle => "闲置",
+            ActivityFilter::Busy => "活跃",
+            ActivityFilter::All => unreachable!("不筛选时，有应答的实例就不会一个都不剩"),
         };
-        println!("没有{which}的 aProxy 实例（阈值 {} 秒）。", threshold);
+        println!(
+            "没有{which}的 aProxy 实例（阈值 {} 秒）。",
+            listing.idle_threshold_secs
+        );
         return;
     }
     println!("运行中的 aProxy 实例 ({}):", filtered.len());
     let cli_version = env!("CARGO_PKG_VERSION");
-    for status in &filtered {
+    for status in filtered {
         let info = &status.instance;
         let activity = &status.activity;
-        let idle_secs = now.saturating_sub(activity.last_request_at);
+        let idle_secs = listing.idle_secs(status);
         println!(
             "  端口 {}  pid {}  v{}  已运行 {}  闲置 {}",
             daemon::port_of(&info.listen_addr),

@@ -192,7 +192,7 @@ impl LedgerEntry {
 // ---------------------------------------------------------------------------
 
 /// 本进程登记的条目文件（进程内至多一条）。显式 `std::process::exit` 的路径不跑析构，
-/// [`exit`] 据此在退出前删掉它。
+/// 退出之前要先调 [`remove_own`] 删掉它。
 static OWN_ENTRY: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 fn own_entry() -> std::sync::MutexGuard<'static, Option<PathBuf>> {
@@ -201,7 +201,7 @@ fn own_entry() -> std::sync::MutexGuard<'static, Option<PathBuf>> {
 }
 
 /// 登记的守卫：析构（正常返回、panic 展开）时删掉本进程的条目。经 `std::process::exit`
-/// 退出的路径不跑析构，要改用 [`exit`]。
+/// 退出的路径不跑析构，退出之前要先调 [`remove_own`]（二进制一侧有合在一起的便利函数）。
 #[must_use = "守卫一析构就会删掉台账条目，要让它活到进程结束"]
 pub struct Registration {
     _private: (),
@@ -291,13 +291,6 @@ pub fn remove_own() {
     if let Some(path) = own_entry().take() {
         let _ = remove_entry_file(&path);
     }
-}
-
-/// 删掉本进程的条目后退出进程。`std::process::exit` 不跑析构，[`Registration`] 管不到
-/// 这条路，所以登记过的进程一律经这里退出。
-pub fn exit(code: i32) -> ! {
-    remove_own();
-    std::process::exit(code)
 }
 
 // ---------------------------------------------------------------------------

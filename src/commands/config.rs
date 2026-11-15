@@ -6,8 +6,8 @@ use aproxy::config;
 use aproxy::config::mask_base_url;
 use aproxy::settings;
 
-use crate::cli::ConfigArgs;
 use crate::util::{mask_secret, parse_kv};
+use aproxy::cli::ConfigArgs;
 
 /// 转换器 args 里「后一个参数是密钥」的旗标（比较时大小写不敏感）。format
 /// 程序常见的传 key 写法：`--api-key sk-...` 或 `--api-key=sk-...`。

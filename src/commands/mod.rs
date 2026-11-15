@@ -1,10 +1,7 @@
 //! 子命令模块：每个 `aproxy <cmd>` 一个文件，与 CLI 定义（crate::cli）分离。
 //!
-//! 共享解析逻辑：
-//! - `resolve_config_target`：start/stop 共用的「别名 | default 保留字 | 路径」
-//!   target 解析
-//! - `config_path_key`：配置路径的运行实例匹配键（统一走
-//!   settings::path_match_key，别名匹配、配置目录去重、doctor 扫描共用同一比较规则）
+//! 这里的每个文件只做两件事：调用操作层（`aproxy::ops`）拿到结果，再把结果渲染成给人看的
+//! 文字、决定退出码。target 解析、停止、拉起这些动作本身在操作层，界面与命令行共用。
 
 pub(crate) mod alias;
 pub(crate) mod config;
@@ -36,7 +33,7 @@ use aproxy::settings;
 /// 显式 `--config` 在此展开 `~` 并按当前工作目录绝对化：这个路径会被转发给
 /// 守护子进程、写进注册表与 .restore，日后可能在别的工作目录被读取（restore
 /// 会把找不到配置文件的记录当失效清理掉）。
-pub(crate) fn resolve_cfg_path(cli: &crate::cli::Cli) -> Result<PathBuf, String> {
+pub(crate) fn resolve_cfg_path(cli: &aproxy::cli::Cli) -> Result<PathBuf, String> {
     if let Some(p) = &cli.config {
         return Ok(match p.to_str() {
             Some(s) => settings::expand_path(s),
@@ -67,22 +64,6 @@ pub(crate) fn require_cfg_path(cfg_path: Result<PathBuf, String>) -> PathBuf {
     })
 }
 
-pub(crate) fn resolve_config_target(target: &str) -> Option<PathBuf> {
-    if let Some(p) = settings::resolve_alias(target) {
-        return Some(PathBuf::from(p));
-    }
-    if let Some(p) = settings::resolve_default_target(target) {
-        return Some(p);
-    }
-    let p = settings::expand_path(target);
-    if p.is_file() {
-        return Some(p);
-    }
-    None
-}
-
-pub(crate) use settings::path_match_key as config_path_key;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,13 +74,13 @@ mod tests {
         // 相对 --config 必须在 CLI 边界绝对化：它会被写进 .restore，restore 若在
         // 别的工作目录运行，相对路径会被当成「配置已不存在」而清掉记录
         let cli =
-            crate::cli::Cli::try_parse_from(["aproxy", "--config", "rel.toml", "status"]).unwrap();
+            aproxy::cli::Cli::try_parse_from(["aproxy", "--config", "rel.toml", "status"]).unwrap();
         let path = resolve_cfg_path(&cli).unwrap();
         assert!(path.is_absolute(), "{}", path.display());
         assert_eq!(path, std::env::current_dir().unwrap().join("rel.toml"));
 
         let cli =
-            crate::cli::Cli::try_parse_from(["aproxy", "--config", "~/x.toml", "status"]).unwrap();
+            aproxy::cli::Cli::try_parse_from(["aproxy", "--config", "~/x.toml", "status"]).unwrap();
         let path = resolve_cfg_path(&cli).unwrap();
         assert_eq!(path, settings::user_dir().unwrap().join("x.toml"));
     }
@@ -109,11 +90,11 @@ mod tests {
         // latest 查询失败时的提示让用户改用「--skills-only <具体版本号>」，
         // 解析层必须接受这种写法
         assert!(
-            crate::cli::Cli::try_parse_from(["aproxy", "install", "0.1.0", "--skills-only"])
+            aproxy::cli::Cli::try_parse_from(["aproxy", "install", "0.1.0", "--skills-only"])
                 .is_ok()
         );
         assert!(
-            crate::cli::Cli::try_parse_from(["aproxy", "install", "--skills-only", "--abort"])
+            aproxy::cli::Cli::try_parse_from(["aproxy", "install", "--skills-only", "--abort"])
                 .is_err(),
             "与 --abort 等仍互斥"
         );
@@ -122,10 +103,10 @@ mod tests {
     #[test]
     fn force_install_flags_parse() {
         let parse = |args: &[&str]| {
-            crate::cli::Cli::try_parse_from(std::iter::once("aproxy").chain(args.iter().copied()))
+            aproxy::cli::Cli::try_parse_from(std::iter::once("aproxy").chain(args.iter().copied()))
         };
         let install = |args: &[&str]| match parse(args).unwrap().command {
-            Some(crate::cli::Commands::Install(a) | crate::cli::Commands::Upgrade(a)) => a,
+            Some(aproxy::cli::Commands::Install(a) | aproxy::cli::Commands::Upgrade(a)) => a,
             other => panic!("{args:?} 解析成了 {other:?}"),
         };
         let a = install(&[

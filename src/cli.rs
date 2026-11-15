@@ -8,53 +8,53 @@ use std::path::PathBuf;
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "aproxy", about = "Local API proxy with infinite retries", long_about = None)]
-pub(crate) struct Cli {
+pub struct Cli {
     /// 配置文件路径（默认 ~/.aproxy/config.toml）。
     /// 多开不同配置的进程时各自指定，例如：
     /// aproxy --config ~/.aproxy/work.toml 与 aproxy --config ~/.aproxy/personal.toml
     /// （listen_addr 须互不相同）
     #[arg(long, value_name = "PATH", global = true)]
-    pub(crate) config: Option<PathBuf>,
+    pub config: Option<PathBuf>,
 
     /// 前台运行（日志输出到控制台，Ctrl+C 停止）；默认在后台运行，
     /// 日志按启动时刻随机命名写 ~/.aproxy/logs/ 下，实际路径以
     /// `aproxy logs` 经 IPC 向实例询问到的为准
     #[arg(long)]
-    pub(crate) foreground: bool,
+    pub foreground: bool,
 
     /// 上游 API base URL，覆盖配置文件中的 base_url
     #[arg(long, value_name = "URL")]
-    pub(crate) baseurl: Option<String>,
+    pub baseurl: Option<String>,
 
     /// 监听地址，覆盖配置文件中的 listen_addr
     #[arg(long, value_name = "ADDR")]
-    pub(crate) listen: Option<String>,
+    pub listen: Option<String>,
 
     /// 上游代理 URL（仅本次运行生效，不写入配置），覆盖配置文件中的 proxy
     #[arg(long, value_name = "URL")]
-    pub(crate) proxy: Option<String>,
+    pub proxy: Option<String>,
 
     /// 守护日志文件路径（仅本次运行生效），覆盖配置文件中的 log_file。
     /// 未指定时写入 ~/.aproxy/logs/ 下按启动时刻随机命名的文件，
     /// 实际路径以 aproxy logs 经 IPC 向实例询问到的为准
     #[arg(long, value_name = "PATH", global = true)]
-    pub(crate) log_file: Option<String>,
+    pub log_file: Option<String>,
 
     /// 快捷 api_key（等效覆盖 Authorization: Bearer <key>，仅本次运行生效），覆盖配置文件中的 api_key
     /// （建议改用配置文件，命令行参数可被本机其他进程枚举）
     #[arg(long, value_name = "KEY")]
-    pub(crate) api_key: Option<String>,
+    pub api_key: Option<String>,
 
     /// [内部] 守护子进程标记：后台启动时父进程把它附加到子进程命令行，
     /// 子进程据此以守护模式运行（无控制台、日志写文件）。勿手动使用。
     /// 必须是 global：start 子命令转发时它出现在 `start` 之后。
     #[arg(long, hide = true, global = true)]
-    pub(crate) daemon_child: bool,
+    pub daemon_child: bool,
 
     /// [内部] 看护进程标记：守护/CLI 拉起看护者时附加到命令行，
     /// 本进程据此进入看护主循环。勿手动使用。
     #[arg(long, hide = true, global = true)]
-    pub(crate) daemon_watchdog: bool,
+    pub daemon_watchdog: bool,
 
     // 不用 clap 自带的版本参数：输出的那一行是安装器认版本的永久格式
     // （aproxy::VERSION_LINE），由 main 自己打印；单独的 `aproxy --version` /
@@ -62,14 +62,14 @@ pub(crate) struct Cli {
     // 与别的参数写在一起的情形
     /// 打印版本（`aproxy v<版本> (<变体>; <目标三元组>…)`）
     #[arg(short = 'V', long)]
-    pub(crate) version: bool,
+    pub version: bool,
 
     #[command(subcommand)]
-    pub(crate) command: Option<Commands>,
+    pub command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
-pub(crate) enum Commands {
+pub enum Commands {
     /// 列出运行中的 aProxy 实例（来自实例注册表，存活以 IPC 探测为准）。
     /// --idle 只列闲置实例，--busy 只列活跃实例（判定阈值 settings 的
     /// idle_timeout_secs，默认 1800s）
@@ -200,30 +200,30 @@ pub(crate) enum Commands {
 
 /// `aproxy install` 的参数集。
 #[derive(clap::Args, Debug, Clone, PartialEq)]
-pub(crate) struct InstallArgs {
+pub struct InstallArgs {
     /// 安装目标版本：`latest`（默认，按更新通道取最大版本——stable 通道只取
     /// 正式版，pre 通道含预发布；通道见 --pre）或具体版本号（如
     /// 0.2.0-alpha.1）。latest 不高于当前版本时提示「已是最新」不重装。
     /// 默认拒绝降级（--allow-downgrade 放行）；低于 0.2.0 的版本一律拒绝。
     /// 加 --force 时不与当前版本比较，总是安装。与 --from/--adopt 互斥。
     #[arg(value_name = "VERSION", conflicts_with_all = ["from", "adopt", "abort"])]
-    pub(crate) version: Option<String>,
+    pub version: Option<String>,
 
     /// 从本地二进制文件安装（复制 → 校验 → 原子落位 → 滚动重启实例）。
     /// 二进制的 `--version` 自报版本即安装目标版本（低于 0.2.0 的拒绝）。
     #[arg(long, value_name = "PATH", conflicts_with_all = ["adopt", "abort", "version"])]
-    pub(crate) from: Option<String>,
+    pub from: Option<String>,
 
     /// 收编：把当前运行的 aProxy（如包管理器/npm 安装的）迁移到标准位置
     /// `~/.aproxy/bin/`——当前进程镜像作为安装源，走完整标准流水线。
     /// 显式执行，绝不自动。
     #[arg(long, conflicts_with_all = ["from", "abort", "version"])]
-    pub(crate) adopt: bool,
+    pub adopt: bool,
 
     /// 中止进行中的安装：仅 swapping 前可完全回滚（此后只进不退）。
     /// 清理状态文件与 staging 现场。
     #[arg(long, conflicts_with_all = ["from", "adopt", "version"])]
-    pub(crate) abort: bool,
+    pub abort: bool,
 
     /// 强制安装：不走交接，按进程台账结束这个 home 下当前用户的全部 aproxy 进程（实例、
     /// 看护者、安装者、桌面界面），换上新二进制，再用新版本的 restore 按原参数恢复实例。
@@ -242,12 +242,12 @@ pub(crate) struct InstallArgs {
         long,
         conflicts_with_all = ["adopt", "abort", "skills_only", "continue_", "no_skills", "allow_downgrade"]
     )]
-    pub(crate) force: bool,
+    pub force: bool,
 
     /// 强制安装不再询问确认（非交互环境必须加）。加之前先向用户确认可以中断经
     /// aproxy 的在途请求
     #[arg(long, requires = "force")]
-    pub(crate) yes: bool,
+    pub yes: bool,
 
     /// 要装的变体：desktop（带桌面界面）或 headless（无界面）；默认与正在运行的这个
     /// aproxy 相同。带界面的版本在缺 WebKitGTK 等系统库的 Linux 上跑不起来：没写这个
@@ -260,56 +260,56 @@ pub(crate) struct InstallArgs {
         value_parser = ["desktop", "headless"],
         conflicts_with_all = ["adopt", "abort", "skills_only", "continue_"]
     )]
-    pub(crate) variant: Option<String>,
+    pub variant: Option<String>,
 
     /// 指令集档：x86-64-v3 或 baseline（默认按本机 CPU：支持 AVX2、且这个目标发布了
     /// x86-64-v3 档（x86_64 的 Windows 与 Linux gnu）→ x86-64-v3，否则 baseline）
     #[arg(long, value_name = "CPU", value_parser = ["x86-64-v3", "baseline"], conflicts_with_all = ["from", "adopt", "abort"])]
-    pub(crate) cpu: Option<String>,
+    pub cpu: Option<String>,
 
     /// 允许降级安装（目标版本 < 当前已安装版本时默认拒绝）；低于 0.2.0 的版本
     /// 仍然拒绝
     #[arg(long)]
-    pub(crate) allow_downgrade: bool,
+    pub allow_downgrade: bool,
 
     /// latest 走预发布通道：在全部版本（含正式版与 alpha/beta/rc 预发布）
     /// 中取最大。不加时通道跟随当前版本——当前是预发布则默认即为预发布
     /// 通道，当前是正式版则只取正式版（不会被带到预发布）。只影响 latest
     /// 解析，指定具体版本号时无作用。
     #[arg(long, conflicts_with_all = ["from", "adopt", "abort"])]
-    pub(crate) pre: bool,
+    pub pre: bool,
 
     /// 仅本次下载使用的代理 URL（与 config.toml 的请求代理绝对分离）；
     /// 未指定时用 settings 的 download_proxy，再未配置则走系统环境代理
     /// （--force 不读 settings：只用这个参数，没给就走系统环境代理）
     #[arg(long, value_name = "URL")]
-    pub(crate) download_proxy: Option<String>,
+    pub download_proxy: Option<String>,
 
     /// 本次安装跳过 skill 文档更新（全局开关在 settings 的
     /// skill_auto_update）
     #[arg(long)]
-    pub(crate) no_skills: bool,
+    pub no_skills: bool,
 
     /// 只更新 skill 文档，不动二进制（跳过整个安装状态机；skill 上次
     /// failed 后的单独重试入口）。可同时给出 VERSION 指定 skill 版本
     /// （默认 latest，查询失败时报错提示改用具体版本号）
     #[arg(long, conflicts_with_all = ["from", "adopt", "abort"])]
-    pub(crate) skills_only: bool,
+    pub skills_only: bool,
 
     /// [内部] 续作模式：从 install.state 残留的 phase 幂等推进（看门狗/
     /// CLI 入口/交棒自动拉起，全自动无人工询问）。勿手动使用。
     #[arg(long, hide = true)]
-    pub(crate) continue_: bool,
+    pub continue_: bool,
 
     /// [内部] 交棒：拉起本进程的安装者的 pid。带着它（且它仍是 install.state
     /// 的主人）的续作进程可以接手一个安装者健在的安装。旧版本的安装者会这样
     /// 拉起新版本，是永久接口，见 install::flow 模块文档。勿手动使用。
     #[arg(long, hide = true, value_name = "PID", requires = "continue_")]
-    pub(crate) handover_from: Option<u32>,
+    pub handover_from: Option<u32>,
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
-pub(crate) enum AliasCmd {
+pub enum AliasCmd {
     /// 添加/覆盖别名（path 省略时指向默认配置 ~/.aproxy/config.toml）
     Add {
         /// 别名（不能为 all 或纯数字——会被 start/stop 当作端口/保留字解析）
@@ -330,51 +330,51 @@ pub(crate) enum AliasCmd {
 /// `aproxy config` 的参数集。独立成结构体以整体传递给处理函数，
 /// 避免 main 与函数之间逐字段搬运十几个参数。
 #[derive(clap::Args, Debug, Clone, PartialEq)]
-pub(crate) struct ConfigArgs {
+pub struct ConfigArgs {
     /// 设置上游 base URL，例如 https://api.anthropic.com
     #[arg(long, value_name = "URL")]
-    pub(crate) baseurl: Option<String>,
+    pub baseurl: Option<String>,
     /// 设置监听地址，例如 127.0.0.1:12345
     #[arg(long, value_name = "ADDR")]
-    pub(crate) listen: Option<String>,
+    pub listen: Option<String>,
     /// 快捷设置 api_key（等效覆盖 Authorization: Bearer <key>）
     #[arg(long, value_name = "KEY")]
-    pub(crate) api_key: Option<String>,
+    pub api_key: Option<String>,
     /// 额外请求头（仅当未携带时追加），格式 key=value，可重复
     #[arg(long = "extra-header", value_name = "KEY=VALUE")]
-    pub(crate) extra_headers: Vec<String>,
+    pub extra_headers: Vec<String>,
     /// 覆盖请求头（无条件覆盖），格式 key=value，可重复
     #[arg(long = "override-header", value_name = "KEY=VALUE")]
-    pub(crate) override_headers: Vec<String>,
+    pub override_headers: Vec<String>,
     /// 保活心跳间隔秒数，0 表示关闭
     #[arg(long, value_name = "SECS")]
-    pub(crate) keepalive_secs: Option<u64>,
+    pub keepalive_secs: Option<u64>,
     /// 设置上游代理 URL，例如 http://127.0.0.1:7890 或 socks5://user:pass@127.0.0.1:7890
     #[arg(long, value_name = "URL")]
-    pub(crate) proxy: Option<String>,
+    pub proxy: Option<String>,
     /// 设置代理用户名（可选，优先于 URL 内嵌的用户名）
     #[arg(long, value_name = "USER")]
-    pub(crate) proxy_username: Option<String>,
+    pub proxy_username: Option<String>,
     /// 设置代理密码（可选，优先于 URL 内嵌的密码）
     #[arg(long, value_name = "PASS")]
-    pub(crate) proxy_password: Option<String>,
+    pub proxy_password: Option<String>,
     /// 清空已配置的 api_key
     #[arg(long)]
-    pub(crate) clear_api_key: bool,
+    pub clear_api_key: bool,
     /// 清空 extra/override 头
     #[arg(long)]
-    pub(crate) clear_headers: bool,
+    pub clear_headers: bool,
     /// 清空代理配置（URL、用户名、密码）
     #[arg(long)]
-    pub(crate) clear_proxy: bool,
+    pub clear_proxy: bool,
     /// 把指定路径设为默认配置文件（写入 settings.json，不指定时默认
     /// ~/.aproxy/config.toml；支持 ~ 展开）
     #[arg(long, value_name = "PATH")]
-    pub(crate) set_default: Option<String>,
+    pub set_default: Option<String>,
     /// 取消默认配置文件设置（恢复用 ~/.aproxy/config.toml）
     #[arg(long)]
-    pub(crate) clear_default: bool,
+    pub clear_default: bool,
     /// 打印当前配置及文件路径
     #[arg(long)]
-    pub(crate) show: bool,
+    pub show: bool,
 }

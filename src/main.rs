@@ -1,7 +1,7 @@
 //! aProxy — 本地 API 代理，无限重试保障 agent 工作流不中断。
 //!
 //! 本文件只是进程入口：控制台代码页设置、配置文件定位、日志初始化与子命令分派。
-//! CLI 定义在 `cli.rs`，各子命令处理在 `commands/`，服务主循环在 `server.rs`，
+//! CLI 定义在库的 `aproxy::cli`，各子命令处理在 `commands/`，服务主循环在 `server.rs`，
 //! 共用小工具在 `util.rs`。
 //!
 //! 入口的顺序：先兑现永久兼容契约 C5 的单独 `--version`，再解析参数、在建 tokio 运行时
@@ -11,14 +11,13 @@
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{GetConsoleOutputCP, SetConsoleOutputCP};
 
-mod cli;
 mod commands;
 mod server;
 mod util;
 
 use clap::Parser;
 
-use cli::{Cli, Commands};
+use aproxy::cli::{Cli, Commands};
 
 use aproxy::settings;
 
@@ -99,7 +98,7 @@ async fn run(cli: Cli) {
         // 一次性生成并写入 OnceLock，注册表/恢复记录/轮转共用同一份路径；
         // 校验失败的错误会写入 startup.log（见 report_config_error），日志
         // 初始化必须发生在校验之前——否则失败的启动连 startup.log 都写不出
-        let cfg = commands::start::load_with_cli_overrides(
+        let cfg = aproxy::ops::start::load_with_cli_overrides(
             &cli,
             &commands::require_cfg_path(cfg_path.clone()),
         );
@@ -135,7 +134,9 @@ async fn run(cli: Cli) {
         );
         let cfg = aproxy::watchdog::WatchdogConfig::from_settings();
         aproxy::watchdog::serve(cfg).await;
-        return;
+        // 主循环返回 = 本看护者到此为止（让位、选举落败或闲置自灭）。硬退而不是从 main
+        // 返回：运行时析构会等后台任务，持有无限循环任务的进程会退不出去
+        util::exit(0);
     }
 
     // settings.json 检查（error 级）：每次软件运行都执行——别名损坏、JSON 语法
@@ -143,7 +144,9 @@ async fn run(cli: Cli) {
     // status/stop 不能因内部配置损坏而不可用。doctor 子命令会再次汇总（含分级），
     // 此处跳过避免重复输出。
     if cli.command != Some(Commands::Doctor) {
-        settings::check_and_report();
+        for e in settings::check_settings_errors_in(&settings::settings_path()) {
+            eprintln!("[ERROR] {e}");
+        }
     }
 
     // 恢复机制兜底（看门狗为主责，此为无看护者场景的静默兜底）：任何命令

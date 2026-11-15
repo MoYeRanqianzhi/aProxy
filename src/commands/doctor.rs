@@ -13,7 +13,14 @@ pub(crate) async fn handle_doctor_cmd() {
         println!("全部配置正常，未发现问题。");
         return;
     }
-    report.print();
+    for f in &report.findings {
+        println!("[{}] {}", f.level.tag(), f.message);
+    }
+    println!(
+        "检查结果: {} error, {} warning",
+        report.error_count(),
+        report.warn_count()
+    );
     if report.error_count() > 0 {
         println!(
             "\nerror 级问题会影响按名字的 start/stop 等操作，建议先修复；warning 级仅供参考。"

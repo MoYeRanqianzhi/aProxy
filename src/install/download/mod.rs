@@ -585,7 +585,7 @@ async fn fetch_url_template(
             }
         }
         None => {
-            eprintln!("[警告] 来源为非官方镜像（url 模板），产物未经独立校验（asset {asset}）");
+            tracing::warn!(asset, "来源为非官方镜像（url 模板），产物未经独立校验");
         }
     }
     Ok(Fetched {

@@ -3,13 +3,13 @@
 //! 使命对齐：「绝对不间断」在升级场景的缺失一环——替换二进制期间服务不
 //! 中断、中断点不留烂摊子。计划全文见 `.agents/plan/install-v1.md`。
 
-use crate::cli::InstallArgs;
+use aproxy::cli::InstallArgs;
 
 /// `install --force` / `upgrade --force`（永久兼容契约 C7、C8，流程见
 /// aproxy::install::force）。main 在读配置与 settings.json 之前就分流到这里。
 ///
 /// 先把本进程作为安装者登记进台账：另一个强制安装据此结束它（后来的结束先来的），
-/// 本进程结束安装者时跳过自己的 pid。退出走 ledger::exit，删掉自己的条目。
+/// 本进程结束安装者时跳过自己的 pid。退出走 util::exit，删掉自己的条目。
 pub(crate) async fn handle_force_cmd(args: &InstallArgs) -> ! {
     use aproxy::install::force;
     use std::io::Write;
@@ -47,7 +47,7 @@ pub(crate) async fn handle_force_cmd(args: &InstallArgs) -> ! {
         download_proxy: args.download_proxy.clone(),
     };
     let code = force::run(&home, &request).await;
-    aproxy::ledger::exit(code)
+    crate::util::exit(code)
 }
 
 /// 入口分派：--abort / --from / --adopt / --continue（续作）/ 无参提示。
@@ -61,7 +61,7 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
     // 进程台账（永久兼容契约 C3）：会动 bin/ 或实例的安装进程——在线安装、--from、
     // --adopt、续作与交接后的接手者——在做任何事之前登记，`aproxy install --force` 据此
     // 先结束它们、再去拿安装锁。只下载 skill 文档的 --skills-only 不碰 bin/，不登记。
-    // 本文件里的退出一律走 ledger::exit：process::exit 不跑析构，守卫删不到条目
+    // 本文件里的退出一律走 util::exit：process::exit 不跑析构，守卫删不到条目
     let _ledger = (args.continue_ || !args.skills_only).then(|| {
         aproxy::ledger::register(
             &home,
@@ -82,11 +82,11 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
         match aproxy::install::flow::continue_install(&home, &run_dir, args.handover_from).await {
             Ok(_) => {
                 tracing::info!("install 续作完成");
-                aproxy::ledger::exit(0);
+                crate::util::exit(0);
             }
             Err(e) => {
                 tracing::error!(error = %e, "install 续作失败（现场已保留，等待下次续作）");
-                aproxy::ledger::exit(1);
+                crate::util::exit(1);
             }
         }
     }
@@ -110,7 +110,7 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
             Ok(probed) => probed,
             Err(e) => {
                 eprintln!("[ERROR] {e}");
-                aproxy::ledger::exit(1);
+                crate::util::exit(1);
             }
         };
         if let Some(want) = args.variant.as_deref() {
@@ -122,13 +122,13 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
                     from_path.display(),
                     line.variant.as_deref().unwrap_or("未知变体")
                 );
-                aproxy::ledger::exit(1);
+                crate::util::exit(1);
             }
         }
         let version = semver::Version::parse(&target).expect("version_of 只返回合法的 semver");
         if let Err(e) = aproxy::install::check_floor(&version) {
             eprintln!("[ERROR] {e}");
-            aproxy::ledger::exit(1);
+            crate::util::exit(1);
         }
         let plan = aproxy::install::flow::InstallPlan {
             target_version: target,
@@ -153,14 +153,14 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("[ERROR] 无法定位自身可执行文件: {e}");
-                aproxy::ledger::exit(1);
+                crate::util::exit(1);
             }
         };
         let target = match aproxy::install::staging::probe_version(&self_exe) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[ERROR] {e}");
-                aproxy::ledger::exit(1);
+                crate::util::exit(1);
             }
         };
         let plan = aproxy::install::flow::InstallPlan {
@@ -241,7 +241,7 @@ async fn run_skills_only(args: &InstallArgs) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[ERROR] {e}");
-            aproxy::ledger::exit(1);
+            crate::util::exit(1);
         }
     };
     let version = match args.version.as_deref() {
@@ -261,7 +261,7 @@ async fn run_skills_only(args: &InstallArgs) {
                 Err(gh_err) => {
                     eprintln!("[ERROR] {gh_err}");
                     eprintln!("可尝试：--skills-only <具体版本号>（跳过 latest 查询）。");
-                    aproxy::ledger::exit(1);
+                    crate::util::exit(1);
                 }
             }
         }
@@ -282,7 +282,7 @@ async fn run_skills_only(args: &InstallArgs) {
             eprintln!(
                 "[ERROR] skill 更新失败（非强制支线，二进制安装不受影响）。可重试本命令或检查下载链条/代理配置。"
             );
-            aproxy::ledger::exit(1);
+            crate::util::exit(1);
         }
     }
 }
@@ -310,7 +310,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         Ok(c) => c,
         Err(e) => {
             eprintln!("[ERROR] {e}");
-            aproxy::ledger::exit(1);
+            crate::util::exit(1);
         }
     };
     let own_variant = ctx.variant;
@@ -340,7 +340,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
                     eprintln!(
                         "可尝试：install <具体版本号>（跳过 latest 查询），或 --download-proxy <URL> 更换出口。"
                     );
-                    aproxy::ledger::exit(1);
+                    crate::util::exit(1);
                 }
             };
             match decide_latest(&current, candidate.as_deref()) {
@@ -387,7 +387,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         aproxy::install::download::check_downgrade(&target, &current, args.allow_downgrade)
     {
         eprintln!("[ERROR] {e}");
-        aproxy::ledger::exit(1);
+        crate::util::exit(1);
     }
 
     // 管辖检查与 --from 同一道（见 run_plan），放在下载之前：bin 外的实例本就
@@ -395,7 +395,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     // 决议之后：已是最新时什么都不会发生，不必拦
     if let Err(e) = aproxy::install::flow::check_jurisdiction(run_dir, home, false).await {
         eprintln!("[ERROR] {e}");
-        aproxy::ledger::exit(1);
+        crate::util::exit(1);
     }
 
     // 下载链条：产物落 install/staging/<版本>/（与 --from 的备料同一位置）
@@ -514,7 +514,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         eprintln!(
             "可尝试：--download-proxy <URL> 配置下载代理，或在 settings.json 配置 download_chain（含 url 模板 CDN 通道，文档见 README）。"
         );
-        aproxy::ledger::exit(1);
+        crate::util::exit(1);
     };
     if installed_variant != attempts[0].variant {
         println!(
@@ -562,26 +562,26 @@ async fn report_outcome(
     match result {
         Ok(aproxy::install::flow::FlowExit::Completed) => {
             done_msg();
-            aproxy::ledger::exit(0);
+            crate::util::exit(0);
         }
         Ok(aproxy::install::flow::FlowExit::HandedOver) => {
             println!("新版本进程已接手安装（广播、交换、滚动重启、终验），等待其完成...");
             match await_handover(home).await {
                 Ok(()) => {
                     done_msg();
-                    aproxy::ledger::exit(0);
+                    crate::util::exit(0);
                 }
                 Err(e) => {
                     eprintln!("[ERROR] 安装失败: {e}");
                     print_failure_guidance(home);
-                    aproxy::ledger::exit(1);
+                    crate::util::exit(1);
                 }
             }
         }
         Err(e) => {
             eprintln!("[ERROR] 安装失败: {e}");
             print_failure_guidance(home);
-            aproxy::ledger::exit(1);
+            crate::util::exit(1);
         }
     }
 }
@@ -660,7 +660,7 @@ async fn run_plan(
 ) {
     if let Err(e) = aproxy::install::flow::check_jurisdiction(run_dir, home, adopt).await {
         eprintln!("[ERROR] {e}");
-        aproxy::ledger::exit(1);
+        crate::util::exit(1);
     }
     let target = plan.target_version.clone();
     println!("开始安装 aProxy {target}...");
@@ -682,7 +682,7 @@ fn handle_abort(home: &std::path::Path) {
             "[ERROR] 安装已进入交换阶段（phase {:?}），无法回滚——实例可能已开始滚动到新版本。\n中断的安装会自动续作完成；如需手动干预，按 skill 的手动更新兜底路径操作。",
             state.phase
         );
-        aproxy::ledger::exit(1);
+        crate::util::exit(1);
     }
     // swapping 前：二进制未动，干净回滚 = 清现场（staging + 状态文件）
     if let Some(staged) = &state.staged_path {

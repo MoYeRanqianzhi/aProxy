@@ -27,7 +27,7 @@ pub enum Level {
 }
 
 impl Level {
-    fn tag(self) -> &'static str {
+    pub fn tag(self) -> &'static str {
         match self {
             Level::Error => "ERROR",
             Level::Warn => "WARN",
@@ -53,16 +53,6 @@ impl Report {
             .iter()
             .filter(|f| f.level == Level::Warn)
             .count()
-    }
-    pub fn print(&self) {
-        for f in &self.findings {
-            println!("[{}] {}", f.level.tag(), f.message);
-        }
-        println!(
-            "检查结果: {} error, {} warning",
-            self.error_count(),
-            self.warn_count()
-        );
     }
     pub fn is_clean(&self) -> bool {
         self.findings.is_empty()

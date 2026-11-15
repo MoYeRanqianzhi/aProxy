@@ -363,10 +363,15 @@ pub fn load_from(path: &std::path::Path) -> Settings {
         Ok(content) => match serde_json::from_str::<Settings>(&content) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!(
-                    "警告: settings.json 解析失败（{}），别名等内部配置已回退为空",
-                    e
-                );
+                // 一个命令里会多次加载 settings，同一份损坏只说一遍
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "settings.json 解析失败，别名等内部配置已回退为空"
+                    );
+                });
                 Settings::default()
             }
         },
@@ -614,14 +619,6 @@ pub fn check_settings_errors_in(path: &std::path::Path) -> Vec<String> {
         ));
     }
     errors
-}
-
-/// 每次软件运行调用的 settings.json 检查：发现问题立刻向 stderr 报出
-/// （不退出——管理命令 status/stop 不能因内部配置损坏而不可用）。
-pub fn check_and_report() {
-    for e in check_settings_errors_in(&settings_path()) {
-        eprintln!("[ERROR] {e}");
-    }
 }
 
 #[cfg(test)]

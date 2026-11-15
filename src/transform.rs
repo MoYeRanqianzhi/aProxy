@@ -892,27 +892,28 @@ pub(crate) async fn transform_response(
 }
 
 /// 库内单测用的 examples/format-echo(.exe)：跨平台的假 format 程序（不依赖系统里的 python），
-/// 本模块与 proxy 的单测共用这一处。库的单测程序在 `target/<profile>/deps/` 里，example 在同一
-/// profile 的 `examples/` 里，所以从单测程序自己的路径直接推出来，不靠逐级往上找。
+/// 本模块与 proxy 的单测共用这一处。example 在 `target/<profile>/examples/` 里，库的单测程序
+/// 在同一个 profile 目录下面，但深度随 cargo 版本而变（1.99 及更早是 `deps/`，1.100 起是
+/// `build/<包名>/<hash>/out/`），所以从单测程序自己的路径逐级往上，找第一个带着这个 example
+/// 的目录。
 ///
 /// 它是 example，不是单测的依赖：只跑 `cargo test --lib` 时 cargo 不编译它，干净的构建目录下
 /// 要先 `cargo build --example format-echo`，否则这里 panic 并给出这条命令。
 #[cfg(test)]
 pub(crate) fn format_echo_path() -> std::path::PathBuf {
     let exe = std::env::current_exe().unwrap();
-    let profile_dir = exe
-        .parent()
-        .and_then(Path::parent)
-        .expect("单测程序应在 target/<profile>/deps/ 里");
-    let path = profile_dir
-        .join("examples")
-        .join(format!("format-echo{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        path.is_file(),
-        "找不到 {}：只跑库的单测时 cargo 不编译 example，先执行 `cargo build --example format-echo`",
-        path.display()
-    );
-    path
+    let relative =
+        Path::new("examples").join(format!("format-echo{}", std::env::consts::EXE_SUFFIX));
+    exe.ancestors()
+        .map(|dir| dir.join(&relative))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "从 {} 往上找不到 {}：只跑库的单测时 cargo 不编译 example，先执行 `cargo build --example format-echo`",
+                exe.display(),
+                relative.display()
+            )
+        })
 }
 
 #[cfg(test)]

@@ -75,10 +75,7 @@ pub fn is_error_body(body: &[u8]) -> bool {
             return true;
         }
     }
-    if obj.get("type").and_then(|t| t.as_str()) == Some("error") {
-        return true;
-    }
-    false
+    obj.get("type").and_then(|t| t.as_str()) == Some("error")
 }
 
 /// 判断流式缓冲体中是否包含错误事件。

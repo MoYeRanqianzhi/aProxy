@@ -518,3 +518,16 @@
   CLAUDE.md 的契约段，home 的解析放到那时一起搬，这几处只改一次；home 的解析也可能该进 aproxy-ipc（`home_id` 与端点名在
   那里），先搬进主 crate 会白搬一次。注意 force_contract 第 28 行 `aproxy::settings::user_dir()` 是函数体里的全路径、不是
   `use` 行，搬 home 时它也得改——同属「`use` 路径随代码移动」（R-S3-15），B0 的提交说明里写明。
+- P5（2026-11-16）：b426201 操作层 `src/ops/`（target、start、stop、restart、restore、alias、list），命令层只渲染；
+  输出文字、去向与退出码不变（restart_integration、install_flow 等原有集成测试照过）。`tests/lib_is_quiet.rs` 守着库里没有
+  `println!`、`eprintln!`、`process::exit`。附带的挪动：cli.rs 进库、`remove_registry_files` 进 daemon、`ledger::exit` 改为
+  二进制一侧的 `util::exit`、看护者 `tick` 返回 `Tick::Retire` 由 main 结束进程。Windows headless 全量通过（库单测 295），
+  两个变体 clippy 与 Linux 交叉 clippy 零输出。
+  **操作层现在的边界**（给 B5、B9、W3 接手时看）：结果是带数据的枚举，但从底层带上来的原因仍是中文字符串
+  （`reason`、`error` 字段：配置校验、bind、IPC 错误），`resolve_runtime_config` 也还返回 `Result<Config, String>`——
+  错误码表（§2.4）随 B0 进 aproxy-ipc 之后，B1/B2 把这些字符串换成码加数据，B9 再接 `--json` 与退出码表。
+  restart 的预检还要用 clap 解析原启动参数（所以 cli.rs 在库里），B5 换成 spec 文件后这层解析可以拿掉。
+  install、config、logs 三个命令还没有进操作层：install 的流程已在库（`install::flow`），命令文件里是渲染与退出；
+  config 与 logs 留到 B9 随 `config get/set/unset` 与 `--json` 一起做。
+- f9ff451（2026-11-16）：本机与 CI 的 stable 升到 Rust 1.100。cargo 1.100 把单测程序放到
+  `target/<profile>/build/<包名>/<hash>/out/`，`transform::format_echo_path` 改为逐级往上找；clippy 新报的 needless_bool 一处。

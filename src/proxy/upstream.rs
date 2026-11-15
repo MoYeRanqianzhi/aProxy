@@ -19,13 +19,14 @@ pub(super) fn log_proxied_request(method: &http::Method, path_and_query: &str, t
 // 传递一次，不构成热点。保持扁平匹配更直接。
 #[allow(clippy::large_enum_variant)]
 pub(super) enum ForwardResult {
-    NetworkError(String),
+    /// 没拿到完整的上游响应：连不上、超时、连接中途断开。原因已归成尝试失败码
+    NetworkError(AttemptFailure),
     /// 上游响应体超出 spool 上限：确定性失败，重试无意义，各通道直接终态处理。
     TooLarge,
     /// 本地磁盘 spool 写入失败（磁盘满/IO 故障）：磁盘模式专属的确定性失败。
     /// 与 NetworkError 不同——同一轮重试无法恢复（文件句柄已坏），但下一轮
-    /// 可能恢复；交由调用方选择终态或继续。
-    SpoolFailed(String),
+    /// 可能恢复；交由调用方选择终态或继续。带着出问题的是哪一步与原因。
+    SpoolFailed(StorageOp, String),
     /// 完整缓冲后的响应；`raw_headers` 保留原始 reqwest 头用于流式嗅探，
     /// `headers` 为已过滤 hop-by-hop 后的待透传头。`disk_scan` 仅为磁盘模式
     /// 增量扫描结论（Some((是否错误, 头部快照)))；内存模式恒 None。
@@ -84,14 +85,14 @@ pub(super) async fn forward_once(
         Ok(b) => b,
         Err(e) => {
             // 请求体临时文件打不开 = 本地确定性故障，重试同样打不开
-            return ForwardResult::SpoolFailed(e.to_string());
+            return ForwardResult::SpoolFailed(StorageOp::ReadRequest, e.to_string());
         }
     };
 
     let resp = match builder.send().await {
         Ok(r) => r,
-        // 在源头脱敏：NetworkError 的文本会流向日志、status 的最近错误与各通道
-        Err(e) => return ForwardResult::NetworkError(redact_reqwest_error(e)),
+        // 在源头归类并脱敏：失败原因会流向日志、status 的最近错误与各通道
+        Err(e) => return ForwardResult::NetworkError(send_failure(e, &state.config)),
     };
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -130,15 +131,15 @@ pub(super) async fn forward_once(
                 scanner.feed(&chunk);
                 spool_chunk(&mut spool, &chunk, spool_dir).await;
                 if matches!(spool, SpoolBuffer::Poisoned) {
-                    return ForwardResult::SpoolFailed("spool 磁盘写入失败".to_string());
+                    return ForwardResult::SpoolFailed(
+                        StorageOp::WriteResponse,
+                        "writing the response body to the disk cache failed".to_string(),
+                    );
                 }
             }
             Ok(None) => break,
             Err(e) => {
-                return ForwardResult::NetworkError(format!(
-                    "读取上游响应体失败: {}",
-                    redact_reqwest_error(e)
-                ));
+                return ForwardResult::NetworkError(body_failure(e, spool.len(), &state.config));
             }
         }
     }
@@ -146,7 +147,7 @@ pub(super) async fn forward_once(
     // 收尾 flush 失败与收集途中写失败同属本地磁盘故障，走同一条 SpoolFailed 路径
     let (body, disk_scan) = match spool.finish(scanner).await {
         Ok(v) => v,
-        Err(e) => return ForwardResult::SpoolFailed(e),
+        Err(e) => return ForwardResult::SpoolFailed(StorageOp::WriteResponse, e),
     };
     ForwardResult::Response {
         status,
@@ -154,6 +155,45 @@ pub(super) async fn forward_once(
         raw_headers,
         body,
         disk_scan,
+    }
+}
+
+/// 把「发出请求、等响应头」阶段的 reqwest 错误归成尝试失败码：
+/// - 连接阶段超时 → `upstream_connect_timeout`；
+/// - 连接阶段的其他失败（DNS、被拒绝、TLS）→ `upstream_connect_failed`；
+/// - 连接已建立、等响应头超时 → `upstream_first_byte_timeout`（reqwest 的 read_timeout 同样
+///   钳制首字节等待，所以时限取 `read_timeout_secs`）；
+/// - 其余（连接建立之后、响应头之前断开等）→ `upstream_body_interrupted`，已收 0 字节。
+pub(super) fn send_failure(e: reqwest::Error, config: &Config) -> AttemptFailure {
+    let (connect, timeout) = (e.is_connect(), e.is_timeout());
+    let reason = redact_reqwest_error(e);
+    match (connect, timeout) {
+        (true, true) => {
+            AttemptFailure::connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+        }
+        (true, false) => AttemptFailure::connect_failed(reason),
+        (false, true) => {
+            AttemptFailure::first_byte_timeout(Duration::from_secs(config.read_timeout_secs))
+        }
+        (false, false) => AttemptFailure::body_interrupted(0, reason),
+    }
+}
+
+/// 把「读响应体」阶段的 reqwest 错误归成尝试失败码：两次读到数据之间超时 →
+/// `upstream_read_idle_timeout`，其余 → `upstream_body_interrupted`。`received_bytes` 是
+/// 出错之前已经收到的响应体字节数。
+pub(super) fn body_failure(
+    e: reqwest::Error,
+    received_bytes: u64,
+    config: &Config,
+) -> AttemptFailure {
+    if e.is_timeout() {
+        AttemptFailure::read_idle_timeout(
+            Duration::from_secs(config.read_timeout_secs),
+            received_bytes,
+        )
+    } else {
+        AttemptFailure::body_interrupted(received_bytes, redact_reqwest_error(e))
     }
 }
 

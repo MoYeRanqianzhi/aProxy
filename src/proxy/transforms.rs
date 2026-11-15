@@ -38,11 +38,12 @@ impl PerAttemptTransform {
     /// 无妨：成功之后不会再有重试。
     pub(super) fn record(&mut self, result: &ForwardResult) {
         let (status, error) = match result {
-            ForwardResult::NetworkError(e) => (None, e.clone()),
-            ForwardResult::Response { status, .. } => {
-                (Some(status.as_u16()), format!("上游返回 {status}"))
-            }
-            ForwardResult::TooLarge | ForwardResult::SpoolFailed(_) => return,
+            ForwardResult::NetworkError(failure) => (None, failure.message.clone()),
+            ForwardResult::Response { status, .. } => (
+                Some(status.as_u16()),
+                format!("the upstream returned {}", status.as_u16()),
+            ),
+            ForwardResult::TooLarge | ForwardResult::SpoolFailed(..) => return,
         };
         self.last.status = status;
         self.last.error = Some(error);
@@ -101,13 +102,13 @@ impl PerAttemptTransform {
 /// 转换请求）、bounded_retry 匹配之后（bounded 对原始路径判定——路径集合是
 /// 客户端视角，转换是实例级配置，语义不同源）。未配置时原样返回。
 ///
-/// 失败返回给客户端看的原因（已记日志与最近一次失败）：请求未发往上游，按约定
-/// 不重试（失败按成因分类，各类性质见 `transform::TransformError` 的分类说明）。
-/// 调用方按响应是否已提交决定回 502 还是写终态 error 事件。
+/// 失败返回这个请求的终态（已记日志与最近一次失败）：请求未发往上游，按约定
+/// 不重试（失败按成因归成不同的码，见 [`request_transform_terminal`]）。
+/// 调用方按响应是否已提交决定回错误响应还是写终态 error 事件。
 pub(super) async fn apply_request_transform(
     state: &AppState,
     req: OutboundRequest,
-) -> Result<OutboundRequest, String> {
+) -> Result<OutboundRequest, Terminal> {
     let Some(pool) = state.request_pool.as_ref() else {
         return Ok(req);
     };
@@ -132,9 +133,11 @@ pub(super) async fn apply_request_transform(
             RequestBody::Disk { path, .. } => match tokio::fs::read(path).await {
                 Ok(v) => Bytes::from(v),
                 Err(e) => {
-                    let msg = format!("请求转换失败: 读取请求体失败: {e}");
-                    state.note_upstream_failure(&msg);
-                    return Err(msg);
+                    let terminal =
+                        Terminal::local_storage_failed(StorageOp::ReadRequest, &e.to_string());
+                    state.note_upstream_failure(&terminal.summary());
+                    tracing::error!(code = %terminal.code(), error = %e, "请求转换前读取落盘的请求体失败");
+                    return Err(terminal);
                 }
             },
         };
@@ -174,21 +177,39 @@ pub(super) async fn apply_request_transform(
             })
         }
         Err(e) => {
-            let msg = format!("请求转换失败: {e}");
-            state.note_upstream_failure(&msg);
-            tracing::warn!(error = %e, "请求转换失败，终态返回（请求侧转换失败按约定不重试）");
-            Err(msg)
+            let terminal = request_transform_terminal(&e);
+            state.note_upstream_failure(&terminal.summary());
+            tracing::warn!(code = %terminal.code(), error = %e, "请求转换失败，终态返回（请求侧转换失败按约定不重试）");
+            Err(terminal)
         }
     }
 }
 
-/// 请求转换失败的 502 终态（尚未向客户端提交任何字节时）
-pub(super) fn request_transform_failed_response(msg: &str) -> Response {
-    (
-        StatusCode::BAD_GATEWAY,
-        format!("{msg}（请求侧转换失败不重试，未发往上游）"),
-    )
-        .into_response()
+/// 请求转换器在码与日志里的名字。现在一个实例只有一个请求转换器，没有自己的名字，用
+/// 配置键名指代它。
+const REQUEST_FORMAT_NAME: &str = "request_transform";
+
+/// 请求转换失败对应的终态：
+/// - format 用信封的 error 行明确拒绝了这个请求 → `format_rejected`；
+/// - 落盘的请求体读不回来（本地磁盘的问题，与 format 无关）→ `local_storage_failed`；
+/// - 其余是 format 程序本身出了问题（起不来、管道断了、超时、中途退出、输出不合协议）→
+///   `format_failed`，`kind` 说明是哪一种。
+fn request_transform_terminal(e: &crate::transform::TransformError) -> Terminal {
+    use crate::transform::TransformError as E;
+    let kind = match e {
+        E::Rejected(reason) => {
+            return Terminal::format_rejected(REQUEST_FORMAT_NAME, "request", reason);
+        }
+        E::Spool(io) => {
+            return Terminal::local_storage_failed(StorageOp::ReadRequest, &io.to_string());
+        }
+        E::Spawn(_) => "spawn",
+        E::Io(_) | E::Closed => "io",
+        E::TimedOut => "timeout",
+        E::WorkerDied => "died",
+        E::Protocol(_) | E::Serialize(_) => "protocol",
+    };
+    Terminal::format_failed(REQUEST_FORMAT_NAME, "request", kind, &e.to_string())
 }
 
 /// 响应侧转换入口（尝试循环交付成功响应时调用）：未配置时原样返回；转换失败时 warn + 原样

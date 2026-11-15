@@ -140,8 +140,8 @@ stream_idle_timeout_ms = 86400000  # 24 h
   wait ended in a complete answer from a single request.
 - Requests are `POST <base_url>/responses` with `Accept: text/event-stream` and `"stream": true`, so
   every `keepalive_trigger` value gives them heartbeats.
-- Leave `supports_websockets` off (the default for custom providers): aProxy proxies HTTP only and does
-  not pass WebSocket upgrades.
+- Leave `supports_websockets` off (the default for custom providers): aProxy proxies HTTP only and
+  refuses a WebSocket upgrade with `501` `upgrade_unsupported`.
 
 ## Gemini CLI
 
@@ -188,11 +188,11 @@ disconnect warning in the log and check the client's current source.
 
 ## Browser and Electron clients
 
-They send an `Origin` header, which aProxy rejects by default with a local 403 that is never forwarded:
-`aProxy 拒绝了该请求（403，未转发上游）：来自浏览器页面的请求（Origin「…」）默认不放行，…` ("aProxy rejected the
-request (403, not forwarded): requests from browser pages are not allowed by default"). The check stops
-a web page from spending the user's key through the local proxy. If the user trusts the client, add
-the exact Origin from the message to `allowed_origins` (config-toml.md) and restart the instance.
+They send an `Origin` header, which aProxy rejects by default with a local `403` that has
+`x-aproxy-error: inbound_origin_rejected` and `details.origin`; it is never forwarded. The check
+stops a web page from spending the user's key through the local proxy. If the user trusts the
+client, add the exact Origin from `details.origin` (or from the request's `入站请求被拒绝…` log
+line) to `allowed_origins` (config-toml.md) and restart the instance.
 
 ## Verify the setup
 

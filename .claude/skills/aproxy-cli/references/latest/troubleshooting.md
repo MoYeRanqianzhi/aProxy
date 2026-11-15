@@ -23,7 +23,8 @@ the aproxy-format skill's troubleshooting.md.
 ## Before you change anything
 
 - Run `aproxy status`. It lists each running instance with port, upstream, config file, request and
-  retry counts, and `最近错误` ("latest error"). Identify the instance the user means, and whether your
+  retry counts, and `最近错误` ("latest error"), which reads `<code>: <English message>`, for example
+  `upstream_status: the upstream returned 503`. Identify the instance the user means, and whether your
   own session runs through it, before stopping or restarting anything: a stop or restart cuts every
   in-flight request on that instance.
 - Instance log: `aproxy logs <port|alias>` prints the file path (`日志文件: …`) and recent lines, then
@@ -72,13 +73,14 @@ the aproxy-format skill's troubleshooting.md.
 | A non-streaming request times out at the client | Non-streaming requests get no heartbeats, so the client sees nothing until the end | Raise the client's overall timeout (Claude Code: `API_TIMEOUT_MS`). A lower `max_retry_backoff_secs` also helps: requests finish sooner once the upstream recovers |
 | A streaming request gets no heartbeat, or its first byte comes late | `keepalive_trigger = "accept"` excludes clients that send `Accept: application/json` with `"stream": true` (Claude Code); or `keepalive_interval_secs = 0`; or forward-only mode | Use `keepalive_trigger = "any"`. Check the effective value with `aproxy config --show` and the settings.json default, then restart |
 | The client got `text/event-stream` with a JSON or NDJSON body; the log warns `已以 text/event-stream 提交的保活响应里回放的是非 SSE 的成功响应体…` | The upstream answered a stream request with a non-SSE body after the skeleton head was committed | Set `keepalive_trigger = "accept"` on that instance |
-| The client receives `event: error` with `error.type` `upstream_error` or `proxy_…` | aProxy ended an already committed response | See behaviors.md, After the commit, for each type; the fixes are the 502 rows below |
-| 502 `上游响应体超出 spool 上限，无法回放（重试无意义）` ("upstream response exceeds the spool limit") | Response larger than `spool_limit_mb` | Raise `spool_limit_mb` |
-| 502 `本地磁盘缓存写入失败，无法回放: …` ("local disk cache write failed"), or `proxy_spool_failed` | Disk full, or `<home>/spool/<port>/` not writable | Free space, or set `disk_cache = false` and restart |
-| 413 `请求体超出上限（N MiB），可在 settings.json 的 max_body_mb 或 config.toml 的 max_body_mb 调整` ("request body over the limit") | Body larger than `max_body_mb` | Raise it, or `0` for no limit |
-| 400 `请求体读取失败（连接中断或本地磁盘缓存写入失败）: …` ("reading the request body failed") | The client disconnected while uploading, or spilling the body to disk failed | Usually client-side; otherwise check disk space |
-| 403 starting `aProxy 拒绝了该请求（403，未转发上游）：` naming a Host or an Origin; log `入站请求被拒绝…` ("inbound request rejected") | Inbound check: browser and Electron clients send `Origin`, rejected by default; a non-default host name is rejected on loopback listeners | Add the exact value from the message to `allowed_origins` or `allowed_hosts` (config-toml.md), only if the user trusts that client; restart |
-| 502 `aProxy 内部错误：保活通道异常结束` ("internal error: keepalive channel ended abnormally") | An internal failure in aProxy | Resend; if it repeats, collect the log around it for a bug report |
+| The client receives an SSE `event: error` frame, or an HTTP response with `x-aproxy-error` | aProxy ended the request, after the response head was already committed or by giving up | Read the code from `error.aproxy.code` or the header; behaviors.md, After the commit lists each code and its status. Most fixes are the rows below |
+| 502 with `x-aproxy-error: response_too_large` (`details.limit_bytes`) | Response larger than `spool_limit_mb` | Raise `spool_limit_mb` |
+| 507 with `x-aproxy-error: local_storage_failed` (`details.op` is `write_request`, `read_request` or `write_response`) | Disk full, or `<home>/spool/<port>/` not writable | Free space, or set `disk_cache = false` and restart |
+| 413 with `x-aproxy-error: request_too_large` (`details.limit_bytes`) | Body larger than `max_body_mb` | Raise it, or `0` for no limit |
+| 400 with `x-aproxy-error: client_body_aborted` | The client stopped sending its request body | Usually client-side; have the client resend |
+| 403 with `x-aproxy-error: inbound_host_rejected` or `inbound_origin_rejected` (`details.host` / `details.origin`); log `入站请求被拒绝…` ("inbound request rejected") | Inbound check: browser and Electron clients send `Origin`, rejected by default; a non-default host name is rejected on loopback listeners | Add the exact value from `details` to `allowed_origins` or `allowed_hosts` (config-toml.md), only if the user trusts that client; restart |
+| 501 with `x-aproxy-error: upgrade_unsupported` (`details.upgrade` is `websocket`) | The client tried a WebSocket upgrade; aProxy refuses it on the spot and does not forward or retry it. Other upgrades such as `h2c` are proxied normally | Use the client's HTTP/SSE mode, or point that client at the upstream directly; aProxy does not proxy WebSocket |
+| 500 with `x-aproxy-error: internal` | An internal defect in aProxy | Resend; if it repeats, collect the log around it for a bug report |
 | Upstream traffic goes through an unexpected proxy, or bypasses the expected one | Without `proxy` in config.toml, the instance uses `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`/`NO_PROXY` from the environment it was started (or respawned) in | Set `proxy` explicitly, which disables those variables, and restart |
 | `aproxy status` shows the request count not moving while the client works | The client is not using aProxy | clients.md, Verify the setup |
 
@@ -97,12 +99,12 @@ the aproxy-format skill's troubleshooting.md.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| 502 `请求转换失败: …` ("request transform failed"), or the event `proxy_transform_failed` | The request transform failed; the request was not sent upstream and is not retried | The reason after the colon says which: `format 进程启动失败` (process failed to start: check `command`), `format 报告转换失败` (the format reported an error), `转换超时` (timed out: raise `timeout_secs` or fix a stuck format), `format 输出违反信封协议` (broke the envelope protocol: extra stdout lines or invalid JSON), `format 进程意外退出且无输出` (exited without output), `format 进程管道读写失败` (pipe failure), `body 临时文件读取失败` (local disk). Details: aproxy-format skill, troubleshooting.md |
+| 422 with `x-aproxy-error: format_rejected`, or 502 with `x-aproxy-error: format_failed` | The request transform failed; the request was not sent upstream and is not retried | `format_rejected` means the program replied with an `error` envelope; the reason after `rejected the request: ` is its own text. `format_failed` means the program itself failed; `details.kind` is `spawn` (check `command`), `died` (exited without output), `io` (pipe failure), `timeout` (raise `timeout_secs` or fix a stuck format) or `protocol` (extra stdout lines, invalid JSON, bad base64). A keepalive request already past the commit gets the same code as an SSE frame. Details: aproxy-format skill, troubleshooting.md |
 | A transformer is configured but responses come back untransformed | `response_transform` is not configured (it is separate from `request_transform`); or it failed and the original was passed through (log `响应转换失败，透传上游原始响应`); or the response was a bounded-retry pass-through, which is never transformed | Configure it, fix the format, or accept that pass-through failures stay raw |
 | Header changes from the response transform are missing on streaming requests | A skeleton head was already committed, because retries or the response transform itself outlasted one keepalive interval; after that only the body transform applies | Expected (behaviors.md, External transformers) |
 | Start fails with `forward_only 与外部转换器互斥：…` ("forward_only and external transformers are mutually exclusive") | Forward-only does not buffer bodies, transformers need them whole | Keep one of the two |
 | The user wants retries off and true incremental streaming | That is forward-only mode | `forward_only = true` in that instance's config.toml (or as a settings.json default), then `aproxy restart <port\|alias>`. Make sure the user accepts losing retries, buffering and heartbeats |
-| Forward-only instance: 502 `上游请求失败: …（仅转发模式不重试）`, or a stream cut off midway | Expected: forward-only never retries and never injects bytes the upstream did not send | Nothing to fix in aProxy; switch back to the default mode if retries are needed |
+| Forward-only instance: 502 with `x-aproxy-error: upstream_failed` (`details.last_code`), or a stream cut off midway | Expected: forward-only never retries and never injects bytes the upstream did not send | Nothing to fix in aProxy; switch back to the default mode if retries are needed |
 
 ## Logs and files
 

@@ -59,14 +59,19 @@ where
     }
 }
 
-/// 读取请求体错误：TooLarge=超出上限（413）；Io=连接中断/磁盘写入失败
+/// 读取请求体错误。三种原因各有各的终态码，归因不能混：客户端没发完不是本机的故障，
+/// 本机磁盘写不进去也不是客户端的问题。
 pub(super) enum ReadBodyError {
+    /// 超出上限（413）
     TooLarge,
-    Io(std::io::Error),
+    /// 客户端在上传途中断开或出错（400）
+    ClientAborted(std::io::Error),
+    /// 请求体写进磁盘缓存失败（507）
+    Storage(std::io::Error),
 }
 
 /// 读取请求体：内存缓冲，超 `RESIDENT_LIMIT` 且 disk_cache 可用则溢写磁盘。
-/// `limit` 超出返回 TooLarge；客户端中断或写盘失败返回 Io。
+/// `limit` 超出返回 TooLarge；客户端中断返回 ClientAborted，写盘失败返回 Storage。
 ///
 /// 溢写文件在交给 `RequestBody::Disk` 之前由 `SpoolPath` 持有：显式的出错分支
 /// 之外，客户端在上传途中断开时 hyper 会直接 drop 整个 handler future（本函数
@@ -85,7 +90,7 @@ pub(super) async fn read_request_body(
     loop {
         let chunk = match body.next().await {
             Some(Ok(c)) => c,
-            Some(Err(e)) => return Err(ReadBodyError::Io(std::io::Error::other(e))),
+            Some(Err(e)) => return Err(ReadBodyError::ClientAborted(std::io::Error::other(e))),
             None => break,
         };
         // 上限判定：磁盘模式下基于累计总量；内存模式基于 Vec 长度
@@ -97,8 +102,8 @@ pub(super) async fn read_request_body(
         match &mut disk {
             Some((file, _, len)) => {
                 if file.write_all(&chunk).await.is_err() {
-                    return Err(ReadBodyError::Io(std::io::Error::other(
-                        "请求体磁盘缓存写入失败",
+                    return Err(ReadBodyError::Storage(std::io::Error::other(
+                        "writing the request body to the disk cache failed",
                     )));
                 }
                 *len += chunk.len() as u64;
@@ -134,8 +139,8 @@ pub(super) async fn read_request_body(
             // 写完整后 flush 确保后续重试读到全量数据（flush 只推缓冲到 OS，
             // 不等待物理落盘——page cache 一致性由 OS 保证）
             if file.flush().await.is_err() {
-                return Err(ReadBodyError::Io(std::io::Error::other(
-                    "请求体磁盘缓存写入失败",
+                return Err(ReadBodyError::Storage(std::io::Error::other(
+                    "flushing the request body to the disk cache failed",
                 )));
             }
             drop(file);
@@ -191,23 +196,12 @@ impl Drop for RequestBody {
     }
 }
 
-/// 请求体上限的人类可读文案（0 = 不设限 → 「不设限」，否则「N MiB」）。
-/// 缓冲路径与仅转发路径的 413 共用，保证两条路径对用户说同一句话。
-pub(super) fn limit_text(body_limit: usize) -> String {
-    if body_limit == usize::MAX {
-        "不设限".to_string()
-    } else {
-        format!("{} MiB", body_limit / 1024 / 1024)
-    }
-}
-
-/// 请求体超限的 413 响应：判定、日志与文案收敛在一处，两条路径共用。
-pub(super) fn body_too_large_response(body_limit: usize) -> Response {
-    let limit_text = limit_text(body_limit);
-    tracing::warn!(limit = %limit_text, "请求体超出上限");
-    (
-        StatusCode::PAYLOAD_TOO_LARGE,
-        format!("请求体超出上限（{limit_text}），可在 settings.json 的 max_body_mb 或 config.toml 的 max_body_mb 调整"),
-    )
-        .into_response()
+/// 请求体超限的 413 终态：判定、日志与响应收敛在一处，缓冲路径与仅转发路径共用。
+pub(super) fn body_too_large_response(body_limit: usize, trace: &RequestTrace) -> Response {
+    tracing::warn!(
+        code = %"request_too_large",
+        limit_bytes = body_limit,
+        "请求体超出上限"
+    );
+    Terminal::request_too_large(body_limit).into_response(trace)
 }

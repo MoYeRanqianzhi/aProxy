@@ -80,7 +80,7 @@ What a failure costs differs by side, so know which side you are on:
 
 | Side | When the transform fails (error reply, crash, timeout, bad output) |
 |---|---|
-| Request | Nothing is sent upstream and the request is not retried. The client gets a 502 with the reason, or, on a streaming request that has already received heartbeat headers, a final SSE error event of type `proxy_transform_failed`. |
+| Request | Nothing is sent upstream and the request is not retried. The client gets `422` `format_rejected` when your program replied with `error`, or `502` `format_failed` when the process itself failed; on a streaming request that has already received heartbeat headers, the same error arrives as a final SSE frame. Match on `error.aproxy.code` or `x-aproxy-error`, not on `message` (aproxy-cli skill, behaviors.md, After the commit). |
 | Retry (request transform with `every_attempt`) | The request goes on: aProxy resends what it sent on the previous attempt and logs one warning per request. |
 | Response | aProxy replays the original upstream response unchanged and logs a warning. |
 
@@ -97,5 +97,5 @@ Check conversions with the test harness and one real request before relying on t
 | Exact envelope fields: direction, required, encoding, samples, security notes | [references/protocol.md](references/protocol.md) |
 | Loop templates, mode choice, testing, wiring it into aProxy | [references/guide.md](references/guide.md) |
 | Complete key-rotation, protocol-conversion and aggregation setups | [references/examples.md](references/examples.md) |
-| A 502 or log message that names the transformer | [references/troubleshooting.md](references/troubleshooting.md) |
+| A 422 or 502, or a log message, that names the transformer | [references/troubleshooting.md](references/troubleshooting.md) |
 | The test harness | [scripts/test_format.py](scripts/test_format.py) |

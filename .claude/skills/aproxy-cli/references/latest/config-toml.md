@@ -230,8 +230,9 @@ Limits on the connection to the upstream. A timeout counts as a network error an
 
 Regex patterns for requests that should stop retrying. When a matching request keeps getting
 failure responses (an error status, or `200` with an error body), aProxy stops after 3 attempts in
-total and passes the last upstream response to the client unchanged. Network errors are still
-retried without limit. Empty (the default) = off.
+total and passes the last upstream response to the client unchanged, adding only
+`x-aproxy-error: retry_exhausted` and `x-aproxy-request-id`. Network errors are still retried
+without limit. Empty (the default) = off.
 
 Use it when an upstream deterministically fails an endpoint the client depends on, so the client
 gets the real error instead of waiting forever. The typical case: Claude Code behind a relay or
@@ -259,10 +260,10 @@ bounded_retry_paths = [
 - An invalid regex fails start, and the error quotes the pattern.
 
 When the cap is reached, the log shows the warn line
-`受限重试路径达到尝试上限，透传最后一次上游响应` ("bounded-retry path reached its attempt cap; passing
-the last upstream response through"); look for it to confirm a pattern matches. If heartbeat headers
-had already been sent to the client, the request ends with an SSE `event: error` instead of the
-upstream status (behaviors.md, "Keepalive heartbeats").
+`受限重试路径达到尝试上限，不再重试` ("bounded-retry path reached its attempt cap; not retrying");
+look for it to confirm a pattern matches. If heartbeat headers had already been sent to the client,
+the request ends with the SSE error frame of code `retry_exhausted` instead of the upstream status
+(behaviors.md, After the commit).
 
 ### keepalive_interval_secs / keepalive_trigger / keepalive_heartbeat
 
@@ -307,9 +308,8 @@ retry, a non-SSE body no longer fits the response. Only the three lowercase valu
 
 ### max_body_mb
 
-The largest request body accepted, in MB. A larger body gets 413
-`请求体超出上限（…），可在 settings.json 的 max_body_mb 或 config.toml 的 max_body_mb 调整` ("request body
-exceeds the limit (…); adjust max_body_mb in settings.json or config.toml") and is not forwarded.
+The largest request body accepted, in MB. A larger body gets `413`
+`x-aproxy-error: request_too_large` (`details.limit_bytes`) and is not forwarded.
 `0` = no limit, which lets one request grow memory or disk use without bound. The default 128 covers
 long agent sessions with images; raise it only if you see that 413. Also enforced with
 `forward_only`.
@@ -317,20 +317,20 @@ long agent sessions with images; raise it only if you see that 413. Also enforce
 ### spool_limit_mb
 
 The largest upstream response aProxy buffers, in MB (default 256). A larger response is a
-deterministic failure and is not retried: the client gets 502
-`上游响应体超出 spool 上限，无法回放（重试无意义）` ("upstream response exceeds the spool limit; cannot
-replay (retrying is pointless)"), or an SSE `event: error` of type `proxy_spool_limit` if heartbeat
-headers were already sent. Raise it for instances that relay large files. `0` is treated as 1 MB,
-not as unlimited. No effect with `forward_only`.
+deterministic failure and is not retried: the client gets `502`
+`x-aproxy-error: response_too_large` (`details.limit_bytes`), or the same error as the SSE frame if
+heartbeat headers were already sent (behaviors.md, After the commit). Raise it for instances that
+relay large files. `0` is treated as 1 MB, not as unlimited. No effect with `forward_only`.
 
 ### disk_cache
 
 Whether request and response bodies larger than 1 MiB spill to temporary files under
 `<APROXY_HOME>/spool/<port>/` instead of staying in memory. On (the built-in default), memory per
 request stays flat whatever the body size; off, every body is held in RAM. Bodies under 1 MiB stay in
-memory either way, so leave it on unless disk writes are unwanted. When a disk write fails, the
-request ends with 502 `本地磁盘缓存写入失败，无法回放` ("local disk cache write failed; cannot replay"),
-or an SSE `event: error` if heartbeat headers were already sent, rather than falling back to memory.
+memory either way, so leave it on unless disk writes are unwanted. When a disk write or read fails,
+the request ends with `507` `x-aproxy-error: local_storage_failed` (`details.op` is
+`write_request`, `read_request` or `write_response`), or the same error as the SSE frame if
+heartbeat headers were already sent, rather than falling back to memory.
 No effect with `forward_only` (behaviors.md, "Disk cache (spool)").
 
 ### forward_only
@@ -379,8 +379,8 @@ is never forwarded, never gets a key injected and is never retried.
 - Entries match case-insensitively and ignore a trailing `/`; write them as the browser sends them,
   scheme and port included: `"http://localhost:5173"`.
 - Applies whatever `listen_addr` is.
-- Desktop or web clients such as Cherry Studio or Open WebUI send `Origin`; add theirs, which the
-  403 body quotes.
+- Desktop or web clients such as Cherry Studio or Open WebUI send `Origin`; add theirs, which
+  `details.origin` carries and the error message quotes.
 
 For both: an entry `"*"` turns that check off. An empty list means the built-in policy, not "allow
 all" or "deny all".
@@ -390,10 +390,10 @@ allowed_hosts   = ["host.docker.internal"]
 allowed_origins = ["http://localhost:5173"]
 ```
 
-403 bodies start with `aProxy 拒绝了该请求（403，未转发上游）` ("aProxy refused the request (403, not
-forwarded upstream)"), followed by `Host「…」不在允许列表内` ("Host … is not in the allowed list") or
-`来自浏览器页面的请求（Origin「…」）默认不放行` ("requests from browser pages (Origin …) are refused by
-default").
+A refused request returns `403` with `x-aproxy-error: inbound_host_rejected`
+(`details.host`) or `inbound_origin_rejected` (`details.origin`), and is logged as warn with
+`入站请求被拒绝…` ("inbound request rejected"); it is never forwarded, never gets a key injected and
+is never retried. The error body is the standard error JSON (behaviors.md, After the commit).
 
 ### log_file
 
@@ -448,10 +448,12 @@ response_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], 
   use absolute paths.
 - With the official binary, give the response side the same `extra` as the request side: it reads
   its config from `extra`, and without it every response transformation fails.
-- The two sides fail differently. A request-side failure returns 502 to the client, or an SSE
-  `event: error` of type `proxy_transform_failed` if heartbeat headers were already sent; the
-  request is not sent upstream and not retried. A response-side failure logs a warn and passes the
-  upstream response through untransformed.
+- The two sides fail differently. A request-side failure returns `422` `format_rejected` when the
+  program replied with `error`, or `502` `format_failed` when the program itself failed (spawn,
+  crash, pipe, timeout or protocol); the request is not sent upstream and not retried. If heartbeat
+  headers were already sent, the same error arrives as the SSE frame instead. A response-side
+  failure logs a warn and passes the upstream response through untransformed. `details` keys and
+  the full code table: behaviors.md, After the commit.
 - Choose `timeout_secs` by how long a stuck program may hold one request, not by client timeouts:
   keepalive requests keep receiving heartbeats while a transformation runs. With `0`, a program
   that hangs holds that request indefinitely and its worker is never replaced.
@@ -487,7 +489,7 @@ response_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], 
 - A table whose `command` is blank is ignored as if absent; a table without a `command` key fails
   to parse.
 
-Runtime behavior and the 502 texts: behaviors.md, "External transformers"; aproxy-format skill,
+Runtime behavior and the error codes: behaviors.md, "External transformers"; aproxy-format skill,
 troubleshooting.md.
 
 ## Checks at start

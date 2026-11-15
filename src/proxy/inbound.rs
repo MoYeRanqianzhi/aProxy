@@ -151,29 +151,18 @@ pub(super) fn inbound_rejection_response(
     rejection: InboundRejection,
     method: &http::Method,
     uri: &http::Uri,
+    trace: &RequestTrace,
 ) -> Response {
     let path = aproxy_ipc::redact::url(uri.path_and_query().map_or("/", |pq| pq.as_str()));
-    let body = match &rejection {
+    let terminal = match &rejection {
         InboundRejection::Host(host) => {
-            tracing::warn!(method = %method, path = %path, host = %host, "入站请求被拒绝：Host 不在 allowed_hosts 白名单（未转发上游）");
-            format!(
-                "aProxy 拒绝了该请求（403，未转发上游）：Host「{host}」不在允许列表内。\n\
-                 为防 DNS 重绑定，监听回环地址时默认只放行 localhost / 127.0.0.1 / [::1]。\n\
-                 若这是你信任的客户端，请把该主机名（不含端口）加入 config.toml 的 allowed_hosts\n\
-                 （或 settings.json 的 allowed_hosts 全局默认），例如 allowed_hosts = [\"主机名\"]；\n\
-                 写 allowed_hosts = [\"*\"] 可关闭 Host 校验。\n"
-            )
+            tracing::warn!(code = %"inbound_host_rejected", request_id = %trace.request_id, method = %method, path = %path, host = %host, "入站请求被拒绝：Host 不在 allowed_hosts 白名单（未转发上游）");
+            Terminal::inbound_host_rejected(host)
         }
         InboundRejection::Origin(origin) => {
-            tracing::warn!(method = %method, path = %path, origin = %origin, "入站请求被拒绝：Origin 不在 allowed_origins 白名单（未转发上游）");
-            format!(
-                "aProxy 拒绝了该请求（403，未转发上游）：来自浏览器页面的请求（Origin「{origin}」）默认不放行，\n\
-                 以防网页借本机代理调用上游、花费你的额度。\n\
-                 若这是你信任的浏览器/Electron 客户端，请把该 Origin 原样加入 config.toml 的 allowed_origins\n\
-                 （或 settings.json 的 allowed_origins 全局默认），例如 allowed_origins = [\"{origin}\"]；\n\
-                 写 allowed_origins = [\"*\"] 可关闭 Origin 校验。\n"
-            )
+            tracing::warn!(code = %"inbound_origin_rejected", request_id = %trace.request_id, method = %method, path = %path, origin = %origin, "入站请求被拒绝：Origin 不在 allowed_origins 白名单（未转发上游）");
+            Terminal::inbound_origin_rejected(origin)
         }
     };
-    (StatusCode::FORBIDDEN, body).into_response()
+    terminal.into_response(trace)
 }

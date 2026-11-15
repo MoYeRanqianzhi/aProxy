@@ -45,6 +45,10 @@
 //! - 入站来源校验（handler 第一步）：Host 不在 `allowed_hosts`、或带了不在
 //!   `allowed_origins` 里的 Origin 的请求本地 403——不转发、不注入 api_key、
 //!   不进重试循环（防 DNS 重绑定与网页跨站调用；语义见 `Config` 同名字段）
+//! - 错误出口（`errors` 模块）：aproxy 自己结束一个请求时，响应头还没写出就回 JSON 错误
+//!   响应，已经写出就写 SSE 的 `event: error`，两者是同一个 JSON；码取自
+//!   `aproxy_ipc::code`。每个请求有一个标识（`request_id`），在响应头、错误体、日志与
+//!   交给 format 的信封里相同
 //! - 头处理：`api_key` 快捷覆盖 `Authorization: Bearer` 与 `x-api-key`（Anthropic 风格），
 //!   `extra_headers` 追加缺失头，`override_headers` 无条件覆盖（兼容非 Bearer 鉴权与额外头需求）
 //! - 磁盘临时文件生命周期：请求体随请求结束（Drop）删除；响应 spool 在回放流

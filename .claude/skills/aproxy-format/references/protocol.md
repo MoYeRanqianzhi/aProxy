@@ -11,7 +11,8 @@ you implement a format program in any language or need to know exactly what a fi
   escape anything yourself. aProxy tolerates a trailing `\r` on your line (Windows text-mode
   output); a blank line or a BOM is a protocol error.
 - aProxy writes one envelope and waits for exactly one envelope back before it sends that worker
-  anything else. There is no request id: the Nth line out answers the Nth line in. Any other
+  anything else. A reply carries no framing id: the Nth line out answers the Nth line in. (The
+  `request_id` field below is data inside the envelope, not a tag on the line.) Any other
   output on stdout (a banner, a log line, a second line, pretty-printed JSON) breaks the pairing,
   so aProxy evicts the worker and fails the request (see troubleshooting.md).
 - Lines can be large. The whole request body travels in one line (up to the instance's
@@ -147,10 +148,12 @@ cooperate.
 - `stage` is `"request"`, `"retry"`, `"response"` or `"heartbeat"`. Treat any other value as a
   stage you do not handle and reply with the envelope unchanged: later aProxy versions may add
   stages.
-- `request_id` is the same string on both sides of one client request and differs between
-  requests. It counts the instance's requests from 1 and restarts when the instance restarts, so
-  it is unique only within one instance run. Use it to correlate your logs; it is not a secret and
-  carries no meaning beyond identity.
+- `request_id` is an opaque string, the same on both sides of one client request and different
+  between requests. It looks like `01a1e0eef745bd28-42`: 16 hex digits of an instance id, a
+  hyphen, and the request's sequence number in that instance; requests refused by the inbound
+  Host/Origin check end in `-x<n>`. It is the same string as the `x-aproxy-request-id` response
+  header and appears in every log line of the request as `request{request_id=<id>}:`. Use it to
+  correlate your logs; it is not a secret and carries no meaning beyond identity.
 - `state` is an opaque string aProxy keeps for the request without reading it. A request-side,
   retry or heartbeat reply that includes `state` sets it; every later stage receives the latest value. Omitting it, or replying with
   `null`, leaves the saved value unchanged. Typical use: the request side records which channel or
@@ -222,18 +225,18 @@ Reply `{"headers": {}, "error": "<reason>"}` to fail one request without failing
 running afterwards: a persistent worker that replies with `error` stays in the pool. The reason
 reaches the user:
 
-- Request side: the client receives HTTP 502 with the body
-  `请求转换失败: format 报告转换失败: <reason>（请求侧转换失败不重试，未发往上游）` ("request transform
-  failed: format reported a conversion failure: <reason> (not retried, not sent upstream)"), or
-  the same text in a `proxy_transform_failed` SSE error event if keepalive headers were already
-  sent (see When aProxy calls you).
+- Request side: the request fails with `422` `x-aproxy-error: format_rejected`, and the error
+  message is `format 'request_transform' rejected the request: <reason>`; `details` names `format`
+  and `stage`. If keepalive headers were already sent, the same error arrives as a final SSE
+  `event: error` frame instead (behaviors.md, After the commit).
 - Response side: the client receives the upstream response unchanged, and the daemon log records
   `响应转换失败，透传上游原始响应` ("response transform failed; passing the upstream response
   through") with the reason.
 
 aProxy never reads your exit code. What it sees is whether a line arrived: a process that exits or
-crashes without replying fails the request with `format 进程意外退出且无输出` ("format process exited
-unexpectedly without output"), and your reason is lost.
+crashes without replying fails the request with `502` `format_failed`, `details.kind` `died`, and
+the message `format 'request_transform' failed (died): format 进程意外退出且无输出` ("format process
+exited unexpectedly without output"); your reason is lost.
 
 ## When aProxy calls you
 
@@ -252,8 +255,9 @@ unexpectedly without output"), and your reason is lost.
   keepalive interval (default 15 s) passes without a result, including time spent in your request
   transform and, for SSE responses, your response transform. Once those headers are out, only your
   response `body` takes effect and header changes are ignored. A request-side failure after that
-  point reaches the client as a final SSE `event: error` instead of a 502; its `error.type` is
-  `proxy_transform_failed` and its `error.message` is the reason, starting with `请求转换失败: `.
+  point reaches the client as a final SSE `event: error` frame carrying the same error JSON that a
+  `422` `format_rejected` or a `502` `format_failed` response would have had, instead of an HTTP
+  status (behaviors.md, After the commit).
 
 ## Samples
 
@@ -263,7 +267,7 @@ Request side, in (shown wrapped; on the wire it is one line):
 {"url":"https://api.anthropic.com/v1/messages","method":"POST",
  "headers":{"anthropic-version":"2023-06-01","content-type":"application/json","x-api-key":"sk-client"},
  "body":"{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":100,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
- "worker_id":2,"extra":"/home/me/.aproxy/agg.toml","stage":"request","request_id":"42"}
+ "worker_id":2,"extra":"/home/me/.aproxy/agg.toml","stage":"request","request_id":"01a1e0eef745bd28-42"}
 ```
 
 Request side, out (moved to another endpoint with a channel key; body rewritten; the chosen channel
@@ -280,7 +284,7 @@ Response side, in (no `method`; `url` is the rewritten request URL):
  "headers":{"content-type":"application/json","x-request-id":"req_1"},
  "body":"{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"choices\":[...]}",
  "worker_id":0,"extra":"/home/me/.aproxy/agg.toml",
- "stage":"response","request_id":"42","state":"{\"channel\":\"relay\"}"}
+ "stage":"response","request_id":"01a1e0eef745bd28-42","state":"{\"channel\":\"relay\"}"}
 ```
 
 Failure, either side:

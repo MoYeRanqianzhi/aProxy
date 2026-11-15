@@ -12,7 +12,7 @@ client setup in clients.md, symptom lookup in troubleshooting.md.
 
 - [Request lifecycle](#request-lifecycle)
 - [Retry decisions](#retry-decisions) (backoff, bounded retry paths)
-- [Keepalive heartbeats](#keepalive-heartbeats) (which requests, commit point, compression, disconnects)
+- [Keepalive heartbeats](#keepalive-heartbeats) (which requests, commit point, error responses, compression, disconnects)
 - [Error detection in response bodies](#error-detection-in-response-bodies)
 - [Disk cache (spool)](#disk-cache-spool)
 - [Forward-only mode](#forward-only-mode)
@@ -28,15 +28,17 @@ client setup in clients.md, symptom lookup in troubleshooting.md.
 A client sets its API base URL to `http://127.0.0.1:<port>`. In the default mode every request goes
 through these steps:
 
-1. **Inbound check.** A request whose `Host` or `Origin` header is not allowed gets a local 403 and is
-   never forwarded or retried (config-toml.md, `allowed_hosts` / `allowed_origins`). CLI clients send
-   no `Origin` and use `127.0.0.1` or `localhost` as host, so they pass.
+1. **Inbound check.** A request whose `Host` or `Origin` header is not allowed gets a local `403`
+   (`x-aproxy-error: inbound_host_rejected` or `inbound_origin_rejected`) and is never forwarded or
+   retried (config-toml.md, `allowed_hosts` / `allowed_origins`). CLI clients send no `Origin` and
+   use `127.0.0.1` or `localhost` as host, so they pass.
 2. **Header rewrite.** `api_key` replaces both `Authorization` (as `Bearer <key>`) and `x-api-key`;
    `override_headers` replace headers; `extra_headers` are added only when the client did not send
    them. Hop-by-hop headers (`Connection`, `Upgrade`, `Transfer-Encoding`, `Host`, ...) are dropped, so
    WebSocket upgrades do not pass through. Method, path, query and all other headers are unchanged.
 3. **Body buffering.** The whole request body is read before anything goes upstream, so every retry
-   can replay it. A body over `max_body_mb` is not sent upstream and gets 413; aProxy first reads and
+   can replay it. A body over `max_body_mb` is not sent upstream and gets `413`
+   `x-aproxy-error: request_too_large`; aProxy first reads and
    discards the rest of the upload (for at most 10 s) so that the client can read the 413 instead of a
    reset connection.
 4. **Keepalive decision**, made on the request as the client sent it (see Keepalive heartbeats).
@@ -67,8 +69,8 @@ Forward-only mode replaces steps 3 to 8 with plain streaming; see Forward-only m
 | Status 400-599, every 4xx included | Retry |
 | Status 2xx/3xx whose body is a JSON object with a non-null `error` field or `"type": "error"` | Retry |
 | Streaming body in which any SSE `data:` payload or NDJSON line is such an error object | Retry |
-| Response larger than `spool_limit_mb` | Stop with 502 `上游响应体超出 spool 上限，无法回放（重试无意义）` ("upstream response exceeds the spool limit; cannot replay, retrying is pointless") |
-| Local disk write failed after the response spilled to disk | Stop with 502 `本地磁盘缓存写入失败，无法回放: …` ("local disk cache write failed; cannot replay") |
+| Response larger than `spool_limit_mb` | Stop with `502` `x-aproxy-error: response_too_large` (`details.limit_bytes`) |
+| Local disk write or read failed after the response spilled to disk | Stop with `507` `x-aproxy-error: local_storage_failed` (`details.op` names the step) |
 | A failure that came with a response, on a bounded retry path, from attempt 3 on | Pass that response through (see Bounded retry paths) |
 | Anything in forward-only mode | No retry (see Forward-only mode) |
 
@@ -81,7 +83,7 @@ retryable status, retrying") lines, each followed by `错误响应预览` ("erro
 upstream's own error body; fix the configuration, or bound the endpoint.
 
 When a request has to stop after a keepalive response was already committed, the client gets a
-terminal SSE error event instead of a 502 (see After the commit).
+terminal SSE error frame instead of an HTTP error response (see After the commit).
 
 ### Backoff
 
@@ -99,11 +101,13 @@ matters more than load on the upstream.
 - attempts 1 and 2 are retried as usual, with no delay;
 - from attempt 3, the first failure that came with a response is passed to the client unchanged
   (status, headers, body) and retrying stops, so a deterministic error comes back after about three
-  round trips;
+  round trips; the pass-through adds only `x-aproxy-error: retry_exhausted` and
+  `x-aproxy-request-id`, so it can be told apart from a normal response;
 - network errors are still retried without limit: they are transient and carry no response to pass on;
 - a passed-through failure never goes through the response transform;
 - if a keepalive response was already committed when the limit is hit, the client gets the terminal
-  event `upstream_error` instead, because the real status line can no longer be sent.
+  SSE frame with code `retry_exhausted` instead, because the real status line can no longer be sent.
+  Its `details` are `by = bounded_retry_paths` and `last_code`, the last attempt's failure code.
 
 The log says `受限重试路径达到尝试上限` ("bounded retry path reached its attempt limit"). Use bounded paths
 for endpoints a particular upstream never supports; troubleshooting.md has the Claude Code
@@ -155,16 +159,53 @@ retries still gets the upstream's real head.
   ("a non-SSE success body was replayed into a keepalive response already committed as
   text/event-stream"). For an upstream that answers `"stream": true` with NDJSON and often needs
   retries, set `keepalive_trigger = "accept"` on that instance.
-- A request that has to stop ends with one SSE event, `event: error` followed by
-  `data: {"type":"error","error":{"type":"<type>","message":"…"}}`:
+- A request that has to stop after the commit ends with one SSE frame: a line `event: error`, then
+  `data: <error JSON>` on one line, then a blank line. Before the commit the same JSON is the whole
+  response body, sent with `content-type: application/json` and the code's own status.
 
-| `error.type` | Cause |
-|---|---|
-| `upstream_error` | Bounded retry path exhausted |
-| `proxy_spool_limit` | Response exceeded `spool_limit_mb` |
-| `proxy_spool_failed` | Local disk write failed |
-| `proxy_decode_failed` | The upstream compressed the body despite `identity` (see Compression) and decoding failed |
-| `proxy_transform_failed` | The request transform failed after the skeleton head was committed |
+#### Error responses
+
+When aProxy itself ends a request, every response has this shape:
+
+```json
+{"type":"error","error":{"type":"aproxy_<code>","message":"<one English sentence>",
+ "aproxy":{"code":"<code>","request_id":"01a1e0eef745bd28-42","attempts":3,
+ "upstream_status":503,"details":{}}}}
+```
+
+- Two headers carry the same values: `x-aproxy-error: <code>` and `x-aproxy-request-id: <id>`. A
+  normally proxied response carries neither, so a response with `x-aproxy-error` is final: aProxy
+  has given up and will not retry it. A response passed through after a bounded retry path ran out
+  keeps the upstream's status and body byte for byte and gains only these two headers.
+- Match on `error.aproxy.code` or on `x-aproxy-error`, never on `message`, which is a human sentence
+  and not a contract. `attempts` counts the upstream attempts made, `upstream_status` appears only
+  when there was an upstream response, and `details` holds the keys in the table.
+- `request_id` is opaque: it looks like `01a1e0eef745bd28-42`, 16 hex digits of an instance id, a
+  hyphen, and the request's sequence number in that instance. Requests refused by the inbound
+  Host/Origin check end in `-x<n>` instead. It is the same string in the header, in the body, in the
+  envelope's `request_id` given to format programs, and in every log line of the request, prefixed
+  `request{request_id=<id>}:`.
+
+| `code` | Status | When | `details` |
+|---|---|---|---|
+| `inbound_host_rejected` | 403 | `Host` is not allowed | `host` |
+| `inbound_origin_rejected` | 403 | `Origin` is not allowed | `origin` |
+| `request_too_large` | 413 | The request body exceeds `max_body_mb` | `limit_bytes` |
+| `client_body_aborted` | 400 | The client stopped sending its request body | none |
+| `local_storage_failed` | 507 | A spool file could not be written or read | `op` = `write_request`, `read_request` or `write_response` |
+| `response_too_large` | 502 | The upstream response exceeds `spool_limit_mb` | `limit_bytes` |
+| `retry_exhausted` | the upstream's, else 502 | A bounded retry path used its attempts up | `by` = `bounded_retry_paths`, `last_code` |
+| `format_rejected` | 422 | The request-side format replied with `error` | `format`, `stage` |
+| `format_failed` | 502 | The request-side format itself failed | `format`, `stage`, `kind` = `spawn`, `died`, `io`, `timeout` or `protocol` |
+| `upstream_failed` | 502 | Forward-only mode: the single upstream attempt failed | `last_code` |
+| `decode_failed` | SSE frame only | The upstream compressed the body despite `identity` and decoding failed | `encoding` |
+| `upgrade_unsupported` | 501 | A WebSocket upgrade request; it is refused on the spot, not forwarded or retried. Other upgrades such as `h2c` are ignored and proxied normally | `upgrade` |
+| `internal` | 500 | A defect in aProxy | none |
+
+Why one upstream attempt failed is a separate set of codes, shown as `last_code` and in logs:
+`upstream_connect_failed`, `upstream_connect_timeout`, `upstream_first_byte_timeout`,
+`upstream_read_idle_timeout`, `upstream_body_interrupted`, `upstream_status` and
+`upstream_error_body`.
 
 ### Compression
 
@@ -210,8 +251,8 @@ memory.
   disconnects. Files left by a crash are deleted the next time an instance starts on that port; after
   a clean exit the directory is empty.
 - If the file cannot be created when a body crosses 1 MiB, buffering continues in memory. If a write
-  fails after the body is already on disk (disk full), the request stops with the 502 or
-  `proxy_spool_failed` above and is not retried.
+  or read after the body is already on disk fails (disk full, permissions), the request stops with
+  `507` `local_storage_failed` (`details.op` names the step) and is not retried.
 - With `disk_cache = false` everything stays in memory; for payloads under 1 MiB both modes behave
   the same.
 
@@ -226,8 +267,9 @@ for. Startup logs a warning beginning `仅转发模式已启用` ("forward-only 
   streams; over the limit the upstream request is aborted and the client gets 413.
 - The request body streams upstream chunked. The response streams back with the upstream's status and
   headers; `content-length` is kept unless the upstream used `transfer-encoding`.
-- Upstream request fails: 502 `上游请求失败: …（仅转发模式不重试）` ("upstream request failed; forward-only
-  mode does not retry"), recorded as the latest error in `aproxy status`.
+- Upstream request fails: `502` `upstream_failed`; its message ends `(this request is not retried)`,
+  and `details.last_code` says why the attempt failed. It is recorded as the latest error in
+  `aproxy status` as `<code>: <English message>`.
 - Response stream breaks: the client connection is cut at that point, and aProxy never injects bytes
   the upstream did not send. Log: `上游响应流中断，连接就此截断（仅转发模式不重试）` ("upstream response
   stream broke; connection truncated").
@@ -256,12 +298,15 @@ response: attempt judged successful -> response transform -> replay
   (see Compression).
 - **One transform per request.** Every retry replays the same transformed request. A format that
   rotates keys therefore switches keys between requests, never between retries of one request.
-- **Request-side failure** (the process failed to start, crashed, timed out, reported an error, or broke
-  the envelope protocol): the request is neither sent upstream nor retried. The client gets 502
-  `请求转换失败: <reason>（请求侧转换失败不重试，未发往上游）` ("request transform failed; not retried, not
-  sent upstream"), or the terminal event `proxy_transform_failed` if a keepalive response was already
-  committed, and the reason becomes the latest error in `aproxy status`. The aproxy-format skill's
-  troubleshooting.md maps each reason.
+- **Request-side failure.** The request is neither sent upstream nor retried, and if a keepalive
+  response was already committed the client gets the error as a terminal SSE frame instead of a
+  status (behaviors.md, After the commit). A format that replies with an `error` envelope produces
+  `422` `format_rejected`, with `details.format` and `details.stage` and the message
+  `format 'request_transform' rejected the request: <reason>`. A format that fails on its own —
+  spawn failure, crash without output, pipe error, timeout, protocol violation — produces `502`
+  `format_failed`, with `details.kind` naming the kind and the message
+  `format 'request_transform' failed (<kind>): <detail>`. The reason becomes the latest error in
+  `aproxy status`. The aproxy-format skill's troubleshooting.md maps each reason.
 - **Response-side failure**: the original upstream response is replayed unchanged and the log warns
   `响应转换失败，透传上游原始响应` ("response transform failed; passing the original upstream response
   through"). The response is already in hand, so availability wins.
@@ -364,6 +409,9 @@ minutes after its last instance stops.
   request path) is masked: userinfo becomes `***@`, query values become `***` with keys kept
   (`?beta=true` shows as `?beta=***`), and a fragment becomes `***`. `aproxy status` follows the same
   rules, so both can be shared as they are. `bounded_retry_paths` still matches the real query string.
+- Each failed attempt that is retried logs `本次尝试失败，重试` ("this attempt failed; retrying") with
+  `attempt`, `code`, `details` and `reason`. Decision lines such as `上游返回可重试状态码，重试` carry a
+  `code` field too.
 - Each failed attempt logs `错误响应预览` ("error response preview") with `content_type`,
   `content_encoding` and the body, decoded first when compressed. A preview of the form
   `（二进制/压缩内容，共 N 字节，hex 前 48: …）` ("binary/compressed content, N bytes, first 48 bytes in hex")

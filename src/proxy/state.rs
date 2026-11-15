@@ -30,6 +30,12 @@ pub struct AppState {
     /// 入站来源校验策略（源 `config.allowed_hosts` / `allowed_origins` 与监听
     /// 地址）：启动时归一一次，热路径只做小集合比较。
     pub(super) inbound: Arc<InboundPolicy>,
+    /// 实例标识：16 位十六进制，由启动时刻毫秒的低 48 位与 pid 的低 16 位拼成，实例重启后
+    /// 不同。它是请求标识的前半段
+    pub instance_id: Arc<str>,
+    /// 入站校验拒掉的请求的序号。这些请求不计入请求数（见 handler），所以另用一个序号给
+    /// 它们的错误响应编标识
+    pub(super) rejected_seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AppState {
@@ -126,7 +132,17 @@ impl AppState {
             .as_ref()
             .map(|t| Arc::new(crate::transform::TransformPool::new(Arc::new(t.clone()))));
         let inbound = Arc::new(InboundPolicy::from_config(&config));
+        let started_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let instance_id = format!(
+            "{:016x}",
+            ((started_ms & 0xffff_ffff_ffff) << 16) | u64::from(std::process::id() & 0xffff)
+        );
         Self {
+            instance_id: instance_id.into(),
+            rejected_seq: Arc::default(),
             spool_dir,
             config: Arc::new(config),
             client,
@@ -150,6 +166,21 @@ impl AppState {
         self.bounded_retry_patterns
             .iter()
             .any(|re| re.is_match(path_and_query))
+    }
+
+    /// 实例内第 `seq` 个请求的标识：`<instance_id>-<seq>`。HTTP 头、错误体、日志与交给 format
+    /// 的信封里都是这同一个串；对外是不透明的
+    pub(super) fn request_id(&self, seq: u64) -> String {
+        format!("{}-{seq}", self.instance_id)
+    }
+
+    /// 入站校验拒掉的请求的标识：`<instance_id>-x<序号>`。与正常请求的标识不会相同
+    pub(super) fn rejected_request_id(&self) -> String {
+        let seq = self
+            .rejected_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        format!("{}-x{seq}", self.instance_id)
     }
 
     /// 记录一次上游失败摘要（覆盖式，只保留最近一次；IPC/status 展示用）

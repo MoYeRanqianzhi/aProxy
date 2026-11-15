@@ -97,7 +97,7 @@ CLI 定义（cli.rs）、动作本身（ops/）与子命令的渲染（commands/
 
 生命周期保证：临时文件在请求结束（Drop）、回放流 EOF、重试丢弃三路删除；
 实例启动时清空本端口目录回收崩溃残留。磁盘写失败按 `SpoolFailed` 终态处理
-（502 / SSE error 事件），绝不退化成内存堆积。`disk_cache = false`（settings
+（507 `local_storage_failed` / SSE error 事件），绝不退化成内存堆积。`disk_cache = false`（settings
 全局默认或 toml 覆盖）关闭时回到纯内存行为。`forward_only` 模式下请求体与响应
 均**不缓冲**，本节整节不适用——见「仅转发模式（forward_only）」。
 
@@ -179,8 +179,8 @@ JSON 对象顶层 `"stream": true`，磁盘溢写的大请求体同样只看顶�
 外部转换器同样在这个节拍内：请求转换在保活通道的后台任务里、首轮之前进行，
 响应转换与「上游无视 identity 的压缩体」的回放前解码也经同一个 select 驱动。
 format 慢（`timeout_secs = 0` 时没有上界）时客户端照样在一个间隔后收到骨架头
-与心跳；请求转换在提交之后才失败时以终态 error 事件（`proxy_transform_failed`）
-收场。唯一例外是「尚未提交 + 上游回 2xx 非 SSE」时的响应转换——与上面的暂停
+与心跳；请求转换在提交之后才失败时以终态 error 事件（`format_rejected` 或
+`format_failed`）收场。唯一例外是「尚未提交 + 上游回 2xx 非 SSE」时的响应转换——与上面的暂停
 同理，此时提交骨架会把非 SSE 的响应改坏，只能直接等转换完成。
 
 取舍：
@@ -193,8 +193,9 @@ format 慢（`timeout_secs = 0` 时没有上界）时客户端照样在一个间
   的请求不改写。
 - **提交后失去状态码自由**：状态行与响应头一旦提交就改不了，所以**已提交后**的
   终态失败（`spool_limit_mb` 超限、spool 写盘失败、压缩体解码失败、受限重试路径
-  达上限）只能以 SSE `event: error` 事件收场，不能再回 502/真实状态码；尚未提交
-  时它们与不保活路径一致（502 / 原样透传）。已提交后才拿到非 SSE 的成功体同样
+  达上限）只能以 SSE `event: error` 事件收场，不能再回错误状态码/真实状态码；尚未提交
+  时它们与不保活路径一致（JSON 错误响应 / 原样透传）。事件的 data 与错误响应的体是
+  同一个 JSON，见「数据面的错误出口」。已提交后才拿到非 SSE 的成功体同样
   撤不回：照常回放并 warn，建议该实例设 `keepalive_trigger = "accept"`。
 - **非 SSE 流的暂停窗口**：上游先回 2xx 非 SSE 头、再迟迟不发体时，那次尝试期间
   客户端收不到任何字节（最长约 `read_timeout_secs`）——非 SSE 的流本就没有可用
@@ -220,7 +221,39 @@ format 慢（`timeout_secs = 0` 时没有上界）时客户端照样在一个间
 重试到天荒地老也不可能成功，只会让客户端永远等不到终态。
 保活适用的请求同样如此：达上限时响应头尚未提交（常态——失败都很快）就原样
 透传；只有响应头已被保活节拍以骨架提交的，才因无法再透传真实状态码而改以终态
-SSE `event: error` 事件收场。
+SSE `event: error` 事件收场。透传的响应状态码与体保真，只多 `x-aproxy-error:
+retry_exhausted` 与 `x-aproxy-request-id` 两个头。
+
+## 数据面的错误出口
+
+aproxy 自己结束一个请求时说的话只在 `src/proxy/errors.rs` 构造，码取自码表
+（`aproxy_ipc::code`，全表见 [error-codes.md](error-codes.md)）：
+
+- **错误响应**（响应头还没写出）：`content-type: application/json`，体是
+  `{"type":"error","error":{"type":"aproxy_<码>","message":…,"aproxy":{…}}}`。
+  `error.aproxy` 给程序读：`code`、`request_id`、`attempts`（已进行的上游尝试数）、
+  `upstream_status`（有上游响应时）、`details`（键与类型由码表登记）。`message`
+  是一句英文，不是契约。状态码取码表登记的值。
+- **SSE 终态事件**（响应头已提交）：`event: error`，data 是压成一行的同一个 JSON。
+  源码里只有 `Terminal::sse_event` 一处构造它。
+- **两个头**：`x-aproxy-request-id` 与 `x-aproxy-error`。自产的错误响应带；放弃重试
+  之后原样透传的上游响应也带（体与状态码保真）；正常透传的响应不带——带
+  `x-aproxy-error` 的响应就是 aproxy 已经放弃、不会再重试的最终结果。
+- **请求标识** `request_id` = `<instance_id>-<序号>`：`instance_id` 是 16 位十六进制
+  （启动时刻毫秒的低 48 位与 pid 的低 16 位），序号是实例内第几个请求。响应头、错误
+  体、交给 format 的信封里是同一个串；这个请求的每一行日志都挂在带
+  `request_id=` 的 span 下（保活通道的后台任务也是）。入站校验拒掉的请求不计入
+  请求数，标识用单独的序号（`<instance_id>-x<n>`）。
+- **尝试失败码**：每次上游尝试没成功都归成一个码（`AttemptFailure`）——连不上、
+  连接超时、等不到响应头、读空闲超时、连接中途断开、上游回 4xx/5xx、2xx 但体是
+  错误——进日志（`code=`）与实例的「最近错误」，也是终态里 `last_code` 的来源。
+
+现在能触发的终态：`inbound_host_rejected`、`inbound_origin_rejected`（403）、
+`request_too_large`（413）、`client_body_aborted`（400）、`upgrade_unsupported`
+（501，只拦 WebSocket 升级）、`local_storage_failed`（507）、`response_too_large`
+（502）、`retry_exhausted`（透传）、`format_rejected`（422，请求侧 format 用 error 行
+拒绝）、`format_failed`（502，format 程序本身的故障）、`upstream_failed`（502，仅转发
+模式）、`decode_failed`（只作 SSE 事件）、`internal`（500）。
 
 `forward_only` 模式整体旁路本节：不缓冲完整请求体、不进重试循环、不发心跳——
 见下一节。
@@ -259,7 +292,7 @@ magic number，连「这是压缩体」都认不出；2026-09-14 的 Cloudflare 
 - **响应**：`resp.bytes_stream()` 直回客户端，状态码与响应头原样透传；
   hop-by-hop 照旧过滤，但 **`content-length` 必须保留**（字节未经变换，
   上游声明仍精确）。
-- **上游请求失败**：502 + 原因，不重试，并调 `state.note_upstream_failure`
+- **上游请求失败**：502 `upstream_failed`（`details.last_code` 是那次尝试的失败码），不重试，并调 `state.note_upstream_failure`
   记录——否则 status 的「最近错误」对这类实例永久显示「无」。
 - **响应流中途中断**：**直接截断**，不注入任何上游未发出的字节；
   `tracing::warn!` 记录错误与已转发字节数，并调 `note_upstream_failure`。

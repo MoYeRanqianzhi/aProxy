@@ -26,15 +26,19 @@ pub(super) struct UpstreamResponse {
 pub(super) enum Outcome {
     /// 可以交付：成功的上游响应
     Deliver(UpstreamResponse),
-    /// 需要重试。`note` 记进实例的「最近错误」（status 与界面里看得到）
-    Retry { note: String },
+    /// 需要重试。`failure` 是这次没成功的原因，记进实例的「最近错误」（status 与界面里
+    /// 看得到）
+    Retry { failure: AttemptFailure },
     /// 受限重试路径用完了尝试次数：不再重试，交付这次失败的响应——客户端拿到真实的
     /// 404 自行处理，好过永远等不到终态（compact 事故，见记忆 bounded-retry-paths）
-    Exhausted(UpstreamResponse),
+    Exhausted {
+        response: UpstreamResponse,
+        failure: AttemptFailure,
+    },
     /// 上游响应体超出 spool 上限：确定性失败，重试无意义
     TooLarge,
-    /// 本地磁盘缓存写入失败：确定性失败
-    SpoolFailed(String),
+    /// 本地磁盘缓存读写失败：确定性失败。带着出问题的是哪一步与原因
+    SpoolFailed(StorageOp, String),
 }
 
 /// 判定一次尝试的结果。只看结果本身、第几次尝试与是否命中受限重试路径，不碰任何状态，
@@ -44,11 +48,9 @@ pub(super) enum Outcome {
 /// 没有响应可供交付。
 pub(super) fn classify(attempt: u32, result: ForwardResult, bounded_retry: bool) -> Outcome {
     match result {
-        ForwardResult::NetworkError(e) => Outcome::Retry {
-            note: format!("网络错误: {e}"),
-        },
+        ForwardResult::NetworkError(failure) => Outcome::Retry { failure },
         ForwardResult::TooLarge => Outcome::TooLarge,
-        ForwardResult::SpoolFailed(e) => Outcome::SpoolFailed(e),
+        ForwardResult::SpoolFailed(op, e) => Outcome::SpoolFailed(op, e),
         ForwardResult::Response {
             status,
             headers,
@@ -64,14 +66,14 @@ pub(super) fn classify(attempt: u32, result: ForwardResult, bounded_retry: bool)
                 body,
             };
             if !failed {
-                Outcome::Deliver(response)
-            } else if bounded_retry && attempt >= retry::BOUNDED_RETRY_MAX_ATTEMPTS {
-                Outcome::Exhausted(response)
+                return Outcome::Deliver(response);
+            }
+            let failure = AttemptFailure::response(status);
+            if bounded_retry && attempt >= retry::BOUNDED_RETRY_MAX_ATTEMPTS {
+                Outcome::Exhausted { response, failure }
             } else {
                 // 进入下一轮时 body 随 response 一起 Drop：磁盘临时文件删除
-                Outcome::Retry {
-                    note: format!("上游返回 {status}（错误内容，重试）"),
-                }
+                Outcome::Retry { failure }
             }
         }
     }
@@ -217,13 +219,13 @@ impl Responder {
         }
     }
 
-    /// 终态：尚未提交 → 完整响应；已提交 → SSE 终态 error 事件（状态行已发出、不可再改，
-    /// 客户端借此明确知道代理放弃了这条请求，而不是永远等下去）
-    async fn finish(&mut self, response: impl FnOnce() -> Response, event: Bytes) {
+    /// 终态：尚未提交 → JSON 错误响应；已提交 → SSE 终态 error 事件（状态行已发出、不可
+    /// 再改，客户端借此明确知道代理放弃了这条请求，而不是永远等下去）。两者是同一个 JSON
+    async fn finish(&mut self, terminal: Terminal, trace: &RequestTrace) {
         if self.is_committed() {
-            self.send(Ok(event)).await;
+            self.send(Ok(terminal.sse_event(trace))).await;
         } else {
-            self.respond(response());
+            self.respond(terminal.into_response(trace));
         }
     }
 
@@ -233,25 +235,26 @@ impl Responder {
         }
     }
 
-    /// 不保活出口交出的响应。每条出口路径都会设上；万一漏了，给客户端一个明确的 502，
+    /// 不保活出口交出的响应。每条出口路径都会设上；万一漏了，给客户端一个明确的 500，
     /// 而不是让连接悬空
-    pub(super) fn into_response(self) -> Response {
+    pub(super) fn into_response(self, trace: &RequestTrace) -> Response {
         match self {
             Self::Buffered { out: Some(resp) } => resp,
             _ => {
-                tracing::error!("尝试循环没有交出响应");
-                (
-                    StatusCode::BAD_GATEWAY,
-                    "aProxy 内部错误：尝试循环没有交出响应",
-                )
-                    .into_response()
+                tracing::error!(code = %"internal", "尝试循环没有交出响应");
+                Terminal::internal("the attempt loop ended without a response").into_response(trace)
             }
         }
     }
 }
 
+/// 受限重试路径用尽时，`retry_exhausted` 的 `details.by` 的取值：给出尝试次数上限的是
+/// `bounded_retry_paths` 这项配置。
+const BOUNDED_RETRY_BY: &str = "bounded_retry_paths";
+
 /// 一个请求的全部尝试：请求转换 → 逐次发往上游并判定 → 按出口收场。返回时结果已交给
-/// `r`（不保活出口取 [`Responder::into_response`]），或客户端已断开。
+/// `r`（不保活出口取 [`Responder::into_response`]），或客户端已断开。`trace` 是这个请求的
+/// 标识与尝试计数，终态的错误体要带。
 ///
 /// 请求转换也经 `r.wait` 驱动：保活出口里它同样处在心跳节拍内——format 慢（timeout_secs = 0
 /// 时没有上界）时客户端照样在一个间隔后收到骨架头与心跳，而不是在拿到任何字节之前干等。
@@ -262,6 +265,7 @@ pub(super) async fn run_attempts(
     max_spool_bytes: usize,
     bounded_retry: bool,
     r: &mut Responder,
+    mut trace: RequestTrace,
 ) {
     let mut req = match r
         .wait(apply_request_transform(state, req), None, "请求转换")
@@ -269,10 +273,8 @@ pub(super) async fn run_attempts(
     {
         None => return,
         Some(Ok(req)) => req,
-        Some(Err(msg)) => {
-            let event = terminal_error_event("proxy_transform_failed", &msg);
-            r.finish(|| request_transform_failed_response(&msg), event)
-                .await;
+        Some(Err(terminal)) => {
+            r.finish(terminal, &trace).await;
             return;
         }
     };
@@ -326,6 +328,7 @@ pub(super) async fn run_attempts(
         }
 
         let (head_tx, head_rx) = r.head_channel();
+        trace.attempts = attempt;
         let attempt_fut = forward_once(
             state,
             &req.method,
@@ -343,60 +346,62 @@ pub(super) async fn run_attempts(
         }
 
         match classify(attempt, result, bounded_retry) {
-            Outcome::Retry { note } => {
-                state.note_upstream_failure(&note);
-                tracing::warn!(attempt, reason = %note, "本次尝试失败，重试");
+            Outcome::Retry { failure } => {
+                state.note_upstream_failure(&failure.summary());
+                tracing::warn!(
+                    attempt,
+                    code = %failure.code,
+                    details = %serde_json::Value::Object(failure.details.clone()),
+                    reason = %failure.message,
+                    "本次尝试失败，重试"
+                );
                 // 需要重试时不在这里提交——保活出口的提交只由节拍与可提交的上游响应头推动，
                 // 下一轮尝试很快成功时客户端仍拿到上游真实头
             }
             Outcome::Deliver(response) => {
-                deliver(state, r, &req, attempt, response, max_spool_bytes).await;
+                deliver(state, r, &req, &trace, response, max_spool_bytes).await;
                 return;
             }
-            Outcome::Exhausted(response) => {
+            Outcome::Exhausted { response, failure } => {
                 let status = response.status;
-                tracing::warn!(attempt, status = %status, "受限重试路径达到尝试上限，不再重试");
+                let terminal = Terminal::retry_exhausted(BOUNDED_RETRY_BY, attempt, &failure);
+                state.note_upstream_failure(&terminal.summary());
+                tracing::warn!(attempt, code = %terminal.code(), last_code = failure.code, status = %status, "受限重试路径达到尝试上限，不再重试");
                 if !r.is_committed() {
-                    // 尚未向客户端写出任何字节：原样交付最后一次失败响应
-                    state.note_upstream_failure(&format!(
-                        "上游返回 {status}（受限重试路径，达上限透传）"
-                    ));
+                    // 尚未向客户端写出任何字节：原样交付最后一次失败响应（状态码与体保真），
+                    // 只加两个头，让调用方分得清「aproxy 已经放弃」与上游的普通回应
                     let UpstreamResponse {
                         status,
                         headers,
                         raw_headers,
                         body,
                     } = response;
-                    r.respond(replay_failure_as_is(status, headers, &raw_headers, body).await);
+                    let mut resp = replay_failure_as_is(status, headers, &raw_headers, body).await;
+                    mark_given_up(resp.headers_mut(), terminal.code(), &trace);
+                    r.respond(resp);
                 } else {
                     // 已提交：状态行已发出，真实 status 与头无法交付，以终态 error 事件收场
-                    state.note_upstream_failure(&format!(
-                        "上游返回 {status}（受限重试路径，达上限终止）"
-                    ));
                     drop(response);
-                    let event = Bytes::from(format!(
-                        "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"upstream_error\",\"message\":\"upstream returned {status}; bounded retry path exhausted after {attempt} attempts\"}}}}\n\n"
-                    ));
-                    r.send(Ok(event)).await;
+                    r.send(Ok(terminal.sse_event(&trace))).await;
                 }
                 return;
             }
             Outcome::TooLarge => {
-                state.note_upstream_failure("上游响应体超出 spool 上限");
-                tracing::error!(attempt, "上游响应体超出 spool 上限，终止重试");
-                let event = Bytes::from_static(
-                    b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"proxy_spool_limit\",\"message\":\"upstream response exceeded proxy spool limit\"}}\n\n",
+                let terminal = Terminal::response_too_large(max_spool_bytes);
+                state.note_upstream_failure(&terminal.summary());
+                tracing::error!(
+                    attempt,
+                    code = %terminal.code(),
+                    "上游响应体超出 spool 上限，终止重试"
                 );
-                r.finish(too_large_response, event).await;
+                r.finish(terminal, &trace).await;
                 return;
             }
-            Outcome::SpoolFailed(e) => {
-                state.note_upstream_failure(&format!("本地 spool 故障: {e}"));
-                tracing::error!(attempt, error = %e, "本地 spool 故障，终止重试");
-                let event = Bytes::from_static(
-                    b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"proxy_spool_failed\",\"message\":\"local disk cache write failed\"}}\n\n",
-                );
-                r.finish(|| spool_failed_response(&e), event).await;
+            Outcome::SpoolFailed(op, e) => {
+                let terminal = Terminal::local_storage_failed(op, &e);
+                state.note_upstream_failure(&terminal.summary());
+                tracing::error!(attempt, code = %terminal.code(), error = %e, "本地 spool 故障，终止重试");
+                r.finish(terminal, &trace).await;
                 return;
             }
         }
@@ -414,10 +419,11 @@ async fn deliver(
     state: &AppState,
     r: &mut Responder,
     req: &OutboundRequest,
-    attempt: u32,
+    trace: &RequestTrace,
     response: UpstreamResponse,
     max_spool_bytes: usize,
 ) {
+    let attempt = trace.attempts;
     let UpstreamResponse {
         status,
         headers,
@@ -482,19 +488,16 @@ async fn deliver(
                     decoded
                 }
                 Err(e) => {
-                    state.note_upstream_failure(&format!(
-                        "回放前解码上游压缩响应失败（{encoding}）: {e}"
-                    ));
+                    let terminal = Terminal::decode_failed(&encoding);
+                    state.note_upstream_failure(&terminal.summary());
                     tracing::warn!(
                         attempt,
+                        code = %terminal.code(),
                         encoding = %encoding,
                         error = %e,
                         "已提交的响应无法回放上游压缩体且解码失败，以终态 error 事件收场（保活通道）"
                     );
-                    let event = Bytes::from_static(
-                        b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"proxy_decode_failed\",\"message\":\"upstream response used a content-encoding the committed stream cannot carry, and decoding it failed\"}}\n\n",
-                    );
-                    r.send(Ok(event)).await;
+                    r.send(Ok(terminal.sse_event(trace))).await;
                     return;
                 }
             }
@@ -543,7 +546,11 @@ mod tests {
     #[test]
     fn error_status_and_error_content_are_retried() {
         let out = classify(1, response(503, "overloaded"), false);
-        assert!(matches!(out, Outcome::Retry { ref note } if note.contains("503")));
+        assert!(matches!(
+            out,
+            Outcome::Retry { ref failure }
+                if failure.code == "upstream_status" && failure.status == Some(503)
+        ));
         // 200 但内容是错误：同样重试
         let out = classify(
             1,
@@ -553,7 +560,12 @@ mod tests {
             ),
             false,
         );
-        assert!(matches!(out, Outcome::Retry { .. }));
+        // 状态码是成功的，失败在体里：记的是另一个码
+        assert!(matches!(
+            out,
+            Outcome::Retry { ref failure }
+                if failure.code == "upstream_error_body" && failure.status == Some(200)
+        ));
     }
 
     #[test]
@@ -561,11 +573,18 @@ mod tests {
         for attempt in [1, retry::BOUNDED_RETRY_MAX_ATTEMPTS, 100] {
             let out = classify(
                 attempt,
-                ForwardResult::NetworkError("connection refused".into()),
+                ForwardResult::NetworkError(AttemptFailure::connect_failed(
+                    "connection refused".into(),
+                )),
                 true,
             );
             assert!(
-                matches!(out, Outcome::Retry { ref note } if note.contains("connection refused")),
+                matches!(
+                    out,
+                    Outcome::Retry { ref failure }
+                        if failure.code == "upstream_connect_failed"
+                            && failure.message.contains("connection refused")
+                ),
                 "第 {attempt} 次"
             );
         }
@@ -579,7 +598,11 @@ mod tests {
             assert!(matches!(out, Outcome::Retry { .. }), "第 {attempt} 次");
         }
         let out = classify(max, response(404, "not found"), true);
-        assert!(matches!(out, Outcome::Exhausted(r) if r.status == 404));
+        assert!(matches!(
+            out,
+            Outcome::Exhausted { response, failure }
+                if response.status == 404 && failure.status == Some(404)
+        ));
         // 不受限的路径不封顶
         let out = classify(max + 10, response(404, "not found"), false);
         assert!(matches!(out, Outcome::Retry { .. }));
@@ -592,8 +615,12 @@ mod tests {
             Outcome::TooLarge
         ));
         assert!(matches!(
-            classify(1, ForwardResult::SpoolFailed("disk full".into()), false),
-            Outcome::SpoolFailed(e) if e == "disk full"
+            classify(
+                1,
+                ForwardResult::SpoolFailed(StorageOp::WriteResponse, "disk full".into()),
+                false
+            ),
+            Outcome::SpoolFailed(StorageOp::WriteResponse, e) if e == "disk full"
         ));
     }
 }

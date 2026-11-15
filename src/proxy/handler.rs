@@ -1,6 +1,7 @@
 //! 入口：路由与请求处理的分派（入站校验 → 计数 → 仅转发分叉 → 读请求体 → 选通道）。
 
 use super::*;
+use tracing::Instrument as _;
 
 /// 构建路由：全量透传（无额外健康检查路径，避免与上游 `/health` 等冲突）
 pub fn router(state: AppState) -> Router {
@@ -16,21 +17,53 @@ pub(super) async fn proxy_handler(State(state): State<AppState>, req: Request) -
     // 任何字节）、先于 apply_header_overrides（绝不给它注入 api_key）、先于
     // 仅转发分支与重试循环（绝不转发）。也先于活动时间戳与请求计数：被拒的
     // 请求不是代理流量，不应让探测者把实例「刷」成活跃、也不计入请求数。
+    // 它们的错误响应同样带请求标识，用单独的序号编（见 AppState::rejected_request_id）。
     if let Some(rejection) = state.inbound.check(req.headers(), &uri) {
-        return inbound_rejection_response(rejection, &method, &uri);
+        let trace = RequestTrace::new(state.rejected_request_id());
+        return inbound_rejection_response(rejection, &method, &uri, &trace);
     }
-
-    let mut headers = req.headers().clone();
 
     // 活动时间戳：收到请求即更新（stop idle / status 筛选的判定依据）
     state.touch_activity();
-    // IPC 观测计数（一条 Relaxed fetch_add，与上面 store 同量级）；计数顺带
-    // 充当转换信封的 request_id（实例内第 N 个请求，唯一且与 status 的计数一致）
+    // IPC 观测计数（一条 Relaxed fetch_add，与上面 store 同量级）；计数顺带是请求标识的
+    // 后半段（实例内第 N 个请求，唯一且与 status 的计数一致）
     let request_seq = state
         .stats
         .requests_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         + 1;
+    let trace = RequestTrace::new(state.request_id(request_seq));
+
+    // 这个请求的全部日志都带 request_id：与响应头 x-aproxy-request-id、错误体里的是同一个串，
+    // 拿着其中任何一个都能在日志里找到这个请求的经过
+    let span = tracing::info_span!("request", request_id = %trace.request_id);
+    handle(state, req, method, uri, trace)
+        .instrument(span)
+        .await
+}
+
+/// 通过了入站校验、编好请求标识之后的处理。
+async fn handle(
+    state: AppState,
+    req: Request,
+    method: http::Method,
+    uri: http::Uri,
+    trace: RequestTrace,
+) -> Response {
+    // WebSocket 升级：代理按请求—响应转发，承载不了升级后的双向流。Upgrade 是逐跳头，转发时
+    // 会被剥掉，上游看到的是一个普通请求，多半回 4xx，然后被无限重试——不如当场说清楚。
+    // 只拦 websocket：别的升级（例如 curl --http2 对明文地址带的 `Upgrade: h2c`）按 HTTP 的
+    // 规定可以忽略，照常以 HTTP/1.1 应答。
+    if let Some(upgrade) = websocket_upgrade(req.headers()) {
+        tracing::warn!(
+            code = %"upgrade_unsupported",
+            upgrade = %upgrade,
+            "拒绝了连接升级请求（不支持，未转发上游）"
+        );
+        return Terminal::upgrade_unsupported(&upgrade).into_response(&trace);
+    }
+
+    let mut headers = req.headers().clone();
 
     // 在本地侧先应用覆盖/追加，避免重试间重复计算
     apply_header_overrides(&mut headers, &state.config);
@@ -46,26 +79,31 @@ pub(super) async fn proxy_handler(State(state): State<AppState>, req: Request) -
         // 日志里的 URL 一律经 redact::url：base_url 可能内嵌 user:pass，客户端
         // 查询串可能带 key（Gemini 式 ?key=），日志常被整段粘贴求助
         tracing::info!(method = %method, target = %aproxy_ipc::redact::url(&target_url), "代理请求（仅转发）");
-        return forward_only_proxy(state, method, target_url, headers, req.into_body()).await;
+        return forward_only_proxy(state, method, target_url, headers, req.into_body(), trace)
+            .await;
     }
 
     // 缓冲请求体以支持重试重放；上限 max_body_mb（默认 128 MB，0=不限），
     // 超出直接 413。disk_cache 开启时超过内存驻留阈值（1 MiB）溢写磁盘，
     // 大请求体的进程内存在途占用恒定。
     let body_limit = state.config.body_limit_bytes();
-    let req_body =
-        match read_request_body(req.into_body(), body_limit, state.spool_dir.as_deref()).await {
-            Ok(b) => b,
-            Err(ReadBodyError::TooLarge) => return body_too_large_response(body_limit),
-            Err(ReadBodyError::Io(e)) => {
-                tracing::error!(error = %e, "读取请求体失败");
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("请求体读取失败（连接中断或本地磁盘缓存写入失败）: {e}"),
-                )
-                    .into_response();
-            }
-        };
+    let req_body = match read_request_body(req.into_body(), body_limit, state.spool_dir.as_deref())
+        .await
+    {
+        Ok(b) => b,
+        Err(ReadBodyError::TooLarge) => return body_too_large_response(body_limit, &trace),
+        // 客户端没把请求体发完：不是上游失败，不记「最近错误」
+        Err(ReadBodyError::ClientAborted(e)) => {
+            tracing::error!(code = %"client_body_aborted", error = %e, "读取请求体失败：客户端在上传途中断开");
+            return Terminal::client_body_aborted().into_response(&trace);
+        }
+        Err(ReadBodyError::Storage(e)) => {
+            let terminal = Terminal::local_storage_failed(StorageOp::WriteRequest, &e.to_string());
+            state.note_upstream_failure(&terminal.summary());
+            tracing::error!(code = %terminal.code(), error = %e, "请求体写入磁盘缓存失败");
+            return terminal.into_response(&trace);
+        }
+    };
 
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let bounded_retry = state.bounded_retry_matches(path_and_query);
@@ -82,7 +120,8 @@ pub(super) async fn proxy_handler(State(state): State<AppState>, req: Request) -
         target_url: upstream_url(&state.config, &uri),
         headers,
         body: req_body,
-        ctx: ExchangeCtx::new(request_seq.to_string()),
+        // 交给 format 的信封里是同一个请求标识
+        ctx: ExchangeCtx::new(trace.request_id.to_string()),
         retransform: None,
     };
     let max_spool_bytes = spool_limit_bytes(&state.config);
@@ -94,24 +133,30 @@ pub(super) async fn proxy_handler(State(state): State<AppState>, req: Request) -
     if keepalive_applies {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<Response>();
         let path_and_query = path_and_query.to_string();
-        tokio::spawn(async move {
-            let mut r = Responder::keepalive(&state, resp_tx);
-            run_attempts(
-                &state,
-                req,
-                &path_and_query,
-                max_spool_bytes,
-                bounded_retry,
-                &mut r,
-            )
-            .await;
-        });
+        let task_trace = trace.clone();
+        tokio::spawn(
+            async move {
+                let mut r = Responder::keepalive(&state, resp_tx);
+                run_attempts(
+                    &state,
+                    req,
+                    &path_and_query,
+                    max_spool_bytes,
+                    bounded_retry,
+                    &mut r,
+                    task_trace,
+                )
+                .await;
+            }
+            // 后台任务的日志也挂在这个请求的 span 下，带同一个 request_id
+            .instrument(tracing::Span::current()),
+        );
         // 客户端在提交前断开时 hyper 会 drop 本 future（连同 resp_rx），后台任务经
         // resp_tx.closed() 感知并中止上游请求。Err 只在后台任务未交出响应就结束时
-        // 出现（panic）——给客户端一个明确的 502 而不是让连接悬空
+        // 出现（panic）——给客户端一个明确的 500 而不是让连接悬空
         return resp_rx.await.unwrap_or_else(|_| {
-            tracing::error!("保活通道后台任务未交出响应即结束");
-            (StatusCode::BAD_GATEWAY, "aProxy 内部错误：保活通道异常结束").into_response()
+            tracing::error!(code = %"internal", "保活通道后台任务未交出响应即结束");
+            Terminal::internal("the keepalive task ended without a response").into_response(&trace)
         });
     }
 
@@ -125,7 +170,24 @@ pub(super) async fn proxy_handler(State(state): State<AppState>, req: Request) -
         max_spool_bytes,
         bounded_retry,
         &mut r,
+        trace.clone(),
     )
     .await;
-    r.into_response()
+    r.into_response(&trace)
+}
+
+/// 请求要求把连接升级成 WebSocket 时，返回 `Upgrade` 头的值（展示用，截短）；不是则 None。
+/// `Upgrade` 的值是逗号分隔的协议列表，协议名不分大小写，可以带 `/版本`。
+fn websocket_upgrade(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(http::header::UPGRADE)?.to_str().ok()?;
+    value
+        .split(',')
+        .any(|protocol| {
+            protocol
+                .trim()
+                .split('/')
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case("websocket"))
+        })
+        .then(|| value.chars().take(64).collect())
 }

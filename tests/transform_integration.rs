@@ -3,7 +3,7 @@
 //! 复用 examples/format-echo.rs 作为跨平台假 format（不依赖系统 python）；
 //! mock 上游为 axum Router。核心断言面：spawn/persistent 两模式 × 请求/响应
 //! 两方向、url 改写、多 key 轮换（persistent 连续 / spawn 重置）、失败语义
-//! （请求 502 不重试 / 响应透传原样）、超时、b64 保真、大 body 磁盘路径、
+//! （请求侧失败不重试：format 拒绝回 422、format 本身故障回 502 / 响应透传原样）、超时、b64 保真、大 body 磁盘路径、
 //! forward_only 互斥拦截、保活通道透传、进程池加固（format 多写 stdout 时
 //! 不串包 / 复用到死 worker 时换新重试）。
 
@@ -339,8 +339,36 @@ async fn request_persistent_rotate_rotates_keys_continuously() {
     );
 }
 
+/// 核对一个响应是 aproxy 自产的错误响应（状态码、JSON 体、两个头与体一致），返回
+/// `error.aproxy` 对象与整个体的文本。
+async fn aproxy_error(
+    resp: reqwest::Response,
+    status: StatusCode,
+    code: &str,
+) -> (serde_json::Value, String) {
+    assert_eq!(resp.status(), status);
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_else(|| panic!("缺响应头 {name}"))
+            .to_string()
+    };
+    assert_eq!(header("content-type"), "application/json");
+    assert_eq!(header("x-aproxy-error"), code);
+    let request_id = header("x-aproxy-request-id");
+    let text = resp.text().await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["type"], "error", "{text}");
+    assert_eq!(json["error"]["type"], format!("aproxy_{code}"), "{text}");
+    let aproxy = json["error"]["aproxy"].clone();
+    assert_eq!(aproxy["code"], code, "{text}");
+    assert_eq!(aproxy["request_id"], request_id.as_str(), "{text}");
+    (aproxy, text)
+}
+
 #[tokio::test]
-async fn request_transform_error_returns_502_without_sending_upstream() {
+async fn request_transform_rejection_returns_422_without_sending_upstream() {
     isolate_env_proxy();
     let (upstream, count, _jh) = fixed_upstream(StatusCode::OK, "ok").await;
     let mut cfg = proxy_config_for(&upstream);
@@ -353,13 +381,16 @@ async fn request_transform_error_returns_502_without_sending_upstream() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-    let text = resp.text().await.unwrap();
+    // format 用 error 行明确拒绝了这个请求：422 而不是 5xx——5xx 会触发客户端 SDK 自己的重试
+    let (aproxy, text) =
+        aproxy_error(resp, StatusCode::UNPROCESSABLE_ENTITY, "format_rejected").await;
+    assert_eq!(aproxy["details"]["format"], "request_transform");
+    assert_eq!(aproxy["details"]["stage"], "request");
+    assert_eq!(aproxy["attempts"], 0, "没有发往上游");
     assert!(
         text.contains("error-rejected"),
-        "502 应含 format 报错原因: {text}"
+        "错误体应含 format 报错原因: {text}"
     );
-    assert!(text.contains("不重试"), "502 应标注不重试语义: {text}");
     assert_eq!(count.load(Ordering::SeqCst), 0, "转换失败不应发上游请求");
 }
 
@@ -377,7 +408,9 @@ async fn request_transform_crash_returns_502() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    // format 进程没回信就退出了：程序本身的故障，502
+    let (aproxy, _) = aproxy_error(resp, StatusCode::BAD_GATEWAY, "format_failed").await;
+    assert_eq!(aproxy["details"]["kind"], "died");
     assert_eq!(count.load(Ordering::SeqCst), 0);
 }
 
@@ -400,14 +433,13 @@ async fn request_transform_timeout_returns_502() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     assert!(
         start.elapsed() < std::time::Duration::from_secs(4),
         "超时应在 ~1s 触发而非等满 sleep: {:?}",
         start.elapsed()
     );
-    let text = resp.text().await.unwrap();
-    assert!(text.contains("超时"), "502 应含超时原因: {text}");
+    let (aproxy, _) = aproxy_error(resp, StatusCode::BAD_GATEWAY, "format_failed").await;
+    assert_eq!(aproxy["details"]["kind"], "timeout");
 }
 
 #[tokio::test]
@@ -520,7 +552,13 @@ async fn transform_stages_share_request_id_and_state() {
             .and_then(|rest| rest.strip_suffix("|-"))
             .unwrap_or_else(|| panic!("请求阶段应收到 stage=request、尚无 state: {upstream_saw:?}"))
             .to_string();
-        assert!(id.parse::<u64>().is_ok(), "request_id 应是请求序号: {id:?}");
+        // 请求标识：16 位十六进制的实例标识、连字符、实例内的请求序号
+        let (instance, seq) = id.split_once('-').expect("请求标识里有连字符");
+        assert!(
+            instance.len() == 16 && instance.chars().all(|c| c.is_ascii_hexdigit()),
+            "{id:?}"
+        );
+        assert!(seq.parse::<u64>().is_ok(), "{id:?}");
         assert_eq!(
             header("x-stage-seen"),
             format!("response|{id}|from-request-{id}"),
@@ -924,13 +962,18 @@ async fn keepalive_request_transform_failure_after_commit_ends_with_error_event(
 
     let (_, status, text) = timed_sse_post(&proxy).await;
     assert_eq!(status, StatusCode::OK, "骨架头已提交");
-    assert!(
-        text.contains("event: error") && text.contains("proxy_transform_failed"),
-        "已提交后请求转换失败应以终态 error 事件收场: {text}"
-    );
-    assert!(
-        text.contains("请求转换失败"),
-        "error 事件应带失败原因: {text}"
+    // 终态事件的 data 与错误体是同一个 JSON
+    let data = text
+        .lines()
+        .skip_while(|line| *line != "event: error")
+        .nth(1)
+        .and_then(|line| line.strip_prefix("data: "))
+        .unwrap_or_else(|| panic!("已提交后请求转换失败应以终态 error 事件收场: {text}"));
+    let event: serde_json::Value = serde_json::from_str(data).unwrap();
+    assert_eq!(event["error"]["type"], "aproxy_format_failed", "{text}");
+    assert_eq!(
+        event["error"]["aproxy"]["details"]["kind"], "timeout",
+        "{text}"
     );
     assert_eq!(count.load(Ordering::SeqCst), 0, "请求转换失败不得发往上游");
 }

@@ -50,6 +50,76 @@ fn local_client() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
+/// 一个响应的状态码、头与体已经取出来之后，核对它是 aproxy 自产的错误响应：状态码是
+/// `status`，体是 JSON，带 `x-aproxy-request-id` 与 `x-aproxy-error` 两个头，头里的请求标识、
+/// 码与体里的一致，`error.type` 是 `aproxy_` 加码。返回 `error.aproxy` 对象，供调用方继续
+/// 核对 `details` 等。
+fn check_aproxy_error(
+    actual_status: u16,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+    status: u16,
+    code: &str,
+) -> serde_json::Value {
+    assert_eq!(actual_status, status, "状态码，体: {body}");
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert_eq!(content_type, "application/json", "体: {body}");
+    let json: serde_json::Value =
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("错误体应是 JSON（{e}）: {body}"));
+    assert_eq!(json["type"], "error", "{body}");
+    assert_eq!(json["error"]["type"], format!("aproxy_{code}"), "{body}");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "{body}"
+    );
+    assert!(
+        json["error"].get("code").is_none(),
+        "error.code 不放任何值: {body}"
+    );
+    let aproxy = json["error"]["aproxy"].clone();
+    assert_eq!(aproxy["code"], code, "{body}");
+    assert!(aproxy["attempts"].is_u64(), "{body}");
+    assert!(aproxy["details"].is_object(), "{body}");
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_else(|| panic!("缺响应头 {name}"))
+            .to_string()
+    };
+    assert_eq!(header("x-aproxy-error"), code);
+    let request_id = header("x-aproxy-request-id");
+    assert_eq!(aproxy["request_id"], request_id.as_str(), "{body}");
+    // 请求标识：16 位十六进制的实例标识、连字符、序号（入站校验拒掉的请求带 x 前缀）
+    let (instance, seq) = request_id.split_once('-').expect("请求标识里有连字符");
+    assert!(
+        instance.len() == 16 && instance.chars().all(|c| c.is_ascii_hexdigit()),
+        "{request_id}"
+    );
+    assert!(
+        seq.trim_start_matches('x').parse::<u64>().is_ok(),
+        "{request_id}"
+    );
+    aproxy
+}
+
+/// 同 [`check_aproxy_error`]，直接吃一个响应。
+async fn expect_aproxy_error(
+    resp: reqwest::Response,
+    status: u16,
+    code: &str,
+) -> serde_json::Value {
+    let actual = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    let body = resp.text().await.unwrap();
+    check_aproxy_error(actual, &headers, &body, status, code)
+}
+
 async fn bind_random_router(router: Router) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -229,8 +299,15 @@ async fn bounded_retry_path_passes_through_after_cap() {
     .expect("受限路径应在 10s 内封顶透传（而非无限重试）")
     .unwrap();
 
-    // 上游的 404 原样透传，客户端拿到真实终态
+    // 上游的 404 原样透传，客户端拿到真实终态：状态码与体保真，只多两个头，说明这是 aproxy
+    // 放弃重试之后的最终结果
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.headers()["x-aproxy-error"], "retry_exhausted");
+    let request_id = resp.headers()["x-aproxy-request-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(request_id.ends_with("-1"), "实例的第一个请求: {request_id}");
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["type"], "not_found_error");
     // 首轮 + 2 次零延迟重试 = 恰好 BOUNDED_RETRY_MAX_ATTEMPTS 次，不多不少
@@ -332,11 +409,26 @@ async fn bounded_retry_path_keepalive_channel_ends_with_error_event() {
         text.contains("event: error"),
         "应以终态 error 事件收场: {text}"
     );
+    // 终态事件的 data 是与错误体相同的 JSON
+    let data = text
+        .lines()
+        .skip_while(|line| *line != "event: error")
+        .nth(1)
+        .and_then(|line| line.strip_prefix("data: "))
+        .unwrap_or_else(|| panic!("event: error 之后应是 data 行: {text}"));
+    let event: serde_json::Value = serde_json::from_str(data).unwrap();
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["error"]["type"], "aproxy_retry_exhausted");
+    let aproxy = &event["error"]["aproxy"];
+    assert_eq!(aproxy["code"], "retry_exhausted");
+    assert_eq!(aproxy["attempts"], 3);
+    assert_eq!(aproxy["upstream_status"], 404, "应携带上游状态码: {text}");
+    assert_eq!(aproxy["details"]["last_code"], "upstream_status");
     assert!(
-        text.contains("upstream_error"),
-        "error 事件应携带类型: {text}"
+        aproxy["request_id"]
+            .as_str()
+            .is_some_and(|id| id.ends_with("-1"))
     );
-    assert!(text.contains("404"), "error 事件应携带上游状态码: {text}");
     assert_eq!(counter.load(Ordering::SeqCst), 3);
 }
 
@@ -1392,7 +1484,9 @@ async fn oversized_request_returns_413() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 413, "超过 max_body_mb 上限应返回 413");
+    let aproxy = expect_aproxy_error(resp, 413, "request_too_large").await;
+    assert_eq!(aproxy["details"]["limit_bytes"], 1024 * 1024);
+    assert_eq!(aproxy["attempts"], 0, "没有发往上游");
 }
 
 // ---------------------------------------------------------------------------
@@ -3168,7 +3262,7 @@ async fn keepalive_committed_replay_decodes_compression_ignoring_identity() {
     let (beats, rest) = split_leading_keepalives(&body);
     assert!(beats >= 1, "{body:?}");
     assert!(
-        rest.starts_with("event: error\n") && rest.contains("proxy_decode_failed"),
+        rest.starts_with("event: error\n") && rest.contains("\"code\":\"decode_failed\""),
         "截断的压缩体不得回放半截，应以终态 error 事件收场: {body:?}"
     );
 }
@@ -3796,16 +3890,9 @@ async fn forward_only_enforces_max_body_mb() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        413,
-        "仅转发模式流式计数越过 max_body_mb 后应返回 413"
-    );
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("请求体超出上限"),
-        "413 文案应与缓冲路径共用（期望含「请求体超出上限」），实际: {body}"
-    );
+    // 与缓冲路径是同一个终态
+    let aproxy = expect_aproxy_error(resp, 413, "request_too_large").await;
+    assert_eq!(aproxy["details"]["limit_bytes"], 1024 * 1024);
 }
 
 // ---------------------------------------------------------------------------
@@ -3855,15 +3942,14 @@ async fn forward_only_unreachable_upstream_returns_502() {
     .expect("仅转发模式的上游失败必须立刻终结；10 秒内没有响应说明落进了常规模式的重试循环")
     .unwrap();
 
-    assert_eq!(resp.status(), 502, "上游请求失败应回 502");
+    let headers = resp.headers().clone();
     let body = resp.text().await.unwrap();
+    let aproxy = check_aproxy_error(502, &headers, &body, 502, "upstream_failed");
+    assert_eq!(aproxy["attempts"], 1, "恰好尝试一次");
+    assert_eq!(aproxy["details"]["last_code"], "upstream_connect_failed");
     assert!(
-        body.contains("上游请求失败"),
-        "502 正文应带上失败原因，实际: {body}"
-    );
-    assert!(
-        body.contains("仅转发模式不重试"),
-        "502 正文应指明本模式不重试（否则排障会指望它重试），实际: {body}"
+        body.contains("not retried"),
+        "502 正文应指明这个请求不重试（否则排障会指望它重试），实际: {body}"
     );
 
     assert_eq!(
@@ -3879,7 +3965,7 @@ async fn forward_only_unreachable_upstream_returns_502() {
     let last_error = probe.stats.last_error.lock().unwrap().clone();
     let msg = last_error.map(|(m, _)| m).unwrap_or_default();
     assert!(
-        msg.contains("上游请求失败"),
+        msg.starts_with("upstream_failed: "),
         "失败必须记入观测（status 的「最近错误」），实际: {msg:?}"
     );
 }
@@ -3928,12 +4014,9 @@ async fn forward_only_makes_exactly_one_upstream_attempt_on_network_failure() {
     .await
     .expect("上游连接被立即关闭时必须立刻终结；10 秒内没有响应说明进了重试循环")
     .unwrap();
-    assert_eq!(resp.status(), 502, "上游网络失败应回 502");
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("上游请求失败"),
-        "502 正文应带上失败原因，实际: {body}"
-    );
+    // 上游接受了连接、没回响应头就关闭：连接建立之后断开，已收 0 字节
+    let aproxy = expect_aproxy_error(resp, 502, "upstream_failed").await;
+    assert_eq!(aproxy["details"]["last_code"], "upstream_body_interrupted");
     assert_eq!(
         attempts.load(Ordering::SeqCst),
         1,
@@ -4113,8 +4196,9 @@ async fn forward_only_client_upload_abort_is_not_an_upstream_failure() {
         "客户端上传途中断开应与缓冲路径同一归因（400），实际响应: {text:?}"
     );
     assert!(
-        text.contains("客户端在上传途中断开"),
-        "400 正文应指明是客户端断开，而非上游失败，实际: {text:?}"
+        text.contains("x-aproxy-error: client_body_aborted")
+            && text.contains("\"code\":\"client_body_aborted\""),
+        "400 应指明是客户端断开，而非上游失败，实际: {text:?}"
     );
 
     // 归因锚点：客户端自己断开**不得**污染「最近错误」——否则 status 会把矛头
@@ -4181,15 +4265,25 @@ async fn inbound_forged_host_is_rejected_locally_without_forwarding() {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(
-                resp.status(),
-                403,
-                "伪造 Host {host} 必须 403（forward_only={forward_only}）"
-            );
+            let headers = resp.headers().clone();
+            let status = resp.status().as_u16();
             let body = resp.text().await.unwrap();
+            let aproxy = check_aproxy_error(status, &headers, &body, 403, "inbound_host_rejected");
+            // details.host 是请求里的 Host 原样
+            assert_eq!(
+                aproxy["details"]["host"], host,
+                "forward_only={forward_only}"
+            );
+            assert_eq!(aproxy["attempts"], 0, "未转发上游");
             assert!(
-                body.contains("allowed_hosts") && body.contains("未转发上游"),
-                "403 文案须点名配置项与处置，实际: {body}"
+                aproxy["request_id"]
+                    .as_str()
+                    .is_some_and(|id| id.contains("-x")),
+                "被拒的请求不计入请求数，标识用单独的序号: {body}"
+            );
+            assert!(
+                body.contains("allowed_hosts"),
+                "403 文案须点名配置项，实际: {body}"
             );
         }
         assert_eq!(
@@ -4221,15 +4315,16 @@ async fn inbound_request_with_origin_is_rejected_by_default() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 403);
+    let headers = resp.headers().clone();
     let body = resp.text().await.unwrap();
+    let aproxy = check_aproxy_error(403, &headers, &body, 403, "inbound_origin_rejected");
+    assert_eq!(
+        aproxy["details"]["origin"], "https://evil.example",
+        "details 回显被拒的 Origin，方便照抄进配置"
+    );
     assert!(
         body.contains("allowed_origins"),
         "403 文案须点名配置项: {body}"
-    );
-    assert!(
-        body.contains("https://evil.example"),
-        "文案应回显被拒的 Origin，方便照抄进配置: {body}"
     );
 
     let resp = client
@@ -4523,7 +4618,7 @@ async fn credentials_masked_in_logs_last_error_and_502() {
     retrying.abort();
     let last_error = recorded.expect("10 秒内应记录首轮网络错误").0;
     assert!(
-        last_error.contains("网络错误") && last_error.contains("key=***"),
+        last_error.starts_with("upstream_connect_failed: ") && last_error.contains("key=***"),
         "最近错误应保留脱敏后的 URL 形态: {last_error}"
     );
     assert!(
@@ -6503,12 +6598,10 @@ fn ipc_stats_reflect_forward_only_traffic() {
     let resp = rt
         .block_on(client.get(&url).send())
         .expect("上游不可达时必须立刻终结（本模式不重试）");
-    assert_eq!(resp.status(), 502, "上游请求失败应回 502");
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
     let body = rt.block_on(resp.text()).unwrap();
-    assert!(
-        body.contains("上游请求失败"),
-        "502 正文应带上失败原因，实际: {body}"
-    );
+    check_aproxy_error(status, &headers, &body, 502, "upstream_failed");
 
     let info = rt
         .block_on(aproxy::daemon::ipc_ping_in(&run_dir, &port_str))
@@ -6524,7 +6617,7 @@ fn ipc_stats_reflect_forward_only_traffic() {
         .clone()
         .expect("仅转发模式的上游失败必须经 IPC 可见（status 的「最近错误」）");
     assert!(
-        last_error.message.contains("上游请求失败"),
+        last_error.message.starts_with("upstream_failed: "),
         "仅转发模式的上游失败必须经 IPC 可见（status 的「最近错误」），实际: {last_error:?}"
     );
     assert!(
@@ -6742,4 +6835,220 @@ fn non_loopback_listen_warns_on_start_and_in_startup_log() {
         "startup.log 应留下非回环告警:\n{startup_log}"
     );
     assert!(!startup_log.contains("sk-LANSECRET"));
+}
+
+// ---------------------------------------------------------------------------
+// 数据面错误出口的其余终态（每个能触发的自产 4xx / 5xx 各有一个测试；别处已有的：
+// request_too_large、inbound_host_rejected、inbound_origin_rejected、retry_exhausted、
+// upstream_failed、仅转发路径的 client_body_aborted，以及 transform_integration 里的
+// format_rejected、format_failed）
+// ---------------------------------------------------------------------------
+
+// WebSocket 升级：当场 501，不转发、不进重试循环。别的升级（h2c）按 HTTP 的规定忽略，
+// 请求照常代理
+#[tokio::test]
+async fn websocket_upgrade_is_refused_and_other_upgrades_are_ignored() {
+    let (upstream_url, hits, _h1) = counting_upstream().await;
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(
+        proxy_config_for(&upstream_url),
+    )))
+    .await;
+    let client = local_client();
+
+    for upgrade in ["websocket", "WebSocket", "h2c, websocket/13"] {
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            client
+                .get(format!("{proxy_url}/v1/realtime"))
+                .header("connection", "upgrade")
+                .header("upgrade", upgrade)
+                .send(),
+        )
+        .await
+        .expect("升级请求应当场被拒，而不是转发后进入重试循环")
+        .unwrap();
+        let aproxy = expect_aproxy_error(resp, 501, "upgrade_unsupported").await;
+        assert_eq!(aproxy["details"]["upgrade"], upgrade);
+        assert_eq!(aproxy["attempts"], 0, "未转发上游");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "升级请求不得到达上游");
+
+    let resp = client
+        .get(format!("{proxy_url}/v1/x"))
+        .header("connection", "upgrade, http2-settings")
+        .header("upgrade", "h2c")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "h2c 升级被忽略，请求照常代理");
+    assert!(resp.headers().get("x-aproxy-error").is_none());
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+// 缓冲路径：客户端声明了请求体却没发完就断开 → 400 client_body_aborted，不记「最近错误」
+// （那不是上游失败），也不发往上游
+#[tokio::test]
+async fn buffered_client_upload_abort_is_client_body_aborted() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (upstream_url, hits, _h1) = counting_upstream().await;
+    let state = AppState::new(proxy_config_for(&upstream_url));
+    let probe = state.clone();
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(state)).await;
+
+    // 裸 TCP：声明 64 KiB 却只发 1 KiB 就半关写端（保留读端，好读回 400）
+    let addr = proxy_url.trim_start_matches("http://").to_string();
+    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let head = format!(
+        "POST /v1/upload HTTP/1.1\r\nhost: {addr}\r\ncontent-length: {}\r\n\r\n",
+        64 * 1024
+    );
+    sock.write_all(head.as_bytes()).await.unwrap();
+    sock.write_all(&vec![b'x'; 1024]).await.unwrap();
+    sock.flush().await.unwrap();
+    sock.shutdown().await.unwrap();
+
+    let mut raw = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut raw)).await;
+    let text = String::from_utf8_lossy(&raw).to_string();
+    assert!(text.starts_with("HTTP/1.1 400"), "实际响应: {text:?}");
+    assert!(
+        text.contains("x-aproxy-error: client_body_aborted")
+            && text.contains("x-aproxy-request-id: ")
+            && text.contains("\"code\":\"client_body_aborted\""),
+        "实际响应: {text:?}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "请求体没收完，不得发往上游");
+    assert!(
+        probe.stats.last_error.lock().unwrap().is_none(),
+        "客户端主动断开不是上游失败，不得记入最近错误"
+    );
+}
+
+// 上游响应超过缓冲上限：确定性失败，502 response_too_large，不重试
+#[tokio::test]
+async fn oversized_upstream_response_is_response_too_large() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c2 = counter.clone();
+    let upstream = Router::new().route(
+        "/v1/big",
+        any(move || {
+            let c = c2.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                vec![b'a'; 2 * 1024 * 1024]
+            }
+        }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.spool_limit_mb = 1;
+    let state = AppState::new(cfg);
+    let probe = state.clone();
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(state)).await;
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        local_client().get(format!("{proxy_url}/v1/big")).send(),
+    )
+    .await
+    .expect("超出上限是确定性失败，应立刻终结而不是重试")
+    .unwrap();
+    let aproxy = expect_aproxy_error(resp, 502, "response_too_large").await;
+    assert_eq!(aproxy["details"]["limit_bytes"], 1024 * 1024);
+    assert_eq!(aproxy["attempts"], 1);
+    assert_eq!(counter.load(Ordering::SeqCst), 1, "不重试");
+    let last_error = probe.stats.last_error.lock().unwrap().clone().unwrap().0;
+    assert!(
+        last_error.starts_with("response_too_large: "),
+        "{last_error}"
+    );
+}
+
+// 同一个请求在响应头、错误体与日志里是同一个 request_id：拿着其中任何一个，都能在日志里
+// 找到这个请求的经过。日志走真实的 tracing 输出（写法与 34 相同）
+#[tokio::test]
+async fn request_id_is_the_same_in_header_body_and_log() {
+    let logs = CapturedLogs::default();
+    let sink = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    // 为什么要第二个 Dispatch，见 credentials_masked_in_logs_last_error_and_502
+    let _second_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+
+    // 受限路径上游恒回 404：三次尝试之后透传，过程中有重试的日志
+    let upstream = Router::new().route(
+        "/v1/messages/count_tokens",
+        any(|| async { (StatusCode::NOT_FOUND, "nope") }),
+    );
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let mut cfg = proxy_config_with_bounded_paths(&upstream_url, &["/v1/messages/count_tokens"]);
+    cfg.max_body_mb = Some(1);
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(cfg))).await;
+    let client = local_client();
+
+    // (1) 放弃之后透传的响应：标识在头里
+    let resp = client
+        .post(format!("{proxy_url}/v1/messages/count_tokens"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let passthrough_id = resp.headers()["x-aproxy-request-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // (2) 自产的错误响应：标识在头里也在体里（expect_aproxy_error 核对两者相同）
+    let resp = client
+        .post(format!("{proxy_url}/v1/x"))
+        .body(vec![b'a'; 2 * 1024 * 1024])
+        .send()
+        .await
+        .unwrap();
+    let aproxy = expect_aproxy_error(resp, 413, "request_too_large").await;
+    let rejected_id = aproxy["request_id"].as_str().unwrap().to_string();
+    assert_ne!(passthrough_id, rejected_id, "不同请求的标识不同");
+
+    let text = logs.text();
+    let lines_of = |id: &str| -> Vec<String> {
+        let needle = format!("request_id={id}");
+        text.lines()
+            .filter(|line| line.contains(&needle))
+            .map(str::to_string)
+            .collect()
+    };
+    // 第一个请求：两次「本次尝试失败」带尝试失败码，一次「达到尝试上限」带终态码
+    let first = lines_of(&passthrough_id);
+    assert_eq!(
+        first
+            .iter()
+            .filter(|line| line.contains(" code=upstream_status "))
+            .count(),
+        2,
+        "日志:\n{text}"
+    );
+    assert!(
+        first
+            .iter()
+            .any(|line| line.contains(" code=retry_exhausted ")),
+        "日志:\n{text}"
+    );
+    // 第二个请求：超限的那一行带着它自己的标识
+    let second = lines_of(&rejected_id);
+    assert!(
+        second
+            .iter()
+            .any(|line| line.contains(" code=request_too_large ")),
+        "日志:\n{text}"
+    );
+    assert!(
+        !second.iter().any(|line| line.contains("retry_exhausted")),
+        "两个请求的日志不串"
+    );
 }

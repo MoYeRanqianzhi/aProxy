@@ -19,7 +19,10 @@ pub(super) async fn forward_only_proxy(
     target_url: String,
     headers: HeaderMap,
     body: axum::body::Body,
+    mut trace: RequestTrace,
 ) -> Response {
+    // 本模式恰好尝试一次：请求一发出就算一次上游尝试
+    trace.attempts = 1;
     let reqwest_method =
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
 
@@ -51,7 +54,7 @@ pub(super) async fn forward_only_proxy(
     // 长得一模一样，只能靠标记区分。客户端在上传途中断开（裸 TCP 声明
     // Content-Length 却提前 close、进程被杀……）必须与「上游请求失败」分开：
     // 后者会把排障矛头指向根本没有收到完整请求体的上游。缓冲路径的同一事件映射为
-    // `ReadBodyError::Io` → 400 且**不碰** last_error（见 `read_request_body` 的
+    // `ReadBodyError::ClientAborted` → 400 且**不碰** last_error（见 `read_request_body` 的
     // 错误分支），两条路径归因必须一致——仅转发模式此前是异常的那一侧。
     let client_gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let gone_flag = client_gone.clone();
@@ -84,7 +87,7 @@ pub(super) async fn forward_only_proxy(
                     // 无需 map_err；真实原因由 too_large 标记承载
                     return Some((
                         Err(axum::Error::new(std::io::Error::other(
-                            "请求体超出上限（仅转发模式流式中断）",
+                            "the request body exceeds the limit",
                         ))),
                         (stream, seen),
                     ));
@@ -100,38 +103,30 @@ pub(super) async fn forward_only_proxy(
     let resp = match builder.send().await {
         Ok(r) => r,
         Err(e) => {
-            // 错误文本与目标 URL 都会进日志 / 最近错误 / 502 正文，一律先脱敏
-            let e = redact_reqwest_error(e);
+            // 错误文本与目标 URL 都会进日志 / 最近错误 / 502 正文，一律先归类、脱敏
+            let failure = send_failure(e, &state.config);
             let masked_target = aproxy_ipc::redact::url(&target_url);
             // send() 的失败有三种来源：上游真的失败，或请求体适配器产出 Err 令
             // reqwest 主动中止（超限 / 客户端上传中断，各有一个标记）。判定顺序
             // 是刻意的：超限排在最前——它同时也会让适配器产出 Err，而「你的请求体
             // 太大」比「你断开了」更接近事实、更可操作。两个标记都没置位才是真·上游失败。
             if too_large.load(AtomicOrdering::Relaxed) {
-                return body_too_large_response(limit);
+                return body_too_large_response(limit, &trace);
             }
             // 客户端上传途中断开：**不记 last_error、不打「上游请求失败」**——
             // 那一头根本没有失败，是我们应客户端断开而主动中止了上游请求。
             // 也不回 502：发起断开的客户端读不到响应，这里的状态码只是给日志与
             // 中间观测看的，取与缓冲路径同一事件一致的 400。
             if client_gone.load(AtomicOrdering::Relaxed) {
-                tracing::error!(error = %e, target = %masked_target, "客户端请求体传输中断，已中止上游请求");
-                return (
-                    StatusCode::BAD_REQUEST,
-                    "请求体读取失败（客户端在上传途中断开）",
-                )
-                    .into_response();
+                tracing::error!(code = %"client_body_aborted", error = %failure.message, target = %masked_target, "客户端请求体传输中断，已中止上游请求");
+                return Terminal::client_body_aborted().into_response(&trace);
             }
             // 上游失败不重试（本模式的定义），但必须记进 note_upstream_failure，
             // 否则 status 的「最近错误」对这类实例永久显示「无」
-            let reason = format!("上游请求失败: {e}");
-            state.note_upstream_failure(&reason);
-            tracing::warn!(error = %e, target = %masked_target, "上游请求失败（仅转发模式不重试）");
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("{reason}（仅转发模式不重试）"),
-            )
-                .into_response();
+            let terminal = Terminal::upstream_failed(&failure);
+            state.note_upstream_failure(&terminal.summary());
+            tracing::warn!(code = %terminal.code(), last_code = failure.code, error = %failure.message, target = %masked_target, "上游请求失败（仅转发模式不重试）");
+            return terminal.into_response(&trace);
         }
     };
 
@@ -180,15 +175,15 @@ pub(super) async fn forward_only_proxy(
             // 是伪造数据），也不重试（本模式已放弃重试能力）。错误记入
             // note_upstream_failure 并带上已转发字节数，便于判断断在了哪里。
             let forwarded_bytes = counter.load(AtomicOrdering::Relaxed);
-            let e = redact_reqwest_error(e);
-            let reason = format!("上游响应流中断: {e}");
-            state.note_upstream_failure(&reason);
+            let failure = body_failure(e, forwarded_bytes, &state.config);
+            state.note_upstream_failure(&failure.summary());
             tracing::warn!(
-                error = %e,
+                code = %failure.code,
+                error = %failure.message,
                 forwarded_bytes,
                 "上游响应流中断，连接就此截断（仅转发模式不重试）"
             );
-            Err(std::io::Error::other(reason))
+            Err(std::io::Error::other(failure.message))
         }
     });
 

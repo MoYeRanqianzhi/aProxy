@@ -1,23 +1,29 @@
 # Troubleshooting transformers
 
 Error messages and symptoms caused by a format program, with their causes and fixes. Read it when
-a request fails with a 502 that mentions the transformer, when a log line names it, or when
+a request fails with a 422 or 502 that names the transformer, when a log line names it, or when
 conversion silently does not happen. The messages are quoted exactly as aProxy and aproxy-format
 print them, so search for the Chinese text in real output.
 
 ## Where the messages appear
 
-- **The client** receives HTTP 502 when the request side fails, with the body
-  `请求转换失败: <reason>（请求侧转换失败不重试，未发往上游）` ("request transform failed: <reason>
-  (not retried, not sent upstream)"). Nothing was sent upstream. A streaming client that had
-  already received keepalive headers gets an SSE `error` event of type `proxy_transform_failed`
-  with `请求转换失败: <reason>` as its message instead.
+- **The client** gets `422` with `x-aproxy-error: format_rejected` when the program replied with an
+  `error` envelope; the message is `format 'request_transform' rejected the request: <reason>`.
+  When the program itself failed (spawn, crash, pipe, timeout, protocol) it gets `502` with
+  `x-aproxy-error: format_failed` and `details.kind` naming which. Nothing was sent upstream, and
+  the request is not retried. A streaming client that had already received keepalive headers gets
+  the same error JSON as a final SSE `event: error` frame instead of an HTTP status. Match on
+  `error.aproxy.code` or `x-aproxy-error`, not on `message` (aproxy-cli skill, behaviors.md,
+  After the commit).
 - **The daemon log** (`aproxy logs <port|alias>`) records request-side failures as
   `请求转换失败，终态返回（请求侧转换失败按约定不重试）` ("request transform failed; final
   response returned, not retried") and response-side failures as `响应转换失败，透传上游原始响应`
-  ("response transform failed; passing the upstream response through"), each with an `error`
-  field holding the reason. `aproxy status` shows the latest
-  request-side failure as the instance's last error.
+  ("response transform failed; passing the upstream response through"), each with an `error` field
+  holding the reason. The request-side line also has a `code` field (`format_rejected`,
+  `format_failed` or `local_storage_failed`); the response-side line has none, because that request
+  did not fail.
+  `aproxy status` shows the latest request-side failure as the instance's last error, written as
+  `<code>: <English message>`.
 - **Your program's stderr** is discarded by aProxy. To see a crash, run the configured command by
   hand with one envelope on stdin (stderr then goes to your terminal):
 
@@ -32,17 +38,25 @@ more but hides stderr.
 
 ## Reasons reported by aProxy
 
-The `<reason>` starts with one of these:
+An `error` reply becomes `422` `format_rejected` with the message
+`format 'request_transform' rejected the request: <reason>`; the reason is your program's own text.
+For the official binary, see Errors from aproxy-format below.
 
-| Message begins with | Meaning | Fix |
-|---|---|---|
-| `format 进程启动失败（检查 command 路径）` ("format process failed to start; check the command path") | The program could not be started: not found, not executable, or a relative path that does not resolve from the daemon's working directory | Use an absolute path in `command`. On Windows a bare name is found only as an `.exe`, so npm `.cmd` shims and scripts need their interpreter as `command`. |
-| `format 进程意外退出且无输出` ("format process exited unexpectedly without output") | The program exited or crashed before writing a reply. A worker that merely died while idle is not the cause: aProxy retries that case once on a fresh process | Run the command by hand (above). Usual causes: a wrong script path in `args` (not `~`-expanded), a missing runtime or module, an unhandled exception, the official binary started without `args = ["run"]` (it prints usage and exits). |
-| `format 进程管道读写失败` ("format process pipe read/write failed") | The process died or closed its pipes mid-exchange | Same as above. |
-| `转换超时` ("conversion timed out") | No reply line within `timeout_secs` (default 30). The worker is killed | Flush after each reply; read one line at a time (a program that reads all of stdin, like `json.load(sys.stdin)`, waits forever); raise `timeout_secs` only if the conversion is slow by nature. |
-| `format 输出违反信封协议:` ("format output violates the envelope protocol") | Your stdout was not exactly one valid envelope line (the worker is evicted), or its `body_b64` did not decode. The detail follows the colon; see the next table | Fix the output. |
-| `format 报告转换失败: ` ("format reported a conversion failure") | Your program replied with `error`; the rest is its own text | For the official binary, see Errors from aproxy-format below. |
-| `body 临时文件读取失败（本地磁盘故障）` ("could not read the body temp file; local disk fault") | aProxy could not read its own spooled body from disk | Not a format problem: check free space and permissions in the aProxy home directory. |
+A failure of the program itself becomes `502` `format_failed` with the message
+`format 'request_transform' failed (<kind>): <detail>`. `details.kind` names the failure, and the
+`<detail>` begins with one of these (the Chinese text is unchanged):
+
+| `details.kind` | Detail begins with | Meaning | Fix |
+|---|---|---|---|
+| `spawn` | `format 进程启动失败（检查 command 路径）` ("format process failed to start; check the command path") | The program could not be started: not found, not executable, or a relative path that does not resolve from the daemon's working directory | Use an absolute path in `command`. On Windows a bare name is found only as an `.exe`, so npm `.cmd` shims and scripts need their interpreter as `command`. |
+| `died` | `format 进程意外退出且无输出` ("format process exited unexpectedly without output") | The program exited or crashed before writing a reply. A worker that merely died while idle is not the cause: aProxy retries that case once on a fresh process | Run the command by hand (above). Usual causes: a wrong script path in `args` (not `~`-expanded), a missing runtime or module, an unhandled exception, the official binary started without `args = ["run"]` (it prints usage and exits). |
+| `io` | `format 进程管道读写失败` ("format process pipe read/write failed") | The process died or closed its pipes mid-exchange | Same as above. |
+| `timeout` | `转换超时` ("conversion timed out") | No reply line within `timeout_secs` (default 30). The worker is killed | Flush after each reply; read one line at a time (a program that reads all of stdin, like `json.load(sys.stdin)`, waits forever); raise `timeout_secs` only if the conversion is slow by nature. |
+| `protocol` | `format 输出违反信封协议:` ("format output violates the envelope protocol") | Your stdout was not exactly one valid envelope line (the worker is evicted), or its `body_b64` did not decode. The detail follows the colon; see the next table | Fix the output. |
+
+`body 临时文件读取失败（本地磁盘故障）` is not a format failure: aProxy could not read its own
+spooled body from disk, which returns `507` `local_storage_failed` with `details.op = read_request`;
+check free space and permissions in the aProxy home directory.
 
 Details after `format 输出违反信封协议:`:
 
@@ -61,8 +75,8 @@ the stray output.
 
 ## Errors from aproxy-format
 
-On the request side these follow `format 报告转换失败: ` in the 502; on the response side they
-appear in the `响应转换失败` log line while the client gets the unconverted response.
+On the request side these are the `<reason>` in the `422 format_rejected` message; on the response
+side they appear in the `响应转换失败` log line while the client gets the unconverted response.
 
 | Message | Cause | Fix |
 |---|---|---|

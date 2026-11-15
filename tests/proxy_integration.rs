@@ -5563,8 +5563,9 @@ fn port_zero_restore_record_uses_actual_port() {
     let out = home.cmd().args(["stop", &port]).output().unwrap();
     assert!(
         out.status.success(),
-        "stop 应成功: {}",
-        String::from_utf8_lossy(&out.stdout)
+        "stop 应成功: stdout {:?} stderr {:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
     assert!(!restore_path.exists(), "优雅停止后恢复记录应被删除");
 }

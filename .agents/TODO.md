@@ -52,6 +52,11 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   `tests/restart_integration.rs:170`（`restart_after_port_change_reports_new_port`）断言失败时打印 restart 的 stdout 与
   stderr，再查 2026-10-12 演练 38291736162 的 test (windows-latest, desktop) 里那次偶发（现在只有「restart 应成功，实际
   exit 非零」，查不了原因；同一提交 458900f 的 ci.yml 里 windows 是绿的）
+  同类的又一次（2026-11-15，CI run 43745240586 的 windows (desktop)，提交 1607caa）：`tests/proxy_integration.rs` 的
+  `port_zero_restore_record_uses_actual_port` 里 `aproxy stop <端口>` 退出非零、stdout 为空（当时没打印 stderr，现在
+  断言失败时两者都打印）；同一提交的 windows (headless) 与下一个提交都是绿的。stdout 为空说明走的是只写 stderr 的
+  分支——`stop_instance` 的失败提示都写 stdout，所以更像是选目标阶段的 `Unresponsive`（ping 不通而进程还在），
+  这是推测，等下一次带 stderr 的失败来证实
 - [ ] **W7 发布 0.2.0**。另外两件：
   - 撤回预发布期的措辞（`--pre` / `@next` / `--version`、「目前只有预发布」）。2026-10-13 文档终审列的位置：README.md 31、60–63，
     README_EN.md 81、135–142、183，docs/INSTALL_AGENT.md 54–58、156，compatibility.md 步骤 3，CHANGELOG.md 24；

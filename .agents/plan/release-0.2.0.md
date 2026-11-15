@@ -551,3 +551,26 @@
     2. 安装码（`install_*`）只登记了设计稿点了名的十个，`details` 多数留空：§2.4 写明由 install 的 `--json`（B9）补齐。
     3. 码表目前只是登记，没有出口在用：B1 接数据面，B2/B3 接诊断，B6 接 IPC，B9 接操作码与退出码。
     4. `ledger::register` 不再自己告警（aproxy-ipc 不带 tracing），原因放在返回的守卫里，由 `util::register_in_ledger` 告警。
+- B1（2026-11-16）：6062b8c 数据面的错误出口。`src/proxy/errors.rs` 是唯一的构造处：`Terminal`（终态，JSON 错误体或
+  SSE `event: error`，同一个 JSON）、`AttemptFailure`（尝试失败码）、`mark_given_up`（给放弃后透传的响应加两个头）。
+  `request_id` = `<instance_id>-<序号>`，在头、体、日志（span）与 format 信封里相同。skill 文档已按新形状改
+  （子代理改、主代理审，纠正了一处「响应侧日志也带 code」的错误说法）。
+  - 验证：Windows headless 全量通过（库单测 284，proxy_integration 106，transform_integration 30）；两个变体 clippy 与
+    Linux 交叉 clippy 零输出；CI 上 windows、ubuntu 两种变体与 upgrade 任务全绿（macOS 是已知红）。
+  - **真实 SDK 解析**（anthropic 2.8.0、openai 3.51.0，Python，`max_retries=0`，对着本机构建的 aproxy）：
+    | 场景 | anthropic SDK | openai SDK |
+    |---|---|---|
+    | 自产 413 `request_too_large` | `ContentTooLargeError`，`status_code` 413，`e.type` = `aproxy_request_too_large`，`e.body` 是整个错误体（含 `error.aproxy`） | `APIStatusError`，413，`e.type` = `aproxy_request_too_large`，`e.body` 是 `error` 对象（含 `aproxy`），`e.code` 为 None |
+    | 放弃后透传的上游 404（`retry_exhausted`） | `NotFoundError`，体是上游原样；`e.response.headers` 里读得到 `x-aproxy-error` 与 `x-aproxy-request-id` | `NotFoundError`，同左 |
+    | 流里的终态 `event: error` | 抛 `APIStatusError`（`e.type` = `aproxy_retry_exhausted`，`e.body` 是整个 JSON） | 抛 `APIError`（`e.type` 同，`e.body` 是 `error` 对象，`e.message` 是英文说明） |
+    两个 SDK 都把 `error.type` 当字符串读、`error.aproxy` 原样保留在 `body` 里，流里的终态事件都当错误抛出、不当数据。
+    openai SDK 的 `e.code` 是 None——设计稿定的就是「`error.code` 不放任何值」。流式那两行喂的是与 `Terminal::sse_event`
+    同形状的一帧（由脚本里的假服务端写出），不是经 aproxy 的保活通道触发的；保活通道写出这一帧由集成测试核对。
+  - **没有集成测试的终态**：`local_storage_failed`（要让磁盘缓存写失败，没有不侵入的办法；`errors.rs` 的单测核对了它的
+    形状）、`internal`（程序缺陷，触发不了）。
+  - **与设计稿的出入**：
+    1. 现在只有一个请求转换器、没有名字，`details.format` 一律是 `request_transform`；B10 引入 `[[format]]` 链之后才是配置里的名字。
+    2. `retry_exhausted` 的 `details.by` 现在是 `bounded_retry_paths`（设计稿的 `rule:<序号>` / `override` 要等 B4 的规则表）。
+    3. `format_unavailable`、`retry_stopped`、`shutting_down` 还没有触发处：分别等 B10 的熔断、decide 阶段，与 B5/B6 的退出状态。
+    4. 首字节超时与读空闲超时现在共用 `read_timeout_secs`（reqwest 的 read_timeout 同时钳制两者），码已经分开；B4 把两个时限拆成各自的配置。
+    5. `upgrade_unsupported` 只拦 WebSocket；`h2c` 之类按 HTTP 的规定忽略、照常代理（设计稿写的是「Upgrade（WebSocket）请求」）。

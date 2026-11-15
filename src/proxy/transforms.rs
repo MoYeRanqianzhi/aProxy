@@ -74,7 +74,7 @@ impl PerAttemptTransform {
             Ok(t) => {
                 tracing::info!(
                     attempt,
-                    url = %crate::config::mask_base_url(&t.url),
+                    url = %aproxy_ipc::redact::url(&t.url),
                     "重试前请求已由外部转换器重新改写"
                 );
                 Some(t)
@@ -163,7 +163,7 @@ pub(super) async fn apply_request_transform(
     .await
     {
         Ok(t) => {
-            tracing::info!(url = %crate::config::mask_base_url(&t.url), "请求已由外部转换器改写");
+            tracing::info!(url = %aproxy_ipc::redact::url(&t.url), "请求已由外部转换器改写");
             Ok(OutboundRequest {
                 method: t.method,
                 target_url: t.url,

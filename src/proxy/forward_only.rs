@@ -102,7 +102,7 @@ pub(super) async fn forward_only_proxy(
         Err(e) => {
             // 错误文本与目标 URL 都会进日志 / 最近错误 / 502 正文，一律先脱敏
             let e = redact_reqwest_error(e);
-            let masked_target = crate::config::mask_base_url(&target_url);
+            let masked_target = aproxy_ipc::redact::url(&target_url);
             // send() 的失败有三种来源：上游真的失败，或请求体适配器产出 Err 令
             // reqwest 主动中止（超限 / 客户端上传中断，各有一个标记）。判定顺序
             // 是刻意的：超限排在最前——它同时也会让适配器产出 Err，而「你的请求体

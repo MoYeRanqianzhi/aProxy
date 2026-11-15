@@ -7,7 +7,6 @@
 use std::path::PathBuf;
 
 use aproxy::cli::Cli;
-use aproxy::config::mask_base_url;
 use aproxy::daemon;
 use aproxy::ops::start::{Preflight, PreflightError, launch, preflight, resolve_runtime_config};
 use aproxy::ops::target::resolve_config_target;
@@ -126,10 +125,10 @@ pub(crate) async fn handle_start_cmd(
     println!("aProxy 已在后台启动");
     println!("  pid: {}", info.instance.pid);
     println!("  监听: http://{}", info.instance.listen_addr);
-    println!("  Base URL: {}", mask_base_url(&cfg.base_url));
+    println!("  Base URL: {}", aproxy_ipc::redact::url(&cfg.base_url));
     if !cfg.base_url.is_empty() {
         // 与上一行同一出口：这一行同样会被整段粘贴求助
-        let base = mask_base_url(cfg.base_url.trim_end_matches('/'));
+        let base = aproxy_ipc::redact::url(cfg.base_url.trim_end_matches('/'));
         println!(
             "  提示: 将你的 API base URL 指向 http://{}",
             info.instance.listen_addr

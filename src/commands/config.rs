@@ -3,7 +3,6 @@
 use std::path::PathBuf;
 
 use aproxy::config;
-use aproxy::config::mask_base_url;
 use aproxy::settings;
 
 use crate::util::{mask_secret, parse_kv};
@@ -40,7 +39,7 @@ fn mask_transform_args(args: &[String]) -> Vec<String> {
         {
             out.push(format!("{flag}={}", mask_secret(value)));
         } else {
-            out.push(mask_base_url(arg));
+            out.push(aproxy_ipc::redact::url(arg));
         }
     }
     out
@@ -225,7 +224,7 @@ pub(crate) fn handle_config_cmd(
             && let Err(msg) = cfg.validate_base_url()
         {
             // 错误消息内嵌 base_url 原文（可能带 user:pass），同一脱敏出口
-            let msg = msg.replace(&cfg.base_url, &mask_base_url(&cfg.base_url));
+            let msg = msg.replace(&cfg.base_url, &aproxy_ipc::redact::url(&cfg.base_url));
             eprintln!("base_url 无效，未保存: {msg}");
             std::process::exit(1);
         }
@@ -251,7 +250,10 @@ pub(crate) fn handle_config_cmd(
         warn_if_config_broken(&path);
         let cfg = config::load_from(&path).normalized();
         println!("配置文件: {}", path.display());
-        println!("base_url     = \"{}\"", mask_base_url(&cfg.base_url));
+        println!(
+            "base_url     = \"{}\"",
+            aproxy_ipc::redact::url(&cfg.base_url)
+        );
         println!("listen_addr  = \"{}\"", cfg.listen_addr);
         println!(
             "api_key      = {}",
@@ -433,7 +435,7 @@ pub(crate) fn handle_config_cmd(
             "proxy          = {}",
             cfg.proxy
                 .as_deref()
-                .map(mask_base_url)
+                .map(aproxy_ipc::redact::url)
                 .unwrap_or_else(|| "(未设置)".to_string())
         );
         println!(

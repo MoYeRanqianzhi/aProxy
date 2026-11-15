@@ -2,7 +2,7 @@
 //!
 //! 全部是纯展示/纯解析函数（无 IO、无状态），供各子命令模块共用。
 //! URL 形态的凭据（base_url、代理 URL 等）一律走 lib 侧的统一出口
-//! `config::mask_base_url`；本模块只管不透明的密钥值（api_key、头值等）。
+//! `aproxy_ipc::redact::url`；本模块只管不透明的密钥值（api_key、头值等）。
 
 /// 删掉本进程的台账条目（永久兼容契约 C3）后退出进程。`std::process::exit` 不跑析构，
 /// `aproxy_ipc::ledger::Registration` 管不到这条路，所以登记过台账的进程一律经这里退出；没登记过

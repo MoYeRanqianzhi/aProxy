@@ -3,13 +3,13 @@
 use super::*;
 
 /// 「代理请求」日志：请求转换之后、首轮之前各通道各记一次。URL 一律经
-/// mask_base_url：base_url 可能内嵌 user:pass，查询串可能带 key（Gemini 式
+/// redact::url：base_url 可能内嵌 user:pass，查询串可能带 key（Gemini 式
 /// ?key=），日志常被整段粘贴求助
 pub(super) fn log_proxied_request(method: &http::Method, path_and_query: &str, target_url: &str) {
     tracing::info!(
         method = %method,
-        path = %crate::config::mask_base_url(path_and_query),
-        target = %crate::config::mask_base_url(target_url),
+        path = %aproxy_ipc::redact::url(path_and_query),
+        target = %aproxy_ipc::redact::url(target_url),
         "代理请求"
     );
 }
@@ -162,7 +162,7 @@ pub(super) async fn forward_once(
 /// （`?key=...`），而这段文本会进日志、status 的最近错误和 502 正文。先剥掉 URL
 /// 再按原有形态附上脱敏版本——保留「for url (...)」便于排障时看出打到了哪里。
 pub(super) fn redact_reqwest_error(e: reqwest::Error) -> String {
-    let url = e.url().map(|u| crate::config::mask_base_url(u.as_str()));
+    let url = e.url().map(|u| aproxy_ipc::redact::url(u.as_str()));
     let e = e.without_url();
     match url {
         Some(u) => format!("{e} for url ({u})"),

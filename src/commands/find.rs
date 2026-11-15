@@ -55,7 +55,7 @@ fn print_list(items: &[find::DiscoveredConfig]) {
                 "  {}  端口 {}  上游 {}{}{}",
                 d.path.display(),
                 aproxy::daemon::port_of(&c.listen_addr),
-                aproxy::config::mask_base_url(&c.base_url),
+                aproxy_ipc::redact::url(&c.base_url),
                 alias_part,
                 default_part
             ),

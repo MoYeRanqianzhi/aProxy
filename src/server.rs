@@ -15,7 +15,6 @@ use aproxy::settings;
 use aproxy::watchdog;
 
 use crate::util::{chrono_like_timestamp, now_unix};
-use aproxy::config::mask_base_url;
 
 /// 本进程守护日志的最终路径（resolve + init 后写入，serve_forever 读取）。
 /// `None` = 前台实例（日志走控制台，无文件，注册表 log_path 落空串）。
@@ -142,7 +141,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
         listen_addr: actual_addr.clone(),
         config_path: cfg_path.display().to_string(),
         // 注册表与 IPC ping 都会把它交给 status 展示（只用于展示），脱敏后再登记
-        base_url: mask_base_url(&base_url),
+        base_url: aproxy_ipc::redact::url(&base_url),
         started_at: now_unix(),
         log_path: daemon_log_path_str,
         // 身份锚点：守护自查自写的进程创建时间（看门狗收养/处决/选举与
@@ -279,7 +278,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     // 日志与控制台都可能被粘贴分享，内嵌凭据的 base_url 一律打码后输出
     tracing::info!(
         listen = %actual_addr,
-        base_url = %mask_base_url(&base_url),
+        base_url = %aproxy_ipc::redact::url(&base_url),
         config = %cfg_path.display(),
         pid = %std::process::id(),
         "启动 aProxy"
@@ -326,7 +325,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     if !daemon_child {
         println!("aProxy 已启动（前台）");
         println!("  监听: http://{actual_addr}");
-        println!("  Base URL: {}", mask_base_url(&base_url));
+        println!("  Base URL: {}", aproxy_ipc::redact::url(&base_url));
         println!("按 Ctrl+C 退出。");
     }
 

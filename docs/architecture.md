@@ -57,7 +57,7 @@ home 的实例。
 | `src/process.rs` | 进程原语（平台层）：创建时间、存活与退出、镜像路径、按 pid + 创建时间核验身份（`record_identity`）与核验后终止、看护者等待进程死亡用的同步句柄 |
 | `src/watchdog.rs` | 看门狗：claim 选举、共享内存心跳、收养与处决、重拉退避状态机 |
 | `src/fsx.rs` | 原子写（`write_atomic`）：注册表、恢复记录、安装状态、settings.json、看护者 claim 共用 |
-| `aproxy-ipc/` | aproxy 与同它打交道的程序（桌面界面、第三方客户端）共用的契约，独立 crate，依赖很少。`home.rs`：home 的解析（永久兼容契约 C1）；`ledger.rs`：进程台账 `<home>/ledger/`（永久兼容契约 C3），长期运行的进程登记 pid、启动标记与角色，强制安装据此核验后结束进程 |
+| `aproxy-ipc/` | aproxy 与同它打交道的程序（桌面界面、第三方客户端）共用的契约，独立 crate，依赖很少。`code.rs`：错误码表（名字、族、`details` 的键与类型、HTTP 状态与退出码），`docs/error-codes.md` 由它生成、`tests/code_table.rs` 比对；`redact.rs`：打码的唯一出口（URL、密钥头、占位对象、已知密钥替换）；`endpoint.rs`：控制端点、心跳节、安装宣告节的名字与 `home_id`；`home.rs`：home 的解析（永久兼容契约 C1）；`ledger.rs`：进程台账 `<home>/ledger/`（永久兼容契约 C3），长期运行的进程登记 pid、启动标记与角色，强制安装据此核验后结束进程 |
 | `src/util.rs` | bin 侧共用小工具：时间戳、时长人性化、凭据打码、key=value 解析 |
 
 ## workspace 四成员
@@ -405,8 +405,8 @@ settings 注入、validate）干跑一遍，换监听地址时再探测新地址
   文件名端口归属判定。推论：优雅停止实例的日志在下次清理时删除；崩溃实例的
   日志由 `.restore` 引用保留到恢复成功
 - 全部输出对凭据打码——可安全粘贴分享。URL 展示的**唯一出口**是
-  `config::mask_base_url`（名称沿用最早只用于 base_url 的叫法，现在 base_url、
-  代理 URL、上游目标 URL、请求的 `路径?查询串`、reqwest 错误里的 URL 一律走它）：
+  `aproxy_ipc::redact::url`（base_url、代理 URL、上游目标 URL、请求的 `路径?查询串`、
+  reqwest 错误里的 URL 一律走它）：
   userinfo（用户名或密码任一存在）整体 `***@`，查询串保留键名、值变 `***`，片段
   整体遮掉，畸形 URL 保守多遮；api_key 与头值走 `util::mask_secret`（前 6 字符 +
   `***`）。`config --show` 另对转换器 `args` 的密钥旗标之后的值与 `extra` 打码

@@ -152,7 +152,7 @@ pub(super) fn inbound_rejection_response(
     method: &http::Method,
     uri: &http::Uri,
 ) -> Response {
-    let path = crate::config::mask_base_url(uri.path_and_query().map_or("/", |pq| pq.as_str()));
+    let path = aproxy_ipc::redact::url(uri.path_and_query().map_or("/", |pq| pq.as_str()));
     let body = match &rejection {
         InboundRejection::Host(host) => {
             tracing::warn!(method = %method, path = %path, host = %host, "入站请求被拒绝：Host 不在 allowed_hosts 白名单（未转发上游）");

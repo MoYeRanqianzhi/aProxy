@@ -1,6 +1,5 @@
 //! `aproxy status [--idle|--busy]`：列出运行中的实例。
 
-use aproxy::config::mask_base_url;
 use aproxy::daemon;
 use aproxy::ops::list::{ActivityFilter, enumerate};
 
@@ -56,7 +55,7 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
         println!(
             "    监听 http://{}   上游 {}   配置 {}",
             info.listen_addr,
-            mask_base_url(&info.base_url),
+            aproxy_ipc::redact::url(&info.base_url),
             info.config_path
         );
         let err_text = match &activity.last_error {

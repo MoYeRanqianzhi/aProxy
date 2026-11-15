@@ -43,9 +43,9 @@ pub(super) async fn proxy_handler(State(state): State<AppState>, req: Request) -
     // 判定，也不做响应体解码（本模式不对响应内容做任何检查，无需解码）。
     if state.config.forward_only_enabled() {
         let target_url = upstream_url(&state.config, &uri);
-        // 日志里的 URL 一律经 mask_base_url：base_url 可能内嵌 user:pass，客户端
+        // 日志里的 URL 一律经 redact::url：base_url 可能内嵌 user:pass，客户端
         // 查询串可能带 key（Gemini 式 ?key=），日志常被整段粘贴求助
-        tracing::info!(method = %method, target = %crate::config::mask_base_url(&target_url), "代理请求（仅转发）");
+        tracing::info!(method = %method, target = %aproxy_ipc::redact::url(&target_url), "代理请求（仅转发）");
         return forward_only_proxy(state, method, target_url, headers, req.into_body()).await;
     }
 

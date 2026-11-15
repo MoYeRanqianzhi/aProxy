@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use crate::cli::Cli;
-use crate::config::{self, Config, mask_base_url};
+use crate::config::{self, Config};
 use crate::daemon::{self, InstanceStatus};
 use crate::settings;
 use crate::spawn::{self, SpawnError};
@@ -62,7 +62,7 @@ pub fn resolve_runtime_config(cli: &Cli, cfg_path: &Path) -> Result<Config, Stri
             .flatten()
             .filter(|s| !s.is_empty())
         {
-            msg = msg.replace(raw, &mask_base_url(raw));
+            msg = msg.replace(raw, &aproxy_ipc::redact::url(raw));
         }
         let msg = if bounded_paths_from_settings && msg.contains("bounded_retry_paths") {
             format!("{msg}\n（该值来自 settings.json 的 bounded_retry_paths 全局默认，不在上述 toml 中）")

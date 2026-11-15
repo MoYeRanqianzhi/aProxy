@@ -51,7 +51,7 @@ pub(crate) fn resolve_daemon_log_path(
             if expanded.is_absolute() {
                 expanded
             } else {
-                aproxy::settings::home().join(expanded)
+                aproxy_ipc::home::home().join(expanded)
             }
         }
         None => aproxy::daemon::logs_dir().join(generate_random_log_name()),
@@ -76,9 +76,9 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     // 是给人看的同一路径。正常退出由守卫删除；下面经 process::exit 的路径一律改走
     // util::exit，同样会删
     let cfg_abs = std::path::absolute(cfg_path).unwrap_or_else(|_| cfg_path.to_path_buf());
-    let _ledger = aproxy::ledger::register(
-        &settings::home(),
-        aproxy::ledger::ROLE_INSTANCE,
+    let _ledger = crate::util::register_in_ledger(
+        &aproxy_ipc::home::home(),
+        aproxy_ipc::ledger::ROLE_INSTANCE,
         daemon::port_of(&listen_addr).parse().ok(),
         Some(&cfg_path.display().to_string()),
         Some(&cfg_abs),
@@ -222,9 +222,9 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
                 // restarting 窗口内本守护（尚为旧版本）补种的看护者会把滚动
                 // 重启误判为崩溃、用旧二进制重拉，与 install 拉锯。install
                 // 结束宣告消失 → 自检恢复 → 新看护者出簇（新 exe）。
-                if aproxy::install::announce::read(&settings::home(), &run_dir).is_some_and(|a| {
-                    aproxy::install::announce::is_active(&a, watchdog::now_millis())
-                }) {
+                if aproxy::install::announce::read(&aproxy_ipc::home::home(), &run_dir).is_some_and(
+                    |a| aproxy::install::announce::is_active(&a, watchdog::now_millis()),
+                ) {
                     continue;
                 }
                 if !watchdog::this_process_may_spawn_watchdog_in(&run_dir) {
@@ -507,7 +507,7 @@ mod tests {
     fn relative_log_file_resolves_against_aproxy_home() {
         // 相对路径一律相对 APROXY_HOME，与当前工作目录无关（守护进程的工作
         // 目录不可靠）；CLI --log-file 优先于配置；绝对路径原样；`~` 展开
-        let home = settings::home();
+        let home = aproxy_ipc::home::home();
         assert_eq!(
             resolve_daemon_log_path(None, Some("logs/a.log")),
             home.join("logs/a.log")

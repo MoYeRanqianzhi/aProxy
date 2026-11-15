@@ -87,7 +87,7 @@ fn violations_in(line: &str) -> Vec<String> {
         rest = arg;
     }
     // 去掉空白后取调用的第一个参数：字面量 "APROXY_HOME"，或以 HOME_ENV 结尾的常量路径
-    // （`HOME_ENV`、`aproxy::settings::HOME_ENV`）
+    // （`HOME_ENV`、`aproxy_ipc::home::HOME_ENV`）
     let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
     for call in [".env(", ".env_remove(", "set_var("] {
         let mut rest = compact.as_str();
@@ -143,7 +143,7 @@ fn the_check_recognizes_what_it_should() {
         "let mut child = std::process::Command::new(&bin)",
         r#"Command::new("aproxy")"#,
         r#"    .env("APROXY_HOME", home.path())"#,
-        "cmd.env(aproxy::settings::HOME_ENV, &home)",
+        "cmd.env(aproxy_ipc::home::HOME_ENV, &home)",
         r#"cmd.env_remove("APROXY_HOME")"#,
         r#"unsafe { std::env::set_var("APROXY_HOME", dir.path()) };"#,
     ] {

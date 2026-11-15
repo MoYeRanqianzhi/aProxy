@@ -511,10 +511,10 @@ jobs:
       # 正式版号（alpha.10/alpha.11 就这么被占掉的）
       - name: Align version with the release
         run: python3 .github/scripts/align-version.py
-      # 按依赖顺序：aproxy 依赖 aproxy-envelope 与 aproxy-desktop 的 registry 版本
+      # 按依赖顺序：aproxy 依赖 aproxy-envelope、aproxy-ipc 与 aproxy-desktop 的 registry 版本
       - name: Plan crates to publish
         id: plan
-        run: bash .github/scripts/plan-crates.sh aproxy-envelope aproxy-desktop aproxy
+        run: bash .github/scripts/plan-crates.sh aproxy-envelope aproxy-ipc aproxy-desktop aproxy
       # tauri-build 往包根写 gen/schemas/，包里要带着本平台的那几个文件，校验构建才不会被判为
       # 「改动了源码目录」（见 aproxy-desktop/Cargo.toml 的 include 说明）。这次构建的依赖产物
       # 校验构建接着用
@@ -522,7 +522,7 @@ jobs:
         if: contains(steps.plan.outputs.args, 'aproxy-desktop')
         run: cargo build -p aproxy-desktop --locked
       # 多个 -p 时 cargo（1.90+）按依赖顺序打包，并用本地刚打好的包校验后续包，所以
-      # envelope、desktop 的新版本尚未上 crates.io 时，aproxy 的 dry-run 也能通过。
+      # envelope、ipc、desktop 的新版本尚未上 crates.io 时，aproxy 的 dry-run 也能通过。
       # --allow-dirty：工作区被对齐步骤有意改为 tag 版本，非意外。
       - name: Dry run
         if: steps.plan.outputs.args != ''
@@ -559,7 +559,7 @@ jobs:
         run: python3 .github/scripts/align-version.py
       - name: Plan crates to publish
         id: plan
-        run: bash .github/scripts/plan-crates.sh aproxy-envelope aproxy-desktop aproxy
+        run: bash .github/scripts/plan-crates.sh aproxy-envelope aproxy-ipc aproxy-desktop aproxy
       - name: Generate the ACL schemas of aproxy-desktop
         if: contains(steps.plan.outputs.args, 'aproxy-desktop')
         run: cargo build -p aproxy-desktop --locked

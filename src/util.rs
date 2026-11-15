@@ -5,11 +5,31 @@
 //! `config::mask_base_url`；本模块只管不透明的密钥值（api_key、头值等）。
 
 /// 删掉本进程的台账条目（永久兼容契约 C3）后退出进程。`std::process::exit` 不跑析构，
-/// `aproxy::ledger::Registration` 管不到这条路，所以登记过台账的进程一律经这里退出；没登记过
+/// `aproxy_ipc::ledger::Registration` 管不到这条路，所以登记过台账的进程一律经这里退出；没登记过
 /// 的进程调用它也无妨（没有条目可删）。
 pub(crate) fn exit(code: i32) -> ! {
-    aproxy::ledger::remove_own();
+    aproxy_ipc::ledger::remove_own();
     std::process::exit(code)
+}
+
+/// 把本进程登记进台账（永久兼容契约 C3，见 `aproxy_ipc::ledger::register`），登记不成时
+/// 告警。登记不成不是错误，进程照常运行，只是强制安装看不见它——所以要留下一条日志。
+pub(crate) fn register_in_ledger(
+    home: &std::path::Path,
+    role: &str,
+    port: Option<u16>,
+    label: Option<&str>,
+    config: Option<&std::path::Path>,
+) -> aproxy_ipc::ledger::Registration {
+    let registration = aproxy_ipc::ledger::register(home, role, port, label, config);
+    if let Some(failure) = registration.failure() {
+        tracing::warn!(
+            error = %failure,
+            role,
+            "failed to write the process ledger entry; continuing without it (install --force will not see this process)"
+        );
+    }
+    registration
 }
 
 /// 当前 Unix 秒（系统时钟早于 epoch 时回退 0——仅用于展示，不影响逻辑）

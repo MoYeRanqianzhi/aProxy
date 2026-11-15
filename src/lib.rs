@@ -6,7 +6,6 @@ pub mod doctor;
 pub mod find;
 pub mod fsx;
 pub mod install;
-pub mod ledger;
 pub mod ops;
 pub mod process;
 pub mod proxy;
@@ -127,6 +126,13 @@ pub const VERSION_LINE: &str = concat!(
 
 #[cfg(test)]
 mod tests {
+    /// 台账条目的 `version` 字段由 aproxy-ipc 写，写的是它自己的包版本；两个包同号发版，
+    /// 这个字段才是「启动这个进程的 aproxy 的版本」。
+    #[test]
+    fn aproxy_ipc_is_released_under_the_same_version() {
+        assert_eq!(aproxy_ipc::VERSION, env!("CARGO_PKG_VERSION"));
+    }
+
     /// 按 VERSION_LINE 的格式拼出任意一种产物的版本行
     fn version_line(variant: &str, target: &str, cpu_level: &str) -> String {
         format!(

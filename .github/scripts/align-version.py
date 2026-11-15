@@ -10,12 +10,13 @@ v…t1 发出去的产物仍自报旧版本，按版本安装的全部渠道自�
 - 手动演练（workflow_dispatch）：输入的 version（环境变量 DRY_RUN_VERSION），留空就用 Cargo.toml
   里现有的版本。
 
-改动的地方（aproxy 与 aproxy-desktop 同步发版，见 aproxy-desktop/Cargo.toml 开头；aproxy-envelope
+改动的地方（aproxy 与 aproxy-desktop、aproxy-ipc 同步发版，见各自 Cargo.toml 开头；aproxy-envelope
 在 aproxy 0.2.0 正式版之前也随主线同号发预发布版，见 aproxy-envelope/Cargo.toml 开头）：
-- 根 Cargo.toml 的 [package] version，以及它对 aproxy-desktop、aproxy-envelope 的版本要求（`=` 精确钉住）；
-- aproxy-desktop/Cargo.toml 与 aproxy-envelope/Cargo.toml 的 version；
+- 根 Cargo.toml 的 [package] version，以及它对 aproxy-desktop、aproxy-envelope、aproxy-ipc 的版本要求
+  （`=` 精确钉住）；
+- aproxy-desktop/Cargo.toml、aproxy-envelope/Cargo.toml 与 aproxy-ipc/Cargo.toml 的 version；
 - aproxy-format/Cargo.toml 对 aproxy-envelope 的版本要求（普通的 caret 要求，与 envelope 同号）；
-- Cargo.lock 里 aproxy、aproxy-desktop、aproxy-envelope 三个条目的 version。
+- Cargo.lock 里 aproxy、aproxy-desktop、aproxy-envelope、aproxy-ipc 四个条目的 version。
 aproxy-format 自己的版本属于它独立的发版线（release-format workflow），不动。
 
 最后把版本写进 $GITHUB_ENV 的 RELEASE_VERSION，同一 job 后面的步骤直接用。
@@ -67,7 +68,7 @@ def main():
 
     # 根 Cargo.toml：[workspace] 段没有 version 行，第一条 ^version = 就是 [package] 的
     root = substitute(root, r'^version = "[^"]*"', f'version = "{version}"', "根 Cargo.toml 的 [package] version", re.M)
-    for name in ("aproxy-desktop", "aproxy-envelope"):
+    for name in ("aproxy-desktop", "aproxy-envelope", "aproxy-ipc"):
         root = substitute(
             root,
             rf'^({name} = \{{ version = )"[^"]*"',
@@ -77,7 +78,7 @@ def main():
         )
     write("Cargo.toml", root)
 
-    for member in ("aproxy-desktop", "aproxy-envelope"):
+    for member in ("aproxy-desktop", "aproxy-envelope", "aproxy-ipc"):
         path = f"{member}/Cargo.toml"
         text = substitute(read(path), r'^version = "[^"]*"', f'version = "{version}"', f"{path} 的 version", re.M)
         write(path, text)
@@ -94,7 +95,7 @@ def main():
     write("aproxy-format/Cargo.toml", fmt)
 
     lock = read("Cargo.lock")
-    for name in ("aproxy", "aproxy-desktop", "aproxy-envelope"):
+    for name in ("aproxy", "aproxy-desktop", "aproxy-envelope", "aproxy-ipc"):
         lock = substitute(
             lock,
             rf'(name = "{name}"\r?\nversion = )"[^"]*"',

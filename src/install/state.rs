@@ -246,7 +246,7 @@ pub const STALE_AFTER_SECS: u64 = 600;
 /// 状态文件路径：`<home>/install/state.json`。它属于 home，不随 APROXY_RUN_DIR
 /// 搬走——安装者的一切状态都收在 `<home>/install/` 下（见 [`super::install_dir_in`]）。
 pub fn state_path() -> PathBuf {
-    state_path_in(&crate::settings::home())
+    state_path_in(&aproxy_ipc::home::home())
 }
 
 /// 同上，home 可指定（测试注入用）。
@@ -270,7 +270,7 @@ pub fn load_in(home: &Path) -> Option<InstallState> {
 
 /// 同上，真实位置。
 pub fn load() -> Option<InstallState> {
-    load_in(&crate::settings::home())
+    load_in(&aproxy_ipc::home::home())
 }
 
 /// stale 判定（锁失效 = 可接管）：**原安装进程已死即残留**（进程死亡后

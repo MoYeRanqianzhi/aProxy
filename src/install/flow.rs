@@ -312,7 +312,7 @@ fn target_drives(target: &str) -> bool {
 /// 安装用的一致才能交棒，否则接手者会去另一个 home 找 install.state（库层测试
 /// 显式传 home、进程环境却指向别处，就是这种情形）。
 fn successor_sees_same_home(home: &Path, run_dir: &Path) -> bool {
-    crate::settings::home() == home && crate::daemon::run_dir() == run_dir
+    aproxy_ipc::home::home() == home && crate::daemon::run_dir() == run_dir
 }
 
 /// 本进程是否就是 `path` 这个文件（规范化后比较）。

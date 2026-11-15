@@ -28,18 +28,18 @@ pub fn run_dir() -> PathBuf {
     if let Ok(d) = std::env::var("APROXY_RUN_DIR") {
         return PathBuf::from(d);
     }
-    crate::settings::home().join("run")
+    aproxy_ipc::home::home().join("run")
 }
 
 /// 守护进程日志目录：`<home>/logs/`
 pub fn logs_dir() -> PathBuf {
-    crate::settings::home().join("logs")
+    aproxy_ipc::home::home().join("logs")
 }
 
 /// spool 临时文件目录基址：`<home>/spool/<端口>/`。每实例独立子目录，
 /// 启动时清空自己的子目录即可回收崩溃残留，互不干扰。
 pub fn spool_dir_for(port: &str) -> PathBuf {
-    crate::settings::home().join("spool").join(port)
+    aproxy_ipc::home::home().join("spool").join(port)
 }
 
 /// 清空实例的 spool 目录（启动时调用）：删除崩溃/强杀残留的 *.spooltmp。

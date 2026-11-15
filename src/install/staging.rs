@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 /// staging 备料目录：`<home>/install/staging/<目标版本>/`。在线渠道的下载暂存
 /// （`.dl` 半截文件、cargo 渠道的构建目录）也落在这里，见 download::fetch_artifact。
 pub fn staging_dir(target_version: &str) -> PathBuf {
-    staging_dir_in(&crate::settings::home(), target_version)
+    staging_dir_in(&aproxy_ipc::home::home(), target_version)
 }
 
 /// 同上，主目录可指定（测试注入用）。

@@ -1,5 +1,5 @@
 //! 强制安装 `aproxy install --force`：永久兼容契约 C6–C8 的执行体。其余几项各在
-//! 一处：台账 C3 在 `crate::ledger`，唯一中间名 C2 在 `super::swap`，安装锁 C4 在
+//! 一处：台账 C3 在 `aproxy_ipc::ledger`，唯一中间名 C2 在 `super::swap`，安装锁 C4 在
 //! `super::lock_install_in`，`--version` 的格式 C5 在 `crate::VERSION_LINE`。设计全文见
 //! `.agents/plan/release-0.2.0.md` 的「W2b 强制安装：永久兼容契约」一节。
 //!
@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use super::download::Channel;
 use super::swap;
-use crate::ledger::{
+use aproxy_ipc::ledger::{
     self, LedgerEntry, ROLE_DESKTOP, ROLE_INSTALLER, ROLE_INSTANCE, ROLE_WATCHDOG,
 };
 
@@ -948,7 +948,7 @@ fn clear_stale_work_dirs(home: &Path) {
 /// 调用方以 10 结束（什么都没动）。强制安装只修已经装着的 home：home 不存在多半是
 /// APROXY_HOME 写错了，照样装下去只会在一个新目录里「成功」，真正要修的那个原封不动。
 pub fn locate_home() -> Result<PathBuf, String> {
-    let home = crate::settings::resolve_home()?;
+    let home = aproxy_ipc::home::resolve_home()?;
     if !home.is_dir() {
         return Err(format!(
             "aproxy 的主目录 {} 不存在：强制安装只修已经装着的 aproxy，多半是 APROXY_HOME 写错了；首次安装请用一键安装脚本。",

@@ -3,7 +3,8 @@
 //! 库（`src/lib.rs` 及其子模块）的调用方有两个：命令行把操作的结果渲染成文字、决定退出码；
 //! 桌面界面在自己的进程里调用同一批函数。库里的 `println!` 界面拿不到，`process::exit` 会
 //! 把界面一起带走——所以这两样只许出现在二进制一侧（`src/main.rs`、`src/commands/`、
-//! `src/server.rs`、`src/util.rs`）。这个测试逐个扫描库的源文件，守着这条线。
+//! `src/server.rs`、`src/util.rs`）。这个测试逐个扫描库的源文件，守着这条线。aproxy-ipc 是
+//! 更多程序（界面、第三方客户端）要链接的库，同样在扫描之内。
 //!
 //! 不在检查之内的：
 //! - 测试代码（`#[cfg(test)]` 的条目）与注释；
@@ -39,8 +40,11 @@ fn library_sources() -> Vec<PathBuf> {
             }
         }
     }
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src = root.join("src");
     let mut out = Vec::new();
+    // aproxy-ipc 整个是库，没有二进制一侧
+    walk(&root.join("aproxy-ipc").join("src"), &mut out);
     for entry in std::fs::read_dir(&src).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -106,6 +110,12 @@ fn library_neither_prints_nor_exits() {
     assert!(
         sources.iter().any(|p| p.ends_with("ops/stop.rs")),
         "没扫到操作层"
+    );
+    assert!(
+        sources
+            .iter()
+            .any(|p| p.ends_with("aproxy-ipc/src/ledger.rs")),
+        "没扫到 aproxy-ipc"
     );
     assert!(
         !sources.iter().any(|p| p.ends_with("main.rs")),

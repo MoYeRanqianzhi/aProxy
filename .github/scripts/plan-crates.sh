@@ -6,7 +6,7 @@
 # 或网络失败一律硬失败——只有「已存在」这一种情况可以跳过，不用 || 吞掉错误。于是发布 job 失败
 # 后可以单独 re-run，已发布的不会重发。
 #
-# 参数按依赖顺序排列，被依赖的在前（aproxy 依赖 aproxy-envelope 与 aproxy-desktop 的 registry
+# 参数按依赖顺序排列，被依赖的在前（aproxy 依赖 aproxy-envelope、aproxy-ipc 与 aproxy-desktop 的 registry
 # 版本）。结果以 `args=-p <名> …`（全部已发布时为空）写进 $GITHUB_OUTPUT，直接接在
 # `cargo publish` 后面。
 #

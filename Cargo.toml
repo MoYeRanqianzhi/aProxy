@@ -1,5 +1,6 @@
-# workspace 四成员：aproxy（本包）/ aproxy-format（官方示例 format 二进制）/
-# aproxy-envelope（信封契约 crate，两二进制共同类型单源维护）/ aproxy-desktop
+# workspace 五成员：aproxy（本包）/ aproxy-format（官方示例 format 二进制）/
+# aproxy-envelope（信封契约 crate，两二进制共同类型单源维护）/ aproxy-ipc（aproxy 与同它
+# 打交道的程序共用的契约：home 的解析、进程台账）/ aproxy-desktop
 # （桌面界面：Tauri 2 外壳与嵌入的前端，aproxy 的 desktop 特性引入它）。
 # aproxy-format 与 aproxy 的依赖树完全隔离——switchyard-translation 不会进入 aproxy
 # 的编译闭包，「aproxy 本体体积不受影响」由此保证。
@@ -17,7 +18,7 @@
 # 源码构建用的裸 `cargo build` 也会连带编译 aproxy-format，并按它的
 # rust-version 1.96.1 拒绝更旧的工具链，而 aproxy 本身只要求 1.90。
 [workspace]
-members = [".", "aproxy-envelope", "aproxy-format", "aproxy-desktop"]
+members = [".", "aproxy-envelope", "aproxy-ipc", "aproxy-format", "aproxy-desktop"]
 resolver = "3"
 
 [package]
@@ -121,6 +122,9 @@ regex = "1"
 # 同样用 `=` 精确钉住：预发布版之间的接口不守 semver。发布前 align-version.py 按正则
 # 把这一行与版本一起改成 tag 版本，改这一行的写法要同步改那个脚本（同下）。
 aproxy-envelope = { version = "=0.2.0-alpha.1", path = "aproxy-envelope" }
+# aproxy 与同它打交道的程序共用的契约（home 的解析、进程台账）。version + path 双写、
+# `=` 精确钉住、由 align-version.py 改写，理由都同上。
+aproxy-ipc = { version = "=0.2.0-alpha.1", path = "aproxy-ipc" }
 # 桌面界面（desktop 特性）：Tauri 外壳与嵌入的前端。version + path 双写，理由同上；
 # 版本与本包同步。它不依赖本包（否则成环），需要的东西（home、运行时）由 bin 在启动
 # 界面时传进去。版本要求用 `=` 精确钉住：两者总是同号一起发布，aproxy-desktop 的接口
@@ -157,16 +161,12 @@ ruzstd = "0.9.0"
 # 的进程时枚举全部进程（CreateToolhelp32Snapshot）。
 # Win32_System_IO：安装锁直接调用 LockFileEx / UnlockFileEx（它们的 OVERLAPPED 参数在
 # 这个 feature 里）——锁原语是永久兼容契约 C4，不经 std 的 File::try_lock。
-# Win32_UI_Shell、Win32_System_Com：USERPROFILE 为空时按 FOLDERID_Profile 取用户目录
-# （SHGetKnownFolderPath，结果用 CoTaskMemFree 释放）——home 的算法是永久兼容契约 C1。
-windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_UI_Shell", "Win32_System_Com"] }
+# home 的解析（C1）与台账（C3）要的 Win32_UI_Shell、Win32_System_Com 在 aproxy-ipc 里声明。
+windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO"] }
 
 [target.'cfg(unix)'.dependencies]
-# 进程台账（src/ledger.rs）结束进程时要用的系统调用：Linux 的 pidfd_open /
-# pidfd_send_signal（经 libc::syscall 与 SYS_* 常量）、macOS 的 proc_pidinfo（读
-# proc_bsdinfo 的启动时刻）。用 libc 而不是像别处那样手写 extern "C"：proc_bsdinfo
-# 的结构体布局与各架构的系统调用号手抄容易抄错，而 libc 已经经 tokio 在依赖图里，
-# 不增加编译闭包。
+# 安装锁（src/install/mod.rs）直接调用 flock：锁原语是永久兼容契约 C4，不经 std 的
+# File::try_lock。libc 已经经 tokio 在依赖图里，不增加编译闭包。
 libc = "0.2"
 
 [dev-dependencies]

@@ -92,7 +92,7 @@ impl TestHome {
             "测试 home 必须在临时目录里: {}",
             canonical.display()
         );
-        if let Some(user_dir) = aproxy::settings::user_dir() {
+        if let Some(user_dir) = aproxy_ipc::home::user_dir() {
             assert!(
                 !canonical.starts_with(real(&user_dir.join(".aproxy"))),
                 "测试 home 绝不能是用户的 ~/.aproxy: {}",
@@ -140,7 +140,7 @@ impl TestHome {
     /// 就回到用户真实的 home（`tests/test_home_check.rs` 会拦下这种写法）。
     pub fn cmd_with(&self, exe: impl AsRef<OsStr>) -> Command {
         let mut cmd = Command::new(exe);
-        cmd.env(aproxy::settings::HOME_ENV, &self.home)
+        cmd.env(aproxy_ipc::home::HOME_ENV, &self.home)
             .env("APROXY_LANG", "en");
         for var in PROXY_VARS {
             cmd.env_remove(var);
@@ -187,9 +187,10 @@ impl Drop for TestHome {
         // 不过就什么都不做，pid 被复用也误伤不了别人。跳过测试进程自己：库层测试可能在进程
         // 内登记过它（例如替测试进程写的条目），结束它就等于中止整个测试程序
         let me = std::process::id();
-        for found in aproxy::ledger::read_all_in(&self.home) {
+        for found in aproxy_ipc::ledger::read_all_in(&self.home) {
             if found.entry.pid != me {
-                let _ = aproxy::ledger::terminate(&found.entry, std::time::Duration::from_secs(5));
+                let _ =
+                    aproxy_ipc::ledger::terminate(&found.entry, std::time::Duration::from_secs(5));
             }
         }
     }

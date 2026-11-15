@@ -57,7 +57,7 @@ home 的实例。
 | `src/process.rs` | 进程原语（平台层）：创建时间、存活与退出、镜像路径、按 pid + 创建时间核验身份（`record_identity`）与核验后终止、看护者等待进程死亡用的同步句柄 |
 | `src/watchdog.rs` | 看门狗：claim 选举、共享内存心跳、收养与处决、重拉退避状态机 |
 | `src/fsx.rs` | 原子写（`write_atomic`）：注册表、恢复记录、安装状态、settings.json、看护者 claim 共用 |
-| `src/ledger.rs` | 进程台账 `<home>/ledger/`（永久兼容契约 C3）：长期运行的进程登记 pid、启动标记与角色，强制安装据此核验后结束进程 |
+| `aproxy-ipc/` | aproxy 与同它打交道的程序（桌面界面、第三方客户端）共用的契约，独立 crate，依赖很少。`home.rs`：home 的解析（永久兼容契约 C1）；`ledger.rs`：进程台账 `<home>/ledger/`（永久兼容契约 C3），长期运行的进程登记 pid、启动标记与角色，强制安装据此核验后结束进程 |
 | `src/util.rs` | bin 侧共用小工具：时间戳、时长人性化、凭据打码、key=value 解析 |
 
 ## workspace 四成员
@@ -500,7 +500,7 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
   bin 运行的进程（只报告；macOS 不做）。home 不存在直接 10。退出码冻结、按实际发生的事
   给：0 完成；10 一个进程都没结束；11 结束过进程、二进制没换；12 二进制已换、有实例
   没回来。写输出失败不改变退出码。契约样本钉在 `tests/force_contract.rs`
-- **台账**（`src/ledger.rs`，契约 C3）：实例、看护者与安装者在占端口或拉子进程之前原子
+- **台账**（`aproxy-ipc/src/ledger.rs`，契约 C3）：实例、看护者与安装者在占端口或拉子进程之前原子
   写入 `<home>/ledger/<pid>.json`（pid、启动标记、角色、版本，可选端口、说明与实例配置
   文件的绝对路径 `config`），正常退出删除（Windows 上写入与删除短暂重试），
   `process::exit` 之前一律先删自己的条目（二进制一侧的 `util::exit`）。启动标记按平台冻结（Windows 创建时间

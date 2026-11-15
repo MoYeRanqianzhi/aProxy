@@ -12,7 +12,7 @@ use common::{TestHome, free_port};
 
 use aproxy::install::force::{self, Manifest, ManifestAsset, OnlineSpec};
 use aproxy::install::swap::{OLD_PREFIX, bin_dir_in, bin_path_in};
-use aproxy::ledger::{self, LedgerEntry};
+use aproxy_ipc::ledger::{self, LedgerEntry};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

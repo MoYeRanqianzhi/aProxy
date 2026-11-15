@@ -82,7 +82,7 @@ async fn run(cli: Cli) {
     // 要读 home 的命令都拒绝运行——相对路径随工作目录解析成不同的 home，在这里报错比在
     // 错误的目录里读写强。`--version`、`--help` 不读 home，在上面已经结束；强制安装在
     // 上面自己报告（退出码 10）
-    if let Err(e) = settings::resolve_home() {
+    if let Err(e) = aproxy_ipc::home::resolve_home() {
         eprintln!("[ERROR] {e}");
         std::process::exit(1);
     }
@@ -125,9 +125,9 @@ async fn run(cli: Cli) {
     if cli.daemon_watchdog {
         // 进程台账（永久兼容契约 C3）：看护者在拉起任何子进程（重拉实例、续作安装）之前
         // 登记，强制安装据此先于实例结束它，免得它把刚结束的实例当成崩溃重新拉起
-        let _ledger = aproxy::ledger::register(
-            &settings::home(),
-            aproxy::ledger::ROLE_WATCHDOG,
+        let _ledger = util::register_in_ledger(
+            &aproxy_ipc::home::home(),
+            aproxy_ipc::ledger::ROLE_WATCHDOG,
             None,
             None,
             None,

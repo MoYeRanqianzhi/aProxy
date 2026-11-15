@@ -5,12 +5,13 @@
 //! **改这些测试就是破坏契约。** 从 0.2.0 起，任意版本的 `aproxy install --force` 都要能
 //! 把任意版本装进同一个 home、停掉任意版本启动的进程；这里每一条断言都是别的版本已经
 //! 写进二进制、收不回来的假设。某条断言挡住了你的改动，该改的是你的改动，不是断言——
-//! 契约只许追加可选字段（追加时在这里补新的断言，旧的一条不动）。
+//! 契约只许追加可选字段（追加时在这里补新的断言，旧的一条不动）。冻结的是断言，不是代码放在
+//! 哪里：被钉住的代码搬了位置（home 的解析与台账现在在 aproxy-ipc），只改 `use` 路径。
 //!
 //! 隔离：会运行 aproxy 的测试都把 APROXY_HOME 设为临时目录（见 [`temp_home`]）。
 
 use aproxy::install::force::{self, Manifest, VersionLine};
-use aproxy::ledger::{self, LedgerEntry};
+use aproxy_ipc::ledger::{self, LedgerEntry};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -25,7 +26,7 @@ fn temp_home() -> tempfile::TempDir {
         "测试 home 必须在临时目录里: {}",
         home.display()
     );
-    if let Some(user_home) = aproxy::settings::user_dir() {
+    if let Some(user_home) = aproxy_ipc::home::user_dir() {
         assert!(
             !home.starts_with(real(&user_home.join(".aproxy"))),
             "测试 home 绝不能是用户的 ~/.aproxy: {}",
@@ -91,7 +92,7 @@ fn c1_c2_c4_locations_and_names() {
 /// 不改本进程的环境，也就不可能把 home 指到用户真正在用的目录）。
 #[test]
 fn c1_home_resolution_rules() {
-    use aproxy::settings::{HOME_ENV, USER_DIR_ENV, home_from, user_dir_from};
+    use aproxy_ipc::home::{HOME_ENV, USER_DIR_ENV, home_from, user_dir_from};
     use std::ffi::OsStr;
     assert_eq!(HOME_ENV, "APROXY_HOME");
     assert_eq!(

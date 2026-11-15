@@ -5760,7 +5760,7 @@ fn tilde_expands_to_the_c1_user_dir() {
     let out = home
         .cmd()
         .args(["alias", "add", "tilde", "~/no-such-config.toml"])
-        .env(aproxy::settings::USER_DIR_ENV, user.path())
+        .env(aproxy_ipc::home::USER_DIR_ENV, user.path())
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);

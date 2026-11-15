@@ -775,12 +775,12 @@ fn trim_transform_command(t: Option<TransformConfig>) -> Option<TransformConfig>
 }
 
 /// `~` 前缀展开：`~/x`、`~\x`、裸 `~` → 用户目录；其余原样。用户目录是 C1 的那一个
-/// （见 `settings::user_dir`）：`~` 在 aproxy 里处处指同一个目录，配置里的 `~` 与命令行
+/// （见 `aproxy_ipc::home::user_dir`）：`~` 在 aproxy 里处处指同一个目录，配置里的 `~` 与命令行
 /// 路径参数里的 `~`、home 的默认位置 `~/.aproxy` 不会落在两个地方。
 /// 展开产物统一用 `/` 分隔（Windows API 同样接受）。
 pub fn expand_tilde(s: &str) -> String {
     let home = || {
-        crate::settings::user_dir()
+        aproxy_ipc::home::user_dir()
             .map(|p| {
                 p.display()
                     .to_string()
@@ -804,9 +804,9 @@ pub fn config_path() -> PathBuf {
 }
 
 /// 返回配置目录：aProxy 主目录（`APROXY_HOME`，未设 = `~/.aproxy`，
-/// 见 `settings::home`）。
+/// 见 `aproxy_ipc::home::home`）。
 pub fn config_dir() -> PathBuf {
-    crate::settings::home()
+    aproxy_ipc::home::home()
 }
 
 /// 加载配置：若文件不存在则返回默认配置（base_url 为空，后续 validate 会提示）。
@@ -953,7 +953,7 @@ mod tests {
     #[test]
     fn tilde_expands_to_the_c1_user_dir() {
         // 与路径参数、home 的默认位置同一来源；产物用 `/` 分隔，只认开头的 `~`
-        let user = crate::settings::user_dir().unwrap().display().to_string();
+        let user = aproxy_ipc::home::user_dir().unwrap().display().to_string();
         let user = user.trim_end_matches(['/', '\\']);
         assert_eq!(expand_tilde("~"), user);
         assert_eq!(expand_tilde("~/bin/x"), format!("{user}/bin/x"));

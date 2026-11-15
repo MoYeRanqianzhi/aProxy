@@ -27,9 +27,9 @@ pub(crate) async fn handle_force_cmd(args: &InstallArgs) -> ! {
             std::process::exit(force::EXIT_UNCHANGED);
         }
     };
-    let _ledger = aproxy::ledger::register(
+    let _ledger = crate::util::register_in_ledger(
         &home,
-        aproxy::ledger::ROLE_INSTALLER,
+        aproxy_ipc::ledger::ROLE_INSTALLER,
         None,
         Some("install --force"),
         None,
@@ -52,7 +52,7 @@ pub(crate) async fn handle_force_cmd(args: &InstallArgs) -> ! {
 
 /// 入口分派：--abort / --from / --adopt / --continue（续作）/ 无参提示。
 pub(crate) async fn handle_install_cmd(args: InstallArgs) {
-    let home = aproxy::settings::home();
+    let home = aproxy_ipc::home::home();
     let run_dir = aproxy::daemon::run_dir();
 
     if args.abort {
@@ -63,9 +63,9 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
     // 先结束它们、再去拿安装锁。只下载 skill 文档的 --skills-only 不碰 bin/，不登记。
     // 本文件里的退出一律走 util::exit：process::exit 不跑析构，守卫删不到条目
     let _ledger = (args.continue_ || !args.skills_only).then(|| {
-        aproxy::ledger::register(
+        crate::util::register_in_ledger(
             &home,
-            aproxy::ledger::ROLE_INSTALLER,
+            aproxy_ipc::ledger::ROLE_INSTALLER,
             None,
             Some(if args.continue_ {
                 "install --continue"
@@ -227,7 +227,7 @@ async fn query_latest(
 /// 同一语义。成功后输出落位位置与「安装到 agent 目录由用户/agent 自行链接」
 /// 提示。
 async fn run_skills_only(args: &InstallArgs) {
-    let home = aproxy::settings::home();
+    let home = aproxy_ipc::home::home();
     let settings = aproxy::settings::load();
     let proxy = args
         .download_proxy

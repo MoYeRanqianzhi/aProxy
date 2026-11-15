@@ -1,0 +1,41 @@
+[package]
+name = "aproxy-ipc"
+# 与 aproxy 主线同号发版（发布顺序本包在 aproxy 之前）：发布前由
+# .github/scripts/align-version.py 一起对齐。aproxy 对它的版本要求用 `=` 精确钉住——
+# 预发布版之间的接口不守 semver。
+version = "0.2.0-alpha.1"
+edition = "2024"
+# let 链（if let … && …）要 1.88
+rust-version = "1.88"
+description = "Contracts shared by aproxy and the programs that talk to it: error codes, redaction, endpoint names, the process ledger"
+license = "MIT"
+authors = ["aProxy Contributors"]
+repository = "https://github.com/MoYeRanqianzhi/aProxy"
+keywords = ["aproxy", "ipc", "contract"]
+categories = ["network-programming"]
+# crates.io 白名单：只装代码。前导 / 锚定本包的根
+include = ["/src/**", "/Cargo.toml"]
+
+# 依赖刻意保持很少：本包会被 aproxy 本体、桌面界面与第三方的客户端一起链接，这里每多一个
+# 依赖，它们的编译闭包就都多一个。新增依赖之前先看能不能用标准库写。
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+# 台账（src/ledger.rs）读进程创建时间、核验属主、结束进程。与 aproxy 一样精确钉在
+# =0.52.0：HANDLE 在 windows-sys 0.59+ 从 isize 改为 *mut c_void，句柄逻辑按 isize 书写；
+# 两个包钉同一个版本，依赖树里只有一份。
+# Win32_UI_Shell、Win32_System_Com：home 的解析在 USERPROFILE 为空时问系统要用户目录
+# （SHGetKnownFolderPath、CoTaskMemFree）。
+windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_UI_Shell", "Win32_System_Com"] }
+
+[target.'cfg(unix)'.dependencies]
+# 台账结束进程时要用的系统调用：Linux 的 pidfd_open / pidfd_send_signal（经 libc::syscall
+# 与 SYS_* 常量）、macOS 的 proc_pidinfo（读 proc_bsdinfo 的启动时刻）。用 libc 而不是手写
+# extern "C"：proc_bsdinfo 的结构体布局与各架构的系统调用号手抄容易抄错。home 的解析在
+# HOME 为空时经 getpwuid_r 读 passwd 条目，也用它。
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -103,6 +103,7 @@ version = "0.2.0-alpha.1"
 dependencies = [
  "aproxy-desktop",
  "aproxy-envelope",
+ "aproxy-ipc",
  "axum",
  "brotli",
  "brotli-decompressor",
@@ -169,6 +170,17 @@ dependencies = [
  "tempfile",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
+]
+
+[[package]]
+name = "aproxy-ipc"
+version = "0.2.0-alpha.1"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

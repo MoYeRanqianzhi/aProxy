@@ -44,7 +44,7 @@ pub(crate) fn handle_desktop_cmd() -> ! {
 
 #[cfg(all(feature = "desktop", not(test)))]
 pub(crate) fn handle_desktop_cmd() -> ! {
-    use aproxy::{ledger, settings};
+    use aproxy_ipc::ledger;
 
     // 写失败一律忽略：Windows 上从快捷方式启动时，控制台紧接着就被释放（见下）
     crate::server::init_force_logging();
@@ -100,7 +100,7 @@ pub(crate) fn handle_desktop_cmd() -> ! {
         }));
     }
 
-    let home = settings::resolve_home().unwrap_or_else(|e| fail(&e));
+    let home = aproxy_ipc::home::resolve_home().unwrap_or_else(|e| fail(&e));
 
     // 同一个 home 只开一个界面。alpha 还不会把已开的窗口切到前台，只说明一下。被杀、崩溃的
     // 界面留下的死条目顺手删掉（删之前重读，确认文件仍是读到的那一条），不必等强制安装来清
@@ -150,7 +150,7 @@ pub(crate) fn handle_desktop_cmd() -> ! {
     }
 
     // 永久兼容契约 C3：在拉起任何子进程之前登记，强制安装据此找到并结束界面进程
-    let _ledger = ledger::register(&home, ledger::ROLE_DESKTOP, None, None, None);
+    let _ledger = crate::util::register_in_ledger(&home, ledger::ROLE_DESKTOP, None, None, None);
 
     // 与 main 里其余命令一样的兜底：有残留的安装状态就静默拉起续作（看护者不在时靠它）
     if aproxy::install::state::load().is_some()

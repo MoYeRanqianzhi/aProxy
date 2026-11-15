@@ -1,4 +1,4 @@
-//! 进程台账 `<home>/ledger/`：永久兼容契约 C3（设计全文见
+//! 进程台账 `<home>/ledger/`：永久兼容契约 C3（设计全文见仓库里
 //! `.agents/plan/release-0.2.0.md` 的「W2b 强制安装：永久兼容契约」一节）。
 //!
 //! **永久兼容契约：本文件定义的目录名、文件名、条目的 JSON 字段（名字、类型、含义）、
@@ -150,7 +150,9 @@ impl LedgerEntry {
             pid,
             start: start_marker(pid)?,
             role: role.to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            // 本包与 aproxy 同号发版（见 Cargo.toml），所以这就是 aproxy 的版本；aproxy 的
+            // 单测核对两者相同
+            version: crate::VERSION.to_string(),
             port,
             label: label.map(str::to_string),
             exe: std::env::current_exe()
@@ -204,7 +206,37 @@ fn own_entry() -> std::sync::MutexGuard<'static, Option<PathBuf>> {
 /// 退出的路径不跑析构，退出之前要先调 [`remove_own`]（二进制一侧有合在一起的便利函数）。
 #[must_use = "守卫一析构就会删掉台账条目，要让它活到进程结束"]
 pub struct Registration {
-    _private: (),
+    failure: Option<RegisterFailure>,
+}
+
+/// 没能登记进台账的原因。进程照常运行，只是强制安装看不见它。
+#[derive(Debug)]
+pub enum RegisterFailure {
+    /// 本平台读不到本进程的启动标记，条目没有写
+    NoStartMarker,
+    /// 条目写不进去（目录不可写等）
+    Write(std::io::Error),
+}
+
+impl std::fmt::Display for RegisterFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegisterFailure::NoStartMarker => {
+                write!(
+                    f,
+                    "cannot derive this process's start marker on this platform"
+                )
+            }
+            RegisterFailure::Write(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl Registration {
+    /// 登记没有成功时的原因；成功时为 None。本包不写日志，要不要告警由调用方决定。
+    pub fn failure(&self) -> Option<&RegisterFailure> {
+        self.failure.as_ref()
+    }
 }
 
 impl Drop for Registration {
@@ -214,8 +246,9 @@ impl Drop for Registration {
 }
 
 /// 把本进程登记进 `home` 的台账：必须在占用端口或拉起任何子进程之前调用。写失败
-/// （目录不可写、平台读不到启动标记）只告警，照常返回守卫——台账只服务强制安装这条
-/// 兜底路径，不能挡住正常服务。`config` 只有实例给（配置文件的绝对路径）。
+/// （目录不可写、平台读不到启动标记）不是错误，照常返回守卫——台账只服务强制安装这条
+/// 兜底路径，不能挡住正常服务；原因留在守卫里（[`Registration::failure`]）。`config` 只有
+/// 实例给（配置文件的绝对路径）。
 pub fn register(
     home: &Path,
     role: &str,
@@ -223,21 +256,17 @@ pub fn register(
     label: Option<&str>,
     config: Option<&Path>,
 ) -> Registration {
-    match LedgerEntry::for_current_process(role, port, label, config) {
+    let failure = match LedgerEntry::for_current_process(role, port, label, config) {
         Some(entry) => match write_entry_in(home, &entry) {
-            Ok(path) => *own_entry() = Some(path),
-            Err(e) => tracing::warn!(
-                error = %e,
-                role,
-                "failed to write the process ledger entry; continuing without it (install --force will not see this process)"
-            ),
+            Ok(path) => {
+                *own_entry() = Some(path);
+                None
+            }
+            Err(e) => Some(RegisterFailure::Write(e)),
         },
-        None => tracing::warn!(
-            role,
-            "cannot derive this process's start marker on this platform; process ledger entry not written"
-        ),
-    }
-    Registration { _private: () }
+        None => Some(RegisterFailure::NoStartMarker),
+    };
+    Registration { failure }
 }
 
 /// 原子写入一条条目：先写同目录的 `<pid>.json.tmp`，再 rename 成 `<pid>.json`。直接写

@@ -282,7 +282,7 @@ impl WatchdogConfig {
             .filter(|v| *v > 0)
             .unwrap_or_else(|| s.watchdog_heartbeat_secs.max(1));
         Self {
-            home: settings::home(),
+            home: aproxy_ipc::home::home(),
             run_dir: crate::daemon::run_dir(),
             scan_secs,
             stale_after_cycles: s.watchdog_stale_after_cycles.max(1),
@@ -930,7 +930,7 @@ pub async fn serve(cfg: WatchdogConfig) {
     // 扩展更多）；职责仅为「发现残留 → spawn」，处于哪一步、续跑还是清理
     // 全部由处理者自己判断——看护者绝不解读状态文件语义（分工原则）。
     // 启动时一次 + 运行中每日一次（防常态浪费）。
-    sweep_local_states(&crate::settings::home());
+    sweep_local_states(&aproxy_ipc::home::home());
 
     let mut state = WatchdogState::new(cfg);
     state.adopt_scan().await;
@@ -968,7 +968,7 @@ pub async fn serve(cfg: WatchdogConfig) {
         // 每日一次的残留状态文件复查（安装中断后看护者长期存活的场景）
         if last_sweep.elapsed() >= Duration::from_secs(24 * 3600) {
             last_sweep = std::time::Instant::now();
-            sweep_local_states(&crate::settings::home());
+            sweep_local_states(&aproxy_ipc::home::home());
         }
     }
 }

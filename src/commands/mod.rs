@@ -82,7 +82,7 @@ mod tests {
         let cli =
             aproxy::cli::Cli::try_parse_from(["aproxy", "--config", "~/x.toml", "status"]).unwrap();
         let path = resolve_cfg_path(&cli).unwrap();
-        assert_eq!(path, settings::user_dir().unwrap().join("x.toml"));
+        assert_eq!(path, aproxy_ipc::home::user_dir().unwrap().join("x.toml"));
     }
 
     #[test]

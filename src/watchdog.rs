@@ -996,7 +996,7 @@ fn sweep_local_states(home: &Path) {
 //
 // 设计要点：
 // - 节名 `aproxy-<home_id>-heart-<端口>`（与控制管道同一套命名空间规则：一个 run
-//   目录内端口唯一区分实例，home_id 把不同 home 隔开，见 daemon::home_id）。
+//   目录内端口唯一区分实例，home_id 把不同 home 隔开，见 aproxy_ipc::endpoint::home_id）。
 // - 8 字节 = 毫秒级 Unix 时间戳（Windows FILETIME 换算），原子 u64 读写。
 // - **守护侧由独立 ticker 任务每 10s 写一次，不经请求热路径**：挂死的定义是
 //   「tokio runtime 无法调度」，ticker 停摆与 runtime 死锁等价；零热路径成本
@@ -1011,15 +1011,7 @@ pub const HEARTBEAT_WRITE_INTERVAL_SECS: u64 = 10;
 /// home_id 的 `aproxy-heart-<端口>`：升级窗口里 0.1.0 的看护者读不到新实例的
 /// 心跳，按它自己的规则退化为纯进程死亡检测，不会误判挂死。
 pub fn heartbeat_section_name(run_dir: &Path, port: &str) -> String {
-    let home_id = crate::daemon::home_id(run_dir);
-    #[cfg(windows)]
-    {
-        format!(r"Local\aproxy-{home_id}-heart-{port}")
-    }
-    #[cfg(unix)]
-    {
-        format!("aproxy-{home_id}-heart-{port}")
-    }
+    aproxy_ipc::endpoint::heartbeat(run_dir, port)
 }
 
 /// 守护侧心跳句柄：持有映射视图，Drop 时 UnmapViewOfFile（句柄随进程退出

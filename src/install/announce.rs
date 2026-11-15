@@ -38,7 +38,7 @@ pub fn location(home: &Path, run_dir: &Path) -> Location {
     #[cfg(windows)]
     {
         let _ = home;
-        format!(r"Local\aproxy-{}-install", crate::daemon::home_id(run_dir))
+        aproxy_ipc::endpoint::install_announce(run_dir)
     }
     #[cfg(not(windows))]
     {

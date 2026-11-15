@@ -21,6 +21,8 @@ include = ["/src/**", "/Cargo.toml"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# home_id：run 目录规范化路径的 SHA-256（src/endpoint.rs）。与 aproxy 用同一个版本线
+sha2 = "0.11"
 
 [target.'cfg(windows)'.dependencies]
 # 台账（src/ledger.rs）读进程创建时间、核验属主、结束进程。与 aproxy 一样精确钉在

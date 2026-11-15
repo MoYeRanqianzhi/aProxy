@@ -3,11 +3,13 @@
 //!
 //! 现在有的：
 //! - [`home`]：aProxy 主目录的解析（永久兼容契约 C1）。
+//! - [`endpoint`]：实例控制端点、心跳节、安装宣告节的名字，以及区分 home 的 `home_id`。
 //! - [`ledger`]：进程台账 `<home>/ledger/`（永久兼容契约 C3）——条目的格式、写者、读者
 //!   与它的义务、启动标记的推导。强制安装靠它找到并结束一个 home 下的全部 aproxy 进程。
 //!
 //! 本包不打印、不结束进程：这两件事属于调用它的程序。
 
+pub mod endpoint;
 pub mod home;
 pub mod ledger;
 

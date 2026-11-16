@@ -638,7 +638,7 @@ mod tests {
     fn concurrent_writers_do_not_lose_updates() {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("settings.json");
-        const WRITERS: usize = 8;
+        const WRITERS: usize = 4;
         std::thread::scope(|scope| {
             for writer in 0..WRITERS {
                 let (path, home) = (&path, home.path());

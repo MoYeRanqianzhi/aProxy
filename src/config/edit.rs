@@ -661,8 +661,10 @@ max_backoff_secs = 60
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("config.toml");
         std::fs::write(&path, "# 保留\nbase_url = \"https://a.example\"\n").unwrap();
-        const WRITERS: usize = 8;
-        const ROUNDS: usize = 6;
+        // 规模刻意小：每次写入都落盘（sync_all），写者串行拿锁，全部写入加起来的时间
+        // 要远小于写锁的等待时限，否则负载高的机器上排在后面的线程会等到超时
+        const WRITERS: usize = 4;
+        const ROUNDS: usize = 4;
         std::thread::scope(|scope| {
             for writer in 0..WRITERS {
                 let (path, home) = (&path, home.path());

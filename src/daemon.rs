@@ -830,8 +830,8 @@ pub fn write_instance_file(info: &InstanceRecord) -> io::Result<()> {
 
 /// 同上，目录可指定（测试注入用）
 ///
-/// 原子写（crate::fsx::write_atomic）：直接写目标文件时，并发的 list_instances 可能读到
-/// 写到一半的 JSON，把记录当损坏清理掉。
+/// 原子写（crate::fsx::write_atomic）：直接写目标文件时，并发的读者可能读到写到一半的
+/// JSON，把这个实例当成不存在。
 pub fn write_instance_file_in(run_dir: &std::path::Path, info: &InstanceRecord) -> io::Result<()> {
     let path = instance_file_path_in(run_dir, &info.listen_addr);
     let json = serde_json::to_string_pretty(info).expect("序列化实例信息失败");
@@ -844,7 +844,6 @@ pub fn remove_instance_file(listen_addr: &str) {
 }
 
 /// 列出注册表中应答控制通道的实例（见 `survey_instances_in`）。
-/// 顺带清理孤儿日志（status 是唯一可靠的清理时机）。
 pub async fn list_instances() -> Vec<InstanceStatus> {
     survey_instances().await.responsive
 }
@@ -859,72 +858,144 @@ pub struct InstanceSurvey {
     pub unresponsive: Vec<InstanceRecord>,
 }
 
-/// 普查注册表并顺带清理孤儿日志——不应答实例的日志同样计入引用集（进程还在
-/// 写它），不能当孤儿删掉。
+/// 普查本 home 的注册表。只读：不删任何文件（清理见 [`collect_garbage_in`]）。
 pub async fn survey_instances() -> InstanceSurvey {
-    let survey = survey_instances_in(&run_dir()).await;
-    let referenced: Vec<InstanceRecord> = survey
-        .responsive
-        .iter()
-        .map(|status| &status.instance)
-        .chain(survey.unresponsive.iter())
-        .cloned()
-        .collect();
-    cleanup_orphan_logs_in(
-        &logs_dir(),
-        &referenced,
-        &crate::spec::list_restore_in(&run_dir()),
-    );
-    survey
+    survey_instances_in(&run_dir()).await
 }
 
-/// 清理孤儿日志：日志文件名是随机的，不带归属信息，判据是「引用集」——活实例上报的
-/// log_path 与期望状态记录里的 log_path 之外的 .log 一律删除。logs 目录是工具专属目录，
-/// 目录内的 .log 一律视为实例日志（非 .log 文件与 startup.log 保留）。崩溃实例的日志由
-/// 期望状态记录引用，重拉后续写同一个文件。自定义 log_file 落在其他目录时，扫描天然
-/// 不触及。空串 log_path（前台）不参与引用集。
-///
-/// run 目录里有读不懂的期望状态记录时整轮不删：它引用了哪个日志无从得知，引用集不完整。
-fn cleanup_orphan_logs_in(
-    logs_dir: &std::path::Path,
-    live: &[InstanceRecord],
-    pending_restore: &crate::spec::RestoreListing,
-) {
-    if !pending_restore.unreadable.is_empty() {
-        return;
-    }
-    // 引用集按 path_match_key 归一比较（大小写/分隔符规则与别名匹配共用）：
-    // 注册表存的路径字符串与 read_dir 枚举出的表示在 Windows 上可能有
-    // 分隔符差异，字面比较会漏保活
-    let referenced: std::collections::HashSet<String> = live
-        .iter()
-        .map(|i| i.log_path.clone())
-        .chain(
-            pending_restore
-                .entries
-                .iter()
-                .map(|e| e.spec.log_path.clone()),
-        )
-        .filter(|p| !p.is_empty())
-        .map(|p| crate::settings::path_match_key(&p))
-        .collect();
+// ---------------------------------------------------------------------------
+// 清理：只在实例开始服务之后与看护者的周期里做，读路径（status、选目标、界面轮询）
+// 不删任何文件——查看状态的命令不该有副作用，而且它们可能由比写者更旧的版本执行。
+// ---------------------------------------------------------------------------
 
-    let Ok(entries) = std::fs::read_dir(logs_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
+/// 清理只碰早于这个年龄（秒）的日志、交接文件与临时文件：更新的可能正被某个进程写着、
+/// 或刚写下还没被引用。
+const GC_MIN_AGE_SECS: u64 = 600;
+
+/// 一轮清理做了什么。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcReport {
+    /// 删掉的文件
+    pub removed: Vec<PathBuf>,
+    /// 日志清理是否因为有读不懂的记录而暂停（引用集不完整，不敢删）
+    pub logs_paused: bool,
+}
+
+/// 一轮清理。规则：
+/// - **实例记录** `<端口>.pid`：读得懂、并且写下它的进程经「pid + 创建时间」核验已经不在，
+///   才删。读不懂的（损坏，或更新的版本写的）绝不删。
+/// - **期望状态记录**：不归清理管，只有 stop 能删。
+/// - **交接文件与原子写的临时文件**（`*.spec.json`、`*.tmp-<pid>-<纳秒>`）：正常情况下
+///   写者自己立即删掉或改名；写者崩溃留下的，在它的 pid 已不在、且文件早于
+///   [`GC_MIN_AGE_SECS`] 时删。交接文件里有明文密钥，不能一直留在盘上。
+/// - **实例日志**：只删同时满足三条的——名字是内置的随机名形状
+///   （`<十六进制>-<四位十六进制>.log`）、早于 [`GC_MIN_AGE_SECS`]、不被任何实例记录或
+///   期望状态记录引用。run 目录里有读不懂的记录时，引用集不完整，这一轮不删任何日志。
+///   自定义的 `log_file` 与 startup.log 等固定名的日志永远不删。
+pub fn collect_garbage_in(run_dir: &std::path::Path, logs_dir: &std::path::Path) -> GcReport {
+    let mut report = GcReport::default();
+    let mut referenced_logs: Vec<String> = Vec::new();
+    let mut unreadable = false;
+
+    let restores = crate::spec::list_restore_in(run_dir);
+    unreadable |= !restores.unreadable.is_empty();
+    referenced_logs.extend(restores.entries.into_iter().map(|e| e.spec.log_path));
+
+    for entry in std::fs::read_dir(run_dir).into_iter().flatten().flatten() {
         let path = entry.path();
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if path.extension().and_then(|e| e.to_str()) != Some("log") || stem == "startup" {
-            continue;
-        }
-        let key = crate::settings::path_match_key(&path.display().to_string());
-        if !referenced.contains(&key) {
-            let _ = std::fs::remove_file(&path);
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".pid") {
+            let record = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<InstanceRecord>(&text).ok());
+            match record {
+                None => unreadable = true,
+                Some(info) => {
+                    // 没登记创建时间（0，平台读不到）的记录核验不了身份：只在这个 pid 上
+                    // 确实没有进程时才当它的写者已经不在，否则宁可留着
+                    let alive = if info.process_start == 0 {
+                        crate::process::process_exited(info.pid) != Some(true)
+                    } else {
+                        matches!(
+                            crate::process::record_identity(info.pid, info.process_start),
+                            crate::process::RecordIdentity::Alive(_)
+                        )
+                    };
+                    if alive {
+                        referenced_logs.push(info.log_path);
+                    } else if std::fs::remove_file(&path).is_ok() {
+                        report.removed.push(path);
+                    }
+                }
+            }
+        } else if let Some(writer) = leftover_writer_pid(&name)
+            && older_than(&path, GC_MIN_AGE_SECS)
+            && crate::process::process_exited(writer) != Some(false)
+            && std::fs::remove_file(&path).is_ok()
+        {
+            report.removed.push(path);
         }
     }
+
+    if unreadable {
+        report.logs_paused = true;
+        return report;
+    }
+    // 引用集按 path_match_key 归一比较（大小写/分隔符规则与别名匹配共用）：记录里存的
+    // 路径字符串与 read_dir 枚举出的表示在 Windows 上可能有分隔符差异，字面比较会误删
+    let referenced: std::collections::HashSet<String> = referenced_logs
+        .iter()
+        .filter(|p| !p.is_empty())
+        .map(|p| crate::settings::path_match_key(p))
+        .collect();
+    for entry in std::fs::read_dir(logs_dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if is_random_log_name(&entry.file_name().to_string_lossy())
+            && older_than(&path, GC_MIN_AGE_SECS)
+            && !referenced.contains(&crate::settings::path_match_key(
+                &path.display().to_string(),
+            ))
+            && std::fs::remove_file(&path).is_ok()
+        {
+            report.removed.push(path);
+        }
+    }
+    report
+}
+
+/// run 目录里一个文件若是交接文件或原子写的临时文件，返回名字里写者的 pid。
+/// 交接文件是 `<纳秒>-<pid>.spec.json`，临时文件是 `<目标名>.tmp-<pid>-<纳秒>`。
+fn leftover_writer_pid(name: &str) -> Option<u32> {
+    if let Some(stem) = name.strip_suffix(".spec.json") {
+        return stem.rsplit_once('-')?.1.parse().ok();
+    }
+    let (_, tail) = name.rsplit_once(".tmp-")?;
+    let (pid, nanos) = tail.split_once('-')?;
+    nanos.chars().all(|c| c.is_ascii_digit()).then_some(())?;
+    pid.parse().ok()
+}
+
+/// 名字是不是内置的随机日志名：`<1 到 16 位小写十六进制>-<4 位小写十六进制>.log`。
+fn is_random_log_name(name: &str) -> bool {
+    let is_hex = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    };
+    name.strip_suffix(".log")
+        .and_then(|stem| stem.split_once('-'))
+        .is_some_and(|(nanos, pid)| {
+            nanos.len() <= 16 && is_hex(nanos) && pid.len() == 4 && is_hex(pid)
+        })
+}
+
+/// 文件的修改时间是否早于 `secs` 秒之前。读不到修改时间的按「不够旧」处理。
+fn older_than(path: &std::path::Path, secs: u64) -> bool {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age.as_secs() >= secs)
 }
 
 /// 同上，目录可指定（测试注入用）
@@ -932,12 +1003,11 @@ pub async fn list_instances_in(dir: &std::path::Path) -> Vec<InstanceStatus> {
     survey_instances_in(dir).await.responsive
 }
 
-/// 逐条读注册表、IPC ping 验活。ping 失败时按「pid + 创建时间」核验记录的
-/// 进程：仍在 → 记录保留、归入 unresponsive；已退出或 pid 已被复用 → 清理
-/// 残留记录。**不应答 ≠ 已死**：挂死的实例进程还在，看门狗的挂死接管要靠
-/// 这条记录核验身份，`stop --force` 也要靠它定位——因为一次 ping 失败就删掉
-/// 它，实例就从 aproxy 的视野里消失了。未登记创建时间（0）的记录证明不了
-/// 身份，同样清理。
+/// 逐条读注册表、IPC ping 验活。只读，不删任何文件。ping 失败时按「pid + 创建时间」
+/// 核验记录的进程：仍在 → 归入 unresponsive；已退出、pid 已被复用、或记录没登记创建时间
+/// （证明不了身份）→ 不列出，残留的记录留给清理（[`collect_garbage_in`]）。
+/// **不应答 ≠ 已死**：挂死的实例进程还在，看门狗的挂死接管要靠这条记录核验身份，
+/// `stop --force` 也要靠它定位。读不懂的记录跳过。
 pub async fn survey_instances_in(dir: &std::path::Path) -> InstanceSurvey {
     let mut out = Vec::new();
     let mut unresponsive = Vec::new();
@@ -955,9 +1025,8 @@ pub async fn survey_instances_in(dir: &std::path::Path) -> InstanceSurvey {
         let info = std::fs::read_to_string(&path)
             .ok()
             .and_then(|c| serde_json::from_str::<InstanceRecord>(&c).ok());
+        // 读不懂的记录（损坏，或更新的版本写的）定位不了端口，跳过
         let Some(info) = info else {
-            // 损坏记录无法定位端口发 IPC，直接清理
-            let _ = std::fs::remove_file(&path);
             continue;
         };
         let port = port_of(&info.listen_addr).to_string();
@@ -979,13 +1048,13 @@ pub async fn survey_instances_in(dir: &std::path::Path) -> InstanceSurvey {
                     unresponsive.push(info);
                 }
             }
-            Err(_) => match crate::process::record_identity(info.pid, info.process_start) {
-                crate::process::RecordIdentity::Alive(_) => unresponsive.push(info),
-                // 实例不在了（或无从核验）：注册已失效，清理
-                _ => {
-                    let _ = std::fs::remove_file(&path);
+            Err(_) => {
+                if let crate::process::RecordIdentity::Alive(_) =
+                    crate::process::record_identity(info.pid, info.process_start)
+                {
+                    unresponsive.push(info);
                 }
-            },
+            }
         }
     }
     out.sort_by(|a, b| a.instance.listen_addr.cmp(&b.instance.listen_addr));
@@ -997,10 +1066,7 @@ pub async fn survey_instances_in(dir: &std::path::Path) -> InstanceSurvey {
 }
 
 /// 只读检索注册表：是否存在 pid 匹配的实例记录。
-/// respawn 的就绪判定专用——不复用 `list_instances_in`（它对 ping 失败的
-/// 条目有删除副作用：A 实例重拉的就绪轮询会顺带清掉同注册表里 B/C 死实例
-/// 的记录，其死亡事件随后被混合态误判为优雅退出而失去自动恢复）。就绪只需
-/// 「新 pid 的注册记录已出现」，读文件即可，无需 IPC。
+/// respawn 的就绪判定专用：就绪只需「新 pid 的注册记录已出现」，读文件即可，无需 IPC。
 pub fn registry_contains_pid_in(dir: &std::path::Path, pid: u32) -> bool {
     registry_find_pid_in(dir, pid).is_some()
 }
@@ -2044,19 +2110,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_instances_cleans_dead_records() {
-        // 写一条指向不存在实例的注册记录 → list 应清理它且不返回
+    async fn listing_skips_dead_records_without_deleting_anything() {
+        // 一条指向不存在实例的注册记录、一条读不懂的记录：列举不返回它们，也不删它们
         let dir = tempfile::tempdir().unwrap();
         let dead = sample_info("59801");
         write_instance_file_in(dir.path(), &dead).unwrap();
         let path = instance_file_path_in(dir.path(), "127.0.0.1:59801");
+        let garbled = dir.path().join("59809.pid");
+        std::fs::write(&garbled, "{not json").unwrap();
         let listed = list_instances_in(dir.path()).await;
-        assert!(
-            listed
-                .iter()
-                .all(|i| i.instance.listen_addr != "127.0.0.1:59801")
-        );
-        assert!(!path.exists(), "死亡实例的注册记录应被清理");
+        assert!(listed.is_empty(), "{listed:?}");
+        assert!(path.exists() && garbled.exists(), "读路径不删任何文件");
     }
 
     #[tokio::test]
@@ -2078,85 +2142,152 @@ mod tests {
         assert_eq!(survey.unresponsive[0].pid, pid);
         assert!(path.exists(), "进程仍在的记录不能因 ping 失败被删");
 
-        // 同一 pid、创建时间对不上 = pid 已被复用，记录的进程早已死亡 → 清理
+        // 同一 pid、创建时间对不上 = pid 已被复用，记录的进程早已死亡 → 不列出；记录留给清理
         hung.process_start = start + 1;
         write_instance_file_in(dir.path(), &hung).unwrap();
         let survey = survey_instances_in(dir.path()).await;
         assert!(survey.unresponsive.is_empty());
-        assert!(!path.exists(), "pid 被复用的记录应被清理");
+        assert!(path.exists(), "读路径不删任何文件");
+    }
+
+    /// 把一个文件的修改时间拨到 `secs` 秒之前
+    fn age(path: &std::path::Path, secs: u64) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(secs))
+            .unwrap();
     }
 
     #[test]
-    fn orphan_log_cleanup_keeps_referenced_and_startup() {
-        // 判据是引用集：日志名是随机的，不带归属，保留 = 活实例上报的 log_path ∪
-        // 期望状态记录里的 log_path ∪ startup.log；其余 .log 删除；非 .log 文件一律不动。
-        let logs = tempfile::tempdir().unwrap();
-        let live_log = logs.path().join("1f3a2b-00ab.log");
-        let crash_log = logs.path().join("5c6d7e-11cd.log");
-        let stale_log = logs.path().join("9900aa-22ef.log");
-        for path in [&live_log, &crash_log, &stale_log] {
+    fn garbage_collection_follows_the_cleanup_rules() {
+        let home = tempfile::tempdir().unwrap();
+        let run = home.path().join("run");
+        let logs = home.path().join("logs");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+        let old = GC_MIN_AGE_SECS + 60;
+        let touch = |path: &std::path::Path, secs: u64| {
             std::fs::write(path, "x").unwrap();
-        }
-        std::fs::write(logs.path().join("startup.log"), "x").unwrap();
-        std::fs::write(logs.path().join("weird.log"), "x").unwrap();
-        std::fs::write(logs.path().join("not-a-log.txt"), "x").unwrap();
+            age(path, secs);
+        };
 
+        // 实例记录：活着的（本测试进程）留下，写者已不在的删掉
+        let me = std::process::id();
         let mut live = sample_info("59811");
-        live.log_path = live_log.display().to_string();
-        let pending = crate::spec::RestoreListing {
-            entries: vec![crate::spec::RestoreEntry {
-                port: "59812".into(),
-                spec: sample_spec(&crash_log.display().to_string()),
-                written_at: 0,
-            }],
-            unreadable: Vec::new(),
-        };
-        // 有读不懂的期望状态记录时整轮不删：它引用了哪个日志无从得知
-        let incomplete = crate::spec::RestoreListing {
-            entries: Vec::new(),
-            unreadable: vec![crate::spec::UnreadableRecord {
-                path: logs.path().join("9.restore.json"),
-                reason: crate::spec::Unreadable::SchemaTooNew(2),
-            }],
-        };
-        cleanup_orphan_logs_in(logs.path(), std::slice::from_ref(&live), &incomplete);
-        assert!(stale_log.exists(), "引用集不完整时不得删任何日志");
+        live.pid = me;
+        live.process_start = crate::process::process_start_time(me).unwrap();
+        let live_log = logs.join("1f3a2b-00ab.log");
+        live.log_path = live_log.display().to_string().replace('\\', "/");
+        write_instance_file_in(&run, &live).unwrap();
+        let mut dead = sample_info("59812");
+        dead.pid = u32::MAX - 779;
+        dead.process_start = 123;
+        let dead_log = logs.join("2a2a2a-00cd.log");
+        dead.log_path = dead_log.display().to_string();
+        write_instance_file_in(&run, &dead).unwrap();
+        // 期望状态记录：不归清理管；它引用的日志留着
+        let crash_log = logs.join("5c6d7e-11cd.log");
+        crate::spec::write_restore_in(
+            &run,
+            "59813",
+            &sample_spec(&crash_log.display().to_string()),
+        )
+        .unwrap();
+        // 交接文件与临时文件：写者不在且够旧才删
+        let dead_writer = u32::MAX - 780;
+        let stale_spec = run.join(format!("1700000000000000000-{dead_writer}.spec.json"));
+        let fresh_spec = run.join(format!("1700000000000000001-{dead_writer}.spec.json"));
+        let own_spec = run.join(format!("1700000000000000002-{me}.spec.json"));
+        let stale_tmp = run.join(format!("59811.pid.tmp-{dead_writer}-1700000000000000003"));
+        touch(&stale_spec, old);
+        touch(&fresh_spec, 0);
+        touch(&own_spec, old);
+        touch(&stale_tmp, old);
+        // 日志
+        let orphan = logs.join("9900aa-22ef.log");
+        let young_orphan = logs.join("9900ab-22ef.log");
+        let custom = logs.join("my-instance.log");
+        let fixed = logs.join("startup.log");
+        for path in [&live_log, &dead_log, &crash_log, &orphan, &custom, &fixed] {
+            touch(path, old);
+        }
+        touch(&young_orphan, 0);
+        std::fs::write(logs.join("not-a-log.txt"), "x").unwrap();
 
-        cleanup_orphan_logs_in(logs.path(), &[live], &pending);
-        assert!(live_log.exists(), "活实例引用的日志不应被删除");
-        assert!(crash_log.exists(), "期望状态记录引用的崩溃日志不应被删除");
+        // 有读不懂的记录时：实例记录与残留文件照常清，日志一个都不删
+        let unreadable = run.join("7.restore.json");
+        std::fs::write(&unreadable, r#"{"schema":9}"#).unwrap();
+        let report = collect_garbage_in(&run, &logs);
+        assert!(report.logs_paused);
         assert!(
-            logs.path().join("startup.log").exists(),
-            "startup.log 不应被孤儿清理删除"
+            orphan.exists() && dead_log.exists(),
+            "引用集不完整时不得删日志"
+        );
+        assert!(unreadable.exists(), "读不懂的记录绝不删");
+        assert!(
+            !instance_file_path_in(&run, "59812").exists(),
+            "写者已不在的实例记录应删"
         );
         assert!(
-            logs.path().join("not-a-log.txt").exists(),
-            "非 .log 文件不应被删除（防御保留）"
+            instance_file_path_in(&run, "59811").exists(),
+            "活实例的记录不删"
         );
-        assert!(!stale_log.exists(), "无引用的孤儿日志应被删除");
-
-        // 大小写/分隔符差异经 path_match_key 归一后同样引用（Windows 注册表
-        // 路径表示与 read_dir 枚举可能不同形，字面比较会误删活实例日志）
-        let logs2 = tempfile::tempdir().unwrap();
-        let mut live2 = sample_info("59811");
-        live2.log_path = logs2
-            .path()
-            .join("CaseCheck-00aa.log")
-            .display()
-            .to_string()
-            .replace('\\', "/");
-        std::fs::write(logs2.path().join("CaseCheck-00aa.log"), "x").unwrap();
-        cleanup_orphan_logs_in(logs2.path(), &[live2], &Default::default());
         assert!(
-            logs2.path().join("CaseCheck-00aa.log").exists(),
-            "归一后同一路径（分隔符差异）不应被误删"
+            !stale_spec.exists() && !stale_tmp.exists(),
+            "写者不在的旧残留应删"
         );
+        assert!(fresh_spec.exists(), "不够旧的不删");
+        assert!(own_spec.exists(), "写者还在的不删");
+        assert!(crate::spec::restore_path_in(&run, "59813").exists());
 
-        // 空串 log_path（前台实例）不参与引用集：其旧日志按无主处理
-        let logs3 = tempfile::tempdir().unwrap();
-        let orphan = logs3.path().join("ff00aa-33ff.log");
-        std::fs::write(&orphan, "x").unwrap();
-        cleanup_orphan_logs_in(logs3.path(), &[sample_info("59811")], &Default::default());
-        assert!(!orphan.exists(), "空串 log_path 的实例不应保住孤儿日志");
+        std::fs::remove_file(&unreadable).unwrap();
+        let report = collect_garbage_in(&run, &logs);
+        assert!(!report.logs_paused);
+        let mut removed = report.removed.clone();
+        removed.sort();
+        // 死实例的日志在它的记录被清掉之后不再被引用
+        let mut expected = vec![dead_log.clone(), orphan.clone()];
+        expected.sort();
+        assert_eq!(removed, expected);
+        assert!(
+            live_log.exists(),
+            "活实例引用的日志不删（路径分隔符不同也认得出）"
+        );
+        assert!(crash_log.exists(), "期望状态记录引用的日志不删");
+        assert!(young_orphan.exists(), "不够旧的不删");
+        assert!(
+            custom.exists() && fixed.exists(),
+            "不是随机名形状的日志永远不删"
+        );
+        assert!(logs.join("not-a-log.txt").exists());
+    }
+
+    #[test]
+    fn leftover_and_log_names_are_recognized_strictly() {
+        assert_eq!(leftover_writer_pid("1700-4242.spec.json"), Some(4242));
+        assert_eq!(leftover_writer_pid("12345.pid.tmp-4242-1700"), Some(4242));
+        assert_eq!(leftover_writer_pid("settings.json.tmp-7-9"), Some(7));
+        for name in [
+            "12345.pid",
+            "12345.restore.json",
+            "x.tmp-abc-1",
+            "x.tmp-1-abc",
+            "watchdog.claim",
+        ] {
+            assert_eq!(leftover_writer_pid(name), None, "{name}");
+        }
+        for name in ["19ac3f2e8b5d-1a2b.log", "0-0000.log"] {
+            assert!(is_random_log_name(name), "{name}");
+        }
+        for name in [
+            "startup.log",
+            "watchdog.log",
+            "my-instance.log",
+            "19AC-1A2B.log",
+            "19ac-1a2.log",
+            "19ac3f2e8b5d19ac3-1a2b.log",
+            "19ac-1a2b.txt",
+        ] {
+            assert!(!is_random_log_name(name), "{name}");
+        }
     }
 }

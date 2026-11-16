@@ -114,6 +114,21 @@ pub(crate) async fn serve_forever(
     let actual_addr = listener.local_addr().expect("获取监听地址失败").to_string();
     let port = daemon::port_of(&actual_addr).to_string();
 
+    // 配置的端口是 0（由系统分配）时，台账里登记的也是 0：强制安装据条目里的端口核对
+    // 「实例有没有被拉回来」，0 对不上任何端口。拿到实际端口之后原子重写条目（同一个
+    // 文件，守卫照旧负责删它）。重写不成只是少了这项核对，条目仍在、仍能据它结束本进程
+    if daemon::port_of(&listen_addr) == "0"
+        && let Some(entry) = aproxy_ipc::ledger::LedgerEntry::for_current_process(
+            aproxy_ipc::ledger::ROLE_INSTANCE,
+            port.parse().ok(),
+            cfg_path.map(|_| cfg_display.as_str()),
+            cfg_abs.as_deref(),
+        )
+        && let Err(e) = aproxy_ipc::ledger::write_entry_in(&aproxy_ipc::home::home(), &entry)
+    {
+        tracing::warn!(error = %e, "台账条目没能改写成实际端口");
+    }
+
     // R1：先退役比自己旧的看护者，再创建控制端点——旧看护者处理死亡事件时会
     // 删掉同一路径上的 socket（见 watchdog::retire_older_watchdog_in）
     watchdog::retire_older_watchdog_in(&daemon::run_dir()).await;
@@ -257,6 +272,24 @@ pub(crate) async fn serve_forever(
             }
         });
     }
+
+    // 清理（见 daemon::collect_garbage_in）：实例已经登记、控制端点在应答，这时清掉别的
+    // 进程崩溃留下的记录、交接文件与没人引用的旧日志。放在这里而不是放在 status 里：
+    // 查看状态的命令不该删东西。文件系统操作放进阻塞线程，不占运行时的工作线程
+    tokio::task::spawn_blocking(|| {
+        let report = daemon::collect_garbage_in(&daemon::run_dir(), &daemon::logs_dir());
+        if !report.removed.is_empty() {
+            tracing::info!(
+                removed = report.removed.len(),
+                "清理了残留的运行期文件与旧日志"
+            );
+        }
+        if report.logs_paused {
+            tracing::warn!(
+                "run 目录里有读不懂的记录（多半由更新版本的 aproxy 写下），旧日志的清理已暂停"
+            );
+        }
+    });
 
     // 运行期日志轮转：守护日志只在启动时做过一次 2MiB 检查，长期运行的实例
     // （正是本项目的目标形态）仍会无限膨胀。每小时检查一次，超过 settings 的

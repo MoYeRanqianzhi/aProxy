@@ -375,6 +375,9 @@ pub struct WatchdogState {
     death_tx: tokio::sync::mpsc::UnboundedSender<(String, u32)>,
     /// 全部实例清零的起始时刻（None = 非空）；闲置自灭计时
     empty_since: Option<std::time::Instant>,
+    /// 「旧日志的清理因读不懂的记录而暂停」已经告过警：每个周期都会遇到同一批记录，
+    /// 只在进入这个状态时说一次
+    gc_pause_reported: bool,
 }
 
 impl WatchdogState {
@@ -387,6 +390,7 @@ impl WatchdogState {
             deaths: rx,
             death_tx: tx,
             empty_since: None,
+            gc_pause_reported: false,
         }
     }
 
@@ -754,6 +758,7 @@ impl WatchdogState {
         self.process_pending_retries().await;
         self.adopt_scan().await;
         self.health_scan().await;
+        self.collect_garbage();
         if self.refresh_claim() == Tick::Retire || self.maybe_idle_exit().await == Tick::Retire {
             return Tick::Retire;
         }
@@ -778,6 +783,27 @@ impl WatchdogState {
         self.cfg.max_restarts = s.watchdog_max_restarts;
         self.cfg.idle_exit_secs = s.watchdog_idle_exit_secs;
         Tick::Continue
+    }
+
+    /// 清理死实例留下的记录、残留的交接文件与没人引用的旧日志（规则见
+    /// [`crate::daemon::collect_garbage_in`]）。放在死亡处置与收养之后：崩溃实例的记录在
+    /// 它被重拉、新实例覆盖之前是「写者已不在」的，但它的期望状态记录不归清理管，重拉
+    /// 靠的是那一份，所以这里删掉旧的实例记录不影响恢复。
+    fn collect_garbage(&mut self) {
+        let logs_dir = self.cfg.home.join("logs");
+        let report = crate::daemon::collect_garbage_in(&self.cfg.run_dir, &logs_dir);
+        if !report.removed.is_empty() {
+            tracing::info!(
+                removed = report.removed.len(),
+                "清理了残留的运行期文件与旧日志"
+            );
+        }
+        if report.logs_paused && !self.gc_pause_reported {
+            tracing::warn!(
+                "run 目录里有读不懂的记录（多半由更新版本的 aproxy 写下），旧日志的清理已暂停"
+            );
+        }
+        self.gc_pause_reported = report.logs_paused;
     }
 
     /// claim 续写：心跳时间戳刷新（其他进程据此刻定本看护者是否在任/假死）。

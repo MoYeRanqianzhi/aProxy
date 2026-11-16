@@ -5659,6 +5659,12 @@ fn port_zero_restore_record_uses_actual_port() {
         .unwrap()
         .expect("期望状态记录应读得懂");
     assert_eq!(entry.spec.pinned_port, port.parse().ok());
+    // 台账条目里登记的也是实际端口（强制安装据它核对实例有没有被拉回来）
+    let in_ledger = aproxy_ipc::ledger::read_all_in(home.path())
+        .into_iter()
+        .find(|found| found.entry.pid == info.pid)
+        .expect("实例应在台账里");
+    assert_eq!(in_ledger.entry.port, port.parse().ok());
 
     home.stop_on_drop(port.parse().unwrap());
 

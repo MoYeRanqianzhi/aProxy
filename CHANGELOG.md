@@ -15,6 +15,37 @@
 - **安装状态挪到 `<home>/install/`**：状态文件由 `run/install.state` 改为 `install/state.json`，备料与下载暂存由 `staging/<版本>/` 改为 `install/staging/<版本>/`，一键安装脚本的下载暂存由 `staging/bootstrap` 改为 `install/bootstrap`。0.1.0 留下的 `run/install.state` 与 `staging/` 不再被读取。
 - **`aproxy install` 拒绝低于 0.2.0 的版本**：在线安装指定的版本号与 `--from` 的二进制都一样，`--allow-downgrade` 也不行，报 `目标版本 <版本> 低于 0.2.0，不能安装：…` 并说明怎样回到 0.1.x。0.2.0 的预发布（alpha、beta、rc）不受影响。
 - **`aproxy install` 的指令集档参数改名为 `--cpu`**：原来的 `--variant v3|baseline` 改为 `--cpu x86-64-v3|baseline`（与 `--version` 末段的写法一致）。`--variant` 改为选变体，取 `desktop|headless`（见「新增」里的两个版本）。
+- **config.toml 的键重新命名，并改为严格解析**：不认识的键、类型不对的值都是错误，指出文件、键与行列（形如 `config.toml:3:1: forward_only: unknown key forward_only [config_unknown_key]`），实例不启动；此前不认识的键被静默忽略，写错一个字母的键等于没写。0.1.x 的键按下表改名：
+
+  | 0.1.x | 0.2.0 |
+  |---|---|
+  | `max_body_mb` | `max_request_mb`（0 表示不限） |
+  | `spool_limit_mb` | `max_response_mb`（0 表示不限） |
+  | `forward_only = true` | `delivery = "forward"`（默认 `"retry"`） |
+  | `connect_timeout_secs` | `[timeouts] connect_secs` |
+  | `read_timeout_secs` | `[timeouts] first_byte_secs`（等响应头）与 `[timeouts] read_idle_secs`（两次读到数据之间），各自计时，默认都是 300 |
+  | `keepalive_interval_secs`、`keepalive_trigger` | `[keepalive] interval_secs`、`[keepalive] trigger` |
+  | `max_retry_backoff_secs` | `[retry] max_backoff_secs` |
+  | `bounded_retry_paths = ["…"]` | `[[retry.rules]]`，每条写 `path`（正则）与 `max_attempts`，可加 `status` |
+  | `[request_transform]`、`[response_transform]` | `[[format]]` 条目，用 `stages` 写它参与的阶段（`request`、`response`、`heartbeat`、`retry`） |
+  | 转换器的 `mode`、`idle_timeout_secs` | `process`、`worker_idle_secs` |
+  | 转换器的 `extra` | 没有对应的键，改用 `args` 或 `env` 传给程序 |
+
+- **settings.json 改成分节的形状，并改为严格解析**：全局默认放进 `defaults`（里面写 config.toml 的键），其余归到 `watchdog`、`logs`、`instances`、`update`、`ui` 各节；`aliases`、`default_config`、`config_dirs` 不变。0.1.x 的平铺字段不再接受，对照如下：
+
+  | 0.1.x | 0.2.0 |
+  |---|---|
+  | `max_body_mb`、`disk_cache`、`allowed_hosts`、`allowed_origins` | `defaults.max_request_mb`、`defaults.disk_cache`、`defaults.allowed_hosts`、`defaults.allowed_origins` |
+  | `forward_only` | `defaults.delivery`（`"forward"` 或 `"retry"`） |
+  | `bounded_retry_paths` | `defaults.retry.rules`，每条 `{"path": "…", "max_attempts": 3}` |
+  | `keepalive_trigger` | `defaults.keepalive.trigger` |
+  | `watchdog`（布尔）、`watchdog_heartbeat_secs`、`watchdog_stale_after_cycles`、`watchdog_max_restarts`、`watchdog_idle_exit_secs` | `watchdog.enabled`、`watchdog.heartbeat_secs`、`watchdog.stale_after_cycles`、`watchdog.max_restarts`、`watchdog.idle_exit_secs` |
+  | `log_rotate_mb` | `logs.rotate_mb` |
+  | `idle_timeout_secs` | `instances.idle_threshold_secs` |
+  | `download_chain`、`download_proxy`、`skill_auto_update` | `update.download_chain`、`update.download_proxy`、`update.skill_auto_update` |
+
+  settings.json 有错误时（不认识的键、类型不对、`schema` 高于本版本认识的）：`aproxy settings` 与 `aproxy doctor` 照常可用；`status`、`stop`、`install` 按内置默认运行并把错误作为告警打印（别名这时不可用，按端口或 `all` 指定实例）；其余命令以退出码 3 结束，给出每个出问题的键的修法；实例不启动。此前解析失败时各命令告警后按内置默认继续运行。
+- **代理自己产生的错误响应改为统一的 JSON 形状**：aProxy 自产的 4xx/5xx（请求体过大、Host 或 Origin 被拒、转换器失败、重试被规则终止等）的响应体是 `{"type":"error","error":{"type":"aproxy_<码>","message":"…","aproxy":{"code":"<码>","request_id":"…","attempts":<已尝试次数>,"details":{…}}}}`（有上游状态码时另带 `upstream_status`），并带 `x-aproxy-error: <码>` 与 `x-aproxy-request-id` 两个头；保活流里的终态错误是内容相同的 `event: error`。此前是各处自拟的中文纯文本或零散的 JSON。Anthropic 与 OpenAI 的官方 SDK 都能把它解析成各自的错误类型。按规则放弃重试后原样透传的上游响应，体不变，只多这两个头。全部错误码见 `docs/error-codes.md`。
 - **`APROXY_HOME` 必须是绝对路径**：设成相对路径时，除 `--version`、`--help` 外的命令一律报错退出，`install --force` 以 10 结束（此前相对当前工作目录解析，在不同目录下执行的命令会用到不同的 home）。值原样使用、不再去掉首尾空白，为空或只含空白视同未设；不是合法 UTF-8 的值也照用（此前会静默退回 `~/.aproxy`）。未设时的用户目录与一键安装脚本一致：Windows 取 `USERPROFILE`，其他平台取 `HOME`，为空时才向系统查询；命令行路径参数、配置（`log_file`、变换的 `command`）里的 `~` 与读 `~/.npmrc` 也都用这个用户目录。三个一键安装脚本按同一规则处理 `APROXY_HOME`：只含空白视同未设，不是绝对路径就报错退出、什么都不装。
 
 #### 从 0.1.x 迁移
@@ -26,7 +57,7 @@
    - npm 装的：`npm i -g @meowo/aproxy@next`（无界面版装 `@meowo/aproxy-headless@next`；0.2.0 正式版之后用 `@latest`）。
    - cargo 装的：`cargo install aproxy --locked --force --version <版本>`（正式版之后可省略 `--version`）。
 4. 清理 0.1.0 的残留：`~/.aproxy/run/install.state`（如果有）、`~/.aproxy/staging/`，以及 `~/.aproxy/run/*.restore`（第 2 步之前崩溃过的实例会留下，留着的话 `aproxy restore` 会按 0.1.0 记下的参数拉起它们）。
-5. 配置文件 `config.toml` 与 `settings.json` 沿用，按本节其余条目修改用到的旧写法（例如 `upstream_url` 须改名为 `base_url`），然后运行 `aproxy doctor` 检查。
+5. 配置文件 `config.toml` 与 `settings.json` 要按上面两张对照表改写：两者都改为严格解析，留着旧键时实例不启动、多数命令以退出码 3 结束。可以用新版本逐项改：`aproxy config --unset <旧键>` 与 `aproxy settings unset <旧键>` 能删掉不认识的键，再用 `aproxy config …` 与 `aproxy settings set <键> <值>` 写上新键；也可以直接手工编辑。改完运行 `aproxy config --show`（每个配置文件）与 `aproxy doctor` 检查。
 6. 用 `aproxy --version` 确认装的是 0.2.0 起的版本（首行形如 `aproxy v0.2.0-alpha.1 (desktop; …)`，0.1.x 的输出是 `aproxy 0.1.0`），再用它逐个启动：`aproxy start <别名|配置路径>`。端口不变，agent 客户端的 base URL 不用改。
 7. 更新 skill 文档：`aproxy install --skills-only`，再确认 agent 的 skills 目录链接或复制的是 `~/.aproxy/skills/` 里的新文档。
 
@@ -38,10 +69,17 @@
 - **桌面界面预览 `aproxy desktop`**：带界面的版本（`--version` 的变体段为 `desktop`）可以打开桌面窗口。这一版的界面是预览版：实例、请求日志与统计都是演示数据，不是这台电脑上正在运行的 aProxy，界面顶部常驻「预览版 · 演示数据」标签；真实数据在之后的版本接入。界面偏好（主题、语言、Mica 开关）这一版也不保存，重新打开窗口恢复默认。窗口是独立的进程，关掉就退出，窗口本身不启停、不改动任何实例（和其余命令一样，发现上次的安装没做完时会在后台续完）；同一个 home 只开一个（再次运行提示已经在运行，以 0 退出），登记在进程台账里（角色 `desktop`），webview 的数据放在 `<home>/desktop/`。Windows 需要 WebView2 运行时：从终端运行时命令立即返回、窗口独立运行，从快捷方式启动时控制台窗口只闪一下（约 0.2 秒）就消失，说明改用对话框；Windows 11 上可以在设置里打开 Mica 背景。Linux 需要图形会话与 WebKitGTK 4.1。打不开时（没有 WebView2、没有图形会话）说明原因并以 1 退出，代理与其余命令不受影响。无界面的 headless 版本也认得这个命令（帮助里不列出），执行时说明怎样换装带界面的版本（`aproxy install --variant desktop`），以 1 退出。
 - **强制安装 `aproxy install --force`**：普通安装失败、卡住，或装着的版本坏到跑不起来时使用。它不走交接：先取得并核对目标（在线时读 release 附带的发布清单 `aproxy-manifest.json` 选资产、比对 sha256，或用 `--from <文件>`），在本机跑通它的 `--version`；确认之后按进程台账结束这个 home 下当前用户的全部 aproxy 进程（安装者、看护者、实例；属于别的用户的跳过并报告），清空 `<home>/install/`，换上新二进制，再用新版本的 `aproxy restore` 按原参数拉回实例。这会立即中断所有经 aproxy 的在途请求，所以先确认；标准输入不是终端时必须加 `--yes`。明确写出的版本号可以降级，但不装低于 0.2.0 的版本；`latest` 解析出的版本低于正在运行的版本时（新版本的发布漏了清单）以 10 结束，不悄悄降级。下载只走 HTTPS，60 秒收不到数据才放弃，清单与资产各有大小上限；`--variant desktop|headless` 选变体，默认与当前相同（与 `--from` 同用时是核对：文件必须正是这个变体）；与 `--force` 冲突的 `--no-skills`、`--allow-downgrade` 等选项按用法错误拒绝（退出码 2，什么都不做）；`--cpu` 显式指定的指令集档必须正好存在，不指定时按本机 CPU 选 x86-64-v3 或基线档。写明了变体或指令集档、而清单里没有这个平台对应的组合时，错误里列出该平台实际有的组合，以 10 结束；没写 `--variant` 而清单里这个平台根本没有当前的变体时，与跑不起来一样改装同一目标的 headless 并说明原因（写了 `--cpu` 就守这一档）。它不读配置与 `settings.json`（损坏的配置挡不住它），也不更新 skill 文档（之后执行 `aproxy install --skills-only`）。它只修已经装着的 home：home 不存在（多半是 `APROXY_HOME` 写错了）时以 10 结束。退出码：0 完成；10 一个进程都没结束、二进制没换；11 结束过进程、二进制没换（再执行一次即可，或 `aproxy restore` 用原来的二进制拉回实例）；12 二进制已换、有实例没回来（按端口列出启动命令）。输出写不出去（例如接到已经关闭的管道）不改变退出码；同一个 home 上后来的强制安装会结束先来的，先来的那个以 1（Windows）或 137（Linux、macOS）结束。装着的版本连运行都不行时，手动下载新版本，执行 `<新版本> install --force --from <新版本>`。从 0.2.0 起，任何版本的强制安装都能安装任何版本、结束任何版本启动的进程，这套约定（目录布局、台账、发布清单、命令行与退出码）不再改动。
 - **进程台账 `<home>/ledger/`**：实例（后台与前台）、看护者、安装者与桌面界面在占用端口或拉起子进程之前写一条 `<pid>.json`（pid、进程启动标记、角色、版本，实例另记端口与配置文件），正常退出时删除；写失败只告警、照常运行。强制安装只按台账找进程，结束前核验启动标记，pid 已被别的进程复用时只删条目、不结束。0.1.x 不写台账，它启动的进程由强制安装列出、不结束。
-- **可自定义心跳**：config.toml 的 `keepalive_heartbeat` 指定每个保活间隔写给客户端的字节，默认仍是 SSE 注释 `: keepalive`。aProxy 不认识协议，心跳的形态由用户按客户端决定，例如解析器容不下注释的客户端可改成空行 `"\n"`。启动与 `aproxy doctor` 校验它写完后客户端的 SSE 解析器停在事件边界（非空、以换行结尾、含 `event:`/`data:` 等字段行时以空行收尾），否则心跳会和回放的第一个上游事件拼在一起。
+- **`aproxy settings show|get|set|unset`**：查看与修改 settings.json。`show` 打印生效的全部设置（文件里的键盖在内置默认上），`get` 取一个键（点号路径，如 `watchdog.enabled`、`defaults.timeouts.connect_secs`），`set` 只改目标键并拒绝会引入新错误的改动，`unset` 能删任何键（包括不认识的）。值写成 JSON，字符串类型的键可以直接写原文；值写 `-` 表示从标准输入读一行，密钥用它传，不进命令行历史。读出来的密钥一律是占位对象 `{"secret": true, "hint": "…"}`，把占位原样写回等于不改。settings.json 只有本用户可读写（unix 0600；Windows 上只保留当前用户、SYSTEM 与 Administrators）。
+- **全局默认可以放任何 config.toml 的键，凭据只发给它所属的上游**：settings.json 的 `defaults` 里能写 `base_url`、`api_key`、`proxy`、头表、超时、重试规则等（`listen_addr`、`log_file`、`[[format]]` 除外），所有实例在自己的配置没写时继承。`defaults.api_key` 与密钥类的头（`authorization`、`x-api-key` 等，按名字识别）只在实例最终的 `base_url` 与 `defaults.base_url` 是同一个目标时继承（比较前去掉末尾斜杠、scheme 与主机转小写、去掉默认端口，路径参与比较）；代理的用户名与口令同理跟着 `defaults.proxy` 走。没被继承的凭据在 `aproxy config --show` 里列出；实例自己也没有这项凭据时另给一条告警。`defaults` 里有凭据却没写它的目标时是错误。
+- **`aproxy config --show` 显示生效值与来源**：每个键的值来自命令行覆盖、config.toml、settings.json 的全局默认还是内置默认，一并列出配置的诊断；有错误时照样打印，以退出码 3 结束。
+- **`aproxy config --unset <键>`**：删掉配置文件里的一个键（点号路径），包括本版本不认识的键。`aproxy config` 的各项修改只动目标键，保留文件里的注释、键的顺序与其余内容；几个进程同时修改不丢更新；会引入新错误的修改被拒绝。
+- **按路径与状态码限定重试次数**：`[[retry.rules]]` 里第一条 `path`（正则）与可选的 `status`（状态码列表）都匹配的规则生效，`max_attempts` 是总尝试次数，`0` 表示这类请求不设上限；例如对某个路径的 404 只试 1 次。因规则放弃时错误码是 `retry_exhausted`，`details.by` 为 `rule:<序号>`。
+- **首字节超时与读空闲超时分开**：`[timeouts] first_byte_secs` 管发出请求后等响应头，`read_idle_secs` 管响应体两次读到数据之间的间隔，分别报 `upstream_first_byte_timeout` 与 `upstream_read_idle_timeout`。
+- **每个请求有 `request_id`**：形如 `<实例标识>-<序号>`，在错误响应的头与体、日志、以及交给 format 程序的信封里是同一个值，可用来对照一次请求的全程。
+- **可自定义心跳**：config.toml 的 `[keepalive] heartbeat` 指定每个保活间隔写给客户端的字节，默认仍是 SSE 注释 `: keepalive`。aProxy 不认识协议，心跳的形态由用户按客户端决定，例如解析器容不下注释的客户端可改成空行 `"\n"`。启动与 `aproxy doctor` 校验它写完后客户端的 SSE 解析器停在事件边界（非空、以换行结尾、含 `event:`/`data:` 等字段行时以空行收尾），否则心跳会和回放的第一个上游事件拼在一起。
 - **转换器信封加 `stage`、`request_id`、`state`**：同一客户端请求的请求转换与响应转换收到同一个 `request_id`；请求转换回信里的 `state`（不透明字符串）由 aProxy 按请求保存、交给响应转换，两个转换器不必再只靠 `url` 反查当初的决定。字段都是可选的，不读它们的 format 程序不受影响。信封契约 crate `aproxy-envelope` 随之升级：0.2.0 正式版之前它与 aproxy 同号发预发布版（这一版的 aproxy 用同号的 envelope），正式版时才发 0.2.0。
-- **心跳转换器 `heartbeat_transform`**：保活响应等待期间，每一拍交给 format 程序按请求内容生成心跳（信封 `stage = "heartbeat"`，首拍带请求体，另附第几拍、已等待毫秒数与当前第几次上游尝试），能按协议发出客户端认可的内容。它不会拖住心跳：上一拍没回来、调用失败或回信不合事件边界规则时，这一拍改发固定心跳（每个请求只告警一次）；回放开始后才回来的心跳直接丢弃。心跳回信的 `state` 同样交给之后的响应转换。
-- **重试前重新执行请求转换（`every_attempt`）**：`[request_transform]` 设 `every_attempt = true` 后，每次重试之前 aProxy 用客户端的原始请求再调用一次请求转换（信封 `stage = "retry"`，`retry` 字段带这是第几次尝试、上一次的上游状态码或失败原因），回信就是这次发往上游的请求。format 可以借此在失败后换 key、换渠道，无限重试不会一直打同一个坏掉的上游；官方 aproxy-format 在 persistent 模式下每次重试都会换到下一个 key。这一次的转换失败不会终止请求，沿用上一次发出的请求。默认关闭，行为不变。信封契约 crate `aproxy-envelope` 随之增加 `retry` 字段。
+- **心跳转换器**（`[[format]]` 条目的 `stages` 里写 `"heartbeat"`）：保活响应等待期间，每一拍交给 format 程序按请求内容生成心跳（信封 `stage = "heartbeat"`，首拍带请求体，另附第几拍、已等待毫秒数与当前第几次上游尝试），能按协议发出客户端认可的内容。它不会拖住心跳：上一拍没回来、调用失败或回信不合事件边界规则时，这一拍改发固定心跳（每个请求只告警一次）；回放开始后才回来的心跳直接丢弃。心跳回信的 `state` 同样交给之后的响应转换。
+- **重试前重新执行请求转换**：`[[format]]` 条目的 `stages` 在 `"request"` 之外再写 `"retry"` 后，每次重试之前 aProxy 用客户端的原始请求再调用一次请求转换（信封 `stage = "retry"`，`retry` 字段带这是第几次尝试、上一次的上游状态码或失败原因），回信就是这次发往上游的请求。format 可以借此在失败后换 key、换渠道，无限重试不会一直打同一个坏掉的上游；官方 aproxy-format 在 persistent 模式下每次重试都会换到下一个 key。这一次的转换失败不会终止请求，沿用上一次发出的请求。不写 `"retry"` 时行为不变。信封契约 crate `aproxy-envelope` 随之增加 `retry` 字段。
 
 ### 变更
 
@@ -62,11 +100,11 @@
 - `aproxy install --skills-only` 可以同时指定版本（`aproxy install <版本> --skills-only`），与 latest 查询失败时的提示一致。
 - `aproxy stop` 等不到实例退出时，提示改为跨平台、会核验进程身份的 `aproxy stop <端口> --force`（此前在所有平台都建议 `taskkill`）。
 - `settings.json` 的 `default_config` 指向的文件不存在时，只有要读配置的命令（启动、`aproxy config` 查看或修改内容）报错退出；`status`、`stop`、`doctor`、自动拉起的 `install --continue` 等不再被拦，报错信息推荐的 `aproxy config --clear-default` 也能直接执行（此前所有不带 `--config` 的命令都在分发前退出 1）。
-- `settings.json` 解析失败时，`aproxy alias add/remove` 与 `aproxy config --set-default/--clear-default` 拒绝修改并提示先修复或删除该文件，不再用默认值写回、冲掉原有的全部别名。
+- `settings.json` 不是合法的 JSON 时，所有会写它的命令（`aproxy alias add/remove`、`aproxy config --set-default/--clear-default`、`aproxy settings set/unset`）拒绝修改并原样保留文件，不再用默认值写回、冲掉原有的全部别名。这些命令现在只改自己的那个键，不再整份重写文件。
 - 相对路径的 `log_file` / `--log-file` 按文档相对 `APROXY_HOME` 解析（此前实际相对当前工作目录）。
 - **外部转换器纳入心跳节拍**：保活适用的请求，请求转换、响应转换与回放前解码期间照常提交骨架头并发心跳。此前 format 慢（`timeout_secs = 0` 时没有上界）时，客户端可能在收到任何字节之前一直干等。请求转换若在骨架头提交之后才失败，以 `proxy_transform_failed` 终态 error 事件收场（提交前失败仍是 502）。
 - `override_headers` 里配置的 `accept-encoding` 对保活适用的请求不生效（这些请求一律以 `identity` 发往上游），启动时 warn 一次说明，不再静默覆盖。
-- 请求体超过 `max_body_mb` 时，客户端能收到 413 和调整上限的提示。此前代理一发现超限就回 413 并关闭连接，而客户端往往还在上传，结果只看到连接被中止（Windows 上必现）。现在先把剩余的请求体读掉丢弃（最多 10 秒，2 秒没有新数据即止）再回应；缓冲路径与 `forward_only` 都是如此。
+- 请求体超过 `max_request_mb` 时，客户端能收到 413 和调整上限的提示。此前代理一发现超限就回 413 并关闭连接，而客户端往往还在上传，结果只看到连接被中止（Windows 上必现）。现在先把剩余的请求体读掉丢弃（最多 10 秒，2 秒没有新数据即止）再回应；缓冲路径与仅转发（`delivery = "forward"`）都是如此。
 - 客户端上传大请求体（超过 1 MiB、已溢写到磁盘）途中断开时，`req-*.spooltmp` 临时文件不再残留到下次启动。
 - **挂死实例不再从视野里消失**：进程还在、却不应答控制通道的实例（按 pid + 创建时间核验），`aproxy status` 不再删掉它的注册记录与日志，而是单列为「无响应」并提示 `aproxy stop <端口> --force`；`stop`/`restart` 的 `--force` 经注册记录找到它并核验后终止，`stop all --force` 一并处理。此前一次 status 就会删掉记录，`--force` 随即找不到它，尚未被看门狗收养的挂死实例也失去了被收养、处决重拉的依据。
 - `aproxy stop` 有目标未能确认停止（等不到退出、`--force` 失败、目标挂死而未加 `--force`）时以 1 退出，脚本可据此判断；此前一律退出 0。

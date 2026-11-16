@@ -279,7 +279,20 @@ pub struct WatchdogConfig {
     pub max_restarts: u32,
     /// 全部实例清零后的闲置自灭等待（秒）；0 = 永不自灭
     pub idle_exit_secs: u64,
+    /// 每个步进周期重读的 settings.json。Some 时：开关（`watchdog.enabled`）被关掉，看护者
+    /// 就退出；`max_restarts` 与 `idle_exit_secs` 跟着文件变。文件无效时沿用上一次读到的
+    /// 有效值（见 [`settings::load_from`]）。None = 不重读（测试注入的配置）
+    pub settings_path: Option<PathBuf>,
 }
+
+/// 连续重拉失败达到 `max_restarts` 之后的重试间隔（秒）。不放弃：期望状态记录还在，
+/// 就说明用户仍然要这个实例在运行；让它失败的原因（配置文件所在的网络盘没挂上、端口被
+/// 别的程序暂时占着）多半会自己消失。
+pub const SLOW_RETRY_SECS: u64 = 300;
+
+/// 重拉出来的实例要存活这么久（秒），之前的连续失败才一笔勾销。起得来、几秒后又崩的
+/// 实例不算恢复：不这样的话它每次都被立即重拉，退避永远不生效。
+pub const HEALTHY_AFTER_SECS: u64 = 60;
 
 impl WatchdogConfig {
     /// 从 settings 组装（生产路径）。
@@ -299,6 +312,7 @@ impl WatchdogConfig {
             stale_after_cycles: s.watchdog_stale_after_cycles.max(1),
             max_restarts: s.watchdog_max_restarts,
             idle_exit_secs: s.watchdog_idle_exit_secs,
+            settings_path: Some(settings::settings_path()),
         }
     }
 }
@@ -313,8 +327,11 @@ struct Watched {
     /// adopt_scan 会补挂），绝不能复用已 close 的旧值——close 后的句柄号
     /// 可能被内核分配给无关对象，复用即误杀。
     handle: isize,
-    /// 本实例连续重拉失败次数（crashloop 防护计数，重拉成功清零）
+    /// 这个实例若在存活满 [`HEALTHY_AFTER_SECS`] 之前死亡，按已经连续失败这么多次处理
+    /// （决定退避多久）。收养来的实例为 0；看护者重拉出来的，是重拉之前的失败次数加一
     consecutive_failures: u32,
+    /// 纳入看护的时刻：判断它活了多久
+    since: std::time::Instant,
     /// 收养/重拉收编时实测的进程创建时间：处决关卡与句柄补挂据此确认
     /// 「pid 仍是当初收编的那个进程」（pid 复用后必然不符）。0 = 收编时
     /// 已测不到（进程刚死），此后任何核验都不会通过——宁可不杀不挂。
@@ -435,6 +452,7 @@ impl WatchdogState {
                 pid: info.pid,
                 handle,
                 consecutive_failures: 0,
+                since: std::time::Instant::now(),
                 start_time: start,
             });
             self.spawn_death_watcher(entry.port.clone(), info.pid, handle);
@@ -529,7 +547,7 @@ impl WatchdogState {
         if self.install_announcement_active()
             && let Some(new_pid) = self.wait_for_install_restart(port, w.pid).await
         {
-            self.admit_respawned(port, new_pid);
+            self.admit_respawned(port, new_pid, 0);
             return DeathOutcome::Reclaimed(new_pid);
         }
 
@@ -540,10 +558,15 @@ impl WatchdogState {
             return DeathOutcome::GracefulExit;
         }
 
+        // 活够了时间的实例，之前的失败一笔勾销；没活够的，这次死亡接着之前的失败往下数。
         // 首次崩溃（failures=0）退避为 0 → 立即重拉；失败后进队列按指数退避
-        let failures = w.consecutive_failures;
+        let failures = if w.since.elapsed().as_secs() >= HEALTHY_AFTER_SECS {
+            0
+        } else {
+            w.consecutive_failures
+        };
         if failures >= self.cfg.max_restarts {
-            return self.give_up(port, failures);
+            return self.slow_retry(port, failures);
         }
         let delay = backoff_delay_secs(failures);
         if delay > 0 {
@@ -560,7 +583,7 @@ impl WatchdogState {
         tracing::warn!(port = %port, "实例崩溃，立即重拉");
         match respawn_instance(&self.cfg.home, &self.cfg.run_dir, port).await {
             Ok((pid, actual_port)) => {
-                self.admit_respawned_at(port, &actual_port, pid);
+                self.admit_respawned_at(port, &actual_port, pid, failures);
                 DeathOutcome::Respawned(pid)
             }
             Err(e) => self.queue_retry(port, failures, e.to_string()),
@@ -584,7 +607,9 @@ impl WatchdogState {
             let p = self.pending.remove(i);
             tracing::info!(port = %p.port, attempt = p.failures + 1, "退避到期，重试重拉");
             match respawn_instance(&self.cfg.home, &self.cfg.run_dir, &p.port).await {
-                Ok((pid, actual_port)) => self.admit_respawned_at(&p.port, &actual_port, pid),
+                Ok((pid, actual_port)) => {
+                    self.admit_respawned_at(&p.port, &actual_port, pid, p.failures)
+                }
                 // 记录没了 = 用户在退避期间 stop 了它：不再是要恢复的实例，出队
                 Err(RespawnError::NoRecord) => {
                     tracing::info!(port = %p.port, "期望状态记录已被删除（实例已被停止），不再重拉");
@@ -610,7 +635,13 @@ impl WatchdogState {
     /// 与（下轮 adopt_scan 收养的）实际端口双重看护；旧端口的期望状态记录也残留，
     /// 用户 stop 新端口后看护者凭它把实例无限复活。实际端口与死亡端口不同
     /// 时，退役死亡端口的记录（旧进程已确认死亡，记录已被新实例取代）。
-    fn admit_respawned_at(&mut self, dead_port: &str, actual_port: &str, pid: u32) {
+    fn admit_respawned_at(
+        &mut self,
+        dead_port: &str,
+        actual_port: &str,
+        pid: u32,
+        prior_failures: u32,
+    ) {
         if crate::daemon::retire_moved_port_records_in(&self.cfg.run_dir, dead_port, actual_port) {
             tracing::warn!(
                 old_port = %dead_port,
@@ -619,14 +650,17 @@ impl WatchdogState {
                 "实例重拉后落在新端口（配置已改端口或端口为 0），已清理旧端口的恢复记录"
             );
         }
-        self.admit_respawned(actual_port, pid);
+        self.admit_respawned(actual_port, pid, prior_failures);
     }
 
     /// 重拉/回归成功后的重新收养：开句柄挂死亡 watcher；开不出则 handle=0
     /// 留给 adopt_scan 补挂（见 adopt_scan 开头分支）。pid 来自 spawn 链（看护
     /// 者亲手拉起并等到就绪）或已核验的回归记录，直接可信——此刻实测的创建
     /// 时间作为它后续处决/补挂的身份基准。
-    fn admit_respawned(&mut self, port: &str, pid: u32) {
+    ///
+    /// `prior_failures` 是这次重拉之前已经连续失败的次数：实例若没活够
+    /// [`HEALTHY_AFTER_SECS`] 就又死了，这次重拉也算失败，从 `prior_failures + 1` 接着数。
+    fn admit_respawned(&mut self, port: &str, pid: u32, prior_failures: u32) {
         tracing::info!(port = %port, new_pid = pid, "实例已重拉并就绪");
         // 先开句柄再测创建时间：Windows 句柄一旦打开就钉住进程对象，随后按
         // pid 测得的必是同一对象的时间（反序则两次调用之间进程若恰好退出、
@@ -637,7 +671,8 @@ impl WatchdogState {
             port: port.to_string(),
             pid,
             handle,
-            consecutive_failures: 0,
+            consecutive_failures: prior_failures.saturating_add(1),
+            since: std::time::Instant::now(),
             start_time,
         });
         if handle != 0 {
@@ -646,14 +681,14 @@ impl WatchdogState {
         self.empty_since = None;
     }
 
-    /// 重拉失败：计数+1，达上限放弃，否则入队按指数退避。
+    /// 重拉失败：计数+1，达上限转入慢速重试，否则入队按指数退避。
     /// 崩溃实例从 watched 消失（死亡 watcher 已消费，句柄已关——留着的都是
     /// 悬空条目，曾导致一次失败后永久失去看护，H1）。
     fn queue_retry(&mut self, port: &str, failures: u32, err: String) -> DeathOutcome {
-        let failures = failures + 1;
+        let failures = failures.saturating_add(1);
         tracing::error!(port = %port, error = %err, attempt = failures, "重拉失败");
         if failures >= self.cfg.max_restarts {
-            return self.give_up(port, failures);
+            return self.slow_retry(port, failures);
         }
         let delay = backoff_delay_secs(failures);
         self.pending.push(PendingRetry {
@@ -665,18 +700,38 @@ impl WatchdogState {
         DeathOutcome::RespawnFailed
     }
 
-    /// crashloop 放弃：写 startup.log 大声报出，保留期望状态记录人工兜底。
-    fn give_up(&mut self, port: &str, failures: u32) -> DeathOutcome {
-        tracing::error!(
-            port = %port,
-            attempts = failures,
-            "实例连续重拉失败达上限，放弃自动重拉（期望状态记录已保留，可 aproxy restore 手工恢复）"
-        );
-        crate::daemon::append_startup_log(&format!(
-            "[watchdog] 端口 {port} 的实例连续重拉 {failures} 次失败，已放弃自动重拉；可执行 aproxy restore 手工恢复"
-        ));
+    /// 连续失败达到上限：不再按指数退避紧追，改为每 [`SLOW_RETRY_SECS`] 试一次，直到
+    /// 拉起来、或它的期望状态记录被 stop 删掉。刚越过上限的那一次在 startup.log 里大声
+    /// 说一遍（用户排查「实例为什么没回来」的第一个入口），之后的重试只进日志。
+    ///
+    /// `max_restarts = 0` 的含义是「只看不拉」：一次都不重拉，记录留着等人工 restore。
+    fn slow_retry(&mut self, port: &str, failures: u32) -> DeathOutcome {
+        if self.cfg.max_restarts == 0 {
+            tracing::warn!(
+                port = %port,
+                "实例已不在运行；watchdog.max_restarts 为 0，不自动重拉（期望状态记录已保留，可 aproxy restore 手工恢复）"
+            );
+            self.after_watch_removal();
+            return DeathOutcome::GaveUp;
+        }
+        if failures == self.cfg.max_restarts {
+            tracing::error!(
+                port = %port,
+                attempts = failures,
+                retry_every_secs = SLOW_RETRY_SECS,
+                "实例连续重拉失败达上限，转入慢速重试（期望状态记录已保留，也可 aproxy restore 手工恢复）"
+            );
+            crate::daemon::append_startup_log(&format!(
+                "[watchdog] the instance on port {port} failed to come back {failures} times in a row; retrying every {SLOW_RETRY_SECS} seconds until it starts or `aproxy stop {port}` is run"
+            ));
+        }
+        self.pending.push(PendingRetry {
+            port: port.to_string(),
+            failures,
+            next_retry: std::time::Instant::now() + Duration::from_secs(SLOW_RETRY_SECS),
+        });
         self.after_watch_removal();
-        DeathOutcome::GaveUp
+        DeathOutcome::SlowRetry
     }
 
     /// 一个完整步进周期：claim 续写 + 收养 + 健康 + 挂死事件处理 + 退避重试
@@ -693,6 +748,9 @@ impl WatchdogState {
         for port in deaths {
             self.handle_death(&port).await;
         }
+        if self.reload_settings() == Tick::Retire {
+            return Tick::Retire;
+        }
         self.process_pending_retries().await;
         self.adopt_scan().await;
         self.health_scan().await;
@@ -700,6 +758,25 @@ impl WatchdogState {
             return Tick::Retire;
         }
         self.check_install_keepalive();
+        Tick::Continue
+    }
+
+    /// 重读 settings.json：开关被关掉就退出（删掉 claim，让以后重新打开时能立刻拉起新的；
+    /// 期望状态记录不动，重新打开之后崩溃的实例照样被拉回），其余可调项跟着文件变。
+    /// 扫描周期不在这里改：它决定心跳多久算新鲜，别的进程是按启动时的值判断本看护者
+    /// 在不在任的。
+    fn reload_settings(&mut self) -> Tick {
+        let Some(path) = &self.cfg.settings_path else {
+            return Tick::Continue;
+        };
+        let s = settings::load_from(path);
+        if !s.watchdog {
+            tracing::info!("settings.json 里的 watchdog.enabled 已关闭，看护者退出");
+            remove_claim_in(&self.cfg.run_dir);
+            return Tick::Retire;
+        }
+        self.cfg.max_restarts = s.watchdog_max_restarts;
+        self.cfg.idle_exit_secs = s.watchdog_idle_exit_secs;
         Tick::Continue
     }
 
@@ -826,7 +903,9 @@ pub enum DeathOutcome {
     Reclaimed(u32),
     /// 重拉失败（退避计数 +1，未达上限）
     RespawnFailed,
-    /// 连续失败达上限，放弃自动重拉
+    /// 连续失败达上限，转入慢速重试（每 [`SLOW_RETRY_SECS`] 一次）
+    SlowRetry,
+    /// `max_restarts` 为 0：不自动重拉
     GaveUp,
     /// 优雅退出（无 .restore），正常摘除
     GracefulExit,
@@ -1284,7 +1363,8 @@ mod tests {
             scan_secs: 1,
             stale_after_cycles: 1,
             max_restarts: 2,
-            idle_exit_secs: 0, // 测试不自灭（退出会杀测试进程！）
+            idle_exit_secs: 0,   // 测试不自灭（退出会杀测试进程！）
+            settings_path: None, // 不读任何 settings.json
         }
     }
 
@@ -1540,6 +1620,7 @@ mod tests {
             pid,
             handle,
             consecutive_failures: 0,
+            since: std::time::Instant::now(),
             start_time: start.wrapping_add(1),
         });
         assert!(st.health_scan().await.is_empty(), "身份不符不得处决");
@@ -1628,6 +1709,7 @@ mod tests {
             pid: u32::MAX - 777,
             handle: 0,
             consecutive_failures: 0,
+            since: std::time::Instant::now(),
             start_time: 0,
         });
         // 有注册表、没有期望状态记录 → 已被停止
@@ -1646,26 +1728,97 @@ mod tests {
         assert!(st.watched_ports().is_empty(), "优雅退出后应摘除看护");
     }
 
+    /// 连续失败达到上限：不放弃，转入慢速重试；记录留着。`max_restarts = 0` 才是不重拉。
     #[tokio::test]
-    async fn watchdog_state_crashloop_gives_up() {
+    async fn watchdog_state_crashloop_slows_down_instead_of_giving_up() {
         let dir = tempfile::tempdir().unwrap();
         let port = "59902";
         write_crashed_instance(dir.path(), port);
         let cfg = test_cfg(dir.path());
         let mut st = WatchdogState::new(cfg);
-        st.watched.push(Watched {
+        let young = |failures: u32| Watched {
             port: port.into(),
             pid: u32::MAX - 777,
             handle: 0,
-            consecutive_failures: st.cfg.max_restarts, // 已达上限
+            consecutive_failures: failures,
+            since: std::time::Instant::now(),
             start_time: 0,
-        });
-        // 崩溃（restore+registry 都在）但失败计数达上限 → GaveUp，记录保留
-        assert_eq!(st.handle_death(port).await, DeathOutcome::GaveUp);
-        assert!(st.watched_ports().is_empty(), "放弃后应摘除看护");
+        };
+        st.watched.push(young(st.cfg.max_restarts)); // 已达上限
+        assert_eq!(st.handle_death(port).await, DeathOutcome::SlowRetry);
+        assert!(st.watched_ports().is_empty(), "死掉的实例应摘出看护表");
+        assert_eq!(st.pending.len(), 1, "应排进慢速重试");
+        let wait = st.pending[0]
+            .next_retry
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            wait > Duration::from_secs(SLOW_RETRY_SECS - 5),
+            "慢速重试的间隔应是 {SLOW_RETRY_SECS} 秒，实际还要等 {wait:?}"
+        );
         assert!(
             crate::spec::restore_path_in(dir.path(), port).is_file(),
-            "期望状态记录必须保留（人工 restore 兜底）"
+            "期望状态记录必须保留"
+        );
+
+        // 到期重试仍失败（配置文件不在）：继续慢速重试，不出队、不加速
+        st.pending[0].next_retry = std::time::Instant::now() - Duration::from_secs(1);
+        st.process_pending_retries().await;
+        assert_eq!(st.pending.len(), 1);
+        assert!(
+            st.pending[0]
+                .next_retry
+                .saturating_duration_since(std::time::Instant::now())
+                > Duration::from_secs(SLOW_RETRY_SECS - 5)
+        );
+
+        // 活够了时间的实例再死：之前的失败一笔勾销，按首次崩溃处理（立即重拉；这里重拉
+        // 因配置文件不在而失败，于是是「失败 1 次」的普通退避，不是慢速重试）
+        st.pending.clear();
+        let mut old = young(st.cfg.max_restarts);
+        old.since = std::time::Instant::now() - Duration::from_secs(HEALTHY_AFTER_SECS + 1);
+        st.watched.push(old);
+        assert_eq!(st.handle_death(port).await, DeathOutcome::RespawnFailed);
+        assert_eq!(st.pending[0].failures, 1);
+
+        // max_restarts = 0：只看不拉
+        st.pending.clear();
+        st.cfg.max_restarts = 0;
+        st.watched.push(young(0));
+        assert_eq!(st.handle_death(port).await, DeathOutcome::GaveUp);
+        assert!(st.pending.is_empty());
+        assert!(crate::spec::restore_path_in(dir.path(), port).is_file());
+    }
+
+    /// settings.json 里把看护者关掉：下一个步进周期退出，claim 删掉，期望状态记录不动；
+    /// 可调项跟着文件变；文件改坏了就沿用上一次的有效值。
+    #[tokio::test]
+    async fn watchdog_follows_settings_and_exits_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let write = |json: &str| std::fs::write(&settings_path, json).unwrap();
+        write(r#"{"watchdog": {"enabled": true, "max_restarts": 9, "idle_exit_secs": 0}}"#);
+        let cfg = WatchdogConfig {
+            settings_path: Some(settings_path.clone()),
+            ..test_cfg(dir.path())
+        };
+        let mut st = WatchdogState::new(cfg);
+        write_restore(dir.path(), "59921");
+
+        assert_eq!(st.tick().await, Tick::Continue);
+        assert_eq!(st.cfg.max_restarts, 9, "可调项应跟着文件变");
+        assert!(read_claim_in(dir.path()).is_some(), "在任期间续写 claim");
+
+        // 改坏文件：沿用上一次的有效值，继续看护
+        write(r#"{"watchdog": "off"}"#);
+        assert_eq!(st.tick().await, Tick::Continue);
+        assert_eq!(st.cfg.max_restarts, 9);
+
+        write(r#"{"watchdog": {"enabled": false}}"#);
+        assert_eq!(st.tick().await, Tick::Retire, "开关关掉应退出");
+        assert!(read_claim_in(dir.path()).is_none(), "退出时删掉 claim");
+        assert!(
+            crate::spec::restore_path_in(dir.path(), "59921").is_file(),
+            "期望状态记录不归看护者删"
         );
     }
 
@@ -1688,6 +1841,7 @@ mod tests {
             pid: u32::MAX - 777,
             handle: 0,
             consecutive_failures: 0,
+            since: std::time::Instant::now(),
             start_time: 0,
         });
         // 首次崩溃：立即重拉 → 失败（配置不存在）→ 入队，failures=1
@@ -1723,8 +1877,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watchdog_state_pending_gives_up_at_limit() {
-        // 退避队列中累计到 max_restarts → GaveUp 且队列清空、期望状态记录保留
+    async fn watchdog_state_pending_reaches_the_limit_and_keeps_retrying_slowly() {
+        // 退避队列中累计到 max_restarts → 转入慢速重试，条目还在、期望状态记录保留
         let dir = tempfile::tempdir().unwrap();
         let port = "59904";
         write_crashed_instance(dir.path(), port);
@@ -1736,10 +1890,17 @@ mod tests {
             next_retry: std::time::Instant::now() - Duration::from_secs(1),
         });
         st.process_pending_retries().await;
-        assert!(st.pending.is_empty(), "放弃后队列应清空");
+        assert_eq!(st.pending.len(), 1, "达上限后应留在队列里慢速重试");
+        assert_eq!(st.pending[0].failures, 2);
+        assert!(
+            st.pending[0]
+                .next_retry
+                .saturating_duration_since(std::time::Instant::now())
+                > Duration::from_secs(SLOW_RETRY_SECS - 5)
+        );
         assert!(
             crate::spec::restore_path_in(dir.path(), port).is_file(),
-            "放弃自动重拉不删记录：人工 restore 还要用它"
+            "慢速重试不删记录"
         );
     }
 
@@ -1757,6 +1918,7 @@ mod tests {
             pid: u32::MAX - 777,
             handle: 0,
             consecutive_failures: 0,
+            since: std::time::Instant::now(),
             start_time: 0,
         });
         let start = std::time::Instant::now();

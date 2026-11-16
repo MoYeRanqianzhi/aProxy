@@ -241,9 +241,10 @@ fn spawn_daemon_with(home: &TestHome, exe: &Path, cfg: &Path) -> ChildGuard {
     )
 }
 
-/// 启动看护者（--daemon-watchdog，扫描周期 1s，只看得到隔离主目录的 run/），
-/// stdout 落文件供断言它的处置日志
+/// 启动看护者（扫描周期 1s，只看得到隔离主目录的 run/），stdout 落文件供断言它的处置
+/// 日志。先打开 settings 里的开关：看护者每个周期都读它，关着就退出
 fn spawn_watchdog(home: &TestHome, exe: &Path, log: &Path) -> ChildGuard {
+    home.enable_watchdog();
     let out = std::fs::File::create(log).unwrap();
     ChildGuard(
         home.watchdog_cmd_with(exe)
@@ -1400,4 +1401,48 @@ fn instance_survives_sigint_to_the_launchers_process_group() {
         Some(pid),
         "发给启动者进程组的 SIGINT 不该停掉实例"
     );
+}
+
+/// settings.json 里把看护者关掉：在任的看护者在下一个扫描周期退出，期望状态记录不动。
+#[test]
+fn watchdog_exits_once_it_is_disabled_in_settings() {
+    let test_home = TestHome::new();
+    let home = test_home.path();
+    let exe = built_exe();
+    let rt = runtime();
+    let port = free_port();
+    let cfg = home.join("wd-off.toml");
+    write_cfg(&cfg, &format!("127.0.0.1:{port}"));
+    test_home.stop_on_drop(port);
+    let _daemon = spawn_daemon_with(&test_home, &exe, &cfg);
+    assert!(wait_daemon_ready(&rt, port, home), "实例未就绪");
+    let wd_log = home.join("watchdog.log");
+    let mut wd = spawn_watchdog(&test_home, &exe, &wd_log);
+    assert!(
+        wait_for(Duration::from_secs(15), || log_has(
+            &wd_log,
+            &["看护者收养实例", &port.to_string()]
+        )),
+        "实例应被收养；看护者日志:
+{}",
+        read_text(&wd_log)
+    );
+
+    test_home.settings(r#"{"watchdog": {"enabled": false}}"#);
+    assert!(
+        wait_for(Duration::from_secs(10), || wd
+            .0
+            .try_wait()
+            .unwrap()
+            .is_some()),
+        "开关关掉后看护者应退出；看护者日志:
+{}",
+        read_text(&wd_log)
+    );
+    assert!(has_restore(home, port), "期望状态记录不归看护者删");
+    assert!(
+        !home.join("run").join("watchdog.claim").exists(),
+        "退出的看护者应删掉自己的 claim"
+    );
+    assert!(ipc_ping_in_dir(&rt, port, home).is_ok(), "实例不受影响");
 }

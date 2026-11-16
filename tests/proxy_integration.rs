@@ -6038,13 +6038,14 @@ fn logs_via_alias_connects_and_follows() {
 //
 // 隔离：APROXY_HOME 指向 TestHome 的临时目录（守护/看护子进程经 spawn_detached
 // 继承环境），APROXY_WATCHDOG_SCAN_SECS=1 让看护者秒级扫描。测试端口向系统要，
-// 绝不触碰生产实例；结束清理 claim 与残留守护。TestHome 关掉的只是 start 与守护
-// 顺带拉起看护者；这里的看护者由测试自己以 --daemon-watchdog 拉起，它不看那个开关。
+// 绝不触碰生产实例；结束清理 claim 与残留守护。TestHome 默认关着看护者的开关，
+// 这里的测试先把它打开（看护者每个周期都读它，关着就退出），再自己拉起看护者。
 // ---------------------------------------------------------------------------
 #[test]
 fn watchdog_respawns_killed_daemon() {
     let port = free_port();
     let home = TestHome::new();
+    home.enable_watchdog();
     let cfg_file = home.path().join("wd.toml");
     std::fs::write(
         &cfg_file,
@@ -6131,6 +6132,7 @@ fn watchdog_respawns_on_death_event_and_force_stop_stays_stopped() {
     // 死亡事件，此时 .restore 必须已经摘掉，否则刚强停的实例会被拉回来
     let port = free_port();
     let home = TestHome::new();
+    home.enable_watchdog();
     let cfg_file = home.path().join("wd-fast.toml");
     std::fs::write(
         &cfg_file,
@@ -6293,6 +6295,7 @@ fn watchdog_lease_prevents_duplicate_watchdogs() {
     // 并发 spawn 两个看护者（同一隔离主目录）：claim 原子接管保证只有一个
     // 在任——后启动者应自行退出（选举唯一性）
     let home = TestHome::new();
+    home.enable_watchdog();
     let watchdog = || {
         home.watchdog_cmd()
             .env("APROXY_WATCHDOG_SCAN_SECS", "1")

@@ -47,7 +47,7 @@ const NO_PROXY_LOOPBACK: &str = "127.0.0.1,localhost";
 ///   看护者，它带着 aproxy 二进制的镜像一直活到闲置自灭（默认 300 秒）——测试早已结束，它还
 ///   锁着构建产物，让随后的 cargo 重新链接失败，还会把测试里模拟崩溃的实例重新拉起来。要测
 ///   看护者的测试显式开启（[`settings`](Self::settings)），或者自己拉起
-///   看护者（[`watchdog_cmd`](Self::watchdog_cmd)；看护者进程本身不看这个开关）。
+///   看护者（先 [`enable_watchdog`](Self::enable_watchdog)，再 [`watchdog_cmd`](Self::watchdog_cmd)）。
 /// - [`cmd`](Self::cmd) / [`cmd_with`](Self::cmd_with) 返回已注入环境的 `Command`，见
 ///   [`cmd_with`](Self::cmd_with)。
 /// - 析构时先对 [`stop_on_drop`](Self::stop_on_drop) 登记过的每个端口执行一次
@@ -190,6 +190,12 @@ impl TestHome {
             .arg("--spec")
             .arg(spec_path);
         cmd
+    }
+
+    /// 打开这个 home 的看护者开关（整个改写 settings.json）。要自己拉起看护者的测试先调用
+    /// 它：看护者每个周期都读这个开关，关着就退出。
+    pub fn enable_watchdog(&self) {
+        self.settings(r#"{"watchdog": {"enabled": true}}"#);
     }
 
     /// 直接以看护者的入口（`aproxy __watchdog`）在这个 home 里运行看护者的命令。

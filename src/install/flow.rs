@@ -17,7 +17,7 @@
 //!   冻结）。降级（目标比本进程旧）不交：较新的一方驱动，见 [`target_drives`]。
 //!   `--handover-from` 与它的接手语义从此是永久接口，以后的版本都要认。
 //! - 失败语义：任何一步 Err → phase=failed + 原因（last_error）落盘（保留
-//!   现场）后返回。滚动重启中某实例在新版本下起不来 → 用旧二进制按原参数
+//!   现场）后返回。滚动重启中某实例在新版本下起不来 → 用旧二进制按同一份拉起规格
 //!   把它拉回（只恢复服务，阶段不回退），置 halted 中止滚动，自动续作不再
 //!   重试（见 restart.rs 模块文档）。
 //! - 中断语义：任何时刻崩溃/被杀 → install.state 残留，`continue_install`
@@ -81,30 +81,29 @@ async fn live_ports(run_dir: &Path) -> Vec<String> {
 
 /// 实例快照 = 存活实例 ∪ 「被本安装停止、尚未恢复」的在途实例。返回
 /// `(live, snapshot)`：广播只对 live（不在跑的实例没有 IPC 可表达）；滚动
-/// 重启按 snapshot（在途实例由 restart 原语用在途记录直接拉起）。
+/// 重启按 snapshot（在途实例由 restart 原语按它的期望状态记录直接拉起）。
 ///
 /// 只靠 IPC 枚举重算快照会把在途实例永久排除——安装进程在「旧实例已停、
-/// 新实例未就绪」的窗口崩溃后续作，该实例既不在跑也已没了 `.restore`，
-/// 续作照常完成而它从此下线。顺手为缺 `.restore` 的在途实例补写一份：
-/// 续作若在拉起它之前再次失败，`aproxy restore` 仍能把它恢复。
+/// 新实例未就绪」的窗口崩溃后续作，该实例不在跑，续作照常完成而它从此下线。
+/// 在途实例的判据：上一次落盘的快照里有它，它的期望状态记录还在（滚动重启用
+/// `keep_restore` 停止实例，记录不会丢；用户期间 stop 掉的实例记录已删，不再算）。
 async fn snapshot_with_pending(run_dir: &Path, state: &InstallState) -> (Vec<String>, Vec<String>) {
     let live = live_ports(run_dir).await;
     let mut snapshot = live.clone();
-    for p in &state.pending_restores {
-        if snapshot.contains(&p.port) {
+    for port in &state.instance_snapshot {
+        if snapshot.contains(port) {
             continue;
         }
-        if !crate::daemon::restore_file_path_in(run_dir, &p.port).is_file() {
-            let _ = crate::daemon::write_restore_file_in(run_dir, &p.port, &p.args, &p.log_path);
+        if crate::spec::restore_path_in(run_dir, port).is_file() {
+            snapshot.push(port.clone());
         }
-        snapshot.push(p.port.clone());
     }
     (live, snapshot)
 }
 
 /// 回滚用旧二进制：本次交换记下的 old_path（`aproxy.old-…`：Windows 是让位的原文件，
 /// unix 是交换前保留的硬链接或副本）。不存在（首次安装、已被清理）→ None，实例起不来
-/// 时只能保住 `.restore` 下线。
+/// 时实例下线，期望状态记录还在。
 fn rollback_binary(state: &InstallState) -> Option<std::path::PathBuf> {
     state
         .old_path

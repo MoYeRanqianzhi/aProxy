@@ -1,5 +1,10 @@
-//! 拉起守护实例并等它就绪。start、restart、restore、安装的滚动重启、看护者重拉都经这一处，
-//! 就绪的判定与「启动即死」的报告因此只有一份。
+//! 按拉起规格（[`crate::spec::InstanceSpec`]）拉起后台实例并等它就绪。start、restart、
+//! restore、安装的滚动重启、看护者重拉都经这一处，就绪的判定与「启动即死」的报告因此只有
+//! 一份。
+//!
+//! 规格经交接文件交给子进程（`aproxy __serve --home <dir> --spec <file>`），密钥不进命令行；
+//! 子进程的环境是拉起方的环境套上规格里记下的代理变量与 `PATH`，工作目录固定为 home，
+//! 并脱离启动者（见 [`crate::daemon::spawn_detached_with`]）。
 //!
 //! 就绪的判定：按 spawn 返回的新 pid 在注册表里找到它的记录（守护 bind 成功之后才写注册表），
 //! 再对记录里的实际端口做 IPC ping，应答的必须就是这个 pid。不按端口轮询：配置可能已被用户
@@ -13,9 +18,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::daemon::{self, InstanceStatus};
+use crate::spec::{self, InstanceSpec};
 
-/// 等新实例就绪的时限：冷启动受杀毒软件对新进程的扫描等影响，可能要好几秒
-pub const READY_TIMEOUT: Duration = Duration::from_secs(8);
+/// 等新实例就绪的时限。冷启动受杀毒软件对新进程的扫描等影响，可能要好几秒；实例还要在
+/// 就绪之前等它的 format 程序启动。子进程退出会立即判失败，所以这个时限只在「进程还在、
+/// 迟迟不就绪」时才会用满
+pub const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 拉起失败的原因
 #[derive(Debug)]
@@ -79,9 +87,9 @@ impl StartupLog {
     pub const MAX_LINES: usize = 20;
 
     /// `mark` 之后新增的内容。文件比 mark 还短（被截断或重建）时从头读。
-    fn since(mark: u64) -> Self {
+    fn since(home: &Path, mark: u64) -> Self {
         use std::io::{Read, Seek, SeekFrom};
-        let path = startup_log_path();
+        let path = startup_log_path(home);
         let mut fresh = String::new();
         if let Ok(mut f) = std::fs::File::open(&path) {
             let len = f.metadata().map(|m| m.len()).unwrap_or(0);
@@ -108,7 +116,10 @@ impl StartupLog {
             return format!(
                 "，原因通常记录在:\n  {}\n  {}",
                 self.path.display(),
-                daemon::logs_dir().display()
+                self.path
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .display()
             );
         }
         let mut out = format!("。{} 本次新增内容:", self.path.display());
@@ -120,29 +131,61 @@ impl StartupLog {
     }
 }
 
-fn startup_log_path() -> PathBuf {
-    daemon::logs_dir().join("startup.log")
+fn startup_log_path(home: &Path) -> PathBuf {
+    home.join("logs").join("startup.log")
 }
 
-fn startup_log_len() -> u64 {
-    std::fs::metadata(startup_log_path())
+fn startup_log_len(home: &Path) -> u64 {
+    std::fs::metadata(startup_log_path(home))
         .map(|m| m.len())
         .unwrap_or(0)
 }
 
-/// 以 `exe` 按 `args`（再追加 `--daemon-child`）拉起一个守护实例，等它就绪，返回它对 IPC
-/// ping 的应答（实际监听地址、日志路径等）。`run_dir` 是新实例将登记的注册表目录（调用方所在
-/// home 的 run/）。
-pub async fn spawn_instance(
-    run_dir: &Path,
+/// 用 `exe` 在 `home` 里按 `spec` 拉起一个后台实例，等它就绪，返回它对 IPC ping 的应答
+/// （实际监听地址、日志路径等）。
+///
+/// 交接文件在子进程就绪或失败之后立即删掉：它含明文密钥，留在盘上的时间越短越好；实例
+/// 自己把规格写进了期望状态记录，不再需要它。
+pub async fn spawn_from_spec(
+    home: &Path,
     exe: &Path,
-    args: &[String],
+    spec: &InstanceSpec,
     timeout: Duration,
 ) -> Result<InstanceStatus, SpawnError> {
-    let mark = startup_log_len();
-    let mut full = args.to_vec();
-    full.push("--daemon-child".to_string());
-    let pid = daemon::spawn_detached(exe, &full).map_err(SpawnError::Spawn)?;
+    let run_dir = home.join("run");
+    let mark = startup_log_len(home);
+    let spec_path = spec::write_spec_file(&run_dir, spec).map_err(SpawnError::Spawn)?;
+    let result = launch_and_wait(home, &run_dir, exe, spec, &spec_path, mark, timeout).await;
+    let _ = std::fs::remove_file(&spec_path);
+    result
+}
+
+async fn launch_and_wait(
+    home: &Path,
+    run_dir: &Path,
+    exe: &Path,
+    spec: &InstanceSpec,
+    spec_path: &Path,
+    mark: u64,
+    timeout: Duration,
+) -> Result<InstanceStatus, SpawnError> {
+    let args = [
+        "__serve".to_string(),
+        "--home".to_string(),
+        home.display().to_string(),
+        "--spec".to_string(),
+        spec_path.display().to_string(),
+    ];
+    // 子进程的 home 由 `--home` 定，不由继承来的 APROXY_HOME 定：拉起方操作的是哪个 home，
+    // 实例就属于哪个 home。环境里的 APROXY_HOME 一并改掉，实例再拉起的子进程（看护者、
+    // format 程序）看到的也是它
+    let mut env = spec.env_changes();
+    env.push(("APROXY_HOME".to_string(), Some(home.display().to_string())));
+    let launch = daemon::Launch {
+        env: &env,
+        cwd: Some(home),
+    };
+    let pid = daemon::spawn_detached_with(exe, &args, &launch).map_err(SpawnError::Spawn)?;
     let start = crate::process::process_start_time(pid);
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -155,7 +198,7 @@ pub async fn spawn_instance(
         if crate::process::process_exited(pid) == Some(true) {
             return Err(SpawnError::Exited {
                 pid,
-                startup_log: StartupLog::since(mark),
+                startup_log: StartupLog::since(home, mark),
             });
         }
         if std::time::Instant::now() > deadline {
@@ -163,7 +206,7 @@ pub async fn spawn_instance(
                 pid,
                 start,
                 alive: crate::process::process_exited(pid) == Some(false),
-                startup_log: StartupLog::since(mark),
+                startup_log: StartupLog::since(home, mark),
             });
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

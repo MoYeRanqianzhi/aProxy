@@ -1,7 +1,7 @@
 //! 守护进程编排：后台启动、实例注册表、IPC 控制。
 //!
 //! 进程模型：`aproxy`（默认）= 后台启动——父进程做预检与就绪等待，
-//! 实际服务由分离的子进程（`--daemon-child`）承载。子进程以 CREATE_NO_WINDOW
+//! 实际服务由分离的子进程（`aproxy __serve`）承载。子进程以 CREATE_NO_WINDOW
 //! 启动、不继承控制台，终端关闭/常规内存清理不会连带杀掉守护进程。
 //!
 //! IPC（铁律：控制通道绝不占用代理端口，代理端口完全用于透传——避免控制
@@ -20,14 +20,8 @@
 use serde::{Deserialize, Serialize};
 use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
-/// 实例注册表目录：`<home>/run/`。`APROXY_RUN_DIR` 环境变量可整体改指
-/// 别处（粒度优先于 APROXY_HOME 派生）——集成测试用它与 tempdir 隔离
-/// （守护/看护子进程经 spawn_detached 继承环境），高级用户亦可借此自定义
-/// 运行数据位置。
+/// 运行期记录的目录：`<home>/run/`。home 是唯一的根，寻址只有 `APROXY_HOME` 这一个变量。
 pub fn run_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("APROXY_RUN_DIR") {
-        return PathBuf::from(d);
-    }
     aproxy_ipc::home::home().join("run")
 }
 
@@ -131,7 +125,15 @@ pub struct InstanceStatus {
     pub activity: Activity,
     /// 实例支持的 op。调用较新的、有副作用的 op 之前先查这里
     pub ops: Vec<String>,
+    /// 实例支持的、不是单独一个 op 的能力，例如 `shutdown.keep_restore`（shutdown 认
+    /// `keep_restore` 参数）。旧实例会静默忽略不认识的参数，所以依赖某个参数生效的调用方
+    /// 要先查这里，不能靠「没报错」推断。没有这个字段的实例读作空表
+    #[serde(default)]
+    pub features: Vec<String>,
 }
+
+/// 能力名：shutdown 认 `keep_restore` 参数。
+pub const FEATURE_SHUTDOWN_KEEP_RESTORE: &str = "shutdown.keep_restore";
 
 /// 实例此刻所处的阶段。
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,36 +177,66 @@ pub struct LastError {
 pub const IPC_VERSION: u32 = 1;
 
 /// 控制操作。线上是一行 JSON：`{"v":1,"op":"<snake_case 名>"}`，可带
-/// `args` 对象（现有 op 都没有参数）。
+/// `args` 对象。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpcOp {
     /// 读状态快照（status、start 预检、就绪等待）
     Ping,
-    /// 优雅停止：应答先发出，随后开始退出
-    Shutdown,
+    /// 优雅停止：应答先发出，随后开始退出。
+    ///
+    /// `keep_restore` 为 false（`aproxy stop` 的语义）时，实例在应答之前先删掉自己的期望
+    /// 状态记录：用户要它停下，restore 与看护者不该再把它拉回来。为 true（restart、安装的
+    /// 滚动重启）时记录留着：调用方接着就要用它拉起新实例，中途崩溃了记录也还在。线上是
+    /// `"args":{"keep_restore":true}`，不带 `args` 等于 false
+    Shutdown { keep_restore: bool },
     /// install 广播：进入二进制更换阶段。实例把它写进可观测的状态
     /// （`swap_prepared`），应答里立即可见——表达的是「进入阶段」而非口头 ok
     PrepareSwap,
 }
 
 impl IpcOp {
-    const ALL: [IpcOp; 3] = [IpcOp::Ping, IpcOp::Shutdown, IpcOp::PrepareSwap];
+    /// 全部 op 的名字（快照里的 `ops`）
+    const NAMES: [&'static str; 3] = ["ping", "shutdown", "prepare_swap"];
+
+    /// `aproxy stop` 用的 shutdown：不留期望状态记录
+    pub const STOP: IpcOp = IpcOp::Shutdown {
+        keep_restore: false,
+    };
 
     pub fn name(self) -> &'static str {
         match self {
             IpcOp::Ping => "ping",
-            IpcOp::Shutdown => "shutdown",
+            IpcOp::Shutdown { .. } => "shutdown",
             IpcOp::PrepareSwap => "prepare_swap",
         }
     }
 
-    fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|op| op.name() == name)
+    /// 按名字与 `args` 还原一个 op。不认识的名字返回 None；不认识的参数忽略
+    fn from_request(name: &str, args: Option<&serde_json::Value>) -> Option<Self> {
+        match name {
+            "ping" => Some(IpcOp::Ping),
+            "shutdown" => Some(IpcOp::Shutdown {
+                keep_restore: args
+                    .and_then(|args| args.get("keep_restore"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            }),
+            "prepare_swap" => Some(IpcOp::PrepareSwap),
+            _ => None,
+        }
     }
 
     /// 发往实例的请求行（不含换行）
     pub fn request_line(self) -> String {
-        serde_json::json!({ "v": IPC_VERSION, "op": self.name() }).to_string()
+        match self {
+            IpcOp::Shutdown { keep_restore: true } => serde_json::json!({
+                "v": IPC_VERSION,
+                "op": self.name(),
+                "args": { "keep_restore": true },
+            }),
+            _ => serde_json::json!({ "v": IPC_VERSION, "op": self.name() }),
+        }
+        .to_string()
     }
 }
 
@@ -398,6 +430,41 @@ pub struct ControlState {
     pub stats: Arc<IpcStats>,
     /// 收到 shutdown 时置位，服务主循环据此优雅退出；已置位即「正在退出」
     pub on_shutdown: tokio::sync::watch::Sender<bool>,
+    /// 「用户已经要它停下」：收到过不带 `keep_restore` 的 shutdown。期望状态记录的写与删
+    /// 都在这把锁下进行，置位之后不再写——否则启动途中收到 stop 的实例，会在记录被删掉
+    /// 之后又把它写回来，随后被 restore 或看护者拉起
+    pub stop_requested: std::sync::Mutex<bool>,
+}
+
+impl ControlState {
+    /// 本实例的端口（记录与端点都按它命名）
+    fn port(&self) -> &str {
+        port_of(&self.record.listen_addr)
+    }
+
+    /// 写本实例的期望状态记录。已经收到过不带 `keep_restore` 的 shutdown 时不写，返回
+    /// `Ok(false)`。
+    pub fn write_restore(&self, spec: &crate::spec::InstanceSpec) -> io::Result<bool> {
+        let stopped = self
+            .stop_requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *stopped {
+            return Ok(false);
+        }
+        crate::spec::write_restore_in(std::path::Path::new(&self.run_dir), self.port(), spec)?;
+        Ok(true)
+    }
+
+    /// 兑现不带 `keep_restore` 的 shutdown：记下「用户要它停下」，删掉期望状态记录。
+    fn forget_restore(&self) {
+        let mut stopped = self
+            .stop_requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *stopped = true;
+        crate::spec::remove_restore_in(std::path::Path::new(&self.run_dir), self.port());
+    }
 }
 
 /// 在已创建的端点上提供控制服务，直到进程退出。
@@ -538,10 +605,23 @@ pub async fn wait_until_gone(port: &str, timeout: Duration) -> bool {
     }
 }
 
-/// 以分离进程重新执行自身承载服务。
-///
-/// CREATE_NO_WINDOW：不继承父控制台、无窗口——关闭终端、控制台进程树清理
-/// 都不会连带杀掉守护进程（这正是前台进程被「常规清理」关掉的根因）。
+/// 分离拉起时对子进程环境的调整。默认值 = 原样继承环境与工作目录。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Launch<'a> {
+    /// 要改的环境变量：`Some` 设成这个值，`None` 在子进程里删掉。其余变量原样继承
+    pub env: &'a [(String, Option<String>)],
+    /// 子进程的工作目录；None = 继承
+    pub cwd: Option<&'a std::path::Path>,
+}
+
+/// 以分离进程运行 `exe`，环境与工作目录原样继承。见 [`spawn_detached_with`]。
+pub fn spawn_detached(exe: &std::path::Path, args: &[String]) -> io::Result<u32> {
+    spawn_detached_with(exe, args, &Launch::default())
+}
+
+/// 以分离进程运行 `exe`：不继承句柄、没有控制台，并脱离启动者——关掉启动它的终端、
+/// 终端向前台进程组发的 Ctrl+C、启动者所在的作业对象被结束，都不该连带结束它。
+/// 返回子进程 pid（拉起即返回，不等待）。
 ///
 /// Windows 上不走 std::process::Command：std 的 CreateProcessW 调用固定
 /// bInheritHandles=TRUE 且无稳定 API 可关闭（CommandExt::inherit_handles
@@ -549,18 +629,26 @@ pub async fn wait_until_gone(port: &str, timeout: Duration) -> bool {
 /// Command::output() 捕获输出运行 `aproxy start` 时，其 stdout/stderr 管道
 /// 写端句柄会被常驻守护进程继承，EOF 永不到来，调用方永久挂死。因此这里
 /// 手写 CreateProcessW，以 bInheritHandles=FALSE 启动，不继承任何句柄。
-/// 刻意不加 CREATE_BREAKAWAY_FROM_JOB：作业对象不允许 breakaway 时该标志
-/// 会让 CreateProcess 直接失败，把「父环境关闭可能连带杀掉守护」这一罕见
-/// 场景恶化成「根本启动不了」，得不偿失。
-/// 返回子进程 pid（spawn 即返回，不等待——守护不随父进程生命周期）。
-pub fn spawn_detached(exe: &std::path::Path, args: &[String]) -> io::Result<u32> {
+///
+/// 脱离的手段：
+/// - Windows：CREATE_NO_WINDOW（没有控制台，控制台的进程树清理碰不到它），外加
+///   CREATE_BREAKAWAY_FROM_JOB 脱出启动者的作业对象。作业不允许脱出时带着这个标志的
+///   CreateProcess 会直接失败，所以失败就去掉它再试一次，并在 startup.log 记一条告警：
+///   子进程仍在启动者的作业里，作业被结束时它会跟着结束。
+/// - unix：子进程里 `setsid()`，自成会话与进程组，终端的信号到不了它。不与
+///   `process_group(0)` 同用：先成了进程组组长，`setsid()` 会以 EPERM 失败。
+pub fn spawn_detached_with(
+    exe: &std::path::Path,
+    args: &[String],
+    launch: &Launch<'_>,
+) -> io::Result<u32> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
         use windows_sys::Win32::System::Threading::{
-            CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, PROCESS_INFORMATION,
-            STARTUPINFOW,
+            CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+            CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
         };
 
         /// Windows 命令行引号规则：含空格/制表符/引号的参数包引号；
@@ -604,27 +692,50 @@ pub fn spawn_detached(exe: &std::path::Path, args: &[String]) -> io::Result<u32>
         }
         let exe_wide: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut cmdline_wide: Vec<u16> = cmdline.encode_utf16().chain(Some(0)).collect();
+        // 没有要改的变量时传 NULL（继承），省掉一次整块复制
+        let env_block = (!launch.env.is_empty()).then(|| windows_env_block(launch.env));
+        let env_ptr = env_block
+            .as_ref()
+            .map_or(std::ptr::null(), |block| block.as_ptr().cast());
+        let cwd_wide: Option<Vec<u16>> = launch
+            .cwd
+            .map(|dir| dir.as_os_str().encode_wide().chain(Some(0)).collect());
+        let cwd_ptr = cwd_wide
+            .as_ref()
+            .map_or(std::ptr::null(), |dir| dir.as_ptr());
 
         let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
         si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-        let ok = unsafe {
-            CreateProcessW(
-                exe_wide.as_ptr(),
-                cmdline_wide.as_mut_ptr(),
-                std::ptr::null(), // lpProcessAttributes：默认安全描述符
-                std::ptr::null(), // lpThreadAttributes：默认安全描述符
-                0,                // bInheritHandles=FALSE：核心目的，杜绝句柄泄漏
-                CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-                std::ptr::null(), // lpEnvironment=NULL：继承父进程环境
-                std::ptr::null(), // lpCurrentDirectory=NULL：维持继承 cwd 的现状
-                &si,
-                &mut pi,
-            )
+        let mut create = |flags: u32| -> Result<(), u32> {
+            let ok = unsafe {
+                CreateProcessW(
+                    exe_wide.as_ptr(),
+                    cmdline_wide.as_mut_ptr(),
+                    std::ptr::null(), // lpProcessAttributes：默认安全描述符
+                    std::ptr::null(), // lpThreadAttributes：默认安全描述符
+                    0,                // bInheritHandles=FALSE：核心目的，杜绝句柄泄漏
+                    flags,
+                    env_ptr,
+                    cwd_ptr,
+                    &si,
+                    &mut pi,
+                )
+            };
+            if ok == 0 {
+                Err(unsafe { GetLastError() })
+            } else {
+                Ok(())
+            }
         };
-        if ok == 0 {
-            return Err(io::Error::from_raw_os_error(
-                unsafe { GetLastError() } as i32
+        let base = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
+        if create(base | CREATE_BREAKAWAY_FROM_JOB).is_err() {
+            // 作业不允许脱出（或别的原因）：去掉标志再试。这一次的错误才是要报的错误——
+            // 可执行文件不在、没有权限这类原因两次都会失败
+            create(base).map_err(|code| io::Error::from_raw_os_error(code as i32))?;
+            append_startup_log(&format!(
+                "warning: pid {} could not leave the launcher's job object and stays inside it; ending that job ends this process too",
+                pi.dwProcessId
             ));
         }
         let pid = pi.dwProcessId;
@@ -637,14 +748,65 @@ pub fn spawn_detached(exe: &std::path::Path, args: &[String]) -> io::Result<u32>
     }
     #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
         let mut cmd = Command::new(exe);
         cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        for (name, value) in launch.env {
+            match value {
+                Some(value) => cmd.env(name, value),
+                None => cmd.env_remove(name),
+            };
+        }
+        if let Some(dir) = launch.cwd {
+            cmd.current_dir(dir);
+        }
+        // SAFETY: 闭包在 fork 之后、exec 之前的子进程里运行，只调用 setsid 这一个
+        // async-signal-safe 的系统调用，不分配内存、不碰锁
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         Ok(cmd.spawn()?.id())
     }
+}
+
+/// 在当前进程的环境上套用 `changes`，写成 CreateProcessW 要的环境块：UTF-16 的
+/// `名=值\0` 逐条相接，末尾再加一个 `\0`。变量名不分大小写：设置或删除一个变量时，
+/// 先去掉任何大小写写法的同名变量。条目按名字的大写形式排序（系统对环境块的约定）。
+#[cfg(windows)]
+fn windows_env_block(changes: &[(String, Option<String>)]) -> Vec<u16> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut vars: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    for (name, value) in changes {
+        vars.retain(|(existing, _)| !existing.to_string_lossy().eq_ignore_ascii_case(name));
+        if let Some(value) = value {
+            vars.push((name.into(), value.into()));
+        }
+    }
+    vars.sort_by_cached_key(|(name, _)| name.to_string_lossy().to_uppercase());
+    let mut block = Vec::new();
+    for (name, value) in &vars {
+        block.extend(name.encode_wide());
+        block.push(u16::from(b'='));
+        block.extend(value.encode_wide());
+        block.push(0);
+    }
+    if vars.is_empty() {
+        // 空环境块是两个 `\0`
+        block.push(0);
+    }
+    block.push(0);
+    block
 }
 
 // ---------------------------------------------------------------------------
@@ -708,30 +870,41 @@ pub async fn survey_instances() -> InstanceSurvey {
         .chain(survey.unresponsive.iter())
         .cloned()
         .collect();
-    cleanup_orphan_logs_in(&logs_dir(), &referenced, &list_restore_entries());
+    cleanup_orphan_logs_in(
+        &logs_dir(),
+        &referenced,
+        &crate::spec::list_restore_in(&run_dir()),
+    );
     survey
 }
 
-/// 清理孤儿日志：日志文件名随机化后不再携带归属信息，判据改为「引用集」——
-/// 活实例上报的 log_path ∪ .restore 记录的 log_path 之外的 .log 一律删除。
-/// logs 目录是工具专属目录，目录内 .log 一律视为实例日志（防御保留非 .log
-/// 文件与 startup.log）。两条推论：(a) 旧版按端口命名的日志升级后会被视为
-/// 孤儿清理（alpha 阶段无兼容义务）；(b) 崩溃实例的日志由 .restore 引用
-/// 保留到恢复成功——恢复后记录重写为新实例的路径，旧日志按孤儿收敛。
-/// 自定义 log_file 落在其他目录时，扫描天然不触及。空串 log_path（前台）
-/// 不参与引用集。目录与待恢复清单参数化（测试注入用）。
+/// 清理孤儿日志：日志文件名是随机的，不带归属信息，判据是「引用集」——活实例上报的
+/// log_path 与期望状态记录里的 log_path 之外的 .log 一律删除。logs 目录是工具专属目录，
+/// 目录内的 .log 一律视为实例日志（非 .log 文件与 startup.log 保留）。崩溃实例的日志由
+/// 期望状态记录引用，重拉后续写同一个文件。自定义 log_file 落在其他目录时，扫描天然
+/// 不触及。空串 log_path（前台）不参与引用集。
+///
+/// run 目录里有读不懂的期望状态记录时整轮不删：它引用了哪个日志无从得知，引用集不完整。
 fn cleanup_orphan_logs_in(
     logs_dir: &std::path::Path,
     live: &[InstanceRecord],
-    pending_restore: &[RestoreEntry],
+    pending_restore: &crate::spec::RestoreListing,
 ) {
+    if !pending_restore.unreadable.is_empty() {
+        return;
+    }
     // 引用集按 path_match_key 归一比较（大小写/分隔符规则与别名匹配共用）：
     // 注册表存的路径字符串与 read_dir 枚举出的表示在 Windows 上可能有
     // 分隔符差异，字面比较会漏保活
     let referenced: std::collections::HashSet<String> = live
         .iter()
         .map(|i| i.log_path.clone())
-        .chain(pending_restore.iter().map(|e| e.log_path.clone()))
+        .chain(
+            pending_restore
+                .entries
+                .iter()
+                .map(|e| e.spec.log_path.clone()),
+        )
         .filter(|p| !p.is_empty())
         .map(|p| crate::settings::path_match_key(&p))
         .collect();
@@ -850,13 +1023,13 @@ pub fn registry_find_pid_in(dir: &std::path::Path, pid: u32) -> Option<InstanceR
     })
 }
 
-/// 实例重拉/恢复后实际落在了另一个端口（用户改了 config.toml 的端口却没
-/// restart，或 listen 端口为 0 每次由系统分配）时，退役旧端口的残留记录：
-/// 删除 `<旧端口>.restore` 与 `<旧端口>.pid`。
+/// 按一份期望状态记录拉起的实例落在了另一个端口（配置里的端口改了）时，退役旧端口的
+/// 残留记录：删除旧端口的期望状态记录与 `<旧端口>.pid`。这是期望状态记录「只有 stop 能删」
+/// 之外唯一的例外：新端口的记录接替了它。
 ///
-/// 为什么必须删：新实例已按实际端口写了自己的 .restore/.pid；旧端口的
-/// .restore 若残留，用户 `stop <新端口>` 后看护者（或下一次 `aproxy restore`）
-/// 会凭它把实例再拉起来，stop 被撤销且可无限重复（watchdog-01 实测）。
+/// 为什么必须删：新实例已按实际端口写了自己的记录；旧端口的期望状态记录若残留，用户
+/// `stop <新端口>` 后看护者（或下一次 `aproxy restore`）会凭它把实例再拉起来，stop 被撤销
+/// 且可无限重复（watchdog-01 实测）。
 /// 旧端口的 .pid 是已死旧进程的记录，留着只会让看护者的闲置自灭永远等不到
 /// 「注册表空」。
 ///
@@ -878,7 +1051,7 @@ pub fn retire_moved_port_records_in(
     {
         return false;
     }
-    remove_restore_file_in(run_dir, old_port);
+    crate::spec::remove_restore_in(run_dir, old_port);
     let _ = std::fs::remove_file(instance_file_path_in(run_dir, old_port));
     true
 }
@@ -902,128 +1075,16 @@ pub fn remove_socket_file(port: &str) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 自愈恢复记录（~/.aproxy/run/<port>.restore）
-//
-// 与 .pid 注册表互补：.pid 只在实例存活期间存在，而崩溃/断电/系统重启时守护
-// 进程来不及清理任何文件——restore 记录承载「期望在运行」的语义：守护 bind
-// 成功时写入当时的启动参数，优雅退出（含 `aproxy stop`）时删除，非正常死亡
-// 则保留，`aproxy restore` 据此一键拉起。注意：参数可能含 --api-key 等明文，
-// 与 config.toml 同级存放（用户主目录内），不额外加密。
-// ---------------------------------------------------------------------------
-
-/// 恢复记录文件路径：`<run_dir>/<port>.restore`
-pub fn restore_file_path(listen_addr: &str) -> PathBuf {
-    restore_file_path_in(&run_dir(), listen_addr)
-}
-
-/// 同上，目录可指定（测试注入用）
-pub fn restore_file_path_in(run_dir: &std::path::Path, listen_addr: &str) -> PathBuf {
-    run_dir.join(format!("{}.restore", port_of(listen_addr)))
-}
-
-/// 写入恢复记录：`args` 为实例的启动参数（不含 --daemon-child，恢复时统一追加），
-/// `log_path` 为本次启动的守护日志路径（崩溃后排障线索，前台实例落空串）。
-/// bind 成功后调用；同端口重复启动时覆盖旧记录。
-pub fn write_restore_file(listen_addr: &str, args: &[String], log_path: &str) -> io::Result<()> {
-    write_restore_file_in(&run_dir(), listen_addr, args, log_path)
-}
-
-/// 同上，目录可指定（测试注入用）。原子写语义同 write_instance_file_in。
-pub fn write_restore_file_in(
-    run_dir: &std::path::Path,
-    listen_addr: &str,
-    args: &[String],
-    log_path: &str,
-) -> io::Result<()> {
-    let path = restore_file_path_in(run_dir, listen_addr);
-    let json = serde_json::to_string(&RestoreRecord {
-        args: args.to_vec(),
-        log_path: log_path.to_string(),
-    })
-    .expect("序列化恢复记录失败");
-    crate::fsx::write_atomic(&path, json.as_bytes())
-}
-
-/// 删除恢复记录（实例优雅退出时调用；无记录时静默）
-pub fn remove_restore_file(listen_addr: &str) {
-    remove_restore_file_in(&run_dir(), listen_addr)
-}
-
-/// 同上，目录可指定（测试注入用）
-pub fn remove_restore_file_in(run_dir: &std::path::Path, listen_addr: &str) {
-    let _ = std::fs::remove_file(restore_file_path_in(run_dir, listen_addr));
-}
-
-/// 优雅退出的注册表清理。顺序是刻意的：先删 .restore 再删 .pid——看门狗的
-/// 死亡事件若恰在两个 unlink 之间触发，读到的状态是「无恢复记录」= 优雅退出；
-/// 反序则会误判为崩溃而重拉一个用户刚停掉的实例。末尾顺带清 IPC 端点文件与
-/// 心跳文件（Windows 侧均为内核回收，这两个调用是 no-op；unix 清 unix socket
-/// 与 /dev/shm 心跳，消除残留）。`stop --force` 强杀成功后由停止它的一方代为执行
-/// 同一清理（被强杀的守护来不及自清），顺序语义相同。
+/// 实例退出时的运行期文件清理：实例记录、心跳与控制端点文件（后两者在 Windows 上由
+/// 内核回收，调用是 no-op）。被强制终止的实例来不及自清，由终止它的一方代为执行。
+///
+/// 期望状态记录不在这里删：它表达「这个实例应当在运行」，只有 stop 能删（见
+/// [`crate::spec`]）。实例因信号、崩溃或系统关机退出时记录留着，restore 与看护者据此把它
+/// 拉回来。
 pub fn remove_registry_files(listen_addr: &str) {
-    remove_restore_file(listen_addr);
     remove_instance_file(listen_addr);
     crate::watchdog::remove_heartbeat_file(&run_dir(), port_of(listen_addr));
     remove_socket_file(port_of(listen_addr));
-}
-
-/// 一条恢复记录：端口 + 启动参数 + 崩溃前那次启动的日志路径。
-/// log_path 供孤儿日志清理引用（崩溃实例的日志保留到恢复成功，作排障线索）；
-/// 前台实例无日志文件，落空串（崩溃恢复后是守护形态，新随机名）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct RestoreEntry {
-    pub port: String,
-    pub args: Vec<String>,
-    pub log_path: String,
-}
-
-/// .restore 文件的落盘格式（结构体 JSON）。两个字段都必填：缺字段的记录
-/// 无法忠实恢复实例，按损坏处理（列举时清理）。
-#[derive(Serialize, Deserialize)]
-struct RestoreRecord {
-    args: Vec<String>,
-    log_path: String,
-}
-
-/// 列出全部恢复记录；损坏记录直接清理。不做存活校验——记录的本义就是
-/// 「实例可能已死」。
-pub fn list_restore_entries() -> Vec<RestoreEntry> {
-    list_restore_entries_in(&run_dir())
-}
-
-/// 同上，目录可指定（测试注入用）
-pub fn list_restore_entries_in(dir: &std::path::Path) -> Vec<RestoreEntry> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("restore") {
-            continue;
-        }
-        let Some(port) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
-            continue;
-        };
-        let parsed = std::fs::read_to_string(&path).ok().and_then(|c| {
-            serde_json::from_str::<RestoreRecord>(&c)
-                .map(|r| RestoreEntry {
-                    port,
-                    args: r.args,
-                    log_path: r.log_path,
-                })
-                .ok()
-        });
-        match parsed {
-            Some(entry) => out.push(entry),
-            None => {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-    }
-    out.sort_by(|a, b| a.port.cmp(&b.port));
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,8 +1162,16 @@ where
             .swap_phase
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // 记录先删、应答后发：调用方拿到应答时，「它不会再被拉回来」已经成立
+    if op
+        == (IpcOp::Shutdown {
+            keep_restore: false,
+        })
+    {
+        state.forget_restore();
+    }
     let mut status = status_snapshot(&state);
-    if op == IpcOp::Shutdown {
+    if matches!(op, IpcOp::Shutdown { .. }) {
         status.state = InstanceState::Stopping;
     }
     let reply = serde_json::to_string(&WireResponse {
@@ -1114,7 +1183,7 @@ where
     .expect("序列化 IPC 应答失败");
     write_line(&mut writer, &reply).await?;
     // 应答先发出去再触发停止：客户端立刻拿到确认，服务随后优雅退出
-    if op == IpcOp::Shutdown {
+    if matches!(op, IpcOp::Shutdown { .. }) {
         let _ = state.on_shutdown.send(true);
     }
     Ok(())
@@ -1151,7 +1220,7 @@ fn parse_request(line: &str) -> Result<IpcOp, String> {
     if request.get("args").is_some_and(|args| !args.is_object()) {
         return Err(error_reply(error_code::BAD_REQUEST, "args 必须是对象"));
     }
-    match IpcOp::from_name(name) {
+    match IpcOp::from_request(name, request.get("args")) {
         Some(op) => Ok(op),
         None => Err(error_reply(
             error_code::UNKNOWN_OP,
@@ -1204,7 +1273,8 @@ fn status_snapshot(state: &ControlState) -> InstanceStatus {
             retries_total: stats.retries_total.load(Relaxed),
             last_error,
         },
-        ops: IpcOp::ALL.iter().map(|op| op.name().to_string()).collect(),
+        ops: IpcOp::NAMES.iter().map(|name| name.to_string()).collect(),
+        features: vec![FEATURE_SHUTDOWN_KEEP_RESTORE.to_string()],
     }
 }
 
@@ -1469,8 +1539,21 @@ mod tests {
             run_dir: "/test/run".into(),
             stats: Arc::new(IpcStats::default()),
             on_shutdown,
+            stop_requested: std::sync::Mutex::new(false),
         };
         (Arc::new(state), rx)
+    }
+
+    /// 一份只为占位的拉起规格：日志指向 `log_path`
+    fn sample_spec(log_path: &str) -> crate::spec::InstanceSpec {
+        crate::spec::InstanceSpec {
+            schema: crate::spec::SCHEMA,
+            config_path: None,
+            overrides: Default::default(),
+            pinned_port: None,
+            env: Default::default(),
+            log_path: log_path.to_string(),
+        }
     }
 
     #[test]
@@ -1535,7 +1618,7 @@ mod tests {
     }
 
     /// 重拉/恢复落到新端口后退役旧端口记录：同端口不动；旧端口记录属于已死
-    /// 进程 → .restore 与 .pid 一并删除；旧端口已被另一个在世实例接手（身份
+    /// 进程 → 期望状态记录与 .pid 一并删除；旧端口已被另一个在世实例接手（身份
     /// 核验通过，或旧版本记录 pid 在世无从核验）→ 记录归它，不动
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
@@ -1546,11 +1629,11 @@ mod tests {
             info.pid = pid;
             info.process_start = process_start;
             write_instance_file_in(dir.path(), &info).unwrap();
-            write_restore_file_in(dir.path(), port, &[], "").unwrap();
+            crate::spec::write_restore_in(dir.path(), port, &sample_spec("")).unwrap();
         };
         let has = |port: &str| {
             (
-                restore_file_path_in(dir.path(), port).is_file(),
+                crate::spec::restore_path_in(dir.path(), port).is_file(),
                 instance_file_path_in(dir.path(), port).is_file(),
             )
         };
@@ -1613,9 +1696,84 @@ mod tests {
 
     #[test]
     fn request_lines_round_trip_through_the_server_parser() {
-        for op in IpcOp::ALL {
+        for op in [
+            IpcOp::Ping,
+            IpcOp::STOP,
+            IpcOp::Shutdown { keep_restore: true },
+            IpcOp::PrepareSwap,
+        ] {
             assert_eq!(parse_request(&(op.request_line() + "\n")).unwrap(), op);
         }
+        // 不带 args 的 shutdown 就是 stop；args 里不认识的键忽略，类型不对的按没给
+        assert_eq!(IpcOp::STOP.request_line(), r#"{"v":1,"op":"shutdown"}"#);
+        for line in [
+            r#"{"v":1,"op":"shutdown","args":{}}"#,
+            r#"{"v":1,"op":"shutdown","args":{"added_later":1}}"#,
+            r#"{"v":1,"op":"shutdown","args":{"keep_restore":"yes"}}"#,
+        ] {
+            assert_eq!(
+                parse_request(&format!("{line}\n")).unwrap(),
+                IpcOp::STOP,
+                "{line}"
+            );
+        }
+        // 快照里列出的 op 名与各 op 的名字一致
+        assert_eq!(
+            IpcOp::NAMES,
+            [
+                IpcOp::Ping.name(),
+                IpcOp::STOP.name(),
+                IpcOp::PrepareSwap.name()
+            ]
+        );
+    }
+
+    /// 期望状态记录的写与删在同一把锁下：收到过不带 `keep_restore` 的 shutdown 之后不再写。
+    #[tokio::test]
+    async fn stop_deletes_the_restore_record_and_blocks_later_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = sample_info("59761");
+        let make = || {
+            let (on_shutdown, _rx) = tokio::sync::watch::channel(false);
+            ControlState {
+                record: record.clone(),
+                run_dir: dir.path().display().to_string(),
+                stats: Arc::new(IpcStats::default()),
+                on_shutdown,
+                stop_requested: std::sync::Mutex::new(false),
+            }
+        };
+        let path = crate::spec::restore_path_in(dir.path(), "59761");
+        let spec = sample_spec("");
+
+        // 启动时写入
+        let state = make();
+        assert!(state.write_restore(&spec).unwrap());
+        assert!(path.is_file());
+        // stop：记录删掉，之后的写入被拒（启动途中收到 stop 的实例不会把记录写回来）
+        state.forget_restore();
+        assert!(!path.exists());
+        assert!(!state.write_restore(&spec).unwrap());
+        assert!(!path.exists());
+
+        // 带 keep_restore 的 shutdown 不走 forget_restore：经真实的请求处理验证
+        let state = Arc::new(make());
+        assert!(state.write_restore(&spec).unwrap());
+        let (client, server) = tokio::io::duplex(4096);
+        let handler = tokio::spawn(handle_conn(server, state.clone()));
+        let line = IpcOp::Shutdown { keep_restore: true }.request_line();
+        let reply = exchange_over(client, &line).await.unwrap();
+        handler.await.unwrap().unwrap();
+        assert_eq!(parse_reply(&reply).unwrap().state, InstanceState::Stopping);
+        assert!(path.is_file(), "keep_restore 的 shutdown 不得删记录");
+        // 同一个实例随后收到 stop：记录删掉
+        let (client, server) = tokio::io::duplex(4096);
+        let handler = tokio::spawn(handle_conn(server, state.clone()));
+        exchange_over(client, &IpcOp::STOP.request_line())
+            .await
+            .unwrap();
+        handler.await.unwrap().unwrap();
+        assert!(!path.exists(), "stop 应删掉记录");
     }
 
     #[test]
@@ -1722,7 +1880,7 @@ mod tests {
         assert_eq!(again.state, InstanceState::SwapPrepared);
 
         // shutdown：应答先到（状态 stopping），随后置位停止信号
-        let stopping = request_raw(&endpoint, IpcOp::Shutdown).await.unwrap();
+        let stopping = request_raw(&endpoint, IpcOp::STOP).await.unwrap();
         assert_eq!(stopping.state, InstanceState::Stopping);
         rx.changed().await.unwrap();
         assert!(*rx.borrow());
@@ -1929,62 +2087,9 @@ mod tests {
     }
 
     #[test]
-    fn restore_file_roundtrip_and_cleanup() {
-        let dir = tempfile::tempdir().unwrap();
-        let args = vec![
-            "--config".to_string(),
-            "C:/tmp/cfg.toml".to_string(),
-            "--api-key".to_string(),
-            "sk-test".to_string(),
-        ];
-        write_restore_file_in(dir.path(), "127.0.0.1:59805", &args, "C:/tmp/old.log").unwrap();
-        let path = restore_file_path_in(dir.path(), "127.0.0.1:59805");
-        assert_eq!(path.file_name().unwrap(), "59805.restore");
-
-        // 覆盖写：同端口再次启动应以最新参数为准（log_path 同步覆盖）
-        let args2 = vec!["--config".to_string(), "C:/tmp/new.toml".to_string()];
-        write_restore_file_in(dir.path(), "127.0.0.1:59805", &args2, "C:/tmp/new.log").unwrap();
-
-        let entries = list_restore_entries_in(dir.path());
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].port, "59805");
-        assert_eq!(entries[0].args, args2);
-        assert_eq!(entries[0].log_path, "C:/tmp/new.log");
-
-        remove_restore_file_in(dir.path(), "127.0.0.1:59805");
-        assert!(!path.exists());
-        assert!(list_restore_entries_in(dir.path()).is_empty());
-    }
-
-    #[test]
-    fn restore_list_cleans_corrupted_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = restore_file_path_in(dir.path(), "127.0.0.1:59806");
-        std::fs::write(&path, "{not-json").unwrap();
-        assert!(list_restore_entries_in(dir.path()).is_empty());
-        assert!(!path.exists(), "损坏的恢复记录应被清理");
-        // 缺字段同样无法忠实恢复：只有 args 的数组形态不是有效记录
-        std::fs::write(&path, r#"["--config","C:/tmp/c.toml"]"#).unwrap();
-        assert!(list_restore_entries_in(dir.path()).is_empty());
-        assert!(!path.exists(), "缺字段的恢复记录应被清理");
-    }
-
-    #[test]
-    fn restore_entry_without_config_is_listed() {
-        // 无 --config 参数的实例（纯默认配置）也应能列出与恢复
-        let dir = tempfile::tempdir().unwrap();
-        write_restore_file_in(dir.path(), "127.0.0.1:59807", &[], "").unwrap();
-        let entries = list_restore_entries_in(dir.path());
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].port, "59807");
-        assert!(entries[0].args.is_empty());
-    }
-
-    #[test]
     fn orphan_log_cleanup_keeps_referenced_and_startup() {
-        // 新判据（引用集）：日志名随机化后不再携带归属，保留 = 活实例上报的
-        // log_path ∪ .restore 记录的 log_path ∪ startup.log；其余 .log 删除；
-        // 非 .log 文件一律不动。
+        // 判据是引用集：日志名是随机的，不带归属，保留 = 活实例上报的 log_path ∪
+        // 期望状态记录里的 log_path ∪ startup.log；其余 .log 删除；非 .log 文件一律不动。
         let logs = tempfile::tempdir().unwrap();
         let live_log = logs.path().join("1f3a2b-00ab.log");
         let crash_log = logs.path().join("5c6d7e-11cd.log");
@@ -1998,14 +2103,28 @@ mod tests {
 
         let mut live = sample_info("59811");
         live.log_path = live_log.display().to_string();
-        let pending = vec![RestoreEntry {
-            port: "59812".into(),
-            args: vec![],
-            log_path: crash_log.display().to_string(),
-        }];
+        let pending = crate::spec::RestoreListing {
+            entries: vec![crate::spec::RestoreEntry {
+                port: "59812".into(),
+                spec: sample_spec(&crash_log.display().to_string()),
+                written_at: 0,
+            }],
+            unreadable: Vec::new(),
+        };
+        // 有读不懂的期望状态记录时整轮不删：它引用了哪个日志无从得知
+        let incomplete = crate::spec::RestoreListing {
+            entries: Vec::new(),
+            unreadable: vec![crate::spec::UnreadableRecord {
+                path: logs.path().join("9.restore.json"),
+                reason: crate::spec::Unreadable::SchemaTooNew(2),
+            }],
+        };
+        cleanup_orphan_logs_in(logs.path(), std::slice::from_ref(&live), &incomplete);
+        assert!(stale_log.exists(), "引用集不完整时不得删任何日志");
+
         cleanup_orphan_logs_in(logs.path(), &[live], &pending);
         assert!(live_log.exists(), "活实例引用的日志不应被删除");
-        assert!(crash_log.exists(), ".restore 引用的崩溃日志不应被删除");
+        assert!(crash_log.exists(), "期望状态记录引用的崩溃日志不应被删除");
         assert!(
             logs.path().join("startup.log").exists(),
             "startup.log 不应被孤儿清理删除"
@@ -2027,7 +2146,7 @@ mod tests {
             .to_string()
             .replace('\\', "/");
         std::fs::write(logs2.path().join("CaseCheck-00aa.log"), "x").unwrap();
-        cleanup_orphan_logs_in(logs2.path(), &[live2], &[]);
+        cleanup_orphan_logs_in(logs2.path(), &[live2], &Default::default());
         assert!(
             logs2.path().join("CaseCheck-00aa.log").exists(),
             "归一后同一路径（分隔符差异）不应被误删"
@@ -2037,7 +2156,7 @@ mod tests {
         let logs3 = tempfile::tempdir().unwrap();
         let orphan = logs3.path().join("ff00aa-33ff.log");
         std::fs::write(&orphan, "x").unwrap();
-        cleanup_orphan_logs_in(logs3.path(), &[sample_info("59811")], &[]);
+        cleanup_orphan_logs_in(logs3.path(), &[sample_info("59811")], &Default::default());
         assert!(!orphan.exists(), "空串 log_path 的实例不应保住孤儿日志");
     }
 }

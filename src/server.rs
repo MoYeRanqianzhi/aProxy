@@ -1,7 +1,7 @@
 //! 服务承载：前台与守护子进程共用的主循环（bind、注册、IPC、优雅关闭）、
 //! 停止信号、日志初始化与配置错误落盘。
 //!
-//! 与 `commands/start.rs` 的分工：start 负责启动预检与后台 spawn 的父进程侧，
+//! 与 `commands/start.rs` 的分工：start 负责启动预检与后台拉起的父进程侧，
 //! server 负责真正「跑起来」的服务进程本身。
 
 use std::path::PathBuf;
@@ -34,15 +34,12 @@ fn generate_random_log_name() -> String {
     format!("{nanos:x}-{:04x}.log", std::process::id() & 0xffff)
 }
 
-/// 解析守护日志的最终路径：CLI `--log-file` > config.toml `log_file` >
-/// 内置随机名。`~` 展开（settings::expand_path）；**相对路径相对 APROXY_HOME
-/// 解析**——守护进程的工作目录不可靠（分离 spawn 维持继承 cwd，但终端关闭
-/// 等场景下语义不明），主目录是唯一稳定基准。返回绝对化路径。
-pub(crate) fn resolve_daemon_log_path(
-    cli_log_file: Option<&str>,
-    cfg_log_file: Option<&str>,
-) -> PathBuf {
-    match cli_log_file.or(cfg_log_file) {
+/// 定出后台实例的日志路径。`log_file` 是解析后的配置里的值（命令行 `--log-file` 的覆盖
+/// 已经并进去）；没有就在 logs 目录下生成一个随机名。`~` 展开；**相对路径相对 APROXY_HOME
+/// 解析**——日志路径会被记进拉起规格、在别的进程里再用，不能依赖谁的工作目录。返回
+/// 绝对路径。
+pub(crate) fn resolve_daemon_log_path(log_file: Option<&str>) -> PathBuf {
+    match log_file {
         Some(raw) => {
             // 只展开 `~`，不用 settings::expand_path：后者按当前工作目录绝对化，
             // 而守护进程的工作目录不可靠——相对路径一律相对 APROXY_HOME
@@ -64,23 +61,35 @@ pub(crate) fn resolved_daemon_log() -> Option<PathBuf> {
     RESOLVED_DAEMON_LOG.get().cloned().flatten()
 }
 
-/// 服务主循环：前台与守护子进程共用。bind、注册实例、启动 IPC 控制通道，
+/// 服务主循环：前台实例与后台实例共用。bind、注册实例、启动 IPC 控制通道，
 /// 一直服务到停止信号（Ctrl+C/SIGTERM 或 `aproxy stop` 经 IPC 触发）。
-pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemon_child: bool) {
+///
+/// `cfg_path` 是这个实例的配置文件，None = 没有配置文件。`spec` 是后台实例的拉起规格，
+/// None = 前台实例：日志在控制台，不写期望状态记录（关掉终端就是用户要它停下）。
+pub(crate) async fn serve_forever(
+    cfg: Config,
+    cfg_path: Option<&std::path::Path>,
+    spec: Option<aproxy::spec::InstanceSpec>,
+) {
+    let daemon_child = spec.is_some();
     let listen_addr = cfg.listen_addr.clone();
     let base_url = cfg.base_url.clone();
+    // 给人看的配置文件路径；没有配置文件时为空串
+    let cfg_display = cfg_path
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     // 进程台账（永久兼容契约 C3）：占用端口之前登记，`aproxy install --force` 靠它找到并
     // 结束本实例；端口取配置里的监听端口（强制安装据此核对 restore 有没有把实例拉回来），
     // config 是配置文件的绝对路径（拉不回的实例，强制安装据此告诉用户怎样启动），label
     // 是给人看的同一路径。正常退出由守卫删除；下面经 process::exit 的路径一律改走
     // util::exit，同样会删
-    let cfg_abs = std::path::absolute(cfg_path).unwrap_or_else(|_| cfg_path.to_path_buf());
+    let cfg_abs = cfg_path.map(|p| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()));
     let _ledger = crate::util::register_in_ledger(
         &aproxy_ipc::home::home(),
         aproxy_ipc::ledger::ROLE_INSTANCE,
         daemon::port_of(&listen_addr).parse().ok(),
-        Some(&cfg_path.display().to_string()),
-        Some(&cfg_abs),
+        cfg_path.map(|_| cfg_display.as_str()),
+        cfg_abs.as_deref(),
     );
     // spool 残留清理（disk_cache）：bind 前清空本端口的 spool 目录——目录
     // 归本进程独占，启动时清空即可回收崩溃/强杀残留的临时文件。
@@ -139,7 +148,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
         pid: std::process::id(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         listen_addr: actual_addr.clone(),
-        config_path: cfg_path.display().to_string(),
+        config_path: cfg_display.clone(),
         // 注册表与 IPC ping 都会把它交给 status 展示（只用于展示），脱敏后再登记
         base_url: aproxy_ipc::redact::url(&base_url),
         started_at: now_unix(),
@@ -153,23 +162,6 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
         tracing::warn!(error = %e, "实例注册表写入失败（不影响代理功能）");
     }
 
-    // 自愈恢复记录：bind 成功即认为「此实例期望在运行」。记录的是启动参数
-    // （从当前进程命令行取，即 start 父进程转发来的原始参数），崩溃/断电/
-    // 系统重启后 aproxy restore 据此一键拉起；优雅退出时删除。前台实例也写
-    // （前台被终端关闭属非正常退出，恢复合理）。**必须按 actual_addr 命名**
-    // （与注册表 .pid 同键）：listen_addr 配置为端口 0 时实际端口由系统分配，
-    // 按配置地址命名会写出 `<配置端口>.restore`（如 `0.restore`），优雅退出
-    // 按实际端口清理删不到它——记录永久残留，`aproxy restore` 会把用户已
-    // stop 的实例复活到另一个随机端口（2026-09-22 大审查实测实锤）。
-    let restore_args: Vec<String> = {
-        let mut v: Vec<String> = std::env::args().skip(1).collect();
-        v.retain(|a| a != "--daemon-child" && a != "--foreground");
-        v
-    };
-    if let Err(e) = daemon::write_restore_file(&actual_addr, &restore_args, &info.log_path) {
-        tracing::warn!(error = %e, "自愈恢复记录写入失败（不影响代理功能）");
-    }
-
     // IPC 控制通道（端点已在注册前创建好）：ping/shutdown 走命名管道，与代理
     // 端口完全隔离。活动时间戳与观测计数由 AppState 持有（请求热路径更新），IPC ping 实时读取——
     // 直接复用 `state.stats` 这**同一份**：此处曾另建一个 IpcStats 只共享活动
@@ -180,10 +172,29 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
         run_dir: daemon::run_dir().display().to_string(),
         stats: state.stats.clone(),
         on_shutdown: stop_tx,
+        stop_requested: std::sync::Mutex::new(false),
     });
-    tokio::spawn(async move {
-        daemon::serve_ipc(ipc_endpoint, control).await;
-    });
+    {
+        let control = control.clone();
+        tokio::spawn(async move {
+            daemon::serve_ipc(ipc_endpoint, control).await;
+        });
+    }
+
+    // 期望状态记录：后台实例到这里就算「应当在运行」，把拉起规格记下来。之后进程不在而
+    // 记录还在（崩溃、断电、系统重启），restore 与看护者据此把它拉回来；只有 stop 删它。
+    // 按实际端口命名。配置解析出的端口是 0（由系统分配）时，把实际拿到的端口钉进规格：
+    // 否则记录按实际端口命名、规格却还是端口 0，每次恢复都换一个端口、多留一份拉不回的
+    // 记录。写入经 ControlState：控制端点已经在应答，启动途中收到 stop 的实例不再写它
+    if let Some(mut spec) = spec {
+        if daemon::port_of(&listen_addr) == "0" {
+            spec.pinned_port = port.parse().ok();
+        }
+        match control.write_restore(&spec) {
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "期望状态记录写入失败（不影响代理功能）"),
+        }
+    }
 
     // 看门狗心跳（共享内存节）：独立 ticker 每 10s 写一次毫秒时间戳——挂死的
     // 定义是「runtime 无法调度」，ticker 停摆与 runtime 死锁等价；不经请求
@@ -231,12 +242,11 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
                 }
                 // 残留 claim（已判无效）清理后拉起；spawn 失败下轮再试
                 watchdog::remove_claim_in(&run_dir);
-                let args = watchdog::watchdog_spawn_args();
                 let exe = match std::env::current_exe() {
                     Ok(e) => e,
                     Err(_) => continue,
                 };
-                match daemon::spawn_detached(&exe, &args) {
+                match watchdog::spawn_watchdog(&exe, &aproxy_ipc::home::home()) {
                     Ok(pid) => {
                         tracing::info!(pid, "看护者缺席，已由守护补种（选举胜出者）");
                     }
@@ -279,7 +289,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     tracing::info!(
         listen = %actual_addr,
         base_url = %aproxy_ipc::redact::url(&base_url),
-        config = %cfg_path.display(),
+        config = %cfg_display,
         pid = %std::process::id(),
         "启动 aProxy"
     );
@@ -504,23 +514,18 @@ mod tests {
 
     #[test]
     fn relative_log_file_resolves_against_aproxy_home() {
-        // 相对路径一律相对 APROXY_HOME，与当前工作目录无关（守护进程的工作
-        // 目录不可靠）；CLI --log-file 优先于配置；绝对路径原样；`~` 展开
+        // 相对路径一律相对 APROXY_HOME，与当前工作目录无关；绝对路径原样；`~` 展开
         let home = aproxy_ipc::home::home();
         assert_eq!(
-            resolve_daemon_log_path(None, Some("logs/a.log")),
+            resolve_daemon_log_path(Some("logs/a.log")),
             home.join("logs/a.log")
-        );
-        assert_eq!(
-            resolve_daemon_log_path(Some("b.log"), Some("logs/a.log")),
-            home.join("b.log")
         );
         let abs = std::env::temp_dir().join("aproxy-abs.log");
         assert_eq!(
-            resolve_daemon_log_path(None, Some(&abs.display().to_string())),
+            resolve_daemon_log_path(Some(&abs.display().to_string())),
             abs
         );
-        let tilde = resolve_daemon_log_path(None, Some("~/aproxy-tilde.log"));
+        let tilde = resolve_daemon_log_path(Some("~/aproxy-tilde.log"));
         assert!(
             tilde.is_absolute() && tilde.ends_with("aproxy-tilde.log"),
             "{}",

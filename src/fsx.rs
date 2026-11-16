@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// 覆盖别人的临时文件。rename 或写入失败时删掉临时文件；进程恰好在写临时文件与 rename 之间
 /// 崩溃时会留下一个临时文件，读者只认目标文件名，不受影响。
 ///
-/// unix 上临时文件一创建就是 0600：这些记录可能含密钥（恢复记录里有启动参数，其中可能有
+/// unix 上临时文件一创建就是 0600：这些记录可能含密钥（期望状态记录里有拉起规格，其中可能有
 /// `--api-key`），rename 之前也不能被别的用户读到。
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_atomic_with(path, bytes, false)

@@ -45,17 +45,6 @@ pub struct Cli {
     #[arg(long, value_name = "KEY")]
     pub api_key: Option<String>,
 
-    /// [内部] 守护子进程标记：后台启动时父进程把它附加到子进程命令行，
-    /// 子进程据此以守护模式运行（无控制台、日志写文件）。勿手动使用。
-    /// 必须是 global：start 子命令转发时它出现在 `start` 之后。
-    #[arg(long, hide = true, global = true)]
-    pub daemon_child: bool,
-
-    /// [内部] 看护进程标记：守护/CLI 拉起看护者时附加到命令行，
-    /// 本进程据此进入看护主循环。勿手动使用。
-    #[arg(long, hide = true, global = true)]
-    pub daemon_watchdog: bool,
-
     // 不用 clap 自带的版本参数：输出的那一行是安装器认版本的永久格式
     // （aproxy::VERSION_LINE），由 main 自己打印；单独的 `aproxy --version` /
     // `aproxy -V` 在解析参数之前就已短路返回，这里只为帮助里列出它、并接住
@@ -107,7 +96,7 @@ pub enum Commands {
         force: bool,
     },
 
-    /// 重启运行中的实例（等价于对该实例执行 stop 后用原参数立即 start）。
+    /// 重启运行中的实例（停下它，再按它启动时的配置文件、覆盖参数与环境重新拉起）。
     /// 只负责重启已运行的实例：未启动的 target 会提示「未启动」而不会拉起。
     /// 单个实例时可直接 `aproxy restart`；多实例必须指定端口号、`all`、配置
     /// 别名或 `idle`（可带秒数），语义与 stop 一致。
@@ -181,6 +170,28 @@ pub enum Commands {
     /// 查看或修改配置（配置文件位于 ~/.aproxy/config.toml）
     Config(ConfigArgs),
 
+    /// [内部] 后台实例的入口：按交接文件里的拉起规格承载服务。由 start、restart、restore、
+    /// 看护者与安装器拉起，也会被别的版本的 aproxy 拉起（安装时新旧版本互相拉起对方），
+    /// 所以名字与两个参数不能改。勿手动使用
+    #[command(name = "__serve", hide = true)]
+    Serve {
+        /// 实例所属的 home（绝对路径）
+        #[arg(long, value_name = "DIR")]
+        home: PathBuf,
+        /// 拉起规格的交接文件
+        #[arg(long, value_name = "FILE")]
+        spec: PathBuf,
+    },
+
+    /// [内部] 看护者的入口：看护这个 home 里的全部实例。与 `__serve` 一样会被别的版本
+    /// 拉起，名字与参数不能改。勿手动使用
+    #[command(name = "__watchdog", hide = true)]
+    Watchdog {
+        /// 看护的 home（绝对路径）
+        #[arg(long, value_name = "DIR")]
+        home: PathBuf,
+    },
+
     /// 查看或修改全局设置（~/.aproxy/settings.json）：别名、config.toml 键的全局默认、
     /// 看护者、日志、安装更新。settings.json 有错误时也能用，用来查看与修复它
     Settings {
@@ -233,7 +244,7 @@ pub struct InstallArgs {
     pub abort: bool,
 
     /// 强制安装：不走交接，按进程台账结束这个 home 下当前用户的全部 aproxy 进程（实例、
-    /// 看护者、安装者、桌面界面），换上新二进制，再用新版本的 restore 按原参数恢复实例。
+    /// 看护者、安装者、桌面界面），换上新二进制，再用新版本的 restore 按原来的拉起规格恢复实例。
     /// 普通安装失败、卡住，或装着的版本坏了时用；会中断所有经 aproxy 的在途请求，先确认
     /// （非交互环境加 --yes）。目标取 VERSION（默认 latest，不低于当前版本）或 --from；
     /// 写明的版本号可以降级，低于 0.2.0 的版本仍不装；不更新 skill 文档。退出码：0 完成；

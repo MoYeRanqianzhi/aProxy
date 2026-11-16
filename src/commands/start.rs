@@ -1,19 +1,24 @@
-//! `aproxy`（无子命令）/ `aproxy start [别名|路径]`：启动代理。
+//! `aproxy`（无子命令）/ `aproxy start [别名|路径]`：启动代理；以及后台实例的入口
+//! `aproxy __serve`。
 //!
 //! 父进程侧的动作（配置解析与校验、端口预检、后台拉起与就绪等待）在操作层
 //! `aproxy::ops::start`，这里把它们串起来并把结果说给用户；服务本身由
-//! `crate::server::serve_forever` 承载（守护子进程直接进入其中）。
+//! `crate::server::serve_forever` 承载（后台实例经 [`handle_serve_cmd`] 进入其中）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use aproxy::cli::Cli;
 use aproxy::daemon;
-use aproxy::ops::start::{Preflight, PreflightError, launch, preflight, resolve_runtime_config};
+use aproxy::ops::start::{
+    Preflight, PreflightError, launch, load_lenient, overrides_from_cli, preflight,
+    resolve_runtime_config,
+};
 use aproxy::ops::target::resolve_config_target;
+use aproxy::spec::{self, InstanceSpec};
 
 use crate::server::{bind_error_message, report_config_error, serve_forever};
 
-/// `aproxy`（无子命令）/ `aproxy start [别名|路径]`：后台启动守护进程；
+/// `aproxy`（无子命令）/ `aproxy start [别名|路径]`：后台启动实例；
 /// --foreground 前台运行。
 ///
 /// target 解析：settings.json 别名表优先（`aproxy alias add` 管理），
@@ -26,8 +31,6 @@ pub(crate) async fn handle_start_cmd(
     cfg_path: Result<PathBuf, String>,
     target: Option<String>,
 ) {
-    // start <别名|路径>：别名解析出的路径只在本进程可见，守护子进程的命令行
-    // 里必须显式带上 --config（拉起时注入），否则子进程会回退默认配置。
     // 给了 target 就不需要默认配置——失效的 default_config 只拦无 target 的启动
     let cfg_path = match target.as_deref() {
         None => super::require_cfg_path(cfg_path),
@@ -41,35 +44,26 @@ pub(crate) async fn handle_start_cmd(
             }
         },
     };
-    let cfg = match resolve_runtime_config(cli, &cfg_path) {
+    // 这个实例有没有配置文件：命令行指定的、别名或路径给出的，必须在（打错路径时明确
+    // 报错，而不是悄悄按空配置启动）；什么都没给、默认的 config.toml 也不在，就是一个只靠
+    // 覆盖旗标与 settings.json 全局默认启动的实例
+    let explicit = cli.config.is_some() || target.is_some();
+    let cfg_file: Option<&Path> = (explicit || cfg_path.exists()).then_some(cfg_path.as_path());
+    let overrides = overrides_from_cli(cli);
+    let cfg = match resolve_runtime_config(&overrides, cfg_file) {
         Ok(c) => c,
         Err(msg) => {
-            report_config_error(&msg, cli.daemon_child);
+            eprintln!("{msg}");
             std::process::exit(1);
         }
     };
     let listen_addr = cfg.listen_addr.clone();
     let port = daemon::port_of(&listen_addr).to_string();
 
-    // 非回环监听告警（不阻断启动——对外开放可能正是用户的意图）。三个去向
-    // 各管一种读者：start 父进程 / 前台实例打到 stderr（当场敲命令的人）；
-    // 守护子进程写守护日志与 startup.log——看门狗重拉、restore、install 滚动
-    // 重启拉起的实例没有控制台，startup.log 是这些启动唯一的留痕处。
-    // report_config_error 是 startup.log 的唯一写入口（含 logs 目录不可写时
-    // 的回退），告警复用它而不另起一套落盘逻辑。
+    // 非回环监听告警（不阻断启动——对外开放可能正是用户的意图）。后台实例自己还会把它
+    // 写进日志与 startup.log，见 handle_serve_cmd
     if let Some(w) = cfg.listen_exposure_warning() {
-        if cli.daemon_child {
-            tracing::warn!("{w}");
-            report_config_error(&format!("警告: {w}"), true);
-        } else {
-            eprintln!("警告: {w}");
-        }
-    }
-
-    // 守护子进程：直接承载服务，不再走启动预检/后台 spawn（父进程已做）
-    if cli.daemon_child {
-        serve_forever(cfg, &cfg_path, true).await;
-        return;
+        eprintln!("警告: {w}");
     }
 
     // 端口预检（见 aproxy::ops::start::preflight）：同端口同地址已有本 home 的实例就不
@@ -103,17 +97,18 @@ pub(crate) async fn handle_start_cmd(
     }
 
     if cli.foreground {
-        serve_forever(cfg, &cfg_path, false).await;
+        serve_forever(cfg, cfg_file, None).await;
         return;
     }
 
-    // 后台：分离子进程承载服务，命令行参数原样转发（`--config` 改写为上面解析出的路径，
-    // 见 aproxy::ops::start::launch）。子进程提前退出时立即报告，附上 startup.log 本次
-    // 新增的内容（子进程没有控制台，配置错误、绑定失败的原因只写在那里）。日志文件按启动
-    // 随机命名（或用户自定义），客户端不拼路径——就绪应答里带着实例上报的 log_path。
+    // 后台：把这次启动写成拉起规格，交给分离的子进程（见 aproxy::spawn）。覆盖旗标与环境
+    // 里的代理变量都记在规格里，以后 restart、restore、看护者重拉用的是同一份。子进程提前
+    // 退出时立即报告，附上 startup.log 本次新增的内容（子进程没有控制台，配置错误、绑定
+    // 失败的原因只写在那里）。日志文件名在这里生成一次，重拉之后续写同一个文件
     let exe = std::env::current_exe().expect("无法定位自身可执行文件");
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let info = match launch(&exe, args, &cfg_path).await {
+    let log_path = crate::server::resolve_daemon_log_path(cfg.log_file.as_deref());
+    let spec = InstanceSpec::capture(cfg_file, overrides, &log_path);
+    let info = match launch(&exe, &spec).await {
         Ok(info) => info,
         Err(e) => {
             let excerpt = e.startup_log().map(|l| l.excerpt()).unwrap_or_default();
@@ -136,7 +131,7 @@ pub(crate) async fn handle_start_cmd(
         println!("        上游路径与查询参数将完整透传到 {base}/<path>?<query>");
     }
     // 仅转发模式是放弃重试保障的取舍，启动提示里必须显式说出来
-    // （父进程的 cfg 已完成 settings 注入，取值与守护子进程一致）
+    // （父进程的 cfg 已完成 settings 注入，取值与后台实例一致）
     if cfg.forward_only_enabled() {
         println!("  仅转发模式：不缓冲、不重试");
     }
@@ -146,7 +141,84 @@ pub(crate) async fn handle_start_cmd(
             "  外部转换器：请求/响应将交给 format 程序改写（转换失败：请求侧 502 不重试、响应侧透传原样）"
         );
     }
-    println!("  配置: {}", cfg_path.display());
+    match cfg_file {
+        Some(path) => println!("  配置: {}", path.display()),
+        None => println!("  配置: （没有配置文件，使用命令行参数与全局默认）"),
+    }
     println!("  日志: {}", info.instance.log_path);
     println!("查看实例: aproxy status    停止: aproxy stop {actual_port}");
+}
+
+/// `aproxy __serve --home <dir> --spec <file>`：后台实例的入口。读交接文件里的拉起规格，
+/// 按它解析配置、初始化日志，然后承载服务直到停止。
+///
+/// 这个进程没有控制台：在日志初始化之前出的错（规格读不出来）与配置错误都写进
+/// startup.log，拉起方在子进程退出后从那里摘录原因。
+pub(crate) async fn handle_serve_cmd(spec_path: &Path) -> ! {
+    let mut spec = match spec::read_spec_file(spec_path) {
+        Ok(spec) => spec,
+        Err(e) => {
+            report_config_error(
+                &format!("cannot read the launch spec {}: {e}", spec_path.display()),
+                true,
+            );
+            crate::util::exit(1)
+        }
+    };
+    let cfg_file = spec.config_file();
+    let cfg_file = cfg_file.as_deref();
+
+    // 日志初始化排在校验之前：此刻配置还没有严格校验，用宽松解析定出日志写到哪里
+    // （配置或覆盖里的 log_file 优先，否则用规格里记下的文件），校验不过的原因才有处可记
+    let lenient = load_lenient(&spec.overrides, cfg_file);
+    let log_path = match lenient.log_file.as_deref() {
+        Some(custom) => crate::server::resolve_daemon_log_path(Some(custom)),
+        None => PathBuf::from(&spec.log_path),
+    };
+    crate::server::init_daemon_logging(&log_path);
+
+    let mut cfg = match resolve_runtime_config(&spec.overrides, cfg_file) {
+        Ok(cfg) => cfg,
+        Err(msg) => {
+            report_config_error(&msg, true);
+            crate::util::exit(1)
+        }
+    };
+    // 配置解析出的端口是 0（由系统分配）而规格里钉着上次拿到的端口：回到那个端口，客户端
+    // 配的就是它。配置已经改成固定端口时以配置为准，钉住的端口作废
+    if daemon::port_of(&cfg.listen_addr) == "0" {
+        if let Some(pinned) = spec.pinned_port {
+            cfg.listen_addr = replace_port(&cfg.listen_addr, pinned);
+        }
+    } else {
+        spec.pinned_port = None;
+    }
+    // 重拉、restore、安装的滚动重启拉起的实例没有人在看控制台，startup.log 是这些启动
+    // 唯一的留痕处
+    if let Some(w) = cfg.listen_exposure_warning() {
+        tracing::warn!("{w}");
+        report_config_error(&format!("警告: {w}"), true);
+    }
+    serve_forever(cfg, cfg_file, Some(spec)).await;
+    crate::util::exit(0)
+}
+
+/// 把监听地址里的端口换成 `port`（地址部分原样保留，含 IPv6 的方括号）。
+fn replace_port(listen_addr: &str, port: u16) -> String {
+    match listen_addr.rsplit_once(':') {
+        Some((host, _)) => format!("{host}:{port}"),
+        None => listen_addr.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replace_port_keeps_the_host_part() {
+        assert_eq!(replace_port("127.0.0.1:0", 40123), "127.0.0.1:40123");
+        assert_eq!(replace_port("[::1]:0", 40123), "[::1]:40123");
+        assert_eq!(replace_port("0.0.0.0:0", 9), "0.0.0.0:9");
+    }
 }

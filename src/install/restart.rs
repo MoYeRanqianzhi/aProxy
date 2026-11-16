@@ -1,28 +1,26 @@
-//! 实例重启原语：取恢复参数 → 优雅停止 → spawn 指定二进制 → IPC 就绪；
-//! 新二进制起不来时用回退二进制按原参数把实例拉回。
+//! 实例重启原语：读期望状态记录里的拉起规格 → 优雅停止（记录留着）→ 用指定的二进制
+//! 按同一份规格拉起 → IPC 就绪；新二进制起不来时用回退二进制按同一份规格把实例拉回。
 //!
 //! 两个消费方共享同一原语：
 //! - **broadcast 的 ACK 收敛**：未表达 PrepareSwap 的旧实例被 restart 到
 //!   安装器版本（顺带完成混版本舰队收敛）；
-//! - **restarting 阶段的滚动重启**：逐实例 stop → 新 exe spawn。
+//! - **restarting 阶段的滚动重启**：逐实例 stop → 新 exe 拉起。
 //!
-//! 「用安装器自身 exe」是关键：respawn 用 `current_exe()`——安装器跑在哪个
+//! 「用安装器自身 exe」是关键：拉起用 `current_exe()`——安装器跑在哪个
 //! 镜像上，重启出的实例就是哪个版本。交棒之后广播由目标版本执行，此刻它跑在
 //! staging 里，收敛重启出的实例也就跑在 staging 的副本上；交换后的滚动重启
 //! 会把快照里的每个实例换到 bin，cleaning 删 staging 时它已不再被占用。
 //!
 //! ## 失败时的服务回滚（不是状态机回滚）
 //!
-//! 升级是「不中断运行」使命里最脆弱的一环：实例被优雅停止后，守护退出会
-//! 删掉自己的 `.restore`；新二进制若在 bind 前就退出（新版本对旧配置的校验
-//! 更严、被杀软拦截、8 秒内没就绪），既不会写 `.restore` 也不会写注册表——
-//! 实例从此无人知晓，`aproxy restore` 也救不回。本原语为此做三件事：
+//! 升级是「不中断运行」使命里最脆弱的一环：新二进制若起不来（新版本对旧配置的校验
+//! 更严、被杀软拦截、时限内没就绪），实例就停在了「旧的已停、新的没起」。本原语靠两点
+//! 保住它：
 //!
-//! 1. **停止之前**把恢复参数记进 install.state 的在途清单（安装进程在窗口内
-//!    崩溃/断电时，续作靠它把实例拉回）；
-//! 2. **停止之后立即**回写 `.restore`（新实例 bind 成功时会用同样的参数
-//!    覆盖它；失败时它就是 `aproxy restore` 与看护者的恢复依据）；
-//! 3. 新二进制起不来 → 用回退二进制（旧版本）按原参数把实例拉回，并置
+//! 1. 停止用带 `keep_restore` 的 shutdown，**期望状态记录从头到尾都在**：安装进程在
+//!    窗口内崩溃或断电，续作、`aproxy restore` 与看护者都能按它把实例拉回。安装状态
+//!    文件因此不必存启动参数（它不含密钥），只记端口；
+//! 2. 新二进制起不来 → 用回退二进制（旧版本）按同一份规格把实例拉回，并置
 //!    install.state 的 `halted`，由调用方中止滚动、不再动剩余实例。
 //!
 //! 与 install-v1 的 forward-fix 铁律（swapping 之后只进不退）兼容：回滚的
@@ -32,21 +30,22 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::state::{InstallState, PendingRestore};
+use super::state::InstallState;
+use crate::spec::InstanceSpec;
 
 /// 实例重启失败的分类——调用方据此决定「中止滚动」还是「照常失败可续作」。
 #[derive(Debug, Clone, PartialEq)]
 pub enum RestartError {
-    /// 实例未被本次重启动过（取恢复参数失败、停止超时等）：服务状态与调用
-    /// 前一致，或停止未确认但在途记录已留存，续作可重试。
+    /// 实例未被本次重启动过（没有期望状态记录、停止超时等）：服务状态与调用
+    /// 前一致，或停止未确认但期望状态记录还在，续作可重试。
     NotRestarted(String),
-    /// 新二进制起不来，已用回退二进制按原参数拉回（服务恢复，版本未升级）。
+    /// 新二进制起不来，已用回退二进制按同一份规格拉回（服务恢复，版本未升级）。
     RolledBack {
         reason: String,
         pid: u32,
         fallback: PathBuf,
     },
-    /// 新二进制起不来，回退也失败：实例下线，`.restore` 已保住（排除原因后
+    /// 新二进制起不来，回退也失败：实例下线，期望状态记录还在（排除原因后
     /// `aproxy restore` 可恢复）。
     Down {
         reason: String,
@@ -64,7 +63,7 @@ impl std::fmt::Display for RestartError {
                 fallback,
             } => write!(
                 f,
-                "新版本启动失败（{reason}）；已用旧二进制 {} 按原参数拉回实例（pid {pid}），\
+                "新版本启动失败（{reason}）；已用旧二进制 {} 按原来的规格拉回实例（pid {pid}），\
                  滚动已中止，其余实例未动",
                 fallback.display()
             ),
@@ -74,45 +73,31 @@ impl std::fmt::Display for RestartError {
             } => write!(
                 f,
                 "新版本启动失败（{reason}），旧二进制拉回也失败（{fallback_error}）；\
-                 实例当前下线，恢复记录（.restore）已保留，排除原因后执行 `aproxy restore` 恢复"
+                 实例当前下线，期望状态记录已保留，排除原因后执行 `aproxy restore` 恢复"
             ),
         }
     }
 }
 
-/// 实例的恢复参数与日志路径：`.restore` 优先（实例在跑时它是权威）；缺失
-/// 时取 install.state 的在途记录（已被本安装停止、尚未恢复的实例——`.restore`
-/// 已随守护优雅退出删除）。**必须在 stop 之前调用**。
-fn restore_entry(
-    run_dir: &Path,
-    state: &InstallState,
-    port: &str,
-) -> Result<(Vec<String>, String), String> {
-    let (args, log_path) = match crate::daemon::list_restore_entries_in(run_dir)
-        .into_iter()
-        .find(|e| e.port == port)
-    {
-        Some(e) => (e.args, e.log_path),
-        None => state
-            .pending_restores
-            .iter()
-            .find(|p| p.port == port)
-            .map(|p| (p.args.clone(), p.log_path.clone()))
-            .ok_or_else(|| format!("实例 {port} 无恢复记录（非本安装启动的实例？）"))?,
+/// 实例的拉起规格，取自它的期望状态记录。没有记录的实例（前台实例，或 stop 之后
+/// 残留在快照里的端口）无从重启。
+fn restore_spec(run_dir: &Path, port: &str) -> Result<InstanceSpec, String> {
+    let spec = match crate::spec::read_restore_in(run_dir, port) {
+        Ok(Some(entry)) => entry.spec,
+        Ok(None) => return Err(format!("实例 {port} 没有期望状态记录（前台实例？）")),
+        Err(reason) => return Err(format!("实例 {port} 的期望状态记录读不懂（{reason}）")),
     };
-    // 配置文件已被删的记录无法忠实恢复
-    if let Some(cfg) = args
-        .iter()
-        .position(|a| a == "--config")
-        .and_then(|i| args.get(i + 1))
-        && !Path::new(cfg).exists()
+    // 配置文件不在的规格拉不起来：新旧二进制都会在读配置时失败
+    if let Some(cfg) = spec.config_file()
+        && !cfg.exists()
     {
-        return Err(format!("配置文件已不存在: {cfg}"));
+        return Err(format!("配置文件已不存在: {}", cfg.display()));
     }
-    Ok((args, log_path))
+    Ok(spec)
 }
 
-/// 优雅停止并等待**进程真正终止**（Shutdown → 实例优雅退出）。
+/// 优雅停止并等待**进程真正终止**（Shutdown → 实例优雅退出）。期望状态记录留着：实例认
+/// `keep_restore` 时带上它；不认的旧实例会在退出时删掉记录，由调用方在停止之后写回。
 ///
 /// 两段确认，缺一不可：
 /// 1. IPC 消失（管道/ socket 没了 = 服务停止）——**不等于进程终止**：守护
@@ -130,9 +115,13 @@ pub async fn stop_and_wait(run_dir: &Path, port: &str, timeout: Duration) -> Res
         .iter()
         .find(|i| crate::daemon::port_of(&i.instance.listen_addr) == port)
         .map(|i| i.instance.pid);
-    crate::daemon::ipc_request_in(run_dir, port, crate::daemon::IpcOp::Shutdown)
-        .await
-        .map_err(|e| e.to_string())?;
+    crate::daemon::ipc_request_in(
+        run_dir,
+        port,
+        crate::daemon::IpcOp::Shutdown { keep_restore: true },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
         // 只有端点消失才算退出：挂死的实例端点还在、只是不应答
@@ -170,7 +159,7 @@ struct SpawnFailure {
     /// spawn 成功时的子进程 pid（spawn 本身失败为 None）
     pid: Option<u32>,
     /// spawn 返回后立刻读到的子进程创建时间（身份锚点，见 process::record_identity）：
-    /// 回收时按「pid + 创建时间」核验再终止——8 秒等待期间子进程若已退出、pid 被系统
+    /// 回收时按「pid + 创建时间」核验再终止——等待就绪期间子进程若已退出、pid 被系统
     /// 复用给别的进程，届时现读的创建时间必然不符，绝不误杀。None = 读不到（进程瞬间
     /// 退出或平台不支持），此时不终止。
     start: Option<u64>,
@@ -179,15 +168,15 @@ struct SpawnFailure {
     message: String,
 }
 
-/// 以 `exe` 按 `args` 拉起守护并等它就绪（见 crate::spawn：按新 pid 在注册表里定位、ping
-/// 确认；子进程提前退出即刻判失败，不空等到时限）。返回新 pid。
+/// 用 `exe` 在 `home` 里按 `spec` 拉起实例并等它就绪（见 crate::spawn：按新 pid 在注册表里
+/// 定位、ping 确认；子进程提前退出即刻判失败，不空等到时限）。返回新 pid。
 async fn spawn_and_wait_ready(
-    run_dir: &Path,
+    home: &Path,
     exe: &Path,
-    args: &[String],
+    spec: &InstanceSpec,
 ) -> Result<u32, SpawnFailure> {
     use crate::spawn::SpawnError;
-    match crate::spawn::spawn_instance(run_dir, exe, args, crate::spawn::READY_TIMEOUT).await {
+    match crate::spawn::spawn_from_spec(home, exe, spec, crate::spawn::READY_TIMEOUT).await {
         Ok(live) => Ok(live.instance.pid),
         Err(e) => {
             let message = format!(
@@ -220,7 +209,7 @@ async fn spawn_and_wait_ready(
     }
 }
 
-/// 清掉 8 秒内没就绪、仍存活的子进程（本函数刚 spawn 的、从未写注册表的
+/// 清掉时限内没就绪、仍存活的子进程（本函数刚 spawn 的、从未写注册表的
 /// 进程——它不承载任何已知流量；不清掉它，回退二进制可能因端口被占而
 /// bind 失败）。身份锚点是 spawn 时读到的「pid + 创建时间」：
 /// `terminate_verified_process` 在同一进程句柄上先核对创建时间再终止，pid 已被
@@ -246,9 +235,9 @@ async fn reap_unready_child(pid: u32, start: Option<u64>) {
     }
 }
 
-/// 一步到位：取恢复参数（停止前！）→ 记在途 → 优雅停止（等进程终止）→
-/// 回写 `.restore` → 用 `exe` 重启。返回新 pid。在途记录与 halted 写进 `home`
-/// 的安装状态文件，实例的注册表与 `.restore` 在 `run_dir`。
+/// 一步到位：读拉起规格 → 优雅停止（等进程终止，期望状态记录留着）→ 用 `exe` 按同一份
+/// 规格重启。返回新 pid。halted 写进 `home` 的安装状态文件，实例的注册表与期望状态记录
+/// 在 `run_dir`。
 ///
 /// `fallback`：新二进制起不来时拉回实例用的旧二进制。None = 用实例停止前
 /// 的进程镜像路径——只在镜像文件**尚未被交换**时准确（swap 前的 ACK 收敛
@@ -256,9 +245,9 @@ async fn reap_unready_child(pid: u32, start: Option<u64>) {
 /// 是让位的原文件、unix 是交换前保留的硬链接或副本），因为原镜像路径此时指向的
 /// 已是新文件。
 ///
-/// 实例本就不在跑（续作接手的「已停未恢复」实例）→ 跳过停止直接拉起。
+/// 实例本就不在跑（续作接手的「已停未恢复」实例，记录还在）→ 跳过停止直接拉起。
 ///
-/// 停止预算 20s：守护的优雅退出含 **10 秒宽限强退**（server.rs 的 select
+/// 停止预算 20s：实例的优雅退出含 **10 秒宽限强退**（server.rs 的 select
 /// 双臂——在途连接挂起时 10s 后 process::exit），进程终止等待必须覆盖它
 /// 并留余量，否则 rolling 阶段每一步都在与宽限计时竞速。
 pub async fn restart_instance(
@@ -269,43 +258,30 @@ pub async fn restart_instance(
     exe: &Path,
     fallback: Option<&Path>,
 ) -> Result<u32, RestartError> {
-    let (args, log_path) =
-        restore_entry(run_dir, state, port).map_err(RestartError::NotRestarted)?;
+    let spec = restore_spec(run_dir, port).map_err(RestartError::NotRestarted)?;
     let live = crate::daemon::ipc_ping_in(run_dir, port).await.ok();
     let image = live
         .as_ref()
         .and_then(|i| crate::process::process_image_path(i.instance.pid));
-
-    // 在途记录先于停止落盘（窗口内崩溃的唯一留存，见模块文档）
-    state.pending_restores.retain(|p| p.port != port);
-    state.pending_restores.push(PendingRestore {
-        port: port.to_string(),
-        args: args.clone(),
-        log_path: log_path.clone(),
-    });
-    super::state::write_in(home, state)
-        .map_err(|e| RestartError::NotRestarted(format!("install/state.json 写入失败: {e}")))?;
 
     if live.is_some() {
         stop_and_wait(run_dir, port, Duration::from_secs(20))
             .await
             .map_err(RestartError::NotRestarted)?;
     }
-    // 停止后立即回写：守护优雅退出刚删掉它；新实例 bind 时会以同样的参数
-    // 覆盖，起不来时它就是 `aproxy restore` / 看护者重拉的依据
-    let rewrite_restore = || {
-        if let Err(e) = crate::daemon::write_restore_file_in(run_dir, port, &args, &log_path) {
-            tracing::warn!(port = %port, error = %e, "恢复记录回写失败（在途记录仍在 install.state）");
+    // 记录必须在：不认 `keep_restore` 的旧实例退出时会删掉它。新实例就绪时会用同样的
+    // 规格覆盖它；起不来时它就是续作、`aproxy restore` 与看护者重拉的依据
+    let ensure_restore = || {
+        if !crate::spec::restore_path_in(run_dir, port).is_file()
+            && let Err(e) = crate::spec::write_restore_in(run_dir, port, &spec)
+        {
+            tracing::warn!(port = %port, error = %e, "期望状态记录写回失败");
         }
     };
-    rewrite_restore();
+    ensure_restore();
 
-    let failure = match spawn_and_wait_ready(run_dir, exe, &args).await {
-        Ok(pid) => {
-            state.pending_restores.retain(|p| p.port != port);
-            let _ = super::state::write_in(home, state);
-            return Ok(pid);
-        }
+    let failure = match spawn_and_wait_ready(home, exe, &spec).await {
+        Ok(pid) => return Ok(pid),
         Err(f) => f,
     };
     tracing::error!(port = %port, error = %failure.message, "新二进制未能拉起实例，转入回滚");
@@ -314,13 +290,11 @@ pub async fn restart_instance(
     {
         reap_unready_child(pid, failure.start).await;
     }
-    rewrite_restore();
+    ensure_restore();
 
-    // 端口上已有可用实例（看护者按 .restore 抢先重拉 / 未就绪的子进程最终
+    // 端口上已有可用实例（看护者按期望状态记录抢先重拉 / 未就绪的子进程最终
     // 起来了）：服务已在，不再叠加回退——verifying 会核对版本
     if let Ok(info) = crate::daemon::ipc_ping_in(run_dir, port).await {
-        state.pending_restores.retain(|p| p.port != port);
-        let _ = super::state::write_in(home, state);
         return Ok(info.instance.pid);
     }
 
@@ -332,10 +306,9 @@ pub async fn restart_instance(
             reason: failure.message,
             fallback_error: "没有可用的旧二进制".to_string(),
         }),
-        Some(old) => match spawn_and_wait_ready(run_dir, &old, &args).await {
+        Some(old) => match spawn_and_wait_ready(home, &old, &spec).await {
             Ok(pid) => {
                 tracing::warn!(port = %port, pid, old = %old.display(), "已用旧二进制拉回实例");
-                state.pending_restores.retain(|p| p.port != port);
                 Err(RestartError::RolledBack {
                     reason: failure.message,
                     pid,
@@ -343,7 +316,7 @@ pub async fn restart_instance(
                 })
             }
             Err(f2) => {
-                rewrite_restore();
+                ensure_restore();
                 Err(RestartError::Down {
                     reason: failure.message,
                     fallback_error: f2.message,

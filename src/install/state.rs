@@ -144,17 +144,22 @@ pub struct SkillState {
 }
 
 /// 被 install 停止、但尚未确认已在新进程上就绪的实例（滚动重启的「在途」
-/// 记录）。**停止之前**落盘：守护优雅退出会删掉自己的 `.restore`，若安装
+/// 记录）。**本版本不再写、也不再读它**：滚动重启用带 `keep_restore` 的 shutdown 停止实例，
+/// 期望状态记录一直在，续作靠它与端口快照就能把实例拉回，安装状态文件因此不含启动参数
+/// （其中可能有密钥）。类型与字段留着，只为早先的版本读这份文件时形状不变；写出的
+/// `pending_restores` 恒为空数组。下面是它当初的用途：
+///
+/// **停止之前**落盘：守护优雅退出会删掉自己的恢复记录，若安装
 /// 进程恰在「旧实例已停、新实例未就绪」的窗口崩溃/断电，这里是该实例启动
 /// 参数的唯一留存——续作据此把它拉回，重算实例快照时也据此把它并回去
 /// （它已不在跑，IPC 枚举看不到它）。实例就绪（或被旧二进制拉回）后移除。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PendingRestore {
     pub port: String,
-    /// 启动参数（与 `.restore` 同形：不含 --daemon-child）
+    /// 启动参数（不含内部的守护标记）
     #[serde(default)]
     pub args: Vec<String>,
-    /// 停止前那次启动的守护日志路径（回写 `.restore` 时原样带上）
+    /// 停止前那次启动的守护日志路径
     #[serde(default)]
     pub log_path: String,
 }
@@ -203,7 +208,7 @@ pub struct InstallState {
     #[serde(default)]
     pub pending_restores: Vec<PendingRestore>,
     /// 实例级失败后的「中止」标记：某实例在新二进制下起不来，已用旧二进制
-    /// 拉回（或拉回也失败、只保住了 `.restore`），滚动就此停止。置位后
+    /// 拉回（或拉回也失败、只保住了期望状态记录），滚动就此停止。置位后
     /// **自动续作不再重试**——原因（多为新版本不接受现有配置）不会自己消失，
     /// 每次续作都会让该实例再经历一次「停止 → 起不来 → 拉回」的服务中断。
     /// 由用户排除原因后显式重新执行 install 收尾（新安装接管残留状态）。
@@ -243,7 +248,7 @@ impl InstallState {
 /// 残留（双条件——长阶段本身不慢到 10 分钟，pid 判活兜住误判）。
 pub const STALE_AFTER_SECS: u64 = 600;
 
-/// 状态文件路径：`<home>/install/state.json`。它属于 home，不随 APROXY_RUN_DIR
+/// 状态文件路径：`<home>/install/state.json`。它属于 home，不在 run/
 /// 搬走——安装者的一切状态都收在 `<home>/install/` 下（见 [`super::install_dir_in`]）。
 pub fn state_path() -> PathBuf {
     state_path_in(&aproxy_ipc::home::home())

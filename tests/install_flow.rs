@@ -188,12 +188,7 @@ fn install_from_with_instance_rolling_restart() {
     // 实例跑在规范 bin 二进制上（管辖内的真实升级形态）
     let child = env
         .home
-        .cmd_with(&bin)
-        .args([
-            "--config",
-            &cfg_file.display().to_string(),
-            "--daemon-child",
-        ])
+        .serve_cmd_with(&bin, &cfg_file)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -291,12 +286,7 @@ async fn jurisdiction_check_rejects_foreign_binary() {
     let foreign_bin = env.source_file("foreign");
     let child = env
         .home
-        .cmd_with(&foreign_bin)
-        .args([
-            "--config",
-            &cfg_file.display().to_string(),
-            "--daemon-child",
-        ])
+        .serve_cmd_with(&foreign_bin, &cfg_file)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -397,12 +387,7 @@ async fn jurisdiction_accepts_an_instance_started_through_a_short_path() {
     .unwrap();
     let mut child = env
         .home
-        .cmd_with(&short_bin)
-        .args([
-            "--config",
-            &cfg_file.display().to_string(),
-            "--daemon-child",
-        ])
+        .serve_cmd_with(&short_bin, &cfg_file)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -463,12 +448,7 @@ fn adopt_migrates_foreign_instance() {
     let foreign_bin = env.source_file("adopt");
     let child = env
         .home
-        .cmd_with(&foreign_bin)
-        .args([
-            "--config",
-            &cfg_file.display().to_string(),
-            "--daemon-child",
-        ])
+        .serve_cmd_with(&foreign_bin, &cfg_file)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -611,18 +591,13 @@ fn install_instance_failure_exits_nonzero_and_keeps_restore() {
     .unwrap();
     let mut child = env
         .home
-        .cmd_with(&bin)
-        .args([
-            "--config",
-            &cfg_file.display().to_string(),
-            "--daemon-child",
-        ])
+        .serve_cmd_with(&bin, &cfg_file)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
     let run_dir = env.home().join("run");
-    let restore_file = aproxy::daemon::restore_file_path_in(&run_dir, &env.port.to_string());
+    let restore_file = aproxy::spec::restore_path_in(&run_dir, &env.port.to_string());
     let mut ready = false;
     for _ in 0..100 {
         // 实例先写注册记录、再写恢复记录（src/server.rs），两个都在才算就绪：只等注册记录，
@@ -677,13 +652,13 @@ fn install_instance_failure_exits_nonzero_and_keeps_restore() {
     let _ = child.wait();
 
     // .restore 以原参数保住（修复前被删）
-    let restore_after = std::fs::read_to_string(aproxy::daemon::restore_file_path_in(
+    let restore_after = std::fs::read_to_string(aproxy::spec::restore_path_in(
         &run_dir,
         &env.port.to_string(),
     ))
     .expect(".restore 必须保住");
-    let args_of = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap()["args"].clone();
-    assert_eq!(args_of(&restore_after), args_of(&restore_before));
+    let spec_of = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap()["spec"].clone();
+    assert_eq!(spec_of(&restore_after), spec_of(&restore_before));
     let st = aproxy::install::state::load_in(&env.home()).expect("failed 现场保留");
     assert_eq!(st.phase, aproxy::install::state::InstallPhase::Failed);
     assert!(st.halted, "实例级失败应置 halted");
@@ -719,12 +694,7 @@ fn unix_install_rolls_back_instance_to_preserved_old_binary() {
     .unwrap();
     let mut child = env
         .home
-        .cmd_with(&bin)
-        .args([
-            "--config",
-            &cfg_file.display().to_string(),
-            "--daemon-child",
-        ])
+        .serve_cmd_with(&bin, &cfg_file)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -780,7 +750,7 @@ fn unix_install_rolls_back_instance_to_preserved_old_binary() {
         "实例应跑在让位的旧二进制上: {image:?}"
     );
     assert!(
-        aproxy::daemon::restore_file_path_in(&run_dir, &env.port.to_string()).is_file(),
+        aproxy::spec::restore_path_in(&run_dir, &env.port.to_string()).is_file(),
         ".restore 应在"
     );
 
@@ -805,12 +775,7 @@ fn start_bin_instance(env: &TestEnv, name: &str) -> std::process::Child {
     .unwrap();
     let mut child = env
         .home
-        .cmd_with(aproxy::install::swap::bin_path_in(&env.home()))
-        .args([
-            "--config",
-            &cfg_file.display().to_string(),
-            "--daemon-child",
-        ])
+        .serve_cmd_with(aproxy::install::swap::bin_path_in(&env.home()), &cfg_file)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

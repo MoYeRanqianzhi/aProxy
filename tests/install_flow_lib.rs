@@ -71,12 +71,7 @@ async fn continue_from_restarting_reclaims_instance() {
     .unwrap();
     let dbg_err = std::fs::File::create(home.join("daemon-stderr.log")).unwrap();
     let mut child = test_home
-        .cmd_with(&bin)
-        .args([
-            "--config",
-            &cfg_file.display().to_string(),
-            "--daemon-child",
-        ])
+        .serve_cmd_with(&bin, &cfg_file)
         .stdout(Stdio::null())
         .stderr(dbg_err)
         .spawn()
@@ -232,12 +227,7 @@ async fn continue_from_swapping_with_live_instance_redoes_swap() {
     )
     .unwrap();
     let mut child = test_home
-        .cmd_with(&bin)
-        .args([
-            "--config",
-            &cfg_file.display().to_string(),
-            "--daemon-child",
-        ])
+        .serve_cmd_with(&bin, &cfg_file)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -640,8 +630,7 @@ fn start_instance(
     )
     .unwrap();
     let child = test_home
-        .cmd_with(exe)
-        .args(["--config", &cfg.display().to_string(), "--daemon-child"])
+        .serve_cmd_with(exe, &cfg)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -651,7 +640,7 @@ fn start_instance(
     let mut ready = false;
     for _ in 0..100 {
         if aproxy::daemon::registry_pids_in(&run_dir).contains(&pid)
-            && restore_args_of(&run_dir, port).is_some()
+            && restore_spec_of(&run_dir, port).is_some()
         {
             ready = true;
             break;
@@ -689,11 +678,11 @@ fn swapped_state(home: &Path, port: u16, old: &Path, bin: &Path) {
     aproxy::install::state::write_in(home, &mut state).unwrap();
 }
 
-fn restore_args_of(run_dir: &Path, port: u16) -> Option<Vec<String>> {
-    aproxy::daemon::list_restore_entries_in(run_dir)
-        .into_iter()
-        .find(|e| e.port == port.to_string())
-        .map(|e| e.args)
+/// `port` 的期望状态记录里的拉起规格；没有记录时为 None
+fn restore_spec_of(run_dir: &Path, port: u16) -> Option<aproxy::spec::InstanceSpec> {
+    aproxy::spec::read_restore_in(run_dir, &port.to_string())
+        .expect("期望状态记录应读得懂")
+        .map(|entry| entry.spec)
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -735,7 +724,7 @@ async fn rollback_case(kind: BrokenNew) {
 
     let (port, cfg, mut child) = start_instance(&dir, &bin, "rollback");
     let old_pid = child.id();
-    let args_before = restore_args_of(&run_dir, port).expect("在跑实例应有 .restore");
+    let spec_before = restore_spec_of(&run_dir, port).expect("在跑实例应有期望状态记录");
     aproxy::install::broadcast::ack_one(&run_dir, &port.to_string())
         .await
         .expect("PrepareSwap 广播应成功");
@@ -754,7 +743,7 @@ async fn rollback_case(kind: BrokenNew) {
         "错误应说明已用旧二进制拉回: {err}"
     );
 
-    // 实例已被旧二进制按原参数拉回：新 pid、跑在旧二进制上、.restore 完好
+    // 实例已被旧二进制按同一份规格拉回：新 pid、跑在旧二进制上、期望状态记录完好
     let info = aproxy::daemon::ipc_ping_in(&run_dir, &port.to_string())
         .await
         .expect("回滚后实例应在线");
@@ -762,13 +751,15 @@ async fn rollback_case(kind: BrokenNew) {
     let image = aproxy::process::process_image_path(info.instance.pid).expect("镜像路径可查");
     assert!(same_path(&image, &old), "实例应跑在旧二进制上: {image:?}");
     assert_eq!(
-        restore_args_of(&run_dir, port).as_deref(),
-        Some(args_before.as_slice()),
-        ".restore 应完好（原参数）"
+        restore_spec_of(&run_dir, port).as_ref(),
+        Some(&spec_before),
+        "期望状态记录应完好（同一份规格）"
     );
     assert!(
-        args_before.iter().any(|a| same_path(Path::new(a), &cfg)),
-        "原参数应含配置路径: {args_before:?}"
+        spec_before
+            .config_file()
+            .is_some_and(|p| same_path(&p, &cfg)),
+        "规格应指向配置文件: {spec_before:?}"
     );
 
     // 状态：failed + halted + 原因；在途清单已清（实例已恢复）
@@ -776,7 +767,10 @@ async fn rollback_case(kind: BrokenNew) {
     assert_eq!(st.phase, InstallPhase::Failed);
     assert!(st.halted, "实例级失败应置 halted");
     assert!(st.last_error.is_some_and(|e| e.contains("旧二进制")));
-    assert!(st.pending_restores.is_empty(), "实例已拉回，在途记录应清除");
+    assert!(
+        st.pending_restores.is_empty(),
+        "安装状态不存启动参数：在途清单恒为空"
+    );
 
     // 自动续作不再重试：原地拒绝且不碰实例
     let err2 = aproxy::install::flow::continue_install(home, &run_dir, None)
@@ -875,7 +869,7 @@ async fn rolling_restart_keeps_restore_when_rollback_also_fails() {
     make_exec(&bin);
 
     let (port, cfg, mut child) = start_instance(&dir, &bin, "down");
-    let args_before = restore_args_of(&run_dir, port).unwrap();
+    let spec_before = restore_spec_of(&run_dir, port).unwrap();
     aproxy::install::broadcast::ack_one(&run_dir, &port.to_string())
         .await
         .unwrap();
@@ -907,27 +901,23 @@ async fn rolling_restart_keeps_restore_when_rollback_also_fails() {
         "实例确实下线（新旧都起不来）"
     );
     assert_eq!(
-        restore_args_of(&run_dir, port).as_deref(),
-        Some(args_before.as_slice()),
-        ".restore 必须以原参数保住（修复前此处为空）"
+        restore_spec_of(&run_dir, port).as_ref(),
+        Some(&spec_before),
+        "期望状态记录必须保住（下线的实例靠它恢复）"
     );
     let st = aproxy::install::state::load_in(home).unwrap();
     assert_eq!(st.phase, InstallPhase::Failed);
     assert!(st.halted);
-    assert_eq!(
-        st.pending_restores
-            .iter()
-            .map(|p| p.port.as_str())
-            .collect::<Vec<_>>(),
-        vec![port.to_string().as_str()],
-        "下线实例的在途记录应留存"
+    assert!(
+        st.pending_restores.is_empty(),
+        "安装状态不存启动参数：在途清单恒为空"
     );
 }
 
 /// 「已停未恢复」的在途实例：安装进程在旧实例已停、新实例未就绪的窗口
-/// 崩溃——实例既不在跑也没了 .restore，只剩 install.state 的在途记录。
-/// 续作从 swapping 重入时重算快照必须把它并回去并用在途参数拉起（修复前
-/// 快照只看 IPC 枚举，它被永久排除，续作照常 done 而实例从此下线）。
+/// 崩溃——实例不在跑，留下的是它的期望状态记录（滚动重启的停止不删它）与安装
+/// 状态里的端口快照。续作从 swapping 重入时重算快照必须把它并回去并按记录里的
+/// 规格拉起（只看 IPC 枚举的话它被永久排除，续作照常 done 而实例从此下线）。
 #[tokio::test(flavor = "current_thread")]
 async fn continue_restores_instance_stopped_mid_restart() {
     let _guard = LIVE_TEST_LOCK.lock().await;
@@ -939,16 +929,17 @@ async fn continue_restores_instance_stopped_mid_restart() {
     std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &bin).unwrap();
     make_exec(&bin);
 
-    // 实例跑起来再优雅停掉：.restore 随之删除，复刻窗口内的现场
+    // 实例跑起来再按滚动重启的方式停掉（记录留着），复刻窗口内的现场
     let (port, _cfg, mut child) = start_instance(&dir, &bin, "pending");
-    let args = restore_args_of(&run_dir, port).unwrap();
+    let spec = restore_spec_of(&run_dir, port).unwrap();
     aproxy::install::restart::stop_and_wait(&run_dir, &port.to_string(), Duration::from_secs(20))
         .await
         .unwrap();
     let _ = child.wait();
-    assert!(
-        restore_args_of(&run_dir, port).is_none(),
-        "优雅退出应删 .restore"
+    assert_eq!(
+        restore_spec_of(&run_dir, port).as_ref(),
+        Some(&spec),
+        "滚动重启的停止不得删期望状态记录"
     );
 
     let staged = aproxy::install::staging::staging_dir_in(home, env!("CARGO_PKG_VERSION"))
@@ -957,11 +948,7 @@ async fn continue_restores_instance_stopped_mid_restart() {
     std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &staged).unwrap();
     make_exec(&staged);
     let mut state = crash_state(InstallPhase::Swapping, &bin, Some(&staged));
-    state.pending_restores = vec![aproxy::install::state::PendingRestore {
-        port: port.to_string(),
-        args,
-        log_path: String::new(),
-    }];
+    state.instance_snapshot = vec![port.to_string()];
     aproxy::install::state::write_in(home, &mut state).unwrap();
 
     let exit = tokio::time::timeout(
@@ -979,8 +966,8 @@ async fn continue_restores_instance_stopped_mid_restart() {
         .expect("在途实例应被续作拉起");
     assert_eq!(info.instance.version, env!("CARGO_PKG_VERSION"));
     assert!(
-        restore_args_of(&run_dir, port).is_some(),
-        "拉起后 .restore 应在"
+        restore_spec_of(&run_dir, port).is_some(),
+        "拉起后期望状态记录应在"
     );
 
     let _ = aproxy::install::restart::stop_and_wait(

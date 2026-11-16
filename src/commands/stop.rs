@@ -1,13 +1,16 @@
 //! `aproxy stop`，以及它与 `aproxy restart` 共用的目标选择与停止结果的渲染。
 //!
 //! 两个命令共享完全相同的 target 语义（省略/PORT/all/ALIAS/idle [SECS]），
-//! 差异仅在「停止后」：stop 到此为止，restart 用原启动参数立即拉起。
+//! 差异仅在「停止后」：stop 到此为止（并删掉期望状态记录），restart 按原来的拉起规格立即拉起。
 //! `--force` 改变停止方式：跳过 IPC 优雅关闭直接终止进程（零等待），终止前
 //! 按「pid + 进程创建时间」核验身份防 pid 复用误杀（与二进制名无关）。
 //! 选目标与停止本身在操作层（`aproxy::ops::target`、`aproxy::ops::stop`）。
 
 use aproxy::daemon::{self, InstanceRecord};
-use aproxy::ops::stop::{StopFailure, StopMode, Stopped, stop_instance};
+use aproxy::ops::stop::{
+    StopFailure, StopMode, Stopped, forget_all_stopped, forget_stopped_config, forget_stopped_port,
+    stop_instance,
+};
 use aproxy::ops::target::{self, Empty, SelectError};
 
 /// stop/restart 共用：选出要处理的实例。
@@ -83,8 +86,32 @@ fn report_select_error(e: &SelectError) {
 }
 
 /// `aproxy stop` 入口。
+///
+/// stop 的含义是「这个实例不该在运行」，所以目标已经不在运行、却还留着期望状态记录时
+/// （崩溃之后还没被拉回来），删掉记录就是这次 stop 的全部工作：restore 与看护者不再拉它。
 pub(crate) async fn handle_stop_cmd(target: Option<String>, threshold: Option<u64>, force: bool) {
     let mode = StopMode::from_force(force);
+    // 已停的目标：按端口或配置文件找到它留下的记录
+    match target::select(target.as_deref(), threshold, force).await {
+        Err(SelectError::NothingOnPort { port }) if forget_stopped_port(&port).await => {
+            println!(
+                "端口 {port} 的实例已不在运行；已删除它的期望状态记录，restore 与看护者不会再拉起它。"
+            );
+            return;
+        }
+        Err(SelectError::NotRunning { config_path, .. }) => {
+            let ports = forget_stopped_config(&config_path).await;
+            if !ports.is_empty() {
+                println!(
+                    "配置 {} 的实例已不在运行；已删除它的期望状态记录（端口 {}），restore 与看护者不会再拉起它。",
+                    config_path.display(),
+                    ports.join("、")
+                );
+                return;
+            }
+        }
+        _ => {}
+    }
     let targets = select_or_exit(target.as_deref(), threshold, force).await;
     // 任一目标没能确认停止 → 退出 1：脚本据此判断，不能把「请求已发、进程还在」
     // 报成成功
@@ -96,6 +123,23 @@ pub(crate) async fn handle_stop_cmd(target: Option<String>, threshold: Option<u6
                 report_stop_failure(info, &failure);
                 all_stopped = false;
             }
+        }
+    }
+    // stop all：连同已经不在运行的实例留下的记录一起清掉，之后 restore 没有可拉的东西
+    if target.as_deref() == Some("all") {
+        let (ports, unreadable) = forget_all_stopped().await;
+        if !ports.is_empty() {
+            println!(
+                "已删除不在运行的实例留下的期望状态记录（端口 {}）。",
+                ports.join("、")
+            );
+        }
+        for record in &unreadable {
+            eprintln!(
+                "保留了读不懂的记录 {}（{}）：多半由更新版本的 aproxy 写下，请用那个版本处理。",
+                record.path.display(),
+                record.reason
+            );
         }
     }
     if !all_stopped {

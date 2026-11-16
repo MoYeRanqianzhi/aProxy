@@ -12,6 +12,7 @@ pub mod proxy;
 pub mod retry;
 pub mod settings;
 pub mod spawn;
+pub mod spec;
 pub mod transform;
 pub mod watchdog;
 

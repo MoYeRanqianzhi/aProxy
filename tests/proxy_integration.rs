@@ -5000,10 +5000,7 @@ fn daemon_without_its_control_endpoint_exits_without_registering() {
     );
 
     let mut late = ChildGuard(
-        home.cmd()
-            .arg("--config")
-            .arg(&cfg_b)
-            .arg("--daemon-child")
+        home.serve_cmd(&cfg_b)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -5026,11 +5023,9 @@ fn daemon_without_its_control_endpoint_exits_without_registering() {
     let record = aproxy::daemon::read_instance_file_in(&run_dir, &port.to_string())
         .expect("前者的注册记录应还在");
     assert_eq!(record.pid, pid_a, "后来者不得覆盖前者的注册记录");
-    let restore = std::fs::read_to_string(aproxy::daemon::restore_file_path_in(
-        &run_dir,
-        &format!("127.0.0.1:{port}"),
-    ))
-    .unwrap();
+    let restore =
+        std::fs::read_to_string(aproxy::spec::restore_path_in(&run_dir, &port.to_string()))
+            .unwrap();
     assert!(
         restore.contains("a.toml"),
         "后来者不得覆盖前者的恢复记录: {restore}"
@@ -5081,10 +5076,7 @@ fn cli_config_show_rejects_missing_explicit_file() {
 /// 不用 `aproxy::daemon::spawn_detached`：它继承测试进程的环境，没法给单个
 /// 子进程注入 APROXY_HOME。分离启动那条路径由经 `aproxy start` 的测试覆盖。
 fn spawn_daemon_in(home: &TestHome, cfg: &std::path::Path) -> u32 {
-    home.cmd()
-        .arg("--config")
-        .arg(cfg)
-        .arg("--daemon-child")
+    home.serve_cmd(cfg)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -5519,7 +5511,7 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     // 不做前置清理：上次失败运行残留的守护属于那次的 tempdir home，控制端点
     // 按 run 目录划分命名空间，本次的 home 寻址不到它（也就不会误停别人的
     // 实例）；它仍占着的端口不会被 free_port 分出来
-    let restore_path = aproxy::daemon::restore_file_path_in(&run_dir, &format!("127.0.0.1:{port}"));
+    let restore_path = aproxy::spec::restore_path_in(&run_dir, &port.to_string());
 
     // 隔离启动：start 父进程注入 APROXY_HOME，守护隔代继承（port_zero 同款）。
     // start 自带就绪轮询，成功返回即守护已在注册表/恢复记录落盘。
@@ -5625,17 +5617,19 @@ fn port_zero_restore_record_uses_actual_port() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // 实际端口从注册表发现；恢复记录与注册表同键（实际端口）且先后落盘
-    //（先 .pid 后 .restore），轮询 .restore 出现即同时证明两者就位
+    // 实际端口从注册表发现；期望状态记录与注册表同键（实际端口）且先后落盘
+    //（先实例记录、后期望状态记录），轮询到期望状态记录出现即同时证明两者就位
     let run_dir = home.path().join("run");
     let mut info = None;
     for _ in 0..100 {
         if let Ok(entries) = std::fs::read_dir(&run_dir) {
             let record = entries
                 .flatten()
-                .find(|e| e.path().extension().and_then(|x| x.to_str()) == Some("restore"));
+                .find(|e| e.file_name().to_string_lossy().ends_with(".restore.json"));
             if let Some(record) = record {
-                let pid_path = record.path().with_extension("pid");
+                let name = record.file_name().to_string_lossy().into_owned();
+                let pid_path =
+                    run_dir.join(format!("{}.pid", name.trim_end_matches(".restore.json")));
                 info = Some((
                     serde_json::from_str::<aproxy::daemon::InstanceRecord>(
                         &std::fs::read_to_string(&pid_path).unwrap(),
@@ -5653,13 +5647,18 @@ fn port_zero_restore_record_uses_actual_port() {
     assert_ne!(port, "0", "实际端口应为系统分配值");
     assert_eq!(
         restore_path.file_name().unwrap().to_string_lossy(),
-        format!("{port}.restore"),
+        format!("{port}.restore.json"),
         "恢复记录必须按实际端口 {port} 命名"
     );
     assert!(
-        !run_dir.join("0.restore").exists(),
-        "不得按配置端口写出 0.restore"
+        !run_dir.join("0.restore.json").exists(),
+        "不得按配置端口写出 0.restore.json"
     );
+    // 规格里钉着实际端口：之后按这份记录恢复，回到的是同一个端口
+    let entry = aproxy::spec::read_restore_in(&run_dir, &port)
+        .unwrap()
+        .expect("期望状态记录应读得懂");
+    assert_eq!(entry.spec.pinned_port, port.parse().ok());
 
     home.stop_on_drop(port.parse().unwrap());
 
@@ -6061,12 +6060,7 @@ fn watchdog_respawns_killed_daemon() {
     // 带隔离环境启动守护：必须经 TestHome 逐子进程注入（spawn_detached 继承的是
     // 测试进程环境）——守护与看护者都要看到同一个 tempdir 注册表
     let mut daemon_child = home
-        .cmd()
-        .args([
-            "--config",
-            cfg_file.display().to_string().as_str(),
-            "--daemon-child",
-        ])
+        .serve_cmd(&cfg_file)
         .env("APROXY_WATCHDOG_SCAN_SECS", "1")
         .spawn()
         .expect("spawn 守护失败");
@@ -6086,8 +6080,7 @@ fn watchdog_respawns_killed_daemon() {
 
     // 启动看护进程（同一隔离 run 目录）
     let mut wd_child = home
-        .cmd()
-        .arg("--daemon-watchdog")
+        .watchdog_cmd()
         .env("APROXY_WATCHDOG_SCAN_SECS", "1")
         .spawn()
         .expect("spawn 看护者失败");
@@ -6150,12 +6143,7 @@ fn watchdog_respawns_on_death_event_and_force_stop_stays_stopped() {
         .build()
         .unwrap();
     let mut daemon_child = home
-        .cmd()
-        .args([
-            "--config",
-            cfg_file.display().to_string().as_str(),
-            "--daemon-child",
-        ])
+        .serve_cmd(&cfg_file)
         .env("APROXY_WATCHDOG_SCAN_SECS", "60")
         .spawn()
         .expect("spawn 守护失败");
@@ -6174,8 +6162,7 @@ fn watchdog_respawns_on_death_event_and_force_stop_stays_stopped() {
 
     // 看护者启动时先做一次收养扫描（不等扫描周期），之后才进入 60s 的循环
     let mut wd_child = ChildGuard(
-        home.cmd()
-            .arg("--daemon-watchdog")
+        home.watchdog_cmd()
             .env("APROXY_WATCHDOG_SCAN_SECS", "60")
             .spawn()
             .expect("spawn 看护者失败"),
@@ -6210,7 +6197,7 @@ fn watchdog_respawns_on_death_event_and_force_stop_stays_stopped() {
         !home
             .path()
             .join("run")
-            .join(format!("{port}.restore"))
+            .join(format!("{port}.restore.json"))
             .exists(),
         "强停后不应留下恢复记录"
     );
@@ -6252,12 +6239,7 @@ fn identity_check_tolerates_swapped_binary() {
         .unwrap();
 
     let mut daemon_child = home
-        .cmd_with(&bin)
-        .args([
-            "--config",
-            cfg_file.display().to_string().as_str(),
-            "--daemon-child",
-        ])
+        .serve_cmd_with(&bin, &cfg_file)
         .spawn()
         .expect("spawn 副本守护失败");
     let pid = daemon_child.id();
@@ -6312,8 +6294,7 @@ fn watchdog_lease_prevents_duplicate_watchdogs() {
     // 在任——后启动者应自行退出（选举唯一性）
     let home = TestHome::new();
     let watchdog = || {
-        home.cmd()
-            .arg("--daemon-watchdog")
+        home.watchdog_cmd()
             .env("APROXY_WATCHDOG_SCAN_SECS", "1")
             .spawn()
             .unwrap()
@@ -6817,10 +6798,7 @@ fn non_loopback_listen_warns_on_start_and_in_startup_log() {
     // 落进 startup.log。bind 失败即退出；万一本机真有该地址，超时后由本测试
     // 结束自己拉起的这个进程
     let mut child = home
-        .cmd()
-        .arg("--config")
-        .arg(&cfg_file)
-        .arg("--daemon-child")
+        .serve_cmd(&cfg_file)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

@@ -58,8 +58,8 @@ pub struct Settings {
     /// 的判定依据（距最近一次收到客户端请求）。默认 1800（30 分钟）。
     pub idle_timeout_secs: u64,
     /// 看门狗总开关：开启时 `aproxy start`/守护自检会确保存在一个全局看护进程
-    /// （同二进制以隐藏标记 `--daemon-watchdog` 分离启动），守护崩溃/挂死时按
-    /// .restore 记录自动重拉。
+    /// （同二进制以内部入口 `__watchdog` 分离启动），实例崩溃/挂死时按
+    /// 期望状态记录自动重拉。
     /// 看门狗是系统级单例（一个看护进程看护全部实例），故只在 settings 配置，
     /// config.toml 不参与。默认 true；false 时回到无看护行为（已运行实例不受
     /// 影响——守护与看护者完全解耦）。
@@ -73,7 +73,7 @@ pub struct Settings {
     /// 并杀+重拉。1 = 一轮超时即启动二意见确认。误杀调节阀，默认 1。
     pub watchdog_stale_after_cycles: u64,
     /// crashloop 上限：同一实例连续重拉失败达此次数后放弃（指数退避封顶 300s），
-    /// 保留 .restore 记录等人工 `aproxy restore`。默认 5。
+    /// 保留期望状态记录等人工 `aproxy restore`。默认 5。
     pub watchdog_max_restarts: u32,
     /// 看护者闲置自灭等待（秒）：全部实例清零（优雅停止/无人看护对象）后，看护者
     /// 再等待此时长即自行退出并清理 claim，系统回到零常驻。0 = 永不自灭。

@@ -1,7 +1,7 @@
 //! 看门狗（G2）核心原语：claim 选举、共享内存心跳（进程探活与身份等平台原语在 crate::process）。
 //!
 //! 架构（见 .agents/plan/watchdog-v1.md）：
-//! - **全局单看护进程**（同二进制以隐藏标记 `--daemon-watchdog` 分离启动）看护全部实例，
+//! - **全局单看护进程**（同二进制以内部入口 `aproxy __watchdog --home <dir>` 分离启动）看护全部实例，
 //!   内存 ~2-3MB 与实例数无关；等待全部下沉内核（线程池等进程句柄 +
 //!   周期扫描共享内存心跳表），自身零轮询线程。
 //! - **选举规范**：排序定发起者（发现看护者缺席时，存活实例中 PID 最小者
@@ -11,7 +11,7 @@
 //!   claim 文件存在 && PID 探活 && 进程创建时间匹配（防 PID 复用冒名）
 //!   && 心跳新鲜（兼测假死）。
 //!
-//! 看护主循环入口是本模块的 [`serve`]，由 main.rs 在 `--daemon-watchdog` 标记下调用
+//! 看护主循环入口是本模块的 [`serve`]，由 main.rs 在 `__watchdog` 入口下调用
 //! （没有公开的 `aproxy watchdog` 子命令）。
 
 use crate::process::{
@@ -230,13 +230,24 @@ fn may_spawn_watchdog(
     alive.iter().all(|&pid| my_pid <= pid)
 }
 
-/// 看护者 spawn 参数：从当前进程命令行还原（与 restore 同思路），
-/// 加上 --daemon-watchdog 标记。
-pub fn watchdog_spawn_args() -> Vec<String> {
-    let mut v: Vec<String> = std::env::args().skip(1).collect();
-    v.retain(|a| a != "--daemon-child" && a != "--foreground");
-    v.push("--daemon-watchdog".to_string());
-    v
+/// 用 `exe` 拉起 `home` 的看护者，返回它的 pid。命令行只有 `__watchdog --home <dir>`：
+/// 看护者要的一切都从 home 里读（settings.json、期望状态记录），启动者的参数与它无关，
+/// 其中的密钥更不该出现在一个常驻进程的命令行上。工作目录固定为 home。
+pub fn spawn_watchdog(exe: &Path, home: &Path) -> std::io::Result<u32> {
+    let args = [
+        "__watchdog".to_string(),
+        "--home".to_string(),
+        home.display().to_string(),
+    ];
+    let env = [("APROXY_HOME".to_string(), Some(home.display().to_string()))];
+    crate::daemon::spawn_detached_with(
+        exe,
+        &args,
+        &crate::daemon::Launch {
+            env: &env,
+            cwd: Some(home),
+        },
+    )
 }
 
 /// 看护者的心跳续写间隔（读取 settings，可注入覆盖供测试）。
@@ -372,7 +383,7 @@ impl WatchdogState {
     /// 返回本次新收养的端口（日志/测试断言用）。
     pub async fn adopt_scan(&mut self) -> Vec<String> {
         let mut adopted = Vec::new();
-        for entry in crate::daemon::list_restore_entries_in(&self.cfg.run_dir) {
+        for entry in crate::spec::list_restore_in(&self.cfg.run_dir).entries {
             // 已在看护的端口：只处理句柄缺失的条目（respawn 成功但 open 句柄
             // 失败的兜底——原注释「下轮补挂」曾因端口去重永远走不到，H1）。
             // 句柄有效则跳过（死亡 watcher 已挂，重复挂会双发死亡事件）。
@@ -386,7 +397,7 @@ impl WatchdogState {
                     // 对复用后的 pid 开句柄等于把无关进程纳入看护（之后还可能
                     // 被当挂死处决）。核验不过 = 收编的那个进程已不在：没有句柄
                     // 就永远等不到它的死亡事件，在这里补发一个，让它走常规死亡
-                    // 处置（.restore 在则重拉）而不是悬空占位。
+                    // 处置（期望状态记录在则重拉）而不是悬空占位。
                     if let RecordIdentity::Alive(_) = record_identity(pid, start) {
                         if let Some(h) = crate::process::open_sync_handle(pid) {
                             self.watched[idx].handle = h;
@@ -401,7 +412,7 @@ impl WatchdogState {
             // 实例身份建立（与二进制名称无关）：注册表记录按「pid + 登记创建
             // 时间」核验为「仍是写下它的那个守护」才收养（见
             // confirm_registered_instance）。不通过（刚死/pid 被复用）→ 跳过，
-            // 下轮再看（.restore 仍在，等 respawn 路径或真实实例出现）
+            // 下轮再看（期望状态记录仍在，等 respawn 路径或真实实例出现）
             let Some(info) = read_registry_info(&self.cfg.run_dir, &entry.port) else {
                 continue;
             };
@@ -487,11 +498,11 @@ impl WatchdogState {
         hung
     }
 
-    /// 处理死亡事件：.restore 缺失 = 优雅退出 → 摘除看护；.restore 在 = 崩溃
-    /// → 立即重拉（注册表 .pid 是否在不是判据——其他实例 respawn 的验活清理
-    /// 会顺带删掉本实例的死注册记录，混合态若据此判「优雅退出」会让崩溃实例
-    /// 静默失去自动恢复，P6 死亡风暴实测）。优雅退出会删 .restore（守护退出
-    /// 路径先 .restore 后 .pid，两 unlink 间死亡事件最多多拉一次，方向安全）。
+    /// 处理死亡事件：期望状态记录不在 = 用户 stop 了它 → 摘除看护；记录在 = 它应当在
+    /// 运行（崩溃、被信号结束、restart 途中）→ 立即重拉（注册表 .pid 是否在不是判据——
+    /// 其他实例 respawn 的验活清理会顺带删掉本实例的死注册记录，混合态若据此判「已停止」
+    /// 会让崩溃实例静默失去自动恢复，P6 死亡风暴实测）。stop 在实例退出之前就删掉记录
+    /// （shutdown 的应答发出之前、强制终止之前），所以死亡事件到来时判据已经就位。
     /// 重拉失败进退避队列（不 sleep——阻塞主循环会让 claim 心跳停摆、被竞争者
     /// 按「假死」夺权，M2），由 tick 的时间驱动重试。
     /// 返回处置结果（测试断言用）。
@@ -522,9 +533,9 @@ impl WatchdogState {
             return DeathOutcome::Reclaimed(new_pid);
         }
 
-        let restore_path = crate::daemon::restore_file_path_in(&self.cfg.run_dir, port);
+        let restore_path = crate::spec::restore_path_in(&self.cfg.run_dir, port);
         if !restore_path.is_file() {
-            tracing::info!(port = %port, "实例已优雅退出（无恢复记录），摘除看护");
+            tracing::info!(port = %port, "实例已被停止（没有期望状态记录），摘除看护");
             self.after_watch_removal();
             return DeathOutcome::GracefulExit;
         }
@@ -547,12 +558,12 @@ impl WatchdogState {
         }
 
         tracing::warn!(port = %port, "实例崩溃，立即重拉");
-        match respawn_instance(&self.cfg.run_dir, port).await {
+        match respawn_instance(&self.cfg.home, &self.cfg.run_dir, port).await {
             Ok((pid, actual_port)) => {
                 self.admit_respawned_at(port, &actual_port, pid);
                 DeathOutcome::Respawned(pid)
             }
-            Err(e) => self.queue_retry(port, failures, e),
+            Err(e) => self.queue_retry(port, failures, e.to_string()),
         }
     }
 
@@ -572,10 +583,15 @@ impl WatchdogState {
         for i in due.into_iter().rev() {
             let p = self.pending.remove(i);
             tracing::info!(port = %p.port, attempt = p.failures + 1, "退避到期，重试重拉");
-            match respawn_instance(&self.cfg.run_dir, &p.port).await {
+            match respawn_instance(&self.cfg.home, &self.cfg.run_dir, &p.port).await {
                 Ok((pid, actual_port)) => self.admit_respawned_at(&p.port, &actual_port, pid),
+                // 记录没了 = 用户在退避期间 stop 了它：不再是要恢复的实例，出队
+                Err(RespawnError::NoRecord) => {
+                    tracing::info!(port = %p.port, "期望状态记录已被删除（实例已被停止），不再重拉");
+                    self.after_watch_removal();
+                }
                 Err(e) => {
-                    self.queue_retry(&p.port, p.failures, e);
+                    self.queue_retry(&p.port, p.failures, e.to_string());
                 }
             }
         }
@@ -587,11 +603,11 @@ impl WatchdogState {
         self.pending.iter().map(|p| p.next_retry).min()
     }
 
-    /// 重拉成功后按**实际端口**收编（watchdog-01）：重拉用的是 .restore 里
-    /// 的原参数，但新守护监听哪个端口由它此刻读到的配置决定——用户改了
+    /// 重拉成功后按**实际端口**收编（watchdog-01）：重拉用的是期望状态记录里
+    /// 的拉起规格，但新实例监听哪个端口由它此刻读到的配置决定——用户改了
     /// config.toml 端口却没 restart、或 listen 端口为 0，新实例都会落在别的
     /// 端口。看护键必须是实际端口：若沿用死亡端口，同一 pid 会被死亡端口
-    /// 与（下轮 adopt_scan 收养的）实际端口双重看护；旧端口 .restore 也残留，
+    /// 与（下轮 adopt_scan 收养的）实际端口双重看护；旧端口的期望状态记录也残留，
     /// 用户 stop 新端口后看护者凭它把实例无限复活。实际端口与死亡端口不同
     /// 时，退役死亡端口的记录（旧进程已确认死亡，记录已被新实例取代）。
     fn admit_respawned_at(&mut self, dead_port: &str, actual_port: &str, pid: u32) {
@@ -649,12 +665,12 @@ impl WatchdogState {
         DeathOutcome::RespawnFailed
     }
 
-    /// crashloop 放弃：写 startup.log 大声报出，保留 .restore 人工兜底。
+    /// crashloop 放弃：写 startup.log 大声报出，保留期望状态记录人工兜底。
     fn give_up(&mut self, port: &str, failures: u32) -> DeathOutcome {
         tracing::error!(
             port = %port,
             attempts = failures,
-            "实例连续重拉失败达上限，放弃自动重拉（.restore 已保留，可 aproxy restore 手工恢复）"
+            "实例连续重拉失败达上限，放弃自动重拉（期望状态记录已保留，可 aproxy restore 手工恢复）"
         );
         crate::daemon::append_startup_log(&format!(
             "[watchdog] 端口 {port} 的实例连续重拉 {failures} 次失败，已放弃自动重拉；可执行 aproxy restore 手工恢复"
@@ -723,7 +739,7 @@ impl WatchdogState {
 
     /// 闲置自灭：全部实例清零（收养表空、退避队列空且注册表空）持续
     /// idle_exit_secs 后删除 claim 退出，系统回到零常驻。pending 非空 = 还有
-    /// 待重试的崩溃实例（.restore 在，期望恢复）——不算空闲，否则看护者会在
+    /// 待重试的崩溃实例（期望状态记录在，期望恢复）——不算空闲，否则看护者会在
     /// 长退避中自灭、崩溃实例失去重试（历史上 respawn 失败路径曾造成此态）。
     async fn maybe_idle_exit(&mut self) -> Tick {
         if self.cfg.idle_exit_secs == 0 {
@@ -841,44 +857,69 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// 按 .restore 记录重拉实例并等待就绪（8s，与 restore/start 一致）。
-/// 成功返回 (新 PID, 新实例实际监听的端口)——后者取自新 pid 的注册表记录
-/// （守护按 bind 后的实际地址自写），可能与 `port`（死亡端口）不同，调用方
-/// 据此决定看护键并退役旧端口记录（见 admit_respawned_at）。
-async fn respawn_instance(run_dir: &Path, port: &str) -> Result<(u32, String), String> {
-    let entries = crate::daemon::list_restore_entries_in(run_dir);
-    let entry = entries
-        .iter()
-        .find(|e| e.port == port)
-        .ok_or_else(|| "恢复记录不存在".to_string())?;
-    // 配置文件已被删的记录无法忠实恢复（与 aproxy restore 同语义）
-    if let Some(cfg) = entry
-        .args
-        .iter()
-        .position(|a| a == "--config")
-        .and_then(|i| entry.args.get(i + 1))
-        && !std::path::Path::new(cfg).exists()
-    {
-        crate::daemon::remove_restore_file_in(run_dir, port);
-        return Err(format!("配置文件已不存在: {cfg}"));
+/// 重拉没有成功的原因。
+#[derive(Debug)]
+enum RespawnError {
+    /// 这个端口没有期望状态记录：实例已被 stop
+    NoRecord,
+    /// 其余原因（记录读不懂、配置文件暂时不在、拉起失败或没等到就绪），文字给日志
+    Other(String),
+}
+
+impl std::fmt::Display for RespawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoRecord => f.write_str("期望状态记录不存在"),
+            Self::Other(reason) => f.write_str(reason),
+        }
     }
-    let exe = std::env::current_exe().map_err(|e| format!("无法定位自身可执行文件: {e}"))?;
-    // 就绪的判定按新 pid 在注册表里定位（见 crate::spawn）：重拉用 .restore 原参数，但配置
-    // 可能已被用户改动（换端口）——新守护监听新端口时 ping 旧端口永远不通（与 restart 同款
-    // 实测坑）。spawn_instance 只读注册表、不做 list_instances_in 那种验活清理：后者的副作用
+}
+
+/// 按期望状态记录重拉实例并等待就绪。成功返回 (新 PID, 新实例实际监听的端口)——后者
+/// 取自新 pid 的注册表记录（实例按 bind 后的实际地址自写），可能与 `port`（死亡端口）
+/// 不同，调用方据此决定看护键并退役旧端口记录（见 admit_respawned_at）。
+///
+/// 配置文件暂时找不到时不删记录，只报失败：网络盘挂载得晚、移动硬盘还没插上都是这种
+/// 情形，调用方照常排进退避队列，文件回来之后的那次重试就能拉起来。
+async fn respawn_instance(
+    home: &Path,
+    run_dir: &Path,
+    port: &str,
+) -> Result<(u32, String), RespawnError> {
+    let entry = match crate::spec::read_restore_in(run_dir, port) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return Err(RespawnError::NoRecord),
+        Err(reason) => {
+            return Err(RespawnError::Other(format!(
+                "期望状态记录读不懂（{reason}）"
+            )));
+        }
+    };
+    if let Some(cfg) = entry.spec.config_file()
+        && !cfg.exists()
+    {
+        return Err(RespawnError::Other(format!(
+            "配置文件暂时找不到: {}",
+            cfg.display()
+        )));
+    }
+    let exe = std::env::current_exe()
+        .map_err(|e| RespawnError::Other(format!("无法定位自身可执行文件: {e}")))?;
+    // 就绪的判定按新 pid 在注册表里定位（见 crate::spawn）：重拉用的是记录里的规格，但配置
+    // 可能已被用户改动（换端口）——新实例监听新端口时 ping 旧端口永远不通（与 restart 同款
+    // 实测坑）。spawn_from_spec 只读注册表、不做 list_instances_in 那种验活清理：后者的副作用
     // 会在轮询里顺带删掉同注册表其他死实例的记录，其死亡事件随后被混合态误判为优雅退出、静默
     // 失去自动恢复（P6 死亡风暴实测）。新实例启动即死时立即返回，不空等到时限，退避照常推进。
-    match crate::spawn::spawn_instance(run_dir, &exe, &entry.args, crate::spawn::READY_TIMEOUT)
-        .await
+    match crate::spawn::spawn_from_spec(home, &exe, &entry.spec, crate::spawn::READY_TIMEOUT).await
     {
         Ok(live) => Ok((
             live.instance.pid,
             crate::daemon::port_of(&live.instance.listen_addr).to_string(),
         )),
-        Err(e) => Err(format!(
+        Err(e) => Err(RespawnError::Other(format!(
             "{e}{}",
             e.startup_log().map(|l| l.excerpt()).unwrap_or_default()
-        )),
+        ))),
     }
 }
 
@@ -1222,6 +1263,20 @@ mod tests {
     #[cfg(any(windows, target_os = "linux"))]
     use crate::process::tests::{spawn_unrelated_child, wait_child_exit};
 
+    /// 给 `port` 写一份期望状态记录；规格指向一个不存在的配置文件（这些测试都不会
+    /// 真的拉起进程）。
+    fn write_restore(run_dir: &Path, port: &str) {
+        let spec = crate::spec::InstanceSpec {
+            schema: crate::spec::SCHEMA,
+            config_path: Some(run_dir.join("no-such-config.toml").display().to_string()),
+            overrides: Default::default(),
+            pinned_port: None,
+            env: Default::default(),
+            log_path: String::new(),
+        };
+        crate::spec::write_restore_in(run_dir, port, &spec).unwrap();
+    }
+
     fn test_cfg(dir: &Path) -> WatchdogConfig {
         WatchdogConfig {
             home: dir.to_path_buf(),
@@ -1437,7 +1492,7 @@ mod tests {
                 process_start,
             };
             crate::daemon::write_instance_file_in(dir.path(), &info).unwrap();
-            crate::daemon::write_restore_file_in(dir.path(), port, &[], "").unwrap();
+            write_restore(dir.path(), port);
         };
         write("59911", start); // 身份一致
         write("59912", start.wrapping_add(1)); // pid 复用模拟
@@ -1554,11 +1609,7 @@ mod tests {
         };
         crate::daemon::write_instance_file_in(dir, &info).unwrap();
         // restore 记录（崩溃信号）
-        let args: Vec<String> = vec![
-            "--config".to_string(),
-            "C:/tmp/no-such-config.toml".to_string(),
-        ];
-        crate::daemon::write_restore_file_in(dir, port, &args, "").unwrap();
+        write_restore(dir, port);
     }
 
     #[tokio::test]
@@ -1568,7 +1619,7 @@ mod tests {
         let mut st = WatchdogState::new(cfg);
         assert!(st.watched_ports().is_empty());
 
-        // 优雅退出：无 .restore → GracefulExit（不在看护表也返回 Unknown 先验证）
+        // 已被停止：没有期望状态记录 → GracefulExit（不在看护表也返回 Unknown 先验证）
         assert_eq!(st.handle_death("59901").await, DeathOutcome::Unknown);
 
         // 把伪实例直接塞进看护表（绕过 adopt 的真实进程探活）
@@ -1579,7 +1630,7 @@ mod tests {
             consecutive_failures: 0,
             start_time: 0,
         });
-        // 有注册表无 .restore → 优雅退出语义
+        // 有注册表、没有期望状态记录 → 已被停止
         let info = crate::daemon::InstanceRecord {
             pid: u32::MAX - 777,
             version: "t".into(),
@@ -1613,8 +1664,8 @@ mod tests {
         assert_eq!(st.handle_death(port).await, DeathOutcome::GaveUp);
         assert!(st.watched_ports().is_empty(), "放弃后应摘除看护");
         assert!(
-            crate::daemon::restore_file_path_in(dir.path(), port).is_file(),
-            ".restore 必须保留（人工 restore 兜底）"
+            crate::spec::restore_path_in(dir.path(), port).is_file(),
+            "期望状态记录必须保留（人工 restore 兜底）"
         );
     }
 
@@ -1651,23 +1702,29 @@ mod tests {
             st.pending[0].next_retry > std::time::Instant::now(),
             "退避 1s：next_retry 应在未来"
         );
-        // 配置不存在的失败路径：respawn_instance 已按既有语义删除 .restore
-        // （与 aproxy restore 清理无法恢复的记录一致），此处验证队列语义
+        // 配置文件找不到时记录留着：文件可能只是暂时不在（网络盘挂载得晚），回来之后的
+        // 那次重试要靠它
         assert!(
-            !crate::daemon::restore_file_path_in(dir.path(), port).is_file(),
-            "配置已删场景下 .restore 应被 respawn 清理（既有语义）"
+            crate::spec::restore_path_in(dir.path(), port).is_file(),
+            "配置文件暂时不在时不得删除期望状态记录"
         );
 
-        // 拨快到期重试：再次失败（恢复记录已不在）→ failures=2 继续入队
+        // 拨快到期重试：再次失败（配置仍不在）→ failures=2 继续入队
         st.pending[0].next_retry = std::time::Instant::now() - Duration::from_secs(1);
         st.process_pending_retries().await;
         assert_eq!(st.pending.len(), 1, "未达上限应继续入队");
         assert_eq!(st.pending[0].failures, 2, "失败计数跨重试周期累计");
+
+        // 退避期间用户 stop 了它（记录被删）：到期后直接出队，不再计失败、不再重拉
+        crate::spec::remove_restore_in(dir.path(), port);
+        st.pending[0].next_retry = std::time::Instant::now() - Duration::from_secs(1);
+        st.process_pending_retries().await;
+        assert!(st.pending.is_empty(), "记录已删的条目应出队");
     }
 
     #[tokio::test]
     async fn watchdog_state_pending_gives_up_at_limit() {
-        // 退避队列中累计到 max_restarts → GaveUp 且队列清空、.restore 保留
+        // 退避队列中累计到 max_restarts → GaveUp 且队列清空、期望状态记录保留
         let dir = tempfile::tempdir().unwrap();
         let port = "59904";
         write_crashed_instance(dir.path(), port);
@@ -1680,9 +1737,10 @@ mod tests {
         });
         st.process_pending_retries().await;
         assert!(st.pending.is_empty(), "放弃后队列应清空");
-        // 本用例配置文件也不存在：.restore 已被 respawn_instance 清理（既有
-        // 语义——无法忠实恢复的记录不留）。真实 crashloop（端口被占等）时
-        // .restore 保留，由集成测试 watchdog_respawns_killed_daemon 覆盖存活面。
+        assert!(
+            crate::spec::restore_path_in(dir.path(), port).is_file(),
+            "放弃自动重拉不删记录：人工 restore 还要用它"
+        );
     }
 
     #[tokio::test]

@@ -47,7 +47,7 @@ const NO_PROXY_LOOPBACK: &str = "127.0.0.1,localhost";
 ///   看护者，它带着 aproxy 二进制的镜像一直活到闲置自灭（默认 300 秒）——测试早已结束，它还
 ///   锁着构建产物，让随后的 cargo 重新链接失败，还会把测试里模拟崩溃的实例重新拉起来。要测
 ///   看护者的测试显式开启（[`settings`](Self::settings)），或者自己拉起
-///   `--daemon-watchdog`（看护者进程本身不看这个开关）。
+///   看护者（[`watchdog_cmd`](Self::watchdog_cmd)；看护者进程本身不看这个开关）。
 /// - [`cmd`](Self::cmd) / [`cmd_with`](Self::cmd_with) 返回已注入环境的 `Command`，见
 ///   [`cmd_with`](Self::cmd_with)。
 /// - 析构时先对 [`stop_on_drop`](Self::stop_on_drop) 登记过的每个端口执行一次
@@ -147,6 +147,60 @@ impl TestHome {
         }
         cmd.env("NO_PROXY", NO_PROXY_LOOPBACK)
             .env("no_proxy", NO_PROXY_LOOPBACK);
+        cmd
+    }
+
+    /// 直接以后台实例的入口（`aproxy __serve`）在这个 home 里运行一个实例的命令，不经
+    /// `aproxy start`：测试因此握着实例进程的句柄，能等它退出、读它的退出码、直接结束它
+    /// 来模拟崩溃。`cfg` 是它的配置文件。
+    pub fn serve_cmd(&self, cfg: impl AsRef<Path>) -> Command {
+        self.serve_cmd_with(APROXY, cfg)
+    }
+
+    /// 同 [`serve_cmd`](Self::serve_cmd)，但运行 `exe`。
+    ///
+    /// 拉起规格写成 `<home>/run/` 下的交接文件（真实的拉起方在实例就绪后删掉它，这里留给
+    /// 临时目录一起删）。规格里记的环境与 [`cmd_with`](Self::cmd_with) 注入的一致：代理
+    /// 变量记为没设、NO_PROXY 记为环回——实例把规格存进期望状态记录，之后 restart、看护者
+    /// 重拉会照它设置子进程的环境，不这样记，开发机环境里的代理变量就会在那时漏进去。
+    pub fn serve_cmd_with(&self, exe: impl AsRef<OsStr>, cfg: impl AsRef<Path>) -> Command {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let log_path = self
+            .home
+            .join("logs")
+            .join(format!("test-{}-{seq}.log", std::process::id()));
+        let mut spec = aproxy::spec::InstanceSpec::capture(
+            Some(cfg.as_ref()),
+            aproxy::config::Overrides::default(),
+            &log_path,
+        );
+        for (name, value) in spec.env.iter_mut() {
+            if PROXY_VARS.iter().any(|var| var.eq_ignore_ascii_case(name)) {
+                *value = None;
+            } else if name.eq_ignore_ascii_case("NO_PROXY") {
+                *value = Some(NO_PROXY_LOOPBACK.to_string());
+            }
+        }
+        let spec_path = aproxy::spec::write_spec_file(&self.home.join("run"), &spec).unwrap();
+        let mut cmd = self.cmd_with(exe);
+        cmd.arg("__serve")
+            .arg("--home")
+            .arg(&self.home)
+            .arg("--spec")
+            .arg(spec_path);
+        cmd
+    }
+
+    /// 直接以看护者的入口（`aproxy __watchdog`）在这个 home 里运行看护者的命令。
+    pub fn watchdog_cmd(&self) -> Command {
+        self.watchdog_cmd_with(APROXY)
+    }
+
+    /// 同 [`watchdog_cmd`](Self::watchdog_cmd)，但运行 `exe`。
+    pub fn watchdog_cmd_with(&self, exe: impl AsRef<OsStr>) -> Command {
+        let mut cmd = self.cmd_with(exe);
+        cmd.arg("__watchdog").arg("--home").arg(&self.home);
         cmd
     }
 

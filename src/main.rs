@@ -58,6 +58,14 @@ fn main() {
         commands::desktop::handle_desktop_cmd();
     }
 
+    // 内部入口 `__serve`、`__watchdog` 的 home 由命令行的 `--home` 定：拉起方操作的是哪个
+    // home，这个进程就属于哪个 home。写进本进程的 APROXY_HOME，之后一切按 home 寻址的
+    // 代码（以及它再拉起的子进程）看到的都是它
+    if let Some(Commands::Serve { home, .. } | Commands::Watchdog { home }) = &cli.command {
+        // SAFETY: 此刻进程里只有主线程——运行时还没建，也没有拉起任何线程
+        unsafe { std::env::set_var("APROXY_HOME", home) };
+    }
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -91,38 +99,19 @@ async fn run(cli: Cli) {
     // 的命令里兑现，见 commands::resolve_cfg_path
     let cfg_path = commands::resolve_cfg_path(&cli);
 
-    // 日志初始化：守护子进程无控制台，写日志文件；其余走 stdout（RUST_LOG 可覆盖）
-    if cli.daemon_child {
-        // 此刻配置尚未严格校验，用宽松 load + CLI 覆盖解析日志最终路径
-        // （CLI --log-file > config.toml log_file > 内置随机名）。随机名在此
-        // 一次性生成并写入 OnceLock，注册表/恢复记录/轮转共用同一份路径；
-        // 校验失败的错误会写入 startup.log（见 report_config_error），日志
-        // 初始化必须发生在校验之前——否则失败的启动连 startup.log 都写不出
-        let cfg = aproxy::ops::start::load_with_cli_overrides(
-            &cli,
-            &commands::require_cfg_path(cfg_path.clone()),
-        );
-        let log_path =
-            server::resolve_daemon_log_path(cli.log_file.as_deref(), cfg.log_file.as_deref());
-        server::init_daemon_logging(&log_path);
-    } else {
-        // 前台实例日志走控制台，无文件——OnceLock 落 None，serve_forever
-        // 据此在注册表/恢复记录里写空串 log_path（logs 命令据此立即报
-        // 「日志输出在它的控制台」，不再间接探测）
-        server::init_foreground_logging();
+    // 后台实例：按交接文件里的拉起规格承载服务，日志由它自己按规格初始化。排在
+    // settings 检查与续作拉起之前：这两件事都是给坐在终端前的人准备的，实例自己在解析
+    // 配置时检查 settings，结果写进 startup.log
+    if let Some(Commands::Serve { spec, .. }) = &cli.command {
+        commands::start::handle_serve_cmd(spec).await;
     }
 
-    // 守护子进程只承载服务，忽略转发来的子命令：start 父进程把完整命令行
-    // （含 `start <别名>`）转发给子进程，若子进程再进入 Start 分支会递归
-    // spawn 出套娃进程。分流必须先于子命令 match。
-    if cli.daemon_child {
-        commands::start::handle_start_cmd(&cli, cfg_path, None).await;
-        return;
-    }
+    // 其余命令的日志走 stdout（RUST_LOG 可覆盖）。前台实例没有日志文件，实例记录里的
+    // log_path 因此为空（logs 命令据此立即报「日志输出在它的控制台」）
+    server::init_foreground_logging();
 
-    // 看护进程：进入看护主循环（claim 接管 + 收养 + 健康扫描 + 重拉）。
-    // 同样忽略一切子命令（转发来的参数对看护者无意义）。
-    if cli.daemon_watchdog {
+    // 看护者：进入看护主循环（claim 接管 + 收养 + 健康扫描 + 重拉）。
+    if let Some(Commands::Watchdog { .. }) = &cli.command {
         // 进程台账（永久兼容契约 C3）：看护者在拉起任何子进程（重拉实例、续作安装）之前
         // 登记，强制安装据此先于实例结束它，免得它把刚结束的实例当成崩溃重新拉起
         let _ledger = util::register_in_ledger(
@@ -238,6 +227,9 @@ async fn run(cli: Cli) {
             commands::install::handle_install_cmd(args).await
         }
         Some(Commands::Desktop) => unreachable!("desktop 在 main 里、建运行时之前已经分派"),
+        Some(Commands::Serve { .. } | Commands::Watchdog { .. }) => {
+            unreachable!("内部入口在子命令分派之前已经处理")
+        }
         None => commands::start::handle_start_cmd(&cli, cfg_path, None).await,
     }
 }

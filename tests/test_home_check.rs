@@ -16,7 +16,16 @@
 use std::path::{Path, PathBuf};
 
 /// `Command::new` 可以直接拉起的外部程序（都不是 aproxy）
-const EXTERNAL_PROGRAMS: &[&str] = &["ping", "sleep", "tasklist", "ps", "taskkill", "kill"];
+const EXTERNAL_PROGRAMS: &[&str] = &[
+    "ping",
+    "sleep",
+    "tasklist",
+    "ps",
+    "taskkill",
+    "kill",
+    // Windows 上读一个进程的完整命令行（Get-CimInstance Win32_Process）
+    "powershell",
+];
 
 /// 例外：(相对 tests/ 的路径, 该行包含的片段, 原因)。整份文件的例外片段写空串。
 const ALLOWED: &[(&str, &str, &str)] = &[
@@ -33,7 +42,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     (
         "spawn_instance.rs",
         "std::env::set_var(\"APROXY_HOME\"",
-        "直接调用 aproxy::spawn::spawn_instance：它分离拉起的守护只继承测试进程的环境；\
+        "直接调用 aproxy::spawn::spawn_from_spec：就绪判定里的 IPC 寻址用测试进程的环境；\
          文件里只有一个测试，值是 TestHome 的路径",
     ),
     (

@@ -1,7 +1,7 @@
 //! `aproxy restart [PORT|all|ALIAS|idle [SECS]]`：重启运行中的实例。
 //!
 //! 语义边界（用户定调）：**只负责重启，不负责启动**——未运行的 target 提示
-//! 「未启动」并退出 1，绝不顺手拉起。重启本身（预检 → 停止 → 用原启动参数拉起 → 等就绪）
+//! 「未启动」并退出 1，绝不顺手拉起。重启本身（预检 → 停止 → 按原来的拉起规格拉起 → 等就绪）
 //! 在操作层 `aproxy::ops::restart`，先预检后停止的理由也写在那里；这里选目标、逐个重启、
 //! 把结果说给用户。`restart all` 逐实例处理，失败的跳过、其余照常重启，最后汇总并以非零
 //! 退出。
@@ -41,6 +41,11 @@ pub(crate) async fn handle_restart_cmd(
             }
             Err(failure) => {
                 match &failure {
+                    RestartFailure::Unsupported => {
+                        eprintln!(
+                            "端口 {port} 未重启：这个实例没有可用来重新拉起它的记录（前台运行的实例要在它自己的终端里重启），旧实例保持运行。"
+                        );
+                    }
                     RestartFailure::Precheck(reason) => {
                         eprintln!(
                             "端口 {port} 未重启：预检未通过，旧实例保持运行。\n{}",
@@ -59,13 +64,15 @@ pub(crate) async fn handle_restart_cmd(
                         config_path,
                     } => {
                         report_stopped(info, *stopped);
-                        // 旧实例的恢复记录已随停止删除，看门狗与 aproxy restore 都不会自动
-                        // 拉起它：把手动恢复的命令直接给出来
+                        // 期望状态记录还在：看护者会继续按它重拉，用户排除原因后也可以
+                        // 自己执行 restore
                         eprintln!(
-                            "端口 {port} 重启失败（旧实例已停止，该端口服务已中断）：{error}{}\n修正上述问题后执行以下命令恢复服务:\n  aproxy start --config \"{}\"",
+                            "端口 {port} 重启失败（旧实例已停止，该端口服务已中断）：{error}{}\n修正上述问题后执行 aproxy restore 恢复服务（看护者开着的话也会自动重试）。",
                             error.startup_log().map(|l| l.excerpt()).unwrap_or_default(),
-                            config_path.display()
                         );
+                        if let Some(path) = config_path {
+                            eprintln!("  配置: {}", path.display());
+                        }
                     }
                 }
                 failures.push((port, failure));
@@ -84,6 +91,7 @@ pub(crate) async fn handle_restart_cmd(
         );
         for (port, failure) in &failures {
             let state = match failure {
+                RestartFailure::Unsupported => "没有可用来重新拉起它的记录，旧实例保持运行",
                 RestartFailure::Precheck(_) => "预检未通过，旧实例保持运行",
                 RestartFailure::Stop(_) => "停止未确认，未启动新实例",
                 RestartFailure::Start { .. } => "旧实例已停止、新实例未就绪，服务已中断",
@@ -97,8 +105,8 @@ pub(crate) async fn handle_restart_cmd(
 /// 预检不通过的原因，说给用户听。
 fn precheck_reason(e: &PrecheckError) -> String {
     match e {
-        PrecheckError::ArgsUnparsable { reason } => {
-            format!("原启动参数无法被当前版本解析：{reason}")
+        PrecheckError::RecordUnreadable { reason } => {
+            format!("这个实例的期望状态记录读不懂：{reason}")
         }
         PrecheckError::ConfigMissing { path } => {
             format!("配置文件已不存在（{}）", path.display())

@@ -56,12 +56,7 @@ fn wait_daemon_ready(rt: &tokio::runtime::Runtime, port: u16, home_dir: &std::pa
 /// 在隔离主目录里直接启动守护子进程（--daemon-child，与 start 的 spawn 同一路径）；
 /// 返回进程句柄。
 fn spawn_daemon(home: &TestHome, cfg_file: &std::path::Path) -> std::process::Child {
-    home.cmd()
-        .args([
-            "--config",
-            cfg_file.display().to_string().as_str(),
-            "--daemon-child",
-        ])
+    home.serve_cmd(cfg_file)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -238,12 +233,7 @@ fn runtime() -> tokio::runtime::Runtime {
 /// （--daemon-child，与 start 的 spawn 同一路径）
 fn spawn_daemon_with(home: &TestHome, exe: &Path, cfg: &Path) -> ChildGuard {
     ChildGuard(
-        home.cmd_with(exe)
-            .args([
-                "--config",
-                cfg.display().to_string().as_str(),
-                "--daemon-child",
-            ])
+        home.serve_cmd_with(exe, cfg)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -256,8 +246,7 @@ fn spawn_daemon_with(home: &TestHome, exe: &Path, cfg: &Path) -> ChildGuard {
 fn spawn_watchdog(home: &TestHome, exe: &Path, log: &Path) -> ChildGuard {
     let out = std::fs::File::create(log).unwrap();
     ChildGuard(
-        home.cmd_with(exe)
-            .arg("--daemon-watchdog")
+        home.watchdog_cmd_with(exe)
             .env("APROXY_WATCHDOG_SCAN_SECS", "1")
             .env("NO_COLOR", "1")
             .stdout(Stdio::from(out))
@@ -307,24 +296,29 @@ fn text(bytes: &[u8]) -> String {
 }
 
 fn has_restore(home: &Path, port: u16) -> bool {
-    home.join("run").join(format!("{port}.restore")).is_file()
+    home.join("run")
+        .join(format!("{port}.restore.json"))
+        .is_file()
 }
 
 fn has_registry(home: &Path, port: u16) -> bool {
     home.join("run").join(format!("{port}.pid")).is_file()
 }
 
-/// run/ 下全部 .restore 记录的端口
+/// run/ 下全部期望状态记录的端口（读不懂的记录也算，按文件名取端口）
 fn restore_ports(home: &Path) -> Vec<String> {
-    std::fs::read_dir(home.join("run"))
-        .map(|rd| {
-            rd.flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("restore"))
-                .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
-                .collect()
-        })
-        .unwrap_or_default()
+    let listing = aproxy::spec::list_restore_in(&home.join("run"));
+    let mut ports: Vec<String> = listing.entries.into_iter().map(|e| e.port).collect();
+    ports.extend(listing.unreadable.into_iter().map(|u| {
+        u.path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .trim_end_matches(".restore.json")
+            .to_string()
+    }));
+    ports.sort();
+    ports
 }
 
 /// 按 pid 终止本测试拉起的进程（被看护者重拉/由 start 分离出去的进程不是
@@ -602,8 +596,8 @@ fn release_asset_named_instance_is_adopted_respawned_and_force_stoppable() {
         read_text(&wd_log)
     );
     assert!(
-        log_has(&wd_log, &["已优雅退出", &port_s]),
-        "看护者应按优雅退出摘除看护；日志:\n{}",
+        log_has(&wd_log, &["实例已被停止", &port_s]),
+        "看护者应按「已被停止」摘除看护；日志:\n{}",
         read_text(&wd_log)
     );
 }
@@ -671,10 +665,11 @@ fn watchdog_respawn_onto_changed_port_retires_old_record() {
 }
 
 // ---------------------------------------------------------------------------
-// 9. 端口 0（每次由系统分配）：崩溃重拉必然换端口，旧端口记录同样被清理
+// 9. 端口 0（由系统分配）：第一次拿到的端口钉在期望状态记录里，崩溃重拉回到同一个端口
+//    （客户端配的就是它），run/ 里始终只有一份期望状态记录
 // ---------------------------------------------------------------------------
 #[test]
-fn watchdog_respawn_with_port_zero_retires_old_record() {
+fn watchdog_respawn_with_port_zero_returns_to_the_same_port() {
     let test_home = TestHome::new();
     let home = test_home.path();
     let run = home.join("run");
@@ -727,12 +722,12 @@ fn watchdog_respawn_with_port_zero_retires_old_record() {
         read_text(&wd_log)
     );
     test_home.stop_on_drop(port_2);
-    assert_ne!(port_1, port_2, "端口 0 重拉应由系统分配到新端口");
-    assert!(
-        wait_for(Duration::from_secs(5), || !has_restore(home, port_1)),
-        "旧端口的恢复记录应被清理"
+    assert_eq!(port_1, port_2, "端口 0 的实例重拉后应回到钉住的端口");
+    assert_eq!(
+        restore_ports(home),
+        vec![port_1.to_string()],
+        "run/ 里应始终只有一份期望状态记录"
     );
-    assert!(has_restore(home, port_2), "新端口应有自己的恢复记录");
 
     let out = run_cli(&test_home, &exe, &["stop", &port_2.to_string()]);
     assert!(out.status.success(), "stop 新端口应成功");
@@ -771,7 +766,7 @@ fn restore_onto_changed_port_retires_old_record() {
     assert!(
         stdout.contains("已恢复")
             && stdout.contains(&port_b.to_string())
-            && stdout.contains("原端口的恢复记录已清理"),
+            && stdout.contains("原端口的记录已由新端口接替"),
         "restore 应报告实际端口并清理旧记录: {stdout}{}",
         text(&out.stderr)
     );
@@ -911,5 +906,498 @@ fn concurrent_start_with_release_asset_name_converges_to_one_watchdog() {
         )
         .is_ok_and(|i| i.instance.pid != victim)),
         "在任看护者应重拉资产名运行的实例"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 拉起规格与期望状态记录（按规格拉起、记录只有 stop 能删）
+// ---------------------------------------------------------------------------
+
+/// 读一个端口的期望状态记录里的拉起规格
+fn restore_spec(home: &Path, port: u16) -> Option<aproxy::spec::InstanceSpec> {
+    aproxy::spec::read_restore_in(&home.join("run"), &port.to_string())
+        .expect("期望状态记录应读得懂")
+        .map(|entry| entry.spec)
+}
+
+/// 一个只会回 200 的 HTTP 服务，数它收到了多少个请求。每个连接读完请求头再应答、应答后
+/// 关闭（不读就关会让 Windows 把应答连同 RST 一起丢掉）。返回它的地址与计数器。
+fn counting_http_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let counter = counter.clone();
+            std::thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => seen.extend_from_slice(&buf[..n]),
+                    }
+                }
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                );
+            });
+        }
+    });
+    (addr, hits)
+}
+
+/// 经实例发一个 GET，返回整个应答的文本
+fn http_get_via(port: u16, path: &str) -> String {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nconnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut out = String::new();
+    let _ = stream.read_to_string(&mut out);
+    out
+}
+
+/// 一个进程的完整命令行（给人看的那种：别的用户列进程时看到的就是它）
+fn process_command_line(pid: u32) -> String {
+    #[cfg(windows)]
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"),
+        ])
+        .output()
+        .expect("运行 powershell 失败");
+    #[cfg(unix)]
+    let out = std::process::Command::new("ps")
+        .args(["-ww", "-o", "args=", "-p", &pid.to_string()])
+        .output()
+        .expect("运行 ps 失败");
+    text(&out.stdout).trim().to_string()
+}
+
+/// 启动者环境里的代理变量记在拉起规格里：restart 是在另一个环境（没有这个变量）里执行的，
+/// 重拉出来的实例仍走同一个代理。只设大写的变量名——Windows 上变量名不分大小写，规格里
+/// 记的就是大写的那一个。
+#[test]
+fn restart_keeps_the_launchers_proxy_environment() {
+    let test_home = TestHome::new();
+    let home = test_home.path();
+    let exe = built_exe();
+    let (proxy_addr, hits) = counting_http_server();
+    let proxy_url = format!("http://{proxy_addr}");
+    let port = free_port();
+    let cfg = home.join("via-proxy.toml");
+    // 上游是一个解析不了的名字：请求只有经代理才到得了那个计数服务
+    std::fs::write(
+        &cfg,
+        format!("base_url = \"http://upstream.invalid\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
+    )
+    .unwrap();
+    test_home.stop_on_drop(port);
+
+    let out = cli(
+        &test_home,
+        &exe,
+        &["start", "--config", cfg.to_str().unwrap()],
+    )
+    .env("HTTP_PROXY", &proxy_url)
+    .output()
+    .unwrap();
+    assert!(out.status.success(), "start: {}", text(&out.stderr));
+    let spec = restore_spec(home, port).expect("后台实例应有期望状态记录");
+    assert_eq!(
+        spec.env.get("HTTP_PROXY"),
+        Some(&Some(proxy_url.clone())),
+        "规格应记下启动者的代理变量: {:?}",
+        spec.env
+    );
+    assert!(http_get_via(port, "/first").starts_with("HTTP/1.1 200"));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // restart 的环境里没有 HTTP_PROXY（TestHome 的命令一律删掉代理变量）
+    let old_pid = restore_pid(home, port);
+    let out = run_cli(&test_home, &exe, &["restart", &port.to_string()]);
+    assert!(out.status.success(), "restart: {}", text(&out.stderr));
+    assert_ne!(restore_pid(home, port), old_pid, "应是新进程");
+    assert!(http_get_via(port, "/second").starts_with("HTTP/1.1 200"));
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "重启后的实例应仍经启动者当时的代理出去"
+    );
+}
+
+/// 端口上应答控制通道的实例的 pid
+fn restore_pid(home: &Path, port: u16) -> u32 {
+    ipc_ping_in_dir(&runtime(), port, home)
+        .expect("实例应在线")
+        .instance
+        .pid
+}
+
+/// 密钥只经拉起规格的交接文件交给实例：实例与看护者的命令行上都没有它。
+#[test]
+fn secrets_never_reach_the_instance_or_watchdog_command_line() {
+    let test_home = TestHome::new();
+    test_home.settings(r#"{"watchdog": {"enabled": true}}"#);
+    let home = test_home.path();
+    let exe = built_exe();
+    let port = free_port();
+    let cfg = home.join("secret.toml");
+    write_cfg(&cfg, &format!("127.0.0.1:{port}"));
+    test_home.stop_on_drop(port);
+
+    const SECRET: &str = "sk-CMDLINESECRET-0123456789abcdef";
+    let out = cli(
+        &test_home,
+        &exe,
+        &[
+            "--api-key",
+            SECRET,
+            "start",
+            "--config",
+            cfg.to_str().unwrap(),
+        ],
+    )
+    .env("APROXY_WATCHDOG_SCAN_SECS", "1")
+    .output()
+    .unwrap();
+    assert!(out.status.success(), "start: {}", text(&out.stderr));
+
+    // 规格里有它（期望状态记录只有本用户能读），命令行上没有
+    let spec = restore_spec(home, port).unwrap();
+    assert_eq!(spec.overrides.api_key.as_deref(), Some(SECRET));
+    let instance_pid = restore_pid(home, port);
+    let cmdline = process_command_line(instance_pid);
+    assert!(cmdline.contains("__serve"), "实例的命令行: {cmdline}");
+    assert!(
+        !cmdline.contains("CMDLINESECRET"),
+        "实例的命令行: {cmdline}"
+    );
+
+    // 看护者：从台账里找到它
+    let mut watchdog_pid = None;
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            watchdog_pid = aproxy_ipc::ledger::read_all_in(home)
+                .into_iter()
+                .find(|found| found.entry.role == aproxy_ipc::ledger::ROLE_WATCHDOG)
+                .map(|found| found.entry.pid);
+            watchdog_pid.is_some()
+        }),
+        "start 应拉起看护者"
+    );
+    let cmdline = process_command_line(watchdog_pid.unwrap());
+    assert!(cmdline.contains("__watchdog"), "看护者的命令行: {cmdline}");
+    assert!(
+        !cmdline.contains("CMDLINESECRET"),
+        "看护者的命令行: {cmdline}"
+    );
+
+    // 看护者重拉出来的实例同样没有：崩溃一次再看
+    kill_own_pid(instance_pid, home);
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            ipc_ping_in_dir(&runtime(), port, home).is_ok_and(|i| i.instance.pid != instance_pid)
+        }),
+        "看护者应重拉实例"
+    );
+    let cmdline = process_command_line(restore_pid(home, port));
+    assert!(cmdline.contains("__serve"), "重拉实例的命令行: {cmdline}");
+    assert!(
+        !cmdline.contains("CMDLINESECRET"),
+        "重拉实例的命令行: {cmdline}"
+    );
+}
+
+/// 配置文件暂时找不到（网络盘还没挂上）时，restore 不删记录；文件回来之后再执行就恢复。
+#[test]
+fn restore_keeps_the_record_while_the_config_is_missing() {
+    let test_home = TestHome::new();
+    let home = test_home.path();
+    let exe = built_exe();
+    let rt = runtime();
+    let port = free_port();
+    let cfg = home.join("late-mount.toml");
+    write_cfg(&cfg, &format!("127.0.0.1:{port}"));
+    test_home.stop_on_drop(port);
+    let mut daemon = spawn_daemon_with(&test_home, &exe, &cfg);
+    assert!(wait_daemon_ready(&rt, port, home), "实例未就绪");
+    assert!(wait_for(Duration::from_secs(5), || has_restore(home, port)));
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+
+    let parked = home.join("late-mount.toml.away");
+    std::fs::rename(&cfg, &parked).unwrap();
+    let out = run_cli(&test_home, &exe, &["restore"]);
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("找不到") && stderr.contains("记录已保留"),
+        "应说明配置文件找不到、记录保留: {stderr}"
+    );
+    assert!(has_restore(home, port), "配置文件暂时不在时不得删记录");
+    assert!(ipc_ping_in_dir(&rt, port, home).is_err());
+
+    std::fs::rename(&parked, &cfg).unwrap();
+    let out = run_cli(&test_home, &exe, &["restore"]);
+    assert!(
+        text(&out.stdout).contains("已恢复"),
+        "文件回来之后应能恢复: {}{}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+    assert!(ipc_ping_in_dir(&rt, port, home).is_ok(), "实例应已恢复");
+}
+
+/// 没有配置文件、只靠覆盖旗标与 settings.json 全局默认启动的实例：规格里的配置路径为
+/// null，restart 与 restore 都不因为「没有配置文件」而拒绝它。
+#[test]
+fn instance_without_a_config_file_restarts_and_restores() {
+    let test_home = TestHome::new();
+    test_home.settings(
+        r#"{"watchdog": {"enabled": false},
+            "defaults": {"base_url": "https://defaults-only.example.com"}}"#,
+    );
+    let home = test_home.path();
+    let exe = built_exe();
+    let rt = runtime();
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}");
+    test_home.stop_on_drop(port);
+    assert!(!home.join("config.toml").exists());
+
+    let out = run_cli(&test_home, &exe, &["--listen", &listen]);
+    assert!(out.status.success(), "start: {}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("没有配置文件"),
+        "{}",
+        text(&out.stdout)
+    );
+    let spec = restore_spec(home, port).expect("应有期望状态记录");
+    assert_eq!(spec.config_path, None);
+    assert_eq!(spec.overrides.listen_addr.as_deref(), Some(listen.as_str()));
+    assert!(
+        !home.join("config.toml").exists(),
+        "启动不得凭空创建配置文件"
+    );
+
+    // restart
+    let first = restore_pid(home, port);
+    let out = run_cli(&test_home, &exe, &["restart", &port.to_string()]);
+    assert!(out.status.success(), "restart: {}", text(&out.stderr));
+    let second = restore_pid(home, port);
+    assert_ne!(first, second);
+
+    // 崩溃后 restore
+    kill_own_pid(second, home);
+    assert!(wait_for(Duration::from_secs(5), || {
+        ipc_ping_in_dir(&rt, port, home).is_err()
+    }));
+    let out = run_cli(&test_home, &exe, &["restore"]);
+    assert!(
+        text(&out.stdout).contains("已恢复"),
+        "restore: {}{}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+    let live = ipc_ping_in_dir(&rt, port, home).expect("实例应已恢复");
+    assert_eq!(live.instance.base_url, "https://defaults-only.example.com");
+}
+
+/// stop 的含义是「它不该在运行」：目标已经崩溃、只剩期望状态记录时，stop 删掉记录，
+/// 之后 restore 没有可拉的东西。按端口、按配置文件、`all` 三种写法都如此。
+#[test]
+fn stop_of_a_crashed_instance_deletes_its_record() {
+    let test_home = TestHome::new();
+    let home = test_home.path();
+    let exe = built_exe();
+    let rt = runtime();
+    let port = free_port();
+    let cfg = home.join("crashed.toml");
+    write_cfg(&cfg, &format!("127.0.0.1:{port}"));
+    test_home.stop_on_drop(port);
+    let port_s = port.to_string();
+
+    for target in [port_s.as_str(), cfg.to_str().unwrap(), "all"] {
+        let mut daemon = spawn_daemon_with(&test_home, &exe, &cfg);
+        assert!(wait_daemon_ready(&rt, port, home), "实例未就绪");
+        assert!(wait_for(Duration::from_secs(5), || has_restore(home, port)));
+        daemon.0.kill().unwrap();
+        daemon.0.wait().unwrap();
+        assert!(has_restore(home, port), "崩溃应留下期望状态记录");
+
+        let out = run_cli(&test_home, &exe, &["stop", target]);
+        assert!(
+            out.status.success(),
+            "stop {target}: {}{}",
+            text(&out.stdout),
+            text(&out.stderr)
+        );
+        assert!(
+            text(&out.stdout).contains("期望状态记录"),
+            "stop {target} 应说明删了记录: {}",
+            text(&out.stdout)
+        );
+        assert!(!has_restore(home, port), "stop {target} 应删掉记录");
+        let out = run_cli(&test_home, &exe, &["restore"]);
+        assert!(
+            text(&out.stdout).contains("没有需要恢复的实例"),
+            "stop {target} 之后 restore 不该再拉它: {}",
+            text(&out.stdout)
+        );
+        assert!(ipc_ping_in_dir(&rt, port, home).is_err());
+    }
+}
+
+/// 前台实例不写期望状态记录（关掉终端就是用户要它停下），也就没有可用来重启它的规格：
+/// restart 明确拒绝，旧实例不受影响。
+#[test]
+fn foreground_instance_has_no_record_and_restart_refuses_it() {
+    let test_home = TestHome::new();
+    let home = test_home.path();
+    let exe = built_exe();
+    let rt = runtime();
+    let port = free_port();
+    let cfg = home.join("fg.toml");
+    write_cfg(&cfg, &format!("127.0.0.1:{port}"));
+    test_home.stop_on_drop(port);
+    let fg = ChildGuard(
+        cli(
+            &test_home,
+            &exe,
+            &["--config", cfg.to_str().unwrap(), "--foreground"],
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap(),
+    );
+    assert!(wait_daemon_ready(&rt, port, home), "前台实例未就绪");
+    assert!(!has_restore(home, port), "前台实例不写期望状态记录");
+
+    let out = run_cli(&test_home, &exe, &["restart", &port.to_string()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("前台"),
+        "应说明前台实例不能这样重启: {}",
+        text(&out.stderr)
+    );
+    assert_eq!(restore_pid(home, port), fg.0.id(), "旧实例应原样在跑");
+}
+
+/// 端口 0 的实例第一次拿到的端口钉在规格里；配置后来改成了固定端口，restart 以配置为准，
+/// 钉住的端口作废，旧端口的记录由新端口的记录接替。
+#[test]
+fn pinned_port_gives_way_once_the_config_names_a_port() {
+    let test_home = TestHome::new();
+    let home = test_home.path();
+    let run = home.join("run");
+    let exe = built_exe();
+    let rt = runtime();
+    let cfg = home.join("pinned.toml");
+    write_cfg(&cfg, "127.0.0.1:0");
+    let daemon = spawn_daemon_with(&test_home, &exe, &cfg);
+    let pid = daemon.0.id();
+    let mut first = 0u16;
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            aproxy::daemon::registry_find_pid_in(&run, pid).is_some_and(|info| {
+                first = aproxy::daemon::port_of(&info.listen_addr).parse().unwrap();
+                true
+            })
+        }),
+        "实例未登记"
+    );
+    test_home.stop_on_drop(first);
+    assert!(wait_daemon_ready(&rt, first, home), "实例未就绪");
+    assert!(wait_for(Duration::from_secs(5), || has_restore(
+        home, first
+    )));
+    assert_eq!(restore_spec(home, first).unwrap().pinned_port, Some(first));
+
+    // 配置不变时 restart：回到钉住的端口
+    let out = run_cli(&test_home, &exe, &["restart", &first.to_string()]);
+    assert!(out.status.success(), "restart: {}", text(&out.stderr));
+    assert!(
+        ipc_ping_in_dir(&rt, first, home).is_ok(),
+        "应回到钉住的端口"
+    );
+    assert_eq!(restore_ports(home), vec![first.to_string()]);
+
+    // 配置改成固定端口
+    let fixed = free_port();
+    test_home.stop_on_drop(fixed);
+    write_cfg(&cfg, &format!("127.0.0.1:{fixed}"));
+    let out = run_cli(&test_home, &exe, &["restart", &first.to_string()]);
+    assert!(out.status.success(), "restart: {}", text(&out.stderr));
+    assert!(
+        ipc_ping_in_dir(&rt, fixed, home).is_ok(),
+        "应监听配置里的端口"
+    );
+    assert!(ipc_ping_in_dir(&rt, first, home).is_err());
+    assert_eq!(
+        restore_ports(home),
+        vec![fixed.to_string()],
+        "旧端口的记录应由新端口的记录接替"
+    );
+    assert_eq!(restore_spec(home, fixed).unwrap().pinned_port, None);
+}
+
+/// 实例脱离启动者：对启动它的那个进程组发 SIGINT（终端里按 Ctrl+C 就是这样），实例仍在。
+#[cfg(unix)]
+#[test]
+fn instance_survives_sigint_to_the_launchers_process_group() {
+    use std::os::unix::process::CommandExt;
+    let test_home = TestHome::new();
+    let home = test_home.path();
+    let exe = built_exe();
+    let rt = runtime();
+    let port = free_port();
+    let cfg = home.join("detached.toml");
+    write_cfg(&cfg, &format!("127.0.0.1:{port}"));
+    test_home.stop_on_drop(port);
+
+    // start 自成一个进程组：不脱离的话，它拉起的实例会留在这个组里
+    let mut start = cli(
+        &test_home,
+        &exe,
+        &["start", "--config", cfg.to_str().unwrap()],
+    );
+    start
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = start.spawn().unwrap();
+    let pgid = child.id();
+    assert!(child.wait().unwrap().success(), "start 应成功");
+    assert!(wait_daemon_ready(&rt, port, home), "实例未就绪");
+    let pid = restore_pid(home, port);
+
+    // 组里已经没有进程时 kill 会报错，这正是期望的结果，不看它的退出码
+    let _ = std::process::Command::new("kill")
+        .args(["-INT", "--", &format!("-{pgid}")])
+        .status();
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        ipc_ping_in_dir(&rt, port, home)
+            .map(|i| i.instance.pid)
+            .ok(),
+        Some(pid),
+        "发给启动者进程组的 SIGINT 不该停掉实例"
     );
 }

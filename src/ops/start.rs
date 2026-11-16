@@ -5,17 +5,37 @@
 use std::path::Path;
 
 use crate::cli::Cli;
-use crate::config::{self, Config};
+use crate::config::{self, Config, Overrides};
 use crate::daemon::{self, InstanceStatus};
 use crate::settings;
 use crate::spawn::{self, SpawnError};
+use crate::spec::InstanceSpec;
 
-/// 启动路径共用的配置解析：显式给出的配置路径必须存在（打错路径时明确报错，而不是悄悄用
-/// 默认配置启动），然后走分层解析（命令行覆盖 > config.toml > settings 的全局默认 > 内置
-/// 默认）。有 error 级诊断时不启动，Err 里逐条列出：哪个文件、哪个键、第几行。
-pub fn resolve_runtime_config(cli: &Cli, cfg_path: &Path) -> Result<Config, String> {
-    if cli.config.is_some() && !cfg_path.exists() {
-        return Err(format!("指定的配置文件不存在: {}", cfg_path.display()));
+/// 命令行上给的覆盖旗标。
+pub fn overrides_from_cli(cli: &Cli) -> Overrides {
+    Overrides {
+        base_url: cli.baseurl.clone(),
+        listen_addr: cli.listen.clone(),
+        proxy: cli.proxy.clone(),
+        api_key: cli.api_key.clone(),
+        log_file: cli.log_file.clone(),
+    }
+}
+
+/// 启动路径共用的配置解析：走分层解析（覆盖 > config.toml > settings 的全局默认 > 内置
+/// 默认）。`cfg_path` 为 None 表示没有配置文件，只有另外三层。有 error 级诊断时不启动，
+/// Err 里逐条列出：哪个文件、哪个键、第几行。
+///
+/// 给了路径而文件不在时同样是错误：调用方给出路径，就是认定这个文件应当在（命令行指定的、
+/// 别名指向的、拉起规格里记下的），悄悄按空配置启动只会得到一个行为不对的实例。
+pub fn resolve_runtime_config(
+    overrides: &Overrides,
+    cfg_path: Option<&Path>,
+) -> Result<Config, String> {
+    if let Some(path) = cfg_path
+        && !path.exists()
+    {
+        return Err(format!("配置文件不存在: {}", path.display()));
     }
     // 实例只在启动时读 settings.json：它无效时不带着内置默认悄悄启动——那样全局默认里的
     // 上游、限额都不生效，用户看到的是一个行为不对的实例，而不是一条说得清的错误
@@ -33,8 +53,12 @@ pub fn resolve_runtime_config(cli: &Cli, cfg_path: &Path) -> Result<Config, Stri
         ));
         return Err(msg);
     }
-    let resolved = resolve_layers(cli, cfg_path)
-        .map_err(|e| format!("读取配置文件失败: {e}\n文件: {}", cfg_path.display()))?;
+    let resolved = resolve_layers(overrides, cfg_path).map_err(|e| {
+        format!(
+            "读取配置文件失败: {e}\n文件: {}",
+            cfg_path.unwrap_or_else(|| Path::new("")).display()
+        )
+    })?;
     // 告警级的诊断（例如全局默认的凭据没有被继承）与扣下的凭据，记进日志
     for d in resolved.diagnostics.iter().filter(|d| !d.is_error()) {
         tracing::warn!(code = d.code, "{}", render_diagnostic(d));
@@ -56,10 +80,12 @@ pub fn resolve_runtime_config(cli: &Cli, cfg_path: &Path) -> Result<Config, Stri
         msg.push_str("\n  ");
         msg.push_str(&render_diagnostic(d));
     }
-    msg.push_str(&format!(
-        "\n\n请修改后重试。上游地址可以这样设置:\n  aproxy config --baseurl https://api.anthropic.com\n  或手动编辑 {}",
-        cfg_path.display()
-    ));
+    msg.push_str(
+        "\n\n请修改后重试。上游地址可以这样设置:\n  aproxy config --baseurl https://api.anthropic.com",
+    );
+    if let Some(path) = cfg_path {
+        msg.push_str(&format!("\n  或手动编辑 {}", path.display()));
+    }
     Err(msg)
 }
 
@@ -80,29 +106,28 @@ pub fn render_diagnostic(d: &aproxy_ipc::diag::Diagnostic) -> String {
     line
 }
 
-/// 分层解析一份配置：命令行覆盖、config.toml、settings.json 的全局默认、内置默认。
-fn resolve_layers(cli: &Cli, cfg_path: &Path) -> std::io::Result<config::Resolved> {
-    let overrides = config::Overrides {
-        base_url: cli.baseurl.clone(),
-        listen_addr: cli.listen.clone(),
-        proxy: cli.proxy.clone(),
-        api_key: cli.api_key.clone(),
-        log_file: cli.log_file.clone(),
-    };
+/// 分层解析一份配置：覆盖、config.toml、settings.json 的全局默认、内置默认。没有配置文件
+/// （`cfg_path` 为 None）时只有另外三层。
+fn resolve_layers(
+    overrides: &Overrides,
+    cfg_path: Option<&Path>,
+) -> std::io::Result<config::Resolved> {
     let defaults =
         config::resolve::Defaults::from_settings(&settings::load(), &settings::settings_path());
-    config::resolve(cfg_path, &overrides, &defaults)
+    match cfg_path {
+        Some(path) => config::resolve(path, overrides, &defaults),
+        None => Ok(config::resolve::resolve_without_file(overrides, &defaults)),
+    }
 }
 
-/// 宽松地解析配置（不因诊断而失败）：守护子进程初始化日志时用。此刻配置还没有校验过，
-/// 即使它有问题，也要能定出日志写到哪里（优先级：命令行 `--log-file`、config.toml 的
-/// `log_file`、内置的随机名），这样问题才有地方记。启动的严格路径是
+/// 宽松地解析配置（不因诊断而失败）：后台实例初始化日志时用。此刻配置还没有校验过，
+/// 即使它有问题，也要能定出日志写到哪里，这样问题才有地方记。启动的严格路径是
 /// [`resolve_runtime_config`]，两者走同一条解析管线，对监听地址与日志路径的认知一致。
-pub fn load_with_cli_overrides(cli: &Cli, cfg_path: &Path) -> Config {
-    match resolve_layers(cli, cfg_path) {
+pub fn load_lenient(overrides: &Overrides, cfg_path: Option<&Path>) -> Config {
+    match resolve_layers(overrides, cfg_path) {
         Ok(resolved) => resolved.config,
         Err(e) => {
-            tracing::warn!(path = %cfg_path.display(), error = %e, "读取配置文件失败，使用默认配置");
+            tracing::warn!(error = %e, "读取配置文件失败，使用默认配置");
             Config::default()
         }
     }
@@ -173,37 +198,12 @@ pub async fn preflight(listen_addr: &str) -> Result<Preflight, PreflightError> {
     Ok(Preflight::Clear)
 }
 
-/// 后台拉起实例并等它就绪：分离子进程承载服务，命令行参数原样转发。
-///
-/// `args` 是本次启动的命令行（不含程序名）。其中 `--config` 的值统一改写为 `cfg_path`
-/// （绝对路径）：普通启动时这只是把相对路径转绝对（注册表与子进程的文件读取不依赖工作
-/// 目录）；按别名或路径启动时命令行里根本没有 `--config`，解析出的路径只有调用方知道，
-/// 必须在此注入，否则守护子进程会回退默认配置。
-///
-/// 就绪判定与「启动即死」的报告见 [`crate::spawn`]：按新 pid 在注册表里定位实际端口（监听
-/// 端口 0 由系统分配时同样等到就绪、报出实际地址），子进程提前退出时立即报告，附上
-/// startup.log 本次新增的内容。实例就绪后顺带确保看护者在任。
-pub async fn launch(
-    exe: &Path,
-    mut args: Vec<String>,
-    cfg_path: &Path,
-) -> Result<InstanceStatus, SpawnError> {
-    let cfg_str = cfg_path.display().to_string();
-    match args.iter().position(|a| a == "--config") {
-        Some(i) => {
-            if let Some(val) = args.get_mut(i + 1) {
-                *val = cfg_str;
-            }
-        }
-        None => match args.iter().position(|a| a.starts_with("--config=")) {
-            Some(i) => args[i] = format!("--config={cfg_str}"),
-            None => {
-                args.push("--config".to_string());
-                args.push(cfg_str);
-            }
-        },
-    }
-    let live = spawn::spawn_instance(&daemon::run_dir(), exe, &args, spawn::READY_TIMEOUT).await?;
+/// 后台拉起实例并等它就绪（见 [`crate::spawn`]：按新 pid 定位实际端口，监听端口 0 由
+/// 系统分配时同样等到就绪、报出实际地址；子进程提前退出时立即报告，附上 startup.log 本次
+/// 新增的内容）。实例就绪后顺带确保看护者在任。
+pub async fn launch(exe: &Path, spec: &InstanceSpec) -> Result<InstanceStatus, SpawnError> {
+    let home = aproxy_ipc::home::home();
+    let live = spawn::spawn_from_spec(&home, exe, spec, spawn::READY_TIMEOUT).await?;
     // 看护者出簇（watchdog 总开关，settings 层）：实例就绪后确保存在看护者。
     // 选举规范防止多实例并发 start 时的重复拉起：claim 有效让位；缺席时仅
     // 存活实例 PID 最小者有权 spawn；claim 原子接管最终裁决唯一性。
@@ -227,8 +227,7 @@ fn ensure_watchdog_if_enabled(exe: &Path) {
         return; // 有更小 PID 的存活实例，拉起是它的事（其自检/该实例 start 兜底）
     }
     crate::watchdog::remove_claim_in(&run_dir); // 清理无效残留 claim
-    let args = crate::watchdog::watchdog_spawn_args();
-    match daemon::spawn_detached(exe, &args) {
+    match crate::watchdog::spawn_watchdog(exe, &aproxy_ipc::home::home()) {
         Ok(pid) => tracing::info!(pid, "看护者已随实例启动拉起"),
         Err(e) => tracing::warn!(error = %e, "看护者拉起失败（守护自检会补种）"),
     }

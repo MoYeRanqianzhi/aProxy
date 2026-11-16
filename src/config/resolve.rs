@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use aproxy_ipc::diag::{Diagnostic, Level};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::file::{self, Delivery, FileConfig, FormatEntry, Process, Stage};
@@ -23,12 +23,20 @@ use super::{Config, TransformConfig, TransformMode};
 use crate::settings::Settings;
 
 /// 启动时在命令行上给的覆盖，优先于文件。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// 它也是拉起规格（[`crate::spec::InstanceSpec`]）里 `overrides` 的落盘形式：字段名就是
+/// config.toml 的键，只写出给过的那些。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Overrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_file: Option<String>,
 }
 
@@ -123,6 +131,18 @@ pub fn resolve(
         defaults,
         env_proxy_is_set(),
     ))
+}
+
+/// 没有配置文件时的解析：只剩覆盖、全局默认与内置默认三层。诊断里的文件名写 `config.toml`
+/// （这一层没有内容，不会有指向它的诊断，名字只是占位）。
+pub fn resolve_without_file(overrides: &Overrides, defaults: &Defaults) -> Resolved {
+    resolve_text(
+        None,
+        Path::new("config.toml"),
+        overrides,
+        defaults,
+        env_proxy_is_set(),
+    )
 }
 
 /// HTTP 客户端在没配置代理时会读的环境变量里，有没有设了值的。

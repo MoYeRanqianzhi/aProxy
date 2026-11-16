@@ -106,31 +106,49 @@ fn apply_observed(
     home: &Path,
     defaults: &Defaults,
     changes: &[Change],
-    mut before_recheck: impl FnMut(),
+    before_recheck: impl FnMut(),
 ) -> Result<Applied, EditError> {
+    rewrite_locked(path, home, false, before_recheck, |old, file| {
+        apply_to_text(old.unwrap_or(""), file, defaults, changes)
+    })
+}
+
+/// 在写锁之内改写一个文件：读入、交给 `transform` 算出新内容、落盘前再读一次核对没有外部
+/// 修改（有就从头再来，最多 [`MAX_ATTEMPTS`] 次）、原子写回。config.toml 与 settings.json
+/// 共用这一套，两种文件的写者也就排在同一把锁上。
+///
+/// `transform` 拿到的是文件现在的内容（不存在时为 None）与实际要写的路径，返回新内容；新
+/// 内容与旧内容相同时不写文件。`private` 为真时按含密钥的文件来写（见
+/// [`crate::fsx::write_atomic_private`]）。
+pub(crate) fn rewrite_locked<E: From<EditError>>(
+    path: &Path,
+    home: &Path,
+    private: bool,
+    mut before_recheck: impl FnMut(),
+    mut transform: impl FnMut(Option<&str>, &Path) -> Result<String, E>,
+) -> Result<Applied, E> {
     let _lock = lock(home)?;
     let file = real_target(path);
     for _ in 0..MAX_ATTEMPTS {
-        let before = read_optional(&file)?;
-        let old = before.as_deref().unwrap_or("");
-        let new = apply_to_text(old, &file, defaults, changes)?;
-        if new == old {
+        let before = read_optional(&file).map_err(EditError::Io)?;
+        let new = transform(before.as_deref(), &file)?;
+        if before.as_deref().unwrap_or("") == new {
             return Ok(Applied {
                 file,
                 changed: false,
             });
         }
         before_recheck();
-        if read_optional(&file)? != before {
+        if read_optional(&file).map_err(EditError::Io)? != before {
             continue;
         }
-        write_with_retry(&file, new.as_bytes())?;
+        write_with_retry(&file, new.as_bytes(), private).map_err(EditError::Io)?;
         return Ok(Applied {
             file,
             changed: true,
         });
     }
-    Err(EditError::Conflict)
+    Err(EditError::Conflict.into())
 }
 
 /// 把 `changes` 应用到文本上并校验结果，返回新的文本。不碰文件系统。
@@ -307,10 +325,17 @@ fn read_optional(path: &Path) -> std::io::Result<Option<String>> {
 
 /// 原子写。Windows 上目标被别的进程短暂开着（编辑器、杀毒软件）时 rename 会被拒绝，
 /// 退避着重试几次。
-fn write_with_retry(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_with_retry(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<()> {
+    let write = |path: &Path, bytes: &[u8]| {
+        if private {
+            crate::fsx::write_atomic_private(path, bytes)
+        } else {
+            crate::fsx::write_atomic(path, bytes)
+        }
+    };
     let mut delay = Duration::from_millis(20);
     for _ in 0..5 {
-        match crate::fsx::write_atomic(path, bytes) {
+        match write(path, bytes) {
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 std::thread::sleep(delay);
                 delay *= 2;
@@ -318,7 +343,7 @@ fn write_with_retry(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             result => return result,
         }
     }
-    crate::fsx::write_atomic(path, bytes)
+    write(path, bytes)
 }
 
 #[cfg(test)]

@@ -18,8 +18,8 @@ use aproxy_ipc::diag::{Diagnostic, Level};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use super::file::{self, Delivery, FileConfig, FormatEntry, Process, RetryRule, Stage};
-use super::{Config, KeepaliveTrigger, TransformConfig, TransformMode};
+use super::file::{self, Delivery, FileConfig, FormatEntry, Process, Stage};
+use super::{Config, TransformConfig, TransformMode};
 use crate::settings::Settings;
 
 /// 启动时在命令行上给的覆盖，优先于文件。
@@ -53,73 +53,31 @@ pub enum Source {
 pub struct Defaults {
     pub file: PathBuf,
     pub values: FileConfig,
-    /// 读这一层时就发现的问题
-    pub diagnostics: Vec<Diagnostic>,
 }
 
 impl Defaults {
-    /// 从 settings.json 取全局默认。settings 里与内置默认相同的值不算「来自 settings」：
-    /// settings 的这些字段总有值，分不出用户写没写，只能按值判断。
+    /// settings.json 的 `defaults` 段就是这一层。
     pub fn from_settings(settings: &Settings, file: &Path) -> Self {
-        let mut values = FileConfig::default();
-        let mut diagnostics = Vec::new();
-        if settings.max_body_mb != super::DEFAULT_MAX_BODY_MB {
-            values.max_request_mb = Some(settings.max_body_mb);
-        }
-        if settings.disk_cache != super::DEFAULT_DISK_CACHE {
-            values.disk_cache = Some(settings.disk_cache);
-        }
-        if settings.forward_only != super::DEFAULT_FORWARD_ONLY {
-            values.delivery = Some(if settings.forward_only {
-                Delivery::Forward
-            } else {
-                Delivery::Retry
-            });
-        }
-        if !settings.bounded_retry_paths.is_empty() {
-            values.retry.rules = Some(
-                settings
-                    .bounded_retry_paths
-                    .iter()
-                    .map(|path| RetryRule {
-                        path: Some(path.clone()),
-                        status: None,
-                        max_attempts: crate::retry::BOUNDED_RETRY_MAX_ATTEMPTS,
-                    })
-                    .collect(),
-            );
-        }
-        if !settings.allowed_hosts.is_empty() {
-            values.allowed_hosts = Some(settings.allowed_hosts.clone());
-        }
-        if !settings.allowed_origins.is_empty() {
-            values.allowed_origins = Some(settings.allowed_origins.clone());
-        }
-        match KeepaliveTrigger::parse(&settings.keepalive_trigger) {
-            Some(trigger) if trigger != super::DEFAULT_KEEPALIVE_TRIGGER => {
-                values.keepalive.trigger = Some(trigger)
-            }
-            Some(_) => {}
-            None => diagnostics.push(Diagnostic {
-                code: "config_invalid_value",
-                severity: Level::Error,
-                file: file.display().to_string(),
-                key: Some("keepalive_trigger".to_string()),
-                line: None,
-                column: None,
-                message: format!(
-                    "keepalive_trigger must be \"accept\", \"body_stream\" or \"any\", not {:?}",
-                    settings.keepalive_trigger
-                ),
-                details: reason_details("not_one_of"),
-            }),
-        }
         Defaults {
             file: file.to_path_buf(),
-            values,
-            diagnostics,
+            values: settings.defaults.clone(),
         }
     }
+}
+
+/// 全局默认里一项没有被继承的凭据：这份配置最终的目标与默认值所属的目标不同。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Withheld {
+    /// 键路径：`api_key`、`proxy_username`、`proxy_password`，或 `extra_headers.<头名>`
+    pub key: String,
+    /// 这项凭据写在哪一层，现在只有 `settings`
+    pub from: &'static str,
+    /// `base_url_differs` 或 `proxy_differs`
+    pub reason: &'static str,
+    /// 默认值所属的目标，已打码
+    pub default_target: String,
+    /// 这份配置最终的目标，已打码；没有目标时为空串
+    pub target: String,
 }
 
 /// 分层解析的结果。
@@ -129,6 +87,8 @@ pub struct Resolved {
     /// 键路径 → 来源。只列有值的键：没设置、也没有内置默认的键（例如 `api_key`）不在里面。
     /// 头表按头名各记一项：`extra_headers.<头名>`。
     pub sources: BTreeMap<String, Source>,
+    /// 全局默认里没有被继承的凭据（见 [`Withheld`]）
+    pub withheld: Vec<Withheld>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -192,7 +152,6 @@ pub fn resolve_text(
         Some(text) => file::parse(text, path),
         None => (FileConfig::default(), Vec::new()),
     };
-    diagnostics.extend(defaults.diagnostics.iter().cloned());
     let d = &defaults.values;
     let o = overrides;
     let builtin = Config::default();
@@ -201,24 +160,108 @@ pub fn resolve_text(
 
     let base_url = pick(s, "base_url", &o.base_url, &f.base_url, &d.base_url);
     let listen_addr = pick(s, "listen_addr", &o.listen_addr, &f.listen_addr, &None);
-    let api_key = pick(s, "api_key", &o.api_key, &f.api_key, &d.api_key);
     let proxy = pick(s, "proxy", &o.proxy, &f.proxy, &d.proxy);
+
+    // 凭据只发给它所属的目标：全局默认里的 api_key 与密钥头只在这份配置最终的 base_url 与
+    // 默认的 base_url 指向同一目标时继承，代理口令只在最终的 proxy 与默认的 proxy 指向同一
+    // 目标时继承。否则指向别家上游的配置会悄悄带上全局的 key，把 A 家的 key 发给 B 家。
+    // 没继承的列进 withheld；这份配置自己也没有这一项时另给一条告警，不然用户只会看到 401
+    let mut withheld: Vec<Withheld> = Vec::new();
+    let base_matches = match (&base_url, &d.base_url) {
+        (Some(target), Some(default)) => same_base_url(target, default),
+        _ => false,
+    };
+    let proxy_matches = match (&proxy, &d.proxy) {
+        (Some(target), Some(default)) => same_proxy(target, default),
+        _ => false,
+    };
+    let base_withheld = |key: String| Withheld {
+        key,
+        from: "settings",
+        reason: "base_url_differs",
+        default_target: d
+            .base_url
+            .as_deref()
+            .map(target_for_display)
+            .unwrap_or_default(),
+        target: base_url
+            .as_deref()
+            .map(target_for_display)
+            .unwrap_or_default(),
+    };
+    let none = None;
+    let default_api_key = if base_matches { &d.api_key } else { &none };
+    if d.api_key.is_some() && !base_matches {
+        withheld.push(base_withheld("api_key".to_string()));
+    }
+    let api_key = pick(s, "api_key", &o.api_key, &f.api_key, default_api_key);
+    // 两张默认头表：目标不同时扣下其中的密钥头，其余的头照常继承
+    let mut default_headers = [d.extra_headers.clone(), d.override_headers.clone()];
+    if !base_matches {
+        for (table, headers) in ["extra_headers", "override_headers"]
+            .into_iter()
+            .zip(default_headers.iter_mut())
+        {
+            let Some(headers) = headers else { continue };
+            let secret: Vec<String> = headers
+                .keys()
+                .filter(|name| aproxy_ipc::redact::is_secret_header(name))
+                .cloned()
+                .collect();
+            for name in secret {
+                headers.remove(&name);
+                withheld.push(base_withheld(format!(
+                    "{table}.{}",
+                    super::quote_key(&name)
+                )));
+            }
+        }
+    }
+    let [default_extra_headers, default_override_headers] = default_headers;
     if proxy.is_none() && env_proxy {
         s.insert("proxy".to_string(), Source::Env);
     }
+    for (key, value) in [
+        ("proxy_username", &d.proxy_username),
+        ("proxy_password", &d.proxy_password),
+    ] {
+        if value.is_some() && !proxy_matches {
+            withheld.push(Withheld {
+                key: key.to_string(),
+                from: "settings",
+                reason: "proxy_differs",
+                default_target: d
+                    .proxy
+                    .as_deref()
+                    .map(target_for_display)
+                    .unwrap_or_default(),
+                target: proxy.as_deref().map(target_for_display).unwrap_or_default(),
+            });
+        }
+    }
+    let default_proxy_username = if proxy_matches {
+        &d.proxy_username
+    } else {
+        &none
+    };
+    let default_proxy_password = if proxy_matches {
+        &d.proxy_password
+    } else {
+        &none
+    };
     let proxy_username = pick(
         s,
         "proxy_username",
         &None,
         &f.proxy_username,
-        &d.proxy_username,
+        default_proxy_username,
     );
     let proxy_password = pick(
         s,
         "proxy_password",
         &None,
         &f.proxy_password,
-        &d.proxy_password,
+        default_proxy_password,
     );
     let log_file = pick(s, "log_file", &o.log_file, &f.log_file, &None);
     let delivery = pick_or(s, "delivery", &f.delivery, &d.delivery, Delivery::Retry);
@@ -247,12 +290,12 @@ pub fn resolve_text(
             builtin.listen_addr.clone()
         }),
         api_key,
-        extra_headers: merge_headers(s, "extra_headers", &f.extra_headers, &d.extra_headers),
+        extra_headers: merge_headers(s, "extra_headers", &f.extra_headers, &default_extra_headers),
         override_headers: merge_headers(
             s,
             "override_headers",
             &f.override_headers,
-            &d.override_headers,
+            &default_override_headers,
         ),
         keepalive_interval_secs: pick_or(
             s,
@@ -358,19 +401,25 @@ pub fn resolve_text(
             (Some(Source::Toml), Some(text)) => file::locate(text, &problem.key),
             _ => None,
         };
-        let (file, message) = match source {
-            Some(Source::Settings) => (defaults.file.as_path(), problem.message),
+        // 来自全局默认的问题指向 settings.json 里的 `defaults.<键>`
+        let (file, key, message) = match source {
+            Some(Source::Settings) => (
+                defaults.file.as_path(),
+                format!("defaults.{}", problem.key),
+                problem.message,
+            ),
             Some(Source::Override) => (
                 path,
+                problem.key,
                 format!("{} (given on the command line)", problem.message),
             ),
-            _ => (path, problem.message),
+            _ => (path, problem.key, problem.message),
         };
         diagnostics.push(Diagnostic {
             code: problem.code,
             severity: Level::Error,
             file: file.display().to_string(),
-            key: Some(problem.key),
+            key: Some(key),
             line: position.map(|p| p.0),
             column: position.map(|p| p.1),
             message,
@@ -378,11 +427,95 @@ pub fn resolve_text(
         });
     }
 
+    // 没继承的凭据，这份配置自己也没有：告警
+    for item in &withheld {
+        let own = match item.key.as_str() {
+            "api_key" => config.api_key.is_some(),
+            "proxy_username" => config.proxy_username.is_some(),
+            "proxy_password" => config.proxy_password.is_some(),
+            // 头：两张表里有没有同名的（不分大小写）
+            header => super::parse_key_path(header)
+                .and_then(|segments| segments.into_iter().nth(1))
+                .is_some_and(|name| {
+                    config
+                        .extra_headers
+                        .keys()
+                        .chain(config.override_headers.keys())
+                        .any(|have| have.eq_ignore_ascii_case(&name.name))
+                }),
+        };
+        if own {
+            continue;
+        }
+        let mut details = reason_details(item.reason);
+        details.insert("key".to_string(), Value::String(item.key.clone()));
+        let (what, own_target) = match item.reason {
+            "proxy_differs" => ("proxy", "this config's proxy"),
+            _ => ("base_url", "this config's base_url"),
+        };
+        diagnostics.push(Diagnostic {
+            code: "default_credential_withheld",
+            severity: Level::Warning,
+            file: defaults.file.display().to_string(),
+            key: Some(format!("defaults.{}", item.key)),
+            line: None,
+            column: None,
+            message: format!(
+                "the default {} was not inherited: it belongs to the default {what} ({}), and {own_target} is {}. This config has no {} of its own; set one in {} if the target needs it",
+                item.key,
+                item.default_target,
+                if item.target.is_empty() { "not set" } else { &item.target },
+                item.key,
+                path.display()
+            ),
+            details,
+        });
+    }
+
     Resolved {
         config,
         sources,
+        withheld,
         diagnostics,
     }
+}
+
+/// 两个 base_url 是否指向同一目标：规范化之后相等（见 [`super::normalize_base_url`]），
+/// userinfo 不参与比较——它是凭据，不是目标。连路径一起比较：按路径分渠道的网关在同一主机上
+/// 用不同路径转给不同的厂商，只比主机会把 A 家的 key 送去 B 家。
+fn same_base_url(a: &str, b: &str) -> bool {
+    let key =
+        |url: &str| super::split_url(&super::normalize_base_url(url)).map(|u| u.without_userinfo());
+    match (key(a), key(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// 两个代理是否同一目标：比较 scheme、主机与端口（端口没写时按 scheme 的默认端口）。
+fn same_proxy(a: &str, b: &str) -> bool {
+    let key = |url: &str| {
+        let parts = super::split_url(url.trim())?;
+        let port = match parts.port {
+            Some(port) => port.to_string(),
+            None => match parts.scheme.as_str() {
+                "http" => "80",
+                "https" => "443",
+                _ => "1080",
+            }
+            .to_string(),
+        };
+        Some((parts.scheme, parts.host, port))
+    };
+    match (key(a), key(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// 目标的展示形式：规范化、打码。
+fn target_for_display(url: &str) -> String {
+    aproxy_ipc::redact::url(&super::normalize_base_url(url))
 }
 
 fn reason_details(reason: &str) -> Map<String, Value> {
@@ -530,12 +663,12 @@ fn assign_formats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{KeepaliveTrigger, RetryRule};
 
     fn defaults(values: FileConfig) -> Defaults {
         Defaults {
             file: PathBuf::from("settings.json"),
             values,
-            diagnostics: Vec::new(),
         }
     }
 
@@ -791,7 +924,7 @@ x-toml = "1"
             brief(&resolved),
             [
                 "config_invalid_value proxy config.toml -",
-                "config_invalid_value retry.rules[0].path settings.json -",
+                "config_invalid_value defaults.retry.rules[0].path settings.json -",
             ]
         );
         let proxy = &resolved.diagnostics[0];
@@ -887,63 +1020,154 @@ stages = ["request"]
         assert!(resolved.config.forward_only_enabled());
     }
 
-    /// settings.json 的全局默认：与内置默认相同的值不算来自 settings；受限重试路径变成规则。
+    fn creds_defaults() -> FileConfig {
+        FileConfig {
+            base_url: Some("https://API.example.com/".to_string()),
+            api_key: Some("default-key".to_string()),
+            extra_headers: Some(BTreeMap::from([
+                ("x-team".to_string(), "core".to_string()),
+                ("X-Api-Key".to_string(), "default-header-key".to_string()),
+            ])),
+            proxy: Some("http://user:pw@proxy.example:7890".to_string()),
+            proxy_username: Some("pu".to_string()),
+            proxy_password: Some("pp".to_string()),
+            ..FileConfig::default()
+        }
+    }
+
+    /// 最终的 base_url 与默认的指向同一目标：默认的 key、密钥头、代理口令都继承。
+    /// 只差大小写、末尾斜杠与默认端口的算同一目标。
     #[test]
-    fn settings_become_the_defaults_layer() {
-        let settings = Settings::default();
-        let layer = Defaults::from_settings(&settings, Path::new("settings.json"));
-        assert_eq!(layer.values, FileConfig::default());
-        assert!(layer.diagnostics.is_empty());
+    fn default_credentials_follow_their_target() {
+        for text in [
+            "",
+            "base_url = \"https://api.example.com\"",
+            "base_url = \"HTTPS://api.EXAMPLE.com:443/\"",
+        ] {
+            let resolved = run(text, &Overrides::default(), creds_defaults());
+            assert_eq!(brief(&resolved), Vec::<String>::new(), "{text}");
+            assert_eq!(resolved.withheld, [], "{text}");
+            let c = &resolved.config;
+            assert_eq!(c.api_key.as_deref(), Some("default-key"));
+            assert_eq!(c.extra_headers["X-Api-Key"], "default-header-key");
+            assert_eq!(c.extra_headers["x-team"], "core");
+            assert_eq!(c.proxy_password.as_deref(), Some("pp"));
+            assert_eq!(resolved.sources["api_key"], Source::Settings);
+        }
+    }
 
-        let settings = Settings {
-            max_body_mb: 16,
-            disk_cache: false,
-            forward_only: true,
-            bounded_retry_paths: vec!["/v1/count".to_string()],
-            allowed_hosts: vec!["h".to_string()],
-            keepalive_trigger: "accept".to_string(),
-            ..Settings::default()
-        };
-        let layer = Defaults::from_settings(&settings, Path::new("settings.json"));
-        let resolved = resolve_text(
-            Some("base_url = \"https://a.example\""),
-            Path::new("config.toml"),
-            &Overrides::default(),
-            &layer,
-            false,
-        );
-        assert_eq!(brief(&resolved), Vec::<String>::new());
+    /// 最终的 base_url 与默认的不同：默认的 key 与密钥头不继承，列进 withheld（URL 已打码）；
+    /// 不是密钥的头照常继承。这份配置自己也没有 key 时另有一条告警。
+    #[test]
+    fn default_credentials_are_withheld_from_other_targets() {
+        let text = "base_url = \"https://user:secret@relay.b.example/v1\"";
+        let resolved = run(text, &Overrides::default(), creds_defaults());
         let c = &resolved.config;
-        assert_eq!(c.max_body_mb, Some(16));
-        assert!(!c.disk_cache_enabled());
-        assert!(c.forward_only_enabled());
-        assert_eq!(c.keepalive_trigger(), KeepaliveTrigger::Accept);
-        assert_eq!(c.allowed_hosts(), ["h".to_string()]);
+        assert_eq!(c.api_key, None);
+        assert!(!c.extra_headers.contains_key("X-Api-Key"));
+        assert_eq!(c.extra_headers["x-team"], "core", "不是密钥的头照常继承");
+        assert!(!resolved.sources.contains_key("api_key"));
         assert_eq!(
-            c.retry_rules,
-            [RetryRule {
-                path: Some("/v1/count".into()),
-                status: None,
-                max_attempts: 3,
-            }]
+            resolved.withheld,
+            [
+                Withheld {
+                    key: "api_key".to_string(),
+                    from: "settings",
+                    reason: "base_url_differs",
+                    default_target: "https://api.example.com".to_string(),
+                    target: "https://***@relay.b.example/v1".to_string(),
+                },
+                Withheld {
+                    key: "extra_headers.X-Api-Key".to_string(),
+                    from: "settings",
+                    reason: "base_url_differs",
+                    default_target: "https://api.example.com".to_string(),
+                    target: "https://***@relay.b.example/v1".to_string(),
+                },
+            ]
         );
-        assert_eq!(resolved.sources["delivery"], Source::Settings);
+        // 告警，不是错误：配置照样能启动
+        assert!(resolved.is_valid());
+        assert_eq!(
+            brief(&resolved),
+            [
+                "default_credential_withheld defaults.api_key settings.json -",
+                "default_credential_withheld defaults.extra_headers.X-Api-Key settings.json -",
+            ]
+        );
+        let warning = &resolved.diagnostics[0];
+        assert_eq!(warning.severity, Level::Warning);
+        assert_eq!(warning.details["key"], "api_key");
+        assert_eq!(warning.details["reason"], "base_url_differs");
+        assert!(!warning.message.contains("secret"), "{}", warning.message);
 
-        let settings = Settings {
-            keepalive_trigger: "sometimes".to_string(),
-            ..Settings::default()
+        // 这份配置自己有 key、有同名的头（不分大小写）：照样列进 withheld，但不告警
+        let text = "base_url = \"https://relay.b.example\"\napi_key = \"own\"\n[override_headers]\nx-api-key = \"own-header\"";
+        let resolved = run(text, &Overrides::default(), creds_defaults());
+        assert_eq!(resolved.withheld.len(), 2);
+        assert_eq!(brief(&resolved), Vec::<String>::new());
+        assert_eq!(resolved.config.api_key.as_deref(), Some("own"));
+
+        // 路径也算目标的一部分：同一主机的另一条路径不继承
+        let text = "base_url = \"https://api.example.com/openai\"";
+        let resolved = run(text, &Overrides::default(), creds_defaults());
+        assert_eq!(resolved.config.api_key, None);
+        // 命令行覆盖的 base_url 同样算数
+        let overrides = Overrides {
+            base_url: Some("https://other.example".to_string()),
+            ..Overrides::default()
         };
-        let layer = Defaults::from_settings(&settings, Path::new("settings.json"));
-        let resolved = resolve_text(
-            Some("base_url = \"https://a.example\""),
-            Path::new("config.toml"),
-            &Overrides::default(),
-            &layer,
-            false,
+        let resolved = run("", &overrides, creds_defaults());
+        assert_eq!(resolved.config.api_key, None);
+    }
+
+    /// 代理口令只跟默认的代理走；配置自己写了 proxy 就整体用配置的值，不与默认值的 userinfo 拼接。
+    #[test]
+    fn default_proxy_credentials_follow_the_default_proxy() {
+        // 同一个代理（不带 userinfo）：独立的用户名口令继承，URL 用配置自己写的
+        let text = "base_url = \"https://api.example.com\"\nproxy = \"http://PROXY.example:7890\"";
+        let resolved = run(text, &Overrides::default(), creds_defaults());
+        assert_eq!(resolved.withheld, []);
+        let c = &resolved.config;
+        assert_eq!(c.proxy.as_deref(), Some("http://PROXY.example:7890"));
+        assert_eq!(c.proxy_username.as_deref(), Some("pu"));
+        assert_eq!(c.proxy_password.as_deref(), Some("pp"));
+
+        // 另一个代理：不继承
+        let text = "base_url = \"https://api.example.com\"\nproxy = \"http://other.example:7890\"";
+        let resolved = run(text, &Overrides::default(), creds_defaults());
+        assert_eq!(resolved.config.proxy_password, None);
+        let keys: Vec<&str> = resolved.withheld.iter().map(|w| w.key.as_str()).collect();
+        assert_eq!(keys, ["proxy_username", "proxy_password"]);
+        assert_eq!(resolved.withheld[0].reason, "proxy_differs");
+        assert_eq!(
+            resolved.withheld[0].default_target,
+            "http://***@proxy.example:7890"
         );
         assert_eq!(
             brief(&resolved),
-            ["config_invalid_value keepalive_trigger settings.json -"]
+            [
+                "default_credential_withheld defaults.proxy_username settings.json -",
+                "default_credential_withheld defaults.proxy_password settings.json -",
+            ]
+        );
+    }
+
+    /// 来自全局默认的语义问题指向 settings.json 的 `defaults.<键>`。
+    #[test]
+    fn problems_in_defaults_point_at_settings() {
+        let settings = FileConfig {
+            proxy: Some("gopher://p.example".to_string()),
+            ..FileConfig::default()
+        };
+        let resolved = run(
+            "base_url = \"https://a.example\"",
+            &Overrides::default(),
+            settings,
+        );
+        assert_eq!(
+            brief(&resolved),
+            ["config_invalid_value defaults.proxy settings.json -"]
         );
     }
 

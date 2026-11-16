@@ -4790,8 +4790,8 @@ fn stale_default_config_blocks_only_commands_that_read_it() {
 
 #[test]
 fn corrupt_settings_json_is_never_overwritten() {
-    // settings.json 解析失败时宽松加载回退全默认；写回型命令若照此保存，文件
-    // 里原有的别名会被整体冲掉。必须拒绝修改、原样保留文件
+    // settings.json 读不懂时，写回型命令若按「回退成默认」的内容保存，文件里原有的别名会被
+    // 整体冲掉。必须拒绝修改、原样保留文件——包括用来修它的 settings 命令：语法错误只能手工修
     let home = TestHome::new();
     let settings_path = home.path().join("settings.json");
     let corrupt = r#"{"aliases": {"keep": "/keep.toml"}"#;
@@ -4802,13 +4802,15 @@ fn corrupt_settings_json_is_never_overwritten() {
     for args in [
         vec!["alias", "add", "x", cfg.to_str().unwrap()],
         vec!["config", "--clear-default"],
+        vec!["settings", "set", "language", "en"],
+        vec!["settings", "unset", "aliases.keep"],
     ] {
         let out = home.cmd().args(&args).output().unwrap();
-        assert_eq!(out.status.code(), Some(1), "{args:?} 应拒绝修改");
+        assert_eq!(out.status.code(), Some(3), "{args:?} 应拒绝修改");
+        let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            String::from_utf8_lossy(&out.stderr).contains("不做修改"),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
+            stderr.contains("settings.json") && stderr.contains("[config_syntax]"),
+            "{args:?}: {stderr}"
         );
         assert_eq!(
             std::fs::read_to_string(&settings_path).unwrap(),
@@ -7492,4 +7494,321 @@ async fn max_response_mb_zero_means_no_limit() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.bytes().await.unwrap().len(), SIZE);
+}
+
+// ---------------------------------------------------------------------------
+// settings.json 的严格解析与 settings 命令
+// ---------------------------------------------------------------------------
+
+/// settings.json 无效（这里是 0.1.x 留下的平铺字段）：
+/// - 要用它的命令（start、alias、config……）以退出码 3 结束，指出文件与键，给出修法；
+/// - status、stop 照常按端口工作，把错误作为告警打印；
+/// - `settings` 命令照常可用，能逐项修好；修好之后一切恢复。
+#[test]
+fn invalid_settings_block_start_but_not_stop_status_or_repair() {
+    let home = TestHome::new();
+    let settings_path = home.path().join("settings.json");
+    let port = free_port();
+    home.stop_on_drop(port);
+    let cfg_file = home.path().join("inst.toml");
+    std::fs::write(
+        &cfg_file,
+        format!("base_url = \"https://api.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
+    )
+    .unwrap();
+    let run = |args: &[&str]| home.cmd().args(args).output().unwrap();
+    let cfg_arg = cfg_file.to_str().unwrap();
+
+    // 先在有效的 settings 下起一个实例
+    let out = run(&["--config", cfg_arg, "start"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 改成 0.1.x 的形状
+    std::fs::write(&settings_path, r#"{"watchdog": false, "max_body_mb": 64}"#).unwrap();
+
+    for args in [
+        vec!["--config", cfg_arg, "start"],
+        vec!["alias", "list"],
+        vec!["--config", cfg_arg, "config", "--show"],
+        vec!["restart", "all"],
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(3), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&settings_path.display().to_string())
+                && stderr.contains("watchdog: watchdog must be an object [config_type]")
+                && stderr.contains("max_body_mb: unknown key max_body_mb [config_unknown_key]")
+                && stderr.contains("aproxy settings unset 'max_body_mb'"),
+            "{args:?}: 应指出文件、键与修法，实际:\n{stderr}"
+        );
+    }
+
+    // status 与 stop 照常按端口工作
+    let out = run(&["status"]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(&port.to_string()),
+        "status 应列出实例: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("[WARN] settings.json 有错误"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // settings 命令照常可用：查看（退出码 3，照样显示）、逐项修
+    let out = run(&["settings", "show"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("\"max_body_mb\": 64"));
+    let out = run(&["settings", "unset", "max_body_mb"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // 还剩一个错误：别的命令仍被挡住
+    assert_eq!(run(&["alias", "list"]).status.code(), Some(3));
+    let out = run(&["settings", "set", "watchdog", r#"{"enabled": false}"#]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run(&["settings", "show"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(run(&["alias", "list"]).status.success());
+
+    // 再改坏一次，stop 仍能按端口停掉实例
+    std::fs::write(&settings_path, r#"{"schema": 2}"#).unwrap();
+    let out = run(&["stop", &port.to_string()]);
+    assert!(
+        out.status.success(),
+        "stop 应照常工作: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // schema 更高：settings 命令也拒绝写它，并说明出路
+    let out = run(&["settings", "set", "language", "en"]);
+    assert_eq!(out.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("[settings_schema_too_new]") && stderr.contains("install --force"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&settings_path).unwrap(),
+        r#"{"schema": 2}"#
+    );
+}
+
+/// `settings` 命令：没有文件时 get 给内置默认；set 只能设认识的键；密钥从 stdin 读、读出来
+/// 是占位，占位写回不改原值；凭据要先有归属；`ui` 里放什么都行。
+#[test]
+fn settings_command_reads_writes_and_never_shows_secrets() {
+    let home = TestHome::unborn();
+    let settings_path = home.path().join("settings.json");
+    let run = |args: &[&str]| home.cmd().arg("settings").args(args).output().unwrap();
+    let ok = |args: &[&str]| {
+        let out = run(args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // 没有 settings.json：内置默认
+    assert_eq!(ok(&["get", "watchdog.heartbeat_secs"]), "30");
+    assert_eq!(ok(&["get", "language"]), "\"system\"");
+    assert_eq!(ok(&["get", "defaults.api_key"]), "null");
+    assert!(!settings_path.exists(), "读不产生文件");
+
+    // 只能设认识的键；类型要对
+    let out = run(&["set", "watchdog.interval", "3"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("[config_unknown_key]"));
+    assert_eq!(
+        run(&["set", "logs.rotate_mb", "\"big\""]).status.code(),
+        Some(3)
+    );
+    assert_eq!(
+        run(&["set", "logs.rotate_mb", "not json"]).status.code(),
+        Some(2)
+    );
+    assert!(!settings_path.exists(), "被拒绝的改动不产生文件");
+
+    // 先设 key 被拒，报错说先设 base_url；按这个顺序再设就成功
+    let out = run(&[
+        "set",
+        "defaults.api_key",
+        "sk-SETTINGSSECRET-0123456789abcdef",
+    ]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("set defaults.base_url first"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    ok(&["set", "defaults.base_url", "https://api.example.com"]);
+    // 密钥从 stdin 读一行
+    let mut child = home
+        .cmd()
+        .args(["settings", "set", "defaults.api_key", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write as _;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"sk-SETTINGSSECRET-0123456789abcdef\n")
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    ok(&["set", "defaults.extra_headers.x-api-key", "HEADERSECRET"]);
+    ok(&["set", "defaults.extra_headers.x-team", "core"]);
+    ok(&[
+        "set",
+        "ui",
+        r#"{"theme": 7, "anything": [null, {"goes": true}]}"#,
+    ]);
+
+    // 文件里是明文（只有本用户能读），schema 排在最前
+    let saved = std::fs::read_to_string(&settings_path).unwrap();
+    assert!(saved.starts_with("{\n  \"schema\": 1,"), "{saved}");
+    assert!(saved.contains("sk-SETTINGSSECRET-0123456789abcdef"));
+
+    // 读出口不给明文：占位对象
+    let shown = ok(&["show"]);
+    assert!(
+        !shown.contains("SETTINGSSECRET") && !shown.contains("HEADERSECRET"),
+        "show 泄露了密钥:\n{shown}"
+    );
+    assert!(shown.contains("\"hint\": \"sk-S…cdef\""), "{shown}");
+    assert!(shown.contains("\"x-team\": \"core\""), "{shown}");
+    let got = ok(&["get", "defaults.api_key"]);
+    assert!(
+        got.contains("\"secret\": true") && !got.contains("SETTINGSSECRET"),
+        "{got}"
+    );
+    let got = ok(&["get", "defaults.extra_headers"]);
+    assert!(!got.contains("HEADERSECRET"), "{got}");
+
+    // 占位写回不改原值
+    let out = run(&[
+        "set",
+        "defaults.api_key",
+        r#"{"secret":true,"hint":"sk-S…cdef"}"#,
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), saved);
+
+    // 删掉 base_url 会让 key 没有归属：被拒；先删 key 与密钥头再删就行
+    assert_eq!(run(&["unset", "defaults.base_url"]).status.code(), Some(3));
+    ok(&["unset", "defaults.api_key"]);
+    ok(&["unset", "defaults.extra_headers.x-api-key"]);
+    ok(&["unset", "defaults.base_url"]);
+    // 删不存在的键也成功
+    ok(&["unset", "never.was.here"]);
+
+    // Windows 上 settings.json 的权限：只有当前用户、SYSTEM、Administrators
+    #[cfg(windows)]
+    {
+        let sddl = aproxy::fsx::dacl_sddl(&settings_path).unwrap();
+        assert!(sddl.starts_with("D:P"), "{sddl}");
+        assert_eq!(sddl.matches("(A;;FA;;;").count(), 3, "{sddl}");
+        assert!(sddl.contains(";;;SY)") && sddl.contains(";;;BA)"), "{sddl}");
+    }
+}
+
+/// 全局默认经 settings.json 的 `defaults` 进入实例的配置；凭据只跟它的目标走。
+#[test]
+fn settings_defaults_reach_config_and_credentials_follow_their_target() {
+    let home = TestHome::new();
+    home.settings(
+        r#"{"watchdog": {"enabled": false},
+            "defaults": {"base_url": "https://API.example.com/", "api_key": "sk-DEFAULTKEY",
+                         "max_request_mb": 7,
+                         "extra_headers": {"x-team": "core", "x-api-key": "HDRKEY"}}}"#,
+    );
+    let show = |name: &str, text: &str| {
+        let cfg_file = home.path().join(name);
+        std::fs::write(&cfg_file, text).unwrap();
+        let out = home
+            .cmd()
+            .arg("--config")
+            .arg(&cfg_file)
+            .args(["config", "--show"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    // 没写 base_url：整套默认都继承
+    let stdout = show("same.toml", "");
+    assert!(
+        stdout.contains("\"https://api.example.com\"  （settings.json 全局默认）"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("max_request_mb             = 7  （settings.json 全局默认）"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("api_key                    = \"sk-DEF"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("x-api-key") && stdout.contains("x-team"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("没有继承"), "{stdout}");
+
+    // 指向别家上游：默认的 key 与密钥头不继承，列出来；不是密钥的头照常继承
+    let stdout = show("other.toml", "base_url = \"https://relay.b.example\"\n");
+    assert!(
+        stdout.contains("api_key                    = (未设置)"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("x-api-key = "), "{stdout}");
+    assert!(stdout.contains("x-team"), "{stdout}");
+    assert!(
+        stdout.contains("没有继承")
+            && stdout.contains("api_key")
+            && stdout.contains("https://api.example.com")
+            && stdout.contains("https://relay.b.example"),
+        "应列出扣下的凭据与两个目标:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("DEFAULTKEY") && !stdout.contains("HDRKEY"),
+        "{stdout}"
+    );
 }

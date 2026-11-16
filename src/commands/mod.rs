@@ -12,13 +12,14 @@ pub(crate) mod install;
 pub(crate) mod logs;
 pub(crate) mod restart;
 pub(crate) mod restore;
+pub(crate) mod settings;
 pub(crate) mod start;
 pub(crate) mod status;
 pub(crate) mod stop;
 
 use std::path::PathBuf;
 
-use aproxy::settings;
+use aproxy::settings as app_settings;
 
 /// 实际生效的配置文件路径：`--config` 显式指定 > settings.json 的 `default_config`
 /// （用户可把日常主力配置换成任意文件）> 默认 `~/.aproxy/config.toml`。
@@ -36,13 +37,13 @@ use aproxy::settings;
 pub(crate) fn resolve_cfg_path(cli: &aproxy::cli::Cli) -> Result<PathBuf, String> {
     if let Some(p) = &cli.config {
         return Ok(match p.to_str() {
-            Some(s) => settings::expand_path(s),
+            Some(s) => app_settings::expand_path(s),
             None => std::path::absolute(p).unwrap_or_else(|_| p.clone()),
         });
     }
-    match settings::load().default_config {
+    match app_settings::load().default_config {
         Some(p) => {
-            let path = settings::expand_path(&p);
+            let path = app_settings::expand_path(&p);
             if path.is_file() {
                 Ok(path)
             } else {

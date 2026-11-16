@@ -818,7 +818,7 @@ fn concurrent_start_with_release_asset_name_converges_to_one_watchdog() {
     let home = test_home.path().to_path_buf();
     let run = home.join("run");
     // 本测试要 start 按看门狗开关拉起看护者：显式打开（TestHome 默认关）
-    test_home.settings(r#"{"watchdog": true}"#);
+    test_home.settings(r#"{"watchdog": {"enabled": true}}"#);
     let bin = release_asset_copy(&home);
     let rt = runtime();
     for port in ports {

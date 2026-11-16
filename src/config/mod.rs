@@ -437,7 +437,7 @@ impl Default for Config {
 impl Config {
     /// 归一化：去除 base_url 末尾斜杠；清理空 api_key；清理空代理配置。
     pub fn normalized(mut self) -> Self {
-        self.base_url = self.base_url.trim_end_matches('/').to_string();
+        self.base_url = normalize_base_url(&self.base_url);
         if let Some(k) = &self.api_key {
             if k.trim().is_empty() {
                 self.api_key = None;
@@ -875,6 +875,100 @@ pub fn config_path() -> PathBuf {
 /// 见 `aproxy_ipc::home::home`）。
 pub fn config_dir() -> PathBuf {
     aproxy_ipc::home::home()
+}
+
+/// 一个 URL 拆出来的几段。只做拆分，不解码、不校验字符。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UrlParts {
+    /// 小写
+    pub scheme: String,
+    /// `用户[:口令]`，没有时为 None
+    pub userinfo: Option<String>,
+    /// 小写；IPv6 带方括号
+    pub host: String,
+    pub port: Option<String>,
+    /// 主机之后的全部内容（路径、查询串、片段），可能为空
+    pub rest: String,
+}
+
+impl UrlParts {
+    /// 去掉 userinfo 之后的 URL
+    pub(crate) fn without_userinfo(&self) -> String {
+        let port = self
+            .port
+            .as_ref()
+            .map(|p| format!(":{p}"))
+            .unwrap_or_default();
+        format!("{}://{}{port}{}", self.scheme, self.host, self.rest)
+    }
+}
+
+/// 把 `scheme://[userinfo@]host[:port][rest]` 拆开；不是这个形状时返回 None。
+pub(crate) fn split_url(url: &str) -> Option<UrlParts> {
+    let (scheme, after) = url.split_once("://")?;
+    if scheme.is_empty()
+        || !scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+    {
+        return None;
+    }
+    let end = after.find(['/', '?', '#']).unwrap_or(after.len());
+    let (authority, rest) = after.split_at(end);
+    let (userinfo, host_port) = match authority.rsplit_once('@') {
+        Some((userinfo, host_port)) => (Some(userinfo.to_string()), host_port),
+        None => (None, authority),
+    };
+    // IPv6 字面量带方括号，里面的冒号不是端口分隔符
+    let (host, port) = match host_port.rfind(':') {
+        Some(colon) if !host_port[colon..].contains(']') => (
+            &host_port[..colon],
+            Some(host_port[colon + 1..].to_string()),
+        ),
+        _ => (host_port, None),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some(UrlParts {
+        scheme: scheme.to_ascii_lowercase(),
+        userinfo,
+        host: host.to_ascii_lowercase(),
+        port,
+        rest: rest.to_string(),
+    })
+}
+
+/// base_url 的规范化：去掉首尾空白与末尾斜杠，scheme 与主机名转小写，去掉默认端口
+/// （http 的 80、https 的 443）。userinfo、路径原样保留。拆不开的（不是 URL）只去空白与
+/// 末尾斜杠——它的问题由校验去报。
+pub fn normalize_base_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    let Some(mut parts) = split_url(trimmed) else {
+        return trimmed.to_string();
+    };
+    let default_port = match parts.scheme.as_str() {
+        "http" => Some("80"),
+        "https" => Some("443"),
+        _ => None,
+    };
+    if parts.port.as_deref() == default_port {
+        parts.port = None;
+    }
+    let userinfo = parts
+        .userinfo
+        .as_ref()
+        .map(|u| format!("{u}@"))
+        .unwrap_or_default();
+    let port = parts
+        .port
+        .as_ref()
+        .map(|p| format!(":{p}"))
+        .unwrap_or_default();
+    format!(
+        "{}://{userinfo}{}{port}{}",
+        parts.scheme, parts.host, parts.rest
+    )
 }
 
 /// 配置的一个语义问题（见 [`Config::problems`]）。
@@ -1564,5 +1658,43 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn base_url_normalization() {
+        for (raw, expected) in [
+            ("https://api.example.com", "https://api.example.com"),
+            ("  HTTPS://API.Example.com/  ", "https://api.example.com"),
+            (
+                "https://api.example.com:443/v1/",
+                "https://api.example.com/v1",
+            ),
+            ("http://LocalHost:80", "http://localhost"),
+            ("http://localhost:8080//", "http://localhost:8080"),
+            // userinfo 与路径的大小写原样保留
+            (
+                "https://User:PW@Host.example/Path",
+                "https://User:PW@host.example/Path",
+            ),
+            ("http://[::1]:80/x", "http://[::1]/x"),
+            ("http://[FE80::1]", "http://[fe80::1]"),
+            // 不是 URL：只去空白与末尾斜杠
+            ("not a url/", "not a url"),
+            ("", ""),
+        ] {
+            assert_eq!(normalize_base_url(raw), expected, "{raw:?}");
+        }
+        let parts = split_url("socks5://u:p@Proxy.example:1080").unwrap();
+        assert_eq!(
+            (
+                parts.scheme.as_str(),
+                parts.host.as_str(),
+                parts.port.as_deref()
+            ),
+            ("socks5", "proxy.example", Some("1080"))
+        );
+        assert_eq!(parts.without_userinfo(), "socks5://proxy.example:1080");
+        assert_eq!(split_url("//no-scheme"), None);
+        assert_eq!(split_url("http://"), None);
     }
 }

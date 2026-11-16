@@ -43,7 +43,7 @@ fn fail(name: &str, e: &AliasError) -> ! {
         AliasError::ConfigMissing { path } => eprintln!("配置文件不存在: {}", path.display()),
         AliasError::NotFound => eprintln!("别名 {name} 不存在。用 aproxy alias list 查看。"),
         AliasError::SettingsUnreadable { reason } => eprintln!("{reason}"),
-        AliasError::SaveFailed { reason } => eprintln!("保存 settings.json 失败: {reason}"),
+        AliasError::SaveFailed { reason } => eprintln!("{reason}"),
     }
     std::process::exit(1)
 }

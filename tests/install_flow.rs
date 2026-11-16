@@ -275,7 +275,7 @@ async fn jurisdiction_check_rejects_foreign_binary() {
     // 报的会是下载失败而不是管辖错误
     std::fs::write(
         env.home().join("settings.json"),
-        r#"{"watchdog": false, "download_chain": [{"url": "http://127.0.0.1:1/{asset}"}]}"#,
+        r#"{"watchdog": {"enabled": false}, "update": {"download_chain": [{"url": "http://127.0.0.1:1/{asset}"}]}}"#,
     )
     .unwrap();
     // 不 seed_bin：实例将跑在 from 源（bin 外）
@@ -372,7 +372,11 @@ fn short_path(path: &std::path::Path) -> std::path::PathBuf {
 #[tokio::test]
 async fn jurisdiction_accepts_an_instance_started_through_a_short_path() {
     let env = TestEnv::new();
-    std::fs::write(env.home().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+    std::fs::write(
+        env.home().join("settings.json"),
+        r#"{"watchdog": {"enabled": false}}"#,
+    )
+    .unwrap();
     let bin = env.seed_bin();
     let short_bin = short_path(&bin);
     if short_bin.as_os_str().eq_ignore_ascii_case(bin.as_os_str()) {
@@ -590,7 +594,11 @@ fn abort_rejected_after_swap_phase() {
 #[test]
 fn install_instance_failure_exits_nonzero_and_keeps_restore() {
     let env = TestEnv::new();
-    std::fs::write(env.home().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+    std::fs::write(
+        env.home().join("settings.json"),
+        r#"{"watchdog": {"enabled": false}}"#,
+    )
+    .unwrap();
     let bin = env.seed_bin();
     let cfg_file = env.home().join("broken.toml");
     std::fs::write(
@@ -694,7 +702,11 @@ fn install_instance_failure_exits_nonzero_and_keeps_restore() {
 fn unix_install_rolls_back_instance_to_preserved_old_binary() {
     use std::os::unix::fs::PermissionsExt;
     let env = TestEnv::new();
-    std::fs::write(env.home().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+    std::fs::write(
+        env.home().join("settings.json"),
+        r#"{"watchdog": {"enabled": false}}"#,
+    )
+    .unwrap();
     let bin = env.seed_bin();
     let cfg_file = env.home().join("unixrb.toml");
     std::fs::write(
@@ -831,7 +843,11 @@ fn write_script(path: &std::path::Path, body: &str) {
 #[test]
 fn handover_to_a_target_that_never_takes_over_fails_without_touching_anything() {
     let env = TestEnv::new();
-    std::fs::write(env.home().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+    std::fs::write(
+        env.home().join("settings.json"),
+        r#"{"watchdog": {"enabled": false}}"#,
+    )
+    .unwrap();
     env.seed_bin();
     let mut child = start_bin_instance(&env, "refuse");
     let pid = child.id();
@@ -894,7 +910,11 @@ fn handover_to_a_target_that_never_takes_over_fails_without_touching_anything() 
 #[test]
 fn staged_target_drives_the_install_and_its_failure_reaches_the_installer() {
     let env = TestEnv::new();
-    std::fs::write(env.home().join("settings.json"), r#"{"watchdog": false}"#).unwrap();
+    std::fs::write(
+        env.home().join("settings.json"),
+        r#"{"watchdog": {"enabled": false}}"#,
+    )
+    .unwrap();
     env.seed_bin();
     let mut child = start_bin_instance(&env, "wrapped");
 
@@ -1123,7 +1143,7 @@ fn a_desktop_build_no_channel_delivers_is_not_replaced() {
     // 下载链只有一个必然连不上的地址：渠道全部失败，与 404 一样走「下载链失败」
     std::fs::write(
         env.home().join("settings.json"),
-        r#"{"watchdog": false, "download_chain": [{"url": "http://127.0.0.1:1/{asset}"}]}"#,
+        r#"{"watchdog": {"enabled": false}, "update": {"download_chain": [{"url": "http://127.0.0.1:1/{asset}"}]}}"#,
     )
     .unwrap();
     let run = |args: &[&str]| {

@@ -77,33 +77,29 @@ pub(crate) fn handle_config_cmd(
             eprintln!("--set-default 与 --clear-default 不能同时使用");
             std::process::exit(1);
         }
-        let mut s = settings::load_for_update().unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1);
-        });
+        let save = |change: settings::edit::Change, done: String| match settings::update(&[change])
+        {
+            Ok(_) => println!("{done}"),
+            Err(reason) => {
+                eprintln!("{reason}");
+                crate::util::exit(1)
+            }
+        };
         if let Some(p) = set_default {
             let abs = settings::expand_path(&p);
             if !abs.is_file() {
                 eprintln!("配置文件不存在: {}", abs.display());
                 std::process::exit(1);
             }
-            s.default_config = Some(abs.display().to_string());
-            match settings::save(&s) {
-                Ok(()) => println!("已把 {} 设为默认配置文件", abs.display()),
-                Err(e) => {
-                    eprintln!("保存 settings.json 失败: {e}");
-                    std::process::exit(1);
-                }
-            }
+            save(
+                settings::edit::Change::set("default_config", abs.display().to_string()),
+                format!("已把 {} 设为默认配置文件", abs.display()),
+            );
         } else {
-            s.default_config = None;
-            match settings::save(&s) {
-                Ok(()) => println!("已取消默认配置文件设置（恢复用 ~/.aproxy/config.toml）"),
-                Err(e) => {
-                    eprintln!("保存 settings.json 失败: {e}");
-                    std::process::exit(1);
-                }
-            }
+            save(
+                settings::edit::Change::unset("default_config"),
+                "已取消默认配置文件设置（恢复用 ~/.aproxy/config.toml）".to_string(),
+            );
         }
         return;
     }
@@ -232,6 +228,26 @@ pub(crate) fn handle_config_cmd(
             Err(e) => fail(format!("读取配置文件失败: {e}\n文件: {}", path.display())),
         };
         print_effective(&path, &resolved);
+        // 全局默认里没有继承的凭据：列出来，不然用户只会看到上游回 401
+        if !resolved.withheld.is_empty() {
+            println!();
+            println!("全局默认里的这些凭据没有继承（它们属于另一个目标）:");
+            for item in &resolved.withheld {
+                println!(
+                    "  {}  默认值属于 {}，这份配置指向 {}",
+                    item.key,
+                    item.default_target,
+                    if item.target.is_empty() {
+                        "(未设置)"
+                    } else {
+                        item.target.as_str()
+                    }
+                );
+            }
+        }
+        for d in resolved.diagnostics.iter().filter(|d| !d.is_error()) {
+            eprintln!("警告: {}", aproxy::ops::start::render_diagnostic(d));
+        }
         if !resolved.is_valid() {
             // 有 error 时照样显示，附上诊断；这份配置现在启动不了
             eprintln!();

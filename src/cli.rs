@@ -181,6 +181,13 @@ pub enum Commands {
     /// 查看或修改配置（配置文件位于 ~/.aproxy/config.toml）
     Config(ConfigArgs),
 
+    /// 查看或修改全局设置（~/.aproxy/settings.json）：别名、config.toml 键的全局默认、
+    /// 看护者、日志、安装更新。settings.json 有错误时也能用，用来查看与修复它
+    Settings {
+        #[command(subcommand)]
+        cmd: SettingsCmd,
+    },
+
     /// 打开桌面界面：独立的窗口进程，关掉窗口就退出，不影响运行中的代理实例。
     /// 这个版本的界面是预览版，显示的是演示数据，不是本机实例的真实状态。
     // 无界面的 headless 构建也认得这个子命令（帮助里隐藏），执行时说明这个版本没有界面、
@@ -329,6 +336,31 @@ pub enum AliasCmd {
 
 /// `aproxy config` 的参数集。独立成结构体以整体传递给处理函数，
 /// 避免 main 与函数之间逐字段搬运十几个参数。
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum SettingsCmd {
+    /// 打印生效的全部设置（文件里的键盖在内置默认上）。密钥显示成占位对象
+    Show,
+    /// 打印一个键的生效值。键是点号路径，例如 watchdog.enabled、aliases.work、
+    /// defaults.timeouts.connect_secs
+    Get {
+        #[arg(value_name = "KEY")]
+        key: String,
+    },
+    /// 设置一个键。值写成 JSON（true、30、["a"]、{"k":1}）；字符串类型的键可以直接写
+    /// 原文。值写 - 表示从 stdin 读一行（传密钥用）。只能设置认识的键
+    Set {
+        #[arg(value_name = "KEY")]
+        key: String,
+        #[arg(value_name = "VALUE", allow_hyphen_values = true)]
+        value: String,
+    },
+    /// 删除一个键（回到内置默认）。任何键都能删，包括不认识的键
+    Unset {
+        #[arg(value_name = "KEY")]
+        key: String,
+    },
+}
+
 #[derive(clap::Args, Debug, Clone, PartialEq)]
 pub struct ConfigArgs {
     /// 设置上游 base URL，例如 https://api.anthropic.com

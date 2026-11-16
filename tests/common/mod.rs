@@ -43,7 +43,7 @@ const NO_PROXY_LOOPBACK: &str = "127.0.0.1,localhost";
 ///
 /// - 新建时核对目录确实在系统临时目录里、不是用户的 `~/.aproxy`；会结束进程的命令
 ///   （`stop`、`restart`、`install --force`）只能在这样的 home 里运行。
-/// - [`new`](Self::new) 写入 `settings.json` = `{"watchdog": false}`：`start` 会顺带拉起全局
+/// - [`new`](Self::new) 写入 `settings.json` = `{"watchdog": {"enabled": false}}`：`start` 会顺带拉起全局
 ///   看护者，它带着 aproxy 二进制的镜像一直活到闲置自灭（默认 300 秒）——测试早已结束，它还
 ///   锁着构建产物，让随后的 cargo 重新链接失败，还会把测试里模拟崩溃的实例重新拉起来。要测
 ///   看护者的测试显式开启（[`settings`](Self::settings)），或者自己拉起
@@ -70,7 +70,7 @@ impl TestHome {
     /// 新建一个隔离的 home，并关掉其中的看护者（理由见类型的文档）。
     pub fn new() -> Self {
         let home = Self::in_temp_dir(Path::to_path_buf);
-        home.settings(r#"{"watchdog": false}"#);
+        home.settings(r#"{"watchdog": {"enabled": false}}"#);
         home
     }
 
@@ -118,7 +118,7 @@ impl TestHome {
         &self.home
     }
 
-    /// 用 `json` 整个改写 `settings.json`（例如 `{"watchdog": true}` 开启看护者）
+    /// 用 `json` 整个改写 `settings.json`（例如 `{"watchdog": {"enabled": true}}` 开启看护者）
     pub fn settings(&self, json: &str) {
         std::fs::write(self.home.join("settings.json"), json).unwrap();
     }

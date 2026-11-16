@@ -275,7 +275,7 @@ fn ping_instance(home: &Path, port: u16) -> Option<aproxy::daemon::InstanceStatu
 #[test]
 fn force_install_stops_everything_swaps_and_restores() {
     let home = ForceHome::new();
-    home.settings(r#"{"watchdog": true}"#);
+    home.settings(r#"{"watchdog": {"enabled": true}}"#);
     home.seed_bin();
     let port = free_port();
     let instance = home.start_instance("main", port);
@@ -331,7 +331,7 @@ fn force_install_stops_everything_swaps_and_restores() {
 #[test]
 fn an_instance_that_does_not_come_back_is_listed_with_12() {
     let home = ForceHome::new();
-    home.settings(r#"{"watchdog": false}"#);
+    home.settings(r#"{"watchdog": {"enabled": false}}"#);
     home.seed_bin();
     let port = free_port();
     let instance = home.start_instance("gone", port);
@@ -676,7 +676,7 @@ fn a_held_retired_binary_does_not_block_the_next_force_install() {
 #[test]
 fn a_closed_output_pipe_does_not_change_the_exit_code() {
     let home = ForceHome::new();
-    home.settings(r#"{"watchdog": false}"#);
+    home.settings(r#"{"watchdog": {"enabled": false}}"#);
     home.seed_bin();
     let ports = [free_port(), free_port()];
     let instances = [

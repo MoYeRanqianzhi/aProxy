@@ -17,8 +17,37 @@ pub fn resolve_runtime_config(cli: &Cli, cfg_path: &Path) -> Result<Config, Stri
     if cli.config.is_some() && !cfg_path.exists() {
         return Err(format!("指定的配置文件不存在: {}", cfg_path.display()));
     }
+    // 实例只在启动时读 settings.json：它无效时不带着内置默认悄悄启动——那样全局默认里的
+    // 上游、限额都不生效，用户看到的是一个行为不对的实例，而不是一条说得清的错误
+    let settings_path = settings::settings_path();
+    let loaded = settings::read(&settings_path);
+    if !loaded.is_valid() {
+        let mut msg = String::from("settings.json 有错误，实例没有启动:");
+        for d in loaded.diagnostics.iter().filter(|d| d.is_error()) {
+            msg.push_str("\n  ");
+            msg.push_str(&render_diagnostic(d));
+        }
+        msg.push_str(&format!(
+            "\n\n用 aproxy settings show 查看，aproxy settings unset <键> 删掉出问题的键；也可以删除 {} 回到内置默认",
+            settings_path.display()
+        ));
+        return Err(msg);
+    }
     let resolved = resolve_layers(cli, cfg_path)
         .map_err(|e| format!("读取配置文件失败: {e}\n文件: {}", cfg_path.display()))?;
+    // 告警级的诊断（例如全局默认的凭据没有被继承）与扣下的凭据，记进日志
+    for d in resolved.diagnostics.iter().filter(|d| !d.is_error()) {
+        tracing::warn!(code = d.code, "{}", render_diagnostic(d));
+    }
+    for item in &resolved.withheld {
+        tracing::info!(
+            key = %item.key,
+            reason = item.reason,
+            default_target = %item.default_target,
+            target = %item.target,
+            "全局默认里的这项凭据没有继承：它属于另一个目标"
+        );
+    }
     if resolved.is_valid() {
         return Ok(resolved.config);
     }

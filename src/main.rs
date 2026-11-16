@@ -139,12 +139,45 @@ async fn run(cli: Cli) {
         util::exit(0);
     }
 
-    // settings.json 检查（error 级）：每次软件运行都执行——别名损坏、JSON 语法
-    // 错误等会严重影响 start/stop 按名字操作，必须立刻报出。不退出：管理命令
-    // status/stop 不能因内部配置损坏而不可用。doctor 子命令会再次汇总（含分级），
-    // 此处跳过避免重复输出。
-    if cli.command != Some(Commands::Doctor) {
-        for e in settings::check_settings_errors_in(&settings::settings_path()) {
+    // settings.json 的检查，每次运行都做。文件无效时（不认识的键、类型不对、schema 更高……）：
+    // - `settings` 的各个子命令与 doctor 照常运行：它们就是用来查看与修复它的，自己会报告；
+    // - stop、status、install 照常运行、用内置默认，把错误作为告警打印：任何时候都要能停
+    //   实例、看状态、装上能修好问题的版本（别名这时不可用，按端口或 all 寻址）；
+    // - 其余命令以退出码 3 结束，说清怎样修——带着一份没生效的设置去做事，比不做更糟。
+    let settings_path = settings::settings_path();
+    let loaded = settings::read(&settings_path);
+    let reports_itself = matches!(
+        cli.command,
+        Some(Commands::Doctor | Commands::Settings { .. })
+    );
+    if !loaded.is_valid() && !reports_itself {
+        let tolerated = matches!(
+            cli.command,
+            Some(
+                Commands::Status { .. }
+                    | Commands::Stop { .. }
+                    | Commands::Install(_)
+                    | Commands::Upgrade(_)
+            )
+        );
+        let level = if tolerated { "WARN" } else { "ERROR" };
+        eprintln!("[{level}] settings.json 有错误:");
+        for d in loaded.diagnostics.iter().filter(|d| d.is_error()) {
+            eprintln!("[{level}]   {}", aproxy::ops::start::render_diagnostic(d));
+        }
+        if tolerated {
+            eprintln!(
+                "[{level}] 本次按内置默认运行（别名不可用，请按端口或 all 指定实例）。用 aproxy settings show 查看、aproxy settings unset <键> 修复"
+            );
+        } else {
+            commands::settings::print_repair_hints(&settings_path);
+            util::exit(aproxy_ipc::code::EXIT_CONFIG as i32);
+        }
+    }
+    // 指向不存在的文件的别名：start/stop 按这个名字操作会失败，每次运行都提醒。doctor 会
+    // 汇总输出，这里跳过以免重复
+    if loaded.is_valid() && cli.command != Some(Commands::Doctor) {
+        for e in settings::missing_alias_targets(&loaded.settings) {
             eprintln!("[ERROR] {e}");
         }
     }
@@ -200,6 +233,7 @@ async fn run(cli: Cli) {
         Some(Commands::Config(args)) => {
             commands::config::handle_config_cmd(cfg_path, args, cli.config.is_some())
         }
+        Some(Commands::Settings { cmd }) => commands::settings::handle_settings_cmd(cmd),
         Some(Commands::Install(args) | Commands::Upgrade(args)) => {
             commands::install::handle_install_cmd(args).await
         }

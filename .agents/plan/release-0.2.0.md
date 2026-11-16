@@ -658,24 +658,7 @@
     run/ 里只有一份记录；钉过端口的配置改成固定端口后 restart 用新端口、旧记录被接替；没有配置文件的实例能 restart、restore；
     前台实例 restart 被拒；读不懂的记录不被删除（`spec.rs` 单测）。
   - 验证：Windows headless 全量 665 通过、0 失败；两个变体 clippy 与 Linux 交叉 clippy 零输出。
-  - **B5 还没做的**（接手时从这里继续，设计稿 §4、§5）：
-    1. 实例记录仍是 `run/<端口>.pid`、旧形状（`process_start` 是数字）；要改成 `<端口>.instance.json`：带 `schema`、
-       `start`（台账的启动标记字符串）、`instance_id`、`foreground`，`log_path`、`config_path` 可为 null。IPC 快照的
-       `instance` 是它去掉 `schema`——这一步与 B6（IPC v1 的快照形状）连在一起，放在 B6 一起做更省事。
-    2. 看护者记录仍是 `run/watchdog.claim`；要改成 `watchdog.json`（`schema`、`restarts` 最近 20 次、`last_scan_at`）。
-       看护者每个 tick 重读 settings、开关关闭就退出；连续失败达上限后改为每 300 秒重试而不是放弃；实例存活满 60 秒才清零
-       失败计数；处置写进 `logs/watchdog.log`。这些都没动。
-    3. unix 心跳仍在 /dev/shm（要挪进 `run/<端口>.heart`，写心跳放专用线程）；spool 仍按端口分目录（要按
-       `<pid>-<start 短哈希>`）。
-    4. 清理规则（§4.3）：`status` 的普查仍会删孤儿日志与失效的 `.pid`（读路径不该删任何文件）；日志 GC 的三个条件、
-       残留交接文件与临时文件的清理、spool 的清理都没按新规则做。本次只做了「有读不懂的期望状态记录时整轮不删日志」。
-    5. 实例的启动顺序没有按 §5 调整：台账条目里的端口在端口为 0 时没有用实际端口重写；没有 `state:"starting"`
-       （控制端点在 bind 之后才建，期望状态记录在控制端点之后写，这两点已经符合）。
-    6. install 一侧：换二进制之前按台账找旧看护者（现在仍读 claim）；广播之前的预检（`install_precheck_failed`）与
-       「管不了的活实例」检查（`install_unmanaged_instances`）没做——它们在 §14.2 归 B9。
-    7. `tests/contract_v0_2.rs`（钉住全部记录的形状）没建：等 1、2 的记录定形后一次写齐，现在 spec 与期望状态记录的
-       形状由 `spec.rs` 的单测钉着。
-    8. 启动要 9 秒的 format 不被判为就绪超时：时限已是 30 秒，没有专门的测试（format 在启动时握手属于 B10a）。
+  - 第一部分做完时列的「还没做的」已经被下面第二到第四部分接过去，当前的清单在「B5 第二到第四部分」末尾。
   - **定下的事（设计稿没写）**：
     1. restart 没有期望状态记录的实例（前台实例）时报「没有可用来重新拉起它的记录」，退出 1；`restart_unsupported` 这个码
        等 B9 接操作码时再用。
@@ -688,6 +671,37 @@
     5. 子进程的 home 由 `--home` 定（`main` 把它写进本进程的 `APROXY_HOME`），不由继承来的环境定。
     6. 看护者重拉时配置文件不在：报失败、进退避队列，记录保留；退避期间记录被 stop 删掉的条目直接出队。
     7. 安装状态的 `pending_restores` 不再写也不再读（恒为空），在途实例靠「上次落盘的端口快照 + 期望状态记录还在」认出来。
-  - **文档还没跟上**（B5 整块做完后一起改，免得记录名改两次）：技能里的 `.restore`、`.pid`、「Processes you may see」
-    （应列 `__serve`、`__watchdog`）、restart 失败后的恢复办法（现在是 `aproxy restore`，不再是手动 start）、`stop` 一个已
-    崩溃的实例、端口 0 钉住端口、`APROXY_RUN_DIR` 已删、就绪时限 30 秒；docs/architecture.md 的对应段落；CHANGELOG。
+- B5 第二到第四部分（2026-11-17）：看护者慢速重试与重读 settings、读路径只读与清理、心跳挪进 home、启动顺序的一处竞态。
+  提交依次是 dcc6afa、8df5c69、1889c19，文档 6148ae4。
+  - **看护者**（`src/watchdog.rs`）：连续失败达 `watchdog.max_restarts` 后不放弃，每 300 秒重试一次（`SLOW_RETRY_SECS`），
+    直到实例起来或记录被 stop 删掉；`max_restarts = 0` 仍是「不自动重拉」，只有这种情形才 `GaveUp`。重拉出的实例存活满
+    60 秒（`HEALTHY_AFTER_SECS`）才清零失败计数，起得来又秒崩的按失败计数退避。每个 tick 重读 settings：
+    `watchdog.enabled` 关掉就删 claim 退出（实例与记录不动），`max_restarts`、`idle_exit_secs` 下一轮生效；
+    `heartbeat_secs`、`stale_after_cycles` 仍只在看护者启动时读。
+  - **读路径只读**（`src/daemon.rs`）：`survey_instances_in` 不再删任何文件。清理是 `collect_garbage_in(run_dir, logs_dir)`，
+    只在两处跑：实例开始服务之后（`spawn_blocking`）、看护者每个 tick。规则写在它的文档注释里，要点：实例记录只在读得懂
+    且写者经「pid + 创建时间」核验已不在时删；`process_start == 0` 的记录（平台读不到创建时间）只有 `process_exited(pid)`
+    明确为真才算死；交接文件与原子写临时文件在写者不在且早于 10 分钟时删；日志只删随机名形状、早于 10 分钟、没人引用的，
+    run 目录里有读不懂的记录时这一轮不删日志（`logs_paused`）；unix 的心跳文件在该端口没有活实例且早于 10 分钟时删。
+    期望状态记录不归清理管。
+  - **心跳**：unix 从 `/dev/shm/aproxy-<home_id>-heart-<端口>` 挪到 `run/<端口>.heart`（`watchdog::heartbeat_location`），
+    Windows 仍是命名共享内存节。实例里 ticker 还在 tokio 上（停摆 = runtime 无法调度，这正是挂死的定义），写入本身放进
+    `spawn_blocking`。设计稿写的是「专用线程」，没照做：专用线程在 runtime 死锁时照样跳，挂死检测就失效了。
+  - **启动顺序的竞态**（CI 的 Windows 桌面构建上两个用例红过）：期望状态记录原来写在控制端点开始应答之后，而拉起方把
+    「端点应答」当就绪，紧跟着的 restart 会读不到记录。现在记录写在 `serve_ipc` 任务启动之前；这时没有 stop 能到达，
+    不会出现「被要求停止后又写回记录」。台账条目的端口在配置端口为 0 时已用实际端口重写（第三部分）。
+  - 验证：Windows headless 全量 668 通过、0 失败；两个变体 clippy 与 Linux 交叉 clippy 零输出。unix 的心跳路径只经
+    Linux 交叉 clippy 与 CI 的 ubuntu 任务验证，本机跑不了。
+  - 文档已跟上（6148ae4）：技能、README、architecture、CHANGELOG 都按上面的行为改过，子代理写、我抽查过 CHANGELOG 与
+    README 的改动，引用的程序输出对过源码。
+  - **B5 还没做的**（接手时从这里继续，设计稿 §4、§5）：
+    1. 实例记录仍是 `run/<端口>.pid`、旧形状（`process_start` 是数字）；要改成 `<端口>.instance.json`：带 `schema`、
+       `start`（台账的启动标记字符串）、`instance_id`、`foreground`，`log_path`、`config_path` 可为 null。IPC 快照的
+       `instance` 是它去掉 `schema`——与 B6（IPC v1 的快照形状）连在一起做。`state:"starting"` 也在这一步。
+    2. 看护者记录仍是 `run/watchdog.claim`；要改成 `watchdog.json`（`schema`、`restarts` 最近 20 次、`last_scan_at`），
+       处置写进 `logs/watchdog.log`。install 换二进制之前按台账找旧看护者（现在仍读 claim）也跟着这一步。
+    3. spool 仍按端口分目录（要按 `<pid>-<start 短哈希>`，实例开始服务之后清掉写者已不在的目录）。
+    4. `tests/contract_v0_2.rs`（钉住全部记录的形状）没建：等 1、2 的记录定形后一次写齐，现在 spec 与期望状态记录的
+       形状由 `spec.rs` 的单测钉着。
+    5. 广播之前的预检（`install_precheck_failed`）与「管不了的活实例」检查（`install_unmanaged_instances`）归 B9。
+    6. 启动要 9 秒的 format 不被判为就绪超时：时限已是 30 秒，没有专门的测试（format 在启动时握手属于 B10a）。

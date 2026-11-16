@@ -574,3 +574,42 @@
     3. `format_unavailable`、`retry_stopped`、`shutting_down` 还没有触发处：分别等 B10 的熔断、decide 阶段，与 B5/B6 的退出状态。
     4. 首字节超时与读空闲超时现在共用 `read_timeout_secs`（reqwest 的 read_timeout 同时钳制两者），码已经分开；B4 把两个时限拆成各自的配置。
     5. `upgrade_unsupported` 只拦 WebSocket；`h2c` 之类按 HTTP 的规定忽略、照常代理（设计稿写的是「Upgrade（WebSocket）请求」）。
+- B2（2026-11-16）：5518090 config.toml 的新键、严格解析、分层解析与写回；26320b5 模块文档。`src/config/` 现在是四个文件：
+  `file.rs`（文本 → `FileConfig` + 带行列的诊断，不补默认值、不读文件系统）、`resolve.rs`（四层合并 → 运行时 `Config`、
+  `sources`、诊断；`Defaults::from_settings` 把现行 settings.json 变成全局默认那一层）、`edit.rs`（toml_edit 写回）、
+  `mod.rs`（运行时 `Config` 与语义校验 `Config::problems`）。诊断类型在 `aproxy-ipc/src/diag.rs`。
+  - 验收逐条：§7.2 样例能解析（`file.rs` 单测）；未知键让启动失败并指出文件、键、行列（集成测试
+    `unknown_config_keys_fail_start_naming_file_and_key`，顶层、子表、规则、format 条目四种）；四层 `sources`
+    （`resolve.rs` 单测）；写回保留注释（单测 + 集成测试 `config_command_edits_in_place_and_unsets_unknown_keys`）；并发写不丢更新
+    （单测 8 线程 × 6 次，集成测试 6 个进程）；`unset` 删未知键（同上）。外部修改检测与 `Conflict` 有单测（用注入的钩子扮演
+    不拿锁的写者）。
+  - 验证：Windows headless 全量通过（库单测 305，proxy_integration 109，transform_integration 30）；两个变体 clippy 与 Linux
+    交叉 clippy 零输出。**没有在 unix 上跑过**的：`edit.rs` 的 0600 断言与符号链接测试（只在 unix 编译），等 CI。
+  - **顺手做掉的 B4 部分**（它们与键的改名分不开）：规则表接进了尝试循环（第一条命中生效、`max_attempts = 0` 豁免、按尝试序号
+    计数，`attempts.rs` 单测）；`retry_exhausted` 的 `details.by` 是 `rule:<序号>`；首字节与读空闲两个时限各自计时
+    （`upstream.rs` 的 `send_with_timeout`、`next_chunk`，不再用 reqwest 的 read_timeout）。B1 记的出入 1、2、4 由此消除。
+    剩下的由 dc5ee49 补齐：`max_response_mb = 0` 表示不限；集成测试覆盖两个超时各报各的码、读空闲时限在每一块上
+    重新计时、上游的 `retry-after: 600` 不影响第 2 次尝试立即发出。**B4 至此完成**（按请求覆盖的 `retry.max_attempts`
+    与 decide 属于 B10）。仅转发模式也走同一对计时函数，但没有单独的超时测试。
+  - **定下的事（设计稿没写）**：
+    1. 旧的三个 transform 表在 B10 之前怎么办：不留。文件只认 `[[format]]`，`resolve.rs` 的 `assign_formats` 把条目派给现有的
+       请求、响应、心跳三个位置（每个阶段至多一个程序；`retry` + `request` = 旧的 `every_attempt`）。`decide`、`stream`、`notify`、
+       同一阶段第二个程序、只有 `retry` 没有 `request`，报 `config_not_supported`。`required`、`decide_timeout_secs`、`breaker_*`、
+       `history.body_budget_mb` 只解析校验、还不起作用。旧的 `extra` 键没有对应物（用 `args` 或 `env`），信封的 `extra` 因此为空。
+    2. `delivery = "forward"` 与 `[[format]]` 仍互斥（`config_conflict`，键为 `delivery`），到 B10d 才放开。
+    3. `set` 没有「已知键」表：不认识的键、类型不对的值都会让写前校验多出一条诊断，于是被拒绝。
+    4. 写前校验按「码 + 键 + 说明」比对新旧诊断，行列不参与（改动会让行号移动）。
+    5. 带换行的字符串写回成一行、换行写成 `\n`（toml_edit 默认写多行字符串，开头多一个换行，心跳这种值看不清）。
+    6. 运行时 `Config` 的字段名没有跟着改（`max_body_mb`、`spool_limit_mb`、`forward_only` 等仍是 0.1.x 的叫法），对应关系写在
+       `src/config/mod.rs` 的模块文档里。改名是纯机械的大改动，留给以后；对外只有文件里的键名。
+  - **与设计稿的出入**：
+    1. `aproxy config` 还是旧的旗标形态（加了 `--unset`），`config set/get/unset/show` 的命令树、`--json`、`-` 从 stdin 读、
+       `instances_to_restart` 属于 B9。`config --show` 已经是「生效值 + 来源 + 诊断，有 error 时退出 3」。
+    2. 凭据只发给所属目标、`withheld`、`default_credential_withheld`（D-16）没有做：现行 settings.json 里没有 `base_url`、`api_key`
+       这些默认值，要等 B3 的 `defaults`。`Defaults` 这一层已经能装它们。
+    3. 「同一目标」的 base_url 规范化（scheme、主机小写，去默认端口）没有做，随 B3。现在仍只去末尾斜杠。
+    4. `[[format]]` 的 `command` 仍按旧规则找（`~` 展开、裸名走 PATH）；「相对路径相对 home、裸名先找 `<home>/bin/`」随 B10。
+    5. 写锁等 10 秒拿不到时报「另一个 aproxy 正在写配置」，退出 1；码表里没有专门的码（`write_conflict` 只指外部修改）。
+    6. `resolve` 的签名是 `resolve(path, &Overrides, &Defaults)`，第三个参数是已经取好的全局默认层而不是 `Settings`：这样
+       B3 换 settings 的形状时不用动它。
+

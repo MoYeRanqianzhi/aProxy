@@ -29,11 +29,13 @@ pub(super) enum Outcome {
     /// 需要重试。`failure` 是这次没成功的原因，记进实例的「最近错误」（status 与界面里
     /// 看得到）
     Retry { failure: AttemptFailure },
-    /// 受限重试路径用完了尝试次数：不再重试，交付这次失败的响应——客户端拿到真实的
-    /// 404 自行处理，好过永远等不到终态（compact 事故，见记忆 bounded-retry-paths）
+    /// 一条重试规则给的尝试次数用完了：不再重试，交付这次失败的响应——客户端拿到真实的
+    /// 404 自行处理，好过永远等不到终态（compact 事故，见记忆 bounded-retry-paths）。
+    /// `rule` 是那条规则的序号（从 1 起）
     Exhausted {
         response: UpstreamResponse,
         failure: AttemptFailure,
+        rule: usize,
     },
     /// 上游响应体超出 spool 上限：确定性失败，重试无意义
     TooLarge,
@@ -41,12 +43,18 @@ pub(super) enum Outcome {
     SpoolFailed(StorageOp, String),
 }
 
-/// 判定一次尝试的结果。只看结果本身、第几次尝试与是否命中受限重试路径，不碰任何状态，
-/// 所以可以单测；重试与否的细则在 `needs_retry_response`（状态码、错误体、流内错误事件）。
+/// 判定一次尝试的结果。只看结果本身、第几次尝试与路径已经匹配的重试规则（`rules`，见
+/// `AppState::retry_rules_for`），不碰任何状态，所以可以单测；重试与否的细则在
+/// `needs_retry_response`（状态码、错误体、流内错误事件）。
 ///
-/// 受限路径只封顶「上游有响应」的失败：网络错误是真正的瞬时类，仍然无限重试，而且它
-/// 没有响应可供交付。
-pub(super) fn classify(attempt: u32, result: ForwardResult, bounded_retry: bool) -> Outcome {
+/// 规则只封顶「上游有响应」的失败：网络错误是真正的瞬时类，仍然无限重试，而且它没有响应
+/// 可供交付。第一条状态码也匹配的规则生效：第 N 次尝试失败且 N ≥ 它的 `max_attempts` 就停；
+/// `max_attempts = 0` 的规则是豁免——它命中了，排在后面的规则就不再看，照常重试。
+pub(super) fn classify(
+    attempt: u32,
+    result: ForwardResult,
+    rules: &[(usize, &CompiledRetryRule)],
+) -> Outcome {
     match result {
         ForwardResult::NetworkError(failure) => Outcome::Retry { failure },
         ForwardResult::TooLarge => Outcome::TooLarge,
@@ -69,11 +77,14 @@ pub(super) fn classify(attempt: u32, result: ForwardResult, bounded_retry: bool)
                 return Outcome::Deliver(response);
             }
             let failure = AttemptFailure::response(status);
-            if bounded_retry && attempt >= retry::BOUNDED_RETRY_MAX_ATTEMPTS {
-                Outcome::Exhausted { response, failure }
-            } else {
+            match first_matching_rule(rules, status.as_u16()) {
+                Some((rule, max)) if max > 0 && attempt >= max => Outcome::Exhausted {
+                    response,
+                    failure,
+                    rule,
+                },
                 // 进入下一轮时 body 随 response 一起 Drop：磁盘临时文件删除
-                Outcome::Retry { failure }
+                _ => Outcome::Retry { failure },
             }
         }
     }
@@ -248,10 +259,6 @@ impl Responder {
     }
 }
 
-/// 受限重试路径用尽时，`retry_exhausted` 的 `details.by` 的取值：给出尝试次数上限的是
-/// `bounded_retry_paths` 这项配置。
-const BOUNDED_RETRY_BY: &str = "bounded_retry_paths";
-
 /// 一个请求的全部尝试：请求转换 → 逐次发往上游并判定 → 按出口收场。返回时结果已交给
 /// `r`（不保活出口取 [`Responder::into_response`]），或客户端已断开。`trace` 是这个请求的
 /// 标识与尝试计数，终态的错误体要带。
@@ -263,10 +270,12 @@ pub(super) async fn run_attempts(
     req: OutboundRequest,
     path_and_query: &str,
     max_spool_bytes: usize,
-    bounded_retry: bool,
     r: &mut Responder,
     mut trace: RequestTrace,
 ) {
+    // 规则对客户端的原始路径判定（在请求转换之前）：哪些端点受限是用户按客户端发出的
+    // 请求写的，format 改写 URL 不影响它
+    let rules = state.retry_rules_for(path_and_query);
     let mut req = match r
         .wait(apply_request_transform(state, req), None, "请求转换")
         .await
@@ -345,7 +354,7 @@ pub(super) async fn run_attempts(
             rt.record(&result);
         }
 
-        match classify(attempt, result, bounded_retry) {
+        match classify(attempt, result, &rules) {
             Outcome::Retry { failure } => {
                 state.note_upstream_failure(&failure.summary());
                 tracing::warn!(
@@ -362,11 +371,17 @@ pub(super) async fn run_attempts(
                 deliver(state, r, &req, &trace, response, max_spool_bytes).await;
                 return;
             }
-            Outcome::Exhausted { response, failure } => {
+            Outcome::Exhausted {
+                response,
+                failure,
+                rule,
+            } => {
                 let status = response.status;
-                let terminal = Terminal::retry_exhausted(BOUNDED_RETRY_BY, attempt, &failure);
+                // `details.by` 说明是谁给的次数：第几条重试规则
+                let by = format!("rule:{rule}");
+                let terminal = Terminal::retry_exhausted(&by, attempt, &failure);
                 state.note_upstream_failure(&terminal.summary());
-                tracing::warn!(attempt, code = %terminal.code(), last_code = failure.code, status = %status, "受限重试路径达到尝试上限，不再重试");
+                tracing::warn!(attempt, code = %terminal.code(), last_code = failure.code, status = %status, rule, "重试规则给的尝试次数用完，不再重试");
                 if !r.is_committed() {
                     // 尚未向客户端写出任何字节：原样交付最后一次失败响应（状态码与体保真），
                     // 只加两个头，让调用方分得清「aproxy 已经放弃」与上游的普通回应
@@ -539,13 +554,13 @@ mod tests {
 
     #[test]
     fn success_is_delivered() {
-        let out = classify(1, response(200, r#"{"id":"msg_1"}"#), false);
+        let out = classify(1, response(200, r#"{"id":"msg_1"}"#), &[]);
         assert!(matches!(out, Outcome::Deliver(r) if r.status == 200));
     }
 
     #[test]
     fn error_status_and_error_content_are_retried() {
-        let out = classify(1, response(503, "overloaded"), false);
+        let out = classify(1, response(503, "overloaded"), &[]);
         assert!(matches!(
             out,
             Outcome::Retry { ref failure }
@@ -558,7 +573,7 @@ mod tests {
                 200,
                 r#"{"type":"error","error":{"type":"overloaded_error"}}"#,
             ),
-            false,
+            &[],
         );
         // 状态码是成功的，失败在体里：记的是另一个码
         assert!(matches!(
@@ -568,15 +583,24 @@ mod tests {
         ));
     }
 
+    fn rule(status: Option<&[u16]>, max_attempts: u32) -> CompiledRetryRule {
+        CompiledRetryRule {
+            path: None,
+            status: status.map(<[u16]>::to_vec),
+            max_attempts,
+        }
+    }
+
     #[test]
-    fn network_errors_are_retried_without_limit_even_on_bounded_paths() {
-        for attempt in [1, retry::BOUNDED_RETRY_MAX_ATTEMPTS, 100] {
+    fn network_errors_are_retried_without_limit_even_under_a_rule() {
+        let limit = rule(None, 3);
+        for attempt in [1, 3, 100] {
             let out = classify(
                 attempt,
                 ForwardResult::NetworkError(AttemptFailure::connect_failed(
                     "connection refused".into(),
                 )),
-                true,
+                &[(1, &limit)],
             );
             assert!(
                 matches!(
@@ -591,34 +615,70 @@ mod tests {
     }
 
     #[test]
-    fn bounded_paths_stop_at_the_attempt_limit() {
-        let max = retry::BOUNDED_RETRY_MAX_ATTEMPTS;
-        for attempt in 1..max {
-            let out = classify(attempt, response(404, "not found"), true);
+    fn a_rule_stops_at_its_attempt_limit() {
+        let limit = rule(None, 3);
+        let rules = [(1, &limit)];
+        for attempt in 1..3 {
+            let out = classify(attempt, response(404, "not found"), &rules);
             assert!(matches!(out, Outcome::Retry { .. }), "第 {attempt} 次");
         }
-        let out = classify(max, response(404, "not found"), true);
+        let out = classify(3, response(404, "not found"), &rules);
         assert!(matches!(
             out,
-            Outcome::Exhausted { response, failure }
+            Outcome::Exhausted { response, failure, rule: 1 }
                 if response.status == 404 && failure.status == Some(404)
         ));
-        // 不受限的路径不封顶
-        let out = classify(max + 10, response(404, "not found"), false);
+        // 计数口径是尝试序号：已经超过上限的尝试同样停
+        let out = classify(7, response(404, "not found"), &rules);
+        assert!(matches!(out, Outcome::Exhausted { .. }));
+        // 没有规则时不封顶
+        let out = classify(13, response(404, "not found"), &[]);
         assert!(matches!(out, Outcome::Retry { .. }));
+        // 规则不改变成功的响应
+        let out = classify(9, response(200, "{}"), &rules);
+        assert!(matches!(out, Outcome::Deliver(_)));
+    }
+
+    /// 第一条状态码也匹配的规则生效；`max_attempts = 0` 的规则是豁免，挡住后面的宽规则。
+    #[test]
+    fn the_first_matching_rule_decides() {
+        let exempt_429 = rule(Some(&[429]), 0);
+        let only_404 = rule(Some(&[404, 410]), 1);
+        let wide = rule(None, 2);
+        // 序号是规则在整张表里的位置，不是在这个子集里的位置
+        let rules = [(2, &exempt_429), (3, &only_404), (5, &wide)];
+
+        // 429 命中豁免：永远重试，不落到宽规则上
+        let out = classify(50, response(429, "slow down"), &rules);
+        assert!(matches!(out, Outcome::Retry { .. }));
+        // 404 命中第二条：第 1 次就停
+        let out = classify(1, response(404, "nope"), &rules);
+        assert!(matches!(out, Outcome::Exhausted { rule: 3, .. }));
+        // 其余状态码落到宽规则：第 2 次停
+        let out = classify(1, response(500, "boom"), &rules);
+        assert!(matches!(out, Outcome::Retry { .. }));
+        let out = classify(2, response(500, "boom"), &rules);
+        assert!(matches!(out, Outcome::Exhausted { rule: 5, .. }));
+        // 200 但内容是错误：状态码是 200，同样按规则匹配
+        let body = r#"{"type":"error","error":{"type":"overloaded_error"}}"#;
+        let out = classify(2, response(200, body), &rules);
+        assert!(matches!(
+            out,
+            Outcome::Exhausted { rule: 5, ref failure, .. } if failure.code == "upstream_error_body"
+        ));
     }
 
     #[test]
     fn local_spool_failures_end_the_request() {
         assert!(matches!(
-            classify(1, ForwardResult::TooLarge, false),
+            classify(1, ForwardResult::TooLarge, &[]),
             Outcome::TooLarge
         ));
         assert!(matches!(
             classify(
                 1,
                 ForwardResult::SpoolFailed(StorageOp::WriteResponse, "disk full".into()),
-                false
+                &[]
             ),
             Outcome::SpoolFailed(StorageOp::WriteResponse, e) if e == "disk full"
         ));

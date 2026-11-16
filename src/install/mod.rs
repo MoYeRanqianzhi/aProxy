@@ -161,6 +161,17 @@ pub fn lock_install_in(home: &Path, wait: std::time::Duration) -> Result<Install
     }
 }
 
+/// 对任意路径的锁文件用同一套锁原语不等待地试一次：Ok(Some) 拿到了，Ok(None) 别人持有。
+/// 父目录不存在时先建好。给 home 里别的需要「同一时刻只有一个写者」的地方用；它们与安装
+/// 锁共用原语，但锁的是各自的文件，互不相干。
+pub(crate) fn try_lock_path(path: &Path) -> std::io::Result<Option<InstallLock>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = open_lock_file(path)?;
+    Ok(try_lock_exclusive(&file)?.then_some(InstallLock { file }))
+}
+
 /// 打开（必要时新建）锁文件，读写；Windows 上共享模式见 [`lock_install_in`]。
 fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();

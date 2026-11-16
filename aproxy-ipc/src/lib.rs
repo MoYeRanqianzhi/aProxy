@@ -4,6 +4,7 @@
 //! 现在有的：
 //! - [`home`]：aProxy 主目录的解析（永久兼容契约 C1）。
 //! - [`code`]：错误码表——名字、族、`details` 的键与类型、HTTP 状态与退出码，并导出 JSON。
+//! - [`diag`]：配置诊断——config.toml 与 settings.json 里一个问题的形状（码、级别、文件、键路径、行列）。
 //! - [`endpoint`]：实例控制端点、心跳节、安装宣告节的名字，以及区分 home 的 `home_id`。
 //! - [`redact`]：打码的唯一出口——URL、密钥头、占位对象、已知密钥替换。
 //! - [`ledger`]：进程台账 `<home>/ledger/`（永久兼容契约 C3）——条目的格式、写者、读者
@@ -12,6 +13,7 @@
 //! 本包不打印、不结束进程：这两件事属于调用它的程序。
 
 pub mod code;
+pub mod diag;
 pub mod endpoint;
 pub mod home;
 pub mod ledger;

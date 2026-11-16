@@ -106,7 +106,6 @@ async fn handle(
     };
 
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-    let bounded_retry = state.bounded_retry_matches(path_and_query);
     // 是否「保活适用」（走保活通道：先提交响应头、再以 SSE 注释心跳维持连接）：
     // keepalive 开启且 keepalive_trigger 判定命中。必须在请求转换前判定——
     // 判定语义是「客户端视角」，转换器改写 Accept/请求体不影响保活选择
@@ -142,7 +141,6 @@ async fn handle(
                     req,
                     &path_and_query,
                     max_spool_bytes,
-                    bounded_retry,
                     &mut r,
                     task_trace,
                 )
@@ -168,7 +166,6 @@ async fn handle(
         req,
         path_and_query,
         max_spool_bytes,
-        bounded_retry,
         &mut r,
         trace.clone(),
     )

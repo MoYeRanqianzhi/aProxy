@@ -65,6 +65,7 @@ fn proxy_config_for(upstream: &str) -> Config {
 
 fn transform_config(cmd_sub: &str, mode: TransformMode) -> TransformConfig {
     TransformConfig {
+        name: "echo".to_string(),
         command: format_echo_path().display().to_string(),
         args: vec![cmd_sub.to_string()],
         mode,
@@ -384,7 +385,8 @@ async fn request_transform_rejection_returns_422_without_sending_upstream() {
     // format 用 error 行明确拒绝了这个请求：422 而不是 5xx——5xx 会触发客户端 SDK 自己的重试
     let (aproxy, text) =
         aproxy_error(resp, StatusCode::UNPROCESSABLE_ENTITY, "format_rejected").await;
-    assert_eq!(aproxy["details"]["format"], "request_transform");
+    // 错误体用配置里的名字指明是哪个程序
+    assert_eq!(aproxy["details"]["format"], "echo");
     assert_eq!(aproxy["details"]["stage"], "request");
     assert_eq!(aproxy["attempts"], 0, "没有发往上游");
     assert!(
@@ -1216,9 +1218,10 @@ fn forward_only_with_transform_start_fails() {
     let raw = format!(
         concat!(
             "base_url = \"https://api.example.com\"\n",
-            "forward_only = true\n",
-            "[request_transform]\n",
+            "delivery = \"forward\"\n",
+            "[[format]]\n",
             "command = \"{}\"\n",
+            "stages = [\"request\"]\n",
             "args = [\"echo\"]\n",
         ),
         format_echo_path()
@@ -1232,5 +1235,8 @@ fn forward_only_with_transform_start_fails() {
     let out = home.cmd().arg("--config").arg(&cfg_path).output().unwrap();
     assert!(!out.status.success(), "互斥配置应启动失败");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("互斥"), "错误应说明互斥语义: {stderr}");
+    assert!(
+        stderr.contains("config_conflict") && stderr.contains("delivery"),
+        "错误应指出冲突的键: {stderr}"
+    );
 }

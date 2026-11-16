@@ -367,6 +367,10 @@ pub struct ConfigArgs {
     /// 清空代理配置（URL、用户名、密码）
     #[arg(long)]
     pub clear_proxy: bool,
+    /// 从配置文件里删除一个键，可重复。键是点号路径，例如 timeouts.connect_secs、
+    /// extra_headers."x-foo"；不认识的键也能删
+    #[arg(long, value_name = "KEY")]
+    pub unset: Vec<String>,
     /// 把指定路径设为默认配置文件（写入 settings.json，不指定时默认
     /// ~/.aproxy/config.toml；支持 ~ 展开）
     #[arg(long, value_name = "PATH")]

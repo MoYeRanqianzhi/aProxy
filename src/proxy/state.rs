@@ -17,9 +17,9 @@ pub struct AppState {
     /// 磁盘缓存的 spool 临时目录；None = disk_cache 关闭（全程纯内存）。
     /// 生产路径 `~/.aproxy/spool/<端口>/`，测试可经 Config::spool_dir_override 注入。
     pub spool_dir: Option<PathBuf>,
-    /// 受限重试路径的预编译正则（源 `config.bounded_retry_paths`，空 = 功能
-    /// 关闭）。启动时编译一次随 AppState 共享，请求热路径只做 is_match。
-    pub bounded_retry_patterns: Arc<Vec<regex::Regex>>,
+    /// 重试规则表（源 `config.retry_rules`，空 = 一切请求无限重试），`path` 已预编译。
+    /// 启动时编译一次随 AppState 共享，请求热路径只做 is_match。
+    pub retry_rules: Arc<Vec<CompiledRetryRule>>,
     /// 外部转换器进程池（request/response 各一，源 `config.request_transform`
     /// / `response_transform`）；None = 未配置，热路径零开销。pub(crate)：池是
     /// 内部编排细节（TransformPool 的接口不对外），AppState 虽 pub 但不泄漏它。
@@ -38,6 +38,33 @@ pub struct AppState {
     pub(super) rejected_seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// 一条重试规则，`path` 已编译（自动锚定两端）。
+#[derive(Debug, Clone)]
+pub struct CompiledRetryRule {
+    /// 没有 = 任何路径
+    pub path: Option<regex::Regex>,
+    /// 没有 = 任何状态码
+    pub status: Option<Vec<u16>>,
+    /// 第 N 次尝试失败、命中这条规则且 N ≥ 它，就停；0 = 不限
+    pub max_attempts: u32,
+}
+
+/// 路径已经匹配的规则里，第一条状态码也匹配的：它决定这次失败之后还重不重试。
+/// 返回规则的序号（从 1 起）与它的 `max_attempts`。
+pub fn first_matching_rule(
+    rules: &[(usize, &CompiledRetryRule)],
+    status: u16,
+) -> Option<(usize, u32)> {
+    rules
+        .iter()
+        .find(|(_, rule)| {
+            rule.status
+                .as_ref()
+                .is_none_or(|codes| codes.contains(&status))
+        })
+        .map(|(index, rule)| (*index, rule.max_attempts))
+}
+
 impl AppState {
     /// 刷新活动时间戳（stop idle 与 status 的闲置判定依据）：收到请求时、每轮重试开头、
     /// 仅转发模式每转发一块时各刷新一次。一条 Relaxed store：只用于粗粒度的空闲判定，
@@ -53,11 +80,11 @@ impl AppState {
     }
 
     pub fn new(config: Config) -> Self {
-        // 超时策略：不设总时限（会掐断超过时限的慢流式生成，导致无限重试永不成功），
-        // 只限制连接建立与两次读到数据之间的间隔（均可经 config.toml 调整）。
-        // 注意 read_timeout 同样钳制首字节等待——LLM 上游排队时 TTFB 可达数十秒，
-        // 阈值过小（如 60s）会把「慢但活着」的上游变成确定性无限重试。spool 设计
-        // 本身容忍慢流。0 表示该项不设限。
+        // 超时策略：不设总时限（会掐断超过时限的慢流式生成，导致无限重试永不成功）。
+        // 客户端上只设连接建立的时限；等响应头（首字节）与两次读到数据之间的时限各有各的
+        // 配置，由发请求与读响应体的地方分别计时（见 upstream.rs 的 `send_with_timeout` 与
+        // `next_chunk`）——reqwest 的 read_timeout 把两者钳成同一个值，所以不用它。
+        // 0 表示该项不设限。
         let mut builder = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(30))
@@ -67,9 +94,6 @@ impl AppState {
             .redirect(reqwest::redirect::Policy::none());
         if config.connect_timeout_secs > 0 {
             builder = builder.connect_timeout(Duration::from_secs(config.connect_timeout_secs));
-        }
-        if config.read_timeout_secs > 0 {
-            builder = builder.read_timeout(Duration::from_secs(config.read_timeout_secs));
         }
 
         // 显式配置代理：所有上游请求经该代理转发；reqwest 在 .proxy() 时会自动关闭
@@ -105,17 +129,21 @@ impl AppState {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
         ));
-        // 受限重试路径模式：启动时编译一次（模式已在 validate() 校验过合法性，
+        // 重试规则的 path 模式：启动时编译一次（模式已在配置校验时确认合法，
         // 此处 expect 不会失败——与上方 proxy URL 的信任同一来源）
-        let bounded_retry_patterns = Arc::new(
+        let retry_rules = Arc::new(
             config
-                .bounded_retry_paths()
+                .retry_rules
                 .iter()
-                .map(|p| {
-                    Config::compile_bounded_retry_pattern(p)
-                        .expect("受限重试路径模式已在 validate() 校验")
+                .map(|rule| CompiledRetryRule {
+                    path: rule.path.as_deref().map(|p| {
+                        Config::compile_bounded_retry_pattern(p)
+                            .expect("重试规则的 path 模式已在配置校验时确认合法")
+                    }),
+                    status: rule.status.clone(),
+                    max_attempts: rule.max_attempts,
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
         );
         // 外部转换器进程池：按配置构造（未配置 = None，热路径零开销）。
         // 仅 spawn 模式惰性启动了 reaper 之外无任何后台任务，构造本身零开销
@@ -151,7 +179,7 @@ impl AppState {
                 ..Default::default()
             }),
             last_activity_secs,
-            bounded_retry_patterns,
+            retry_rules,
             request_pool,
             response_pool,
             heartbeat_pool,
@@ -159,13 +187,20 @@ impl AppState {
         }
     }
 
-    /// 请求是否命中受限重试路径：`路径?查询串` 整体匹配任一配置模式
-    /// （模式在 Config::compile_bounded_retry_pattern 自动锚定，普通路径
-    /// 即精准匹配）。
-    pub fn bounded_retry_matches(&self, path_and_query: &str) -> bool {
-        self.bounded_retry_patterns
+    /// 路径可能命中的重试规则：`路径?查询串` 整体匹配 `path` 的规则（没写 `path` 的规则匹配
+    /// 任何路径），带着它们在规则表里的序号（从 1 起），保持书写顺序。一个请求只算一次；
+    /// 每次失败再按状态码在这个子集里找第一条命中的（见 [`first_matching_rule`]）。
+    pub fn retry_rules_for(&self, path_and_query: &str) -> Vec<(usize, &CompiledRetryRule)> {
+        self.retry_rules
             .iter()
-            .any(|re| re.is_match(path_and_query))
+            .enumerate()
+            .filter(|(_, rule)| {
+                rule.path
+                    .as_ref()
+                    .is_none_or(|re| re.is_match(path_and_query))
+            })
+            .map(|(index, rule)| (index + 1, rule))
+            .collect()
     }
 
     /// 实例内第 `seq` 个请求的标识：`<instance_id>-<seq>`。HTTP 头、错误体、日志与交给 format

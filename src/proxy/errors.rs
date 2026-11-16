@@ -207,7 +207,7 @@ impl Terminal {
         Self::new(
             "request_too_large",
             format!(
-                "the request body exceeds the limit of {limit_bytes} bytes; raise max_body_mb in config.toml or settings.json"
+                "the request body exceeds the limit of {limit_bytes} bytes; raise max_request_mb in config.toml"
             ),
             json!({ "limit_bytes": limit_bytes }),
         )
@@ -245,7 +245,7 @@ impl Terminal {
         Self::new(
             "response_too_large",
             format!(
-                "the upstream response exceeds the limit of {limit_bytes} bytes; raise spool_limit_mb in config.toml"
+                "the upstream response exceeds the limit of {limit_bytes} bytes; raise max_response_mb in config.toml"
             ),
             json!({ "limit_bytes": limit_bytes }),
         )
@@ -426,9 +426,9 @@ mod tests {
             Terminal::upgrade_unsupported("websocket"),
             Terminal::local_storage_failed(StorageOp::WriteResponse, "disk full"),
             Terminal::response_too_large(1024),
-            Terminal::retry_exhausted("bounded_retry_paths", 3, &failure),
-            Terminal::format_rejected("request_transform", "request", "no"),
-            Terminal::format_failed("request_transform", "request", "timeout", "timed out"),
+            Terminal::retry_exhausted("rule:1", 3, &failure),
+            Terminal::format_rejected("keys", "request", "no"),
+            Terminal::format_failed("keys", "request", "timeout", "timed out"),
             Terminal::upstream_failed(&failure),
             Terminal::decode_failed("br"),
             Terminal::internal("x"),

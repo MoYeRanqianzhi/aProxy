@@ -10,105 +10,73 @@ use crate::daemon::{self, InstanceStatus};
 use crate::settings;
 use crate::spawn::{self, SpawnError};
 
-/// 启动路径共用的配置解析：显式配置路径必须存在（打错路径时报明确错误而非
-/// 静默回退默认配置）、CLI 覆盖参数、normalize、validate。
+/// 启动路径共用的配置解析：显式给出的配置路径必须存在（打错路径时明确报错，而不是悄悄用
+/// 默认配置启动），然后走分层解析（命令行覆盖 > config.toml > settings 的全局默认 > 内置
+/// 默认）。有 error 级诊断时不启动，Err 里逐条列出：哪个文件、哪个键、第几行。
 pub fn resolve_runtime_config(cli: &Cli, cfg_path: &Path) -> Result<Config, String> {
     if cli.config.is_some() && !cfg_path.exists() {
         return Err(format!("指定的配置文件不存在: {}", cfg_path.display()));
     }
-    // 严格加载：TOML 语法错误在此明确报出——宽松版会把解析失败静默回退成
-    // 默认配置（base_url 空），下方的 validate 报错于是变成「base_url 不能
-    // 为空」，用户明明写了却被告知没写，排障方向被带偏（实测实锤）
-    let mut cfg = config::load_from_strict(cfg_path)?;
-    // CLI 覆盖在严格加载之上应用（覆盖参数不需要文件先合法）
-    cfg = apply_cli_overrides(cfg, cli);
-    // settings.json 全局默认注入：toml 显式值 > settings 值 > 内置默认。
-    // get_or_insert 只在 toml 未显式配置时写入 settings 值——这正是
-    // 「settings 公用默认、toml 按实例覆盖」的优先级实现点。
-    // bounded_retry_paths 是 settings 层第一个能让 start 失败的值（非法正则），
-    // 注入前记录来源：validate 报错时若值来自 settings，下方「位置: toml」
-    // 的指引找不到问题，必须点名真实来源。
-    let bounded_paths_from_settings = cfg.bounded_retry_paths.is_none();
-    let keepalive_trigger_from_settings = cfg.keepalive_trigger.is_none();
-    {
-        let s = settings::load();
-        cfg.max_body_mb.get_or_insert(s.max_body_mb);
-        cfg.disk_cache.get_or_insert(s.disk_cache);
-        cfg.forward_only.get_or_insert(s.forward_only);
-        cfg.bounded_retry_paths
-            .get_or_insert_with(|| s.bounded_retry_paths.clone());
-        cfg.allowed_hosts
-            .get_or_insert_with(|| s.allowed_hosts.clone());
-        cfg.allowed_origins
-            .get_or_insert_with(|| s.allowed_origins.clone());
-        cfg.keepalive_trigger
-            .get_or_insert_with(|| s.keepalive_trigger.clone());
+    let resolved = resolve_layers(cli, cfg_path)
+        .map_err(|e| format!("读取配置文件失败: {e}\n文件: {}", cfg_path.display()))?;
+    if resolved.is_valid() {
+        return Ok(resolved.config);
     }
-    // listen_addr 必须带端口（port_of 取最后一个 ':' 之后）：缺端口/端口越界的
-    // bind 失败不是占用，提前拦截给出明确错误，避免被误诊为「被其他程序占用」
-    if daemon::port_of(&cfg.listen_addr).parse::<u16>().is_err() {
-        return Err(format!(
-            "listen_addr 缺少端口或端口无效: {}（示例: 127.0.0.1:12345）",
-            cfg.listen_addr
-        ));
+    let mut msg = String::from("配置错误:");
+    for d in resolved.errors() {
+        msg.push_str("\n  ");
+        msg.push_str(&render_diagnostic(d));
     }
-    // validate 的错误消息会内嵌 proxy / base_url 原文（URL 里可能带 user:pass
-    // 或查询串），转给用户（以及守护的 startup.log）前打码，与日志/展示处的
-    // 保密策略同一出口
-    cfg.validate().map_err(|msg| {
-        let mut msg = msg;
-        for raw in [cfg.proxy.as_deref(), Some(cfg.base_url.as_str())]
-            .into_iter()
-            .flatten()
-            .filter(|s| !s.is_empty())
-        {
-            msg = msg.replace(raw, &aproxy_ipc::redact::url(raw));
+    msg.push_str(&format!(
+        "\n\n请修改后重试。上游地址可以这样设置:\n  aproxy config --baseurl https://api.anthropic.com\n  或手动编辑 {}",
+        cfg_path.display()
+    ));
+    Err(msg)
+}
+
+/// 一条诊断写成一行：`文件:行:列: 键: 说明 [码]`，没有的部分省略。
+pub fn render_diagnostic(d: &aproxy_ipc::diag::Diagnostic) -> String {
+    let mut line = d.file.clone();
+    if let Some(l) = d.line {
+        line.push_str(&format!(":{l}"));
+        if let Some(c) = d.column {
+            line.push_str(&format!(":{c}"));
         }
-        let msg = if bounded_paths_from_settings && msg.contains("bounded_retry_paths") {
-            format!("{msg}\n（该值来自 settings.json 的 bounded_retry_paths 全局默认，不在上述 toml 中）")
-        } else if keepalive_trigger_from_settings && msg.contains("keepalive_trigger") {
-            format!("{msg}\n（该值来自 settings.json 的 keepalive_trigger 全局默认，不在上述 toml 中）")
-        } else {
-            msg
-        };
-        format!(
-            "配置错误: {msg}\n位置: {}\n\n请执行以下任一操作后重试:\n  aproxy config --baseurl https://api.anthropic.com\n  或手动编辑 {}",
-            cfg_path.display(),
-            cfg_path.display()
-        )
-    })?;
-    Ok(cfg)
+    }
+    line.push_str(": ");
+    if let Some(key) = &d.key {
+        line.push_str(&format!("{key}: "));
+    }
+    line.push_str(&format!("{} [{}]", d.message, d.code));
+    line
 }
 
-/// 宽松加载配置并应用 CLI 覆盖参数（不做校验）：守护子进程日志初始化共用，
-/// 保证日志解析对 listen_addr 的认知与启动路径一致（优先级 CLI --log-file、
-/// config log_file、内置随机名）。宽松版适用于日志初始化（此刻配置尚未严格
-/// 校验，解析失败仍要能解析出日志路径）；启动的严格校验路径用
-/// `load_from_strict` 加 [`resolve_runtime_config`]。
+/// 分层解析一份配置：命令行覆盖、config.toml、settings.json 的全局默认、内置默认。
+fn resolve_layers(cli: &Cli, cfg_path: &Path) -> std::io::Result<config::Resolved> {
+    let overrides = config::Overrides {
+        base_url: cli.baseurl.clone(),
+        listen_addr: cli.listen.clone(),
+        proxy: cli.proxy.clone(),
+        api_key: cli.api_key.clone(),
+        log_file: cli.log_file.clone(),
+    };
+    let defaults =
+        config::resolve::Defaults::from_settings(&settings::load(), &settings::settings_path());
+    config::resolve(cfg_path, &overrides, &defaults)
+}
+
+/// 宽松地解析配置（不因诊断而失败）：守护子进程初始化日志时用。此刻配置还没有校验过，
+/// 即使它有问题，也要能定出日志写到哪里（优先级：命令行 `--log-file`、config.toml 的
+/// `log_file`、内置的随机名），这样问题才有地方记。启动的严格路径是
+/// [`resolve_runtime_config`]，两者走同一条解析管线，对监听地址与日志路径的认知一致。
 pub fn load_with_cli_overrides(cli: &Cli, cfg_path: &Path) -> Config {
-    let cfg = config::load_from(cfg_path);
-    apply_cli_overrides(cfg, cli)
-}
-
-/// 在已加载的配置上应用 CLI 覆盖参数并 normalize。启动严格路径与宽松日志
-/// 初始化路径共用，保证两者的覆盖语义一致。
-fn apply_cli_overrides(mut cfg: Config, cli: &Cli) -> Config {
-    if let Some(u) = &cli.baseurl {
-        cfg.base_url = u.clone();
+    match resolve_layers(cli, cfg_path) {
+        Ok(resolved) => resolved.config,
+        Err(e) => {
+            tracing::warn!(path = %cfg_path.display(), error = %e, "读取配置文件失败，使用默认配置");
+            Config::default()
+        }
     }
-    if let Some(l) = &cli.listen {
-        cfg.listen_addr = l.clone();
-    }
-    if let Some(p) = &cli.proxy {
-        cfg.proxy = Some(p.clone());
-    }
-    if let Some(k) = &cli.api_key {
-        cfg.api_key = Some(k.clone());
-    }
-    if let Some(f) = &cli.log_file {
-        cfg.log_file = Some(f.clone());
-    }
-    cfg.normalized()
 }
 
 /// 端口预检通过之后的两种情形。

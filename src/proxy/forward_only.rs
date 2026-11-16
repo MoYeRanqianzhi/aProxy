@@ -100,11 +100,10 @@ pub(super) async fn forward_only_proxy(
     // 缓冲），content-length 无从回填——这是本模式的代价之一，也是必然后果。
     builder = builder.body(reqwest::Body::wrap_stream(counted));
 
-    let resp = match builder.send().await {
+    let resp = match send_with_timeout(&state.config, builder.send()).await {
         Ok(r) => r,
-        Err(e) => {
-            // 错误文本与目标 URL 都会进日志 / 最近错误 / 502 正文，一律先归类、脱敏
-            let failure = send_failure(e, &state.config);
+        Err(failure) => {
+            // 错误文本与目标 URL 都会进日志 / 最近错误 / 502 正文，已在源头归类、脱敏
             let masked_target = aproxy_ipc::redact::url(&target_url);
             // send() 的失败有三种来源：上游真的失败，或请求体适配器产出 Err 令
             // reqwest 主动中止（超限 / 客户端上传中断，各有一个标记）。判定顺序
@@ -158,34 +157,46 @@ pub(super) async fn forward_only_proxy(
     //（与常规路径重试轮开头的刷新同义）。不刷新的话，一个正在传输的实例会被
     // stop idle / status --idle 判为闲置并强退——idle_timeout_secs 默认 1800s，
     // 任何长流都会越线，恰在传输中途被掐断。覆盖范围与残余窗口：chunk 持续到达
-    // 即视为活跃；上游长时间一个字节都不发（真正的停滞，read_timeout 才是该管
+    // 即视为活跃；上游长时间一个字节都不发（真正的停滞，读空闲时限才是该管
     // 这件事的地方）期间不刷新——那时实例确实没在推进任何数据，被判闲置符合语义。
     // 代价是每 chunk 一次 SystemTime::now() + 一条 Relaxed store，相对该 chunk
     // 的网络读写开销可忽略。
-    let forwarded = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let counter = forwarded.clone();
-    let stream = resp.bytes_stream().map(move |chunk| match chunk {
-        Ok(c) => {
-            counter.fetch_add(c.len() as u64, AtomicOrdering::Relaxed);
-            state.touch_activity();
-            Ok(c)
-        }
-        Err(e) => {
-            // 上游响应流中断：**直接截断**——绝不注入任何上游未发出的字节（那
-            // 是伪造数据），也不重试（本模式已放弃重试能力）。错误记入
-            // note_upstream_failure 并带上已转发字节数，便于判断断在了哪里。
-            let forwarded_bytes = counter.load(AtomicOrdering::Relaxed);
-            let failure = body_failure(e, forwarded_bytes, &state.config);
-            state.note_upstream_failure(&failure.summary());
-            tracing::warn!(
-                code = %failure.code,
-                error = %failure.message,
-                forwarded_bytes,
-                "上游响应流中断，连接就此截断（仅转发模式不重试）"
-            );
-            Err(std::io::Error::other(failure.message))
-        }
-    });
+    //
+    // 逐块读、逐块交出：两次读到数据之间的时限（`timeouts.read_idle_secs`）在每一块上重新
+    // 计时。流在第一个错误之后结束（`done`）。
+    let stream =
+        futures_util::stream::unfold((resp, 0u64, false), move |(mut resp, forwarded, done)| {
+            let state = state.clone();
+            async move {
+                if done {
+                    return None;
+                }
+                match next_chunk(&mut resp, &state.config, forwarded).await {
+                    Ok(Some(chunk)) => {
+                        state.touch_activity();
+                        let forwarded = forwarded + chunk.len() as u64;
+                        Some((Ok(chunk), (resp, forwarded, false)))
+                    }
+                    Ok(None) => None,
+                    Err(failure) => {
+                        // 上游响应流中断：**直接截断**——绝不注入任何上游未发出的字节（那
+                        // 是伪造数据），也不重试（本模式已放弃重试能力）。错误记入
+                        // note_upstream_failure 并带上已转发字节数，便于判断断在了哪里。
+                        state.note_upstream_failure(&failure.summary());
+                        tracing::warn!(
+                            code = %failure.code,
+                            error = %failure.message,
+                            forwarded_bytes = forwarded,
+                            "上游响应流中断，连接就此截断（仅转发模式不重试）"
+                        );
+                        Some((
+                            Err(std::io::Error::other(failure.message)),
+                            (resp, forwarded, true),
+                        ))
+                    }
+                }
+            }
+        });
 
     // 与 build_replay_response 同款收尾：header 逐条经 from_bytes 校验过、status
     // 已降级兜底，body() 的错误态不可能出现（框架保证，不做不可达分支）

@@ -89,10 +89,10 @@ pub(super) async fn forward_once(
         }
     };
 
-    let resp = match builder.send().await {
+    let resp = match send_with_timeout(&state.config, builder.send()).await {
         Ok(r) => r,
         // 在源头归类并脱敏：失败原因会流向日志、status 的最近错误与各通道
-        Err(e) => return ForwardResult::NetworkError(send_failure(e, &state.config)),
+        Err(failure) => return ForwardResult::NetworkError(failure),
     };
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -122,7 +122,7 @@ pub(super) async fn forward_once(
     let mut scanner = StreamErrorScanner::new();
     let mut resp_stream = resp;
     loop {
-        match resp_stream.chunk().await {
+        match next_chunk(&mut resp_stream, &state.config, spool.len()).await {
             Ok(Some(chunk)) => {
                 // 各提前返回路径上 spool 随之 drop，半截磁盘文件由 SpoolPath 删除
                 if spool.len() + chunk.len() as u64 > max_spool_bytes as u64 {
@@ -138,9 +138,7 @@ pub(super) async fn forward_once(
                 }
             }
             Ok(None) => break,
-            Err(e) => {
-                return ForwardResult::NetworkError(body_failure(e, spool.len(), &state.config));
-            }
+            Err(failure) => return ForwardResult::NetworkError(failure),
         }
     }
 
@@ -158,11 +156,50 @@ pub(super) async fn forward_once(
     }
 }
 
+/// 发出请求并等响应头，最多等 `timeouts.first_byte_secs`（0 = 不限）。时限从发出请求起算，
+/// 包含连接建立与请求体上传；到点时这次尝试以 `upstream_first_byte_timeout` 失败，在途的
+/// 请求随 future 被丢弃而中止。
+pub(super) async fn send_with_timeout(
+    config: &Config,
+    send: impl Future<Output = Result<reqwest::Response, reqwest::Error>>,
+) -> Result<reqwest::Response, AttemptFailure> {
+    let limit = Duration::from_secs(config.first_byte_timeout_secs);
+    if limit.is_zero() {
+        return send.await.map_err(|e| send_failure(e, config));
+    }
+    match tokio::time::timeout(limit, send).await {
+        Ok(result) => result.map_err(|e| send_failure(e, config)),
+        Err(_) => Err(AttemptFailure::first_byte_timeout(limit)),
+    }
+}
+
+/// 读响应体的下一块，最多等 `timeouts.read_idle_secs`（0 = 不限）：每读到一块就重新计时，
+/// 所以它限制的是两次读到数据之间的间隔，不是整个响应的时长。到点时以
+/// `upstream_read_idle_timeout` 失败。`received_bytes` 是此前已经收到的响应体字节数。
+pub(super) async fn next_chunk(
+    resp: &mut reqwest::Response,
+    config: &Config,
+    received_bytes: u64,
+) -> Result<Option<Bytes>, AttemptFailure> {
+    let limit = Duration::from_secs(config.read_timeout_secs);
+    let read = async {
+        resp.chunk()
+            .await
+            .map_err(|e| body_failure(e, received_bytes, config))
+    };
+    if limit.is_zero() {
+        return read.await;
+    }
+    match tokio::time::timeout(limit, read).await {
+        Ok(result) => result,
+        Err(_) => Err(AttemptFailure::read_idle_timeout(limit, received_bytes)),
+    }
+}
+
 /// 把「发出请求、等响应头」阶段的 reqwest 错误归成尝试失败码：
 /// - 连接阶段超时 → `upstream_connect_timeout`；
 /// - 连接阶段的其他失败（DNS、被拒绝、TLS）→ `upstream_connect_failed`；
-/// - 连接已建立、等响应头超时 → `upstream_first_byte_timeout`（reqwest 的 read_timeout 同样
-///   钳制首字节等待，所以时限取 `read_timeout_secs`）；
+/// - 连接已建立、等响应头超时 → `upstream_first_byte_timeout`；
 /// - 其余（连接建立之后、响应头之前断开等）→ `upstream_body_interrupted`，已收 0 字节。
 pub(super) fn send_failure(e: reqwest::Error, config: &Config) -> AttemptFailure {
     let (connect, timeout) = (e.is_connect(), e.is_timeout());
@@ -173,15 +210,14 @@ pub(super) fn send_failure(e: reqwest::Error, config: &Config) -> AttemptFailure
         }
         (true, false) => AttemptFailure::connect_failed(reason),
         (false, true) => {
-            AttemptFailure::first_byte_timeout(Duration::from_secs(config.read_timeout_secs))
+            AttemptFailure::first_byte_timeout(Duration::from_secs(config.first_byte_timeout_secs))
         }
         (false, false) => AttemptFailure::body_interrupted(0, reason),
     }
 }
 
-/// 把「读响应体」阶段的 reqwest 错误归成尝试失败码：两次读到数据之间超时 →
-/// `upstream_read_idle_timeout`，其余 → `upstream_body_interrupted`。`received_bytes` 是
-/// 出错之前已经收到的响应体字节数。
+/// 把「读响应体」阶段的 reqwest 错误归成尝试失败码：超时 → `upstream_read_idle_timeout`，
+/// 其余 → `upstream_body_interrupted`。`received_bytes` 是出错之前已经收到的响应体字节数。
 pub(super) fn body_failure(
     e: reqwest::Error,
     received_bytes: u64,

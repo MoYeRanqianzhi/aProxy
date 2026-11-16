@@ -86,12 +86,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
-# config.toml 的解析。1.x 与 tauri-utils 等共用一份；依赖树里另有一份 0.8，只在 Linux 带界面版
-# 构建期经 system-deps 用到。0.8 时代这里写过下限 0.8.23：Linux 上 tauri 的 GTK3 一族经
-# glib-macros 引入 proc-macro-crate 2.0，它的 2.0.1、2.0.2 精确钉住 toml_edit =0.20.2，不带锁
-# 文件的 `cargo install aproxy` 会把同属 0.8 线的这里退回从没测过的 0.8.2。换到 1.x 之后两条
-# 版本线互不统一，这个问题不再波及 config 的解析。
-toml = "1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -145,6 +139,9 @@ aproxy-desktop = { version = "=0.2.0-alpha.1", path = "aproxy-desktop", optional
 # 9.0.0 依赖 `brotli-decompressor ~6.0`，升 brotli 时需核对本行。
 brotli-decompressor = "6.0.0"
 ruzstd = "0.9.0"
+# config.toml 的严格解析与写回：解析结果带每个键在原文里的位置（诊断要报行列），改写时保留
+# 用户的注释、空行与键的顺序。上面的 toml 包两样都不给。
+toml_edit = "0.25"
 
 [target.'cfg(windows)'.dependencies]
 # spawn_detached 手写 CreateProcessW（bInheritHandles=FALSE，std 无稳定 API 可关）。

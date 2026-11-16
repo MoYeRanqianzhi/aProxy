@@ -421,6 +421,8 @@ impl TransformPool {
     async fn spawn_worker(&self) -> Result<Worker, TransformError> {
         let mut cmd = tokio::process::Command::new(&self.cfg.command);
         cmd.args(&self.cfg.args)
+            // 配置里给这个程序追加的环境变量（其余的继承本进程的）
+            .envs(&self.cfg.env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())

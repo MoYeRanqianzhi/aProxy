@@ -336,8 +336,18 @@ pub fn port_conflict_findings(
 /// 由调用方生成对应提示。
 pub fn parse_config_file(path: &Path) -> Option<Config> {
     let content = std::fs::read_to_string(path).ok()?;
-    let cfg: Config = toml::from_str(&content).ok()?;
-    Some(cfg.normalized())
+    let (_, diagnostics) = config::file::parse(&content, path);
+    if aproxy_ipc::diag::has_errors(&diagnostics) {
+        return None;
+    }
+    let resolved = config::resolve::resolve_text(
+        Some(&content),
+        path,
+        &config::Overrides::default(),
+        &config::resolve::Defaults::default(),
+        false,
+    );
+    Some(resolved.config)
 }
 
 #[cfg(test)]

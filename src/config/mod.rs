@@ -11,9 +11,14 @@
 //!   可在 URL 内嵌 user:pass，也可用 `proxy_username`/`proxy_password` 单独指定）；
 //!   未配置时保留 reqwest 默认的系统代理（读取 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 环境变量）
 
+pub mod edit;
+pub mod file;
+pub mod resolve;
+
 use std::{collections::HashMap, path::PathBuf};
 
-use serde::{Deserialize, Serialize};
+pub use file::RetryRule;
+pub use resolve::{Overrides, Resolved, Source, resolve};
 
 /// 心跳的内置默认值：SSE 注释，合法 SSE 客户端按规范忽略。
 pub const DEFAULT_KEEPALIVE_HEARTBEAT: &str = ": keepalive\n\n";
@@ -21,26 +26,26 @@ pub const DEFAULT_KEEPALIVE_HEARTBEAT: &str = ": keepalive\n\n";
 /// 心跳写完后客户端 SSE 解析器必须停在事件边界，否则心跳会和随后回放的
 /// 第一个上游事件拼在一起（例如心跳 `data: x\n` 没有空行收尾，解析器会把它
 /// 并进下一个事件的 data）。SSE 的行尾可以是 CRLF、LF 或单独的 CR。规则：
-/// - 非空（不想要心跳字节请把 keepalive_interval_secs 设为 0）；
+/// - 非空（不想要心跳字节请把 `keepalive.interval_secs` 设为 0）；
 /// - 以行尾结束（半行会粘到回放的第一行上）；
 /// - 含字段行（不以 `:` 开头的非空行，如 `event:`、`data:`）时以空行收尾，
 ///   让解析器把这个事件派发掉、清空缓冲。只含注释行与空行时无此要求。
 ///
-/// 返回违反的规则（人类可读），合法时 None。
+/// 返回违反的规则（一句英文，接在键名之后读），合法时 None。
 pub fn heartbeat_problem(hb: &str) -> Option<&'static str> {
     if hb.is_empty() {
-        return Some("不能为空（不需要心跳时把 keepalive_interval_secs 设为 0）");
+        return Some("must not be empty (set keepalive.interval_secs = 0 to turn heartbeats off)");
     }
     let normalized = hb.replace("\r\n", "\n").replace('\r', "\n");
     if !normalized.ends_with('\n') {
-        return Some("必须以换行结尾，否则半行会和回放的第一行拼在一起");
+        return Some("must end with a line break, or the half line joins the first replayed line");
     }
     let has_field = normalized
         .split('\n')
         .any(|line| !line.is_empty() && !line.starts_with(':'));
     if has_field && !normalized.ends_with("\n\n") {
         return Some(
-            "含 event:/data: 等字段行时必须以空行结尾，否则会和回放的第一个事件拼成一个事件",
+            "must end with a blank line when it has field lines such as event: or data:, or it merges with the first replayed event",
         );
     }
     None
@@ -110,8 +115,7 @@ impl KeepaliveTrigger {
 pub const DEFAULT_KEEPALIVE_TRIGGER: KeepaliveTrigger = KeepaliveTrigger::Any;
 
 /// 外部转换器的运行模式（`request_transform`/`response_transform` 的 `mode`）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TransformMode {
     /// 每请求一次性 spawn（默认）：请求时启动进程、写一行信封、读一行回信、
     /// 进程退出。任何能读写 stdin/stdout 的程序都可用，无需循环支持。
@@ -126,40 +130,37 @@ pub enum TransformMode {
 /// 外部转换器配置（`request_transform` / `response_transform` 各一份）。
 /// 指向外部 format 程序：stdin 收一行 JSON 信封、stdout 回一行 JSON 信封。
 /// 信封契约见 aproxy-envelope crate；format 编写指南见 aproxy-format skill。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct TransformConfig {
+    /// 这个程序在配置里的名字（`[[format]]` 的 `name`）。错误体与日志用它指明是哪个程序。
+    pub name: String,
+    /// 追加给程序的环境变量（`[[format]]` 的 `env`）。
+    pub env: std::collections::BTreeMap<String, String>,
     /// format 程序命令（必填非空，validate 拦截）。不走 shell，直接按
     /// argv 数组执行——无注入面。`~` 前缀在加载时展开为用户主目录
     /// （`~/.aproxy/bin/aproxy-format` 可直接使用）；裸文件名走 PATH。
     pub command: String,
     /// format 程序参数（如官方示例的 `["run", "--config", "...toml"]`）。
-    #[serde(default)]
     pub args: Vec<String>,
     /// 运行模式。默认 spawn（一次性）；聚合类 format 必须 persistent。
-    #[serde(default)]
     pub mode: TransformMode,
     /// persistent 模式池上限（并发 worker 数，超限排队）。未配置取
     /// `DEFAULT_TRANSFORM_POOL_MAX`（4）；spawn 模式无意义。
-    #[serde(default)]
     pub pool_max: Option<u32>,
     /// persistent 模式 worker 空闲回收秒数。0 = 永不回收。未配置取
     /// `DEFAULT_TRANSFORM_IDLE_TIMEOUT_SECS`（300）；spawn 模式无意义。
-    #[serde(default)]
     pub idle_timeout_secs: Option<u64>,
     /// 单请求转换超时秒数。0 = 不限。未配置取
     /// `DEFAULT_TRANSFORM_TIMEOUT_SECS`（30）。超时的 worker 不可信
     /// （可能仍在消化旧输入），kill 后剔除。
-    #[serde(default)]
     pub timeout_secs: Option<u64>,
     /// 原样透传进信封 `extra` 字段的字符串（格式无要求，format 自解）。
     /// 官方示例用它传聚合配置文件路径。
-    #[serde(default)]
     pub extra: Option<String>,
     /// 只对 request_transform 有意义：每次重试之前用客户端的原始请求再跑一次
     /// 请求转换（信封 `stage = "retry"`，附上一次失败的状态码或原因），回信就是
     /// 这次尝试发往上游的请求。默认 false = 每个请求只转换一次、各次重试复用。
     /// 这一次的转换失败不会让请求终止（那会违背无限重试），沿用上一次发出的请求。
-    #[serde(default)]
     pub every_attempt: bool,
 }
 
@@ -187,26 +188,20 @@ impl TransformConfig {
 }
 
 /// 配置文件内容
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Config {
     /// 上游 API 的 base URL，例如 `https://api.anthropic.com`
     /// 末尾斜杠会被自动去除以避免拼接时产生 `//`。
-    #[serde(default)]
     pub base_url: String,
     /// 本地代理监听地址，默认 `127.0.0.1:12345`（仅本地可访问，避免局域网暴露）。
-    #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
     /// 快捷 api_key：若设置，等效覆盖 `Authorization: Bearer <api_key>`。
-    #[serde(default)]
     pub api_key: Option<String>,
     /// 额外头：仅在请求未携带该头时追加（大小写不敏感判定）。
-    #[serde(default)]
     pub extra_headers: HashMap<String, String>,
     /// 覆盖头：无条件覆盖请求头（大小写不敏感匹配，写入时保留配置中的大小写）。
-    #[serde(default)]
     pub override_headers: HashMap<String, String>,
     /// 流式重试保活心跳间隔（秒），0 表示关闭。默认 15 秒。
-    #[serde(default = "default_keepalive_secs")]
     pub keepalive_interval_secs: u64,
     /// 保活触发条件：`"accept"` | `"body_stream"` | `"any"`。命中的请求（且
     /// keepalive_interval_secs > 0、非 forward_only）在等待上游与重试期间
@@ -228,7 +223,6 @@ pub struct Config {
     ///
     /// 未设置时用 settings.json 的 `keepalive_trigger`（全局默认，内置 `any`）。
     /// 存原始字符串、由 `KeepaliveTrigger::parse` 解释，非法值 validate() 报错。
-    #[serde(default)]
     pub keepalive_trigger: Option<String>,
     /// 保活心跳：每个 keepalive 间隔原样写给客户端的字节。未设置时为 SSE 注释
     /// `": keepalive\n\n"`（合法 SSE 客户端按规范忽略）。aProxy 不认识任何协议，
@@ -236,45 +230,35 @@ pub struct Config {
     /// 出错、只容得下空行（`"\n"`）；也可以写成一个完整事件。validate() 只把关
     /// 一条与协议无关的规则：写完心跳后客户端的 SSE 解析器必须停在事件边界，
     /// 否则它会和随后回放的第一个上游事件拼成一个事件（见 `heartbeat_problem`）。
-    #[serde(default)]
     pub keepalive_heartbeat: Option<String>,
     /// 上游代理 URL，例如 `http://127.0.0.1:7890`、`socks5://user:pass@127.0.0.1:7890`。
     /// 未设置时使用系统/环境变量代理。
-    #[serde(default)]
     pub proxy: Option<String>,
     /// 代理用户名（可选；优先于代理 URL 内嵌的 user:pass）。
-    #[serde(default)]
     pub proxy_username: Option<String>,
     /// 代理密码（可选；优先于代理 URL 内嵌的密码）。
-    #[serde(default)]
     pub proxy_password: Option<String>,
     /// 重试退避的最大等待时间（秒）。指数退避 5s→10s→20s→…增长到该值后封顶；
     /// 设为 0 表示所有重试零延迟（立即重试）。默认 320 秒。
-    #[serde(default = "default_max_backoff_secs")]
     pub max_retry_backoff_secs: u64,
     /// 上游响应缓冲（spool）上限（MB）。超过即视为不可重试的确定性失败。
     /// 默认 256；小内存机器可调小，转发超大文件可调大。
-    #[serde(default = "default_spool_limit_mb")]
     pub spool_limit_mb: u64,
     /// 上游连接建立超时（秒）。默认 30；慢网络/高延迟上游可调大。
-    #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
     /// 上游两次读到数据之间的超时（秒，同样钳制首字节等待）。默认 300；
     /// LLM 上游排队久（TTFB 数十秒）可调大，调过小会把「慢但活着」的上游
     /// 变成确定性无限重试。
-    #[serde(default = "default_read_timeout_secs")]
     pub read_timeout_secs: u64,
     /// 请求体大小上限（MB），超出直接 413。未设置时用 settings.json 的
     /// `max_body_mb`（全局默认，内置 128）；设 0 表示不设限。
     /// None = toml 未显式配置（由 main 启动时注入 settings 值）。
-    #[serde(default)]
     pub max_body_mb: Option<u64>,
     /// 磁盘缓存：开启时超过内存驻留阈值（1 MiB）的请求体与响应 spool 溢写
     /// 到磁盘临时文件——进程内存与负载大小解耦（SSD 上 IO 开销为噪声级）。
     /// 未设置时用 settings.json 的 `disk_cache`（全局默认，内置 true）。
     /// 高并发大请求体实例务必开启；低并发实例可关闭保持全内存行为。
     /// None = toml 未显式配置（由 main 启动时注入 settings 值）。
-    #[serde(default)]
     pub disk_cache: Option<bool>,
     /// 仅转发模式：请求体边收边转发上游、上游响应边收边回客户端，全程不缓冲、
     /// 不落盘、不重试，也不发保活心跳。进程内存与负载大小完全解耦，下游拿到
@@ -289,24 +273,20 @@ pub struct Config {
     /// 链路整体不进）；`max_body_mb` 仍强制——流式途中计数超限即 413。
     /// 未设置时用 settings.json 的 `forward_only`（全局默认，内置 false）。
     /// None = toml 未显式配置（由 main 启动时注入 settings 值）。
-    #[serde(default)]
     pub forward_only: Option<bool>,
-    /// 受限重试路径（正则数组）：命中任一模式的请求，上游「有响应的失败」达到
-    /// `retry::BOUNDED_RETRY_MAX_ATTEMPTS` 次尝试后不再重试，把最后一次上游
-    /// 响应原样透传给客户端。**空 = 功能关闭**（一切路径照旧无限重试）。
+    /// 重试规则表（config.toml 的 `[[retry.rules]]`）：按书写顺序匹配，第一条全部匹配器都成立的
+    /// 规则生效；第 N 次尝试得到「有上游响应的失败」、命中规则且 N ≥ 它的 `max_attempts` 时不再
+    /// 重试，把最后一次上游响应原样透传。**空 = 一切请求无限重试**。
     ///
-    /// 动机：部分上游对特定端点确定性报错，无限重试只会让客户端永远等不到
-    /// 终态。哪些端点属于这一类完全因上游而异——同一软件换个上游结论就翻转，
-    /// 因此哪些路径受限**交由用户按自己的上游配置**，不内置任何具体 URL。
+    /// 动机：部分上游对特定端点确定性报错，无限重试只会让客户端永远等不到终态。哪些端点属于
+    /// 这一类因上游而异，所以交由用户配置，不内置任何具体 URL。
     ///
-    /// 匹配语义：每个模式是对「`路径?查询串` 整体」的正则，编译时自动锚定
-    /// 两端（`^(?:模式)$`）——不含元字符的普通路径即精准匹配；查询串必须
-    /// 显式出现在模式里（`?` 是正则元字符，字面量写 `\?`；toml 建议用单引号
-    /// 字符串免转义）；通配用 `.*` 等。非法正则在 validate() 即报错，不会
-    /// 静默失效。未设置时用 settings.json 的 `bounded_retry_paths`（全局
-    /// 默认，内置空）。
-    #[serde(default)]
-    pub bounded_retry_paths: Option<Vec<String>>,
+    /// `path` 是对「`路径?查询串` 整体」的正则，编译时自动锚定两端（`^(?:模式)$`）：不含元字符
+    /// 的普通路径即精准匹配；查询串必须显式出现在模式里。`max_attempts = 0` 表示不限，写在宽
+    /// 规则前面当豁免。网络类失败不受规则封顶。
+    pub retry_rules: Vec<RetryRule>,
+    /// 等上游响应头的时限（秒，config.toml 的 `timeouts.first_byte_secs`）。0 = 不设限。
+    pub first_byte_timeout_secs: u64,
     /// 入站 Host 白名单（防 DNS 重绑定）：Host 校验生效时，额外放行的主机名。
     ///
     /// 威胁：恶意网页把自己的域名重绑定到 127.0.0.1 后，浏览器会把它当「同源」
@@ -327,7 +307,6 @@ pub struct Config {
     ///   可把 settings.json 的全局列表恢复成内置默认
     ///
     /// 未设置时用 settings.json 的 `allowed_hosts`（全局默认，内置空）。
-    #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
     /// 入站 Origin 白名单（防网页借本机代理调用上游）：默认拒绝**任何**携带
     /// Origin 头的请求——只有浏览器（及 Electron/WebView 类客户端）会发 Origin，
@@ -340,7 +319,6 @@ pub struct Config {
     /// 的请求）。与监听地址无关（非回环监听同样生效）。
     ///
     /// 未设置时用 settings.json 的 `allowed_origins`（全局默认，内置空）。
-    #[serde(default)]
     pub allowed_origins: Option<Vec<String>>,
     /// 请求转换器（外部 format 程序）：请求体缓冲完成后交给它改写
     /// （body/headers/url/method），重试全程重放转换后的产物。
@@ -349,13 +327,11 @@ pub struct Config {
     /// 的分类说明）。与 forward_only 互斥（后者不缓冲请求体，转换器需要
     /// 全量 body）——共存时 validate() 启动报错。仅 toml 每实例配置，无
     /// settings.json 全局默认层（设计决策：转换是场景特定功能）。
-    #[serde(default)]
     pub request_transform: Option<TransformConfig>,
     /// 响应转换器（外部 format 程序）：重试判定为「成功」后、回放前交给它
     /// 改写响应 body/headers。**失败语义**：转换失败 → 透传上游原始响应 +
     /// warn（响应已在手，可用性优先）——与请求侧的 502 语义不同，各按其性质。
     /// 仅 toml 每实例配置。
-    #[serde(default)]
     pub response_transform: Option<TransformConfig>,
     /// 心跳转换器（外部 format 程序）：保活响应提交之后、真实字节回放之前，
     /// 每个 keepalive 间隔调用一次（信封 `stage = "heartbeat"`），回信的 body
@@ -365,7 +341,6 @@ pub struct Config {
     /// → 这一拍改发固定心跳（同一请求只 warn 一次）；上一拍的调用还没回来时，
     /// 这一拍直接发固定心跳而不排队——心跳不得被慢 format 拖住。请求转换完成
     /// 之前的各拍同样发固定心跳（此时还不知道最终请求）。仅 toml 每实例配置。
-    #[serde(default)]
     pub heartbeat_transform: Option<TransformConfig>,
     /// 守护日志文件路径（自定义去向）：不设时写入 `~/.aproxy/logs/` 下按启动
     /// 时刻随机命名的文件（文件名不含端口——端口是易变标识，换端口重启后
@@ -375,12 +350,10 @@ pub struct Config {
     /// 本字段。**有意不设 settings.json 全局默认层**——日志去向是单实例语义
     /// （每个实例的配置文件各管各的），与 max_body_mb 等四个全局默认字段
     /// 形成对照，这是设计决策而非遗漏。
-    #[serde(default)]
     pub log_file: Option<String>,
     /// spool 临时文件目录覆盖（serde skip，不落盘）。仅测试注入用：集成测试
     /// 进程内构建 AppState 时若无此覆盖，会按端口写入真实 ~/.aproxy/spool/。
     /// 生产路径为 None，实际目录 = ~/.aproxy/spool/<端口>/。
-    #[serde(skip)]
     pub spool_dir_override: Option<PathBuf>,
 }
 
@@ -440,7 +413,8 @@ impl Default for Config {
             max_body_mb: None,
             disk_cache: None,
             forward_only: None,
-            bounded_retry_paths: None,
+            retry_rules: Vec::new(),
+            first_byte_timeout_secs: default_read_timeout_secs(),
             allowed_hosts: None,
             allowed_origins: None,
             request_transform: None,
@@ -512,107 +486,201 @@ impl Config {
         self
     }
 
-    /// 校验：base_url 必须非空且为 http/https URL；proxy 若配置必须为受支持的代理 URL。
-    pub fn validate(&self) -> Result<(), String> {
+    /// 这份配置的全部语义问题（空 = 可以启动）。键是 config.toml 里的键路径，码取自码表的
+    /// 诊断族；`message` 是英文，里面的 URL 已打码。分层解析把它们变成带文件与行列的诊断。
+    pub fn problems(&self) -> Vec<Problem> {
+        let mut out = Vec::new();
+        let mut push =
+            |code: &'static str, key: &str, reason: Option<&'static str>, message: String| {
+                out.push(Problem {
+                    code,
+                    key: key.to_string(),
+                    reason,
+                    message,
+                })
+            };
+        let base = aproxy_ipc::redact::url(&self.base_url);
         if self.base_url.trim().is_empty() {
-            return Err("base_url 不能为空，请在 ~/.aproxy/config.toml 中配置".to_string());
+            push(
+                "config_missing_key",
+                "base_url",
+                None,
+                "base_url is not set: it is the upstream API this instance forwards to".to_string(),
+            );
+        } else if let Err(reason) = self.base_url_problem() {
+            let message = match reason {
+                "not_http_url" => {
+                    format!("base_url must start with http:// or https://, not {base}")
+                }
+                _ => format!(
+                    "base_url must not contain ? or #: the request path is appended to it, so the path would end up in the query ({base})"
+                ),
+            };
+            push("config_invalid_value", "base_url", Some(reason), message);
         }
-        self.validate_base_url()?;
+        // 监听地址必须带端口：缺端口或端口越界时 bind 的失败不是「端口被占用」，提前说清楚
+        if crate::daemon::port_of(&self.listen_addr)
+            .parse::<u16>()
+            .is_err()
+        {
+            push(
+                "config_invalid_value",
+                "listen_addr",
+                Some("no_port"),
+                format!(
+                    "listen_addr has no port or the port is not valid: {} (example: 127.0.0.1:12345)",
+                    self.listen_addr
+                ),
+            );
+        }
         if let Some(p) = &self.proxy {
-            let url = url::Url::parse(p).map_err(|e| format!("proxy 配置无效 ({p}): {e}"))?;
-            let scheme = url.scheme();
-            if !matches!(
-                scheme,
-                "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h"
-            ) {
-                return Err(format!(
-                    "proxy 仅支持 http/https/socks4/socks5 协议，当前值: {p}"
-                ));
-            }
-            if url.host_str().is_none() {
-                return Err(format!("proxy 缺少主机地址: {p}"));
+            let shown = aproxy_ipc::redact::url(p);
+            match url::Url::parse(p) {
+                Err(e) => push(
+                    "config_invalid_value",
+                    "proxy",
+                    Some("not_a_url"),
+                    format!("proxy is not a URL ({shown}): {e}"),
+                ),
+                Ok(url) => {
+                    if !matches!(
+                        url.scheme(),
+                        "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h"
+                    ) {
+                        push(
+                            "config_invalid_value",
+                            "proxy",
+                            Some("unsupported_scheme"),
+                            format!(
+                                "proxy must be an http, https, socks4 or socks5 URL, not {shown}"
+                            ),
+                        );
+                    } else if url.host_str().is_none() {
+                        push(
+                            "config_invalid_value",
+                            "proxy",
+                            Some("no_host"),
+                            format!("proxy has no host: {shown}"),
+                        );
+                    }
+                }
             }
         } else if self.proxy_username.is_some() || self.proxy_password.is_some() {
-            // 仅当显式配置代理 URL 时用户名/密码才有意义，否则是配置遗漏
-            return Err("配置了 proxy_username/proxy_password 但未配置 proxy URL".to_string());
-        }
-        // 受限重试路径：正则合法性在此把关（编译入口与运行期同一，保证
-        // 「校验通过 = 运行期编译必成功」），非法模式启动即报明确错误而非
-        // 静默不匹配
-        for p in self.bounded_retry_paths() {
-            Self::compile_bounded_retry_pattern(p).map_err(|e| {
-                // 原样显示模式（不用 {:?}——Debug 会把 \? 转义成 \\?，用户拿
-                // 错误消息回填 toml 会得到语义不同的正则）
-                format!("bounded_retry_paths 含非法正则 \"{p}\": {e}")
-            })?;
-        }
-        // 保活触发条件：只认三种写法，其余启动即拒绝并点名字段（错误消息里
-        // 带上用户写的原值，便于对照修改）
-        if let Some(t) = &self.keepalive_trigger
-            && KeepaliveTrigger::parse(t).is_none()
-        {
-            return Err(format!(
-                "keepalive_trigger 取值无效 \"{t}\"：只能是 \"accept\"、\"body_stream\" 或 \"any\""
-            ));
+            // 只有配置了代理 URL，用户名与密码才有意义，否则是配置遗漏
+            push(
+                "config_missing_key",
+                "proxy",
+                None,
+                "proxy_username or proxy_password is set but proxy is not".to_string(),
+            );
         }
         if let Some(hb) = &self.keepalive_heartbeat
             && let Some(why) = heartbeat_problem(hb)
         {
-            return Err(format!("keepalive_heartbeat 无效：{why}"));
+            push(
+                "config_invalid_value",
+                "keepalive.heartbeat",
+                Some("breaks_sse_framing"),
+                format!("keepalive.heartbeat {why}"),
+            );
         }
-        // 转换器：command 非空；persistent 模式 pool_max >= 1；与 forward_only
-        // 互斥（后者不缓冲请求体，转换器需要全量 body——两者同开是配置矛盾）
-        for (name, t) in [
-            ("request_transform", &self.request_transform),
-            ("response_transform", &self.response_transform),
-            ("heartbeat_transform", &self.heartbeat_transform),
+        if let Some(t) = &self.keepalive_trigger
+            && KeepaliveTrigger::parse(t).is_none()
+        {
+            push(
+                "config_invalid_value",
+                "keepalive.trigger",
+                Some("not_one_of"),
+                format!(
+                    "keepalive.trigger must be \"accept\", \"body_stream\" or \"any\", not {t:?}"
+                ),
+            );
+        }
+        // 头：名字与值要能写进一个 HTTP 请求，否则每个请求都会在组装时失败
+        if let Some(key) = &self.api_key
+            && http::HeaderValue::from_str(&format!("Bearer {key}")).is_err()
+        {
+            push(
+                "config_invalid_value",
+                "api_key",
+                Some("invalid_header_value"),
+                "api_key contains characters that cannot be sent in an HTTP header".to_string(),
+            );
+        }
+        for (table, headers) in [
+            ("extra_headers", &self.extra_headers),
+            ("override_headers", &self.override_headers),
         ] {
-            let Some(t) = t else { continue };
-            if t.command.trim().is_empty() {
-                return Err(format!("{name} 的 command 不能为空"));
-            }
-            if t.mode == TransformMode::Persistent {
-                let pm = t.pool_max.unwrap_or(DEFAULT_TRANSFORM_POOL_MAX);
-                if pm == 0 {
-                    return Err(format!("{name} 的 pool_max 必须 >= 1，当前值: {pm}"));
+            let mut names: Vec<&String> = headers.keys().collect();
+            names.sort();
+            for name in names {
+                let key = format!("{table}.{}", quote_key(name));
+                if http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                    push(
+                        "config_invalid_value",
+                        &key,
+                        Some("invalid_header_name"),
+                        format!("{name:?} is not a valid HTTP header name"),
+                    );
+                } else if http::HeaderValue::from_str(&headers[name]).is_err() {
+                    push(
+                        "config_invalid_value",
+                        &key,
+                        Some("invalid_header_value"),
+                        format!(
+                            "the value of header {name} contains characters that cannot be sent in an HTTP header"
+                        ),
+                    );
                 }
             }
-            if t.every_attempt && name != "request_transform" {
-                return Err(format!(
-                    "every_attempt 只能用于 request_transform（{name} 每个请求只在固定时机调用）"
-                ));
+        }
+        for (index, rule) in self.retry_rules.iter().enumerate() {
+            if let Some(pattern) = &rule.path
+                && let Err(e) = Self::compile_bounded_retry_pattern(pattern)
+            {
+                push(
+                    "config_invalid_value",
+                    &format!("retry.rules[{index}].path"),
+                    Some("invalid_regex"),
+                    format!("not a valid regular expression: {e}"),
+                );
             }
         }
+        // forward 不缓冲请求体，转换器需要全量 body：两者同开是配置矛盾
         if self.forward_only_enabled()
             && (self.request_transform.is_some()
                 || self.response_transform.is_some()
                 || self.heartbeat_transform.is_some())
         {
-            return Err(
-                "forward_only 与外部转换器互斥：forward_only 不缓冲请求体，转换器需要全量 body（两者只能留一个）"
-                    .to_string(),
+            push(
+                "config_conflict",
+                "delivery",
+                None,
+                "delivery = \"forward\" cannot be combined with a format: forward does not buffer the request body, and a format needs all of it".to_string(),
             );
         }
-        Ok(())
+        out
     }
 
-    /// 校验 base_url 自身的格式（scheme、无 query/fragment）。空值是否允许由调用方
-    /// 决定——启动时禁止，而 `aproxy config` 允许分多次配置的中间态，故单独拆出。
-    pub fn validate_base_url(&self) -> Result<(), String> {
+    /// 校验：没有语义问题时 Ok，否则 Err 带第一个问题的说明（见 [`Config::problems`]）。
+    pub fn validate(&self) -> Result<(), String> {
+        match self.problems().into_iter().next() {
+            None => Ok(()),
+            Some(problem) => Err(problem.message),
+        }
+    }
+
+    /// base_url 自身的格式问题（scheme、无 query/fragment），返回诊断的 `reason`。空值是否
+    /// 允许由调用方决定：启动时禁止，而配置可以分多次写成，中间态合法。
+    pub fn base_url_problem(&self) -> Result<(), &'static str> {
         // scheme 判定大小写不敏感（"HTTP://" 亦合法）
         let scheme_lower = self.base_url.trim().to_ascii_lowercase();
         if !(scheme_lower.starts_with("http://") || scheme_lower.starts_with("https://")) {
-            return Err(format!(
-                "base_url 必须以 http:// 或 https:// 开头，当前值: {}",
-                self.base_url
-            ));
+            return Err("not_http_url");
         }
         // 拒绝带 query/fragment 的 base_url：拼接 path 时会把路径拼进 query，静默错路由
         if self.base_url.contains('?') || self.base_url.contains('#') {
-            return Err(format!(
-                "base_url 不应包含 ? 或 #（路径拼接会错路由），当前值: {}",
-                self.base_url
-            ));
+            return Err("has_query_or_fragment");
         }
         Ok(())
     }
@@ -685,16 +753,8 @@ impl Config {
         self.forward_only.unwrap_or(DEFAULT_FORWARD_ONLY)
     }
 
-    /// 受限重试路径模式列表（同 body_limit_bytes 的注入/回退语义：toml 显式
-    /// 值 > settings 注入值 > 内置空 = 功能关闭）。
-    /// 消费点必须走本方法而非 `Option::unwrap()`——不经 settings 注入的构建
-    /// 路径（doctor/find/测试）上 `None` 是常态。
-    pub fn bounded_retry_paths(&self) -> &[String] {
-        self.bounded_retry_paths.as_deref().unwrap_or(&[])
-    }
-
-    /// 编译一个受限重试路径模式：对「`路径?查询串` 整体」匹配，自动锚定两端
-    /// ——不含元字符的普通路径即精准匹配，通配需显式写 `.*`。validate() 与
+    /// 编译重试规则的 `path` 模式：对「`路径?查询串` 整体」匹配，自动锚定两端
+    /// ——不含元字符的普通路径即精准匹配，通配需显式写 `.*`。配置的解析与
     /// AppState::new 共用此入口，两处语义不可能分叉。
     pub fn compile_bounded_retry_pattern(pattern: &str) -> Result<regex::Regex, regex::Error> {
         regex::Regex::new(&format!("^(?:{pattern})$"))
@@ -809,61 +869,84 @@ pub fn config_dir() -> PathBuf {
     aproxy_ipc::home::home()
 }
 
-/// 加载配置：若文件不存在则返回默认配置（base_url 为空，后续 validate 会提示）。
-pub fn load() -> Config {
-    load_from(&config_path())
+/// 配置的一个语义问题（见 [`Config::problems`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Problem {
+    /// 码表里诊断族的名字
+    pub code: &'static str,
+    /// config.toml 里的键路径
+    pub key: String,
+    /// `config_invalid_value` 的 `details.reason`
+    pub reason: Option<&'static str>,
+    /// 一句英文说明，URL 已打码
+    pub message: String,
 }
 
-/// 严格加载：文件存在但 TOML 解析失败时返回 Err（含解析错误详情），
-/// 其余语义同 `load_from`。启动路径必须用这个——宽松版会把解析失败静默
-/// 回退成默认配置（base_url 空），启动报错于是变成误导性的「base_url 不能
-/// 为空」，而用户文件里明明写了（2026-09-22 大审查实测实锤）；守护模式下
-/// 真相只存在于日志文件里，主报错带偏排障方向。
-pub fn load_from_strict(path: &std::path::Path) -> Result<Config, String> {
-    match std::fs::read_to_string(path) {
-        Ok(content) => match toml::from_str::<Config>(&content) {
-            Ok(cfg) => Ok(cfg.normalized()),
-            Err(e) => Err(format!(
-                "配置文件解析失败（TOML 语法错误）: {e}\n文件: {}",
-                path.display()
-            )),
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-        Err(e) => Err(format!("读取配置文件失败: {e}\n文件: {}", path.display())),
-    }
+/// 键路径里的一段：名字，以及（数组里的条目）下标。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeySegment {
+    pub name: String,
+    pub index: Option<usize>,
 }
 
-/// 加载指定路径的配置：语义同 `load`（不存在/解析失败回退默认配置）。
-/// 多开场景由 `--config <PATH>` 显式指定路径；是否要求文件存在由调用方决定。
-pub fn load_from(path: &std::path::Path) -> Config {
-    match std::fs::read_to_string(path) {
-        Ok(content) => match toml::from_str::<Config>(&content) {
-            Ok(cfg) => cfg.normalized(),
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "配置文件解析失败，使用默认配置");
-                Config::default()
+/// 解析键路径：点号分隔，名字里有点号等字符时加引号，数组条目带下标，例如
+/// `retry.max_backoff_secs`、`extra_headers."x.y"`、`format[1].stages`。写法不对时返回 None。
+pub fn parse_key_path(path: &str) -> Option<Vec<KeySegment>> {
+    let mut segments = Vec::new();
+    let mut rest = path;
+    loop {
+        let name;
+        if let Some(quoted) = rest.strip_prefix('"') {
+            // 带引号的一段：反斜杠转义它后面的一个字符
+            let mut out = String::new();
+            let mut chars = quoted.char_indices();
+            let end = loop {
+                match chars.next()? {
+                    (i, '"') => break i,
+                    (_, '\\') => out.push(chars.next()?.1),
+                    (_, c) => out.push(c),
+                }
+            };
+            name = out;
+            rest = &quoted[end + 1..];
+        } else {
+            let end = rest.find(['.', '[']).unwrap_or(rest.len());
+            name = rest[..end].to_string();
+            let bare = !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+            if !bare {
+                return None;
             }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "读取配置文件失败，使用默认配置");
-            Config::default()
+            rest = &rest[end..];
         }
+        let mut index = None;
+        if let Some(after) = rest.strip_prefix('[') {
+            let close = after.find(']')?;
+            index = Some(after[..close].parse().ok()?);
+            rest = &after[close + 1..];
+        }
+        segments.push(KeySegment { name, index });
+        if rest.is_empty() {
+            return Some(segments);
+        }
+        rest = rest.strip_prefix('.')?;
     }
 }
 
-/// 保存配置到默认路径（自动创建目录）。
-pub fn save(cfg: &Config) -> std::io::Result<()> {
-    save_to(&config_path(), cfg)
-}
-
-/// 保存配置到指定路径（自动创建目录）。多开场景配合 `--config <PATH>` 使用。
-pub fn save_to(path: &std::path::Path, cfg: &Config) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// 把一个名字写成 TOML 键路径里的一段：裸键原样，其余加引号（`x-api-key` 是裸键，
+/// `a.b` 要写成 `"a.b"`）。
+pub fn quote_key(name: &str) -> String {
+    let bare = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if bare {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
     }
-    let content = toml::to_string_pretty(cfg).expect("序列化配置失败");
-    std::fs::write(path, content)
 }
 
 #[cfg(test)]
@@ -965,68 +1048,6 @@ mod tests {
     }
 
     #[test]
-    fn save_and_load_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        let mut cfg = Config {
-            base_url: "https://api.example.com".to_string(),
-            listen_addr: "127.0.0.1:9999".to_string(),
-            ..Default::default()
-        };
-        cfg.api_key = Some("sk-test".to_string());
-        cfg.extra_headers
-            .insert("x-extra".to_string(), "1".to_string());
-        cfg.override_headers
-            .insert("authorization".to_string(), "Bearer x".to_string());
-        save_to(&path, &cfg).unwrap();
-        let loaded = load_from(&path);
-        assert_eq!(loaded.base_url, cfg.base_url);
-        assert_eq!(loaded.listen_addr, cfg.listen_addr);
-        assert_eq!(loaded.api_key, cfg.api_key);
-        assert_eq!(loaded.extra_headers.get("x-extra").unwrap(), "1");
-        assert_eq!(
-            loaded.override_headers.get("authorization").unwrap(),
-            "Bearer x"
-        );
-    }
-
-    #[test]
-    fn load_missing_returns_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nonexistent.toml");
-        let cfg = load_from(&path);
-        assert!(cfg.base_url.is_empty());
-        assert_eq!(cfg.listen_addr, default_listen_addr());
-    }
-
-    #[test]
-    fn strict_load_reports_syntax_error_and_accepts_missing() {
-        // 严格加载：语法错误必须报 Err（含详情）——启动路径依赖它把「toml
-        // 写坏了」与「字段缺失」区分开；文件不存在与宽松版同为默认配置。
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("broken.toml");
-        std::fs::write(
-            &path,
-            "base_url = \"https://x.example.com\"\nbroken = {unclosed",
-        )
-        .unwrap();
-        let err = load_from_strict(&path).unwrap_err();
-        assert!(err.contains("解析失败"), "{err}");
-        assert!(err.contains("unclosed"), "错误应含 TOML 解析详情: {err}");
-        assert!(err.contains(&path.display().to_string()), "{err}");
-
-        // 文件不存在：Ok(默认)——「还没写配置」不是错误（validate 再把关）
-        let missing = dir.path().join("absent.toml");
-        let cfg = load_from_strict(&missing).unwrap();
-        assert!(cfg.base_url.is_empty());
-
-        // 合法文件：与宽松版同结果
-        std::fs::write(&path, "base_url = \"https://x.example.com\"").unwrap();
-        let strict = load_from_strict(&path).unwrap();
-        assert_eq!(strict.base_url, "https://x.example.com");
-    }
-
-    #[test]
     fn accept_encoding_override_shadowed_only_when_keepalive_rewrites_it() {
         let with = |value: &str| Config {
             override_headers: HashMap::from([("Accept-Encoding".to_string(), value.to_string())]),
@@ -1090,92 +1111,6 @@ mod tests {
     }
 
     #[test]
-    fn tuning_fields_roundtrip() {
-        // 三个调参字段写入读出 + 旧配置文件（无字段）读出默认值
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cfg.toml");
-        let cfg = Config {
-            base_url: "https://api.example.com".to_string(),
-            spool_limit_mb: 64,
-            connect_timeout_secs: 60,
-            read_timeout_secs: 600,
-            ..Default::default()
-        };
-        save_to(&path, &cfg).unwrap();
-        let loaded = load_from(&path);
-        assert_eq!(loaded.spool_limit_mb, 64);
-        assert_eq!(loaded.connect_timeout_secs, 60);
-        assert_eq!(loaded.read_timeout_secs, 600);
-        std::fs::write(&path, "base_url = \"https://api.example.com\"").unwrap();
-        let legacy = load_from(&path);
-        assert_eq!(legacy.spool_limit_mb, 256);
-        assert_eq!(legacy.connect_timeout_secs, 30);
-        assert_eq!(legacy.read_timeout_secs, 300);
-    }
-
-    #[test]
-    fn body_limit_and_disk_cache_override_semantics() {
-        // toml 覆盖字段：显式值/0（不设限）写入读出；未配置（None）时
-        // body_limit_bytes 回退内置默认 128MB，disk_cache_enabled 回退 true。
-        // None 语义是「运行时由 settings 注入」，此处验证的是注入前的回退。
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cfg.toml");
-        let cfg = Config {
-            base_url: "https://api.example.com".to_string(),
-            max_body_mb: Some(0),
-            disk_cache: Some(false),
-            ..Default::default()
-        };
-        save_to(&path, &cfg).unwrap();
-        let loaded = load_from(&path);
-        assert_eq!(loaded.max_body_mb, Some(0));
-        assert_eq!(loaded.disk_cache, Some(false));
-        assert_eq!(loaded.body_limit_bytes(), usize::MAX, "0 = 不设限");
-        assert!(!loaded.disk_cache_enabled());
-
-        // 未配置：回退内置默认（128MB / 开启）
-        std::fs::write(&path, "base_url = \"https://api.example.com\"").unwrap();
-        let legacy = load_from(&path);
-        assert_eq!(legacy.max_body_mb, None);
-        assert_eq!(
-            legacy.body_limit_bytes(),
-            128 * 1024 * 1024,
-            "None 回退内置 128MB"
-        );
-        assert!(legacy.disk_cache_enabled(), "None 回退内置开启");
-    }
-
-    #[test]
-    fn forward_only_override_semantics() {
-        // toml 覆盖字段：Some(true)/Some(false) 落盘往返；未配置（None）时
-        // forward_only_enabled 回退内置默认 false。None 语义是「运行时由
-        // settings 注入」，此处验证的是注入前的回退（doctor / find / 测试
-        // 直接构建 AppState 时正是这条路径，故绝不能对 None 做 unwrap）。
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cfg.toml");
-        for value in [true, false] {
-            let cfg = Config {
-                base_url: "https://api.example.com".to_string(),
-                forward_only: Some(value),
-                ..Default::default()
-            };
-            save_to(&path, &cfg).unwrap();
-            let loaded = load_from(&path);
-            assert_eq!(loaded.forward_only, Some(value), "显式值应落盘往返");
-            assert_eq!(loaded.forward_only_enabled(), value);
-        }
-
-        // 未配置：回退内置默认（关闭）
-        std::fs::write(&path, "base_url = \"https://api.example.com\"").unwrap();
-        let legacy = load_from(&path);
-        assert_eq!(legacy.forward_only, None, "旧配置文件应读出 None");
-        assert!(
-            !legacy.forward_only_enabled(),
-            "None 回退内置关闭（默认不得启用仅转发模式）"
-        );
-    }
-
-    #[test]
     fn keepalive_heartbeat_default_and_boundary_rule() {
         let base = || Config {
             base_url: "https://x.example.com".into(),
@@ -1205,162 +1140,8 @@ mod tests {
             }
             .validate()
             .unwrap_err();
-            assert!(err.contains("keepalive_heartbeat"), "{bad:?}: {err}");
+            assert!(err.contains("keepalive.heartbeat"), "{bad:?}: {err}");
         }
-    }
-
-    #[test]
-    fn keepalive_trigger_override_and_validate() {
-        // 三种合法写法落盘往返、访问器解释一致；未配置回退内置 any（Claude Code
-        // 的流式请求是 Accept: application/json + stream:true，默认必须覆盖它）；
-        // 非法写法 validate 点名字段拒绝
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cfg.toml");
-        for (raw, want) in [
-            ("accept", KeepaliveTrigger::Accept),
-            ("body_stream", KeepaliveTrigger::BodyStream),
-            ("any", KeepaliveTrigger::Any),
-        ] {
-            let cfg = Config {
-                base_url: "https://api.example.com".to_string(),
-                keepalive_trigger: Some(raw.to_string()),
-                ..Default::default()
-            };
-            save_to(&path, &cfg).unwrap();
-            let loaded = load_from(&path);
-            assert_eq!(loaded.keepalive_trigger.as_deref(), Some(raw));
-            assert_eq!(loaded.keepalive_trigger(), want);
-            assert_eq!(want.as_str(), raw, "as_str 必须是 parse 的逆");
-            assert!(loaded.validate().is_ok());
-        }
-
-        std::fs::write(&path, "base_url = \"https://api.example.com\"").unwrap();
-        let legacy = load_from(&path);
-        assert_eq!(legacy.keepalive_trigger, None, "旧配置文件应读出 None");
-        assert_eq!(legacy.keepalive_trigger(), KeepaliveTrigger::Any);
-
-        for bad in ["Any", "stream", "", "accept "] {
-            let cfg = Config {
-                base_url: "https://api.example.com".to_string(),
-                keepalive_trigger: Some(bad.to_string()),
-                ..Default::default()
-            };
-            let err = cfg.validate().unwrap_err();
-            assert!(
-                err.contains("keepalive_trigger") && err.contains(&format!("\"{bad}\"")),
-                "错误应点名字段并带原值: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn bounded_retry_paths_matching_semantics() {
-        // 匹配语义钉死：模式对「路径?查询串」整体生效且自动锚定——
-        // 普通路径即精准匹配（不含查询串时不命中带查询串的请求），
-        // 通配必须显式写正则。
-        let m = |pattern: &str, target: &str| {
-            Config::compile_bounded_retry_pattern(pattern)
-                .unwrap()
-                .is_match(target)
-        };
-        // 精准匹配：路径本身命中，路径不带查询串的模式不命中带查询串的请求
-        assert!(m("/v1/messages/count_tokens", "/v1/messages/count_tokens"));
-        assert!(!m(
-            "/v1/messages/count_tokens",
-            "/v1/messages/count_tokens?beta=true"
-        ));
-        assert!(!m(
-            "/v1/messages/count_tokens",
-            "/v1/messages/count_tokens_extra"
-        ));
-        assert!(!m("/v1/messages/count_tokens", "/v1/messages"));
-        // 查询串必须显式出现在模式中（`?` 是正则元字符，字面量需转义 `\?`）
-        assert!(m(
-            "/v1/messages/count_tokens\\?.*",
-            "/v1/messages/count_tokens?beta=true"
-        ));
-        assert!(!m(
-            "/v1/messages/count_tokens\\?.*",
-            "/v1/messages/count_tokens"
-        ));
-        // 通配：`.*` 覆盖任意后缀；前缀式模式可同时命中带/不带查询串的请求
-        assert!(m(
-            "/v1/messages/count_tokens.*",
-            "/v1/messages/count_tokens"
-        ));
-        assert!(m(
-            "/v1/messages/count_tokens.*",
-            "/v1/messages/count_tokens?beta=true"
-        ));
-        assert!(!m("/v1/messages/count_tokens.*", "/v1/messages"));
-        // 自动锚定：模式不会作为子串命中其他路径
-        assert!(!m("/messages", "/v1/messages/count_tokens"));
-        // 顶层交替依赖包裹的非捕获组 (?:...)：锚定必须罩住整个交替，否则
-        // ^/a|/b$ 的右支会作为子串命中任意以 /b 结尾的路径（误封顶）
-        assert!(m("/a|/b", "/a"));
-        assert!(m("/a|/b", "/b"));
-        assert!(!m("/a|/b", "/x/y/b"));
-        // 用户自带的 ^ $ 锚点在包裹内仍合法且语义不变
-        assert!(m("^/x$", "/x"));
-        assert!(!m("^/x$", "/x/y"));
-    }
-
-    #[test]
-    fn bounded_retry_paths_accessor_and_validate() {
-        // 访问器注入/回退语义与 validate 的非法正则拒绝
-        let mut cfg = Config {
-            base_url: "https://api.example.com".to_string(),
-            ..Default::default()
-        };
-        assert!(
-            cfg.bounded_retry_paths().is_empty(),
-            "None 回退空 = 功能关闭"
-        );
-
-        cfg.bounded_retry_paths = Some(vec!["/v1/messages/count_tokens".to_string()]);
-        assert_eq!(cfg.bounded_retry_paths().len(), 1);
-        cfg.validate().expect("合法正则应通过校验");
-
-        let bad = Config {
-            base_url: "https://api.example.com".to_string(),
-            bounded_retry_paths: Some(vec!["[unclosed".to_string()]),
-            ..Default::default()
-        };
-        let err = bad.validate().unwrap_err();
-        assert!(err.contains("bounded_retry_paths"), "错误应指明字段: {err}");
-        assert!(err.contains("[unclosed"), "错误应包含非法模式原文: {err}");
-    }
-
-    #[test]
-    fn bounded_retry_paths_toml_roundtrip() {
-        // toml 往返：该字段唯一入口就是手编文件（无 CLI 旗标），单引号字面量
-        // 写法（正则含 \? 时免转义）必须保真；旧配置（无该字段）读出 None 且
-        // 访问器回退空。
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cfg.toml");
-        let raw = concat!(
-            "base_url = \"https://api.example.com\"\n",
-            "bounded_retry_paths = ['/v1/messages/count_tokens', '/v1/messages/count_tokens\\?.*']\n",
-        );
-        std::fs::write(&path, raw).unwrap();
-        let loaded = load_from(&path);
-        assert_eq!(
-            loaded.bounded_retry_paths(),
-            [
-                "/v1/messages/count_tokens".to_string(),
-                "/v1/messages/count_tokens\\?.*".to_string()
-            ],
-            "单引号 toml 字面量里的 \\? 必须原样保真（不能被 TOML 转义吃掉）"
-        );
-        // 往返后模式仍可编译且语义不变
-        let re = Config::compile_bounded_retry_pattern(&loaded.bounded_retry_paths()[1]).unwrap();
-        assert!(re.is_match("/v1/messages/count_tokens?beta=true"));
-
-        // 旧配置（无该字段）：None + 访问器回退空
-        std::fs::write(&path, "base_url = \"https://api.example.com\"").unwrap();
-        let legacy = load_from(&path);
-        assert_eq!(legacy.bounded_retry_paths, None);
-        assert!(legacy.bounded_retry_paths().is_empty());
     }
 
     #[test]
@@ -1431,73 +1212,6 @@ mod tests {
                 .unwrap()
                 .contains("共享给整个局域网")
         );
-    }
-
-    #[test]
-    fn allowed_hosts_and_origins_roundtrip_and_default() {
-        // 两个入站白名单：toml 往返保真；旧配置（无字段）读出 None、访问器回退空
-        // （= 内置默认策略）
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cfg.toml");
-        let raw = concat!(
-            "base_url = \"https://api.example.com\"\n",
-            "allowed_hosts = [\"myproxy.local\", \"*\"]\n",
-            "allowed_origins = [\"http://localhost:5173\"]\n",
-        );
-        std::fs::write(&path, raw).unwrap();
-        let loaded = load_from(&path);
-        assert_eq!(loaded.allowed_hosts(), ["myproxy.local", "*"]);
-        assert_eq!(loaded.allowed_origins(), ["http://localhost:5173"]);
-
-        std::fs::write(&path, "base_url = \"https://api.example.com\"").unwrap();
-        let legacy = load_from(&path);
-        assert_eq!(legacy.allowed_hosts, None);
-        assert_eq!(legacy.allowed_origins, None);
-        assert!(legacy.allowed_hosts().is_empty() && legacy.allowed_origins().is_empty());
-    }
-
-    #[test]
-    fn log_file_roundtrip_and_default() {
-        // log_file：显式值落盘往返；旧配置文件（无该字段）读出 None
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cfg.toml");
-        let cfg = Config {
-            base_url: "https://api.example.com".to_string(),
-            log_file: Some("/var/log/aproxy/inst-a.log".to_string()),
-            ..Default::default()
-        };
-        save_to(&path, &cfg).unwrap();
-        let loaded = load_from(&path);
-        assert_eq!(
-            loaded.log_file.as_deref(),
-            Some("/var/log/aproxy/inst-a.log"),
-            "显式值应落盘往返"
-        );
-
-        // 旧配置（无该字段）：None = 内置随机命名
-        std::fs::write(&path, "base_url = \"https://api.example.com\"").unwrap();
-        let legacy = load_from(&path);
-        assert_eq!(legacy.log_file, None, "旧配置文件应读出 None");
-    }
-
-    #[test]
-    fn max_backoff_roundtrip_and_zero() {
-        // 自定义封顶写入读出；0（所有重试零延迟）也必须能落盘往返
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cfg.toml");
-        let mut cfg = Config {
-            base_url: "https://api.example.com".to_string(),
-            ..Default::default()
-        };
-        cfg.max_retry_backoff_secs = 60;
-        save_to(&path, &cfg).unwrap();
-        assert_eq!(load_from(&path).max_retry_backoff_secs, 60);
-        cfg.max_retry_backoff_secs = 0;
-        save_to(&path, &cfg).unwrap();
-        assert_eq!(load_from(&path).max_retry_backoff_secs, 0);
-        // 旧版配置文件（无该字段）读出默认 320
-        std::fs::write(&path, "base_url = \"https://api.example.com\"").unwrap();
-        assert_eq!(load_from(&path).max_retry_backoff_secs, 320);
     }
 
     #[test]
@@ -1649,24 +1363,6 @@ mod tests {
     }
 
     #[test]
-    fn proxy_survives_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        let cfg = Config {
-            base_url: "https://api.example.com".to_string(),
-            proxy: Some("socks5://127.0.0.1:1080".to_string()),
-            proxy_username: Some("alice".to_string()),
-            proxy_password: Some("secret".to_string()),
-            ..Default::default()
-        };
-        save_to(&path, &cfg).unwrap();
-        let loaded = load_from(&path);
-        assert_eq!(loaded.proxy, cfg.proxy);
-        assert_eq!(loaded.proxy_username, cfg.proxy_username);
-        assert_eq!(loaded.proxy_password, cfg.proxy_password);
-    }
-
-    #[test]
     fn transform_config_defaults_and_effective_values() {
         // 未配置的池/空闲/超时参数回退 DEFAULT_* 常量；0 值显式配置原样保留
         // （语义由消费方解释：idle 0=永不回收、timeout 0=不限）
@@ -1698,50 +1394,6 @@ mod tests {
     }
 
     #[test]
-    fn transform_config_toml_roundtrip_and_legacy_default() {
-        // toml 往返：mode 字符串、args、extra 均保真；旧配置（无字段）读出 None
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cfg.toml");
-        let raw = concat!(
-            "base_url = \"https://api.example.com\"\n",
-            "[request_transform]\n",
-            "command = \"aproxy-format\"\n",
-            "args = [\"run\", \"--config\", \"agg.toml\"]\n",
-            "mode = \"persistent\"\n",
-            "pool_max = 8\n",
-            "extra = \"{\\\"keys\\\":[\\\"k1\\\"]}\"\n",
-        );
-        std::fs::write(&path, raw).unwrap();
-        let loaded = load_from(&path);
-        let rt = loaded
-            .request_transform
-            .as_ref()
-            .expect("应读出 request_transform");
-        assert_eq!(rt.command, "aproxy-format");
-        assert_eq!(
-            rt.args,
-            vec![
-                "run".to_string(),
-                "--config".to_string(),
-                "agg.toml".to_string()
-            ]
-        );
-        assert_eq!(rt.mode, TransformMode::Persistent);
-        assert_eq!(rt.effective_pool_max(), 8);
-        assert!(rt.extra.as_deref().unwrap_or("").contains("k1"));
-        assert!(
-            loaded.response_transform.is_none(),
-            "未配置的 response_transform 应为 None"
-        );
-
-        // 旧配置文件（无两字段）：读出 None（升级安全）
-        std::fs::write(&path, "base_url = \"https://api.example.com\"").unwrap();
-        let legacy = load_from(&path);
-        assert!(legacy.request_transform.is_none());
-        assert!(legacy.response_transform.is_none());
-    }
-
-    #[test]
     fn normalized_blank_transform_command_becomes_none() {
         // command 纯空白 = 配置视为未设置；有值则 trim 保留
         let cfg = Config {
@@ -1765,37 +1417,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_transform_without_command() {
-        let cfg = Config {
-            base_url: "https://api.example.com".to_string(),
-            request_transform: Some(TransformConfig {
-                command: String::new(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("request_transform"), "错误应指明字段: {err}");
-        assert!(err.contains("command"), "{err}");
-    }
-
-    #[test]
-    fn validate_rejects_persistent_pool_max_zero() {
-        let cfg = Config {
-            base_url: "https://api.example.com".to_string(),
-            request_transform: Some(TransformConfig {
-                command: "f".to_string(),
-                mode: TransformMode::Persistent,
-                pool_max: Some(0),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("pool_max"), "{err}");
-    }
-
-    #[test]
     fn validate_rejects_forward_only_with_transform() {
         // 互斥：forward_only 不缓冲请求体，转换器需要全量 body——同开是配置矛盾，
         // 必须启动即报错而非静默丢弃其一
@@ -1814,7 +1435,7 @@ mod tests {
             };
             let err = cfg.validate().unwrap_err();
             assert!(
-                err.contains("互斥"),
+                err.contains("cannot be combined with a format"),
                 "{name} 转换器 + forward_only 应报互斥: {err}"
             );
         }
@@ -1831,38 +1452,109 @@ mod tests {
         assert!(cfg.validate().is_ok());
     }
 
+    /// 每个语义问题带着码表里的码与 config.toml 的键路径；说明里的 URL 已打码。
     #[test]
-    fn every_attempt_is_only_for_the_request_transform() {
-        // 响应与心跳转换器的调用时机是固定的，写上 every_attempt 是配错了地方：
-        // 启动即报错，而不是静默无效
-        let t = || TransformConfig {
-            command: "f".to_string(),
-            every_attempt: true,
-            ..Default::default()
-        };
-        for name in ["response", "heartbeat"] {
-            let cfg = Config {
-                base_url: "https://api.example.com".to_string(),
-                response_transform: (name == "response").then(t),
-                heartbeat_transform: (name == "heartbeat").then(t),
-                ..Default::default()
-            };
-            let err = cfg.validate().unwrap_err();
-            assert!(err.contains("every_attempt"), "{name}: {err}");
-        }
+    fn problems_carry_codes_and_key_paths() {
         let cfg = Config {
-            base_url: "https://api.example.com".to_string(),
-            request_transform: Some(t()),
+            base_url: "ftp://user:secret@a.example".to_string(),
+            listen_addr: "127.0.0.1".to_string(),
+            api_key: Some("bad\nkey".to_string()),
+            proxy_username: Some("u".to_string()),
+            keepalive_heartbeat: Some("data: x".to_string()),
+            extra_headers: HashMap::from([
+                ("bad name".to_string(), "v".to_string()),
+                ("x-ok".to_string(), "bad\nvalue".to_string()),
+            ]),
+            retry_rules: vec![
+                RetryRule {
+                    path: Some("/ok".to_string()),
+                    status: None,
+                    max_attempts: 1,
+                },
+                RetryRule {
+                    path: Some("(".to_string()),
+                    status: None,
+                    max_attempts: 1,
+                },
+            ],
             ..Default::default()
         };
-        assert!(cfg.validate().is_ok());
-        // toml 里的写法
-        let parsed: TransformConfig = toml::from_str(
-            "command = \"f\"
-every_attempt = true
-",
-        )
-        .unwrap();
-        assert!(parsed.every_attempt);
+        let problems = cfg.problems();
+        let brief: Vec<String> = problems
+            .iter()
+            .map(|p| format!("{} {} {}", p.code, p.key, p.reason.unwrap_or("-")))
+            .collect();
+        assert_eq!(
+            brief,
+            [
+                "config_invalid_value base_url not_http_url",
+                "config_invalid_value listen_addr no_port",
+                "config_missing_key proxy -",
+                "config_invalid_value keepalive.heartbeat breaks_sse_framing",
+                "config_invalid_value api_key invalid_header_value",
+                "config_invalid_value extra_headers.\"bad name\" invalid_header_name",
+                "config_invalid_value extra_headers.x-ok invalid_header_value",
+                "config_invalid_value retry.rules[1].path invalid_regex",
+            ]
+        );
+        assert!(
+            !problems[0].message.contains("secret"),
+            "{}",
+            problems[0].message
+        );
+        for problem in &problems {
+            assert!(aproxy_ipc::code::lookup(problem.code).is_some());
+        }
+
+        let ok = Config {
+            base_url: "https://a.example".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(ok.problems(), []);
+    }
+
+    #[test]
+    fn key_paths_parse_and_quote() {
+        let seg = |name: &str, index: Option<usize>| KeySegment {
+            name: name.to_string(),
+            index,
+        };
+        assert_eq!(
+            parse_key_path("base_url"),
+            Some(vec![seg("base_url", None)])
+        );
+        assert_eq!(
+            parse_key_path("retry.rules[2].path"),
+            Some(vec![
+                seg("retry", None),
+                seg("rules", Some(2)),
+                seg("path", None)
+            ])
+        );
+        assert_eq!(
+            parse_key_path(r#"extra_headers."x.y \"z\"""#),
+            Some(vec![seg("extra_headers", None), seg("x.y \"z\"", None)])
+        );
+        for bad in [
+            "", ".a", "a.", "a..b", "a b", "a[x]", "a[1", "\"open", "a\"b\"",
+        ] {
+            assert_eq!(parse_key_path(bad), None, "{bad:?}");
+        }
+        // quote_key 写出的一段，parse_key_path 读得回来
+        for name in [
+            "x-api-key",
+            "a.b",
+            "has space",
+            "quo\"te",
+            "back\\slash",
+            "",
+        ] {
+            let path = format!("t.{}", quote_key(name));
+            assert_eq!(
+                parse_key_path(&path),
+                Some(vec![seg("t", None), seg(name, None)]),
+                "{path}"
+            );
+        }
     }
 }

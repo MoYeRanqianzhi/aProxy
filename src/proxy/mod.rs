@@ -118,4 +118,5 @@ pub use handler::router;
 pub(crate) use headers::is_hop_header;
 pub use spool::SpooledBody;
 pub(crate) use spool::unique_seq;
-pub use state::AppState;
+use state::first_matching_rule;
+pub use state::{AppState, CompiledRetryRule};

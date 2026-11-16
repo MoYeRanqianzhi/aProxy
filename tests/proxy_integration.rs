@@ -145,7 +145,14 @@ fn proxy_config_for(upstream: &str) -> Config {
 /// 构建带受限重试路径模式（bounded_retry_paths）的代理配置，其余同 proxy_config_for
 fn proxy_config_with_bounded_paths(upstream: &str, patterns: &[&str]) -> Config {
     let mut cfg = proxy_config_for(upstream);
-    cfg.bounded_retry_paths = Some(patterns.iter().map(|s| s.to_string()).collect());
+    cfg.retry_rules = patterns
+        .iter()
+        .map(|s| aproxy::config::RetryRule {
+            path: Some(s.to_string()),
+            status: None,
+            max_attempts: 3,
+        })
+        .collect();
     cfg
 }
 
@@ -4719,7 +4726,7 @@ fn cli_config_flag_scopes_config_subcommand() {
         "配置应写入 --config 指定的文件，实际: {saved}"
     );
     assert!(
-        saved.contains("keepalive_interval_secs = 30"),
+        saved.contains("[keepalive]\ninterval_secs = 30"),
         "其他字段应一并保存，实际: {saved}"
     );
 
@@ -6516,7 +6523,7 @@ fn ipc_stats_reflect_forward_only_traffic() {
     std::fs::write(
         &cfg_file,
         format!(
-            "base_url = \"{upstream}\"\nlisten_addr = \"127.0.0.1:{port}\"\nforward_only = true\n"
+            "base_url = \"{upstream}\"\nlisten_addr = \"127.0.0.1:{port}\"\ndelivery = \"forward\"\n"
         ),
     )
     .unwrap();
@@ -6720,7 +6727,7 @@ fn credentials_masked_in_start_output_registry_and_daemon_log() {
 }
 
 // ---------------------------------------------------------------------------
-// 36. config --show：URL 凭据、transform 的 args 密钥值与 extra 一律打码
+// 36. config --show：URL 凭据、format 的 args 密钥值与 env 的值一律不显示
 // ---------------------------------------------------------------------------
 #[test]
 fn config_show_masks_url_credentials_and_transform_secrets() {
@@ -6731,10 +6738,11 @@ fn config_show_masks_url_credentials_and_transform_secrets() {
         concat!(
             "base_url = \"https://TOKENUSER@api.example.com/v1\"\n",
             "proxy = \"http://puser:PROXYPASS@127.0.0.1:7890?token=QSECRET\"\n",
-            "[request_transform]\n",
+            "[[format]]\n",
             "command = \"fmt\"\n",
+            "stages = [\"request\"]\n",
             "args = [\"run\", \"--api-key\", \"SUPERSECRET2\", \"--token=TOKSECRET\"]\n",
-            "extra = \"{\\\"keys\\\":[\\\"sk-EXTRASECRET\\\"]}\"\n",
+            "env = { KEYS = \"sk-EXTRASECRET\" }\n",
         ),
     )
     .unwrap();
@@ -6762,7 +6770,7 @@ fn config_show_masks_url_credentials_and_transform_secrets() {
         "https://***@api.example.com/v1",
         "http://***@127.0.0.1:7890?token=***",
         "--api-key, SUPERS***",
-        "已打码",
+        "env              = KEYS（值不显示）",
     ] {
         assert!(
             stdout.contains(shape),
@@ -7051,4 +7059,169 @@ async fn request_id_is_the_same_in_header_body_and_log() {
         !second.iter().any(|line| line.contains("retry_exhausted")),
         "两个请求的日志不串"
     );
+}
+
+// ---------------------------------------------------------------------------
+// config.toml 的严格解析与写回（命令行一侧）
+// ---------------------------------------------------------------------------
+
+/// 任何不认识的键都让启动失败，报错指出文件、键路径与行号——顶层的键、重试规则里的键、
+/// `[[format]]` 条目里的键都一样；0.1.x 的旧键名也只是「不认识」。失败发生在拉起任何进程
+/// 之前。
+#[test]
+fn unknown_config_keys_fail_start_naming_file_and_key() {
+    let home = TestHome::new();
+    let cases = [
+        ("forward_only = true\n", "forward_only", 2),
+        ("[timeouts]\nread_secs = 1\n", "timeouts.read_secs", 3),
+        (
+            "[[retry.rules]]\nmax_attempts = 3\nheader = \"x\"\n",
+            "retry.rules[0].header",
+            4,
+        ),
+        (
+            "[[format]]\ncommand = \"f\"\nstages = [\"request\"]\nmode = \"spawn\"\n",
+            "format[0].mode",
+            5,
+        ),
+    ];
+    for (index, (extra, key, line)) in cases.iter().enumerate() {
+        let cfg_file = home.path().join(format!("unknown-{index}.toml"));
+        std::fs::write(
+            &cfg_file,
+            format!("base_url = \"https://api.example.com\"\n{extra}"),
+        )
+        .unwrap();
+        let out = home.cmd().arg("--config").arg(&cfg_file).output().unwrap();
+        assert!(!out.status.success(), "{key}: 应启动失败");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let expected = format!("{}:{line}:", cfg_file.display());
+        assert!(
+            stderr.contains(&expected)
+                && stderr.contains(&format!("{key}: unknown key"))
+                && stderr.contains("[config_unknown_key]"),
+            "{key}: 报错应指出文件、行与键，实际:\n{stderr}"
+        );
+    }
+    let status = home.cmd().arg("status").output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&status.stdout).contains("127.0.0.1:"),
+        "不应有实例被拉起"
+    );
+}
+
+/// `aproxy config` 只改目标键：注释、空行与键的顺序原样保留；`--unset` 删得掉不认识的键；
+/// 会让配置无效的改动不写入、退出码 3。
+#[test]
+fn config_command_edits_in_place_and_unsets_unknown_keys() {
+    let home = TestHome::new();
+    let cfg_file = home.path().join("edit.toml");
+    let original = "# 我的上游\nbase_url = \"https://old.example.com\"  # 行尾注释\nlegacy_key = 1\n\n# 超时\n[timeouts]\nconnect_secs = 5\n";
+    std::fs::write(&cfg_file, original).unwrap();
+    let run = |args: &[&str]| {
+        home.cmd()
+            .arg("--config")
+            .arg(&cfg_file)
+            .arg("config")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    // 文件里有一个不认识的键：展示照常，附上诊断与删除它的命令，退出码 3
+    let show = run(&["--show"]);
+    assert_eq!(show.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&show.stderr);
+    assert!(
+        stderr.contains("legacy_key: unknown key") && stderr.contains("--unset 'legacy_key'"),
+        "{stderr}"
+    );
+    assert!(String::from_utf8_lossy(&show.stdout).contains("old.example.com"));
+
+    // 原有的错误不挡住无关的改动
+    let out = run(&[
+        "--baseurl",
+        "https://new.example.com/",
+        "--keepalive-secs",
+        "20",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cfg_file).unwrap(),
+        "# 我的上游\nbase_url = \"https://new.example.com\"  # 行尾注释\nlegacy_key = 1\n\n# 超时\n[timeouts]\nconnect_secs = 5\n\n[keepalive]\ninterval_secs = 20\n"
+    );
+
+    // 删掉不认识的键之后配置有效
+    assert!(run(&["--unset", "legacy_key"]).status.success());
+    let show = run(&["--show"]);
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        stdout.contains("timeouts.connect_secs      = 5  （config.toml）")
+            && stdout.contains("timeouts.read_idle_secs    = 300  （内置默认）"),
+        "每个值后面注明来源:\n{stdout}"
+    );
+
+    // 会让配置无效的改动不写入
+    let before = std::fs::read_to_string(&cfg_file).unwrap();
+    let bad = run(&["--baseurl", "ftp://nope.example.com"]);
+    assert_eq!(bad.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("[config_invalid_value]"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&cfg_file).unwrap(), before);
+    // 删一个不存在的键也成功
+    assert!(run(&["--unset", "never.was.here"]).status.success());
+    assert_eq!(std::fs::read_to_string(&cfg_file).unwrap(), before);
+}
+
+/// 多个进程同时各改各的键：一个更新都不丢（写锁串行化了「读、改、写」）。
+#[test]
+fn concurrent_config_writers_do_not_lose_updates() {
+    let home = TestHome::new();
+    let cfg_file = home.path().join("race.toml");
+    std::fs::write(
+        &cfg_file,
+        "# 保留\nbase_url = \"https://api.example.com\"\n",
+    )
+    .unwrap();
+    const WRITERS: usize = 6;
+    let children: Vec<_> = (0..WRITERS)
+        .map(|i| {
+            home.cmd()
+                .arg("--config")
+                .arg(&cfg_file)
+                .args(["config", "--extra-header", &format!("x-writer-{i}=v{i}")])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let saved = std::fs::read_to_string(&cfg_file).unwrap();
+    assert!(saved.starts_with("# 保留\n"), "{saved}");
+    for i in 0..WRITERS {
+        assert!(
+            saved.contains(&format!("x-writer-{i} = \"v{i}\"")),
+            "第 {i} 个写者的更新丢了:\n{saved}"
+        );
+    }
 }

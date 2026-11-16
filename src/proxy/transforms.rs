@@ -99,7 +99,7 @@ impl PerAttemptTransform {
 /// 全部可变）——默认转换**一次**，产物被重试循环的每一轮 forward_once 原样重放；
 /// `every_attempt` 打开时顺带留下原始请求，供每次重试前重新转换（见
 /// [`PerAttemptTransform`]）。位置约束：必须在首轮 forward_once 之前（否则重放的是未
-/// 转换请求）、bounded_retry 匹配之后（bounded 对原始路径判定——路径集合是
+/// 转换请求）、重试规则的路径匹配之后（规则对原始路径判定——路径集合是
 /// 客户端视角，转换是实例级配置，语义不同源）。未配置时原样返回。
 ///
 /// 失败返回这个请求的终态（已记日志与最近一次失败）：请求未发往上游，按约定
@@ -177,7 +177,7 @@ pub(super) async fn apply_request_transform(
             })
         }
         Err(e) => {
-            let terminal = request_transform_terminal(&e);
+            let terminal = request_transform_terminal(&request_format_name(state), &e);
             state.note_upstream_failure(&terminal.summary());
             tracing::warn!(code = %terminal.code(), error = %e, "请求转换失败，终态返回（请求侧转换失败按约定不重试）");
             Err(terminal)
@@ -185,20 +185,29 @@ pub(super) async fn apply_request_transform(
     }
 }
 
-/// 请求转换器在码与日志里的名字。现在一个实例只有一个请求转换器，没有自己的名字，用
-/// 配置键名指代它。
-const REQUEST_FORMAT_NAME: &str = "request_transform";
+/// 请求侧 format 程序在错误体与日志里的名字：配置里它的 `name`（没写时是 `command` 的文件名
+/// 主干）。不经配置文件、直接构造出来的配置可能没有名字，那时用 `request` 指代它。
+fn request_format_name(state: &AppState) -> String {
+    state
+        .config
+        .request_transform
+        .as_ref()
+        .map(|t| t.name.as_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("request")
+        .to_string()
+}
 
 /// 请求转换失败对应的终态：
 /// - format 用信封的 error 行明确拒绝了这个请求 → `format_rejected`；
 /// - 落盘的请求体读不回来（本地磁盘的问题，与 format 无关）→ `local_storage_failed`；
 /// - 其余是 format 程序本身出了问题（起不来、管道断了、超时、中途退出、输出不合协议）→
 ///   `format_failed`，`kind` 说明是哪一种。
-fn request_transform_terminal(e: &crate::transform::TransformError) -> Terminal {
+fn request_transform_terminal(format: &str, e: &crate::transform::TransformError) -> Terminal {
     use crate::transform::TransformError as E;
     let kind = match e {
         E::Rejected(reason) => {
-            return Terminal::format_rejected(REQUEST_FORMAT_NAME, "request", reason);
+            return Terminal::format_rejected(format, "request", reason);
         }
         E::Spool(io) => {
             return Terminal::local_storage_failed(StorageOp::ReadRequest, &io.to_string());
@@ -209,7 +218,7 @@ fn request_transform_terminal(e: &crate::transform::TransformError) -> Terminal 
         E::WorkerDied => "died",
         E::Protocol(_) | E::Serialize(_) => "protocol",
     };
-    Terminal::format_failed(REQUEST_FORMAT_NAME, "request", kind, &e.to_string())
+    Terminal::format_failed(format, "request", kind, &e.to_string())
 }
 
 /// 响应侧转换入口（尝试循环交付成功响应时调用）：未配置时原样返回；转换失败时 warn + 原样

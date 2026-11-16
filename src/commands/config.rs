@@ -2,7 +2,8 @@
 
 use std::path::PathBuf;
 
-use aproxy::config;
+use aproxy::config::edit::{Change, EditError};
+use aproxy::config::{self, Source};
 use aproxy::settings;
 
 use crate::util::{mask_secret, parse_kv};
@@ -45,17 +46,6 @@ fn mask_transform_args(args: &[String]) -> Vec<String> {
     out
 }
 
-/// 展示前守卫：配置文件存在但解析失败时 load() 会静默回退默认值，`--show` 打印的
-/// 「当前配置」并非用户文件的真实内容——至少要警告，避免误导排障。
-fn warn_if_config_broken(path: &std::path::Path) {
-    if let Ok(content) = std::fs::read_to_string(path)
-        && let Err(e) = toml::from_str::<aproxy::config::Config>(&content)
-    {
-        eprintln!("警告: 配置文件解析失败，以下展示的是回退默认值而非文件内容");
-        eprintln!("解析错误: {e}");
-    }
-}
-
 pub(crate) fn handle_config_cmd(
     path: Result<PathBuf, String>,
     args: ConfigArgs,
@@ -74,6 +64,7 @@ pub(crate) fn handle_config_cmd(
         clear_api_key,
         clear_headers,
         clear_proxy,
+        unset,
         set_default,
         clear_default,
         show,
@@ -119,357 +110,386 @@ pub(crate) fn handle_config_cmd(
 
     // 以下编辑/查看 toml 内容，才真正需要配置文件路径
     let path = super::require_cfg_path(path);
-    let mut cfg = config::load_from(&path);
+    let fail = |msg: String| -> ! {
+        eprintln!("{msg}");
+        crate::util::exit(1)
+    };
+    let non_empty = |value: String, name: &str, clear: &str| -> String {
+        let value = value.trim().to_string();
+        if value.is_empty() {
+            fail(format!("{name} 不能为空（用 {clear} 清空）"));
+        }
+        value
+    };
 
-    let mut changed = false;
+    let mut changes: Vec<Change> = Vec::new();
     if let Some(u) = baseurl {
-        cfg.base_url = u.trim_end_matches('/').to_string();
-        changed = true;
+        changes.push(Change::set("base_url", u.trim().trim_end_matches('/')));
     }
     if let Some(l) = listen {
-        cfg.listen_addr = l;
-        changed = true;
+        changes.push(Change::set("listen_addr", l.trim()));
     }
     if clear_api_key {
-        cfg.api_key = None;
-        changed = true;
+        changes.push(Change::unset("api_key"));
     } else if let Some(k) = api_key {
-        if k.trim().is_empty() {
-            eprintln!("api_key 不能为空（用 --clear-api-key 清空）");
-            std::process::exit(1);
-        }
-        cfg.api_key = Some(k.trim().to_string());
-        changed = true;
+        changes.push(Change::set(
+            "api_key",
+            non_empty(k, "api_key", "--clear-api-key"),
+        ));
     }
     if clear_headers {
-        cfg.extra_headers.clear();
-        cfg.override_headers.clear();
-        changed = true;
+        changes.push(Change::unset("extra_headers"));
+        changes.push(Change::unset("override_headers"));
     }
-    for kv in extra_headers {
-        let Some((k, v)) = parse_kv(&kv) else {
-            eprintln!("extra-header 格式错误，应为 key=value，得到: {kv}");
-            std::process::exit(1);
-        };
-        cfg.extra_headers.insert(k, v);
-        changed = true;
-    }
-    for kv in override_headers {
-        let Some((k, v)) = parse_kv(&kv) else {
-            eprintln!("override-header 格式错误，应为 key=value，得到: {kv}");
-            std::process::exit(1);
-        };
-        cfg.override_headers.insert(k, v);
-        changed = true;
+    for (table, flag, list) in [
+        ("extra_headers", "extra-header", extra_headers),
+        ("override_headers", "override-header", override_headers),
+    ] {
+        for kv in list {
+            let Some((k, v)) = parse_kv(&kv) else {
+                fail(format!("{flag} 格式错误，应为 key=value，得到: {kv}"));
+            };
+            changes.push(Change::set(
+                &format!("{table}.{}", config::quote_key(&k)),
+                v,
+            ));
+        }
     }
     if let Some(s) = keepalive_secs {
-        cfg.keepalive_interval_secs = s;
-        changed = true;
+        changes.push(Change::set("keepalive.interval_secs", s as i64));
     }
     if clear_proxy {
-        cfg.proxy = None;
-        cfg.proxy_username = None;
-        cfg.proxy_password = None;
-        changed = true;
-    } else if let Some(p) = proxy {
-        if p.trim().is_empty() {
-            eprintln!("proxy 不能为空（用 --clear-proxy 清空）");
-            std::process::exit(1);
+        for key in ["proxy", "proxy_username", "proxy_password"] {
+            changes.push(Change::unset(key));
         }
-        cfg.proxy = Some(p.trim().to_string());
-        changed = true;
+    } else if let Some(p) = proxy {
+        changes.push(Change::set("proxy", non_empty(p, "proxy", "--clear-proxy")));
     }
     if let Some(u) = proxy_username {
-        if u.trim().is_empty() {
-            eprintln!("proxy-username 不能为空（用 --clear-proxy 清空）");
-            std::process::exit(1);
-        }
-        cfg.proxy_username = Some(u.trim().to_string());
-        changed = true;
+        changes.push(Change::set(
+            "proxy_username",
+            non_empty(u, "proxy-username", "--clear-proxy"),
+        ));
     }
     if let Some(p) = proxy_password {
-        if p.trim().is_empty() {
-            eprintln!("proxy-password 不能为空（用 --clear-proxy 清空）");
-            std::process::exit(1);
-        }
-        cfg.proxy_password = Some(p.trim().to_string());
-        changed = true;
+        changes.push(Change::set(
+            "proxy_password",
+            non_empty(p, "proxy-password", "--clear-proxy"),
+        ));
+    }
+    for key in unset {
+        changes.push(Change::unset(&key));
     }
 
+    let defaults =
+        config::resolve::Defaults::from_settings(&settings::load(), &settings::settings_path());
+    let changed = !changes.is_empty();
     if changed {
-        // 保存前守卫：配置文件存在但解析失败时 load() 会静默回退默认值，
-        // 直接保存会把用户手写（或损坏）的配置整个覆盖掉——拒绝修改并报告解析错误。
-        if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    if let Err(e) = toml::from_str::<aproxy::config::Config>(&content) {
-                        eprintln!(
-                            "现有配置文件解析失败，拒绝覆盖（请先修复或删除 {}）",
-                            path.display()
-                        );
-                        eprintln!("解析错误: {e}");
-                        std::process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("读取配置文件失败: {e}");
-                    std::process::exit(1);
+        // 只改这几个键：文件里的注释、键的顺序与其余内容原样保留。会引入新错误的改动
+        // 不写入；文件里原有的、与这次改动无关的错误不挡路，可以逐项修
+        match config::edit::apply(&path, &aproxy_ipc::home::home(), &defaults, &changes) {
+            Ok(applied) if applied.changed => println!("已保存配置到 {}", applied.file.display()),
+            Ok(applied) => println!("配置没有变化: {}", applied.file.display()),
+            Err(EditError::BadKey(key)) => {
+                eprintln!(
+                    "键路径写法不对: {key}（点号分隔，例如 timeouts.connect_secs、extra_headers.\"x-foo\"；数组表只能整体删除）"
+                );
+                crate::util::exit(aproxy_ipc::code::EXIT_USAGE as i32)
+            }
+            Err(EditError::Syntax(diagnostics)) => {
+                eprintln!(
+                    "现有配置文件有语法错误，没有修改（请先修复或删除 {}）:",
+                    path.display()
+                );
+                print_diagnostics(&diagnostics);
+                crate::util::exit(aproxy_ipc::code::EXIT_CONFIG as i32)
+            }
+            Err(EditError::Invalid(diagnostics)) => {
+                eprintln!("这次修改会让配置无效，没有保存:");
+                print_diagnostics(&diagnostics);
+                crate::util::exit(aproxy_ipc::code::EXIT_CONFIG as i32)
+            }
+            Err(EditError::Conflict) => fail(format!(
+                "配置文件一直在被别的程序修改，没有保存（关掉正在编辑它的程序后重试）: {}",
+                path.display()
+            )),
+            Err(EditError::LockBusy) => fail(
+                "另一个 aproxy 正在写配置，等了 10 秒仍未结束，没有保存（稍后重试）".to_string(),
+            ),
+            Err(EditError::Io(e)) => fail(format!("保存配置失败: {e}")),
+        }
+    }
+    if show || !changed {
+        // 显式 --config 指向的文件不存在时，展示的只是默认值（抬头却是用户给的路径）——
+        // 纯粹的排障误导，报错而非静默回退。写操作不受此限：--config 指向新路径 + 修改
+        // 参数是「创建新实例配置」的合法入口（多开工作流）；默认路径豁免：首配场景就是
+        // 在尚不存在的 config.toml 上创建。
+        if explicit_config && !path.is_file() {
+            fail(format!("指定的配置文件不存在: {}", path.display()));
+        }
+        let resolved = match config::resolve(&path, &config::Overrides::default(), &defaults) {
+            Ok(resolved) => resolved,
+            Err(e) => fail(format!("读取配置文件失败: {e}\n文件: {}", path.display())),
+        };
+        print_effective(&path, &resolved);
+        if !resolved.is_valid() {
+            // 有 error 时照样显示，附上诊断；这份配置现在启动不了
+            eprintln!();
+            eprintln!("这份配置有错误，现在不能用来启动:");
+            let errors: Vec<_> = resolved.errors().cloned().collect();
+            print_diagnostics(&errors);
+            if resolved.config.base_url.is_empty() {
+                eprintln!();
+                eprintln!("提示: base_url 为空，请设置:");
+                eprintln!("  aproxy config --baseurl https://api.anthropic.com");
+            }
+            let unknown: Vec<&str> = errors
+                .iter()
+                .filter(|d| d.code == "config_unknown_key")
+                .filter_map(|d| d.key.as_deref())
+                .collect();
+            if !unknown.is_empty() {
+                eprintln!();
+                eprintln!("不认识的键可以这样删除:");
+                for key in unknown {
+                    eprintln!("  aproxy config --unset '{key}'");
                 }
             }
+            crate::util::exit(aproxy_ipc::code::EXIT_CONFIG as i32)
         }
-        cfg = cfg.normalized();
-        // 保存前校验已设置的 base_url 格式（允许为空——首次配置可分多次完成，中间态
-        // 合法）；否则 query 形式的 base_url 会被存盘，直到下次启动才报错
-        if !cfg.base_url.is_empty()
-            && let Err(msg) = cfg.validate_base_url()
-        {
-            // 错误消息内嵌 base_url 原文（可能带 user:pass），同一脱敏出口
-            let msg = msg.replace(&cfg.base_url, &aproxy_ipc::redact::url(&cfg.base_url));
-            eprintln!("base_url 无效，未保存: {msg}");
-            std::process::exit(1);
+    }
+}
+
+/// 逐条打印诊断（stderr）：`文件:行:列: 键: 说明 [码]`。
+fn print_diagnostics(diagnostics: &[aproxy_ipc::diag::Diagnostic]) {
+    for d in diagnostics {
+        eprintln!("  {}", aproxy::ops::start::render_diagnostic(d));
+    }
+}
+
+/// 来源的中文说法（展示在每个值后面）。
+fn source_label(source: Option<Source>) -> &'static str {
+    match source {
+        Some(Source::Override) => "命令行",
+        Some(Source::Toml) => "config.toml",
+        Some(Source::Settings) => "settings.json 全局默认",
+        Some(Source::Env) => "环境变量",
+        Some(Source::Default) => "内置默认",
+        None => "未设置",
+    }
+}
+
+/// 打印一份配置的生效值：每个键一行，后面注明它来自哪一层。密钥只显示打码后的样子。
+fn print_effective(path: &std::path::Path, resolved: &config::Resolved) {
+    let cfg = &resolved.config;
+    let line = |key: &str, value: String| {
+        println!(
+            "{key:<26} = {value}  （{}）",
+            source_label(resolved.sources.get(key).copied())
+        );
+    };
+    let quoted = |s: &str| format!("\"{s}\"");
+    let optional = |v: Option<String>| v.unwrap_or_else(|| "(未设置)".to_string());
+    // 0 在这几个键上有特别的含义，写在值后面
+    let with_zero = |n: u64, zero: &str| {
+        if n == 0 {
+            format!("0（{zero}）")
+        } else {
+            n.to_string()
         }
-        match config::save_to(&path, &cfg) {
-            Ok(()) => println!("已保存配置到 {}", path.display()),
-            Err(e) => {
-                eprintln!("保存配置失败: {e}");
-                std::process::exit(1);
+    };
+    let list = |items: &[String], empty: &str| {
+        if items.is_empty() {
+            format!("[]（{empty}）")
+        } else {
+            // 原样列出（不用 {:?}：Debug 会把正则里的 \? 写成 \\?，对照 toml 会被误导）
+            format!("[{}]", items.join(", "))
+        }
+    };
+
+    println!("配置文件: {}", path.display());
+    line("base_url", quoted(&aproxy_ipc::redact::url(&cfg.base_url)));
+    line("listen_addr", quoted(&cfg.listen_addr));
+    line(
+        "api_key",
+        optional(cfg.api_key.as_deref().map(|k| quoted(&mask_secret(k)))),
+    );
+    line(
+        "delivery",
+        if cfg.forward_only_enabled() {
+            "\"forward\"（边收边转：不缓冲、不重试）".to_string()
+        } else {
+            "\"retry\"".to_string()
+        },
+    );
+    line(
+        "max_request_mb",
+        with_zero(
+            cfg.max_body_mb.unwrap_or(config::DEFAULT_MAX_BODY_MB),
+            "不设限",
+        ),
+    );
+    line("max_response_mb", cfg.spool_limit_mb.to_string());
+    line("disk_cache", cfg.disk_cache_enabled().to_string());
+    line(
+        "allowed_hosts",
+        list(
+            cfg.allowed_hosts(),
+            "内置默认：回环监听只放行 localhost / 127.0.0.1 / [::1]",
+        ),
+    );
+    line(
+        "allowed_origins",
+        list(
+            cfg.allowed_origins(),
+            "内置默认：拒绝一切携带 Origin 的浏览器请求",
+        ),
+    );
+    line(
+        "log_file",
+        optional(cfg.log_file.clone())
+            + if cfg.log_file.is_none() {
+                "（~/.aproxy/logs/ 下按启动随机命名，实际路径看 aproxy status）"
+            } else {
+                ""
+            },
+    );
+    line(
+        "timeouts.connect_secs",
+        with_zero(cfg.connect_timeout_secs, "不设限"),
+    );
+    line(
+        "timeouts.first_byte_secs",
+        with_zero(cfg.first_byte_timeout_secs, "不设限"),
+    );
+    line(
+        "timeouts.read_idle_secs",
+        with_zero(cfg.read_timeout_secs, "不设限"),
+    );
+    line(
+        "keepalive.interval_secs",
+        with_zero(cfg.keepalive_interval_secs, "保活关闭"),
+    );
+    line(
+        "keepalive.trigger",
+        format!(
+            "\"{}\"（accept=看 Accept 头 / body_stream=看请求体 stream:true / any=任一）",
+            cfg.keepalive_trigger().as_str()
+        ),
+    );
+    // 心跳字节通常含换行：按字符串字面量形式（{:?}）打印，换行显示为 `\n`，与 toml 里的
+    // 写法一一对应
+    line(
+        "keepalive.heartbeat",
+        format!("{:?}", String::from_utf8_lossy(cfg.keepalive_heartbeat())),
+    );
+    line(
+        "retry.max_backoff_secs",
+        with_zero(cfg.max_retry_backoff_secs, "所有重试零延迟"),
+    );
+    line(
+        "retry.rules",
+        if cfg.retry_rules.is_empty() {
+            "[]（一切请求无限重试）".to_string()
+        } else {
+            format!("{} 条", cfg.retry_rules.len())
+        },
+    );
+    for (index, rule) in cfg.retry_rules.iter().enumerate() {
+        let path = rule.path.as_deref().unwrap_or("(任何路径)");
+        let status = match &rule.status {
+            Some(codes) => codes
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            None => "(任何状态码)".to_string(),
+        };
+        let limit = match rule.max_attempts {
+            0 => "不限（豁免）".to_string(),
+            n => format!("第 {n} 次失败后透传"),
+        };
+        println!("  {}. path = {path}  status = {status}  {limit}", index + 1);
+    }
+
+    // format 程序：请求、响应、心跳各至多一个
+    let formats = [
+        ("request", &cfg.request_transform),
+        ("response", &cfg.response_transform),
+        ("heartbeat", &cfg.heartbeat_transform),
+    ];
+    if formats.iter().all(|(_, t)| t.is_none()) {
+        line("format", "[]".to_string());
+    }
+    for (stage, t) in formats {
+        let Some(t) = t else { continue };
+        println!("format \"{}\"（{stage} 阶段）:", t.name);
+        println!("  command          = \"{}\"", t.command);
+        if !t.args.is_empty() {
+            // 多 key 轮换类 format 常把 key 直接写在 args 里
+            println!(
+                "  args             = [{}]",
+                mask_transform_args(&t.args).join(", ")
+            );
+        }
+        if !t.env.is_empty() {
+            // 环境变量的值只写不读：只列名字
+            let names: Vec<&str> = t.env.keys().map(String::as_str).collect();
+            println!("  env              = {}（值不显示）", names.join(", "));
+        }
+        match t.mode {
+            config::TransformMode::Spawn => {
+                println!("  process          = spawn（每条消息起一个进程）")
             }
+            config::TransformMode::Persistent => println!(
+                "  process          = persistent（进程池 pool_max={}，空闲 {}）",
+                t.effective_pool_max(),
+                match t.effective_idle_timeout_secs() {
+                    0 => "永不回收".to_string(),
+                    secs => format!("{secs}s 后回收"),
+                }
+            ),
+        }
+        println!(
+            "  timeout_secs     = {}",
+            with_zero(t.effective_timeout_secs(), "不限")
+        );
+        if t.every_attempt {
+            println!("  每次重试前用原始请求重新转换（声明了 retry 阶段）");
         }
     }
 
-    if show || !changed {
-        // 显式 --config 指向的文件不存在时，展示的只是内置默认值（抬头却是
-        // 用户给的路径）——纯粹的排障误导，报错而非静默回退。写操作不受此限：
-        // --config 指向新路径 + 修改参数是「创建新实例配置」的合法入口（多开
-        // 工作流）；默认路径豁免：首配场景就是在尚不存在的 config.toml 上创建。
-        if explicit_config && !path.is_file() {
-            eprintln!("指定的配置文件不存在: {}", path.display());
-            std::process::exit(1);
+    line(
+        "proxy",
+        optional(cfg.proxy.as_deref().map(aproxy_ipc::redact::url)),
+    );
+    line("proxy_username", optional(cfg.proxy_username.clone()));
+    line(
+        "proxy_password",
+        optional(cfg.proxy_password.as_ref().map(|_| "***".to_string())),
+    );
+    for (table, headers) in [
+        ("extra_headers", &cfg.extra_headers),
+        ("override_headers", &cfg.override_headers),
+    ] {
+        if headers.is_empty() {
+            println!("{table:<26} = (空)");
+            continue;
         }
-        // 重新加载以展示最终值
-        warn_if_config_broken(&path);
-        let cfg = config::load_from(&path).normalized();
-        println!("配置文件: {}", path.display());
-        println!(
-            "base_url     = \"{}\"",
-            aproxy_ipc::redact::url(&cfg.base_url)
-        );
-        println!("listen_addr  = \"{}\"", cfg.listen_addr);
-        println!(
-            "api_key      = {}",
-            cfg.api_key
-                .as_deref()
-                .map(mask_secret)
-                .map(|s| format!("\"{s}\""))
-                .unwrap_or_else(|| "(未设置)".to_string())
-        );
-        println!("keepalive_interval_secs = {}", cfg.keepalive_interval_secs);
-        // keepalive_trigger：同 max_body_mb 等的三态来源展示；原值原样打印（含
-        // 非法写法——此处不校验，start/doctor 会点名报错，展示真实内容便于对照）
-        match &cfg.keepalive_trigger {
-            Some(t) => println!(
-                "keepalive_trigger       = {t}（accept=看 Accept 头 / body_stream=看请求体 stream:true / any=任一）"
-            ),
-            None => println!(
-                "keepalive_trigger       = （未在 toml 设置，运行时取 settings.json 全局默认）"
-            ),
-        }
-        // 心跳字节通常含换行：按字符串字面量形式（{:?}）打印，换行显示为 `\n`，
-        // 与 toml 里的写法一一对应
-        match &cfg.keepalive_heartbeat {
-            Some(hb) => println!("keepalive_heartbeat     = {hb:?}"),
-            None => println!(
-                "keepalive_heartbeat     = （未设置，用内置的 \": keepalive\\n\\n\" 注释）"
-            ),
-        }
-        // 0 表示所有重试零延迟，语义特殊，提示出来
-        if cfg.max_retry_backoff_secs == 0 {
-            println!("max_retry_backoff_secs = 0（所有重试零延迟）");
-        } else {
-            println!("max_retry_backoff_secs = {}", cfg.max_retry_backoff_secs);
-        }
-        println!("spool_limit_mb          = {}", cfg.spool_limit_mb);
-        // max_body_mb / disk_cache：None = toml 未显式配置（运行时由 settings
-        // 注入），展示生效值更利于排障——但此处 cfg 未经启动注入，注明来源
-        match cfg.max_body_mb {
-            Some(0) => println!("max_body_mb             = 0（不设限）"),
-            Some(mb) => println!("max_body_mb             = {mb}"),
-            None => println!(
-                "max_body_mb             = （未在 toml 设置，运行时取 settings.json 全局默认）"
-            ),
-        }
-        match cfg.disk_cache {
-            Some(dc) => println!("disk_cache              = {dc}"),
-            None => println!(
-                "disk_cache              = （未在 toml 设置，运行时取 settings.json 全局默认）"
-            ),
-        }
-        // forward_only：None 与 Some 一起展示来源；true 必须把「放弃重试」
-        // 写在脸上——它不是一个无害的性能开关
-        match cfg.forward_only {
-            Some(true) => {
-                println!("forward_only            = true（仅转发：不缓冲、不重试）")
-            }
-            Some(false) => println!("forward_only            = false"),
-            None => println!(
-                "forward_only            = （未在 toml 设置，运行时取 settings.json 全局默认）"
-            ),
-        }
-        // bounded_retry_paths：与上面三个 Option 字段同款的三态展示；空列表
-        // 显式标注「功能关闭」，有值时**原样**列出模式（不能用 {:?}——Debug
-        // 会把 \? 转义成 \\?，用户对照 toml 会被误导）
-        match &cfg.bounded_retry_paths {
-            Some(list) if list.is_empty() => {
-                println!("bounded_retry_paths     = []（功能关闭）")
-            }
-            Some(list) => {
-                println!(
-                    "bounded_retry_paths     = [{}]（命中者失败 3 次即透传）",
-                    list.join(", ")
-                )
-            }
-            None => println!(
-                "bounded_retry_paths     = （未在 toml 设置，运行时取 settings.json 全局默认）"
-            ),
-        }
-        // 入站白名单：同款三态展示；空列表注明它等于内置默认策略（不是「全拒」
-        // 也不是「全放」，两种误读都会把排障带偏）
-        match &cfg.allowed_hosts {
-            Some(list) if list.is_empty() => println!(
-                "allowed_hosts           = []（内置默认：回环监听只放行 localhost / 127.0.0.1 / [::1]）"
-            ),
-            Some(list) => println!("allowed_hosts           = [{}]", list.join(", ")),
-            None => println!(
-                "allowed_hosts           = （未在 toml 设置，运行时取 settings.json 全局默认）"
-            ),
-        }
-        match &cfg.allowed_origins {
-            Some(list) if list.is_empty() => println!(
-                "allowed_origins         = []（内置默认：拒绝一切携带 Origin 的浏览器请求）"
-            ),
-            Some(list) => println!("allowed_origins         = [{}]", list.join(", ")),
-            None => println!(
-                "allowed_origins         = （未在 toml 设置，运行时取 settings.json 全局默认）"
-            ),
-        }
-        // 0 表示不设限，语义特殊，提示出来
-        if cfg.connect_timeout_secs == 0 {
-            println!("connect_timeout_secs    = 0（不设限）");
-        } else {
-            println!("connect_timeout_secs    = {}", cfg.connect_timeout_secs);
-        }
-        if cfg.read_timeout_secs == 0 {
-            println!("read_timeout_secs       = 0（不设限）");
-        } else {
-            println!("read_timeout_secs       = {}", cfg.read_timeout_secs);
-        }
-        match &cfg.log_file {
-            Some(f) => println!(
-                "log_file                = {f}（自定义守护日志文件；CLI --log-file 可覆盖）"
-            ),
-            None => println!(
-                "log_file                = (未设)（内置: ~/.aproxy/logs/ 下按启动随机命名，实际路径以 aproxy status/logs 经 IPC 获取为准）"
-            ),
-        }
-        // 外部转换器（request_transform/response_transform）：逐字段展示便于
-        // 排障对照 toml；两字段无 settings 全局默认层，未设置即「(未设置)」
-        for (name, t) in [
-            ("request_transform", &cfg.request_transform),
-            ("response_transform", &cfg.response_transform),
-            ("heartbeat_transform", &cfg.heartbeat_transform),
-        ] {
-            let Some(t) = t else {
-                println!("{name} = (未设置)");
-                continue;
-            };
-            println!("{name}:");
-            println!("  command           = \"{}\"", t.command);
-            if !t.args.is_empty() {
-                // 多 key 轮换类 format 常把 key 直接写在 args 里
-                println!(
-                    "  args              = [{}]",
-                    mask_transform_args(&t.args).join(", ")
-                );
-            }
-            match t.mode {
-                aproxy::config::TransformMode::Spawn => {
-                    println!("  mode              = spawn（每请求一次性进程）")
-                }
-                aproxy::config::TransformMode::Persistent => {
-                    println!(
-                        "  mode              = persistent（进程池 pool_max={}，空闲 {}s 后回收{}）",
-                        t.effective_pool_max(),
-                        t.effective_idle_timeout_secs(),
-                        if t.effective_idle_timeout_secs() == 0 {
-                            "（永不回收）"
-                        } else {
-                            ""
-                        }
-                    );
-                }
-            }
+        println!("{table}:");
+        let mut names: Vec<&String> = headers.keys().collect();
+        names.sort();
+        for name in names {
+            // 头值常含完整鉴权令牌，与 api_key 一致做截断打码
+            let source = resolved
+                .sources
+                .get(&format!("{table}.{}", config::quote_key(name)))
+                .copied();
             println!(
-                "  timeout_secs      = {}{}",
-                t.effective_timeout_secs(),
-                if t.effective_timeout_secs() == 0 {
-                    "（不限）"
-                } else {
-                    ""
-                }
+                "  {name} = \"{}\"  （{}）",
+                mask_secret(&headers[name]),
+                source_label(source)
             );
-            // extra 格式由 format 自定，官方示例就用它内联多个 key（JSON 列表）
-            // ——无法逐字段识别，整体按密钥打码，只留前缀与长度供对照 toml
-            match &t.extra {
-                Some(e) => println!(
-                    "  extra             = {}（已打码，共 {} 字符；原样透传进信封）",
-                    mask_secret(e),
-                    e.chars().count()
-                ),
-                None => println!("  extra             = (未设置)"),
-            }
-            if t.every_attempt {
-                println!("  every_attempt     = true（每次重试前用原始请求重新转换）");
-            }
-        }
-        println!(
-            "proxy          = {}",
-            cfg.proxy
-                .as_deref()
-                .map(aproxy_ipc::redact::url)
-                .unwrap_or_else(|| "(未设置)".to_string())
-        );
-        println!(
-            "proxy_username = {}",
-            cfg.proxy_username.as_deref().unwrap_or("(未设置)")
-        );
-        println!(
-            "proxy_password = {}",
-            cfg.proxy_password
-                .as_deref()
-                .map(|_| "***".to_string())
-                .unwrap_or_else(|| "(未设置)".to_string())
-        );
-        if cfg.extra_headers.is_empty() {
-            println!("extra_headers    = (空)");
-        } else {
-            println!("extra_headers:");
-            for (k, v) in &cfg.extra_headers {
-                // 头值常含完整鉴权令牌，与 api_key 一致做截断打码
-                println!("  {k} = \"{}\"", mask_secret(v));
-            }
-        }
-        if cfg.override_headers.is_empty() {
-            println!("override_headers = (空)");
-        } else {
-            println!("override_headers:");
-            for (k, v) in &cfg.override_headers {
-                println!("  {k} = \"{}\"", mask_secret(v));
-            }
-        }
-        if cfg.base_url.is_empty() {
-            println!();
-            println!("提示: base_url 为空，请设置:");
-            println!("  aproxy config --baseurl https://api.anthropic.com");
         }
     }
 }

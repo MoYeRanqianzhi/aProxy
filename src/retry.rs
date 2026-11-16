@@ -40,16 +40,12 @@ pub fn is_retryable_status(status: u16) -> bool {
     (400..=599).contains(&status)
 }
 
-/// 受限重试路径（config.toml / settings.json 的 `bounded_retry_paths` 命中的
-/// 请求）的最大上游尝试次数（含首轮）：达到后不再重试，把最后一次上游响应
-/// 原样透传。哪些路径受限由用户按自己的上游配置——部分上游对特定端点确定性
-/// 报错，无限重试只会让客户端永远等不到终态。
+/// settings.json 的 `bounded_retry_paths`（全局的受限重试路径）里每个路径的最大上游尝试
+/// 次数（含首轮）：它们各自变成一条 `max_attempts` 为这个值的重试规则。config.toml 里的
+/// `[[retry.rules]]` 自己写 `max_attempts`，不用这个值。
 ///
 /// 上限取 3：前两次重试零延迟，真正的瞬时故障大概率仍能在此窗口内自愈，
 /// 确定性错误则在秒级拿到真实响应，因此不设为 1。
-///
-/// 语义：每次尝试（含首轮）的结果都经 `proxy::attempts::classify` 判定，第 N 次有响应的
-/// 失败在 N 达到此值时停止，所以它就是总尝试次数的上限。
 pub const BOUNDED_RETRY_MAX_ATTEMPTS: u32 = 3;
 
 /// 判断响应体是否表示“错误内容”而非正常业务响应。

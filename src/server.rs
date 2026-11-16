@@ -289,7 +289,7 @@ pub(crate) async fn serve_forever(cfg: Config, cfg_path: &std::path::Path, daemo
     // forward_only_enabled()（settings 注入已完成）。
     if state.config.forward_only_enabled() {
         tracing::warn!(
-            "仅转发模式已启用：请求体与响应均不缓冲、不重试（上游失败直接 502、响应流中断直接截断）；disk_cache / spool_limit_mb / keepalive_interval_secs / max_retry_backoff_secs 在本模式下不生效"
+            "仅转发模式已启用：请求体与响应均不缓冲、不重试（上游失败直接 502、响应流中断直接截断）；disk_cache / max_response_mb / keepalive.interval_secs / retry.max_backoff_secs 在本模式下不生效"
         );
     }
     // 保活适用的请求发往上游时 accept-encoding 一律改为 identity（往压缩流里插

@@ -4,13 +4,13 @@
 
 **本地 API 代理，为 agent 软件的每一次请求护道。**
 
-上游限流、断流、超时、五百年一遇的抖动——aProxy 在本地把请求完整接住：失败**无限重试**（指数退避，封顶可配），流式请求（`Accept` 含 `text/event-stream` 或请求体 `"stream": true`）期间注入 SSE 心跳保活，成功后按原字节回放。客户端零感知：它以为的那次请求，只是慢了一点。（两个显式例外：`forward_only` 模式显式放弃重试保障，换取真流式直通；`bounded_retry_paths` 命中的请求失败 3 次即透传真实响应、响应头已被保活心跳提交的流式请求则以终态 SSE error 事件收场——均见「配置文件」。）
+上游限流、断流、超时、五百年一遇的抖动——aProxy 在本地把请求完整接住：失败**无限重试**（指数退避，封顶可配），流式请求（`Accept` 含 `text/event-stream` 或请求体 `"stream": true`）期间注入 SSE 心跳保活，成功后按原字节回放。客户端零感知：它以为的那次请求，只是慢了一点。（两个显式例外：`delivery = "forward"` 模式显式放弃重试保障，换取真流式直通；`[[retry.rules]]` 命中的请求达到 `max_attempts` 即透传真实响应、响应头已被保活心跳提交的流式请求则以终态 SSE error 事件收场——均见「配置文件」。）
 
 [English](README_EN.md)
 
 ## 其术
 
-- **无限重试** —— 夫唯不争，故天下莫能与之争。网络错误、4xx/5xx、错误 JSON（200 携带 error）皆触发重试；客户端断开即中止上游请求（计费保护）。两个**显式出口**：`forward_only` 模式（显式放弃重试，换取请求体与响应的流式直通）与 `bounded_retry_paths`（对确定性报错的上游端点，失败 3 次即透传真实响应，不再无限等待；仅当流式请求的响应头已被保活心跳提交时，改以终态 SSE error 事件告知）。
+- **无限重试** —— 夫唯不争，故天下莫能与之争。网络错误、4xx/5xx、错误 JSON（200 携带 error）皆触发重试；客户端断开即中止上游请求（计费保护）。两个**显式出口**：`delivery = "forward"` 模式（显式放弃重试，换取请求体与响应的流式直通）与 `[[retry.rules]]`（对确定性报错的上游端点，达到 `max_attempts` 即透传真实响应，不再无限等待；仅当流式请求的响应头已被保活心跳提交时，改以终态 SSE error 事件告知）。
 - **完全透传** —— 大音希声，大象无形。路径、查询、请求头原样转发；控制通道走独立命名管道，代理端口只做透传一件事。
 - **外部转换器（可选）** —— 化而欲作，吾将镇之以无名之朴。请求/响应可整流交给外部 format 程序改写（一行 JSON 信封进出，任何能读写 stdin/stdout 的程序都行）：OpenAI ↔ Anthropic 协议转换、多 key 轮换、多模型多渠道聚合。本体只加编排代码，转换逻辑全部外置；官方示例 `aproxy-format` 二进制开箱即用（独立发版）。常驻进程池复用到已死的空闲 worker 时，会自动换新 worker 重试一次。**限制**：`aproxy-format` 的跨协议转换（如 Anthropic ↔ OpenAI）只支持**非流式**，跨协议的 SSE 流式响应不支持——响应侧转换报错后透传上游原始响应，客户端会收到渠道协议格式的流；同协议 SSE 原样直通，多 key 轮换与同协议聚合不受影响。
 - **守护进程** —— `aproxy` 后台启动（分离子进程，关终端不掉）；`status` / `stop` / `logs` / `restore` 全套实例管理。
@@ -57,7 +57,7 @@ curl -fsSL https://raw.githubusercontent.com/MoYeRanqianzhi/aProxy/main/scripts/
 ```sh
 npm install -g @meowo/aproxy@next            # 带桌面界面，按平台自动选二进制
 npm install -g @meowo/aproxy-headless@next   # 无界面（服务器、缺 WebKitGTK 的 Linux）；两个包都提供 aproxy 命令，只装其一
-cargo install aproxy --locked --version 0.2.0-alpha.1   # 源码编译，需 rustc 1.90+
+cargo install aproxy --locked --version 0.2.0-alpha.2   # 源码编译，需 rustc 1.90+
 ```
 
 预发布发在 npm 的 `next` 标签，`latest` 标签留给正式版；cargo 不写版本号时也只取稳定版。0.2.0 现在只有预发布，所以上面的命令都带着标签或版本号（`@meowo/aproxy-headless` 的 `latest` 只是占位版本，不能用）。0.2.0 正式版发布后，去掉 `@next` 与 `--version` 即可。
@@ -73,7 +73,7 @@ cargo binstall aproxy --pkg-url '{ repo }/releases/download/v{ version }/{ name 
 升级：`aproxy install`（在线下载链条自动滚动重启，逐实例无感；`--from <路径>` 本地安装、`--adopt` 收编既有安装）。
 - **更新通道**：`install` 默认的 `latest` 在「通道」内取版本号最大者。当前是正式版则只取正式版（不会被带到预发布）；当前是预发布（如 alpha）则默认就在预发布通道；`--pre` 显式让预发布参与选择。只认 `vX.Y.Z` / `vX.Y.Z-(alpha|beta|rc).N`，按版本号而非创建时间比较，`format-v*` 与历史测试 tag 不参与。通道内没有更新版本时提示「已是最新」或「暂无可用版本」并保持现状，不会偷偷换通道。指定具体版本号（`aproxy install 0.2.0`）不受通道影响；低于当前版本的目标默认拒绝，需 `--allow-downgrade`；低于 0.2.0 的版本一律不装。
 - **从 0.1.x 升级**：0.1.x 与 0.2.0 起的版本互相控制不了对方的实例，0.1.x 的 `aproxy install` 装不上 0.2.0（下载后报 `--version 输出无版本号` 退出，什么都不改）。按 [CHANGELOG](CHANGELOG.md) 的「从 0.1.x 迁移」停掉实例、重新安装；0.2.0 现在只有预发布，重装时一键脚本要加 `--pre`，否则装回的还是 0.1.x。
-- **下载渠道与代理**：在线安装按 github → npm → cargo-binstall → cargo 的顺序尝试，settings.json 的 `download_chain` 可以调整次序、加镜像（url 模板）；下载走代理用 `--download-proxy <URL>` 或 settings.json 的 `download_proxy`，与上游请求代理无关。字段说明见 skill 文档 [settings-json.md](.claude/skills/aproxy-cli/references/latest/settings-json.md)。强制安装不读 settings.json，只用命令行的 `--download-proxy`（没给就走系统环境代理）。
+- **下载渠道与代理**：在线安装按 github → npm → cargo-binstall → cargo 的顺序尝试，settings.json 的 `update.download_chain` 可以调整次序、加镜像（url 模板）；下载走代理用 `--download-proxy <URL>` 或 settings.json 的 `update.download_proxy`，与上游请求代理无关。字段说明见 skill 文档 [settings-json.md](.claude/skills/aproxy-cli/references/latest/settings-json.md)。强制安装不读 settings.json，只用命令行的 `--download-proxy`（没给就走系统环境代理）。
 - **变体**：升级保持已装的变体（`aproxy --version` 括号里的第一段）；`aproxy install --variant desktop|headless` 换变体，通道里没有更新的版本时重装当前版本的另一个变体。安装器不预先猜本机缺什么，只看下载下来的二进制自检（`--version`）能不能跑：没写 `--variant` 时，带界面的版本跑不起来（Linux 上多半是缺 WebKitGTK）就改装同一目标的 headless 并说明，Linux 上再不行换 musl 产物；写了 `--variant desktop` 就报错退出，什么都不改。`install --force` 也一样。
 - **失败回滚**：滚动重启时某个实例在新版本下起不来，`install` 会用旧二进制按原参数把它拉回、中止滚动（其余实例不动）并以非零退出；排除原因后重新执行 `aproxy install` 继续。
 - **强制安装**：普通安装失败、卡住，或装着的版本坏到跑不起来时，用 `aproxy install --force [版本|latest]`（或 `--from <下载好的二进制>`）。它不走交接：按进程台账结束这个 home 下当前用户的全部 aproxy 进程，换上新二进制，再用新版本的 `restore` 按原参数拉回实例。这会立即中断所有经 aproxy 的在途请求，所以先确认（非交互环境加 `--yes`）。装着的版本连运行都不行时，手动下载新版本，执行 `<新版本> install --force --from <新版本>`。退出码：0 完成；10 一个进程都没结束、二进制没换；11 结束过进程、二进制没换（再执行一次即可）；12 二进制已换、有实例没回来（输出里按端口列出启动命令）。它不更新 skill 文档，之后执行 `aproxy install --skills-only`。
@@ -194,6 +194,7 @@ Codex 的 `stream_idle_timeout_ms` 默认 300000（5 分钟），按 SSE 事件�
 | `aproxy doctor` | 配置体检：settings.json error 级检查 + 别名配置与目录 toml 审查（warning） |
 | `aproxy find [关键字]` | 从配置目录发现全部配置；`--aliased/--unaliased --port PORT` 过滤 |
 | `aproxy config [选项]` | 查看或修改配置（`--show` 打印当前配置） |
+| `aproxy settings show\|get\|set\|unset` | 查看或修改全局设置（`~/.aproxy/settings.json`）：别名、`defaults` 全局默认、看护者、日志、安装更新；settings.json 有错误时也能用，用来修复它 |
 | `aproxy install [版本]` | 安装或升级（别名 `upgrade`），逐实例滚动重启；`--variant` 换变体，`--force` 强制安装；见「入门」里的升级说明 |
 | `aproxy desktop` | 打开桌面界面（预览版，显示的是演示数据，见下） |
 
@@ -203,7 +204,7 @@ Codex 的 `stream_idle_timeout_ms` 默认 300000（5 分钟），按 SSE 事件�
 
 `aproxy desktop` 打开桌面界面。它是一个独立的窗口进程，关掉窗口就退出。窗口本身不启停、不改动任何实例；和其余 aproxy 命令一样，它发现上次的安装没做完时会在后台把安装续完，续作可能逐个重启实例。
 
-- **0.2.0-alpha.1 的界面是预览版**：里面的实例、请求日志与统计都是演示数据，不是这台电脑上正在运行的 aProxy，界面顶部常驻「预览版 · 演示数据」标签。真实数据在之后的版本接入，在那之前以 `aproxy status`、`aproxy logs` 为准。界面偏好（主题、语言、Mica 开关）这个版本也不保存：关掉窗口再打开，恢复默认。
+- **0.2.0 各 alpha 版的界面是预览版**：里面的实例、请求日志与统计都是演示数据，不是这台电脑上正在运行的 aProxy，界面顶部常驻「预览版 · 演示数据」标签。真实数据在之后的版本接入，在那之前以 `aproxy status`、`aproxy logs` 为准。界面偏好（主题、语言、Mica 开关）这个版本也不保存：关掉窗口再打开，恢复默认。
 - Windows 需要 Microsoft Edge WebView2 运行时（Windows 11 自带，Windows 10 没有时按提示安装）。从终端运行时命令立即返回，窗口独立运行。
 - Linux 需要图形会话与 WebKitGTK 4.1（2.40 或更新）。带界面的版本动态链接 WebKitGTK，缺这些库时整个程序都起不来（连 `aproxy --version` 也不行），没有图形界面的机器请用无界面的 headless 版本——一键安装脚本与 `aproxy install` 在缺库的机器上会自动装它；musl 构建只有 headless 版本。
 - macOS 的带界面版本只保证编得过，窗口未经真机验证（和整个 macOS 支持一样，见「平台支持」）。
@@ -227,7 +228,7 @@ aproxy stop openrouter                   # 按别名停止（端口变了依然�
 aproxy alias list
 ```
 
-别名存于 `~/.aproxy/settings.json`（程序管理的内部配置，唯一；用 `aproxy alias` 管理）。config.toml 人类可读可写、可多份平行并存。
+别名存于 `~/.aproxy/settings.json`（整个 home 唯一的程序状态；用 `aproxy alias` 管理，也可以 `aproxy settings` 直接读写）。config.toml 人类可读可写、可多份平行并存。
 
 ## 开机自启（可选）
 
@@ -241,47 +242,61 @@ aproxy alias list
 base_url = "https://api.anthropic.com"   # 上游地址
 listen_addr = "127.0.0.1:12345"          # 本地监听
 # api_key = "sk-..."                     # 快捷鉴权（等效覆盖 Authorization: Bearer）
-# keepalive_interval_secs = 15           # SSE 心跳间隔，0 关闭保活
-# keepalive_trigger = "any"              # 哪些请求走保活：accept（Accept 含 SSE）/ body_stream（请求体 "stream": true）/ any（任一，默认）
-# keepalive_heartbeat = ": keepalive\n\n" # 每拍写给客户端的心跳字节（默认 SSE 注释；如客户端容不下注释可改成 "\n"）
 # proxy = "http://127.0.0.1:7890"        # 上游经代理转发（支持 socks5，可配用户名密码）
-# extra_headers / override_headers       # 追加/覆盖请求头
-# max_retry_backoff_secs = 320           # 重试退避封顶（0 = 所有重试零延迟）
-# spool_limit_mb = 256                   # 上游响应缓冲上限（MB）
-# max_body_mb = 128                      # 请求体上限（MB；0 = 不设限。未设时取 settings.json 全局默认）
+# extra_headers / override_headers       # 追加/覆盖请求头（表：extra_headers = { "x-title" = "..." }）
+# max_request_mb = 128                   # 请求体上限（MB；0 = 不设限。未设时取 settings.json 的 defaults.max_request_mb）
+# max_response_mb = 256                  # 上游响应缓冲上限（MB；0 按 1 处理）
 # disk_cache = true                      # 磁盘缓存：大请求体/响应溢写磁盘，内存与负载解耦
-# forward_only = false                   # 仅转发模式（开启即放弃重试）：请求体与响应流式直通，无重试/缓冲/心跳
-# bounded_retry_paths = [ '/v1/x' ]      # 受限重试路径（正则）：命中者失败 3 次即透传，不再无限重试
+# delivery = "retry"                     # "retry"（默认，缓冲并重试）/ "forward"（仅转发：流式直通，无重试/缓冲/心跳）
 # log_file = "D:/aproxy-logs/a.log"      # 自定义日志文件（~ 展开，相对路径相对 APROXY_HOME；缺省按启动随机命名，地址经 IPC 获取）
-# connect_timeout_secs = 30              # 上游连接建立超时（0 = 不设限）
-# read_timeout_secs = 300                # 两次读到数据间隔超时（0 = 不设限）
 # allowed_hosts = ["myproxy.local"]      # 额外放行的 Host（防 DNS 重绑定；追加到内置名单，"*" 关闭校验）
 # allowed_origins = ["http://localhost:5173"] # 放行的浏览器 Origin（默认拒绝一切带 Origin 的请求，"*" 关闭校验）
-# request_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
-                                         # 外部转换器（请求侧）：交给 format 程序改写 body/headers/url（协议转换、
-                                         # 多 key 轮换、多渠道聚合；失败 502 不重试；与 forward_only 互斥）
-# response_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
-                                         # 外部转换器（响应侧，须与请求侧配同一份 extra）：改写上游响应后回放（失败透传原样）
-# heartbeat_transform = { command = "...", mode = "persistent" }
-                                         # 心跳转换器：保活等待中每拍由 format 按请求内容生成心跳（失败或慢则改发固定心跳）
-                                         # command/extra 用 ~/ 或绝对路径：守护进程的工作目录不可靠，相对路径会找不到
+
+[timeouts]
+# connect_secs = 30                     # 上游连接建立超时（0 = 不设限）
+# first_byte_secs = 300                 # 从发出请求到收到响应头的时限（0 = 不设限）
+# read_idle_secs = 300                  # 两次读到响应体数据之间的间隔上限（0 = 不设限）
+
+[keepalive]
+# interval_secs = 15                    # SSE 心跳间隔，0 关闭保活
+# trigger = "any"                       # accept（Accept 含 SSE）/ body_stream（请求体 "stream": true）/ any（任一，默认）
+# heartbeat = ": keepalive\n\n"         # 每拍写给客户端的心跳字节（默认 SSE 注释；如客户端容不下注释可改成 "\n"）
+
+[retry]
+# max_backoff_secs = 320                # 重试退避封顶（0 = 所有重试零延迟）
+# [[retry.rules]]                      # 第 N 次带响应的失败命中规则且 N >= max_attempts 即透传（0 = 不限，可作豁免）
+# path = '/v1/messages/count_tokens(\?.*)?'   # 对「路径?查询串」整体的正则，自动锚定两端
+# max_attempts = 3
+
+[history]
+# body_budget_mb = 8                    # 已解析，本版本尚无效果
+
+# [[format]]                             # 外部转换器：请求/响应/心跳每阶段至多一个
+# name = "convert"
+# command = "~/.aproxy/bin/aproxy-format"
+# args = ["run", "--config", "~/.aproxy/agg.toml"]   # 不再有 extra 键，配置路径走 args 或 env
+# process = "persistent"                 # spawn（默认）/ persistent（有状态程序必须用）
+# stages = ["request", "retry"]          # request / response / heartbeat；加 retry = 每次重试前重新转换
+# env = { KEYS = '{"keys": ["sk-a", "sk-b"]}' }  # 额外环境变量（值不在 --show 中显示）
 ```
 
-多 key 轮换只在**请求之间**生效：同一请求的重试沿用转换后的同一个 key（请求只转换一次，重试重放转换产物）。
+多 key 轮换默认只在**请求之间**生效：同一请求的重试沿用转换后的同一个 key（请求只转换一次，重试重放转换产物）。需要每次重试都重新转换时，在请求方的 `stages` 里加上 `"retry"`。
 
 运行数据在 `~/.aproxy/`：`run/`（实例注册与恢复记录、看护者 claim）、`logs/`（守护日志，按启动随机命名、自动清理与轮转，地址经 IPC 向实例询问；可用 `log_file` 自定义去向）、
 `spool/<端口>/`（磁盘缓存临时文件，启动时自动清理）、
-`settings.json`（内部配置：别名、默认配置文件、日志轮转阈值、看门狗五字段等，程序管理不建议手改）。
+`settings.json`（整个 home 的程序状态：`aliases`、`default_config`、`config_dirs`，`defaults`（config.toml 键的全局默认），以及 `watchdog`、`logs`、`instances`、`update`、`ui` 各段）。
+
+`settings.json` 由 `aproxy settings show|get|set|unset` 读写（键是点号路径，例如 `watchdog.enabled`、`defaults.max_request_mb`）；也可以 `aproxy alias add|remove` 与 `aproxy config --set-default|--clear-default` 改各自的键。手工编辑只在文件无法解析时作为兜底：它被严格解析，不认识的键、类型不对的值都是错误，此时 `status`、`stop`、`install` 会按内置默认运行并告警（别名不可用），其余命令以退出码 3 结束并打印修法。`defaults` 里的凭据（`api_key`、密钥头、代理口令）只随它的目标继承：实例的 `base_url`/`proxy` 指向别处时不会带上它，`aproxy config --show` 会列出被扣下的项。字段说明见 skill 文档 [settings-json.md](.claude/skills/aproxy-cli/references/latest/settings-json.md)。
 
 ### 保活（SSE 心跳）
 
-保活适用的请求（`keepalive_interval_secs` > 0、非 `forward_only`，且按 `keepalive_trigger` 命中：`Accept` 含 `text/event-stream`，或请求体顶层 `"stream": true`；默认 `any` 任一即可）从**首轮**起就走保活通道：
+保活适用的请求（`keepalive.interval_secs` > 0、`delivery` 不是 `"forward"`，且按 `keepalive.trigger` 命中：`Accept` 含 `text/event-stream`，或请求体顶层 `"stream": true`；默认 `any` 任一即可）从**首轮**起就走保活通道：
 
-- 任一次尝试上游回 2xx + 未压缩的 `text/event-stream` 时，立即把上游真实的状态码与响应头转给客户端（未配 `response_transform` 时）；否则约一个保活间隔后先提交骨架头（200 + SSE）。「需要重试」本身不提交，重试几次后很快成功的请求拿到的仍是上游真实响应。
-- `"stream": true` 的非 SSE 流（如 Ollama 原生 API 的 NDJSON）在不重试时原样直通；若该上游常需重试（重试拖过一个保活间隔会提交 SSE 骨架头，改写 content-type 并混入心跳），建议该实例设 `keepalive_trigger = "accept"`。
-- 提交之后，无论是在等首字节、上游在途、缓冲上游流还是退避，都按 `keepalive_interval_secs` 发 SSE 注释心跳；响应体仍是缓冲完整、校验无误后才回放，失败尝试的数据不会混入。
+- 任一次尝试上游回 2xx + 未压缩的 `text/event-stream` 时，立即把上游真实的状态码与响应头转给客户端（未配 `response` 阶段的 format 时）；否则约一个保活间隔后先提交骨架头（200 + SSE）。「需要重试」本身不提交，重试几次后很快成功的请求拿到的仍是上游真实响应。
+- `"stream": true` 的非 SSE 流（如 Ollama 原生 API 的 NDJSON）在不重试时原样直通；若该上游常需重试（重试拖过一个保活间隔会提交 SSE 骨架头，改写 content-type 并混入心跳），建议该实例设 `[keepalive] trigger = "accept"`。
+- 提交之后，无论是在等首字节、上游在途、缓冲上游流还是退避，都按 `keepalive.interval_secs` 发 SSE 注释心跳；响应体仍是缓冲完整、校验无误后才回放，失败尝试的数据不会混入。
 - 为避免往压缩流里插入明文心跳，保活适用的请求发往上游时 `accept-encoding` 一律改为 `identity`——这是对「完全透传」的一个有意例外，代价只是上游到本机这一段多传一些字节；不适用保活的请求不改写。
-- `"stream": false` 的普通请求没有保活通道；`forward_only` 实例与 `keepalive_interval_secs = 0` 同样没有。
+- `"stream": false` 的普通请求没有保活通道；`delivery = "forward"` 实例与 `keepalive.interval_secs = 0` 同样没有。
 
 ### 入站来源校验
 
@@ -289,7 +304,7 @@ listen_addr = "127.0.0.1:12345"          # 本地监听
 
 - **Host**（防 DNS 重绑定）：监听回环地址时，只放行 `localhost` / `127.0.0.1` / `[::1]` 与监听地址自身的主机名；`allowed_hosts` 的条目在此基础上**追加**（忽略端口、不区分大小写）。监听非回环地址且 `allowed_hosts` 为空时不做 Host 校验。
 - **Origin**：任何携带 `Origin` 头的请求默认拒绝（只有浏览器、Electron/WebView 类客户端会发），除非精确匹配 `allowed_origins`（不区分大小写，忽略末尾 `/`）；与监听地址无关。
-- 两项都可写 `"*"` 关闭；`[]` 等同未配置。每实例的 `config.toml` 与 `settings.json` 全局默认均可配置（toml 优先）。
+- 两项都可写 `"*"` 关闭；`[]` 等同未配置。每实例的 `config.toml` 与 settings.json 的 `defaults.allowed_hosts`/`defaults.allowed_origins` 均可配置（toml 优先）。
 - 被拒请求在本地返回 **403**，错误文案点名对应配置项；它从未转发上游、不注入 `api_key`、不进入重试，对被放行的请求无任何影响。
 - 受影响的客户端：Cherry Studio、Open WebUI 等会发 `Origin` 的应用，需把其 Origin 加入 `allowed_origins`。Claude Code 等 CLI 客户端不发 `Origin`、Host 为 `127.0.0.1:端口`，不受影响。
 
@@ -299,7 +314,7 @@ aProxy 是本机单用户代理：它持有并向每个转发请求注入上游�
 
 - 默认只监听回环地址（`127.0.0.1`）。**不要把 `listen_addr` 改成 `0.0.0.0` 或局域网地址**——那等于让同网段的任何主机免鉴权使用你的密钥；确需对外开放时，启动、`startup.log` 与 `aproxy doctor` 会给出警告。
 - `api_key` 以明文存放在 `config.toml`，请收紧文件权限（仅当前用户可读）。
-- 外部转换器（`request_transform` / `response_transform` / `heartbeat_transform`）会按配置执行任意命令；只配置你信任的程序，且不要让他人能修改你的 `config.toml`。
+- 外部转换器（`[[format]]` 条目）会按配置执行任意命令；只配置你信任的程序，且不要让他人能修改你的 `config.toml`。
 - 日志与 `status` 对 URL 内嵌凭据与查询串的值打码（`?key=***`），可安全粘贴分享。
 
 完整的威胁模型与漏洞报告方式见 [SECURITY.md](SECURITY.md)。

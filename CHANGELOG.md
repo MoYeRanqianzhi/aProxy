@@ -58,7 +58,7 @@
    - cargo 装的：`cargo install aproxy --locked --force --version <版本>`（正式版之后可省略 `--version`）。
 4. 清理 0.1.0 的残留：`~/.aproxy/run/install.state`（如果有）、`~/.aproxy/staging/`，以及 `~/.aproxy/run/*.restore`（第 2 步之前崩溃过的实例会留下，留着的话 `aproxy restore` 会按 0.1.0 记下的参数拉起它们）。
 5. 配置文件 `config.toml` 与 `settings.json` 要按上面两张对照表改写：两者都改为严格解析，留着旧键时实例不启动、多数命令以退出码 3 结束。可以用新版本逐项改：`aproxy config --unset <旧键>` 与 `aproxy settings unset <旧键>` 能删掉不认识的键，再用 `aproxy config …` 与 `aproxy settings set <键> <值>` 写上新键；也可以直接手工编辑。改完运行 `aproxy config --show`（每个配置文件）与 `aproxy doctor` 检查。
-6. 用 `aproxy --version` 确认装的是 0.2.0 起的版本（首行形如 `aproxy v0.2.0-alpha.1 (desktop; …)`，0.1.x 的输出是 `aproxy 0.1.0`），再用它逐个启动：`aproxy start <别名|配置路径>`。端口不变，agent 客户端的 base URL 不用改。
+6. 用 `aproxy --version` 确认装的是 0.2.0 起的版本（首行形如 `aproxy v0.2.0-alpha.2 (desktop; …)`，0.1.x 的输出是 `aproxy 0.1.0`），再用它逐个启动：`aproxy start <别名|配置路径>`。端口不变，agent 客户端的 base URL 不用改。
 7. 更新 skill 文档：`aproxy install --skills-only`，再确认 agent 的 skills 目录链接或复制的是 `~/.aproxy/skills/` 里的新文档。
 
 要回到 0.1.x：先用 0.2.0 执行 `aproxy stop all`，删除 `~/.aproxy/bin/` 下的 aproxy 二进制，再用 0.1.x 的一键安装脚本指定版本重新安装（例如 `sh install.sh v0.1.0`、`install.ps1 -Version v0.1.0`）；0.2.0 的 `aproxy install` 不会装回 0.1.x。

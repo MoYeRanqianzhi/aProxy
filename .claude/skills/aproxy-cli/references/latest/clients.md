@@ -42,7 +42,7 @@ own: it cuts their in-flight requests (behaviors.md, Stopping).
 
 To retry transparently even when a stream breaks halfway, aProxy buffers each upstream response
 completely and replays it only after validating it. Until then a streaming client receives a response
-head and SSE comment heartbeats, `: keepalive`, once per `keepalive_interval_secs` (behaviors.md,
+head and SSE comment heartbeats, `: keepalive`, once per `keepalive.interval_secs` (behaviors.md,
 "Keepalive heartbeats"). What happens next depends on what the client's idle timer counts:
 
 - **Byte-level timers** (time between received bytes, such as undici `bodyTimeout`, the httpx read
@@ -60,7 +60,7 @@ while receiving only heartbeats, after about N s"); N approximates the client's 
 Two more client-side effects to plan for:
 
 - **Requests without heartbeats** (`"stream": false` calls, and streaming requests that match no
-  `keepalive_trigger` test, such as Gemini CLI's) receive nothing until the final answer is complete.
+  `keepalive.trigger` test, such as Gemini CLI's) receive nothing until the final answer is complete.
   The client's overall HTTP timeout must cover retries plus generation.
 - **Client retries stack on aProxy's.** Each client resend is a new request to aProxy and cancels the
   previous one's upstream attempt, so a client that resends often keeps restarting aProxy's retry
@@ -103,7 +103,7 @@ including background agents, which may not inherit your shell's environment:
   byte-level watchdog at 30 minutes, which does not matter here because heartbeats keep bytes flowing.
   `API_TIMEOUT_MS` does not control this watchdog.
 - The main request is `POST /v1/messages?beta=true` with `Accept: application/json` and
-  `"stream": true` in the body. It gets heartbeats with `keepalive_trigger` set to `any` (the default)
+  `"stream": true` in the body. It gets heartbeats with `keepalive.trigger` set to `any` (the default)
   or `body_stream`; `accept` leaves it without.
 - Non-streaming calls such as `POST /v1/messages/count_tokens` get no heartbeats and are bounded by
   `API_TIMEOUT_MS` (per Claude Code's documentation: default 600000, maximum 2147483647). Raise it if
@@ -139,7 +139,7 @@ stream_idle_timeout_ms = 86400000  # 24 h
   60 s after the skeleton head despite four heartbeats in between; at 86400000, a 620 s heartbeat-only
   wait ended in a complete answer from a single request.
 - Requests are `POST <base_url>/responses` with `Accept: text/event-stream` and `"stream": true`, so
-  every `keepalive_trigger` value gives them heartbeats.
+  every `keepalive.trigger` value gives them heartbeats.
 - Leave `supports_websockets` off (the default for custom providers): aProxy proxies HTTP only and
   refuses a WebSocket upgrade with `501` `upgrade_unsupported`.
 
@@ -152,7 +152,7 @@ source of 0.35.3 and 0.62.0.
   OAuth and Code Assist logins do not use a custom base URL and cannot go through aProxy.
 - The key travels as `x-goog-api-key`, which aProxy's `api_key` does not set (Setup checklist, step 3).
 - Streaming requests are `POST /v1beta/models/<model>:streamGenerateContent?alt=sse` with `Accept: */*`
-  and no `stream` field, so no `keepalive_trigger` value gives them heartbeats. aProxy buffers them and
+  and no `stream` field, so no `keepalive.trigger` value gives them heartbeats. aProxy buffers them and
   replays each response whole, which works.
 - Limit: Gemini CLI's HTTP timeouts are hard-coded with no user setting. In 0.62.0 the response-header
   timeout is 60 s and the body timeout 300 s (both 300 s in 0.35.3). aProxy sends the response head only

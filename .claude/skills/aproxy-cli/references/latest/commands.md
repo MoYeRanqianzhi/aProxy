@@ -12,7 +12,7 @@ troubleshooting.md.
 - [Global options](#global-options)
 - [start](#start) · [status](#status) · [stop](#stop) · [restart](#restart) · [logs](#logs) ·
   [restore](#restore)
-- [alias](#alias) · [find](#find) · [doctor](#doctor) · [config](#config)
+- [alias](#alias) · [find](#find) · [doctor](#doctor) · [config](#config) · [settings](#settings)
 - [desktop](#desktop): the desktop window
 - [install / upgrade](#install--upgrade), including recovery from a failed install and
   [force install](#force-install)
@@ -32,7 +32,7 @@ directory, and `install --force` ends with 10.
 |---|---|
 | `<home>/config.toml` | the default instance config |
 | `<home>/configs/` | the conventional place for further instance configs (`find` and `doctor` scan it) |
-| `<home>/settings.json` | aliases, the default config, global defaults (settings-json.md) |
+| `<home>/settings.json` | aliases, the default config, the `defaults` global defaults, watchdog and install settings (settings-json.md) |
 | `<home>/run/` | instance registry `<port>.pid`, restore records `<port>.restore`; `APROXY_RUN_DIR` relocates this directory alone |
 | `<home>/logs/` | instance logs (random file names) and `startup.log` |
 | `<home>/bin/` | the binary managed by `aproxy install`; on Windows also `aproxy.bat` (see install / upgrade). Files named `aproxy.old-…` and `aproxy.tmp-…` are left by binary swaps; installs delete the ones they can |
@@ -80,7 +80,7 @@ instance on 12345. Address test instances only by their own port there.
 | `default` | the default config: `default_config` in settings.json, else `<home>/config.toml` (any case; the typo `defult` also works) | start, stop, restart, logs |
 | `PATH` | a config file; `~` is expanded and the path made absolute | start; stop, restart and logs match it against running instances |
 | `all` | every instance in the registry (lowercase only) | stop, restart |
-| `idle [SECS]` | instances whose last client request is at least SECS old (default `idle_timeout_secs`, 1800) | stop, restart |
+| `idle [SECS]` | instances whose last client request is at least SECS old (default `instances.idle_threshold_secs`, 1800) | stop, restart |
 
 A number is always a port. Anything else is tried as an alias, then as `default`, then as a file
 path. Alias names may not be numbers or reserved words, so these forms never collide. When two
@@ -93,9 +93,15 @@ reaches only one of them; use ports.
   stdout, errors to stderr. The Windows console is switched to UTF-8 at startup.
 - Credentials are masked everywhere: keys and header values keep their first 6 characters then
   `***`; URLs lose their userinfo (`***@`) and query values (`?key=***`).
-- Every command except `doctor` first checks settings.json and prints problems as `[ERROR] …` on
-  stderr, then carries on.
+- Every command checks `<home>/settings.json` at startup, before doing anything else. When it is
+  invalid, `settings …` and `doctor` work normally, `status`, `stop` and `install`/`upgrade` run on
+  built-in defaults with `[WARN]` lines (aliases unavailable), and every other command prints the
+  errors as `[ERROR]` lines with repair hints and exits 3. settings-json.md, "When settings.json is
+  invalid", lists which command falls in which group.
 - Argument errors exit 2. `aproxy <command> --help` prints the options (in Chinese).
+
+The table below describes a command's own outcome, assuming a valid settings.json; the startup
+check above can end a command with exit 3 before it runs (except the tolerated commands).
 
 | Command | Exit 0 | Exit 1 |
 |---|---|---|
@@ -105,9 +111,10 @@ reaches only one of them; use ports.
 | restart | every target restarted; nothing running for no target, `all` or `idle` | any target failed; target cannot be resolved |
 | logs | the followed instance stopped; nothing running | `all`, ambiguous or unknown target, foreground instance, unreadable log |
 | restore | always, even when an instance fails to come back | never |
-| alias | success | invalid name, missing file, unknown alias, unparsable settings.json, write failure |
+| alias | success | invalid name, missing file, unknown alias, write failure (exit 3 instead when settings.json itself is invalid, before the command runs) |
 | doctor | always, **even when it reports errors** | never |
-| config | success | invalid value, unparsable existing toml or settings.json, missing config file on read, write failure |
+| config | success | a missing config file on read or a write failure (1), a malformed key path (2), or a TOML syntax error / a change that introduces a config error (3) |
+| settings | show/get printed, set/unset stored or unchanged | a malformed key path or unparsable JSON value (2); the file cannot be read, or the change would make it invalid (3); write failure (1) |
 | desktop | the window was closed; a window is already open for this home; on Windows from a terminal, the window was opened | headless build; no web view runtime or no display; the window failed to start |
 | install | installed; already latest; channel empty; nothing to abort | any failure |
 
@@ -172,9 +179,10 @@ aproxy --foreground [start [ALIAS|PATH]]
 
 What `start` checks, in order:
 
-1. **Config.** The file is loaded strictly; a TOML syntax error, an invalid value or a
-   `listen_addr` without a valid port stops here with exit 1, printing `配置错误: …` ("config
-   error") or the parse error together with the file path. A fresh install has no `base_url`, so
+1. **Config.** The file is loaded strictly; a TOML syntax error, an unknown key (including every
+   old 0.1.x name), an invalid value or a `listen_addr` without a valid port stops here with exit
+   1, printing `配置错误: …` ("config error") followed by one `file:line:col: key: message [code]`
+   line per problem; the codes are listed in config-toml.md, "Checks at start". A fresh install has no `base_url`, so
    run `aproxy config --baseurl URL [--api-key KEY]` before the first start. Field rules:
    config-toml.md.
 2. **Same port.** If an aProxy instance already answers on the port with the same listen address,
@@ -192,8 +200,8 @@ What `start` checks, in order:
   address from `aproxy status`.
 - A non-loopback listen address prints `警告: 监听地址 <addr> 不是回环地址…` ("not a loopback
   address") but does not block the start.
-- After a successful background start, aProxy makes sure a watchdog is running when `watchdog` is
-  enabled in settings.json (the default).
+- After a successful background start, aProxy makes sure a watchdog is running when
+  `watchdog.enabled` is true in settings.json (the default).
 - `--foreground` keeps the instance in the console: logs print there and Ctrl+C stops it. It is
   still registered, so `status` and `stop` work. If the console closes without Ctrl+C, its restore
   record remains and `aproxy restore` brings it back as a background instance.
@@ -222,9 +230,9 @@ appear:
 - `注意: 实例版本 v<x> 与当前 CLI v<y> 不同…` ("instance version differs from this CLI"):
   see compatibility.md.
 
-`--idle` shows only instances idle for at least `idle_timeout_secs` (settings.json, default
-1800); `--busy` the rest. An instance that has served no request yet is idle from its start time.
-`status` does not print log paths; see [logs](#logs).
+`--idle` shows only instances idle for at least `instances.idle_threshold_secs` (settings.json,
+default 1800); `--busy` the rest. An instance that has served no request yet is idle from its start
+time. `status` does not print log paths; see [logs](#logs).
 
 ## stop
 
@@ -261,8 +269,8 @@ asking.
   `stop all --force` includes them.
 - **`stop all`** stops every registered instance, including any your own session or the user's
   other sessions depend on. Use it only when the user asked for exactly that.
-- **`stop idle [SECS]`** stops instances idle for at least SECS (default `idle_timeout_secs`).
-  A small SECS can include instances in active use. Prints `没有闲置超过 <n> 秒的实例。` ("no
+- **`stop idle [SECS]`** stops instances idle for at least SECS (default
+  `instances.idle_threshold_secs`). A small SECS can include instances in active use. Prints `没有闲置超过 <n> 秒的实例。` ("no
   instance idle longer than n s") when none qualify.
 - An alias whose config is not running: `别名 <name>（配置 <path>）当前未在运行。`; a port with no
   instance: `端口 <port> 上没有运行中的 aProxy 实例。`; both exit 1.
@@ -368,10 +376,14 @@ can address an instance by name even after its port changes.
   `idle`, `default`, `defult` in any case. Lookup is case-sensitive.
 - `remove` deletes the name only; a running instance keeps running. An unknown name exits 1.
 
-`alias add/remove` and `config --set-default/--clear-default` rewrite settings.json. If the file
-does not parse, they change nothing and exit 1 with `settings.json 解析失败（…），为免覆盖其中的别名等内容，本次不做修改。请先修复或删除该文件: <path>`
-("settings.json failed to parse; not modified, to avoid overwriting its aliases; repair or delete
-it first"); see settings-json.md, "Location and editing".
+`alias add/remove` and `config --set-default/--clear-default` edit only their own key in
+settings.json through the same writer as `aproxy settings`: the rest of the file, including key order
+and any `ui` content, is kept, and a key this version does not know stays in the file (it is an
+error, not something the write may drop). A change that would introduce an error is refused and
+nothing is written. When settings.json is invalid, these commands do not run at all: every command
+outside the tolerated group exits 3 with the `[ERROR] settings.json 有错误` block and repair hints
+before it reaches them (settings-json.md, "When settings.json is invalid"). Repair the file first
+with `aproxy settings unset KEY` (that command does run), then add the alias.
 
 ## find
 
@@ -397,7 +409,7 @@ Prints `[ERROR]` and `[WARN]` findings and `检查结果: <n> error, <m> warning
 
 | Level | Checks |
 |---|---|
-| ERROR | settings.json: JSON syntax, invalid alias names, aliases pointing to missing files, invalid `bounded_retry_paths` or `keepalive_trigger`, watchdog values that break hang detection or spin the CPU |
+| ERROR | settings.json: every problem the strict parser reports (JSON syntax, an unknown key, a wrong type or value, `watchdog.heartbeat_secs = 0`, a credential in `defaults` without its target, a newer `schema`), an invalid alias name, and an alias pointing to a missing file |
 | WARN | configs that aliases point to, and other `*.toml` in the config directories: parse and validation failures, non-loopback listen addresses, port conflicts within each group (legal as long as the configs do not run at the same time); questionable watchdog values |
 
 **The default config gets only the non-loopback check** unless an alias points at it. To validate
@@ -413,46 +425,55 @@ aproxy config --set-default PATH | --clear-default
 ```
 
 Reads or edits one config.toml: `--config`, else `default_config`, else `<home>/config.toml`.
-Without setters it prints the file, as `--show` does.
+Without setters it prints the effective values, as `--show` does.
 
 | Option | Effect |
 |---|---|
-| `--show` | print the file's values with secrets masked; combine with setters to print the result |
+| `--show` | print every effective value with the layer it comes from and secrets masked; combine with setters to print the result |
 | `--baseurl URL` | `base_url`; a trailing `/` is removed; must start with `http://` or `https://` and contain no `?` or `#` (checked before saving) |
 | `--listen ADDR` | `listen_addr`; checked only at start |
 | `--api-key KEY` / `--clear-api-key` | set or remove `api_key` (what it injects: config-toml.md) |
 | `--extra-header K=V` | add or replace an `extra_headers` entry: sent only when the request lacks that header; repeatable |
 | `--override-header K=V` | add or replace an `override_headers` entry: always replaces the header; repeatable |
 | `--clear-headers` | empty both header maps, before any header given in the same command is added |
-| `--keepalive-secs N` | `keepalive_interval_secs`; `0` turns heartbeats off |
+| `--keepalive-secs N` | `[keepalive] interval_secs`; `0` turns heartbeats off |
 | `--proxy URL` | upstream proxy, e.g. `http://127.0.0.1:7890` or `socks5://user:pass@127.0.0.1:7890` |
 | `--proxy-username U`, `--proxy-password P` | proxy credentials; take precedence over those in the URL |
 | `--clear-proxy` | remove proxy URL, username and password |
+| `--unset KEY` | remove one key; repeatable. `KEY` is a dotted key path such as `timeouts.connect_secs` or `extra_headers."x-foo"`; it may name a key this version does not know, and array tables (`format`, `retry.rules`) can only be removed as a whole |
 | `--set-default PATH` | set `default_config` in settings.json; the file must exist |
 | `--clear-default` | remove `default_config` |
 
-- **Setters rewrite the whole file** from the values this binary parsed: comments, formatting and
-  keys it does not know are lost. Edit by hand when the file holds anything worth keeping. If the
-  existing file does not parse, setters refuse with `现有配置文件解析失败，拒绝覆盖…` ("existing
-  config fails to parse; refusing to overwrite") instead of replacing it with defaults.
-- A missing file is created, parent directories included; this is how a config for a new
-  instance is made. Reading a missing file named by `--config` exits 1 with
-  `指定的配置文件不存在`.
+- **Setters edit only the target key.** Comments, key order and everything else in the file are
+  preserved. A missing file, and its parent directories, are created; this is how a config for a
+  new instance is made. Writes are serialized across processes with a lock in `<home>/run/`.
+- **A change that would introduce a new error is refused**, with the diagnostics and exit 3; the
+  file is not written. Errors already in the file that this edit does not touch do not block it, so
+  a broken file can be repaired one key at a time (`--unset` is the way to delete an unknown key).
+  A file with a TOML syntax error cannot be edited at all: fix the syntax first (exit 3).
 - Empty values for `--api-key`, `--proxy`, `--proxy-username` and `--proxy-password` are rejected;
   use the `--clear-…` options. `--set-default` and `--clear-default` cannot be combined, and when
   either is given, other setters in the same command are ignored.
 - **Running instances do not pick up changes.** Run `aproxy restart PORT|ALIAS` afterwards.
-- `--show` reads the file, not a running instance: one-off start options and edits not yet
-  applied are invisible to it. Fields left to settings.json print
-  `（未在 toml 设置，运行时取 settings.json 全局默认）` ("not set in the toml; the settings.json
-  global default applies"). If the file does not parse, it warns `警告: 配置文件解析失败，以下展示的是回退默认值而非文件内容` ("parse
-  failed; showing fallback defaults, not the file").
-- Transformer `args` values after `--api-key`, `--api_key`, `--apikey`, `--key`, `--token`,
-  `--secret` or `--password`, and the whole `extra` string, are masked in `--show`.
-- Every other field (timeouts, backoff, disk cache, `forward_only`, `bounded_retry_paths`,
-  `allowed_hosts`, `allowed_origins`, `keepalive_trigger`, `log_file`, transformers, size limits)
-  has no option here; edit config.toml (config-toml.md) or the settings.json global default
-  (settings-json.md).
+- `--show` (and a bare `aproxy config`) reads the file, not a running instance: one-off start
+  options and edits not yet applied are invisible to it. Every value is printed with its source
+  layer (`config.toml`, `settings.json 全局默认`, `环境变量`, `内置默认` or `未设置`), so a value
+  inherited from settings.json is shown as effective, not left out. If the file has
+  errors, `--show` still prints every value, then lists the diagnostics on stderr as
+  `file:line:col: key: message [code]`, suggests `aproxy config --unset '<key>'` for unknown keys,
+  and exits 3. Reading a missing file named by `--config` exits 1 with `指定的配置文件不存在`.
+- Credentials in settings.json `defaults` are inherited only by an instance whose final `base_url`
+  (or `proxy`) points at the same target as the default's. When it does not, `--show` prints a
+  `全局默认里的这些凭据没有继承…` ("these credentials in the global defaults were not inherited")
+  block naming each withheld key and both targets, and warns with `default_credential_withheld` when
+  the instance has no credential of its own. settings-json.md, "Credentials in defaults follow their
+  target", explains the comparison and which header names count as credentials.
+- Format `args` values after `--api-key`, `--api_key`, `--apikey`, `--key`, `--token`,
+  `--secret` or `--password` are masked in `--show`; `env` is shown as names only, never values.
+- Most fields (timeouts, retry, disk cache, `delivery`, `[keepalive]`, `[history]`, allow-lists,
+  `log_file`, `[[format]]`, size limits) have no dedicated option: edit config.toml
+  (config-toml.md) or the settings.json global default (settings-json.md). Use `--unset` to delete
+  a key, including an unknown one.
 
 Adding a second instance, for example:
 
@@ -460,6 +481,46 @@ Adding a second instance, for example:
 aproxy --config "~/.aproxy/configs/work.toml" config --baseurl https://api.example.com --listen 127.0.0.1:12346
 aproxy alias add work "~/.aproxy/configs/work.toml"
 aproxy start work
+```
+
+## settings
+
+```
+aproxy settings show
+aproxy settings get KEY
+aproxy settings set KEY VALUE
+aproxy settings unset KEY
+```
+
+Reads and edits `<home>/settings.json`; the file's keys and their meanings are in settings-json.md.
+KEY is a dotted path as written in the file: `watchdog.enabled`, `aliases.work`,
+`defaults.timeouts.connect_secs`, `defaults.extra_headers."x-foo"`. `show` prints the effective
+settings — the file's keys over the built-in defaults — preceded by a `# <path>` line; `get` prints
+one value as JSON, or `null` for a key that is neither stored nor built in.
+
+- **This group works when settings.json is invalid.** It is how the file is inspected and repaired:
+  `show` still prints every effective value, then the errors, and exits 3; `set` accepts a change
+  that makes the file more correct and refuses one that would introduce a new error.
+- **Values.** `set` takes a JSON value (`true`, `30`, `["a"]`, `{"k":1}`); string-valued keys accept
+  raw text (`aproxy settings set language zh-CN`), and a value starting with `"` is read as a JSON
+  string literal. `-` reads the value from one line of stdin, for keys that should not appear in the
+  shell history: `printf '%s\n' "$KEY" | aproxy settings set defaults.api_key -`. Only keys this
+  version knows can be set; `unset` accepts any key, including an unknown one.
+- **Secrets are write-only.** `show` and `get` print a secret as `{"secret": true, "hint": "sk-a…f3a9"}`
+  and mask URL credentials. Writing the placeholder back keeps the stored value.
+- **Results and exit codes.** `已保存到 <path>` ("saved to") after a change, `没有变化: <path>`
+  ("no change") when the value was already there. Exit 0 for those and for a successful `show`/`get`;
+  2 for a malformed key path or a value that is not valid JSON; 3 when the file cannot be read or the
+  change would make it invalid (nothing is written); 1 when the file cannot be written.
+- `aproxy alias add|remove` and `aproxy config --set-default|--clear-default` remain the commands for
+  their fields; both go through the same writer and touch only their own key.
+
+Example: give every instance a global default without editing JSON by hand.
+
+```sh
+aproxy settings set defaults.max_request_mb 128
+aproxy settings set defaults.retry.rules '[{"path": "/v1/messages/count_tokens(\\?.*)?", "max_attempts": 3}]'
+aproxy settings get defaults.max_request_mb
 ```
 
 ## desktop
@@ -473,7 +534,7 @@ itself starts, stops and reconfigures nothing, so opening or closing it never af
 instances; like every other `aproxy` command, it only resumes an install that was interrupted (see
 install / upgrade). It opens on the user's screen, so run it only when the user asks for the window.
 
-**In 0.2.0-alpha.1 the window is a preview filled with demo data.** The instances, logs and counts
+**In the 0.2.0 alpha releases the window is a preview filled with demo data.** The instances, logs and counts
 it shows are made up, not the ones on this machine, and a label `预览版 · 演示数据` ("preview · demo
 data") stays on screen to say so. Never read the state of the user's proxies from it, and never
 tell the user that what it shows is real; use `aproxy status` and `aproxy logs`. Its preferences
@@ -541,8 +602,8 @@ to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running anot
 | `--pre` | resolve `latest` in the pre-release channel |
 | `--allow-downgrade` | allow a VERSION lower than the running CLI's version, but never below 0.2.0. Not with `--force`, which installs a named VERSION regardless |
 | `--cpu x86-64-v3\|baseline` | which x86-64 build to download; default `x86-64-v3` when the CPU has AVX2 and the target publishes one (x86_64 Windows and x86_64 Linux gnu), baseline otherwise |
-| `--download-proxy URL` | proxy for downloads only; default `download_proxy` in settings.json (not read by `--force`), then the environment's proxy settings. Unrelated to config.toml's `proxy` |
-| `--no-skills` | skip the skill update this time (permanently: `skill_auto_update` in settings.json). Not with `--force`, which never updates skills |
+| `--download-proxy URL` | proxy for downloads only; default `update.download_proxy` in settings.json (not read by `--force`), then the environment's proxy settings. Unrelated to config.toml's `proxy` |
+| `--no-skills` | skip the skill update this time (permanently: `update.skill_auto_update` in settings.json). Not with `--force`, which never updates skills |
 | `--from PATH` | install a local binary; its `--version` output decides the version, with no downgrade check (below 0.2.0 is still refused) |
 | `--adopt` | copy the binary you are running into `<home>/bin/` and move running instances onto it |
 | `--skills-only` | update only the skill documents, to VERSION or, by default, the channel's latest version (the running version if the channel is empty) |
@@ -573,7 +634,7 @@ to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running anot
   cannot be installed: 0.1.x and 0.2.0 or later are incompatible"). compatibility.md, "Going back to
   0.1.x", explains the way back. Likewise a 0.1.x `aproxy install` cannot reach 0.2.0; see
   "Moving from 0.1.x to 0.2.0" there.
-- Downloads try the channels in `download_chain` (settings-json.md), by default github, npm,
+- Downloads try the channels in `update.download_chain` (settings-json.md), by default github, npm,
   cargo-binstall, cargo. Each downloaded binary must run its `--version` on this machine and report
   the target version and variant. When it does not run: a desktop build is replaced by the headless
   build of the same target, unless you gave `--variant desktop`; on Linux a gnu build is then

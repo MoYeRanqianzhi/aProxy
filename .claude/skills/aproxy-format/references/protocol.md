@@ -16,7 +16,7 @@ you implement a format program in any language or need to know exactly what a fi
   output on stdout (a banner, a log line, a second line, pretty-printed JSON) breaks the pairing,
   so aProxy evicts the worker and fails the request (see troubleshooting.md).
 - Lines can be large. The whole request body travels in one line (up to the instance's
-  `max_body_mb`, default 128), and binary bodies grow by a third in base64. Read lines with a
+  `max_request_mb`, default 128), and binary bodies grow by a third in base64. Read lines with a
   growable buffer, never a fixed-size one.
 - Write non-ASCII characters as UTF-8 or as `\uXXXX` escapes; both are valid JSON. On Windows,
   set your stdin/stdout encoding to UTF-8 explicitly (see guide.md, language pitfalls).
@@ -31,15 +31,15 @@ you implement a format program in any language or need to know exactly what a fi
 | `body` | string | Body as UTF-8 text (`""` when empty) | New body as text | Same | Same |
 | `body_b64` | string | Body as base64 when it is not valid UTF-8 | New body as base64 | Same | Same |
 | `worker_id` | integer | Pool slot of this worker | Ignored | Same | Ignored |
-| `extra` | string | The transform's `extra` setting, verbatim | Ignored | Same | Ignored |
+| `extra` | string | Caller-supplied data, passed verbatim; always `""` when the format is configured from config.toml | Ignored | Same | Ignored |
 | `error` | string | Never present | Marks this request as failed | Never present | Marks this conversion as failed |
 | `stage` | string | `"request"` (`"retry"` before a retry, see "Retry stage") | Ignored | `"response"` | Ignored |
 | `request_id` | string | Identifies the client request | Ignored | Same value as on the request side | Ignored |
 | `state` | string | Absent (nothing earlier sets it) | Saved for later stages; omitted = keep | The latest value a request or heartbeat reply left, if any | Ignored |
 
-A third stage, `"heartbeat"`, exists when the instance configures `heartbeat_transform`; its
-envelope and reply are described under "Heartbeat stage" below. A fourth, `"retry"`, reaches the
-request transform before each retry when it sets `every_attempt = true` ("Retry stage" below).
+A third stage, `"heartbeat"`, exists when a `[[format]]` entry declares `heartbeat` in `stages`;
+its envelope and reply are described under "Heartbeat stage" below. A fourth, `"retry"`, reaches a
+request format before each retry when its `stages` include `retry` ("Retry stage" below).
 
 `stage` names the side. The presence of `method` tells them apart too (request envelopes always
 carry it, response envelopes never do), and it is the only signal on aProxy 0.1.0, which sends
@@ -135,10 +135,13 @@ replaced, two live workers can share a number. In `spawn` mode it is always `0`.
 
 ### extra
 
-The `extra` string from the transform's configuration, passed through untouched (`""` when not
-set). It is the only configuration channel into your program besides `args`. aProxy does not
-interpret it and does not expand `~` in it; if you pass a path, use an absolute one or expand `~`
-in your program. Request and response transforms each have their own `extra`.
+Caller-supplied data, passed through untouched. When the format is configured from config.toml it
+is always `""`: config.toml no longer has an `extra` key. Put configuration in the `env` table or in
+`args` instead. `env` values are available to your program as ordinary environment variables and
+are never printed by `aproxy config --show`; `args` are visible on the command line, so keep secrets
+out of them. aProxy does not interpret either and does not expand `~` in them; if you pass a path,
+use an absolute one or expand `~` in your program. Each `[[format]]` entry has its own `args` and
+`env`.
 
 ### stage, request_id and state
 
@@ -163,9 +166,10 @@ cooperate.
 
 ### Heartbeat stage
 
-Configured with `heartbeat_transform` (aproxy-cli skill, config-toml.md). While a keepalive response
-waits for a usable upstream result, aProxy calls the program once per keepalive tick, after the
-response head is committed and the request side is done, until the first real byte is replayed.
+Configured with a `[[format]]` entry whose `stages` include `heartbeat` (aproxy-cli skill,
+config-toml.md). While a keepalive response waits for a usable upstream result, aProxy calls the
+program once per keepalive tick, after the response head is committed and the request side is done,
+until the first real byte is replayed.
 
 | Field | In | Reply |
 |---|---|---|
@@ -177,10 +181,10 @@ response head is committed and the request side is done, until the first real by
 | `error` | Never present | This tick fails |
 
 - The reply body must be UTF-8 and must leave the client's SSE parser at an event boundary, the same
-  rule as `keepalive_heartbeat`: end with a line break, and end with a blank line if it has any
+  rule as `keepalive.heartbeat`: end with a line break, and end with a blank line if it has any
   field line (`event:`, `data:`). Otherwise the heartbeat would merge with the first replayed
   event, so aProxy rejects it.
-- A failed tick (error reply, timeout, bad bytes, crash) sends the fixed `keepalive_heartbeat`
+- A failed tick (error reply, timeout, bad bytes, crash) sends the fixed `keepalive.heartbeat`
   instead and logs one warn per request. The request itself is unaffected.
 - aProxy does not wait for you: if the previous call has not returned when the next tick comes,
   that tick sends the fixed heartbeat. A reply that arrives after the real response has started is
@@ -188,14 +192,15 @@ response head is committed and the request side is done, until the first real by
 - Read what you need from the body on `seq` 1 and keep it in `state`; later ticks do not carry
   the body.
 - If your heartbeats are protocol events rather than comments, the client sees them before the
-  real response, which aProxy replays unchanged. Configure a `response_transform` that reads
-  `state` and removes what the heartbeats already sent (for example a duplicate `message_start`).
+  real response, which aProxy replays unchanged. Configure a format with the `response` stage that
+  reads `state` and removes what the heartbeats already sent (for example a duplicate
+  `message_start`).
 
 ### Retry stage
 
-Sent to the request transform when it is configured with `every_attempt = true` (aproxy-cli skill,
-config-toml.md). Before every retry, from the second upstream attempt on, aProxy calls the program
-again with the client's original request and sends your reply upstream as that attempt.
+Sent to a request format whose `stages` include `retry` (aproxy-cli skill, config-toml.md). Before
+every retry, from the second upstream attempt on, aProxy calls the program again with the client's
+original request and sends your reply upstream as that attempt.
 
 | Field | In | Reply |
 |---|---|---|
@@ -212,11 +217,11 @@ again with the client's original request and sends your reply upstream as that a
   never gives up retrying: it sends the request it sent last time and logs one warn per request.
   Only the `"request"` stage can fail a request.
 - The official binary handles a retry envelope exactly like a request (it carries `method`), so with
-  `every_attempt` each retry goes through its routing and key rotation again.
-- Replying with the envelope unchanged sends the client's untransformed request, so only enable
-  `every_attempt` for a program that handles this stage.
+  `retry` in the stages each retry goes through its routing and key rotation again.
+- Replying with the envelope unchanged sends the client's untransformed request, so only add
+  `retry` to the stages of a program that handles this stage.
 - The whole original body travels to you on every retry. Retries back off up to
-  `max_retry_backoff_secs`, so the rate is bounded, but a large body costs a large envelope each
+  `retry.max_backoff_secs`, so the rate is bounded, but a large body costs a large envelope each
   time.
 
 ### error
@@ -226,30 +231,30 @@ running afterwards: a persistent worker that replies with `error` stays in the p
 reaches the user:
 
 - Request side: the request fails with `422` `x-aproxy-error: format_rejected`, and the error
-  message is `format 'request_transform' rejected the request: <reason>`; `details` names `format`
-  and `stage`. If keepalive headers were already sent, the same error arrives as a final SSE
-  `event: error` frame instead (behaviors.md, After the commit).
+  message is `format '<name>' rejected the request: <reason>`; `details` names `format` (the
+  entry's `name`) and `stage`. If keepalive headers were already sent, the same error arrives as a
+  final SSE `event: error` frame instead (behaviors.md, After the commit).
 - Response side: the client receives the upstream response unchanged, and the daemon log records
   `响应转换失败，透传上游原始响应` ("response transform failed; passing the upstream response
   through") with the reason.
 
 aProxy never reads your exit code. What it sees is whether a line arrived: a process that exits or
 crashes without replying fails the request with `502` `format_failed`, `details.kind` `died`, and
-the message `format 'request_transform' failed (died): format 进程意外退出且无输出` ("format process
+the message `format '<name>' failed (died): format 进程意外退出且无输出` ("format process
 exited unexpectedly without output"); your reason is lost.
 
 ## When aProxy calls you
 
 - **Request side:** once per client request, after aProxy has buffered the body and before the
   first upstream attempt. Every retry replays the transformed request unchanged, including the key
-  you chose. aProxy retries upstream 4xx and 5xx responses as well as network errors (paths in
-  `bounded_retry_paths` stop after a few attempts), so a request you converted into something the
-  upstream rejects is retried indefinitely rather than failing.
+  you chose. aProxy retries upstream 4xx and 5xx responses as well as network errors (a request
+  that matches a `[[retry.rules]]` entry stops when its `max_attempts` is reached), so a request
+  you converted into something the upstream rejects is retried indefinitely rather than failing.
 - **Response side:** only for the upstream response aProxy accepts as successful, just before it
-  is replayed to the client. Error responses never reach you, including a final error that
-  `bounded_retry_paths` passes through.
-- **Heartbeat side:** only with `heartbeat_transform`, once per keepalive tick while a keepalive
-  response waits (see "Heartbeat stage").
+  is replayed to the client. Error responses never reach you, including a final error that a retry
+  rule passes through.
+- **Heartbeat side:** only for a format whose `stages` include `heartbeat`, once per keepalive tick
+  while a keepalive response waits (see "Heartbeat stage").
 - **Keepalive:** for a request that uses the keepalive channel (a streaming request, by default),
   aProxy sends the client skeleton headers (`200`, `text/event-stream`) and heartbeats whenever a
   keepalive interval (default 15 s) passes without a result, including time spent in your request
@@ -267,7 +272,7 @@ Request side, in (shown wrapped; on the wire it is one line):
 {"url":"https://api.anthropic.com/v1/messages","method":"POST",
  "headers":{"anthropic-version":"2023-06-01","content-type":"application/json","x-api-key":"sk-client"},
  "body":"{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":100,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
- "worker_id":2,"extra":"/home/me/.aproxy/agg.toml","stage":"request","request_id":"01a1e0eef745bd28-42"}
+ "worker_id":2,"extra":"","stage":"request","request_id":"01a1e0eef745bd28-42"}
 ```
 
 Request side, out (moved to another endpoint with a channel key; body rewritten; the chosen channel
@@ -283,7 +288,7 @@ Response side, in (no `method`; `url` is the rewritten request URL):
 {"url":"https://relay.example.com/v1/chat/completions",
  "headers":{"content-type":"application/json","x-request-id":"req_1"},
  "body":"{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"choices\":[...]}",
- "worker_id":0,"extra":"/home/me/.aproxy/agg.toml",
+ "worker_id":0,"extra":"",
  "stage":"response","request_id":"01a1e0eef745bd28-42","state":"{\"channel\":\"relay\"}"}
 ```
 

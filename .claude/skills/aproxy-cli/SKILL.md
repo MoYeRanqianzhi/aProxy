@@ -1,6 +1,6 @@
 ---
 name: aproxy-cli
-description: Operate and configure aProxy, the local API proxy that retries failed LLM API requests indefinitely so agent workflows keep running. Covers every aproxy command (start, status, stop, restart, logs, restore, alias, find, doctor, config, desktop, install/upgrade, and install --force for a failed upgrade or a broken binary), the config.toml and settings.json fields, runtime behavior (retries, keepalive heartbeats, multiple instances, logs, watchdog), connecting agent clients such as Claude Code and Codex, and troubleshooting. Use this skill whenever the user mentions aproxy or wants an agent client routed through a local retrying proxy, even if they do not ask for documentation - for example "point Claude Code at aproxy", "add a second instance on port 12346", "why is the port still in use after stop", "/compact hangs behind my relay API". Configuring request_transform / response_transform on the aProxy side is covered here; writing the format program itself belongs to the aproxy-format skill.
+description: Operate and configure aProxy, the local API proxy that retries failed LLM API requests indefinitely so agent workflows keep running. Covers every aproxy command (start, status, stop, restart, logs, restore, alias, find, doctor, config, settings, desktop, install/upgrade, and install --force for a failed upgrade or a broken binary), the config.toml and settings.json fields, runtime behavior (retries, keepalive heartbeats, multiple instances, logs, watchdog), connecting agent clients such as Claude Code and Codex, and troubleshooting. Use this skill whenever the user mentions aproxy or wants an agent client routed through a local retrying proxy, even if they do not ask for documentation - for example "point Claude Code at aproxy", "add a second instance on port 12346", "why is the port still in use after stop", "/compact hangs behind my relay API". Configuring format programs ([[format]]) on the aProxy side is covered here; writing the format program itself belongs to the aproxy-format skill.
 ---
 
 # aProxy
@@ -16,17 +16,17 @@ or flaky upstreams.
 - **It buffers, then replays.** aProxy reads the whole upstream response before sending anything
   back. That is what lets it retry failures the client would otherwise see half-way: network
   errors, 4xx, 5xx, `200` with an error JSON body, streams that break mid-way. Retries wait
-  0, 0, 0, 5, 10, 20 ... seconds, capped at `max_retry_backoff_secs` (default 320), forever.
+  0, 0, 0, 5, 10, 20 ... seconds, capped at `retry.max_backoff_secs` (default 320), forever.
 - **Heartbeats keep streaming requests alive.** While it retries a streaming request, aProxy sends
   the client response headers early and then a heartbeat, by default the SSE comment
   `: keepalive`, every 15 s. That defeats byte-level timeouts, but SSE parsers drop comments, so a
   client that times out on *events* (Claude Code, Codex and others) still gives up unless its
   stream idle timeout is raised.
   This is the most common integration mistake; see "Connect an agent client" below.
-- **Two deliberate exceptions to infinite retry:** `forward_only = true` streams straight through
-  with no buffering and no retries, and paths matched by `bounded_retry_paths` give up after 3
-  attempts and pass the real upstream response through (the fix when an upstream never supports
-  an endpoint, such as `count_tokens` behind some relay APIs).
+- **Two deliberate exceptions to infinite retry:** `delivery = "forward"` streams straight through
+  with no buffering and no retries, and requests matched by a `[[retry.rules]]` entry with
+  `max_attempts` reached pass the real upstream response through (the fix when an upstream never
+  supports an endpoint, such as `count_tokens` behind some relay APIs).
 - **Each instance is one config.toml with its own `listen_addr`.** Instances run in the background
   and are controlled over a local IPC channel (named pipe / Unix socket), never over the proxy
   port, so `status`, `stop` and `logs` work even when the proxy port is busy.
@@ -85,18 +85,23 @@ Every other client, the reasoning behind the timeouts, and how to verify the set
   config file path. A bare number is always a port.
 - `aproxy restart PORT|ALIAS` applies config changes: it stops the instance and starts it again
   with its original arguments. It does not start an instance that is not running; use `start`.
-- `aproxy desktop` opens the desktop window. In 0.2.0-alpha.1 it is a preview that shows demo
+- `aproxy desktop` opens the desktop window. In the 0.2.0 alpha releases it is a preview that shows demo
   data, not this machine's instances, so never take the state of the proxies from it; the CLI is
   the source of truth. Details: commands.md, desktop.
 
 ### Change configuration
 
 - `config.toml` is the per-instance file people edit; several can coexist, one per instance.
-  `settings.json` is aProxy's own state (aliases, the default config, global defaults); change it
-  through `aproxy alias ...` and `aproxy config ...` rather than by hand: if the file stops
-  parsing, aProxy prints a warning and runs on built-in defaults, losing every alias.
-- Precedence, highest first: CLI flags (this run only, never saved), config.toml, the global
-  defaults in settings.json (only a few fields have one), built-in defaults.
+  `settings.json` is aProxy's own state for the whole home (aliases, the default config, global
+  defaults under `defaults`, the watchdog, log rotation, install updates). Change it with
+  `aproxy settings show|get|set|unset`, `aproxy alias ...` or `aproxy config --set-default`; hand-edit
+  it only when it cannot be parsed at all. It is read strictly: an unknown key or a wrong type is an
+  error, and commands other than `settings`/`doctor`/`status`/`stop`/`install` then exit 3. This is
+  deliberate: a silently ignored setting would look like it was in effect.
+- Precedence, highest first: CLI flags (this run only, never saved), config.toml, the `defaults`
+  section of settings.json (any config.toml key except `listen_addr`, `log_file` and `format`),
+  built-in defaults. Credentials in `defaults` are inherited only by instances whose `base_url` (or
+  `proxy`) points at the same target as the default's.
 - Apply an edit with `aproxy restart PORT|ALIAS`. It parses and validates the edited config, and
   checks that a changed listen address can be bound, before it stops anything, so a bad edit is
   reported while the old instance keeps serving. `aproxy doctor` is the wider check: aliased
@@ -146,7 +151,7 @@ own session included. Exit codes 10, 11 and 12 each call for a different next st
 |---|---|
 | A command's exact syntax, flags, exit codes | [commands.md](references/latest/commands.md) |
 | A config.toml field: type, default, what 0 or empty means | [config-toml.md](references/latest/config-toml.md) |
-| Aliases, the default config, global defaults in settings.json | [settings-json.md](references/latest/settings-json.md) |
+| Aliases, the default config, global defaults and the other settings.json keys (`aproxy settings`) | [settings-json.md](references/latest/settings-json.md) |
 | Setting up Claude Code, Codex, Gemini CLI or another client | [clients.md](references/latest/clients.md) |
 | How retries, heartbeats, streaming, disk cache, forward-only mode, transformers, IPC, logs, watchdog and install work | [behaviors.md](references/latest/behaviors.md) |
 | A symptom or log message to explain | [troubleshooting.md](references/latest/troubleshooting.md) |

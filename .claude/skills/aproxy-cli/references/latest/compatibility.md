@@ -33,9 +33,10 @@ process, so it is safe to run at any time, even in the middle of an install.
   `~/.aproxy` unless `APROXY_HOME` is set), while npm, cargo or a package manager put theirs
   elsewhere. `where aproxy` (Windows) or `command -v aproxy` shows which one runs. `restart`
   launches the copy you invoke, so restarting from an older copy downgrades the instance. Run
-  file-writing commands (`config` setters, `alias`) with the newest copy too: an older binary drops
-  the keys it does not know when it rewrites config.toml or settings.json. A 0.1.x copy and a 0.2.0
-  or later copy cannot control each other's instances at all (see
+  file-writing commands (`config` setters, `alias`, `settings`) with the newest copy too: an older
+  binary may drop the keys it does not know when it rewrites config.toml or settings.json, while
+  0.2.0 and later keep them (and report an unknown key as an error in the first place). A 0.1.x copy
+  and a 0.2.0 or later copy cannot control each other's instances at all (see
   [Moving from 0.1.x to 0.2.0](#moving-from-01x-to-020)).
 - An `aproxy install` that halts mid-way leaves the new binary in place while some instances still
   run the old one; commands.md, install / upgrade, explains how to finish.
@@ -55,7 +56,7 @@ does not have. These development-line changes alter what you see or do on 0.1.0:
 | On 0.1.0 | These docs describe |
 |---|---|
 | A `default_config` pointing to a missing file makes every command without `--config` exit 1, `status`, `stop` and `config --clear-default` included; add `--config <any path>` to get past it | only commands that read the config fail (commands.md, Global options) |
-| With a corrupt settings.json, `alias add` and `config --set-default/--clear-default` save the empty defaults over it, losing every alias | these commands refuse to write (commands.md, alias) |
+| With a corrupt settings.json, `alias add` and `config --set-default/--clear-default` save the empty defaults over it, losing every alias | every command outside the tolerated group exits 3 before changing anything; the file is never rewritten from the defaults (commands.md, alias) |
 | A relative `log_file` / `--log-file` resolves against the working directory of the process that starts the instance; use absolute paths | relative paths resolve against `<home>` |
 | `--config` is used as given (no `~` expansion); a relative path is recorded relative, so `restart` or `restore` run from another directory cannot find it and `restore` deletes the record; pass absolute paths | `~` is expanded and the path made absolute (commands.md, Global options) |
 | `aproxy install VERSION --skills-only` is rejected; `--skills-only` always takes the channel's latest | a VERSION is accepted |
@@ -69,9 +70,10 @@ does not have. These development-line changes alter what you see or do on 0.1.0:
 | An online `aproxy install` moves every running instance onto `<home>/bin/`, including instances started from an npm, cargo or package-manager copy | an online install refuses while such an instance runs, as `--from` does (commands.md, install / upgrade) |
 | `aproxy install` keeps its progress in `<home>/run/install.state` and downloads into `<home>/staging/` | `<home>/install/state.json` and `<home>/install/staging/` (commands.md, Home directory) |
 | `upstream_url` is accepted as another name for `base_url` | only `base_url` is read; rename the key |
+| `settings.json` is a flat object whose unknown fields are ignored, and a corrupt one makes commands warn and run on built-in defaults | it is sectioned (aliases, `defaults`, `watchdog`, `logs`, `instances`, `update`, `ui`) and parsed strictly: any unknown or 0.1.x field is an error, and commands outside `settings`/`doctor`/`status`/`stop`/`install` exit 3 (settings-json.md) |
 | `keepalive_heartbeat` is ignored; heartbeats are always `: keepalive` | the heartbeat is configurable (config-toml.md) |
 | `heartbeat_transform` is ignored, and transformer envelopes carry no `stage`, `request_id` or `state` | heartbeats can come from a format program, and both transformer sides of a request share `request_id` and `state` (aproxy-format skill) |
-| There is no `aproxy desktop` | builds with the desktop interface open a window with it; in 0.2.0-alpha.1 it shows demo data only (commands.md, desktop) |
+| There is no `aproxy desktop` | builds with the desktop interface open a window with it; in the 0.2.0 alpha releases it shows demo data only (commands.md, desktop) |
 | There is no `aproxy install --force` and no process ledger | force install stops every process of the home through `<home>/ledger/` and replaces the binary (commands.md, Force install) |
 | The CPU build option is `--variant v3\|baseline`, and the swap renames the old binary to the fixed name `aproxy.old(.exe)` | the option is `--cpu x86-64-v3\|baseline` (`--variant` now picks `desktop` or `headless`), and the swap uses unique names `aproxy.old-<nanoseconds>-<pid>[.exe]` (commands.md, install / upgrade) |
 
@@ -120,12 +122,107 @@ moment with the user first.
 4. Delete what 0.1.x leaves behind: `<home>/run/install.state` and `<home>/staging/`, which 0.2.0
    never reads, and any `<home>/run/*.restore`. A restore record that survived step 2 belongs to an
    instance that had crashed, and `aproxy restore` would start it with 0.1.x's command line.
-5. Keep `settings.json` and the config files. Apply the renames listed in the CHANGELOG (for
-   example `upstream_url` is now `base_url`), then run `aproxy doctor`.
+5. Keep `settings.json` and the config files, but rewrite both: settings.json changed shape, and a
+   flat 0.1.x file is refused. Rename its keys with the table in "settings.json keys renamed in
+   0.2.0", then rename the config.toml keys in the table after it. Run `aproxy doctor`.
 6. Start each instance with the new CLI: `aproxy start <alias or config path>`. Ports are unchanged,
    so agent clients need no change.
 7. Refresh these documents with `aproxy install --skills-only`, and check that the agent's skills
    directory links to or copies `<home>/skills/aproxy-cli`.
+
+### settings.json keys renamed in 0.2.0
+
+0.2.0 has no automatic migration for settings.json, because a value that moved into a section cannot
+be distinguished reliably from a key the user meant to keep. A flat 0.1.x file is rejected field by
+field: every old top-level key is reported as `config_unknown_key`, `watchdog: true|false` as
+`config_type` ("watchdog must be an object"), and commands that need settings stop with exit 3
+(settings-json.md, "When settings.json is invalid"). `aproxy settings show`, `aproxy doctor` and the
+other tolerated commands still run, so you can inspect the file and repair it one key at a time;
+`aproxy settings unset` accepts the old keys even though this version does not know them.
+
+Rewrite each old key with the table below. Keep `aliases`, `default_config` and `config_dirs` where
+they are: their names and shapes did not change.
+
+| 0.1.x settings.json | 0.2.0 |
+|---|---|
+| `max_body_mb = N` | `defaults.max_request_mb = N` (`0` = no limit) |
+| `disk_cache = true\|false` | `defaults.disk_cache` |
+| `forward_only = true\|false` | `defaults.delivery = "forward"\|"retry"` |
+| `bounded_retry_paths = ["..."]` | `defaults.retry.rules`: one entry per pattern, `{ "path": "<pattern>", "max_attempts": 3 }` (0.1.x stopped after three attempts, so keep 3 to preserve behavior) |
+| `allowed_hosts = [...]` | `defaults.allowed_hosts` |
+| `allowed_origins = [...]` | `defaults.allowed_origins` |
+| `keepalive_trigger = "..."` | `defaults.keepalive.trigger` |
+| `watchdog = true\|false` | `watchdog.enabled` (the other watchdog fields move into the same object) |
+| `watchdog_heartbeat_secs = N` | `watchdog.heartbeat_secs` |
+| `watchdog_stale_after_cycles = N` | `watchdog.stale_after_cycles` |
+| `watchdog_max_restarts = N` | `watchdog.max_restarts` |
+| `watchdog_idle_exit_secs = N` | `watchdog.idle_exit_secs` |
+| `log_rotate_mb = N` | `logs.rotate_mb` |
+| `idle_timeout_secs = N` | `instances.idle_threshold_secs` |
+| `download_chain = [...]` | `update.download_chain` |
+| `download_proxy = "..."` | `update.download_proxy` |
+| `skill_auto_update = true\|false` | `update.skill_auto_update` |
+
+Two behaviors differ from a pure rename:
+
+- **A global `api_key` now needs a target.** `defaults.api_key` (and with it any secret header in
+  `defaults.extra_headers`) is an error without `defaults.base_url`, because the key would otherwise
+  be inherited by every instance and sent to every upstream. Set `defaults.base_url` first. After
+  that, only instances whose own `base_url` names the same target inherit the key; an instance that
+  points elsewhere keeps working but sends no key unless its own config.toml sets one (settings-json.md,
+  "Credentials in defaults follow their target").
+- **0.1.x had no `language` or `ui`.** Both are optional; leave them out and take the built-in
+  defaults (`"system"` and `{}`).
+
+Rewrite the whole file before starting 0.2.0: a mixture of old and new keys is still invalid for the
+new CLI (the old keys are unknown), and 0.1.x cannot read the new sections either. With the 0.2.0
+CLI, for example:
+
+```sh
+aproxy settings unset max_body_mb
+aproxy settings set defaults.max_request_mb 128
+aproxy settings unset forward_only
+aproxy settings set defaults.delivery '"retry"'
+aproxy settings unset watchdog
+aproxy settings set watchdog.enabled false
+```
+
+`settings unset` removes an old key even though this version does not know it; `settings set` rejects
+a key this version does not know. A change that would introduce a new error is refused, so do the
+`watchdog` object in the order shown (remove the old boolean, then set the section). `settings show`
+names whatever is still wrong, and `doctor` lists it with the rest of the home's problems.
+
+### Config keys renamed in 0.2.0
+
+config.toml is parsed strictly from 0.2.0 on. An old key is not ignored: it is reported as
+`config_unknown_key`, naming the file, the key path and line:column, and the instance does not
+start. Rename each key before the first start with the new CLI.
+
+| 0.1.x config.toml | 0.2.0 |
+|---|---|
+| `max_body_mb = N` | `max_request_mb = N` (`0` = no limit) |
+| `spool_limit_mb = N` | `max_response_mb = N` |
+| `forward_only = true\|false` | `delivery = "forward"\|"retry"` (default `"retry"`) |
+| `connect_timeout_secs = N` | `[timeouts] connect_secs = N` |
+| `read_timeout_secs = N` | `[timeouts] first_byte_secs = N` for the wait for response headers, and `[timeouts] read_idle_secs = N` for the gap between body reads; both default 300, and they now report `upstream_first_byte_timeout` and `upstream_read_idle_timeout` separately |
+| `keepalive_interval_secs = N` | `[keepalive] interval_secs = N` |
+| `keepalive_trigger = "..."` | `[keepalive] trigger = "..."`; `"always"` is rejected in the file (only a format may ask for it per request) |
+| `keepalive_heartbeat = "..."` | `[keepalive] heartbeat = "..."` |
+| `max_retry_backoff_secs = N` | `[retry] max_backoff_secs = N` |
+| `bounded_retry_paths = ["..."]` | `[[retry.rules]]` entries with `path` (regex) and `max_attempts` (required; `0` = no limit), plus optional `status` |
+| `[request_transform]`, `[response_transform]`, `[heartbeat_transform]` tables | `[[format]]` array entries with `command`, `args`, `process`, and `stages` (`request`, `response` or `heartbeat`) |
+| format `mode = "spawn"\|"persistent"` | `process = "spawn"\|"persistent"` |
+| format `idle_timeout_secs = N` | `worker_idle_secs = N` |
+| format `every_attempt = true` | add `"retry"` to `stages` next to `"request"` |
+| format `extra = "..."` | pass the data through `args` or `env`; the envelope's `extra` field is empty when configured from config.toml |
+
+The 0.1.x `upstream_url` name is older still and also no longer read; it is `base_url` in 0.2.0 and
+in 0.1.0's stable line (the "What these docs describe" table above).
+
+A rewrite that edits one key at a time with `aproxy config SETTER` and `aproxy config --unset OLD`
+is safe: an unknown key does not block unrelated edits, and `--unset` accepts any key, including
+one this version does not know. After the renames, `aproxy config --show` prints every effective
+value and exits 3 if anything is still wrong.
 
 If the binary was replaced while 0.1.x instances were still running, `aproxy status` lists them
 under `无响应的 aProxy 实例 (<n>)——进程仍在，但不应答控制通道` ("unresponsive instances: the process
@@ -157,7 +254,8 @@ these docs do not track how they differ, so upgrade rather than look up alpha be
 3. Check that `aproxy status` shows the new version for every instance, and run
    `aproxy restart <port>` for any that does not.
 
-Config files from alpha builds load unchanged, with one exception on the development line: rename
-`upstream_url` to `base_url`. Otherwise keys a version does not know are ignored and missing keys take
-their defaults. If something stops working after the upgrade, look the symptom up in
-troubleshooting.md.
+Config files from alpha builds need the same renames as 0.1.x (see "Config keys renamed in 0.2.0",
+and rename `upstream_url` to `base_url`), and their flat settings.json is refused the same way
+("settings.json keys renamed in 0.2.0"). From 0.2.0 on, a key the version does not know is an error
+that stops the instance; it is no longer ignored. Missing keys still take their defaults. If
+something stops working after the upgrade, look the symptom up in troubleshooting.md.

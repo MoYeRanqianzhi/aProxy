@@ -8,7 +8,8 @@ print them, so search for the Chinese text in real output.
 ## Where the messages appear
 
 - **The client** gets `422` with `x-aproxy-error: format_rejected` when the program replied with an
-  `error` envelope; the message is `format 'request_transform' rejected the request: <reason>`.
+  `error` envelope; the message is `format '<name>' rejected the request: <reason>`, where `<name>`
+  is the `[[format]]` entry's `name`.
   When the program itself failed (spawn, crash, pipe, timeout, protocol) it gets `502` with
   `x-aproxy-error: format_failed` and `details.kind` naming which. Nothing was sent upstream, and
   the request is not retried. A streaming client that had already received keepalive headers gets
@@ -33,17 +34,17 @@ printf '%s\n' "$E" | <command> <args...>          # expect exactly one JSON line
 printf '%s\n' "$E" "$E" | <command> <args...> | wc -l   # expect 2
 ```
 
-Use the same `extra` as the config. `scripts/test_format.py` (guide.md, Test without aProxy) checks
-more but hides stderr.
+Run the command with the same `env` and `args` as the config. `scripts/test_format.py` (guide.md,
+Test without aProxy) checks more but hides stderr.
 
 ## Reasons reported by aProxy
 
 An `error` reply becomes `422` `format_rejected` with the message
-`format 'request_transform' rejected the request: <reason>`; the reason is your program's own text.
-For the official binary, see Errors from aproxy-format below.
+`format '<name>' rejected the request: <reason>`; the reason is your program's own text. For the
+official binary, see Errors from aproxy-format below.
 
 A failure of the program itself becomes `502` `format_failed` with the message
-`format 'request_transform' failed (<kind>): <detail>`. `details.kind` names the failure, and the
+`format '<name>' failed (<kind>): <detail>`. `details.kind` names the failure, and the
 `<detail>` begins with one of these (the Chinese text is unchanged):
 
 | `details.kind` | Detail begins with | Meaning | Fix |
@@ -80,7 +81,7 @@ side they appear in the `响应转换失败` log line while the client gets the 
 
 | Message | Cause | Fix |
 |---|---|---|
-| `未提供聚合配置（--config 或 transform extra 均为空）` ("no aggregation config: --config and extra are both empty") | `extra` not set on this side | Set `extra` to the config path on both transforms. |
+| `未提供聚合配置（--config 或 transform extra 均为空）` ("no aggregation config: --config and extra are both empty") | `args` for this entry has no `--config`, and the envelope `extra` is empty (which it always is when configured from config.toml) | Add `"--config", "<aggregation config path>"` to the `args` of every aproxy-format entry. |
 | `聚合配置加载失败: 读取 <path>: ...` ("failed to load aggregation config: reading <path>") | File missing or unreadable | Use an absolute path or one starting with `~/`. |
 | `聚合配置加载失败: 解析失败: ...` ("... parse failed") | TOML syntax error, missing `client_format`, or an unknown protocol name (`unknown variant`) | Protocol names are `anthropic_messages`, `openai_chat`, `openai_responses` (and `auto` for `client_format`). |
 | `聚合配置加载失败: 至少需要一个 [[channel]]` | No channels | Add a `[[channel]]` table. |
@@ -92,7 +93,7 @@ side they appear in the `响应转换失败` log line while the client gets the 
 | `client_format=auto 检测失败：请求形态不像已知协议（检查字段名）` ("auto detection failed") | The body does not look like any supported protocol | Declare `client_format` explicitly. |
 | `client_format = "auto" 只支持同协议：...` ("auto supports same-protocol only") | Under `auto`, the request was routed to a channel of another protocol; rejected before reaching the upstream. Also happens when an Anthropic request without `system` is detected as `openai_chat` | Declare `client_format` explicitly. |
 | `协议转换失败: ...` ("protocol conversion failed") | The converter could not express this request or response in the other protocol | Route this model to a same-protocol channel. |
-| `url <url> 反查不到渠道（检查渠道表的 url 配置）` ("url matches no channel") | Response side: the request went to a URL no channel `url` prefixes, usually because the two sides use different `extra` files | Give both transforms the same `extra`, and restart after editing the config. |
+| `url <url> 反查不到渠道（检查渠道表的 url 配置）` ("url matches no channel") | Response side: the request went to a URL no channel `url` prefixes, usually because the request and response entries use different `--config` files | Give both entries the same `--config` path, and restart after editing the config. |
 | `SSE 流式响应的跨协议转换尚未支持（渠道协议 <a> ≠ 客户端协议 <b>）` ("cross-protocol SSE conversion is not supported") | A streaming response from a channel of another protocol; the client receives the upstream stream unchanged and cannot parse it | Route streaming clients to a channel of their own protocol (examples.md, Limits). |
 | `响应 body 非 JSON` ("response body is not JSON") | The upstream answered with a non-JSON, non-SSE body that aProxy accepted as success | Check the channel URL; it may point at a web page rather than the API. |
 
@@ -100,15 +101,15 @@ side they appear in the `响应转换失败` log line while the client gets the 
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Responses reach the client unconverted | No `response_transform`; or the response transform failed (look for `响应转换失败` in the log); or the response was an upstream error, which is never transformed | Configure both sides; read the logged reason. |
+| Responses reach the client unconverted | No `[[format]]` entry has the `response` stage; or the response format failed (look for `响应转换失败` in the log); or the response was an upstream error, which is never transformed | Add a `response` entry; read the logged reason. |
 | A response header change takes effect only sometimes | When aProxy has already sent keepalive headers to a waiting client, only the body change applies | Expected; do not rely on response headers for keepalive-eligible streaming requests. |
 | Requests hang after enabling a transformer, and the log repeats `上游返回可重试状态码，重试` ("upstream returned a retryable status; retrying") or `上游返回错误内容，重试` ("upstream returned an error body; retrying") | The upstream rejects the transformed request (bad key, wrong model name, malformed body, wrong path). aProxy retries 4xx like any failure, always with the same transformed request | Read the upstream error preview logged next to that line, fix the conversion, and test it with `scripts/test_format.py`. A malformed `url` shows up as repeated network errors instead. |
-| Rotation always uses the first key | `mode` is not `persistent` (also check its spelling: an unknown key is ignored and the default `spawn` applies) | `mode = "persistent"`. |
+| Rotation always uses the first key | `process` is not `persistent` (a misspelling such as `mode` is now `config_unknown_key`, so the instance would not start instead of silently defaulting) | `process = "persistent"`. |
 | Some keys are used more than others | Each persistent worker counts from the first key on its own; idle reaping restarts counters | Offset by `worker_id` in your own program (examples.md, Key rotation); the official binary does not. |
-| Conversions are slow under load, one at a time | `spawn` mode runs one conversion at a time per side | Switch to `persistent`; raise `pool_max` if requests queue. |
-| A transformer you configured never runs, and startup prints no transformer line | `command` is blank, which aProxy treats as not configured | Set `command`. |
-| The instance refuses to start: `forward_only 与外部转换器互斥：...` ("forward_only and external transformers are mutually exclusive") | `forward_only` is enabled for the instance, possibly inherited from settings.json | Set `forward_only = false` in this instance's config.toml, or remove the transformer. |
-| The instance refuses to start: `request_transform 的 pool_max 必须 >= 1，当前值: 0` (or `response_transform`) | `pool_max = 0` | Use 1 or more. |
+| Conversions are slow under load, one at a time | `spawn` process runs one conversion at a time per stage | Switch to `persistent`; raise `pool_max` if messages queue. |
+| A transformer you configured never runs, and startup prints no transformer line | `command` is blank, which is now a `config_invalid_value` error: the entry is not silently dropped | Set `command`. |
+| The instance refuses to start with `config_conflict` on `delivery` | `delivery = "forward"` is set for the instance, possibly inherited from settings.json `defaults.delivery` | Set `delivery = "retry"` in this instance's config.toml, or remove the format. |
+| The instance refuses to start with `config_invalid_value` on `format[N].pool_max`: `pool_max must be at least 1` | `pool_max = 0` | Use 1 or more. |
 | Non-ASCII text arrives garbled, or the program raises `UnicodeEncodeError` | The program's pipes use the system code page | Set UTF-8 on stdin and stdout (guide.md, Language pitfalls). |
 | Format processes keep running after the instance stopped | The program ignores EOF, and aProxy exited without cleaning up (crash or forced stop) | Make the loop exit on EOF. End the leftovers by PID after confirming they are the format program; never kill by image name, which would also hit `aproxy` instances that agent sessions depend on. |
 | The client receives an upstream key in a response header | The response side copied headers that contain credentials | Rebuild or allow-list response headers (protocol.md, Security). |

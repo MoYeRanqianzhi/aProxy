@@ -20,7 +20,7 @@ for the envelope are in protocol.md; complete working programs are in examples.m
 | | `spawn` (default) | `persistent` |
 |---|---|---|
 | Process lifetime | One process per conversion; aProxy kills it after reading the reply | A pool of long-lived workers, each looping over lines |
-| Concurrency | One conversion at a time per transform (request and response each) | Up to `pool_max` (default 4) at once; further requests wait for a free worker |
+| Concurrency | One conversion at a time per stage (request, response and heartbeat each) | Up to `pool_max` (default 4) at once; further messages wait for a free worker |
 | State between requests | None: every request sees a fresh process | Kept in each worker's memory |
 | `worker_id` | Always `0` | Slot number `0 .. pool_max - 1` |
 | Cost per request | A process start | A pipe round trip |
@@ -34,7 +34,7 @@ How the persistent pool behaves, so you can reason about your program's lifetime
 - Workers start on demand, not at instance start, and an idle worker is reused before a new one is
   started. Requests beyond `pool_max` queue; the time spent queueing does not count toward
   `timeout_secs`.
-- A worker idle for `idle_timeout_secs` (default 300; `0` = never) is killed. State held in
+- A worker idle for `worker_idle_secs` (default 300; `0` = never) is killed. State held in
   memory is lost with it, so a rotation counter restarts from the beginning.
 - A worker that times out, breaks the protocol, or dies is killed and removed; the next request
   starts a fresh one.
@@ -123,7 +123,7 @@ pre-release the crate's interface can still change, so pin it exactly, as the `C
 below does; once 0.2.0 is released, switch to `"0.2"`.
 
 ```rust
-// Cargo.toml: aproxy-envelope = "=0.2.0-alpha.1"
+// Cargo.toml: aproxy-envelope = "=0.2.0-alpha.2"
 use std::io::{BufRead, Write};
 
 use aproxy_envelope::TransformEnvelope;
@@ -177,14 +177,17 @@ megabytes), parse it with a JSON library, write one compact line, flush. In C or
 ## Techniques
 
 **One program for both sides.** Branch on whether `method` is present and configure the same
-command for `request_transform` and `response_transform`. Each side still runs in its own process
-pool, so the two halves cannot share memory; carry anything the response side needs in the URL
-(the response envelope's `url` is your request-side URL) or derive it from configuration.
+command in two `[[format]]` entries, one with `stages = ["request"]` and one with
+`stages = ["response"]`. Each stage still runs in its own process pool, so the two halves cannot
+share memory; carry anything the response side needs in the URL (the response envelope's `url` is
+your request-side URL) or derive it from configuration.
 
-**Pass settings through `extra`.** JSON is the most flexible encoding. In TOML, a single-quoted
-literal string avoids escaping: `extra = '{"keys": ["sk-a", "sk-b"]}'`. For anything long or
-secret, put a file path in `extra` and read the file once per worker. Keep secrets out of `args`:
-command lines are visible to other processes on the machine.
+**Pass settings through `env`.** The `[[format]]` table has no `extra` key any more; the envelope's
+`extra` field is empty when the format is configured from the file. Put configuration in `env`
+(JSON is the most flexible encoding) and read it with `os.environ` / `process.env`. `env` values
+are never displayed by `aproxy config --show`, which also keeps secrets out of the printed config;
+a file path in `env` works for anything long. Keep secrets out of `args`: command lines are
+visible to other processes on the machine.
 
 **Rewrite the URL, keep the path when it matters.** To change only the host, replace the scheme
 and host and keep the rest of `url`, so every endpoint the client calls (for example
@@ -218,19 +221,22 @@ python scripts/test_format.py --side response --format-spec openai-chat --comman
 # response side, streaming: the body is a complete SSE event sequence
 python scripts/test_format.py --side response --sse --format-spec anthropic --command ./my-format
 
-# pass the same extra your config will use; supply your own body
-python scripts/test_format.py --format-spec anthropic --extra '{"keys":["sk-a"]}' --command ./my-format
+# pass configuration the way config.toml env does, in the environment
+ROTATE='{"keys":["sk-a"]}' python scripts/test_format.py --format-spec anthropic --command ./my-format
+# --extra sets the envelope field; config.toml leaves it empty, so use it only for a program
+# that accepts it when run by hand
+python scripts/test_format.py --format-spec anthropic --extra '{"demo":true}' --command ./my-format
 python scripts/test_format.py --format-spec anthropic --body-file payload.bin --command ./my-format
 ```
 
 | Flag | Meaning |
 |---|---|
 | `--format-spec` | `anthropic`, `openai-chat` or `openai-responses`: protocol of the mock body (required) |
-| `--side` | `request` (default), `retry` (the same request before a retry, with a mock `retry` object; for `every_attempt`), `response`, or `heartbeat` (the first tick of `heartbeat_transform`, body included; the reply body is checked against the event-boundary rule) |
+| `--side` | `request` (default), `retry` (the same request before a retry, with a mock `retry` object; for a request format with `retry` in its stages), `response`, or `heartbeat` (the first tick of a format with the `heartbeat` stage, body included; the reply body is checked against the event-boundary rule) |
 | `--sse` | Response side only: an SSE body instead of JSON |
 | `--command` | Program to run (required); its arguments go after `--` |
 | `--url` | Envelope `url` (default: the protocol's usual endpoint) |
-| `--extra` | Envelope `extra` (default empty) |
+| `--extra` | Envelope `extra` (default empty). config.toml has no `extra` key, so a format it launches always receives `""`; use the environment for configuration |
 | `--worker-id` | Envelope `worker_id` (default 0) |
 | `--body-file` | Use a file as the body; non-UTF-8 content is sent as `body_b64` |
 | `--raw` | Print the reply as received instead of pretty-printing it |
@@ -252,33 +258,47 @@ Also feed an input that should fail and confirm you get an `error` reply rather 
 
 ## Configure it in aProxy
 
-Transformers are per instance, set in that instance's config.toml (there is no global default and
-no command-line flag):
+Formats are per instance, set as `[[format]]` entries in that instance's config.toml (there is no
+global default and no command-line flag):
 
 ```toml
-request_transform  = { command = "/usr/bin/python3", args = ["/home/me/formats/convert.py"], mode = "persistent", pool_max = 4, idle_timeout_secs = 300, timeout_secs = 30, extra = '{"model": "gpt-4o"}' }
-response_transform = { command = "/usr/bin/python3", args = ["/home/me/formats/convert.py"], mode = "persistent" }
+[[format]]
+name = "convert-request"
+command = "/usr/bin/python3"
+args = ["/home/me/formats/convert.py"]
+process = "persistent"
+stages = ["request", "retry"]
+env = { CONVERT = '{"model": "gpt-4o"}' }
+
+[[format]]
+name = "convert-response"
+command = "/usr/bin/python3"
+args = ["/home/me/formats/convert.py"]
+process = "persistent"
+stages = ["response"]
+env = { CONVERT = '{"model": "gpt-4o"}' }
 ```
 
-`pool_max`, `idle_timeout_secs` and `timeout_secs` are shown at their defaults; the full field
+`pool_max`, `worker_idle_secs` and `timeout_secs` are shown at their defaults; the full field
 reference is in the aproxy-cli skill, config-toml.md. Points that trip up format authors:
 
-- **Two independent settings.** A protocol converter needs both; with only `request_transform`,
-  responses reach the client unconverted. `extra` and every other field are set per side.
+- **The stages are separate entries.** A protocol converter needs both the `request` and
+  `response` stages; with only `request`, responses reach the client unconverted. Each entry has
+  its own `args` and `env`, and at most one format may serve a given stage in this version.
 - **Use absolute paths.** aProxy runs `command` directly, without a shell. A bare name is looked
   up on PATH; a relative path resolves against the daemon's working directory, which is wherever
   the instance happened to be started. `~/` at the start of `command` expands to the user's home
-  directory, but `args` and `extra` are passed untouched, so a script path in `args` must be
+  directory, but `args` and `env` are passed untouched, so a script path in `args` must be
   absolute. On Windows, write paths with forward slashes or in single-quoted TOML strings
   (`'C:\fmt\convert.py'`); a bare command name is found on PATH only as an `.exe`.
-- **Stateful programs need `persistent`.** In spawn mode every request starts a fresh process, so
-  a rotation counter is always zero.
-- **Not with `forward_only`.** An instance with `forward_only` enabled (in config.toml, or
-  inherited from settings.json) refuses to start with a transformer, because it never buffers the
-  body.
-- **Every request on the instance goes through the transformer**, including requests your
-  program was not written for (model listing, token counting, `GET` requests with an empty body).
-  Pass those through unchanged or reply with a clear `error`.
+- **Stateful programs need `process = "persistent"`.** In spawn mode every message starts a fresh
+  process, so a rotation counter is always zero.
+- **Not with `delivery = "forward"`.** An instance in forward-only mode (set in config.toml, or
+  inherited from settings.json `defaults.delivery`) refuses to start with a format, because it never
+  buffers the body; the error is `config_conflict` on `delivery`.
+- **Every request on the instance goes through the format**, including requests your program was
+  not written for (model listing, token counting, `GET` requests with an empty body). Pass those
+  through unchanged or reply with a clear `error`.
 
 Apply the change with `aproxy restart <port|alias>`. Restarting cuts every connection through that
 instance. If you are an agent whose own model traffic goes through it, that includes your session
@@ -293,4 +313,5 @@ Confirm it is active:
   ("external transformer enabled") once per configured side at startup, and
   `请求已由外部转换器改写` ("request rewritten by the external transformer") with the new URL for
   every converted request.
-- `aproxy config --show` prints the transformer settings as aProxy parsed them (`extra` masked).
+- `aproxy config --show` prints each format as aProxy parsed it: `args` values after a secret flag
+  are masked, and `env` is listed by name only, never by value.

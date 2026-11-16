@@ -20,12 +20,12 @@ the shapes in each provider's API reference.
   # is what a format program sees after aProxy has buffered the whole stream
   python test_format.py --side response --sse --format-spec anthropic --command ./my-format
 
-  # Heartbeat stage (heartbeat_transform): the first call of a request, which
-  # carries the request body; the reply body is checked against the SSE
-  # event-boundary rule aProxy enforces
+  # Heartbeat stage (a [[format]] entry with "heartbeat" in stages): the first
+  # call of a request, which carries the request body; the reply body is
+  # checked against the SSE event-boundary rule aProxy enforces
   python test_format.py --side heartbeat --format-spec anthropic --command ./my-format
 
-  # Retry stage (request_transform with every_attempt = true): the client's
+  # Retry stage (a request format with "retry" in stages): the client's
   # original request again, plus what happened on the previous attempt
   python test_format.py --side retry --format-spec anthropic --command ./my-format
 
@@ -308,8 +308,8 @@ def checkpoints(spec: str, side: str, sse: bool) -> list[str]:
             "(empty = nothing is written)",
             "the client's SSE parser accepts it; comments and blank lines are safe, "
             "protocol events must be valid for the client's protocol",
-            "if the heartbeats are protocol events, a response_transform removes what the "
-            "real response would duplicate (keep the bookkeeping in `state`)",
+            "if the heartbeats are protocol events, a format with the response stage removes "
+            "what the real response would duplicate (keep the bookkeeping in `state`)",
         ]
     if side == "retry":
         return [
@@ -356,9 +356,9 @@ def main() -> None:
         choices=["request", "retry", "response", "heartbeat"],
         default="request",
         help="envelope side: request = client request (has method); "
-        "retry = the same request before a retry (request_transform with every_attempt); "
+        "retry = the same request before a retry (a request format with retry in stages); "
         "response = upstream response (no method); heartbeat = one keepalive tick "
-        "(heartbeat_transform). Default: request",
+        "(a format with the heartbeat stage). Default: request",
     )
     ap.add_argument(
         "--sse",

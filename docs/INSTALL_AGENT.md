@@ -48,8 +48,8 @@ as `v0.1.0-alpha.12t3`; those are ignored) and drafts are skipped. By default it
 release; if the repository has no stable release at all it falls back to the
 highest-versioned pre-release and prints a note. Pass `--pre`
 (`-Pre` for PowerShell, or set `APROXY_PRE=1`) to take the highest version,
-pre-release or not (by version number, not by creation time). An explicit tag (`sh install.sh v0.2.0-alpha.1`,
-`-Version v0.2.0-alpha.1`) overrides all of this.
+pre-release or not (by version number, not by creation time). An explicit tag (`sh install.sh v0.2.0-alpha.2`,
+`-Version v0.2.0-alpha.2`) overrides all of this.
 
 **0.2.0 is currently available as a pre-release only**, so without `--pre` the
 scripts install the stable 0.1.x, which has no desktop window, no variants and
@@ -214,7 +214,7 @@ them.
 ## 3. Verify
 
 ```sh
-aproxy --version   # e.g. aproxy v0.2.0-alpha.1 (desktop; x86_64-unknown-linux-gnu)
+aproxy --version   # e.g. aproxy v0.2.0-alpha.2 (desktop; x86_64-unknown-linux-gnu)
 aproxy status      # lists running instances (empty is fine after install)
 ```
 

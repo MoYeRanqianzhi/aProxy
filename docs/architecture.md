@@ -34,8 +34,8 @@ home 的实例。
 加错误码、加状态值都不递增。没有 `v` 的请求按 `bad_request` 拒绝，没有 `v` 的应答不予
 采信（0.1.0 的格式就是这样，0.2.0 起与它不再互通）。
 
-上图的「重试循环 / spool / 回放」是默认模式的主流程；`forward_only` 模式下这两
-环整体旁路（见「仅转发模式（forward_only）」）。
+上图的「重试循环 / spool / 回放」是默认模式的主流程；`delivery = "forward"` 模式下这两
+环整体旁路（见「仅转发模式（delivery = "forward"）」）。
 
 ## 模块
 
@@ -43,20 +43,20 @@ home 的实例。
 |---|---|
 | `src/main.rs` | 进程入口：C5 的 `--version`、控制台代码页、在建 tokio 运行时之前分派 `desktop`、其余子命令在手建的运行时里分派（配置文件定位、日志初始化） |
 | `src/cli.rs` | clap 命令树定义（`Cli`/`Commands`/`AliasCmd`/`ConfigArgs`），只承载定义不含逻辑；在库里，操作层按原启动参数预检重启时要解析它 |
-| `src/commands/` | 十二个子命令各自一文件（start/status/stop/restart/restore/alias/doctor/find/logs/config/install/desktop）：调用操作层拿到结果，渲染成给人看的文字、决定退出码 |
+| `src/commands/` | 十三个子命令各自一文件（start/status/stop/restart/restore/alias/doctor/find/logs/config/settings/install/desktop）：调用操作层拿到结果，渲染成给人看的文字、决定退出码 |
 | `src/ops/` | 操作层：选目标（`target`）、启动（`start`）、停止（`stop`）、重启（`restart`）、恢复（`restore`）、别名（`alias`）、列举（`list`）。每个动作把带数据的结果交回调用方，自己不打印、不结束进程——命令行与桌面界面共用；`tests/lib_is_quiet.rs` 守着「库里没有 `println!` 与 `process::exit`」 |
 | `src/server.rs` | 服务承载：`serve_forever` 主循环、停止信号、日志初始化、配置错误落盘 startup.log |
 | `src/proxy/` | 转发核心，按职责分文件：入站来源校验（Host/Origin）、hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、尝试结局分类（`attempts::classify`）与唯一的尝试循环（`attempts::run_attempts`）、保活通道与提交点、断开保护、仅转发模式 |
 | `src/transform.rs` | 外部转换器编排：stdin/stdout 一行 JSON 信封交给外部 format 程序改写（spawn 与 persistent 统一进程池、空闲 reaper、超时/崩溃 worker 剔除）；信封契约在独立 crate `aproxy-envelope` |
 | `src/decode.rs` | 检查用解码：按 `content-encoding`（gzip/deflate/br/zstd，多层逆序）解出一份**仅供检查/预览**的副本，转发字节不受影响 |
 | `src/retry.rs` | 重试判定：状态码、错误 JSON（含流式 NDJSON/SSE 形态） |
-| `src/config.rs` | 代理配置加载/保存/校验（`~/.aproxy/config.toml`，可多份平行并存） |
-| `src/settings.rs` | 内部配置（`~/.aproxy/settings.json`，唯一）：别名表、全局默认等程序管理状态 |
+| `src/config/` | 代理配置：`file.rs` 严格解析 config.toml（未知键即错误、带行列诊断）、`resolve.rs` 分层解析（命令行 > toml > settings 的 `defaults` > 内置）、`edit.rs` 只改目标键的写回（`~/.aproxy/config.toml`，可多份平行并存） |
+| `src/settings/` | 内部配置（`~/.aproxy/settings.json`，整个 home 唯一）：`mod.rs` 内存结构与加载（无效文件沿用上一次有效值）、`file.rs` 严格解析（未知键/类型不对/更高 schema 都是带键路径的错误；`defaults` 段复用 config.toml 解析器）、`edit.rs` 按键路径打补丁的写回（密钥占位、读出口打码、按含密钥文件私有落盘） |
 | `src/daemon.rs` | 守护编排：IPC（ping/shutdown/观测）、实例注册表、恢复记录、孤儿清理 |
 | `src/spawn.rs` | 拉起守护并等就绪（`spawn_instance`）：start、restart、restore、安装的滚动重启、看护者重拉共用；按新 pid 认就绪，启动即死时立即返回并附上 startup.log 的新增内容 |
 | `src/process.rs` | 进程原语（平台层）：创建时间、存活与退出、镜像路径、按 pid + 创建时间核验身份（`record_identity`）与核验后终止、看护者等待进程死亡用的同步句柄 |
 | `src/watchdog.rs` | 看门狗：claim 选举、共享内存心跳、收养与处决、重拉退避状态机 |
-| `src/fsx.rs` | 原子写（`write_atomic`）：注册表、恢复记录、安装状态、settings.json、看护者 claim 共用 |
+| `src/fsx.rs` | 原子写（`write_atomic`）：注册表、恢复记录、安装状态、看护者 claim 共用；`write_atomic_private` 额外收紧权限（unix 0600、Windows 只含本用户/SYSTEM/Administrators 的 DACL），settings.json 走它 |
 | `aproxy-ipc/` | aproxy 与同它打交道的程序（桌面界面、第三方客户端）共用的契约，独立 crate，依赖很少。`code.rs`：错误码表（名字、族、`details` 的键与类型、HTTP 状态与退出码），`docs/error-codes.md` 由它生成、`tests/code_table.rs` 比对；`redact.rs`：打码的唯一出口（URL、密钥头、占位对象、已知密钥替换）；`endpoint.rs`：控制端点、心跳节、安装宣告节的名字与 `home_id`；`home.rs`：home 的解析（永久兼容契约 C1）；`ledger.rs`：进程台账 `<home>/ledger/`（永久兼容契约 C3），长期运行的进程登记 pid、启动标记与角色，强制安装据此核验后结束进程 |
 | `src/util.rs` | bin 侧共用小工具：时间戳、时长人性化、凭据打码、key=value 解析 |
 
@@ -98,8 +98,8 @@ CLI 定义（cli.rs）、动作本身（ops/）与子命令的渲染（commands/
 生命周期保证：临时文件在请求结束（Drop）、回放流 EOF、重试丢弃三路删除；
 实例启动时清空本端口目录回收崩溃残留。磁盘写失败按 `SpoolFailed` 终态处理
 （507 `local_storage_failed` / SSE error 事件），绝不退化成内存堆积。`disk_cache = false`（settings
-全局默认或 toml 覆盖）关闭时回到纯内存行为。`forward_only` 模式下请求体与响应
-均**不缓冲**，本节整节不适用——见「仅转发模式（forward_only）」。
+的 `defaults.disk_cache` 或 toml 覆盖）关闭时回到纯内存行为。`delivery = "forward"` 模式下请求体与响应
+均**不缓冲**，本节整节不适用——见「仅转发模式（delivery = "forward"）」。
 
 ## 入站来源校验（Host / Origin）
 
@@ -115,33 +115,33 @@ CLI 定义（cli.rs）、动作本身（ops/）与子命令的渲染（commands/
 - **Origin 校验**（防网页跨站调用）：任何带 `Origin` 头的请求默认拒绝，除非
   精确匹配 `allowed_origins`（不区分大小写、忽略末尾 `/`）；与监听地址无关。
   CLI 类客户端不发 `Origin`，对它们零影响。
-- 两个列表都支持 `"*"` 关闭对应校验；`[]` 等同未配置。分层同
-  `bounded_retry_paths`（toml 显式值 > settings.json > 内置空）。
+- 两个列表都支持 `"*"` 关闭对应校验；`[]` 等同未配置。分层：config.toml >
+  settings.json 的 `defaults.allowed_hosts`/`defaults.allowed_origins` > 内置空。
 - 被拒请求本地回 403，文案点名配置项与修法：**绝不转发、绝不注入 api_key、
   绝不进入重试循环、不计入请求数**。这是唯一不经上游就终结请求的入口，而它
   只作用于从未转发过的请求——「无限重试」对放行的请求毫无改变。
 
 ## 重试与流式回放
 
-请求体完整读入（超 `max_body_mb` 即 413，不转发——客户端断开即中止上游请求，
+请求体完整读入（超 `max_request_mb` 即 413，不转发——客户端断开即中止上游请求，
 避免无谓计费）后进入重试循环。回 413 之前先把剩余请求体读掉丢弃（总时长 10 秒、
 空闲 2 秒为限）：关闭一个还有未读请求数据的连接会让对端收到复位，客户端接收缓冲里
 已到达的 413 随之丢失，它只看到连接被中止（Windows 上必现）。响应体**逐块暂存**（spool）到内存/磁盘（上限
-`spool_limit_mb` 256MiB，超限按不可重试终态处理）——只有拿到完整响应才能保证
+`max_response_mb` 256MiB，超限按不可重试终态处理）——只有拿到完整响应才能保证
 「失败即重试」。响应完成后按原始字节序回放（零拷贝：内存模式用
 `Bytes::slice_ref` 共享原分配）。
 
 ### 保活通道与提交点
 
 缓冲期间客户端什么也收不到，所以保活适用的请求要靠心跳维持连接：默认是 SSE 注释
-（`: keepalive`），`keepalive_heartbeat` 可换成任意字节（aProxy 不认识协议，心跳的形态
+（`: keepalive`），`[keepalive] heartbeat` 可换成任意字节（aProxy 不认识协议，心跳的形态
 由用户按客户端决定；`heartbeat_problem` 只把关「写完后 SSE 解析器停在事件边界」）。
-配置了 `heartbeat_transform` 时，请求转换完成后的每一拍交给心跳转换器生成（信封
+配置了带 `heartbeat` 阶段的 `[[format]]` 时，请求转换完成后的每一拍交给它生成（信封
 `stage = "heartbeat"`）：每拍 `tokio::spawn` 一个任务跑完整次转换（drive 返回时不会
 drop 在途转换，persistent worker 不会因此被剔除），上一拍未回来就发固定心跳；任务写
 通道前在 `replay_gate` 锁内确认回放尚未开始，`send` 写第一块真实字节前在同一把锁内
 关闸——迟到的动态心跳一律丢弃，不会插进回放的事件中间。**适用判定**（`keepalive_triggered`，在请求转换之前、按客户端视角）：
-`keepalive_interval_secs` > 0、非 `forward_only`，且按 `keepalive_trigger`
+`keepalive.interval_secs` > 0、`delivery` 不是 `"forward"`，且按 `keepalive.trigger`
 命中——`accept`（Accept 含 `text/event-stream`，旧判定）/ `body_stream`（请求体
 JSON 对象顶层 `"stream": true`，磁盘溢写的大请求体同样只看顶层键）/ `any`（任一，
 默认）。默认必须把请求体算进来：真实 Claude Code 的流式主请求是
@@ -152,7 +152,7 @@ JSON 对象顶层 `"stream": true`，磁盘溢写的大请求体同样只看顶�
 **提交点**是个只发生一次、不可撤回的三态机：未提交 → 提交上游真实头 / 提交
 骨架头。推动提交的只有时间与上游响应头，「需要重试」本身不提交——重试几次后
 很快成功的请求照样拿到上游真实头。尚未提交时（每一次尝试、每一段退避）：
-- 上游 2xx + 未压缩的 `text/event-stream`（且未配 `response_transform`）→ 立即
+- 上游 2xx + 未压缩的 `text/event-stream`（且未配 `response` 阶段的 format）→ 立即
   把这次尝试的上游真实 status 与响应头转给客户端（去掉 content-length 与
   hop-by-hop）；
 - 一个保活间隔到点仍无可提交的结果 → 提交骨架头（200 + `text/event-stream`），
@@ -170,8 +170,8 @@ JSON 对象顶层 `"stream": true`，磁盘溢写的大请求体同样只看顶�
 信号一起）实现。完整缓冲、判定无误后才把成功那一次的字节写进同一个响应；
 期间的重试客户端只见到心跳。
 
-请求转换默认每个请求只做一次、各次重试重放产物；`[request_transform]` 设
-`every_attempt = true` 时（`proxy::PerAttemptTransform`），客户端的原始请求留在内存里，
+请求转换默认每个请求只做一次、各次重试重放产物；请求方的 `[[format]]` 在 `stages`
+里带上 `"retry"` 时（`proxy::PerAttemptTransform`），客户端的原始请求留在内存里，
 每次重试之前再转换一次（`stage = "retry"`，附上一次的状态码或失败原因），用于故障
 转移。这次转换失败只沿用上一次的请求、不终止——format 没有让请求停止重试的途径，
 这是有意的：重试判定交给 format 会让核心承诺取决于外部程序。
@@ -192,16 +192,16 @@ format 慢（`timeout_secs = 0` 时没有上界）时客户端照样在一个间
   `decode::decode_strict` 完整解码（截断/损坏即失败，绝不回放半截）。不适用保活
   的请求不改写。
 - **提交后失去状态码自由**：状态行与响应头一旦提交就改不了，所以**已提交后**的
-  终态失败（`spool_limit_mb` 超限、spool 写盘失败、压缩体解码失败、受限重试路径
+  终态失败（`max_response_mb` 超限、spool 写盘失败、压缩体解码失败、重试规则
   达上限）只能以 SSE `event: error` 事件收场，不能再回错误状态码/真实状态码；尚未提交
   时它们与不保活路径一致（JSON 错误响应 / 原样透传）。事件的 data 与错误响应的体是
   同一个 JSON，见「数据面的错误出口」。已提交后才拿到非 SSE 的成功体同样
-  撤不回：照常回放并 warn，建议该实例设 `keepalive_trigger = "accept"`。
+  撤不回：照常回放并 warn，建议该实例设 `[keepalive] trigger = "accept"`。
 - **非 SSE 流的暂停窗口**：上游先回 2xx 非 SSE 头、再迟迟不发体时，那次尝试期间
-  客户端收不到任何字节（最长约 `read_timeout_secs`）——非 SSE 的流本就没有可用
+  客户端收不到任何字节（最长约 `timeouts.read_idle_secs`）——非 SSE 的流本就没有可用
   的保活手段，与不保活路径的等待特性一致。
 
-没有保活通道的请求（`"stream": false`、`forward_only`、间隔为 0）沿用首轮快速
+没有保活通道的请求（`"stream": false`、`delivery = "forward"`、间隔为 0）沿用首轮快速
 路径 + `proxy_without_keepalive`：成功后一次性回放，期间不向客户端写任何字节。
 
 客户端在「只收到心跳」的等待中（已提交、尚未写出任何上游真实字节）等了至少
@@ -211,18 +211,20 @@ format 慢（`timeout_secs = 0` 时没有上界）时客户端照样在一个间
 与 `codex-stream-idle-timeout` 的黑盒实测）。提示不点名客户端，行为对任何客户端
 都一样；开始回放之后的断开、以及 60 秒以内的断开（多为主动取消）不提示。
 
-重试退避：前 3 次零延迟，第 4 次起 5s→10s→20s→…封顶 `max_retry_backoff_secs`
+重试退避：前 3 次零延迟，第 4 次起 5s→10s→20s→…封顶 `retry.max_backoff_secs`
 （默认 320s），无限重试。客户端断开立即中止上游请求并停止重试（计费保护）。
 
-例外——**受限重试路径**（`bounded_retry_paths` 配置，正则对「路径?查询串」
-整体匹配，自动锚定；哪些路径受限由用户按上游配置，不内置任何 URL）：命中的
-请求从总尝试第 3 次起，任何一次有响应的失败立即原样透传并终止重试（第 1、2
-次照常重试；网络错误不触发，继续重试）——部分上游对特定端点确定性报错，
-重试到天荒地老也不可能成功，只会让客户端永远等不到终态。
+例外——**重试规则**（`[[retry.rules]]` 配置，`path` 正则对「路径?查询串」
+整体匹配并自动锚定，`status` 限定状态码，`max_attempts` 必填；哪些请求受限由
+用户按上游配置，不内置任何 URL）：按书写顺序取第一条全部匹配器都成立的规则，
+第 N 次带上游响应的失败命中且 N ≥ `max_attempts` 时原样透传并终止重试；
+`max_attempts = 0` 是不限，写在宽规则前面当豁免。网络错误不触发，继续重试——
+部分上游对特定端点确定性报错，重试到天荒地老也不可能成功，只会让客户端永远
+等不到终态。
 保活适用的请求同样如此：达上限时响应头尚未提交（常态——失败都很快）就原样
 透传；只有响应头已被保活节拍以骨架提交的，才因无法再透传真实状态码而改以终态
 SSE `event: error` 事件收场。透传的响应状态码与体保真，只多 `x-aproxy-error:
-retry_exhausted` 与 `x-aproxy-request-id` 两个头。
+retry_exhausted`（`details.by` 为 `rule:<序号>`）与 `x-aproxy-request-id` 两个头。
 
 ## 数据面的错误出口
 
@@ -255,7 +257,7 @@ aproxy 自己结束一个请求时说的话只在 `src/proxy/errors.rs` 构造�
 拒绝）、`format_failed`（502，format 程序本身的故障）、`upstream_failed`（502，仅转发
 模式）、`decode_failed`（只作 SSE 事件）、`internal`（500）。
 
-`forward_only` 模式整体旁路本节：不缓冲完整请求体、不进重试循环、不发心跳——
+仅转发模式整体旁路本节：不缓冲完整请求体、不进重试循环、不发心跳——
 见下一节。
 
 ## 压缩响应体：检查解码、转发不解码
@@ -274,9 +276,9 @@ magic number，连「这是压缩体」都认不出；2026-09-14 的 Cloudflare 
 压缩体上不判内容（仍按状态码判），只为日志预览解一份头部快照——>1 MiB 的压缩
 错误体现实中不存在，为它改造成流式解码的收益与风险不成比例。
 
-## 仅转发模式（forward_only）
+## 仅转发模式（delivery = "forward"）
 
-`forward_only = true`（toml 显式值，或 settings.json 全局默认）时，实例走一条与
+`delivery = "forward"`（toml 显式值，或 settings.json 的 `defaults.delivery`）时，实例走一条与
 上面主流程完全不同的极简路径：**不缓冲、不重试、不保活**。请求体边收边发上游，
 响应边收边回客户端。这是给「上游可信、且要真流式」场景的**显式取舍**——它放弃
 了本产品最核心的重试保障，请勿当作普通开关随手打开。
@@ -285,9 +287,9 @@ magic number，连「这是压缩体」都认不出；2026-09-14 的 Cloudflare 
   且在 `requests_total.fetch_add` 之后（否则 status 的请求数恒为 0）。
 - **请求体**：`req.into_body().into_data_stream()` 经计数适配器交给
   `reqwest::Body::wrap_stream` 流式直发——一律流式，不做空 body 特判；不缓冲、
-  不落盘。计数在流式途中进行，超 `max_body_mb` 即先读掉客户端剩余的请求体（同
+  不落盘。计数在流式途中进行，超 `max_request_mb` 即先读掉客户端剩余的请求体（同
   缓冲路径的上限与理由），再让请求体流产出 `Err`（令 reqwest 中止上游请求），回
-  413（复用既有文案）。**`max_body_mb` 是本模式下
+  413（复用既有文案）。**`max_request_mb` 是本模式下
   唯一仍然强制的限制。**
 - **响应**：`resp.bytes_stream()` 直回客户端，状态码与响应头原样透传；
   hop-by-hop 照旧过滤，但 **`content-length` 必须保留**（字节未经变换，
@@ -299,26 +301,43 @@ magic number，连「这是压缩体」都认不出；2026-09-14 的 Cloudflare 
 - **客户端断开**：响应 Body 被 drop，reqwest 连接随之关闭——既有计费保护靠
   Drop 天然成立。
 - **不进入的路径**：重试循环、SSE 保活骨架、错误内容拦截
-  （`is_error_body`/`is_stream_error_body`）、spool、`keepalive_trigger` 判定。
-- **本模式下不生效**：`disk_cache`/`spool_limit_mb`/`keepalive_interval_secs`/`keepalive_trigger`/`keepalive_heartbeat`/
-  `max_retry_backoff_secs`（磁盘 spool 完全不参与）。
+  （`is_error_body`/`is_stream_error_body`）、spool、`keepalive.trigger` 判定。
+- **本模式下不生效**：`disk_cache`/`max_response_mb`/`keepalive.*`/`retry.*`
+  （磁盘 spool 完全不参与；与任何 `[[format]]` 同配是 `config_conflict`）。
 - 消费方一律走 `Config::forward_only_enabled()`（`unwrap_or(DEFAULT_FORWARD_ONLY)`），
   **不得 `unwrap()`**——doctor 的 `parse_config_file`、`find::discover` 与大量
   测试的 `AppState::new` 都不经 settings 注入。`proxy::router(AppState)` 签名不变。
 
 ## 配置分层
 
-三级优先级（仅 `max_body_mb`/`disk_cache`/`forward_only`/`bounded_retry_paths`/
-`allowed_hosts`/`allowed_origins`/`keepalive_trigger` 七个字段有 settings 层；其余
-字段 toml > 内置默认）：
+四级优先级：
 
 ```
-CLI 覆盖参数（--baseurl 等，仅本次） > config.toml 显式值 > settings.json 全局默认 > 内置默认
+CLI 覆盖参数（--baseurl 等，仅本次） > config.toml 显式值 > settings.json 的 defaults 段 > 内置默认
 ```
 
-`config.toml` 人类可读可写、可多份（多开各自指定）；`settings.json` 程序管理的
-内部配置，**全局唯一**（JSON 原子写，损坏回退默认），存别名表、default_config、
-config_dirs、日志轮转阈值、空闲阈值与上述七个字段的全局默认。
+settings.json 的 `defaults` 段收的就是 config.toml 的键（同名同嵌套，以 JSON 写出），所以除
+`listen_addr`、`log_file`、`format` 这三个只能属于单个实例的键外，每个键都有全局默认层；这三
+个键写进 `defaults` 是 `config_unknown_key`。标量与数组整体取最高层（toml 里写空数组也算显式
+设置），两张头表按头名跨层合并、toml 优先。
+
+`defaults` 里的凭据不按普通层继承，而是**跟随它的目标**：`api_key` 与 `extra_headers`/
+`override_headers` 里的密钥头，只在这份配置最终的 `base_url` 与 `defaults.base_url` 指向同一目
+标时继承；`proxy_username`/`proxy_password` 只在 `proxy` 相同（scheme、主机、端口）时继承。
+比较前先规范化 URL（去空白与结尾斜杠、scheme 与主机小写、去默认端口；路径参与比较，userinfo
+不参与——它是凭据不是目标）。没继承的项进 `Resolved::withheld`，`config --show` 列出它们；这
+份配置自己也没有该凭据时另发一条 `default_credential_withheld` 告警，否则用户只会看到上游
+401。密钥头按名字识别（`aproxy_ipc::redact::is_secret_header`）；名字不常见的凭据头不会被识别，
+会随每个目标继承，文档因此建议这类头写进各实例的 config.toml。
+
+`config.toml` 人类可读可写、可多份（多开各自指定）；`settings.json` 是整个 home 的程序状态，
+**全局唯一**，分节存放：`schema`、`language`、`aliases`、`default_config`、`config_dirs`、
+`defaults`、`watchdog`、`logs`、`instances`、`update`、`ui`（不透明，界面私有）。它被严格解析：
+未知键、类型不对、取值非法、更高 `schema` 都是 error 级诊断；没有自动迁移，0.1.x 的平铺字段
+按未知键（`watchdog` 布尔值则按类型不对）报错。写入走 config.toml 同一把写锁与原子写，只打补丁目标键，并因可能含明文密钥而以
+所有者私有权限落盘（`write_atomic_private`）。无效文件不参与任何实例的启动：`main` 在分派
+前统一检查，`settings`/`doctor` 照常运行并自己报告，`status`/`stop`/`install` 按内置默认运行并
+告警，其余命令退出码 3——带着没生效的设置去启动，比不启动更糟。
 
 ### 配置别名（settings.json）
 
@@ -378,7 +397,7 @@ config_dirs、日志轮转阈值、空闲阈值与上述七个字段的全局默
   由主循环时间驱动重试（等待不阻塞 tick——否则长退避会让 claim 心跳停摆、
   现任被竞争者按「假死」夺权），就绪判定按新 pid 定位；重拉后实例落在不同
   端口（toml 改了端口）时退役旧端口的 `.restore`/`.pid` 并按实际端口续看护；
-  连续失败达 `watchdog_max_restarts` 放弃并写 startup.log（`.restore` 保留
+  连续失败达 `watchdog.max_restarts` 放弃并写 startup.log（`.restore` 保留
   人工兜底）。
 - **选举规范**（多守护并发拉起看护者的唯一性保障）：claim 文件
   `run/watchdog.claim`（PID + 进程创建时间 + 心跳）为在任真相源——
@@ -389,8 +408,9 @@ config_dirs、日志轮转阈值、空闲阈值与上述七个字段的全局默
 - **互保**：守护与看护者完全解耦（看护者死亡实例不受影响）；守护每 5 分钟
   自检，缺席即按选举规范补种。全部实例清零后看护者闲置自灭（默认 300s），
   系统回到零常驻。
-- 配置：settings.json `watchdog` 五字段（总开关/扫描周期/挂死容忍/重拉上限/
-  闲置自灭）——系统级单例故无 toml 层。
+- 配置：settings.json `watchdog` 段的五个键（`enabled` 总开关 / `heartbeat_secs` 扫描周期 /
+  `stale_after_cycles` 挂死容忍 / `max_restarts` 重拉上限 / `idle_exit_secs` 闲置自灭）——
+  系统级单例故无 toml 层。
 
 ## 自愈恢复（restore）
 
@@ -442,7 +462,7 @@ settings 注入、validate）干跑一遍，换监听地址时再探测新地址
   reqwest 错误里的 URL 一律走它）：
   userinfo（用户名或密码任一存在）整体 `***@`，查询串保留键名、值变 `***`，片段
   整体遮掉，畸形 URL 保守多遮；api_key 与头值走 `util::mask_secret`（前 6 字符 +
-  `***`）。`config --show` 另对转换器 `args` 的密钥旗标之后的值与 `extra` 打码
+  `***`）。`config --show` 另对 format `args` 的密钥旗标之后的值打码，`env` 只列名字、不显示值
 
 ## 安装与升级（install）
 
@@ -515,9 +535,9 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
   「新读旧」。降级由较新的安装者自己执行（旧版本不认交棒参数）。没被指名的续作
   （CLI 入口、看护者拉起的）在安装者健在时一律不接手
 - **download**：有序下载链条 github → npm → cargo-binstall → cargo
-  （settings download_chain 严格数组可配 + url 模板通道，CDN 域名不硬
+  （settings `update.download_chain` 严格数组可配 + url 模板通道，CDN 域名不硬
   编码）；github=.sha256 强校验、npm=integrity 强校验（跟随 ~/.npmrc
-  镜像）、cargo=本地编译自证；下载代理（download_proxy/--download-proxy）
+  镜像）、cargo=本地编译自证；下载代理（`update.download_proxy`/`--download-proxy`）
   与上游请求代理绝对分离
 - **skills**：skill 文档支线（并行下载、失败不影响安装、原子目录替换）
 - **force**（`aproxy install --force`，契约 C6–C8）：普通安装失败、卡住或装着的版本坏了
@@ -549,7 +569,7 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
 ## 桌面界面（aproxy-desktop）
 
 `aproxy desktop` 打开的窗口：Tauri 2 外壳加嵌入的前端（`aproxy-desktop/ui/`，Vite + Svelte 5 +
-TypeScript）。0.2.0-alpha.1 的界面是预览版，数据全部来自前端的 mock 后端，界面顶部常驻
+TypeScript）。0.2.0 各 alpha 版的界面是预览版，数据全部来自前端的 mock 后端，界面顶部常驻
 「预览版 · 演示数据」标签。
 
 **两种变体。** 根包的 `desktop` 特性（默认开）就是对 aproxy-desktop 的可选依赖；
@@ -714,7 +734,7 @@ Ubuntu 22.04 等系统启动即报 `GLIBC_2.39 not found`（alpha.17 实测如�
 
 - **0.1.x**：0.1.0 是首个稳定版（此前为 `0.1.0-alpha.*` 预发布）；无 UI，纯 CLI + 守护。
 - **0.2.0**：当前开发线（`0.2.0-alpha.*` 预发布）。与 0.1.x 互不兼容、不能原地升级
-  （迁移步骤见 CHANGELOG），可安装版本的下限是 0.2.0；引入桌面界面（alpha.1 是显示演示
+  （迁移步骤见 CHANGELOG），可安装版本的下限是 0.2.0；引入桌面界面（各 alpha 版是显示演示
   数据的预览版，见「桌面界面」）。
 - 发布产物：x86_64 的 Windows 与 Linux gnu 同时提供 baseline 与 x86-64-v3
   （AVX2）两种指令集变体。`aproxy install` 运行时检测 AVX2，只在这两个目标上选 v3

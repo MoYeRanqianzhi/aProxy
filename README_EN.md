@@ -11,11 +11,11 @@ aProxy catches the request locally: on failure it **retries without limit**
 (`Accept: text/event-stream` or a body with `"stream": true`) alive with
 injected SSE heartbeats, and replays the successful response
 byte-for-byte. Your client never notices the storm upstream; it only notices
-that the request took a little longer. (Two explicit exceptions: `forward_only`
-mode gives up that retry guarantee for true streaming passthrough, and
-`bounded_retry_paths` passes through the real response after 3 failures for
-matched paths, except that a streaming request whose headers were already
-committed by keepalive ends with a terminal SSE error event; see Configuration.)
+that the request took a little longer. (Two explicit exceptions: `delivery =
+"forward"` gives up that retry guarantee for true streaming passthrough, and a
+`[[retry.rules]]` entry passes through the real response once its `max_attempts`
+is reached, except that a streaming request whose headers were already committed
+by keepalive ends with a terminal SSE error event; see Configuration.)
 
 [中文](README.md)
 
@@ -24,12 +24,12 @@ committed by keepalive ends with a terminal SSE error event; see Configuration.)
 - **Infinite retries** — What stands in the way becomes the way. Network
   errors, 4xx/5xx, error JSON (a 200 carrying an error) all trigger retries;
   when the client disconnects, the upstream request is aborted immediately
-  (billing protection). Two **explicit ways out**: `forward_only` mode (an
+  (billing protection). Two **explicit ways out**: `delivery = "forward"` (an
   explicit trade that drops retries for streamed request/response passthrough)
-  and `bounded_retry_paths` (for upstream endpoints that fail deterministically,
-  the real response is passed through after 3 attempts instead of waiting
-  forever; only a streaming request whose headers keepalive already committed
-  is told via a terminal SSE error event instead).
+  and `[[retry.rules]]` (for upstream endpoints that fail deterministically, the
+  real response is passed through once `max_attempts` is reached instead of
+  waiting forever; only a streaming request whose headers keepalive already
+  committed is told via a terminal SSE error event instead).
 - **Total passthrough** — Transparency as a principle. Paths, queries, and
   headers forwarded untouched; control traffic rides a separate named pipe,
   so the proxy port does exactly one thing.
@@ -132,7 +132,7 @@ standard location):
 ```sh
 npm install -g @meowo/aproxy@next            # with the desktop interface; picks the right binary
 npm install -g @meowo/aproxy-headless@next   # without it (servers, Linux without WebKitGTK); both provide the aproxy command, install one
-cargo install aproxy --locked --version 0.2.0-alpha.1   # builds from source; needs rustc 1.90+
+cargo install aproxy --locked --version 0.2.0-alpha.2   # builds from source; needs rustc 1.90+
 ```
 
 Pre-releases go to npm's `next` tag and the `latest` tag is kept for stable releases; cargo
@@ -183,9 +183,9 @@ a local binary, `--adopt` takes over an existing install).
   0.2.0 is a pre-release, add `--pre` to the install script when reinstalling,
   or it installs 0.1.x again.
 - **Download channels and proxy**: online installs try github → npm →
-  cargo-binstall → cargo in that order; `download_chain` in settings.json
+  cargo-binstall → cargo in that order; `update.download_chain` in settings.json
   reorders them or adds a mirror (URL template). Use `--download-proxy <URL>`
-  or `download_proxy` in settings.json to download through a proxy; it is
+  or `update.download_proxy` in settings.json to download through a proxy; it is
   unrelated to the upstream request proxy. The fields are described in the skill
   document
   [settings-json.md](.claude/skills/aproxy-cli/references/latest/settings-json.md).
@@ -364,6 +364,7 @@ timeout (for Claude Code, `API_TIMEOUT_MS`).
 | `aproxy doctor` | Config health check: settings.json errors + alias/toml review (warnings) |
 | `aproxy find [keyword]` | Discover all configs in configured directories; `--aliased/--unaliased --port PORT` filters |
 | `aproxy config [options]` | View or modify the config (`--show` prints it) |
+| `aproxy settings show\|get\|set\|unset` | View or modify the global settings (`~/.aproxy/settings.json`): aliases, `defaults` global defaults, watchdog, logs, install updates; works even when settings.json has errors, to repair it |
 | `aproxy install [VERSION]` | Install or upgrade (alias `upgrade`), rolling-restarting instances; `--variant` switches the build, `--force` forces an install; see the upgrade notes under Getting started |
 | `aproxy desktop` | Open the desktop window (a preview showing demo data; see below) |
 
@@ -377,7 +378,7 @@ closed. The window itself starts, stops and changes no instance; like every othe
 it resumes an interrupted install in the background when it finds one, and finishing that install
 may restart instances one at a time.
 
-- **In 0.2.0-alpha.1 the window is a preview**: the instances, request logs and statistics in it
+- **In the 0.2.0 alpha releases the window is a preview**: the instances, request logs and statistics in it
   are demo data, not the aProxy running on your computer, and a "Preview · demo data" label stays
   at the top of the window. Real data comes in a later version; until then `aproxy status` and
   `aproxy logs` are the source of truth. Interface preferences (theme, language, the Mica switch)
@@ -414,9 +415,9 @@ aproxy stop openrouter                   # stop by alias (survives port changes)
 aproxy alias list
 ```
 
-Aliases live in `~/.aproxy/settings.json` (program-managed; use `aproxy
-alias`). config.toml stays human-readable and may exist in many parallel
-copies.
+Aliases live in `~/.aproxy/settings.json` (the home's program state; use
+`aproxy alias`, or read and write it directly with `aproxy settings`). config.toml
+stays human-readable and may exist in many parallel copies.
 
 ## Login autostart (optional)
 
@@ -432,54 +433,81 @@ silently.
 base_url = "https://api.anthropic.com"   # upstream address
 listen_addr = "127.0.0.1:12345"          # local listener
 # api_key = "sk-..."                     # quick auth (overrides Authorization: Bearer)
-# keepalive_interval_secs = 15           # SSE heartbeat interval, 0 disables keepalive
-# keepalive_trigger = "any"              # which requests get keepalive: accept (Accept has SSE) / body_stream (body "stream": true) / any (either, default)
-# keepalive_heartbeat = ": keepalive\n\n" # heartbeat bytes per tick (default SSE comment; e.g. "\n" for clients that choke on comments)
 # proxy = "http://127.0.0.1:7890"        # forward via proxy (socks5 supported)
-# extra_headers / override_headers       # append/override request headers
-# max_retry_backoff_secs = 320           # retry backoff cap (0 = retry instantly)
-# spool_limit_mb = 256                   # upstream response buffer cap (MB)
-# max_body_mb = 128                      # request body cap (MB; 0 = unlimited)
+# extra_headers / override_headers       # append/override request headers (tables, e.g. extra_headers = { "x-title" = "..." })
+# max_request_mb = 128                   # request body cap (MB; 0 = unlimited; defaults to settings.json defaults.max_request_mb)
+# max_response_mb = 256                  # upstream response buffer cap (MB; 0 is treated as 1)
 # disk_cache = true                      # spool large bodies/responses to disk
-# forward_only = false                   # forward-only (gives up retries): stream both ways, no retries/buffering/heartbeats
-# bounded_retry_paths = [ '/v1/x' ]      # bounded retry paths (regex): matched requests pass through after 3 failures
+# delivery = "retry"                     # "retry" (default: buffer and retry) / "forward" (stream both ways, no retries/buffering/heartbeats)
 # log_file = "D:/aproxy-logs/a.log"      # custom log file (~ expanded; relative paths resolve against APROXY_HOME; default is a random per-start name, resolved via IPC)
-# connect_timeout_secs = 30              # upstream connect timeout (0 = none)
-# read_timeout_secs = 300                # inter-read timeout (0 = none)
 # allowed_hosts = ["myproxy.local"]      # extra Hosts to allow (DNS-rebinding guard; appended to the built-in list, "*" disables the check)
 # allowed_origins = ["http://localhost:5173"] # browser Origins to allow (any request carrying Origin is rejected by default, "*" disables the check)
-# request_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
-                                         # external transformer (request side): hand body/headers/url to a format program
-                                         # (protocol conversion, key rotation, multi-channel aggregation; failure = 502, no retry; exclusive with forward_only)
-# response_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
-                                         # external transformer (response side; use the same extra as the request side): rewrite upstream responses before replay (failure passes through)
-# heartbeat_transform = { command = "...", mode = "persistent" }
-                                         # heartbeat transformer: a format program generates each keepalive heartbeat from the request (fixed heartbeat on failure or when slow)
-                                         # use ~/ or absolute paths for command/extra: the daemon's working directory is unreliable, so relative paths may not resolve
+
+[timeouts]
+# connect_secs = 30                     # TCP/TLS connect timeout (0 = none)
+# first_byte_secs = 300                 # from sending the request until response headers arrive (0 = none)
+# read_idle_secs = 300                  # longest gap between two response-body reads (0 = none)
+
+[keepalive]
+# interval_secs = 15                    # SSE heartbeat interval, 0 disables keepalive
+# trigger = "any"                       # accept (Accept has SSE) / body_stream (body "stream": true) / any (either, default)
+# heartbeat = ": keepalive\n\n"         # heartbeat bytes per tick (default SSE comment; e.g. "\n" for clients that choke on comments)
+
+[retry]
+# max_backoff_secs = 320                # retry backoff cap (0 = retry instantly)
+# [[retry.rules]]                      # attempt N with an upstream response stops once N >= max_attempts (0 = no limit, an exemption)
+# path = '/v1/messages/count_tokens(\?.*)?'   # regex over path?query, anchored at both ends
+# max_attempts = 3
+
+[history]
+# body_budget_mb = 8                    # parsed, no effect in this version
+
+# [[format]]                             # external transformer: at most one per stage (request/response/heartbeat)
+# name = "convert"
+# command = "~/.aproxy/bin/aproxy-format"
+# args = ["run", "--config", "~/.aproxy/agg.toml"]   # no extra key any more: pass configuration through args or env
+# process = "persistent"                 # spawn (default) / persistent (required for stateful programs)
+# stages = ["request", "retry"]          # request / response / heartbeat; adding retry re-runs it before every retry
+# env = { KEYS = '{"keys": ["sk-a", "sk-b"]}' }  # extra environment variables (values are never shown by --show)
 ```
 
-Multi-key rotation only takes effect **between requests**: retries of the same
-request keep the same transformed key (a request is transformed once and the
-result is replayed on every retry).
+Multi-key rotation takes effect **between requests** by default: retries of the
+same request keep the same transformed key (a request is transformed once and
+the result is replayed on every retry). Add `"retry"` to the request format's
+`stages` to transform again before every retry.
 
 Runtime data lives in `~/.aproxy/`: `run/` (registry, restore records,
 watchdog claim), `logs/` (daemon logs, randomly named per start, rotated and
 orphan-cleaned; paths reported via IPC — customize with `log_file`),
 `spool/<port>/` (disk-cache
-scratch space), `settings.json` (internal state: aliases, defaults, watchdog
-fields — program-managed).
+scratch space), `settings.json` (the home's program state: `aliases`,
+`default_config`, `config_dirs`, `defaults` with global config.toml defaults, and
+the `watchdog`, `logs`, `instances`, `update` and `ui` sections).
+
+`settings.json` is read and written with
+`aproxy settings show|get|set|unset` (keys are dotted paths such as
+`watchdog.enabled` or `defaults.max_request_mb`); `aproxy alias add|remove` and
+`aproxy config --set-default|--clear-default` edit their own keys. Hand-edit it
+only when it cannot be parsed at all: it is parsed strictly, so an unknown key or
+a wrong type is an error. In that state `status`, `stop` and `install` run on
+built-in defaults with a warning (aliases unavailable) and every other command
+exits 3 with the repair steps. Credentials in `defaults` (`api_key`, secret
+headers, proxy passwords) are inherited only by instances whose `base_url` /
+`proxy` names the same target; `aproxy config --show` lists what was withheld.
+The fields are documented in the skill file
+[settings-json.md](.claude/skills/aproxy-cli/references/latest/settings-json.md).
 
 ### Keepalive (SSE heartbeats)
 
-A request is eligible for keepalive when `keepalive_interval_secs` > 0, the
-instance is not `forward_only`, and it matches `keepalive_trigger`: `Accept`
-contains `text/event-stream`, or the body has a top-level `"stream": true`
-(default `any` = either). Eligible requests use the keepalive channel from the
-**first** attempt:
+A request is eligible for keepalive when `keepalive.interval_secs` > 0, the
+instance's `delivery` is not `"forward"`, and it matches `keepalive.trigger`:
+`Accept` contains `text/event-stream`, or the body has a top-level `"stream":
+true` (default `any` = either). Eligible requests use the keepalive channel from
+the **first** attempt:
 
 - If any attempt gets a 2xx with an uncompressed `text/event-stream` from the
   upstream, its real status and headers are forwarded to the client immediately
-  (when no `response_transform` is configured); otherwise, after about one
+  (when no `response`-stage format is configured); otherwise, after about one
   keepalive interval, skeleton headers (200 + SSE) are committed. Needing a
   retry does not commit anything by itself, so a request that succeeds after a
   few quick retries still gets the real upstream response.
@@ -487,9 +515,9 @@ contains `text/event-stream`, or the body has a top-level `"stream": true`
   API) passes through unaltered when no retry is needed; if that upstream often
   needs retries (a retry lasting past one keepalive interval commits SSE
   skeleton headers, rewriting the content type and mixing in heartbeats), set
-  `keepalive_trigger = "accept"` for that instance.
+  `[keepalive] trigger = "accept"` for that instance.
 - Once committed, SSE comment heartbeats go out every
-  `keepalive_interval_secs` while waiting for the first byte, while the
+  `keepalive.interval_secs` while waiting for the first byte, while the
   upstream is in flight, while its stream is being buffered and during backoff;
   the body is still replayed only after it is fully buffered and checked, so
   data from failed attempts never leaks in.
@@ -498,7 +526,7 @@ contains `text/event-stream`, or the body has a top-level `"stream": true`
   exception to "total passthrough" that only costs some extra bytes between the
   upstream and this machine; ineligible requests are not rewritten.
 - Ordinary `"stream": false` requests have no keepalive channel, nor do
-  `forward_only` instances or `keepalive_interval_secs = 0`.
+  `delivery = "forward"` instances or `keepalive.interval_secs = 0`.
 
 ### Inbound origin checks
 
@@ -516,7 +544,7 @@ web-page origins (see [SECURITY.md](SECURITY.md)):
   independent of the listen address.
 - Either list may contain `"*"` to disable that check; `[]` is the same as
   unset. Both can be set per instance in `config.toml` and as global defaults
-  in `settings.json` (toml wins).
+  under `defaults` in `settings.json` (toml wins).
 - A rejected request gets a local **403** whose message names the setting to
   change. It was never forwarded, no `api_key` was injected and no retry
   happens; requests that pass are unaffected.
@@ -535,7 +563,7 @@ into every forwarded request, and the proxy port itself has no authentication.
   `aproxy doctor` will warn you.
 - `api_key` is stored in plain text in `config.toml`; restrict the file's
   permissions to your own user.
-- External transformers (`request_transform` / `response_transform` / `heartbeat_transform`) run
+- External transformers (`[[format]]` entries) run
   arbitrary commands from the config; only configure programs you trust and do
   not let others edit your `config.toml`.
 - Logs and `status` mask URL-embedded credentials and query-string values

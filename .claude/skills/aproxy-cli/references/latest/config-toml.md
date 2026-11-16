@@ -15,14 +15,10 @@ behaviors.md; this file keeps only what you need to pick a value.
 - [Fields](#fields): [base_url](#base_url) · [listen_addr](#listen_addr) · [api_key](#api_key) ·
   [extra_headers / override_headers](#extra_headers--override_headers) ·
   [proxy / proxy_username / proxy_password](#proxy--proxy_username--proxy_password) ·
-  [max_retry_backoff_secs](#max_retry_backoff_secs) ·
-  [connect_timeout_secs / read_timeout_secs](#connect_timeout_secs--read_timeout_secs) ·
-  [bounded_retry_paths](#bounded_retry_paths) ·
-  [keepalive_interval_secs / keepalive_trigger / keepalive_heartbeat](#keepalive_interval_secs--keepalive_trigger--keepalive_heartbeat) ·
-  [max_body_mb](#max_body_mb) · [spool_limit_mb](#spool_limit_mb) · [disk_cache](#disk_cache) ·
-  [forward_only](#forward_only) · [allowed_hosts / allowed_origins](#allowed_hosts--allowed_origins) ·
-  [log_file](#log_file) ·
-  [request_transform / response_transform / heartbeat_transform](#request_transform--response_transform--heartbeat_transform)
+  [max_request_mb](#max_request_mb) · [max_response_mb](#max_response_mb) ·
+  [timeouts](#timeouts) · [keepalive](#keepalive) · [retry](#retry) · [delivery](#delivery) ·
+  [disk_cache](#disk_cache) · [allowed_hosts / allowed_origins](#allowed_hosts--allowed_origins) ·
+  [log_file](#log_file) · [history](#history) · [[[format]]](#format)
 - [Checks at start](#checks-at-start)
 - [Normalization](#normalization)
 
@@ -34,27 +30,32 @@ behaviors.md; this file keeps only what you need to pick a value.
   `aproxy start PATH` or an alias, and needs its own port in `listen_addr`, because instances are
   identified by port. Keep extra configs in `~/.aproxy/configs/`: `aproxy find` and `aproxy doctor`
   scan it without setup (other directories: settings-json.md, `config_dirs`).
-- **Create or change a file with `aproxy config`, or by hand.**
-  `aproxy config [--config PATH] --baseurl URL --listen ADDR ...` writes the file and creates it if
-  needed (all flags: commands.md, `config`). Flags exist only for `base_url`, `listen_addr`,
-  `api_key`, `extra_headers`, `override_headers`, `keepalive_interval_secs` and the three proxy
-  fields; edit the rest by hand. The command rewrites the whole file in its own layout, dropping
-  comments and unknown keys, so edit by hand any file whose comments matter. It will not touch a
-  file it cannot parse: `现有配置文件解析失败，拒绝覆盖` ("existing config fails to parse; refusing to
-  overwrite").
-- **Misspelled keys are ignored silently.** aProxy does not reject unknown keys, so a typo in a key
-  name simply has no effect. After editing, run `aproxy config --show [--config PATH]` and confirm
-  each field shows the value you wrote. A wrong value type (a string where a number belongs,
-  `mode = "Persistent"`) is different: it fails the whole file. Start then reports
-  `配置文件解析失败（TOML 语法错误）` ("config file failed to parse (TOML syntax error)"), and `--show`
-  warns `警告: 配置文件解析失败，以下展示的是回退默认值而非文件内容` ("the config failed to parse; the
-  values below are fallback defaults, not the file's contents").
+- **Create or change a file with `aproxy config`, or by hand.** `aproxy config [--config PATH]
+  --baseurl URL --listen ADDR ...` writes the file and creates it if needed (all flags:
+  commands.md, `config`). Flags exist only for `base_url`, `listen_addr`, `api_key`,
+  `extra_headers`, `override_headers`, `keepalive.interval_secs` and the three proxy fields, plus
+  the repeatable `--unset KEY`; edit the rest by hand. A write changes only the target key and
+  keeps comments, key order and everything else in the file. Writes are serialized across
+  processes by a lock, and a change that would introduce a new error is refused with exit 3 while
+  unrelated errors already in the file do not block it, so a broken file can be repaired one key
+  at a time. `--unset` removes any key, including one this version does not know; array tables
+  (`format`, `retry.rules`) can only be removed as a whole.
+- **Every key is checked strictly; an unknown key is an error.** A misspelled key, an old 0.1.x
+  name, or a key from a later release produces `config_unknown_key`, naming the file, the key path
+  and line:column, and the instance does not start. This is deliberate: an ignored matcher would
+  make a retry rule wider than written, and silently dropping a key hides the typo until the
+  behavior matters. Remove a key you no longer want with `aproxy config --unset KEY`.
+- **A wrong type or value is an error too.** After editing, run `aproxy config --show [--config
+  PATH]`: it prints every effective value annotated with its source layer, then lists any
+  diagnostics as `file:line:col: key: message [code]` and exits 3 when the file has errors. The
+  message is English; `[code]` is the stable part (see [Checks at start](#checks-at-start)).
 - **Apply a change with a restart.** An instance reads its config only when it starts. Run
   `aproxy restart PORT|ALIAS`: it checks the edited config first and leaves the old instance
   running if the check fails, so a typo does not take the instance down.
 - **Check without applying.** `aproxy doctor` validates every config an alias points to and every
   other `*.toml` in the config directories, but not the default config unless an alias points to
-  it. For the default config, `aproxy restart` or `aproxy start` is the check.
+  it. For the default config, `aproxy restart` or `aproxy start` is the check, and `aproxy config
+  --show` reports its diagnostics without starting anything.
 
 ## Example
 
@@ -65,43 +66,55 @@ listen_addr = "127.0.0.1:12345"
 
 # Optional, uncomment as needed
 # proxy = "http://127.0.0.1:7890"
-# read_timeout_secs = 600
-# bounded_retry_paths = ['/v1/messages/count_tokens', '/v1/messages/count_tokens\?.*']
-# allowed_origins = ["http://localhost:5173"]
-# extra_headers = { "x-title" = "my-agent" }
+
+[timeouts]
+first_byte_secs = 600                     # long non-streaming generations
+
+[[retry.rules]]
+path = '/v1/messages/count_tokens(\?.*)?' # path?query, anchored at both ends
+max_attempts = 3
+
+# [[format]]
+# name = "convert"
+# command = "~/.aproxy/bin/aproxy-format"
+# args = ["run", "--config", "~/.aproxy/agg.toml"]
+# process = "persistent"
+# stages = ["request", "retry"]
 ```
 
 ## Field summary
 
-"settings.json" in the Default column means the field falls back to the settings.json global
-default, whose built-in value is shown (see [Precedence](#precedence)). Integers are non-negative.
+"settings.json" in the Default column means the field falls back to a key of the same name and
+nesting in the `defaults` section of settings.json, whose built-in value is shown (see
+[Precedence](#precedence)). Integers are non-negative.
 
 | Field | Type | Default | 0 / empty means |
 |---|---|---|---|
-| `base_url` | string | none, required | start fails |
+| `base_url` | string | none, required (may come from settings.json `defaults.base_url`) | start fails |
 | `listen_addr` | string `host:port` | `"127.0.0.1:12345"` | port 0: the OS picks one |
-| `api_key` | string | unset | blank = unset |
+| `api_key` | string | settings.json (`defaults.api_key`), unset | blank = unset |
 | `extra_headers` | table of strings | `{}` | |
 | `override_headers` | table of strings | `{}` | |
-| `proxy` | string (URL) | unset: environment proxy variables apply | blank = unset |
-| `proxy_username` | string | unset | blank = unset |
-| `proxy_password` | string | unset | blank = unset |
-| `max_retry_backoff_secs` | integer | `320` | 0 = every retry immediate |
-| `connect_timeout_secs` | integer | `30` | 0 = no limit |
-| `read_timeout_secs` | integer | `300` | 0 = no limit |
-| `bounded_retry_paths` | array of regex strings | settings.json, `[]` | empty = off |
-| `keepalive_interval_secs` | integer | `15` | 0 = keepalive off |
-| `keepalive_trigger` | `"accept"` \| `"body_stream"` \| `"any"` | settings.json, `"any"` | |
-| `keepalive_heartbeat` | string | `": keepalive\n\n"` | must end at an SSE event boundary |
-| `max_body_mb` | integer | settings.json, `128` | 0 = no limit |
-| `spool_limit_mb` | integer | `256` | 0 is treated as 1 |
-| `disk_cache` | boolean | settings.json, `true` | |
-| `forward_only` | boolean | settings.json, `false` | |
-| `allowed_hosts` | array of strings | settings.json, `[]` | empty = built-in policy; `["*"]` = check off |
-| `allowed_origins` | array of strings | settings.json, `[]` | empty = built-in policy; `["*"]` = check off |
+| `proxy` | string (URL) | settings.json (`defaults.proxy`), unset: environment proxy variables apply | blank = unset |
+| `proxy_username` | string | settings.json (`defaults.proxy_username`), unset | blank = unset |
+| `proxy_password` | string | settings.json (`defaults.proxy_password`), unset | blank = unset |
+| `max_request_mb` | integer | settings.json (`defaults.max_request_mb`), `128` | 0 = no limit |
+| `max_response_mb` | integer | settings.json (`defaults.max_response_mb`), `256` | 0 is treated as 1 |
+| `[timeouts] connect_secs` | integer | settings.json (`defaults.timeouts.connect_secs`), `30` | 0 = no limit |
+| `[timeouts] first_byte_secs` | integer | settings.json (`defaults.timeouts.first_byte_secs`), `300` | 0 = no limit |
+| `[timeouts] read_idle_secs` | integer | settings.json (`defaults.timeouts.read_idle_secs`), `300` | 0 = no limit |
+| `[keepalive] interval_secs` | integer | settings.json (`defaults.keepalive.interval_secs`), `15` | 0 = keepalive off |
+| `[keepalive] trigger` | `"accept"` \| `"body_stream"` \| `"any"` | settings.json (`defaults.keepalive.trigger`), `"any"` | `"always"` is rejected |
+| `[keepalive] heartbeat` | string | settings.json (`defaults.keepalive.heartbeat`), `": keepalive\n\n"` | must not be empty; must end at an SSE event boundary |
+| `[retry] max_backoff_secs` | integer | settings.json (`defaults.retry.max_backoff_secs`), `320` | 0 = every retry immediate |
+| `[[retry.rules]]` | array of tables | settings.json (`defaults.retry.rules`), `[]` | empty = every request retries without limit |
+| `delivery` | `"retry"` \| `"forward"` | settings.json (`defaults.delivery`), `"retry"` | |
+| `disk_cache` | boolean | settings.json (`defaults.disk_cache`), `true` | |
+| `[history] body_budget_mb` | integer | settings.json (`defaults.history.body_budget_mb`), unset | parsed, no effect yet |
+| `allowed_hosts` | array of strings | settings.json (`defaults.allowed_hosts`), `[]` | empty = built-in policy; `["*"]` = check off |
+| `allowed_origins` | array of strings | settings.json (`defaults.allowed_origins`), `[]` | empty = built-in policy; `["*"]` = check off |
 | `log_file` | string (path) | unset: random name in `<APROXY_HOME>/logs/` | |
-| `request_transform` | table | unset | |
-| `response_transform` | table | unset | |
+| `[[format]]` | array of tables | `[]` | no external transformer |
 
 ## Precedence
 
@@ -114,17 +127,37 @@ Highest first:
    To drop one, stop the instance and start it again without the flag. Prefer the file over
    `--api-key`: command lines are visible to other processes on the machine.
 2. **config.toml.**
-3. **The settings.json global default**, which exists only for `max_body_mb`, `disk_cache`,
-   `forward_only`, `bounded_retry_paths`, `allowed_hosts`, `allowed_origins` and
-   `keepalive_trigger` (settings-json.md, "Global defaults for config.toml fields").
+3. **The `defaults` section of settings.json.** It can hold any key of this file except
+   `listen_addr`, `log_file` and `format`, under the same name and nesting, written as JSON
+   (settings-json.md, "defaults"). A key present in config.toml always wins, even when its value
+   equals the built-in default; an explicit empty array in the toml (for example
+   `allowed_hosts = []`) also counts as set where the key is an array.
 4. **The built-in default.**
 
-A key present in config.toml always wins over settings.json, even when its value equals the
-built-in default. So `allowed_hosts = []`, `allowed_origins = []` or `bounded_retry_paths = []` in
-one config restores the built-in behavior for that instance even if settings.json sets a list.
-When one of these seven fields is not in the toml, `aproxy config --show` prints
-`（未在 toml 设置，运行时取 settings.json 全局默认）` ("not set in the toml; the settings.json global
-default applies at runtime") instead of the effective value; read settings.json for that.
+Scalars and arrays take the highest layer that sets them, as a whole. Arrays are replaced, not
+merged: a `retry.rules` or `allowed_hosts` written in config.toml replaces the `defaults` value
+whole. The two header tables are the exception: they merge by header name (case-insensitive) across
+config.toml and `defaults`, with config.toml winning a conflict. `listen_addr`, `log_file` and
+`format` are per-instance and have no settings.json layer.
+
+**Credentials in `defaults` follow their target.** `defaults.api_key` and the secret headers in
+`defaults.extra_headers` / `defaults.override_headers` are used only when this instance's final
+`base_url` points at the same target as `defaults.base_url`; `defaults.proxy_username` and
+`defaults.proxy_password` only when its final `proxy` names the same scheme, host and port as
+`defaults.proxy`. Otherwise they are withheld — a key meant for one vendor's API must not be sent to
+another. Everything else, including non-secret headers, is inherited as usual. `aproxy config --show`
+lists what was withheld and warns when the instance ends up with no credential of its own;
+settings-json.md, "Credentials in defaults follow their target", describes the comparison and which
+header names are recognized as secrets.
+
+`aproxy config --show` prints each effective value with its source layer: `config.toml`,
+`settings.json 全局默认` (settings.json global default), `环境变量` (environment, `proxy` only),
+`内置默认` (built-in default) or `未设置` (unset). Run-only CLI flags are not visible to it; they
+are described in step 1 above.
+
+`proxy` has one extra source: with no `proxy` in either layer, the HTTP client reads the usual
+environment variables (`HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`, `ALL_PROXY`,
+`all_proxy`), and `--show` reports the source as `环境变量`.
 
 ## Fields
 
@@ -138,14 +171,17 @@ URL is `http://127.0.0.1:12345/v1` and it calls `/v1/chat/completions`, set
 - Must start with `http://` or `https://` (any case) and must not contain `?` or `#`, which would
   turn the appended path into part of the query.
 - A trailing `/` is removed.
+- It may come from settings.json `defaults.base_url`. Credentials in `defaults` are tied to that
+  value: an instance whose own `base_url` names another target does not inherit them (see
+  [Precedence](#precedence)).
 
 ### listen_addr
 
 The `host:port` the instance listens on. The default `127.0.0.1:12345` is reachable only from this
 machine.
 
-- The port is required; without one, start fails with `listen_addr 缺少端口或端口无效` ("listen_addr
-  lacks a port or the port is invalid").
+- The port is required; without one, start fails with `config_invalid_value` on `listen_addr`
+  (`listen_addr has no port or the port is not valid`).
 - Every instance needs its own port. A second instance on a port that another aProxy instance
   already uses is refused, even with a different host part.
 - Port `0` lets the OS choose; read the port from `aproxy status`. Clients need a fixed address, so
@@ -162,7 +198,9 @@ Injects a key into every forwarded request: sets `Authorization: Bearer <key>` a
 OpenAI-style and Anthropic-style upstreams and keeps a stale client key from reaching the upstream
 through the other header. Use it when the client cannot hold the key or you want one place to
 change it. For an upstream that expects the key in another header, such as Gemini's
-`x-goog-api-key`, use `override_headers` instead.
+`x-goog-api-key`, use `override_headers` instead. It may come from settings.json `defaults.api_key`;
+that value is inherited only by instances whose `base_url` names the same target as
+`defaults.base_url` ([Precedence](#precedence)).
 
 ### extra_headers / override_headers
 
@@ -201,82 +239,71 @@ daemon inherited from the shell that started it (`HTTP_PROXY`, `HTTPS_PROXY`, `A
 - Credentials can be embedded (`socks5://user:pass@127.0.0.1:1080`) or given separately.
   `proxy_username` (with `proxy_password`) replaces embedded credentials; `proxy_password` without
   `proxy_username` is ignored. Username or password without `proxy` fails start.
-- Downloads by `aproxy install` do not use this; they use settings.json `download_proxy`.
+- Downloads by `aproxy install` do not use this; they use settings.json
+  `update.download_proxy`.
 - `aproxy config --clear-proxy` clears all three fields.
 
-### max_retry_backoff_secs
+### max_request_mb
 
-The longest wait between retries. The first three retries are immediate; from the fourth the wait
-is 5 s and doubles (10, 20, 40 ...) until it reaches this cap, then stays there; a cap below 5
-makes every delayed retry wait exactly the cap. Retries never stop;
-the cap only sets how often aProxy tries. Default 320. `0` makes every retry immediate, which hammers
-an upstream that is down; for fast recovery prefer a small cap such as 10. Retry rules: behaviors.md,
-"Retry decisions".
+The largest request body accepted, in MB (default 128, or settings.json
+`defaults.max_request_mb`). A larger body gets `413` `x-aproxy-error: request_too_large` (`details.limit_bytes`) and
+is not forwarded. `0` = no limit, which lets one request grow memory or disk use without bound.
+Raise it for long agent sessions with images, only when you see that 413. Also enforced with
+`delivery = "forward"`.
 
-### connect_timeout_secs / read_timeout_secs
+### max_response_mb
 
-Limits on the connection to the upstream. A timeout counts as a network error and is retried.
+The largest upstream response aProxy buffers, in MB (default 256). A larger response is a
+deterministic failure and is not retried: the client gets `502` `x-aproxy-error:
+response_too_large` (`details.limit_bytes`), or the same error as the SSE frame if heartbeat
+headers were already sent (behaviors.md, After the commit). Raise it for instances that relay large
+files. `0` is treated as 1 MB, not as unlimited. No effect with `delivery = "forward"`.
 
-- `connect_timeout_secs` (default 30): time allowed to establish the TCP/TLS connection.
-- `read_timeout_secs` (default 300): the longest gap between two reads from the upstream, including
-  the wait for the first byte. Set it above the longest time the upstream can stay silent while
-  healthy: queueing before the first token, or a `"stream": false` request that sends nothing until
-  the whole answer is ready. Too small, and a slow but healthy upstream times out on every attempt,
-  so the request retries forever.
-- `0` = no limit. There is no limit on total request time. Neither field affects the client's own
-  timeouts (clients.md).
+### timeouts
 
-### bounded_retry_paths
-
-Regex patterns for requests that should stop retrying. When a matching request keeps getting
-failure responses (an error status, or `200` with an error body), aProxy stops after 3 attempts in
-total and passes the last upstream response to the client unchanged, adding only
-`x-aproxy-error: retry_exhausted` and `x-aproxy-request-id`. Network errors are still retried
-without limit. Empty (the default) = off.
-
-Use it when an upstream deterministically fails an endpoint the client depends on, so the client
-gets the real error instead of waiting forever. The typical case: Claude Code behind a relay or
-mirror API that does not implement `POST /v1/messages/count_tokens`, so `/compact` hangs until the
-client times out. Which endpoints need this depends entirely on the upstream, so aProxy ships no
-patterns.
+Limits on talking to the upstream. Each timeout counts as a network error and is retried; each has
+its own failure code in logs and in `status`'s latest error.
 
 ```toml
-# Single quotes: TOML keeps backslashes literally, so \? needs no doubling
-bounded_retry_paths = [
-  '/v1/messages/count_tokens',       # this path with no query string
-  '/v1/messages/count_tokens\?.*',   # this path with any query string (Claude Code sends ?beta=true)
-]
+[timeouts]
+connect_secs = 30      # TCP/TLS connection
+first_byte_secs = 300  # from sending the request until the response headers arrive
+read_idle_secs = 300   # gap between two reads of the response body
 ```
 
-- Each pattern must match the whole request target, `path?query`; patterns are anchored at both
-  ends. A plain path therefore matches only that path without a query string.
-- Patterns are regular expressions. Write a literal `?` as `\?`, and escape `.`, `+`, `(`, `[`,
-  `$`, `^` when you mean the character. A stray `$` or `^` gives a valid pattern that never matches,
-  and nothing reports it.
-- Matching is case-sensitive and sees the target exactly as the client sent it, percent-encoding
-  included: write a space in a query as `%20`.
-- Logs mask query values (`?beta=***`), but matching uses the real query, so write real values.
-- Matching uses the client's original path, before any request transformer rewrites it.
-- An invalid regex fails start, and the error quotes the pattern.
+- `connect_secs` (default 30): time allowed to establish the TCP/TLS connection. On expiry the
+  attempt fails with `upstream_connect_timeout`.
+- `first_byte_secs` (default 300): time from sending the request (connection setup and upload of
+  the request body included) until the upstream sends its response headers. On expiry the attempt
+  fails with `upstream_first_byte_timeout`. Set it above the longest time an upstream can stay
+  silent before its headers while healthy: queueing before the first token, or a
+  `"stream": false` request that sends nothing until the whole answer is ready.
+- `read_idle_secs` (default 300): the longest gap between two reads of the response body. It is
+  re-armed on every read, so it does not cap the total duration of a response. On expiry the
+  attempt fails with `upstream_read_idle_timeout`.
+- `0` = no limit for that timeout. There is no limit on total request time. None of these affects
+  the client's own timeouts (clients.md).
 
-When the cap is reached, the log shows the warn line
-`受限重试路径达到尝试上限，不再重试` ("bounded-retry path reached its attempt cap; not retrying");
-look for it to confirm a pattern matches. If heartbeat headers had already been sent to the client,
-the request ends with the SSE error frame of code `retry_exhausted` instead of the upstream status
-(behaviors.md, After the commit).
-
-### keepalive_interval_secs / keepalive_trigger / keepalive_heartbeat
+### keepalive
 
 While aProxy waits for and retries a request that qualifies for keepalive, it sends the client
 response headers early and then a heartbeat (by default the SSE comment `: keepalive`) every
-`keepalive_interval_secs`; the body is still buffered and replayed only after a successful attempt
+`interval_secs`; the body is still buffered and replayed only after a successful attempt
 (behaviors.md, "Keepalive heartbeats").
 
-- `keepalive_interval_secs` (default 15): the heartbeat period, and also how long aProxy waits for
-  upstream headers before sending its own. Keep it below the shortest byte-level idle timeout
-  between client and aProxy. `0` turns keepalive off for the instance. CLI:
-  `aproxy config --keepalive-secs N`.
-- `keepalive_trigger` (default `"any"`): which requests qualify. No CLI flag.
+```toml
+[keepalive]
+interval_secs = 15
+trigger = "any"
+heartbeat = ": keepalive\n\n"
+```
+
+- `interval_secs` (default 15): the heartbeat period, and also how long aProxy waits for upstream
+  headers before sending its own. Keep it below the shortest byte-level idle timeout between
+  client and aProxy. `0` turns keepalive off for the instance. CLI: `aproxy config
+  --keepalive-secs N` writes this key.
+- `trigger` (default `"any"`, or settings.json `defaults.keepalive.trigger`): which
+  requests qualify. No CLI flag.
 
 | Value | A request qualifies when |
 |---|---|
@@ -288,70 +315,131 @@ Keep `"any"`. Claude Code's streaming requests send `Accept: application/json` w
 `"stream": true`, so `"accept"` alone would leave them without heartbeats. Switch an instance to
 `"accept"` when its upstream answers `"stream": true` with something other than SSE (Ollama's native
 API streams NDJSON, for example) and often needs retries: once aProxy has sent SSE headers during a
-retry, a non-SSE body no longer fits the response. Only the three lowercase values are accepted.
+retry, a non-SSE body no longer fits the response. `"always"` cannot be written in the file: it
+would put SSE headers on every request and break non-streaming clients, so only a format program
+may ask for it per request.
 
 - The decision uses what the client sent, before any request transformer.
-- `keepalive_heartbeat` (default `": keepalive\n\n"`): the bytes written on every tick, as they
-  are. aProxy knows no protocol, so pick what the client tolerates: a blank line (`"\n"`) for a
-  client whose SSE parser chokes on comments, or a whole event such as
-  `"event: ping\ndata: {}\n\n"`. A heartbeat does not reset an event-level idle timeout unless the
-  client counts it as an event; Claude Code drops both comments and `ping` events, so raise its
-  timeout instead (clients.md). The value must leave the client's SSE parser at an event boundary,
-  or the heartbeat merges with the first replayed event: it must be non-empty, end with a line
-  break, and, if it has any field line (`event:`, `data:` and so on), end with a blank line.
-  `aproxy config --show` prints it with `\n` escapes. No CLI flag.
+- `heartbeat` (default `": keepalive\n\n"`): the bytes written on every tick, as they are. aProxy
+  knows no protocol, so pick what the client tolerates: a blank line (`"\n"`) for a client whose
+  SSE parser chokes on comments, or a whole event such as `"event: ping\ndata: {}\n\n"`. A
+  heartbeat does not reset an event-level idle timeout unless the client counts it as an event;
+  Claude Code drops both comments and `ping` events, so raise its timeout instead (clients.md).
+  The value must leave the client's SSE parser at an event boundary, or the heartbeat merges with
+  the first replayed event: it must be non-empty, end with a line break, and, if it has any field
+  line (`event:`, `data:` and so on), end with a blank line. `aproxy config --show` prints it with
+  `\n` escapes. No CLI flag.
 - No keepalive for requests that do not qualify (notably `"stream": false`: the client's own
-  timeout must cover the whole generation), for `forward_only` instances, and when
-  `keepalive_interval_secs = 0`.
+  timeout must cover the whole generation), for `delivery = "forward"` instances, and when
+  `interval_secs = 0`.
 - Heartbeats defeat byte-level idle timeouts only. Clients that time out on SSE events need their
   own timeout raised (clients.md).
 
-### max_body_mb
+### retry
 
-The largest request body accepted, in MB. A larger body gets `413`
-`x-aproxy-error: request_too_large` (`details.limit_bytes`) and is not forwarded.
-`0` = no limit, which lets one request grow memory or disk use without bound. The default 128 covers
-long agent sessions with images; raise it only if you see that 413. Also enforced with
-`forward_only`.
+Retry pacing and the rules that cap retries for specific upstream failures.
 
-### spool_limit_mb
+```toml
+[retry]
+max_backoff_secs = 320
 
-The largest upstream response aProxy buffers, in MB (default 256). A larger response is a
-deterministic failure and is not retried: the client gets `502`
-`x-aproxy-error: response_too_large` (`details.limit_bytes`), or the same error as the SSE frame if
-heartbeat headers were already sent (behaviors.md, After the commit). Raise it for instances that
-relay large files. `0` is treated as 1 MB, not as unlimited. No effect with `forward_only`.
+[[retry.rules]]
+path = '/v1/messages/count_tokens(\?.*)?'
+max_attempts = 3
+```
 
-### disk_cache
+`max_backoff_secs` (default 320) is the longest wait between retries. The first three retries are
+immediate; from the fourth the wait is 5 s and doubles (10, 20, 40 ...) until it reaches this cap,
+then stays there; a cap below 5 makes every delayed retry wait exactly the cap. Retries never
+stop; the cap only sets how often aProxy tries. `0` makes every retry immediate, which hammers an
+upstream that is down; for fast recovery prefer a small cap such as 10.
 
-Whether request and response bodies larger than 1 MiB spill to temporary files under
-`<APROXY_HOME>/spool/<port>/` instead of staying in memory. On (the built-in default), memory per
-request stays flat whatever the body size; off, every body is held in RAM. Bodies under 1 MiB stay in
-memory either way, so leave it on unless disk writes are unwanted. When a disk write or read fails,
-the request ends with `507` `x-aproxy-error: local_storage_failed` (`details.op` is
-`write_request`, `read_request` or `write_response`), or the same error as the SSE frame if
-heartbeat headers were already sent, rather than falling back to memory.
-No effect with `forward_only` (behaviors.md, "Disk cache (spool)").
+`[[retry.rules]]` describe failures that should stop retrying. A rule has these keys:
 
-### forward_only
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `path` | string (regex) | unset = any path | Matched against the client's `path?query` as a whole; anchored at both ends automatically |
+| `status` | array of integers | unset = any status | HTTP status codes 100-599 |
+| `max_attempts` | integer | required | Attempt N that fails with an upstream response and matches this rule stops when N ≥ `max_attempts`; `0` = no limit |
 
-`true` turns the instance into a plain streaming pass-through: request and response bytes are
-relayed as they arrive, with no buffering, no retries, no heartbeats and no error-body detection.
-This gives up aProxy's core guarantee: an upstream failure becomes a 502 to the client, and a stream
-that breaks mid-way is cut off where it broke. Enable it only for a trusted upstream when the client
-needs true incremental streaming, and keep the settings.json default `false` so other instances
-keep retrying.
+- Rules are matched in order. The first rule whose matchers all hold decides; a rule with
+  `max_attempts = 0` is an exemption and keeps retrying, so place it before a wider rule.
+- Only failures that came with an upstream response are capped: an error status, or a 2xx carrying
+  an error body. Network failures (connect, timeout, interrupted body) are always retried without
+  limit, because there is no response to pass on.
+- When a rule stops a request, the last upstream response goes to the client unchanged (status,
+  headers, body), plus `x-aproxy-error: retry_exhausted` and `x-aproxy-request-id`. The error
+  detail `by` is `rule:<1-based index>`, and `last_code` is the failure code of the last attempt.
+- If heartbeat headers were already committed, the client gets the terminal SSE error frame with
+  code `retry_exhausted` instead, because the real status line can no longer be sent.
+- `path` is a regular expression over the real request target, percent-encoding included and
+  before any request transform. Write a literal `?` as `\?`; escape regex metacharacters when you
+  mean the character. Matching is case-sensitive. Logs mask query values (`?beta=***`), but
+  matching sees the real ones.
+- A `body` matcher is reserved for a later release: writing it reports `config_not_supported`.
+  An invalid regex, a status outside 100-599, or a missing `max_attempts` reports an error and the
+  whole rule is dropped, because a rule with a matcher silently removed would be wider than
+  written.
+- An empty rule list (the default) means every request retries without limit. The settings.json
+  `defaults.retry.rules` global default is inherited as a whole when config.toml has no rules;
+  config.toml rules replace that array when present.
+
+Use rules when an upstream deterministically fails an endpoint the client depends on, so the client
+gets the real error instead of waiting forever. The typical case: Claude Code behind a relay or
+mirror API that does not implement `POST /v1/messages/count_tokens`, so `/compact` hangs until the
+client times out. Which endpoints need this depends entirely on the upstream, so aProxy ships no
+rules.
+
+```toml
+[[retry.rules]]
+path = '/v1/messages/count_tokens(\?.*)?'
+max_attempts = 3
+
+# Exempt 429 from a wider rule below it
+[[retry.rules]]
+status = [429]
+max_attempts = 0
+
+[[retry.rules]]
+status = [400, 404, 410]
+max_attempts = 2
+```
+
+When a rule stops a request, the log says `重试规则给的尝试次数用完，不再重试` ("the attempt count
+given by the retry rule is used up; not retrying"), with the rule's index and the last failure
+code. Look for it to confirm a rule matched. Runtime details: behaviors.md, "Retry rules".
+
+### delivery
+
+`"retry"` (the default, or settings.json `defaults.delivery`) buffers the request and
+the upstream response and retries failures. `"forward"` turns the instance into a plain streaming
+pass-through: request and response bytes are relayed as they arrive, with no buffering, no retries,
+no heartbeats and no error-body detection. This gives up aProxy's core guarantee: an upstream
+failure becomes a 502 to the client, and a stream that breaks mid-way is cut off where it broke.
+Enable it only for a trusted upstream when the client needs true incremental streaming.
 
 - Still applied: `api_key`, `extra_headers`, `override_headers`, the inbound checks, and
-  `max_body_mb` (counted while streaming).
-- Ignored: `disk_cache`, `spool_limit_mb`, `keepalive_interval_secs`, `keepalive_trigger`, `keepalive_heartbeat`,
-  `max_retry_backoff_secs`, `bounded_retry_paths`.
-- Cannot be combined with `request_transform` or `response_transform`, which need the whole body;
-  start fails, also when `forward_only` comes from settings.json.
+  `max_request_mb` (counted while streaming).
+- Ignored: `disk_cache`, `max_response_mb`, `keepalive.*`, `retry.*`.
+- Cannot be combined with any `[[format]]`: forward does not buffer the body and a format needs all
+  of it. Start fails with `config_conflict` on `delivery`, also when `"forward"` comes from
+  settings.json `defaults.delivery`.
 - No CLI flag. When it is on, `aproxy start` prints `仅转发模式：不缓冲、不重试` ("forward-only mode: no
   buffering, no retries").
 
 Runtime details: behaviors.md, "Forward-only mode".
+
+### disk_cache
+
+Whether request and response bodies larger than 1 MiB spill to temporary files under
+`<APROXY_HOME>/spool/<port>/` instead of staying in memory. On (the built-in default, or
+settings.json `defaults.disk_cache`), memory per request stays flat whatever the body size; off,
+every body is held in RAM. Bodies under 1 MiB stay in
+memory either way, so leave it on unless disk writes are unwanted. When a disk write or read fails,
+the request ends with `507` `x-aproxy-error: local_storage_failed` (`details.op` is
+`write_request`, `read_request` or `write_response`), or the same error as the SSE frame if
+heartbeat headers were already sent, rather than falling back to memory.
+No effect with `delivery = "forward"` (behaviors.md, "Disk cache (spool)").
 
 ### allowed_hosts / allowed_origins
 
@@ -410,114 +498,133 @@ from `aproxy status` or `aproxy logs` rather than guessing it.
   in `<APROXY_HOME>/logs/` that no running or restorable instance refers to whenever it lists
   instances. Files outside that directory are never deleted by aProxy.
 - A custom file is appended to across restarts, but emptied at start when it is over 2 MiB, and
-  while running when it grows past settings.json `log_rotate_mb`.
+  while running when it grows past settings.json `logs.rotate_mb`.
 - Foreground instances (`--foreground`) log to the console and ignore it.
 
-### request_transform / response_transform / heartbeat_transform
+### history
+
+```toml
+[history]
+body_budget_mb = 8
+```
+
+`body_budget_mb` is parsed and validated now but has no effect in this version.
+
+### format
 
 Hand each request before forwarding, or each successful response before replay, to an external
 "format" program that rewrites it: protocol conversion (OpenAI to Anthropic and back), key
 rotation, routing models to different channels. aProxy has no transformer built in. The official
 `aproxy-format` binary, the envelope protocol and how to write your own program are in the
-aproxy-format skill; this section covers only the aProxy side. Default: unset.
+aproxy-format skill; this section covers only the aProxy side.
 
-`heartbeat_transform` is the third kind: while a keepalive response waits for a usable upstream
-result, aProxy asks the program for each heartbeat instead of writing `keepalive_heartbeat`, so a
-program that knows the client's protocol can send something the client accepts, chosen from the
-request's content. Its rules are below the table.
+`[[format]]` is an array of tables. In this version the stages `request`, `response` and
+`heartbeat` can each be served by at most one format, and `retry` is a modifier on a request
+format. Everything else is reported as `config_not_supported` until a later release.
 
 ```toml
-request_transform  = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
-response_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
+[[format]]
+name = "convert"
+command = "~/.aproxy/bin/aproxy-format"
+args = ["run", "--config", "~/.aproxy/agg.toml"]
+process = "persistent"
+stages = ["request", "retry"]
+
+[[format]]
+name = "heartbeat"
+command = "~/.aproxy/bin/aproxy-format"
+args = ["run", "--config", "~/.aproxy/agg.toml"]
+process = "persistent"
+stages = ["heartbeat"]
 ```
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
+| `name` | string | file stem of `command` | Identifies the format in `--show`, logs and the error body's `details.format`; must be unique |
 | `command` | string | required | The program. Run directly, not through a shell. A leading `~` expands to the user's home directory; a bare name is looked up on `PATH`. |
 | `args` | array of strings | `[]` | Arguments, passed verbatim (no `~` expansion). |
-| `mode` | `"spawn"` \| `"persistent"` | `"spawn"` | `spawn`: a new process per request. `persistent`: a pool of long-running workers; required when the program keeps state between requests (key rotation, counters). |
-| `pool_max` | integer | `4` | Most workers in `persistent` mode; further requests queue. `0` fails start. Unused in `spawn` mode. |
-| `idle_timeout_secs` | integer | `300` | A `persistent` worker idle this long is stopped. `0` = never. |
+| `env` | table of strings | `{}` | Extra environment variables for the program. `--show` lists the names only, never the values. |
+| `process` | `"spawn"` \| `"persistent"` | `"spawn"` | `spawn`: a new process per message. `persistent`: a pool of long-running workers; required when the program keeps state between requests (key rotation, counters). |
+| `stages` | array of strings | required, non-empty | Which stages this format serves (see below). |
+| `required` | boolean | `true` | Parsed and validated; no effect in this version. |
+| `pool_max` | integer | `4` | Most workers in `persistent` mode; further messages queue. `0` fails start. Unused in `spawn` mode. |
+| `worker_idle_secs` | integer | `300` | A `persistent` worker idle this long is stopped. `0` = never. |
 | `timeout_secs` | integer | `30` | Limit for one transformation. `0` = none. A worker that times out is killed and replaced, and that transformation counts as failed. |
-| `extra` | string | unset | Copied verbatim into every envelope's `extra` field; its meaning is up to the program. The official binary expects the path of its config here and expands `~/` itself. |
-| `every_attempt` | boolean | `false` | `request_transform` only (on the other two it fails start): run the request transform again before every retry. See below. |
+| `decide_timeout_secs` | integer | `2` | Parsed and validated; no effect in this version. |
+| `breaker_failures` | integer | `5` | Parsed and validated; no effect in this version. |
+| `breaker_cooldown_secs` | integer | `30` | Parsed and validated; no effect in this version. `0` is rejected. |
 
-- Write `command` with `~/` or an absolute path. A relative path resolves against the daemon's
-  working directory, which depends on where `start` or `restore` happened to run.
-- `~` means the user's home directory even under another `APROXY_HOME`; in an isolated test home,
-  use absolute paths.
-- With the official binary, give the response side the same `extra` as the request side: it reads
-  its config from `extra`, and without it every response transformation fails.
-- The two sides fail differently. A request-side failure returns `422` `format_rejected` when the
-  program replied with `error`, or `502` `format_failed` when the program itself failed (spawn,
-  crash, pipe, timeout or protocol); the request is not sent upstream and not retried. If heartbeat
-  headers were already sent, the same error arrives as the SSE frame instead. A response-side
-  failure logs a warn and passes the upstream response through untransformed. `details` keys and
-  the full code table: behaviors.md, After the commit.
+The official `aproxy-format` expands a leading `~/` in its own `--config` argument; for any other
+program, put an absolute path in `args`, which aProxy passes verbatim (it does not expand `~` there).
+
+Stages in this version:
+
+- `request` runs on the client request after its body is buffered, before the first upstream
+  attempt. Every retry replays its output.
+- Adding `retry` to a request format means the format is called again before each retry, with the
+  client's original request and the previous attempt's failure (envelope `stage = "retry"`). A
+  format that declares `retry` without `request` is `config_not_supported`.
+- `response` runs on an upstream response aProxy judged successful, before replay.
+- `heartbeat` generates each keepalive tick after the response head is committed and until the real
+  bytes are replayed. Prefer `process = "persistent"`: it is called every interval for every
+  waiting request, and `spawn` starts a process each time. Its reply must obey the same
+  event-boundary rule as `keepalive.heartbeat`.
+- `decide`, `stream`, `notify` and `admit`, a second format for the same stage, and `retry` without
+  `request` are reported as `config_not_supported` (they arrive in a later release). A format
+  cannot declare both `response` and `stream`, and one that declares `stream` or `notify` must use
+  `process = "persistent"`.
+
+Other rules:
+
+- In the request direction, a format that serves `request` and is listed after one that declares
+  `retry` must declare `retry` too: on a retry the earlier format produces a new request, and a
+  later request format that did not run again would forward the previous attempt's output. This is
+  reported as `config_conflict`.
+- There is no `extra` key any more. Pass such data through `args` or `env`; the envelope's `extra`
+  field is empty when the format is configured from the file.
+- A request-side failure returns `422` `format_rejected` when the program replied with `error`, or
+  `502` `format_failed` when the program itself failed (spawn, crash, pipe, timeout or protocol);
+  the request is not sent upstream and not retried. If heartbeat headers were already sent, the
+  same error arrives as the SSE frame instead. `details.format` is the format's `name`. A
+  response-side failure logs a warn and passes the upstream response through untransformed. Full
+  code table: behaviors.md, After the commit.
 - Choose `timeout_secs` by how long a stuck program may hold one request, not by client timeouts:
   keepalive requests keep receiving heartbeats while a transformation runs. With `0`, a program
   that hangs holds that request indefinitely and its worker is never replaced.
-- By default a request is transformed once and every retry replays the result, so a rotating key
-  changes between requests, not between retries. With `every_attempt = true`, aProxy calls the
-  request transform again before each retry with the client's original request (envelope
-  `stage = "retry"`, plus the previous attempt's status) and sends what it returns, so the program
-  can move to another key or channel after a failure; the official binary in `persistent` mode then
-  takes the next key on every retry. A failed call at that point does not end the request: aProxy
-  retries with the request it sent last time. The original body stays in memory for the whole
-  request. Only enable it for a program that handles `stage = "retry"` (the aproxy-format skill,
-  protocol.md); one that echoes unknown stages back would send the untransformed request.
-- Responses passed through by `bounded_retry_paths` are not transformed.
+- A response passed through by a retry rule is not transformed.
 - aProxy discards the program's stderr; have the program write its own log file.
-- Cannot be combined with `forward_only`.
-
-`heartbeat_transform` takes the same keys and differs in when it runs and how it fails:
-
-- It runs once per keepalive tick after aProxy has committed the response head and until the first
-  real byte is replayed, but only once the request side is done (earlier ticks, while a slow
-  request transform runs, send `keepalive_heartbeat`). The reply's body is written to the client
-  as that tick's heartbeat; an empty body writes nothing.
-- It never delays a heartbeat. If the previous call has not returned, that tick sends
-  `keepalive_heartbeat` without calling again. A call that fails, times out or returns bytes that
-  are not UTF-8 or break the event-boundary rule of `keepalive_heartbeat` also sends
-  `keepalive_heartbeat`, with one warn per request: `心跳转换失败，这一拍改发固定心跳（本请求之后的失败不再重复告警）`
-  ("heartbeat transform failed; sending the fixed heartbeat").
-- Prefer `mode = "persistent"`: it is called every `keepalive_interval_secs` for every waiting
-  request, and `spawn` starts a process each time.
-- Heartbeats that look like protocol events (for example an Anthropic `message_start`) are on the
-  program: when the real response arrives, aProxy replays it unchanged, so pair it with a
-  `response_transform` that uses the envelope `state` to drop what the heartbeats already sent.
-- A table whose `command` is blank is ignored as if absent; a table without a `command` key fails
-  to parse.
+- Cannot be combined with `delivery = "forward"`.
 
 Runtime behavior and the error codes: behaviors.md, "External transformers"; aproxy-format skill,
 troubleshooting.md.
 
 ## Checks at start
 
-`aproxy start`, and the precheck of `aproxy restart`, load the file, apply CLI flags and settings.json
-defaults, and check the result. On failure the instance does not start, and the error reads
-`配置错误: <reason>` ("configuration error") followed by `位置: <file>` ("location"). A daemon that
-fails during its own startup writes the error to `<APROXY_HOME>/logs/startup.log`. When the bad value
-came from settings.json, the message adds `（该值来自 settings.json 的 … 全局默认，不在上述 toml 中）`
-("the value comes from the settings.json global default, not from the toml above").
+`aproxy start`, and the precheck of `aproxy restart`, load the file strictly, apply CLI flags and
+settings.json defaults, and check the result. On failure the instance does not start and the error
+reads `配置错误:` ("configuration error") followed by one line per error:
 
-| Reason (verbatim prefix) | Meaning and fix |
+```
+<file>:<line>:<column>: <key>: <message> [<code>]
+```
+
+Parts that do not apply are omitted (`<file>: <message> [<code>]` when there is no position, and
+no `<key>:` when the problem is the file itself). When the bad value came from settings.json, the
+line names settings.json and the key under `defaults.` instead of the toml file. `aproxy config
+--show` prints the same diagnostics on stderr and exits 3.
+
+| Code | Meaning and fix |
 |---|---|
-| `配置文件解析失败（TOML 语法错误）` | Not valid TOML, a value of the wrong type, an invalid `mode`, or a transformer table without `command`. The message includes the parser's location. |
-| `指定的配置文件不存在` | The file given with `--config` does not exist. |
-| `base_url 不能为空` | `base_url` is missing or blank. This is also what you get when the default config file does not exist yet. |
-| `base_url 必须以 http:// 或 https:// 开头` | "must start with http:// or https://". |
-| `base_url 不应包含 ? 或 #` | "must not contain ? or #": move query parameters out of `base_url`. |
-| `listen_addr 缺少端口或端口无效` | "lacks a port or the port is invalid". |
-| `proxy 配置无效` | "proxy is invalid": the URL does not parse. |
-| `proxy 仅支持 http/https/socks4/socks5 协议` | "proxy supports only http/https/socks4/socks5": unsupported scheme. |
-| `proxy 缺少主机地址` | "proxy lacks a host". |
-| `配置了 proxy_username/proxy_password 但未配置 proxy URL` | Credentials without `proxy`. |
-| `bounded_retry_paths 含非法正则` | "contains an invalid regex"; the pattern is quoted. |
-| `keepalive_trigger 取值无效` | "invalid value": use `accept`, `body_stream` or `any`. |
-| `keepalive_heartbeat 无效：…` | "invalid": the reason follows, one of: empty (set `keepalive_interval_secs = 0` instead), not ending with a line break, or field lines without a closing blank line. |
-| `request_transform 的 pool_max 必须 >= 1` (or `response_transform …`) | `pool_max = 0` with `mode = "persistent"`. |
-| `forward_only 与外部转换器互斥` | "forward_only and external transformers are mutually exclusive": keep one. |
+| `config_syntax` | Not valid TOML. The message includes the parser's location. |
+| `config_unknown_key` | A key this version does not know, including every old 0.1.x name. Remove it with `aproxy config --unset KEY` or rename it (compatibility.md lists the renames). |
+| `config_type` | The value has the wrong type, for example a string where an integer belongs. |
+| `config_invalid_value` | A value outside its allowed set: `delivery` not `forward`/`retry`, `keepalive.trigger = "always"`, an invalid regex, a status outside 100-599, `pool_max = 0`, `breaker_cooldown_secs = 0`, a bad `base_url`, or a `keepalive.heartbeat` that breaks SSE framing. |
+| `config_missing_key` | A required key is absent: `base_url` at start, `max_attempts` in a retry rule, `command` or `stages` in a format. |
+| `config_conflict` | Two settings cannot hold together: `delivery = "forward"` with a format, two formats with the same name, or a request format after a `retry` format without declaring `retry`. |
+| `config_not_supported` | A shape this version parses but does not implement: the retry-rule `body` matcher, a format stage outside `request`/`response`/`heartbeat` (`decide`, `stream`, `notify`, `admit`), `retry` without `request`, or a second format for the same stage. |
+
+Other start checks that are not file diagnostics: the file named by `--config` must exist
+(`指定的配置文件不存在`), and the listen address must bind. Both exit 1.
 
 ## Normalization
 
@@ -525,6 +632,9 @@ Applied every time the file is loaded:
 
 - A trailing `/` is removed from `base_url`.
 - `api_key`, `proxy`, `proxy_username` and `proxy_password` are trimmed; blank means unset.
-- Header names and values are trimmed; entries with a blank name are dropped.
-- A transformer's `command` is trimmed and a leading `~` expanded; blank means the transformer is
-  unset.
+- Header names and values are trimmed; entries with a blank name are dropped. Header tables from
+  settings.json `defaults` and config.toml merge by name, case-insensitively; secret headers are
+  withheld from an instance whose target differs (see [Precedence](#precedence)).
+- A format's `name` and `command` are trimmed; a leading `~` in `command` is expanded; blank
+  `command` is reported as an error (a format entry is not silently dropped).
+- Arrays replace lower layers as a whole; the two header tables merge per name.

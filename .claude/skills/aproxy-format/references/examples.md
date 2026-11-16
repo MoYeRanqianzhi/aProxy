@@ -19,17 +19,18 @@ you need a working starting point; the loop structure and duties are explained i
 
 ## Key rotation
 
-Gives each request the next key from a list, for a single upstream. Configure it as `request_transform`
-only.
+Gives each request the next key from a list, for a single upstream. Configure it with the `request`
+stage only.
 
 ```python
 #!/usr/bin/env python3
-"""Rotate API keys across requests (request_transform only, mode = "persistent").
+"""Rotate API keys across requests (stages = ["request"], process = "persistent").
 
-extra = '{"keys": ["sk-a", "sk-b", "sk-c"], "header": "authorization"}'
+env = { ROTATE = '{"keys": ["sk-a", "sk-b", "sk-c"], "header": "authorization"}' }
 "header" is "authorization" (Bearer) or "x-api-key" (Anthropic style).
 """
 import json
+import os
 import sys
 
 sys.stdin.reconfigure(encoding="utf-8")
@@ -40,7 +41,7 @@ handled = 0  # requests served by this worker; lives as long as the process
 for line in sys.stdin:
     try:
         env = json.loads(line)
-        cfg = json.loads(env["extra"])
+        cfg = json.loads(os.environ["ROTATE"])
         keys = cfg["keys"]
         # Start each pool worker at a different key so busy pools spread evenly.
         key = keys[(env.get("worker_id", 0) + handled) % len(keys)]
@@ -60,10 +61,18 @@ for line in sys.stdin:
 ```
 
 ```toml
-request_transform = { command = "/usr/bin/python3", args = ["/home/me/formats/rotate.py"], mode = "persistent", extra = '{"keys": ["sk-a", "sk-b", "sk-c"], "header": "x-api-key"}' }
+[[format]]
+name = "rotate"
+command = "/usr/bin/python3"
+args = ["/home/me/formats/rotate.py"]
+process = "persistent"
+stages = ["request"]
+env = { ROTATE = '{"keys": ["sk-a", "sk-b", "sk-c"], "header": "x-api-key"}' }
 ```
 
-- `mode = "persistent"` is what makes rotation work: in spawn mode `handled` is always 0.
+- `process = "persistent"` is what makes rotation work: in spawn mode `handled` is always 0.
+- `env` values are never printed by `aproxy config --show`; the config file still holds them in
+  plain text, so protect its permissions.
 - The key is chosen once per client request. aProxy retries a failed request by replaying it with
   the same key, and it retries upstream 401/403 like any other error, so a revoked key makes every
   request that draws it retry indefinitely. Remove dead keys from the list and restart the
@@ -80,11 +89,13 @@ the official binary below, which converts the full request and response schemas.
 #!/usr/bin/env python3
 """Anthropic Messages client -> OpenAI Chat Completions upstream.
 
-Non-streaming text only: no tools, images or SSE. Configure this one file as
-both request_transform and response_transform, mode = "persistent", with
-extra = '{"url": "https://api.openai.com/v1/chat/completions", "key": "sk-...", "model": "gpt-4o"}'
+Non-streaming text only: no tools, images or SSE. Configure this one file in two
+[[format]] entries, stages = ["request"] and stages = ["response"],
+process = "persistent", with
+env = { CONVERT = '{"url": "https://api.openai.com/v1/chat/completions", "key": "sk-...", "model": "gpt-4o"}' }
 """
 import json
+import os
 import sys
 
 sys.stdin.reconfigure(encoding="utf-8")
@@ -149,7 +160,7 @@ for line in sys.stdin:
     try:
         env = json.loads(line)
         if "method" in env:
-            reply = convert_request(env, json.loads(env["extra"]))
+            reply = convert_request(env, json.loads(os.environ["CONVERT"]))
         else:
             reply = convert_response(env)
     except Exception as e:
@@ -159,21 +170,35 @@ for line in sys.stdin:
 ```
 
 ```toml
-request_transform  = { command = "/usr/bin/python3", args = ["/home/me/formats/convert.py"], mode = "persistent", extra = '{"url": "https://api.openai.com/v1/chat/completions", "key": "sk-...", "model": "gpt-4o"}' }
-response_transform = { command = "/usr/bin/python3", args = ["/home/me/formats/convert.py"], mode = "persistent" }
+[[format]]
+name = "convert-request"
+command = "/usr/bin/python3"
+args = ["/home/me/formats/convert.py"]
+process = "persistent"
+stages = ["request", "retry"]
+env = { CONVERT = '{"url": "https://api.openai.com/v1/chat/completions", "key": "sk-...", "model": "gpt-4o"}' }
+
+[[format]]
+name = "convert-response"
+command = "/usr/bin/python3"
+args = ["/home/me/formats/convert.py"]
+process = "persistent"
+stages = ["response"]
+env = { CONVERT = '{"url": "https://api.openai.com/v1/chat/completions", "key": "sk-...", "model": "gpt-4o"}' }
 ```
 
-Test both halves before connecting a client:
+Test both halves before connecting a client. The program reads `CONVERT` from its environment, so
+export it for the harness run:
 
 ```bash
 X='{"url": "https://api.openai.com/v1/chat/completions", "key": "sk-test", "model": "gpt-4o"}'
-python scripts/test_format.py --format-spec anthropic --extra "$X" --command python3 -- convert.py
-python scripts/test_format.py --side response --format-spec openai-chat --command python3 -- convert.py
+CONVERT="$X" python scripts/test_format.py --format-spec anthropic --command python3 -- convert.py
+CONVERT="$X" python scripts/test_format.py --side response --format-spec openai-chat --command python3 -- convert.py
 ```
 
-This keeps the upstream key in plain text in config.toml (`aproxy config --show` masks `extra`,
-the file does not). To keep it out of the config, put a file path in `extra` and read the key from
-that file.
+This keeps the upstream key in plain text in config.toml (`aproxy config --show` lists `env` by
+name only; the file does not mask it). To keep it out of the config, put a file path in `env` and
+read the key from that file.
 
 ## The official aproxy-format binary
 
@@ -202,15 +227,26 @@ Release targets: `x86_64-pc-windows-msvc` (also `-v3`), `i686-pc-windows-msvc`,
 ### Connect it to an instance
 
 ```toml
-request_transform  = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
-response_transform = { command = "~/.aproxy/bin/aproxy-format", args = ["run"], mode = "persistent", extra = "~/.aproxy/agg.toml" }
+[[format]]
+name = "aggregate-request"
+command = "~/.aproxy/bin/aproxy-format"
+args = ["run", "--config", "~/.aproxy/agg.toml"]
+process = "persistent"
+stages = ["request", "retry"]
+
+[[format]]
+name = "aggregate-response"
+command = "~/.aproxy/bin/aproxy-format"
+args = ["run", "--config", "~/.aproxy/agg.toml"]
+process = "persistent"
+stages = ["response"]
 ```
 
-- Both sides, same `args` and `extra`, `persistent` mode (rotation counters live in memory).
-- `run` reads the aggregation config path from `extra`; `run --config <path>` (or
-  `--config=<path>`) takes precedence over `extra`. aproxy-format expands a leading `~/` itself
-  (from `HOME`, else `USERPROFILE`); other relative paths resolve against the daemon's working
-  directory, so avoid them.
+- Both stages, same `args`, `persistent` process (rotation counters live in memory).
+- `run` reads the aggregation config path from `--config` (`--config=<path>` also works).
+  aproxy-format expands a leading `~/` itself (from `HOME`, else `USERPROFILE`); other relative
+  paths resolve against the daemon's working directory, so avoid them. The envelope's `extra`
+  field is empty when the format is configured from config.toml, so pass the path in `args`.
 - Each worker loads the config on its first request and keeps it. After editing the file, restart
   the instance so all workers load the new version (restarting cuts every connection through it,
   see guide.md, Configure it in aProxy). A config that fails to load is retried on every request,
@@ -321,8 +357,8 @@ On failure it prints the reason to stderr and exits with code 1.
 ## Response-side transform
 
 Rewrites what the client sees: keeps only an allow-list of upstream headers and renames the model
-in JSON responses. Use it with the Python loop template in guide.md, configured as
-`response_transform` only.
+in JSON responses. Use it with the Python loop template in guide.md, configured as a `[[format]]`
+entry with `stages = ["response"]` only.
 
 ```python
 KEEP = {"content-type", "request-id", "x-request-id"}

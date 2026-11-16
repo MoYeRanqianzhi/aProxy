@@ -1,6 +1,6 @@
 ---
 name: aproxy-format
-description: Write, test and configure format programs - the external transformers aProxy runs for request_transform, response_transform and heartbeat_transform - and use the official aproxy-format binary. Covers the one-line JSON envelope protocol field by field, spawn vs persistent mode, protocol conversion between OpenAI Chat, OpenAI Responses and Anthropic Messages, API key rotation, multi-channel aggregation by model (newapi style), testing a format without aProxy, and diagnosing 502s caused by a transformer. Use this skill whenever a request must be rewritten on its way through aProxy or a response rewritten on its way back, even if the user never says "format" - for example "point this instance at an OpenAI-compatible endpoint", "convert Anthropic requests to OpenAI", "rotate between these three keys", "route claude models to one channel and gpt models to another", "my transformer makes every request 502". For aProxy commands and the rest of config.toml use the aproxy-cli skill.
+description: Write, test and configure format programs - the external transformers aProxy runs for the request, response and heartbeat stages of a [[format]] entry - and use the official aproxy-format binary. Covers the one-line JSON envelope protocol field by field, spawn vs persistent mode, protocol conversion between OpenAI Chat, OpenAI Responses and Anthropic Messages, API key rotation, multi-channel aggregation by model (newapi style), testing a format without aProxy, and diagnosing 502s caused by a transformer. Use this skill whenever a request must be rewritten on its way through aProxy or a response rewritten on its way back, even if the user never says "format" - for example "point this instance at an OpenAI-compatible endpoint", "convert Anthropic requests to OpenAI", "rotate between these three keys", "route claude models to one channel and gpt models to another", "my transformer makes every request 502". For aProxy commands and the rest of config.toml use the aproxy-cli skill.
 ---
 
 # aProxy format programs
@@ -11,19 +11,23 @@ stdin; the program writes **one envelope line** back to stdout. The envelope car
 URL, headers and body, and everything the program writes back replaces what aProxy sends. That
 one mechanism is enough for protocol conversion, key rotation and multi-channel routing.
 
-- `request_transform` runs once per client request, after aProxy has buffered the body and before
-  the first upstream attempt. Every retry replays the transformed request, so a rotated key stays
-  the same across that request's retries and changes only on the next request.
-- `response_transform` runs on the upstream response aProxy has judged successful, just before
-  replaying it to the client. Its envelope `url` is the final upstream URL from the request side.
-  The two transformers are separate processes with no shared memory: the URL tells a response
-  transformer which channel answered, and anything else the request side decided can be handed
-  over in the envelope's `state` field (references/protocol.md).
+- A format whose `stages` include `request` runs once per client request, after aProxy has
+  buffered the body and before the first upstream attempt. Every retry replays the transformed
+  request, so a rotated key stays the same across that request's retries and changes only on the
+  next request. Adding `retry` to `stages` makes it run again before every retry instead, from the
+  client's original request.
+- A format whose `stages` include `response` runs on the upstream response aProxy has judged
+  successful, just before replaying it to the client. Its envelope `url` is the final upstream URL
+  from the request side. The two stages are separate processes with no shared memory: the URL tells
+  a response format which channel answered, and anything else the request side decided can be
+  handed over in the envelope's `state` field (references/protocol.md).
+- A format whose `stages` include `heartbeat` generates each keepalive heartbeat while a request
+  waits for a usable upstream result.
 
 ## First, check whether the official binary already does it
 
 `aproxy-format` converts between OpenAI Chat, OpenAI Responses and Anthropic Messages, rotates
-keys, and routes models to channels from a TOML file passed in `extra`. It is a separate download
+keys, and routes models to channels from a TOML file passed with `run --config PATH` in `args`. It is a separate download
 with its own version line (not installed by `aproxy install`); installation and configuration are
 in [references/examples.md](references/examples.md). Reach for it before writing code. Its limits
 decide whether it fits:
@@ -36,18 +40,19 @@ decide whether it fits:
 
 ## Writing your own
 
-1. **Pick a mode.** `spawn` (the default) starts a fresh process per request: any script that reads
-   a line and prints a line works, but transformations on one instance then run one at a time.
-   `persistent` keeps a pool of worker processes (up to `pool_max`, default 4) that loop over
-   lines. Use `persistent` whenever the program keeps state between requests (a rotation counter,
-   a cache) or the instance handles concurrent traffic.
+1. **Pick a process model.** `process = "spawn"` (the default) starts a fresh process per message:
+   any script that reads a line and prints a line works, but transformations on one instance then
+   run one at a time. `process = "persistent"` keeps a pool of worker processes (up to `pool_max`,
+   default 4) that loop over lines. Use `persistent` whenever the program keeps state between
+   messages (a rotation counter, a cache) or the instance handles concurrent traffic.
 2. **Start from a loop template** in [references/guide.md](references/guide.md) for your language,
    and keep to the protocol duties below.
 3. **Test it without aProxy:** `python scripts/test_format.py` feeds your program request- and
    response-side envelopes for each protocol, checks the replies, and checks that a persistent
    program exits on EOF. See [references/guide.md](references/guide.md) for usage.
-4. **Configure it** in the instance's config.toml (`request_transform` / `response_transform`;
-   field reference in the aproxy-cli skill, config-toml.md) and `aproxy restart` the instance.
+4. **Configure it** as a `[[format]]` entry in the instance's config.toml, naming the stage in
+   `stages` (field reference in the aproxy-cli skill, config-toml.md), and `aproxy restart` the
+   instance.
 
 ## Protocol duties and why they matter
 
@@ -81,12 +86,12 @@ What a failure costs differs by side, so know which side you are on:
 | Side | When the transform fails (error reply, crash, timeout, bad output) |
 |---|---|
 | Request | Nothing is sent upstream and the request is not retried. The client gets `422` `format_rejected` when your program replied with `error`, or `502` `format_failed` when the process itself failed; on a streaming request that has already received heartbeat headers, the same error arrives as a final SSE frame. Match on `error.aproxy.code` or `x-aproxy-error`, not on `message` (aproxy-cli skill, behaviors.md, After the commit). |
-| Retry (request transform with `every_attempt`) | The request goes on: aProxy resends what it sent on the previous attempt and logs one warning per request. |
+| Retry (a request format that declares `retry` in `stages`) | The request goes on: aProxy resends what it sent on the previous attempt and logs one warning per request. |
 | Response | aProxy replays the original upstream response unchanged and logs a warning. |
 
 A transform that succeeds but produces a request the upstream rejects (a wrong conversion, a revoked
 key) is a different story: aProxy retries upstream errors indefinitely, with the same transformed
-request each time, so the client just waits. With `every_attempt = true` your program is asked again
+request each time, so the client just waits. With `retry` in `stages` your program is asked again
 before each retry and can switch to another key or channel (references/protocol.md, "Retry stage").
 Check conversions with the test harness and one real request before relying on them.
 

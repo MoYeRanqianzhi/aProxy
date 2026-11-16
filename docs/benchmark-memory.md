@@ -58,8 +58,8 @@ aProxy 的重试使命要求请求体可重放、上游响应可完整缓冲（s
 
 改动要点：请求体与响应 spool 超 1 MiB 内存驻留阈值即溢写 `~/.aproxy/spool/<端口>/`
 临时文件；重试重放/回放流式读文件；读写都走 OS page cache（进程内存与负载解耦）；
-`disk_cache` 可关（关闭=纯内存旧行为）；请求体上限改为 `max_body_mb`（默认 128MB，
-settings.json 全局默认 + toml 按实例覆盖）。
+`disk_cache` 可关（关闭=纯内存旧行为）；请求体上限改为 `max_request_mb`（默认 128MB，
+settings.json 的 `defaults.max_request_mb` 全局默认 + toml 按实例覆盖）。
 
 | 并发 | 请求数 | 失败 | 峰值 Private | 每并发成本 | 吞吐 | P50/P99 (s) | 线程峰值 |
 |---|---|---|---|---|---|---|---|
@@ -134,7 +134,7 @@ after 线程数更高（44→475 随并发增长）：tokio 对 `tokio::fs` 阻�
   用户「用存储占用换内存占用」的方向被证实，且无性能代价（page cache 机制）。
 - 顺带解锁了旧版 10 MiB 请求体硬上限（413）——50MB 图片会话类负载现可透传
   （默认 128 MB，可配 0=不限）。
-- 配置分层落地：settings.json `max_body_mb`/`disk_cache` 全局默认，config.toml
+- 配置分层落地：settings.json `defaults.max_request_mb`/`defaults.disk_cache` 全局默认，config.toml
   按实例覆盖——低并发实例可关磁盘缓存保持纯内存，高并发实例默认受保护。
 - 原始数据：`.agents/bench/levels-before.csv`、`levels-after.csv`、
   `samples-before.csv`、`samples-after.csv`（每秒采样全程）。

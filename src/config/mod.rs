@@ -1,15 +1,23 @@
-//! 配置管理：`~/.aproxy/config.toml`，单一 upstream base URL，完整透传。
+//! 配置：一个实例实际用的运行时配置 [`Config`]，以及得到它的整条路。
 //!
-//! 额外能力（兼容设计）：
-//! - `api_key` 快捷：等效覆盖 `Authorization: Bearer <key>`
-//! - `extra_headers`：仅当上游请求未携带该头时追加
-//! - `override_headers`：无条件覆盖（用于非 Bearer 鉴权或额外头）
-//! - `keepalive_interval_secs`：流式重试期间的保活心跳间隔，0 表示关闭
-//! - `keepalive_trigger`：哪些请求走保活通道（看 Accept 头 / 请求体 stream:true / 任一）
-//! - `keepalive_heartbeat`：每个保活间隔写给客户端的心跳字节（默认 SSE 注释）
-//! - `proxy`：上游请求经配置的代理转发（与常见代理配置一致，支持 http/https/socks5，
-//!   可在 URL 内嵌 user:pass，也可用 `proxy_username`/`proxy_password` 单独指定）；
-//!   未配置时保留 reqwest 默认的系统代理（读取 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 环境变量）
+//! - [`mod@file`]：config.toml 的严格解析——文件里写了什么，连同带行列的诊断。
+//! - [`mod@resolve`]：分层解析——启动时的覆盖 > config.toml > settings.json 的全局默认 > 内置默认，
+//!   产出 [`Config`]、每个键的来源与诊断。启动、诊断与展示都走它。
+//! - [`mod@edit`]：写回——只改目标键，保留注释与键序。
+//!
+//! [`Config`] 的字段名是运行时一侧的名字，其中一部分沿用了 0.1.x 的叫法，与 config.toml 里的
+//! 键名不同。对应关系（左边是字段，右边是文件里的键）：
+//! `max_body_mb` ← `max_request_mb`；`spool_limit_mb` ← `max_response_mb`；
+//! `forward_only` ← `delivery = "forward"`；`connect_timeout_secs`、`first_byte_timeout_secs`、
+//! `read_timeout_secs` ← `timeouts.connect_secs`、`timeouts.first_byte_secs`、
+//! `timeouts.read_idle_secs`；`keepalive_interval_secs`、`keepalive_trigger`、
+//! `keepalive_heartbeat` ← `keepalive.interval_secs`、`keepalive.trigger`、`keepalive.heartbeat`；
+//! `max_retry_backoff_secs` ← `retry.max_backoff_secs`；`retry_rules` ← `[[retry.rules]]`；
+//! `request_transform`、`response_transform`、`heartbeat_transform` ← `[[format]]` 里声明了
+//! `request`、`response`、`heartbeat` 阶段的程序。字段注释里说到「配置」时用的是字段名。
+//!
+//! 经 [`resolve()`] 得到的 [`Config`] 里，带全局默认的 `Option` 字段都已经填好；`None` 只出现在
+//! 不经解析、直接构造出来的配置上（测试），所以消费点一律走访问方法取生效值。
 
 pub mod edit;
 pub mod file;
@@ -187,7 +195,8 @@ impl TransformConfig {
     }
 }
 
-/// 配置文件内容
+/// 一个实例的运行时配置。由 [`resolve()`] 从各层合并得到；字段名与 config.toml 键名的对应
+/// 见模块文档。
 #[derive(Debug, Clone)]
 pub struct Config {
     /// 上游 API 的 base URL，例如 `https://api.anthropic.com`
@@ -246,9 +255,8 @@ pub struct Config {
     pub spool_limit_mb: u64,
     /// 上游连接建立超时（秒）。默认 30；慢网络/高延迟上游可调大。
     pub connect_timeout_secs: u64,
-    /// 上游两次读到数据之间的超时（秒，同样钳制首字节等待）。默认 300；
-    /// LLM 上游排队久（TTFB 数十秒）可调大，调过小会把「慢但活着」的上游
-    /// 变成确定性无限重试。
+    /// 上游两次读到数据之间的超时（秒；等响应头的时限是 `first_byte_timeout_secs`）。
+    /// 默认 300；0 = 不设限。调过小会把「慢但活着」的上游变成确定性无限重试。
     pub read_timeout_secs: u64,
     /// 请求体大小上限（MB），超出直接 413。未设置时用 settings.json 的
     /// `max_body_mb`（全局默认，内置 128）；设 0 表示不设限。

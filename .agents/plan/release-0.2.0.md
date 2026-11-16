@@ -485,7 +485,7 @@
   dependabot：#8、#9、#11–#15 由这两个提交覆盖；#10（base64 0.23）关闭——headless 构建里 base64 只有一份 0.22，
   envelope 单独升会多一份重复，等 reqwest、hyper-util 换版本时再看；#6（toml 1.x）、#7（sha2 0.11）归 P3。
 - 阶段 1，前置重构：P1 → P2 → P4 → P3 → P5（§14.1；内存所限不并行）。
-- 阶段 2，契约块：B0 → B1 → B2 → B3 → B4 → **tag alpha.2** → B5 → B6 → B7 → B8 → B9 → **tag alpha.3** →
+- 阶段 2，契约块：✓ B0 → ✓ B1 → ✓ B2 → ✓ B3 → ✓ B4 → ✓ **tag alpha.2**（2026-11-17）→ B5（进行中）→ B6 → B7 → B8 → B9 → **tag alpha.3** →
   B10a → B10b、B10c → B10d → B11 与 W2c → **tag alpha.4**。B12（文档、skill、记忆）随各块。alpha.2 之后补跨版本强制安装
   的 CI 测试（TODO 的 W2b 一条）。
 - 阶段 3：W4 `aproxy skill`、W3 i18n、W5 界面接入真实数据（前端可提前对 §6 的形状做 mock 侧的工作）→ **tag beta.1**。
@@ -640,4 +640,54 @@
        **W7 发版前要定**：是否在 `install` 换版时自动迁移（0.1.x 用户升级后第一条命令就会撞上）。`upgrade_from_0_1_0` 的 CI
        测试用的 settings 仍是平铺的（给 0.1.0 的二进制读），升级后没有再跑要读 settings 的命令，所以没暴露这一点。
     5. 「0 的含义统一」没有逐项核对。
-
+- **v0.2.0-alpha.2 已发布**（2026-11-17，tag 在 4cfc363）：打 tag 前 workflow_dispatch 演练 run 43929031519 全绿（B0 改过
+  release.yml）；发布 run 43934123484 成功。核对过：GitHub 预发布、47 个资产；npm `@meowo/aproxy` 与
+  `@meowo/aproxy-headless` 的 `next` 都是 0.2.0-alpha.2（`latest` 没动）；crates.io 上 aproxy、aproxy-ipc、aproxy-envelope、
+  aproxy-desktop 都是 0.2.0-alpha.2。发布前补了 CHANGELOG（两张键名对照表、统一的错误出口、settings 命令）、技能与 README
+  （7a… 之后的 `docs:` 提交），文档里「alpha.1 的界面是预览版」改成了「各 alpha 版」。
+  **alpha.2 之后该做而还没做的**：跨版本强制安装的 CI 测试（TODO 的 W2b 一条；现在有 alpha.1、alpha.2 两个带强制安装的版本了）。
+- B5 第一部分（2026-11-17）：b7d2b27 拉起规格与期望状态记录。新模块 `src/spec.rs`（`InstanceSpec`、
+  `run/<端口>.restore.json`、交接文件 `run/<纳秒>-<pid>.spec.json`）；内部入口 `aproxy __serve --home --spec` 与
+  `aproxy __watchdog --home` 取代两个隐藏旗标；`spawn::spawn_from_spec` 是唯一的拉起函数（就绪时限 30 秒）；
+  `daemon::spawn_detached_with` 脱离启动者（unix `setsid`，Windows `CREATE_BREAKAWAY_FROM_JOB`、被拒就退回并在 startup.log
+  记告警）、可改环境与工作目录；shutdown 的 `keep_restore` 与快照的 `features`；`APROXY_RUN_DIR` 删除。
+  - 验收里已有测试的（都在 `tests/restart_integration.rs`，另有 `tests/spawn_instance.rs` 与各模块单测）：命令行里没有密钥
+    （实例、看护者、看护者重拉出的实例；Windows 用 `Get-CimInstance` 读命令行，unix 用 `ps`）；只设大写 `HTTP_PROXY` 启动、
+    restart 之后仍走代理；对启动者进程组发 SIGINT 实例仍在（unix，等 CI）；restart 遇坏配置不动旧实例（原有测试）；restore
+    遇暂时缺失的配置保留记录；`stop` 之后不被拉回（原有测试 + 崩溃后 stop 删记录）；端口 0 的实例崩溃后回到同一端口、
+    run/ 里只有一份记录；钉过端口的配置改成固定端口后 restart 用新端口、旧记录被接替；没有配置文件的实例能 restart、restore；
+    前台实例 restart 被拒；读不懂的记录不被删除（`spec.rs` 单测）。
+  - 验证：Windows headless 全量 665 通过、0 失败；两个变体 clippy 与 Linux 交叉 clippy 零输出。
+  - **B5 还没做的**（接手时从这里继续，设计稿 §4、§5）：
+    1. 实例记录仍是 `run/<端口>.pid`、旧形状（`process_start` 是数字）；要改成 `<端口>.instance.json`：带 `schema`、
+       `start`（台账的启动标记字符串）、`instance_id`、`foreground`，`log_path`、`config_path` 可为 null。IPC 快照的
+       `instance` 是它去掉 `schema`——这一步与 B6（IPC v1 的快照形状）连在一起，放在 B6 一起做更省事。
+    2. 看护者记录仍是 `run/watchdog.claim`；要改成 `watchdog.json`（`schema`、`restarts` 最近 20 次、`last_scan_at`）。
+       看护者每个 tick 重读 settings、开关关闭就退出；连续失败达上限后改为每 300 秒重试而不是放弃；实例存活满 60 秒才清零
+       失败计数；处置写进 `logs/watchdog.log`。这些都没动。
+    3. unix 心跳仍在 /dev/shm（要挪进 `run/<端口>.heart`，写心跳放专用线程）；spool 仍按端口分目录（要按
+       `<pid>-<start 短哈希>`）。
+    4. 清理规则（§4.3）：`status` 的普查仍会删孤儿日志与失效的 `.pid`（读路径不该删任何文件）；日志 GC 的三个条件、
+       残留交接文件与临时文件的清理、spool 的清理都没按新规则做。本次只做了「有读不懂的期望状态记录时整轮不删日志」。
+    5. 实例的启动顺序没有按 §5 调整：台账条目里的端口在端口为 0 时没有用实际端口重写；没有 `state:"starting"`
+       （控制端点在 bind 之后才建，期望状态记录在控制端点之后写，这两点已经符合）。
+    6. install 一侧：换二进制之前按台账找旧看护者（现在仍读 claim）；广播之前的预检（`install_precheck_failed`）与
+       「管不了的活实例」检查（`install_unmanaged_instances`）没做——它们在 §14.2 归 B9。
+    7. `tests/contract_v0_2.rs`（钉住全部记录的形状）没建：等 1、2 的记录定形后一次写齐，现在 spec 与期望状态记录的
+       形状由 `spec.rs` 的单测钉着。
+    8. 启动要 9 秒的 format 不被判为就绪超时：时限已是 30 秒，没有专门的测试（format 在启动时握手属于 B10a）。
+  - **定下的事（设计稿没写）**：
+    1. restart 没有期望状态记录的实例（前台实例）时报「没有可用来重新拉起它的记录」，退出 1；`restart_unsupported` 这个码
+       等 B9 接操作码时再用。
+    2. restart 的强制终止（`restart --force`）不删记录；看护者可能抢先拉起，新实例绑不上端口时若端口上已是同一配置的
+       新实例就算成功（§5 restart 第 5 条）。
+    3. 旧实例（没有 `shutdown.keep_restore` 这个 feature 的）：先发不带参数的 shutdown，等端点消失后把记录原样写回。
+       alpha.1、alpha.2 的实例写的是旧的 `.restore`，本版本不读，所以这条路径实际只会遇到没有记录的情形。
+    4. 给了配置路径而文件不在一律是错误（原来只有命令行显式 `--config` 才是）；默认的 `config.toml` 不存在、又没显式给
+       路径时，规格的 `config_path` 记 null，启动提示写「没有配置文件」。
+    5. 子进程的 home 由 `--home` 定（`main` 把它写进本进程的 `APROXY_HOME`），不由继承来的环境定。
+    6. 看护者重拉时配置文件不在：报失败、进退避队列，记录保留；退避期间记录被 stop 删掉的条目直接出队。
+    7. 安装状态的 `pending_restores` 不再写也不再读（恒为空），在途实例靠「上次落盘的端口快照 + 期望状态记录还在」认出来。
+  - **文档还没跟上**（B5 整块做完后一起改，免得记录名改两次）：技能里的 `.restore`、`.pid`、「Processes you may see」
+    （应列 `__serve`、`__watchdog`）、restart 失败后的恢复办法（现在是 `aproxy restore`，不再是手动 start）、`stop` 一个已
+    崩溃的实例、端口 0 钉住端口、`APROXY_RUN_DIR` 已删、就绪时限 30 秒；docs/architecture.md 的对应段落；CHANGELOG。

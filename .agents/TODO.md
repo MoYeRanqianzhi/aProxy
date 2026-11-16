@@ -63,6 +63,9 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
     带「alpha.1」字样、等有真实数据要改的：README.md 206，README_EN.md 380，SKILL.md 88，commands.md 476，troubleshooting.md 145，
     architecture.md 513、678，aproxy-format 的 guide.md（envelope 钉 `=0.2.0-alpha.1` 改回 `"0.2"`）。行号会漂，按内容找。
   - 重写 SECURITY.md：支持的版本改为 0.2.x，威胁模型补上桌面窗口与强制安装。
+  - **0.1.x 的 settings.json 怎么过渡**（B3 留下，rc.1 之前要定并做完）：0.2.0 只认分节的新形状，0.1.x 的平铺文件会让
+    多数命令以退出码 3 结束。现在只有技能 compatibility.md 里的手工对照表。倾向：`install` 换版时把平铺文件迁成新形状
+    （原文件留备份），并让 `upgrade_from_0_1_0` 的 CI 测试在升级后跑一条要读 settings 的命令。见计划 B3 记录第 4 条。
 
 ### 0.2.0 之后紧接着（近期，用户 2026-10-12）
 - [ ] **并发限制与排队**：aproxy 的排队放行 + 官方 aproxy-format 的并发/限速/额度规则（协议形状在 0.2.0 定稿，见计划 W2 的 format 定稿补充）

@@ -612,4 +612,32 @@
     5. 写锁等 10 秒拿不到时报「另一个 aproxy 正在写配置」，退出 1；码表里没有专门的码（`write_conflict` 只指外部修改）。
     6. `resolve` 的签名是 `resolve(path, &Overrides, &Defaults)`，第三个参数是已经取好的全局默认层而不是 `Settings`：这样
        B3 换 settings 的形状时不用动它。
+- B3（2026-11-17）：26883f1 settings.json 的新形状、严格解析、`settings` 命令与凭据继承规则。`src/settings.rs` 拆成
+  `src/settings/`：`file.rs`（文本 → `Settings` + 带行列的诊断；`defaults` 一节转成 TOML 交给 `config::file::parse`，键名前面
+  加 `defaults.`）、`edit.rs`（set/unset、占位对象的还原、读出口打码）、`mod.rs`（`read`/`load`/`update`）。写入走
+  `config::edit::rewrite_locked`（同一把 `run/config-write.lock`），用 `fsx::write_atomic_private`。
+  - 验收：四个集成测试（`invalid_settings_block_start_but_not_stop_status_or_repair`、
+    `settings_command_reads_writes_and_never_shows_secrets`、`settings_defaults_reach_config_and_credentials_follow_their_target`、
+    `corrupt_settings_json_is_never_overwritten`）；库单测 324。
+  - 验证：Windows headless 全量通过，只有 `ipc_stats_reflect_forward_only_traffic` 红过一次——`free_port()` 取到的端口在
+    实例启动前被别的并行测试占了（startup.log 写的是「端口被其他程序占用」），单跑通过，是测试自身的老竞争，同 B3 无关。
+    两个变体 clippy 与 Linux 交叉 clippy 零输出。unix 的 0600 断言等 CI。
+  - **定下的事（设计稿没写）**：
+    1. settings.json 无效时各命令怎么办：`settings` 与 `doctor` 照常（自己报告）；`status`、`stop`、`install`/`upgrade` 用内置
+       默认运行，把错误打成 `[WARN]`；其余命令退出 3 并给修法（每个出问题的键一条 `aproxy settings unset`）。实例不启动。
+       不是 JSON 对象的文件只能手工修，写回型命令一律拒绝、原样保留。
+    2. 长驻进程（看护者）读到无效的 settings 时沿用上一次有效的那份（按路径缓存），只告警一次；没有上一次就用内置默认。
+    3. 内存里的 `Settings` 字段名没有跟着分节（仍是 `log_rotate_mb`、`watchdog_heartbeat_secs` 这些），只有文件里的键变了。
+    4. `defaults` 里不收 `listen_addr`、`log_file`、`format`；凭据要先有归属（`defaults.base_url`、`defaults.proxy`），否则
+       `config_missing_key`。
+    5. `settings set` 的值：字符串类型的键可以直接写原文，以 `"` 开头按 JSON 字符串解析；`-` 从 stdin 读一行。
+    6. Windows 上的私有写入：DACL 只留当前用户、SYSTEM、Administrators，受保护（不继承）。config.toml 还没有这样写（B7）。
+  - **与设计稿的出入、没做的**：
+    1. `settings` 命令提前做了（命令树属于 B9）；`--json` 输出还没有。
+    2. `language` 只解析、不起作用（W3）；clap 之前读语言也没做。
+    3. doctor 的 `default_header_shared`（info 级）没做：doctor 现在是自己的两级 `Level`，随 B9 的 doctor 一起换成诊断类型。
+    4. 0.1.x 的平铺 settings.json 直接被拒（退出 3 + 修法），没有自动迁移。对照表写进技能的 compatibility.md；
+       **W7 发版前要定**：是否在 `install` 换版时自动迁移（0.1.x 用户升级后第一条命令就会撞上）。`upgrade_from_0_1_0` 的 CI
+       测试用的 settings 仍是平铺的（给 0.1.0 的二进制读），升级后没有再跑要读 settings 的命令，所以没暴露这一点。
+    5. 「0 的含义统一」没有逐项核对。
 

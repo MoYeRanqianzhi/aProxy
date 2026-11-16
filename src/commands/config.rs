@@ -329,7 +329,7 @@ fn print_effective(path: &std::path::Path, resolved: &config::Resolved) {
             "不设限",
         ),
     );
-    line("max_response_mb", cfg.spool_limit_mb.to_string());
+    line("max_response_mb", with_zero(cfg.spool_limit_mb, "不设限"));
     line("disk_cache", cfg.disk_cache_enabled().to_string());
     line(
         "allowed_hosts",

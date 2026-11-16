@@ -39,11 +39,14 @@ pub(super) enum ForwardResult {
     },
 }
 
-/// 响应体 spool 上限（字节）：配置 spool_limit_mb（MB，最小 1）换算，
-/// 防止失控/恶意上游把内存打爆。超过上限的响应无法完整缓冲，直接按
-/// TooLarge 终态处理。
+/// 响应体 spool 上限（字节）：配置 spool_limit_mb（MB）换算，防止失控/恶意上游把内存或
+/// 磁盘打爆。超过上限的响应无法完整缓冲，直接按 TooLarge 终态处理。0 表示不设限
+/// （与请求体上限的 0 同义）。
 pub(super) fn spool_limit_bytes(config: &Config) -> usize {
-    (config.spool_limit_mb.max(1) as usize).saturating_mul(1024 * 1024)
+    match config.spool_limit_mb {
+        0 => usize::MAX,
+        mb => (mb as usize).saturating_mul(1024 * 1024),
+    }
 }
 
 /// 一次上游尝试：发出请求、完整缓冲响应（内存/磁盘 spool）并做增量错误扫描。

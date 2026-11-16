@@ -7225,3 +7225,271 @@ fn concurrent_config_writers_do_not_lose_updates() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 重试的时序与两个超时
+// ---------------------------------------------------------------------------
+
+/// 第 `slow_calls` 次及之前的调用先交出响应头与第一块、再停 `stall` 才交第二块；之后的调用
+/// 立即完整返回。返回上游地址与调用计数。
+async fn stalling_body_upstream(
+    slow_calls: usize,
+    stall: Duration,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let router = Router::new().fallback(any(move || {
+        let c = c.clone();
+        async move {
+            let slow = c.fetch_add(1, Ordering::SeqCst) < slow_calls;
+            let stream = futures_util::stream::unfold(0u8, move |step| async move {
+                match step {
+                    0 => Some((
+                        Ok::<Bytes, std::io::Error>(Bytes::from_static(b"{\"a\":")),
+                        1,
+                    )),
+                    1 => {
+                        if slow {
+                            tokio::time::sleep(stall).await;
+                        }
+                        Some((Ok(Bytes::from_static(b"1}")), 2))
+                    }
+                    _ => None,
+                }
+            });
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from_stream(stream))
+                .unwrap()
+        }
+    }));
+    let (url, handle) = bind_random_router(router).await;
+    (url, calls, handle)
+}
+
+/// 等响应头超过 `timeouts.first_byte_secs`：这次尝试以 `upstream_first_byte_timeout` 失败并
+/// 重试；读空闲时限很长，说明两个时限各管各的。
+#[tokio::test]
+async fn first_byte_timeout_has_its_own_limit_and_code() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let upstream = Router::new().fallback(any(move || {
+        let c = c.clone();
+        async move {
+            if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                // 第一次：迟迟不给响应头
+                tokio::time::sleep(Duration::from_secs(20)).await;
+            }
+            axum::Json(serde_json::json!({"ok": true}))
+        }
+    }));
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.first_byte_timeout_secs = 1;
+    cfg.read_timeout_secs = 300;
+    let state = AppState::new(cfg);
+    let probe = state.clone();
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(state)).await;
+
+    let started = std::time::Instant::now();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        local_client()
+            .post(format!("{proxy_url}/v1/x"))
+            .body("{}")
+            .send(),
+    )
+    .await
+    .expect("首字节超时之后应立即重试并成功")
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), r#"{"ok":true}"#);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(6),
+        "应在约 1 秒的首字节时限之后重试，实际 {elapsed:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let last_error = probe.stats.last_error.lock().unwrap().clone().unwrap().0;
+    assert!(
+        last_error.starts_with("upstream_first_byte_timeout: "),
+        "{last_error}"
+    );
+}
+
+/// 响应头按时到了、响应体中途停住超过 `timeouts.read_idle_secs`：这次尝试以
+/// `upstream_read_idle_timeout` 失败并重试；首字节时限很长，没有它的事。
+#[tokio::test]
+async fn read_idle_timeout_has_its_own_limit_and_code() {
+    let (upstream_url, calls, _h1) = stalling_body_upstream(1, Duration::from_secs(20)).await;
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.first_byte_timeout_secs = 300;
+    cfg.read_timeout_secs = 1;
+    let state = AppState::new(cfg);
+    let probe = state.clone();
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(state)).await;
+
+    let started = std::time::Instant::now();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        local_client()
+            .post(format!("{proxy_url}/v1/x"))
+            .body("{}")
+            .send(),
+    )
+    .await
+    .expect("读空闲超时之后应立即重试并成功")
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.text().await.unwrap(),
+        r#"{"a":1}"#,
+        "客户端只看到完整的那一次"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(6),
+        "应在约 1 秒的读空闲时限之后重试，实际 {elapsed:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let last_error = probe.stats.last_error.lock().unwrap().clone().unwrap().0;
+    assert!(
+        last_error.starts_with("upstream_read_idle_timeout: "),
+        "{last_error}"
+    );
+}
+
+/// 读空闲时限限制的是两次读到数据之间的间隔，不是整个响应的时长：每块之间停 0.6 秒、总共
+/// 远超 1 秒的响应不算超时。
+#[tokio::test]
+async fn read_idle_timeout_restarts_on_every_chunk() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let upstream = Router::new().fallback(any(move || {
+        let c = c.clone();
+        async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            let stream = futures_util::stream::unfold(0u8, |step| async move {
+                if step == 4 {
+                    return None;
+                }
+                if step > 0 {
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                }
+                Some((
+                    Ok::<Bytes, std::io::Error>(Bytes::from_static(b"x")),
+                    step + 1,
+                ))
+            });
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/plain")
+                .body(axum::body::Body::from_stream(stream))
+                .unwrap()
+        }
+    }));
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let mut cfg = proxy_config_for(&upstream_url);
+    cfg.read_timeout_secs = 1;
+    cfg.first_byte_timeout_secs = 1;
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(cfg))).await;
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        local_client()
+            .post(format!("{proxy_url}/v1/x"))
+            .body("{}")
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resp.text().await.unwrap(), "xxxx");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "慢但一直有数据的响应不重试"
+    );
+}
+
+/// 重试的时序不听上游的：上游回 503 并带 `retry-after: 600`，第 2 次尝试照样立即发出。
+#[tokio::test]
+async fn retry_after_from_upstream_is_ignored() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let upstream = Router::new().fallback(any(move || {
+        let c = c.clone();
+        async move {
+            if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                axum::response::Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("retry-after", "600")
+                    .body(axum::body::Body::from("busy"))
+                    .unwrap()
+            } else {
+                axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .body(axum::body::Body::from("done"))
+                    .unwrap()
+            }
+        }
+    }));
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(
+        proxy_config_for(&upstream_url),
+    )))
+    .await;
+
+    let started = std::time::Instant::now();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        local_client()
+            .post(format!("{proxy_url}/v1/x"))
+            .body("{}")
+            .send(),
+    )
+    .await
+    .expect("不读 Retry-After：第 2 次尝试应立即发出")
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "done");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// 响应上限：超过 `max_response_mb` 的响应是终态；0 表示不设限，同样的响应照常交付。
+#[tokio::test]
+async fn max_response_mb_zero_means_no_limit() {
+    const SIZE: usize = 2 * 1024 * 1024 + 7;
+    let upstream = Router::new().fallback(any(|| async { vec![b'z'; SIZE] }));
+    let (upstream_url, _h1) = bind_random_router(upstream).await;
+
+    let mut limited = proxy_config_for(&upstream_url);
+    limited.spool_limit_mb = 1;
+    let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(limited))).await;
+    let resp = local_client()
+        .post(format!("{proxy_url}/v1/x"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    expect_aproxy_error(resp, 502, "response_too_large").await;
+
+    let mut unlimited = proxy_config_for(&upstream_url);
+    unlimited.spool_limit_mb = 0;
+    let (proxy_url, _h3) =
+        bind_random_router(aproxy::proxy::router(AppState::new(unlimited))).await;
+    let resp = local_client()
+        .post(format!("{proxy_url}/v1/x"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().len(), SIZE);
+}

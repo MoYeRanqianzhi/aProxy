@@ -368,16 +368,24 @@ mod tests {
             .collect();
         aces.sort();
         assert_eq!(aces.len(), 3, "{sddl}");
-        // 当前用户恰好是内置账户时，SDDL 会把它写成别名（例如 SY、BA），就不逐字比对了
-        if user.starts_with("S-1-5-21-") {
-            let mut expected = vec![
-                format!("A;;FA;;;{user}"),
-                "A;;FA;;;SY".to_string(),
-                "A;;FA;;;BA".to_string(),
-            ];
-            expected.sort();
-            assert_eq!(aces, expected, "{sddl}");
-        }
+        assert!(aces.contains(&"A;;FA;;;SY"), "{sddl}");
+        assert!(aces.contains(&"A;;FA;;;BA"), "{sddl}");
+        // 剩下的那一条是当前用户。SDDL 给一批众所周知的账户起了两个字母的别名，当前用户恰好
+        // 是其中之一时（例如内置的 Administrator 写成 LA）读回来的是别名而不是 SID 原文，
+        // 这种情况只确认它是「完全控制」的允许项
+        let own: Vec<&str> = aces
+            .iter()
+            .copied()
+            .filter(|ace| !matches!(*ace, "A;;FA;;;SY" | "A;;FA;;;BA"))
+            .collect();
+        assert_eq!(own.len(), 1, "{sddl}");
+        let trustee = own[0]
+            .strip_prefix("A;;FA;;;")
+            .unwrap_or_else(|| panic!("当前用户那一条应是完全控制的允许项: {sddl}"));
+        assert!(
+            trustee == user || !trustee.starts_with("S-"),
+            "第三条应属于当前用户 {user}: {sddl}"
+        );
 
         // 普通的原子写不动权限模型：新文件继承目录
         let plain = dir.path().join("plain.json");

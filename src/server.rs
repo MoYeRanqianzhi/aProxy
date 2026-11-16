@@ -189,18 +189,18 @@ pub(crate) async fn serve_forever(
         on_shutdown: stop_tx,
         stop_requested: std::sync::Mutex::new(false),
     });
-    {
-        let control = control.clone();
-        tokio::spawn(async move {
-            daemon::serve_ipc(ipc_endpoint, control).await;
-        });
-    }
 
     // 期望状态记录：后台实例到这里就算「应当在运行」，把拉起规格记下来。之后进程不在而
     // 记录还在（崩溃、断电、系统重启），restore 与看护者据此把它拉回来；只有 stop 删它。
     // 按实际端口命名。配置解析出的端口是 0（由系统分配）时，把实际拿到的端口钉进规格：
     // 否则记录按实际端口命名、规格却还是端口 0，每次恢复都换一个端口、多留一份拉不回的
-    // 记录。写入经 ControlState：控制端点已经在应答，启动途中收到 stop 的实例不再写它
+    // 记录。
+    //
+    // 必须写在控制端点开始应答之前：拉起方把「控制端点应答了」当作就绪，就绪之后它（以及
+    // 紧跟着的 restart、restore、看护者）就会去读这份记录。顺序反过来，就绪与记录落盘
+    // 之间有一个窗口，窗口里的 restart 会把一个正常的后台实例当成「没有记录、不归我管」。
+    // 这时还没有任何 stop 能到达本实例（端点上排队的连接要等下面的任务来读），所以不会
+    // 出现「已经被要求停止、却又把记录写回来」；之后到达的 stop 经 ControlState 删它。
     if let Some(mut spec) = spec {
         if daemon::port_of(&listen_addr) == "0" {
             spec.pinned_port = port.parse().ok();
@@ -211,22 +211,32 @@ pub(crate) async fn serve_forever(
         }
     }
 
-    // 看门狗心跳（共享内存节）：独立 ticker 每 10s 写一次毫秒时间戳——挂死的
-    // 定义是「runtime 无法调度」，ticker 停摆与 runtime 死锁等价；不经请求
-    // 热路径（零请求成本）。创建失败只降级（看护者对该实例退化为纯进程死亡
-    // 检测），绝不阻断启动。句柄存活于整个服务生命周期（随进程退出由系统回收）。
+    {
+        let control = control.clone();
+        tokio::spawn(async move {
+            daemon::serve_ipc(ipc_endpoint, control).await;
+        });
+    }
+
+    // 看门狗心跳：独立 ticker 每 10s 写一次毫秒时间戳——挂死的定义是「runtime 无法
+    // 调度」，ticker 停摆与 runtime 死锁等价；不经请求热路径（零请求成本）。写入本身交给
+    // 阻塞线程池：unix 上心跳是 home 里的一个文件，home 在网络文件系统上时一次写可能卡住，
+    // 不能让它占着运行时的工作线程。创建失败只降级（看护者对该实例退化为纯进程死亡检测），
+    // 绝不阻断启动。句柄存活于整个服务生命周期（随进程退出由系统回收）。
     if let Some(writer) = watchdog::HeartbeatWriter::create(&daemon::run_dir(), &port) {
+        let writer = std::sync::Arc::new(writer);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(
                     watchdog::HEARTBEAT_WRITE_INTERVAL_SECS,
                 ))
                 .await;
-                writer.beat();
+                let writer = writer.clone();
+                let _ = tokio::task::spawn_blocking(move || writer.beat()).await;
             }
         });
     } else {
-        tracing::warn!("看门狗心跳节创建失败，该实例将不受挂死检测保护（进程死亡检测不受影响）");
+        tracing::warn!("看门狗心跳创建失败，该实例将不受挂死检测保护（进程死亡检测不受影响）");
     }
 
     // 守护侧互保（watchdog 总开关，settings 层）：看护者是增值层而非依赖层——

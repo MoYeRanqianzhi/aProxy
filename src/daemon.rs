@@ -885,6 +885,8 @@ pub struct GcReport {
 /// - **实例记录** `<端口>.pid`：读得懂、并且写下它的进程经「pid + 创建时间」核验已经不在，
 ///   才删。读不懂的（损坏，或更新的版本写的）绝不删。
 /// - **期望状态记录**：不归清理管，只有 stop 能删。
+/// - **心跳文件** `<端口>.heart`（unix）：这个端口没有活着的实例、且文件早于
+///   [`GC_MIN_AGE_SECS`] 时删（活实例每 10 秒写它一次，旧成这样的只能是崩溃留下的）。
 /// - **交接文件与原子写的临时文件**（`*.spec.json`、`*.tmp-<pid>-<纳秒>`）：正常情况下
 ///   写者自己立即删掉或改名；写者崩溃留下的，在它的 pid 已不在、且文件早于
 ///   [`GC_MIN_AGE_SECS`] 时删。交接文件里有明文密钥，不能一直留在盘上。
@@ -896,6 +898,9 @@ pub fn collect_garbage_in(run_dir: &std::path::Path, logs_dir: &std::path::Path)
     let mut report = GcReport::default();
     let mut referenced_logs: Vec<String> = Vec::new();
     let mut unreadable = false;
+    // 有活实例的端口，与见到的心跳文件（等实例记录都看完再判断它们）
+    let mut live_ports: Vec<String> = Vec::new();
+    let mut hearts: Vec<(String, PathBuf)> = Vec::new();
 
     let restores = crate::spec::list_restore_in(run_dir);
     unreadable |= !restores.unreadable.is_empty();
@@ -922,15 +927,27 @@ pub fn collect_garbage_in(run_dir: &std::path::Path, logs_dir: &std::path::Path)
                         )
                     };
                     if alive {
+                        live_ports.push(port_of(&info.listen_addr).to_string());
                         referenced_logs.push(info.log_path);
                     } else if std::fs::remove_file(&path).is_ok() {
                         report.removed.push(path);
                     }
                 }
             }
+        } else if let Some(port) = name.strip_suffix(".heart") {
+            hearts.push((port.to_string(), path));
         } else if let Some(writer) = leftover_writer_pid(&name)
             && older_than(&path, GC_MIN_AGE_SECS)
             && crate::process::process_exited(writer) != Some(false)
+            && std::fs::remove_file(&path).is_ok()
+        {
+            report.removed.push(path);
+        }
+    }
+
+    for (port, path) in hearts {
+        if !live_ports.contains(&port)
+            && older_than(&path, GC_MIN_AGE_SECS)
             && std::fs::remove_file(&path).is_ok()
         {
             report.removed.push(path);
@@ -2198,6 +2215,11 @@ mod tests {
         let fresh_spec = run.join(format!("1700000000000000001-{dead_writer}.spec.json"));
         let own_spec = run.join(format!("1700000000000000002-{me}.spec.json"));
         let stale_tmp = run.join(format!("59811.pid.tmp-{dead_writer}-1700000000000000003"));
+        // 心跳文件：端口上没有活实例且够旧才删
+        let dead_heart = run.join("59812.heart");
+        let live_heart = run.join("59811.heart");
+        touch(&dead_heart, old);
+        touch(&live_heart, old);
         touch(&stale_spec, old);
         touch(&fresh_spec, 0);
         touch(&own_spec, old);
@@ -2237,6 +2259,8 @@ mod tests {
         );
         assert!(fresh_spec.exists(), "不够旧的不删");
         assert!(own_spec.exists(), "写者还在的不删");
+        assert!(!dead_heart.exists(), "没有活实例的端口留下的旧心跳文件应删");
+        assert!(live_heart.exists(), "活实例的心跳文件不删");
         assert!(crate::spec::restore_path_in(&run, "59813").exists());
 
         std::fs::remove_file(&unreadable).unwrap();

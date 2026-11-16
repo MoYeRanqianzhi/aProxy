@@ -535,8 +535,8 @@ impl WatchdogState {
         let w = self.watched.swap_remove(idx);
         crate::process::close_handle(w.handle);
         // 看护关系终止即清理心跳残留：优雅退出路径守护会自清，崩溃/强杀路径
-        // 靠这里兜底（Windows 节对象由内核回收，这里是 no-op；unix 的
-        // /dev/shm 文件无人自愈）。删到同端口刚起来的新实例也只丢一拍，它的
+        // 靠这里兜底（Windows 节对象由内核回收，这里是 no-op；unix 上是 run 目录里
+        // 的心跳文件）。删到同端口刚起来的新实例也只丢一拍，它的
         // 下一拍会重建文件。控制 socket 不在这里删：此刻端口上可能已有新实例，
         // 删掉就是抢走它的控制通道；残留 socket 由下一个实例 bind 前探测清理
         remove_heartbeat_file(&self.cfg.run_dir, port);
@@ -1137,13 +1137,15 @@ fn sweep_local_states(home: &Path) {
 }
 
 // ---------------------------------------------------------------------------
-// 共享内存心跳：守护每周期写毫秒时间戳，看护者扫描判定挂死
+// 心跳：实例每周期写毫秒时间戳，看护者扫描判定挂死
 // ---------------------------------------------------------------------------
 //
 // 设计要点：
-// - 节名 `aproxy-<home_id>-heart-<端口>`（与控制管道同一套命名空间规则：一个 run
-//   目录内端口唯一区分实例，home_id 把不同 home 隔开，见 aproxy_ipc::endpoint::home_id）。
-// - 8 字节 = 毫秒级 Unix 时间戳（Windows FILETIME 换算），原子 u64 读写。
+// - Windows 上是共享内存节 `aproxy-<home_id>-heart-<端口>`（与控制管道同一套命名空间
+//   规则：一个 run 目录内端口唯一区分实例，home_id 把不同 home 隔开，见
+//   aproxy_ipc::endpoint::home_id）；unix 上是文件 `<run 目录>/<端口>.heart`——在 home 里，
+//   不在 /dev/shm：macOS 没有 /dev/shm，容器里它往往很小，而且 home 是唯一的根。
+// - 开头 8 字节 = 小端的毫秒级 Unix 时间戳。
 // - **守护侧由独立 ticker 任务每 10s 写一次，不经请求热路径**：挂死的定义是
 //   「tokio runtime 无法调度」，ticker 停摆与 runtime 死锁等价；零热路径成本
 //   是它优于请求内 store 的地方（计划偏差：热路径 store 改 ticker，W7 记录）。
@@ -1153,11 +1155,17 @@ fn sweep_local_states(home: &Path) {
 /// 保证任何一次扫描都能读到新鲜值。
 pub const HEARTBEAT_WRITE_INTERVAL_SECS: u64 = 10;
 
-/// 共享内存节的命名（与控制端点同一套命名空间规则）。0.1.0 用的是不带
-/// home_id 的 `aproxy-heart-<端口>`：升级窗口里 0.1.0 的看护者读不到新实例的
-/// 心跳，按它自己的规则退化为纯进程死亡检测，不会误判挂死。
-pub fn heartbeat_section_name(run_dir: &Path, port: &str) -> String {
-    aproxy_ipc::endpoint::heartbeat(run_dir, port)
+/// 心跳的存放处：Windows 上是共享内存节的名字（与控制端点同一套命名空间规则），unix 上
+/// 是 run 目录里的文件路径 `<端口>.heart`。
+pub fn heartbeat_location(run_dir: &Path, port: &str) -> String {
+    #[cfg(windows)]
+    {
+        aproxy_ipc::endpoint::heartbeat(run_dir, port)
+    }
+    #[cfg(unix)]
+    {
+        run_dir.join(format!("{port}.heart")).display().to_string()
+    }
 }
 
 /// 守护侧心跳句柄：持有映射视图，Drop 时 UnmapViewOfFile（句柄随进程退出
@@ -1169,11 +1177,11 @@ pub struct HeartbeatWriter {
     mapping: isize,
     #[cfg(windows)]
     view: *mut std::ffi::c_void,
-    /// unix 实现按路径写 /dev/shm 文件，beat() 需要知道写入目标
+    /// unix 实现按路径写心跳文件，beat() 需要知道写入目标
     #[cfg(unix)]
     path: String,
     #[cfg(unix)]
-    _shm_fd: std::fs::File,
+    _file: std::fs::File,
 }
 
 // 视图指针跨线程使用（写操作是原子 store）；Windows 句柄本身线程无关
@@ -1186,7 +1194,7 @@ impl HeartbeatWriter {
     /// 创建/打开本实例的心跳节并写入初始时间戳。实例 bind 成功后调用；
     /// 失败只降级（看护者对该实例退化为纯进程死亡检测），绝不能阻断启动。
     pub fn create(run_dir: &Path, port: &str) -> Option<Self> {
-        imp_heart::create_heartbeat(&heartbeat_section_name(run_dir, port))
+        imp_heart::create_heartbeat(&heartbeat_location(run_dir, port))
     }
 
     /// 写入当前毫秒时间戳（原子 store，无锁）
@@ -1205,14 +1213,13 @@ impl Drop for HeartbeatWriter {
 /// （心跳节创建失败）→ None，看护者按「无心跳数据」处理（只做
 /// 进程死亡检测，不做挂死判定）。
 pub fn read_heartbeat(run_dir: &Path, port: &str) -> Option<u64> {
-    imp_heart::heartbeat_load(&heartbeat_section_name(run_dir, port))
+    imp_heart::heartbeat_load(&heartbeat_location(run_dir, port))
 }
 
 /// 清理实例的心跳文件（守护优雅退出/看护摘除时调用）。
-/// Windows 节对象由内核回收（no-op）；unix 删除 /dev/shm 下的文件，
-/// 消除崩溃/强杀后的 tmpfs 残留（实测一轮测试曾留 13 个）。
+/// Windows 节对象由内核回收（no-op）；unix 删除 run 目录里的心跳文件。
 pub fn remove_heartbeat_file(run_dir: &Path, port: &str) {
-    imp_heart::remove_heartbeat_file(&heartbeat_section_name(run_dir, port))
+    imp_heart::remove_heartbeat_file(&heartbeat_location(run_dir, port))
 }
 
 /// 当前 Unix 毫秒（系统时钟早于 epoch 回退 0——仅用于新鲜度比较，
@@ -1309,18 +1316,23 @@ mod imp_heart {
 
 #[cfg(unix)]
 mod imp_heart {
-    pub fn create_heartbeat(name: &str) -> Option<super::HeartbeatWriter> {
-        // posix shm：/dev/shm/<节名>；写透文件实现同一语义
-        let path = format!("/dev/shm/{name}");
+    /// `path` 是心跳文件的完整路径（见 [`super::heartbeat_location`]）。
+    pub fn create_heartbeat(path: &str) -> Option<super::HeartbeatWriter> {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&path)
+            .open(path)
             .ok()?;
         use std::io::Write;
         f.write_all(&super::now_millis().to_le_bytes()).ok()?;
-        Some(super::HeartbeatWriter { path, _shm_fd: f })
+        Some(super::HeartbeatWriter {
+            path: path.to_string(),
+            _file: f,
+        })
     }
 
     pub fn heartbeat_store(writer: &super::HeartbeatWriter, millis: u64) {
@@ -1338,8 +1350,7 @@ mod imp_heart {
         }
     }
 
-    pub fn heartbeat_load(name: &str) -> Option<u64> {
-        let path = format!("/dev/shm/{name}");
+    pub fn heartbeat_load(path: &str) -> Option<u64> {
         let data = std::fs::read(path).ok()?;
         if data.len() < 8 {
             return None;
@@ -1351,13 +1362,10 @@ mod imp_heart {
 
     pub fn unmap_heartbeat(_writer: &super::HeartbeatWriter) {}
 
-    /// 删除心跳文件。Windows 的节对象随进程退出由内核回收，unix 是 /dev/shm
-    /// 下的真实文件（tmpfs 内存计费），守护优雅退出/看护摘除时清掉，崩溃残留
-    /// 由下次同端口 create 的 truncate 覆盖 + 人工/治理路径兜底
-    pub fn remove_heartbeat_file(name: &str) {
-        let path = format!("/dev/shm/{name}");
-        // 写侧仍持有打开句柄时 unlink 合法（句柄继续可写直至关闭），
-        // 残留仅出现在「创建后未到优雅退出就崩溃」的场景
+    /// 删除心跳文件。实例正常退出、看护者摘除看护时清掉；崩溃残留由下次同端口启动的
+    /// truncate 覆盖，或由清理（daemon::collect_garbage_in）收走
+    pub fn remove_heartbeat_file(path: &str) {
+        // 写侧仍持有打开句柄时 unlink 合法（句柄继续可写直至关闭）
         let _ = std::fs::remove_file(path);
     }
 }
@@ -1661,14 +1669,17 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_section_name_carries_home_and_port() {
-        // 节名含端口（一个 home 内唯一区分实例）与 home 标识（不同 home 同端口
-        // 的实例互不相干，同控制端点的命名空间规则）
+    fn heartbeat_location_carries_home_and_port() {
+        // 存放处含端口（一个 home 内唯一区分实例），并且随 home 不同而不同（不同 home
+        // 同端口的实例互不相干，同控制端点的命名空间规则）
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
-        let n = heartbeat_section_name(a.path(), "12345");
+        let n = heartbeat_location(a.path(), "12345");
         assert!(n.contains("12345") && n.contains("heart"), "{n}");
-        assert_ne!(n, heartbeat_section_name(b.path(), "12345"));
+        assert_ne!(n, heartbeat_location(b.path(), "12345"));
+        // unix 上心跳是 run 目录里的文件，不落在 home 之外
+        #[cfg(unix)]
+        assert_eq!(std::path::Path::new(&n), a.path().join("12345.heart"));
     }
 
     #[test]

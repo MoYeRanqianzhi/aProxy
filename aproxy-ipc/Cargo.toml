@@ -3,7 +3,7 @@ name = "aproxy-ipc"
 # 与 aproxy 主线同号发版（发布顺序本包在 aproxy 之前）：发布前由
 # .github/scripts/align-version.py 一起对齐。aproxy 对它的版本要求用 `=` 精确钉住——
 # 预发布版之间的接口不守 semver。
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.2"
 edition = "2024"
 # let 链（if let … && …）要 1.88
 rust-version = "1.88"

@@ -33,7 +33,7 @@ directory, and `install --force` ends with 10.
 | `<home>/config.toml` | the default instance config |
 | `<home>/configs/` | the conventional place for further instance configs (`find` and `doctor` scan it) |
 | `<home>/settings.json` | aliases, the default config, the `defaults` global defaults, watchdog and install settings (settings-json.md) |
-| `<home>/run/` | instance registry `<port>.pid`, restore records `<port>.restore`; `APROXY_RUN_DIR` relocates this directory alone |
+| `<home>/run/` | instance registry `<port>.pid`, desired-state records `<port>.restore.json`, the watchdog claim `watchdog.claim`; while an instance starts, a short-lived `<nanoseconds>-<pid>.spec.json` launch-spec handoff file. `APROXY_HOME` is the only root; the run directory cannot be relocated separately |
 | `<home>/logs/` | instance logs (random file names) and `startup.log` |
 | `<home>/bin/` | the binary managed by `aproxy install`; on Windows also `aproxy.bat` (see install / upgrade). Files named `aproxy.old-…` and `aproxy.tmp-…` are left by binary swaps; installs delete the ones they can |
 | `<home>/install/` | `aproxy install`'s own files: the progress record `state.json` while an install runs, downloads and staged binaries in `staging/<version>/`, the install script's downloads in `bootstrap/`, force install's download in `force/`, on Linux and macOS the install announcement `announce`, and `lock`, held while `bin/` changes |
@@ -105,7 +105,7 @@ check above can end a command with exit 3 before it runs (except the tolerated c
 
 | Command | Exit 0 | Exit 1 |
 |---|---|---|
-| start, bare `aproxy` | started; already running on that port; listen port 0 (not waited for) | the config cannot be resolved, validated or bound, or the instance is not ready in 8 s |
+| start, bare `aproxy` | started; already running on that port; a port-0 listener was started and the OS-assigned port reported | the config cannot be resolved, validated or bound, or the instance is not ready in 30 s |
 | status, find | always | never |
 | stop | every target confirmed stopped; nothing running for no target, `all` or `idle` | a stop not confirmed or `--force` failed; several instances and no target; unknown alias or port; target not running; target hung and no `--force` |
 | restart | every target restarted; nothing running for no target, `all` or `idle` | any target failed; target cannot be resolved |
@@ -127,14 +127,20 @@ killing `aproxy` by image name takes everything down at once. Tell them apart by
 
 | Command line contains | Process |
 |---|---|
-| `--daemon-child` | a background instance; `aproxy status` maps its pid to a port |
-| `--daemon-watchdog` | the watchdog that restarts crashed or hung instances (behaviors.md, "Crash recovery and the watchdog") |
+| `__serve` | a background instance, started as `aproxy __serve --home <dir> --spec <file>`; `aproxy status` maps its pid to a port |
+| `__watchdog` | the watchdog that restarts crashed or hung instances, started as `aproxy __watchdog --home <dir>` (behaviors.md, "Crash recovery and the watchdog") |
 | `install --continue` | a background step of an install that is finishing or resuming |
 | `install --force` | a force install in progress; it stops every other aproxy process of its home |
 | `desktop` | the desktop window; it holds no port and closes with its window |
 
-`--daemon-child`, `--daemon-watchdog` and `install --continue` are internal; never pass them
-yourself.
+How an instance starts is written to a launch-spec file under `<home>/run/`, not to its command
+line, so `--api-key` and other overrides never appear in the instance's process list entry. The
+handoff file is deleted once the instance is ready or has failed; the instance's own copy lives in
+its desired-state record (owner-only permissions, like the handoff).
+
+`__serve`, `__watchdog` and `install --continue` are internal; never pass them yourself. Another
+aProxy version may start this one through `__serve`, so the names and their two arguments are
+fixed across versions.
 
 ## Global options
 
@@ -152,11 +158,18 @@ yourself.
 - Only `--config` and `--log-file` may follow a subcommand. Write
   `aproxy --listen 127.0.0.1:12346 start work`; `aproxy start work --listen …` is rejected.
 - The override options matter only when starting. They are not written to config.toml, but they
-  become part of the instance's recorded start arguments, so `restart`, `restore`, the watchdog
-  and `install` reuse them. `config --show` does not show them; `status` shows the effective
-  listen address and upstream.
-- `--api-key` on a command line is visible to other local processes and is stored in plain text
-  in the restore record; put long-lived keys in config.toml.
+  become part of the instance's launch spec (in its desired-state record), so `restart`, `restore`,
+  the watchdog and `install` reuse them. `config --show` does not show them; `status` shows the
+  effective listen address and upstream.
+- `--api-key` does not appear on the instance's or the watchdog's command line: it travels in the launch-spec file and
+  the desired-state record, both readable only by the current user. It is still in the shell history
+  and briefly on the `aproxy start` command line, and it is stored in plain text in the record, so a
+  backup or a copied home contains it; prefer config.toml for long-lived keys.
+- The proxy environment (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and their lowercase
+  forms on Unix) and `PATH` of the shell that runs `start` are captured in the launch spec.
+  `restart`, `restore` and watchdog respawns therefore reach the network the same way and find the
+  same format programs, even when they run from another shell. Change the environment by stopping
+  and starting the instance again.
 - `--config` expands `~` and turns a relative path into an absolute one against the current
   directory; the instance records that absolute path. `--log-file` expands `~` and resolves a
   relative path against `<home>`, like `log_file`.
@@ -184,27 +197,38 @@ What `start` checks, in order:
    1, printing `配置错误: …` ("config error") followed by one `file:line:col: key: message [code]`
    line per problem; the codes are listed in config-toml.md, "Checks at start". A fresh install has no `base_url`, so
    run `aproxy config --baseurl URL [--api-key KEY]` before the first start. Field rules:
-   config-toml.md.
+   config-toml.md. When neither `--config` nor a target is given and `<home>/config.toml` does not
+   exist, the instance starts with no config file: the override flags and settings.json
+   `defaults` supply everything, and `base_url` must come from one of them. Such an instance can
+   still be restarted and restored.
 2. **Same port.** If an aProxy instance already answers on the port with the same listen address,
    `start` prints `此端口已有 aProxy 在运行，无需重复启动：` ("already running on this port") and
    exits 0, so repeating `start` is safe. With a different listen address it refuses
    (`…两者不能并存。`, "the two cannot coexist"): instances are identified by port alone.
 3. **Bind.** A trial bind distinguishes a port taken by another program from one the system
    reserves; the messages and fixes are in troubleshooting.md.
-4. **Launch.** The instance is spawned detached, so it outlives the terminal, and `start` waits up
-   to 8 s for it to answer over IPC. Success prints pid, listen address, upstream, config and
-   `日志: <path>` ("log"). Otherwise it prints `后台进程未在预期时间内就绪（pid <pid>）` ("background
-   process not ready in time") and the reason is usually in `<home>/logs/startup.log`.
+4. **Launch.** The instance is started from a launch spec and detaches from the launching terminal
+   (on Unix it gets its own session, so Ctrl+C in that terminal does not reach it; on Windows it
+   tries to leave the launcher's job object, and startup.log warns when it cannot). `start` waits
+   up to 30 s for it to answer over IPC; an early exit is reported at once. Success prints pid,
+   listen address, upstream, config and `日志: <path>` ("log"). A timeout prints
+   `新实例（pid <pid>）未在预期时间内就绪（进程存活）` ("new instance not ready in time"; the parenthesis
+   says `进程状态不可判` when liveness cannot be determined) and the reason is usually in
+   `<home>/logs/startup.log`.
 
-- A listen port of `0` lets the OS choose; `start` does not wait and tells you to read the actual
-  address from `aproxy status`.
+- A listen port of `0` lets the OS choose. `start` waits for the instance and reports the actual
+  address; that port is pinned in the instance's desired-state record, so `restart`, `restore` and
+  a watchdog respawn return to it while the config still says `0`. Once the config names a fixed
+  port, the config wins and the pinned port is discarded.
 - A non-loopback listen address prints `警告: 监听地址 <addr> 不是回环地址…` ("not a loopback
   address") but does not block the start.
 - After a successful background start, aProxy makes sure a watchdog is running when
   `watchdog.enabled` is true in settings.json (the default).
 - `--foreground` keeps the instance in the console: logs print there and Ctrl+C stops it. It is
-  still registered, so `status` and `stop` work. If the console closes without Ctrl+C, its restore
-  record remains and `aproxy restore` brings it back as a background instance.
+  still registered, so `status` and `stop` work, but it has no desired-state record: closing the
+  console ends it for good, `aproxy restore` does not bring it back, and `aproxy restart` refuses
+  it with `…没有可用来重新拉起它的记录（前台运行的实例要在它自己的终端里重启）`. Start it again
+  to bring it back.
 
 ## status
 
@@ -212,9 +236,12 @@ What `start` checks, in order:
 aproxy status [--idle | --busy]
 ```
 
-Lists instances in the registry that answer over IPC. A record that does not answer is deleted
-when its process is gone (or its pid now belongs to another process); when the process is still
-there, the record is kept and listed first, whatever the filter:
+Lists instances in the registry that answer over IPC. A record that does not answer is shown when
+its process is still there; if the process is gone (or the pid now belongs to another process), the
+record is ignored. `status` deletes nothing: stale records, leftover launch-spec files and
+old unreferenced logs are cleaned in the background by an instance after it starts serving and by
+the watchdog (behaviors.md, Logs). A hung process's record is kept and listed first, whatever the
+filter:
 `无响应的 aProxy 实例 (<n>)——进程仍在，但不应答控制通道:` ("unresponsive instances: the process is
 still there but does not answer the control channel"), with port, pid, version, config and the hint
 `aproxy stop <port> --force`. Such an instance is almost always hung; with the watchdog on, its
@@ -251,12 +278,18 @@ asking.
   `有 <n> 个实例在运行，必须指定端口号、别名或 all：` ("n instances running; give a port, alias or
   all"), followed by one `aproxy stop <port>` line per instance.
 - **Graceful stop (default):** the instance stops accepting work, gives in-flight requests up to
-  10 s and then drops them, removes its registry and restore records, and exits. `stop` confirms
-  within 12 s: `已停止 pid <pid>（端口 <port>）` ("stopped"). If it prints
+  10 s and then drops them, removes its registry entry and its desired-state record, and exits.
+  `stop` confirms within 12 s: `已停止 pid <pid>（端口 <port>）` ("stopped"). If it prints
   `pid <pid> 已收到停止请求但尚未退出，可用 aproxy status 稍后确认，或 aproxy stop <port> --force 强制结束`
   ("received the stop request but has not exited; check status later or force it"), check
   `aproxy status` again shortly; if it is still listed, use `--force`. `stop` exits 1 whenever a
   target was not confirmed stopped, so scripts can rely on the exit code.
+- **A target that already crashed** still has its desired-state record, which `restore` and the
+  watchdog would use to bring it back. `stop` on that target (port, alias or config path) deletes
+  the record and prints
+  `端口 <port> 的实例已不在运行；已删除它的期望状态记录，restore 与看护者不会再拉起它。` ("the
+  instance is not running; its desired-state record was deleted, so restore and the watchdog will
+  not bring it back"). By alias or path the message starts `配置 <path> 的实例已不在运行；…`.
 - **A hung instance** (process alive, control channel silent) cannot be stopped gracefully.
   Naming it by port or alias prints
   `端口 <port> 的实例（pid <pid>）进程仍在，但不应答控制通道，无法优雅停止；用 --force 强制结束`
@@ -264,17 +297,21 @@ asking.
   without `--force` stops the answering instances and says how many hung ones it left out.
 - **`--force`:** terminates the process immediately, without the 10 s grace, after verifying by
   pid plus process start time that the pid still belongs to that instance (a reused pid is
-  refused). It then deletes the restore record so neither the watchdog nor `restore` revives the
-  instance. It finds hung instances through their registry record, so it works when IPC does not;
-  `stop all --force` includes them.
+  refused). It deletes the desired-state record before terminating, so the watchdog does not race
+  it and neither the watchdog nor `restore` revives the instance. It finds hung instances through
+  their registry record, so it works when IPC does not; `stop all --force` includes them.
 - **`stop all`** stops every registered instance, including any your own session or the user's
-  other sessions depend on. Use it only when the user asked for exactly that.
+  other sessions depend on. Use it only when the user asked for exactly that. It also deletes the
+  desired-state records of instances that are already gone
+  (`已删除不在运行的实例留下的期望状态记录（端口 …）。`) and leaves records it cannot read in
+  place, saying which and why.
 - **`stop idle [SECS]`** stops instances idle for at least SECS (default
   `instances.idle_threshold_secs`). A small SECS can include instances in active use. Prints `没有闲置超过 <n> 秒的实例。` ("no
   instance idle longer than n s") when none qualify.
 - An alias whose config is not running: `别名 <name>（配置 <path>）当前未在运行。`; a port with no
-  instance: `端口 <port> 上没有运行中的 aProxy 实例。`; both exit 1.
-- Do not stop instances by killing processes. Killing a pid leaves the restore record, so the
+  instance: `端口 <port> 上没有运行中的 aProxy 实例。`; both exit 1 when there is no record to
+  delete either.
+- Do not stop instances by killing processes. Killing a pid leaves the desired-state record, so the
   watchdog (on by default) starts the instance again; killing by name (`taskkill /IM aproxy.exe`,
   `pkill aproxy`) takes down every instance and the watchdog.
 
@@ -285,35 +322,44 @@ aproxy restart [PORT|ALIAS|PATH|default|all] [--force]
 aproxy restart idle [SECS] [--force]
 ```
 
-Restarts running instances with their original start arguments, which is how config.toml edits
-take effect. Targets, the multi-instance rule and `--force` work as for [stop](#stop), and the
-same caution applies: restarting the instance your own client uses drops its in-flight requests,
-and if the new instance fails to start you lose your connection to the model.
+Restarts running instances from their launch specs, which is how config.toml edits take effect.
+Targets are resolved the same way as for [stop](#stop), but `restart` never starts a non-running
+target and never deletes a desired-state record. The same caution applies: restarting the instance
+your own client uses drops its in-flight requests, and if the new instance fails to start you lose
+your connection to the model.
 
 - **Only running instances.** A target that is not running exits 1; use `start` for that.
-- **Checks before stopping.** `restart` first dry-runs what the new instance will do: parse the
-  original arguments with this CLI, load and validate the config with settings.json defaults
-  applied, and, if the listen address changed, check that the new address is free. On failure
-  it prints `端口 <port> 未重启：预检未通过，旧实例保持运行。` ("not restarted: pre-check failed,
-  old instance still running") and the reason; the old instance keeps serving.
-- **Launch and confirm.** It stops the old instance, starts the new one and waits up to 8 s,
-  locating it by its new pid, so a port changed in config.toml is handled. Success prints
-  `已重启（端口 <port>）` with the new and old pid.
-- **Failure after the stop.** `端口 <port> 重启失败（旧实例已停止，该端口服务已中断）：…` ("restart
-  failed: old instance stopped, service on this port is down") includes the new lines from
-  `startup.log` and a recovery command, `aproxy start --config "<path>"`. That command does not
-  repeat one-off options such as `--listen` or `--api-key`; add them if the instance had any.
-- `端口 <port> 停止未确认，重启中止…` ("stop not confirmed, restart aborted"): the old instance may
-  still be running; nothing new was started.
+- **Checks before stopping.** `restart` first dry-runs what the new instance will do: load and
+  validate the config with settings.json defaults applied, and, if the listen address changed,
+  check that the new address is free. On failure it prints
+  `端口 <port> 未重启：预检未通过，旧实例保持运行。` ("not restarted: pre-check failed, old instance
+  still running") and the reason; the old instance keeps serving.
+- **Launch and confirm.** It stops the old instance, starts the new one from the same launch spec
+  and waits up to 30 s, locating it by its new pid, so a port changed in config.toml is handled.
+  Success prints `已重启（端口 <port>）` with the new and old pid.
+- **The desired-state record survives the whole restart.** It is never deleted between the stop and
+  the new start, so if the new instance fails, the port is down but the record is still there:
+  `端口 <port> 重启失败（旧实例已停止，该端口服务已中断）：…` ("restart failed: old instance
+  stopped, service on this port is down") includes the new lines from `startup.log` and says
+  `修正上述问题后执行 aproxy restore 恢复服务（看护者开着的话也会自动重试）。` Fix the cause,
+  then run `aproxy restore`; with the watchdog enabled it also retries by itself. There is no
+  `aproxy start --config …` recovery command, and one-off options do not need to be repeated.
+- `端口 <port> 停止未确认，重启中止（未启动新实例，以免与旧实例争抢端口）。` ("stop not
+  confirmed, restart aborted"): the old instance may still be running; nothing new was started.
 - With several targets (`all`, `idle`) a failing instance is skipped, the rest are restarted, and a
   summary follows; the exit code is 1 if any failed.
 - The new instance runs the binary you invoked `aproxy` from, so `restart` also moves an instance
-  to that binary's version. A `--foreground` instance comes back in the background.
-- Arguments come from the instance's restore record. If the record is missing, `restart` falls
-  back to `--config <registered config path>` and one-off options are lost.
-- `--force` removes the old instance's restore record before terminating it, as `stop --force`
-  does, so the watchdog does not start a second copy alongside the new one. If the new instance
-  then fails, recover with the `aproxy start` command the failure message prints.
+  to that binary's version.
+- The config path (or the absence of one), the override flags, the pinned port, the launch-time
+  proxy environment and `PATH`, and the log path all come from the instance's desired-state record.
+  An instance without a record cannot be restarted this way: a `--foreground` instance, or one
+  started by 0.2.0-alpha.1/alpha.2 (their record has the old name), is refused with
+  `端口 <port> 未重启：这个实例没有可用来重新拉起它的记录（前台运行的实例要在它自己的终端里重启），旧实例保持运行。`
+  and keeps running. Stop it and start it again to give it a record.
+- `--force` terminates the old instance immediately but keeps the record, so the watchdog and
+  `restore` can still bring the instance back if the new one fails. The watchdog may respawn it
+  first; both use the same launch spec, and a new instance that finds the port already taken by the
+  same config is treated as a success.
 
 ## logs
 
@@ -342,21 +388,25 @@ instance for its log path, because log files get a new random name at every star
 aproxy restore
 ```
 
-Starts every instance that has a restore record but is not running: instances that crashed, were
-killed, or were running when the machine lost power or rebooted. A graceful `stop` deletes the
-record, so stopped instances are not revived. Each instance gets its original arguments and the
-same 8 s readiness check.
+Starts every instance that has a desired-state record but is not running: instances that crashed,
+were killed, or were running when the machine lost power or rebooted. A graceful `stop`, a
+`stop --force`, or `stop` on an instance that had already crashed deletes the record, so stopped
+instances are not revived. Each instance is started from the launch spec in its record and gets the
+same 30 s readiness check.
 
 | Output | Meaning |
 |---|---|
 | `没有需要恢复的实例。` | nothing to restore |
 | `端口 <port> 已在运行，跳过。` | already running, skipped |
-| `端口 <port> 的配置文件已不存在（<path>），跳过并清理该记录。` | config gone; record deleted |
-| `已恢复 pid <pid>（端口 <port>）` | restored; if the config now names another port, the old port's record is cleaned |
-| `端口 <port> 的实例（pid <pid>）启动后立即退出…` / `未在预期时间内就绪…` | failed; reason in `startup.log` |
+| `端口 <port> 的配置文件找不到（<path>），这次没有恢复；记录已保留，文件回来之后再执行 aproxy restore。不再需要这个实例时执行 aproxy stop <port>` | the config file is temporarily gone (an unmounted network drive, for example); the record is kept so a later `restore` works. The same applies to a watchdog respawn |
+| `已恢复 pid <pid>（端口 <port>）` | restored. If the config now names another port, the actual port is reported and the old port's record is replaced by the new one |
+| `已恢复 pid <pid>（端口 <port>；配置的端口已从 <old> 变更，原端口的记录已由新端口接替）` | restored on another port |
+| `端口 <port> 恢复失败：新实例（pid <pid>）启动后立即退出…` / `…未在预期时间内就绪…` | failed; the record is kept and `startup.log` has the reason |
+| `跳过读不懂的记录 <path>: <reason>` | the record is damaged or was written by a newer aproxy. It is left untouched; use the version that wrote it, or remove it by hand once it is obsolete |
 
-`restore` is safe to repeat, which suits a login task (Task Scheduler on Windows) for recovery
-after reboots.
+An instance started without a config file (only override flags and settings.json `defaults`) has a
+record with no config path and is restored the same way. `restore` is safe to repeat, which suits a
+login task (Task Scheduler on Windows) for recovery after reboots.
 
 ## alias
 
@@ -688,8 +738,8 @@ every running instance onto `<home>/bin/`.
 **When it fails.** `[ERROR] 安装失败: …` is followed by one of two hints:
 
 - `滚动已中止，不会自动重试…` ("rolling aborted, no automatic retry"): an instance did not start on
-  the new version. It was brought back on the old binary (if that also failed, its restore record
-  was kept for `aproxy restore`), and the remaining instances were not touched. Usually the new
+  the new version. It was brought back on the old binary (if that also failed, its desired-state
+  record was kept for `aproxy restore`), and the remaining instances were not touched. Usually the new
   version rejects the existing config: fix the reported cause and run `aproxy install` again, or
   stay on the old version with `aproxy install <old version> --allow-downgrade`. The new binary is
   already in `<home>/bin/` at this point, so the CLI and some instances run different versions
@@ -714,8 +764,8 @@ atomic rename, so there is no such gap. If no copy runs, force-install from a do
 binary, as the end of the next section describes.
 
 Do not replace the binary by hand with `stop all` followed by `restore`: a graceful stop deletes the
-restore records, so `restore` finds nothing to start. Force install keeps those records and runs
-`restore` itself.
+desired-state records, so `restore` finds nothing to start. Force install keeps those records and
+runs `restore` itself.
 
 ### Force install
 
@@ -738,8 +788,9 @@ the new version or restart instances one at a time. It:
 4. empties `<home>/install/`, discarding any unfinished normal install (its progress record
    first);
 5. replaces the binary in `<home>/bin/`;
-6. runs the new binary's `aproxy restore`, which starts the stopped instances with their original
-   arguments, and checks the ledger for an instance of the new version on each of their ports;
+6. runs the new binary's `aproxy restore`, which starts the stopped instances from their
+   desired-state records, and checks the ledger for an instance of the new version on each of their
+   ports;
 7. lists processes that run from `<home>/bin/` but are not in the ledger, without stopping them
    (not on macOS, where the paths of other processes cannot be read).
 

@@ -122,10 +122,12 @@ Highest first:
 
 1. **Run-only CLI flags** `--baseurl`, `--listen`, `--proxy`, `--api-key` and `--log-file`, given
    to `aproxy` before any subcommand, as in `aproxy --listen 127.0.0.1:12399 start work` (syntax:
-   commands.md). They are never written to a file, but they become part of the instance's recorded
-   start arguments, so `aproxy restart`, `aproxy restore` and watchdog restarts keep applying them.
+   commands.md). They are never written to a file, but they become part of the instance's launch
+   spec, so `aproxy restart`, `aproxy restore` and watchdog restarts keep applying them.
    To drop one, stop the instance and start it again without the flag. Prefer the file over
-   `--api-key`: command lines are visible to other processes on the machine.
+   `--api-key`: the flag is visible in the shell history and is stored in plain text in the
+   desired-state record (owner-only), even though it no longer appears on the instance's command
+   line.
 2. **config.toml.**
 3. **The `defaults` section of settings.json.** It can hold any key of this file except
    `listen_addr`, `log_file` and `format`, under the same name and nesting, written as JSON
@@ -184,8 +186,10 @@ machine.
   (`listen_addr has no port or the port is not valid`).
 - Every instance needs its own port. A second instance on a port that another aProxy instance
   already uses is refused, even with a different host part.
-- Port `0` lets the OS choose; read the port from `aproxy status`. Clients need a fixed address, so
-  use it only for throwaway tests.
+- Port `0` lets the OS choose. The instance reports the actual address, and that port is pinned in
+  its desired-state record: `restart`, `restore` and watchdog respawns return to the same port
+  while the config still says `0`. Once the config names a fixed port, the config wins and the
+  pinned port is discarded. Clients need a fixed address, so use `0` only for throwaway tests.
 - A non-loopback address (`0.0.0.0`, a LAN IP) lets every host that can reach the port use the
   upstream through the proxy, with any key the instance injects. `aproxy start`, the startup log and
   `aproxy doctor` warn with a message containing `不是回环地址` ("is not a loopback address"). It

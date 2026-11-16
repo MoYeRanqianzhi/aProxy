@@ -48,18 +48,27 @@ by keepalive ends with a terminal SSE error event; see Configuration.)
   the client receives a stream in the channel's protocol. Same-protocol SSE
   passes through untouched, and key rotation / same-protocol aggregation are
   unaffected.
-- **Background daemon** — `aproxy` starts detached (survives terminal close);
-  `status` / `stop` / `logs` / `restore` for full instance management.
+- **Background daemon** — `aproxy` starts detached from a launch spec (survives terminal close;
+  secrets stay in the spec file, not on the instance's command line); `status` / `stop` / `logs` /
+  `restore` for full instance management.
 - **Watchdog** — Nothing slips through. A global supervisor process
   automatically revives crashed or hung instances (on by default; measured at
   +2.4% binary size, +2.9MB resident, zero hot-path overhead). Process identity
   is verified by PID + creation time, independent of the binary's file name.
-  Not supported on macOS yet; see Platform support.
+  After `watchdog.max_restarts` failed respawns it does not give up: it retries
+  every 300 s until the instance starts or `aproxy stop` deletes its record,
+  and a respawned instance must stay up 60 s before earlier failures are
+  forgotten. It re-reads settings every scan, so disabling it stops a running
+  watchdog. Not supported on macOS yet; see Platform support.
 - **Multi-instance** — Every config.toml is its own instance, each on its own
   port, coexisting without interference.
 - **Self-healing** — After a crash, power loss, or reboot, `aproxy restore`
   brings everything back in one command. Nothing to restore? It exits
-  silently — safe for login autostart.
+  silently — safe for login autostart. An instance's desired-state record (its
+  launch spec: config file, override flags, pinned port, launch-time proxy
+  environment and PATH, log path) is deleted only by `stop`; a failed restart
+  leaves it in place, so `restore` or the watchdog can still bring the instance
+  back, and a temporarily missing config file does not delete it either.
 
 ## Getting started
 
@@ -202,16 +211,16 @@ a local binary, `--adopt` takes over an existing install).
   `--variant desktop` the install stops with an error and changes nothing.
   `install --force` behaves the same.
 - **Rollback on failure**: if an instance cannot start under the new version
-  during the rolling restart, `install` brings it back with the old binary and
-  the original arguments, stops the rollout (the other instances are left
+  during the rolling restart, `install` brings it back with the old binary from
+  the same launch spec, stops the rollout (the other instances are left
   alone) and exits non-zero; fix the cause and run `aproxy install` again.
 - **Force install**: when a normal install fails or hangs, or the installed
   version is too broken to run, use `aproxy install --force [VERSION|latest]`
   (or `--from <downloaded binary>`). It skips the hand-over: it stops every
   aproxy process of this home that belongs to the current user, through the
   process ledger, swaps in the new
-  binary, and brings the instances back with the new version's `restore` and
-  their original arguments. That cuts every request in flight through aproxy at
+  binary, and brings the instances back with the new version's `restore` from
+  their desired-state records. That cuts every request in flight through aproxy at
   once, so it asks for confirmation (add `--yes` when not interactive). If the
   installed version does not run at all, download the new version yourself and
   run `<new binary> install --force --from <new binary>`. Exit codes: 0 done;
@@ -244,7 +253,7 @@ development package (see above).
 |---|---|
 | Windows (x64 / x86 / arm64) | Full support |
 | Linux (x86_64 / aarch64, glibc and musl) | Full support; the headless gnu build requires glibc ≥ 2.28, the desktop gnu build glibc ≥ 2.34 and WebKitGTK ≥ 2.40 (glibc floors asserted at build time in the release pipeline); older glibc and musl systems use the statically linked musl build (headless only) |
-| macOS (Apple Silicon / Intel) | Pre-built binaries are published but untested on real hardware; the watchdog, `aproxy install` and process-query-based instance management rely on Linux-only interfaces (`/dev/shm`, `/proc`) and are unavailable or degraded on macOS (needs real hardware; contributions welcome) |
+| macOS (Apple Silicon / Intel) | Pre-built binaries are published but untested on real hardware; the watchdog, `aproxy install` and process-query-based instance management rely on a Linux-only interface (`/proc`) and are unavailable or degraded on macOS (needs real hardware; contributions welcome) |
 
 ## Quick start
 
@@ -356,10 +365,10 @@ timeout (for Claude Code, `API_TIMEOUT_MS`).
 | `aproxy start <alias\|path>` | Start by alias or config file path |
 | `aproxy --foreground` | Run in the foreground (logs to console, Ctrl+C to stop) |
 | `aproxy status` | List running instances (port/pid/version/upstream/config) |
-| `aproxy stop [PORT\|all\|alias]` | Stop instances; multi-instance requires a port, `all`, or an alias; `--force` kills instantly (the watchdog will not revive it) |
-| `aproxy restart [PORT\|all\|alias]` | Restart running instances (restart-only, never starts); the new config is pre-checked before the old instance is stopped, and a failed check leaves it running; `--force` kills instantly |
+| `aproxy stop [PORT\|all\|alias]` | Stop instances; multi-instance requires a port, `all`, or an alias; `--force` kills instantly (the watchdog will not revive it); a target that already crashed has its desired-state record deleted |
+| `aproxy restart [PORT\|all\|alias]` | Restart running instances (restart-only, never starts); the new config is pre-checked before the old instance is stopped, and a failed check leaves it running; a failed start keeps the record, so `restore` or the watchdog can bring it back; `--force` kills instantly |
 | `aproxy logs [PORT\|ALIAS]` | Tail an instance's live logs; `all` not supported |
-| `aproxy restore` | Revive instances that were running before a crash/reboot; exits silently if none |
+| `aproxy restore` | Revive instances from their desired-state records; a temporarily missing config file keeps the record and is reported; exits silently if none |
 | `aproxy alias add\|remove\|list` | Manage config aliases (stored in settings.json) |
 | `aproxy doctor` | Config health check: settings.json errors + alias/toml review (warnings) |
 | `aproxy find [keyword]` | Discover all configs in configured directories; `--aliased/--unaliased --port PORT` filters |
@@ -369,7 +378,8 @@ timeout (for Claude Code, `API_TIMEOUT_MS`).
 | `aproxy desktop` | Open the desktop window (a preview showing demo data; see below) |
 
 Global flags: `--config <PATH>` (multi-instance), `--listen <ADDR>`,
-`--proxy <URL>`, `--api-key <KEY>` (current launch only).
+`--proxy <URL>`, `--api-key <KEY>` (recorded in this launch's spec and reused by
+`restart`/`restore`; never written to config.toml).
 
 ## Desktop window (preview)
 
@@ -431,7 +441,7 @@ silently.
 
 ```toml
 base_url = "https://api.anthropic.com"   # upstream address
-listen_addr = "127.0.0.1:12345"          # local listener
+listen_addr = "127.0.0.1:12345"          # local listener (port 0 = OS-assigned; the first port is pinned, so restart/restore return to it)
 # api_key = "sk-..."                     # quick auth (overrides Authorization: Bearer)
 # proxy = "http://127.0.0.1:7890"        # forward via proxy (socks5 supported)
 # extra_headers / override_headers       # append/override request headers (tables, e.g. extra_headers = { "x-title" = "..." })
@@ -476,8 +486,10 @@ same request keep the same transformed key (a request is transformed once and
 the result is replayed on every retry). Add `"retry"` to the request format's
 `stages` to transform again before every retry.
 
-Runtime data lives in `~/.aproxy/`: `run/` (registry, restore records,
-watchdog claim), `logs/` (daemon logs, randomly named per start, rotated and
+Runtime data lives in `~/.aproxy/`: `run/` (registry `<port>.pid`, desired-state
+records `<port>.restore.json`, the watchdog claim, and a short-lived launch-spec
+handoff while an instance starts), `logs/` (daemon logs, randomly named per
+start, rotated and
 orphan-cleaned; paths reported via IPC — customize with `log_file`),
 `spool/<port>/` (disk-cache
 scratch space), `settings.json` (the home's program state: `aliases`,

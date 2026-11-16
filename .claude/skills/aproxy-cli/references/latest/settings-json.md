@@ -117,11 +117,11 @@ means running instances keep the old value until `aproxy restart PORT|ALIAS`.
 | `default_config` | string or `null` | `null` | next command |
 | `config_dirs` | array of paths | `[]` | next `find` / `doctor` |
 | `defaults` | object of config.toml keys | `{}` | instance start |
-| `watchdog.enabled` | boolean | `true` | see [watchdog](#watchdog) |
+| `watchdog.enabled` | boolean | `true` | next watchdog scan (a running watchdog exits) |
 | `watchdog.heartbeat_secs` | integer | `30` | watchdog start |
 | `watchdog.stale_after_cycles` | integer | `1` | watchdog start |
-| `watchdog.max_restarts` | integer | `5` | watchdog start |
-| `watchdog.idle_exit_secs` | integer | `300` | watchdog start |
+| `watchdog.max_restarts` | integer | `5` | next watchdog scan |
+| `watchdog.idle_exit_secs` | integer | `300` | next watchdog scan |
 | `logs.rotate_mb` | integer | `8` | instance start |
 | `instances.idle_threshold_secs` | integer | `1800` | next `status` / `stop` / `restart` |
 | `update.download_chain` | array or `null` | `null` (built-in chain) | next install |
@@ -332,26 +332,28 @@ above your longest single generation before using `stop idle`.
 ## watchdog
 
 `watchdog.enabled` is `true` by default and keeps one watchdog process per aProxy home. It watches
-every instance and restarts one that crashes or hangs, with that instance's original start
-arguments. `aproxy start` launches the watchdog if none is running, and every instance checks every
+every instance and restarts one that crashes or hangs, from that instance's launch spec.
+`aproxy start` launches the watchdog if none is running, and every instance checks every
 5 minutes and relaunches it if it has gone.
 
-`false` stops new launches by `aproxy start` and by instances started after the change. It does not
-stop a watchdog that is already running: that one keeps working until it exits by itself
-(`watchdog.idle_exit_secs` after the last instance is gone), and instances started while the field
-was `true` keep relaunching it until they are restarted. Behavior: behaviors.md, "Crash recovery and
-the watchdog".
+`false` stops a running watchdog at its next scan: the watchdog re-reads settings.json every scan,
+removes its claim and exits, leaving the instances and their desired-state records alone. It also
+stops new launches by `aproxy start` and by instances started after the change. Behavior:
+behaviors.md, "Crash recovery and the watchdog".
 
 ## Watchdog tuning
 
-The watchdog reads these when its process starts; a running watchdog keeps its values.
+The watchdog re-reads this section every scan. `max_restarts` and `idle_exit_secs` follow the file
+on the next scan, as does `enabled`; `heartbeat_secs` and `stale_after_cycles` are fixed when the
+watchdog process starts, because other processes judge its liveness by the period it started with.
+If settings.json is invalid, the watchdog keeps its last valid values.
 
 | Key | Default | Meaning | Choosing a value |
 |---|---|---|---|
 | `watchdog.heartbeat_secs` | `30` | Scan period for hang detection and adoption (crashes are handled the moment the process exits, not at the next scan). An instance whose heartbeat is older than `heartbeat_secs × (stale_after_cycles + 1)` (60 s with the defaults) and that does not answer an IPC ping is killed and restarted. | Lower detects hangs sooner at the cost of more wake-ups. `0` is an error (it would spin the CPU). |
 | `watchdog.stale_after_cycles` | `1` | Extra scan periods a heartbeat may lag before the ping check. | Raise it if healthy instances on a heavily loaded machine get killed. `0` behaves as `1`. |
-| `watchdog.max_restarts` | `5` | Failed restarts in a row, for one instance, before the watchdog gives up. The first restart is immediate; after a failure it waits 1 s, 2 s, 4 s ... up to 300 s. After giving up, the instance's restore record is kept, so `aproxy restore` can bring it back. | `0` = never restart, only give up and keep the record. |
-| `watchdog.idle_exit_secs` | `300` | How long the watchdog stays after the last instance is gone before exiting. | `0` = stay resident. |
+| `watchdog.max_restarts` | `5` | Failed respawns in a row, for one instance, after which the watchdog stops the fast exponential backoff and retries only every 300 s. The first restart is immediate; after a failure it waits 1 s, 2 s, 4 s ... up to 300 s. It never gives up: it keeps retrying while the desired-state record exists. A respawned instance must stay up 60 s before its earlier failures are forgotten. | `0` = never restart automatically; the record is kept for a manual `aproxy restore`. |
+| `watchdog.idle_exit_secs` | `300` | How long the watchdog stays after the last instance is gone before exiting. An instance whose respawn is still pending (including the 300 s slow retry) keeps it from exiting. | `0` = stay resident. |
 
 ## update.download_chain
 

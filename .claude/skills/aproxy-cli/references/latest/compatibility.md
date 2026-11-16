@@ -84,6 +84,20 @@ documents. If your agent loads this skill from a different directory, copy or li
 aproxy-format, the companion transformer, is released separately (tags `format-v*`) with its own
 version numbers; see the aproxy-format skill.
 
+## Upgrading from 0.2.0-alpha.1 or 0.2.0-alpha.2
+
+Those alphas wrote the desired-state record as `<home>/run/<port>.restore` (no `.json` suffix). This
+version reads only `<port>.restore.json`, so it ignores the old file and leaves it in place. Running
+alpha instances keep running, appear in `aproxy status` and can be stopped normally, but:
+
+- `aproxy restart <port>` refuses them with `端口 <port> 未重启：这个实例没有可用来重新拉起它的记录…`
+  ("no record to start it from"); the old file is not used as a fallback.
+- If such an instance crashes, neither `aproxy restore` nor the watchdog can bring it back.
+
+Run one `aproxy stop <port>` followed by `aproxy start <alias|path>` (with any one-off flags it had)
+for every instance after the upgrade; `start` writes a current record. The old `<port>.restore`
+files are then stale and can be deleted.
+
 ## Moving from 0.1.x to 0.2.0
 
 0.2.0 changed the control protocol, so the two lines cannot work on each other's instances: a 0.2.0
@@ -120,8 +134,10 @@ moment with the user first.
    Then run `aproxy --version`: the first line must read `aproxy v0.2…` (0.1.x prints
    `aproxy 0.1.0`).
 4. Delete what 0.1.x leaves behind: `<home>/run/install.state` and `<home>/staging/`, which 0.2.0
-   never reads, and any `<home>/run/*.restore`. A restore record that survived step 2 belongs to an
-   instance that had crashed, and `aproxy restore` would start it with 0.1.x's command line.
+   never reads, and any `<home>/run/*.restore`. 0.2.0 reads only `<home>/run/*.restore.json`, so the
+   old files are ignored rather than acted on; remove them so they do not mislead a later
+   inspection. A crashed 0.1.x instance's record is dead too: if that instance matters, start it
+   again with the new CLI after the upgrade.
 5. Keep `settings.json` and the config files, but rewrite both: settings.json changed shape, and a
    flat 0.1.x file is refused. Rename its keys with the table in "settings.json keys renamed in
    0.2.0", then rename the config.toml keys in the table after it. Run `aproxy doctor`.

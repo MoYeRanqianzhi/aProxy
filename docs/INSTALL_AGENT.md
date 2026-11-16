@@ -160,7 +160,8 @@ script installs 0.1.x again.
 the installed version is broken:** `aproxy install --force` skips the
 hand-over. It stops every aproxy process of this home (instances, watchdog,
 installers) through the process ledger, replaces the binary, and runs the new
-version's `restore` to bring the instances back with their original arguments.
+version's `restore` to bring the instances back from their desired-state
+records (the saved launch specs).
 It is also the route on macOS, where the rolling `aproxy install` is not
 supported yet (neither is verified on real macOS hardware).
 

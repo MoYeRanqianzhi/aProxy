@@ -22,17 +22,20 @@ Windows 的管道名全机共享，带上它，一个 home（`APROXY_HOME`）的
 home 的实例。
 
 启动顺序：bind TCP → 独占创建控制端点（失败即退出，写 startup.log）→ 写 `.pid` →
-写 `.restore` → 心跳 → 服务。由此「有 `.pid` 记录 ⇒ 端点在应答」（挂死除外）。客户端
-核对应答者自报的 pid 与连接对端进程（`GetNamedPipeServerProcessId` / `SO_PEERCRED`）：
-端点名可预测，抢先占住它的进程只能报出自己的 pid，普查再拿这个 pid 与注册记录比对。
+写期望状态记录 `<端口>.restore.json`（前台实例不写）→ 心跳 → 服务。由此「有 `.pid`
+记录 ⇒ 端点在应答」（挂死除外）。客户端核对应答者自报的 pid 与连接对端进程
+（`GetNamedPipeServerProcessId` / `SO_PEERCRED`）：端点名可预测，抢先占住它的进程只能
+报出自己的 pid，普查再拿这个 pid 与注册记录比对。
 
 线上格式（v1，一连接一来回，各一行 JSON）：请求 `{"v":1,"op":"ping|shutdown|prepare_swap"}`
-（可带 `args` 对象）；成功应答 `{"v":1,"ok":true,"result":InstanceStatus}`，所有 op 都回同一份
+（可带 `args` 对象；shutdown 的 `args.keep_restore` 为真时实例退出但不删期望状态记录）；
+成功应答 `{"v":1,"ok":true,"result":InstanceStatus}`，所有 op 都回同一份
 状态快照——`instance`（即 `.pid` 记录）、`run_dir`、`state`（`serving`/`swap_prepared`/
-`stopping`，不认识的值读作 `unknown`）、`activity`、`ops`；失败应答
-`{"v":1,"ok":false,"error":{"code","message"}}`。`v` 只在语义不兼容时递增，加 op、加字段、
-加错误码、加状态值都不递增。没有 `v` 的请求按 `bad_request` 拒绝，没有 `v` 的应答不予
-采信（0.1.0 的格式就是这样，0.2.0 起与它不再互通）。
+`stopping`，不认识的值读作 `unknown`）、`activity`、`ops`、`features`（如
+`shutdown.keep_restore`：实例支持这个参数；调用方据它决定要不要在旧实例退出后自己把记录
+写回）；失败应答 `{"v":1,"ok":false,"error":{"code","message"}}`。`v` 只在语义不兼容时递增，
+加 op、加字段、加错误码、加状态值都不递增。没有 `v` 的请求按 `bad_request` 拒绝，没有 `v`
+的应答不予采信（0.1.0 的格式就是这样，0.2.0 起与它不再互通）。
 
 上图的「重试循环 / spool / 回放」是默认模式的主流程；`delivery = "forward"` 模式下这两
 环整体旁路（见「仅转发模式（delivery = "forward"）」）。
@@ -41,22 +44,23 @@ home 的实例。
 
 | 模块 | 职责 |
 |---|---|
-| `src/main.rs` | 进程入口：C5 的 `--version`、控制台代码页、在建 tokio 运行时之前分派 `desktop`、其余子命令在手建的运行时里分派（配置文件定位、日志初始化） |
-| `src/cli.rs` | clap 命令树定义（`Cli`/`Commands`/`AliasCmd`/`ConfigArgs`），只承载定义不含逻辑；在库里，操作层按原启动参数预检重启时要解析它 |
-| `src/commands/` | 十三个子命令各自一文件（start/status/stop/restart/restore/alias/doctor/find/logs/config/settings/install/desktop）：调用操作层拿到结果，渲染成给人看的文字、决定退出码 |
+| `src/main.rs` | 进程入口：C5 的 `--version`、控制台代码页、在建 tokio 运行时之前分派 `desktop`，并把内部入口 `__serve`/`__watchdog` 的 `--home` 写进本进程的 `APROXY_HOME`；其余子命令在手建的运行时里分派（`__serve` 早于 settings 检查与续作拉起，自己初始化日志） |
+| `src/cli.rs` | clap 命令树定义（`Cli`/`Commands`/`AliasCmd`/`ConfigArgs`），只承载定义不含逻辑；含两个隐藏内部入口 `__serve --home --spec` 与 `__watchdog --home`（跨版本互相拉起，名字与参数冻结） |
+| `src/commands/` | 十三个子命令各自一文件（start/status/stop/restart/restore/alias/doctor/find/logs/config/settings/install/desktop）：调用操作层拿到结果，渲染成给人看的文字、决定退出码；`start.rs` 还承载 `__serve` 入口 |
 | `src/ops/` | 操作层：选目标（`target`）、启动（`start`）、停止（`stop`）、重启（`restart`）、恢复（`restore`）、别名（`alias`）、列举（`list`）。每个动作把带数据的结果交回调用方，自己不打印、不结束进程——命令行与桌面界面共用；`tests/lib_is_quiet.rs` 守着「库里没有 `println!` 与 `process::exit`」 |
-| `src/server.rs` | 服务承载：`serve_forever` 主循环、停止信号、日志初始化、配置错误落盘 startup.log |
+| `src/spec.rs` | 拉起规格 `InstanceSpec`（配置文件、覆盖参数、钉住的端口、启动者环境里的代理变量与 `PATH`、日志文件）与期望状态记录 `run/<端口>.restore.json`；交接文件 `run/<纳秒>-<pid>.spec.json`。两种文件都以私有权限写；读路径（status/restore/list/看护者）遇到读不懂的记录只报告不删除，`stop <端口>` 按文件名删记录、不读内容 |
+| `src/server.rs` | 服务承载：`serve_forever` 主循环、停止信号、日志初始化、期望状态记录的写与「用户要求停止」语义、配置错误落盘 startup.log |
 | `src/proxy/` | 转发核心，按职责分文件：入站来源校验（Host/Origin）、hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、尝试结局分类（`attempts::classify`）与唯一的尝试循环（`attempts::run_attempts`）、保活通道与提交点、断开保护、仅转发模式 |
 | `src/transform.rs` | 外部转换器编排：stdin/stdout 一行 JSON 信封交给外部 format 程序改写（spawn 与 persistent 统一进程池、空闲 reaper、超时/崩溃 worker 剔除）；信封契约在独立 crate `aproxy-envelope` |
 | `src/decode.rs` | 检查用解码：按 `content-encoding`（gzip/deflate/br/zstd，多层逆序）解出一份**仅供检查/预览**的副本，转发字节不受影响 |
 | `src/retry.rs` | 重试判定：状态码、错误 JSON（含流式 NDJSON/SSE 形态） |
 | `src/config/` | 代理配置：`file.rs` 严格解析 config.toml（未知键即错误、带行列诊断）、`resolve.rs` 分层解析（命令行 > toml > settings 的 `defaults` > 内置）、`edit.rs` 只改目标键的写回（`~/.aproxy/config.toml`，可多份平行并存） |
 | `src/settings/` | 内部配置（`~/.aproxy/settings.json`，整个 home 唯一）：`mod.rs` 内存结构与加载（无效文件沿用上一次有效值）、`file.rs` 严格解析（未知键/类型不对/更高 schema 都是带键路径的错误；`defaults` 段复用 config.toml 解析器）、`edit.rs` 按键路径打补丁的写回（密钥占位、读出口打码、按含密钥文件私有落盘） |
-| `src/daemon.rs` | 守护编排：IPC（ping/shutdown/观测）、实例注册表、恢复记录、孤儿清理 |
-| `src/spawn.rs` | 拉起守护并等就绪（`spawn_instance`）：start、restart、restore、安装的滚动重启、看护者重拉共用；按新 pid 认就绪，启动即死时立即返回并附上 startup.log 的新增内容 |
+| `src/daemon.rs` | 守护编排：IPC（ping/shutdown/观测，`shutdown.keep_restore` 与 `features`）、实例注册表、分离拉起（`spawn_detached_with`：Windows 作业对象脱出、unix setsid；工作目录与代理环境按规格设置）、孤儿清理 |
+| `src/spawn.rs` | 按拉起规格拉起并等就绪（`spawn_from_spec`）：start、restart、restore、安装的滚动重启、看护者重拉共用；规格经交接文件交给 `__serve`，按新 pid 认就绪，启动即死时立即返回并附上 startup.log 的新增内容；就绪时限 30 秒 |
 | `src/process.rs` | 进程原语（平台层）：创建时间、存活与退出、镜像路径、按 pid + 创建时间核验身份（`record_identity`）与核验后终止、看护者等待进程死亡用的同步句柄 |
-| `src/watchdog.rs` | 看门狗：claim 选举、共享内存心跳、收养与处决、重拉退避状态机 |
-| `src/fsx.rs` | 原子写（`write_atomic`）：注册表、恢复记录、安装状态、看护者 claim 共用；`write_atomic_private` 额外收紧权限（unix 0600、Windows 只含本用户/SYSTEM/Administrators 的 DACL），settings.json 走它 |
+| `src/watchdog.rs` | 看门狗：claim 选举、实例心跳、收养与处决、重拉退避状态机 |
+| `src/fsx.rs` | 原子写（`write_atomic`）：注册表、期望状态记录、安装状态、看护者 claim 共用；`write_atomic_private` 额外收紧权限（unix 0600、Windows 只含本用户/SYSTEM/Administrators 的 DACL），settings.json、拉起规格与期望状态记录走它 |
 | `aproxy-ipc/` | aproxy 与同它打交道的程序（桌面界面、第三方客户端）共用的契约，独立 crate，依赖很少。`code.rs`：错误码表（名字、族、`details` 的键与类型、HTTP 状态与退出码），`docs/error-codes.md` 由它生成、`tests/code_table.rs` 比对；`redact.rs`：打码的唯一出口（URL、密钥头、占位对象、已知密钥替换）；`endpoint.rs`：控制端点、心跳节、安装宣告节的名字与 `home_id`；`home.rs`：home 的解析（永久兼容契约 C1）；`ledger.rs`：进程台账 `<home>/ledger/`（永久兼容契约 C3），长期运行的进程登记 pid、启动标记与角色，强制安装据此核验后结束进程 |
 | `src/util.rs` | bin 侧共用小工具：时间戳、时长人性化、凭据打码、key=value 解析 |
 
@@ -343,21 +347,31 @@ settings.json 的 `defaults` 段收的就是 config.toml 的键（同名同嵌�
 
 - `aproxy alias add <名> [路径]`：路径省略时指向默认 config.toml；
   别名不得为 `all`/`idle`/`default`/`defult`/纯数字（保留字与端口解析冲突）
-- `aproxy start/stop <别名>`：start 把别名解析出的配置路径以 `--config` 绝对
-  路径注入守护子进程命令行（别名解析只发生在父进程）；stop 按实例注册的
+- `aproxy start/stop <别名>`：start 把别名解析出的配置文件路径与覆盖参数写进拉起规格（别名解析只发生在父进程），子进程经 `__serve --home <dir> --spec <file>` 接手；stop 按实例注册的
   config_path 归一匹配（大小写/分隔符），端口变了别名依然有效
 
 ## 守护进程模型
 
-- `aproxy`（默认）= 后台启动：父进程预检（IPC ping → TCP bind 探测）→
-  `spawn_detached` 分离子进程（Windows 手写 `CreateProcessW`，
-  `bInheritHandles=FALSE` + `CREATE_NO_WINDOW`）→ 父进程轮询 IPC ping 就绪后返回。
-- 子进程（`--daemon-child`）承载服务：清 spool 目录（bind 前，回收崩溃残留）→
-  bind → 写实例注册表（`run/<端口>.pid`，含实例上报的 log_path）→ 写恢复记录
-  （`run/<端口>.restore`，同样携带 log_path——崩溃实例的日志凭此保留）→
-  启动 IPC 管道 → 创建看门狗心跳节 + 心跳 ticker
-  （10s）→ 守护侧互保任务（5 分钟自检）→ serve。
-- 停止：IPC `shutdown` → 优雅关闭（10s 宽限强退）→ 清注册表与恢复记录。
+- `aproxy`（默认）= 后台启动：父进程预检（IPC ping → TCP bind 探测）→ 把这次启动写成拉起规格
+  `InstanceSpec`（配置文件或 null、覆盖参数、启动者环境里的代理变量与 `PATH`、日志文件；端口为 0
+  时首次启动后钉住实际端口）→ 经交接文件 `run/<纳秒>-<pid>.spec.json` 交给子进程
+  `aproxy __serve --home <dir> --spec <file>`（`spawn_detached_with`，Windows 手写
+  `CreateProcessW`，`bInheritHandles=FALSE` + `CREATE_NO_WINDOW` + `CREATE_BREAKAWAY_FROM_JOB`，
+  unix `setsid`）→ 父进程按新 pid 轮询 IPC 就绪（≤30 秒）后返回，并删掉交接文件。密钥只在交接
+  文件与期望状态记录里（都只本用户可读），不进实例与看护者的命令行（`aproxy start` 自己的
+  短暂命令行上仍有用户给的覆盖参数）。
+- 子进程承载服务：读交接文件里的规格 → 宽松解析定出日志路径并初始化日志 → 严格校验配置（失败写
+  startup.log 并退出）→ 清 spool 目录（bind 前，回收崩溃残留）→ bind → 写实例注册表
+  （`run/<端口>.pid`，含实例上报的 log_path）→ 写期望状态记录（`run/<端口>.restore.json`，内嵌
+  规格）→ 启动 IPC 管道 → 创建看门狗心跳节 + 心跳 ticker（10s）→ 守护侧互保任务（5 分钟自检）
+  → serve。前台实例（`--foreground`）走同一服务主循环，但不写期望状态记录、日志写控制台。
+- 停止：IPC `shutdown` → 优雅关闭（10s 宽限强退）→ 清注册表与期望状态记录。带
+  `keep_restore` 的 shutdown（`restart` 与安装滚动重启使用）只清注册表，记录留着；不认这个
+  参数的旧实例会照常删记录，调用方等它退出后再把记录写回（见 `features`）。
+- 实例脱离启动者：unix 上 `setsid`，终端的 Ctrl+C 到不了它；Windows 上先带
+  `CREATE_BREAKAWAY_FROM_JOB` 拉起，作业对象不允许脱出时去掉该标志重试并往 startup.log 写一条
+  告警（它仍在作业里，作业结束会连带结束它）。工作目录固定为 home，环境是拉起方环境套上规格里
+  记下的代理变量与 `PATH`。
 
 ### 端口冲突的两种情况
 
@@ -372,9 +386,9 @@ settings.json 的 `defaults` 段收的就是 config.toml 的键（同名同嵌�
 
 ## 看门狗（watchdog）
 
-全局单看护进程（没有公开子命令，同二进制以 `--daemon-watchdog` 隐藏标记分离
-启动），把「进程级死亡/挂死 → 永久断流直到人工发现」降级为「秒级检出 → 退避
-重拉」。实测 +2.4% 体积、+2.9MB 常驻、热路径零损耗（[benchmark-watchdog.md](benchmark-watchdog.md)）。
+全局单看护进程（没有公开子命令，同二进制以内部入口 `aproxy __watchdog --home <dir>` 分离
+启动），把「进程级死亡/挂死 → 永久断流直到人工发现」降级为「秒级检出 → 退避重拉」。实测
++2.4% 体积、+2.9MB 常驻、热路径零损耗（[benchmark-watchdog.md](benchmark-watchdog.md)）。
 
 - **进程身份**：一律按「pid + 进程创建时间」核验，与二进制文件名无关（改名
   部署的实例同样受看护）。实例在注册表登记 `process_start`（Windows FILETIME /
@@ -384,21 +398,28 @@ settings.json 的 `defaults` 段收的就是 config.toml 的键（同名同嵌�
 - **死亡检测**：收养时 `OpenProcess(SYNCHRONIZE|TERMINATE)` 取进程句柄，
   `spawn_blocking` 内核阻塞等待——死亡信号即时、零轮询线程。死亡事件到达即
   唤醒主循环处理，崩溃实例在其启动耗时内回来，不等扫描周期。主动强停的一方
-  （`stop --force` / `restart --force`）因此必须在终止**之前**摘掉 `.restore`
+  （`stop --force`）因此必须在终止**之前**摘掉期望状态记录
   （终止失败再放回），否则看护者会先于它的收尾读到「记录在 = 崩溃」，把刚
-  强停的实例拉回来。
-- **挂死检测**：实例侧独立 ticker 每 10s 向命名共享内存节
-  （Windows 为 `Local\aproxy-<home_id>-heart-<端口>`，unix 为 `/dev/shm/aproxy-<home_id>-heart-<端口>`
-  文件，`home_id` 同控制管道；8 字节原子 u64 毫秒时间戳）写心跳——挂死 =
-  runtime 无法调度 = ticker 停摆，与请求热路径零耦合。看护侧扫描过期 +
+  强停的实例拉回来；`restart --force` 则保留记录，两边用同一份规格，看护者抢先拉起也算收敛。
+- **挂死检测**：实例侧独立 ticker 每 10s 写心跳（8 字节毫秒时间戳）：Windows 写命名共享
+  内存节 `Local\aproxy-<home_id>-heart-<端口>`（`home_id` 同控制管道），unix 写 run 目录里的
+  文件 `run/<端口>.heart`（在 home 里，不用 `/dev/shm`；写入交给阻塞线程池，文件系统卡住
+  不占运行时的工作线程）——挂死 = runtime 无法调度 = ticker 停摆，与请求热路径零耦合。
+  崩溃留下的心跳文件由清理收走。看护侧扫描过期 +
   IPC ping 二意见都失败才终止进程（句柄绑定原进程，PID 复用免疫）。
-- **重拉与退避**：`.restore` 残留 = 异常死亡信号；优雅退出（记录已删）摘除
-  看护。首次崩溃立即重拉；重拉失败进退避队列，按指数退避 1/2/4/8…封顶 300s
-  由主循环时间驱动重试（等待不阻塞 tick——否则长退避会让 claim 心跳停摆、
+- **重拉与退避**：期望状态记录残留 = 异常死亡信号；优雅退出（记录已删）摘除
+  看护。重拉从记录里的拉起规格启动，首次崩溃立即重拉；重拉失败进退避队列，按指数退避
+  1/2/4/8…封顶 300s 由主循环时间驱动重试（等待不阻塞 tick——否则长退避会让 claim 心跳停摆、
   现任被竞争者按「假死」夺权），就绪判定按新 pid 定位；重拉后实例落在不同
-  端口（toml 改了端口）时退役旧端口的 `.restore`/`.pid` 并按实际端口续看护；
-  连续失败达 `watchdog.max_restarts` 放弃并写 startup.log（`.restore` 保留
-  人工兜底）。
+  端口（toml 改了端口）时退役旧端口的记录/`.pid` 并按实际端口续看护。
+  连续失败达 `watchdog.max_restarts` **不再放弃**：转入每 300s 一次的慢速重试，直到实例起来或
+  记录被 `stop` 删掉，并在刚越过上限时往 startup.log 写一条英文说明；`max_restarts = 0` 才是
+  「不自动重拉」（记录保留，交给 `aproxy restore`）。重拉出来的实例存活满 60 秒，之前的连续
+  失败才清零——起得来、几秒后又崩的实例按失败计数退避，不会每次都被立即重拉。
+- **设置热更新**：每个 tick 重读 settings.json。`watchdog.enabled` 关掉时删 claim 退出
+  （记录不动，之后重新打开时崩溃实例照样能被拉回）；`max_restarts`、`idle_exit_secs` 下一轮
+  生效；`heartbeat_secs`、`stale_after_cycles` 不在运行期改——别的进程按看护者启动时的周期判断
+  它是否在任。文件无效时沿用上一次读到的有效值。
 - **选举规范**（多守护并发拉起看护者的唯一性保障）：claim 文件
   `run/watchdog.claim`（PID + 进程创建时间 + 心跳）为在任真相源——
   排序定发起者（核验在世的实例中 PID 最小者才有权 spawn；CLI `start` 不在在世
@@ -406,38 +427,44 @@ settings.json 的 `defaults` 段收的就是 config.toml 的键（同名同嵌�
   定在任者；进程创建时间比对拒绝 PID 复用冒名；假死前任（心跳过期）经验证
   后终止接管。
 - **互保**：守护与看护者完全解耦（看护者死亡实例不受影响）；守护每 5 分钟
-  自检，缺席即按选举规范补种。全部实例清零后看护者闲置自灭（默认 300s），
-  系统回到零常驻。
+  自检，缺席即按选举规范补种。全部实例清零、且没有待重拉的条目后，看护者闲置自灭
+  （默认 300s），系统回到零常驻；慢速重试队列非空时它一直留着。
 - 配置：settings.json `watchdog` 段的五个键（`enabled` 总开关 / `heartbeat_secs` 扫描周期 /
-  `stale_after_cycles` 挂死容忍 / `max_restarts` 重拉上限 / `idle_exit_secs` 闲置自灭）——
-  系统级单例故无 toml 层。
+  `stale_after_cycles` 挂死容忍 / `max_restarts` 快速重拉上限（之后转每 300s 慢速重试）/
+  `idle_exit_secs` 闲置自灭）——系统级单例故无 toml 层。
 
 ## 自愈恢复（restore）
 
-`run/<端口>.restore` 存实例的启动参数：
+`run/<端口>.restore.json` 是期望状态记录，内嵌拉起规格：配置文件（可为 null）、覆盖参数、钉住
+的端口、启动者环境里的代理变量与 `PATH`、日志路径。
 
-- **写入**：守护 bind 成功时（无论前台/后台）
-- **删除**：优雅退出（stop、Ctrl+C）
-- **保留**：崩溃、断电、系统重启
+- **写入**：后台实例 bind 成功后写（前台实例不写——关掉终端就是用户要它停下）
+- **删除**：只有 `stop` 的各条路径删它（优雅停止由实例自己删，`stop --force` 在终止前由 CLI
+  删，`stop` 一个已崩溃的目标 / `stop all` 删掉已不在运行的实例留下的记录）；`restart` 与安装
+  的滚动重启从头到尾不删，新实例就绪时以同一份规格覆盖
+- **保留**：崩溃、断电、系统重启、`restart` 失败、配置文件暂时找不到、读不懂的记录（读路径只
+  报告、不删除；`stop <端口>` 按文件名删，不读内容）
 
-`aproxy restore` 按记录重新拉起（`--daemon-child`），IPC ping 就绪后才报成功；
-已在运行跳过（幂等）；空清单静默 exit 0（开机自启友好）。
+`aproxy restore` 按记录经 `spawn_from_spec` 拉起（`__serve`），就绪判定按新 pid（≤30 秒）；
+已在运行跳过（幂等）；空清单静默 exit 0（开机自启友好）。配置文件找不到时记录保留并说明，文件
+回来后再执行一次即可；没有配置文件的规格（只靠覆盖参数与全局默认启动）不做这项检查。
 
-`.restore` 绝不在 status 清理时删除——崩溃实例恰恰靠它存活到 restore 执行。
-`restore` 按新 pid 定位实例并报告实际端口；实例落在不同于记录的端口时清理旧
-端口记录。`stop --force` 来不及做优雅退出的自清，由 CLI 在强杀成功后按守护自清
-的同一顺序删除 `.restore`/`.pid`/socket/心跳，否则残留的 `.restore` 会被当作
-崩溃信号复活实例；`restart --force` 的强杀路径则保留它作为自愈兜底。
+读路径（`status`、选目标、`logs`、界面轮询）只读，不删任何文件；实例的期望状态记录更不
+归它们管——崩溃实例恰恰靠它存活到 restore 执行。`restore` 按新 pid 定位
+实例并报告实际端口；实例落在不同于记录的端口时，新端口写了新记录、旧端口那份被接替。端口为 0
+的实例把首次拿到的端口钉在规格里，配置仍是 0 时回到那个端口；配置改成固定端口后以配置为准。
 
 ### restart：先预检、后停止
 
 `restart` 的主要用途是「改完 config.toml 让它生效」，而配置笔误恰恰最常出现
-在这一步。先停旧实例再由新守护读配置，配置有错时新守护秒死，旧实例的
-`.restore` 又已随优雅退出删除——健康的服务就此下线。因此 stop 之前先按新守护将
-走的同一条解析路径（`start::resolve_runtime_config`：严格 TOML 加载、CLI 覆盖、
-settings 注入、validate）干跑一遍，换监听地址时再探测新地址可否绑定；预检不通过
-就不碰旧实例。`restart all` 逐实例预检，失败的跳过、其余照常重启，最后汇总并
-以非零退出；新实例启动即退出时展示 startup.log 本次新增内容与恢复命令。
+在这一步。先停旧实例再由新实例读配置，配置有错时新实例秒死，一个健康的服务就此中断。因此
+stop 之前先按新实例将走的同一条解析路径（`start::resolve_runtime_config`：严格 TOML 加载、
+CLI 覆盖、settings 注入、validate）干跑一遍，换监听地址时再探测新地址可否绑定；预检不通过
+就不碰旧实例。停止用带 `keep_restore` 的 shutdown，期望状态记录始终在；新实例起不来时记录
+留着，修好原因后 `aproxy restore` 或看护者能把它拉回。`restart all` 逐实例预检，失败的跳过、
+其余照常重启，最后汇总并以非零退出；新实例启动即退出时展示 startup.log 本次新增内容与
+`aproxy restore` 的恢复方式。没有记录的实例（前台实例，或 alpha.1/alpha.2 写的旧格式记录）
+明确拒绝，旧实例不动。
 
 ## 日志治理
 
@@ -448,15 +475,21 @@ settings 注入、validate）干跑一遍，换监听地址时再探测新地址
   日志初始化）→ resolve（CLI `--log-file` > config.toml `log_file` > 内置
   随机名；`~` 展开，相对路径相对 APROXY_HOME——守护 cwd 不可靠）→ 日志
   init → 实例经 IPC 上报 log_path（`InstanceRecord.log_path`），注册表与
-  `.restore` 记录均携带
+  期望状态记录均携带
 - **地址以 IPC 为准**：`aproxy logs [PORT|别名]`（tail -f 语义：末尾 8KB/
   30 行 + 增量轮询，实例停止自动退出）与 start 成功提示都向实例询问真实
   路径，客户端不拼路径；`--foreground` 实例 log_path 为空，logs 立即报
   「日志输出在它的控制台」
-- 孤儿清理：`status` 时删除「活实例上报的 log_path ∪ `.restore` 记录的
-  log_path」之外的 `*.log`（startup.log 除外，非 .log 文件不动）——不再按
-  文件名端口归属判定。推论：优雅停止实例的日志在下次清理时删除；崩溃实例的
-  日志由 `.restore` 引用保留到恢复成功
+- 清理（`daemon::collect_garbage_in`，实例开始服务之后一次、看护者每轮一次；读路径不删文件）：
+  - 实例记录 `<端口>.pid`：读得懂、且写者经「pid + 创建时间」核验已不在时才删；读不懂的不删
+  - 期望状态记录：不归清理管，只有 `stop` 能删
+  - 交接文件 `*.spec.json` 与原子写的临时文件 `*.tmp-<pid>-<纳秒>`：写者已不在（或核验不到它
+    仍在运行）且早于 10 分钟时删（交接文件含明文密钥，不能一直留在盘上）
+  - 实例日志：只删同时满足「内置随机名（`<十六进制>-<四位十六进制>.log`）、早于 10 分钟、不被
+    任何实例记录或期望状态记录引用」的；`run/` 里有读不懂的记录时这一轮不删任何日志；自定义
+    `log_file` 与 `startup.log` 等固定名永不动。引用集按 `path_match_key` 归一比较
+    （大小写/分隔符差异不会误删）。推论：优雅停止实例的日志在下次清理时删除；崩溃实例的
+    日志由期望状态记录引用保留到恢复成功
 - 全部输出对凭据打码——可安全粘贴分享。URL 展示的**唯一出口**是
   `aproxy_ipc::redact::url`（base_url、代理 URL、上游目标 URL、请求的 `路径?查询串`、
   reqwest 错误里的 URL 一律走它）：
@@ -516,10 +549,11 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
   发现没有状态文件可续的 `install --continue` 删掉，强制安装清空 `install/` 时也一并
   清掉）——看护者/守护的差异化行为全部由它门控：实例死亡复查 5×3s、install 保活
   续作、守护自检补种抑制
-- **restart 与服务回滚**：实例重启原语（`install/restart.rs`）在停止之前把恢复
-  参数记进 install.state 的在途清单，停止之后立即回写 `.restore`；新二进制起不来
-  （bind 前退出、8 秒内没就绪）则用旧二进制按原参数把该实例拉回并置 `halted`，
-  由 flow 中止滚动、剩余实例不动。回滚的只是这一个实例的服务——与 forward-fix
+- **restart 与服务回滚**：实例重启原语（`install/restart.rs`）用带 `keep_restore` 的 shutdown
+  停止实例，期望状态记录全程留在原处（旧实例不认这个参数时由调用方在它退出后写回）；新二进制
+  起不来（bind 前退出、30 秒内没就绪）则用旧二进制按同一份规格把该实例拉回并置 `halted`，
+  由 flow 中止滚动、剩余实例不动。安装状态因此不再存启动参数（`pending_restores` 恒为空）。
+  回滚的只是这一个实例的服务——与 forward-fix
   铁律（swapping 之后只进不退）兼容：bin 里的新二进制与阶段都不回退（阶段落
   failed 保留现场），自动续作不再重试。旧二进制的来源：交换让位之前记进 install.state
   的 `old_path`（`aproxy.old-…`：Windows 是改名让位的原文件；unix 是单步 rename 覆盖前
@@ -549,7 +583,7 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
   `--from`），在本机跑通 `--version` 之前什么都不停；确认（非终端要 `--yes`）→ 按台账
   结束安装者 → 拿锁 → 结束其余角色（连续两轮没有存活条目为止，有上限）→ 清空
   `install/` → swap → 用新二进制的 `restore` 拉回实例（被强制结束的实例留着
-  `.restore`），按台账看被结束实例的端口上有没有新版本的 instance 条目 → 报告台账外、从
+  期望状态记录），按台账看被结束实例的端口上有没有新版本的 instance 条目 → 报告台账外、从
   bin 运行的进程（只报告；macOS 不做）。home 不存在直接 10。退出码冻结、按实际发生的事
   给：0 完成；10 一个进程都没结束；11 结束过进程、二进制没换；12 二进制已换、有实例
   没回来。写输出失败不改变退出码。契约样本钉在 `tests/force_contract.rs`
@@ -561,7 +595,8 @@ rename（staging 备料校验全过才动 bin）、ACK 齐了才交换（IPC Pre
   本平台前缀的条目，结束前在同一个进程句柄（Windows）或 pidfd（Linux）上核验启动标记
   与属主（只结束当前用户的进程），pid 复用不会误杀；删条目前重读，`start` 仍一致才删。台账与实例
   注册表分开（G3）：注册表可以随版本演进，台账只回答「这个 home 有哪些 aproxy 进程、
-  怎样确认 pid 仍是它」
+  怎样确认 pid 仍是它」。端口为 0 的实例在 bind 拿到实际端口后原子改写自己的台账条目（原来
+  登记的 0 对不上任何端口，强制安装的「实例有没有回来」核对会失效）。
 
 跨平台分工：状态机/IPC/恢复全部平台无关，平台分支只收口在交换原语、
 宣告节介质、可执行位，以及台账的启动标记与核验后结束（`ledger::imp`）。
@@ -645,7 +680,7 @@ tauri-build 每次构建都在包根写 `gen/schemas/`，包里没有这些文�
 
 ## 测试
 
-- 单元测试（lib + bin）：重试判定、配置分层、IPC 协议、注册表/恢复记录、打码、claim 选举、退避状态机、安装状态机/下载链条/zip 安全
+- 单元测试（lib + bin）：重试判定、配置分层、IPC 协议、注册表/期望状态记录、打码、claim 选举、退避状态机、安装状态机/下载链条/zip 安全
 - 集成测试：mock 上游 + 真实代理联调、守护生命周期、logs/restore 端到端、
   双模缓冲（磁盘 spool 字节保真/EOF 清理/流尾错误重试）、看门狗（强杀重拉/
   优雅停不复活/并发看护者唯一性）、install 流程（恢复矩阵崩溃注入 + CLI
@@ -661,7 +696,7 @@ tauri-build 每次构建都在包根写 `gen/schemas/`，包里没有这些文�
   目标三元组）；headless 另断言依赖树里没有任何界面 crate。`upgrade-from-0-1-0` 任务下载
   真实的 v0.1.0 二进制（windows 与 ubuntu），断言它的 `install --from` 装当前构建时在改动任何
   东西之前失败（`tests/upgrade_from_0_1_0.rs`，平时 `#[ignore]`，只在 CI 跑）。macos-build 只要求两种变体都
-  编得过。macOS 测试是独立 job，**已知红**（`/dev/shm`、`/proc` 依赖，见「平台」）：不设
+  编得过。macOS 测试是独立 job，**已知红**（`/proc` 依赖，见「平台」）：不设
   skip 也不设 `continue-on-error`，红色就是「未完成」的如实信号，独立成 job 后不淹没其他
   平台的结论
 - **发布门禁**（`release.yml`）：tag 触发后先构建一次前端，再在 windows 与 ubuntu 上按
@@ -683,12 +718,12 @@ tauri-build 每次构建都在包根写 `gen/schemas/`，包里没有这些文�
 |---|---|
 | Windows（x64 / x86 / arm64） | 全功能（开发与主测试平台） |
 | Linux（x86_64 / aarch64，glibc 与 musl） | 全功能；headless 的 gnu 产物 glibc 下限 2.28，带界面的 gnu 产物要 glibc 2.34 与 WebKitGTK 2.40；更低的 glibc 与 musl 系统用 musl 产物（只有 headless） |
-| macOS（Apple Silicon / Intel） | 提供预构建二进制，但未经真机验证；看门狗、`aproxy install` 与依赖进程查询的实例管理用到 Linux 专有接口（`/dev/shm`、`/proc`），在 macOS 上不可用或退化 |
+| macOS（Apple Silicon / Intel） | 提供预构建二进制，但未经真机验证；看门狗、`aproxy install` 与依赖进程查询的实例管理用到 Linux 专有接口（`/proc`），在 macOS 上不可用或退化 |
 
-unix 分支（UDS IPC、`/dev/shm` 心跳、`/proc` 进程查询、单步 rename 交换）按
-**Linux** 实现：`#[cfg(unix)]` 路径依赖 `/dev/shm` 与 `/proc`，这两族原语在 macOS
-上不存在，所以 macOS 上共享内存心跳、进程创建时间读取，以及靠创建时间判定安装者
-存活的 install 宣告无法工作。这部分需要在 macOS 真机上补齐实现与验证（后续贡献者），
+unix 分支（UDS IPC、run 目录里的心跳文件、`/proc` 进程查询、单步 rename 交换）按
+**Linux** 实现：`#[cfg(unix)]` 路径读 `/proc` 取进程创建时间，macOS 上没有它，所以 macOS 上
+进程创建时间读取，以及一切靠「pid + 创建时间」核验身份的环节（看护者的收养与处决、
+`stop --force`、靠创建时间判定安装者存活的 install 宣告）无法工作。这部分需要在 macOS 真机上补齐实现与验证（后续贡献者），
 补齐之前 README 的平台矩阵如实标注为暂不支持。macOS 的代理转发路径不依赖它们，
 可用。
 

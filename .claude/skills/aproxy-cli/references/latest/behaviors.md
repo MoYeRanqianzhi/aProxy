@@ -366,9 +366,21 @@ response: attempt judged successful -> response format -> replay
 ## Instances, ports and the control channel
 
 - One config file runs as one instance, and the port is the instance's identity: the registry record
-  `<home>/run/<port>.pid`, the restore record `<home>/run/<port>.restore`, the control endpoint, the
-  spool directory and the watchdog heartbeat are all keyed by port. Log files are the exception (see
-  Logs). Give each config.toml its own port.
+  `<home>/run/<port>.pid`, the desired-state record `<home>/run/<port>.restore.json`, the control
+  endpoint, the spool directory and the watchdog heartbeat are all keyed by port. Log files are the
+  exception (see Logs). Give each config.toml its own port.
+- A background instance is started from a **launch spec**, passed through a short-lived handoff file
+  under `<home>/run/` (`aproxy __serve --home <dir> --spec <file>`), not from an inherited command
+  line. The spec holds the config path (or null), the override flags, a pinned port for a port-0
+  listener, the launching environment's proxy variables and `PATH`, and the log path. The handoff
+  file is deleted once the instance is ready or has failed; the instance writes the same spec into
+  its desired-state record. Both files are readable only by the current user, so `--api-key` and
+  other secrets never appear on the instance's or the watchdog's command line (the short-lived
+  `aproxy start` process is the one that was given the flag).
+- A background instance detaches from its launcher: on Unix it calls `setsid`, so a Ctrl+C sent to
+  the launching terminal's process group does not reach it; on Windows it tries to leave the
+  launcher's job object (`CREATE_BREAKAWAY_FROM_JOB`) and, when the job does not allow that, stays
+  in it and appends a warning to `startup.log`. It also gets no console and inherits no handles.
 - Two instances on one port with different listen addresses cannot coexist; the second refuses with
   `端口 <port> 已被监听地址 <addr> 的 aProxy 实例使用（本进程将监听 <addr>），两者不能并存。` ("port already
   used by an aProxy instance listening on another address; the two cannot coexist").
@@ -382,9 +394,10 @@ response: attempt judged successful -> response format -> replay
   traffic. An instance creates its channel before it registers, and refuses to start if it cannot:
   startup.log gets `控制通道 <endpoint> 创建失败：…` ("control channel could not be created"). So a
   registered instance is always reachable unless it hung.
-- `aproxy status` lists instances that answer on their control channel, lists separately those whose
-  process is alive but does not answer (hung), and deletes registry records of processes that are
-  gone.
+- `aproxy status` lists instances that answer on their control channel and lists separately those
+  whose process is alive but does not answer (hung). It deletes nothing: a record whose process is
+  gone (or whose pid now belongs to another process) is ignored for this run and cleaned later by an
+  instance that starts serving or by the watchdog.
 
 ### Stopping
 
@@ -398,16 +411,20 @@ response: attempt judged successful -> response format -> replay
   user's other sessions. Never stop every instance or kill aproxy processes by name to clean up: that
   takes down every instance at once, possibly including the one carrying this conversation.
 - `aproxy stop --force` terminates at once, after verifying the process by PID plus creation time
-  (never by executable name), and removes the restore record. A process killed any other way
-  (`taskkill /PID`, `kill`, a crash) leaves its restore record behind, so the watchdog brings it back
-  (see Crash recovery and the watchdog).
+  (never by executable name), and removes the desired-state record before terminating so the
+  watchdog does not race it. A process killed any other way (`taskkill /PID`, `kill`, a crash)
+  leaves its desired-state record behind, so the watchdog brings it back (see Crash recovery and the
+  watchdog). Only `stop` deletes records: `restart` and the install rollout keep them throughout.
+- A target that is already gone but still has a record is stopped by deleting the record; `stop all`
+  does the same for every record whose port has no instance process. A record this version cannot
+  read is reported and left in place.
 
 ### Isolated experiments
 
 `APROXY_HOME` replaces `~/.aproxy` as the home for the default config.toml, settings.json, `run/`,
-`logs/`, `spool/`, `bin/`, `install/`, `ledger/`, `desktop/` and `skills/`; `APROXY_RUN_DIR` moves only
-`run/`. The control channel
-follows the run directory, so commands under an isolated home cannot reach the user's instances.
+`logs/`, `spool/`, `bin/`, `install/`, `ledger/`, `desktop/` and `skills/`. It is the only root:
+there is no separate variable for the run directory. The control channel
+follows the home, so commands under an isolated home cannot reach the user's instances.
 Neither isolates ports: a test instance on a port a real instance listens on fails to start as
 `被其他程序占用` ("in use by another program"). Run `aproxy status` without the override first and
 pick a port nothing uses. An isolated home also gets its own watchdog, which exits by itself some
@@ -422,16 +439,23 @@ minutes after its last instance stops.
 - A custom path comes from `log_file` in config.toml or `--log-file` (the flag wins); a relative path is
   resolved against `<home>`.
 - `<home>/logs/startup.log` collects what happens before an instance has its own log or without a
-  console: configuration errors, bind failures, non-loopback warnings of daemon starts, and watchdog
-  give-ups. Read it first when an instance fails to start.
+  console: configuration errors, bind failures, non-loopback warnings of daemon starts, the Windows
+  job-object warning of a detach that was not allowed, and watchdog slow-retry notices. Read it
+  first when an instance fails to start.
 - Size: at startup an existing log file over 2 MiB is emptied (this matters for a fixed `log_file`); a
   running daemon empties its log once an hourly check finds it over `settings.json logs.rotate_mb` (0
   disables). `aproxy logs` keeps following across truncation.
-- Cleanup: every command that lists instances (`aproxy status`, and `stop`, `restart` or `logs` unless
-  given a port) deletes each `*.log` in `<home>/logs/` that no live instance and no restore record
-  refers to, `startup.log` excepted. A stopped instance's log therefore disappears soon
-  after it stops, and a crashed instance's log stays until the instance is restored. Files outside
-  `<home>/logs/` are never touched; copy a log elsewhere if it must outlive its instance.
+- Cleanup happens in the background, never in a read-only command. An instance runs one cleanup
+  right after it starts serving, and the watchdog does one on every scan. It removes an instance
+  record `<port>.pid` only when the record is readable and the process that wrote it is verifiably
+  gone (pid plus creation time); it removes leftover launch-spec and atomic-write temp files only
+  when their writer is no longer running (or cannot be found) and they are older than 10 minutes;
+  and it removes an instance log only
+  when the name has the built-in random shape (`<hex>-<4 hex>.log`), the file is older than
+  10 minutes, and no instance record or desired-state record refers to it. If `run/` holds a record
+  this version cannot read, no log is deleted in that round. Custom `log_file` paths and fixed names
+  such as `startup.log` are never deleted. `aproxy status`, `stop`, `restart`, `logs` and target
+  selection delete no files.
 - Encoding: UTF-8 without BOM. aProxy switches the Windows console to code page 65001 itself; garbled
   text usually comes from the tool reading the file (troubleshooting.md, Logs and files).
 - Secrets: logs do not contain `api_key` or header values. Every URL (base_url, proxy, upstream target,
@@ -452,44 +476,70 @@ minutes after its last instance stops.
 
 ## Crash recovery and the watchdog
 
-### Restore records
+### Desired-state records
 
-- After binding its port, an instance writes `<home>/run/<port>.restore`: the command line it was
-  started with (config path plus any CLI overrides) and its log path. A graceful stop deletes it, so a
-  remaining record means "this instance should be running". `aproxy status` never deletes these
-  records.
-- `aproxy restore` starts every recorded instance that is not running. It skips instances that answer,
-  deletes records whose config file no longer exists, waits up to 8 s for each start, and reports the
-  actual port. With nothing to do it prints `没有需要恢复的实例。` ("no instances to restore") and exits 0,
-  so it is safe as a logon task for recovery after a reboot or power loss.
-- A restored or respawned instance replays the recorded command line but reads its config file as it
-  is now: unapplied edits take effect, and a changed port moves the instance (the old port's records
-  are then removed). `aproxy restart` reuses the recorded command line in the same way, so changing a
-  CLI override needs a stop followed by a start with the new flags.
+- A background instance writes `<home>/run/<port>.restore.json` when it starts. The record holds the
+  launch spec: the config path (null for an instance started without a config file), the override
+  flags, the pinned port of a port-0 listener, the launch-time proxy environment and `PATH`, and the
+  log path. A `--foreground` instance writes no record, because closing its console is the user
+  stopping it.
+- **Only `stop` deletes a record.** A record that remains means "this instance should be running",
+  whatever took the process away: a crash, a kill by PID, a signal, a reboot, or a failed restart.
+  `aproxy status` never deletes records. A record this version cannot read (damaged, or written by a
+  newer aproxy) is reported and left in place by every reader — `status`, `restore`, the watchdog and
+  `stop all` — but `aproxy stop <port>` deletes the file named `<port>.restore.json` without reading
+  it, so a direct stop still clears an unreadable record. Records written by
+  0.2.0-alpha.1/alpha.2 under the old name `<port>.restore` are not read at all.
+- `aproxy restore` starts every recorded instance that is not running. It skips instances that
+  answer, waits up to 30 s for each start, and reports the actual port. If the config file named by
+  a record is missing, it keeps the record and says so, so a file that comes back later (a network
+  drive that mounts late) can still be restored. With nothing to do it prints
+  `没有需要恢复的实例。` ("no instances to restore") and exits 0, so it is safe as a logon task for
+  recovery after a reboot or power loss.
+- A restored or respawned instance reuses the spec but reads its config file as it is now: unapplied
+  edits take effect, and a changed port moves the instance (the old port's record is replaced by the
+  new port's). It keeps the launch-time proxy environment and `PATH`, so it reaches the network the
+  same way as the original `start`. `aproxy restart` reuses the same spec, so changing a CLI
+  override needs a stop followed by a start with the new flags.
 
 ### Watchdog
 
-One background process watches every instance: the same executable started with an internal flag (no
-public subcommand), a few MB of memory regardless of instance count. It is on by default; the switch
-and tuning fields are in settings-json.md (`watchdog.enabled` and the other `watchdog` keys). It
-works on Windows and Linux and is not supported on macOS.
+One background process watches every instance: the same executable started as
+`aproxy __watchdog --home <dir>` (no public subcommand), a few MB of memory regardless of instance
+count. It is on by default; the switch and tuning fields are in settings-json.md
+(`watchdog.enabled` and the other `watchdog` keys). It works on Windows and Linux and is not
+supported on macOS.
 
 - **Death** (crash, kill by PID): the watchdog sees the process exit at once and acts on it at once,
-  so the instance is back within its startup time (typically under a second). With a restore
-  record present it respawns the instance from that record and waits up to 8 s for it to come up; failed respawns are retried with backoff from 1 s doubling to 300 s. Without a record
-  (graceful stop) it just stops watching. A respawn that lands on another port moves the watch there
-  and removes the old port's records.
-- **Hang** (process alive, runtime stuck): each instance writes a heartbeat to shared memory every
-  10 s. When it is stale past the scan tolerance and the instance does not answer on the control
+  so the instance is back within its startup time (typically under a second). With a desired-state
+  record present it respawns the instance from that record and waits up to 30 s for it to come up;
+  failed respawns are retried with backoff from 1 s doubling to 300 s. Without a record (graceful
+  stop) it just stops watching. A respawn that lands on another port moves the watch there and
+  replaces the old port's record.
+- **Hang** (process alive, runtime stuck): each instance writes a heartbeat every 10 s (a
+  shared-memory section on Windows, the file `<home>/run/<port>.heart` elsewhere). When it is stale past the scan tolerance and the instance does not answer on the control
   channel, the watchdog re-verifies PID plus creation time, kills the process and respawns it.
-- **Crash loop**: after `watchdog.max_restarts` consecutive failed respawns it gives up, keeps the
-  restore record, and appends to startup.log
-  `[watchdog] 端口 <port> 的实例连续重拉 N 次失败，已放弃自动重拉；可执行 aproxy restore 手工恢复` ("gave up
-  respawning the instance on <port> after N failures; run aproxy restore by hand").
+- **Crash loop**: after `watchdog.max_restarts` consecutive failed respawns the watchdog no longer
+  gives up. It retries once every 300 s until the instance starts or its record is deleted
+  (`aproxy stop <port>`), keeping the record throughout. The first time the limit is crossed it
+  appends to startup.log:
+  `[watchdog] the instance on port <port> failed to come back N times in a row; retrying every 300 seconds until it starts or aproxy stop <port> is run`.
+  `watchdog.max_restarts = 0` is the exception: the watchdog never restarts an instance
+  automatically (the record is kept for a manual `aproxy restore`).
+- **Failure counting**: a respawned instance must stay up for 60 s before its earlier consecutive
+  failures are forgotten. An instance that starts and dies again after a few seconds keeps counting
+  and backs off instead of being respawned in a tight loop.
+- **Settings are re-read every scan.** Setting `watchdog.enabled = false` makes a running watchdog
+  exit at its next scan (it removes its claim and leaves the instances and their records alone);
+  `max_restarts` and `idle_exit_secs` follow the file on the next scan. `heartbeat_secs` and
+  `stale_after_cycles` are fixed when the watchdog process starts, because other processes judge its
+  liveness by the period it started with. If settings.json is invalid, the watchdog keeps its last
+  valid values.
 - **Single watchdog**: `<home>/run/watchdog.claim` names the active one (PID, creation time,
   heartbeat). `aproxy start` launches one if none is active, and every instance checks every 5 minutes
   and launches a replacement if needed, logging `看护者缺席，已由守护补种（选举胜出者）` ("watchdog absent;
-  relaunched by an instance"). With no instances left for `watchdog.idle_exit_secs`, it exits.
+  relaunched by an instance"). With no instances left and no respawn pending for `watchdog.idle_exit_secs`,
+  it exits; an instance still waiting for its 300 s slow retry keeps it running.
 - `aproxy status` does not show the watchdog. To check it, read the claim file and see whether its PID
   is alive.
 - Limits: a respawn does not save requests in flight when the process died; their clients see a reset
@@ -512,13 +562,13 @@ commands.md. During the run:
   instance <port> failed") and kills nothing. Ask the user whether that instance may be stopped, stop
   it, and run install again.
 - If the new binary cannot bring an instance up (stricter validation of the existing config,
-  antivirus, not ready within 8 s), install restarts that instance from the old binary with its
-  original arguments, halts the rollout (remaining instances stay on the old version), prints
+  antivirus, not ready within 30 s), install restarts that instance from the old binary with the
+  same launch spec, halts the rollout (remaining instances stay on the old version), prints
   `滚动已中止，不会自动重试：…` ("rollout halted, will not retry automatically") and exits non-zero. The
   binary in `bin/` and the install phase are not rolled back: `<home>/install/state.json` holds phase
   `failed` and the cause in `last_error`. Read startup.log, fix the cause, run `aproxy install` again.
-  If the old binary cannot start the instance either, it is down but its restore record is kept, and
-  `aproxy restore` brings it back after the fix.
+  If the old binary cannot start the instance either, it is down but its desired-state record is
+  kept, and `aproxy restore` brings it back after the fix.
 - The old binary is kept under a unique name, `bin/aproxy.old-<nanoseconds>-<pid>[.exe]`, for that
   rollback and removed at the end. One that is still locked (Windows) stays until a later install
   can delete it, and never blocks one. While `bin/` changes, the installer holds the lock

@@ -84,7 +84,15 @@ Every other client, the reasoning behind the timeouts, and how to verify the set
 - A target is resolved as: alias, then the reserved word `default` (the default config), then a
   config file path. A bare number is always a port.
 - `aproxy restart PORT|ALIAS` applies config changes: it stops the instance and starts it again
-  with its original arguments. It does not start an instance that is not running; use `start`.
+  from its launch spec. It does not start an instance that is not running; use `start`. If the new
+  instance fails to come up, the desired-state record is still there: fix the cause and run
+  `aproxy restore` (the watchdog also retries).
+- A background instance keeps a desired-state record under `<home>/run/`. Only `stop` deletes it,
+  so a crash, a kill, a reboot or a failed restart can be recovered with `aproxy restore` or by the
+  watchdog. `stop` on an instance that already crashed deletes its record. Secrets given to `start`
+  (`--api-key`) travel in a launch-spec file, not on the instance's command line.
+- A `--foreground` instance writes no record: closing its console ends it, `restore` does not
+  revive it, and `restart` refuses it.
 - `aproxy desktop` opens the desktop window. In the 0.2.0 alpha releases it is a preview that shows demo
   data, not this machine's instances, so never take the state of the proxies from it; the CLI is
   the source of truth. Details: commands.md, desktop.

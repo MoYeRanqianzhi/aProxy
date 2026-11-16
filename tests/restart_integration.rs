@@ -1446,3 +1446,68 @@ fn watchdog_exits_once_it_is_disabled_in_settings() {
     );
     assert!(ipc_ping_in_dir(&rt, port, home).is_ok(), "实例不受影响");
 }
+
+/// spool 按进程分目录：实例只用 `spool/<pid>-<启动标记短哈希>/`。同一端口上第二次启动的
+/// 进程（会因端口被占而失败）不碰正在运行的实例的缓存文件；已退出的进程留下的目录在实例
+/// 开始服务之后被清掉；实例正常停止时收掉自己的目录。
+#[test]
+fn spool_is_per_process_and_survives_a_second_start_on_the_same_port() {
+    let test_home = TestHome::new();
+    let home = test_home.path();
+    let exe = built_exe();
+    let rt = runtime();
+    let port = free_port();
+    let cfg = home.join("spool.toml");
+    write_cfg(&cfg, &format!("127.0.0.1:{port}"));
+    test_home.stop_on_drop(port);
+
+    // 一个早已不在的进程留下的目录
+    let spool = home.join("spool");
+    let stale = spool.join(format!("{}-0a0b0c0d", u32::MAX - 783));
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("req-1-1.spooltmp"), "x").unwrap();
+
+    let out = run_cli(
+        &test_home,
+        &exe,
+        &["start", "--config", cfg.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "start: {}", text(&out.stderr));
+    let pid = ipc_ping_in_dir(&rt, port, home).unwrap().instance.pid;
+    let own = spool.join(aproxy::daemon::spool_dir_name(
+        pid,
+        aproxy_ipc::ledger::start_marker(pid).as_deref(),
+    ));
+    assert!(
+        own.is_dir(),
+        "实例应建出自己的 spool 目录: {}",
+        own.display()
+    );
+    assert!(
+        wait_for(Duration::from_secs(10), || !stale.exists()),
+        "已退出的进程留下的 spool 目录应在实例开始服务之后被清掉"
+    );
+
+    // 模拟一个在途请求的缓存文件，再在同一端口上启动第二次
+    let in_flight = own.join("spool-7-7.spooltmp");
+    std::fs::write(&in_flight, "in flight").unwrap();
+    let out = run_cli(
+        &test_home,
+        &exe,
+        &["start", "--config", cfg.to_str().unwrap()],
+    );
+    assert!(
+        ipc_ping_in_dir(&rt, port, home).is_ok_and(|s| s.instance.pid == pid),
+        "原实例应仍在: {}{}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+    assert!(in_flight.exists(), "第二次启动不得清掉运行中实例的缓存文件");
+
+    let out = run_cli(&test_home, &exe, &["stop", &port.to_string()]);
+    assert!(out.status.success(), "stop: {}", text(&out.stderr));
+    assert!(
+        wait_for(Duration::from_secs(10), || !own.exists()),
+        "实例正常停止后应收掉自己的 spool 目录"
+    );
+}

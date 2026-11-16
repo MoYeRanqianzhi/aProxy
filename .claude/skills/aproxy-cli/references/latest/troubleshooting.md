@@ -76,7 +76,7 @@ the aproxy-format skill's troubleshooting.md.
 | The client got `text/event-stream` with a JSON or NDJSON body; the log warns `已以 text/event-stream 提交的保活响应里回放的是非 SSE 的成功响应体…` | The upstream answered a stream request with a non-SSE body after the skeleton head was committed | Set `[keepalive] trigger = "accept"` on that instance |
 | The client receives an SSE `event: error` frame, or an HTTP response with `x-aproxy-error` | aProxy ended the request, after the response head was already committed or by giving up | Read the code from `error.aproxy.code` or the header; behaviors.md, After the commit lists each code and its status. Most fixes are the rows below |
 | 502 with `x-aproxy-error: response_too_large` (`details.limit_bytes`) | Response larger than `max_response_mb` | Raise `max_response_mb` |
-| 507 with `x-aproxy-error: local_storage_failed` (`details.op` is `write_request`, `read_request` or `write_response`) | Disk full, or `<home>/spool/<port>/` not writable | Free space, or set `disk_cache = false` and restart |
+| 507 with `x-aproxy-error: local_storage_failed` (`details.op` is `write_request`, `read_request` or `write_response`) | Disk full, or the instance's directory under `<home>/spool/` not writable | Free space, or set `disk_cache = false` and restart |
 | 413 with `x-aproxy-error: request_too_large` (`details.limit_bytes`) | Body larger than `max_request_mb` | Raise it, or `0` for no limit |
 | 400 with `x-aproxy-error: client_body_aborted` | The client stopped sending its request body | Usually client-side; have the client resend |
 | 403 with `x-aproxy-error: inbound_host_rejected` or `inbound_origin_rejected` (`details.host` / `details.origin`); log `入站请求被拒绝…` ("inbound request rejected") | Inbound check: browser and Electron clients send `Origin`, rejected by default; a non-default host name is rejected on loopback listeners | Add the exact value from `details` to `allowed_origins` or `allowed_hosts` (config-toml.md), only if the user trusts that client; restart |
@@ -118,7 +118,7 @@ the aproxy-format skill's troubleshooting.md.
 | `aproxy logs` says `该实例以前台模式运行（--foreground），日志输出在它的控制台，无日志文件可跟随。` ("this instance runs in the foreground; its log goes to its console") | Foreground instances have no log file | Read the console it runs in |
 | `aproxy logs` never returns | It follows the file until Ctrl+C or the instance stops | Run it with a timeout, or read the file at the printed path |
 | The error preview reads `（二进制/压缩内容，共 N 字节，hex 前 48: …）` ("binary/compressed content, N bytes, first 48 bytes in hex") | The body is binary or could not be decoded (unknown encoding, corrupt data, over 8 MiB decoded) | Check the `content_encoding` field on the same line; `1f 8b` starts gzip, `28 b5 2f fd` starts zstd |
-| `*.spooltmp` files remain in `<home>/spool/<port>/` | Left by a crash or kill | Harmless; they are deleted the next time an instance starts on that port |
+| `*.spooltmp` files remain in a `<home>/spool/<pid>-<hash>/` directory whose process is gone | Left by a crash or kill | They hold request and response bodies. The next instance that starts in this home, or the watchdog on its next scan, deletes them; with nothing running they can be deleted by hand |
 
 ## Crash recovery, watchdog and upgrades
 

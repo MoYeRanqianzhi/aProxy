@@ -436,7 +436,7 @@ Runtime details: behaviors.md, "Forward-only mode".
 ### disk_cache
 
 Whether request and response bodies larger than 1 MiB spill to temporary files under
-`<APROXY_HOME>/spool/<port>/` instead of staying in memory. On (the built-in default, or
+`<APROXY_HOME>/spool/<pid>-<hash>/` instead of staying in memory. On (the built-in default, or
 settings.json `defaults.disk_cache`), memory per request stays flat whatever the body size; off,
 every body is held in RAM. Bodies under 1 MiB stay in
 memory either way, so leave it on unless disk writes are unwanted. When a disk write or read fails,

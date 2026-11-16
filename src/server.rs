@@ -91,14 +91,13 @@ pub(crate) async fn serve_forever(
         cfg_path.map(|_| cfg_display.as_str()),
         cfg_abs.as_deref(),
     );
-    // spool 残留清理（disk_cache）：bind 前清空本端口的 spool 目录——目录
-    // 归本进程独占，启动时清空即可回收崩溃/强杀残留的临时文件。
-    // 仅转发模式下 spool 链路整体不进，本实例永不产生 spool 文件；但这里**不是**
-    // no-op：清理逻辑自身会 create_dir_all，于是每个仅转发实例启动时仍会创建
-    // ~/.aproxy/spool/<端口>/ 这个空目录，只是无文件可清。空目录无害（不占空间、
-    // 与磁盘缓存实例的目录互不干扰），故不做特判，只把注释说准。
-    daemon::clean_spool_dir(daemon::port_of(&listen_addr));
     let state = aproxy::proxy::AppState::new(cfg);
+    // 磁盘缓存开着时，建出本进程自己的 spool 目录（按进程分，不按端口：见
+    // daemon::spool_dir_name）。别的进程崩溃留下的目录不在这里清——这时还没 bind，本进程
+    // 可能马上因为端口被占而退出；清理在开始服务之后做。
+    if let Some(dir) = &state.spool_dir {
+        daemon::prepare_spool_dir(dir);
+    }
     let app = aproxy::proxy::router(state.clone());
 
     let listener = match tokio::net::TcpListener::bind(&listen_addr).await {
@@ -294,6 +293,10 @@ pub(crate) async fn serve_forever(
                 "清理了残留的运行期文件与旧日志"
             );
         }
+        let spool = daemon::collect_stale_spool_in(&daemon::spool_root());
+        if !spool.is_empty() {
+            tracing::info!(removed = spool.len(), "清理了已退出的进程留下的 spool 目录");
+        }
         if report.logs_paused {
             tracing::warn!(
                 "run 目录里有读不懂的记录（多半由更新版本的 aproxy 写下），旧日志的清理已暂停"
@@ -398,6 +401,11 @@ pub(crate) async fn serve_forever(
         } => {}
     }
     daemon::remove_registry_files(&actual_addr);
+    // 在途请求都已结束，各自的临时文件已删，这里收掉本进程的 spool 目录。上面那条强制
+    // 退出的路径不收：还有请求在写它，留给下一个开始服务的实例或看护者清理
+    if let Some(dir) = &state.spool_dir {
+        daemon::remove_spool_dir(dir);
+    }
     tracing::info!("aProxy 已停止");
 }
 

@@ -9,7 +9,7 @@ agent 软件 ──HTTP──▶ [代理端口 12345] ──重试循环──�
                         ▲                 │
                         │ 透传             │ spool（内存 ≤1MiB 驻留，
                     命名管道 IPC           ▼        超出溢写磁盘）
-                        │          磁盘 spool ~/.aproxy/spool/<端口>/
+                        │          磁盘 spool ~/.aproxy/spool/<pid>-…/
                   [控制通道 <端口>]        │
                         ▲                回放
         aproxy status/stop/logs/restore
@@ -95,7 +95,10 @@ CLI 定义（cli.rs）、动作本身（ops/）与子命令的渲染（commands/
 
 - **内存**：≤ 1 MiB（`RESIDENT_LIMIT`）全程驻留内存，小流量零磁盘 IO（真实
   agent 流量的绝大多数）。
-- **磁盘 spool**：超出 1 MiB 即溢写 `~/.aproxy/spool/<端口>/*.spooltmp`，
+- **磁盘 spool**：超出 1 MiB 即溢写 `~/.aproxy/spool/<pid>-<启动标记短哈希>/*.spooltmp`
+  （按进程分目录，不按端口：按端口时，同一端口上第二次启动的进程会在 bind 失败之前清掉运行中
+  实例的缓存；启动标记防 pid 复用。实例正常停止时收掉自己的目录，已退出的进程留下的目录由
+  开始服务之后的实例与看护者清理），
   重试重放与响应回放流式读文件——进程内存与负载大小解耦。读写走 OS page
   cache，SSD 上吞吐与纯内存持平（实测数据见 [benchmark-memory.md](benchmark-memory.md)）。
 
@@ -361,7 +364,7 @@ settings.json 的 `defaults` 段收的就是 config.toml 的键（同名同嵌�
   文件与期望状态记录里（都只本用户可读），不进实例与看护者的命令行（`aproxy start` 自己的
   短暂命令行上仍有用户给的覆盖参数）。
 - 子进程承载服务：读交接文件里的规格 → 宽松解析定出日志路径并初始化日志 → 严格校验配置（失败写
-  startup.log 并退出）→ 清 spool 目录（bind 前，回收崩溃残留）→ bind → 写实例注册表
+  startup.log 并退出）→ 建本进程的 spool 目录 → bind → 写实例注册表
   （`run/<端口>.pid`，含实例上报的 log_path）→ 写期望状态记录（`run/<端口>.restore.json`，内嵌
   规格）→ 启动 IPC 管道 → 创建看门狗心跳节 + 心跳 ticker（10s）→ 守护侧互保任务（5 分钟自检）
   → serve。前台实例（`--foreground`）走同一服务主循环，但不写期望状态记录、日志写控制台。

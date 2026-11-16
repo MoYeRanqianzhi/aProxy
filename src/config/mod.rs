@@ -361,7 +361,7 @@ pub struct Config {
     pub log_file: Option<String>,
     /// spool 临时文件目录覆盖（serde skip，不落盘）。仅测试注入用：集成测试
     /// 进程内构建 AppState 时若无此覆盖，会按端口写入真实 ~/.aproxy/spool/。
-    /// 生产路径为 None，实际目录 = ~/.aproxy/spool/<端口>/。
+    /// 生产路径为 None，实际目录 = ~/.aproxy/spool/<pid>-<启动标记短哈希>/。
     pub spool_dir_override: Option<PathBuf>,
 }
 

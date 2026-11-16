@@ -283,7 +283,7 @@ listen_addr = "127.0.0.1:12345"          # 本地监听（端口 0 = 系统分�
 多 key 轮换默认只在**请求之间**生效：同一请求的重试沿用转换后的同一个 key（请求只转换一次，重试重放转换产物）。需要每次重试都重新转换时，在请求方的 `stages` 里加上 `"retry"`。
 
 运行数据在 `~/.aproxy/`：`run/`（实例注册 `<端口>.pid`、期望状态记录 `<端口>.restore.json`、看护者 claim；启动瞬间还有短暂存在的拉起规格交接文件）、`logs/`（守护日志，按启动随机命名、自动清理与轮转，地址经 IPC 向实例询问；可用 `log_file` 自定义去向）、
-`spool/<端口>/`（磁盘缓存临时文件，启动时自动清理）、
+`spool/<pid>-<短哈希>/`（磁盘缓存临时文件，每个实例进程一个目录；实例停止时删掉，崩溃留下的由下一个启动的实例或看门狗清理）、
 `settings.json`（整个 home 的程序状态：`aliases`、`default_config`、`config_dirs`，`defaults`（config.toml 键的全局默认），以及 `watchdog`、`logs`、`instances`、`update`、`ui` 各段）。
 
 `settings.json` 由 `aproxy settings show|get|set|unset` 读写（键是点号路径，例如 `watchdog.enabled`、`defaults.max_request_mb`）；也可以 `aproxy alias add|remove` 与 `aproxy config --set-default|--clear-default` 改各自的键。手工编辑只在文件无法解析时作为兜底：它被严格解析，不认识的键、类型不对的值都是错误，此时 `status`、`stop`、`install` 会按内置默认运行并告警（别名不可用），其余命令以退出码 3 结束并打印修法。`defaults` 里的凭据（`api_key`、密钥头、代理口令）只随它的目标继承：实例的 `base_url`/`proxy` 指向别处时不会带上它，`aproxy config --show` 会列出被扣下的项。字段说明见 skill 文档 [settings-json.md](.claude/skills/aproxy-cli/references/latest/settings-json.md)。

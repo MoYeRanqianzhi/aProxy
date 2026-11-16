@@ -37,7 +37,7 @@ directory, and `install --force` ends with 10.
 | `<home>/logs/` | instance logs (random file names) and `startup.log` |
 | `<home>/bin/` | the binary managed by `aproxy install`; on Windows also `aproxy.bat` (see install / upgrade). Files named `aproxy.old-…` and `aproxy.tmp-…` are left by binary swaps; installs delete the ones they can |
 | `<home>/install/` | `aproxy install`'s own files: the progress record `state.json` while an install runs, downloads and staged binaries in `staging/<version>/`, the install script's downloads in `bootstrap/`, force install's download in `force/`, on Linux and macOS the install announcement `announce`, and `lock`, held while `bin/` changes |
-| `<home>/spool/<port>/` | an instance's disk-cache scratch files (behaviors.md, Disk cache); deleted when an instance starts on that port |
+| `<home>/spool/<pid>-<hash>/` | one instance process's disk-cache scratch files (behaviors.md, Disk cache); removed when the instance stops, and after a crash by the next instance that starts or by the watchdog |
 | `<home>/ledger/` | one `<pid>.json` per running aproxy process (instances, the watchdog, installers, the desktop window), written at start and deleted at exit. `aproxy install --force` finds the processes to stop here. Leave these files alone |
 | `<home>/desktop/` | the desktop window's web view data (see desktop) |
 | `<home>/skills/` | skill documents placed by `aproxy install` |

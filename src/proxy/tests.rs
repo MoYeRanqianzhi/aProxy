@@ -354,7 +354,7 @@ async fn spool_finish_surfaces_error_of_last_write() {
 #[tokio::test]
 async fn dropped_disk_spool_buffer_deletes_partial_file() {
     // 收集途中被整体丢弃（客户端断开让在途 forward_once 被 drop 即此情形）：
-    // 半截 spool 文件必须当场删除，不能留到下次启动才由 clean_spool_dir 回收
+    // 半截 spool 文件必须当场删除，不能留到进程退出之后才由 collect_stale_spool_in 回收
     let dir = tempfile::tempdir().unwrap();
     let mut buf = SpoolBuffer::Memory(Vec::new());
     spool_chunk(&mut buf, &vec![b'x'; RESIDENT_LIMIT + 1], Some(dir.path())).await;

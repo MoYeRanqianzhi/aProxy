@@ -252,8 +252,9 @@ not events. The fix is on the client side; see clients.md.
 
 ## Disk cache (spool)
 
-With `disk_cache` on, request bodies and responses larger than 1 MiB spill to `<home>/spool/<port>/`
-as `req-*.spooltmp` and `spool-*.spooltmp` files. Retries and replays stream from the file, so memory
+With `disk_cache` on, request bodies and responses larger than 1 MiB spill to
+`<home>/spool/<pid>-<hash>/` (one directory per instance process) as `req-*.spooltmp` and
+`spool-*.spooltmp` files. Retries and replays stream from the file, so memory
 use does not grow with payload size; through the OS page cache an SSD performs about as well as
 memory.
 
@@ -367,8 +368,8 @@ response: attempt judged successful -> response format -> replay
 
 - One config file runs as one instance, and the port is the instance's identity: the registry record
   `<home>/run/<port>.pid`, the desired-state record `<home>/run/<port>.restore.json`, the control
-  endpoint, the spool directory and the watchdog heartbeat are all keyed by port. Log files are the
-  exception (see Logs). Give each config.toml its own port.
+  endpoint and the watchdog heartbeat are all keyed by port. Log files and the spool directory are
+  the exceptions (see Logs and Disk cache). Give each config.toml its own port.
 - A background instance is started from a **launch spec**, passed through a short-lived handoff file
   under `<home>/run/` (`aproxy __serve --home <dir> --spec <file>`), not from an inherited command
   line. The spec holds the config path (or null), the override flags, a pinned port for a port-0

@@ -52,7 +52,7 @@
 //! - 头处理：`api_key` 快捷覆盖 `Authorization: Bearer` 与 `x-api-key`（Anthropic 风格），
 //!   `extra_headers` 追加缺失头，`override_headers` 无条件覆盖（兼容非 Bearer 鉴权与额外头需求）
 //! - 磁盘临时文件生命周期：请求体随请求结束（Drop）删除；响应 spool 在回放流
-//!   结束/客户端断开/重试丢弃时删除；进程崩溃残留由启动时 `clean_spool_dir`
+//!   结束/客户端断开/重试丢弃时删除；进程崩溃残留由 `daemon::collect_stale_spool_in`
 //!   回收（每实例独立子目录，互不干扰）。
 
 use axum::{

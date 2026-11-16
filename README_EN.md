@@ -491,8 +491,10 @@ records `<port>.restore.json`, the watchdog claim, and a short-lived launch-spec
 handoff while an instance starts), `logs/` (daemon logs, randomly named per
 start, rotated and
 orphan-cleaned; paths reported via IPC — customize with `log_file`),
-`spool/<port>/` (disk-cache
-scratch space), `settings.json` (the home's program state: `aliases`,
+`spool/<pid>-<hash>/` (disk-cache
+scratch space, one directory per instance process; removed when the instance
+stops, and leftovers of a crashed one are removed by the next instance that
+starts or by the watchdog), `settings.json` (the home's program state: `aliases`,
 `default_config`, `config_dirs`, `defaults` with global config.toml defaults, and
 the `watchdog`, `logs`, `instances`, `update` and `ui` sections).
 

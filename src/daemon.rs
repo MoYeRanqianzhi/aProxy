@@ -30,39 +30,94 @@ pub fn logs_dir() -> PathBuf {
     aproxy_ipc::home::home().join("logs")
 }
 
-/// spool 临时文件目录基址：`<home>/spool/<端口>/`。每实例独立子目录，
-/// 启动时清空自己的子目录即可回收崩溃残留，互不干扰。
-pub fn spool_dir_for(port: &str) -> PathBuf {
-    aproxy_ipc::home::home().join("spool").join(port)
+/// spool 临时文件的根目录：`<home>/spool/`。每个实例进程在它下面有自己的一个子目录
+/// （见 [`own_spool_dir`]）。
+pub fn spool_root() -> PathBuf {
+    aproxy_ipc::home::home().join("spool")
 }
 
-/// 清空实例的 spool 目录（启动时调用）：删除崩溃/强杀残留的 *.spooltmp。
-/// 目录不存在视为首次运行（创建之）。仅在 bind 监听端口之前调用——此后
-/// 该端口目录归本进程独占，运行中不清理（清理职责在临时文件的使用方）。
-pub fn clean_spool_dir(port: &str) {
-    let dir = spool_dir_for(port);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+/// 一个进程的 spool 子目录名：`<pid>-<启动标记的短哈希>`（哈希是 8 位小写十六进制）。
+///
+/// 按进程而不是按端口分：目录按端口命名时，同一端口上第二次启动的进程会在 bind 失败之前
+/// 清掉正在运行的那个实例的缓存文件。带上启动标记（台账用的那一个，见
+/// [`aproxy_ipc::ledger::start_marker`]）是为了防 pid 复用——pid 相同而标记不同的目录
+/// 属于早已不在的进程。读不到标记的平台按空串算哈希，名字仍然确定。
+pub fn spool_dir_name(pid: u32, start: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(start.unwrap_or("").as_bytes());
+    format!(
+        "{pid}-{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3]
+    )
+}
+
+/// 本进程的 spool 目录：`<home>/spool/<pid>-<启动标记的短哈希>/`。
+pub fn own_spool_dir() -> PathBuf {
+    let pid = std::process::id();
+    spool_root().join(spool_dir_name(
+        pid,
+        aproxy_ipc::ledger::start_marker(pid).as_deref(),
+    ))
+}
+
+/// 建出实例自己的 spool 目录（开始接收请求之前调用）。失败只告警：磁盘缓存不可用时
+/// 请求体与响应体留在内存里。
+pub fn prepare_spool_dir(dir: &std::path::Path) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, dir = %dir.display(), "spool 目录创建失败（磁盘缓存将不可用，回退纯内存）");
-        return;
     }
-    match std::fs::read_dir(&dir) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                // 只删本实例的 spool 临时文件；意外出现的其他内容保留（不扩大删除面）
-                if entry
-                    .path()
-                    .extension()
-                    .is_some_and(|ext| ext == "spooltmp")
-                    && let Err(e) = std::fs::remove_file(entry.path())
-                {
-                    tracing::warn!(error = %e, path = %entry.path().display(), "spool 残留清理失败");
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, dir = %dir.display(), "spool 目录读取失败");
+}
+
+/// 删掉一个 spool 目录里的临时文件（`*.spooltmp`），目录空了就连目录一起删，返回目录
+/// 是否已删。只删这一种文件：意外出现的其他内容保留，目录也就留着（不扩大删除面）。
+pub fn remove_spool_dir(dir: &std::path::Path) -> bool {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "spooltmp")
+            && let Err(e) = std::fs::remove_file(&path)
+        {
+            tracing::warn!(error = %e, path = %path.display(), "spool 残留清理失败");
         }
     }
+    std::fs::remove_dir(dir).is_ok()
+}
+
+/// 清掉别的进程留下的 spool 目录，返回删掉的目录。spool 里是请求与响应的全文，进程崩溃
+/// 或被强杀之后不该一直留在盘上。只看名字是 `<pid>-<8 位十六进制>` 的子目录，删除的条件
+/// 是下面两条之一：
+/// - 这个 pid 现在的启动标记算出来的名字与目录名不同（pid 已被别的进程复用）；
+/// - 读不到这个 pid 的启动标记，并且能确认这个 pid 上已经没有进程。
+///
+/// 读不到标记、又确认不了进程不在时（本平台没有定义标记，或没有权限）保留。别的名字
+/// （包括旧版本按端口命名的目录）不碰。
+pub fn collect_stale_spool_in(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(pid) = spool_dir_owner(&name) else {
+            continue;
+        };
+        let stale = match aproxy_ipc::ledger::start_marker(pid) {
+            Some(marker) => spool_dir_name(pid, Some(&marker)) != name,
+            None => crate::process::process_exited(pid) == Some(true),
+        };
+        let path = entry.path();
+        if stale && path.is_dir() && remove_spool_dir(&path) {
+            removed.push(path);
+        }
+    }
+    removed
+}
+
+/// 目录名是 `<pid>-<8 位小写十六进制>` 时返回其中的 pid。
+fn spool_dir_owner(name: &str) -> Option<u32> {
+    let (pid, hash) = name.split_once('-')?;
+    (hash.len() == 8
+        && hash
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)))
+    .then_some(())?;
+    pid.parse().ok()
 }
 
 /// 实例的 IPC 端点：windows 为命名管道名，unix 为 UDS 路径。
@@ -2283,6 +2338,74 @@ mod tests {
             "不是随机名形状的日志永远不删"
         );
         assert!(logs.join("not-a-log.txt").exists());
+    }
+
+    #[test]
+    fn stale_spool_dirs_are_removed_and_live_ones_kept() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("spool");
+        let make = |name: &str, files: &[&str]| {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            for file in files {
+                std::fs::write(dir.join(file), "x").unwrap();
+            }
+            dir
+        };
+        let me = std::process::id();
+        let marker = aproxy_ipc::ledger::start_marker(me);
+        let own_name = spool_dir_name(me, marker.as_deref());
+        // 活着的进程自己的目录
+        let own = make(&own_name, &["req-1-1.spooltmp"]);
+        // pid 上已经没有进程
+        let dead = make(
+            &format!("{}-0a0b0c0d", u32::MAX - 781),
+            &["spool-1-1.spooltmp"],
+        );
+        // 里面有不认识的文件：临时文件删掉，目录与那个文件留着
+        let mixed = make(
+            &format!("{}-0a0b0c0d", u32::MAX - 782),
+            &["res-1-1.spooltmp", "notes.txt"],
+        );
+        // 名字不是这个形状的不碰（旧版本按端口命名的目录也在其中）
+        let by_port = make("59820", &["spool-9-9.spooltmp"]);
+        let odd = make(&format!("{me}-XYZ"), &["a.spooltmp"]);
+
+        let mut expected = vec![dead.clone()];
+        // pid 还在而启动标记对不上：只有读得到标记的平台才判得出
+        let reused = marker.as_ref().map(|_| {
+            let wrong = if own_name.ends_with("00000000") {
+                "11111111"
+            } else {
+                "00000000"
+            };
+            make(&format!("{me}-{wrong}"), &["req-2-2.spooltmp"])
+        });
+        expected.extend(reused.clone());
+        expected.sort();
+
+        let mut removed = collect_stale_spool_in(&root);
+        removed.sort();
+        assert_eq!(removed, expected);
+        assert!(own.join("req-1-1.spooltmp").exists(), "活进程的目录不碰");
+        assert!(!dead.exists());
+        assert!(mixed.join("notes.txt").exists() && !mixed.join("res-1-1.spooltmp").exists());
+        assert!(by_port.join("spool-9-9.spooltmp").exists());
+        assert!(odd.join("a.spooltmp").exists());
+        // 根目录不存在时什么也不做
+        assert!(collect_stale_spool_in(&home.path().join("absent")).is_empty());
+    }
+
+    #[test]
+    fn spool_dir_name_is_stable_and_tied_to_the_start_marker() {
+        let a = spool_dir_name(4242, Some("133801234567890000"));
+        assert_eq!(a, spool_dir_name(4242, Some("133801234567890000")));
+        assert_ne!(a, spool_dir_name(4242, Some("133801234567890001")));
+        assert_eq!(spool_dir_owner(&a), Some(4242));
+        assert_eq!(spool_dir_owner(&spool_dir_name(7, None)), Some(7));
+        for name in ["59820", "7-abc", "7-ABCDEF01", "x-0a0b0c0d", "7-0a0b0c0d0"] {
+            assert_eq!(spool_dir_owner(name), None, "{name}");
+        }
     }
 
     #[test]

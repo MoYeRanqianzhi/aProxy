@@ -15,7 +15,7 @@ pub struct AppState {
     /// 操作，量级同上；serve_forever 组装进 IpcStats 供 IPC 响应读取。
     pub stats: Arc<crate::daemon::IpcStats>,
     /// 磁盘缓存的 spool 临时目录；None = disk_cache 关闭（全程纯内存）。
-    /// 生产路径 `~/.aproxy/spool/<端口>/`，测试可经 Config::spool_dir_override 注入。
+    /// 生产路径 `~/.aproxy/spool/<pid>-<启动标记短哈希>/`，测试可经 Config::spool_dir_override 注入。
     pub spool_dir: Option<PathBuf>,
     /// 重试规则表（源 `config.retry_rules`，空 = 一切请求无限重试），`path` 已预编译。
     /// 启动时编译一次随 AppState 共享，请求热路径只做 is_match。
@@ -110,11 +110,14 @@ impl AppState {
 
         let client = builder.build().expect("构建 reqwest client 失败");
         // 磁盘缓存目录：关闭（disk_cache=false）时为 None——全程纯内存；
-        // 开启时用测试注入覆盖，否则按端口取 ~/.aproxy/spool/<端口>/
+        // 开启时用测试注入覆盖，否则是本进程自己的 <home>/spool/<pid>-<启动标记短哈希>/
         let spool_dir = if config.disk_cache_enabled() {
-            Some(config.spool_dir_override.clone().unwrap_or_else(|| {
-                crate::daemon::spool_dir_for(crate::daemon::port_of(&config.listen_addr))
-            }))
+            Some(
+                config
+                    .spool_dir_override
+                    .clone()
+                    .unwrap_or_else(crate::daemon::own_spool_dir),
+            )
         } else {
             None
         };

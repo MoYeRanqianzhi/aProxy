@@ -798,6 +798,11 @@ impl WatchdogState {
                 "清理了残留的运行期文件与旧日志"
             );
         }
+        // spool 里是请求与响应的全文：实例崩溃之后即使迟迟拉不回来，也不该一直留在盘上
+        let spool = crate::daemon::collect_stale_spool_in(&self.cfg.home.join("spool"));
+        if !spool.is_empty() {
+            tracing::info!(removed = spool.len(), "清理了已退出的进程留下的 spool 目录");
+        }
         if report.logs_paused && !self.gc_pause_reported {
             tracing::warn!(
                 "run 目录里有读不懂的记录（多半由更新版本的 aproxy 写下），旧日志的清理已暂停"

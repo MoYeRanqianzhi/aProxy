@@ -39,3 +39,4 @@
 - [0.2.0 定调](memory/2026-10-11-0.2.0-direction.md) — 用户 2026-10-11：去掉全部兼容（含 0.1.0 原地升级）、前瞻稳定优先、给人看的 i18n 给 agent 的固定英文、注释文档仍中文、Tauri 编进本体默认启用（另出无 UI 版）、Mica 默认关、新增 aproxy skill 命令 [[ipc-v1-upgrade-contract]]
 - [桌面界面风格](memory/2026-10-11-ui-design-style.md) — 用户要求：新颖、略高对比、鲜艳不刺眼、柔和圆润可爱、有动效；先浏览器原型审风格，通过后再接入与做日志性能 [[0.2.0-direction]]
 - [IPC v1 与升级契约](memory/2026-10-06-ipc-v1-upgrade-contract.md) — 跨版本永久接口清单（.pid/.restore/claim/install.state 词表/socket 路径/CLI 含 --handover-from）、早交接由目标版本驱动；0.1.x 兼容层已于 W1 删除，0.1.0 的安装器在交换前失败 [[install-pitfalls]] [[ci-unix-blindspot]]
+- [0.2.0 的配置与设置形状](memory/2026-11-17-config-settings-shape.md) — config.toml、settings.json 的新键、严格解析、分层与写回在哪实现；旧记忆里的 0.1.x 键名按它换；运行时字段名没改；凭据随目标继承 [[config-settings-shape-0-2-0]]

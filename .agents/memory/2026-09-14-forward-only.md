@@ -5,6 +5,8 @@ metadata:
   type: project
 ---
 
+> **2026-11-17 更新**：0.2.0 起文件里的键是 `delivery = "forward"`（config.toml）与 `defaults.delivery`（settings.json），`forward_only` 只剩运行时结构的字段名；`max_body_mb` 同理改叫 `max_request_mb`。见 [[config-settings-shape-0-2-0]]。机制与取舍不变。
+
 2026-09-14 新增：**仅转发模式 `forward_only`**（config.toml 每实例字段 +
 settings.json 全局默认，与 `max_body_mb`/`disk_cache` 完全同款分层）。
 

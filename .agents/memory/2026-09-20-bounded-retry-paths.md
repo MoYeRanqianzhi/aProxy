@@ -5,6 +5,8 @@ metadata:
   type: project
 ---
 
+> **2026-11-17 更新**：0.2.0 起 `bounded_retry_paths` 由 `[[retry.rules]]`（`path`、可选的 `status`、`max_attempts`）取代，上限不再固定为 3 次，放弃时的错误码是 `retry_exhausted`、`details.by = rule:<序号>`。见 [[config-settings-shape-0-2-0]]。下面的事故根因与「不内置 URL」的教训仍然成立。
+
 # 受限重试路径（2026-09-20）
 
 ## 问题与根因

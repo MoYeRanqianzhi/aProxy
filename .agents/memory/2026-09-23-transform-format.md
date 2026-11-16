@@ -1,3 +1,5 @@
+> **2026-11-17 更新**：0.2.0 起配置里没有 `[request_transform]`、`[response_transform]`、`[heartbeat_transform]` 三个表，统一写 `[[format]]` 条目，用 `stages` 声明参与的阶段（`every_attempt` = `stages` 里的 `"retry"`，`mode` 改叫 `process`，`extra` 没有对应物）。见 [[config-settings-shape-0-2-0]]；协议 1 与链在 B10 落地后本条还要再更新。
+
 # 外部转换器（format）+ aproxy-format：设计决策留档
 
 2026-09-23 定稿。功能：aProxy 支持把请求/响应交给外部 format 程序转换

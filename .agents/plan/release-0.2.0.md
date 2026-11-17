@@ -771,3 +771,18 @@
        带 `code` 与 `details`。`formats` 与 `behavior.history` 分别等 B10 与 B8。
     2. §6.6 只读枚举 `enumerate(home)`（四种 liveness、`unreadable`、`gc_paused`、`watchdog`、`processes`）。
     3. `tests/contract_v0_2.rs`：把各模块里钉形状的单测归到一处（或在那里引用它们），验收条目要它。
+- B6 第三部分（2026-11-17）：ca07ac8 快照的 `activity`。
+  - 定下的口径（设计稿只给了样例，没给定义）：
+    1. `in_flight`：从收到请求算到**响应体交付完**（或客户端断开、响应被丢弃）。守卫 `daemon::Counted` 存在响应体里
+       （`proxy/handler.rs` 的 `hold_until_body_ends`，用 `http_body_util::BodyExt::map_frame`），保活、回放、仅转发三条
+       路径一致。入站校验拒掉的请求不计。
+    2. `retrying`：第二次尝试开始（含退避等待）到交付或放弃；交付回放期间不算。
+    3. `rescued_total`：`Outcome::Deliver` 且之前重试过。
+    4. `by_code`：失败的上游尝试记尝试失败码，aproxy 自己结束的请求记终态码——规则给的次数用完时两个都记
+       （`upstream_status` 与 `retry_exhausted`），所以它的总和不等于失败的尝试数。
+    5. `buckets`：30 个 120 秒的桶，旧的在前；`failures` 只数失败的上游尝试。读快照时桶也随时间前移。
+    6. `last_error`：`code`、`details`、`message`（不再带码前缀）、`at`。
+  - 没做的字段：`upgraded_total`（forward 升级为 retry，§10.10 属 B10）、`formats`（B10）、`behavior.history`（B8）。
+  - 每个请求、每次重试、每次失败各锁一次 `IpcStats` 里的互斥锁（临界区只有整数运算）；没有压测过它对吞吐的影响，
+    `docs/benchmark-*.md` 的数字是这之前测的。
+  - 验证：Windows headless 全量 681 通过、0 失败；两个变体 clippy 与 Linux 交叉 clippy 零输出。

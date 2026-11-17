@@ -246,8 +246,13 @@ filter:
 still there but does not answer the control channel"), with port, pid, version, config and the hint
 `aproxy stop <port> --force`. Such an instance is almost always hung; with the watchdog on, its
 hang detection terminates and respawns it on its own. Per answering instance: port, pid, `v<version>`, uptime, idle time, listen address, masked
-upstream, config path, and request and retry counts with the latest error. Extra lines can
-appear:
+upstream, config path (`（没有配置文件）` when it was started without one), and the line
+`请求 <n>  在途 <n>  重试 <n>  救回 <n>  最近错误: …`: requests received, requests still in flight
+(waiting for the upstream, backing off, retrying or still being delivered), upstream retries,
+requests that succeeded only after a retry ("rescued"), and the latest error as
+`"<code>: <English message>"（<age> 前）` or `无` ("none"). Extra lines can appear:
+
+- `正在启动（还没开始接收请求）` ("starting; not accepting requests yet").
 
 - `二进制更换中（install 滚动重启阶段，请勿手动干预此实例）` ("binary swap in progress; do not
   intervene"): `aproxy install` is about to restart this instance. Leave it alone.

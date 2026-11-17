@@ -171,10 +171,7 @@ impl AppState {
             spool_dir,
             config: Arc::new(config),
             client,
-            stats: Arc::new(crate::daemon::IpcStats {
-                last_activity_ms: last_activity_ms.clone(),
-                ..Default::default()
-            }),
+            stats: Arc::new(crate::daemon::IpcStats::sharing(last_activity_ms.clone())),
             last_activity_ms,
             retry_rules,
             request_pool,
@@ -213,11 +210,6 @@ impl AppState {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         format!("{}-x{seq}", self.instance_id)
-    }
-
-    /// 记录一次上游失败摘要（覆盖式，只保留最近一次；IPC/status 展示用）
-    pub(super) fn note_upstream_failure(&self, msg: &str) {
-        self.stats.record_error(msg);
     }
 
     /// 实例闲置时长（秒）：距最近一次收到客户端请求。

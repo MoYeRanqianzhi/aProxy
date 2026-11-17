@@ -25,21 +25,33 @@ pub(super) async fn proxy_handler(State(state): State<AppState>, req: Request) -
 
     // 活动时间戳：收到请求即更新（stop idle / status 筛选的判定依据）
     state.touch_activity();
-    // IPC 观测计数（一条 Relaxed fetch_add，与上面 store 同量级）；计数顺带是请求标识的
-    // 后半段（实例内第 N 个请求，唯一且与 status 的计数一致）
-    let request_seq = state
-        .stats
-        .requests_total
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        + 1;
+    // IPC 观测计数；计数顺带是请求标识的后半段（实例内第 N 个请求，唯一且与 status 的
+    // 计数一致）
+    let request_seq = state.stats.note_request();
+    // 在途数：从这里算起，到响应体交付完（或客户端断开、响应被丢弃）为止
+    let in_flight = state.stats.enter();
     let trace = RequestTrace::new(state.request_id(request_seq));
 
     // 这个请求的全部日志都带 request_id：与响应头 x-aproxy-request-id、错误体里的是同一个串，
     // 拿着其中任何一个都能在日志里找到这个请求的经过
     let span = tracing::info_span!("request", request_id = %trace.request_id);
-    handle(state, req, method, uri, trace)
+    let response = handle(state, req, method, uri, trace)
         .instrument(span)
-        .await
+        .await;
+    hold_until_body_ends(response, in_flight)
+}
+
+/// 把 `guard` 存进响应体里：响应体发完、或客户端断开使它被丢弃时才释放。在途请求数靠它
+/// 算到响应真正交付完为止——处理函数返回时，保活流、回放与仅转发的响应体都还在往外写。
+fn hold_until_body_ends(response: Response, guard: crate::daemon::Counted) -> Response {
+    use http_body_util::BodyExt;
+    response.map(|body| {
+        axum::body::Body::new(body.map_frame(move |frame| {
+            // 引用一下，让闭包按值持有守卫
+            let _held = &guard;
+            frame
+        }))
+    })
 }
 
 /// 通过了入站校验、编好请求标识之后的处理。
@@ -99,7 +111,7 @@ async fn handle(
         }
         Err(ReadBodyError::Storage(e)) => {
             let terminal = Terminal::local_storage_failed(StorageOp::WriteRequest, &e.to_string());
-            state.note_upstream_failure(&terminal.summary());
+            terminal.record_in(&state.stats);
             tracing::error!(code = %terminal.code(), error = %e, "请求体写入磁盘缓存失败");
             return terminal.into_response(&trace);
         }

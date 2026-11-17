@@ -135,7 +135,7 @@ pub(super) async fn apply_request_transform(
                 Err(e) => {
                     let terminal =
                         Terminal::local_storage_failed(StorageOp::ReadRequest, &e.to_string());
-                    state.note_upstream_failure(&terminal.summary());
+                    terminal.record_in(&state.stats);
                     tracing::error!(code = %terminal.code(), error = %e, "请求转换前读取落盘的请求体失败");
                     return Err(terminal);
                 }
@@ -178,7 +178,7 @@ pub(super) async fn apply_request_transform(
         }
         Err(e) => {
             let terminal = request_transform_terminal(&request_format_name(state), &e);
-            state.note_upstream_failure(&terminal.summary());
+            terminal.record_in(&state.stats);
             tracing::warn!(code = %terminal.code(), error = %e, "请求转换失败，终态返回（请求侧转换失败按约定不重试）");
             Err(terminal)
         }

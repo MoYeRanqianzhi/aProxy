@@ -296,24 +296,64 @@ pub enum InstanceState {
     Unknown,
 }
 
-/// 实例的实时观测值（应答时现读）。
+/// 实例的实时观测值（应答时现读）。时刻都是 Unix 毫秒。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Activity {
-    /// 最近一次收到客户端请求的时刻（Unix 毫秒）；还没收到过请求时为启动时刻
+    /// 最近一次收到客户端请求的时刻；还没收到过请求时为启动时刻
     pub last_request_at: u64,
     /// 累计收到的客户端请求数
     pub requests_total: u64,
     /// 累计上游重试次数（首轮之后的所有尝试）
     pub retries_total: u64,
-    /// 最近一次上游失败；从未失败为 null
+    /// 经过至少一次重试、最终成功的请求数
+    #[serde(default)]
+    pub rescued_total: u64,
+    /// 已收到、响应还没交付完的请求数（等上游、退避、重试、回放都算）
+    #[serde(default)]
+    pub in_flight: u64,
+    /// 其中正处在第二次及以后的尝试里（含退避等待）的请求数
+    #[serde(default)]
+    pub retrying: u64,
+    /// 失败的次数，按码分：失败的上游尝试记尝试失败码，aproxy 自己结束的请求记终态码
+    #[serde(default)]
+    pub by_code: std::collections::BTreeMap<String, u64>,
+    /// 最近一小时的走势：[`BUCKET_COUNT`] 个桶，每桶 [`BUCKET_WIDTH_SECS`] 秒，旧的在前
+    #[serde(default)]
+    pub buckets: ActivityBuckets,
+    /// 最近一次失败；从未失败为 null
     pub last_error: Option<LastError>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+/// 每个时间桶的宽度（秒）。
+pub const BUCKET_WIDTH_SECS: u64 = 120;
+/// 保留多少个时间桶。
+pub const BUCKET_COUNT: usize = 30;
+
+/// 按时间桶的计数（快照里的 `activity.buckets`）。三个数组等长，旧的在前，最后一个是
+/// 当前这个桶。
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActivityBuckets {
+    pub width_secs: u64,
+    /// 收到的请求数
+    pub requests: Vec<u64>,
+    /// 重试次数（首轮之后的尝试）
+    pub retries: Vec<u64>,
+    /// 失败的上游尝试数
+    pub failures: Vec<u64>,
+}
+
+/// 最近一次失败。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct LastError {
-    /// 已脱敏的简短摘要
+    /// 码：失败的上游尝试是尝试失败码，aproxy 自己结束的请求是终态码
+    #[serde(default)]
+    pub code: String,
+    /// 这个码带的数据（键与类型见码表）
+    #[serde(default)]
+    pub details: serde_json::Value,
+    /// 已脱敏的一句英文说明，只给日志与兜底显示用
     pub message: String,
-    /// 发生时刻（Unix 毫秒）
+    /// 发生时刻
     pub at: u64,
 }
 
@@ -817,7 +857,7 @@ async fn serve_endpoint(endpoint: String, state: Arc<ControlState>) -> io::Resul
 }
 
 /// 实例的实时观测数据源：代理热路径写入，IPC 响应读取。
-/// 全部 Relaxed——计数器只用于展示与告警，无跨线程因果序需求。
+/// 原子计数全部 Relaxed——只用于展示与告警，无跨线程因果序需求。
 #[derive(Debug, Default)]
 pub struct IpcStats {
     /// 最近一次收到客户端请求的时刻（Unix 毫秒；即 AppState::last_activity_ms，
@@ -827,25 +867,230 @@ pub struct IpcStats {
     pub requests_total: std::sync::atomic::AtomicU64,
     /// 累计上游重试次数（首轮之后的所有尝试）
     pub retries_total: std::sync::atomic::AtomicU64,
-    /// 最近一次上游失败的简短摘要与发生时刻（打码后的短串、Unix 毫秒；None = 从未失败）
-    pub last_error: std::sync::Mutex<Option<(String, u64)>>,
+    /// 经过至少一次重试、最终成功的请求数
+    pub rescued_total: std::sync::atomic::AtomicU64,
+    /// 已收到、响应还没交付完的请求数（由 [`IpcStats::enter`] 的守卫维护）
+    pub in_flight: std::sync::atomic::AtomicU64,
+    /// 正处在第二次及以后的尝试里的请求数（由 [`IpcStats::begin_retrying`] 的守卫维护）
+    pub retrying: std::sync::atomic::AtomicU64,
+    /// 按码的失败计数、时间桶与最近一次失败。一把锁：每个请求、每次重试、每次失败各锁
+    /// 一次，临界区里只有几次整数运算
+    tally: std::sync::Mutex<Tally>,
     /// 二进制更换阶段的到期时刻（Unix 毫秒）：prepare_swap 时写下，晚于现在就算在这个
     /// 阶段里。0 = 没进入过；重启自然清除
     pub swap_until_ms: std::sync::atomic::AtomicU64,
 }
 
-impl IpcStats {
-    /// 记录一次上游失败（覆盖式：只保留最近一次）。`error` 须已打码。
-    pub fn record_error(&self, error: &str) {
-        let now = now_millis();
-        // 截断到 200 字符：错误摘要进 IPC 响应与 status 展示，防止上游返回
-        // 超长错误文本把响应行撑爆
-        let mut brief: String = error.chars().take(200).collect();
-        if brief.is_empty() {
-            brief = "未知错误".to_string();
+/// [`IpcStats`] 里要在一把锁下一起改的部分。
+#[derive(Debug, Default)]
+struct Tally {
+    by_code: std::collections::BTreeMap<String, u64>,
+    buckets: Buckets,
+    last_error: Option<LastError>,
+}
+
+/// 时间桶：三条等长的计数，下标 0 最旧，最后一个是序号为 `newest` 的桶。
+#[derive(Debug)]
+struct Buckets {
+    /// 最后一个桶的序号：Unix 秒除以 [`BUCKET_WIDTH_SECS`]
+    newest: u64,
+    requests: [u64; BUCKET_COUNT],
+    retries: [u64; BUCKET_COUNT],
+    failures: [u64; BUCKET_COUNT],
+}
+
+impl Default for Buckets {
+    fn default() -> Self {
+        Buckets {
+            newest: 0,
+            requests: [0; BUCKET_COUNT],
+            retries: [0; BUCKET_COUNT],
+            failures: [0; BUCKET_COUNT],
         }
-        if let Ok(mut slot) = self.last_error.lock() {
-            *slot = Some((brief, now));
+    }
+}
+
+impl Buckets {
+    /// 把窗口推进到 `now_ms` 所在的桶：过去的桶往前挪，新露出来的桶清零。时钟回拨时
+    /// 不动（记进当前最新的那个桶）。
+    fn advance(&mut self, now_ms: u64) {
+        let index = now_ms / 1000 / BUCKET_WIDTH_SECS;
+        let shift = index.saturating_sub(self.newest);
+        if shift == 0 {
+            return;
+        }
+        self.newest = index;
+        for counts in [&mut self.requests, &mut self.retries, &mut self.failures] {
+            if shift >= BUCKET_COUNT as u64 {
+                counts.fill(0);
+            } else {
+                let shift = shift as usize;
+                counts.rotate_left(shift);
+                counts[BUCKET_COUNT - shift..].fill(0);
+            }
+        }
+    }
+
+    fn view(&self) -> ActivityBuckets {
+        ActivityBuckets {
+            width_secs: BUCKET_WIDTH_SECS,
+            requests: self.requests.to_vec(),
+            retries: self.retries.to_vec(),
+            failures: self.failures.to_vec(),
+        }
+    }
+}
+
+/// 存活期间让 [`IpcStats`] 的一个计数加一的守卫：丢弃时减回去。
+#[derive(Debug)]
+pub struct Counted {
+    stats: Arc<IpcStats>,
+    which: fn(&IpcStats) -> &std::sync::atomic::AtomicU64,
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        (self.which)(&self.stats).fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl IpcStats {
+    /// 一份全新的观测值，活动时间戳用给定的那一个（代理层的 AppState 也持有它）。
+    pub fn sharing(last_activity_ms: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        IpcStats {
+            last_activity_ms,
+            ..Default::default()
+        }
+    }
+
+    fn counted(self: &Arc<Self>, which: fn(&IpcStats) -> &std::sync::atomic::AtomicU64) -> Counted {
+        which(self).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Counted {
+            stats: self.clone(),
+            which,
+        }
+    }
+
+    /// 一个请求进入处理：在途数加一，守卫丢弃时减回去。
+    pub fn enter(self: &Arc<Self>) -> Counted {
+        self.counted(|stats| &stats.in_flight)
+    }
+
+    /// 一个请求开始它的第二次尝试：重试中的请求数加一，守卫丢弃时减回去。
+    pub fn begin_retrying(self: &Arc<Self>) -> Counted {
+        self.counted(|stats| &stats.retrying)
+    }
+
+    fn tally(&self) -> std::sync::MutexGuard<'_, Tally> {
+        // 锁被毒化只可能是持锁时 panic；计数照常用，不让一次 panic 废掉整个观测
+        self.tally.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 记一个收到的请求，返回它是本实例的第几个请求。
+    pub fn note_request(&self) -> u64 {
+        self.note_request_at(now_millis())
+    }
+
+    fn note_request_at(&self, now_ms: u64) -> u64 {
+        let mut tally = self.tally();
+        tally.buckets.advance(now_ms);
+        tally.buckets.requests[BUCKET_COUNT - 1] += 1;
+        self.requests_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+
+    /// 记一次重试（首轮之后的一次尝试开始）。
+    pub fn note_retry(&self) {
+        self.note_retry_at(now_millis());
+    }
+
+    fn note_retry_at(&self, now_ms: u64) {
+        let mut tally = self.tally();
+        tally.buckets.advance(now_ms);
+        tally.buckets.retries[BUCKET_COUNT - 1] += 1;
+        self.retries_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 记一个经过重试之后成功的请求。
+    pub fn note_rescued(&self) {
+        self.rescued_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 记一次失败的上游尝试：按码计数、进时间桶，并成为「最近一次失败」。`message` 与
+    /// `details` 须已打码。
+    pub fn note_failed_attempt(
+        &self,
+        code: &str,
+        details: &serde_json::Map<String, serde_json::Value>,
+        message: &str,
+    ) {
+        self.note_failure_at(now_millis(), code, details, message, true);
+    }
+
+    /// 记一个被 aproxy 自己结束的请求（终态码）：按码计数，并成为「最近一次失败」。不进
+    /// 时间桶的 `failures`——那里数的是失败的上游尝试。`message` 与 `details` 须已打码。
+    pub fn note_terminal(
+        &self,
+        code: &str,
+        details: &serde_json::Map<String, serde_json::Value>,
+        message: &str,
+    ) {
+        self.note_failure_at(now_millis(), code, details, message, false);
+    }
+
+    fn note_failure_at(
+        &self,
+        now_ms: u64,
+        code: &str,
+        details: &serde_json::Map<String, serde_json::Value>,
+        message: &str,
+        attempt: bool,
+    ) {
+        let mut tally = self.tally();
+        *tally.by_code.entry(code.to_string()).or_insert(0) += 1;
+        if attempt {
+            tally.buckets.advance(now_ms);
+            tally.buckets.failures[BUCKET_COUNT - 1] += 1;
+        }
+        tally.last_error = Some(LastError {
+            code: code.to_string(),
+            details: serde_json::Value::Object(details.clone()),
+            // 截断到 200 字符：说明进 IPC 应答与 status 展示，防止上游返回的超长错误文本
+            // 把应答行撑大
+            message: message.chars().take(200).collect(),
+            at: now_ms,
+        });
+    }
+
+    /// 最近一次失败；从未失败为 None。
+    pub fn last_error(&self) -> Option<LastError> {
+        self.tally().last_error.clone()
+    }
+
+    /// 此刻的观测值（快照里的 `activity`）。`started_at` 是实例的启动时刻：还没收到过请求
+    /// 时，「最近一次请求」取它。
+    pub fn activity(&self, started_at: u64) -> Activity {
+        self.activity_at(now_millis(), started_at)
+    }
+
+    fn activity_at(&self, now_ms: u64, started_at: u64) -> Activity {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut tally = self.tally();
+        // 推进到现在：长时间没有请求的实例，桶也要跟着时间往前走
+        tally.buckets.advance(now_ms);
+        Activity {
+            last_request_at: self.last_activity_ms.load(Relaxed).max(started_at),
+            requests_total: self.requests_total.load(Relaxed),
+            retries_total: self.retries_total.load(Relaxed),
+            rescued_total: self.rescued_total.load(Relaxed),
+            in_flight: self.in_flight.load(Relaxed),
+            retrying: self.retrying.load(Relaxed),
+            by_code: tally.by_code.clone(),
+            buckets: tally.buckets.view(),
+            last_error: tally.last_error.clone(),
         }
     }
 }
@@ -1672,22 +1917,11 @@ fn status_snapshot(state: &ControlState) -> InstanceStatus {
     } else {
         InstanceState::Serving
     };
-    let last_error = stats.last_error.lock().ok().and_then(|slot| {
-        slot.as_ref().map(|(message, at)| LastError {
-            message: message.clone(),
-            at: *at,
-        })
-    });
     InstanceStatus {
         instance: state.record.clone(),
         state: phase,
         behavior: state.behavior.clone(),
-        activity: Activity {
-            last_request_at: state.last_request_at(),
-            requests_total: stats.requests_total.load(Relaxed),
-            retries_total: stats.retries_total.load(Relaxed),
-            last_error,
-        },
+        activity: stats.activity(state.record.started_at),
         ops: IpcOp::NAMES.iter().map(|name| name.to_string()).collect(),
         features: IpcOp::FEATURES
             .iter()
@@ -2341,13 +2575,14 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            reply,
+            reply.replace(&["0"; BUCKET_COUNT].join(","), "ZEROS"),
             concat!(
                 r#"{"v":1,"ok":true,"result":{"#,
                 r#""instance":{"pid":42,"start":"","instance_id":"19ac3f2e8b5d1a2b","version":"0.0.0-test","listen_addr":"127.0.0.1:12345","config_path":"C:/tmp/config.toml","base_url":"https://api.example.com","started_at":1700000000000,"log_path":null,"foreground":false},"#,
                 r#""state":"serving","#,
                 r#""behavior":{"delivery":"retry","disk_cache":true,"keepalive":{"trigger":"any","interval_secs":15},"retry_rules":1},"#,
-                r#""activity":{"last_request_at":1700000000000,"requests_total":120,"retries_total":7,"last_error":null},"#,
+                r#""activity":{"last_request_at":1700000000000,"requests_total":120,"retries_total":7,"rescued_total":0,"in_flight":0,"retrying":0,"by_code":{},"#,
+                r#""buckets":{"width_secs":120,"requests":[ZEROS],"retries":[ZEROS],"failures":[ZEROS]},"last_error":null},"#,
                 r#""ops":["ping","shutdown","prepare_swap"],"#,
                 r#""features":["shutdown.if_idle_secs","shutdown.keep_restore","prepare_swap.ttl_secs"]}}"#
             )
@@ -2487,9 +2722,11 @@ mod tests {
         let (state, mut rx) = control(record);
         state.stats.requests_total.store(7, Ordering::Relaxed);
         state.stats.retries_total.store(2, Ordering::Relaxed);
-        state
-            .stats
-            .record_error("上游返回 502 Bad Gateway（错误内容，重试）");
+        state.stats.note_failed_attempt(
+            "upstream_status",
+            serde_json::json!({ "status": 502 }).as_object().unwrap(),
+            "the upstream returned 502",
+        );
         let server = tokio::spawn(serve_endpoint(endpoint.clone(), state.clone()));
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -2504,6 +2741,11 @@ mod tests {
         assert_eq!(status.activity.retries_total, 2);
         let last = status.activity.last_error.expect("应带最近错误");
         assert!(last.message.contains("502") && last.at > 0);
+        assert_eq!(last.code, "upstream_status");
+        assert_eq!(last.details["status"], 502);
+        assert_eq!(status.activity.by_code["upstream_status"], 1);
+        assert_eq!(status.activity.buckets.failures.len(), BUCKET_COUNT);
+        assert_eq!(status.activity.buckets.failures.last(), Some(&1));
         // 还没收到过请求：最近活动取启动时刻，不是 0
         assert_eq!(status.activity.last_request_at, status.instance.started_at);
 
@@ -2618,22 +2860,93 @@ mod tests {
     }
 
     #[test]
-    fn ipc_stats_record_error_overwrites_and_truncates() {
+    fn last_error_is_overwritten_and_its_message_truncated() {
         let stats = IpcStats::default();
-        assert!(stats.last_error.lock().unwrap().is_none());
-        stats.record_error("第一次错误");
-        stats.record_error("第二次错误");
-        {
-            let slot = stats.last_error.lock().unwrap();
-            let (msg, _) = slot.as_ref().unwrap();
-            assert!(msg.contains("第二次"), "应覆盖为最近一次: {msg}");
+        assert!(stats.last_error().is_none());
+        let none = serde_json::Map::new();
+        stats.note_failed_attempt("upstream_status", &none, "first");
+        stats.note_terminal("retry_exhausted", &none, "second");
+        let last = stats.last_error().unwrap();
+        assert_eq!(
+            (last.code.as_str(), last.message.as_str()),
+            ("retry_exhausted", "second")
+        );
+        // 超长的说明截断到 200 字符（按 char，多字节不撕裂）
+        stats.note_failed_attempt("upstream_connect_failed", &none, &"长".repeat(500));
+        assert_eq!(stats.last_error().unwrap().message.chars().count(), 200);
+    }
+
+    /// 计数与时间桶：请求、重试、失败的尝试各进各的桶；终态码只进按码计数；窗口随时间
+    /// 前移，移出窗口的桶清零。
+    #[test]
+    fn activity_counts_by_code_and_by_time_bucket() {
+        let stats = Arc::new(IpcStats::default());
+        let none = serde_json::Map::new();
+        let width_ms = BUCKET_WIDTH_SECS * 1000;
+        let t0 = 1_760_190_000_000 / width_ms * width_ms;
+
+        assert_eq!(stats.note_request_at(t0), 1);
+        assert_eq!(stats.note_request_at(t0 + 1), 2);
+        stats.note_retry_at(t0 + 2);
+        stats.note_failure_at(t0 + 3, "upstream_status", &none, "x", true);
+        stats.note_failure_at(t0 + 4, "retry_exhausted", &none, "y", false);
+        // 下一个桶
+        assert_eq!(stats.note_request_at(t0 + width_ms), 3);
+        stats.note_failure_at(t0 + width_ms, "upstream_status", &none, "z", true);
+        stats.note_rescued();
+
+        let activity = stats.activity_at(t0 + width_ms + 5, t0);
+        let tail = |counts: &[u64]| counts[BUCKET_COUNT - 2..].to_vec();
+        assert_eq!(activity.buckets.width_secs, BUCKET_WIDTH_SECS);
+        for counts in [
+            &activity.buckets.requests,
+            &activity.buckets.retries,
+            &activity.buckets.failures,
+        ] {
+            assert_eq!(counts.len(), BUCKET_COUNT);
         }
-        // 超长错误截断到 200 字符（按 char，多字节不撕裂）
-        let long = "长".repeat(500);
-        stats.record_error(&long);
-        let slot = stats.last_error.lock().unwrap();
-        let (msg, _) = slot.as_ref().unwrap();
-        assert_eq!(msg.chars().count(), 200);
+        assert_eq!(tail(&activity.buckets.requests), [2, 1]);
+        assert_eq!(tail(&activity.buckets.retries), [1, 0]);
+        assert_eq!(
+            tail(&activity.buckets.failures),
+            [1, 1],
+            "终态码不进 failures"
+        );
+        assert_eq!(activity.by_code["upstream_status"], 2);
+        assert_eq!(activity.by_code["retry_exhausted"], 1);
+        assert_eq!(
+            (
+                activity.requests_total,
+                activity.retries_total,
+                activity.rescued_total
+            ),
+            (3, 1, 1)
+        );
+        assert_eq!(activity.last_error.unwrap().code, "upstream_status");
+
+        // 没有新事件，只是时间过去：读快照时桶照样前移
+        let later = stats.activity_at(t0 + 3 * width_ms, t0);
+        assert_eq!(later.buckets.requests[BUCKET_COUNT - 4..], [2, 1, 0, 0]);
+        // 整个窗口都过去了：全部清零，累计值不变
+        let much_later = stats.activity_at(t0 + (BUCKET_COUNT as u64 + 5) * width_ms, t0);
+        assert!(much_later.buckets.requests.iter().all(|n| *n == 0));
+        assert_eq!(much_later.requests_total, 3);
+        // 时钟回拨：记进当前最新的桶，不动窗口
+        stats.note_request_at(t0);
+        let after_rewind = stats.activity_at(t0, t0);
+        assert_eq!(after_rewind.buckets.requests.last(), Some(&1));
+
+        // 在途与重试中由守卫维护
+        let a = stats.enter();
+        let b = stats.enter();
+        let retrying = stats.begin_retrying();
+        let now = stats.activity_at(t0, t0);
+        assert_eq!((now.in_flight, now.retrying), (2, 1));
+        drop((a, retrying));
+        let now = stats.activity_at(t0, t0);
+        assert_eq!((now.in_flight, now.retrying), (1, 0));
+        drop(b);
+        assert_eq!(stats.activity_at(t0, t0).in_flight, 0);
     }
 
     #[tokio::test]

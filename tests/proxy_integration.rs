@@ -132,6 +132,14 @@ async fn bind_random_router(router: Router) -> (String, tokio::task::JoinHandle<
     (url, handle)
 }
 
+/// 实例记下的最近一次失败：`"<码>: <说明>"` 与发生时刻；从未失败为 None。
+fn recorded_error(state: &aproxy::proxy::AppState) -> Option<(String, u64)> {
+    state
+        .stats
+        .last_error()
+        .map(|e| (format!("{}: {}", e.code, e.message), e.at))
+}
+
 fn proxy_config_for(upstream: &str) -> Config {
     isolate_env_proxy();
     Config {
@@ -3969,7 +3977,7 @@ async fn forward_only_unreachable_upstream_returns_502() {
         0,
         "仅转发模式不得重试：重试计数必须为 0（常规模式对不可达上游会无限重试）"
     );
-    let last_error = probe.stats.last_error.lock().unwrap().clone();
+    let last_error = recorded_error(&probe);
     let msg = last_error.map(|(m, _)| m).unwrap_or_default();
     assert!(
         msg.starts_with("upstream_failed: "),
@@ -4126,6 +4134,8 @@ async fn forward_only_refreshes_activity_while_response_streams() {
     let mut stream = resp.bytes_stream();
     let first = stream.next().await.unwrap().unwrap();
     assert_eq!(first.as_ref(), b"data: chunk-A\n\n");
+    // 响应头早已交给客户端，但响应体还在往外写：这个请求仍然算在途
+    assert_eq!(probe.stats.in_flight.load(Ordering::Relaxed), 1);
 
     // 拨回远古：此后到 chunk-B 到达之前，上游被门控挂住，不可能有任何刷新
     // （请求入口那次 store 早已发生，重试轮也不存在——本模式无重试）
@@ -4140,6 +4150,18 @@ async fn forward_only_refreshes_activity_while_response_streams() {
         activity > 1,
         "转发 chunk 时必须刷新活动时间戳，否则长流实例会被 stop idle 误杀；实际仍为 {activity}"
     );
+
+    // 响应体交付完（或客户端丢掉了它）之后不再算在途
+    drop(stream);
+    let mut in_flight = 1;
+    for _ in 0..50 {
+        in_flight = probe.stats.in_flight.load(Ordering::Relaxed);
+        if in_flight == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(in_flight, 0, "响应体结束后在途数应回到 0");
 }
 
 // ---------------------------------------------------------------------------
@@ -4210,7 +4232,7 @@ async fn forward_only_client_upload_abort_is_not_an_upstream_failure() {
 
     // 归因锚点：客户端自己断开**不得**污染「最近错误」——否则 status 会把矛头
     // 指向根本没收到完整请求体的上游
-    let last_error = probe.stats.last_error.lock().unwrap().clone();
+    let last_error = recorded_error(&probe);
     assert!(
         last_error.is_none(),
         "客户端主动断开不是上游失败，不得记入 last_error，实际: {last_error:?}"
@@ -4300,7 +4322,7 @@ async fn inbound_forged_host_is_rejected_locally_without_forwarding() {
         );
         // 被拒请求不是代理流量：不计数、不记最近错误（不进入任何转发/重试路径）
         assert_eq!(probe.stats.requests_total.load(Ordering::Relaxed), 0);
-        assert!(probe.stats.last_error.lock().unwrap().is_none());
+        assert!(probe.stats.last_error().is_none());
     }
 }
 
@@ -4616,7 +4638,7 @@ async fn credentials_masked_in_logs_last_error_and_502() {
     });
     let mut recorded = None;
     for _ in 0..100 {
-        recorded = probe.stats.last_error.lock().unwrap().clone();
+        recorded = recorded_error(&probe);
         if recorded.is_some() {
             break;
         }
@@ -4651,7 +4673,7 @@ async fn credentials_masked_in_logs_last_error_and_502() {
         !body.contains("QUERYSECRET3"),
         "502 正文泄露查询串值: {body}"
     );
-    let last_error = probe.stats.last_error.lock().unwrap().clone().unwrap().0;
+    let last_error = recorded_error(&probe).unwrap().0;
     assert!(!last_error.contains("QUERYSECRET3"), "{last_error}");
 
     let text = logs.text();
@@ -6458,6 +6480,14 @@ fn ipc_stats_reflect_real_traffic() {
         "首个请求上游回 500，必然产生至少一次重试；IPC 报告的重试数为 {}",
         info.activity.retries_total
     );
+    // 那个请求经过重试才成功：算救回一个；失败的尝试按码计数、进了当前的时间桶
+    assert_eq!(info.activity.rescued_total, 1, "{:?}", info.activity);
+    assert_eq!(info.activity.by_code.get("upstream_status"), Some(&1));
+    assert_eq!(info.activity.buckets.requests.iter().sum::<u64>(), 3);
+    assert_eq!(info.activity.buckets.retries.iter().sum::<u64>(), 1);
+    assert_eq!(info.activity.buckets.failures.iter().sum::<u64>(), 1);
+    // 三个请求都已交付完
+    assert_eq!((info.activity.in_flight, info.activity.retrying), (0, 0));
     // 重试本身是成功收尾的，但「最近错误」保留覆盖式的最后一次失败记录——
     // 这一半此前完全没断言（接线曾恒为 None）
     let last_error = info
@@ -6613,8 +6643,8 @@ fn ipc_stats_reflect_forward_only_traffic() {
         .last_error
         .clone()
         .expect("仅转发模式的上游失败必须经 IPC 可见（status 的「最近错误」）");
-    assert!(
-        last_error.message.starts_with("upstream_failed: "),
+    assert_eq!(
+        last_error.code, "upstream_failed",
         "仅转发模式的上游失败必须经 IPC 可见（status 的「最近错误」），实际: {last_error:?}"
     );
     assert!(
@@ -6916,7 +6946,7 @@ async fn buffered_client_upload_abort_is_client_body_aborted() {
     );
     assert_eq!(hits.load(Ordering::SeqCst), 0, "请求体没收完，不得发往上游");
     assert!(
-        probe.stats.last_error.lock().unwrap().is_none(),
+        probe.stats.last_error().is_none(),
         "客户端主动断开不是上游失败，不得记入最近错误"
     );
 }
@@ -6954,7 +6984,7 @@ async fn oversized_upstream_response_is_response_too_large() {
     assert_eq!(aproxy["details"]["limit_bytes"], 1024 * 1024);
     assert_eq!(aproxy["attempts"], 1);
     assert_eq!(counter.load(Ordering::SeqCst), 1, "不重试");
-    let last_error = probe.stats.last_error.lock().unwrap().clone().unwrap().0;
+    let last_error = recorded_error(&probe).unwrap().0;
     assert!(
         last_error.starts_with("response_too_large: "),
         "{last_error}"
@@ -7299,7 +7329,7 @@ async fn first_byte_timeout_has_its_own_limit_and_code() {
         "应在约 1 秒的首字节时限之后重试，实际 {elapsed:?}"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-    let last_error = probe.stats.last_error.lock().unwrap().clone().unwrap().0;
+    let last_error = recorded_error(&probe).unwrap().0;
     assert!(
         last_error.starts_with("upstream_first_byte_timeout: "),
         "{last_error}"
@@ -7341,7 +7371,7 @@ async fn read_idle_timeout_has_its_own_limit_and_code() {
         "应在约 1 秒的读空闲时限之后重试，实际 {elapsed:?}"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-    let last_error = probe.stats.last_error.lock().unwrap().clone().unwrap().0;
+    let last_error = recorded_error(&probe).unwrap().0;
     assert!(
         last_error.starts_with("upstream_read_idle_timeout: "),
         "{last_error}"

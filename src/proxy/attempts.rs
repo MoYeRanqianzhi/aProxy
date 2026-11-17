@@ -293,6 +293,8 @@ pub(super) async fn run_attempts(
 
     let max_backoff = state.config.max_retry_backoff_secs;
     let mut attempt: u32 = 0;
+    // 「重试中」的计数守卫：第二次尝试开始时拿到，交付之前放掉；别的出口随函数返回丢弃
+    let mut retrying: Option<crate::daemon::Counted> = None;
     loop {
         attempt += 1;
         r.note_attempt(attempt);
@@ -302,10 +304,11 @@ pub(super) async fn run_attempts(
             // stop idle / status --idle 误判为闲置并强退，恰恰杀掉最需要「不中断」保障的
             // 实例（M1）。放在重试轮开头而非退避之后：退避等待期间的实例也视为活跃。
             state.touch_activity();
-            state
-                .stats
-                .retries_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state.stats.note_retry();
+            // 从第二次尝试起算「重试中」，直到交付或放弃
+            if retrying.is_none() {
+                retrying = Some(state.stats.begin_retrying());
+            }
             let delay = retry::delay_for_attempt(attempt - 1, max_backoff);
             if delay.is_zero() {
                 tracing::warn!(attempt, "立即重试");
@@ -356,7 +359,7 @@ pub(super) async fn run_attempts(
 
         match classify(attempt, result, &rules) {
             Outcome::Retry { failure } => {
-                state.note_upstream_failure(&failure.summary());
+                failure.record_in(&state.stats);
                 tracing::warn!(
                     attempt,
                     code = %failure.code,
@@ -368,6 +371,10 @@ pub(super) async fn run_attempts(
                 // 下一轮尝试很快成功时客户端仍拿到上游真实头
             }
             Outcome::Deliver(response) => {
+                // 回放期间它不再是「重试中」；经过重试才成功的算救回一个
+                if retrying.take().is_some() {
+                    state.stats.note_rescued();
+                }
                 deliver(state, r, &req, &trace, response, max_spool_bytes).await;
                 return;
             }
@@ -380,7 +387,9 @@ pub(super) async fn run_attempts(
                 // `details.by` 说明是谁给的次数：第几条重试规则
                 let by = format!("rule:{rule}");
                 let terminal = Terminal::retry_exhausted(&by, attempt, &failure);
-                state.note_upstream_failure(&terminal.summary());
+                // 这次尝试也是一次失败的尝试；随后的终态成为「最近一次失败」
+                failure.record_in(&state.stats);
+                terminal.record_in(&state.stats);
                 tracing::warn!(attempt, code = %terminal.code(), last_code = failure.code, status = %status, rule, "重试规则给的尝试次数用完，不再重试");
                 if !r.is_committed() {
                     // 尚未向客户端写出任何字节：原样交付最后一次失败响应（状态码与体保真），
@@ -403,7 +412,7 @@ pub(super) async fn run_attempts(
             }
             Outcome::TooLarge => {
                 let terminal = Terminal::response_too_large(max_spool_bytes);
-                state.note_upstream_failure(&terminal.summary());
+                terminal.record_in(&state.stats);
                 tracing::error!(
                     attempt,
                     code = %terminal.code(),
@@ -414,7 +423,7 @@ pub(super) async fn run_attempts(
             }
             Outcome::SpoolFailed(op, e) => {
                 let terminal = Terminal::local_storage_failed(op, &e);
-                state.note_upstream_failure(&terminal.summary());
+                terminal.record_in(&state.stats);
                 tracing::error!(attempt, code = %terminal.code(), error = %e, "本地 spool 故障，终止重试");
                 r.finish(terminal, &trace).await;
                 return;
@@ -504,7 +513,7 @@ async fn deliver(
                 }
                 Err(e) => {
                     let terminal = Terminal::decode_failed(&encoding);
-                    state.note_upstream_failure(&terminal.summary());
+                    terminal.record_in(&state.stats);
                     tracing::warn!(
                         attempt,
                         code = %terminal.code(),

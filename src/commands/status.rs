@@ -59,16 +59,26 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
             config_label(&info.config_path)
         );
         let err_text = match &activity.last_error {
+            // 码在前，便于按码检索；没有码的（更旧的实例）只显示说明
             Some(e) => format!(
-                "\"{}\"（{} 前）",
+                "\"{}{}\"（{} 前）",
+                if e.code.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}: ", e.code)
+                },
                 e.message,
                 humanize_duration(now.saturating_sub(e.at) / 1000)
             ),
             None => "无".to_string(),
         };
         println!(
-            "    请求 {}  重试 {}  最近错误: {}",
-            activity.requests_total, activity.retries_total, err_text
+            "    请求 {}  在途 {}  重试 {}  救回 {}  最近错误: {}",
+            activity.requests_total,
+            activity.in_flight,
+            activity.retries_total,
+            activity.rescued_total,
+            err_text
         );
         match status.state {
             daemon::InstanceState::Serving => {}

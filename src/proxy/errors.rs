@@ -138,9 +138,10 @@ impl AttemptFailure {
         failure
     }
 
-    /// 记进实例「最近错误」的那一行：码在前，便于按码检索
-    pub(super) fn summary(&self) -> String {
-        format!("{}: {}", self.code, self.message)
+    /// 记进实例的观测值：按码计数、进时间桶，并成为「最近一次失败」（status 与界面里
+    /// 看得到）
+    pub(super) fn record_in(&self, stats: &crate::daemon::IpcStats) {
+        stats.note_failed_attempt(self.code, &self.details, &self.message);
     }
 }
 
@@ -175,9 +176,9 @@ impl Terminal {
         self.code
     }
 
-    /// 记进实例「最近错误」的那一行
-    pub(super) fn summary(&self) -> String {
-        format!("{}: {}", self.code, self.message)
+    /// 记进实例的观测值：按码计数，并成为「最近一次失败」
+    pub(super) fn record_in(&self, stats: &crate::daemon::IpcStats) {
+        stats.note_terminal(self.code, &self.details, &self.message);
     }
 
     /// Host 不在允许范围

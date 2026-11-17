@@ -120,10 +120,12 @@ pub(super) async fn forward_only_proxy(
                 tracing::error!(code = %"client_body_aborted", error = %failure.message, target = %masked_target, "客户端请求体传输中断，已中止上游请求");
                 return Terminal::client_body_aborted().into_response(&trace);
             }
-            // 上游失败不重试（本模式的定义），但必须记进 note_upstream_failure，
-            // 否则 status 的「最近错误」对这类实例永久显示「无」
+            // 上游失败不重试（本模式的定义），但必须记进实例的观测值，否则 status 的
+            // 「最近错误」对这类实例永久显示「无」。这一次尝试记一次失败的尝试，随后的
+            // 终态成为「最近一次失败」
             let terminal = Terminal::upstream_failed(&failure);
-            state.note_upstream_failure(&terminal.summary());
+            failure.record_in(&state.stats);
+            terminal.record_in(&state.stats);
             tracing::warn!(code = %terminal.code(), last_code = failure.code, error = %failure.message, target = %masked_target, "上游请求失败（仅转发模式不重试）");
             return terminal.into_response(&trace);
         }
@@ -180,9 +182,9 @@ pub(super) async fn forward_only_proxy(
                     Ok(None) => None,
                     Err(failure) => {
                         // 上游响应流中断：**直接截断**——绝不注入任何上游未发出的字节（那
-                        // 是伪造数据），也不重试（本模式已放弃重试能力）。错误记入
-                        // note_upstream_failure 并带上已转发字节数，便于判断断在了哪里。
-                        state.note_upstream_failure(&failure.summary());
+                        // 是伪造数据），也不重试（本模式已放弃重试能力）。错误记进实例的
+                        // 观测值并带上已转发字节数，便于判断断在了哪里。
+                        failure.record_in(&state.stats);
                         tracing::warn!(
                             code = %failure.code,
                             error = %failure.message,

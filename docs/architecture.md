@@ -43,7 +43,11 @@ home 的实例。
 - `state`：`starting`/`serving`/`swap_prepared`/`stopping`，不认识的值读作 `unknown`；
 - `behavior`：行为摘要（默认投递方式 `delivery`、`disk_cache`、`keepalive` 的触发方式与间隔、
   重试规则条数），枚举值按字符串传；
-- `activity`：最近请求时刻、请求数、重试数、最近错误（时刻都是 Unix 毫秒）；
+- `activity`：最近请求时刻、请求数 `requests_total`、重试数 `retries_total`、救回数
+  `rescued_total`（经过重试才成功的请求）、在途数 `in_flight`（算到响应体交付完为止）、其中
+  重试中的 `retrying`、按码的失败计数 `by_code`（失败的上游尝试记尝试失败码，aproxy 自己
+  结束的请求记终态码）、`buckets`（最近 30 个 120 秒的桶：请求、重试、失败的尝试，旧的在前）、
+  最近一次失败 `last_error`（`code`、`details`、`message`、`at`）；时刻都是 Unix 毫秒；
 - `ops` 与 `features`：实例支持的 op，与它认得的 op 参数（名字是 `<op>.<参数>`，如
   `shutdown.keep_restore`）。带一个参数之前先查 `features`——不认识的参数会让整个请求被拒。
 
@@ -309,7 +313,7 @@ magic number，连「这是压缩体」都认不出；2026-09-14 的 Cloudflare 
 了本产品最核心的重试保障，请勿当作普通开关随手打开。
 
 - **分叉点**：在 `read_request_body` 之前判定（否则缓冲已发生，模式失去意义），
-  且在 `requests_total.fetch_add` 之后（否则 status 的请求数恒为 0）。
+  且在请求计数（`IpcStats::note_request`）之后（否则 status 的请求数恒为 0）。
 - **请求体**：`req.into_body().into_data_stream()` 经计数适配器交给
   `reqwest::Body::wrap_stream` 流式直发——一律流式，不做空 body 特判；不缓冲、
   不落盘。计数在流式途中进行，超 `max_request_mb` 即先读掉客户端剩余的请求体（同

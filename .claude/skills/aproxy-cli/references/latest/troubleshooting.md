@@ -22,8 +22,9 @@ the aproxy-format skill's troubleshooting.md.
 
 ## Before you change anything
 
-- Run `aproxy status`. It lists each running instance with port, upstream, config file, request and
-  retry counts, and `最近错误` ("latest error"), which reads `<code>: <English message>`, for example
+- Run `aproxy status`. It lists each running instance with port, upstream, config file, the counts
+  `请求` (requests), `在途` (in flight), `重试` (retries) and `救回` (succeeded after a retry), and
+  `最近错误` ("latest error"), which reads `<code>: <English message>`, for example
   `upstream_status: the upstream returned 503`. Identify the instance the user means, and whether your
   own session runs through it, before stopping or restarting anything: a stop or restart cuts every
   in-flight request on that instance.

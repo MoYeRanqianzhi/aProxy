@@ -728,3 +728,27 @@
     4. 启动要 9 秒的 format 不被判为就绪超时：时限已是 30 秒，没有专门的测试（format 在启动时握手属于 B10a）。
     5. status 与 doctor 还不展示看护者记录（在任与否、最近的重拉）与「日志清理因读不懂的记录而暂停」：等 B9 的
        status 输出改版一起做。
+- B6 第一部分（2026-11-17）：defb916 实例记录 `run/<端口>.instance.json`（`daemon::InstanceRecord`，形状由单测
+  `instance_record_shape_is_pinned` 钉着；盘上是 `schema` 在前、其余与快照里的 `instance` 相同）。
+  - 身份锚点从数字的进程创建时间换成台账的启动标记：`process::record_identity(pid, &str)`、`RecordIdentity::Alive`
+    不再带值；按记录结束进程走 `process::terminate_marked_process`（内部是 `ledger::terminate`，会等进程退出、
+    属主不同不结束）。数字创建时间的 `terminate_verified_process` 只剩两处用：install 里刚拉起、还没写记录的子进程。
+  - 时刻统一为 Unix 毫秒：`started_at`、`activity.last_request_at`、`last_error.at`（`daemon::now_millis`）；
+    `ops::list::Listing.now` 也是毫秒，闲置秒数除以 1000。
+  - 实例每 30 秒核对一次自己的记录，丢了或内容不是自己的就补写；已在退出的不补写。
+  - **alpha.1、alpha.2 启动的实例对本版本不可见**（快照缺 `start` 等字段，解析失败；记录名也不同）：`stop <端口>` 报
+    「端口上没有运行中的 aProxy 实例」。升级说明写进了 CHANGELOG 与技能的 compatibility.md：升级前用旧版本 stop all；
+    已换二进制的用 `install --force`。**「`install --force` 能结束 alpha 实例」是按 C3 契约推出来的，没实测**——
+    跨版本强制安装的 CI 测试（TODO 的 W2b）做完才算验证过。
+  - 验证：Windows headless 全量 678 通过、0 失败；两个变体 clippy 与 Linux 交叉 clippy 零输出。
+  - **B6 还没做的**（设计稿 §6.1–§6.4、§6.6，验收见 §14.2 的 B6 行）：
+    1. 协议规则：未知参数回 `unsupported_arg`（现在静默忽略）、参数类型不对回 `bad_request`；错误对象带 `details`
+       （`unsupported_version` 的 `supported` 现在在错误对象顶层，要挪进 `details`）；应答行上限 16 MiB。
+    2. op 的参数：`shutdown.if_idle_secs`（不闲回 `condition_not_met`）、`prepare_swap.ttl_secs`（默认 600，到期回到
+       `serving`）；`features` 列全。
+    3. 快照：删掉 `run_dir`（先查谁在用）；`state` 加 `starting`；加 `behavior`、`formats`（熔断器字段等 B10）、
+       `activity` 的 `in_flight`、`retrying`、`rescued_total`、`by_code`、`buckets`，`last_error` 带 `code` 与 `details`。
+    4. §6.6 只读枚举 `enumerate(home)`：四种 liveness（`live`、`unresponsive`、`incompatible`、`down`）、`unreadable`、
+       `gc_paused`、`watchdog`、`processes`。设计稿要它放在 aproxy-ipc（那里没有 tokio，客户端要写成同步的）；
+       status 改用它之后，别的版本的实例显示为 `incompatible` 而不是「没有实例」，届时改 compatibility.md 那一节。
+    5. 每个 op 的请求、成功、每种错误的 golden；`tests/contract_v0_2.rs` 钉住全部记录的形状。

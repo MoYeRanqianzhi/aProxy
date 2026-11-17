@@ -752,3 +752,22 @@
        `gc_paused`、`watchdog`、`processes`。设计稿要它放在 aproxy-ipc（那里没有 tokio，客户端要写成同步的）；
        status 改用它之后，别的版本的实例显示为 `incompatible` 而不是「没有实例」，届时改 compatibility.md 那一节。
     5. 每个 op 的请求、成功、每种错误的 golden；`tests/contract_v0_2.rs` 钉住全部记录的形状。
+- B6 第二部分（2026-11-17）：9981217 协议规则与 op 参数。
+  - 未知参数回 `unsupported_arg`、类型或取值不对回 `bad_request`（`details.reason` 的词表：`incomplete_line`、`not_json`、
+    `missing_v`、`missing_op`、`args_not_object`、`invalid_arg`；`invalid_arg` 时另带 `details.arg`——码表里补了这个
+    可选键）。错误对象带 `details`，`message` 是英文。客户端的 `IpcError::Remote` 带 `details`。
+  - `shutdown.if_idle_secs`：条件只在实例还没开始退出时判断（重复的 shutdown 结果相同）。`ops::stop::stop_if_idle` 给
+    `stop idle` 用；不认这个参数的实例退回无条件停止。`--force` 没有条件可带。
+  - `prepare_swap.ttl_secs`：`IpcStats.swap_until_ms` 存到期时刻，快照现算；0 不接受（一进入就过期）。安装器发的是不带
+    参数的 `IpcOp::PREPARE_SWAP`（默认 600 秒）——安装的广播到滚动重启之间若超过 10 分钟，实例会回到 `serving`，
+    续作重入时广播是幂等置位，会重新进入。
+  - 快照：删了 `run_dir`（没人用），加了 `behavior`（枚举值按字符串传）与 `starting` 状态。**`starting` 只进了词表，
+    实例还不会报它**：现在控制端点开始应答时实例已经能服务；等 B10a（format 在启动时握手）才有真实的启动阶段，
+    届时就绪判定要改成「state 为 serving」。
+  - golden：`request_lines_are_pinned_…`、`rejections_are_pinned`、`snapshot_shape_is_pinned`（都在 `src/daemon.rs`）。
+  - 验证：Windows headless 全量 680 通过、0 失败；两个变体 clippy 与 Linux 交叉 clippy 零输出。
+  - **B6 还没做的**：
+    1. 快照的 `activity`：`in_flight`、`retrying`、`rescued_total`、`by_code`、`buckets`（30 个 120 秒的桶），`last_error`
+       带 `code` 与 `details`。`formats` 与 `behavior.history` 分别等 B10 与 B8。
+    2. §6.6 只读枚举 `enumerate(home)`（四种 liveness、`unreadable`、`gc_paused`、`watchdog`、`processes`）。
+    3. `tests/contract_v0_2.rs`：把各模块里钉形状的单测归到一处（或在那里引用它们），验收条目要它。

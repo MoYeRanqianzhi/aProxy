@@ -5540,7 +5540,7 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     home.stop_on_drop(port);
 
     // 模拟崩溃：强杀守护进程（不经过 IPC 优雅退出），恢复记录应残留。
-    // 隔离 home 内无看门狗收养（tempdir 的 run 目录没有活跃看护者 claim），
+    // 隔离 home 内无看门狗收养（tempdir 的 run 目录没有在任的看护者），
     // 强杀窗口期的记录状态完全由测试掌控。
     kill_pid(pid);
     let mut gone = false;
@@ -6044,7 +6044,7 @@ fn logs_via_alias_connects_and_follows() {
 //
 // 隔离：APROXY_HOME 指向 TestHome 的临时目录（守护/看护子进程经 spawn_detached
 // 继承环境），APROXY_WATCHDOG_SCAN_SECS=1 让看护者秒级扫描。测试端口向系统要，
-// 绝不触碰生产实例；结束清理 claim 与残留守护。TestHome 默认关着看护者的开关，
+// 绝不触碰生产实例；结束清理看护者记录与残留守护。TestHome 默认关着看护者的开关，
 // 这里的测试先把它打开（看护者每个周期都读它，关着就退出），再自己拉起看护者。
 // ---------------------------------------------------------------------------
 #[test]
@@ -6127,7 +6127,7 @@ fn watchdog_respawns_killed_daemon() {
         "优雅停止后看护者不得复活实例"
     );
     let _ = wd_child.kill();
-    let _ = std::fs::remove_file(home.path().join("run").join("watchdog.claim"));
+    let _ = std::fs::remove_file(home.path().join("run").join("watchdog.json"));
 }
 
 #[test]
@@ -6211,7 +6211,7 @@ fn watchdog_respawns_on_death_event_and_force_stop_stays_stopped() {
     );
     assert!(wd_child.0.try_wait().unwrap().is_none(), "看护者不应退出");
     drop(wd_child);
-    let _ = std::fs::remove_file(home.path().join("run").join("watchdog.claim"));
+    let _ = std::fs::remove_file(home.path().join("run").join("watchdog.json"));
 }
 
 // ---------------------------------------------------------------------------
@@ -6298,7 +6298,7 @@ fn identity_check_tolerates_swapped_binary() {
 
 #[test]
 fn watchdog_lease_prevents_duplicate_watchdogs() {
-    // 并发 spawn 两个看护者（同一隔离主目录）：claim 原子接管保证只有一个
+    // 并发 spawn 两个看护者（同一隔离主目录）：看护者记录的原子接管保证只有一个
     // 在任——后启动者应自行退出（选举唯一性）
     let home = TestHome::new();
     home.enable_watchdog();
@@ -6309,17 +6309,17 @@ fn watchdog_lease_prevents_duplicate_watchdogs() {
             .unwrap()
     };
     let mut c1 = watchdog();
-    // 等 c1 接管 claim
+    // 等 c1 写下看护者记录
     std::thread::sleep(Duration::from_secs(2));
     let mut c2 = watchdog();
     std::thread::sleep(Duration::from_secs(3));
     assert!(c1.try_wait().unwrap().is_none(), "先任看护者应持续在任");
     assert!(
         c2.try_wait().unwrap().is_some(),
-        "后任看护者应因 claim 被占而退出"
+        "后任看护者应因看护者记录已被占而退出"
     );
     let _ = c1.kill();
-    let _ = std::fs::remove_file(home.path().join("run").join("watchdog.claim"));
+    let _ = std::fs::remove_file(home.path().join("run").join("watchdog.json"));
 }
 
 /// 对运行在隔离主目录里的守护做 IPC ping：端点属于 run 目录（unix 的 socket

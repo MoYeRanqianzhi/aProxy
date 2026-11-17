@@ -337,7 +337,7 @@ every instance and restarts one that crashes or hangs, from that instance's laun
 5 minutes and relaunches it if it has gone.
 
 `false` stops a running watchdog at its next scan: the watchdog re-reads settings.json every scan,
-removes its claim and exits, leaving the instances and their desired-state records alone. It also
+removes its record and exits, leaving the instances and their desired-state records alone. It also
 stops new launches by `aproxy start` and by instances started after the change. Behavior:
 behaviors.md, "Crash recovery and the watchdog".
 

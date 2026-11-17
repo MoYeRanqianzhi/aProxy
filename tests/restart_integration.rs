@@ -789,22 +789,23 @@ fn restore_onto_changed_port_retires_old_record() {
     );
 }
 
-/// 收尾守卫：按 claim 终止本测试主目录里的在任看护者（镜像路径核对 +
+/// 收尾守卫：按看护者记录终止本测试主目录里的在任看护者（镜像路径核对 +
 /// pid/创建时间核验，绝不按名字杀）
 struct WatchdogCleanup(PathBuf);
 
 impl Drop for WatchdogCleanup {
     fn drop(&mut self) {
-        if let Some(c) = aproxy::watchdog::read_claim_in(&self.0.join("run"))
-            && aproxy::watchdog::verify_claim_identity(c.pid, c.created_at_process)
+        if let aproxy::watchdog::RecordRead::Readable(record) =
+            aproxy::watchdog::read_record_in(&self.0.join("run"))
+            && record.owner_alive()
         {
-            kill_own_pid(c.pid, &self.0);
+            kill_own_pid(record.pid, &self.0);
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// 11. 资产名二进制并发 start：选举 + claim 收敛到恰好一个在任看护者，且它
+// 11. 资产名二进制并发 start：选举 + 看护者记录收敛到恰好一个在任看护者，且它
 //     收养了这些实例（崩溃即重拉）
 // ---------------------------------------------------------------------------
 #[test]
@@ -870,10 +871,10 @@ fn concurrent_start_with_release_asset_name_converges_to_one_watchdog() {
         "并发 start 应至少拉起一个看护者（CLI 不在注册表，必有发起权）"
     );
 
-    // 收敛：落败者发现 claim 已被占后立即退出；只剩 claim 持有者在世
-    let claim_holder = || {
-        aproxy::watchdog::read_claim_in(&run)
-            .filter(|c| aproxy::watchdog::verify_claim_identity(c.pid, c.created_at_process))
+    // 收敛：落败者发现看护者记录已被占后立即退出；只剩记录的属主在世
+    let claim_holder = || match aproxy::watchdog::read_record_in(&run) {
+        aproxy::watchdog::RecordRead::Readable(record) if record.owner_alive() => Some(record),
+        _ => None,
     };
     assert!(
         wait_for(Duration::from_secs(10), || claim_holder().is_some()),
@@ -889,13 +890,13 @@ fn concurrent_start_with_release_asset_name_converges_to_one_watchdog() {
     assert_eq!(
         alive,
         vec![holder],
-        "被拉起的看护者 {spawned:?} 中应恰好剩下 claim 持有者"
+        "被拉起的看护者 {spawned:?} 中应恰好剩下看护者记录的属主"
     );
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(
         claim_holder().map(|c| c.pid),
         Some(holder),
-        "claim 不得在看护者之间翻转"
+        "看护者记录不得在看护者之间翻转"
     );
 
     // 唯一的看护者收养了资产名运行的实例：杀掉一个，应被重拉
@@ -1441,8 +1442,8 @@ fn watchdog_exits_once_it_is_disabled_in_settings() {
     );
     assert!(has_restore(home, port), "期望状态记录不归看护者删");
     assert!(
-        !home.join("run").join("watchdog.claim").exists(),
-        "退出的看护者应删掉自己的 claim"
+        !home.join("run").join("watchdog.json").exists(),
+        "退出的看护者应删掉自己的记录"
     );
     assert!(ipc_ping_in_dir(&rt, port, home).is_ok(), "实例不受影响");
 }

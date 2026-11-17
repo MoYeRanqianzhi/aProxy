@@ -487,7 +487,7 @@ the result is replayed on every retry). Add `"retry"` to the request format's
 `stages` to transform again before every retry.
 
 Runtime data lives in `~/.aproxy/`: `run/` (registry `<port>.pid`, desired-state
-records `<port>.restore.json`, the watchdog claim, and a short-lived launch-spec
+records `<port>.restore.json`, the watchdog record `watchdog.json`, and a short-lived launch-spec
 handoff while an instance starts), `logs/` (daemon logs, randomly named per
 start, rotated and
 orphan-cleaned; paths reported via IPC — customize with `log_file`),

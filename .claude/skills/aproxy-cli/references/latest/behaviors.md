@@ -531,18 +531,24 @@ supported on macOS.
   failures are forgotten. An instance that starts and dies again after a few seconds keeps counting
   and backs off instead of being respawned in a tight loop.
 - **Settings are re-read every scan.** Setting `watchdog.enabled = false` makes a running watchdog
-  exit at its next scan (it removes its claim and leaves the instances and their records alone);
+  exit at its next scan (it removes its record and leaves the instances and their records alone);
   `max_restarts` and `idle_exit_secs` follow the file on the next scan. `heartbeat_secs` and
   `stale_after_cycles` are fixed when the watchdog process starts, because other processes judge its
   liveness by the period it started with. If settings.json is invalid, the watchdog keeps its last
   valid values.
-- **Single watchdog**: `<home>/run/watchdog.claim` names the active one (PID, creation time,
-  heartbeat). `aproxy start` launches one if none is active, and every instance checks every 5 minutes
+- **Single watchdog**: `<home>/run/watchdog.json` names the active one: `pid`, `start` (its start
+  marker), `version`, `heartbeat_secs` (scan period), `created_at`, `last_scan_at` and `restarts`,
+  the last 20 respawns as `{port, at, kind, ok}` with `kind` being `crash` or `hang` (times are Unix
+  milliseconds). The watchdog rewrites it every scan; it counts as active while its process is alive
+  and `last_scan_at` is within three scan periods (never less than 90 s). `aproxy start` launches
+  one if none is active, and every instance checks every 5 minutes
   and launches a replacement if needed, logging `看护者缺席，已由守护补种（选举胜出者）` ("watchdog absent;
   relaunched by an instance"). With no instances left and no respawn pending for `watchdog.idle_exit_secs`,
   it exits; an instance still waiting for its 300 s slow retry keeps it running.
-- `aproxy status` does not show the watchdog. To check it, read the claim file and see whether its PID
-  is alive.
+- `aproxy status` does not show the watchdog. To check it, read `watchdog.json` (is `last_scan_at`
+  recent, is the PID alive) and `<home>/logs/watchdog.log`, where the watchdog writes in English
+  what it did and why: instances it terminated as hung, every respawn and its result, the switch to
+  slow retries, instances it stopped watching, takeovers and its own exit.
 - Limits: a respawn does not save requests in flight when the process died; their clients see a reset
   connection and must resend, which agent clients with their own retries do after a pause. What the
   watchdog prevents is an outage that lasts until someone notices.

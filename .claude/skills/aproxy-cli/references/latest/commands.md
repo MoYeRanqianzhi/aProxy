@@ -33,8 +33,8 @@ directory, and `install --force` ends with 10.
 | `<home>/config.toml` | the default instance config |
 | `<home>/configs/` | the conventional place for further instance configs (`find` and `doctor` scan it) |
 | `<home>/settings.json` | aliases, the default config, the `defaults` global defaults, watchdog and install settings (settings-json.md) |
-| `<home>/run/` | instance registry `<port>.pid`, desired-state records `<port>.restore.json`, the watchdog claim `watchdog.claim`; while an instance starts, a short-lived `<nanoseconds>-<pid>.spec.json` launch-spec handoff file. `APROXY_HOME` is the only root; the run directory cannot be relocated separately |
-| `<home>/logs/` | instance logs (random file names) and `startup.log` |
+| `<home>/run/` | instance registry `<port>.pid`, desired-state records `<port>.restore.json`, the watchdog record `watchdog.json`; while an instance starts, a short-lived `<nanoseconds>-<pid>.spec.json` launch-spec handoff file. `APROXY_HOME` is the only root; the run directory cannot be relocated separately |
+| `<home>/logs/` | instance logs (random file names), `startup.log`, and `watchdog.log` (what the watchdog did and why) |
 | `<home>/bin/` | the binary managed by `aproxy install`; on Windows also `aproxy.bat` (see install / upgrade). Files named `aproxy.old-…` and `aproxy.tmp-…` are left by binary swaps; installs delete the ones they can |
 | `<home>/install/` | `aproxy install`'s own files: the progress record `state.json` while an install runs, downloads and staged binaries in `staging/<version>/`, the install script's downloads in `bootstrap/`, force install's download in `force/`, on Linux and macOS the install announcement `announce`, and `lock`, held while `bin/` changes |
 | `<home>/spool/<pid>-<hash>/` | one instance process's disk-cache scratch files (behaviors.md, Disk cache); removed when the instance stops, and after a crash by the next instance that starts or by the watchdog |

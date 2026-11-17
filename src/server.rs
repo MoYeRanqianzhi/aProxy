@@ -129,8 +129,8 @@ pub(crate) async fn serve_forever(
     }
 
     // R1：先退役比自己旧的看护者，再创建控制端点——旧看护者处理死亡事件时会
-    // 删掉同一路径上的 socket（见 watchdog::retire_older_watchdog_in）
-    watchdog::retire_older_watchdog_in(&daemon::run_dir()).await;
+    // 删掉同一路径上的 socket（见 watchdog::retire_older_watchdogs_in）
+    watchdog::retire_older_watchdogs_in(&aproxy_ipc::home::home()).await;
 
     // 控制端点紧接 TCP 之后、注册表之前创建：失败就不登记、不写恢复记录、
     // 直接退出。带着一个 stop/status 都找不到的实例跑下去比启动失败更糟——
@@ -249,7 +249,7 @@ pub(crate) async fn serve_forever(
                 tokio::time::sleep(SELF_CHECK_INTERVAL).await;
                 let run_dir = daemon::run_dir();
                 let fresh = watchdog::heartbeat_fresh_secs(&settings::load());
-                if watchdog::claim_is_in_effect_in(&run_dir, fresh, watchdog::now_secs()) {
+                if watchdog::watchdog_in_effect_in(&run_dir, fresh, watchdog::now_millis()) {
                     continue;
                 }
                 // 安装态宣告有效 → 跳过补种（install 的差异化行为之一）：
@@ -264,8 +264,8 @@ pub(crate) async fn serve_forever(
                 if !watchdog::this_process_may_spawn_watchdog_in(&run_dir) {
                     continue; // 有更小 PID 的存活实例，拉起是它的事
                 }
-                // 残留 claim（已判无效）清理后拉起；spawn 失败下轮再试
-                watchdog::remove_claim_in(&run_dir);
+                // 无效的看护者记录留给新看护者接管时处理（它要靠记录找到假死的前任）；
+                // spawn 失败下轮再试
                 let exe = match std::env::current_exe() {
                     Ok(e) => e,
                     Err(_) => continue,

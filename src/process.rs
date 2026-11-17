@@ -110,11 +110,6 @@ pub fn terminate_verified_process(pid: u32, expected_start: u64) -> Result<(), S
     imp::terminate_verified(pid, expected_start)
 }
 
-/// 进程是否存活且创建时间与 `created_at` 匹配；None = 无法判定（权限不足等）。
-pub(crate) fn alive_with_start(pid: u32, created_at: u64) -> Option<bool> {
-    imp_process::process_alive_with_start(pid, created_at)
-}
-
 // 看护者等待实例死亡用的同步句柄（Windows 为进程句柄；unix 上句柄值就是 pid，等待退化为每秒探活）
 pub(crate) use imp::{close_handle, open_sync_handle, terminate_handle, wait_blocking};
 
@@ -287,12 +282,6 @@ mod imp {
 
 #[cfg(windows)]
 mod imp_process {
-    /// 进程存活且创建时间匹配（FILETIME 100ns）。
-    pub fn process_alive_with_start(pid: u32, created_at: u64) -> Option<bool> {
-        let actual = process_start_time(pid)?;
-        Some(actual == created_at)
-    }
-
     /// OpenProcess + GetProcessTimes：进程不存在（ERROR_INVALID_PARAMETER/
     /// ACCESS_DENIED 之外的失败一并视为不可知 → None）。
     pub fn process_start_time(pid: u32) -> Option<u64> {
@@ -392,11 +381,6 @@ mod imp_process {
 
 #[cfg(unix)]
 mod imp_process {
-    pub fn process_alive_with_start(pid: u32, created_at: u64) -> Option<bool> {
-        let actual = process_start_time(pid)?;
-        Some(actual == created_at)
-    }
-
     /// /proc/<pid>/stat 的 starttime（字段 22，时钟滴答）。
     pub fn process_start_time(pid: u32) -> Option<u64> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;

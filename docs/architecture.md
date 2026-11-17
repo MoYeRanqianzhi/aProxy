@@ -59,8 +59,8 @@ home 的实例。
 | `src/daemon.rs` | 守护编排：IPC（ping/shutdown/观测，`shutdown.keep_restore` 与 `features`）、实例注册表、分离拉起（`spawn_detached_with`：Windows 作业对象脱出、unix setsid；工作目录与代理环境按规格设置）、孤儿清理 |
 | `src/spawn.rs` | 按拉起规格拉起并等就绪（`spawn_from_spec`）：start、restart、restore、安装的滚动重启、看护者重拉共用；规格经交接文件交给 `__serve`，按新 pid 认就绪，启动即死时立即返回并附上 startup.log 的新增内容；就绪时限 30 秒 |
 | `src/process.rs` | 进程原语（平台层）：创建时间、存活与退出、镜像路径、按 pid + 创建时间核验身份（`record_identity`）与核验后终止、看护者等待进程死亡用的同步句柄 |
-| `src/watchdog.rs` | 看门狗：claim 选举、实例心跳、收养与处决、重拉退避状态机 |
-| `src/fsx.rs` | 原子写（`write_atomic`）：注册表、期望状态记录、安装状态、看护者 claim 共用；`write_atomic_private` 额外收紧权限（unix 0600、Windows 只含本用户/SYSTEM/Administrators 的 DACL），settings.json、拉起规格与期望状态记录走它 |
+| `src/watchdog.rs` | 看门狗：看护者记录与选举、实例心跳、收养与处决、重拉退避状态机、`logs/watchdog.log` |
+| `src/fsx.rs` | 原子写（`write_atomic`）：注册表、期望状态记录、安装状态、看护者记录共用；`write_atomic_private` 额外收紧权限（unix 0600、Windows 只含本用户/SYSTEM/Administrators 的 DACL），settings.json、拉起规格与期望状态记录走它 |
 | `aproxy-ipc/` | aproxy 与同它打交道的程序（桌面界面、第三方客户端）共用的契约，独立 crate，依赖很少。`code.rs`：错误码表（名字、族、`details` 的键与类型、HTTP 状态与退出码），`docs/error-codes.md` 由它生成、`tests/code_table.rs` 比对；`redact.rs`：打码的唯一出口（URL、密钥头、占位对象、已知密钥替换）；`endpoint.rs`：控制端点、心跳节、安装宣告节的名字与 `home_id`；`home.rs`：home 的解析（永久兼容契约 C1）；`ledger.rs`：进程台账 `<home>/ledger/`（永久兼容契约 C3），长期运行的进程登记 pid、启动标记与角色，强制安装据此核验后结束进程 |
 | `src/util.rs` | bin 侧共用小工具：时间戳、时长人性化、凭据打码、key=value 解析 |
 
@@ -412,23 +412,31 @@ settings.json 的 `defaults` 段收的就是 config.toml 的键（同名同嵌�
   IPC ping 二意见都失败才终止进程（句柄绑定原进程，PID 复用免疫）。
 - **重拉与退避**：期望状态记录残留 = 异常死亡信号；优雅退出（记录已删）摘除
   看护。重拉从记录里的拉起规格启动，首次崩溃立即重拉；重拉失败进退避队列，按指数退避
-  1/2/4/8…封顶 300s 由主循环时间驱动重试（等待不阻塞 tick——否则长退避会让 claim 心跳停摆、
+  1/2/4/8…封顶 300s 由主循环时间驱动重试（等待不阻塞 tick——否则长退避会让看护者记录停止更新、
   现任被竞争者按「假死」夺权），就绪判定按新 pid 定位；重拉后实例落在不同
   端口（toml 改了端口）时退役旧端口的记录/`.pid` 并按实际端口续看护。
   连续失败达 `watchdog.max_restarts` **不再放弃**：转入每 300s 一次的慢速重试，直到实例起来或
   记录被 `stop` 删掉，并在刚越过上限时往 startup.log 写一条英文说明；`max_restarts = 0` 才是
   「不自动重拉」（记录保留，交给 `aproxy restore`）。重拉出来的实例存活满 60 秒，之前的连续
   失败才清零——起得来、几秒后又崩的实例按失败计数退避，不会每次都被立即重拉。
-- **设置热更新**：每个 tick 重读 settings.json。`watchdog.enabled` 关掉时删 claim 退出
+- **设置热更新**：每个 tick 重读 settings.json。`watchdog.enabled` 关掉时删掉看护者记录退出
   （记录不动，之后重新打开时崩溃实例照样能被拉回）；`max_restarts`、`idle_exit_secs` 下一轮
   生效；`heartbeat_secs`、`stale_after_cycles` 不在运行期改——别的进程按看护者启动时的周期判断
   它是否在任。文件无效时沿用上一次读到的有效值。
-- **选举规范**（多守护并发拉起看护者的唯一性保障）：claim 文件
-  `run/watchdog.claim`（PID + 进程创建时间 + 心跳）为在任真相源——
+- **选举规范**（多守护并发拉起看护者的唯一性保障）：看护者记录
+  `run/watchdog.json`（`schema`、PID、启动标记、版本、扫描周期 `heartbeat_secs`、`created_at`、
+  `last_scan_at`、最近 20 次重拉 `restarts`）为在任真相源，在任的看护者每个 tick 整份重写——
   排序定发起者（核验在世的实例中 PID 最小者才有权 spawn；CLI `start` 不在在世
-  集合内，视为有权，多发起由 claim 原子接管兜底）+ `create_new` 原子接管
-  定在任者；进程创建时间比对拒绝 PID 复用冒名；假死前任（心跳过期）经验证
-  后终止接管。
+  集合内，视为有权，多发起由记录的原子接管兜底）+ `create_new` 原子接管
+  定在任者；启动标记（台账用的同一个）比对拒绝 PID 复用冒名；假死前任（`last_scan_at` 早于
+  三个扫描周期、且不短于 90 秒）经核验后终止接管。读不懂的记录（schema 更高）不解读、不覆盖，
+  只按文件修改时间判断新鲜；在任者发现记录已不是自己的就让位退出。
+- **找旧看护者靠台账**：实例启动时退役比自己旧的看护者、install 换二进制之前停掉看护者，都按
+  台账里 role 为 watchdog 的条目找，按「pid + 启动标记」核验后结束，不读看护者记录——记录的
+  格式随版本变，台账是永久兼容契约。
+- **看护者日志**：处决（挂死）、重拉的结果与起因、转入慢速重试、摘除看护、接管前任与退出，
+  都以英文写进 `logs/watchdog.log`（达到 `logs.rotate_mb` 时清空重写）。看护者是脱离终端的
+  后台进程，这是它的处置唯一看得见的地方。
 - **互保**：守护与看护者完全解耦（看护者死亡实例不受影响）；守护每 5 分钟
   自检，缺席即按选举规范补种。全部实例清零、且没有待重拉的条目后，看护者闲置自灭
   （默认 300s），系统回到零常驻；慢速重试队列非空时它一直留着。
@@ -683,7 +691,7 @@ tauri-build 每次构建都在包根写 `gen/schemas/`，包里没有这些文�
 
 ## 测试
 
-- 单元测试（lib + bin）：重试判定、配置分层、IPC 协议、注册表/期望状态记录、打码、claim 选举、退避状态机、安装状态机/下载链条/zip 安全
+- 单元测试（lib + bin）：重试判定、配置分层、IPC 协议、注册表/期望状态记录、打码、看护者记录与选举、退避状态机、安装状态机/下载链条/zip 安全
 - 集成测试：mock 上游 + 真实代理联调、守护生命周期、logs/restore 端到端、
   双模缓冲（磁盘 spool 字节保真/EOF 清理/流尾错误重试）、看门狗（强杀重拉/
   优雅停不复活/并发看护者唯一性）、install 流程（恢复矩阵崩溃注入 + CLI

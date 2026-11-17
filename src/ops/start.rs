@@ -220,13 +220,13 @@ fn ensure_watchdog_if_enabled(exe: &Path) {
     }
     let run_dir = daemon::run_dir();
     let fresh = crate::watchdog::heartbeat_fresh_secs(&settings);
-    if crate::watchdog::claim_is_in_effect_in(&run_dir, fresh, crate::watchdog::now_secs()) {
+    if crate::watchdog::watchdog_in_effect_in(&run_dir, fresh, crate::watchdog::now_millis()) {
         return; // 已有在任看护者
     }
     if !crate::watchdog::this_process_may_spawn_watchdog_in(&run_dir) {
         return; // 有更小 PID 的存活实例，拉起是它的事（其自检/该实例 start 兜底）
     }
-    crate::watchdog::remove_claim_in(&run_dir); // 清理无效残留 claim
+    // 无效的看护者记录不在这里删：新看护者接管时自己处理，它要靠记录找到假死的前任
     match crate::watchdog::spawn_watchdog(exe, &aproxy_ipc::home::home()) {
         Ok(pid) => tracing::info!(pid, "看护者已随实例启动拉起"),
         Err(e) => tracing::warn!(error = %e, "看护者拉起失败（守护自检会补种）"),

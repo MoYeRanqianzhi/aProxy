@@ -2418,7 +2418,7 @@ mod tests {
             "12345.restore.json",
             "x.tmp-abc-1",
             "x.tmp-1-abc",
-            "watchdog.claim",
+            "watchdog.json",
         ] {
             assert_eq!(leftover_writer_pid(name), None, "{name}");
         }

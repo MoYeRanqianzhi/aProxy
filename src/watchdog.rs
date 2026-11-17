@@ -1,173 +1,299 @@
-//! 看门狗（G2）核心原语：claim 选举、共享内存心跳（进程探活与身份等平台原语在 crate::process）。
+//! 看门狗（G2）核心原语：看护者记录与选举、实例心跳（进程探活与身份等平台原语在 crate::process）。
 //!
 //! 架构（见 .agents/plan/watchdog-v1.md）：
 //! - **全局单看护进程**（同二进制以内部入口 `aproxy __watchdog --home <dir>` 分离启动）看护全部实例，
 //!   内存 ~2-3MB 与实例数无关；等待全部下沉内核（线程池等进程句柄 +
 //!   周期扫描共享内存心跳表），自身零轮询线程。
 //! - **选举规范**：排序定发起者（发现看护者缺席时，存活实例中 PID 最小者
-//!   才有权 spawn）+ 原子 claim 定在任者（`CREATE_NEW` 语义，并发 spawn
-//!   收敛到恰好一个在任看护者）。
-//! - **在任判定四条件**（任何进程独立判定，结果必然一致）：
-//!   claim 文件存在 && PID 探活 && 进程创建时间匹配（防 PID 复用冒名）
-//!   && 心跳新鲜（兼测假死）。
+//!   才有权 spawn）+ 原子建出看护者记录 `run/watchdog.json` 定在任者（`CREATE_NEW` 语义，
+//!   并发 spawn 收敛到恰好一个在任看护者）。
+//! - **在任判定**（任何进程独立判定，结果必然一致）：记录存在 && 属主进程还在 && 启动标记
+//!   匹配（防 PID 复用冒名）&& 最近一次扫描新鲜（兼测假死）。
+//! - 看护者结束了谁、重拉了谁、为什么，写在 `logs/watchdog.log`。
 //!
 //! 看护主循环入口是本模块的 [`serve`]，由 main.rs 在 `__watchdog` 入口下调用
 //! （没有公开的 `aproxy watchdog` 子命令）。
 
-use crate::process::{
-    RecordIdentity, process_exited, process_start_time, record_identity, terminate_verified_process,
-};
+use crate::process::{RecordIdentity, process_start_time, record_identity};
 use crate::settings;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
-// claim 文件：看护者在任的真相源
+// 看护者记录：看护者在任的真相源
 // ---------------------------------------------------------------------------
 
-/// 看护者身份凭据（run/watchdog.claim，JSON 一行）。
-/// 进程创建时间是防 PID 复用的关键：PID 被无关进程（甚至另一个 aProxy 实例）
-/// 复用后，创建时间必然不同——探活通过但时间不匹配 = 冒名，判无效。
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct WatchdogClaim {
+/// 看护者记录的 schema。读到更高的 schema 时不解读内容（见 [`RecordRead::Unreadable`]）。
+pub const RECORD_SCHEMA: u32 = 1;
+/// 记录里保留最近多少次重拉。
+pub const RESTARTS_KEPT: usize = 20;
+/// 重拉的起因：进程自己没了（崩溃、被信号结束、被强杀）。
+pub const KIND_CRASH: &str = "crash";
+/// 重拉的起因：进程还在、却不再调度（心跳过期且控制端点不应答），被看护者结束。
+pub const KIND_HANG: &str = "hang";
+/// 「最近一次扫描」早于这么久（秒）之前，才可能算看护者假死，不管扫描周期设得多短。
+/// 看护者的一个步进周期里可能要等重拉出来的实例就绪（每个最多
+/// [`crate::spawn::READY_TIMEOUT`]），窗口比这短的话，正忙着重拉的看护者会被当成假死、
+/// 在重拉途中被接管者结束。
+pub const FRESH_FLOOR_SECS: u64 = 90;
+
+/// 一次重拉。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RestartEvent {
+    /// 实例的端口
+    pub port: u16,
+    /// 重拉结束的时刻（Unix 毫秒）
+    pub at: u64,
+    /// 起因，[`KIND_CRASH`] 或 [`KIND_HANG`]（词表只增）
+    pub kind: String,
+    /// 实例有没有起来
+    pub ok: bool,
+}
+
+/// 看护者记录（`run/watchdog.json`，一行 JSON）：谁在任、多久扫一次、最近一次扫描在什么
+/// 时候、最近重拉过谁。在任的看护者每个步进周期整份重写它；别的进程据此判断有没有看护者
+/// 在任（见 [`watchdog_in_effect_in`]），status 与界面据此展示。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct WatchdogRecord {
+    /// 恒为 [`RECORD_SCHEMA`]
+    pub schema: u32,
     pub pid: u32,
-    /// 看护进程的创建时刻（100ns 单位的 Windows FILETIME；Linux 为
-    /// /proc/<pid>/stat 的 starttime 时钟滴答）。跨平台语义统一为「进程
-    /// 启动时间戳」，比较只在同平台进行。
-    pub created_at_process: u64,
-    /// 看护者最近一次心跳续写时刻（Unix 秒）。看护者每周期续写；
-    /// 超过 3×心跳周期未更新 = 看护者假死。
+    /// 看护者进程的启动标记（台账用的同一个，见 [`aproxy_ipc::ledger::start_marker`]）：pid
+    /// 被别的进程复用之后标记必然不同。读不到标记的平台记空串，这时只能按 pid 判断。
+    pub start: String,
+    /// 看护者自己的版本（不带 v）
+    pub version: String,
+    /// 扫描周期（秒）。读者按它算新鲜窗口，不按自己的 settings：看护者启动之后周期不变，
+    /// 而 settings 可能已经被改过
     pub heartbeat_secs: u64,
-    /// 看护者自己的版本。0.1.0 的 claim 没有这个字段（读作 None），0.1.0 读
-    /// 新 claim 时忽略它。守护启动时据此退役更旧的看护者，见
-    /// `retire_older_watchdog_in`
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
+    /// 看护者开始看护的时刻（Unix 毫秒）
+    pub created_at: u64,
+    /// 最近一次步进周期结束的时刻（Unix 毫秒）
+    pub last_scan_at: u64,
+    /// 最近 [`RESTARTS_KEPT`] 次重拉，旧的在前
+    #[serde(default)]
+    pub restarts: Vec<RestartEvent>,
 }
 
-/// R1：守护启动时（创建控制端点之前）退役比自己旧的看护者。claim 没有
-/// version（0.1.0）或版本更低、且 claim 里的进程经 pid + 创建时间核验仍在，
-/// 就终止它、等它退出、删掉 claim，补种交给守护的自检。为什么要这样：换了
-/// 二进制之后旧看护者可能还在任（从 0.1.0 迁移时，0.1.0 的看护者在实例清零后
-/// 最多 5 分钟才自行退出），它会留着有效的 claim 继续看护新实例——用旧的或
-/// 已被替换的二进制重拉崩溃实例（Linux 上 current_exe 指向 `(deleted)`，重拉
-/// 必然失败），处理死亡事件时还会删掉新实例的控制 socket。「新版本胜出」：
-/// 同版本或更新的看护者不动，混版本的 home 不会来回拉锯。返回是否退役了一个。
-pub async fn retire_older_watchdog_in(run_dir: &Path) -> bool {
-    let Some(claim) = read_claim_in(run_dir) else {
-        return false;
-    };
-    let older = match &claim.version {
-        None => true,
-        Some(theirs) => matches!(
-            (
-                semver::Version::parse(theirs),
-                semver::Version::parse(env!("CARGO_PKG_VERSION")),
-            ),
-            (Ok(theirs), Ok(ours)) if theirs < ours
-        ),
-    };
-    if !older || claim.pid == std::process::id() {
-        return false;
-    }
-    // 进程已不在（或 pid 被复用）：claim 自然失效，补种照常进行
-    if !matches!(
-        record_identity(claim.pid, claim.created_at_process),
-        RecordIdentity::Alive(_)
-    ) {
-        return false;
-    }
-    if let Err(e) = terminate_verified_process(claim.pid, claim.created_at_process) {
-        tracing::warn!(pid = claim.pid, error = %e, "旧版本看护者退役失败");
-        return false;
-    }
-    // 等它真正退出再删 claim：它退出前的最后一次续写不能把 claim 写回来
-    for _ in 0..50 {
-        if process_exited(claim.pid) == Some(true) {
-            break;
+impl WatchdogRecord {
+    /// 本进程的记录：刚开始看护，还没重拉过谁。
+    pub fn for_current_process(heartbeat_secs: u64) -> Self {
+        let pid = std::process::id();
+        let now = now_millis();
+        Self {
+            schema: RECORD_SCHEMA,
+            pid,
+            start: aproxy_ipc::ledger::start_marker(pid).unwrap_or_default(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            heartbeat_secs,
+            created_at: now,
+            last_scan_at: now,
+            restarts: Vec::new(),
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    remove_claim_in(run_dir);
-    tracing::info!(
-        pid = claim.pid,
-        version = claim.version.as_deref().unwrap_or("0.1.0"),
-        "已退役旧版本看护者，由守护自检补种新的"
-    );
-    true
+
+    /// 两份记录是不是同一个看护者进程写的。
+    pub fn same_owner(&self, other: &Self) -> bool {
+        self.pid == other.pid && self.start == other.start
+    }
+
+    /// 写下这份记录的进程是否还在：pid 现在的启动标记与记录一致，并且没有退出。记录里
+    /// 没有标记（平台读不到）时只看这个 pid 上的进程有没有退出。
+    pub fn owner_alive(&self) -> bool {
+        if crate::process::process_exited(self.pid) == Some(true) {
+            return false;
+        }
+        self.start.is_empty()
+            || aproxy_ipc::ledger::start_marker(self.pid).as_deref() == Some(self.start.as_str())
+    }
+
+    /// 最近一次扫描是否还算新鲜：距今不超过三个扫描周期（且不短于 [`FRESH_FLOOR_SECS`]）。
+    pub fn is_fresh(&self, now_ms: u64) -> bool {
+        let window_secs = self.heartbeat_secs.saturating_mul(3).max(FRESH_FLOOR_SECS);
+        now_ms.saturating_sub(self.last_scan_at) <= window_secs.saturating_mul(1000)
+    }
+
+    /// 结束这份记录的属主要用的台账条目：结束进程一律走台账的「核验 pid + 启动标记之后
+    /// 结束」（[`aproxy_ipc::ledger::terminate`]），这里只是把记录里的身份填进它要的形状。
+    fn as_ledger_entry(&self) -> aproxy_ipc::ledger::LedgerEntry {
+        aproxy_ipc::ledger::LedgerEntry {
+            ledger: aproxy_ipc::ledger::LEDGER_FORMAT,
+            pid: self.pid,
+            start: self.start.clone(),
+            role: aproxy_ipc::ledger::ROLE_WATCHDOG.to_string(),
+            version: self.version.clone(),
+            port: None,
+            label: None,
+            exe: None,
+            config: None,
+        }
+    }
 }
 
-/// claim 文件路径（run_dir 注入，测试绝不读写真实 run/）
-pub fn claim_path_in(run_dir: &Path) -> PathBuf {
-    run_dir.join("watchdog.claim")
+/// 读看护者记录的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordRead {
+    /// 没有记录
+    Absent,
+    /// 读得懂
+    Readable(WatchdogRecord),
+    /// 文件在，却读不懂：schema 比本版本高（更新的看护者写的）、内容损坏，或正好读到另一个
+    /// 进程刚建出、还没写完的文件。读不懂就不解读、也不覆盖，只按文件的修改时间判断它
+    /// 新不新鲜。`age_secs` 是文件距上次修改的秒数，读不到修改时间为 None
+    Unreadable { age_secs: Option<u64> },
 }
 
-/// 读 claim 文件（不存在/损坏 → None）
-pub fn read_claim_in(run_dir: &Path) -> Option<WatchdogClaim> {
-    let content = std::fs::read_to_string(claim_path_in(run_dir)).ok()?;
-    serde_json::from_str(&content).ok()
+/// 看护者记录的路径（run_dir 注入，测试绝不读写真实 run/）
+pub fn record_path_in(run_dir: &Path) -> PathBuf {
+    run_dir.join("watchdog.json")
 }
 
-/// 原子接管 claim：仅当成功创建新文件（或安全替换已判无效的旧文件）时返回
-/// Some——这是「并发 spawn 收敛到恰好一个在任看护者」的落点。
-///
-/// Windows 无 create_new 可覆盖已存在文件的原子原语，策略分两步：
-/// 1. 旧 claim 不存在 → `create_new` 原子创建（两个竞争者至多一个成功）；
-/// 2. 旧 claim 存在 → 先验证无效（调用方负责），删除后 create_new。
-///    删旧建新之间仍有理论竞态窗，由创建后二次校验补齐：写入者回头读自己的
-///    claim 与进程身份比对，不符即让位退出。
-pub fn acquire_claim_in(run_dir: &Path, claim: &WatchdogClaim) -> Option<WatchdogClaim> {
-    std::fs::create_dir_all(run_dir).ok()?;
-    let path = claim_path_in(run_dir);
-    let json = serde_json::to_string(claim).ok()?;
+/// 读看护者记录。
+pub fn read_record_in(run_dir: &Path) -> RecordRead {
+    let path = record_path_in(run_dir);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RecordRead::Absent,
+        Err(_) => String::new(),
+    };
+    match serde_json::from_str::<WatchdogRecord>(&text) {
+        Ok(record) if record.schema <= RECORD_SCHEMA => RecordRead::Readable(record),
+        _ => RecordRead::Unreadable {
+            age_secs: std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .map(|age| age.as_secs()),
+        },
+    }
+}
+
+/// 原子接管：只有成功建出新文件才返回 true——这是「并发拉起的看护者收敛到恰好一个在任」
+/// 的落点（`create_new` 在两个竞争者之间至多让一个成功）。已有记录时返回 false，由调用方
+/// 判断它是否还有效；无效的先删掉再来一次。删旧建新之间的竞态窗由每个步进周期的归属
+/// 校验补齐（见 `WatchdogState::refresh_record`）：发现记录不是自己的就让位退出。
+pub fn acquire_record_in(run_dir: &Path, record: &WatchdogRecord) -> bool {
+    if std::fs::create_dir_all(run_dir).is_err() {
+        return false;
+    }
+    let Ok(json) = serde_json::to_string(record) else {
+        return false;
+    };
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&path)
+        .open(record_path_in(run_dir))
     {
         Ok(mut f) => {
             use std::io::Write;
-            f.write_all(json.as_bytes()).ok()?;
-            f.write_all(b"\n").ok()?;
-            Some(claim.clone())
+            f.write_all((json + "\n").as_bytes()).is_ok()
         }
-        // 已有 claim：调用方判定无效后先 remove_claim_in 再重试一次；
-        // 仍失败 = 竞争者抢先，让位
-        Err(_) => None,
+        Err(_) => false,
     }
 }
 
-/// 删除 claim（看护者优雅退出/清理残留时调用）
-pub fn remove_claim_in(run_dir: &Path) {
-    let _ = std::fs::remove_file(claim_path_in(run_dir));
+/// 删除看护者记录（看护者自己退出时调用）
+pub fn remove_record_in(run_dir: &Path) {
+    let _ = std::fs::remove_file(record_path_in(run_dir));
 }
 
-/// 在任判定：claim 存在且其身份在当前系统上验证通过且心跳新鲜。
-/// `heartbeat_fresh_secs` = 3×心跳周期（新鲜阈值）。
-/// `now_secs` 注入（测试可拨时钟）；进程身份验证不可注入（真实系统调用），
-/// 测试用 `verify_claim_identity_in` 的注入版本。
-pub fn claim_is_in_effect_in(run_dir: &Path, heartbeat_fresh_secs: u64, now_secs: u64) -> bool {
-    let Some(claim) = read_claim_in(run_dir) else {
+/// 有没有看护者在任：记录读得懂时，要求属主进程还在、最近一次扫描还新鲜（假死的看护者
+/// 不再重写记录，进程活着也判不在任）；读不懂时按文件的修改时间判断，窗口取
+/// `fallback_fresh_secs`（读者按自己的 settings 算出的三个扫描周期）与
+/// [`FRESH_FLOOR_SECS`] 中较大的一个。`now_ms` 注入（测试可拨时钟）。
+pub fn watchdog_in_effect_in(run_dir: &Path, fallback_fresh_secs: u64, now_ms: u64) -> bool {
+    match read_record_in(run_dir) {
+        RecordRead::Absent => false,
+        RecordRead::Readable(record) => record.is_fresh(now_ms) && record.owner_alive(),
+        RecordRead::Unreadable { age_secs } => {
+            age_secs.is_some_and(|age| age <= fallback_fresh_secs.max(FRESH_FLOOR_SECS))
+        }
+    }
+}
+
+/// 按台账结束本 home 里别的看护者，返回结束了几个。`older_than` 给了版本时只结束版本比它
+/// 低的，None 时全部结束。阻塞调用（每个进程最多等 5 秒）。
+///
+/// 找看护者靠台账（role 为 watchdog）而不是看护者记录：记录的格式会随版本变，台账的格式
+/// 是永久兼容契约，任何版本的看护者都在那里登记过；结束进程也走台账的「核验 pid + 启动
+/// 标记之后结束」，与进程叫什么无关。被结束的看护者来不及收拾的东西替它收掉：它的台账
+/// 条目，以及属主已经不在的看护者记录。
+pub fn terminate_watchdogs_in(home: &Path, older_than: Option<&semver::Version>) -> usize {
+    use aproxy_ipc::ledger;
+    let me = std::process::id();
+    let mut terminated = 0;
+    for found in ledger::read_all_in(home) {
+        let entry = &found.entry;
+        if entry.role != ledger::ROLE_WATCHDOG || entry.pid == me {
+            continue;
+        }
+        // 版本解析不了的不算「更旧」：宁可留着一个说不清版本的看护者，不可误伤
+        if let Some(ours) = older_than
+            && !semver::Version::parse(&entry.version).is_ok_and(|theirs| &theirs < ours)
+        {
+            continue;
+        }
+        match ledger::terminate(entry, Duration::from_secs(5)) {
+            ledger::Termination::Terminated => {
+                ledger::remove_if_unchanged(&found);
+                tracing::info!(pid = entry.pid, version = %entry.version, "已结束看护者");
+                terminated += 1;
+            }
+            ledger::Termination::AlreadyGone => {}
+            ledger::Termination::NotOwned(owner) => {
+                tracing::warn!(pid = entry.pid, owner = %owner, "看护者属于别的用户，没有结束它");
+            }
+            ledger::Termination::Failed(why) => {
+                tracing::warn!(pid = entry.pid, error = %why, "看护者结束失败");
+            }
+        }
+    }
+    let run_dir = home.join("run");
+    if terminated > 0
+        && let RecordRead::Readable(record) = read_record_in(&run_dir)
+        && !record.owner_alive()
+    {
+        remove_record_in(&run_dir);
+    }
+    terminated
+}
+
+/// 实例启动时（创建控制端点之前）退役比自己旧的看护者，补种交给实例的自检。为什么要
+/// 这样：换了二进制之后旧看护者可能还在任，它会继续看护新实例——用旧的或已被替换的
+/// 二进制重拉崩溃实例（Linux 上 current_exe 指向 `(deleted)`，重拉必然失败），处理死亡
+/// 事件时还会删掉新实例的控制 socket。「新版本胜出」：同版本或更新的看护者不动，混版本的
+/// home 不会来回拉锯。返回是否退役了至少一个。
+pub async fn retire_older_watchdogs_in(home: &Path) -> bool {
+    let Ok(ours) = semver::Version::parse(env!("CARGO_PKG_VERSION")) else {
         return false;
     };
-    // 心跳新鲜性：假死的看护者不再续写——即使进程还活着也判不在任
-    now_secs.saturating_sub(claim.heartbeat_secs) <= heartbeat_fresh_secs
-        && verify_claim_identity_in(run_dir, &claim)
+    let home = home.to_path_buf();
+    tokio::task::spawn_blocking(move || terminate_watchdogs_in(&home, Some(&ours)))
+        .await
+        .is_ok_and(|terminated| terminated > 0)
 }
 
-/// claim 身份验证（真实系统调用版）：PID 探活 + 进程创建时间匹配。
-pub fn verify_claim_identity_in(_run_dir: &Path, claim: &WatchdogClaim) -> bool {
-    verify_claim_identity(claim.pid, claim.created_at_process)
-}
-
-/// 进程是否存活且创建时间与 `created_at` 匹配。
-/// Windows：`created_at` 为 FILETIME（100ns）；
-/// unix：为 /proc/<pid>/stat 的 starttime（时钟滴答）。
-/// 探活失败（进程不存在）与身份不符（PID 复用）统一返回 false——
-/// 对「在任判定」两者等价：都不是我们的看护者。
-pub fn verify_claim_identity(pid: u32, created_at: u64) -> bool {
-    crate::process::alive_with_start(pid, created_at).unwrap_or(false)
+/// 向 `<home>/logs/watchdog.log` 追加一行（带 unix 时间戳前缀，格式同 startup.log）。
+/// 看护者是脱离终端的后台进程，它结束了谁、重拉了谁、为什么，只有写在这里用户才看得到。
+/// 固定名的日志，内容用英文。文件达到 `rotate_bytes` 时先清空再写（0 = 不限）。
+pub fn append_watchdog_log(home: &Path, rotate_bytes: u64, line: &str) {
+    let dir = home.join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("watchdog.log");
+    let oversized =
+        rotate_bytes > 0 && std::fs::metadata(&path).is_ok_and(|meta| meta.len() >= rotate_bytes);
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true);
+    if oversized {
+        options.write(true).truncate(true);
+    } else {
+        options.append(true);
+    }
+    if let Ok(mut f) = options.open(path) {
+        use std::io::Write;
+        let _ = writeln!(f, "[unix+{}s] {line}", now_secs());
+    }
 }
 
 /// 收养/回归时的注册表记录核验：「该 pid 当前就是写下这条记录的守护」。
@@ -204,7 +330,7 @@ pub fn this_process_may_spawn_watchdog_in(run_dir: &Path) -> bool {
 /// 存活：挂死实例不应答，却仍是需要看护的在世实例。两个误判方向代价不对称：
 /// - 把死记录/复用 pid 误算「活」：若它的 pid 更小，所有人都让位给一个不
 ///   存在的发起者，看护者永远没人拉起——不可接受；
-/// - 把活实例漏算：可能多个守护同时自认最小而并发 spawn，claim 原子接管
+/// - 把活实例漏算：可能多个守护同时自认最小而并发 spawn，看护者记录的原子接管
 ///   保证最终只有一个在任，代价只是几个短命进程。
 ///
 /// 所以 Reused/Gone 一律不计入，宁可多发起、不可无人发起。
@@ -213,7 +339,7 @@ pub fn this_process_may_spawn_watchdog_in(run_dir: &Path) -> bool {
 /// 视为有权：排序只用来收敛「多个在册守护的周期自检同时发现缺席」，CLI 的
 /// pid 与守护 pid 之间的大小毫无意义——若按它让位，start 时有更早启动的
 /// 实例就拉不起看护者，只能干等守护最长 5 分钟一次的自检。多发起的代价由
-/// claim 原子接管兜住。
+/// 看护者记录的原子接管兜住。
 fn may_spawn_watchdog(
     my_pid: u32,
     records: &[crate::daemon::InstanceRecord],
@@ -271,7 +397,7 @@ pub struct WatchdogConfig {
     pub home: PathBuf,
     /// 实例注册表/run 目录（测试注入 tempdir，绝不触碰真实 run/）
     pub run_dir: PathBuf,
-    /// 心跳扫描周期（秒）：每此间隔执行一次 adopt/health/claim 续写
+    /// 心跳扫描周期（秒）：每此间隔执行一次 adopt/health/看护者记录重写
     pub scan_secs: u64,
     /// 挂死容忍周期数：连续 N 轮心跳过期 + ping 失败才判挂死
     pub stale_after_cycles: u64,
@@ -344,6 +470,8 @@ struct Watched {
 #[derive(Debug)]
 struct PendingRetry {
     port: String,
+    /// 这个实例当初为什么没了（[`KIND_CRASH`] 或 [`KIND_HANG`]），记进重拉记录
+    kind: &'static str,
     /// 连续重拉失败次数（crashloop 计数挂在队列条目上，跨收养周期累计）
     failures: u32,
     /// 下次重试时刻（退避序列 1s→2s→4s…封顶 300s）
@@ -367,7 +495,7 @@ pub struct WatchdogState {
     /// 重拉失败的退避队列：实例崩溃 → 立即重拉失败 → 摘除进队列，到期由
     /// tick 重试。等待发生在 tick 之间（主循环按 next_pending_deadline 竞速
     /// 提前唤醒），绝不阻塞 tick 本身——否则一次 300s 的退避 sleep 就能让
-    /// claim 心跳停摆超过 90s 新鲜窗口，现任被「假死夺权」误杀（M2 实审）。
+    /// 看护者记录停止更新超过 90s 新鲜窗口，现任被「假死夺权」误杀（M2 实审）。
     pending: Vec<PendingRetry>,
     /// 死亡事件接收端（等待任务 → 主循环）
     deaths: tokio::sync::mpsc::UnboundedReceiver<(String, u32)>,
@@ -378,12 +506,21 @@ pub struct WatchdogState {
     /// 「旧日志的清理因读不懂的记录而暂停」已经告过警：每个周期都会遇到同一批记录，
     /// 只在进入这个状态时说一次
     gc_pause_reported: bool,
+    /// 本看护者的记录：每个步进周期带着新的 `last_scan_at` 与最近的重拉整份写回
+    record: WatchdogRecord,
+    /// 因挂死被本看护者结束、死亡事件还没到的实例端口：死亡事件到来时据此把起因记成挂死
+    hung_ports: Vec<String>,
+    /// watchdog.log 的大小上限（字节，0 = 不限），跟着 settings 的 `logs.rotate_mb`
+    log_rotate_bytes: u64,
 }
 
 impl WatchdogState {
     pub fn new(cfg: WatchdogConfig) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
+            record: WatchdogRecord::for_current_process(cfg.scan_secs),
+            hung_ports: Vec::new(),
+            log_rotate_bytes: 0,
             cfg,
             watched: Vec::new(),
             pending: Vec::new(),
@@ -392,6 +529,35 @@ impl WatchdogState {
             empty_since: None,
             gc_pause_reported: false,
         }
+    }
+
+    /// 把一次处置写进 watchdog.log（见 [`append_watchdog_log`]）
+    fn log(&self, line: &str) {
+        append_watchdog_log(&self.cfg.home, self.log_rotate_bytes, line);
+    }
+
+    /// 记下一次重拉的结果：写进 watchdog.log，并追加到记录的 `restarts`（只留最近
+    /// [`RESTARTS_KEPT`] 次，下一次重写记录时落盘）。
+    fn note_restart(&mut self, port: &str, kind: &'static str, outcome: Result<u32, &str>) {
+        match outcome {
+            Ok(pid) => self.log(&format!(
+                "respawned the instance on port {port} after a {kind} (new pid {pid})"
+            )),
+            Err(why) => self.log(&format!(
+                "respawning the instance on port {port} after a {kind} failed: {why}"
+            )),
+        }
+        let Ok(port) = port.parse::<u16>() else {
+            return;
+        };
+        self.record.restarts.push(RestartEvent {
+            port,
+            at: now_millis(),
+            kind: kind.to_string(),
+            ok: outcome.is_ok(),
+        });
+        let extra = self.record.restarts.len().saturating_sub(RESTARTS_KEPT);
+        self.record.restarts.drain(..extra);
     }
 
     /// 当前在册（收养中）实例端口
@@ -514,9 +680,14 @@ impl WatchdogState {
                 continue;
             }
             tracing::error!(port = %w.port, pid = w.pid, "实例心跳过期且 IPC 无响应，判定挂死，终止进程");
+            self.log(&format!(
+                "the instance on port {} (pid {}) is hung: its heartbeat is stale and its control endpoint does not answer; terminating it",
+                w.port, w.pid
+            ));
             hung.push(w.port.clone());
             crate::process::terminate_handle(w.handle);
         }
+        self.hung_ports.extend(hung.iter().cloned());
         hung
     }
 
@@ -525,7 +696,7 @@ impl WatchdogState {
     /// 其他实例 respawn 的验活清理会顺带删掉本实例的死注册记录，混合态若据此判「已停止」
     /// 会让崩溃实例静默失去自动恢复，P6 死亡风暴实测）。stop 在实例退出之前就删掉记录
     /// （shutdown 的应答发出之前、强制终止之前），所以死亡事件到来时判据已经就位。
-    /// 重拉失败进退避队列（不 sleep——阻塞主循环会让 claim 心跳停摆、被竞争者
+    /// 重拉失败进退避队列（不 sleep——阻塞主循环会让看护者记录停止更新、被竞争者
     /// 按「假死」夺权，M2），由 tick 的时间驱动重试。
     /// 返回处置结果（测试断言用）。
     pub async fn handle_death(&mut self, port: &str) -> DeathOutcome {
@@ -534,6 +705,14 @@ impl WatchdogState {
         };
         let w = self.watched.swap_remove(idx);
         crate::process::close_handle(w.handle);
+        // 起因：被本看护者按挂死结束的，死亡事件到这里才来；其余都算崩溃
+        let kind = match self.hung_ports.iter().position(|p| p == port) {
+            Some(i) => {
+                self.hung_ports.swap_remove(i);
+                KIND_HANG
+            }
+            None => KIND_CRASH,
+        };
         // 看护关系终止即清理心跳残留：优雅退出路径守护会自清，崩溃/强杀路径
         // 靠这里兜底（Windows 节对象由内核回收，这里是 no-op；unix 上是 run 目录里
         // 的心跳文件）。删到同端口刚起来的新实例也只丢一拍，它的
@@ -558,6 +737,9 @@ impl WatchdogState {
         let restore_path = crate::spec::restore_path_in(&self.cfg.run_dir, port);
         if !restore_path.is_file() {
             tracing::info!(port = %port, "实例已被停止（没有期望状态记录），摘除看护");
+            self.log(&format!(
+                "the instance on port {port} was stopped; no longer watching it"
+            ));
             self.after_watch_removal();
             return DeathOutcome::GracefulExit;
         }
@@ -570,13 +752,17 @@ impl WatchdogState {
             w.consecutive_failures
         };
         if failures >= self.cfg.max_restarts {
-            return self.slow_retry(port, failures);
+            return self.slow_retry(port, failures, kind);
         }
         let delay = backoff_delay_secs(failures);
         if delay > 0 {
             tracing::warn!(port = %port, delay_secs = delay, "实例崩溃，进入退避队列");
+            self.log(&format!(
+                "the instance on port {port} went down again ({kind}) soon after a respawn; next attempt in {delay} s"
+            ));
             self.pending.push(PendingRetry {
                 port: port.to_string(),
+                kind,
                 failures,
                 next_retry: std::time::Instant::now() + Duration::from_secs(delay),
             });
@@ -587,10 +773,15 @@ impl WatchdogState {
         tracing::warn!(port = %port, "实例崩溃，立即重拉");
         match respawn_instance(&self.cfg.home, &self.cfg.run_dir, port).await {
             Ok((pid, actual_port)) => {
+                self.note_restart(port, kind, Ok(pid));
                 self.admit_respawned_at(port, &actual_port, pid, failures);
                 DeathOutcome::Respawned(pid)
             }
-            Err(e) => self.queue_retry(port, failures, e.to_string()),
+            Err(e) => {
+                let why = e.to_string();
+                self.note_restart(port, kind, Err(&why));
+                self.queue_retry(port, failures, kind, why)
+            }
         }
     }
 
@@ -612,15 +803,22 @@ impl WatchdogState {
             tracing::info!(port = %p.port, attempt = p.failures + 1, "退避到期，重试重拉");
             match respawn_instance(&self.cfg.home, &self.cfg.run_dir, &p.port).await {
                 Ok((pid, actual_port)) => {
+                    self.note_restart(&p.port, p.kind, Ok(pid));
                     self.admit_respawned_at(&p.port, &actual_port, pid, p.failures)
                 }
                 // 记录没了 = 用户在退避期间 stop 了它：不再是要恢复的实例，出队
                 Err(RespawnError::NoRecord) => {
                     tracing::info!(port = %p.port, "期望状态记录已被删除（实例已被停止），不再重拉");
+                    self.log(&format!(
+                        "the instance on port {} was stopped while waiting for a retry; no longer watching it",
+                        p.port
+                    ));
                     self.after_watch_removal();
                 }
                 Err(e) => {
-                    self.queue_retry(&p.port, p.failures, e.to_string());
+                    let why = e.to_string();
+                    self.note_restart(&p.port, p.kind, Err(&why));
+                    self.queue_retry(&p.port, p.failures, p.kind, why);
                 }
             }
         }
@@ -688,15 +886,22 @@ impl WatchdogState {
     /// 重拉失败：计数+1，达上限转入慢速重试，否则入队按指数退避。
     /// 崩溃实例从 watched 消失（死亡 watcher 已消费，句柄已关——留着的都是
     /// 悬空条目，曾导致一次失败后永久失去看护，H1）。
-    fn queue_retry(&mut self, port: &str, failures: u32, err: String) -> DeathOutcome {
+    fn queue_retry(
+        &mut self,
+        port: &str,
+        failures: u32,
+        kind: &'static str,
+        err: String,
+    ) -> DeathOutcome {
         let failures = failures.saturating_add(1);
         tracing::error!(port = %port, error = %err, attempt = failures, "重拉失败");
         if failures >= self.cfg.max_restarts {
-            return self.slow_retry(port, failures);
+            return self.slow_retry(port, failures, kind);
         }
         let delay = backoff_delay_secs(failures);
         self.pending.push(PendingRetry {
             port: port.to_string(),
+            kind,
             failures,
             next_retry: std::time::Instant::now() + Duration::from_secs(delay),
         });
@@ -709,8 +914,11 @@ impl WatchdogState {
     /// 说一遍（用户排查「实例为什么没回来」的第一个入口），之后的重试只进日志。
     ///
     /// `max_restarts = 0` 的含义是「只看不拉」：一次都不重拉，记录留着等人工 restore。
-    fn slow_retry(&mut self, port: &str, failures: u32) -> DeathOutcome {
+    fn slow_retry(&mut self, port: &str, failures: u32, kind: &'static str) -> DeathOutcome {
         if self.cfg.max_restarts == 0 {
+            self.log(&format!(
+                "the instance on port {port} is down ({kind}); watchdog.max_restarts is 0, so it is not respawned (run `aproxy restore` to bring it back)"
+            ));
             tracing::warn!(
                 port = %port,
                 "实例已不在运行；watchdog.max_restarts 为 0，不自动重拉（期望状态记录已保留，可 aproxy restore 手工恢复）"
@@ -728,9 +936,13 @@ impl WatchdogState {
             crate::daemon::append_startup_log(&format!(
                 "[watchdog] the instance on port {port} failed to come back {failures} times in a row; retrying every {SLOW_RETRY_SECS} seconds until it starts or `aproxy stop {port}` is run"
             ));
+            self.log(&format!(
+                "the instance on port {port} failed to come back {failures} times in a row; retrying every {SLOW_RETRY_SECS} s until it starts or `aproxy stop {port}` is run"
+            ));
         }
         self.pending.push(PendingRetry {
             port: port.to_string(),
+            kind,
             failures,
             next_retry: std::time::Instant::now() + Duration::from_secs(SLOW_RETRY_SECS),
         });
@@ -738,10 +950,10 @@ impl WatchdogState {
         DeathOutcome::SlowRetry
     }
 
-    /// 一个完整步进周期：claim 续写 + 收养 + 健康 + 挂死事件处理 + 退避重试
+    /// 一个完整步进周期：看护者记录重写 + 收养 + 健康 + 挂死事件处理 + 退避重试
     /// + 闲置自灭判定 + install 保活。
     ///
-    /// 返回 [`Tick::Retire`] 表示本看护者到此为止（claim 已易主，或闲置自灭的条件满足）：
+    /// 返回 [`Tick::Retire`] 表示本看护者到此为止（看护者记录已易主，或闲置自灭的条件满足）：
     /// 主循环随即返回，进程由二进制一侧结束。库里不调用 `process::exit`。
     pub async fn tick(&mut self) -> Tick {
         // 消化本周期内累积的死亡事件
@@ -759,14 +971,14 @@ impl WatchdogState {
         self.adopt_scan().await;
         self.health_scan().await;
         self.collect_garbage();
-        if self.refresh_claim() == Tick::Retire || self.maybe_idle_exit().await == Tick::Retire {
+        if self.refresh_record() == Tick::Retire || self.maybe_idle_exit().await == Tick::Retire {
             return Tick::Retire;
         }
         self.check_install_keepalive();
         Tick::Continue
     }
 
-    /// 重读 settings.json：开关被关掉就退出（删掉 claim，让以后重新打开时能立刻拉起新的；
+    /// 重读 settings.json：开关被关掉就退出（删掉看护者记录，让以后重新打开时能立刻拉起新的；
     /// 期望状态记录不动，重新打开之后崩溃的实例照样被拉回），其余可调项跟着文件变。
     /// 扫描周期不在这里改：它决定心跳多久算新鲜，别的进程是按启动时的值判断本看护者
     /// 在不在任的。
@@ -777,9 +989,11 @@ impl WatchdogState {
         let s = settings::load_from(path);
         if !s.watchdog {
             tracing::info!("settings.json 里的 watchdog.enabled 已关闭，看护者退出");
-            remove_claim_in(&self.cfg.run_dir);
+            self.log("watchdog.enabled was turned off in settings.json; exiting");
+            remove_record_in(&self.cfg.run_dir);
             return Tick::Retire;
         }
+        self.log_rotate_bytes = s.log_rotate_mb.saturating_mul(1024 * 1024);
         self.cfg.max_restarts = s.watchdog_max_restarts;
         self.cfg.idle_exit_secs = s.watchdog_idle_exit_secs;
         Tick::Continue
@@ -811,42 +1025,47 @@ impl WatchdogState {
         self.gc_pause_reported = report.logs_paused;
     }
 
-    /// claim 续写：心跳时间戳刷新（其他进程据此刻定本看护者是否在任/假死）。
-    /// 覆写前先校验归属——claim 已易主（被接管者夺权）还继续双写，两个看护者
-    /// 会同时 respawn 同一实例（P7 实测 claim 内容在两 pid 间翻转的根源）。
-    /// 正常路径接管者已把前任杀掉（terminate_verified），这里只是杀失败/
-    /// 竞态窗口的确定性收尾：让位退出，claim 文件留给新任（勿动，动了会被
-    /// 新任按「心跳停滞」再次夺权）。
-    fn refresh_claim(&mut self) -> Tick {
-        if let Some(existing) = read_claim_in(&self.cfg.run_dir)
-            && existing.pid != std::process::id()
-        {
-            tracing::warn!(
-                claim_pid = existing.pid,
-                "claim 已被其他看护者接管，本进程让位退出"
-            );
-            return Tick::Retire;
+    /// 重写看护者记录：带上新的 `last_scan_at` 与最近的重拉（别的进程据此判断本看护者是否
+    /// 在任、有没有假死）。
+    ///
+    /// 写之前先校验归属。记录已经是别的看护者的（被接管了），或读不懂（多半是更新版本的
+    /// 看护者写的），就让位退出，记录原样留给它：还继续写的话两个看护者会同时重拉同一个
+    /// 实例，记录的内容在两个 pid 之间来回翻。正常情况下接管者已经把前任结束掉，这里是
+    /// 结束失败与竞态窗口的确定性收尾。记录不在了（被人删掉）就照常重写。
+    fn refresh_record(&mut self) -> Tick {
+        match read_record_in(&self.cfg.run_dir) {
+            RecordRead::Readable(existing) if !existing.same_owner(&self.record) => {
+                tracing::warn!(
+                    record_pid = existing.pid,
+                    "看护者记录已被其他看护者接管，本进程让位退出"
+                );
+                self.log(&format!(
+                    "the watchdog record now belongs to pid {}; exiting",
+                    existing.pid
+                ));
+                return Tick::Retire;
+            }
+            RecordRead::Unreadable { .. } => {
+                tracing::warn!("看护者记录读不懂（多半由更新版本的看护者写下），本进程让位退出");
+                self.log("the watchdog record is not readable by this version (a newer watchdog probably wrote it); exiting");
+                return Tick::Retire;
+            }
+            _ => {}
         }
-        let claim = WatchdogClaim {
-            pid: std::process::id(),
-            created_at_process: process_start_time(std::process::id()).unwrap_or(0),
-            heartbeat_secs: now_secs(),
-            version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        };
-        // 原子写（crate::fsx::write_atomic）：原地写时，并发读到的可能是截断到一半的
-        // claim，读者把它当「无 claim」，随即补种出第二个看护者
-        let Ok(json) = serde_json::to_string(&claim) else {
+        self.record.last_scan_at = now_millis();
+        // 原子写：原地写时，并发的读者可能读到截断到一半的记录
+        let Ok(json) = serde_json::to_string(&self.record) else {
             return Tick::Continue;
         };
-        let path = claim_path_in(&self.cfg.run_dir);
-        if let Err(e) = crate::fsx::write_atomic(&path, (json + "\n").as_bytes()) {
-            tracing::warn!(error = %e, "claim 心跳续写失败");
+        let path = record_path_in(&self.cfg.run_dir);
+        if let Err(e) = crate::fsx::write_atomic_private(&path, (json + "\n").as_bytes()) {
+            tracing::warn!(error = %e, "看护者记录重写失败");
         }
         Tick::Continue
     }
 
     /// 闲置自灭：全部实例清零（收养表空、退避队列空且注册表空）持续
-    /// idle_exit_secs 后删除 claim 退出，系统回到零常驻。pending 非空 = 还有
+    /// idle_exit_secs 后删除看护者记录退出，系统回到零常驻。pending 非空 = 还有
     /// 待重试的崩溃实例（期望状态记录在，期望恢复）——不算空闲，否则看护者会在
     /// 长退避中自灭、崩溃实例失去重试（历史上 respawn 失败路径曾造成此态）。
     async fn maybe_idle_exit(&mut self) -> Tick {
@@ -858,7 +1077,8 @@ impl WatchdogState {
             let since = *self.empty_since.get_or_insert_with(std::time::Instant::now);
             if since.elapsed().as_secs() >= self.cfg.idle_exit_secs {
                 tracing::info!("无任何实例需要看护，看护者退出（闲置自灭）");
-                remove_claim_in(&self.cfg.run_dir);
+                self.log("no instance left to watch; exiting");
+                remove_record_in(&self.cfg.run_dir);
                 return Tick::Retire;
             }
         } else {
@@ -1033,48 +1253,67 @@ async fn respawn_instance(
     }
 }
 
-/// 看护者主循环（CLI 入口调用）：接管 claim → tick 循环。
-/// claim 被竞争者持有且有效时安静退出（唯一性落点）。
+/// 看护者主循环（CLI 入口调用）：接管看护者记录 → tick 循环。
+/// 记录被另一个在任的看护者持有时安静退出（唯一性落点）。
 pub async fn serve(cfg: WatchdogConfig) {
-    // claim 接管：已有有效 claim = 另一个看护者在任 → 让位退出
-    let my_claim = WatchdogClaim {
-        pid: std::process::id(),
-        created_at_process: process_start_time(std::process::id()).unwrap_or(0),
-        heartbeat_secs: now_secs(),
-        version: Some(env!("CARGO_PKG_VERSION").to_string()),
-    };
-    if acquire_claim_in(&cfg.run_dir, &my_claim).is_none() {
-        // 已有 claim：验证其有效性；无效则清理重试（前任死亡/假死/残留）
-        if claim_is_in_effect_in(
-            &cfg.run_dir,
-            heartbeat_fresh_secs(&settings::load()),
-            now_secs(),
-        ) {
+    let mine = WatchdogRecord::for_current_process(cfg.scan_secs);
+    if !acquire_record_in(&cfg.run_dir, &mine) {
+        // 已有记录：有效 = 另一个看护者在任，让位退出
+        let fallback = heartbeat_fresh_secs(&settings::load());
+        if watchdog_in_effect_in(&cfg.run_dir, fallback, now_millis()) {
             tracing::info!("已有在任的看护者，本进程退出（选举唯一性）");
             return;
         }
-        // 无效 claim：先杀掉「活着但假死」的前任，再原子接管。身份 = claim
-        // 里前任自写的 pid + 创建时间（与二进制名无关：改名部署的看护者同样
-        // 该被正常接管；pid 被复用给无关进程则时间必然不符，不会误杀）。
-        // 终止本身也在同一核验下执行（Windows 同句柄先核验后终止）
-        if let Some(old) = read_claim_in(&cfg.run_dir) {
-            if verify_claim_identity(old.pid, old.created_at_process) {
-                tracing::error!(
-                    pid = old.pid,
-                    "前任看护者仍在但心跳过期（假死），终止后接管"
-                );
-                if let Err(e) = terminate_verified_process(old.pid, old.created_at_process) {
-                    tracing::warn!(pid = old.pid, error = %e, "终止假死前任失败");
-                }
+        // 无效的记录：前任已经不在，或者还活着却不再扫描（假死）。假死的先结束掉再接管，
+        // 身份是记录里前任自己写下的 pid 与启动标记（与二进制叫什么无关；pid 被复用给
+        // 无关进程时标记必然对不上，不会误杀）。读不懂的记录不知道属主是谁，只删不杀
+        let stale = read_record_in(&cfg.run_dir);
+        if let RecordRead::Readable(old) = &stale
+            && old.owner_alive()
+        {
+            tracing::error!(
+                pid = old.pid,
+                "前任看护者仍在但不再扫描（假死），终止后接管"
+            );
+            append_watchdog_log(
+                &cfg.home,
+                0,
+                &format!(
+                    "the previous watchdog (pid {}) is alive but stopped scanning; terminating it and taking over",
+                    old.pid
+                ),
+            );
+            let entry = old.as_ledger_entry();
+            let outcome = tokio::task::spawn_blocking(move || {
+                aproxy_ipc::ledger::terminate(&entry, Duration::from_secs(5))
+            })
+            .await;
+            if let Ok(
+                aproxy_ipc::ledger::Termination::Failed(why)
+                | aproxy_ipc::ledger::Termination::NotOwned(why),
+            ) = outcome
+            {
+                tracing::warn!(pid = old.pid, error = %why, "终止假死前任失败");
             }
-            remove_claim_in(&cfg.run_dir);
         }
-        if acquire_claim_in(&cfg.run_dir, &my_claim).is_none() {
-            tracing::info!("claim 被竞争者抢先，本进程退出（选举唯一性）");
+        // 只删刚才判为无效的那一份：这期间另一个竞争者可能已经删掉它、写下了自己的
+        if read_record_in(&cfg.run_dir) == stale {
+            remove_record_in(&cfg.run_dir);
+        }
+        if !acquire_record_in(&cfg.run_dir, &mine) {
+            tracing::info!("看护者记录被竞争者抢先写下，本进程退出（选举唯一性）");
             return;
         }
     }
     tracing::info!(pid = std::process::id(), "看护者就绪（watchdog）");
+    append_watchdog_log(
+        &cfg.home,
+        0,
+        &format!(
+            "watchdog started (pid {}, version {}, scanning every {} s)",
+            mine.pid, mine.version, mine.heartbeat_secs
+        ),
+    );
 
     // 启动全量检查：本地状态文件残留 → 拉起对应处理者（恢复机制的主责入口，
     // 用户定调）。检查对象是各类本地状态文件（当前只有 install.state，后续
@@ -1084,6 +1323,8 @@ pub async fn serve(cfg: WatchdogConfig) {
     sweep_local_states(&aproxy_ipc::home::home());
 
     let mut state = WatchdogState::new(cfg);
+    // 记录的属主身份与开始时刻以刚才接管时写下的那一份为准
+    state.record = mine;
     state.adopt_scan().await;
     let scan = Duration::from_secs(state.cfg.scan_secs.max(1));
     let mut last_sweep = std::time::Instant::now();
@@ -1092,7 +1333,7 @@ pub async fn serve(cfg: WatchdogConfig) {
         // 到秒而非被扫描周期拖累），或死亡事件到达（崩溃实例立即进入重拉，
         // 不再等满一个扫描周期——默认 30s 的断流对正在等回复的客户端太长）。
         // 主循环单步耗时预算：handle_death/process 的 respawn 至多 8s +
-        // health_scan 的 ipc_ping 至多 ~9.6s，远小于 claim 的 90s 新鲜窗口——
+        // health_scan 的 ipc_ping 至多 ~9.6s，远小于看护者记录的 90s 新鲜窗口——
         // 把退避 sleep 放进 tick 会击穿这个预算（M2），故等待一律发生在 tick
         // 之间。
         //
@@ -1408,63 +1649,174 @@ mod tests {
     }
 
     #[test]
-    fn claim_roundtrip_and_missing() {
+    fn record_roundtrip_and_exclusive_acquire() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_claim_in(dir.path()).is_none(), "无 claim 文件读 None");
-        let claim = WatchdogClaim {
-            pid: 42,
-            created_at_process: 133_000_000_000,
-            heartbeat_secs: 1_700_000_000,
-            version: Some("9.9.9".into()),
-        };
-        acquire_claim_in(dir.path(), &claim).expect("空目录首次接管应成功");
-        let read = read_claim_in(dir.path()).unwrap();
-        assert_eq!(read, claim);
-        // 已存在：再次接管失败（原子性——并发 spawn 只有一个赢）
-        let rival = WatchdogClaim { pid: 99, ..claim };
+        assert_eq!(read_record_in(dir.path()), RecordRead::Absent);
+        let mut record = WatchdogRecord::for_current_process(30);
+        record.restarts.push(RestartEvent {
+            port: 59830,
+            at: 1_760_190_100_000,
+            kind: KIND_CRASH.into(),
+            ok: true,
+        });
         assert!(
-            acquire_claim_in(dir.path(), &rival).is_none(),
-            "已有在任 claim 时接管必须失败"
+            acquire_record_in(dir.path(), &record),
+            "空目录首次接管应成功"
+        );
+        assert_eq!(
+            read_record_in(dir.path()),
+            RecordRead::Readable(record.clone())
+        );
+        // 已存在：再次接管失败（原子性——并发拉起只有一个赢）
+        let rival = WatchdogRecord {
+            pid: 99,
+            ..record.clone()
+        };
+        assert!(
+            !acquire_record_in(dir.path(), &rival),
+            "已有记录时接管必须失败"
         );
         // 删除后可重新接管
-        remove_claim_in(dir.path());
-        assert!(acquire_claim_in(dir.path(), &rival).is_some());
+        remove_record_in(dir.path());
+        assert!(acquire_record_in(dir.path(), &rival));
     }
 
+    /// 记录的形状是跨版本读的：字段名、顺序与类型钉在这里。
     #[test]
-    fn claim_corrupted_file_reads_none() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(claim_path_in(dir.path()), "{corrupted").unwrap();
-        assert!(read_claim_in(dir.path()).is_none());
-        // 损坏 claim 的接管：OpenOptions create_new 失败 → None（调用方先
-        // remove 再重试）；此处验证不会 panic
-        let claim = WatchdogClaim {
-            pid: 1,
-            created_at_process: 1,
-            heartbeat_secs: 1,
-            version: None,
+    fn record_shape_is_pinned() {
+        let record = WatchdogRecord {
+            schema: 1,
+            pid: 5555,
+            start: "w:133712345000000000".into(),
+            version: "0.2.0".into(),
+            heartbeat_secs: 30,
+            created_at: 1_760_190_000_000,
+            last_scan_at: 1_760_190_123_456,
+            restarts: vec![RestartEvent {
+                port: 12345,
+                at: 1_760_190_100_000,
+                kind: "crash".into(),
+                ok: true,
+            }],
         };
-        assert!(acquire_claim_in(dir.path(), &claim).is_none());
+        assert_eq!(
+            serde_json::to_string(&record).unwrap(),
+            r#"{"schema":1,"pid":5555,"start":"w:133712345000000000","version":"0.2.0","heartbeat_secs":30,"created_at":1760190000000,"last_scan_at":1760190123456,"restarts":[{"port":12345,"at":1760190100000,"kind":"crash","ok":true}]}"#
+        );
+        // 以后追加的字段读得过去；没有 restarts 的也读得出
+        let read: WatchdogRecord = serde_json::from_str(
+            r#"{"schema":1,"pid":1,"start":"","version":"0.2.0","heartbeat_secs":30,"created_at":1,"last_scan_at":2,"later":true}"#,
+        )
+        .unwrap();
+        assert!(read.restarts.is_empty());
     }
 
     #[test]
-    fn claim_identity_rejects_mismatch_and_dead() {
-        // 真实进程身份验证：本进程的创建时间可查且与自身匹配
-        let my_pid = std::process::id();
-        let my_start = process_start_time(my_pid).expect("本进程创建时间必须可查");
+    fn unreadable_record_is_judged_by_file_age_and_never_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = record_path_in(dir.path());
+        for text in [
+            "{corrupted",
+            r#"{"schema":2,"pid":1,"start":"","version":"9.0.0","heartbeat_secs":30,"created_at":1,"last_scan_at":2}"#,
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert!(
+                matches!(read_record_in(dir.path()), RecordRead::Unreadable { age_secs: Some(age) } if age < 60),
+                "{text}"
+            );
+            // 刚写下的：按修改时间算新鲜，视为有看护者在任；已有记录时接管必须失败
+            assert!(
+                watchdog_in_effect_in(dir.path(), 90, now_millis()),
+                "{text}"
+            );
+            assert!(!acquire_record_in(
+                dir.path(),
+                &WatchdogRecord::for_current_process(30)
+            ));
+            // 修改时间拨到窗口之外：不再算在任
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
+                .unwrap();
+            drop(file);
+            assert!(
+                !watchdog_in_effect_in(dir.path(), 90, now_millis()),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_effect_needs_a_live_owner_and_a_fresh_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let put = |record: &WatchdogRecord| {
+            remove_record_in(dir.path());
+            assert!(acquire_record_in(dir.path(), record));
+        };
+        let now = now_millis();
+        assert!(!watchdog_in_effect_in(dir.path(), 90, now), "没有记录");
+
+        // 本进程写的、刚扫描过：在任
+        let mine = WatchdogRecord::for_current_process(30);
+        put(&mine);
+        assert!(mine.owner_alive());
+        assert!(watchdog_in_effect_in(dir.path(), 90, now));
+        // 最近一次扫描在三个周期之外：假死，不在任（窗口按记录自己的周期算）
+        assert!(watchdog_in_effect_in(dir.path(), 90, now + 90_000));
+        assert!(!watchdog_in_effect_in(dir.path(), 90, now + 91_000));
+        put(&WatchdogRecord {
+            heartbeat_secs: 100,
+            ..mine.clone()
+        });
+        assert!(watchdog_in_effect_in(dir.path(), 90, now + 300_000));
+        assert!(!watchdog_in_effect_in(dir.path(), 90, now + 301_000));
+        // 周期设得再短，窗口也不短于下限
+        put(&WatchdogRecord {
+            heartbeat_secs: 1,
+            ..mine.clone()
+        });
+        assert!(watchdog_in_effect_in(
+            dir.path(),
+            3,
+            now + FRESH_FLOOR_SECS * 1000
+        ));
+
+        // pid 上已经没有进程：不在任
+        let gone = WatchdogRecord {
+            pid: u32::MAX - 7,
+            ..mine.clone()
+        };
+        assert!(!gone.owner_alive());
+        put(&gone);
+        assert!(!watchdog_in_effect_in(dir.path(), 90, now));
+        // pid 还在而启动标记对不上（pid 被复用）：不在任。读不到标记的平台判不出，跳过
+        if !mine.start.is_empty() {
+            let reused = WatchdogRecord {
+                start: format!("{}0", mine.start),
+                ..mine.clone()
+            };
+            assert!(!reused.owner_alive());
+            assert!(!reused.same_owner(&mine));
+        }
+    }
+
+    #[test]
+    fn watchdog_log_appends_and_truncates_at_the_limit() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("logs").join("watchdog.log");
+        append_watchdog_log(home.path(), 0, "first");
+        append_watchdog_log(home.path(), 0, "second");
+        let text = std::fs::read_to_string(&path).unwrap();
         assert!(
-            verify_claim_identity(my_pid, my_start),
-            "本进程身份验证必须通过"
+            text.contains("] first\n") && text.contains("] second\n"),
+            "{text}"
         );
-        // 篡改创建时间 → 冒名拒绝（PID 复用场景的模拟）
+        assert!(text.starts_with("[unix+"), "{text}");
+        // 达到上限：清空之后再写
+        append_watchdog_log(home.path(), 8, "third");
+        let text = std::fs::read_to_string(&path).unwrap();
         assert!(
-            !verify_claim_identity(my_pid, my_start.wrapping_add(1)),
-            "创建时间不匹配必须拒绝"
-        );
-        // 不存在的 PID（测试区高位端口同思路：选一个几乎不可能的 pid）
-        assert!(
-            process_start_time(u32::MAX - 7).is_none(),
-            "不存在的进程应返回 None"
+            text.contains("] third\n") && !text.contains("first"),
+            "{text}"
         );
     }
 
@@ -1481,45 +1833,68 @@ mod tests {
         assert_eq!(heartbeat_fresh_secs(&s), 3);
     }
 
-    /// R1：旧版本（或没有版本的 0.1.0）看护者被守护启动时退役；同版本、更新
-    /// 版本的不动。被测进程名字与 aProxy 无关——身份只认 pid + 创建时间
+    /// 比本版本旧的看护者被实例启动时退役；同版本、更新版本、版本说不清的不动，别的角色
+    /// 不动。找它们靠台账，被测进程的名字与 aProxy 无关——身份只认 pid + 启动标记
     #[cfg(any(windows, target_os = "linux"))]
     #[tokio::test]
-    async fn daemon_startup_retires_only_older_watchdogs() {
-        let dir = tempfile::tempdir().unwrap();
-        let claim_for = |child: &std::process::Child, version: Option<&str>| WatchdogClaim {
-            pid: child.id(),
-            created_at_process: process_start_time(child.id()).expect("子进程创建时间可查"),
-            heartbeat_secs: now_secs(),
-            version: version.map(str::to_string),
-        };
-        let put = |claim: &WatchdogClaim| {
-            remove_claim_in(dir.path());
-            acquire_claim_in(dir.path(), claim).expect("写 claim");
-        };
+    async fn instance_startup_retires_only_older_watchdogs() {
+        use aproxy_ipc::ledger;
+        let home = tempfile::tempdir().unwrap();
+        let run = home.path().join("run");
+        let entry_for =
+            |child: &std::process::Child, role: &str, version: &str| ledger::LedgerEntry {
+                ledger: ledger::LEDGER_FORMAT,
+                pid: child.id(),
+                start: ledger::start_marker(child.id()).expect("子进程的启动标记可查"),
+                role: role.to_string(),
+                version: version.to_string(),
+                port: None,
+                label: None,
+                exe: None,
+                config: None,
+            };
 
-        // 同版本、更新版本：不动
+        // 同版本、更新版本、版本解析不了的看护者，以及更旧版本的实例：都不动
         let mut keeper = spawn_unrelated_child();
-        for version in [env!("CARGO_PKG_VERSION"), "999.0.0"] {
-            put(&claim_for(&keeper, Some(version)));
-            assert!(!retire_older_watchdog_in(dir.path()).await, "{version}");
+        for (role, version) in [
+            (ledger::ROLE_WATCHDOG, env!("CARGO_PKG_VERSION")),
+            (ledger::ROLE_WATCHDOG, "999.0.0"),
+            (ledger::ROLE_WATCHDOG, "not-a-version"),
+            (ledger::ROLE_INSTANCE, "0.0.1"),
+        ] {
+            let path =
+                ledger::write_entry_in(home.path(), &entry_for(&keeper, role, version)).unwrap();
+            assert!(
+                !retire_older_watchdogs_in(home.path()).await,
+                "{role} {version}"
+            );
             assert!(
                 keeper.try_wait().unwrap().is_none(),
-                "{version} 的看护者不得被退役"
+                "{role} {version} 不得被结束"
             );
-            assert!(read_claim_in(dir.path()).is_some());
+            assert!(path.exists(), "没被结束的进程的台账条目不动");
         }
         let _ = keeper.kill();
         let _ = keeper.wait();
-
-        // 没有版本（0.1.0）与更旧的版本：终止并删 claim
-        for version in [None, Some("0.0.1")] {
-            let mut old = spawn_unrelated_child();
-            put(&claim_for(&old, version));
-            assert!(retire_older_watchdog_in(dir.path()).await, "{version:?}");
-            assert!(wait_child_exit(&mut old), "{version:?} 的看护者应被退役");
-            assert!(read_claim_in(dir.path()).is_none());
+        for found in ledger::read_all_in(home.path()) {
+            let _ = std::fs::remove_file(found.path);
         }
+
+        // 更旧的版本：结束它，收掉它的台账条目与属主已不在的看护者记录
+        let mut old = spawn_unrelated_child();
+        let entry = entry_for(&old, ledger::ROLE_WATCHDOG, "0.0.1");
+        let path = ledger::write_entry_in(home.path(), &entry).unwrap();
+        let record = WatchdogRecord {
+            pid: entry.pid,
+            start: entry.start.clone(),
+            version: entry.version.clone(),
+            ..WatchdogRecord::for_current_process(30)
+        };
+        assert!(acquire_record_in(&run, &record));
+        assert!(retire_older_watchdogs_in(home.path()).await);
+        assert!(wait_child_exit(&mut old), "更旧的看护者应被退役");
+        assert!(!path.exists(), "被结束的看护者的台账条目应收掉");
+        assert_eq!(read_record_in(&run), RecordRead::Absent);
     }
 
     /// 选举纯判定核：用 pid → 身份状态的映射注入，覆盖全部进程状态组合
@@ -1566,7 +1941,7 @@ mod tests {
             );
         }
         // 本进程不在在世集合（CLI 父进程 25 / 孤守护）→ 有权，即使有更小 pid
-        // 的在世实例（pid 大小在守护与 CLI 之间无意义，多发起由 claim 兜底）
+        // 的在世实例（pid 大小在守护与 CLI 之间无意义，多发起由看护者记录的原子接管兜底）
         assert!(may_spawn_watchdog(
             25,
             &records,
@@ -1831,7 +2206,7 @@ mod tests {
         assert!(crate::spec::restore_path_in(dir.path(), port).is_file());
     }
 
-    /// settings.json 里把看护者关掉：下一个步进周期退出，claim 删掉，期望状态记录不动；
+    /// settings.json 里把看护者关掉：下一个步进周期退出，看护者记录删掉，期望状态记录不动；
     /// 可调项跟着文件变；文件改坏了就沿用上一次的有效值。
     #[tokio::test]
     async fn watchdog_follows_settings_and_exits_when_disabled() {
@@ -1848,7 +2223,10 @@ mod tests {
 
         assert_eq!(st.tick().await, Tick::Continue);
         assert_eq!(st.cfg.max_restarts, 9, "可调项应跟着文件变");
-        assert!(read_claim_in(dir.path()).is_some(), "在任期间续写 claim");
+        assert!(
+            matches!(read_record_in(dir.path()), RecordRead::Readable(r) if r.same_owner(&st.record)),
+            "在任期间重写看护者记录"
+        );
 
         // 改坏文件：沿用上一次的有效值，继续看护
         write(r#"{"watchdog": "off"}"#);
@@ -1857,7 +2235,11 @@ mod tests {
 
         write(r#"{"watchdog": {"enabled": false}}"#);
         assert_eq!(st.tick().await, Tick::Retire, "开关关掉应退出");
-        assert!(read_claim_in(dir.path()).is_none(), "退出时删掉 claim");
+        assert_eq!(
+            read_record_in(dir.path()),
+            RecordRead::Absent,
+            "退出时删掉看护者记录"
+        );
         assert!(
             crate::spec::restore_path_in(dir.path(), "59921").is_file(),
             "期望状态记录不归看护者删"
@@ -1916,6 +2298,95 @@ mod tests {
         st.pending[0].next_retry = std::time::Instant::now() - Duration::from_secs(1);
         st.process_pending_retries().await;
         assert!(st.pending.is_empty(), "记录已删的条目应出队");
+
+        // 两次失败的重拉都进了记录（下一次重写时落盘）与 watchdog.log；被 stop 的那次不算重拉
+        let events: Vec<(u16, &str, bool)> = st
+            .record
+            .restarts
+            .iter()
+            .map(|e| (e.port, e.kind.as_str(), e.ok))
+            .collect();
+        assert_eq!(
+            events,
+            [(59903, KIND_CRASH, false), (59903, KIND_CRASH, false)]
+        );
+        assert_eq!(st.refresh_record(), Tick::Continue);
+        assert!(
+            matches!(read_record_in(dir.path()), RecordRead::Readable(r) if r.restarts == st.record.restarts)
+        );
+        let log = std::fs::read_to_string(dir.path().join("logs").join("watchdog.log")).unwrap();
+        assert_eq!(
+            log.matches("respawning the instance on port 59903 after a crash failed")
+                .count(),
+            2,
+            "{log}"
+        );
+        assert!(
+            log.contains("was stopped while waiting for a retry"),
+            "{log}"
+        );
+    }
+
+    /// 被看护者按挂死结束的实例，死亡事件到来时起因记成 hang；记录只留最近 20 次重拉。
+    #[tokio::test]
+    async fn restart_events_carry_the_kind_and_keep_only_the_latest() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = "59904";
+        write_crashed_instance(dir.path(), port);
+        let mut st = WatchdogState::new(test_cfg(dir.path()));
+        st.watched.push(Watched {
+            port: port.into(),
+            pid: u32::MAX - 776,
+            handle: 0,
+            consecutive_failures: 0,
+            since: std::time::Instant::now(),
+            start_time: 0,
+        });
+        st.hung_ports.push(port.into());
+        assert_eq!(st.handle_death(port).await, DeathOutcome::RespawnFailed);
+        assert!(st.hung_ports.is_empty(), "起因用过一次就清掉");
+        assert_eq!(st.record.restarts.len(), 1);
+        assert_eq!(st.record.restarts[0].kind, KIND_HANG);
+        assert_eq!(st.pending[0].kind, KIND_HANG, "之后的重试沿用同一个起因");
+
+        for i in 0..(RESTARTS_KEPT as u32 + 5) {
+            st.note_restart("59905", KIND_CRASH, Ok(i));
+        }
+        assert_eq!(st.record.restarts.len(), RESTARTS_KEPT);
+        assert!(
+            st.record.restarts.iter().all(|e| e.port == 59905 && e.ok),
+            "最早的那次应已被挤掉"
+        );
+    }
+
+    /// 记录已经是别的看护者的，或读不懂：让位退出，不覆盖它。
+    #[test]
+    fn refresh_yields_to_another_owner_and_to_an_unreadable_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = WatchdogState::new(test_cfg(dir.path()));
+        // 没有记录：照常写下自己的
+        assert_eq!(st.refresh_record(), Tick::Continue);
+        assert!(
+            matches!(read_record_in(dir.path()), RecordRead::Readable(r) if r.same_owner(&st.record))
+        );
+
+        let other = WatchdogRecord {
+            pid: st.record.pid.wrapping_add(1),
+            ..st.record.clone()
+        };
+        remove_record_in(dir.path());
+        assert!(acquire_record_in(dir.path(), &other));
+        assert_eq!(st.refresh_record(), Tick::Retire);
+        assert_eq!(read_record_in(dir.path()), RecordRead::Readable(other));
+
+        let newer = r#"{"schema":2,"pid":1,"owner":"someone"}"#;
+        std::fs::write(record_path_in(dir.path()), newer).unwrap();
+        assert_eq!(st.refresh_record(), Tick::Retire);
+        assert_eq!(
+            std::fs::read_to_string(record_path_in(dir.path())).unwrap(),
+            newer,
+            "读不懂的记录不得被覆盖"
+        );
     }
 
     #[tokio::test]
@@ -1927,6 +2398,7 @@ mod tests {
         let cfg = test_cfg(dir.path()); // max_restarts = 2
         let mut st = WatchdogState::new(cfg);
         st.pending.push(PendingRetry {
+            kind: KIND_CRASH,
             port: port.to_string(),
             failures: 1, // 再失败一次即达上限
             next_retry: std::time::Instant::now() - Duration::from_secs(1),
@@ -1983,6 +2455,7 @@ mod tests {
         };
         let mut st = WatchdogState::new(cfg);
         st.pending.push(PendingRetry {
+            kind: KIND_CRASH,
             port: port.to_string(),
             failures: 1,
             next_retry: std::time::Instant::now() + Duration::from_secs(3600), // 远期

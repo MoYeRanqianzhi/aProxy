@@ -883,7 +883,7 @@ async fn run_forward_from_staged(
         // 换血：广播之前停掉旧看护者——它的 respawn 用 current_exe 拉实例，
         // 换血后那条路径已不是新二进制（Windows 指向让位后的 aproxy.old-…，升级
         // 永不完成；Linux 读到的是 `… (deleted)`，重拉必然失败）。
-        stop_old_watchdog(run_dir);
+        stop_old_watchdog(home).await;
         // 相位守卫（与 run_tail 同款）：Acked/Swapping 残留的续作重入时
         // phase 已高于 Broadcasting/Acked——逆向迁移非法，保留高位重做即可
         //（广播是幂等置位）
@@ -951,21 +951,18 @@ async fn run_forward_from_staged(
     Ok(FlowExit::Completed)
 }
 
-/// 停掉旧看护者（换血，广播之前）：身份验证 + 终止 + 删 claim。
+/// 停掉旧看护者（换血，广播之前）。按台账找（role 为 watchdog 的条目），不读看护者记录：
+/// 记录的格式随版本变，台账是永久兼容契约，所以对任何版本的看护者都有效。
 /// 看护者不承载流量，零服务影响；换血窗口内实例崩溃 = 短时失去自动重拉，
 /// 可接受微窗（install 结束、宣告消失后，新实例的自检用新二进制补种）。
-fn stop_old_watchdog(run_dir: &Path) {
-    let Some(claim) = crate::watchdog::read_claim_in(run_dir) else {
-        return; // 无看护者，无事
-    };
-    crate::watchdog::remove_claim_in(run_dir);
-    let alive = crate::watchdog::verify_claim_identity(claim.pid, claim.created_at_process);
-    if alive {
-        tracing::info!(
-            pid = claim.pid,
-            "停掉旧看护者（换血：其 respawn 会用旧镜像）"
-        );
-        let _ = crate::process::terminate_verified_process(claim.pid, claim.created_at_process);
+async fn stop_old_watchdog(home: &Path) {
+    let home = home.to_path_buf();
+    let stopped =
+        tokio::task::spawn_blocking(move || crate::watchdog::terminate_watchdogs_in(&home, None))
+            .await
+            .unwrap_or(0);
+    if stopped > 0 {
+        tracing::info!(stopped, "已停掉旧看护者（换血：它的重拉会用旧镜像）");
     }
 }
 

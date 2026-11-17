@@ -307,7 +307,11 @@ asking.
   place, saying which and why.
 - **`stop idle [SECS]`** stops instances idle for at least SECS (default
   `instances.idle_threshold_secs`). A small SECS can include instances in active use. Prints `没有闲置超过 <n> 秒的实例。` ("no
-  instance idle longer than n s") when none qualify.
+  instance idle longer than n s") when none qualify. The instance itself re-checks its idle time
+  when the stop arrives: one that received a request after it was selected is left running, with
+  `pid <pid>（端口 <port>）刚才又收到了请求（已闲置 <n> 秒），不再算闲置，未停止` ("just received a
+  request; no longer idle; not stopped"), and the command still exits 0. `--force` has no such
+  re-check.
 - An alias whose config is not running: `别名 <name>（配置 <path>）当前未在运行。`; a port with no
   instance: `端口 <port> 上没有运行中的 aProxy 实例。`; both exit 1 when there is no record to
   delete either.

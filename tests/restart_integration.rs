@@ -1558,3 +1558,71 @@ fn instance_rewrites_its_record_after_it_is_deleted() {
         Some(before)
     );
 }
+
+/// `stop idle N`：闲置不到 N 秒的实例不停；闲置够久的停掉、连同期望状态记录一起删。
+/// 判断由实例自己做（shutdown 的 `if_idle_secs`），应答里说得出它实际闲置了多久。
+#[test]
+fn stop_idle_only_stops_instances_that_are_idle_long_enough() {
+    let test_home = TestHome::new();
+    let home = test_home.path();
+    let exe = built_exe();
+    let rt = runtime();
+    let port = free_port();
+    let cfg = home.join("idle.toml");
+    write_cfg(&cfg, &format!("127.0.0.1:{port}"));
+    test_home.stop_on_drop(port);
+
+    let out = run_cli(
+        &test_home,
+        &exe,
+        &["start", "--config", cfg.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "start: {}", text(&out.stderr));
+    let live = ipc_ping_in_dir(&rt, port, home).unwrap();
+    assert!(
+        live.features.iter().any(|f| f == "shutdown.if_idle_secs"),
+        "{:?}",
+        live.features
+    );
+
+    // 刚启动的实例闲置不到一小时：不在选中之列，照常运行
+    let out = run_cli(&test_home, &exe, &["stop", "idle", "3600"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        ipc_ping_in_dir(&rt, port, home).is_ok(),
+        "不够闲的实例不得被停"
+    );
+    assert!(has_restore(home, port));
+
+    // 条件由实例判断：直接发带条件的 shutdown，它拒绝并报出实际闲置时长
+    let err = rt
+        .block_on(aproxy::daemon::ipc_request_in(
+            &home.join("run"),
+            &port.to_string(),
+            aproxy::daemon::IpcOp::Shutdown {
+                keep_restore: false,
+                if_idle_secs: Some(3600),
+            },
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(&err, aproxy::daemon::IpcError::Remote { code, details, .. }
+            if code == "condition_not_met" && details["idle_ms"].is_u64()),
+        "{err}"
+    );
+    assert!(
+        has_restore(home, port),
+        "被拒的 shutdown 不得删期望状态记录"
+    );
+
+    // 阈值 0：任何实例都算闲置，停掉并删记录
+    let out = run_cli(&test_home, &exe, &["stop", "idle", "0"]);
+    assert!(
+        out.status.success() && text(&out.stdout).contains("已停止"),
+        "{}{}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+    assert!(ipc_ping_in_dir(&rt, port, home).is_err());
+    assert!(!has_restore(home, port), "stop idle 是 stop：记录一并删掉");
+}

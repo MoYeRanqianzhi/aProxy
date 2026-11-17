@@ -115,13 +115,9 @@ pub async fn stop_and_wait(run_dir: &Path, port: &str, timeout: Duration) -> Res
         .iter()
         .find(|i| crate::daemon::port_of(&i.instance.listen_addr) == port)
         .map(|i| i.instance.pid);
-    crate::daemon::ipc_request_in(
-        run_dir,
-        port,
-        crate::daemon::IpcOp::Shutdown { keep_restore: true },
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    crate::daemon::ipc_request_in(run_dir, port, crate::daemon::IpcOp::STOP_KEEPING_RESTORE)
+        .await
+        .map_err(|e| e.to_string())?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
         // 只有端点消失才算退出：挂死的实例端点还在、只是不应答

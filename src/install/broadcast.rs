@@ -22,7 +22,7 @@ pub async fn ack_one(run_dir: &Path, port: &str) -> Result<(), String> {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        match crate::daemon::ipc_request_in(run_dir, port, crate::daemon::IpcOp::PrepareSwap).await
+        match crate::daemon::ipc_request_in(run_dir, port, crate::daemon::IpcOp::PREPARE_SWAP).await
         {
             // 应答里的状态是实例置位之后组装的：swap_prepared 即 ACK 完成
             Ok(status) if status.state == crate::daemon::InstanceState::SwapPrepared => {

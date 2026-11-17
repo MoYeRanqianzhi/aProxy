@@ -8,8 +8,8 @@
 
 use aproxy::daemon::{self, InstanceRecord};
 use aproxy::ops::stop::{
-    StopFailure, StopMode, Stopped, forget_all_stopped, forget_stopped_config, forget_stopped_port,
-    stop_instance,
+    IdleStop, StopFailure, StopMode, Stopped, forget_all_stopped, forget_stopped_config,
+    forget_stopped_port, stop_if_idle, stop_instance,
 };
 use aproxy::ops::target::{self, Empty, SelectError};
 
@@ -116,9 +116,25 @@ pub(crate) async fn handle_stop_cmd(target: Option<String>, threshold: Option<u6
     // 任一目标没能确认停止 → 退出 1：脚本据此判断，不能把「请求已发、进程还在」
     // 报成成功
     let mut all_stopped = true;
+    // stop idle 的优雅停止带着闲置条件：被选中之后又收到请求的实例不停（强制终止没有条件
+    // 可带，照旧按选中时的闲置时长）
+    let idle_secs = (mode == StopMode::Graceful
+        && target
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case("idle")))
+    .then(|| threshold.unwrap_or(aproxy::settings::load().idle_timeout_secs));
     for info in &targets {
-        match stop_instance(info, mode).await {
-            Ok(stopped) => report_stopped(info, stopped),
+        let outcome = match idle_secs {
+            Some(secs) => stop_if_idle(info, secs).await,
+            None => stop_instance(info, mode).await.map(IdleStop::Stopped),
+        };
+        match outcome {
+            Ok(IdleStop::Stopped(stopped)) => report_stopped(info, stopped),
+            Ok(IdleStop::Busy { idle_secs }) => println!(
+                "pid {}（端口 {}）刚才又收到了请求（已闲置 {idle_secs} 秒），不再算闲置，未停止",
+                info.pid,
+                daemon::port_of(&info.listen_addr)
+            ),
             Err(failure) => {
                 report_stop_failure(info, &failure);
                 all_stopped = false;

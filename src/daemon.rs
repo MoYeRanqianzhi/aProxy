@@ -212,32 +212,82 @@ pub fn new_instance_id() -> String {
 }
 
 /// IPC 状态快照：v1 每个成功应答的 `result`，所有 op 都回它。
+///
+/// 应答只增字段：以后追加的字段在这里一律带 `#[serde(default)]`，读不到就是缺省值；
+/// 不认识的字段忽略。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct InstanceStatus {
     pub instance: InstanceRecord,
-    /// 实例所属的 run 目录。端口被另一个 home 的实例占着时，据此认出是谁
-    pub run_dir: String,
     pub state: InstanceState,
+    /// 实例的行为摘要：默认的投递方式、缓存、保活与规则数
+    pub behavior: Behavior,
     pub activity: Activity,
     /// 实例支持的 op。调用较新的、有副作用的 op 之前先查这里
     pub ops: Vec<String>,
-    /// 实例支持的、不是单独一个 op 的能力，例如 `shutdown.keep_restore`（shutdown 认
-    /// `keep_restore` 参数）。旧实例会静默忽略不认识的参数，所以依赖某个参数生效的调用方
-    /// 要先查这里，不能靠「没报错」推断。没有这个字段的实例读作空表
+    /// 实例认得的 op 参数，名字是 `<op>.<参数>`，例如 `shutdown.keep_restore`。依赖某个
+    /// 参数生效的调用方先查这里，再决定带不带它
     #[serde(default)]
     pub features: Vec<String>,
 }
 
+/// 实例的行为摘要（快照里的 `behavior`）。枚举值按字符串传：更新的版本多出一种取值时，
+/// 今天的读者照样读得出整份快照。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Behavior {
+    /// 请求的默认投递方式：`retry`（缓冲后发往上游、失败重试）或 `forward`（边收边转）
+    pub delivery: String,
+    /// 大于 1 MiB 的请求体与响应体是否落盘
+    pub disk_cache: bool,
+    pub keepalive: KeepaliveBehavior,
+    /// 生效的重试规则条数
+    pub retry_rules: u32,
+}
+
+/// 保活的摘要（`behavior.keepalive`）。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct KeepaliveBehavior {
+    /// 哪些请求走保活：`accept`、`body_stream` 或 `any`
+    pub trigger: String,
+    /// 心跳间隔（秒）；0 = 保活关闭
+    pub interval_secs: u64,
+}
+
+impl Behavior {
+    /// 从生效的配置取摘要。
+    pub fn of(cfg: &crate::config::Config) -> Self {
+        Behavior {
+            delivery: if cfg.forward_only_enabled() {
+                "forward"
+            } else {
+                "retry"
+            }
+            .to_string(),
+            disk_cache: cfg.disk_cache_enabled(),
+            keepalive: KeepaliveBehavior {
+                trigger: cfg.keepalive_trigger().as_str().to_string(),
+                interval_secs: cfg.keepalive_interval().as_secs(),
+            },
+            retry_rules: cfg.retry_rules.len() as u32,
+        }
+    }
+}
+
 /// 能力名：shutdown 认 `keep_restore` 参数。
 pub const FEATURE_SHUTDOWN_KEEP_RESTORE: &str = "shutdown.keep_restore";
+/// 能力名：shutdown 认 `if_idle_secs` 参数。
+pub const FEATURE_SHUTDOWN_IF_IDLE_SECS: &str = "shutdown.if_idle_secs";
+/// 能力名：prepare_swap 认 `ttl_secs` 参数。
+pub const FEATURE_PREPARE_SWAP_TTL_SECS: &str = "prepare_swap.ttl_secs";
 
 /// 实例此刻所处的阶段。
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InstanceState {
+    /// 控制端点已经在应答，但还没开始接收请求
+    Starting,
     Serving,
-    /// install 广播 prepare_swap 之后、重启之前（内存态，重启自然清除）。
-    /// 安装器的 ACK 判定就是读到这个状态
+    /// install 广播 prepare_swap 之后、重启之前（内存态：重启自然清除，到期也会自己回到
+    /// `serving`）。安装器的 ACK 判定就是读到这个状态
     SwapPrepared,
     /// 已收到 shutdown，正在优雅退出
     Stopping,
@@ -272,67 +322,151 @@ pub struct LastError {
 /// 不认识的字段，不认识的状态读作 `Unknown`。
 pub const IPC_VERSION: u32 = 1;
 
+/// prepare_swap 不带 `ttl_secs` 时，更换阶段保持多久（秒）。
+pub const DEFAULT_SWAP_TTL_SECS: u64 = 600;
+
 /// 控制操作。线上是一行 JSON：`{"v":1,"op":"<snake_case 名>"}`，可带
 /// `args` 对象。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpcOp {
     /// 读状态快照（status、start 预检、就绪等待）
     Ping,
-    /// 优雅停止：应答先发出，随后开始退出。
+    /// 优雅停止：应答先发出，随后开始退出。重复调用结果相同。
     ///
     /// `keep_restore` 为 false（`aproxy stop` 的语义）时，实例在应答之前先删掉自己的期望
     /// 状态记录：用户要它停下，restore 与看护者不该再把它拉回来。为 true（restart、安装的
-    /// 滚动重启）时记录留着：调用方接着就要用它拉起新实例，中途崩溃了记录也还在。线上是
-    /// `"args":{"keep_restore":true}`，不带 `args` 等于 false
-    Shutdown { keep_restore: bool },
+    /// 滚动重启）时记录留着：调用方接着就要用它拉起新实例，中途崩溃了记录也还在。
+    ///
+    /// `if_idle_secs` 给了时，只有实例已经闲置至少这么多秒才停，否则回
+    /// `condition_not_met`（`details.idle_ms` 是它实际闲置了多久）、什么都不做。判断与停止
+    /// 在实例里一次完成：调用方先查闲置再发停止的话，中间到达的请求会被打断。
+    Shutdown {
+        keep_restore: bool,
+        if_idle_secs: Option<u64>,
+    },
     /// install 广播：进入二进制更换阶段。实例把它写进可观测的状态
-    /// （`swap_prepared`），应答里立即可见——表达的是「进入阶段」而非口头 ok
-    PrepareSwap,
+    /// （`swap_prepared`），应答里立即可见——表达的是「进入阶段」而非口头 ok。
+    /// 阶段保持 `ttl_secs` 秒（不给按 [`DEFAULT_SWAP_TTL_SECS`]），到期自己回到 `serving`：
+    /// 安装者中途没了的话，实例不会永远停在这个状态。重复调用重新计时
+    PrepareSwap { ttl_secs: Option<u64> },
 }
 
 impl IpcOp {
     /// 全部 op 的名字（快照里的 `ops`）
     const NAMES: [&'static str; 3] = ["ping", "shutdown", "prepare_swap"];
 
+    /// 本版本认得的 op 参数（快照里的 `features`）
+    const FEATURES: [&'static str; 3] = [
+        FEATURE_SHUTDOWN_IF_IDLE_SECS,
+        FEATURE_SHUTDOWN_KEEP_RESTORE,
+        FEATURE_PREPARE_SWAP_TTL_SECS,
+    ];
+
     /// `aproxy stop` 用的 shutdown：不留期望状态记录
     pub const STOP: IpcOp = IpcOp::Shutdown {
         keep_restore: false,
+        if_idle_secs: None,
     };
+
+    /// 为了马上再拉起而停（restart、滚动重启）：期望状态记录留着
+    pub const STOP_KEEPING_RESTORE: IpcOp = IpcOp::Shutdown {
+        keep_restore: true,
+        if_idle_secs: None,
+    };
+
+    /// 进入更换阶段，按默认时长保持
+    pub const PREPARE_SWAP: IpcOp = IpcOp::PrepareSwap { ttl_secs: None };
 
     pub fn name(self) -> &'static str {
         match self {
             IpcOp::Ping => "ping",
             IpcOp::Shutdown { .. } => "shutdown",
-            IpcOp::PrepareSwap => "prepare_swap",
+            IpcOp::PrepareSwap { .. } => "prepare_swap",
         }
     }
 
-    /// 按名字与 `args` 还原一个 op。不认识的名字返回 None；不认识的参数忽略
-    fn from_request(name: &str, args: Option<&serde_json::Value>) -> Option<Self> {
-        match name {
-            "ping" => Some(IpcOp::Ping),
-            "shutdown" => Some(IpcOp::Shutdown {
-                keep_restore: args
-                    .and_then(|args| args.get("keep_restore"))
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false),
+    /// 按名字与 `args` 还原一个 op。不认识的名字、不认识的参数、类型或取值不对的参数，
+    /// 各有各的拒绝。
+    fn from_request(
+        name: &str,
+        args: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<Self, Rejection> {
+        let known: &[&str] = match name {
+            "ping" => &[],
+            "shutdown" => &["keep_restore", "if_idle_secs"],
+            "prepare_swap" => &["ttl_secs"],
+            _ => return Err(Rejection::UnknownOp(name.to_string())),
+        };
+        let unknown: Vec<String> = args
+            .into_iter()
+            .flat_map(|args| args.keys())
+            .filter(|key| !known.contains(&key.as_str()))
+            .cloned()
+            .collect();
+        if !unknown.is_empty() {
+            return Err(Rejection::UnsupportedArg(unknown));
+        }
+        let arg = |key: &str| args.and_then(|args| args.get(key));
+        let boolean = |key: &'static str| match arg(key) {
+            None => Ok(None),
+            Some(value) => value.as_bool().map(Some).ok_or(Rejection::BadRequest {
+                reason: "invalid_arg",
+                arg: Some(key),
             }),
-            "prepare_swap" => Some(IpcOp::PrepareSwap),
-            _ => None,
-        }
+        };
+        let seconds =
+            |key: &'static str, min: u64| match arg(key) {
+                None => Ok(None),
+                Some(value) => value.as_u64().filter(|secs| *secs >= min).map(Some).ok_or(
+                    Rejection::BadRequest {
+                        reason: "invalid_arg",
+                        arg: Some(key),
+                    },
+                ),
+            };
+        Ok(match name {
+            "ping" => IpcOp::Ping,
+            "shutdown" => IpcOp::Shutdown {
+                keep_restore: boolean("keep_restore")?.unwrap_or(false),
+                if_idle_secs: seconds("if_idle_secs", 0)?,
+            },
+            // 时长为 0 的更换阶段一进入就过期，等于没进入：不接受
+            _ => IpcOp::PrepareSwap {
+                ttl_secs: seconds("ttl_secs", 1)?,
+            },
+        })
     }
 
-    /// 发往实例的请求行（不含换行）
+    /// 发往实例的请求行（不含换行）。参数只在不是缺省值时才带：不认识它的实例会拒绝整个
+    /// 请求，所以带之前先查快照的 `features`。
     pub fn request_line(self) -> String {
+        let mut args = serde_json::Map::new();
         match self {
-            IpcOp::Shutdown { keep_restore: true } => serde_json::json!({
-                "v": IPC_VERSION,
-                "op": self.name(),
-                "args": { "keep_restore": true },
-            }),
-            _ => serde_json::json!({ "v": IPC_VERSION, "op": self.name() }),
+            IpcOp::Ping => {}
+            IpcOp::Shutdown {
+                keep_restore,
+                if_idle_secs,
+            } => {
+                if let Some(secs) = if_idle_secs {
+                    args.insert("if_idle_secs".into(), secs.into());
+                }
+                if keep_restore {
+                    args.insert("keep_restore".into(), true.into());
+                }
+            }
+            IpcOp::PrepareSwap { ttl_secs } => {
+                if let Some(secs) = ttl_secs {
+                    args.insert("ttl_secs".into(), secs.into());
+                }
+            }
         }
-        .to_string()
+        let mut line = serde_json::Map::new();
+        line.insert("v".into(), IPC_VERSION.into());
+        line.insert("op".into(), self.name().into());
+        if !args.is_empty() {
+            line.insert("args".into(), args.into());
+        }
+        serde_json::Value::Object(line).to_string()
     }
 }
 
@@ -347,27 +481,116 @@ struct WireResponse {
     error: Option<WireError>,
 }
 
-/// 失败应答。`code` 是稳定的 snake_case 字符串，供程序判断；`message` 只给人看，
-/// 不要解析它。
+/// 失败应答。`code` 是稳定的 snake_case 字符串，供程序判断；`details` 是这个码带的数据
+/// （键与类型见码表 [`aproxy_ipc::code`]）；`message` 是英文，只给日志看，不要解析它。
 #[derive(Serialize, Deserialize)]
 struct WireError {
     code: String,
     message: String,
-    /// `unsupported_version` 时列出实例支持的版本
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    supported: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    details: serde_json::Value,
 }
 
 /// 错误码。客户端遇到不认识的码按一般的「实例拒绝」处理。
 pub mod error_code {
-    /// 不是 JSON、缺 `v`/`op`、行过长、`args` 不合法
+    /// 不是 JSON、缺 `v`/`op`、行过长、参数的类型或取值不对（`details.reason`）
     pub const BAD_REQUEST: &str = "bad_request";
-    /// `v` 不是实例支持的版本（应答带 `supported`）
+    /// `v` 不是实例支持的版本（`details.supported` 列出支持的）
     pub const UNSUPPORTED_VERSION: &str = "unsupported_version";
     /// 实例没有这个 op（没有副作用，可以放心用来探测能力）
     pub const UNKNOWN_OP: &str = "unknown_op";
-    /// op 此刻不允许（例如已在退出时收到 prepare_swap）
+    /// 带了实例不认识的参数（`details.args` 列出它们）；什么都没做
+    pub const UNSUPPORTED_ARG: &str = "unsupported_arg";
+    /// op 此刻不允许（例如已在退出时收到 prepare_swap；`details.state` 是此刻的状态）
     pub const INVALID_STATE: &str = "invalid_state";
+    /// 带条件的 op 条件不成立（`shutdown{if_idle_secs}` 时实例不够闲；`details.idle_ms`）
+    pub const CONDITION_NOT_MET: &str = "condition_not_met";
+}
+
+/// 实例对一个请求的拒绝：码、英文说明与 `details`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Rejection {
+    /// `reason` 的词表：`incomplete_line`、`not_json`、`missing_v`、`missing_op`、
+    /// `args_not_object`、`invalid_arg`（这时 `arg` 是那个参数的名字）
+    BadRequest {
+        reason: &'static str,
+        arg: Option<&'static str>,
+    },
+    /// 请求里的 `v`（原样）不受支持
+    UnsupportedVersion(String),
+    UnknownOp(String),
+    UnsupportedArg(Vec<String>),
+    /// 此刻的状态不允许这个 op
+    InvalidState(&'static str),
+    /// 实例只闲置了 `idle_ms` 毫秒
+    ConditionNotMet {
+        idle_ms: u64,
+    },
+}
+
+impl Rejection {
+    fn bad(reason: &'static str) -> Self {
+        Rejection::BadRequest { reason, arg: None }
+    }
+
+    /// 要回给客户端的那一行应答（不含换行）
+    fn reply(&self) -> String {
+        use serde_json::json;
+        let (code, message, details) = match self {
+            Rejection::BadRequest { reason, arg } => {
+                let message = match (*reason, arg) {
+                    ("incomplete_line", _) => "the request line is too long or incomplete".into(),
+                    ("not_json", _) => "the request is not JSON".into(),
+                    ("missing_v", _) => "the request has no v".into(),
+                    ("missing_op", _) => "the request has no op".into(),
+                    ("args_not_object", _) => "args must be an object".into(),
+                    (_, Some(arg)) => format!("arg {arg} has the wrong type or value"),
+                    (other, None) => other.to_string(),
+                };
+                let details = match arg {
+                    Some(arg) => json!({ "reason": reason, "arg": arg }),
+                    None => json!({ "reason": reason }),
+                };
+                (error_code::BAD_REQUEST, message, details)
+            }
+            Rejection::UnsupportedVersion(v) => (
+                error_code::UNSUPPORTED_VERSION,
+                format!("unsupported protocol version {v}; this instance supports {IPC_VERSION}"),
+                json!({ "supported": [IPC_VERSION] }),
+            ),
+            Rejection::UnknownOp(op) => (
+                error_code::UNKNOWN_OP,
+                format!("unknown op: {op}"),
+                json!({ "op": op }),
+            ),
+            Rejection::UnsupportedArg(args) => (
+                error_code::UNSUPPORTED_ARG,
+                format!("unknown arg: {}", args.join(", ")),
+                json!({ "args": args }),
+            ),
+            Rejection::InvalidState(state) => (
+                error_code::INVALID_STATE,
+                format!("not allowed while the instance is {state}"),
+                json!({ "state": state }),
+            ),
+            Rejection::ConditionNotMet { idle_ms } => (
+                error_code::CONDITION_NOT_MET,
+                format!("the instance has been idle for only {idle_ms} ms"),
+                json!({ "idle_ms": idle_ms }),
+            ),
+        };
+        serde_json::to_string(&WireResponse {
+            v: IPC_VERSION,
+            ok: false,
+            result: None,
+            error: Some(WireError {
+                code: code.to_string(),
+                message,
+                details,
+            }),
+        })
+        .expect("序列化 IPC 应答失败")
+    }
 }
 
 /// 一次 IPC 请求的失败，按「能据此下什么结论」分类。
@@ -379,15 +602,21 @@ pub enum IpcError {
     Transient(String),
     /// 有应答但无法采信：解析不了、协议版本不符、自报 pid 与连接对端不符
     Protocol(String),
-    /// 实例明确拒绝了请求
-    Remote { code: String, message: String },
+    /// 实例明确拒绝了请求。`details` 是这个码带的数据（没有时为 null）
+    Remote {
+        code: String,
+        message: String,
+        details: serde_json::Value,
+    },
 }
 
 impl std::fmt::Display for IpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unreachable(e) | Self::Transient(e) | Self::Protocol(e) => f.write_str(e),
-            Self::Remote { code, message } => write!(f, "实例拒绝了请求（{code}）：{message}"),
+            Self::Remote { code, message, .. } => {
+                write!(f, "实例拒绝了请求（{code}）：{message}")
+            }
         }
     }
 }
@@ -499,6 +728,7 @@ fn parse_reply(line: &str) -> Result<InstanceStatus, IpcError> {
         (false, _, Some(error)) => Err(IpcError::Remote {
             code: error.code,
             message: error.message,
+            details: error.details,
         }),
         _ => Err(IpcError::Protocol("应答缺少 result 或 error".to_string())),
     }
@@ -520,7 +750,9 @@ pub async fn bind_ipc(port: &str) -> io::Result<IpcEndpoint> {
 pub struct ControlState {
     /// 本实例的注册记录（应答里的 `instance`）
     pub record: InstanceRecord,
-    /// 本实例所属的 run 目录（应答里的 `run_dir`）
+    /// 本实例的行为摘要（应答里的 `behavior`）
+    pub behavior: Behavior,
+    /// 本实例所属的 run 目录（期望状态记录写在这里）
     pub run_dir: String,
     /// 代理层的实时观测源，应答时现读
     pub stats: Arc<IpcStats>,
@@ -536,6 +768,14 @@ impl ControlState {
     /// 本实例的端口（记录与端点都按它命名）
     fn port(&self) -> &str {
         port_of(&self.record.listen_addr)
+    }
+
+    /// 最近一次收到客户端请求的时刻（Unix 毫秒）；还没收到过请求时是启动时刻
+    fn last_request_at(&self) -> u64 {
+        self.stats
+            .last_activity_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(self.record.started_at)
     }
 
     /// 写本实例的期望状态记录。已经收到过不带 `keep_restore` 的 shutdown 时不写，返回
@@ -589,8 +829,9 @@ pub struct IpcStats {
     pub retries_total: std::sync::atomic::AtomicU64,
     /// 最近一次上游失败的简短摘要与发生时刻（打码后的短串、Unix 毫秒；None = 从未失败）
     pub last_error: std::sync::Mutex<Option<(String, u64)>>,
-    /// 二进制更换阶段（PrepareSwap 广播后置位，重启自然清除）
-    pub swap_phase: std::sync::atomic::AtomicBool,
+    /// 二进制更换阶段的到期时刻（Unix 毫秒）：prepare_swap 时写下，晚于现在就算在这个
+    /// 阶段里。0 = 没进入过；重启自然清除
+    pub swap_until_ms: std::sync::atomic::AtomicU64,
 }
 
 impl IpcStats {
@@ -1285,8 +1526,8 @@ where
 {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     // 应答行长度上限：端点名可以预测，应答者未必是 aProxy，不能让它把客户端
-    // 内存撑爆。真实应答只有几百字节
-    const MAX_RESPONSE_LINE: u64 = 1024 * 1024;
+    // 内存撑爆。快照只有几百字节到几千字节；上限留给以后一行带一批请求记录的 op
+    const MAX_RESPONSE_LINE: u64 = 16 * 1024 * 1024;
     let failed = |e: io::Error| IpcError::Transient(e.to_string());
     let (reader, mut writer) = tokio::io::split(stream);
     writer
@@ -1335,27 +1576,45 @@ where
     }
     let op = match parse_request(&line) {
         Ok(op) => op,
-        Err(reply) => return write_line(&mut writer, &reply).await,
+        Err(rejection) => return write_line(&mut writer, &rejection.reply()).await,
     };
-    if op == IpcOp::PrepareSwap {
-        if *state.on_shutdown.borrow() {
-            let reply = error_reply(error_code::INVALID_STATE, "实例正在退出，不再进入更换阶段");
-            return write_line(&mut writer, &reply).await;
+    let stopping = *state.on_shutdown.borrow();
+    match op {
+        IpcOp::Ping => {}
+        IpcOp::PrepareSwap { ttl_secs } => {
+            if stopping {
+                let reply = Rejection::InvalidState("stopping").reply();
+                return write_line(&mut writer, &reply).await;
+            }
+            // 先置位再组装应答：应答里立即是 swap_prepared，安装器拿这一个应答
+            // 就完成 ACK 判定，无需再补一次 ping
+            let ttl_ms = ttl_secs
+                .unwrap_or(DEFAULT_SWAP_TTL_SECS)
+                .saturating_mul(1000);
+            state.stats.swap_until_ms.store(
+                now_millis().saturating_add(ttl_ms),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
-        // 先置位再组装应答：应答里立即是 swap_prepared，安装器拿这一个应答
-        // 就完成 ACK 判定，无需再补一次 ping
-        state
-            .stats
-            .swap_phase
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-    // 记录先删、应答后发：调用方拿到应答时，「它不会再被拉回来」已经成立
-    if op
-        == (IpcOp::Shutdown {
-            keep_restore: false,
-        })
-    {
-        state.forget_restore();
+        IpcOp::Shutdown {
+            keep_restore,
+            if_idle_secs,
+        } => {
+            // 条件只在还没开始退出时判断：已经在退出的实例，重复的 shutdown 结果相同
+            if let Some(secs) = if_idle_secs
+                && !stopping
+            {
+                let idle_ms = now_millis().saturating_sub(state.last_request_at());
+                if idle_ms < secs.saturating_mul(1000) {
+                    let reply = Rejection::ConditionNotMet { idle_ms }.reply();
+                    return write_line(&mut writer, &reply).await;
+                }
+            }
+            // 记录先删、应答后发：调用方拿到应答时，「它不会再被拉回来」已经成立
+            if !keep_restore {
+                state.forget_restore();
+            }
+        }
     }
     let mut status = status_snapshot(&state);
     if matches!(op, IpcOp::Shutdown { .. }) {
@@ -1376,58 +1635,30 @@ where
     Ok(())
 }
 
-/// 解析请求行。Err 里是要直接回给客户端的拒绝应答。
-fn parse_request(line: &str) -> Result<IpcOp, String> {
+/// 解析请求行。Err 是要回给客户端的拒绝。
+fn parse_request(line: &str) -> Result<IpcOp, Rejection> {
     // 行未正常终止：超过长度上限被截断，或对端在发完整请求前就断开
     if !line.ends_with('\n') {
-        return Err(error_reply(error_code::BAD_REQUEST, "请求行过长或不完整"));
+        return Err(Rejection::bad("incomplete_line"));
     }
     let Ok(request) = serde_json::from_str::<serde_json::Value>(line) else {
-        return Err(error_reply(error_code::BAD_REQUEST, "请求不是 JSON"));
+        return Err(Rejection::bad("not_json"));
     };
     let Some(v) = request.get("v") else {
-        return Err(error_reply(error_code::BAD_REQUEST, "请求缺少 v"));
+        return Err(Rejection::bad("missing_v"));
     };
     if v.as_u64() != Some(u64::from(IPC_VERSION)) {
-        let reply = WireResponse {
-            v: IPC_VERSION,
-            ok: false,
-            result: None,
-            error: Some(WireError {
-                code: error_code::UNSUPPORTED_VERSION.to_string(),
-                message: format!("实例只支持控制协议 v{IPC_VERSION}，收到 v{v}"),
-                supported: Some(vec![IPC_VERSION]),
-            }),
-        };
-        return Err(serde_json::to_string(&reply).expect("序列化 IPC 应答失败"));
+        return Err(Rejection::UnsupportedVersion(v.to_string()));
     }
     let Some(name) = request.get("op").and_then(|op| op.as_str()) else {
-        return Err(error_reply(error_code::BAD_REQUEST, "请求缺少 op"));
+        return Err(Rejection::bad("missing_op"));
     };
-    if request.get("args").is_some_and(|args| !args.is_object()) {
-        return Err(error_reply(error_code::BAD_REQUEST, "args 必须是对象"));
-    }
-    match IpcOp::from_request(name, request.get("args")) {
-        Some(op) => Ok(op),
-        None => Err(error_reply(
-            error_code::UNKNOWN_OP,
-            &format!("实例没有 op \"{name}\""),
-        )),
-    }
-}
-
-fn error_reply(code: &str, message: &str) -> String {
-    serde_json::to_string(&WireResponse {
-        v: IPC_VERSION,
-        ok: false,
-        result: None,
-        error: Some(WireError {
-            code: code.to_string(),
-            message: message.to_string(),
-            supported: None,
-        }),
-    })
-    .expect("序列化 IPC 应答失败")
+    let args = match request.get("args") {
+        None => None,
+        Some(serde_json::Value::Object(args)) => Some(args),
+        Some(_) => return Err(Rejection::bad("args_not_object")),
+    };
+    IpcOp::from_request(name, args)
 }
 
 /// 组装此刻的状态快照（计数器、最近错误在应答瞬间现读）。
@@ -1436,7 +1667,7 @@ fn status_snapshot(state: &ControlState) -> InstanceStatus {
     let stats = &state.stats;
     let phase = if *state.on_shutdown.borrow() {
         InstanceState::Stopping
-    } else if stats.swap_phase.load(Relaxed) {
+    } else if stats.swap_until_ms.load(Relaxed) > now_millis() {
         InstanceState::SwapPrepared
     } else {
         InstanceState::Serving
@@ -1449,19 +1680,19 @@ fn status_snapshot(state: &ControlState) -> InstanceStatus {
     });
     InstanceStatus {
         instance: state.record.clone(),
-        run_dir: state.run_dir.clone(),
         state: phase,
+        behavior: state.behavior.clone(),
         activity: Activity {
-            last_request_at: stats
-                .last_activity_ms
-                .load(Relaxed)
-                .max(state.record.started_at),
+            last_request_at: state.last_request_at(),
             requests_total: stats.requests_total.load(Relaxed),
             retries_total: stats.retries_total.load(Relaxed),
             last_error,
         },
         ops: IpcOp::NAMES.iter().map(|name| name.to_string()).collect(),
-        features: vec![FEATURE_SHUTDOWN_KEEP_RESTORE.to_string()],
+        features: IpcOp::FEATURES
+            .iter()
+            .map(|name| name.to_string())
+            .collect(),
     }
 }
 
@@ -1720,11 +1951,24 @@ mod tests {
         }
     }
 
+    fn sample_behavior() -> Behavior {
+        Behavior {
+            delivery: "retry".into(),
+            disk_cache: true,
+            keepalive: KeepaliveBehavior {
+                trigger: "any".into(),
+                interval_secs: 15,
+            },
+            retry_rules: 1,
+        }
+    }
+
     /// 测试用的控制服务状态；返回的 Receiver 用来观察 shutdown 是否被触发
     fn control(record: InstanceRecord) -> (Arc<ControlState>, tokio::sync::watch::Receiver<bool>) {
         let (on_shutdown, rx) = tokio::sync::watch::channel(false);
         let state = ControlState {
             record,
+            behavior: sample_behavior(),
             run_dir: "/test/run".into(),
             stats: Arc::new(IpcStats::default()),
             on_shutdown,
@@ -1886,22 +2130,46 @@ mod tests {
         ));
     }
 
+    /// 每个 op 的请求行钉在这里，并且都能被服务端的解析器还原成同一个 op。
     #[test]
-    fn request_lines_round_trip_through_the_server_parser() {
-        for op in [
-            IpcOp::Ping,
-            IpcOp::STOP,
-            IpcOp::Shutdown { keep_restore: true },
-            IpcOp::PrepareSwap,
-        ] {
-            assert_eq!(parse_request(&(op.request_line() + "\n")).unwrap(), op);
+    fn request_lines_are_pinned_and_round_trip_through_the_server_parser() {
+        let cases = [
+            (IpcOp::Ping, r#"{"v":1,"op":"ping"}"#),
+            (IpcOp::STOP, r#"{"v":1,"op":"shutdown"}"#),
+            (
+                IpcOp::STOP_KEEPING_RESTORE,
+                r#"{"v":1,"op":"shutdown","args":{"keep_restore":true}}"#,
+            ),
+            (
+                IpcOp::Shutdown {
+                    keep_restore: false,
+                    if_idle_secs: Some(600),
+                },
+                r#"{"v":1,"op":"shutdown","args":{"if_idle_secs":600}}"#,
+            ),
+            (
+                IpcOp::Shutdown {
+                    keep_restore: true,
+                    if_idle_secs: Some(0),
+                },
+                r#"{"v":1,"op":"shutdown","args":{"if_idle_secs":0,"keep_restore":true}}"#,
+            ),
+            (IpcOp::PREPARE_SWAP, r#"{"v":1,"op":"prepare_swap"}"#),
+            (
+                IpcOp::PrepareSwap {
+                    ttl_secs: Some(120),
+                },
+                r#"{"v":1,"op":"prepare_swap","args":{"ttl_secs":120}}"#,
+            ),
+        ];
+        for (op, line) in cases {
+            assert_eq!(op.request_line(), line);
+            assert_eq!(parse_request(&format!("{line}\n")).unwrap(), op, "{line}");
         }
-        // 不带 args 的 shutdown 就是 stop；args 里不认识的键忽略，类型不对的按没给
-        assert_eq!(IpcOp::STOP.request_line(), r#"{"v":1,"op":"shutdown"}"#);
+        // 空的 args 等于没带；显式的 keep_restore:false 等于缺省
         for line in [
             r#"{"v":1,"op":"shutdown","args":{}}"#,
-            r#"{"v":1,"op":"shutdown","args":{"added_later":1}}"#,
-            r#"{"v":1,"op":"shutdown","args":{"keep_restore":"yes"}}"#,
+            r#"{"v":1,"op":"shutdown","args":{"keep_restore":false}}"#,
         ] {
             assert_eq!(
                 parse_request(&format!("{line}\n")).unwrap(),
@@ -1909,13 +2177,21 @@ mod tests {
                 "{line}"
             );
         }
-        // 快照里列出的 op 名与各 op 的名字一致
+        // 快照里列出的 op 名与各 op 的名字一致；features 的名字是 <op>.<参数>
         assert_eq!(
             IpcOp::NAMES,
             [
                 IpcOp::Ping.name(),
                 IpcOp::STOP.name(),
-                IpcOp::PrepareSwap.name()
+                IpcOp::PREPARE_SWAP.name()
+            ]
+        );
+        assert_eq!(
+            IpcOp::FEATURES,
+            [
+                "shutdown.if_idle_secs",
+                "shutdown.keep_restore",
+                "prepare_swap.ttl_secs"
             ]
         );
     }
@@ -1929,6 +2205,7 @@ mod tests {
             let (on_shutdown, _rx) = tokio::sync::watch::channel(false);
             ControlState {
                 record: record.clone(),
+                behavior: sample_behavior(),
                 run_dir: dir.path().display().to_string(),
                 stats: Arc::new(IpcStats::default()),
                 on_shutdown,
@@ -1953,7 +2230,7 @@ mod tests {
         assert!(state.write_restore(&spec).unwrap());
         let (client, server) = tokio::io::duplex(4096);
         let handler = tokio::spawn(handle_conn(server, state.clone()));
-        let line = IpcOp::Shutdown { keep_restore: true }.request_line();
+        let line = IpcOp::STOP_KEEPING_RESTORE.request_line();
         let reply = exchange_over(client, &line).await.unwrap();
         handler.await.unwrap().unwrap();
         assert_eq!(parse_reply(&reply).unwrap().state, InstanceState::Stopping);
@@ -1968,55 +2245,167 @@ mod tests {
         assert!(!path.exists(), "stop 应删掉记录");
     }
 
+    /// 每种拒绝的应答行钉在这里：码、英文说明与 `details` 的键。
     #[test]
-    fn bad_requests_get_stable_error_codes() {
-        let reply = |line: &str| -> serde_json::Value {
-            serde_json::from_str(&parse_request(line).unwrap_err()).unwrap()
-        };
-        let code = |line: &str| {
-            reply(line)["error"]["code"]
-                .as_str()
-                .unwrap_or("")
-                .to_string()
-        };
-        assert_eq!(code("{\"v\":1,\"op\":\"what\"}\n"), "unknown_op");
-        assert_eq!(code("{\"v\":2,\"op\":\"ping\"}\n"), "unsupported_version");
+    fn rejections_are_pinned() {
+        let reply = |line: &str| parse_request(line).unwrap_err().reply();
+        let cases = [
+            (
+                "{\"v\":1,\"op\":\"what\"}\n",
+                r#"{"v":1,"ok":false,"error":{"code":"unknown_op","message":"unknown op: what","details":{"op":"what"}}}"#,
+            ),
+            (
+                "{\"v\":2,\"op\":\"ping\"}\n",
+                r#"{"v":1,"ok":false,"error":{"code":"unsupported_version","message":"unsupported protocol version 2; this instance supports 1","details":{"supported":[1]}}}"#,
+            ),
+            (
+                "{\"v\":1,\"op\":\"shutdown\",\"args\":{\"drain_secs\":5,\"keep_restore\":true,\"later\":1}}\n",
+                r#"{"v":1,"ok":false,"error":{"code":"unsupported_arg","message":"unknown arg: drain_secs, later","details":{"args":["drain_secs","later"]}}}"#,
+            ),
+            (
+                "{\"v\":1,\"op\":\"ping\",\"args\":{\"x\":1}}\n",
+                r#"{"v":1,"ok":false,"error":{"code":"unsupported_arg","message":"unknown arg: x","details":{"args":["x"]}}}"#,
+            ),
+            (
+                "{\"v\":1,\"op\":\"shutdown\",\"args\":{\"keep_restore\":\"yes\"}}\n",
+                r#"{"v":1,"ok":false,"error":{"code":"bad_request","message":"arg keep_restore has the wrong type or value","details":{"reason":"invalid_arg","arg":"keep_restore"}}}"#,
+            ),
+            (
+                "{\"v\":1,\"op\":\"shutdown\",\"args\":{\"if_idle_secs\":-1}}\n",
+                r#"{"v":1,"ok":false,"error":{"code":"bad_request","message":"arg if_idle_secs has the wrong type or value","details":{"reason":"invalid_arg","arg":"if_idle_secs"}}}"#,
+            ),
+            (
+                "{\"v\":1,\"op\":\"prepare_swap\",\"args\":{\"ttl_secs\":0}}\n",
+                r#"{"v":1,"ok":false,"error":{"code":"bad_request","message":"arg ttl_secs has the wrong type or value","details":{"reason":"invalid_arg","arg":"ttl_secs"}}}"#,
+            ),
+            (
+                "not json\n",
+                r#"{"v":1,"ok":false,"error":{"code":"bad_request","message":"the request is not JSON","details":{"reason":"not_json"}}}"#,
+            ),
+            (
+                // 没有 v 的请求（例如 0.1.0 的 CLI 发来的）一样按 v1 拒绝
+                "{\"op\":\"ping\"}\n",
+                r#"{"v":1,"ok":false,"error":{"code":"bad_request","message":"the request has no v","details":{"reason":"missing_v"}}}"#,
+            ),
+            (
+                "{\"v\":1}\n",
+                r#"{"v":1,"ok":false,"error":{"code":"bad_request","message":"the request has no op","details":{"reason":"missing_op"}}}"#,
+            ),
+            (
+                "{\"v\":1,\"op\":\"ping\",\"args\":3}\n",
+                r#"{"v":1,"ok":false,"error":{"code":"bad_request","message":"args must be an object","details":{"reason":"args_not_object"}}}"#,
+            ),
+            (
+                // 行没有正常结束（超长被截断，或对端提前断开）
+                "{\"v\":1,\"op\":\"ping\"}",
+                r#"{"v":1,"ok":false,"error":{"code":"bad_request","message":"the request line is too long or incomplete","details":{"reason":"incomplete_line"}}}"#,
+            ),
+        ];
+        for (line, expected) in cases {
+            assert_eq!(reply(line), expected, "{line}");
+        }
         assert_eq!(
-            reply("{\"v\":2,\"op\":\"ping\"}\n")["error"]["supported"],
-            serde_json::json!([1])
+            Rejection::InvalidState("stopping").reply(),
+            r#"{"v":1,"ok":false,"error":{"code":"invalid_state","message":"not allowed while the instance is stopping","details":{"state":"stopping"}}}"#
         );
-        assert_eq!(code("not json\n"), "bad_request");
-        assert_eq!(code("{\"v\":1}\n"), "bad_request");
         assert_eq!(
-            code("{\"v\":1,\"op\":\"ping\",\"args\":3}\n"),
-            "bad_request"
+            Rejection::ConditionNotMet { idle_ms: 1500 }.reply(),
+            r#"{"v":1,"ok":false,"error":{"code":"condition_not_met","message":"the instance has been idle for only 1500 ms","details":{"idle_ms":1500}}}"#
         );
-        // 行没有正常结束（超长被截断，或对端提前断开）
-        assert_eq!(code("{\"v\":1,\"op\":\"ping\"}"), "bad_request");
-        // 没有 v 的请求（例如 0.1.0 的 CLI 发来的）一样按 v1 拒绝
-        assert_eq!(code("{\"op\":\"ping\"}\n"), "bad_request");
+        // 每个码都在码表里，details 的键也都是码表里登记过的
+        for (line, _) in cases {
+            let value: serde_json::Value = serde_json::from_str(&reply(line)).unwrap();
+            let code = aproxy_ipc::code::lookup(value["error"]["code"].as_str().unwrap())
+                .expect("码表里应有这个码");
+            for key in value["error"]["details"].as_object().unwrap().keys() {
+                assert!(
+                    code.details.iter().any(|d| d.key == key),
+                    "{} 的 details 里有码表没登记的键 {key}",
+                    code.name
+                );
+            }
+        }
+    }
+
+    /// 成功应答的形状钉在这里：快照的字段名、顺序与类型。
+    #[test]
+    fn snapshot_shape_is_pinned() {
+        let (state, _rx) = control(sample_info("12345"));
+        state.stats.requests_total.store(120, Ordering::Relaxed);
+        state.stats.retries_total.store(7, Ordering::Relaxed);
+        let reply = serde_json::to_string(&WireResponse {
+            v: IPC_VERSION,
+            ok: true,
+            result: Some(status_snapshot(&state)),
+            error: None,
+        })
+        .unwrap();
+        assert_eq!(
+            reply,
+            concat!(
+                r#"{"v":1,"ok":true,"result":{"#,
+                r#""instance":{"pid":42,"start":"","instance_id":"19ac3f2e8b5d1a2b","version":"0.0.0-test","listen_addr":"127.0.0.1:12345","config_path":"C:/tmp/config.toml","base_url":"https://api.example.com","started_at":1700000000000,"log_path":null,"foreground":false},"#,
+                r#""state":"serving","#,
+                r#""behavior":{"delivery":"retry","disk_cache":true,"keepalive":{"trigger":"any","interval_secs":15},"retry_rules":1},"#,
+                r#""activity":{"last_request_at":1700000000000,"requests_total":120,"retries_total":7,"last_error":null},"#,
+                r#""ops":["ping","shutdown","prepare_swap"],"#,
+                r#""features":["shutdown.if_idle_secs","shutdown.keep_restore","prepare_swap.ttl_secs"]}}"#
+            )
+        );
+        // 客户端读回同一份
+        let status = parse_reply(&reply).unwrap();
+        assert_eq!(status.behavior, sample_behavior());
+        assert_eq!(status.state, InstanceState::Serving);
     }
 
     #[test]
     fn client_reads_v1_errors_and_unknown_states() {
+        let err = parse_reply(
+            r#"{"v":1,"ok":false,"error":{"code":"unsupported_arg","message":"x","details":{"args":["a"]},"later":1}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, IpcError::Remote { code, details, .. }
+                if code == "unsupported_arg" && details["args"][0] == "a"),
+            "{err}"
+        );
+        // 没有 details 的错误也读得出
         let err = parse_reply(r#"{"v":1,"ok":false,"error":{"code":"unknown_op","message":"x"}}"#)
             .unwrap_err();
         assert!(
-            matches!(&err, IpcError::Remote { code, .. } if code == "unknown_op"),
+            matches!(&err, IpcError::Remote { code, details, .. }
+                if code == "unknown_op" && details.is_null()),
             "{err}"
         );
         assert!(matches!(
             parse_reply(r#"{"v":2,"ok":true}"#),
             Err(IpcError::Protocol(_))
         ));
-        // 更新版本的实例：不认识的状态读作 Unknown，不认识的字段忽略
+        // 更新版本的实例：不认识的状态读作 Unknown，不认识的字段（顶层、快照里、instance 里、
+        // behavior 里）一律忽略，没见过的枚举值照样读得出
+        let mut instance = serde_json::to_value(sample_info("1")).unwrap();
+        instance["added_later"] = serde_json::json!({"x": 1});
         let newer = serde_json::json!({"v": 1, "ok": true, "extra": 1, "result": {
-            "instance": sample_info("1"), "run_dir": "r", "state": "draining",
+            "instance": instance, "state": "draining",
+            "behavior": {"delivery": "adaptive", "disk_cache": false,
+                         "keepalive": {"trigger": "path", "interval_secs": 0, "later": 1},
+                         "retry_rules": 0, "history": {"body_budget_mb": 64}},
+            "formats": [{"name": "adaptive"}],
             "activity": {"last_request_at": 1, "requests_total": 0, "retries_total": 0,
-                         "last_error": null},
-            "ops": ["ping"], "future_field": true}});
+                         "last_error": null, "in_flight": 2},
+            "ops": ["ping", "subscribe"], "features": ["subscribe.filter"],
+            "future_field": true}});
         let status = parse_reply(&newer.to_string()).unwrap();
         assert_eq!(status.state, InstanceState::Unknown);
+        assert_eq!(status.behavior.delivery, "adaptive");
+        assert_eq!(status.ops, ["ping", "subscribe"]);
+        // `starting` 是认得的状态
+        let mut starting = newer.clone();
+        starting["result"]["state"] = "starting".into();
+        assert_eq!(
+            parse_reply(&starting.to_string()).unwrap().state,
+            InstanceState::Starting
+        );
         // 没有 v 的应答（0.1.0 守护的形状）无法采信
         assert!(matches!(
             parse_reply(r#"{"ok":true,"info":{"pid":7},"proto":2}"#),
@@ -2108,7 +2497,8 @@ mod tests {
         let status = request_raw(&endpoint, IpcOp::Ping).await.unwrap();
         assert_eq!(status.instance.pid, std::process::id());
         assert_eq!(status.state, InstanceState::Serving);
-        assert_eq!(status.run_dir, "/test/run");
+        assert_eq!(status.behavior, sample_behavior());
+        assert_eq!(status.features.len(), 3);
         assert_eq!(status.ops, ["ping", "shutdown", "prepare_swap"]);
         assert_eq!(status.activity.requests_total, 7);
         assert_eq!(status.activity.retries_total, 2);
@@ -2117,23 +2507,110 @@ mod tests {
         // 还没收到过请求：最近活动取启动时刻，不是 0
         assert_eq!(status.activity.last_request_at, status.instance.started_at);
 
+        // 实例不认识的参数：整个请求被拒，什么都没做
+        let (client, conn) = tokio::io::duplex(4096);
+        let handler = tokio::spawn(handle_conn(conn, state.clone()));
+        let reply = exchange_over(client, r#"{"v":1,"op":"shutdown","args":{"drain_secs":5}}"#)
+            .await
+            .unwrap();
+        handler.await.unwrap().unwrap();
+        assert!(
+            matches!(parse_reply(&reply), Err(IpcError::Remote { code, .. }) if code == "unsupported_arg")
+        );
+        assert!(!*rx.borrow(), "被拒的 shutdown 不得触发停止");
+
+        // 带条件的 shutdown：实例刚收到过请求，不够闲 → 拒绝，照常服务
+        state
+            .stats
+            .last_activity_ms
+            .store(now_millis(), Ordering::Relaxed);
+        let err = request_raw(
+            &endpoint,
+            IpcOp::Shutdown {
+                keep_restore: false,
+                if_idle_secs: Some(3600),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, IpcError::Remote { code, details, .. }
+                if code == "condition_not_met" && details["idle_ms"].as_u64().is_some_and(|ms| ms < 60_000)),
+            "{err}"
+        );
+        assert!(!*rx.borrow(), "条件不成立时不得触发停止");
+        assert_eq!(
+            request_raw(&endpoint, IpcOp::Ping).await.unwrap().state,
+            InstanceState::Serving
+        );
+
         // prepare_swap：应答里立即是 swap_prepared（安装器的 ACK 判定），之后也是
-        let swap = request_raw(&endpoint, IpcOp::PrepareSwap).await.unwrap();
+        let swap = request_raw(&endpoint, IpcOp::PREPARE_SWAP).await.unwrap();
         assert_eq!(swap.state, InstanceState::SwapPrepared);
         let again = request_raw(&endpoint, IpcOp::Ping).await.unwrap();
         assert_eq!(again.state, InstanceState::SwapPrepared);
+        // 到期之后自己回到 serving：安装者中途没了，实例不会永远停在更换阶段
+        state
+            .stats
+            .swap_until_ms
+            .store(now_millis() - 1, Ordering::Relaxed);
+        assert_eq!(
+            request_raw(&endpoint, IpcOp::Ping).await.unwrap().state,
+            InstanceState::Serving
+        );
+        // 带时长的 prepare_swap 重新进入，按给的时长计
+        let before = now_millis();
+        let swap = request_raw(
+            &endpoint,
+            IpcOp::PrepareSwap {
+                ttl_secs: Some(120),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(swap.state, InstanceState::SwapPrepared);
+        let until = state.stats.swap_until_ms.load(Ordering::Relaxed);
+        assert!(
+            (before + 120_000..=now_millis() + 120_000).contains(&until),
+            "{until}"
+        );
 
-        // shutdown：应答先到（状态 stopping），随后置位停止信号
-        let stopping = request_raw(&endpoint, IpcOp::STOP).await.unwrap();
+        // 带条件的 shutdown：条件成立（闲置 0 秒总是成立）就停。应答先到（状态 stopping），
+        // 随后置位停止信号
+        let stopping = request_raw(
+            &endpoint,
+            IpcOp::Shutdown {
+                keep_restore: false,
+                if_idle_secs: Some(0),
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(stopping.state, InstanceState::Stopping);
         rx.changed().await.unwrap();
         assert!(*rx.borrow());
+        // 已经在退出：重复的 shutdown 结果相同，条件不再判断
+        state
+            .stats
+            .last_activity_ms
+            .store(now_millis(), Ordering::Relaxed);
+        let again = request_raw(
+            &endpoint,
+            IpcOp::Shutdown {
+                keep_restore: false,
+                if_idle_secs: Some(3600),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.state, InstanceState::Stopping);
         // 退出中不再进入更换阶段
-        let err = request_raw(&endpoint, IpcOp::PrepareSwap)
+        let err = request_raw(&endpoint, IpcOp::PREPARE_SWAP)
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, IpcError::Remote { code, .. } if code == "invalid_state"),
+            matches!(&err, IpcError::Remote { code, details, .. }
+                if code == "invalid_state" && details["state"] == "stopping"),
             "{err}"
         );
 

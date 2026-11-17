@@ -72,6 +72,7 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
         );
         match status.state {
             daemon::InstanceState::Serving => {}
+            daemon::InstanceState::Starting => println!("    正在启动（还没开始接收请求）"),
             // install 广播 prepare_swap 之后：滚动重启中该实例随时会被停止、
             // 用新 exe 重拉——外部不要在此窗口 stop/kill
             daemon::InstanceState::SwapPrepared => {

@@ -4090,7 +4090,7 @@ async fn forward_only_preserves_content_length_on_fixed_length_response() {
 // 22k. 仅转发模式：响应流式期间刷新活动时间戳
 //
 // 回归锚点（刚修的行为）：本模式下小时级长流是常态，若响应流路径不刷新
-// last_activity_secs，一个正在传输的实例会被 stop idle / status --idle 判为
+// last_activity_ms，一个正在传输的实例会被 stop idle / status --idle 判为
 // 闲置并强退——恰在传输中途被掐断，正砸在本模式的存在理由上。
 //
 // 构造成确定性的（不依赖真实时钟竞态）：门控上游在两次 chunk 之间挂起，客户端

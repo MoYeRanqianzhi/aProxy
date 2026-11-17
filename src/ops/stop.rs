@@ -83,29 +83,10 @@ pub async fn stop_with_intent(
     let port = daemon::port_of(&info.listen_addr).to_string();
     let run_dir = daemon::run_dir();
     match mode {
-        StopMode::Graceful => match graceful_shutdown(&run_dir, &port, intent).await {
-            Ok(_) => {
-                if daemon::wait_until_gone(&port, GRACEFUL_WAIT).await {
-                    Ok(Stopped::Graceful)
-                } else {
-                    Err(StopFailure::StillRunning)
-                }
-            }
-            // 发不出 shutdown：区分「其间已自行退出」与「进程还在、只是不应答」，
-            // 前者就是停止的结果，后者只能强制
-            Err(e) => match record_identity(info.pid, &info.start) {
-                RecordIdentity::Gone | RecordIdentity::Reused => {
-                    // 进程自己没了、没来得及兑现这次 stop：用户要它停下，记录由这里删
-                    if intent == Intent::Stop {
-                        crate::spec::remove_restore_in(&run_dir, &port);
-                    }
-                    Ok(Stopped::AlreadyGone)
-                }
-                RecordIdentity::Alive => Err(StopFailure::Unresponsive {
-                    error: e.to_string(),
-                }),
-            },
-        },
+        StopMode::Graceful => {
+            let sent = graceful_shutdown(&run_dir, &port, intent).await;
+            settle_graceful(info, &run_dir, &port, intent, sent).await
+        }
         // 强制终止之后进程不在、期望状态记录还在，正是「崩溃」的样子：看护者收到死亡事件
         // 即刻按记录重拉，aproxy restore 也会复活它。所以 stop 的强制终止要在终止**之前**
         // 删掉记录——看护者被死亡事件即时唤醒，终止之后再删必然与它赛跑。终止失败（身份
@@ -143,9 +124,89 @@ pub async fn stop_with_intent(
     }
 }
 
+/// 停止请求发出之后的收尾：送达了就等实例退出；发不出去就区分「其间已自行退出」与
+/// 「进程还在、只是不应答」，前者就是停止的结果，后者只能强制。
+async fn settle_graceful(
+    info: &InstanceRecord,
+    run_dir: &std::path::Path,
+    port: &str,
+    intent: Intent,
+    sent: Result<(), daemon::IpcError>,
+) -> Result<Stopped, StopFailure> {
+    match sent {
+        Ok(()) => {
+            if daemon::wait_until_gone(port, GRACEFUL_WAIT).await {
+                Ok(Stopped::Graceful)
+            } else {
+                Err(StopFailure::StillRunning)
+            }
+        }
+        Err(e) => match record_identity(info.pid, &info.start) {
+            RecordIdentity::Gone | RecordIdentity::Reused => {
+                // 进程自己没了、没来得及兑现这次 stop：用户要它停下，记录由这里删
+                if intent == Intent::Stop {
+                    crate::spec::remove_restore_in(run_dir, port);
+                }
+                Ok(Stopped::AlreadyGone)
+            }
+            RecordIdentity::Alive => Err(StopFailure::Unresponsive {
+                error: e.to_string(),
+            }),
+        },
+    }
+}
+
+/// `stop idle` 对一个实例的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleStop {
+    /// 停了
+    Stopped(Stopped),
+    /// 被选中之后它又收到了请求，已经不够闲：没有停它。`idle_secs` 是它实际闲置了多久
+    Busy { idle_secs: u64 },
+}
+
+/// 只在实例已经闲置至少 `idle_secs` 秒时优雅停止它（`aproxy stop idle` 的语义）。
+///
+/// 判断与停止交给实例一次完成（shutdown 的 `if_idle_secs`）：命令行先查闲置、再发停止的话，
+/// 两步之间到达的请求会被打断。不认这个参数的旧实例退回无条件的停止——调用方已经按它
+/// 刚才上报的闲置时长选中了它。
+pub async fn stop_if_idle(info: &InstanceRecord, idle_secs: u64) -> Result<IdleStop, StopFailure> {
+    let port = daemon::port_of(&info.listen_addr).to_string();
+    let run_dir = daemon::run_dir();
+    let conditional = daemon::ipc_ping_in(&run_dir, &port)
+        .await
+        .is_ok_and(|live| {
+            live.features
+                .iter()
+                .any(|f| f == daemon::FEATURE_SHUTDOWN_IF_IDLE_SECS)
+        });
+    if !conditional {
+        return stop_instance(info, StopMode::Graceful)
+            .await
+            .map(IdleStop::Stopped);
+    }
+    let op = daemon::IpcOp::Shutdown {
+        keep_restore: false,
+        if_idle_secs: Some(idle_secs),
+    };
+    let sent = match daemon::ipc_request_in(&run_dir, &port, op).await {
+        Err(daemon::IpcError::Remote { code, details, .. })
+            if code == daemon::error_code::CONDITION_NOT_MET =>
+        {
+            return Ok(IdleStop::Busy {
+                idle_secs: details["idle_ms"].as_u64().unwrap_or(0) / 1000,
+            });
+        }
+        other => other.map(|_| ()),
+    };
+    settle_graceful(info, &run_dir, &port, Intent::Stop, sent)
+        .await
+        .map(IdleStop::Stopped)
+}
+
 /// 发 shutdown。要留着期望状态记录（[`Intent::Restart`]）时先看实例认不认 `keep_restore`：
-/// 不认这个参数的旧实例会静默忽略它、照常删掉记录，所以对它们发不带参数的 shutdown，
-/// 等它退出后由这里把记录原样写回。
+/// 不认这个参数的实例发不带参数的 shutdown（它会删掉记录），等它退出后由这里把记录原样
+/// 写回。
 async fn graceful_shutdown(
     run_dir: &std::path::Path,
     port: &str,
@@ -162,13 +223,9 @@ async fn graceful_shutdown(
         .iter()
         .any(|f| f == daemon::FEATURE_SHUTDOWN_KEEP_RESTORE)
     {
-        return daemon::ipc_request_in(
-            run_dir,
-            port,
-            daemon::IpcOp::Shutdown { keep_restore: true },
-        )
-        .await
-        .map(|_| ());
+        return daemon::ipc_request_in(run_dir, port, daemon::IpcOp::STOP_KEEPING_RESTORE)
+            .await
+            .map(|_| ());
     }
     let saved = crate::spec::read_restore_in(run_dir, port).ok().flatten();
     daemon::ipc_request_in(run_dir, port, daemon::IpcOp::STOP).await?;

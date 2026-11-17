@@ -28,17 +28,32 @@ home 的实例。
 （`GetNamedPipeServerProcessId` / `SO_PEERCRED`）：端点名可预测，抢先占住它的进程只能
 报出自己的 pid，普查再拿这个 pid 与注册记录比对。
 
-线上格式（v1，一连接一来回，各一行 JSON）：请求 `{"v":1,"op":"ping|shutdown|prepare_swap"}`
-（可带 `args` 对象；shutdown 的 `args.keep_restore` 为真时实例退出但不删期望状态记录）；
-成功应答 `{"v":1,"ok":true,"result":InstanceStatus}`，所有 op 都回同一份
-状态快照——`instance`（即实例记录去掉 `schema`：`pid`、启动标记 `start`、`instance_id`、
-`version`、`listen_addr`、`config_path`（没有配置文件为 null）、打过码的 `base_url`、
-`started_at`、`log_path`（前台实例为 null）、`foreground`）、`run_dir`、`state`（`serving`/`swap_prepared`/
-`stopping`，不认识的值读作 `unknown`）、`activity`、`ops`、`features`（如
-`shutdown.keep_restore`：实例支持这个参数；调用方据它决定要不要在旧实例退出后自己把记录
-写回）；失败应答 `{"v":1,"ok":false,"error":{"code","message"}}`。`v` 只在语义不兼容时递增，
-加 op、加字段、加错误码、加状态值都不递增。没有 `v` 的请求按 `bad_request` 拒绝，没有 `v`
-的应答不予采信（0.1.0 的格式就是这样，0.2.0 起与它不再互通）。
+线上格式（v1，一连接一来回，各一行 JSON）：请求 `{"v":1,"op":"ping|shutdown|prepare_swap"}`，
+可带 `args` 对象：
+- `shutdown` 的 `keep_restore`（为真时实例退出但不删期望状态记录）与 `if_idle_secs`（实例已
+  闲置至少这么多秒才停，否则回 `condition_not_met`、什么都不做——判断与停止在实例里一次完成，
+  `stop idle` 靠它避免打断刚到的请求）；
+- `prepare_swap` 的 `ttl_secs`（更换阶段保持多久，默认 600 秒；到期自己回到 `serving`，安装者
+  中途没了实例也不会永远停在这个状态）。
+
+成功应答 `{"v":1,"ok":true,"result":InstanceStatus}`，所有 op 都回同一份状态快照：
+- `instance`：实例记录去掉 `schema`（`pid`、启动标记 `start`、`instance_id`、`version`、
+  `listen_addr`、`config_path`（没有配置文件为 null）、打过码的 `base_url`、`started_at`、
+  `log_path`（前台实例为 null）、`foreground`）；
+- `state`：`starting`/`serving`/`swap_prepared`/`stopping`，不认识的值读作 `unknown`；
+- `behavior`：行为摘要（默认投递方式 `delivery`、`disk_cache`、`keepalive` 的触发方式与间隔、
+  重试规则条数），枚举值按字符串传；
+- `activity`：最近请求时刻、请求数、重试数、最近错误（时刻都是 Unix 毫秒）；
+- `ops` 与 `features`：实例支持的 op，与它认得的 op 参数（名字是 `<op>.<参数>`，如
+  `shutdown.keep_restore`）。带一个参数之前先查 `features`——不认识的参数会让整个请求被拒。
+
+失败应答 `{"v":1,"ok":false,"error":{"code","message","details"}}`：`code` 是码表里的 IPC
+协议码（`bad_request`、`unsupported_version`、`unknown_op`、`unsupported_arg`、`invalid_state`、
+`condition_not_met`），`details` 是这个码带的数据（键与类型见 [error-codes.md](error-codes.md)），
+`message` 是英文、只给日志看。未知 op 与未知参数都没有副作用。`v` 只在语义不兼容时递增，
+加 op、加可选参数、加应答字段、加错误码、加状态值都不递增；应答只增字段，读者忽略不认识的。
+没有 `v` 的请求按 `bad_request` 拒绝，没有 `v` 的应答不予采信（0.1.0 的格式就是这样，0.2.0 起
+与它不再互通）。每个 op 的请求行、每种拒绝与快照的形状都由 `src/daemon.rs` 的单测逐字钉住。
 
 上图的「重试循环 / spool / 回放」是默认模式的主流程；`delivery = "forward"` 模式下这两
 环整体旁路（见「仅转发模式（delivery = "forward"）」）。

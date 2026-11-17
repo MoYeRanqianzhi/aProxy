@@ -53,7 +53,7 @@ The `code` of the error object an instance returns on its control endpoint.
 | Code | When | `details` |
 |---|---|---|
 | `internal` | A defect in aproxy itself. | — |
-| `bad_request` | Not JSON, missing v or op, line too long, or an argument of the wrong type or value. | `reason` (string) |
+| `bad_request` | Not JSON, missing v or op, line too long, or an argument of the wrong type or value. | `reason` (string), `arg`? (string) |
 | `unsupported_version` | The protocol version v is not supported. | `supported` (integer list) |
 | `unknown_op` | There is no such op. Nothing was done. | `op` (string) |
 | `unsupported_arg` | The request carries arguments this instance does not know. | `args` (string list) |

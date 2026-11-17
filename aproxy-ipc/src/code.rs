@@ -441,7 +441,7 @@ pub const TABLE: &[Code] = &[
         "bad_request",
         IPC,
         "Not JSON, missing v or op, line too long, or an argument of the wrong type or value.",
-        &[req("reason", T::String)],
+        &[req("reason", T::String), opt("arg", T::String)],
     ),
     plain(
         "unsupported_version",

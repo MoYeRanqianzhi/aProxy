@@ -694,14 +694,37 @@
     Linux 交叉 clippy 与 CI 的 ubuntu 任务验证，本机跑不了。
   - 文档已跟上（6148ae4）：技能、README、architecture、CHANGELOG 都按上面的行为改过，子代理写、我抽查过 CHANGELOG 与
     README 的改动，引用的程序输出对过源码。
+- B5 第五、第六部分（2026-11-17）：4dae49c spool 按进程分目录；5149a46 看护者记录与看护者日志。
+  - **spool**：`spool/<pid>-<启动标记短哈希>/`（`daemon::spool_dir_name`，哈希是启动标记 SHA-256 的前 4 字节）。
+    实例只在磁盘缓存开着时建目录（bind 之前），正常停止时收掉；别的进程留下的目录由 `collect_stale_spool_in` 清，
+    在两处跑：实例开始服务之后、看护者每个 tick。判据是「pid 的启动标记算出的名字与目录名不同」或「读不到标记且
+    确认 pid 上没有进程」；读不到标记又确认不了的保留。只删 `*.spooltmp`，目录空了才删目录。旧的按端口命名的目录不碰。
+  - **看护者记录** `run/watchdog.json`（`watchdog::WatchdogRecord`，形状由单测 `record_shape_is_pinned` 钉着）：
+    1. 在任 = 记录读得懂、属主进程还在（pid + 启动标记）、`last_scan_at` 新鲜。新鲜窗口按记录自己的 `heartbeat_secs`
+       算三个周期，**且不短于 90 秒**（`FRESH_FLOOR_SECS`，设计稿没写）：一个 tick 里可能要等重拉出来的实例就绪
+       （每个最多 30 秒），窗口更短的话忙着重拉的看护者会被当成假死、在重拉途中被结束。集成测试用
+       `APROXY_WATCHDOG_SCAN_SECS=1` 驱动看护者，没有这个下限窗口只有 3 秒。
+    2. 读不懂的记录（schema 更高、损坏、或另一个进程刚 `create_new` 还没写完）：不解读、不覆盖，按文件修改时间
+       判断新鲜；在任者遇到它就让位退出。过期的读不懂的记录在接管时只删、不杀任何进程（不知道属主是谁）。
+    3. 接管假死的前任：按记录里的 pid + 启动标记，用台账的 `ledger::terminate` 结束（不改台账那个冻结文件，
+       只是把记录里的身份填成它要的 `LedgerEntry`）。删旧记录之前再读一次，只删刚才判为无效的那一份。
+    4. `aproxy start` 与实例的自检不再替新看护者删无效记录：新看护者要靠它找到假死的前任。
+    5. 实例启动时退役旧看护者、install 换二进制之前停看护者：都走 `terminate_watchdogs_in(home, older_than)`，按台账
+       里 role 为 watchdog 的条目找。**不再认 0.1.0 的看护者**（它没有台账条目）：0.1.0 的实例与看护者要按 CHANGELOG
+       的迁移步骤先停掉；实例记录改名为 `.instance.json`（B6）之后，残留的 0.1.0 看护者也看不到新实例。
+    6. 重拉的起因 `kind`：被看护者按挂死结束的记 `hang`，其余记 `crash`；起因跟着退避队列的条目走。
+  - **看护者日志** `logs/watchdog.log`（`append_watchdog_log`，英文，时间戳前缀同 startup.log）：启动、接管前任、
+    结束挂死的实例、每次重拉的结果、转入慢速重试、摘除看护、退出。重拉失败的原因是 `RespawnError` 的文本，目前是
+    中文——等 W3 的错误码与双语文案落地后换成英文。上限跟 `logs.rotate_mb`，达到时清空重写。
+  - 验证：Windows headless 全量 675 通过、0 失败；两个变体 clippy 与 Linux 交叉 clippy 零输出。
   - **B5 还没做的**（接手时从这里继续，设计稿 §4、§5）：
     1. 实例记录仍是 `run/<端口>.pid`、旧形状（`process_start` 是数字）；要改成 `<端口>.instance.json`：带 `schema`、
-       `start`（台账的启动标记字符串）、`instance_id`、`foreground`，`log_path`、`config_path` 可为 null。IPC 快照的
-       `instance` 是它去掉 `schema`——与 B6（IPC v1 的快照形状）连在一起做。`state:"starting"` 也在这一步。
-    2. 看护者记录仍是 `run/watchdog.claim`；要改成 `watchdog.json`（`schema`、`restarts` 最近 20 次、`last_scan_at`），
-       处置写进 `logs/watchdog.log`。install 换二进制之前按台账找旧看护者（现在仍读 claim）也跟着这一步。
-    3. spool 仍按端口分目录（要按 `<pid>-<start 短哈希>`，实例开始服务之后清掉写者已不在的目录）。
-    4. `tests/contract_v0_2.rs`（钉住全部记录的形状）没建：等 1、2 的记录定形后一次写齐，现在 spec 与期望状态记录的
-       形状由 `spec.rs` 的单测钉着。
-    5. 广播之前的预检（`install_precheck_failed`）与「管不了的活实例」检查（`install_unmanaged_instances`）归 B9。
-    6. 启动要 9 秒的 format 不被判为就绪超时：时限已是 30 秒，没有专门的测试（format 在启动时握手属于 B10a）。
+       `start`（台账的启动标记字符串）、`instance_id`、`foreground`，`log_path`、`config_path` 可为 null；实例每 30 秒
+       核对一次，记录丢了就补写。IPC 快照的 `instance` 是它去掉 `schema`——与 B6（IPC v1 的快照形状）连在一起做。
+       `state:"starting"` 也在这一步。
+    2. `tests/contract_v0_2.rs`（钉住全部记录的形状）没建：等实例记录定形后一次写齐，现在 spec、期望状态记录、
+       看护者记录的形状各由所在模块的单测钉着。
+    3. 广播之前的预检（`install_precheck_failed`）与「管不了的活实例」检查（`install_unmanaged_instances`）归 B9。
+    4. 启动要 9 秒的 format 不被判为就绪超时：时限已是 30 秒，没有专门的测试（format 在启动时握手属于 B10a）。
+    5. status 与 doctor 还不展示看护者记录（在任与否、最近的重拉）与「日志清理因读不懂的记录而暂停」：等 B9 的
+       status 输出改版一起做。

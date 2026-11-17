@@ -86,17 +86,32 @@ version numbers; see the aproxy-format skill.
 
 ## Upgrading from 0.2.0-alpha.1 or 0.2.0-alpha.2
 
-Those alphas wrote the desired-state record as `<home>/run/<port>.restore` (no `.json` suffix). This
-version reads only `<port>.restore.json`, so it ignores the old file and leaves it in place. Running
-alpha instances keep running, appear in `aproxy status` and can be stopped normally, but:
+Those alphas keep their runtime records under other names and shapes: the instance record is
+`<home>/run/<port>.pid`, the desired-state record `<home>/run/<port>.restore`, the watchdog record
+`<home>/run/watchdog.claim`, and their status snapshot has no `start`, `instance_id` or
+`foreground`. This version reads only `<port>.instance.json`, `<port>.restore.json` and
+`watchdog.json`, and it cannot use an alpha instance's snapshot. So an instance started by one of
+those alphas is out of reach for this version's CLI:
 
-- `aproxy restart <port>` refuses them with `端口 <port> 未重启：这个实例没有可用来重新拉起它的记录…`
-  ("no record to start it from"); the old file is not used as a fallback.
-- If such an instance crashes, neither `aproxy restore` nor the watchdog can bring it back.
+- `aproxy status` does not list it, and `aproxy stop <port>` answers
+  `端口 <port> 上没有运行中的 aProxy 实例。` ("no running aProxy instance on port"), although the
+  process is still serving.
+- Neither `aproxy restore` nor the watchdog brings it back after a crash.
 
-Run one `aproxy stop <port>` followed by `aproxy start <alias|path>` (with any one-off flags it had)
-for every instance after the upgrade; `start` writes a current record. The old `<port>.restore`
-files are then stale and can be deleted.
+Stop the instances **before** replacing the binary:
+
+1. With the alpha CLI: `aproxy status`, note each instance's port, config and one-off flags, then
+   `aproxy stop all` and check that `aproxy status` lists nothing.
+2. Install this version, then `aproxy start <alias|path>` for each instance. `start` writes the
+   current records.
+3. Delete what the alpha left in `<home>/run/`: `*.pid`, `*.restore` and `watchdog.claim`. Nothing
+   reads them.
+
+If the binary was already replaced while alpha instances were running, the alpha CLI is gone and
+the new one cannot see them. `aproxy install --force` still can: it finds every aproxy process of
+this home through the process ledger, whose format never changes, and terminates them (requests in
+flight are cut off). It cannot restart them, because their desired-state records are in the old
+format; start each one again with `aproxy start`.
 
 ## Moving from 0.1.x to 0.2.0
 

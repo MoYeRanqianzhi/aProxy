@@ -33,7 +33,7 @@ directory, and `install --force` ends with 10.
 | `<home>/config.toml` | the default instance config |
 | `<home>/configs/` | the conventional place for further instance configs (`find` and `doctor` scan it) |
 | `<home>/settings.json` | aliases, the default config, the `defaults` global defaults, watchdog and install settings (settings-json.md) |
-| `<home>/run/` | instance registry `<port>.pid`, desired-state records `<port>.restore.json`, the watchdog record `watchdog.json`; while an instance starts, a short-lived `<nanoseconds>-<pid>.spec.json` launch-spec handoff file. `APROXY_HOME` is the only root; the run directory cannot be relocated separately |
+| `<home>/run/` | instance records `<port>.instance.json`, desired-state records `<port>.restore.json`, the watchdog record `watchdog.json`; while an instance starts, a short-lived `<nanoseconds>-<pid>.spec.json` launch-spec handoff file. `APROXY_HOME` is the only root; the run directory cannot be relocated separately |
 | `<home>/logs/` | instance logs (random file names), `startup.log`, and `watchdog.log` (what the watchdog did and why) |
 | `<home>/bin/` | the binary managed by `aproxy install`; on Windows also `aproxy.bat` (see install / upgrade). Files named `aproxy.old-…` and `aproxy.tmp-…` are left by binary swaps; installs delete the ones they can |
 | `<home>/install/` | `aproxy install`'s own files: the progress record `state.json` while an install runs, downloads and staged binaries in `staging/<version>/`, the install script's downloads in `bootstrap/`, force install's download in `force/`, on Linux and macOS the install announcement `announce`, and `lock`, held while `bin/` changes |
@@ -352,10 +352,10 @@ your connection to the model.
   to that binary's version.
 - The config path (or the absence of one), the override flags, the pinned port, the launch-time
   proxy environment and `PATH`, and the log path all come from the instance's desired-state record.
-  An instance without a record cannot be restarted this way: a `--foreground` instance, or one
-  started by 0.2.0-alpha.1/alpha.2 (their record has the old name), is refused with
+  An instance without a record cannot be restarted this way: a `--foreground` instance is refused
+  with
   `端口 <port> 未重启：这个实例没有可用来重新拉起它的记录（前台运行的实例要在它自己的终端里重启），旧实例保持运行。`
-  and keeps running. Stop it and start it again to give it a record.
+  and keeps running. Stop it in its terminal and start it in the background to give it a record.
 - `--force` terminates the old instance immediately but keeps the record, so the watchdog and
   `restore` can still bring the instance back if the new one fails. The watchdog may respawn it
   first; both use the same launch spec, and a new instance that finds the port already taken by the
@@ -374,7 +374,8 @@ instance for its log path, because log files get a new random name at every star
 - **It does not return while the instance runs.** In a non-interactive tool call, run it with a
   timeout (`timeout 5 aproxy logs 12345` in a POSIX shell, Git Bash included), take the path from
   its `日志文件: <path>` ("log file") line and read that file directly. The same path is the
-  `log_path` field of the JSON registry file `<home>/run/<port>.pid`.
+  `log_path` field of the instance record `<home>/run/<port>.instance.json` (one line of JSON; `null`
+  for a foreground instance).
 - Several instances and no target exit 1; `all` is refused (`aproxy logs 不支持 all…`).
 - A `--foreground` instance has no log file:
   `该实例以前台模式运行（--foreground），日志输出在它的控制台…` ("runs in foreground; its log is in

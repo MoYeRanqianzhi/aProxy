@@ -486,7 +486,7 @@ same request keep the same transformed key (a request is transformed once and
 the result is replayed on every retry). Add `"retry"` to the request format's
 `stages` to transform again before every retry.
 
-Runtime data lives in `~/.aproxy/`: `run/` (registry `<port>.pid`, desired-state
+Runtime data lives in `~/.aproxy/`: `run/` (instance records `<port>.instance.json`, desired-state
 records `<port>.restore.json`, the watchdog record `watchdog.json`, and a short-lived launch-spec
 handoff while an instance starts), `logs/` (daemon logs, randomly named per
 start, rotated and

@@ -4129,13 +4129,13 @@ async fn forward_only_refreshes_activity_while_response_streams() {
 
     // 拨回远古：此后到 chunk-B 到达之前，上游被门控挂住，不可能有任何刷新
     // （请求入口那次 store 早已发生，重试轮也不存在——本模式无重试）
-    probe.last_activity_secs.store(1, Ordering::Relaxed);
+    probe.last_activity_ms.store(1, Ordering::Relaxed);
 
     release.send(()).unwrap();
     let second = stream.next().await.unwrap().unwrap();
     assert_eq!(second.as_ref(), b"data: chunk-B\n\n");
 
-    let activity = probe.last_activity_secs.load(Ordering::Relaxed);
+    let activity = probe.last_activity_ms.load(Ordering::Relaxed);
     assert!(
         activity > 1,
         "转发 chunk 时必须刷新活动时间戳，否则长流实例会被 stop idle 误杀；实际仍为 {activity}"
@@ -4838,20 +4838,22 @@ fn hung_instance_is_reported_and_only_force_stops_it() {
     let dummy = Command::new("sleep").arg("120").spawn();
     let mut dummy = ChildGuard(dummy.expect("拉起哑进程失败"));
     let pid = dummy.0.id();
-    let start = aproxy::process::process_start_time(pid).expect("读不到哑进程创建时间");
+    let start = aproxy_ipc::ledger::start_marker(pid).expect("读不到哑进程的启动标记");
     let run_dir = home.path().join("run");
     let info = aproxy::daemon::InstanceRecord {
         pid,
-        process_start: start,
+        start,
+        instance_id: "19ac3f2e8b5d1a2b".into(),
         version: "0.0.0-test".into(),
         listen_addr: format!("127.0.0.1:{port}"),
-        config_path: home.path().join("c.toml").display().to_string(),
+        config_path: Some(home.path().join("c.toml").display().to_string()),
         base_url: "https://api.example.com".into(),
-        started_at: 1_700_000_000,
-        log_path: String::new(),
+        started_at: 1_700_000_000_000,
+        log_path: None,
+        foreground: false,
     };
     aproxy::daemon::write_instance_file_in(&run_dir, &info).unwrap();
-    let record = run_dir.join(format!("{port}.pid"));
+    let record = aproxy::daemon::instance_file_path_in(&run_dir, &port.to_string());
     let run = |args: &[&str]| home.cmd().args(args).output().unwrap();
     let port_s = port.to_string();
 
@@ -5172,20 +5174,17 @@ fn daemon_lifecycle_start_status_stop() {
         "守护子进程未就绪 (pid {pid})"
     );
 
-    // 身份判定：守护登记的进程创建时间必须与实测一致（看门狗收养/选举/
-    // 处决关卡与 stop --force 的全部前置；pid + 创建时间，与二进制名无关）。
-    // 无 /proc 的 unix 读不到创建时间，登记为 0，不在此断言
+    // 身份判定：守护登记的启动标记必须与现算的一致（看门狗收养/选举/
+    // 处决关卡与 stop --force 的全部前置；pid + 启动标记，与二进制名无关）
     #[cfg(any(windows, target_os = "linux"))]
     {
         let rec = aproxy::daemon::read_instance_file_in(&run_dir, &port.to_string())
             .expect("守护应已写注册表");
-        assert!(
-            matches!(
-                aproxy::process::record_identity(pid, rec.process_start),
-                aproxy::process::RecordIdentity::Alive(_)
-            ),
-            "守护 (pid {pid}) 应通过进程身份判定（登记创建时间 {}）",
-            rec.process_start
+        assert_eq!(
+            aproxy::process::record_identity(pid, &rec.start),
+            aproxy::process::RecordIdentity::Alive,
+            "守护 (pid {pid}) 应通过进程身份判定（登记的启动标记 {}）",
+            rec.start
         );
     }
 
@@ -5528,7 +5527,7 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     );
     // pid 从注册表读（.pid 与 .restore 同键——注册表键 = port_of(listen_addr)
     // 即纯端口号——且 .pid 先于 .restore 落盘）
-    let pid_path = run_dir.join(format!("{port}.pid"));
+    let pid_path = run_dir.join(format!("{port}.instance.json"));
     let pid: u32 = serde_json::from_str::<aproxy::daemon::InstanceRecord>(
         &std::fs::read_to_string(&pid_path).unwrap(),
     )
@@ -5628,8 +5627,10 @@ fn port_zero_restore_record_uses_actual_port() {
                 .find(|e| e.file_name().to_string_lossy().ends_with(".restore.json"));
             if let Some(record) = record {
                 let name = record.file_name().to_string_lossy().into_owned();
-                let pid_path =
-                    run_dir.join(format!("{}.pid", name.trim_end_matches(".restore.json")));
+                let pid_path = run_dir.join(format!(
+                    "{}.instance.json",
+                    name.trim_end_matches(".restore.json")
+                ));
                 info = Some((
                     serde_json::from_str::<aproxy::daemon::InstanceRecord>(
                         &std::fs::read_to_string(&pid_path).unwrap(),
@@ -6265,10 +6266,7 @@ fn identity_check_tolerates_swapped_binary() {
     let identity_alive = || {
         let rec = aproxy::daemon::read_instance_file_in(&home_dir.join("run"), &port.to_string())
             .expect("守护应已写注册表");
-        matches!(
-            aproxy::process::record_identity(pid, rec.process_start),
-            aproxy::process::RecordIdentity::Alive(_)
-        )
+        aproxy::process::record_identity(pid, &rec.start) == aproxy::process::RecordIdentity::Alive
     };
     assert!(identity_alive(), "替换前守护应通过身份判定");
 
@@ -6676,7 +6674,7 @@ fn credentials_masked_in_start_output_registry_and_daemon_log() {
 
     // 实例注册表：status / IPC 展示的源头，只存脱敏值
     let run_dir = home.path().join("run");
-    let registry = std::fs::read_to_string(run_dir.join(format!("{port}.pid"))).unwrap();
+    let registry = std::fs::read_to_string(run_dir.join(format!("{port}.instance.json"))).unwrap();
     assert!(
         !registry.contains("BASEPASS123") && registry.contains("***@127.0.0.1"),
         "注册表 base_url 必须是脱敏值: {registry}"
@@ -6703,7 +6701,8 @@ fn credentials_masked_in_start_output_registry_and_daemon_log() {
     );
     let mut log = String::new();
     for _ in 0..50 {
-        log = std::fs::read_to_string(&info.instance.log_path).unwrap_or_default();
+        log =
+            std::fs::read_to_string(info.instance.log_path.as_deref().unwrap()).unwrap_or_default();
         if log.contains("/v1/masked") {
             break;
         }

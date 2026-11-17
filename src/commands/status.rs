@@ -3,7 +3,7 @@
 use aproxy::daemon;
 use aproxy::ops::list::{ActivityFilter, enumerate};
 
-use crate::util::{humanize_duration, humanize_uptime};
+use crate::util::humanize_duration;
 
 /// `aproxy status [--idle|--busy]`：列出注册表中的实例（存活以 IPC 探测为准）。
 /// idle/busy 按实例的最近活动时间与 settings.idle_timeout_secs 判定。
@@ -49,20 +49,20 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
             daemon::port_of(&info.listen_addr),
             info.pid,
             info.version,
-            humanize_uptime(info.started_at),
+            humanize_duration(now.saturating_sub(info.started_at) / 1000),
             humanize_duration(idle_secs)
         );
         println!(
             "    监听 http://{}   上游 {}   配置 {}",
             info.listen_addr,
             aproxy_ipc::redact::url(&info.base_url),
-            info.config_path
+            config_label(&info.config_path)
         );
         let err_text = match &activity.last_error {
             Some(e) => format!(
                 "\"{}\"（{} 前）",
                 e.message,
-                humanize_duration(now.saturating_sub(e.at))
+                humanize_duration(now.saturating_sub(e.at) / 1000)
             ),
             None => "无".to_string(),
         };
@@ -111,7 +111,14 @@ fn print_unresponsive(unresponsive: &[daemon::InstanceRecord]) {
         let port = daemon::port_of(&info.listen_addr);
         println!(
             "  端口 {port}  pid {}  v{}  配置 {}\n    可用 aproxy stop {port} --force 结束（或 aproxy restart {port} --force 重启）",
-            info.pid, info.version, info.config_path
+            info.pid,
+            info.version,
+            config_label(&info.config_path)
         );
     }
+}
+
+/// 展示用的配置文件路径；没有配置文件的实例显示「（没有配置文件）」。
+fn config_label(config_path: &Option<String>) -> &str {
+    config_path.as_deref().unwrap_or("（没有配置文件）")
 }

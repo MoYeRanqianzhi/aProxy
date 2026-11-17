@@ -145,7 +145,9 @@ pub(crate) async fn handle_start_cmd(
         Some(path) => println!("  配置: {}", path.display()),
         None => println!("  配置: （没有配置文件，使用命令行参数与全局默认）"),
     }
-    println!("  日志: {}", info.instance.log_path);
+    if let Some(log_path) = &info.instance.log_path {
+        println!("  日志: {log_path}");
+    }
     println!("查看实例: aproxy status    停止: aproxy stop {actual_port}");
 }
 

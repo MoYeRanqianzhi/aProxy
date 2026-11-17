@@ -21,16 +21,19 @@ agent 软件 ──HTTP──▶ [代理端口 12345] ──重试循环──�
 Windows 的管道名全机共享，带上它，一个 home（`APROXY_HOME`）的命令就只能控制本
 home 的实例。
 
-启动顺序：bind TCP → 独占创建控制端点（失败即退出，写 startup.log）→ 写 `.pid` →
-写期望状态记录 `<端口>.restore.json`（前台实例不写）→ 心跳 → 服务。由此「有 `.pid`
-记录 ⇒ 端点在应答」（挂死除外）。客户端核对应答者自报的 pid 与连接对端进程
+启动顺序：bind TCP → 独占创建控制端点（失败即退出，写 startup.log）→ 写实例记录
+`<端口>.instance.json` → 写期望状态记录 `<端口>.restore.json`（前台实例不写）→ 开始应答控制
+端点 → 心跳 → 服务。由此「有实例记录 ⇒ 端点已建好」（挂死除外），拉起方看到端点应答时
+期望状态记录也已经落盘。客户端核对应答者自报的 pid 与连接对端进程
 （`GetNamedPipeServerProcessId` / `SO_PEERCRED`）：端点名可预测，抢先占住它的进程只能
 报出自己的 pid，普查再拿这个 pid 与注册记录比对。
 
 线上格式（v1，一连接一来回，各一行 JSON）：请求 `{"v":1,"op":"ping|shutdown|prepare_swap"}`
 （可带 `args` 对象；shutdown 的 `args.keep_restore` 为真时实例退出但不删期望状态记录）；
 成功应答 `{"v":1,"ok":true,"result":InstanceStatus}`，所有 op 都回同一份
-状态快照——`instance`（即 `.pid` 记录）、`run_dir`、`state`（`serving`/`swap_prepared`/
+状态快照——`instance`（即实例记录去掉 `schema`：`pid`、启动标记 `start`、`instance_id`、
+`version`、`listen_addr`、`config_path`（没有配置文件为 null）、打过码的 `base_url`、
+`started_at`、`log_path`（前台实例为 null）、`foreground`）、`run_dir`、`state`（`serving`/`swap_prepared`/
 `stopping`，不认识的值读作 `unknown`）、`activity`、`ops`、`features`（如
 `shutdown.keep_restore`：实例支持这个参数；调用方据它决定要不要在旧实例退出后自己把记录
 写回）；失败应答 `{"v":1,"ok":false,"error":{"code","message"}}`。`v` 只在语义不兼容时递增，
@@ -365,7 +368,7 @@ settings.json 的 `defaults` 段收的就是 config.toml 的键（同名同嵌�
   短暂命令行上仍有用户给的覆盖参数）。
 - 子进程承载服务：读交接文件里的规格 → 宽松解析定出日志路径并初始化日志 → 严格校验配置（失败写
   startup.log 并退出）→ 建本进程的 spool 目录 → bind → 写实例注册表
-  （`run/<端口>.pid`，含实例上报的 log_path）→ 写期望状态记录（`run/<端口>.restore.json`，内嵌
+  （`run/<端口>.instance.json`，含实例上报的 log_path；之后每 30 秒核对一次，丢了就补写）→ 写期望状态记录（`run/<端口>.restore.json`，内嵌
   规格）→ 启动 IPC 管道 → 创建看门狗心跳节 + 心跳 ticker（10s）→ 守护侧互保任务（5 分钟自检）
   → serve。前台实例（`--foreground`）走同一服务主循环，但不写期望状态记录、日志写控制台。
 - 停止：IPC `shutdown` → 优雅关闭（10s 宽限强退）→ 清注册表与期望状态记录。带
@@ -414,7 +417,7 @@ settings.json 的 `defaults` 段收的就是 config.toml 的键（同名同嵌�
   看护。重拉从记录里的拉起规格启动，首次崩溃立即重拉；重拉失败进退避队列，按指数退避
   1/2/4/8…封顶 300s 由主循环时间驱动重试（等待不阻塞 tick——否则长退避会让看护者记录停止更新、
   现任被竞争者按「假死」夺权），就绪判定按新 pid 定位；重拉后实例落在不同
-  端口（toml 改了端口）时退役旧端口的记录/`.pid` 并按实际端口续看护。
+  端口（toml 改了端口）时退役旧端口的期望状态记录与实例记录并按实际端口续看护。
   连续失败达 `watchdog.max_restarts` **不再放弃**：转入每 300s 一次的慢速重试，直到实例起来或
   记录被 `stop` 删掉，并在刚越过上限时往 startup.log 写一条英文说明；`max_restarts = 0` 才是
   「不自动重拉」（记录保留，交给 `aproxy restore`）。重拉出来的实例存活满 60 秒，之前的连续
@@ -492,7 +495,7 @@ CLI 覆盖、settings 注入、validate）干跑一遍，换监听地址时再�
   路径，客户端不拼路径；`--foreground` 实例 log_path 为空，logs 立即报
   「日志输出在它的控制台」
 - 清理（`daemon::collect_garbage_in`，实例开始服务之后一次、看护者每轮一次；读路径不删文件）：
-  - 实例记录 `<端口>.pid`：读得懂、且写者经「pid + 创建时间」核验已不在时才删；读不懂的不删
+  - 实例记录 `<端口>.instance.json`：读得懂、且写者经「pid + 启动标记」核验已不在时才删；读不懂的不删
   - 期望状态记录：不归清理管，只有 `stop` 能删
   - 交接文件 `*.spec.json` 与原子写的临时文件 `*.tmp-<pid>-<纳秒>`：写者已不在（或核验不到它
     仍在运行）且早于 10 分钟时删（交接文件含明文密钥，不能一直留在盘上）

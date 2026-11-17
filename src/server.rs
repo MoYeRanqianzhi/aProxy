@@ -14,7 +14,7 @@ use aproxy::daemon;
 use aproxy::settings;
 use aproxy::watchdog;
 
-use crate::util::{chrono_like_timestamp, now_unix};
+use crate::util::chrono_like_timestamp;
 
 /// 本进程守护日志的最终路径（resolve + init 后写入，serve_forever 读取）。
 /// `None` = 前台实例（日志走控制台，无文件，注册表 log_path 落空串）。
@@ -151,26 +151,24 @@ pub(crate) async fn serve_forever(
 
     // 注册实例记录（bind 成功后才写，避免留下死记录）。实时观测值不进记录，
     // 由 IPC ping 应答携带。log_path 是本实例守护日志的最终路径（随机命名或
-    // 用户自定义；前台实例无文件落空串）——客户端（aproxy logs/start 提示）
+    // 用户自定义；前台实例无文件，为 null）——客户端（aproxy logs/start 提示）
     // 一律经 IPC/注册表向实例索取，不按端口拼路径。
     let daemon_log_path = resolved_daemon_log();
-    let daemon_log_path_str = daemon_log_path
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
     let info = daemon::InstanceRecord {
         pid: std::process::id(),
+        // 身份锚点：实例现算现写的启动标记（看门狗收养/处决/选举与 stop --force 按
+        // 「pid + 本值」防 pid 复用，与二进制名无关）。算不出（没有定义标记的平台）落
+        // 空串，这样的记录无法核验身份
+        start: aproxy_ipc::ledger::start_marker(std::process::id()).unwrap_or_default(),
+        instance_id: daemon::new_instance_id(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         listen_addr: actual_addr.clone(),
-        config_path: cfg_display.clone(),
+        config_path: cfg_path.map(|_| cfg_display.clone()),
         // 注册表与 IPC ping 都会把它交给 status 展示（只用于展示），脱敏后再登记
         base_url: aproxy_ipc::redact::url(&base_url),
-        started_at: now_unix(),
-        log_path: daemon_log_path_str,
-        // 身份锚点：守护自查自写的进程创建时间（看门狗收养/处决/选举与
-        // stop --force 按「pid + 本值」防 pid 复用，与二进制名无关）。
-        // 读不到（无 /proc 的平台）落 0，这样的记录无法核验身份
-        process_start: aproxy::process::process_start_time(std::process::id()).unwrap_or(0),
+        started_at: daemon::now_millis(),
+        log_path: daemon_log_path.as_ref().map(|p| p.display().to_string()),
+        foreground: !daemon_child,
     };
     if let Err(e) = daemon::write_instance_file(&info) {
         tracing::warn!(error = %e, "实例注册表写入失败（不影响代理功能）");
@@ -214,6 +212,37 @@ pub(crate) async fn serve_forever(
         let control = control.clone();
         tokio::spawn(async move {
             daemon::serve_ipc(ipc_endpoint, control).await;
+        });
+    }
+
+    // 实例记录每 30 秒核对一次：被删掉、或内容已不是本进程的（有人清 run 目录、别的工具
+    // 误删），就补写。没有记录的实例 status 看不见、看护者不收养、restart 也找不到它，而它
+    // 明明还占着端口在服务。已经在退出的实例不补写：退出时会删记录，补写会留下一份死记录。
+    {
+        let control = control.clone();
+        let run_dir = daemon::run_dir();
+        tokio::spawn(async move {
+            let port = daemon::port_of(&control.record.listen_addr).to_string();
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                if *control.on_shutdown.borrow() {
+                    return;
+                }
+                let intact = daemon::read_instance_file_in(&run_dir, &port)
+                    .is_some_and(|on_disk| on_disk == control.record);
+                if intact {
+                    continue;
+                }
+                match daemon::write_instance_file_in(&run_dir, &control.record) {
+                    Ok(()) => tracing::warn!("实例记录不在或已被改动，已补写"),
+                    Err(e) => tracing::warn!(error = %e, "实例记录补写失败"),
+                }
+                // 补写期间开始退出的：退出路径可能已经删过记录，把刚写下的这一份收掉
+                if *control.on_shutdown.borrow() {
+                    let _ = std::fs::remove_file(daemon::instance_file_path_in(&run_dir, &port));
+                    return;
+                }
+            }
         });
     }
 

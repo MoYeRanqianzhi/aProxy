@@ -90,7 +90,11 @@ async fn spawn_from_spec_reports_an_early_exit_at_once_and_waits_for_a_healthy_i
         .expect("后台实例应写下期望状态记录");
     assert_eq!(entry.spec.pinned_port, Some(port));
     assert_eq!(entry.spec.overrides, spec.overrides);
-    assert_eq!(entry.spec.log_path, live.instance.log_path);
+    assert_eq!(
+        Some(&entry.spec.log_path),
+        live.instance.log_path.as_ref(),
+        "实例记录里的日志路径就是规格里的那个"
+    );
 
     // 密钥不在实例的命令行上（Linux 上直接读 /proc；别的平台由规格的传递方式保证）
     #[cfg(target_os = "linux")]

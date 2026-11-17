@@ -142,7 +142,7 @@ fn restart_after_port_change_reports_new_port() {
     let live = ipc_ping_in_dir(&rt, port_b, home_dir).expect("端口 B 实例应可 ping");
     assert_eq!(
         live.instance.config_path,
-        cfg_file.display().to_string(),
+        Some(cfg_file.display().to_string()),
         "重启后实例应指向同一配置文件"
     );
 }
@@ -303,7 +303,9 @@ fn has_restore(home: &Path, port: u16) -> bool {
 }
 
 fn has_registry(home: &Path, port: u16) -> bool {
-    home.join("run").join(format!("{port}.pid")).is_file()
+    home.join("run")
+        .join(format!("{port}.instance.json"))
+        .is_file()
 }
 
 /// run/ 下全部期望状态记录的端口（读不懂的记录也算，按文件名取端口）
@@ -559,9 +561,9 @@ fn release_asset_named_instance_is_adopted_respawned_and_force_stoppable() {
         image.display()
     );
     #[cfg(any(windows, target_os = "linux"))]
-    assert_ne!(
-        live.instance.process_start, 0,
-        "新实例应登记进程创建时间（身份锚点）"
+    assert!(
+        !live.instance.start.is_empty(),
+        "新实例应登记启动标记（身份锚点）"
     );
 
     // 等看护者确认重拉就绪、重新收编新 pid 之后再强杀：新实例的 IPC 在它
@@ -1510,5 +1512,49 @@ fn spool_is_per_process_and_survives_a_second_start_on_the_same_port() {
     assert!(
         wait_for(Duration::from_secs(10), || !own.exists()),
         "实例正常停止后应收掉自己的 spool 目录"
+    );
+}
+
+/// 实例记录被删掉之后（有人清了 run 目录），实例在下一次核对时把它补写回来，内容与原来
+/// 一致；没有记录的实例 status 看不见、看护者也不收养。
+#[test]
+fn instance_rewrites_its_record_after_it_is_deleted() {
+    let test_home = TestHome::new();
+    let home = test_home.path();
+    let exe = built_exe();
+    let rt = runtime();
+    let port = free_port();
+    let cfg = home.join("rewrite.toml");
+    write_cfg(&cfg, &format!("127.0.0.1:{port}"));
+    test_home.stop_on_drop(port);
+
+    let out = run_cli(
+        &test_home,
+        &exe,
+        &["start", "--config", cfg.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "start: {}", text(&out.stderr));
+    let run_dir = home.join("run");
+    let before = aproxy::daemon::read_instance_file_in(&run_dir, &port.to_string())
+        .expect("实例应已写下记录");
+    assert!(!before.foreground && !before.instance_id.is_empty());
+    assert_eq!(
+        ipc_ping_in_dir(&rt, port, home).unwrap().instance,
+        before,
+        "快照里的 instance 就是实例记录"
+    );
+
+    std::fs::remove_file(aproxy::daemon::instance_file_path_in(
+        &run_dir,
+        &port.to_string(),
+    ))
+    .unwrap();
+    assert!(
+        wait_for(Duration::from_secs(45), || has_registry(home, port)),
+        "实例应在下一次核对时补写记录"
+    );
+    assert_eq!(
+        aproxy::daemon::read_instance_file_in(&run_dir, &port.to_string()),
+        Some(before)
     );
 }

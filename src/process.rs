@@ -1,9 +1,11 @@
-//! 进程原语（平台层）：创建时间、存活与退出、镜像路径、按「pid + 创建时间」核验身份后终止，
-//! 以及看护者等待进程死亡用的同步句柄。看护者、实例管理（stop --force、restart）、安装器与
-//! 拉起逻辑共用。
+//! 进程原语（平台层）：创建时间、存活与退出、镜像路径、核验身份后终止，以及看护者等待进程
+//! 死亡用的同步句柄。看护者、实例管理（stop --force、restart）、安装器与拉起逻辑共用。
 //!
-//! 创建时间的单位随平台：Windows 为 FILETIME（100ns），unix 为 /proc/<pid>/stat 的 starttime
-//! （时钟滴答）。只用于相等比较，不跨平台换算。
+//! 身份有两种锚点，都只用于相等比较：
+//! - **启动标记**（字符串，见 [`aproxy_ipc::ledger::start_marker`]）：实例记录、看护者记录
+//!   与台账里登记的都是它，[`record_identity`] 与 [`terminate_marked_process`] 按它核验；
+//! - **创建时间**（数字；Windows 为 FILETIME，unix 为 /proc/<pid>/stat 的 starttime）：只给
+//!   「刚拉起、还没写下任何记录的子进程」与安装状态用。
 
 use std::path::PathBuf;
 
@@ -46,17 +48,16 @@ pub fn process_image_path(pid: u32) -> Option<PathBuf> {
 // 1. spawn 链：看护者亲手 spawn 并等到就绪的 pid 直接可信；
 // 2. IPC 端点归属：应答 `<端口>` 端点 ping、且自报 pid 与记录一致的进程，
 //    就是该端口的实例——但挂死实例不应答，所以它不能作为判据；
-// 3. 进程创建时间戳：守护注册时把自己的创建时间写进注册表（InstanceRecord.
-//    process_start），看护者 claim 同理（created_at_process）。pid 被复用后
-//    新进程的创建时间必然不同，比对它就能把「同一个进程」钉死，且不需要
-//    对方应答（挂死实例同样可判）。
+// 3. 启动标记：实例注册时把自己的启动标记写进实例记录（InstanceRecord.start），看护者
+//    记录同理。pid 被复用后新进程的标记必然不同，比对它就能把「同一个进程」钉死，且
+//    不需要对方应答（挂死实例同样可判）。
 
-/// 一条记录（pid + 登记的创建时间）在当前系统上的身份核验结果。
+/// 一条记录（pid + 登记的启动标记）在当前系统上的身份核验结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordIdentity {
-    /// 记录的进程仍在运行：实测创建时间与登记值一致（携带实测值）
-    Alive(u64),
-    /// 该 pid 当前有在运行的进程，但创建时间与登记值不符：pid 已被系统
+    /// 记录的进程仍在运行：现算的启动标记与登记值一致
+    Alive,
+    /// 该 pid 当前有在运行的进程，但启动标记与登记值不符：pid 已被系统
     /// 回收后复用，记录的进程早已死亡
     Reused,
     /// 该 pid 当前没有在运行的进程（不存在、已退出未回收的 zombie、或只剩
@@ -64,33 +65,71 @@ pub enum RecordIdentity {
     Gone,
 }
 
-/// 核验记录身份：`recorded_start` 为记录登记的进程创建时间。
+/// 核验记录身份：`recorded_start` 为记录登记的启动标记。
 /// 「已退出但进程对象仍在」（unix zombie、Windows 被句柄维持的已退出对象）
-/// 一律算 Gone——它们的创建时间仍查得到且与登记一致，但进程已死，不能计入
+/// 一律算 Gone——它们的标记仍算得出且与登记一致，但进程已死，不能计入
 /// 选举的存活集合，也不该被收养或处决。
 ///
-/// 登记值 0 不是可比对的锚点（平台读不到创建时间时守护登记的就是 0）：这样的
+/// 空的登记值不是可比对的锚点（平台算不出标记时登记的就是空串）：这样的
 /// 记录证明不了任何进程是它，同样算 Gone——不计入选举、不收养、不处决。
-pub fn record_identity(pid: u32, recorded_start: u64) -> RecordIdentity {
-    if recorded_start == 0 {
+pub fn record_identity(pid: u32, recorded_start: &str) -> RecordIdentity {
+    if recorded_start.is_empty() {
         return RecordIdentity::Gone;
     }
-    let Some(actual) = process_start_time(pid) else {
+    let Some(actual) = aproxy_ipc::ledger::start_marker(pid) else {
         return RecordIdentity::Gone;
     };
     if process_exited(pid) == Some(true) {
         return RecordIdentity::Gone;
     }
     if actual == recorded_start {
-        RecordIdentity::Alive(actual)
+        RecordIdentity::Alive
     } else {
         RecordIdentity::Reused
     }
 }
 
-/// 核验后终止：仅当 pid 当前对应进程的创建时间 == `expected_start` 时终止
-/// （SIGKILL / TerminateProcess，不做优雅关闭）。用于 `stop --force`、接管
-/// 假死前任看护者、install 换血停旧看护者——一切「按记录主动杀」的动作。
+/// 核验后终止：仅当 pid 当前对应进程的启动标记 == `expected_start` 时强制结束它，并等它
+/// 退出（最多 5 秒）。用于 `stop --force` 等「按记录主动杀」的动作。核验与结束走台账的
+/// [`aproxy_ipc::ledger::terminate`]（Windows 在同一个句柄上先核验后结束，Linux 经 pidfd），
+/// 属主不是本用户的进程不结束。
+///
+/// 空的 `expected_start` 不是可比对的锚点，直接拒绝。不符、已退出、结束失败均返回 Err
+/// （信息已含原因）——宁可漏杀不误杀。阻塞调用。
+pub fn terminate_marked_process(pid: u32, expected_start: &str) -> Result<(), String> {
+    use aproxy_ipc::ledger;
+    if expected_start.is_empty() {
+        return Err(format!(
+            "pid {pid} 没有登记启动标记，无法核验身份，拒绝终止以防误杀"
+        ));
+    }
+    let entry = ledger::LedgerEntry {
+        ledger: ledger::LEDGER_FORMAT,
+        pid,
+        start: expected_start.to_string(),
+        role: ledger::ROLE_INSTANCE.to_string(),
+        version: String::new(),
+        port: None,
+        label: None,
+        exe: None,
+        config: None,
+    };
+    match ledger::terminate(&entry, std::time::Duration::from_secs(5)) {
+        ledger::Termination::Terminated => Ok(()),
+        ledger::Termination::AlreadyGone => Err(format!(
+            "pid {pid} 已不是记录里的那个进程（已退出，或 pid 已被复用），未终止"
+        )),
+        ledger::Termination::NotOwned(owner) => {
+            Err(format!("pid {pid} 属于别的用户（{owner}），未终止"))
+        }
+        ledger::Termination::Failed(why) => Err(format!("终止 pid {pid} 失败（{why}）")),
+    }
+}
+
+/// 核验后终止（按数字创建时间）：仅当 pid 当前对应进程的创建时间 == `expected_start` 时
+/// 终止（SIGKILL / TerminateProcess，不做优雅关闭）。只给「本进程刚拉起、还没写下任何记录
+/// 的子进程」用——它的身份锚点是拉起时读到的创建时间；按记录终止走
+/// [`terminate_marked_process`]。
 ///
 /// - Windows：在**同一个进程句柄**上先 GetProcessTimes 核验、后
 ///   TerminateProcess。句柄打开后即钉住该进程对象（其 pid 在句柄关闭前不会
@@ -464,24 +503,42 @@ pub(crate) mod tests {
     fn record_identity_classifies_alive_reused_legacy_gone() {
         let mut child = spawn_unrelated_child();
         let pid = child.id();
-        let start = process_start_time(pid).expect("子进程创建时间可查");
-        assert_eq!(record_identity(pid, start), RecordIdentity::Alive(start));
+        let start = aproxy_ipc::ledger::start_marker(pid).expect("子进程的启动标记可查");
+        assert_eq!(record_identity(pid, &start), RecordIdentity::Alive);
         // 登记值不符 = pid 已被复用给别的进程
         assert_eq!(
-            record_identity(pid, start.wrapping_add(1)),
+            record_identity(pid, &format!("{start}0")),
             RecordIdentity::Reused
         );
-        // 旧版本记录（未登记创建时间）：在世但无从核验
-        // 登记值 0 证明不了身份：即便 pid 在世也不算 Alive
-        assert_eq!(record_identity(pid, 0), RecordIdentity::Gone);
+        // 空的登记值证明不了身份：即便 pid 在世也不算 Alive
+        assert_eq!(record_identity(pid, ""), RecordIdentity::Gone);
         // 已退出但未回收（unix zombie / Windows 被 Child 句柄维持的对象）：
-        // 创建时间仍查得到且一致，但必须判 Gone——死进程不得计入存活集合
+        // 标记仍算得出且一致，但必须判 Gone——死进程不得计入存活集合
         child.kill().unwrap();
         std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(record_identity(pid, start), RecordIdentity::Gone);
+        assert_eq!(record_identity(pid, &start), RecordIdentity::Gone);
         child.wait().unwrap();
         // 不存在的 pid
-        assert_eq!(record_identity(u32::MAX - 7, 1), RecordIdentity::Gone);
+        assert_eq!(record_identity(u32::MAX - 7, "w:1"), RecordIdentity::Gone);
+    }
+
+    #[test]
+    fn terminate_marked_refuses_mismatch_and_kills_match() {
+        let mut child = spawn_unrelated_child();
+        let pid = child.id();
+        let start = aproxy_ipc::ledger::start_marker(pid).expect("子进程的启动标记可查");
+        // 标记不符（pid 被复用的形态）与没有登记标记：都拒绝，子进程必须仍在
+        assert!(terminate_marked_process(pid, &format!("{start}0")).is_err());
+        let err = terminate_marked_process(pid, "").unwrap_err();
+        assert!(err.contains("核验"), "{err}");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "拒绝后子进程必须仍在运行"
+        );
+        // 标记一致：结束，并且已经等到它退出
+        terminate_marked_process(pid, &start).expect("身份一致应终止成功");
+        assert!(wait_child_exit(&mut child), "终止后子进程应退出");
     }
 
     #[test]

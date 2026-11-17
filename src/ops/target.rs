@@ -82,11 +82,11 @@ pub async fn select(
     // idle 保留字：全部空闲超阈值的实例（阈值可临时覆盖 settings 配置）
     if target.is_some_and(|t| t.eq_ignore_ascii_case("idle")) {
         let idle_secs = threshold.unwrap_or(settings::load().idle_timeout_secs);
-        let now = super::now_unix();
+        let now = daemon::now_millis();
         let instances: Vec<_> = daemon::list_instances()
             .await
             .into_iter()
-            .filter(|s| now.saturating_sub(s.activity.last_request_at) >= idle_secs)
+            .filter(|s| now.saturating_sub(s.activity.last_request_at) / 1000 >= idle_secs)
             .map(|s| s.instance)
             .collect();
         let empty = instances
@@ -112,7 +112,12 @@ pub async fn select(
         };
         let key = config_path_key(&cfg_path.display().to_string());
         let survey = daemon::survey_instances().await;
-        let matches = |i: &&InstanceRecord| config_path_key(&i.config_path) == key;
+        // 没有配置文件的实例（config_path 为 null）不会被任何配置路径选中
+        let matches = |i: &&InstanceRecord| {
+            i.config_path
+                .as_deref()
+                .is_some_and(|path| config_path_key(path) == key)
+        };
         if let Some(info) = survey.responsive.iter().map(|s| &s.instance).find(matches) {
             return Ok(Selection::of(vec![info.clone()]));
         }
@@ -189,9 +194,7 @@ impl Selection {
 /// 控制通道的实例（多半挂死）只能这样定位。
 fn unresponsive_record(port: &str) -> Option<InstanceRecord> {
     let info = daemon::read_instance_file_in(&daemon::run_dir(), port)?;
-    matches!(
-        crate::process::record_identity(info.pid, info.process_start),
-        crate::process::RecordIdentity::Alive(_)
-    )
-    .then_some(info)
+    (crate::process::record_identity(info.pid, &info.start)
+        == crate::process::RecordIdentity::Alive)
+        .then_some(info)
 }

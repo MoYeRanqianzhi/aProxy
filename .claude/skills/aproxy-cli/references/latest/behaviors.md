@@ -366,8 +366,8 @@ response: attempt judged successful -> response format -> replay
 
 ## Instances, ports and the control channel
 
-- One config file runs as one instance, and the port is the instance's identity: the registry record
-  `<home>/run/<port>.pid`, the desired-state record `<home>/run/<port>.restore.json`, the control
+- One config file runs as one instance, and the port is the instance's identity: the instance record
+  `<home>/run/<port>.instance.json`, the desired-state record `<home>/run/<port>.restore.json`, the control
   endpoint and the watchdog heartbeat are all keyed by port. Log files and the spool directory are
   the exceptions (see Logs and Disk cache). Give each config.toml its own port.
 - A background instance is started from a **launch spec**, passed through a short-lived handoff file
@@ -448,8 +448,8 @@ minutes after its last instance stops.
   disables). `aproxy logs` keeps following across truncation.
 - Cleanup happens in the background, never in a read-only command. An instance runs one cleanup
   right after it starts serving, and the watchdog does one on every scan. It removes an instance
-  record `<port>.pid` only when the record is readable and the process that wrote it is verifiably
-  gone (pid plus creation time); it removes leftover launch-spec and atomic-write temp files only
+  record `<port>.instance.json` only when the record is readable and the process that wrote it is
+  verifiably gone (pid plus start marker); it removes leftover launch-spec and atomic-write temp files only
   when their writer is no longer running (or cannot be found) and they are older than 10 minutes;
   and it removes an instance log only
   when the name has the built-in random shape (`<hex>-<4 hex>.log`), the file is older than
@@ -490,7 +490,8 @@ minutes after its last instance stops.
   newer aproxy) is reported and left in place by every reader — `status`, `restore`, the watchdog and
   `stop all` — but `aproxy stop <port>` deletes the file named `<port>.restore.json` without reading
   it, so a direct stop still clears an unreadable record. Records written by
-  0.2.0-alpha.1/alpha.2 under the old name `<port>.restore` are not read at all.
+  0.2.0-alpha.1/alpha.2 under the old name `<port>.restore` are not read at all (compatibility.md,
+  "Upgrading from 0.2.0-alpha.1 or 0.2.0-alpha.2").
 - `aproxy restore` starts every recorded instance that is not running. It skips instances that
   answer, waits up to 30 s for each start, and reports the actual port. If the config file named by
   a record is missing, it keeps the record and says so, so a file that comes back later (a network

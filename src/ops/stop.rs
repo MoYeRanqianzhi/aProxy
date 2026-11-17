@@ -93,7 +93,7 @@ pub async fn stop_with_intent(
             }
             // 发不出 shutdown：区分「其间已自行退出」与「进程还在、只是不应答」，
             // 前者就是停止的结果，后者只能强制
-            Err(e) => match record_identity(info.pid, info.process_start) {
+            Err(e) => match record_identity(info.pid, &info.start) {
                 RecordIdentity::Gone | RecordIdentity::Reused => {
                     // 进程自己没了、没来得及兑现这次 stop：用户要它停下，记录由这里删
                     if intent == Intent::Stop {
@@ -101,7 +101,7 @@ pub async fn stop_with_intent(
                     }
                     Ok(Stopped::AlreadyGone)
                 }
-                RecordIdentity::Alive(_) => Err(StopFailure::Unresponsive {
+                RecordIdentity::Alive => Err(StopFailure::Unresponsive {
                     error: e.to_string(),
                 }),
             },
@@ -186,12 +186,8 @@ async fn port_has_instance(run_dir: &std::path::Path, port: &str) -> bool {
     if daemon::ipc_ping_in(run_dir, port).await.is_ok() {
         return true;
     }
-    daemon::read_instance_file_in(run_dir, port).is_some_and(|info| {
-        matches!(
-            record_identity(info.pid, info.process_start),
-            RecordIdentity::Alive(_)
-        )
-    })
+    daemon::read_instance_file_in(run_dir, port)
+        .is_some_and(|info| record_identity(info.pid, &info.start) == RecordIdentity::Alive)
 }
 
 /// stop 一个已经不在运行的端口：它若还留着期望状态记录（崩溃之后、看护者还没拉回来，

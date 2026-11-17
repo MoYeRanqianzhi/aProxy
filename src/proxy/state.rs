@@ -10,7 +10,7 @@ pub struct AppState {
     /// 最近一次收到客户端请求的时刻（Unix 秒）。AtomicU64 供 IPC ping 读取
     /// 展示/判闲置，请求热路径上仅一次 store（Relaxed 足够：只用于粗粒度的
     /// 空闲判定，无需跨线程因果序）。
-    pub last_activity_secs: Arc<std::sync::atomic::AtomicU64>,
+    pub last_activity_ms: Arc<std::sync::atomic::AtomicU64>,
     /// IPC 实时观测源（请求数/重试数/最近错误）：热路径各一条 Relaxed 原子
     /// 操作，量级同上；serve_forever 组装进 IpcStats 供 IPC 响应读取。
     pub stats: Arc<crate::daemon::IpcStats>,
@@ -70,11 +70,8 @@ impl AppState {
     /// 仅转发模式每转发一块时各刷新一次。一条 Relaxed store：只用于粗粒度的空闲判定，
     /// 不需要跨线程的因果序
     pub(super) fn touch_activity(&self) {
-        self.last_activity_secs.store(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+        self.last_activity_ms.store(
+            crate::daemon::now_millis(),
             std::sync::atomic::Ordering::Relaxed,
         );
     }
@@ -126,11 +123,8 @@ impl AppState {
         // 活动时间戳），而 serve_forever 只把活动时间戳共享进 IPC 那份，
         // 于是「请求 / 重试 / 最近错误」三项对任何实例都恒显示 0（活动时间戳正常
         // 反而掩盖了该缺陷，直到 2026-09-14 端到端实测才发现）。
-        let last_activity_secs = Arc::new(std::sync::atomic::AtomicU64::new(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+        let last_activity_ms = Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::daemon::now_millis(),
         ));
         // 重试规则的 path 模式：启动时编译一次（模式已在配置校验时确认合法，
         // 此处 expect 不会失败——与上方 proxy URL 的信任同一来源）
@@ -178,10 +172,10 @@ impl AppState {
             config: Arc::new(config),
             client,
             stats: Arc::new(crate::daemon::IpcStats {
-                last_activity_secs: last_activity_secs.clone(),
+                last_activity_ms: last_activity_ms.clone(),
                 ..Default::default()
             }),
-            last_activity_secs,
+            last_activity_ms,
             retry_rules,
             request_pool,
             response_pool,
@@ -228,13 +222,9 @@ impl AppState {
 
     /// 实例闲置时长（秒）：距最近一次收到客户端请求。
     pub fn idle_secs(&self) -> u64 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        now.saturating_sub(
-            self.last_activity_secs
+        crate::daemon::now_millis().saturating_sub(
+            self.last_activity_ms
                 .load(std::sync::atomic::Ordering::Relaxed),
-        )
+        ) / 1000
     }
 }

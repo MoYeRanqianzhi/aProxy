@@ -46,10 +46,6 @@ pub(crate) fn chrono_like_timestamp() -> String {
     format!("unix+{}s", now_unix())
 }
 
-pub(crate) fn humanize_uptime(started_at: u64) -> String {
-    humanize_duration(now_unix().saturating_sub(started_at))
-}
-
 /// 时长人性化（秒 → 中文）：uptime 与闲置时长共用
 pub(crate) fn humanize_duration(secs: u64) -> String {
     if secs < 60 {

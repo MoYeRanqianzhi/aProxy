@@ -27,14 +27,15 @@ pub struct Listing {
     pub unresponsive: Vec<InstanceRecord>,
     /// 判定闲置用的阈值（秒），取自 settings 的 `idle_timeout_secs`
     pub idle_threshold_secs: u64,
-    /// 列举时刻（Unix 秒）。闲置时长、运行时长都按它算，同一次列举里口径一致
+    /// 列举时刻（Unix 毫秒，与快照里的时刻同单位）。闲置时长、运行时长都按它算，同一次
+    /// 列举里口径一致
     pub now: u64,
 }
 
 impl Listing {
     /// 这个实例已经闲置了多少秒（按列举时刻算）
     pub fn idle_secs(&self, status: &InstanceStatus) -> u64 {
-        self.now.saturating_sub(status.activity.last_request_at)
+        self.now.saturating_sub(status.activity.last_request_at) / 1000
     }
 }
 
@@ -42,13 +43,14 @@ impl Listing {
 pub async fn enumerate(filter: ActivityFilter) -> Listing {
     let idle_threshold_secs = settings::load().idle_timeout_secs;
     let survey = daemon::survey_instances().await;
-    let now = super::now_unix();
+    let now = daemon::now_millis();
     let responsive_total = survey.responsive.len();
     let instances = survey
         .responsive
         .into_iter()
         .filter(|status| {
-            let idle = now.saturating_sub(status.activity.last_request_at) >= idle_threshold_secs;
+            let idle =
+                now.saturating_sub(status.activity.last_request_at) / 1000 >= idle_threshold_secs;
             match filter {
                 ActivityFilter::All => true,
                 ActivityFilter::Idle => idle,

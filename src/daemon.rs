@@ -14,11 +14,19 @@
 //! - 管道 ping 通 → 该端口已有 aProxy 实例在运行；
 //! - 管道不通但 TCP bind 失败 → 端口被其他程序占用。
 //!
-//! 实例注册表：`~/.aproxy/run/<port>.pid`（JSON），仅供 `status`/`stop` 枚举
+//! 实例注册表：`~/.aproxy/run/<port>.instance.json`（JSON），仅供 `status`/`stop` 枚举
 //! 实例；存活一律以 IPC ping 为准，不信任注册文件与 pid 本身。
 
 use serde::{Deserialize, Serialize};
 use std::{io, path::PathBuf, sync::Arc, time::Duration};
+
+/// 现在的时刻（Unix 毫秒）。记录、快照与事件里的时刻都用这个单位。
+pub fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// 运行期记录的目录：`<home>/run/`。home 是唯一的根，寻址只有 `APROXY_HOME` 这一个变量。
 pub fn run_dir() -> PathBuf {
@@ -140,34 +148,67 @@ pub fn port_of(listen_addr: &str) -> &str {
     listen_addr.rsplit(':').next().unwrap_or("unknown")
 }
 
-/// 实例的注册记录：`run/<端口>.pid` 的内容，也是 IPC 状态快照里的 `instance`。
+/// 实例记录的 schema。读到更高的 schema 时不解读内容，那份记录算读不懂。
+pub const INSTANCE_SCHEMA: u32 = 1;
+
+/// 实例记录：`run/<端口>.instance.json` 的内容去掉开头的 `schema`，也是 IPC 状态快照里的
+/// `instance`。实例在 bind 之后写下它，正常退出时删掉。
 ///
-/// 字段全部必填。原地升级时新旧两个版本同时在跑，会读对方写下的记录：改名、
-/// 删字段或新增必填字段，另一个版本就读不懂这份记录了，所以新字段只能是可缺省的。
+/// 原地升级时新旧两个版本同时在跑，会读对方写下的记录：已有字段不改名、不删、不改类型，
+/// 以后新增的字段只能是可缺省的。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct InstanceRecord {
     pub pid: u32,
-    /// 守护进程自身的创建时间戳：守护注册时自查自写（Windows 为
-    /// GetProcessTimes 的 FILETIME，100ns；Linux 为 /proc/<pid>/stat 的
-    /// starttime，时钟滴答），只在同平台内与实测值比对，是不透明的身份锚点。
+    /// 实例进程的启动标记（台账用的同一个，见 [`aproxy_ipc::ledger::start_marker`]），实例
+    /// 注册时现算现写，只与现算的值比对，是不透明的身份锚点。
     ///
-    /// 进程身份 = 「这个 pid 现在是不是写下这条记录的那个守护」，与二进制
-    /// 叫什么无关：pid 被系统回收再分配给任何进程后，新进程的创建时间必然
-    /// 不同。看门狗的收养/处决/选举与 `stop --force` 都以「pid + 本字段」
-    /// 比对防 pid 复用误杀（见 process::record_identity）。0 = 平台读不到
-    /// 创建时间（无 /proc 的 unix），这样的记录无法核验身份，一律不据它动手。
-    pub process_start: u64,
+    /// 进程身份 = 「这个 pid 现在是不是写下这条记录的那个实例」，与二进制叫什么无关：pid
+    /// 被系统回收再分配给任何进程后，新进程的标记必然不同。看门狗的收养/处决/选举与
+    /// `stop --force` 都以「pid + 本字段」比对防 pid 复用误杀（见 process::record_identity）。
+    /// 空串 = 平台算不出标记，这样的记录无法核验身份，一律不据它动手。
+    pub start: String,
+    /// 这一次运行的标识：同一个端口上先后启动的实例各不相同。界面与请求记录据此认出
+    /// 「实例重启过」
+    pub instance_id: String,
     pub version: String,
     pub listen_addr: String,
-    pub config_path: String,
+    /// 配置文件的绝对路径；没有配置文件、只靠覆盖参数与 settings `defaults` 启动的实例为 null
+    pub config_path: Option<String>,
     /// 脱敏后的上游地址，只用于展示
     pub base_url: String,
-    /// 启动时刻（Unix 秒）
+    /// 启动时刻（Unix 毫秒）
     pub started_at: u64,
-    /// 本实例守护日志文件的绝对路径（随机命名或用户自定义 log_file）。
-    /// 客户端（aproxy logs / start 成功提示）一律向实例或注册表索取，不按端口
-    /// 拼路径——端口是易变标识。空串 = 前台实例（日志走控制台，无文件）。
-    pub log_path: String,
+    /// 本实例日志文件的绝对路径（随机命名或用户自定义 log_file）。客户端（aproxy logs /
+    /// start 成功提示）一律向实例或注册表索取，不按端口拼路径——端口是易变标识。
+    /// 前台实例的日志走控制台，为 null
+    pub log_path: Option<String>,
+    /// 前台实例：占着启动它的终端，没有日志文件，也没有期望状态记录
+    pub foreground: bool,
+}
+
+/// 实例记录在盘上的形状：`schema` 在前，其余就是 [`InstanceRecord`]。
+#[derive(Serialize, Deserialize)]
+struct InstanceFile {
+    schema: u32,
+    #[serde(flatten)]
+    record: InstanceRecord,
+}
+
+/// 解析一份实例记录的文本。读不懂（不是这个形状，或 schema 比本版本高）→ None。
+pub fn parse_instance_file(text: &str) -> Option<InstanceRecord> {
+    serde_json::from_str::<InstanceFile>(text)
+        .ok()
+        .filter(|file| file.schema <= INSTANCE_SCHEMA)
+        .map(|file| file.record)
+}
+
+/// 新的一次运行的标识：启动时刻的纳秒数（十六进制）接 pid 的低 16 位，与随机日志名同源。
+pub fn new_instance_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos:x}{:04x}", std::process::id() & 0xffff)
 }
 
 /// IPC 状态快照：v1 每个成功应答的 `result`，所有 op 都回它。
@@ -208,7 +249,7 @@ pub enum InstanceState {
 /// 实例的实时观测值（应答时现读）。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Activity {
-    /// 最近一次收到客户端请求的时刻（Unix 秒）；还没收到过请求时为启动时刻
+    /// 最近一次收到客户端请求的时刻（Unix 毫秒）；还没收到过请求时为启动时刻
     pub last_request_at: u64,
     /// 累计收到的客户端请求数
     pub requests_total: u64,
@@ -222,7 +263,7 @@ pub struct Activity {
 pub struct LastError {
     /// 已脱敏的简短摘要
     pub message: String,
-    /// 发生时刻（Unix 秒）
+    /// 发生时刻（Unix 毫秒）
     pub at: u64,
 }
 
@@ -464,7 +505,7 @@ fn parse_reply(line: &str) -> Result<InstanceStatus, IpcError> {
 }
 
 /// 本实例已独占创建、尚未开始接受连接的控制端点。守护先创建它、再写注册表
-/// 与恢复记录（见 server::serve_forever）：有 `.pid` 记录就意味着端点在应答
+/// 与恢复记录（见 server::serve_forever）：有实例记录就意味着端点在应答
 /// （挂死除外）。创建失败时守护直接启动失败，不带着一个谁也控制不了的实例
 /// 继续跑。
 pub struct IpcEndpoint(imp::Listener);
@@ -539,14 +580,14 @@ async fn serve_endpoint(endpoint: String, state: Arc<ControlState>) -> io::Resul
 /// 全部 Relaxed——计数器只用于展示与告警，无跨线程因果序需求。
 #[derive(Debug, Default)]
 pub struct IpcStats {
-    /// 最近一次收到客户端请求的时刻（即 AppState::last_activity_secs，
+    /// 最近一次收到客户端请求的时刻（Unix 毫秒；即 AppState::last_activity_ms，
     /// 同一 Arc 由 serve_forever 组装进来）
-    pub last_activity_secs: Arc<std::sync::atomic::AtomicU64>,
+    pub last_activity_ms: Arc<std::sync::atomic::AtomicU64>,
     /// 累计收到客户端请求数
     pub requests_total: std::sync::atomic::AtomicU64,
     /// 累计上游重试次数（首轮之后的所有尝试）
     pub retries_total: std::sync::atomic::AtomicU64,
-    /// 最近一次上游失败的简短摘要（打码后的短串；None = 从未失败）
+    /// 最近一次上游失败的简短摘要与发生时刻（打码后的短串、Unix 毫秒；None = 从未失败）
     pub last_error: std::sync::Mutex<Option<(String, u64)>>,
     /// 二进制更换阶段（PrepareSwap 广播后置位，重启自然清除）
     pub swap_phase: std::sync::atomic::AtomicBool,
@@ -555,10 +596,7 @@ pub struct IpcStats {
 impl IpcStats {
     /// 记录一次上游失败（覆盖式：只保留最近一次）。`error` 须已打码。
     pub fn record_error(&self, error: &str) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = now_millis();
         // 截断到 200 字符：错误摘要进 IPC 响应与 status 展示，防止上游返回
         // 超长错误文本把响应行撑爆
         let mut brief: String = error.chars().take(200).collect();
@@ -571,9 +609,9 @@ impl IpcStats {
     }
 }
 
-/// 注册表中登记的全部实例记录（只读 *.pid 文件，不做 IPC 探活），按 pid
+/// 注册表中登记的全部实例记录（只读 `*.instance.json`，不做 IPC 探活；读不懂的跳过），按 pid
 /// 升序。看门狗选举的输入：存活与身份由调用方用进程级手段（pid + 记录里
-/// 的 process_start 比对实测创建时间）判定——实例 IPC 不可达恰恰是需要
+/// 的启动标记比对现算的标记）判定——实例 IPC 不可达恰恰是需要
 /// 看护的信号，不能作为「死」的依据参与选举。
 pub fn registry_instances_in(run_dir: &std::path::Path) -> Vec<InstanceRecord> {
     let mut out = Vec::new();
@@ -581,12 +619,15 @@ pub fn registry_instances_in(run_dir: &std::path::Path) -> Vec<InstanceRecord> {
         return out;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("pid") {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(INSTANCE_FILE_SUFFIX)
+        {
             continue;
         }
-        if let Ok(content) = std::fs::read_to_string(&path)
-            && let Ok(info) = serde_json::from_str::<InstanceRecord>(&content)
+        if let Ok(content) = std::fs::read_to_string(entry.path())
+            && let Some(info) = parse_instance_file(&content)
         {
             out.push(info);
         }
@@ -605,10 +646,10 @@ pub fn registry_pids_in(run_dir: &std::path::Path) -> Vec<u32> {
     out
 }
 
-/// 读取单个端口的注册表记录（只读，不探活；不存在/损坏 → None）。
+/// 读取单个端口的注册表记录（只读，不探活；不存在/读不懂 → None）。
 pub fn read_instance_file_in(run_dir: &std::path::Path, port: &str) -> Option<InstanceRecord> {
     let content = std::fs::read_to_string(instance_file_path_in(run_dir, port)).ok()?;
-    serde_json::from_str(&content).ok()
+    parse_instance_file(&content)
 }
 
 /// 强制终止实例进程（`--force`）：跳过 IPC 优雅关闭直接终止。`info` 必须
@@ -622,7 +663,7 @@ pub fn read_instance_file_in(run_dir: &std::path::Path, port: &str) -> Option<In
 ///
 /// 返回 Err 的信息已含原因，调用方直接展示。
 pub fn force_terminate(info: &InstanceRecord) -> Result<(), String> {
-    crate::process::terminate_verified_process(info.pid, info.process_start)
+    crate::process::terminate_marked_process(info.pid, &info.start)
 }
 
 /// 向 startup.log 追加一行（带 unix 时间戳前缀）。看门狗的 crashloop 放弃、
@@ -865,17 +906,20 @@ fn windows_env_block(changes: &[(String, Option<String>)]) -> Vec<u16> {
 }
 
 // ---------------------------------------------------------------------------
-// 实例注册表（~/.aproxy/run/<port>.pid）
+// 实例注册表（~/.aproxy/run/<port>.instance.json）
 // ---------------------------------------------------------------------------
 
-/// 注册表文件路径：`<run_dir>/<port>.pid`
+/// 实例记录的文件名后缀：文件是 `<端口>.instance.json`。
+pub const INSTANCE_FILE_SUFFIX: &str = ".instance.json";
+
+/// 注册表文件路径：`<run_dir>/<port>.instance.json`
 pub fn instance_file_path(listen_addr: &str) -> PathBuf {
     instance_file_path_in(&run_dir(), listen_addr)
 }
 
 /// 同上，目录可指定（测试注入用）
 pub fn instance_file_path_in(run_dir: &std::path::Path, listen_addr: &str) -> PathBuf {
-    run_dir.join(format!("{}.pid", port_of(listen_addr)))
+    run_dir.join(format!("{}{INSTANCE_FILE_SUFFIX}", port_of(listen_addr)))
 }
 
 /// 写入实例注册（bind 成功后调用，避免留下死记录）
@@ -885,12 +929,16 @@ pub fn write_instance_file(info: &InstanceRecord) -> io::Result<()> {
 
 /// 同上，目录可指定（测试注入用）
 ///
-/// 原子写（crate::fsx::write_atomic）：直接写目标文件时，并发的读者可能读到写到一半的
-/// JSON，把这个实例当成不存在。
+/// 一行 JSON，`schema` 在前。原子写、只有本用户可读（crate::fsx::write_atomic_private）：
+/// 直接写目标文件时，并发的读者可能读到写到一半的 JSON，把这个实例当成不存在。
 pub fn write_instance_file_in(run_dir: &std::path::Path, info: &InstanceRecord) -> io::Result<()> {
     let path = instance_file_path_in(run_dir, &info.listen_addr);
-    let json = serde_json::to_string_pretty(info).expect("序列化实例信息失败");
-    crate::fsx::write_atomic(&path, json.as_bytes())
+    let file = InstanceFile {
+        schema: INSTANCE_SCHEMA,
+        record: info.clone(),
+    };
+    let json = serde_json::to_string(&file).expect("序列化实例信息失败");
+    crate::fsx::write_atomic_private(&path, (json + "\n").as_bytes())
 }
 
 /// 删除实例注册（服务退出时调用）
@@ -937,7 +985,7 @@ pub struct GcReport {
 }
 
 /// 一轮清理。规则：
-/// - **实例记录** `<端口>.pid`：读得懂、并且写下它的进程经「pid + 创建时间」核验已经不在，
+/// - **实例记录** `<端口>.instance.json`：读得懂、并且写下它的进程经「pid + 启动标记」核验已经不在，
 ///   才删。读不懂的（损坏，或更新的版本写的）绝不删。
 /// - **期望状态记录**：不归清理管，只有 stop 能删。
 /// - **心跳文件** `<端口>.heart`（unix）：这个端口没有活着的实例、且文件早于
@@ -964,26 +1012,24 @@ pub fn collect_garbage_in(run_dir: &std::path::Path, logs_dir: &std::path::Path)
     for entry in std::fs::read_dir(run_dir).into_iter().flatten().flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".pid") {
+        if name.ends_with(INSTANCE_FILE_SUFFIX) {
             let record = std::fs::read_to_string(&path)
                 .ok()
-                .and_then(|text| serde_json::from_str::<InstanceRecord>(&text).ok());
+                .and_then(|text| parse_instance_file(&text));
             match record {
                 None => unreadable = true,
                 Some(info) => {
-                    // 没登记创建时间（0，平台读不到）的记录核验不了身份：只在这个 pid 上
+                    // 没登记启动标记（空串，平台算不出）的记录核验不了身份：只在这个 pid 上
                     // 确实没有进程时才当它的写者已经不在，否则宁可留着
-                    let alive = if info.process_start == 0 {
+                    let alive = if info.start.is_empty() {
                         crate::process::process_exited(info.pid) != Some(true)
                     } else {
-                        matches!(
-                            crate::process::record_identity(info.pid, info.process_start),
-                            crate::process::RecordIdentity::Alive(_)
-                        )
+                        crate::process::record_identity(info.pid, &info.start)
+                            == crate::process::RecordIdentity::Alive
                     };
                     if alive {
                         live_ports.push(port_of(&info.listen_addr).to_string());
-                        referenced_logs.push(info.log_path);
+                        referenced_logs.extend(info.log_path);
                     } else if std::fs::remove_file(&path).is_ok() {
                         report.removed.push(path);
                     }
@@ -1090,20 +1136,23 @@ pub async fn survey_instances_in(dir: &std::path::Path) -> InstanceSurvey {
         };
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("pid") {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(INSTANCE_FILE_SUFFIX)
+        {
             continue;
         }
-        let info = std::fs::read_to_string(&path)
+        let info = std::fs::read_to_string(entry.path())
             .ok()
-            .and_then(|c| serde_json::from_str::<InstanceRecord>(&c).ok());
+            .and_then(|c| parse_instance_file(&c));
         // 读不懂的记录（损坏，或更新的版本写的）定位不了端口，跳过
         let Some(info) = info else {
             continue;
         };
         let port = port_of(&info.listen_addr).to_string();
         match ipc_ping_in(dir, &port).await {
-            // ping 应答携带实例的实时状态（含最近活动时刻）——注册表 .pid
+            // ping 应答携带实例的实时状态（含最近活动时刻）——实例记录
             // 是启动时刻的快照，闲置判定/展示必须用实时值
             Ok(live) if live.instance.pid == info.pid => out.push(live),
             // 应答的不是记录里的进程。新实例先建端点、后写记录，记录可能正被
@@ -1113,16 +1162,15 @@ pub async fn survey_instances_in(dir: &std::path::Path) -> InstanceSurvey {
             Ok(live) => {
                 if read_instance_file_in(dir, &port).is_some_and(|f| f.pid == live.instance.pid) {
                     out.push(live);
-                } else if matches!(
-                    crate::process::record_identity(info.pid, info.process_start),
-                    crate::process::RecordIdentity::Alive(_)
-                ) {
+                } else if crate::process::record_identity(info.pid, &info.start)
+                    == crate::process::RecordIdentity::Alive
+                {
                     unresponsive.push(info);
                 }
             }
             Err(_) => {
-                if let crate::process::RecordIdentity::Alive(_) =
-                    crate::process::record_identity(info.pid, info.process_start)
+                if crate::process::record_identity(info.pid, &info.start)
+                    == crate::process::RecordIdentity::Alive
                 {
                     unresponsive.push(info);
                 }
@@ -1150,25 +1198,28 @@ pub fn registry_contains_pid_in(dir: &std::path::Path, pid: u32) -> bool {
 pub fn registry_find_pid_in(dir: &std::path::Path, pid: u32) -> Option<InstanceRecord> {
     let entries = std::fs::read_dir(dir).ok()?;
     entries.flatten().find_map(|entry| {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("pid") {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(INSTANCE_FILE_SUFFIX)
+        {
             return None;
         }
-        std::fs::read_to_string(&path)
+        std::fs::read_to_string(entry.path())
             .ok()
-            .and_then(|c| serde_json::from_str::<InstanceRecord>(&c).ok())
+            .and_then(|c| parse_instance_file(&c))
             .filter(|info| info.pid == pid)
     })
 }
 
 /// 按一份期望状态记录拉起的实例落在了另一个端口（配置里的端口改了）时，退役旧端口的
-/// 残留记录：删除旧端口的期望状态记录与 `<旧端口>.pid`。这是期望状态记录「只有 stop 能删」
+/// 残留记录：删除旧端口的期望状态记录与实例记录。这是期望状态记录「只有 stop 能删」
 /// 之外唯一的例外：新端口的记录接替了它。
 ///
 /// 为什么必须删：新实例已按实际端口写了自己的记录；旧端口的期望状态记录若残留，用户
 /// `stop <新端口>` 后看护者（或下一次 `aproxy restore`）会凭它把实例再拉起来，stop 被撤销
 /// 且可无限重复（watchdog-01 实测）。
-/// 旧端口的 .pid 是已死旧进程的记录，留着只会让看护者的闲置自灭永远等不到
+/// 旧端口的实例记录是已死旧进程的记录，留着只会让看护者的闲置自灭永远等不到
 /// 「注册表空」。
 ///
 /// 保护：旧端口若已被另一个仍在运行的实例接手（其注册表记录核验为同一
@@ -1182,10 +1233,8 @@ pub fn retire_moved_port_records_in(
         return false;
     }
     if let Some(rec) = read_instance_file_in(run_dir, old_port)
-        && matches!(
-            crate::process::record_identity(rec.pid, rec.process_start),
-            crate::process::RecordIdentity::Alive(_)
-        )
+        && crate::process::record_identity(rec.pid, &rec.start)
+            == crate::process::RecordIdentity::Alive
     {
         return false;
     }
@@ -1404,7 +1453,7 @@ fn status_snapshot(state: &ControlState) -> InstanceStatus {
         state: phase,
         activity: Activity {
             last_request_at: stats
-                .last_activity_secs
+                .last_activity_ms
                 .load(Relaxed)
                 .max(state.record.started_at),
             requests_total: stats.requests_total.load(Relaxed),
@@ -1659,13 +1708,15 @@ mod tests {
     fn sample_info(port: &str) -> InstanceRecord {
         InstanceRecord {
             pid: 42,
-            process_start: 0,
+            start: String::new(),
+            instance_id: "19ac3f2e8b5d1a2b".into(),
             version: "0.0.0-test".into(),
             listen_addr: format!("127.0.0.1:{port}"),
-            config_path: "C:/tmp/config.toml".into(),
+            config_path: Some("C:/tmp/config.toml".into()),
             base_url: "https://api.example.com".into(),
-            started_at: 1_700_000_000,
-            log_path: String::new(),
+            started_at: 1_700_000_000_000,
+            log_path: None,
+            foreground: false,
         }
     }
 
@@ -1720,24 +1771,27 @@ mod tests {
     async fn force_terminate_checks_identity_not_name() {
         let mut child = spawn_unrelated_child();
         let pid = child.id();
-        let start = crate::process::process_start_time(pid).expect("子进程创建时间可查");
+        let start = aproxy_ipc::ledger::start_marker(pid).expect("子进程的启动标记可查");
         let mut info = sample_info(&format!("597{:02}", std::process::id() % 50));
         info.pid = pid;
 
-        info.process_start = start.wrapping_add(1);
+        info.start = format!("{start}0");
         let err = force_terminate(&info).unwrap_err();
-        assert!(err.contains("不符"), "pid 复用应以身份不符拒绝: {err}");
+        assert!(
+            err.contains("已不是记录里的那个进程"),
+            "pid 复用应以身份不符拒绝: {err}"
+        );
 
-        info.process_start = 0;
+        info.start = String::new();
         let err = force_terminate(&info).unwrap_err();
-        assert!(err.contains("核验"), "未登记创建时间应拒绝: {err}");
+        assert!(err.contains("核验"), "未登记启动标记应拒绝: {err}");
         std::thread::sleep(Duration::from_millis(200));
         assert!(
             child.try_wait().unwrap().is_none(),
             "拒绝后子进程必须仍在运行"
         );
 
-        info.process_start = start;
+        info.start = start;
         force_terminate(&info).expect("身份一致应终止成功");
         assert!(wait_child_exit(&mut child), "终止后子进程应退出");
     }
@@ -1756,16 +1810,16 @@ mod tests {
     }
 
     /// 重拉/恢复落到新端口后退役旧端口记录：同端口不动；旧端口记录属于已死
-    /// 进程 → 期望状态记录与 .pid 一并删除；旧端口已被另一个在世实例接手（身份
+    /// 进程 → 期望状态记录与实例记录一并删除；旧端口已被另一个在世实例接手（身份
     /// 核验通过，或旧版本记录 pid 在世无从核验）→ 记录归它，不动
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn retire_moved_port_records_only_touches_dead_owner() {
         let dir = tempfile::tempdir().unwrap();
-        let write = |port: &str, pid: u32, process_start: u64| {
+        let write = |port: &str, pid: u32, start: &str| {
             let mut info = sample_info(port);
             info.pid = pid;
-            info.process_start = process_start;
+            info.start = start.to_string();
             write_instance_file_in(dir.path(), &info).unwrap();
             crate::spec::write_restore_in(dir.path(), port, &sample_spec("")).unwrap();
         };
@@ -1776,7 +1830,7 @@ mod tests {
             )
         };
 
-        write("59741", u32::MAX - 777, 123);
+        write("59741", u32::MAX - 777, "w:123");
         assert!(!retire_moved_port_records_in(dir.path(), "59741", "59741"));
         assert_eq!(has("59741"), (true, true), "同端口不得退役");
         assert!(retire_moved_port_records_in(dir.path(), "59741", "59742"));
@@ -1788,16 +1842,16 @@ mod tests {
 
         let mut child = spawn_unrelated_child();
         let pid = child.id();
-        let start = crate::process::process_start_time(pid).expect("子进程创建时间可查");
-        write("59743", pid, start);
+        let start = aproxy_ipc::ledger::start_marker(pid).expect("子进程的启动标记可查");
+        write("59743", pid, &start);
         assert!(!retire_moved_port_records_in(dir.path(), "59743", "59744"));
         assert_eq!(has("59743"), (true, true), "在世实例接手的端口不得退役");
-        // 未登记创建时间：证明不了是哪个进程，按无主记录退役
-        write("59745", pid, 0);
+        // 未登记启动标记：证明不了是哪个进程，按无主记录退役
+        write("59745", pid, "");
         assert!(retire_moved_port_records_in(dir.path(), "59745", "59746"));
         assert_eq!(has("59745"), (false, false));
-        // 登记时间不符 = pid 已复用，记录的进程已死 → 退役
-        write("59747", pid, start.wrapping_add(1));
+        // 登记的标记不符 = pid 已复用，记录的进程已死 → 退役
+        write("59747", pid, &format!("{start}0"));
         assert!(retire_moved_port_records_in(dir.path(), "59747", "59748"));
         assert_eq!(has("59747"), (false, false));
 
@@ -1814,7 +1868,7 @@ mod tests {
 
         assert!(registry_contains_pid_in(dir.path(), 4242));
         assert!(!registry_contains_pid_in(dir.path(), 4243));
-        // 非 .pid 后缀的文件不参与检索
+        // 不是实例记录后缀的文件不参与检索
         std::fs::write(dir.path().join("59901.restore"), "args").unwrap();
         assert!(registry_contains_pid_in(dir.path(), 4242));
     }
@@ -1823,7 +1877,7 @@ mod tests {
     fn registry_contains_pid_skips_corrupt_and_missing_dir() {
         let dir = tempfile::tempdir().unwrap();
         // 损坏记录（不可解析）跳过，不 panic 不误报
-        std::fs::write(dir.path().join("59902.pid"), "not-json").unwrap();
+        std::fs::write(dir.path().join("59902.instance.json"), "not-json").unwrap();
         assert!(!registry_contains_pid_in(dir.path(), 1));
         // 目录不存在 → false（respawn 轮询的前置态）
         assert!(!registry_contains_pid_in(
@@ -1970,15 +2024,67 @@ mod tests {
         ));
     }
 
+    /// 实例记录的形状是跨版本读的：文件名、字段名、顺序与类型钉在这里。快照里的 `instance`
+    /// 是同一个对象去掉 `schema`。
+    #[test]
+    fn instance_record_shape_is_pinned() {
+        let record = InstanceRecord {
+            pid: 4321,
+            start: "w:133712345678901234".into(),
+            instance_id: "19ac3f2e8b5d1a2b".into(),
+            version: "0.2.0".into(),
+            listen_addr: "127.0.0.1:12345".into(),
+            config_path: Some("/home/u/.aproxy/config.toml".into()),
+            base_url: "https://api.example.com".into(),
+            started_at: 1_760_190_000_123,
+            log_path: Some("/home/u/.aproxy/logs/19ac3f2e8b5d-1a2b.log".into()),
+            foreground: false,
+        };
+        let in_snapshot = r#"{"pid":4321,"start":"w:133712345678901234","instance_id":"19ac3f2e8b5d1a2b","version":"0.2.0","listen_addr":"127.0.0.1:12345","config_path":"/home/u/.aproxy/config.toml","base_url":"https://api.example.com","started_at":1760190000123,"log_path":"/home/u/.aproxy/logs/19ac3f2e8b5d-1a2b.log","foreground":false}"#;
+        assert_eq!(serde_json::to_string(&record).unwrap(), in_snapshot);
+
+        let dir = tempfile::tempdir().unwrap();
+        write_instance_file_in(dir.path(), &record).unwrap();
+        let on_disk = std::fs::read_to_string(dir.path().join("12345.instance.json")).unwrap();
+        assert_eq!(
+            on_disk,
+            format!(
+                "{{\"schema\":1,{}
+",
+                &in_snapshot[1..]
+            ),
+            "盘上的形状是 schema 在前、其余与快照里的 instance 相同"
+        );
+        assert_eq!(parse_instance_file(&on_disk), Some(record));
+
+        // 前台实例、没有配置文件：两个路径都是 null
+        let foreground = parse_instance_file(
+            r#"{"schema":1,"pid":1,"start":"","instance_id":"a","version":"0.2.0","listen_addr":"127.0.0.1:1","config_path":null,"base_url":"https://x","started_at":1,"log_path":null,"foreground":true,"later":1}"#,
+        )
+        .expect("以后追加的字段读得过去");
+        assert!(foreground.foreground);
+        assert_eq!((foreground.config_path, foreground.log_path), (None, None));
+        // schema 更高的记录不解读；旧版本的形状读不懂
+        assert_eq!(
+            parse_instance_file(&on_disk.replace("\"schema\":1", "\"schema\":2")),
+            None
+        );
+        assert_eq!(
+            parse_instance_file(
+                r#"{"pid":7,"process_start":1,"version":"0.1.0","listen_addr":"127.0.0.1:1","config_path":"c","base_url":"b","started_at":1,"log_path":""}"#
+            ),
+            None
+        );
+    }
+
     #[test]
     fn instance_file_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let info = sample_info("45678");
         write_instance_file_in(dir.path(), &info).unwrap();
         let path = instance_file_path_in(dir.path(), "127.0.0.1:45678");
-        assert_eq!(path.file_name().unwrap(), "45678.pid");
-        let loaded: InstanceRecord =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(path.file_name().unwrap(), "45678.instance.json");
+        let loaded = parse_instance_file(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded.pid, 42);
         assert_eq!(loaded.listen_addr, "127.0.0.1:45678");
     }
@@ -2166,7 +2272,7 @@ mod tests {
 
         let mut stale = live.clone();
         stale.pid = u32::MAX - 778;
-        stale.process_start = 123;
+        stale.start = "w:123".into();
         write_instance_file_in(dir.path(), &stale).unwrap();
         let survey = survey_instances_in(dir.path()).await;
         assert!(survey.responsive.is_empty(), "{:?}", survey.responsive);
@@ -2188,7 +2294,7 @@ mod tests {
         let dead = sample_info("59801");
         write_instance_file_in(dir.path(), &dead).unwrap();
         let path = instance_file_path_in(dir.path(), "127.0.0.1:59801");
-        let garbled = dir.path().join("59809.pid");
+        let garbled = dir.path().join("59809.instance.json");
         std::fs::write(&garbled, "{not json").unwrap();
         let listed = list_instances_in(dir.path()).await;
         assert!(listed.is_empty(), "{listed:?}");
@@ -2201,10 +2307,10 @@ mod tests {
         // pid 与创建时间都核验得上，但 59802 上没有 IPC 端点
         let dir = tempfile::tempdir().unwrap();
         let pid = std::process::id();
-        let start = crate::process::process_start_time(pid).expect("读不到自身创建时间");
+        let start = aproxy_ipc::ledger::start_marker(pid).expect("读不到自身的启动标记");
         let mut hung = sample_info("59802");
         hung.pid = pid;
-        hung.process_start = start;
+        hung.start = start.clone();
         write_instance_file_in(dir.path(), &hung).unwrap();
         let path = instance_file_path_in(dir.path(), "127.0.0.1:59802");
 
@@ -2215,7 +2321,7 @@ mod tests {
         assert!(path.exists(), "进程仍在的记录不能因 ping 失败被删");
 
         // 同一 pid、创建时间对不上 = pid 已被复用，记录的进程早已死亡 → 不列出；记录留给清理
-        hung.process_start = start + 1;
+        hung.start = format!("{start}0");
         write_instance_file_in(dir.path(), &hung).unwrap();
         let survey = survey_instances_in(dir.path()).await;
         assert!(survey.unresponsive.is_empty());
@@ -2246,15 +2352,15 @@ mod tests {
         let me = std::process::id();
         let mut live = sample_info("59811");
         live.pid = me;
-        live.process_start = crate::process::process_start_time(me).unwrap();
+        live.start = aproxy_ipc::ledger::start_marker(me).unwrap();
         let live_log = logs.join("1f3a2b-00ab.log");
-        live.log_path = live_log.display().to_string().replace('\\', "/");
+        live.log_path = Some(live_log.display().to_string().replace('\\', "/"));
         write_instance_file_in(&run, &live).unwrap();
         let mut dead = sample_info("59812");
         dead.pid = u32::MAX - 779;
-        dead.process_start = 123;
+        dead.start = "w:123".into();
         let dead_log = logs.join("2a2a2a-00cd.log");
-        dead.log_path = dead_log.display().to_string();
+        dead.log_path = Some(dead_log.display().to_string());
         write_instance_file_in(&run, &dead).unwrap();
         // 期望状态记录：不归清理管；它引用的日志留着
         let crash_log = logs.join("5c6d7e-11cd.log");
@@ -2269,7 +2375,9 @@ mod tests {
         let stale_spec = run.join(format!("1700000000000000000-{dead_writer}.spec.json"));
         let fresh_spec = run.join(format!("1700000000000000001-{dead_writer}.spec.json"));
         let own_spec = run.join(format!("1700000000000000002-{me}.spec.json"));
-        let stale_tmp = run.join(format!("59811.pid.tmp-{dead_writer}-1700000000000000003"));
+        let stale_tmp = run.join(format!(
+            "59811.instance.json.tmp-{dead_writer}-1700000000000000003"
+        ));
         // 心跳文件：端口上没有活实例且够旧才删
         let dead_heart = run.join("59812.heart");
         let live_heart = run.join("59811.heart");
@@ -2411,10 +2519,13 @@ mod tests {
     #[test]
     fn leftover_and_log_names_are_recognized_strictly() {
         assert_eq!(leftover_writer_pid("1700-4242.spec.json"), Some(4242));
-        assert_eq!(leftover_writer_pid("12345.pid.tmp-4242-1700"), Some(4242));
+        assert_eq!(
+            leftover_writer_pid("12345.instance.json.tmp-4242-1700"),
+            Some(4242)
+        );
         assert_eq!(leftover_writer_pid("settings.json.tmp-7-9"), Some(7));
         for name in [
-            "12345.pid",
+            "12345.instance.json",
             "12345.restore.json",
             "x.tmp-abc-1",
             "x.tmp-1-abc",

@@ -14,7 +14,7 @@
 //! 看护主循环入口是本模块的 [`serve`]，由 main.rs 在 `__watchdog` 入口下调用
 //! （没有公开的 `aproxy watchdog` 子命令）。
 
-use crate::process::{RecordIdentity, process_start_time, record_identity};
+use crate::process::{RecordIdentity, record_identity};
 use crate::settings;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -297,12 +297,12 @@ pub fn append_watchdog_log(home: &Path, rotate_bytes: u64, line: &str) {
 }
 
 /// 收养/回归时的注册表记录核验：「该 pid 当前就是写下这条记录的守护」。
-/// 时间戳比对即身份证明，**不要求实例应答**——挂死实例恰恰最需要被收养
-/// （随后由健康扫描判挂死处决重拉）。通过返回核验时的实测创建时间（作为
-/// Watched.start_time，后续处决关卡与句柄补挂的比对基准），不通过返回 None。
-fn confirm_registered_instance(info: &crate::daemon::InstanceRecord) -> Option<u64> {
-    match record_identity(info.pid, info.process_start) {
-        RecordIdentity::Alive(start) => Some(start),
+/// 启动标记比对即身份证明，**不要求实例应答**——挂死实例恰恰最需要被收养
+/// （随后由健康扫描判挂死处决重拉）。通过返回记录里的启动标记（作为
+/// Watched.start，后续处决关卡与句柄补挂的比对基准），不通过返回 None。
+fn confirm_registered_instance(info: &crate::daemon::InstanceRecord) -> Option<String> {
+    match record_identity(info.pid, &info.start) {
+        RecordIdentity::Alive => Some(info.start.clone()),
         RecordIdentity::Reused | RecordIdentity::Gone => None,
     }
 }
@@ -320,7 +320,7 @@ pub fn this_process_may_spawn_watchdog_in(run_dir: &Path) -> bool {
     may_spawn_watchdog(
         std::process::id(),
         &crate::daemon::registry_instances_in(run_dir),
-        |info| record_identity(info.pid, info.process_start),
+        |info| record_identity(info.pid, &info.start),
     )
 }
 
@@ -347,7 +347,7 @@ fn may_spawn_watchdog(
 ) -> bool {
     let alive: Vec<u32> = records
         .iter()
-        .filter(|info| matches!(identity(info), RecordIdentity::Alive(_)))
+        .filter(|info| identity(info) == RecordIdentity::Alive)
         .map(|info| info.pid)
         .collect();
     if !alive.contains(&my_pid) {
@@ -458,10 +458,10 @@ struct Watched {
     consecutive_failures: u32,
     /// 纳入看护的时刻：判断它活了多久
     since: std::time::Instant,
-    /// 收养/重拉收编时实测的进程创建时间：处决关卡与句柄补挂据此确认
-    /// 「pid 仍是当初收编的那个进程」（pid 复用后必然不符）。0 = 收编时
-    /// 已测不到（进程刚死），此后任何核验都不会通过——宁可不杀不挂。
-    start_time: u64,
+    /// 收养/重拉收编时的启动标记：处决关卡与句柄补挂据此确认
+    /// 「pid 仍是当初收编的那个进程」（pid 复用后必然不符）。空串 = 收编时
+    /// 已算不出（进程刚死），此后任何核验都不会通过——宁可不杀不挂。
+    start: String,
 }
 
 /// 待重试的崩溃实例（重拉失败后的退避队列条目）。
@@ -577,7 +577,7 @@ impl WatchdogState {
             if let Some(idx) = self.watched.iter().position(|w| w.port == entry.port) {
                 let (port, pid, handle, start) = {
                     let w = &self.watched[idx];
-                    (w.port.clone(), w.pid, w.handle, w.start_time)
+                    (w.port.clone(), w.pid, w.handle, w.start.clone())
                 };
                 if handle == 0 {
                     // 补挂前先核验身份：句柄缺失期间进程可能已死、pid 被复用，
@@ -585,7 +585,7 @@ impl WatchdogState {
                     // 被当挂死处决）。核验不过 = 收编的那个进程已不在：没有句柄
                     // 就永远等不到它的死亡事件，在这里补发一个，让它走常规死亡
                     // 处置（期望状态记录在则重拉）而不是悬空占位。
-                    if let RecordIdentity::Alive(_) = record_identity(pid, start) {
+                    if record_identity(pid, &start) == RecordIdentity::Alive {
                         if let Some(h) = crate::process::open_sync_handle(pid) {
                             self.watched[idx].handle = h;
                             self.spawn_death_watcher(port, pid, h);
@@ -596,8 +596,8 @@ impl WatchdogState {
                 }
                 continue;
             }
-            // 实例身份建立（与二进制名称无关）：注册表记录按「pid + 登记创建
-            // 时间」核验为「仍是写下它的那个守护」才收养（见
+            // 实例身份建立（与二进制名称无关）：注册表记录按「pid + 登记的启动
+            // 标记」核验为「仍是写下它的那个守护」才收养（见
             // confirm_registered_instance）。不通过（刚死/pid 被复用）→ 跳过，
             // 下轮再看（期望状态记录仍在，等 respawn 路径或真实实例出现）
             let Some(info) = read_registry_info(&self.cfg.run_dir, &entry.port) else {
@@ -612,7 +612,7 @@ impl WatchdogState {
             // 开句柄后复核：核验与开句柄之间进程若恰好退出、pid 被复用，句柄
             // 指向的就是无关进程。Windows 句柄此刻已钉住进程对象，复核通过
             // 即此后再无复用可能；unix 句柄即 pid，复核把窗口收窄到微秒级
-            if process_start_time(info.pid) != Some(start) {
+            if aproxy_ipc::ledger::start_marker(info.pid).as_deref() != Some(start.as_str()) {
                 crate::process::close_handle(handle);
                 continue;
             }
@@ -623,7 +623,7 @@ impl WatchdogState {
                 handle,
                 consecutive_failures: 0,
                 since: std::time::Instant::now(),
-                start_time: start,
+                start,
             });
             self.spawn_death_watcher(entry.port.clone(), info.pid, handle);
             adopted.push(entry.port);
@@ -667,15 +667,12 @@ impl WatchdogState {
             }
             // 防误杀关卡：「主动杀」前的既定验证。pid 若被复用给无关进程，
             // 心跳/IPC 失效的表现与「实例挂死」不可区分，但那个进程是无辜的。
-            // 判据是收编时实测的创建时间（与二进制名无关：改名部署的守护
+            // 判据是收编时的启动标记（与二进制名无关：改名部署的守护
             // 时间戳不变照常处决，复用 pid 的进程时间戳必然不同）。unix 的
             // 裸 SIGKILL 尤其依赖此关（Windows 侧为冗余的第二道验证）。
             // 候选已死（zombie/reaped）时判 Gone → 跳过处决，死亡事件由
             // watcher 兜底
-            if !matches!(
-                record_identity(w.pid, w.start_time),
-                RecordIdentity::Alive(_)
-            ) {
+            if record_identity(w.pid, &w.start) != RecordIdentity::Alive {
                 tracing::warn!(port = %w.port, pid = w.pid, "挂死候选的 pid 已不是收编时的进程（已退出或被复用），跳过处决");
                 continue;
             }
@@ -864,18 +861,18 @@ impl WatchdogState {
     /// [`HEALTHY_AFTER_SECS`] 就又死了，这次重拉也算失败，从 `prior_failures + 1` 接着数。
     fn admit_respawned(&mut self, port: &str, pid: u32, prior_failures: u32) {
         tracing::info!(port = %port, new_pid = pid, "实例已重拉并就绪");
-        // 先开句柄再测创建时间：Windows 句柄一旦打开就钉住进程对象，随后按
-        // pid 测得的必是同一对象的时间（反序则两次调用之间进程若恰好退出、
+        // 先开句柄再算启动标记：Windows 句柄一旦打开就钉住进程对象，随后按
+        // pid 算得的必是同一对象的标记（反序则两次调用之间进程若恰好退出、
         // pid 被复用，基准与句柄会分属两个进程）
         let handle = crate::process::open_sync_handle(pid).unwrap_or(0);
-        let start_time = process_start_time(pid).unwrap_or(0);
+        let start = aproxy_ipc::ledger::start_marker(pid).unwrap_or_default();
         self.watched.push(Watched {
             port: port.to_string(),
             pid,
             handle,
             consecutive_failures: prior_failures.saturating_add(1),
             since: std::time::Instant::now(),
-            start_time,
+            start,
         });
         if handle != 0 {
             self.spawn_death_watcher(port.to_string(), pid, handle);
@@ -1636,6 +1633,22 @@ mod tests {
         crate::spec::write_restore_in(run_dir, port, &spec).unwrap();
     }
 
+    /// 一份测试用的实例记录：给定 pid、端口与登记的启动标记，其余字段随意。
+    fn sample_record(pid: u32, port: &str, start: &str) -> crate::daemon::InstanceRecord {
+        crate::daemon::InstanceRecord {
+            pid,
+            start: start.to_string(),
+            instance_id: "19ac3f2e8b5d1a2b".into(),
+            version: "0.0.0-test".into(),
+            listen_addr: format!("127.0.0.1:{port}"),
+            config_path: Some("C:/tmp/no-such-config.toml".into()),
+            base_url: "https://x".into(),
+            started_at: now_millis(),
+            log_path: None,
+            foreground: false,
+        }
+    }
+
     fn test_cfg(dir: &Path) -> WatchdogConfig {
         WatchdogConfig {
             home: dir.to_path_buf(),
@@ -1900,16 +1913,7 @@ mod tests {
     /// 选举纯判定核：用 pid → 身份状态的映射注入，覆盖全部进程状态组合
     #[test]
     fn election_counts_only_verified_live_records() {
-        let rec = |pid: u32| crate::daemon::InstanceRecord {
-            pid,
-            version: "t".into(),
-            listen_addr: format!("127.0.0.1:{}", 50000 + pid),
-            config_path: String::new(),
-            base_url: String::new(),
-            started_at: 0,
-            log_path: String::new(),
-            process_start: pid as u64,
-        };
+        let rec = |pid: u32| sample_record(pid, &(50000 + pid).to_string(), &format!("w:{pid}"));
         let records = vec![rec(10), rec(20), rec(30)];
         let with = |map: Vec<(u32, RecordIdentity)>| {
             move |info: &crate::daemon::InstanceRecord| {
@@ -1924,8 +1928,8 @@ mod tests {
             20,
             &records,
             with(vec![
-                (10, RecordIdentity::Alive(10)),
-                (20, RecordIdentity::Alive(20))
+                (10, RecordIdentity::Alive),
+                (20, RecordIdentity::Alive)
             ])
         ));
         // 更小 pid 的记录是死记录/复用 pid/旧版本无从核验 → 一律不计入，
@@ -1935,7 +1939,7 @@ mod tests {
                 may_spawn_watchdog(
                     20,
                     &records,
-                    with(vec![(10, stale), (20, RecordIdentity::Alive(20))])
+                    with(vec![(10, stale), (20, RecordIdentity::Alive)])
                 ),
                 "{stale:?} 的更小 pid 不得让本守护让位"
             );
@@ -1945,16 +1949,16 @@ mod tests {
         assert!(may_spawn_watchdog(
             25,
             &records,
-            with(vec![(10, RecordIdentity::Alive(10))])
+            with(vec![(10, RecordIdentity::Alive)])
         ));
         // 无任何在世记录 → 有权
         assert!(may_spawn_watchdog(20, &records, with(vec![])));
         // 并发场景唯一性：同一注册表视图下，只有在世集合的最小者有权
         let all_alive = || {
             with(vec![
-                (10, RecordIdentity::Alive(10)),
-                (20, RecordIdentity::Alive(20)),
-                (30, RecordIdentity::Alive(30)),
+                (10, RecordIdentity::Alive),
+                (20, RecordIdentity::Alive),
+                (30, RecordIdentity::Alive),
             ])
         };
         let initiators: Vec<u32> = [10, 20, 30]
@@ -1964,33 +1968,24 @@ mod tests {
         assert_eq!(initiators, vec![10], "并发发现缺席时恰好一个发起者");
     }
 
-    /// 收养按「pid + 登记创建时间」核验：名字与 aProxy 无关的进程只要记录
-    /// 时间一致即被收养（改名二进制的单元级等价物）；时间不符（pid 复用）
-    /// 与未登记创建时间的一律不收养；收养后死亡 watcher 挂在正确的进程上
+    /// 收养按「pid + 登记的启动标记」核验：名字与 aProxy 无关的进程只要记录里的
+    /// 标记一致即被收养（改名二进制的单元级等价物）；标记不符（pid 复用）
+    /// 与未登记标记的一律不收养；收养后死亡 watcher 挂在正确的进程上
     #[cfg(any(windows, target_os = "linux"))]
     #[tokio::test]
     async fn adopt_scan_uses_start_time_identity_not_name() {
         let dir = tempfile::tempdir().unwrap();
         let mut child = spawn_unrelated_child();
         let pid = child.id();
-        let start = process_start_time(pid).expect("子进程创建时间可查");
-        let write = |port: &str, process_start: u64| {
-            let info = crate::daemon::InstanceRecord {
-                pid,
-                version: "t".into(),
-                listen_addr: format!("127.0.0.1:{port}"),
-                config_path: "C:/tmp/no-such-config.toml".into(),
-                base_url: "https://x".into(),
-                started_at: now_secs(),
-                log_path: String::new(),
-                process_start,
-            };
+        let start = aproxy_ipc::ledger::start_marker(pid).expect("子进程的启动标记可查");
+        let write = |port: &str, recorded: &str| {
+            let info = sample_record(pid, port, recorded);
             crate::daemon::write_instance_file_in(dir.path(), &info).unwrap();
             write_restore(dir.path(), port);
         };
-        write("59911", start); // 身份一致
-        write("59912", start.wrapping_add(1)); // pid 复用模拟
-        write("59913", 0); // 未登记创建时间：证明不了身份
+        write("59911", &start); // 身份一致
+        write("59912", &format!("{start}0")); // pid 复用模拟
+        write("59913", ""); // 未登记启动标记：证明不了身份
         let mut st = WatchdogState::new(test_cfg(dir.path()));
         let adopted = st.adopt_scan().await;
         assert_eq!(
@@ -1999,7 +1994,7 @@ mod tests {
             "只收养身份核验通过的记录"
         );
         let w = st.watched.iter().find(|w| w.port == "59911").unwrap();
-        assert_eq!(w.start_time, start, "收养时应记下实测创建时间作为处决基准");
+        assert_eq!(w.start, start, "收养时应记下启动标记作为处决基准");
 
         // 死亡 watcher 挂在被收养的进程上：杀掉它即收到该端口的死亡事件
         child.kill().unwrap();
@@ -2014,7 +2009,7 @@ mod tests {
         }
     }
 
-    /// 处决关卡按收编时的创建时间：不符（pid 已被复用）不杀，一致即杀——
+    /// 处决关卡按收编时的启动标记：不符（pid 已被复用）不杀，一致即杀——
     /// 被测进程名字与 aProxy 无关，旧名称关卡会一律跳过处决
     #[cfg(any(windows, target_os = "linux"))]
     #[tokio::test]
@@ -2023,7 +2018,7 @@ mod tests {
         let port = format!("599{:02}", 20 + std::process::id() % 50);
         let mut child = spawn_unrelated_child();
         let pid = child.id();
-        let start = process_start_time(pid).expect("子进程创建时间可查");
+        let start = aproxy_ipc::ledger::start_marker(pid).expect("子进程的启动标记可查");
         let handle = crate::process::open_sync_handle(pid).expect("子进程句柄");
         // 心跳停在远古时刻（判过期），端点无人应答（ping 二意见也失败）
         let writer = HeartbeatWriter::create(dir.path(), &port).expect("心跳节创建");
@@ -2035,12 +2030,12 @@ mod tests {
             handle,
             consecutive_failures: 0,
             since: std::time::Instant::now(),
-            start_time: start.wrapping_add(1),
+            start: format!("{start}0"),
         });
         assert!(st.health_scan().await.is_empty(), "身份不符不得处决");
         assert!(child.try_wait().unwrap().is_none(), "无辜进程必须仍在运行");
 
-        st.watched[0].start_time = start;
+        st.watched[0].start = start;
         assert_eq!(st.health_scan().await, vec![port.clone()]);
         assert!(wait_child_exit(&mut child), "身份一致的挂死候选应被处决");
         crate::process::close_handle(handle);
@@ -2095,16 +2090,8 @@ mod tests {
     /// 构造一个伪实例环境：注册表 + 恢复记录齐全（进程身份不真存在——
     /// adopt_scan 的身份核验会判 Gone 拒绝它，测试直接操纵 watched）
     fn write_crashed_instance(dir: &Path, port: &str) {
-        let info = crate::daemon::InstanceRecord {
-            pid: u32::MAX - 777, // 不会存活也不易复用的 PID
-            version: "0.0.0-test".into(),
-            listen_addr: format!("127.0.0.1:{port}"),
-            config_path: "C:/tmp/no-such-config.toml".into(),
-            base_url: "https://x".into(),
-            started_at: now_secs(),
-            log_path: String::new(),
-            process_start: 0,
-        };
+        // 不会存活也不易复用的 PID
+        let info = sample_record(u32::MAX - 777, port, "");
         crate::daemon::write_instance_file_in(dir, &info).unwrap();
         // restore 记录（崩溃信号）
         write_restore(dir, port);
@@ -2127,19 +2114,10 @@ mod tests {
             handle: 0,
             consecutive_failures: 0,
             since: std::time::Instant::now(),
-            start_time: 0,
+            start: String::new(),
         });
         // 有注册表、没有期望状态记录 → 已被停止
-        let info = crate::daemon::InstanceRecord {
-            pid: u32::MAX - 777,
-            version: "t".into(),
-            listen_addr: "127.0.0.1:59901".into(),
-            config_path: "C:/tmp/c.toml".into(),
-            base_url: "https://x".into(),
-            started_at: now_secs(),
-            log_path: String::new(),
-            process_start: 0,
-        };
+        let info = sample_record(u32::MAX - 777, "59901", "");
         crate::daemon::write_instance_file_in(dir.path(), &info).unwrap();
         assert_eq!(st.handle_death("59901").await, DeathOutcome::GracefulExit);
         assert!(st.watched_ports().is_empty(), "优雅退出后应摘除看护");
@@ -2159,7 +2137,7 @@ mod tests {
             handle: 0,
             consecutive_failures: failures,
             since: std::time::Instant::now(),
-            start_time: 0,
+            start: String::new(),
         };
         st.watched.push(young(st.cfg.max_restarts)); // 已达上限
         assert_eq!(st.handle_death(port).await, DeathOutcome::SlowRetry);
@@ -2266,7 +2244,7 @@ mod tests {
             handle: 0,
             consecutive_failures: 0,
             since: std::time::Instant::now(),
-            start_time: 0,
+            start: String::new(),
         });
         // 首次崩溃：立即重拉 → 失败（配置不存在）→ 入队，failures=1
         assert_eq!(st.handle_death(port).await, DeathOutcome::RespawnFailed);
@@ -2340,7 +2318,7 @@ mod tests {
             handle: 0,
             consecutive_failures: 0,
             since: std::time::Instant::now(),
-            start_time: 0,
+            start: String::new(),
         });
         st.hung_ports.push(port.into());
         assert_eq!(st.handle_death(port).await, DeathOutcome::RespawnFailed);
@@ -2433,7 +2411,7 @@ mod tests {
             handle: 0,
             consecutive_failures: 0,
             since: std::time::Instant::now(),
-            start_time: 0,
+            start: String::new(),
         });
         let start = std::time::Instant::now();
         let _ = st.handle_death(port).await;

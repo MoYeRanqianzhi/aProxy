@@ -145,8 +145,9 @@ async fn raced_by_watchdog(
         return None;
     }
     let live = daemon::ipc_ping(port).await.ok()?;
-    let same_config = super::target::config_path_key(&live.instance.config_path)
-        == super::target::config_path_key(spec.config_path.as_deref().unwrap_or(""));
+    // 两边都没有配置文件也算同一配置：同一份规格拉起的就是这样的实例
+    let key = |path: &Option<String>| path.as_deref().map(super::target::config_path_key);
+    let same_config = key(&live.instance.config_path) == key(&spec.config_path);
     (live.instance.pid != old_pid && same_config).then_some(live)
 }
 

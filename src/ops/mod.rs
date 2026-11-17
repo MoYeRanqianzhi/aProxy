@@ -22,12 +22,3 @@ pub mod restore;
 pub mod start;
 pub mod stop;
 pub mod target;
-
-/// 当前 Unix 秒（系统时钟早于 epoch 时回退 0）。只用来算「闲置了多久」这类展示与筛选
-/// 用的时长。
-pub(crate) fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}

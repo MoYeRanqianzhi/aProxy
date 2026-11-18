@@ -851,7 +851,9 @@
     - 三个安装脚本新建 home 时设同样的权限（sh：`chmod 700`；ps1 与 cmd：`icacls /inheritance:r /grant:r`，账户用 SID）。
       两个 Windows 写法在临时目录里实测，读回都是 `D:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;<用户>)`；
       **脚本整体没有重跑**（它们要从 GitHub 下载发布资产），sh 只过了 `bash -n`。
-    - 测试 home（`tests/common`）起步就收紧：临时目录在有的机器上给了别的账户权限，会让 doctor 多一条告警。
+    - 测试 home（`tests/common`）起步就收紧：`tempfile::tempdir()` 在 unix 上按 umask 建目录（多半 0755，不是 0700——
+      第一次推送时 doctor 的单测就错在这个假设上，CI run 44300790832 的 ubuntu 红，随后修正），在有的 Windows 机器上
+      还给了别的账户权限，都会让 doctor 多一条告警。
   - 验收表 B7 行逐项：管道 DACL ✓（单测）；第二个用户连不上、root 连得上 ✓（CI 实测）；home 为 0700 ✓
     （`a_new_home_is_private_to_its_owner`，两个平台）；权限过宽的既有 home 在第一次写配置后被收紧 ✓
     （`a_loose_home_is_tightened_by_the_first_config_write`）；临时文件一创建就是最终权限 ✓（unix 单测

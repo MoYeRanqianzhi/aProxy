@@ -525,10 +525,9 @@ mod tests {
     fn doctor_warns_when_others_can_access_the_home() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        assert!(
-            check_home_access(dir.path()).is_empty(),
-            "临时目录本来是 0700"
-        );
+        // 临时目录按 umask 建出来，多半是 0755：先收成只让属主访问
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(check_home_access(dir.path()).is_empty());
         assert!(check_home_access(&dir.path().join("missing")).is_empty());
 
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750)).unwrap();

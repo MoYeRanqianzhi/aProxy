@@ -106,8 +106,9 @@ impl TestHome {
             "测试 home 不是绝对路径: {}",
             home.display()
         );
-        // 已经存在的 home 起步就只让属主访问，与 aproxy 自己建出来的一样：临时目录在有的
-        // 机器上还给了别的账户权限，那样的 home 会让 doctor 多出一条告警
+        // 已经存在的 home 起步就只让属主访问，与 aproxy 自己建出来的一样：临时目录在 unix 上
+        // 按 umask 建（多半是 0755），在有的 Windows 机器上还给了别的账户权限，那样的 home
+        // 会让 doctor 多出一条告警
         if home.exists() {
             aproxy::fsx::secure_home_in(&home).expect("收紧测试 home 的权限失败");
         }

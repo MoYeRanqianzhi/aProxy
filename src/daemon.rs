@@ -2477,6 +2477,9 @@ where
             data
         };
         batch.clear();
+        if last {
+            push_state_if_changed(&mut batch, &mut seq, &state, &mut sent_snapshot);
+        }
         push_event(&mut batch, &mut seq, event, at, &data);
         // 队列里已经排着的事件一并带上，一次写出去。实例忙的时候，每写一次都要等运行时再排到
         // 这个任务；一次只写一个事件的话，每秒几百个事件就跟不上，订阅者会不停地收到 lagged
@@ -2487,6 +2490,7 @@ where
                     push_event(&mut batch, &mut seq, "request", Some(at), &record);
                 }
                 Ok(Event::Closing(reason)) => {
+                    push_state_if_changed(&mut batch, &mut seq, &state, &mut sent_snapshot);
                     let data = format!(r#"{{"reason":"{reason}"}}"#);
                     push_event(&mut batch, &mut seq, "closing", None, &data);
                     last = true;
@@ -2511,6 +2515,24 @@ where
         if last {
             return Ok(());
         }
+    }
+}
+
+/// `closing` 之前调用：快照与上一次发给这个订阅者的不一样时，先补一个 `state` 事件。
+///
+/// 实例是先改状态（`stopping`、更换阶段）、再宣布关闭的，但两件事可能在这个任务被排到之前
+/// 都已经发生，那时先处理哪一个没有定数。在这里补发，订阅者就总是先看到状态的变化、再看到
+/// `closing`，不会带着一份过时的状态被关掉连接。
+fn push_state_if_changed(
+    batch: &mut String,
+    seq: &mut u64,
+    state: &ControlState,
+    sent_snapshot: &mut String,
+) {
+    let now = serde_json::to_string(&status_snapshot(state)).expect("序列化状态快照失败");
+    if now != *sent_snapshot {
+        push_event(batch, seq, "state", None, &now);
+        *sent_snapshot = now;
     }
 }
 
@@ -3790,6 +3812,40 @@ mod tests {
         assert_eq!(closing["data"], serde_json::json!({"reason": "swap"}));
         handler.await.unwrap().unwrap();
         assert_eq!(state.history.subscribers(), 0);
+    }
+
+    /// 实例退出时状态先变、再宣布关闭；两件事在订阅的任务被排到之前都已发生时，订阅者仍然
+    /// 先收到状态的变化，再收到 `closing`。先处理哪一个是随机的，所以多试几十次。
+    #[tokio::test]
+    async fn closing_always_follows_the_state_change() {
+        use tokio::io::AsyncWriteExt;
+        for round in 0..50 {
+            let (state, _rx) = control(sample_info("12345"));
+            let (mut client, server) = tokio::io::duplex(1 << 16);
+            let handler = tokio::spawn(handle_conn(server, state.clone()));
+            client
+                .write_all(
+                    b"{\"v\":1,\"op\":\"subscribe\"}
+",
+                )
+                .await
+                .unwrap();
+            let (read_half, _write_half) = tokio::io::split(client);
+            let mut lines = tokio::io::BufReader::new(read_half);
+            assert_eq!(next_event(&mut lines).await["ok"], true);
+
+            // 中间不让出执行权：订阅的任务下一次被排到时，两件事都已经发生
+            state.on_shutdown.send(true).unwrap();
+            state.history.announce_closing("shutdown");
+
+            let changed = next_event(&mut lines).await;
+            assert_eq!(changed["event"], "state", "第 {round} 轮：{changed}");
+            assert_eq!(changed["data"]["state"], "stopping");
+            let closing = next_event(&mut lines).await;
+            assert_eq!(closing["event"], "closing", "第 {round} 轮：{closing}");
+            assert_eq!(closing["seq"], 2);
+            handler.await.unwrap().unwrap();
+        }
     }
 
     /// 流式连接最多 8 条，第 9 条回 `busy`；客户端关了连接，名额就还回来。

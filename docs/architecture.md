@@ -825,7 +825,11 @@ tauri-build 每次构建都在包根写 `gen/schemas/`，包里没有这些文�
   aproxy 跑 `--version` 冒烟（`.github/scripts/version-smoke.sh`，按 C5 核对版本、变体与
   目标三元组）；headless 另断言依赖树里没有任何界面 crate。`upgrade-from-0-1-0` 任务下载
   真实的 v0.1.0 二进制（windows 与 ubuntu），断言它的 `install --from` 装当前构建时在改动任何
-  东西之前失败（`tests/upgrade_from_0_1_0.rs`，平时 `#[ignore]`，只在 CI 跑）。macos-build 只要求两种变体都
+  东西之前失败（`tests/upgrade_from_0_1_0.rs`，平时 `#[ignore]`，只在 CI 跑）。`force-cross-version`
+  任务下载已经发布的每个 0.2.0 版本（预发布也算；清单在 ci.yml 的 `PREV_VERSIONS`，每发一个
+  版本加一个）的无界面资产，让它与当前构建互相强制安装——谁执行、装上谁、被结束的进程是谁
+  启动的，四种组合都走——断言进程按台账结束、二进制换好、端口放开
+  （`tests/force_cross_version.rs`，同样平时 `#[ignore]`）。macos-build 只要求两种变体都
   编得过。macOS 测试是独立 job，**已知红**（`/proc` 依赖，见「平台」）：不设
   skip 也不设 `continue-on-error`，红色就是「未完成」的如实信号，独立成 job 后不淹没其他
   平台的结论

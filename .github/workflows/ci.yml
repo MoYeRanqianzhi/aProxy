@@ -193,6 +193,51 @@ jobs:
           echo "APROXY_V010_BIN=$dest" >> "$GITHUB_ENV"
       - run: cargo test --locked --no-default-features --test upgrade_from_0_1_0 -- --ignored --nocapture
 
+  force-cross-version:
+    # 永久兼容契约 C1–C8：每个发布的版本都要能强制安装别的每个版本，并结束它启动的进程。
+    # 真实发布的旧版本二进制与当前构建互相强制安装（tests/force_cross_version.rs，平时
+    # #[ignore]）：谁执行、装上谁、被结束的进程是谁启动的，四种组合都走。
+    # 每发布一个版本（预发布也算），就把它的 tag 加进下面的 PREV_VERSIONS：这张表里的版本
+    # 今后的每个提交都要能与它互相强制安装。
+    # 用无界面的资产与 headless 变体的构建：强制安装的流程两种变体相同，这样省掉前端与
+    # WebKitGTK 的准备。
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: aproxy-headless-x86_64-pc-windows-msvc.exe
+            sep: ";"
+          - os: ubuntu-latest
+            asset: aproxy-headless-x86_64-unknown-linux-gnu
+            sep: ":"
+    runs-on: ${{ matrix.os }}
+    env:
+      PREV_VERSIONS: v0.2.0-alpha.1 v0.2.0-alpha.2
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.3
+      - name: Download the earlier release binaries
+        shell: bash
+        run: |
+          list=""
+          for version in $PREV_VERSIONS; do
+            dir="$RUNNER_TEMP/prev/$version"
+            mkdir -p "$dir"
+            base="https://github.com/${{ github.repository }}/releases/download/$version"
+            curl -fsSL -o "$dir/${{ matrix.asset }}" "$base/${{ matrix.asset }}"
+            curl -fsSL -o "$dir/${{ matrix.asset }}.sha256" "$base/${{ matrix.asset }}.sha256"
+            (cd "$dir" && sha256sum -c "${{ matrix.asset }}.sha256")
+            chmod +x "$dir/${{ matrix.asset }}"
+            list="$list${list:+${{ matrix.sep }}}$dir/${{ matrix.asset }}"
+          done
+          echo "APROXY_PREV_BINS=$list" >> "$GITHUB_ENV"
+      # 一次只跑一种组合：每种都要起实例与看护者、等 restore，并发只会互相拖慢
+      - run: cargo test --locked --no-default-features --test force_cross_version -- --ignored --nocapture --test-threads=1
+
   macos-build:
     # macOS 不在 0.2.0 的支持范围（测试见下面的 macos 任务，已知红），但两种变体都必须编得过：
     # 带界面的变体在 macOS 上链接 WebKit 与 AppKit，任何平台分支写错都在这里暴露。

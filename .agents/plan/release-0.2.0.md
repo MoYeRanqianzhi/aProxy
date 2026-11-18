@@ -645,7 +645,7 @@
   `@meowo/aproxy-headless` 的 `next` 都是 0.2.0-alpha.2（`latest` 没动）；crates.io 上 aproxy、aproxy-ipc、aproxy-envelope、
   aproxy-desktop 都是 0.2.0-alpha.2。发布前补了 CHANGELOG（两张键名对照表、统一的错误出口、settings 命令）、技能与 README
   （7a… 之后的 `docs:` 提交），文档里「alpha.1 的界面是预览版」改成了「各 alpha 版」。
-  **alpha.2 之后该做而还没做的**：跨版本强制安装的 CI 测试（TODO 的 W2b 一条；现在有 alpha.1、alpha.2 两个带强制安装的版本了）。
+  跨版本强制安装的 CI 测试已在 2026-11-19 补上，见文末「跨版本强制安装」一条。
 - B5 第一部分（2026-11-17）：b7d2b27 拉起规格与期望状态记录。新模块 `src/spec.rs`（`InstanceSpec`、
   `run/<端口>.restore.json`、交接文件 `run/<纳秒>-<pid>.spec.json`）；内部入口 `aproxy __serve --home --spec` 与
   `aproxy __watchdog --home` 取代两个隐藏旗标；`spawn::spawn_from_spec` 是唯一的拉起函数（就绪时限 30 秒）；
@@ -738,8 +738,8 @@
   - 实例每 30 秒核对一次自己的记录，丢了或内容不是自己的就补写；已在退出的不补写。
   - **alpha.1、alpha.2 启动的实例对本版本不可见**（快照缺 `start` 等字段，解析失败；记录名也不同）：`stop <端口>` 报
     「端口上没有运行中的 aProxy 实例」。升级说明写进了 CHANGELOG 与技能的 compatibility.md：升级前用旧版本 stop all；
-    已换二进制的用 `install --force`。**「`install --force` 能结束 alpha 实例」是按 C3 契约推出来的，没实测**——
-    跨版本强制安装的 CI 测试（TODO 的 W2b）做完才算验证过。
+    已换二进制的用 `install --force`。「`install --force` 能结束 alpha 实例」当时是按 C3 契约推出来的；
+    2026-11-19 已由跨版本强制安装的测试实测（见文末那一条）。
   - 验证：Windows headless 全量 678 通过、0 失败；两个变体 clippy 与 Linux 交叉 clippy 零输出。
   - **B6 还没做的**（设计稿 §6.1–§6.4、§6.6，验收见 §14.2 的 B6 行）：
     1. 协议规则：未知参数回 `unsupported_arg`（现在静默忽略）、参数类型不对回 `bad_request`；错误对象带 `details`
@@ -922,3 +922,15 @@
     history 与 daemon 54 个、history_integration 11 个、contract_v0_2 5 个，都过），没有再跑全量。两个变体 clippy 与
     Linux 交叉 clippy 在最终源码上零输出。
     Linux/macOS 上新测试的运行结果看推送后的 CI。压测脚本在本机临时目录里，没有进仓库；三个程序在 `examples/`。
+- 跨版本强制安装（2026-11-19，TODO 的 W2b 剩余项）：`tests/force_cross_version.rs`（4 个测试，`#[ignore]`，要
+  `APROXY_PREV_BINS`）与 CI 的 force-cross-version 任务（windows、ubuntu；下载 `PREV_VERSIONS` 里各版本的无界面资产并核对
+  sha256）。对每个旧版本走四种组合：当前装当前（现场是旧的）、旧装当前（现场是旧的）、旧装旧（现场是当前的）、当前装旧
+  （现场是当前的）。断言退出码是 0 或 12、强制安装之前台账里活着的实例与看护者全部结束、`bin/` 里是目标二进制；12 时输出
+  里有端口、端口能重新绑上，0 时实例在台账里且版本是目标版本。
+  - 本机 Windows 用 v0.2.0-alpha.1 与 v0.2.0-alpha.2 的发布资产实跑：8 种组合全过，退出码都是 12——实例都没回来，
+    因为期望状态记录的格式在 alpha.2 之后换了（`.restore` → `.restore.json`），目标版本的 `restore` 读不懂另一个版本
+    留下的记录。这在契约允许的范围内（记录格式不冻结），CHANGELOG 的升级说明写的也是「再逐个 `aproxy start`」。
+    「回来了（0）」那一支这里走不到，同版本的由 `install_force.rs` 覆盖。
+  - 当前构建的版本号还是 0.2.0-alpha.2，与发布的 alpha.2 相同；测试输出里用「当前构建」与「发布的」区分。
+  - **发版时要做的**：每发布一个版本（预发布也算），把 tag 加进 ci.yml 的 `PREV_VERSIONS`。
+  - ubuntu 上的结果看推送后的 CI。

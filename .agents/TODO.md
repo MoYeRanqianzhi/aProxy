@@ -24,8 +24,9 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   实现落地后重写永久接口清单
 - [x] **W2b `install --force` + 进程台账**（alpha.1 第 2 步，2026-10-12 完成：2f1df42…fad48c7；独立审查
   `.agents/review/2026-10-12-force-install-review.md` 无 P0，P1 与选定的 P2 全部修完；Windows 全量 549 通过，CI 三平台核过）。
-  发布清单的生成与校验已随第 4 步落地。剩余：有两个带强制安装的版本（alpha.1 之后的下一个 tag）后加跨版本强制安装的
-  CI 测试；桌面界面拉起强制安装时 stdio 为 null（W5）
+  发布清单的生成与校验已随第 4 步落地。跨版本强制安装的 CI 测试已加（2026-11-19，`tests/force_cross_version.rs` 与 CI 的
+  force-cross-version 任务；**每发布一个版本，把它的 tag 加进 ci.yml 的 `PREV_VERSIONS`**）。剩余：桌面界面拉起强制安装时
+  stdio 为 null（W5）
 - [x] **alpha.1 第 3 步：Tauri 桌面外壳**（2026-10-12 提交 58c1518…a7cf72f，Windows 两种变体各 552 通过、实机验过；推送前
   审查 `.agents/review/2026-10-12-desktop-shell-review.md` 的应该修 1–4 与可以不修里定下要修的 a、b、d–l 已在 fbb65ee…267e712 落实；
   be3893e 改调试构建只带行号表之后，ubuntu (desktop) 的 install_force 测试在 CI 转绿（run 38273956900）；Linux 带界面版的

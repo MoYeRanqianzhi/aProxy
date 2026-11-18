@@ -202,6 +202,14 @@ pub fn parse_instance_file(text: &str) -> Option<InstanceRecord> {
         .map(|file| file.record)
 }
 
+/// 读一份实例记录文件，读不懂时说明是哪一种读不懂（读不出、不是这个形状、schema 比本版本
+/// 高）。只想知道「读不读得懂」的调用方用 [`parse_instance_file`]。
+pub fn read_instance_record(
+    path: &std::path::Path,
+) -> Result<InstanceRecord, crate::spec::Unreadable> {
+    crate::spec::read_record::<InstanceFile>(path, INSTANCE_SCHEMA).map(|file| file.record)
+}
+
 /// 新的一次运行的标识：启动时刻的纳秒数（十六进制）接 pid 的低 16 位，与随机日志名同源。
 pub fn new_instance_id() -> String {
     let nanos = std::time::SystemTime::now()
@@ -695,6 +703,24 @@ pub async fn ipc_ping_in(
     }
 }
 
+/// 清点用的探测：比 [`ipc_ping_in`] 快得多地下结论——单次只等 1 秒，`Transient` 时再试
+/// 一次。清点要同时问遍所有端口并立刻给出一张表，挂死的实例不该让整张表等上十秒；代价是
+/// 忙到 1 秒内答不上来的实例会被报成不应答，下一次清点自然纠正。
+pub async fn ipc_probe_in(
+    run_dir: &std::path::Path,
+    port: &str,
+) -> Result<InstanceStatus, IpcError> {
+    const TIMEOUT: Duration = Duration::from_secs(1);
+    let endpoint = endpoint_for_in(run_dir, port);
+    match request_raw_within(&endpoint, IpcOp::Ping, TIMEOUT).await {
+        Err(IpcError::Transient(_)) => {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            request_raw_within(&endpoint, IpcOp::Ping, TIMEOUT).await
+        }
+        other => other,
+    }
+}
+
 /// 发送一次 IPC 请求并等待应答（3 秒超时），找本进程 run 目录里的实例。
 pub async fn ipc_request(port: &str, op: IpcOp) -> Result<InstanceStatus, IpcError> {
     ipc_request_in(&run_dir(), port, op).await
@@ -721,9 +747,18 @@ async fn request_in(
 /// 按显式端点发送 IPC 请求并等待应答（3 秒超时）。按实例寻址请用
 /// `ipc_request_in`：它负责端点命名空间。
 async fn request_raw(endpoint: &str, op: IpcOp) -> Result<InstanceStatus, IpcError> {
+    request_raw_within(endpoint, op, Duration::from_secs(3)).await
+}
+
+/// 同 [`request_raw`]，等待应答的时限由调用方给。
+async fn request_raw_within(
+    endpoint: &str,
+    op: IpcOp,
+    timeout: Duration,
+) -> Result<InstanceStatus, IpcError> {
     let request = op.request_line();
     let fut = imp::exchange(endpoint, &request);
-    let (line, peer) = match tokio::time::timeout(Duration::from_secs(3), fut).await {
+    let (line, peer) = match tokio::time::timeout(timeout, fut).await {
         Ok(Ok(reply)) => reply,
         Ok(Err(IpcError::Unreachable(e))) => {
             return Err(IpcError::Unreachable(format!("{endpoint}: {e}")));
@@ -755,14 +790,38 @@ async fn request_raw(endpoint: &str, op: IpcOp) -> Result<InstanceStatus, IpcErr
 fn parse_reply(line: &str) -> Result<InstanceStatus, IpcError> {
     let value: serde_json::Value = serde_json::from_str(line)
         .map_err(|e| IpcError::Protocol(format!("应答不是 JSON：{e}")))?;
+    // 先只看 `v`：别的版本的应答可能改了其余字段的形状，按 v1 的结构解析只会报出一句
+    // 「格式不符」，说不出真正的原因
+    let version = value.get("v").and_then(serde_json::Value::as_u64);
+    if version != Some(u64::from(IPC_VERSION)) {
+        // 别的版本的应答里只认一种：实例说它不支持请求的版本。这个错误的形状各版本都
+        // 一样（它本来就是说给不同版本的对端听的），`details.supported` 列出实例支持哪些
+        if let Some(error) = value.get("error")
+            && error.get("code").and_then(serde_json::Value::as_str)
+                == Some(error_code::UNSUPPORTED_VERSION)
+        {
+            return Err(IpcError::Remote {
+                code: error_code::UNSUPPORTED_VERSION.to_string(),
+                message: error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                details: error
+                    .get("details")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            });
+        }
+        return Err(IpcError::Protocol(match version {
+            Some(v) => format!(
+                "实例使用控制协议 v{v}，本程序只懂 v{IPC_VERSION}：请用与实例同版本的 aproxy 操作它"
+            ),
+            None => "应答没有协议版本 v".to_string(),
+        }));
+    }
     let reply: WireResponse = serde_json::from_value(value)
         .map_err(|e| IpcError::Protocol(format!("应答格式不符：{e}")))?;
-    if reply.v != IPC_VERSION {
-        return Err(IpcError::Protocol(format!(
-            "实例使用控制协议 v{}，本程序只懂 v{IPC_VERSION}：请用与实例同版本的 aproxy 操作它",
-            reply.v
-        )));
-    }
     match (reply.ok, reply.result, reply.error) {
         (true, Some(status), _) => Ok(status),
         (false, _, Some(error)) => Err(IpcError::Remote {
@@ -2614,6 +2673,21 @@ mod tests {
         );
         assert!(matches!(
             parse_reply(r#"{"v":2,"ok":true}"#),
+            Err(IpcError::Protocol(_))
+        ));
+        // 别的版本的应答里只认一种：实例说它不支持请求的版本，并列出它支持哪些。别的
+        // 版本的其余应答（哪怕也是个错误）形状不保证，一律不采信
+        let err = parse_reply(
+            r#"{"v":2,"ok":false,"error":{"code":"unsupported_version","message":"x","details":{"supported":[2]},"shape":"new"}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, IpcError::Remote { code, details, .. }
+                if code == "unsupported_version" && details["supported"][0] == 2),
+            "{err}"
+        );
+        assert!(matches!(
+            parse_reply(r#"{"v":2,"ok":false,"error":{"code":"unknown_op","message":"x"}}"#),
             Err(IpcError::Protocol(_))
         ));
         // 更新版本的实例：不认识的状态读作 Unknown，不认识的字段（顶层、快照里、instance 里、

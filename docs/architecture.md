@@ -57,7 +57,29 @@ home 的实例。
 `message` 是英文、只给日志看。未知 op 与未知参数都没有副作用。`v` 只在语义不兼容时递增，
 加 op、加可选参数、加应答字段、加错误码、加状态值都不递增；应答只增字段，读者忽略不认识的。
 没有 `v` 的请求按 `bad_request` 拒绝，没有 `v` 的应答不予采信（0.1.0 的格式就是这样，0.2.0 起
-与它不再互通）。每个 op 的请求行、每种拒绝与快照的形状都由 `src/daemon.rs` 的单测逐字钉住。
+与它不再互通）。别的版本的应答里客户端只认一种：`unsupported_version`（实例说它不支持请求的
+版本，`details.supported` 列出它支持哪些），其余一律不采信。每个 op 的请求行、每种拒绝与快照的
+形状都由 `src/daemon.rs` 的单测逐字钉住；`tests/contract_v0_2.rs` 再对一个真实例走原始的控制
+通道、读它写在盘上的记录，逐项比对样本（样本里的键不能少、类型不能变，多出来的不算错）。
+
+只读清点（`ops::enumerate::enumerate_in(home)`）给 `status --json` 与界面的实例列表供数：读
+`run/` 与 `ledger/`，同时向每个端口的控制通道问一次（单次 1 秒，没答上再试一次），不删任何
+文件。结果能直接序列化：
+- `instances`：每个端口一条，`liveness` 是 `live`（应答可采信，带 `instance` 与实时的
+  `status`——快照去掉 `instance`）、`unresponsive`（记录里的进程经「pid + 启动标记」核验还在，
+  控制通道不应答；只有这一种该建议 `stop --force`）、`incompatible`（应答了但无法采信，
+  `reason` 是 `unsupported_version` 带 `supported`，或 `instance_incompatible` 带 `port` 与
+  `reason`）、`down`（没有实例在运行、留着期望状态记录：`restore_pending` 为真，配置文件不在时
+  `restore_reason` 是 `config_missing`）；读者遇到不认识的取值读作 `unknown`。只剩一份死进程的
+  实例记录的端口不列出；
+- `unreadable`：`run/` 里读不懂的记录，`file` 是相对 home 的路径，`reason.code` 是
+  `record_unreadable` 或 `record_schema_too_new`（带 `schema`）；
+- `gc_paused`：有读不懂的实例记录或期望状态记录时出现（`reason` 为 `unreadable_records`），
+  日志清理在它们消失之前暂停；
+- `watchdog`：属主进程还在的看护者记录，`state` 是 `running` 或 `stale`（最近一次扫描早于三个
+  扫描周期）；没有时为 null；
+- `processes`：台账里仍在运行、却不属于上面任何实例或看护者的进程——界面、安装者，以及本
+  版本读不懂其记录的实例（别的版本启动的）。
 
 上图的「重试循环 / spool / 回放」是默认模式的主流程；`delivery = "forward"` 模式下这两
 环整体旁路（见「仅转发模式（delivery = "forward"）」）。
@@ -69,7 +91,7 @@ home 的实例。
 | `src/main.rs` | 进程入口：C5 的 `--version`、控制台代码页、在建 tokio 运行时之前分派 `desktop`，并把内部入口 `__serve`/`__watchdog` 的 `--home` 写进本进程的 `APROXY_HOME`；其余子命令在手建的运行时里分派（`__serve` 早于 settings 检查与续作拉起，自己初始化日志） |
 | `src/cli.rs` | clap 命令树定义（`Cli`/`Commands`/`AliasCmd`/`ConfigArgs`），只承载定义不含逻辑；含两个隐藏内部入口 `__serve --home --spec` 与 `__watchdog --home`（跨版本互相拉起，名字与参数冻结） |
 | `src/commands/` | 十三个子命令各自一文件（start/status/stop/restart/restore/alias/doctor/find/logs/config/settings/install/desktop）：调用操作层拿到结果，渲染成给人看的文字、决定退出码；`start.rs` 还承载 `__serve` 入口 |
-| `src/ops/` | 操作层：选目标（`target`）、启动（`start`）、停止（`stop`）、重启（`restart`）、恢复（`restore`）、别名（`alias`）、列举（`list`）。每个动作把带数据的结果交回调用方，自己不打印、不结束进程——命令行与桌面界面共用；`tests/lib_is_quiet.rs` 守着「库里没有 `println!` 与 `process::exit`」 |
+| `src/ops/` | 操作层：选目标（`target`）、启动（`start`）、停止（`stop`）、重启（`restart`）、恢复（`restore`）、别名（`alias`）、列举（`list`）、只读清点（`enumerate`）。每个动作把带数据的结果交回调用方，自己不打印、不结束进程——命令行与桌面界面共用；`tests/lib_is_quiet.rs` 守着「库里没有 `println!` 与 `process::exit`」 |
 | `src/spec.rs` | 拉起规格 `InstanceSpec`（配置文件、覆盖参数、钉住的端口、启动者环境里的代理变量与 `PATH`、日志文件）与期望状态记录 `run/<端口>.restore.json`；交接文件 `run/<纳秒>-<pid>.spec.json`。两种文件都以私有权限写；读路径（status/restore/list/看护者）遇到读不懂的记录只报告不删除，`stop <端口>` 按文件名删记录、不读内容 |
 | `src/server.rs` | 服务承载：`serve_forever` 主循环、停止信号、日志初始化、期望状态记录的写与「用户要求停止」语义、配置错误落盘 startup.log |
 | `src/proxy/` | 转发核心，按职责分文件：入站来源校验（Host/Origin）、hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、尝试结局分类（`attempts::classify`）与唯一的尝试循环（`attempts::run_attempts`）、保活通道与提交点、断开保护、仅转发模式 |

@@ -26,7 +26,7 @@ use crate::config::Overrides;
 pub const SCHEMA: u32 = 1;
 
 /// 期望状态记录的文件名后缀：`<端口>.restore.json`。
-const RESTORE_SUFFIX: &str = ".restore.json";
+pub(crate) const RESTORE_SUFFIX: &str = ".restore.json";
 /// 交接文件的文件名后缀：`<纳秒>-<pid>.spec.json`。
 const SPEC_SUFFIX: &str = ".spec.json";
 
@@ -98,30 +98,37 @@ impl std::fmt::Display for Unreadable {
         match self {
             Self::Io(e) => write!(f, "cannot read: {e}"),
             Self::Parse(e) => write!(f, "not a valid record: {e}"),
-            Self::SchemaTooNew(schema) => write!(
-                f,
-                "written by a newer aproxy (schema {schema}, this version reads up to {SCHEMA})"
-            ),
+            Self::SchemaTooNew(schema) => {
+                write!(f, "written by a newer aproxy (schema {schema})")
+            }
         }
     }
 }
 
-/// 解析一条带 `schema` 的记录。先只取 `schema`：更高的版本可能改了别的字段的形状，
-/// 直接按本版本的结构解析会把「太新」误报成「损坏」。
-fn parse_record<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, Unreadable> {
+/// 解析一条带 `schema` 的记录；`newest` 是本版本读得懂的最高 schema（每种记录各有自己的）。
+/// 先只取 `schema`：更高的版本可能改了别的字段的形状，直接按本版本的结构解析会把「太新」
+/// 误报成「损坏」。
+pub(crate) fn parse_record<T: serde::de::DeserializeOwned>(
+    text: &str,
+    newest: u32,
+) -> Result<T, Unreadable> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| Unreadable::Parse(e.to_string()))?;
     match value.get("schema").and_then(serde_json::Value::as_u64) {
-        Some(schema) if schema > u64::from(SCHEMA) => return Err(Unreadable::SchemaTooNew(schema)),
+        Some(schema) if schema > u64::from(newest) => return Err(Unreadable::SchemaTooNew(schema)),
         Some(_) => {}
         None => return Err(Unreadable::Parse("missing schema".to_string())),
     }
     serde_json::from_value(value).map_err(|e| Unreadable::Parse(e.to_string()))
 }
 
-fn read_record<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Unreadable> {
+/// 读一条带 `schema` 的记录文件，见 [`parse_record`]。
+pub(crate) fn read_record<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    newest: u32,
+) -> Result<T, Unreadable> {
     let text = std::fs::read_to_string(path).map_err(|e| Unreadable::Io(e.to_string()))?;
-    parse_record(&text)
+    parse_record(&text, newest)
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +182,7 @@ pub fn write_spec_file(run_dir: &Path, spec: &InstanceSpec) -> std::io::Result<P
 
 /// 读交接文件。
 pub fn read_spec_file(path: &Path) -> Result<InstanceSpec, Unreadable> {
-    read_record(path)
+    read_record(path, SCHEMA)
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +252,7 @@ pub fn read_restore_in(run_dir: &Path, port: &str) -> Result<Option<RestoreEntry
     if !path.exists() {
         return Ok(None);
     }
-    let record: RestoreRecord = read_record(&path)?;
+    let record: RestoreRecord = read_record(&path, SCHEMA)?;
     Ok(Some(RestoreEntry {
         port: port.to_string(),
         spec: record.spec,
@@ -269,7 +276,7 @@ pub fn list_restore_in(run_dir: &Path) -> RestoreListing {
         else {
             continue;
         };
-        match read_record::<RestoreRecord>(&path) {
+        match read_record::<RestoreRecord>(&path, SCHEMA) {
             Ok(record) => listing.entries.push(RestoreEntry {
                 port,
                 spec: record.spec,
@@ -350,11 +357,11 @@ mod tests {
     fn spec_reads_back_and_tolerates_added_fields() {
         let spec = sample();
         let text = serde_json::to_string(&spec).unwrap();
-        assert_eq!(parse_record::<InstanceSpec>(&text).unwrap(), spec);
+        assert_eq!(parse_record::<InstanceSpec>(&text, SCHEMA).unwrap(), spec);
 
         // 以后的版本加的字段，今天的读者忽略；缺省的可选字段取默认
         let text = r#"{"schema":1,"config_path":null,"log_path":"/x.log","added_later":{"a":1}}"#;
-        let spec: InstanceSpec = parse_record(text).unwrap();
+        let spec: InstanceSpec = parse_record(text, SCHEMA).unwrap();
         assert_eq!(spec.config_path, None);
         assert_eq!(spec.overrides, Overrides::default());
         assert_eq!(spec.pinned_port, None);
@@ -366,19 +373,19 @@ mod tests {
         // schema 更高：即使别的字段形状变了，也报「太新」而不是「损坏」
         let text = r#"{"schema":2,"config_path":["now","a","list"]}"#;
         assert_eq!(
-            parse_record::<InstanceSpec>(text),
+            parse_record::<InstanceSpec>(text, SCHEMA),
             Err(Unreadable::SchemaTooNew(2))
         );
         assert!(matches!(
-            parse_record::<InstanceSpec>("{not json"),
+            parse_record::<InstanceSpec>("{not json", SCHEMA),
             Err(Unreadable::Parse(_))
         ));
         assert!(matches!(
-            parse_record::<InstanceSpec>(r#"{"config_path":null,"log_path":"x"}"#),
+            parse_record::<InstanceSpec>(r#"{"config_path":null,"log_path":"x"}"#, SCHEMA),
             Err(Unreadable::Parse(_))
         ));
         assert!(matches!(
-            parse_record::<InstanceSpec>(r#"{"schema":1}"#),
+            parse_record::<InstanceSpec>(r#"{"schema":1}"#, SCHEMA),
             Err(Unreadable::Parse(_))
         ));
     }

@@ -16,6 +16,7 @@
 //! 函数，循环留给调用方：每个实例可能要等好几秒，调用方要在每一个做完时就能报告进度。
 
 pub mod alias;
+pub mod enumerate;
 pub mod list;
 pub mod restart;
 pub mod restore;

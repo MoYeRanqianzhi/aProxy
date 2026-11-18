@@ -1626,3 +1626,205 @@ fn stop_idle_only_stops_instances_that_are_idle_long_enough() {
     assert!(ipc_ping_in_dir(&rt, port, home).is_err());
     assert!(!has_restore(home, port), "stop idle 是 stop：记录一并删掉");
 }
+
+/// 在 `endpoint` 上冒充一个只懂别的协议版本的实例：读一行请求，回一行 `reply`，循环。
+/// 在调用方的运行时里跑，随运行时结束。
+async fn answer_every_request_with(endpoint: String, reply: &'static str) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    async fn serve<S>(stream: S, reply: &str)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut line = String::new();
+        let _ = BufReader::new(reader).read_line(&mut line).await;
+        let _ = writer.write_all(reply.as_bytes()).await;
+        let _ = writer.write_all(b"\n").await;
+        let _ = writer.flush().await;
+    }
+    #[cfg(windows)]
+    {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&endpoint)
+            .expect("建冒充端点失败");
+        loop {
+            server.connect().await.expect("等待连接失败");
+            let connected = std::mem::replace(
+                &mut server,
+                ServerOptions::new()
+                    .create(&endpoint)
+                    .expect("重建端点失败"),
+            );
+            serve(connected, reply).await;
+        }
+    }
+    #[cfg(unix)]
+    {
+        let listener = tokio::net::UnixListener::bind(&endpoint).expect("建冒充端点失败");
+        loop {
+            let (stream, _) = listener.accept().await.expect("等待连接失败");
+            serve(stream, reply).await;
+        }
+    }
+}
+
+/// 只读清点把四种实例分清：应答的（live）、进程在却不应答的（unresponsive）、应答了但
+/// 协议版本不同的（incompatible）、只剩期望状态记录的（down）。清点前后 `run/` 里的
+/// 文件一个不少。
+#[test]
+fn enumeration_tells_the_four_kinds_of_instance_apart() {
+    use aproxy::ops::enumerate::{Liveness, enumerate_in};
+    let test_home = TestHome::new();
+    let home = test_home.path();
+    let exe = built_exe();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let run_dir = home.join("run");
+
+    // live：一个真实例
+    let live_port = free_port();
+    let cfg = home.join("live.toml");
+    write_cfg(&cfg, &format!("127.0.0.1:{live_port}"));
+    test_home.stop_on_drop(live_port);
+    let out = run_cli(
+        &test_home,
+        &exe,
+        &["start", "--config", cfg.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "start: {}", text(&out.stderr));
+    let live_record =
+        aproxy::daemon::read_instance_file_in(&run_dir, &live_port.to_string()).unwrap();
+
+    // unresponsive：记录里的进程在（拿本测试进程顶替），它的控制通道上没有人听
+    let hung_port = free_port();
+    let own = std::process::id();
+    let mut hung_record = live_record.clone();
+    hung_record.pid = own;
+    hung_record.start = aproxy_ipc::ledger::start_marker(own).expect("本进程的启动标记可查");
+    hung_record.listen_addr = format!("127.0.0.1:{hung_port}");
+    aproxy::daemon::write_instance_file_in(&run_dir, &hung_record).unwrap();
+
+    // incompatible：端点上应答的是只懂 v2 的实例。它留下的记录本版本读不懂
+    let alien_port = free_port();
+    std::fs::write(
+        run_dir.join(format!("{alien_port}.instance.json")),
+        r#"{"schema":2,"shape":"new"}"#,
+    )
+    .unwrap();
+    rt.spawn(answer_every_request_with(
+        aproxy::daemon::endpoint_for_in(&run_dir, &alien_port.to_string()),
+        r#"{"v":2,"ok":false,"error":{"code":"unsupported_version","message":"this instance speaks v2","details":{"supported":[2]}}}"#,
+    ));
+
+    // down：只剩一份期望状态记录，配置文件已经不在
+    let down_port = free_port();
+    let mut spec = restore_spec(home, live_port).expect("真实例的期望状态记录");
+    spec.config_path = Some(home.join("gone.toml").display().to_string());
+    aproxy::spec::write_restore_in(&run_dir, &down_port.to_string(), &spec).unwrap();
+
+    let listing = |dir: &Path| {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = listing(&run_dir);
+    // 冒充端点在另一个任务里建：等它建好再清点
+    let mut found = rt.block_on(enumerate_in(home));
+    for _ in 0..50 {
+        if found
+            .instances
+            .iter()
+            .any(|item| item.liveness == Liveness::Incompatible)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        found = rt.block_on(enumerate_in(home));
+    }
+    assert_eq!(listing(&run_dir), before, "清点不删、不建任何文件");
+
+    let of = |port: u16| {
+        found
+            .instances
+            .iter()
+            .find(|item| item.port == port)
+            .unwrap_or_else(|| panic!("端口 {port} 应被列出：{found:?}"))
+    };
+    assert_eq!(found.instances.len(), 4, "{found:?}");
+
+    let live = of(live_port);
+    assert_eq!(live.liveness, Liveness::Live);
+    assert_eq!(live.instance.as_ref(), Some(&live_record));
+    let status = live.status.as_ref().expect("应答的实例带实时状态");
+    assert_eq!(status.state, aproxy::daemon::InstanceState::Serving);
+    assert!(status.ops.iter().any(|op| op == "ping"));
+    assert!(!live.restore_pending, "在运行的实例没有什么等着恢复");
+
+    let hung = of(hung_port);
+    assert_eq!(hung.liveness, Liveness::Unresponsive);
+    assert_eq!(hung.instance.as_ref(), Some(&hung_record));
+    assert!(hung.status.is_none() && hung.reason.is_none());
+
+    let alien = of(alien_port);
+    assert_eq!(alien.liveness, Liveness::Incompatible);
+    assert!(alien.instance.is_none() && alien.status.is_none());
+    let reason = alien.reason.as_ref().expect("说明为什么不兼容");
+    assert_eq!(reason.code, "unsupported_version");
+    assert_eq!(reason.details["supported"][0], 2);
+
+    let down = of(down_port);
+    assert_eq!(down.liveness, Liveness::Down);
+    assert!(down.instance.is_none() && down.restore_pending);
+    assert_eq!(down.restore_reason.as_deref(), Some("config_missing"));
+
+    // 读不懂的那份实例记录照实报告，日志清理因此暂停
+    assert_eq!(found.unreadable.len(), 1, "{:?}", found.unreadable);
+    assert_eq!(
+        found.unreadable[0].file,
+        format!("run/{alien_port}.instance.json")
+    );
+    assert_eq!(found.unreadable[0].reason.code, "record_schema_too_new");
+    assert_eq!(
+        found
+            .gc_paused
+            .as_ref()
+            .map(|paused| paused.reason.as_str()),
+        Some("unreadable_records")
+    );
+    // 真实例在台账里，但它已经列为实例，不在「其余进程」里重复出现
+    assert!(
+        found
+            .processes
+            .iter()
+            .all(|process| process.pid != live_record.pid),
+        "{:?}",
+        found.processes
+    );
+
+    // 文档里的 JSON 形状：四种取值都是小写的词
+    let json = serde_json::to_value(&found).unwrap();
+    let mut kinds: Vec<&str> = json["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["liveness"].as_str().unwrap())
+        .collect();
+    kinds.sort_unstable();
+    assert_eq!(kinds, ["down", "incompatible", "live", "unresponsive"]);
+
+    // 收尾：顶替用的记录指向本测试进程，不能留给 TestHome 的清理去「停」它
+    std::fs::remove_file(aproxy::daemon::instance_file_path_in(
+        &run_dir,
+        &hung_port.to_string(),
+    ))
+    .unwrap();
+}

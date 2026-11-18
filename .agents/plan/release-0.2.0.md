@@ -786,3 +786,37 @@
   - 每个请求、每次重试、每次失败各锁一次 `IpcStats` 里的互斥锁（临界区只有整数运算）；没有压测过它对吞吐的影响，
     `docs/benchmark-*.md` 的数字是这之前测的。
   - 验证：Windows headless 全量 681 通过、0 失败；两个变体 clippy 与 Linux 交叉 clippy 零输出。
+- B6 第四部分（2026-11-18）：§6.6 只读清点与 `tests/contract_v0_2.rs`，**B6 至此做完**。
+  - `src/ops/enumerate.rs`：`enumerate_in(home) -> Enumeration`（可直接序列化，形状由单测
+    `enumeration_shape_is_pinned` 钉着）。端口取 `run/` 里文件名是「数字 + `.instance.json` / `.restore.json`」的并集，
+    所有端口同时探测（`daemon::ipc_probe_in`：单次 1 秒、`Transient` 再试一次）。
+  - **与设计稿不同的地方**：
+    1. 清点放在主 crate 的操作层，没有放进 aproxy-ipc。原因：IPC 客户端是 tokio 写的，aproxy-ipc 没有 tokio；
+       把客户端搬过去或另写一份同步的都是大改，而 aproxy-desktop 现在根本不依赖主 crate，也不依赖 aproxy-ipc。
+       界面要用它时（W5）经注入的操作层调用；第三方若要链接，届时再决定搬不搬。C3 的代码早已在 aproxy-ipc 里（B0）。
+    2. 只剩一份「进程已死的实例记录」、没有期望状态记录的端口**不列出**（设计稿没说；它既不在运行也不会被恢复，
+       记录等后台清理删）。
+    3. `incompatible` 的 `reason`：实例回 `unsupported_version` 时原样带它的码与 `details.supported`；应答无法采信
+       （不是 v1 的形状、自报 pid 与对端不符）或 ping 被别的码拒绝时用 `instance_incompatible`，`details` 带 `port`
+       与英文的 `reason`。为此客户端的 `parse_reply` 先看 `v`：别的版本的应答里只认 `unsupported_version` 这一种。
+    4. 看护者记录读不懂时 `watchdog` 给 null、并把文件列进 `unreadable`（设计稿的兜底是 `state: unknown`，但读不懂
+       的记录给不出 pid、版本这些必填字段）。它不触发 `gc_paused`——与 `collect_garbage_in` 的口径一致，那里只有
+       读不懂的实例记录与期望状态记录让日志清理暂停。
+    5. `gc_paused` 是按同一条规则在清点时现算的，不是从清理那边读来的状态。
+  - `spec::parse_record` / `read_record` 多了「本版本读得懂的最高 schema」参数，实例记录与看护者记录的读取共用它
+    来区分「损坏」与「太新」；`daemon::read_instance_record` 是带原因的读法，`parse_instance_file` 仍是 Option。
+  - `tests/contract_v0_2.rs`（4 个测试）：对真实例走**原始**的控制通道（不经 aproxy 的客户端代码）核对每个 op 的
+    成功应答与十种拒绝、`condition_not_met`、`swap_prepared`、`stopping`；`base_url` 带 userinfo 时线上与盘上都已
+    打码；没有配置文件的实例 `config_path` 为 null；盘上的实例记录、期望状态记录、看护者记录与清点结果比对样本
+    （`assert_covers`：样本里的键不能少、类型不能变，多出来的不算错）；最后一个测试守着各模块里逐字钉形状的
+    单测清单（`PINNED_IN_MODULES`）不被删或改名。
+  - 四种 liveness 的区分：`tests/restart_integration.rs` 的 `enumeration_tells_the_four_kinds_of_instance_apart`
+    （真实例 + 本测试进程顶替的挂死记录 + 在端点上回 v2 `unsupported_version` 的冒充者 + 只剩期望状态记录的端口）。
+  - **没接线的**：`aproxy status` 还在用 `ops::list::enumerate`（`survey_instances`），不显示 incompatible、down、
+    看护者与读不懂的记录——留给 B9 的 status 改版与 `--json` 一起做，免得 status 的文档改两遍。所以别的版本启动的
+    实例在 `status` 里仍然看不见（只在清点结果的 `processes` 里），compatibility.md 那一节现在的说法仍然成立。
+  - 验收表 B6 行里「模拟新旧客户端与服务端互连，多出的字段被忽略」：服务端忽略请求里多出的顶层字段
+    （contract_v0_2 实测）、客户端忽略应答里多出的字段（`client_reads_v1_errors_and_unknown_states`）；与真的
+    旧版本二进制互连没有测（alpha.1/alpha.2 的协议本来就不互通，见 B6 第一部分）。
+  - 验证：Windows headless 全量 690 通过、0 失败；两个变体 clippy 与 Linux 交叉 clippy 零输出。Linux/macOS 上
+    新测试的运行结果看推送后的 CI。

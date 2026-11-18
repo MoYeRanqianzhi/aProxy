@@ -14,6 +14,9 @@ use super::*;
 /// 大请求体/大响应才进入磁盘路径。
 pub(crate) const RESIDENT_LIMIT: usize = 1024 * 1024;
 
+// 溢写之前攒下的那一段正好这么大；请求历史循环使用的大缓冲区按同一个大小准备
+const _: () = assert!(RESIDENT_LIMIT == crate::history::LARGE_BUFFER);
+
 /// 请求体缓冲：支持无限重试的字节重放源。
 ///
 /// - Memory：单份 Bytes，重试间零拷贝共享（小请求体常态路径）
@@ -77,16 +80,37 @@ pub(super) enum ReadBodyError {
 /// 之外，客户端在上传途中断开时 hyper 会直接 drop 整个 handler future（本函数
 /// 停在某个 await 上、不会走到任何返回分支），守卫的 Drop 照样删掉半截文件，
 /// 不留 `req-*.spooltmp` 等到下次启动才回收。
+///
+/// `history` 是请求历史里这个请求体的写者（不保留体时为 None）。留在内存里的请求体读完
+/// 之后整份交过去，与重试重放共用同一份内存；溢写磁盘的边读边交。
+///
+/// 一并返回请求体顶层的 `model`（不是 JSON 对象、没有这个键或不是字符串时为 None）。溢写
+/// 磁盘的请求体在溢写的那一刻、开头一段还在内存里时读：`model` 通常是头几个键之一，这样
+/// 读到了就不必为它再打开一次文件——在会扫描新文件的系统上，多开一次文件是毫秒级的开销。
+/// 开头一段里没有时才从文件读。
 pub(super) async fn read_request_body(
     body: axum::body::Body,
     limit: usize,
     spool_dir: Option<&Path>,
-) -> Result<RequestBody, ReadBodyError> {
+    mut history: Option<crate::history::BodyWriter>,
+) -> Result<(RequestBody, Option<String>), ReadBodyError> {
+    // 客户端声明了长度时按它预留（封顶到内存驻留阈值）：缓冲不必一次次翻倍搬家，读完时
+    // 容量正好等于长度——这份内存接着要与请求历史共用，多出来的容量会白白算在历史头上。
+    // 预留不超过 1 MiB，声明一个很大的长度却什么都不发的客户端占不到更多
+    let declared = axum::body::HttpBody::size_hint(&body).upper();
+    let reserve = declared.map_or(0, |len| len.min(RESIDENT_LIMIT as u64) as usize);
     let mut body = body.into_data_stream();
-    let mut mem: Vec<u8> = Vec::new();
+    let reserve = reserve.min(limit);
+    // 进历史的请求体向历史要缓冲：大请求体溢写之前的这一段，历史那边是循环使用的
+    let mut mem: Vec<u8> = match history.as_ref() {
+        Some(history) => history.buffer(reserve),
+        None => Vec::with_capacity(reserve),
+    };
     // 落盘状态：写句柄 + 删除责任守卫 + 已写字节数。各出错分支直接 return，
     // 守卫随之 drop 删除文件
     let mut disk: Option<(tokio::fs::File, SpoolPath, u64)> = None;
+    // 溢写磁盘的请求体：溢写时从内存里的开头一段读到的 `model`
+    let mut head_model: Option<String> = None;
     loop {
         let chunk = match body.next().await {
             Some(Ok(c)) => c,
@@ -107,6 +131,9 @@ pub(super) async fn read_request_body(
                     )));
                 }
                 *len += chunk.len() as u64;
+                if let Some(history) = history.as_mut() {
+                    history.feed_copy(&chunk);
+                }
             }
             None => {
                 if mem.len() + chunk.len() > RESIDENT_LIMIT {
@@ -125,7 +152,17 @@ pub(super) async fn read_request_body(
                             && file.write_all(&chunk).await.is_ok()
                         {
                             disk = Some((file, path, (mem.len() + chunk.len()) as u64));
-                            mem = Vec::new();
+                            head_model = model_in_slice(&mem);
+                            // 已经写进文件的这一段内存不再需要：整块交给请求历史，不拷贝。
+                            // 先用这一块的开头把它没用上的容量填满（这些字节本来也要拷进
+                            // 历史），交过去的缓冲就没有空着的容量算在历史头上
+                            let mut spilled = std::mem::take(&mut mem);
+                            if let Some(history) = history.as_mut() {
+                                let head = chunk.len().min(spilled.capacity() - spilled.len());
+                                spilled.extend_from_slice(&chunk[..head]);
+                                history.feed_buffer(spilled);
+                                history.feed_copy(&chunk[head..]);
+                            }
                             continue;
                         }
                     }
@@ -145,12 +182,30 @@ pub(super) async fn read_request_body(
             }
             drop(file);
             // 删除责任从守卫移交给 RequestBody（其 Drop 负责删文件）
-            RequestBody::Disk {
+            let body = RequestBody::Disk {
                 path: path.into_path(),
                 len,
-            }
+            };
+            let model = match (head_model, &body) {
+                (None, RequestBody::Disk { path, .. }) => model_in_file(path).await,
+                (model, _) => model,
+            };
+            (body, model)
         }
-        None => RequestBody::Memory(Bytes::from(mem)),
+        None => {
+            // 请求历史与重试重放共用这一份内存。进历史的要把没用上的容量还回去：没声明长度
+            // 的请求体，缓冲是翻倍长出来的，不还的话历史实际占着的内存会比记在预算上的多出
+            // 近一倍。声明了长度的容量本来就正好，这里什么都不做
+            if history.is_some() {
+                mem.shrink_to_fit();
+            }
+            let bytes = Bytes::from(mem);
+            if let Some(history) = history.as_mut() {
+                history.feed(&bytes);
+            }
+            let model = model_in_slice(&bytes);
+            (RequestBody::Memory(bytes), model)
+        }
     })
 }
 

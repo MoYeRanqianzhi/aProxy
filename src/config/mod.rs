@@ -368,6 +368,18 @@ pub struct Config {
     pub spool_dir_override: Option<PathBuf>,
 }
 
+/// 转换器 args 里「后一个参数是密钥」的旗标（比较时大小写不敏感）。format 程序常见的传 key
+/// 写法：`--api-key sk-...` 或 `--api-key=sk-...`。
+pub const SECRET_ARG_FLAGS: &[&str] = &[
+    "--api-key",
+    "--api_key",
+    "--apikey",
+    "--key",
+    "--token",
+    "--secret",
+    "--password",
+];
+
 /// `history.body_budget_mb` 的内置默认值（MiB）。
 pub const DEFAULT_HISTORY_BODY_BUDGET_MB: u64 = 64;
 
@@ -766,6 +778,56 @@ impl Config {
     /// settings 注入，`None` 在这些路径上是常态。
     pub fn forward_only_enabled(&self) -> bool {
         self.forward_only.unwrap_or(DEFAULT_FORWARD_ONLY)
+    }
+
+    /// 这份配置里 aproxy 自己知道的密钥原文：请求历史入库时把它们从体与头里换掉。
+    ///
+    /// 收的是 `api_key`、代理口令（单独配的与写在代理 URL 里的）、两张头表里密钥头的值
+    /// （`Bearer xxx` 这样带方案的，连同后面的凭据单独再收一份）、format 的 `env` 值与 args 里
+    /// 密钥旗标之后的值。过短的由 [`aproxy_ipc::redact::Secrets`] 自己丢掉。
+    pub fn known_secrets(&self) -> aproxy_ipc::redact::Secrets {
+        let mut known: Vec<String> = Vec::new();
+        known.extend(self.api_key.clone());
+        known.extend(self.proxy_password.clone());
+        if let Some(password) = self
+            .proxy
+            .as_deref()
+            .and_then(|proxy| url::Url::parse(proxy).ok())
+            .and_then(|proxy| proxy.password().map(str::to_string))
+        {
+            known.push(password);
+        }
+        for (name, value) in self.extra_headers.iter().chain(&self.override_headers) {
+            if aproxy_ipc::redact::is_secret_header(name) {
+                known.push(value.clone());
+                if let Some((_, credential)) = value.trim().rsplit_once(' ') {
+                    known.push(credential.to_string());
+                }
+            }
+        }
+        let is_secret_flag =
+            |arg: &str| SECRET_ARG_FLAGS.iter().any(|f| f.eq_ignore_ascii_case(arg));
+        let formats = [
+            &self.request_transform,
+            &self.response_transform,
+            &self.heartbeat_transform,
+        ];
+        for format in formats.into_iter().flatten() {
+            known.extend(format.env.values().cloned());
+            let mut next_is_secret = false;
+            for arg in &format.args {
+                if std::mem::take(&mut next_is_secret) {
+                    known.push(arg.clone());
+                } else if is_secret_flag(arg) {
+                    next_is_secret = true;
+                } else if let Some((flag, value)) = arg.split_once('=')
+                    && is_secret_flag(flag)
+                {
+                    known.push(value.to_string());
+                }
+            }
+        }
+        aproxy_ipc::redact::Secrets::new(known)
     }
 
     /// 编译重试规则的 `path` 模式：对「`路径?查询串` 整体」匹配，自动锚定两端

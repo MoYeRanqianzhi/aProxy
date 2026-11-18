@@ -87,3 +87,10 @@ pub(super) fn apply_header_overrides(headers: &mut HeaderMap, config: &Config) {
         headers.insert(name, val);
     }
 }
+
+/// 体的 content-encoding（`value` 是那个头的值）：没有编码（没有这个头、值为空或
+/// `identity`）时为 None。请求历史据此决定入库之前要不要解码。
+pub(super) fn body_encoding(value: Option<&[u8]>) -> Option<&str> {
+    let value = std::str::from_utf8(value?).ok()?.trim();
+    (!value.is_empty() && !value.eq_ignore_ascii_case("identity")).then_some(value)
+}

@@ -81,6 +81,7 @@ use crate::{
 
 mod attempts;
 mod body;
+mod delivery;
 mod errors;
 mod forward_only;
 mod handler;
@@ -100,6 +101,7 @@ mod upstream;
 // 兄弟模块与 tests 经各自的 `use super::*;` 互相看到对方的条目（拆分前它们同在一个文件里）
 use attempts::*;
 use body::*;
+use delivery::*;
 use errors::*;
 use forward_only::*;
 use headers::*;

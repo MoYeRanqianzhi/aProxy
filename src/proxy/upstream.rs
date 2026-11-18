@@ -54,6 +54,10 @@ pub(super) fn spool_limit_bytes(config: &Config) -> usize {
 /// `on_head`：拿到上游响应头（status + 已滤 hop-by-hop 的头）时立即通知调用方，
 /// 早于缓冲响应体——保活通道据此在首轮把上游真实头先行提交给客户端。接收方已
 /// 不关心（已提交、已结束）时发送失败，忽略即可。
+///
+/// `rec` 与 `attempt`：请求历史里这个请求的记录，以及这是第几次尝试。响应头一到就记下，
+/// 响应体边收边交一份——中途断开的那次尝试，已经收到的部分也留得下来。
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn forward_once(
     state: &AppState,
     method: &http::Method,
@@ -62,6 +66,8 @@ pub(super) async fn forward_once(
     req_body: &RequestBody,
     max_spool_bytes: usize,
     on_head: Option<tokio::sync::oneshot::Sender<(StatusCode, HeaderMap)>>,
+    rec: &crate::history::Recorder,
+    attempt: u32,
 ) -> ForwardResult {
     let spool_dir = state.spool_dir.as_deref();
     let reqwest_method =
@@ -118,6 +124,19 @@ pub(super) async fn forward_once(
     if let Some(tx) = on_head {
         let _ = tx.send((status, resp_headers.clone()));
     }
+    // 请求历史里记原始的响应头（逐跳头也在内：这是上游实际回的）。写者随本函数返回而结束
+    let mut history = rec.response_head(
+        attempt,
+        status.as_u16(),
+        raw_headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        body_encoding(
+            raw_headers
+                .get(reqwest::header::CONTENT_ENCODING)
+                .map(|v| v.as_bytes()),
+        ),
+    );
 
     // 关键：完整 spool（分块累积）——任何流式中断都会在此处以 Err 形式暴露，从而触发重试；
     // 超出上限按 TooLarge 终态处理；磁盘写入失败按 SpoolFailed 处理
@@ -130,6 +149,9 @@ pub(super) async fn forward_once(
                 // 各提前返回路径上 spool 随之 drop，半截磁盘文件由 SpoolPath 删除
                 if spool.len() + chunk.len() as u64 > max_spool_bytes as u64 {
                     return ForwardResult::TooLarge;
+                }
+                if let Some(history) = history.as_mut() {
+                    history.feed_copy(&chunk);
                 }
                 scanner.feed(&chunk);
                 spool_chunk(&mut spool, &chunk, spool_dir).await;

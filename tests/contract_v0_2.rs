@@ -34,6 +34,14 @@ const PINNED_IN_MODULES: &[(&str, &str)] = &[
     ),
     // 每种拒绝的应答行
     ("src/daemon.rs", "rejections_are_pinned"),
+    // 读请求历史的 op：请求行与拒绝
+    (
+        "src/daemon.rs",
+        "read_request_lines_are_pinned_and_round_trip_through_the_server_parser",
+    ),
+    ("src/daemon.rs", "read_rejections_are_pinned"),
+    // 请求记录
+    ("src/history.rs", "record_shape_is_pinned"),
     // 成功应答与状态快照
     ("src/daemon.rs", "snapshot_shape_is_pinned"),
     // 客户端怎样读别的版本的应答
@@ -106,7 +114,8 @@ fn snapshot_sample() -> Value {
             "delivery": "retry",
             "disk_cache": true,
             "keepalive": {"trigger": "any", "interval_secs": 15},
-            "retry_rules": 1
+            "retry_rules": 1,
+            "history": {"body_budget_mb": 64}
         },
         "activity": {
             "last_request_at": 1_760_190_000_123_u64,
@@ -131,20 +140,23 @@ fn runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
+/// 控制端点上的一条连接（两个平台的传输不同，这里只当它是能读能写的字节流）。
+trait Duplex: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Duplex for T {}
+
 /// 向控制端点原样写出 `request`（调用方自己带换行），读回一行应答。不经 aproxy 的客户端
 /// 代码：别的程序连上来看到的就是这些字节。
 async fn exchange(endpoint: &str, request: &str) -> String {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    async fn over<S>(stream: S, request: &str) -> String
-    where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    {
-        let (reader, mut writer) = tokio::io::split(stream);
-        writer.write_all(request.as_bytes()).await.unwrap();
-        let mut line = String::new();
-        BufReader::new(reader).read_line(&mut line).await.unwrap();
-        line
-    }
+    let (reader, mut writer) = tokio::io::split(connect(endpoint).await);
+    writer.write_all(request.as_bytes()).await.unwrap();
+    let mut line = String::new();
+    BufReader::new(reader).read_line(&mut line).await.unwrap();
+    line
+}
+
+/// 连上控制端点。
+async fn connect(endpoint: &str) -> Box<dyn Duplex> {
     #[cfg(windows)]
     {
         use tokio::net::windows::named_pipe::ClientOptions;
@@ -159,14 +171,14 @@ async fn exchange(endpoint: &str, request: &str) -> String {
                 Err(e) => panic!("连不上控制端点 {endpoint}：{e}"),
             }
         };
-        over(client, request).await
+        Box::new(client)
     }
     #[cfg(unix)]
     {
         let client = tokio::net::UnixStream::connect(endpoint)
             .await
             .unwrap_or_else(|e| panic!("连不上控制端点 {endpoint}：{e}"));
-        over(client, request).await
+        Box::new(client)
     }
 }
 
@@ -186,6 +198,41 @@ impl Instance<'_> {
         assert!(line.ends_with('\n'), "应答应以换行结束：{line:?}");
         assert_eq!(line.matches('\n').count(), 1, "应答应是一行：{line:?}");
         serde_json::from_str(&line).unwrap_or_else(|e| panic!("应答不是 JSON（{e}）：{line}"))
+    }
+
+    /// 这个实例的控制端点。
+    fn endpoint(&self) -> String {
+        aproxy::daemon::endpoint_for_in(&self.home.path().join("run"), &self.port.to_string())
+    }
+
+    /// 被拒的请求：应答除 `message` 外必须逐字等于 `expected`（`{"code","details"}`），码与
+    /// `details` 的键都登记在码表里。
+    fn rejected(&self, request: &str, expected: &Value) {
+        let mut reply = self.ask(request);
+        assert!(
+            reply["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.is_ascii() && !m.is_empty()),
+            "message 是一句英文：{reply}"
+        );
+        reply["error"]
+            .as_object_mut()
+            .unwrap()
+            .shift_remove("message");
+        assert_eq!(
+            reply,
+            json!({"v": 1, "ok": false, "error": expected}),
+            "{request}"
+        );
+        let code = aproxy_ipc::code::lookup(expected["code"].as_str().unwrap())
+            .unwrap_or_else(|| panic!("码表里没有 {}", expected["code"]));
+        for key in expected["details"].as_object().unwrap().keys() {
+            assert!(
+                code.details.iter().any(|detail| detail.key == key),
+                "{} 的 details 里有码表没登记的键 {key}",
+                code.name
+            );
+        }
     }
 
     /// 成功应答里的快照；应答不成功就失败。
@@ -256,6 +303,464 @@ fn record_on_disk(home: &Path, name: &str) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name} 不是 JSON（{e}）：{text}"))
 }
 
+/// 请求记录（RequestRecord）的样本：`requests` 的元素、`request` 结果里的 `record`、
+/// `request` 事件的 `data`。一个重试过一次、还在进行的请求。
+fn record_sample() -> Value {
+    json!({
+        "request_id": "19ac3f2e8b5d1a2b-42",
+        "request_seq": 42,
+        "started_at": 1_760_190_000_123_u64,
+        "method": "POST",
+        "path": "/v1/messages?beta=***",
+        "stream": true,
+        "delivery": "retry",
+        "upgraded": false,
+        "outcome": "in_flight",
+        "phase": "attempting",
+        "attempts": 2,
+        "tries_omitted": 0,
+        "tries": [{
+            "attempt": 1,
+            "started_at": 1_760_190_000_200_u64,
+            "response_bytes": 96,
+            "reports": []
+        }],
+        "keepalive": true,
+        "heartbeats": 3,
+        "request_bytes": 20480,
+        "response_bytes": 0,
+        "reports": []
+    })
+}
+
+/// 可以为 null 的键：样本里给不出一个固定的类型，只要求键在。
+const NULLABLE_RECORD_KEYS: &[&str] = &[
+    "ended_at",
+    "model",
+    "user_agent",
+    "code",
+    "client_status",
+    "next_attempt_at",
+];
+const NULLABLE_TRY_KEYS: &[&str] = &["duration_ms", "upstream_status", "code", "decision"];
+
+/// 断言 `record` 是一条请求记录：覆盖样本，可空的键一个不少。
+fn assert_is_record(record: &Value, at: &str) {
+    assert_covers(record, &record_sample(), at);
+    for key in NULLABLE_RECORD_KEYS {
+        assert!(record.get(key).is_some(), "{at}.{key} 不见了");
+    }
+    for (index, attempt) in record["tries"].as_array().unwrap().iter().enumerate() {
+        for key in NULLABLE_TRY_KEYS {
+            assert!(
+                attempt.get(key).is_some(),
+                "{at}.tries[{index}].{key} 不见了"
+            );
+        }
+    }
+}
+
+/// 一个只会回固定响应的上游：每条连接读完一个请求、回一个 200，然后关闭。返回它的地址。
+/// 线程随测试程序结束。
+fn fixed_upstream(body: &'static str) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            // 读到请求头结束，再按 content-length 读完请求体
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 4096];
+            let head_end = loop {
+                if let Some(at) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break at + 4;
+                }
+                match stream.read(&mut buf) {
+                    Ok(n) if n > 0 => seen.extend_from_slice(&buf[..n]),
+                    _ => break seen.len(),
+                }
+            };
+            let head = String::from_utf8_lossy(&seen[..head_end]).to_ascii_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            while seen.len() < head_end + length {
+                match stream.read(&mut buf) {
+                    Ok(n) if n > 0 => seen.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    url
+}
+
+/// 经代理发一个 POST，读完整个响应，返回响应的全文（状态行、头与体）。
+fn post_through(port: u16, path: &str, body: &str) -> String {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\ncontent-type: application/json\r\nuser-agent: contract-test/1.0\r\nx-api-key: client-side-0123456789abcdef\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
+
+/// 请求历史与事件，走真实例的控制端点：`requests`、`request`、`body` 的结果，它们的拒绝，
+/// `subscribe` 的第一行与之后的事件。经控制通道出去的字节里没有密钥原文。
+#[test]
+fn request_history_is_read_over_the_control_channel() {
+    use base64::Engine as _;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    const KEY: &str = "sk-contract-0123456789abcdefghij";
+    const UPSTREAM_BODY: &str = r#"{"id":"msg_1","content":"hello"}"#;
+
+    let home = TestHome::new();
+    let port = free_port();
+    let upstream = fixed_upstream(UPSTREAM_BODY);
+    let cfg = home.path().join("history.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "base_url = \"{upstream}\"\nlisten_addr = \"127.0.0.1:{port}\"\napi_key = \"{KEY}\"\n"
+        ),
+    )
+    .unwrap();
+    let instance = start(&home, port, &["start", "--config", cfg.to_str().unwrap()]);
+    let snapshot = instance.snapshot("{\"v\":1,\"op\":\"ping\"}\n");
+    assert_eq!(snapshot["behavior"]["history"]["body_budget_mb"], 64);
+
+    // 还没有请求
+    let empty = instance.ask("{\"v\":1,\"op\":\"requests\"}\n");
+    assert_eq!(
+        empty,
+        json!({"v": 1, "ok": true, "result": {"requests": [], "more": false}})
+    );
+
+    // ---- subscribe：第一行是一元应答，带快照与在途的记录 ----
+    let (subscriber, mut subscriber_writer) =
+        tokio::io::split(instance.rt.block_on(connect(&instance.endpoint())));
+    let mut events = BufReader::new(subscriber);
+    let next_line = |events: &mut BufReader<_>| -> Value {
+        let mut line = String::new();
+        instance
+            .rt
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(20), events.read_line(&mut line)).await
+            })
+            .expect("20 秒内应有一行")
+            .unwrap();
+        assert!(line.ends_with('\n'), "连接提前关闭：{line:?}");
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("不是 JSON（{e}）：{line}"))
+    };
+    instance
+        .rt
+        .block_on(subscriber_writer.write_all(b"{\"v\":1,\"op\":\"subscribe\"}\n"))
+        .unwrap();
+    let first = next_line(&mut events);
+    assert_eq!((&first["v"], &first["ok"]), (&json!(1), &json!(true)));
+    assert_covers(&first["result"]["snapshot"], &snapshot_sample(), "snapshot");
+    assert_eq!(first["result"]["requests"], json!([]));
+
+    // ---- 一个请求经过代理 ----
+    let sent = format!(r#"{{"model":"claude-contract","stream":false,"note":"{KEY}"}}"#);
+    let response = post_through(port, "/v1/messages?beta=tools", &sent);
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with(UPSTREAM_BODY), "{response}");
+
+    // 订阅者先后收到开始与结束；之间与之后可能夹着 state 事件（计数变了）
+    let mut request_events = Vec::new();
+    let mut last_seq = 0;
+    while request_events.len() < 2 {
+        let event = next_line(&mut events);
+        assert_covers(
+            &event,
+            &json!({"v": 1, "event": "request", "seq": 42, "at": 1_760_190_000_123_u64}),
+            "event",
+        );
+        let seq = event["seq"].as_u64().unwrap();
+        assert_eq!(seq, last_seq + 1, "seq 在一条连接上从 1 起递增");
+        last_seq = seq;
+        match event["event"].as_str().unwrap() {
+            "request" => request_events.push(event["data"].clone()),
+            "state" => assert_covers(&event["data"], &snapshot_sample(), "state.data"),
+            "heartbeat" => assert_eq!(event["data"], json!({})),
+            other => panic!("意料之外的事件 {other}：{event}"),
+        }
+    }
+    for (index, record) in request_events.iter().enumerate() {
+        assert_is_record(record, &format!("events[{index}]"));
+    }
+    assert_eq!(request_events[0]["outcome"], "in_flight");
+    assert_eq!(request_events[1]["outcome"], "ok");
+    assert_eq!(request_events[1]["phase"], "done");
+
+    // ---- requests ----
+    let listed = instance.ask("{\"v\":1,\"op\":\"requests\",\"args\":{\"limit\":10}}\n");
+    assert_eq!(listed["ok"], true, "{listed}");
+    assert_eq!(listed["result"]["more"], false);
+    let records = listed["result"]["requests"].as_array().unwrap();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_is_record(record, "requests[0]");
+    assert_eq!(record, &request_events[1], "事件里的就是整条记录");
+    let id = record["request_id"].as_str().unwrap();
+    // 请求标识是「实例标识-序号」；实例标识是 16 位十六进制，与快照里的是同一个
+    let instance_id = snapshot["instance"]["instance_id"].as_str().unwrap();
+    assert!(
+        instance_id.len() == 16 && instance_id.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{instance_id}"
+    );
+    assert_eq!(
+        id,
+        format!(
+            "{}-1",
+            snapshot["instance"]["instance_id"].as_str().unwrap()
+        )
+    );
+    assert_eq!(record["path"], "/v1/messages?beta=***");
+    assert_eq!(record["model"], "claude-contract");
+    assert_eq!(record["user_agent"], "contract-test/1.0");
+    assert_eq!(record["client_status"], 200);
+    assert_eq!(record["request_bytes"], sent.len());
+    assert_eq!(record["response_bytes"], UPSTREAM_BODY.len());
+
+    // ---- request ----
+    let detail = instance.ask(&format!(
+        "{{\"v\":1,\"op\":\"request\",\"args\":{{\"request_id\":\"{id}\"}}}}\n"
+    ));
+    assert_eq!(detail["ok"], true, "{detail}");
+    let detail = &detail["result"];
+    let redacted_len = sent.len() - KEY.len() + "<secret>".len();
+    assert_covers(
+        detail,
+        &json!({
+            "request": {
+                "headers": [{"name": "x-api-key"}],
+                "body": {"bytes": 20480, "state": "retained"}
+            },
+            "tries": [{
+                "attempt": 1,
+                "sent": {
+                    "method": "POST",
+                    "url": "https://relay.example.com/v1/chat/completions",
+                    "headers": [{"name": "authorization"}],
+                    "body": {"bytes": 18200, "state": "retained"}
+                },
+                "response": {
+                    "upstream_status": 529,
+                    "headers": [{"name": "content-type"}],
+                    "body": {"bytes": 96, "state": "retained"}
+                }
+            }]
+        }),
+        "detail",
+    );
+    assert_eq!(&detail["record"], record);
+    assert_eq!(
+        detail["request"]["body"],
+        json!({"bytes": redacted_len, "state": "retained"})
+    );
+    assert_eq!(
+        detail["tries"][0]["sent"]["body"],
+        json!({"bytes": redacted_len, "state": "same_as_previous"})
+    );
+    assert_eq!(detail["tries"][0]["error"], Value::Null);
+    let header_value = |headers: &Value, name: &str| {
+        headers
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["name"] == name)
+            .map(|h| h["value"].clone())
+    };
+    // 密钥头的值是占位对象：`{"secret":true}`，够长时带 `hint`
+    assert_eq!(
+        header_value(&detail["request"]["headers"], "x-api-key"),
+        Some(json!({"secret": true, "hint": "clie…cdef"}))
+    );
+    assert_eq!(
+        header_value(&detail["tries"][0]["sent"]["headers"], "x-api-key"),
+        Some(json!({"secret": true, "hint": "sk-c…ghij"}))
+    );
+    assert_eq!(
+        header_value(&detail["request"]["headers"], "content-type"),
+        Some(json!("application/json"))
+    );
+
+    // ---- body：分两块读回请求体，再读响应体 ----
+    let read = |args: &str| -> Value {
+        let reply = instance.ask(&format!(
+            "{{\"v\":1,\"op\":\"body\",\"args\":{{\"request_id\":\"{id}\",{args}}}}}\n"
+        ));
+        assert_eq!(reply["ok"], true, "{reply}");
+        reply["result"].clone()
+    };
+    let decode = |chunk: &Value| {
+        base64::engine::general_purpose::STANDARD
+            .decode(chunk["data_b64"].as_str().unwrap())
+            .unwrap()
+    };
+    let head = read("\"part\":\"request\",\"limit\":16");
+    assert_eq!(
+        (
+            &head["total_bytes"],
+            &head["offset"],
+            &head["more"],
+            &head["complete"]
+        ),
+        (&json!(redacted_len), &json!(0), &json!(true), &json!(true))
+    );
+    let tail = read("\"part\":\"request\",\"offset\":16");
+    assert_eq!(tail["offset"], 16);
+    assert_eq!(tail["more"], false);
+    let mut stored = decode(&head);
+    assert_eq!(stored.len(), 16);
+    stored.extend(decode(&tail));
+    assert_eq!(
+        String::from_utf8(stored).unwrap(),
+        sent.replace(KEY, "<secret>")
+    );
+    let at_end = read(&format!("\"part\":\"request\",\"offset\":{redacted_len}"));
+    assert_eq!(
+        at_end,
+        json!({"total_bytes": redacted_len, "offset": redacted_len, "data_b64": "", "more": false, "complete": true})
+    );
+    let upstream_reply = read("\"part\":\"response\",\"attempt\":1");
+    assert_eq!(decode(&upstream_reply), UPSTREAM_BODY.as_bytes());
+    assert_eq!(
+        decode(&read("\"part\":\"sent\",\"attempt\":1")).len(),
+        redacted_len
+    );
+
+    // ---- 拒绝：除 message 外逐字 ----
+    let body_request = |args: &str| {
+        format!("{{\"v\":1,\"op\":\"body\",\"args\":{{\"request_id\":\"{id}\",{args}}}}}\n")
+    };
+    let rejections = [
+        (
+            "{\"v\":1,\"op\":\"request\",\"args\":{\"request_id\":\"0000000000000000-1\"}}\n"
+                .to_string(),
+            json!({"code": "not_found", "details": {"request_id": "0000000000000000-1", "reason": "unknown_request"}}),
+        ),
+        (
+            body_request("\"part\":\"response\",\"attempt\":7"),
+            json!({"code": "not_found", "details": {"request_id": id, "reason": "no_such_part"}}),
+        ),
+        (
+            body_request(&format!(
+                "\"part\":\"request\",\"offset\":{}",
+                redacted_len + 1
+            )),
+            json!({"code": "bad_request", "details": {"reason": "invalid_arg", "arg": "offset"}}),
+        ),
+        (
+            body_request("\"part\":\"request\",\"limit\":0"),
+            json!({"code": "bad_request", "details": {"reason": "invalid_arg", "arg": "limit"}}),
+        ),
+        (
+            body_request("\"part\":\"request\",\"limit\":1048577"),
+            json!({"code": "bad_request", "details": {"reason": "invalid_arg", "arg": "limit"}}),
+        ),
+        (
+            body_request("\"part\":\"sent\""),
+            json!({"code": "bad_request", "details": {"reason": "missing_arg", "arg": "attempt"}}),
+        ),
+        (
+            "{\"v\":1,\"op\":\"request\"}\n".to_string(),
+            json!({"code": "bad_request", "details": {"reason": "missing_arg", "arg": "request_id"}}),
+        ),
+        (
+            "{\"v\":1,\"op\":\"requests\",\"args\":{\"limit\":201}}\n".to_string(),
+            json!({"code": "bad_request", "details": {"reason": "invalid_arg", "arg": "limit"}}),
+        ),
+        (
+            "{\"v\":1,\"op\":\"subscribe\",\"args\":{\"filter\":\"x\"}}\n".to_string(),
+            json!({"code": "unsupported_arg", "details": {"args": ["filter"]}}),
+        ),
+    ];
+    for (request, expected) in &rejections {
+        instance.rejected(request, expected);
+    }
+
+    // ---- 流式连接最多 8 条，第 9 条回 busy ----
+    let mut held = Vec::new();
+    for _ in 0..7 {
+        let (extra, mut extra_writer) =
+            tokio::io::split(instance.rt.block_on(connect(&instance.endpoint())));
+        instance
+            .rt
+            .block_on(extra_writer.write_all(b"{\"v\":1,\"op\":\"subscribe\"}\n"))
+            .unwrap();
+        let mut extra = BufReader::new(extra);
+        assert_eq!(next_line(&mut extra)["ok"], true);
+        // 读写两半都留着：丢掉任何一半，服务端都可能当成客户端走了
+        held.push((extra, extra_writer));
+    }
+    instance.rejected(
+        "{\"v\":1,\"op\":\"subscribe\"}\n",
+        &json!({"code": "busy", "details": {"limit": 8}}),
+    );
+    drop(held);
+
+    // ---- 密钥不出线：到此为止经控制通道读到的每一行里都没有密钥原文 ----
+    for value in [&listed, detail, &head, &tail, &first] {
+        let wire = value.to_string();
+        assert!(
+            !wire.contains(KEY) && !wire.contains("client-side-0123456789abcdef"),
+            "{wire}"
+        );
+    }
+
+    // ---- 实例退出前告诉订阅者：closing，然后关连接 ----
+    let stopping = instance.snapshot("{\"v\":1,\"op\":\"shutdown\"}\n");
+    assert_eq!(stopping["state"], "stopping");
+    let mut saw_stopping = false;
+    loop {
+        let event = next_line(&mut events);
+        match event["event"].as_str().unwrap() {
+            "closing" => {
+                assert_eq!(event["data"], json!({"reason": "shutdown"}));
+                break;
+            }
+            "state" => saw_stopping |= event["data"]["state"] == "stopping",
+            "heartbeat" | "request" => {}
+            other => panic!("意料之外的事件 {other}：{event}"),
+        }
+    }
+    assert!(
+        saw_stopping,
+        "状态变成 stopping 时订阅者应收到一个 state 事件"
+    );
+    let mut rest = String::new();
+    let closed = instance.rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), events.read_line(&mut rest)).await
+    });
+    assert!(
+        matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+        "closing 之后服务端应关闭连接：{closed:?} {rest:?}"
+    );
+    assert!(
+        wait_for(Duration::from_secs(15), || instance.gone()),
+        "收到 shutdown 的实例应退出"
+    );
+}
+
 /// 控制协议 v1：每个 op 的请求与成功应答、每种拒绝，走真实例的控制端点。
 #[test]
 fn control_channel_speaks_v1_as_sampled() {
@@ -294,7 +799,15 @@ fn control_channel_speaks_v1_as_sampled() {
         );
     }
     // 调用方靠这两张表决定用不用某个 op、带不带某个参数：已有的名字不能少
-    for op in ["ping", "shutdown", "prepare_swap"] {
+    for op in [
+        "ping",
+        "shutdown",
+        "prepare_swap",
+        "requests",
+        "request",
+        "body",
+        "subscribe",
+    ] {
         assert!(
             snapshot["ops"].as_array().unwrap().contains(&json!(op)),
             "{op}"
@@ -383,32 +896,7 @@ fn control_channel_speaks_v1_as_sampled() {
         ),
     ];
     for (request, expected) in &rejections {
-        let mut reply = instance.ask(request);
-        assert!(
-            reply["error"]["message"]
-                .as_str()
-                .is_some_and(|m| m.is_ascii() && !m.is_empty()),
-            "message 是一句英文：{reply}"
-        );
-        reply["error"]
-            .as_object_mut()
-            .unwrap()
-            .shift_remove("message");
-        assert_eq!(
-            reply,
-            json!({"v": 1, "ok": false, "error": expected}),
-            "{request}"
-        );
-        // 码与 details 的键都登记在码表里
-        let code = aproxy_ipc::code::lookup(expected["code"].as_str().unwrap())
-            .unwrap_or_else(|| panic!("码表里没有 {}", expected["code"]));
-        for key in expected["details"].as_object().unwrap().keys() {
-            assert!(
-                code.details.iter().any(|detail| detail.key == key),
-                "{} 的 details 里有码表没登记的键 {key}",
-                code.name
-            );
-        }
+        instance.rejected(request, expected);
     }
     // 被拒的请求没有任何效果：实例照常服务，期望状态记录还在
     assert_eq!(

@@ -90,6 +90,145 @@ pub(super) fn json_requests_stream<'de, R: serde_json::de::Read<'de>>(
     ) && de.end().is_ok()
 }
 
+/// serde 访问器：读一个值，是字符串就取它，别的一概跳过。
+struct TextOrSkip;
+
+impl<'de> serde::de::DeserializeSeed<'de> for TextOrSkip {
+    type Value = Option<String>;
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Option<String>, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for TextOrSkip {
+    type Value = Option<String>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("任意 JSON 值")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Option<String>, E> {
+        Ok(Some(v.to_string()))
+    }
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Option<String>, E> {
+        Ok(None)
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Option<String>, E> {
+        Ok(None)
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Option<String>, E> {
+        Ok(None)
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Option<String>, E> {
+        Ok(None)
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Option<String>, E> {
+        Ok(None)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> Result<Option<String>, A::Error> {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> Result<Option<String>, A::Error> {
+        use serde::de::IgnoredAny;
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+}
+
+/// serde 访问器：从 JSON 顶层对象里读 `model`（字符串）与 `stream`（字面量 `true` 才算真），
+/// 结果写进借来的两个槽。要的都读到了就以一个错误提前结束，不再往后解析——`model` 通常是
+/// 第一个键，几十 MB 的请求体也只看开头几十个字节。所以它不保证后面的内容是合法的 JSON，
+/// 重复的键以第一次出现为准。
+struct ShapeProbe<'a> {
+    model: &'a mut Option<String>,
+    stream: &'a mut Option<bool>,
+    /// 还要读 `stream`；否则读到 `model` 就结束
+    want_stream: bool,
+}
+
+impl<'de> serde::de::Visitor<'de> for ShapeProbe<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("一个 JSON 对象")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        use serde::de::{Error as _, IgnoredAny};
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "model" if self.model.is_none() => *self.model = map.next_value_seed(TextOrSkip)?,
+                "stream" if self.want_stream && self.stream.is_none() => {
+                    *self.stream = Some(map.next_value_seed(StreamFlagProbe { top_level: false })?);
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            if self.model.is_some() && (!self.want_stream || self.stream.is_some()) {
+                return Err(A::Error::custom("done"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 从请求体（或它开头的一段）里读顶层的 `model` 与 `stream`。读不到的那一项为 None：不是
+/// JSON 对象、没有这个键、`model` 不是字符串，或者内容在读到它之前就断了。
+pub(super) fn probe_shape<'de, R: serde_json::de::Read<'de>>(
+    mut de: serde_json::Deserializer<R>,
+    want_stream: bool,
+) -> (Option<String>, Option<bool>) {
+    use serde::Deserializer as _;
+    let (mut model, mut stream) = (None, None);
+    // 提前结束与内容不合法都表现为 Err，两种情形下已经读到的都算数
+    let _ = de.deserialize_any(ShapeProbe {
+        model: &mut model,
+        stream: &mut stream,
+        want_stream,
+    });
+    (model, stream)
+}
+
+/// 一段在内存里的请求体（整个体，或它开头的一段）顶层的 `model`（见 [`probe_shape`]）。
+pub(super) fn model_in_slice(bytes: &[u8]) -> Option<String> {
+    probe_shape(serde_json::Deserializer::from_slice(bytes), false).0
+}
+
+/// 落盘的请求体顶层的 `model`（见 [`probe_shape`]）：在阻塞线程池里从文件读。
+pub(super) async fn model_in_file(path: &Path) -> Option<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&path).ok()?;
+        probe_shape(
+            serde_json::Deserializer::from_reader(std::io::BufReader::with_capacity(
+                64 * 1024,
+                file,
+            )),
+            false,
+        )
+        .0
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// 请求的 Accept 里有没有 `text/event-stream`。
+pub(super) fn accepts_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.to_ascii_lowercase().contains("text/event-stream"))
+}
+
 /// 客户端原始请求体是否为顶层 `"stream": true` 的 JSON 对象。内存请求体
 /// （≤ 1 MiB）就地扫描；溢写磁盘的大请求体在阻塞线程池里从文件流式读——
 /// 几十 MB 的同步解析不能占住 async worker 线程。
@@ -122,12 +261,7 @@ pub(super) async fn keepalive_triggered(
     body: &RequestBody,
 ) -> bool {
     use crate::config::KeepaliveTrigger;
-    let accept_sse = || {
-        headers
-            .get(http::header::ACCEPT)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|s| s.to_ascii_lowercase().contains("text/event-stream"))
-    };
+    let accept_sse = || accepts_event_stream(headers);
     match trigger {
         KeepaliveTrigger::Accept => accept_sse(),
         KeepaliveTrigger::BodyStream => request_body_wants_stream(body).await,

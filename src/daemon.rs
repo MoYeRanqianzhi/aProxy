@@ -210,15 +210,6 @@ pub fn read_instance_record(
     crate::spec::read_record::<InstanceFile>(path, INSTANCE_SCHEMA).map(|file| file.record)
 }
 
-/// 新的一次运行的标识：启动时刻的纳秒数（十六进制）接 pid 的低 16 位，与随机日志名同源。
-pub fn new_instance_id() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{nanos:x}{:04x}", std::process::id() & 0xffff)
-}
-
 /// IPC 状态快照：v1 每个成功应答的 `result`，所有 op 都回它。
 ///
 /// 应答只增字段：以后追加的字段在这里一律带 `#[serde(default)]`，读不到就是缺省值；
@@ -413,8 +404,17 @@ pub enum IpcOp {
 }
 
 impl IpcOp {
-    /// 全部 op 的名字（快照里的 `ops`）
-    const NAMES: [&'static str; 3] = ["ping", "shutdown", "prepare_swap"];
+    /// 实例支持的全部 op 的名字（快照里的 `ops`）：这里的三个控制 op，加上读请求历史的
+    /// 四个（见 [`ReadOp`]）
+    const NAMES: [&'static str; 7] = [
+        "ping",
+        "shutdown",
+        "prepare_swap",
+        "requests",
+        "request",
+        "body",
+        "subscribe",
+    ];
 
     /// 本版本认得的 op 参数（快照里的 `features`）
     const FEATURES: [&'static str; 3] = [
@@ -458,15 +458,7 @@ impl IpcOp {
             "prepare_swap" => &["ttl_secs"],
             _ => return Err(Rejection::UnknownOp(name.to_string())),
         };
-        let unknown: Vec<String> = args
-            .into_iter()
-            .flat_map(|args| args.keys())
-            .filter(|key| !known.contains(&key.as_str()))
-            .cloned()
-            .collect();
-        if !unknown.is_empty() {
-            return Err(Rejection::UnsupportedArg(unknown));
-        }
+        reject_unknown_args(args, known)?;
         let arg = |key: &str| args.and_then(|args| args.get(key));
         let boolean = |key: &'static str| match arg(key) {
             None => Ok(None),
@@ -531,6 +523,197 @@ impl IpcOp {
     }
 }
 
+/// 带了 `known` 之外的参数就拒绝，列出它们。
+fn reject_unknown_args(
+    args: Option<&serde_json::Map<String, serde_json::Value>>,
+    known: &[&str],
+) -> Result<(), Rejection> {
+    let unknown: Vec<String> = args
+        .into_iter()
+        .flat_map(|args| args.keys())
+        .filter(|key| !known.contains(&key.as_str()))
+        .cloned()
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(Rejection::UnsupportedArg(unknown))
+    }
+}
+
+/// 读请求历史的操作。都没有副作用；成功应答的 `result` 各有各的形状（不是状态快照）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadOp {
+    /// 列请求记录，新的在前：`{"requests":[RequestRecord…],"more":bool}`。`before` 是一个
+    /// 请求标识，给了就只列比它更早的；`limit` 是一次最多几条
+    /// （1 到 [`crate::history::MAX_LIST`]，不给是 [`crate::history::DEFAULT_LIST`]）
+    Requests {
+        before: Option<String>,
+        limit: Option<u64>,
+    },
+    /// 一个请求的明细（RequestDetail）：记录、请求头、每次尝试发出与收到的头；体只给大小与
+    /// 状态
+    Request { request_id: String },
+    /// 读一个体的一块：`{"total_bytes","offset","data_b64","more","complete"}`。`attempt` 在
+    /// `part` 是发出的体或响应体时必填；`offset` 不给是 0；`limit` 是这一块最多多少字节
+    /// （1 到 [`crate::history::MAX_BODY_READ`]，不给就是上限）
+    Body {
+        request_id: String,
+        part: crate::history::Part,
+        attempt: Option<u32>,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    },
+    /// 订阅事件：先回 `{"snapshot":…,"requests":[在途的 RequestRecord]}`，之后每行一个事件，
+    /// 直到任一方关闭连接
+    Subscribe,
+}
+
+impl ReadOp {
+    pub fn name(&self) -> &'static str {
+        match self {
+            ReadOp::Requests { .. } => "requests",
+            ReadOp::Request { .. } => "request",
+            ReadOp::Body { .. } => "body",
+            ReadOp::Subscribe => "subscribe",
+        }
+    }
+
+    /// `part` 在线上的名字
+    fn part_name(part: crate::history::Part) -> &'static str {
+        match part {
+            crate::history::Part::Request => "request",
+            crate::history::Part::Sent => "sent",
+            crate::history::Part::Response => "response",
+        }
+    }
+
+    /// 按名字与 `args` 还原一个 op。`name` 已经确认是这四个之一。
+    fn from_request(
+        name: &str,
+        args: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<Self, Rejection> {
+        let known: &[&str] = match name {
+            "requests" => &["before", "limit"],
+            "request" => &["request_id"],
+            "body" => &["request_id", "part", "attempt", "offset", "limit"],
+            _ => &[],
+        };
+        reject_unknown_args(args, known)?;
+        let invalid = |arg: &'static str| Rejection::BadRequest {
+            reason: "invalid_arg",
+            arg: Some(arg),
+        };
+        let arg = |key: &str| args.and_then(|args| args.get(key));
+        let text = |key: &'static str| match arg(key) {
+            None => Ok(None),
+            Some(value) => value
+                .as_str()
+                .map(|s| Some(s.to_string()))
+                .ok_or(invalid(key)),
+        };
+        let required_text = |key: &'static str| {
+            text(key)?.ok_or(Rejection::BadRequest {
+                reason: "missing_arg",
+                arg: Some(key),
+            })
+        };
+        // 取值在 `range` 之内的整数
+        let integer = |key: &'static str, range: std::ops::RangeInclusive<u64>| match arg(key) {
+            None => Ok(None),
+            Some(value) => value
+                .as_u64()
+                .filter(|n| range.contains(n))
+                .map(Some)
+                .ok_or(invalid(key)),
+        };
+        Ok(match name {
+            "requests" => ReadOp::Requests {
+                before: text("before")?,
+                limit: integer("limit", 1..=crate::history::MAX_LIST as u64)?,
+            },
+            "request" => ReadOp::Request {
+                request_id: required_text("request_id")?,
+            },
+            "body" => {
+                let part = match required_text("part")?.as_str() {
+                    "request" => crate::history::Part::Request,
+                    "sent" => crate::history::Part::Sent,
+                    "response" => crate::history::Part::Response,
+                    _ => return Err(invalid("part")),
+                };
+                let attempt = integer("attempt", 1..=u64::from(u32::MAX))?.map(|n| n as u32);
+                if part != crate::history::Part::Request && attempt.is_none() {
+                    return Err(Rejection::BadRequest {
+                        reason: "missing_arg",
+                        arg: Some("attempt"),
+                    });
+                }
+                ReadOp::Body {
+                    request_id: required_text("request_id")?,
+                    part,
+                    attempt,
+                    offset: integer("offset", 0..=u64::MAX)?,
+                    limit: integer("limit", 1..=crate::history::MAX_BODY_READ)?,
+                }
+            }
+            _ => ReadOp::Subscribe,
+        })
+    }
+
+    /// 发往实例的请求行（不含换行）。没给的参数不带。
+    pub fn request_line(&self) -> String {
+        let mut args = serde_json::Map::new();
+        match self {
+            ReadOp::Requests { before, limit } => {
+                if let Some(before) = before {
+                    args.insert("before".into(), before.as_str().into());
+                }
+                if let Some(limit) = limit {
+                    args.insert("limit".into(), (*limit).into());
+                }
+            }
+            ReadOp::Request { request_id } => {
+                args.insert("request_id".into(), request_id.as_str().into());
+            }
+            ReadOp::Body {
+                request_id,
+                part,
+                attempt,
+                offset,
+                limit,
+            } => {
+                args.insert("request_id".into(), request_id.as_str().into());
+                args.insert("part".into(), Self::part_name(*part).into());
+                if let Some(attempt) = attempt {
+                    args.insert("attempt".into(), (*attempt).into());
+                }
+                if let Some(offset) = offset {
+                    args.insert("offset".into(), (*offset).into());
+                }
+                if let Some(limit) = limit {
+                    args.insert("limit".into(), (*limit).into());
+                }
+            }
+            ReadOp::Subscribe => {}
+        }
+        let mut line = serde_json::Map::new();
+        line.insert("v".into(), IPC_VERSION.into());
+        line.insert("op".into(), self.name().into());
+        if !args.is_empty() {
+            line.insert("args".into(), args.into());
+        }
+        serde_json::Value::Object(line).to_string()
+    }
+}
+
+/// 一个解析好的请求：控制 op，或读请求历史的 op。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Parsed {
+    Control(IpcOp),
+    Read(ReadOp),
+}
+
 /// v1 应答的线上形状。成功带 `result`，失败带 `error`。
 #[derive(Serialize, Deserialize)]
 struct WireResponse {
@@ -566,13 +749,19 @@ pub mod error_code {
     pub const INVALID_STATE: &str = "invalid_state";
     /// 带条件的 op 条件不成立（`shutdown{if_idle_secs}` 时实例不够闲；`details.idle_ms`）
     pub const CONDITION_NOT_MET: &str = "condition_not_met";
+    /// 要的请求或体取不到（`details.request_id`、`details.reason`；`reason` 是
+    /// `not_retained` 时 `details.cause` 说明为什么没留）
+    pub const NOT_FOUND: &str = "not_found";
+    /// 流式连接已经满了（`details.limit` 是上限）
+    pub const BUSY: &str = "busy";
 }
 
 /// 实例对一个请求的拒绝：码、英文说明与 `details`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Rejection {
     /// `reason` 的词表：`incomplete_line`、`not_json`、`missing_v`、`missing_op`、
-    /// `args_not_object`、`invalid_arg`（这时 `arg` 是那个参数的名字）
+    /// `args_not_object`、`invalid_arg`（参数的类型或取值不对）、`missing_arg`（缺必填的
+    /// 参数）；后两种的 `arg` 是那个参数的名字
     BadRequest {
         reason: &'static str,
         arg: Option<&'static str>,
@@ -586,6 +775,18 @@ enum Rejection {
     /// 实例只闲置了 `idle_ms` 毫秒
     ConditionNotMet {
         idle_ms: u64,
+    },
+    /// 要的请求或体取不到。`reason` 的词表：`unknown_request`（没有这个请求，或它的记录
+    /// 已经被淘汰）、`no_such_part`（这个请求没有这个体）、`evicted`（体为了腾地方被丢掉
+    /// 了）、`not_retained`（体没有保留，`cause` 说明原因）
+    NotFound {
+        request_id: String,
+        reason: &'static str,
+        cause: Option<&'static str>,
+    },
+    /// 流式连接已经有 `limit` 条
+    Busy {
+        limit: usize,
     },
 }
 
@@ -605,6 +806,7 @@ impl Rejection {
                     ("missing_v", _) => "the request has no v".into(),
                     ("missing_op", _) => "the request has no op".into(),
                     ("args_not_object", _) => "args must be an object".into(),
+                    ("missing_arg", Some(arg)) => format!("arg {arg} is required"),
                     (_, Some(arg)) => format!("arg {arg} has the wrong type or value"),
                     (other, None) => other.to_string(),
                 };
@@ -638,6 +840,28 @@ impl Rejection {
                 error_code::CONDITION_NOT_MET,
                 format!("the instance has been idle for only {idle_ms} ms"),
                 json!({ "idle_ms": idle_ms }),
+            ),
+            Rejection::NotFound {
+                request_id,
+                reason,
+                cause,
+            } => {
+                let details = match cause {
+                    Some(cause) => {
+                        json!({ "request_id": request_id, "reason": reason, "cause": cause })
+                    }
+                    None => json!({ "request_id": request_id, "reason": reason }),
+                };
+                (
+                    error_code::NOT_FOUND,
+                    format!("nothing to return for request {request_id}: {reason}"),
+                    details,
+                )
+            }
+            Rejection::Busy { limit } => (
+                error_code::BUSY,
+                format!("all {limit} streaming connections are in use"),
+                json!({ "limit": limit }),
             ),
         };
         serde_json::to_string(&WireResponse {
@@ -683,6 +907,18 @@ impl std::fmt::Display for IpcError {
 }
 
 impl std::error::Error for IpcError {}
+
+impl IpcError {
+    /// 给连接类与协议类的失败补上是哪个端点；实例明确的拒绝原样返回。
+    fn at(self, endpoint: &str) -> Self {
+        match self {
+            IpcError::Unreachable(e) => IpcError::Unreachable(format!("{endpoint}: {e}")),
+            IpcError::Transient(e) => IpcError::Transient(format!("{endpoint}: {e}")),
+            IpcError::Protocol(e) => IpcError::Protocol(format!("{endpoint}: {e}")),
+            other => other,
+        }
+    }
+}
 
 /// 探测端口上是否有 aProxy 实例（纯 IPC，不触碰任何 TCP 端口）。
 /// Ok = 实例在运行；Err = 端点上没有可识别的 aProxy（无实例，或该端口被
@@ -799,6 +1035,121 @@ async fn request_raw_within(
     Ok(status)
 }
 
+/// 读请求历史的一元 op（`requests`、`request`、`body`）：发一次请求，返回应答里的 `result`。
+/// 3 秒超时。`subscribe` 用 [`ipc_subscribe_in`]。
+///
+/// 调用之前先看快照的 `ops` 里有没有这个 op：没有它的实例回 `unknown_op`。
+pub async fn ipc_read_in(
+    run_dir: &std::path::Path,
+    port: &str,
+    op: &ReadOp,
+) -> Result<serde_json::Value, IpcError> {
+    let endpoint = endpoint_for_in(run_dir, port);
+    let request = op.request_line();
+    let exchange = async {
+        let (stream, _) = imp::connect(&endpoint).await?;
+        exchange_over(stream, &request).await
+    };
+    let line = match tokio::time::timeout(Duration::from_secs(3), exchange).await {
+        Ok(Ok(line)) => line,
+        Ok(Err(e)) => return Err(e.at(&endpoint)),
+        Err(_) => return Err(IpcError::Transient(format!("{endpoint}: 请求超时"))),
+    };
+    parse_result(&line).map_err(|e| e.at(&endpoint))
+}
+
+/// 一条订阅连接：[`ipc_subscribe_in`] 的返回值，之后每调一次 [`EventStream::next`] 读一个
+/// 事件。丢掉它就是退订。
+pub struct EventStream {
+    lines: tokio::io::BufReader<imp::Stream>,
+}
+
+impl EventStream {
+    /// 下一个事件：`{"v":1,"event":…,"seq":n,"at":毫秒,"data":…}`。实例关了连接时为
+    /// `Ok(None)`。45 秒收不到任何一行按失联报 `Transient`（实例至少每 15 秒发一行）。
+    ///
+    /// 不认识的事件照样返回，由调用方忽略；`lagged` 之后调用方该重取快照与记录。
+    pub async fn next(&mut self) -> Result<Option<serde_json::Value>, IpcError> {
+        use tokio::io::AsyncBufReadExt;
+        const SILENCE: Duration = Duration::from_secs(45);
+        let mut line = String::new();
+        let read = tokio::time::timeout(SILENCE, self.lines.read_line(&mut line))
+            .await
+            .map_err(|_| IpcError::Transient("订阅连接 45 秒没有收到任何事件".to_string()))?
+            .map_err(|e| IpcError::Transient(e.to_string()))?;
+        if read == 0 || !line.ends_with('\n') {
+            return Ok(None);
+        }
+        serde_json::from_str(&line)
+            .map(Some)
+            .map_err(|e| IpcError::Protocol(format!("事件不是 JSON：{e}")))
+    }
+}
+
+/// 订阅实例的事件。返回订阅那一刻的 `{"snapshot":…,"requests":[在途的记录]}` 与事件流。
+/// 实例的流式连接已满时是 `Remote`，码为 `busy`。
+pub async fn ipc_subscribe_in(
+    run_dir: &std::path::Path,
+    port: &str,
+) -> Result<(serde_json::Value, EventStream), IpcError> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let endpoint = endpoint_for_in(run_dir, port);
+    let open = async {
+        let (mut stream, _) = imp::connect(&endpoint).await?;
+        let failed = |e: io::Error| IpcError::Transient(e.to_string());
+        let request = ReadOp::Subscribe.request_line();
+        stream.write_all(request.as_bytes()).await.map_err(failed)?;
+        stream.write_all(b"\n").await.map_err(failed)?;
+        let mut lines = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        lines.read_line(&mut line).await.map_err(failed)?;
+        if !line.ends_with('\n') {
+            return Err(IpcError::Transient("连接在应答完整之前关闭".to_string()));
+        }
+        Ok((parse_result(&line)?, EventStream { lines }))
+    };
+    match tokio::time::timeout(Duration::from_secs(3), open).await {
+        Ok(Ok(opened)) => Ok(opened),
+        Ok(Err(e)) => Err(e.at(&endpoint)),
+        Err(_) => Err(IpcError::Transient(format!("{endpoint}: 请求超时"))),
+    }
+}
+
+/// 解析一行 v1 应答，取出 `result`；失败应答变成 `Remote`。
+fn parse_result(line: &str) -> Result<serde_json::Value, IpcError> {
+    let mut value: serde_json::Value = serde_json::from_str(line)
+        .map_err(|e| IpcError::Protocol(format!("应答不是 JSON：{e}")))?;
+    let version = value.get("v").and_then(serde_json::Value::as_u64);
+    let error = value.get("error");
+    let field = |key: &str| error.and_then(|error| error.get(key));
+    if let Some(code) = field("code").and_then(serde_json::Value::as_str)
+        // 别的版本的应答里只认「不支持这个版本」（见 parse_reply）
+        && (version == Some(u64::from(IPC_VERSION)) || code == error_code::UNSUPPORTED_VERSION)
+    {
+        return Err(IpcError::Remote {
+            code: code.to_string(),
+            message: field("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            details: field("details").cloned().unwrap_or(serde_json::Value::Null),
+        });
+    }
+    if version != Some(u64::from(IPC_VERSION)) {
+        return Err(IpcError::Protocol(match version {
+            Some(v) => format!(
+                "实例使用控制协议 v{v}，本程序只懂 v{IPC_VERSION}：请用与实例同版本的 aproxy 操作它"
+            ),
+            None => "应答没有协议版本 v".to_string(),
+        }));
+    }
+    let ok = value.get("ok").and_then(serde_json::Value::as_bool) == Some(true);
+    match value.get_mut("result") {
+        Some(result) if ok => Ok(result.take()),
+        _ => Err(IpcError::Protocol("应答缺少 result 或 error".to_string())),
+    }
+}
+
 /// 解析一行 v1 应答。
 fn parse_reply(line: &str) -> Result<InstanceStatus, IpcError> {
     let value: serde_json::Value = serde_json::from_str(line)
@@ -868,6 +1219,10 @@ pub struct ControlState {
     pub run_dir: String,
     /// 代理层的实时观测源，应答时现读
     pub stats: Arc<IpcStats>,
+    /// 请求历史：读类 op 与事件都从这里取
+    pub history: Arc<crate::history::History>,
+    /// 实例的状态变了（进入更换阶段）：流式连接据此立即发一个 `state` 事件
+    pub state_changed: tokio::sync::Notify,
     /// 收到 shutdown 时置位，服务主循环据此优雅退出；已置位即「正在退出」
     pub on_shutdown: tokio::sync::watch::Sender<bool>,
     /// 「用户已经要它停下」：收到过不带 `keep_restore` 的 shutdown。期望状态记录的写与删
@@ -1892,7 +2247,18 @@ where
         Err(_) => return Ok(()),
     }
     let op = match parse_request(&line) {
-        Ok(op) => op,
+        Ok(Parsed::Control(op)) => op,
+        Ok(Parsed::Read(ReadOp::Subscribe)) => {
+            // 请求行之后客户端不再发东西；读端留着，只为看出它关了连接
+            return serve_events(limited.into_inner(), writer, state).await;
+        }
+        Ok(Parsed::Read(op)) => {
+            let reply = match read_reply(&op, &state.history) {
+                Ok(result) => ok_reply(&result),
+                Err(rejection) => rejection.reply(),
+            };
+            return write_line(&mut writer, &reply).await;
+        }
         Err(rejection) => return write_line(&mut writer, &rejection.reply()).await,
     };
     let stopping = *state.on_shutdown.borrow();
@@ -1912,6 +2278,7 @@ where
                 now_millis().saturating_add(ttl_ms),
                 std::sync::atomic::Ordering::Relaxed,
             );
+            state.state_changed.notify_waiters();
         }
         IpcOp::Shutdown {
             keep_restore,
@@ -1952,8 +2319,209 @@ where
     Ok(())
 }
 
+/// 成功应答的一行（不含换行）。`result` 是已经写成 JSON 文本的结果。
+fn ok_reply(result: &str) -> String {
+    format!(r#"{{"v":{IPC_VERSION},"ok":true,"result":{result}}}"#)
+}
+
+/// 执行一个一元的读 op，返回 `result` 的 JSON 文本。
+fn read_reply(op: &ReadOp, history: &crate::history::History) -> Result<String, Rejection> {
+    use crate::history::ReadError;
+    let unknown = |request_id: &str| Rejection::NotFound {
+        request_id: request_id.to_string(),
+        reason: "unknown_request",
+        cause: None,
+    };
+    match op {
+        ReadOp::Requests { before, limit } => {
+            let limit = limit.map_or(crate::history::DEFAULT_LIST, |n| n as usize);
+            history
+                .list_json(before.as_deref(), limit)
+                .ok_or_else(|| unknown(before.as_deref().unwrap_or_default()))
+        }
+        ReadOp::Request { request_id } => history
+            .detail_json(request_id)
+            .ok_or_else(|| unknown(request_id)),
+        ReadOp::Body {
+            request_id,
+            part,
+            attempt,
+            offset,
+            limit,
+        } => history
+            .read_body_json(
+                request_id,
+                *part,
+                attempt.unwrap_or(0),
+                offset.unwrap_or(0),
+                limit.unwrap_or(crate::history::MAX_BODY_READ),
+            )
+            .map_err(|e| match e {
+                ReadError::NotFound { reason, cause } => Rejection::NotFound {
+                    request_id: request_id.clone(),
+                    reason,
+                    cause,
+                },
+                // 起点在体的末尾之后
+                ReadError::BadOffset { .. } => Rejection::BadRequest {
+                    reason: "invalid_arg",
+                    arg: Some("offset"),
+                },
+            }),
+        // 流式的 op 不走这里（见 handle_conn）
+        ReadOp::Subscribe => Err(Rejection::bad("invalid_arg")),
+    }
+}
+
+/// 流式连接上两行之间最长的间隔：没有别的事件可发时，到点发一个 `heartbeat`。客户端 45 秒
+/// 收不到任何一行就判失联。
+const EVENT_IDLE: Duration = Duration::from_secs(15);
+/// 往流式连接里写一行的时限：不读的客户端不能一直占着一条流式连接的名额
+const EVENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 一次写出去的事件攒到这么多字节就不再往里加：一批写不完的留给下一轮
+const EVENT_BATCH_BYTES: usize = 256 * 1024;
+
+/// `subscribe`：先回一行应答（快照与在途的记录），之后每行一个事件，直到任一方关闭连接、
+/// 写不出去或实例退出。
+///
+/// 事件有五种：`request`（一条记录变了，整条替换）、`state`（整份快照：状态变化立即发，
+/// 计数的变化合并成每秒最多一个）、`heartbeat`（[`EVENT_IDLE`] 内没有别的事件）、
+/// `lagged`（订阅者跟不上，丢了 `dropped` 个事件，它该重取快照与记录）、`closing`（实例
+/// 要退出了）。每条连接上事件的 `seq` 从 1 起递增。
+async fn serve_events<R, W>(
+    mut reader: R,
+    mut writer: W,
+    state: Arc<ControlState>,
+) -> io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use crate::history::Event;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+
+    let Some(mut subscription) = state.history.subscribe() else {
+        let reply = Rejection::Busy {
+            limit: crate::history::MAX_SUBSCRIBERS,
+        }
+        .reply();
+        return write_line(&mut writer, &reply).await;
+    };
+    let snapshot_json = |state: &ControlState| {
+        serde_json::to_string(&status_snapshot(state)).expect("序列化状态快照失败")
+    };
+    // 最近一次发给这个订阅者的快照：之后只在它变了的时候再发
+    let mut sent_snapshot = snapshot_json(&state);
+    let first = ok_reply(&format!(
+        r#"{{"snapshot":{sent_snapshot},"requests":{}}}"#,
+        subscription.in_flight
+    ));
+    write_line(&mut writer, &first).await?;
+
+    let mut seq = 0u64;
+    let mut last_line = tokio::time::Instant::now();
+    let mut stopping = state.on_shutdown.subscribe();
+    let mut every_second = tokio::time::interval(Duration::from_secs(1));
+    every_second.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut scratch = [0u8; 256];
+    // 这一轮要写出去的事件行
+    let mut batch = String::new();
+    loop {
+        // 这一轮要发的事件：名字与 data 的 JSON 文本；`closing` 发完就结束
+        let (event, data, last) = tokio::select! {
+            received = subscription.events.recv() => match received {
+                Ok(Event::Request(record)) => ("request", record.to_string(), false),
+                Ok(Event::Closing(reason)) => {
+                    ("closing", format!(r#"{{"reason":"{reason}"}}"#), true)
+                }
+                Err(RecvError::Lagged(dropped)) => {
+                    ("lagged", format!(r#"{{"dropped":{dropped}}}"#), false)
+                }
+                Err(RecvError::Closed) => return Ok(()),
+            },
+            // 状态变了（进入更换阶段、开始退出）：立即发。到期自己回到 serving 的那一次由
+            // 下面每秒一次的检查发出
+            _ = state.state_changed.notified() => ("state", String::new(), false),
+            changed = stopping.changed() => match changed {
+                Ok(()) => ("state", String::new(), false),
+                Err(_) => return Ok(()),
+            },
+            // 计数的变化合并到这里；没有任何东西可发、又静了够久，就发一个心跳
+            _ = every_second.tick() => {
+                if last_line.elapsed() >= EVENT_IDLE {
+                    ("heartbeat", "{}".to_string(), false)
+                } else {
+                    ("state", String::new(), false)
+                }
+            }
+            // 客户端关了连接。它在请求行之后发来的别的东西一概不看
+            read = reader.read(&mut scratch) => match read {
+                Ok(0) | Err(_) => return Ok(()),
+                Ok(_) => continue,
+            },
+        };
+        let data = if event == "state" {
+            let now = snapshot_json(&state);
+            if now == sent_snapshot {
+                continue;
+            }
+            sent_snapshot.clone_from(&now);
+            now
+        } else {
+            data
+        };
+        batch.clear();
+        push_event(&mut batch, &mut seq, event, &data);
+        // 队列里已经排着的事件一并带上，一次写出去。实例忙的时候，每写一次都要等运行时再排到
+        // 这个任务；一次只写一个事件的话，每秒几百个事件就跟不上，订阅者会不停地收到 lagged
+        let mut last = last;
+        while !last && batch.len() < EVENT_BATCH_BYTES {
+            match subscription.events.try_recv() {
+                Ok(Event::Request(record)) => {
+                    push_event(&mut batch, &mut seq, "request", &record);
+                }
+                Ok(Event::Closing(reason)) => {
+                    let data = format!(r#"{{"reason":"{reason}"}}"#);
+                    push_event(&mut batch, &mut seq, "closing", &data);
+                    last = true;
+                }
+                Err(TryRecvError::Lagged(dropped)) => {
+                    let data = format!(r#"{{"dropped":{dropped}}}"#);
+                    push_event(&mut batch, &mut seq, "lagged", &data);
+                }
+                // 队列关了的那一种留给下一轮的 recv 去结束
+                Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+            }
+        }
+        let write = async {
+            writer.write_all(batch.as_bytes()).await?;
+            writer.flush().await
+        };
+        match tokio::time::timeout(EVENT_WRITE_TIMEOUT, write).await {
+            Ok(written) => written?,
+            Err(_) => return Ok(()),
+        }
+        last_line = tokio::time::Instant::now();
+        if last {
+            return Ok(());
+        }
+    }
+}
+
+/// 往 `batch` 里加一行事件：序号加一，时刻取此刻。`data` 是事件数据的 JSON 文本。
+fn push_event(batch: &mut String, seq: &mut u64, event: &str, data: &str) {
+    use std::fmt::Write as _;
+    *seq += 1;
+    let _ = writeln!(
+        batch,
+        r#"{{"v":{IPC_VERSION},"event":"{event}","seq":{seq},"at":{},"data":{data}}}"#,
+        now_millis()
+    );
+}
+
 /// 解析请求行。Err 是要回给客户端的拒绝。
-fn parse_request(line: &str) -> Result<IpcOp, Rejection> {
+fn parse_request(line: &str) -> Result<Parsed, Rejection> {
     // 行未正常终止：超过长度上限被截断，或对端在发完整请求前就断开
     if !line.ends_with('\n') {
         return Err(Rejection::bad("incomplete_line"));
@@ -1975,7 +2543,12 @@ fn parse_request(line: &str) -> Result<IpcOp, Rejection> {
         Some(serde_json::Value::Object(args)) => Some(args),
         Some(_) => return Err(Rejection::bad("args_not_object")),
     };
-    IpcOp::from_request(name, args)
+    match name {
+        "requests" | "request" | "body" | "subscribe" => {
+            ReadOp::from_request(name, args).map(Parsed::Read)
+        }
+        _ => IpcOp::from_request(name, args).map(Parsed::Control),
+    }
 }
 
 /// 组装此刻的状态快照（计数器、最近错误在应答瞬间现读）。
@@ -2034,6 +2607,15 @@ mod imp {
         endpoint: &str,
         req_line: &str,
     ) -> Result<(String, Option<u32>), IpcError> {
+        let (client, peer) = connect(endpoint).await?;
+        Ok((exchange_over(client, req_line).await?, peer))
+    }
+
+    /// 客户端一侧的连接
+    pub type Stream = NamedPipeClient;
+
+    /// 连上端点。一并返回管道服务端的进程 pid（取不到为 None）。重试的规矩见 [`exchange`]。
+    pub async fn connect(endpoint: &str) -> Result<(Stream, Option<u32>), IpcError> {
         const ERROR_PIPE_BUSY: i32 = 231;
         const BUSY_RETRY_CAP: Duration = Duration::from_secs(2);
         const BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -2055,7 +2637,7 @@ mod imp {
             }
         };
         let peer = server_pid(&client);
-        Ok((exchange_over(client, req_line).await?, peer))
+        Ok((client, peer))
     }
 
     fn server_pid(client: &NamedPipeClient) -> Option<u32> {
@@ -2170,6 +2752,15 @@ mod imp {
         endpoint: &str,
         req_line: &str,
     ) -> Result<(String, Option<u32>), IpcError> {
+        let (client, peer) = connect(endpoint).await?;
+        Ok((exchange_over(client, req_line).await?, peer))
+    }
+
+    /// 客户端一侧的连接
+    pub type Stream = tokio::net::UnixStream;
+
+    /// 连上端点，核对在那里听的进程该不该信。一并返回对端进程 pid（取不到为 None）。
+    pub async fn connect(endpoint: &str) -> Result<(Stream, Option<u32>), IpcError> {
         let client = tokio::net::UnixStream::connect(endpoint)
             .await
             .map_err(|e| {
@@ -2203,7 +2794,7 @@ mod imp {
             .and_then(|cred| cred.pid())
             .and_then(|pid| u32::try_from(pid).ok())
             .filter(|&pid| pid != 0);
-        Ok((exchange_over(client, req_line).await?, peer))
+        Ok((client, peer))
     }
 
     /// 客户端该不该信在控制端点上听的进程。`me` 是客户端的有效 uid，`server` 是对端的，
@@ -2368,6 +2959,15 @@ mod tests {
         }
     }
 
+    /// 一份空的请求历史：1 MiB 的体预算，认得一个密钥
+    fn sample_history() -> Arc<crate::history::History> {
+        crate::history::History::new(
+            1,
+            aproxy_ipc::redact::Secrets::new(["sk-live-0123456789abcdef"]),
+            Arc::from("19ac3f2e8b5d1a2b"),
+        )
+    }
+
     /// 测试用的控制服务状态；返回的 Receiver 用来观察 shutdown 是否被触发
     fn control(record: InstanceRecord) -> (Arc<ControlState>, tokio::sync::watch::Receiver<bool>) {
         let (on_shutdown, rx) = tokio::sync::watch::channel(false);
@@ -2376,6 +2976,8 @@ mod tests {
             behavior: sample_behavior(),
             run_dir: "/test/run".into(),
             stats: Arc::new(IpcStats::default()),
+            history: sample_history(),
+            state_changed: tokio::sync::Notify::new(),
             on_shutdown,
             stop_requested: std::sync::Mutex::new(false),
         };
@@ -2569,7 +3171,11 @@ mod tests {
         ];
         for (op, line) in cases {
             assert_eq!(op.request_line(), line);
-            assert_eq!(parse_request(&format!("{line}\n")).unwrap(), op, "{line}");
+            assert_eq!(
+                parse_request(&format!("{line}\n")).unwrap(),
+                Parsed::Control(op),
+                "{line}"
+            );
         }
         // 空的 args 等于没带；显式的 keep_restore:false 等于缺省
         for line in [
@@ -2578,7 +3184,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse_request(&format!("{line}\n")).unwrap(),
-                IpcOp::STOP,
+                Parsed::Control(IpcOp::STOP),
                 "{line}"
             );
         }
@@ -2588,7 +3194,25 @@ mod tests {
             [
                 IpcOp::Ping.name(),
                 IpcOp::STOP.name(),
-                IpcOp::PREPARE_SWAP.name()
+                IpcOp::PREPARE_SWAP.name(),
+                ReadOp::Requests {
+                    before: None,
+                    limit: None
+                }
+                .name(),
+                ReadOp::Request {
+                    request_id: String::new()
+                }
+                .name(),
+                ReadOp::Body {
+                    request_id: String::new(),
+                    part: crate::history::Part::Request,
+                    attempt: None,
+                    offset: None,
+                    limit: None
+                }
+                .name(),
+                ReadOp::Subscribe.name(),
             ]
         );
         assert_eq!(
@@ -2613,6 +3237,8 @@ mod tests {
                 behavior: sample_behavior(),
                 run_dir: dir.path().display().to_string(),
                 stats: Arc::new(IpcStats::default()),
+                history: sample_history(),
+                state_changed: tokio::sync::Notify::new(),
                 on_shutdown,
                 stop_requested: std::sync::Mutex::new(false),
             }
@@ -2732,6 +3358,476 @@ mod tests {
         }
     }
 
+    /// 往测试用的请求历史里放一个结束了的请求：一个请求体、一次带响应的尝试。返回它的标识。
+    fn recorded_request(history: &Arc<crate::history::History>, seq: u64) -> String {
+        let id = format!("19ac3f2e8b5d1a2b-{seq}");
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-api-key", "sk-live-0123456789abcdef".parse().unwrap());
+        let recorder = history.begin(
+            seq,
+            Arc::from(id.as_str()),
+            crate::history::Start {
+                method: "POST",
+                path_and_query: "/v1/messages",
+                headers: &headers,
+                delivery: "retry",
+                phase: crate::history::Phase::ReadingBody,
+            },
+        );
+        let mut body = recorder.request_body(None).unwrap();
+        body.feed(&bytes::Bytes::from_static(
+            br#"{"model":"m","key":"sk-live-0123456789abcdef"}"#,
+        ));
+        body.finish();
+        recorder.try_started(1, None, true, None);
+        let mut response = recorder
+            .response_head(
+                1,
+                200,
+                [("content-type", &b"application/json"[..])].into_iter(),
+                None,
+            )
+            .unwrap();
+        response.feed(&bytes::Bytes::from_static(br#"{"ok":true}"#));
+        response.finish();
+        recorder.try_ended(1, 11, None);
+        recorder.client_status(200);
+        recorder.end(true);
+        id
+    }
+
+    /// 读类 op 的请求行钉在这里，并且实例的解析还原得出同一个 op。
+    #[test]
+    fn read_request_lines_are_pinned_and_round_trip_through_the_server_parser() {
+        use crate::history::Part;
+        let cases = [
+            (
+                ReadOp::Requests {
+                    before: None,
+                    limit: None,
+                },
+                r#"{"v":1,"op":"requests"}"#,
+            ),
+            (
+                ReadOp::Requests {
+                    before: Some("19ac3f2e8b5d1a2b-42".into()),
+                    limit: Some(200),
+                },
+                r#"{"v":1,"op":"requests","args":{"before":"19ac3f2e8b5d1a2b-42","limit":200}}"#,
+            ),
+            (
+                ReadOp::Request {
+                    request_id: "19ac3f2e8b5d1a2b-42".into(),
+                },
+                r#"{"v":1,"op":"request","args":{"request_id":"19ac3f2e8b5d1a2b-42"}}"#,
+            ),
+            (
+                ReadOp::Body {
+                    request_id: "19ac3f2e8b5d1a2b-42".into(),
+                    part: Part::Request,
+                    attempt: None,
+                    offset: None,
+                    limit: None,
+                },
+                r#"{"v":1,"op":"body","args":{"request_id":"19ac3f2e8b5d1a2b-42","part":"request"}}"#,
+            ),
+            (
+                ReadOp::Body {
+                    request_id: "19ac3f2e8b5d1a2b-42".into(),
+                    part: Part::Response,
+                    attempt: Some(3),
+                    offset: Some(1048576),
+                    limit: Some(1),
+                },
+                r#"{"v":1,"op":"body","args":{"request_id":"19ac3f2e8b5d1a2b-42","part":"response","attempt":3,"offset":1048576,"limit":1}}"#,
+            ),
+            (ReadOp::Subscribe, r#"{"v":1,"op":"subscribe"}"#),
+        ];
+        for (op, line) in cases {
+            assert_eq!(op.request_line(), line);
+            assert_eq!(
+                parse_request(&format!("{line}\n")).unwrap(),
+                Parsed::Read(op),
+                "{line}"
+            );
+        }
+    }
+
+    /// 读类 op 的拒绝：未知参数、缺必填、类型或取值不对、取不到。应答行逐字钉住。
+    #[test]
+    fn read_rejections_are_pinned() {
+        let (state, _rx) = control(sample_info("12345"));
+        let id = recorded_request(&state.history, 42);
+        let reply = |line: &str| match parse_request(&format!("{line}\n")) {
+            Err(rejection) => rejection.reply(),
+            Ok(Parsed::Read(op)) => read_reply(&op, &state.history).unwrap_err().reply(),
+            Ok(other) => panic!("{line}: {other:?}"),
+        };
+        let bad = |arg: &str| {
+            format!(
+                r#"{{"v":1,"ok":false,"error":{{"code":"bad_request","message":"arg {arg} has the wrong type or value","details":{{"reason":"invalid_arg","arg":"{arg}"}}}}}}"#
+            )
+        };
+        let missing = |arg: &str| {
+            format!(
+                r#"{{"v":1,"ok":false,"error":{{"code":"bad_request","message":"arg {arg} is required","details":{{"reason":"missing_arg","arg":"{arg}"}}}}}}"#
+            )
+        };
+        let not_found = |request_id: &str, reason: &str| {
+            format!(
+                r#"{{"v":1,"ok":false,"error":{{"code":"not_found","message":"nothing to return for request {request_id}: {reason}","details":{{"request_id":"{request_id}","reason":"{reason}"}}}}}}"#
+            )
+        };
+        let body =
+            |args: &str| format!(r#"{{"v":1,"op":"body","args":{{"request_id":"{id}",{args}}}}}"#);
+        let cases: Vec<(String, String)> = vec![
+            (
+                r#"{"v":1,"op":"subscribe","args":{"filter":"x"}}"#.into(),
+                r#"{"v":1,"ok":false,"error":{"code":"unsupported_arg","message":"unknown arg: filter","details":{"args":["filter"]}}}"#.into(),
+            ),
+            (
+                r#"{"v":1,"op":"requests","args":{"since":1}}"#.into(),
+                r#"{"v":1,"ok":false,"error":{"code":"unsupported_arg","message":"unknown arg: since","details":{"args":["since"]}}}"#.into(),
+            ),
+            (r#"{"v":1,"op":"requests","args":{"limit":0}}"#.into(), bad("limit")),
+            (r#"{"v":1,"op":"requests","args":{"limit":201}}"#.into(), bad("limit")),
+            (r#"{"v":1,"op":"requests","args":{"before":7}}"#.into(), bad("before")),
+            (r#"{"v":1,"op":"request"}"#.into(), missing("request_id")),
+            (r#"{"v":1,"op":"request","args":{"request_id":7}}"#.into(), bad("request_id")),
+            (r#"{"v":1,"op":"body","args":{"request_id":"x"}}"#.into(), missing("part")),
+            (body(r#""part":"headers""#), bad("part")),
+            (body(r#""part":"sent""#), missing("attempt")),
+            (body(r#""part":"response","attempt":0"#), bad("attempt")),
+            (body(r#""part":"request","limit":0"#), bad("limit")),
+            (body(r#""part":"request","limit":1048577"#), bad("limit")),
+            (body(r#""part":"request","offset":-1"#), bad("offset")),
+            // 起点在体的末尾之后
+            (body(r#""part":"request","offset":1000"#), bad("offset")),
+            (body(r#""part":"response","attempt":2"#), not_found(&id, "no_such_part")),
+            (
+                r#"{"v":1,"op":"request","args":{"request_id":"19ac3f2e8b5d1a2b-7"}}"#.into(),
+                not_found("19ac3f2e8b5d1a2b-7", "unknown_request"),
+            ),
+            (
+                r#"{"v":1,"op":"body","args":{"request_id":"nope","part":"request"}}"#.into(),
+                not_found("nope", "unknown_request"),
+            ),
+            (
+                r#"{"v":1,"op":"requests","args":{"before":"nope"}}"#.into(),
+                not_found("nope", "unknown_request"),
+            ),
+        ];
+        for (line, expected) in &cases {
+            assert_eq!(&reply(line), expected, "{line}");
+        }
+        assert_eq!(
+            Rejection::NotFound {
+                request_id: id.clone(),
+                reason: "not_retained",
+                cause: Some("exceeds_budget"),
+            }
+            .reply(),
+            format!(
+                r#"{{"v":1,"ok":false,"error":{{"code":"not_found","message":"nothing to return for request {id}: not_retained","details":{{"request_id":"{id}","reason":"not_retained","cause":"exceeds_budget"}}}}}}"#
+            )
+        );
+        assert_eq!(
+            Rejection::Busy { limit: 8 }.reply(),
+            r#"{"v":1,"ok":false,"error":{"code":"busy","message":"all 8 streaming connections are in use","details":{"limit":8}}}"#
+        );
+        // 码与 details 的键都在码表里
+        let mut replies: Vec<String> = cases.iter().map(|(line, _)| reply(line)).collect();
+        replies.push(Rejection::Busy { limit: 8 }.reply());
+        replies.push(
+            Rejection::NotFound {
+                request_id: id,
+                reason: "not_retained",
+                cause: Some("decode_failed"),
+            }
+            .reply(),
+        );
+        for text in replies {
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let code = aproxy_ipc::code::lookup(value["error"]["code"].as_str().unwrap())
+                .expect("码表里应有这个码");
+            for key in value["error"]["details"].as_object().unwrap().keys() {
+                assert!(
+                    code.details.iter().any(|d| d.key == key),
+                    "{} 的 details 里有码表没登记的键 {key}",
+                    code.name
+                );
+            }
+        }
+    }
+
+    /// `requests`、`request`、`body` 经真实的端点走一遍：结果的形状，以及体里的密钥已经
+    /// 在入库时换掉。
+    #[tokio::test]
+    async fn read_ops_round_trip_over_a_real_endpoint() {
+        use crate::history::Part;
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = test_endpoint(dir.path(), "readops");
+        let (state, _rx) = control(sample_info("0"));
+        let first = recorded_request(&state.history, 41);
+        let second = recorded_request(&state.history, 42);
+        let server = tokio::spawn(serve_endpoint(endpoint.clone(), state.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let read = |op: ReadOp| {
+            let endpoint = endpoint.clone();
+            async move {
+                let (stream, _) = imp::connect(&endpoint).await.unwrap();
+                parse_result(&exchange_over(stream, &op.request_line()).await.unwrap())
+            }
+        };
+
+        let list = read(ReadOp::Requests {
+            before: None,
+            limit: Some(1),
+        })
+        .await
+        .unwrap();
+        assert_eq!(list["more"], true);
+        assert_eq!(list["requests"].as_array().unwrap().len(), 1);
+        assert_eq!(list["requests"][0]["request_id"], second.as_str());
+        assert_eq!(list["requests"][0]["outcome"], "ok");
+        let older = read(ReadOp::Requests {
+            before: Some(second.clone()),
+            limit: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(older["more"], false);
+        assert_eq!(older["requests"][0]["request_id"], first.as_str());
+
+        let detail = read(ReadOp::Request {
+            request_id: second.clone(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(detail["record"], list["requests"][0]);
+        assert_eq!(
+            detail["request"],
+            serde_json::json!({
+                "headers": [{"name": "x-api-key", "value": {"secret": true, "hint": "sk-l…cdef"}}],
+                "body": {"bytes": 30, "state": "retained"},
+            })
+        );
+        assert_eq!(
+            detail["tries"],
+            serde_json::json!([{
+                "attempt": 1,
+                "sent": null,
+                "response": {
+                    "upstream_status": 200,
+                    "headers": [{"name": "content-type", "value": "application/json"}],
+                    "body": {"bytes": 11, "state": "retained"},
+                },
+                "error": null,
+            }])
+        );
+
+        let chunk = read(ReadOp::Body {
+            request_id: second.clone(),
+            part: Part::Request,
+            attempt: None,
+            offset: Some(4),
+            limit: Some(10),
+        })
+        .await
+        .unwrap();
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(chunk["data_b64"].as_str().unwrap())
+            .unwrap();
+        // 入库的是换掉密钥之后的：{"model":"m","key":"<secret>"}
+        assert_eq!(String::from_utf8(data).unwrap(), r#"del":"m",""#);
+        assert_eq!(
+            (
+                &chunk["total_bytes"],
+                &chunk["offset"],
+                &chunk["more"],
+                &chunk["complete"]
+            ),
+            (
+                &serde_json::json!(30),
+                &serde_json::json!(4),
+                &serde_json::json!(true),
+                &serde_json::json!(true)
+            )
+        );
+        let response = read(ReadOp::Body {
+            request_id: second.clone(),
+            part: Part::Response,
+            attempt: Some(1),
+            offset: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(response["data_b64"], "eyJvayI6dHJ1ZX0=");
+        assert_eq!(response["more"], false);
+
+        let err = read(ReadOp::Request {
+            request_id: "19ac3f2e8b5d1a2b-7".into(),
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, IpcError::Remote { code, details, .. }
+                if code == "not_found" && details["reason"] == "unknown_request"),
+            "{err:?}"
+        );
+        server.abort();
+    }
+
+    /// 读一行事件，按 JSON 解析。
+    async fn next_event<R>(lines: &mut tokio::io::BufReader<R>) -> serde_json::Value
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncBufReadExt;
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), lines.read_line(&mut line))
+            .await
+            .expect("5 秒内应有一行")
+            .unwrap();
+        assert!(line.ends_with('\n'), "连接提前关闭：{line:?}");
+        serde_json::from_str(&line).unwrap()
+    }
+
+    /// `subscribe`：先回快照与在途的记录，之后是事件——记录的开始与结束、状态变化、实例
+    /// 退出。每条连接上 `seq` 从 1 起递增。
+    #[tokio::test]
+    async fn subscribe_streams_snapshot_then_events() {
+        use tokio::io::AsyncWriteExt;
+        let (state, _rx) = control(sample_info("12345"));
+        // 订阅之前就在途的请求
+        let headers = http::HeaderMap::new();
+        let begin = |seq: u64| {
+            state.history.begin(
+                seq,
+                Arc::from(format!("19ac3f2e8b5d1a2b-{seq}")),
+                crate::history::Start {
+                    method: "POST",
+                    path_and_query: "/v1/messages",
+                    headers: &headers,
+                    delivery: "retry",
+                    phase: crate::history::Phase::ReadingBody,
+                },
+            )
+        };
+        let early = begin(1);
+
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        let handler = tokio::spawn(handle_conn(server, state.clone()));
+        client
+            .write_all(b"{\"v\":1,\"op\":\"subscribe\"}\n")
+            .await
+            .unwrap();
+        let (read_half, _write_half) = tokio::io::split(client);
+        let mut lines = tokio::io::BufReader::new(read_half);
+
+        let first = next_event(&mut lines).await;
+        assert_eq!(first["ok"], true);
+        assert_eq!(first["result"]["snapshot"]["state"], "serving");
+        assert_eq!(
+            first["result"]["snapshot"]["instance"]["listen_addr"],
+            "127.0.0.1:12345"
+        );
+        assert_eq!(first["result"]["requests"].as_array().unwrap().len(), 1);
+        assert_eq!(first["result"]["requests"][0]["request_seq"], 1);
+        assert_eq!(state.history.subscribers(), 1);
+
+        // 开始与结束各一个 request 事件，data 是整条记录
+        let recorder = begin(2);
+        let started = next_event(&mut lines).await;
+        assert_eq!(
+            (&started["v"], &started["event"], &started["seq"]),
+            (
+                &serde_json::json!(1),
+                &serde_json::json!("request"),
+                &serde_json::json!(1)
+            )
+        );
+        assert!(started["at"].as_u64().is_some_and(|at| at > 0));
+        assert_eq!(started["data"]["request_seq"], 2);
+        assert_eq!(started["data"]["outcome"], "in_flight");
+        recorder.end(true);
+        let ended = next_event(&mut lines).await;
+        assert_eq!(ended["seq"], 2);
+        assert_eq!(ended["data"]["outcome"], "ok");
+        assert_eq!(ended["data"]["phase"], "done");
+        early.end(false);
+        let gone = next_event(&mut lines).await;
+        assert_eq!(gone["data"]["outcome"], "client_gone");
+
+        // 状态变化：另一条连接上的 prepare_swap 让订阅者立即收到一份新的快照
+        let (other, other_server) = tokio::io::duplex(1 << 16);
+        let other_handler = tokio::spawn(handle_conn(other_server, state.clone()));
+        exchange_over(other, &IpcOp::PREPARE_SWAP.request_line())
+            .await
+            .unwrap();
+        other_handler.await.unwrap().unwrap();
+        let swapped = next_event(&mut lines).await;
+        assert_eq!(swapped["event"], "state");
+        assert_eq!(swapped["seq"], 4);
+        assert_eq!(swapped["data"]["state"], "swap_prepared");
+        assert_eq!(swapped["data"]["ops"], first["result"]["snapshot"]["ops"]);
+
+        // 实例退出：closing 之后服务端关连接，名额还回去
+        state.history.announce_closing("swap");
+        let closing = next_event(&mut lines).await;
+        assert_eq!(closing["event"], "closing");
+        assert_eq!(closing["data"], serde_json::json!({"reason": "swap"}));
+        handler.await.unwrap().unwrap();
+        assert_eq!(state.history.subscribers(), 0);
+    }
+
+    /// 流式连接最多 8 条，第 9 条回 `busy`；客户端关了连接，名额就还回来。
+    #[tokio::test]
+    async fn subscribers_are_capped_and_a_closed_client_frees_its_slot() {
+        use tokio::io::AsyncWriteExt;
+        let (state, _rx) = control(sample_info("12345"));
+        let mut clients = Vec::new();
+        for _ in 0..crate::history::MAX_SUBSCRIBERS {
+            let (mut client, server) = tokio::io::duplex(1 << 16);
+            let handler = tokio::spawn(handle_conn(server, state.clone()));
+            client
+                .write_all(b"{\"v\":1,\"op\":\"subscribe\"}\n")
+                .await
+                .unwrap();
+            let (read_half, write_half) = tokio::io::split(client);
+            let mut lines = tokio::io::BufReader::new(read_half);
+            assert_eq!(next_event(&mut lines).await["ok"], true);
+            clients.push((lines, write_half, handler));
+        }
+        assert_eq!(state.history.subscribers(), crate::history::MAX_SUBSCRIBERS);
+
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let handler = tokio::spawn(handle_conn(server, state.clone()));
+        let reply = exchange_over(client, r#"{"v":1,"op":"subscribe"}"#)
+            .await
+            .unwrap();
+        handler.await.unwrap().unwrap();
+        assert_eq!(
+            reply.trim_end(),
+            r#"{"v":1,"ok":false,"error":{"code":"busy","message":"all 8 streaming connections are in use","details":{"limit":8}}}"#
+        );
+
+        // 一个客户端走了：它那条连接的处理任务结束，名额还回来
+        let (lines, write_half, handler) = clients.pop().unwrap();
+        drop((lines, write_half));
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .expect("客户端关闭后处理任务应结束")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.history.subscribers(),
+            crate::history::MAX_SUBSCRIBERS - 1
+        );
+    }
+
     /// 成功应答的形状钉在这里：快照的字段名、顺序与类型。
     #[test]
     fn snapshot_shape_is_pinned() {
@@ -2754,7 +3850,7 @@ mod tests {
                 r#""behavior":{"delivery":"retry","disk_cache":true,"keepalive":{"trigger":"any","interval_secs":15},"retry_rules":1,"history":{"body_budget_mb":64}},"#,
                 r#""activity":{"last_request_at":1700000000000,"requests_total":120,"retries_total":7,"rescued_total":0,"in_flight":0,"retrying":0,"by_code":{},"#,
                 r#""buckets":{"width_secs":120,"requests":[ZEROS],"retries":[ZEROS],"failures":[ZEROS]},"last_error":null},"#,
-                r#""ops":["ping","shutdown","prepare_swap"],"#,
+                r#""ops":["ping","shutdown","prepare_swap","requests","request","body","subscribe"],"#,
                 r#""features":["shutdown.if_idle_secs","shutdown.keep_restore","prepare_swap.ttl_secs"]}}"#
             )
         );
@@ -2922,7 +4018,18 @@ mod tests {
         assert_eq!(status.state, InstanceState::Serving);
         assert_eq!(status.behavior, sample_behavior());
         assert_eq!(status.features.len(), 3);
-        assert_eq!(status.ops, ["ping", "shutdown", "prepare_swap"]);
+        assert_eq!(
+            status.ops,
+            [
+                "ping",
+                "shutdown",
+                "prepare_swap",
+                "requests",
+                "request",
+                "body",
+                "subscribe"
+            ]
+        );
         assert_eq!(status.activity.requests_total, 7);
         assert_eq!(status.activity.retries_total, 2);
         let last = status.activity.last_error.expect("应带最近错误");

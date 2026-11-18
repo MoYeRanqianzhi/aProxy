@@ -12,6 +12,7 @@
 //! 已经放弃、不会再重试的最终结果；正常透传的响应不带。
 
 use super::*;
+use crate::history::Recorder;
 use serde_json::{Map, Value, json};
 
 /// 响应头：这个请求的标识，与错误体、日志里的 `request_id` 相同
@@ -27,13 +28,22 @@ pub(super) struct RequestTrace {
     pub(super) request_id: Arc<str>,
     /// 已进行的上游尝试数（还没发往上游就结束的请求为 0）
     pub(super) attempts: u32,
+    /// 这个请求在请求历史里的记录；不进历史的请求（入站校验拒掉的）是空句柄
+    pub(super) rec: Recorder,
 }
 
 impl RequestTrace {
+    /// 不进请求历史的请求。
     pub(super) fn new(request_id: impl Into<Arc<str>>) -> Self {
+        Self::recorded(request_id, Recorder::none())
+    }
+
+    /// 在请求历史里有记录的请求。
+    pub(super) fn recorded(request_id: impl Into<Arc<str>>, rec: Recorder) -> Self {
         Self {
             request_id: request_id.into(),
             attempts: 0,
+            rec,
         }
     }
 }
@@ -62,6 +72,25 @@ impl AttemptFailure {
             details: as_map(details),
             message,
             status: None,
+        }
+    }
+
+    /// 失败之前已经收到的响应体字节数：响应体读到一半断开、或读着读着超时的失败带着它
+    /// （`details.received_bytes`），别的失败是 0。
+    pub(super) fn received_bytes(&self) -> u64 {
+        self.details
+            .get("received_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    }
+
+    /// 请求历史要的那几样。
+    pub(super) fn for_history(&self) -> crate::history::Failure<'_> {
+        crate::history::Failure {
+            code: self.code,
+            details: &self.details,
+            message: &self.message,
+            has_response: self.status.is_some(),
         }
     }
 
@@ -336,8 +365,12 @@ impl Terminal {
     }
 
     /// 响应头还没写出时的终态：JSON 错误响应，带两个头。状态码取码表登记的值
-    /// （「透传，否则 N」的码在没有可透传的响应时用 N）。
+    /// （「透传，否则 N」的码在没有可透传的响应时用 N）。请求记录的结局随之定为
+    /// 「aproxy 自己结束了它」。
     pub(super) fn into_response(self, trace: &RequestTrace) -> Response {
+        trace
+            .rec
+            .settle(crate::history::Outcome::AproxyError, Some(self.code));
         let status = match aproxy_ipc::code::lookup(self.code).and_then(|c| c.http) {
             Some(
                 aproxy_ipc::code::HttpStatus::Fixed(status)
@@ -353,7 +386,11 @@ impl Terminal {
 
     /// 响应头已经写出之后的终态：SSE 的 `event: error`，data 是压成一行的同一个 JSON。
     /// 状态行已发出、不可再改，客户端借此明确知道 aproxy 放弃了这条请求，而不是永远等下去。
+    /// 请求记录的结局随之定为「aproxy 自己结束了它」。
     pub(super) fn sse_event(&self, trace: &RequestTrace) -> Bytes {
+        trace
+            .rec
+            .settle(crate::history::Outcome::AproxyError, Some(self.code));
         // serde_json 的紧凑输出不含换行（字符串里的换行被转义），整个 data 就是一行
         Bytes::from(format!("event: error\ndata: {}\n\n", self.payload(trace)))
     }
@@ -412,6 +449,7 @@ mod tests {
         RequestTrace {
             request_id: Arc::from("19ac3f2e8b5d1a2b-41"),
             attempts,
+            rec: Recorder::none(),
         }
     }
 

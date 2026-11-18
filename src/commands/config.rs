@@ -9,23 +9,15 @@ use aproxy::settings;
 use crate::util::{mask_secret, parse_kv};
 use aproxy::cli::ConfigArgs;
 
-/// 转换器 args 里「后一个参数是密钥」的旗标（比较时大小写不敏感）。format
-/// 程序常见的传 key 写法：`--api-key sk-...` 或 `--api-key=sk-...`。
-const SECRET_ARG_FLAGS: &[&str] = &[
-    "--api-key",
-    "--api_key",
-    "--apikey",
-    "--key",
-    "--token",
-    "--secret",
-    "--password",
-];
-
 /// 转换器 args 的展示打码：密钥旗标之后的值（或 `--flag=值` 的值）走
 /// mask_secret；其余参数走 URL 脱敏出口（参数里出现的 `user:pass@host`、
 /// `?key=` 一并遮掉，普通参数原样）。
 fn mask_transform_args(args: &[String]) -> Vec<String> {
-    let is_secret_flag = |s: &str| SECRET_ARG_FLAGS.iter().any(|f| f.eq_ignore_ascii_case(s));
+    let is_secret_flag = |s: &str| {
+        aproxy::config::SECRET_ARG_FLAGS
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(s))
+    };
     let mut out = Vec::with_capacity(args.len());
     let mut mask_next = false;
     for arg in args {

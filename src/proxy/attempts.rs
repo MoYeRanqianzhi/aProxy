@@ -11,6 +11,7 @@
 //! 本地失败——各出口按 Outcome 收场。判定与「最近错误」的文案因此只有一份。
 
 use super::*;
+use crate::history::{Phase, Recorder, SentHead};
 
 /// 从 forward_once 的完整响应里拆出、要交付给客户端的一份上游响应。
 pub(super) struct UpstreamResponse {
@@ -27,8 +28,14 @@ pub(super) enum Outcome {
     /// 可以交付：成功的上游响应
     Deliver(UpstreamResponse),
     /// 需要重试。`failure` 是这次没成功的原因，记进实例的「最近错误」（status 与界面里
-    /// 看得到）
-    Retry { failure: AttemptFailure },
+    /// 看得到）。`rule` 是让它接着重试的那条重试规则的序号（从 1 起）：命中了规则、还没到它
+    /// 给的次数，或者命中的是豁免；没有规则命中（按默认无限重试）时为 None。
+    /// `response_bytes` 是这次尝试从上游收到的响应体字节数
+    Retry {
+        failure: AttemptFailure,
+        rule: Option<usize>,
+        response_bytes: u64,
+    },
     /// 一条重试规则给的尝试次数用完了：不再重试，交付这次失败的响应——客户端拿到真实的
     /// 404 自行处理，好过永远等不到终态（compact 事故，见记忆 bounded-retry-paths）。
     /// `rule` 是那条规则的序号（从 1 起）
@@ -56,7 +63,11 @@ pub(super) fn classify(
     rules: &[(usize, &CompiledRetryRule)],
 ) -> Outcome {
     match result {
-        ForwardResult::NetworkError(failure) => Outcome::Retry { failure },
+        ForwardResult::NetworkError(failure) => Outcome::Retry {
+            response_bytes: failure.received_bytes(),
+            failure,
+            rule: None,
+        },
         ForwardResult::TooLarge => Outcome::TooLarge,
         ForwardResult::SpoolFailed(op, e) => Outcome::SpoolFailed(op, e),
         ForwardResult::Response {
@@ -84,7 +95,12 @@ pub(super) fn classify(
                     rule,
                 },
                 // 进入下一轮时 body 随 response 一起 Drop：磁盘临时文件删除
-                _ => Outcome::Retry { failure },
+                matched => Outcome::Retry {
+                    failure,
+                    rule: matched.map(|(rule, _)| rule),
+                    // 这次尝试收到了完整的响应体，只是内容算失败
+                    response_bytes: response.body.len(),
+                },
             }
         }
     }
@@ -120,6 +136,7 @@ impl Responder {
     pub(super) fn keepalive(
         state: &AppState,
         resp_tx: tokio::sync::oneshot::Sender<Response>,
+        rec: Recorder,
     ) -> Self {
         let interval = state.config.keepalive_interval();
         let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
@@ -131,6 +148,7 @@ impl Responder {
                 beat: Heartbeat {
                     fixed: Bytes::copy_from_slice(state.config.keepalive_heartbeat()),
                     dynamic: None,
+                    rec,
                 },
             },
             ticker,
@@ -259,6 +277,60 @@ impl Responder {
     }
 }
 
+/// 把要发往上游的请求行与头交给请求历史，返回入库的那一份（发出的请求不变时，各次尝试
+/// 共用它）。只留真正发出去的头：逐跳头在发送时会被剥掉。
+fn sent_head(rec: &Recorder, req: &OutboundRequest) -> Option<Arc<SentHead>> {
+    rec.sent_head(
+        req.method.as_str(),
+        &req.target_url,
+        req.headers
+            .iter()
+            .filter(|(name, _)| !is_hop_header(name.as_str()))
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )
+}
+
+/// 在请求历史里记下第 `attempt` 次尝试开始。`same_body` 为假（这次发出的体与上一次不同）
+/// 时把体也交过去：内存里的整块交，不拷贝；落盘的在阻塞线程池里读。
+fn record_try(
+    rec: &Recorder,
+    attempt: u32,
+    sent: Option<&Arc<SentHead>>,
+    same_body: bool,
+    req: &OutboundRequest,
+) {
+    let encoding = body_encoding(
+        req.headers
+            .get(http::header::CONTENT_ENCODING)
+            .map(|v| v.as_bytes()),
+    );
+    let Some(mut history) = rec.try_started(attempt, sent, same_body, encoding) else {
+        return;
+    };
+    match &req.body {
+        RequestBody::Memory(bytes) => history.feed(bytes),
+        RequestBody::Disk { path, .. } => {
+            // 现在就把文件打开：请求结束时它会被删掉，已经打开的句柄照样读得完
+            let Ok(mut file) = std::fs::File::open(path) else {
+                return;
+            };
+            tokio::task::spawn_blocking(move || {
+                use std::io::Read as _;
+                while history.is_live() {
+                    let mut block = vec![0u8; 64 * 1024];
+                    match file.read(&mut block) {
+                        Ok(n) if n > 0 => {
+                            block.truncate(n);
+                            history.feed(&Bytes::from(block));
+                        }
+                        _ => break,
+                    }
+                }
+            });
+        }
+    }
+}
+
 /// 一个请求的全部尝试：请求转换 → 逐次发往上游并判定 → 按出口收场。返回时结果已交给
 /// `r`（不保活出口取 [`Responder::into_response`]），或客户端已断开。`trace` 是这个请求的
 /// 标识与尝试计数，终态的错误体要带。
@@ -276,6 +348,10 @@ pub(super) async fn run_attempts(
     // 规则对客户端的原始路径判定（在请求转换之前）：哪些端点受限是用户按客户端发出的
     // 请求写的，format 改写 URL 不影响它
     let rules = state.retry_rules_for(path_and_query);
+    let rec = trace.rec.clone();
+    if state.request_pool.is_some() {
+        rec.phase(Phase::Transforming);
+    }
     let mut req = match r
         .wait(apply_request_transform(state, req), None, "请求转换")
         .await
@@ -290,6 +366,10 @@ pub(super) async fn run_attempts(
     r.prepare_upstream_headers(&mut req.headers);
     log_proxied_request(&req.method, path_and_query, &req.target_url);
     r.arm_dynamic_heartbeat(state, &req);
+    // 请求历史：发出的请求行与头，以及这次发出的体是不是与上一次相同（第一次与客户端的原始
+    // 请求体比——没有请求转换时就是它）
+    let mut sent = sent_head(&rec, &req);
+    let mut same_body = state.request_pool.is_none();
 
     let max_backoff = state.config.max_retry_backoff_secs;
     let mut attempt: u32 = 0;
@@ -310,6 +390,7 @@ pub(super) async fn run_attempts(
                 retrying = Some(state.stats.begin_retrying());
             }
             let delay = retry::delay_for_attempt(attempt - 1, max_backoff);
+            rec.backoff(delay);
             if delay.is_zero() {
                 tracing::warn!(attempt, "立即重试");
             } else {
@@ -324,6 +405,7 @@ pub(super) async fn run_attempts(
             // every_attempt：重试前用客户端的原始请求重新转换出这次要发的请求（失败沿用
             // 上一次的）
             if let Some(rt) = req.retransform.as_mut() {
+                rec.phase(Phase::Transforming);
                 let next = rt.next(state, &req.ctx, attempt);
                 match r.wait(next, None, "请求转换（重试前）").await {
                     None => return,
@@ -333,6 +415,8 @@ pub(super) async fn run_attempts(
                         req.headers = t.headers;
                         req.body = t.body;
                         r.prepare_upstream_headers(&mut req.headers);
+                        sent = sent_head(&rec, &req);
+                        same_body = false;
                     }
                     Some(None) => {}
                 }
@@ -341,6 +425,8 @@ pub(super) async fn run_attempts(
 
         let (head_tx, head_rx) = r.head_channel();
         trace.attempts = attempt;
+        record_try(&rec, attempt, sent.as_ref(), same_body, &req);
+        same_body = true;
         let attempt_fut = forward_once(
             state,
             &req.method,
@@ -349,6 +435,8 @@ pub(super) async fn run_attempts(
             &req.body,
             max_spool_bytes,
             head_tx,
+            &rec,
+            attempt,
         );
         let Some(result) = r.wait(attempt_fut, head_rx, "等待上游").await else {
             return;
@@ -358,8 +446,16 @@ pub(super) async fn run_attempts(
         }
 
         match classify(attempt, result, &rules) {
-            Outcome::Retry { failure } => {
+            Outcome::Retry {
+                failure,
+                rule,
+                response_bytes,
+            } => {
                 failure.record_in(&state.stats);
+                rec.try_ended(attempt, response_bytes, Some(failure.for_history()));
+                // 谁让它接着重试的：命中的重试规则，或者默认的无限重试
+                let by = rule.map_or_else(|| "default".to_string(), |rule| format!("rule:{rule}"));
+                rec.decided(attempt, by, true);
                 tracing::warn!(
                     attempt,
                     code = %failure.code,
@@ -371,6 +467,7 @@ pub(super) async fn run_attempts(
                 // 下一轮尝试很快成功时客户端仍拿到上游真实头
             }
             Outcome::Deliver(response) => {
+                rec.try_ended(attempt, response.body.len(), None);
                 // 回放期间它不再是「重试中」；经过重试才成功的算救回一个
                 if retrying.take().is_some() {
                     state.stats.note_rescued();
@@ -387,6 +484,8 @@ pub(super) async fn run_attempts(
                 // `details.by` 说明是谁给的次数：第几条重试规则
                 let by = format!("rule:{rule}");
                 let terminal = Terminal::retry_exhausted(&by, attempt, &failure);
+                rec.try_ended(attempt, response.body.len(), Some(failure.for_history()));
+                rec.decided(attempt, by, false);
                 // 这次尝试也是一次失败的尝试；随后的终态成为「最近一次失败」
                 failure.record_in(&state.stats);
                 terminal.record_in(&state.stats);
@@ -400,8 +499,15 @@ pub(super) async fn run_attempts(
                         raw_headers,
                         body,
                     } = response;
+                    rec.phase(Phase::Replaying);
+                    rec.response_bytes(body.len());
                     let mut resp = replay_failure_as_is(status, headers, &raw_headers, body).await;
                     mark_given_up(resp.headers_mut(), terminal.code(), &trace);
+                    // 客户端拿到的是上游的失败响应原样，不是 aproxy 自产的错误体
+                    rec.settle(
+                        crate::history::Outcome::UpstreamError,
+                        Some(terminal.code()),
+                    );
                     r.respond(resp);
                 } else {
                     // 已提交：状态行已发出，真实 status 与头无法交付，以终态 error 事件收场
@@ -411,6 +517,7 @@ pub(super) async fn run_attempts(
                 return;
             }
             Outcome::TooLarge => {
+                rec.try_ended(attempt, 0, None);
                 let terminal = Terminal::response_too_large(max_spool_bytes);
                 terminal.record_in(&state.stats);
                 tracing::error!(
@@ -422,6 +529,7 @@ pub(super) async fn run_attempts(
                 return;
             }
             Outcome::SpoolFailed(op, e) => {
+                rec.try_ended(attempt, 0, None);
                 let terminal = Terminal::local_storage_failed(op, &e);
                 terminal.record_in(&state.stats);
                 tracing::error!(attempt, code = %terminal.code(), error = %e, "本地 spool 故障，终止重试");
@@ -455,6 +563,10 @@ async fn deliver(
         body,
     } = response;
     let upstream_sse = is_event_stream(&headers);
+    let rec = &trace.rec;
+    if state.response_pool.is_some() {
+        rec.phase(Phase::Transforming);
+    }
     let transform =
         transform_response_if_configured(state, &req.target_url, &req.ctx, headers, body);
     let transformed = if !r.is_committed() && !upstream_sse {
@@ -467,6 +579,8 @@ async fn deliver(
     };
     if !r.is_committed() {
         // 提交前就成功：保真快速路径（上游 status 与转换后的响应头）
+        rec.phase(Phase::Replaying);
+        rec.response_bytes(body.len());
         let resp = replay_transformed(attempt, status, headers, &raw_headers, body).await;
         r.respond(resp);
         return;
@@ -537,14 +651,20 @@ async fn deliver(
     if body.is_empty() {
         return;
     }
+    rec.phase(Phase::Replaying);
     let mut stream = body.into_stream().await;
+    // 已经交给客户端的响应体字节数，记进请求记录
+    let mut replayed = 0u64;
     while let Some(item) = stream.next().await {
+        let bytes = item.as_ref().map_or(0, |chunk| chunk.len() as u64);
         if !r.send(item).await {
             // 客户端在回放中断开：Drop 链负责删临时文件
             r.log_client_gone("回放");
-            return;
+            break;
         }
+        replayed += bytes;
     }
+    rec.response_bytes(replayed);
 }
 
 #[cfg(test)]
@@ -572,7 +692,7 @@ mod tests {
         let out = classify(1, response(503, "overloaded"), &[]);
         assert!(matches!(
             out,
-            Outcome::Retry { ref failure }
+            Outcome::Retry { ref failure, .. }
                 if failure.code == "upstream_status" && failure.status == Some(503)
         ));
         // 200 但内容是错误：同样重试
@@ -587,7 +707,7 @@ mod tests {
         // 状态码是成功的，失败在体里：记的是另一个码
         assert!(matches!(
             out,
-            Outcome::Retry { ref failure }
+            Outcome::Retry { ref failure, .. }
                 if failure.code == "upstream_error_body" && failure.status == Some(200)
         ));
     }
@@ -614,7 +734,7 @@ mod tests {
             assert!(
                 matches!(
                     out,
-                    Outcome::Retry { ref failure }
+                    Outcome::Retry { ref failure, .. }
                         if failure.code == "upstream_connect_failed"
                             && failure.message.contains("connection refused")
                 ),

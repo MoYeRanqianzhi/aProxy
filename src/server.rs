@@ -161,7 +161,8 @@ pub(crate) async fn serve_forever(
         // 「pid + 本值」防 pid 复用，与二进制名无关）。算不出（没有定义标记的平台）落
         // 空串，这样的记录无法核验身份
         start: aproxy_ipc::ledger::start_marker(std::process::id()).unwrap_or_default(),
-        instance_id: daemon::new_instance_id(),
+        // 与请求标识的前半段是同一个值：拿着一个 request_id 就认得出它是哪一次运行的
+        instance_id: state.instance_id.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         listen_addr: actual_addr.clone(),
         config_path: cfg_path.map(|_| cfg_display.clone()),
@@ -185,6 +186,8 @@ pub(crate) async fn serve_forever(
         behavior,
         run_dir: daemon::run_dir().display().to_string(),
         stats: state.stats.clone(),
+        history: state.history.clone(),
+        state_changed: tokio::sync::Notify::new(),
         on_shutdown: stop_tx,
         stop_requested: std::sync::Mutex::new(false),
     });
@@ -418,7 +421,21 @@ pub(crate) async fn serve_forever(
 
     // 优雅关闭 + 宽限强退：keepalive 后台重试任务不会主动结束，axum::serve 等待
     // 在途连接完成时可能被其无限期挂起，收到停止信号后给 10 秒宽限窗口即强制退出。
-    let graceful = stop_signal(stop_rx.clone());
+    // 停止信号一到就告诉订阅事件的客户端「实例要退出了」：处在二进制更换阶段时原因是 swap
+    // （随后会有新版本的实例起来），否则是 shutdown
+    let graceful = {
+        let history = state.history.clone();
+        let stats = state.stats.clone();
+        let stop_rx = stop_rx.clone();
+        async move {
+            stop_signal(stop_rx).await;
+            let swapping = stats
+                .swap_until_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > daemon::now_millis();
+            history.announce_closing(if swapping { "swap" } else { "shutdown" });
+        }
+    };
     tokio::select! {
         result = axum::serve(listener, app).with_graceful_shutdown(graceful) => {
             result.unwrap();
@@ -430,6 +447,11 @@ pub(crate) async fn serve_forever(
             daemon::remove_registry_files(&actual_addr);
             crate::util::exit(0);
         } => {}
+    }
+    // 订阅连接各自把 `closing` 那一行写出去就断开；最多等半秒，不为一个不读的客户端拖住退出
+    let closing_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while state.history.subscribers() > 0 && tokio::time::Instant::now() < closing_deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     daemon::remove_registry_files(&actual_addr);
     // 在途请求都已结束，各自的临时文件已删，这里收掉本进程的 spool 目录。上面那条强制

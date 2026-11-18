@@ -15,7 +15,7 @@
 //! 其余的写都只锁自己那条记录或自己那个体，请求之间互不争抢。
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,8 @@ const REQUEST_EVENT_INTERVAL_MS: u64 = 1000;
 const FLUSH_EVERY: Duration = Duration::from_millis(250);
 /// 每个订阅者最多积压多少个事件；跟不上的订阅者丢掉最旧的，并被告知丢了几个
 const EVENT_QUEUE: usize = 1024;
+/// 同时最多多少个订阅者
+pub const MAX_SUBSCRIBERS: usize = 8;
 
 /// 取锁；持锁的线程 panic 过也照常用（这里的数据每一步都是自洽的）。
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -197,19 +199,25 @@ impl Body {
         })
     }
 
-    /// 丢掉入库的字节、把占着的预算还回去，状态改成 `state`。
-    fn release(&self, inner: &mut BodyInner, state: BodyState) {
+    /// 把入库的字节摘下来、把占着的预算还回去，状态改成 `state`。摘下来的块交还给调用方：
+    /// 释放它们的内存可能要找系统（大块）或者进空闲表，调用方手里要是还握着别人在等的锁，
+    /// 应当先放了锁再丢它们。
+    #[must_use]
+    fn release(&self, inner: &mut BodyInner, state: BodyState) -> Vec<Bytes> {
         self.budget.used.fetch_sub(inner.held, Ordering::Relaxed);
         inner.held = 0;
-        inner.chunks = Vec::new();
         inner.state = state;
+        std::mem::take(&mut inner.chunks)
     }
 
-    /// 为了腾地方丢掉这个体。已经不在的不动。
-    fn evict(&self) {
+    /// 为了腾地方丢掉这个体，返回摘下来的块（见 [`Body::release`]）。已经不在的不动。
+    #[must_use]
+    fn evict(&self) -> Vec<Bytes> {
         let mut inner = lock(&self.inner);
         if inner.state == BodyState::Retained {
-            self.release(&mut inner, BodyState::Evicted);
+            self.release(&mut inner, BodyState::Evicted)
+        } else {
+            Vec::new()
         }
     }
 
@@ -330,14 +338,209 @@ pub struct BodyWriter {
     carry: Vec<u8>,
     /// 带 content-encoding：先攒原始字节，结束时解码、替换，再入库
     encoded: bool,
+    /// [`BodyWriter::feed_copy`] 正在填的一块（[`COPY_BLOCK`] 字节，取自空闲表）、已经填了
+    /// 多少，以及它里面最早的字节是什么时候进来的
+    block: Option<Box<[u8]>>,
+    filled: usize,
+    block_since: Instant,
     /// 这个体已经不保留了（被淘汰、超出预算）：之后进来的块直接丢掉
     dead: bool,
     finished: bool,
 }
 
+/// [`BodyWriter::feed_copy`] 攒到多大就入库
+const COPY_BLOCK: usize = 64 * 1024;
+/// [`BodyWriter::feed_copy`] 攒着的字节最多留多久再入库：正在接收的体，读的人最多晚这么久
+/// 看到新到的字节
+const COPY_BLOCK_AGE: Duration = Duration::from_millis(250);
+/// 空闲表里最多留多少块（见 [`BlockPool`]）
+const MAX_FREE_BLOCKS: usize = 128;
+/// 循环使用的大缓冲区的容量（见 [`BufferPool`]）：正好是请求体在内存里驻留的上限，溢写
+/// 磁盘之前攒下的那一段用的就是这么大的缓冲
+pub const LARGE_BUFFER: usize = 1024 * 1024;
+/// 空闲表里最多留多少个大缓冲区（见 [`BufferPool`]）
+const MAX_FREE_BUFFERS: usize = 8;
+
+/// [`COPY_BLOCK`] 字节的块的空闲表：被丢掉的块回到这里，下一个体接着用。
+///
+/// 高吞吐下历史每秒要换掉几百 MiB 的体。每一块都向系统要新内存、用完还回去的话，每次都要
+/// 重新建立页映射，这笔开销比拷贝本身还大，会实实在在拖慢转发；块循环使用，稳定之后就不
+/// 再向系统要内存。空闲表有上限（预算的八分之一，最多 [`MAX_FREE_BLOCKS`] 块），所以历史
+/// 占的内存是「预算，加上至多这么多空闲块，再加上 [`BufferPool`] 里空闲的缓冲区」。
+#[derive(Debug)]
+struct BlockPool {
+    free: Mutex<Vec<Box<[u8]>>>,
+    /// 空闲表最多留几块
+    keep: usize,
+}
+
+impl BlockPool {
+    fn take(&self) -> Box<[u8]> {
+        lock(&self.free)
+            .pop()
+            .unwrap_or_else(|| vec![0u8; COPY_BLOCK].into_boxed_slice())
+    }
+
+    fn give(&self, block: Box<[u8]>) {
+        let mut free = lock(&self.free);
+        if free.len() < self.keep {
+            free.push(block);
+        }
+    }
+}
+
+/// [`LARGE_BUFFER`] 字节的缓冲区的空闲表：大请求体溢写磁盘之前在内存里攒的那一段，写进
+/// 文件之后整块进历史，被丢掉时回到这里，下一个大请求体接着用。
+///
+/// 这么大的一块内存，分配器是直接向系统要、用完直接还的：要来时每一页都要缺页一次，还回去
+/// 要拆页表、通知各个核，一来一回是几百微秒的 CPU。循环使用就没有这笔开销。空闲表有上限
+/// （预算的八分之一，最多 [`MAX_FREE_BUFFERS`] 个）。
+#[derive(Debug)]
+struct BufferPool {
+    free: Mutex<Vec<Vec<u8>>>,
+    /// 空闲表最多留几个
+    keep: usize,
+}
+
+impl BufferPool {
+    /// 一个空的、容量为 [`LARGE_BUFFER`] 的缓冲区。
+    fn take(&self) -> Vec<u8> {
+        lock(&self.free)
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(LARGE_BUFFER))
+    }
+
+    fn give(&self, mut buffer: Vec<u8>) {
+        buffer.clear();
+        let mut free = lock(&self.free);
+        if free.len() < self.keep {
+            free.push(buffer);
+        }
+    }
+}
+
+/// 一个入了库的大缓冲区：没有人再用它时回到空闲表。
+struct PooledBuffer {
+    data: Option<Vec<u8>>,
+    pool: Arc<BufferPool>,
+}
+
+impl AsRef<[u8]> for PooledBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.data.as_deref().unwrap_or_default()
+    }
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        if let Some(data) = self.data.take() {
+            self.pool.give(data);
+        }
+    }
+}
+
+/// 一块填满了、入了库的块：没有人再用它时回到空闲表。
+struct PooledBlock {
+    data: Option<Box<[u8]>>,
+    pool: Arc<BlockPool>,
+}
+
+impl AsRef<[u8]> for PooledBlock {
+    fn as_ref(&self) -> &[u8] {
+        self.data.as_deref().unwrap_or_default()
+    }
+}
+
+impl Drop for PooledBlock {
+    fn drop(&mut self) {
+        if let Some(data) = self.data.take() {
+            self.pool.give(data);
+        }
+    }
+}
+
 impl BodyWriter {
-    /// 交一块。
+    /// 交一块自己拥有、大小正好的字节（读完的请求体、format 给出的体）：入库的就是这一块，
+    /// 不拷贝。
+    ///
+    /// 网络库交出来的块不要走这里：它们是读缓冲区的切片，留住几百字节的一小片会把整个
+    /// 缓冲区（几 KiB 到几百 KiB）一起留住，实际占的内存就远多于记在预算上的。那样的块用
+    /// [`BodyWriter::feed_copy`]。
     pub fn feed(&mut self, chunk: &Bytes) {
+        self.flush_block();
+        self.accept(chunk);
+    }
+
+    /// 一个空的缓冲区，容量为 `capacity`：调用方往里攒字节，攒好了经
+    /// [`BodyWriter::feed_buffer`] 整个交回来。要的正好是 [`LARGE_BUFFER`] 时从空闲表里取
+    /// （见 [`BufferPool`]），别的大小现分配。
+    pub fn buffer(&self, capacity: usize) -> Vec<u8> {
+        if capacity == LARGE_BUFFER {
+            self.history.buffers.take()
+        } else {
+            Vec::with_capacity(capacity)
+        }
+    }
+
+    /// 交一个自己拥有的缓冲区：入库的就是它，不拷贝。容量是 [`LARGE_BUFFER`] 的（不管是不是
+    /// 从 [`BodyWriter::buffer`] 拿的）在没有人再用它时进空闲表。
+    ///
+    /// 记在预算上的是它里面的字节数，所以交过来之前要么填满、要么把多余的容量还回去。
+    pub fn feed_buffer(&mut self, buffer: Vec<u8>) {
+        let chunk = if buffer.capacity() == LARGE_BUFFER {
+            Bytes::from_owner(PooledBuffer {
+                data: Some(buffer),
+                pool: self.history.buffers.clone(),
+            })
+        } else {
+            Bytes::from(buffer)
+        };
+        self.feed(&chunk);
+    }
+
+    /// 交一块借来的字节（网络库的读缓冲区切片）：拷进自己的块里，填满 [`COPY_BLOCK`] 或
+    /// 留了 [`COPY_BLOCK_AGE`] 再入库。入库的块大小正好，记在预算上的就是实际占的。
+    pub fn feed_copy(&mut self, mut data: &[u8]) {
+        while !self.dead && !data.is_empty() {
+            let pool = &self.history.pool;
+            let block = self.block.get_or_insert_with(|| pool.take());
+            if self.filled == 0 {
+                self.block_since = Instant::now();
+            }
+            let n = data.len().min(COPY_BLOCK - self.filled);
+            block[self.filled..self.filled + n].copy_from_slice(&data[..n]);
+            self.filled += n;
+            data = &data[n..];
+            if self.filled == COPY_BLOCK {
+                // 填满了：整块入库，没有人再用它时回到空闲表
+                self.filled = 0;
+                let full = Bytes::from_owner(PooledBlock {
+                    data: self.block.take(),
+                    pool: pool.clone(),
+                });
+                self.accept(&full);
+            }
+        }
+        if self.filled > 0 && self.block_since.elapsed() >= COPY_BLOCK_AGE {
+            self.flush_block();
+        }
+    }
+
+    /// 把 [`BodyWriter::feed_copy`] 攒着的、还没填满一块的字节入库：按实际大小另存一份，
+    /// 正在填的那一块留着接着用。
+    fn flush_block(&mut self) {
+        if self.filled == 0 {
+            return;
+        }
+        let filled = std::mem::take(&mut self.filled);
+        let part = match &self.block {
+            Some(block) => Bytes::copy_from_slice(&block[..filled]),
+            None => return,
+        };
+        self.accept(&part);
+    }
+
+    fn accept(&mut self, chunk: &Bytes) {
         if self.dead || chunk.is_empty() {
             return;
         }
@@ -428,8 +631,11 @@ impl BodyWriter {
             }
             if inner.held + added > budget.limit {
                 // 这一个体就比整个预算大：已经入库的部分也丢掉
-                self.body
-                    .release(&mut inner, BodyState::NotRetained(Cause::ExceedsBudget));
+                // 握着的只有这个体自己的锁，没有别人在等：就地释放
+                drop(
+                    self.body
+                        .release(&mut inner, BodyState::NotRetained(Cause::ExceedsBudget)),
+                );
                 inner.bytes = 0;
                 self.dead = true;
                 return;
@@ -454,6 +660,10 @@ impl BodyWriter {
             return;
         }
         self.finished = true;
+        self.flush_block();
+        if let Some(block) = self.block.take() {
+            self.history.pool.give(block);
+        }
         if self.dead {
             lock(&self.body.inner).complete = true;
             return;
@@ -526,22 +736,11 @@ impl std::io::Read for ChunkReader<'_> {
     }
 }
 
-/// 一个头：名字与值。密钥头（名字像鉴权的）的值是占位对象，其余是字符串。
-#[derive(Debug, Clone, PartialEq)]
-pub struct Header {
-    name: String,
-    value: Value,
-}
-
-impl Header {
-    fn view(&self) -> Value {
-        json!({ "name": self.name, "value": self.value })
-    }
-}
-
-fn headers_view(headers: &[Header]) -> Value {
-    Value::Array(headers.iter().map(Header::view).collect())
-}
+/// 一组头，入库时就写成 JSON 数组的文本：`[{"name":…,"value":…},…]`。密钥头（名字像鉴权
+/// 的）的值是占位对象，其余是字符串。
+///
+/// 存成一段文本而不是逐个头的结构：每个请求、每次尝试都要存一组头，这样一组只分配一次。
+type HeaderList = Box<str>;
 
 /// 一次尝试发往上游的请求行与头（体另存）。发出的请求不变时，各次尝试共用同一份。
 #[derive(Debug)]
@@ -549,7 +748,7 @@ pub struct SentHead {
     method: String,
     /// 已打码
     url: String,
-    headers: Vec<Header>,
+    headers: HeaderList,
 }
 
 /// 一次尝试之后的决定（记录里的 `tries[].decision`）。
@@ -567,7 +766,7 @@ struct Decision {
 #[derive(Debug)]
 struct TryResponse {
     status: u16,
-    headers: Vec<Header>,
+    headers: HeaderList,
     body: Arc<Body>,
 }
 
@@ -628,7 +827,7 @@ struct RecordInner {
     heartbeats: u64,
     request_bytes: u64,
     response_bytes: u64,
-    request_headers: Vec<Header>,
+    request_headers: HeaderList,
     request_body: Option<Arc<Body>>,
     /// 最近一次为它发事件的时刻
     last_event_at: u64,
@@ -660,6 +859,21 @@ pub enum Event {
     Closing(&'static str),
 }
 
+/// 一个订阅：事件的接收端，以及订阅那一刻在途的记录。丢掉它就是退订。
+pub struct Subscription {
+    history: Arc<History>,
+    /// 事件。跟不上时收到的是「丢了几个」（`RecvError::Lagged`），之后接着收新的
+    pub events: tokio::sync::broadcast::Receiver<Event>,
+    /// 订阅那一刻在途的记录：一个 JSON 数组的文本，元素是 RequestRecord
+    pub in_flight: String,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.history.subscribers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// 一个请求开始时就知道的东西。
 pub struct Start<'a> {
     pub method: &'a str,
@@ -684,12 +898,19 @@ pub struct Failure<'a> {
 pub struct History {
     instance_id: Arc<str>,
     budget: Arc<Budget>,
+    /// 拷贝入库用的块的空闲表
+    pool: Arc<BlockPool>,
+    /// 大缓冲区的空闲表
+    buffers: Arc<BufferPool>,
     secrets: Secrets,
     records: Mutex<BTreeMap<u64, Arc<Record>>>,
     /// 序号比它小的记录都没有还留着的体：腾地方时从它开始找，不必每次从头扫过早已空了的
     /// 记录。给旧记录挂上新的体时把它往回拨
     evict_floor: AtomicU64,
     events: tokio::sync::broadcast::Sender<Event>,
+    /// 此刻有多少个订阅者。热路径每次改记录都要问一句「有人在听吗」，所以自己数：问广播
+    /// 通道要拿它的锁，所有请求会挤在那一把锁上
+    subscribers: AtomicUsize,
     /// 有变化、还没发事件的记录的序号
     dirty: Mutex<Vec<u64>>,
     /// 补发任务是否在跑
@@ -710,16 +931,30 @@ impl History {
     /// 已知密钥。`instance_id`：请求标识的前半段，用来从标识里认出序号。
     pub fn new(budget_mb: u64, secrets: Secrets, instance_id: Arc<str>) -> Arc<History> {
         let (events, _) = tokio::sync::broadcast::channel(EVENT_QUEUE);
+        let limit = budget_mb.saturating_mul(1024 * 1024);
         Arc::new(History {
             instance_id,
             budget: Arc::new(Budget {
-                limit: budget_mb.saturating_mul(1024 * 1024),
+                limit,
                 used: AtomicU64::new(0),
+            }),
+            pool: Arc::new(BlockPool {
+                free: Mutex::new(Vec::new()),
+                keep: usize::try_from(limit / COPY_BLOCK as u64 / 8)
+                    .unwrap_or(MAX_FREE_BLOCKS)
+                    .min(MAX_FREE_BLOCKS),
+            }),
+            buffers: Arc::new(BufferPool {
+                free: Mutex::new(Vec::new()),
+                keep: usize::try_from(limit / LARGE_BUFFER as u64 / 8)
+                    .unwrap_or(MAX_FREE_BUFFERS)
+                    .min(MAX_FREE_BUFFERS),
             }),
             secrets,
             records: Mutex::new(BTreeMap::new()),
             evict_floor: AtomicU64::new(0),
             events,
+            subscribers: AtomicUsize::new(0),
             dirty: Mutex::new(Vec::new()),
             flushing: AtomicBool::new(false),
         })
@@ -736,23 +971,32 @@ impl History {
     }
 
     /// 把一组头变成入库的形状：密钥头的值换成占位对象，其余的值里出现的已知密钥换掉。
-    fn headers<'a>(&self, headers: impl Iterator<Item = (&'a str, &'a [u8])>) -> Vec<Header> {
-        headers
-            .map(|(name, value)| {
-                let text = String::from_utf8_lossy(value);
-                let value = if redact::is_secret_header(name) {
-                    redact::placeholder(&text)
-                } else if self.secrets.is_empty() {
-                    Value::String(text.into_owned())
-                } else {
-                    Value::String(self.secrets.replace(&text))
-                };
-                Header {
-                    name: name.to_string(),
-                    value,
-                }
-            })
-            .collect()
+    fn headers<'a>(&self, headers: impl Iterator<Item = (&'a str, &'a [u8])>) -> HeaderList {
+        // serde_json 往字节缓冲里写的都是合法的 UTF-8；往 Vec 里写不会失败
+        fn push(out: &mut Vec<u8>, value: &impl serde::Serialize) {
+            let _ = serde_json::to_writer(out, value);
+        }
+        let mut out = Vec::with_capacity(1024);
+        out.push(b'[');
+        for (name, value) in headers {
+            if out.len() > 1 {
+                out.push(b',');
+            }
+            out.extend_from_slice(br#"{"name":"#);
+            push(&mut out, &name);
+            out.extend_from_slice(br#","value":"#);
+            let text = String::from_utf8_lossy(value);
+            if redact::is_secret_header(name) {
+                push(&mut out, &redact::placeholder(&text));
+            } else if self.secrets.find(value).is_some() {
+                push(&mut out, &self.secrets.replace(&text));
+            } else {
+                push(&mut out, &text);
+            }
+            out.push(b'}');
+        }
+        out.push(b']');
+        String::from_utf8(out).unwrap_or_default().into_boxed_str()
     }
 
     /// 一个请求开始：建一条记录，返回往里写的句柄。`seq` 是实例内的请求序号，`id` 是
@@ -816,7 +1060,7 @@ impl History {
                 };
             }
         }
-        if self.events.receiver_count() > 0 {
+        if self.subscribers.load(Ordering::Relaxed) > 0 {
             let line = record_json(&record, &lock(&record.inner));
             let _ = self.events.send(Event::Request(line.into()));
         }
@@ -829,7 +1073,7 @@ impl History {
     /// 记录变了。`urgent`（开始、结束）立即发事件；其余的变化，距上一个事件不到一秒就先
     /// 记下，由补发任务合并成一个。没有订阅者时什么都不做——连记录的 JSON 都不构造。
     fn changed(&self, record: &Record, inner: &mut RecordInner, urgent: bool) {
-        if self.events.receiver_count() == 0 {
+        if self.subscribers.load(Ordering::Relaxed) == 0 {
             inner.queued = false;
             return;
         }
@@ -877,21 +1121,37 @@ impl History {
         }
     }
 
-    /// 订阅事件。返回事件的接收端，以及此刻在途的记录（JSON 数组）。先订阅、后取在途的
-    /// 记录：两者之间发生的变化订阅者会收到两次，不会漏。
+    /// 订阅事件。已经有 [`MAX_SUBSCRIBERS`] 个订阅者时为 None。先订阅、后取在途的记录：
+    /// 两者之间发生的变化订阅者会收到两次，不会漏。
     ///
     /// 要在 tokio 运行时里调用：第一个订阅者到来时起一个补发任务，最后一个走了它自己结束。
-    pub fn subscribe(self: &Arc<Self>) -> (tokio::sync::broadcast::Receiver<Event>, String) {
-        let receiver = self.events.subscribe();
+    pub fn subscribe(self: &Arc<Self>) -> Option<Subscription> {
+        // 占一个名额：满了就不给
+        let mut count = self.subscribers.load(Ordering::Acquire);
+        loop {
+            if count >= MAX_SUBSCRIBERS {
+                return None;
+            }
+            match self.subscribers.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(now) => count = now,
+            }
+        }
+        let events = self.events.subscribe();
         if !self.flushing.swap(true, Ordering::AcqRel) {
             let history = self.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(FLUSH_EVERY).await;
-                    if history.events.receiver_count() == 0 {
+                    if history.subscribers.load(Ordering::Acquire) == 0 {
                         history.flushing.store(false, Ordering::Release);
                         // 刚要结束时又来了订阅者、而它看到任务还在跑就没有另起：接着跑
-                        if history.events.receiver_count() == 0
+                        if history.subscribers.load(Ordering::Acquire) == 0
                             || history.flushing.swap(true, Ordering::AcqRel)
                         {
                             return;
@@ -910,7 +1170,16 @@ impl History {
             .iter()
             .map(|record| record_json(record, &lock(&record.inner)))
             .collect();
-        (receiver, format!("[{}]", lines.join(",")))
+        Some(Subscription {
+            history: self.clone(),
+            events,
+            in_flight: format!("[{}]", lines.join(",")),
+        })
+    }
+
+    /// 此刻有多少个订阅者。
+    pub fn subscribers(&self) -> usize {
+        self.subscribers.load(Ordering::Acquire)
     }
 
     /// 告诉订阅者实例要退出了。
@@ -961,43 +1230,51 @@ impl History {
     pub fn detail_json(&self, request_id: &str) -> Option<String> {
         let record = self.find(request_id)?;
         let inner = lock(&record.inner);
-        let (summary, _) = capped_record(&record, &inner);
-        let tries: Vec<Value> = inner
+        // 头入库时已经是 JSON 文本，记录也直接写成文本：整份明细按文本拼，不搭 JSON 树
+        let body = |body: Option<&Arc<Body>>, same: bool| {
+            body.map_or_else(|| "null".to_string(), |b| b.view(same).to_string())
+        };
+        let tries: Vec<String> = inner
             .tries
             .iter()
             .map(|t| {
-                let sent = t.sent.as_ref().map(|head| {
-                    json!({
-                        "method": head.method,
-                        "url": head.url,
-                        "headers": headers_view(&head.headers),
-                        "body": t.sent_body.as_ref().map(|b| b.view(t.sent_same)),
-                    })
-                });
-                let response = t.response.as_ref().map(|r| {
-                    json!({
-                        "upstream_status": r.status,
-                        "headers": headers_view(&r.headers),
-                        "body": r.body.view(false),
-                    })
-                });
-                json!({
-                    "attempt": t.attempt,
-                    "sent": sent,
-                    "response": response,
-                    "error": t.error,
-                })
+                let sent = t.sent.as_ref().map_or_else(
+                    || "null".to_string(),
+                    |head| {
+                        format!(
+                            r#"{{"method":{},"url":{},"headers":{},"body":{}}}"#,
+                            Value::from(head.method.as_str()),
+                            Value::from(head.url.as_str()),
+                            head.headers,
+                            body(t.sent_body.as_ref(), t.sent_same),
+                        )
+                    },
+                );
+                let response = t.response.as_ref().map_or_else(
+                    || "null".to_string(),
+                    |r| {
+                        format!(
+                            r#"{{"upstream_status":{},"headers":{},"body":{}}}"#,
+                            r.status,
+                            r.headers,
+                            body(Some(&r.body), false),
+                        )
+                    },
+                );
+                format!(
+                    r#"{{"attempt":{},"sent":{sent},"response":{response},"error":{}}}"#,
+                    t.attempt,
+                    t.error.as_ref().unwrap_or(&Value::Null),
+                )
             })
             .collect();
-        let detail = json!({
-            "record": summary,
-            "request": {
-                "headers": headers_view(&inner.request_headers),
-                "body": inner.request_body.as_ref().map(|b| b.view(false)),
-            },
-            "tries": tries,
-        });
-        Some(detail.to_string())
+        Some(format!(
+            r#"{{"record":{},"request":{{"headers":{},"body":{}}},"tries":[{}]}}"#,
+            record_json(&record, &inner),
+            inner.request_headers,
+            body(inner.request_body.as_ref(), false),
+            tries.join(","),
+        ))
     }
 
     /// 读一个体的一块：`{"total_bytes","offset","data_b64","more","complete"}`。
@@ -1044,6 +1321,9 @@ impl History {
         let floor = self.evict_floor.load(Ordering::Acquire);
         let mut new_floor = floor;
         let mut contiguous = true;
+        // 丢掉的块攒在这里，放了记录表的锁再释放：每个新请求都要拿这把锁，不能让它们等着
+        // 这边把几 MiB 内存还完
+        let mut freed: Vec<Vec<Bytes>> = Vec::new();
         {
             let records = lock(&self.records);
             for (seq, record) in records.range(floor..) {
@@ -1056,7 +1336,10 @@ impl History {
                     if Arc::ptr_eq(body, keep) {
                         kept = true;
                     } else {
-                        body.evict();
+                        let chunks = body.evict();
+                        if !chunks.is_empty() {
+                            freed.push(chunks);
+                        }
                     }
                 }
                 // 丢空了的记录连成一段时，下次从这一段之后找起
@@ -1066,6 +1349,7 @@ impl History {
                 }
             }
         }
+        drop(freed);
         if new_floor > floor {
             // 期间有人给更旧的记录挂了新的体、把起点往回拨了的话，以它为准
             let _ = self.evict_floor.compare_exchange(
@@ -1093,6 +1377,9 @@ impl History {
             body: body.clone(),
             carry: Vec::new(),
             encoded,
+            block: None,
+            filled: 0,
+            block_since: Instant::now(),
             dead: false,
             finished: false,
         })
@@ -1132,11 +1419,11 @@ impl History {
                     self.budget.used.fetch_add(now, Ordering::Relaxed) + now
                 }
                 Ok(_) => {
-                    body.release(&mut inner, BodyState::NotRetained(Cause::ExceedsBudget));
+                    drop(body.release(&mut inner, BodyState::NotRetained(Cause::ExceedsBudget)));
                     return;
                 }
                 Err(cause) => {
-                    body.release(&mut inner, BodyState::NotRetained(cause));
+                    drop(body.release(&mut inner, BodyState::NotRetained(cause)));
                     return;
                 }
             }
@@ -1147,101 +1434,135 @@ impl History {
     }
 }
 
-/// 一条记录（RequestRecord）的 JSON 值与它的序列化结果，已按 [`MAX_RECORD_BYTES`] 收过。
-///
-/// 超出上限时依次：从最旧的尝试起清掉 `tries[].reports`；把 `path`、`user_agent`、`model`
-/// 截到 [`TRUNCATED_TEXT_CHARS`] 个字符；清掉顶层的 `reports`。动过的记录带
-/// `"truncated": true`。大小不受控的只有客户端给的那三个串与 format 给的报告，三步之后
-/// 剩下的字段都有上限。
-fn capped_record(record: &Record, inner: &RecordInner) -> (Value, String) {
-    let tries: Vec<Value> = inner
-        .tries
-        .iter()
-        .map(|t| {
-            let decision = t.decision.as_ref().map(|d| {
-                let mut decision = Map::new();
-                decision.insert("by".into(), d.by.as_str().into());
-                decision.insert("decision".into(), d.decision.into());
-                if let Some(delay) = d.delay_ms {
-                    decision.insert("delay_ms".into(), delay.into());
-                }
-                Value::Object(decision)
-            });
-            json!({
-                "attempt": t.attempt,
-                "started_at": t.started_at,
-                "duration_ms": t.duration_ms,
-                "upstream_status": t.upstream_status,
-                "code": t.code,
-                "response_bytes": t.response_bytes,
-                "decision": decision,
-                "reports": [],
-            })
-        })
-        .collect();
-    let mut value = json!({
-        "request_id": &*record.id,
-        "request_seq": record.seq,
-        "started_at": inner.started_at,
-        "ended_at": inner.ended_at,
-        "method": inner.method,
-        "path": inner.path,
-        "model": inner.model,
-        "stream": inner.stream,
-        "user_agent": inner.user_agent,
-        "delivery": inner.delivery,
-        "upgraded": false,
-        "outcome": inner.outcome.as_str(),
-        "code": inner.code,
-        "client_status": inner.client_status,
-        "phase": inner.phase.as_str(),
-        "next_attempt_at": inner.next_attempt_at,
-        "attempts": inner.attempts,
-        "tries_omitted": inner.tries_omitted,
-        "tries": tries,
-        "keepalive": inner.keepalive,
-        "heartbeats": inner.heartbeats,
-        "request_bytes": inner.request_bytes,
-        "response_bytes": inner.response_bytes,
-        "reports": [],
-    });
-    let mut text = value.to_string();
-    if text.len() <= MAX_RECORD_BYTES {
-        return (value, text);
-    }
-    value["truncated"] = Value::Bool(true);
-    let tries = value["tries"].as_array().map_or(0, Vec::len);
-    for index in 0..tries {
-        let reports = &mut value["tries"][index]["reports"];
-        if reports.as_array().is_some_and(|r| !r.is_empty()) {
-            *reports = json!([]);
-            text = value.to_string();
-            if text.len() <= MAX_RECORD_BYTES {
-                return (value, text);
-            }
-        }
-    }
-    for key in ["path", "user_agent", "model"] {
-        if let Some(short) = value[key]
-            .as_str()
-            .filter(|s| s.chars().count() > TRUNCATED_TEXT_CHARS)
-            .map(|s| s.chars().take(TRUNCATED_TEXT_CHARS).collect::<String>())
-        {
-            value[key] = Value::String(short);
-        }
-    }
-    text = value.to_string();
-    if text.len() <= MAX_RECORD_BYTES {
-        return (value, text);
-    }
-    value["reports"] = json!([]);
-    text = value.to_string();
-    (value, text)
+/// 记录里的一次尝试，序列化用。
+#[derive(serde::Serialize)]
+struct TryView<'a> {
+    attempt: u32,
+    started_at: u64,
+    duration_ms: Option<u64>,
+    upstream_status: Option<u16>,
+    code: Option<&'a str>,
+    response_bytes: u64,
+    decision: Option<DecisionView<'a>>,
+    /// 这次尝试的 retry、decide 阶段的报告。本版本不产生报告，恒为空数组
+    reports: [(); 0],
 }
 
-/// 一条记录的 JSON 文本（RequestRecord）。
+#[derive(serde::Serialize)]
+struct DecisionView<'a> {
+    by: &'a str,
+    decision: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delay_ms: Option<u64>,
+}
+
+/// 一条记录（RequestRecord）的线上形状，序列化用。字段的次序就是线上的次序。
+#[derive(serde::Serialize)]
+struct RecordView<'a> {
+    request_id: &'a str,
+    request_seq: u64,
+    started_at: u64,
+    ended_at: Option<u64>,
+    method: &'a str,
+    path: &'a str,
+    model: Option<&'a str>,
+    stream: bool,
+    user_agent: Option<&'a str>,
+    delivery: &'a str,
+    /// 中途从 forward 转成了 retry。本版本的投递方式由配置定死，恒为 false
+    upgraded: bool,
+    outcome: &'a str,
+    code: Option<&'a str>,
+    client_status: Option<u16>,
+    phase: &'a str,
+    next_attempt_at: Option<u64>,
+    attempts: u32,
+    tries_omitted: u32,
+    tries: Vec<TryView<'a>>,
+    keepalive: bool,
+    heartbeats: u64,
+    request_bytes: u64,
+    response_bytes: u64,
+    /// request、response、stream 阶段的报告。本版本不产生报告，恒为空数组
+    reports: [(); 0],
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    truncated: bool,
+}
+
+/// `text` 的前 [`TRUNCATED_TEXT_CHARS`] 个字符（按字符数，不会切在多字节字符中间）。
+fn clipped(text: &str) -> &str {
+    match text.char_indices().nth(TRUNCATED_TEXT_CHARS) {
+        Some((end, _)) => &text[..end],
+        None => text,
+    }
+}
+
+/// 一条记录的 JSON 文本（RequestRecord），不超过 [`MAX_RECORD_BYTES`]。
+///
+/// 记录里大小不受控的只有客户端给的三个串——`path`、`user_agent`、`model`：尝试的条数、
+/// 每条的字段都有上限。超出时把这三个串截到 [`TRUNCATED_TEXT_CHARS`] 个字符，并带上
+/// `"truncated": true`。
+///
+/// 直接从记录写成文本，不先搭一棵 JSON 树：有订阅者时每个请求至少要写两次。
 fn record_json(record: &Record, inner: &RecordInner) -> String {
-    capped_record(record, inner).1
+    let view = |truncated: bool| {
+        fn clip(text: &str, truncated: bool) -> &str {
+            if truncated { clipped(text) } else { text }
+        }
+        RecordView {
+            request_id: &record.id,
+            request_seq: record.seq,
+            started_at: inner.started_at,
+            ended_at: inner.ended_at,
+            method: &inner.method,
+            path: clip(&inner.path, truncated),
+            model: inner.model.as_deref().map(|text| clip(text, truncated)),
+            stream: inner.stream,
+            user_agent: inner
+                .user_agent
+                .as_deref()
+                .map(|text| clip(text, truncated)),
+            delivery: inner.delivery,
+            upgraded: false,
+            outcome: inner.outcome.as_str(),
+            code: inner.code,
+            client_status: inner.client_status,
+            phase: inner.phase.as_str(),
+            next_attempt_at: inner.next_attempt_at,
+            attempts: inner.attempts,
+            tries_omitted: inner.tries_omitted,
+            tries: inner
+                .tries
+                .iter()
+                .map(|t| TryView {
+                    attempt: t.attempt,
+                    started_at: t.started_at,
+                    duration_ms: t.duration_ms,
+                    upstream_status: t.upstream_status,
+                    code: t.code,
+                    response_bytes: t.response_bytes,
+                    decision: t.decision.as_ref().map(|d| DecisionView {
+                        by: &d.by,
+                        decision: d.decision,
+                        delay_ms: d.delay_ms,
+                    }),
+                    reports: [],
+                })
+                .collect(),
+            keepalive: inner.keepalive,
+            heartbeats: inner.heartbeats,
+            request_bytes: inner.request_bytes,
+            response_bytes: inner.response_bytes,
+            reports: [],
+            truncated,
+        }
+    };
+    // 这些结构里没有会让序列化失败的东西（没有非字符串的键，没有自定义的 Serialize）
+    let text = serde_json::to_string(&view(false)).unwrap_or_default();
+    if text.len() <= MAX_RECORD_BYTES {
+        return text;
+    }
+    serde_json::to_string(&view(true)).unwrap_or_default()
 }
 
 struct Live {
@@ -1932,6 +2253,36 @@ mod tests {
         assert_eq!(history.body_bytes(), MIB * 3 / 2);
     }
 
+    /// 以 64 MiB 的预算推入 200 MiB 的体：任何时刻保留的合计都不超过预算，留下的是最新的
+    /// 那一段，更旧的全部被淘汰。
+    #[test]
+    fn the_budget_holds_under_sustained_load() {
+        let history = history(64, &[]);
+        // 一百个请求共用同一块 2 MiB 的内存：记账按字节数算，测试本身不必真占 200 MiB
+        let block = Bytes::from(vec![b'x'; (2 * MIB) as usize]);
+        for seq in 1..=100 {
+            let recorder = begin(&history, seq);
+            let mut writer = recorder.request_body(None).unwrap();
+            writer.feed(&block);
+            writer.finish();
+            recorder.end(true);
+            assert!(history.body_bytes() <= 64 * MIB, "第 {seq} 个之后超了预算");
+        }
+        assert_eq!(history.body_bytes(), 64 * MIB);
+        let states: Vec<String> = (1..=100)
+            .map(|seq| {
+                body_state(&history, seq)["state"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        let kept = states.iter().filter(|s| *s == "retained").count();
+        assert_eq!(kept, 32);
+        assert!(states[..100 - kept].iter().all(|s| s == "evicted"));
+        assert!(states[100 - kept..].iter().all(|s| s == "retained"));
+    }
+
     /// 一个体就比整个预算大：不保留，已经收下的部分也丢掉，别的体不受牵连。
     #[test]
     fn a_body_larger_than_the_budget_is_not_retained() {
@@ -2052,6 +2403,152 @@ mod tests {
         }
     }
 
+    /// 借来的小块拷进自己的块里再入库：入库的块不指向原来的缓冲区，攒够了才成块。
+    #[test]
+    fn borrowed_chunks_are_copied_into_owned_blocks() {
+        let history = history(1, &["sk-live-0123456789abcdef"]);
+        let recorder = begin(&history, 1);
+        let mut writer = recorder.request_body(None).unwrap();
+        let buffer = Bytes::from(vec![b'e'; 8192]);
+        let mut expected = Vec::new();
+        for round in 0..40 {
+            // 夹一个被切成两半的密钥
+            let piece: &[u8] = match round {
+                7 => b"sk-live-0123",
+                8 => b"456789abcdef",
+                _ => &buffer[..3000],
+            };
+            writer.feed_copy(piece);
+            expected.extend_from_slice(piece);
+        }
+        let expected = Secrets::new(["sk-live-0123456789abcdef"]).replace_bytes(&expected);
+        {
+            let record = history.find(&id(1)).unwrap();
+            let inner = lock(&record.inner);
+            let body = lock(&inner.request_body.as_ref().unwrap().inner);
+            // 40 次、共约 114 KiB：攒满 64 KiB 入库过一次，其余还攒着
+            assert!(body.bytes >= COPY_BLOCK as u64 - 64 && body.bytes < 2 * COPY_BLOCK as u64);
+            let range = buffer.as_ptr() as usize..buffer.as_ptr() as usize + buffer.len();
+            for chunk in &body.chunks {
+                assert!(!range.contains(&(chunk.as_ptr() as usize)));
+            }
+        }
+        writer.finish();
+        assert_eq!(
+            read_all(&history, 1, Part::Request, 0, MAX_BODY_READ),
+            expected
+        );
+        assert_eq!(history.body_bytes(), expected.len() as u64);
+    }
+
+    /// 填满的块在体被丢掉之后回到空闲表，下一个体用的就是同一块内存；空闲表有上限。
+    #[test]
+    fn full_blocks_are_recycled() {
+        let history = history(2, &[]);
+        assert_eq!(history.pool.keep, 4, "2 MiB 预算：空闲表最多留八分之一");
+        let data = vec![b'p'; 6 * COPY_BLOCK + 100];
+        let first = begin(&history, 1);
+        let mut writer = first.request_body(None).unwrap();
+        writer.feed_copy(&data);
+        writer.finish();
+        assert_eq!(history.body_bytes(), data.len() as u64);
+        let blocks: Vec<usize> = {
+            let record = history.find(&id(1)).unwrap();
+            let inner = lock(&record.inner);
+            let body = lock(&inner.request_body.as_ref().unwrap().inner);
+            // 六个整块，加一个按实际大小另存的尾巴
+            assert_eq!(body.chunks.len(), 7);
+            assert_eq!(body.chunks[6].len(), 100);
+            body.chunks[..6]
+                .iter()
+                .map(|c| {
+                    assert_eq!(c.len(), COPY_BLOCK);
+                    c.as_ptr() as usize
+                })
+                .collect()
+        };
+        assert_eq!(lock(&history.pool.free).len(), 1, "写者用完的那一块");
+
+        // 记录没了：六个整块还回来，空闲表只留四块
+        drop(first);
+        lock(&history.records).clear();
+        assert_eq!(history.body_bytes(), 0);
+        let free: Vec<usize> = lock(&history.pool.free)
+            .iter()
+            .map(|b| b.as_ptr() as usize)
+            .collect();
+        assert_eq!(free.len(), 4);
+
+        // 下一个体用的是空闲表里的块
+        let second = begin(&history, 2);
+        let mut writer = second.request_body(None).unwrap();
+        writer.feed_copy(&data[..2 * COPY_BLOCK]);
+        writer.finish();
+        {
+            let record = history.find(&id(2)).unwrap();
+            let inner = lock(&record.inner);
+            let body = lock(&inner.request_body.as_ref().unwrap().inner);
+            assert_eq!(body.chunks.len(), 2);
+            for chunk in &body.chunks {
+                let at = chunk.as_ptr() as usize;
+                assert!(free.contains(&at), "用的是空闲表里的块");
+                assert!(blocks.contains(&at), "也就是上一个体用过的块");
+            }
+        }
+        assert_eq!(
+            read_all(&history, 2, Part::Request, 0, MAX_BODY_READ),
+            &data[..2 * COPY_BLOCK]
+        );
+    }
+
+    /// 大缓冲区入库不拷贝；体被丢掉之后它回到空闲表，下一个要的人拿到的是同一块内存。
+    /// 别的大小的缓冲区不进空闲表。
+    #[test]
+    fn large_buffers_are_recycled() {
+        let history = history(16, &[]);
+        assert_eq!(history.buffers.keep, 2, "16 MiB 预算：空闲表最多留八分之一");
+        let first = begin(&history, 1);
+        let mut writer = first.request_body(None).unwrap();
+        let mut buffer = writer.buffer(LARGE_BUFFER);
+        assert_eq!((buffer.len(), buffer.capacity()), (0, LARGE_BUFFER));
+        let at = buffer.as_ptr() as usize;
+        buffer.resize(LARGE_BUFFER, b'h');
+        writer.feed_buffer(buffer);
+        // 不是这个大小的：现分配，入库之后也不回空闲表
+        let mut small = writer.buffer(1000);
+        assert_eq!(small.capacity(), 1000);
+        small.resize(1000, b's');
+        writer.feed_buffer(small);
+        writer.finish();
+        assert_eq!(history.body_bytes(), LARGE_BUFFER as u64 + 1000);
+        {
+            let record = history.find(&id(1)).unwrap();
+            let inner = lock(&record.inner);
+            let body = lock(&inner.request_body.as_ref().unwrap().inner);
+            assert_eq!(
+                body.chunks[0].as_ptr() as usize,
+                at,
+                "入库的就是交来的那一块"
+            );
+        }
+        let all = read_all(&history, 1, Part::Request, 0, MAX_BODY_READ);
+        assert_eq!(all.len(), LARGE_BUFFER + 1000);
+        assert!(all[..LARGE_BUFFER].iter().all(|b| *b == b'h'));
+        assert!(all[LARGE_BUFFER..].iter().all(|b| *b == b's'));
+        assert!(lock(&history.buffers.free).is_empty());
+
+        drop(first);
+        lock(&history.records).clear();
+        assert_eq!(history.body_bytes(), 0);
+        assert_eq!(lock(&history.buffers.free).len(), 1);
+
+        let second = begin(&history, 2);
+        let writer = second.request_body(None).unwrap();
+        let again = writer.buffer(LARGE_BUFFER);
+        assert_eq!(again.as_ptr() as usize, at);
+        assert_eq!((again.len(), again.capacity()), (0, LARGE_BUFFER));
+    }
+
     fn gzip(data: &[u8]) -> Vec<u8> {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(data).unwrap();
@@ -2094,6 +2591,34 @@ mod tests {
         assert_eq!(
             detail["tries"][0]["response"]["body"],
             json!({"bytes": stored.len(), "state": "retained", "encoding": "gzip"})
+        );
+    }
+
+    /// br 编码的体同样解码后保留，其中的密钥被替换，`encoding` 照记。
+    #[test]
+    fn brotli_bodies_are_decoded_too() {
+        let history = history(1, &["sk-live-0123456789abcdef"]);
+        let recorder = begin(&history, 1);
+        recorder.try_started(1, None, true, None);
+        let plain = br#"{"error":"bad key sk-live-0123456789abcdef"}"#;
+        let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22);
+        encoder.write_all(plain).unwrap();
+        let packed = encoder.into_inner();
+        let mut writer = recorder
+            .response_head(1, 401, std::iter::empty(), Some("br"))
+            .unwrap();
+        writer.feed_copy(&packed);
+        writer.finish();
+
+        let stored = read_all(&history, 1, Part::Response, 1, 1024);
+        assert_eq!(
+            String::from_utf8_lossy(&stored),
+            r#"{"error":"bad key <secret>"}"#
+        );
+        let detail: Value = serde_json::from_str(&history.detail_json(&id(1)).unwrap()).unwrap();
+        assert_eq!(
+            detail["tries"][0]["response"]["body"],
+            json!({"bytes": stored.len(), "state": "retained", "encoding": "br"})
         );
     }
 
@@ -2271,8 +2796,9 @@ mod tests {
         quiet.phase(Phase::Attempting);
         assert!(lock(&history.dirty).is_empty());
 
-        let (mut events, in_flight) = history.subscribe();
-        let in_flight: Value = serde_json::from_str(&in_flight).unwrap();
+        let mut subscription = history.subscribe().unwrap();
+        let events = &mut subscription.events;
+        let in_flight: Value = serde_json::from_str(&subscription.in_flight).unwrap();
         assert_eq!(in_flight.as_array().unwrap().len(), 1);
         assert_eq!(in_flight[0]["request_seq"], 1);
 
@@ -2320,8 +2846,17 @@ mod tests {
             events.try_recv().unwrap(),
             Event::Closing("shutdown")
         ));
+        // 订阅者有上限
+        let more: Vec<Subscription> = (1..MAX_SUBSCRIBERS)
+            .map(|_| history.subscribe().unwrap())
+            .collect();
+        assert_eq!(history.subscribers(), MAX_SUBSCRIBERS);
+        assert!(history.subscribe().is_none());
+        drop(more);
+        assert!(history.subscribe().is_some(), "退订之后名额还回来");
         // 最后一个订阅者走了，补发任务自己结束
-        drop(events);
+        drop(subscription);
+        assert_eq!(history.subscribers(), 0);
         tokio::time::sleep(FLUSH_EVERY * 3).await;
         assert!(!history.flushing.load(Ordering::Acquire));
     }

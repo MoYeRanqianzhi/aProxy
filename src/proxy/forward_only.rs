@@ -1,6 +1,78 @@
 //! 仅转发模式：真流式直通，不重试、不缓冲、不保活。
 
 use super::*;
+use crate::history::{BodyWriter, Phase, Recorder};
+
+/// 请求体开头留多少字节来读 `model` 与 `stream`（见 [`RequestTap`]）
+const SHAPE_PREFIX: usize = 64 * 1024;
+
+/// 请求体转发途中顺带做的记录：每一块交给请求历史一份，并留住开头的一段——本模式不缓冲
+/// 请求体，`model` 与 `stream` 只能从这一段里读，`model` 通常就在最前面。请求体流结束或被
+/// 丢弃时，把读到的结果与字节数记进请求记录。
+struct RequestTap {
+    rec: Recorder,
+    history: Option<BodyWriter>,
+    /// 请求体开头的至多 [`SHAPE_PREFIX`] 字节
+    prefix: Vec<u8>,
+    /// 已经收到的请求体字节数
+    seen: u64,
+    accept_sse: bool,
+    trigger: crate::config::KeepaliveTrigger,
+}
+
+impl RequestTap {
+    fn chunk(&mut self, chunk: &Bytes) {
+        self.seen += chunk.len() as u64;
+        let room = SHAPE_PREFIX.saturating_sub(self.prefix.len());
+        self.prefix
+            .extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if let Some(history) = self.history.as_mut() {
+            history.feed_copy(chunk);
+        }
+    }
+}
+
+impl Drop for RequestTap {
+    fn drop(&mut self) {
+        use crate::config::KeepaliveTrigger;
+        let (model, body_stream) =
+            probe_shape(serde_json::Deserializer::from_slice(&self.prefix), true);
+        let body_stream = body_stream == Some(true);
+        // 与缓冲路径同一套判定（见 keepalive_triggered），只是请求体那一半看的是开头一段
+        let stream = match self.trigger {
+            KeepaliveTrigger::Accept => self.accept_sse,
+            KeepaliveTrigger::BodyStream => body_stream,
+            KeepaliveTrigger::Any => self.accept_sse || body_stream,
+        };
+        // 写者先结束，体的状态才是「收完了」
+        drop(self.history.take());
+        self.rec.request_bytes(self.seen);
+        self.rec.request_shape(model, stream);
+    }
+}
+
+/// 响应转发途中顺带做的记录：每一块交给请求历史一份，数着已经转给客户端多少字节。响应流
+/// 结束、出错或被丢弃（客户端断开）时，把这唯一的一次尝试记完。
+struct ResponseTap {
+    rec: Recorder,
+    history: Option<BodyWriter>,
+    /// 已经转给客户端的响应体字节数
+    forwarded: u64,
+    /// 这次尝试算失败的原因：上游回了错误状态码，或响应流中途断了
+    failure: Option<AttemptFailure>,
+}
+
+impl Drop for ResponseTap {
+    fn drop(&mut self) {
+        drop(self.history.take());
+        self.rec.response_bytes(self.forwarded);
+        self.rec.try_ended(
+            1,
+            self.forwarded,
+            self.failure.as_ref().map(AttemptFailure::for_history),
+        );
+    }
+}
 
 /// 仅转发模式的核心路径：请求体边收边发上游、上游响应边收边回客户端，
 /// **不缓冲、不落盘、不重试、不检查响应内容**。
@@ -23,6 +95,30 @@ pub(super) async fn forward_only_proxy(
 ) -> Response {
     // 本模式恰好尝试一次：请求一发出就算一次上游尝试
     trace.attempts = 1;
+    // 请求历史：发出的体就是客户端的请求体（边收边发，同一份），所以这次尝试记为
+    // 「与原始请求体相同」，体只存一份
+    let rec = trace.rec.clone();
+    let tap = RequestTap {
+        history: rec.request_body(body_encoding(
+            headers
+                .get(http::header::CONTENT_ENCODING)
+                .map(|v| v.as_bytes()),
+        )),
+        rec: rec.clone(),
+        prefix: Vec::new(),
+        seen: 0,
+        accept_sse: accepts_event_stream(&headers),
+        trigger: state.config.keepalive_trigger(),
+    };
+    let sent = rec.sent_head(
+        method.as_str(),
+        &target_url,
+        headers
+            .iter()
+            .filter(|(name, _)| !is_hop_header(name.as_str()))
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    );
+    rec.try_started(1, sent.as_ref(), true, None);
     let reqwest_method =
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
 
@@ -58,14 +154,15 @@ pub(super) async fn forward_only_proxy(
     // 错误分支），两条路径归因必须一致——仅转发模式此前是异常的那一侧。
     let client_gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let gone_flag = client_gone.clone();
-    // unfold 状态 = (上游流, 已见字节数)；产出的就是同一份 chunk（移动，不拷贝、
-    // 不累积），故在途内存与负载大小无关
+    // unfold 状态 = (上游流, 已见字节数, 请求历史的记录)；产出的就是同一份 chunk（移动，
+    // 不拷贝、不累积），故在途内存与负载大小无关
     let counted = futures_util::stream::unfold(
-        (body.into_data_stream(), 0usize),
-        move |(mut stream, seen)| {
+        (body.into_data_stream(), 0usize, tap),
+        move |(mut stream, seen, mut tap)| {
             let flag = flag.clone();
             let gone_flag = gone_flag.clone();
             async move {
+                // 流结束时 tap 随这个 future 一起被丢弃，请求体的记录就此收尾
                 let chunk = stream.next().await?;
                 let chunk = match chunk {
                     Ok(c) => c,
@@ -73,9 +170,10 @@ pub(super) async fn forward_only_proxy(
                         // 这里的 Err 只可能来自客户端侧（body 即客户端请求体）；
                         // 原样透传给 reqwest 以中止上游请求，真实原因由标记承载
                         gone_flag.store(true, AtomicOrdering::Relaxed);
-                        return Some((Err(e), (stream, seen)));
+                        return Some((Err(e), (stream, seen, tap)));
                     }
                 };
+                tap.chunk(&chunk);
                 let seen = seen.saturating_add(chunk.len());
                 if seen > limit {
                     flag.store(true, AtomicOrdering::Relaxed);
@@ -89,10 +187,10 @@ pub(super) async fn forward_only_proxy(
                         Err(axum::Error::new(std::io::Error::other(
                             "the request body exceeds the limit",
                         ))),
-                        (stream, seen),
+                        (stream, seen, tap),
                     ));
                 }
-                Some((Ok(chunk), (stream, seen)))
+                Some((Ok(chunk), (stream, seen, tap)))
             }
         },
     );
@@ -110,6 +208,7 @@ pub(super) async fn forward_only_proxy(
             // 是刻意的：超限排在最前——它同时也会让适配器产出 Err，而「你的请求体
             // 太大」比「你断开了」更接近事实、更可操作。两个标记都没置位才是真·上游失败。
             if too_large.load(AtomicOrdering::Relaxed) {
+                rec.try_ended(1, 0, None);
                 return body_too_large_response(limit, &trace);
             }
             // 客户端上传途中断开：**不记 last_error、不打「上游请求失败」**——
@@ -118,6 +217,7 @@ pub(super) async fn forward_only_proxy(
             // 中间观测看的，取与缓冲路径同一事件一致的 400。
             if client_gone.load(AtomicOrdering::Relaxed) {
                 tracing::error!(code = %"client_body_aborted", error = %failure.message, target = %masked_target, "客户端请求体传输中断，已中止上游请求");
+                rec.try_ended(1, 0, None);
                 return Terminal::client_body_aborted().into_response(&trace);
             }
             // 上游失败不重试（本模式的定义），但必须记进实例的观测值，否则 status 的
@@ -126,12 +226,41 @@ pub(super) async fn forward_only_proxy(
             let terminal = Terminal::upstream_failed(&failure);
             failure.record_in(&state.stats);
             terminal.record_in(&state.stats);
+            rec.try_ended(1, 0, Some(failure.for_history()));
+            rec.decided(1, "default".to_string(), false);
             tracing::warn!(code = %terminal.code(), last_code = failure.code, error = %failure.message, target = %masked_target, "上游请求失败（仅转发模式不重试）");
             return terminal.into_response(&trace);
         }
     };
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    // 请求历史：上游实际回的响应头（逐跳头也在内），响应体边转边交一份。上游回了错误
+    // 状态码时照样原样转给客户端，记录的结局是「上游错误」
+    let mut tap = ResponseTap {
+        history: rec.response_head(
+            1,
+            status.as_u16(),
+            resp.headers()
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+            body_encoding(
+                resp.headers()
+                    .get(reqwest::header::CONTENT_ENCODING)
+                    .map(|v| v.as_bytes()),
+            ),
+        ),
+        rec: rec.clone(),
+        forwarded: 0,
+        failure: None,
+    };
+    rec.phase(Phase::Forwarding);
+    if status.is_client_error() || status.is_server_error() {
+        tap.failure = Some(AttemptFailure::response(status));
+        rec.settle(
+            crate::history::Outcome::UpstreamError,
+            Some("upstream_failed"),
+        );
+    }
     let mut resp_builder = Response::builder().status(status);
     // 上游是否用 transfer-encoding 分帧（判定取自**上游原始响应头**，而非我们
     // 正在拼的下游头表）：决定 content-length 能否保留，理由见 is_hop_response_header
@@ -165,19 +294,24 @@ pub(super) async fn forward_only_proxy(
     // 的网络读写开销可忽略。
     //
     // 逐块读、逐块交出：两次读到数据之间的时限（`timeouts.read_idle_secs`）在每一块上重新
-    // 计时。流在第一个错误之后结束（`done`）。
+    // 计时。流在第一个错误之后结束（`done`）。`tap` 跟着状态走：流结束、出错之后或客户端
+    // 断开时它被丢弃，这次尝试就此记完。
     let stream =
-        futures_util::stream::unfold((resp, 0u64, false), move |(mut resp, forwarded, done)| {
+        futures_util::stream::unfold((resp, tap, false), move |(mut resp, mut tap, done)| {
             let state = state.clone();
             async move {
                 if done {
                     return None;
                 }
+                let forwarded = tap.forwarded;
                 match next_chunk(&mut resp, &state.config, forwarded).await {
                     Ok(Some(chunk)) => {
                         state.touch_activity();
-                        let forwarded = forwarded + chunk.len() as u64;
-                        Some((Ok(chunk), (resp, forwarded, false)))
+                        tap.forwarded += chunk.len() as u64;
+                        if let Some(history) = tap.history.as_mut() {
+                            history.feed_copy(&chunk);
+                        }
+                        Some((Ok(chunk), (resp, tap, false)))
                     }
                     Ok(None) => None,
                     Err(failure) => {
@@ -191,10 +325,14 @@ pub(super) async fn forward_only_proxy(
                             forwarded_bytes = forwarded,
                             "上游响应流中断，连接就此截断（仅转发模式不重试）"
                         );
-                        Some((
-                            Err(std::io::Error::other(failure.message)),
-                            (resp, forwarded, true),
-                        ))
+                        // 请求记录：这次尝试断在半路，结局是「上游错误」
+                        tap.rec.settle(
+                            crate::history::Outcome::UpstreamError,
+                            Some("upstream_failed"),
+                        );
+                        let message = failure.message.clone();
+                        tap.failure = Some(failure);
+                        Some((Err(std::io::Error::other(message)), (resp, tap, true)))
                     }
                 }
             }

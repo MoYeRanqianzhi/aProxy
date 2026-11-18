@@ -187,6 +187,7 @@ fn committed_sink(
         beat: Heartbeat {
             fixed: Bytes::from_static(b": keepalive\n\n"),
             dynamic: None,
+            rec: crate::history::Recorder::none(),
         },
         replay_gate: Arc::default(),
     };
@@ -213,6 +214,7 @@ fn heartbeat_only_disconnect_logs_generic_client_hint() {
         beat: Heartbeat {
             fixed: Bytes::new(),
             dynamic: None,
+            rec: crate::history::Recorder::none(),
         },
     }
     .log_client_gone("等待上游");
@@ -413,7 +415,12 @@ async fn request_body_dropped_mid_upload_leaves_no_file() {
         .chain(futures_util::stream::pending());
     let count = || std::fs::read_dir(dir.path()).unwrap().count();
     {
-        let fut = read_request_body(Body::from_stream(stream), usize::MAX, Some(dir.path()));
+        let fut = read_request_body(
+            Body::from_stream(stream),
+            usize::MAX,
+            Some(dir.path()),
+            None,
+        );
         tokio::pin!(fut);
         // 逐次 poll：文件出现后再推进一段时间，让溢写写完、future 停到
         // 「等下一块」上（这正是客户端上传中途停住再断开的形态）

@@ -1,6 +1,7 @@
 //! 入口：路由与请求处理的分派（入站校验 → 计数 → 仅转发分叉 → 读请求体 → 选通道）。
 
 use super::*;
+use crate::history::Phase;
 use tracing::Instrument as _;
 
 /// 构建路由：全量透传（无额外健康检查路径，避免与上游 `/health` 等冲突）
@@ -30,7 +31,29 @@ pub(super) async fn proxy_handler(State(state): State<AppState>, req: Request) -
     let request_seq = state.stats.note_request();
     // 在途数：从这里算起，到响应体交付完（或客户端断开、响应被丢弃）为止
     let in_flight = state.stats.enter();
-    let trace = RequestTrace::new(state.request_id(request_seq));
+    let request_id: Arc<str> = state.request_id(request_seq).into();
+    // 请求历史里的一条记录，从这里记到响应交付完。头记的是客户端发来的原样（入库时打码），
+    // 不是下面覆盖、追加之后的
+    let forward = state.config.forward_only_enabled();
+    let rec = state.history.begin(
+        request_seq,
+        request_id.clone(),
+        crate::history::Start {
+            method: method.as_str(),
+            path_and_query: uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/"),
+            headers: req.headers(),
+            delivery: if forward { "forward" } else { "retry" },
+            phase: if forward {
+                Phase::Attempting
+            } else {
+                Phase::ReadingBody
+            },
+        },
+    );
+    // 处理函数被取消（客户端在拿到响应之前断开）时，它随 future 一起被丢弃，照样收尾
+    let delivery = Delivery::new(rec.clone(), in_flight);
+    let trace = RequestTrace::recorded(request_id, rec);
+    let bodiless = method == http::Method::HEAD;
 
     // 这个请求的全部日志都带 request_id：与响应头 x-aproxy-request-id、错误体里的是同一个串，
     // 拿着其中任何一个都能在日志里找到这个请求的经过
@@ -38,20 +61,7 @@ pub(super) async fn proxy_handler(State(state): State<AppState>, req: Request) -
     let response = handle(state, req, method, uri, trace)
         .instrument(span)
         .await;
-    hold_until_body_ends(response, in_flight)
-}
-
-/// 把 `guard` 存进响应体里：响应体发完、或客户端断开使它被丢弃时才释放。在途请求数靠它
-/// 算到响应真正交付完为止——处理函数返回时，保活流、回放与仅转发的响应体都还在往外写。
-fn hold_until_body_ends(response: Response, guard: crate::daemon::Counted) -> Response {
-    use http_body_util::BodyExt;
-    response.map(|body| {
-        axum::body::Body::new(body.map_frame(move |frame| {
-            // 引用一下，让闭包按值持有守卫
-            let _held = &guard;
-            frame
-        }))
-    })
+    delivery.attach(response, bodiless)
 }
 
 /// 通过了入站校验、编好请求标识之后的处理。
@@ -99,8 +109,18 @@ async fn handle(
     // 超出直接 413。disk_cache 开启时超过内存驻留阈值（1 MiB）溢写磁盘，
     // 大请求体的进程内存在途占用恒定。
     let body_limit = state.config.body_limit_bytes();
-    let req_body = match read_request_body(req.into_body(), body_limit, state.spool_dir.as_deref())
-        .await
+    let history = trace.rec.request_body(body_encoding(
+        headers
+            .get(http::header::CONTENT_ENCODING)
+            .map(|v| v.as_bytes()),
+    ));
+    let (req_body, model) = match read_request_body(
+        req.into_body(),
+        body_limit,
+        state.spool_dir.as_deref(),
+        history,
+    )
+    .await
     {
         Ok(b) => b,
         Err(ReadBodyError::TooLarge) => return body_too_large_response(body_limit, &trace),
@@ -123,8 +143,18 @@ async fn handle(
     // 判定语义是「客户端视角」，转换器改写 Accept/请求体不影响保活选择
     let keepalive_dur = state.config.keepalive_interval();
     let keepalive_enabled = state.config.keepalive_enabled() && keepalive_dur.as_secs() > 0;
-    let keepalive_applies = keepalive_enabled
-        && keepalive_triggered(state.config.keepalive_trigger(), &headers, &req_body).await;
+    // 「客户端是不是在要一个流」不管保活开没开都判：请求记录的 `stream` 用的是同一个结论
+    let wants_stream =
+        keepalive_triggered(state.config.keepalive_trigger(), &headers, &req_body).await;
+    let keepalive_applies = keepalive_enabled && wants_stream;
+    trace.rec.request_bytes(match &req_body {
+        RequestBody::Memory(bytes) => bytes.len() as u64,
+        RequestBody::Disk { len, .. } => *len,
+    });
+    trace.rec.request_shape(model, wants_stream);
+    if keepalive_applies {
+        trace.rec.keepalive();
+    }
 
     let req = OutboundRequest {
         method,
@@ -147,7 +177,7 @@ async fn handle(
         let task_trace = trace.clone();
         tokio::spawn(
             async move {
-                let mut r = Responder::keepalive(&state, resp_tx);
+                let mut r = Responder::keepalive(&state, resp_tx, task_trace.rec.clone());
                 run_attempts(
                     &state,
                     req,

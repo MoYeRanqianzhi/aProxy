@@ -36,6 +36,8 @@ pub struct AppState {
     /// 入站校验拒掉的请求的序号。这些请求不计入请求数（见 handler），所以另用一个序号给
     /// 它们的错误响应编标识
     pub(super) rejected_seq: Arc<std::sync::atomic::AtomicU64>,
+    /// 请求历史：最近的请求、每次尝试，以及请求体与响应体。热路径往里写，控制通道从里读
+    pub history: Arc<crate::history::History>,
 }
 
 /// 一条重试规则，`path` 已编译（自动锚定两端）。
@@ -165,8 +167,15 @@ impl AppState {
             "{:016x}",
             ((started_ms & 0xffff_ffff_ffff) << 16) | u64::from(std::process::id() & 0xffff)
         );
+        let instance_id: Arc<str> = instance_id.into();
+        let history = crate::history::History::new(
+            config.history_body_budget_mb,
+            config.known_secrets(),
+            instance_id.clone(),
+        );
         Self {
-            instance_id: instance_id.into(),
+            instance_id,
+            history,
             rejected_seq: Arc::default(),
             spool_dir,
             config: Arc::new(config),

@@ -49,6 +49,8 @@ pub(super) enum KeepaliveSink {
 pub(super) struct Heartbeat {
     pub(super) fixed: Bytes,
     pub(super) dynamic: Option<Arc<DynamicHeartbeat>>,
+    /// 这个请求在请求历史里的记录：每发出一个心跳记一次
+    pub(super) rec: crate::history::Recorder,
 }
 
 /// 一个请求的动态心跳生成器（在各拍的独立任务间共享）。
@@ -218,12 +220,17 @@ impl KeepaliveSink {
                         beat.fixed.clone(),
                         at.elapsed(),
                     );
+                    beat.rec.heartbeat();
                     return true;
                 }
-                !matches!(
-                    tx.try_send(Ok(beat.fixed.clone())),
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
-                )
+                match tx.try_send(Ok(beat.fixed.clone())) {
+                    Ok(()) => {
+                        beat.rec.heartbeat();
+                        true
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => true,
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+                }
             }
             Self::Pending { .. } => true,
         }

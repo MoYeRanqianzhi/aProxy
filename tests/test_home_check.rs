@@ -46,6 +46,16 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          文件里只有一个测试，值是 TestHome 的路径",
     ),
     (
+        "access_control.rs",
+        "Command::new(\"python3\")",
+        "一个只会连 unix socket、发一行 ping 的 python 客户端，不是 aproxy",
+    ),
+    (
+        "access_control.rs",
+        "Command::new(\"sudo\")",
+        "以另一个用户的身份运行上面那个 python 客户端（sudo 之后跟的恒为 python3），不是 aproxy",
+    ),
+    (
         "install_flow_lib.rs",
         "std::env::set_var(\"APROXY_HOME\"",
         "库层测试在进程内调用安装流程，库函数分离拉起的守护只继承测试进程的环境，\

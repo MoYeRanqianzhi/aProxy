@@ -2054,21 +2054,99 @@ mod imp {
         (ok != 0 && pid != 0).then_some(pid)
     }
 
+    /// 控制管道的安全描述符：受保护的显式 DACL，只有两项——当前用户与 SYSTEM，各自完全
+    /// 控制。每个管道实例创建时都带它。
+    ///
+    /// 不带它时管道用默认的安全描述符，其中有给 Everyone 的读权限；控制通道能停实例，
+    /// 以后还能读请求内容，只该让启动实例的用户（与本来就无所不能的 SYSTEM）连上。同一
+    /// 用户提权后的进程用的还是同一个用户 SID，照样连得上。
+    pub struct PipeSecurity {
+        /// `ConvertStringSecurityDescriptorToSecurityDescriptorW` 分配的自相对描述符，
+        /// 建好之后只读，`Drop` 时用 `LocalFree` 归还
+        descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+    }
+
+    // SAFETY: 描述符是一块建好之后不再改动的堆内存，只被读取（交给 CreateNamedPipe 拷贝），
+    // 在线程之间移动或共享都不会产生数据竞争
+    unsafe impl Send for PipeSecurity {}
+    unsafe impl Sync for PipeSecurity {}
+
+    impl PipeSecurity {
+        /// 为当前用户建描述符。
+        pub fn for_current_user() -> io::Result<Self> {
+            use windows_sys::Win32::Security::Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            };
+            // D:P = 受保护的 DACL（不继承）；GA = 完全控制；SY = SYSTEM
+            let sddl = format!(
+                "D:P(A;;GA;;;{})(A;;GA;;;SY)",
+                crate::fsx::current_user_sid()?
+            );
+            let sddl: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut descriptor = std::ptr::null_mut();
+            // SAFETY: sddl 以 0 结尾；descriptor 指向本栈上的指针，成功时由系统填入
+            let ok = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self { descriptor })
+        }
+
+        /// 按 `options` 建一个带这份描述符的管道实例。
+        fn create(&self, options: &ServerOptions, endpoint: &str) -> io::Result<NamedPipeServer> {
+            let mut attributes = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
+                    as u32,
+                lpSecurityDescriptor: self.descriptor,
+                bInheritHandle: 0,
+            };
+            // SAFETY: attributes 是一个有效的 SECURITY_ATTRIBUTES，它指向的描述符在 self
+            // 存活期间有效；CreateNamedPipe 在调用期间拷贝描述符，不保留指针
+            unsafe {
+                options.create_with_security_attributes_raw(
+                    endpoint,
+                    (&mut attributes as *mut windows_sys::Win32::Security::SECURITY_ATTRIBUTES)
+                        .cast(),
+                )
+            }
+        }
+    }
+
+    impl Drop for PipeSecurity {
+        fn drop(&mut self) {
+            // SAFETY: descriptor 来自 ConvertStringSecurityDescriptorToSecurityDescriptorW，
+            // 只在这里释放一次
+            unsafe {
+                windows_sys::Win32::Foundation::LocalFree(self.descriptor as _);
+            }
+        }
+    }
+
     /// 已独占创建的端点：第一个管道实例在手，名字从此归本进程。
     pub struct Listener {
         endpoint: String,
         first: NamedPipeServer,
+        security: PipeSecurity,
     }
 
     /// `first_pipe_instance`：名字已被别的进程占着就失败，而不是加入它、和它
-    /// 分摊连接——那样一半的 stop/ping 会落到别人手里。
+    /// 分摊连接——那样一半的 stop/ping 会落到别人手里。管道拒绝远程客户端（tokio 的
+    /// 默认值），只让当前用户与 SYSTEM 连接（见 [`PipeSecurity`]）；建不出安全描述符时
+    /// 宁可没有控制通道，也不建一个谁都能连的。
     pub async fn bind(endpoint: &str) -> io::Result<Listener> {
-        let first = ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(endpoint)?;
+        let security = PipeSecurity::for_current_user()?;
+        let first = security.create(ServerOptions::new().first_pipe_instance(true), endpoint)?;
         Ok(Listener {
             endpoint: endpoint.to_string(),
             first,
+            security,
         })
     }
 
@@ -2078,13 +2156,14 @@ mod imp {
         let Listener {
             endpoint,
             first: mut server,
+            security,
         } = listener;
         loop {
             let connected = server.connect().await;
             // 先建好下一个实例，再交出（或丢掉）当前这个：管道名只在至少还有
             // 一个实例时存在，名字一消失，客户端就会把「找不到」当成实例已退出
             let next = loop {
-                match ServerOptions::new().create(&endpoint) {
+                match security.create(&ServerOptions::new(), &endpoint) {
                     Ok(next) => break next,
                     Err(e) => {
                         tracing::warn!(error = %e, "控制管道新建监听实例失败，1 秒后重试");
@@ -2132,13 +2211,58 @@ mod imp {
                     _ => IpcError::Transient(msg),
                 }
             })?;
-        let peer = client
-            .peer_cred()
-            .ok()
+        let cred = client.peer_cred().ok();
+        // 在这个路径上听的进程必须是该信的用户，否则不发请求、也不读它的应答：socket
+        // 的路径可以预测，目录权限过宽时别的用户能抢先在那里放一个自己的 socket
+        if let Some(server) = cred.as_ref().map(|cred| cred.uid()) {
+            // SAFETY: geteuid 没有前置条件，也不会失败
+            let me = unsafe { libc::geteuid() };
+            let dir_owner = Path::new(endpoint)
+                .parent()
+                .and_then(|dir| std::fs::metadata(dir).ok())
+                .map(|meta| std::os::unix::fs::MetadataExt::uid(&meta));
+            if !trusted_server_uid(me, server, dir_owner) {
+                return Err(IpcError::Protocol(format!(
+                    "控制端点上的进程属于另一个用户（uid {server}），不予采信"
+                )));
+            }
+        }
+        let peer = cred
             .and_then(|cred| cred.pid())
             .and_then(|pid| u32::try_from(pid).ok())
             .filter(|&pid| pid != 0);
         Ok((exchange_over(client, req_line).await?, peer))
+    }
+
+    /// 客户端该不该信在控制端点上听的进程。`me` 是客户端的有效 uid，`server` 是对端的，
+    /// `dir_owner` 是 socket 所在目录（run 目录，归 home 的属主）的属主。
+    /// - 普通用户：只信自己的进程；
+    /// - root（`sudo aproxy stop`）：信 home 属主的进程，也信 root 自己的。
+    pub(super) fn trusted_server_uid(me: u32, server: u32, dir_owner: Option<u32>) -> bool {
+        if me != 0 {
+            return server == me;
+        }
+        server == 0 || dir_owner == Some(server)
+    }
+
+    /// 服务端该不该接受这个客户端：同一个用户，或 root（它本来就无所不能，放行它
+    /// `sudo aproxy stop` 才能用）。
+    pub(super) fn accepted_client_uid(me: u32, client: u32) -> bool {
+        client == me || client == 0
+    }
+
+    /// 在 `path` 上建监听 socket，并把它的权限收到 0600：只有属主连得上。bind 按 umask
+    /// 建文件，随后才改权限，中间有一小段窗口；这段窗口里连进来的别的用户仍然过不了接受
+    /// 循环里的对端 uid 核对。权限改不成时不留下这个 socket。
+    fn bind_private(path: &Path) -> io::Result<UnixListener> {
+        use std::os::unix::fs::PermissionsExt;
+        let listener = UnixListener::bind(path)?;
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            drop(listener);
+            let _ = std::fs::remove_file(path);
+            return Err(e);
+        }
+        Ok(listener)
     }
 
     pub struct Listener {
@@ -2168,7 +2292,7 @@ mod imp {
                 ));
             }
         }
-        UnixListener::bind(path).map(|listener| Listener {
+        bind_private(path).map(|listener| Listener {
             listener,
             path: path.to_path_buf(),
         })
@@ -2195,6 +2319,21 @@ mod imp {
                             continue;
                         }
                     };
+                    // 只接受本用户与 root 的连接；对端是谁都读不出来的连接同样不接受。
+                    // 不读请求、不回应答，直接断开
+                    // SAFETY: geteuid 没有前置条件，也不会失败
+                    let me = unsafe { libc::geteuid() };
+                    match stream.peer_cred().map(|cred| cred.uid()) {
+                        Ok(client) if accepted_client_uid(me, client) => {}
+                        Ok(client) => {
+                            tracing::warn!(uid = client, "控制 socket 拒绝了另一个用户的连接");
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "控制 socket 读不出对端的身份，连接已拒绝");
+                            continue;
+                        }
+                    }
                     let state = state.clone();
                     tokio::spawn(async move {
                         let _ = handle_conn(stream, state).await;
@@ -2208,7 +2347,7 @@ mod imp {
                         Err(e) if e.kind() == io::ErrorKind::NotFound
                     );
                     if missing && !retiring {
-                        match UnixListener::bind(&path) {
+                        match bind_private(&path) {
                             Ok(fresh) => {
                                 listener = fresh;
                                 tracing::warn!(path = %path.display(), "控制 socket 文件被删除，已在原路径重建");
@@ -3117,6 +3256,151 @@ mod tests {
             }
         }
         assert!(healed, "被删的控制 socket 应在原路径重建");
+        server.abort();
+    }
+
+    /// 控制 socket 只有属主连得上（0600），被删后重建出来的也一样。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn control_socket_is_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &str| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = test_endpoint(dir.path(), "private");
+        let mut record = sample_info("0");
+        record.pid = std::process::id();
+        let server = tokio::spawn(serve_endpoint(endpoint.clone(), control(record).0));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(mode(&endpoint), 0o600);
+
+        std::fs::remove_file(&endpoint).unwrap();
+        let mut recreated = false;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if std::path::Path::new(&endpoint).exists() {
+                recreated = true;
+                break;
+            }
+        }
+        assert!(recreated, "被删的控制 socket 应在原路径重建");
+        assert_eq!(
+            mode(&endpoint),
+            0o600,
+            "重建出来的 socket 同样只有属主连得上"
+        );
+        server.abort();
+    }
+
+    /// 两端各自信谁：普通用户只信自己；root 作客户端时信 home 的属主与 root；服务端只接受
+    /// 本用户与 root。
+    #[cfg(unix)]
+    #[test]
+    fn peers_are_trusted_by_uid() {
+        use imp::{accepted_client_uid, trusted_server_uid};
+        // 普通用户作客户端
+        assert!(trusted_server_uid(1000, 1000, Some(1000)));
+        assert!(!trusted_server_uid(1000, 1001, Some(1001)));
+        assert!(
+            !trusted_server_uid(1000, 0, Some(1000)),
+            "root 的实例普通用户不认"
+        );
+        // root 作客户端
+        assert!(trusted_server_uid(0, 1000, Some(1000)), "home 属主的实例");
+        assert!(trusted_server_uid(0, 0, Some(1000)), "root 自己的实例");
+        assert!(
+            !trusted_server_uid(0, 1001, Some(1000)),
+            "别人放在这个目录里的"
+        );
+        assert!(!trusted_server_uid(0, 1001, None), "目录属主读不出来时不认");
+        // 服务端
+        assert!(accepted_client_uid(1000, 1000));
+        assert!(accepted_client_uid(1000, 0));
+        assert!(!accepted_client_uid(1000, 1001));
+    }
+
+    /// 控制管道的 DACL 只有两项：当前用户与 SYSTEM，各自完全控制，不继承。连接之后新建的
+    /// 下一个管道实例同样如此。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn control_pipe_admits_only_its_owner_and_system() {
+        use std::os::windows::io::AsRawHandle;
+        use tokio::net::windows::named_pipe::ClientOptions;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+            SE_KERNEL_OBJECT,
+        };
+        use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+        /// 读回一个已打开的管道句柄的 DACL，写成 SDDL。
+        fn dacl_of(client: &tokio::net::windows::named_pipe::NamedPipeClient) -> String {
+            unsafe {
+                let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+                let code = GetSecurityInfo(
+                    client.as_raw_handle() as isize,
+                    SE_KERNEL_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut descriptor,
+                );
+                assert_eq!(code, 0, "GetSecurityInfo 失败");
+                let mut text: *mut u16 = std::ptr::null_mut();
+                let ok = ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    descriptor,
+                    SDDL_REVISION_1,
+                    DACL_SECURITY_INFORMATION,
+                    &mut text,
+                    std::ptr::null_mut(),
+                );
+                assert_ne!(ok, 0, "描述符转 SDDL 失败");
+                let mut len = 0;
+                while *text.add(len) != 0 {
+                    len += 1;
+                }
+                let sddl = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+                LocalFree(text as _);
+                LocalFree(descriptor as _);
+                sddl
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = test_endpoint(dir.path(), "dacl");
+        let mut record = sample_info("0");
+        record.pid = std::process::id();
+        let server = tokio::spawn(serve_endpoint(endpoint.clone(), control(record).0));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 第一个连接落在第一个管道实例上；它连上之后服务端建出第二个实例，再连一次就是它
+        for round in ["第一个管道实例", "连接之后新建的管道实例"] {
+            let client = ClientOptions::new().open(&endpoint).unwrap();
+            let sddl = dacl_of(&client);
+            assert!(sddl.starts_with("D:P"), "{round}：不继承，{sddl}");
+            let mut aces: Vec<&str> = sddl[sddl.find('(').unwrap_or(sddl.len())..]
+                .split(['(', ')'])
+                .filter(|ace| !ace.is_empty())
+                .collect();
+            aces.sort();
+            assert_eq!(aces.len(), 2, "{round}：只有两项，{sddl}");
+            // 「完全控制」读回来是 FA（管道对象上 GENERIC_ALL 映射成的具体权限）
+            assert!(aces.contains(&"A;;FA;;;SY"), "{round}：{sddl}");
+            let own = aces.iter().find(|ace| **ace != "A;;FA;;;SY").unwrap();
+            assert!(own.starts_with("A;;FA;;;"), "{round}：{sddl}");
+            // 当前用户恰好是 SDDL 有两个字母别名的账户时读回来的是别名，否则是 SID 原文
+            let user = crate::fsx::current_user_sid().unwrap();
+            let who = own.rsplit(';').next().unwrap();
+            assert!(
+                who == user || who.len() == 2,
+                "{round}：{sddl}（当前用户 {user}）"
+            );
+            drop(client);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // 带着这份描述符，本用户照常能用控制通道
+        assert!(request_raw(&endpoint, IpcOp::Ping).await.is_ok());
         server.abort();
     }
 

@@ -28,6 +28,15 @@ home 的实例。
 （`GetNamedPipeServerProcessId` / `SO_PEERCRED`）：端点名可预测，抢先占住它的进程只能
 报出自己的 pid，普查再拿这个 pid 与注册记录比对。
 
+控制端点只让启动实例的用户用（同一用户的进程互相信任——它们本来就读得到配置里的明文
+密钥——所以不设令牌；防的是别的用户与远程）：
+- Windows：每个管道实例都带受保护的显式 DACL `D:P(A;;GA;;;<当前用户 SID>)(A;;GA;;;SY)`，
+  并拒绝远程客户端。建不出安全描述符时实例不启动，不退回谁都能连的默认权限。
+- unix：socket 文件是 0600（被删后重建的也是）。服务端经 `SO_PEERCRED` 只接受同一 uid 或
+  root 的连接，别的连接不读请求、不回应答，直接断开；客户端核对在端点上听的进程的 uid
+  等于自己，客户端是 root 时改为核对它等于 run 目录的属主（或 root）——`sudo aproxy stop`
+  因此可用。
+
 线上格式（v1，一连接一来回，各一行 JSON）：请求 `{"v":1,"op":"ping|shutdown|prepare_swap"}`，
 可带 `args` 对象：
 - `shutdown` 的 `keep_restore`（为真时实例退出但不删期望状态记录）与 `if_idle_secs`（实例已

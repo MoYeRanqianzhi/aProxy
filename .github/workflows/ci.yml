@@ -103,8 +103,10 @@ jobs:
         include:
           - variant: desktop
             flags: ""
+            features: ""
           - variant: headless
             flags: --exclude aproxy-desktop --no-default-features
+            features: --no-default-features
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
@@ -149,6 +151,13 @@ jobs:
       # windows 上的 clippy 不编译 #[cfg(unix)] 代码，零警告纪律在这里补上 unix 面
       - run: cargo clippy --workspace ${{ matrix.flags }} --all-targets --locked -- -D warnings
       - run: cargo test --workspace ${{ matrix.flags }} --locked --no-fail-fast
+      # 控制端点的访问控制要跨用户实测：建第二个用户，断言它连不上实例的控制 socket、root
+      # 连得上（tests/access_control.rs，平时 #[ignore]——开发机上没有这个用户，也未必有
+      # 免密 sudo）。runner 的 sudo 不要密码
+      - name: Access control across users
+        run: |
+          sudo useradd --system --no-create-home aproxy-ci-other
+          APROXY_TEST_OTHER_USER=aproxy-ci-other cargo test ${{ matrix.features }} --locked --test access_control -- --ignored --nocapture
       - name: Smoke-test --version (C5)
         run: bash .github/scripts/version-smoke.sh target/debug/aproxy ${{ matrix.variant }}
 

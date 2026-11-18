@@ -128,7 +128,7 @@ pub fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
 
 /// 当前进程所属用户的 SID，写成 `S-1-5-21-…` 的文本。
 #[cfg(windows)]
-fn current_user_sid() -> std::io::Result<String> {
+pub(crate) fn current_user_sid() -> std::io::Result<String> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};

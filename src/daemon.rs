@@ -249,6 +249,16 @@ pub struct Behavior {
     pub keepalive: KeepaliveBehavior,
     /// 生效的重试规则条数
     pub retry_rules: u32,
+    /// 请求历史的设置
+    #[serde(default)]
+    pub history: HistoryBehavior,
+}
+
+/// 请求历史的摘要（`behavior.history`）。
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HistoryBehavior {
+    /// 全部请求体与响应体加起来最多占多少内存（MiB）；0 = 不保留体
+    pub body_budget_mb: u64,
 }
 
 /// 保活的摘要（`behavior.keepalive`）。
@@ -276,6 +286,9 @@ impl Behavior {
                 interval_secs: cfg.keepalive_interval().as_secs(),
             },
             retry_rules: cfg.retry_rules.len() as u32,
+            history: HistoryBehavior {
+                body_budget_mb: cfg.history_body_budget_mb,
+            },
         }
     }
 }
@@ -2351,6 +2364,7 @@ mod tests {
                 interval_secs: 15,
             },
             retry_rules: 1,
+            history: HistoryBehavior { body_budget_mb: 64 },
         }
     }
 
@@ -2737,7 +2751,7 @@ mod tests {
                 r#"{"v":1,"ok":true,"result":{"#,
                 r#""instance":{"pid":42,"start":"","instance_id":"19ac3f2e8b5d1a2b","version":"0.0.0-test","listen_addr":"127.0.0.1:12345","config_path":"C:/tmp/config.toml","base_url":"https://api.example.com","started_at":1700000000000,"log_path":null,"foreground":false},"#,
                 r#""state":"serving","#,
-                r#""behavior":{"delivery":"retry","disk_cache":true,"keepalive":{"trigger":"any","interval_secs":15},"retry_rules":1},"#,
+                r#""behavior":{"delivery":"retry","disk_cache":true,"keepalive":{"trigger":"any","interval_secs":15},"retry_rules":1,"history":{"body_budget_mb":64}},"#,
                 r#""activity":{"last_request_at":1700000000000,"requests_total":120,"retries_total":7,"rescued_total":0,"in_flight":0,"retrying":0,"by_code":{},"#,
                 r#""buckets":{"width_secs":120,"requests":[ZEROS],"retries":[ZEROS],"failures":[ZEROS]},"last_error":null},"#,
                 r#""ops":["ping","shutdown","prepare_swap"],"#,

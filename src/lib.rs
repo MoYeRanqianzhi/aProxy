@@ -5,6 +5,7 @@ pub mod decode;
 pub mod doctor;
 pub mod find;
 pub mod fsx;
+pub mod history;
 pub mod install;
 pub mod ops;
 pub mod process;

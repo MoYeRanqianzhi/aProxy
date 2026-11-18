@@ -295,6 +295,9 @@ pub struct Config {
     pub retry_rules: Vec<RetryRule>,
     /// 等上游响应头的时限（秒，config.toml 的 `timeouts.first_byte_secs`）。0 = 不设限。
     pub first_byte_timeout_secs: u64,
+    /// 请求历史里全部请求体与响应体加起来最多占多少内存（MiB，config.toml 的
+    /// `history.body_budget_mb`）。超出时从最旧的请求开始丢体，记录本身留着；0 = 不保留体。
+    pub history_body_budget_mb: u64,
     /// 入站 Host 白名单（防 DNS 重绑定）：Host 校验生效时，额外放行的主机名。
     ///
     /// 威胁：恶意网页把自己的域名重绑定到 127.0.0.1 后，浏览器会把它当「同源」
@@ -365,6 +368,9 @@ pub struct Config {
     pub spool_dir_override: Option<PathBuf>,
 }
 
+/// `history.body_budget_mb` 的内置默认值（MiB）。
+pub const DEFAULT_HISTORY_BODY_BUDGET_MB: u64 = 64;
+
 /// 请求体上限（字节）：toml 显式值 > settings 注入值 > 内置 128。
 /// 0 = 不设限（与其他超时/上限配置的 0 语义一致）。
 /// None（未注入 settings 值，如测试直连构建）按内置默认。
@@ -423,6 +429,7 @@ impl Default for Config {
             forward_only: None,
             retry_rules: Vec::new(),
             first_byte_timeout_secs: default_read_timeout_secs(),
+            history_body_budget_mb: DEFAULT_HISTORY_BODY_BUDGET_MB,
             allowed_hosts: None,
             allowed_origins: None,
             request_transform: None,

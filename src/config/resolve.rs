@@ -380,6 +380,13 @@ pub fn resolve_text(
         )),
         forward_only: Some(delivery == Delivery::Forward),
         retry_rules: pick_or(s, "retry.rules", &f.retry.rules, &d.retry.rules, Vec::new()),
+        history_body_budget_mb: pick_or(
+            s,
+            "history.body_budget_mb",
+            &f.history.body_budget_mb,
+            &d.history.body_budget_mb,
+            super::DEFAULT_HISTORY_BODY_BUDGET_MB,
+        ),
         allowed_hosts: Some(pick_or(
             s,
             "allowed_hosts",

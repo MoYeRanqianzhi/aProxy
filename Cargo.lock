@@ -105,6 +105,7 @@ dependencies = [
  "aproxy-envelope",
  "aproxy-ipc",
  "axum",
+ "base64 0.22.1",
  "brotli",
  "brotli-decompressor",
  "bytes",
@@ -112,6 +113,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "http",
+ "http-body",
  "http-body-util",
  "libc",
  "regex",
@@ -177,6 +179,7 @@ name = "aproxy-ipc"
 version = "0.2.0-alpha.2"
 dependencies = [
  "libc",
+ "memchr",
  "serde",
  "serde_json",
  "sha2 0.11.1",

@@ -94,6 +94,11 @@ bytes = "1"
 http-body-util = "0.1"
 futures-util = "0.3"
 http = "1"
+# 响应体的包装（src/proxy/delivery.rs）要自己实现 Body：数发给客户端的字节、分清「发完了」
+# 与「客户端中途断开」。axum 与 hyper 用的就是这一个版本
+http-body = "1"
+# 请求历史的体经控制通道分块读出时用 base64（src/history.rs）
+base64 = "0.22"
 tokio-util = { version = "0.7", features = ["io"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 # install 下载校验：github 渠道 .sha256 强校验 / npm integrity 换算 / --from 完整性记录

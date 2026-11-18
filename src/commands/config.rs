@@ -383,6 +383,10 @@ fn print_effective(path: &std::path::Path, resolved: &config::Resolved) {
         with_zero(cfg.read_timeout_secs, "不设限"),
     );
     line(
+        "history.body_budget_mb",
+        with_zero(cfg.history_body_budget_mb, "不保留请求体与响应体"),
+    );
+    line(
         "keepalive.interval_secs",
         with_zero(cfg.keepalive_interval_secs, "保活关闭"),
     );

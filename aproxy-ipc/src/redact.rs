@@ -273,9 +273,33 @@ impl Secrets {
         self.known.is_empty()
     }
 
-    /// 最长的密钥的长度（字节）；没有密钥时为 0
-    fn max_len(&self) -> usize {
+    /// 最长的密钥的长度（字节）；没有密钥时为 0。按流替换的调用方每次要留住「它减 1」
+    /// 字节的尾巴，等下一块到了再一起看，被块边界切开的密钥才换得掉
+    pub fn max_len(&self) -> usize {
         self.known.first().map_or(0, Vec::len)
+    }
+
+    /// `haystack` 里最靠前的一处已知密钥：`(起点, 长度)`；同一起点既能匹配长的也能匹配短的
+    /// 时取长的。没有就是 None。
+    ///
+    /// 每个密钥用一次子串查找（`memchr::memmem`，按机器字宽成批比较），不逐字节比对：请求
+    /// 历史对每一块流过的体都要查一遍，绝大多数块里什么也没有。
+    pub fn find(&self, haystack: &[u8]) -> Option<(usize, usize)> {
+        let mut best: Option<(usize, usize)> = None;
+        // known 按长度从长到短：起点相同时先到的（长的）留下
+        for secret in &self.known {
+            // 已经有一处匹配时，更靠前的匹配只可能完全落在它的起点加本密钥长度之前
+            let window = match best {
+                Some((start, _)) => &haystack[..haystack.len().min(start + secret.len() - 1)],
+                None => haystack,
+            };
+            if let Some(at) = memchr::memmem::find(window, secret)
+                && best.is_none_or(|(start, _)| at < start)
+            {
+                best = Some((at, secret.len()));
+            }
+        }
+        best
     }
 
     /// `haystack[at..]` 开头处匹配的密钥的长度（取最长的）

@@ -23,6 +23,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # home_id：run 目录规范化路径的 SHA-256（src/endpoint.rs）。与 aproxy 用同一个版本线
 sha2 = "0.11"
+# 已知密钥的子串查找（src/redact.rs 的 Secrets::find）：请求历史对流过的每一块体都要查，
+# 逐字节比对在高吞吐下占得起 CPU。serde_json 本来就带着它，依赖树里不多出一个包
+memchr = "2"
 
 [target.'cfg(windows)'.dependencies]
 # 台账（src/ledger.rs）读进程创建时间、核验属主、结束进程。与 aproxy 一样精确钉在

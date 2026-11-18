@@ -2428,10 +2428,15 @@ where
     // 这一轮要写出去的事件行
     let mut batch = String::new();
     loop {
-        // 这一轮要发的事件：名字与 data 的 JSON 文本；`closing` 发完就结束
+        // 这一轮要发的事件：名字与 data 的 JSON 文本；`closing` 发完就结束。`at` 是事件自带
+        // 的时刻，没有的取写出的此刻
+        let mut at = None;
         let (event, data, last) = tokio::select! {
             received = subscription.events.recv() => match received {
-                Ok(Event::Request(record)) => ("request", record.to_string(), false),
+                Ok(Event::Request { at: happened, record }) => {
+                    at = Some(happened);
+                    ("request", record.to_string(), false)
+                }
                 Ok(Event::Closing(reason)) => {
                     ("closing", format!(r#"{{"reason":"{reason}"}}"#), true)
                 }
@@ -2472,23 +2477,23 @@ where
             data
         };
         batch.clear();
-        push_event(&mut batch, &mut seq, event, &data);
+        push_event(&mut batch, &mut seq, event, at, &data);
         // 队列里已经排着的事件一并带上，一次写出去。实例忙的时候，每写一次都要等运行时再排到
         // 这个任务；一次只写一个事件的话，每秒几百个事件就跟不上，订阅者会不停地收到 lagged
         let mut last = last;
         while !last && batch.len() < EVENT_BATCH_BYTES {
             match subscription.events.try_recv() {
-                Ok(Event::Request(record)) => {
-                    push_event(&mut batch, &mut seq, "request", &record);
+                Ok(Event::Request { at, record }) => {
+                    push_event(&mut batch, &mut seq, "request", Some(at), &record);
                 }
                 Ok(Event::Closing(reason)) => {
                     let data = format!(r#"{{"reason":"{reason}"}}"#);
-                    push_event(&mut batch, &mut seq, "closing", &data);
+                    push_event(&mut batch, &mut seq, "closing", None, &data);
                     last = true;
                 }
                 Err(TryRecvError::Lagged(dropped)) => {
                     let data = format!(r#"{{"dropped":{dropped}}}"#);
-                    push_event(&mut batch, &mut seq, "lagged", &data);
+                    push_event(&mut batch, &mut seq, "lagged", None, &data);
                 }
                 // 队列关了的那一种留给下一轮的 recv 去结束
                 Err(TryRecvError::Empty | TryRecvError::Closed) => break,
@@ -2509,14 +2514,18 @@ where
     }
 }
 
-/// 往 `batch` 里加一行事件：序号加一，时刻取此刻。`data` 是事件数据的 JSON 文本。
-fn push_event(batch: &mut String, seq: &mut u64, event: &str, data: &str) {
+/// 往 `batch` 里加一行事件：序号加一。`at` 是事件发生的时刻（`request` 事件自带，是记录
+/// 成为这个样子的时刻），没有的取此刻。`data` 是事件数据的 JSON 文本。
+///
+/// 所以 `at` 不保证逐行不减：一个排了几毫秒队的 `request` 事件可以比它前面那一行的 `state`
+/// 略早。次序以 `seq` 为准。
+fn push_event(batch: &mut String, seq: &mut u64, event: &str, at: Option<u64>, data: &str) {
     use std::fmt::Write as _;
     *seq += 1;
     let _ = writeln!(
         batch,
         r#"{{"v":{IPC_VERSION},"event":"{event}","seq":{seq},"at":{},"data":{data}}}"#,
-        now_millis()
+        at.unwrap_or_else(now_millis)
     );
 }
 

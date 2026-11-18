@@ -793,7 +793,9 @@ async fn subscribers_see_each_request_start_and_end() {
     let mut events = Vec::new();
     while let Ok(event) = subscription.events.try_recv() {
         match event {
-            Event::Request(line) => events.push(serde_json::from_str::<Value>(&line).unwrap()),
+            Event::Request { at, record } => {
+                events.push((at, serde_json::from_str::<Value>(&record).unwrap()));
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -805,13 +807,22 @@ async fn subscribers_see_each_request_start_and_end() {
         events.len()
     );
     assert!(events.len() >= 3, "{}", events.len());
-    assert_eq!(events[0]["phase"], "reading_body");
-    assert_eq!(events[0]["outcome"], "in_flight");
-    let last = events.last().unwrap();
+    assert_eq!(events[0].1["phase"], "reading_body");
+    assert_eq!(events[0].1["outcome"], "in_flight");
+    let (_, last) = events.last().unwrap();
     assert_eq!(last["outcome"], "client_gone");
     assert_eq!(last, &record);
-    for event in &events {
+    for (_, event) in &events {
         assert_eq!(event["request_id"], record["request_id"]);
         assert!(event.to_string().len() <= 64 * 1024);
+    }
+    // 中间的事件（去掉开始与结束）按它们自带的时刻算，相邻两个至少隔一秒
+    let middle = &events[1..events.len() - 1];
+    for pair in middle.windows(2) {
+        assert!(
+            pair[1].0 >= pair[0].0 + 1000,
+            "相邻两个中间事件只隔 {} ms",
+            pair[1].0 - pair[0].0
+        );
     }
 }

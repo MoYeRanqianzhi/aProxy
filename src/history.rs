@@ -853,8 +853,10 @@ impl RecordInner {
 /// 发给订阅者的事件。
 #[derive(Debug, Clone)]
 pub enum Event {
-    /// 一条记录变了：整条记录的 JSON，订阅者按 `request_id` 整条替换
-    Request(Arc<str>),
+    /// 一条记录变了：`record` 是整条记录的 JSON，订阅者按 `request_id` 整条替换；`at` 是
+    /// 记录成为这个样子的时刻（Unix 毫秒）。限频按这个时刻算，所以同一条记录相邻两个中间
+    /// 事件的 `at` 至少相隔一秒——事件什么时候真的写到订阅者的连接上，前后还差着排队的时间
+    Request { at: u64, record: Arc<str> },
     /// 实例要退出了。`reason` 取 `shutdown` 或 `swap`
     Closing(&'static str),
 }
@@ -1062,7 +1064,10 @@ impl History {
         }
         if self.subscribers.load(Ordering::Relaxed) > 0 {
             let line = record_json(&record, &lock(&record.inner));
-            let _ = self.events.send(Event::Request(line.into()));
+            let _ = self.events.send(Event::Request {
+                at: now,
+                record: line.into(),
+            });
         }
         Recorder(Some(Arc::new(Live {
             history: self.clone(),
@@ -1081,9 +1086,10 @@ impl History {
         if urgent || now.saturating_sub(inner.last_event_at) >= REQUEST_EVENT_INTERVAL_MS {
             inner.last_event_at = now;
             inner.queued = false;
-            let _ = self
-                .events
-                .send(Event::Request(record_json(record, inner).into()));
+            let _ = self.events.send(Event::Request {
+                at: now,
+                record: record_json(record, inner).into(),
+            });
         } else if !inner.queued {
             inner.queued = true;
             lock(&self.dirty).push(record.seq);
@@ -1109,9 +1115,10 @@ impl History {
             if now.saturating_sub(inner.last_event_at) >= REQUEST_EVENT_INTERVAL_MS {
                 inner.last_event_at = now;
                 inner.queued = false;
-                let _ = self
-                    .events
-                    .send(Event::Request(record_json(&record, &inner).into()));
+                let _ = self.events.send(Event::Request {
+                    at: now,
+                    record: record_json(&record, &inner).into(),
+                });
             } else {
                 later.push(seq);
             }
@@ -2804,7 +2811,7 @@ mod tests {
 
         let recorder = begin(&history, 2);
         let seq_and_phase = |event: Event| match event {
-            Event::Request(line) => {
+            Event::Request { record: line, .. } => {
                 let record: Value = serde_json::from_str(&line).unwrap();
                 (
                     record["request_seq"].as_u64().unwrap(),

@@ -15,6 +15,7 @@ client setup in clients.md, symptom lookup in troubleshooting.md.
 - [Keepalive heartbeats](#keepalive-heartbeats) (which requests, commit point, error responses, compression, disconnects)
 - [Error detection in response bodies](#error-detection-in-response-bodies)
 - [Disk cache (spool)](#disk-cache-spool)
+- [Request history](#request-history) (what an instance remembers, memory use)
 - [Forward-only mode](#forward-only-mode)
 - [External transformers](#external-transformers)
 - [Instances, ports and the control channel](#instances-ports-and-the-control-channel) (stopping, isolated experiments)
@@ -254,9 +255,10 @@ not events. The fix is on the client side; see clients.md.
 
 With `disk_cache` on, request bodies and responses larger than 1 MiB spill to
 `<home>/spool/<pid>-<hash>/` (one directory per instance process) as `req-*.spooltmp` and
-`spool-*.spooltmp` files. Retries and replays stream from the file, so memory
-use does not grow with payload size; through the OS page cache an SSD performs about as well as
-memory.
+`spool-*.spooltmp` files. Retries and replays stream from the file, so the memory a request
+needs while it is in flight does not grow with payload size; through the OS page cache an SSD
+performs about as well as memory. (The request history below keeps its own copy of recent bodies,
+within a fixed budget.)
 
 - A temp file is deleted when its request finishes, when its attempt is retried, or when the client
   disconnects. Files left by a crash are deleted the next time an instance starts on that port; after
@@ -266,6 +268,23 @@ memory.
   `507` `local_storage_failed` (`details.op` names the step) and is not retried.
 - With `disk_cache = false` everything stays in memory; for payloads under 1 MiB both modes behave
   the same.
+
+## Request history
+
+Each instance remembers the requests it handled, in memory: the last 1000 records, plus the bodies
+of the most recent ones within `[history] body_budget_mb` (default 64 MiB, `0` = no bodies). A
+record holds the method, path, model, every upstream attempt with its failure and the retry
+decision, heartbeats sent, byte counts and the outcome. Forward-only instances record requests too.
+
+- Memory: an instance that has seen enough traffic sits at its baseline plus up to the budget plus
+  about 16 MiB, and stays there. That is the history, not a leak. `body_budget_mb = 0` (then
+  restart) brings it back to the baseline.
+- Known secrets (the API key, proxy password, secret header and `[[format]]` values) are replaced
+  before anything is stored; secrets aProxy cannot know about that appear inside a body are kept as
+  sent. Set the budget to `0` when body content must not be retained.
+- The history is per instance and is gone after `stop`, `restart` or a crash.
+- No command prints it in this version; it is served over the control channel to the user who
+  started the instance. Details and the full option: config-toml.md, "history".
 
 ## Forward-only mode
 

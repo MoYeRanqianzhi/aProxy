@@ -470,7 +470,7 @@ listen_addr = "127.0.0.1:12345"          # local listener (port 0 = OS-assigned;
 # max_attempts = 3
 
 [history]
-# body_budget_mb = 8                    # parsed, no effect in this version
+# body_budget_mb = 64                   # cap on request/response bodies kept in the request history (MB of memory; 0 = keep none)
 
 # [[format]]                             # external transformer: at most one per stage (request/response/heartbeat)
 # name = "convert"

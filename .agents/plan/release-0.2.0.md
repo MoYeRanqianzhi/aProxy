@@ -485,7 +485,7 @@
   dependabot：#8、#9、#11–#15 由这两个提交覆盖；#10（base64 0.23）关闭——headless 构建里 base64 只有一份 0.22，
   envelope 单独升会多一份重复，等 reqwest、hyper-util 换版本时再看；#6（toml 1.x）、#7（sha2 0.11）归 P3。
 - 阶段 1，前置重构：P1 → P2 → P4 → P3 → P5（§14.1；内存所限不并行）。
-- 阶段 2，契约块：✓ B0 → ✓ B1 → ✓ B2 → ✓ B3 → ✓ B4 → ✓ **tag alpha.2**（2026-11-17）→ B5（进行中）→ B6 → B7 → B8 → B9 → **tag alpha.3** →
+- 阶段 2，契约块：✓ B0 → ✓ B1 → ✓ B2 → ✓ B3 → ✓ B4 → ✓ **tag alpha.2**（2026-11-17）→ ✓ B5 → ✓ B6 → ✓ B7 → ✓ B8 → B9 → **tag alpha.3** →
   B10a → B10b、B10c → B10d → B11 与 W2c → **tag alpha.4**。B12（文档、skill、记忆）随各块。alpha.2 之后补跨版本强制安装
   的 CI 测试（TODO 的 W2b 一条）。
 - 阶段 3：W4 `aproxy skill`、W3 i18n、W5 界面接入真实数据（前端可提前对 §6 的形状做 mock 侧的工作）→ **tag beta.1**。
@@ -861,3 +861,64 @@
     看的是刚建出来、还没写内容的文件）；「`body` 只在这一块之后出现在 `ops` 里」——`body` 属于 B8，现在 `ops` 里没有它。
   - 验证：Windows headless 全量 695 通过、0 失败；两个变体 clippy 与 Linux 交叉 clippy 零输出。unix 上新加的 home
     测试看推送后的 CI。
+- B8（2026-11-19）：请求历史、`body`、`subscribe`、事件（设计稿 §6.3、§6.5、§6.7）。提交 e6060a1（存储）、d185316
+  （接进数据面与控制通道）、8cebecf（事件的 `at`），以及本条所在的提交（文档、skill、记忆）。
+  - **做了什么**：`src/history.rs` 是存储与读取；数据面经 `Recorder` 与 `BodyWriter` 往里写（`proxy/handler.rs`、
+    `attempts.rs`、`upstream.rs`、`forward_only.rs`、`body.rs`、`delivery.rs`）；控制通道多了 `requests`、`request`、
+    `body`、`subscribe` 四个 op（`daemon.rs` 的 `ReadOp`、`read_reply`、`serve_events`，客户端 `ipc_read_in`、
+    `ipc_subscribe_in`、`EventStream`）。实例快照的 `behavior.history.body_budget_mb` 与 `ops` 里的四个新名字随之出现。
+  - **与设计稿的出入、以及设计稿没写而这里定下的**：
+    1. 记录里的 `reports` 恒为空数组、`upgraded` 恒为 false：报告与 forward 升级为 retry 属于 B10。结局
+       `format_response` 也要等 B10 才会出现。
+    2. `bad_request` 的 `reason` 多了一个 `missing_arg`（读 op 缺必需的参数），码表与 error-codes.md 已有。
+    3. 请求标识的前半段与快照的 `instance.instance_id` 原来是两个各自生成的值，现在是同一个
+       （`AppState.instance_id`，`daemon::new_instance_id` 删了）——历史靠它从请求标识里认出序号。
+    4. 仅转发模式不缓冲请求体，`model` 与 `stream` 只从请求体的前 64 KiB 里读；读不到就是 null / false。
+    5. 体的记账是精确的，代价是拷贝：网络库交出来的块不直接留（理由与量法见记忆 request-history）。64 KiB 的块与
+       1 MiB 的缓冲各有一张空闲表（各至多 8 MiB），所以历史占的内存是「预算加至多约 16 MiB」，不是设计稿字面上的
+       「不超过预算」。文档与 skill 按这个口径写。
+    6. `state` 事件是每秒比一次快照文本、变了才发（进入更换阶段与开始退出时立即发），不是每个计数变化都发。
+    7. 事件的 `at`：`request` 事件取记录成为这个样子的时刻（限频按它算），别的事件取写出的时刻。所以 `at` 不保证
+       逐行不减，次序以 `seq` 为准。设计稿没有定义 `at`，这里定了。
+    8. 推送一侧把排着的事件合成一批一次写（至多 256 KiB 一批）。设计稿没提；不这样做，64 并发下订阅者九成事件
+       变成 `lagged`。
+    9. `model` 的读取挪进了读请求体的函数（溢写那一刻从内存里的开头一段读）；保活触发的判定没有动。
+    10. **没接线的**：命令行与界面都还没有用这四个 op（B9、W5）。`aproxy status` 不显示历史。
+  - **验收阈值逐项**（设计稿 §14 的 B8 清单）：
+    - 吞吐与延迟：loadgen（2.1 MiB 请求体、约 300 KiB 响应）对 mock_upstream，64 并发，每轮 30 秒，基线是提交
+      e433bee，本机 Windows，三者交替跑。没有订阅者，七轮：基线平均 348 rps、p99 348 ms，新版 334 rps（96.1%）、
+      p99 358 ms（103%）——过线（≥95%、≤110%），余量很薄，单轮的比值在 92.7% 到 100.7% 之间（基线自己各轮
+      335–359 rps）。一个订阅者，最终构建四轮：330 对 350 rps（94.4%），p99 368 对 352 ms（104%）——过线（≥90%、
+      ≤120%），事件零丢失（每轮 21000 个 `request` 事件、`lagged` 为 0）。进程 CPU 时间多 2.8%–4.4%。
+      头一版只有 92–94%；拉回来的几处改动与量法在记忆 request-history。这些数字是在 d185316 的构建上量的，
+      8cebecf（只给事件多带一个时刻）之后没有重跑压测。
+    - 长重试（退避 0、上游拒绝连接、8 并发、10 分钟，一个订阅者全程在线）：跑了两遍。第 1 分钟之后常驻内存
+      最多涨 2.9 MiB（≤32 MiB）；最大的记录 5.3 KiB（≤64 KiB）。Windows 上连接被拒要等约 2 秒，所以这个用例里每个
+      请求十分钟只有约三百次尝试。
+      每条请求每秒的 `request` 事件：限频按实例产生事件的时刻算，相邻两个中间事件至少隔 1000 ms。头几遍事件的
+      `at` 取的是写上连接的时刻，前后差着几毫秒的排队时间，量到的最小间隔是 1002、1000、994 ms（最后一个是 30 分钟
+      那一遍，当时机器上同时在跑全量测试与压测），按一秒的滑动窗口偶尔数到 2 个。于是把 `request` 事件的 `at` 改成
+      产生时刻（提交 8cebecf），订阅者按 `at` 数就严格是每秒至多 1 个：改完后同样的用例跑 5 分钟（同时在跑 clippy），1888 个事件，每条请求任何一秒里至多 1 个，最小间隔 1000 ms。
+      集成测试 `subscribers_see_each_request_start_and_end` 断言同一件事。
+      另跑了一遍 30 分钟的看有没有泄漏：私有内存从第 13 分钟到第 29 分钟停在 30.2–30.3 MiB，不涨。工作集不能用来
+      看这个：同一遍里它被系统从 33 MiB 修剪到 22 MiB。（10 分钟的用例里基线的工作集约 17 MiB、新版 34–36 MiB，差的
+      是 8 个 2.1 MiB 的请求体。）
+    - 体的总量：`the_budget_holds_under_sustained_load`（64 MiB 预算推入 200 MiB，任何时刻不超、留下的是最新的 32 个）
+      与 `bodies_are_evicted_oldest_first`。
+    - 体整份保留：`a_large_body_round_trips_in_chunks`（10 MiB，带密钥替换）、`a_body_larger_than_the_budget_is_not_retained`；
+      端到端 `a_request_body_spilled_to_disk_is_stored_whole`（3 MiB，真的溢写磁盘）。
+    - 分块读取：单块上限 1 MiB（base64 之后约 1.4 MiB，远小于 16 MiB 的行上限）；进行中的体 `complete` 为 false
+      （`a_large_body_round_trips_in_chunks`、`encoded_bodies_are_decoded_before_they_are_stored`）。
+    - 解码与替换：`known_secrets_are_replaced_across_chunk_boundaries`、`encoded_bodies_are_decoded_before_they_are_stored`
+      （gzip）、`brotli_bodies_are_decoded_too`、`undecodable_and_exploding_bodies_are_not_retained`；端到端
+      `compressed_responses_are_stored_decoded`。
+    - 边界：`read_rejections_are_pinned`（`limit` 为 0 或超过 1 MiB、`offset` 越界、不存在的尝试回 `no_such_part`）、
+      `sent_bodies_are_shared_and_dropped_with_their_tries`（被省略的尝试的体回 `no_such_part`）、
+      `a_large_body_round_trips_in_chunks`（`offset` 等于 `total_bytes` 回空块）、`oversized_records_are_truncated_to_the_limit`。
+      「含 `actions` 很长的报告」那一半等 B10 有了报告再测。
+    - 真实例上的原始通道：`tests/contract_v0_2.rs` 的 `request_history_is_read_over_the_control_channel`（三个读 op、
+      各种拒绝、8 条订阅连接之后的 `busy`、线上没有密钥、退出时的 `closing`）。
+  - 验证：d185316 上 Windows headless 全量 734 通过、0 失败、3 个忽略；8cebecf 之后重跑的是受影响的部分（lib 的
+    history 与 daemon 54 个、history_integration 11 个、contract_v0_2 5 个，都过），没有再跑全量。两个变体 clippy 与
+    Linux 交叉 clippy 在最终源码上零输出。
+    Linux/macOS 上新测试的运行结果看推送后的 CI。压测脚本在本机临时目录里，没有进仓库；三个程序在 `examples/`。

@@ -63,7 +63,7 @@ home 本身同样只让属主访问——里面有明文密钥（config.toml、s
   `log_path`（前台实例为 null）、`foreground`）；
 - `state`：`starting`/`serving`/`swap_prepared`/`stopping`，不认识的值读作 `unknown`；
 - `behavior`：行为摘要（默认投递方式 `delivery`、`disk_cache`、`keepalive` 的触发方式与间隔、
-  重试规则条数），枚举值按字符串传；
+  重试规则条数、请求历史的体预算 `history.body_budget_mb`），枚举值按字符串传；
 - `activity`：最近请求时刻、请求数 `requests_total`、重试数 `retries_total`、救回数
   `rescued_total`（经过重试才成功的请求）、在途数 `in_flight`（算到响应体交付完为止）、其中
   重试中的 `retrying`、按码的失败计数 `by_code`（失败的上游尝试记尝试失败码，aproxy 自己
@@ -79,7 +79,26 @@ home 本身同样只让属主访问——里面有明文密钥（config.toml、s
 加 op、加可选参数、加应答字段、加错误码、加状态值都不递增；应答只增字段，读者忽略不认识的。
 没有 `v` 的请求按 `bad_request` 拒绝，没有 `v` 的应答不予采信（0.1.0 的格式就是这样，0.2.0 起
 与它不再互通）。别的版本的应答里客户端只认一种：`unsupported_version`（实例说它不支持请求的
-版本，`details.supported` 列出它支持哪些），其余一律不采信。每个 op 的请求行、每种拒绝与快照的
+版本，`details.supported` 列出它支持哪些），其余一律不采信。读请求历史的四个 op（`ops` 里列着才有）不回状态快照：
+- `requests`（`args`：`before` 请求标识、`limit` 至多 200、默认 50）→
+  `{"requests":[记录…],"more":bool}`，新的在前；
+- `request`（`request_id`）→ `{"record":…,"request":{"headers","body"},"tries":[…]}`，头是
+  `[名字, 值]` 对的数组，体是 `{"bytes","state","cause"?,"encoding"?}`；
+- `body`（`request_id`、`part` 为 `request`/`sent`/`response`、后两种带 `attempt`、可选
+  `offset` 与 `limit`，单块至多 1 MiB）→ `{"total_bytes","offset","data_b64","more","complete"}`，
+  还在接收的体 `complete` 为 false；
+- `subscribe`：这条连接不再一来一回。第一行是应答 `{"snapshot":状态快照,"requests":[在途的
+  记录]}`，之后每行一个事件 `{"v":1,"event","seq","at","data"}`：`request`（整条记录，按
+  `request_id` 替换）、`state`（状态快照，变了才发，至多每秒一个）、`heartbeat`（静了 15 秒）、
+  `lagged`（`dropped`）、`closing`（`reason` 为 `shutdown` 或 `swap`，发完实例关连接）。`seq`
+  每条连接从 1 递增，次序以它为准；`at` 是事件发生的时刻（`request` 事件是记录成为这个样子
+  的时刻，不是写上连接的时刻，所以它可以比前一行略早）。同一实例至多 8 条订阅连接，满了回 `busy`（`details.limit`）；10 秒写不
+  出去的连接被关掉。
+
+查不到时回 `not_found`，`details.reason` 说明是哪一种：`unknown_request`、`no_such_part`、
+`evicted`、`not_retained`（带 `cause`）。
+
+每个 op 的请求行、每种拒绝与快照的
 形状都由 `src/daemon.rs` 的单测逐字钉住；`tests/contract_v0_2.rs` 再对一个真实例走原始的控制
 通道、读它写在盘上的记录，逐项比对样本（样本里的键不能少、类型不能变，多出来的不算错）。
 
@@ -117,6 +136,7 @@ home 本身同样只让属主访问——里面有明文密钥（config.toml、s
 | `src/server.rs` | 服务承载：`serve_forever` 主循环、停止信号、日志初始化、期望状态记录的写与「用户要求停止」语义、配置错误落盘 startup.log |
 | `src/proxy/` | 转发核心，按职责分文件：入站来源校验（Host/Origin）、hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、尝试结局分类（`attempts::classify`）与唯一的尝试循环（`attempts::run_attempts`）、保活通道与提交点、断开保护、仅转发模式 |
 | `src/transform.rs` | 外部转换器编排：stdin/stdout 一行 JSON 信封交给外部 format 程序改写（spawn 与 persistent 统一进程池、空闲 reaper、超时/崩溃 worker 剔除）；信封契约在独立 crate `aproxy-envelope` |
+| `src/history.rs` | 请求历史：记录（最近 1000 条）、体的保留与预算、已知密钥的替换、读取（列表、详情、分块读体）、事件与订阅者；转发路径经 `Recorder` 与 `BodyWriter` 往里写，控制通道的读 op 从这里取。见「请求历史」 |
 | `src/decode.rs` | 检查用解码：按 `content-encoding`（gzip/deflate/br/zstd，多层逆序）解出一份**仅供检查/预览**的副本，转发字节不受影响 |
 | `src/retry.rs` | 重试判定：状态码、错误 JSON（含流式 NDJSON/SSE 形态） |
 | `src/config/` | 代理配置：`file.rs` 严格解析 config.toml（未知键即错误、带行列诊断）、`resolve.rs` 分层解析（命令行 > toml > settings 的 `defaults` > 内置）、`edit.rs` 只改目标键的写回（`~/.aproxy/config.toml`，可多份平行并存） |
@@ -172,6 +192,40 @@ CLI 定义（cli.rs）、动作本身（ops/）与子命令的渲染（commands/
 （507 `local_storage_failed` / SSE error 事件），绝不退化成内存堆积。`disk_cache = false`（settings
 的 `defaults.disk_cache` 或 toml 覆盖）关闭时回到纯内存行为。`delivery = "forward"` 模式下请求体与响应
 均**不缓冲**，本节整节不适用——见「仅转发模式（delivery = "forward"）」。
+
+## 请求历史
+
+实例在内存里记住它处理过的请求（`src/history.rs`），供控制通道的 `requests`、`request`、
+`body`、`subscribe` 读取。它只是旁路：转发路径把经过的东西交给它，任何一步都不等它，也不因为
+它失败。
+
+- **记录**：最近 1000 条，先进先出，在途的不淘汰。一条记录是方法、路径（查询串里的凭据打码）、
+  顶层的 `model` 与是否要流、投递方式、阶段、结局与终态码、心跳次数、字节数，以及各次尝试——
+  发出与结束的时刻、上游状态码、失败原因、重试决定（默认规则还是第几条 `[[retry.rules]]`）。
+  尝试只留最前 3 次与最后 20 次，中间的记个数；一条记录序列化后不超过 64 KiB（超了就把
+  `path`、`user_agent`、`model` 截短并带 `truncated`）。入站校验挡下的请求（Host、Origin）
+  不进历史。
+- **体**：请求体、每次尝试发给上游的体（与上一次是同一份时只记 `same_as_previous`）、每次尝试
+  收到的响应体，整份保留，合计不超过 `history.body_budget_mb`（默认 64 MiB，0 = 不保留）。超了
+  从最旧的请求开始丢体（状态 `evicted`），记录留着；单个体比整个预算大就不保留
+  （`not_retained`，`cause` 为 `exceeds_budget`）。带 `content-encoding` 的体先攒原始字节，收完
+  后在阻塞线程池里解码再入库，解不开的为 `decode_failed`。
+- **密钥**：配置里已知的密钥（`Config::known_secrets`）在入库时就被替换，头与体都是；按流
+  替换，留一段「最长密钥减一」的尾巴等下一块，被块边界切开的密钥也换得掉。历史里从来没有
+  这些密钥的原文，所以读出来的东西不需要再打码。认不出来的第三方密钥原样保留。
+- **不拖慢转发**：留在内存里的请求体（≤ 1 MiB）与重试重放共用同一份内存，不拷贝；溢写磁盘的
+  请求体，溢写之前攒的那 1 MiB 整块进历史，其余的与响应体一样拷进 64 KiB 的块。网络库交出
+  来的块不直接留——它们是读缓冲区的切片，留一小片会把整个缓冲区留住，实际占的内存就对不上
+  预算。64 KiB 的块与 1 MiB 的缓冲都循环使用（各至多留 8 MiB 空闲的），所以历史占的内存是
+  「预算加至多约 16 MiB」；丢体时内存的释放放在记录表的锁之外。验收的门槛是 64 并发、2 MiB
+  请求体的压测（`examples/loadgen` 对 `examples/mock_upstream`）下，没有订阅者时吞吐不低于
+  没有历史时的 95%、p99 不高于 110%；2026-11 在 Windows 上与前一个提交交替各跑七轮 30 秒，
+  平均是 96% 与 103%，进程的 CPU 时间多 3% 到 4%。单轮吞吐本身有 5% 上下的抖动（单轮的比值
+  从 93% 到 101%），比较时要交替跑、取平均，并对照 CPU 时间。
+- **事件**：有订阅者时，请求开始与结束各发一个 `request` 事件（整条记录），中间的变化每条
+  记录每秒至多一个（按事件的 `at` 算，相邻两个至少隔一秒），由一个 250 毫秒一轮的任务补发；没有订阅者时不序列化任何东西。每个订阅者
+  排队 1024 个事件，跟不上的丢最旧的并收到 `lagged`（丢了几个），之后该重取快照与列表。推送
+  一侧把排着的事件合成一批一次写出，实例忙的时候也跟得上。
 
 ## 入站来源校验（Host / Origin）
 

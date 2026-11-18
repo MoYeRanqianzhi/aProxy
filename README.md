@@ -269,7 +269,7 @@ listen_addr = "127.0.0.1:12345"          # 本地监听（端口 0 = 系统分�
 # max_attempts = 3
 
 [history]
-# body_budget_mb = 8                    # 已解析，本版本尚无效果
+# body_budget_mb = 64                   # 请求历史里保留的请求体与响应体合计上限（MB，占内存；0 = 不保留体）
 
 # [[format]]                             # 外部转换器：请求/响应/心跳每阶段至多一个
 # name = "convert"

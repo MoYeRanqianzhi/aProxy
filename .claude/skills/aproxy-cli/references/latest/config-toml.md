@@ -110,7 +110,7 @@ nesting in the `defaults` section of settings.json, whose built-in value is show
 | `[[retry.rules]]` | array of tables | settings.json (`defaults.retry.rules`), `[]` | empty = every request retries without limit |
 | `delivery` | `"retry"` \| `"forward"` | settings.json (`defaults.delivery`), `"retry"` | |
 | `disk_cache` | boolean | settings.json (`defaults.disk_cache`), `true` | |
-| `[history] body_budget_mb` | integer | settings.json (`defaults.history.body_budget_mb`), unset | parsed, no effect yet |
+| `[history] body_budget_mb` | integer | settings.json (`defaults.history.body_budget_mb`), `64` | 0 = keep no bodies |
 | `allowed_hosts` | array of strings | settings.json (`defaults.allowed_hosts`), `[]` | empty = built-in policy; `["*"]` = check off |
 | `allowed_origins` | array of strings | settings.json (`defaults.allowed_origins`), `[]` | empty = built-in policy; `["*"]` = check off |
 | `log_file` | string (path) | unset: random name in `<APROXY_HOME>/logs/` | |
@@ -509,10 +509,32 @@ from `aproxy status` or `aproxy logs` rather than guessing it.
 
 ```toml
 [history]
-body_budget_mb = 8
+body_budget_mb = 64
 ```
 
-`body_budget_mb` is parsed and validated now but has no effect in this version.
+Each instance keeps a history of the requests it handled, in memory only: the last 1000 requests
+(method, path, model, every attempt and why it was retried, outcome, timing), and for as many of
+the most recent ones as fit, the request body, the body sent upstream on each attempt and each
+response body. `body_budget_mb` caps the memory those bodies take together (default 64).
+
+- When the bodies exceed the budget the oldest requests lose their bodies first; their records
+  stay. A single body larger than the whole budget is not kept at all.
+- `0` keeps no bodies. The records themselves are always kept; they are small (a few KiB each, at
+  most 64 KiB).
+- Lower it, or set it to `0`, when the instance must stay small or when request and response
+  content should not sit in the instance's memory. Raise it to look further back when requests
+  are large: 64 MiB holds the bodies of about thirty requests of 2 MiB each.
+- The instance's memory grows by up to the budget plus about 16 MiB of reusable buffers, and
+  stays there; it is not returned while the instance runs.
+- Bodies are stored decoded (a gzip or brotli response is kept as text). Values aProxy knows to be
+  secret - `api_key`, the proxy password, secret header values, secret `[[format]]` arguments and
+  environment values - are replaced before a body or header is stored. Other secrets that travel
+  inside a body (a token pasted into a prompt, a key some tool printed) are not recognised and are
+  kept as they are.
+- The history is lost when the instance stops or restarts. Nothing is written to disk.
+- This version has no command that prints the history; it is read over the instance's control
+  channel (ops `requests`, `request`, `body`, `subscribe`), which only the user who started the
+  instance can open.
 
 ### format
 

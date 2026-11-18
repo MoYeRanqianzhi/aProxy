@@ -933,4 +933,25 @@
     「回来了（0）」那一支这里走不到，同版本的由 `install_force.rs` 覆盖。
   - 当前构建的版本号还是 0.2.0-alpha.2，与发布的 alpha.2 相同；测试输出里用「当前构建」与「发布的」区分。
   - **发版时要做的**：每发布一个版本（预发布也算），把 tag 加进 ci.yml 的 `PREV_VERSIONS`。
-  - ubuntu 上的结果看推送后的 CI。
+  - CI：force-cross-version 在 windows 与 ubuntu 上都过了（run 的提交 e41e160）。同一次推送里 windows 与 ubuntu 的常规
+    任务红了：新测试文件里取版本号的那一处直接 `Command::new(exe)`，没经 `TestHome`，被 `tests/test_home_check.rs`
+    拦下——加这个文件之后没有重跑全量就推了。随后改成经 `TestHome::cmd_with` 运行。**新增或改动 tests/ 下的文件后，
+    推送前要跑全量**（至少 `--test test_home_check`）。
+- B9 的分块（2026-11-19 开工前定的做法；设计稿 §9、§2.4，验收见 §14.2 的 B9 行）。每块一个提交，做完一块在这里
+  打勾并写下与设计稿的出入：
+  - [ ] B9-1 命令树（§9.1）：启动的覆盖参数与 `--config`、`--log-file` 从顶层挪进 `start`（`--base-url`、`--listen-addr`、
+    `--api-key <KEY|->`）；裸 `aproxy` 打印帮助、退出 2；`upgrade` 改成 install 的 visible_alias；stop/restart 的 idle 阈值
+    改成 `--idle-threshold-secs`；`logs` 默认打最近 200 行就退出，`-n`、`-f`；删 `install --skills-only`。
+    **牵连**：tests/ 里约 56 处 `start --config`/顶层 `--config` 的写法、三个安装脚本、技能与 README 里的命令行、
+    `tests/force_cross_version.rs`（旧版本的二进制仍用旧写法启动，要按版本分写法）。
+  - [ ] B9-2 `config show|get|set|unset`（§9.3）：专用旗标一个不留；`--config <ALIAS|PATH>` 是 config 自己的参数；
+    `set`/`unset` 的 `--json` 带 `instances_to_restart`。
+  - [ ] B9-3 退出码表（§9.5）与操作码（§2.4）：操作层的中文原因换成码加数据；§9.5 每一格一个测试。
+  - [ ] B9-4 `--json`（§9.4）：status（改用 `ops::enumerate`，顺带显示 incompatible、down、看护者、读不懂的记录）、
+    start、stop、restart、restore、alias list、config/settings 的 show 与 get、find；每个一份 golden。
+  - [ ] B9-5 doctor：换成诊断类型，`--json`，码（`file_permissions_too_open`、`default_header_shared` 等）。
+  - [ ] B9-6 install：`--check`、`--json`（NDJSON）、预检（`install_precheck_failed`、`install_unmanaged_instances`）、
+    A5 的四个字段、`halted` 时不拉起续作、与 `--force` 冲突的旗标进 force_contract 的命令行样本。
+  - [ ] B9-7 输出纪律（§9.6）：CLI 的 tracing 写 stderr、默认 WARN；遍历命令树的帮助测试；`RUST_LOG=info` 时 stdout
+    没有日志行。
+  - [ ] B9-8 文档：技能的 commands.md、compatibility.md（0.2.0 之内的命令行变化）、README、CHANGELOG、安装脚本。

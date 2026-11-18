@@ -59,10 +59,13 @@ fn copy_exe(from: &Path, to: &Path) {
     }
 }
 
-/// `exe --version` 首行里的版本号（永久格式 `aproxy v<版本> (…)`，契约 C5）
-fn version_of(exe: &Path) -> String {
-    let out = std::process::Command::new(exe)
+/// `exe --version` 首行里的版本号（永久格式 `aproxy v<版本> (…)`，契约 C5）。`--version` 不读
+/// home，但照样经测试的 home 运行：这个文件里的 aproxy 进程没有一个是带着用户环境跑的
+fn version_of(home: &TestHome, exe: &Path) -> String {
+    let out = home
+        .cmd_with(exe)
         .arg("--version")
+        .stdin(Stdio::null())
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -101,6 +104,11 @@ fn wait_for(
 /// 一种组合：`running` 装在 `bin/` 里并启动一个实例（带看护者），然后由 `installer` 执行
 /// `install --force --from <target 的副本> --yes`。
 fn force_install_across(installer: &Path, target: &Path, running: &Path) {
+    let home = TestHome::new();
+    // 开着看护者：它也是要被结束的长期进程。这个形状旧版本读不懂时按它自己的默认运行，
+    // 默认同样是开
+    home.settings(r#"{"watchdog": {"enabled": true}}"#);
+    let version_of = |exe: &Path| version_of(&home, exe);
     // 当前构建的版本号可能与某个发布版本相同（开发期间还没改号），所以单独标出来
     let name = |exe: &Path| {
         if exe == Path::new(THIS_BUILD) {
@@ -115,10 +123,6 @@ fn force_install_across(installer: &Path, target: &Path, running: &Path) {
         name(target),
         name(running)
     );
-    let home = TestHome::new();
-    // 开着看护者：它也是要被结束的长期进程。这个形状旧版本读不懂时按它自己的默认运行，
-    // 默认同样是开
-    home.settings(r#"{"watchdog": {"enabled": true}}"#);
     let bin = bin_path_in(home.path());
     copy_exe(running, &bin);
     let port = free_port();

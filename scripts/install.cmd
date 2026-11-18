@@ -130,6 +130,27 @@ echo Installing aProxy %TAG%
 set "ASSET=aproxy-x86_64-pc-windows-msvc.exe"
 set "BASE=https://github.com/%REPO%/releases/download/%TAG%"
 
+rem ---- The home will hold plaintext keys, logs and cached request bodies, so
+rem ---- only its owner may access it. When this script creates it, replace the
+rem ---- inherited ACL with an explicit one: the current user, SYSTEM (S-1-5-18)
+rem ---- and Administrators (S-1-5-32-544), full control, inherited by children.
+rem ---- SIDs rather than names: names change with the system language. An
+rem ---- existing home is left to aproxy, which tightens a home that belongs to
+rem ---- the current user the next time it writes into it. ----
+if not exist "%HOME_DIR%\" (
+    mkdir "%HOME_DIR%" 2>nul
+    set "ME_SID="
+    for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value"`) do set "ME_SID=%%S"
+    if not defined ME_SID (
+        echo Cannot determine the current user, so the access rights of %HOME_DIR% cannot be set. 1>&2
+        exit /b 1
+    )
+    icacls "%HOME_DIR%" /inheritance:r /grant:r "*!ME_SID!:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" >nul
+    if errorlevel 1 (
+        echo Cannot set the access rights of %HOME_DIR%. 1>&2
+        exit /b 1
+    )
+)
 mkdir "%BIN_DIR%" 2>nul
 mkdir "%SKILLS_DIR%" 2>nul
 mkdir "%TMP_DIR%" 2>nul

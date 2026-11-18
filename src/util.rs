@@ -21,6 +21,8 @@ pub(crate) fn register_in_ledger(
     label: Option<&str>,
     config: Option<&std::path::Path>,
 ) -> aproxy_ipc::ledger::Registration {
+    // 登记会往 home 里写（home 不存在时还会把它建出来）：先保证它只让属主访问
+    aproxy::fsx::ensure_private_home_for(home);
     let registration = aproxy_ipc::ledger::register(home, role, port, label, config);
     if let Some(failure) = registration.failure() {
         tracing::warn!(

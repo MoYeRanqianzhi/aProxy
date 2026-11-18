@@ -28,6 +28,13 @@ used exactly as written, so it must be an absolute path: with a relative one eve
 `--version` and `--help` stops with an error instead of guessing a directory from the working
 directory, and `install --force` ends with 10.
 
+The home is private to its owner, because it holds API keys in plain text, logs and cached
+request bodies: aProxy creates it with mode `0700` on Unix and, on Windows, an ACL granting only
+the current user, SYSTEM and Administrators. A home the current user owns that other users can
+also access is tightened the next time a command writes into it; read-only commands such as
+`status` leave it alone, and so does everything when the home belongs to someone else. `doctor`
+reports a home that other users can access.
+
 | Path | Holds |
 |---|---|
 | `<home>/config.toml` | the default instance config |
@@ -470,7 +477,7 @@ Prints `[ERROR]` and `[WARN]` findings and `检查结果: <n> error, <m> warning
 | Level | Checks |
 |---|---|
 | ERROR | settings.json: every problem the strict parser reports (JSON syntax, an unknown key, a wrong type or value, `watchdog.heartbeat_secs = 0`, a credential in `defaults` without its target, a newer `schema`), an invalid alias name, and an alias pointing to a missing file |
-| WARN | configs that aliases point to, and other `*.toml` in the config directories: parse and validation failures, non-loopback listen addresses, port conflicts within each group (legal as long as the configs do not run at the same time); questionable watchdog values |
+| WARN | configs that aliases point to, and other `*.toml` in the config directories: parse and validation failures, non-loopback listen addresses, port conflicts within each group (legal as long as the configs do not run at the same time); questionable watchdog values; a home that other users can access, as `主目录 <path> 能被别的用户访问（<who>）：…` ("the home can be accessed by other users"), where `<who>` is `mode 0755`-style on Unix and the extra accounts on Windows. The line ends with `aproxy 下一次往里写入时会自动收紧` ("tightened automatically at the next write") when the current user owns the home, and otherwise says the owner has to fix it |
 
 **The default config gets only the non-loopback check** unless an alias points at it. To validate
 it fully, give it an alias (`aproxy alias add main <path>`; without a path the alias names

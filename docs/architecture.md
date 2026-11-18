@@ -37,6 +37,18 @@ home 的实例。
   等于自己，客户端是 root 时改为核对它等于 run 目录的属主（或 root）——`sudo aproxy stop`
   因此可用。
 
+home 本身同样只让属主访问——里面有明文密钥（config.toml、settings.json、期望状态记录）、
+日志与落盘的请求内容，逐个文件设权限迟早会漏掉一处：
+- 新建：unix 上 0700；Windows 上受保护的显式 DACL（当前用户、SYSTEM、Administrators 各自
+  完全控制，子项继承）。三个安装脚本新建 home 时设同样的权限。
+- 既有的 home 属于当前用户而别人也能访问（别的版本建的、放在公共目录里的）：aproxy 下一次
+  往里写东西时收紧它。只读的命令（`status`、`doctor`、`settings get`）不改权限；不属于当前
+  用户的 home（`sudo aproxy …`）不动。
+- `aproxy doctor` 对别的用户能访问的 home 给一条告警，说明它会不会被自动收紧。Windows 上
+  「别的用户」不包括 SYSTEM、Administrators 与同一用户的沙箱化应用（应用容器 SID）。
+- 台账（C3）由冻结的写者自己建目录、写文件；进程登记之前先过上面的检查，所以 home 不会
+  经它按 umask 被建出来。
+
 线上格式（v1，一连接一来回，各一行 JSON）：请求 `{"v":1,"op":"ping|shutdown|prepare_swap"}`，
 可带 `args` 对象：
 - `shutdown` 的 `keep_restore`（为真时实例退出但不删期望状态记录）与 `if_idle_secs`（实例已
@@ -113,7 +125,7 @@ home 的实例。
 | `src/spawn.rs` | 按拉起规格拉起并等就绪（`spawn_from_spec`）：start、restart、restore、安装的滚动重启、看护者重拉共用；规格经交接文件交给 `__serve`，按新 pid 认就绪，启动即死时立即返回并附上 startup.log 的新增内容；就绪时限 30 秒 |
 | `src/process.rs` | 进程原语（平台层）：创建时间、存活与退出、镜像路径、按 pid + 创建时间核验身份（`record_identity`）与核验后终止、看护者等待进程死亡用的同步句柄 |
 | `src/watchdog.rs` | 看门狗：看护者记录与选举、实例心跳、收养与处决、重拉退避状态机、`logs/watchdog.log` |
-| `src/fsx.rs` | 原子写（`write_atomic`）：注册表、期望状态记录、安装状态、看护者记录共用；`write_atomic_private` 额外收紧权限（unix 0600、Windows 只含本用户/SYSTEM/Administrators 的 DACL），settings.json、拉起规格与期望状态记录走它 |
+| `src/fsx.rs` | 原子写（`write_atomic`）：注册表、期望状态记录、安装状态、看护者记录共用；`write_atomic_private` 给含密钥的文件用（settings.json、config.toml、拉起规格、期望状态记录），临时文件创建的那一刻就带最终权限（unix 0600、Windows 只含本用户/SYSTEM/Administrators 的 DACL）。home 的访问权限也在这里：`create_dir_all` 与原子写在往 home 里写之前先保证 home 只让属主访问（`secure_home_in`），`access_of` 给 doctor 读权限 |
 | `aproxy-ipc/` | aproxy 与同它打交道的程序（桌面界面、第三方客户端）共用的契约，独立 crate，依赖很少。`code.rs`：错误码表（名字、族、`details` 的键与类型、HTTP 状态与退出码），`docs/error-codes.md` 由它生成、`tests/code_table.rs` 比对；`redact.rs`：打码的唯一出口（URL、密钥头、占位对象、已知密钥替换）；`endpoint.rs`：控制端点、心跳节、安装宣告节的名字与 `home_id`；`home.rs`：home 的解析（永久兼容契约 C1）；`ledger.rs`：进程台账 `<home>/ledger/`（永久兼容契约 C3），长期运行的进程登记 pid、启动标记与角色，强制安装据此核验后结束进程 |
 | `src/util.rs` | bin 侧共用小工具：时间戳、时长人性化、凭据打码、key=value 解析 |
 

@@ -197,7 +197,7 @@ pub fn stage_from_in(
         return Err(format!("源二进制不存在: {}", from.display()));
     }
     let dir = staging_dir_in(home, target_version);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("staging 目录创建失败: {e}"))?;
+    crate::fsx::create_dir_all(&dir).map_err(|e| format!("staging 目录创建失败: {e}"))?;
     let staged = dir.join(binary_name());
     std::fs::copy(from, &staged).map_err(|e| format!("复制到 staging 失败: {e}"))?;
     ensure_executable(&staged);

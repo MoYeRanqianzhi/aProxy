@@ -142,7 +142,7 @@ pub fn lock_install_in(home: &Path, wait: std::time::Duration) -> Result<Install
     let path = lock_path_in(home);
     let deadline = std::time::Instant::now() + wait;
     loop {
-        let failure = match std::fs::create_dir_all(&dir).and_then(|()| open_lock_file(&path)) {
+        let failure = match crate::fsx::create_dir_all(&dir).and_then(|()| open_lock_file(&path)) {
             Err(e) => format!("安装锁 {} 打开失败: {e}", path.display()),
             Ok(file) => match try_lock_exclusive(&file) {
                 Ok(true) => return Ok(InstallLock { file }),
@@ -166,7 +166,7 @@ pub fn lock_install_in(home: &Path, wait: std::time::Duration) -> Result<Install
 /// 锁共用原语，但锁的是各自的文件，互不相干。
 pub(crate) fn try_lock_path(path: &Path) -> std::io::Result<Option<InstallLock>> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::fsx::create_dir_all(parent)?;
     }
     let file = open_lock_file(path)?;
     Ok(try_lock_exclusive(&file)?.then_some(InstallLock { file }))

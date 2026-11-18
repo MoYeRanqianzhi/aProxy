@@ -20,7 +20,7 @@ fn crate_url(version: &str) -> String {
 /// 下载并解包 .crate 到 dest_dir（内含 `aproxy-{version}/` 目录）。
 /// 返回解包出的 crate 源码目录。
 async fn fetch_and_unpack_crate(ctx: &DownloadCtx, dest_dir: &Path) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(dest_dir).map_err(|e| format!("crate 目录创建失败: {e}"))?;
+    crate::fsx::create_dir_all(dest_dir).map_err(|e| format!("crate 目录创建失败: {e}"))?;
     let tgz = dest_dir.join("crate.tgz");
     let result = async {
         super::download_to(&ctx.client, &crate_url(&ctx.version), &tgz).await?;

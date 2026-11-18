@@ -71,7 +71,7 @@ pub fn own_spool_dir() -> PathBuf {
 /// 建出实例自己的 spool 目录（开始接收请求之前调用）。失败只告警：磁盘缓存不可用时
 /// 请求体与响应体留在内存里。
 pub fn prepare_spool_dir(dir: &std::path::Path) {
-    if let Err(e) = std::fs::create_dir_all(dir) {
+    if let Err(e) = crate::fsx::create_dir_all(dir) {
         tracing::warn!(error = %e, dir = %dir.display(), "spool 目录创建失败（磁盘缓存将不可用，回退纯内存）");
     }
 }
@@ -1214,7 +1214,7 @@ pub fn force_terminate(info: &InstanceRecord) -> Result<(), String> {
 /// 向 startup.log 追加一行（带 unix 时间戳前缀）。看门狗的 crashloop 放弃、
 /// 假死接管等重大事件写这里——用户排查「实例为什么没被拉起」的第一个入口。
 pub fn append_startup_log(line: &str) {
-    let _ = std::fs::create_dir_all(logs_dir());
+    let _ = crate::fsx::create_dir_all(logs_dir());
     let path = logs_dir().join("startup.log");
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2060,53 +2060,22 @@ mod imp {
     /// 不带它时管道用默认的安全描述符，其中有给 Everyone 的读权限；控制通道能停实例，
     /// 以后还能读请求内容，只该让启动实例的用户（与本来就无所不能的 SYSTEM）连上。同一
     /// 用户提权后的进程用的还是同一个用户 SID，照样连得上。
-    pub struct PipeSecurity {
-        /// `ConvertStringSecurityDescriptorToSecurityDescriptorW` 分配的自相对描述符，
-        /// 建好之后只读，`Drop` 时用 `LocalFree` 归还
-        descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
-    }
-
-    // SAFETY: 描述符是一块建好之后不再改动的堆内存，只被读取（交给 CreateNamedPipe 拷贝），
-    // 在线程之间移动或共享都不会产生数据竞争
-    unsafe impl Send for PipeSecurity {}
-    unsafe impl Sync for PipeSecurity {}
+    pub struct PipeSecurity(crate::fsx::Descriptor);
 
     impl PipeSecurity {
         /// 为当前用户建描述符。
         pub fn for_current_user() -> io::Result<Self> {
-            use windows_sys::Win32::Security::Authorization::{
-                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-            };
             // D:P = 受保护的 DACL（不继承）；GA = 完全控制；SY = SYSTEM
-            let sddl = format!(
+            crate::fsx::Descriptor::from_sddl(&format!(
                 "D:P(A;;GA;;;{})(A;;GA;;;SY)",
                 crate::fsx::current_user_sid()?
-            );
-            let sddl: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
-            let mut descriptor = std::ptr::null_mut();
-            // SAFETY: sddl 以 0 结尾；descriptor 指向本栈上的指针，成功时由系统填入
-            let ok = unsafe {
-                ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                    sddl.as_ptr(),
-                    SDDL_REVISION_1,
-                    &mut descriptor,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(Self { descriptor })
+            ))
+            .map(Self)
         }
 
         /// 按 `options` 建一个带这份描述符的管道实例。
         fn create(&self, options: &ServerOptions, endpoint: &str) -> io::Result<NamedPipeServer> {
-            let mut attributes = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-                nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
-                    as u32,
-                lpSecurityDescriptor: self.descriptor,
-                bInheritHandle: 0,
-            };
+            let mut attributes = self.0.attributes();
             // SAFETY: attributes 是一个有效的 SECURITY_ATTRIBUTES，它指向的描述符在 self
             // 存活期间有效；CreateNamedPipe 在调用期间拷贝描述符，不保留指针
             unsafe {
@@ -2115,16 +2084,6 @@ mod imp {
                     (&mut attributes as *mut windows_sys::Win32::Security::SECURITY_ATTRIBUTES)
                         .cast(),
                 )
-            }
-        }
-    }
-
-    impl Drop for PipeSecurity {
-        fn drop(&mut self) {
-            // SAFETY: descriptor 来自 ConvertStringSecurityDescriptorToSecurityDescriptorW，
-            // 只在这里释放一次
-            unsafe {
-                windows_sys::Win32::Foundation::LocalFree(self.descriptor as _);
             }
         }
     }
@@ -2278,7 +2237,7 @@ mod imp {
         let path = Path::new(endpoint);
         // 端点先于注册表创建，首次启动时 run 目录可能还不存在
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+            crate::fsx::create_dir_all(dir)?;
         }
         match tokio::net::UnixStream::connect(path).await {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}

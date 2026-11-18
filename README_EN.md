@@ -575,8 +575,15 @@ into every forwarded request, and the proxy port itself has no authentication.
   to `0.0.0.0` or a LAN address** — that lets any host on the network use your
   key without authentication; if you do need it, start-up, `startup.log` and
   `aproxy doctor` will warn you.
-- `api_key` is stored in plain text in `config.toml`; restrict the file's
-  permissions to your own user.
+- `api_key` is stored in plain text in `config.toml`. aProxy's home directory
+  (`~/.aproxy` by default) is accessible only to your own user: it is created
+  that way, an existing home with looser permissions is tightened the next
+  time aProxy writes into it, and `aproxy doctor` points out a home that other
+  users can read. Restrict the permissions yourself for a config kept outside
+  the home (`--config` pointing elsewhere).
+- The control channel between commands such as `status` and `stop` and the
+  instance accepts only the user who started the instance (plus root on
+  Unix), and it never opens a network port.
 - External transformers (`[[format]]` entries) run
   arbitrary commands from the config; only configure programs you trust and do
   not let others edit your `config.toml`.

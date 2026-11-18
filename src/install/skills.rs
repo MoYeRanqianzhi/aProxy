@@ -79,7 +79,7 @@ fn install_skill_dir(home: &Path, zip: &Path) -> Result<Vec<String>, String> {
     // 解包到 .staging 本身，逐个顶层目录 rename 进位，不产生双层嵌套
     let staging = home.join("skills").join(".staging");
     let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging).map_err(|e| format!("skill staging 创建失败: {e}"))?;
+    crate::fsx::create_dir_all(&staging).map_err(|e| format!("skill staging 创建失败: {e}"))?;
     unpack_zip(zip, &staging)?;
 
     // 顶层目录清单：staging 下全部非隐藏目录（zip 无顶层目录条目 = 组包形态不符）
@@ -104,7 +104,7 @@ fn install_skill_dir(home: &Path, zip: &Path) -> Result<Vec<String>, String> {
     incoming.sort();
 
     let skills_root = home.join("skills");
-    std::fs::create_dir_all(&skills_root).map_err(|e| format!("skills 目录创建失败: {e}"))?;
+    crate::fsx::create_dir_all(&skills_root).map_err(|e| format!("skills 目录创建失败: {e}"))?;
     let mut installed = Vec::new();
     for src in incoming {
         let name = src
@@ -160,10 +160,10 @@ fn unpack_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
         }
         let target = dest.join(&rel);
         if entry.is_dir() {
-            std::fs::create_dir_all(&target).map_err(|e| format!("目录创建失败: {e}"))?;
+            crate::fsx::create_dir_all(&target).map_err(|e| format!("目录创建失败: {e}"))?;
         } else {
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| format!("目录创建失败: {e}"))?;
+                crate::fsx::create_dir_all(parent).map_err(|e| format!("目录创建失败: {e}"))?;
             }
             let mut out = std::fs::File::create(&target)
                 .map_err(|e| format!("{} 创建失败: {e}", target.display()))?;

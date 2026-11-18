@@ -174,7 +174,7 @@ pub fn read_record_in(run_dir: &Path) -> RecordRead {
 /// 判断它是否还有效；无效的先删掉再来一次。删旧建新之间的竞态窗由每个步进周期的归属
 /// 校验补齐（见 `WatchdogState::refresh_record`）：发现记录不是自己的就让位退出。
 pub fn acquire_record_in(run_dir: &Path, record: &WatchdogRecord) -> bool {
-    if std::fs::create_dir_all(run_dir).is_err() {
+    if crate::fsx::create_dir_all(run_dir).is_err() {
         return false;
     }
     let Ok(json) = serde_json::to_string(record) else {
@@ -279,7 +279,7 @@ pub async fn retire_older_watchdogs_in(home: &Path) -> bool {
 /// 固定名的日志，内容用英文。文件达到 `rotate_bytes` 时先清空再写（0 = 不限）。
 pub fn append_watchdog_log(home: &Path, rotate_bytes: u64, line: &str) {
     let dir = home.join("logs");
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = crate::fsx::create_dir_all(&dir);
     let path = dir.join("watchdog.log");
     let oversized =
         rotate_bytes > 0 && std::fs::metadata(&path).is_ok_and(|meta| meta.len() >= rotate_bytes);
@@ -1562,7 +1562,7 @@ mod imp_heart {
     /// `path` 是心跳文件的完整路径（见 [`super::heartbeat_location`]）。
     pub fn create_heartbeat(path: &str) -> Option<super::HeartbeatWriter> {
         if let Some(parent) = std::path::Path::new(path).parent() {
-            let _ = std::fs::create_dir_all(parent);
+            let _ = crate::fsx::create_dir_all(parent);
         }
         let mut f = std::fs::OpenOptions::new()
             .create(true)

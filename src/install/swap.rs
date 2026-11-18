@@ -135,7 +135,7 @@ pub fn swap_in(
 ) -> Result<SwapOutcome, String> {
     let dir = bin_dir_in(home);
     let bin = bin_path_in(home);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("bin 目录创建失败: {e}"))?;
+    crate::fsx::create_dir_all(&dir).map_err(|e| format!("bin 目录创建失败: {e}"))?;
 
     // 入口兜底脚本先于交换就位：只在交换之后才写，就保护不了这一次的空窗
     #[cfg(windows)]
@@ -380,7 +380,7 @@ fn move_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(windows)]
 pub fn ensure_fallback_scripts_in(home: &Path) -> std::io::Result<()> {
     let dir = bin_dir_in(home);
-    std::fs::create_dir_all(&dir)?;
+    crate::fsx::create_dir_all(&dir)?;
     std::fs::write(dir.join("aproxy.bat"), FALLBACK_BAT)?;
     std::fs::write(dir.join("aproxy"), FALLBACK_SH)?;
     Ok(())

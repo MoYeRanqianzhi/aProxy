@@ -820,3 +820,42 @@
     旧版本二进制互连没有测（alpha.1/alpha.2 的协议本来就不互通，见 B6 第一部分）。
   - 验证：Windows headless 全量 690 通过、0 失败；两个变体 clippy 与 Linux 交叉 clippy 零输出。Linux/macOS 上
     新测试的运行结果看推送后的 CI。
+- B7（2026-11-18）：访问控制（设计稿 §1.6）。两个提交：f6b2425 + d35249d（端点），以及本条所在的提交（home）。
+  - **端点**：
+    - Windows：每个管道实例带 `D:P(A;;GA;;;<当前用户 SID>)(A;;GA;;;SY)`（`daemon.rs` 的 `imp::PipeSecurity`，经 tokio 的
+      `create_with_security_attributes_raw`），拒绝远程客户端是 tokio 的默认值。建不出描述符时 `bind` 失败，实例不启动。
+      读回来「完全控制」是 `FA`（单测 `control_pipe_admits_only_its_owner_and_system` 读两个管道实例的 DACL）。
+    - unix：socket 0600（`bind_private`：bind 之后 chmod，重建的也一样）；接受循环里核对对端 uid，只接受本用户与 root，
+      别的不读请求直接断开；客户端核对服务端 uid（`trusted_server_uid`），root 作客户端时信 **run 目录的属主**或 root。
+      设计稿写的是「home 的属主」——run 目录由 home 的属主建，取它省得从端点路径倒推 home。
+    - 跨用户实测：`tests/access_control.rs` 的 `control_socket_refuses_other_users_and_admits_root`（`#[ignore]`，CI 的
+      ubuntu 两个变体里 `sudo useradd` 之后带 `APROXY_TEST_OTHER_USER` 运行；客户端是 python3）。CI run 44289316523
+      两个变体都跑了并通过：0600 时别的用户 `connect` 得 PermissionError；把 socket 放开到 0666 之后别的用户连上即被
+      断开、读不到应答；root 得到正常应答。
+    - 没做：Windows 的心跳节与安装宣告节（`Local\aproxy-…`）仍是默认安全描述符——设计稿的「端点」只列了管道与
+      socket，节里只有时间戳与安装宣告；macOS 上没有跨用户实测（CI 的 macos 任务本来就是红的）。
+  - **home**（`src/fsx.rs`）：
+    - `secure_home_in(home)`：不存在就建成只让属主访问（unix 0700；Windows 受保护的 DACL，当前用户、SYSTEM、
+      Administrators 各自完全控制，子项继承），属于当前用户而过宽就收紧，不属于当前用户不动。
+    - 触发点：`fsx::create_dir_all`（库里往 home 建目录的地方都换成了它）、原子写、台账登记之前
+      （`util::register_in_ledger`）。每个进程对一个 home 只检查一次。只读的命令不触发。
+      **与设计稿的出入**：设计稿说「install 与第一次写配置时」收紧；现在是「任何往 home 里写的动作」（启动实例、
+      写记录、install、写配置），范围更大，原因是 home 也可能由这些动作第一次建出来。强制安装（C7/C8，冻结文件）
+      没有改：它经 `handle_force_cmd` 的台账登记走到同一处检查。
+    - `access_of(path)`：unix 看组与他人的权限位；Windows 看 DACL 里的允许项，当前用户、SYSTEM、Administrators、
+      CREATOR OWNER / OWNER RIGHTS 与应用容器 SID（`S-1-15-…`）之外的都算「别人」。应用容器那一条是实测加的：
+      本机的临时目录上就有两个能力 SID 与另一个账户的项。**没有处理拒绝项与继承标志的细节**（只读允许项的 SID）。
+    - Windows 上含密钥的临时文件现在用 `CreateFileW` 在创建时就带 DACL（原来是建好再 `SetNamedSecurityInfo`）。
+      R-S3-12 的这一条在 unix 上本来就成立（`mode(0o600)` + create_new）。
+    - doctor：`check_home_access` 一条 WARN（文字，不带码——doctor 的 `--json` 与码 `file_permissions_too_open` 等 B9）。
+    - 三个安装脚本新建 home 时设同样的权限（sh：`chmod 700`；ps1 与 cmd：`icacls /inheritance:r /grant:r`，账户用 SID）。
+      两个 Windows 写法在临时目录里实测，读回都是 `D:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;<用户>)`；
+      **脚本整体没有重跑**（它们要从 GitHub 下载发布资产），sh 只过了 `bash -n`。
+    - 测试 home（`tests/common`）起步就收紧：临时目录在有的机器上给了别的账户权限，会让 doctor 多一条告警。
+  - 验收表 B7 行逐项：管道 DACL ✓（单测）；第二个用户连不上、root 连得上 ✓（CI 实测）；home 为 0700 ✓
+    （`a_new_home_is_private_to_its_owner`，两个平台）；权限过宽的既有 home 在第一次写配置后被收紧 ✓
+    （`a_loose_home_is_tightened_by_the_first_config_write`）；临时文件一创建就是最终权限 ✓（unix 单测
+    `written_files_are_private_to_the_owner` 看的是成品，Windows 单测 `private_temp_file_is_restricted_from_the_moment_it_exists`
+    看的是刚建出来、还没写内容的文件）；「`body` 只在这一块之后出现在 `ops` 里」——`body` 属于 B8，现在 `ops` 里没有它。
+  - 验证：Windows headless 全量 695 通过、0 失败；两个变体 clippy 与 Linux 交叉 clippy 零输出。unix 上新加的 home
+    测试看推送后的 CI。

@@ -106,7 +106,31 @@ fn run_with(errors: Vec<String>, settings: Settings, home: &Path) -> Report {
         .findings
         .extend(check_default_config_exposure(&settings, home));
 
+    // 6) 主目录让别的用户访问
+    report.findings.extend(check_home_access(home));
+
     report
+}
+
+/// 主目录的访问权限告警：里面有明文密钥（配置、settings.json、期望状态记录）、日志与落盘的
+/// 请求内容，别的用户不该读得到。属于当前用户的 home，aproxy 下一次往里写东西时会自己
+/// 收紧；不属于的它不改，只能由属主处理。体检只读，这里不动权限。
+pub fn check_home_access(home: &Path) -> Vec<Finding> {
+    let Ok(crate::fsx::Access::TooOpen { owned, who }) = crate::fsx::access_of(home) else {
+        return Vec::new();
+    };
+    let remedy = if owned {
+        "aproxy 下一次往里写入时会自动收紧"
+    } else {
+        "它不属于当前用户，aproxy 不会改它的权限，请由它的属主收紧"
+    };
+    vec![Finding {
+        level: Level::Warn,
+        message: format!(
+            "主目录 {} 能被别的用户访问（{who}）：其中的配置与密钥、日志、请求缓存都读得到；{remedy}",
+            home.display()
+        ),
+    }]
 }
 
 /// 默认配置（settings.default_config 或 ~/.aproxy/config.toml）的非回环监听
@@ -495,9 +519,36 @@ mod tests {
         );
     }
 
+    /// 别的用户能访问的主目录给一条告警；体检只读，不改权限。
+    #[cfg(unix)]
+    #[test]
+    fn doctor_warns_when_others_can_access_the_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            check_home_access(dir.path()).is_empty(),
+            "临时目录本来是 0700"
+        );
+        assert!(check_home_access(&dir.path().join("missing")).is_empty());
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        let findings = check_home_access(dir.path());
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].level, Level::Warn);
+        assert!(
+            findings[0].message.contains("mode 0750") && findings[0].message.contains("自动收紧"),
+            "{}",
+            findings[0].message
+        );
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o750, "体检不改权限");
+    }
+
     #[test]
     fn doctor_clean_when_all_good() {
         let dir = tempfile::tempdir().unwrap();
+        // 「一切正常」包括主目录只让属主访问：临时目录在有的机器上还给了别的账户权限
+        crate::fsx::secure_home_in(dir.path()).unwrap();
         let a = write_cfg(
             dir.path(),
             "a.toml",

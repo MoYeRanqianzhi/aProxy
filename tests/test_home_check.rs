@@ -47,6 +47,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     (
         "access_control.rs",
+        "Command::new(\"icacls\")",
+        "Windows 自带的权限工具，用来把测试的 home 放宽给别的用户，不是 aproxy",
+    ),
+    (
+        "access_control.rs",
         "Command::new(\"python3\")",
         "一个只会连 unix socket、发一行 ping 的 python 客户端，不是 aproxy",
     ),

@@ -276,7 +276,7 @@ mod imp {
     use std::path::Path;
 
     pub fn create_section(path: &Path, ann: Announcement) -> Option<Section> {
-        std::fs::create_dir_all(path.parent()?).ok()?;
+        crate::fsx::create_dir_all(path.parent()?).ok()?;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .write(true)

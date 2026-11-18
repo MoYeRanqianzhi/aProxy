@@ -156,6 +156,17 @@ function Install-AProxy {
     $asset = "aproxy-x86_64-pc-windows-msvc.exe"
     $base = "https://github.com/$Repo/releases/download/$tag"
 
+    # home 里会有明文密钥、日志与落盘的请求内容，只让属主访问：新建它时换上不继承上级的
+    # 显式 ACL——当前用户、SYSTEM、Administrators 各自完全控制，子项继承。已有的 home 留给
+    # aproxy 自己处理（它往里写东西时会收紧属于本用户而权限过宽的 home）。
+    # 账户用 SID 写，不用名字：名字随系统语言变
+    if (-not (Test-Path $Home_)) {
+        New-Item -ItemType Directory -Force $Home_ | Out-Null
+        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $grants = foreach ($sid in @($me, 'S-1-5-18', 'S-1-5-32-544')) { "*${sid}:(OI)(CI)F" }
+        & icacls.exe $Home_ /inheritance:r /grant:r @grants | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "无法设置 $Home_ 的访问权限（icacls 退出码 $LASTEXITCODE）" }
+    }
     New-Item -ItemType Directory -Force $BinDir, $SkillsDir, $TmpDir | Out-Null
 
     try {

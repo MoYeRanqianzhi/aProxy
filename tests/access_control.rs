@@ -1,25 +1,110 @@
-//! 控制端点的访问控制，跨用户实测：别的用户连不上实例的控制 socket，root 连得上。
+//! 访问控制，从外面看：home 只让属主访问，别的用户连不上实例的控制 socket。
 //!
-//! 只在 unix 上有意义（Windows 的管道权限由 `src/daemon.rs` 的单测读回 DACL 核对），并且
-//! 要一个「别的用户」与免密的 `sudo`——开发机上通常没有，所以测试标了 `#[ignore]`，由 CI 的
-//! ubuntu 任务建好用户、把名字放进 `APROXY_TEST_OTHER_USER` 之后用 `--ignored` 运行。
-//!
-//! 客户端用 python3 写：它要以另一个用户的身份运行，而那个用户读不到本测试的构建目录；
-//! 况且要核对的正是「任何程序连上来会怎样」，不该经过 aproxy 自己的客户端代码。
-
-#![cfg(unix)]
+//! - home：aproxy 建出来的 home 只让属主访问；属于本用户而权限过宽的 home，第一次往里写
+//!   配置时被收紧；只读的命令不改权限。
+//! - 控制 socket（unix）：别的用户连不上，root 连得上。这一项要一个「别的用户」与免密的
+//!   `sudo`——开发机上通常没有，所以那个测试标了 `#[ignore]`，由 CI 的 ubuntu 任务建好
+//!   用户、把名字放进 `APROXY_TEST_OTHER_USER` 之后用 `--ignored` 运行。它的客户端用
+//!   python3 写：要以另一个用户的身份运行，而那个用户读不到本测试的构建目录；况且要核对
+//!   的正是「任何程序连上来会怎样」，不该经过 aproxy 自己的客户端代码。Windows 的管道权限
+//!   由 `src/daemon.rs` 的单测读回 DACL 核对。
 
 mod common;
-use common::{TestHome, free_port};
+use common::TestHome;
+#[cfg(unix)]
+use common::free_port;
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+
+/// 在 `home` 里运行一条 aproxy 命令，要求它成功，返回 stdout。
+fn aproxy_ok(home: &TestHome, args: &[&str]) -> String {
+    let out = home.cmd().args(args).output().expect("运行 aproxy 失败");
+    assert!(
+        out.status.success(),
+        "{args:?} 失败：{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// home 是否只让属主访问。
+fn is_private(home: &Path) -> bool {
+    aproxy::fsx::access_of(home).unwrap() == aproxy::fsx::Access::Private
+}
+
+/// 让别的用户也能读 `home`：unix 改权限位，Windows 加一项给 Everyone 的可继承读权限。
+fn loosen(home: &Path) {
+    #[cfg(unix)]
+    chmod(home, 0o755);
+    #[cfg(windows)]
+    {
+        // *S-1-1-0 = Everyone；(OI)(CI) = 文件与子目录都继承；R = 读
+        let out = Command::new("icacls")
+            .arg(home)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)R"])
+            .output()
+            .expect("运行 icacls 失败");
+        assert!(
+            out.status.success(),
+            "icacls 失败：{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// aproxy 建出来的 home 只让属主访问：unix 是 0700，Windows 是不继承上级的显式 DACL。
+#[test]
+fn a_new_home_is_private_to_its_owner() {
+    let home = TestHome::unborn();
+    assert!(!home.path().exists());
+    aproxy_ok(&home, &["settings", "set", "watchdog.enabled", "false"]);
+    assert!(home.path().join("settings.json").exists());
+    assert!(is_private(home.path()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(home.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+    #[cfg(windows)]
+    {
+        let sddl = aproxy::fsx::dacl_sddl(home.path()).unwrap();
+        assert!(sddl.starts_with("D:P"), "{sddl}");
+        assert_eq!(sddl.matches("(A;OICI;FA;;;").count(), 3, "{sddl}");
+    }
+}
+
+/// 权限过宽的既有 home（别的版本或安装脚本建的、放在公共目录里的）：只读的命令照实报告、
+/// 不改它；第一次往里写配置时被收紧。
+#[test]
+fn a_loose_home_is_tightened_by_the_first_config_write() {
+    let home = TestHome::new();
+    loosen(home.path());
+    assert!(!is_private(home.path()), "前提：home 此刻别人读得到");
+
+    // 只读的命令不改权限；doctor 指出来
+    aproxy_ok(&home, &["settings", "get", "language"]);
+    let doctor = home.cmd().arg("doctor").output().expect("运行 aproxy 失败");
+    let report = String::from_utf8_lossy(&doctor.stdout).into_owned()
+        + &String::from_utf8_lossy(&doctor.stderr);
+    assert!(report.contains("能被别的用户访问"), "{report}");
+    assert!(!is_private(home.path()), "只读的命令不该改权限");
+
+    aproxy_ok(&home, &["settings", "set", "language", "en"]);
+    assert!(is_private(home.path()), "写过配置之后 home 只让属主访问");
+    let doctor = home.cmd().arg("doctor").output().expect("运行 aproxy 失败");
+    let report = String::from_utf8_lossy(&doctor.stdout).into_owned()
+        + &String::from_utf8_lossy(&doctor.stderr);
+    assert!(!report.contains("能被别的用户访问"), "{report}");
+}
 
 /// 连上 `argv[1]` 的 unix socket，发一个 ping，打印结果：
 /// - `connect:<异常名>`：连不上；
 /// - `recv:<异常名>`：连上了，读应答时出错；
 /// - `reply:<应答>`：读到的应答（对端不答就断开时为空）。
+#[cfg(unix)]
 const CLIENT: &str = r#"
 import socket, sys
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -44,6 +129,7 @@ print("reply:" + data.decode().strip())
 "#;
 
 /// 以 `sudo_args` 给出的身份（空 = 本用户，不经 sudo）运行客户端，返回它打印的那一行。
+#[cfg(unix)]
 fn connect_as(sudo_args: &[&str], socket: &Path) -> String {
     let mut cmd = if sudo_args.is_empty() {
         Command::new("python3")
@@ -67,10 +153,13 @@ fn connect_as(sudo_args: &[&str], socket: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+#[cfg(unix)]
 fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 #[ignore = "要免密 sudo 与 APROXY_TEST_OTHER_USER 指定的第二个用户，由 CI 的 ubuntu 任务运行"]
 fn control_socket_refuses_other_users_and_admits_root() {
@@ -100,11 +189,14 @@ fn control_socket_refuses_other_users_and_admits_root() {
 
     let run = home.path().join("run");
     let socket = run.join(format!("{port}.sock"));
-    assert_eq!(
-        std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
-        0o600,
-        "控制 socket 只有属主连得上"
-    );
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "控制 socket 只有属主连得上"
+        );
+    }
 
     // 本用户照常连得上：先确认这个客户端本身是好的
     let own = connect_as(&[], &socket);

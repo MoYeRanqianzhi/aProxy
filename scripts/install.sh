@@ -392,6 +392,13 @@ main() {
     fi
 
     pick_sha_tool
+    # home 里会有明文密钥、日志与落盘的请求内容，只让属主访问。只在这里新建它时设权限：
+    # 已有的 home 留给 aproxy 自己处理（它往里写东西时会收紧属于本用户而权限过宽的 home）。
+    # Git Bash 之类的环境里 chmod 不改 Windows 的 ACL，那里同样由 aproxy 处理
+    if [ ! -d "$APROXY_HOME" ]; then
+        mkdir -p "$APROXY_HOME"
+        chmod 700 "$APROXY_HOME"
+    fi
     mkdir -p "$BIN_DIR" "$SKILLS_DIR" "$TMP_DIR"
     # 任何出口（含校验失败/自证失败）都清掉暂存目录，不留残骸
     trap 'rm -rf "$TMP_DIR"' EXIT

@@ -517,7 +517,7 @@ pub(crate) fn init_daemon_logging(log_path: &std::path::Path) {
     if let Some(parent) = log_path.parent() {
         // 自定义 log_file 的父目录可能不存在（内置随机名已由调用方在
         // resolve 阶段指向既有 logs 目录，此调用对其是无害的重复创建）
-        let _ = std::fs::create_dir_all(parent);
+        let _ = aproxy::fsx::create_dir_all(parent);
     }
     if let Ok(meta) = std::fs::metadata(log_path)
         && meta.len() > 2 * 1024 * 1024
@@ -570,7 +570,7 @@ pub(crate) fn init_foreground_logging() {
 /// 尽量留下线索，两级都失败才放弃。
 pub(crate) fn report_config_error(msg: &str, daemon_child: bool) {
     if daemon_child {
-        let _ = std::fs::create_dir_all(daemon::logs_dir());
+        let _ = aproxy::fsx::create_dir_all(daemon::logs_dir());
         let open = |path: &std::path::Path| {
             std::fs::OpenOptions::new()
                 .create(true)
@@ -579,7 +579,7 @@ pub(crate) fn report_config_error(msg: &str, daemon_child: bool) {
                 .ok()
         };
         let mut file = open(&daemon::logs_dir().join("startup.log")).or_else(|| {
-            let _ = std::fs::create_dir_all(config::config_dir());
+            let _ = aproxy::fsx::create_dir_all(config::config_dir());
             open(&config::config_dir().join("startup.log"))
         });
         if let Some(f) = file.as_mut() {

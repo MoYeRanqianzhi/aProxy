@@ -501,7 +501,7 @@ pub async fn fetch_artifact(
     artifact: Artifact,
     dest_dir: &Path,
 ) -> Result<Fetched, String> {
-    std::fs::create_dir_all(dest_dir).map_err(|e| format!("下载目录创建失败: {e}"))?;
+    crate::fsx::create_dir_all(dest_dir).map_err(|e| format!("下载目录创建失败: {e}"))?;
     let asset = artifact.asset_name(ctx.target, ctx.variant, ctx.cpu_suffix);
     let mut errors = Vec::new();
     for step in chain {

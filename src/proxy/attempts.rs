@@ -276,7 +276,7 @@ impl Responder {
                 last: Default::default(),
                 seq: Default::default(),
                 attempt: Default::default(),
-                in_flight: Default::default(),
+                pending: Default::default(),
                 warned: Default::default(),
             }));
         }
@@ -544,10 +544,12 @@ pub(super) async fn run_attempts(
                 rule,
                 response_bytes,
             } => {
-                if let Some(c) = chain.as_mut() {
+                if chain.is_some() || state.has_format(Stage::Heartbeat) {
                     let mut f = aproxy_envelope::Failure::new(failure.code.into());
                     f.details = Some(failure.details.clone());
-                    c.last = Some(f.clone());
+                    if let Some(c) = &mut chain {
+                        c.last = Some(f.clone());
+                    }
                     if let Responder::Keepalive { sink, .. } = r {
                         let beat = match sink {
                             KeepaliveSink::Committed { beat, .. }
@@ -557,6 +559,8 @@ pub(super) async fn run_attempts(
                             *d.last.lock().unwrap() = Some(f);
                         }
                     }
+                }
+                if let Some(c) = &chain {
                     if c.max_attempts.is_some_and(|n| n != 0 && attempt >= n) {
                         let t = Terminal::retry_exhausted("override", attempt, &failure);
                         failure.record_in(&state.stats);

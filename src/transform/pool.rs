@@ -587,8 +587,14 @@ impl Pool {
             || r.response
                 .as_ref()
                 .and_then(|p| p.status)
-                .or_else(|| r.fail.as_ref()?.response.as_ref().map(|p| p.status))
-                .is_some_and(|s| http::StatusCode::from_u16(s).is_err())
+                .into_iter()
+                .chain(
+                    r.fail
+                        .as_ref()
+                        .and_then(|f| f.response.as_ref())
+                        .map(|p| p.status),
+                )
+                .any(|s| http::StatusCode::from_u16(s).is_err())
             || r.state.as_ref().is_some_and(|s| s.len() > 64 * 1024)
             || r.request
                 .as_ref()

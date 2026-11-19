@@ -603,9 +603,8 @@ async fn slow_sse_upstream(delay_ms: u64) -> (String, tokio::task::JoinHandle<()
 
 #[tokio::test]
 async fn heartbeat_reply_cannot_change_state() {
-    // 心跳转换器逐拍生成心跳字节；首拍带请求体、之后不带；它回信的 state 经
-    // aProxy 交给响应转换（响应转换把收到的 state 追加成一行注释）。回放的上游
-    // 事件完整出现在所有心跳之后
+    // 心跳始终只读本程序的 state 且不带请求体；响应层追加它收到的状态以供核对。
+    // 回放的上游事件完整出现在所有心跳之后。
     isolate_env_proxy();
     let (upstream, _jh) = slow_sse_upstream(2500).await;
     let mut cfg = keepalive_1s_config_for(&upstream);

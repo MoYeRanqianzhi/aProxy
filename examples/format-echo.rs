@@ -141,6 +141,13 @@ fn main() {
                     let fields: serde_json::Map<String, Value> = serde_json::from_str(arg).unwrap();
                     r.as_object_mut().unwrap().extend(fields);
                 }
+                "append" if stage == "heartbeat" => {
+                    r["data"] = json!(format!("{}: {arg}\n\n", m["data"].as_str().unwrap()));
+                    r["state"] = json!("heartbeat cannot store this");
+                }
+                "append" => {
+                    r[obj] = json!({"body":format!("{}{arg}",m[obj]["body"].as_str().unwrap())})
+                }
                 "upper" => {
                     if let Some(body) = m[obj]["body"].as_str() {
                         r[obj] = json!({"body":body.to_uppercase()});

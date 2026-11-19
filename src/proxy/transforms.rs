@@ -313,10 +313,11 @@ pub(super) async fn transform_response_if_configured(
     };
     let mut input = wire::Response::new(status.as_u16());
     let mut heads = transform::headers_to_btreemap(&headers);
-    let decoded = if let Some(enc) = encoding_to_undo(&headers) {
+    let encoding = encoding_to_undo(&headers);
+    let decoded = if let Some(enc) = &encoding {
         let mut out = Vec::new();
         if crate::decode::decode_strict(
-            &enc,
+            enc,
             raw.as_slice(),
             &mut out,
             spool_limit_bytes(&state.config) as u64,
@@ -338,6 +339,7 @@ pub(super) async fn transform_response_if_configured(
     for p in state
         .formats
         .iter()
+        .rev()
         .filter(|p| p.entry.has_stage(Stage::Response))
     {
         let name = &p.entry.name;
@@ -346,7 +348,13 @@ pub(super) async fn transform_response_if_configured(
             wire::Request::new(req.method.to_string(), req.target_url.clone()),
             input.clone(),
         ));
-        let r = match p.call(m, p.entry.timeout_secs, false).await {
+        let result = match p.call(m.clone(), p.entry.timeout_secs, false).await {
+            Err(e) if !matches!(e, Fault::Open { .. }) => {
+                p.call(m, p.entry.timeout_secs, true).await
+            }
+            other => other,
+        };
+        let r = match result {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(format=%state.history.secrets().replace(name),error=%e,"response format layer skipped");
@@ -370,17 +378,16 @@ pub(super) async fn transform_response_if_configured(
     if rewrite_headers {
         headers = transform::headers_from_btreemap(&input.headers.unwrap_or_default());
     }
-    if rewrite_body
-        || rewrite_headers
-            && body.len() != 0
-            && headers.get(http::header::CONTENT_ENCODING).is_none()
-    {
+    if rewrite_body || rewrite_headers && encoding.is_some() {
         body = transform::spool_response_body(
             input.body.as_bytes().unwrap_or_default(),
             state.spool_dir.as_deref(),
         )
         .await;
+    }
+    if rewrite_body || rewrite_headers {
         headers.remove(http::header::CONTENT_ENCODING);
+        headers.remove(http::header::CONTENT_LENGTH);
     }
     (status, headers, body)
 }

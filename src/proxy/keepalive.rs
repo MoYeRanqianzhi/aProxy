@@ -66,8 +66,8 @@ pub(super) struct DynamicHeartbeat {
     pub(super) seq: std::sync::atomic::AtomicU64,
     /// 当前第几次上游尝试，重试循环每轮更新
     pub(super) attempt: std::sync::atomic::AtomicU32,
-    /// 有一次调用还没回来：这一拍不再排队调用，直接发固定心跳
-    pub(super) in_flight: std::sync::atomic::AtomicBool,
+    /// 在途心跳的序号及最近完成的一层的字节。到下一拍时可直接取走，旧任务不会再发第二份。
+    pub(super) pending: std::sync::Mutex<Option<(u64, Bytes)>>,
     /// 本请求已就心跳转换失败 warn 过（只 warn 一次，免得每拍刷屏）
     pub(super) warned: std::sync::atomic::AtomicBool,
 }
@@ -81,19 +81,33 @@ pub(super) fn spawn_dynamic_heartbeat(
     gate: Arc<std::sync::Mutex<bool>>,
     fixed: Bytes,
     elapsed: Duration,
+    rec: crate::history::Recorder,
 ) {
+    let id = d.seq.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+    let deadline = tokio::time::Instant::now() + d.interval;
+    {
+        let replaying = gate.lock().unwrap();
+        if *replaying {
+            return;
+        }
+        if let Some((_, previous)) = d.pending.lock().unwrap().replace((id, fixed.clone()))
+            && tx.try_send(Ok(previous)).is_ok()
+        {
+            rec.heartbeat();
+        }
+    }
     tokio::spawn(async move {
         let mut info = aproxy_envelope::Heartbeat::new(
-            d.seq.fetch_add(1, AtomicOrdering::Relaxed) + 1,
+            id,
             elapsed.as_millis() as u64,
             d.attempt.load(AtomicOrdering::Relaxed),
         );
         info.last_failure = d.last.lock().unwrap().clone();
-        let deadline = tokio::time::Instant::now() + d.interval;
         let mut bytes = fixed;
         for p in d
             .pools
             .iter()
+            .rev()
             .filter(|p| p.entry.has_stage(crate::config::file::Stage::Heartbeat))
         {
             let mut m = aproxy_envelope::HeartbeatMessage::new(
@@ -115,6 +129,14 @@ pub(super) fn spawn_dynamic_heartbeat(
                 Ok(Ok(reply)) if reply.fail.is_none() => {
                     if let Some(b) = reply.data.as_bytes() {
                         bytes = Bytes::copy_from_slice(b);
+                        let mut pending = d.pending.lock().unwrap();
+                        let Some((current, last)) = pending.as_mut() else {
+                            return;
+                        };
+                        if *current != id {
+                            return;
+                        }
+                        *last = bytes.clone();
                     }
                 }
                 Err(_) => break,
@@ -129,11 +151,14 @@ pub(super) fn spawn_dynamic_heartbeat(
             let replaying = gate
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !*replaying {
-                let _ = tx.try_send(Ok(bytes));
+            let mut pending = d.pending.lock().unwrap();
+            if !*replaying && pending.as_ref().is_some_and(|(current, _)| *current == id) {
+                pending.take();
+                if tx.try_send(Ok(bytes)).is_ok() {
+                    rec.heartbeat();
+                }
             }
         }
-        d.in_flight.store(false, AtomicOrdering::Release);
     });
 }
 
@@ -223,8 +248,7 @@ impl KeepaliveSink {
 
     /// 发一个心跳。用 try_send 而非 send：通道满说明客户端还有没读走的字节，
     /// 这一拍可以省；而在这里阻塞会连带停住对上游响应的读取。配置了心跳转换器
-    /// 且上一次调用已回来时，这一拍交给它生成（独立任务，结果稍后写出）；否则
-    /// 发固定心跳。false = 客户端已断开（接收端随响应 Body 销毁）。
+    /// 时先发出上一拍已完成各层的输出，再独立开始本拍。false = 客户端已断开（接收端随响应 Body 销毁）。
     pub(super) fn heartbeat(&self) -> bool {
         match self {
             Self::Committed {
@@ -237,17 +261,15 @@ impl KeepaliveSink {
                 if tx.is_closed() {
                     return false;
                 }
-                if let Some(d) = &beat.dynamic
-                    && !d.in_flight.swap(true, AtomicOrdering::AcqRel)
-                {
+                if let Some(d) = &beat.dynamic {
                     spawn_dynamic_heartbeat(
                         d.clone(),
                         tx.clone(),
                         replay_gate.clone(),
                         beat.fixed.clone(),
                         at.elapsed(),
+                        beat.rec.clone(),
                     );
-                    beat.rec.heartbeat();
                     return true;
                 }
                 match tx.try_send(Ok(beat.fixed.clone())) {
@@ -263,7 +285,7 @@ impl KeepaliveSink {
         }
     }
 
-    /// 请求转换完成后启用动态心跳（之前各拍不知道最终请求，只发固定心跳）
+    /// 启用动态心跳；它读取客户端原始视角与本程序的请求状态。
     pub(super) fn arm_dynamic_heartbeat(&mut self, d: Arc<DynamicHeartbeat>) {
         match self {
             Self::Pending { beat, .. } | Self::Committed { beat, .. } => beat.dynamic = Some(d),

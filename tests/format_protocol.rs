@@ -360,3 +360,58 @@ async fn keepalive_overrides_observe_the_commit_between_layers() {
     assert!(body.matches(": first\n\n").count() >= 2, "{body}");
     assert!(!body.contains(": late"));
 }
+
+/// 两个程序逐层追加自己的名字。核对收到的字节而非日志先后，证明真实的数据依赖。
+#[tokio::test]
+async fn chain_runs_request_in_order_and_response_and_heartbeat_in_reverse() {
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let app = axum::Router::new().fallback(|body: String| async move {
+        assert_eq!(body, "qAB");
+        tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
+        (
+            [("content-type", "text/event-stream")],
+            "data: response\n\n",
+        )
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let stages = "'request','response','heartbeat'";
+    let config = String::from("[keepalive]\ninterval_secs=1\n")
+        + &layer(&home, "outer", stages, &["append", "A"])
+        + &layer(&home, "inner", stages, &["append", "B"]);
+    let (client, url) = running(&home, up, &config);
+    let res = client
+        .post(format!("{url}/stream"))
+        .header("accept", "text/event-stream")
+        .body("q")
+        .send()
+        .await
+        .unwrap();
+    let text = res.text().await.unwrap();
+    assert!(text.contains(": keepalive\n\n: B\n\n: A\n\n"), "{text:?}");
+    assert!(text.ends_with("data: response\n\nBA"), "{text:?}");
+    for (name, request, heartbeat, response) in [
+        (
+            "outer",
+            "q",
+            ": keepalive\n\n: B\n\n",
+            "data: response\n\nB",
+        ),
+        ("inner", "qA", ": keepalive\n\n", "data: response\n\n"),
+    ] {
+        let f = frames(&home, name);
+        let at = |stage: &str| f.iter().find(|m| m["stage"] == stage).unwrap();
+        assert_eq!(at("request")["request"]["body"], request);
+        assert_eq!(at("heartbeat")["data"], heartbeat);
+        assert_eq!(
+            at("heartbeat")["client"],
+            serde_json::json!({"path":"/stream","stream":true})
+        );
+        assert_eq!(at("response")["response"]["body"], response);
+        assert_eq!(at("heartbeat")["request_id"], at("response")["request_id"]);
+        assert!(at("response").get("state").is_none());
+    }
+}

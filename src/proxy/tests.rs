@@ -265,7 +265,7 @@ async fn dynamic_heartbeat_arriving_after_replay_started_is_dropped() {
         last: Default::default(),
         seq: Default::default(),
         attempt: Default::default(),
-        in_flight: Default::default(),
+        pending: Default::default(),
         warned: Default::default(),
     }));
     assert!(sink.heartbeat(), "发起这一拍的动态心跳（在途）");

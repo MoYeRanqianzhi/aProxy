@@ -35,11 +35,19 @@ pub(crate) fn handle_alias_cmd(cmd: AliasCmd) {
                 }
             }
             if json {
-                // 人读列表保留登记时的写法；文档给出实际检查的路径，文件消失也保留别名。
-                let aliases: Vec<_> = entries.into_iter().map(|(name, raw)| {
-                    let path = aproxy::settings::expand_path(&raw);
-                    json!({"name": name, "path": path.display().to_string(), "exists": path.is_file()})
-                }).collect();
+                // 给人看的列表照登记时的写法；文档给展开后的绝对路径（`~` 已展开），程序拿去
+                // 就能用。文件不在了别名照样列出，`exists` 为 false
+                let aliases: Vec<_> = entries
+                    .into_iter()
+                    .map(|(name, raw)| {
+                        let path = aproxy::settings::expand_path(&raw);
+                        json!({
+                            "name": name,
+                            "path": path.display().to_string(),
+                            "exists": path.is_file(),
+                        })
+                    })
+                    .collect();
                 super::print_doc(json!({"aliases": aliases}));
                 return;
             }

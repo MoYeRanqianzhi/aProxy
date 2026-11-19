@@ -486,7 +486,7 @@ not change the exit code.
 ```
 aproxy alias add NAME [PATH]
 aproxy alias remove NAME
-aproxy alias list
+aproxy alias list [--json]
 ```
 
 Aliases live in settings.json and name a config file, so `start`, `stop`, `restart` and `logs`
@@ -498,6 +498,8 @@ can address an instance by name even after its port changes.
 - Rejected names (`别名无效: …`, "invalid alias"): empty, a number from 0 to 65535, and `all`,
   `idle`, `default`, `defult` in any case. Lookup is case-sensitive.
 - `remove` deletes the name only; a running instance keeps running. An unknown name exits 1.
+- `list --json` prints `{"schema":1,"aliases":[{"name","path","exists"}]}`, sorted by name, with
+  `path` absolute and `exists` false when the file is gone (the alias is kept).
 
 `alias add/remove` and `settings set default_config` / `settings unset default_config` edit only
 their own key in
@@ -512,7 +514,7 @@ with `aproxy settings unset KEY` (that command does run), then add the alias.
 ## find
 
 ```
-aproxy find [QUERY] [--aliased | --unaliased] [--port PORT]
+aproxy find [QUERY] [--aliased | --unaliased] [--port PORT] [--json]
 ```
 
 Lists `*.toml` files directly inside the config directories (`config_dirs` from settings.json plus
@@ -521,6 +523,12 @@ masked upstream, aliases and `[默认]` ("default") for the default config; file
 are flagged `（无法解析为有效 aProxy 配置）`. A config outside these directories is not listed even
 when an alias points to it; add its directory to `config_dirs`. QUERY matches a path fragment or
 alias name, case-insensitively; `--port` matches the configured listen port.
+
+`--json` prints `{"schema":1,"configs":[{"path","aliases","listen_addr","base_url","errors"}]}`.
+`base_url` is masked; `listen_addr` and `base_url` are `null` for a file that does not parse.
+`errors` lists the file's error-level diagnostics (each with `code`, `file`, `key`, `line`,
+`column`, `message`), resolved the way `start` would resolve it, settings.json `defaults` included,
+so an empty `errors` means the config would pass `start`'s config check.
 
 ## doctor
 

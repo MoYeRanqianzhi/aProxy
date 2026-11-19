@@ -40,6 +40,8 @@ pub(super) enum KeepaliveSink {
         /// 互斥，否则心跳可能插进回放的事件中间。`send` 写第一块真实字节前在
         /// 锁内置位；心跳任务在锁内确认未置位才写（try_send 不阻塞，持锁极短）
         replay_gate: Arc<std::sync::Mutex<bool>>,
+        /// 属于这个响应的心跳任务；结束或断开时取消在途往返，不占后续消息的进程。
+        tasks: tokio::task::JoinSet<()>,
     },
 }
 
@@ -58,8 +60,6 @@ pub(super) struct DynamicHeartbeat {
     /// 配置顺序与请求方向相同，逐拍逆序遍历。
     pub(super) pools: Arc<[Arc<crate::transform::Pool>]>,
     pub(super) ctx: ExchangeCtx,
-    /// 超过下一拍的消息不能阻塞保活，逐层保留上一层的字节。
-    pub(super) interval: Duration,
     /// 最近一次尝试的失败，不会把别的请求的状态带进心跳。
     pub(super) last: std::sync::Mutex<Option<aproxy_envelope::Failure>>,
     /// 已发起的心跳调用次数（信封 heartbeat.seq）
@@ -77,14 +77,16 @@ pub(super) struct DynamicHeartbeat {
 /// drop 会被剔除（进程被杀），每拍都可能发生。
 pub(super) fn spawn_dynamic_heartbeat(
     d: Arc<DynamicHeartbeat>,
-    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    tasks: &mut tokio::task::JoinSet<()>,
     gate: Arc<std::sync::Mutex<bool>>,
     fixed: Bytes,
     elapsed: Duration,
-    rec: crate::history::Recorder,
+    deadline: tokio::time::Instant,
 ) {
     let id = d.seq.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-    let deadline = tokio::time::Instant::now() + d.interval;
+    tasks.abort_all();
+    while tasks.try_join_next().is_some() {}
     {
         let replaying = gate.lock().unwrap();
         if *replaying {
@@ -93,10 +95,11 @@ pub(super) fn spawn_dynamic_heartbeat(
         if let Some((_, previous)) = d.pending.lock().unwrap().replace((id, fixed.clone()))
             && tx.try_send(Ok(previous)).is_ok()
         {
-            rec.heartbeat();
+            d.ctx.rec.heartbeat();
         }
     }
-    tokio::spawn(async move {
+    let tx = tx.downgrade();
+    tasks.spawn(async move {
         let mut info = aproxy_envelope::Heartbeat::new(
             id,
             elapsed.as_millis() as u64,
@@ -121,8 +124,13 @@ pub(super) fn spawn_dynamic_heartbeat(
                 turn.send(aproxy_envelope::Stage::Heartbeat(m), p.entry.timeout_secs)
                     .await
             };
-            match tokio::time::timeout_at(deadline, exchange).await {
-                Ok(Ok(reply)) if reply.fail.is_none() => {
+            let reply = tokio::select! {biased;
+                _=tokio::time::sleep_until(deadline)=>break,
+                result=exchange=>result,
+            };
+            match reply {
+                _ if tokio::time::Instant::now() >= deadline => break,
+                Ok(reply) if reply.fail.is_none() => {
                     if let Some(b) = reply.data.as_bytes() {
                         bytes = Bytes::copy_from_slice(b);
                         let mut pending = d.pending.lock().unwrap();
@@ -132,10 +140,10 @@ pub(super) fn spawn_dynamic_heartbeat(
                         if *current != id {
                             return;
                         }
+                        if tokio::time::Instant::now() >= deadline { break; }
                         *last = bytes.clone();
                     }
                 }
-                Err(_) => break,
                 _ => {
                     if !d.warned.swap(true, AtomicOrdering::Relaxed) {
                         tracing::warn!(request_id=%d.ctx.request_id,"heartbeat format failed; retaining input bytes");
@@ -148,11 +156,12 @@ pub(super) fn spawn_dynamic_heartbeat(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut pending = d.pending.lock().unwrap();
-            if !*replaying && pending.as_ref().is_some_and(|(current, _)| *current == id) {
-                pending.take();
-                if tx.try_send(Ok(bytes)).is_ok() {
-                    rec.heartbeat();
-                }
+            // 超时或最后一层处理跨过节拍时，只发布在截止前已经接纳的结果。
+            if !*replaying && pending.as_ref().is_some_and(|(current, _)| *current == id)
+                    && let Some((_, bytes)) = pending.take()
+                    && let Some(tx) = tx.upgrade()
+                    && tx.try_send(Ok(bytes)).is_ok() {
+                d.ctx.rec.heartbeat();
             }
         }
     });
@@ -222,6 +231,7 @@ impl KeepaliveSink {
             heartbeats_only: true,
             beat,
             replay_gate: Arc::default(),
+            tasks: Default::default(),
         };
         true
     }
@@ -229,7 +239,7 @@ impl KeepaliveSink {
     /// 提交骨架头（200 + text/event-stream，不设 connection 头——hyper 按协议
     /// 自动管理）并立刻发首个心跳：客户端的空闲计时从收到首批字节起算。
     /// false = 客户端已断开。
-    pub(super) fn commit_skeleton(&mut self) -> bool {
+    pub(super) fn commit_skeleton(&mut self, deadline: tokio::time::Instant) -> bool {
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::CONTENT_TYPE,
@@ -239,18 +249,19 @@ impl KeepaliveSink {
             http::header::CACHE_CONTROL,
             HeaderValue::from_static("no-cache"),
         );
-        self.commit(StatusCode::OK, headers) && self.heartbeat()
+        self.commit(StatusCode::OK, headers) && self.heartbeat(deadline)
     }
 
     /// 发一个心跳。用 try_send 而非 send：通道满说明客户端还有没读走的字节，
     /// 这一拍可以省；而在这里阻塞会连带停住对上游响应的读取。配置了心跳转换器
     /// 时先发出上一拍已完成各层的输出，再独立开始本拍。false = 客户端已断开（接收端随响应 Body 销毁）。
-    pub(super) fn heartbeat(&self) -> bool {
+    pub(super) fn heartbeat(&mut self, deadline: tokio::time::Instant) -> bool {
         match self {
             Self::Committed {
                 tx,
                 beat,
                 at,
+                tasks,
                 replay_gate,
                 ..
             } => {
@@ -260,11 +271,12 @@ impl KeepaliveSink {
                 if let Some(d) = &beat.dynamic {
                     spawn_dynamic_heartbeat(
                         d.clone(),
-                        tx.clone(),
+                        tx,
+                        tasks,
                         replay_gate.clone(),
                         beat.fixed.clone(),
                         at.elapsed(),
-                        beat.rec.clone(),
+                        deadline,
                     );
                     return true;
                 }
@@ -278,6 +290,23 @@ impl KeepaliveSink {
                 }
             }
             Self::Pending { .. } => true,
+        }
+    }
+
+    /// 上游响应已就绪，转入交付；慢转换期间仍可用静态心跳，但不再争用 response 的进程。
+    pub(super) fn cancel_dynamic(&mut self) {
+        match self {
+            Self::Committed {
+                tasks,
+                replay_gate,
+                beat,
+                ..
+            } => {
+                *replay_gate.lock().unwrap() = true;
+                tasks.abort_all();
+                beat.dynamic = None;
+            }
+            Self::Pending { beat, .. } => beat.dynamic = None,
         }
     }
 
@@ -443,7 +472,9 @@ pub(super) async fn drive<F: std::future::Future>(
 ) -> Option<F::Output> {
     if sink.take_skeleton_due() {
         tracing::info!("上一次尝试暂停期间已到保活间隔，补提交骨架头（保活通道）");
-        if !sink.commit_skeleton() {
+        let deadline = tokio::time::Instant::now() + ticker.period();
+        ticker.reset_at(deadline);
+        if !sink.commit_skeleton(deadline) {
             sink.log_client_gone(during);
             return None;
         }
@@ -479,14 +510,17 @@ pub(super) async fn drive<F: std::future::Future>(
                 }
             }
             _ = ticker.tick() => {
+                // 定时器与心跳任务持有同一截止点，调度延迟不能让过期回信取得资格。
+                let deadline = tokio::time::Instant::now() + ticker.period();
+                ticker.reset_at(deadline);
                 let alive = if sink.is_committed() {
-                    sink.heartbeat()
+                    sink.heartbeat(deadline)
                 } else if skeleton_paused {
                     sink.mark_skeleton_due();
                     true
                 } else {
                     tracing::info!("一个保活间隔内上游未给出可提交的结果，先提交骨架头（保活通道）");
-                    sink.commit_skeleton()
+                    sink.commit_skeleton(deadline)
                 };
                 if !alive {
                     sink.log_client_gone(during);

@@ -421,7 +421,7 @@ impl RequestChain {
         }
     }
 }
-/// 只对最终交付的成功响应逆序派发。整条链都跳过或不改内容时原样交付原始字节（包括压缩）。
+/// 只对最终交付的成功响应逆序派发。整条链跳过时原样交付；一旦程序接受解码后的输入，输出编码以它的补丁为准。
 pub(super) async fn transform_response_if_configured(
     state: &AppState,
     req: &OutboundRequest,
@@ -440,6 +440,7 @@ pub(super) async fn transform_response_if_configured(
         input.headers.remove("content-encoding");
     }
     let mut decoded_spool = None;
+    let mut accepted = false;
     let mut rewrite_body = false;
     let mut rewrite_headers = false;
     for p in state
@@ -513,6 +514,7 @@ pub(super) async fn transform_response_if_configured(
             ctx.rec.format_report(name, "response", None, report);
         }
         ctx.absorb(name, r.state);
+        accepted |= r.fail.as_ref().is_none_or(|f| f.response.is_some());
         let replacement = if let Some(f) = r.fail {
             if let Some(mut response) = f.response {
                 let bytes = std::mem::take(&mut response.body);
@@ -545,12 +547,13 @@ pub(super) async fn transform_response_if_configured(
     }
     if rewrite_headers {
         headers = transform::headers_from_btreemap(&input.headers);
-        if let Some(decoded) = decoded_spool {
-            body = decoded;
-        }
-    }
-    if rewrite_body || rewrite_headers {
+    } else if accepted && encoding.is_some() {
         headers.remove(http::header::CONTENT_ENCODING);
+    }
+    if accepted && let Some(decoded) = decoded_spool {
+        body = decoded;
+    }
+    if rewrite_body || rewrite_headers || (accepted && encoding.is_some()) {
         headers.remove(http::header::CONTENT_LENGTH);
     }
     (status, headers, body)

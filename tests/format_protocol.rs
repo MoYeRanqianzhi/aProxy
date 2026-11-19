@@ -1598,3 +1598,379 @@ async fn disconnected_format_request_releases_the_only_worker_without_heartbeat(
         assert!(!gate.exists());
     }
 }
+
+/// 测试控制上游给出最终响应的时刻；先观察实际子进程读帧，再释放对应的一份响应。
+async fn held_upstream(
+    statuses: &'static [u16],
+    body: &'static str,
+) -> (
+    u16,
+    std::sync::Arc<tokio::sync::Semaphore>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let port = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = release.clone();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = calls.clone();
+    let app = axum::Router::new().fallback(move || {
+        let gate = gate.clone();
+        let i = count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .min(statuses.len() - 1);
+        async move {
+            gate.acquire().await.unwrap().forget();
+            (
+                axum::http::StatusCode::from_u16(statuses[i]).unwrap(),
+                [("content-type", "text/event-stream")],
+                body,
+            )
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (port, release, calls)
+}
+
+/// 测试进程每次写入完整的一行，观察确认带超时；未写完的一行不当成确认。
+async fn observed_stage(home: &TestHome, name: &str, stage: &str, count: usize) -> Vec<Value> {
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        loop {
+            let seen: Vec<Value> = std::fs::read_to_string(home.path().join(name))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|s| serde_json::from_str::<Value>(s).ok())
+                .filter(|f| f["stage"] == stage)
+                .collect();
+            if seen.len() >= count {
+                return seen;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+/// 同一个槽里响应不能排在慢心跳后面；即使响应体为空，下游也立即收到 EOF。
+#[tokio::test]
+async fn pending_heartbeat_does_not_delay_a_response_or_its_eof() {
+    for body in ["data: result\n\n", ""] {
+        let home = TestHome::new();
+        let (up, release, _) = held_upstream(&[200], body).await;
+        let cfg = String::from("[keepalive]\ninterval_secs=3\ntrigger='accept'\n")
+            + &layer(
+                &home,
+                "shared",
+                "'heartbeat','response'",
+                &["held-beat", home.path().join("never").to_str().unwrap()],
+            )
+            + "pool_max=1\ntimeout_secs=0\n";
+        let (client, url) = running(&home, up, &cfg);
+        let res = client
+            .post(&url)
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .unwrap();
+        observed_stage(&home, "shared", "heartbeat", 1).await;
+        release.add_permits(1);
+        let text = tokio::time::timeout(std::time::Duration::from_millis(1500), res.text())
+            .await
+            .expect("response waited on heartbeat")
+            .unwrap();
+        assert_eq!(text, body);
+        assert_eq!(
+            frames(&home, "shared")
+                .iter()
+                .filter(|f| f["stage"] == "hello")
+                .count(),
+            2
+        );
+        assert_eq!(breaker(&home, &url).await["failures"], 0);
+    }
+}
+
+/// 中间层出错或熔断均跳过；省略 data 保持上一层的字节，不让它覆盖外层的正常结果。
+#[tokio::test]
+async fn heartbeat_skips_failed_or_open_layers_and_keeps_each_client() {
+    let home = TestHome::new();
+    let (up, release, _) = held_upstream(&[200], "data: done\n\n").await;
+    let cfg = String::from("[keepalive]\ninterval_secs=1\n")
+        + &layer(&home, "outer", "'heartbeat'", &["append", "outer"])
+        + &layer(&home, "fault", "'heartbeat'", &["bad-beat"])
+        + "breaker_failures=1\nbreaker_cooldown_secs=30\n"
+        + &layer(&home, "inner", "'heartbeat'", &["alternate-beat"]);
+    let (client, url) = running(&home, up, &cfg);
+    let mut res = client
+        .get(format!("{url}/beats"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    let mut text = String::new();
+    let expected = ": keepalive\n\n: outer\n\n: second\n\n: outer\n\n";
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !text.contains(expected) {
+            text.push_str(std::str::from_utf8(&res.chunk().await.unwrap().unwrap()).unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    release.add_permits(1);
+    assert!(res.text().await.unwrap().ends_with("data: done\n\n"));
+    assert_eq!(
+        frames(&home, "fault")
+            .iter()
+            .filter(|f| f["stage"] == "heartbeat")
+            .count(),
+        1
+    );
+    for n in ["inner", "outer"] {
+        let f = observed_stage(&home, n, "heartbeat", 2).await;
+        for (i, b) in f[..2].iter().enumerate() {
+            assert_eq!(b["heartbeat"]["beat"], i + 1);
+            assert_eq!(
+                b["client"],
+                serde_json::json!({"path":"/beats","stream":true})
+            );
+            if n == "outer" {
+                assert_eq!(
+                    b["data"],
+                    if i == 0 {
+                        ": keepalive\n\n"
+                    } else {
+                        ": second\n\n"
+                    }
+                );
+            }
+        }
+    }
+}
+
+/// 慢外层错过截止时，只能写已及时返回的内层字节；上游不会等迟到的回信。
+#[tokio::test]
+async fn missed_beat_deadline_preserves_last_timely_fragment() {
+    let home = TestHome::new();
+    let (up, release, _) = held_upstream(&[200], "data: done\n\n").await;
+    let cfg = String::from("[keepalive]\ninterval_secs=1\n")
+        + &layer(
+            &home,
+            "slow",
+            "'heartbeat'",
+            &["held-beat", home.path().join("hold").to_str().unwrap()],
+        )
+        + &layer(&home, "inner", "'heartbeat'", &["append", "timely"]);
+    let (client, url) = running(&home, up, &cfg);
+    let mut res = client
+        .get(&url)
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    observed_stage(&home, "slow", "heartbeat", 1).await;
+    let first = tokio::time::timeout(std::time::Duration::from_secs(3), res.chunk())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.as_ref(), b": keepalive\n\n: timely\n\n");
+    release.add_permits(1);
+    assert!(!res.text().await.unwrap().contains(": late"));
+}
+
+/// 故障后最多换进程一次；熔断已开或半开探针已占用时，响应透传且不写 hello。
+#[tokio::test]
+async fn response_recovery_and_breaker_admission_use_only_allowed_workers() {
+    let (up, calls) = upstream(&[200]).await;
+    for (mode, expected, n) in [
+        ("recover-response", "fresh reply", 2),
+        ("exit1", "upstream bytes", 2),
+        ("probe-response", "upstream bytes", 1),
+    ] {
+        let home = TestHome::new();
+        let flag = home.path().join("probe");
+        let mut cfg = layer(&home, "res", "'response'", &[mode, flag.to_str().unwrap()]);
+        if mode == "probe-response" {
+            cfg += "breaker_failures=1\nbreaker_cooldown_secs=2\n";
+        }
+        let (c, url) = running(&home, up, &cfg);
+        let get = || c.get(&url).send();
+        assert_eq!(get().await.unwrap().text().await.unwrap(), expected);
+        assert_eq!(
+            frames(&home, "res")
+                .iter()
+                .filter(|f| f["stage"] == "hello")
+                .count(),
+            n
+        );
+        assert_eq!(observed_stage(&home, "res", "response", n).await.len(), n);
+        if mode == "probe-response" {
+            assert_eq!(get().await.unwrap().text().await.unwrap(), "upstream bytes");
+            assert_eq!(frames(&home, "res").len(), 2);
+            std::fs::write(&flag, b"").unwrap();
+            let at = breaker(&home, &url).await["probe_at"].as_u64().unwrap();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            tokio::time::sleep(std::time::Duration::from_millis(at.saturating_sub(now) + 1)).await;
+            let probe = tokio::spawn(get());
+            observed_stage(&home, "res", "response", 2).await;
+            assert_eq!(breaker(&home, &url).await["state"], "half_open");
+            assert_eq!(get().await.unwrap().text().await.unwrap(), "upstream bytes");
+            assert_eq!(frames(&home, "res").len(), 4);
+            std::fs::write(flag.with_extension("release"), b"").unwrap();
+            assert_eq!(
+                probe.await.unwrap().unwrap().text().await.unwrap(),
+                "probe reply"
+            );
+        }
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 6);
+}
+
+/// 内层明确拒绝的替代响应仍向外走；没有替代时外层看到原数据，两种都不重发上游。
+#[tokio::test]
+async fn explicit_response_failure_passes_only_the_selected_response_outward() {
+    for custom in [false, true] {
+        let home = TestHome::new();
+        let (up, calls) = upstream(&[200]).await;
+        let mut fail = serde_json::json!({"retry":true,"reason":"stop"});
+        if custom {
+            fail["response"] =
+                serde_json::json!({"status":409,"headers":{"x-inner":"given"},"body":"custom"});
+        }
+        let cfg = layer(&home, "outer", "'response'", &["append", "!"])
+            + &layer(
+                &home,
+                "inner",
+                "'response'",
+                &["reply", &serde_json::json!({"fail":fail}).to_string()],
+            );
+        let (c, url) = running(&home, up, &cfg);
+        let res = c.get(url).send().await.unwrap();
+        let expected = if custom { "custom" } else { "upstream bytes" };
+        assert_eq!(res.status().as_u16(), if custom { 409 } else { 200 });
+        assert_eq!(res.headers().contains_key("x-inner"), custom);
+        assert_eq!(res.text().await.unwrap(), format!("{expected}!"));
+        assert_eq!(frames(&home, "outer")[1]["response"]["body"], expected);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+}
+
+/// 只有判成成功且将交付的响应跑逆序链；保活是否已经提交不能改变派发次数。
+#[tokio::test]
+async fn response_runs_only_on_the_delivered_success_buffered_or_committed() {
+    for committed in [false, true] {
+        for exhausted in [false, true] {
+            let home = TestHome::new();
+            let (up, release, calls) = held_upstream(
+                if exhausted { &[503] } else { &[503, 200] },
+                "data: upstream\n\n",
+            )
+            .await;
+            let mut cfg = String::from("[keepalive]\ninterval_secs=1\ntrigger='accept'\n");
+            if exhausted {
+                cfg += "[[retry.rules]]\nstatus=[503]\nmax_attempts=1\n";
+            }
+            cfg += &layer(&home, "outer", "'response'", &["append", "A"]);
+            cfg += &layer(&home, "inner", "'response'", &["append", "B"]);
+            let (c, url) = running(&home, up, &cfg);
+            if !committed {
+                release.add_permits(2);
+            }
+            let mut req = c.get(url);
+            if committed {
+                req = req.header("accept", "text/event-stream");
+            }
+            let mut res = req.send().await.unwrap();
+            if committed {
+                let first = res.chunk().await.unwrap().unwrap();
+                assert!(first.starts_with(b":"));
+                release.add_permits(2);
+            }
+            let body = res.text().await.unwrap();
+            if exhausted && committed {
+                assert!(body.contains("retry_exhausted"));
+            } else {
+                assert_eq!(
+                    body,
+                    if exhausted {
+                        "data: upstream\n\n"
+                    } else {
+                        "data: upstream\n\nBA"
+                    }
+                );
+            }
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::Relaxed),
+                if exhausted { 1 } else { 2 }
+            );
+            for name in ["inner", "outer"] {
+                assert_eq!(
+                    frames(&home, name)
+                        .iter()
+                        .filter(|f| f["stage"] == "response")
+                        .count(),
+                    usize::from(!exhausted)
+                );
+            }
+        }
+    }
+}
+
+/// 解码后的输入不带上游编码；即使回信只保留原样也交付解码字节，而程序写的新编码必须保留。
+#[tokio::test]
+async fn response_program_encoding_replaces_only_the_upstream_encoding() {
+    use base64::Engine as _;
+    use std::io::Write as _;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(b"decoded").unwrap();
+    let raw = gz.finish().unwrap();
+    let encoded = raw.clone();
+    let port = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    let app = axum::Router::new().fallback(move || {
+        let b = encoded.clone();
+        async move {
+            (
+                [
+                    ("content-encoding", "gzip"),
+                    ("content-type", "application/octet-stream"),
+                ],
+                b,
+            )
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for writes in [false, true] {
+        let home = TestHome::new();
+        let json = if writes {
+            serde_json::json!({"response":{"headers":{"Content-Encoding":"gzip","content-length":"999"},"body_b64":base64::engine::general_purpose::STANDARD.encode(&raw)}})
+        } else {
+            serde_json::json!({})
+        };
+        let cfg = layer(&home, "codec", "'response'", &["reply", &json.to_string()]);
+        let (c, url) = running(&home, port, &cfg);
+        let res = c.get(url).send().await.unwrap();
+        let expected = if writes { raw.as_slice() } else { b"decoded" };
+        assert_eq!(res.headers().get("content-encoding").is_some(), writes);
+        assert_eq!(
+            res.headers()["content-length"].to_str().unwrap(),
+            expected.len().to_string()
+        );
+        assert_eq!(res.bytes().await.unwrap().as_ref(), expected);
+        let f = frames(&home, "codec");
+        assert_eq!(f[1]["response"]["body"], "decoded");
+        assert!(
+            f[1]["response"]["headers"]
+                .get("content-encoding")
+                .is_none()
+        );
+    }
+}

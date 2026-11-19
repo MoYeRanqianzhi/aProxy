@@ -190,6 +190,7 @@ fn committed_sink(
             rec: crate::history::Recorder::none(),
         },
         replay_gate: Arc::default(),
+        tasks: Default::default(),
     };
     (sink, rx, gone_tx)
 }
@@ -267,14 +268,16 @@ async fn dynamic_heartbeat_arriving_after_replay_started_is_dropped() {
             true,
             crate::history::Recorder::none(),
         ),
-        interval: Duration::from_secs(1),
         last: Default::default(),
         seq: Default::default(),
         attempt: Default::default(),
         pending: Default::default(),
         warned: Default::default(),
     }));
-    assert!(sink.heartbeat(), "发起这一拍的动态心跳（在途）");
+    assert!(
+        sink.heartbeat(tokio::time::Instant::now() + Duration::from_secs(1)),
+        "发起这一拍的动态心跳（在途）"
+    );
     let real = Bytes::from_static(b"data: real\n\n");
     assert!(sink.send(Ok(real.clone())).await);
     assert_eq!(rx.recv().await.unwrap().unwrap(), real);

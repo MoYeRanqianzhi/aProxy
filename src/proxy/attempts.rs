@@ -193,11 +193,6 @@ impl Responder {
             beat.rec.set_keepalive(enabled);
         }
         beat.fixed = Bytes::copy_from_slice(cfg.keepalive_heartbeat());
-        if let Some(dynamic) = &mut beat.dynamic {
-            Arc::get_mut(dynamic)
-                .expect("no heartbeat runs before commit")
-                .interval = interval;
-        }
     }
 
     /// 已经向客户端提交了响应头（只有保活出口会提交）：此后 status 与响应头不能再改，
@@ -272,7 +267,6 @@ impl Responder {
             sink.arm_dynamic_heartbeat(Arc::new(DynamicHeartbeat {
                 pools: state.formats.clone(),
                 ctx: req.ctx.as_ref().expect("format context").clone(),
-                interval: state.config.keepalive_interval(),
                 last: Default::default(),
                 seq: Default::default(),
                 attempt: Default::default(),
@@ -699,6 +693,9 @@ async fn deliver(
         raw_headers,
         body,
     } = response;
+    if let Responder::Keepalive { sink, .. } = r {
+        sink.cancel_dynamic();
+    }
     let upstream_sse = is_event_stream(&headers);
     let rec = &trace.rec;
     if state.has_format(Stage::Response) {

@@ -191,6 +191,33 @@ fn main() {
                 r["state"] = json!(format!("{worker}/{}", std::process::id()));
             }
             match mode {
+                "held-beat" if stage == "heartbeat" => {
+                    wait_gate(std::path::Path::new(arg));
+                    r["data"] = json!(": late\n\n");
+                }
+                "recover-response" if stage == "response" => {
+                    if OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(arg)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                    r["response"] = json!({"body":"fresh reply"});
+                }
+                "probe-response" if stage == "response" => {
+                    if !std::path::Path::new(arg).is_file() {
+                        r["seq"] = json!(seq + 1);
+                    } else {
+                        wait_gate(&std::path::Path::new(arg).with_extension("release"));
+                        r["response"] = json!({"body":"probe reply"});
+                    }
+                }
+                "alternate-beat" if stage == "heartbeat" && m["heartbeat"]["beat"] == 2 => {
+                    r["data"] = json!(": second\n\n");
+                }
+                "bad-beat" if stage == "heartbeat" => r["seq"] = json!(seq + 1),
                 "crash-then-unfinished" if stage == "response" => {
                     if OpenOptions::new()
                         .write(true)

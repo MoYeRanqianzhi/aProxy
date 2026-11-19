@@ -1406,7 +1406,9 @@ aproxy desktop                  W5
 
 ### 10.1 传输
 
-- **帧**：一行一个 JSON 对象，UTF-8 编码，以 `\n` 结尾。
+- **帧**：一行一个 JSON 对象，UTF-8 编码，以 `\n` 结尾。数组与标量不是合法的帧。
+  取值来自词表的字段（`decision`、`delivery`、`process`、`request_body` 的各个值）一律是 JSON 字符串，写成别的形状就是不合法
+  （2026-11-20 补：审查发现 serde 默认也接受按位置排列的数组与 `{"retry":null}` 这种写法，这些都不属于协议）。
 - **stderr**：每一行先做已知密钥替换，再写进实例日志，前缀为 `format[<name>]`。
 - **一问一答**：
   - 每条消息恰好一个回信，按顺序，回信必须原样带回消息的 `seq`。
@@ -1425,12 +1427,19 @@ aproxy desktop                  W5
 - **公共字段**：
   - aproxy 发出：`v`（协议版本）、`seq`（每个会话从 0 起递增）、`stage`、`request_id`、`state`（这个程序在这个请求上存下的值，没有就省略）；
     在这个阶段要了摘要的程序另收 `digest`（§10.2）。
+    例外：流的 data、close、abort 事件只带 `stream_id`，不带 `request_id` 与 `state`（§10.6）。这条流由同一个 worker 从头处理到尾，
+    它自己记得；`state` 可以有 64 KiB，不该每一块都重发。这三种事件的回信照样可以给 `state`。
   - format 回：`v`、`seq`；可选的 `state`（字符串表示替换，空串表示清除，省略表示不变；上限 64 KiB）；可选的 `report`。
+  - 回信里，可选字段写成 `null` 与省略同义：不少语言的 JSON 库把没有值的字段写成 `null`。所以 `{"body":null,"body_b64":"…"}` 就是只给了
+    `body_b64`。aproxy 发出的消息里，`null` 只出现在写明了含义的地方（§10.2 的 `digest`、§10.5 的 `truncated`）（2026-11-20 补）。
 - **HTTP 对象**：
   - 请求对象 `{"method","url","headers":{小写名: 值},"body"|"body_b64"}`；响应对象 `{"status","headers","body"|"body_b64"}`。
   - 回信里的同名对象是补丁：字段省略表示不变；给出 `headers` 就整表替换；`body` 与 `body_b64` 都省略表示不变，要清空就写 `"body":""`。
   - 多值头只保留第一个值。
+  - aproxy 发出的完整对象总带 `headers`，一个头都没有就写 `{}`：request、retry 阶段的请求对象，以及各阶段的响应对象。
+    decide、response、stream 阶段消息里的 `request` 只是方法与 url 的摘要，不带头与体（2026-11-20 补）。
 - **字节流**（stream、heartbeat 阶段）用 `data` 或 `data_b64`。aproxy 把块尾不完整的 UTF-8 序列留到下一块。
+  aproxy 发出的 heartbeat 消息与流的 data 事件总带其中一个，空块写 `"data":""`；只有回信可以两个都省略（2026-11-20 补）。
 
 ### 10.2 hello 与能力协商
 
@@ -1448,12 +1457,13 @@ aproxy desktop                  W5
   进行中的流独占的 worker 不计入 `pool_max`（§10.6），所以编号可以到 `pool_max` 或更大；流结束回到池里的 worker 保留原来的编号，
   池子满没满按进程数算，不按编号（2026-11-19 改：原来写「0 到 pool_max 之间」，与流的 worker 不计入池子矛盾）。
 - **`request_body`**（format 回）：按阶段声明要多少请求体，取 `none`、`digest` 或 `full`（用户追加 2026-10-12）。
-  - 只对带请求体的阶段有意义：request、retry、decide、notify；其余阶段的键被忽略。
-  - 省略时 request 与 retry 为 `full`，decide 与 notify 为 `none`；notify 只能取 `none` 或 `digest`。
+  - 只对带请求体的阶段有意义：request、retry、decide、notify；其余阶段的键连同它的值一起忽略，不校验
+    （以后的协议可能给别的阶段加含义、加取值，为它写的程序仍要能同协议 1 握手；2026-11-20 补）。
+  - 省略时 request 与 retry 为 `full`，decide 与 notify 为 `none`；notify 只能取 `none` 或 `digest`，给 `full` 按 hello 回信不合法处理。
   - `digest` 是 aproxy 对原始请求体算的 SHA-256，64 位小写十六进制，放在消息的 `digest` 字段。原始请求体指客户端发来的字节：
     不解码 content-encoding，不经链上改写，所以同一个请求重发时摘要不变。
   - 要 `digest` 或 `none` 的程序，消息里的请求对象不带 `body` 与 `body_b64`；它的补丁照样可以改头与 url。
-  - 取值不认识时，按 hello 回信不合法处理。
+  - 这四个阶段的取值不认识时，按 hello 回信不合法处理。
   - 这是性能契约：几 MB 的请求体不必经管道交给只做判断的程序。
   - 什么时候要先读完请求体，以 §10.10 为准（R-S3-3）：request 阶段有程序要 `full` 或 `digest`，或者链上有 decide 程序。
     只在 notify 上要 `digest` 时不必缓冲：摘要边转发边算；请求体不完整（客户端中途断开）时，notify 里的 `digest` 为 null。
@@ -1561,8 +1571,11 @@ aproxy desktop                  W5
 - **`fallback`**：不问 format 时 aproxy 会怎么做，即覆盖、规则表与默认三者得出的结论。
 - **回信**（`decision` 与 `reroute` 各自取第一个表态的程序）：
   - `decision:"retry"`：重试。`delay_ms` 可选，取值 0–86 400 000；省略就用 `fallback.delay_ms`，fallback 是 stop 时按现行退避算。
+    不是整数或超出这个范围，按回信不合法处理（见护栏），不截到上限（2026-11-20 补）。
     对成功的尝试回 retry，就是把它判为失败（`format_decision`），这个判决对这次尝试是终局。
   - `decision:"stop"`：停止。带了 `response` 就返回它（码 `retry_stopped`）；不带就透传上游响应；没有上游响应时回 502 `retry_stopped`。
+    这里的 `response` 同别处一样是补丁（§10.1）：有上游响应时改在它上面，例如只换体、保留状态码；没有上游响应时改在一个空响应上
+    （状态 502，没有头，空体），所以不给 `status` 就是 502（2026-11-20 补）。
   - `reroute`：这次重试要不要重跑重试链（§10.3）。true 重跑，false 沿用上一次发出的请求；没人表态时按默认处理。
     这就是用户原话里「是否换路由（every_attempt）」的落点。
     没有程序声明 retry 时，或上一次尝试在链里就失败了（没有发出请求）时，`reroute` 不起作用。
@@ -1639,6 +1652,10 @@ aproxy desktop                  W5
 
 - 形状：`{"summary":"<一句英文，最多 512 个字符>","actions":[{"type":"…",…,"label"?}]}`，`actions` 最多 32 条，超出就截断并告警。
 - 动作类型表只增不改；遇到不认识的类型，显示它的 `label`。
+- 报告只用来展示，绝不让回信作废（2026-11-20 补）：
+  - `report` 不是这个形状的对象，就丢掉这份报告并告警，回信的其余部分照常生效；
+  - 某个动作不是对象、没有字符串的 `type`，或者是表里的类型却缺了这一行的字段、字段不是字符串、`op` 不在取值里，就丢掉这一个动作并告警；
+  - 表里的类型只留这一行列出的字段与 `label`，别的字段忽略；不认识的类型只留 `type` 与 `label`，别的字段不管是什么形状都忽略。
 
 | type | 字段 |
 |---|---|

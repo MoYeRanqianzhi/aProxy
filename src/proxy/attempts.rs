@@ -364,7 +364,7 @@ fn record_try(
     let Some(mut history) = rec.try_started(attempt, sent, same_body, encoding) else {
         return;
     };
-    match &req.body {
+    match req.sent_body() {
         RequestBody::Memory(bytes) => history.feed(bytes),
         RequestBody::Disk { path, .. } => {
             // 现在就把文件打开：请求结束时它会被删掉，已经打开的句柄照样读得完
@@ -410,14 +410,7 @@ pub(super) async fn run_attempts(
     let needs_chain = state.has_format(Stage::Request) || state.has_format(Stage::Retry);
     let mut local = needs_chain.then(|| state.clone());
     let mut chain = if needs_chain {
-        match RequestChain::new(&req).await {
-            Ok(c) => Some(c),
-            Err(t) => {
-                t.record_in(&state.stats);
-                r.finish(t, &trace).await;
-                return;
-            }
-        }
+        Some(RequestChain::new(&req))
     } else {
         None
     };
@@ -525,7 +518,7 @@ pub(super) async fn run_attempts(
                 &req.method,
                 &req.target_url,
                 &req.headers,
-                &req.body,
+                req.sent_body(),
                 max_spool_bytes,
                 head_tx,
                 &rec,

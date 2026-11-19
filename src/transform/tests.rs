@@ -16,7 +16,13 @@ fn pool(mode: Process, sub: &str, edit: impl FnOnce(&mut FormatEntry)) -> Arc<Po
     e.process = mode;
     e.timeout_secs = 5;
     edit(&mut e);
-    Pool::new(e, PathBuf::new(), Secrets::default(), Default::default())
+    Pool::new(
+        e,
+        PathBuf::new(),
+        Secrets::default(),
+        Default::default(),
+        [1024 * 1024; 2],
+    )
 }
 /// 每次发送不同的正文；从错误的进程或旧序号取到的回信不能冒充本次回显。
 async fn call(p: &Arc<Pool>, body: &str, fresh: bool) -> Result<Reply, Fault> {
@@ -265,4 +271,41 @@ async fn pool_max_one_serializes_on_single_worker() {
     let (a, b) = tokio::join!(call(&p, "1", false), call(&p, "2", false));
     assert_eq!(worker(a.unwrap(), "1"), worker(b.unwrap(), "2"));
     assert_eq!(p.idle.lock().unwrap().len(), 1);
+}
+
+/// 无终点的内存数据源也只读到上限；最后一个字节恰为换行时仍是一条合法的完整帧。
+#[tokio::test]
+async fn reply_limit_is_enforced_before_newline_or_eof() {
+    let mut endless = BufReader::with_capacity(7, tokio::io::repeat(b'x'));
+    assert!(matches!(
+        read_reply(&mut endless, 31).await,
+        Err(Fault::Invalid)
+    ));
+    for (input, ok) in [(b"abc\n".as_slice(), true), (b"abcd\n", false)] {
+        let mut r = BufReader::with_capacity(2, input);
+        assert_eq!(read_reply(&mut r, 4).await.is_ok(), ok);
+    }
+    let mut partial = b"{\"v\":".as_slice();
+    assert!(matches!(
+        read_reply(&mut partial, 100).await,
+        Err(Fault::Died)
+    ));
+}
+
+/// 模拟 stderr 被其他进程继承：原进程被强制丢弃后，永不就绪的读取任务仍会随 worker 取消。
+#[tokio::test]
+async fn evicted_worker_aborts_even_a_stderr_reader_that_never_reaches_eof() {
+    let p = pool(Process::Persistent, "echo", |_| {});
+    let mut t = p.turn(false).await.unwrap();
+    let replacement = tokio::spawn(std::future::pending());
+    let handle = replacement.abort_handle();
+    std::mem::replace(&mut t.worker.stderr, replacement).abort();
+    drop(t);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 }

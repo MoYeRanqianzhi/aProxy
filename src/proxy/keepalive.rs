@@ -110,22 +110,18 @@ pub(super) fn spawn_dynamic_heartbeat(
             .rev()
             .filter(|p| p.entry.has_stage(crate::config::file::Stage::Heartbeat))
         {
-            let m = aproxy_envelope::HeartbeatMessage::new(
-                d.ctx.context(&p.entry.name),
-                info.clone(),
-                d.ctx.client.clone(),
-                aproxy_envelope::Fragment::from_bytes(bytes.to_vec()),
-            );
-            match tokio::time::timeout_at(
-                deadline,
-                p.call(
-                    aproxy_envelope::Stage::Heartbeat(m),
-                    p.entry.timeout_secs,
-                    false,
-                ),
-            )
-            .await
-            {
+            let exchange = async {
+                let turn = p.turn(false).await?;
+                let m = aproxy_envelope::HeartbeatMessage::new(
+                    d.ctx.context(&p.entry.name),
+                    info.clone(),
+                    d.ctx.client.clone(),
+                    aproxy_envelope::Fragment::from_bytes(bytes.to_vec()),
+                );
+                turn.send(aproxy_envelope::Stage::Heartbeat(m), p.entry.timeout_secs)
+                    .await
+            };
+            match tokio::time::timeout_at(deadline, exchange).await {
                 Ok(Ok(reply)) if reply.fail.is_none() => {
                     if let Some(b) = reply.data.as_bytes() {
                         bytes = Bytes::copy_from_slice(b);

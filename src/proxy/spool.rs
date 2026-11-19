@@ -10,11 +10,11 @@ use super::*;
 /// 删除时写句柄可能仍在 tokio 阻塞池的在途写操作里持有：Rust 标准库在 Windows
 /// 上以 FILE_SHARE_DELETE 打开文件，删除照样成功（最后一个句柄关闭时文件消失），
 /// unix 上 unlink 本就不受打开句柄影响。
-pub(super) struct SpoolPath(pub(super) PathBuf);
+pub(crate) struct SpoolPath(pub(crate) PathBuf);
 
 impl SpoolPath {
     /// 交出路径并解除删除责任（取走后自身成空路径，Drop 不再删）
-    pub(super) fn into_path(mut self) -> PathBuf {
+    pub(crate) fn into_path(mut self) -> PathBuf {
         std::mem::take(&mut self.0)
     }
 }

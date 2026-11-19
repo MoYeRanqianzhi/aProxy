@@ -1,5 +1,7 @@
 //! 外部 format 的运行时。协议只走子进程的 stdin/stdout，stderr 独立读走。
-use crate::proxy::{RESIDENT_LIMIT, RequestBody, SpooledBody, is_hop_header, unique_seq};
+use crate::proxy::{
+    RESIDENT_LIMIT, RequestBody, SpoolPath, SpooledBody, is_hop_header, unique_seq,
+};
 use aproxy_envelope as wire;
 use std::{
     collections::{BTreeMap, btree_map::Entry},
@@ -65,21 +67,19 @@ pub(crate) async fn spool_request_body(bytes: &[u8], spool_dir: Option<&Path>) -
     if bytes.len() > RESIDENT_LIMIT
         && let Some(dir) = spool_dir
     {
-        let path = dir.join(format!(
+        let path = SpoolPath(dir.join(format!(
             "req-{}-{}.spooltmp",
             std::process::id(),
             unique_seq()
-        ));
-        if let Ok(mut file) = tokio::fs::File::create(&path).await {
+        )));
+        if let Ok(mut file) = tokio::fs::File::create(&path.0).await {
             if file.write_all(bytes).await.is_ok() && file.flush().await.is_ok() {
                 return RequestBody::Disk {
-                    path,
+                    path: path.into_path(),
                     len: bytes.len() as u64,
                 };
             }
-            // 半截文件必须删除
-            drop(file);
-            let _ = std::fs::remove_file(&path);
+            // 写失败或 future 中途取消，都由路径守卫删除半截文件。
         }
     }
     RequestBody::Memory(bytes::Bytes::copy_from_slice(bytes))
@@ -90,20 +90,18 @@ pub(crate) async fn spool_response_body(bytes: &[u8], spool_dir: Option<&Path>) 
     if bytes.len() > RESIDENT_LIMIT
         && let Some(dir) = spool_dir
     {
-        let path = dir.join(format!(
+        let path = SpoolPath(dir.join(format!(
             "res-{}-{}.spooltmp",
             std::process::id(),
             unique_seq()
-        ));
-        if let Ok(mut file) = tokio::fs::File::create(&path).await {
+        )));
+        if let Ok(mut file) = tokio::fs::File::create(&path.0).await {
             if file.write_all(bytes).await.is_ok() && file.flush().await.is_ok() {
                 return SpooledBody::Disk {
-                    path,
+                    path: path.into_path(),
                     len: bytes.len() as u64,
                 };
             }
-            drop(file);
-            let _ = std::fs::remove_file(&path);
         }
     }
     SpooledBody::Memory(bytes::Bytes::copy_from_slice(bytes))

@@ -161,6 +161,7 @@ async fn handle(
         target_url: upstream_url(&state.config, &uri),
         headers,
         body: req_body,
+        replacement: None,
         // 交给 format 的信封里是同一个请求标识
         ctx: (!state.formats.is_empty()).then(|| {
             ExchangeCtx::new(

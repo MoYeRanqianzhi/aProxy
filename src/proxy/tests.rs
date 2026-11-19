@@ -256,6 +256,7 @@ async fn dynamic_heartbeat_arriving_after_replay_started_is_dropped() {
         PathBuf::new(),
         Default::default(),
         Default::default(),
+        [1024 * 1024; 2],
     );
     let (mut sink, mut rx, _gone) = committed_sink(Duration::ZERO, true);
     sink.arm_dynamic_heartbeat(Arc::new(DynamicHeartbeat {
@@ -863,4 +864,90 @@ fn uncompressed_responses_are_judged_without_decoding() {
         &reqwest::header::HeaderMap::new(),
         plain
     ));
+}
+
+/// 池位被占用时两个方向都不能先读 spool；文件直到归还池位之前才出现，提前读会直接失败或跳层。
+#[tokio::test]
+async fn queued_format_calls_only_read_the_spool_after_admission() {
+    let temp = tempfile::tempdir().unwrap();
+    let (parsed, errors) = crate::config::file::parse(
+        "[[format]]\ncommand='f'\nprocess='persistent'\npool_max=1\nstages=['request','response']",
+        Path::new("unit.toml"),
+    );
+    assert!(errors.is_empty());
+    let mut entry = parsed.format.unwrap().pop().unwrap();
+    entry.command = crate::transform::format_echo_path().display().to_string();
+    entry.args = vec!["stateful".into()];
+    let pool = crate::transform::Pool::new(
+        entry,
+        temp.path().into(),
+        Default::default(),
+        Default::default(),
+        [1024 * 1024; 2],
+    );
+    let mut state = AppState::new(Config {
+        disk_cache: Some(false),
+        ..Config::default()
+    });
+    state.formats = vec![pool.clone()].into();
+    let response_state = state.clone();
+    let hold = pool.turn(false).await.unwrap();
+    let req_path = temp.path().join("request");
+    let resp_path = temp.path().join("response");
+    let make_req = |body| OutboundRequest {
+        method: http::Method::POST,
+        target_url: "http://localhost/test".into(),
+        headers: HeaderMap::new(),
+        body,
+        replacement: None,
+        ctx: Some(ExchangeCtx::new(
+            "id".into(),
+            "/",
+            false,
+            crate::history::Recorder::none(),
+        )),
+    };
+    let mut req = make_req(RequestBody::Disk {
+        path: req_path.clone(),
+        len: 1,
+    });
+    let response_req = make_req(RequestBody::Memory(Bytes::new()));
+    let mut chain = RequestChain::new(&req);
+    let mut responder = Responder::buffered();
+    {
+        let mut run = std::pin::pin!(chain.run(&mut state, &mut req, 1, &mut responder));
+        let mut response = std::pin::pin!(transform_response_if_configured(
+            &response_state,
+            &response_req,
+            StatusCode::OK,
+            HeaderMap::new(),
+            SpooledBody::Disk {
+                path: resp_path.clone(),
+                len: 1
+            }
+        ));
+        assert!(futures_util::poll!(&mut run).is_pending());
+        assert!(futures_util::poll!(&mut response).is_pending());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), &mut run)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), &mut response)
+                .await
+                .is_err()
+        );
+        std::fs::write(&req_path, b"r").unwrap();
+        std::fs::write(&resp_path, b"s").unwrap();
+        drop(hold);
+        let (sent, (_, headers, _)) = tokio::time::timeout(Duration::from_secs(8), async {
+            tokio::join!(run, response)
+        })
+        .await
+        .unwrap();
+        assert!(sent.is_ok());
+        assert!(headers.contains_key("x-stage-seen"));
+    }
+    assert!(req.headers.contains_key("x-stage-seen"));
 }

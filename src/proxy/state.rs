@@ -169,6 +169,7 @@ impl AppState {
                     aproxy_ipc::home::home(),
                     history.secrets().clone(),
                     stats.state_changed.clone(),
+                    [config.body_limit_bytes(), spool_limit_bytes(&config)],
                 )
             })
             .collect();

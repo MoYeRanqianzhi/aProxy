@@ -30,6 +30,142 @@ const OVERRIDES: [&str; 8] = [
     "retry.max_attempts",
 ];
 
+/// 协商帧不带业务正文，普通控制帧只需容纳状态与报告。上限包括行末换行。
+const HELLO_BYTES: usize = 64 * 1024;
+/// 正文帧在两倍正文预算之外留给头、补丁、状态与 JSON 编码的空间。
+const FRAME_OVERHEAD: usize = 1024 * 1024;
+/// stderr 只保留一行的前缀；stdout 是协议，不能截断后继续解码。
+const STDERR_BYTES: usize = 8 * 1024;
+/// 同一程序的所有进程共享日志额度，不因池变大而放大日志流量。
+const STDERR_LINES: u32 = 50;
+
+/// 在每次从读缓冲取出字节时就检查剩余空间；没有换行的 EOF 是进程退出，不是帧。
+async fn read_reply<R: tokio::io::AsyncBufRead + Unpin>(
+    r: &mut R,
+    limit: usize,
+) -> Result<Vec<u8>, Fault> {
+    let mut line = Vec::new();
+    loop {
+        let chunk = r.fill_buf().await.map_err(|_| Fault::Io)?;
+        if chunk.is_empty() {
+            return Err(Fault::Died);
+        }
+        let remaining = limit - line.len();
+        let visible = &chunk[..chunk.len().min(remaining)];
+        if let Some(i) = visible.iter().position(|&b| b == b'\n') {
+            line.extend_from_slice(&visible[..=i]);
+            r.consume(i + 1);
+            return Ok(line);
+        }
+        if visible.len() == remaining {
+            return Err(Fault::Invalid);
+        }
+        let n = visible.len();
+        line.extend_from_slice(visible);
+        r.consume(n);
+    }
+}
+
+/// 每秒的日志额度与被抑制行数，同一程序的所有 worker 共用一个窗口。
+struct LogWindow {
+    /// 这一秒结束时，即使没有新输出也要汇总丢弃数。
+    end: Instant,
+    /// 已经写出的行数。
+    shown: u32,
+    /// 只计数，不保存限流后丢弃的内容。
+    dropped: u64,
+}
+impl LogWindow {
+    /// 开启首个固定时长窗口，随后仅在有输出时续开。
+    fn new() -> Self {
+        Self {
+            end: Instant::now() + Duration::from_secs(1),
+            shown: 0,
+            dropped: 0,
+        }
+    }
+    /// 窗口交界处可由定时器或下一行触发汇总，但只清零一次。
+    fn report(&mut self, name: &str) {
+        if self.dropped > 0 {
+            tracing::warn!("format[{}] dropped {} stderr lines", name, self.dropped);
+            self.dropped = 0;
+        }
+    }
+    /// 只在首次丢弃时安排定时汇总，进程即使退出或不再输出仍能看见计数。
+    fn allow(window: &Arc<Mutex<Self>>, name: &Arc<str>) -> bool {
+        let mut w = window.lock().unwrap();
+        if w.shown == 0 || Instant::now() >= w.end {
+            w.report(name);
+            *w = Self::new();
+        }
+        if w.shown < STDERR_LINES {
+            w.shown += 1;
+            return true;
+        }
+        w.dropped = w.dropped.saturating_add(1);
+        if w.dropped == 1 {
+            let window = window.clone();
+            let name = name.clone();
+            let end = w.end;
+            tokio::spawn(async move {
+                tokio::time::sleep_until(end).await;
+                let mut w = window.lock().unwrap();
+                if w.end == end {
+                    w.report(&name);
+                }
+            });
+        }
+        false
+    }
+}
+
+/// 边读边丢弃超长行的余部，保留有界前缀；截点若切进密钥，宁可多遮而不泄露前半段。
+async fn log_stderr<R: tokio::io::AsyncRead + Unpin>(
+    pipe: R,
+    secrets: Secrets,
+    name: Arc<str>,
+    window: Arc<Mutex<LogWindow>>,
+) {
+    let mut r = BufReader::new(pipe);
+    let mut line = Vec::new();
+    let mut truncated = false;
+    loop {
+        let Ok(chunk) = r.fill_buf().await else { break };
+        let eof = chunk.is_empty();
+        if eof && line.is_empty() && !truncated {
+            break;
+        }
+        let newline = chunk.iter().position(|&b| b == b'\n');
+        let n = newline.unwrap_or(chunk.len());
+        let take = n.min(STDERR_BYTES - line.len());
+        line.extend_from_slice(&chunk[..take]);
+        truncated |= take < n;
+        r.consume(n + usize::from(newline.is_some()));
+        if eof || newline.is_some() {
+            if LogWindow::allow(&window, &name) {
+                let mut safe = if truncated {
+                    secrets.replace_cut_prefix(&line)
+                } else {
+                    secrets.replace_bytes(&line)
+                };
+                truncated |= safe.len() > STDERR_BYTES;
+                safe.truncate(STDERR_BYTES);
+                tracing::warn!(
+                    "format[{}] {}{}",
+                    name,
+                    String::from_utf8_lossy(&safe).trim_end_matches('\r'),
+                    if truncated { "…(truncated)" } else { "" }
+                );
+            }
+            line.clear();
+            truncated = false;
+        }
+        if eof {
+            break;
+        }
+    }
+}
+
 /// 不把外部程序输出的原文拼进错误：畸形 JSON 或错位帧也可能含凭据。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Fault {
@@ -123,6 +259,8 @@ impl Drop for Slot {
 struct Worker {
     /// Drop 时可以取出子进程，异步等待真正退出。
     child: Option<Child>,
+    /// 强制回收时终止读取，避免继承管道的后代拖住日志任务。
+    stderr: tokio::task::JoinHandle<()>,
     /// 先关闭 stdin 通知进程退出，再收走进程名额。
     stdin: Option<ChildStdin>,
     /// 已预读的下一行不能交给另一个进程或请求。
@@ -136,6 +274,7 @@ struct Worker {
 }
 impl Drop for Worker {
     fn drop(&mut self) {
+        self.stderr.abort();
         self.stdin.take();
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
@@ -158,6 +297,8 @@ impl Worker {
             .is_ok_and(|wait| wait.is_ok())
         {
             self.child.take();
+            // 正常退出允许排空最后几行，但继承 stderr 的其他进程不应阻挡回收。
+            let _ = tokio::time::timeout(Duration::from_millis(100), &mut self.stderr).await;
         }
     }
     /// 排队与序列化不算在时限内，堵在写管道则算；调用被取消时不复用 worker。
@@ -166,6 +307,7 @@ impl Worker {
         stage: Stage,
         timeout: u64,
         admission: Option<&Admission<'_>>,
+        limit: usize,
     ) -> Result<Vec<u8>, Fault> {
         let mut line = serde_json::to_vec(&Message::new(self.seq, stage))
             .expect("protocol messages serialize");
@@ -195,15 +337,11 @@ impl Worker {
                 .write_all(&line[written..])
                 .await
                 .map_err(|_| Fault::Io)?;
-            let mut reply = Vec::new();
-            self.stdout
-                .read_until(b'\n', &mut reply)
-                .await
-                .map_err(|_| Fault::Io)?;
-            match reply.last() {
-                None => Err(Fault::Died),
-                Some(b'\n') if self.stdout.buffer().is_empty() => Ok(reply),
-                _ => Err(Fault::Protocol),
+            let reply = read_reply(&mut self.stdout, limit).await?;
+            if self.stdout.buffer().is_empty() {
+                Ok(reply)
+            } else {
+                Err(Fault::Protocol)
             }
         };
         if timeout == 0 {
@@ -267,6 +405,10 @@ pub(crate) struct Pool {
     home: PathBuf,
     /// stderr 在写日志之前走与请求历史相同的替换。
     secrets: Secrets,
+    /// 请求、响应的单帧上限；usize::MAX 对应用户明确选择的不设限。
+    frame_limits: [usize; 2],
+    /// 每个程序一个日志窗口，跨并发、换进程与重新握手。
+    stderr_window: Arc<Mutex<LogWindow>>,
     /// 同时进池的请求数；空闲进程可由持票者直接取走。
     turns: Semaphore,
     /// 已启动但仍未退出的进程数上限。
@@ -293,6 +435,7 @@ impl Pool {
         home: PathBuf,
         secrets: Secrets,
         notify: Arc<tokio::sync::Notify>,
+        body_limits: [usize; 2],
     ) -> Arc<Self> {
         let n = if entry.process == Process::Spawn {
             1
@@ -303,6 +446,8 @@ impl Pool {
             entry,
             home,
             secrets,
+            frame_limits: body_limits.map(|n| n.saturating_mul(2).saturating_add(FRAME_OVERHEAD)),
+            stderr_window: Arc::new(Mutex::new(LogWindow::new())),
             turns: Semaphore::new(n),
             capacity: Arc::new(Semaphore::new(n)),
             ids: Default::default(),
@@ -437,26 +582,14 @@ impl Pool {
                 .spawn()
                 .map_err(|_| Fault::Spawn)?
         };
-        let stderr = child.stderr.take().unwrap();
-        let secrets = self.secrets.clone();
-        let name = secrets.replace(&self.entry.name);
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut line = Vec::new();
-            while let Ok(n) = reader.read_until(b'\n', &mut line).await {
-                if n == 0 {
-                    break;
-                }
-                let safe = secrets.replace_bytes(&line);
-                tracing::warn!(
-                    "format[{}] {}",
-                    name,
-                    String::from_utf8_lossy(&safe).trim_end_matches(['\r', '\n'])
-                );
-                line.clear();
-            }
-        });
+        let stderr = tokio::spawn(log_stderr(
+            child.stderr.take().unwrap(),
+            self.secrets.clone(),
+            self.secrets.replace(&self.entry.name).into(),
+            self.stderr_window.clone(),
+        ));
         let mut w = Worker {
+            stderr,
             stdin: child.stdin.take(),
             stdout: BufReader::new(child.stdout.take().unwrap()),
             child: Some(child),
@@ -479,7 +612,7 @@ impl Pool {
             id,
         );
         hello.overrides = OVERRIDES.iter().map(|k| (*k).into()).collect();
-        let line = w.frame(Stage::Hello(hello), 10, None).await?;
+        let line = w.frame(Stage::Hello(hello), 10, None, HELLO_BYTES).await?;
         let reply: HelloReply = serde_json::from_slice(&line).map_err(|_| Fault::Invalid)?;
         if reply.v != 1 || reply.protocol != 1 || reply.seq != 0 {
             return Err(Fault::Protocol);
@@ -554,13 +687,8 @@ impl Pool {
         }
         None
     }
-    /// 做一次有序往返。序号先于业务字段检查；字段语义也要在归还 worker 之前校验。
-    pub(crate) async fn call(
-        self: &Arc<Self>,
-        stage: Stage,
-        timeout: u64,
-        fresh: bool,
-    ) -> Result<Reply, Fault> {
+    /// 先拿到已握手的独占进程，再让上一层读取磁盘与构造业务帧；等待者只持有轻量上下文。
+    pub(crate) async fn turn(self: &Arc<Self>, fresh: bool) -> Result<Turn<'_>, Fault> {
         let mut changed = self.changed.subscribe();
         let ticket = self.admit()?;
         let _turn = tokio::select! {biased;
@@ -580,28 +708,30 @@ impl Pool {
             _=changed.changed()=>return Err(self.circuit.lock().unwrap().refusal()),
             result=borrow=>result,
         };
-        let result = match worker {
-            Ok(mut w) => self
-                .exchange(&mut w, stage, timeout, &ticket)
-                .await
-                .map(|reply| (reply, w)),
-            Err(f) => Err(f),
-        };
-        if matches!(result, Err(Fault::Open { .. })) {
-            return result.map(|(r, _)| r);
-        }
-        self.complete(&ticket, result.as_ref().err());
-        let (reply, w) = result?;
-        if self.entry.process == Process::Spawn {
-            w.finish().await;
-        } else {
-            // 熔断和归还在同一把锁下排序，已被清空的空闲池不会收到旧代的 worker。
-            let c = self.circuit.lock().unwrap();
-            if c.epoch == ticket.epoch && c.window.is_none() {
-                self.park(w);
+        match worker {
+            Ok(worker) => Ok(Turn {
+                pool: self,
+                ticket,
+                worker,
+                _turn,
+            }),
+            Err(f) => {
+                if !matches!(f, Fault::Open { .. }) {
+                    self.complete(&ticket, Some(&f));
+                }
+                Err(f)
             }
         }
-        Ok(reply)
+    }
+    /// 管道单元测试只传很小的合成帧，生产路径先取得 turn 再构造可能很大的消息。
+    #[cfg(test)]
+    async fn call(
+        self: &Arc<Self>,
+        stage: Stage,
+        timeout: u64,
+        fresh: bool,
+    ) -> Result<Reply, Fault> {
+        self.turn(fresh).await?.send(stage, timeout).await
     }
     /// 帧的首次写入与熔断按同一把锁排序；已经发出的消息读完并计数，但不会提前结束冷却。
     async fn exchange(
@@ -611,7 +741,12 @@ impl Pool {
         timeout: u64,
         a: &Admission<'_>,
     ) -> Result<Reply, Fault> {
-        let line = w.frame(stage, timeout, Some(a)).await?;
+        let limit = match &stage {
+            Stage::Request(_) | Stage::Retry(_) => self.frame_limits[0],
+            Stage::Response(_) | Stage::Stream(_) => self.frame_limits[1],
+            _ => FRAME_OVERHEAD,
+        };
+        let line = w.frame(stage, timeout, Some(a), limit).await?;
         /// 先核对回信的版本和序列再解释补丁，以免把其他请求的回信应用到本次。
         #[derive(serde::Deserialize)]
         struct Sequence {
@@ -663,6 +798,42 @@ impl Pool {
         }
         w.seq += 1;
         Ok(r)
+    }
+}
+
+/// 已获接纳的一次往返；取消或未发出就丢弃时，进程与试探资格一起回收。
+pub(crate) struct Turn<'a> {
+    /// 归还 worker 和报告故障的原池。
+    pool: &'a Arc<Pool>,
+    /// 首字节仍须通过同代熔断器检查。
+    ticket: Admission<'a>,
+    /// 本次独占的会话。
+    worker: Worker,
+    /// 从接纳到归还始终占一个并发名额。
+    _turn: tokio::sync::SemaphorePermit<'a>,
+}
+impl Turn<'_> {
+    /// 只从写出开始计时，已取得名额后的本地正文读取也不占管道时限。
+    pub(crate) async fn send(mut self, stage: Stage, timeout: u64) -> Result<Reply, Fault> {
+        let pool = self.pool;
+        let result = pool
+            .exchange(&mut self.worker, stage, timeout, &self.ticket)
+            .await;
+        if matches!(result, Err(Fault::Open { .. })) {
+            return result;
+        }
+        pool.complete(&self.ticket, result.as_ref().err());
+        let reply = result?;
+        if pool.entry.process == Process::Spawn {
+            self.worker.finish().await;
+        } else {
+            // 熔断和归还在同一把锁下排序，已被清空的空闲池不会收到旧代的 worker。
+            let c = pool.circuit.lock().unwrap();
+            if c.epoch == self.ticket.epoch && c.window.is_none() {
+                pool.park(self.worker);
+            }
+        }
+        Ok(reply)
     }
 }
 

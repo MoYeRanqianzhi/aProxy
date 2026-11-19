@@ -690,3 +690,111 @@ async fn malformed_report_and_action_warn_without_discarding_data() {
     }
     assert!(!log.contains("untrusted-content"));
 }
+
+/// 静态超长与未写完就退出是不同的失败；后者允许可选程序以后试探。
+#[test]
+fn hello_line_limits_and_partial_eof_observe_the_startup_table() {
+    for required in [true, false] {
+        assert_eq!(
+            failure("unfinished-hello", required, "format_handshake_failed", 3)["kind"],
+            "invalid_output"
+        );
+    }
+    assert_eq!(
+        failure("partial-hello", true, "format_handshake_failed", 1)["kind"],
+        "died"
+    );
+    let (_home, out) = start("partial-hello", false);
+    assert!(out.status.success(), "{out:?}");
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let b = &doc["instance"]["formats"][0]["breaker"];
+    assert_eq!(b["state"], "open");
+    assert_eq!(b["last_failure"]["details"]["kind"], "died");
+}
+
+/// 第一个进程退出、第二个不换行；重发仍使用响应阶段的预算，不影响原响应或上游调用数。
+#[tokio::test]
+async fn fresh_response_worker_cannot_exceed_the_reply_limit() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[200]).await;
+    std::fs::write(
+        home.path().join("settings.json"),
+        r#"{"defaults":{"max_response_mb":1}}"#,
+    )
+    .unwrap();
+    let marker = home.path().join("first-worker");
+    let cfg = layer(
+        &home,
+        "bounded",
+        "'response'",
+        &["crash-then-unfinished", marker.to_str().unwrap()],
+    ) + "timeout_secs=3\n";
+    let (client, url) = running(&home, up, &cfg);
+    let response = client.get(&url).send().await.unwrap();
+    assert_eq!(response.text().await.unwrap(), "upstream bytes");
+    let b = breaker(&home, &url).await;
+    assert_eq!(b["failures"], 2);
+    assert_eq!(b["last_failure"]["details"]["kind"], "invalid_output");
+    assert_eq!(
+        frames(&home, "bounded")
+            .iter()
+            .filter(|f| f["stage"] == "response")
+            .count(),
+        2
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+/// 即使 stderr 最后一段输出之后再无新行，窗口也会写出丢弃数；边界密钥不能泄漏半截。
+#[tokio::test]
+async fn stderr_truncates_redacts_and_reports_suppressed_lines() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[200]).await;
+    let cfg = layer(&home, "noisy", "'request'", &["stderr-burst"]).replace(
+        "env={ ECHO_RECORD=",
+        "env={ ECHO_SECRET='private-fixture', ECHO_RECORD=",
+    );
+    let (port, out) = launch(&home, up, &cfg);
+    assert!(out.status.success(), "{out:?}");
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let log_path = doc["log_path"].as_str().unwrap();
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .unwrap()
+        .get(format!("http://127.0.0.1:{port}/"))
+        .send()
+        .await
+        .unwrap();
+    let log = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        loop {
+            let text = std::fs::read_to_string(log_path).unwrap();
+            if text.contains("dropped 8 stderr lines") {
+                break text;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(log.contains("<secret>…(truncated)"));
+    assert!(!log.contains("private-f"));
+    assert_eq!(log.matches("small-stderr-line").count(), 49);
+}
+
+/// 探测用的一次性进程会在 stdin 关闭后临退出时写最后一行，正常回收要读完它。
+#[test]
+fn normal_spawn_exit_drains_the_final_stderr_line() {
+    let home = TestHome::new();
+    let cfg = layer(&home, "drain", "'request'", &["stderr-on-eof"])
+        .replace("process='persistent'", "process='spawn'");
+    let (_, out) = launch(&home, free_port(), &cfg);
+    assert!(out.status.success(), "{out:?}");
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let log = std::fs::read_to_string(doc["log_path"].as_str().unwrap()).unwrap();
+    assert!(
+        log.contains("format[drain] last diagnostic after stdin EOF"),
+        "{log}"
+    );
+}

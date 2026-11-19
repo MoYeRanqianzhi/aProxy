@@ -17,15 +17,39 @@ pub(super) struct OutboundRequest {
     pub(super) headers: HeaderMap,
     /// 磁盘或内存形式的可重放请求体。
     pub(super) body: RequestBody,
+    /// 最终正文若有改写，游标、前缀与上游只持同一份可重放体的引用。
+    pub(super) replacement: Option<Arc<RequestBody>>,
     /// 各阶段共享的标识与按程序隔离的 state。
     pub(super) ctx: Option<ExchangeCtx>,
+}
+impl OutboundRequest {
+    /// 正文未改写时直接借用原请求，未配置 format 的路径不分配共享体。
+    pub(super) fn sent_body(&self) -> &RequestBody {
+        self.replacement.as_deref().unwrap_or(&self.body)
+    }
+}
+/// 首个 retry 层前的输入。磁盘正文只留句柄，不因排队或保留前缀而整份进内存。
+#[derive(Clone)]
+struct Prefix {
+    /// 重试段的首层位置。
+    cursor: usize,
+    /// 正文之外的协议字段。
+    input: wire::Request,
+    /// 上游可见的完整头表。
+    headers: HeaderMap,
+    /// 前缀改写体；缺省时仍是客户端原体。
+    body: Option<Arc<RequestBody>>,
+    /// 对应的请求历史版本。
+    version: u64,
 }
 /// 每次尝试从自己的游标继续；只有上一轮整条链成功时才回到重试段入口。
 pub(super) struct RequestChain {
     /// 上次已成功的各层留下的当前输入。
     input: wire::Request,
     /// 首个 retry 程序之前的缓存，与该层后续改写互不影响。
-    prefix: Option<(usize, wire::Request, HeaderMap, u64)>,
+    prefix: Option<Prefix>,
+    /// 当前改写体与重试前缀、上游重放共享；未改写时从客户端原体读取。
+    body: Option<Arc<RequestBody>>,
     /// 未被补丁整表替换的头保留原来的多值和非 ASCII 字节。
     headers: HeaderMap,
     /// 正文补丁的版本、下一次可分配的版本和上次交给上游的版本。
@@ -34,7 +58,7 @@ pub(super) struct RequestChain {
     sent_body_version: u64,
     /// 保活触发条件只用客户端原样的 Accept 和请求体，不受上游改写影响。
     accept: bool,
-    body_stream: bool,
+    body_stream: Option<bool>,
     /// 尚未成功的程序在配置里的位置。
     cursor: usize,
     /// 当前跑首轮 request 方向还是重跑 retry 方向，层失败时不变。
@@ -56,32 +80,26 @@ pub(super) enum ChainError {
     Stop(Terminal, Option<wire::Response>),
 }
 impl RequestChain {
-    /// 只有请求方向有程序时才读整份请求体。失败属于存储，不计程序的熔断。
-    pub(super) async fn new(req: &OutboundRequest) -> Result<Self, Terminal> {
-        let bytes = match &req.body {
-            RequestBody::Memory(b) => b.to_vec(),
-            RequestBody::Disk { path, .. } => tokio::fs::read(path).await.map_err(|e| {
-                Terminal::local_storage_failed(StorageOp::ReadRequest, &e.to_string())
-            })?,
-        };
+    /// 游标只记录元数据，原始正文直到已分配 worker 才展开。
+    pub(super) fn new(req: &OutboundRequest) -> Self {
         let mut input = wire::Request::new(req.method.to_string(), req.target_url.clone());
         input.headers = transform::headers_to_btreemap(&req.headers);
-        input.body = wire::Body::from_bytes(bytes);
-        Ok(Self {
+        Self {
             input,
             prefix: None,
+            body: None,
             headers: req.headers.clone(),
             body_version: 0,
             next_body_version: 1,
             sent_body_version: 0,
             accept: accepts_event_stream(&req.headers),
-            body_stream: request_body_wants_stream(&req.body).await,
+            body_stream: None,
             cursor: 0,
             stage: Stage::Request,
             last: None,
             started: tokio::time::Instant::now(),
             max_attempts: None,
-        })
+        }
     }
     /// 依次派发；在完成一层之后才移动游标。一个请求的局部配置不能通过共享的实例泄漏。
     pub(super) async fn run(
@@ -93,55 +111,79 @@ impl RequestChain {
     ) -> Result<bool, ChainError> {
         let ctx = req.ctx.as_ref().expect("format context");
         if self.cursor == state.formats.len() {
-            let Some((i, p, h, v)) = &self.prefix else {
+            let Some(p) = &self.prefix else {
                 return Ok(false);
             };
-            self.cursor = *i;
-            self.input = p.clone();
-            self.headers = h.clone();
-            self.body_version = *v;
+            self.cursor = p.cursor;
+            self.input = p.input.clone();
+            self.headers = p.headers.clone();
+            self.body_version = p.version;
+            self.body = p.body.clone();
             self.stage = Stage::Retry;
         }
         while self.cursor < state.formats.len() {
             let pool = state.formats[self.cursor].clone();
             if self.prefix.is_none() && pool.entry.has_stage(Stage::Retry) {
-                self.prefix = Some((
-                    self.cursor,
-                    self.input.clone(),
-                    self.headers.clone(),
-                    self.body_version,
-                ));
+                self.prefix = Some(Prefix {
+                    cursor: self.cursor,
+                    input: self.input.clone(),
+                    headers: self.headers.clone(),
+                    body: self.body.clone(),
+                    version: self.body_version,
+                });
             }
             if pool.entry.has_stage(self.stage) {
                 let name = &pool.entry.name;
                 let safe = state.history.secrets().replace(name);
                 let stage = self.stage.as_str();
-                let m = wire::RequestMessage::new(
-                    ctx.context(name),
-                    wire::Delivery::Retry,
-                    self.input.clone(),
-                    ctx.client.clone(),
-                );
-                let frame = if self.stage == Stage::Retry {
-                    wire::Stage::Retry(wire::RetryMessage::new(
-                        m,
-                        wire::Retry::new(
-                            attempt,
-                            self.last.clone().expect("retry follows a failure"),
-                            self.started.elapsed().as_millis() as u64,
-                        ),
-                    ))
-                } else {
-                    wire::Stage::Request(m)
+                let exchange = async {
+                    let turn = match pool.turn(false).await {
+                        Ok(turn) => turn,
+                        Err(f) => return Ok(Err(f)),
+                    };
+                    let mut input = self.input.clone();
+                    let bytes = match self.body.as_deref().unwrap_or(&req.body) {
+                        RequestBody::Memory(b) => b.to_vec(),
+                        RequestBody::Disk { path, .. } => {
+                            tokio::fs::read(path).await.map_err(|e| {
+                                ChainError::Stop(
+                                    Terminal::local_storage_failed(
+                                        StorageOp::ReadRequest,
+                                        &e.to_string(),
+                                    ),
+                                    None,
+                                )
+                            })?
+                        }
+                    };
+                    self.body_stream.get_or_insert_with(|| {
+                        json_requests_stream(serde_json::Deserializer::from_slice(&bytes))
+                    });
+                    input.body = wire::Body::from_bytes(bytes);
+                    let m = wire::RequestMessage::new(
+                        ctx.context(name),
+                        wire::Delivery::Retry,
+                        input,
+                        ctx.client.clone(),
+                    );
+                    let frame = if self.stage == Stage::Retry {
+                        wire::Stage::Retry(wire::RetryMessage::new(
+                            m,
+                            wire::Retry::new(
+                                attempt,
+                                self.last.clone().expect("retry follows a failure"),
+                                self.started.elapsed().as_millis() as u64,
+                            ),
+                        ))
+                    } else {
+                        wire::Stage::Request(m)
+                    };
+                    Ok(turn.send(frame, pool.entry.timeout_secs).await)
                 };
                 match responder
-                    .wait(
-                        pool.call(frame, pool.entry.timeout_secs, false),
-                        None,
-                        "request format",
-                    )
+                    .wait(exchange, None, "request format")
                     .await
-                    .ok_or(ChainError::Disconnected)?
+                    .ok_or(ChainError::Disconnected)??
                 {
                     Ok(reply) => {
                         if self.stage == Stage::Request
@@ -187,11 +229,24 @@ impl RequestChain {
                                 ))
                             };
                         }
-                        if let Some(patch) = reply.request {
+                        if let Some(mut patch) = reply.request {
                             if let Some(h) = &patch.headers {
                                 self.headers = transform::headers_from_btreemap(h);
                             }
-                            if patch.body.as_bytes().is_some() {
+                            if let Some(bytes) = std::mem::take(&mut patch.body).as_bytes() {
+                                self.body = Some(Arc::new(
+                                    responder
+                                        .wait(
+                                            transform::spool_request_body(
+                                                bytes,
+                                                state.spool_dir.as_deref(),
+                                            ),
+                                            None,
+                                            "format request spool",
+                                        )
+                                        .await
+                                        .ok_or(ChainError::Disconnected)?,
+                                ));
                                 self.body_version = self.next_body_version;
                                 self.next_body_version += 1;
                             }
@@ -230,14 +285,8 @@ impl RequestChain {
         req.target_url = self.input.url.clone();
         req.headers = self.headers.clone();
         let changed = self.body_version != self.sent_body_version;
-        if changed {
-            self.sent_body_version = self.body_version;
-            req.body = transform::spool_request_body(
-                self.input.body.as_bytes().unwrap(),
-                state.spool_dir.as_deref(),
-            )
-            .await;
-        }
+        self.sent_body_version = self.body_version;
+        req.replacement = self.body.clone();
         Ok(changed)
     }
     /// 只允许 hello 列明的叶键；单个非法键不作废同一回信里的其他键，也不记录它的值。
@@ -300,7 +349,11 @@ impl RequestChain {
                 }
             }
             if group == "keepalive" {
-                responder.configure_beats(&state.config, self.accept, self.body_stream);
+                responder.configure_beats(
+                    &state.config,
+                    self.accept,
+                    self.body_stream.unwrap_or(false),
+                );
             }
         }
     }
@@ -317,39 +370,13 @@ pub(super) async fn transform_response_if_configured(
         return (status, headers, body);
     }
     let ctx = req.ctx.as_ref().expect("format context");
-    let raw = match &body {
-        SpooledBody::Memory(b) => b.to_vec(),
-        SpooledBody::Disk { path, .. } => match tokio::fs::read(path).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error=%e,"could not read response spool; format skipped");
-                return (status, headers, body);
-            }
-        },
-    };
     let mut input = wire::Response::new(status.as_u16());
-    let mut heads = transform::headers_to_btreemap(&headers);
+    input.headers = transform::headers_to_btreemap(&headers);
     let encoding = encoding_to_undo(&headers);
-    let decoded = if let Some(enc) = &encoding {
-        let mut out = Vec::new();
-        if crate::decode::decode_strict(
-            enc,
-            raw.as_slice(),
-            &mut out,
-            spool_limit_bytes(&state.config) as u64,
-        )
-        .is_err()
-        {
-            tracing::warn!("could not decode response body; format skipped");
-            return (status, headers, body);
-        }
-        heads.remove("content-encoding");
-        out
-    } else {
-        raw
-    };
-    input.headers = heads;
-    input.body = wire::Body::from_bytes(decoded);
+    if encoding.is_some() {
+        input.headers.remove("content-encoding");
+    }
+    let mut decoded_spool = None;
     let mut rewrite_body = false;
     let mut rewrite_headers = false;
     for p in state
@@ -359,50 +386,103 @@ pub(super) async fn transform_response_if_configured(
         .filter(|p| p.entry.has_stage(Stage::Response))
     {
         let name = &p.entry.name;
-        let m = wire::Stage::Response(wire::ResponseMessage::new(
-            ctx.context(name),
-            wire::RequestMeta::new(req.method.to_string(), req.target_url.clone()),
-            input.clone(),
-        ));
-        let result = match p.call(m.clone(), p.entry.timeout_secs, false).await {
-            Err(e) if !matches!(e, Fault::Open { .. }) => {
-                p.call(m, p.entry.timeout_secs, true).await
+        let mut fresh = false;
+        let reply = loop {
+            let result = match p.turn(fresh).await {
+                Err(f) => Err(f),
+                Ok(turn) => {
+                    // 已拿到进程才展开当前响应；重发走同一入口，无故障时不准备第二帧。
+                    let mut raw = match decoded_spool.as_ref().unwrap_or(&body) {
+                        SpooledBody::Memory(b) => b.to_vec(),
+                        SpooledBody::Disk { path, .. } => match tokio::fs::read(path).await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::warn!(error=%e,"could not read response spool; format skipped");
+                                break None;
+                            }
+                        },
+                    };
+                    if let Some(enc) = &encoding
+                        && !rewrite_body
+                        && decoded_spool.is_none()
+                    {
+                        let mut decoded = Vec::new();
+                        if crate::decode::decode_strict(
+                            enc,
+                            raw.as_slice(),
+                            &mut decoded,
+                            spool_limit_bytes(&state.config) as u64,
+                        )
+                        .is_err()
+                        {
+                            tracing::warn!("could not decode response body; format skipped");
+                            return (status, headers, body);
+                        }
+                        raw = decoded;
+                        decoded_spool = Some(
+                            transform::spool_response_body(&raw, state.spool_dir.as_deref()).await,
+                        );
+                    }
+                    let mut current = input.clone();
+                    current.body = wire::Body::from_bytes(raw);
+                    let m = wire::ResponseMessage::new(
+                        ctx.context(name),
+                        wire::RequestMeta::new(req.method.to_string(), req.target_url.clone()),
+                        current,
+                    );
+                    turn.send(wire::Stage::Response(m), p.entry.timeout_secs)
+                        .await
+                }
+            };
+            match result {
+                Ok(r) => break Some(r),
+                Err(e) if !fresh && !matches!(e, Fault::Open { .. }) => fresh = true,
+                Err(e) => {
+                    tracing::warn!(format=%state.history.secrets().replace(name),error=%e,"response format layer skipped");
+                    break None;
+                }
             }
-            other => other,
         };
-        let r = match result {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(format=%state.history.secrets().replace(name),error=%e,"response format layer skipped");
-                continue;
-            }
+        let Some(r) = reply else {
+            continue;
         };
         if let wire::ReportField::Present(report) = r.report {
             ctx.rec.format_report(name, "response", None, report);
         }
         ctx.absorb(name, r.state);
-        if let Some(f) = r.fail {
-            if let Some(response) = f.response {
+        let replacement = if let Some(f) = r.fail {
+            if let Some(mut response) = f.response {
+                let bytes = std::mem::take(&mut response.body);
                 input = response;
-                rewrite_body = true;
                 rewrite_headers = true;
+                Some(bytes)
+            } else {
+                None
             }
-        } else if let Some(patch) = r.response {
+        } else if let Some(mut patch) = r.response {
+            let bytes = std::mem::take(&mut patch.body);
             rewrite_headers |= patch.headers.is_some();
-            rewrite_body |= patch.body.as_bytes().is_some();
             input.apply(patch);
+            (bytes != wire::Body::Absent).then_some(bytes)
+        } else {
+            None
+        };
+        if let Some(bytes) = replacement {
+            body = transform::spool_response_body(
+                bytes.as_bytes().unwrap_or_default(),
+                state.spool_dir.as_deref(),
+            )
+            .await;
+            decoded_spool = None;
+            rewrite_body = true;
         }
     }
     status = StatusCode::from_u16(input.status).expect("validated response status");
     if rewrite_headers {
         headers = transform::headers_from_btreemap(&input.headers);
-    }
-    if rewrite_body || rewrite_headers && encoding.is_some() {
-        body = transform::spool_response_body(
-            input.body.as_bytes().unwrap_or_default(),
-            state.spool_dir.as_deref(),
-        )
-        .await;
+        if let Some(decoded) = decoded_spool {
+            body = decoded;
+        }
     }
     if rewrite_body || rewrite_headers {
         headers.remove(http::header::CONTENT_ENCODING);

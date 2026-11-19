@@ -7,6 +7,19 @@ use std::{
     time::Duration,
 };
 
+/// 输出没有换行的固定块。测试预算限制写出总量，旧读者也只会等到超时而不会耗尽内存。
+fn unfinished_frame(bytes: usize) {
+    let mut out = std::io::stdout().lock();
+    let block = [b'x'; 8192];
+    for _ in 0..bytes.div_ceil(block.len()) {
+        if out.write_all(&block).is_err() {
+            return;
+        }
+    }
+    let _ = out.flush();
+    std::thread::sleep(Duration::from_secs(12));
+}
+
 /// 每个进程按行处理到 EOF；同批多余帧和延迟多余帧要区分，才能测出两种错位。
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -70,6 +83,15 @@ fn main() {
             assert_eq!((stage, seq), ("hello", 0));
             seen_hello = true;
             worker = m["worker_id"].as_u64().unwrap() as usize;
+            if mode == "partial-hello" {
+                print!("{{");
+                std::io::stdout().flush().unwrap();
+                break;
+            }
+            if mode == "unfinished-hello" {
+                unfinished_frame(64 * 1024);
+                break;
+            }
             if mode == "no-hello" {
                 std::thread::sleep(Duration::from_secs(60));
                 break;
@@ -116,6 +138,25 @@ fn main() {
                 r["state"] = json!(format!("{worker}/{}", std::process::id()));
             }
             match mode {
+                "crash-then-unfinished" if stage == "response" => {
+                    if OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(arg)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                    unfinished_frame(3 * 1024 * 1024);
+                    break;
+                }
+                "stderr-burst" => {
+                    // 让已知值横跨 8 KiB 截点；后续小行验证丢弃汇总与新额度。
+                    eprintln!("{}private-fixture", "x".repeat(8192 - 9));
+                    for _ in 0..57 {
+                        eprintln!("small-stderr-line");
+                    }
+                }
                 "sleep" => std::thread::sleep(delay),
                 "oneshot" if count > 1 || dead => break,
                 "exit1" => std::process::exit(1),
@@ -234,5 +275,8 @@ fn main() {
             writeln!(out, "{r}").unwrap();
             out.flush().unwrap();
         }
+    }
+    if mode == "stderr-on-eof" {
+        eprintln!("last diagnostic after stdin EOF");
     }
 }

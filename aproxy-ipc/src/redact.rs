@@ -332,6 +332,29 @@ impl Secrets {
         out
     }
 
+    /// 替换一条被截短的原始字节前缀。截点以后的字节未知，末尾若与已知密钥的开头相同，
+    /// 把可疑尾巴一并遮住；不为了精确匹配超长配置值而延长日志的读取上限。
+    pub fn replace_cut_prefix(&self, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut at = 0;
+        while at < bytes.len() {
+            if self.first_bytes[usize::from(bytes[at])]
+                && self.known.iter().any(|s| s.starts_with(&bytes[at..]))
+            {
+                out.extend_from_slice(SECRET_TEXT.as_bytes());
+                break;
+            }
+            if let Some(n) = self.match_at(bytes, at) {
+                out.extend_from_slice(SECRET_TEXT.as_bytes());
+                at += n;
+            } else {
+                out.push(bytes[at]);
+                at += 1;
+            }
+        }
+        out
+    }
+
     /// 把 `text` 里出现的每一处已知密钥换成 [`SECRET_TEXT`]。
     pub fn replace(&self, text: &str) -> String {
         if self.is_empty() {

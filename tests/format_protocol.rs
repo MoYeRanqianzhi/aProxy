@@ -1231,7 +1231,7 @@ async fn format_state_is_isolated_and_bounded_on_the_wire() {
         let stages: Vec<_> = f.iter().filter(|f| f["stage"] != "hello").collect();
         assert_eq!(stages.len(), 12);
         assert_ne!(stages[0]["request_id"], stages[6]["request_id"]);
-        for request in stages.chunks_exact(6) {
+        for request in stages.as_chunks::<6>().0 {
             assert_eq!(request[0]["stage"], "request");
             assert!(request[0].get("state").is_none());
             for frame in &request[1..4] {

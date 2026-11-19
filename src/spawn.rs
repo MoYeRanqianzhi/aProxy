@@ -36,7 +36,7 @@ pub enum SpawnError {
         pid: u32,
         startup_log: StartupLog,
         /// 子进程离开前写回交接文件的格式诊断，与别的实例的日志无关。
-        format: Option<crate::transform::StartupError>,
+        format: Option<Box<crate::transform::StartupError>>,
     },
     /// 时限内没有就绪。`start` 是 spawn 之后立刻读到的进程创建时间（身份锚点）：回收卡住的
     /// 子进程时按「pid + 创建时间」核验再终止，等待期间 pid 若已被系统复用给别的进程，届时

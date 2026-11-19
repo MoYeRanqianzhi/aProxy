@@ -129,8 +129,7 @@ async fn log_stderr<R: tokio::io::AsyncRead + Unpin>(
     let mut r = BufReader::new(pipe);
     let mut line = Vec::new();
     let mut truncated = false;
-    loop {
-        let Ok(chunk) = r.fill_buf().await else { break };
+    while let Ok(chunk) = r.fill_buf().await {
         let eof = chunk.is_empty();
         if eof && line.is_empty() && !truncated {
             break;

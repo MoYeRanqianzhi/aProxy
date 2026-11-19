@@ -464,7 +464,8 @@ pub(super) async fn run_attempts(
                     same_body = !changed;
                 }
                 Err(ChainError::Retry(f)) => failed = Some(f),
-                Err(ChainError::Stop(t, custom)) => {
+                Err(ChainError::Stop(stop)) => {
+                    let (t, custom) = *stop;
                     t.record_in(&state.stats);
                     record_try(&rec, attempt, None, true, &req);
                     rec.try_ended(attempt, 0, Some(t.for_history()));
@@ -561,16 +562,16 @@ pub(super) async fn run_attempts(
                         }
                     }
                 }
-                if let Some(c) = &chain {
-                    if c.max_attempts.is_some_and(|n| n != 0 && attempt >= n) {
-                        let t = Terminal::retry_exhausted("override", attempt, &failure);
-                        failure.record_in(&state.stats);
-                        t.record_in(&state.stats);
-                        rec.try_ended(attempt, response_bytes, Some(failure.for_history()));
-                        rec.decided(attempt, "override".into(), false);
-                        r.finish(t, &trace).await;
-                        return;
-                    }
+                if let Some(c) = &chain
+                    && c.max_attempts.is_some_and(|n| n != 0 && attempt >= n)
+                {
+                    let t = Terminal::retry_exhausted("override", attempt, &failure);
+                    failure.record_in(&state.stats);
+                    t.record_in(&state.stats);
+                    rec.try_ended(attempt, response_bytes, Some(failure.for_history()));
+                    rec.decided(attempt, "override".into(), false);
+                    r.finish(t, &trace).await;
+                    return;
                 }
                 failure.record_in(&state.stats);
                 rec.try_ended(attempt, response_bytes, Some(failure.for_history()));

@@ -76,15 +76,16 @@ pub(crate) async fn spool_request_body(bytes: &[u8], spool_dir: Option<&Path>) -
             std::process::id(),
             unique_seq()
         )));
-        if let Ok(mut file) = tokio::fs::File::create(&path.0).await {
-            if file.write_all(bytes).await.is_ok() && file.flush().await.is_ok() {
-                return RequestBody::Disk {
-                    path: path.into_path(),
-                    len: bytes.len() as u64,
-                };
-            }
-            // 写失败或 future 中途取消，都由路径守卫删除半截文件。
+        if let Ok(mut file) = tokio::fs::File::create(&path.0).await
+            && file.write_all(bytes).await.is_ok()
+            && file.flush().await.is_ok()
+        {
+            return RequestBody::Disk {
+                path: path.into_path(),
+                len: bytes.len() as u64,
+            };
         }
+        // 写失败或 future 中途取消，都由路径守卫删除半截文件。
     }
     RequestBody::Memory(bytes::Bytes::copy_from_slice(bytes))
 }
@@ -99,13 +100,14 @@ pub(crate) async fn spool_response_body(bytes: &[u8], spool_dir: Option<&Path>) 
             std::process::id(),
             unique_seq()
         )));
-        if let Ok(mut file) = tokio::fs::File::create(&path.0).await {
-            if file.write_all(bytes).await.is_ok() && file.flush().await.is_ok() {
-                return SpooledBody::Disk {
-                    path: path.into_path(),
-                    len: bytes.len() as u64,
-                };
-            }
+        if let Ok(mut file) = tokio::fs::File::create(&path.0).await
+            && file.write_all(bytes).await.is_ok()
+            && file.flush().await.is_ok()
+        {
+            return SpooledBody::Disk {
+                path: path.into_path(),
+                len: bytes.len() as u64,
+            };
         }
     }
     SpooledBody::Memory(bytes::Bytes::copy_from_slice(bytes))

@@ -87,7 +87,13 @@ pub(super) enum ChainError {
     /// 等子进程期间客户端断开，不计失败也不再访问上游。
     Disconnected,
     /// 请求立即结束，未提交时可用 format 给出的客户端响应。
-    Stop(Terminal, Option<wire::Response>),
+    Stop(Box<(Terminal, Option<wire::Response>)>),
+}
+impl ChainError {
+    /// 终态可能携带完整响应；只在确定结束时为这份诊断分配，不撑大普通往返。
+    fn stop(terminal: Terminal, response: Option<wire::Response>) -> Self {
+        Self::Stop(Box::new((terminal, response)))
+    }
 }
 impl RequestChain {
     /// 游标只记录元数据，原始正文直到已分配 worker 才展开。
@@ -148,7 +154,7 @@ impl RequestChain {
                 .await
                 .ok_or(ChainError::Disconnected)?
                 .map_err(|e| {
-                    ChainError::Stop(
+                    ChainError::stop(
                         Terminal::local_storage_failed(StorageOp::ReadRequest, &e.to_string()),
                         None,
                     )
@@ -199,7 +205,7 @@ impl RequestChain {
                         RequestBody::Memory(b) => b.to_vec(),
                         RequestBody::Disk { path, .. } => {
                             tokio::fs::read(path).await.map_err(|e| {
-                                ChainError::Stop(
+                                ChainError::stop(
                                     Terminal::local_storage_failed(
                                         StorageOp::ReadRequest,
                                         &e.to_string(),
@@ -280,7 +286,7 @@ impl RequestChain {
                                     details,
                                 )))
                             } else {
-                                Err(ChainError::Stop(
+                                Err(ChainError::stop(
                                     Terminal::format_rejected(&safe, &reason, details),
                                     f.response,
                                 ))
@@ -316,7 +322,7 @@ impl RequestChain {
                         }
                     }
                     Err(Fault::Open { kind, probe_at }) if pool.entry.required => {
-                        return Err(ChainError::Stop(
+                        return Err(ChainError::stop(
                             Terminal::new(
                                 "format_unavailable",
                                 format!("format '{safe}' is unavailable (circuit open)"),

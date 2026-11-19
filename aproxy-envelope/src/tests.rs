@@ -351,3 +351,31 @@ fn stream_and_heartbeat_inputs_require_fragments() {
     assert_eq!(reply.data.as_bytes(), Some(&[0, 255][..]));
     assert_eq!(serde_json::to_value(reply).unwrap(), raw);
 }
+
+/// A malformed delay invalidates the vote, unlike a bad delivery hint, which is advisory.
+#[test]
+fn decide_delays_are_checked_and_delivery_does_not_discard_patches() {
+    for n in [0, MAX_DELAY_MS] {
+        let raw = json!({"v":1,"seq":1,"delay_ms":n});
+        let r: Reply = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(r.delay_ms.unwrap(), RetryDelay::new(n).unwrap());
+        assert_eq!(r.delay_ms.unwrap().millis(), n);
+        assert_eq!(serde_json::to_value(r).unwrap(), raw);
+    }
+    assert!(RetryDelay::new(MAX_DELAY_MS + 1).is_err());
+    for n in [json!(-1), json!(0.5), json!("0"), json!(MAX_DELAY_MS + 1)] {
+        assert!(serde_json::from_value::<Reply>(json!({"v":1,"seq":1,"delay_ms":n})).is_err());
+    }
+    for vote in [json!(42), json!("later"), json!({"retry":null})] {
+        let r: Reply =
+            serde_json::from_value(json!({"v":1,"seq":15,"response":{"body":"x"},"delivery":vote}))
+                .unwrap();
+        assert_eq!(r.delivery, Some(vote));
+        for status in [429, 502] {
+            let mut base = Response::new(status);
+            base.apply(r.response.clone().unwrap());
+            assert_eq!(base.status, status);
+            assert_eq!(base.body, Body::Text("x".into()));
+        }
+    }
+}

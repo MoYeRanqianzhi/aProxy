@@ -45,6 +45,35 @@ pub enum BodyNeed {
     Full,
 }
 
+/// Largest wait a program can propose for one retry, in milliseconds (24 hours).
+pub const MAX_DELAY_MS: u64 = 86_400_000;
+
+/// A program's retry delay, validated before a decide vote can take effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u64")]
+#[non_exhaustive]
+pub struct RetryDelay(u64);
+impl RetryDelay {
+    /// Reject an out-of-range wait rather than silently changing the program's decision.
+    pub fn new(ms: u64) -> Result<Self, &'static str> {
+        ms.try_into()
+    }
+    /// Return the validated number of milliseconds.
+    pub fn millis(self) -> u64 {
+        self.0
+    }
+}
+impl TryFrom<u64> for RetryDelay {
+    type Error = &'static str;
+    fn try_from(ms: u64) -> Result<Self, Self::Error> {
+        if ms <= MAX_DELAY_MS {
+            Ok(Self(ms))
+        } else {
+            Err("delay_ms exceeds 86400000")
+        }
+    }
+}
+
 /// Worker lifetime selected by the instance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -818,13 +847,13 @@ pub struct Reply {
     pub overrides: Option<Overrides>,
     /// First recognized request-stage vote wins; unknown values are ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delivery: Option<String>,
+    pub delivery: Option<serde_json::Value>,
     /// Optional decide vote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<Decision>,
     /// Delay proposed for a retry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delay_ms: Option<u64>,
+    pub delay_ms: Option<RetryDelay>,
     /// Vote on rerunning the retry segment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reroute: Option<bool>,

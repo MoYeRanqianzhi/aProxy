@@ -608,3 +608,41 @@ async fn instance_without_formats_is_unaffected() {
             .is_empty()
     );
 }
+
+/// 非法投递提示不抹掉响应补丁，日志只在请求阶段告警且不回显外部数据。
+#[tokio::test]
+async fn malformed_delivery_preserves_patches_and_only_warns_on_request() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[200]).await;
+    let cfg = layer(
+        &home,
+        "voter",
+        "'request','response'",
+        &[
+            "reply",
+            r#"{"delivery":{"untrusted-vote":42},"response":{"body":"patched"}}"#,
+        ],
+    );
+    let (port, out) = launch(&home, up, &cfg);
+    assert!(out.status.success(), "{out:?}");
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap()
+        .get(format!("http://127.0.0.1:{port}/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "patched");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    let log = std::fs::read_to_string(doc["log_path"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        log.matches("invalid format delivery ignored").count(),
+        1,
+        "{log}"
+    );
+    assert!(!log.contains("untrusted-vote"));
+}

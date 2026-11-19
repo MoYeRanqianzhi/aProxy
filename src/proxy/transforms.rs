@@ -144,6 +144,14 @@ impl RequestChain {
                     .ok_or(ChainError::Disconnected)?
                 {
                     Ok(reply) => {
+                        if self.stage == Stage::Request
+                            && reply
+                                .delivery
+                                .as_ref()
+                                .is_some_and(|v| !matches!(v.as_str(), Some("forward" | "retry")))
+                        {
+                            tracing::warn!(format=%safe,"invalid format delivery ignored");
+                        }
                         if let Some(report) = reply.report {
                             ctx.rec.format_report(
                                 name,

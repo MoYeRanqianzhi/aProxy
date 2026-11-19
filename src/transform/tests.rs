@@ -67,11 +67,26 @@ fn headers_from_btreemap_filters_managed_and_invalid() {
     map.insert("x-custom".to_string(), "1".to_string());
     map.insert("[invalid header]".to_string(), "x".to_string());
 
-    let headers = headers_from_btreemap(&map);
+    let headers = headers_from_btreemap(&map, 8).unwrap();
     assert!(headers.contains_key("content-type"));
     assert!(headers.contains_key("x-custom"));
     assert!(!headers.contains_key("content-length"), "CL 防御性剔除");
     assert_eq!(headers.len(), 2, "非法头名丢弃");
+}
+
+/// 程序提供的头表最终还要添加内容长度、错误码等代理头，不可耗尽容量后才到交付路径。
+#[test]
+fn accepted_format_headers_leave_space_for_delivery_headers() {
+    let map = (0..6)
+        .map(|i| (format!("x-field-{i}"), "v".into()))
+        .collect();
+    let headers = headers_from_btreemap(&map, 8).unwrap();
+    assert!(headers.capacity() - headers.len() >= 8);
+    // 用同一个小表模拟无法满足的容量预留；不需要把整个请求解析器逼到极限。
+    assert!(matches!(
+        headers_from_btreemap(&map, usize::MAX),
+        Err(Fault::Invalid)
+    ));
 }
 
 /// 不存在的程序返回 spawn 分类。

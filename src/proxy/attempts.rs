@@ -466,10 +466,8 @@ pub(super) async fn run_attempts(
                     t.record_in(&state.stats);
                     record_try(&rec, attempt, None, true, &req);
                     rec.try_ended(attempt, 0, Some(t.for_history()));
-                    if let Some(response) = custom {
+                    if let Some((response, mut headers)) = custom {
                         rec.settle(crate::history::Outcome::FormatResponse, Some(t.code()));
-                        let mut headers =
-                            crate::transform::headers_from_btreemap(&response.headers);
                         let bytes = response.body.as_bytes().unwrap_or_default();
                         if r.is_committed() {
                             let data = if is_event_stream(&headers) {

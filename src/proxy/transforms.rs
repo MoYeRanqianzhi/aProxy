@@ -82,6 +82,9 @@ pub(super) struct RequestChain {
     /// 程序对此请求给出的重试上限，0 是显式无限制。
     pub(super) max_attempts: Option<u32>,
 }
+/// 主动结束时交付程序的响应以及通过容量校验的 HTTP 头。
+type ProgramResponse = (wire::Response, HeaderMap);
+
 /// 程序可以否决请求、使本次尝试失败，或无法读取本地 spool；上游尚未收到请求。
 pub(super) enum ChainError {
     /// 进入普通重试循环，保持失败层与它的输入。
@@ -89,11 +92,11 @@ pub(super) enum ChainError {
     /// 等子进程期间客户端断开，不计失败也不再访问上游。
     Disconnected,
     /// 请求立即结束，未提交时可用 format 给出的客户端响应。
-    Stop(Box<(Terminal, Option<wire::Response>)>),
+    Stop(Box<(Terminal, Option<ProgramResponse>)>),
 }
 impl ChainError {
     /// 终态可能携带完整响应；只在确定结束时为这份诊断分配，不撑大普通往返。
-    fn stop(terminal: Terminal, response: Option<wire::Response>) -> Self {
+    fn stop(terminal: Terminal, response: Option<ProgramResponse>) -> Self {
         Self::Stop(Box::new((terminal, response)))
     }
 }
@@ -259,7 +262,7 @@ impl RequestChain {
                     .await
                     .ok_or(ChainError::Disconnected)??
                 {
-                    Ok(reply) => {
+                    Ok((reply, headers)) => {
                         if self.stage == Stage::Request
                             && reply
                                 .delivery
@@ -303,7 +306,8 @@ impl RequestChain {
                             } else {
                                 Err(ChainError::stop(
                                     Terminal::format_rejected(&safe, &reason, details),
-                                    f.response,
+                                    f.response
+                                        .map(|r| (r, headers.expect("validated terminal headers"))),
                                 ))
                             };
                         }
@@ -313,7 +317,7 @@ impl RequestChain {
                                 req.method = method;
                             }
                             if let Some(h) = &mut patch.headers {
-                                self.headers = transform::headers_from_btreemap(h);
+                                self.headers = headers.expect("validated request headers");
                                 *h = transform::headers_to_btreemap(&self.headers);
                             }
                             if let Some(bytes) = std::mem::take(&mut patch.body).as_bytes() {
@@ -528,7 +532,7 @@ pub(super) async fn transform_response_if_configured(
                 }
             }
         };
-        let Some(r) = reply else {
+        let Some((r, prepared_headers)) = reply else {
             continue;
         };
         if let wire::ReportField::Present(report) = r.report {
@@ -540,6 +544,7 @@ pub(super) async fn transform_response_if_configured(
             if let Some(mut response) = f.response {
                 let bytes = std::mem::take(&mut response.body);
                 input = response;
+                headers = prepared_headers.expect("validated terminal headers");
                 rewrite_headers = true;
                 Some(bytes)
             } else {
@@ -547,7 +552,10 @@ pub(super) async fn transform_response_if_configured(
             }
         } else if let Some(mut patch) = r.response {
             let bytes = std::mem::take(&mut patch.body);
-            rewrite_headers |= patch.headers.is_some();
+            if let Some(h) = prepared_headers {
+                headers = h;
+                rewrite_headers = true;
+            }
             input.apply(patch);
             (bytes != wire::Body::Absent).then_some(bytes)
         } else {
@@ -566,9 +574,7 @@ pub(super) async fn transform_response_if_configured(
     if let Ok(patched) = StatusCode::from_u16(input.status) {
         status = patched;
     }
-    if rewrite_headers {
-        headers = transform::headers_from_btreemap(&input.headers);
-    } else if accepted && encoding.is_some() {
+    if !rewrite_headers && accepted && encoding.is_some() {
         headers.remove(http::header::CONTENT_ENCODING);
     }
     if accepted && let Some(decoded) = decoded_spool {

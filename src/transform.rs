@@ -49,7 +49,10 @@ pub(crate) fn headers_to_btreemap(headers: &axum::http::HeaderMap) -> BTreeMap<S
 
 /// 信封头表 → HeaderMap（整表替换）：非法头名/头值丢弃 + warn；hop-by-hop
 /// 与 content-length 防御性再过滤（format 不该回传它们，回了也不生效）。
-pub(crate) fn headers_from_btreemap(map: &BTreeMap<String, String>) -> axum::http::HeaderMap {
+fn headers_from_btreemap(
+    map: &BTreeMap<String, String>,
+    headroom: usize,
+) -> Result<axum::http::HeaderMap, Fault> {
     let mut headers = axum::http::HeaderMap::new();
     for (k, v) in map {
         if is_hop_header(k) || k.eq_ignore_ascii_case("content-length") {
@@ -68,9 +71,11 @@ pub(crate) fn headers_from_btreemap(map: &BTreeMap<String, String>) -> axum::htt
             tracing::warn!("invalid header value omitted from format output");
             continue;
         }
-        headers.insert(name, val);
+        headers.try_insert(name, val).map_err(|_| Fault::Invalid)?;
     }
-    headers
+    // 补丁还要经过 HTTP 客户端/服务端和代理的错误头注入；在承认合法回信前给它们留足空间。
+    headers.try_reserve(headroom).map_err(|_| Fault::Invalid)?;
+    Ok(headers)
 }
 
 /// 转换后的字节 → RequestBody：超内存驻留阈值且有 spool 目录则落盘成 Disk

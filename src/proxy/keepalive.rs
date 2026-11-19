@@ -130,7 +130,7 @@ pub(super) fn spawn_dynamic_heartbeat(
             };
             match reply {
                 _ if tokio::time::Instant::now() >= deadline => break,
-                Ok(reply) if reply.fail.is_none() => {
+                Ok((reply, _)) if reply.fail.is_none() => {
                     if let Some(b) = reply.data.as_bytes() {
                         bytes = Bytes::copy_from_slice(b);
                         let mut pending = d.pending.lock().unwrap();

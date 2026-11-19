@@ -862,7 +862,7 @@ impl Pool {
         timeout: u64,
         fresh: bool,
     ) -> Result<Reply, Fault> {
-        self.turn(fresh).await?.send(stage, timeout).await
+        Ok(self.turn(fresh).await?.send(stage, timeout).await?.0)
     }
     /// 帧的首次写入与熔断按同一把锁排序；已经发出的消息读完并计数，但不会提前结束冷却。
     async fn exchange(
@@ -871,12 +871,13 @@ impl Pool {
         stage: Stage,
         timeout: u64,
         a: &Admission<'_>,
-    ) -> Result<Reply, Fault> {
+    ) -> Result<PreparedReply, Fault> {
         let limit = match &stage {
             Stage::Request(_) | Stage::Retry(_) => self.frame_limits[0],
             Stage::Response(_) | Stage::Stream(_) => self.frame_limits[1],
             _ => FRAME_OVERHEAD,
         };
+        let request_stage = matches!(&stage, Stage::Request(_) | Stage::Retry(_));
         let line = w.frame(stage, timeout, Some(a), limit).await?;
         /// 先核对回信的版本和序列再解释补丁，以免把其他请求的回信应用到本次。
         #[derive(serde::Deserialize)]
@@ -930,10 +931,24 @@ impl Pool {
             }
             _ => (),
         }
+        // 只解析这一阶段实际采用的补丁；优先级和数据面相同，fail 覆盖同帧的其他补丁。
+        let table = if let Some(fail) = &r.fail {
+            fail.response.as_ref().map(|r| &r.headers)
+        } else if request_stage {
+            r.request.as_ref().and_then(|p| p.headers.as_ref())
+        } else {
+            r.response.as_ref().and_then(|p| p.headers.as_ref())
+        };
+        let headers = table
+            .map(|h| super::headers_from_btreemap(h, 8))
+            .transpose()?;
         w.seq += 1;
-        Ok(r)
+        Ok((r, headers))
     }
 }
+
+/// HTTP 头与回信一起通过容量校验；调用方接收同一份头表，不在终态路径重新转换。
+type PreparedReply = (Reply, Option<http::HeaderMap>);
 
 /// 已获接纳的一次往返；取消或未发出就丢弃时，进程与试探资格一起回收。
 pub(crate) struct Turn<'a> {
@@ -948,7 +963,7 @@ pub(crate) struct Turn<'a> {
 }
 impl Turn<'_> {
     /// 只从写出开始计时，已取得名额后的本地正文读取也不占管道时限。
-    pub(crate) async fn send(mut self, stage: Stage, timeout: u64) -> Result<Reply, Fault> {
+    pub(crate) async fn send(mut self, stage: Stage, timeout: u64) -> Result<PreparedReply, Fault> {
         let pool = self.pool;
         let result = pool
             .exchange(&mut self.worker, stage, timeout, &self.ticket)

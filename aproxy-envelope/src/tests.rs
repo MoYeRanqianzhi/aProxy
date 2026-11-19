@@ -476,6 +476,25 @@ fn accepted_actions_keep_bounded_fields_and_drop_only_overlong_types() {
     assert_eq!(a[1]["label"], "界".repeat(256));
 }
 
+/// A parseable wrong type discards only the optional code; a parser error rejects the frame.
+#[test]
+fn fail_code_wrong_type_on_the_wire_preserves_the_rejection() {
+    for code in ["42", r#"{"unexpected":true}"#] {
+        let line = format!(
+            r#"{{"v":1,"seq":1,"fail":{{"retry":false,"reason":"denied","code":{code}}}}}"#
+        );
+        let fail = serde_json::from_str::<Reply>(&line).unwrap().fail.unwrap();
+        assert!(!fail.retry && fail.code.is_none() && fail.discarded_code);
+        assert_eq!(fail.reason, "denied");
+    }
+    assert!(
+        serde_json::from_str::<Reply>(
+            r#"{"v":1,"seq":1,"fail":{"retry":false,"reason":"denied","code":1e999}}"#
+        )
+        .is_err()
+    );
+}
+
 /// Invalid optional failure codes cannot discard a deliberate program rejection.
 #[test]
 fn fail_code_is_bounded_independently_of_the_failure() {

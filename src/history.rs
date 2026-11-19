@@ -1767,7 +1767,16 @@ impl Recorder {
         for action in value["actions"].as_array_mut().unwrap() {
             for field in action.as_object_mut().unwrap().values_mut() {
                 if let Value::String(s) = field {
-                    *s = secrets.replace(s);
+                    // 恰好达到接收上限时，末尾可能是被截断的凭据前缀；宁可多遮住几个字符。
+                    *s = if s.chars().count() >= 256 {
+                        let end = s.char_indices().nth(256).map_or(s.len(), |(i, _)| i);
+                        String::from_utf8_lossy(&secrets.replace_cut_prefix(&s.as_bytes()[..end]))
+                            .chars()
+                            .take(256)
+                            .collect()
+                    } else {
+                        secrets.replace(s)
+                    };
                 }
             }
         }

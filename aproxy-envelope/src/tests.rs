@@ -452,3 +452,48 @@ fn notify_digest_null_and_absent_are_distinct_on_the_wire() {
         assert_eq!(serde_json::to_value(msg).unwrap(), raw);
     }
 }
+
+/// A report can name an unfamiliar action without retaining unbounded program strings.
+#[test]
+fn accepted_actions_keep_bounded_fields_and_drop_only_overlong_types() {
+    let text = "界".repeat(257);
+    let reply: Reply = serde_json::from_value(
+        serde_json::json!({"v":1,"seq":2,"report":{"summary":"ok","actions":[
+            {"type":"route","channel":text,"model_from":text,"model_to":text,"label":text},
+            {"type":"x".repeat(64),"label":text}, {"type":"x".repeat(62)+"界","label":"drop"}
+        ]}}),
+    )
+    .unwrap();
+    let ReportField::Present(report) = reply.report else {
+        panic!()
+    };
+    assert_eq!(report.discarded_actions, 1);
+    let a = serde_json::to_value(report.actions).unwrap();
+    assert_eq!(a.as_array().unwrap().len(), 2);
+    for k in ["channel", "model_from", "model_to", "label"] {
+        assert_eq!(a[0][k], "界".repeat(256));
+    }
+    assert_eq!(a[1]["label"], "界".repeat(256));
+}
+
+/// Invalid optional failure codes cannot discard a deliberate program rejection.
+#[test]
+fn fail_code_is_bounded_independently_of_the_failure() {
+    for (code, valid) in [
+        (json!("Az09._-"), true),
+        (json!("a".repeat(64)), true),
+        (json!("a".repeat(65)), false),
+        (json!("a/b"), false),
+        (json!("界"), false),
+        (json!(7), false),
+        (json!(""), false),
+    ] {
+        let r: Reply = serde_json::from_value(
+            json!({"v":1,"seq":1,"fail":{"retry":false,"reason":"stop","code":code}}),
+        )
+        .unwrap();
+        let fail = r.fail.unwrap();
+        assert_eq!(fail.reason, "stop");
+        assert_eq!(fail.code.is_some(), valid);
+    }
+}

@@ -194,6 +194,21 @@ impl Action {
 impl TryFrom<Map<String, Value>> for Action {
     type Error = serde_json::Error;
     fn try_from(mut fields: Map<String, Value>) -> Result<Self, Self::Error> {
+        if fields
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.len() > 64)
+        {
+            return Err(Self::Error::custom("action type exceeds 64 bytes"));
+        }
+        // Replace rather than truncate: a short label must not retain the source allocation.
+        for field in fields.values_mut() {
+            if let Value::String(text) = field
+                && let Some((end, _)) = text.char_indices().nth(256)
+            {
+                *text = text[..end].to_owned();
+            }
+        }
         let label = fields
             .remove("label")
             .map(serde_json::from_value::<String>)

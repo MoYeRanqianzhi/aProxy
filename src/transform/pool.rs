@@ -883,6 +883,9 @@ impl Pool {
         {
             return Err(Fault::Invalid);
         }
+        if r.fail.as_ref().is_some_and(|f| f.discarded_code) {
+            tracing::warn!(format=%self.secrets.replace(&self.entry.name),"invalid format fail code ignored");
+        }
         match &r.report {
             aproxy_envelope::ReportField::Invalid => {
                 tracing::warn!(format=%self.secrets.replace(&self.entry.name),"invalid format report ignored")

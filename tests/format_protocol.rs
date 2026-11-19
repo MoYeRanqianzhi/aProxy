@@ -331,7 +331,7 @@ async fn program_terminal_bytes_stay_private_to_the_client() {
     let safe = format!("<secret>{}", "界".repeat(504));
     for custom in [true, false] {
         let home = TestHome::new();
-        let mut fail = serde_json::json!({"retry":false,"reason":reason});
+        let mut fail = serde_json::json!({"retry":false,"reason":reason,"code":"invalid/private"});
         if custom {
             fail["response"] = serde_json::json!({"status":409,"body":secret});
         }
@@ -415,6 +415,9 @@ async fn program_terminal_bytes_stay_private_to_the_client() {
         let log = std::fs::read_to_string(startup["log_path"].as_str().unwrap()).unwrap();
         assert!(!log.contains(secret));
         assert!(log.contains(&safe));
+        assert_eq!(log.matches("invalid format fail code ignored").count(), 1);
+        assert!(!log.contains("invalid/private"));
+        assert!(!doc.to_string().contains("invalid/private"));
     }
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
@@ -556,7 +559,9 @@ async fn reports_land_in_the_request_record() {
     use aproxy::daemon::{ReadOp, ipc_read_in};
     let home = TestHome::new();
     let (up, _) = upstream(&[503, 200]).await;
-    let report = serde_json::json!({"report":{"summary":format!("fictional-token {}","界".repeat(520)),"actions":vec![serde_json::json!({"type":"other","label":"seen fictional-token"});35]}});
+    let mut actions = vec![serde_json::json!({"type":"other","label":"seen fictional-token"}); 35];
+    actions[1]["label"] = format!("{}fictional-token", "界".repeat(249)).into();
+    let report = serde_json::json!({"report":{"summary":format!("fictional-token {}","界".repeat(520)),"actions":actions}});
     let cfg = layer(
         &home,
         "reporter",
@@ -593,6 +598,9 @@ async fn reports_land_in_the_request_record() {
         assert_eq!(report["format"], "reporter");
         assert_eq!(report["summary"].as_str().unwrap().chars().count(), 512);
         assert_eq!(report["actions"].as_array().unwrap().len(), 32);
+        let clipped = report["actions"][1]["label"].as_str().unwrap();
+        assert!(!clipped.contains("fiction"));
+        assert!(clipped.chars().count() <= 256);
         assert_eq!(
             report["actions"][0],
             serde_json::json!({"type":"other","label":"seen <secret>"})

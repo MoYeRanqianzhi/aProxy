@@ -794,6 +794,7 @@ impl Message {
 
 /// A deliberate program rejection rather than a process error.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "ReceivedFail")]
 #[non_exhaustive]
 pub struct Fail {
     /// Whether to enter the normal retry loop.
@@ -803,9 +804,47 @@ pub struct Fail {
     /// Optional program-specific machine-readable code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    /// Set only on receipt of an invalid optional code; receivers warn without echoing it.
+    #[serde(skip)]
+    pub discarded_code: bool,
     /// Optional client-protocol response when stopping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<Response>,
+}
+/// Receive the diagnostic code separately: a bad optional field cannot undo a rejection.
+#[derive(Deserialize)]
+struct ReceivedFail {
+    /// Whether the operation may be retried.
+    retry: bool,
+    /// Program's explanation.
+    reason: String,
+    /// Raw optional field, including a value of the wrong JSON type.
+    code: Option<serde_json::Value>,
+    /// Optional terminal bytes and metadata.
+    response: Option<Response>,
+}
+impl From<ReceivedFail> for Fail {
+    fn from(input: ReceivedFail) -> Self {
+        let supplied = input.code.is_some();
+        let code = match input.code {
+            Some(serde_json::Value::String(s))
+                if !s.is_empty()
+                    && s.len() <= 64
+                    && s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')) =>
+            {
+                Some(s)
+            }
+            _ => None,
+        };
+        Self {
+            retry: input.retry,
+            reason: input.reason,
+            discarded_code: supplied && code.is_none(),
+            code,
+            response: input.response,
+        }
+    }
 }
 impl Fail {
     /// Construct the wire object from its required context.
@@ -813,6 +852,7 @@ impl Fail {
         Self {
             retry,
             reason,
+            discarded_code: false,
             code: None,
             response: None,
         }

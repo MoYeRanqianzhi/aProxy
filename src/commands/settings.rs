@@ -131,7 +131,8 @@ pub(crate) fn print_repair_hints(path: &std::path::Path) {
     );
 }
 
-/// 写回一个键。回执取落盘后的生效值：删去覆盖项，露出来的可能是内置默认而不是 null。
+/// 写一个键。`--json` 文档里的 `value` 取写完之后这个键的生效值：删掉一个键之后露出来的
+/// 可能是内置默认，而不是 null。
 async fn apply(path: &Path, change: edit::Change, json: bool) {
     let key = match &change {
         edit::Change::Set { key, .. } | edit::Change::Unset { key } => key,
@@ -142,7 +143,7 @@ async fn apply(path: &Path, change: edit::Change, json: bool) {
         std::slice::from_ref(&change),
     )
     .unwrap_or_else(|e| fail(&e, path, json));
-    let ports = if applied.changed && (key == "defaults" || key.starts_with("defaults.")) {
+    let ports = if applied.changed && in_defaults(key) {
         running_ports().await
     } else {
         Vec::new()
@@ -172,7 +173,16 @@ async fn apply(path: &Path, change: edit::Change, json: bool) {
     }
 }
 
-/// 全局默认在启动时读取，与实例使用哪份配置文件无关；未响应的实例也不能漏掉。
+/// 这个键是不是 `defaults` 或它下面的键。按解析后的第一段判断：键路径的名字可以加引号，
+/// `"defaults".max_request_mb` 与 `defaults.max_request_mb` 是同一个键。
+fn in_defaults(key: &str) -> bool {
+    parse_key_path(key)
+        .and_then(|segments| segments.into_iter().next())
+        .is_some_and(|first| first.name == "defaults")
+}
+
+/// 运行中的全部实例的端口，从小到大。实例只在启动时读 settings.json 的全局默认，与它用哪份
+/// 配置文件无关，所以改了 `defaults` 时每个实例都要重启才用上；不应答的实例也算在内。
 async fn running_ports() -> Vec<u16> {
     let survey = aproxy::daemon::survey_instances().await;
     let mut ports: Vec<u16> = survey
@@ -320,6 +330,13 @@ mod tests {
             json!({"disk_cache": false})
         );
         assert!(!is_string_key("aliases"));
+        // 键名加不加引号都是同一个键
+        assert!(in_defaults("defaults"));
+        assert!(in_defaults("defaults.max_request_mb"));
+        assert!(in_defaults("\"defaults\".max_request_mb"));
+        assert!(!in_defaults("defaultsx.max_request_mb"));
+        assert!(!in_defaults("watchdog.enabled"));
+        assert!(!in_defaults("bad..path"));
         assert!(!is_string_key("defaults.max_request_mb"));
         assert!(!is_string_key("bad..path"));
     }

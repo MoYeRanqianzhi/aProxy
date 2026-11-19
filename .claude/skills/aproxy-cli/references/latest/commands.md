@@ -639,10 +639,10 @@ aproxy start work
 ## settings
 
 ```
-aproxy settings show
-aproxy settings get KEY
-aproxy settings set KEY VALUE
-aproxy settings unset KEY
+aproxy settings show [--json]
+aproxy settings get KEY [--json]
+aproxy settings set KEY VALUE [--json]
+aproxy settings unset KEY [--json]
 ```
 
 Reads and edits `<home>/settings.json`; the file's keys and their meanings are in settings-json.md.
@@ -665,6 +665,16 @@ one value as JSON, or `null` for a key that is neither stored nor built in.
   ("no change") when the value was already there. Exit 0 for those and for a successful `show`/`get`;
   2 for a malformed key path or a value that is not valid JSON; 3 when the file cannot be read or the
   change would make it invalid (nothing is written); 1 when the file cannot be written.
+- **Running instances read settings.json only when they start.** After a change under `defaults`,
+  `set` and `unset` list every running instance on stderr (`运行中的实例要重启才用上这次改动:`,
+  "running instances need a restart to use this change", then one `aproxy restart <port>` line each).
+  Changes outside `defaults` need no restart.
+- **`--json`** prints one document on stdout: `show` gives
+  `{"schema":1,"file","values","diagnostics"}` (the document comes first even when the file has
+  errors, then the exit code is 3); `get` gives `{"schema":1,"key","value"}`; `set` and `unset` give
+  `{"schema":1,"file","key","value","changed","instances_to_restart":[ports]}`, where `value` is the
+  key's effective value after the write (after `unset`, that can be the built-in default). Failures
+  give `{"schema":1,"error":{…}}` with `usage`, `config_invalid` or `write_conflict`.
 - `aproxy alias add|remove` and `aproxy settings set|unset default_config` remain the commands for
   their fields; all go through the same writer and touch only their own key.
 

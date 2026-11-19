@@ -417,6 +417,35 @@ pub(super) fn is_event_stream(headers: &HeaderMap) -> bool {
         .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"))
 }
 
+/// 程序给的终态体仅在媒体类型确实是 SSE 时原样转发，参数和大小写不影响判断。
+pub(super) fn terminal_is_sse(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+        })
+}
+
+/// 验证整个 JSON 值但不把数字装进机器整数或浮点数；仅删掉原始换行，字符串内的转义不变。
+pub(super) fn terminal_json_event(bytes: &[u8]) -> Option<Bytes> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    serde_json::from_str::<serde::de::IgnoredAny>(text).ok()?;
+    let mut event = b"event: error\ndata: ".to_vec();
+    event.extend(
+        bytes
+            .iter()
+            .copied()
+            .filter(|b| !matches!(b, b'\r' | b'\n')),
+    );
+    event.extend_from_slice(b"\n\n");
+    Some(Bytes::from(event))
+}
+
 /// 响应声明的、回放前必须解掉的编码；无该头或只有 identity 层 → None
 pub(super) fn encoding_to_undo(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(http::header::CONTENT_ENCODING)?;

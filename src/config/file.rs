@@ -398,9 +398,10 @@ fn read_format(ctx: &mut Ctx, entry: &Tbl) -> Option<FormatEntry> {
         #[cfg(windows)]
         Some(command)
             if Path::new(command.trim().trim_end_matches([' ', '.']))
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")) =>
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.rsplit_once('.'))
+                .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")) =>
         {
             ctx.push(
                 "config_invalid_value",
@@ -1001,7 +1002,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_format_batch_targets_are_rejected_at_validation() {
-        for command in ["tool.cmd", "TOOL.BaT", "tool.CMD."] {
+        for command in [
+            "tool.cmd",
+            "TOOL.BaT",
+            "tool.CMD.",
+            r"scripts\.cmd",
+            r"scripts\.BAT",
+        ] {
             let (_, d) = parse_text(&format!(
                 "[[format]]\ncommand='{command}'\nstages=['request']"
             ));

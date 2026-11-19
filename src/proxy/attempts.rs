@@ -401,6 +401,7 @@ pub(super) async fn run_attempts(
     // 请求写的，format 改写 URL 不影响它
     let rules = state.retry_rules_for(path_and_query);
     let rec = trace.rec.clone();
+    let client_head = req.method == http::Method::HEAD;
     let mut req = req;
     let needs_chain = state.has_format(Stage::Request) || state.has_format(Stage::Retry);
     let mut local = needs_chain.then(|| state.clone());
@@ -480,12 +481,10 @@ pub(super) async fn run_attempts(
                         rec.settle(crate::history::Outcome::FormatResponse, Some(t.code()));
                         let bytes = response.body.as_bytes().unwrap_or_default();
                         if r.is_committed() {
-                            let data = if is_event_stream(&headers) {
+                            let data = if terminal_is_sse(&headers) {
                                 Bytes::copy_from_slice(bytes)
-                            } else if let Ok(value) =
-                                serde_json::from_slice::<serde_json::Value>(bytes)
-                            {
-                                Bytes::from(format!("event: error\ndata: {value}\n\n"))
+                            } else if let Some(event) = terminal_json_event(bytes) {
+                                event
                             } else {
                                 r.finish(t, &trace).await;
                                 return;
@@ -496,7 +495,9 @@ pub(super) async fn run_attempts(
                             }
                         } else if let Ok(status) = StatusCode::from_u16(response.status) {
                             mark_given_up(&mut headers, t.code(), &trace);
-                            rec.response_bytes(bytes.len() as u64);
+                            if delivers_body(client_head, status) {
+                                rec.response_bytes(bytes.len() as u64);
+                            }
                             r.respond(build_response(
                                 status,
                                 headers,
@@ -628,7 +629,7 @@ pub(super) async fn run_attempts(
                             rec.decided(attempt, by, false);
                             failure.record_in(&state.stats);
                             terminal.record_in(&state.stats);
-                            decide::finish(r, &trace, terminal, original, patch).await;
+                            decide::finish(r, &trace, terminal, original, patch, client_head).await;
                             return;
                         }
                     }

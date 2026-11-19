@@ -18,6 +18,13 @@ pub(super) struct Delivery {
     _in_flight: crate::daemon::Counted,
 }
 
+/// 以原始客户端方法和最终状态为准；重试链可以改写发往上游的方法，却不能改变这里的语义。
+pub(super) fn delivers_body(head: bool, status: StatusCode) -> bool {
+    !head
+        && !status.is_informational()
+        && !matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED)
+}
+
 impl Delivery {
     pub(super) fn new(rec: Recorder, in_flight: crate::daemon::Counted) -> Self {
         Self {
@@ -35,10 +42,7 @@ impl Delivery {
         response.map(|body| {
             use axum::body::HttpBody as _;
             // 没有体可写的响应，连接层一次都不读就丢掉它：这不是客户端断开
-            self.delivered = bodiless
-                || body.is_end_stream()
-                || status.is_informational()
-                || matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED);
+            self.delivered = !delivers_body(bodiless, status) || body.is_end_stream();
             Body::new(Delivered {
                 body,
                 delivery: self,

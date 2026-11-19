@@ -8,6 +8,11 @@ use std::collections::BTreeMap;
 /// Header names are lowercase. The wire protocol keeps only the first value.
 pub type Headers = BTreeMap<String, String>;
 
+/// Program responses may omit the header table or explicitly send null for it.
+fn response_headers<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Headers, D::Error> {
+    Ok(Option::<Headers>::deserialize(d)?.unwrap_or_default())
+}
+
 /// Define the two spellings of the same bytes without ever emitting both keys.
 macro_rules! bytes_field {
     ($name:ident, $text:literal, $b64:literal, $doc:literal) => {
@@ -162,7 +167,7 @@ pub struct Request {
     /// Absolute upstream URL.
     pub url: String,
     /// Complete header table, including an empty table when no headers remain.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "response_headers")]
     pub headers: Headers,
     /// Omitted when the program did not negotiate a body.
     #[serde(flatten)]
@@ -226,7 +231,7 @@ pub struct Response {
     /// HTTP status code.
     pub status: u16,
     /// Complete header table, including an empty table when no headers remain.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "response_headers")]
     pub headers: Headers,
     /// Omitted when the program did not negotiate a body.
     #[serde(flatten)]

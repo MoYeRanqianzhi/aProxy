@@ -1539,16 +1539,17 @@ async fn committed_format_rejection_uses_the_terminal_event_rules() {
     let (up, calls) = upstream(&[200]).await;
     for (mime, body, tail) in [
         (
-            "text/event-stream",
+            "Text/Event-Stream; charset=utf-8",
             "event: end\ndata: custom\n\n",
             "event: end\ndata: custom\n\n",
         ),
         (
             "application/json",
-            "{\n \"detail\": \"two\"\n}",
-            "event: error\ndata: {\"detail\":\"two\"}\n\n",
+            "{\r\n \"id\": 123456789012345678901234567890, \"n\": 1e999\n}",
+            "event: error\ndata: { \"id\": 123456789012345678901234567890, \"n\": 1e999}\n\n",
         ),
         ("text/plain", "not an event", ""),
+        ("application/not-text/event-stream", "not SSE", ""),
     ] {
         let home = TestHome::new();
         let json = serde_json::json!({"fail":{"retry":false,"reason":"stop","response":{"status":409,"headers":{"content-type":mime},"body":body}},"overrides":{"keepalive":{"unknown":"never-log-late","interval_secs":"bad-late-value"}}});
@@ -2366,4 +2367,31 @@ async fn successful_decide_abstention_keeps_a_null_decision() {
     assert!(attempt["decision"].is_null());
     assert!(attempt["code"].is_null());
     assert_eq!(attempt["reports"][0]["summary"], "seen");
+}
+
+/// HEAD 和无正文状态不能把程序提供但没发出的诊断体计入客户端交付量。
+#[tokio::test]
+async fn bodyless_format_terminals_record_zero_delivered_bytes() {
+    let (up, _) = upstream(&[200]).await;
+    for (method, status) in [
+        (reqwest::Method::HEAD, 409),
+        (reqwest::Method::GET, 204),
+        (reqwest::Method::GET, 304),
+    ] {
+        let home = TestHome::new();
+        let reply = serde_json::json!({"fail":{"retry":false,"reason":"stop","response":{"status":status,"body":"not delivered"}}});
+        let cfg = layer(&home, "stop", "'request'", &["reply", &reply.to_string()]);
+        let (c, url) = running(&home, up, &cfg);
+        let res = c.request(method, &url).send().await.unwrap();
+        assert_eq!(res.status().as_u16(), status);
+        let id = res.headers()["x-aproxy-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(res.bytes().await.unwrap().is_empty());
+        assert_eq!(
+            request_detail(&home, &url, &id).await["record"]["response_bytes"],
+            0
+        );
+    }
 }

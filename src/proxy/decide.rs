@@ -299,6 +299,7 @@ pub(super) async fn finish(
     terminal: Terminal,
     response: Option<UpstreamResponse>,
     patch: Option<(wire::ResponsePatch, Option<HeaderMap>)>,
+    client_head: bool,
 ) {
     let supplied = patch.is_some();
     if !supplied && (response.is_none() || r.is_committed()) {
@@ -335,7 +336,9 @@ pub(super) async fn finish(
     );
     rec.phase(crate::history::Phase::Replaying);
     if !r.is_committed() {
-        rec.response_bytes(response.body.len());
+        if delivers_body(client_head, response.status) {
+            rec.response_bytes(response.body.len());
+        }
         let mut out = replay_failure_as_is(
             response.status,
             response.headers,
@@ -347,7 +350,7 @@ pub(super) async fn finish(
         r.respond(out);
         return;
     }
-    if is_event_stream(&response.headers) {
+    if terminal_is_sse(&response.headers) {
         let mut stream = response.body.into_stream().await;
         while let Some(chunk) = stream.next().await {
             let Ok(chunk) = chunk else {
@@ -364,19 +367,9 @@ pub(super) async fn finish(
             SpooledBody::Memory(b) => Some(b.clone()),
             SpooledBody::Disk { path, .. } => tokio::fs::read(path).await.ok().map(Bytes::from),
         };
-        if let Some(bytes) = bytes
-            && serde_json::from_slice::<serde::de::IgnoredAny>(&bytes).is_ok()
-        {
-            let mut data = b"event: error\ndata: ".to_vec();
-            data.extend(
-                bytes
-                    .iter()
-                    .copied()
-                    .filter(|b| !matches!(b, b'\r' | b'\n')),
-            );
-            data.extend_from_slice(b"\n\n");
-            let len = data.len();
-            if r.send(Ok(Bytes::from(data))).await {
+        if let Some(event) = bytes.as_deref().and_then(terminal_json_event) {
+            let len = event.len();
+            if r.send(Ok(event)).await {
                 rec.response_bytes(len as u64);
             }
         } else {

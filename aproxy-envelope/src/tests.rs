@@ -497,3 +497,10 @@ fn fail_code_is_bounded_independently_of_the_failure() {
         assert_eq!(fail.code.is_some(), valid);
     }
 }
+
+/// A null header table on a terminal program response is identical to an omitted one.
+#[test]
+fn terminal_response_accepts_null_headers() {
+    let reply: Reply = serde_json::from_value(json!({"v":1,"seq":1,"fail":{"retry":false,"reason":"stop","response":{"status":409,"headers":null}}})).unwrap();
+    assert!(reply.fail.unwrap().response.unwrap().headers.is_empty());
+}

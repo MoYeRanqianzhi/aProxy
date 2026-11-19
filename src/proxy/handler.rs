@@ -171,13 +171,21 @@ async fn handle(
     // 处在心跳节拍内，format 慢（timeout_secs = 0 时没有上界）时客户端照样在一个间隔后
     // 收到骨架头与心跳，而不是在拿到任何字节之前干等。req 所有权移交，请求体随任务结束
     // 自动 Drop 删除磁盘临时文件。
-    if keepalive_applies {
+    if keepalive_applies
+        || state.has_format(crate::config::file::Stage::Request)
+        || state.has_format(crate::config::file::Stage::Retry)
+    {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<Response>();
         let path_and_query = path_and_query.to_string();
         let task_trace = trace.clone();
         tokio::spawn(
             async move {
-                let mut r = Responder::keepalive(&state, resp_tx, task_trace.rec.clone());
+                let mut r = Responder::keepalive(
+                    &state,
+                    resp_tx,
+                    task_trace.rec.clone(),
+                    keepalive_applies,
+                );
                 run_attempts(
                     &state,
                     req,

@@ -43,7 +43,7 @@ pub(super) enum Outcome {
     Exhausted {
         response: UpstreamResponse,
         failure: AttemptFailure,
-        rule: usize,
+        rule: Option<usize>,
     },
     /// 上游响应体超出 spool 上限：确定性失败，重试无意义
     TooLarge,
@@ -62,6 +62,7 @@ pub(super) fn classify(
     attempt: u32,
     result: ForwardResult,
     rules: &[(usize, &CompiledRetryRule)],
+    override_max: Option<u32>,
 ) -> Outcome {
     match result {
         ForwardResult::NetworkError(failure) => Outcome::Retry {
@@ -89,7 +90,10 @@ pub(super) fn classify(
                 return Outcome::Deliver(response);
             }
             let failure = AttemptFailure::response(status);
-            match first_matching_rule(rules, status.as_u16()) {
+            let limit = override_max
+                .map(|n| (None, n))
+                .or_else(|| first_matching_rule(rules, status.as_u16()).map(|(i, n)| (Some(i), n)));
+            match limit {
                 Some((rule, max)) if max > 0 && attempt >= max => Outcome::Exhausted {
                     response,
                     failure,
@@ -98,7 +102,7 @@ pub(super) fn classify(
                 // 进入下一轮时 body 随 response 一起 Drop：磁盘临时文件删除
                 matched => Outcome::Retry {
                     failure,
-                    rule: matched.map(|(rule, _)| rule),
+                    rule: matched.and_then(|(rule, _)| rule),
                     // 这次尝试收到了完整的响应体，只是内容算失败
                     response_bytes: response.body.len(),
                 },
@@ -117,7 +121,7 @@ pub(super) enum Responder {
         sink: KeepaliveSink,
         /// 整个请求共用一个节拍：既是「一个间隔内仍无可提交的结果就提交骨架」的计时器，
         /// 也是提交后的心跳节拍
-        ticker: tokio::time::Interval,
+        ticker: Option<tokio::time::Interval>,
         /// 上游真实的 SSE 响应头能不能先行提交：配置了响应转换时不能（转换可能改头）
         real_head_allowed: bool,
     },
@@ -138,10 +142,9 @@ impl Responder {
         state: &AppState,
         resp_tx: tokio::sync::oneshot::Sender<Response>,
         rec: Recorder,
+        enabled: bool,
     ) -> Self {
         let interval = state.config.keepalive_interval();
-        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         Self::Keepalive {
             sink: KeepaliveSink::Pending {
                 resp_tx: Some(resp_tx),
@@ -152,14 +155,54 @@ impl Responder {
                     rec,
                 },
             },
-            ticker,
+            ticker: enabled.then(|| Self::ticker(interval)),
             real_head_allowed: !state.has_format(Stage::Response),
+        }
+    }
+
+    /// 从改变间隔的时刻重新计时，不把之前累积的心跳挤在一起。
+    fn ticker(interval: Duration) -> tokio::time::Interval {
+        let mut t = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        t
+    }
+
+    /// 每层回信到达后、处理下一层之前更新未提交的出口；已提交的流不能再换帧格式。
+    pub(super) fn configure_beats(&mut self, cfg: &Config, accept: bool, body_stream: bool) {
+        let Self::Keepalive {
+            sink: KeepaliveSink::Pending {
+                beat, skeleton_due, ..
+            },
+            ticker,
+            ..
+        } = self
+        else {
+            return;
+        };
+        let triggered = match cfg.keepalive_trigger.as_deref() {
+            Some("always") => true,
+            Some("accept") => accept,
+            Some("body_stream") => body_stream,
+            _ => accept || body_stream,
+        };
+        let interval = cfg.keepalive_interval();
+        let enabled = triggered && !interval.is_zero();
+        if ticker.as_ref().map(|t| t.period()) != enabled.then_some(interval) {
+            *ticker = enabled.then(|| Self::ticker(interval));
+            *skeleton_due = false;
+            beat.rec.set_keepalive(enabled);
+        }
+        beat.fixed = Bytes::copy_from_slice(cfg.keepalive_heartbeat());
+        if let Some(dynamic) = &mut beat.dynamic {
+            Arc::get_mut(dynamic)
+                .expect("no heartbeat runs before commit")
+                .interval = interval;
         }
     }
 
     /// 已经向客户端提交了响应头（只有保活出口会提交）：此后 status 与响应头不能再改，
     /// 只能往 SSE 体里写
-    fn is_committed(&self) -> bool {
+    pub(super) fn is_committed(&self) -> bool {
         match self {
             Self::Buffered { .. } => false,
             Self::Keepalive { sink, .. } => sink.is_committed(),
@@ -169,7 +212,7 @@ impl Responder {
     /// 等 `fut` 完成。None = 客户端已断开（只有保活出口会感知到；`fut` 随之被 drop，在途的
     /// 上游连接关闭）。保活出口在等待期间照常心跳或提交骨架头；`head_rx` 是本次尝试的响应头
     /// 通知，见 [`Responder::head_channel`]。
-    async fn wait<F: std::future::Future>(
+    pub(super) async fn wait<F: std::future::Future>(
         &mut self,
         fut: F,
         head_rx: Option<HeadRx>,
@@ -181,7 +224,10 @@ impl Responder {
                 sink,
                 ticker,
                 real_head_allowed,
-            } => drive(sink, ticker, fut, head_rx, *real_head_allowed, during).await,
+            } => match ticker {
+                Some(ticker) => drive(sink, ticker, fut, head_rx, *real_head_allowed, during).await,
+                None => tokio::select! {result=fut => Some(result), _=sink.client_gone() => None},
+            },
         }
     }
 
@@ -189,7 +235,11 @@ impl Responder {
     /// 「2xx 非 SSE」暂停骨架提交，见 drive），其余情况不要
     fn head_channel(&self) -> (Option<HeadTx>, Option<HeadRx>) {
         match self {
-            Self::Keepalive { sink, .. } if !sink.is_committed() => {
+            Self::Keepalive {
+                sink,
+                ticker: Some(_),
+                ..
+            } if !sink.is_committed() => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 (Some(tx), Some(rx))
             }
@@ -203,7 +253,10 @@ impl Responder {
     /// 放在请求转换之后，覆盖 format 可能写入的同名头（override_headers 里配的同名头也被覆盖，
     /// 启动时 server.rs 会 warn 一次）。
     fn prepare_upstream_headers(&self, headers: &mut HeaderMap) {
-        if let Self::Keepalive { .. } = self {
+        if let Self::Keepalive {
+            ticker: Some(_), ..
+        } = self
+        {
             headers.insert(
                 http::header::ACCEPT_ENCODING,
                 HeaderValue::from_static("identity"),
@@ -355,6 +408,7 @@ pub(super) async fn run_attempts(
     let rec = trace.rec.clone();
     let mut req = req;
     let needs_chain = state.has_format(Stage::Request) || state.has_format(Stage::Retry);
+    let mut local = needs_chain.then(|| state.clone());
     let mut chain = if needs_chain {
         match RequestChain::new(&req).await {
             Ok(c) => Some(c),
@@ -389,7 +443,14 @@ pub(super) async fn run_attempts(
             if retrying.is_none() {
                 retrying = Some(state.stats.begin_retrying());
             }
-            let delay = retry::delay_for_attempt(attempt - 1, state.config.max_retry_backoff_secs);
+            let delay = retry::delay_for_attempt(
+                attempt - 1,
+                local
+                    .as_ref()
+                    .unwrap_or(state)
+                    .config
+                    .max_retry_backoff_secs,
+            );
             rec.backoff(delay);
             if delay.is_zero() {
                 tracing::warn!(attempt, "立即重试");
@@ -404,28 +465,60 @@ pub(super) async fn run_attempts(
             }
         }
 
-        if let Some(c) = chain.as_mut() {
+        let mut failed = None;
+        if let (Some(c), Some(local)) = (chain.as_mut(), local.as_mut()) {
             rec.phase(Phase::Transforming);
-            match r
-                .wait(c.run(state, &mut req, attempt), None, "request format")
-                .await
-            {
-                None => return,
-                Some(Ok(changed)) => {
+            match c.run(local, &mut req, attempt, r).await {
+                Err(ChainError::Disconnected) => return,
+                Ok(changed) => {
                     r.prepare_upstream_headers(&mut req.headers);
                     sent = sent_head(&rec, &req);
                     same_body = !changed;
                 }
-                Some(Err(t)) => {
+                Err(ChainError::Retry(f)) => failed = Some(f),
+                Err(ChainError::Stop(t, custom)) => {
                     t.record_in(&state.stats);
-                    r.finish(t, &trace).await;
+                    record_try(&rec, attempt, None, true, &req);
+                    rec.try_ended(attempt, 0, None);
+                    if let Some(response) = custom
+                        && !r.is_committed()
+                    {
+                        let mut headers = crate::transform::headers_from_btreemap(
+                            &response.headers.unwrap_or_default(),
+                        );
+                        mark_given_up(&mut headers, t.code(), &trace);
+                        trace
+                            .rec
+                            .settle(crate::history::Outcome::FormatResponse, Some(t.code()));
+                        r.respond(build_response(
+                            StatusCode::from_u16(response.status)
+                                .expect("validated response status"),
+                            headers,
+                            Bytes::copy_from_slice(response.body.as_bytes().unwrap_or_default()),
+                        ));
+                    } else {
+                        r.finish(t, &trace).await;
+                    }
                     return;
                 }
             }
         }
-        record_try(&rec, attempt, sent.as_ref(), same_body, &req);
+        let state = local.as_ref().unwrap_or(state);
+        record_try(
+            &rec,
+            attempt,
+            if failed.is_none() {
+                sent.as_ref()
+            } else {
+                None
+            },
+            same_body,
+            &req,
+        );
         same_body = true;
-        let result = {
+        let result = if let Some(f) = failed {
+            ForwardResult::NetworkError(f)
+        } else {
             trace.attempts += 1;
             let (head_tx, head_rx) = r.head_channel();
             let attempt_fut = forward_once(
@@ -444,7 +537,8 @@ pub(super) async fn run_attempts(
             };
             result
         };
-        match classify(attempt, result, &rules) {
+        let override_max = chain.as_ref().and_then(|c| c.max_attempts);
+        match classify(attempt, result, &rules, override_max) {
             Outcome::Retry {
                 failure,
                 rule,
@@ -463,11 +557,30 @@ pub(super) async fn run_attempts(
                             *d.last.lock().unwrap() = Some(f);
                         }
                     }
+                    if c.max_attempts.is_some_and(|n| n != 0 && attempt >= n) {
+                        let t = Terminal::retry_exhausted("override", attempt, &failure);
+                        failure.record_in(&state.stats);
+                        t.record_in(&state.stats);
+                        rec.try_ended(attempt, response_bytes, Some(failure.for_history()));
+                        rec.decided(attempt, "override".into(), false);
+                        r.finish(t, &trace).await;
+                        return;
+                    }
                 }
                 failure.record_in(&state.stats);
                 rec.try_ended(attempt, response_bytes, Some(failure.for_history()));
                 // 谁让它接着重试的：命中的重试规则，或者默认的无限重试
-                let by = rule.map_or_else(|| "default".to_string(), |rule| format!("rule:{rule}"));
+                let by = rule.map_or_else(
+                    || {
+                        if override_max.is_some() {
+                            "override"
+                        } else {
+                            "default"
+                        }
+                        .into()
+                    },
+                    |rule| format!("rule:{rule}"),
+                );
                 rec.decided(attempt, by, true);
                 tracing::warn!(
                     attempt,
@@ -495,14 +608,14 @@ pub(super) async fn run_attempts(
             } => {
                 let status = response.status;
                 // `details.by` 说明是谁给的次数：第几条重试规则
-                let by = format!("rule:{rule}");
+                let by = rule.map_or_else(|| "override".into(), |i| format!("rule:{i}"));
                 let terminal = Terminal::retry_exhausted(&by, attempt, &failure);
                 rec.try_ended(attempt, response.body.len(), Some(failure.for_history()));
                 rec.decided(attempt, by, false);
                 // 这次尝试也是一次失败的尝试；随后的终态成为「最近一次失败」
                 failure.record_in(&state.stats);
                 terminal.record_in(&state.stats);
-                tracing::warn!(attempt, code = %terminal.code(), last_code = failure.code, status = %status, rule, "重试规则给的尝试次数用完，不再重试");
+                tracing::warn!(attempt, code = %terminal.code(), last_code = failure.code, status = %status, ?rule, "retry attempt limit reached");
                 if !r.is_committed() {
                     // 尚未向客户端写出任何字节：原样交付最后一次失败响应（状态码与体保真），
                     // 只加两个头，让调用方分得清「aproxy 已经放弃」与上游的普通回应
@@ -695,13 +808,13 @@ mod tests {
 
     #[test]
     fn success_is_delivered() {
-        let out = classify(1, response(200, r#"{"id":"msg_1"}"#), &[]);
+        let out = classify(1, response(200, r#"{"id":"msg_1"}"#), &[], None);
         assert!(matches!(out, Outcome::Deliver(r) if r.status == 200));
     }
 
     #[test]
     fn error_status_and_error_content_are_retried() {
-        let out = classify(1, response(503, "overloaded"), &[]);
+        let out = classify(1, response(503, "overloaded"), &[], None);
         assert!(matches!(
             out,
             Outcome::Retry { ref failure, .. }
@@ -715,6 +828,7 @@ mod tests {
                 r#"{"type":"error","error":{"type":"overloaded_error"}}"#,
             ),
             &[],
+            None,
         );
         // 状态码是成功的，失败在体里：记的是另一个码
         assert!(matches!(
@@ -742,6 +856,7 @@ mod tests {
                     "connection refused".into(),
                 )),
                 &[(1, &limit)],
+                None,
             );
             assert!(
                 matches!(
@@ -760,23 +875,23 @@ mod tests {
         let limit = rule(None, 3);
         let rules = [(1, &limit)];
         for attempt in 1..3 {
-            let out = classify(attempt, response(404, "not found"), &rules);
+            let out = classify(attempt, response(404, "not found"), &rules, None);
             assert!(matches!(out, Outcome::Retry { .. }), "第 {attempt} 次");
         }
-        let out = classify(3, response(404, "not found"), &rules);
+        let out = classify(3, response(404, "not found"), &rules, None);
         assert!(matches!(
             out,
-            Outcome::Exhausted { response, failure, rule: 1 }
+            Outcome::Exhausted { response, failure, rule: Some(1) }
                 if response.status == 404 && failure.status == Some(404)
         ));
         // 计数口径是尝试序号：已经超过上限的尝试同样停
-        let out = classify(7, response(404, "not found"), &rules);
+        let out = classify(7, response(404, "not found"), &rules, None);
         assert!(matches!(out, Outcome::Exhausted { .. }));
         // 没有规则时不封顶
-        let out = classify(13, response(404, "not found"), &[]);
+        let out = classify(13, response(404, "not found"), &[], None);
         assert!(matches!(out, Outcome::Retry { .. }));
         // 规则不改变成功的响应
-        let out = classify(9, response(200, "{}"), &rules);
+        let out = classify(9, response(200, "{}"), &rules, None);
         assert!(matches!(out, Outcome::Deliver(_)));
     }
 
@@ -790,36 +905,36 @@ mod tests {
         let rules = [(2, &exempt_429), (3, &only_404), (5, &wide)];
 
         // 429 命中豁免：永远重试，不落到宽规则上
-        let out = classify(50, response(429, "slow down"), &rules);
+        let out = classify(50, response(429, "slow down"), &rules, None);
         assert!(matches!(out, Outcome::Retry { .. }));
         // 404 命中第二条：第 1 次就停
-        let out = classify(1, response(404, "nope"), &rules);
-        assert!(matches!(out, Outcome::Exhausted { rule: 3, .. }));
+        let out = classify(1, response(404, "nope"), &rules, None);
+        assert!(matches!(out, Outcome::Exhausted { rule: Some(3), .. }));
         // 其余状态码落到宽规则：第 2 次停
-        let out = classify(1, response(500, "boom"), &rules);
+        let out = classify(1, response(500, "boom"), &rules, None);
         assert!(matches!(out, Outcome::Retry { .. }));
-        let out = classify(2, response(500, "boom"), &rules);
-        assert!(matches!(out, Outcome::Exhausted { rule: 5, .. }));
+        let out = classify(2, response(500, "boom"), &rules, None);
+        assert!(matches!(out, Outcome::Exhausted { rule: Some(5), .. }));
         // 200 但内容是错误：状态码是 200，同样按规则匹配
         let body = r#"{"type":"error","error":{"type":"overloaded_error"}}"#;
-        let out = classify(2, response(200, body), &rules);
+        let out = classify(2, response(200, body), &rules, None);
         assert!(matches!(
             out,
-            Outcome::Exhausted { rule: 5, ref failure, .. } if failure.code == "upstream_error_body"
+            Outcome::Exhausted { rule: Some(5), ref failure, .. } if failure.code == "upstream_error_body"
         ));
     }
 
     #[test]
     fn local_spool_failures_end_the_request() {
         assert!(matches!(
-            classify(1, ForwardResult::TooLarge, &[]),
+            classify(1, ForwardResult::TooLarge, &[], None),
             Outcome::TooLarge
         ));
         assert!(matches!(
             classify(
                 1,
                 ForwardResult::SpoolFailed(StorageOp::WriteResponse, "disk full".into()),
-                &[]
+                &[], None
             ),
             Outcome::SpoolFailed(StorageOp::WriteResponse, e) if e == "disk full"
         ));

@@ -62,7 +62,7 @@ pub(super) struct AttemptFailure {
 }
 
 impl AttemptFailure {
-    fn new(code: &'static str, message: String, details: Value) -> Self {
+    pub(super) fn new(code: &'static str, message: String, details: Value) -> Self {
         debug_assert!(
             aproxy_ipc::code::lookup(code).is_some(),
             "未登记的码: {code}"
@@ -188,7 +188,7 @@ pub(super) struct Terminal {
 }
 
 impl Terminal {
-    fn new(code: &'static str, message: String, details: Value) -> Self {
+    pub(super) fn new(code: &'static str, message: String, details: Value) -> Self {
         debug_assert!(
             aproxy_ipc::code::lookup(code).is_some_and(|c| c.http.is_some()),
             "不是数据面终态码: {code}"
@@ -297,20 +297,11 @@ impl Terminal {
     }
 
     /// 请求侧 format 明确拒绝了这个请求
-    pub(super) fn format_rejected(format: &str, stage: &str, reason: &str) -> Self {
+    pub(super) fn format_rejected(format: &str, reason: &str, details: Value) -> Self {
         Self::new(
             "format_rejected",
             format!("format '{format}' rejected the request: {reason}"),
-            json!({ "format": format, "stage": stage }),
-        )
-    }
-
-    /// 请求侧 format 失败，请求没有重试。`kind` 是失败的种类
-    pub(super) fn format_failed(format: &str, stage: &str, kind: &str, error: &str) -> Self {
-        Self::new(
-            "format_failed",
-            format!("format '{format}' failed ({kind}): {error}"),
-            json!({ "format": format, "stage": stage, "kind": kind }),
+            details,
         )
     }
 
@@ -466,8 +457,7 @@ mod tests {
             Terminal::local_storage_failed(StorageOp::WriteResponse, "disk full"),
             Terminal::response_too_large(1024),
             Terminal::retry_exhausted("rule:1", 3, &failure),
-            Terminal::format_rejected("keys", "request", "no"),
-            Terminal::format_failed("keys", "request", "timeout", "timed out"),
+            Terminal::format_rejected("keys", "no", json!({"format":"keys", "stage":"request"})),
             Terminal::upstream_failed(&failure),
             Terminal::decode_failed("br"),
             Terminal::internal("x"),
@@ -554,8 +544,11 @@ mod tests {
     /// 说明文字里的引号、换行、非 ASCII 字符都不会破坏这一帧。
     #[test]
     fn sse_event_is_one_frame_with_the_same_json() {
-        let terminal =
-            Terminal::format_rejected("keys", "request", "line one\nline \"two\"\r\n中文");
+        let terminal = Terminal::format_rejected(
+            "keys",
+            "line one\nline \"two\"\r\n中文",
+            json!({"format":"keys", "stage":"request"}),
+        );
         let event = terminal.sse_event(&trace(2));
         let text = std::str::from_utf8(&event).unwrap();
         let data = text

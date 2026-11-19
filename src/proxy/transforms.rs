@@ -1,7 +1,11 @@
 //! format 请求方向的重试游标、结果与响应方向的逐层补丁。
 use super::*;
-use crate::{config::file::Stage, transform};
+use crate::{
+    config::file::Stage,
+    transform::{self, Fault},
+};
 use aproxy_envelope as wire;
+use serde_json::json;
 
 /// 发往上游的最终请求。无格式程序时不创建会话状态，也不为重试复制请求体。
 pub(super) struct OutboundRequest {
@@ -21,7 +25,16 @@ pub(super) struct RequestChain {
     /// 上次已成功的各层留下的当前输入。
     input: wire::Request,
     /// 首个 retry 程序之前的缓存，与该层后续改写互不影响。
-    prefix: Option<(usize, wire::Request)>,
+    prefix: Option<(usize, wire::Request, HeaderMap, u64)>,
+    /// 未被补丁整表替换的头保留原来的多值和非 ASCII 字节。
+    headers: HeaderMap,
+    /// 正文补丁的版本、下一次可分配的版本和上次交给上游的版本。
+    body_version: u64,
+    next_body_version: u64,
+    sent_body_version: u64,
+    /// 保活触发条件只用客户端原样的 Accept 和请求体，不受上游改写影响。
+    accept: bool,
+    body_stream: bool,
     /// 尚未成功的程序在配置里的位置。
     cursor: usize,
     /// 当前跑首轮 request 方向还是重跑 retry 方向，层失败时不变。
@@ -30,6 +43,17 @@ pub(super) struct RequestChain {
     pub(super) last: Option<wire::Failure>,
     /// retry.elapsed_ms 使用单调时钟，系统对时不会让它倒退。
     started: tokio::time::Instant,
+    /// 程序对此请求给出的重试上限，0 是显式无限制。
+    pub(super) max_attempts: Option<u32>,
+}
+/// 程序可以否决请求、使本次尝试失败，或无法读取本地 spool；上游尚未收到请求。
+pub(super) enum ChainError {
+    /// 进入普通重试循环，保持失败层与它的输入。
+    Retry(AttemptFailure),
+    /// 等子进程期间客户端断开，不计失败也不再访问上游。
+    Disconnected,
+    /// 请求立即结束，未提交时可用 format 给出的客户端响应。
+    Stop(Terminal, Option<wire::Response>),
 }
 impl RequestChain {
     /// 只有请求方向有程序时才读整份请求体。失败属于存储，不计程序的熔断。
@@ -46,33 +70,47 @@ impl RequestChain {
         Ok(Self {
             input,
             prefix: None,
+            headers: req.headers.clone(),
+            body_version: 0,
+            next_body_version: 1,
+            sent_body_version: 0,
+            accept: accepts_event_stream(&req.headers),
+            body_stream: request_body_wants_stream(&req.body).await,
             cursor: 0,
             stage: Stage::Request,
             last: None,
             started: tokio::time::Instant::now(),
+            max_attempts: None,
         })
     }
     /// 依次派发；在完成一层之后才移动游标。一个请求的局部配置不能通过共享的实例泄漏。
     pub(super) async fn run(
         &mut self,
-        state: &AppState,
+        state: &mut AppState,
         req: &mut OutboundRequest,
         attempt: u32,
-    ) -> Result<bool, Terminal> {
+        responder: &mut Responder,
+    ) -> Result<bool, ChainError> {
         let ctx = req.ctx.as_ref().expect("format context");
         if self.cursor == state.formats.len() {
-            let Some((i, p)) = &self.prefix else {
+            let Some((i, p, h, v)) = &self.prefix else {
                 return Ok(false);
             };
             self.cursor = *i;
             self.input = p.clone();
+            self.headers = h.clone();
+            self.body_version = *v;
             self.stage = Stage::Retry;
         }
-        let mut changed = false;
         while self.cursor < state.formats.len() {
             let pool = state.formats[self.cursor].clone();
             if self.prefix.is_none() && pool.entry.has_stage(Stage::Retry) {
-                self.prefix = Some((self.cursor, self.input.clone()));
+                self.prefix = Some((
+                    self.cursor,
+                    self.input.clone(),
+                    self.headers.clone(),
+                    self.body_version,
+                ));
             }
             if pool.entry.has_stage(self.stage) {
                 let name = &pool.entry.name;
@@ -96,25 +134,73 @@ impl RequestChain {
                 } else {
                     wire::Stage::Request(m)
                 };
-                match pool.call(frame, pool.entry.timeout_secs, false).await {
+                match responder
+                    .wait(
+                        pool.call(frame, pool.entry.timeout_secs, false),
+                        None,
+                        "request format",
+                    )
+                    .await
+                    .ok_or(ChainError::Disconnected)?
+                {
                     Ok(reply) => {
                         ctx.absorb(name, reply.state);
                         if let Some(f) = reply.fail {
-                            let reason = state.history.secrets().replace(&f.reason);
-                            return Err(Terminal::format_rejected(&safe, stage, &reason));
+                            let reason: String = state
+                                .history
+                                .secrets()
+                                .replace(&f.reason)
+                                .chars()
+                                .take(512)
+                                .collect();
+                            let mut details = json!({"format":safe,"stage":stage});
+                            if let Some(code) = f.code {
+                                details["fail_code"] =
+                                    json!(state.history.secrets().replace(&code));
+                            }
+                            return if f.retry {
+                                Err(ChainError::Retry(AttemptFailure::new(
+                                    "format_fail",
+                                    reason,
+                                    details,
+                                )))
+                            } else {
+                                Err(ChainError::Stop(
+                                    Terminal::format_rejected(&safe, &reason, details),
+                                    f.response,
+                                ))
+                            };
                         }
                         if let Some(patch) = reply.request {
+                            if let Some(h) = &patch.headers {
+                                self.headers = transform::headers_from_btreemap(h);
+                            }
+                            if patch.body.as_bytes().is_some() {
+                                self.body_version = self.next_body_version;
+                                self.next_body_version += 1;
+                            }
                             self.input.apply(patch);
-                            changed = true;
+                        }
+                        if let Some(overrides) = reply.overrides {
+                            self.apply_overrides(state, overrides, responder);
                         }
                     }
-                    Err(e) if pool.entry.required => {
-                        return Err(Terminal::format_failed(
-                            &safe,
-                            stage,
-                            e.kind(),
-                            &e.to_string(),
+                    Err(Fault::Open { kind, probe_at }) if pool.entry.required => {
+                        return Err(ChainError::Stop(
+                            Terminal::new(
+                                "format_unavailable",
+                                format!("format '{safe}' is unavailable (circuit open)"),
+                                json!({"format":safe,"stage":stage,"kind":kind,"probe_at":probe_at}),
+                            ),
+                            None,
                         ));
+                    }
+                    Err(e) if pool.entry.required => {
+                        return Err(ChainError::Retry(AttemptFailure::new(
+                            "format_error",
+                            format!("format '{safe}': {e}"),
+                            json!({"format":safe,"stage":stage,"kind":e.kind()}),
+                        )));
                     }
                     Err(e) => {
                         tracing::warn!(format=%safe,stage,error=%e,"optional format layer skipped")
@@ -126,13 +212,81 @@ impl RequestChain {
         // 游标也可能是从失败层恢复；此前各层留下的 input 必须交付，不能只看本轮是否有补丁。
         req.method = self.input.method.parse().expect("validated method");
         req.target_url = self.input.url.clone();
-        req.headers = transform::headers_from_btreemap(self.input.headers.as_ref().unwrap());
-        req.body = transform::spool_request_body(
-            self.input.body.as_bytes().unwrap(),
-            state.spool_dir.as_deref(),
-        )
-        .await;
-        Ok(changed || self.stage == Stage::Retry)
+        req.headers = self.headers.clone();
+        let changed = self.body_version != self.sent_body_version;
+        if changed {
+            self.sent_body_version = self.body_version;
+            req.body = transform::spool_request_body(
+                self.input.body.as_bytes().unwrap(),
+                state.spool_dir.as_deref(),
+            )
+            .await;
+        }
+        Ok(changed)
+    }
+    /// 只允许 hello 列明的叶键；单个非法键不作废同一回信里的其他键，也不记录它的值。
+    fn apply_overrides(
+        &mut self,
+        state: &mut AppState,
+        overrides: wire::Overrides,
+        responder: &mut Responder,
+    ) {
+        for (group, value) in overrides {
+            let Some(map) = value.as_object() else {
+                tracing::warn!("invalid format override ignored");
+                continue;
+            };
+            for (k, v) in map {
+                let n = v.as_u64();
+                let cfg = Arc::make_mut(&mut state.config);
+                match (group.as_str(), k.as_str()) {
+                    ("timeouts", "connect_secs") if n.is_some() => {
+                        cfg.connect_timeout_secs = n.unwrap();
+                        state.client = AppState::upstream_client(cfg);
+                    }
+                    ("timeouts", "first_byte_secs") if n.is_some() => {
+                        cfg.first_byte_timeout_secs = n.unwrap()
+                    }
+                    ("timeouts", "read_idle_secs") if n.is_some() => {
+                        cfg.read_timeout_secs = n.unwrap()
+                    }
+                    ("retry", "max_backoff_secs") if n.is_some() => {
+                        cfg.max_retry_backoff_secs = n.unwrap()
+                    }
+                    ("retry", "max_attempts") if n.is_some_and(|n| u32::try_from(n).is_ok()) => {
+                        self.max_attempts = Some(n.unwrap() as u32)
+                    }
+                    ("keepalive", _) if responder.is_committed() => {}
+                    ("keepalive", "interval_secs")
+                        if n.is_some_and(|n| {
+                            tokio::time::Instant::now()
+                                .checked_add(Duration::from_secs(n))
+                                .is_some()
+                        }) =>
+                    {
+                        cfg.keepalive_interval_secs = n.unwrap()
+                    }
+                    ("keepalive", "trigger")
+                        if v.as_str() == Some("always")
+                            || v.as_str()
+                                .and_then(crate::config::KeepaliveTrigger::parse)
+                                .is_some() =>
+                    {
+                        cfg.keepalive_trigger = v.as_str().map(String::from)
+                    }
+                    ("keepalive", "heartbeat")
+                        if v.as_str()
+                            .is_some_and(|s| crate::config::heartbeat_problem(s).is_none()) =>
+                    {
+                        cfg.keepalive_heartbeat = v.as_str().map(String::from)
+                    }
+                    _ => tracing::warn!("invalid or unknown format override ignored"),
+                }
+            }
+            if group == "keepalive" {
+                responder.configure_beats(&state.config, self.accept, self.body_stream);
+            }
+        }
     }
 }
 /// 只对最终交付的成功响应逆序派发。整条链都跳过或不改内容时原样交付原始字节（包括压缩）。

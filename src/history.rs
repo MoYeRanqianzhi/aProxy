@@ -102,6 +102,8 @@ pub enum Outcome {
     UpstreamError,
     /// aproxy 自己结束了这个请求（错误响应或终态事件）
     AproxyError,
+    /// 主动返回 format 选择的客户端协议响应。
+    FormatResponse,
     /// 客户端在拿到完整响应之前断开了
     ClientGone,
 }
@@ -112,6 +114,7 @@ impl Outcome {
             Outcome::InFlight => "in_flight",
             Outcome::Ok => "ok",
             Outcome::UpstreamError => "upstream_error",
+            Outcome::FormatResponse => "format_response",
             Outcome::AproxyError => "aproxy_error",
             Outcome::ClientGone => "client_gone",
         }
@@ -1643,7 +1646,12 @@ impl Recorder {
 
     /// 这个请求走保活通道。
     pub fn keepalive(&self) {
-        self.update(|inner, _| inner.keepalive = true);
+        self.set_keepalive(true);
+    }
+
+    /// 只有响应尚未提交时才能重新选择保活；历史反映这次请求实际选用的出口。
+    pub(crate) fn set_keepalive(&self, enabled: bool) {
+        self.update(|inner, _| inner.keepalive = enabled);
     }
 
     /// 把要发往上游的请求行与头变成入库的形状。发出的请求不变时，各次尝试共用返回的这

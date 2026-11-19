@@ -101,3 +101,262 @@ fn stderr_lines_reach_the_instance_log_with_secrets_replaced() {
     }
     assert!(!log.contains("fixture-credential"));
 }
+
+/// 配置一个本地持久进程并记录每帧；不同程序用不同的记录文件，测试不依赖日志调度。
+fn layer(home: &TestHome, name: &str, stages: &str, args: &[&str]) -> String {
+    let quoted = |p: std::path::PathBuf| serde_json::to_string(p.to_str().unwrap()).unwrap();
+    format!(
+        "\n[[format]]\nname='{name}'\ncommand={}\nprocess='persistent'\nworker_idle_secs=0\nstages=[{stages}]\nargs={}\nenv={{ ECHO_RECORD={} }}\n",
+        quoted(format_echo_path()),
+        serde_json::to_string(args).unwrap(),
+        quoted(home.path().join(name))
+    )
+}
+
+/// 实例仅在临时 home 内注册，裸 HTTP 请求走环回地址，不使用环境代理。
+fn launch(home: &TestHome, upstream: u16, config: &str) -> (u16, std::process::Output) {
+    let port = free_port();
+    home.stop_on_drop(port);
+    let cfg = home.path().join("chain.toml");
+    std::fs::write(&cfg,format!("base_url='http://127.0.0.1:{upstream}'\nlisten_addr='127.0.0.1:{port}'\n[retry]\nmax_backoff_secs=0\n{config}")).unwrap();
+    let out = home
+        .cmd()
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .args(["start", "--json", "--config"])
+        .arg(cfg)
+        .output()
+        .unwrap();
+    (port, out)
+}
+
+/// 断言启动成功，返回带客户端超时的本地请求入口，不让无限重试拖住整个测试。
+fn running(home: &TestHome, upstream: u16, config: &str) -> (reqwest::Client, String) {
+    let (port, out) = launch(home, upstream, config);
+    assert!(out.status.success(), "{out:?}");
+    (
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(12))
+            .build()
+            .unwrap(),
+        format!("http://127.0.0.1:{port}"),
+    )
+}
+
+/// 测试上游按调用次数依次给出状态码，最后一个状态码持续生效。
+async fn upstream(
+    statuses: &'static [u16],
+) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let app = axum::Router::new().fallback(move || {
+        let i = count
+            .fetch_add(1, Ordering::Relaxed)
+            .min(statuses.len() - 1);
+        async move {
+            (
+                axum::http::StatusCode::from_u16(statuses[i]).unwrap(),
+                "upstream bytes",
+            )
+        }
+    });
+    let port = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (port, calls)
+}
+
+/// 逐帧重读测试程序落下的事实，不用推算调用顺序或进程数。
+fn frames(home: &TestHome, name: &str) -> Vec<Value> {
+    std::fs::read_to_string(home.path().join(name))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// 不合法的重试段应在任何一个子进程被拉起前就返回配置诊断。
+#[test]
+fn retry_segment_violation_fails_start() {
+    let home = TestHome::new();
+    let cfg = layer(&home, "early", "'request','retry'", &["echo"])
+        + &layer(&home, "late", "'request'", &["echo"]);
+    let (_, out) = launch(&home, free_port(), &cfg);
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        doc["error"]["details"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "config_conflict")
+    );
+    assert!(!home.path().join("early").exists());
+}
+
+/// 进程级失败恢复时重跑同一层、同一 stage，且只有成功的那次到达上游。
+async fn recover_once(mode: &str) {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[200]).await;
+    let stamp = home.path().join("once");
+    let cfg = layer(&home, "work", "'request'", &[mode, stamp.to_str().unwrap()]);
+    let (client, url) = running(&home, up, &cfg);
+    assert_eq!(
+        client.post(url).send().await.unwrap().text().await.unwrap(),
+        "upstream bytes"
+    );
+    let f = frames(&home, "work");
+    assert_eq!(
+        f.iter()
+            .map(|m| m["stage"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["hello", "request", "hello", "request"]
+    );
+    assert_eq!(f[1]["request_id"], f[3]["request_id"]);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+/// 错序的旧回信不能交给下一个请求，重新握手后才重新发送。
+#[tokio::test]
+async fn bad_seq_drops_the_worker_and_the_request_is_retried() {
+    recover_once("bad-seq-once").await;
+}
+
+/// 进程崩溃不是业务拒绝；它恢复后客户端得到上游响应。
+#[tokio::test]
+async fn crash_mid_request_is_retried_and_succeeds() {
+    recover_once("crash-once").await;
+}
+
+/// 上游失败只重跑配置的后段，后段的输入仍是前段的补丁结果。
+#[tokio::test]
+async fn program_before_the_retry_segment_is_not_called_again_on_retries() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[503, 200]).await;
+    let cfg = layer(
+        &home,
+        "prefix",
+        "'request'",
+        &["reply", r#"{"request":{"body":"prefix"}}"#],
+    ) + &layer(
+        &home,
+        "suffix",
+        "'request','retry'",
+        &["reply", r#"{"request":{"body":"suffix"}}"#],
+    );
+    let (client, url) = running(&home, up, &cfg);
+    assert_eq!(client.post(url).send().await.unwrap().status(), 200);
+    assert_eq!(frames(&home, "prefix").len(), 2);
+    let f = frames(&home, "suffix");
+    assert_eq!(f.len(), 3);
+    assert_eq!(f[2]["stage"], "retry");
+    assert_eq!(f[2]["retry"]["last_failure"]["details"]["status"], 503);
+    assert_eq!(f[2]["request"]["body"], "prefix");
+}
+
+/// 两种主动拒绝都没有上游尝试；程序给的状态、头和体保持原样。
+#[tokio::test]
+async fn fail_without_retry_returns_the_given_response_or_422() {
+    let (up, calls) = upstream(&[200]).await;
+    for custom in [false, true] {
+        let home = TestHome::new();
+        let mut f = serde_json::json!({"retry":false,"reason":"fixture","code":"ruleset"});
+        if custom {
+            f["response"] =
+                serde_json::json!({"status":409,"headers":{"x-fixture":"present"},"body":"no"});
+        }
+        let cfg = layer(
+            &home,
+            "gate",
+            "'request'",
+            &["reply", &serde_json::json!({"fail":f}).to_string()],
+        );
+        let (client, url) = running(&home, up, &cfg);
+        let res = client.post(url).send().await.unwrap();
+        assert_eq!(res.headers()["x-aproxy-error"], "format_rejected");
+        assert!(res.headers().contains_key("x-aproxy-request-id"));
+        if custom {
+            assert_eq!(res.status(), 409);
+            assert_eq!(res.headers()["x-fixture"], "present");
+            assert_eq!(res.text().await.unwrap(), "no");
+        } else {
+            assert_eq!(res.status(), 422);
+            assert_eq!(
+                res.json::<Value>().await.unwrap()["error"]["aproxy"]["details"]["fail_code"],
+                "ruleset"
+            );
+        }
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+/// 并列一个无效键不影响合法覆盖；下一个请求仍然遵守实例规则。
+#[tokio::test]
+async fn overrides_apply_to_one_request_and_unknown_keys_are_ignored() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[503, 503, 200]).await;
+    let cfg = layer(
+        &home,
+        "limit",
+        "'request'",
+        &[
+            "reply-on-path",
+            r#"{"overrides":{"retry":{"max_attempts":1,"unknown":3}}}"#,
+        ],
+    );
+    let (client, url) = running(&home, up, &cfg);
+    let first = client.post(format!("{url}/limited")).send().await.unwrap();
+    assert_eq!(first.status(), 503);
+    assert_eq!(first.headers()["x-aproxy-error"], "retry_exhausted");
+    assert_eq!(first.text().await.unwrap(), "upstream bytes");
+    assert_eq!(
+        client
+            .post(format!("{url}/other"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 3);
+}
+
+/// 第一层能在静默请求上开启保活；另一层慢到已提交后才返回，不能把流改用另一种心跳。
+#[tokio::test]
+async fn keepalive_overrides_observe_the_commit_between_layers() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[200]).await;
+    let cfg = String::from("[keepalive]\ninterval_secs=0\n")
+        + &layer(
+            &home,
+            "arm",
+            "'request'",
+            &[
+                "reply",
+                r#"{"overrides":{"keepalive":{"trigger":"always","interval_secs":1,"heartbeat":": first\n\n"}}}"#,
+            ],
+        )
+        + &layer(&home, "slow", "'request'", &["sleep", "1400"])
+        + &layer(
+            &home,
+            "late",
+            "'request'",
+            &[
+                "reply",
+                r#"{"overrides":{"keepalive":{"heartbeat":": late\n\n"}}}"#,
+            ],
+        )
+        + &layer(&home, "wait", "'request'", &["sleep", "1200"]);
+    let (client, url) = running(&home, up, &cfg);
+    let res = client.post(url).send().await.unwrap();
+    assert_eq!(res.headers()["content-type"], "text/event-stream");
+    let body = res.text().await.unwrap();
+    assert!(body.matches(": first\n\n").count() >= 2, "{body}");
+    assert!(!body.contains(": late"));
+}

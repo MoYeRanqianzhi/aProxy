@@ -136,7 +136,8 @@ fn main() {
                     r["seq"] = json!(seq + 1);
                 }
                 "error" => r["fail"] = json!({"retry":false,"reason":reason}),
-                "reply" => {
+                "reply-on-path" if m["client"]["path"] != "/limited" => {}
+                "reply" | "reply-on-path" => {
                     let fields: serde_json::Map<String, Value> = serde_json::from_str(arg).unwrap();
                     r.as_object_mut().unwrap().extend(fields);
                 }

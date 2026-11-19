@@ -477,6 +477,8 @@ data: {"type":"error","error":{"type":"aproxy_format_unavailable","message":"for
   - 它的 `content-type` 是 `text/event-stream`：把体原样写进流，然后结束；
   - 它的体是 JSON：压成一行，作为 `event: error` 的 data 写出；
   - 都不是：写 aproxy 的标准终态事件。
+  - 要压成 `event: error` 的 JSON 体超过 1 MiB 时，也写标准终态事件：不为一条错误事件把整个大体读进内存（2026-11-20 补）。
+  - 体带着 `content-encoding` 时先解码再按上面三条判断；解不了就写标准终态事件（2026-11-20 补）。
 
 **为什么**：
 - 结构与英文化一次到位，skill 与 agent 的锚点只断这一次（DP-01）。
@@ -796,6 +798,7 @@ Windows 内核对象（A）：
    - 服务端至少每 15 秒发一行，客户端 45 秒收不到就判失联；
    - 实例退出前发 `closing`；
    - 事件的 `seq` 在每条连接上从 1 起递增；丢弃了事件就发 `lagged{dropped}`，客户端据此重取快照与记录。
+     `lagged` 之后跟一条当前的 `state`，缓冲里更早的事件不再补发；`dropped` 把没发出去的都算上（2026-11-20 补）。
 
 ### 6.3 op 一览
 
@@ -1433,6 +1436,9 @@ aproxy desktop                  W5
   - persistent 在握手之后处理消息，直到 stdin EOF；遇到 EOF 必须退出。
   - spawn 在握手之后收一条阶段消息、回一次，然后 aproxy 关闭 stdin。
   - 两种模式都是同一个「读一行、回一行、直到 EOF」的循环。
+  - 退役（2026-11-20 补）：空闲的 persistent worker 正常退役（闲置到期、实例停机）时，aproxy 关闭它的 stdin，最多等 2 秒让它退出，
+    然后才杀掉。实例停机时等在途请求的期限一到，还占着消息没回的 worker 立刻杀掉，不给宽限：它手里的消息已经没有人等了。
+    两者加上等操作系统回收的时间，都要落在 `stop` 的等待期限之内。
 - **公共字段**：
   - aproxy 发出：`v`（协议版本）、`seq`（每个会话从 0 起递增）、`stage`、`request_id`、`state`（这个程序在这个请求上存下的值，没有就省略）；
     在这个阶段要了摘要的程序另收 `digest`（§10.2）。
@@ -1445,7 +1451,8 @@ aproxy desktop                  W5
 - **HTTP 对象**：
   - 请求对象 `{"method","url","headers":{小写名: 值},"body"|"body_b64"}`；响应对象 `{"status","headers","body"|"body_b64"}`。
   - 回信里的同名对象是补丁：字段省略表示不变；给出 `headers` 就整表替换；`body` 与 `body_b64` 都省略表示不变，要清空就写 `"body":""`。
-  - 多值头只保留第一个值。
+  - 多值头只保留第一个值。例外是 `content-encoding`：它的各行按顺序用 `, ` 连成一个值，因为编码的层次由整张列表决定
+    （2026-11-20 补）。
   - aproxy 发出的完整对象总带 `headers`，一个头都没有就写 `{}`：request、retry 阶段的请求对象，以及各阶段的响应对象。
     decide、response、stream 阶段消息里的 `request` 只是方法与 url 的摘要，不带头与体（2026-11-20 补）。
     唯一的例外：在 decide 上要了 `full` 的程序（§10.2），它收到的 `request` 另带 `body` 或 `body_b64`，仍然不带头。
@@ -1593,6 +1600,10 @@ aproxy desktop                  W5
   回 `retry` 就是让它升级。forward 请求成功时不问。
 - **`response`**：有上游响应时给出，体是解码后的内容，上限 1 MiB；超出时保留开头 64 KiB 与结尾，`truncated` 标出省略了多少（S3-30）。
   没有上游响应就省略。
+  - 体解不了码（不认识的编码、数据坏了、层数超过上限）时，原样给出收到的字节（`body_b64`，同样的上限与头尾规则），
+    头表不动，程序从 `content-encoding` 看得出来；照常问，不因此跳过 decide（2026-11-20 补）。
+  - 响应头到了、体没收全就断了（`upstream_body_interrupted` 之类）时，`response` 只带 `status` 与 `headers`，不带体。
+    这种尝试在 stop 的处理里按没有上游响应算：不带 `response` 的 stop 回 502 `retry_stopped`，补丁的底是空的 502（2026-11-20 补）。
 - **`fallback`**：不问 format 时 aproxy 会怎么做，即覆盖、规则表与默认三者得出的结论。
 - **回信**（`decision` 与 `reroute` 各自取第一个表态的程序）：
   - `decision:"retry"`：重试。`delay_ms` 可选，取值 0–86 400 000；省略就用 `fallback.delay_ms`，fallback 是 stop 时按现行退避算。
@@ -1608,6 +1619,9 @@ aproxy desktop                  W5
     这就是用户原话里「是否换路由（every_attempt）」的落点。
     没有程序声明 retry 时，或上一次尝试在链里就失败了（没有发出请求）时，`reroute` 不起作用。
   - 省略 `decision`：表示不表态，交给下一个程序；都不表态，就用 `fallback`。
+  - 问到哪里为止（2026-11-20 补）：按顺序问，直到 `decision` 与 `reroute` 都有了着落（`decision` 是 stop 时 `reroute` 不再有意义）。
+    之后的程序不问：decide 是提问，不是通知，多问一个程序就多一段等待；只想旁观的程序用 notify（§10.11）。
+  - `elapsed_ms` 从 aproxy 收到这个请求算起，读请求体的时间也算在内（2026-11-20 补）。
 - **护栏**：
   - 超时（`decide_timeout_secs`）、崩溃、回信不合法，都视为不表态，并计入熔断；绝不因为 decide 出错而结束这个请求。
   - 每个决定连同理由，写进日志与请求记录的 `tries[].decision`。
@@ -1650,6 +1664,9 @@ aproxy desktop                  W5
   - data 的回信可以没有字节；
   - 上游正常结束时发 close；
   - 上游中断或客户端断开时发 abort。客户端已经断开时，回信会被丢弃。
+    `reason.code` 的取值（2026-11-20 补）：上游中断时是这次尝试的失败码（§2.2，例如 `upstream_body_interrupted`）；
+    内侧某一层失败时是那一层的失败码（`format_error`、`format_fail`）；客户端断开时是 `client_gone`，与请求记录的 `outcome`
+    同一个词，它不是错误码，不进错误码表。程序把不认识的取值当作一般的中止处理。
 - **`stream_id`** 等于 `<request_id>/<attempt>`。
 - **worker**（S3-31）：
   - 一条流固定由一个 worker 处理，独占它直到 close 或 abort；

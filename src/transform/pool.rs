@@ -161,15 +161,38 @@ impl Worker {
         }
     }
     /// 排队与序列化不算在时限内，堵在写管道则算；调用被取消时不复用 worker。
-    async fn frame(&mut self, stage: Stage, timeout: u64) -> Result<Vec<u8>, Fault> {
+    async fn frame(
+        &mut self,
+        stage: Stage,
+        timeout: u64,
+        admission: Option<&Admission<'_>>,
+    ) -> Result<Vec<u8>, Fault> {
         let mut line = serde_json::to_vec(&Message::new(self.seq, stage))
             .expect("protocol messages serialize");
         line.push(b'\n');
         let io = async {
-            self.stdin
-                .as_mut()
-                .unwrap()
-                .write_all(&line)
+            let stdin = self.stdin.as_mut().unwrap();
+            let written = if let Some(a) = admission {
+                use tokio::io::AsyncWrite;
+                let mut changed = a.pool.changed.subscribe();
+                let first = std::future::poll_fn(|cx| {
+                    let c = a.pool.circuit.lock().unwrap();
+                    if c.epoch != a.epoch {
+                        return std::task::Poll::Ready(Err(c.refusal()));
+                    }
+                    std::pin::Pin::new(&mut *stdin)
+                        .poll_write(cx, &line)
+                        .map_err(|_| Fault::Io)
+                });
+                tokio::select! {biased; _=changed.changed()=>return Err(a.pool.circuit.lock().unwrap().refusal()), result=first=>result?}
+            } else {
+                0
+            };
+            if admission.is_some() && written == 0 {
+                return Err(Fault::Io);
+            }
+            stdin
+                .write_all(&line[written..])
                 .await
                 .map_err(|_| Fault::Io)?;
             let mut reply = Vec::new();
@@ -229,8 +252,9 @@ impl Drop for Admission<'_> {
     fn drop(&mut self) {
         if self.probe {
             let mut c = self.pool.circuit.lock().unwrap();
-            if c.epoch == self.epoch {
+            if c.epoch == self.epoch && c.probing {
                 c.probing = false;
+                self.pool.notify.notify_waiters();
             }
         }
     }
@@ -354,19 +378,21 @@ impl Pool {
     /// 每个已写出的消息按完成顺序登记；程序的显式拒绝是合法回信，不是进程故障。
     fn complete(&self, a: &Admission<'_>, fault: Option<&Fault>) {
         let mut c = self.circuit.lock().unwrap();
-        if c.epoch != a.epoch {
-            return;
-        }
+        let current_probe = a.probe && c.epoch == a.epoch;
         if let Some(f) = fault {
             let now = crate::daemon::now_millis();
             c.failures = c.failures.saturating_add(1);
             c.last = Some((f.clone(), now));
-            if a.probe {
+            if current_probe
+                || (c.window.is_none()
+                    && self.entry.breaker_failures != 0
+                    && c.failures >= self.entry.breaker_failures)
+            {
                 self.open(&mut c, now);
             }
         } else {
             c.failures = 0;
-            if a.probe {
+            if current_probe {
                 c.window = None;
                 c.probing = false;
                 self.notify.notify_waiters();
@@ -375,7 +401,7 @@ impl Pool {
         }
     }
     /// 建会话、分配最小空闲编号。每次都重新查找命令，供冷却后的程序恢复。
-    async fn spawn(&self) -> Result<Worker, Fault> {
+    async fn spawn(&self, admission: Option<&Admission<'_>>) -> Result<Worker, Fault> {
         let permit = self
             .capacity
             .clone()
@@ -396,15 +422,21 @@ impl Pool {
             used: self.ids.clone(),
             _permit: permit,
         };
-        let mut child = Command::new(exe)
-            .args(&self.entry.args)
-            .envs(&self.entry.env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|_| Fault::Spawn)?;
+        let mut child = {
+            let c = self.circuit.lock().unwrap();
+            if admission.is_some_and(|a| a.epoch != c.epoch) {
+                return Err(c.refusal());
+            }
+            Command::new(exe)
+                .args(&self.entry.args)
+                .envs(&self.entry.env)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|_| Fault::Spawn)?
+        };
         let stderr = child.stderr.take().unwrap();
         let secrets = self.secrets.clone();
         let name = secrets.replace(&self.entry.name);
@@ -447,7 +479,7 @@ impl Pool {
             id,
         );
         hello.overrides = OVERRIDES.iter().map(|k| (*k).into()).collect();
-        let line = w.frame(Stage::Hello(hello), 10).await?;
+        let line = w.frame(Stage::Hello(hello), 10, None).await?;
         let reply: HelloReply = serde_json::from_slice(&line).map_err(|_| Fault::Invalid)?;
         if reply.v != 1 || reply.protocol != 1 || reply.seq != 0 {
             return Err(Fault::Protocol);
@@ -471,16 +503,16 @@ impl Pool {
     }
     /// 探测 persistent 的首个进程留池；spawn 进程在握手后单独关闭。
     pub(crate) async fn probe(self: &Arc<Self>) -> Result<(), Fault> {
-        let w = self.spawn().await?;
-        self.put(w).await;
+        let w = self.spawn(None).await?;
+        if self.entry.process == Process::Spawn {
+            w.finish().await;
+        } else {
+            self.park(w);
+        }
         Ok(())
     }
     /// 没有流占用时，回收器每个空闲期唤醒一次，取出时也检查截止时刻。
-    async fn put(self: &Arc<Self>, mut w: Worker) {
-        if self.entry.process == Process::Spawn {
-            w.finish().await;
-            return;
-        }
+    fn park(self: &Arc<Self>, mut w: Worker) {
         // Windows 的异步管道首个 poll 可能只启动后台读取。归还时先 poll 一次，
         // 下次借出再查，跨越这两次检查的迟到帧则由 seq 拦住。
         if futures_util::FutureExt::now_or_never(w.stdout.fill_buf()).is_some() {
@@ -538,41 +570,57 @@ impl Pool {
             _=changed.changed()=>return Err(self.circuit.lock().unwrap().refusal()),
             turn=self.turns.acquire()=>turn.expect("pool is never closed"),
         };
-        let result = self
-            .exchange(stage, timeout, fresh || ticket.probe, &ticket)
-            .await;
-        if !matches!(&result, Err(Fault::Open { .. })) {
-            self.complete(&ticket, result.as_ref().err());
+        let borrow = async {
+            let old = self.take();
+            if fresh || ticket.probe {
+                drop(old);
+            } else if let Some(w) = old {
+                return Ok(w);
+            }
+            self.spawn(Some(&ticket)).await
+        };
+        let worker = tokio::select! {biased;
+            _=changed.changed()=>return Err(self.circuit.lock().unwrap().refusal()),
+            result=borrow=>result,
+        };
+        let result = match worker {
+            Ok(mut w) => self
+                .exchange(&mut w, stage, timeout, &ticket)
+                .await
+                .map(|reply| (reply, w)),
+            Err(f) => Err(f),
+        };
+        if matches!(result, Err(Fault::Open { .. })) {
+            return result.map(|(r, _)| r);
         }
-        result
+        self.complete(&ticket, result.as_ref().err());
+        let (reply, w) = result?;
+        if self.entry.process == Process::Spawn {
+            w.finish().await;
+        } else {
+            // 熔断和归还在同一把锁下排序，已被清空的空闲池不会收到旧代的 worker。
+            let c = self.circuit.lock().unwrap();
+            if c.epoch == ticket.epoch && c.window.is_none() {
+                self.park(w);
+            }
+        }
+        Ok(reply)
     }
-    /// 得到派发位后取得会话；若排队或建会话期间已经熔断，不把阶段帧写进管道。
+    /// 帧的首次写入与熔断按同一把锁排序；已经发出的消息读完并计数，但不会提前结束冷却。
     async fn exchange(
-        self: &Arc<Self>,
+        &self,
+        w: &mut Worker,
         stage: Stage,
         timeout: u64,
-        fresh: bool,
         a: &Admission<'_>,
     ) -> Result<Reply, Fault> {
-        if self.circuit.lock().unwrap().epoch != a.epoch {
-            return Err(self.circuit.lock().unwrap().refusal());
-        }
-        let old = self.take();
-        let mut w = if fresh {
-            drop(old);
-            self.spawn().await?
-        } else if let Some(w) = old {
-            w
-        } else {
-            self.spawn().await?
-        };
-        if self.circuit.lock().unwrap().epoch != a.epoch {
-            return Err(self.circuit.lock().unwrap().refusal());
-        }
-        let line = w.frame(stage, timeout).await?;
+        let line = w.frame(stage, timeout, Some(a)).await?;
+        /// 先核对回信的版本和序列再解释补丁，以免把其他请求的回信应用到本次。
         #[derive(serde::Deserialize)]
         struct Sequence {
+            /// 固定的协议版本。
             v: u32,
+            /// 本进程本次派发的序号。
             seq: u64,
         }
         let stamp: Sequence = serde_json::from_slice(&line).map_err(|_| Fault::Protocol)?;
@@ -608,9 +656,6 @@ impl Pool {
             return Err(Fault::Invalid);
         }
         w.seq += 1;
-        if self.circuit.lock().unwrap().epoch == a.epoch {
-            self.put(w).await;
-        }
         Ok(r)
     }
 }

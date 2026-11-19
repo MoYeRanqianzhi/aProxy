@@ -478,3 +478,123 @@ async fn reports_land_in_the_request_record() {
     }
     assert!(!r.to_string().contains("fictional-token"));
 }
+
+/// 通过临时 home 的快照读熔断状态，而不是依据一次 HTTP 响应猜测。
+async fn breaker(home: &TestHome, url: &str) -> Value {
+    let port = url.rsplit(':').next().unwrap();
+    aproxy::daemon::ipc_ping_in(&home.path().join("run"), port)
+        .await
+        .unwrap()
+        .formats[0]["breaker"]
+        .clone()
+}
+
+/// 第五条坏回信后停止派发；熔断期间的下一次请求不再启动进程，也不会访问上游。
+#[tokio::test]
+async fn breaker_opens_after_five_failures_and_answers_503() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[200]).await;
+    let cfg = layer(&home, "broken", "'request'", &["bad-seq"]);
+    let (c, url) = running(&home, up, &cfg);
+    for _ in 0..2 {
+        let r = c.post(&url).send().await.unwrap();
+        assert_eq!(r.status(), 503);
+        assert_eq!(r.headers()["x-aproxy-error"], "format_unavailable");
+    }
+    let f = frames(&home, "broken");
+    assert_eq!(f.len(), 10);
+    assert_eq!(f.iter().filter(|m| m["stage"] == "request").count(), 5);
+    let b = breaker(&home, &url).await;
+    assert_eq!(b["state"], "open");
+    assert_eq!(b["failures"], 5);
+    assert_eq!(b["last_failure"]["details"]["kind"], "protocol");
+    assert!(b["probe_at"].as_u64() > b["opened_at"].as_u64());
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+/// 冷却结束后的一条新消息重新握手；有效回信清零，之后的请求可复用试探进程。
+#[tokio::test]
+async fn breaker_closes_after_a_successful_probe() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[200]).await;
+    let stamp = home.path().join("healthy");
+    let cfg = layer(
+        &home,
+        "flaky",
+        "'request'",
+        &["bad-until-file", stamp.to_str().unwrap()],
+    ) + "breaker_failures=1\nbreaker_cooldown_secs=1\n";
+    let (c, url) = running(&home, up, &cfg);
+    assert_eq!(c.post(&url).send().await.unwrap().status(), 503);
+    assert_eq!(breaker(&home, &url).await["state"], "open");
+    std::fs::write(stamp, b"ok").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1050)).await;
+    for _ in 0..2 {
+        assert_eq!(c.post(&url).send().await.unwrap().status(), 200);
+    }
+    assert_eq!(
+        frames(&home, "flaky")
+            .iter()
+            .filter(|m| m["stage"] == "hello")
+            .count(),
+        2
+    );
+    let b = breaker(&home, &url).await;
+    assert_eq!(b["state"], "closed");
+    assert_eq!(b["failures"], 0);
+    assert!(b.get("opened_at").is_none());
+}
+
+/// 上游连续接收请求后断开六次，超过程序的阈值；第七次仍能在同一程序会话内成功。
+#[tokio::test]
+async fn network_failures_do_not_trip_the_breaker() {
+    use tokio::io::AsyncReadExt;
+    let home = TestHome::new();
+    let up = free_port();
+    let socket = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        for _ in 0..6 {
+            let (mut stream, _) = socket.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            assert!(stream.read(&mut buf).await.unwrap() > 0);
+        }
+        axum::serve(socket, axum::Router::new().fallback(|| async { "ok" }))
+            .await
+            .unwrap();
+    });
+    let cfg = layer(&home, "healthy", "'request','retry'", &["echo"]);
+    let (c, url) = running(&home, up, &cfg);
+    assert_eq!(
+        c.post(&url).send().await.unwrap().text().await.unwrap(),
+        "ok"
+    );
+    let b = breaker(&home, &url).await;
+    assert_eq!(b["failures"], 0);
+    assert_eq!(b["state"], "closed");
+    assert!(b.get("last_failure").is_none());
+    let f = frames(&home, "healthy");
+    assert_eq!(f.iter().filter(|m| m["stage"] == "hello").count(), 1);
+    assert!(f.iter().filter(|m| m["stage"] == "retry").count() >= 5);
+}
+
+/// 不配置程序时保留原来的上游重试和响应正文，快照不凭空出现格式程序。
+#[tokio::test]
+async fn instance_without_formats_is_unaffected() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[503, 200]).await;
+    let (c, url) = running(&home, up, "");
+    assert_eq!(
+        c.post(&url).send().await.unwrap().text().await.unwrap(),
+        "upstream bytes"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert!(
+        aproxy::daemon::ipc_ping_in(&home.path().join("run"), url.rsplit(':').next().unwrap())
+            .await
+            .unwrap()
+            .formats
+            .is_empty()
+    );
+}

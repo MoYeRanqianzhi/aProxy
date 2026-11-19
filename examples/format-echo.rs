@@ -122,6 +122,9 @@ fn main() {
                     println!("not-json");
                     continue;
                 }
+                "bad-until-file" if !std::path::Path::new(arg).exists() => {
+                    r["seq"] = json!(seq + 1)
+                }
                 "bad-seq" => r["seq"] = json!(seq + 1),
                 "bad-seq-once" | "crash-once"
                     if OpenOptions::new()

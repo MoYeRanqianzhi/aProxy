@@ -2936,3 +2936,84 @@ async fn decide_receives_raw_bounded_bytes_when_decoding_fails() {
         );
     }
 }
+
+/// 在确认客户端已收到骨架头后才放行上游；stop 只改状态，不替换可能落盘或压缩的正文。
+async fn committed_stop_body(
+    mime: &'static str,
+    coding: &'static str,
+    raw: Vec<u8>,
+) -> bytes::Bytes {
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = release.clone();
+    let raw = bytes::Bytes::from(raw);
+    let app = axum::Router::new().fallback(move || {
+        let gate = gate.clone();
+        let raw = raw.clone();
+        async move {
+            gate.acquire().await.unwrap().forget();
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                [("content-type", mime), ("content-encoding", coding)],
+                raw,
+            )
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = String::from("[keepalive]\ntrigger='accept'\ninterval_secs=1\n")
+        + &layer(
+            &home,
+            "stop",
+            "'decide'",
+            &["reply", r#"{"decision":"stop","response":{"status":429}}"#],
+        );
+    let (c, url) = running(&home, up, &cfg);
+    let r = c
+        .get(url)
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    release.add_permits(1);
+    let out = r.bytes().await.unwrap();
+    assert_eq!(frames(&home, "stop")[1]["response"]["status"], 503);
+    out
+}
+
+/// 状态补丁继承的是有效头表描述的正文；已提交的 SSE 里不能出现压缩字节或半个流。
+#[tokio::test]
+async fn committed_stop_decodes_inherited_body_or_uses_terminal_event() {
+    use std::io::Write as _;
+    for (mime, plain, tail) in [
+        ("text/event-stream", "data: denied\n\n", "data: denied\n\n"),
+        (
+            "application/json",
+            "{\n\"n\":9}",
+            "event: error\ndata: {\"n\":9}\n\n",
+        ),
+    ] {
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(plain.as_bytes()).unwrap();
+        let b = committed_stop_body(mime, "gzip", gz.finish().unwrap()).await;
+        assert!(b.ends_with(tail.as_bytes()), "unexpected event for {mime}");
+    }
+    let out = committed_stop_body("text/event-stream", "gzip", b"not encoded".to_vec()).await;
+    let text = std::str::from_utf8(&out).unwrap();
+    assert!(
+        text.contains("retry_stopped") && !text.contains("not encoded"),
+        "{text}"
+    );
+}
+
+/// 状态补丁不能把超过 1 MiB 的磁盘 JSON 搬回内存，或当作单个 SSE 事件写出去。
+#[tokio::test]
+async fn committed_stop_limits_disk_json_conversion() {
+    let raw = format!("{{\"message\":\"{}\"}}", "x".repeat(1024 * 1024));
+    let b = committed_stop_body("application/json", "identity", raw.into_bytes()).await;
+    assert!(b.len() < 4096, "terminal response was {} bytes", b.len());
+    assert!(std::str::from_utf8(&b).unwrap().contains("retry_stopped"));
+}

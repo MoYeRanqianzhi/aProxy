@@ -325,6 +325,7 @@ pub(super) async fn consult(
 
 /// 决定阶段的响应补丁应用于真实上游体，而不是给程序看的有界预览。停止以后不进响应转换链。
 pub(super) async fn finish(
+    state: &AppState,
     r: &mut Responder,
     trace: &RequestTrace,
     terminal: Terminal,
@@ -381,8 +382,49 @@ pub(super) async fn finish(
         r.respond(out);
         return;
     }
-    if terminal_is_sse(&response.headers) {
-        let mut stream = response.body.into_stream().await;
+    let sse = terminal_is_sse(&response.headers);
+    // 已提交的头没有编码。必须先严格解完整条流，不能写完一些字节才发现尾部校验失败。
+    // 非 SSE 只打算生成单个 JSON 事件，对输入文件与解码后的单值都执行同一个上限。
+    if !sse && response.body.len() > PREVIEW_BYTES as u64 {
+        r.finish(terminal, trace).await;
+        return;
+    }
+    let encoding = request_encoding(&response.headers, true);
+    let encoding = encoding
+        .as_deref()
+        .map(|v| String::from_utf8_lossy(v.as_bytes()));
+    let mut body = if let Some(enc) = encoding.filter(|v| {
+        v.split(',')
+            .any(|e| !e.trim().is_empty() && !e.trim().eq_ignore_ascii_case("identity"))
+    }) {
+        if !format_encoding_depth_allowed(&enc) {
+            r.finish(terminal, trace).await;
+            return;
+        }
+        let limit = if sse {
+            spool_limit_bytes(&state.config)
+        } else {
+            PREVIEW_BYTES
+        };
+        let decode = decode_for_committed_replay(
+            response.body,
+            enc.into_owned(),
+            state.spool_dir.clone(),
+            limit,
+        );
+        match r.wait(decode, None, "decode stop response").await {
+            Some(Ok(body)) => body,
+            Some(Err(_)) => {
+                r.finish(terminal, trace).await;
+                return;
+            }
+            None => return,
+        }
+    } else {
+        response.body
+    };
+    if sse {
+        let mut stream = body.into_stream().await;
         while let Some(chunk) = stream.next().await {
             let Ok(chunk) = chunk else {
                 break;
@@ -394,9 +436,18 @@ pub(super) async fn finish(
             rec.response_bytes(len as u64);
         }
     } else {
-        let bytes = match &response.body {
+        let bytes = match &body {
             SpooledBody::Memory(b) => Some(b.clone()),
-            SpooledBody::Disk { path, .. } => tokio::fs::read(path).await.ok().map(Bytes::from),
+            SpooledBody::Disk { path, len } => {
+                use tokio::io::AsyncReadExt as _;
+                let read = async {
+                    let mut file = tokio::fs::File::open(path).await.ok()?;
+                    let mut bytes = vec![0; *len as usize];
+                    file.read_exact(&mut bytes).await.ok()?;
+                    Some(Bytes::from(bytes))
+                };
+                read.await
+            }
         };
         if let Some(event) = bytes.as_deref().and_then(terminal_json_event) {
             let len = event.len();

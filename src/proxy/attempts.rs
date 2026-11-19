@@ -662,7 +662,16 @@ pub(super) async fn run_attempts(
                             rec.decided(attempt, by, false);
                             failure.record_in(&state.stats);
                             terminal.record_in(&state.stats);
-                            decide::finish(r, &trace, terminal, original, patch, client_head).await;
+                            decide::finish(
+                                state,
+                                r,
+                                &trace,
+                                terminal,
+                                original,
+                                patch,
+                                client_head,
+                            )
+                            .await;
                             return;
                         }
                     }

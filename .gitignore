@@ -45,9 +45,6 @@ desktop.ini
 # Claude Code's per-user settings (permission allowlists and the like) are
 # machine-specific; the skills under .claude/skills/ are shared and stay tracked.
 /.claude/settings.local.json
-# The release packs every directory under .claude/skills/; use-codex is the
-# maintainers' local workflow for delegating to Codex, not a skill for users.
-/.claude/skills/use-codex/
 
 # Keep user- and machine-specific agent records out of shared history.
 # A `.local` segment in a name marks a record local: MEMORY.local.md,

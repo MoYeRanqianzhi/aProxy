@@ -313,9 +313,9 @@ async fn reply_limit_is_enforced_before_newline_or_eof() {
 async fn evicted_worker_aborts_even_a_stderr_reader_that_never_reaches_eof() {
     let p = pool(Process::Persistent, "echo", |_| {});
     let mut t = p.turn(false).await.unwrap();
-    let replacement = tokio::spawn(std::future::pending());
+    let replacement = tokio::spawn(std::future::pending::<()>());
     let handle = replacement.abort_handle();
-    std::mem::replace(&mut t.worker.stderr, replacement).abort();
+    std::mem::replace(&mut t.worker.stderr_abort, handle.clone()).abort();
     drop(t);
     tokio::time::timeout(Duration::from_secs(2), async {
         while !handle.is_finished() {
@@ -520,7 +520,10 @@ async fn probe_resolves_a_bare_name_from_the_entry_path() {
 #[tokio::test]
 async fn return_check_distinguishes_stray_bytes_from_clean_eof() {
     let dir = tempfile::tempdir().unwrap();
+    let obs = dir.path().join("events");
     let p = pool(Process::Persistent, "late-stray", |e| {
+        e.env
+            .insert("ECHO_OBSERVE".into(), obs.display().to_string());
         e.args.push(dir.path().display().to_string());
     });
     let mut turn = p.turn(false).await.unwrap();
@@ -533,7 +536,9 @@ async fn return_check_distinguishes_stray_bytes_from_clean_eof() {
     p.exchange(&mut turn.worker, frame, 2, &turn.ticket)
         .await
         .unwrap();
-    let pid = turn.worker.child.as_ref().unwrap().id().unwrap();
+    let pid = wait_observed(&obs, "hello", 1).await[0]["pid"]
+        .as_u64()
+        .unwrap();
     std::fs::write(dir.path().join(format!("release-{pid}")), b"").unwrap();
     assert!(
         !tokio::time::timeout(Duration::from_secs(2), turn.worker.stdout.fill_buf())
@@ -554,4 +559,33 @@ async fn return_check_distinguishes_stray_bytes_from_clean_eof() {
     })
     .await
     .unwrap();
+}
+
+/// 持有 Turn 的任务可以仍在准备本地数据；停止池不能靠该任务主动归还进程。
+#[tokio::test]
+async fn shutdown_reaps_a_checked_out_worker_before_returning() {
+    let temp = tempfile::tempdir().unwrap();
+    let obs = temp.path().join("events");
+    let p = pool(Process::Persistent, "echo", |e| {
+        e.pool_max = 1;
+        e.env
+            .insert("ECHO_OBSERVE".into(), obs.display().to_string());
+    });
+    let held = p.turn(false).await.unwrap();
+    assert_eq!(p.ids.lock().unwrap().len(), 1);
+    #[cfg(any(windows, target_os = "linux"))]
+    let pid = wait_observed(&obs, "hello", 1).await[0]["pid"]
+        .as_u64()
+        .unwrap() as u32;
+    tokio::time::timeout(Duration::from_secs(5), p.shutdown())
+        .await
+        .unwrap();
+    assert!(
+        p.ids.lock().unwrap().is_empty(),
+        "shutdown returned before the child exited"
+    );
+    #[cfg(any(windows, target_os = "linux"))]
+    assert_eq!(crate::process::process_exited(pid), Some(true));
+    assert!(matches!(p.turn(false).await, Err(Fault::Died)));
+    drop(held);
 }

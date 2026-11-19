@@ -13,7 +13,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
+    process::{ChildStdin, ChildStdout, Command},
     sync::{OwnedSemaphorePermit, Semaphore},
     time::Instant,
 };
@@ -270,16 +270,16 @@ impl Drop for Slot {
 
 /// stdin、stdout 与序号作为一组移动；读缓冲在同一进程的各帧之间保持不变。
 struct Worker {
-    /// Drop 时可以取出子进程，异步等待真正退出。
-    child: Option<Child>,
-    /// 强制回收时终止读取，避免继承管道的后代拖住日志任务。
-    stderr: tokio::task::JoinHandle<()>,
+    /// 管道使用者与进程回收分开；即使管道被未完成的 Turn 借走，池关闭时仍能等到 wait。
+    exited: tokio::task::JoinHandle<()>,
+    /// 强制丢弃管道时立即停止日志读取，不让继承 stderr 的后代拖住它。
+    stderr_abort: tokio::task::AbortHandle,
+    /// 丢弃发送端会立即强制终止进程；正常退役先关 stdin 给程序宽限。
+    kill: Option<tokio::sync::oneshot::Sender<()>>,
     /// 先关闭 stdin 通知进程退出，再收走进程名额。
     stdin: Option<ChildStdin>,
     /// 已预读的下一行不能交给另一个进程或请求。
     stdout: BufReader<ChildStdout>,
-    /// 直到 wait 完成才交还进程池。
-    slot: Option<Slot>,
     /// 握手用 0，其余消息沿用这个进程各自的序列。
     seq: u64,
     /// 最后一次归还到池里的时刻。
@@ -287,18 +287,9 @@ struct Worker {
 }
 impl Drop for Worker {
     fn drop(&mut self) {
-        self.stderr.abort();
+        self.stderr_abort.abort();
+        self.kill.take();
         self.stdin.take();
-        if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
-            let slot = self.slot.take();
-            if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                rt.spawn(async move {
-                    let _ = child.wait().await;
-                    drop(slot);
-                });
-            }
-        }
     }
 }
 /// 正常退役的 EOF 宽限时间；并发等待而不是按进程逐个累加。
@@ -317,18 +308,12 @@ impl Worker {
     async fn finish(mut self) {
         self.stdin.take();
         let end = Instant::now() + RETIRE_GRACE;
-        if tokio::time::timeout_at(end, self.child.as_mut().unwrap().wait())
+        if tokio::time::timeout_at(end, &mut self.exited)
             .await
-            .is_ok_and(|wait| wait.is_ok())
+            .is_err()
         {
-            self.child.take();
-            self.slot.take();
-            // 正常退出允许排空最后几行，但继承 stderr 的其他进程不应阻挡回收。
-            let _ = tokio::time::timeout_at(
-                end.min(Instant::now() + Duration::from_millis(100)),
-                &mut self.stderr,
-            )
-            .await;
+            self.kill.take();
+            let _ = (&mut self.exited).await;
         }
     }
     /// 排队与序列化不算在时限内，堵在写管道则算；调用被取消时不复用 worker。
@@ -443,6 +428,8 @@ pub(crate) struct Pool {
     turns: Semaphore,
     /// 已启动但仍未退出的进程数上限。
     capacity: Arc<Semaphore>,
+    /// 关闭信号也送给已借出和正在握手的进程，与持有管道的任务是否继续运行无关。
+    stopping: tokio::sync::watch::Sender<bool>,
     /// 活进程的编号，空洞总是优先复用。
     ids: Arc<Mutex<BTreeSet<u32>>>,
     /// 仅在收发全部完成后归还，这把同步锁不跨 await。
@@ -491,6 +478,7 @@ impl Pool {
             stderr_window: Arc::new(Mutex::new(LogWindow::new())),
             turns: Semaphore::new(n),
             capacity: Arc::new(Semaphore::new(n)),
+            stopping: tokio::sync::watch::channel(false).0,
             ids: Default::default(),
             idle: Default::default(),
             reaper: OnceLock::new(),
@@ -596,6 +584,10 @@ impl Pool {
             .acquire_owned()
             .await
             .expect("pool is never closed");
+        let mut stopping = self.stopping.subscribe();
+        if *stopping.borrow() {
+            return Err(Fault::Died);
+        }
         let env_path = self.entry.env.iter().rev().find(|(key, _)| {
             if cfg!(windows) {
                 key.eq_ignore_ascii_case("PATH")
@@ -645,13 +637,39 @@ impl Pool {
             self.secrets.replace(&self.entry.name).into(),
             self.stderr_window.clone(),
         ));
+        let stdin = child.stdin.take();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let stderr_abort = stderr.abort_handle();
+        let (kill, force) = tokio::sync::oneshot::channel();
+        // 只有此任务持有 OS 句柄和槽位。交还全部槽位因此也证明所有子进程都已 wait，
+        // 不需要按 pid 寻找进程，更不依赖即将强退的服务端执行各请求的析构函数。
+        let exited = tokio::spawn(async move {
+            let grace = async {
+                let _ = stopping.wait_for(|stop| *stop).await;
+                tokio::time::sleep(RETIRE_GRACE).await;
+            };
+            let normal = tokio::select! {
+                result = child.wait() => result.is_ok(),
+                _ = force => false,
+                _ = grace => false,
+            };
+            let mut stderr = stderr;
+            if normal {
+                let _ = tokio::time::timeout(Duration::from_millis(100), &mut stderr).await;
+            } else {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+            stderr.abort();
+            drop(slot);
+        });
         let mut w = Worker {
-            stderr,
-            stdin: child.stdin.take(),
-            stdout: BufReader::new(child.stdout.take().unwrap()),
-            child: Some(child),
+            exited,
+            stderr_abort,
+            kill: Some(kill),
+            stdin,
+            stdout,
             seq: 0,
-            slot: Some(slot),
             idle_since: Instant::now(),
         };
         let mut hello = Hello::new(
@@ -716,6 +734,8 @@ impl Pool {
     }
     /// 停止回收计时器，发出所有空闲进程的 EOF，与已经退役的进程并行等待。
     pub(crate) async fn shutdown(&self) {
+        self.turns.close();
+        self.stopping.send_replace(true);
         if let Some(t) = self.reaper.get() {
             t.abort();
         }
@@ -725,11 +745,28 @@ impl Pool {
             retired.spawn(w.finish());
         }
         while retired.join_next().await.is_some() {}
+        // 在途/握手/已丢弃的会话不一定在退役队列里，它们的名额也必须全部收齐。
+        let slots = if self.entry.process == Process::Spawn {
+            1
+        } else {
+            self.entry.pool_max
+        };
+        let _all = self
+            .capacity
+            .acquire_many(slots)
+            .await
+            .expect("process capacity stays open");
     }
     /// 只有刚检查过输出的健康会话可以归还；第二次检查放在取用一刻，截住迟到的杂字节。
     fn park(self: &Arc<Self>, mut w: Worker) {
         w.idle_since = Instant::now();
-        self.idle.lock().unwrap().push(w);
+        {
+            let mut idle = self.idle.lock().unwrap();
+            if *self.stopping.borrow() {
+                return;
+            }
+            idle.push(w);
+        }
         let timeout = Duration::from_secs(self.entry.worker_idle_secs);
         if timeout.is_zero() {
             return;
@@ -764,21 +801,19 @@ impl Pool {
     fn take(&self) -> Option<Worker> {
         let mut idle = self.idle.lock().unwrap();
         while let Some(mut w) = idle.pop() {
-            match w.child.as_mut().unwrap().try_wait() {
-                Ok(Some(_)) => {
-                    w.child.take();
-                    w.slot.take();
-                    continue;
-                }
-                Err(_) => continue,
-                Ok(None) => {}
+            if w.exited.is_finished() {
+                continue;
             }
             if self.entry.worker_idle_secs != 0
                 && w.idle_since.elapsed() >= Duration::from_secs(self.entry.worker_idle_secs)
             {
                 self.retire(w);
-            } else if matches!(w.reusable(), Ok(true)) {
-                return Some(w);
+            } else {
+                match w.reusable() {
+                    Ok(true) => return Some(w),
+                    Ok(false) => self.retire(w),
+                    Err(_) => (),
+                }
             }
         }
         None
@@ -789,7 +824,7 @@ impl Pool {
         let ticket = self.admit()?;
         let _turn = tokio::select! {biased;
             _=changed.changed()=>return Err(self.circuit.lock().unwrap().refusal()),
-            turn=self.turns.acquire()=>turn.expect("pool is never closed"),
+            turn=self.turns.acquire()=>turn.map_err(|_| Fault::Died)?,
         };
         let borrow = async {
             let old = self.take();

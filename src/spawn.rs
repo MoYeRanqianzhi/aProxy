@@ -160,14 +160,13 @@ pub async fn spawn_from_spec(
     let run_dir = home.join("run");
     let mark = startup_log_len(home);
     let spec_path = spec::write_spec_file(&run_dir, spec).map_err(SpawnError::Spawn)?;
-    let result = launch_and_wait(home, &run_dir, exe, spec, &spec_path, mark, timeout).await;
+    let result = launch_and_wait(home, exe, spec, &spec_path, mark, timeout).await;
     let _ = std::fs::remove_file(&spec_path);
     result
 }
 
 async fn launch_and_wait(
     home: &Path,
-    run_dir: &Path,
     exe: &Path,
     spec: &InstanceSpec,
     spec_path: &Path,
@@ -191,11 +190,27 @@ async fn launch_and_wait(
         cwd: Some(home),
     };
     let pid = daemon::spawn_detached_with(exe, &args, &launch).map_err(SpawnError::Spawn)?;
+    wait_ready(home, pid, Some(spec_path), mark, timeout).await
+}
+
+/// 另一个启动者已占用端口，只观察这个 pid 的就绪或退出，不读取它的私有规格、不回收其进程。
+pub(crate) async fn wait_existing(home: &Path, pid: u32) -> Result<InstanceStatus, SpawnError> {
+    wait_ready(home, pid, None, startup_log_len(home), READY_TIMEOUT).await
+}
+/// 同一个就绪循环供拉起者与旁观者共用；只有前者有权读取子进程写回的握手诊断。
+async fn wait_ready(
+    home: &Path,
+    pid: u32,
+    spec_path: Option<&Path>,
+    mark: u64,
+    timeout: Duration,
+) -> Result<InstanceStatus, SpawnError> {
+    let run_dir = home.join("run");
     let start = crate::process::process_start_time(pid);
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if let Some(rec) = daemon::registry_find_pid_in(run_dir, pid)
-            && let Ok(live) = daemon::ipc_ping_in(run_dir, daemon::port_of(&rec.listen_addr)).await
+        if let Some(rec) = daemon::registry_find_pid_in(&run_dir, pid)
+            && let Ok(live) = daemon::ipc_ping_in(&run_dir, daemon::port_of(&rec.listen_addr)).await
             && live.instance.pid == pid
             && live.state == daemon::InstanceState::Serving
         {
@@ -203,8 +218,8 @@ async fn launch_and_wait(
         }
         if crate::process::process_exited(pid) == Some(true) {
             // 子进程退出后文件不会再变化。不是格式错误时它仍是原始规格，按普通启动失败处理。
-            let format = std::fs::File::open(spec_path)
-                .ok()
+            let format = spec_path
+                .and_then(|p| std::fs::File::open(p).ok())
                 .and_then(|f| serde_json::from_reader(f).ok());
             return Err(SpawnError::Exited {
                 pid,

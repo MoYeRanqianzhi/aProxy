@@ -1168,23 +1168,52 @@ async fn request_persistent_multiline_never_crosswires() {
 #[tokio::test]
 async fn request_persistent_late_stray_line_never_crosswires() {
     isolate_env_proxy();
-    // 多余的一行（合法信封）晚于回复 100ms 才到：读回复时它还不在，worker
-    // 已归还空闲表——必须在下次取用前探测到并剔除，否则下一个请求静默串包
+    // 只在正常回信已交付之后才允许写多余的一行，再用写完的确认控制下一次请求。
     let (upstream, log, _jh) = recording_upstream().await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.formats.push(single_worker_persistent(
-        &["late-stray", "100"],
+    let home = common::TestHome::new();
+    let obs = home.path().join("observed");
+    let mut entry = single_worker_persistent(
+        &["late-stray", home.path().to_str().unwrap()],
         &[Stage::Request],
-    ));
+    );
+    entry
+        .env
+        .insert("ECHO_OBSERVE".into(), obs.display().to_string());
+    cfg.formats.push(entry);
     let (proxy, _pj) = start_proxy(cfg).await;
     let client = local_client();
 
-    for sent in ["AAA", "BBB", "CCC"] {
+    for (n, sent) in ["AAA", "BBB", "CCC"].into_iter().enumerate() {
         let (status, text) = post_body(&client, &proxy, sent).await;
         assert_not_crosswired(status, &text, sent);
         assert_eq!(status, StatusCode::OK, "回复本身合法，请求应成功: {text}");
-        // 等多余行落进管道：下一个请求取 worker 时它已可见
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let events = || {
+            std::fs::read_to_string(&obs)
+                .unwrap()
+                .lines()
+                .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .collect::<Vec<_>>()
+        };
+        let pid = events()
+            .into_iter()
+            .rfind(|e| e["event"] == "request")
+            .unwrap()["pid"]
+            .as_u64()
+            .unwrap();
+        std::fs::write(home.path().join(format!("release-{pid}")), b"").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            while events()
+                .iter()
+                .filter(|e| e["event"] == "stray-written")
+                .count()
+                <= n
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
     assert_eq!(log.lock().unwrap().len(), 3);
 }

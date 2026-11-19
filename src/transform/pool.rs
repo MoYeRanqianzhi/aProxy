@@ -220,21 +220,39 @@ impl std::fmt::Display for Fault {
 }
 
 /// 程序名只在 home/bin 与 PATH 中查，不让后台进程的当前目录意外参与解析。
-fn program_path(command: &str, home: &Path) -> Result<PathBuf, Fault> {
+fn program_path(
+    command: &str,
+    home: &Path,
+    path: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, Fault> {
     let expanded = crate::config::expand_tilde(command);
     let p = Path::new(&expanded);
     if p.file_name().is_none_or(|name| name != p.as_os_str()) {
         return Ok(home.join(p));
     }
-    let dirs = std::env::var_os("PATH").unwrap_or_default();
-    for dir in std::iter::once(home.join("bin")).chain(std::env::split_paths(&dirs)) {
-        let file = dir.join(p);
-        if file.is_file() {
+    #[cfg(windows)]
+    let name = if p.extension().is_none() {
+        p.with_extension("exe")
+    } else {
+        p.to_owned()
+    };
+    #[cfg(not(windows))]
+    let name = p;
+    for dir in
+        std::iter::once(home.join("bin")).chain(path.into_iter().flat_map(std::env::split_paths))
+    {
+        let file = dir.join(&name);
+        if let Ok(meta) = file.metadata()
+            && meta.is_file()
+        {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if meta.permissions().mode() & 0o111 == 0 {
+                    continue;
+                }
+            }
             return Ok(file);
-        }
-        #[cfg(windows)]
-        if file.extension().is_none() && file.with_extension("exe").is_file() {
-            return Ok(file.with_extension("exe"));
         }
     }
     Err(Fault::Spawn)
@@ -288,17 +306,34 @@ impl Drop for Worker {
         }
     }
 }
+/// 正常退役的 EOF 宽限时间；并发等待而不是按进程逐个累加。
+const RETIRE_GRACE: Duration = Duration::from_secs(2);
 impl Worker {
+    /// 无数据可读才复用；正常 EOF 使本次回信有效但不留进程，未请求的额外字节则使往返失败。
+    fn reusable(&mut self) -> Result<bool, Fault> {
+        match futures_util::FutureExt::now_or_never(self.stdout.fill_buf()) {
+            None => Ok(true),
+            Some(Ok([])) => Ok(false),
+            Some(Ok(_)) => Err(Fault::Protocol),
+            Some(Err(_)) => Err(Fault::Io),
+        }
+    }
     /// 正常结束先发 EOF，给遵守协议的程序留出清理机会；不读 EOF 的进程仍能回收。
     async fn finish(mut self) {
         self.stdin.take();
-        if tokio::time::timeout(Duration::from_secs(1), self.child.as_mut().unwrap().wait())
+        let end = Instant::now() + RETIRE_GRACE;
+        if tokio::time::timeout_at(end, self.child.as_mut().unwrap().wait())
             .await
             .is_ok_and(|wait| wait.is_ok())
         {
             self.child.take();
+            self.slot.take();
             // 正常退出允许排空最后几行，但继承 stderr 的其他进程不应阻挡回收。
-            let _ = tokio::time::timeout(Duration::from_millis(100), &mut self.stderr).await;
+            let _ = tokio::time::timeout_at(
+                end.min(Instant::now() + Duration::from_millis(100)),
+                &mut self.stderr,
+            )
+            .await;
         }
     }
     /// 排队与序列化不算在时限内，堵在写管道则算；调用被取消时不复用 worker。
@@ -418,7 +453,11 @@ pub(crate) struct Pool {
     /// 仅在收发全部完成后归还，这把同步锁不跨 await。
     idle: Mutex<Vec<Worker>>,
     /// 回收任务只持弱引用，实例退出不被它阻挡。
-    reaper: OnceLock<()>,
+    reaper: OnceLock<tokio::task::JoinHandle<()>>,
+    /// 同一池只探测一次；同时询问的调用方共享第一次握手的结果。
+    startup: tokio::sync::OnceCell<Result<(), Fault>>,
+    /// 因空闲正常退役的进程在后台限时等待 EOF；实例关闭时一起等完。
+    retiring: Mutex<tokio::task::JoinSet<()>>,
     /// 熔断状态的写锁只覆盖进程消息的接纳与完成，不跨管道操作。
     circuit: Mutex<Circuit>,
     /// IPC 订阅者在阶段变动时重读快照。
@@ -427,6 +466,13 @@ pub(crate) struct Pool {
     changed: tokio::sync::watch::Sender<u64>,
     /// 最近一次成功握手的身份与能力，握手失败时不杜撰版本。
     pub(crate) negotiated: Mutex<Option<HelloReply>>,
+}
+impl Drop for Pool {
+    fn drop(&mut self) {
+        if let Some(t) = self.reaper.take() {
+            t.abort();
+        }
+    }
 }
 impl Pool {
     /// 这里只分配管理结构；进程由异步启动探测或阶段入口创建。
@@ -453,6 +499,8 @@ impl Pool {
             ids: Default::default(),
             idle: Default::default(),
             reaper: OnceLock::new(),
+            startup: Default::default(),
+            retiring: Default::default(),
             notify,
             negotiated: Mutex::new(None),
             circuit: Default::default(),
@@ -553,7 +601,21 @@ impl Pool {
             .acquire_owned()
             .await
             .expect("pool is never closed");
-        let exe = program_path(&self.entry.command, &self.home)?;
+        let env_path = self.entry.env.iter().rev().find(|(key, _)| {
+            if cfg!(windows) {
+                key.eq_ignore_ascii_case("PATH")
+            } else {
+                key.as_str() == "PATH"
+            }
+        });
+        let inherited = std::env::var_os("PATH");
+        let exe = program_path(
+            &self.entry.command,
+            &self.home,
+            env_path
+                .map(|(_, v)| std::ffi::OsStr::new(v))
+                .or(inherited.as_deref()),
+        )?;
         let id = {
             let mut ids = self.ids.lock().unwrap();
             let id = (0..)
@@ -613,7 +675,12 @@ impl Pool {
         );
         hello.overrides = OVERRIDES.iter().map(|k| (*k).into()).collect();
         let line = w.frame(Stage::Hello(hello), 10, None, HELLO_BYTES).await?;
-        let reply: HelloReply = serde_json::from_slice(&line).map_err(|_| Fault::Invalid)?;
+        let object: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&line).map_err(|_| Fault::Invalid)?;
+        if object.get("seq").and_then(|v| v.as_u64()) != Some(0) {
+            return Err(Fault::Protocol);
+        }
+        let reply = HelloReply::try_from(object).map_err(|_| Fault::Invalid)?;
         if reply.v != 1 || reply.protocol != 1 || reply.seq != 0 {
             return Err(Fault::Protocol);
         }
@@ -633,21 +700,39 @@ impl Pool {
     }
     /// 探测 persistent 的首个进程留池；spawn 进程在握手后单独关闭。
     pub(crate) async fn probe(self: &Arc<Self>) -> Result<(), Fault> {
-        let w = self.spawn(None).await?;
-        if self.entry.process == Process::Spawn {
-            w.finish().await;
-        } else {
-            self.park(w);
-        }
-        Ok(())
+        self.startup
+            .get_or_init(|| async {
+                let mut w = self.spawn(None).await?;
+                if self.entry.process == Process::Spawn || !w.reusable()? {
+                    w.finish().await;
+                } else {
+                    self.park(w);
+                }
+                Ok(())
+            })
+            .await
+            .clone()
     }
-    /// 没有流占用时，回收器每个空闲期唤醒一次，取出时也检查截止时刻。
-    fn park(self: &Arc<Self>, mut w: Worker) {
-        // Windows 的异步管道首个 poll 可能只启动后台读取。归还时先 poll 一次，
-        // 下次借出再查，跨越这两次检查的迟到帧则由 seq 拦住。
-        if futures_util::FutureExt::now_or_never(w.stdout.fill_buf()).is_some() {
-            return;
+    /// 已完成的退役任务及时摘除；在清理宽限期内，进程仍占容量但不占数据通路的锁。
+    fn retire(&self, w: Worker) {
+        let mut tasks = self.retiring.lock().unwrap();
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(w.finish());
+    }
+    /// 停止回收计时器，发出所有空闲进程的 EOF，与已经退役的进程并行等待。
+    pub(crate) async fn shutdown(&self) {
+        if let Some(t) = self.reaper.get() {
+            t.abort();
         }
+        let workers = std::mem::take(&mut *self.idle.lock().unwrap());
+        let mut retired = std::mem::take(&mut *self.retiring.lock().unwrap());
+        for w in workers {
+            retired.spawn(w.finish());
+        }
+        while retired.join_next().await.is_some() {}
+    }
+    /// 只有刚检查过输出的健康会话可以归还；第二次检查放在取用一刻，截住迟到的杂字节。
+    fn park(self: &Arc<Self>, mut w: Worker) {
         w.idle_since = Instant::now();
         self.idle.lock().unwrap().push(w);
         let timeout = Duration::from_secs(self.entry.worker_idle_secs);
@@ -661,7 +746,14 @@ impl Pool {
                     let Some(p) = pool.upgrade() else { break };
                     let delay = {
                         let mut idle = p.idle.lock().unwrap();
-                        idle.retain(|w| w.idle_since.elapsed() < timeout);
+                        let mut i = 0;
+                        while i < idle.len() {
+                            if idle[i].idle_since.elapsed() >= timeout {
+                                p.retire(idle.swap_remove(i));
+                            } else {
+                                i += 1;
+                            }
+                        }
                         idle.iter()
                             .map(|w| timeout.saturating_sub(w.idle_since.elapsed()))
                             .min()
@@ -670,18 +762,27 @@ impl Pool {
                     drop(p);
                     tokio::time::sleep(delay).await;
                 }
-            });
+            })
         });
     }
     /// 空闲进程若已退出，或空闲过久，直接回收；下一次消息使用另一条会话。
     fn take(&self) -> Option<Worker> {
         let mut idle = self.idle.lock().unwrap();
         while let Some(mut w) = idle.pop() {
-            if (self.entry.worker_idle_secs == 0
-                || w.idle_since.elapsed() < Duration::from_secs(self.entry.worker_idle_secs))
-                && matches!(w.child.as_mut().unwrap().try_wait(), Ok(None))
-                && futures_util::FutureExt::now_or_never(w.stdout.fill_buf()).is_none()
+            match w.child.as_mut().unwrap().try_wait() {
+                Ok(Some(_)) => {
+                    w.child.take();
+                    w.slot.take();
+                    continue;
+                }
+                Err(_) => continue,
+                Ok(None) => {}
+            }
+            if self.entry.worker_idle_secs != 0
+                && w.idle_since.elapsed() >= Duration::from_secs(self.entry.worker_idle_secs)
             {
+                self.retire(w);
+            } else if matches!(w.reusable(), Ok(true)) {
                 return Some(w);
             }
         }
@@ -822,12 +923,17 @@ impl Turn<'_> {
         if matches!(result, Err(Fault::Open { .. })) {
             return result;
         }
+        let result = result.and_then(|r| {
+            Ok((
+                r,
+                pool.entry.process == Process::Persistent && self.worker.reusable()?,
+            ))
+        });
         pool.complete(&self.ticket, result.as_ref().err());
-        let reply = result?;
-        if pool.entry.process == Process::Spawn {
+        let (reply, reuse) = result?;
+        if !reuse {
             self.worker.finish().await;
         } else {
-            // 熔断和归还在同一把锁下排序，已被清空的空闲池不会收到旧代的 worker。
             let c = pool.circuit.lock().unwrap();
             if c.epoch == self.ticket.epoch && c.window.is_none() {
                 pool.park(self.worker);

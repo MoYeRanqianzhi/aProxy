@@ -216,11 +216,15 @@ pub enum Preflight {
     Clear,
     /// 同一监听地址上已有本 home 的实例在运行：不必重复启动
     AlreadyRunning(Box<InstanceStatus>),
+    /// 到达时尚在启动，现已等到它完成握手。
+    BecameReady(Box<InstanceStatus>),
 }
 
 /// 端口预检不通过。
 #[derive(Debug)]
 pub enum PreflightError {
+    /// 同地址原实例在握手期间退出或未能及时就绪，不再另开一份重复的启动。
+    Startup(SpawnError),
     /// 这个端口已被**另一个监听地址**上的本 home 实例使用。实例按端口号区分，两者
     /// 不能并存
     PortHeldByOtherAddress {
@@ -235,6 +239,27 @@ pub enum PreflightError {
     },
 }
 
+/// 两次端口预检看到同一状态时走同一条路径，不把 starting 伪装成已就绪。
+async fn existing_instance(
+    listen_addr: &str,
+    info: InstanceStatus,
+) -> Result<Preflight, PreflightError> {
+    if info.instance.listen_addr != listen_addr {
+        return Err(PreflightError::PortHeldByOtherAddress {
+            port: daemon::port_of(listen_addr).to_owned(),
+            listen_addr: listen_addr.to_owned(),
+            other_listen_addr: info.instance.listen_addr,
+        });
+    }
+    if info.state == daemon::InstanceState::Starting {
+        return spawn::wait_existing(&aproxy_ipc::home::home(), info.instance.pid)
+            .await
+            .map(|i| Preflight::BecameReady(Box::new(i)))
+            .map_err(PreflightError::Startup);
+    }
+    Ok(Preflight::AlreadyRunning(Box::new(info)))
+}
+
 /// 启动之前的端口预检。控制通道走 IPC，不触碰代理端口：
 /// - IPC ping 通且监听地址一致 → 同端口已有 aProxy 实例，不重复启动；
 /// - IPC ping 通但监听地址不同 → 同端口不同地址的另一实例，实例键（端口号）无法区分，
@@ -247,14 +272,7 @@ pub async fn preflight(listen_addr: &str) -> Result<Preflight, PreflightError> {
     // （端口号）无法区分两者，注册表与 IPC 端点会互相顶替（stop 会停错实例），
     // 必须明确拒绝。别的 home 的同端口实例这里看不到，由预检 2 的 bind 失败拦下。
     if let Ok(info) = daemon::ipc_ping(&port).await {
-        if info.instance.listen_addr == listen_addr {
-            return Ok(Preflight::AlreadyRunning(Box::new(info)));
-        }
-        return Err(PreflightError::PortHeldByOtherAddress {
-            port,
-            listen_addr: listen_addr.to_string(),
-            other_listen_addr: info.instance.listen_addr,
-        });
+        return existing_instance(listen_addr, info).await;
     }
 
     // 预检 2：端口能否绑定（探测 listener 随即释放，端口让给守护子进程）
@@ -264,7 +282,7 @@ pub async fn preflight(listen_addr: &str) -> Result<Preflight, PreflightError> {
         // 报「被占用」前再 ping 一次，避免把自家正在启动的实例误分类为其他程序占用。
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         if let Ok(info) = daemon::ipc_ping(&port).await {
-            return Ok(Preflight::AlreadyRunning(Box::new(info)));
+            return existing_instance(listen_addr, info).await;
         }
         return Err(PreflightError::Bind {
             listen_addr: listen_addr.to_string(),

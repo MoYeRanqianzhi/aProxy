@@ -78,6 +78,18 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
     // 重复启动；同端口不同地址的实例与本进程不能并存；绑定不了则按错误类别说明
     match preflight(&listen_addr).await {
         Ok(Preflight::Clear) => {}
+        Ok(Preflight::BecameReady(info)) => {
+            if json {
+                print_doc(start_document("started", &info));
+            } else {
+                println!(
+                    "Instance ready: pid {} at {}",
+                    info.instance.pid, info.instance.listen_addr
+                );
+            }
+            return;
+        }
+        Err(PreflightError::Startup(e)) => super::spawn_failure(&e, e.to_string()).exit(json),
         Ok(Preflight::AlreadyRunning(info)) => {
             if json {
                 print_doc(start_document("already_running", &info));

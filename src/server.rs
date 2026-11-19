@@ -200,13 +200,16 @@ pub(crate) async fn serve_forever(
         let control = control.clone();
         tokio::spawn(async move { daemon::serve_ipc(ipc_endpoint, control).await })
     };
+    // 信号订阅从握手一直保持到退出，避免从 starting 转入 serving 时漏掉终止通知。
+    use futures_util::FutureExt as _;
+    let stopping = stop_signal(stop_rx).shared();
     if !state.config.formats.is_empty() {
-        let mut stopping = stop_rx.clone();
         let outcome = tokio::select! {
             result=state.handshake_formats()=>Some(result),
-            _=stopping.changed()=>None,
+            _=stopping.clone()=>None,
         };
         if !matches!(outcome, Some(Ok(()))) {
+            state.retire_formats().await;
             ipc_task.abort();
             let _ = ipc_task.await;
             daemon::remove_registry_files(&actual_addr);
@@ -434,9 +437,9 @@ pub(crate) async fn serve_forever(
     let graceful = {
         let history = state.history.clone();
         let stats = state.stats.clone();
-        let stop_rx = stop_rx.clone();
+        let stopping = stopping.clone();
         async move {
-            stop_signal(stop_rx).await;
+            stopping.await;
             let swapping = stats
                 .swap_until_ms
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -449,13 +452,15 @@ pub(crate) async fn serve_forever(
             result.unwrap();
         }
         _ = async {
-            stop_signal(stop_rx).await;
+            stopping.await;
             tracing::info!("10 秒后强制退出（在途请求将中断）");
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            state.retire_formats().await;
             daemon::remove_registry_files(&actual_addr);
             crate::util::exit(0);
         } => {}
     }
+    state.retire_formats().await;
     // 订阅连接各自把 `closing` 那一行写出去就断开；最多等半秒，不为一个不读的客户端拖住退出
     let closing_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     while state.history.subscribers() > 0 && tokio::time::Instant::now() < closing_deadline {

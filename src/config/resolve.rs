@@ -922,7 +922,7 @@ x-toml = "1"
         );
     }
 
-    /// `[[format]]` 派给请求、响应、心跳三个位置；声明了 retry 的请求程序每次重试都重跑。
+    /// `[[format]]` 保留声明顺序与各条目的阶段集合；同一阶段可由多层依次处理。
     #[test]
     fn formats_preserve_order_and_stage_membership() {
         let text = r#"

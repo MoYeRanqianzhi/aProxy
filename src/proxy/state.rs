@@ -204,6 +204,11 @@ impl AppState {
         Ok(())
     }
 
+    /// 所有程序同时收到 EOF，正常关闭的宽限不随链长或池大小累加。
+    pub async fn retire_formats(&self) {
+        futures_util::future::join_all(self.formats.iter().map(|p| p.shutdown())).await;
+    }
+
     /// 只查看配置，不触碰进程和状态；没有相应阶段就走原来的转发路径。
     pub(super) fn has_format(&self, stage: crate::config::file::Stage) -> bool {
         self.formats.iter().any(|p| p.entry.has_stage(stage))

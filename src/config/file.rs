@@ -395,6 +395,21 @@ fn read_format(ctx: &mut Ctx, entry: &Tbl) -> Option<FormatEntry> {
             "command must not be empty".to_string(),
             json!({ "reason": "empty" }),
         ),
+        #[cfg(windows)]
+        Some(command)
+            if Path::new(command.trim().trim_end_matches([' ', '.']))
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")) =>
+        {
+            ctx.push(
+                "config_invalid_value",
+                &entry.key_path("command"),
+                entry.span_of("command"),
+                "batch files cannot be format commands; put the interpreter in command and the script in args".into(),
+                json!({ "reason": "batch_file" }),
+            )
+        }
         _ => {}
     }
     let name = entry.string(ctx, "name").or_else(|| {
@@ -974,6 +989,28 @@ mod tests {
         parse(text, Path::new("config.toml"))
     }
 
+    /// Windows 的批处理不用隐式 cmd 启动；显式解释器作为真正的子进程不受这个限制。
+    #[cfg(windows)]
+    #[test]
+    fn windows_format_batch_targets_are_rejected_at_validation() {
+        for command in ["tool.cmd", "TOOL.BaT", "tool.CMD."] {
+            let (_, d) = parse_text(&format!(
+                "[[format]]\ncommand='{command}'\nstages=['request']"
+            ));
+            assert!(d.iter().any(|d| {
+                d.code == "config_invalid_value"
+                    && d.message
+                        .contains("interpreter in command and the script in args")
+            }));
+        }
+        assert!(
+            parse_text(
+                "[[format]]\ncommand='interpreter.exe'\nargs=['script']\nstages=['request']"
+            )
+            .1
+            .is_empty()
+        );
+    }
     /// 解析出的诊断，压成 `码 键路径 行号` 方便比对
     fn brief(diagnostics: &[Diagnostic]) -> Vec<String> {
         diagnostics

@@ -2276,6 +2276,13 @@ where
                 let reply = Rejection::InvalidState("stopping").reply();
                 return write_line(&mut writer, &reply).await;
             }
+            if state
+                .stats
+                .starting
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return write_line(&mut writer, &Rejection::InvalidState("starting").reply()).await;
+            }
             // 先置位再组装应答：应答里立即是 swap_prepared，安装器拿这一个应答
             // 就完成 ACK 判定，无需再补一次 ping
             let ttl_ms = ttl_secs

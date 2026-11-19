@@ -117,9 +117,17 @@ async fn persistent_mode_reuses_worker_across_requests() {
 /// 空闲回收后，进程不同但取最小空闲号，仍是 0。
 #[tokio::test]
 async fn idle_worker_is_reaped_after_timeout() {
-    let p = pool(Process::Persistent, "echo", |e| e.worker_idle_secs = 1);
+    let dir = tempfile::tempdir().unwrap();
+    let obs = dir.path().join("events");
+    let p = pool(Process::Persistent, "echo", |e| {
+        // 程序看见 EOF 不表示它已经退出；单进程池让下一次取号等到旧槽真正释放。
+        e.pool_max = 1;
+        e.worker_idle_secs = 1;
+        e.env
+            .insert("ECHO_OBSERVE".into(), obs.display().to_string());
+    });
     let a = worker(call(&p, "a", false).await.unwrap(), "a");
-    tokio::time::sleep(Duration::from_millis(2600)).await;
+    wait_observed(&obs, "eof", 1).await;
     assert!(p.idle.lock().unwrap().is_empty());
     let b = worker(call(&p, "b", false).await.unwrap(), "b");
     assert_ne!(a, b);
@@ -199,12 +207,18 @@ async fn multiline_reply_in_one_batch_is_protocol_error() {
 /// 归还后才多写的一帧由取用前的检查剔除。
 #[tokio::test]
 async fn stray_line_arriving_while_idle_is_evicted_before_reuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let obs = dir.path().join("observed");
     let p = pool(Process::Persistent, "late-stray", |e| {
-        e.args.push("50".into());
+        e.args.push(dir.path().display().to_string());
+        e.env
+            .insert("ECHO_OBSERVE".into(), obs.display().to_string());
         e.pool_max = 1;
     });
     let a = worker(call(&p, "s1", false).await.unwrap(), "s1");
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    let pid = a.split_once('/').unwrap().1;
+    std::fs::write(dir.path().join(format!("release-{pid}")), b"").unwrap();
+    wait_observed(&obs, "stray-written", 1).await;
     assert_ne!(a, worker(call(&p, "s2", false).await.unwrap(), "s2"));
 }
 /// 合法的 fail 不破坏会话。
@@ -222,7 +236,9 @@ async fn idle_worker_that_exited_is_skipped_on_take() {
     });
     let a = worker(call(&p, "d1", false).await.unwrap(), "d1");
     tokio::time::sleep(Duration::from_millis(800)).await;
-    assert_ne!(a, worker(call(&p, "d2", false).await.unwrap(), "d2"));
+    let b = worker(call(&p, "d2", false).await.unwrap(), "d2");
+    assert_ne!(a, b);
+    assert!(a.starts_with("0/") && b.starts_with("0/"), "{a}, {b}");
 }
 /// 复用时遇到 EOF 先交回失败；上层明确派发到新 worker 才会重做。
 #[tokio::test]
@@ -303,6 +319,236 @@ async fn evicted_worker_aborts_even_a_stderr_reader_that_never_reaches_eof() {
     drop(t);
     tokio::time::timeout(Duration::from_secs(2), async {
         while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// 读取由进程自己确认的事件；未写完整的一行留给下次轮询，不用睡眠猜测进程进度。
+async fn wait_observed(path: &Path, event: &str, count: usize) -> Vec<serde_json::Value> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            let events: Vec<_> = text
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|v| v["event"] == event)
+                .collect();
+            if events.len() >= count {
+                return events;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+/// 超时和在途取消都淘汰读过 A 的进程；排队时取消不消耗一个唤醒，也不占试探名额。
+#[tokio::test]
+async fn cancellation_or_timeout_drops_the_exchange_and_queued_cancellation_releases_its_turn() {
+    for cancel in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let obs = dir.path().join("observations");
+        let p = pool(Process::Persistent, "gate-request", |e| {
+            e.pool_max = 1;
+            e.timeout_secs = 1;
+            e.args
+                .push(dir.path().join("release").display().to_string());
+            e.env
+                .insert("ECHO_OBSERVE".into(), obs.display().to_string());
+        });
+        let p1 = p.clone();
+        let first = tokio::spawn(async move { call(&p1, "blocked", false).await });
+        let a = wait_observed(&obs, "request", 1).await;
+        {
+            let mut removed = std::pin::pin!(call(&p, "cancelled-in-queue", false));
+            assert!(futures_util::poll!(&mut removed).is_pending());
+        }
+        if cancel {
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
+        } else {
+            assert!(matches!(first.await.unwrap(), Err(Fault::Timeout)));
+        }
+        let b = worker(call(&p, "second", false).await.unwrap(), "second");
+        assert_ne!(b.split_once('/').unwrap().1, a[0]["pid"].to_string());
+        let second = wait_observed(&obs, "request", 2).await;
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[1]["seq"], 1);
+    }
+}
+
+/// 实际进程收到的 seq 随进程重置；同一个池中的第二次探测不能再抢自己的名额。
+#[tokio::test]
+async fn one_handshake_per_pool_and_sequences_per_live_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let obs = dir.path().join("observed");
+    let p = pool(Process::Persistent, "echo", |e| {
+        e.pool_max = 1;
+        e.env
+            .insert("ECHO_OBSERVE".into(), obs.display().to_string());
+    });
+    let (a, b) = tokio::time::timeout(Duration::from_secs(4), async {
+        tokio::join!(p.probe(), p.probe())
+    })
+    .await
+    .unwrap();
+    a.unwrap();
+    b.unwrap();
+    for (body, fresh) in [("a", false), ("b", false), ("c", true)] {
+        worker(call(&p, body, fresh).await.unwrap(), body);
+    }
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(&obs)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|v: &serde_json::Value| v["event"] != "eof")
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [0, 1, 2, 0, 1]
+    );
+    assert_eq!(events[0]["pid"], events[2]["pid"]);
+    assert_ne!(events[0]["pid"], events[3]["pid"]);
+    assert_eq!(events[3]["pid"], events[4]["pid"]);
+    let bad = pool(Process::Persistent, "bad-seq", |_| {});
+    assert!(matches!(call(&bad, "q", false).await, Err(Fault::Protocol)));
+    assert!(bad.idle.lock().unwrap().is_empty());
+}
+
+/// 一个慢退出进程不能让其他进程多等一个宽限期；闲置回收器也不跟着长间隔继续睡。
+#[tokio::test]
+async fn normal_retirement_sends_parallel_eof_and_drop_ends_the_reaper() {
+    let dir = tempfile::tempdir().unwrap();
+    let obs = dir.path().join("observed");
+    let p = pool(Process::Persistent, "slow-eof", |e| {
+        e.pool_max = 2;
+        e.worker_idle_secs = 86400;
+        e.env
+            .insert("ECHO_OBSERVE".into(), obs.display().to_string());
+    });
+    let (a, b) = tokio::join!(call(&p, "a", false), call(&p, "b", false));
+    let a = worker(a.unwrap(), "a");
+    let b = worker(b.unwrap(), "b");
+    assert_ne!(a, b);
+    tokio::time::timeout(Duration::from_millis(3400), p.shutdown())
+        .await
+        .unwrap();
+    assert_eq!(wait_observed(&obs, "eof", 2).await.len(), 2);
+    let p = pool(Process::Persistent, "echo", |e| e.worker_idle_secs = 86400);
+    p.probe().await.unwrap();
+    let h = p.reaper.get().unwrap().abort_handle();
+    drop(p);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !h.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// 命令搜索忽略不可执行的影子，home/bin 胜过显式 PATH；不存在的 PATH 不补当前目录。
+#[test]
+fn command_lookup_uses_runnable_candidates_and_the_supplied_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let bin = home.join("bin");
+    let other = home.join("path");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    #[cfg(windows)]
+    {
+        std::fs::write(bin.join("tool"), b"shadow").unwrap();
+        std::fs::write(other.join("tool.exe"), b"fixture").unwrap();
+        assert_eq!(
+            program_path("tool", home, Some(other.as_os_str())).unwrap(),
+            other.join("tool.exe")
+        );
+        assert!(program_path("tool", home, None).is_err());
+        std::fs::write(bin.join("tool.exe"), b"fixture").unwrap();
+        assert_eq!(
+            program_path("tool", home, Some(other.as_os_str())).unwrap(),
+            bin.join("tool.exe")
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let earlier = home.join("first");
+        std::fs::create_dir(&earlier).unwrap();
+        for d in [&bin, &earlier, &other] {
+            std::fs::write(d.join("tool"), b"fixture").unwrap();
+        }
+        std::fs::set_permissions(other.join("tool"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let path = std::env::join_paths([earlier, other.clone()]).unwrap();
+        assert_eq!(
+            program_path("tool", home, Some(&path)).unwrap(),
+            other.join("tool")
+        );
+        assert!(program_path("tool", home, None).is_err());
+    }
+}
+
+/// 仅条目自己的 PATH 包含这个工具，验证实际创建进程时也用该环境来解析裸名。
+#[tokio::test]
+async fn probe_resolves_a_bare_name_from_the_entry_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let name = "aproxy-format-private-path-fixture";
+    std::fs::copy(
+        format_echo_path(),
+        temp.path()
+            .join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
+    )
+    .unwrap();
+    let p = pool(Process::Spawn, "echo", |e| {
+        e.command = name.into();
+        e.env
+            .insert("PATH".into(), temp.path().display().to_string());
+    });
+    p.probe().await.unwrap();
+}
+
+/// 即使一份合法应答已读完，归还前可读的额外字节仍是协议错误，EOF 则只是不可复用。
+#[tokio::test]
+async fn return_check_distinguishes_stray_bytes_from_clean_eof() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(Process::Persistent, "late-stray", |e| {
+        e.args.push(dir.path().display().to_string());
+    });
+    let mut turn = p.turn(false).await.unwrap();
+    let frame = Stage::Request(wire::RequestMessage::new(
+        wire::Context::new("q".into()),
+        wire::Delivery::Retry,
+        wire::Request::new("POST".into(), "http://localhost/".into()),
+        wire::Client::new("/".into(), false),
+    ));
+    p.exchange(&mut turn.worker, frame, 2, &turn.ticket)
+        .await
+        .unwrap();
+    let pid = turn.worker.child.as_ref().unwrap().id().unwrap();
+    std::fs::write(dir.path().join(format!("release-{pid}")), b"").unwrap();
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(2), turn.worker.stdout.fill_buf())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(turn.worker.reusable(), Err(Fault::Protocol)));
+    let p = pool(Process::Persistent, "echo", |_| {});
+    let mut t = p.turn(false).await.unwrap();
+    t.worker.stdin.take();
+    // 空切片不会像非空数据留在 BufReader 里；探测函数自己观察到第一次 EOF 即可。
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while t.worker.reusable().unwrap() {
             tokio::task::yield_now().await;
         }
     })

@@ -798,3 +798,241 @@ fn normal_spawn_exit_drains_the_final_stderr_line() {
         "{log}"
     );
 }
+
+/// 启动父进程不阻塞测试，只有专属 home 里的实例才可能出现在随后的 IPC 断言里。
+fn background_start(
+    home: &TestHome,
+    port: u16,
+    up: u16,
+    config: &str,
+) -> (std::process::Child, std::path::PathBuf) {
+    home.stop_on_drop(port);
+    let cfg = home.path().join("startup.toml");
+    std::fs::write(
+        &cfg,
+        format!("base_url='http://127.0.0.1:{up}'\nlisten_addr='127.0.0.1:{port}'\n{config}"),
+    )
+    .unwrap();
+    let child = home
+        .cmd()
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .args(["start", "--json", "--config"])
+        .arg(&cfg)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    (child, cfg)
+}
+/// 等待程序写下握手帧，不依赖创建进程到开始读 stdin 的时延。
+async fn observed_hello(home: &TestHome, name: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+        loop {
+            let file = std::fs::read_to_string(home.path().join(name)).unwrap_or_default();
+            if file
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .any(|v| v["stage"] == "hello")
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// 两个 hello 都到达才释放同一道闸门；persistent 探测的 pid 继续用，spawn 探测确实读到了 EOF。
+#[tokio::test]
+async fn startup_probes_run_in_parallel_and_respect_worker_lifetimes() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[200]).await;
+    let gate = home.path().join("release");
+    let args = ["gate-hello", gate.to_str().unwrap()];
+    let mut cfg = String::new();
+    for (name, process) in [("persist", "persistent"), ("once", "spawn")] {
+        let obs = serde_json::to_string(&home.path().join(format!("{name}-obs"))).unwrap();
+        cfg += &layer(&home, name, "'request'", &args)
+            .replace("process='persistent'", &format!("process='{process}'"))
+            .replace(
+                "env={ ECHO_RECORD=",
+                &format!("env={{ ECHO_OBSERVE={obs}, ECHO_RECORD="),
+            );
+    }
+    let port = free_port();
+    let (parent, _) = background_start(&home, port, up, &cfg);
+    tokio::join!(
+        observed_hello(&home, "persist"),
+        observed_hello(&home, "once")
+    );
+    let run = home.path().join("run");
+    let key = port.to_string();
+    assert!(
+        matches!(aproxy::daemon::ipc_request_in(&run,&key,aproxy::daemon::IpcOp::PREPARE_SWAP).await,Err(aproxy::daemon::IpcError::Remote{code,details,..}) if code=="invalid_state" && details["state"]=="starting")
+    );
+    std::fs::write(gate, b"").unwrap();
+    let out = parent.wait_with_output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        aproxy::daemon::ipc_ping_in(&run, &key).await.unwrap().state,
+        aproxy::daemon::InstanceState::Serving
+    );
+    let once = frames(&home, "once-obs");
+    assert_eq!(once[0]["event"], "hello");
+    assert_eq!(once[1]["event"], "eof");
+    assert_eq!(once[0]["pid"], once[1]["pid"]);
+    let r = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .unwrap()
+        .get(format!("http://127.0.0.1:{port}/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let persist = frames(&home, "persist-obs");
+    assert_eq!(persist.len(), 2);
+    assert_eq!(persist[0]["pid"], persist[1]["pid"]);
+    assert_eq!(persist[1]["seq"], 1);
+    assert_ne!(frames(&home, "once-obs")[2]["pid"], once[0]["pid"]);
+}
+
+/// 启动中的实例拒绝更换；第二个启动者等到失败，不会报告 already_running，也不会再起一个实例。
+#[tokio::test]
+async fn second_start_waits_for_failed_hello_and_prepare_swap_changes_nothing() {
+    let home = TestHome::new();
+    let port = free_port();
+    let cfg = layer(&home, "stuck", "'request'", &["no-hello"]);
+    let (first, path) = background_start(&home, port, free_port(), &cfg);
+    observed_hello(&home, "stuck").await;
+    let run = home.path().join("run");
+    let key = port.to_string();
+    let first_info = aproxy::daemon::ipc_ping_in(&run, &key).await.unwrap();
+    assert_eq!(first_info.state, aproxy::daemon::InstanceState::Starting);
+    let err = aproxy::daemon::ipc_request_in(&run, &key, aproxy::daemon::IpcOp::PREPARE_SWAP)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err,aproxy::daemon::IpcError::Remote{code,details,..} if code=="invalid_state" && details["state"]=="starting")
+    );
+    let mut second = home
+        .cmd()
+        .args(["start", "--json", "--config"])
+        .arg(path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    assert!(second.try_wait().unwrap().is_none());
+    let original = first.wait_with_output().unwrap();
+    let observer = second.wait_with_output().unwrap();
+    assert_eq!(original.status.code(), Some(1));
+    assert_eq!(observer.status.code(), Some(1));
+    let result: Value = serde_json::from_slice(&observer.stdout).unwrap();
+    assert!(result["error"].is_object());
+    assert!(result.get("outcome").is_none());
+    assert_eq!(frames(&home, "stuck").len(), 1);
+}
+
+/// 有答复但不兼容时，可选性不改变退出码；缺失或错误的 seq 是错位而不是正文不合法。
+#[test]
+fn static_hello_errors_and_exits_follow_the_required_optional_table() {
+    for required in [true, false] {
+        for (mode, kind) in [
+            ("wrong-hello-seq", "protocol"),
+            ("missing-seq", "protocol"),
+            ("bad-protocol", "protocol"),
+            ("bad-body-need", "invalid_output"),
+            ("malformed-hello", "invalid_output"),
+        ] {
+            assert_eq!(
+                failure(mode, required, "format_handshake_failed", 3)["kind"],
+                kind
+            );
+        }
+        assert_eq!(
+            failure("missing-stage", required, "format_stage_unsupported", 3)["stages"],
+            serde_json::json!(["request"])
+        );
+        let home = TestHome::new();
+        let entry = format!(
+            "[[format]]\nname='absent'\ncommand='nonexistent-format-test-387'\nstages=['request']\nrequired={required}"
+        );
+        let (_, out) = launch(&home, free_port(), &entry);
+        let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+        if required {
+            assert_eq!(out.status.code(), Some(1));
+            assert_eq!(doc["error"]["details"]["kind"], "spawn");
+        } else {
+            assert!(out.status.success());
+            assert_eq!(
+                doc["instance"]["formats"][0]["breaker"]["last_failure"]["details"]["kind"],
+                "spawn"
+            );
+        }
+    }
+    let (_home, out) = start("exit-hello", false);
+    assert!(out.status.success());
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        doc["instance"]["formats"][0]["breaker"]["last_failure"]["details"]["kind"],
+        "died"
+    );
+}
+
+/// 在握手期间收到停止通知，管道随被取消的探测关闭，程序进程不遗留。Unix 直接送 SIGTERM。
+#[tokio::test]
+async fn stopping_during_hello_cancels_the_probe_and_child() {
+    let home = TestHome::new();
+    let port = free_port();
+    let obs = serde_json::to_string(&home.path().join("probe-obs")).unwrap();
+    let cfg = layer(&home, "probe", "'request'", &["no-hello"]).replace(
+        "env={ ECHO_RECORD=",
+        &format!("env={{ ECHO_OBSERVE={obs}, ECHO_RECORD="),
+    );
+    let (parent, _) = background_start(&home, port, free_port(), &cfg);
+    observed_hello(&home, "probe").await;
+    let run = home.path().join("run");
+    let status = aproxy::daemon::ipc_ping_in(&run, &port.to_string())
+        .await
+        .unwrap();
+    assert_eq!(status.state, aproxy::daemon::InstanceState::Starting);
+    let child_pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(pid) = std::fs::read_to_string(home.path().join("probe-obs"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(s.trim()).ok())
+                .and_then(|v| v["pid"].as_u64())
+            {
+                return pid as u32;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            unsafe { libc::kill(status.instance.pid.try_into().unwrap(), libc::SIGTERM) },
+            0
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        aproxy::daemon::ipc_request_in(&run, &port.to_string(), aproxy::daemon::IpcOp::STOP)
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while aproxy::process::process_exited(child_pid) != Some(true) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!parent.wait_with_output().unwrap().status.success());
+}

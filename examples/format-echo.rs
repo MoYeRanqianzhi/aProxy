@@ -20,6 +20,33 @@ fn unfinished_frame(bytes: usize) {
     std::thread::sleep(Duration::from_secs(12));
 }
 
+/// 将观察结果写到测试指定的日志；先落下已收帧的确认，再由测试释放闸门。
+fn observe(event: &str, seq: Option<u64>) {
+    if let Some(path) = std::env::var_os("ECHO_OBSERVE") {
+        let mut bytes =
+            serde_json::to_vec(&json!({"event":event,"pid":std::process::id(),"seq":seq})).unwrap();
+        bytes.push(b'\n');
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+    }
+}
+/// 只让测试在它观察到指定事实后继续；父测试异常离开时也不会无限占据子进程。
+fn wait_gate(path: &std::path::Path) {
+    let until = std::time::Instant::now() + Duration::from_secs(8);
+    while !path.is_file() {
+        assert!(
+            std::time::Instant::now() < until,
+            "fixture gate not released"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// 每个进程按行处理到 EOF；同批多余帧和延迟多余帧要区分，才能测出两种错位。
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -63,7 +90,13 @@ fn main() {
         } else {
             rx.recv().ok()
         };
-        let Some(line) = line else { break };
+        let Some(line) = line else {
+            observe("eof", None);
+            if mode == "slow-eof" {
+                std::thread::sleep(Duration::from_secs(6));
+            }
+            break;
+        };
         if let Some(path) = std::env::var_os("ECHO_RECORD") {
             let mut bytes = line.as_bytes().to_vec();
             bytes.push(b'\n');
@@ -78,6 +111,7 @@ fn main() {
         let m: Value = serde_json::from_str(&line).unwrap();
         let stage = m["stage"].as_str().unwrap();
         let seq = m["seq"].as_u64().unwrap();
+        observe(stage, Some(seq));
         let mut r = json!({"v":1,"seq":seq});
         if !seen_hello {
             assert_eq!((stage, seq), ("hello", 0));
@@ -92,6 +126,13 @@ fn main() {
                 unfinished_frame(64 * 1024);
                 break;
             }
+            if mode == "gate-hello" {
+                wait_gate(std::path::Path::new(arg));
+            }
+            if mode == "malformed-hello" {
+                println!("not JSON");
+                continue;
+            }
             if mode == "no-hello" {
                 std::thread::sleep(Duration::from_secs(60));
                 break;
@@ -103,6 +144,12 @@ fn main() {
                 std::thread::sleep(delay);
             }
             r = json!({"v":1,"seq":0,"name":"format-echo","version":"1.0","protocol":1,"features":[],"stages":["request","retry","response","heartbeat"]});
+            if mode == "missing-seq" {
+                r.as_object_mut().unwrap().remove("seq");
+            }
+            if mode == "wrong-hello-seq" {
+                r["seq"] = json!(1);
+            }
             if mode == "bad-protocol" {
                 r["protocol"] = json!(2);
             }
@@ -127,6 +174,9 @@ fn main() {
                     mode,
                     "echo"
                         | "inspect"
+                        | "gate-hello"
+                        | "gate-request"
+                        | "slow-eof"
                         | "sleep"
                         | "multiline"
                         | "late-stray"
@@ -156,6 +206,9 @@ fn main() {
                     for _ in 0..57 {
                         eprintln!("small-stderr-line");
                     }
+                }
+                "gate-request" if m["request"]["body"] == "blocked" => {
+                    wait_gate(std::path::Path::new(arg))
                 }
                 "sleep" => std::thread::sleep(delay),
                 "oneshot" if count > 1 || dead => break,
@@ -271,9 +324,11 @@ fn main() {
         }
         out.flush().unwrap();
         if count != 0 && mode == "late-stray" {
-            std::thread::sleep(delay);
+            let dir = std::path::Path::new(arg);
+            wait_gate(&dir.join(format!("release-{}", std::process::id())));
             writeln!(out, "{r}").unwrap();
             out.flush().unwrap();
+            observe("stray-written", Some(seq));
         }
     }
     if mode == "stderr-on-eof" {

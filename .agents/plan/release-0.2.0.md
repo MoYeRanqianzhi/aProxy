@@ -1008,9 +1008,27 @@
     `init_foreground_logging`，B9-7 统一换成 stderr 日志时去掉这个特例。技能与 CHANGELOG 随后补上。
     验证：headless 全量 783 过，headless 与 desktop 两种 clippy 干净（Linux 交叉未跑：这一步没有平台相关代码）。
     偏离：设计稿要每个命令一份 golden；status 的文档里有 pid、时刻等每次不同的值，测试改为断言结构与关键字段。
-  - [ ] B9-5 doctor：换成诊断类型，`--json`，码（`file_permissions_too_open`、`default_header_shared` 等）。
+  - [x] B9-5 doctor：换成诊断类型，`--json`，码（`file_permissions_too_open`、`default_header_shared` 等）。
+    Doctor reports the settings file, distinct config paths, home permissions and unreadable records in that order.
+    It uses startup's layered config diagnostics, names the other files sharing a port, and shows an `unset` command
+    for unknown keys. Text and JSON both exit 3 only for errors; `gc_paused` comes from the same read-only scan as status.
+    Six warning codes extend §2.4 so consumers need not parse prose. Zero `watchdog.stale_after_cycles` is a settings
+    error rather than a silent clamp; both legal watchdog settings that disable or delay recovery remain warnings.
+    Verification (Windows, locked, headless): `cargo test -p aproxy-ipc --locked` (30); `cargo test --no-default-features
+    --locked` with `--test code_table` (1), `--lib doctor` (9), `--lib settings` (39), `--lib find` (3), `--test json_docs`
+    (9), `--test exit_codes doctor` (1) and `--test access_control` (2). No change to the §9.4 document or §9.5 exits.
+    The forward/format warnings still depend on B10d allowing that combination; user documentation is tracked by B9-8.
   - [ ] B9-6 install：`--check`、`--json`（NDJSON）、预检（`install_precheck_failed`、`install_unmanaged_instances`）、
     A5 的四个字段、`halted` 时不拉起续作、与 `--force` 冲突的旗标进 force_contract 的命令行样本。
-  - [ ] B9-7 输出纪律（§9.6）：CLI 的 tracing 写 stderr、默认 WARN；遍历命令树的帮助测试；`RUST_LOG=info` 时 stdout
+  - [x] B9-7 输出纪律（§9.6）：CLI 的 tracing 写 stderr、默认 WARN；遍历命令树的帮助测试；`RUST_LOG=info` 时 stdout
     没有日志行。
+    CLI tracing now goes to stderr (WARN unless `RUST_LOG` overrides it); captured stderr has no ANSI colours.
+    Foreground instances keep their console log. The detached watchdog, `__serve`, desktop and C7 force-install
+    retain their own logging; in particular a force install must keep its established write-error and exit behaviour.
+    The help walk covers the root plus 23 visible command paths. Seven JSON commands each returned one schema-1
+    line under `RUST_LOG=info`; the withheld-credential INFO appeared on stderr and was absent at the default level.
+    Verification (Windows): `cargo fmt --all` and `cargo clippy --workspace --exclude aproxy-desktop --all-targets
+    --no-default-features --locked -- -D warnings` passed. `cargo test --no-default-features --locked --test` targets:
+    `cli_tree` (9), `test_home_check` (2), `exit_codes` (22), `proxy_integration` (117), `restart_integration` (23).
+    No further logging changes pending here. The skill footer for help is tracked separately by W4 (§9.6).
   - [ ] B9-8 文档：技能的 commands.md、compatibility.md（0.2.0 之内的命令行变化）、README、CHANGELOG、安装脚本。

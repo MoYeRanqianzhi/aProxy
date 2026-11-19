@@ -102,11 +102,14 @@ async fn run(cli: Cli) {
         commands::start::handle_serve_cmd(spec).await;
     }
 
-    // 其余命令的日志走 stdout（RUST_LOG 可覆盖）。前台实例没有日志文件，实例记录里的
-    // log_path 因此为空（logs 命令据此立即报「日志输出在它的控制台」）
-    // status --json 的 stdout 只留给文档；设置告警仍由下面的检查写到 stderr。
-    if !matches!(cli.command, Some(Commands::Status { json: true, .. })) {
+    // 前台实例没有日志文件，控制台就是它的日志；分离拉起的看护者沿用这一模式，输出不继承。
+    // 普通命令的 stdout 留给文字或 JSON 文档，诊断日志写 stderr，便于单独捕获。
+    if matches!(&cli.command, Some(Commands::Start(args)) if args.foreground)
+        || matches!(cli.command, Some(Commands::Watchdog { .. }))
+    {
         server::init_foreground_logging();
+    } else {
+        server::init_cli_logging();
     }
 
     // 看护者：进入看护主循环（claim 接管 + 收养 + 健康扫描 + 重拉）。

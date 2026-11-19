@@ -837,22 +837,23 @@ fn concurrent_start_with_release_asset_name_converges_to_one_watchdog() {
                 &bin,
                 &["start", "--config", cfg.display().to_string().as_str()],
             );
-            cmd.env("APROXY_WATCHDOG_SCAN_SECS", "1");
+            cmd.env("APROXY_WATCHDOG_SCAN_SECS", "1")
+                .env("RUST_LOG", "info");
             std::thread::spawn(move || cmd.output().unwrap())
         })
         .collect();
-    // start CLI 拉起看护者时打印「看护者已随实例启动拉起 … pid=N」：收集全部
+    // start CLI 拉起看护者时向 stderr 写 INFO「看护者已随实例启动拉起 … pid=N」：收集全部
     // 被拉起的看护者 pid，用来断言最终只剩一个
     let mut spawned = Vec::new();
     for h in starts {
         let out = h.join().unwrap();
         let stdout = text(&out.stdout);
+        let stderr = text(&out.stderr);
         assert!(
             out.status.success() && stdout.contains("已在后台启动"),
-            "start 应成功: {stdout}{}",
-            text(&out.stderr)
+            "start 应成功: {stdout}{stderr}"
         );
-        for line in stdout
+        for line in stderr
             .lines()
             .filter(|l| l.contains("看护者已随实例启动拉起"))
         {

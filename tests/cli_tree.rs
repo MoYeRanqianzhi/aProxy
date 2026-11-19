@@ -219,3 +219,120 @@ fn upgrade_is_an_alias_of_install() {
         upgrade.replace("aproxy install", "aproxy upgrade")
     );
 }
+
+/// 从真实帮助的 Commands 段发现下一层，既能覆盖以后增加的命令，也防止空遍历误过。
+#[test]
+fn help_tree_prints_help_for_every_command() {
+    // 不含根与 help：顶层 12 个，alias 下 3 个，config、settings 各 4 个。
+    const MIN_COMMAND_PATHS: usize = 23;
+    let home = TestHome::new();
+    let mut pending = vec![Vec::<String>::new()];
+    let mut visited = 0;
+    while let Some(path) = pending.pop() {
+        let mut args: Vec<_> = path.iter().map(String::as_str).collect();
+        args.push("--help");
+        let out = run(&home, &args);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+        assert!(out.stderr.is_empty(), "{args:?}: {}", text(&out.stderr));
+        let help = text(&out.stdout);
+        assert!(!help.trim().is_empty(), "{args:?}");
+        visited += usize::from(!path.is_empty());
+        for line in help
+            .lines()
+            .skip_while(|line| *line != "Commands:")
+            .skip(1)
+            .take_while(|line| !line.is_empty())
+        {
+            let Some(entry) = line.strip_prefix("  ") else {
+                continue;
+            };
+            // 续行是说明，不把它的第一个词当子命令。
+            if entry.starts_with(char::is_whitespace) {
+                continue;
+            }
+            if let Some(name) = entry.split_whitespace().next()
+                && name != "help"
+            {
+                let mut child = path.clone();
+                child.push(name.to_owned());
+                pending.push(child);
+            }
+        }
+    }
+    assert!(
+        visited >= MIN_COMMAND_PATHS,
+        "{visited} < {MIN_COMMAND_PATHS}"
+    );
+}
+
+/// 真的触发一条 INFO，分别检查它所在的输出流和默认级别，而不是仅凭空日志推断两者。
+#[test]
+fn cli_logs_stay_off_stdout() {
+    const INFO: &str = "全局默认里的这项凭据没有继承：它属于另一个目标";
+    let home = TestHome::new();
+    let port = free_port();
+    let cfg = config(&home, "logging", port);
+    let cfg = cfg.to_str().unwrap();
+    home.stop_on_drop(port);
+    // 默认凭据属于另一个上游，启动时必记 INFO，无须为了产生事件而启用看护者。
+    home.settings(r#"{"watchdog":{"enabled":false},"defaults":{"base_url":"https://other.example.com","api_key":"test-only"}}"#);
+    let with_logs = |args: &[&str]| {
+        home.cmd()
+            .env("RUST_LOG", "info")
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let start = ["start", cfg, "--json"];
+    let port_arg = port.to_string();
+    for args in [
+        start.as_slice(),
+        &["status", "--json"],
+        &["alias", "list", "--json"],
+        &["find", "--json"],
+        &["settings", "show", "--json"],
+        &["doctor", "--json"],
+        &["stop", &port_arg, "--json"],
+    ] {
+        let out = with_logs(args);
+        let stdout = text(&out.stdout);
+        let stderr = text(&out.stderr);
+        assert_eq!(stdout.lines().count(), 1, "{args:?}: {stdout}");
+        let doc: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(doc["schema"], 1, "{args:?}: {doc}");
+        assert!(out.status.success(), "{args:?}: {doc} {stderr}");
+        if args == start {
+            assert!(stderr.contains(INFO), "{stderr}");
+            assert!(!stderr.contains('\x1b'), "{stderr:?}");
+        }
+    }
+    for args in [&["status"][..], &["settings", "show"]] {
+        let out = with_logs(args);
+        assert!(out.status.success(), "{args:?}: {}", text(&out.stderr));
+        let stdout = text(&out.stdout);
+        for level in [" INFO ", " WARN ", " DEBUG "] {
+            assert!(!stdout.contains(level), "{stdout}");
+        }
+    }
+    // 同一份配置停掉后再启动，扣下的凭据不变；不设置 RUST_LOG 时不显示那条 INFO。
+    let quiet = home
+        .cmd()
+        .env_remove("RUST_LOG")
+        .args(start)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        quiet.status.success(),
+        "{}{}",
+        text(&quiet.stdout),
+        text(&quiet.stderr)
+    );
+    assert!(!text(&quiet.stderr).contains(INFO) && !text(&quiet.stdout).contains(INFO));
+}

@@ -579,6 +579,21 @@ pub(crate) fn init_force_logging() {
         .init();
 }
 
+/// 普通命令的 stdout 留给人和程序解析主输出，日志单走 stderr；默认 WARN，只报问题，
+/// 可用 RUST_LOG 调整。捕获 stderr 时不加颜色，保留纯文本；忽略内部写错误，避免
+/// 对端关闭 stderr 后报告写失败又触发 panic。
+pub(crate) fn init_cli_logging() {
+    use std::io::IsTerminal;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .log_internal_errors(false)
+        .init();
+}
+
 /// 前台实例的日志初始化：stdout + 标记「本进程无日志文件」（OnceLock 落
 /// None，serve_forever 据此在注册表/恢复记录里写空串 log_path）。
 pub(crate) fn init_foreground_logging() {

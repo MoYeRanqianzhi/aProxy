@@ -814,6 +814,20 @@ pub const TABLE: &[Code] = &[
         &[],
     ),
     exiting(
+        "install_restart_failed",
+        INSTALL,
+        Exit(EXIT_FAILED),
+        "An instance did not start on the new binary, so the rolling restart stopped.",
+        &[req("port", T::Integer)],
+    ),
+    exiting(
+        "install_failed",
+        INSTALL,
+        Exit(EXIT_FAILED),
+        "The install failed for a reason that no more specific code covers.",
+        &[],
+    ),
+    exiting(
         "install_unmanaged_instances",
         INSTALL,
         Exit(EXIT_FAILED),

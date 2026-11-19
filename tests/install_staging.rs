@@ -62,7 +62,8 @@ fn stage_from_rejects_version_mismatch_and_cleans_up() {
 
     let err = aproxy::install::staging::stage_from_in(home.path(), &from, "0.0.0-definitely-not")
         .unwrap_err();
-    assert!(err.contains("版本不匹配"), "{err}");
+    assert_eq!(err.code, "install_probe_failed");
+    assert!(err.message.contains("版本不匹配"), "{err}");
     // 不带病留在 staging：拒绝时已清理 staged 副本
     let leftover = home
         .path()

@@ -48,7 +48,7 @@ pub async fn broadcast_prepare_swap(
     run_dir: &Path,
     ports: &[String],
     state: &mut super::state::InstallState,
-) -> Result<(), String> {
+) -> Result<(), super::InstallFailure> {
     let exe = std::env::current_exe().map_err(|e| format!("无法定位自身可执行文件: {e}"))?;
     let mut unacked: Vec<String> = Vec::new();
     for round in 0..3 {
@@ -74,11 +74,11 @@ pub async fn broadcast_prepare_swap(
                 Err(e @ super::restart::RestartError::NotRestarted(_)) => {
                     tracing::warn!(port = %port, error = %e, "ACK 收敛 restart 失败");
                 }
-                Err(e) => return Err(format!("实例 {port} 收敛重启失败: {e}")),
+                Err(e) => return Err(e.failure(port, format!("实例 {port} 收敛重启失败: {e}"))),
             }
         }
     }
-    Err(format!("实例未表达（已按重试/restart 收敛）: {unacked:?}"))
+    Err(format!("实例未表达（已按重试/restart 收敛）: {unacked:?}").into())
 }
 
 #[cfg(test)]
@@ -106,7 +106,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.contains("59988") && err.contains("59989"),
+            err.message.contains("59988") && err.message.contains("59989"),
             "全部未 ACK 应逐一上报: {err}"
         );
         assert!(!state.halted && state.pending_restores.is_empty());

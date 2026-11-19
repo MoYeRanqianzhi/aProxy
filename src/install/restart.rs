@@ -53,6 +53,40 @@ pub enum RestartError {
     },
 }
 
+impl InstallState {
+    /// 记录一次真正结束的实例滚动。没有停止或拉起实例的错误不虚构结局；
+    /// 失败结局与 halted 一起由外层落盘，成功结局由逐实例的进度写入保存。
+    pub(super) fn record_restart(&mut self, port: &str, result: &Result<u32, RestartError>) {
+        let outcome = match result {
+            Ok(_) => "restarted",
+            Err(RestartError::RolledBack { .. }) => "rolled_back",
+            Err(RestartError::Down { .. }) => "failed",
+            Err(RestartError::NotRestarted(_)) => return,
+        };
+        if let Ok(port) = port.parse() {
+            self.instance_outcomes.push(super::state::InstanceOutcome {
+                port,
+                outcome: outcome.into(),
+            });
+        }
+    }
+}
+
+impl RestartError {
+    /// 新版本拉不起实例才中止滚动；停止前的失败不声称换过二进制或回退过实例。
+    pub(super) fn failure(&self, port: &str, message: String) -> super::InstallFailure {
+        if !matches!(self, Self::NotRestarted(_))
+            && let Ok(port) = port.parse::<u16>()
+        {
+            let mut error = super::InstallFailure::new("install_restart_failed", message);
+            error.details = serde_json::json!({"port": port});
+            error
+        } else {
+            message.into()
+        }
+    }
+}
+
 impl std::fmt::Display for RestartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

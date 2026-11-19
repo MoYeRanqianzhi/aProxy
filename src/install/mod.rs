@@ -17,6 +17,82 @@ pub mod swap;
 
 use std::path::{Path, PathBuf};
 
+/// 普通安装在操作边界确定失败码，交棒与落盘只搬运它，不从翻译后的文字猜原因。
+#[derive(Debug)]
+pub struct InstallFailure {
+    /// 码表里的名字；接手者可能是更高版本，所以保留它写下的原名。
+    pub code: String,
+    /// 人能读懂的原因；也是较早的安装者唯一认得的 last_error。
+    pub message: String,
+    /// 与这个码同一项的详情；没有字段时仍是空对象。
+    pub details: serde_json::Value,
+}
+
+impl InstallFailure {
+    /// 在知道原因的那一层选码；没有结构化详情的失败到这里就构造完了。
+    pub fn new(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            details: serde_json::json!({}),
+        }
+    }
+
+    /// 上层补充操作上下文时保留底层的码与详情。
+    pub fn with_message(self, message: String) -> Self {
+        Self { message, ..self }
+    }
+
+    /// 交棒后使用接手版本留下的失败记录；旧版本没写码时仍然按普通失败退出。
+    pub fn recorded(state: &state::InstallState, message: String) -> Self {
+        Self {
+            code: state
+                .error_code
+                .clone()
+                .unwrap_or_else(|| "install_failed".into()),
+            message,
+            details: state
+                .error_details
+                .clone()
+                .filter(|v| v.is_object())
+                .unwrap_or_else(|| serde_json::json!({})),
+        }
+    }
+
+    /// 安装码都带固定退出码；若接手者比自己新，读不懂的码仍以失败结束。
+    pub fn exit_code(&self) -> i32 {
+        use aproxy_ipc::code::{self, ExitCode, Family};
+        match code::lookup(&self.code)
+            .filter(|c| c.families.contains(&Family::Install))
+            .and_then(|c| c.exit)
+        {
+            Some(ExitCode::Fixed(n)) => i32::from(n),
+            _ => i32::from(code::EXIT_FAILED),
+        }
+    }
+}
+
+impl std::fmt::Display for InstallFailure {
+    /// 日志与已有的文字界面显示原因，不把机器码混进 last_error。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for InstallFailure {
+    /// 没有专用码的本地操作保留原来的完整原因。
+    fn from(message: String) -> Self {
+        Self::new("install_failed", message)
+    }
+}
+
+impl From<InstallFailure> for String {
+    /// 只报告文字的安装接口不解释普通安装码，仍保留完整的人类可读原因。
+    fn from(error: InstallFailure) -> Self {
+        error.message
+    }
+}
+
 /// 二进制安装的一切状态都只放在这里：`<home>/install/`。状态文件（state.rs）、备料与
 /// 下载暂存（staging.rs）、一键安装脚本的下载暂存、unix 的安装宣告（announce.rs）都在
 /// 它下面，此外不写任何地方，没有例外。skill 文档的下载暂存（`<home>/skills/` 下的
@@ -138,20 +214,28 @@ impl Drop for InstallLock {
 /// 一个同名文件再锁上，就会有两个持有者。unix 没有对应的办法，靠所有版本都不删它
 /// （强制安装清空 `<home>/install/` 时也跳过它）。
 pub fn lock_install_in(home: &Path, wait: std::time::Duration) -> Result<InstallLock, String> {
+    lock_for_install(home, wait).map_err(|e| e.message)
+}
+
+/// 普通安装要区分另一进程持锁与系统调用失败；两种安装仍竞争同一个系统锁。
+fn lock_for_install(home: &Path, wait: std::time::Duration) -> Result<InstallLock, InstallFailure> {
     let dir = install_dir_in(home);
     let path = lock_path_in(home);
     let deadline = std::time::Instant::now() + wait;
     loop {
         let failure = match crate::fsx::create_dir_all(&dir).and_then(|()| open_lock_file(&path)) {
-            Err(e) => format!("安装锁 {} 打开失败: {e}", path.display()),
+            Err(e) => format!("安装锁 {} 打开失败: {e}", path.display()).into(),
             Ok(file) => match try_lock_exclusive(&file) {
                 Ok(true) => return Ok(InstallLock { file }),
-                Ok(false) => format!(
-                    "安装锁 {} 被别的进程持有，{} 秒内没有等到（另一个安装正在修改 bin/？）",
-                    path.display(),
-                    wait.as_secs()
+                Ok(false) => InstallFailure::new(
+                    "install_in_progress",
+                    format!(
+                        "安装锁 {} 被别的进程持有，{} 秒内没有等到（另一个安装正在修改 bin/？）",
+                        path.display(),
+                        wait.as_secs()
+                    ),
                 ),
-                Err(e) => format!("安装锁 {} 加锁失败: {e}", path.display()),
+                Err(e) => format!("安装锁 {} 加锁失败: {e}", path.display()).into(),
             },
         };
         if std::time::Instant::now() >= deadline {

@@ -164,6 +164,15 @@ pub struct PendingRestore {
     pub log_path: String,
 }
 
+/// 滚动到一个端口后已经确认的结局；等待交棒的进程无需再查询已被换掉的实例。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InstanceOutcome {
+    /// 实例在安装快照中的端口。
+    pub port: u16,
+    /// 新版本就绪、旧版本拉回、两者都没拉起，分别记为 restarted、rolled_back、failed。
+    pub outcome: String,
+}
+
 /// install.state 全量 schema。全部字段 serde default——旧版本状态文件缺
 /// 字段可读，新字段加入不破坏旧二进制续跑（恢复矩阵「状态文件损坏」之外
 /// 的兼容底线）。
@@ -218,6 +227,21 @@ pub struct InstallState {
     /// 的安装者靠它把接手者的失败原因转告用户。
     #[serde(default)]
     pub last_error: Option<String>,
+    /// 进入 failed 前的阶段，便于区分备料、交换与实例滚动的故障。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_at: Option<InstallPhase>,
+    /// 当前持有现场的安装者版本；交棒时随 pid 一起更新。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installer_version: Option<String>,
+    /// 失败的安装码，等待者按自己的码表决定退出码。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// 码表声明的详情对象，不把结构化诊断塞进给旧安装者的文字。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_details: Option<serde_json::Value>,
+    /// 已完成的实例结局，交棒或进程中断后仍可观察。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instance_outcomes: Vec<InstanceOutcome>,
 }
 
 impl InstallState {
@@ -240,6 +264,11 @@ impl InstallState {
             pending_restores: Vec::new(),
             halted: false,
             last_error: None,
+            failed_at: None,
+            installer_version: Some(env!("CARGO_PKG_VERSION").into()),
+            error_code: None,
+            error_details: None,
+            instance_outcomes: Vec::new(),
         }
     }
 }
@@ -315,14 +344,20 @@ pub fn is_takeable(home: &Path, run_dir: &Path, state: &InstallState, now_secs: 
 
 /// 安装锁下的新建：状态文件不存在或已 stale 才成功（stale 即接管续跑），
 /// 存在且新鲜 → Err（并发安装拒绝）。成功返回带锁信息（pid/时间戳）的状态。
-pub fn create_new_in(home: &Path, mut state: InstallState) -> Result<InstallState, String> {
+pub fn create_new_in(
+    home: &Path,
+    mut state: InstallState,
+) -> Result<InstallState, super::InstallFailure> {
     if let Some(existing) = load_in(home)
         && !is_stale(&existing, now_secs())
     {
-        return Err(format!(
-            "已有安装进行中（target {}，phase {:?}，pid {}）。\
+        return Err(super::InstallFailure::new(
+            "install_in_progress",
+            format!(
+                "已有安装进行中（target {}，phase {:?}，pid {}）。\
              等待其完成，或确认其已中断后等待 {} 秒自动失效",
-            existing.target_version, existing.phase, existing.installer_pid, STALE_AFTER_SECS
+                existing.target_version, existing.phase, existing.installer_pid, STALE_AFTER_SECS
+            ),
         ));
     }
     // 走到这里的残留（stale/不存在）即接管：不询问直接续跑（用户调 install
@@ -347,22 +382,26 @@ pub fn advance_in(home: &Path, state: &mut InstallState, to: InstallPhase) -> Re
             state.phase
         ));
     }
-    state.phase = to;
-    write_in(home, state)
-        .map(|_| ())
-        .map_err(|e| format!("install/state.json 写入失败: {e}"))
+    let previous = std::mem::replace(&mut state.phase, to);
+    write_in(home, state).map_err(|e| {
+        // 写不成就没有推进；随后记 failed_at 要用上一个成功落盘的相位。
+        state.phase = previous;
+        format!("install/state.json 写入失败: {e}")
+    })
 }
 
 /// 失败落盘：记录原因并置 failed（保留现场）。已是 failed（续作重跑再次
 /// 失败）时只刷新原因——failed → failed 不是合法迁移，但原因必须是最新的。
 /// 落盘失败只能放弃（调用方本就在失败路径上，原错误已向上返回）。
-pub fn fail_in(home: &Path, state: &mut InstallState, error: &str) {
-    state.last_error = Some(error.to_string());
-    if state.phase == InstallPhase::Failed {
-        let _ = write_in(home, state);
-    } else {
-        let _ = advance_in(home, state, InstallPhase::Failed);
+pub fn fail_in(home: &Path, state: &mut InstallState, error: &super::InstallFailure) {
+    if state.phase != InstallPhase::Failed || state.failed_at.is_none() {
+        state.failed_at = Some(state.phase);
     }
+    state.last_error = Some(error.message.clone());
+    state.error_code = Some(error.code.clone());
+    state.error_details = Some(error.details.clone());
+    state.phase = InstallPhase::Failed;
+    let _ = write_in(home, state);
 }
 
 /// 删除状态文件（done/aborted 后清场；不存在静默成功）。
@@ -453,6 +492,10 @@ mod tests {
         .unwrap();
         assert_eq!(s.phase, InstallPhase::Marking);
         assert_eq!(s.installer_pid, std::process::id());
+        assert_eq!(
+            s.installer_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
 
         // 新鲜锁：并发安装拒绝
         let err = create_new_in(
@@ -460,7 +503,8 @@ mod tests {
             InstallState::new_marking("0.1.0-alpha.8", InstallSource::From),
         )
         .unwrap_err();
-        assert!(err.contains("已有安装进行中"), "{err}");
+        assert_eq!(err.code, "install_in_progress");
+        assert!(err.message.contains("已有安装进行中"), "{err}");
 
         // 残留接管：updated_at 过期 + pid 已死。直接写文件构造（write_in 会
         // 刷新 updated_at，无法用它伪造过期的锁——这正是它自动刷新的意义）
@@ -584,15 +628,55 @@ mod tests {
         let mut s =
             create_new_in(home, InstallState::new_marking("v", InstallSource::From)).unwrap();
         advance_in(home, &mut s, InstallPhase::Downloading).unwrap();
-        fail_in(home, &mut s, "第一次");
+        fail_in(
+            home,
+            &mut s,
+            &super::super::InstallFailure::new("install_download_failed", "第一次"),
+        );
         let loaded = load_in(home).unwrap();
         assert_eq!(loaded.phase, InstallPhase::Failed);
         assert_eq!(loaded.last_error.as_deref(), Some("第一次"));
         // 已 failed 再失败：phase 不变、原因刷新为最新
-        fail_in(home, &mut s, "第二次");
+        fail_in(
+            home,
+            &mut s,
+            &super::super::InstallFailure::new("install_failed", "第二次"),
+        );
         let loaded = load_in(home).unwrap();
         assert_eq!(loaded.phase, InstallPhase::Failed);
         assert_eq!(loaded.last_error.as_deref(), Some("第二次"));
+    }
+
+    /// 老安装者没有写过扩展字段；重写空字段不改变它认识的形状，带值则保留所有结局。
+    #[test]
+    fn optional_failure_record_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let mut state: InstallState = serde_json::from_str(r#"{"phase":"downloaded"}"#).unwrap();
+        write_in(home, &mut state).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(state_path_in(home)).unwrap()).unwrap();
+        for key in [
+            "failed_at",
+            "installer_version",
+            "error_code",
+            "error_details",
+            "instance_outcomes",
+        ] {
+            assert!(doc.get(key).is_none(), "{key}");
+        }
+        state.installer_version = Some(env!("CARGO_PKG_VERSION").into());
+        state.instance_outcomes.push(InstanceOutcome {
+            port: 90,
+            outcome: "rolled_back".into(),
+        });
+        let mut error = super::super::InstallFailure::new("install_restart_failed", "not ready");
+        error.details = serde_json::json!({"port": 90});
+        fail_in(home, &mut state, &error);
+        assert_eq!(load_in(home).unwrap(), state);
+        assert_eq!(state.failed_at, Some(InstallPhase::Downloaded));
+        assert_eq!(state.error_details, Some(error.details));
+        assert_eq!(state.error_code.as_deref(), Some("install_restart_failed"));
     }
 
     #[test]

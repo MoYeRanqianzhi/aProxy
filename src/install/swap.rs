@@ -132,14 +132,16 @@ pub fn swap_in(
     expected_version: &str,
     keep: Option<&Path>,
     before_retire: impl FnOnce(&Path) -> Result<(), String>,
-) -> Result<SwapOutcome, String> {
+) -> Result<SwapOutcome, super::InstallFailure> {
+    let swap_error = |e| super::InstallFailure::new("install_swap_failed", e);
     let dir = bin_dir_in(home);
     let bin = bin_path_in(home);
-    crate::fsx::create_dir_all(&dir).map_err(|e| format!("bin 目录创建失败: {e}"))?;
+    crate::fsx::create_dir_all(&dir).map_err(|e| swap_error(format!("bin 目录创建失败: {e}")))?;
 
     // 入口兜底脚本先于交换就位：只在交换之后才写，就保护不了这一次的空窗
     #[cfg(windows)]
-    ensure_fallback_scripts_in(home).map_err(|e| format!("入口兜底脚本写入失败: {e}"))?;
+    ensure_fallback_scripts_in(home)
+        .map_err(|e| swap_error(format!("入口兜底脚本写入失败: {e}")))?;
 
     sweep_residue_in(home, keep);
 
@@ -159,7 +161,7 @@ pub fn swap_in(
     }
 
     // 1. 新文件以唯一临时名落进 bin：与 bin 同目录，最后一步改名必然在同一个卷上
-    let tmp = copy_to_unique(source, &dir, TMP_PREFIX)?;
+    let tmp = copy_to_unique(source, &dir, TMP_PREFIX).map_err(swap_error)?;
 
     // 2. 旧二进制让位（bin 里没有二进制：首次安装；续作重入：旧二进制已在 keep，见上）
     let old = if resumed.is_some() {
@@ -169,7 +171,7 @@ pub fn swap_in(
             Ok(old) => Some(old),
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp);
-                return Err(e);
+                return Err(swap_error(e));
             }
         }
     } else {
@@ -179,17 +181,19 @@ pub fn swap_in(
     // 3. 新二进制就位。unix 是一步原子替换；Windows 上 bin 此刻已空，失败就把旧的改回去
     if let Err(e) = with_retries(|| std::fs::rename(&tmp, &bin)) {
         let _ = std::fs::remove_file(&tmp);
+        let unchanged = format!("新二进制落位失败，bin 未改动: {e}");
         #[cfg(windows)]
-        if let Some(old) = &old
-            && let Err(back) = move_no_replace(old, &bin)
-        {
-            return Err(format!(
-                "新二进制落位失败（{e}），把旧二进制改回 {} 也失败（{back}）：旧二进制现在在 {}",
-                bin.display(),
-                old.display()
-            ));
+        if let Some(old) = &old {
+            return match move_no_replace(old, &bin) {
+                Ok(()) => Err(super::InstallFailure::new("install_rolled_back", unchanged)),
+                Err(back) => Err(swap_error(format!(
+                    "新二进制落位失败（{e}），把旧二进制改回 {} 也失败（{back}）：旧二进制现在在 {}",
+                    bin.display(),
+                    old.display()
+                ))),
+            };
         }
-        return Err(format!("新二进制落位失败，bin 未改动: {e}"));
+        return Err(swap_error(unchanged));
     }
     crate::install::staging::ensure_executable(&bin);
 
@@ -206,15 +210,25 @@ fn verify_placed(
     dir: &Path,
     expected_version: &str,
     old: Option<&Path>,
-) -> Result<(), String> {
+) -> Result<(), super::InstallFailure> {
     let verified = match crate::install::staging::probe_version(bin) {
         Ok(v) if v == expected_version => Ok(()),
         Ok(v) => Err(format!("自报版本 {v}，应为 {expected_version}")),
-        Err(e) => Err(e),
+        Err(e) => Err(e.message),
     };
     verified.map_err(|e| match roll_back(bin, dir, old) {
-        Ok(()) => format!("落位后核对失败，已换回原来的二进制: {e}"),
-        Err(back) => format!("落位后核对失败（{e}），换回原来的二进制也失败: {back}"),
+        Ok(()) => super::InstallFailure::new(
+            if old.is_some() {
+                "install_rolled_back"
+            } else {
+                "install_probe_failed"
+            },
+            format!("落位后核对失败，已换回原来的二进制: {e}"),
+        ),
+        Err(back) => super::InstallFailure::new(
+            "install_swap_failed",
+            format!("落位后核对失败（{e}），换回原来的二进制也失败: {back}"),
+        ),
     })
 }
 

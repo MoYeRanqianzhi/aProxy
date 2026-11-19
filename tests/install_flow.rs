@@ -139,8 +139,8 @@ fn install_from_without_instances_fast_path() {
         "install 应成功: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // 安装者在接手者进入 cleaning 时就以 0 退出（Windows 上让位的旧二进制可能是它
-    // 自己的镜像，它不退出就删不掉），状态文件稍后由接手者清掉
+    // 看到 done 即可退出；接手者稍后删除状态文件（Windows 上让位的旧镜像可能要等
+    // 安装者退出才删得掉）。
     let state = aproxy::install::state::state_path_in(&env.home());
     let deadline = Instant::now() + Duration::from_secs(30);
     while state.exists() && Instant::now() < deadline {
@@ -470,8 +470,8 @@ fn adopt_migrates_foreign_instance() {
     assert!(old_pid != 0, "外域实例未就绪");
 
     // --adopt：当前进程（CARGO_BIN_EXE）作为源收编
-    // CLI 交棒后会等接手者到达终点（终验通过即 cleaning）才以 0 退出——
-    // 退出码即结局；此后只剩接手者删 .old/staging 与状态文件
+    // CLI 交棒后会等接手者到达终点（状态为 done 或已清场）才以 0 退出——
+    // 退出码即结局；此后只可能剩下状态文件清场与被等待者占用的旧镜像
     let out = env
         .install_cmd(&["--adopt", "--no-skills"])
         .output()

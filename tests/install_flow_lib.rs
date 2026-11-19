@@ -569,7 +569,10 @@ async fn only_the_named_successor_takes_over_a_live_install() {
         let err = aproxy::install::flow::continue_install(home, &run_dir, handover_from)
             .await
             .expect_err("未被指名的续作不得接手");
-        assert!(err.contains("安装仍在进行"), "{handover_from:?}: {err}");
+        assert!(
+            err.message.contains("安装仍在进行"),
+            "{handover_from:?}: {err}"
+        );
     }
     let untouched = aproxy::install::state::load_in(home).unwrap();
     assert_eq!(
@@ -595,6 +598,8 @@ async fn only_the_named_successor_takes_over_a_live_install() {
 /// APROXY_HOME（restart 原语 spawn 的隔代守护只继承进程 env）。
 fn live_home() -> TestHome {
     let home = TestHome::new();
+    // 续作只测二进制与实例，不能让并行的 skill 更新访问真实发布源。
+    home.settings(r#"{"watchdog":{"enabled":false},"update":{"skill_auto_update":false}}"#);
     unsafe { std::env::set_var("APROXY_HOME", home.path()) };
     std::fs::create_dir_all(home.path().join("run")).unwrap();
     home
@@ -669,6 +674,7 @@ fn simulate_swap(home: &Path, new_bin: impl FnOnce(&Path)) -> std::path::PathBuf
 fn swapped_state(home: &Path, port: u16, old: &Path, bin: &Path) {
     let mut state = InstallState::new_marking("99.0.0", InstallSource::From);
     state.phase = InstallPhase::Swapped;
+    state.installer_version = None;
     state.instance_snapshot = vec![port.to_string()];
     state.old_path = Some(old.display().to_string());
     state.from_path = Some(bin.display().to_string());
@@ -739,7 +745,7 @@ async fn rollback_case(kind: BrokenNew) {
     .expect("续作不应挂死")
     .expect_err("新二进制起不来，续作应失败");
     assert!(
-        err.contains("旧二进制"),
+        err.message.contains("旧二进制"),
         "错误应说明已用旧二进制拉回: {err}"
     );
 
@@ -765,6 +771,16 @@ async fn rollback_case(kind: BrokenNew) {
     // 状态：failed + halted + 原因；在途清单已清（实例已恢复）
     let st = aproxy::install::state::load_in(home).expect("failed 现场保留");
     assert_eq!(st.phase, InstallPhase::Failed);
+    assert_eq!(st.failed_at, Some(InstallPhase::Restarting));
+    assert_eq!(
+        st.installer_version.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(st.error_code.as_deref(), Some("install_restart_failed"));
+    assert_eq!(st.error_details, Some(serde_json::json!({"port": port})));
+    assert_eq!(st.instance_outcomes.len(), 1);
+    assert_eq!(st.instance_outcomes[0].port, port);
+    assert_eq!(st.instance_outcomes[0].outcome, "rolled_back");
     assert!(st.halted, "实例级失败应置 halted");
     assert!(st.last_error.is_some_and(|e| e.contains("旧二进制")));
     assert!(
@@ -776,7 +792,7 @@ async fn rollback_case(kind: BrokenNew) {
     let err2 = aproxy::install::flow::continue_install(home, &run_dir, None)
         .await
         .expect_err("halted 后续作应拒绝");
-    assert!(err2.contains("不自动重试"), "{err2}");
+    assert!(err2.message.contains("不自动重试"), "{err2}");
     let again = aproxy::daemon::ipc_ping_in(&run_dir, &port.to_string())
         .await
         .expect("实例应仍在线");
@@ -891,7 +907,10 @@ async fn rolling_restart_keeps_restore_when_rollback_also_fails() {
     .await
     .expect("续作不应挂死")
     .expect_err("新旧二进制都起不来，续作应失败");
-    assert!(err.contains("aproxy restore"), "错误应指引 restore: {err}");
+    assert!(
+        err.message.contains("aproxy restore"),
+        "错误应指引 restore: {err}"
+    );
     let _ = child.wait();
 
     assert!(
@@ -907,6 +926,14 @@ async fn rolling_restart_keeps_restore_when_rollback_also_fails() {
     );
     let st = aproxy::install::state::load_in(home).unwrap();
     assert_eq!(st.phase, InstallPhase::Failed);
+    assert_eq!(st.failed_at, Some(InstallPhase::Restarting));
+    assert_eq!(
+        st.installer_version.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(st.error_code.as_deref(), Some("install_restart_failed"));
+    assert_eq!(st.instance_outcomes.len(), 1);
+    assert_eq!(st.instance_outcomes[0].outcome, "failed");
     assert!(st.halted);
     assert!(
         st.pending_restores.is_empty(),

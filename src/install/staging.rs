@@ -5,6 +5,7 @@
 //! 原子性的同卷前提；备料文件保留至 done/abort 才清理（它是 swapping 中断
 //! 的恢复源）。
 
+use super::InstallFailure;
 use std::path::{Path, PathBuf};
 
 /// staging 备料目录：`<home>/install/staging/<目标版本>/`。在线渠道的下载暂存
@@ -59,8 +60,11 @@ pub const VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// 读取二进制自报版本：在本机执行它的 `--version`（[`run_version`]），按永久格式（C5，
 /// 见 `crate::VERSION_LINE`）取版本号。不能运行、超时、或输出不是这一格式 → Err——它
 /// 不配作为安装源。
-pub fn probe_version(bin: &Path) -> Result<String, String> {
-    version_of(bin, &run_version(bin)?)
+pub fn probe_version(bin: &Path) -> Result<String, InstallFailure> {
+    version_of(
+        bin,
+        &run_version(bin).map_err(|e| InstallFailure::new("install_probe_failed", e))?,
+    )
 }
 
 /// 在本机执行 `bin --version`（最多 [`VERSION_TIMEOUT`]），返回它的标准输出。跑不起来、
@@ -148,7 +152,7 @@ pub fn is_loader_failure(error: &str) -> bool {
 
 /// 从 `bin --version` 的输出里取版本号：首行是永久格式（C5）就取出来；是 0.1.x 的
 /// 格式就按版本下限说明它为什么装不了、怎样回到 0.1.x；其余的报格式不对。
-pub fn version_of(bin: &Path, stdout: &str) -> Result<String, String> {
+pub fn version_of(bin: &Path, stdout: &str) -> Result<String, InstallFailure> {
     if let Some(version) = parse_version_line(stdout) {
         return Ok(version);
     }
@@ -161,11 +165,17 @@ pub fn version_of(bin: &Path, stdout: &str) -> Result<String, String> {
         .and_then(|rest| rest.split(char::is_whitespace).next())
         .and_then(|version| semver::Version::parse(version).ok());
     if let Some(Err(e)) = legacy.map(|version| super::check_floor(&version)) {
-        return Err(format!("{}：{e}", bin.display()));
+        return Err(InstallFailure::new(
+            "install_below_floor",
+            format!("{}：{e}", bin.display()),
+        ));
     }
-    Err(format!(
-        "{} --version 的输出不是 `aproxy v<版本> (…)`（0.2.0 起每个版本都这样输出）: {stdout:?}",
-        bin.display()
+    Err(InstallFailure::new(
+        "install_probe_failed",
+        format!(
+            "{} --version 的输出不是 `aproxy v<版本> (…)`（0.2.0 起每个版本都这样输出）: {stdout:?}",
+            bin.display()
+        ),
     ))
 }
 
@@ -192,9 +202,9 @@ pub fn stage_from_in(
     home: &Path,
     from: &Path,
     target_version: &str,
-) -> Result<StagedBinary, String> {
+) -> Result<StagedBinary, InstallFailure> {
     if !from.is_file() {
-        return Err(format!("源二进制不存在: {}", from.display()));
+        return Err(format!("源二进制不存在: {}", from.display()).into());
     }
     let dir = staging_dir_in(home, target_version);
     crate::fsx::create_dir_all(&dir).map_err(|e| format!("staging 目录创建失败: {e}"))?;
@@ -206,9 +216,12 @@ pub fn stage_from_in(
     let probed = probe_version(&staged)?;
     if probed != target_version {
         let _ = std::fs::remove_file(&staged);
-        return Err(format!(
-            "版本不匹配：{} 自报 {probed}，目标 {target_version}",
-            from.display()
+        return Err(InstallFailure::new(
+            "install_probe_failed",
+            format!(
+                "版本不匹配：{} 自报 {probed}，目标 {target_version}",
+                from.display()
+            ),
         ));
     }
     Ok(StagedBinary {
@@ -294,7 +307,7 @@ mod tests {
     fn stage_from_rejects_missing_source() {
         let dir = tempfile::tempdir().unwrap();
         let err = stage_from_in(dir.path(), &dir.path().join("no-such.exe"), "0.1.0").unwrap_err();
-        assert!(err.contains("不存在"), "{err}");
+        assert!(err.message.contains("不存在"), "{err}");
     }
 
     /// 动态加载器的三种报错（glibc 的 ld.so 原样输出，经 run_version 包进错误里）才算缺系统库

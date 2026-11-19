@@ -221,14 +221,15 @@ pub fn check_downgrade(
     target: &str,
     current: &semver::Version,
     allow_downgrade: bool,
-) -> Result<semver::Version, String> {
+) -> Result<semver::Version, crate::install::InstallFailure> {
     let t = semver::Version::parse(target)
         .map_err(|e| format!("版本号 {target} 非法（semver 解析失败: {e}）"))?;
-    super::check_floor(&t)?;
+    super::check_floor(&t).map_err(|e| super::InstallFailure::new("install_below_floor", e))?;
     if t < *current && !allow_downgrade {
         return Err(format!(
             "目标版本 {target} 低于当前 {current}。确认要降级请加 --allow-downgrade。"
-        ));
+        )
+        .into());
     }
     Ok(t)
 }
@@ -500,10 +501,12 @@ pub async fn fetch_artifact(
     chain: &[ChainStep],
     artifact: Artifact,
     dest_dir: &Path,
-) -> Result<Fetched, String> {
+) -> Result<Fetched, super::InstallFailure> {
     crate::fsx::create_dir_all(dest_dir).map_err(|e| format!("下载目录创建失败: {e}"))?;
     let asset = artifact.asset_name(ctx.target, ctx.variant, ctx.cpu_suffix);
     let mut errors = Vec::new();
+    let mut missing_only = !chain.is_empty();
+    let mut checksum = false;
     for step in chain {
         for attempt in 0..3 {
             let dest = dest_dir.join(format!(
@@ -517,8 +520,12 @@ pub async fn fetch_artifact(
             let r = match step {
                 ChainStep::Github => github::fetch(ctx, artifact, &dest).await,
                 ChainStep::Npm => npmpkg::fetch(ctx, artifact, &dest).await,
-                ChainStep::Binstall => crates::fetch(ctx, artifact, &dest).await,
-                ChainStep::Cargo => crates::fetch_build(ctx, artifact, &dest).await,
+                ChainStep::Binstall => crates::fetch(ctx, artifact, &dest)
+                    .await
+                    .map_err(Into::into),
+                ChainStep::Cargo => crates::fetch_build(ctx, artifact, &dest)
+                    .await
+                    .map_err(Into::into),
                 ChainStep::Url { url } => fetch_url_template(ctx, url, artifact, &dest).await,
             };
             match r {
@@ -536,6 +543,8 @@ pub async fn fetch_artifact(
                 }
                 Err(e) => {
                     let _ = std::fs::remove_file(&dest);
+                    missing_only &= e.code == "install_version_not_found";
+                    checksum |= e.code == "install_checksum_mismatch";
                     if attempt == 2 {
                         errors.push(format!("[{}] {e}", step.name()));
                         break;
@@ -544,9 +553,20 @@ pub async fn fetch_artifact(
             }
         }
     }
-    Err(format!(
-        "下载链条全失败（asset {asset}）:\n  {}",
-        errors.join("\n  ")
+    // 镜像缺少一个产物不等于这个版本不存在；只有各次失败都确认版本缺失才报未找到。
+    let code = if checksum {
+        "install_checksum_mismatch"
+    } else if missing_only {
+        "install_version_not_found"
+    } else {
+        "install_download_failed"
+    };
+    Err(super::InstallFailure::new(
+        code,
+        format!(
+            "下载链条全失败（asset {asset}）:\n  {}",
+            errors.join("\n  ")
+        ),
     ))
 }
 
@@ -558,7 +578,7 @@ async fn fetch_url_template(
     template: &str,
     artifact: Artifact,
     dest: &Path,
-) -> Result<Fetched, String> {
+) -> Result<Fetched, super::InstallFailure> {
     let url = ctx.fill_template(template, artifact);
     download_to(&ctx.client, &url, dest).await?;
     // 弱档校验尝试：<url>.sha256 拼得出且下载成功 → 比对
@@ -581,7 +601,10 @@ async fn fetch_url_template(
                 .to_lowercase();
             if expected != sum {
                 let _ = std::fs::remove_file(dest);
-                return Err(format!("sha256 不匹配（期望 {expected}，实际 {sum}）"));
+                return Err(super::InstallFailure::new(
+                    "install_checksum_mismatch",
+                    format!("sha256 不匹配（期望 {expected}，实际 {sum}）"),
+                ));
             }
         }
         None => {
@@ -811,11 +834,12 @@ mod tests {
         assert!(check_downgrade("0.3.0-alpha.1", &v("0.2.0"), false).is_ok());
         // 真降级：拒绝，--allow-downgrade 放行
         let err = check_downgrade("0.2.0-alpha.17", &v("0.2.0"), false).unwrap_err();
-        assert!(err.contains("--allow-downgrade"), "{err}");
+        assert!(err.message.contains("--allow-downgrade"), "{err}");
         assert!(check_downgrade("0.2.0-alpha.17", &v("0.2.0"), true).is_ok());
         // 低于 0.2.0 的下限：--allow-downgrade 也放不过去
         let err = check_downgrade("0.1.0", &v("0.2.0"), true).unwrap_err();
-        assert!(err.contains("0.1.x"), "{err}");
+        assert_eq!(err.code, "install_below_floor");
+        assert!(err.message.contains("0.1.x"), "{err}");
         // 非法版本号：明确报错（不是 panic）
         assert!(check_downgrade("latest-ish", &v("0.2.0"), true).is_err());
     }
@@ -854,8 +878,7 @@ mod tests {
             variant: crate::install::force::VARIANT_DESKTOP,
             cpu_suffix: "",
         };
-        // github/npm 走真实网络（不可达即失败）+ url 模板指向本地不存在的
-        // 端口——链条全失败时错误应汇总各级
+        // 两个 URL 模板都指向本地关闭的端口，不访问发布源，也能验证错误汇总。
         let dir = tempfile::tempdir().unwrap();
         let chain = vec![
             ChainStep::Url {
@@ -868,6 +891,10 @@ mod tests {
         let err = fetch_artifact(&ctx, &chain, Artifact::Binary, dir.path())
             .await
             .unwrap_err();
-        assert!(err.contains("全失败") && err.contains("[url]"), "{err}");
+        assert_eq!(err.code, "install_download_failed");
+        assert!(
+            err.message.contains("全失败") && err.message.contains("[url]"),
+            "{err}"
+        );
     }
 }

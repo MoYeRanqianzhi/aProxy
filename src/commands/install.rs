@@ -4,6 +4,13 @@
 //! 中断、中断点不留烂摊子。计划全文见 `.agents/plan/install-v1.md`。
 
 use aproxy::cli::InstallArgs;
+use aproxy::install::InstallFailure;
+
+/// 安装者把原因写给用户，按安装码退出；提前失败时也不伪造安装状态。
+fn fail(error: InstallFailure) -> ! {
+    eprintln!("[ERROR] {error}");
+    crate::util::exit(error.exit_code())
+}
 
 /// `install --force` / `upgrade --force`（永久兼容契约 C7、C8，流程见
 /// aproxy::install::force）。main 在读配置与 settings.json 之前就分流到这里。
@@ -86,7 +93,7 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
             }
             Err(e) => {
                 tracing::error!(error = %e, "install 续作失败（现场已保留，等待下次续作）");
-                crate::util::exit(1);
+                crate::util::exit(e.exit_code());
             }
         }
     }
@@ -102,33 +109,33 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
     // 这个变体（与 install --force --from 同一语义）
     if let Some(from) = &args.from {
         let from_path = aproxy::settings::expand_path(from);
-        let probed = aproxy::install::staging::run_version(&from_path).and_then(|output| {
-            let target = aproxy::install::staging::version_of(&from_path, &output)?;
-            Ok((target, output))
-        });
+        let probed = aproxy::install::staging::run_version(&from_path)
+            .map_err(|e| InstallFailure::new("install_probe_failed", e))
+            .and_then(|output| {
+                let target = aproxy::install::staging::version_of(&from_path, &output)?;
+                Ok((target, output))
+            });
         let (target, output) = match probed {
             Ok(probed) => probed,
-            Err(e) => {
-                eprintln!("[ERROR] {e}");
-                crate::util::exit(1);
-            }
+            Err(e) => fail(e),
         };
         if let Some(want) = args.variant.as_deref() {
             let line = aproxy::install::force::VersionLine::parse(&output)
                 .expect("version_of 认得的输出 VersionLine 也认得");
             if line.variant.as_deref() != Some(want) {
-                eprintln!(
-                    "[ERROR] {} 是 {} 版本，与 --variant {want} 不符",
-                    from_path.display(),
-                    line.variant.as_deref().unwrap_or("未知变体")
-                );
-                crate::util::exit(1);
+                fail(InstallFailure::new(
+                    "install_probe_failed",
+                    format!(
+                        "{} 是 {} 版本，与 --variant {want} 不符",
+                        from_path.display(),
+                        line.variant.as_deref().unwrap_or("未知变体")
+                    ),
+                ));
             }
         }
         let version = semver::Version::parse(&target).expect("version_of 只返回合法的 semver");
         if let Err(e) = aproxy::install::check_floor(&version) {
-            eprintln!("[ERROR] {e}");
-            crate::util::exit(1);
+            fail(InstallFailure::new("install_below_floor", e));
         }
         let plan = aproxy::install::flow::InstallPlan {
             target_version: target,
@@ -152,16 +159,12 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
         let self_exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("[ERROR] 无法定位自身可执行文件: {e}");
-                crate::util::exit(1);
+                fail(format!("无法定位自身可执行文件: {e}").into());
             }
         };
         let target = match aproxy::install::staging::probe_version(&self_exe) {
             Ok(v) => v,
-            Err(e) => {
-                eprintln!("[ERROR] {e}");
-                crate::util::exit(1);
-            }
+            Err(e) => fail(e),
         };
         let plan = aproxy::install::flow::InstallPlan {
             target_version: target,
@@ -239,10 +242,7 @@ async fn run_skills_only(args: &InstallArgs) {
         args.cpu.as_deref(),
     ) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("[ERROR] {e}");
-            crate::util::exit(1);
-        }
+        Err(e) => fail(InstallFailure::new("install_download_failed", e)),
     };
     let version = match args.version.as_deref() {
         None | Some("latest") => {
@@ -261,7 +261,9 @@ async fn run_skills_only(args: &InstallArgs) {
                 Err(gh_err) => {
                     eprintln!("[ERROR] {gh_err}");
                     eprintln!("可尝试：--skills-only <具体版本号>（跳过 latest 查询）。");
-                    crate::util::exit(1);
+                    crate::util::exit(
+                        InstallFailure::new("install_download_failed", gh_err).exit_code(),
+                    );
                 }
             }
         }
@@ -278,11 +280,10 @@ async fn run_skills_only(args: &InstallArgs) {
                 aproxy::install::skills::skill_dir_in(&home).display()
             );
         }
-        _ => {
-            eprintln!(
-                "[ERROR] skill 更新失败（非强制支线，二进制安装不受影响）。可重试本命令或检查下载链条/代理配置。"
-            );
-            crate::util::exit(1);
+        outcome => {
+            fail(outcome.failure.expect("失败结局带原因").with_message(
+                "skill 更新失败（非强制支线，二进制安装不受影响）。可重试本命令或检查下载链条/代理配置。".into(),
+            ));
         }
     }
 }
@@ -308,10 +309,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         args.cpu.as_deref(),
     ) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("[ERROR] {e}");
-            crate::util::exit(1);
-        }
+        Err(e) => fail(InstallFailure::new("install_download_failed", e)),
     };
     let own_variant = ctx.variant;
     let explicit_variant = args.variant.is_some();
@@ -340,7 +338,9 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
                     eprintln!(
                         "可尝试：install <具体版本号>（跳过 latest 查询），或 --download-proxy <URL> 更换出口。"
                     );
-                    crate::util::exit(1);
+                    crate::util::exit(
+                        InstallFailure::new("install_download_failed", gh_err).exit_code(),
+                    );
                 }
             };
             match decide_latest(&current, candidate.as_deref()) {
@@ -386,16 +386,14 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     if let Err(e) =
         aproxy::install::download::check_downgrade(&target, &current, args.allow_downgrade)
     {
-        eprintln!("[ERROR] {e}");
-        crate::util::exit(1);
+        fail(e);
     }
 
     // 管辖检查与 --from 同一道（见 run_plan），放在下载之前：bin 外的实例本就
     // 不该被滚动到 `<home>/bin`，没必要先下载一个注定装不上的产物。放在版本
     // 决议之后：已是最新时什么都不会发生，不必拦
     if let Err(e) = aproxy::install::flow::check_jurisdiction(run_dir, home, false).await {
-        eprintln!("[ERROR] {e}");
-        crate::util::exit(1);
+        fail(e.into());
     }
 
     // 下载链条：产物落 install/staging/<版本>/（与 --from 的备料同一位置）
@@ -418,7 +416,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     enum DownloadOutcome {
         Ok(aproxy::install::download::Fetched),
         VerifyFailed(String),
-        ChainFailed(String),
+        ChainFailed(InstallFailure),
     }
     async fn download_verified(
         ctx: &aproxy::install::download::DownloadCtx,
@@ -456,16 +454,19 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         }
         // 变体不符是产物与名字对不上（例如 url 模板指错了文件），换一个产物也不会好
         if line.variant.as_deref() != Some(ctx.variant) {
-            return DownloadOutcome::ChainFailed(format!(
-                "下载的 {} 自报变体 {}，不是要装的 {}",
-                ctx.binary_asset(),
-                line.variant.as_deref().unwrap_or("未知"),
-                ctx.variant
+            return DownloadOutcome::ChainFailed(InstallFailure::new(
+                "install_probe_failed",
+                format!(
+                    "下载的 {} 自报变体 {}，不是要装的 {}",
+                    ctx.binary_asset(),
+                    line.variant.as_deref().unwrap_or("未知"),
+                    ctx.variant
+                ),
             ));
         }
         DownloadOutcome::Ok(fetched)
     }
-    let mut failures: Vec<String> = Vec::new();
+    let mut failures: Vec<InstallFailure> = Vec::new();
     let mut installed = None;
     // 有带界面的产物下载下来了、却被动态加载器挡在 main 之前（本机缺系统库，见
     // staging::is_loader_failure）；超时、输出不对之类的失败与系统库无关，不算
@@ -486,7 +487,10 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
             DownloadOutcome::VerifyFailed(e) => {
                 desktop_unusable |= attempt.variant == VARIANT_DESKTOP
                     && aproxy::install::staging::is_loader_failure(&e);
-                failures.push(format!("{} 在本机不可运行（{e}）", attempt.binary_asset()));
+                failures.push(InstallFailure::new(
+                    "install_probe_failed",
+                    format!("{} 在本机不可运行（{e}）", attempt.binary_asset()),
+                ));
             }
             DownloadOutcome::ChainFailed(e) => {
                 desktop_not_fetched = attempt.variant == VARIANT_DESKTOP;
@@ -514,7 +518,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         eprintln!(
             "可尝试：--download-proxy <URL> 配置下载代理，或在 settings.json 配置 download_chain（含 url 模板 CDN 通道，文档见 README）。"
         );
-        crate::util::exit(1);
+        crate::util::exit(failures.last().expect("每次下载尝试都有结果").exit_code());
     };
     if installed_variant != attempts[0].variant {
         println!(
@@ -551,7 +555,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
 /// 是退出码 0，agent 会以为升级成功。
 async fn report_outcome(
     home: &std::path::Path,
-    result: Result<aproxy::install::flow::FlowExit, String>,
+    result: Result<aproxy::install::flow::FlowExit, InstallFailure>,
 ) -> ! {
     let done_msg = || {
         println!(
@@ -574,14 +578,14 @@ async fn report_outcome(
                 Err(e) => {
                     eprintln!("[ERROR] 安装失败: {e}");
                     print_failure_guidance(home);
-                    crate::util::exit(1);
+                    crate::util::exit(e.exit_code());
                 }
             }
         }
         Err(e) => {
             eprintln!("[ERROR] 安装失败: {e}");
             print_failure_guidance(home);
-            crate::util::exit(1);
+            crate::util::exit(e.exit_code());
         }
     }
 }
@@ -591,11 +595,10 @@ async fn report_outcome(
 const HANDOVER_WAIT_SECS: u64 = aproxy::install::state::STALE_AFTER_SECS;
 
 /// 轮询 install.state 直到接手者到达终点。成功判据：状态文件消失（done
-/// 清场）或 phase 进入 cleaning（终验已通过——cleaning 只剩删让位的旧二进制与
-/// staging，而那个旧二进制正是本进程的运行镜像，Windows 上本进程必须先退出它才
-/// 删得掉，所以不能等到 done）。失败判据：phase=failed（带接手者记下的原因）、
+/// 清场）或 phase 为 done。cleaning 的持锁与状态写入仍可能失败，不能把它当成成功；
+/// 等待者退出才删得掉的 Windows 旧镜像由接手者在写成 done 后重试。失败判据：phase=failed、
 /// 接手进程已死而安装未终结、等待超时。
-async fn await_handover(home: &std::path::Path) -> Result<(), String> {
+async fn await_handover(home: &std::path::Path) -> Result<(), InstallFailure> {
     use aproxy::install::state::{InstallPhase, is_stale, load_in, state_path_in};
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(HANDOVER_WAIT_SECS);
     loop {
@@ -604,20 +607,23 @@ async fn await_handover(home: &std::path::Path) -> Result<(), String> {
             // 文件在但读不出（状态损坏）：不臆断，继续等到超时
             None => {}
             Some(s) => match s.phase {
-                InstallPhase::Cleaning | InstallPhase::Done => return Ok(()),
+                InstallPhase::Done => return Ok(()),
                 InstallPhase::Failed => {
-                    return Err(s
-                        .last_error
-                        .unwrap_or_else(|| "接手进程报告失败（原因未记录）".to_string()));
+                    return Err(InstallFailure::recorded(
+                        &s,
+                        s.last_error
+                            .clone()
+                            .unwrap_or_else(|| "接手进程报告失败（原因未记录）".to_string()),
+                    ));
                 }
-                InstallPhase::Aborted => return Err("安装已被中止（--abort）".to_string()),
+                InstallPhase::Aborted => return Err("安装已被中止（--abort）".to_string().into()),
                 _ if s.installer_pid != std::process::id()
                     && is_stale(&s, aproxy::watchdog::now_secs()) =>
                 {
                     return Err(format!(
                         "接手进程（pid {}）已退出但安装停在 {:?}；现场已保留，任何 aproxy 命令会自动续作",
                         s.installer_pid, s.phase
-                    ));
+                    ).into());
                 }
                 _ => {}
             },
@@ -625,7 +631,7 @@ async fn await_handover(home: &std::path::Path) -> Result<(), String> {
         if std::time::Instant::now() >= deadline {
             return Err(format!(
                 "{HANDOVER_WAIT_SECS} 秒内未确认安装完成（可能仍在后台进行）；可用 aproxy status 查看实例版本"
-            ));
+            ).into());
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
@@ -659,8 +665,7 @@ async fn run_plan(
     download_proxy: Option<&str>,
 ) {
     if let Err(e) = aproxy::install::flow::check_jurisdiction(run_dir, home, adopt).await {
-        eprintln!("[ERROR] {e}");
-        crate::util::exit(1);
+        fail(e.into());
     }
     let target = plan.target_version.clone();
     println!("开始安装 aProxy {target}...");
@@ -678,11 +683,13 @@ fn handle_abort(home: &std::path::Path) {
     };
     // swapping 及之后只进不退（运行实例可能已开始滚动）——拒绝并说明
     if state.phase >= aproxy::install::state::InstallPhase::Swapping {
-        eprintln!(
-            "[ERROR] 安装已进入交换阶段（phase {:?}），无法回滚——实例可能已开始滚动到新版本。\n中断的安装会自动续作完成；如需手动干预，按 skill 的手动更新兜底路径操作。",
-            state.phase
-        );
-        crate::util::exit(1);
+        fail(InstallFailure::new(
+            "install_failed",
+            format!(
+                "安装已进入交换阶段（phase {:?}），无法回滚——实例可能已开始滚动到新版本。\n中断的安装会自动续作完成；如需手动干预，按 skill 的手动更新兜底路径操作。",
+                state.phase
+            ),
+        ));
     }
     // swapping 前：二进制未动，干净回滚 = 清现场（staging + 状态文件）
     if let Some(staged) = &state.staged_path {
@@ -693,4 +700,35 @@ fn handle_abort(home: &std::path::Path) {
     }
     aproxy::install::state::remove_in(home);
     println!("安装已中止，现场已清理（二进制与实例未受影响）。");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// cleaning 仍可能失败；等待者不能抢在失败落盘前退出，也不能丢掉接手者的退出码。
+    #[tokio::test]
+    async fn handover_reports_a_failure_after_cleaning() {
+        use aproxy::install::state::{self, InstallPhase, InstallSource, InstallState};
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let mut st = InstallState::new_marking("x", InstallSource::From);
+        st.phase = InstallPhase::Cleaning;
+        state::write_in(home, &mut st).unwrap();
+        let publish = async {
+            tokio::task::yield_now().await;
+            state::fail_in(
+                home,
+                &mut st,
+                &InstallFailure::new("install_version_not_found", "from successor"),
+            );
+        };
+        let (outcome, ()) = tokio::join!(await_handover(home), publish);
+        let error = outcome.unwrap_err();
+        assert_eq!(error.message, "from successor");
+        assert_eq!(error.exit_code(), 4);
+        st.error_code = None;
+        state::write_in(home, &mut st).unwrap();
+        assert_eq!(await_handover(home).await.unwrap_err().exit_code(), 1);
+    }
 }

@@ -26,6 +26,8 @@ pub fn skill_dir_in(home: &Path) -> PathBuf {
 pub struct SkillOutcome {
     pub phase: SkillPhase,
     pub attempt: u32,
+    /// 单独执行 skill 更新时按失败码退出；随二进制安装的支线只记阶段。
+    pub failure: Option<super::InstallFailure>,
 }
 
 /// 支线主任务：按链条下载 skills zip → 原子落位。失败重试已在链条级
@@ -46,6 +48,7 @@ pub async fn update_skills(
                 tracing::info!(skills = ?installed, "skill 文档已随版本落位");
                 SkillOutcome {
                     phase: SkillPhase::Done,
+                    failure: None,
                     attempt,
                 }
             }
@@ -53,6 +56,7 @@ pub async fn update_skills(
                 tracing::warn!(error = %e, "skill 落位失败（下次 install 重试）");
                 SkillOutcome {
                     phase: SkillPhase::Failed,
+                    failure: Some(e.into()),
                     attempt,
                 }
             }
@@ -61,6 +65,7 @@ pub async fn update_skills(
             tracing::warn!(error = %e, "skill 下载失败（非强制，不影响安装；--skills-only 可单独重试）");
             SkillOutcome {
                 phase: SkillPhase::Failed,
+                failure: Some(e),
                 attempt,
             }
         }

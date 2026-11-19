@@ -238,7 +238,11 @@ pub async fn latest_version(
 }
 
 /// npm 通道获取：元数据 → tgz 下载 + integrity 强校验 → 解包提取产物。
-pub async fn fetch(ctx: &DownloadCtx, artifact: Artifact, dest: &Path) -> Result<Fetched, String> {
+pub async fn fetch(
+    ctx: &DownloadCtx,
+    artifact: Artifact,
+    dest: &Path,
+) -> Result<Fetched, crate::install::InstallFailure> {
     let meta = fetch_meta(ctx, artifact).await?;
     let tgz_dest = dest.with_extension("tgz");
     let result = async {
@@ -246,7 +250,7 @@ pub async fn fetch(ctx: &DownloadCtx, artifact: Artifact, dest: &Path) -> Result
         // integrity（sha512）强校验
         if let Some(integrity) = &meta.integrity_sha512 {
             let Some(encoded) = integrity.strip_prefix("sha512-") else {
-                return Err(format!("不支持的 integrity 格式: {integrity}"));
+                return Err(format!("不支持的 integrity 格式: {integrity}").into());
             };
             let expected = b64_decode(encoded)?;
             let data = std::fs::read(&tgz_dest).map_err(|e| format!("tgz 读取失败: {e}"))?;
@@ -255,7 +259,10 @@ pub async fn fetch(ctx: &DownloadCtx, artifact: Artifact, dest: &Path) -> Result
             h.update(&data);
             let actual: Vec<u8> = h.finalize().iter().copied().collect();
             if expected != actual {
-                return Err("integrity sha512 不匹配（npm registry 校验失败）".to_string());
+                return Err(crate::install::InstallFailure::new(
+                    "install_checksum_mismatch",
+                    "integrity sha512 不匹配（npm registry 校验失败）",
+                ));
             }
         }
         // 解包提取：二进制在平台包 `bin/aproxy[.exe]`；skill 在主包

@@ -26,7 +26,11 @@ struct Release {
 }
 
 /// GitHub API GET → JSON（匿名 API，仓库公开，60/h 限流够用）。
-async fn api_get(ctx: &DownloadCtx, url: &str) -> Result<serde_json::Value, String> {
+async fn api_get(
+    ctx: &DownloadCtx,
+    url: &str,
+    exact_tag: bool,
+) -> Result<serde_json::Value, crate::install::InstallFailure> {
     let resp = ctx
         .client
         .get(url)
@@ -35,18 +39,33 @@ async fn api_get(ctx: &DownloadCtx, url: &str) -> Result<serde_json::Value, Stri
         .await
         .map_err(|e| format!("GitHub API 请求失败: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("GitHub API HTTP {}", resp.status()));
+        let code = if exact_tag && resp.status() == reqwest::StatusCode::NOT_FOUND {
+            "install_version_not_found"
+        } else {
+            "install_download_failed"
+        };
+        return Err(crate::install::InstallFailure::new(
+            code,
+            format!("GitHub API HTTP {}", resp.status()),
+        ));
     }
-    resp.json()
-        .await
-        .map_err(|e| format!("GitHub API 解析失败: {e}"))
+    resp.json().await.map_err(|e| {
+        crate::install::InstallFailure::new(
+            "install_download_failed",
+            format!("GitHub API 解析失败: {e}"),
+        )
+    })
 }
 
 /// 按版本精确定位 release（tag `v<version>`）。
-async fn release_by_version(ctx: &DownloadCtx, version: &str) -> Result<Release, String> {
+async fn release_by_version(
+    ctx: &DownloadCtx,
+    version: &str,
+) -> Result<Release, crate::install::InstallFailure> {
     let item = api_get(
         ctx,
         &format!("https://api.github.com/repos/{REPO}/releases/tags/v{version}"),
+        true,
     )
     .await?;
     let mut assets = Vec::new();
@@ -147,7 +166,11 @@ pub fn pick_latest(
 }
 
 /// github 通道获取：下载 asset + `<asset>.sha256` 比对（强校验，不匹配即拒）。
-pub async fn fetch(ctx: &DownloadCtx, artifact: Artifact, dest: &Path) -> Result<Fetched, String> {
+pub async fn fetch(
+    ctx: &DownloadCtx,
+    artifact: Artifact,
+    dest: &Path,
+) -> Result<Fetched, crate::install::InstallFailure> {
     let asset = artifact.asset_name(ctx.target, ctx.variant, ctx.cpu_suffix);
     let release = release_by_version(ctx, &ctx.version).await?;
     let url = release
@@ -178,7 +201,10 @@ pub async fn fetch(ctx: &DownloadCtx, artifact: Artifact, dest: &Path) -> Result
     let actual = crate::install::staging::sha256_hex(dest)?;
     if expected != actual {
         let _ = std::fs::remove_file(dest);
-        return Err(format!("sha256 不匹配（期望 {expected}，实际 {actual}）"));
+        return Err(crate::install::InstallFailure::new(
+            "install_checksum_mismatch",
+            format!("sha256 不匹配（期望 {expected}，实际 {actual}）"),
+        ));
     }
     Ok(Fetched {
         path: dest.to_path_buf(),
@@ -204,6 +230,7 @@ pub async fn latest_version(
     let body = api_get(
         ctx,
         &format!("https://api.github.com/repos/{REPO}/releases?per_page=100"),
+        false,
     )
     .await?;
     if !body.is_array() {

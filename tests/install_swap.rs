@@ -145,7 +145,7 @@ fn refusal_before_retiring_leaves_bin_untouched() {
         |_| Err("写不了状态".to_string()),
     )
     .unwrap_err();
-    assert!(err.contains("写不了状态"), "{err}");
+    assert!(err.message.contains("写不了状态"), "{err}");
     assert_eq!(
         std::fs::read(swap::bin_path_in(home.path())).unwrap(),
         old_bytes
@@ -164,7 +164,8 @@ fn version_mismatch_after_placing_rolls_back() {
     let old_bytes = seed_marked_bin(home.path());
     let staged = stage(home.path(), "mismatch");
     let err = swap::swap_in(home.path(), &staged, "99.0.0", None, |_| Ok(())).unwrap_err();
-    assert!(err.contains("已换回原来的二进制"), "{err}");
+    assert_eq!(err.code, "install_rolled_back");
+    assert!(err.message.contains("已换回原来的二进制"), "{err}");
     assert_eq!(
         std::fs::read(swap::bin_path_in(home.path())).unwrap(),
         old_bytes,
@@ -324,7 +325,8 @@ mod windows_swap {
             |_| Ok(()),
         )
         .unwrap_err();
-        assert!(err.contains("bin 未改动"), "{err}");
+        assert_eq!(err.code, "install_swap_failed");
+        assert!(err.message.contains("bin 未改动"), "{err}");
         drop(handle);
         assert_eq!(
             std::fs::read(swap::bin_path_in(home.path())).unwrap(),

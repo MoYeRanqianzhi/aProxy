@@ -27,6 +27,7 @@
 
 use std::path::Path;
 
+use super::InstallFailure;
 use super::staging::stage_from_in;
 use super::state::{InstallPhase, InstallSource, InstallState, SkillPhase, write_in};
 use super::swap;
@@ -179,8 +180,8 @@ async fn drive_with_skill(
     version: &str,
     skill_enabled: bool,
     download_proxy: Option<&str>,
-    fut: impl std::future::Future<Output = Result<FlowExit, String>>,
-) -> Result<FlowExit, String> {
+    fut: impl std::future::Future<Output = Result<FlowExit, InstallFailure>>,
+) -> Result<FlowExit, InstallFailure> {
     let settings = crate::settings::load();
     let mut skill_handle = None;
     if skill_enabled
@@ -230,7 +231,7 @@ pub async fn run_install(
     plan: &InstallPlan,
     skill_enabled: bool,
     download_proxy: Option<&str>,
-) -> Result<FlowExit, String> {
+) -> Result<FlowExit, InstallFailure> {
     // ---- marking：第一件事写状态文件（铁律 1）——此后任何时刻崩溃，
     // 下一次启动都能识别「正在 install」并恢复。宣告节在停看护者之前创建
     //（守护自检的补种抑制依赖它的有效性，时序严格咬合）。
@@ -283,11 +284,13 @@ async fn run_forward(
     state: &mut InstallState,
     from: &Path,
     may_hand_over: bool,
-) -> Result<FlowExit, String> {
+) -> Result<FlowExit, InstallFailure> {
     // ---- downloading：先下载后 rename（铁律 2）——备料校验全过才许动 bin
     super::state::advance_in(home, state, InstallPhase::Downloading)?;
-    let staged =
-        stage_from_in(home, from, &state.target_version).map_err(|e| format!("备料失败: {e}"))?;
+    let staged = stage_from_in(home, from, &state.target_version).map_err(|e| {
+        let message = format!("备料失败: {e}");
+        e.with_message(message)
+    })?;
     state.staged_path = Some(staged.path.display().to_string());
     state.sha256 = Some(staged.sha256.clone());
     super::state::advance_in(home, state, InstallPhase::Downloaded)?;
@@ -338,9 +341,9 @@ const BIN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// 在 async 流程里拿安装锁（最多等 [`BIN_LOCK_WAIT`]）。`lock_install_in` 是阻塞的轮询
 /// （每 100 毫秒一次），放到 blocking 线程上去等，不占着 tokio 的工作线程——同一个运行时
 /// 上还跑着宣告心跳等任务，被阻塞 30 秒，心跳就会过期。
-async fn lock_install(home: &Path) -> Result<super::InstallLock, String> {
+async fn lock_install(home: &Path) -> Result<super::InstallLock, InstallFailure> {
     let home = home.to_path_buf();
-    tokio::task::spawn_blocking(move || super::lock_install_in(&home, BIN_LOCK_WAIT))
+    tokio::task::spawn_blocking(move || super::lock_for_install(&home, BIN_LOCK_WAIT))
         .await
         .map_err(|e| format!("等安装锁的任务异常结束: {e}"))?
 }
@@ -493,7 +496,7 @@ async fn run_tail(
     state: &mut InstallState,
     new_bin: &Path,
     skip_ready: bool,
-) -> Result<(), String> {
+) -> Result<(), InstallFailure> {
     let snapshot = state.instance_snapshot.clone();
 
     // ---- restarting：逐实例滚动（任一时刻至多一个下线）
@@ -512,7 +515,7 @@ async fn run_tail(
         // 任一实例失败即中止滚动、剩余实例不再动（restart 原语已就该实例
         // 尽力恢复服务并置 halted；不动剩余实例 = 不再扩大影响面）
         let fallback = rollback_binary(state);
-        match super::restart::restart_instance(
+        let result = super::restart::restart_instance(
             home,
             run_dir,
             state,
@@ -520,12 +523,13 @@ async fn run_tail(
             new_bin,
             fallback.as_deref(),
         )
-        .await
-        {
+        .await;
+        state.record_restart(port, &result);
+        match result {
             Ok(pid) => {
                 tracing::info!(port = %port, new_pid = pid, "实例已滚动到新版本");
             }
-            Err(e) => return Err(format!("实例 {port} 滚动重启失败: {e}")),
+            Err(e) => return Err(e.failure(port, format!("实例 {port} 滚动重启失败: {e}"))),
         }
         // 每实例重启后推进状态文件（进度可观察 + updated_at 保活）
         write_in(home, state).map_err(|e| format!("install/state.json 写入失败: {e}"))?;
@@ -551,15 +555,13 @@ async fn run_tail(
             break;
         }
         if round == 1 {
-            return Err(format!(
-                "终验未通过（版本/阶段不符，已补 restart 一轮）: {bad:?}"
-            ));
+            return Err(format!("终验未通过（版本/阶段不符，已补 restart 一轮）: {bad:?}").into());
         }
         for port in &bad {
             let fallback = rollback_binary(state);
             // 补 restart 的「未被动过」类失败照旧忽略（下一轮终验如实判定）；
             // 实例级失败（新版本起不来、已回滚/下线）必须立即中止
-            match super::restart::restart_instance(
+            let result = super::restart::restart_instance(
                 home,
                 run_dir,
                 state,
@@ -567,54 +569,52 @@ async fn run_tail(
                 new_bin,
                 fallback.as_deref(),
             )
-            .await
-            {
+            .await;
+            state.record_restart(port, &result);
+            match result {
                 Ok(_) | Err(super::restart::RestartError::NotRestarted(_)) => {}
-                Err(e) => return Err(format!("实例 {port} 终验补重启失败: {e}")),
+                Err(e) => return Err(e.failure(port, format!("实例 {port} 终验补重启失败: {e}"))),
             }
         }
     }
 
     // ---- cleaning：删让位的旧二进制与本次的 staging（它是 swapping 中断的恢复源，
     // done 后即无用）；入口脚本常驻不删（防线 0 是基础设施）。两者在 Windows 上都可能
-    // 暂时被镜像锁住：旧二进制是等待结局的安装者的镜像，它看到 cleaning 才退出；
+    // 暂时被镜像锁住：旧二进制可能是等待安装结局的进程镜像；
     // staging 里的副本可能是刚把剩余阶段交出来的那个进程的镜像。短重试吸收这段
     // 退出窗口，仍删不掉就保留待下次（唯一名的残留挡不住以后的安装），绝不强杀。
     // 删 bin/ 里的文件也是改 bin/，持有安装锁（永久兼容契约 C4）。
     // 相位守卫：Cleaning 残留的续作重入不重复迁移
+    let _lock = lock_install(home).await?;
     if state.phase < InstallPhase::Cleaning {
         super::state::advance_in(home, state, InstallPhase::Cleaning)?;
     }
-    let _lock = lock_install(home).await?;
     let staging = super::staging::staging_dir_in(home, &state.target_version);
     let gone = |result: std::io::Result<()>| match result {
         Ok(()) => true,
         Err(e) => e.kind() == std::io::ErrorKind::NotFound,
     };
     for attempt in 0..6 {
-        let old_gone = state
-            .old_path
-            .as_ref()
-            .is_none_or(|old| gone(std::fs::remove_file(old)));
-        let staging_gone = gone(std::fs::remove_dir_all(&staging));
+        let old = state.old_path.as_deref().map(Path::new);
+        let old_gone = old.is_none_or(|old| gone(std::fs::remove_file(old)));
+        let staging_gone =
+            state.phase == InstallPhase::Done || gone(std::fs::remove_dir_all(&staging));
+        if state.phase != InstallPhase::Done && (staging_gone || attempt == 5) {
+            // 顺带清掉以前留下、此刻删得掉的中间文件残留。
+            swap::sweep_residue_in(home, old);
+            super::state::advance_in(home, state, InstallPhase::Done)?;
+            // 等待者见到 done 才退出。此后只重试本次的唯一旧名，不再碰状态或 staging。
+            super::state::remove_in(home);
+        }
         if old_gone && staging_gone {
             break;
         }
         if attempt == 5 {
-            tracing::warn!(
-                old = ?state.old_path,
-                staging = %staging.display(),
-                "旧二进制或 staging 删除失败（仍被占用？），保留待下次安装清理"
-            );
+            tracing::warn!(old = ?state.old_path, staging = %staging.display(), "旧二进制或 staging 删除失败（仍被占用？），保留待下次安装清理");
         } else {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
-    // 顺带清掉以前留下、此刻删得掉的中间文件残留
-    swap::sweep_residue_in(home, None);
-    super::state::advance_in(home, state, InstallPhase::Done)?;
-    // 状态文件删除 = 安装完成（恢复机制的触发依据：任何残留都意味着未完成）
-    super::state::remove_in(home);
     Ok(())
 }
 
@@ -629,7 +629,7 @@ pub async fn run_install_online(
     source: InstallSource,
     skill_enabled: bool,
     download_proxy: Option<&str>,
-) -> Result<FlowExit, String> {
+) -> Result<FlowExit, InstallFailure> {
     let mut state = InstallState::new_marking(version.to_string(), source);
     note_skill_choice(&mut state, skill_enabled);
     let mut state = super::state::create_new_in(home, state)?;
@@ -638,14 +638,17 @@ pub async fn run_install_online(
     // Marking，无实例场景 run_forward_from_staged 跳过广播段直进
     // advance(Swapping) → 「非法状态迁移 Marking → Swapping」（实测暴露：
     // 此前在线路径一直被下载问题挡住，从未跑通到安装段）
-    super::state::advance_in(home, &mut state, InstallPhase::Downloading)?;
-    state.staged_path = Some(staged.display().to_string());
-    state.sha256 = Some(crate::install::staging::sha256_hex(staged)?);
-    super::state::advance_in(home, &mut state, InstallPhase::Downloaded)?;
     let announcer = spawn_announcer(home, run_dir);
-
     drive_with_skill(home, version, skill_enabled, download_proxy, async {
-        match run_forward_from_staged(home, run_dir, &mut state, staged, true).await {
+        let result = async {
+            super::state::advance_in(home, &mut state, InstallPhase::Downloading)?;
+            state.staged_path = Some(staged.display().to_string());
+            state.sha256 = Some(crate::install::staging::sha256_hex(staged)?);
+            super::state::advance_in(home, &mut state, InstallPhase::Downloaded)?;
+            run_forward_from_staged(home, run_dir, &mut state, staged, true).await
+        }
+        .await;
+        match result {
             Ok(exit) => {
                 end_announcer(announcer, exit);
                 Ok(exit)
@@ -697,7 +700,7 @@ pub async fn continue_install(
     home: &Path,
     run_dir: &Path,
     handover_from: Option<u32>,
-) -> Result<FlowExit, String> {
+) -> Result<FlowExit, InstallFailure> {
     let Some(mut state) = super::state::load_in(home) else {
         // 没有状态文件 = 没有要续作的安装。本进程却可能正是看护者因为过期的宣告拉起的
         //（unix 上宣告是文件，安装者崩溃时来不及删）：删掉它，否则看护者每轮都拉起一个
@@ -724,9 +727,12 @@ pub async fn continue_install(
             super::state::remove_in(home);
             return Ok(FlowExit::Completed);
         }
-        return Err(format!(
-            "上次安装因实例级失败已中止，不自动重试（{}）。排除原因后重新执行 aproxy install",
-            state.last_error.as_deref().unwrap_or("原因未记录")
+        return Err(InstallFailure::recorded(
+            &state,
+            format!(
+                "上次安装因实例级失败已中止，不自动重试（{}）。排除原因后重新执行 aproxy install",
+                state.last_error.as_deref().unwrap_or("原因未记录")
+            ),
         ));
     }
     // 接管判定：常规 stale（超时+原进程死）或宣告心跳过期（runtime 挂死
@@ -737,13 +743,17 @@ pub async fn continue_install(
     // 指名的接手者抢同一个安装。
     let named = handover_from.is_some_and(|pid| pid == state.installer_pid);
     if !named && !super::state::is_takeable(home, run_dir, &state, crate::watchdog::now_secs()) {
-        return Err(format!(
-            "安装仍在进行（phase {:?}，pid {}），不重复接管",
-            state.phase, state.installer_pid
+        return Err(InstallFailure::new(
+            "install_in_progress",
+            format!(
+                "安装仍在进行（phase {:?}，pid {}），不重复接管",
+                state.phase, state.installer_pid
+            ),
         ));
     }
     tracing::info!(phase = ?state.phase, target = %state.target_version, named, "install 续作接管");
     state.installer_pid = std::process::id();
+    state.installer_version = Some(env!("CARGO_PKG_VERSION").into());
     write_in(home, &mut state).map_err(|e| format!("install/state.json 写入失败: {e}"))?;
     let announcer = spawn_announcer(home, run_dir);
     // skill 支线：交到手里的安装，skill 归交出它的那个进程（它还活着、带着
@@ -766,54 +776,55 @@ pub async fn continue_install(
         skill_should_run,
         settings.download_proxy.as_deref(),
         async {
-            let result = match state.phase {
-                // 备料前/备料中中断：staging 可能半截——重新备料（幂等重做；
-                // --from 源路径已记录；网络渠道续作因 from_path 缺失而请用户重跑）
-                InstallPhase::Marking | InstallPhase::Downloading | InstallPhase::Failed => {
-                    let Some(from) = state.from_path.clone() else {
-                        stop_announcer(announcer);
-                        return Err(
-                            "续作缺少 --from 源记录（状态文件损坏？），请重新执行安装".into()
-                        );
-                    };
-                    run_forward(home, run_dir, &mut state, Path::new(&from), !named).await
-                }
-                // 备料完成、交换前：staging 完整在盘——直接从广播重入。
-                // swapping 中断：Windows bin 可能空窗（旧二进制已让位到 aproxy.old-…、
-                // 新的未落位）——swap 原语对「bin 缺失」幂等（首次安装同款路径），重新
-                // 执行交换即恢复；让位的旧二进制在让位之前就记进了 old_path，回滚照样
-                // 用它。unix 两态（rename 前中断 = 原文件完好 / rename 后 = 新文件已就位）
-                // 都无需修复。重入走广播（ACK 是幂等置位）+ 交换。
-                InstallPhase::Downloaded
-                | InstallPhase::Broadcasting
-                | InstallPhase::Acked
-                | InstallPhase::Swapping => {
-                    let Some(staged_path) = state.staged_path.clone() else {
-                        stop_announcer(announcer);
-                        return Err(
-                            "续作缺少 staging 记录（状态文件损坏？），请重新执行安装".into()
-                        );
-                    };
-                    run_forward_from_staged(
-                        home,
-                        run_dir,
-                        &mut state,
-                        Path::new(&staged_path),
-                        !named,
-                    )
-                    .await
-                }
-                // 交换完成及以后：新 bin 已在规范位置——直接进尾部（滚动/终验/清理）
-                InstallPhase::Swapped
-                | InstallPhase::Restarting
-                | InstallPhase::Verifying
-                | InstallPhase::Cleaning => {
-                    run_tail(home, run_dir, &mut state, &swap::bin_path_in(home), true)
+            let result = async {
+                match state.phase {
+                    // 备料前/备料中中断：staging 可能半截——重新备料（幂等重做；
+                    // --from 源路径已记录；网络渠道续作因 from_path 缺失而请用户重跑）
+                    InstallPhase::Marking | InstallPhase::Downloading | InstallPhase::Failed => {
+                        let Some(from) = state.from_path.clone() else {
+                            return Err("续作缺少 --from 源记录（状态文件损坏？），请重新执行安装"
+                                .to_string()
+                                .into());
+                        };
+                        run_forward(home, run_dir, &mut state, Path::new(&from), !named).await
+                    }
+                    // 备料完成、交换前：staging 完整在盘——直接从广播重入。
+                    // swapping 中断：Windows bin 可能空窗（旧二进制已让位到 aproxy.old-…、
+                    // 新的未落位）——swap 原语对「bin 缺失」幂等（首次安装同款路径），重新
+                    // 执行交换即恢复；让位的旧二进制在让位之前就记进了 old_path，回滚照样
+                    // 用它。unix 两态（rename 前中断 = 原文件完好 / rename 后 = 新文件已就位）
+                    // 都无需修复。重入走广播（ACK 是幂等置位）+ 交换。
+                    InstallPhase::Downloaded
+                    | InstallPhase::Broadcasting
+                    | InstallPhase::Acked
+                    | InstallPhase::Swapping => {
+                        let Some(staged_path) = state.staged_path.clone() else {
+                            return Err("续作缺少 staging 记录（状态文件损坏？），请重新执行安装"
+                                .to_string()
+                                .into());
+                        };
+                        run_forward_from_staged(
+                            home,
+                            run_dir,
+                            &mut state,
+                            Path::new(&staged_path),
+                            !named,
+                        )
                         .await
-                        .map(|_| FlowExit::Completed)
+                    }
+                    // 交换完成及以后：新 bin 已在规范位置——直接进尾部（滚动/终验/清理）
+                    InstallPhase::Swapped
+                    | InstallPhase::Restarting
+                    | InstallPhase::Verifying
+                    | InstallPhase::Cleaning => {
+                        run_tail(home, run_dir, &mut state, &swap::bin_path_in(home), true)
+                            .await
+                            .map(|_| FlowExit::Completed)
+                    }
+                    InstallPhase::Done | InstallPhase::Aborted => unreachable!("终态已在入口处理"),
                 }
-                InstallPhase::Done | InstallPhase::Aborted => unreachable!("终态已在入口处理"),
-            };
+            }
+            .await;
 
             match result {
                 Ok(exit) => {
@@ -845,11 +856,13 @@ async fn run_forward_from_staged(
     state: &mut InstallState,
     staged_path: &Path,
     may_hand_over: bool,
-) -> Result<FlowExit, String> {
+) -> Result<FlowExit, InstallFailure> {
     if !staged_path.is_file() {
         // staging 也没了（极端中的极端）→ 从 --from 源重新备料兜底
         let Some(from) = state.from_path.clone() else {
-            return Err("staging 与 --from 源均已缺失，请重新执行安装".into());
+            return Err("staging 与 --from 源均已缺失，请重新执行安装"
+                .to_string()
+                .into());
         };
         return Box::pin(run_forward(
             home,
@@ -867,9 +880,9 @@ async fn run_forward_from_staged(
         && !is_current_exe(staged_path)
         && successor_sees_same_home(home, run_dir)
     {
-        return hand_over(home, staged_path)
-            .await
-            .map_err(|e| format!("目标版本没有接手安装（{e}）；实例与 bin 里的二进制都未改动"));
+        return hand_over(home, staged_path).await.map_err(|e| {
+            format!("目标版本没有接手安装（{e}）；实例与 bin 里的二进制都未改动").into()
+        });
     }
 
     // ---- 实例快照（ACK 阶段清单）：续作重算时必须并回在途实例（见
@@ -892,10 +905,11 @@ async fn run_forward_from_staged(
         }
         if let Err(e) = super::broadcast::broadcast_prepare_swap(home, run_dir, &live, state).await
         {
-            return Err(format!(
+            let message = format!(
                 "PrepareSwap 广播终失败（{e}）。\n\
                  问题实例有隐患，处置指引：将其关闭后重试安装（不强杀——避免服务中断）"
-            ));
+            );
+            return Err(e.with_message(message));
         }
         if state.phase < InstallPhase::Acked {
             super::state::advance_in(home, state, InstallPhase::Acked)?;
@@ -913,7 +927,10 @@ async fn run_forward_from_staged(
     if !fresh.is_empty() {
         super::broadcast::broadcast_prepare_swap(home, run_dir, &fresh, state)
             .await
-            .map_err(|e| format!("广播后新启实例 ACK 失败: {e}"))?;
+            .map_err(|e| {
+                let message = format!("广播后新启实例 ACK 失败: {e}");
+                e.with_message(message)
+            })?;
     }
     super::state::advance_in(home, state, InstallPhase::Swapping)?;
     // 改 bin/ 期间持有安装锁（永久兼容契约 C4）：强制安装先结束全部安装者再拿这把锁，
@@ -929,7 +946,10 @@ async fn run_forward_from_staged(
         state.old_path = Some(old.display().to_string());
         write_in(home, state).map_err(|e| format!("install/state.json 写入失败: {e}"))
     })
-    .map_err(|e| format!("二进制交换失败: {e}"))?;
+    .map_err(|e| {
+        let message = format!("二进制交换失败: {e}");
+        e.with_message(message)
+    })?;
     drop(lock);
     super::state::advance_in(home, state, InstallPhase::Swapped)?;
 

@@ -139,5 +139,7 @@ Why an install or upgrade failed. `install --force` does not use these; it only 
 | `install_probe_failed` | 1 | The new binary did not run, or reported a version other than the one being installed. | — |
 | `install_swap_failed` | 1 | Replacing the binary in bin/ failed. | — |
 | `install_rolled_back` | 1 | The install failed and the previous binary was put back. | — |
+| `install_restart_failed` | 1 | An instance did not start on the new binary, so the rolling restart stopped. | `port` (integer) |
+| `install_failed` | 1 | The install failed for a reason that no more specific code covers. | — |
 | `install_unmanaged_instances` | 1 | Live instances started by an older version are in this home and cannot be restarted by this install. | — |
 | `install_precheck_failed` | 3 | The precheck before the rolling restart did not pass. | `port` (integer), `diagnostics` (diagnostic list) |

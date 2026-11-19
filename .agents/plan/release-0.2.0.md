@@ -997,11 +997,17 @@
        restore 时配置改坏是 `start_failed`/1 而不是 3（start 自己在拉起之前就解析配置，报 3）；`instance_incompatible`
        还没有产生它的路径（随 B9-4 status 改用 `ops::enumerate`）；`EditError::Io` 仍没有操作码；status、doctor、
        find、install、skill、desktop 几行随 B9-4、B9-5、B9-6、W4。
-  - [ ] B9-4 `--json`（§9.4）：status（改用 `ops::enumerate`，顺带显示 incompatible、down、看护者、读不懂的记录）、
+  - [x] B9-4 `--json`（§9.4）：status（改用 `ops::enumerate`，顺带显示 incompatible、down、看护者、读不懂的记录）、
     start、stop、restart、restore、alias list、config/settings 的 show 与 get、find；每个一份 golden。
     进度：start、stop、restart、restore 随 B9-3；alias list 与 find 在 d7da787（`tests/json_docs.rs` 整份文档比对，
-    find 的 `errors` 按启动的分层管线解析，含 settings 的全局默认），技能与 CHANGELOG 在 f507fca。还剩 settings 与
-    status。
+    find 的 `errors` 按启动的分层管线解析，含 settings 的全局默认），技能与 CHANGELOG 在 f507fca；settings 的
+    show/get/set/unset 在 7e7f765 与 50ff99f（改了 `defaults` 时 `instances_to_restart` 列出全部运行中的实例，别的
+    键是空表；按解析后的键路径判断，加引号的写法也算）。status 在 40d584a（Codex t03）：改用 `ops::enumerate`，`--json` 输出
+    §6.6 的枚举结果；文字输出按存活状态分块（无响应、运行中、无法采信应答、等待恢复、读不懂的记录、日志清理暂停、看护者、
+    台账里的其他进程）；`--idle`/`--busy` 只筛选运行中的实例；删掉 `ops::list`。`main.rs` 里 `status --json` 暂时跳过
+    `init_foreground_logging`，B9-7 统一换成 stderr 日志时去掉这个特例。技能与 CHANGELOG 随后补上。
+    验证：headless 全量 783 过，headless 与 desktop 两种 clippy 干净（Linux 交叉未跑：这一步没有平台相关代码）。
+    偏离：设计稿要每个命令一份 golden；status 的文档里有 pid、时刻等每次不同的值，测试改为断言结构与关键字段。
   - [ ] B9-5 doctor：换成诊断类型，`--json`，码（`file_permissions_too_open`、`default_header_shared` 等）。
   - [ ] B9-6 install：`--check`、`--json`（NDJSON）、预检（`install_precheck_failed`、`install_unmanaged_instances`）、
     A5 的四个字段、`halted` 时不拉起续作、与 `--force` 冲突的旗标进 force_contract 的命令行样本。

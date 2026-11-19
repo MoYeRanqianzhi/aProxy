@@ -127,7 +127,8 @@ the `--json` codes, not from the Chinese text.
 | status, find | always | — | — | — | — | — |
 | alias | success | invalid name, missing file, unknown alias, write failure | — | — | — | — |
 
-**`--json`** (on `start`, `stop`, `restart`, `restore` and the `config` subcommands) prints exactly
+**`--json`** (on `start`, `stop`, `restart`, `restore`, `status`, `find`, `alias list`, and the
+`config` and `settings` subcommands) prints exactly
 one JSON document on stdout, starting with `"schema":1`; the human-readable lines move to stderr.
 When the whole command fails, the document is
 `{"schema":1,"error":{"code","message","details"}}`; `code` names the cause, for example
@@ -276,19 +277,42 @@ What `start` checks, in order:
 ## status
 
 ```
-aproxy status [--idle | --busy]
+aproxy status [--idle | --busy] [--json]
 ```
 
-Lists instances in the registry that answer over IPC. A record that does not answer is shown when
-its process is still there; if the process is gone (or the pid now belongs to another process), the
-record is ignored. `status` deletes nothing: stale records, leftover launch-spec files and
-old unreferenced logs are cleaned in the background by an instance after it starts serving and by
-the watchdog (behaviors.md, Logs). A hung process's record is kept and listed first, whatever the
-filter:
-`无响应的 aProxy 实例 (<n>)——进程仍在，但不应答控制通道:` ("unresponsive instances: the process is
-still there but does not answer the control channel"), with port, pid, version, config and the hint
-`aproxy stop <port> --force`. Such an instance is almost always hung; with the watchdog on, its
-hang detection terminates and respawns it on its own. Per answering instance: port, pid, `v<version>`, uptime, idle time, listen address, masked
+Takes a read-only inventory of the home: every instance in the registry, desired-state records of
+instances that are not running, records this version cannot read, the watchdog, and other aProxy
+processes in the process ledger. A record whose process is gone (or whose pid now belongs to
+another process) is not an instance. `status` deletes nothing: stale records, leftover launch-spec
+files and old unreferenced logs are cleaned in the background by an instance after it starts
+serving and by the watchdog (behaviors.md, Logs). The text output has these blocks, each printed
+only when it has entries, in this order:
+
+- `无响应的 aProxy 实例 (<n>)——进程仍在，但不应答控制通道:` ("unresponsive instances: the
+  process is still there but does not answer the control channel"), with port, pid, version, config
+  and the hint `aproxy stop <port> --force`. Such an instance is almost always hung; with the
+  watchdog on, its hang detection terminates and respawns it on its own. This is the only state
+  where `--force` is the right answer.
+- `运行中的 aProxy 实例 (<n>):` ("running instances"), described below.
+- `无法采信应答的 aProxy 实例 (<n>)——…` ("instances whose answer cannot be trusted": a different
+  protocol version or an identity mismatch), with port, pid, version and a reason code. Operate such
+  an instance with the aproxy version it runs; do not `--force` it.
+- `等待恢复的实例 (<n>)——…` ("instances waiting to be restored"): not running, but their
+  desired-state record is kept, so `aproxy restore` or the watchdog will start them again.
+  `（配置文件找不到）` marks one whose config file is missing; restoring it fails until the file is
+  back. `aproxy stop <port>` drops the record when the instance is no longer wanted.
+- `读不懂的记录 (<n>)，原样保留…` ("unreadable records, kept as they are"): files in `run/` this
+  version cannot parse, usually written by a newer aproxy; handle them with that version. While
+  they exist, `日志清理已暂停` ("log cleanup is paused") is printed too.
+- `看护者: pid <pid>  v<version>  最近扫描 <age> 前` ("watchdog, last scan <age> ago"), or
+  `已 <age> 没有扫描（可能卡住了）` ("no scan for <age>; it may be stuck").
+- `台账里的其他 aProxy 进程 (<n>):` ("other aProxy processes in the ledger"): pid, role and version
+  of processes that belong to no instance or watchdog, such as the desktop window or instances
+  started by a version before 0.2.0.
+
+With nothing in any block, it prints `没有运行中的 aProxy 实例。` ("no running instances").
+
+Per running instance: port, pid, `v<version>`, uptime, idle time, listen address, masked
 upstream, config path (`（没有配置文件）` when it was started without one), and the line
 `请求 <n>  在途 <n>  重试 <n>  救回 <n>  最近错误: …`: requests received, requests still in flight
 (waiting for the upstream, backing off, retrying or still being delivered), upstream retries,
@@ -305,9 +329,28 @@ requests that succeeded only after a retry ("rescued"), and the latest error as
 - `注意: 实例版本 v<x> 与当前 CLI v<y> 不同…` ("instance version differs from this CLI"):
   see compatibility.md.
 
-`--idle` shows only instances idle for at least `instances.idle_threshold_secs` (settings.json,
-default 1800); `--busy` the rest. An instance that has served no request yet is idle from its start
-time. `status` does not print log paths; see [logs](#logs).
+`--idle` shows only running instances idle for at least `instances.idle_threshold_secs`
+(settings.json, default 1800); `--busy` the running ones that are not. An instance that has served
+no request yet is idle from its start time. The filters apply to running instances only: the other
+blocks are always shown, because each of them needs attention whatever the filter. `status` does not
+print log paths; see [logs](#logs).
+
+`--json` prints the same inventory as one document, which is the form to parse:
+
+```json
+{"schema":1,
+ "instances":[{"port":12346,"liveness":"live","instance":{"pid":4321,…},"status":{"state":"serving",…},"restore_pending":false}],
+ "unreadable":[{"file":"run/12349.instance.json","reason":{"code":"record_schema_too_new","details":{…}}}],
+ "watchdog":{"pid":5555,"version":"0.2.0","state":"running","last_scan_at":1760190123456,…},
+ "processes":[{"pid":7777,"role":"desktop","version":"0.2.0",…}]}
+```
+
+`liveness` is `live`, `unresponsive`, `incompatible`, `down`, or `unknown` for a state this version
+does not know. A `live` entry carries `status` (state and the request counters); an `incompatible`
+one carries `reason` (`code`, `details`); a `down` one has `instance: null`, `restore_pending: true`
+and, when the config file is missing, `restore_reason: "config_missing"`. `gc_paused` appears only
+while log cleanup is paused; `watchdog` is `null` without a watchdog, and its `state` is `running` or
+`stale`. `--idle`/`--busy` filter only the `live` entries here as well.
 
 ## stop
 

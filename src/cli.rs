@@ -190,6 +190,9 @@ pub enum Commands {
         /// 按监听端口过滤
         #[arg(long, value_name = "PORT")]
         port: Option<u16>,
+        /// 输出一个 JSON 文档（给程序读）：匹配的配置、别名与错误诊断
+        #[arg(long)]
+        json: bool,
     },
 
     /// 安装/升级 aProxy 到规范位置（~/.aproxy/bin/）：全程对客户端 ≈ 无感
@@ -377,7 +380,11 @@ pub enum AliasCmd {
         name: String,
     },
     /// 列出全部别名
-    List,
+    List {
+        /// 输出一个 JSON 文档（给程序读）：每个别名的路径与文件是否存在
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `aproxy config` 的参数集。独立成结构体以整体传递给处理函数，

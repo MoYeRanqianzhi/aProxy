@@ -9,6 +9,9 @@ use std::path::PathBuf;
 pub struct DiscoveredConfig {
     pub path: PathBuf,
     pub config: Option<crate::config::Config>,
+    /// 按启动实例时的分层管线（配置文件与 settings.json 的全局默认）解析所得的 error 级诊断；
+    /// 没有错误或文件读不出来时为空。
+    pub errors: Vec<aproxy_ipc::diag::Diagnostic>,
     pub aliases: Vec<String>,
     /// 是否为默认配置文件（settings.default_config 或 ~/.aproxy/config.toml）
     pub is_default: bool,
@@ -46,6 +49,10 @@ pub fn discover_in(settings: &Settings, home: &std::path::Path) -> Vec<Discovere
 
     let mut out: Vec<DiscoveredConfig> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let defaults = crate::config::resolve::Defaults::from_settings(
+        settings,
+        &crate::settings::settings_path_in(home),
+    );
     for dir in settings::effective_config_dirs_in(settings, home) {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -62,9 +69,15 @@ pub fn discover_in(settings: &Settings, home: &std::path::Path) -> Vec<Discovere
             let aliases = alias_map.get(&key).cloned().unwrap_or_default();
             let is_default = default_keys.contains(&key);
             let config = crate::doctor::parse_config_file(&path);
+            // 展示和端口过滤仍读取文件本身；只有诊断需要合并全局默认，才能反映启动时的错误。
+            let errors =
+                crate::config::resolve(&path, &crate::config::Overrides::default(), &defaults)
+                    .map(|resolved| resolved.errors().cloned().collect())
+                    .unwrap_or_default();
             out.push(DiscoveredConfig {
                 path,
                 config,
+                errors,
                 aliases,
                 is_default,
             });

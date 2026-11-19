@@ -2,14 +2,16 @@
 
 use aproxy::find;
 use aproxy::settings;
+use serde_json::json;
 
-/// `aproxy find [查询] [--aliased|--unaliased] [--port 端口]`：
+/// `aproxy find [查询] [--aliased|--unaliased] [--port 端口] [--json]`：
 /// 从配置目录列表发现全部配置并列出。
 pub(crate) fn handle_find_cmd(
     aliased: bool,
     unaliased: bool,
     query: Option<String>,
     port: Option<u16>,
+    json: bool,
 ) {
     let settings = settings::load();
     let filter = if aliased {
@@ -31,17 +33,37 @@ pub(crate) fn handle_find_cmd(
         // 必为 false，无需特判
         .filter(|d| port.is_none_or(|p| d.matches_port(p)))
         .collect();
+    if items.is_empty() {
+        super::say(
+            json,
+            "没有找到配置文件。配置目录列表见 settings.json 的 config_dirs（默认 ~/.aproxy/ 与 ~/.aproxy/configs/）。",
+        );
+        if !json {
+            return;
+        }
+    }
+    if json {
+        let configs: Vec<_> = items
+            .iter()
+            .map(|d| {
+                let config = d.config.as_ref();
+                json!({
+                    "path": d.path.display().to_string(),
+                    "aliases": d.aliases,
+                    "listen_addr": config.map(|c| &c.listen_addr),
+                    "base_url": config.map(|c| aproxy_ipc::redact::url(&c.base_url)),
+                    "errors": d.errors,
+                })
+            })
+            .collect();
+        super::print_doc(json!({"configs": configs}));
+        return;
+    }
     print_list(&items);
 }
 
-/// 列出发现的配置（人类可读）。空结果时也明确提示。
+/// 列出找到的配置（人类可读），保留别名与默认配置标记。
 fn print_list(items: &[find::DiscoveredConfig]) {
-    if items.is_empty() {
-        println!(
-            "没有找到配置文件。配置目录列表见 settings.json 的 config_dirs（默认 ~/.aproxy/ 与 ~/.aproxy/configs/）。"
-        );
-        return;
-    }
     println!("找到 {} 个配置:", items.len());
     for d in items {
         let alias_part = if d.aliases.is_empty() {

@@ -2,6 +2,7 @@
 
 use aproxy::cli::AliasCmd;
 use aproxy::ops::alias::{self, AliasError};
+use serde_json::json;
 
 /// `aproxy alias add/remove/list`：别名管理，存于 settings.json（内部配置，
 /// 唯一；toml 配置可多份平行并存）。
@@ -22,10 +23,24 @@ pub(crate) fn handle_alias_cmd(cmd: AliasCmd) {
             Ok(path) => println!("已删除别名 {name}（原指向 {path}）"),
             Err(e) => fail(&name, &e),
         },
-        AliasCmd::List => {
+        AliasCmd::List { json } => {
             let entries = alias::list();
             if entries.is_empty() {
-                println!("暂无别名。添加: aproxy alias add <名称> <config.toml 路径>");
+                super::say(
+                    json,
+                    "暂无别名。添加: aproxy alias add <名称> <config.toml 路径>",
+                );
+                if !json {
+                    return;
+                }
+            }
+            if json {
+                // 人读列表保留登记时的写法；文档给出实际检查的路径，文件消失也保留别名。
+                let aliases: Vec<_> = entries.into_iter().map(|(name, raw)| {
+                    let path = aproxy::settings::expand_path(&raw);
+                    json!({"name": name, "path": path.display().to_string(), "exists": path.is_file()})
+                }).collect();
+                super::print_doc(json!({"aliases": aliases}));
                 return;
             }
             println!("别名 ({}):", entries.len());

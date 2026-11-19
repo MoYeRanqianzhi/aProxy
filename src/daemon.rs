@@ -3934,6 +3934,7 @@ mod tests {
                 r#""behavior":{"delivery":"retry","disk_cache":true,"keepalive":{"trigger":"any","interval_secs":15},"retry_rules":1,"history":{"body_budget_mb":64}},"#,
                 r#""activity":{"last_request_at":1700000000000,"requests_total":120,"retries_total":7,"rescued_total":0,"in_flight":0,"retrying":0,"by_code":{},"#,
                 r#""buckets":{"width_secs":120,"requests":[ZEROS],"retries":[ZEROS],"failures":[ZEROS]},"last_error":null},"#,
+                r#""formats":[],"#,
                 r#""ops":["ping","shutdown","prepare_swap","requests","request","body","subscribe"],"#,
                 r#""features":["shutdown.if_idle_secs","shutdown.keep_restore","prepare_swap.ttl_secs"]}}"#
             )

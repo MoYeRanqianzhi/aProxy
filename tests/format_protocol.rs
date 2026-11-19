@@ -306,6 +306,103 @@ async fn fail_without_retry_returns_the_given_response_or_422() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
 
+/// 程序的终态体只走数据面；记下的是实际交付量与已脱敏的失败，不虚构上游响应。
+#[tokio::test]
+async fn program_terminal_bytes_stay_private_to_the_client() {
+    use aproxy::daemon::{IpcError, ReadOp, ipc_read_in};
+    let (up, calls) = upstream(&[200]).await;
+    let secret = "fixture-terminal-token";
+    let reason = format!("{secret}{}", "界".repeat(520));
+    let safe = format!("<secret>{}", "界".repeat(504));
+    for custom in [true, false] {
+        let home = TestHome::new();
+        let mut fail = serde_json::json!({"retry":false,"reason":reason});
+        if custom {
+            fail["response"] = serde_json::json!({"status":409,"body":secret});
+        }
+        let cfg = layer(
+            &home,
+            "gate",
+            "'request'",
+            &["reply", &serde_json::json!({"fail":fail}).to_string()],
+        )
+        .replace("env={", &format!("env={{ TOKEN='{secret}',"));
+        let (port, out) = launch(&home, up, &cfg);
+        assert!(out.status.success(), "{out:?}");
+        let startup: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let res = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(6))
+            .build()
+            .unwrap()
+            .post(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap();
+        let id = res.headers()["x-aproxy-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(res.status().as_u16(), if custom { 409 } else { 422 });
+        if custom {
+            assert_eq!(res.bytes().await.unwrap().as_ref(), secret.as_bytes());
+        } else {
+            let error = res.json::<Value>().await.unwrap();
+            assert!(error["error"]["message"].as_str().unwrap().ends_with(&safe));
+            assert!(!error.to_string().contains(secret));
+        }
+        let run = home.path().join("run");
+        let port = port.to_string();
+        let doc = ipc_read_in(
+            &run,
+            &port,
+            &ReadOp::Request {
+                request_id: id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(doc["record"]["code"], "format_rejected");
+        assert_eq!(
+            doc["record"]["client_status"],
+            if custom { 409 } else { 422 }
+        );
+        assert_eq!(
+            doc["record"]["response_bytes"],
+            if custom { secret.len() } else { 0 }
+        );
+        assert_eq!(doc["record"]["tries"][0]["code"], "format_rejected");
+        assert!(doc["record"]["tries"][0]["upstream_status"].is_null());
+        assert_eq!(doc["tries"][0].get("response"), Some(&Value::Null));
+        assert!(
+            doc["tries"][0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .ends_with(&safe)
+        );
+        assert!(!doc.to_string().contains(secret));
+        let error = ipc_read_in(
+            &run,
+            &port,
+            &ReadOp::Body {
+                request_id: id,
+                part: aproxy::history::Part::Response,
+                attempt: Some(1),
+                offset: None,
+                limit: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error,IpcError::Remote {code,details,..} if code=="not_found" && details["reason"]=="no_such_part")
+        );
+        let log = std::fs::read_to_string(startup["log_path"].as_str().unwrap()).unwrap();
+        assert!(!log.contains(secret));
+        assert!(log.contains(&safe));
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
 /// 并列一个无效键不影响合法覆盖；下一个请求仍然遵守实例规则。
 #[tokio::test]
 async fn overrides_apply_to_one_request_and_unknown_keys_are_ignored() {
@@ -1035,4 +1132,469 @@ async fn stopping_during_hello_cancels_the_probe_and_child() {
     .await
     .unwrap();
     assert!(!parent.wait_with_output().unwrap().status.success());
+}
+
+/// 按请求标识读取实际实例的完成记录，避免把别的请求的规则或报告误判为本次结果。
+async fn request_detail(home: &TestHome, url: &str, id: &str) -> Value {
+    aproxy::daemon::ipc_read_in(
+        &home.path().join("run"),
+        url.rsplit(':').next().unwrap(),
+        &aproxy::daemon::ReadOp::Request {
+            request_id: id.into(),
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// 同一回信的报告、状态与上限先于 fail 生效；invalid 嵌套状态不受合法外层状态遮蔽。
+#[tokio::test]
+async fn format_failure_keeps_overrides_and_rejects_bad_nested_status() {
+    let (up, calls) = upstream(&[200]).await;
+    for invalid in [false, true] {
+        let home = TestHome::new();
+        let reply = if invalid {
+            r#"{"response":{"status":200},"fail":{"retry":false,"reason":"bad","response":{"status":600}}}"#
+        } else {
+            r#"{"state":"local","report":{"summary":"attempt note","actions":[]},"overrides":{"retry":{"max_attempts":1}},"fail":{"retry":true,"reason":"try"}}"#
+        };
+        let cfg = layer(&home, "fail", "'request'", &["reply", reply]) + "breaker_failures=1\n";
+        let (client, url) = running(&home, up, &cfg);
+        let res = client.post(&url).send().await.unwrap();
+        let id = res.headers()["x-aproxy-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            res.headers()["x-aproxy-error"],
+            if invalid {
+                "format_unavailable"
+            } else {
+                "retry_exhausted"
+            }
+        );
+        res.bytes().await.unwrap();
+        let d = request_detail(&home, &url, &id).await;
+        let tries = d["record"]["tries"].as_array().unwrap();
+        assert_eq!(
+            tries[0]["code"],
+            if invalid {
+                "format_error"
+            } else {
+                "format_fail"
+            }
+        );
+        assert!(d["tries"][0]["response"].is_null());
+        if invalid {
+            assert_eq!(tries[1]["code"], "format_unavailable");
+            assert_eq!(d["tries"][0]["error"]["details"]["kind"], "invalid_output");
+        } else {
+            assert_eq!(tries.len(), 1);
+            assert_eq!(tries[0]["decision"]["by"], "override");
+            assert_eq!(d["record"]["reports"][0]["summary"], "attempt note");
+        }
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+/// 每个程序、每个请求独享 state；省略、清空、恰好达到与越过字节上限都从下一帧验证。
+#[tokio::test]
+async fn format_state_is_isolated_and_bounded_on_the_wire() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[503, 503, 503, 503, 200, 503, 503, 503, 503, 200]).await;
+    let full = "界".repeat(21845) + "x";
+    assert_eq!(full.len(), 65536);
+    let mut cfg = String::new();
+    for (name, initial) in [("a", full.as_str()), ("b", "separate")] {
+        let script = home.path().join(format!("{name}.json"));
+        let mut program = serde_json::json!({"request":{"state":initial},"retry:4":{"state":""}});
+        if name == "a" {
+            program["retry:3"] = serde_json::json!({"state":format!("{full}界")});
+        }
+        std::fs::write(&script, program.to_string()).unwrap();
+        cfg += &layer(
+            &home,
+            name,
+            "'request','retry','response'",
+            &["reply-by-stage", script.to_str().unwrap()],
+        );
+        cfg += "required=false\n";
+    }
+    let (client, url) = running(&home, up, &cfg);
+    for _ in 0..2 {
+        let res = client.post(&url).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        res.bytes().await.unwrap();
+    }
+    for (name, initial) in [("a", full.as_str()), ("b", "separate")] {
+        let f = frames(&home, name);
+        let stages: Vec<_> = f.iter().filter(|f| f["stage"] != "hello").collect();
+        assert_eq!(stages.len(), 12);
+        assert_ne!(stages[0]["request_id"], stages[6]["request_id"]);
+        for request in stages.chunks_exact(6) {
+            assert_eq!(request[0]["stage"], "request");
+            assert!(request[0].get("state").is_none());
+            for frame in &request[1..4] {
+                assert_eq!(frame["stage"], "retry");
+                assert_eq!(frame["state"], initial);
+            }
+            for frame in &request[4..] {
+                assert!(frame.get("state").is_none());
+            }
+        }
+        if name == "a" {
+            assert_eq!(f.iter().filter(|f| f["stage"] == "hello").count(), 3);
+        }
+    }
+}
+
+/// 可选层的进程错误只略过本层；主动拒绝则直接结束，不能误当成进程故障。
+#[tokio::test]
+async fn optional_format_faults_preserve_input_and_warn_once() {
+    let (up, calls) = upstream(&[200]).await;
+    for args in [
+        &["exit1"][..],
+        &["sleep", "1800"],
+        &["invalid"],
+        &["reply", r#"{"request":{"url":"relative"}}"#],
+        &["error"],
+    ] {
+        let home = TestHome::new();
+        let cfg = layer(&home, "optional", "'request'", args)
+            + "required=false\ntimeout_secs=1\n"
+            + &layer(&home, "suffix", "'request'", &["reply", "{}"]);
+        let (port, out) = launch(&home, up, &cfg);
+        assert!(out.status.success(), "{out:?}");
+        let startup: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let res = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .post(format!("http://127.0.0.1:{port}/"))
+            .body("input")
+            .send()
+            .await
+            .unwrap();
+        let rejected = args[0] == "error";
+        assert_eq!(res.status().as_u16(), if rejected { 422 } else { 200 });
+        res.bytes().await.unwrap();
+        let f = frames(&home, "suffix");
+        if rejected {
+            assert_eq!(f.len(), 1);
+        } else {
+            assert_eq!(f[1]["request"]["body"], "input");
+        }
+        let log = std::fs::read_to_string(startup["log_path"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            log.matches("optional format layer skipped").count(),
+            usize::from(!rejected)
+        );
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 4);
+}
+
+/// 一次覆盖压过实际配置的一次尝试规则，但只对命中路径的这份请求有效。
+#[tokio::test]
+async fn retry_rule_and_override_sources_are_recorded_per_request() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[503, 200, 503]).await;
+    let cfg = String::from("[[retry.rules]]\npath='.*'\nstatus=[503]\nmax_attempts=1\n")
+        + &layer(
+            &home,
+            "chooser",
+            "'request'",
+            &[
+                "reply-on-path",
+                r#"{"overrides":{"retry":{"max_attempts":2,"misspelled":"never-log-this-value"}}}"#,
+            ],
+        );
+    let (port, out) = launch(&home, up, &cfg);
+    assert!(out.status.success(), "{out:?}");
+    let start: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let url = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(6))
+        .build()
+        .unwrap();
+    for (path, expected, by) in [("limited", 200, "override"), ("other", 503, "rule:1")] {
+        let response = client.post(format!("{url}/{path}")).send().await.unwrap();
+        assert_eq!(response.status(), expected);
+        response.bytes().await.unwrap();
+        let f = frames(&home, "chooser");
+        let id = f.last().unwrap()["request_id"].as_str().unwrap();
+        assert_eq!(
+            request_detail(&home, &url, id).await["record"]["tries"][0]["decision"]["by"],
+            by
+        );
+    }
+    let log = std::fs::read_to_string(start["log_path"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        log.matches("invalid or unknown format override ignored")
+            .count(),
+        1
+    );
+    assert!(!log.contains("never-log-this-value"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 3);
+}
+
+/// 同一组头在层间、重试前缀与真实 HTTP 上保持一致；编码不同的历史体不能只按字节版本合并。
+#[tokio::test]
+async fn request_format_headers_encoding_and_history_match_the_upstream() {
+    use base64::Engine as _;
+    use std::io::Write as _;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(b"original").unwrap();
+    let compressed = gz.finish().unwrap();
+    for mode in [
+        "decoded",
+        "bad-gzip",
+        "header-only",
+        "no-program",
+        "metadata-only",
+    ] {
+        let home = TestHome::new();
+        let data = if mode == "bad-gzip" {
+            b"broken".to_vec()
+        } else {
+            compressed.clone()
+        };
+        let up = free_port();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+            .await
+            .unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = observations.clone();
+        let app =
+            axum::Router::new().fallback(move |h: axum::http::HeaderMap, b: axum::body::Bytes| {
+                let seen = seen.clone();
+                async move {
+                    let mut obs = seen.lock().unwrap();
+                    obs.push((h, b));
+                    if obs.len() == 1 && mode != "no-program" {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        axum::http::StatusCode::OK
+                    }
+                }
+            });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut cfg = String::new();
+        if mode == "metadata-only" {
+            cfg += &layer(&home, "meta", "'request','retry'", &["metadata-only"]);
+        } else if mode != "no-program" {
+            let script = home.path().join("patch.json");
+            let mut h = serde_json::json!({"X-Test":"ok","Connection":"close","Content-Length":"900","bad key":"ignored"});
+            if mode == "bad-gzip" {
+                h["Content-Encoding"] = "gzip".into();
+            }
+            let first = serde_json::json!({"request":{"headers":h}});
+            h["Content-Encoding"] = "gzip".into();
+            std::fs::write(
+                &script,
+                serde_json::json!({"request":first,"retry":{"request":{"headers":h}}}).to_string(),
+            )
+            .unwrap();
+            cfg += &layer(
+                &home,
+                "edit",
+                "'request','retry'",
+                &["reply-by-stage", script.to_str().unwrap()],
+            );
+            cfg += &layer(&home, "check", "'request','retry'", &["reply", "{}"]);
+        }
+        let (client, url) = running(&home, up, &cfg);
+        let mut req = client.post(&url).body(data.clone());
+        if mode != "header-only" {
+            req = req.header("content-encoding", "gzip");
+        }
+        let res = req.send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        res.bytes().await.unwrap();
+        let expected = if mode == "decoded" {
+            b"original".as_slice()
+        } else {
+            data.as_slice()
+        };
+        {
+            let obs = observations.lock().unwrap();
+            assert_eq!(obs.len(), if mode == "no-program" { 1 } else { 2 });
+            for (i, (h, b)) in obs.iter().enumerate() {
+                assert_eq!(b.as_ref(), expected);
+                assert_eq!(
+                    h["content-length"].to_str().unwrap(),
+                    expected.len().to_string()
+                );
+                assert_eq!(
+                    h.get("content-encoding").is_some(),
+                    i == 1 || matches!(mode, "bad-gzip" | "no-program" | "metadata-only")
+                );
+                if !matches!(mode, "no-program" | "metadata-only") {
+                    assert_eq!(h["x-test"], "ok");
+                }
+            }
+        }
+        if matches!(mode, "no-program" | "metadata-only") {
+            continue;
+        }
+        let edit = frames(&home, "edit");
+        let check = frames(&home, "check");
+        assert_eq!(edit[1]["request"], edit[2]["request"]);
+        for frame in &check[1..] {
+            let h = frame["request"]["headers"].as_object().unwrap();
+            assert_eq!(h["x-test"], "ok");
+            assert!(
+                h.keys()
+                    .all(|k| matches!(k.as_str(), "x-test" | "content-encoding"))
+            );
+        }
+        if mode == "header-only" {
+            let id = edit[1]["request_id"].as_str().unwrap();
+            let detail = request_detail(&home, &url, id).await;
+            assert_eq!(detail["tries"][1]["sent"]["body"]["state"], "retained");
+            let data = aproxy::daemon::ipc_read_in(
+                &home.path().join("run"),
+                url.rsplit(':').next().unwrap(),
+                &aproxy::daemon::ReadOp::Body {
+                    request_id: id.into(),
+                    part: aproxy::history::Part::Sent,
+                    attempt: Some(2),
+                    offset: None,
+                    limit: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(data["data_b64"].as_str().unwrap())
+                    .unwrap(),
+                b"original"
+            );
+        }
+    }
+}
+
+/// 已提交后保留客户端状态行，只按程序给的类型写 SSE、紧凑 JSON 或标准终态。
+#[tokio::test]
+async fn committed_format_rejection_uses_the_terminal_event_rules() {
+    let (up, calls) = upstream(&[200]).await;
+    for (mime, body, tail) in [
+        (
+            "text/event-stream",
+            "event: end\ndata: custom\n\n",
+            "event: end\ndata: custom\n\n",
+        ),
+        (
+            "application/json",
+            "{\n \"detail\": \"two\"\n}",
+            "event: error\ndata: {\"detail\":\"two\"}\n\n",
+        ),
+        ("text/plain", "not an event", ""),
+    ] {
+        let home = TestHome::new();
+        let json = serde_json::json!({"fail":{"retry":false,"reason":"stop","response":{"status":409,"headers":{"content-type":mime},"body":body}},"overrides":{"keepalive":{"unknown":"never-log-late","interval_secs":"bad-late-value"}}});
+        let cfg = String::from(
+            "[keepalive]\ninterval_secs=1\ntrigger='accept'\n[override_headers]\naccept='text/plain'\n",
+        ) + &layer(&home, "wait", "'request'", &["sleep", "1300"])
+            + &layer(&home, "stop", "'request'", &["reply", &json.to_string()]);
+        let (port, out) = launch(&home, up, &cfg);
+        assert!(out.status.success(), "{out:?}");
+        let start: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let url = format!("http://127.0.0.1:{port}");
+        let res = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(6))
+            .build()
+            .unwrap()
+            .get(&url)
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let bytes = res.text().await.unwrap();
+        if tail.is_empty() {
+            assert!(bytes.contains("event: error\ndata:") && bytes.contains("format_rejected"));
+            assert!(!bytes.contains(body));
+        } else {
+            assert!(bytes.ends_with(tail), "{bytes}");
+        }
+        let f = frames(&home, "stop");
+        assert_eq!(f[1]["client"]["stream"], true);
+        let d = request_detail(&home, &url, f[1]["request_id"].as_str().unwrap()).await;
+        assert_eq!(d["record"]["response_bytes"], tail.len());
+        assert_eq!(d["record"]["code"], "format_rejected");
+        let log = std::fs::read_to_string(start["log_path"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            log.matches("invalid or unknown format override ignored")
+                .count(),
+            2
+        );
+        assert!(!log.contains("never-log-late") && !log.contains("bad-late-value"));
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+/// 关闭尚未提交的真实 HTTP 连接：不启动心跳也能取消卡在请求或非 SSE 响应阶段的进程。
+#[tokio::test]
+async fn disconnected_format_request_releases_the_only_worker_without_heartbeat() {
+    use tokio::io::AsyncWriteExt as _;
+    for (mode, stage) in [("gate-request", "request"), ("gate-response", "response")] {
+        let home = TestHome::new();
+        let (up, _) = upstream(&[200]).await;
+        let gate = home.path().join("hold");
+        let cfg = String::from("[keepalive]\ninterval_secs=0\n")
+            + &layer(
+                &home,
+                "gated",
+                "'request','response'",
+                &[mode, gate.to_str().unwrap()],
+            )
+            + "pool_max=1\ntimeout_secs=0\n";
+        let (client, url) = running(&home, up, &cfg);
+        let mut conn = tokio::net::TcpStream::connect(url.strip_prefix("http://").unwrap())
+            .await
+            .unwrap();
+        conn.write_all(
+            b"POST /hold HTTP/1.1\r\nHost: localhost\r\nContent-Length: 7\r\n\r\nblocked",
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                if std::fs::read_to_string(home.path().join("gated"))
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|s| serde_json::from_str::<Value>(s).ok())
+                    .any(|f| f["stage"] == stage)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(conn);
+        let res = client
+            .post(format!("{url}/next"))
+            .body("second")
+            .timeout(std::time::Duration::from_secs(4))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        res.bytes().await.unwrap();
+        assert_eq!(
+            frames(&home, "gated")
+                .iter()
+                .filter(|f| f["stage"] == "hello")
+                .count(),
+            2,
+            "{mode}: {:?}",
+            frames(&home, "gated")
+        );
+        assert!(!gate.exists());
+    }
 }

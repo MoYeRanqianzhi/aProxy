@@ -217,6 +217,39 @@ impl RequestBody {
         }
     }
 
+    /// 在阻塞线程里严格解码原体；超出驻留阈值就溢写。失败保留原字节，不交出半份解码结果。
+    pub(super) fn decode_for_format(
+        self,
+        encoding: &str,
+        dir: Option<PathBuf>,
+        limit: u64,
+    ) -> (Self, bool) {
+        let mut out = SpillWriter::Memory {
+            buf: Vec::new(),
+            dir,
+        };
+        let decoded = match &self {
+            Self::Memory(bytes) => {
+                crate::decode::decode_strict(encoding, bytes.as_ref(), &mut out, limit).is_ok()
+            }
+            Self::Disk { path, .. } => std::fs::File::open(path).is_ok_and(|file| {
+                crate::decode::decode_strict(encoding, file, &mut out, limit).is_ok()
+            }),
+        };
+        if decoded && let Ok(mut body) = out.into_body() {
+            let body = match &mut body {
+                SpooledBody::Memory(bytes) => Self::Memory(std::mem::take(bytes)),
+                SpooledBody::Disk { path, len } => Self::Disk {
+                    path: std::mem::take(path),
+                    len: *len,
+                },
+            };
+            (body, true)
+        } else {
+            (self, false)
+        }
+    }
+
     /// 把请求体应用为 reqwest body：内存零拷贝；磁盘流式 + content-length。
     pub async fn apply_to(
         &self,

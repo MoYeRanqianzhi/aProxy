@@ -108,11 +108,11 @@ async fn handle(
     // 缓冲请求体以支持重试重放；上限 max_body_mb（默认 128 MB，0=不限），
     // 超出直接 413。disk_cache 开启时超过内存驻留阈值（1 MiB）溢写磁盘，
     // 大请求体的进程内存在途占用恒定。
+    let client_accept = accepts_event_stream(req.headers());
+    let client_encoding = req.headers().get(http::header::CONTENT_ENCODING).cloned();
     let body_limit = state.config.body_limit_bytes();
     let history = trace.rec.request_body(body_encoding(
-        headers
-            .get(http::header::CONTENT_ENCODING)
-            .map(|v| v.as_bytes()),
+        client_encoding.as_ref().map(|v| v.as_bytes()),
     ));
     let (req_body, model) = match read_request_body(
         req.into_body(),
@@ -144,8 +144,8 @@ async fn handle(
     let keepalive_dur = state.config.keepalive_interval();
     let keepalive_enabled = state.config.keepalive_enabled() && keepalive_dur.as_secs() > 0;
     // 「客户端是不是在要一个流」不管保活开没开都判：请求记录的 `stream` 用的是同一个结论
-    let wants_stream =
-        keepalive_triggered(state.config.keepalive_trigger(), &headers, &req_body).await;
+    let (wants_stream, body_stream) =
+        keepalive_triggered(state.config.keepalive_trigger(), client_accept, &req_body).await;
     let keepalive_applies = keepalive_enabled && wants_stream;
     trace.rec.request_bytes(match &req_body {
         RequestBody::Memory(bytes) => bytes.len() as u64,
@@ -162,6 +162,9 @@ async fn handle(
         headers,
         body: req_body,
         replacement: None,
+        client_encoding,
+        client_accept,
+        body_stream,
         // 交给 format 的信封里是同一个请求标识
         ctx: (!state.formats.is_empty()).then(|| {
             ExchangeCtx::new(

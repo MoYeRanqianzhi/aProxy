@@ -257,15 +257,17 @@ pub(super) async fn request_body_wants_stream(body: &RequestBody) -> bool {
 /// 「客户端在等一个流」这一事实。
 pub(super) async fn keepalive_triggered(
     trigger: crate::config::KeepaliveTrigger,
-    headers: &HeaderMap,
+    accept: bool,
     body: &RequestBody,
-) -> bool {
+) -> (bool, Option<bool>) {
     use crate::config::KeepaliveTrigger;
-    let accept_sse = || accepts_event_stream(headers);
     match trigger {
-        KeepaliveTrigger::Accept => accept_sse(),
-        KeepaliveTrigger::BodyStream => request_body_wants_stream(body).await,
-        // Accept 命中就不必扫请求体
-        KeepaliveTrigger::Any => accept_sse() || request_body_wants_stream(body).await,
+        KeepaliveTrigger::Accept => (accept, None),
+        KeepaliveTrigger::Any if accept => (true, None),
+        _ => {
+            // 已经为客户端判定扫描过时，链复用这个值；其余情况用第一帧本来要读的字节。
+            let stream = request_body_wants_stream(body).await;
+            (stream, Some(stream))
+        }
     }
 }

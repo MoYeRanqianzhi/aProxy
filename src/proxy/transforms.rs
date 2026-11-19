@@ -19,6 +19,12 @@ pub(super) struct OutboundRequest {
     pub(super) body: RequestBody,
     /// 最终正文若有改写，游标、前缀与上游只持同一份可重放体的引用。
     pub(super) replacement: Option<Arc<RequestBody>>,
+    /// 客户端原本的编码，用于比较首次发出体与历史所存原体。
+    pub(super) client_encoding: Option<HeaderValue>,
+    /// 保活判定看客户端给出的 Accept，不看上游配置覆盖之后的头。
+    pub(super) client_accept: bool,
+    /// 为初始保活判定扫描过客户端正文时，保存其流标记。
+    pub(super) body_stream: Option<bool>,
     /// 各阶段共享的标识与按程序隔离的 state。
     pub(super) ctx: Option<ExchangeCtx>,
 }
@@ -35,6 +41,8 @@ struct Prefix {
     cursor: usize,
     /// 正文之外的协议字段。
     input: wire::Request,
+    /// 与缓存输入同一时刻的已解析 HTTP 方法。
+    method: http::Method,
     /// 上游可见的完整头表。
     headers: HeaderMap,
     /// 前缀改写体；缺省时仍是客户端原体。
@@ -56,6 +64,8 @@ pub(super) struct RequestChain {
     body_version: u64,
     next_body_version: u64,
     sent_body_version: u64,
+    /// 即使字节不变，编码的差异也会影响历史解码后实际保留的内容。
+    sent_encoding: Option<HeaderValue>,
     /// 保活触发条件只用客户端原样的 Accept 和请求体，不受上游改写影响。
     accept: bool,
     body_stream: Option<bool>,
@@ -92,8 +102,9 @@ impl RequestChain {
             body_version: 0,
             next_body_version: 1,
             sent_body_version: 0,
-            accept: accepts_event_stream(&req.headers),
-            body_stream: None,
+            sent_encoding: req.client_encoding.clone(),
+            accept: req.client_accept,
+            body_stream: req.body_stream,
             cursor: 0,
             stage: Stage::Request,
             last: None,
@@ -110,11 +121,52 @@ impl RequestChain {
         responder: &mut Responder,
     ) -> Result<bool, ChainError> {
         let ctx = req.ctx.as_ref().expect("format context");
+        if attempt == 1
+            && let Some(encoding) = self.headers.get(http::header::CONTENT_ENCODING).cloned()
+            && state.formats.iter().any(|pool| {
+                let hello = pool.negotiated.lock().unwrap();
+                [Stage::Request, Stage::Retry].into_iter().any(|stage| {
+                    pool.entry.has_stage(stage)
+                        && matches!(
+                            hello
+                                .as_ref()
+                                .and_then(|h| h.request_body.get(stage.as_str())),
+                            None | Some(wire::BodyNeed::Full)
+                        )
+                })
+            })
+        {
+            let limit = state.config.body_limit_bytes() as u64;
+            let dir = state.spool_dir.clone();
+            let original = std::mem::replace(&mut req.body, RequestBody::Memory(Bytes::new()));
+            let task = tokio::task::spawn_blocking(move || match encoding.to_str() {
+                Ok(enc) => original.decode_for_format(enc, dir, limit),
+                Err(_) => (original, false),
+            });
+            let (body, decoded) = responder
+                .wait(task, None, "format request decode")
+                .await
+                .ok_or(ChainError::Disconnected)?
+                .map_err(|e| {
+                    ChainError::Stop(
+                        Terminal::local_storage_failed(StorageOp::ReadRequest, &e.to_string()),
+                        None,
+                    )
+                })?;
+            req.body = body;
+            if decoded {
+                self.headers.remove(http::header::CONTENT_ENCODING);
+                self.input.headers.remove("content-encoding");
+                self.body_version = self.next_body_version;
+                self.next_body_version += 1;
+            }
+        }
         if self.cursor == state.formats.len() {
             let Some(p) = &self.prefix else {
                 return Ok(false);
             };
             self.cursor = p.cursor;
+            req.method = p.method.clone();
             self.input = p.input.clone();
             self.headers = p.headers.clone();
             self.body_version = p.version;
@@ -126,6 +178,7 @@ impl RequestChain {
             if self.prefix.is_none() && pool.entry.has_stage(Stage::Retry) {
                 self.prefix = Some(Prefix {
                     cursor: self.cursor,
+                    method: req.method.clone(),
                     input: self.input.clone(),
                     headers: self.headers.clone(),
                     body: self.body.clone(),
@@ -203,6 +256,9 @@ impl RequestChain {
                             );
                         }
                         ctx.absorb(name, reply.state);
+                        if let Some(overrides) = reply.overrides {
+                            self.apply_overrides(state, overrides, responder);
+                        }
                         if let Some(f) = reply.fail {
                             let reason: String = state
                                 .history
@@ -216,6 +272,7 @@ impl RequestChain {
                                 details["fail_code"] =
                                     json!(state.history.secrets().replace(&code));
                             }
+                            tracing::warn!(format=%safe,stage,reason=%reason,"format rejected attempt");
                             return if f.retry {
                                 Err(ChainError::Retry(AttemptFailure::new(
                                     "format_fail",
@@ -230,8 +287,13 @@ impl RequestChain {
                             };
                         }
                         if let Some(mut patch) = reply.request {
-                            if let Some(h) = &patch.headers {
+                            if let Some(method) = patch.method.as_ref().and_then(|s| s.parse().ok())
+                            {
+                                req.method = method;
+                            }
+                            if let Some(h) = &mut patch.headers {
                                 self.headers = transform::headers_from_btreemap(h);
+                                *h = transform::headers_to_btreemap(&self.headers);
                             }
                             if let Some(bytes) = std::mem::take(&mut patch.body).as_bytes() {
                                 self.body = Some(Arc::new(
@@ -251,9 +313,6 @@ impl RequestChain {
                                 self.next_body_version += 1;
                             }
                             self.input.apply(patch);
-                        }
-                        if let Some(overrides) = reply.overrides {
-                            self.apply_overrides(state, overrides, responder);
                         }
                     }
                     Err(Fault::Open { kind, probe_at }) if pool.entry.required => {
@@ -281,10 +340,12 @@ impl RequestChain {
             self.cursor += 1;
         }
         // 游标也可能是从失败层恢复；此前各层留下的 input 必须交付，不能只看本轮是否有补丁。
-        req.method = self.input.method.parse().expect("validated method");
         req.target_url = self.input.url.clone();
         req.headers = self.headers.clone();
-        let changed = self.body_version != self.sent_body_version;
+        let encoding = req.headers.get(http::header::CONTENT_ENCODING);
+        let changed =
+            self.body_version != self.sent_body_version || encoding != self.sent_encoding.as_ref();
+        self.sent_encoding = encoding.cloned();
         self.sent_body_version = self.body_version;
         req.replacement = self.body.clone();
         Ok(changed)
@@ -304,45 +365,47 @@ impl RequestChain {
             for (k, v) in map {
                 let n = v.as_u64();
                 let cfg = Arc::make_mut(&mut state.config);
-                match (group.as_str(), k.as_str()) {
-                    ("timeouts", "connect_secs") if n.is_some() => {
-                        cfg.connect_timeout_secs = n.unwrap();
+                match (group.as_str(), k.as_str(), n) {
+                    ("timeouts", "connect_secs", Some(n)) => {
+                        cfg.connect_timeout_secs = n;
                         state.client = AppState::upstream_client(cfg);
                     }
-                    ("timeouts", "first_byte_secs") if n.is_some() => {
-                        cfg.first_byte_timeout_secs = n.unwrap()
+                    ("timeouts", "first_byte_secs", Some(n)) => cfg.first_byte_timeout_secs = n,
+                    ("timeouts", "read_idle_secs", Some(n)) => cfg.read_timeout_secs = n,
+                    ("retry", "max_backoff_secs", Some(n)) => cfg.max_retry_backoff_secs = n,
+                    ("retry", "max_attempts", Some(n)) if u32::try_from(n).is_ok() => {
+                        self.max_attempts = Some(n as u32)
                     }
-                    ("timeouts", "read_idle_secs") if n.is_some() => {
-                        cfg.read_timeout_secs = n.unwrap()
-                    }
-                    ("retry", "max_backoff_secs") if n.is_some() => {
-                        cfg.max_retry_backoff_secs = n.unwrap()
-                    }
-                    ("retry", "max_attempts") if n.is_some_and(|n| u32::try_from(n).is_ok()) => {
-                        self.max_attempts = Some(n.unwrap() as u32)
-                    }
-                    ("keepalive", _) if responder.is_committed() => {}
-                    ("keepalive", "interval_secs")
-                        if n.is_some_and(|n| {
+                    ("keepalive", "interval_secs", Some(n))
+                        if {
                             tokio::time::Instant::now()
                                 .checked_add(Duration::from_secs(n))
                                 .is_some()
-                        }) =>
+                        } =>
                     {
-                        cfg.keepalive_interval_secs = n.unwrap()
+                        if responder.is_committed() {
+                            continue;
+                        }
+                        cfg.keepalive_interval_secs = n
                     }
-                    ("keepalive", "trigger")
+                    ("keepalive", "trigger", _)
                         if v.as_str() == Some("always")
                             || v.as_str()
                                 .and_then(crate::config::KeepaliveTrigger::parse)
                                 .is_some() =>
                     {
+                        if responder.is_committed() {
+                            continue;
+                        }
                         cfg.keepalive_trigger = v.as_str().map(String::from)
                     }
-                    ("keepalive", "heartbeat")
+                    ("keepalive", "heartbeat", _)
                         if v.as_str()
                             .is_some_and(|s| crate::config::heartbeat_problem(s).is_none()) =>
                     {
+                        if responder.is_committed() {
+                            continue;
+                        }
                         cfg.keepalive_heartbeat = v.as_str().map(String::from)
                     }
                     _ => tracing::warn!("invalid or unknown format override ignored"),
@@ -477,7 +540,9 @@ pub(super) async fn transform_response_if_configured(
             rewrite_body = true;
         }
     }
-    status = StatusCode::from_u16(input.status).expect("validated response status");
+    if let Ok(patched) = StatusCode::from_u16(input.status) {
+        status = patched;
+    }
     if rewrite_headers {
         headers = transform::headers_from_btreemap(&input.headers);
         if let Some(decoded) = decoded_spool {

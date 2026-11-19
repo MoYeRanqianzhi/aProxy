@@ -900,6 +900,9 @@ async fn queued_format_calls_only_read_the_spool_after_admission() {
         headers: HeaderMap::new(),
         body,
         replacement: None,
+        client_accept: false,
+        body_stream: None,
+        client_encoding: None,
         ctx: Some(ExchangeCtx::new(
             "id".into(),
             "/",

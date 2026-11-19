@@ -39,7 +39,7 @@ pub(super) enum Outcome {
     },
     /// 一条重试规则给的尝试次数用完了：不再重试，交付这次失败的响应——客户端拿到真实的
     /// 404 自行处理，好过永远等不到终态（compact 事故，见记忆 bounded-retry-paths）。
-    /// `rule` 是那条规则的序号（从 1 起）
+    /// `rule` 为命中规则的序号（从 1 起）；None 表示本请求的覆盖给出了上限。
     Exhausted {
         response: UpstreamResponse,
         failure: AttemptFailure,
@@ -418,7 +418,8 @@ pub(super) async fn run_attempts(
     r.prepare_upstream_headers(&mut req.headers);
     log_proxied_request(&req.method, path_and_query, &req.target_url);
     let mut sent = sent_head(&rec, &req);
-    let mut same_body = true;
+    let mut same_body =
+        req.headers.get(http::header::CONTENT_ENCODING) == req.client_encoding.as_ref();
     let mut attempt: u32 = 0;
     // 「重试中」的计数守卫：第二次尝试开始时拿到，交付之前放掉；别的出口随函数返回丢弃
     let mut retrying: Option<crate::daemon::Counted> = None;
@@ -472,22 +473,36 @@ pub(super) async fn run_attempts(
                 Err(ChainError::Stop(t, custom)) => {
                     t.record_in(&state.stats);
                     record_try(&rec, attempt, None, true, &req);
-                    rec.try_ended(attempt, 0, None);
-                    if let Some(response) = custom
-                        && !r.is_committed()
-                    {
+                    rec.try_ended(attempt, 0, Some(t.for_history()));
+                    if let Some(response) = custom {
+                        rec.settle(crate::history::Outcome::FormatResponse, Some(t.code()));
                         let mut headers =
                             crate::transform::headers_from_btreemap(&response.headers);
-                        mark_given_up(&mut headers, t.code(), &trace);
-                        trace
-                            .rec
-                            .settle(crate::history::Outcome::FormatResponse, Some(t.code()));
-                        r.respond(build_response(
-                            StatusCode::from_u16(response.status)
-                                .expect("validated response status"),
-                            headers,
-                            Bytes::copy_from_slice(response.body.as_bytes().unwrap_or_default()),
-                        ));
+                        let bytes = response.body.as_bytes().unwrap_or_default();
+                        if r.is_committed() {
+                            let data = if is_event_stream(&headers) {
+                                Bytes::copy_from_slice(bytes)
+                            } else if let Ok(value) =
+                                serde_json::from_slice::<serde_json::Value>(bytes)
+                            {
+                                Bytes::from(format!("event: error\ndata: {value}\n\n"))
+                            } else {
+                                r.finish(t, &trace).await;
+                                return;
+                            };
+                            let size = data.len() as u64;
+                            if r.send(Ok(data)).await {
+                                rec.response_bytes(size);
+                            }
+                        } else if let Ok(status) = StatusCode::from_u16(response.status) {
+                            mark_given_up(&mut headers, t.code(), &trace);
+                            rec.response_bytes(bytes.len() as u64);
+                            r.respond(build_response(
+                                status,
+                                headers,
+                                Bytes::copy_from_slice(bytes),
+                            ));
+                        }
                     } else {
                         r.finish(t, &trace).await;
                     }
@@ -691,7 +706,13 @@ async fn deliver(
     }
     let transform = transform_response_if_configured(state, req, status, headers, body);
     let transformed = if !r.is_committed() && !upstream_sse {
-        Some(transform.await)
+        match r {
+            Responder::Buffered { .. } => Some(transform.await),
+            // 非 SSE 响应不能插入心跳，仍须在下游断开时撤销这次管道往返。
+            Responder::Keepalive { sink, .. } => {
+                tokio::select! { result=transform => Some(result), _=sink.client_gone()=>None }
+            }
+        }
     } else {
         r.wait(transform, None, "响应转换").await
     };

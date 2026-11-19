@@ -144,6 +144,9 @@ fn main() {
                 std::thread::sleep(delay);
             }
             r = json!({"v":1,"seq":0,"name":"format-echo","version":"1.0","protocol":1,"features":[],"stages":["request","retry","response","heartbeat"]});
+            if mode == "metadata-only" {
+                r["request_body"] = json!({"request":"none","retry":"digest"});
+            }
             if mode == "missing-seq" {
                 r.as_object_mut().unwrap().remove("seq");
             }
@@ -207,6 +210,14 @@ fn main() {
                         eprintln!("small-stderr-line");
                     }
                 }
+                "gate-response"
+                    if stage == "response"
+                        && m["request"]["url"]
+                            .as_str()
+                            .is_some_and(|url| url.ends_with("/hold")) =>
+                {
+                    wait_gate(std::path::Path::new(arg));
+                }
                 "gate-request" if m["request"]["body"] == "blocked" => {
                     wait_gate(std::path::Path::new(arg))
                 }
@@ -235,6 +246,23 @@ fn main() {
                     r["seq"] = json!(seq + 1);
                 }
                 "error" => r["fail"] = json!({"retry":false,"reason":reason}),
+                // 大状态与二进制样例从临时文件读，不受系统命令行长度上限影响。
+                "reply-by-stage" => {
+                    let script: Value =
+                        serde_json::from_slice(&std::fs::read(arg).unwrap()).unwrap();
+                    let key = if stage == "retry" {
+                        format!("retry:{}", m["retry"]["attempt"])
+                    } else {
+                        stage.to_string()
+                    };
+                    if let Some(fields) = script
+                        .get(&key)
+                        .or_else(|| script.get(stage))
+                        .and_then(Value::as_object)
+                    {
+                        r.as_object_mut().unwrap().extend(fields.clone());
+                    }
+                }
                 "reply-on-path" if m["client"]["path"] != "/limited" => {}
                 "reply" | "reply-on-path" => {
                     let fields: serde_json::Map<String, Value> = serde_json::from_str(arg).unwrap();

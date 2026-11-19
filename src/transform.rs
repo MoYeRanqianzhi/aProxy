@@ -56,6 +56,10 @@ pub(crate) fn headers_from_btreemap(map: &BTreeMap<String, String>) -> axum::htt
             tracing::warn!("invalid header value omitted from format output");
             continue;
         };
+        if val.to_str().is_err() {
+            tracing::warn!("invalid header value omitted from format output");
+            continue;
+        }
         headers.insert(name, val);
     }
     headers

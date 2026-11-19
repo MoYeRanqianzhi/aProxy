@@ -875,7 +875,7 @@ impl Pool {
                         .and_then(|f| f.response.as_ref())
                         .map(|p| p.status),
                 )
-                .any(|s| http::StatusCode::from_u16(s).is_err())
+                .any(|s| !(100..=599).contains(&s))
             || r.state.as_ref().is_some_and(|s| s.len() > 64 * 1024)
             || r.request
                 .as_ref()

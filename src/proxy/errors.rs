@@ -210,6 +210,16 @@ impl Terminal {
         stats.note_terminal(self.code, &self.details, &self.message);
     }
 
+    /// 链内结束的尝试没有上游响应，明细只描述已脱敏的终止原因。
+    pub(super) fn for_history(&self) -> crate::history::Failure<'_> {
+        crate::history::Failure {
+            code: self.code,
+            details: &self.details,
+            message: &self.message,
+            has_response: false,
+        }
+    }
+
     /// Host 不在允许范围
     pub(super) fn inbound_host_rejected(host: &str) -> Self {
         Self::new(

@@ -343,3 +343,28 @@ async fn restore_does_not_spawn_a_continuation_for_a_halted_install() {
     run(&h, &["install", "--continue"], 0);
     assert!(!path.exists());
 }
+
+/// GitHub 和 npm 共用指定的下载代理，关闭的环回端口让两次查询都在本地失败。
+#[test]
+fn install_check_reports_a_failed_query() {
+    let h = TestHome::new();
+    let proxy = format!("http://127.0.0.1:{}", free_port());
+    let out = run(
+        &h,
+        &["install", "--check", "--json", "--download-proxy", &proxy],
+        1,
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["schema"], 1);
+    assert_eq!(doc["error"]["code"], "install_download_failed");
+    assert_eq!(doc["error"]["details"], serde_json::json!({}));
+    assert!(doc["error"]["message"].is_string());
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("查询最新版本")
+    );
+    for name in ["ledger", "install", "bin"] {
+        assert!(!h.path().join(name).exists());
+    }
+}

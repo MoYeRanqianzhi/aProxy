@@ -264,6 +264,14 @@ pub enum Commands {
 /// `aproxy install` 的参数集。
 #[derive(clap::Args, Debug, Clone, PartialEq)]
 pub struct InstallArgs {
+    /// 只查通道中的目标版本，不登记安装者也不准备安装现场。
+    #[arg(long, help="Check the latest installable version without installing", conflicts_with_all=["version","from","adopt","abort","continue_","handover_from","no_skills","allow_downgrade","skills_only","yes","force"])]
+    pub check: bool,
+
+    /// 机器输出只占用 stdout，人读的说明另写 stderr。
+    #[arg(long, help="Write machine-readable output", requires="check", conflicts_with_all=["force","abort","continue_","skills_only"])]
+    pub json: bool,
+
     /// 安装目标版本：`latest`（默认，按更新通道取最大版本——stable 通道只取
     /// 正式版，pre 通道含预发布；通道见 --pre）或具体版本号（如
     /// 0.2.0-alpha.1）。latest 不高于当前版本时提示「已是最新」不重装。

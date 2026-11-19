@@ -115,6 +115,9 @@ pub(crate) async fn handle_force_cmd(args: &InstallArgs) -> ! {
 
 /// 入口分派：--abort / --from / --adopt / --continue（续作）/ 无参提示。
 pub(crate) async fn handle_install_cmd(args: InstallArgs) {
+    if args.check {
+        return run_check(&args).await;
+    }
     let home = aproxy_ipc::home::home();
     let run_dir = aproxy::daemon::run_dir();
 
@@ -273,22 +276,109 @@ async fn query_latest(
     ctx: &aproxy::install::download::DownloadCtx,
     channel: aproxy::install::download::Channel,
     artifact: aproxy::install::download::Artifact,
-) -> Result<Option<String>, String> {
-    println!("查询最新版本（{} 通道）...", channel.label());
+    json: bool,
+) -> Result<Option<aproxy::install::download::github::LatestRelease>, String> {
+    super::say(
+        json,
+        format_args!("查询最新版本（{} 通道）...", channel.label()),
+    );
     match aproxy::install::download::github::latest_version(ctx, channel, artifact).await {
         Ok(v) => Ok(v),
         Err(gh_err) => {
             match aproxy::install::download::npmpkg::latest_version(ctx, channel).await {
                 Ok(v) => {
-                    println!(
-                        "github 查询失败（{gh_err}），npm 兜底结果：{}",
-                        v.as_deref().unwrap_or("通道内无版本")
+                    super::say(
+                        json,
+                        format_args!(
+                            "github 查询失败（{gh_err}），npm 兜底结果：{}",
+                            v.as_deref().unwrap_or("通道内无版本")
+                        ),
                     );
-                    Ok(v)
+                    Ok(
+                        v.map(|version| aproxy::install::download::github::LatestRelease {
+                            version,
+                            ..Default::default()
+                        }),
+                    )
                 }
                 Err(_) => Err(gh_err),
             }
         }
+    }
+}
+
+/// 只做二进制的 latest 查询，不进入安装台账、锁、备料和续作流程。
+async fn run_check(args: &InstallArgs) {
+    use aproxy::install::download::{
+        Artifact, Channel, DownloadCtx, LatestDecision, decide_latest,
+    };
+    let current = semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("编译版本是 semver");
+    let channel = Channel::resolve(args.pre, &current);
+    let label = channel.label();
+    let query = async {
+        let mut ctx = DownloadCtx::build(
+            env!("CARGO_PKG_VERSION"),
+            effective_proxy(args).as_deref(),
+            args.cpu.as_deref(),
+        )?;
+        if let Some(variant) = &args.variant {
+            ctx.variant = if variant == "desktop" {
+                "desktop"
+            } else {
+                "headless"
+            };
+        }
+        let release = query_latest(&ctx, channel, Artifact::Binary, args.json).await?;
+        Ok::<_, String>((ctx.variant, release))
+    }
+    .await;
+    let (variant, release) = match query {
+        Ok(pair) => pair,
+        Err(e) => {
+            let failure = InstallFailure::new("install_download_failed", e);
+            eprintln!("[ERROR] {failure}");
+            eprintln!("可尝试：--download-proxy <URL> 更换出口。");
+            if args.json {
+                super::print_doc(
+                    serde_json::json!({"error":{"code":failure.code,"message":failure.message,"details":failure.details}}),
+                );
+            }
+            crate::util::exit(failure.exit_code());
+        }
+    };
+    let latest = release.as_ref().map(|r| r.version.as_str());
+    let decision = decide_latest(&current, latest);
+    let update = matches!(decision, LatestDecision::Install(_));
+    match decision {
+        LatestDecision::Install(latest) => super::say(
+            args.json,
+            format_args!(
+                "有新版本 {latest}（当前 {current}，{label} 通道）。执行 aproxy install 升级。"
+            ),
+        ),
+        LatestDecision::UpToDate(latest) => super::say(
+            args.json,
+            format_args!("已是最新：当前 {current}，{label} 通道最新为 {latest}。"),
+        ),
+        LatestDecision::NoneInChannel => super::say(
+            args.json,
+            format_args!("{label} 通道暂无可用版本，当前 {current}。"),
+        ),
+    }
+    if !update && channel == Channel::Stable {
+        super::say(args.json, "（如需预发布版本，可加 --pre）");
+    }
+    if args.json {
+        let mut doc = serde_json::json!({"current":current.to_string(),"latest":latest,"update_available":update,"channel":label,"variant":variant});
+        if let Some(r) = release {
+            if let Some(v) = r.published_at {
+                doc["published_at"] = v.into();
+            }
+            if let Some(v) = r.url {
+                doc["url"] = v.into();
+            }
+        }
+        super::print_doc(doc);
     }
 }
 
@@ -317,8 +407,15 @@ async fn run_skills_only(args: &InstallArgs) {
             let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
                 .expect("内置版本号必为合法 semver");
             let channel = aproxy::install::download::Channel::resolve(args.pre, &current);
-            match query_latest(&ctx, channel, aproxy::install::download::Artifact::Skills).await {
-                Ok(Some(v)) => v,
+            match query_latest(
+                &ctx,
+                channel,
+                aproxy::install::download::Artifact::Skills,
+                false,
+            )
+            .await
+            {
+                Ok(Some(v)) => v.version,
                 Ok(None) => {
                     println!(
                         "{} 通道暂无可用版本，skill 按当前版本 {current} 更新。",
@@ -399,8 +496,8 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         None | Some("latest") => {
             use aproxy::install::download::{Artifact, Channel, LatestDecision, decide_latest};
             let channel = Channel::resolve(args.pre, &current);
-            let candidate = match query_latest(&ctx, channel, Artifact::Binary).await {
-                Ok(c) => c,
+            let candidate = match query_latest(&ctx, channel, Artifact::Binary, args.json).await {
+                Ok(c) => c.map(|r| r.version),
                 Err(gh_err) => {
                     eprintln!("[ERROR] {gh_err}");
                     eprintln!(

@@ -133,7 +133,27 @@ pub fn pick_latest(
     channel: Channel,
     required_asset: &str,
 ) -> Option<String> {
-    let mut best: Option<(semver::Version, String)> = None;
+    pick_release(releases, channel, required_asset).map(|r| r.version)
+}
+
+/// 已选发布的版本和可选的网页元数据；npm 只有版本号，不代它推算日期或地址。
+#[derive(Debug, Default)]
+pub struct LatestRelease {
+    /// 安装器实际选中的语义版本。
+    pub version: String,
+    /// GitHub 为这一条发布提供的发布时间。
+    pub published_at: Option<String>,
+    /// 给用户打开的发布页，而非二进制资产的下载链接。
+    pub url: Option<String>,
+}
+
+/// 只从通过通道、资产和版本筛选的同一条发布取元数据。
+fn pick_release(
+    releases: &serde_json::Value,
+    channel: Channel,
+    required_asset: &str,
+) -> Option<LatestRelease> {
+    let mut best: Option<(semver::Version, &serde_json::Value)> = None;
     for item in releases.as_array()? {
         if item["draft"].as_bool().unwrap_or(false) {
             continue;
@@ -159,10 +179,15 @@ pub fn pick_latest(
             continue;
         }
         if best.as_ref().is_none_or(|(b, _)| ver > *b) {
-            best = Some((ver, ver_str.to_string()));
+            best = Some((ver, item));
         }
     }
-    best.map(|(_, s)| s)
+    let (_, item) = best?;
+    Some(LatestRelease {
+        version: mainline_version(item["tag_name"].as_str()?)?.to_owned(),
+        published_at: item["published_at"].as_str().map(str::to_owned),
+        url: item["html_url"].as_str().map(str::to_owned),
+    })
 }
 
 /// github 通道获取：下载 asset + `<asset>.sha256` 比对（强校验，不匹配即拒）。
@@ -224,7 +249,7 @@ pub async fn latest_version(
     ctx: &DownloadCtx,
     channel: Channel,
     artifact: Artifact,
-) -> Result<Option<String>, String> {
+) -> Result<Option<LatestRelease>, String> {
     // 一页 100 条：两条发版线合计远低于此量级（主线每版一条、format 线
     // 更稀疏）；即便未来超出，被挤出首页的也只会是最旧的 release
     let body = api_get(
@@ -236,7 +261,7 @@ pub async fn latest_version(
     if !body.is_array() {
         return Err("GitHub Releases 列表格式异常（非数组）".to_string());
     }
-    Ok(pick_latest(
+    Ok(pick_release(
         &body,
         channel,
         &artifact.asset_name(ctx.target, ctx.variant, ""),
@@ -258,6 +283,26 @@ mod tests {
             "prerelease": prerelease,
             "assets": [{"name": ASSET, "browser_download_url": "https://x/a"}]
         })
+    }
+
+    /// 时间和网页均取自入选的那条 release，既不取数组首项，也不把资产地址当发布页。
+    #[test]
+    fn metadata_belongs_to_the_selected_release() {
+        let mut chosen = rel("v2.0.0", false);
+        chosen["html_url"] = json!("https://example.test/releases/v2.0.0");
+        chosen["published_at"] = json!("2026-11-01T02:03:04Z");
+        let r = pick_release(
+            &json!([rel("v1.0.0", false), chosen]),
+            Channel::Stable,
+            ASSET,
+        )
+        .unwrap();
+        assert_eq!(r.version, "2.0.0");
+        assert_eq!(
+            r.url.as_deref(),
+            Some("https://example.test/releases/v2.0.0")
+        );
+        assert_eq!(r.published_at.as_deref(), Some("2026-11-01T02:03:04Z"));
     }
 
     #[test]

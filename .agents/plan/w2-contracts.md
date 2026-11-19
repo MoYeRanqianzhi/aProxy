@@ -428,7 +428,7 @@ C1–C8 保证任何版本都能装上任何版本；它也是 settings.json 被
 
 **安装码**用 `install_*` 一族，例如 `install_in_progress`、`install_version_not_found`（退出码 4）、`install_below_floor`、
 `install_download_failed`、`install_checksum_mismatch`、`install_probe_failed`、`install_swap_failed`、`install_rolled_back`、
-`install_unmanaged_instances`（退出码 1，§4.3 第 7 条）、`install_precheck_failed`（退出码 3，滚动重启之前的预检不通过，带 `port` 与 `diagnostics`，§5）。
+`install_unmanaged_instances`（退出码 1，§4.3 第 7 条）、`install_foreground_instances`（退出码 1，有前台实例在运行，带 `ports`，§5）、`install_precheck_failed`（退出码 3，滚动重启之前的预检不通过，带 `port` 与 `diagnostics`，§5）。
 - install 的实现者做 `--json` 时补齐；install.state 的 `error_code` 与 NDJSON 用同一套码。
 - 强制安装只承诺 C7 的退出码。
 
@@ -626,6 +626,7 @@ Windows 内核对象（A）：
      0.1.x 不写台账，C8 第 7 步只报告它们。
    - 检查管不了的实例：台账里有活着的 instance，而 run/ 里没有这个端口的本 schema 实例记录。查两次（R-S2-4、T-S3-3）：
      - 普通 install 在入口查，加锁与下载之前。查到就报错退出，不加锁、不下载、不写 install 状态，真正做到在改动任何东西之前失败。
+       安装者自己的台账登记（C3）在这之前，不算改动：C3 要求它先于任何子进程，`--from` 又要运行源二进制才知道目标版本；条目随进程退出删除。
      - 所有路径（含续作 `install --continue`，包括从 alpha.1 交棒过来的）在广播之前再查一次，也覆盖这段时间里新起的实例。
        查到就以失败结束，实例与 bin 都不动：
        - 置 `phase = failed`、`halted = true`、`error_code = install_unmanaged_instances`；`last_error` 写英文原因，alpha.1 的等待者只读这个字段；
@@ -714,6 +715,14 @@ Windows 内核对象（A）：
 **install**：
 - 滚动重启用同一套原语；install/state.json 只记端口。
 - 换二进制之前，按台账（role 为 watchdog）找到并结束旧看护者，不读看护者记录，所以对任何版本的看护者都有效。
+- **前台实例**（2026-11-19 定）：前台实例没有期望状态记录，滚动重启无从重启它；原来的代码在广播、换完 bin 之后才因此失败。
+  - 与管不了的实例同一处检查：普通 install 在入口查一次，所有路径在广播之前再查一次（先查管不了的实例，两种都有时报前者）。
+    查到就以 `install_foreground_instances`（退出码 1，`details.ports`）失败，实例与 bin 都不动；广播之前查到时同样置 `halted`。
+  - 提示用户先停掉前台实例（在它的终端里 Ctrl+C、`aproxy stop <端口>`，或用托管它的服务管理器），装好之后照原来的方式启动。
+  - 没有选「跳过前台实例，让它留在旧版本上」：广播与终验都要为它开例外，混合版本的现场也更难向用户说明；以后需要再放宽。
+- **安装期间被停掉的端口**（2026-11-19 定）：滚动重启轮到快照里的某个端口时，它既没有活实例、也没有期望状态记录（用户在
+  安装期间 `stop` 了它），就跳过它，结局记为 `skipped`，终验也不再要求它。原来这会让安装在换完 bin 之后失败，留下的
+  failed 现场又会被每条变更类命令拉起的续作反复撞上。有记录、没有活实例的端口（崩溃了）照旧在新二进制上拉起。
 - 管不了的活实例：普通 install 在入口查一次，所有路径在广播之前再查一次，查到就以失败结束，实例与 bin 都不动（§4.3 第 7 条）。
 - **预检**（T-S2-2）：执行续作的目标版本在广播之前，用自己的 §7.5 管线预检每个要滚动重启的实例，即它的 spec 加上当前的 settings.json。
   - 任何一个不过，就以失败结束，什么都不动：不广播、不换 bin、不停实例。置 `phase = failed`、`halted = true`、
@@ -1366,7 +1375,7 @@ aproxy desktop                  W5
 | config、settings | 完成 | 写冲突 | 用法 | 结果无效、未知键、文件无效 | `config get` 时文件不存在 | — |
 | doctor | 没有 error | — | — | 有 error | — | — |
 | find | 完成 | — | — | — | — | — |
-| install | 已安装或已是最新 | 失败（含回滚、管不了的实例） | 用法 | 滚动重启之前的预检不通过（`install_precheck_failed`，§5）；settings 无效本身只告警 | 版本不存在 | — |
+| install | 已安装或已是最新 | 失败（含回滚、管不了的实例、前台实例） | 用法 | 滚动重启之前的预检不通过（`install_precheck_failed`，§5）；settings 无效本身只告警 | 版本不存在 | — |
 | skill | 完成 | 下载或读写失败 | 用法 | — | 没装，或文件不在清单里 | — |
 | desktop | 正常退出 | headless 版本、起不来 | — | — | — | — |
 
@@ -2035,7 +2044,7 @@ aproxy-format 是官方单元的合集：`aproxy-format <角色>` 只启用一�
 | B6 | IPC v1：§6.1–§6.4、§6.6 | B5、B1 | 每个 op 的请求、成功、每种错误都有 golden；未知参数回 `unsupported_arg`；模拟新旧客户端与服务端互连，多出的字段被忽略；`base_url` 带 userinfo 时快照里已打码；没有配置文件的实例，快照的 `instance.config_path` 为 null（T-S3-7）；四种 liveness 都能区分出来 |
 | B7 | 访问控制：§1.6 | B6 | Windows 上读回管道的 DACL，只有当前用户与 SYSTEM；ubuntu 的 CI 里建第二个用户（runner 有免密 sudo），断言它连不上、root 能连上；home 为 0700；权限过宽的既有 home 在第一次写配置后被收紧；临时文件一创建就是 0600，rename 之前不可被他人读取（R-S3-12）；`body` 只在这一块之后出现在 `ops` 里 |
 | B8 | 请求历史、`body`、`subscribe`、事件：§6.3、§6.5、§6.7 | P2、B1、B3、B6、B7（B3：已知密钥包括 settings `defaults` 里的） | 见下面的阈值 |
-| B9 | 命令行：§9（含 install 的 `--json`、`--check`、A5 的四个字段，§4.3 第 7 条的拒绝，以及 §5 的预检） | P5、B2、B3、B5、B6 | §9.5 的每一格都有测试；每个命令的 `--json` 都有 golden；带 `RUST_LOG=info` 运行时 stdout 里没有日志行；`install --force --json` 退出 2；遍历命令树的帮助测试；以 `install --continue --handover-from` 接手的路径有测试；台账里登记为 instance、却没有实例记录的活进程在场时，普通安装在加锁与下载之前就失败（`install_unmanaged_instances`，T-S3-3）；模拟 alpha.1 的安装者交棒、同时 home 里有 alpha.1 启动的活实例时，续作在广播之前以 failed 结束，`halted` 为 true，`error_code` 为 `install_unmanaged_instances`，`last_error` 为英文，bin 与实例都没动；之后在这个 home 里执行 alpha.1 的 `aproxy stop all`，它拉起的续作不接管这个现场（R-S2-4、T-S3-2）；W2 写出的 `pending_restores` 恒为空（R-S3-11）；settings.json 无效、没有活实例时 install 照常完成并告警（R-S3-17）；settings.json 无效、有活实例时 install 以 `install_precheck_failed` 结束，退出码 3，`halted` 为 true，实例没被停、bin 没换（T-S2-2）；`halted` 的现场在场时，W2 的变更类命令不拉起续作（T-S3-2） |
+| B9 | 命令行：§9（含 install 的 `--json`、`--check`、A5 的四个字段，§4.3 第 7 条的拒绝，以及 §5 的预检） | P5、B2、B3、B5、B6 | §9.5 的每一格都有测试；每个命令的 `--json` 都有 golden；带 `RUST_LOG=info` 运行时 stdout 里没有日志行；`install --force --json` 退出 2；遍历命令树的帮助测试；以 `install --continue --handover-from` 接手的路径有测试；台账里登记为 instance、却没有实例记录的活进程在场时，普通安装在加锁与下载之前就失败（`install_unmanaged_instances`，T-S3-3）；模拟 alpha.1 的安装者交棒、同时 home 里有 alpha.1 启动的活实例时，续作在广播之前以 failed 结束，`halted` 为 true，`error_code` 为 `install_unmanaged_instances`，`last_error` 为英文，bin 与实例都没动；之后在这个 home 里执行 alpha.1 的 `aproxy stop all`，它拉起的续作不接管这个现场（R-S2-4、T-S3-2）；W2 写出的 `pending_restores` 恒为空（R-S3-11）；settings.json 无效、没有活实例时 install 照常完成并告警（R-S3-17）；settings.json 无效、有活实例时 install 以 `install_precheck_failed` 结束，退出码 3，`halted` 为 true，实例没被停、bin 没换（T-S2-2）；`halted` 的现场在场时，W2 的变更类命令不拉起续作（T-S3-2）；前台实例在场时普通安装在入口失败、续作在广播之前失败并置 `halted`（`install_foreground_instances`），停掉前台实例之后重新安装能成功；安装期间被停掉的端口被跳过，安装照常完成 |
 | B10a | format 协议核心：hello（含 spawn）、`seq`、链与重试段、request、retry、response、heartbeat、fail、overrides、report、熔断 | P2、B1、B4 | format-echo 升级到协议 1，覆盖坏 `seq`、缺 hello、中途崩溃；链的顺序；配置违反「retry 在后段」时启动失败；没声明 retry 的程序成功之后，重试时收不到消息；熔断：连续 5 次失败之后返回 503，冷却后的试探成功就恢复；网络失败不触发熔断；心跳回信改不了 state |
 | B10b | decide：`decide.success`、`reroute`、体上限 | B10a | 第一个表态者生效；`reroute:false` 时重用上一次的请求；decide 超时回落，并计入熔断 |
 | B10c | stream：retry 的回放转换与 forward 的实时转换 | B10a | forward 下的流式转换端到端通过；中途失败时写出 `abort_tail`；流结束后 worker 的回收符合 §10.6 |

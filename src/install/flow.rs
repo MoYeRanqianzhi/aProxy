@@ -42,19 +42,30 @@ pub struct InstallPlan {
     pub from: std::path::PathBuf,
 }
 
-/// 从同一份只读普查先找管不了的进程，再找不能重启的前台实例；成功时交回计划端口。
+/// 从只读台账与实例普查先找管不了的进程，再找不能重启的前台实例；成功时交回计划端口。
 /// 按进程身份辨认台账项，不把退出后被复用的 pid 当作还在跑的旧实例。
 pub async fn check_restartable(home: &Path) -> Result<Vec<u16>, InstallFailure> {
-    use crate::ops::enumerate::{Liveness, enumerate_in};
-    let found = enumerate_in(home).await;
-    let pids: Vec<_> = found
-        .processes
-        .iter()
-        .filter(|p| p.role == aproxy_ipc::ledger::ROLE_INSTANCE)
-        .map(|p| p.pid.to_string())
+    use aproxy_ipc::ledger;
+    let run_dir = home.join("run");
+    // IPC 仍能应答也不能代替磁盘记录：滚动快照只收录本版本能读出的实例文件。
+    let mut pids: Vec<_> = ledger::read_all_in(home)
+        .into_iter()
+        .map(|f| f.entry)
+        .filter(|e| e.role == ledger::ROLE_INSTANCE && ledger::is_alive(e))
+        .filter(|e| {
+            !e.port
+                .and_then(|p| crate::daemon::read_instance_file_in(&run_dir, &p.to_string()))
+                .is_some_and(|r| r.pid == e.pid && r.start == e.start)
+        })
+        .map(|e| e.pid)
         .collect();
+    pids.sort_unstable();
     if !pids.is_empty() {
-        let pids = pids.join(", ");
+        let pids = pids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(InstallFailure::new(
             "install_unmanaged_instances",
             format!(
@@ -62,21 +73,28 @@ pub async fn check_restartable(home: &Path) -> Result<Vec<u16>, InstallFailure> 
             ),
         ));
     }
+    let survey = crate::daemon::survey_instances_in(&run_dir).await;
     let mut ports = Vec::new();
     let mut foreground = Vec::new();
-    for item in found.instances {
-        if item.liveness == Liveness::Live {
-            ports.push(item.port);
-        }
-        if item.instance.is_some_and(|rec| {
-            rec.foreground
-                && (item.liveness == Liveness::Live
-                    || crate::process::record_identity(rec.pid, &rec.start)
-                        == crate::process::RecordIdentity::Alive)
-        }) {
-            foreground.push(item.port);
+    for rec in survey.responsive.iter().map(|s| &s.instance) {
+        if let Ok(port) = crate::daemon::port_of(&rec.listen_addr).parse::<u16>() {
+            ports.push(port);
         }
     }
+    for rec in survey
+        .responsive
+        .iter()
+        .map(|s| &s.instance)
+        .chain(&survey.unresponsive)
+    {
+        if rec.foreground
+            && let Ok(port) = crate::daemon::port_of(&rec.listen_addr).parse::<u16>()
+        {
+            foreground.push(port);
+        }
+    }
+    ports.sort_unstable();
+    foreground.sort_unstable();
     if !foreground.is_empty() {
         let ports = foreground
             .iter()
@@ -737,7 +755,19 @@ async fn run_tail(
             swap::sweep_residue_in(home, old);
             super::state::advance_in(home, state, InstallPhase::Done)?;
             // 等待者见到 done 才退出。此后只重试本次的唯一旧名，不再碰状态或 staging。
-            super::state::remove_in(home);
+            if let Some(id) = state.report_to
+                && id.0 != std::process::id()
+                && crate::process::process_exited(id.0) != Some(true)
+            {
+                // 等待者还来不及读到结局时也能清场：原子移动同一份状态，由它读完再删。
+                std::fs::rename(
+                    super::state::state_path_in(home),
+                    super::state::outcome_path(home, id),
+                )
+                .map_err(|e| format!("install/state.json: {e}"))?;
+            } else {
+                super::state::remove_in(home);
+            }
         }
         if old_gone && staging_gone {
             break;

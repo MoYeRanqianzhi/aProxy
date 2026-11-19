@@ -269,7 +269,7 @@ pub struct InstallArgs {
     pub check: bool,
 
     /// 机器输出只占用 stdout，人读的说明另写 stderr。
-    #[arg(long, help="Write machine-readable output", requires="check", conflicts_with_all=["force","abort","continue_","skills_only"])]
+    #[arg(long, help="Write machine-readable output", conflicts_with_all=["force","abort","continue_","skills_only"])]
     pub json: bool,
 
     /// 安装目标版本：`latest`（默认，按更新通道取最大版本——stable 通道只取

@@ -430,15 +430,36 @@ pub async fn download_to(client: &reqwest::Client, url: &str, dest: &Path) -> Re
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
+    save_download(resp, dest).await
+}
+
+/// 直接把响应体写入目标，按字节而不是分块数上报进度；写盘失败不发送完成通知。
+async fn save_download(resp: reqwest::Response, dest: &Path) -> Result<(), String> {
     let mut file =
         std::fs::File::create(dest).map_err(|e| format!("{} 创建失败: {e}", dest.display()))?;
+    let total = resp.content_length().or_else(|| {
+        resp.headers()
+            .get(reqwest::header::CONTENT_LENGTH)?
+            .to_str()
+            .ok()?
+            .parse()
+            .ok()
+    });
+    let mut bytes = 0;
+    let mut last = std::time::Instant::now();
     let mut stream = resp;
     use std::io::Write;
     while let Some(chunk) = stream.chunk().await.map_err(|e| format!("下载中断: {e}"))? {
         file.write_all(&chunk)
             .map_err(|e| format!("写入失败: {e}"))?;
+        bytes += chunk.len() as u64;
+        if last.elapsed() >= std::time::Duration::from_millis(100) {
+            let _ = super::state::OBSERVER.try_with(|o| (o.progress)(bytes, total));
+            last = std::time::Instant::now();
+        }
     }
     file.flush().map_err(|e| format!("flush 失败: {e}"))?;
+    let _ = super::state::OBSERVER.try_with(|o| (o.progress)(bytes, total));
     Ok(())
 }
 
@@ -867,6 +888,40 @@ mod tests {
             decide_latest(&cur, Some("garbage")),
             LatestDecision::Install("garbage".into())
         );
+    }
+
+    /// 内存中的 HTTP 响应与真实响应走同一个落盘循环；不连网也能核对最后的字节数。
+    #[tokio::test]
+    async fn completed_download_reports_bytes_with_or_without_a_total() {
+        use crate::install::state::{OBSERVER, Observer};
+        tokio::task_local! { static SAMPLE: std::cell::Cell<Option<(u64,Option<u64>)>>; }
+        for total in [Some(3u64), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut response = http::Response::builder();
+            if let Some(n) = total {
+                response = response.header("content-length", n);
+            }
+            // 流式 body 不自带长度：无 Content-Length 时不替服务器猜一个总量。
+            let body =
+                reqwest::Body::wrap_stream(futures_util::stream::iter([Ok::<_, std::io::Error>(
+                    bytes::Bytes::from_static(b"abc"),
+                )]));
+            let resp = reqwest::Response::from(response.body(body).unwrap());
+            let observer = Observer {
+                id: (0, 0),
+                state: |_| {},
+                progress: |bytes, total| SAMPLE.with(|s| s.set(Some((bytes, total)))),
+            };
+            SAMPLE
+                .scope(std::cell::Cell::new(None), async {
+                    OBSERVER
+                        .scope(observer, save_download(resp, &dir.path().join("asset")))
+                        .await
+                        .unwrap();
+                    assert_eq!(SAMPLE.with(|s| s.get()), Some((3, total)));
+                })
+                .await;
+        }
     }
 
     #[tokio::test]

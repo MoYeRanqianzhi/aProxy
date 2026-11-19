@@ -40,13 +40,7 @@ async fn continue_from_restarting_reclaims_instance() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
-    let test_home = TestHome::new();
-    // 进程级注入 APROXY_HOME：本文件独占测试进程（cargo test 每 target 一
-    // 进程），可安全 set_var。必须设在进程 env 上——spawn_detached 只继承
-    // 父进程环境，仅给直接子进程 cmd.env 注入管不到隔代 spawn（实测教训：
-    // 新守护把注册表写进真实 ~/.aproxy/run，测试轮询 tempdir 永远落空）。
-    // edition 2024 下 set_var 为 unsafe（本测试单线程且无并发读 env，安全）。
-    unsafe { std::env::set_var("APROXY_HOME", test_home.path()) };
+    let test_home = live_home();
     let home = test_home.path();
     let run_dir = home.join("run");
     std::fs::create_dir_all(&run_dir).unwrap();
@@ -204,8 +198,7 @@ async fn continue_from_restarting_reclaims_instance() {
 #[tokio::test(flavor = "current_thread")]
 async fn continue_from_swapping_with_live_instance_redoes_swap() {
     let _guard = LIVE_TEST_LOCK.lock().await;
-    let test_home = TestHome::new();
-    unsafe { std::env::set_var("APROXY_HOME", test_home.path()) };
+    let test_home = live_home();
     let home = test_home.path();
     let run_dir = home.join("run");
     std::fs::create_dir_all(&run_dir).unwrap();
@@ -327,6 +320,13 @@ fn crash_state(phase: InstallPhase, from: &Path, staged: Option<&Path>) -> Insta
     state
 }
 
+/// 库层故障注入刻意让进程所见的 home 与安装现场不同：禁止早交棒，才能观察进程内续作。
+/// 两者都由 TestHome 隔离；版本探测继承前者，且不会并行下载 skill。
+async fn in_process_homes() -> (tokio::sync::MutexGuard<'static, ()>, TestHome, TestHome) {
+    let lock = LIVE_TEST_LOCK.lock().await;
+    (lock, live_home(), TestHome::new())
+}
+
 fn usable_from(home: &Path) -> std::path::PathBuf {
     let from = home.join("download.exe");
     std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &from).unwrap();
@@ -341,7 +341,7 @@ fn usable_from(home: &Path) -> std::path::PathBuf {
 /// 恢复矩阵行「downloading 中」：staging 半截文件 → 删半截重下 → done。
 #[tokio::test(flavor = "current_thread")]
 async fn crash_during_downloading_redownloads() {
-    let dir = tempfile::tempdir().unwrap();
+    let (_lock, _probe_home, dir) = in_process_homes().await;
     let home = dir.path();
     let run_dir = home.join("run");
     std::fs::create_dir_all(&run_dir).unwrap();
@@ -371,7 +371,7 @@ async fn crash_during_downloading_redownloads() {
 #[cfg(windows)]
 #[tokio::test(flavor = "current_thread")]
 async fn crash_during_swapping_recovers_from_staging() {
-    let dir = tempfile::tempdir().unwrap();
+    let (_lock, _probe_home, dir) = in_process_homes().await;
     let home = dir.path();
     let run_dir = home.join("run");
     std::fs::create_dir_all(&run_dir).unwrap();
@@ -416,7 +416,7 @@ async fn crash_during_swapping_recovers_from_staging() {
 /// 终验/清理）→ done。
 #[tokio::test(flavor = "current_thread")]
 async fn crash_after_swap_finishes_tail() {
-    let dir = tempfile::tempdir().unwrap();
+    let (_lock, _probe_home, dir) = in_process_homes().await;
     let home = dir.path();
     let run_dir = home.join("run");
     std::fs::create_dir_all(&run_dir).unwrap();
@@ -498,7 +498,7 @@ async fn without_state_only_an_expired_announcement_is_removed() {
 /// 重做清理即 done。
 #[tokio::test(flavor = "current_thread")]
 async fn crash_during_cleaning_resumes_without_backward_move() {
-    let dir = tempfile::tempdir().unwrap();
+    let (_lock, _probe_home, dir) = in_process_homes().await;
     let home = dir.path();
     let run_dir = home.join("run");
     std::fs::create_dir_all(&run_dir).unwrap();
@@ -548,7 +548,7 @@ async fn done_residue_is_cleared() {
 /// 推进同一个安装。指名接手者不再往下交：这里它在进程内把安装做完。
 #[tokio::test(flavor = "current_thread")]
 async fn only_the_named_successor_takes_over_a_live_install() {
-    let dir = tempfile::tempdir().unwrap();
+    let (_lock, _probe_home, dir) = in_process_homes().await;
     let home = dir.path();
     let run_dir = home.join("run");
     std::fs::create_dir_all(&run_dir).unwrap();
@@ -600,6 +600,11 @@ fn live_home() -> TestHome {
     let home = TestHome::new();
     // 续作只测二进制与实例，不能让并行的 skill 更新访问真实发布源。
     home.settings(r#"{"watchdog":{"enabled":false},"update":{"skill_auto_update":false}}"#);
+    // 进程级注入 APROXY_HOME：本文件独占测试进程（cargo test 每 target 一
+    // 进程），可安全 set_var。必须设在进程 env 上——spawn_detached 只继承
+    // 父进程环境，仅给直接子进程 cmd.env 注入管不到隔代 spawn（实测教训：
+    // 新守护把注册表写进真实 ~/.aproxy/run，测试轮询 tempdir 永远落空）。
+    // edition 2024 下 set_var 为 unsafe（本测试单线程且无并发读 env，安全）。
     unsafe { std::env::set_var("APROXY_HOME", home.path()) };
     std::fs::create_dir_all(home.path().join("run")).unwrap();
     home
@@ -811,8 +816,6 @@ async fn rollback_case(kind: BrokenNew) {
     let _ = child.wait();
 }
 
-/// 失败现场（failed + halted）里的实例其实都已从 bin 的二进制、以目标版本正常
-/// 服务：续作收尾清场，不碰实例。只比版本不够——上面的回滚用例里实例跑在
 /// 交换后用户停掉快照中的一个端口，只滚动仍在服务的另一个；终验不把被停端口拉回来。
 #[tokio::test(flavor = "current_thread")]
 async fn rolling_restart_skips_a_port_stopped_during_the_install() {
@@ -888,6 +891,8 @@ async fn rolling_restart_skips_a_port_stopped_during_the_install() {
     assert!(!aproxy::install::state::state_path_in(home).exists());
 }
 
+/// 失败现场（failed + halted）里的实例其实都已从 bin 的二进制、以目标版本正常
+/// 服务：续作收尾清场，不碰实例。只比版本不够——上面的回滚用例里实例跑在
 /// 旧二进制上、版本号却相同，那里续作必须照旧拒绝
 #[tokio::test(flavor = "current_thread")]
 async fn halted_failure_is_cleaned_up_when_the_fleet_already_runs_the_target() {

@@ -91,6 +91,17 @@ async fn run(cli: Cli) {
     // 错误的目录里读写强。`--version`、`--help` 不读 home，在上面已经结束；强制安装在
     // 上面自己报告（退出码 10）
     if let Err(e) = aproxy_ipc::home::resolve_home() {
+        if let Some(Commands::Install(args)) = &cli.command
+            && args.json
+        {
+            let error = serde_json::json!({"code":"install_failed","message":e,"details":{}});
+            let body = if args.check {
+                serde_json::json!({"error":error})
+            } else {
+                serde_json::json!({"event":"result","outcome":"failed","version":null,"error":error})
+            };
+            commands::print_doc(body);
+        }
         eprintln!("[ERROR] {e}");
         std::process::exit(1);
     }

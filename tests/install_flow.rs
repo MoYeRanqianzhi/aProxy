@@ -85,12 +85,17 @@ fn wait_install_done(env: &TestEnv, timeout: Duration) -> bool {
     true
 }
 
-fn bin_works(home: &std::path::Path) -> bool {
-    let bin = aproxy::install::swap::bin_path_in(home);
-    bin.is_file()
-        && aproxy::install::staging::probe_version(&bin)
-            .map(|v| v == env!("CARGO_PKG_VERSION"))
-            .unwrap_or(false)
+/// 规范位置的镜像必须能在同一个临时 home 中自报本次构建的版本。
+fn bin_works(home: &TestHome) -> bool {
+    let bin = aproxy::install::swap::bin_path_in(home.path());
+    home.cmd_with(&bin)
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| {
+            out.status.success()
+                && aproxy::install::staging::version_of(&bin, &String::from_utf8_lossy(&out.stdout))
+                    .is_ok_and(|v| v == env!("CARGO_PKG_VERSION"))
+        })
 }
 
 /// bin 里交换留下的中间文件（`aproxy.old-…`、`aproxy.tmp-…`）
@@ -149,7 +154,7 @@ fn install_from_without_instances_fast_path() {
     // 终态：bin 可运行、让位的旧二进制已删、staging 清理（Windows 上接手者交换后
     // 把剩余阶段交给了 bin 里的二进制，staging 里的副本已不在运行）、状态文件删除
     //（done 的完成语义）
-    assert!(bin_works(&env.home()));
+    assert!(bin_works(&env.home));
     assert!(
         residues(&env.home()).is_empty(),
         "无实例快路径下让位的旧二进制应在 cleaning 删除（无镜像锁）: {:?}",
@@ -230,7 +235,7 @@ fn install_from_with_instance_rolling_restart() {
 
     // 终态断言：bin 可运行、让位的旧二进制已删（尾部由 bin 里的二进制执行，非自
     // 镜像）、实例已滚动到新 pid（旧实例被优雅停止后用新二进制拉起）
-    assert!(bin_works(&env.home()));
+    assert!(bin_works(&env.home));
     assert!(
         residues(&env.home()).is_empty(),
         "{:?}",
@@ -489,7 +494,7 @@ fn adopt_migrates_foreign_instance() {
     assert!(!state.exists(), "收编未完成（状态文件残留）");
 
     // 终态：标准位置出现二进制、实例滚动到 bin 二进制
-    assert!(bin_works(&env.home()));
+    assert!(bin_works(&env.home));
     let live = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

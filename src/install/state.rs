@@ -173,6 +173,26 @@ pub struct InstanceOutcome {
     pub outcome: String,
 }
 
+/// 本次命令在安装任务的上下文里接收进度。分离的接手进程没有这些函数，只负责写状态。
+pub struct Observer {
+    /// 用户进程与调用时间，限定终态副本只能交给这一轮的等待者。
+    pub id: (u32, u64),
+    /// 本进程成功落盘之后立即通知，不依赖轮询的采样频率。
+    pub state: fn(&InstallState),
+    /// 二进制下载的字节数；未提供 Content-Length 时总量未知。
+    pub progress: fn(u64, Option<u64>),
+}
+
+tokio::task_local! {
+    /// 只属于运行普通安装的任务，不传给并行下载 skill 的支线。
+    pub static OBSERVER: Observer;
+}
+
+/// 等待者专属的终态文件；只用数字构造路径，不采信现场里可指向 home 外的路径。
+pub fn outcome_path(home: &Path, (pid, at): (u32, u64)) -> PathBuf {
+    super::install_dir_in(home).join(format!("result-{pid}-{at}.json"))
+}
+
 /// install.state 全量 schema。全部字段 serde default——旧版本状态文件缺
 /// 字段可读，新字段加入不破坏旧二进制续跑（恢复矩阵「状态文件损坏」之外
 /// 的兼容底线）。
@@ -239,6 +259,12 @@ pub struct InstallState {
     /// 码表声明的详情对象，不把结构化诊断塞进给旧安装者的文字。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_details: Option<serde_json::Value>,
+    /// 需要读取完整结局的等待者；不输出事件的安装仍然就地清场。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_to: Option<(u32, u64)>,
+    /// 已经落盘的相位及其首次进入的毫秒时间，让交棒后两次读取之间的快相位也能报告。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phase_times: Vec<(InstallPhase, u64)>,
     /// 已完成的实例结局，交棒或进程中断后仍可观察。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub instance_outcomes: Vec<InstanceOutcome>,
@@ -268,6 +294,8 @@ impl InstallState {
             installer_version: Some(env!("CARGO_PKG_VERSION").into()),
             error_code: None,
             error_details: None,
+            report_to: OBSERVER.try_with(|o| o.id).ok(),
+            phase_times: Vec::new(),
             instance_outcomes: Vec::new(),
         }
     }
@@ -369,8 +397,21 @@ pub fn create_new_in(
 /// 原子重写（crate::fsx::write_atomic）并刷新 updated_at。
 pub fn write_in(home: &Path, state: &mut InstallState) -> std::io::Result<()> {
     state.updated_at = now_secs();
+    let record =
+        state.report_to.is_some() && !state.phase_times.iter().any(|(p, _)| *p == state.phase);
+    if record {
+        state
+            .phase_times
+            .push((state.phase, crate::watchdog::now_millis()));
+    }
     let json = serde_json::to_string_pretty(state).expect("序列化安装状态失败");
-    crate::fsx::write_atomic(&state_path_in(home), json.as_bytes())
+    crate::fsx::write_atomic(&state_path_in(home), json.as_bytes()).inspect_err(|_| {
+        if record {
+            state.phase_times.pop();
+        }
+    })?;
+    let _ = OBSERVER.try_with(|o| (o.state)(state));
+    Ok(())
 }
 
 /// 阶段推进：校验迁移合法性后原子落盘。非法迁移是编程错误（状态机被绕过

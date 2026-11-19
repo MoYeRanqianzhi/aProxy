@@ -132,6 +132,22 @@ async fn pid(h: &TestHome, p: u16) -> u32 {
 fn install_fails_before_touching_anything_with_unmanaged_instances() {
     let (h, from, bin) = fixture();
     let child = unmanaged(&h);
+    let lines = events(&run(
+        &h,
+        &[
+            "install",
+            "--from",
+            from.to_str().unwrap(),
+            "--no-skills",
+            "--json",
+        ],
+        1,
+    ));
+    let result = lines.last().unwrap();
+    assert_eq!(result["event"], "result");
+    assert_eq!(result["outcome"], "failed");
+    assert_eq!(result["error"]["code"], "install_unmanaged_instances");
+    assert_eq!(lines.len(), 1);
     let out = run(
         &h,
         &["install", "--from", from.to_str().unwrap(), "--no-skills"],
@@ -151,6 +167,23 @@ fn install_fails_before_touching_anything_with_unmanaged_instances() {
 async fn install_refuses_foreground_instances_before_touching_anything() {
     let (h, from, bin) = fixture();
     let (p, child) = instance(&h, &from, true).await;
+    let lines = events(&run(
+        &h,
+        &[
+            "install",
+            "--from",
+            from.to_str().unwrap(),
+            "--no-skills",
+            "--json",
+        ],
+        1,
+    ));
+    let result = lines.last().unwrap();
+    assert_eq!(result["event"], "result");
+    assert_eq!(result["outcome"], "failed");
+    assert_eq!(result["error"]["code"], "install_foreground_instances");
+    assert_eq!(lines.len(), 1);
+    assert_eq!(result["error"]["details"], serde_json::json!({"ports":[p]}));
     let out = run(
         &h,
         &["install", "--from", from.to_str().unwrap(), "--no-skills"],
@@ -239,6 +272,23 @@ async fn install_precheck_failure_changes_nothing() {
     let (p, child) = instance(&h, &bin, false).await;
     let before = fs::metadata(&bin).unwrap().modified().unwrap();
     h.settings(r#"{"schema":1,"nope":1}"#);
+    let lines = events(&run(
+        &h,
+        &[
+            "install",
+            "--from",
+            from.to_str().unwrap(),
+            "--no-skills",
+            "--json",
+        ],
+        3,
+    ));
+    let result = lines.last().unwrap();
+    assert_eq!(result["event"], "result");
+    assert_eq!(result["outcome"], "failed");
+    assert_eq!(result["error"]["code"], "install_precheck_failed");
+    assert_eq!(result["error"]["details"]["port"], p);
+    assert_eq!(pid(&h, p).await, child.0.id());
     let out = run(
         &h,
         &["install", "--from", from.to_str().unwrap(), "--no-skills"],
@@ -367,4 +417,107 @@ fn install_check_reports_a_failed_query() {
     for name in ["ledger", "install", "bin"] {
         assert!(!h.path().join(name).exists());
     }
+}
+
+/// 每一行都是独立文档，以便管道消费者在安装尚未结束时就能使用它。
+fn events(out: &Output) -> Vec<serde_json::Value> {
+    std::str::from_utf8(&out.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let doc: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(doc["schema"], 1);
+            doc
+        })
+        .collect()
+}
+
+/// 一次从规范镜像运行的真实滚动跨过交棒，验证完整的相位、实例和最终应答。
+#[tokio::test]
+async fn install_json_reports_plan_phases_instances_and_result() {
+    let (h, from, bin) = fixture();
+    binary(&bin);
+    let (p, child) = instance(&h, &bin, false).await;
+    let out = run(
+        &h,
+        &[
+            "install",
+            "--from",
+            from.to_str().unwrap(),
+            "--json",
+            "--no-skills",
+        ],
+        0,
+    );
+    let lines = events(&out);
+    assert_eq!(
+        lines[0],
+        serde_json::json!({"schema":1,"event":"plan","ports":[p]})
+    );
+    let phases: Vec<_> = lines
+        .iter()
+        .filter(|d| d["event"] == "phase")
+        .map(|d| {
+            assert!(d["at"].as_u64().unwrap() > 0);
+            serde_json::from_value::<InstallPhase>(d["phase"].clone()).unwrap()
+        })
+        .collect();
+    assert_eq!(
+        phases,
+        [InstallPhase::RUN_ORDER, &[InstallPhase::Done]].concat()
+    );
+    let instances: Vec<_> = lines.iter().filter(|d| d["event"] == "instance").collect();
+    assert_eq!(
+        instances,
+        vec![&serde_json::json!({"schema":1,"event":"instance","port":p,"outcome":"restarted"})]
+    );
+    assert_eq!(
+        lines.last().unwrap(),
+        &serde_json::json!({"schema":1,"event":"result","outcome":"installed","version":env!("CARGO_PKG_VERSION")})
+    );
+    assert_ne!(pid(&h, p).await, child.0.id());
+}
+
+/// 即便还可以通过期望记录找到应答者，缺失本 schema 的实例记录也不能把它列进滚动计划。
+#[tokio::test]
+async fn install_plan_requires_a_readable_instance_record_not_only_an_ipc_reply() {
+    let (h, from, bin) = fixture();
+    binary(&bin);
+    let (p, child) = instance(&h, &bin, false).await;
+    let path = aproxy::daemon::instance_file_path_in(&h.path().join("run"), &p.to_string());
+    let original = fs::read(&path).unwrap();
+    fs::write(&path, r#"{"schema":999}"#).unwrap();
+    let out = run(
+        &h,
+        &[
+            "install",
+            "--from",
+            from.to_str().unwrap(),
+            "--no-skills",
+            "--json",
+        ],
+        1,
+    );
+    fs::write(path, original).unwrap();
+    let lines = events(&out);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["error"]["code"], "install_unmanaged_instances");
+    assert_eq!(pid(&h, p).await, child.0.id());
+    assert!(!state::state_path_in(h.path()).exists());
+}
+
+/// 无法决定目标的失败也必须以单行结束，不能先输出空计划来表示「没有实例」。
+#[test]
+fn install_json_probe_failure_has_no_plan() {
+    let h = TestHome::new();
+    let missing = h.path().join("no-image");
+    let lines = events(&run(
+        &h,
+        &["install", "--from", missing.to_str().unwrap(), "--json"],
+        1,
+    ));
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["outcome"], "failed");
+    assert_eq!(lines[0]["error"]["code"], "install_probe_failed");
+    assert!(lines[0]["version"].is_null());
 }

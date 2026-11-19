@@ -336,3 +336,22 @@ fn cli_logs_stay_off_stdout() {
     );
     assert!(!text(&quiet.stderr).contains(INFO) && !text(&quiet.stdout).contains(INFO));
 }
+
+/// 用法错误必须在解析层结束：连安装目录与 bin 都不能出现。
+#[test]
+fn install_check_and_json_reject_conflicting_modes() {
+    let h = TestHome::new();
+    for args in [
+        &["install", "--force", "--json"][..],
+        &["install", "--force", "--check"],
+        &["upgrade", "--force", "--json"],
+        &["install", "--check", "0.2.0"],
+        &["install", "--check", "--from", "x"],
+        &["install", "--abort", "--json"],
+        &["install", "--continue", "--json"],
+        &["install", "--skills-only", "--json"],
+    ] {
+        assert_eq!(run(&h, args).status.code(), Some(2), "{args:?}");
+        assert!(!h.path().join("install").exists() && !h.path().join("bin").exists());
+    }
+}

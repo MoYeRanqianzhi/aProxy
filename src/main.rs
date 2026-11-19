@@ -104,7 +104,10 @@ async fn run(cli: Cli) {
 
     // 其余命令的日志走 stdout（RUST_LOG 可覆盖）。前台实例没有日志文件，实例记录里的
     // log_path 因此为空（logs 命令据此立即报「日志输出在它的控制台」）
-    server::init_foreground_logging();
+    // status --json 的 stdout 只留给文档；设置告警仍由下面的检查写到 stderr。
+    if !matches!(cli.command, Some(Commands::Status { json: true, .. })) {
+        server::init_foreground_logging();
+    }
 
     // 看护者：进入看护主循环（claim 接管 + 收养 + 健康扫描 + 重拉）。
     if let Some(Commands::Watchdog { .. }) = &cli.command {
@@ -180,8 +183,8 @@ async fn run(cli: Cli) {
 
     // 子命令分派
     match cli.command {
-        Some(Commands::Status { idle, busy }) => {
-            commands::status::handle_status_cmd(idle, busy).await
+        Some(Commands::Status { idle, busy, json }) => {
+            commands::status::handle_status_cmd(idle, busy, json).await
         }
         Some(Commands::Start(args)) => commands::start::handle_start_cmd(args).await,
         Some(Commands::Stop {

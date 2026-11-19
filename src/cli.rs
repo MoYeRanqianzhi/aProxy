@@ -90,6 +90,9 @@ pub enum Commands {
         /// 只列活跃（阈值内有请求）的实例
         #[arg(long)]
         busy: bool,
+        /// 输出一个 JSON 文档（给程序读）
+        #[arg(long)]
+        json: bool,
     },
 
     /// 启动代理，可指定配置别名或配置文件路径。默认在后台运行。

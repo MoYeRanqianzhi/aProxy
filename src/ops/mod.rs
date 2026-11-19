@@ -17,7 +17,6 @@
 
 pub mod alias;
 pub mod enumerate;
-pub mod list;
 pub mod restart;
 pub mod restore;
 pub mod start;

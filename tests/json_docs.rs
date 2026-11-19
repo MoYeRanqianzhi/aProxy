@@ -5,7 +5,8 @@ mod common;
 use common::{TestHome, free_port};
 
 use std::fs;
-use std::process::{Output, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 use aproxy::settings::path_match_key;
 use serde_json::{Value, json};
@@ -49,6 +50,138 @@ fn assert_keys(value: &Value, keys: &[&str]) {
     for key in keys {
         assert!(obj.contains_key(*key), "缺少 {key}: {value}");
     }
+}
+
+/// 模拟崩溃：按 pid 强行结束本测试自己启动的实例，等它的端口不再接受连接。期望状态记录
+/// 留在原处，正是崩溃之后的样子。
+fn crash(pid: u64, port: u16) {
+    #[cfg(windows)]
+    let status = Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .stdout(Stdio::null())
+        .status();
+    #[cfg(unix)]
+    let status = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    assert!(status.unwrap().success(), "结束 pid {pid} 失败");
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("pid {pid} 被结束之后，端口 {port} 仍在接受连接");
+}
+
+/// 空 home 也输出完整文档；活动筛选只影响运行中的实例，等待恢复的实例仍可供人和程序查看。
+#[test]
+fn status_json_document() {
+    let home = TestHome::new();
+    let args = ["status", "--json"];
+    assert_eq!(
+        document(&run(&home, &args)),
+        json!({
+            "schema": 1,
+            "instances": [],
+            "unreadable": [],
+            "watchdog": null,
+            "processes": []
+        })
+    );
+
+    let port = free_port();
+    let path = home.path().join("a.toml");
+    fs::write(
+        &path,
+        format!("base_url = \"https://a.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
+    )
+    .unwrap();
+    home.stop_on_drop(port);
+    let start = document(&run(&home, &["start", path.to_str().unwrap(), "--json"]));
+    let pid = start["pid"].as_u64().unwrap();
+
+    let doc = document(&run(&home, &args));
+    let instances = doc["instances"].as_array().unwrap();
+    assert_eq!(instances.len(), 1);
+    let live = &instances[0];
+    assert_eq!(live["port"], port);
+    assert_eq!(live["liveness"], "live");
+    assert_eq!(live["instance"]["pid"], pid);
+    assert_eq!(live["status"]["state"], "serving");
+    assert_eq!(live["restore_pending"], false);
+    assert!(live.get("reason").is_none(), "{live}");
+
+    let busy = document(&run(&home, &["status", "--json", "--busy"]));
+    assert!(
+        busy["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["port"] == port),
+        "{busy}"
+    );
+    let idle = document(&run(&home, &["status", "--json", "--idle"]));
+    assert_eq!(idle["instances"], json!([]));
+
+    let plain = run(&home, &["status"]);
+    let stdout = String::from_utf8_lossy(&plain.stdout);
+    assert!(stdout.contains("运行中的 aProxy 实例 (1):"), "{stdout}");
+    assert!(stdout.contains(&format!("端口 {port}")), "{stdout}");
+
+    crash(pid, port);
+    fs::remove_file(&path).unwrap();
+
+    let doc = document(&run(&home, &args));
+    let down = doc["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["port"] == port)
+        .unwrap();
+    assert_eq!(down["liveness"], "down");
+    assert_eq!(down.get("instance"), Some(&Value::Null));
+    assert_eq!(down["restore_pending"], true);
+    assert_eq!(down["restore_reason"], "config_missing");
+
+    let plain = run(&home, &["status"]);
+    let stdout = String::from_utf8_lossy(&plain.stdout);
+    assert!(stdout.contains("等待恢复的实例 (1)"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("端口 {port}（配置文件找不到）")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("不再需要它时执行 aproxy stop {port}")),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("没有运行中的 aProxy 实例"), "{stdout}");
+}
+
+/// 读不懂的记录带相对路径和原因列出，暂停日志清理的状态也必须对人和程序可见。
+#[test]
+fn status_lists_unreadable_records() {
+    let home = TestHome::new();
+    let port = free_port();
+    let file = format!("{port}.instance.json");
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).unwrap();
+    fs::write(run_dir.join(&file), "not json").unwrap();
+    let file = format!("run/{file}");
+
+    let doc = document(&run(&home, &["status", "--json"]));
+    let unreadable = doc["unreadable"].as_array().unwrap();
+    assert_eq!(unreadable.len(), 1);
+    assert_eq!(unreadable[0]["file"], file);
+    assert_eq!(unreadable[0]["reason"]["code"], "record_unreadable");
+    assert_eq!(doc["gc_paused"], json!({"reason": "unreadable_records"}));
+
+    let plain = run(&home, &["status"]);
+    let stdout = String::from_utf8_lossy(&plain.stdout);
+    assert!(stdout.contains("读不懂的记录 (1)"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("{file}  [record_unreadable]")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("日志清理已暂停"), "{stdout}");
 }
 
 /// 别名按名称排序；目标消失只改变 exists，不会抹掉已登记的路径。

@@ -1,49 +1,151 @@
-//! `aproxy status [--idle|--busy]`：列出运行中的实例。
+//! `aproxy status [--idle|--busy] [--json]`：只读清点 home 里的实例、记录与其他进程。
 
 use aproxy::daemon;
-use aproxy::ops::list::{ActivityFilter, enumerate};
+use aproxy::ops::enumerate::{
+    Enumerated, Enumeration, Liveness, RESTORE_REASON_CONFIG_MISSING, WATCHDOG_RUNNING, enumerate,
+};
 
 use crate::util::humanize_duration;
 
-/// `aproxy status [--idle|--busy]`：列出注册表中的实例（存活以 IPC 探测为准）。
-/// idle/busy 按实例的最近活动时间与 settings.idle_timeout_secs 判定。
-pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
-    let filter = if idle_only {
-        ActivityFilter::Idle
-    } else if busy_only {
-        ActivityFilter::Busy
-    } else {
-        ActivityFilter::All
+/// 清点一次并按请求输出文字或 JSON，使两种格式都以同一份只读清点结果为准。
+/// idle/busy 按运行中实例的最近活动时间与 settings.idle_timeout_secs 判定。
+pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool, json: bool) {
+    let idle_threshold_secs = aproxy::settings::load().idle_timeout_secs;
+    let enumeration = enumerate().await;
+    let now = daemon::now_millis();
+    let had_live = enumeration
+        .instances
+        .iter()
+        .any(|entry| entry.liveness == Liveness::Live);
+    // 只有运行中的实例能按闲置与否归类；不应答、无法采信应答、等待恢复的都要报。
+    let filtered_enumeration = Enumeration {
+        instances: enumeration
+            .instances
+            .into_iter()
+            .filter(|entry| {
+                if entry.liveness != Liveness::Live || !(idle_only || busy_only) {
+                    return true;
+                }
+                let status = entry.status.as_ref().unwrap();
+                let idle_secs = now.saturating_sub(status.activity.last_request_at) / 1000;
+                (idle_secs >= idle_threshold_secs) == idle_only
+            })
+            .collect(),
+        ..enumeration
     };
-    let listing = enumerate(filter).await;
-    // 不应答的实例无论 --idle/--busy 都要报：它们多半挂死了，用户最需要知道
-    print_unresponsive(&listing.unresponsive);
-    if listing.responsive_total == 0 {
-        if listing.unresponsive.is_empty() {
-            println!("没有运行中的 aProxy 实例。");
+    if json {
+        super::print_doc(serde_json::to_value(&filtered_enumeration).unwrap());
+        return;
+    }
+
+    // 按存活状态分块，保留清点结果中各组内的端口顺序。
+    let mut unresponsive = Vec::new();
+    let mut live = Vec::new();
+    let mut incompatible = Vec::new();
+    let mut down = Vec::new();
+    for entry in &filtered_enumeration.instances {
+        match entry.liveness {
+            Liveness::Unresponsive => unresponsive.extend(entry.instance.as_ref()),
+            Liveness::Live => live.push(entry),
+            Liveness::Incompatible | Liveness::Unknown => incompatible.push(entry),
+            Liveness::Down => down.push(entry),
         }
-        return;
     }
-    let now = listing.now;
-    let filtered = &listing.instances;
-    if filtered.is_empty() {
-        let which = match filter {
-            ActivityFilter::Idle => "闲置",
-            ActivityFilter::Busy => "活跃",
-            ActivityFilter::All => unreachable!("不筛选时，有应答的实例就不会一个都不剩"),
-        };
+    print_unresponsive(&unresponsive);
+    if !live.is_empty() {
+        print_live(&live, now);
+    } else if had_live {
+        let which = if idle_only { "闲置" } else { "活跃" };
+        println!("没有{which}的 aProxy 实例（阈值 {idle_threshold_secs} 秒）。");
+    }
+
+    if !incompatible.is_empty() {
         println!(
-            "没有{which}的 aProxy 实例（阈值 {} 秒）。",
-            listing.idle_threshold_secs
+            "无法采信应答的 aProxy 实例 ({})——协议版本不同或身份对不上，用与实例同版本的 aproxy 操作它:",
+            incompatible.len()
         );
-        return;
+        for entry in &incompatible {
+            let port = entry.port;
+            let (pid, version) = match &entry.instance {
+                Some(info) => (info.pid.to_string(), info.version.as_str()),
+                None => ("?".to_string(), "?"),
+            };
+            let code = entry
+                .reason
+                .as_ref()
+                .map_or("unknown", |reason| reason.code.as_str());
+            println!("  端口 {port}  pid {pid}  v{version}  原因 {code}");
+        }
     }
-    println!("运行中的 aProxy 实例 ({}):", filtered.len());
+    if !down.is_empty() {
+        println!(
+            "等待恢复的实例 ({})——没在运行，留着期望状态记录，aproxy restore 或看护者会拉起它:",
+            down.len()
+        );
+        for entry in &down {
+            let port = entry.port;
+            if entry.restore_reason.as_deref() == Some(RESTORE_REASON_CONFIG_MISSING) {
+                println!("  端口 {port}（配置文件找不到）");
+            } else {
+                println!("  端口 {port}");
+            }
+            println!("    不再需要它时执行 aproxy stop {port}");
+        }
+    }
+    if !had_live && unresponsive.is_empty() && incompatible.is_empty() && down.is_empty() {
+        println!("没有运行中的 aProxy 实例。");
+    }
+
+    if !filtered_enumeration.unreadable.is_empty() {
+        println!(
+            "读不懂的记录 ({})，原样保留（多半由更新版本的 aproxy 写下，请用那个版本处理）:",
+            filtered_enumeration.unreadable.len()
+        );
+        for entry in &filtered_enumeration.unreadable {
+            println!("  {}  [{}]", entry.file, entry.reason.code);
+        }
+    }
+    if filtered_enumeration.gc_paused.is_some() {
+        println!("日志清理已暂停：run/ 里有读不懂的记录。");
+    }
+    if let Some(w) = &filtered_enumeration.watchdog {
+        let since_scan = humanize_duration(now.saturating_sub(w.last_scan_at) / 1000);
+        if w.state == WATCHDOG_RUNNING {
+            println!(
+                "看护者: pid {}  v{}  最近扫描 {since_scan} 前",
+                w.pid, w.version
+            );
+        } else {
+            println!(
+                "看护者: pid {}  v{}  已 {since_scan} 没有扫描（可能卡住了）",
+                w.pid, w.version
+            );
+        }
+    }
+    if !filtered_enumeration.processes.is_empty() {
+        println!(
+            "台账里的其他 aProxy 进程 ({}):",
+            filtered_enumeration.processes.len()
+        );
+        for process in &filtered_enumeration.processes {
+            println!(
+                "  pid {}  {}  v{}",
+                process.pid, process.role, process.version
+            );
+        }
+    }
+}
+
+/// 列出可采信的实时状态；运行时长、闲置时长与最近错误的时刻使用同一次清点的时间。
+fn print_live(live: &[&Enumerated], now: u64) {
+    println!("运行中的 aProxy 实例 ({}):", live.len());
     let cli_version = env!("CARGO_PKG_VERSION");
-    for status in filtered {
-        let info = &status.instance;
+    for entry in live {
+        // 清点只在控制通道给出可采信的应答时标为 Live，此时两份数据都在。
+        let info = entry.instance.as_ref().unwrap();
+        let status = entry.status.as_ref().unwrap();
         let activity = &status.activity;
-        let idle_secs = listing.idle_secs(status);
+        let idle_secs = now.saturating_sub(activity.last_request_at) / 1000;
         println!(
             "  端口 {}  pid {}  v{}  已运行 {}  闲置 {}",
             daemon::port_of(&info.listen_addr),
@@ -110,7 +212,7 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool) {
 /// 列出「进程仍在、却不应答控制通道」的实例：优雅停止走不通，只能 --force
 /// （终止前核验 pid + 创建时间，不会误杀）。开着看门狗时，挂死检测会自行处决
 /// 并重拉它们。
-fn print_unresponsive(unresponsive: &[daemon::InstanceRecord]) {
+fn print_unresponsive(unresponsive: &[&daemon::InstanceRecord]) {
     if unresponsive.is_empty() {
         return;
     }

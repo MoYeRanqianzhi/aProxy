@@ -169,7 +169,7 @@ pub struct PendingRestore {
 pub struct InstanceOutcome {
     /// 实例在安装快照中的端口。
     pub port: u16,
-    /// 新版本就绪、旧版本拉回、两者都没拉起，分别记为 restarted、rolled_back、failed。
+    /// 新版本就绪、旧版本拉回、两者都没拉起，分别记为 restarted、rolled_back、failed；用户停掉的端口记 skipped。
     pub outcome: String,
 }
 

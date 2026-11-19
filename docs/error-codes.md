@@ -142,4 +142,5 @@ Why an install or upgrade failed. `install --force` does not use these; it only 
 | `install_restart_failed` | 1 | An instance did not start on the new binary, so the rolling restart stopped. | `port` (integer) |
 | `install_failed` | 1 | The install failed for a reason that no more specific code covers. | — |
 | `install_unmanaged_instances` | 1 | Live instances started by an older version are in this home and cannot be restarted by this install. | — |
+| `install_foreground_instances` | 1 | Live foreground instances are in this home; an install cannot restart a foreground instance. | `ports` (integer list) |
 | `install_precheck_failed` | 3 | The precheck before the rolling restart did not pass. | `port` (integer), `diagnostics` (diagnostic list) |

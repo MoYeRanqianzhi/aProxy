@@ -835,6 +835,13 @@ pub const TABLE: &[Code] = &[
         &[],
     ),
     exiting(
+        "install_foreground_instances",
+        INSTALL,
+        Exit(EXIT_FAILED),
+        "Live foreground instances are in this home; an install cannot restart a foreground instance.",
+        &[req("ports", T::IntegerList)],
+    ),
+    exiting(
         "install_precheck_failed",
         INSTALL,
         Exit(EXIT_CONFIG),

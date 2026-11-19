@@ -42,6 +42,59 @@ pub struct InstallPlan {
     pub from: std::path::PathBuf,
 }
 
+/// 从同一份只读普查先找管不了的进程，再找不能重启的前台实例；成功时交回计划端口。
+/// 按进程身份辨认台账项，不把退出后被复用的 pid 当作还在跑的旧实例。
+pub async fn check_restartable(home: &Path) -> Result<Vec<u16>, InstallFailure> {
+    use crate::ops::enumerate::{Liveness, enumerate_in};
+    let found = enumerate_in(home).await;
+    let pids: Vec<_> = found
+        .processes
+        .iter()
+        .filter(|p| p.role == aproxy_ipc::ledger::ROLE_INSTANCE)
+        .map(|p| p.pid.to_string())
+        .collect();
+    if !pids.is_empty() {
+        let pids = pids.join(", ");
+        return Err(InstallFailure::new(
+            "install_unmanaged_instances",
+            format!(
+                "live instances started by an older version are in this home (pid {pids}); stop them with the aproxy that started them (aproxy stop all), or run aproxy install --force"
+            ),
+        ));
+    }
+    let mut ports = Vec::new();
+    let mut foreground = Vec::new();
+    for item in found.instances {
+        if item.liveness == Liveness::Live {
+            ports.push(item.port);
+        }
+        if item.instance.is_some_and(|rec| {
+            rec.foreground
+                && (item.liveness == Liveness::Live
+                    || crate::process::record_identity(rec.pid, &rec.start)
+                        == crate::process::RecordIdentity::Alive)
+        }) {
+            foreground.push(item.port);
+        }
+    }
+    if !foreground.is_empty() {
+        let ports = foreground
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut error = InstallFailure::new(
+            "install_foreground_instances",
+            format!(
+                "live foreground instances are in this home (port {ports}); install cannot restart a foreground instance: stop them, run aproxy install again, then start them the way they were started"
+            ),
+        );
+        error.details = serde_json::json!({"ports": foreground});
+        return Err(error);
+    }
+    Ok(ports)
+}
+
 /// 管辖检查（铁律前置）：运行实例的进程镜像必须在 `<home>/bin/` 下——
 /// 包管理器管辖目录的实例交给对应渠道升级，或显式 `--adopt` 收编。
 /// 镜像路径不可判（进程刚死/权限）→ 不拦（只拦「确认在管辖外」）。
@@ -86,8 +139,7 @@ async fn live_ports(run_dir: &Path) -> Vec<String> {
 ///
 /// 只靠 IPC 枚举重算快照会把在途实例永久排除——安装进程在「旧实例已停、
 /// 新实例未就绪」的窗口崩溃后续作，该实例不在跑，续作照常完成而它从此下线。
-/// 在途实例的判据：上一次落盘的快照里有它，它的期望状态记录还在（滚动重启用
-/// `keep_restore` 停止实例，记录不会丢；用户期间 stop 掉的实例记录已删，不再算）。
+/// 保留原快照中的端口，到滚动时再区分在途实例（记录还在）和用户停掉的端口（记作跳过）。
 async fn snapshot_with_pending(run_dir: &Path, state: &InstallState) -> (Vec<String>, Vec<String>) {
     let live = live_ports(run_dir).await;
     let mut snapshot = live.clone();
@@ -95,9 +147,7 @@ async fn snapshot_with_pending(run_dir: &Path, state: &InstallState) -> (Vec<Str
         if snapshot.contains(port) {
             continue;
         }
-        if crate::spec::restore_path_in(run_dir, port).is_file() {
-            snapshot.push(port.clone());
-        }
+        snapshot.push(port.clone());
     }
     (live, snapshot)
 }
@@ -503,7 +553,31 @@ async fn run_tail(
     if !snapshot.is_empty() && state.phase < InstallPhase::Restarting {
         super::state::advance_in(home, state, InstallPhase::Restarting)?;
     }
+    let mut verify = Vec::new();
     for port in &snapshot {
+        if matches!(crate::spec::read_restore_in(run_dir, port), Ok(None))
+            && crate::daemon::ipc_ping_in(run_dir, port).await.is_err()
+            && !crate::daemon::read_instance_file_in(run_dir, port).is_some_and(|rec| {
+                crate::process::record_identity(rec.pid, &rec.start)
+                    == crate::process::RecordIdentity::Alive
+            })
+        {
+            // 用户 stop 后没有期望状态，续作也不能把它拉回来，终验只检查剩余端口。
+            if let Ok(port) = port.parse()
+                && !state
+                    .instance_outcomes
+                    .iter()
+                    .any(|o| o.port == port && o.outcome == "skipped")
+            {
+                state.instance_outcomes.push(super::state::InstanceOutcome {
+                    port,
+                    outcome: "skipped".into(),
+                });
+                write_in(home, state).map_err(|e| format!("install/state.json 写入失败: {e}"))?;
+            }
+            continue;
+        }
+        verify.push(port);
         // 跳过已就绪（仅续作：崩溃前已滚动的实例不再动）
         if skip_ready
             && let Ok(info) = crate::daemon::ipc_ping_in(run_dir, port).await
@@ -543,7 +617,7 @@ async fn run_tail(
     }
     for round in 0..2 {
         let mut bad = Vec::new();
-        for port in &snapshot {
+        for &port in &verify {
             match crate::daemon::ipc_ping_in(run_dir, port).await {
                 Ok(info)
                     if info.instance.version == state.target_version
@@ -883,6 +957,11 @@ async fn run_forward_from_staged(
         return hand_over(home, staged_path).await.map_err(|e| {
             format!("目标版本没有接手安装（{e}）；实例与 bin 里的二进制都未改动").into()
         });
+    }
+
+    if let Err(e) = check_restartable(home).await {
+        state.halted = true;
+        return Err(e);
     }
 
     // ---- 实例快照（ACK 阶段清单）：续作重算时必须并回在途实例（见

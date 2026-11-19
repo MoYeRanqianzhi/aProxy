@@ -6,9 +6,43 @@
 use aproxy::cli::InstallArgs;
 use aproxy::install::InstallFailure;
 
+/// 跨版本的 last_error 用英文；给当前用户的处置建议按码选择，不重查可能已变化的实例。
+fn refusal(error: &InstallFailure) -> Option<String> {
+    match error.code.as_str() {
+        "install_unmanaged_instances" => {
+            let (_, rest) = error.message.split_once("(pid ")?;
+            let (pids, _) = rest.split_once(')')?;
+            Some(format!(
+                "这个 home 里有旧版本启动、本次安装管不了的实例还在运行（pid {pids}）。先用启动它们的那个版本执行 aproxy stop all，再重新安装；或者改用 aproxy install --force（会结束全部 aproxy 进程）。"
+            ))
+        }
+        "install_foreground_instances" => {
+            let ports = error.details["ports"].as_array()?;
+            if let [p] = ports.as_slice() {
+                Some(format!(
+                    "端口 {p} 上的实例在前台运行，安装无法替它重启。什么都没有改动：实例照常运行，二进制没换。先停掉它（在启动它的终端里按 Ctrl+C，或执行 aproxy stop {p}；交给服务管理器运行的，用服务管理器停止），再执行 aproxy install，装好之后照原来的方式启动它。"
+                ))
+            } else {
+                let ports = ports
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join("、");
+                Some(format!(
+                    "端口 {ports} 上的实例在前台运行，安装无法替它们重启。什么都没有改动：实例照常运行，二进制没换。先停掉它们（在各自的终端里按 Ctrl+C，或逐个执行 aproxy stop <端口>；交给服务管理器运行的，用服务管理器停止），再执行 aproxy install，装好之后照原来的方式启动它们。"
+                ))
+            }
+        }
+        _ => None,
+    }
+}
+
 /// 安装者把原因写给用户，按安装码退出；提前失败时也不伪造安装状态。
 fn fail(error: InstallFailure) -> ! {
-    eprintln!("[ERROR] {error}");
+    eprintln!(
+        "[ERROR] {}",
+        refusal(&error).as_deref().unwrap_or(&error.message)
+    );
     crate::util::exit(error.exit_code())
 }
 
@@ -86,12 +120,24 @@ pub(crate) async fn handle_install_cmd(args: InstallArgs) {
         // 续作模式：静默执行（由看护者/CLI 入口/交棒自动拉起）。失败落
         // failed 现场等下次续作，不打扰用户——但首轮失败输出到日志可查。
         // 硬退理由同 report_outcome：续作也可能再次交棒，后台任务不保证已结束
-        match aproxy::install::flow::continue_install(&home, &run_dir, args.handover_from).await {
+        let result =
+            aproxy::install::flow::continue_install(&home, &run_dir, args.handover_from).await;
+        // 无指名的续作也有自己的调用者：转交后等最终退出码。指名接手者应尽早释放 staging 镜像。
+        let result = match result {
+            Ok(aproxy::install::flow::FlowExit::HandedOver) if args.handover_from.is_none() => {
+                await_handover(&home).await
+            }
+            other => other.map(|_| ()),
+        };
+        match result {
             Ok(_) => {
                 tracing::info!("install 续作完成");
                 crate::util::exit(0);
             }
             Err(e) => {
+                if refusal(&e).is_some() {
+                    fail(e);
+                }
                 tracing::error!(error = %e, "install 续作失败（现场已保留，等待下次续作）");
                 crate::util::exit(e.exit_code());
             }
@@ -392,6 +438,9 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
     // 管辖检查与 --from 同一道（见 run_plan），放在下载之前：bin 外的实例本就
     // 不该被滚动到 `<home>/bin`，没必要先下载一个注定装不上的产物。放在版本
     // 决议之后：已是最新时什么都不会发生，不必拦
+    if let Err(e) = aproxy::install::flow::check_restartable(home).await {
+        fail(e);
+    }
     if let Err(e) = aproxy::install::flow::check_jurisdiction(run_dir, home, false).await {
         fail(e.into());
     }
@@ -576,6 +625,9 @@ async fn report_outcome(
                     crate::util::exit(0);
                 }
                 Err(e) => {
+                    if refusal(&e).is_some() {
+                        fail(e);
+                    }
                     eprintln!("[ERROR] 安装失败: {e}");
                     print_failure_guidance(home);
                     crate::util::exit(e.exit_code());
@@ -583,6 +635,9 @@ async fn report_outcome(
             }
         }
         Err(e) => {
+            if refusal(&e).is_some() {
+                fail(e);
+            }
             eprintln!("[ERROR] 安装失败: {e}");
             print_failure_guidance(home);
             crate::util::exit(e.exit_code());
@@ -664,6 +719,9 @@ async fn run_plan(
     skill_enabled: bool,
     download_proxy: Option<&str>,
 ) {
+    if let Err(e) = aproxy::install::flow::check_restartable(home).await {
+        fail(e);
+    }
     if let Err(e) = aproxy::install::flow::check_jurisdiction(run_dir, home, adopt).await {
         fail(e.into());
     }

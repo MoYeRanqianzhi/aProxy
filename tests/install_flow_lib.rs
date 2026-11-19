@@ -813,6 +813,81 @@ async fn rollback_case(kind: BrokenNew) {
 
 /// 失败现场（failed + halted）里的实例其实都已从 bin 的二进制、以目标版本正常
 /// 服务：续作收尾清场，不碰实例。只比版本不够——上面的回滚用例里实例跑在
+/// 交换后用户停掉快照中的一个端口，只滚动仍在服务的另一个；终验不把被停端口拉回来。
+#[tokio::test(flavor = "current_thread")]
+async fn rolling_restart_skips_a_port_stopped_during_the_install() {
+    let _guard = LIVE_TEST_LOCK.lock().await;
+    let dir = live_home();
+    let home = dir.path();
+    let run_dir = home.join("run");
+    let bin = aproxy::install::swap::bin_path_in(home);
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), &bin).unwrap();
+    make_exec(&bin);
+    let (port, _, mut child) = start_instance(&dir, &bin, "kept");
+    dir.stop_on_drop(port);
+    let stopped = free_port();
+    aproxy::install::broadcast::ack_one(&run_dir, &port.to_string())
+        .await
+        .unwrap();
+    let old = simulate_swap(home, |b| {
+        std::fs::copy(env!("CARGO_BIN_EXE_aproxy"), b).unwrap();
+    });
+    swapped_state(home, port, &old, &bin);
+    let mut st = aproxy::install::state::load_in(home).unwrap();
+    st.target_version = env!("CARGO_PKG_VERSION").into();
+    st.instance_snapshot.insert(0, stopped.to_string());
+    aproxy::install::state::write_in(home, &mut st).unwrap();
+    // 暂时挡住清场，读到的是终验后的真实结局，而不是轮询碰巧撞到的中间相位。
+    let lock = aproxy::install::lock_install_in(home, Duration::ZERO).unwrap();
+    let observe = async move {
+        loop {
+            let st = aproxy::install::state::load_in(home).unwrap();
+            if st.phase == InstallPhase::Verifying {
+                assert!(
+                    st.instance_outcomes
+                        .iter()
+                        .any(|o| o.port == stopped && o.outcome == "skipped")
+                );
+                assert!(
+                    st.instance_outcomes
+                        .iter()
+                        .any(|o| o.port == port && o.outcome == "restarted")
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        drop(lock);
+    };
+    let install = aproxy::install::flow::continue_install(home, &run_dir, None);
+    tokio::time::timeout(Duration::from_secs(90), async {
+        tokio::try_join!(install, async {
+            observe.await;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let info = aproxy::daemon::ipc_ping_in(&run_dir, &port.to_string())
+        .await
+        .unwrap();
+    assert_ne!(info.instance.pid, child.id());
+    assert!(same_path(
+        &aproxy::process::process_image_path(info.instance.pid).unwrap(),
+        &bin
+    ));
+    assert!(
+        aproxy::daemon::ipc_ping_in(&run_dir, &stopped.to_string())
+            .await
+            .is_err()
+    );
+    assert!(restore_spec_of(&run_dir, stopped).is_none());
+    child.wait().unwrap();
+    assert!(!aproxy::install::state::state_path_in(home).exists());
+}
+
 /// 旧二进制上、版本号却相同，那里续作必须照旧拒绝
 #[tokio::test(flavor = "current_thread")]
 async fn halted_failure_is_cleaned_up_when_the_fleet_already_runs_the_target() {

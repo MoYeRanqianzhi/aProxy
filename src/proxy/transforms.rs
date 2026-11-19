@@ -144,6 +144,14 @@ impl RequestChain {
                     .ok_or(ChainError::Disconnected)?
                 {
                     Ok(reply) => {
+                        if let Some(report) = reply.report {
+                            ctx.rec.format_report(
+                                name,
+                                stage,
+                                (self.stage == Stage::Retry).then_some(attempt),
+                                report,
+                            );
+                        }
                         ctx.absorb(name, reply.state);
                         if let Some(f) = reply.fail {
                             let reason: String = state
@@ -361,6 +369,9 @@ pub(super) async fn transform_response_if_configured(
                 continue;
             }
         };
+        if let Some(report) = r.report {
+            ctx.rec.format_report(name, "response", None, report);
+        }
         ctx.absorb(name, r.state);
         if let Some(f) = r.fail {
             if let Some(response) = f.response {

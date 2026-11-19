@@ -415,3 +415,66 @@ async fn chain_runs_request_in_order_and_response_and_heartbeat_in_reverse() {
         assert!(at("response").get("state").is_none());
     }
 }
+
+/// 成功握手后，配置顺序的身份、能力与熔断状态一起出现在快照里。
+#[test]
+fn snapshot_lists_formats_with_their_breaker() {
+    let (_home, out) = start("echo", true);
+    assert!(out.status.success(), "{out:?}");
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        doc["instance"]["formats"][0],
+        serde_json::json!({"name":"test-layer","stages":["request"],"required":true,"process":"spawn","protocol":1,"version":"1.0","breaker":{"state":"closed","failures":0}})
+    );
+}
+
+/// 从独立实例的控制端点取得明细，区分顶层报告与每次尝试的报告，并核对未知动作的标签。
+#[tokio::test]
+async fn reports_land_in_the_request_record() {
+    use aproxy::daemon::{ReadOp, ipc_read_in};
+    let home = TestHome::new();
+    let (up, _) = upstream(&[503, 200]).await;
+    let report = serde_json::json!({"report":{"summary":format!("fictional-token {}","界".repeat(520)),"actions":vec![serde_json::json!({"type":"other","label":"seen fictional-token"});35]}});
+    let cfg = layer(
+        &home,
+        "reporter",
+        "'request','retry','response'",
+        &["reply", &report.to_string()],
+    )
+    .replace("env={", "env={ TOKEN='fictional-token',");
+    let (client, url) = running(&home, up, &cfg);
+    let res = client.post(&url).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    res.text().await.unwrap();
+    let f = frames(&home, "reporter");
+    let id = f[1]["request_id"].as_str().unwrap();
+    let port = url.rsplit(':').next().unwrap();
+    let detail = ipc_read_in(
+        &home.path().join("run"),
+        port,
+        &ReadOp::Request {
+            request_id: id.into(),
+        },
+    )
+    .await
+    .unwrap();
+    let r = &detail["record"];
+    assert_eq!(r["reports"].as_array().unwrap().len(), 2);
+    assert_eq!(r["tries"][0]["reports"], serde_json::json!([]));
+    assert_eq!(r["tries"][1]["reports"].as_array().unwrap().len(), 1);
+    for (report, stage) in [
+        (&r["reports"][0], "request"),
+        (&r["reports"][1], "response"),
+        (&r["tries"][1]["reports"][0], "retry"),
+    ] {
+        assert_eq!(report["stage"], stage);
+        assert_eq!(report["format"], "reporter");
+        assert_eq!(report["summary"].as_str().unwrap().chars().count(), 512);
+        assert_eq!(report["actions"].as_array().unwrap().len(), 32);
+        assert_eq!(
+            report["actions"][0],
+            serde_json::json!({"type":"other","label":"seen <secret>"})
+        );
+    }
+    assert!(!r.to_string().contains("fictional-token"));
+}

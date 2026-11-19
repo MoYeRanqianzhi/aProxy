@@ -184,14 +184,22 @@ pub(crate) struct ExchangeCtx {
     pub(crate) client: wire::Client,
     /// 只在读取一份状态或写入一个回信时持锁。
     states: Arc<Mutex<BTreeMap<String, String>>>,
+    /// 报告写进原请求的同一份记录。
+    pub(crate) rec: crate::history::Recorder,
 }
 impl ExchangeCtx {
     /// 为客户端请求建立隔离的程序状态。
-    pub(crate) fn new(request_id: Arc<str>, path: &str, stream: bool) -> Self {
+    pub(crate) fn new(
+        request_id: Arc<str>,
+        path: &str,
+        stream: bool,
+        rec: crate::history::Recorder,
+    ) -> Self {
         Self {
             request_id,
             client: wire::Client::new(path.into(), stream),
             states: Default::default(),
+            rec,
         }
     }
     /// 本层只收到自己之前给出的字符串。

@@ -162,8 +162,14 @@ async fn handle(
         headers,
         body: req_body,
         // 交给 format 的信封里是同一个请求标识
-        ctx: (!state.formats.is_empty())
-            .then(|| ExchangeCtx::new(trace.request_id.clone(), path_and_query, wants_stream)),
+        ctx: (!state.formats.is_empty()).then(|| {
+            ExchangeCtx::new(
+                trace.request_id.clone(),
+                path_and_query,
+                wants_stream,
+                trace.rec.clone(),
+            )
+        }),
     };
     let max_spool_bytes = spool_limit_bytes(&state.config);
 

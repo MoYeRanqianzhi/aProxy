@@ -114,8 +114,8 @@ impl Outcome {
             Outcome::InFlight => "in_flight",
             Outcome::Ok => "ok",
             Outcome::UpstreamError => "upstream_error",
-            Outcome::FormatResponse => "format_response",
             Outcome::AproxyError => "aproxy_error",
+            Outcome::FormatResponse => "format_response",
             Outcome::ClientGone => "client_gone",
         }
     }
@@ -786,6 +786,8 @@ struct Try {
     /// 这次尝试从上游收到的响应体字节数（线上的）
     response_bytes: u64,
     decision: Option<Decision>,
+    /// 与这一轮一起保留、一起淘汰的 retry 与 decide 报告。
+    reports: Vec<Value>,
     sent: Option<Arc<SentHead>>,
     /// 这次发出的体。与上一次相同时指向同一个体（`sent_same` 为真），只存一份
     sent_body: Option<Arc<Body>>,
@@ -826,6 +828,10 @@ struct RecordInner {
     attempts: u32,
     tries_omitted: u32,
     tries: VecDeque<Try>,
+    /// request 与 response 报告各按程序保留，重试同一层不能使顶层记录无限增长。
+    reports: Vec<Value>,
+    /// retry 先于该次上游请求的发送，等发出的请求头确定之后才有这次尝试的明细。
+    pending_reports: Vec<Value>,
     keepalive: bool,
     heartbeats: u64,
     request_bytes: u64,
@@ -1030,6 +1036,8 @@ impl History {
             attempts: 0,
             tries_omitted: 0,
             tries: VecDeque::new(),
+            reports: Vec::new(),
+            pending_reports: Vec::new(),
             keepalive: false,
             heartbeats: 0,
             request_bytes: 0,
@@ -1454,8 +1462,8 @@ struct TryView<'a> {
     code: Option<&'a str>,
     response_bytes: u64,
     decision: Option<DecisionView<'a>>,
-    /// 这次尝试的 retry、decide 阶段的报告。本版本不产生报告，恒为空数组
-    reports: [(); 0],
+    /// 这次尝试的 retry、decide 阶段的报告。
+    reports: &'a [Value],
 }
 
 #[derive(serde::Serialize)]
@@ -1493,8 +1501,8 @@ struct RecordView<'a> {
     heartbeats: u64,
     request_bytes: u64,
     response_bytes: u64,
-    /// request、response、stream 阶段的报告。本版本不产生报告，恒为空数组
-    reports: [(); 0],
+    /// request、response、stream 阶段的报告。
+    reports: &'a [Value],
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     truncated: bool,
 }
@@ -1509,13 +1517,12 @@ fn clipped(text: &str) -> &str {
 
 /// 一条记录的 JSON 文本（RequestRecord），不超过 [`MAX_RECORD_BYTES`]。
 ///
-/// 记录里大小不受控的只有客户端给的四个串——`method`、`path`、`user_agent`、`model`：尝试的条数、
-/// 每条的字段都有上限。超出时把这四个串截到 [`TRUNCATED_TEXT_CHARS`] 个字符，并带上
-/// `"truncated": true`。
+/// 超出时先从最旧的尝试起去报告，再截短客户端的四个字符串，最后才丢顶层报告。
+/// 只改变序列化视图，不让某次读取改写还在进行中的请求。
 ///
 /// 直接从记录写成文本，不先搭一棵 JSON 树：有订阅者时每个请求至少要写两次。
 fn record_json(record: &Record, inner: &RecordInner) -> String {
-    let view = |truncated: bool| {
+    let view = |truncated: bool, clip_text: bool, skip: usize, top: bool| {
         fn clip(text: &str, truncated: bool) -> &str {
             if truncated { clipped(text) } else { text }
         }
@@ -1524,14 +1531,14 @@ fn record_json(record: &Record, inner: &RecordInner) -> String {
             request_seq: record.seq,
             started_at: inner.started_at,
             ended_at: inner.ended_at,
-            method: clip(&inner.method, truncated),
-            path: clip(&inner.path, truncated),
-            model: inner.model.as_deref().map(|text| clip(text, truncated)),
+            method: clip(&inner.method, clip_text),
+            path: clip(&inner.path, clip_text),
+            model: inner.model.as_deref().map(|text| clip(text, clip_text)),
             stream: inner.stream,
             user_agent: inner
                 .user_agent
                 .as_deref()
-                .map(|text| clip(text, truncated)),
+                .map(|text| clip(text, clip_text)),
             delivery: inner.delivery,
             upgraded: false,
             outcome: inner.outcome.as_str(),
@@ -1544,7 +1551,8 @@ fn record_json(record: &Record, inner: &RecordInner) -> String {
             tries: inner
                 .tries
                 .iter()
-                .map(|t| TryView {
+                .enumerate()
+                .map(|(i, t)| TryView {
                     attempt: t.attempt,
                     started_at: t.started_at,
                     duration_ms: t.duration_ms,
@@ -1556,23 +1564,35 @@ fn record_json(record: &Record, inner: &RecordInner) -> String {
                         decision: d.decision,
                         delay_ms: d.delay_ms,
                     }),
-                    reports: [],
+                    reports: if i < skip { &[] } else { &t.reports },
                 })
                 .collect(),
             keepalive: inner.keepalive,
             heartbeats: inner.heartbeats,
             request_bytes: inner.request_bytes,
             response_bytes: inner.response_bytes,
-            reports: [],
+            reports: if top { &inner.reports } else { &[] },
             truncated,
         }
     };
     // 这些结构里没有会让序列化失败的东西（没有非字符串的键，没有自定义的 Serialize）
-    let text = serde_json::to_string(&view(false)).unwrap_or_default();
+    let text = serde_json::to_string(&view(false, false, 0, true)).unwrap_or_default();
     if text.len() <= MAX_RECORD_BYTES {
         return text;
     }
-    serde_json::to_string(&view(true)).unwrap_or_default()
+    for (i, t) in inner.tries.iter().enumerate() {
+        if !t.reports.is_empty() {
+            let text = serde_json::to_string(&view(true, false, i + 1, true)).unwrap();
+            if text.len() <= MAX_RECORD_BYTES {
+                return text;
+            }
+        }
+    }
+    let clipped = serde_json::to_string(&view(true, true, usize::MAX, true)).unwrap();
+    if clipped.len() <= MAX_RECORD_BYTES {
+        return clipped;
+    }
+    serde_json::to_string(&view(true, true, usize::MAX, false)).unwrap()
 }
 
 struct Live {
@@ -1705,6 +1725,7 @@ impl Recorder {
                 code: None,
                 response_bytes: 0,
                 decision: None,
+                reports: std::mem::take(&mut inner.pending_reports),
                 sent: head.cloned(),
                 sent_body,
                 sent_same: same_body,
@@ -1718,6 +1739,55 @@ impl Recorder {
             }
         });
         writer
+    }
+
+    /// 来自程序的报告先打码再限长。同一层在首轮 stage 失败而续跑时，保留它最后一份报告。
+    pub(crate) fn format_report(
+        &self,
+        name: &str,
+        stage: &str,
+        attempt: Option<u32>,
+        mut report: aproxy_envelope::Report,
+    ) {
+        let Some(live) = &self.0 else { return };
+        let secrets = &live.history.secrets;
+        let name = secrets.replace(name);
+        report.summary = secrets.replace(&report.summary);
+        if let Some((end, _)) = report.summary.char_indices().nth(512) {
+            report.summary.truncate(end);
+            tracing::warn!(format=%name,stage,"format report summary truncated to 512 characters");
+        }
+        if report.actions.len() > 32 {
+            tracing::warn!(format=%name,stage,"format report truncated to 32 actions");
+            report.actions.truncate(32);
+        }
+        let mut value = json!(report);
+        value["format"] = json!(name);
+        value["stage"] = json!(stage);
+        for action in value["actions"].as_array_mut().unwrap() {
+            for field in action.as_object_mut().unwrap().values_mut() {
+                if let Value::String(s) = field {
+                    *s = secrets.replace(s);
+                }
+            }
+        }
+        self.update(|inner, _| {
+            if let Some(n) = attempt {
+                if let Some(t) = inner.try_mut(n) {
+                    t.reports.push(value);
+                } else {
+                    inner.pending_reports.push(value);
+                }
+            } else if let Some(v) = inner
+                .reports
+                .iter_mut()
+                .find(|v| v["format"] == name && v["stage"] == stage)
+            {
+                *v = value;
+            } else {
+                inner.reports.push(value);
+            }
+        });
     }
 
     /// 第 `attempt` 次尝试拿到了上游的响应头。返回往响应体里写的写者；不保留体时为 None。
@@ -2146,6 +2216,40 @@ mod tests {
             );
         }
         assert_eq!(method.as_str().len(), HEAD_LIMIT);
+    }
+
+    /// 每一步能让记录放得下就停止，读记录也不能破坏后续读取看到的原始字段。
+    #[test]
+    fn record_trims_oldest_try_reports_then_client_text_then_top_reports() {
+        let h = history(0, &[]);
+        let path = format!("/{}", "p".repeat(500));
+        let rec = begin_with(&h, 1, &path, &http::HeaderMap::new());
+        let latest = || {
+            let list: Value = serde_json::from_str(&h.list_json(None, 1).unwrap()).unwrap();
+            let record = list["requests"][0].clone();
+            assert!(record.to_string().len() <= MAX_RECORD_BYTES);
+            record
+        };
+        let report = || aproxy_envelope::Report::new("done".into());
+        rec.format_report("outer", "request", None, report());
+        for n in 1..=2 {
+            rec.try_started(n, None, true, None);
+            rec.format_report(&"n".repeat(40_000), "retry", Some(n), report());
+        }
+        let r = latest();
+        assert_eq!(r["truncated"], true);
+        assert_eq!(r["path"], path);
+        assert_eq!(r["tries"][0]["reports"], json!([]));
+        assert_eq!(r["tries"][1]["reports"].as_array().unwrap().len(), 1);
+        rec.request_shape(Some("m".repeat(MAX_RECORD_BYTES)), false);
+        let r = latest();
+        assert_eq!(r["tries"][1]["reports"], json!([]));
+        assert_eq!(r["model"].as_str().unwrap().len(), TRUNCATED_TEXT_CHARS);
+        assert_eq!(r["reports"][0]["format"], "outer");
+        rec.format_report(&"n".repeat(MAX_RECORD_BYTES), "response", None, report());
+        let r = latest();
+        assert_eq!(r["reports"], json!([]));
+        assert_eq!(r["truncated"], true);
     }
 
     /// 记录最多 1000 条，先进先出；在途的不淘汰。

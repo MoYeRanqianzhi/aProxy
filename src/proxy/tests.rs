@@ -260,7 +260,12 @@ async fn dynamic_heartbeat_arriving_after_replay_started_is_dropped() {
     let (mut sink, mut rx, _gone) = committed_sink(Duration::ZERO, true);
     sink.arm_dynamic_heartbeat(Arc::new(DynamicHeartbeat {
         pools: vec![pool].into(),
-        ctx: ExchangeCtx::new("1".into(), "/v1/messages", true),
+        ctx: ExchangeCtx::new(
+            "1".into(),
+            "/v1/messages",
+            true,
+            crate::history::Recorder::none(),
+        ),
         interval: Duration::from_secs(1),
         last: Default::default(),
         seq: Default::default(),

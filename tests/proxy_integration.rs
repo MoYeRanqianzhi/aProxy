@@ -6192,6 +6192,69 @@ fn watchdog_respawns_killed_daemon() {
     let _ = std::fs::remove_file(home.path().join("run").join("watchdog.json"));
 }
 
+/// 最后一次 IPC 结果随超时返回，区分启动中、端点不可达与已经可以看护的实例。
+fn wait_watchdog_serving(
+    rt: &tokio::runtime::Runtime,
+    port: u16,
+    home: &std::path::Path,
+    timeout: Duration,
+) -> Result<aproxy::daemon::InstanceStatus, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let last = match ipc_ping_in_dir(rt, port, home) {
+            Ok(info) if info.state == aproxy::daemon::InstanceState::Serving => return Ok(info),
+            Ok(info) => format!("pid={}, state={:?}", info.instance.pid, info.state),
+            Err(error) => error.to_string(),
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err(last);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// 已绑定 IPC 但握手未结束时，响应 ping 不等于已写恢复记录，也不是看护者收养的起点。
+#[test]
+fn watchdog_readiness_does_not_accept_a_starting_ping() {
+    let home = TestHome::new();
+    let port = free_port();
+    home.stop_on_drop(port);
+    let cfg = home.path().join("gated.toml");
+    let gate = home.path().join("release");
+    let observed = home.path().join("observed");
+    let quote = |p: &std::path::Path| serde_json::to_string(p.to_str().unwrap()).unwrap();
+    std::fs::write(&cfg, format!("base_url='http://127.0.0.1:{port}'\nlisten_addr='127.0.0.1:{port}'\n[[format]]\ncommand={}\nstages=['request']\nargs=['gate-hello',{}]\nenv={{ECHO_OBSERVE={}}}\n",quote(&format_echo_path()),quote(&gate),quote(&observed))).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _daemon = ChildGuard(home.serve_cmd(&cfg).spawn().unwrap());
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    while !observed.is_file() {
+        assert!(std::time::Instant::now() < end, "未观察到握手");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let observed_state = ipc_ping_in_dir(&rt, port, home.path()).unwrap().state;
+    let early = wait_watchdog_serving(&rt, port, home.path(), Duration::from_millis(100));
+    std::fs::write(&gate, b"ready").unwrap();
+    let ready = wait_watchdog_serving(&rt, port, home.path(), Duration::from_secs(5));
+    assert_eq!(observed_state, aproxy::daemon::InstanceState::Starting);
+    assert!(
+        early.is_err(),
+        "watchdog readiness accepted a starting ping"
+    );
+    assert_eq!(ready.unwrap().state, aproxy::daemon::InstanceState::Serving);
+    assert!(aproxy::spec::restore_path_in(&home.path().join("run"), &port.to_string()).is_file());
+    assert!(
+        home.cmd()
+            .args(["stop", &port.to_string()])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}
+
 #[test]
 fn watchdog_respawns_on_death_event_and_force_stop_stays_stopped() {
     // 扫描周期拉到 60s：崩溃实例若在几秒内回来，只能是死亡事件即时唤醒了
@@ -6212,38 +6275,74 @@ fn watchdog_respawns_on_death_event_and_force_stop_stays_stopped() {
         .enable_all()
         .build()
         .unwrap();
+    // 临时文件而非无人读的管道：即使日志很多，也不能阻塞正在诊断的子进程。
+    let daemon_err = home.path().join("daemon.stderr");
+    let watchdog_err = home.path().join("watchdog.stderr");
+    let watchdog_out = home.path().join("watchdog.stdout");
     let mut daemon_child = home
         .serve_cmd(&cfg_file)
+        .stderr(std::fs::File::create(&daemon_err).unwrap())
         .env("APROXY_WATCHDOG_SCAN_SECS", "60")
         .spawn()
         .expect("spawn 守护失败");
     let orig_pid = daemon_child.id();
-    let wait_ping = |secs: u64| {
-        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
-        while std::time::Instant::now() < deadline {
-            if let Ok(info) = ipc_ping_in_dir(&rt, port, home.path()) {
-                return Some(info);
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        None
+    let wait_ping = |secs| wait_watchdog_serving(&rt, port, home.path(), Duration::from_secs(secs));
+    let evidence = || {
+        // 被拉起的替代进程不继承测试的 stderr，它的启动错误记在这个 home 的 startup.log。
+        [
+            &daemon_err,
+            &watchdog_err,
+            &watchdog_out,
+            &home.path().join("logs/startup.log"),
+            &home.path().join("logs/watchdog.log"),
+        ]
+        .iter()
+        .map(|p| {
+            format!(
+                "{}: {}",
+                p.file_name().unwrap().to_string_lossy(),
+                std::fs::read_to_string(p).unwrap_or_else(|e| e.to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
     };
-    assert!(wait_ping(10).is_some(), "守护未就绪");
+    wait_ping(10).unwrap_or_else(|last| panic!("守护未就绪；last ping: {last:?}\n{}", evidence()));
 
     // 看护者启动时先做一次收养扫描（不等扫描周期），之后才进入 60s 的循环
     let mut wd_child = ChildGuard(
         home.watchdog_cmd()
+            .stderr(std::fs::File::create(&watchdog_err).unwrap())
+            .stdout(std::fs::File::create(&watchdog_out).unwrap())
+            .env("RUST_LOG", "info")
             .env("APROXY_WATCHDOG_SCAN_SECS", "60")
             .spawn()
             .expect("spawn 看护者失败"),
     );
-    std::thread::sleep(Duration::from_secs(2));
+    // 首轮扫描须已为这个实例打开死亡句柄。双进程各有自己的调度时机，睡足两秒不证明已收养。
+    let adopted = std::time::Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&watchdog_out)
+        .unwrap_or_default()
+        .contains("看护者收养实例")
+    {
+        assert!(
+            std::time::Instant::now() < adopted,
+            "看护者尚未收养实例\n{}",
+            evidence()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     // 模拟崩溃。守护是本测试的直接子进程：unix 上不 wait 就是僵尸，看护者
     // 的死亡等待要到收割后才触发——kill 后立即 wait
     let _ = daemon_child.kill();
     let _ = daemon_child.wait();
-    let respawned = wait_ping(15).expect("看护者应在扫描周期之前（死亡事件到达即）重拉守护");
+    let respawned = wait_ping(15).unwrap_or_else(|last| {
+        panic!(
+            "看护者应在扫描周期之前（死亡事件到达即）重拉守护；last ping: {last:?}\n{}",
+            evidence()
+        )
+    });
     assert_ne!(respawned.instance.pid, orig_pid, "应是被重拉的新进程");
 
     // 强停被重拉的实例：看护者即刻收到死亡事件，必须读到「无恢复记录」

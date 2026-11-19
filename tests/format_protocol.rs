@@ -646,3 +646,47 @@ async fn malformed_delivery_preserves_patches_and_only_warns_on_request() {
     );
     assert!(!log.contains("untrusted-vote"));
 }
+
+/// 畸形展示信息不让请求重试、不吞补丁；两种告警都不复制程序提供的文本。
+#[tokio::test]
+async fn malformed_report_and_action_warn_without_discarding_data() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[200]).await;
+    let cfg = layer(
+        &home,
+        "first",
+        "'request'",
+        &["reply", r#"{"report":"untrusted-content"}"#],
+    ) + &layer(
+        &home,
+        "last",
+        "'response'",
+        &[
+            "reply",
+            r#"{"response":{"body":"patch survived"},"report":{"summary":"ok","actions":[{"type":"key_select","key_id":{"untrusted-content":42}},{"type":"custom","label":"valid"}]}}"#,
+        ],
+    );
+    let (port, out) = launch(&home, up, &cfg);
+    assert!(out.status.success(), "{out:?}");
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap()
+        .get(format!("http://127.0.0.1:{port}/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "patch survived");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    let log = std::fs::read_to_string(doc["log_path"].as_str().unwrap()).unwrap();
+    for warning in [
+        "invalid format report ignored",
+        "invalid format report actions ignored",
+    ] {
+        assert_eq!(log.matches(warning).count(), 1, "{log}");
+    }
+    assert!(!log.contains("untrusted-content"));
+}

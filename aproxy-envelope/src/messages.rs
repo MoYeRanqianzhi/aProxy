@@ -1,6 +1,6 @@
 //! Session negotiation, stage inputs and replies. Optional fields are never emitted merely to fill a slot.
 use crate::{
-    Data, DecideRequest, Fragment, Report, Request, RequestMeta, RequestPatch, Response,
+    Data, DecideRequest, Fragment, ReportField, Request, RequestMeta, RequestPatch, Response,
     ResponsePatch,
 };
 use serde::{Deserialize, Serialize};
@@ -831,8 +831,8 @@ pub struct Reply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
     /// Public per-stage summary and actions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub report: Option<Report>,
+    #[serde(default, skip_serializing_if = "ReportField::is_omitted")]
+    pub report: ReportField,
     /// Edits to the outgoing request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<RequestPatch>,
@@ -883,7 +883,7 @@ impl Reply {
             v: 1,
             seq,
             state: None,
-            report: None,
+            report: ReportField::Absent,
             request: None,
             response: None,
             fail: None,

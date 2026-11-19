@@ -152,7 +152,7 @@ impl RequestChain {
                         {
                             tracing::warn!(format=%safe,"invalid format delivery ignored");
                         }
-                        if let Some(report) = reply.report {
+                        if let wire::ReportField::Present(report) = reply.report {
                             ctx.rec.format_report(
                                 name,
                                 stage,
@@ -377,7 +377,7 @@ pub(super) async fn transform_response_if_configured(
                 continue;
             }
         };
-        if let Some(report) = r.report {
+        if let wire::ReportField::Present(report) = r.report {
             ctx.rec.format_report(name, "response", None, report);
         }
         ctx.absorb(name, r.state);

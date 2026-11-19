@@ -652,6 +652,15 @@ impl Pool {
         {
             return Err(Fault::Invalid);
         }
+        match &r.report {
+            aproxy_envelope::ReportField::Invalid => {
+                tracing::warn!(format=%self.secrets.replace(&self.entry.name),"invalid format report ignored")
+            }
+            aproxy_envelope::ReportField::Present(report) if report.discarded_actions != 0 => {
+                tracing::warn!(format=%self.secrets.replace(&self.entry.name),count=report.discarded_actions,"invalid format report actions ignored")
+            }
+            _ => (),
+        }
         w.seq += 1;
         Ok(r)
     }

@@ -379,3 +379,76 @@ fn decide_delays_are_checked_and_delivery_does_not_discard_patches() {
         }
     }
 }
+
+/// Display-only errors are local to the report or action. Unknown fields never leak into output.
+#[test]
+fn invalid_reports_and_individual_actions_do_not_invalidate_replies() {
+    let mut frame = json!({"v":1,"seq":2,"state":"keep","response":{"body":"x"}});
+    for malformed in [
+        json!(42),
+        json!(["summary", []]),
+        json!({}),
+        json!({"summary":1,"actions":[]}),
+        json!({"summary":"ok","actions":false}),
+    ] {
+        frame["report"] = malformed;
+        let reply: Reply = serde_json::from_value(frame.clone()).unwrap();
+        assert_eq!(reply.report, ReportField::Invalid);
+        assert_eq!(
+            serde_json::to_value(reply).unwrap(),
+            json!({"v":1,"seq":2,"state":"keep","response":{"body":"x"}})
+        );
+    }
+    let valid = json!([{"type":"protocol_convert","from":"a","to":"b"},{"type":"key_select","key_id":"public"},{"type":"route","channel":"c","model_to":"m"},{"type":"header_edit","op":"remove","name":"x"},{"type":"body_edit","op":"set","path":"/m"},{"type":"custom","label":"text"},{"type":"batch","label":"three items"}]);
+    let mut actions = valid.as_array().unwrap().clone();
+    for action in &mut actions {
+        action["irrelevant"] = json!([4]);
+    }
+    actions.last_mut().unwrap()["from"] = json!([1, 2, 3]);
+    let invalid = [
+        json!([]),
+        json!({}),
+        json!({"type":2}),
+        json!({"type":"protocol_convert","from":"x"}),
+        json!({"type":"key_select","key_id":21}),
+        json!({"type":"route","channel":"c","model_to":null}),
+        json!({"type":"body_edit","path":"/x","op":"unset"}),
+        json!({"type":"header_edit","name":"x","op":{"set":null}}),
+        json!({"type":"custom"}),
+        json!({"type":"batch","label":5}),
+    ];
+    let dropped = invalid.len();
+    actions.extend(invalid);
+    frame["report"] = json!({"summary":"s","actions":actions});
+    let r: Reply = serde_json::from_value(frame.clone()).unwrap();
+    assert!(matches!(&r.report,ReportField::Present(rep) if rep.discarded_actions==dropped));
+    frame["report"]["actions"] = valid;
+    assert_eq!(serde_json::to_value(r).unwrap(), frame);
+    assert_eq!(
+        serde_json::to_value(Action::new(
+            StandardAction::HeaderEdit {
+                name: "h".into(),
+                op: EditOp::Remove
+            },
+            Some("why".into())
+        ))
+        .unwrap(),
+        json!({"type":"header_edit","name":"h","op":"remove","label":"why"})
+    );
+}
+
+/// An incomplete upload and a worker that did not ask for a digest are separate wire states.
+#[test]
+fn notify_digest_null_and_absent_are_distinct_on_the_wire() {
+    let absent = json!({"v":1,"seq":3,"stage":"notify","event":"request_end","request_id":"r","delivery":"forward","upgraded":false,"attempts":1,"upstream_status":200,"stream_completed":true,"duration_ms":2,"outcome":"ok","code":null});
+    let mut incomplete = absent.clone();
+    incomplete["digest"] = Value::Null;
+    for (raw, expected) in [(absent, None), (incomplete, Some(None))] {
+        let msg: Message = serde_json::from_value(raw.clone()).unwrap();
+        let Stage::Notify(NotifyEvent::RequestEnd(end)) = &msg.stage else {
+            panic!("expected completion")
+        };
+        assert_eq!(end.context.digest, expected);
+        assert_eq!(serde_json::to_value(msg).unwrap(), raw);
+    }
+}

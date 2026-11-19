@@ -863,9 +863,11 @@ Windows 内核对象（A）：
   - 顶层 `reports` 只放 request、response、stream 阶段的报告，条数受链长限制；
   - 单条记录序列化后不超过 64 KiB。超出时依次处理，处理过的记录带 `"truncated":true`（R-S3-4、T-S3-8 ①）：
     1. 从最旧的尝试起删掉 `tries[].reports`；
-    2. 把 `path`、`user_agent`、`model` 截短，截短后的长度是 E 级常量；
+    2. 把 `method`、`path`、`user_agent`、`model` 截短，截短后的长度是 E 级常量；
     3. 仍超出就删掉顶层 `reports`。
-    大小不受控的只有客户端给的这三个串和 format 给的报告，三步之后剩下的字段都有上限。
+    大小不受控的只有客户端给的这四个串和 format 给的报告，三步之后剩下的字段都有上限。截短的只是记录里的那一份，
+    发给上游的方法与路径不变（2026-11-19 改：原来的第 2 步漏了 `method`；HTTP 允许自定义方法名，解析器收下的可以长到 64 KiB，
+    只截另外三个串时记录仍会超出）。
   - 被省略的尝试（计入 `tries_omitted` 的那些）的 `sent` 与 `response` 体随之丢弃，不再占预算。
     用 `body` 取它们，回 `not_found`，`reason` 为 `no_such_part`（R-S3-5）。
 - **`delivery`**：请求此刻的投递方式，`forward` 或 `retry`；`upgraded` 表示它中途从 forward 转成了 retry（§10.10）。

@@ -999,6 +999,9 @@
        find、install、skill、desktop 几行随 B9-4、B9-5、B9-6、W4。
   - [ ] B9-4 `--json`（§9.4）：status（改用 `ops::enumerate`，顺带显示 incompatible、down、看护者、读不懂的记录）、
     start、stop、restart、restore、alias list、config/settings 的 show 与 get、find；每个一份 golden。
+    进度：start、stop、restart、restore 随 B9-3；alias list 与 find 在 d7da787（`tests/json_docs.rs` 整份文档比对，
+    find 的 `errors` 按启动的分层管线解析，含 settings 的全局默认），技能与 CHANGELOG 在 f507fca。还剩 settings 与
+    status。
   - [ ] B9-5 doctor：换成诊断类型，`--json`，码（`file_permissions_too_open`、`default_header_shared` 等）。
   - [ ] B9-6 install：`--check`、`--json`（NDJSON）、预检（`install_precheck_failed`、`install_unmanaged_instances`）、
     A5 的四个字段、`halted` 时不拉起续作、与 `--force` 冲突的旗标进 force_contract 的命令行样本。

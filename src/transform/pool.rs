@@ -333,17 +333,16 @@ impl Worker {
             let stdin = self.stdin.as_mut().unwrap();
             let written = if let Some(a) = admission {
                 use tokio::io::AsyncWrite;
-                let mut changed = a.pool.changed.subscribe();
                 let first = std::future::poll_fn(|cx| {
                     let c = a.pool.circuit.lock().unwrap();
                     if c.epoch != a.epoch {
-                        return std::task::Poll::Ready(Err(c.refusal()));
+                        return std::task::Poll::Ready(Err(a.refusal()));
                     }
                     std::pin::Pin::new(&mut *stdin)
                         .poll_write(cx, &line)
                         .map_err(|_| Fault::Io)
                 });
-                tokio::select! {biased; _=changed.changed()=>return Err(a.pool.circuit.lock().unwrap().refusal()), result=first=>result?}
+                tokio::select! {biased; f=a.revoked()=>return Err(f), result=first=>result?}
             } else {
                 0
             };
@@ -371,6 +370,27 @@ impl Worker {
     }
 }
 
+/// 冷却按单调时间执行，IPC 时间戳只用于说明；拒绝信息在一次打开后固定不变。
+struct Cooldown {
+    /// 本机经过的时间不受系统时钟校正影响。
+    start: Instant,
+    /// 快照里的 Unix 毫秒。
+    opened_at: u64,
+    /// 真正触发本次打开的故障分类，不随在途消息的结果而变。
+    kind: &'static str,
+    /// 快照显示的下次试探时间，不用来计算经过的时长。
+    probe_at: u64,
+}
+impl Cooldown {
+    /// 取出给请求的拒绝原因，与被本次打开撤销的旧票所见一致。
+    fn refusal(&self) -> Fault {
+        Fault::Open {
+            kind: self.kind.into(),
+            probe_at: self.probe_at,
+        }
+    }
+}
+
 /// 每次打开都推进代数，已写出的旧请求只能结束自己的往返，不能让熔断器越过冷却。
 #[derive(Default)]
 struct Circuit {
@@ -380,21 +400,14 @@ struct Circuit {
     epoch: u64,
     /// 进程级连续失败次数，合法 fail 回信也清零。
     failures: u32,
-    /// 这次熔断的开始与最早试探时刻，单位都是 Unix 毫秒。
-    window: Option<(u64, u64)>,
+    /// 当前熔断窗口，合法试探完成后才清空。
+    window: Option<Cooldown>,
+    /// 打开时仅通知旧代的持票者；关闭不会唤醒旧队列。
+    changed: tokio::sync::watch::Sender<Option<Fault>>,
     /// 冷却结束后，同一时刻只有一个数据消息在试探。
     probing: bool,
     /// 最近一次失败分类与时刻，不记录任意进程输出。
     last: Option<(Fault, u64)>,
-}
-impl Circuit {
-    /// 为快速失败保留快照所用的同一个分类与试探时间。
-    fn refusal(&self) -> Fault {
-        Fault::Open {
-            kind: self.last.as_ref().map_or("io", |(f, _)| f.kind()).into(),
-            probe_at: self.window.map_or(0, |(_, t)| t),
-        }
-    }
 }
 /// 客户端取消时释放试探资格，不计故障，也不让半开的状态永远卡住。
 struct Admission<'a> {
@@ -402,8 +415,26 @@ struct Admission<'a> {
     pool: &'a Pool,
     /// 只改变自己所属代的状态。
     epoch: u64,
+    /// 即使后面又开闭过几次，这里收到的仍是令本票作废的那次打开。
+    changed: tokio::sync::watch::Receiver<Option<Fault>>,
     /// 普通消息不用归还试探资格。
     probe: bool,
+}
+impl Admission<'_> {
+    /// 只在锁内已见到代号不符时读取；打开先写原因再释放锁。
+    fn refusal(&self) -> Fault {
+        self.changed.borrow().clone().expect("revoked generation")
+    }
+    /// 排队或等待首次写入时及时退出，不让过期票变成冷却后的试探。
+    async fn revoked(&self) -> Fault {
+        self.changed
+            .clone()
+            .wait_for(Option::is_some)
+            .await
+            .expect("admission holds pool")
+            .clone()
+            .expect("revoked generation")
+    }
 }
 impl Drop for Admission<'_> {
     fn drop(&mut self) {
@@ -444,12 +475,10 @@ pub(crate) struct Pool {
     startup: tokio::sync::OnceCell<Result<(), Fault>>,
     /// 因空闲正常退役的进程在后台限时等待 EOF；实例关闭时一起等完。
     retiring: Mutex<tokio::task::JoinSet<()>>,
-    /// 熔断状态的写锁只覆盖进程消息的接纳与完成，不跨管道操作。
+    /// 首次 poll_write 与打开熔断器在同一锁内排序；从不持锁跨越 await。
     circuit: Mutex<Circuit>,
     /// 上报状态的配置序号和有界事件队列；不用脱敏后的名字作为身份。
     events: Option<(usize, std::sync::Weak<crate::history::History>)>,
-    /// 关闭时唤醒等候池位的消息；旧队列不得成为下一轮冷却后的试探。
-    changed: tokio::sync::watch::Sender<u64>,
     /// 最近一次成功握手的身份与能力，握手失败时不杜撰版本。
     pub(crate) negotiated: Mutex<Option<Arc<HelloReply>>>,
 }
@@ -491,7 +520,6 @@ impl Pool {
             events,
             negotiated: Mutex::new(None),
             circuit: Default::default(),
-            changed: tokio::sync::watch::channel(0).0,
         })
     }
     /// 快照不曝光命令行、环境、回信中的任意文本；版本与配置名也替换已知凭据。
@@ -512,9 +540,9 @@ impl Pool {
     fn circuit_snapshot(&self, c: &Circuit) -> serde_json::Value {
         use serde_json::json;
         let mut breaker = json!({"state":if c.probing{"half_open"}else if c.window.is_some(){"open"}else{"closed"},"failures":c.failures});
-        if let Some((opened, probe)) = c.window {
-            breaker["opened_at"] = json!(opened);
-            breaker["probe_at"] = json!(probe);
+        if let Some(window) = &c.window {
+            breaker["opened_at"] = json!(window.opened_at);
+            breaker["probe_at"] = json!(window.probe_at);
         }
         if let Some((f, at)) = &c.last {
             breaker["last_failure"] =
@@ -530,13 +558,16 @@ impl Pool {
     /// 记录冷却并清空空闲进程；与试探、已排队消息的判定共用同一把锁。
     fn open(&self, c: &mut Circuit, now: u64) {
         c.epoch = c.epoch.wrapping_add(1);
-        c.window = Some((
-            now,
-            now.saturating_add(self.entry.breaker_cooldown_secs.saturating_mul(1000)),
-        ));
+        let window = Cooldown {
+            start: Instant::now(),
+            opened_at: now,
+            kind: c.last.as_ref().expect("opening fault").0.kind(),
+            probe_at: now.saturating_add(self.entry.breaker_cooldown_secs.saturating_mul(1000)),
+        };
+        std::mem::take(&mut c.changed).send_replace(Some(window.refusal()));
+        c.window = Some(window);
         c.probing = false;
         self.idle.lock().unwrap().clear();
-        self.changed.send_replace(c.epoch);
         self.transition(c);
         tracing::warn!(format=%self.secrets.replace(&self.entry.name),failures=c.failures,cooldown_secs=self.entry.breaker_cooldown_secs,kind=c.last.as_ref().map(|(f,_)|f.kind()),"format circuit opened");
     }
@@ -546,14 +577,18 @@ impl Pool {
         let now = crate::daemon::now_millis();
         c.failures = 1;
         c.last = Some((f, now));
-        self.open(&mut c, now);
+        if self.entry.breaker_failures != 0 {
+            self.open(&mut c, now);
+        }
     }
     /// 打开的程序不排队。冷却后的首条消息抢到独占试探，即使用 persistent 也重新握手。
     fn admit(&self) -> Result<Admission<'_>, Fault> {
         let mut c = self.circuit.lock().unwrap();
-        let probe = if let Some((_, at)) = c.window {
-            if c.probing || crate::daemon::now_millis() < at {
-                return Err(c.refusal());
+        let probe = if let Some(window) = &c.window {
+            if c.probing
+                || window.start.elapsed() < Duration::from_secs(self.entry.breaker_cooldown_secs)
+            {
+                return Err(window.refusal());
             }
             c.probing = true;
             self.transition(&mut c);
@@ -565,6 +600,7 @@ impl Pool {
         Ok(Admission {
             pool: self,
             epoch: c.epoch,
+            changed: c.changed.subscribe(),
             probe,
         })
     }
@@ -635,8 +671,10 @@ impl Pool {
         };
         let mut child = {
             let c = self.circuit.lock().unwrap();
-            if admission.is_some_and(|a| a.epoch != c.epoch) {
-                return Err(c.refusal());
+            if let Some(a) = admission
+                && a.epoch != c.epoch
+            {
+                return Err(a.refusal());
             }
             Command::new(exe)
                 .args(&self.entry.args)
@@ -690,6 +728,16 @@ impl Pool {
             seq: 0,
             idle_since: Instant::now(),
         };
+        self.handshake(&mut w, id, admission).await?;
+        Ok(w)
+    }
+    /// 拉起和握手之间别的进程仍能令本票作废；hello 与业务帧共用首次写入的原子检查。
+    async fn handshake(
+        &self,
+        w: &mut Worker,
+        id: u32,
+        admission: Option<&Admission<'_>>,
+    ) -> Result<(), Fault> {
         let mut hello = Hello::new(
             env!("CARGO_PKG_VERSION").into(),
             self.entry.name.clone(),
@@ -706,7 +754,9 @@ impl Pool {
         );
         hello.features.push("decide.success".into());
         hello.overrides = OVERRIDES.iter().map(|k| (*k).into()).collect();
-        let line = w.frame(Stage::Hello(hello), 10, None, HELLO_BYTES).await?;
+        let line = w
+            .frame(Stage::Hello(hello), 10, admission, HELLO_BYTES)
+            .await?;
         let object: serde_json::Map<String, serde_json::Value> =
             serde_json::from_slice(&line).map_err(|_| Fault::Invalid)?;
         if object.get("seq").and_then(|v| v.as_u64()) != Some(0) {
@@ -726,11 +776,12 @@ impl Pool {
         if !missing.is_empty() {
             return Err(Fault::Stages(missing));
         }
+        // 握手成功只建立会话；只有合法的业务阶段回信才清零连续失败数。
         let hello = Arc::new(reply);
         w.hello = Some(hello.clone());
         *self.negotiated.lock().unwrap() = Some(hello);
         w.seq = 1;
-        Ok(w)
+        Ok(())
     }
     /// 探测 persistent 的首个进程留池；spawn 进程在握手后单独关闭。
     pub(crate) async fn probe(self: &Arc<Self>) -> Result<(), Fault> {
@@ -841,10 +892,9 @@ impl Pool {
     }
     /// 先拿到已握手的独占进程，再让上一层读取磁盘与构造业务帧；等待者只持有轻量上下文。
     pub(crate) async fn turn(self: &Arc<Self>, fresh: bool) -> Result<Turn<'_>, Fault> {
-        let mut changed = self.changed.subscribe();
         let ticket = self.admit()?;
         let _turn = tokio::select! {biased;
-            _=changed.changed()=>return Err(self.circuit.lock().unwrap().refusal()),
+            f=ticket.revoked()=>return Err(f),
             turn=self.turns.acquire()=>turn.map_err(|_| Fault::Died)?,
         };
         let borrow = async {
@@ -857,7 +907,7 @@ impl Pool {
             self.spawn(Some(&ticket)).await
         };
         let worker = tokio::select! {biased;
-            _=changed.changed()=>return Err(self.circuit.lock().unwrap().refusal()),
+            f=ticket.revoked()=>return Err(f),
             result=borrow=>result,
         };
         match worker {

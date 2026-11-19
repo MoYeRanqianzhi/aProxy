@@ -341,6 +341,7 @@ impl RequestChain {
                         }
                     }
                     Err(Fault::Open { kind, probe_at }) if pool.entry.required => {
+                        tracing::warn!(format=%safe,stage,code="format_unavailable",kind,probe_at,"format request unavailable");
                         return Err(ChainError::stop(
                             Terminal::new(
                                 "format_unavailable",

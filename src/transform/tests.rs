@@ -26,15 +26,19 @@ fn pool(mode: Process, sub: &str, edit: impl FnOnce(&mut FormatEntry)) -> Arc<Po
 }
 /// 每次发送不同的正文；从错误的进程或旧序号取到的回信不能冒充本次回显。
 async fn call(p: &Arc<Pool>, body: &str, fresh: bool) -> Result<Reply, Fault> {
+    p.call(request_frame(body), p.entry.timeout_secs, fresh)
+        .await
+}
+/// 构造小业务帧，供已借出进程和按需借用两种测试共用。
+fn request_frame(body: &str) -> Stage {
     let mut req = wire::Request::new("POST".into(), "http://localhost/test".into());
     req.body = wire::Body::Text(body.into());
-    let frame = Stage::Request(wire::RequestMessage::new(
+    Stage::Request(wire::RequestMessage::new(
         wire::Context::new("r".into()),
         wire::Delivery::Retry,
         req,
         wire::Client::new("/test".into(), false),
-    ));
-    p.call(frame, p.entry.timeout_secs, fresh).await
+    ))
 }
 /// 假程序的 state 携带槽号与 pid；顺带核对正文确实经过了管道。
 fn worker(r: Reply, body: &str) -> String {
@@ -603,4 +607,127 @@ async fn shutdown_reaps_a_checked_out_worker_before_returning() {
     assert_eq!(crate::process::process_exited(pid), Some(true));
     assert!(matches!(p.turn(false).await, Err(Fault::Died)));
     drop(held);
+}
+
+/// 调整系统时钟不会缩短冷却；观测用的 Unix 时间可与真正的耗时完全不同。
+#[tokio::test]
+async fn breaker_generation_cooldown_uses_elapsed_time() {
+    let p = pool(Process::Persistent, "echo", |e| {
+        e.breaker_cooldown_secs = 90
+    });
+    {
+        let mut c = p.circuit.lock().unwrap();
+        c.last = Some((Fault::Died, 0));
+        p.open(&mut c, 0);
+    }
+    assert!(matches!(
+        p.admit(),
+        Err(Fault::Open {
+            probe_at: 90000,
+            ..
+        })
+    ));
+}
+/// 熔断后的在途故障更新快照，却不能改写旧请求被拒时的故障和时间，包括恢复以后。
+#[tokio::test]
+async fn breaker_generation_retains_the_fault_after_recovery() {
+    let p = pool(Process::Persistent, "echo", |e| {
+        e.breaker_failures = 1;
+        e.breaker_cooldown_secs = 0
+    });
+    let old = p.turn(false).await.unwrap();
+    let a = p.admit().unwrap();
+    let b = p.admit().unwrap();
+    p.complete(&a, Some(&Fault::Protocol));
+    let at = p.snapshot().1["breaker"]["probe_at"].as_u64().unwrap();
+    p.complete(&b, Some(&Fault::Timeout));
+    let probe = p.admit().unwrap();
+    let refused = |r: Fault| {
+        assert!(
+            matches!(r,Fault::Open{ref kind,probe_at} if kind=="protocol" && probe_at==at),
+            "{r:?}"
+        )
+    };
+    refused(p.admit().err().unwrap());
+    assert_eq!(
+        p.snapshot().1["breaker"]["last_failure"]["details"]["kind"],
+        "timeout"
+    );
+    p.complete(&probe, None);
+    refused(old.send(request_frame("not written"), 1).await.unwrap_err());
+    assert_eq!(p.snapshot().1["breaker"]["state"], "closed");
+}
+
+/// 已经获得 OS 句柄并非获准写 hello；在两步之间打开就不能再写出一行。
+#[tokio::test]
+async fn revoked_ticket_prevents_the_first_runtime_hello_byte() {
+    let dir = tempfile::tempdir().unwrap();
+    let frames = dir.path().join("frames");
+    let p = pool(Process::Persistent, "echo", |e| {
+        e.breaker_failures = 1;
+        e.env
+            .insert("ECHO_RECORD".into(), frames.display().to_string());
+    });
+    let mut w = p.spawn(None).await.unwrap();
+    let a = p.admit().unwrap();
+    p.complete(&a, Some(&Fault::Protocol));
+    assert!(matches!(
+        p.handshake(&mut w, 0, Some(&a)).await,
+        Err(Fault::Open { .. })
+    ));
+    w.finish().await;
+    assert_eq!(std::fs::read_to_string(frames).unwrap().lines().count(), 1);
+}
+
+/// 真正写出探针后分别取消、超时和收到坏序号；只有后两者另起冷却，三者均不遗留半开资格。
+#[tokio::test]
+async fn half_open_probe_cancellation_timeout_and_invalid_reply_have_distinct_outcomes() {
+    for (mode, cancel) in [
+        ("gate-request", true),
+        ("gate-request", false),
+        ("bad-seq", false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let obs = dir.path().join("observations");
+        let p = pool(Process::Persistent, mode, |e| {
+            e.timeout_secs = 1;
+            e.breaker_cooldown_secs = 1;
+            e.args.push(dir.path().join("gate").display().to_string());
+            e.env
+                .insert("ECHO_OBSERVE".into(), obs.display().to_string());
+        });
+        p.open_at_startup(Fault::Spawn);
+        let opened = p.snapshot().1["breaker"]["probe_at"].clone();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let test_pool = p.clone();
+        let send = tokio::spawn(async move { call(&test_pool, "blocked", false).await });
+        wait_observed(&obs, "request", 1).await;
+        if cancel {
+            send.abort();
+            assert!(send.await.unwrap_err().is_cancelled());
+        } else {
+            let f = send.await.unwrap().unwrap_err();
+            assert_eq!(
+                f.kind(),
+                if mode == "bad-seq" {
+                    "protocol"
+                } else {
+                    "timeout"
+                }
+            );
+        }
+        let b = &p.snapshot().1["breaker"];
+        assert_eq!(b["state"], "open");
+        assert_eq!(b["failures"], if cancel { 1 } else { 2 });
+        if cancel {
+            assert_eq!(b["probe_at"], opened);
+        } else {
+            assert!(b["probe_at"].as_u64() > opened.as_u64());
+            assert!(matches!(p.admit(), Err(Fault::Open { .. })));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert!(p.admit().unwrap().probe);
+        assert_eq!(wait_observed(&obs, "hello", 1).await.len(), 1);
+        assert_eq!(wait_observed(&obs, "request", 1).await.len(), 1);
+    }
 }

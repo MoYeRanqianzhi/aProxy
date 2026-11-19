@@ -631,6 +631,19 @@ async fn breaker_opens_after_five_failures_and_answers_503() {
         assert_eq!(r.status(), 503);
         assert_eq!(r.headers()["x-aproxy-error"], "format_unavailable");
     }
+    let ping =
+        aproxy::daemon::ipc_ping_in(&home.path().join("run"), url.rsplit(':').next().unwrap())
+            .await
+            .unwrap();
+    let log = std::fs::read_to_string(ping.instance.log_path.unwrap()).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("format request unavailable")
+                && line.contains("format_unavailable"))
+            .count(),
+        2,
+        "{log}"
+    );
     let f = frames(&home, "broken");
     assert_eq!(f.len(), 10);
     assert_eq!(f.iter().filter(|m| m["stage"] == "request").count(), 5);
@@ -1846,11 +1859,25 @@ async fn response_recovery_and_breaker_admission_use_only_allowed_workers() {
     for (mode, expected, n) in [
         ("recover-response", "fresh reply", 2),
         ("exit1", "upstream bytes", 2),
+        ("open-skip", "upstream bytes", 1),
         ("probe-response", "upstream bytes", 1),
     ] {
         let home = TestHome::new();
         let flag = home.path().join("probe");
-        let mut cfg = layer(&home, "res", "'response'", &[mode, flag.to_str().unwrap()]);
+        let fixture = if mode == "open-skip" {
+            "probe-response"
+        } else {
+            mode
+        };
+        let mut cfg = layer(
+            &home,
+            "res",
+            "'response'",
+            &[fixture, flag.to_str().unwrap()],
+        );
+        if mode == "open-skip" {
+            cfg += "breaker_failures=1\nbreaker_cooldown_secs=86400\n";
+        }
         if mode == "probe-response" {
             cfg += "breaker_failures=1\nbreaker_cooldown_secs=2\n";
         }
@@ -1865,9 +1892,11 @@ async fn response_recovery_and_breaker_admission_use_only_allowed_workers() {
             n
         );
         assert_eq!(observed_stage(&home, "res", "response", n).await.len(), n);
-        if mode == "probe-response" {
+        if mode == "open-skip" {
             assert_eq!(get().await.unwrap().text().await.unwrap(), "upstream bytes");
             assert_eq!(frames(&home, "res").len(), 2);
+        }
+        if mode == "probe-response" {
             std::fs::write(&flag, b"").unwrap();
             let at = breaker(&home, &url).await["probe_at"].as_u64().unwrap();
             let now = std::time::SystemTime::now()
@@ -1887,7 +1916,7 @@ async fn response_recovery_and_breaker_admission_use_only_allowed_workers() {
             );
         }
     }
-    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 6);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 7);
 }
 
 /// 内层明确拒绝的替代响应仍向外走；没有替代时外层看到原数据，两种都不重发上游。
@@ -2394,4 +2423,26 @@ async fn bodyless_format_terminals_record_zero_delivered_bytes() {
             0
         );
     }
+}
+
+/// 禁用熔断的可选程序暂缺时，每条请求仍尝试启动；恢复可执行文件后立即工作。
+#[tokio::test]
+async fn disabled_breaker_optional_startup_recovers_on_the_next_request() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[200]).await;
+    let exe = home
+        .path()
+        .join(format!("later{}", std::env::consts::EXE_SUFFIX));
+    let cfg = layer(&home, "optional", "'request'", &["echo"]).replace(
+        &serde_json::to_string(&format_echo_path()).unwrap(),
+        &serde_json::to_string(&exe).unwrap(),
+    ) + "required=false\nbreaker_failures=0\n";
+    let (c, url) = running(&home, up, &cfg);
+    assert_eq!(breaker(&home, &url).await["state"], "closed");
+    assert_eq!(c.get(&url).send().await.unwrap().status(), 200);
+    assert_eq!(breaker(&home, &url).await["failures"], 2);
+    std::fs::copy(format_echo_path(), exe).unwrap();
+    assert_eq!(c.get(&url).send().await.unwrap().status(), 200);
+    assert_eq!(breaker(&home, &url).await["failures"], 0);
+    assert_eq!(frames(&home, "optional").len(), 2);
 }

@@ -197,7 +197,7 @@ Codex 的 `stream_idle_timeout_ms` 默认 300000（5 分钟），按 SSE 事件�
 | `aproxy find [关键字]` | 从配置目录发现全部配置；`--aliased/--unaliased --port PORT` 过滤 |
 | `aproxy config show\|get\|set\|unset` | 查看或修改配置：`show` 打印文件里写的值，`--effective` 连全局默认与内置默认一起打印并注明来源；`set`/`unset` 每次改一个键 |
 | `aproxy settings show\|get\|set\|unset` | 查看或修改全局设置（`~/.aproxy/settings.json`）：别名、`defaults` 全局默认、看护者、日志、安装更新；settings.json 有错误时也能用，用来修复它 |
-| `aproxy install [版本]` | 安装或升级（别名 `upgrade`），逐实例滚动重启；`--variant` 换变体，`--force` 强制安装；见「入门」里的升级说明 |
+| `aproxy install [版本]` | 安装或升级（别名 `upgrade`），逐实例滚动重启，动第一个实例之前先预检；`--check` 只查询有没有新版本，`--variant` 换变体，`--force` 强制安装；见「入门」里的升级说明 |
 | `aproxy desktop` | 打开桌面界面（预览版，显示的是演示数据，见下） |
 
 `start` 的参数：`<别名|路径>` 或 `--config <PATH>`（指定配置文件，多开用；两者等价）、`--listen-addr <ADDR>`、`--base-url <URL>`、`--proxy <URL>`、`--api-key <KEY|->`（只记录进这次启动的拉起规格，`restart`/`restore` 沿用，不写进 config.toml；`-` 表示从 stdin 读一行）、`--log-file <PATH>`、`--foreground`。不带命令的 `aproxy` 只打印帮助并以退出码 2 结束。

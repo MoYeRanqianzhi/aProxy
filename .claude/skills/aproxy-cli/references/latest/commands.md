@@ -134,10 +134,10 @@ the `--json` codes, not from the Chinese text.
 | config | the values printed, or the change saved | write conflict or I/O failure | a malformed key path, or a value that is not TOML | the result would be invalid, an unknown key, or the file has errors (`show` still prints, then exits 3) | the file does not exist (`get`, or `show` with an explicit `--config`) | — |
 | settings | show/get printed; set/unset stored or unchanged | write failure | a malformed key path, or a value that is not JSON | the file cannot be read, or the change would make it invalid | — | — |
 | desktop | the window was closed; a window is already open for this home; on Windows from a terminal, the window was opened | headless build; no web view runtime or no display; the window failed to start | — | — | — | — |
-| install | installed; already latest; channel empty; nothing to abort | any failure | — | — | — | — |
+| install | installed; already latest; channel empty; nothing to abort; `--check` answered | failed, or refused before changing anything (instances it cannot restart) | usage | the precheck before the rolling restart failed | the requested version does not exist | — |
 
-**`--json`** (on `start`, `stop`, `restart`, `restore`, `status`, `find`, `doctor`, `alias list`, and
-the `config` and `settings` subcommands) prints exactly
+**`--json`** (on `start`, `stop`, `restart`, `restore`, `status`, `find`, `doctor`, `alias list`,
+`install --check`, and the `config` and `settings` subcommands) prints exactly
 one JSON document on stdout, starting with `"schema":1`; the human-readable lines move to stderr.
 When the whole command fails, the document is
 `{"schema":1,"error":{"code","message","details"}}`; `code` names the cause, for example
@@ -155,6 +155,8 @@ instance:
 `restarted`, `failed` for `restart`; `restored`, `already_running`, `config_missing`, `failed` for
 `restore`. A `failed` item carries an `error` object shaped like the failure document's (codes such
 as `instance_unresponsive`, `stop_failed`, `restart_unsupported`, `config_invalid`).
+An install with `--json` prints one JSON object per line instead (install / upgrade, "Exit codes
+and `--json`").
 
 `install --force` exits 0, 10, 11 or 12 instead; see install / upgrade, Force install.
 
@@ -812,9 +814,10 @@ tell the user that what it shows is real; use `aproxy status` and `aproxy logs`.
 
 ```
 aproxy install [latest|VERSION] [--pre] [--allow-downgrade] [--cpu x86-64-v3|baseline]
-               [--variant desktop|headless] [--download-proxy URL] [--no-skills]
-aproxy install --from PATH [--variant desktop|headless] [--no-skills] [--download-proxy URL]
-aproxy install --adopt [--no-skills]
+               [--variant desktop|headless] [--download-proxy URL] [--no-skills] [--json]
+aproxy install --from PATH [--variant desktop|headless] [--no-skills] [--download-proxy URL] [--json]
+aproxy install --adopt [--no-skills] [--json]
+aproxy install --check [--pre] [--variant desktop|headless] [--download-proxy URL] [--json]
 aproxy install [latest|VERSION] --skills-only [--pre] [--download-proxy URL]
 aproxy install --abort
 aproxy install --force [latest|VERSION] [--pre] [--variant desktop|headless]
@@ -843,7 +846,9 @@ to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running anot
 | `--adopt` | copy the binary you are running into `<home>/bin/` and move running instances onto it |
 | `--skills-only` | update only the skill documents, to VERSION or, by default, the channel's latest version (the running version if the channel is empty) |
 | `--abort` | cancel an install that has not reached the swap |
-| `--force` | stop every aproxy process of this home and replace the binary without the hand-over ([Force install](#force-install)). `--adopt`, `--abort`, `--skills-only`, `--no-skills` and `--allow-downgrade` cannot be combined with it: the command stops with a usage error (exit 2) and does nothing |
+| `--check` | only report which version `install` would install, and whether it is newer than the running one; downloads nothing and changes nothing ("Checking for an update" below). Combines only with `--pre`, `--variant`, `--download-proxy` and `--json` |
+| `--json` | machine-readable output on stdout, human lines on stderr: one JSON object per line during an install, one document with `--check` ("Exit codes and `--json`" below). Not with `--abort` or `--skills-only` |
+| `--force` | stop every aproxy process of this home and replace the binary without the hand-over ([Force install](#force-install)). `--adopt`, `--abort`, `--skills-only`, `--no-skills`, `--allow-downgrade`, `--check` and `--json` cannot be combined with it: the command stops with a usage error (exit 2) and does nothing |
 | `--yes` | with `--force`: do not ask for confirmation; required when stdin is not a terminal |
 | `--variant desktop\|headless` | the build to install, with or without the desktop interface; default the build you run, so upgrades keep it ("Choosing the variant" below). With `--from` it is a check, not a choice: the file must be that build, or nothing is installed. Not with `--adopt`, `--abort` or `--skills-only` |
 
@@ -879,6 +884,26 @@ to `<home>/bin/` (`where aproxy`, `command -v aproxy`), or you keep running anot
   `--variant headless`, or `install --force`, which reads the release manifest and installs the
   headless build only when the desktop build is really missing.
 
+**Checking for an update.** `aproxy install --check` asks the same sources in the same channel as
+`install latest` and prints one of:
+
+- `有新版本 <latest>（当前 <current>，<channel> 通道）。执行 aproxy install 升级。` ("version <latest>
+  is available; run aproxy install to upgrade");
+- `已是最新：当前 <current>，<channel> 通道最新为 <latest>。` ("up to date");
+- `<channel> 通道暂无可用版本，当前 <current>。` ("no version in this channel").
+
+In the stable channel the last two add `（如需预发布版本，可加 --pre）` ("add --pre for
+pre-releases"). It exits 0 whenever the sources answered, update or not, and 1 when they did not
+(`install_download_failed`; `--download-proxy` may help). It takes no lock and starts nothing, so it
+is safe to run at any time. With `--json`:
+
+```json
+{"schema":1,"current":"0.2.0-alpha.3","latest":"0.2.0-alpha.4","update_available":true,"channel":"pre","variant":"desktop","published_at":"2026-11-25T08:00:00Z","url":"https://github.com/MoYeRanqianzhi/aProxy/releases/tag/v0.2.0-alpha.4"}
+```
+
+`latest` is null when the channel has no version; `variant` is the build `install` would install;
+`published_at` and `url` are present when the answer came from GitHub.
+
 **Choosing the variant.** Every platform has two builds with the same proxy and commands: `desktop`,
 with the window of `aproxy desktop`, and `headless`, without it. The first word in the parentheses
 of `aproxy --version` tells which one runs. Upgrades keep it; `--variant` switches. When nothing
@@ -898,11 +923,39 @@ the loader's error above"). The loader's error names what is missing: a library 
 (the library is too old), or `GLIBC_2.xx not found` (glibc is too old, which only a newer system
 fixes). Install what it names and run the command again, or use `--variant headless`.
 
-**Which instances move.** Online installs and `--from` refuse while a running instance's binary
-lives outside `<home>/bin/` (`实例 <port> 的二进制不在安装管辖目录（…）下`, "instance binary outside
-the managed directory"); an online install refuses before downloading anything. Upgrade that copy
-through its own channel (npm, cargo, a package manager) or run `aproxy install --adopt`, which moves
-every running instance onto `<home>/bin/`.
+**Which instances move.** Every running instance of the home is restarted on the new binary, so an
+install first makes sure it can restart all of them, and refuses before it downloads, locks or
+writes anything (exit 1) when it cannot:
+
+- An instance started by an older version whose records this version cannot read (`status` lists it
+  among the other aproxy processes):
+  `[ERROR] 这个 home 里有旧版本启动、本次安装管不了的实例还在运行（pid <pids>）。…`
+  ("instances started by an older version, which this install cannot manage, are running"), code
+  `install_unmanaged_instances`. Stop them with the version that started them (its `aproxy stop all`),
+  then install; or use `install --force`, which stops every aproxy process of the home.
+  compatibility.md has the steps for the 0.2.0 alphas.
+- A foreground instance (`start --foreground`), which has no record to restart it from:
+  `[ERROR] 端口 <port> 上的实例在前台运行，安装无法替它重启。…` ("the instance on port <port> runs in
+  the foreground; the install cannot restart it"), code `install_foreground_instances` with
+  `details.ports`. Stop it (Ctrl+C in its terminal, `aproxy stop <port>`, or the service manager that
+  runs it), install, then start it again the way it was started.
+- Online installs and `--from` also refuse while a running instance's binary lives outside
+  `<home>/bin/` (`实例 <port> 的二进制不在安装管辖目录（…）下`, "instance binary outside the managed
+  directory"). Upgrade that copy through its own channel (npm, cargo, a package manager) or run
+  `aproxy install --adopt`, which moves every running instance onto `<home>/bin/`.
+
+Right before it touches the first instance, after the download, the install checks the first two
+points again (an instance may have started meanwhile) and prechecks every instance it will restart:
+the instance's start spec, resolved by the new version against the current settings.json. When an
+instance fails it, nothing is changed and the command prints
+`[ERROR] 安装前的预检没有通过：端口 <port> 的实例按新版本解析配置时出错。什么都没有改动：实例照常运行，二进制没换。`
+("the precheck failed: the new version cannot resolve the configuration of the instance on port
+<port>; nothing was changed"), the diagnostics, and `修正上面的问题后重新执行 aproxy install。` ("fix
+the problems above and run aproxy install again"), exit 3, code `install_precheck_failed` with
+`details.port` and `details.diagnostics`. An invalid settings.json is only a warning for an install
+with no running instance, but fails this precheck when one runs. A failure at this point leaves
+`<home>/install/state.json` marked as halted, which nothing resumes in the background; fix the cause
+and run `aproxy install` again. An instance you stop while the install runs is skipped, not an error.
 
 **Reading the result.**
 
@@ -923,23 +976,55 @@ every running instance onto `<home>/bin/`.
 **When it fails.** `[ERROR] 安装失败: …` is followed by one of two hints:
 
 - `滚动已中止，不会自动重试…` ("rolling aborted, no automatic retry"): an instance did not start on
-  the new version. It was brought back on the old binary (if that also failed, its desired-state
+  the new version (`install_restart_failed`, with `details.port`). It was brought back on the old binary (if that also failed, its desired-state
   record was kept for `aproxy restore`), and the remaining instances were not touched. Usually the new
   version rejects the existing config: fix the reported cause and run `aproxy install` again, or
   stay on the old version with `aproxy install <old version> --allow-downgrade`. The new binary is
   already in `<home>/bin/` at this point, so the CLI and some instances run different versions
   until you finish.
-- `现场已保留，中断后重试同一命令或任何 aproxy 命令可自动续作…` ("state kept; rerun, or any aproxy
-  command resumes"): run the same command again. When the error reads `目标版本没有接手安装（…）`
+- `现场已保留：重新执行同一条命令即可接着装完…` ("state kept; rerun the same command to finish"):
+  run the same command again. When the error reads `目标版本没有接手安装（…）`
   ("the target version did not take over"), the downloaded binary exited or hung before starting;
   no instance and no file in `<home>/bin/` was changed.
 
-An install interrupted by a crash, kill or power loss leaves `<home>/install/state.json`; the
-watchdog and every other `aproxy` command resume it in the background. Do not delete that file by
-hand: it is what lets the install finish. `--abort` works only before the swap
+An install interrupted by a crash, kill or power loss leaves `<home>/install/state.json`. The
+watchdog resumes it in the background, and so does any command that changes instances or settings
+(`start`, `stop`, `restart`, `restore`, `alias add|remove`, `config set|unset`, `settings set|unset`);
+commands that only look (`status`, `logs`, `find`, `doctor`, `alias list`, `config show|get`,
+`settings show|get`) never do, and nothing resumes a failure marked halted. Do not delete that file
+by hand: it is what lets the install finish. `--abort` works only before the swap
 (`安装已中止，现场已清理（二进制与实例未受影响）。`, "aborted; binary and instances untouched");
 after it, the install can only be completed. When none of this gets the install through, use
 [Force install](#force-install).
+
+**Exit codes and `--json`.** 0: installed, or nothing to do; 1: failed; 2: usage error; 3: the
+precheck failed; 4: the requested version does not exist (`install_version_not_found`). Every failure
+has an `install_*` code (`docs/error-codes.md`), for example `install_download_failed`,
+`install_checksum_mismatch`, `install_probe_failed`, `install_swap_failed`, `install_rolled_back` (the
+previous binary was put back), `install_restart_failed`, `install_in_progress`, `install_failed`.
+
+With `--json` an install prints one JSON object per line on stdout, each with `"schema":1` and an
+`event`:
+
+```json
+{"schema":1,"event":"plan","ports":[12346,12347]}
+{"schema":1,"event":"phase","phase":"downloading","at":1763540000000}
+{"schema":1,"event":"progress","phase":"downloading","bytes":4194304,"total":9437184}
+{"schema":1,"event":"instance","port":12346,"outcome":"restarted"}
+{"schema":1,"event":"result","outcome":"installed","version":"0.2.0-alpha.4"}
+```
+
+- `plan` comes first, once the target version is known and the checks above passed: the running
+  instances the install will restart.
+- `phase` marks each phase as it begins, in the order `marking`, `downloading`, `downloaded`,
+  `broadcasting`, `acked`, `swapping`, `swapped`, `restarting`, `verifying`, `cleaning`; `at` is Unix
+  milliseconds.
+- `progress` reports the download, at most about ten times a second; `total` is null when unknown.
+- `instance` gives each instance's outcome: `restarted`, `rolled_back` (back on the old binary),
+  `failed`, or `skipped` (stopped during the install).
+- `result` is the last line: `outcome` is `installed`, `up_to_date` or `failed`; a failure adds
+  `"error":{"code","message","details"}`, and `version` is null when it failed before the target
+  version was known. A failure that early, or a refusal by the checks above, prints only this line.
 
 **If `aproxy` itself will not run.** On Windows the swap renames the old binary to a unique
 `<home>/bin/aproxy.old-<nanoseconds>-<pid>.exe` before moving the new one in, and

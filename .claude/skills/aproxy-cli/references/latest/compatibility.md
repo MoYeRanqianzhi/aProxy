@@ -76,6 +76,7 @@ does not have. These development-line changes alter what you see or do on 0.1.0:
 | There is no `aproxy desktop` | builds with the desktop interface open a window with it; in the 0.2.0 alpha releases it shows demo data only (commands.md, desktop) |
 | There is no `aproxy install --force` and no process ledger | force install stops every process of the home through `<home>/ledger/` and replaces the binary (commands.md, Force install) |
 | The CPU build option is `--variant v3\|baseline`, and the swap renames the old binary to the fixed name `aproxy.old(.exe)` | the option is `--cpu x86-64-v3\|baseline` (`--variant` now picks `desktop` or `headless`), and the swap uses unique names `aproxy.old-<nanoseconds>-<pid>[.exe]` (commands.md, install / upgrade) |
+| `aproxy install` exits 1 on any failure, has no `--check` or `--json`, and is resumed in the background by any command after an interruption | it refuses up front while instances it cannot restart run, prechecks every instance before it touches one (exit 3 when that fails), exits 4 for a version that does not exist, has `--check` and `--json`, and only commands that change something resume it (commands.md, install / upgrade) |
 | `aproxy doctor` exits 0 whatever it finds, checks the default config only for a non-loopback address, and calls an alias that points to a missing file an error | it exits 3 when it finds an error, checks every config the way `start` would, and reports a missing alias target as a warning; `--json` gives the whole report (commands.md, doctor) |
 | Commands print their log lines, `INFO` included, on stdout | log lines go to stderr, warnings and errors only unless `RUST_LOG` asks for more, so stdout holds only results (commands.md, Output and exit codes) |
 
@@ -95,12 +96,16 @@ Those alphas keep their runtime records under other names and shapes: the instan
 `watchdog.json`, and it cannot use an alpha instance's snapshot. So an instance started by one of
 those alphas is out of reach for this version's CLI:
 
-- `aproxy status` does not list it, and `aproxy stop <port>` answers
+- `aproxy status` lists it only among the other aproxy processes, and `aproxy stop <port>` answers
   `端口 <port> 上没有运行中的 aProxy 实例。` ("no running aProxy instance on port"), although the
   process is still serving.
 - Neither `aproxy restore` nor the watchdog brings it back after a crash.
 
-Stop the instances **before** replacing the binary:
+Stop the instances **before** installing. An install started while they run stops before it
+replaces anything: the alpha's `aproxy install` hands the work to this version, which finds the alpha
+instances and fails with
+`live instances started by an older version are in this home (pid …); stop them with the aproxy that started them (aproxy stop all), or run aproxy install --force`.
+The alpha binary stays in place; follow the steps below and install again.
 
 1. With the alpha CLI: `aproxy status`, note each instance's port, config and one-off flags, then
    `aproxy stop all` and check that `aproxy status` lists nothing.
@@ -109,8 +114,11 @@ Stop the instances **before** replacing the binary:
 3. Delete what the alpha left in `<home>/run/`: `*.pid`, `*.restore` and `watchdog.claim`. Nothing
    reads them.
 
-If the binary was already replaced while alpha instances were running, the alpha CLI is gone and
-the new one cannot see them. `aproxy install --force` still can: it finds every aproxy process of
+The command line changed after alpha.2 as well: `aproxy` alone no longer starts an instance, and the
+`config` flags became `config set`/`unset`. See "Commands changed in 0.2.0" below.
+
+If the binary was replaced another way while alpha instances were running (by hand, for example),
+the alpha CLI is gone and the new one cannot manage them. `aproxy install --force` still can: it finds every aproxy process of
 this home through the process ledger, whose format never changes, and terminates them (requests in
 flight are cut off). It cannot restart them, because their desired-state records are in the old
 format; start each one again with `aproxy start`.
@@ -162,6 +170,33 @@ moment with the user first.
    so agent clients need no change.
 7. Refresh these documents with `aproxy install --skills-only`, and check that the agent's skills
    directory links to or copies `<home>/skills/aproxy-cli`.
+
+### Commands changed in 0.2.0
+
+The command line was reorganized. 0.2.0-alpha.1 and alpha.2 still had the 0.1.x command line apart
+from the `install` options in the last row, so this table applies to them as well. A bare `aproxy` no
+longer starts an instance: it prints the help and exits 2.
+
+| 0.1.x | Now |
+|---|---|
+| `aproxy`, `aproxy --config <file>` | `aproxy start`, `aproxy start <file>` (`aproxy start --config <file>` works too) |
+| `aproxy --foreground` | `aproxy start --foreground` |
+| `aproxy --baseurl <URL>`, `--listen <addr>` | `aproxy start --base-url <URL>`, `--listen-addr <addr>` |
+| top-level `--proxy`, `--api-key`, `--log-file`, `--config` | options of `start`, written after it; `--api-key -` reads one line from stdin |
+| `aproxy stop idle 600`, `aproxy restart idle 600` | `aproxy stop idle --idle-threshold-secs 600` (`restart` likewise) |
+| `aproxy logs`, which follows until interrupted | `aproxy logs` prints the last 200 lines and exits; `-n <lines>` sets the count, `-f` follows |
+| `aproxy config`, `aproxy config --show` | `aproxy config show` (the values the file sets), `aproxy config show --effective` (effective values and where each comes from) |
+| `aproxy config --baseurl <URL>`, `--listen`, `--api-key`, `--proxy`, `--proxy-username`, `--proxy-password`, `--keepalive-secs <s>` | `aproxy config set <key> <value>` with the keys `base_url`, `listen_addr`, `api_key`, `proxy`, `proxy_username`, `proxy_password`, `keepalive.interval_secs`; one key per command |
+| `aproxy config --extra-header k=v`, `--override-header k=v` | `aproxy config set extra_headers.k v`, `aproxy config set override_headers.k v` |
+| `aproxy config --clear-api-key`, `--clear-headers`, `--clear-proxy` | `aproxy config unset <key>` |
+| `aproxy config --set-default <file>`, `--clear-default` | `aproxy settings set default_config <file>`, `aproxy settings unset default_config` |
+| `aproxy --config <file> config …` | `aproxy config --config <alias or file> …`, before or after the subcommand |
+| `aproxy install --variant v3\|baseline` | `aproxy install --cpu x86-64-v3\|baseline`; `--variant` now picks `desktop` or `headless` |
+
+Exit codes now follow one table in every command (commands.md, "Output and exit codes"): a script
+that treated any nonzero exit as failure should know 3 (invalid configuration), 4 (not found) and 5
+(partly done), and that stopping an instance that is not running exits 0. Log lines no longer appear on
+stdout, so a script can read the output of `--json` directly.
 
 ### settings.json keys renamed in 0.2.0
 

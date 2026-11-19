@@ -376,7 +376,7 @@ timeout (for Claude Code, `API_TIMEOUT_MS`).
 | `aproxy find [keyword]` | Discover all configs in configured directories; `--aliased/--unaliased --port PORT` filters |
 | `aproxy config show\|get\|set\|unset` | View or modify the config: `show` prints the values written in the file, `--effective` adds the global and built-in defaults with each value's source; `set`/`unset` change one key per command |
 | `aproxy settings show\|get\|set\|unset` | View or modify the global settings (`~/.aproxy/settings.json`): aliases, `defaults` global defaults, watchdog, logs, install updates; works even when settings.json has errors, to repair it |
-| `aproxy install [VERSION]` | Install or upgrade (alias `upgrade`), rolling-restarting instances; `--variant` switches the build, `--force` forces an install; see the upgrade notes under Getting started |
+| `aproxy install [VERSION]` | Install or upgrade (alias `upgrade`), rolling-restarting instances after a precheck of each; `--check` only looks for a newer version, `--variant` switches the build, `--force` forces an install; see the upgrade notes under Getting started |
 | `aproxy desktop` | Open the desktop window (a preview showing demo data; see below) |
 
 `start` options: `<alias|path>` or `--config <PATH>` (the same thing;

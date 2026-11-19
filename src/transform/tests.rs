@@ -753,3 +753,26 @@ async fn expired_unwritten_heartbeat_does_not_charge_the_breaker() {
     assert_eq!(log.lines().count(), 2);
     assert!(!log.contains("expired"));
 }
+
+/// spawn 进程在 EOF 后的额外 stdout 仍属于当前往返；握手或业务都不能将它当作合法单帧。
+#[tokio::test]
+async fn spawn_rejects_extra_stdout_at_hello_and_after_stage() {
+    for startup in [true, false] {
+        let p = pool(
+            Process::Spawn,
+            if startup {
+                "stray-on-eof"
+            } else {
+                "stage-stray-on-eof"
+            },
+            |_| {},
+        );
+        let result = if startup {
+            p.probe().await
+        } else {
+            p.probe().await.unwrap();
+            call(&p, "ok", false).await.map(drop)
+        };
+        assert!(matches!(result, Err(Fault::Protocol)), "{result:?}");
+    }
+}

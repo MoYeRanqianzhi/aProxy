@@ -2490,3 +2490,29 @@ async fn response_ready_heartbeat_reuses_last_timely_bytes_without_more_calls() 
     std::fs::write(gate, b"").unwrap();
     assert!(res.text().await.unwrap().ends_with("data: done\n\n"));
 }
+
+/// 限制最终写入日志的 UTF-8 正文字节，而不是替换非法字节之前的原始管道长度。
+#[test]
+fn stderr_rendered_utf8_observes_the_byte_limit() {
+    let (_home, out) = start("stderr-bytes", true);
+    assert!(out.status.success(), "{out:?}");
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let log = std::fs::read_to_string(doc["log_path"].as_str().unwrap()).unwrap();
+    for tag in ["invalid:", "text:"] {
+        let line = log
+            .lines()
+            .find_map(|l| {
+                l.split_once("format[test-layer] ")
+                    .map(|(_, s)| s)
+                    .filter(|s| s.starts_with(tag))
+            })
+            .unwrap();
+        let payload = line
+            .strip_suffix("…(truncated)")
+            .expect("rendered line must carry marker");
+        assert!(payload.len() <= 8192);
+        if tag == "text:" {
+            assert!(!payload.contains('�'));
+        }
+    }
+}

@@ -147,12 +147,23 @@ async fn log_stderr<R: tokio::io::AsyncRead + Unpin>(
                 } else {
                     secrets.replace_bytes(&line)
                 };
-                truncated |= safe.len() > STDERR_BYTES;
-                safe.truncate(STDERR_BYTES);
+                // 输入截点可能刚好落在一个 UTF-8 字符中间；不要把这个人为的半字符记为乱码。
+                if truncated && let Some(chunk) = safe.utf8_chunks().last() {
+                    let suffix = chunk.invalid();
+                    if std::str::from_utf8(suffix).is_err_and(|e| e.error_len().is_none()) {
+                        safe.truncate(safe.len() - suffix.len());
+                    }
+                }
+                let text = String::from_utf8_lossy(&safe);
+                truncated |= text.len() > STDERR_BYTES;
+                let mut end = text.len().min(STDERR_BYTES);
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
                 tracing::warn!(
                     "format[{}] {}{}",
                     name,
-                    String::from_utf8_lossy(&safe).trim_end_matches('\r'),
+                    text[..end].trim_end_matches('\r'),
                     if truncated { "…(truncated)" } else { "" }
                 );
             }
@@ -310,8 +321,25 @@ impl Worker {
     }
     /// 正常结束先发 EOF，给遵守协议的程序留出清理机会；不读 EOF 的进程仍能回收。
     async fn finish(mut self) {
+        let _ = self.retire_pipe(false).await;
+    }
+    /// 一次性进程的最后回复不能带多余 stdout。关 stdin 后顺便等 EOF 和所有者的 wait，
+    /// 两项共用同一宽限期；正常空闲进程退役时不再把任何输出交给请求。
+    async fn retire_pipe(&mut self, check_stdout: bool) -> Result<(), Fault> {
         self.stdin.take();
         let end = Instant::now() + RETIRE_GRACE;
+        let checked = if check_stdout {
+            match tokio::time::timeout_at(end, self.stdout.fill_buf()).await {
+                Ok(Ok([])) | Err(_) => Ok(()),
+                Ok(Ok(_)) => Err(Fault::Protocol),
+                Ok(Err(_)) => Err(Fault::Io),
+            }
+        } else {
+            Ok(())
+        };
+        if checked.is_err() {
+            self.kill.take();
+        }
         if tokio::time::timeout_at(end, &mut self.exited)
             .await
             .is_err()
@@ -319,6 +347,7 @@ impl Worker {
             self.kill.take();
             let _ = (&mut self.exited).await;
         }
+        checked
     }
     /// 排队与序列化不算在时限内，堵在写管道则算；调用被取消时不复用 worker。
     async fn frame(
@@ -792,10 +821,12 @@ impl Pool {
         self.startup
             .get_or_init(|| async {
                 let mut w = self.spawn(None).await?;
-                if self.entry.process == Process::Spawn || !w.reusable()? {
-                    w.finish().await;
-                } else {
+                if self.entry.process == Process::Spawn {
+                    w.retire_pipe(true).await?;
+                } else if w.reusable()? {
                     self.park(w);
+                } else {
+                    w.finish().await;
                 }
                 Ok(())
             })
@@ -1088,12 +1119,15 @@ impl Turn<'_> {
         if matches!(result, Err(Fault::Open { .. })) {
             return result;
         }
-        let result = result.and_then(|r| {
-            Ok((
-                r,
-                pool.entry.process == Process::Persistent && self.worker.reusable()?,
-            ))
-        });
+        if pool.entry.process == Process::Spawn {
+            let result = match result {
+                Ok(r) => self.worker.retire_pipe(true).await.map(|()| r),
+                Err(e) => Err(e),
+            };
+            pool.complete(&self.ticket, result.as_ref().err());
+            return result;
+        }
+        let result = result.and_then(|r| Ok((r, self.worker.reusable()?)));
         pool.complete(&self.ticket, result.as_ref().err());
         let (reply, reuse) = result?;
         if !reuse {

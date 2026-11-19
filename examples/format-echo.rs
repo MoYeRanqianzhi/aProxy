@@ -92,6 +92,9 @@ fn main() {
         };
         let Some(line) = line else {
             observe("eof", None);
+            if mode == "stray-on-eof" || (mode == "stage-stray-on-eof" && count != 0) {
+                println!("unexpected diagnostic on stdout");
+            }
             if mode == "slow-eof" {
                 std::thread::sleep(Duration::from_secs(6));
             }
@@ -117,6 +120,13 @@ fn main() {
             assert_eq!((stage, seq), ("hello", 0));
             seen_hello = true;
             worker = m["worker_id"].as_u64().unwrap() as usize;
+            if mode == "stderr-bytes" {
+                let mut err = std::io::stderr().lock();
+                err.write_all(b"invalid:").unwrap();
+                err.write_all(&vec![0xff; 4000]).unwrap();
+                err.write_all(b"\n").unwrap();
+                writeln!(err, "text:{}", "界".repeat(3000)).unwrap();
+            }
             if mode == "partial-hello" {
                 print!("{{");
                 std::io::stdout().flush().unwrap();

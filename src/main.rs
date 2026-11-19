@@ -168,14 +168,11 @@ async fn run(cli: Cli) {
         }
     }
 
-    // 恢复机制兜底（看门狗为主责，此为无看护者场景的静默兜底）：任何命令
-    // 入口读到活动安装态（`<home>/install/state.json` 残留）→ 静默 spawn `install
-    // --continue`（不等待不提示，本命令照常执行）。续作进程的接管判定
-    // 自会收敛（原安装进程健在则不动）。install 自身的分派分支跳过
-    // （--continue/--abort 与续作无并发意义，且避免递归拉起）。
-    let is_install_cmd = matches!(cli.command, Some(Commands::Install(_)));
-    if !is_install_cmd
-        && aproxy::install::state::load().is_some()
+    // 只有要改动实例或设置的请求才顺带恢复安装；观察现场的命令不应改变它。
+    // halted 表示原因不会自行消失，必须让用户排除原因后显式安装。
+    if cli.command.as_ref().is_some_and(resumes_install)
+        && aproxy::install::state::load()
+            .is_some_and(|s| !(s.phase == aproxy::install::state::InstallPhase::Failed && s.halted))
         && let Ok(exe) = std::env::current_exe()
     {
         let _ = aproxy::daemon::spawn_detached(
@@ -247,4 +244,35 @@ fn version_requested() -> bool {
         (args.next(), args.next()),
         (Some(flag), None) if flag == "--version" || flag == "-V"
     )
+}
+
+/// 按实际子命令区分读写；入口自己分派的内部进程、安装及桌面都不触发 CLI 续作。
+fn resumes_install(command: &Commands) -> bool {
+    use aproxy::cli::{AliasCmd, ConfigCmd, SettingsCmd};
+    match command {
+        Commands::Start(_)
+        | Commands::Stop { .. }
+        | Commands::Restart { .. }
+        | Commands::Restore { .. } => true,
+        Commands::Alias { cmd } => match cmd {
+            AliasCmd::Add { .. } | AliasCmd::Remove { .. } => true,
+            AliasCmd::List { .. } => false,
+        },
+        Commands::Config(args) => match args.cmd {
+            ConfigCmd::Set { .. } | ConfigCmd::Unset { .. } => true,
+            ConfigCmd::Show { .. } | ConfigCmd::Get { .. } => false,
+        },
+        Commands::Settings { cmd } => match cmd {
+            SettingsCmd::Set { .. } | SettingsCmd::Unset { .. } => true,
+            SettingsCmd::Show { .. } | SettingsCmd::Get { .. } => false,
+        },
+        Commands::Status { .. }
+        | Commands::Logs { .. }
+        | Commands::Find { .. }
+        | Commands::Doctor { .. }
+        | Commands::Install(_)
+        | Commands::Desktop
+        | Commands::Serve { .. }
+        | Commands::Watchdog { .. } => false,
+    }
 }

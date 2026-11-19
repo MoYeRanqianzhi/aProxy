@@ -969,8 +969,8 @@ fn concurrent_install_rejected_by_lock() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. `--version` 先于一切副作用（永久兼容契约 C5）：安装状态残留时，别的命令
-//    会顺带拉起续作，`--version`/`-V` 不会。对照组 status 证明这个测试看得见
+// 8. `--version` 先于一切副作用（永久兼容契约 C5）：安装状态残留时，变更类命令
+//    会顺带拉起续作，`--version`/`-V` 不会。对照组 restore 证明这个测试看得见
 //    续作——终态残留一被续作接手就会删掉
 // ---------------------------------------------------------------------------
 #[test]
@@ -993,10 +993,13 @@ fn version_flag_does_not_resume_a_leftover_install() {
     std::thread::sleep(Duration::from_secs(2));
     assert!(state.exists(), "--version 不得拉起续作");
 
-    run("status");
+    run("restore");
     let deadline = Instant::now() + Duration::from_secs(15);
     while state.exists() {
-        assert!(Instant::now() < deadline, "status 应拉起续作并清掉终态残留");
+        assert!(
+            Instant::now() < deadline,
+            "restore 应拉起续作并清掉终态残留"
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
 }

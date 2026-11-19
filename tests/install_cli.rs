@@ -308,3 +308,38 @@ fn continuation_prechecks_an_unreadable_record_on_a_down_port() {
     assert_eq!(d["port"], p);
     assert_eq!(d["diagnostics"][0]["code"], "install_restore_unreadable");
 }
+
+/// 同一份终态现场能被 restore 拉起的续作立即清掉；只读的 status 应让它逐字保持。
+#[test]
+fn status_does_not_resume_a_leftover_install() {
+    let h = TestHome::new();
+    let mut st = InstallState::new_marking("x", InstallSource::From);
+    st.phase = InstallPhase::Aborted;
+    state::write_in(h.path(), &mut st).unwrap();
+    let path = state::state_path_in(h.path());
+    let before = fs::read(&path).unwrap();
+    run(&h, &["status"], 0);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+/// 这个 halted 现场的实例均在目标镜像上，显式续作会清掉它，所以能检测到多余的 spawn。
+#[tokio::test]
+async fn restore_does_not_spawn_a_continuation_for_a_halted_install() {
+    let (h, _, bin) = fixture();
+    binary(&bin);
+    let (p, _child) = instance(&h, &bin, false).await;
+    let mut st = InstallState::new_marking(env!("CARGO_PKG_VERSION"), InstallSource::From);
+    st.phase = InstallPhase::Failed;
+    st.halted = true;
+    st.instance_snapshot.push(p.to_string());
+    st.installer_pid = u32::MAX;
+    state::write_in(h.path(), &mut st).unwrap();
+    let path = state::state_path_in(h.path());
+    let before = fs::read(&path).unwrap();
+    run(&h, &["restore"], 0);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    run(&h, &["install", "--continue"], 0);
+    assert!(!path.exists());
+}

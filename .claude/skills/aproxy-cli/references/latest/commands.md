@@ -111,18 +111,40 @@ reaches only one of them; use ports.
 - Argument errors exit 2. `aproxy <command> --help` prints the options (in Chinese). A bare
   `aproxy` with no command prints the help and exits 2; write `aproxy start` to start an instance.
 
-The table below describes a command's own outcome, assuming a valid settings.json; the startup
-check above can end a command with exit 3 before it runs (except the tolerated commands).
+Exit codes mean the same thing in every command: 0 done (or the requested state already holds),
+1 failed, 2 usage error, 3 invalid configuration, 4 target or file not found, 5 partly done. The
+table gives each command's cases, assuming a valid settings.json; the startup check above can end
+a command with exit 3 before it runs (except the tolerated commands). Decide from the exit code and
+the `--json` codes, not from the Chinese text.
 
-| Command | Exit 0 | Failure |
-|---|---|---|
-| start | started; already running on that port; a port-0 listener was started and the OS-assigned port reported | the config cannot be resolved, validated or bound, or the instance is not ready in 30 s |
-| status, find | always | never |
-| stop | every target confirmed stopped; nothing running for no target, `all` or `idle` | a stop not confirmed or `--force` failed; several instances and no target; unknown alias or port; target not running; target hung and no `--force` |
-| restart | every target restarted; nothing running for no target, `all` or `idle` | any target failed; target cannot be resolved |
-| logs | the requested lines printed; with `-f`, the followed instance stopped; nothing running | `all`, ambiguous or unknown target, foreground instance, unreadable log |
-| restore | always, even when an instance fails to come back | never |
-| alias | success | invalid name, missing file, unknown alias, write failure (exit 3 instead when settings.json itself is invalid, before the command runs) |
+| Command | 0 | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|---|
+| start | started, or already running on that port | port taken, could not start, not ready in 30 s | usage | the config has errors | alias or config file not found | — |
+| stop | stopped; the target was not running (a leftover record is deleted); `idle` with nothing idle | not confirmed stopped, `--force` failed, hung without `--force` | several instances and no target | — | unknown alias | some stopped, some not |
+| restart | restarted; `all` or `idle` with nothing to restart | failed; foreground instance | several instances and no target | the pre-check found the config invalid | target not running, or not found | some restarted, some not |
+| logs | lines printed | foreground instance (no log file) | several instances and no target; `all` | — | not running and no record to read; unknown alias | — |
+| restore | everything restored, or nothing to restore | every record failed | — | — | — | some failed, or a config file is missing |
+| status, find | always | — | — | — | — | — |
+| alias | success | invalid name, missing file, unknown alias, write failure | — | — | — | — |
+
+**`--json`** (on `start`, `stop`, `restart`, `restore` and the `config` subcommands) prints exactly
+one JSON document on stdout, starting with `"schema":1`; the human-readable lines move to stderr.
+When the whole command fails, the document is
+`{"schema":1,"error":{"code","message","details"}}`; `code` names the cause, for example
+`target_not_found`, `target_not_running`, `target_ambiguous`, `config_invalid`, `port_in_use`,
+`ready_timeout`, `start_failed`, `usage`. `stop`, `restart` and `restore` report one item per
+instance:
+
+```json
+{"schema":1,"results":[{"target":"work","port":12346,"outcome":"stopped"}],"summary":{"ok":1,"failed":0}}
+```
+
+`target` is the target as written (`null` when none was given) and `port` the instance's port
+(after `restart` or `restore`, the port the new instance listens on). `outcome` is one of `stopped`,
+`already_stopped`, `killed`, `skipped` (with `"reason":"not_idle"`), `failed` for `stop`;
+`restarted`, `failed` for `restart`; `restored`, `already_running`, `config_missing`, `failed` for
+`restore`. A `failed` item carries an `error` object shaped like the failure document's (codes such
+as `instance_unresponsive`, `stop_failed`, `restart_unsupported`, `config_invalid`).
 | doctor | always, **even when it reports errors** | never |
 | config | the values printed or the change saved | 1: write conflict or I/O failure; 2: a malformed key path or a value that is not TOML; 3: the result would be invalid, an unknown key, or the file has errors (`show` still prints, then exits 3); 4: the file does not exist (`get`, or `show` with an explicit `--config`) |
 | settings | show/get printed, set/unset stored or unchanged | a malformed key path or unparsable JSON value (2); the file cannot be read, or the change would make it invalid (3); write failure (1) |
@@ -192,7 +214,7 @@ Only `start` takes start options; each other command lists its own options with 
 **Which config file a command uses:** `start` uses its positional target, else `--config`, else
 `default_config` from settings.json, else `<home>/config.toml`. `config …` uses its own `--config`
 (an alias or a path), else `default_config`, else `<home>/config.toml`. If `default_config` points
-to a file that no longer exists, the commands that need the config exit 1 with
+to a file that no longer exists, the commands that need the config exit 4 with
 `settings.json 指定的默认配置文件不存在: <path>` ("the default config named in settings.json does
 not exist"): `aproxy start` without a target and `aproxy config …` without `--config`. Every other
 command is unaffected; repair the setting with `aproxy settings set default_config PATH` or
@@ -201,16 +223,21 @@ command is unaffected; repair the setting with `aproxy settings set default_conf
 ## start
 
 ```
-aproxy start [OPTIONS] [ALIAS|PATH]   # start a config; the default config when no target is given
-aproxy start --config PATH [OPTIONS]  # the same, with the path as an option
+aproxy start [OPTIONS] [ALIAS|PATH] [--json]   # start a config; the default config when no target is given
+aproxy start --config PATH [OPTIONS] [--json]  # the same, with the path as an option
 aproxy start --foreground [ALIAS|PATH]
 ```
+
+An unknown alias or a config file that does not exist exits 4. With `--json` the success document
+is `{"schema":1,"outcome":"started"|"already_running","port","pid","log_path","instance"}`, where
+`instance` is the instance's status as `status` reports it. `--json` cannot be combined with
+`--foreground`, which has no moment at which the start is complete.
 
 What `start` checks, in order:
 
 1. **Config.** The file is loaded strictly; a TOML syntax error, an unknown key (including every
    old 0.1.x name), an invalid value or a `listen_addr` without a valid port stops here with exit
-   1, printing `配置错误: …` ("config error") followed by one `file:line:col: key: message [code]`
+   3, printing `配置错误: …` ("config error") followed by one `file:line:col: key: message [code]`
    line per problem; the codes are listed in config-toml.md, "Checks at start". A fresh install has no `base_url`, so
    run `aproxy config set base_url URL` and `aproxy config set api_key KEY` before the first start.
    Field rules: config-toml.md. When `start` is given neither `--config` nor a positional target and
@@ -285,8 +312,8 @@ time. `status` does not print log paths; see [logs](#logs).
 ## stop
 
 ```
-aproxy stop [PORT|ALIAS|PATH|default|all] [--force]
-aproxy stop idle [--idle-threshold-secs SECS] [--force]
+aproxy stop [PORT|ALIAS|PATH|default|all] [--force] [--json]
+aproxy stop idle [--idle-threshold-secs SECS] [--force] [--json]
 ```
 
 Before stopping anything, run `aproxy status` and name the instance. Your own client may be
@@ -303,8 +330,9 @@ asking.
   `stop` confirms within 12 s: `已停止 pid <pid>（端口 <port>）` ("stopped"). If it prints
   `pid <pid> 已收到停止请求但尚未退出，可用 aproxy status 稍后确认，或 aproxy stop <port> --force 强制结束`
   ("received the stop request but has not exited; check status later or force it"), check
-  `aproxy status` again shortly; if it is still listed, use `--force`. `stop` exits 1 whenever a
-  target was not confirmed stopped, so scripts can rely on the exit code.
+  `aproxy status` again shortly; if it is still listed, use `--force`. `stop` exits 1 when a
+  target was not confirmed stopped (5 when other targets of the same command did stop), so scripts
+  can rely on the exit code.
 - **A target that already crashed** still has its desired-state record, which `restore` and the
   watchdog would use to bring it back. `stop` on that target (port, alias or config path) deletes
   the record and prints
@@ -315,7 +343,7 @@ asking.
   Naming it by port or alias prints
   `端口 <port> 的实例（pid <pid>）进程仍在，但不应答控制通道，无法优雅停止；用 --force 强制结束`
   ("the process is still there but does not answer; use --force") and exits 1. `stop all`
-  without `--force` stops the answering instances and says how many hung ones it left out.
+  without `--force` stops the answering instances, reports each hung one the same way, and exits 5.
 - **`--force`:** terminates the process immediately, without the 10 s grace, after verifying by
   pid plus process start time that the pid still belongs to that instance (a reused pid is
   refused). It deletes the desired-state record before terminating, so the watchdog does not race
@@ -336,8 +364,8 @@ asking.
   request; no longer idle; not stopped"), and the command still exits 0. `--force` has no such
   re-check.
 - An alias whose config is not running: `别名 <name>（配置 <path>）当前未在运行。`; a port with no
-  instance: `端口 <port> 上没有运行中的 aProxy 实例。`; both exit 1 when there is no record to
-  delete either.
+  instance: `端口 <port> 上没有运行中的 aProxy 实例。`. Both exit 0 (outcome `already_stopped`):
+  the instance is not running, which is what `stop` asks for. An unknown alias exits 4.
 - Do not stop instances by killing processes. Killing a pid leaves the desired-state record, so the
   watchdog (on by default) starts the instance again; killing by name (`taskkill /IM aproxy.exe`,
   `pkill aproxy`) takes down every instance and the watchdog.
@@ -345,8 +373,8 @@ asking.
 ## restart
 
 ```
-aproxy restart [PORT|ALIAS|PATH|default|all] [--force]
-aproxy restart idle [--idle-threshold-secs SECS] [--force]
+aproxy restart [PORT|ALIAS|PATH|default|all] [--force] [--json]
+aproxy restart idle [--idle-threshold-secs SECS] [--force] [--json]
 ```
 
 Restarts running instances from their launch specs, which is how config.toml edits take effect.
@@ -355,12 +383,14 @@ target and never deletes a desired-state record. The same caution applies: resta
 your own client uses drops its in-flight requests, and if the new instance fails to start you lose
 your connection to the model.
 
-- **Only running instances.** A target that is not running exits 1; use `start` for that.
+- **Only running instances.** A target that is not running exits 4 (`target_not_running`), and
+  so does `restart` with no target when nothing is running; use `start` for that.
 - **Checks before stopping.** `restart` first dry-runs what the new instance will do: load and
   validate the config with settings.json defaults applied, and, if the listen address changed,
   check that the new address is free. On failure it prints
   `端口 <port> 未重启：预检未通过，旧实例保持运行。` ("not restarted: pre-check failed, old instance
-  still running") and the reason; the old instance keeps serving.
+  still running") and the reason; the old instance keeps serving. An invalid config exits 3, a
+  config file that no longer exists 4, a listen address that cannot be bound 1.
 - **Launch and confirm.** It stops the old instance, starts the new one from the same launch spec
   and waits up to 30 s, locating it by its new pid, so a port changed in config.toml is handled.
   Success prints `已重启（端口 <port>）` with the new and old pid.
@@ -374,7 +404,8 @@ your connection to the model.
 - `端口 <port> 停止未确认，重启中止（未启动新实例，以免与旧实例争抢端口）。` ("stop not
   confirmed, restart aborted"): the old instance may still be running; nothing new was started.
 - With several targets (`all`, `idle`) a failing instance is skipped, the rest are restarted, and a
-  summary follows; the exit code is 1 if any failed.
+  summary follows; the exit code is 5 when some were restarted, and the failure's own code (usually
+  1) when none were. Hung instances that `all` cannot reach without `--force` count as failed.
 - The new instance runs the binary you invoked `aproxy` from, so `restart` also moves an instance
   to that binary's version.
 - The config path (or the absence of one), the override flags, the pinned port, the launch-time
@@ -406,17 +437,23 @@ log files get a new random name at every start.
   Bash included), take the path from its `日志文件: <path>` ("log file") line and read that file
   directly. The same path is the `log_path` field of the instance record
   `<home>/run/<port>.instance.json` (one line of JSON; `null` for a foreground instance).
-- Several instances and no target exit 1; `all` is refused (`aproxy logs 不支持 all…`).
-- A `--foreground` instance has no log file:
-  `该实例以前台模式运行（--foreground），日志输出在它的控制台…` ("runs in foreground; its log is in
-  its console").
+- Several instances and no target, and `all` (`aproxy logs 不支持 all…`), exit 2.
+- A `--foreground` instance has no log file and exits 1:
+  `端口 <port> 的实例以前台模式运行（--foreground），日志输出在它的控制台，没有日志文件。` ("runs in
+  foreground; its log is in its console; no log file").
+- **A target that is not running but still has its desired-state record** (it crashed or was
+  killed) gets the end of the log file named in that record, which is where the crash is recorded.
+  stderr says `端口 <port> 的实例没在运行，以下是它上次运行的日志。` ("not running; this is the log of
+  its last run"), and `-f` does not follow. With no target and nothing running, `logs` does this
+  when exactly one record exists and exits 2 listing the ports when there are several. With
+  nothing to read it exits 4.
 - `── 日志文件已被截断，重新从头跟踪 ──` ("log file truncated, following from the start") appears
   while following when log rotation empties the file.
 
 ## restore
 
 ```
-aproxy restore
+aproxy restore [--json]
 ```
 
 Starts every instance that has a desired-state record but is not running: instances that crashed,
@@ -438,6 +475,11 @@ same 30 s readiness check.
 An instance started without a config file (only override flags and settings.json `defaults`) has a
 record with no config path and is restored the same way. `restore` is safe to repeat, which suits a
 login task (Task Scheduler on Windows) for recovery after reboots.
+
+Exit codes: 0 when every record was restored or already running, or there was nothing to restore;
+1 when every record failed; 5 when some failed, or when a config file is missing (that record was
+not restored, and is kept for a later `restore`). Unreadable records are reported on stderr and do
+not change the exit code.
 
 ## alias
 

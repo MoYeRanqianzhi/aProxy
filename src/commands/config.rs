@@ -9,8 +9,10 @@ use aproxy::cli::{ConfigArgs, ConfigCmd};
 use aproxy::config::edit::{Change, EditError};
 use aproxy::config::{self, Source, view};
 use aproxy::settings;
-use aproxy_ipc::code::{EXIT_CONFIG, EXIT_FAILED, EXIT_NOT_FOUND, EXIT_USAGE};
+use aproxy_ipc::code::{EXIT_CONFIG, EXIT_FAILED};
 use serde_json::{Value, json};
+
+use super::print_doc;
 
 use aproxy_ipc::redact::placeholder_text;
 
@@ -47,11 +49,17 @@ pub(crate) async fn handle_config_cmd(args: ConfigArgs) {
     // 给了 --config：别名优先；不是别名就当路径，文件可以还不存在（对一个新路径 set，就是
     // 在建一份新实例的配置）。没给：默认配置文件
     let explicit = config.is_some();
+    let json = match &cmd {
+        ConfigCmd::Show { json, .. }
+        | ConfigCmd::Get { json, .. }
+        | ConfigCmd::Set { json, .. }
+        | ConfigCmd::Unset { json, .. } => *json,
+    };
     let path = match config.as_deref() {
         Some(target) => settings::resolve_alias(target)
             .map(PathBuf::from)
             .unwrap_or_else(|| settings::expand_path(target)),
-        None => super::require_cfg_path(super::resolve_cfg_path(None)),
+        None => super::require_cfg_path(super::resolve_cfg_path(None), json),
     };
     match cmd {
         ConfigCmd::Show { effective, json } => show(&path, explicit, effective, json),
@@ -64,24 +72,9 @@ pub(crate) async fn handle_config_cmd(args: ConfigArgs) {
     }
 }
 
-/// 整条命令失败：原因写到 stderr；`--json` 时 stdout 上是错误文档
-/// `{"schema":1,"error":{"code","message","details"}}`。以 `exit` 退出。
-fn fail(json: bool, code: &'static str, exit: u8, message: String, details: Value) -> ! {
-    eprintln!("{message}");
-    if json {
-        print_doc(json!({"error": {"code": code, "message": message, "details": details}}));
-    }
-    crate::util::exit(exit as i32)
-}
-
-/// 把 `--json` 的文档写到 stdout：一行，`schema` 在最前面。
-fn print_doc(body: Value) {
-    let mut doc = serde_json::Map::new();
-    doc.insert("schema".to_string(), 1.into());
-    if let Value::Object(body) = body {
-        doc.extend(body);
-    }
-    println!("{}", Value::Object(doc));
+/// 整条命令失败（见 [`super::Failure`]）。
+fn fail(json: bool, code: &'static str, message: String, details: Value) -> ! {
+    super::Failure::new(code, message, details).exit(json)
 }
 
 /// 读配置文件的文本；不存在时是 None。读不出来（权限、不是 UTF-8）时失败退出。
@@ -122,7 +115,6 @@ fn show(path: &Path, explicit: bool, effective: bool, json: bool) {
         fail(
             json,
             "target_not_found",
-            EXIT_NOT_FOUND,
             format!("指定的配置文件不存在: {}", path.display()),
             json!({"target": path.display().to_string()}),
         );
@@ -214,7 +206,6 @@ fn require_known_key(key: &str, json: bool) -> view::KeyKind {
         fail(
             json,
             "usage",
-            EXIT_USAGE,
             format!(
                 "键路径写法不对: {key}（点号分隔，例如 timeouts.connect_secs、extra_headers.\"x-foo\"；数组表只能整体读写）"
             ),
@@ -224,7 +215,6 @@ fn require_known_key(key: &str, json: bool) -> view::KeyKind {
     fail(
         json,
         "config_unknown_key",
-        EXIT_CONFIG,
         format!("不认识的键: {key}（aproxy config show --effective 列出全部的键）"),
         json!({"key": key}),
     )
@@ -237,7 +227,6 @@ fn get(path: &Path, key: &str, json: bool) {
         fail(
             json,
             "target_not_found",
-            EXIT_NOT_FOUND,
             format!("配置文件不存在: {}", path.display()),
             json!({"target": path.display().to_string()}),
         );
@@ -251,7 +240,6 @@ fn get(path: &Path, key: &str, json: bool) {
         fail(
             json,
             "config_invalid",
-            EXIT_CONFIG,
             format!("读不出 {key}：先修复 {}", path.display()),
             json!({"diagnostics": errors}),
         );
@@ -313,7 +301,6 @@ fn parse_value(key: &str, raw: &str, json: bool) -> toml_edit::Value {
         Err(e) => fail(
             json,
             "usage",
-            EXIT_USAGE,
             format!(
                 "{key} 的值要写成 TOML（例如 true、30、\"text\"、[\"a\"]、{{ k = 1 }}），解析失败: {e}"
             ),
@@ -354,7 +341,6 @@ async fn write(path: &Path, change: Change, json: bool) {
         Err(EditError::BadKey(key)) => fail(
             json,
             "usage",
-            EXIT_USAGE,
             format!(
                 "键路径写法不对: {key}（点号分隔，例如 timeouts.connect_secs、extra_headers.\"x-foo\"；数组表只能整体读写）"
             ),
@@ -366,7 +352,6 @@ async fn write(path: &Path, change: Change, json: bool) {
             fail(
                 json,
                 "config_invalid",
-                EXIT_CONFIG,
                 format!("先修复或删除 {}", path.display()),
                 json!({"diagnostics": diagnostics}),
             )
@@ -376,7 +361,6 @@ async fn write(path: &Path, change: Change, json: bool) {
             fail(
                 json,
                 "config_invalid",
-                EXIT_CONFIG,
                 "这次修改会让配置无效，没有保存".to_string(),
                 json!({"diagnostics": diagnostics}),
             )
@@ -384,7 +368,6 @@ async fn write(path: &Path, change: Change, json: bool) {
         Err(EditError::Conflict) => fail(
             json,
             "write_conflict",
-            EXIT_FAILED,
             format!(
                 "配置文件一直在被别的程序修改，没有保存（关掉正在编辑它的程序后重试）: {}",
                 path.display()
@@ -394,7 +377,6 @@ async fn write(path: &Path, change: Change, json: bool) {
         Err(EditError::LockBusy) => fail(
             json,
             "write_conflict",
-            EXIT_FAILED,
             "另一个 aproxy 正在写配置，等了 10 秒仍未结束，没有保存（稍后重试）".to_string(),
             json!({"file": path.display().to_string()}),
         ),

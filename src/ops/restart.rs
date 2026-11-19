@@ -60,8 +60,8 @@ pub enum PrecheckError {
     RecordUnreadable { reason: String },
     /// 配置文件已不存在
     ConfigMissing { path: PathBuf },
-    /// 配置解析或校验不通过。`reason` 是给人看的完整说明
-    Config { reason: String },
+    /// 配置解析或校验不通过
+    Config(super::start::ConfigError),
     /// 新配置的监听端口上已有另一个 aProxy 实例在运行
     PortTaken { port: String, pid: u32 },
     /// 新配置的监听地址绑定不了
@@ -167,7 +167,7 @@ async fn precheck(
         return Err(PrecheckError::ConfigMissing { path: path.clone() });
     }
     let cfg = resolve_runtime_config(&spec.overrides, cfg_path.as_deref())
-        .map_err(|reason| PrecheckError::Config { reason })?;
+        .map_err(PrecheckError::Config)?;
     // 配置解析出的端口仍是 0 时，新实例回到规格里钉住的端口
     let mut new_addr = cfg.listen_addr.clone();
     if daemon::port_of(&new_addr) == "0"

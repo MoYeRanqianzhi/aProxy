@@ -188,18 +188,20 @@ async fn run(cli: Cli) {
             target,
             threshold,
             force,
-        }) => commands::stop::handle_stop_cmd(target, threshold, force).await,
+            json,
+        }) => commands::stop::handle_stop_cmd(target, threshold, force, json).await,
         Some(Commands::Restart {
             target,
             threshold,
             force,
-        }) => commands::restart::handle_restart_cmd(target, threshold, force).await,
+            json,
+        }) => commands::restart::handle_restart_cmd(target, threshold, force, json).await,
         Some(Commands::Logs {
             target,
             lines,
             follow,
         }) => commands::logs::handle_logs_cmd(target, lines, follow).await,
-        Some(Commands::Restore) => commands::restore::handle_restore_cmd().await,
+        Some(Commands::Restore { json }) => commands::restore::handle_restore_cmd(json).await,
         Some(Commands::Alias { cmd }) => commands::alias::handle_alias_cmd(cmd),
         Some(Commands::Doctor) => commands::doctor::handle_doctor_cmd().await,
         Some(Commands::Find {

@@ -10,13 +10,15 @@ use std::path::{Path, PathBuf};
 use aproxy::cli::StartArgs;
 use aproxy::daemon;
 use aproxy::ops::start::{
-    Preflight, PreflightError, launch, load_lenient, overrides_from_cli, preflight,
+    ConfigError, Preflight, PreflightError, launch, load_lenient, overrides_from_cli, preflight,
     resolve_runtime_config,
 };
 use aproxy::ops::target::resolve_config_target;
 use aproxy::spec::{self, InstanceSpec};
+use serde_json::json;
 
-use crate::server::{bind_error_message, report_config_error, serve_forever};
+use super::{Failure, port_value, print_doc};
+use crate::server::{report_config_error, serve_forever};
 
 /// `aproxy start [别名|路径]`：后台启动实例；--foreground 前台运行。
 ///
@@ -26,6 +28,7 @@ use crate::server::{bind_error_message, report_config_error, serve_forever};
 /// 端口冲突的情况严格区分（同端口已有实例 / 同端口不同地址的另一实例 / 绑定失败），
 /// 判定在 `aproxy::ops::start::preflight`。
 pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
+    let json = args.json;
     // `--api-key -`：密钥从 stdin 读一行，不出现在命令行上
     if args.api_key.as_deref() == Some("-") {
         match crate::util::read_secret_line() {
@@ -39,15 +42,17 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
     let target = args.target.clone();
     // 给了 target 就不需要默认配置——失效的 default_config 只拦无 target 的启动
     let cfg_path = match target.as_deref() {
-        None => super::require_cfg_path(super::resolve_cfg_path(args.config.as_deref())),
+        None => super::require_cfg_path(super::resolve_cfg_path(args.config.as_deref()), json),
         Some(t) => match resolve_config_target(t) {
             Some(p) => p,
-            None => {
-                eprintln!(
+            None => Failure::new(
+                "target_not_found",
+                format!(
                     "未知的别名或配置文件: {t}\n用 aproxy alias list 查看已有别名，或 aproxy alias add {t} <路径> 添加"
-                );
-                std::process::exit(1);
-            }
+                ),
+                json!({"target": t}),
+            )
+            .exit(json),
         },
     };
     // 这个实例有没有配置文件：命令行指定的、别名或路径给出的，必须在（打错路径时明确
@@ -58,10 +63,7 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
     let overrides = overrides_from_cli(&args);
     let cfg = match resolve_runtime_config(&overrides, cfg_file) {
         Ok(c) => c,
-        Err(msg) => {
-            eprintln!("{msg}");
-            std::process::exit(1);
-        }
+        Err(e) => config_failure(&e).exit(json),
     };
     let listen_addr = cfg.listen_addr.clone();
     let port = daemon::port_of(&listen_addr).to_string();
@@ -77,6 +79,10 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
     match preflight(&listen_addr).await {
         Ok(Preflight::Clear) => {}
         Ok(Preflight::AlreadyRunning(info)) => {
+            if json {
+                print_doc(start_document("already_running", &info));
+                return;
+            }
             println!("此端口已有 aProxy 在运行，无需重复启动：");
             println!(
                 "  pid {}  监听 http://{}  v{}",
@@ -89,16 +95,16 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
             port,
             listen_addr,
             other_listen_addr,
-        }) => {
-            eprintln!(
-                "端口 {port} 已被监听地址 {other_listen_addr} 的 aProxy 实例使用（本进程将监听 {listen_addr}），两者不能并存。"
-            );
-            eprintln!("实例按端口号区分，请为其中一个更换监听地址/端口。");
-            std::process::exit(1);
-        }
+        }) => Failure::new(
+            "port_in_use",
+            format!(
+                "端口 {port} 已被监听地址 {other_listen_addr} 的 aProxy 实例使用（本进程将监听 {listen_addr}），两者不能并存。\n实例按端口号区分，请为其中一个更换监听地址/端口。"
+            ),
+            json!({"port": port_value(&port), "owner": "aproxy"}),
+        )
+        .exit(json),
         Err(PreflightError::Bind { listen_addr, error }) => {
-            eprintln!("{}", bind_error_message(&listen_addr, &error));
-            std::process::exit(1);
+            super::bind_failure(&listen_addr, &error).exit(json)
         }
     }
 
@@ -118,10 +124,13 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
         Ok(info) => info,
         Err(e) => {
             let excerpt = e.startup_log().map(|l| l.excerpt()).unwrap_or_default();
-            eprintln!("{e}{excerpt}");
-            std::process::exit(1);
+            super::spawn_failure(&e, format!("{e}{excerpt}")).exit(json)
         }
     };
+    if json {
+        print_doc(start_document("started", &info));
+        return;
+    }
     let actual_port = daemon::port_of(&info.instance.listen_addr).to_string();
     println!("aProxy 已在后台启动");
     println!("  pid: {}", info.instance.pid);
@@ -157,6 +166,41 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
     println!("查看实例: aproxy status    停止: aproxy stop {actual_port}");
 }
 
+/// `start --json` 的文档：`outcome` 是 `started` 或 `already_running`，`instance` 是实例应答的
+/// 状态（与 status 里的一项同形）。
+fn start_document(outcome: &str, info: &daemon::InstanceStatus) -> serde_json::Value {
+    json!({
+        "outcome": outcome,
+        "port": port_value(daemon::port_of(&info.instance.listen_addr)),
+        "pid": info.instance.pid,
+        "log_path": info.instance.log_path,
+        "instance": info,
+    })
+}
+
+/// 配置解析不出一份能用的配置：文件不在是「目标不存在」（4），有 error 级诊断是「配置
+/// 无效」（3），读不出来是一般的失败（1）。
+pub(crate) fn config_failure(error: &ConfigError) -> Failure {
+    let message = error.to_string();
+    match error {
+        ConfigError::Missing(path) => Failure::new(
+            "target_not_found",
+            message,
+            json!({"target": path.display().to_string()}),
+        ),
+        ConfigError::Settings { diagnostics, .. } | ConfigError::Invalid { diagnostics, .. } => {
+            Failure::new(
+                "config_invalid",
+                message,
+                json!({"diagnostics": diagnostics}),
+            )
+        }
+        ConfigError::Read { .. } => {
+            Failure::new("start_failed", message, json!({"startup_log": []}))
+        }
+    }
+}
+
 /// `aproxy __serve --home <dir> --spec <file>`：后台实例的入口。读交接文件里的拉起规格，
 /// 按它解析配置、初始化日志，然后承载服务直到停止。
 ///
@@ -187,8 +231,8 @@ pub(crate) async fn handle_serve_cmd(spec_path: &Path) -> ! {
 
     let mut cfg = match resolve_runtime_config(&spec.overrides, cfg_file) {
         Ok(cfg) => cfg,
-        Err(msg) => {
-            report_config_error(&msg, true);
+        Err(e) => {
+            report_config_error(&e.to_string(), true);
             crate::util::exit(1)
         }
     };

@@ -1,101 +1,207 @@
-//! `aproxy logs [PORT|别名] [-n N] [-f]`：打印运行实例的守护日志的最近若干行，`-f` 时接着跟踪。
+//! `aproxy logs [PORT|别名] [-n N] [-f]`：打印实例的守护日志的最近若干行，`-f` 时接着跟踪。
+//!
+//! 退出码：输出完毕 0；前台实例没有日志文件 1（`no_log_file`）；多个实例而没指定目标 2
+//! （`target_ambiguous`）；目标没在运行、也没有记录可读 4（`target_not_running`），别名不存在
+//! 也是 4（`target_not_found`）。
 
-use aproxy::daemon;
-
+use aproxy::daemon::{self, InstanceStatus};
 use aproxy::ops::target::{config_path_key, resolve_config_target};
+use aproxy::spec::RestoreEntry;
+use serde_json::json;
 
-/// `aproxy logs [PORT|别名]`：打印运行中的实例的守护日志的最近 `lines` 行；`follow` 为真时
-/// 接着实时输出新写进来的。默认打印完就退出：调用它的 agent 与脚本不会被挂住。
+use super::{Failure, port_value};
+
+/// logs 要读的日志从哪来。
+enum Source {
+    /// 在运行的实例：日志路径向它本人要（日志文件按启动随机命名，或是配置里的 log_file，
+    /// 不能按端口拼）
+    Running(Box<InstanceStatus>),
+    /// 没在运行、但留着期望状态记录的实例：读记录里的日志路径，那里是它上次运行（多半是
+    /// 崩溃）的现场
+    Stopped { port: String, log_path: String },
+}
+
+/// `aproxy logs [PORT|别名]`：打印实例的守护日志的最近 `lines` 行；`follow` 为真时接着实时
+/// 输出新写进来的。默认打印完就退出：调用它的 agent 与脚本不会被挂住。
 /// 目标的语义与 stop 一致：单实例可省略 target；多实例必须指定；别名按配置文件
-/// 匹配运行实例（端口变了别名依然有效）；不支持 all（一次只能连接一个实例，
-/// 传入 all 视为端口解析失败）。日志文件按启动随机命名（或用户自定义
-/// log_file），文件地址一律经 IPC/注册表向实例索取，不按端口拼路径。
+/// 匹配运行实例（端口变了别名依然有效）；不支持 all（一次只读一个实例的日志）。
 pub(crate) async fn handle_logs_cmd(target: Option<String>, lines: usize, follow: bool) {
-    if target.as_deref() == Some("all") {
-        eprintln!("aproxy logs 不支持 all：一次只能连接一个实例，请指定端口号或配置别名。");
-        std::process::exit(1);
-    }
-    let info = if let Some(target) = target.as_deref() {
-        // 别名定位：非数字 target 先查别名表/default——按 config_path 匹配
-        // 运行实例（与 stop 同语义：别名不依赖端口号，端口变了别名依然有效）
-        if target.parse::<u16>().is_err() {
-            match resolve_config_target(target) {
-                Some(cfg_path) => {
-                    let key = config_path_key(&cfg_path.display().to_string());
-                    let instances = daemon::list_instances().await;
-                    match instances.iter().find(|i| {
-                        i.instance
-                            .config_path
-                            .as_deref()
-                            .is_some_and(|path| config_path_key(path) == key)
-                    }) {
-                        Some(info) => info.clone(),
-                        None => {
-                            println!("别名 {target}（配置 {}）当前未在运行。", cfg_path.display());
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                None => {
-                    eprintln!(
-                        "未知的别名或端口号: {target}\n用 aproxy alias list 查看已有别名，或 aproxy alias add {target} <路径> 添加"
-                    );
-                    std::process::exit(1);
-                }
-            }
-        } else {
-            // 指定端口时不依赖注册表：直接按端口 IPC 定位（与 stop 相同）
-            let port = daemon::port_of(target).to_string();
-            match daemon::ipc_ping(&port).await {
-                Ok(info) => info,
-                Err(_) => {
-                    println!("端口 {port} 上没有运行中的 aProxy 实例。");
-                    std::process::exit(1);
-                }
-            }
-        }
-    } else {
-        let instances = daemon::list_instances().await;
-        match instances.len() {
-            0 => {
-                println!("没有运行中的 aProxy 实例。");
-                return;
-            }
-            1 => instances.into_iter().next().unwrap(),
-            n => {
-                eprintln!("有 {n} 个实例在运行，必须指定端口号或配置别名（一次只能连接一个）：");
-                for info in &instances {
-                    eprintln!(
-                        "  aproxy logs {}",
-                        daemon::port_of(&info.instance.listen_addr)
-                    );
-                }
-                std::process::exit(1);
-            }
-        }
+    // logs 没有 --json：失败只写 stderr、给退出码
+    let source = match locate(target.as_deref()).await {
+        Ok(source) => source,
+        Err(failure) => failure.exit(false),
     };
-
-    let port = daemon::port_of(&info.instance.listen_addr).to_string();
-    let Some(log_path) = &info.instance.log_path else {
-        // 前台实例经 IPC 上报的 log_path 为 null——显式信号，立即报出（原先的
-        // 5 秒文件等待是为前台实例设计的间接探测，现在有权威来源不再需要）
-        println!("该实例以前台模式运行（--foreground），日志输出在它的控制台，无日志文件可跟随。");
-        std::process::exit(1);
+    let (port, log_path, running) = match source {
+        Source::Running(info) => {
+            let port = daemon::port_of(&info.instance.listen_addr).to_string();
+            let Some(log_path) = info.instance.log_path else {
+                // 前台实例经 IPC 上报的 log_path 为 null：日志在它的控制台
+                Failure::new(
+                    "no_log_file",
+                    format!(
+                        "端口 {port} 的实例以前台模式运行（--foreground），日志输出在它的控制台，没有日志文件。"
+                    ),
+                    json!({"port": port_value(&port)}),
+                )
+                .exit(false)
+            };
+            if follow {
+                eprintln!(
+                    "正在连接 pid {}（端口 {port}）——Ctrl+C 退出。",
+                    info.instance.pid
+                );
+            }
+            (port, log_path, true)
+        }
+        Source::Stopped { port, log_path } => {
+            if !std::path::Path::new(&log_path).exists() {
+                Failure::new(
+                    "target_not_running",
+                    format!(
+                        "端口 {port} 的实例没在运行；它的期望状态记录指向的日志文件不存在: {log_path}"
+                    ),
+                    json!({"target": port}),
+                )
+                .exit(false)
+            }
+            eprintln!(
+                "端口 {port} 的实例没在运行，以下是它上次运行的日志{}。",
+                if follow {
+                    "（没在运行，不跟随）"
+                } else {
+                    ""
+                }
+            );
+            (port, log_path, false)
+        }
     };
     let path = std::path::PathBuf::from(log_path);
     // 说明写到 stderr：stdout 上只有日志本身，接在管道后面的程序拿到的就是日志行
-    if follow {
-        eprintln!(
-            "正在连接 pid {}（端口 {}）——Ctrl+C 退出。",
-            info.instance.pid, port
-        );
-    }
     eprintln!("日志文件: {}", path.display());
-
-    if let Err(e) = print_log_file(&path, &port, lines, follow).await {
+    if let Err(e) = print_log_file(&path, &port, lines, follow && running).await {
         eprintln!("{e}");
-        std::process::exit(1);
+        crate::util::exit(1);
     }
+}
+
+/// 按 target 找到要读的日志。在运行的实例优先；找不到在运行的，再找它留下的期望状态记录。
+async fn locate(target: Option<&str>) -> Result<Source, Failure> {
+    if target == Some("all") {
+        return Err(Failure::new(
+            "usage",
+            "aproxy logs 不支持 all：一次只读一个实例的日志，请指定端口号或配置别名。",
+            json!({"reason": "logs_target_all"}),
+        ));
+    }
+    let records = aproxy::spec::list_restore_in(&daemon::run_dir()).entries;
+    let stopped = |entry: &RestoreEntry| Source::Stopped {
+        port: entry.port.clone(),
+        log_path: entry.spec.log_path.clone(),
+    };
+    match target {
+        // 端口：直接按端口 IPC 定位，不依赖注册表（与 stop 相同）
+        Some(target) if target.parse::<u16>().is_ok() => {
+            let port = daemon::port_of(target).to_string();
+            if let Ok(info) = daemon::ipc_ping(&port).await {
+                return Ok(Source::Running(Box::new(info)));
+            }
+            match records.iter().find(|entry| entry.port == port) {
+                Some(entry) => Ok(stopped(entry)),
+                None => Err(Failure::new(
+                    "target_not_running",
+                    format!("端口 {port} 上没有运行中的 aProxy 实例，也没有它上次运行留下的记录。"),
+                    json!({"target": port}),
+                )),
+            }
+        }
+        // 别名（或配置文件路径）：按配置文件匹配实例与记录，端口变了别名依然有效
+        Some(target) => {
+            let Some(cfg_path) = resolve_config_target(target) else {
+                return Err(super::stop::unknown_target(target));
+            };
+            let key = config_path_key(&cfg_path.display().to_string());
+            let instances = daemon::list_instances().await;
+            if let Some(info) = instances.into_iter().find(|i| {
+                i.instance
+                    .config_path
+                    .as_deref()
+                    .is_some_and(|path| config_path_key(path) == key)
+            }) {
+                return Ok(Source::Running(Box::new(info)));
+            }
+            // 同一份配置留下的记录不止一条时（端口改过），取最近写下的那条
+            let record = records
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .spec
+                        .config_path
+                        .as_deref()
+                        .is_some_and(|path| config_path_key(path) == key)
+                })
+                .max_by_key(|entry| entry.written_at);
+            match record {
+                Some(entry) => Ok(stopped(entry)),
+                None => Err(Failure::new(
+                    "target_not_running",
+                    format!(
+                        "别名 {target}（配置 {}）当前未在运行，也没有它上次运行留下的记录。",
+                        cfg_path.display()
+                    ),
+                    json!({"target": target}),
+                )),
+            }
+        }
+        // 省略：只有一个实例在运行时就是它；一个都没有时，只有一条记录就读那条
+        None => {
+            let mut instances = daemon::list_instances().await;
+            if instances.len() > 1 {
+                let ports: Vec<String> = instances
+                    .iter()
+                    .map(|info| daemon::port_of(&info.instance.listen_addr).to_string())
+                    .collect();
+                return Err(ambiguous(
+                    format!(
+                        "有 {} 个实例在运行，必须指定端口号或配置别名（一次只读一个实例的日志）：",
+                        ports.len()
+                    ),
+                    &ports,
+                ));
+            }
+            if let Some(info) = instances.pop() {
+                return Ok(Source::Running(Box::new(info)));
+            }
+            match records.as_slice() {
+                [] => Err(Failure::new(
+                    "target_not_running",
+                    "没有运行中的 aProxy 实例，也没有实例上次运行留下的记录。",
+                    json!({"target": null}),
+                )),
+                [entry] => Ok(stopped(entry)),
+                _ => {
+                    let ports: Vec<String> =
+                        records.iter().map(|entry| entry.port.clone()).collect();
+                    Err(ambiguous(
+                        format!(
+                            "没有运行中的实例；有 {} 个实例留下了期望状态记录，指定端口查看它上次运行的日志：",
+                            ports.len()
+                        ),
+                        &ports,
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// 没指定目标而可读的日志不止一份：`target_ambiguous`（2），说明里列出可以照抄的命令行。
+fn ambiguous(head: String, ports: &[String]) -> Failure {
+    let mut message = head;
+    for port in ports {
+        message.push_str(&format!("\n  aproxy logs {port}"));
+    }
+    let ports: Vec<_> = ports.iter().map(|port| port_value(port)).collect();
+    Failure::new("target_ambiguous", message, json!({"ports": ports}))
 }
 
 /// 输出日志文件末尾的 `tail_lines` 行；`follow` 为真时随后轮询增量输出（tail -f 语义），

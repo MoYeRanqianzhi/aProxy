@@ -971,7 +971,32 @@
     7. **留给 B9-4**：`settings show|get|set|unset` 的 `--json`（设计稿 `set`/`unset` 的 `instances_to_restart` 对
        settings 也适用：改了 `defaults` 时是哪些实例）；`--json` 文档的 golden。`config.rs` 里的 `fail`/`print_doc`
        到时挪成各命令共用的。
-  - [ ] B9-3 退出码表（§9.5）与操作码（§2.4）：操作层的中文原因换成码加数据；§9.5 每一格一个测试。
+  - [x] B9-3 退出码表（§9.5）与操作码（§2.4）：start、stop、restart、restore、logs、config、settings 七行。共用的出口在
+    `src/commands/mod.rs`：`Failure`（码、message、details；退出码查码表；`--json` 时 stdout 上是错误文档）、`Results`
+    （stop/restart/restore 逐实例的结局与汇总，`{"results":[…],"summary":{"ok","failed"}}`）、`print_doc`、`say`
+    （`--json` 时给人看的行改写 stderr）、`port_value`、`spawn_failure`、`bind_failure`。配置解析的失败有了类别
+    （`ops::start::ConfigError`），restart 预检带着它（`PrecheckError::Config(ConfigError)`）。start、stop、restart、
+    restore 有了 `--json`（这四个的文档随这一步定下，B9-4 不再做）。测试 `tests/exit_codes.rs`（每格至少一个断言）；
+    技能 commands.md 的退出码表与各命令的相关段落、CHANGELOG 随之改写。验证：headless 全量 776 过（0 失败、7 忽略），
+    三路 clippy 干净。
+    **与设计稿的出入、留给后面的**：
+    1. stop 一个没在运行的目标（端口或别名）是 `already_stopped`、退出 0（原来是 1），按 §2.4「端点不存在」那一行。
+    2. 选目标时因不应答而跳过的实例（不带 `--force` 的 all 与省略目标）现在逐个记为 `failed`（`instance_unresponsive`），
+       所以 `stop all` 遇到挂死的实例以 5 结束。`ops::target::Selection::unresponsive_skipped` 从计数改成记录本身。
+    3. restart 省略目标而没有运行中的实例：`target_not_running`（4），`details.target` 为 null（码表写的是 String；
+       null 与结果项里「没写目标」的约定一致）。`restart all` 没有实例时是 0、空结果。
+    4. restart、restore 结果项的 `port` 是新实例实际监听的端口（配置改了端口时与旧的不同）。
+    5. restore 的 `config_missing` 不计入 `summary` 的 ok 与 failed，命令以 5 结束；读不懂的记录只在 stderr 上报，
+       不进结果。
+    6. logs（没有 `--json`）：目标没在运行、但有期望状态记录时，读记录里的 `log_path`（§9.6），`-f` 时不跟随；省略
+       目标而没有运行中的实例时，只有一条记录就读它，几条时 `target_ambiguous` 列出记录的端口；`logs all` 是 `usage`（2）。
+    7. `details.reason` 的取值：`stop_failed` 是 `still_running`、`kill_failed`；`usage` 是
+       `idle_threshold_without_idle`、`logs_target_all`。restart 预检：记录读不懂是 `restart_unsupported`，配置文件
+       不在是 `target_not_found`（4），配置无效 `config_invalid`（3），端口被占 `port_in_use`，别的绑定失败 `start_failed`。
+    8. **没做的**：`start_failed` 的 `details.code`（子进程的退出码）没填，`__serve` 遇到配置错误以 1 退出，所以
+       restore 时配置改坏是 `start_failed`/1 而不是 3（start 自己在拉起之前就解析配置，报 3）；`instance_incompatible`
+       还没有产生它的路径（随 B9-4 status 改用 `ops::enumerate`）；`EditError::Io` 仍没有操作码；status、doctor、
+       find、install、skill、desktop 几行随 B9-4、B9-5、B9-6、W4。
   - [ ] B9-4 `--json`（§9.4）：status（改用 `ops::enumerate`，顺带显示 incompatible、down、看护者、读不懂的记录）、
     start、stop、restart、restore、alias list、config/settings 的 show 与 get、find；每个一份 golden。
   - [ ] B9-5 doctor：换成诊断类型，`--json`，码（`file_permissions_too_open`、`default_header_shared` 等）。

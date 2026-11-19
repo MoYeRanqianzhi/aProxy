@@ -33,6 +33,7 @@
   | `aproxy --config <文件> config …` | `aproxy config --config <别名或文件> …`（写在子命令前后都可以） |
 
   `aproxy logs` 的说明文字（连上了哪个实例、日志文件在哪、实例已停止）改写到标准错误，标准输出上只有日志行。`--idle-threshold-secs` 配在 `idle` 以外的目标上是用法错误（退出码 2）。读出来的密钥不再是「前 6 个字符加 `***`」：给人看的输出里是 `<secret>`（值不短于 24 个字符时带首尾各 4 个字符，如 `<secret sk-a…f3a9>`），`--json` 里是占位对象。
+- **退出码按一张固定的表**：0 完成（或要的状态已经达成），1 失败，2 用法错误，3 配置无效，4 目标或文件不存在，5 部分完成，各命令一致。与 0.1.x 不同的地方：配置错误时 `start` 以 3 结束（原来是 1），别名或配置文件不存在以 4 结束；`stop` 一个没在运行的目标是 0（要的状态已经达成，留着的期望状态记录照旧删掉），原来是 1；`restart` 一个没在运行的目标以 4 结束，预检发现配置无效以 3 结束，`restart all` 有成有败时以 5 结束；`stop all` 遇到不应答的实例时逐个报告并以 5 结束；`restore` 全部失败以 1 结束，部分失败或有配置文件找不到的记录以 5 结束（原来总是 0）；`logs` 多个实例而没指定目标、或写 `all` 时以 2 结束，没在运行也没有记录可读时以 4 结束；默认配置文件的指向失效时以 4 结束。
 - **config.toml 的键重新命名，并改为严格解析**：不认识的键、类型不对的值都是错误，指出文件、键与行列（形如 `config.toml:3:1: forward_only: unknown key forward_only [config_unknown_key]`），实例不启动；此前不认识的键被静默忽略，写错一个字母的键等于没写。0.1.x 的键按下表改名：
 
   | 0.1.x | 0.2.0 |
@@ -83,6 +84,9 @@
 要回到 0.1.x：先用 0.2.0 执行 `aproxy stop all`，删除 `~/.aproxy/bin/` 下的 aproxy 二进制，再用 0.1.x 的一键安装脚本指定版本重新安装（例如 `sh install.sh v0.1.0`、`install.ps1 -Version v0.1.0`）；0.2.0 的 `aproxy install` 不会装回 0.1.x。
 
 ### 新增
+
+- **`--json`**：`start`、`stop`、`restart`、`restore` 与 `config` 的四个子命令接受 `--json`，标准输出上只有一个 JSON 文档（带 `"schema":1`），给人看的文字改写到标准错误。整条命令失败时文档是 `{"schema":1,"error":{"code","message","details"}}`，`code` 取自错误码表（`docs/error-codes.md`）；`stop`、`restart`、`restore` 逐个实例给出结局：`{"results":[{"target","port","outcome","error"?,"reason"?}],"summary":{"ok","failed"}}`。
+- **`aproxy logs` 能读崩溃现场**：实例没在运行、但留着期望状态记录时，打印记录里那个日志文件的末尾（不跟随）。
 
 - **每个平台两个版本：带桌面界面的 desktop 与无界面的 headless**，代理与命令行完全相同。GitHub 资产里带界面的沿用 `aproxy-<target>[-v3]`，无界面的是 `aproxy-headless-<target>[-v3]`；musl 只有 headless，共 20 个二进制。npm 新增 `@meowo/aproxy-headless` 一组（与 `@meowo/aproxy` 都提供 `aproxy` 命令，只装其一；`@meowo/aproxy` 的两个 musl 平台包装的也是无界面的二进制）；cargo 编无界面版本用 `--no-default-features`；`cargo binstall aproxy` 在 musl 系统上取 headless。每个 Release 附发布清单 `aproxy-manifest.json`（每个二进制的目标、变体、指令集档与 SHA256）。`aproxy install` 升级保持已装的变体，`--variant desktop|headless` 换变体，没有更新的版本时重装当前版本的另一个变体；与 `--from` 同用时是核对。Linux 上带界面的版本动态链接 GTK 与 WebKitGTK，缺库时连 `--version` 都起不来。在线安装（含 `--force`）不预先猜本机缺什么，只看下载下来的二进制自检能不能跑：没写 `--variant` 时带界面的版本跑不起来就改装同一目标的 headless 并说明原因，Linux 上再不行换 musl 产物；写了 `--variant desktop` 就报错，什么都不改。普通安装在下载链的哪个渠道都取不到带界面的产物时也不自动改装（渠道分不清「这一版没有为本机发布它」与网络抖动），报错并提示 `--variant headless` 或 `install --force`；`install --force` 读发布清单，确定没有才改装 headless。一键安装脚本 install.sh 首装时在 Linux 上先看本机（musl、glibc 低于 2.34、找不到 WebKitGTK 4.1 的装 headless），带界面的版本下载后自检跑不起来也改装 headless；可用 `--variant desktop|headless`（或 `APROXY_VARIANT`）指定，写明了 desktop 就照装，交给自检判断。npm 装的带界面版本在 Linux 上缺库起不来时，启动器提示改装 `@meowo/aproxy-headless`。
 - **桌面界面预览 `aproxy desktop`**：带界面的版本（`--version` 的变体段为 `desktop`）可以打开桌面窗口。这一版的界面是预览版：实例、请求日志与统计都是演示数据，不是这台电脑上正在运行的 aProxy，界面顶部常驻「预览版 · 演示数据」标签；真实数据在之后的版本接入。界面偏好（主题、语言、Mica 开关）这一版也不保存，重新打开窗口恢复默认。窗口是独立的进程，关掉就退出，窗口本身不启停、不改动任何实例（和其余命令一样，发现上次的安装没做完时会在后台续完）；同一个 home 只开一个（再次运行提示已经在运行，以 0 退出），登记在进程台账里（角色 `desktop`），webview 的数据放在 `<home>/desktop/`。Windows 需要 WebView2 运行时：从终端运行时命令立即返回、窗口独立运行，从快捷方式启动时控制台窗口只闪一下（约 0.2 秒）就消失，说明改用对话框；Windows 11 上可以在设置里打开 Mica 背景。Linux 需要图形会话与 WebKitGTK 4.1。打不开时（没有 WebView2、没有图形会话）说明原因并以 1 退出，代理与其余命令不受影响。无界面的 headless 版本也认得这个命令（帮助里不列出），执行时说明怎样换装带界面的版本（`aproxy install --variant desktop`），以 1 退出。

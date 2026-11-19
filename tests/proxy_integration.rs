@@ -4791,7 +4791,7 @@ fn stale_default_config_blocks_only_commands_that_read_it() {
     let run = |args: &[&str]| home.cmd().args(args).output().unwrap();
 
     let show = run(&["config", "show"]);
-    assert_eq!(show.status.code(), Some(1), "要读配置的命令应报错");
+    assert_eq!(show.status.code(), Some(4), "要读配置的命令应报错");
     let stderr = String::from_utf8_lossy(&show.stderr);
     assert!(
         stderr.contains("默认配置文件不存在") && stderr.contains("settings unset default_config"),
@@ -4933,7 +4933,8 @@ fn hung_instance_is_reported_and_only_force_stops_it() {
 #[test]
 fn stop_from_another_home_does_not_reach_this_instance() {
     // 控制端点属于 run 目录：另一个 home 里的 `aproxy stop <同端口>` 必须找不到
-    // 本 home 的实例、以 1 退出，实例照常服务。曾经 Windows 的管道名只含端口、
+    // 本 home 的实例——对那个 home 而言端口上没有实例，结局是 already_stopped、以 0
+    // 退出——实例照常服务。曾经 Windows 的管道名只含端口、
     // 全机共享——用隔离 home 做实验时 `stop 12345` 会停掉用户正在用的实例。
     // 守护同时在 0.1.0 的旧管道名上应答（升级兼容），这里一并确认那条路没有
     // 把跨 home 的口子重新打开
@@ -4963,14 +4964,16 @@ fn stop_from_another_home_does_not_reach_this_instance() {
         "另一个 home 的 status 不应列出本实例: {}",
         String::from_utf8_lossy(&status_b.stdout)
     );
-    let stop_b = run_in(&home_b, &["stop", &port_s]);
+    let stop_b = run_in(&home_b, &["stop", &port_s, "--json"]);
     assert_eq!(
         stop_b.status.code(),
-        Some(1),
-        "另一个 home 里找不到该端口的实例，应以 1 退出: {}{}",
+        Some(0),
+        "另一个 home 里找不到该端口的实例，是 already_stopped: {}{}",
         String::from_utf8_lossy(&stop_b.stdout),
         String::from_utf8_lossy(&stop_b.stderr)
     );
+    let doc: serde_json::Value = serde_json::from_slice(&stop_b.stdout).unwrap();
+    assert_eq!(doc["results"][0]["outcome"], "already_stopped", "{doc}");
     assert!(
         wait_daemon_ready_in(&home_a.path().join("run"), port),
         "另一个 home 的 stop 不得停掉本实例"
@@ -5482,7 +5485,11 @@ fn logs_requires_port_when_multiple_instances() {
 
     // 无参：报错列出两个端口
     let out = run(&["logs"]);
-    assert!(!out.status.success(), "多实例时无参 logs 应失败");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "多实例时无参 logs 是 target_ambiguous"
+    );
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -5494,7 +5501,7 @@ fn logs_requires_port_when_multiple_instances() {
 
     // all：明确拒绝（一次只能连接一个）
     let out = run(&["logs", "all"]);
-    assert!(!out.status.success(), "logs all 应失败");
+    assert_eq!(out.status.code(), Some(2), "logs all 是用法错误");
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -5515,11 +5522,15 @@ fn logs_reports_missing_instance() {
         .args(["logs", &port.to_string()])
         .output()
         .unwrap();
-    assert!(!out.status.success(), "无实例时 logs 应失败");
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "无实例、无记录时 logs 是 target_not_running"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("没有运行中的 aProxy 实例"),
-        "实际: {stdout}"
+        stderr.contains("没有运行中的 aProxy 实例"),
+        "实际: {stderr}"
     );
 }
 
@@ -5811,9 +5822,13 @@ fn alias_start_and_stop_roundtrip() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("已停止"), "实际: {stdout}");
 
-    // 已停止后再 stop 别名：明确报「未在运行」
+    // 已停止后再 stop 别名：说明「未在运行」，stop 要的状态已经达成，以 0 退出
     let out = home.cmd().args(["stop", &alias]).output().unwrap();
-    assert!(!out.status.success(), "别名配置未运行时 stop 应失败");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "别名配置未运行时 stop 是 already_stopped"
+    );
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

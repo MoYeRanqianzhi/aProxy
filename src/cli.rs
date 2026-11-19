@@ -71,6 +71,11 @@ pub struct StartArgs {
     /// 前台运行（日志输出到控制台，Ctrl+C 停止）；默认在后台运行
     #[arg(long)]
     pub foreground: bool,
+
+    /// 输出一个 JSON 文档（给程序读）：启动了还是本来就在运行，端口、pid、日志路径与实例的
+    /// 状态。前台运行没有「启动完成」这个时刻，不能与 --foreground 同用
+    #[arg(long, conflicts_with = "foreground")]
+    pub json: bool,
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -108,6 +113,9 @@ pub enum Commands {
         /// 立即强制终止（跳过优雅关闭，零等待；终止前按 pid + 进程创建时间核验身份防杀错）
         #[arg(long)]
         force: bool,
+        /// 输出一个 JSON 文档（给程序读）：每个实例的结局与汇总
+        #[arg(long)]
+        json: bool,
     },
 
     /// 重启运行中的实例（停下它，再按它启动时的配置文件、覆盖参数与环境重新拉起）。
@@ -125,6 +133,9 @@ pub enum Commands {
         /// 立即强制终止旧进程（跳过优雅关闭，零等待）再重启
         #[arg(long)]
         force: bool,
+        /// 输出一个 JSON 文档（给程序读）：每个实例的结局与汇总
+        #[arg(long)]
+        json: bool,
     },
 
     /// 打印一个实例的守护日志的最近若干行然后退出；加 -f 接着实时输出新写进来的
@@ -144,10 +155,14 @@ pub enum Commands {
 
     /// 一键恢复先前在运行、因崩溃/断电/系统重启而消失的实例。
     /// 无可恢复实例时静默结束（适合配置为开机自启）。
-    /// 已在运行的实例自动跳过；配置文件已不存在的记录被清理。
+    /// 已在运行的实例自动跳过；配置文件此刻找不到的记录保留着，文件回来之后再恢复。
     // 永久兼容契约 C7：restore 子命令永远存在、名字不变——任何版本的强制安装换好二进制
     // 之后，都执行新二进制的 `restore` 把被结束的实例拉回来（见 aproxy::install::force）
-    Restore,
+    Restore {
+        /// 输出一个 JSON 文档（给程序读）：每条记录的结局与汇总
+        #[arg(long)]
+        json: bool,
+    },
 
     /// 管理配置别名（存于 ~/.aproxy/settings.json，内部配置不建议手改）。
     /// 别名指向某个 config.toml，让多开配置可以用名字快捷启停。

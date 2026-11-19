@@ -20,6 +20,201 @@ pub(crate) mod stop;
 use std::path::PathBuf;
 
 use aproxy::settings as app_settings;
+use serde_json::{Value, json};
+
+/// 一条命令整体失败的原因：码表里的码、它的 `details`、给人看的一段话。
+///
+/// 退出码取自码表（`aproxy_ipc::code`）；诊断码（例如 `config_unknown_key`）作为整条命令的
+/// 失败原因时，是「配置无效」，退出码 3。
+#[derive(Debug)]
+pub(crate) struct Failure {
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
+    pub(crate) details: Value,
+}
+
+impl Failure {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>, details: Value) -> Self {
+        Failure {
+            code,
+            message: message.into(),
+            details,
+        }
+    }
+
+    /// 这个失败的退出码。
+    pub(crate) fn exit_code(&self) -> u8 {
+        use aproxy_ipc::code::ExitCode;
+        match aproxy_ipc::code::lookup(self.code).and_then(|code| code.exit) {
+            Some(ExitCode::Fixed(code) | ExitCode::ChildOr(code)) => code,
+            None => aproxy_ipc::code::EXIT_CONFIG,
+        }
+    }
+
+    /// 报告并退出：原因写到 stderr；`json` 为真时 stdout 上是错误文档
+    /// `{"schema":1,"error":{"code","message","details"}}`。
+    pub(crate) fn exit(self, json: bool) -> ! {
+        let exit = self.exit_code();
+        eprintln!("{}", self.message);
+        if json {
+            print_doc(json!({
+                "error": {"code": self.code, "message": self.message, "details": self.details},
+            }));
+        }
+        crate::util::exit(exit as i32)
+    }
+}
+
+/// 给人看的一行：平时写到 stdout；`json` 为真时 stdout 只留给那一个 JSON 文档，这行改写到
+/// stderr。
+pub(crate) fn say(json: bool, text: impl std::fmt::Display) {
+    if json {
+        eprintln!("{text}");
+    } else {
+        println!("{text}");
+    }
+}
+
+/// 逐个实例处理的命令（stop、restart、restore）的结果清单：每个实例一项，最后汇总成退出码
+/// 与 `--json` 的文档 `{"results":[{"target","port","outcome","error"?,"reason"?}],
+/// "summary":{"ok","failed"}}`。
+///
+/// `target` 是命令行上写的目标（没写时为 null），`port` 是这一项说的那个实例的端口。
+pub(crate) struct Results {
+    target: Option<String>,
+    items: Vec<Value>,
+    ok: usize,
+    /// 失败的各项的退出码
+    failed: Vec<u8>,
+    /// 有一项的结局虽然不算错误，却要让命令以「部分成功」（5）结束
+    partial: bool,
+}
+
+impl Results {
+    pub(crate) fn new(target: Option<&str>) -> Self {
+        Results {
+            target: target.map(str::to_string),
+            items: Vec::new(),
+            ok: 0,
+            failed: Vec::new(),
+            partial: false,
+        }
+    }
+
+    fn item(&self, port: &str, outcome: &str) -> serde_json::Map<String, Value> {
+        let mut item = serde_json::Map::new();
+        item.insert("target".to_string(), json!(self.target));
+        item.insert("port".to_string(), port_value(port));
+        item.insert("outcome".to_string(), json!(outcome));
+        item
+    }
+
+    /// 这个实例达到了命令要的状态。`reason` 说明为什么是这个结局（例如 `not_idle`）。
+    pub(crate) fn ok(&mut self, port: &str, outcome: &str, reason: Option<&str>) {
+        let mut item = self.item(port, outcome);
+        if let Some(reason) = reason {
+            item.insert("reason".to_string(), json!(reason));
+        }
+        self.items.push(Value::Object(item));
+        self.ok += 1;
+    }
+
+    /// 这个实例没有达到命令要的状态。`outcome` 一般是 `failed`。
+    pub(crate) fn failed(&mut self, port: &str, outcome: &str, failure: &Failure) {
+        let mut item = self.item(port, outcome);
+        item.insert(
+            "error".to_string(),
+            json!({"code": failure.code, "message": failure.message, "details": failure.details}),
+        );
+        self.items.push(Value::Object(item));
+        self.failed.push(failure.exit_code());
+    }
+
+    /// 这个实例没有达到命令要的状态，却也不算出错（例如 restore 时配置文件暂时不在，记录
+    /// 保留着等它回来）：不计入 `ok` 与 `failed`，命令至少以「部分成功」（5）结束。
+    pub(crate) fn deferred(&mut self, port: &str, outcome: &str) {
+        let item = self.item(port, outcome);
+        self.items.push(Value::Object(item));
+        self.partial = true;
+    }
+
+    /// 退出码：没有失败是 0；有成有败是 5；全部失败时，各项的退出码相同就用它，否则 1。
+    pub(crate) fn exit_code(&self) -> u8 {
+        use aproxy_ipc::code::{EXIT_FAILED, EXIT_OK, EXIT_PARTIAL};
+        match self.failed.as_slice() {
+            [] if self.partial => EXIT_PARTIAL,
+            [] => EXIT_OK,
+            _ if self.ok > 0 || self.partial => EXIT_PARTIAL,
+            [first, rest @ ..] if rest.iter().all(|code| code == first) => *first,
+            _ => EXIT_FAILED,
+        }
+    }
+
+    /// 结束命令：`json` 为真时把文档写到 stdout，然后以 [`Self::exit_code`] 退出。
+    pub(crate) fn finish(self, json: bool) -> ! {
+        let exit = self.exit_code();
+        if json {
+            print_doc(json!({
+                "results": self.items,
+                "summary": {"ok": self.ok, "failed": self.failed.len()},
+            }));
+        }
+        crate::util::exit(exit as i32)
+    }
+}
+
+/// 端口写成 JSON：数字；空串（这一项说的不是某个端口，例如一个没在运行的别名）是 null。
+pub(crate) fn port_value(port: &str) -> Value {
+    port.parse::<u16>().map_or(Value::Null, |port| json!(port))
+}
+
+/// 实例没能拉起来：时限内没就绪是 `ready_timeout`，其余（拉不起进程、进程起来就退出）是
+/// `start_failed`，`details` 里带 startup.log 这次新增的几行。`message` 是给人看的说明。
+pub(crate) fn spawn_failure(error: &aproxy::spawn::SpawnError, message: String) -> Failure {
+    use aproxy::spawn::SpawnError;
+    match error {
+        SpawnError::TimedOut { .. } => Failure::new(
+            "ready_timeout",
+            message,
+            json!({"timeout_ms": aproxy::spawn::READY_TIMEOUT.as_millis() as u64}),
+        ),
+        SpawnError::Spawn(_) | SpawnError::Exited { .. } => {
+            let lines = error
+                .startup_log()
+                .map(|log| log.lines.clone())
+                .unwrap_or_default();
+            Failure::new("start_failed", message, json!({"startup_log": lines}))
+        }
+    }
+}
+
+/// 监听地址绑定不了：被占用是 `port_in_use`；无权限、地址不可用是这个地址本来就起不来，
+/// 归 `start_failed`。
+pub(crate) fn bind_failure(listen_addr: &str, error: &std::io::Error) -> Failure {
+    let message = crate::server::bind_error_message(listen_addr, error);
+    if error.kind() == std::io::ErrorKind::AddrInUse {
+        Failure::new(
+            "port_in_use",
+            message,
+            json!({
+                "port": port_value(aproxy::daemon::port_of(listen_addr)),
+                "owner": "unknown",
+            }),
+        )
+    } else {
+        Failure::new("start_failed", message, json!({"startup_log": []}))
+    }
+}
+
+/// 把 `--json` 的文档写到 stdout：一行，`schema` 在最前面，其余的键照 `body` 的顺序。
+pub(crate) fn print_doc(body: Value) {
+    let mut doc = serde_json::Map::new();
+    doc.insert("schema".to_string(), 1.into());
+    if let Value::Object(body) = body {
+        doc.extend(body);
+    }
+    println!("{}", Value::Object(doc));
+}
 
 /// 实际生效的配置文件路径：命令行上显式给的（`explicit`） > settings.json 的 `default_config`
 /// （用户可把日常主力配置换成任意文件）> 默认 `~/.aproxy/config.toml`。
@@ -34,7 +229,7 @@ use aproxy::settings as app_settings;
 /// 显式给的路径在此展开 `~` 并按当前工作目录绝对化：这个路径会被转发给
 /// 守护子进程、写进注册表与 .restore，日后可能在别的工作目录被读取（restore
 /// 会把找不到配置文件的记录当失效清理掉）。
-pub(crate) fn resolve_cfg_path(explicit: Option<&std::path::Path>) -> Result<PathBuf, String> {
+pub(crate) fn resolve_cfg_path(explicit: Option<&std::path::Path>) -> Result<PathBuf, Failure> {
     if let Some(p) = explicit {
         return Ok(match p.to_str() {
             Some(s) => app_settings::expand_path(s),
@@ -47,9 +242,14 @@ pub(crate) fn resolve_cfg_path(explicit: Option<&std::path::Path>) -> Result<Pat
             if path.is_file() {
                 Ok(path)
             } else {
-                Err(format!(
-                    "settings.json 指定的默认配置文件不存在: {}\n用 aproxy settings set default_config <路径> 重新指定，或 aproxy settings unset default_config 取消",
-                    path.display()
+                Err(Failure::new(
+                    "target_not_found",
+                    format!(
+                        "settings.json 指定的默认配置文件不存在: {}
+用 aproxy settings set default_config <路径> 重新指定，或 aproxy settings unset default_config 取消",
+                        path.display()
+                    ),
+                    json!({"target": path.display().to_string()}),
                 ))
             }
         }
@@ -57,12 +257,9 @@ pub(crate) fn resolve_cfg_path(explicit: Option<&std::path::Path>) -> Result<Pat
     }
 }
 
-/// 兑现 `resolve_cfg_path` 的结果：失效即打印原因并以 1 退出。
-pub(crate) fn require_cfg_path(cfg_path: Result<PathBuf, String>) -> PathBuf {
-    cfg_path.unwrap_or_else(|e| {
-        eprintln!("{e}");
-        std::process::exit(1);
-    })
+/// 兑现 `resolve_cfg_path` 的结果：默认配置文件失效时报告并以 4 退出。
+pub(crate) fn require_cfg_path(cfg_path: Result<PathBuf, Failure>, json: bool) -> PathBuf {
+    cfg_path.unwrap_or_else(|failure| failure.exit(json))
 }
 
 #[cfg(test)]

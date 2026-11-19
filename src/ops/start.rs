@@ -2,7 +2,7 @@
 //!
 //! 服务本身（守护子进程进入的主循环）在二进制一侧的 `server.rs`；这里只管「把它拉起来」。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::cli::StartArgs;
 use crate::config::{self, Config, Overrides};
@@ -22,6 +22,75 @@ pub fn overrides_from_cli(args: &StartArgs) -> Overrides {
     }
 }
 
+/// 启动路径上配置解析不出一份能用的配置的原因。`Display` 是给人看的完整说明（逐条列出
+/// 诊断与修法），写到 stderr 与 startup.log 的就是它。
+#[derive(Debug)]
+pub enum ConfigError {
+    /// 给了路径而文件不在
+    Missing(PathBuf),
+    /// settings.json 有 error 级诊断：实例不带着内置默认悄悄启动
+    Settings {
+        file: PathBuf,
+        diagnostics: Vec<aproxy_ipc::diag::Diagnostic>,
+    },
+    /// 配置文件在，却读不出来
+    Read {
+        file: PathBuf,
+        error: std::io::Error,
+    },
+    /// 解析出来的配置有 error 级诊断。`file` 是配置文件，没有配置文件时为 None
+    Invalid {
+        file: Option<PathBuf>,
+        diagnostics: Vec<aproxy_ipc::diag::Diagnostic>,
+    },
+}
+
+impl ConfigError {
+    /// error 级的诊断；文件不在、读不出来时没有
+    pub fn diagnostics(&self) -> &[aproxy_ipc::diag::Diagnostic] {
+        match self {
+            Self::Settings { diagnostics, .. } | Self::Invalid { diagnostics, .. } => diagnostics,
+            Self::Missing(_) | Self::Read { .. } => &[],
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing(path) => write!(f, "配置文件不存在: {}", path.display()),
+            Self::Settings { file, diagnostics } => {
+                write!(f, "settings.json 有错误，实例没有启动:")?;
+                for d in diagnostics {
+                    write!(f, "\n  {}", render_diagnostic(d))?;
+                }
+                write!(
+                    f,
+                    "\n\n用 aproxy settings show 查看，aproxy settings unset <键> 删掉出问题的键；也可以删除 {} 回到内置默认",
+                    file.display()
+                )
+            }
+            Self::Read { file, error } => {
+                write!(f, "读取配置文件失败: {error}\n文件: {}", file.display())
+            }
+            Self::Invalid { file, diagnostics } => {
+                write!(f, "配置错误:")?;
+                for d in diagnostics {
+                    write!(f, "\n  {}", render_diagnostic(d))?;
+                }
+                write!(
+                    f,
+                    "\n\n请修改后重试。上游地址可以这样设置:\n  aproxy config set base_url https://api.anthropic.com"
+                )?;
+                if let Some(path) = file {
+                    write!(f, "\n  或手动编辑 {}", path.display())?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// 启动路径共用的配置解析：走分层解析（覆盖 > config.toml > settings 的全局默认 > 内置
 /// 默认）。`cfg_path` 为 None 表示没有配置文件，只有另外三层。有 error 级诊断时不启动，
 /// Err 里逐条列出：哪个文件、哪个键、第几行。
@@ -31,33 +100,29 @@ pub fn overrides_from_cli(args: &StartArgs) -> Overrides {
 pub fn resolve_runtime_config(
     overrides: &Overrides,
     cfg_path: Option<&Path>,
-) -> Result<Config, String> {
+) -> Result<Config, ConfigError> {
     if let Some(path) = cfg_path
         && !path.exists()
     {
-        return Err(format!("配置文件不存在: {}", path.display()));
+        return Err(ConfigError::Missing(path.to_path_buf()));
     }
     // 实例只在启动时读 settings.json：它无效时不带着内置默认悄悄启动——那样全局默认里的
     // 上游、限额都不生效，用户看到的是一个行为不对的实例，而不是一条说得清的错误
     let settings_path = settings::settings_path();
     let loaded = settings::read(&settings_path);
     if !loaded.is_valid() {
-        let mut msg = String::from("settings.json 有错误，实例没有启动:");
-        for d in loaded.diagnostics.iter().filter(|d| d.is_error()) {
-            msg.push_str("\n  ");
-            msg.push_str(&render_diagnostic(d));
-        }
-        msg.push_str(&format!(
-            "\n\n用 aproxy settings show 查看，aproxy settings unset <键> 删掉出问题的键；也可以删除 {} 回到内置默认",
-            settings_path.display()
-        ));
-        return Err(msg);
+        return Err(ConfigError::Settings {
+            file: settings_path,
+            diagnostics: loaded
+                .diagnostics
+                .into_iter()
+                .filter(|d| d.is_error())
+                .collect(),
+        });
     }
-    let resolved = resolve_layers(overrides, cfg_path).map_err(|e| {
-        format!(
-            "读取配置文件失败: {e}\n文件: {}",
-            cfg_path.unwrap_or_else(|| Path::new("")).display()
-        )
+    let resolved = resolve_layers(overrides, cfg_path).map_err(|error| ConfigError::Read {
+        file: cfg_path.unwrap_or_else(|| Path::new("")).to_path_buf(),
+        error,
     })?;
     // 告警级的诊断（例如全局默认的凭据没有被继承）与扣下的凭据，记进日志
     for d in resolved.diagnostics.iter().filter(|d| !d.is_error()) {
@@ -75,18 +140,10 @@ pub fn resolve_runtime_config(
     if resolved.is_valid() {
         return Ok(resolved.config);
     }
-    let mut msg = String::from("配置错误:");
-    for d in resolved.errors() {
-        msg.push_str("\n  ");
-        msg.push_str(&render_diagnostic(d));
-    }
-    msg.push_str(
-        "\n\n请修改后重试。上游地址可以这样设置:\n  aproxy config set base_url https://api.anthropic.com",
-    );
-    if let Some(path) = cfg_path {
-        msg.push_str(&format!("\n  或手动编辑 {}", path.display()));
-    }
-    Err(msg)
+    Err(ConfigError::Invalid {
+        file: cfg_path.map(Path::to_path_buf),
+        diagnostics: resolved.errors().cloned().collect(),
+    })
 }
 
 /// 一条诊断写成一行：`文件:行:列: 键: 说明 [码]`，没有的部分省略。

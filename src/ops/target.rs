@@ -32,9 +32,9 @@ pub struct Selection {
     pub instances: Vec<InstanceRecord>,
     /// 清单为空的原因；清单不空时为 None
     pub empty: Option<Empty>,
-    /// 进程仍在、却不应答控制通道，因而**没有**纳入清单的实例数（只在不带 `force`、
-    /// target 省略或为 `all` 时计数）。它们只能强制结束
-    pub unresponsive_skipped: usize,
+    /// 进程仍在、却不应答控制通道，因而**没有**纳入清单的实例（只在不带 `force`、
+    /// target 省略或为 `all` 时收集）。它们只能强制结束；调用方把它们报成没处理成的那几个
+    pub unresponsive_skipped: Vec<InstanceRecord>,
 }
 
 /// 清单为空、但不算错误的两种情形。
@@ -95,7 +95,7 @@ pub async fn select(
         return Ok(Selection {
             instances,
             empty,
-            unresponsive_skipped: 0,
+            unresponsive_skipped: Vec::new(),
         });
     }
 
@@ -157,11 +157,11 @@ pub async fn select(
     let survey = daemon::survey_instances().await;
     let mut instances: Vec<InstanceRecord> =
         survey.responsive.into_iter().map(|s| s.instance).collect();
-    let mut unresponsive_skipped = 0;
+    let mut unresponsive_skipped = Vec::new();
     if force {
         instances.extend(survey.unresponsive);
     } else {
-        unresponsive_skipped = survey.unresponsive.len();
+        unresponsive_skipped = survey.unresponsive;
     }
     // target 省略时只接受唯一的那个实例
     if target.is_none() && instances.len() > 1 {
@@ -185,7 +185,7 @@ impl Selection {
         Selection {
             instances,
             empty: None,
-            unresponsive_skipped: 0,
+            unresponsive_skipped: Vec::new(),
         }
     }
 }

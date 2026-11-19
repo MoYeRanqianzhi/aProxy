@@ -143,7 +143,7 @@ fn restart_after_port_change_reports_new_port() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. restart 未启动的端口：只重启不启动语义——提示未运行并退出 1
+// 2. restart 未启动的端口：只重启不启动语义——报 target_not_running 并退出 4
 // ---------------------------------------------------------------------------
 #[test]
 fn restart_not_running_port_fails() {
@@ -157,11 +157,11 @@ fn restart_not_running_port_fails() {
         .args(["restart", &port.to_string()])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1), "未启动的 target 应退出 1");
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(4), "未启动的 target 应退出 4");
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("没有运行中的 aProxy 实例"),
-        "应提示未在运行，实际: {stdout}"
+        stderr.contains("没有运行中的 aProxy 实例"),
+        "应提示未在运行，实际: {stderr}"
     );
 }
 
@@ -352,7 +352,11 @@ fn restart_with_broken_config_keeps_old_instance() {
     write_broken_cfg(&cfg, port);
     let out = run_cli(&test_home, &exe, &["restart", &port.to_string()]);
     let stderr = text(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "预检失败应退出 1: {stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "预检发现配置无效应退出 3: {stderr}"
+    );
     assert!(
         stderr.contains("预检未通过") && stderr.contains("TOML"),
         "应报出预检失败与配置错误原因: {stderr}"
@@ -366,7 +370,7 @@ fn restart_with_broken_config_keeps_old_instance() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. restart all：逐实例预检，失败的跳过、其余照常重启，最后非零退出
+// 4. restart all：逐实例预检，失败的跳过、其余照常重启，最后以部分失败（5）退出
 // ---------------------------------------------------------------------------
 #[test]
 fn restart_all_skips_failed_instance_and_exits_nonzero() {
@@ -389,7 +393,11 @@ fn restart_all_skips_failed_instance_and_exits_nonzero() {
     write_broken_cfg(&cfg_b, port_b);
     let out = run_cli(&test_home, &exe, &["restart", "all"]);
     let stderr = text(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "有失败者时应非零退出: {stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "有成有败时应以 5 退出: {stderr}"
+    );
     assert!(
         stderr.contains("2 个实例中有 1 个重启失败"),
         "应汇总失败实例: {stderr}"

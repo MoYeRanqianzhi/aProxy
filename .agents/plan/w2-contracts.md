@@ -749,6 +749,8 @@ Windows 内核对象（A）：
 - argv 落盘会把启动语法与明文 key 冻结成跨版本契约（CP-02）。结构化的 spec，任何版本的拉起方都能翻译成自己的命令行。
 - 环境快照让重拉出来的实例走同一条网络路径（D-2）。
 - 先 bind 端口、后握手，再以 `starting` 应答：端口冲突能尽早报出；界面能显示「正在启动」；拉起方不会把慢启动的 format 误判为失败。
+- `starting` 期间（握手可能要 10 秒，2026-11-20 补）：`prepare_swap` 回 `invalid_state`，不置位；对同一地址再执行 `start`，
+  要等这次启动出结果，不能当作已经在运行；收到终止信号同 `serving` 时一样处理，握手中的子进程随之结束。
   否决「先 bind 控制端点」：端口为 0 时，控制端点要等实际端口才能命名。
 - `keep_restore` 比「停止后回写」少一个窗口：调用方在中途崩溃，记录也还在。
 - 跨版本只依赖台账与内部入口：二者都是冻结的，其余记录可以随 schema 演进。
@@ -1106,7 +1108,7 @@ stages = ["request", "retry"]
 | 键 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `name` | 字符串 | `command` 的文件名主干 | 在列表内唯一 |
-| `command` | 路径或命令名 | 必填 | 相对路径相对 home；裸命令名先找 `<home>/bin/`，再找 PATH |
+| `command` | 路径或命令名 | 必填 | 相对路径相对 home；裸命令名先找 `<home>/bin/`，再找 PATH（这个程序的 `env` 里给了 PATH 就用它）。只认能执行的文件：Unix 看执行位；Windows 上没写扩展名的裸名找 `<名字>.exe`。Windows 上不接受 `.cmd` 与 `.bat`，配置校验时报错：它们只能经 cmd.exe 运行，杀掉 cmd.exe 时真正的程序还活着；要用脚本，就把解释器写在 `command`、脚本写在 `args`（2026-11-20 补） |
 | `args` | 字符串数组 | [] | 打码规则见 §1.5 |
 | `env` | 表 | {} | 追加给程序的环境变量；值只写不读，密钥建议放这里 |
 | `process` | `spawn` 或 `persistent` | `spawn` | 进程方式（命名见 §1.3） |
@@ -1410,6 +1412,12 @@ aproxy desktop                  W5
   取值来自词表的字段（`decision`、`delivery`、`process`、`request_body` 的各个值）一律是 JSON 字符串，写成别的形状就是不合法
   （2026-11-20 补：审查发现 serde 默认也接受按位置排列的数组与 `{"retry":null}` 这种写法，这些都不属于协议）。
 - **stderr**：每一行先做已知密钥替换，再写进实例日志，前缀为 `format[<name>]`。
+  有界（2026-11-20 补）：一行超过 8 KiB 的部分丢掉，并在行尾标 `…(truncated)`；每个程序每秒最多写 50 行，超出的丢掉，
+  另用一行告警报出丢了多少行。worker 退出或被换掉时，读它 stderr 的任务随之结束。
+- **回信的长度**（2026-11-20 补）：回信一行有上限，读到上限还没遇到换行就按输出不合法处理、换掉这个 worker，不把整行读进内存。
+  hello 回信 64 KiB；request、retry 的回信是 `max_request_mb` 的两倍加 1 MiB，response、stream 的回信是 `max_response_mb` 的两倍加 1 MiB
+  （JSON 转义与 base64 都会让体变长；对应的配置不设限时，这里也不设）；其余阶段 1 MiB。
+  换行之前就遇到 EOF 的半行不是帧，按进程退出处理（握手时属于 §10.2 表里「中途退出」那一行）。
 - **一问一答**：
   - 每条消息恰好一个回信，按顺序，回信必须原样带回消息的 `seq`。
   - `seq` 不符或缺失按协议错误处理（`format_error`，kind 为 `protocol`），剔除这个 worker。这根治了串包。
@@ -1438,6 +1446,7 @@ aproxy desktop                  W5
   - 多值头只保留第一个值。
   - aproxy 发出的完整对象总带 `headers`，一个头都没有就写 `{}`：request、retry 阶段的请求对象，以及各阶段的响应对象。
     decide、response、stream 阶段消息里的 `request` 只是方法与 url 的摘要，不带头与体（2026-11-20 补）。
+    唯一的例外：在 decide 上要了 `full` 的程序（§10.2），它收到的 `request` 另带 `body` 或 `body_b64`，仍然不带头。
 - **字节流**（stream、heartbeat 阶段）用 `data` 或 `data_b64`。aproxy 把块尾不完整的 UTF-8 序列留到下一块。
   aproxy 发出的 heartbeat 消息与流的 data 事件总带其中一个，空块写 `"data":""`；只有回信可以两个都省略（2026-11-20 补）。
 
@@ -1525,6 +1534,11 @@ aproxy desktop                  W5
 
 - **`request`**：输入是应用了头覆盖之后的请求。回信里的 `url` 必须是绝对的 http 或 https URL，否则按输出不合法处理
   （`format_error`，kind 为 `invalid_output`）。
+  - 体是解码后的字节（2026-11-20 补）：请求带 `content-encoding`、链上又有程序在 request 或 retry 阶段要 `full` 时，aproxy 先解码，
+    并从头表里去掉 `content-encoding`，发给上游的也是解码后的体；解不了（不认识的编码、数据坏了）就原样交出，头表不动。
+    `digest` 仍按客户端发来的原始字节算（§10.2）。
+  - 链的输出里，程序自己在头表里写了 `content-encoding`，就照它写的发：它为自己给的字节负责。`content-length` 总由 aproxy 重算。
+  - 下一层看到的头表，就是会发给上游的那一份：名字小写，aproxy 自己管的头与不合法的头已经去掉。
 - **`delivery`**：输入是当前的投递方式；回信可以给 `forward` 或 `retry`，链上第一个给出的生效（§10.10）。
 - **`client`**：客户端视角的路径与是否流式，链上每一层看到的都一样。
 - **retry 阶段**的输入多一个 `retry` 对象：`{"attempt":3,"last_failure":{"code","details"},"elapsed_ms"}`，其中 `attempt` 是即将进行的尝试序号。
@@ -1542,6 +1556,11 @@ aproxy desktop                  W5
   - `retry:false`：带了 `response` 就原样返回它，并加上 §3 的两个头，码为 `format_rejected`；没带就回 422 `format_rejected`。两种模式相同。
   - `code` 是 format 自定的机读串，可以省略，进入 `details.fail_code`；`reason` 用英文，不超过 512 个字符。
   - `fail` 是程序的决定，不是错误：可选程序回的 `fail` 同样执行。`required` 只管程序出错与熔断（S3-6）。
+  - 带 `fail` 的回信里，`state`、`overrides`、`report` 照常生效，例如同时给 `retry.max_attempts`（2026-11-20 补）。
+  - `fail.response` 与 decide 叫停时附带的 `response` 是数据面的字节，同上游的响应一样原样交给客户端，不做密钥替换；
+    存进请求历史、写进日志时照常替换。它的 `status` 不是合法的状态码时，按输出不合法处理（2026-11-20 补）。
+  - 在链里结束的尝试也是一次尝试：请求记录里这一次的 `code` 是它的原因（`format_fail`、`format_error`、`format_rejected`、
+    `format_unavailable`），没有 `upstream_status`（2026-11-20 补）。
 - **进程崩溃、超时、回信不合法**：
   - required 程序：单次按应重试（`format_error`），连续出现由熔断处理（§10.9）；forward 请求同 `retry:true`。
   - 可选程序：跳过这一层，把它的输入原样当作输出，并记一行告警。
@@ -1595,6 +1614,8 @@ aproxy desktop                  W5
 
 - **范围**：只处理判定为成功、要交给客户端的响应。放弃之后透传的错误不经过它（X-3）；要按客户端协议改写错误，用 decide 的 `stop` 附带 `response`。
 - **forward 请求**：响应要先在这一层攒齐再交给它，这一段失去真流式（§10.10）。
+- **编码**：交给程序的体是解码后的字节，所以输出时去掉上游的 `content-encoding`、重算 `content-length`；
+  程序自己在头表里写了 `content-encoding`，就照它写的发（同 §10.4，2026-11-20 补）。
 - **失败**：进程级失败时，熔断器仍放行的话换一个新 worker 重做一次，仍失败就跳过这一层（用户 09-23：响应侧失败就透传，并告警）。
   熔断已开（或半开、试探已发出）时不起 worker、不写消息，直接跳过这一层（§10.9；2026-11-19 改：原来把熔断已开也列为要重做一次的失败，
   与 §10.9 熔断期间不再发消息矛盾）。
@@ -1647,6 +1668,9 @@ aproxy desktop                  W5
 - **每一拍都带 `client`**，判断协议够用了；不再像现行那样在第 1 拍附上请求体（S3-32）。
   需要更多信息的程序，在 request 阶段写进 `state`，心跳时读出。
 - **迟到与失败**：一拍没在下一拍之前回来，就照发上一层的字节；出错或熔断时，这一拍用输入的字节。
+  出错或熔断的那一层按跳过处理，外侧各层照常处理这一拍。一拍的时限就是到下一拍为止，结果过了时限才到就不用它。
+- **不挡响应**（2026-11-20 补）：上游的响应到了、要交给客户端时，还没回来的那一拍作废，不等它；它占着的 worker 换掉，不计入熔断。
+  所以同一个程序既声明 heartbeat 又声明 response、`pool_max` 为 1 时，响应也不会被一拍心跳拖住。
 
 ### 10.8 report
 

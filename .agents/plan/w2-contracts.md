@@ -1442,7 +1442,9 @@ aproxy desktop                  W5
   - aproxy 至少等 10 秒的 hello 回信。
 - **`stages`**：aproxy 发出的是配置声明的阶段，format 回的是它支持的全部阶段。
 - **`overrides`**：aproxy 接受的按请求覆盖键。format 据此知道哪些覆盖会生效；回信里不在列表中的覆盖，被忽略并告警。
-- **`worker_id`**：0 到 pool_max 之间、在世 worker 之间唯一的槽位号，取最小的空闲号；spawn 模式恒为 0。
+- **`worker_id`**：这个程序在世的 worker 之间唯一的编号，起进程时取最小的空闲号，进程一生不变（hello 只发一次）；spawn 模式恒为 0。
+  进行中的流独占的 worker 不计入 `pool_max`（§10.6），所以编号可以到 `pool_max` 或更大；流结束回到池里的 worker 保留原来的编号，
+  池子满没满按进程数算，不按编号（2026-11-19 改：原来写「0 到 pool_max 之间」，与流的 worker 不计入池子矛盾）。
 - **`request_body`**（format 回）：按阶段声明要多少请求体，取 `none`、`digest` 或 `full`（用户追加 2026-10-12）。
   - 只对带请求体的阶段有意义：request、retry、decide、notify；其余阶段的键被忽略。
   - 省略时 request 与 retry 为 `full`，decide 与 notify 为 `none`；notify 只能取 `none` 或 `digest`。
@@ -1578,7 +1580,9 @@ aproxy desktop                  W5
 
 - **范围**：只处理判定为成功、要交给客户端的响应。放弃之后透传的错误不经过它（X-3）；要按客户端协议改写错误，用 decide 的 `stop` 附带 `response`。
 - **forward 请求**：响应要先在这一层攒齐再交给它，这一段失去真流式（§10.10）。
-- **失败**（进程级失败，或熔断已开）：换一个新 worker 重做一次，仍失败就跳过这一层（用户 09-23：响应侧失败就透传，并告警）。
+- **失败**：进程级失败时，熔断器仍放行的话换一个新 worker 重做一次，仍失败就跳过这一层（用户 09-23：响应侧失败就透传，并告警）。
+  熔断已开（或半开、试探已发出）时不起 worker、不写消息，直接跳过这一层（§10.9；2026-11-19 改：原来把熔断已开也列为要重做一次的失败，
+  与 §10.9 熔断期间不再发消息矛盾）。
 - **`fail`**：带 `response` 就用它，否则跳过这一层；`fail.retry` 在响应方向不适用。
 
 **stream 阶段**：逐块处理，只能由 `persistent` 程序声明。

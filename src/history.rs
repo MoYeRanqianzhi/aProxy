@@ -33,7 +33,7 @@ pub const TRIES_HEAD: usize = 3;
 pub const TRIES_TAIL: usize = 20;
 /// 一条记录序列化后的字节数上限
 pub const MAX_RECORD_BYTES: usize = 64 * 1024;
-/// 记录超出上限时，`path`、`user_agent`、`model` 各截到多少个字符
+/// 记录超出上限时，`method`、`path`、`user_agent`、`model` 各截到多少个字符
 pub const TRUNCATED_TEXT_CHARS: usize = 256;
 /// 读体时一块最多多少字节（原始字节，base64 之前）
 pub const MAX_BODY_READ: u64 = 1024 * 1024;
@@ -1509,8 +1509,8 @@ fn clipped(text: &str) -> &str {
 
 /// 一条记录的 JSON 文本（RequestRecord），不超过 [`MAX_RECORD_BYTES`]。
 ///
-/// 记录里大小不受控的只有客户端给的三个串——`path`、`user_agent`、`model`：尝试的条数、
-/// 每条的字段都有上限。超出时把这三个串截到 [`TRUNCATED_TEXT_CHARS`] 个字符，并带上
+/// 记录里大小不受控的只有客户端给的四个串——`method`、`path`、`user_agent`、`model`：尝试的条数、
+/// 每条的字段都有上限。超出时把这四个串截到 [`TRUNCATED_TEXT_CHARS`] 个字符，并带上
 /// `"truncated": true`。
 ///
 /// 直接从记录写成文本，不先搭一棵 JSON 树：有订阅者时每个请求至少要写两次。
@@ -1524,7 +1524,7 @@ fn record_json(record: &Record, inner: &RecordInner) -> String {
             request_seq: record.seq,
             started_at: inner.started_at,
             ended_at: inner.ended_at,
-            method: &inner.method,
+            method: clip(&inner.method, truncated),
             path: clip(&inner.path, truncated),
             model: inner.model.as_deref().map(|text| clip(text, truncated)),
             stream: inner.stream,
@@ -2100,6 +2100,52 @@ mod tests {
         begin(&history, 8);
         let list: Value = serde_json::from_str(&history.list_json(None, 1).unwrap()).unwrap();
         assert!(list["requests"][0].get("truncated").is_none());
+    }
+
+    /// 扩展方法和头值没有单字段长度限制，分别取 HTTP/1 读缓冲的上界；路径取 URI
+    /// 解析器的上界，模型取默认请求体能容纳的最大 JSON 字符串。它们共享报头预算，故
+    /// 在记录层组合各自的极值，比从单条连接构造边界更严格，不会改变真实 HTTP 请求。
+    #[test]
+    fn a_record_with_an_oversized_method_fits_the_limit() {
+        const HEAD_LIMIT: usize = 8192 + 4096 * 100;
+        const URI_LIMIT: usize = u16::MAX as usize - 1;
+        let history = history(0, &[]);
+        let method = http::Method::from_bytes(&vec![b'X'; HEAD_LIMIT]).unwrap();
+        let uri = format!("/{}", "p".repeat(URI_LIMIT - 1))
+            .parse::<http::Uri>()
+            .unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::USER_AGENT,
+            http::HeaderValue::from_bytes(&vec![b'a'; HEAD_LIMIT]).unwrap(),
+        );
+        let recorder = history.begin(
+            1,
+            id(1).into(),
+            Start {
+                method: method.as_str(),
+                path_and_query: uri.path(),
+                headers: &headers,
+                delivery: "retry",
+                phase: Phase::ReadingBody,
+            },
+        );
+        let max_model = crate::config::body_limit_bytes(None) - br#"{"model":""}"#.len();
+        recorder.request_shape(Some("m".repeat(max_model)), false);
+        let list: Value = serde_json::from_str(&history.list_json(None, 1).unwrap()).unwrap();
+        let record = &list["requests"][0];
+        assert!(serde_json::to_vec(record).unwrap().len() <= MAX_RECORD_BYTES);
+        assert_eq!(record["truncated"], true);
+        assert_eq!(record["reports"], json!([]));
+        assert_eq!(record["tries"], json!([]));
+        for key in ["method", "path", "user_agent", "model"] {
+            assert_eq!(
+                record[key].as_str().unwrap().chars().count(),
+                TRUNCATED_TEXT_CHARS,
+                "{key}"
+            );
+        }
+        assert_eq!(method.as_str().len(), HEAD_LIMIT);
     }
 
     /// 记录最多 1000 条，先进先出；在途的不淘汰。

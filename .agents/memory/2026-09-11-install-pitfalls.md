@@ -5,7 +5,7 @@ metadata:
   type: project
   scope: install 滚动重启、守护与看护者的退出路径、库层集成测试
   status: active
-  last_verified: 2026-11-12
+  last_verified: 2026-11-19
 ---
 
 # 2026-09-11 install 实测深坑集（滚动重启轮）
@@ -39,6 +39,21 @@ metadata:
 
 **Evidence:** 2026-09-11 滚动重启实测轮（四个测试驱动）；第 2 条的原语与说明在 `src/process.rs` 的 `process_exited`。
 **Recheck when:** 退出路径不再硬退、分离拉起改为显式传环境，或测试改用别的端口分配方式。
+
+### A responsive instance is not necessarily restartable
+
+**Why:** Status can discover a port from its desired-state record, get a valid IPC reply, and omit the process
+from its list of other ledger entries even if the instance record on disk is unreadable. The rolling snapshot
+cannot use that reply in place of the missing record. An empty `status.processes` is not proof of a safe swap.
+
+**How to apply:** Before an ordinary install can change binaries, compare each live instance ledger identity
+(pid and start mark) with the readable instance record for its port. Keep this disk-compatibility check separate
+from the IPC liveness check.
+
+**Evidence:** `install_plan_requires_a_readable_instance_record_not_only_an_ipc_reply` gives a running instance
+an unreadable record; install refuses before creating state, and the original instance still answers.
+**Recheck when:** The rolling snapshot no longer depends on instance records, or enumeration changes how it groups
+ledger entries and IPC replies.
 
 关联：[[never-kill-aproxy-by-name]]（本轮测试泄漏 33 个进程曾致系统
 内存不足，全部按 pid 精确清理，生产实例分毫不碰）

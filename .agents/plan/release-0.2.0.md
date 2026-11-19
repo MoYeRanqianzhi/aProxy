@@ -1018,8 +1018,22 @@
     仍是 warning。验证（Windows、headless）：aproxy-ipc 30、code_table 1、`--lib doctor` 9、`--lib settings` 39、
     `--lib find` 3、json_docs 9、exit_codes 的 doctor 1、access_control 2。§9.4 的文档与 §9.5 的退出码不变。
     forward 与 format 同用的告警要等 B10d 放开这个组合；面向用户的文档归 B9-8。
-  - [ ] B9-6 install：`--check`、`--json`（NDJSON）、预检（`install_precheck_failed`、`install_unmanaged_instances`）、
+  - [x] B9-6 install：`--check`、`--json`（NDJSON）、预检（`install_precheck_failed`、`install_unmanaged_instances`）、
     A5 的四个字段、`halted` 时不拉起续作、与 `--force` 冲突的旗标进 force_contract 的命令行样本。
+    Ordinary installs refuse unmanaged or foreground instances before taking the lock and again before broadcasting.
+    The target resolves desired configurations before stopping anything. A port stopped during the install is skipped;
+    a crashed port with desired state is still restarted. Failures retain the phase, installer version, code and details.
+    Only mutating CLI commands trigger recovery, and none resume a halted failure. `--check` queries without installing;
+    `--json` reports the plan, phases, download progress, per-port outcomes and result across handover.
+    Verified on Windows: `cargo fmt --all`, headless workspace Clippy (`--all-targets`, `-D warnings`),
+    `cargo test -p aproxy-ipc --locked` (30), and `cargo test --no-default-features --locked` with `--lib install` (60)
+    or `--test` targeting code_table (1), install_cli (13), install_flow (13), install_flow_lib (16),
+    force_contract (18 passed, one subprocess helper ignored), cli_tree (10), exit_codes (22), json_docs (9).
+    Force flag conflicts are tested in cli_tree rather than changing frozen C7 assertions. Before a target is known,
+    the result version is null. Older successors without event history can only report phases seen while polling.
+    The precheck uses two error-level diagnostic codes: the existing record code is not a diagnostic, and the
+    existing unreadable-config warning describes a different case. The real alpha.1 `stop all` scenario still needs
+    the historical binary; user documentation belongs to B9-8.
   - [x] B9-7 输出纪律（§9.6）：CLI 的 tracing 写 stderr、默认 WARN；遍历命令树的帮助测试；`RUST_LOG=info` 时 stdout
     没有日志行。
     6c254f2（Codex t04）。CLI 的 tracing 写 stderr（`init_cli_logging`），默认 WARN，`RUST_LOG` 可调；stderr 被捕获时

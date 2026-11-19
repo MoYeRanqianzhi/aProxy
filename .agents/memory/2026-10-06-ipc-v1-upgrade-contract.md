@@ -5,7 +5,7 @@ metadata:
   type: project
   scope: src/daemon.rs、src/install/、src/watchdog.rs 的 claim、src/cli.rs 的隐藏参数
   status: active
-  last_verified: 2026-10-06
+  last_verified: 2026-11-19
 ---
 
 原地升级时新旧两个版本的代码同时在跑：旧安装器、旧 CLI、旧看护者读新版本写下的文件、联系新守护，
@@ -45,5 +45,22 @@ CHANGELOG 写明升级下限（先装到 0.1.x 的某个版本）。2026-10-11 �
 覆盖；变异验证：去掉 Windows 交换后的那一跳，快路径测试因 staging 删不掉而失败。
 
 **Recheck when:** 规划 0.2.0（删兼容模块、写升级下限）；改动上述任一产物；upgrade-from-0-1-0 任务变红。
+
+### Observing a handover from `install --json`
+
+**Why:** `cleaning` is not success: the successor can still fail to take the lock or write its state. Conversely,
+when it succeeds it can write `done` and remove the canonical state between two polls. File disappearance alone
+cannot tell the waiting CLI which phases or per-port outcomes to publish.
+
+**How to apply:** Keep progress and the terminal result distinct. For a JSON waiter, the successor records the
+first timestamp of each phase and atomically renames the completed state for that specific waiter to consume.
+The waiter checks for that result again after seeing the canonical path disappear; the rename can race its first
+read. Older successors need not know these fields. Report only phases actually observed from them and never infer
+outcomes from a port appearing in the plan.
+
+**Evidence:** `handover_reports_a_failure_after_cleaning` checks the successor's exit code and the fallback for
+an older failure record. `install_json_reports_plan_phases_instances_and_result` checks every phase in order,
+the final instance outcome and the new serving process after a handover.
+**Recheck when:** The terminal-state cleanup, waiter polling or cross-version state format changes.
 
 相关：[[install-pitfalls]]、[[ci-unix-blindspot]]、[[identity-no-name]]

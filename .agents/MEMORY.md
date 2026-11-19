@@ -18,7 +18,7 @@
 - [criticism-not-authorization](memory/2026-09-10-criticism-not-authorization.md) — 教训：用户批评 ≠ 实施授权，先对齐修正方案再动手；平台共享语义重构不塞进单平台修复分支；方向稿 stash 留档规范 [[identity-no-name]]
 - [trusted-publishing-p0](memory/2026-09-11-trusted-publishing-p0.md) — 渠道 P0 落地：npm(@meowo 10 包)/crates.io/binstall 全自动 OIDC 发布（tag 即发）；关键坑：npm GAT IP 白名单杀 CI token 路径、npm TP 绑定强制人类 2FA 而 crates.io 有 API、cargo include 前导 / 锚定；2026-10-11 headless 10 个 npm 包种子发布，npm trust 只能所有者 2FA（GAT 403）；crates.io 新包种子发布：aproxy-desktop #25198（10-13）、aproxy-ipc #33128（11-11） [[daemon-model]]
 - [安全铁则：绝不按名杀 aproxy.exe](memory/2026-09-11-never-kill-aproxy-by-name.md) — 2026-09-11 实际事故：记忆 pid 过期+会话经 aproxy 代理，批量杀=断用户会话；测试守护只走 APROXY_HOME+stop <端口>
-- [install 实测深坑集](memory/2026-09-11-install-pitfalls.md) — tokio runtime drop 等无限任务须硬退/IPC 消失≠进程终止（退出码判死）/spawn_detached 只继承父 env（库层测试须 set_var）/测试端口 bind 试探+两段等待
+- [install 实测深坑集](memory/2026-09-11-install-pitfalls.md) — tokio runtime drop 等无限任务须硬退/IPC 消失≠进程终止（退出码判死）/spawn_detached 只继承父 env（库层测试须 set_var）/测试端口 bind 试探+两段等待; a valid IPC reply does not make an instance restartable
 - [CI unix 编译盲区](memory/2026-09-11-ci-unix-blindspot.md) — 918ea33 的 unix job 红着没人看就报了收尾；push 后必须 gh run list 确认 CI 绿；unix-only 改动本地无法编译验证时交 WSL/CI 裁决；现行 windows/ubuntu 为门禁、macos 已知红；2026-10-06 复发四坑（平台门控调用方致 unix 死代码、启动顺序致 run 目录未建、errno 假设、unix 测试里 Child 未 wait 触发 zombie_processes），改 unix 路径后先等 ubuntu 结论再叠加；2026-10-12 起推送前可在本机用 clang + 三个 C 头文件桩交叉 check/clippy Linux 目标
 - [install 在线深度实测](memory/2026-09-12-install-online-deep-test.md) — WSL 3 轮 16 场景全 PASS；挖出在线主路径状态机缺口/skill 下载目录自毁/产物缺 755/版本回写缺失；musl 回退 + npm latest 兜底；测试 tag 发布全坑集
 - [release 版本对齐](memory/2026-09-12-release-version-alignment.md) — build+publish 双 job 对齐 tag 版本（python 显式 utf-8 + \r?\n + --allow-dirty）；alpha.10/11 被 t 标签抢注正式版顺延 alpha.12；测试 tag 一次性（失败必须 bump tN）；tN 被选版排除但仍会把 npm next 移到测试构建，演练建议改用 rc.N
@@ -38,6 +38,6 @@
 - [agent 客户端流超时调研](memory/2026-10-04-agent-client-timeouts-survey.md) — 判断法（字节级续得住、事件级续不住）+ Qwen Code / dsh / pi / OpenCode / Aider / Cline / Roo / Kimi 的源码依据与核实程度 [[codex-stream-idle-timeout]] [[gemini-cli-sse-parsing]]
 - [0.2.0 定调](memory/2026-10-11-0.2.0-direction.md) — 用户 2026-10-11：去掉全部兼容（含 0.1.0 原地升级）、前瞻稳定优先、给人看的 i18n 给 agent 的固定英文、注释文档仍中文、Tauri 编进本体默认启用（另出无 UI 版）、Mica 默认关、新增 aproxy skill 命令 [[ipc-v1-upgrade-contract]]
 - [桌面界面风格](memory/2026-10-11-ui-design-style.md) — 用户要求：新颖、略高对比、鲜艳不刺眼、柔和圆润可爱、有动效；先浏览器原型审风格，通过后再接入与做日志性能 [[0.2.0-direction]]
-- [IPC v1 与升级契约](memory/2026-10-06-ipc-v1-upgrade-contract.md) — 跨版本永久接口清单（.pid/.restore/claim/install.state 词表/socket 路径/CLI 含 --handover-from）、早交接由目标版本驱动；0.1.x 兼容层已于 W1 删除，0.1.0 的安装器在交换前失败 [[install-pitfalls]] [[ci-unix-blindspot]]
+- [IPC v1 与升级契约](memory/2026-10-06-ipc-v1-upgrade-contract.md) — 跨版本永久接口清单（.pid/.restore/claim/install.state 词表/socket 路径/CLI 含 --handover-from）、早交接由目标版本驱动；0.1.x 兼容层已于 W1 删除，0.1.0 的安装器在交换前失败 [[install-pitfalls]] [[ci-unix-blindspot]]; why the JSON waiter needs the terminal state after cleanup
 - [0.2.0 的配置与设置形状](memory/2026-11-17-config-settings-shape.md) — config.toml、settings.json 的新键、严格解析、分层与写回在哪实现；旧记忆里的 0.1.x 键名按它换；运行时字段名没改；凭据随目标继承 [[config-settings-shape-0-2-0]]
 - [请求历史](memory/2026-11-19-request-history.md) — 体为什么拷贝而不零拷贝、量出来的四处开销（1 MiB 缓冲的释放、多开一次文件、锁里释放、事件逐个写）、几个百分点的差别怎么量 [[request-history]]

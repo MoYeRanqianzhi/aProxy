@@ -1290,7 +1290,7 @@ async fn serve_endpoint(endpoint: String, state: Arc<ControlState>) -> io::Resul
 pub struct IpcStats {
     /// 池的生命期由实例持有；IPC 仅读取快照，不延长进程生命期。
     pub(crate) formats: Vec<std::sync::Weak<crate::transform::Pool>>,
-    /// 实例阶段和程序熔断变化都复用控制通道的 state 事件。
+    /// 实例阶段变动唤醒状态读者；熔断变化另有带快照的有界队列。
     pub state_changed: Arc<tokio::sync::Notify>,
     /// 控制端点已上线，但格式程序尚未全部协商，或启动记录尚未落盘。
     pub starting: std::sync::atomic::AtomicBool,
@@ -2422,11 +2422,9 @@ where
         .reply();
         return write_line(&mut writer, &reply).await;
     };
-    let snapshot_json = |state: &ControlState| {
-        serde_json::to_string(&status_snapshot(state)).expect("序列化状态快照失败")
-    };
+    let mut view = SubscriberStatus::new(&state);
     // 最近一次发给这个订阅者的快照：之后只在它变了的时候再发
-    let mut sent_snapshot = snapshot_json(&state);
+    let mut sent_snapshot = view.json();
     let first = ok_reply(&format!(
         r#"{{"snapshot":{sent_snapshot},"requests":{}}}"#,
         subscription.in_flight
@@ -2451,10 +2449,16 @@ where
                     at = Some(happened);
                     ("request", record.to_string(), false)
                 }
+                Ok(Event::Format { at: happened, index, revision, snapshot }) => {
+                    if !view.apply(index, revision, &snapshot) { continue; }
+                    at = Some(happened);
+                    ("state", view.json(), false)
+                }
                 Ok(Event::Closing(reason)) => {
                     ("closing", format!(r#"{{"reason":"{reason}"}}"#), true)
                 }
                 Err(RecvError::Lagged(dropped)) => {
+                    view.refresh(&state, true);
                     ("lagged", format!(r#"{{"dropped":{dropped}}}"#), false)
                 }
                 Err(RecvError::Closed) => return Ok(()),
@@ -2481,10 +2485,16 @@ where
             },
         };
         let data = if event == "state" {
-            let now = snapshot_json(&state);
-            if now == sent_snapshot {
-                continue;
-            }
+            let now = if data.is_empty() {
+                view.refresh(&state, false);
+                let now = view.json();
+                if now == sent_snapshot {
+                    continue;
+                }
+                now
+            } else {
+                data
+            };
             sent_snapshot.clone_from(&now);
             now
         } else {
@@ -2492,7 +2502,7 @@ where
         };
         batch.clear();
         if last {
-            push_state_if_changed(&mut batch, &mut seq, &state, &mut sent_snapshot);
+            push_state_if_changed(&mut batch, &mut seq, &state, &mut view, &mut sent_snapshot);
         }
         push_event(&mut batch, &mut seq, event, at, &data);
         // 队列里已经排着的事件一并带上，一次写出去。实例忙的时候，每写一次都要等运行时再排到
@@ -2503,13 +2513,31 @@ where
                 Ok(Event::Request { at, record }) => {
                     push_event(&mut batch, &mut seq, "request", Some(at), &record);
                 }
+                Ok(Event::Format {
+                    at,
+                    index,
+                    revision,
+                    snapshot,
+                }) => {
+                    if view.apply(index, revision, &snapshot) {
+                        sent_snapshot = view.json();
+                        push_event(&mut batch, &mut seq, "state", Some(at), &sent_snapshot);
+                    }
+                }
                 Ok(Event::Closing(reason)) => {
-                    push_state_if_changed(&mut batch, &mut seq, &state, &mut sent_snapshot);
+                    push_state_if_changed(
+                        &mut batch,
+                        &mut seq,
+                        &state,
+                        &mut view,
+                        &mut sent_snapshot,
+                    );
                     let data = format!(r#"{{"reason":"{reason}"}}"#);
                     push_event(&mut batch, &mut seq, "closing", None, &data);
                     last = true;
                 }
                 Err(TryRecvError::Lagged(dropped)) => {
+                    view.refresh(&state, true);
                     let data = format!(r#"{{"dropped":{dropped}}}"#);
                     push_event(&mut batch, &mut seq, "lagged", None, &data);
                 }
@@ -2532,6 +2560,65 @@ where
     }
 }
 
+/// 订阅者看过的每个池的修订号。定时刷新可带上同一代的失败次数，但不能抢发队列里
+/// 尚未交付的状态；否则短暂的 half_open 会被它之后的 closed 越过。
+struct SubscriberStatus {
+    /// 配置位置、进程池和订阅者已收到的状态修订号，位置不受脱敏后名字重复的影响。
+    pools: Vec<(usize, std::sync::Weak<crate::transform::Pool>, u64)>,
+    /// 最近一次取样的活动与实例状态，以及到当前事件为止的各池状态。
+    snapshot: InstanceStatus,
+}
+impl SubscriberStatus {
+    /// 先订阅再取基线；比基线早的队列项在 apply 中忽略。
+    fn new(state: &ControlState) -> Self {
+        let (pools, formats) = state
+            .stats
+            .formats
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pool)| {
+                let pool = pool.upgrade()?;
+                let (revision, format) = pool.snapshot();
+                Some(((index, Arc::downgrade(&pool), revision), format))
+            })
+            .unzip();
+        Self {
+            pools,
+            snapshot: status_with_formats(state, formats),
+        }
+    }
+    /// 队列提供当前变化自己的快照，不再向活池查询此刻可能已经不同的状态。
+    fn apply(&mut self, index: usize, revision: u64, value: &serde_json::Value) -> bool {
+        for ((id, _, seen), slot) in self.pools.iter_mut().zip(&mut self.snapshot.formats) {
+            if *id == index && revision > *seen {
+                *seen = revision;
+                slot.clone_from(value);
+                return true;
+            }
+        }
+        false
+    }
+    /// 队列溢出时按 lagged 契约重新建立基线；日常采样不能跳过事件。
+    fn refresh(&mut self, state: &ControlState, resync: bool) {
+        let mut formats = std::mem::take(&mut self.snapshot.formats);
+        for ((_, pool, seen), slot) in self.pools.iter_mut().zip(&mut formats) {
+            let Some(pool) = pool.upgrade() else {
+                continue;
+            };
+            let (revision, current) = pool.snapshot();
+            if revision == *seen || resync {
+                *seen = revision;
+                *slot = current;
+            }
+        }
+        self.snapshot = status_with_formats(state, formats);
+    }
+    /// 初始应答和每一条 state 都使用 ping 的既有形状。
+    fn json(&self) -> String {
+        serde_json::to_string(&self.snapshot).expect("序列化状态快照失败")
+    }
+}
+
 /// `closing` 之前调用：快照与上一次发给这个订阅者的不一样时，先补一个 `state` 事件。
 ///
 /// 实例是先改状态（`stopping`、更换阶段）、再宣布关闭的，但两件事可能在这个任务被排到之前
@@ -2541,9 +2628,11 @@ fn push_state_if_changed(
     batch: &mut String,
     seq: &mut u64,
     state: &ControlState,
+    view: &mut SubscriberStatus,
     sent_snapshot: &mut String,
 ) {
-    let now = serde_json::to_string(&status_snapshot(state)).expect("序列化状态快照失败");
+    view.refresh(state, false);
+    let now = view.json();
     if now != *sent_snapshot {
         push_event(batch, seq, "state", None, &now);
         *sent_snapshot = now;
@@ -2598,6 +2687,17 @@ fn parse_request(line: &str) -> Result<Parsed, Rejection> {
 
 /// 组装此刻的状态快照（计数器、最近错误在应答瞬间现读）。
 fn status_snapshot(state: &ControlState) -> InstanceStatus {
+    let formats = state
+        .stats
+        .formats
+        .iter()
+        .filter_map(|p| p.upgrade().map(|p| p.snapshot().1))
+        .collect();
+    status_with_formats(state, formats)
+}
+
+/// 非 format 状态保持原有采样频率，熔断事件只替换它自己那一项。
+fn status_with_formats(state: &ControlState, formats: Vec<serde_json::Value>) -> InstanceStatus {
     use std::sync::atomic::Ordering::Relaxed;
     let stats = &state.stats;
     let phase = if *state.on_shutdown.borrow() {
@@ -2614,11 +2714,7 @@ fn status_snapshot(state: &ControlState) -> InstanceStatus {
         state: phase,
         behavior: state.behavior.clone(),
         activity: stats.activity(state.record.started_at),
-        formats: stats
-            .formats
-            .iter()
-            .filter_map(|p| p.upgrade().map(|p| p.snapshot()))
-            .collect(),
+        formats,
         ops: IpcOp::NAMES.iter().map(|name| name.to_string()).collect(),
         features: IpcOp::FEATURES
             .iter()
@@ -3865,6 +3961,61 @@ mod tests {
             assert_eq!(closing["seq"], 2);
             handler.await.unwrap().unwrap();
         }
+    }
+
+    /// 一次试探可以在订阅任务再次获得调度前开始又取消；两次状态变化都要出现在 IPC 上。
+    #[tokio::test]
+    async fn subscription_preserves_breaker_transitions_between_reads() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut control, _rx) = control(sample_info("0"));
+        let state = Arc::get_mut(&mut control).unwrap();
+        let (cfg, diagnostics) = crate::config::file::parse(
+            "[[format]]\ncommand='example'\nprocess='persistent'\nstages=['request']\npool_max=1\nbreaker_cooldown_secs=1",
+            &dir.path().join("config.toml"),
+        );
+        assert!(diagnostics.is_empty());
+        let mut entry = cfg.format.unwrap().pop().unwrap();
+        entry.command = crate::transform::format_echo_path().display().to_string();
+        let pool = crate::transform::Pool::new(
+            entry,
+            dir.path().into(),
+            Default::default(),
+            Some((0, Arc::downgrade(&state.history))),
+            [1024; 2],
+        );
+        Arc::get_mut(&mut state.stats).unwrap().formats = vec![Arc::downgrade(&pool)];
+        let held = pool.turn(false).await.unwrap();
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let handler = tokio::spawn(handle_conn(server, control));
+        client
+            .write_all(b"{\"v\":1,\"op\":\"subscribe\"}\n")
+            .await
+            .unwrap();
+        let mut lines = tokio::io::BufReader::new(client);
+        let first = next_event(&mut lines).await;
+        assert_eq!(
+            first["result"]["snapshot"]["formats"][0]["breaker"]["state"],
+            "closed"
+        );
+        pool.open_at_startup(crate::transform::Fault::Spawn);
+        assert_eq!(
+            next_event(&mut lines).await["data"]["formats"][0]["breaker"]["state"],
+            "open"
+        );
+        tokio::time::sleep(Duration::from_millis(1050)).await;
+        let mut probe = Box::pin(pool.turn(false));
+        assert!(futures_util::poll!(&mut probe).is_pending());
+        drop(probe);
+        for expected in ["half_open", "open"] {
+            let event = next_event(&mut lines).await;
+            assert_eq!(event["event"], "state");
+            assert_eq!(event["data"]["formats"][0]["breaker"]["state"], expected);
+        }
+        drop(lines);
+        handler.await.unwrap().unwrap();
+        drop(held);
+        pool.shutdown().await;
     }
 
     /// 流式连接最多 8 条，第 9 条回 `busy`；客户端关了连接，名额就还回来。

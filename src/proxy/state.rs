@@ -163,12 +163,13 @@ impl AppState {
         let formats: Arc<[Arc<crate::transform::Pool>]> = config
             .formats
             .iter()
-            .map(|entry| {
+            .enumerate()
+            .map(|(index, entry)| {
                 crate::transform::Pool::new(
                     entry.clone(),
                     aproxy_ipc::home::home(),
                     history.secrets().clone(),
-                    stats.state_changed.clone(),
+                    Some((index, Arc::downgrade(&history))),
                     [config.body_limit_bytes(), spool_limit_bytes(&config)],
                 )
             })

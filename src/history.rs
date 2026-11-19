@@ -866,6 +866,13 @@ pub enum Event {
     /// 记录成为这个样子的时刻（Unix 毫秒）。限频按这个时刻算，所以同一条记录相邻两个中间
     /// 事件的 `at` 至少相隔一秒——事件什么时候真的写到订阅者的连接上，前后还差着排队的时间
     Request { at: u64, record: Arc<str> },
+    /// 进程池状态变动时的完整脱敏条目，与记录共用有界队列和 lagged 语义。
+    Format {
+        at: u64,
+        index: usize,
+        revision: u64,
+        snapshot: Arc<Value>,
+    },
     /// 实例要退出了。`reason` 取 `shutdown` 或 `swap`
     Closing(&'static str),
 }
@@ -1198,6 +1205,23 @@ impl History {
     /// 此刻有多少个订阅者。
     pub fn subscribers(&self) -> usize {
         self.subscribers.load(Ordering::Acquire)
+    }
+
+    /// 没有实时读者就不序列化。新读者从订阅后的初始快照和它的修订号接着读。
+    pub(crate) fn format_transition(
+        &self,
+        index: usize,
+        revision: u64,
+        snapshot: impl FnOnce() -> Value,
+    ) {
+        if self.events.receiver_count() != 0 {
+            let _ = self.events.send(Event::Format {
+                at: crate::daemon::now_millis(),
+                index,
+                revision,
+                snapshot: Arc::new(snapshot()),
+            });
+        }
     }
 
     /// 告诉订阅者实例要退出了。

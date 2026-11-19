@@ -372,6 +372,8 @@ impl Worker {
 /// 每次打开都推进代数，已写出的旧请求只能结束自己的往返，不能让熔断器越过冷却。
 #[derive(Default)]
 struct Circuit {
+    /// 每次状态变化单独编号；订阅的初始快照可能已包含队列中的前几项。
+    revision: u64,
     /// 当前冷却代；活跃消息在派发时记下它。
     epoch: u64,
     /// 进程级连续失败次数，合法 fail 回信也清零。
@@ -407,7 +409,7 @@ impl Drop for Admission<'_> {
             let mut c = self.pool.circuit.lock().unwrap();
             if c.epoch == self.epoch && c.probing {
                 c.probing = false;
-                self.pool.notify.notify_waiters();
+                self.pool.transition(&mut c);
             }
         }
     }
@@ -442,8 +444,8 @@ pub(crate) struct Pool {
     retiring: Mutex<tokio::task::JoinSet<()>>,
     /// 熔断状态的写锁只覆盖进程消息的接纳与完成，不跨管道操作。
     circuit: Mutex<Circuit>,
-    /// IPC 订阅者在阶段变动时重读快照。
-    notify: Arc<tokio::sync::Notify>,
+    /// 上报状态的配置序号和有界事件队列；不用脱敏后的名字作为身份。
+    events: Option<(usize, std::sync::Weak<crate::history::History>)>,
     /// 关闭时唤醒等候池位的消息；旧队列不得成为下一轮冷却后的试探。
     changed: tokio::sync::watch::Sender<u64>,
     /// 最近一次成功握手的身份与能力，握手失败时不杜撰版本。
@@ -462,7 +464,7 @@ impl Pool {
         entry: FormatEntry,
         home: PathBuf,
         secrets: Secrets,
-        notify: Arc<tokio::sync::Notify>,
+        events: Option<(usize, std::sync::Weak<crate::history::History>)>,
         body_limits: [usize; 2],
     ) -> Arc<Self> {
         let n = if entry.process == Process::Spawn {
@@ -484,16 +486,29 @@ impl Pool {
             reaper: OnceLock::new(),
             startup: Default::default(),
             retiring: Default::default(),
-            notify,
+            events,
             negotiated: Mutex::new(None),
             circuit: Default::default(),
             changed: tokio::sync::watch::channel(0).0,
         })
     }
     /// 快照不曝光命令行、环境、回信中的任意文本；版本与配置名也替换已知凭据。
-    pub(crate) fn snapshot(&self) -> serde_json::Value {
-        use serde_json::json;
+    pub(crate) fn snapshot(&self) -> (u64, serde_json::Value) {
         let c = self.circuit.lock().unwrap();
+        (c.revision, self.circuit_snapshot(&c))
+    }
+    /// 在修改者仍持有熔断锁时取值；发到队列不等待 IPC 写出，也不锁其他进程池。
+    fn transition(&self, c: &mut Circuit) {
+        c.revision += 1;
+        if let Some((index, history)) = &self.events
+            && let Some(history) = history.upgrade()
+        {
+            history.format_transition(*index, c.revision, || self.circuit_snapshot(c));
+        }
+    }
+    /// 读者和状态事件共用同一份字段选择和脱敏逻辑。
+    fn circuit_snapshot(&self, c: &Circuit) -> serde_json::Value {
+        use serde_json::json;
         let mut breaker = json!({"state":if c.probing{"half_open"}else if c.window.is_some(){"open"}else{"closed"},"failures":c.failures});
         if let Some((opened, probe)) = c.window {
             breaker["opened_at"] = json!(opened);
@@ -520,7 +535,7 @@ impl Pool {
         c.probing = false;
         self.idle.lock().unwrap().clear();
         self.changed.send_replace(c.epoch);
-        self.notify.notify_waiters();
+        self.transition(c);
         tracing::warn!(format=%self.secrets.replace(&self.entry.name),failures=c.failures,cooldown_secs=self.entry.breaker_cooldown_secs,kind=c.last.as_ref().map(|(f,_)|f.kind()),"format circuit opened");
     }
     /// 可选程序启动时暂不可用，与静态不匹配不同；冷却后允许一次真正的数据往返。
@@ -539,7 +554,7 @@ impl Pool {
                 return Err(c.refusal());
             }
             c.probing = true;
-            self.notify.notify_waiters();
+            self.transition(&mut c);
             tracing::info!(format=%self.secrets.replace(&self.entry.name),"format circuit half-open");
             true
         } else {
@@ -571,7 +586,7 @@ impl Pool {
             if current_probe {
                 c.window = None;
                 c.probing = false;
-                self.notify.notify_waiters();
+                self.transition(&mut c);
                 tracing::info!(format=%self.secrets.replace(&self.entry.name),"format circuit closed");
             }
         }

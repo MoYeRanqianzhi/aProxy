@@ -655,6 +655,14 @@ async fn breaker_closes_after_a_successful_probe() {
         &["bad-until-file", stamp.to_str().unwrap()],
     ) + "breaker_failures=1\nbreaker_cooldown_secs=1\n";
     let (c, url) = running(&home, up, &cfg);
+    let (snapshot, mut events) =
+        aproxy::daemon::ipc_subscribe_in(&home.path().join("run"), url.rsplit(':').next().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(
+        snapshot["snapshot"]["formats"][0]["breaker"]["state"],
+        "closed"
+    );
     assert_eq!(c.post(&url).send().await.unwrap().status(), 503);
     assert_eq!(breaker(&home, &url).await["state"], "open");
     std::fs::write(stamp, b"ok").unwrap();
@@ -673,6 +681,28 @@ async fn breaker_closes_after_a_successful_probe() {
     assert_eq!(b["state"], "closed");
     assert_eq!(b["failures"], 0);
     assert!(b.get("opened_at").is_none());
+    // 此时三个转变都已发生；读事件流而不是从随后的一次 ping 推测中间状态。
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut last = String::from("closed");
+        for expected in ["open", "half_open", "closed"] {
+            loop {
+                let event = events.next().await.unwrap().unwrap();
+                assert_ne!(event["event"], "lagged");
+                if event["event"] == "state" {
+                    let state = event["data"]["formats"][0]["breaker"]["state"]
+                        .as_str()
+                        .unwrap();
+                    if state != last {
+                        assert_eq!(state, expected);
+                        last = state.to_owned();
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
 }
 
 /// 上游连续接收请求后断开六次，超过程序的阈值；第七次仍能在同一程序会话内成功。

@@ -192,7 +192,7 @@ if "%APROXY_NO_SKILLS%"=="1" goto :done
 echo Downloading skills aproxy-skills.zip ...
 powershell -NoProfile -Command "try { Invoke-WebRequest -Uri '%BASE%/aproxy-skills.zip' -OutFile '%TMP_DIR%\aproxy-skills.zip' -UserAgent '%UA%'; Invoke-WebRequest -Uri '%BASE%/aproxy-skills.zip.sha256' -OutFile '%TMP_DIR%\aproxy-skills.zip.sha256' -UserAgent '%UA%' } catch { exit 1 }"
 if errorlevel 1 (
-    echo Skill docs download failed - skipped ^(does not affect the install; retry later via aproxy install^)
+    echo Skill docs download failed - skipped ^(does not affect the install; retry later via aproxy install --skills-only^)
     goto :done
 )
 powershell -NoProfile -Command "try { $e = (Get-Content '%TMP_DIR%\aproxy-skills.zip.sha256' -Raw).Trim().Split(' ')[0].ToLower(); $ok = $false; try { $h = certutil -hashfile '%TMP_DIR%\aproxy-skills.zip' SHA256 | Select-String -Pattern '^[0-9a-f]+$'; if ($h -and $h.Matches[0].Value.ToLower() -eq $e) { $ok = $true } } catch {}; if (-not $ok) { exit 1 }; Expand-Archive '%TMP_DIR%\aproxy-skills.zip' '%SKILLS_DIR%' -Force; Write-Host ('Skill docs placed at ' + '%SKILLS_DIR%') } catch { exit 1 }"

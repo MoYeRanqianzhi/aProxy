@@ -194,7 +194,7 @@ function Install-AProxy {
                 Expand-Archive $zipTmp $SkillsDir -Force
                 Write-Host "skill 文档已就位 $SkillsDir（按所用 agent 的方式链接/复制到其 skills 目录）"
             } catch {
-                Write-Host "skill 文档下载失败（不影响安装，可稍后用 aproxy install 重试）: $_"
+                Write-Host "skill 文档下载失败（不影响安装，可稍后用 aproxy install --skills-only 重试）: $_"
             }
         }
     } finally {

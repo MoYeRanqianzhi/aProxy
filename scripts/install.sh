@@ -476,7 +476,7 @@ main() {
                 echo "skill 文档 SHA256 校验失败，跳过（不影响安装）"
             fi
         else
-            echo "skill 文档下载失败，跳过（不影响安装，可稍后用 aproxy install 重试）"
+            echo "skill 文档下载失败，跳过（不影响安装，可稍后用 aproxy install --skills-only 重试）"
         fi
     fi
 

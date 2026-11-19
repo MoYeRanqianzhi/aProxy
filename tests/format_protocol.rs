@@ -2046,18 +2046,39 @@ async fn response_program_encoding_replaces_only_the_upstream_encoding() {
         }
     });
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    for writes in [false, true] {
+    for (writes, outer) in [(false, false), (true, false), (true, true)] {
         let home = TestHome::new();
         let json = if writes {
             serde_json::json!({"response":{"headers":{"Content-Encoding":"gzip","content-length":"999"},"body_b64":base64::engine::general_purpose::STANDARD.encode(&raw)}})
         } else {
             serde_json::json!({})
         };
-        let cfg = layer(&home, "codec", "'response'", &["reply", &json.to_string()]);
+        let mut cfg = if outer {
+            layer(&home, "outer", "'response'", &["reply", "{}"])
+        } else {
+            String::new()
+        };
+        cfg += &layer(&home, "codec", "'response'", &["reply", &json.to_string()]);
         let (c, url) = running(&home, port, &cfg);
         let res = c.get(url).send().await.unwrap();
-        let expected = if writes { raw.as_slice() } else { b"decoded" };
-        assert_eq!(res.headers().get("content-encoding").is_some(), writes);
+        if outer {
+            let f = frames(&home, "outer");
+            assert_eq!(f[1]["response"]["body"], "decoded");
+            assert!(
+                f[1]["response"]["headers"]
+                    .get("content-encoding")
+                    .is_none()
+            );
+        }
+        let expected = if writes && !outer {
+            raw.as_slice()
+        } else {
+            b"decoded"
+        };
+        assert_eq!(
+            res.headers().get("content-encoding").is_some(),
+            writes && !outer
+        );
         assert_eq!(
             res.headers()["content-length"].to_str().unwrap(),
             expected.len().to_string()
@@ -2515,4 +2536,44 @@ fn stderr_rendered_utf8_observes_the_byte_limit() {
             assert!(!payload.contains('�'));
         }
     }
+}
+
+/// 本地无法解码不表示进程出错；下一次合法响应继续使用原握手的进程。
+#[tokio::test]
+async fn local_response_decode_failure_keeps_the_admitted_worker() {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, free_port()))
+        .await
+        .unwrap();
+    let up = listener.local_addr().unwrap().port();
+    let app = axum::Router::new()
+        .route(
+            "/broken",
+            axum::routing::get(|| async { ([("content-encoding", "gzip")], "invalid gzip") }),
+        )
+        .fallback(|| async { "ok" });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let home = TestHome::new();
+    let (c, url) = running(
+        &home,
+        up,
+        &layer(&home, "response", "'response'", &["reply", "{}"]),
+    );
+    assert_eq!(
+        c.get(format!("{url}/broken"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "invalid gzip"
+    );
+    assert_eq!(
+        c.get(&url).send().await.unwrap().text().await.unwrap(),
+        "ok"
+    );
+    let f = frames(&home, "response");
+    assert_eq!(f.len(), 2);
+    assert_eq!(f[0]["stage"], "hello");
+    assert_eq!(f[1]["stage"], "response");
 }

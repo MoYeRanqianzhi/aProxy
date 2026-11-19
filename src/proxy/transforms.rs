@@ -459,16 +459,6 @@ pub(super) async fn transform_response_if_configured(
         return (status, headers, body);
     }
     let ctx = req.ctx.as_ref().expect("format context");
-    let mut input = wire::Response::new(status.as_u16());
-    input.headers = transform::headers_to_btreemap(&headers);
-    let encoding = encoding_to_undo(&headers);
-    if encoding.is_some() {
-        input.headers.remove("content-encoding");
-    }
-    let mut decoded_spool = None;
-    let mut accepted = false;
-    let mut rewrite_body = false;
-    let mut rewrite_headers = false;
     for (layer, p) in state
         .formats
         .iter()
@@ -476,6 +466,17 @@ pub(super) async fn transform_response_if_configured(
         .rev()
         .filter(|(_, p)| p.entry.has_stage(Stage::Response))
     {
+        // 每个层界按当前头解释当前的体：上一层可以刚刚重新编码，而外层也可能完全跳过。
+        let raw_encoding = request_encoding(&headers, true);
+        let encoding = raw_encoding
+            .as_deref()
+            .map(|v| v.to_str().unwrap_or("unsupported"))
+            .filter(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .any(|e| !e.is_empty() && !e.eq_ignore_ascii_case("identity"))
+            });
+        let mut decoded_spool = None;
         let name = &p.entry.name;
         let mut fresh = false;
         let reply = loop {
@@ -489,24 +490,26 @@ pub(super) async fn transform_response_if_configured(
                             Ok(b) => b,
                             Err(e) => {
                                 tracing::warn!(error=%e,"could not read response spool; format skipped");
-                                break None;
+                                turn.unused().await;
+                                return (status, headers, body);
                             }
                         },
                     };
-                    if let Some(enc) = &encoding
-                        && !rewrite_body
+                    if let Some(enc) = encoding
                         && decoded_spool.is_none()
                     {
                         let mut decoded = Vec::new();
-                        if crate::decode::decode_strict(
-                            enc,
-                            raw.as_slice(),
-                            &mut decoded,
-                            spool_limit_bytes(&state.config) as u64,
-                        )
-                        .is_err()
+                        if !format_encoding_depth_allowed(enc)
+                            || crate::decode::decode_strict(
+                                enc,
+                                raw.as_slice(),
+                                &mut decoded,
+                                spool_limit_bytes(&state.config) as u64,
+                            )
+                            .is_err()
                         {
                             tracing::warn!("could not decode response body; format skipped");
+                            turn.unused().await;
                             return (status, headers, body);
                         }
                         raw = decoded;
@@ -514,7 +517,11 @@ pub(super) async fn transform_response_if_configured(
                             transform::spool_response_body(&raw, state.spool_dir.as_deref()).await,
                         );
                     }
-                    let mut current = input.clone();
+                    let mut current = wire::Response::new(status.as_u16());
+                    current.headers = transform::headers_to_btreemap(&headers);
+                    if decoded_spool.is_some() {
+                        current.headers.remove("content-encoding");
+                    }
                     current.body = wire::Body::from_bytes(raw);
                     let m = wire::ResponseMessage::new(
                         ctx.context(name),
@@ -542,49 +549,40 @@ pub(super) async fn transform_response_if_configured(
                 .format_report((layer, name), "response", None, report);
         }
         ctx.absorb(name, r.state);
-        accepted |= r.fail.as_ref().is_none_or(|f| f.response.is_some());
-        let replacement = if let Some(f) = r.fail {
-            if let Some(mut response) = f.response {
-                let bytes = std::mem::take(&mut response.body);
-                input = response;
-                headers = prepared_headers.expect("validated terminal headers");
-                rewrite_headers = true;
-                Some(bytes)
-            } else {
-                None
-            }
-        } else if let Some(mut patch) = r.response {
-            let bytes = std::mem::take(&mut patch.body);
-            if let Some(h) = prepared_headers {
-                headers = h;
-                rewrite_headers = true;
-            }
-            input.apply(patch);
-            (bytes != wire::Body::Absent).then_some(bytes)
+        let (code, replacement) = if let Some(f) = r.fail {
+            let Some(response) = f.response else {
+                continue;
+            };
+            (Some(response.status), Some(response.body))
+        } else if let Some(patch) = r.response {
+            (
+                patch.status,
+                (patch.body != wire::Body::Absent).then_some(patch.body),
+            )
         } else {
-            None
+            (None, None)
         };
+        if let Some(code) = code {
+            status = StatusCode::from_u16(code).expect("validated response status");
+        }
+        if decoded_spool.is_some() {
+            headers.remove(http::header::CONTENT_ENCODING);
+            headers.remove(http::header::CONTENT_LENGTH);
+        }
+        if let Some(h) = prepared_headers {
+            headers = h;
+            headers.remove(http::header::CONTENT_LENGTH);
+        }
         if let Some(bytes) = replacement {
             body = transform::spool_response_body(
                 bytes.as_bytes().unwrap_or_default(),
                 state.spool_dir.as_deref(),
             )
             .await;
-            decoded_spool = None;
-            rewrite_body = true;
+            headers.remove(http::header::CONTENT_LENGTH);
+        } else if let Some(decoded) = decoded_spool {
+            body = decoded;
         }
-    }
-    if let Ok(patched) = StatusCode::from_u16(input.status) {
-        status = patched;
-    }
-    if !rewrite_headers && accepted && encoding.is_some() {
-        headers.remove(http::header::CONTENT_ENCODING);
-    }
-    if accepted && let Some(decoded) = decoded_spool {
-        body = decoded;
-    }
-    if rewrite_body || rewrite_headers || (accepted && encoding.is_some()) {
-        headers.remove(http::header::CONTENT_LENGTH);
     }
     (status, headers, body)
 }

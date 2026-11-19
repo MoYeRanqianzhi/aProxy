@@ -485,7 +485,7 @@
   dependabot：#8、#9、#11–#15 由这两个提交覆盖；#10（base64 0.23）关闭——headless 构建里 base64 只有一份 0.22，
   envelope 单独升会多一份重复，等 reqwest、hyper-util 换版本时再看；#6（toml 1.x）、#7（sha2 0.11）归 P3。
 - 阶段 1，前置重构：P1 → P2 → P4 → P3 → P5（§14.1；内存所限不并行）。
-- 阶段 2，契约块：✓ B0 → ✓ B1 → ✓ B2 → ✓ B3 → ✓ B4 → ✓ **tag alpha.2**（2026-11-17）→ ✓ B5 → ✓ B6 → ✓ B7 → ✓ B8 → B9 → **tag alpha.3** →
+- 阶段 2，契约块：✓ B0 → ✓ B1 → ✓ B2 → ✓ B3 → ✓ B4 → ✓ **tag alpha.2**（2026-11-17）→ ✓ B5 → ✓ B6 → ✓ B7 → ✓ B8 → ✓ B9 → **tag alpha.3** →
   B10a → B10b、B10c → B10d → B11 与 W2c → **tag alpha.4**。B12（文档、skill、记忆）随各块。alpha.2 之后补跨版本强制安装
   的 CI 测试（TODO 的 W2b 一条）。
 - 阶段 3：W4 `aproxy skill`、W3 i18n、W5 界面接入真实数据（前端可提前对 §6 的形状做 mock 侧的工作）→ **tag beta.1**。
@@ -1020,23 +1020,31 @@
     forward 与 format 同用的告警要等 B10d 放开这个组合；面向用户的文档归 B9-8。
   - [x] B9-6 install：`--check`、`--json`（NDJSON）、预检（`install_precheck_failed`、`install_unmanaged_instances`）、
     A5 的四个字段、`halted` 时不拉起续作、与 `--force` 冲突的旗标进 force_contract 的命令行样本。
-    Ordinary installs refuse unmanaged or foreground instances before taking the lock and again before broadcasting.
-    The target resolves desired configurations before stopping anything. A port stopped during the install is skipped;
-    a crashed port with desired state is still restarted. Failures retain the phase, installer version, code and details.
-    Only mutating CLI commands trigger recovery, and none resume a halted failure. `--check` queries without installing;
-    `--json` reports the plan, phases, download progress, per-port outcomes and result across handover.
-    Verified on Windows: `cargo fmt --all`, headless workspace Clippy (`--all-targets`, `-D warnings`),
-    `cargo test -p aproxy-ipc --locked` (30), and `cargo test --no-default-features --locked` with `--lib install` (60)
-    or `--test` targeting code_table (1), install_cli (13), install_flow (13), install_flow_lib (16),
-    force_contract (18 passed, one subprocess helper ignored), cli_tree (10), exit_codes (22), json_docs (9).
-    The full headless suite passed (809 passed, 0 failed, 7 ignored). Before running desktop Clippy in a clean
-    worktree, run `npm ci` and `npm run build` in `aproxy-desktop/ui`: the Rust build embeds the generated
-    frontend and stops before linting if `dist/index.html` is absent. No desktop source change is needed.
-    Force flag conflicts are tested in cli_tree rather than changing frozen C7 assertions. Before a target is known,
-    the result version is null. Older successors without event history can only report phases seen while polling.
-    The precheck uses two error-level diagnostic codes: the existing record code is not a diagnostic, and the
-    existing unreadable-config warning describes a different case. The real alpha.1 `stop all` scenario still needs
-    the historical binary; user documentation belongs to B9-8.
+    ef82416、5337bda、53eeac9、a3602b6、9c0ed52、d928fd7（Codex t05），帮助与提示文字 41217c3。
+    - 失败记录：install.state 加 `failed_at`、`installer_version`、`error_code`、`error_details`（A5），以及滚动重启里
+      每个端口的结局 `instance_outcomes`（`restarted`、`rolled_back`、`failed`、`skipped`），都是可选字段。退出码按失败的
+      码查表；码表加 `install_restart_failed`（带 `port`）与兜底的 `install_failed`。
+    - 动手之前的两道检查：普通安装在加锁、下载、写状态之前，查管不了的实例（台账里活着的 instance，run/ 里却没有本版本
+      读得懂的实例记录）与前台实例；下载之后、广播之前（含续作与交棒后的接手者）再查一次，并用目标版本按当前的
+      settings.json 预检每个有期望状态记录的快照端口。查到或预检不过就置 failed 与 halted，二进制与实例都不动。
+      前台实例一条是 2026-11-19 定的（原来要等换完 bin 才失败，见设计稿 §5 的 install），码表加
+      `install_foreground_instances`（带 `ports`）。预检用两个 error 级诊断码 `install_restore_unreadable`、
+      `install_config_unreadable`：`record_unreadable` 不是诊断码，`config_file_unreadable` 是 warning、说的是另一件事。
+      安装者自己的台账登记（C3）在入口检查之前，不算改动（设计稿 §4.3 第 7 条）。
+    - 安装期间被停掉的端口（既没有活实例，也没有期望状态记录）跳过，记 `skipped`，终验不再要求它；崩溃了、记录还在的照旧拉起。
+    - 续作只由变更类命令拉起（start、stop、restart、restore、alias add/remove、config set/unset、settings set/unset，
+      main.rs 里穷举匹配）；halted 的 failed 现场谁都不拉起。
+    - `--check` 与 `install latest` 同一套查询与通道规则，不登记台账、不建状态；`--json` 的文档在答复来自 GitHub 时带
+      `published_at` 与 `url`。`--json`：plan、phase、progress、instance、result 五种事件；交棒之后接手者记下每个相位的
+      首个时刻，并把最终状态原子改名留给等它的那个进程读，所以快速完成的接手者也不漏报相位与实例结局；更早的接手者没有
+      这些字段，只能报轮询时看到的相位。目标版本还没定下就失败时 `result.version` 为 null。
+    - 与 `--force` 冲突的 `--json`、`--check` 在 cli_tree 里测，不改冻结的 force_contract。
+    验证（Windows）：fmt、headless 与 desktop 两种 clippy、Linux 交叉 clippy 干净；headless 全量 809 过、0 败、7 忽略，
+    其中 aproxy-ipc 30、`--lib install` 60、code_table 1、install_cli 13、install_flow 13、install_flow_lib 16、
+    force_contract 18（一个子进程辅助用例忽略）、cli_tree 10、exit_codes 22、json_docs 9。新工作树里跑 desktop clippy
+    之前，先在 `aproxy-desktop/ui` 里 `npm ci` 与 `npm run build`：Rust 构建要嵌入前端产物，缺 `dist/index.html` 就在
+    lint 之前停下。
+    没测的：设计稿 B9 验收里「之后执行 alpha.1 的 `aproxy stop all`，它拉起的续作不接管这个现场」要 alpha.1 的二进制。
   - [x] B9-7 输出纪律（§9.6）：CLI 的 tracing 写 stderr、默认 WARN；遍历命令树的帮助测试；`RUST_LOG=info` 时 stdout
     没有日志行。
     6c254f2（Codex t04）。CLI 的 tracing 写 stderr（`init_cli_logging`），默认 WARN，`RUST_LOG` 可调；stderr 被捕获时
@@ -1046,4 +1054,8 @@
     出现在 stderr、默认级别时不出现。restart_integration 的并发看护者测试原来从 stdout 读 INFO，改为开 INFO 读 stderr。
     验证（Windows、headless）：fmt、clippy 干净；cli_tree 9、test_home_check 2、exit_codes 22、proxy_integration 117、
     restart_integration 23。帮助末尾的 skill 提示归 W4（§9.6）。
-  - [ ] B9-8 文档：技能的 commands.md、compatibility.md（0.2.0 之内的命令行变化）、README、CHANGELOG、安装脚本。
+  - [x] B9-8 文档：技能的 commands.md、compatibility.md（0.2.0 之内的命令行变化）、README、CHANGELOG、安装脚本。
+    87a09a4（status）、b70e482（doctor、日志改走 stderr、`stale_after_cycles = 0`；commands.md 的退出码表原来有五行落在
+    表外，一并修好）、d752047（install 的 `--check`、`--json`、两道检查与预检、续作的触发范围、退出码 3 与 4；
+    compatibility.md 补上 0.2.0 的命令行对照表，0.1.x 与前两个 alpha 适用）、0bd9f5b（三个安装脚本里 skill 下载失败的
+    重试提示改为 `--skills-only`：已是最新时 `aproxy install` 直接返回，不重下 skill）。

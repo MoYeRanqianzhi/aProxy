@@ -156,6 +156,27 @@ fn extension_fields_are_ignored_and_action_labels_survive() {
     roundtrip::<Context>(serde_json::to_value(ctx).unwrap());
 }
 
+/// Future stages choose their own vocabulary; the four negotiated stages have fixed needs.
+#[test]
+fn hello_checks_only_negotiated_body_need_keys() {
+    let mut hello =
+        json!({"v":1,"seq":0,"protocol":1,"stages":[],"features":[],"name":"tool","version":"1"});
+    hello["request_body"] = json!({"request":"digest","response":"future","other":{"future":[]}});
+    let reply: HelloReply = serde_json::from_value(hello.clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(reply).unwrap()["request_body"],
+        json!({"request":"digest"})
+    );
+    for stage in ["request", "retry", "decide", "notify"] {
+        for invalid in [json!("future"), json!({"digest":null})] {
+            hello["request_body"] = json!({(stage):invalid});
+            assert!(serde_json::from_value::<HelloReply>(hello.clone()).is_err());
+        }
+    }
+    hello["request_body"] = json!({"notify":"full"});
+    assert!(serde_json::from_value::<HelloReply>(hello).is_err());
+}
+
 /// Non-exhaustive objects must remain constructible without downstream struct literals.
 #[test]
 fn public_constructors_and_retry_input() {

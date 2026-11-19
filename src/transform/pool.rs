@@ -2,7 +2,7 @@
 //! 不跟随请求；在写入和读完一帧之间取消任务，等价于丢掉这个会话。
 
 use crate::config::file::{FormatEntry, Process};
-use aproxy_envelope::{BodyNeed, Hello, HelloReply, Message, Reply, Stage};
+use aproxy_envelope::{Hello, HelloReply, Message, Reply, Stage};
 use aproxy_ipc::redact::Secrets;
 use std::{
     collections::BTreeSet,
@@ -483,9 +483,6 @@ impl Pool {
         let reply: HelloReply = serde_json::from_slice(&line).map_err(|_| Fault::Invalid)?;
         if reply.v != 1 || reply.protocol != 1 || reply.seq != 0 {
             return Err(Fault::Protocol);
-        }
-        if matches!(reply.request_body.get("notify"), Some(BodyNeed::Full)) {
-            return Err(Fault::Invalid);
         }
         let missing: Vec<_> = self
             .entry

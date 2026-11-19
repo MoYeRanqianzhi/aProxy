@@ -157,7 +157,23 @@ impl TryFrom<serde_json::Map<String, serde_json::Value>> for HelloReply {
         }
         let request_body = match obj.remove("request_body") {
             None | Some(serde_json::Value::Null) => BTreeMap::new(),
-            Some(v) => serde_json::from_value(v)?,
+            Some(v) => {
+                let mut needs: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_value(v)?;
+                let mut known = BTreeMap::new();
+                for stage in ["request", "retry", "decide", "notify"] {
+                    if let Some(value) = needs.remove(stage) {
+                        let need = serde_json::from_value(value)?;
+                        if stage == "notify" && need == BodyNeed::Full {
+                            return Err(serde_json::Error::custom(
+                                "notify cannot request a full body",
+                            ));
+                        }
+                        known.insert(stage.to_owned(), need);
+                    }
+                }
+                known
+            }
         };
         Ok(Self {
             v: field(&mut obj, "v")?,

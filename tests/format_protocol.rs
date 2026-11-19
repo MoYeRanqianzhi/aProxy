@@ -75,6 +75,16 @@ fn optional_program_with_an_incompatible_protocol_fails_start() {
         "invalid_output"
     );
 }
+/// 通知永远拿不到正文；声明需要正文是静态错误，而不是暂时不可用。
+#[test]
+fn notify_requesting_a_full_body_fails_start() {
+    for required in [true, false] {
+        assert_eq!(
+            failure("bad-notify-need", required, "format_handshake_failed", 3)["kind"],
+            "invalid_output"
+        );
+    }
+}
 /// 子进程退出与协议不兼容的退出码不同。
 #[test]
 fn required_program_exiting_during_hello_fails_start() {

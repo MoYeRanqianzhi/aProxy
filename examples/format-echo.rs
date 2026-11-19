@@ -89,6 +89,8 @@ fn main() {
             }
             if mode == "bad-body-need" {
                 r["request_body"] = json!({"request":"all"});
+            } else if mode == "bad-notify-need" {
+                r["request_body"] = json!({"notify":"full"});
             }
         } else {
             count += 1;

@@ -797,6 +797,17 @@ struct Try {
     error: Option<Value>,
 }
 
+/// 顶层报告在同一阶段内按配置位置替换；位置是内部身份，不在 IPC 上公开。
+#[derive(Debug, serde::Serialize)]
+#[serde(transparent)]
+struct LayerReport {
+    /// 名字经脱敏后可能碰撞，位置不会。
+    #[serde(skip)]
+    layer: usize,
+    /// 唯一公开的数据，已经过脱敏和长度限制。
+    value: Value,
+}
+
 /// 一条请求记录。
 #[derive(Debug)]
 pub struct Record {
@@ -829,9 +840,7 @@ struct RecordInner {
     tries_omitted: u32,
     tries: VecDeque<Try>,
     /// request 与 response 报告各按程序保留，重试同一层不能使顶层记录无限增长。
-    reports: Vec<Value>,
-    /// retry 先于该次上游请求的发送，等发出的请求头确定之后才有这次尝试的明细。
-    pending_reports: Vec<Value>,
+    reports: Vec<LayerReport>,
     keepalive: bool,
     heartbeats: u64,
     request_bytes: u64,
@@ -845,6 +854,36 @@ struct RecordInner {
 }
 
 impl RecordInner {
+    /// 格式程序可能在发送之前就报告本轮工作；先建一个无发出头、无上游响应的尝试，
+    /// 随后真正发送时补写头和体，不重复计数，也不会在断开时丢掉早到的报告。
+    fn enter_try(&mut self, attempt: u32) -> &mut Try {
+        if self.tries.back().is_none_or(|t| t.attempt != attempt) {
+            self.attempts = attempt;
+            self.tries.push_back(Try {
+                attempt,
+                started_at: now_millis(),
+                started: Instant::now(),
+                duration_ms: None,
+                upstream_status: None,
+                code: None,
+                response_bytes: 0,
+                decision: None,
+                reports: Vec::new(),
+                sent: None,
+                sent_body: None,
+                sent_same: false,
+                response: None,
+                error: None,
+            });
+            // 只留最前几次与最近几次；中间省掉的尝试连同它们的体一起丢
+            if self.tries.len() > TRIES_HEAD + TRIES_TAIL {
+                drop(self.tries.remove(TRIES_HEAD));
+                self.tries_omitted += 1;
+            }
+        }
+        self.tries.back_mut().expect("attempt just entered")
+    }
+
     fn try_mut(&mut self, attempt: u32) -> Option<&mut Try> {
         self.tries.iter_mut().rev().find(|t| t.attempt == attempt)
     }
@@ -1044,7 +1083,6 @@ impl History {
             tries_omitted: 0,
             tries: VecDeque::new(),
             reports: Vec::new(),
-            pending_reports: Vec::new(),
             keepalive: false,
             heartbeats: 0,
             request_bytes: 0,
@@ -1526,7 +1564,7 @@ struct RecordView<'a> {
     request_bytes: u64,
     response_bytes: u64,
     /// request、response、stream 阶段的报告。
-    reports: &'a [Value],
+    reports: &'a [LayerReport],
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     truncated: bool,
 }
@@ -1729,7 +1767,9 @@ impl Recorder {
             let sent_body = if same_body {
                 inner
                     .tries
-                    .back()
+                    .iter()
+                    .rev()
+                    .find(|t| t.attempt != attempt)
                     .and_then(|t| t.sent_body.clone())
                     .or_else(|| inner.request_body.clone())
             } else {
@@ -1739,28 +1779,10 @@ impl Recorder {
             };
             inner.phase = Phase::Attempting;
             inner.next_attempt_at = None;
-            inner.attempts = attempt;
-            inner.tries.push_back(Try {
-                attempt,
-                started_at: now_millis(),
-                started: Instant::now(),
-                duration_ms: None,
-                upstream_status: None,
-                code: None,
-                response_bytes: 0,
-                decision: None,
-                reports: std::mem::take(&mut inner.pending_reports),
-                sent: head.cloned(),
-                sent_body,
-                sent_same: same_body,
-                response: None,
-                error: None,
-            });
-            // 只留最前几次与最近几次；中间省掉的尝试连同它们的体一起丢
-            if inner.tries.len() > TRIES_HEAD + TRIES_TAIL {
-                drop(inner.tries.remove(TRIES_HEAD));
-                inner.tries_omitted += 1;
-            }
+            let t = inner.enter_try(attempt);
+            t.sent = head.cloned();
+            t.sent_body = sent_body;
+            t.sent_same = same_body;
         });
         writer
     }
@@ -1768,7 +1790,7 @@ impl Recorder {
     /// 来自程序的报告先打码再限长。同一层在首轮 stage 失败而续跑时，保留它最后一份报告。
     pub(crate) fn format_report(
         &self,
-        name: &str,
+        (layer, name): (usize, &str),
         stage: &str,
         attempt: Option<u32>,
         mut report: aproxy_envelope::Report,
@@ -1806,19 +1828,15 @@ impl Recorder {
         }
         self.update(|inner, _| {
             if let Some(n) = attempt {
-                if let Some(t) = inner.try_mut(n) {
-                    t.reports.push(value);
-                } else {
-                    inner.pending_reports.push(value);
-                }
+                inner.enter_try(n).reports.push(value);
             } else if let Some(v) = inner
                 .reports
                 .iter_mut()
-                .find(|v| v["format"] == name && v["stage"] == stage)
+                .find(|r| r.layer == layer && r.value["stage"] == stage)
             {
-                *v = value;
+                v.value = value;
             } else {
-                inner.reports.push(value);
+                inner.reports.push(LayerReport { layer, value });
             }
         });
     }
@@ -2251,6 +2269,56 @@ mod tests {
         assert_eq!(method.as_str().len(), HEAD_LIMIT);
     }
 
+    /// 请求在后续层断开时，上一层的 retry 报告和尝试仍然可见；不能杜撰发出的请求。
+    #[test]
+    fn early_format_reports_survive_disconnect() {
+        let h = history(1, &[]);
+        let rec = begin(&h, 1);
+        rec.format_report(
+            (0, "inner"),
+            "retry",
+            Some(1),
+            aproxy_envelope::Report::new("before disconnect".into()),
+        );
+        rec.end(false);
+        let d: Value = serde_json::from_str(&h.detail_json(&id(1)).unwrap()).unwrap();
+        assert_eq!(d["record"]["outcome"], "client_gone");
+        assert_eq!(d["record"]["attempts"], 1);
+        assert_eq!(
+            d["record"]["tries"][0]["reports"][0]["summary"],
+            "before disconnect"
+        );
+        assert_eq!(d["tries"][0]["sent"], Value::Null);
+        assert_eq!(d["tries"][0]["response"], Value::Null);
+    }
+
+    /// 脱敏后的名称可以完全相同，替换报告只能覆盖同一个配置项。
+    #[test]
+    fn early_format_reports_keep_distinct_redacted_layers() {
+        let h = history(0, &["abcdefgh"]);
+        let rec = begin(&h, 1);
+        for (layer, name, summary) in [
+            (0, "layer-abcdefgh", "first"),
+            (1, "layer-<secret>", "second"),
+            (0, "layer-abcdefgh", "latest"),
+        ] {
+            rec.format_report(
+                (layer, name),
+                "request",
+                None,
+                aproxy_envelope::Report::new(summary.into()),
+            );
+        }
+        let text = h.list_json(None, 1).unwrap();
+        assert!(!text.contains("abcdefgh"));
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        let reports = doc["requests"][0]["reports"].as_array().unwrap();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0]["format"], reports[1]["format"]);
+        assert_eq!(reports[0]["summary"], "latest");
+        assert_eq!(reports[1]["summary"], "second");
+    }
+
     /// 每一步能让记录放得下就停止，读记录也不能破坏后续读取看到的原始字段。
     #[test]
     fn record_trims_oldest_try_reports_then_client_text_then_top_reports() {
@@ -2264,10 +2332,10 @@ mod tests {
             record
         };
         let report = || aproxy_envelope::Report::new("done".into());
-        rec.format_report("outer", "request", None, report());
+        rec.format_report((0, "outer"), "request", None, report());
         for n in 1..=2 {
             rec.try_started(n, None, true, None);
-            rec.format_report(&"n".repeat(40_000), "retry", Some(n), report());
+            rec.format_report((1, &"n".repeat(40_000)), "retry", Some(n), report());
         }
         let r = latest();
         assert_eq!(r["truncated"], true);
@@ -2279,7 +2347,12 @@ mod tests {
         assert_eq!(r["tries"][1]["reports"], json!([]));
         assert_eq!(r["model"].as_str().unwrap().len(), TRUNCATED_TEXT_CHARS);
         assert_eq!(r["reports"][0]["format"], "outer");
-        rec.format_report(&"n".repeat(MAX_RECORD_BYTES), "response", None, report());
+        rec.format_report(
+            (1, &"n".repeat(MAX_RECORD_BYTES)),
+            "response",
+            None,
+            report(),
+        );
         let r = latest();
         assert_eq!(r["reports"], json!([]));
         assert_eq!(r["truncated"], true);

@@ -273,7 +273,7 @@ impl RequestChain {
                         }
                         if let wire::ReportField::Present(report) = reply.report {
                             ctx.rec.format_report(
-                                name,
+                                (self.cursor, name),
                                 stage,
                                 (self.stage == Stage::Retry).then_some(attempt),
                                 report,
@@ -468,11 +468,12 @@ pub(super) async fn transform_response_if_configured(
     let mut accepted = false;
     let mut rewrite_body = false;
     let mut rewrite_headers = false;
-    for p in state
+    for (layer, p) in state
         .formats
         .iter()
+        .enumerate()
         .rev()
-        .filter(|p| p.entry.has_stage(Stage::Response))
+        .filter(|(_, p)| p.entry.has_stage(Stage::Response))
     {
         let name = &p.entry.name;
         let mut fresh = false;
@@ -536,7 +537,8 @@ pub(super) async fn transform_response_if_configured(
             continue;
         };
         if let wire::ReportField::Present(report) = r.report {
-            ctx.rec.format_report(name, "response", None, report);
+            ctx.rec
+                .format_report((layer, name), "response", None, report);
         }
         ctx.absorb(name, r.state);
         accepted |= r.fail.as_ref().is_none_or(|f| f.response.is_some());

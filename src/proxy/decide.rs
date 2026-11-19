@@ -169,10 +169,11 @@ pub(super) async fn consult(
     }
     let ctx = req.ctx.as_ref().expect("format context");
     let mut preview = None;
-    for pool in state
+    for (layer, pool) in state
         .formats
         .iter()
-        .filter(|p| p.entry.has_stage(Stage::Decide))
+        .enumerate()
+        .filter(|(_, p)| p.entry.has_stage(Stage::Decide))
     {
         let supports_success =
             |h: &wire::HelloReply| h.features.iter().any(|f| f == "decide.success");
@@ -258,7 +259,8 @@ pub(super) async fn consult(
             }
         };
         if let wire::ReportField::Present(report) = reply.report {
-            ctx.rec.format_report(name, "decide", Some(attempt), report);
+            ctx.rec
+                .format_report((layer, name), "decide", Some(attempt), report);
         }
         ctx.absorb(name, reply.state);
         if reply.fail.is_some() {

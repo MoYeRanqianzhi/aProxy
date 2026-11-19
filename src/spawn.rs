@@ -240,6 +240,9 @@ async fn wait_ready(
 ) -> Result<InstanceStatus, SpawnError> {
     let run_dir = home.join("run");
     let start = crate::process::process_start_time(pid);
+    if expected_id.is_some() {
+        tracing::debug!(pid, "waiting for existing instance readiness");
+    }
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let Some(rec) = daemon::registry_find_pid_in(&run_dir, pid)

@@ -2699,6 +2699,36 @@ async fn open_optional_full_layer_preserves_the_compressed_request() {
     );
 }
 
+/// 只在第二个 CLI 已选择旁观已有实例的就绪等待后返回；子进程是否仍活着不能证明走到了哪一步。
+async fn observing_start(home: &TestHome, config: &std::path::Path) -> std::process::Child {
+    let log = home.path().join("observer.stderr");
+    let mut child = home
+        .cmd()
+        .env("RUST_LOG", "aproxy::spawn=debug")
+        .args(["start", "--json", "--config"])
+        .arg(config)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        loop {
+            let text = std::fs::read_to_string(&log).unwrap();
+            if text.contains("waiting for existing instance readiness") {
+                break;
+            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "observer exited before readiness wait: {text}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("observer did not enter its readiness wait");
+    child
+}
+
 /// 两个启动者拿到同一份静态契约错误和退出码；非公开的启动规格不必交给第二个进程。
 #[tokio::test]
 async fn observing_start_preserves_a_static_handshake_failure() {
@@ -2714,16 +2744,7 @@ async fn observing_start_preserves_a_static_handshake_failure() {
     .replace("env={", "env={ ECHO_REFUSE_STAGE='1',");
     let (first, path) = background_start(&home, port, free_port(), &cfg);
     observed_hello(&home, "gate").await;
-    let mut second = home
-        .cmd()
-        .args(["start", "--json", "--config"])
-        .arg(path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-    assert!(second.try_wait().unwrap().is_none());
+    let second = observing_start(&home, &path).await;
     std::fs::write(gate, b"").unwrap();
     let mut errors = Vec::new();
     for child in [first, second] {

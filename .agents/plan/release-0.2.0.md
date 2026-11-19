@@ -324,6 +324,7 @@
     skill 原样不动。预发布版不受影响（0.1.0 的稳定通道不选预发布）。
 
 ### W5 UI（Tauri 2，编进本体）
+- 接入真实数据（换掉演示数据）的架构、去留与分段另见 [w5-real-data](w5-real-data.md)（2026-11-19）。
 - 构建：cargo feature `desktop` 进 default features（与 `aproxy desktop` 命令、`--version` 的变体词一致）；
   `--no-default-features` 出无 UI 版本，不得多出任何依赖（CI 用 `cargo tree` 断言依赖树里没有 tauri）。
 - **crate 布局（用户 2026-10-11 提议「新增两个 crate」，主代理细化切法，用户未反对）**：

@@ -3929,14 +3929,16 @@ async fn forward_only_enforces_max_body_mb() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn forward_only_unreachable_upstream_returns_502() {
-    // 取一个刚释放的端口：bind 到 0 拿到内核分配的端口后立刻 drop，此后对该
-    // 端口的 connect 必然 ECONNREFUSED（环回上无监听者），且失败是即时的——
-    // 不依赖 connect_timeout 收敛
-    let dead_addr = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = l.local_addr().unwrap();
-        drop(l);
-        addr
+    // 绑定但不 listen：连接会被拒绝，而端口在请求结束前不会被并行测试的监听器拿走。
+    // free_port 与 bind 之间若有竞争就换端口；绝不向没有占住的地址发请求。
+    let reservation = tokio::net::TcpSocket::new_v4().unwrap();
+    let dead_addr = loop {
+        let addr = ([127, 0, 0, 1], common::free_port()).into();
+        match reservation.bind(addr) {
+            Ok(()) => break addr,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(e) => panic!("不能保留未监听的测试端口：{e}"),
+        }
     };
 
     let mut cfg = proxy_config_for(&format!("http://{dead_addr}"));

@@ -230,17 +230,13 @@ fn program_path(
         return Ok(home.join(p));
     }
     #[cfg(windows)]
-    let name = if p.extension().is_none() {
-        p.with_extension("exe")
-    } else {
-        p.to_owned()
-    };
-    #[cfg(not(windows))]
-    let name = p;
+    let exe = p.extension().is_none().then(|| p.with_extension("exe"));
+    #[cfg(windows)]
+    let p = exe.as_deref().unwrap_or(p);
     for dir in
         std::iter::once(home.join("bin")).chain(path.into_iter().flat_map(std::env::split_paths))
     {
-        let file = dir.join(&name);
+        let file = dir.join(p);
         if let Ok(meta) = file.metadata()
             && meta.is_file()
         {

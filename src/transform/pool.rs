@@ -280,6 +280,8 @@ struct Worker {
     stdin: Option<ChildStdin>,
     /// 已预读的下一行不能交给另一个进程或请求。
     stdout: BufReader<ChildStdout>,
+    /// 这一条管道实际协商到的能力，不借用另一个 worker 的握手结果。
+    hello: Option<Arc<HelloReply>>,
     /// 握手用 0，其余消息沿用这个进程各自的序列。
     seq: u64,
     /// 最后一次归还到池里的时刻。
@@ -449,7 +451,7 @@ pub(crate) struct Pool {
     /// 关闭时唤醒等候池位的消息；旧队列不得成为下一轮冷却后的试探。
     changed: tokio::sync::watch::Sender<u64>,
     /// 最近一次成功握手的身份与能力，握手失败时不杜撰版本。
-    pub(crate) negotiated: Mutex<Option<HelloReply>>,
+    pub(crate) negotiated: Mutex<Option<Arc<HelloReply>>>,
 }
 impl Drop for Pool {
     fn drop(&mut self) {
@@ -684,6 +686,7 @@ impl Pool {
             kill: Some(kill),
             stdin,
             stdout,
+            hello: None,
             seq: 0,
             idle_since: Instant::now(),
         };
@@ -701,6 +704,7 @@ impl Pool {
                 .collect(),
             id,
         );
+        hello.features.push("decide.success".into());
         hello.overrides = OVERRIDES.iter().map(|k| (*k).into()).collect();
         let line = w.frame(Stage::Hello(hello), 10, None, HELLO_BYTES).await?;
         let object: serde_json::Map<String, serde_json::Value> =
@@ -722,7 +726,9 @@ impl Pool {
         if !missing.is_empty() {
             return Err(Fault::Stages(missing));
         }
-        *self.negotiated.lock().unwrap() = Some(reply);
+        let hello = Arc::new(reply);
+        w.hello = Some(hello.clone());
+        *self.negotiated.lock().unwrap() = Some(hello);
         w.seq = 1;
         Ok(w)
     }
@@ -977,6 +983,24 @@ pub(crate) struct Turn<'a> {
     _turn: tokio::sync::SemaphorePermit<'a>,
 }
 impl Turn<'_> {
+    /// 借出的进程已经握手，按这个进程的实际能力决定要不要发送消息。
+    pub(crate) fn hello(&self) -> &HelloReply {
+        self.worker
+            .hello
+            .as_deref()
+            .expect("worker has completed hello")
+    }
+    /// 本地没有消息可发时不惩罚健康进程，已经打开的旧代仍不得归还。
+    pub(crate) async fn unused(self) {
+        if self.pool.entry.process == Process::Spawn {
+            self.worker.finish().await;
+        } else {
+            let c = self.pool.circuit.lock().unwrap();
+            if c.epoch == self.ticket.epoch && !self.ticket.probe && c.window.is_none() {
+                self.pool.park(self.worker);
+            }
+        }
+    }
     /// 只从写出开始计时，已取得名额后的本地正文读取也不占管道时限。
     pub(crate) async fn send(mut self, stage: Stage, timeout: u64) -> Result<PreparedReply, Fault> {
         let pool = self.pool;

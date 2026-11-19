@@ -186,6 +186,7 @@ async fn handle(
     if keepalive_applies
         || state.has_format(crate::config::file::Stage::Request)
         || state.has_format(crate::config::file::Stage::Retry)
+        || state.has_format(crate::config::file::Stage::Decide)
     {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<Response>();
         let path_and_query = path_and_query.to_string();

@@ -143,7 +143,13 @@ fn main() {
             if mode == "slow-hello" {
                 std::thread::sleep(delay);
             }
-            r = json!({"v":1,"seq":0,"name":"format-echo","version":"1.0","protocol":1,"features":[],"stages":["request","retry","response","heartbeat"]});
+            r = json!({"v":1,"seq":0,"name":"format-echo","version":"1.0","protocol":1,"features":[],"stages":["request","retry","decide","response","heartbeat"]});
+            if std::env::var_os("ECHO_DECIDE_SUCCESS").is_some() {
+                r["features"] = json!(["decide.success"]);
+            }
+            if std::env::var_os("ECHO_DECIDE_FULL").is_some() {
+                r["request_body"] = json!({"decide":"full"});
+            }
             if mode == "metadata-only" {
                 r["request_body"] = json!({"request":"none","retry":"digest"});
             }
@@ -279,6 +285,8 @@ fn main() {
                         serde_json::from_slice(&std::fs::read(arg).unwrap()).unwrap();
                     let key = if stage == "retry" {
                         format!("retry:{}", m["retry"]["attempt"])
+                    } else if stage == "decide" {
+                        format!("decide:{}", m["attempt"])
                     } else {
                         stage.to_string()
                     };

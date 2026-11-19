@@ -77,6 +77,7 @@ use crate::{config::Config, retry, transform::ExchangeCtx};
 
 mod attempts;
 mod body;
+mod decide;
 mod delivery;
 mod errors;
 mod forward_only;

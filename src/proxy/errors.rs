@@ -306,6 +306,16 @@ impl Terminal {
         terminal
     }
 
+    /// 程序终止重试，保留最近一次尝试的真正故障码，不把程序自定的状态冒充上游状态。
+    pub(super) fn retry_stopped(name: &str, last: &AttemptFailure) -> Self {
+        let mut t = Self::new(
+            "retry_stopped",
+            format!("format '{name}' stopped retrying: {}", last.message),
+            json!({"format":name,"last_code":last.code}),
+        );
+        t.upstream_status = last.status;
+        t
+    }
     /// 请求侧 format 明确拒绝了这个请求
     pub(super) fn format_rejected(format: &str, reason: &str, details: Value) -> Self {
         Self::new(

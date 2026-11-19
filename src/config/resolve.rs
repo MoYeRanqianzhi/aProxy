@@ -616,7 +616,7 @@ fn check_supported_stages(
 ) {
     for (index, format) in formats.iter().enumerate() {
         for stage in &format.stages {
-            if matches!(stage, Stage::Decide | Stage::Stream | Stage::Notify) {
+            if matches!(stage, Stage::Stream | Stage::Notify) {
                 let key = format!("format[{index}].stages");
                 let position = text.and_then(|text| file::locate(text, &key));
                 diagnostics.push(Diagnostic {
@@ -975,7 +975,7 @@ stages = ["response", "heartbeat"]
 name = "a"
 command = "f"
 process = "persistent"
-stages = ["request", "decide", "notify"]
+stages = ["request", "stream", "notify"]
 [[format]]
 name = "b"
 command = "f"

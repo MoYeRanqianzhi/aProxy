@@ -2031,3 +2031,339 @@ async fn response_program_encoding_replaces_only_the_upstream_encoding() {
         );
     }
 }
+
+/// 决定和是否换路各自取第一票；单独决定已经足够时不再给后续层机会覆盖。
+#[tokio::test]
+async fn first_decide_vote_wins() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[503, 200]).await;
+    let cfg = layer(
+        &home,
+        "first",
+        "'decide'",
+        &["reply", r#"{"decision":"retry"}"#],
+    ) + &layer(
+        &home,
+        "last",
+        "'decide'",
+        &["reply", r#"{"decision":"stop"}"#],
+    );
+    let (c, url) = running(&home, up, &cfg);
+    assert_eq!(c.get(&url).send().await.unwrap().status(), 200);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    let first = frames(&home, "first");
+    assert_eq!(first.len(), 2);
+    assert!(
+        first[0]["features"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::from("decide.success"))
+    );
+    let m = &first[1];
+    assert_eq!(m["attempt"], 1);
+    assert_eq!(m["delivery"], "retry");
+    assert_eq!(m["outcome"], "failure");
+    assert_eq!(m["failure"]["code"], "upstream_status");
+    assert_eq!(
+        m["fallback"],
+        serde_json::json!({"decision":"retry","delay_ms":0,"by":"default"})
+    );
+    assert_eq!(m["response"]["body"], "upstream bytes");
+    assert!(m["response"]["truncated"].is_null());
+    assert!(m["request"].get("headers").is_none());
+    assert!(m["request"].get("body").is_none());
+    assert_eq!(frames(&home, "last").len(), 1);
+}
+
+/// 用两层分别给出 decision 和 reroute，确保第一票不会短路尚未取得的另一个字段。
+async fn exercise_reroute(again: bool) {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[503, 200]).await;
+    let cfg = layer(&home, "route", "'request','retry'", &["reply", "{}"])
+        + &layer(
+            &home,
+            "vote",
+            "'decide'",
+            &["reply", r#"{"decision":"retry"}"#],
+        )
+        + &layer(
+            &home,
+            "choose",
+            "'decide'",
+            &[
+                "reply",
+                &serde_json::json!({"decision":"stop","reroute":again}).to_string(),
+            ],
+        );
+    let (c, url) = running(&home, up, &cfg);
+    assert_eq!(c.post(url).send().await.unwrap().status(), 200);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    let f = frames(&home, "route");
+    assert_eq!(f.iter().filter(|v| v["stage"] == "request").count(), 1);
+    assert_eq!(
+        f.iter().filter(|v| v["stage"] == "retry").count(),
+        usize::from(again)
+    );
+    assert_eq!(frames(&home, "choose").len(), 2);
+}
+/// false 保留请求段最后发出的完整表示。
+#[tokio::test]
+async fn reroute_false_reuses_the_previous_request() {
+    exercise_reroute(false).await;
+}
+/// true 回到第一层 retry 前的缓存，而非重新执行普通前缀。
+#[tokio::test]
+async fn reroute_true_reruns_the_retry_segment() {
+    exercise_reroute(true).await;
+}
+
+/// 超时没有投票；即使这个程序是必需的，下一次上游尝试仍能成功。
+#[tokio::test]
+async fn decide_timeout_falls_back_and_counts_toward_the_breaker() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[503, 503, 200]).await;
+    let cfg = layer(&home, "slow", "'decide'", &["sleep", "2500"])
+        + "decide_timeout_secs=1\ntimeout_secs=0\nbreaker_failures=1\n";
+    let (c, url) = running(&home, up, &cfg);
+    assert_eq!(c.get(&url).send().await.unwrap().status(), 200);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 3);
+    let b = breaker(&home, &url).await;
+    assert_eq!(b["state"], "open");
+    assert_eq!(b["last_failure"]["details"]["kind"], "timeout");
+    assert_eq!(frames(&home, "slow").len(), 2);
+}
+/// 进程提前退出只使这次咨询失效，不用 503 替代客户端本来可以得到的成功响应。
+#[tokio::test]
+async fn decide_crash_never_ends_the_request() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[503, 200]).await;
+    let cfg = layer(&home, "crash", "'decide'", &["exit1"]);
+    let (c, url) = running(&home, up, &cfg);
+    let response = c.get(&url).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "upstream bytes");
+    assert_eq!(breaker(&home, &url).await["failures"], 1);
+}
+/// 只给协商了成功咨询的程序看 200；可以判为失败，也可以明确停止或完全不表态。
+#[tokio::test]
+async fn decide_success_can_fail_a_200() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[200]).await;
+    let script = home.path().join("decisions.json");
+    std::fs::write(
+        &script,
+        r#"{"decide:1":{"decision":"retry"},"decide:2":{"decision":"stop"}}"#,
+    )
+    .unwrap();
+    let cfg = layer(
+        &home,
+        "policy",
+        "'decide'",
+        &["reply-by-stage", script.to_str().unwrap()],
+    )
+    .replace(
+        "env={",
+        "env={ ECHO_DECIDE_SUCCESS='1', ECHO_DECIDE_FULL='1',",
+    ) + &layer(&home, "later", "'decide'", &["reply", "{}"])
+        .replace("env={", "env={ ECHO_DECIDE_SUCCESS='1',");
+    let (c, url) = running(&home, up, &cfg);
+    let response = c.post(&url).body("request").send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(!response.headers().contains_key("x-aproxy-error"));
+    assert_eq!(response.text().await.unwrap(), "upstream bytes");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    let f = frames(&home, "policy");
+    assert_eq!(f.len(), 3);
+    assert_eq!(f[1]["outcome"], "success");
+    assert!(f[1].get("failure").is_none());
+    assert_eq!(f[1]["request"]["body"], "request");
+    assert!(f[1]["request"].get("headers").is_none());
+    assert_eq!(frames(&home, "later").len(), 1);
+    let detail = request_detail(&home, &url, f[1]["request_id"].as_str().unwrap()).await;
+    let record = &detail["record"];
+    assert_eq!(record["outcome"], "ok");
+    assert_eq!(record["tries"][0]["code"], "format_decision");
+    assert_eq!(record["tries"][1]["decision"]["decision"], "stop");
+    assert_eq!(record["tries"][1]["decision"]["by"], "format:policy");
+}
+/// 无论原来成功还是失败，程序只改体的补丁都继承原状态；终态不再经过响应转换层。
+#[tokio::test]
+async fn decide_stop_with_response_returns_it_as_retry_stopped() {
+    for status in [200, 503] {
+        let home = TestHome::new();
+        let (up, _) = upstream(if status == 200 { &[200] } else { &[503] }).await;
+        let cfg = layer(
+            &home,
+            "policy",
+            "'decide'",
+            &[
+                "reply",
+                r#"{"decision":"stop","response":{"body":"replacement"}}"#,
+            ],
+        )
+        .replace("env={", "env={ ECHO_DECIDE_SUCCESS='1',")
+            + &layer(&home, "outer", "'response'", &["upper"]);
+        let (c, url) = running(&home, up, &cfg);
+        let response = c.get(&url).send().await.unwrap();
+        assert_eq!(response.status().as_u16(), status);
+        assert_eq!(response.headers()["x-aproxy-error"], "retry_stopped");
+        let id = response.headers()["x-aproxy-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(response.text().await.unwrap(), "replacement");
+        assert_eq!(frames(&home, "outer").len(), 1);
+        let detail = request_detail(&home, &url, &id).await;
+        assert_eq!(detail["record"]["code"], "retry_stopped");
+        assert_eq!(
+            detail["record"]["tries"][0]["code"],
+            if status == 200 {
+                "format_decision"
+            } else {
+                "upstream_status"
+            }
+        );
+    }
+}
+/// 有上游时保留原错体，没有上游时生成带 last_code 的 502。
+#[tokio::test]
+async fn decide_stop_without_response_passes_the_upstream_response_through() {
+    let (up, _) = upstream(&[503]).await;
+    for (port, status) in [(up, 503), (free_port(), 502)] {
+        let home = TestHome::new();
+        let cfg = layer(
+            &home,
+            "stopper",
+            "'decide'",
+            &["reply", r#"{"decision":"stop"}"#],
+        );
+        let (c, url) = running(&home, port, &cfg);
+        let res = c.get(url).send().await.unwrap();
+        assert_eq!(res.status().as_u16(), status);
+        assert_eq!(res.headers()["x-aproxy-error"], "retry_stopped");
+        if status == 503 {
+            assert_eq!(res.text().await.unwrap(), "upstream bytes");
+        } else {
+            let j = res.json::<Value>().await.unwrap();
+            assert_eq!(
+                j["error"]["aproxy"]["details"]["last_code"],
+                "upstream_connect_failed"
+            );
+        }
+    }
+}
+/// 实际延迟和记录中的 delay_ms 都来自投票，非 default 的零退避。
+#[tokio::test]
+async fn decide_delay_overrides_the_backoff() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[503, 200]).await;
+    let cfg = layer(
+        &home,
+        "delay",
+        "'decide'",
+        &["reply", r#"{"decision":"retry","delay_ms":180}"#],
+    );
+    let (c, url) = running(&home, up, &cfg);
+    let start = std::time::Instant::now();
+    let res = c.get(&url).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    res.bytes().await.unwrap();
+    assert!(start.elapsed() >= std::time::Duration::from_millis(180));
+    let f = frames(&home, "delay");
+    let d = request_detail(&home, &url, f[1]["request_id"].as_str().unwrap()).await;
+    assert_eq!(d["record"]["tries"][0]["decision"]["delay_ms"], 180);
+}
+/// 真正的磁盘体越过 1 MiB 后只给首尾，转发字节不受预览截断影响。
+#[tokio::test]
+async fn large_upstream_body_reaches_decide_truncated() {
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let text = format!(
+        "{}{}{}",
+        "a".repeat(65536),
+        "b".repeat(32768),
+        "z".repeat(1024 * 1024 - 65536)
+    );
+    let raw = text.clone();
+    let app = axum::Router::new().fallback(move || {
+        let t = raw.clone();
+        async move { (axum::http::StatusCode::SERVICE_UNAVAILABLE, t) }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = layer(
+        &home,
+        "preview",
+        "'decide'",
+        &["reply", r#"{"decision":"stop"}"#],
+    );
+    let (c, url) = running(&home, up, &cfg);
+    let response = c.get(url).send().await.unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(response.text().await.unwrap(), text);
+    let f = frames(&home, "preview");
+    assert_eq!(f[1]["response"]["truncated"], 32768);
+    assert_eq!(
+        f[1]["response"]["body"],
+        format!("{}{}", "a".repeat(65536), "z".repeat(1024 * 1024 - 65536))
+    );
+}
+/// 格式程序可以推翻规则的停止判定；尝试保存真正的决策来源、报告，第二次成功无票。
+#[tokio::test]
+async fn decision_and_reports_are_recorded_in_the_attempt() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[503, 200]).await;
+    let cfg = String::from("[[retry.rules]]\nstatus=[503]\nmax_attempts=1\n")
+        + &layer(
+            &home,
+            "voter",
+            "'decide'",
+            &[
+                "reply",
+                r#"{"decision":"retry","report":{"summary":"decision note","actions":[]}}"#,
+            ],
+        );
+    let (c, url) = running(&home, up, &cfg);
+    let response = c.get(&url).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    let f = frames(&home, "voter");
+    assert_eq!(
+        f[1]["fallback"],
+        serde_json::json!({"decision":"stop","by":"rule:1"})
+    );
+    let d = request_detail(&home, &url, f[1]["request_id"].as_str().unwrap()).await;
+    let tries = &d["record"]["tries"];
+    assert_eq!(tries[0]["decision"]["by"], "format:voter");
+    assert_eq!(tries[0]["reports"][0]["summary"], "decision note");
+    assert_eq!(tries[0]["reports"][0]["stage"], "decide");
+    assert!(tries[1]["decision"].is_null());
+}
+
+/// 成功咨询没有投票时，也不能因为程序回了报告就凭空生成决定或错误终态。
+#[tokio::test]
+async fn successful_decide_abstention_keeps_a_null_decision() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[200]).await;
+    let cfg = layer(
+        &home,
+        "observe",
+        "'decide'",
+        &["reply", r#"{"report":{"summary":"seen","actions":[]}}"#],
+    )
+    .replace("env={", "env={ ECHO_DECIDE_SUCCESS='1',");
+    let (c, url) = running(&home, up, &cfg);
+    let response = c.get(&url).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(!response.headers().contains_key("x-aproxy-error"));
+    response.bytes().await.unwrap();
+    let f = frames(&home, "observe");
+    let d = request_detail(&home, &url, f[1]["request_id"].as_str().unwrap()).await;
+    assert_eq!(d["record"]["outcome"], "ok");
+    let attempt = &d["record"]["tries"][0];
+    assert!(attempt["decision"].is_null());
+    assert!(attempt["code"].is_null());
+    assert_eq!(attempt["reports"][0]["summary"], "seen");
+}

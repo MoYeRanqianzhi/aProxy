@@ -420,13 +420,21 @@ fn read_format(ctx: &mut Ctx, entry: &Tbl) -> Option<FormatEntry> {
                 .map(|stem| stem.to_string_lossy().into_owned())
         })
     });
-    if name.as_deref().is_some_and(|name| name.trim().is_empty()) {
+    // 在去掉首尾空白之前检验原值，不能让制表符、换行或超长的显式名字悄悄过关。
+    // 没有可用文件名主干的命令也需要显式名字；不要给缺少 command 的条目重复报错。
+    let name_error = match name.as_deref() {
+        Some(s) if s.trim().is_empty() => Some("empty"),
+        Some(s) if s.len() > 64 || s.chars().any(char::is_control) => Some("invalid_name"),
+        None if command.as_deref().is_some_and(|c| !c.trim().is_empty()) => Some("empty"),
+        _ => None,
+    };
+    if let Some(reason) = name_error {
         ctx.push(
             "config_invalid_value",
             &entry.key_path("name"),
-            entry.span_of("name"),
-            "name must not be empty".to_string(),
-            json!({ "reason": "empty" }),
+            entry.span_of("name").or_else(|| entry.span_of("command")),
+            "set name to 1–64 UTF-8 bytes without control characters".to_string(),
+            json!({ "reason": reason }),
         );
     }
     let args = entry.string_list(ctx, "args").unwrap_or_default();
@@ -1351,6 +1359,47 @@ pool_max = 0
             ]
         );
         assert_eq!(config.format, Some(vec![]), "有问题的条目都不要");
+    }
+
+    /// 名字会进入日志和每次尝试的决定；长度按 UTF-8 字节而不是字符计，控制符不能被 trim 掩盖。
+    #[test]
+    fn format_names_are_bounded_at_their_source() {
+        let mixed = format!("{}界", "a".repeat(61));
+        for (name, valid) in [
+            ("a".into(), true),
+            ("a".repeat(64), true),
+            (mixed.clone(), true),
+            ("a".repeat(65), false),
+            (format!("{mixed}a"), false),
+            (String::new(), false),
+            ("x\ny".into(), false),
+            ("\tname".into(), false),
+            ("x\u{85}y".into(), false),
+        ] {
+            let value = serde_json::to_string(&name).unwrap();
+            let (cfg, diagnostics) = parse_text(&format!(
+                "[[format]]\nname={value}\ncommand='tool'\nstages=['request']"
+            ));
+            let entries = cfg.format.unwrap();
+            if valid {
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                assert_eq!(entries[0].name, name);
+            } else {
+                assert!(entries.is_empty(), "{value}");
+                assert_eq!(
+                    brief(&diagnostics),
+                    ["config_invalid_value format[0].name 2"]
+                );
+                assert!(diagnostics[0].message.contains("set name"));
+            }
+        }
+        // 命令本身不受名字长度限制：显式取短名时，不检查没有被采用的文件名主干。
+        let command = format!("{}.exe", "x".repeat(65));
+        let (cfg, diagnostics) = parse_text(&format!(
+            "[[format]]\ncommand='{command}'\nname='short'\nstages=['request']"
+        ));
+        assert!(diagnostics.is_empty());
+        assert_eq!(cfg.format.unwrap()[0].name, "short");
     }
 
     #[test]

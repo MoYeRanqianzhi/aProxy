@@ -191,6 +191,21 @@ fn frames(home: &TestHome, name: &str) -> Vec<Value> {
         .collect()
 }
 
+/// 没写 name 时也要验证命令的文件名主干，并在启动子进程之前提示写明 name。
+#[test]
+fn oversized_derived_format_name_fails_start_as_invalid_config() {
+    let home = TestHome::new();
+    let command = format!("{}.exe", "x".repeat(65));
+    let config = format!("[[format]]\ncommand='{command}'\nstages=['request']\n");
+    let (_, out) = launch(&home, free_port(), &config);
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["error"]["code"], "config_invalid");
+    let diagnostic = &doc["error"]["details"]["diagnostics"][0];
+    assert_eq!(diagnostic["code"], "config_invalid_value");
+    assert!(diagnostic["message"].as_str().unwrap().contains("set name"));
+}
+
 /// 不合法的重试段应在任何一个子进程被拉起前就返回配置诊断。
 #[test]
 fn retry_segment_violation_fails_start() {

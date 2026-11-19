@@ -1,8 +1,6 @@
 # TODO（团队共享，定期清理；完成项删除并留 git 历史）
 
-> 2026-09-05 据进度盘点建立。2026-09-07 全部近期收口完成（v0.1.0-alpha.4 已 tag）。
-> 2026-09-08 补录 tag 之后一轮（性能优化 + 磁盘缓存 + 重构 + skill），全部已完成。
-> 2026-09-09 第四轮审查修复 + 实测 restart bug + skill 指引优化，全部已完成。
+> 2026-11-20 整理：做完的条目与全部做完的小节已删（见 git 历史）；现在分三部分：0.2.0、0.2.0 之后、更早留下的未排期条目。
 
 ## 0.1.0 已发布（2026-10-04）
 
@@ -15,27 +13,15 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 
 计划：[plan/release-0.2.0.md](plan/release-0.2.0.md)，执行顺序、tag 节点与进度在它的「执行顺序与进度」一节（2026-11-11 用户：
 做完 0.2.0、过程中持续提交与打 tag）；定调：[0.2.0-direction](memory/2026-10-11-0.2.0-direction.md)。
+**接下来做什么、谁在做，看 [plan/codex-tasks-0.2.0.md](plan/codex-tasks-0.2.0.md)**（交给 Codex 的任务清单，按先后排好）。
+已发：alpha.1（2026-10-13）、alpha.2（2026-11-17）、alpha.3（2026-11-19）。下一个：alpha.4（format 一线做完）。
 
-- [x] **四路审查收口**（2026-10-11）：报告与综合稿在 `.agents/review/2026-10-11-0.2.0-audit/`，结论已并入计划
-- [x] **W1 去除兼容**（2026-10-12，a54896b…7537128 + fbcc738；Windows 全量 490 通过，ubuntu 看推送后的 CI）：兼容层与 relaying 删除、`--version` 永久格式（C5）、安装状态迁到 `<home>/install/`、版本下限 0.2.0、upgrade-from-0-1-0 改为断言 0.1.0 干净拒绝、迁移文档
-- [x] **W2 契约设计定稿**（2026-10-12）：[plan/w2-contracts.md](plan/w2-contracts.md)，经四轮对抗式审查（57 → 23 → 11 → 第四轮没有 S1/S2），
-  审查记录在 `.agents/review/2026-10-12-w2-contracts-review.md`
-- [ ] **W2 契约实现**（alpha.1 之后；按设计稿 §14：先做 P1–P5 前置重构，再做 B0–B11 与 B10d；第四轮留下的 6 条 S3 在实现时处理），
-  实现落地后重写永久接口清单
-- [x] **W2b `install --force` + 进程台账**（alpha.1 第 2 步，2026-10-12 完成：2f1df42…fad48c7；独立审查
-  `.agents/review/2026-10-12-force-install-review.md` 无 P0，P1 与选定的 P2 全部修完；Windows 全量 549 通过，CI 三平台核过）。
-  发布清单的生成与校验已随第 4 步落地。跨版本强制安装的 CI 测试已加（2026-11-19，`tests/force_cross_version.rs` 与 CI 的
-  force-cross-version 任务；**每发布一个版本，把它的 tag 加进 ci.yml 的 `PREV_VERSIONS`**）。剩余：桌面界面拉起强制安装时
-  stdio 为 null（W5）
-- [x] **alpha.1 第 3 步：Tauri 桌面外壳**（2026-10-12 提交 58c1518…a7cf72f，Windows 两种变体各 552 通过、实机验过；推送前
-  审查 `.agents/review/2026-10-12-desktop-shell-review.md` 的应该修 1–4 与可以不修里定下要修的 a、b、d–l 已在 fbb65ee…267e712 落实；
-  be3893e 改调试构建只带行号表之后，ubuntu (desktop) 的 install_force 测试在 CI 转绿（run 38273956900）；Linux 带界面版的
-  链接与运行由 alpha.1 的发布构建与容器里的 `--version` 冒烟证实）。留下的三件并入 W5
-- [x] **alpha.1 第 4 步：发布流水线**（release.yml 与 release-format.yml 在默认带界面后会坏：没有前端产物、没有 WebKitGTK、
-  musl 与交叉编译要 `--no-default-features`；aproxy-desktop 首发 crates.io 要所有者种子发布）。2026-10-12 提交
-  f1f463d、7a8882a…62223c6，第 4 步审查的修复 8296a02…a86e2c0；workflow_dispatch 演练 2026-10-12 全绿（run
-  38279211569），带界面版 glibc 下限按实测改 2.34；修复核对的 N1–N6 已提交（4468243、ac6ce9d），CI 过了门槛。
-  2026-10-13 发布 run 38331800678 成功。交接记录已关闭，最后版本 `git show 7b52641^:.agents/plan/release-pipeline-step4.md`
+- [ ] **W2 契约实现**（按设计稿 §14）：P1–P5 与 B0–B9 已做完（alpha.3）；剩 B10a–B10d、B11 与 W2c，即 format 协议 1 与官方
+  aproxy-format，任务 t06 在做，做完打 alpha.4。实现落地后重写永久接口清单
+- [ ] **性能**（用户 2026-11-20）：在服务器上严格测出基线，功能都接入之后重测，rc.1 之前做优化。见
+  [plan/perf-0.2.0.md](plan/perf-0.2.0.md)
+- [ ] **已知缺口**（B9 留下，归 W6）：`start_failed` 的 `details.code` 没填；没有路径产生 `instance_incompatible`；
+  `EditError::Io` 没有操作码；桌面界面拉起强制安装时 stdio 为 null（归 W5）
 - [ ] **format-v* 线在 aproxy 0.2.0 正式版之前发布前，先定 envelope 怎么办**：envelope 现在随主线同号发预发布版
   （align-version.py），release-format.yml 只对齐 aproxy-format 自己，于是会按仓库里的开发版本号（例如
   0.2.0-alpha.0，不对应任何 aproxy 发布）把 envelope 发出去，aproxy-format 也依赖一个预发布版。现在不发 format
@@ -76,125 +62,23 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 
 ### 以后可能会做（低优先级，暂不做）
 - [ ] embeddings、图片等非对话接口的转换
-- [x] **（所有者）给 10 个 headless npm 包绑定可信发布**：包已于 2026-10-11 以 0.0.0 占位发布，所有者同日告知绑定完成。
-  已验证：alpha.1 的发布 run 38331800678 把 `@meowo/aproxy-headless` 发成 0.2.0-alpha.1（`next`），带 provenance（2026-11-11 `npm view` 核对）
 
-## 下一版发布前（2026-10-06 用户下令）
+## 更早留下的（没排进 0.2.0；按当时的来源分组，动手之前先核对是否仍然成立）
 
-用户原则：发布前每一部分都要做到足够优秀，好的设计能避免发布后才发现问题、再改动带来的连锁问题。
+用户原则（2026-10-06）：发布前每一部分都要做到足够优秀，好的设计能避免发布后才发现问题、再改动带来的连锁问题。
 
-- [x] **skill 按 skill-creator 标准重写（2026-10-06 完成，评测新 100% / 旧 87.5%，见 [plan/skill-standardization.md](plan/skill-standardization.md)）**：aproxy-cli 与 aproxy-format 两个 skill 全部改为英文，并按标准重写写法，不是直接翻译——面向操作 aProxy 的 agent 而非维护者；用「说明原因」替代成堆的「必须/铁律」；去掉版本史与维护者内容；补上操作安全（agent 自己的会话可能就经 aproxy 转发，stop/restart/按名杀进程会切断自己）。用 skill-creator 的评测流程验证（新旧 skill 对照）
-- [x] **去掉 alpha 时代的兼容写法**：用户定调——之前是 alpha、几乎零用户，不兼容合情合理；2026-10-06 补充：把 0.1.0 当作真正的第一版，不需要任何更早版本的兼容。已知清单（2026-10-06 grep `旧版|兼容|legacy` 所得，删前逐项确认它只服务 alpha 而非 0.1.0 的格式）：config 的 `upstream_url` 别名（src/config.rs:156 及测试 `legacy_upstream_url_field_still_loads`）；`.restore` 旧格式「纯 args 数组」的读侧兼容（src/daemon.rs:850-881）；注册表/IPC 响应缺 `process_start` / `last_activity_secs` 的「旧版本守护」分支（daemon.rs、watchdog.rs、commands/status.rs、stop.rs、restart.rs）；install/broadcast.rs 对不认识 PrepareSwap 的旧实例的处理；IPC `ipc_proto_v1_default`；保留字 `defult` 笔误别名（算不算兼容需判定）；skill compatibility.md 的 alpha 逐版差异。连同对应测试与文档一起删。进度：`upstream_url` 别名与 `.restore` 旧格式已删（2026-10-06）；`defult` 判定为 alpha.5 有意加的笔误容错（13598b3），不是版本兼容，保留；其余与 IPC/注册表格式相关的项（`IPC_PROTO_V1`、`ipc_proto_v1_default`、`Stats` op、status/stop 的旧协议与 `last_activity_secs > 0` 守卫、无创建时间记录的身份退路）已随 IPC v1 删除（db770a0、4018555）。剩余：无
-- [x] **IPC 设计整理与优化（2026-10-06 完成，CI windows/ubuntu 验证）**：端点按 home 命名空间、启动不变式、对端 pid 核对、线上格式 v1（协议版本从 1 重新计数）、心跳/宣告命名空间、R1 退役旧看门狗、unix socket 自愈、在线安装管辖检查、halted 现场收尾、早交接（安装由目标版本执行）；真实 v0.1.0 驱动的升级在 CI 的 upgrade-from-0-1-0 任务里跑。永久接口与兼容窗口见记忆 [ipc-v1-upgrade-contract](memory/2026-10-06-ipc-v1-upgrade-contract.md)；计划最后版本 `git show 9e91a95:.agents/plan/ipc-v1.md`
-- [x] **IPC 整理时一并决定的问题**（2026-10-06 skill 重写子代理读代码发现，未实测）：（1）已修（7def3bf，端点按 home 命名空间）：Windows 命名管道按端口全机共享（`\\.\pipe\aproxy-<端口>`，src/daemon.rs `endpoint_for_in`），临时 APROXY_HOME 下的 `stop/restart/logs <端口>` 会打到同端口的生产实例——unix 的 socket 在 run 目录里，天然随主目录隔离，两平台语义不一致；（2）（3）已修（f4210aa）：挂死实例单列为无响应、`stop --force` 经注册记录核验后终止；`stop` 未确认停止时退出 1；（4）已修（c992af2）：在线 install 在下载前做管辖检查
-- [x] 看门狗崩溃恢复延迟（2026-10-06 修复）：主循环加死亡事件唤醒分支，崩溃实例即时重拉（集成测试 `watchdog_respawns_on_death_event_and_force_stop_stays_stopped` 以 60s 扫描周期验证，实测约 0.2s 回来；旧代码上该测试失败）。随之暴露的竞态一并处理：`stop/restart --force` 改为终止前摘掉 `.restore`、失败再放回
-- [x] **install 测试依赖外网**（2026-10-06 发现并处理）：根因有二——Windows 接力进程无视 `--no-skills` 照常下载 skill（随早交接修掉：接手者不跑 skill 支线，续作认 skipped 记录），以及快路径测试没传 `--no-skills`（已补）。代价：skill 下载经 install 的端到端路径不再有自动化测试（此前也只是顺带、且不稳定地覆盖），skill 解包与替换仍由 install::skills 的单测覆盖
-- [x] **`forward_only_enforces_max_body_mb` 偶发失败（2026-10-06 查明并修复）**：不是测试问题，是真缺陷——代理一发现
-  请求体超限就回 413 并关连接，客户端还在上传，连接被复位，读不到 413（请求体放大到 32 MiB 后缓冲路径与
-  forward_only 在 Windows 上都 3/3 必现）。修法：回 413 前读掉剩余请求体（总 10 秒、空闲 2 秒为限）；两个 413 用例
-  改用 32 MiB 请求体以保持区分力，另加停住的客户端照样拿到 413 的用例
-- [x] **自定义心跳 + format 扩展（2026-10-06 完成）**：静态 `keepalive_heartbeat`、信封 `stage`/`request_id`/`state`、`heartbeat_transform`、`[request_transform] every_attempt`（重试前用原始请求重新转换，故障转移）；另三个决策点评估后不做。决策与理由见记忆 [transform-format](memory/2026-09-23-transform-format.md) 的「跨阶段扩展」一节
+### 0.1.0 发布前留下（2026-10-06）
+
 - [ ] **format 扩展的开放问题**（低优先）：（1）`state` 不设大小上限，文档只建议保持很小——若有人塞大对象，它随该请求的每行信封往返；（2）format 生成的协议事件当心跳时，真实客户端（Claude Code 等）的反应未实测；（3）心跳信封没有「最近一次上游失败」摘要（every_attempt 的 retry 信封有）
 
-## 外部转换器（format）+ aproxy-format（2026-09-23 下令，2026-09-30 完成）
+### 外部转换器（format）+ aproxy-format（2026-09-23 下令，2026-09-30 完成）
 
-- [x] **Workflow 全链审查 + 处置闭环（2026-09-30，用户下令「分配 workflow
-  再进行一轮审查」）**：六维并行（需求符合性/正确性并发/安全/文档一致性/
-  平台分发/测试完整性，32 agents）+ 逐条对抗验证——确认 26 项（0 驳回）
-  全部闭环（cf9874d）：**P0×2**（release-format 缺 download-artifact、
-  aproxy-format path 依赖缺 version——两处发布链断裂）；**P1×7**（command
-  ~ 展开代码化、SSE 能力宣传不实、示例 url/jq/rust-version 修正、两个假
-  覆盖测试重写）；**P2×17**（method warn、鉴权头剥离扩展、安全须知节、
-  spawn 串行化/auto 误判/保活 headers 例外等文档补全、8 项测试覆盖与
-  卫生）。**基线：全量 297 项全绿**。残余观察：install_flow_lib 组内并行
-  偶发（60s 卡死监视器窗口，单跑/重跑必过，非本功能）。
-
-- [x] **全链完成（主代理直接开发，两提交 85aa85d + 6ec95b0）**：
-  - workspace 三成员化（aproxy / aproxy-envelope / aproxy-format）+ 信封契约
-    crate；TransformConfig 配置链 + validate 互斥 + src/transform.rs 进程池 +
-    proxy.rs 请求/响应两插入点 + examples/format-echo.rs 跨平台测试 helper +
-    transform_integration 13 项集成测试 + aproxy-format 实现（run/convert、
-    switchyard 协议转换、轮换/加权轮换、多渠道路由、detect 启发式、
-    snake_case wire format）+ aproxy-format skill（4 references）+ 分发链
-    （release.yml skills 泛化、release-format.yml 独立发版链、npm 双包组、
-    install 多 skill 泛化）+ 文档全量同步
-  - **自死锁修复**（实测定位）：convert 的 match 内 MutexGuard 活到语句
-    结束，arm 里 spawn_worker 再拿同一把锁即死锁——所有转换首请求即挂。
-    pop 先落变量再 spawn；冒烟测试钉死
-  - **基线**：transform_integration 13 项稳定全绿；全量 270 项中守护/安装类
-    长时序测试偶发 1 项（见下条隔离债务）；clippy -D warnings 零警告；
-    fmt clean
-  - **行为面实测**（隔离 APROXY_HOME）：aproxy-format persistent 双池挂进
-    真实实例，anthropic 请求经聚合路由到 mock 上游、SSE 同协议直通回放、
-    第二请求复用 worker（恰 2 个 format 进程）
-- [x] **守护/安装类时序测试的隔离债务——restore 已修复（2026-09-30）**：
-  restore_recovers 隔离化重写完成（APROXY_HOME 注入 start 父进程、守护隔代
-  继承、前置 IPC ping 清残留），全量并行 62 项 proxy_integration 稳定全绿。
-  全量基线升至 **293 项全绿 0 失败**。残余观察项：continue_from_swapping
-  （install_flow，已有 TestEnv 隔离）曾单次偶发、单跑必过，暂留观察。
 - [ ] **其余全局 run 目录测试的隔离化**（低优先）：仍有少数测试走全局
   run 目录（依赖真实环境语义），生产看门狗活跃时的竞争面已大幅收窄，
   逐个评估是否需要同款隔离模式。
 
-## 正式发布 v0.1.0-alpha.16（2026-09-23，用户下令）
+### 大审查轮（2026-09-22，用户下令「多角度审查 + 全量实测，主代理进行」）
 
-- [x] **发版闭环（含 rustls 收口）**：推送 master（大审查第二轮两修复
-  4c5019f/c72499a）→ bump 提交 32ca65a（**rustls 0.23.44 → 0.23.45，
-  RUSTSEC-2026-0285 收口完成**——修补版本 >= 0.23.45，Review workflow 的
-  cargo-deny 随此转绿；compatibility.md 同步 alpha.16 关键行为节）→
-  annotated tag `v0.1.0-alpha.16` 打于 bump 提交 → Release run
-  35827137289 **一次全绿**（test 门禁/skills/11 变体 build/release/publish，
-  共 14 job）。三渠道验证：GitHub Release（prerelease，26 资产：11 变体 +
-  sha256 + skill 双包）、npm latest=0.1.0-alpha.16（publish 日志 provenance
-  实证 sigstore logIndex=2916523006 + dist-tags 复核）、crates.io
-  max_version=newest=0.1.0-alpha.16。CI：windows/ubuntu 绿，macOS 红为既有
-  留档项。rustls 收口待办消除（本条与下方 alpha.15 节的 rustls 待办）。
-- [x] **rustls 依赖升级收口**：见上条——alpha.16 随发版生效。
-
-## 大审查第二轮（2026-09-23，用户下令同款「多角度审查 + 全量实测，主代理进行」）
-
-- [x] **审查 + 实测 + 一项行为修复 + 五处文档漂移修复**：主代理亲读上轮未
-  深读面——watchdog.rs 全文（选举/收养/挂死/退避/install 差异化全链自洽；
-  上轮端口 0 修复恰好补齐 watchdog respawn 链——死亡事件的 port 本就是
-  actual_addr）、install 全家约 3200 行（state/announce/broadcast/staging/
-  swap/restart/skills/flow/download×4 + commands/install.rs——状态机/续作/
-  校验矩阵/路径穿越防护严密）、cli/main/lib/find、skill 五文件全量、docs
-  文档树全量。基线 fmt/clippy 零警告/全量测试绿。e2e（隔离 APROXY_HOME）：
-  上轮两修复复验通过（toml 语法错误显式报出行号；端口 0 实例 .pid/.restore
-  同键实际端口、stop 后 run 目录全空、restore 幂等）+ 命令面冒烟（status/
-  logs/stop/alias/doctor/find/config --show）。
-  实测挖出并修复：**config 命令对「显式 --config 指向的不存在文件」静默回退
-  默认值**——--show 把内置默认当「当前配置」且抬头是用户给的路径（实测实锤，
-  与 b462d18 同族）。修复为**读写分界**：纯读（--show/无修改参数）报错退出；
-  写操作保留「--config 新路径 + 修改参数 = 创建新配置」的多开工作流（既有
-  测试 cli_config_flag_scopes_config_subcommand 固化的合法场景——首轮修复
-  一概拒绝曾误伤它，被全量测试当场拦下后收敛为分界语义）。新增回归测试
-  cli_config_show_rejects_missing_explicit_file。修复后全量 259 项全绿。
-  文档漂移五处同批修复：cli.rs --foreground 帮助文本仍写「日志写
-  <端口>.log」（随机命名前旧语义，用户可见于 --help）；settings-json.md
-  字段总表把 watchdog_idle_exit_secs/download_chain/skill_auto_update/
-  download_proxy 四字段挤一行（类型/默认值列失真）；README 双语测试基线
-  数字过时（232→259）；architecture.md 模块表「十个子命令」漏 install；
-  INSTALL_AGENT.md 排障表残留「logs/<port>.log」按端口拼路径旧指引。全仓
-  grep 确认无同类残留。
-
-## 大审查轮（2026-09-22，用户下令「多角度审查 + 全量实测，主代理进行」）
-
-- [x] **审查 + 实测 + 两项修复闭环**：主代理逐模块亲读全部 src（proxy/server/
-  daemon/config/settings/retry/decode/util/commands 九命令）+ skill SKILL.md
-  一致性抽查。基线：fmt clean / clippy -D warnings 零警告 / 全量测试绿（首跑
-  1 项偶发失败见下条）。实测挖出并修复 2 个真 bug（1040bcc / b462d18）：
-  (1) **端口 0 实例的 .restore 按配置地址命名**——start.rs 明确支持端口 0
-  （系统分配端口），但 .restore 按配置地址写出 `0.restore` 而注册表与优雅
-  退出清理按实际端口，记录永久残留 → `aproxy restore` 把已 stop 的实例复活
-  到另一个随机端口、新实例再写 0.restore 循环残留（隔离 APROXY_HOME 实测
-  实锤：stop 后残留 → restore 复活 pid → 复活实例重写记录）。修复：按
-  actual_addr 命名与 .pid 同键，附带治好 restore 对端口 0 的就绪判定。
-  (2) **toml 语法错误以「base_url 不能为空」误导报出**——load_from 解析
-  失败静默回退默认配置，用户明明写了 base_url 却被告知没写，守护模式下
-  真相只在日志里（实测实锤）。修复：load_from_strict + 启动路径显式报
-  TOML 错误详情与文件路径。修复后：fmt/clippy/全量 258 项绿 + 两场景
-  e2e 复验通过。
 - [ ] **测试隔离债务：restore_recovers 测试写真实 run 目录**（本轮全量测试
   首跑偶发失败的根因定性）：该测试有意用全局真实 `~/.aproxy/run`（restore
   命令当时无隔离手段的妥协，注释已写明），守护被**生产看护者收养**
@@ -207,96 +91,14 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   resolve_config_target 在 stop/logs/start 三处各有同构展开（别名分支约 20
   行 ×3）；若第四处出现再抽公共函数（现在抽会破坏各命令报错文案的差异化）
 
+### 日志随机命名 + IPC 上报（2026-09-22，用户定调三点）
 
-## 正式发布 v0.1.0-alpha.15（2026-09-22，用户下令）
-
-- [x] **发版闭环（含一次门禁卡死与根因修复）**：tag `v0.1.0-alpha.15` 首打于
-  `1a2adc1`，Release run 35725451213 的 test 门禁连续两次失败（既有
-  continue_from_swapping 竞态）→ 定位真正根因是 **HandedOver 交棒语义未被
-  测试跟上**（非超时竞态，304db6c 修复，见下方测试稳定性条目）→ **删 tag
-  重打**于修复提交（publish 未跑过，crates.io/npm 无该版本记录，安全）→
-  新 run 35727417539 一次全绿（test/skills/11 变体 build/publish）。
-  三渠道验证：GitHub Release v0.1.0-alpha.15（prerelease，26 资产）、npm
-  latest=0.1.0-alpha.15（publish 日志 provenance 实证 + 传播后 dist-tags
-  复核）、crates.io max_version=newest=0.1.0-alpha.15。CI：windows/ubuntu
-  绿，macOS 红为既有留档项。
-  （原「rustls 依赖升级收口」待办已在 alpha.16 完成，见上节。）
-
-## 日志随机命名 + IPC 上报（2026-09-22，用户定调三点）
-
-- [x] **守护日志从「端口命名 + 客户端拼路径」改为「随机命名 + IPC 上报真实路径」**：
-  用户定调——(1) 随机命名（`<纳秒hex>-<pid hex>.log`，无新依赖）；(2) 日志地址
-  经 IPC 上报（InstanceInfo.log_path），客户端一律问实例拿真实路径，**不提供
-  端口拼接回退**（alpha 无兼容承诺）；(3) 自定义位置 = config.toml `log_file` +
-  CLI `--log-file`（优先级 CLI > toml > 随机名；~ 展开；相对路径相对
-  APROXY_HOME；**有意不设 settings.json 全局默认层**）。关键实现：OnceLock 一次
-  解析处处一致（注册表/.restore/轮转共用）；前台实例 log_path 空串（logs 立即
-  报「日志输出在它的控制台」，取代 5 秒间接探测）；**孤儿清理判据重构为引用集**
-  （活实例 log_path ∪ .restore log_path 之外的 .log 删；startup.log 除外；非
-  .log 保留；path_match_key 归一比较防分隔符差异误删）；.restore 文件格式改
-  结构体 `{args, log_path}` 且**读侧宽容旧格式**（否则混版本窗口把用户有效
-  恢复记录当损坏删掉）。IPC 管道/spool/心跳仍按端口标识，只有日志文件脱钩。
-  单测：log_file roundtrip + 孤儿清理引用集（含归一/空串三例）+ .restore 新旧
-  格式往返。详见 `.agents/memory/2026-09-22-random-log-names.md`
 - [ ] **集成测试补强**：随机命名日志的 e2e（自定义 log_file 经 CLI+IPC、
   换端口 restart 后 log_path 经 IPC 更新、stop 后日志清理/kill -9 后 .restore
   引用保留）——代码已落地，集成测试待补（Windows 侧 e2e + router 实测）
 
-## 受限重试路径（2026-09-20）
+### 仅转发模式 forward_only（2026-09-14）
 
-- [x] **compact 被 count_tokens 无限重试风暴挂死——bounded_retry_paths 配置
-  项落地（重写版）**：用户实测 Claude Code compact 总是出错（仅转发/直连
-  正常）。定位：compact 依赖的 `POST /v1/messages/count_tokens` 在镜像上游
-  （opencode.ai/zen、hub.oaifree）是确定性 404，「4xx/5xx 一律无限重试」让它
-  永远等不到终态（12233 复现日志：attempt 1→7+、退避封顶 320s）；compact 的
-  总结请求本身是成功的。
-  **首版（1affbc1/423d69b，内置 `/count_tokens` 后缀表 + 剥查询串匹配）被
-  用户否决**——「没有权利内置任何 url」「不能省略 ? 后面的内容」「不能假设
-  只有 count_tokens 这一种问题（用户可能用其他 agent 软件）」。重写为最终
-  形态：`bounded_retry_paths` 配置项（config.toml 每实例 + settings.json
-  全局默认，内置空 = 关闭），正则对「路径?查询串」整体匹配、自动锚定（普通
-  路径即精准匹配，查询串须显式 `\?` 写进模式，通配 `.*`），非法正则启动即
-  拒绝；命中请求总尝试第 3 次起有响应失败即透传终止，网络错误与非命中请求
-  不受影响，保活通道以终态 SSE error 事件收场。新增 regex 依赖（纯 Rust）。
-  测试 8 集成（透传 / 窗口内自愈 / 保活事件 / 非命中对照 / 网络错误守护 /
-  精准不命中带查询串 / 通配命中带查询串 + 既有回归）+ 2 单测（匹配语义 /
-  访问器与校验），全量 250 项绿 + clippy 零警告。skill 四份 references +
-  SKILL.md + 架构文档全量同步，含用户要求的排障标注（Claude Code 非官方
-  API 的 compact 卡死 → 本配置可解）。
-- [x] **严格实测 + 5 维对抗审查闭环（2026-09-21）**：真实实例 e2e 矩阵 18 项
-  全过（精准/通配/查询串边界、序列自愈、保活 SSE 终态、非法正则拒绝启动、
-  settings/toml 分层、旧版 alpha.13 二进制兼容、网络错误 4698 次/4s 不封顶、
-  交替与自锚点极端正则）；实测挖出并修复 `config --show` 缺展示（2c0e45c）。
-  Workflow 审查（5 维并行 + 逐条对抗复核）：报 13 条、成立 12、驳回 1，
-  成立的全部处置——README/README_EN「唯一出口」表述改为两个出口、
-  architecture.md 分层节补第四字段、compatibility.md 补「未随 alpha.13
-  出厂」条目、校验错误改原样显示模式（Debug 转义误导回填）、settings 层
-  非法正则纳入 doctor 预检 + start 报错点名来源、补 7 项测试（交替/自锚点、
-  toml 往返、settings 往返、doctor 预检、多模式任一命中、封顶超时包裹、
-  保活通道网络错误不封顶）、config-toml.md 匹配语义补「原始未解码 +
-  区分大小写 + $ ^ 字面量转义」。驳回 1 条：「可编译但恒不匹配」死亡模式
-  ——核心例证有误且拟议 validate 判据会误伤正常模式；其文档建议并入
-  语义节。新增 regex 依赖后 install_flow 在整机高负载下偶发 2 例（swapping
-  为既有留档 + restarting 同族新面孔，单跑 7/7 全过），重跑全量 254 项全绿。
-- [x] **正式发布 v0.1.0-alpha.14**（2026-09-21，用户下令）：annotated tag
-  打于 33ece38，Release workflow 一次全绿（test 门禁本次未撞偶发）。
-  三渠道验证：GitHub 26 资产（11 变体 + sha256 + skill 包）、npm
-  latest=0.1.0-alpha.14（**registry 传播延迟数分钟**——发布后立即查询得
-  404/latest 未动，日志证实 `+ @meowo/…@0.1.0-alpha.14` 已上传，数分钟后
-  全部可见；教训：npm 渠道验证须等传播或以 publish 日志为准）、crates.io
-  max_version=newest=0.1.0-alpha.14。CI：windows/ubuntu 绿，macOS 红为
-  既有未支持项（见 macOS 节）。
-  详见 `.agents/memory/2026-09-20-bounded-retry-paths.md`
-
-## 仅转发模式 forward_only（2026-09-14）
-
-- [x] **落地 + 独立审查闭环**：代码/测试/文档全部落地（`d357915`/`6daedec`/
-  `391a65a`/`fd168e4`/`8f55746`/`8a1cff5`）。一轮独立审查（4 维 + 逐条对抗式复核）
-  报 29 条、复核成立 22 条、驳回 7 条；成立的已全部处置，其中：长流期间刷新
-  活动时间戳（否则 `stop idle` 会误杀正在传输的实例）、客户端上传中断不再被
-  归因为「上游请求失败」、CL 与 TE 并存时剥离 content-length（否则静默截断）、
-  `identity` 层不再拖垮整条解码链、MSRV 声明为 1.88、brotli 编码器移出常规依赖。
-  测试面补齐三处规格零覆盖并修掉一条恒真断言（241 项全绿）。
 - [ ] **仅转发模式在 status/find/doctor 里没有模式标识**（审查 items，产品决定）：
   「重试 0」与正常实例的「无需重试」读数完全同形，运维时看不出这个实例已放弃
   重试保障。要做需经 IPC 暴露模式 = bump `IPC_PROTO_VERSION` 并处理混版本。
@@ -315,16 +117,8 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   **代码实现与测试由并行 agent 完成，落地后按上列约束逐条核对本条目**。
   详见 `.agents/memory/2026-09-14-forward-only.md`
 
-## 压缩响应体检查（2026-09-14，用户实测暴露）
+### 压缩响应体检查（2026-09-14，用户实测暴露）
 
-- [x] **压缩错误体不再退化为 hex**（f37e813 + 9ed566f）：Cloudflare 的 brotli
-  404 页在日志里只剩 hex。根因是**检查路径跑在压缩字节上**（reqwest 为保真透传
-  刻意不解压），连带 `is_error_body` / `is_stream_error_body` **静默失效**——
-  HTTP 200 携带 error JSON 不再重试、流尾 error 事件检测不到。修法：新增
-  `src/decode.rs` 解一份副本供检查，**转发字节不变**；日志补
-  content-type/content-encoding 字段。新依赖 brotli + ruzstd（均纯 Rust）。
-  端到端复现验证 + `cargo test --locked` 220 项全绿 + clippy 零警告。
-  详见 `.agents/memory/2026-09-14-compressed-body-inspection.md`
 - [ ] **测试补强：mock 上游要覆盖压缩**：既有集成测试的 mock 从不发
   `content-encoding`，这正是 220 项全绿却漏掉上述 bug 的直接原因。补一组
   「压缩响应体」集成测试（gzip/br 各一，覆盖判定与预览两条路径）
@@ -332,46 +126,8 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   增量扫描，压缩体不解码（仅预览解头部快照）。现实中 >1 MiB 的压缩错误体不存在，
   故不做流式解码；若将来出现真实场景再补
 
-## 近期收口（全部完成）
+### alpha.6 之后（2026-09-09~10，unix 实测轮）
 
-- [x] **A. alpha.4 收口**：bump + tag v0.1.0-alpha.4；release 构建于独立 `CARGO_TARGET_DIR=target-rel`（target/release/aproxy.exe 被生产实例锁定不可覆盖）——用户自行替换部署
-- [x] **B. logs 前台实例修复**（d378e30）：限时 5 秒明确报错
-- [x] **C. 日志治理**（6a6f137）：status 清孤儿日志（保 .restore 待恢复实例）+ 运行期 8MiB 每小时轮转
-- [x] **D. CI**（624c6a6）：windows 全量（fmt --check/clippy -D warnings/test）+ ubuntu/macos cargo check
-- [x] **E. 文档树**（624c6a6/382dbec）：README + docs/architecture + .agents/docs 三篇
-- [x] **别名系统** [G]（3e5e1a1）：settings.json 内部配置层 + aproxy start/stop <别名> + alias 管理
-- [x] **三项收口** [G]（2b88808）：settings default_config 指定默认配置 + max_retry_backoff_secs（0=零延迟）+ 控制台 UTF-8 乱码修复
-- [x] **审查**（fab2bad）：主会话直接审查（后台 workflow agent 连续被外部中断）——修复 4 项（退避指数写死/默认配置失效误导/verbatim 前缀/测试期望），跳过 3 项有据
-
-## alpha.4 之后（2026-09-07~08，全部完成）
-
-- [x] **零拷贝回放**（0fb38d8）：流式回放/keepalive 转发 slice_ref 共享原分配，50MB 响应峰值 64.7→~33MB
-- [x] **release profile**（cbe3e1b/1f3a0ae）：fat LTO + opt-level=z + strip，6.78→4.06MB（-40%）；panic 保持 unwind（理由入注释，abort 实测数据入记忆）
-- [x] **磁盘缓存双模缓冲**（1fe69ca→0ee93c3）：请求体/响应超 1MiB 溢写 spool，内存与负载解耦——每并发 10.5→~2.4MB（-77%），1GB 预算并发容量 80→320+，吞吐持平；压测报告 docs/benchmark-memory.md，原始数据 .agents/bench/
-- [x] **max_body_mb 分层配置**（随磁盘缓存）：默认 128MB（0=不限），settings.json 全局默认 + toml 覆盖，解锁旧 10MiB 硬上限
-- [x] **main.rs 拆分**（70e103f）：1719→114 行；cli.rs + commands/ 九命令 + server.rs + util.rs
-- [x] **aproxy-cli skill**（f62d837）：.claude/skills/ 渐进式全量参考；版本留存策略见 memory/2026-09-07-aproxy-cli-skill-versioning（小版本直改 latest，大版本才留存）；评测经用户决定放弃（agent 越界读源码，验证靠逐条源码核对）
-- [x] **alpha.5 收口**（2026-09-08）：bump v0.1.0-alpha.5 + tag；architecture.md 文档同步（模块分工/双模缓冲/版本路线）；版本路线定调——0.1.x 全程预发布后缀，0.2.0 起才引入 UI（远期）；生产实例（12345/12349）仍跑旧二进制，新功能需用户替换部署后生效
-- [x] **G2 看门狗**（W1-W7，2026-09-08 完成）：全局单看护进程 + 内核等待 + 选举规范 + settings 五字段 + IPC v2 观测；实测 +2.4% 体积/+2.9MB 常驻/热路径零损耗（docs/benchmark-watchdog.md）；计划偏差 3 项记录；107 lib + 36 集成全绿
-- [x] **F. IPC 观测扩展**（随 G2 落地）：proto 版本化 + InstanceInfo 观测字段（请求数/重试数/最近错误）+ status 混版本检测——滚动升级地基齐备
-
-## alpha.6 之后（2026-09-09，全部完成）
-
-- [x] **第四轮审查修复**（7bef574/4ba5b5c/6492740/4c89ab9/e6f676b，详见
-  review-history.md 第四轮修复节）：H1 重试队列 + M2 退避移出主循环 +
-  H2 unix 字段 + M1 重试中不算闲置 + L3/L4/L1/M3 + 文档/skill 全批；
-  配套修复用户实测「改端口 restart 误报未就绪」（就绪判定按新 pid 定位，
-  restart 与看门狗 respawn 同款）与 skill「stop 后再 start」误导源三处
-- [x] restart 换端口回归集成测试（tests/restart_integration.rs 2 例）
-
-## alpha.6 之后（2026-09-09~10，unix 实测轮）
-
-- [x] **unix 分支实测**（ssh remote Ubuntu 24.04 实机，报告 .agents/docs/unix-testing.md）：
-  修复 5 项——P0 编译/链接阻断 2 项（watchdog Duration 导入、daemon extern 符号名
-  libc_kill→kill）、P1 看门狗 unix 失效 2 项（adopt_scan 收养不进 + zombie 误判/
-  terminate 空操作）、P2 测试平台假设 3 处；解锁 5 个 Windows-only 测试并在 Linux
-  通过；功能/并发/内存/perf/valgrind/体积全套数据入报告。
-  分支 fix/unix-first-test（.worktree/unix-fixes），待合并。
 - [ ] **产品语义决策**（实测发现）：unix 上 APROXY_RUN_DIR 影响 IPC 寻址
   （UDS 路径在 run_dir 内，Windows 管道全局名不受影响）——是否对齐待定。
   2026-09-22 router 实测补充：logs/status 的注册表读取与 IPC ping 在
@@ -392,38 +148,8 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   删 .restore，看护者不 respawn）→ 看护者等 `watchdog_idle_exit_secs`
   空闲自灭。根因是测试收尾未覆盖 panic/超时路径，与上一条 RAII 化同源
 
-## 待修（2026-09-10 压力实测审查轮）——已全部修复（a389d40/01978b4/f13bc0a/9cc53c8，详录 .agents/docs/unix-stress-review.md 修复记录节）
+### 修复审查轮遗留（2026-09-10，独立复验后记录，详录 .agents/docs/unix-stress-review.md 复验节）
 
-- [x] **S1（产品级，两平台同病）：respawn 就绪判定竞态**——respawn A 的就绪等待
-  （每 200ms 调 list_instances_in）顺带删掉同注册表里 B/C 死实例的 .pid → 死亡事件
-  被误判优雅退出 → 永不 respawn。修复：respawn_instance 改 registry_contains_pid_in
-  只读检索 + handle_death 以 .restore 为唯一优雅退出依据 + server.rs 退出清理先
-  .restore 后 .pid。复跑 p6_storm：3/5 → PASS=5 FAIL=0（3 实例全部 respawn）。
-- [x] **S2：refresh_claim 无条件覆写无运行期夺权检测**——被接管的前任恢复后与
-  接管者互相翻转 claim、双看护者共存。修复：refresh_claim 覆写前校验 pid 归属，
-  易主即让位退出；unix terminate_verified 实装 SIGKILL。复跑 p7_takeover：
-  PASS=5 FAIL=0，claim 单一 pid，前任被真杀。
-- [x] **S3：is_aproxy_process unix 占位恒 true**——/proc/<pid>/exe 比对 basename
-  实装（ENOENT 判死对齐 Windows 拒收；权限失败 fail-open；「 (deleted)」后缀兼容
-  swap 升级）。选举与收养链随判定生效自动修复。
-- [x] **S4：health_scan「无 PID 复用风险」注释 unix 不成立**——注释按平台改写 +
-  处决前加 is_aproxy_process 防误杀关卡（ starttime 字段方案未采纳：S3 的 exe
-  比对已封住复用误杀面，字段增加无增量收益）。
-- [x] **S5：/dev/shm 心跳文件与 UDS socket 无退出清理**——新增 remove_heartbeat_file
-  与 daemon::remove_socket_file（Windows 均 no-op），守护优雅退出 + 看护者
-  handle_death 两处调用。
-- [x] **S6：macOS 回退分支对 zombie 失效**——注释补声明，health_scan 兜底
-  （macOS 未实测平台，接受退化）。
-
-## 修复审查轮遗留（2026-09-10，独立复验后记录，详录 .agents/docs/unix-stress-review.md 复验节）
-
-- [x] **R1（测试覆盖）→ 已补（75afe6b）**：registry_contains_pid_in 四分支 +
-  is_aproxy_process unix 版真实 zombie/ENOENT 判死单测 + 正名成功路径集成断言 +
-  swap 覆盖替换 (deleted) 语义集成测试（unix）。实测纠正：rename 走开（mv）不产生
-  「 (deleted)」后缀（exe 跟随新路径名）；fail-open 分支无法确定性构造，留人工路径。
-- [x] **R2（探针维护）→ 已修（75afe6b）**：p7_takeover.sh 文案与断言对齐修复后
-  语义（接管即杀前任 SIGCONT 不可恢复 / 接管者在任 / claim 单一 pid 三条硬断言），
-  复跑 PASS=7 FAIL=0
 - [ ] **F2（产品决策）：is_aproxy_process 二进制名精确耦合**——改名运行的二进制
   （如生产 aproxy-using.exe 部署形态）被判非 aProxy 进程：不被收养（失去看门狗
   自动恢复，remote 实证：改名副本运行时看护者收养日志 0 条）、不计入选举、
@@ -431,86 +157,13 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   Windows 侧 merge-base 前已有语义，unix 实装后两端一致。待决策：接受「改名
   二进制不受看护」为约定，或放宽比对（会同时削弱防冒名闸门）
 
-## 中期功能（对齐「无限重试、不中断」使命）
+### 中期功能（对齐「无限重试、不中断」使命）
 
 - [ ] **正式发布：GitHub 构建指令集多版本**（必然项，2026-09-07 定调）：CI 矩阵 baseline + `RUSTFLAGS="-C target-cpu=x86-64-v3"`（AVX2），产物命名区分，发布页两者都放；详见 memory/release-engineering
 - [ ] **H.（可选）配置热重载**：IPC reload，避免 restart 断流（改配置生效目前用 restart，已有单命令路径）
-- [x] **install/upgrade 二进制安装升级**（2026-09-11 完成，alpha.10）：完整计划
-  `.agents/plan/install-v1.md` 十步全部落地——APROXY_HOME 重定向/状态机/
-  staging/交换原语（Windows 双 rename 舞 + PATHEXT fallback）/PrepareSwap
-  广播 + 安装态宣告节 + 看护者差异化/滚动重启/恢复续作（崩溃注入测试
-  全矩阵）/下载链条（github+sha256/npm+integrity/binstall/cargo + url 模板
-  + 下载代理分离）/skill 支线（并行 + 原子落位 + 路径穿越防护）。
-  CLI：`install [latest|版本]`、`--from/--adopt/--skills-only/--abort/
-  --no-skills/--variant/--allow-downgrade/--download-proxy`。
-  实测挖出并修复的深层 bug：守护优雅退出删 .restore（restart 须先取参数）、
-  IPC 消失≠进程终止（新增 process_exited 退出码判死）、10s 宽限强退竞速、
-  tokio runtime drop 等无限任务须硬退、fallback bat 空窗验证通过。
-  坑与教训：.agents/memory/2026-09-11-install-pitfalls.md
-- [x] **install 三平台深审查实测**（2026-09-11，090ea90 前后提交链）：Windows/
-  Ubuntu(ssh remote)/WSL(Debian) 三平台全量测试 + CLI 级 e2e 全绿（Windows
-  24/24、两 Linux 各 26/26）。实测挖出并修复 5 个真 bug：unix 编译面×2
-  （announce E0596、is_x86_feature_detected aarch64）、平台硬编码测试×2、
-  库层 IPC 环境依赖泄漏（run_dir 参数被全局 env 派生架空 + 误删注册表副作用）、
-  有实例 Acked/Swapping 续作被状态机拒绝（相位守卫）。CI unix job 同步升级
-  为 cargo test。CI 首次暴露流程教训：push 后必须 gh run list 确认绿
-  （且要按 workflow 名过滤——同一次 push 会同时触发 CI 与 Review）。
-  详录 .agents/memory/2026-09-11-install-three-platform-e2e.md
-  **遗留**：CI 升级后 macos job 一直红（见下节 macOS 支持），当时误报为绿
-- [x] **install 在线渠道深度实测**（2026-09-12，WSL 3 轮 × 16 场景全 PASS）：
-  测试 tag（v…tN，用户授权）触发全链发布做真实下载测试。挖出并修复 5 个
-  产品 bug + 2 个韧性改进（gnu→musl 自动回退、latest 查询 npm 兜底）+
-  release 版本对齐机制（build/publish 双 job）。代价：crates.io 的
-  alpha.10/alpha.11 正式号被测试发布抢注（对齐缺失时代），正式版顺延
-  alpha.12（Cargo.toml 已 bump，待发布）。详录
-  .agents/memory/2026-09-12-install-online-deep-test.md 与
-  .agents/memory/2026-09-12-release-version-alignment.md
-- [x] **正式发布 v0.1.0-alpha.12**（2026-09-14，用户下令）：annotated tag
-  `v0.1.0-alpha.12` 打于 `50b94f2`，触发 Release workflow（test 门禁 → 11 变体
-  构建 → GitHub/npm/crates.io 发布）。发版时 CI 状态：ubuntu job 绿、macOS 红
-  （既有未支持平台）、windows 红于一条**既有竞态偶发**（见下条）。三平台验证：
-  本地 Windows 241 项全绿、远端 Ubuntu 全绿；WSL 因无网络拉不下新依赖
-  （brotli/ruzstd）未能跑，其环境事实见
-  `.agents/docs/environment.md` / 本文件「WSL 无 git/curl/python3 且有 TLS 故障」
 - [ ] **测试稳定性**：proxy_integration 的 alias_start_and_stop_roundtrip
   偶发并行失败（单跑必过——端口/时序竞争，本轮全量跑撞上一次）
-- [x] **测试稳定性（新，有本机复现）**：`install_flow_lib` 的
-  `continue_from_swapping_with_live_instance_redoes_swap` 是**既有竞态偶发**——
-  2026-09-14 本机隔离重复 5 次**复现 1 次失败**（第 2 次耗时 90.33 秒，撞测试
-  内部 90 秒超时；CI 那次是同一测试的 `done 后状态文件应删除` 断言，症状不同但
-  同一处）。与当轮改动无文件交集（该文件未被触碰），ubuntu CI 恒绿、远端 Ubuntu
-  全绿。**注意它会卡住 Release 的 test 门禁（跑在 windows-latest）**，
-  值得专项排查：疑似「活实例滚动重启 + 状态文件删除」这条路径在 Windows 上有
-  时序/句柄竞争（Windows 上删除被打开的文件会失败）。
-  **2026-09-22 应验并已修复**：alpha.15 发版时 CI 实锤卡门禁——Release run
-  35725451213 连续两次失败于同一断言（2.63s/2.95s 快速失败，非超时），build/
-  publish 全 skipped。定位到真正根因：**不是超时竞态，是 Windows 接力交棒
-  （FlowExit::HandedOver）语义未被测试跟上**——continue_install 交棒返回时
-  状态文件留给接棒者，测试却立即断言「已删除」；windows-latest 高概率走进
-  交棒分支故确定性失败，本机时好时坏（时序决定走不走交棒）。修复：测试对
-  HandedOver 轮询等待接棒者收敛（90s 窗口）。发版后记：正式 tag 发布失败
-  且 publish 未跑时删 tag 重打是安全操作（crates.io/npm 无该版本记录）。
-  **待办消除**（竞态不再是谜，根因闭环）。
-- [x] **渠道 P0 全配 + 可信发布自动化**（2026-09-11，alpha.7~9 三轮发布实测）：
-  npm（@meowo/aproxy，esbuild 式多平台包：主包 JS 转发器 + 9 平台子包
-  os/cpu/libc 装配）、crates.io（aproxy）、cargo-binstall（零配置命中内置
-  模板）、GitHub（11 变体：win x64±v3/x86/arm64 + linux x64/arm64 gnu+musl
-  + macOS arm64/x64）；tag 推送全自动发布（release.yml publish job，
-  npm OIDC provenance SLSA v1 实证 + crates.io trusted publishing #19617）；
-  种子发布走本地 token，token 退役（NPM_TOKEN secret 已删）。
-  坑与边界：npm GAT 有 IP 允许列表（GitHub runner 必 404，token 路径在 CI
-  不可行）；npm trust 网页绑定强制人类 2FA（AI 不可代办，crates.io 有
-  API 可代办——POST /api/v1/trusted_publishing/github_configs）；
-  npm 11 prerelease 强制 --tag latest（0.1.x 全程 alpha，latest=最新 alpha）
 - [ ] **看门狗二期（可选）**：挂死不杀进程原地救（scoped runtime 注入 spike）、实例数极大时线程池死亡等待（unix 死亡等待已实装为轮询，见 unix-testing.md）
-- [x] **CI 激活与首版发布**（2026-09-10）：仓库开源（MoYeRanqianzhi/aProxy）+
-  workflows 首跑全绿（CI/Review）；首跑抓到并修复 windows-sys 解析漂移
-  （^0.52 被 CI 解析为 0.61.2，HANDLE 类型不兼容）——精确钉死 =0.52.0 +
-  全工作流 --locked；v0.1.0-alpha.7 发布全链实测通过（7 变体 + skill 双包 +
-  SHA256 表 + 更新链文案 + prerelease 标记）；三平台引导脚本实测通过
-  （scripts/install.ps1|sh|cmd，APROXY_HOME 隔离测试，均实测从 GitHub 拉取
-  二进制与 skill 并通过校验/落位/--version/幂等全断言）；dependabot 运行中
-  （windows-sys 升级建议已忽略并关 PR）
 
 ## macOS 支持（必须完成——用户 2026-09-12 定调）
 

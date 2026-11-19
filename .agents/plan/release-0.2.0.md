@@ -481,6 +481,10 @@
   还要：release.yml 的 crates 发布顺序改为 aproxy-envelope、aproxy-ipc → aproxy-desktop → aproxy；align-version.py 一并对齐
   aproxy-ipc 的版本与根包、aproxy-desktop 对它的 `=` 要求；`rehearse-crates` 打包它。
 
+**2026-11-20 起**：实现、审查、看 CI 与性能测量都交给 Codex，主代理只做分配、裁定、合并与给人看的文字。接下来的任务按先后
+列在 [codex-tasks-0.2.0](codex-tasks-0.2.0.md)；性能的基线、重测与优化见 [perf-0.2.0](perf-0.2.0.md)。上面「做法」里
+「主代理直接实现各块」一句已不适用，其余（验收、提交、打 tag 的步骤）照旧。
+
 **阶段与 tag**（✓ 为已完成）：
 - 阶段 0（2026-11-11）：✓ 依赖安全修复 9e45495（12 条 RUSTSEC，zip 升 9）；✓ Actions 升级 9087969；✓ TODO 整理。
   dependabot：#8、#9、#11–#15 由这两个提交覆盖；#10（base64 0.23）关闭——headless 构建里 base64 只有一份 0.22，
@@ -491,7 +495,7 @@
   的 CI 测试（TODO 的 W2b 一条）。
 - 阶段 3：W4 `aproxy skill`、W3 i18n、W5 界面接入真实数据（前端可提前对 §6 的形状做 mock 侧的工作）→ **tag beta.1**。
 - 阶段 4：W6 修复（含 restart 偶发、`install --from` 降级检查）、0.1.0 skill 支线的防护（W4 一节最后一条：skills 资产换名、
-  npm 包内路径换、crate 不再带 `.claude/skills/`）、文档与 README 截图、W7 撤回预发布措辞与重写 SECURITY.md →
+  npm 包内路径换、crate 不再带 `.claude/skills/`）、性能重测与优化（[perf-0.2.0](perf-0.2.0.md)）、文档与 README 截图、W7 撤回预发布措辞与重写 SECURITY.md →
   **tag rc.1** → **v0.2.0**（aproxy-envelope 同时发 0.2.0；aproxy-format 0.2.0 随后走 format-v* 线，见 TODO 的 envelope 一条）。
 
 **进度记录**（每块完成时追加一行：块、提交、验证）：

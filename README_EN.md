@@ -366,13 +366,13 @@ timeout (for Claude Code, `API_TIMEOUT_MS`).
 | `aproxy start` | Start the proxy in the background (default config, default port 127.0.0.1:12345) |
 | `aproxy start <alias\|path>` | Start by alias or config file path |
 | `aproxy start --foreground` | Run in the foreground (logs to console, Ctrl+C to stop) |
-| `aproxy status` | List running instances (port/pid/version/upstream/config) |
+| `aproxy status` | List the home's instances and watchdog: running, unresponsive and waiting-to-be-restored instances and unreadable records, each in its own block; `--idle`/`--busy` filter the running ones |
 | `aproxy stop [PORT\|all\|alias]` | Stop instances; multi-instance requires a port, `all`, or an alias; `--force` kills instantly (the watchdog will not revive it); a target that already crashed has its desired-state record deleted |
 | `aproxy restart [PORT\|all\|alias]` | Restart running instances (restart-only, never starts); the new config is pre-checked before the old instance is stopped, and a failed check leaves it running; a failed start keeps the record, so `restore` or the watchdog can bring it back; `--force` kills instantly |
 | `aproxy logs [PORT\|ALIAS]` | Print the instance's most recent 200 log lines and exit; `-n N` sets the count, `-f` keeps following; `all` not supported |
 | `aproxy restore` | Revive instances from their desired-state records; a temporarily missing config file keeps the record and is reported; exits silently if none |
 | `aproxy alias add\|remove\|list` | Manage config aliases (stored in settings.json) |
-| `aproxy doctor` | Config health check: settings.json errors + alias/toml review (warnings) |
+| `aproxy doctor` | Check settings.json and every config by the rules `start` applies, plus home and config permissions and unreadable records; exits 3 when it finds an error |
 | `aproxy find [keyword]` | Discover all configs in configured directories; `--aliased/--unaliased --port PORT` filters |
 | `aproxy config show\|get\|set\|unset` | View or modify the config: `show` prints the values written in the file, `--effective` adds the global and built-in defaults with each value's source; `set`/`unset` change one key per command |
 | `aproxy settings show\|get\|set\|unset` | View or modify the global settings (`~/.aproxy/settings.json`): aliases, `defaults` global defaults, watchdog, logs, install updates; works even when settings.json has errors, to repair it |

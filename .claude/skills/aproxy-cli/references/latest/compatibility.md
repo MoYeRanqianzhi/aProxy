@@ -76,6 +76,8 @@ does not have. These development-line changes alter what you see or do on 0.1.0:
 | There is no `aproxy desktop` | builds with the desktop interface open a window with it; in the 0.2.0 alpha releases it shows demo data only (commands.md, desktop) |
 | There is no `aproxy install --force` and no process ledger | force install stops every process of the home through `<home>/ledger/` and replaces the binary (commands.md, Force install) |
 | The CPU build option is `--variant v3\|baseline`, and the swap renames the old binary to the fixed name `aproxy.old(.exe)` | the option is `--cpu x86-64-v3\|baseline` (`--variant` now picks `desktop` or `headless`), and the swap uses unique names `aproxy.old-<nanoseconds>-<pid>[.exe]` (commands.md, install / upgrade) |
+| `aproxy doctor` exits 0 whatever it finds, checks the default config only for a non-loopback address, and calls an alias that points to a missing file an error | it exits 3 when it finds an error, checks every config the way `start` would, and reports a missing alias target as a warning; `--json` gives the whole report (commands.md, doctor) |
+| Commands print their log lines, `INFO` included, on stdout | log lines go to stderr, warnings and errors only unless `RUST_LOG` asks for more, so stdout holds only results (commands.md, Output and exit codes) |
 
 For a version newer than these docs, refresh them: `aproxy install` updates the skill documents in
 `<home>/skills/` together with the binary, and `aproxy install --skills-only` updates only the

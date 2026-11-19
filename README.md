@@ -187,13 +187,13 @@ Codex 的 `stream_idle_timeout_ms` 默认 300000（5 分钟），按 SSE 事件�
 | `aproxy start` | 后台启动代理（默认配置，默认端口 127.0.0.1:12345） |
 | `aproxy start <别名\|路径>` | 按别名或配置文件路径启动 |
 | `aproxy start --foreground` | 前台运行（日志走控制台，Ctrl+C 停止） |
-| `aproxy status` | 列出运行中的实例（端口/pid/版本/上游/配置） |
+| `aproxy status` | 列出 home 里的实例与看护者：运行中、无响应、等待恢复的实例与读不懂的记录分块列出；`--idle`/`--busy` 只筛运行中的实例 |
 | `aproxy stop [PORT\|all\|别名]` | 停止实例；多实例必须指定端口、`all` 或别名；`--force` 立即强杀（不会被看门狗复活）；目标已崩溃时删掉它留下的期望状态记录 |
 | `aproxy restart [PORT\|all\|别名]` | 重启运行中的实例（只重启不启动；改配置生效用）；停旧实例前先预检新配置，不通过则旧实例保持运行；失败时记录保留，`restore` 或看门狗可拉回；`--force` 立即强杀重启 |
 | `aproxy logs [PORT\|别名]` | 打印实例日志最近 200 行后退出；`-n N` 改行数，`-f` 持续跟随；不支持 `all` |
 | `aproxy restore` | 恢复崩溃/重启前在运行的实例（按期望状态记录）；配置文件暂时找不到时保留记录并说明；无实例则静默结束（开机自启友好） |
 | `aproxy alias add\|remove\|list` | 管理配置别名（存于 settings.json） |
-| `aproxy doctor` | 配置体检：settings.json error 级检查 + 别名配置与目录 toml 审查（warning） |
+| `aproxy doctor` | 配置体检：settings.json 与每份配置都按 `start` 的规则检查，另查 home 与配置文件的权限、读不懂的记录；有 error 时以 3 结束 |
 | `aproxy find [关键字]` | 从配置目录发现全部配置；`--aliased/--unaliased --port PORT` 过滤 |
 | `aproxy config show\|get\|set\|unset` | 查看或修改配置：`show` 打印文件里写的值，`--effective` 连全局默认与内置默认一起打印并注明来源；`set`/`unset` 每次改一个键 |
 | `aproxy settings show\|get\|set\|unset` | 查看或修改全局设置（`~/.aproxy/settings.json`）：别名、`defaults` 全局默认、看护者、日志、安装更新；settings.json 有错误时也能用，用来修复它 |

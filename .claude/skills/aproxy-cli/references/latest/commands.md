@@ -99,6 +99,10 @@ reaches only one of them; use ports.
 
 - Messages are in Chinese; this file quotes them verbatim with an English gloss. Results go to
   stdout, errors to stderr. The Windows console is switched to UTF-8 at startup.
+- Log lines go to stderr too, warnings and errors only by default; set `RUST_LOG=info` (or
+  `debug`) to see more. stdout carries only results, so `--json` output stays one parseable
+  document whatever `RUST_LOG` says. The exception is `start --foreground`, whose instance writes
+  its log to stdout.
 - Secrets are never printed. A redacted secret prints as `<secret>` in text, or as
   `<secret sk-a…f3a9>` when it is at least 24 characters long (first and last four characters);
   `--json` prints `{"secret":true}` with a `"hint"` field in the same form. URLs lose their
@@ -126,9 +130,14 @@ the `--json` codes, not from the Chinese text.
 | restore | everything restored, or nothing to restore | every record failed | — | — | — | some failed, or a config file is missing |
 | status, find | always | — | — | — | — | — |
 | alias | success | invalid name, missing file, unknown alias, write failure | — | — | — | — |
+| doctor | no errors (warnings and infos do not count) | — | — | at least one error | — | — |
+| config | the values printed, or the change saved | write conflict or I/O failure | a malformed key path, or a value that is not TOML | the result would be invalid, an unknown key, or the file has errors (`show` still prints, then exits 3) | the file does not exist (`get`, or `show` with an explicit `--config`) | — |
+| settings | show/get printed; set/unset stored or unchanged | write failure | a malformed key path, or a value that is not JSON | the file cannot be read, or the change would make it invalid | — | — |
+| desktop | the window was closed; a window is already open for this home; on Windows from a terminal, the window was opened | headless build; no web view runtime or no display; the window failed to start | — | — | — | — |
+| install | installed; already latest; channel empty; nothing to abort | any failure | — | — | — | — |
 
-**`--json`** (on `start`, `stop`, `restart`, `restore`, `status`, `find`, `alias list`, and the
-`config` and `settings` subcommands) prints exactly
+**`--json`** (on `start`, `stop`, `restart`, `restore`, `status`, `find`, `doctor`, `alias list`, and
+the `config` and `settings` subcommands) prints exactly
 one JSON document on stdout, starting with `"schema":1`; the human-readable lines move to stderr.
 When the whole command fails, the document is
 `{"schema":1,"error":{"code","message","details"}}`; `code` names the cause, for example
@@ -146,11 +155,6 @@ instance:
 `restarted`, `failed` for `restart`; `restored`, `already_running`, `config_missing`, `failed` for
 `restore`. A `failed` item carries an `error` object shaped like the failure document's (codes such
 as `instance_unresponsive`, `stop_failed`, `restart_unsupported`, `config_invalid`).
-| doctor | always, **even when it reports errors** | never |
-| config | the values printed or the change saved | 1: write conflict or I/O failure; 2: a malformed key path or a value that is not TOML; 3: the result would be invalid, an unknown key, or the file has errors (`show` still prints, then exits 3); 4: the file does not exist (`get`, or `show` with an explicit `--config`) |
-| settings | show/get printed, set/unset stored or unchanged | a malformed key path or unparsable JSON value (2); the file cannot be read, or the change would make it invalid (3); write failure (1) |
-| desktop | the window was closed; a window is already open for this home; on Windows from a terminal, the window was opened | headless build; no web view runtime or no display; the window failed to start |
-| install | installed; already latest; channel empty; nothing to abort | any failure |
 
 `install --force` exits 0, 10, 11 or 12 instead; see install / upgrade, Force install.
 
@@ -576,20 +580,45 @@ so an empty `errors` means the config would pass `start`'s config check.
 ## doctor
 
 ```
-aproxy doctor
+aproxy doctor [--json]
 ```
 
-Prints `[ERROR]` and `[WARN]` findings and `检查结果: <n> error, <m> warning`, or
-`全部配置正常，未发现问题。` ("all configuration fine"). It exits 0 either way, so read the output.
+Checks, without changing anything, every file aproxy reads, with the same parsers `start` uses:
+settings.json; the default config (when it exists or settings.json names it), every alias target and
+every `*.toml` directly inside the config directories, each resolved the way `start` would resolve it,
+settings.json `defaults` included; the permissions of the home and of each config; and records in
+`run/` that cannot be read. Run it after editing configuration by hand, and when `start`, `restart`
+or `status` report something you cannot explain.
 
-| Level | Checks |
+Each finding is one line, `[ERROR]`, `[WARN]` or `[INFO]` followed by
+`file:line:col: key: message [code]` (line, column and key appear when known; the message is in
+English). An unknown key gets a second line with the command that deletes it, `删除这个键: aproxy
+settings unset '<key>'` or `删除这个键: aproxy config --config '<file>' unset '<key>'` ("delete this
+key"). The last line is `检查结果: <n> error, <m> warning, <k> info` ("result"); with nothing to
+report the output is `全部配置正常，未发现问题。` ("all configuration fine").
+
+**Exit 3 when there is at least one error, 0 otherwise**: warnings and infos never fail it. An error
+in a config means `start` refuses that config; an error in settings.json means most commands refuse
+to run (settings-json.md, "When settings.json is invalid").
+
+| Severity | Findings and their codes |
 |---|---|
-| ERROR | settings.json: every problem the strict parser reports (JSON syntax, an unknown key, a wrong type or value, `watchdog.heartbeat_secs = 0`, a credential in `defaults` without its target, a newer `schema`), an invalid alias name, and an alias pointing to a missing file |
-| WARN | configs that aliases point to, and other `*.toml` in the config directories: parse and validation failures, non-loopback listen addresses, port conflicts within each group (legal as long as the configs do not run at the same time); questionable watchdog values; a home that other users can access, as `主目录 <path> 能被别的用户访问（<who>）：…` ("the home can be accessed by other users"), where `<who>` is `mode 0755`-style on Unix and the extra accounts on Windows. The line ends with `aproxy 下一次往里写入时会自动收紧` ("tightened automatically at the next write") when the current user owns the home, and otherwise says the owner has to fix it |
+| error | everything `start` rejects, in settings.json and in each config: syntax (`config_syntax`), an unknown key (`config_unknown_key`), a wrong type or value (`config_type`, `config_invalid_value`), a missing key (`config_missing_key`), a newer settings.json `schema` (`settings_schema_too_new`). In settings.json this includes `watchdog.heartbeat_secs` or `watchdog.stale_after_cycles` set to 0, a credential in `defaults` without the `base_url` or `proxy` it belongs to, and an invalid alias name |
+| warning | `config_file_unreadable`: an alias or `default_config` points at a file that is missing or cannot be read. `config_dir_missing`: a directory added to `config_dirs` does not exist. `listen_not_loopback`: any host that can reach the port can use the proxy, with the key it injects. `port_shared`: configs on the same port cannot run at the same time (each alone is fine). `file_permissions_too_open`: other users can read the home or a config, which hold keys; when the current user owns the home, aproxy tightens it on its next write. `watchdog_slow_hang_detection`: `watchdog.heartbeat_secs` above 600 delays hang detection. `watchdog_restarts_disabled`: `watchdog.max_restarts` is 0. `record_unreadable`, `record_schema_too_new`: a record in `run/` is left as it is, and log cleanup pauses while it is there |
+| info | `default_header_shared`: a header in settings.json `defaults` is sent to every target; a header that carries a credential belongs in the configs that need it |
 
-**The default config gets only the non-loopback check** unless an alias points at it. To validate
-it fully, give it an alias (`aproxy alias add main <path>`; without a path the alias names
-`<home>/config.toml`), or rely on `aproxy restart`, which validates before it stops anything.
+`--json` prints one document:
+
+```json
+{"schema":1,"files":[{"file":"C:\\Users\\me\\.aproxy\\settings.json","kind":"settings","diagnostics":[]},{"file":"C:\\Users\\me\\.aproxy\\config.toml","kind":"config","diagnostics":[{"code":"config_unknown_key","severity":"error","file":"C:\\Users\\me\\.aproxy\\config.toml","key":"retyr","line":3,"column":1,"message":"unknown key retyr","details":{}}]}],"summary":{"errors":1,"warnings":0}}
+```
+
+`files` lists every file checked, in the order settings, configs (by path), home, unreadable
+records (`kind` is `settings`, `config`, `home` or `record`); a file without findings has an empty
+`diagnostics`, so the list also tells you what was covered. A diagnostic has `code`, `severity`
+(`error`, `warning`, `info`), `file`, `message` and `details`, plus `key`, `line` and `column` when
+known. `"gc_paused":{"reason":"unreadable_records"}` appears while log cleanup is paused. The exit
+code is the same as in text mode.
 
 ## config
 

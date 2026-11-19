@@ -312,6 +312,35 @@ const RETIRE_GRACE: Duration = Duration::from_secs(2);
 impl Worker {
     /// 无数据可读才复用；正常 EOF 使本次回信有效但不留进程，未请求的额外字节则使往返失败。
     fn reusable(&mut self) -> Result<bool, Fault> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            if !self.stdout.buffer().is_empty() {
+                return Err(Fault::Protocol);
+            }
+            // Unix 子管道本身是非阻塞的；进程已写出字节时，反应器的就绪缓存还可能没收过这次通知。
+            let mut byte = 0u8;
+            loop {
+                // SAFETY: 管道由本 worker 独占；指针指向可写的一个字节，不保留其地址。
+                let n = unsafe {
+                    libc::read(
+                        self.stdout.get_ref().as_raw_fd(),
+                        (&mut byte as *mut u8).cast(),
+                        1,
+                    )
+                };
+                match n {
+                    1 => return Err(Fault::Protocol),
+                    0 => return Ok(false),
+                    _ => match std::io::Error::last_os_error().kind() {
+                        std::io::ErrorKind::Interrupted => continue,
+                        std::io::ErrorKind::WouldBlock => return Ok(true),
+                        _ => return Err(Fault::Io),
+                    },
+                }
+            }
+        }
+        #[cfg(not(unix))]
         match futures_util::FutureExt::now_or_never(self.stdout.fill_buf()) {
             None => Ok(true),
             Some(Ok([])) => Ok(false),

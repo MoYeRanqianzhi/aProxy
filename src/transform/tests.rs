@@ -199,7 +199,7 @@ async fn spawn_mode_borrowed_worker_never_reused() {
 async fn idle_zero_means_never_reaped() {
     let p = pool(Process::Persistent, "echo", |e| e.worker_idle_secs = 0);
     call(&p, "keep", false).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(p.reaper.get().is_none());
     assert_eq!(p.idle.lock().unwrap().len(), 1);
 }
 /// 横幅破坏握手，无论如何分类都不是一次业务拒绝。
@@ -237,6 +237,21 @@ async fn stray_line_arriving_while_idle_is_evicted_before_reuse() {
     let a = worker(call(&p, "s1", false).await.unwrap(), "s1");
     let pid = a.split_once('/').unwrap().1;
     std::fs::write(dir.path().join(format!("release-{pid}")), b"").unwrap();
+    // Unix 的单线程反应器故意不让出：已刷到管道的帧不一定已经触发 Tokio 的就绪通知。
+    #[cfg(unix)]
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !std::fs::read_to_string(&obs)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|v| v["event"] == "stray-written")
+        {
+            assert!(std::time::Instant::now() < deadline, "no post-flush marker");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    #[cfg(not(unix))]
     wait_observed(&obs, "stray-written", 1).await;
     assert_ne!(a, worker(call(&p, "s2", false).await.unwrap(), "s2"));
 }
@@ -254,7 +269,13 @@ async fn idle_worker_that_exited_is_skipped_on_take() {
         e.args.push("100".into())
     });
     let a = worker(call(&p, "d1", false).await.unwrap(), "d1");
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !p.ids.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("idle worker was not reaped");
     let b = worker(call(&p, "d2", false).await.unwrap(), "d2");
     assert_ne!(a, b);
     assert!(a.starts_with("0/") && b.starts_with("0/"), "{a}, {b}");

@@ -1248,17 +1248,34 @@ async fn request_persistent_idle_worker_death_respawns() {
     // 下一个请求必须换新 worker 成功，而不是写进死管道后 502
     let (upstream, log, _jh) = recording_upstream().await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.formats.push(single_worker_persistent(
-        &["die-idle", "200"],
-        &[Stage::Request],
-    ));
+    let home = common::TestHome::new();
+    let obs = home.path().join("observed");
+    let mut entry = single_worker_persistent(&["die-idle", "200"], &[Stage::Request]);
+    entry
+        .env
+        .insert("ECHO_OBSERVE".into(), obs.display().to_string());
+    cfg.formats.push(entry);
     let (proxy, _pj) = start_proxy(cfg).await;
     let client = local_client();
 
     let (s1, t1) = post_body(&client, &proxy, "AAA").await;
     assert_eq!((s1, t1.as_str()), (StatusCode::OK, "AAA"));
-    // 远超空闲阈值：确保 worker 已退出（进程退出在 Windows 上也有收尾延迟）
-    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    // 等处理首个请求的进程确实退出，不把调度和回收耗时算成测试的固定延时。
+    let pid = std::fs::read_to_string(&obs)
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["event"] == "request")
+        .unwrap()["pid"]
+        .as_u64()
+        .unwrap() as u32;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while aproxy::process::process_exited(pid) != Some(true) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("idle worker did not exit");
     let (s2, t2) = post_body(&client, &proxy, "BBB").await;
     assert_eq!(
         (s2, t2.as_str()),

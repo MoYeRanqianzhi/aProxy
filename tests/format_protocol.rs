@@ -494,13 +494,18 @@ async fn chain_runs_request_in_order_and_response_and_heartbeat_in_reverse() {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
         .await
         .unwrap();
-    let app = axum::Router::new().fallback(|body: String| async move {
-        assert_eq!(body, "qAB");
-        tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
-        (
-            [("content-type", "text/event-stream")],
-            "data: response\n\n",
-        )
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = release.clone();
+    let app = axum::Router::new().fallback(move |body: String| {
+        let gate = gate.clone();
+        async move {
+            assert_eq!(body, "qAB");
+            gate.acquire().await.unwrap().forget();
+            (
+                [("content-type", "text/event-stream")],
+                "data: response\n\n",
+            )
+        }
     });
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let stages = "'request','response','heartbeat'";
@@ -508,14 +513,26 @@ async fn chain_runs_request_in_order_and_response_and_heartbeat_in_reverse() {
         + &layer(&home, "outer", stages, &["append", "A"])
         + &layer(&home, "inner", stages, &["append", "B"]);
     let (client, url) = running(&home, up, &config);
-    let res = client
+    let mut res = client
         .post(format!("{url}/stream"))
         .header("accept", "text/event-stream")
         .body("q")
         .send()
         .await
         .unwrap();
-    let text = res.text().await.unwrap();
+    let mut bytes = Vec::new();
+    let beat = b": keepalive\n\n: B\n\n: A\n\n";
+    while !bytes.windows(beat.len()).any(|w| w == beat) {
+        bytes.extend_from_slice(
+            &res.chunk()
+                .await
+                .unwrap()
+                .expect("stream ended before a converted beat"),
+        );
+    }
+    release.add_permits(1);
+    bytes.extend_from_slice(&res.bytes().await.unwrap());
+    let text = String::from_utf8(bytes).unwrap();
     assert!(text.contains(": keepalive\n\n: B\n\n: A\n\n"), "{text:?}");
     assert!(text.ends_with("data: response\n\nBA"), "{text:?}");
     for (name, request, heartbeat, response) in [
@@ -1080,16 +1097,7 @@ async fn second_start_waits_for_failed_hello_and_prepare_swap_changes_nothing() 
     assert!(
         matches!(err,aproxy::daemon::IpcError::Remote{code,details,..} if code=="invalid_state" && details["state"]=="starting")
     );
-    let mut second = home
-        .cmd()
-        .args(["start", "--json", "--config"])
-        .arg(path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
-    assert!(second.try_wait().unwrap().is_none());
+    let second = observing_start(&home, &path).await;
     let original = first.wait_with_output().unwrap();
     let observer = second.wait_with_output().unwrap();
     assert_eq!(original.status.code(), Some(1));

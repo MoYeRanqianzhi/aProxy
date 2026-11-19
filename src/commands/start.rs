@@ -1,4 +1,4 @@
-//! `aproxy`（无子命令）/ `aproxy start [别名|路径]`：启动代理；以及后台实例的入口
+//! `aproxy start [别名|路径]`：启动代理；以及后台实例的入口
 //! `aproxy __serve`。
 //!
 //! 父进程侧的动作（配置解析与校验、端口预检、后台拉起与就绪等待）在操作层
@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use aproxy::cli::Cli;
+use aproxy::cli::StartArgs;
 use aproxy::daemon;
 use aproxy::ops::start::{
     Preflight, PreflightError, launch, load_lenient, overrides_from_cli, preflight,
@@ -18,22 +18,28 @@ use aproxy::spec::{self, InstanceSpec};
 
 use crate::server::{bind_error_message, report_config_error, serve_forever};
 
-/// `aproxy`（无子命令）/ `aproxy start [别名|路径]`：后台启动实例；
-/// --foreground 前台运行。
+/// `aproxy start [别名|路径]`：后台启动实例；--foreground 前台运行。
 ///
 /// target 解析：settings.json 别名表优先（`aproxy alias add` 管理），
 /// 其次按配置文件路径；都落空则报错。
 ///
 /// 端口冲突的情况严格区分（同端口已有实例 / 同端口不同地址的另一实例 / 绑定失败），
 /// 判定在 `aproxy::ops::start::preflight`。
-pub(crate) async fn handle_start_cmd(
-    cli: &Cli,
-    cfg_path: Result<PathBuf, String>,
-    target: Option<String>,
-) {
+pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
+    // `--api-key -`：密钥从 stdin 读一行，不出现在命令行上
+    if args.api_key.as_deref() == Some("-") {
+        match crate::util::read_secret_line() {
+            Ok(key) => args.api_key = Some(key),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    let target = args.target.clone();
     // 给了 target 就不需要默认配置——失效的 default_config 只拦无 target 的启动
     let cfg_path = match target.as_deref() {
-        None => super::require_cfg_path(cfg_path),
+        None => super::require_cfg_path(super::resolve_cfg_path(args.config.as_deref())),
         Some(t) => match resolve_config_target(t) {
             Some(p) => p,
             None => {
@@ -47,9 +53,9 @@ pub(crate) async fn handle_start_cmd(
     // 这个实例有没有配置文件：命令行指定的、别名或路径给出的，必须在（打错路径时明确
     // 报错，而不是悄悄按空配置启动）；什么都没给、默认的 config.toml 也不在，就是一个只靠
     // 覆盖旗标与 settings.json 全局默认启动的实例
-    let explicit = cli.config.is_some() || target.is_some();
+    let explicit = args.config.is_some() || target.is_some();
     let cfg_file: Option<&Path> = (explicit || cfg_path.exists()).then_some(cfg_path.as_path());
-    let overrides = overrides_from_cli(cli);
+    let overrides = overrides_from_cli(&args);
     let cfg = match resolve_runtime_config(&overrides, cfg_file) {
         Ok(c) => c,
         Err(msg) => {
@@ -96,7 +102,7 @@ pub(crate) async fn handle_start_cmd(
         }
     }
 
-    if cli.foreground {
+    if args.foreground {
         serve_forever(cfg, cfg_file, None).await;
         return;
     }

@@ -1232,7 +1232,13 @@ fn forward_only_with_transform_start_fails() {
     std::fs::write(&cfg_path, raw).unwrap();
 
     // 无子命令 = start：validate 在预检之前，报互斥错误退出且不产生任何进程
-    let out = home.cmd().arg("--config").arg(&cfg_path).output().unwrap();
+    let out = home
+        .cmd()
+        .arg("start")
+        .arg("--config")
+        .arg(&cfg_path)
+        .output()
+        .unwrap();
     assert!(!out.status.success(), "互斥配置应启动失败");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

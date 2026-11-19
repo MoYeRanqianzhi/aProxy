@@ -79,7 +79,7 @@ async fn run(cli: Cli) {
     // 配置文件、settings 检查与拉起续作之前：它不读配置与 settings.json——要修的
     // 可能正是它们，损坏的 settings.json 不能挡住修复它的手段；它也不能拉起续作，
     // 续作要推进的那个安装正是它要清掉的
-    if let Some(Commands::Install(args) | Commands::Upgrade(args)) = &cli.command
+    if let Some(Commands::Install(args)) = &cli.command
         && args.force
     {
         server::init_force_logging();
@@ -94,10 +94,6 @@ async fn run(cli: Cli) {
         eprintln!("[ERROR] {e}");
         std::process::exit(1);
     }
-
-    // 实际生效的配置文件路径（default_config 失效时为 Err）。只在真正要读配置
-    // 的命令里兑现，见 commands::resolve_cfg_path
-    let cfg_path = commands::resolve_cfg_path(&cli);
 
     // 后台实例：按交接文件里的拉起规格承载服务，日志由它自己按规格初始化。排在
     // settings 检查与续作拉起之前：这两件事都是给坐在终端前的人准备的，实例自己在解析
@@ -142,12 +138,7 @@ async fn run(cli: Cli) {
     if !loaded.is_valid() && !reports_itself {
         let tolerated = matches!(
             cli.command,
-            Some(
-                Commands::Status { .. }
-                    | Commands::Stop { .. }
-                    | Commands::Install(_)
-                    | Commands::Upgrade(_)
-            )
+            Some(Commands::Status { .. } | Commands::Stop { .. } | Commands::Install(_))
         );
         let level = if tolerated { "WARN" } else { "ERROR" };
         eprintln!("[{level}] settings.json 有错误:");
@@ -176,10 +167,7 @@ async fn run(cli: Cli) {
     // --continue`（不等待不提示，本命令照常执行）。续作进程的接管判定
     // 自会收敛（原安装进程健在则不动）。install 自身的分派分支跳过
     // （--continue/--abort 与续作无并发意义，且避免递归拉起）。
-    let is_install_cmd = matches!(
-        cli.command,
-        Some(Commands::Install(_)) | Some(Commands::Upgrade(_))
-    );
+    let is_install_cmd = matches!(cli.command, Some(Commands::Install(_)));
     if !is_install_cmd
         && aproxy::install::state::load().is_some()
         && let Ok(exe) = std::env::current_exe()
@@ -190,15 +178,12 @@ async fn run(cli: Cli) {
         );
     }
 
-    // 子命令分派；无子命令 = 启动代理（默认后台）
+    // 子命令分派
     match cli.command {
         Some(Commands::Status { idle, busy }) => {
             commands::status::handle_status_cmd(idle, busy).await
         }
-        Some(Commands::Start { ref target }) => {
-            let cli = cli.clone();
-            commands::start::handle_start_cmd(&cli, cfg_path, target.clone()).await;
-        }
+        Some(Commands::Start(args)) => commands::start::handle_start_cmd(args).await,
         Some(Commands::Stop {
             target,
             threshold,
@@ -209,7 +194,11 @@ async fn run(cli: Cli) {
             threshold,
             force,
         }) => commands::restart::handle_restart_cmd(target, threshold, force).await,
-        Some(Commands::Logs { target }) => commands::logs::handle_logs_cmd(target).await,
+        Some(Commands::Logs {
+            target,
+            lines,
+            follow,
+        }) => commands::logs::handle_logs_cmd(target, lines, follow).await,
         Some(Commands::Restore) => commands::restore::handle_restore_cmd().await,
         Some(Commands::Alias { cmd }) => commands::alias::handle_alias_cmd(cmd),
         Some(Commands::Doctor) => commands::doctor::handle_doctor_cmd().await,
@@ -219,18 +208,16 @@ async fn run(cli: Cli) {
             query,
             port,
         }) => commands::find::handle_find_cmd(aliased, unaliased, query, port),
-        Some(Commands::Config(args)) => {
-            commands::config::handle_config_cmd(cfg_path, args, cli.config.is_some())
-        }
+        Some(Commands::Config(args)) => commands::config::handle_config_cmd(args),
         Some(Commands::Settings { cmd }) => commands::settings::handle_settings_cmd(cmd),
-        Some(Commands::Install(args) | Commands::Upgrade(args)) => {
-            commands::install::handle_install_cmd(args).await
-        }
+        Some(Commands::Install(args)) => commands::install::handle_install_cmd(args).await,
         Some(Commands::Desktop) => unreachable!("desktop 在 main 里、建运行时之前已经分派"),
         Some(Commands::Serve { .. } | Commands::Watchdog { .. }) => {
             unreachable!("内部入口在子命令分派之前已经处理")
         }
-        None => commands::start::handle_start_cmd(&cli, cfg_path, None).await,
+        // 不带子命令的调用在参数解析时已经打印帮助并以 2 退出；走到这里的只有版本参数与
+        // 别的参数写在一起的情形，上面已经处理
+        None => unreachable!("没有子命令的调用在参数解析时已经结束"),
     }
 }
 

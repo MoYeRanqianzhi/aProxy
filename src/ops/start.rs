@@ -4,21 +4,21 @@
 
 use std::path::Path;
 
-use crate::cli::Cli;
+use crate::cli::StartArgs;
 use crate::config::{self, Config, Overrides};
 use crate::daemon::{self, InstanceStatus};
 use crate::settings;
 use crate::spawn::{self, SpawnError};
 use crate::spec::InstanceSpec;
 
-/// 命令行上给的覆盖旗标。
-pub fn overrides_from_cli(cli: &Cli) -> Overrides {
+/// `aproxy start` 命令行上给的覆盖。
+pub fn overrides_from_cli(args: &StartArgs) -> Overrides {
     Overrides {
-        base_url: cli.baseurl.clone(),
-        listen_addr: cli.listen.clone(),
-        proxy: cli.proxy.clone(),
-        api_key: cli.api_key.clone(),
-        log_file: cli.log_file.clone(),
+        base_url: args.base_url.clone(),
+        listen_addr: args.listen_addr.clone(),
+        proxy: args.proxy.clone(),
+        api_key: args.api_key.clone(),
+        log_file: args.log_file.clone(),
     }
 }
 

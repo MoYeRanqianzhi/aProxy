@@ -21,7 +21,7 @@ use std::path::PathBuf;
 
 use aproxy::settings as app_settings;
 
-/// 实际生效的配置文件路径：`--config` 显式指定 > settings.json 的 `default_config`
+/// 实际生效的配置文件路径：命令行上显式给的（`explicit`） > settings.json 的 `default_config`
 /// （用户可把日常主力配置换成任意文件）> 默认 `~/.aproxy/config.toml`。
 ///
 /// default_config 失效（文件被删/移动）返回 Err（给用户的报错）：静默回退默认
@@ -31,14 +31,14 @@ use aproxy::settings as app_settings;
 /// 一个失效的 default_config 拦住，报错里推荐的 `aproxy config --clear-default`
 /// 自己更必须能执行。
 ///
-/// 显式 `--config` 在此展开 `~` 并按当前工作目录绝对化：这个路径会被转发给
+/// 显式给的路径在此展开 `~` 并按当前工作目录绝对化：这个路径会被转发给
 /// 守护子进程、写进注册表与 .restore，日后可能在别的工作目录被读取（restore
 /// 会把找不到配置文件的记录当失效清理掉）。
-pub(crate) fn resolve_cfg_path(cli: &aproxy::cli::Cli) -> Result<PathBuf, String> {
-    if let Some(p) = &cli.config {
+pub(crate) fn resolve_cfg_path(explicit: Option<&std::path::Path>) -> Result<PathBuf, String> {
+    if let Some(p) = explicit {
         return Ok(match p.to_str() {
             Some(s) => app_settings::expand_path(s),
-            None => std::path::absolute(p).unwrap_or_else(|_| p.clone()),
+            None => std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()),
         });
     }
     match app_settings::load().default_config {
@@ -74,15 +74,11 @@ mod tests {
     fn explicit_config_path_is_made_absolute() {
         // 相对 --config 必须在 CLI 边界绝对化：它会被写进 .restore，restore 若在
         // 别的工作目录运行，相对路径会被当成「配置已不存在」而清掉记录
-        let cli =
-            aproxy::cli::Cli::try_parse_from(["aproxy", "--config", "rel.toml", "status"]).unwrap();
-        let path = resolve_cfg_path(&cli).unwrap();
+        let path = resolve_cfg_path(Some(std::path::Path::new("rel.toml"))).unwrap();
         assert!(path.is_absolute(), "{}", path.display());
         assert_eq!(path, std::env::current_dir().unwrap().join("rel.toml"));
 
-        let cli =
-            aproxy::cli::Cli::try_parse_from(["aproxy", "--config", "~/x.toml", "status"]).unwrap();
-        let path = resolve_cfg_path(&cli).unwrap();
+        let path = resolve_cfg_path(Some(std::path::Path::new("~/x.toml"))).unwrap();
         assert_eq!(path, aproxy_ipc::home::user_dir().unwrap().join("x.toml"));
     }
 
@@ -107,7 +103,7 @@ mod tests {
             aproxy::cli::Cli::try_parse_from(std::iter::once("aproxy").chain(args.iter().copied()))
         };
         let install = |args: &[&str]| match parse(args).unwrap().command {
-            Some(aproxy::cli::Commands::Install(a) | aproxy::cli::Commands::Upgrade(a)) => a,
+            Some(aproxy::cli::Commands::Install(a)) => a,
             other => panic!("{args:?} 解析成了 {other:?}"),
         };
         let a = install(&[

@@ -38,12 +38,9 @@ fn mask_transform_args(args: &[String]) -> Vec<String> {
     out
 }
 
-pub(crate) fn handle_config_cmd(
-    path: Result<PathBuf, String>,
-    args: ConfigArgs,
-    explicit_config: bool,
-) {
+pub(crate) fn handle_config_cmd(args: ConfigArgs) {
     let ConfigArgs {
+        config,
         baseurl,
         listen,
         api_key,
@@ -97,7 +94,15 @@ pub(crate) fn handle_config_cmd(
     }
 
     // 以下编辑/查看 toml 内容，才真正需要配置文件路径
-    let path = super::require_cfg_path(path);
+    // 给了 --config：别名优先；不是别名就当路径，文件可以还不存在（给一个新路径加上修改
+    // 参数，就是在建一份新实例的配置）。没给：默认配置文件
+    let explicit_config = config.is_some();
+    let path = match config.as_deref() {
+        Some(target) => settings::resolve_alias(target)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| settings::expand_path(target)),
+        None => super::require_cfg_path(super::resolve_cfg_path(None)),
+    };
     let fail = |msg: String| -> ! {
         eprintln!("{msg}");
         crate::util::exit(1)

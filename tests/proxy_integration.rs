@@ -4706,7 +4706,13 @@ use std::process::Command;
 fn cli_config_flag_rejects_missing_file_on_start() {
     let home = TestHome::new();
     let missing = home.path().join("nope.toml");
-    let out = home.cmd().arg("--config").arg(&missing).output().unwrap();
+    let out = home
+        .cmd()
+        .arg("start")
+        .arg("--config")
+        .arg(&missing)
+        .output()
+        .unwrap();
     assert!(
         !out.status.success(),
         "显式指定的配置文件不存在时启动必须失败（而非静默回退默认配置）"
@@ -4726,10 +4732,10 @@ fn cli_config_flag_scopes_config_subcommand() {
     // 多开工作流：为新实例创建独立配置，写入 --config 指定的文件
     let out = home
         .cmd()
+        .arg("config")
         .arg("--config")
         .arg(&cfg_file)
         .args([
-            "config",
             "--baseurl",
             "https://multi-instance.example.com",
             "--keepalive-secs",
@@ -4755,9 +4761,10 @@ fn cli_config_flag_scopes_config_subcommand() {
     // --show 读取的也是同一份文件
     let out = home
         .cmd()
+        .arg("config")
         .arg("--config")
         .arg(&cfg_file)
-        .args(["config", "--show"])
+        .args(["--show"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -5067,9 +5074,10 @@ fn cli_config_show_rejects_missing_explicit_file() {
     let missing = home.path().join("nope.toml");
     let out = home
         .cmd()
+        .arg("config")
         .arg("--config")
         .arg(&missing)
-        .args(["config", "--show"])
+        .args(["--show"])
         .output()
         .unwrap();
     assert!(
@@ -5319,6 +5327,7 @@ fn start_parent_command_output_returns() {
     // 等待 IPC 就绪后打印结果并退出——捕获输出的调用必须能等到这个退出
     let out = home
         .cmd()
+        .arg("start")
         .arg("--config")
         .arg(&cfg_file)
         .output()
@@ -5361,15 +5370,15 @@ fn logs_follows_daemon_and_exits_on_stop() {
     // 连接 logs（stdout 管道捕获；logs 进程为单层 spawn，无句柄继承问题）
     let mut child = home
         .cmd()
-        .args(["logs", &port.to_string()])
+        .args(["logs", "-f", &port.to_string()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn aproxy logs 失败");
     let collected = Arc::new(Mutex::new(String::new()));
-    let reader = {
+    // 日志行在 stdout，说明性的文字（连上了哪个实例、实例已停止）在 stderr：两路都收进同一份
+    let collect = |mut pipe: Box<dyn Read + Send>| {
         let collected = collected.clone();
-        let mut pipe = child.stdout.take().expect("logs stdout 管道");
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
@@ -5383,6 +5392,8 @@ fn logs_follows_daemon_and_exits_on_stop() {
             }
         })
     };
+    let reader = collect(Box::new(child.stdout.take().expect("logs stdout 管道")));
+    let notes = collect(Box::new(child.stderr.take().expect("logs stderr 管道")));
 
     // 首屏应包含守护的启动日志行（tracing 写入日志文件，logs 回读输出）
     let mut saw_startup = false;
@@ -5419,6 +5430,7 @@ fn logs_follows_daemon_and_exits_on_stop() {
     }
     assert!(exited, "实例停止后 aproxy logs 应自动退出");
     let _ = reader.join();
+    let _ = notes.join();
     let out = collected.lock().unwrap();
     assert!(
         out.contains("实例已停止，日志跟踪结束"),
@@ -5977,15 +5989,15 @@ fn logs_via_alias_connects_and_follows() {
     // logs <别名>：经配置文件匹配到运行实例，首屏输出连接信息与启动日志
     let mut child = home
         .cmd()
-        .args(["logs", &alias])
+        .args(["logs", "-f", &alias])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn aproxy logs 失败");
     let collected = Arc::new(Mutex::new(String::new()));
-    let reader = {
+    // 日志行在 stdout，说明性的文字（连上了哪个实例、实例已停止）在 stderr：两路都收进同一份
+    let collect = |mut pipe: Box<dyn Read + Send>| {
         let collected = collected.clone();
-        let mut pipe = child.stdout.take().expect("logs stdout 管道");
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
@@ -5999,6 +6011,8 @@ fn logs_via_alias_connects_and_follows() {
             }
         })
     };
+    let reader = collect(Box::new(child.stdout.take().expect("logs stdout 管道")));
+    let notes = collect(Box::new(child.stderr.take().expect("logs stderr 管道")));
     let mut saw_startup = false;
     for _ in 0..100 {
         let hit = {
@@ -6042,6 +6056,7 @@ fn logs_via_alias_connects_and_follows() {
     }
     assert!(exited, "实例停止后 aproxy logs 应自动退出");
     let _ = reader.join();
+    let _ = notes.join();
     let out = collected.lock().unwrap();
     assert!(
         out.contains("实例已停止，日志跟踪结束"),
@@ -6769,9 +6784,10 @@ fn config_show_masks_url_credentials_and_transform_secrets() {
     .unwrap();
     let out = home
         .cmd()
+        .arg("config")
         .arg("--config")
         .arg(&cfg_file)
-        .args(["config", "--show"])
+        .args(["--show"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -7110,7 +7126,13 @@ fn unknown_config_keys_fail_start_naming_file_and_key() {
             format!("base_url = \"https://api.example.com\"\n{extra}"),
         )
         .unwrap();
-        let out = home.cmd().arg("--config").arg(&cfg_file).output().unwrap();
+        let out = home
+            .cmd()
+            .arg("start")
+            .arg("--config")
+            .arg(&cfg_file)
+            .output()
+            .unwrap();
         assert!(!out.status.success(), "{key}: 应启动失败");
         let stderr = String::from_utf8_lossy(&out.stderr);
         let expected = format!("{}:{line}:", cfg_file.display());
@@ -7138,9 +7160,9 @@ fn config_command_edits_in_place_and_unsets_unknown_keys() {
     std::fs::write(&cfg_file, original).unwrap();
     let run = |args: &[&str]| {
         home.cmd()
+            .arg("config")
             .arg("--config")
             .arg(&cfg_file)
-            .arg("config")
             .args(args)
             .output()
             .unwrap()
@@ -7217,9 +7239,10 @@ fn concurrent_config_writers_do_not_lose_updates() {
     let children: Vec<_> = (0..WRITERS)
         .map(|i| {
             home.cmd()
+                .arg("config")
                 .arg("--config")
                 .arg(&cfg_file)
-                .args(["config", "--extra-header", &format!("x-writer-{i}=v{i}")])
+                .args(["--extra-header", &format!("x-writer-{i}=v{i}")])
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -7536,7 +7559,7 @@ fn invalid_settings_block_start_but_not_stop_status_or_repair() {
     let cfg_arg = cfg_file.to_str().unwrap();
 
     // 先在有效的 settings 下起一个实例
-    let out = run(&["--config", cfg_arg, "start"]);
+    let out = run(&["start", "--config", cfg_arg]);
     assert!(
         out.status.success(),
         "{}",
@@ -7547,9 +7570,9 @@ fn invalid_settings_block_start_but_not_stop_status_or_repair() {
     std::fs::write(&settings_path, r#"{"watchdog": false, "max_body_mb": 64}"#).unwrap();
 
     for args in [
-        vec!["--config", cfg_arg, "start"],
+        vec!["start", "--config", cfg_arg],
         vec!["alias", "list"],
-        vec!["--config", cfg_arg, "config", "--show"],
+        vec!["config", "--config", cfg_arg, "--show"],
         vec!["restart", "all"],
     ] {
         let out = run(&args);
@@ -7775,9 +7798,10 @@ fn settings_defaults_reach_config_and_credentials_follow_their_target() {
         std::fs::write(&cfg_file, text).unwrap();
         let out = home
             .cmd()
+            .arg("config")
             .arg("--config")
             .arg(&cfg_file)
-            .args(["config", "--show"])
+            .args(["--show"])
             .output()
             .unwrap();
         assert!(

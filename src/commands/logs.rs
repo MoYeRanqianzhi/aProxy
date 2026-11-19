@@ -1,15 +1,16 @@
-//! `aproxy logs [PORT|别名]`：实时跟踪运行实例的守护日志。
+//! `aproxy logs [PORT|别名] [-n N] [-f]`：打印运行实例的守护日志的最近若干行，`-f` 时接着跟踪。
 
 use aproxy::daemon;
 
 use aproxy::ops::target::{config_path_key, resolve_config_target};
 
-/// `aproxy logs [PORT|别名]`：连接到运行中的实例并实时输出其守护日志。
-/// 语义与 stop 一致：单实例可省略 target；多实例必须指定；别名按配置文件
+/// `aproxy logs [PORT|别名]`：打印运行中的实例的守护日志的最近 `lines` 行；`follow` 为真时
+/// 接着实时输出新写进来的。默认打印完就退出：调用它的 agent 与脚本不会被挂住。
+/// 目标的语义与 stop 一致：单实例可省略 target；多实例必须指定；别名按配置文件
 /// 匹配运行实例（端口变了别名依然有效）；不支持 all（一次只能连接一个实例，
 /// 传入 all 视为端口解析失败）。日志文件按启动随机命名（或用户自定义
 /// log_file），文件地址一律经 IPC/注册表向实例索取，不按端口拼路径。
-pub(crate) async fn handle_logs_cmd(target: Option<String>) {
+pub(crate) async fn handle_logs_cmd(target: Option<String>, lines: usize, follow: bool) {
     if target.as_deref() == Some("all") {
         eprintln!("aproxy logs 不支持 all：一次只能连接一个实例，请指定端口号或配置别名。");
         std::process::exit(1);
@@ -82,28 +83,37 @@ pub(crate) async fn handle_logs_cmd(target: Option<String>) {
         std::process::exit(1);
     };
     let path = std::path::PathBuf::from(log_path);
-    println!(
-        "正在连接 pid {}（端口 {}）——Ctrl+C 退出。",
-        info.instance.pid, port
-    );
-    println!("  日志文件: {}", path.display());
-    println!("────────── 最近日志 ──────────");
+    // 说明写到 stderr：stdout 上只有日志本身，接在管道后面的程序拿到的就是日志行
+    if follow {
+        eprintln!(
+            "正在连接 pid {}（端口 {}）——Ctrl+C 退出。",
+            info.instance.pid, port
+        );
+    }
+    eprintln!("日志文件: {}", path.display());
 
-    if let Err(e) = follow_log_file(&path, &port).await {
+    if let Err(e) = print_log_file(&path, &port, lines, follow).await {
         eprintln!("{e}");
         std::process::exit(1);
     }
 }
 
-/// 跟踪日志文件：先输出末尾若干行（tail -f 语义），随后轮询增量输出；
-/// 实例退出（IPC ping 失败，内部已含 3 次重试判死）或 Ctrl+C 结束。
+/// 输出日志文件末尾的 `tail_lines` 行；`follow` 为真时随后轮询增量输出（tail -f 语义），
+/// 直到实例退出（IPC ping 失败，内部已含 3 次重试判死）或 Ctrl+C。
 /// 读文件是同步小量轮询（200ms），期间穿插 IPC 探活（约 1 秒一次）。
-async fn follow_log_file(path: &std::path::Path, port: &str) -> Result<(), String> {
+async fn print_log_file(
+    path: &std::path::Path,
+    port: &str,
+    tail_lines: usize,
+    follow: bool,
+) -> Result<(), String> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
     const POLL_MS: u64 = 200;
-    const TAIL_WINDOW: u64 = 8 * 1024; // 首屏最多回读 8KB
-    const TAIL_LINES: usize = 30; // 首屏最多显示 30 行
+    // 末尾回读的窗口：每行按 1 KiB 留量，至少 64 KiB、至多 16 MiB（日志文件本身有轮转上限）
+    const TAIL_BYTES_PER_LINE: u64 = 1024;
+    const TAIL_WINDOW_MIN: u64 = 64 * 1024;
+    const TAIL_WINDOW_MAX: u64 = 16 * 1024 * 1024;
     const PING_EVERY: u32 = 5; // 每 5 轮（约 1 秒）探活一次
 
     // 等待日志文件出现（实例刚启动时 IPC 已通、日志可能尚未落盘）。限时 5 秒：
@@ -127,10 +137,13 @@ async fn follow_log_file(path: &std::path::Path, port: &str) -> Result<(), Strin
         tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
     }
 
-    // 首屏：回读文件末尾 TAIL_WINDOW 字节，丢弃可能被截断的残行，只显示最后 TAIL_LINES 行
+    // 回读文件末尾的一个窗口，丢弃可能被截断的残行，只显示最后 tail_lines 行
+    let window = (tail_lines as u64)
+        .saturating_mul(TAIL_BYTES_PER_LINE)
+        .clamp(TAIL_WINDOW_MIN, TAIL_WINDOW_MAX);
     let mut file = std::fs::File::open(path).map_err(|e| format!("无法打开日志文件: {e}"))?;
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let start = len.saturating_sub(TAIL_WINDOW);
+    let start = len.saturating_sub(window);
     file.seek(SeekFrom::Start(start))
         .map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
@@ -147,9 +160,12 @@ async fn follow_log_file(path: &std::path::Path, port: &str) -> Result<(), Strin
     if lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop(); // 文件以 \n 结尾时 split 会产生末尾空段，丢弃
     }
-    let skip = lines.len().saturating_sub(TAIL_LINES);
+    let skip = lines.len().saturating_sub(tail_lines);
     for line in &lines[skip..] {
         println!("{}", String::from_utf8_lossy(line));
+    }
+    if !follow {
+        return Ok(());
     }
     let mut pos = len;
     let mut pending: Vec<u8> = Vec::new();
@@ -166,14 +182,14 @@ async fn follow_log_file(path: &std::path::Path, port: &str) -> Result<(), Strin
                 let _ = out.write_all(&pending);
                 let _ = out.flush();
             }
-            println!();
-            println!("实例已停止，日志跟踪结束。");
+            eprintln!();
+            eprintln!("实例已停止，日志跟踪结束。");
             return Ok(());
         }
         let cur_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(pos);
         if cur_len < pos {
             // 文件被截断（守护启动时 >2MiB 清空）：从头重新跟踪
-            println!("── 日志文件已被截断，重新从头跟踪 ──");
+            eprintln!("── 日志文件已被截断，重新从头跟踪 ──");
             pos = 0;
             pending.clear();
         }

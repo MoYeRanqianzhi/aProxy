@@ -61,6 +61,16 @@ pub(crate) fn humanize_duration(secs: u64) -> String {
     }
 }
 
+/// 从 stdin 读一行（去掉行尾的换行）：命令行上值写成 `-` 时用，密钥就不必出现在命令行与
+/// shell 历史里。读不到（stdin 已关闭、不是文本）时返回给用户看的原因。
+pub(crate) fn read_secret_line() -> Result<String, String> {
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("从 stdin 读取值失败: {e}"))?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
 /// 密钥类值的展示打码：保留前 6 个字符 + "***"（按字符截断，避免多字节字符在字节边界 panic）。
 pub(crate) fn mask_secret(s: &str) -> String {
     let prefix: String = s.chars().take(6).collect();

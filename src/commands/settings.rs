@@ -138,12 +138,10 @@ fn print_json(value: &Value) {
 /// - 其余的键只收 JSON 值。
 fn parse_value(key: &str, raw: &str) -> Value {
     let raw = if raw == "-" {
-        let mut line = String::new();
-        if let Err(e) = std::io::stdin().read_line(&mut line) {
-            eprintln!("从 stdin 读取值失败: {e}");
+        crate::util::read_secret_line().unwrap_or_else(|e| {
+            eprintln!("{e}");
             crate::util::exit(1)
-        }
-        line.trim_end_matches(['\r', '\n']).to_string()
+        })
     } else {
         raw.to_string()
     };

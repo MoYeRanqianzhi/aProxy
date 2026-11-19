@@ -19,6 +19,7 @@ pub(crate) async fn handle_restart_cmd(
     threshold: Option<u64>,
     force: bool,
 ) {
+    super::stop::require_idle_for_threshold(target.as_deref(), threshold);
     let mode = StopMode::from_force(force);
     let targets = select_or_exit(target.as_deref(), threshold, force).await;
     if targets.is_empty() {

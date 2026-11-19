@@ -85,11 +85,23 @@ fn report_select_error(e: &SelectError) {
     }
 }
 
+/// `--idle-threshold-secs` 只对目标 `idle` 有意义；配在别的目标上是用法错误（退出码 2），
+/// 而不是悄悄不起作用。stop 与 restart 共用。
+pub(crate) fn require_idle_for_threshold(target: Option<&str>, threshold: Option<u64>) {
+    if threshold.is_some() && !target.is_some_and(|t| t.eq_ignore_ascii_case("idle")) {
+        eprintln!(
+            "--idle-threshold-secs 只能与目标 idle 一起用，例如: aproxy stop idle --idle-threshold-secs 600"
+        );
+        std::process::exit(aproxy_ipc::code::EXIT_USAGE as i32);
+    }
+}
+
 /// `aproxy stop` 入口。
 ///
 /// stop 的含义是「这个实例不该在运行」，所以目标已经不在运行、却还留着期望状态记录时
 /// （崩溃之后还没被拉回来），删掉记录就是这次 stop 的全部工作：restore 与看护者不再拉它。
 pub(crate) async fn handle_stop_cmd(target: Option<String>, threshold: Option<u64>, force: bool) {
+    require_idle_for_threshold(target.as_deref(), threshold);
     let mode = StopMode::from_force(force);
     // 已停的目标：按端口或配置文件找到它留下的记录
     match target::select(target.as_deref(), threshold, force).await {

@@ -939,11 +939,18 @@
     推送前要跑全量**（至少 `--test test_home_check`）。
 - B9 的分块（2026-11-19 开工前定的做法；设计稿 §9、§2.4，验收见 §14.2 的 B9 行）。每块一个提交，做完一块在这里
   打勾并写下与设计稿的出入：
-  - [ ] B9-1 命令树（§9.1）：启动的覆盖参数与 `--config`、`--log-file` 从顶层挪进 `start`（`--base-url`、`--listen-addr`、
+  - [x] B9-1 命令树（§9.1）：启动的覆盖参数与 `--config`、`--log-file` 从顶层挪进 `start`（`--base-url`、`--listen-addr`、
     `--api-key <KEY|->`）；裸 `aproxy` 打印帮助、退出 2；`upgrade` 改成 install 的 visible_alias；stop/restart 的 idle 阈值
-    改成 `--idle-threshold-secs`；`logs` 默认打最近 200 行就退出，`-n`、`-f`；删 `install --skills-only`。
-    **牵连**：tests/ 里约 56 处 `start --config`/顶层 `--config` 的写法、三个安装脚本、技能与 README 里的命令行、
-    `tests/force_cross_version.rs`（旧版本的二进制仍用旧写法启动，要按版本分写法）。
+    改成 `--idle-threshold-secs`（配在别的目标上退出 2）；`logs` 默认打最近 200 行就退出，`-n`、`-f`，说明文字写 stderr。
+    测试 `tests/cli_tree.rs`。验证：headless 全量 742 过、三路 clippy 干净。**与设计稿的出入**：
+    1. **`start --config <PATH>` 保留，而且是永久的**（§9.1 的 start 只有位置参数）。冻结的 `src/install/force.rs`
+       在实例没能恢复时打印 `aproxy start --config "<文件>"`，已经发布的每个版本的强制安装都会打印这一行，所以以后的
+       每个版本都要认它。它与位置参数互斥；`tests/cli_tree.rs` 的
+       `start_takes_the_config_as_a_path_or_with_the_config_flag` 钉住。顶层的 `aproxy --config X start` 不再接受。
+    2. `install --skills-only` 没删：设计稿把它的删除划给 W4（`aproxy skill`），在那之前删掉会让技能没有单独安装的办法。
+    3. `config` 这一步只把 `--config` 改成了自己的参数（可以写别名），15 个专用旗标留给 B9-2。
+    4. 文档、技能、安装脚本与提示文字里的旧写法（`aproxy config --baseurl …` 等，约 75 处）还没改：等 B9-2 把 config
+       的写法定下来一起扫，免得同一处改两遍。**在那之前 README 与技能里的命令行与实际不符**，B9-2 之后必须接着做。
   - [ ] B9-2 `config show|get|set|unset`（§9.3）：专用旗标一个不留；`--config <ALIAS|PATH>` 是 config 自己的参数；
     `set`/`unset` 的 `--json` 带 `instances_to_restart`。
   - [ ] B9-3 退出码表（§9.5）与操作码（§2.4）：操作层的中文原因换成码加数据；§9.5 每一格一个测试。

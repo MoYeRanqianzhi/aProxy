@@ -974,7 +974,11 @@ fn instance_without_a_config_file_reports_null_config_path() {
             "defaults": {"base_url": "https://defaults-only.example.com"}}"#,
     );
     let port = free_port();
-    let instance = start(&home, port, &["--listen", &format!("127.0.0.1:{port}")]);
+    let instance = start(
+        &home,
+        port,
+        &["start", "--listen-addr", &format!("127.0.0.1:{port}")],
+    );
 
     let snapshot = instance.snapshot("{\"v\":1,\"op\":\"ping\"}\n");
     assert!(snapshot["instance"]["config_path"].is_null(), "{snapshot}");

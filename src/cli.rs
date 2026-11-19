@@ -7,44 +7,15 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "aproxy", about = "Local API proxy with infinite retries", long_about = None)]
+// 不带任何参数时打印帮助（写到 stderr）并以 2 退出：那是一次没说要做什么的调用，按 clap 的
+// 惯例算用法错误。启动实例要写 `aproxy start`
+#[command(
+    name = "aproxy",
+    about = "Local API proxy with infinite retries",
+    long_about = None,
+    arg_required_else_help = true
+)]
 pub struct Cli {
-    /// 配置文件路径（默认 ~/.aproxy/config.toml）。
-    /// 多开不同配置的进程时各自指定，例如：
-    /// aproxy --config ~/.aproxy/work.toml 与 aproxy --config ~/.aproxy/personal.toml
-    /// （listen_addr 须互不相同）
-    #[arg(long, value_name = "PATH", global = true)]
-    pub config: Option<PathBuf>,
-
-    /// 前台运行（日志输出到控制台，Ctrl+C 停止）；默认在后台运行，
-    /// 日志按启动时刻随机命名写 ~/.aproxy/logs/ 下，实际路径以
-    /// `aproxy logs` 经 IPC 向实例询问到的为准
-    #[arg(long)]
-    pub foreground: bool,
-
-    /// 上游 API base URL，覆盖配置文件中的 base_url
-    #[arg(long, value_name = "URL")]
-    pub baseurl: Option<String>,
-
-    /// 监听地址，覆盖配置文件中的 listen_addr
-    #[arg(long, value_name = "ADDR")]
-    pub listen: Option<String>,
-
-    /// 上游代理 URL（仅本次运行生效，不写入配置），覆盖配置文件中的 proxy
-    #[arg(long, value_name = "URL")]
-    pub proxy: Option<String>,
-
-    /// 守护日志文件路径（仅本次运行生效），覆盖配置文件中的 log_file。
-    /// 未指定时写入 ~/.aproxy/logs/ 下按启动时刻随机命名的文件，
-    /// 实际路径以 aproxy logs 经 IPC 向实例询问到的为准
-    #[arg(long, value_name = "PATH", global = true)]
-    pub log_file: Option<String>,
-
-    /// 快捷 api_key（等效覆盖 Authorization: Bearer <key>，仅本次运行生效），覆盖配置文件中的 api_key
-    /// （建议改用配置文件，命令行参数可被本机其他进程枚举）
-    #[arg(long, value_name = "KEY")]
-    pub api_key: Option<String>,
-
     // 不用 clap 自带的版本参数：输出的那一行是安装器认版本的永久格式
     // （aproxy::VERSION_LINE），由 main 自己打印；单独的 `aproxy --version` /
     // `aproxy -V` 在解析参数之前就已短路返回，这里只为帮助里列出它、并接住
@@ -55,6 +26,51 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Option<Commands>,
+}
+
+/// `aproxy start` 的参数集：启动哪个配置，以及只对这次启动生效的覆盖。
+#[derive(clap::Args, Debug, Clone, PartialEq, Default)]
+pub struct StartArgs {
+    /// 配置别名（settings.json 中的别名表）或配置文件路径；不写时用默认配置文件
+    /// （settings.json 的 default_config，否则 ~/.aproxy/config.toml）
+    #[arg(value_name = "ALIAS|PATH", conflicts_with = "config")]
+    pub target: Option<String>,
+
+    /// 配置文件路径，与把路径直接写在 start 后面等价。多开不同配置的实例时各自指定
+    /// （listen_addr 须互不相同）
+    // 这个写法是永久的：强制安装（永久兼容契约 C7、C8）在实例没能恢复时，让用户执行的就是
+    // `aproxy start --config "<文件>"`，而执行强制安装的可以是任何一个已经发布的版本——
+    // 它们打印出来的命令，以后的每个版本都要认
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// 上游 API base URL，覆盖配置文件中的 base_url（只对这个实例生效，不写入配置；
+    /// restart、restore 与看护者重拉时沿用）
+    #[arg(long, value_name = "URL")]
+    pub base_url: Option<String>,
+
+    /// 监听地址，覆盖配置文件中的 listen_addr
+    #[arg(long, value_name = "ADDR")]
+    pub listen_addr: Option<String>,
+
+    /// 上游代理 URL，覆盖配置文件中的 proxy
+    #[arg(long, value_name = "URL")]
+    pub proxy: Option<String>,
+
+    /// 快捷 api_key（等效覆盖 Authorization: Bearer <key>），覆盖配置文件中的 api_key。
+    /// 写 - 表示从 stdin 读一行：写在命令行上的密钥会留在 shell 历史里，本机其他进程也
+    /// 看得到
+    #[arg(long, value_name = "KEY|-", allow_hyphen_values = true)]
+    pub api_key: Option<String>,
+
+    /// 守护日志文件路径，覆盖配置文件中的 log_file。未指定时写入 ~/.aproxy/logs/ 下按
+    /// 启动时刻随机命名的文件，实际路径以 aproxy logs 经 IPC 向实例询问到的为准
+    #[arg(long, value_name = "PATH")]
+    pub log_file: Option<String>,
+
+    /// 前台运行（日志输出到控制台，Ctrl+C 停止）；默认在后台运行
+    #[arg(long)]
+    pub foreground: bool,
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -71,25 +87,23 @@ pub enum Commands {
         busy: bool,
     },
 
-    /// 启动代理（与直接运行 `aproxy` 相同），可指定配置别名或配置文件路径。
+    /// 启动代理，可指定配置别名或配置文件路径。默认在后台运行。
     /// 别名用 `aproxy alias add` 管理，如 `aproxy start openrouter`。
-    Start {
-        /// 配置别名（settings.json 中的别名表）或配置文件路径
-        #[arg(value_name = "ALIAS|PATH")]
-        target: Option<String>,
-    },
+    Start(StartArgs),
 
     /// 停止运行中的实例。
     /// 单个实例时可直接 `aproxy stop`；多实例必须指定端口号、`all`、配置别名
     /// 或 `idle`（可带秒数）：
     /// `aproxy stop 12345` / `aproxy stop all` / `aproxy stop openrouter`
-    /// `aproxy stop idle`（闲置超 1800s 的全部实例）/ `aproxy stop idle 600`
+    /// `aproxy stop idle`（闲置超 1800s 的全部实例）/
+    /// `aproxy stop idle --idle-threshold-secs 600`
     Stop {
-        /// 端口号、all、配置别名或 idle
-        #[arg(value_name = "PORT|all|ALIAS|idle")]
+        /// 端口号、配置别名、all 或 idle
+        #[arg(value_name = "PORT|ALIAS|all|idle")]
         target: Option<String>,
-        /// idle 模式的空闲阈值（秒），覆盖 settings.json 的 idle_timeout_secs
-        #[arg(value_name = "SECS", requires = "target")]
+        /// 目标是 idle 时的空闲阈值（秒），覆盖 settings.json 的
+        /// instances.idle_threshold_secs
+        #[arg(long = "idle-threshold-secs", value_name = "SECS")]
         threshold: Option<u64>,
         /// 立即强制终止（跳过优雅关闭，零等待；终止前按 pid + 进程创建时间核验身份防杀错）
         #[arg(long)]
@@ -99,26 +113,33 @@ pub enum Commands {
     /// 重启运行中的实例（停下它，再按它启动时的配置文件、覆盖参数与环境重新拉起）。
     /// 只负责重启已运行的实例：未启动的 target 会提示「未启动」而不会拉起。
     /// 单个实例时可直接 `aproxy restart`；多实例必须指定端口号、`all`、配置
-    /// 别名或 `idle`（可带秒数），语义与 stop 一致。
+    /// 别名或 `idle`（可加 --idle-threshold-secs），语义与 stop 一致。
     Restart {
-        /// 端口号、all、配置别名或 idle
-        #[arg(value_name = "PORT|all|ALIAS|idle")]
+        /// 端口号、配置别名、all 或 idle
+        #[arg(value_name = "PORT|ALIAS|all|idle")]
         target: Option<String>,
-        /// idle 模式的空闲阈值（秒），覆盖 settings.json 的 idle_timeout_secs
-        #[arg(value_name = "SECS", requires = "target")]
+        /// 目标是 idle 时的空闲阈值（秒），覆盖 settings.json 的
+        /// instances.idle_threshold_secs
+        #[arg(long = "idle-threshold-secs", value_name = "SECS")]
         threshold: Option<u64>,
         /// 立即强制终止旧进程（跳过优雅关闭，零等待）再重启
         #[arg(long)]
         force: bool,
     },
 
-    /// 连接到运行中的实例并实时输出其守护日志（Ctrl+C 退出）。
-    /// 单个实例时可直接 `aproxy logs`；多实例必须指定端口号或配置别名。
-    /// 不支持 all：一次只能连接一个实例。
+    /// 打印一个实例的守护日志的最近若干行然后退出；加 -f 接着实时输出新写进来的
+    /// （Ctrl+C 退出）。单个实例时可直接 `aproxy logs`；多实例必须指定端口号或配置别名。
+    /// 不支持 all：一次只看一个实例。
     Logs {
         /// 端口号或配置别名
         #[arg(value_name = "PORT|ALIAS")]
         target: Option<String>,
+        /// 打印最近多少行
+        #[arg(short = 'n', long, value_name = "N", default_value_t = 200)]
+        lines: usize,
+        /// 打印完最近的日志之后不退出，接着输出新写进来的，直到实例停止或 Ctrl+C
+        #[arg(short, long)]
+        follow: bool,
     },
 
     /// 一键恢复先前在运行、因崩溃/断电/系统重启而消失的实例。
@@ -157,15 +178,14 @@ pub enum Commands {
     },
 
     /// 安装/升级 aProxy 到规范位置（~/.aproxy/bin/）：全程对客户端 ≈ 无感
-    /// （逐实例滚动重启，任一时刻至多一个实例在重启）。`upgrade` 为其别名。
+    /// （逐实例滚动重启，任一时刻至多一个实例在重启）。`upgrade` 是它的别名。
     /// 在线安装走下载链条（github → npm → cargo-binstall → cargo，可配
     /// settings 的 download_chain/url 模板与 --download-proxy）；中断自动续作。
     /// 某实例在新版本下起不来时用旧二进制把它拉回并中止滚动（命令返回非零）。
     /// 普通安装失败或卡住时，`install --force` 结束全部 aproxy 进程后直接换二进制。
+    // 永久兼容契约 C7：`upgrade --force …` 与 `install --force …` 是同一个命令
+    #[command(visible_alias = "upgrade")]
     Install(InstallArgs),
-
-    /// `aproxy install` 的别名（可发现性）
-    Upgrade(InstallArgs),
 
     /// 查看或修改配置（配置文件位于 ~/.aproxy/config.toml）
     Config(ConfigArgs),
@@ -374,6 +394,10 @@ pub enum SettingsCmd {
 
 #[derive(clap::Args, Debug, Clone, PartialEq)]
 pub struct ConfigArgs {
+    /// 要查看或修改的配置文件：别名或路径。不写时用默认配置文件（settings.json 的
+    /// default_config，否则 ~/.aproxy/config.toml）
+    #[arg(long, value_name = "ALIAS|PATH")]
+    pub config: Option<String>,
     /// 设置上游 base URL，例如 https://api.anthropic.com
     #[arg(long, value_name = "URL")]
     pub baseurl: Option<String>,

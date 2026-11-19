@@ -105,12 +105,7 @@ fn restart_after_port_change_reports_new_port() {
     // （避免 CLI 进程读取真实 settings.json 的 default_config）
     let out = home
         .cmd()
-        .args([
-            "restart",
-            &port_a.to_string(),
-            "--config",
-            &cfg_file.display().to_string(),
-        ])
+        .args(["restart", &port_a.to_string()])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -159,12 +154,7 @@ fn restart_not_running_port_fails() {
 
     let out = home
         .cmd()
-        .args([
-            "restart",
-            &port.to_string(),
-            "--config",
-            &cfg_file.display().to_string(),
-        ])
+        .args(["restart", &port.to_string()])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1), "未启动的 target 应退出 1");
@@ -1070,9 +1060,9 @@ fn secrets_never_reach_the_instance_or_watchdog_command_line() {
         &test_home,
         &exe,
         &[
+            "start",
             "--api-key",
             SECRET,
-            "start",
             "--config",
             cfg.to_str().unwrap(),
         ],
@@ -1184,7 +1174,7 @@ fn instance_without_a_config_file_restarts_and_restores() {
     test_home.stop_on_drop(port);
     assert!(!home.join("config.toml").exists());
 
-    let out = run_cli(&test_home, &exe, &["--listen", &listen]);
+    let out = run_cli(&test_home, &exe, &["start", "--listen-addr", &listen]);
     assert!(out.status.success(), "start: {}", text(&out.stderr));
     assert!(
         text(&out.stdout).contains("没有配置文件"),
@@ -1283,7 +1273,7 @@ fn foreground_instance_has_no_record_and_restart_refuses_it() {
         cli(
             &test_home,
             &exe,
-            &["--config", cfg.to_str().unwrap(), "--foreground"],
+            &["start", "--config", cfg.to_str().unwrap(), "--foreground"],
         )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1586,7 +1576,11 @@ fn stop_idle_only_stops_instances_that_are_idle_long_enough() {
     );
 
     // 刚启动的实例闲置不到一小时：不在选中之列，照常运行
-    let out = run_cli(&test_home, &exe, &["stop", "idle", "3600"]);
+    let out = run_cli(
+        &test_home,
+        &exe,
+        &["stop", "idle", "--idle-threshold-secs", "3600"],
+    );
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(
         ipc_ping_in_dir(&rt, port, home).is_ok(),
@@ -1616,7 +1610,11 @@ fn stop_idle_only_stops_instances_that_are_idle_long_enough() {
     );
 
     // 阈值 0：任何实例都算闲置，停掉并删记录
-    let out = run_cli(&test_home, &exe, &["stop", "idle", "0"]);
+    let out = run_cli(
+        &test_home,
+        &exe,
+        &["stop", "idle", "--idle-threshold-secs", "0"],
+    );
     assert!(
         out.status.success() && text(&out.stdout).contains("已停止"),
         "{}{}",

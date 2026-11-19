@@ -1029,6 +1029,9 @@
     `cargo test -p aproxy-ipc --locked` (30), and `cargo test --no-default-features --locked` with `--lib install` (60)
     or `--test` targeting code_table (1), install_cli (13), install_flow (13), install_flow_lib (16),
     force_contract (18 passed, one subprocess helper ignored), cli_tree (10), exit_codes (22), json_docs (9).
+    The full headless suite passed (809 passed, 0 failed, 7 ignored). Before running desktop Clippy in a clean
+    worktree, run `npm ci` and `npm run build` in `aproxy-desktop/ui`: the Rust build embeds the generated
+    frontend and stops before linting if `dist/index.html` is absent. No desktop source change is needed.
     Force flag conflicts are tested in cli_tree rather than changing frozen C7 assertions. Before a target is known,
     the result version is null. Older successors without event history can only report phases seen while polling.
     The precheck uses two error-level diagnostic codes: the existing record code is not a diagnostic, and the

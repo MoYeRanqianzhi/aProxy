@@ -1,0 +1,217 @@
+//! HTTP values are complete on input. In a reply, absence means inheritance,
+//! including for bodies; an explicitly empty string or map clears that field.
+
+use base64::{Engine, engine::general_purpose::STANDARD};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// Header names are lowercase. The wire protocol keeps only the first value.
+pub type Headers = BTreeMap<String, String>;
+
+/// Define the two spellings of the same bytes without ever emitting both keys.
+macro_rules! bytes_field {
+    ($name:ident, $text:literal, $b64:literal, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Debug, Clone, Default, PartialEq, Eq)]
+        #[non_exhaustive]
+        pub enum $name {
+            /// No bytes offered: keep the input unchanged when applying a patch.
+            #[default]
+            Absent,
+            /// UTF-8 is carried literally, including the empty string.
+            Text(String),
+            /// Binary input is decoded once at the wire boundary.
+            Binary(Vec<u8>),
+        }
+        impl $name {
+            /// Choose the lossless wire representation without copying binary data.
+            pub fn from_bytes(bytes: Vec<u8>) -> Self {
+                match String::from_utf8(bytes) {
+                    Ok(s) => Self::Text(s),
+                    Err(e) => Self::Binary(e.into_bytes()),
+                }
+            }
+            /// Borrow the decoded payload, preserving the distinction between absent and empty.
+            pub fn as_bytes(&self) -> Option<&[u8]> {
+                match self {
+                    Self::Absent => None,
+                    Self::Text(s) => Some(s.as_bytes()),
+                    Self::Binary(b) => Some(b),
+                }
+            }
+        }
+        impl Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeMap;
+                let mut m = serializer.serialize_map(None)?;
+                match self {
+                    Self::Absent => (),
+                    Self::Text(s) => m.serialize_entry($text, s)?,
+                    Self::Binary(b) => m.serialize_entry($b64, &STANDARD.encode(b))?,
+                };
+                m.end()
+            }
+        }
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                #[derive(Deserialize)]
+                struct Pair {
+                    #[serde(rename=$text)]
+                    text: Option<String>,
+                    #[serde(rename=$b64)]
+                    binary: Option<String>,
+                }
+                let p = Pair::deserialize(d)?;
+                match (p.text, p.binary) {
+                    (None, None) => Ok(Self::Absent),
+                    (Some(s), None) => Ok(Self::Text(s)),
+                    (None, Some(s)) => STANDARD
+                        .decode(s)
+                        .map(Self::Binary)
+                        .map_err(serde::de::Error::custom),
+                    _ => Err(serde::de::Error::custom(concat!(
+                        $text,
+                        " and ",
+                        $b64,
+                        " are mutually exclusive"
+                    ))),
+                }
+            }
+        }
+    };
+}
+bytes_field!(
+    Body,
+    "body",
+    "body_b64",
+    "The entity body of an HTTP request, response or patch."
+);
+bytes_field!(
+    Data,
+    "data",
+    "data_b64",
+    "One stream fragment or heartbeat; boundaries are not HTTP body boundaries."
+);
+
+/// A request as observed at this position in the chain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct Request {
+    /// HTTP verb.
+    pub method: String,
+    /// Absolute upstream URL.
+    pub url: String,
+    /// Complete header table; omitted in metadata-only views.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<Headers>,
+    /// Omitted when the program did not negotiate a body.
+    #[serde(flatten)]
+    pub body: Body,
+}
+impl Request {
+    /// Construct the metadata view; attach headers and body only when needed.
+    pub fn new(method: String, url: String) -> Self {
+        Self {
+            method,
+            url,
+            headers: None,
+            body: Body::Absent,
+        }
+    }
+    /// Apply one layer, replacing rather than merging the supplied headers.
+    pub fn apply(&mut self, p: RequestPatch) {
+        if let Some(v) = p.method {
+            self.method = v;
+        }
+        if let Some(v) = p.url {
+            self.url = v;
+        }
+        if p.headers.is_some() {
+            self.headers = p.headers;
+        }
+        if p.body != Body::Absent {
+            self.body = p.body;
+        }
+    }
+}
+
+/// A request patch; every omitted member is inherited.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[non_exhaustive]
+pub struct RequestPatch {
+    /// HTTP verb.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// Absolute upstream URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Complete header table; omitted in metadata-only views.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<Headers>,
+    /// Omitted when the program did not negotiate a body.
+    #[serde(flatten)]
+    pub body: Body,
+}
+impl RequestPatch {
+    /// An empty patch leaves all input fields untouched.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// A response as observed at this position in the chain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct Response {
+    /// HTTP status code.
+    pub status: u16,
+    /// Complete header table; omitted in metadata-only views.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<Headers>,
+    /// Omitted when the program did not negotiate a body.
+    #[serde(flatten)]
+    pub body: Body,
+}
+impl Response {
+    /// Construct the metadata view; attach headers and body only when needed.
+    pub fn new(status: u16) -> Self {
+        Self {
+            status,
+            headers: None,
+            body: Body::Absent,
+        }
+    }
+    /// Apply one layer, replacing rather than merging the supplied headers.
+    pub fn apply(&mut self, p: ResponsePatch) {
+        if let Some(v) = p.status {
+            self.status = v;
+        }
+        if p.headers.is_some() {
+            self.headers = p.headers;
+        }
+        if p.body != Body::Absent {
+            self.body = p.body;
+        }
+    }
+}
+
+/// A response patch; every omitted member is inherited.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[non_exhaustive]
+pub struct ResponsePatch {
+    /// HTTP status code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Complete header table; omitted in metadata-only views.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<Headers>,
+    /// Omitted when the program did not negotiate a body.
+    #[serde(flatten)]
+    pub body: Body,
+}
+impl ResponsePatch {
+    /// An empty patch leaves all input fields untouched.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}

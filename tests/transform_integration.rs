@@ -12,7 +12,10 @@ use common::{TestHome, format_echo_path};
 
 use std::sync::{Arc, Mutex, atomic::AtomicUsize, atomic::Ordering};
 
-use aproxy::config::{Config, TransformConfig, TransformMode};
+use aproxy::config::{
+    Config,
+    file::{FormatEntry, Process, Stage},
+};
 use aproxy::proxy::{AppState, router};
 use axum::{
     Router,
@@ -63,16 +66,19 @@ fn proxy_config_for(upstream: &str) -> Config {
     .normalized()
 }
 
-fn transform_config(cmd_sub: &str, mode: TransformMode) -> TransformConfig {
-    TransformConfig {
-        name: "echo".to_string(),
-        command: format_echo_path().display().to_string(),
-        args: vec![cmd_sub.to_string()],
-        mode,
-        // 测试用短超时防挂死；timeout 专项测试单独给 1s
-        timeout_secs: Some(10),
-        ..Default::default()
-    }
+/// 从真实的配置默认值出发；测试分别声明要覆盖的阶段，所有阶段共享一个条目时才共享 state。
+fn transform_config(cmd_sub: &str, mode: Process, stages: &[Stage]) -> FormatEntry {
+    let (cfg, diags) = aproxy::config::file::parse(
+        "[[format]]\nname='echo'\ncommand='f'\nstages=['request']\nrequired=true\ntimeout_secs=10",
+        std::path::Path::new("unit.toml"),
+    );
+    assert!(diags.is_empty());
+    let mut e = cfg.format.unwrap().pop().unwrap();
+    e.command = format_echo_path().display().to_string();
+    e.args = vec![cmd_sub.into()];
+    e.process = mode;
+    e.stages = stages.to_vec();
+    e
 }
 
 type Captured = Arc<Mutex<Vec<u8>>>;
@@ -221,7 +227,8 @@ async fn request_spawn_echo_preserves_body_and_target() {
     isolate_env_proxy();
     let (upstream, captured, _jh) = echo_upstream().await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.request_transform = Some(transform_config("echo", TransformMode::Spawn));
+    cfg.formats
+        .push(transform_config("echo", Process::Spawn, &[Stage::Request]));
     let (proxy, _pj) = start_proxy(cfg).await;
 
     let body = r#"{"model":"claude","messages":[]}"#;
@@ -247,10 +254,9 @@ async fn request_transform_rewrites_url() {
     let (upstream, log, _jh) = recording_upstream().await;
     let mut cfg = proxy_config_for(&upstream);
     // extra 即新 url：改写到上游的 /rewritten 路径（协议转换核心语义）
-    cfg.request_transform = Some(TransformConfig {
-        args: vec!["rewrite".to_string()],
-        extra: Some(format!("{upstream}/rewritten?marker=1")),
-        ..transform_config("rewrite", TransformMode::Spawn)
+    cfg.formats.push(FormatEntry {
+        args: vec!["rewrite".into(), format!("{upstream}/rewritten?marker=1")],
+        ..transform_config("rewrite", Process::Spawn, &[Stage::Request])
     });
     let (proxy, _pj) = start_proxy(cfg).await;
 
@@ -276,7 +282,8 @@ async fn request_transform_scrub_deletes_header_and_rewrites_method() {
     // 头表替换的「删头语义」与 method 改写的可观测验证
     let (upstream, log, _jh) = recording_upstream().await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.request_transform = Some(transform_config("scrub", TransformMode::Spawn));
+    cfg.formats
+        .push(transform_config("scrub", Process::Spawn, &[Stage::Request]));
     let (proxy, _pj) = start_proxy(cfg).await;
 
     let resp = local_client()
@@ -303,10 +310,9 @@ async fn request_persistent_rotate_rotates_keys_continuously() {
     // authorization 头**上观测——旧版此测试第二次请求零断言（假覆盖）
     let (upstream, log, _jh) = recording_upstream().await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.request_transform = Some(TransformConfig {
-        args: vec!["rotate".to_string()],
-        extra: Some(r#"{"keys":["k1","k2"]}"#.to_string()),
-        ..transform_config("rotate", TransformMode::Persistent)
+    cfg.formats.push(FormatEntry {
+        args: vec!["rotate".into(), r#"["k1","k2"]"#.into()],
+        ..transform_config("rotate", Process::Persistent, &[Stage::Request])
     });
     let (proxy, _pj) = start_proxy(cfg).await;
     let client = local_client();
@@ -373,7 +379,8 @@ async fn request_transform_rejection_returns_422_without_sending_upstream() {
     isolate_env_proxy();
     let (upstream, count, _jh) = fixed_upstream(StatusCode::OK, "ok").await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.request_transform = Some(transform_config("error", TransformMode::Spawn));
+    cfg.formats
+        .push(transform_config("error", Process::Spawn, &[Stage::Request]));
     let (proxy, _pj) = start_proxy(cfg).await;
 
     let resp = local_client()
@@ -388,7 +395,7 @@ async fn request_transform_rejection_returns_422_without_sending_upstream() {
     // 错误体用配置里的名字指明是哪个程序
     assert_eq!(aproxy["details"]["format"], "echo");
     assert_eq!(aproxy["details"]["stage"], "request");
-    assert_eq!(aproxy["attempts"], 0, "没有发往上游");
+    assert_eq!(aproxy["attempts"], 0, "首轮在格式程序处失败，未发往上游");
     assert!(
         text.contains("error-rejected"),
         "错误体应含 format 报错原因: {text}"
@@ -397,11 +404,12 @@ async fn request_transform_rejection_returns_422_without_sending_upstream() {
 }
 
 #[tokio::test]
-async fn request_transform_crash_returns_502() {
+async fn request_transform_crash_opens_the_breaker() {
     isolate_env_proxy();
     let (upstream, count, _jh) = fixed_upstream(StatusCode::OK, "ok").await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.request_transform = Some(transform_config("exit1", TransformMode::Spawn));
+    cfg.formats
+        .push(transform_config("exit1", Process::Spawn, &[Stage::Request]));
     let (proxy, _pj) = start_proxy(cfg).await;
 
     let resp = local_client()
@@ -411,20 +419,22 @@ async fn request_transform_crash_returns_502() {
         .await
         .unwrap();
     // format 进程没回信就退出了：程序本身的故障，502
-    let (aproxy, _) = aproxy_error(resp, StatusCode::BAD_GATEWAY, "format_failed").await;
+    let (aproxy, _) =
+        aproxy_error(resp, StatusCode::SERVICE_UNAVAILABLE, "format_unavailable").await;
     assert_eq!(aproxy["details"]["kind"], "died");
     assert_eq!(count.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
-async fn request_transform_timeout_returns_502() {
+async fn request_transform_timeout_opens_the_breaker() {
     isolate_env_proxy();
     let (upstream, _count, _jh) = fixed_upstream(StatusCode::OK, "ok").await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.request_transform = Some(TransformConfig {
+    cfg.formats.push(FormatEntry {
         args: vec!["sleep".to_string(), "5000".to_string()],
-        timeout_secs: Some(1),
-        ..transform_config("sleep", TransformMode::Spawn)
+        timeout_secs: 1,
+        breaker_failures: 1,
+        ..transform_config("sleep", Process::Spawn, &[Stage::Request])
     });
     let (proxy, _pj) = start_proxy(cfg).await;
 
@@ -440,7 +450,8 @@ async fn request_transform_timeout_returns_502() {
         "超时应在 ~1s 触发而非等满 sleep: {:?}",
         start.elapsed()
     );
-    let (aproxy, _) = aproxy_error(resp, StatusCode::BAD_GATEWAY, "format_failed").await;
+    let (aproxy, _) =
+        aproxy_error(resp, StatusCode::SERVICE_UNAVAILABLE, "format_unavailable").await;
     assert_eq!(aproxy["details"]["kind"], "timeout");
 }
 
@@ -449,7 +460,8 @@ async fn request_transform_b64_body_preserved() {
     isolate_env_proxy();
     let (upstream, captured, _jh) = echo_upstream().await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.request_transform = Some(transform_config("echo", TransformMode::Spawn));
+    cfg.formats
+        .push(transform_config("echo", Process::Spawn, &[Stage::Request]));
     let (proxy, _pj) = start_proxy(cfg).await;
 
     // 非 UTF-8 body（gzip magic 头两字节）：必须经 body_b64 保真往返
@@ -473,7 +485,8 @@ async fn request_transform_large_body_disk_path_reaches_upstream() {
     isolate_env_proxy();
     let (upstream, captured, _jh) = echo_upstream().await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.request_transform = Some(transform_config("echo", TransformMode::Spawn));
+    cfg.formats
+        .push(transform_config("echo", Process::Spawn, &[Stage::Request]));
     // 2 MiB：超内存驻留阈值（1 MiB），走「Disk 读出 → 转换 → 新 Disk 落盘」
     // 链路。spool_dir 注入 tempdir——不注入会按端口写真实 ~/.aproxy/spool/
     // （测试卫生：每次运行约 6MiB 临时文件进生产目录）
@@ -527,8 +540,11 @@ async fn transform_stages_share_request_id_and_state() {
     });
     let (upstream, _jh) = bind_router(app).await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.request_transform = Some(transform_config("stateful", TransformMode::Persistent));
-    cfg.response_transform = Some(transform_config("stateful", TransformMode::Spawn));
+    cfg.formats.push(transform_config(
+        "stateful",
+        Process::Persistent,
+        &[Stage::Request, Stage::Response],
+    ));
     let (proxy, _pj) = start_proxy(cfg).await;
 
     let mut ids = Vec::new();
@@ -586,15 +602,18 @@ async fn slow_sse_upstream(delay_ms: u64) -> (String, tokio::task::JoinHandle<()
 }
 
 #[tokio::test]
-async fn heartbeat_transform_generates_heartbeats_and_hands_state_to_response() {
+async fn heartbeat_reply_cannot_change_state() {
     // 心跳转换器逐拍生成心跳字节；首拍带请求体、之后不带；它回信的 state 经
     // aProxy 交给响应转换（响应转换把收到的 state 追加成一行注释）。回放的上游
     // 事件完整出现在所有心跳之后
     isolate_env_proxy();
     let (upstream, _jh) = slow_sse_upstream(2500).await;
     let mut cfg = keepalive_1s_config_for(&upstream);
-    cfg.heartbeat_transform = Some(transform_config("heartbeat", TransformMode::Persistent));
-    cfg.response_transform = Some(transform_config("heartbeat", TransformMode::Spawn));
+    cfg.formats.push(transform_config(
+        "heartbeat",
+        Process::Persistent,
+        &[Stage::Heartbeat, Stage::Response],
+    ));
     let (proxy, _pj) = start_proxy(cfg).await;
 
     let body = local_client()
@@ -608,8 +627,8 @@ async fn heartbeat_transform_generates_heartbeats_and_hands_state_to_response() 
         .await
         .unwrap();
     assert!(
-        body.contains(": hb seq=1 attempt=1 body=true\n\n"),
-        "首拍应由心跳转换器生成且带请求体: {body:?}"
+        body.contains(": hb seq=1 attempt=1 body=false\n\n"),
+        "首拍应由心跳转换器生成且不带请求体: {body:?}"
     );
     assert!(
         body.contains(": hb seq=2 attempt=1 body=false\n\n"),
@@ -620,10 +639,10 @@ async fn heartbeat_transform_generates_heartbeats_and_hands_state_to_response() 
         body.rfind(": hb seq=").unwrap() < replay,
         "心跳只出现在回放之前: {body:?}"
     );
-    // 最后一拍是第几拍取决于时序，只断言 state 来自心跳回信
+    // 最后一拍是第几拍取决于时序，只断言心跳不能改写 state
     assert!(
-        body[replay..].contains("\n\n: state=hb-"),
-        "响应转换应收到心跳回信留下的 state: {body:?}"
+        body[replay..].contains("\n\n: state=-"),
+        "响应转换不应收到心跳回信里的 state: {body:?}"
     );
 }
 
@@ -633,7 +652,11 @@ async fn heartbeat_transform_failure_falls_back_to_fixed_heartbeat() {
     isolate_env_proxy();
     let (upstream, _jh) = slow_sse_upstream(2500).await;
     let mut cfg = keepalive_1s_config_for(&upstream);
-    cfg.heartbeat_transform = Some(transform_config("error", TransformMode::Persistent));
+    cfg.formats.push(transform_config(
+        "error",
+        Process::Persistent,
+        &[Stage::Heartbeat],
+    ));
     let (proxy, _pj) = start_proxy(cfg).await;
 
     let resp = local_client()
@@ -657,7 +680,11 @@ async fn response_transform_rewrites_body() {
     isolate_env_proxy();
     let (upstream, _count, _jh) = fixed_upstream(StatusCode::OK, "plain-payload").await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.response_transform = Some(transform_config("upper", TransformMode::Spawn));
+    cfg.formats.push(transform_config(
+        "upper",
+        Process::Spawn,
+        &[Stage::Response],
+    ));
     let (proxy, _pj) = start_proxy(cfg).await;
 
     let resp = local_client()
@@ -683,7 +710,11 @@ async fn response_transform_large_body_disk_path_byte_fidelity() {
     let mut cfg = proxy_config_for(&upstream);
     let spool = tempfile::tempdir().unwrap();
     cfg.spool_dir_override = Some(spool.path().to_path_buf());
-    cfg.response_transform = Some(transform_config("upper", TransformMode::Persistent));
+    cfg.formats.push(transform_config(
+        "upper",
+        Process::Persistent,
+        &[Stage::Response],
+    ));
     let (proxy, _pj) = start_proxy(cfg).await;
 
     let resp = local_client()
@@ -707,7 +738,11 @@ async fn response_transform_failure_passes_through_original() {
     isolate_env_proxy();
     let (upstream, _count, _jh) = fixed_upstream(StatusCode::OK, "original-body").await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.response_transform = Some(transform_config("error", TransformMode::Spawn));
+    cfg.formats.push(transform_config(
+        "error",
+        Process::Spawn,
+        &[Stage::Response],
+    ));
     let (proxy, _pj) = start_proxy(cfg).await;
 
     let resp = local_client()
@@ -725,7 +760,11 @@ async fn response_transform_sse_rewrites_stream() {
     isolate_env_proxy();
     let (upstream, _count, _jh) = fixed_upstream(StatusCode::OK, "data: {\"a\":1}\n\n").await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.response_transform = Some(transform_config("upper", TransformMode::Spawn));
+    cfg.formats.push(transform_config(
+        "upper",
+        Process::Spawn,
+        &[Stage::Response],
+    ));
     let (proxy, _pj) = start_proxy(cfg).await;
 
     let resp = local_client()
@@ -746,7 +785,8 @@ async fn response_transform_b64_body_preserved() {
     let payload: Vec<u8> = vec![0x1f, 0x8b, 0x00, 0xff, 0xfe, 0x80];
     let (upstream, _count, _jh) = bytes_upstream(StatusCode::OK, payload.clone()).await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.response_transform = Some(transform_config("echo", TransformMode::Spawn));
+    cfg.formats
+        .push(transform_config("echo", Process::Spawn, &[Stage::Response]));
     let (proxy, _pj) = start_proxy(cfg).await;
 
     let resp = local_client()
@@ -772,7 +812,11 @@ async fn keepalive_channel_response_transform_failure_passes_through() {
     )
     .await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.response_transform = Some(transform_config("error", TransformMode::Spawn));
+    cfg.formats.push(transform_config(
+        "error",
+        Process::Spawn,
+        &[Stage::Response],
+    ));
     let (proxy, _pj) = start_proxy(cfg).await;
 
     // 首轮 500 → 客户端接受 SSE → 进保活通道；第二轮成功 + 响应转换失败
@@ -842,10 +886,9 @@ fn failover_config(sub: &str, primary: &str, backup: &str, keepalive: bool) -> C
     } else {
         proxy_config_for(primary)
     };
-    cfg.request_transform = Some(TransformConfig {
-        extra: Some(format!("{backup}/v1/x")),
-        every_attempt: true,
-        ..transform_config(sub, TransformMode::Spawn)
+    cfg.formats.push(FormatEntry {
+        args: vec![sub.into(), format!("{backup}/v1/x")],
+        ..transform_config(sub, Process::Spawn, &[Stage::Request, Stage::Retry])
     });
     cfg
 }
@@ -893,7 +936,7 @@ async fn every_attempt_retransforms_the_original_request_before_each_retry() {
 }
 
 #[tokio::test]
-async fn every_attempt_transform_failure_keeps_retrying_the_previous_request() {
+async fn retry_stage_rejection_does_not_resend_the_previous_request() {
     // 重试前的转换失败不能让请求终止（那会违背无限重试）：沿用上一次发出的请求，
     // 主上游第二次就好了，客户端照样拿到 200
     isolate_env_proxy();
@@ -915,9 +958,9 @@ async fn every_attempt_transform_failure_keeps_retrying_the_previous_request() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(resp.text().await.unwrap(), "recovered");
-    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    let (e, _) = aproxy_error(resp, StatusCode::UNPROCESSABLE_ENTITY, "format_rejected").await;
+    assert_eq!(e["details"]["stage"], "retry");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -928,9 +971,9 @@ async fn keepalive_covers_slow_request_transform() {
     isolate_env_proxy();
     let (upstream, count, _jh) = fixed_upstream(StatusCode::OK, "ok-payload").await;
     let mut cfg = keepalive_1s_config_for(&upstream);
-    cfg.request_transform = Some(TransformConfig {
+    cfg.formats.push(FormatEntry {
         args: vec!["sleep".to_string(), "2500".to_string()],
-        ..transform_config("sleep", TransformMode::Spawn)
+        ..transform_config("sleep", Process::Spawn, &[Stage::Request])
     });
     let (proxy, _pj) = start_proxy(cfg).await;
 
@@ -955,10 +998,11 @@ async fn keepalive_request_transform_failure_after_commit_ends_with_error_event(
     isolate_env_proxy();
     let (upstream, count, _jh) = fixed_upstream(StatusCode::OK, "never").await;
     let mut cfg = keepalive_1s_config_for(&upstream);
-    cfg.request_transform = Some(TransformConfig {
+    cfg.formats.push(FormatEntry {
         args: vec!["sleep".to_string(), "5000".to_string()],
-        timeout_secs: Some(2),
-        ..transform_config("sleep", TransformMode::Spawn)
+        timeout_secs: 2,
+        breaker_failures: 1,
+        ..transform_config("sleep", Process::Spawn, &[Stage::Request])
     });
     let (proxy, _pj) = start_proxy(cfg).await;
 
@@ -972,7 +1016,10 @@ async fn keepalive_request_transform_failure_after_commit_ends_with_error_event(
         .and_then(|line| line.strip_prefix("data: "))
         .unwrap_or_else(|| panic!("已提交后请求转换失败应以终态 error 事件收场: {text}"));
     let event: serde_json::Value = serde_json::from_str(data).unwrap();
-    assert_eq!(event["error"]["type"], "aproxy_format_failed", "{text}");
+    assert_eq!(
+        event["error"]["type"], "aproxy_format_unavailable",
+        "{text}"
+    );
     assert_eq!(
         event["error"]["aproxy"]["details"]["kind"], "timeout",
         "{text}"
@@ -994,9 +1041,9 @@ async fn keepalive_covers_slow_response_transform() {
     });
     let (upstream, _jh) = bind_router(app).await;
     let mut cfg = keepalive_1s_config_for(&upstream);
-    cfg.response_transform = Some(TransformConfig {
+    cfg.formats.push(FormatEntry {
         args: vec!["sleep".to_string(), "2500".to_string()],
-        ..transform_config("sleep", TransformMode::Spawn)
+        ..transform_config("sleep", Process::Spawn, &[Stage::Response])
     });
     let (proxy, _pj) = start_proxy(cfg).await;
 
@@ -1016,11 +1063,11 @@ async fn keepalive_covers_slow_response_transform() {
 
 /// persistent + pool_max=1：所有请求必经同一个 worker 槽位——stdout 一旦
 /// 错位，下一个请求必然踩中，串包若存在一定暴露（多槽位会让错位概率性漏测）。
-fn single_worker_persistent(sub_args: &[&str]) -> TransformConfig {
-    TransformConfig {
+fn single_worker_persistent(sub_args: &[&str], stages: &[Stage]) -> FormatEntry {
+    FormatEntry {
         args: sub_args.iter().map(|s| s.to_string()).collect(),
-        pool_max: Some(1),
-        ..transform_config(sub_args[0], TransformMode::Persistent)
+        pool_max: 1,
+        ..transform_config(sub_args[0], Process::Persistent, stages)
     }
 }
 
@@ -1055,7 +1102,8 @@ async fn request_persistent_banner_fails_loudly_and_never_crosswires() {
     // 上一个请求的回显（A 的 body 被当成 B 的发往上游）
     let (upstream, log, _jh) = recording_upstream().await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.request_transform = Some(single_worker_persistent(&["banner"]));
+    cfg.formats
+        .push(single_worker_persistent(&["banner"], &[Stage::Request]));
     let (proxy, _pj) = start_proxy(cfg).await;
     let client = local_client();
 
@@ -1067,7 +1115,7 @@ async fn request_persistent_banner_fails_loudly_and_never_crosswires() {
         assert_not_crosswired(status, &text, sent);
         assert_eq!(
             status,
-            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
             "横幅必定先于回显被读到，每个请求都应失败: {text}"
         );
         texts.push(text);
@@ -1078,7 +1126,7 @@ async fn request_persistent_banner_fails_loudly_and_never_crosswires() {
     );
     for text in texts {
         assert!(
-            text.contains("违反信封协议"),
+            text.contains("format_unavailable"),
             "应归类为协议错误（而非 format 自报的失败）: {text}"
         );
     }
@@ -1091,7 +1139,8 @@ async fn request_persistent_multiline_never_crosswires() {
     // （修复前：第二个请求把第一个请求的 body 发往上游，客户端拿到 200）
     let (upstream, log, _jh) = recording_upstream().await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.request_transform = Some(single_worker_persistent(&["multiline"]));
+    cfg.formats
+        .push(single_worker_persistent(&["multiline"], &[Stage::Request]));
     let (proxy, _pj) = start_proxy(cfg).await;
     let client = local_client();
 
@@ -1101,7 +1150,7 @@ async fn request_persistent_multiline_never_crosswires() {
         // 两行同批到达时读完首行即见残行 → 协议错误；残行若分批晚到，则在
         // 下次取用该 worker 前被探测剔除、本请求成功——两种结局都不串包
         assert!(
-            status == StatusCode::OK || text.contains("违反信封协议"),
+            status == StatusCode::OK || text.contains("format_unavailable"),
             "失败只应是协议错误: {status} {text}"
         );
     }
@@ -1124,7 +1173,10 @@ async fn request_persistent_late_stray_line_never_crosswires() {
     // 已归还空闲表——必须在下次取用前探测到并剔除，否则下一个请求静默串包
     let (upstream, log, _jh) = recording_upstream().await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.request_transform = Some(single_worker_persistent(&["late-stray", "100"]));
+    cfg.formats.push(single_worker_persistent(
+        &["late-stray", "100"],
+        &[Stage::Request],
+    ));
     let (proxy, _pj) = start_proxy(cfg).await;
     let client = local_client();
 
@@ -1146,7 +1198,8 @@ async fn response_persistent_multiline_never_crosswires() {
     // 客户端拿到的都必须是自己的内容
     let (upstream, _captured, _jh) = echo_upstream().await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.response_transform = Some(single_worker_persistent(&["multiline"]));
+    cfg.formats
+        .push(single_worker_persistent(&["multiline"], &[Stage::Response]));
     let (proxy, _pj) = start_proxy(cfg).await;
     let client = local_client();
 
@@ -1167,7 +1220,10 @@ async fn request_persistent_idle_worker_death_respawns() {
     // 下一个请求必须换新 worker 成功，而不是写进死管道后 502
     let (upstream, log, _jh) = recording_upstream().await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.request_transform = Some(single_worker_persistent(&["die-idle", "200"]));
+    cfg.formats.push(single_worker_persistent(
+        &["die-idle", "200"],
+        &[Stage::Request],
+    ));
     let (proxy, _pj) = start_proxy(cfg).await;
     let client = local_client();
 
@@ -1191,7 +1247,8 @@ async fn request_persistent_reused_worker_dying_on_write_is_retried_once() {
     // 请求「写入成功、读到 EOF」，尚未产生任何输出，换新 worker 重试一次即成功
     let (upstream, log, _jh) = recording_upstream().await;
     let mut cfg = proxy_config_for(&upstream);
-    cfg.request_transform = Some(single_worker_persistent(&["oneshot"]));
+    cfg.formats
+        .push(single_worker_persistent(&["oneshot"], &[Stage::Request]));
     let (proxy, _pj) = start_proxy(cfg).await;
     let client = local_client();
 

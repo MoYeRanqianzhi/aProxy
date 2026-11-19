@@ -18,8 +18,8 @@ use aproxy_ipc::diag::{Diagnostic, Level};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::file::{self, Delivery, FileConfig, FormatEntry, Process, Stage};
-use super::{Config, TransformConfig, TransformMode};
+use super::Config;
+use super::file::{self, Delivery, FileConfig, FormatEntry, Stage};
 use crate::settings::Settings;
 
 /// 启动时在命令行上给的覆盖，优先于文件。
@@ -300,8 +300,7 @@ pub fn resolve_text(
         super::DEFAULT_KEEPALIVE_HEARTBEAT.to_string(),
     );
     let formats = pick_or(s, "format", &f.format, &None, Vec::new());
-    let (request_transform, response_transform, heartbeat_transform) =
-        assign_formats(&formats, text, path, &mut diagnostics);
+    check_supported_stages(&formats, text, path, &mut diagnostics);
 
     let config = Config {
         base_url: base_url.unwrap_or_default(),
@@ -401,9 +400,7 @@ pub fn resolve_text(
             &d.allowed_origins,
             Vec::new(),
         )),
-        request_transform,
-        response_transform,
-        heartbeat_transform,
+        formats,
         log_file,
         spool_dir_override: None,
     }
@@ -610,81 +607,34 @@ fn merge_headers(
         .collect()
 }
 
-/// 把 `[[format]]` 的条目派给现有的三个转换位置：请求、响应、心跳各至多一个程序。
-/// 这个版本还不支持的写法——同一阶段多个程序，以及 decide、stream、notify 阶段——报
-/// `config_not_supported`，而不是带着一个不会被调用的程序启动。
-fn assign_formats(
+/// 文件层校验链的结构；运行时还不能处理的阶段单独诊断，避免静默跳过配置。
+fn check_supported_stages(
     formats: &[FormatEntry],
     text: Option<&str>,
     path: &Path,
     diagnostics: &mut Vec<Diagnostic>,
-) -> (
-    Option<TransformConfig>,
-    Option<TransformConfig>,
-    Option<TransformConfig>,
 ) {
-    let mut slots: [Option<TransformConfig>; 3] = [None, None, None];
     for (index, format) in formats.iter().enumerate() {
-        let mut unsupported = |message: String| {
-            let key = format!("format[{index}].stages");
-            let position = text.and_then(|text| file::locate(text, &key));
-            diagnostics.push(Diagnostic {
-                code: "config_not_supported",
-                severity: Level::Error,
-                file: path.display().to_string(),
-                key: Some(key),
-                line: position.map(|p| p.0),
-                column: position.map(|p| p.1),
-                message,
-                details: Map::new(),
-            });
-        };
-        if format.has_stage(Stage::Retry) && !format.has_stage(Stage::Request) {
-            unsupported(format!(
-                "format {:?} declares retry without request, which is not implemented in this version",
-                format.name
-            ));
-        }
         for stage in &format.stages {
-            let slot = match stage {
-                Stage::Request => 0,
-                Stage::Response => 1,
-                Stage::Heartbeat => 2,
-                Stage::Retry => continue,
-                Stage::Decide | Stage::Stream | Stage::Notify => {
-                    unsupported(format!(
+            if matches!(stage, Stage::Decide | Stage::Stream | Stage::Notify) {
+                let key = format!("format[{index}].stages");
+                let position = text.and_then(|text| file::locate(text, &key));
+                diagnostics.push(Diagnostic {
+                    code: "config_not_supported",
+                    severity: Level::Error,
+                    file: path.display().to_string(),
+                    key: Some(key),
+                    line: position.map(|p| p.0),
+                    column: position.map(|p| p.1),
+                    message: format!(
                         "the {} stage is not implemented in this version",
                         stage.as_str()
-                    ));
-                    continue;
-                }
-            };
-            if slots[slot].is_some() {
-                unsupported(format!(
-                    "more than one format for the {} stage is not implemented in this version",
-                    stage.as_str()
-                ));
-                continue;
+                    ),
+                    details: Map::new(),
+                });
             }
-            slots[slot] = Some(TransformConfig {
-                name: format.name.clone(),
-                env: format.env.clone(),
-                command: format.command.clone(),
-                args: format.args.clone(),
-                mode: match format.process {
-                    Process::Spawn => TransformMode::Spawn,
-                    Process::Persistent => TransformMode::Persistent,
-                },
-                pool_max: Some(format.pool_max),
-                idle_timeout_secs: Some(format.worker_idle_secs),
-                timeout_secs: Some(format.timeout_secs),
-                extra: None,
-                every_attempt: *stage == Stage::Request && format.has_stage(Stage::Retry),
-            });
         }
     }
-    let [request, response, heartbeat] = slots;
-    (request, response, heartbeat)
 }
 
 #[cfg(test)]
@@ -974,7 +924,7 @@ x-toml = "1"
 
     /// `[[format]]` 派给请求、响应、心跳三个位置；声明了 retry 的请求程序每次重试都重跑。
     #[test]
-    fn formats_fill_the_three_slots() {
+    fn formats_preserve_order_and_stage_membership() {
         let text = r#"
 base_url = "https://a.example"
 
@@ -996,20 +946,24 @@ stages = ["response", "heartbeat"]
         let resolved = run(text, &Overrides::default(), FileConfig::default());
         assert_eq!(brief(&resolved), Vec::<String>::new());
         let c = &resolved.config;
-        let request = c.request_transform.as_ref().unwrap();
+        assert_eq!(c.formats.len(), 2);
+        let request = &c.formats[0];
         assert_eq!(request.name, "keys");
-        assert_eq!(request.mode, TransformMode::Persistent);
-        assert!(request.every_attempt);
-        assert_eq!(request.effective_pool_max(), 1);
-        assert_eq!(request.effective_idle_timeout_secs(), 0);
-        assert_eq!(request.effective_timeout_secs(), 7);
-        assert_eq!(request.env["KEYS_FILE"], "keys.toml");
-        let response = c.response_transform.as_ref().unwrap();
+        assert_eq!(request.process, file::Process::Persistent);
+        assert_eq!(request.stages, [Stage::Request, Stage::Retry]);
+        assert_eq!(request.command, "aproxy-format");
+        assert_eq!(request.args, ["keys"]);
         assert_eq!(
-            (response.name.as_str(), response.every_attempt),
-            ("back", false)
+            (
+                request.pool_max,
+                request.worker_idle_secs,
+                request.timeout_secs
+            ),
+            (1, 0, 7)
         );
-        assert_eq!(c.heartbeat_transform.as_ref().unwrap().name, "back");
+        assert_eq!(request.env["KEYS_FILE"], "keys.toml");
+        assert_eq!(c.formats[1].name, "back");
+        assert_eq!(c.formats[1].stages, [Stage::Response, Stage::Heartbeat]);
         assert_eq!(resolved.sources["format"], Source::Toml);
     }
 
@@ -1033,7 +987,6 @@ stages = ["request"]
             [
                 "config_not_supported format[0].stages config.toml 6",
                 "config_not_supported format[0].stages config.toml 6",
-                "config_not_supported format[1].stages config.toml 10",
             ]
         );
     }

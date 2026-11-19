@@ -244,24 +244,25 @@ async fn dynamic_heartbeat_arriving_after_replay_started_is_dropped() {
     // 心跳转换器慢（400ms）：这一拍的调用还没回来，回放已写出第一块真实
     // 字节。迟到的动态心跳必须丢弃——写出去就插进了回放的事件中间
     let echo = crate::transform::format_echo_path();
-    let pool = Arc::new(crate::transform::TransformPool::new(Arc::new(
-        crate::config::TransformConfig {
-            command: echo.display().to_string(),
-            args: vec!["heartbeat".to_string(), "400".to_string()],
-            timeout_secs: Some(10),
-            ..Default::default()
-        },
-    )));
+    let (cfg, diags) = crate::config::file::parse(
+        "[[format]]\ncommand='f'\nstages=['heartbeat']\nargs=['heartbeat','400']\ntimeout_secs=10",
+        Path::new("unit.toml"),
+    );
+    assert!(diags.is_empty());
+    let mut entry = cfg.format.unwrap().pop().unwrap();
+    entry.command = echo.display().to_string();
+    let pool = crate::transform::Pool::new(
+        entry,
+        PathBuf::new(),
+        Default::default(),
+        Default::default(),
+    );
     let (mut sink, mut rx, _gone) = committed_sink(Duration::ZERO, true);
     sink.arm_dynamic_heartbeat(Arc::new(DynamicHeartbeat {
-        pool,
-        ctx: ExchangeCtx::new("1".to_string()),
-        source: HeartbeatSource::new(
-            &http::Method::POST,
-            "http://upstream.invalid/v1/messages",
-            &HeaderMap::new(),
-            &RequestBody::Memory(Bytes::new()),
-        ),
+        pools: vec![pool].into(),
+        ctx: ExchangeCtx::new("1".into(), "/v1/messages", true),
+        interval: Duration::from_secs(1),
+        last: Default::default(),
         seq: Default::default(),
         attempt: Default::default(),
         in_flight: Default::default(),

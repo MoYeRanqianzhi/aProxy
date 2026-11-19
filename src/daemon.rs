@@ -221,6 +221,9 @@ pub struct InstanceStatus {
     /// 实例的行为摘要：默认的投递方式、缓存、保活与规则数
     pub behavior: Behavior,
     pub activity: Activity,
+    /// 每个配置条目的协商与熔断状态，配置顺序不变；早期实例没有这个字段。
+    #[serde(default)]
+    pub formats: Vec<serde_json::Value>,
     /// 实例支持的 op。调用较新的、有副作用的 op 之前先查这里
     pub ops: Vec<String>,
     /// 实例认得的 op 参数，名字是 `<op>.<参数>`，例如 `shutdown.keep_restore`。依赖某个
@@ -1221,8 +1224,6 @@ pub struct ControlState {
     pub stats: Arc<IpcStats>,
     /// 请求历史：读类 op 与事件都从这里取
     pub history: Arc<crate::history::History>,
-    /// 实例的状态变了（进入更换阶段）：流式连接据此立即发一个 `state` 事件
-    pub state_changed: tokio::sync::Notify,
     /// 收到 shutdown 时置位，服务主循环据此优雅退出；已置位即「正在退出」
     pub on_shutdown: tokio::sync::watch::Sender<bool>,
     /// 「用户已经要它停下」：收到过不带 `keep_restore` 的 shutdown。期望状态记录的写与删
@@ -1287,6 +1288,12 @@ async fn serve_endpoint(endpoint: String, state: Arc<ControlState>) -> io::Resul
 /// 原子计数全部 Relaxed——只用于展示与告警，无跨线程因果序需求。
 #[derive(Debug, Default)]
 pub struct IpcStats {
+    /// 池的生命期由实例持有；IPC 仅读取快照，不延长进程生命期。
+    pub(crate) formats: Vec<std::sync::Weak<crate::transform::Pool>>,
+    /// 实例阶段和程序熔断变化都复用控制通道的 state 事件。
+    pub state_changed: Arc<tokio::sync::Notify>,
+    /// 控制端点已上线，但格式程序尚未全部协商，或启动记录尚未落盘。
+    pub starting: std::sync::atomic::AtomicBool,
     /// 最近一次收到客户端请求的时刻（Unix 毫秒；即 AppState::last_activity_ms，
     /// 同一 Arc 由 serve_forever 组装进来）
     pub last_activity_ms: Arc<std::sync::atomic::AtomicU64>,
@@ -2278,7 +2285,7 @@ where
                 now_millis().saturating_add(ttl_ms),
                 std::sync::atomic::Ordering::Relaxed,
             );
-            state.state_changed.notify_waiters();
+            state.stats.state_changed.notify_waiters();
         }
         IpcOp::Shutdown {
             keep_restore,
@@ -2447,7 +2454,7 @@ where
             },
             // 状态变了（进入更换阶段、开始退出）：立即发。到期自己回到 serving 的那一次由
             // 下面每秒一次的检查发出
-            _ = state.state_changed.notified() => ("state", String::new(), false),
+            _ = state.stats.state_changed.notified() => ("state", String::new(), false),
             changed = stopping.changed() => match changed {
                 Ok(()) => ("state", String::new(), false),
                 Err(_) => return Ok(()),
@@ -2588,6 +2595,8 @@ fn status_snapshot(state: &ControlState) -> InstanceStatus {
     let stats = &state.stats;
     let phase = if *state.on_shutdown.borrow() {
         InstanceState::Stopping
+    } else if stats.starting.load(std::sync::atomic::Ordering::Acquire) {
+        InstanceState::Starting
     } else if stats.swap_until_ms.load(Relaxed) > now_millis() {
         InstanceState::SwapPrepared
     } else {
@@ -2598,6 +2607,11 @@ fn status_snapshot(state: &ControlState) -> InstanceStatus {
         state: phase,
         behavior: state.behavior.clone(),
         activity: stats.activity(state.record.started_at),
+        formats: stats
+            .formats
+            .iter()
+            .filter_map(|p| p.upgrade().map(|p| p.snapshot()))
+            .collect(),
         ops: IpcOp::NAMES.iter().map(|name| name.to_string()).collect(),
         features: IpcOp::FEATURES
             .iter()
@@ -3008,7 +3022,6 @@ mod tests {
             run_dir: "/test/run".into(),
             stats: Arc::new(IpcStats::default()),
             history: sample_history(),
-            state_changed: tokio::sync::Notify::new(),
             on_shutdown,
             stop_requested: std::sync::Mutex::new(false),
         };
@@ -3269,7 +3282,6 @@ mod tests {
                 run_dir: dir.path().display().to_string(),
                 stats: Arc::new(IpcStats::default()),
                 history: sample_history(),
-                state_changed: tokio::sync::Notify::new(),
                 on_shutdown,
                 stop_requested: std::sync::Mutex::new(false),
             }

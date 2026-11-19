@@ -20,13 +20,8 @@ pub struct AppState {
     /// 重试规则表（源 `config.retry_rules`，空 = 一切请求无限重试），`path` 已预编译。
     /// 启动时编译一次随 AppState 共享，请求热路径只做 is_match。
     pub retry_rules: Arc<Vec<CompiledRetryRule>>,
-    /// 外部转换器进程池（request/response 各一，源 `config.request_transform`
-    /// / `response_transform`）；None = 未配置，热路径零开销。pub(crate)：池是
-    /// 内部编排细节（TransformPool 的接口不对外），AppState 虽 pub 但不泄漏它。
-    pub(crate) request_pool: Option<Arc<crate::transform::TransformPool>>,
-    pub(crate) response_pool: Option<Arc<crate::transform::TransformPool>>,
-    /// 心跳转换器进程池（`heartbeat_transform`）；None = 只发固定心跳
-    pub(crate) heartbeat_pool: Option<Arc<crate::transform::TransformPool>>,
+    /// 配置顺序就是请求方向的调用顺序。同一条目的所有阶段共用一组会话。
+    pub(crate) formats: Arc<[Arc<crate::transform::Pool>]>,
     /// 入站来源校验策略（源 `config.allowed_hosts` / `allowed_origins` 与监听
     /// 地址）：启动时归一一次，热路径只做小集合比较。
     pub(super) inbound: Arc<InboundPolicy>,
@@ -78,7 +73,8 @@ impl AppState {
         );
     }
 
-    pub fn new(config: Config) -> Self {
+    /// 代理和连接超时是建连策略；有逐请求覆盖时单独建 client，不影响并行请求。
+    pub(super) fn upstream_client(config: &Config) -> reqwest::Client {
         // 超时策略：不设总时限（会掐断超过时限的慢流式生成，导致无限重试永不成功）。
         // 客户端上只设连接建立的时限；等响应头（首字节）与两次读到数据之间的时限各有各的
         // 配置，由发请求与读响应体的地方分别计时（见 upstream.rs 的 `send_with_timeout` 与
@@ -107,7 +103,11 @@ impl AppState {
             builder = builder.proxy(proxy);
         }
 
-        let client = builder.build().expect("构建 reqwest client 失败");
+        builder.build().expect("构建 reqwest client 失败")
+    }
+
+    pub fn new(config: Config) -> Self {
+        let client = Self::upstream_client(&config);
         // 磁盘缓存目录：关闭（disk_cache=false）时为 None——全程纯内存；
         // 开启时用测试注入覆盖，否则是本进程自己的 <home>/spool/<pid>-<启动标记短哈希>/
         let spool_dir = if config.disk_cache_enabled() {
@@ -144,20 +144,6 @@ impl AppState {
                 })
                 .collect::<Vec<_>>(),
         );
-        // 外部转换器进程池：按配置构造（未配置 = None，热路径零开销）。
-        // 仅 spawn 模式惰性启动了 reaper 之外无任何后台任务，构造本身零开销
-        let request_pool = config
-            .request_transform
-            .as_ref()
-            .map(|t| Arc::new(crate::transform::TransformPool::new(Arc::new(t.clone()))));
-        let response_pool = config
-            .response_transform
-            .as_ref()
-            .map(|t| Arc::new(crate::transform::TransformPool::new(Arc::new(t.clone()))));
-        let heartbeat_pool = config
-            .heartbeat_transform
-            .as_ref()
-            .map(|t| Arc::new(crate::transform::TransformPool::new(Arc::new(t.clone()))));
         let inbound = Arc::new(InboundPolicy::from_config(&config));
         let started_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -173,6 +159,20 @@ impl AppState {
             config.known_secrets(),
             instance_id.clone(),
         );
+        let mut stats = crate::daemon::IpcStats::sharing(last_activity_ms.clone());
+        let formats: Arc<[Arc<crate::transform::Pool>]> = config
+            .formats
+            .iter()
+            .map(|entry| {
+                crate::transform::Pool::new(
+                    entry.clone(),
+                    aproxy_ipc::home::home(),
+                    history.secrets().clone(),
+                    stats.state_changed.clone(),
+                )
+            })
+            .collect();
+        stats.formats = formats.iter().map(Arc::downgrade).collect();
         Self {
             instance_id,
             history,
@@ -180,14 +180,32 @@ impl AppState {
             spool_dir,
             config: Arc::new(config),
             client,
-            stats: Arc::new(crate::daemon::IpcStats::sharing(last_activity_ms.clone())),
+            stats: Arc::new(stats),
             last_activity_ms,
             retry_rules,
-            request_pool,
-            response_pool,
-            heartbeat_pool,
+            formats,
             inbound,
         }
+    }
+
+    /// 控制端点就绪后并行协商。按配置顺序报告错误，不让子进程调度影响启动诊断。
+    pub async fn handshake_formats(&self) -> Result<(), crate::transform::StartupError> {
+        let results = futures_util::future::join_all(self.formats.iter().map(|p| p.probe())).await;
+        for (pool, result) in self.formats.iter().zip(results) {
+            if let Err(fault) = result {
+                let name = self.history.secrets().replace(&pool.entry.name);
+                if pool.entry.required || !fault.unavailable() {
+                    return Err(crate::transform::StartupError { name, fault });
+                }
+                pool.open_at_startup(fault);
+            }
+        }
+        Ok(())
+    }
+
+    /// 只查看配置，不触碰进程和状态；没有相应阶段就走原来的转发路径。
+    pub(super) fn has_format(&self, stage: crate::config::file::Stage) -> bool {
+        self.formats.iter().any(|p| p.entry.has_stage(stage))
     }
 
     /// 路径可能命中的重试规则：`路径?查询串` 整体匹配 `path` 的规则（没写 `path` 的规则匹配

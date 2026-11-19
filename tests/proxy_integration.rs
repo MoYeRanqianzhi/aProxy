@@ -2903,12 +2903,13 @@ async fn keepalive_with_response_transform_commits_skeleton_not_upstream_head() 
     let (upstream_url, _h1) = bind_random_router(upstream).await;
     let mut cfg = proxy_config_for(&upstream_url);
     cfg.keepalive_interval_secs = 1;
-    cfg.response_transform = Some(aproxy::config::TransformConfig {
-        command: format_echo_path().display().to_string(),
-        args: vec!["upper".to_string()],
-        timeout_secs: Some(10),
-        ..Default::default()
-    });
+    let (file, diags) = aproxy::config::file::parse(
+        "[[format]]\ncommand='f'\nstages=['response']\nargs=['upper']\ntimeout_secs=10",
+        std::path::Path::new("test.toml"),
+    );
+    assert!(diags.is_empty());
+    cfg.formats = file.format.unwrap();
+    cfg.formats[0].command = format_echo_path().display().to_string();
     let (proxy_url, _h2) = bind_random_router(aproxy::proxy::router(AppState::new(cfg))).await;
 
     let t0 = std::time::Instant::now();

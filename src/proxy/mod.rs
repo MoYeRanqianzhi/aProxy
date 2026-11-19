@@ -73,11 +73,7 @@ use std::{
 use tokio::io::{AsyncRead as _, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::io::ReaderStream;
 
-use crate::{
-    config::Config,
-    retry,
-    transform::{ExchangeCtx, HeartbeatSource},
-};
+use crate::{config::Config, retry, transform::ExchangeCtx};
 
 mod attempts;
 mod body;

@@ -603,17 +603,17 @@ fn print_effective(path: &Path, resolved: &config::Resolved) {
         println!("  {}. path = {path}  status = {status}  {limit}", index + 1);
     }
 
-    // format 程序：请求、响应、心跳各至多一个
-    let formats = [
-        ("request", &cfg.request_transform),
-        ("response", &cfg.response_transform),
-        ("heartbeat", &cfg.heartbeat_transform),
-    ];
-    if formats.iter().all(|(_, t)| t.is_none()) {
+    // 每条配置只展示一次，阶段顺序按文件列出；凭据不参与展示。
+    if cfg.formats.is_empty() {
         line("format", "[]".to_string());
     }
-    for (stage, t) in formats {
-        let Some(t) = t else { continue };
+    for t in &cfg.formats {
+        let stage = t
+            .stages
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         println!("format \"{}\"（{stage} 阶段）:", t.name);
         println!("  command          = \"{}\"", t.command);
         if !t.args.is_empty() {
@@ -628,26 +628,20 @@ fn print_effective(path: &Path, resolved: &config::Resolved) {
             let names: Vec<&str> = t.env.keys().map(String::as_str).collect();
             println!("  env              = {}（值不显示）", names.join(", "));
         }
-        match t.mode {
-            config::TransformMode::Spawn => {
+        match t.process {
+            config::file::Process::Spawn => {
                 println!("  process          = spawn（每条消息起一个进程）")
             }
-            config::TransformMode::Persistent => println!(
+            config::file::Process::Persistent => println!(
                 "  process          = persistent（进程池 pool_max={}，空闲 {}）",
-                t.effective_pool_max(),
-                match t.effective_idle_timeout_secs() {
+                t.pool_max,
+                match t.worker_idle_secs {
                     0 => "永不回收".to_string(),
                     secs => format!("{secs}s 后回收"),
                 }
             ),
         }
-        println!(
-            "  timeout_secs     = {}",
-            with_zero(t.effective_timeout_secs(), "不限")
-        );
-        if t.every_attempt {
-            println!("  每次重试前用原始请求重新转换（声明了 retry 阶段）");
-        }
+        println!("  timeout_secs     = {}", with_zero(t.timeout_secs, "不限"));
     }
 
     line(

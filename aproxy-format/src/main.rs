@@ -18,7 +18,7 @@ mod translate;
 
 use std::io::{BufRead, Write};
 
-use aproxy_envelope::TransformEnvelope;
+use aproxy_envelope::legacy::TransformEnvelope;
 use config::{AggConfig, ClientFormat};
 use switchyard_translation::WireFormat;
 

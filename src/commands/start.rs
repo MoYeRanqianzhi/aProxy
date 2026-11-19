@@ -109,7 +109,9 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
     }
 
     if args.foreground {
-        serve_forever(cfg, cfg_file, None).await;
+        if let Err(e) = serve_forever(cfg, cfg_file, None).await {
+            Failure::handshake(&e).exit(json);
+        }
         return;
     }
 
@@ -151,10 +153,8 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
         println!("  仅转发模式：不缓冲、不重试");
     }
     // 外部转换器改变了「原样透传」的承诺，启动提示必须显式说出来
-    if cfg.request_transform.is_some() || cfg.response_transform.is_some() {
-        println!(
-            "  外部转换器：请求/响应将交给 format 程序改写（转换失败：请求侧 502 不重试、响应侧透传原样）"
-        );
+    if !cfg.formats.is_empty() {
+        println!("  Format programs: {}", cfg.formats.len());
     }
     match cfg_file {
         Some(path) => println!("  配置: {}", path.display()),
@@ -251,7 +251,19 @@ pub(crate) async fn handle_serve_cmd(spec_path: &Path) -> ! {
         tracing::warn!("{w}");
         report_config_error(&format!("警告: {w}"), true);
     }
-    serve_forever(cfg, cfg_file, Some(spec)).await;
+    if let Err(e) = serve_forever(cfg, cfg_file, Some(spec)).await {
+        report_config_error(&e.to_string(), true);
+        // 规格已读完，原文件仅本次拉起方可读。只覆盖已有文件：若父进程已超时清理，
+        // 不得重新留下交接文件。父进程只在确认子进程退出之后读取错误。
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(spec_path)
+        {
+            let _ = serde_json::to_writer(file, &e);
+        }
+        crate::util::exit(e.exit_code().into());
+    }
     crate::util::exit(0)
 }
 

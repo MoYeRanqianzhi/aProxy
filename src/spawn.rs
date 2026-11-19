@@ -32,7 +32,12 @@ pub enum SpawnError {
     Spawn(std::io::Error),
     /// 新进程在就绪之前就退出了：配置错误、端口被占这类确定性错误在毫秒级就会退出，
     /// 不必空等到时限
-    Exited { pid: u32, startup_log: StartupLog },
+    Exited {
+        pid: u32,
+        startup_log: StartupLog,
+        /// 子进程离开前写回交接文件的格式诊断，与别的实例的日志无关。
+        format: Option<crate::transform::StartupError>,
+    },
     /// 时限内没有就绪。`start` 是 spawn 之后立刻读到的进程创建时间（身份锚点）：回收卡住的
     /// 子进程时按「pid + 创建时间」核验再终止，等待期间 pid 若已被系统复用给别的进程，届时
     /// 现读的创建时间必然对不上，绝不误杀；None = 没读到（进程瞬间退出或平台不支持），此时
@@ -192,12 +197,18 @@ async fn launch_and_wait(
         if let Some(rec) = daemon::registry_find_pid_in(run_dir, pid)
             && let Ok(live) = daemon::ipc_ping_in(run_dir, daemon::port_of(&rec.listen_addr)).await
             && live.instance.pid == pid
+            && live.state == daemon::InstanceState::Serving
         {
             return Ok(live);
         }
         if crate::process::process_exited(pid) == Some(true) {
+            // 子进程退出后文件不会再变化。不是格式错误时它仍是原始规格，按普通启动失败处理。
+            let format = std::fs::File::open(spec_path)
+                .ok()
+                .and_then(|f| serde_json::from_reader(f).ok());
             return Err(SpawnError::Exited {
                 pid,
+                format,
                 startup_log: StartupLog::since(home, mark),
             });
         }

@@ -1,256 +1,232 @@
-//! 外部转换器（format）的接线：请求转换、按次重新转换、响应转换。
-
+//! format 请求方向的重试游标、结果与响应方向的逐层补丁。
 use super::*;
+use crate::{config::file::Stage, transform};
+use aproxy_envelope as wire;
 
-/// 发往上游的请求：请求转换（若配置）之后的最终形态，重试循环的每一轮原样重放。
-/// `ctx` 随请求带到响应转换（同一 request_id、请求转换留下的 state）。
+/// 发往上游的最终请求。无格式程序时不创建会话状态，也不为重试复制请求体。
 pub(super) struct OutboundRequest {
+    /// 当前层生效的 HTTP 方法。
     pub(super) method: http::Method,
+    /// 完整的上游地址，可能由路由程序改写。
     pub(super) target_url: String,
+    /// 头覆盖和各层补丁之后的头。
     pub(super) headers: HeaderMap,
+    /// 磁盘或内存形式的可重放请求体。
     pub(super) body: RequestBody,
-    pub(super) ctx: ExchangeCtx,
-    /// 请求转换开了 `every_attempt` 时由 [`apply_request_transform`] 填上：每次重试
-    /// 之前据此重新转换（见 [`PerAttemptTransform`]）
-    pub(super) retransform: Option<PerAttemptTransform>,
+    /// 各阶段共享的标识与按程序隔离的 state。
+    pub(super) ctx: Option<ExchangeCtx>,
 }
-
-/// 请求转换的「每次尝试」模式（`[request_transform] every_attempt = true`）：留着客户端
-/// 的原始请求，每次重试之前用它再跑一次请求转换（信封 `stage = "retry"`，附上一次
-/// 失败的状态码或原因），回信替换这次尝试发出的请求。用途是故障转移：format 换
-/// key、换渠道，无限重试就不会一直打同一个坏掉的上游。
-///
-/// 这一次的转换失败（format 拒绝、超时、输出不合法）不终止请求——那会违背无限重试；
-/// 沿用上一次发出的请求，每个请求只告警一次。代价：原始请求体在请求的整个生命期
-/// 留在内存里（转换本来就要整份 body）。
-pub(super) struct PerAttemptTransform {
-    pub(super) method: http::Method,
-    pub(super) url: String,
-    pub(super) headers: HeaderMap,
-    pub(super) body: Bytes,
-    /// 上一次尝试的失败（`attempt` 在调用时填）
-    pub(super) last: aproxy_envelope::RetryInfo,
-    pub(super) warned: bool,
+/// 每次尝试从自己的游标继续；只有上一轮整条链成功时才回到重试段入口。
+pub(super) struct RequestChain {
+    /// 上次已成功的各层留下的当前输入。
+    input: wire::Request,
+    /// 首个 retry 程序之前的缓存，与该层后续改写互不影响。
+    prefix: Option<(usize, wire::Request)>,
+    /// 尚未成功的程序在配置里的位置。
+    cursor: usize,
+    /// 当前跑首轮 request 方向还是重跑 retry 方向，层失败时不变。
+    stage: Stage,
+    /// 下一轮的 retry 信封带着上一次失败；保活也只读这份故障。
+    pub(super) last: Option<wire::Failure>,
+    /// retry.elapsed_ms 使用单调时钟，系统对时不会让它倒退。
+    started: tokio::time::Instant,
 }
-
-impl PerAttemptTransform {
-    /// 记下一次尝试的结果；下一次重新转换时随信封交给 format。成功的结果也会记，
-    /// 无妨：成功之后不会再有重试。
-    pub(super) fn record(&mut self, result: &ForwardResult) {
-        let (status, error) = match result {
-            ForwardResult::NetworkError(failure) => (None, failure.message.clone()),
-            ForwardResult::Response { status, .. } => (
-                Some(status.as_u16()),
-                format!("the upstream returned {}", status.as_u16()),
-            ),
-            ForwardResult::TooLarge | ForwardResult::SpoolFailed(..) => return,
+impl RequestChain {
+    /// 只有请求方向有程序时才读整份请求体。失败属于存储，不计程序的熔断。
+    pub(super) async fn new(req: &OutboundRequest) -> Result<Self, Terminal> {
+        let bytes = match &req.body {
+            RequestBody::Memory(b) => b.to_vec(),
+            RequestBody::Disk { path, .. } => tokio::fs::read(path).await.map_err(|e| {
+                Terminal::local_storage_failed(StorageOp::ReadRequest, &e.to_string())
+            })?,
         };
-        self.last.status = status;
-        self.last.error = Some(error);
+        let mut input = wire::Request::new(req.method.to_string(), req.target_url.clone());
+        input.headers = Some(transform::headers_to_btreemap(&req.headers));
+        input.body = wire::Body::from_bytes(bytes);
+        Ok(Self {
+            input,
+            prefix: None,
+            cursor: 0,
+            stage: Stage::Request,
+            last: None,
+            started: tokio::time::Instant::now(),
+        })
     }
-
-    /// 第 `attempt` 次尝试（2 起）之前重新转换。返回这次要发的请求；失败返回 None，
-    /// 调用方沿用上一次的。
-    pub(super) async fn next(
+    /// 依次派发；在完成一层之后才移动游标。一个请求的局部配置不能通过共享的实例泄漏。
+    pub(super) async fn run(
         &mut self,
         state: &AppState,
-        ctx: &ExchangeCtx,
+        req: &mut OutboundRequest,
         attempt: u32,
-    ) -> Option<crate::transform::TransformedRequest> {
-        let pool = state.request_pool.as_ref()?;
-        let mut retry = self.last.clone();
-        retry.attempt = attempt;
-        match crate::transform::transform_request(
-            pool,
-            ctx,
-            &self.method,
-            &self.url,
-            &self.headers,
-            RequestBody::Memory(self.body.clone()),
-            Some(retry),
+    ) -> Result<bool, Terminal> {
+        let ctx = req.ctx.as_ref().expect("format context");
+        if self.cursor == state.formats.len() {
+            let Some((i, p)) = &self.prefix else {
+                return Ok(false);
+            };
+            self.cursor = *i;
+            self.input = p.clone();
+            self.stage = Stage::Retry;
+        }
+        let mut changed = false;
+        while self.cursor < state.formats.len() {
+            let pool = state.formats[self.cursor].clone();
+            if self.prefix.is_none() && pool.entry.has_stage(Stage::Retry) {
+                self.prefix = Some((self.cursor, self.input.clone()));
+            }
+            if pool.entry.has_stage(self.stage) {
+                let name = &pool.entry.name;
+                let safe = state.history.secrets().replace(name);
+                let stage = self.stage.as_str();
+                let m = wire::RequestMessage::new(
+                    ctx.context(name),
+                    wire::Delivery::Retry,
+                    self.input.clone(),
+                    ctx.client.clone(),
+                );
+                let frame = if self.stage == Stage::Retry {
+                    wire::Stage::Retry(wire::RetryMessage::new(
+                        m,
+                        wire::Retry::new(
+                            attempt,
+                            self.last.clone().expect("retry follows a failure"),
+                            self.started.elapsed().as_millis() as u64,
+                        ),
+                    ))
+                } else {
+                    wire::Stage::Request(m)
+                };
+                match pool.call(frame, pool.entry.timeout_secs, false).await {
+                    Ok(reply) => {
+                        ctx.absorb(name, reply.state);
+                        if let Some(f) = reply.fail {
+                            let reason = state.history.secrets().replace(&f.reason);
+                            return Err(Terminal::format_rejected(&safe, stage, &reason));
+                        }
+                        if let Some(patch) = reply.request {
+                            self.input.apply(patch);
+                            changed = true;
+                        }
+                    }
+                    Err(e) if pool.entry.required => {
+                        return Err(Terminal::format_failed(
+                            &safe,
+                            stage,
+                            e.kind(),
+                            &e.to_string(),
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::warn!(format=%safe,stage,error=%e,"optional format layer skipped")
+                    }
+                }
+            }
+            self.cursor += 1;
+        }
+        // 游标也可能是从失败层恢复；此前各层留下的 input 必须交付，不能只看本轮是否有补丁。
+        req.method = self.input.method.parse().expect("validated method");
+        req.target_url = self.input.url.clone();
+        req.headers = transform::headers_from_btreemap(self.input.headers.as_ref().unwrap());
+        req.body = transform::spool_request_body(
+            self.input.body.as_bytes().unwrap(),
             state.spool_dir.as_deref(),
         )
-        .await
-        {
-            Ok(t) => {
-                tracing::info!(
-                    attempt,
-                    url = %aproxy_ipc::redact::url(&t.url),
-                    "重试前请求已由外部转换器重新改写"
-                );
-                Some(t)
-            }
-            Err(e) => {
-                if !self.warned {
-                    self.warned = true;
-                    tracing::warn!(
-                        attempt,
-                        error = %e,
-                        "重试前的请求转换失败，沿用上一次发出的请求（本请求只告警这一次）"
-                    );
-                }
-                None
-            }
-        }
+        .await;
+        Ok(changed || self.stage == Stage::Retry)
     }
 }
-
-/// 请求转换器：缓冲完成后交给外部 format 程序改写（body/headers/url/method
-/// 全部可变）——默认转换**一次**，产物被重试循环的每一轮 forward_once 原样重放；
-/// `every_attempt` 打开时顺带留下原始请求，供每次重试前重新转换（见
-/// [`PerAttemptTransform`]）。位置约束：必须在首轮 forward_once 之前（否则重放的是未
-/// 转换请求）、重试规则的路径匹配之后（规则对原始路径判定——路径集合是
-/// 客户端视角，转换是实例级配置，语义不同源）。未配置时原样返回。
-///
-/// 失败返回这个请求的终态（已记日志与最近一次失败）：请求未发往上游，按约定
-/// 不重试（失败按成因归成不同的码，见 [`request_transform_terminal`]）。
-/// 调用方按响应是否已提交决定回错误响应还是写终态 error 事件。
-pub(super) async fn apply_request_transform(
-    state: &AppState,
-    req: OutboundRequest,
-) -> Result<OutboundRequest, Terminal> {
-    let Some(pool) = state.request_pool.as_ref() else {
-        return Ok(req);
-    };
-    let OutboundRequest {
-        method,
-        target_url,
-        headers,
-        body,
-        ctx,
-        ..
-    } = req;
-    // every_attempt：原始请求留一份给每次重试重新转换。磁盘上的体读进内存（转换
-    // 本来就要整份 body），首次转换也改用内存这份，不必再读一遍
-    let every_attempt = state
-        .config
-        .request_transform
-        .as_ref()
-        .is_some_and(|t| t.every_attempt);
-    let (body, retransform) = if every_attempt {
-        let bytes = match &body {
-            RequestBody::Memory(b) => b.clone(),
-            RequestBody::Disk { path, .. } => match tokio::fs::read(path).await {
-                Ok(v) => Bytes::from(v),
-                Err(e) => {
-                    let terminal =
-                        Terminal::local_storage_failed(StorageOp::ReadRequest, &e.to_string());
-                    terminal.record_in(&state.stats);
-                    tracing::error!(code = %terminal.code(), error = %e, "请求转换前读取落盘的请求体失败");
-                    return Err(terminal);
-                }
-            },
-        };
-        let original = PerAttemptTransform {
-            method: method.clone(),
-            url: target_url.clone(),
-            headers: headers.clone(),
-            body: bytes.clone(),
-            last: Default::default(),
-            warned: false,
-        };
-        (RequestBody::Memory(bytes), Some(original))
-    } else {
-        (body, None)
-    };
-    match crate::transform::transform_request(
-        pool,
-        &ctx,
-        &method,
-        &target_url,
-        &headers,
-        body,
-        None,
-        state.spool_dir.as_deref(),
-    )
-    .await
-    {
-        Ok(t) => {
-            tracing::info!(url = %aproxy_ipc::redact::url(&t.url), "请求已由外部转换器改写");
-            Ok(OutboundRequest {
-                method: t.method,
-                target_url: t.url,
-                headers: t.headers,
-                body: t.body,
-                ctx,
-                retransform,
-            })
-        }
-        Err(e) => {
-            let terminal = request_transform_terminal(&request_format_name(state), &e);
-            terminal.record_in(&state.stats);
-            tracing::warn!(code = %terminal.code(), error = %e, "请求转换失败，终态返回（请求侧转换失败按约定不重试）");
-            Err(terminal)
-        }
-    }
-}
-
-/// 请求侧 format 程序在错误体与日志里的名字：配置里它的 `name`（没写时是 `command` 的文件名
-/// 主干）。不经配置文件、直接构造出来的配置可能没有名字，那时用 `request` 指代它。
-fn request_format_name(state: &AppState) -> String {
-    state
-        .config
-        .request_transform
-        .as_ref()
-        .map(|t| t.name.as_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("request")
-        .to_string()
-}
-
-/// 请求转换失败对应的终态：
-/// - format 用信封的 error 行明确拒绝了这个请求 → `format_rejected`；
-/// - 落盘的请求体读不回来（本地磁盘的问题，与 format 无关）→ `local_storage_failed`；
-/// - 其余是 format 程序本身出了问题（起不来、管道断了、超时、中途退出、输出不合协议）→
-///   `format_failed`，`kind` 说明是哪一种。
-fn request_transform_terminal(format: &str, e: &crate::transform::TransformError) -> Terminal {
-    use crate::transform::TransformError as E;
-    let kind = match e {
-        E::Rejected(reason) => {
-            return Terminal::format_rejected(format, "request", reason);
-        }
-        E::Spool(io) => {
-            return Terminal::local_storage_failed(StorageOp::ReadRequest, &io.to_string());
-        }
-        E::Spawn(_) => "spawn",
-        E::Io(_) | E::Closed => "io",
-        E::TimedOut => "timeout",
-        E::WorkerDied => "died",
-        E::Protocol(_) | E::Serialize(_) => "protocol",
-    };
-    Terminal::format_failed(format, "request", kind, &e.to_string())
-}
-
-/// 响应侧转换入口（尝试循环交付成功响应时调用）：未配置时原样返回；转换失败时 warn + 原样
-/// 返回（透传上游原始响应——响应已在手，可用性优先，用户已定语义）。
-/// is_streaming 由调用方按返回值重算（format 可改 content-type/body 形态）。
+/// 只对最终交付的成功响应逆序派发。整条链都跳过或不改内容时原样交付原始字节（包括压缩）。
 pub(super) async fn transform_response_if_configured(
     state: &AppState,
-    upstream_url: &str,
-    ctx: &ExchangeCtx,
-    headers: HeaderMap,
-    body: SpooledBody,
-) -> (HeaderMap, SpooledBody) {
-    let Some(pool) = state.response_pool.as_ref() else {
-        return (headers, body);
-    };
-    let content_encoding = headers
-        .get(http::header::CONTENT_ENCODING)
-        .and_then(|v| v.to_str().ok().map(|s| s.to_string()));
-    let out = crate::transform::transform_response(
-        pool,
-        ctx,
-        upstream_url,
-        content_encoding.as_deref(),
-        headers,
-        body,
-        state.spool_dir.as_deref(),
-    )
-    .await;
-    if let Some(e) = &out.error {
-        tracing::warn!(error = %e, "响应转换失败，透传上游原始响应");
+    req: &OutboundRequest,
+    mut status: StatusCode,
+    mut headers: HeaderMap,
+    mut body: SpooledBody,
+) -> (StatusCode, HeaderMap, SpooledBody) {
+    if !state.has_format(Stage::Response) {
+        return (status, headers, body);
     }
-    // 失败时 transform_response 已把 headers/body 还原为原始值（透传语义），
-    // 两分支同构返回
-    (out.headers, out.body)
+    let ctx = req.ctx.as_ref().expect("format context");
+    let raw = match &body {
+        SpooledBody::Memory(b) => b.to_vec(),
+        SpooledBody::Disk { path, .. } => match tokio::fs::read(path).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error=%e,"could not read response spool; format skipped");
+                return (status, headers, body);
+            }
+        },
+    };
+    let mut input = wire::Response::new(status.as_u16());
+    let mut heads = transform::headers_to_btreemap(&headers);
+    let decoded = if let Some(enc) = encoding_to_undo(&headers) {
+        let mut out = Vec::new();
+        if crate::decode::decode_strict(
+            &enc,
+            raw.as_slice(),
+            &mut out,
+            spool_limit_bytes(&state.config) as u64,
+        )
+        .is_err()
+        {
+            tracing::warn!("could not decode response body; format skipped");
+            return (status, headers, body);
+        }
+        heads.remove("content-encoding");
+        out
+    } else {
+        raw
+    };
+    input.headers = Some(heads);
+    input.body = wire::Body::from_bytes(decoded);
+    let mut rewrite_body = false;
+    let mut rewrite_headers = false;
+    for p in state
+        .formats
+        .iter()
+        .filter(|p| p.entry.has_stage(Stage::Response))
+    {
+        let name = &p.entry.name;
+        let m = wire::Stage::Response(wire::ResponseMessage::new(
+            ctx.context(name),
+            wire::Request::new(req.method.to_string(), req.target_url.clone()),
+            input.clone(),
+        ));
+        let r = match p.call(m, p.entry.timeout_secs, false).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(format=%state.history.secrets().replace(name),error=%e,"response format layer skipped");
+                continue;
+            }
+        };
+        ctx.absorb(name, r.state);
+        if let Some(f) = r.fail {
+            if let Some(response) = f.response {
+                input = response;
+                rewrite_body = true;
+                rewrite_headers = true;
+            }
+        } else if let Some(patch) = r.response {
+            rewrite_headers |= patch.headers.is_some();
+            rewrite_body |= patch.body.as_bytes().is_some();
+            input.apply(patch);
+        }
+    }
+    status = StatusCode::from_u16(input.status).expect("validated response status");
+    if rewrite_headers {
+        headers = transform::headers_from_btreemap(&input.headers.unwrap_or_default());
+    }
+    if rewrite_body
+        || rewrite_headers
+            && body.len() != 0
+            && headers.get(http::header::CONTENT_ENCODING).is_none()
+    {
+        body = transform::spool_response_body(
+            input.body.as_bytes().unwrap_or_default(),
+            state.spool_dir.as_deref(),
+        )
+        .await;
+        headers.remove(http::header::CONTENT_ENCODING);
+    }
+    (status, headers, body)
 }

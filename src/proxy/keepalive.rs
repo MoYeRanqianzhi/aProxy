@@ -55,9 +55,13 @@ pub(super) struct Heartbeat {
 
 /// 一个请求的动态心跳生成器（在各拍的独立任务间共享）。
 pub(super) struct DynamicHeartbeat {
-    pub(super) pool: Arc<crate::transform::TransformPool>,
+    /// 配置顺序与请求方向相同，逐拍逆序遍历。
+    pub(super) pools: Arc<[Arc<crate::transform::Pool>]>,
     pub(super) ctx: ExchangeCtx,
-    pub(super) source: HeartbeatSource,
+    /// 超过下一拍的消息不能阻塞保活，逐层保留上一层的字节。
+    pub(super) interval: Duration,
+    /// 最近一次尝试的失败，不会把别的请求的状态带进心跳。
+    pub(super) last: std::sync::Mutex<Option<aproxy_envelope::Failure>>,
     /// 已发起的心跳调用次数（信封 heartbeat.seq）
     pub(super) seq: std::sync::atomic::AtomicU64,
     /// 当前第几次上游尝试，重试循环每轮更新
@@ -79,26 +83,49 @@ pub(super) fn spawn_dynamic_heartbeat(
     elapsed: Duration,
 ) {
     tokio::spawn(async move {
-        let info = aproxy_envelope::HeartbeatInfo {
-            seq: d.seq.fetch_add(1, AtomicOrdering::Relaxed) + 1,
-            elapsed_ms: elapsed.as_millis() as u64,
-            attempt: d.attempt.load(AtomicOrdering::Relaxed),
-        };
-        let bytes =
-            match crate::transform::transform_heartbeat(&d.pool, &d.ctx, &d.source, info).await {
-                Ok(b) => b,
-                Err(why) => {
-                    if !d.warned.swap(true, AtomicOrdering::Relaxed) {
-                        tracing::warn!(
-                            request_id = %d.ctx.request_id,
-                            error = %why,
-                            "心跳转换失败，这一拍改发固定心跳（本请求之后的失败不再重复告警）"
-                        );
+        let mut info = aproxy_envelope::Heartbeat::new(
+            d.seq.fetch_add(1, AtomicOrdering::Relaxed) + 1,
+            elapsed.as_millis() as u64,
+            d.attempt.load(AtomicOrdering::Relaxed),
+        );
+        info.last_failure = d.last.lock().unwrap().clone();
+        let deadline = tokio::time::Instant::now() + d.interval;
+        let mut bytes = fixed;
+        for p in d
+            .pools
+            .iter()
+            .filter(|p| p.entry.has_stage(crate::config::file::Stage::Heartbeat))
+        {
+            let mut m = aproxy_envelope::HeartbeatMessage::new(
+                d.ctx.context(&p.entry.name),
+                info.clone(),
+                d.ctx.client.clone(),
+            );
+            m.data = aproxy_envelope::Data::from_bytes(bytes.to_vec());
+            match tokio::time::timeout_at(
+                deadline,
+                p.call(
+                    aproxy_envelope::Stage::Heartbeat(m),
+                    p.entry.timeout_secs,
+                    false,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(reply)) if reply.fail.is_none() => {
+                    if let Some(b) = reply.data.as_bytes() {
+                        bytes = Bytes::copy_from_slice(b);
                     }
-                    Some(fixed)
                 }
-            };
-        if let Some(bytes) = bytes {
+                Err(_) => break,
+                _ => {
+                    if !d.warned.swap(true, AtomicOrdering::Relaxed) {
+                        tracing::warn!(request_id=%d.ctx.request_id,"heartbeat format failed; retaining input bytes");
+                    }
+                }
+            }
+        }
+        {
             let replaying = gate
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);

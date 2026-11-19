@@ -11,6 +11,7 @@
 //! 本地失败——各出口按 Outcome 收场。判定与「最近错误」的文案因此只有一份。
 
 use super::*;
+use crate::config::file::Stage;
 use crate::history::{Phase, Recorder, SentHead};
 
 /// 从 forward_once 的完整响应里拆出、要交付给客户端的一份上游响应。
@@ -152,7 +153,7 @@ impl Responder {
                 },
             },
             ticker,
-            real_head_allowed: state.response_pool.is_none(),
+            real_head_allowed: !state.has_format(Stage::Response),
         }
     }
 
@@ -212,11 +213,14 @@ impl Responder {
 
     /// 配置了心跳转换时，保活出口改由心跳转换器逐拍生成心跳（请求转换完成之后才有它要的请求）
     fn arm_dynamic_heartbeat(&mut self, state: &AppState, req: &OutboundRequest) {
-        if let (Self::Keepalive { sink, .. }, Some(pool)) = (self, &state.heartbeat_pool) {
+        if let Self::Keepalive { sink, .. } = self
+            && state.has_format(Stage::Heartbeat)
+        {
             sink.arm_dynamic_heartbeat(Arc::new(DynamicHeartbeat {
-                pool: pool.clone(),
-                ctx: req.ctx.clone(),
-                source: HeartbeatSource::new(&req.method, &req.target_url, &req.headers, &req.body),
+                pools: state.formats.clone(),
+                ctx: req.ctx.as_ref().expect("format context").clone(),
+                interval: state.config.keepalive_interval(),
+                last: Default::default(),
                 seq: Default::default(),
                 attempt: Default::default(),
                 in_flight: Default::default(),
@@ -349,29 +353,25 @@ pub(super) async fn run_attempts(
     // 请求写的，format 改写 URL 不影响它
     let rules = state.retry_rules_for(path_and_query);
     let rec = trace.rec.clone();
-    if state.request_pool.is_some() {
-        rec.phase(Phase::Transforming);
-    }
-    let mut req = match r
-        .wait(apply_request_transform(state, req), None, "请求转换")
-        .await
-    {
-        None => return,
-        Some(Ok(req)) => req,
-        Some(Err(terminal)) => {
-            r.finish(terminal, &trace).await;
-            return;
+    let mut req = req;
+    let needs_chain = state.has_format(Stage::Request) || state.has_format(Stage::Retry);
+    let mut chain = if needs_chain {
+        match RequestChain::new(&req).await {
+            Ok(c) => Some(c),
+            Err(t) => {
+                t.record_in(&state.stats);
+                r.finish(t, &trace).await;
+                return;
+            }
         }
+    } else {
+        None
     };
+    r.arm_dynamic_heartbeat(state, &req);
     r.prepare_upstream_headers(&mut req.headers);
     log_proxied_request(&req.method, path_and_query, &req.target_url);
-    r.arm_dynamic_heartbeat(state, &req);
-    // 请求历史：发出的请求行与头，以及这次发出的体是不是与上一次相同（第一次与客户端的原始
-    // 请求体比——没有请求转换时就是它）
     let mut sent = sent_head(&rec, &req);
-    let mut same_body = state.request_pool.is_none();
-
-    let max_backoff = state.config.max_retry_backoff_secs;
+    let mut same_body = true;
     let mut attempt: u32 = 0;
     // 「重试中」的计数守卫：第二次尝试开始时拿到，交付之前放掉；别的出口随函数返回丢弃
     let mut retrying: Option<crate::daemon::Counted> = None;
@@ -389,7 +389,7 @@ pub(super) async fn run_attempts(
             if retrying.is_none() {
                 retrying = Some(state.stats.begin_retrying());
             }
-            let delay = retry::delay_for_attempt(attempt - 1, max_backoff);
+            let delay = retry::delay_for_attempt(attempt - 1, state.config.max_retry_backoff_secs);
             rec.backoff(delay);
             if delay.is_zero() {
                 tracing::warn!(attempt, "立即重试");
@@ -402,55 +402,68 @@ pub(super) async fn run_attempts(
                     return;
                 }
             }
-            // every_attempt：重试前用客户端的原始请求重新转换出这次要发的请求（失败沿用
-            // 上一次的）
-            if let Some(rt) = req.retransform.as_mut() {
-                rec.phase(Phase::Transforming);
-                let next = rt.next(state, &req.ctx, attempt);
-                match r.wait(next, None, "请求转换（重试前）").await {
-                    None => return,
-                    Some(Some(t)) => {
-                        req.method = t.method;
-                        req.target_url = t.url;
-                        req.headers = t.headers;
-                        req.body = t.body;
-                        r.prepare_upstream_headers(&mut req.headers);
-                        sent = sent_head(&rec, &req);
-                        same_body = false;
-                    }
-                    Some(None) => {}
+        }
+
+        if let Some(c) = chain.as_mut() {
+            rec.phase(Phase::Transforming);
+            match r
+                .wait(c.run(state, &mut req, attempt), None, "request format")
+                .await
+            {
+                None => return,
+                Some(Ok(changed)) => {
+                    r.prepare_upstream_headers(&mut req.headers);
+                    sent = sent_head(&rec, &req);
+                    same_body = !changed;
+                }
+                Some(Err(t)) => {
+                    t.record_in(&state.stats);
+                    r.finish(t, &trace).await;
+                    return;
                 }
             }
         }
-
-        let (head_tx, head_rx) = r.head_channel();
-        trace.attempts = attempt;
         record_try(&rec, attempt, sent.as_ref(), same_body, &req);
         same_body = true;
-        let attempt_fut = forward_once(
-            state,
-            &req.method,
-            &req.target_url,
-            &req.headers,
-            &req.body,
-            max_spool_bytes,
-            head_tx,
-            &rec,
-            attempt,
-        );
-        let Some(result) = r.wait(attempt_fut, head_rx, "等待上游").await else {
-            return;
+        let result = {
+            trace.attempts += 1;
+            let (head_tx, head_rx) = r.head_channel();
+            let attempt_fut = forward_once(
+                state,
+                &req.method,
+                &req.target_url,
+                &req.headers,
+                &req.body,
+                max_spool_bytes,
+                head_tx,
+                &rec,
+                attempt,
+            );
+            let Some(result) = r.wait(attempt_fut, head_rx, "等待上游").await else {
+                return;
+            };
+            result
         };
-        if let Some(rt) = req.retransform.as_mut() {
-            rt.record(&result);
-        }
-
         match classify(attempt, result, &rules) {
             Outcome::Retry {
                 failure,
                 rule,
                 response_bytes,
             } => {
+                if let Some(c) = chain.as_mut() {
+                    let mut f = aproxy_envelope::Failure::new(failure.code.into());
+                    f.details = Some(failure.details.clone());
+                    c.last = Some(f.clone());
+                    if let Responder::Keepalive { sink, .. } = r {
+                        let beat = match sink {
+                            KeepaliveSink::Committed { beat, .. }
+                            | KeepaliveSink::Pending { beat, .. } => beat,
+                        };
+                        if let Some(d) = &beat.dynamic {
+                            *d.last.lock().unwrap() = Some(f);
+                        }
+                    }
+                }
                 failure.record_in(&state.stats);
                 rec.try_ended(attempt, response_bytes, Some(failure.for_history()));
                 // 谁让它接着重试的：命中的重试规则，或者默认的无限重试
@@ -564,17 +577,16 @@ async fn deliver(
     } = response;
     let upstream_sse = is_event_stream(&headers);
     let rec = &trace.rec;
-    if state.response_pool.is_some() {
+    if state.has_format(Stage::Response) {
         rec.phase(Phase::Transforming);
     }
-    let transform =
-        transform_response_if_configured(state, &req.target_url, &req.ctx, headers, body);
+    let transform = transform_response_if_configured(state, req, status, headers, body);
     let transformed = if !r.is_committed() && !upstream_sse {
         Some(transform.await)
     } else {
         r.wait(transform, None, "响应转换").await
     };
-    let Some((headers, body)) = transformed else {
+    let Some((status, headers, body)) = transformed else {
         return;
     };
     if !r.is_committed() {

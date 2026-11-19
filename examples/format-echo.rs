@@ -1,294 +1,225 @@
-//! 集成测试用假 format 程序：子命令切换行为，跨平台可用（不依赖系统
-//! python——Windows runner 的 python3 是 Store stub，不可靠）。
-//!
-//! cargo test 会先编译全部 example 再跑测试，二进制必已存在；测试按
-//! current_exe 祖先目录定位 `target/<profile>/examples/`。
-//!
-//! 子命令：
-//! - `echo`    读一行信封 → 原样回一行（循环直到 EOF——协议义务）
-//! - `upper`   body 文本大写后回显（验证转换确实发生）
-//! - `error`   输出 error 行（单请求失败，进程不崩）
-//! - `exit1`   读一行后以非零退出（进程级失败模拟）
-//! - `sleep <ms>` 睡指定毫秒后回显（超时测试）
-//! - `rotate`  从 extra 解析 {"keys":[...]}，按请求计数轮换 authorization 头
-//!   （多 key 轮换场景验证；计数在进程内存——persistent 模式下复现）
-//! - `stateful` 跨阶段状态验证：把收到的 `stage|request_id|state` 写进
-//!   `x-stage-seen` 头（请求侧进发往上游的请求头，响应侧进回给客户端的响应
-//!   头）；请求阶段回信带 `state = "from-request-<request_id>"`
-//! - `heartbeat [<ms>]` 心跳阶段（先睡 <ms> 毫秒，缺省不睡）回一条 SSE 注释
-//!   `: hb seq=<n> attempt=<n> body=<有无请求体>` 并把 state 设为 `hb-<seq>`；
-//!   响应阶段在 body 末尾追加注释 `: state=<state>`（验证心跳回信的 state 能到达
-//!   响应转换）；请求阶段原样回显
-//!
-//! 违反协议 / 进程生命周期类（进程池加固的回归面）：
-//! - `banner`  启动时先往 stdout 打一行非信封横幅，之后照常回显——模拟
-//!   「format 把启动日志写进 stdout」，stdout 从此比请求多一行
-//! - `multiline` 每个请求回**两行**相同信封（单次写入，两行同批到达）——模拟
-//!   jq 未加 -c / console.log 与 write 混用等「一请求多行」，且多出的那行恰好
-//!   是合法信封（最危险的形态：错位后解析照样成功，串包静默）
-//! - `late-stray <ms>` 回显后再等 <ms> 毫秒，把同一信封**再写一行**——模拟
-//!   多余输出晚于回复到达（Node 的 console.log 交错、后台线程打日志）：
-//!   aproxy 读回复时它还没来，worker 归还空闲表后才冒出来
-//! - `die-idle <ms>` 回显；每处理完一个请求后空闲超过 <ms> 毫秒即自行退出
-//!   （模拟空闲期崩溃 / 被杀 / format 自带空闲退出——池里留下的是死 worker）
-//! - `oneshot [<marker>]` 首个请求正常回显；之后再读到输入行即**无输出退出**
-//!   （复用 worker「写入成功、读到 EOF」的确定性复现）。给了 marker 文件路径
-//!   时：每次启动往 marker 追加一行（行数 = 启动次数）；启动前 marker 已存在
-//!   → 首个请求即无输出退出（模拟「换新 worker 也起不来」）
+//! 集成测试的本地 format 程序。握手独立于阶段行为，测试可分别模拟不兼容、未就绪、
+//! 管道错位和合法拒绝。记录文件由测试指定，只含测试构造的帧。
+use serde_json::{Value, json};
+use std::{
+    fs::OpenOptions,
+    io::{BufRead, Write},
+    time::Duration,
+};
 
-use std::io::{BufRead, Write};
-
+/// 每个进程按行处理到 EOF；同批多余帧和延迟多余帧要区分，才能测出两种错位。
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = args.first().map(String::as_str).unwrap_or("echo");
-    if cmd == "die-idle" {
-        // 需要「带超时的读行」，与下方同步逐行循环的结构不同，单独实现
-        let idle_ms: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(300);
-        die_idle(std::time::Duration::from_millis(idle_ms));
-        return;
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let mode = args.first().map_or("echo", String::as_str);
+    let arg = args.get(1).map_or("", String::as_str);
+    let delay = Duration::from_millis(arg.parse().unwrap_or(100));
+    if mode == "banner" {
+        println!("format-echo banner: ready");
     }
-    if cmd == "banner" {
-        // 横幅先于任何请求写出：aproxy 读到的第一行必然是它
-        print_line("format-echo banner: ready");
+    if mode == "stderr" {
+        eprintln!("worker diagnostic");
+        eprintln!("value={}", std::env::var("ECHO_SECRET").unwrap_or_default());
     }
-    // oneshot 的「首个请求也直接退出」开关：marker 已存在 = 本进程不是第一个。
-    // 每次启动都往 marker 追加一行：测试按行数数出 aproxy 一共拉起了几个
-    // worker（重试上限的可观测断言面）
-    let oneshot_dead_on_arrival = cmd == "oneshot"
-        && args.get(1).is_some_and(|marker| {
-            let path = std::path::Path::new(marker);
-            let existed = path.exists();
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                let _ = f.write_all(b"spawned\n");
-            }
-            existed
-        });
-    let stdin = std::io::stdin();
-    let mut lines = stdin.lock().lines();
-    let mut counter: u64 = 0;
-
-    // 循环逐行处理直到 EOF（persistent 协议义务；spawn 模式处理一行后由
-    // aproxy 侧 kill/自然退出，行为兼容）
-    while let Some(Ok(line)) = lines.next() {
-        counter += 1;
-        match cmd {
-            "exit1" => std::process::exit(1),
-            "sleep" => {
-                let ms: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(100);
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-                respond(&line, |env| env);
-            }
-            "error" => {
-                let out = format!(r#"{{"headers":{{}},"error":"{cmd}-rejected-{counter}"}}"#);
-                print_line(&out);
-            }
-            "upper" => {
-                respond(&line, |mut env| {
-                    env.body = env.body.take().map(|b| b.to_uppercase());
-                    env
-                });
-            }
-            "rotate" => {
-                respond(&line, |mut env| {
-                    // extra: {"keys":["k1","k2",...]}；轮换 authorization 头。
-                    // worker_id 计入偏移：池内各 worker 起点错开（协议字段语义）
-                    let keys: Vec<String> = serde_json::from_str::<serde_json::Value>(&env.extra)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("keys").and_then(|k| {
-                                k.as_array().map(|a| {
-                                    a.iter()
-                                        .filter_map(|x| x.as_str().map(String::from))
-                                        .collect()
-                                })
-                            })
-                        })
-                        .unwrap_or_default();
-                    if !keys.is_empty() {
-                        let idx = ((counter - 1) as u32 + env.worker_id) as usize % keys.len();
-                        env.headers
-                            .insert("authorization".to_string(), format!("Bearer {}", keys[idx]));
-                    }
-                    env
-                });
-            }
-            "stateful" => {
-                respond(&line, |mut env| {
-                    let id = env.request_id.clone().unwrap_or_default();
-                    let seen = format!(
-                        "{}|{id}|{}",
-                        env.stage.as_deref().unwrap_or("-"),
-                        env.state.as_deref().unwrap_or("-")
-                    );
-                    env.headers.insert("x-stage-seen".to_string(), seen);
-                    env.state = (env.stage.as_deref() == Some("request"))
-                        .then(|| format!("from-request-{id}"));
-                    env
-                });
-            }
-            "heartbeat" => {
-                respond(&line, |mut env| match env.stage.as_deref() {
-                    Some("heartbeat") => {
-                        if let Some(ms) = args.get(1).and_then(|s| s.parse().ok()) {
-                            std::thread::sleep(std::time::Duration::from_millis(ms));
-                        }
-                        let hb = env.heartbeat.clone().unwrap_or_default();
-                        let has_body = env.body.is_some() || env.body_b64.is_some();
-                        env.body = Some(format!(
-                            ": hb seq={} attempt={} body={has_body}\n\n",
-                            hb.seq, hb.attempt
-                        ));
-                        env.body_b64 = None;
-                        env.state = Some(format!("hb-{}", hb.seq));
-                        env
-                    }
-                    Some("response") => {
-                        let state = env.state.clone().unwrap_or_else(|| "-".to_string());
-                        env.body = Some(format!(
-                            "{}: state={state}\n\n",
-                            env.body.take().unwrap_or_default()
-                        ));
-                        env
-                    }
-                    _ => env,
-                });
-            }
-            "failover" | "failover-reject" => {
-                // every_attempt 的故障转移：request 阶段原样放行、给发出的请求打标记；
-                // retry 阶段把 url 换成 extra 指定的备用上游，并把看到的重试上下文写
-                // 进请求头（第几次、上次的状态码、收到的是否是未经转换的原始请求）。
-                // failover-reject 在 retry 阶段回 error——aproxy 应沿用上一次的请求
-                respond(&line, |mut env| {
-                    if env.stage.as_deref() != Some("retry") {
-                        env.headers
-                            .insert("x-transformed".to_string(), "1".to_string());
-                        return env;
-                    }
-                    if cmd == "failover-reject" {
-                        return aproxy_envelope::TransformEnvelope {
-                            error: Some("no backup".to_string()),
-                            ..Default::default()
-                        };
-                    }
-                    let r = env.retry.clone().unwrap_or_default();
-                    let seen = format!(
-                        "attempt={} status={} original={}",
-                        r.attempt,
-                        r.status.map_or("-".to_string(), |s| s.to_string()),
-                        !env.headers.contains_key("x-transformed")
-                    );
-                    env.headers.insert("x-retry-seen".to_string(), seen);
-                    env.url = Some(env.extra.clone());
-                    env
-                });
-            }
-            "rewrite" => {
-                // url 改写验证：extra 即新的完整 url（协议转换的核心语义）
-                respond(&line, |mut env| {
-                    if !env.extra.is_empty() {
-                        env.url = Some(env.extra.clone());
-                    }
-                    env
-                });
-            }
-            "scrub" => {
-                // 头表替换「删头语义」+ method 改写的可观测验证：
-                // 删 authorization 头、method 改写为 PUT（headers/method
-                // 可变性的两条路径都有确定性断言面）
-                respond(&line, |mut env| {
-                    env.headers.remove("authorization");
-                    env.method = Some("PUT".to_string());
-                    env
-                });
-            }
-            "multiline" => {
-                // 两行拼成**一次** write_all 写出（不走 print_line：它分两次写
-                // 正文与换行，stdout 的 LineWriter 会拆成两次系统调用）——两行
-                // 同批进管道，aproxy 一次读就能把两行都收进缓冲，让「读完首行
-                // 后缓冲里还有残行」可确定性复现
-                let out = match aproxy_envelope::TransformEnvelope::from_line(line.trim_end())
-                    .ok()
-                    .and_then(|env| env.to_line().ok())
-                {
-                    Some(l) => l,
-                    None => r#"{"headers":{},"error":"bad envelope"}"#.to_string(),
-                };
-                let stdout = std::io::stdout();
-                let mut o = stdout.lock();
-                let _ = o.write_all(format!("{out}\n{out}\n").as_bytes());
-                let _ = o.flush();
-            }
-            "late-stray" => {
-                let ms: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(100);
-                respond(&line, |env| env);
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-                respond(&line, |env| env);
-            }
-            "oneshot" => {
-                if oneshot_dead_on_arrival || counter > 1 {
-                    // 无输出退出：aproxy 侧写入已成功，读侧拿到 EOF
-                    std::process::exit(0);
-                }
-                respond(&line, |env| env);
-            }
-            // echo（默认）：原样回显
-            _ => respond(&line, |env| env),
-        }
-        if cmd == "exit1" {
-            // 不会到达（exit1 在读取后立即退出），防御性兜底
-            std::process::exit(1);
-        }
-    }
-}
-
-/// `die-idle`：读行放到独立线程，主线程按「空闲超时」等下一行——超时即
-/// exit(0)，留下一个对 aproxy 而言「空闲表里的死 worker」。
-fn die_idle(idle: std::time::Duration) {
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        for line in std::io::stdin().lock().lines() {
-            let Ok(line) = line else { break };
+        for line in std::io::stdin().lock().lines().map_while(Result::ok) {
             if tx.send(line).is_err() {
                 break;
             }
         }
     });
-    // 首个请求之前不计空闲（worker 刚启动、尚未被用过）
-    let mut next = rx.recv().ok();
-    while let Some(line) = next {
-        respond(&line, |env| env);
-        // 空闲超时与 stdin EOF（发送端随读线程退出而断开）都收尾退出
-        next = rx.recv_timeout(idle).ok();
-    }
-    std::process::exit(0);
-}
-
-fn respond(
-    line: &str,
-    f: impl FnOnce(aproxy_envelope::TransformEnvelope) -> aproxy_envelope::TransformEnvelope,
-) {
-    match aproxy_envelope::TransformEnvelope::from_line(line.trim_end()) {
-        Ok(env) => {
-            let out = f(env);
-            match out.to_line() {
-                Ok(l) => print_line(&l),
-                Err(e) => print_line(&format!(r#"{{"headers":{{}},"error":"serialize: {e}"}}"#)),
+    let mut worker = 0;
+    let mut count = 0usize;
+    let mut seen_hello = false;
+    let dead = mode == "oneshot" && !arg.is_empty() && {
+        let exists = std::path::Path::new(arg).exists();
+        writeln!(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(arg)
+                .unwrap(),
+            "spawned"
+        )
+        .unwrap();
+        exists
+    };
+    loop {
+        let line = if seen_hello && mode == "die-idle" {
+            rx.recv_timeout(delay).ok()
+        } else {
+            rx.recv().ok()
+        };
+        let Some(line) = line else { break };
+        if let Some(path) = std::env::var_os("ECHO_RECORD") {
+            let mut bytes = line.as_bytes().to_vec();
+            bytes.push(b'\n');
+            OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(path)
+                .unwrap()
+                .write_all(&bytes)
+                .unwrap();
+        }
+        let m: Value = serde_json::from_str(&line).unwrap();
+        let stage = m["stage"].as_str().unwrap();
+        let seq = m["seq"].as_u64().unwrap();
+        let mut r = json!({"v":1,"seq":seq});
+        if !seen_hello {
+            assert_eq!((stage, seq), ("hello", 0));
+            seen_hello = true;
+            worker = m["worker_id"].as_u64().unwrap() as usize;
+            if mode == "no-hello" {
+                std::thread::sleep(Duration::from_secs(60));
+                break;
+            }
+            if mode == "exit-hello" {
+                break;
+            }
+            if mode == "slow-hello" {
+                std::thread::sleep(delay);
+            }
+            r = json!({"v":1,"seq":0,"name":"format-echo","version":"1.0","protocol":1,"features":[],"stages":["request","retry","response","heartbeat"]});
+            if mode == "bad-protocol" {
+                r["protocol"] = json!(2);
+            }
+            if mode == "missing-stage" {
+                r["stages"] = json!([]);
+            }
+            if mode == "bad-body-need" {
+                r["request_body"] = json!({"request":"all"});
+            }
+        } else {
+            count += 1;
+            let obj = if stage == "response" {
+                "response"
+            } else {
+                "request"
+            };
+            let reason = "error-rejected";
+            if matches!(stage, "request" | "retry" | "response")
+                && matches!(
+                    mode,
+                    "echo"
+                        | "inspect"
+                        | "sleep"
+                        | "multiline"
+                        | "late-stray"
+                        | "oneshot"
+                        | "die-idle"
+                )
+            {
+                r[obj] = m[obj].clone();
+                r["state"] = json!(format!("{worker}/{}", std::process::id()));
+            }
+            match mode {
+                "sleep" => std::thread::sleep(delay),
+                "oneshot" if count > 1 || dead => break,
+                "exit1" => std::process::exit(1),
+                "exit-after" if count > arg.parse().unwrap_or(1) => break,
+                "invalid" => {
+                    println!("not-json");
+                    continue;
+                }
+                "bad-seq" => r["seq"] = json!(seq + 1),
+                "bad-seq-once" | "crash-once"
+                    if OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(arg)
+                        .is_ok() =>
+                {
+                    if mode == "crash-once" {
+                        break;
+                    }
+                    r["seq"] = json!(seq + 1);
+                }
+                "error" => r["fail"] = json!({"retry":false,"reason":reason}),
+                "reply" => {
+                    let fields: serde_json::Map<String, Value> = serde_json::from_str(arg).unwrap();
+                    r.as_object_mut().unwrap().extend(fields);
+                }
+                "upper" => {
+                    if let Some(body) = m[obj]["body"].as_str() {
+                        r[obj] = json!({"body":body.to_uppercase()});
+                    }
+                }
+                "rotate" => {
+                    let keys: Vec<String> = serde_json::from_str(arg).unwrap();
+                    let mut h = m[obj]["headers"].clone();
+                    h["authorization"] = json!(format!(
+                        "Bearer {}",
+                        keys[(worker + count - 1) % keys.len()]
+                    ));
+                    r[obj] = json!({"headers":h});
+                }
+                "stateful" => {
+                    let id = m["request_id"].as_str().unwrap();
+                    let mut h = m[obj]["headers"].clone();
+                    h["x-stage-seen"] = json!(format!(
+                        "{stage}|{id}|{}",
+                        m["state"].as_str().unwrap_or("-")
+                    ));
+                    r[obj] = json!({"headers":h});
+                    if stage == "request" {
+                        r["state"] = json!(format!("from-request-{id}"));
+                    }
+                }
+                "heartbeat" if stage == "heartbeat" => {
+                    if !arg.is_empty() {
+                        std::thread::sleep(delay);
+                    }
+                    let b = &m["heartbeat"];
+                    r["data"] = json!(format!(
+                        ": hb seq={} attempt={} body=false\n\n",
+                        b["beat"], b["attempt"]
+                    ));
+                    r["state"] = json!(format!("hb-{}", b["beat"]));
+                }
+                "heartbeat" if stage == "response" => {
+                    r[obj] = json!({"body":format!("{}: state={}\n\n",m[obj]["body"].as_str().unwrap_or(""),m["state"].as_str().unwrap_or("-"))})
+                }
+                "failover" | "failover-reject" => {
+                    let mut h = m[obj]["headers"].clone();
+                    if stage == "retry" {
+                        if mode == "failover-reject" {
+                            r["fail"] = json!({"retry":false,"reason":"no backup"});
+                        } else {
+                            h["x-retry-seen"] = json!(format!(
+                                "attempt={} status={} original={}",
+                                m["retry"]["attempt"],
+                                m["retry"]["last_failure"]["details"]["status"],
+                                h.get("x-transformed").is_none()
+                            ));
+                            r[obj] = json!({"url":arg,"headers":h});
+                        }
+                    } else {
+                        h["x-transformed"] = json!("1");
+                        r[obj] = json!({"headers":h});
+                    }
+                }
+                "rewrite" => r[obj] = json!({"url":arg}),
+                "scrub" => {
+                    let mut h = m[obj]["headers"].clone();
+                    h.as_object_mut().unwrap().remove("authorization");
+                    r[obj] = json!({"method":"PUT","headers":h});
+                }
+                _ => {}
             }
         }
-        Err(e) => print_line(&format!(
-            r#"{{"headers":{{}},"error":"bad envelope: {e}"}}"#
-        )),
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        if count != 0 && mode == "multiline" {
+            out.write_all(format!("{r}\n{r}\n").as_bytes()).unwrap();
+        } else {
+            writeln!(out, "{r}").unwrap();
+        }
+        out.flush().unwrap();
+        if count != 0 && mode == "late-stray" {
+            std::thread::sleep(delay);
+            writeln!(out, "{r}").unwrap();
+            out.flush().unwrap();
+        }
     }
-}
-
-fn print_line(s: &str) {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    let _ = out.write_all(s.as_bytes());
-    let _ = out.write_all(b"\n");
-    let _ = out.flush();
 }

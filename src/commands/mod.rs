@@ -31,6 +31,8 @@ pub(crate) struct Failure {
     pub(crate) code: &'static str,
     pub(crate) message: String,
     pub(crate) details: Value,
+    /// 同一个握手诊断的退出码取决于故障能否自行恢复。
+    exit_override: Option<u8>,
 }
 
 impl Failure {
@@ -39,11 +41,25 @@ impl Failure {
             code,
             message: message.into(),
             details,
+            exit_override: None,
+        }
+    }
+
+    /// 前台与后台用同一份结构化诊断；静态协议不匹配和程序暂时不可用的退出码不同。
+    pub(crate) fn handshake(e: &aproxy::transform::StartupError) -> Self {
+        Self {
+            code: e.code(),
+            message: e.to_string(),
+            details: e.details(),
+            exit_override: Some(e.exit_code()),
         }
     }
 
     /// 这个失败的退出码。
     pub(crate) fn exit_code(&self) -> u8 {
+        if let Some(code) = self.exit_override {
+            return code;
+        }
         use aproxy_ipc::code::ExitCode;
         match aproxy_ipc::code::lookup(self.code).and_then(|code| code.exit) {
             Some(ExitCode::Fixed(code) | ExitCode::ChildOr(code)) => code,
@@ -173,6 +189,9 @@ pub(crate) fn port_value(port: &str) -> Value {
 pub(crate) fn spawn_failure(error: &aproxy::spawn::SpawnError, message: String) -> Failure {
     use aproxy::spawn::SpawnError;
     match error {
+        SpawnError::Exited {
+            format: Some(e), ..
+        } => Failure::handshake(e),
         SpawnError::TimedOut { .. } => Failure::new(
             "ready_timeout",
             message,

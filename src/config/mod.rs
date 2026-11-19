@@ -13,8 +13,7 @@
 //! `timeouts.read_idle_secs`；`keepalive_interval_secs`、`keepalive_trigger`、
 //! `keepalive_heartbeat` ← `keepalive.interval_secs`、`keepalive.trigger`、`keepalive.heartbeat`；
 //! `max_retry_backoff_secs` ← `retry.max_backoff_secs`；`retry_rules` ← `[[retry.rules]]`；
-//! `request_transform`、`response_transform`、`heartbeat_transform` ← `[[format]]` 里声明了
-//! `request`、`response`、`heartbeat` 阶段的程序。字段注释里说到「配置」时用的是字段名。
+//! `formats` ← `[[format]]`（保留配置顺序，各阶段从同一份链选出参与者）。字段注释里说到「配置」时用的是字段名。
 //!
 //! 经 [`resolve()`] 得到的 [`Config`] 里，带全局默认的 `Option` 字段都已经填好；`None` 只出现在
 //! 不经解析、直接构造出来的配置上（测试），所以消费点一律走访问方法取生效值。
@@ -68,16 +67,6 @@ pub const DEFAULT_DISK_CACHE: bool = true;
 /// 仅转发模式的内置默认值（关）。语义与代价见 Config::forward_only——
 /// 开启即放弃本产品最核心的重试保障，故默认必须为关。
 pub const DEFAULT_FORWARD_ONLY: bool = false;
-/// 外部转换器持续模式池上限的内置默认值（`pool_max` 未配置时生效）。
-/// 转换是「改 JSON 结构」微秒级操作，小池即可撑高并发；默认 4。
-pub const DEFAULT_TRANSFORM_POOL_MAX: u32 = 4;
-/// 外部转换器持续模式 worker 空闲回收的内置默认值（秒，`idle_timeout_secs`
-/// 未配置时生效）。0 = 永不回收（worker 跟随实例生命周期）。
-pub const DEFAULT_TRANSFORM_IDLE_TIMEOUT_SECS: u64 = 300;
-/// 外部转换器单请求转换超时的内置默认值（秒，`timeout_secs` 未配置时生效）。
-/// 转换耗时极低，30s 已极宽裕；0 = 不限。
-pub const DEFAULT_TRANSFORM_TIMEOUT_SECS: u64 = 30;
-
 /// 保活触发条件（`keepalive_trigger` 的取值）：哪些请求在等待上游与重试期间走
 /// 「先向客户端提交响应头、再用 SSE 注释心跳保活」的通道。语义详见
 /// `Config::keepalive_trigger` 字段说明。
@@ -122,79 +111,6 @@ impl KeepaliveTrigger {
 /// `Accept: application/json` + 请求体 `"stream": true`（2026-10-04 实测），
 /// 只看 Accept 的旧判定让它永远进不了保活通道——默认必须把请求体也算进来。
 pub const DEFAULT_KEEPALIVE_TRIGGER: KeepaliveTrigger = KeepaliveTrigger::Any;
-
-/// 外部转换器的运行模式（`request_transform`/`response_transform` 的 `mode`）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum TransformMode {
-    /// 每请求一次性 spawn（默认）：请求时启动进程、写一行信封、读一行回信、
-    /// 进程退出。任何能读写 stdin/stdout 的程序都可用，无需循环支持。
-    #[default]
-    Spawn,
-    /// 持续进程池：worker 进程以 `while` 循环逐行处理（一次一个请求、输入
-    /// 输出有序），按需扩容至 `pool_max`，空闲超时回收。聚合类 format
-    /// （轮换/计数状态在进程内存）必须用本模式。
-    Persistent,
-}
-
-/// 外部转换器配置（`request_transform` / `response_transform` 各一份）。
-/// 指向外部 format 程序：stdin 收一行 JSON 信封、stdout 回一行 JSON 信封。
-/// 信封契约见 aproxy-envelope crate；format 编写指南见 aproxy-format skill。
-#[derive(Debug, Clone, Default)]
-pub struct TransformConfig {
-    /// 这个程序在配置里的名字（`[[format]]` 的 `name`）。错误体与日志用它指明是哪个程序。
-    pub name: String,
-    /// 追加给程序的环境变量（`[[format]]` 的 `env`）。
-    pub env: std::collections::BTreeMap<String, String>,
-    /// format 程序命令（必填非空，validate 拦截）。不走 shell，直接按
-    /// argv 数组执行——无注入面。`~` 前缀在加载时展开为用户主目录
-    /// （`~/.aproxy/bin/aproxy-format` 可直接使用）；裸文件名走 PATH。
-    pub command: String,
-    /// format 程序参数（如官方示例的 `["run", "--config", "...toml"]`）。
-    pub args: Vec<String>,
-    /// 运行模式。默认 spawn（一次性）；聚合类 format 必须 persistent。
-    pub mode: TransformMode,
-    /// persistent 模式池上限（并发 worker 数，超限排队）。未配置取
-    /// `DEFAULT_TRANSFORM_POOL_MAX`（4）；spawn 模式无意义。
-    pub pool_max: Option<u32>,
-    /// persistent 模式 worker 空闲回收秒数。0 = 永不回收。未配置取
-    /// `DEFAULT_TRANSFORM_IDLE_TIMEOUT_SECS`（300）；spawn 模式无意义。
-    pub idle_timeout_secs: Option<u64>,
-    /// 单请求转换超时秒数。0 = 不限。未配置取
-    /// `DEFAULT_TRANSFORM_TIMEOUT_SECS`（30）。超时的 worker 不可信
-    /// （可能仍在消化旧输入），kill 后剔除。
-    pub timeout_secs: Option<u64>,
-    /// 原样透传进信封 `extra` 字段的字符串（格式无要求，format 自解）。
-    /// 官方示例用它传聚合配置文件路径。
-    pub extra: Option<String>,
-    /// 只对 request_transform 有意义：每次重试之前用客户端的原始请求再跑一次
-    /// 请求转换（信封 `stage = "retry"`，附上一次失败的状态码或原因），回信就是
-    /// 这次尝试发往上游的请求。默认 false = 每个请求只转换一次、各次重试复用。
-    /// 这一次的转换失败不会让请求终止（那会违背无限重试），沿用上一次发出的请求。
-    pub every_attempt: bool,
-}
-
-impl TransformConfig {
-    /// 池上限生效值（persistent 模式；未配置回退内置默认）。
-    pub fn effective_pool_max(&self) -> u32 {
-        self.pool_max.unwrap_or(DEFAULT_TRANSFORM_POOL_MAX).max(1)
-    }
-
-    /// 空闲回收生效值（秒；未配置回退内置默认，0 = 永不）。
-    pub fn effective_idle_timeout_secs(&self) -> u64 {
-        self.idle_timeout_secs
-            .unwrap_or(DEFAULT_TRANSFORM_IDLE_TIMEOUT_SECS)
-    }
-
-    /// 单请求转换超时生效值（秒；未配置回退内置默认，0 = 不限）。
-    pub fn effective_timeout_secs(&self) -> u64 {
-        self.timeout_secs.unwrap_or(DEFAULT_TRANSFORM_TIMEOUT_SECS)
-    }
-
-    /// 信封 `extra` 生效值（未配置 = 空字符串）。
-    pub fn effective_extra(&self) -> &str {
-        self.extra.as_deref().unwrap_or("")
-    }
-}
 
 /// 一个实例的运行时配置。由 [`resolve()`] 从各层合并得到；字段名与 config.toml 键名的对应
 /// 见模块文档。
@@ -332,28 +248,8 @@ pub struct Config {
     ///
     /// 未设置时用 settings.json 的 `allowed_origins`（全局默认，内置空）。
     pub allowed_origins: Option<Vec<String>>,
-    /// 请求转换器（外部 format 程序）：请求体缓冲完成后交给它改写
-    /// （body/headers/url/method），重试全程重放转换后的产物。
-    /// **失败语义**：转换失败（进程崩溃/超时/error 行/协议错误）→ 502 + 原因，
-    /// 不重试（按约定，请求未发往上游；各类失败的性质见 `transform::TransformError`
-    /// 的分类说明）。与 forward_only 互斥（后者不缓冲请求体，转换器需要
-    /// 全量 body）——共存时 validate() 启动报错。仅 toml 每实例配置，无
-    /// settings.json 全局默认层（设计决策：转换是场景特定功能）。
-    pub request_transform: Option<TransformConfig>,
-    /// 响应转换器（外部 format 程序）：重试判定为「成功」后、回放前交给它
-    /// 改写响应 body/headers。**失败语义**：转换失败 → 透传上游原始响应 +
-    /// warn（响应已在手，可用性优先）——与请求侧的 502 语义不同，各按其性质。
-    /// 仅 toml 每实例配置。
-    pub response_transform: Option<TransformConfig>,
-    /// 心跳转换器（外部 format 程序）：保活响应提交之后、真实字节回放之前，
-    /// 每个 keepalive 间隔调用一次（信封 `stage = "heartbeat"`），回信的 body
-    /// 就是这一拍写给客户端的字节（空 = 本拍不写）。用于按请求内容生成心跳：
-    /// aProxy 不认识协议，能被客户端当作「事件」的心跳只能由懂协议的 format 生成。
-    /// **失败语义**：调用失败、超时、回信不合 keepalive_heartbeat 的事件边界规则
-    /// → 这一拍改发固定心跳（同一请求只 warn 一次）；上一拍的调用还没回来时，
-    /// 这一拍直接发固定心跳而不排队——心跳不得被慢 format 拖住。请求转换完成
-    /// 之前的各拍同样发固定心跳（此时还不知道最终请求）。仅 toml 每实例配置。
-    pub heartbeat_transform: Option<TransformConfig>,
+    /// 按配置顺序保存的程序链；同一条目的各阶段共用一个 worker 池与熔断器。
+    pub formats: Vec<file::FormatEntry>,
     /// 守护日志文件路径（自定义去向）：不设时写入 `~/.aproxy/logs/` 下按启动
     /// 时刻随机命名的文件（文件名不含端口——端口是易变标识，换端口重启后
     /// 日志照样按实例连续可查，实际路径由实例经 IPC 上报，客户端不拼路径）。
@@ -445,9 +341,7 @@ impl Default for Config {
             history_body_budget_mb: DEFAULT_HISTORY_BODY_BUDGET_MB,
             allowed_hosts: None,
             allowed_origins: None,
-            request_transform: None,
-            response_transform: None,
-            heartbeat_transform: None,
+            formats: Vec::new(),
             log_file: None,
             spool_dir_override: None,
         }
@@ -507,10 +401,6 @@ impl Config {
             .take()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        // 转换器：command 统一 trim，trim 后为空视为未配置（与代理空白语义一致）
-        self.request_transform = trim_transform_command(self.request_transform.take());
-        self.response_transform = trim_transform_command(self.response_transform.take());
-        self.heartbeat_transform = trim_transform_command(self.heartbeat_transform.take());
         self
     }
 
@@ -675,11 +565,7 @@ impl Config {
             }
         }
         // forward 不缓冲请求体，转换器需要全量 body：两者同开是配置矛盾
-        if self.forward_only_enabled()
-            && (self.request_transform.is_some()
-                || self.response_transform.is_some()
-                || self.heartbeat_transform.is_some())
-        {
+        if self.forward_only_enabled() && !self.formats.is_empty() {
             push(
                 "config_conflict",
                 "delivery",
@@ -808,12 +694,7 @@ impl Config {
         }
         let is_secret_flag =
             |arg: &str| SECRET_ARG_FLAGS.iter().any(|f| f.eq_ignore_ascii_case(arg));
-        let formats = [
-            &self.request_transform,
-            &self.response_transform,
-            &self.heartbeat_transform,
-        ];
-        for format in formats.into_iter().flatten() {
+        for format in &self.formats {
             known.extend(format.env.values().cloned());
             let mut next_is_secret = false;
             for arg in &format.args {
@@ -896,20 +777,6 @@ impl Config {
             )
         })
     }
-}
-
-/// 转换器 command 归一化：trim + `~` 展开；trim 后为空 = 配置视为未设置。
-///
-/// `~` 展开是**必须的**：transform 的 command 不经 shell 直接 spawn（tokio
-/// Command 不做任何路径展开），而官方文档/skill 推荐的写法恰是
-/// `~/.aproxy/bin/aproxy-format`——不展开的话该字符串按「当前目录下名为
-/// `~` 的相对路径」解析，照抄示例的用户每请求必 502。
-fn trim_transform_command(t: Option<TransformConfig>) -> Option<TransformConfig> {
-    t.map(|mut t| {
-        t.command = expand_tilde(t.command.trim());
-        t
-    })
-    .filter(|t| !t.command.is_empty())
 }
 
 /// `~` 前缀展开：`~/x`、`~\x`、裸 `~` → 用户目录；其余原样。用户目录是 C1 的那一个
@@ -1534,94 +1401,24 @@ mod tests {
         );
     }
 
+    /// 参数以配置文件为单一来源，显式的零值不能重新套用默认值。
     #[test]
     fn transform_config_defaults_and_effective_values() {
-        // 未配置的池/空闲/超时参数回退 DEFAULT_* 常量；0 值显式配置原样保留
-        // （语义由消费方解释：idle 0=永不回收、timeout 0=不限）
-        let t = TransformConfig {
-            command: "aproxy-format".to_string(),
-            ..Default::default()
+        let parse = |suffix: &str| {
+            file::parse(
+                &format!("[[format]]\ncommand='f'\nstages=['request']\n{suffix}"),
+                std::path::Path::new("test.toml"),
+            )
         };
-        assert_eq!(t.mode, TransformMode::Spawn);
-        assert_eq!(t.effective_pool_max(), DEFAULT_TRANSFORM_POOL_MAX);
+        let parsed = parse("");
+        let t = &parsed.0.format.as_ref().unwrap()[0];
         assert_eq!(
-            t.effective_idle_timeout_secs(),
-            DEFAULT_TRANSFORM_IDLE_TIMEOUT_SECS
+            (t.process, t.pool_max, t.worker_idle_secs, t.timeout_secs),
+            (file::Process::Spawn, 4, 300, 30)
         );
-        assert_eq!(t.effective_timeout_secs(), DEFAULT_TRANSFORM_TIMEOUT_SECS);
-        assert_eq!(t.effective_extra(), "");
-
-        let t = TransformConfig {
-            command: "f".to_string(),
-            pool_max: Some(8),
-            idle_timeout_secs: Some(0),
-            timeout_secs: Some(0),
-            extra: Some("{\"keys\":[\"a\"]}".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(t.effective_pool_max(), 8);
-        assert_eq!(t.effective_idle_timeout_secs(), 0);
-        assert_eq!(t.effective_timeout_secs(), 0);
-        assert_eq!(t.effective_extra(), "{\"keys\":[\"a\"]}");
-    }
-
-    #[test]
-    fn normalized_blank_transform_command_becomes_none() {
-        // command 纯空白 = 配置视为未设置；有值则 trim 保留
-        let cfg = Config {
-            base_url: "https://api.example.com".to_string(),
-            request_transform: Some(TransformConfig {
-                command: "  ".to_string(),
-                ..Default::default()
-            }),
-            response_transform: Some(TransformConfig {
-                command: "  aproxy-format  ".to_string(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-        .normalized();
-        assert!(cfg.request_transform.is_none());
-        assert_eq!(
-            cfg.response_transform.as_ref().unwrap().command,
-            "aproxy-format"
-        );
-    }
-
-    #[test]
-    fn validate_rejects_forward_only_with_transform() {
-        // 互斥：forward_only 不缓冲请求体，转换器需要全量 body——同开是配置矛盾，
-        // 必须启动即报错而非静默丢弃其一
-        for name in ["request", "response", "heartbeat"] {
-            let t = || TransformConfig {
-                command: "f".to_string(),
-                ..Default::default()
-            };
-            let cfg = Config {
-                base_url: "https://api.example.com".to_string(),
-                forward_only: Some(true),
-                request_transform: (name == "request").then(t),
-                response_transform: (name == "response").then(t),
-                heartbeat_transform: (name == "heartbeat").then(t),
-                ..Default::default()
-            };
-            let err = cfg.validate().unwrap_err();
-            assert!(
-                err.contains("cannot be combined with a format"),
-                "{name} 转换器 + forward_only 应报互斥: {err}"
-            );
-        }
-
-        // 互不共存单开各侧均合法
-        let cfg = Config {
-            base_url: "https://api.example.com".to_string(),
-            request_transform: Some(TransformConfig {
-                command: "f".to_string(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_ok());
+        let parsed = parse("pool_max=8\nworker_idle_secs=0\ntimeout_secs=0");
+        let t = &parsed.0.format.as_ref().unwrap()[0];
+        assert_eq!((t.pool_max, t.worker_idle_secs, t.timeout_secs), (8, 0, 0));
     }
 
     /// 每个语义问题带着码表里的码与 config.toml 的键路径；说明里的 URL 已打码。

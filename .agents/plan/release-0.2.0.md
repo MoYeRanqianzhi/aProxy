@@ -1084,3 +1084,23 @@
     以设计稿为准。
   - **验证**（Codex 在 Windows 上跑的，84a030b）：`cargo fmt --all` 无改动；headless 全量 881 通过、0 失败、7 忽略；
     headless、desktop 与 Linux 交叉三种 clippy 零输出。契约测试的夹具与冻结的强制安装实现没有改动。
+- B10b（2026-11-20，Codex 实现；提交「format 的 decide 阶段」及其前后的修复）：decide 阶段。
+  - **表态**：retry 投递的请求在每次尝试失败之后（声明了 `decide.success` 的程序在成功之后也）按配置顺序问 decide。
+    第一个明确表态的程序说了算；都不表态就照重试策略。等待多久与要不要重跑重试段（`reroute`）可以各自表态。对成功的尝试
+    回 stop：不带响应是认可这次成功，照常交付；带响应是用它取代，不再经过 response 阶段。这次尝试的记录里，表态与报告
+    同上游的状态码分开记。交给 decide 的响应体是有上限的预览（开头 64 KiB 加结尾，共 1 MiB），但原样透传或在它上面打补丁时，
+    交付的仍是完整的上游响应。forward 投递的请求这一块还不问 decide（归 B10d）。
+  - **由实现方定、主代理认可的几处**：本地的溢写或大小上限失败（`request_too_large`、`response_too_large` 等）是终局，
+    不问 decide；嵌套的 content-encoding 最多解 4 层，再多就原样交出、头表不动；动作里的字符串在 256 个字符处截断时，
+    截断处若可能是半个已知密钥也一并遮掉；第二个 `start` 观察同一次启动时，读的是一份只在失败时写下、只含脱敏后的握手诊断的
+    临时结果（按启动时刻与 pid 命名，过了保护期由清理回收），没有为此新增 IPC 操作。
+  - **第二轮审查引出的修复**（设计稿 2026-11-20 的各处补充）：先取得 worker 再解码请求体；只有阶段消息的合法回信清零熔断
+    计数；`breaker_failures` 为 0 时，握手时不可用的可选程序以 `closed` 起步；半开的试探被取消时让出试探、不清零；已写出的
+    心跳逾期计入熔断，响应就绪而作废的不计；熔断的冷却用单调时钟；熔断状态的每次变化依序发给订阅者；停机时等已借出的
+    worker 退出；头表容量、UTF-8 与报告的上限。
+  - **CI 的那次失败**（5739219 的 windows (desktop)，`watchdog_respawns_on_death_event_and_force_stop_stays_stopped`）：
+    B10a 之后实例在登记之前就以 `starting` 应答 ping，这个测试原来靠「ping 通再等 2 秒」当作已被看护者收养，于是偶尔在收养
+    之前就杀掉了实例。改了测试：等到 `serving` 并确认已被收养再模拟崩溃，失败时打印最后一次 ping 与两边的 stderr。
+    产品代码没动。本地改之前两种变体各 20 次都没有复现。macOS 上的存活判断改为信号 0，没有在 macOS 上运行过。
+  - **验证**（Codex 在 Windows 上跑的，4cc4994）：`cargo fmt --all` 无改动；headless 全量 925 通过、0 失败、7 忽略；
+    headless、desktop 与 Linux 交叉三种 clippy 零输出。

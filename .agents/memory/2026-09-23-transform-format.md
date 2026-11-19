@@ -15,11 +15,19 @@ metadata:
 错位的回信。记录与历史里的密钥替换是另一条边界：程序自己给的终态响应是交给客户端的数据，既不是上游响应，也不是诊断信息。
 
 **How to apply:** 旧进程被回收之前保留它的编号；逐进程核对 `seq`；区分正常的 EOF 退役与强制剔除。还没回来的心跳要把
-worker 让给响应的交付，这次取消不计入熔断。测这些边界时，看夹具实际收到的帧、pid、EOF 与放行的应答，不要靠 sleep 推断
+worker 让给响应的交付，这次取消不计入熔断；已经写给 worker、到下一拍还没回来的一拍则是超时，要计入。响应就绪之后，
+每一拍沿用最近一次按时得到的字节，不再去借交付要用的 worker。测这些边界时，看夹具实际收到的帧、pid、EOF 与放行的应答，不要靠 sleep 推断
 先后。请求链里给出的终态响应，让这次尝试的上游响应保持为 null：分别核对客户端收到的字节原样、历史里没有留体、错误字段
 经过替换。协议与历史的契约见 `.agents/plan/w2-contracts.md` 的 §6 与 §10。
 
-**Evidence:** `src/transform/pool.rs`、`src/proxy/keepalive.rs`，以及 `tests/format_protocol.rs` 里用真实 worker 的测试
+交给 decide 的响应是有意不完整的预览。表态出来之前要留着完整的上游响应：不带补丁的 `stop` 要原样透传它，补丁也可能沿用
+它的体。对成功的尝试回 `stop` 本身不是错误。测试时把表态、这次尝试是否失败、终态码、客户端收到的字节分开核对，不要由
+一个推断另一个。熔断的计数说的是阶段消息的回信，不是握手成功。放行用单调时钟算经过的时间；墙上时间与让排队的票作废的
+那次故障留着只为报告，恢复之后也留。
+
+**Evidence:** `src/proxy/decide.rs`；`tests/format_protocol.rs` 的 `large_upstream_body_reaches_decide_truncated`、
+`decide_success_can_fail_a_200`；`src/transform/tests.rs` 的 `breaker_generation_retains_the_fault_after_recovery`；
+`src/transform/pool.rs`、`src/proxy/keepalive.rs`，以及 `tests/format_protocol.rs` 里用真实 worker 的测试
 `disconnected_format_request_releases_the_only_worker_without_heartbeat`、
 `pending_heartbeat_does_not_delay_a_response_or_its_eof`、`program_terminal_bytes_stay_private_to_the_client`。
 

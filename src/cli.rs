@@ -176,7 +176,11 @@ pub enum Commands {
 
     /// 全面体检全部配置（settings.json error 级检查 + 别名配置深入审查 +
     /// 配置目录 toml 扫描，均含端口冲突检测）
-    Doctor,
+    Doctor {
+        /// 输出一个 JSON 文档（给程序读）
+        #[arg(long)]
+        json: bool,
+    },
 
     /// 从配置目录列表（settings.json 的 config_dirs + 默认两个）发现全部
     /// config（toml），支持按别名归属与关键字/端口过滤

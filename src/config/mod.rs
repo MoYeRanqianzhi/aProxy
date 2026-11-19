@@ -867,7 +867,7 @@ impl Config {
     /// 本实例是否会给入站请求注入凭据：api_key，或 extra/override_headers 里配置
     /// 了 Authorization / x-api-key。用于非回环监听告警的措辞分级——注入凭据的
     /// 实例对外监听，等于把 key 交给每一个能连上端口的主机。
-    fn injects_credentials(&self) -> bool {
+    pub(crate) fn injects_credentials(&self) -> bool {
         self.api_key.is_some()
             || self
                 .override_headers
@@ -879,7 +879,7 @@ impl Config {
     }
 
     /// 非回环监听的告警文案；回环监听返回 None。start 输出、守护的
-    /// startup.log 与 doctor 共用这一份文案，三处口径一致。
+    /// startup.log 共用这一份文案；体检按相同的监听与凭据判定给出结构化诊断。
     pub fn listen_exposure_warning(&self) -> Option<String> {
         if self.listen_is_loopback() {
             return None;

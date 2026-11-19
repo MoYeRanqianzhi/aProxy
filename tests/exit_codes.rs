@@ -731,3 +731,21 @@ fn settings_exit_codes() {
         );
     }
 }
+
+/// 体检给完整报告而不是失败文档；只有错误使文字和 JSON 两种模式都返回 3。
+#[test]
+fn doctor_exit_codes() {
+    let home = TestHome::new();
+    for exit in [0, 3] {
+        if exit == 3 {
+            home.settings(r#"{"schema":1,"nope":1}"#);
+        }
+        let doc = run_json(&home, &["doctor", "--json"], exit);
+        assert_eq!(doc["summary"]["errors"], usize::from(exit == 3));
+        let plain = run(&home, &["doctor"]);
+        assert_eq!(plain.status.code(), Some(exit));
+        if exit == 3 {
+            assert!(text(&plain.stdout).contains("    删除这个键: aproxy settings unset 'nope'"));
+        }
+    }
+}

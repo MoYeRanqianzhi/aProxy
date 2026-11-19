@@ -455,23 +455,6 @@ pub fn effective_config_dirs_in(settings: &Settings, home: &Path) -> Vec<PathBuf
     out
 }
 
-/// settings.json 的 error 级问题清单（空 = 无问题），每条一行文字：文件内容的诊断，以及
-/// 指向不存在的文件的别名。doctor 汇总输出用。
-pub fn check_settings_errors_in(path: &Path) -> Vec<String> {
-    let loaded = read(path);
-    let mut errors: Vec<String> = loaded
-        .diagnostics
-        .iter()
-        .filter(|d| d.is_error())
-        .map(|d| match &d.key {
-            Some(key) => format!("settings.json: {key}: {} [{}]", d.message, d.code),
-            None => format!("settings.json: {} [{}]", d.message, d.code),
-        })
-        .collect();
-    errors.extend(missing_alias_targets(&loaded.settings));
-    errors
-}
-
 /// 指向不存在的文件的别名，每个一行文字。这是现场的状态（文件可以随时被移走），不是
 /// settings.json 写错了，所以不算进它的诊断。
 pub fn missing_alias_targets(settings: &Settings) -> Vec<String> {
@@ -661,10 +644,7 @@ mod tests {
     fn check_reports_diagnostics_and_missing_alias_targets() {
         let dir = tempfile::tempdir().unwrap();
         let path = settings_path_in(dir.path());
-        assert!(
-            check_settings_errors_in(&path).is_empty(),
-            "没有文件不是错误"
-        );
+        assert!(read(&path).diagnostics.is_empty(), "没有文件不是错误");
 
         let present = dir.path().join("present.toml");
         std::fs::write(&present, "").unwrap();
@@ -672,18 +652,16 @@ mod tests {
             "aliases": {"ok": present.display().to_string(), "gone": dir.path().join("gone.toml").display().to_string()}
         });
         std::fs::write(&path, json.to_string()).unwrap();
-        let errors = check_settings_errors_in(&path);
+        let errors = missing_alias_targets(&read(&path).settings);
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].contains("\"gone\"") && errors[0].contains("不存在"));
 
         std::fs::write(&path, r#"{"nope": 1, "language": "fr"}"#).unwrap();
-        let errors = check_settings_errors_in(&path);
+        let errors = read(&path).diagnostics;
         assert_eq!(errors.len(), 2, "{errors:?}");
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.contains("nope") && e.contains("[config_unknown_key]"))
-        );
+        assert!(errors.iter().any(|e| e.key.as_deref() == Some("nope")
+            && e.code == "config_unknown_key"
+            && e.is_error()));
     }
 
     #[test]

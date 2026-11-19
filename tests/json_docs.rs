@@ -426,3 +426,125 @@ fn settings_set_and_unset_json_documents() {
     assert_eq!(doc["error"]["code"], "usage");
     assert_eq!(doc["error"]["details"]["reason"], "bad_value");
 }
+
+/// 体检始终列出检查过的文件；冲突告诉每一方另一方是谁，只有错误改变退出码。
+#[test]
+fn doctor_json_document() {
+    let home = TestHome::new();
+    let args = ["doctor", "--json"];
+    let doc = document(&run(&home, &args));
+    assert_keys(&doc, &["schema", "files", "summary"]);
+    assert_eq!(doc["summary"], json!({"errors":0,"warnings":0}));
+    let files = doc["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0]["kind"], "settings");
+    assert_eq!(files[1]["kind"], "home");
+    for file in files {
+        assert_keys(file, &["file", "kind", "diagnostics"]);
+        assert_eq!(file["diagnostics"], json!([]));
+    }
+
+    let port = free_port();
+    let configs = home.path().join("configs");
+    fs::create_dir_all(&configs).unwrap();
+    let a = configs.join("a.toml");
+    let b = configs.join("b.toml");
+    let bad = configs.join("bad.toml");
+    let gone = home.path().join("gone.toml");
+    for path in [&a, &b] {
+        fs::write(
+            path,
+            format!("base_url = 'https://ok.example.com'\nlisten_addr = '127.0.0.1:{port}'\n"),
+        )
+        .unwrap();
+    }
+    fs::write(&bad, "base_url = \"https://bad.example.com\"\nnope = 1\n").unwrap();
+    home.settings(
+        &json!({
+            "schema": 1, "watchdog": {"enabled": false},
+            "defaults": {"extra_headers": {"x-team": "blue"}}, "aliases": {"gone": gone}
+        })
+        .to_string(),
+    );
+
+    let (doc, _) = failed_document(&home, &args, 3);
+    assert_eq!(doc["summary"]["errors"], 1, "{doc}");
+    let files = doc["files"].as_array().unwrap();
+    let diag = |path: &std::path::Path, code: &str| {
+        let key = path_match_key(path.to_str().unwrap());
+        let file = files
+            .iter()
+            .find(|f| path_match_key(f["file"].as_str().unwrap()) == key)
+            .unwrap();
+        file["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["code"] == code)
+            .unwrap()
+    };
+    assert_eq!(diag(&bad, "config_unknown_key")["key"], "nope");
+    for (path, other) in [(&a, &b), (&b, &a)] {
+        let d = diag(path, "port_shared");
+        assert_eq!(d["details"]["port"], port);
+        let others = d["details"]["files"].as_array().unwrap();
+        assert_eq!(others.len(), 1);
+        assert_eq!(
+            path_match_key(others[0].as_str().unwrap()),
+            path_match_key(other.to_str().unwrap())
+        );
+    }
+    assert_eq!(
+        diag(&gone, "config_file_unreadable")["details"]["reason"],
+        "not_found"
+    );
+    let header = diag(&home.path().join("settings.json"), "default_header_shared");
+    assert_eq!(header["severity"], "info");
+    assert_eq!(header["key"], "defaults.extra_headers.x-team");
+    let warnings = files
+        .iter()
+        .flat_map(|f| f["diagnostics"].as_array().unwrap())
+        .filter(|d| d["severity"] == "warning")
+        .count();
+    assert_eq!(doc["summary"]["warnings"], warnings);
+    let plain = home.cmd().arg("doctor").output().unwrap();
+    assert_eq!(plain.status.code(), Some(3));
+    let stdout = String::from_utf8(plain.stdout).unwrap();
+    for fragment in [
+        "[ERROR] ",
+        "删除这个键: aproxy config --config '",
+        "检查结果: 1 error,",
+        "有 error 的配置不能用来启动",
+    ] {
+        assert!(stdout.contains(fragment), "{stdout}");
+    }
+}
+
+/// 无法读取的记录保留在原处并暂停日志清理，但不是配置错误。
+#[test]
+fn doctor_reports_unreadable_records() {
+    let home = TestHome::new();
+    let file = format!("run/{}.instance.json", free_port());
+    fs::create_dir(home.path().join("run")).unwrap();
+    let path = home.path().join(&file);
+    fs::write(&path, "not json").unwrap();
+    let doc = document(&run(&home, &["doctor", "--json"]));
+    let record = doc["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["kind"] == "record" && f["file"] == file)
+        .unwrap();
+    let diagnostics = record["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["code"], "record_unreadable");
+    assert_eq!(diagnostics[0]["severity"], "warning");
+    assert_eq!(diagnostics[0]["file"], file);
+    assert_eq!(doc["gc_paused"], json!({"reason":"unreadable_records"}));
+    assert!(
+        String::from_utf8(run(&home, &["doctor"]).stdout)
+            .unwrap()
+            .contains("日志清理已暂停")
+    );
+    assert_eq!(fs::read_to_string(path).unwrap(), "not json");
+}

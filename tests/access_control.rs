@@ -86,18 +86,14 @@ fn a_loose_home_is_tightened_by_the_first_config_write() {
 
     // 只读的命令不改权限；doctor 指出来
     aproxy_ok(&home, &["settings", "get", "language"]);
-    let doctor = home.cmd().arg("doctor").output().expect("运行 aproxy 失败");
-    let report = String::from_utf8_lossy(&doctor.stdout).into_owned()
-        + &String::from_utf8_lossy(&doctor.stderr);
-    assert!(report.contains("能被别的用户访问"), "{report}");
+    let report = aproxy_ok(&home, &["doctor"]);
+    assert!(report.contains("[file_permissions_too_open]"), "{report}");
     assert!(!is_private(home.path()), "只读的命令不该改权限");
 
     aproxy_ok(&home, &["settings", "set", "language", "en"]);
     assert!(is_private(home.path()), "写过配置之后 home 只让属主访问");
-    let doctor = home.cmd().arg("doctor").output().expect("运行 aproxy 失败");
-    let report = String::from_utf8_lossy(&doctor.stdout).into_owned()
-        + &String::from_utf8_lossy(&doctor.stderr);
-    assert!(!report.contains("能被别的用户访问"), "{report}");
+    let report = aproxy_ok(&home, &["doctor"]);
+    assert!(!report.contains("[file_permissions_too_open]"), "{report}");
 }
 
 /// 连上 `argv[1]` 的 unix socket，发一个 ping，打印结果：

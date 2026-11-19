@@ -136,7 +136,7 @@ async fn run(cli: Cli) {
     let loaded = settings::read(&settings_path);
     let reports_itself = matches!(
         cli.command,
-        Some(Commands::Doctor | Commands::Settings { .. })
+        Some(Commands::Doctor { .. } | Commands::Settings { .. })
     );
     if !loaded.is_valid() && !reports_itself {
         let tolerated = matches!(
@@ -159,7 +159,7 @@ async fn run(cli: Cli) {
     }
     // 指向不存在的文件的别名：start/stop 按这个名字操作会失败，每次运行都提醒。doctor 会
     // 汇总输出，这里跳过以免重复
-    if loaded.is_valid() && cli.command != Some(Commands::Doctor) {
+    if loaded.is_valid() && !matches!(cli.command, Some(Commands::Doctor { .. })) {
         for e in settings::missing_alias_targets(&loaded.settings) {
             eprintln!("[ERROR] {e}");
         }
@@ -206,7 +206,7 @@ async fn run(cli: Cli) {
         }) => commands::logs::handle_logs_cmd(target, lines, follow).await,
         Some(Commands::Restore { json }) => commands::restore::handle_restore_cmd(json).await,
         Some(Commands::Alias { cmd }) => commands::alias::handle_alias_cmd(cmd),
-        Some(Commands::Doctor) => commands::doctor::handle_doctor_cmd().await,
+        Some(Commands::Doctor { json }) => commands::doctor::handle_doctor_cmd(json).await,
         Some(Commands::Find {
             aliased,
             unaliased,

@@ -103,12 +103,12 @@ fn stage_replies_roundtrip() {
 #[test]
 fn patches_preserve_omitted_and_replace_explicitly_empty() {
     let mut r = Request::new("POST".into(), "https://example.test".into());
-    r.headers = Some(Headers::from([("first".into(), "1".into())]));
+    r.headers = Headers::from([("first".into(), "1".into())]);
     r.body = Body::from_bytes(vec![255]);
     let patch: RequestPatch = serde_json::from_value(json!({"headers":{},"future":true})).unwrap();
     assert_eq!(serde_json::to_value(&patch).unwrap(), json!({"headers":{}}));
     r.apply(patch);
-    assert_eq!(r.headers, Some(Headers::new()));
+    assert_eq!(r.headers, Headers::new());
     assert_eq!(r.body.as_bytes(), Some([255].as_slice()));
     r.apply(serde_json::from_value(json!({"body":""})).unwrap());
     assert_eq!(r.body.as_bytes(), Some([].as_slice()));
@@ -120,7 +120,7 @@ fn patches_preserve_omitted_and_replace_explicitly_empty() {
     assert_eq!(r.status, 201);
     assert_eq!(
         serde_json::to_value(r).unwrap(),
-        json!({"status":201,"body_b64":"/w=="})
+        json!({"status":201,"headers":{},"body_b64":"/w=="})
     );
 }
 
@@ -224,7 +224,7 @@ fn public_constructors_and_retry_input() {
     let wire = serde_json::to_value(Message::new(3, Stage::Retry(retry))).unwrap();
     assert_eq!(
         wire,
-        json!({"v":1,"seq":3,"stage":"retry","request_id":"id","delivery":"retry","request":{"method":"POST","url":"https://example.test/"},"client":{"path":"/","stream":false},"retry":{"attempt":2,"last_failure":{"code":"upstream_status"},"elapsed_ms":80}})
+        json!({"v":1,"seq":3,"stage":"retry","request_id":"id","delivery":"retry","request":{"method":"POST","url":"https://example.test/","headers":{}},"client":{"path":"/","stream":false},"retry":{"attempt":2,"last_failure":{"code":"upstream_status"},"elapsed_ms":80}})
     );
     roundtrip::<Message>(wire);
 }
@@ -274,4 +274,80 @@ fn null_reply_fields_mean_absence() {
     )
     .unwrap();
     assert_eq!(r, Reply::new(3));
+}
+
+/// Full HTTP objects keep empty header tables; metadata views cannot expose those headers.
+#[test]
+fn full_and_metadata_http_views_have_distinct_fields() {
+    let input = json!({"method":"POST","url":"u"});
+    let req: Request = serde_json::from_value(input.clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(req).unwrap(),
+        json!({"method":"POST","url":"u","headers":{}})
+    );
+    let resp: Response = serde_json::from_value(json!({"status":200})).unwrap();
+    assert_eq!(
+        serde_json::to_value(resp).unwrap(),
+        json!({"status":200,"headers":{}})
+    );
+    let meta = RequestMeta::new("POST".into(), "u".into());
+    assert_eq!(serde_json::to_value(&meta).unwrap(), input);
+    assert_eq!(
+        serde_json::to_value(DecideRequest::new(meta.clone(), Body::Absent)).unwrap(),
+        input
+    );
+    assert_eq!(
+        serde_json::to_value(DecideRequest::new(meta, Body::Binary(vec![255]))).unwrap(),
+        json!({"method":"POST","url":"u","body_b64":"/w=="})
+    );
+}
+
+/// Only replies can omit a fragment. Worker-owned stream events do not repeat request context.
+#[test]
+fn stream_and_heartbeat_inputs_require_fragments() {
+    let stream = json!({"v":1,"seq":1,"stage":"stream","stream_id":"r/1","event":"data"});
+    let beat = json!({"v":1,"seq":1,"stage":"heartbeat","request_id":"r","client":{"path":"/","stream":true},"heartbeat":{"beat":1,"attempt":1,"elapsed_ms":4}});
+    for mut frame in [stream.clone(), beat] {
+        assert!(serde_json::from_value::<Message>(frame.clone()).is_err());
+        frame["data_b64"] = json!("AP8=");
+        let msg: Message = serde_json::from_value(frame.clone()).unwrap();
+        let fragment = match &msg.stage {
+            Stage::Stream(s) => match &s.event {
+                StreamEvent::Data(f) => f,
+                _ => unreachable!(),
+            },
+            Stage::Heartbeat(b) => &b.data,
+            _ => unreachable!(),
+        };
+        assert_eq!(fragment.as_bytes(), &[0, 255]);
+        assert_eq!(serde_json::to_value(msg).unwrap(), frame);
+    }
+    assert_eq!(
+        serde_json::to_value(Fragment::from_bytes(vec![])).unwrap(),
+        json!({"data":""})
+    );
+    for (event, name) in [
+        (StreamEvent::Data(Fragment::from_bytes(vec![])), "data"),
+        (StreamEvent::Close, "close"),
+        (
+            StreamEvent::Abort {
+                reason: Failure::new("e".into()),
+            },
+            "abort",
+        ),
+    ] {
+        let msg = Message::new(1, Stage::Stream(StreamMessage::new("r/1".into(), event)));
+        let mut expected = stream.clone();
+        expected["event"] = json!(name);
+        if name == "abort" {
+            expected["reason"] = json!({"code":"e"});
+        } else if name == "data" {
+            expected["data"] = json!("");
+        }
+        assert_eq!(serde_json::to_value(msg).unwrap(), expected);
+    }
+    let raw = json!({"v":1,"seq":1,"data_b64":"AP8=","state":"after"});
+    let reply: Reply = serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(reply.data.as_bytes(), Some(&[0, 255][..]));
+    assert_eq!(serde_json::to_value(reply).unwrap(), raw);
 }

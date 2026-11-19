@@ -93,6 +93,66 @@ bytes_field!(
     "One stream fragment or heartbeat; boundaries are not HTTP body boundaries."
 );
 
+/// A stream input always contains bytes, even when the fragment is empty. Replies use
+/// [`Data`] instead, since omission there means that the program supplied no output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(try_from = "Data")]
+pub struct Fragment(Data);
+impl Fragment {
+    /// Select a lossless representation for bytes received from the previous layer.
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(Data::from_bytes(bytes))
+    }
+    /// Borrow the bytes without exposing the optional representation used in replies.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes().expect("fragment contains bytes")
+    }
+}
+impl TryFrom<Data> for Fragment {
+    type Error = &'static str;
+    fn try_from(data: Data) -> Result<Self, Self::Error> {
+        match data {
+            Data::Absent => Err("expected data or data_b64"),
+            present => Ok(Self(present)),
+        }
+    }
+}
+
+/// Only the method and upstream URL accompany a response or stream open.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RequestMeta {
+    /// HTTP verb at the end of request processing.
+    pub method: String,
+    /// Final upstream URL, including its query.
+    pub url: String,
+}
+impl RequestMeta {
+    /// Construct a metadata view that cannot leak request headers or body bytes.
+    pub fn new(method: String, url: String) -> Self {
+        Self { method, url }
+    }
+}
+
+/// A deciding program can negotiate a request body but never receives the header table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DecideRequest {
+    /// Method and URL identify the request behind this attempt.
+    #[serde(flatten)]
+    pub metadata: RequestMeta,
+    /// Bytes only when this program negotiated a full request body at decide.
+    #[serde(flatten)]
+    pub body: Body,
+}
+impl DecideRequest {
+    /// Supply the negotiated body, or [`Body::Absent`] for a metadata-only input.
+    pub fn new(metadata: RequestMeta, body: Body) -> Self {
+        Self { metadata, body }
+    }
+}
+
 /// A request as observed at this position in the chain.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -101,20 +161,20 @@ pub struct Request {
     pub method: String,
     /// Absolute upstream URL.
     pub url: String,
-    /// Complete header table; omitted in metadata-only views.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub headers: Option<Headers>,
+    /// Complete header table, including an empty table when no headers remain.
+    #[serde(default)]
+    pub headers: Headers,
     /// Omitted when the program did not negotiate a body.
     #[serde(flatten)]
     pub body: Body,
 }
 impl Request {
-    /// Construct the metadata view; attach headers and body only when needed.
+    /// Construct a full HTTP object with an empty header table and no body.
     pub fn new(method: String, url: String) -> Self {
         Self {
             method,
             url,
-            headers: None,
+            headers: Headers::new(),
             body: Body::Absent,
         }
     }
@@ -126,8 +186,8 @@ impl Request {
         if let Some(v) = p.url {
             self.url = v;
         }
-        if p.headers.is_some() {
-            self.headers = p.headers;
+        if let Some(headers) = p.headers {
+            self.headers = headers;
         }
         if p.body != Body::Absent {
             self.body = p.body;
@@ -165,19 +225,19 @@ impl RequestPatch {
 pub struct Response {
     /// HTTP status code.
     pub status: u16,
-    /// Complete header table; omitted in metadata-only views.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub headers: Option<Headers>,
+    /// Complete header table, including an empty table when no headers remain.
+    #[serde(default)]
+    pub headers: Headers,
     /// Omitted when the program did not negotiate a body.
     #[serde(flatten)]
     pub body: Body,
 }
 impl Response {
-    /// Construct the metadata view; attach headers and body only when needed.
+    /// Construct a full HTTP object with an empty header table and no body.
     pub fn new(status: u16) -> Self {
         Self {
             status,
-            headers: None,
+            headers: Headers::new(),
             body: Body::Absent,
         }
     }
@@ -186,8 +246,8 @@ impl Response {
         if let Some(v) = p.status {
             self.status = v;
         }
-        if p.headers.is_some() {
-            self.headers = p.headers;
+        if let Some(headers) = p.headers {
+            self.headers = headers;
         }
         if p.body != Body::Absent {
             self.body = p.body;

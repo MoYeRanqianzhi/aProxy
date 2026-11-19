@@ -110,12 +110,12 @@ pub(super) fn spawn_dynamic_heartbeat(
             .rev()
             .filter(|p| p.entry.has_stage(crate::config::file::Stage::Heartbeat))
         {
-            let mut m = aproxy_envelope::HeartbeatMessage::new(
+            let m = aproxy_envelope::HeartbeatMessage::new(
                 d.ctx.context(&p.entry.name),
                 info.clone(),
                 d.ctx.client.clone(),
+                aproxy_envelope::Fragment::from_bytes(bytes.to_vec()),
             );
-            m.data = aproxy_envelope::Data::from_bytes(bytes.to_vec());
             match tokio::time::timeout_at(
                 deadline,
                 p.call(

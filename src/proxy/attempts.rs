@@ -483,9 +483,8 @@ pub(super) async fn run_attempts(
                     if let Some(response) = custom
                         && !r.is_committed()
                     {
-                        let mut headers = crate::transform::headers_from_btreemap(
-                            &response.headers.unwrap_or_default(),
-                        );
+                        let mut headers =
+                            crate::transform::headers_from_btreemap(&response.headers);
                         mark_given_up(&mut headers, t.code(), &trace);
                         trace
                             .rec

@@ -1,5 +1,8 @@
 //! Session negotiation, stage inputs and replies. Optional fields are never emitted merely to fill a slot.
-use crate::{Data, Report, Request, RequestPatch, Response, ResponsePatch};
+use crate::{
+    Data, DecideRequest, Fragment, Report, Request, RequestMeta, RequestPatch, Response,
+    ResponsePatch,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -420,7 +423,7 @@ pub struct DecideMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<Failure>,
     /// Metadata and any negotiated request body.
-    pub request: Request,
+    pub request: DecideRequest,
     /// Available only if the upstream sent a response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<ObservedResponse>,
@@ -435,7 +438,7 @@ impl DecideMessage {
         elapsed_ms: u64,
         delivery: Delivery,
         outcome: String,
-        request: Request,
+        request: DecideRequest,
         fallback: Fallback,
     ) -> Self {
         Self {
@@ -460,13 +463,13 @@ pub struct ResponseMessage {
     #[serde(flatten)]
     pub context: Context,
     /// Final upstream request metadata.
-    pub request: Request,
+    pub request: RequestMeta,
     /// Response to be delivered after patching.
     pub response: Response,
 }
 impl ResponseMessage {
     /// Construct the wire object from its required context.
-    pub fn new(context: Context, request: Request, response: Response) -> Self {
+    pub fn new(context: Context, request: RequestMeta, response: Response) -> Self {
         Self {
             context,
             request,
@@ -488,16 +491,16 @@ pub struct HeartbeatMessage {
     pub client: Client,
     /// Previous layer output or configured static bytes.
     #[serde(flatten)]
-    pub data: Data,
+    pub data: Fragment,
 }
 impl HeartbeatMessage {
     /// Construct the wire object from its required context.
-    pub fn new(context: Context, heartbeat: Heartbeat, client: Client) -> Self {
+    pub fn new(context: Context, heartbeat: Heartbeat, client: Client, data: Fragment) -> Self {
         Self {
             context,
             heartbeat,
             client,
-            data: Data::Absent,
+            data,
         }
     }
 }
@@ -510,13 +513,13 @@ pub struct StreamOpen {
     #[serde(flatten)]
     pub context: Context,
     /// Final upstream request metadata.
-    pub request: Request,
+    pub request: RequestMeta,
     /// Status and headers before stream conversion.
     pub response: Response,
 }
 impl StreamOpen {
     /// Construct the wire object from its required context.
-    pub fn new(context: Context, request: Request, response: Response) -> Self {
+    pub fn new(context: Context, request: RequestMeta, response: Response) -> Self {
         Self {
             context,
             request,
@@ -533,7 +536,7 @@ pub enum StreamEvent {
     /// Begin conversion with request and response headers.
     Open(StreamOpen),
     /// Convert one fragment of the decoded byte stream.
-    Data(Data),
+    Data(Fragment),
     /// Flush end-of-stream output.
     Close,
     /// Produce a protocol-correct error ending.
@@ -684,13 +687,13 @@ pub struct AdmitMessage {
     /// Upcoming attempt.
     pub attempt: u32,
     /// Upstream request metadata.
-    pub request: Request,
+    pub request: RequestMeta,
     /// Current queue observation.
     pub queue: Queue,
 }
 impl AdmitMessage {
     /// Construct the wire object from its required context.
-    pub fn new(context: Context, attempt: u32, request: Request, queue: Queue) -> Self {
+    pub fn new(context: Context, attempt: u32, request: RequestMeta, queue: Queue) -> Self {
         Self {
             context,
             attempt,

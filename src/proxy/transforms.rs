@@ -65,7 +65,7 @@ impl RequestChain {
             })?,
         };
         let mut input = wire::Request::new(req.method.to_string(), req.target_url.clone());
-        input.headers = Some(transform::headers_to_btreemap(&req.headers));
+        input.headers = transform::headers_to_btreemap(&req.headers);
         input.body = wire::Body::from_bytes(bytes);
         Ok(Self {
             input,
@@ -340,7 +340,7 @@ pub(super) async fn transform_response_if_configured(
     } else {
         raw
     };
-    input.headers = Some(heads);
+    input.headers = heads;
     input.body = wire::Body::from_bytes(decoded);
     let mut rewrite_body = false;
     let mut rewrite_headers = false;
@@ -353,7 +353,7 @@ pub(super) async fn transform_response_if_configured(
         let name = &p.entry.name;
         let m = wire::Stage::Response(wire::ResponseMessage::new(
             ctx.context(name),
-            wire::Request::new(req.method.to_string(), req.target_url.clone()),
+            wire::RequestMeta::new(req.method.to_string(), req.target_url.clone()),
             input.clone(),
         ));
         let result = match p.call(m.clone(), p.entry.timeout_secs, false).await {
@@ -387,7 +387,7 @@ pub(super) async fn transform_response_if_configured(
     }
     status = StatusCode::from_u16(input.status).expect("validated response status");
     if rewrite_headers {
-        headers = transform::headers_from_btreemap(&input.headers.unwrap_or_default());
+        headers = transform::headers_from_btreemap(&input.headers);
     }
     if rewrite_body || rewrite_headers && encoding.is_some() {
         body = transform::spool_response_body(

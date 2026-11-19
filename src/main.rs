@@ -212,7 +212,7 @@ async fn run(cli: Cli) {
             json,
         }) => commands::find::handle_find_cmd(aliased, unaliased, query, port, json),
         Some(Commands::Config(args)) => commands::config::handle_config_cmd(args).await,
-        Some(Commands::Settings { cmd }) => commands::settings::handle_settings_cmd(cmd),
+        Some(Commands::Settings { cmd }) => commands::settings::handle_settings_cmd(cmd).await,
         Some(Commands::Install(args)) => commands::install::handle_install_cmd(args).await,
         Some(Commands::Desktop) => unreachable!("desktop 在 main 里、建运行时之前已经分派"),
         Some(Commands::Serve { .. } | Commands::Watchdog { .. }) => {

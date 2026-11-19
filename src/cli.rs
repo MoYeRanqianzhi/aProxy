@@ -392,12 +392,19 @@ pub enum AliasCmd {
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 pub enum SettingsCmd {
     /// 打印生效的全部设置（文件里的键盖在内置默认上）。密钥显示成占位对象
-    Show,
+    Show {
+        /// 输出一个 JSON 文档：生效的设置与诊断
+        #[arg(long)]
+        json: bool,
+    },
     /// 打印一个键的生效值。键是点号路径，例如 watchdog.enabled、aliases.work、
     /// defaults.timeouts.connect_secs
     Get {
         #[arg(value_name = "KEY")]
         key: String,
+        /// 输出一个 JSON 文档：键与它的生效值
+        #[arg(long)]
+        json: bool,
     },
     /// 设置一个键。值写成 JSON（true、30、["a"]、{"k":1}）；字符串类型的键可以直接写
     /// 原文。值写 - 表示从 stdin 读一行（传密钥用）。只能设置认识的键
@@ -406,11 +413,17 @@ pub enum SettingsCmd {
         key: String,
         #[arg(value_name = "VALUE", allow_hyphen_values = true)]
         value: String,
+        /// 输出一个 JSON 文档，里面列出要重启才生效的实例
+        #[arg(long)]
+        json: bool,
     },
     /// 删除一个键（回到内置默认）。任何键都能删，包括不认识的键
     Unset {
         #[arg(value_name = "KEY")]
         key: String,
+        /// 输出一个 JSON 文档，里面列出要重启才生效的实例
+        #[arg(long)]
+        json: bool,
     },
 }
 

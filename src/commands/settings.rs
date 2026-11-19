@@ -4,42 +4,60 @@
 //! 密钥的明文：密钥显示成占位对象 `{"secret":true}`，URL 里的口令打码；把占位对象原样写回
 //! 等于不改。
 
+use std::path::Path;
+
 use aproxy::cli::SettingsCmd;
 use aproxy::config::edit::EditError;
 use aproxy::config::parse_key_path;
 use aproxy::settings::{self, edit};
-use aproxy_ipc::code::{EXIT_CONFIG, EXIT_USAGE};
-use serde_json::Value;
+use aproxy_ipc::code::EXIT_CONFIG;
+use aproxy_ipc::diag::Diagnostic;
+use serde_json::{Value, json};
 
-pub(crate) fn handle_settings_cmd(cmd: SettingsCmd) {
+use super::{Failure, print_doc, say};
+
+/// 查看或修改当前 home 的设置；只有写入全局默认值时才需要异步查询运行中的实例。
+pub(crate) async fn handle_settings_cmd(cmd: SettingsCmd) {
     let path = settings::settings_path();
     match cmd {
-        SettingsCmd::Show => {
-            let effective = effective_or_exit(&path);
-            println!("# {}", path.display());
-            print_json(&edit::redacted(effective));
-            exit_if_invalid(&path);
+        SettingsCmd::Show { json } => {
+            let values = edit::redacted(effective_or_exit(&path, json));
+            let loaded = settings::read(&path);
+            if json {
+                print_doc(json!({
+                    "file": path.display().to_string(),
+                    "values": values,
+                    "diagnostics": loaded.diagnostics,
+                }));
+            } else {
+                println!("# {}", path.display());
+                print_json(&values);
+            }
+            exit_if_invalid(&path, &loaded);
         }
-        SettingsCmd::Get { key } => {
-            let effective = edit::redacted(effective_or_exit(&path));
-            match edit::get(&effective, &key) {
-                Ok(Some(value)) => print_json(value),
-                // 没设置、也没有内置默认的键（例如 defaults.api_key）
-                Ok(None) => println!("null"),
-                Err(e) => fail(&e, &path),
+        SettingsCmd::Get { key, json } => {
+            let effective = edit::redacted(effective_or_exit(&path, json));
+            // 没设置、也没有内置默认的键（例如 defaults.api_key），两种输出都给 null。
+            let value = edit::get(&effective, &key)
+                .unwrap_or_else(|e| fail(&e, &path, json))
+                .unwrap_or(&Value::Null);
+            if json {
+                print_doc(json!({"key": key, "value": value}));
+            } else {
+                print_json(value);
             }
         }
-        SettingsCmd::Set { key, value } => {
-            let value = parse_value(&key, &value);
-            apply(&path, &[edit::Change::Set { key, value }]);
+        SettingsCmd::Set { key, value, json } => {
+            let value = parse_value(&key, &value, json);
+            apply(&path, edit::Change::Set { key, value }, json).await;
         }
-        SettingsCmd::Unset { key } => apply(&path, &[edit::Change::Unset { key }]),
+        SettingsCmd::Unset { key, json } => apply(&path, edit::Change::Unset { key }, json).await,
     }
 }
 
-/// 生效的设置（文件里的键盖在内置默认上）。文件读不出来、或不是 JSON 对象时，打印诊断并
-/// 以退出码 3 结束：这种文件只能手工修。
-fn effective_or_exit(path: &std::path::Path) -> Value {
+/// 生效的设置（文件里的键盖在内置默认上）。读文件失败以 1 退出；读出来不是合法的 JSON
+/// 对象时列出诊断并以 3 退出：这种文件只能手工修。
+fn effective_or_exit(path: &Path, json: bool) -> Value {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -51,33 +69,39 @@ fn effective_or_exit(path: &std::path::Path) -> Value {
     match edit::effective_value(text.as_deref()) {
         Some(value) => value,
         None => {
-            eprintln!(
-                "settings.json 不是合法的 JSON 对象，只能手工修复（或删除它，回到内置默认）:"
-            );
-            print_errors(path);
+            let message =
+                "settings.json 不是合法的 JSON 对象，只能手工修复（或删除它，回到内置默认）:";
+            let errors: Vec<_> = settings::read(path)
+                .diagnostics
+                .into_iter()
+                .filter(Diagnostic::is_error)
+                .collect();
+            if json {
+                print_errors(&errors);
+                Failure::new("config_invalid", message, json!({"diagnostics": errors})).exit(json);
+            }
+            eprintln!("{message}");
+            print_errors(&errors);
             crate::util::exit(EXIT_CONFIG as i32)
         }
     }
 }
 
 /// 文件有 error 级诊断时列出它们与修法，以退出码 3 结束。
-fn exit_if_invalid(path: &std::path::Path) {
-    if settings::read(path).is_valid() {
+fn exit_if_invalid(path: &Path, loaded: &settings::Loaded) {
+    if loaded.is_valid() {
         return;
     }
     eprintln!();
     eprintln!("settings.json 有错误:");
-    print_errors(path);
+    print_errors(&loaded.diagnostics);
     print_repair_hints(path);
     crate::util::exit(EXIT_CONFIG as i32)
 }
 
-fn print_errors(path: &std::path::Path) {
-    for d in settings::read(path)
-        .diagnostics
-        .iter()
-        .filter(|d| d.is_error())
-    {
+/// 只列出阻止使用这份设置的诊断，警告不当作错误报告。
+fn print_errors(diagnostics: &[Diagnostic]) {
+    for d in diagnostics.iter().filter(|d| d.is_error()) {
         eprintln!("  {}", aproxy::ops::start::render_diagnostic(d));
     }
 }
@@ -107,21 +131,80 @@ pub(crate) fn print_repair_hints(path: &std::path::Path) {
     );
 }
 
-fn apply(path: &std::path::Path, changes: &[edit::Change]) {
-    match edit::apply(path, &aproxy_ipc::home::home(), changes) {
-        Ok(applied) if applied.changed => println!("已保存到 {}", applied.file.display()),
-        Ok(applied) => println!("没有变化: {}", applied.file.display()),
-        Err(e) => fail(&e, path),
+/// 写回一个键。回执取落盘后的生效值：删去覆盖项，露出来的可能是内置默认而不是 null。
+async fn apply(path: &Path, change: edit::Change, json: bool) {
+    let key = match &change {
+        edit::Change::Set { key, .. } | edit::Change::Unset { key } => key,
+    };
+    let applied = edit::apply(
+        path,
+        &aproxy_ipc::home::home(),
+        std::slice::from_ref(&change),
+    )
+    .unwrap_or_else(|e| fail(&e, path, json));
+    let ports = if applied.changed && (key == "defaults" || key.starts_with("defaults.")) {
+        running_ports().await
+    } else {
+        Vec::new()
+    };
+    if json {
+        let effective = edit::redacted(effective_or_exit(&applied.file, json));
+        let value = edit::get(&effective, key).unwrap_or_else(|e| fail(&e, path, json));
+        print_doc(json!({
+            "file": applied.file.display().to_string(),
+            "key": key,
+            "value": value,
+            "changed": applied.changed,
+            "instances_to_restart": ports,
+        }));
+        return;
+    }
+    if applied.changed {
+        say(json, format_args!("已保存到 {}", applied.file.display()));
+    } else {
+        say(json, format_args!("没有变化: {}", applied.file.display()));
+    }
+    if !ports.is_empty() {
+        eprintln!("运行中的实例要重启才用上这次改动:");
+        for port in ports {
+            eprintln!("  aproxy restart {port}");
+        }
     }
 }
 
-fn fail(error: &EditError, path: &std::path::Path) -> ! {
-    eprintln!("{}", settings::describe_edit_error(error, path));
-    crate::util::exit(match error {
-        EditError::BadKey(_) => EXIT_USAGE as i32,
-        EditError::Syntax(_) | EditError::Invalid(_) => EXIT_CONFIG as i32,
-        EditError::Conflict | EditError::LockBusy | EditError::Io(_) => 1,
-    })
+/// 全局默认在启动时读取，与实例使用哪份配置文件无关；未响应的实例也不能漏掉。
+async fn running_ports() -> Vec<u16> {
+    let survey = aproxy::daemon::survey_instances().await;
+    let mut ports: Vec<u16> = survey
+        .responsive
+        .iter()
+        .map(|status| &status.instance)
+        .chain(survey.unresponsive.iter())
+        .filter_map(|instance| aproxy::daemon::port_of(&instance.listen_addr).parse().ok())
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+/// 编辑失败的两种输出共用错误码与说明；I/O 错误没有文档，只报告原因并以 1 退出。
+fn fail(error: &EditError, path: &Path, json: bool) -> ! {
+    let message = settings::describe_edit_error(error, path);
+    let (code, details) = match error {
+        EditError::BadKey(_) => ("usage", json!({"reason": "bad_key_path"})),
+        EditError::Syntax(d) | EditError::Invalid(d) => {
+            ("config_invalid", json!({"diagnostics": d}))
+        }
+        EditError::Conflict | EditError::LockBusy => (
+            "write_conflict",
+            json!({"file": path.display().to_string()}),
+        ),
+        EditError::Io(_) => {
+            eprintln!("{message}");
+            crate::util::exit(1)
+        }
+    };
+    Failure::new(code, message, details).exit(json)
 }
 
 fn print_json(value: &Value) {
@@ -136,7 +219,7 @@ fn print_json(value: &Value) {
 /// - 字符串类型的键可以直接写原文；以 `"` 开头时按 JSON 字符串字面量解析（用来写换行等）。
 ///   写回一个占位对象表示保持原值。
 /// - 其余的键只收 JSON 值。
-fn parse_value(key: &str, raw: &str) -> Value {
+fn parse_value(key: &str, raw: &str, json: bool) -> Value {
     let raw = if raw == "-" {
         crate::util::read_secret_line().unwrap_or_else(|e| {
             eprintln!("{e}");
@@ -159,10 +242,10 @@ fn parse_value(key: &str, raw: &str) -> Value {
         };
     }
     parsed.unwrap_or_else(|e| {
-        eprintln!(
+        let message = format!(
             "{key} 的值要写成 JSON（例如 true、30、\"text\"、[\"a\"]、{{\"k\":1}}），解析失败: {e}"
         );
-        crate::util::exit(EXIT_USAGE as i32)
+        Failure::new("usage", message, json!({"reason": "bad_value"})).exit(json)
     })
 }
 
@@ -195,29 +278,45 @@ mod tests {
     #[test]
     fn string_keys_take_raw_text_and_others_take_json() {
         // 字符串类型的键：原文
-        assert_eq!(parse_value("language", "en"), json!("en"));
-        assert_eq!(parse_value("defaults.api_key", "12345"), json!("12345"));
-        assert_eq!(parse_value("defaults.api_key", "true"), json!("true"));
+        assert_eq!(parse_value("language", "en", false), json!("en"));
         assert_eq!(
-            parse_value("defaults.extra_headers.\"x.y\"", "a b"),
+            parse_value("defaults.api_key", "12345", false),
+            json!("12345")
+        );
+        assert_eq!(
+            parse_value("defaults.api_key", "true", false),
+            json!("true")
+        );
+        assert_eq!(
+            parse_value("defaults.extra_headers.\"x.y\"", "a b", false),
             json!("a b")
         );
         // 以引号开头：按字符串字面量解析
         assert_eq!(
-            parse_value("defaults.keepalive.heartbeat", r#"": ping\n\n""#),
+            parse_value("defaults.keepalive.heartbeat", r#"": ping\n\n""#, false),
             json!(": ping\n\n")
         );
         // 占位对象原样保留，表示保持原值
         assert_eq!(
-            parse_value("defaults.api_key", r#"{"secret":true,"hint":"sk-a…f3a9"}"#),
+            parse_value(
+                "defaults.api_key",
+                r#"{"secret":true,"hint":"sk-a…f3a9"}"#,
+                false
+            ),
             json!({"secret": true, "hint": "sk-a…f3a9"})
         );
         // 其余的键：JSON
-        assert_eq!(parse_value("watchdog.enabled", "false"), json!(false));
-        assert_eq!(parse_value("logs.rotate_mb", "16"), json!(16));
-        assert_eq!(parse_value("config_dirs", r#"["~/a"]"#), json!(["~/a"]));
         assert_eq!(
-            parse_value("defaults", r#"{"disk_cache":false}"#),
+            parse_value("watchdog.enabled", "false", false),
+            json!(false)
+        );
+        assert_eq!(parse_value("logs.rotate_mb", "16", false), json!(16));
+        assert_eq!(
+            parse_value("config_dirs", r#"["~/a"]"#, false),
+            json!(["~/a"])
+        );
+        assert_eq!(
+            parse_value("defaults", r#"{"disk_cache":false}"#, false),
             json!({"disk_cache": false})
         );
         assert!(!is_string_key("aliases"));

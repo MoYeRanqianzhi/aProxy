@@ -30,6 +30,18 @@ fn document(out: &Output) -> Value {
     serde_json::from_str(stdout).unwrap()
 }
 
+/// 失败也只能给一份文档；分别保留解析结果和 stderr，便于核对退出码对应的诊断与修法。
+fn failed_document(home: &TestHome, args: &[&str], code: i32) -> (Value, String) {
+    let out = home.cmd().args(args).stdin(Stdio::null()).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(code),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (document(&out), String::from_utf8(out.stderr).unwrap())
+}
+
 /// 按集合核对字段：多一个或少一个都不行，但不约束对象内部的排列顺序。
 fn assert_keys(value: &Value, keys: &[&str]) {
     let obj = value.as_object().unwrap();
@@ -145,4 +157,139 @@ fn find_json_document() {
         stdout.contains("good.toml") && !stdout.starts_with('{'),
         "{stdout}"
     );
+}
+
+/// 生效设置的文档不泄露密钥；能读但无效的对象仍列出诊断，让人可以按 stderr 的提示修复。
+#[test]
+fn settings_show_json_document() {
+    let home = TestHome::new();
+    let args = ["settings", "show", "--json"];
+    let doc = document(&run(&home, &args));
+    assert_keys(&doc, &["schema", "file", "values", "diagnostics"]);
+    assert_eq!(
+        path_match_key(doc["file"].as_str().unwrap()),
+        path_match_key(home.path().join("settings.json").to_str().unwrap())
+    );
+    assert_eq!(doc["values"]["watchdog"]["enabled"], false);
+    assert_eq!(doc["diagnostics"], json!([]));
+
+    run(
+        &home,
+        &[
+            "settings",
+            "set",
+            "defaults.base_url",
+            "https://api.example.com",
+        ],
+    );
+    run(
+        &home,
+        &[
+            "settings",
+            "set",
+            "defaults.api_key",
+            "sk-abcdefghijklmnopqrstuvwxyz0123",
+        ],
+    );
+    let out = run(&home, &args);
+    assert_eq!(
+        document(&out)["values"]["defaults"]["api_key"],
+        json!({"secret": true, "hint": "sk-a…0123"})
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("abcdefghijklmnopqrstuvwxyz"));
+
+    home.settings(r#"{"schema":1,"nope":1}"#);
+    let (doc, stderr) = failed_document(&home, &args, 3);
+    assert!(
+        doc["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| { d["code"] == "config_unknown_key" && d["key"] == "nope" })
+    );
+    assert!(stderr.contains("aproxy settings unset 'nope'"), "{stderr}");
+}
+
+/// 未设置的值是 null，不等于路径写错；只有后者是带原因的用法错误。
+#[test]
+fn settings_get_json_document() {
+    let home = TestHome::new();
+    for (key, value) in [
+        ("watchdog.enabled", json!(false)),
+        ("defaults.api_key", Value::Null),
+    ] {
+        let doc = document(&run(&home, &["settings", "get", key, "--json"]));
+        assert_eq!(doc, json!({"schema": 1, "key": key, "value": value}));
+    }
+    let (doc, _) = failed_document(&home, &["settings", "get", "a..b", "--json"], 2);
+    assert_eq!(doc["error"]["code"], "usage");
+    assert_eq!(doc["error"]["details"]["reason"], "bad_key_path");
+}
+
+/// 写回后报告生效的值；只有改动全局默认才列出实例，文本模式把重启命令留在 stderr。
+#[test]
+fn settings_set_and_unset_json_documents() {
+    let home = TestHome::new();
+    let builtin = document(&run(
+        &home,
+        &["settings", "get", "logs.rotate_mb", "--json"],
+    ));
+    let args = ["settings", "set", "logs.rotate_mb", "16", "--json"];
+    let doc = document(&run(&home, &args));
+    assert_keys(
+        &doc,
+        &[
+            "schema",
+            "file",
+            "key",
+            "value",
+            "changed",
+            "instances_to_restart",
+        ],
+    );
+    assert_eq!(doc["key"], "logs.rotate_mb");
+    assert_eq!(doc["value"], 16);
+    assert_eq!(doc["changed"], true);
+    assert_eq!(doc["instances_to_restart"], json!([]));
+    assert_eq!(document(&run(&home, &args))["changed"], false);
+    let doc = document(&run(
+        &home,
+        &["settings", "unset", "logs.rotate_mb", "--json"],
+    ));
+    assert_eq!(doc["changed"], true);
+    assert_eq!(doc["value"], builtin["value"]);
+
+    let port = free_port();
+    let path = home.path().join("a.toml");
+    fs::write(
+        &path,
+        format!("base_url = \"https://a.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
+    )
+    .unwrap();
+    home.stop_on_drop(port);
+    run(&home, &["start", path.to_str().unwrap(), "--json"]);
+    for (key, value, ports) in [
+        ("defaults.max_request_mb", "64", json!([port])),
+        ("watchdog.heartbeat_secs", "60", json!([])),
+    ] {
+        let doc = document(&run(&home, &["settings", "set", key, value, "--json"]));
+        assert_eq!(doc["instances_to_restart"], ports);
+    }
+    let out = run(&home, &["settings", "set", "defaults.max_request_mb", "32"]);
+    assert!(!out.stdout.starts_with(b"{"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(&format!("aproxy restart {port}")));
+
+    let (doc, _) = failed_document(&home, &["settings", "set", "nope", "1", "--json"], 3);
+    assert_eq!(doc["error"]["code"], "config_invalid");
+    assert_eq!(
+        doc["error"]["details"]["diagnostics"][0]["code"],
+        "config_unknown_key"
+    );
+    let (doc, _) = failed_document(
+        &home,
+        &["settings", "set", "watchdog.enabled", "notjson", "--json"],
+        2,
+    );
+    assert_eq!(doc["error"]["code"], "usage");
+    assert_eq!(doc["error"]["details"]["reason"], "bad_value");
 }

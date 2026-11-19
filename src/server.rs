@@ -209,6 +209,12 @@ pub(crate) async fn serve_forever(
             _=stopping.clone()=>None,
         };
         if !matches!(outcome, Some(Ok(()))) {
+            if let Some(Err(error)) = &outcome
+                && let Err(e) =
+                    aproxy::spawn::publish_startup_failure(&daemon::run_dir(), &info, error)
+            {
+                tracing::warn!(error=%e,"could not save format startup diagnosis for observers");
+            }
             state.retire_formats().await;
             ipc_task.abort();
             let _ = ipc_task.await;

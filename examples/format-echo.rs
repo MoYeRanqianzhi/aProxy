@@ -172,7 +172,7 @@ fn main() {
             if mode == "bad-protocol" {
                 r["protocol"] = json!(2);
             }
-            if mode == "missing-stage" {
+            if mode == "missing-stage" || std::env::var_os("ECHO_REFUSE_STAGE").is_some() {
                 r["stages"] = json!([]);
             }
             if mode == "bad-body-need" {

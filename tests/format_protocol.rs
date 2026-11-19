@@ -1095,7 +1095,9 @@ async fn second_start_waits_for_failed_hello_and_prepare_swap_changes_nothing() 
     assert_eq!(original.status.code(), Some(1));
     assert_eq!(observer.status.code(), Some(1));
     let result: Value = serde_json::from_slice(&observer.stdout).unwrap();
-    assert!(result["error"].is_object());
+    let first: Value = serde_json::from_slice(&original.stdout).unwrap();
+    assert_eq!(result["error"], first["error"]);
+    assert_eq!(result["error"]["code"], "format_handshake_failed");
     assert!(result.get("outcome").is_none());
     assert_eq!(frames(&home, "stuck").len(), 1);
 }
@@ -2460,6 +2462,17 @@ async fn bodyless_format_terminals_record_zero_delivered_bytes() {
 /// 禁用熔断的可选程序暂缺时，每条请求仍尝试启动；恢复可执行文件后立即工作。
 #[tokio::test]
 async fn disabled_breaker_optional_startup_recovers_on_the_next_request() {
+    exercise_optional_startup_recovery(false).await;
+}
+
+/// 启动时打开的可选层能在首次冷却后通过真正的数据帧恢复。
+#[tokio::test]
+async fn optional_startup_recovers_after_its_initial_cooldown() {
+    exercise_optional_startup_recovery(true).await;
+}
+
+/// 启动时程序文件不存在；安装同一条目指向的程序后，只有合法的阶段应答才能恢复。
+async fn exercise_optional_startup_recovery(enabled: bool) {
     let home = TestHome::new();
     let (up, _) = upstream(&[200]).await;
     let exe = home
@@ -2468,14 +2481,24 @@ async fn disabled_breaker_optional_startup_recovers_on_the_next_request() {
     let cfg = layer(&home, "optional", "'request'", &["echo"]).replace(
         &serde_json::to_string(&format_echo_path()).unwrap(),
         &serde_json::to_string(&exe).unwrap(),
-    ) + "required=false\nbreaker_failures=0\n";
+    ) + if enabled {
+        "required=false\nbreaker_failures=1\nbreaker_cooldown_secs=1\n"
+    } else {
+        "required=false\nbreaker_failures=0\n"
+    };
     let (c, url) = running(&home, up, &cfg);
-    assert_eq!(breaker(&home, &url).await["state"], "closed");
-    assert_eq!(c.get(&url).send().await.unwrap().status(), 200);
-    assert_eq!(breaker(&home, &url).await["failures"], 2);
+    if enabled {
+        assert_eq!(breaker(&home, &url).await["state"], "open");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    } else {
+        assert_eq!(breaker(&home, &url).await["state"], "closed");
+        assert_eq!(c.get(&url).send().await.unwrap().status(), 200);
+        assert_eq!(breaker(&home, &url).await["failures"], 2);
+    }
     std::fs::copy(format_echo_path(), exe).unwrap();
     assert_eq!(c.get(&url).send().await.unwrap().status(), 200);
     assert_eq!(breaker(&home, &url).await["failures"], 0);
+    assert_eq!(breaker(&home, &url).await["state"], "closed");
     assert_eq!(frames(&home, "optional").len(), 2);
 }
 
@@ -2674,4 +2697,42 @@ async fn open_optional_full_layer_preserves_the_compressed_request() {
             .unwrap(),
         expected
     );
+}
+
+/// 两个启动者拿到同一份静态契约错误和退出码；非公开的启动规格不必交给第二个进程。
+#[tokio::test]
+async fn observing_start_preserves_a_static_handshake_failure() {
+    let home = TestHome::new();
+    let port = free_port();
+    let gate = home.path().join("release");
+    let cfg = layer(
+        &home,
+        "gate",
+        "'request'",
+        &["gate-hello", gate.to_str().unwrap()],
+    )
+    .replace("env={", "env={ ECHO_REFUSE_STAGE='1',");
+    let (first, path) = background_start(&home, port, free_port(), &cfg);
+    observed_hello(&home, "gate").await;
+    let mut second = home
+        .cmd()
+        .args(["start", "--json", "--config"])
+        .arg(path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert!(second.try_wait().unwrap().is_none());
+    std::fs::write(gate, b"").unwrap();
+    let mut errors = Vec::new();
+    for child in [first, second] {
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(3), "{out:?}");
+        let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["error"]["code"], "format_stage_unsupported");
+        errors.push(doc["error"].clone());
+    }
+    assert_eq!(errors[0], errors[1]);
+    assert_eq!(frames(&home, "gate").len(), 1);
 }

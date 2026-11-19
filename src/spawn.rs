@@ -190,18 +190,51 @@ async fn launch_and_wait(
         cwd: Some(home),
     };
     let pid = daemon::spawn_detached_with(exe, &args, &launch).map_err(SpawnError::Spawn)?;
-    wait_ready(home, pid, Some(spec_path), mark, timeout).await
+    wait_ready(home, pid, spec_path, None, mark, timeout).await
 }
 
-/// 另一个启动者已占用端口，只观察这个 pid 的就绪或退出，不读取它的私有规格、不回收其进程。
-pub(crate) async fn wait_existing(home: &Path, pid: u32) -> Result<InstanceStatus, SpawnError> {
-    wait_ready(home, pid, None, startup_log_len(home), READY_TIMEOUT).await
+/// 旁观者只能看到本次运行的已脱敏错误，不能接触原始启动规格。文件名只含两个数字；
+/// 即使端口被另一进程重新绑定，仍能分清两次握手。多个旁观者可独立读取，过期待 GC。
+fn observed_result(run_dir: &Path, instance: &daemon::InstanceRecord) -> PathBuf {
+    run_dir.join(format!(
+        "startup-{}-{}.result",
+        instance.started_at, instance.pid
+    ))
 }
-/// 同一个就绪循环供拉起者与旁观者共用；只有前者有权读取子进程写回的握手诊断。
+
+/// 启动探测失败才落这份小结果；成功启动和无格式程序的实例不写任何额外文件。
+pub fn publish_startup_failure(
+    run_dir: &Path,
+    instance: &daemon::InstanceRecord,
+    error: &crate::transform::StartupError,
+) -> std::io::Result<()> {
+    crate::fsx::write_atomic_private(
+        &observed_result(run_dir, instance),
+        &serde_json::to_vec(error)?,
+    )
+}
+
+/// 另一个启动者已占用端口，只观察这个实例的就绪或退出，不读取它的私有规格、不回收其进程。
+pub(crate) async fn wait_existing(
+    home: &Path,
+    instance: &daemon::InstanceRecord,
+) -> Result<InstanceStatus, SpawnError> {
+    wait_ready(
+        home,
+        instance.pid,
+        &observed_result(&home.join("run"), instance),
+        Some(&instance.instance_id),
+        startup_log_len(home),
+        READY_TIMEOUT,
+    )
+    .await
+}
+/// 同一个就绪循环供拉起者与旁观者共用；各自只读取自己的诊断来源。
 async fn wait_ready(
     home: &Path,
     pid: u32,
-    spec_path: Option<&Path>,
+    result_path: &Path,
+    expected_id: Option<&str>,
     mark: u64,
     timeout: Duration,
 ) -> Result<InstanceStatus, SpawnError> {
@@ -212,14 +245,15 @@ async fn wait_ready(
         if let Some(rec) = daemon::registry_find_pid_in(&run_dir, pid)
             && let Ok(live) = daemon::ipc_ping_in(&run_dir, daemon::port_of(&rec.listen_addr)).await
             && live.instance.pid == pid
+            && expected_id.is_none_or(|id| live.instance.instance_id == id)
             && live.state == daemon::InstanceState::Serving
         {
             return Ok(live);
         }
         if crate::process::process_exited(pid) == Some(true) {
-            // 子进程退出后文件不会再变化。不是格式错误时它仍是原始规格，按普通启动失败处理。
-            let format = spec_path
-                .and_then(|p| std::fs::File::open(p).ok())
+            // 子进程退出后文件不会再变化；无握手诊断时仍报告普通启动失败。
+            let format = std::fs::File::open(result_path)
+                .ok()
                 .and_then(|f| serde_json::from_reader(f).ok());
             return Err(SpawnError::Exited {
                 pid,

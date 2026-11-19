@@ -1912,7 +1912,8 @@ pub struct GcReport {
 ///   [`GC_MIN_AGE_SECS`] 时删（活实例每 10 秒写它一次，旧成这样的只能是崩溃留下的）。
 /// - **交接文件与原子写的临时文件**（`*.spec.json`、`*.tmp-<pid>-<纳秒>`）：正常情况下
 ///   写者自己立即删掉或改名；写者崩溃留下的，在它的 pid 已不在、且文件早于
-///   [`GC_MIN_AGE_SECS`] 时删。交接文件里有明文密钥，不能一直留在盘上。
+///   [`GC_MIN_AGE_SECS`] 时删。交接文件里有明文密钥，不能一直留在盘上。只有失败时写的
+///   `startup-<毫秒>-<pid>.result` 只含握手诊断，用同一保护期让各个旁观者都能读到。
 /// - **实例日志**：只删同时满足三条的——名字是内置的随机名形状
 ///   （`<十六进制>-<四位十六进制>.log`）、早于 [`GC_MIN_AGE_SECS`]、不被任何实例记录或
 ///   期望状态记录引用。run 目录里有读不懂的记录时，引用集不完整，这一轮不删任何日志。
@@ -2006,6 +2007,18 @@ pub fn collect_garbage_in(run_dir: &std::path::Path, logs_dir: &std::path::Path)
 fn leftover_writer_pid(name: &str) -> Option<u32> {
     if let Some(stem) = name.strip_suffix(".spec.json") {
         return stem.rsplit_once('-')?.1.parse().ok();
+    }
+    // 旁观启动者可能还没来得及读错误；同其他交接文件一样，只有超过保护期且写者已退出才删。
+    if let Some(stem) = name
+        .strip_prefix("startup-")
+        .and_then(|s| s.strip_suffix(".result"))
+    {
+        let (stamp, pid) = stem.split_once('-')?;
+        if !stamp.bytes().chain(pid.bytes()).all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        stamp.parse::<u64>().ok()?;
+        return pid.parse().ok();
     }
     let (_, tail) = name.rsplit_once(".tmp-")?;
     let (pid, nanos) = tail.split_once('-')?;
@@ -4983,6 +4996,8 @@ mod tests {
     #[test]
     fn leftover_and_log_names_are_recognized_strictly() {
         assert_eq!(leftover_writer_pid("1700-4242.spec.json"), Some(4242));
+        assert_eq!(leftover_writer_pid("startup-82000-42.result"), Some(42));
+        assert_eq!(leftover_writer_pid("startup-not-a-time-42.result"), None);
         assert_eq!(
             leftover_writer_pid("12345.instance.json.tmp-4242-1700"),
             Some(4242)

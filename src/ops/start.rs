@@ -252,7 +252,7 @@ async fn existing_instance(
         });
     }
     if info.state == daemon::InstanceState::Starting {
-        return spawn::wait_existing(&aproxy_ipc::home::home(), info.instance.pid)
+        return spawn::wait_existing(&aproxy_ipc::home::home(), &info.instance)
             .await
             .map(|i| Preflight::BecameReady(Box::new(i)))
             .map_err(PreflightError::Startup);

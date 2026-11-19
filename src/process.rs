@@ -432,6 +432,7 @@ mod imp_process {
     /// 进程是否已退出：/proc/<pid>/stat 的进程态——'Z'（zombie，已退出未
     /// 收割）与文件不存在（已收割）都算已退出。macOS 无 /proc 回退
     /// kill(pid,0)：ESRCH = 已退出；EPERM = 活着（权限拒绝但存在）。
+    #[cfg(not(target_os = "macos"))]
     pub fn process_exited(pid: u32) -> Option<bool> {
         match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => {
@@ -442,6 +443,21 @@ mod imp_process {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(true),
             Err(_) => None,
+        }
+    }
+
+    /// macOS 没有 procfs；信号 0 只查询正 pid 的存在性。这里只认 ESRCH 为已退出，
+    /// EPERM 说明进程仍在；未收割的僵尸要等父进程收割之后才能观察到退出。
+    #[cfg(target_os = "macos")]
+    pub fn process_exited(pid: u32) -> Option<bool> {
+        let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return Some(false);
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Some(true),
+            Some(libc::EPERM) => Some(false),
+            _ => None,
         }
     }
 

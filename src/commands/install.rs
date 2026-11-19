@@ -830,7 +830,7 @@ async fn await_handover(home: &std::path::Path) -> Result<(), InstallFailure> {
                     && is_stale(&s, aproxy::watchdog::now_secs()) =>
                 {
                     return Err(format!(
-                        "接手进程（pid {}）已退出但安装停在 {:?}；现场已保留，任何 aproxy 命令会自动续作",
+                        "接手进程（pid {}）已退出但安装停在 {:?}；现场已保留，重新执行 aproxy install 即可接着装完",
                         s.installer_pid, s.phase
                     ).into());
                 }
@@ -857,7 +857,9 @@ fn print_failure_guidance(home: &std::path::Path) {
         );
     } else {
         eprintln!(
-            "现场已保留，中断后重试同一命令或任何 aproxy 命令可自动续作；`aproxy install --abort` 可显式回滚（仅交换前）。"
+            "现场已保留：重新执行同一条命令即可接着装完；看护者，以及会改动实例或设置的 aproxy 命令\
+             （start、stop、restart、restore 等），也会在后台接着装。交换二进制之前可以用 \
+             `aproxy install --abort` 回滚。"
         );
     }
 }

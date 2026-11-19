@@ -264,14 +264,6 @@ pub enum Commands {
 /// `aproxy install` 的参数集。
 #[derive(clap::Args, Debug, Clone, PartialEq)]
 pub struct InstallArgs {
-    /// 只查通道中的目标版本，不登记安装者也不准备安装现场。
-    #[arg(long, help="Check the latest installable version without installing", conflicts_with_all=["version","from","adopt","abort","continue_","handover_from","no_skills","allow_downgrade","skills_only","yes","force"])]
-    pub check: bool,
-
-    /// 机器输出只占用 stdout，人读的说明另写 stderr。
-    #[arg(long, help="Write machine-readable output", conflicts_with_all=["force","abort","continue_","skills_only"])]
-    pub json: bool,
-
     /// 安装目标版本：`latest`（默认，按更新通道取最大版本——stable 通道只取
     /// 正式版，pre 通道含预发布；通道见 --pre）或具体版本号（如
     /// 0.2.0-alpha.1）。latest 不高于当前版本时提示「已是最新」不重装。
@@ -366,6 +358,25 @@ pub struct InstallArgs {
     /// （默认 latest，查询失败时报错提示改用具体版本号）
     #[arg(long, conflicts_with_all = ["from", "adopt", "abort"])]
     pub skills_only: bool,
+
+    /// 只查询 install 会装哪个版本：打印当前版本、通道里的最新版本与有没有更新，
+    /// 不下载、不改动任何东西。可与 --pre、--variant、--download-proxy、--json 同用
+    // 不登记台账、不建安装状态，所以随时可以执行；能与之同用的只有影响「会装哪个版本」
+    // 与怎样查询的那几个参数，其余一律按用法错误拒绝
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "version", "from", "adopt", "abort", "continue_", "handover_from", "no_skills",
+            "allow_downgrade", "skills_only", "yes", "force"
+        ]
+    )]
+    pub check: bool,
+
+    /// 机器可读的输出：标准输出上只有 JSON（安装时每行一个事件，--check 时一个文档），
+    /// 给人看的文字改写到标准错误
+    // 续作与交棒的进程没有读它输出的人；--force 是冻结的另一条路径（C7），不带这个参数
+    #[arg(long, conflicts_with_all = ["force", "abort", "continue_", "skills_only"])]
+    pub json: bool,
 
     /// [内部] 续作模式：从 install.state 残留的 phase 幂等推进（看门狗/
     /// CLI 入口/交棒自动拉起，全自动无人工询问）。勿手动使用。

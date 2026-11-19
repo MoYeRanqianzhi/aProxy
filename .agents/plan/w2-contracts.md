@@ -1557,8 +1557,10 @@ aproxy desktop                  W5
   - `code` 是 format 自定的机读串，可以省略，进入 `details.fail_code`；`reason` 用英文，不超过 512 个字符。
   - `fail` 是程序的决定，不是错误：可选程序回的 `fail` 同样执行。`required` 只管程序出错与熔断（S3-6）。
   - 带 `fail` 的回信里，`state`、`overrides`、`report` 照常生效，例如同时给 `retry.max_attempts`（2026-11-20 补）。
-  - `fail.response` 与 decide 叫停时附带的 `response` 是数据面的字节，同上游的响应一样原样交给客户端，不做密钥替换；
-    存进请求历史、写进日志时照常替换。它的 `status` 不是合法的状态码时，按输出不合法处理（2026-11-20 补）。
+  - `fail.response` 与 decide 叫停时附带的 `response` 是数据面的字节，同上游的响应一样原样交给客户端，不做密钥替换。
+    请求历史不留它的体：§6.5 的体只有客户端的请求、发出的请求、上游的响应三种，程序自己给的响应不是其中任何一种，
+    0.2.0 不为它加新的体；记录里看得到的是终态码、`client_status` 与 `response_bytes`。日志与诊断里出现的部分（`fail.reason` 等）照常替换。
+    它的 `status` 不是合法的状态码时，按输出不合法处理（2026-11-20 补）。
   - 在链里结束的尝试也是一次尝试：请求记录里这一次的 `code` 是它的原因（`format_fail`、`format_error`、`format_rejected`、
     `format_unavailable`），没有 `upstream_status`（2026-11-20 补）。
 - **进程崩溃、超时、回信不合法**：

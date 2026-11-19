@@ -951,8 +951,26 @@
     3. `config` 这一步只把 `--config` 改成了自己的参数（可以写别名），15 个专用旗标留给 B9-2。
     4. 文档、技能、安装脚本与提示文字里的旧写法（`aproxy config --baseurl …` 等，约 75 处）还没改：等 B9-2 把 config
        的写法定下来一起扫，免得同一处改两遍。**在那之前 README 与技能里的命令行与实际不符**，B9-2 之后必须接着做。
-  - [ ] B9-2 `config show|get|set|unset`（§9.3）：专用旗标一个不留；`--config <ALIAS|PATH>` 是 config 自己的参数；
-    `set`/`unset` 的 `--json` 带 `instances_to_restart`。
+  - [x] B9-2 `config show|get|set|unset`（§9.3）：专用旗标一个不留；`--config <ALIAS|PATH>` 是 config 自己的参数
+    （clap 的 global，写在子命令前后都行）；四个子命令都有 `--json`。读出口在新模块 `src/config/view.rs`：文件值与
+    生效值的 JSON、打码（settings 的 `defaults` 共用同一份 `redact_table`）、占位写回（`restore_placeholders`，
+    `config::edit` 在 `set` 时调用）、键表 `key_kind`、JSON 转 TOML 文本。测试 `tests/config_cli.rs` 与 view 的单测。
+    文档、技能、安装脚本、CHANGELOG 里 B9-1 与 B9-2 的旧写法一并扫过。**与设计稿的出入、留给后面的**：
+    1. `get` 给的是**生效值**与来源（`source`），文件不存在时退出 4；文件只有别处的错误时照样给值、退出 0，只有语法
+       错误（一个值都读不出）才退出 3。设计稿 §9.5 的「文件无效 → 3」按这个口径实现。
+    2. `show` 不带 `--effective` 时只列文件里写了的键，但 `diagnostics` 两种显示都是整份解析的诊断（这份配置能不能
+       启动），所以「全局默认的 key 没继承」的告警在不带 `--effective` 时也在。
+    3. `set`/`unset` 的 `--json` 比设计稿多一个 `changed`（加性）；没变化时 `instances_to_restart` 为空。
+    4. 文本输出里的密钥统一成 `<secret …>`（§1.5），`show --effective` 原来的「前 6 个字符加 ***」没有了，
+       `util::mask_secret` 删了。format 的 `args` 里写成 `--flag=值` 的密钥，JSON 里是字符串 `--flag=<secret>`，
+       写回时按「同一旗标第几次出现」对回原值。`args` 里别的参数 JSON 里原样（设计稿只点了密钥旗标之后的值），
+       给人看的文本另过一遍 URL 打码。
+    5. `settings set default_config <路径>` 把原文按当前目录绝对化（原来 `config --set-default` 做的事）。
+    6. **留给 B9-3**：写配置时的 I/O 失败（`EditError::Io`）码表里没有对应的操作码，现在只有 stderr 与退出码 1，
+       `--json` 时 stdout 上没有错误文档；写锁等不到（`LockBusy`）暂用 `write_conflict`。
+    7. **留给 B9-4**：`settings show|get|set|unset` 的 `--json`（设计稿 `set`/`unset` 的 `instances_to_restart` 对
+       settings 也适用：改了 `defaults` 时是哪些实例）；`--json` 文档的 golden。`config.rs` 里的 `fail`/`print_doc`
+       到时挪成各命令共用的。
   - [ ] B9-3 退出码表（§9.5）与操作码（§2.4）：操作层的中文原因换成码加数据；§9.5 每一格一个测试。
   - [ ] B9-4 `--json`（§9.4）：status（改用 `ops::enumerate`，顺带显示 incompatible、down、看护者、读不懂的记录）、
     start、stop、restart、restore、alias list、config/settings 的 show 与 get、find；每个一份 golden。

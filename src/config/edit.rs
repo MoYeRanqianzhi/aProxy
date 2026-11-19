@@ -13,6 +13,9 @@
 //! `set` 不需要一张「已知键」的表：不认识的键、类型不对的值，都会让第 2 步的校验多出一条
 //! 诊断，于是被拒绝。`unset` 则接受任何键路径——删除总是安全的，这也是清掉一个不认识的键
 //! 的办法。
+//!
+//! 读出口给的是占位对象而不是密钥（见 [`super::view`]），所以读出来再写回的值里会带着
+//! 占位：`set` 把它们换回文件里的原值，对不上就拒绝。
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -163,9 +166,15 @@ pub fn apply_to_text(
         Ok(document) => document,
         Err(_) => return Err(EditError::Syntax(super::file::parse(old, path).1)),
     };
+    // 占位对象对应的是改动之前文件里的值
+    let before = super::view::file_value(old);
     for change in changes {
         match change {
-            Change::Set { key, value } => set(&mut document, &plain_path(key)?, value.clone()),
+            Change::Set { key, value } => {
+                let segments = plain_path(key)?;
+                let value = keep_placeholders(value, before.as_ref(), key, path)?;
+                set(&mut document, &segments, value);
+            }
             Change::Unset { key } => unset(&mut document, &plain_path(key)?),
         }
     }
@@ -192,6 +201,28 @@ pub fn apply_to_text(
     } else {
         Err(EditError::Invalid(introduced))
     }
+}
+
+/// 要写进 `key` 的值里有占位对象时，把它们换回 `before`（改动之前的文件）里的原值；没有
+/// 占位时原样返回，值的写法（引号、数字的进制）不动。
+fn keep_placeholders(
+    value: &Value,
+    before: Option<&serde_json::Value>,
+    key: &str,
+    file: &Path,
+) -> Result<Value, EditError> {
+    use super::view;
+    let json = view::toml_to_json(value);
+    if !view::has_placeholder(&json) {
+        return Ok(value.clone());
+    }
+    let old = match before {
+        Some(before) => view::get(before, key)?,
+        None => None,
+    };
+    let restored = view::restore_placeholders(json, old, key, file)?;
+    // 占位对象都换成了字符串，结果里没有 null，总能写成 TOML
+    view::json_to_toml(&restored).ok_or_else(|| EditError::BadKey(key.to_string()))
 }
 
 /// 解析键路径，拒绝带下标的写法。
@@ -236,7 +267,7 @@ fn set(document: &mut DocumentMut, path: &[KeySegment], value: Value) {
 
 /// 带换行的字符串写成一行、换行写成 `\n`：默认的写法是多行字符串，它在开头多出一个换行，
 /// 对 `keepalive.heartbeat` 这种「每个字节都算数」的值很难看清到底写了什么。
-fn one_line(value: Value) -> Value {
+pub(crate) fn one_line(value: Value) -> Value {
     match value.as_str() {
         // JSON 的字符串字面量也是合法的 TOML 基本字符串（转义写法是它的子集）
         Some(text) if text.contains(['\n', '\r']) => serde_json::to_string(text)

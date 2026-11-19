@@ -48,7 +48,7 @@ by keepalive ends with a terminal SSE error event; see Configuration.)
   the client receives a stream in the channel's protocol. Same-protocol SSE
   passes through untouched, and key rotation / same-protocol aggregation are
   unaffected.
-- **Background daemon** — `aproxy` starts detached from a launch spec (survives terminal close;
+- **Background daemon** — `aproxy start` launches detached from a launch spec (survives terminal close;
   secrets stay in the spec file, not on the instance's command line); `status` / `stop` / `logs` /
   `restore` for full instance management.
 - **Watchdog** — Nothing slips through. A global supervisor process
@@ -257,15 +257,17 @@ development package (see above).
 
 ## Quick start
 
-A fresh machine has no upstream configured, so running `aproxy` right away
+A fresh machine has no upstream configured, so running `aproxy start` right away
 fails because `base_url` is empty — configure first, then start:
 
 ```sh
-# 1. Configure the upstream (writes ~/.aproxy/config.toml)
-aproxy config --baseurl https://api.anthropic.com --api-key sk-ant-...
+# 1. Configure the upstream (writes ~/.aproxy/config.toml; one key per command)
+aproxy config set base_url https://api.anthropic.com
+aproxy config set api_key sk-ant-...
+#    keep the key out of the shell history: aproxy config set api_key -
 
 # 2. Start (background daemon)
-aproxy
+aproxy start
 
 # 3. Point your agent's API base URL at the local proxy
 #    https://api.anthropic.com  →  http://127.0.0.1:12345
@@ -361,25 +363,28 @@ timeout (for Claude Code, `API_TIMEOUT_MS`).
 
 | Command | Description |
 |---|---|
-| `aproxy [start]` | Start the proxy in the background (default port 127.0.0.1:12345) |
+| `aproxy start` | Start the proxy in the background (default config, default port 127.0.0.1:12345) |
 | `aproxy start <alias\|path>` | Start by alias or config file path |
-| `aproxy --foreground` | Run in the foreground (logs to console, Ctrl+C to stop) |
+| `aproxy start --foreground` | Run in the foreground (logs to console, Ctrl+C to stop) |
 | `aproxy status` | List running instances (port/pid/version/upstream/config) |
 | `aproxy stop [PORT\|all\|alias]` | Stop instances; multi-instance requires a port, `all`, or an alias; `--force` kills instantly (the watchdog will not revive it); a target that already crashed has its desired-state record deleted |
 | `aproxy restart [PORT\|all\|alias]` | Restart running instances (restart-only, never starts); the new config is pre-checked before the old instance is stopped, and a failed check leaves it running; a failed start keeps the record, so `restore` or the watchdog can bring it back; `--force` kills instantly |
-| `aproxy logs [PORT\|ALIAS]` | Tail an instance's live logs; `all` not supported |
+| `aproxy logs [PORT\|ALIAS]` | Print the instance's most recent 200 log lines and exit; `-n N` sets the count, `-f` keeps following; `all` not supported |
 | `aproxy restore` | Revive instances from their desired-state records; a temporarily missing config file keeps the record and is reported; exits silently if none |
 | `aproxy alias add\|remove\|list` | Manage config aliases (stored in settings.json) |
 | `aproxy doctor` | Config health check: settings.json errors + alias/toml review (warnings) |
 | `aproxy find [keyword]` | Discover all configs in configured directories; `--aliased/--unaliased --port PORT` filters |
-| `aproxy config [options]` | View or modify the config (`--show` prints it) |
+| `aproxy config show\|get\|set\|unset` | View or modify the config: `show` prints the values written in the file, `--effective` adds the global and built-in defaults with each value's source; `set`/`unset` change one key per command |
 | `aproxy settings show\|get\|set\|unset` | View or modify the global settings (`~/.aproxy/settings.json`): aliases, `defaults` global defaults, watchdog, logs, install updates; works even when settings.json has errors, to repair it |
 | `aproxy install [VERSION]` | Install or upgrade (alias `upgrade`), rolling-restarting instances; `--variant` switches the build, `--force` forces an install; see the upgrade notes under Getting started |
 | `aproxy desktop` | Open the desktop window (a preview showing demo data; see below) |
 
-Global flags: `--config <PATH>` (multi-instance), `--listen <ADDR>`,
-`--proxy <URL>`, `--api-key <KEY>` (recorded in this launch's spec and reused by
-`restart`/`restore`; never written to config.toml).
+`start` options: `<alias|path>` or `--config <PATH>` (the same thing;
+multi-instance), `--listen-addr <ADDR>`, `--base-url <URL>`,
+`--proxy <URL>`, `--api-key <KEY|->` (recorded in this launch's spec and reused by
+`restart`/`restore`; never written to config.toml; `-` reads one line from stdin),
+`--log-file <PATH>`, `--foreground`. A bare `aproxy` with no command only prints the
+help and exits 2.
 
 ## Desktop window (preview)
 
@@ -411,8 +416,8 @@ may restart instances one at a time.
 ## Multi-instance & aliases
 
 ```sh
-aproxy --config ~/.aproxy/work.toml      # listen_addr = "127.0.0.1:12345"
-aproxy --config ~/.aproxy/personal.toml  # listen_addr = "127.0.0.1:12346"
+aproxy start ~/.aproxy/work.toml      # listen_addr = "127.0.0.1:12345"
+aproxy start ~/.aproxy/personal.toml  # listen_addr = "127.0.0.1:12346"
 aproxy status                            # both visible
 aproxy stop 12346                        # manage by port
 ```
@@ -478,7 +483,7 @@ listen_addr = "127.0.0.1:12345"          # local listener (port 0 = OS-assigned;
 # args = ["run", "--config", "~/.aproxy/agg.toml"]   # no extra key any more: pass configuration through args or env
 # process = "persistent"                 # spawn (default) / persistent (required for stateful programs)
 # stages = ["request", "retry"]          # request / response / heartbeat; adding retry re-runs it before every retry
-# env = { KEYS = '{"keys": ["sk-a", "sk-b"]}' }  # extra environment variables (values are never shown by --show)
+# env = { KEYS = '{"keys": ["sk-a", "sk-b"]}' }  # extra environment variables (values are never shown by config show)
 ```
 
 Multi-key rotation takes effect **between requests** by default: retries of the
@@ -501,13 +506,13 @@ the `watchdog`, `logs`, `instances`, `update` and `ui` sections).
 `settings.json` is read and written with
 `aproxy settings show|get|set|unset` (keys are dotted paths such as
 `watchdog.enabled` or `defaults.max_request_mb`); `aproxy alias add|remove` and
-`aproxy config --set-default|--clear-default` edit their own keys. Hand-edit it
+`aproxy settings set|unset default_config` edit their own keys. Hand-edit it
 only when it cannot be parsed at all: it is parsed strictly, so an unknown key or
 a wrong type is an error. In that state `status`, `stop` and `install` run on
 built-in defaults with a warning (aliases unavailable) and every other command
 exits 3 with the repair steps. Credentials in `defaults` (`api_key`, secret
 headers, proxy passwords) are inherited only by instances whose `base_url` /
-`proxy` names the same target; `aproxy config --show` lists what was withheld.
+`proxy` names the same target; `aproxy config show --effective` lists what was withheld.
 The fields are documented in the skill file
 [settings-json.md](.claude/skills/aproxy-cli/references/latest/settings-json.md).
 

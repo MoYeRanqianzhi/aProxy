@@ -1,17 +1,21 @@
-//! `aproxy config [选项]`：查看或修改配置文件与默认配置指向。
+//! `aproxy config show|get|set|unset`：查看与修改一份 config.toml。
+//!
+//! 读出口不给密钥的明文：`--json` 里密钥是占位对象 `{"secret":true}`，给人看的输出里是
+//! `<secret>`；URL 里的口令打码。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use aproxy::cli::{ConfigArgs, ConfigCmd};
 use aproxy::config::edit::{Change, EditError};
-use aproxy::config::{self, Source};
+use aproxy::config::{self, Source, view};
 use aproxy::settings;
+use aproxy_ipc::code::{EXIT_CONFIG, EXIT_FAILED, EXIT_NOT_FOUND, EXIT_USAGE};
+use serde_json::{Value, json};
 
-use crate::util::{mask_secret, parse_kv};
-use aproxy::cli::ConfigArgs;
+use aproxy_ipc::redact::placeholder_text;
 
-/// 转换器 args 的展示打码：密钥旗标之后的值（或 `--flag=值` 的值）走
-/// mask_secret；其余参数走 URL 脱敏出口（参数里出现的 `user:pass@host`、
-/// `?key=` 一并遮掉，普通参数原样）。
+/// 转换器 args 的展示打码：密钥旗标之后的值（或 `--flag=值` 的值）写成占位的文本形式；
+/// 其余参数走 URL 脱敏出口（参数里出现的 `user:pass@host`、`?key=` 一并遮掉，普通参数原样）。
 fn mask_transform_args(args: &[String]) -> Vec<String> {
     let is_secret_flag = |s: &str| {
         aproxy::config::SECRET_ARG_FLAGS
@@ -22,7 +26,7 @@ fn mask_transform_args(args: &[String]) -> Vec<String> {
     let mut mask_next = false;
     for arg in args {
         if mask_next {
-            out.push(mask_secret(arg));
+            out.push(placeholder_text(arg));
             mask_next = false;
         } else if is_secret_flag(arg) {
             out.push(arg.clone());
@@ -30,7 +34,7 @@ fn mask_transform_args(args: &[String]) -> Vec<String> {
         } else if let Some((flag, value)) = arg.split_once('=')
             && is_secret_flag(flag)
         {
-            out.push(format!("{flag}={}", mask_secret(value)));
+            out.push(format!("{flag}={}", placeholder_text(value)));
         } else {
             out.push(aproxy_ipc::redact::url(arg));
         }
@@ -38,193 +42,112 @@ fn mask_transform_args(args: &[String]) -> Vec<String> {
     out
 }
 
-pub(crate) fn handle_config_cmd(args: ConfigArgs) {
-    let ConfigArgs {
-        config,
-        baseurl,
-        listen,
-        api_key,
-        extra_headers,
-        override_headers,
-        keepalive_secs,
-        proxy,
-        proxy_username,
-        proxy_password,
-        clear_api_key,
-        clear_headers,
-        clear_proxy,
-        unset,
-        set_default,
-        clear_default,
-        show,
-    } = args;
-
-    // 默认配置文件指向存于 settings.json（内部配置），与 config.toml 内容无关，
-    // 独立处理后再进入 toml 内容编辑流程
-    if set_default.is_some() || clear_default {
-        if set_default.is_some() && clear_default {
-            eprintln!("--set-default 与 --clear-default 不能同时使用");
-            std::process::exit(1);
-        }
-        let save = |change: settings::edit::Change, done: String| match settings::update(&[change])
-        {
-            Ok(_) => println!("{done}"),
-            Err(reason) => {
-                eprintln!("{reason}");
-                crate::util::exit(1)
-            }
-        };
-        if let Some(p) = set_default {
-            let abs = settings::expand_path(&p);
-            if !abs.is_file() {
-                eprintln!("配置文件不存在: {}", abs.display());
-                std::process::exit(1);
-            }
-            save(
-                settings::edit::Change::set("default_config", abs.display().to_string()),
-                format!("已把 {} 设为默认配置文件", abs.display()),
-            );
-        } else {
-            save(
-                settings::edit::Change::unset("default_config"),
-                "已取消默认配置文件设置（恢复用 ~/.aproxy/config.toml）".to_string(),
-            );
-        }
-        return;
-    }
-
-    // 以下编辑/查看 toml 内容，才真正需要配置文件路径
-    // 给了 --config：别名优先；不是别名就当路径，文件可以还不存在（给一个新路径加上修改
-    // 参数，就是在建一份新实例的配置）。没给：默认配置文件
-    let explicit_config = config.is_some();
+pub(crate) async fn handle_config_cmd(args: ConfigArgs) {
+    let ConfigArgs { config, cmd } = args;
+    // 给了 --config：别名优先；不是别名就当路径，文件可以还不存在（对一个新路径 set，就是
+    // 在建一份新实例的配置）。没给：默认配置文件
+    let explicit = config.is_some();
     let path = match config.as_deref() {
         Some(target) => settings::resolve_alias(target)
             .map(PathBuf::from)
             .unwrap_or_else(|| settings::expand_path(target)),
         None => super::require_cfg_path(super::resolve_cfg_path(None)),
     };
-    let fail = |msg: String| -> ! {
-        eprintln!("{msg}");
-        crate::util::exit(1)
-    };
-    let non_empty = |value: String, name: &str, clear: &str| -> String {
-        let value = value.trim().to_string();
-        if value.is_empty() {
-            fail(format!("{name} 不能为空（用 {clear} 清空）"));
+    match cmd {
+        ConfigCmd::Show { effective, json } => show(&path, explicit, effective, json),
+        ConfigCmd::Get { key, json } => get(&path, &key, json),
+        ConfigCmd::Set { key, value, json } => {
+            let value = parse_value(&key, &value, json);
+            write(&path, Change::Set { key, value }, json).await
         }
-        value
-    };
+        ConfigCmd::Unset { key, json } => write(&path, Change::Unset { key }, json).await,
+    }
+}
 
-    let mut changes: Vec<Change> = Vec::new();
-    if let Some(u) = baseurl {
-        changes.push(Change::set("base_url", u.trim().trim_end_matches('/')));
+/// 整条命令失败：原因写到 stderr；`--json` 时 stdout 上是错误文档
+/// `{"schema":1,"error":{"code","message","details"}}`。以 `exit` 退出。
+fn fail(json: bool, code: &'static str, exit: u8, message: String, details: Value) -> ! {
+    eprintln!("{message}");
+    if json {
+        print_doc(json!({"error": {"code": code, "message": message, "details": details}}));
     }
-    if let Some(l) = listen {
-        changes.push(Change::set("listen_addr", l.trim()));
-    }
-    if clear_api_key {
-        changes.push(Change::unset("api_key"));
-    } else if let Some(k) = api_key {
-        changes.push(Change::set(
-            "api_key",
-            non_empty(k, "api_key", "--clear-api-key"),
-        ));
-    }
-    if clear_headers {
-        changes.push(Change::unset("extra_headers"));
-        changes.push(Change::unset("override_headers"));
-    }
-    for (table, flag, list) in [
-        ("extra_headers", "extra-header", extra_headers),
-        ("override_headers", "override-header", override_headers),
-    ] {
-        for kv in list {
-            let Some((k, v)) = parse_kv(&kv) else {
-                fail(format!("{flag} 格式错误，应为 key=value，得到: {kv}"));
-            };
-            changes.push(Change::set(
-                &format!("{table}.{}", config::quote_key(&k)),
-                v,
-            ));
-        }
-    }
-    if let Some(s) = keepalive_secs {
-        changes.push(Change::set("keepalive.interval_secs", s as i64));
-    }
-    if clear_proxy {
-        for key in ["proxy", "proxy_username", "proxy_password"] {
-            changes.push(Change::unset(key));
-        }
-    } else if let Some(p) = proxy {
-        changes.push(Change::set("proxy", non_empty(p, "proxy", "--clear-proxy")));
-    }
-    if let Some(u) = proxy_username {
-        changes.push(Change::set(
-            "proxy_username",
-            non_empty(u, "proxy-username", "--clear-proxy"),
-        ));
-    }
-    if let Some(p) = proxy_password {
-        changes.push(Change::set(
-            "proxy_password",
-            non_empty(p, "proxy-password", "--clear-proxy"),
-        ));
-    }
-    for key in unset {
-        changes.push(Change::unset(&key));
-    }
+    crate::util::exit(exit as i32)
+}
 
-    let defaults =
-        config::resolve::Defaults::from_settings(&settings::load(), &settings::settings_path());
-    let changed = !changes.is_empty();
-    if changed {
-        // 只改这几个键：文件里的注释、键的顺序与其余内容原样保留。会引入新错误的改动
-        // 不写入；文件里原有的、与这次改动无关的错误不挡路，可以逐项修
-        match config::edit::apply(&path, &aproxy_ipc::home::home(), &defaults, &changes) {
-            Ok(applied) if applied.changed => println!("已保存配置到 {}", applied.file.display()),
-            Ok(applied) => println!("配置没有变化: {}", applied.file.display()),
-            Err(EditError::BadKey(key)) => {
-                eprintln!(
-                    "键路径写法不对: {key}（点号分隔，例如 timeouts.connect_secs、extra_headers.\"x-foo\"；数组表只能整体删除）"
-                );
-                crate::util::exit(aproxy_ipc::code::EXIT_USAGE as i32)
-            }
-            Err(EditError::Syntax(diagnostics)) => {
-                eprintln!(
-                    "现有配置文件有语法错误，没有修改（请先修复或删除 {}）:",
-                    path.display()
-                );
-                print_diagnostics(&diagnostics);
-                crate::util::exit(aproxy_ipc::code::EXIT_CONFIG as i32)
-            }
-            Err(EditError::Invalid(diagnostics)) => {
-                eprintln!("这次修改会让配置无效，没有保存:");
-                print_diagnostics(&diagnostics);
-                crate::util::exit(aproxy_ipc::code::EXIT_CONFIG as i32)
-            }
-            Err(EditError::Conflict) => fail(format!(
-                "配置文件一直在被别的程序修改，没有保存（关掉正在编辑它的程序后重试）: {}",
-                path.display()
-            )),
-            Err(EditError::LockBusy) => fail(
-                "另一个 aproxy 正在写配置，等了 10 秒仍未结束，没有保存（稍后重试）".to_string(),
-            ),
-            Err(EditError::Io(e)) => fail(format!("保存配置失败: {e}")),
+/// 把 `--json` 的文档写到 stdout：一行，`schema` 在最前面。
+fn print_doc(body: Value) {
+    let mut doc = serde_json::Map::new();
+    doc.insert("schema".to_string(), 1.into());
+    if let Value::Object(body) = body {
+        doc.extend(body);
+    }
+    println!("{}", Value::Object(doc));
+}
+
+/// 读配置文件的文本；不存在时是 None。读不出来（权限、不是 UTF-8）时失败退出。
+fn read_text(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            eprintln!("读取配置文件失败: {e}\n文件: {}", path.display());
+            crate::util::exit(1)
         }
     }
-    if show || !changed {
-        // 显式 --config 指向的文件不存在时，展示的只是默认值（抬头却是用户给的路径）——
-        // 纯粹的排障误导，报错而非静默回退。写操作不受此限：--config 指向新路径 + 修改
-        // 参数是「创建新实例配置」的合法入口（多开工作流）；默认路径豁免：首配场景就是
-        // 在尚不存在的 config.toml 上创建。
-        if explicit_config && !path.is_file() {
-            fail(format!("指定的配置文件不存在: {}", path.display()));
+}
+
+fn global_defaults() -> config::resolve::Defaults {
+    config::resolve::Defaults::from_settings(&settings::load(), &settings::settings_path())
+}
+
+/// 分层解析 `path` 处的配置（文件不存在时只剩全局默认与内置默认两层）。
+fn resolve(path: &Path) -> config::Resolved {
+    match config::resolve(path, &config::Overrides::default(), &global_defaults()) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            eprintln!("读取配置文件失败: {e}\n文件: {}", path.display());
+            crate::util::exit(1)
         }
-        let resolved = match config::resolve(&path, &config::Overrides::default(), &defaults) {
-            Ok(resolved) => resolved,
-            Err(e) => fail(format!("读取配置文件失败: {e}\n文件: {}", path.display())),
-        };
-        print_effective(&path, &resolved);
+    }
+}
+
+/// `config show`：文件里写了的值；`--effective` 时是生效的值、各自的来源与没有继承的凭据。
+/// 文件有 error 级诊断时照样显示，然后以 3 退出。
+fn show(path: &Path, explicit: bool, effective: bool, json: bool) {
+    let text = read_text(path);
+    // 显式 --config 指向的文件不存在时，展示的只会是默认值（抬头却是用户给的路径）——纯粹
+    // 的排障误导，报错而不是照样显示。默认路径豁免：还没有 config.toml 是首次配置之前的
+    // 正常状态
+    if text.is_none() && explicit {
+        fail(
+            json,
+            "target_not_found",
+            EXIT_NOT_FOUND,
+            format!("指定的配置文件不存在: {}", path.display()),
+            json!({"target": path.display().to_string()}),
+        );
+    }
+    let resolved = resolve(path);
+    let file_values = text.as_deref().and_then(view::file_value);
+    let values = view::redacted(if effective {
+        view::effective_value(&resolved, file_values.as_ref())
+    } else {
+        file_values.clone().unwrap_or_else(|| json!({}))
+    });
+
+    if json {
+        let mut doc = json!({
+            "file": path.display().to_string(),
+            "values": values,
+        });
+        if effective {
+            doc["sources"] = json!(resolved.sources);
+            doc["withheld"] = json!(resolved.withheld);
+        }
+        doc["diagnostics"] = json!(resolved.diagnostics);
+        print_doc(doc);
+    } else if effective {
+        print_effective(path, &resolved);
         // 全局默认里没有继承的凭据：列出来，不然用户只会看到上游回 401
         if !resolved.withheld.is_empty() {
             println!();
@@ -242,35 +165,304 @@ pub(crate) fn handle_config_cmd(args: ConfigArgs) {
                 );
             }
         }
-        for d in resolved.diagnostics.iter().filter(|d| !d.is_error()) {
-            eprintln!("警告: {}", aproxy::ops::start::render_diagnostic(d));
+    } else {
+        println!("# {}", path.display());
+        if text.is_none() {
+            eprintln!("配置文件还不存在；用 aproxy config set <键> <值> 写入第一个键时创建。");
         }
-        if !resolved.is_valid() {
-            // 有 error 时照样显示，附上诊断；这份配置现在启动不了
+        print!("{}", view::to_document(&view::for_display(values)));
+    }
+
+    for d in resolved.diagnostics.iter().filter(|d| !d.is_error()) {
+        eprintln!("警告: {}", aproxy::ops::start::render_diagnostic(d));
+    }
+    if !resolved.is_valid() {
+        // 这份配置现在启动不了
+        eprintln!();
+        eprintln!("这份配置有错误，现在不能用来启动:");
+        let errors: Vec<_> = resolved.errors().cloned().collect();
+        print_diagnostics(&errors);
+        if resolved.config.base_url.is_empty() {
             eprintln!();
-            eprintln!("这份配置有错误，现在不能用来启动:");
-            let errors: Vec<_> = resolved.errors().cloned().collect();
-            print_diagnostics(&errors);
-            if resolved.config.base_url.is_empty() {
-                eprintln!();
-                eprintln!("提示: base_url 为空，请设置:");
-                eprintln!("  aproxy config --baseurl https://api.anthropic.com");
+            eprintln!("提示: base_url 为空，请设置:");
+            eprintln!("  aproxy config set base_url https://api.anthropic.com");
+        }
+        let unknown: Vec<&str> = errors
+            .iter()
+            .filter(|d| d.code == "config_unknown_key")
+            .filter_map(|d| d.key.as_deref())
+            .collect();
+        if !unknown.is_empty() {
+            eprintln!();
+            eprintln!("不认识的键可以这样删除:");
+            for key in unknown {
+                eprintln!("  aproxy config unset '{key}'");
             }
-            let unknown: Vec<&str> = errors
+        }
+        crate::util::exit(EXIT_CONFIG as i32)
+    }
+}
+
+/// 键路径写法不对是用法错误（2），写法对但不认识是 `config_unknown_key`（3）。
+fn require_known_key(key: &str, json: bool) -> view::KeyKind {
+    if let Some(kind) = view::key_kind(key) {
+        return kind;
+    }
+    let plain = config::parse_key_path(key)
+        .is_some_and(|segments| segments.iter().all(|s| s.index.is_none()));
+    if !plain {
+        fail(
+            json,
+            "usage",
+            EXIT_USAGE,
+            format!(
+                "键路径写法不对: {key}（点号分隔，例如 timeouts.connect_secs、extra_headers.\"x-foo\"；数组表只能整体读写）"
+            ),
+            json!({"reason": "bad_key_path"}),
+        );
+    }
+    fail(
+        json,
+        "config_unknown_key",
+        EXIT_CONFIG,
+        format!("不认识的键: {key}（aproxy config show --effective 列出全部的键）"),
+        json!({"key": key}),
+    )
+}
+
+/// `config get`：一个键的生效值，与它来自哪一层。密钥给的是占位。
+fn get(path: &Path, key: &str, json: bool) {
+    require_known_key(key, json);
+    let Some(text) = read_text(path) else {
+        fail(
+            json,
+            "target_not_found",
+            EXIT_NOT_FOUND,
+            format!("配置文件不存在: {}", path.display()),
+            json!({"target": path.display().to_string()}),
+        );
+    };
+    let resolved = resolve(path);
+    let Some(file_values) = view::file_value(&text) else {
+        // 语法错误：文件里的值一个都读不出来，给出的只会是默认值
+        let errors: Vec<_> = resolved.errors().cloned().collect();
+        eprintln!("配置文件有语法错误:");
+        print_diagnostics(&errors);
+        fail(
+            json,
+            "config_invalid",
+            EXIT_CONFIG,
+            format!("读不出 {key}：先修复 {}", path.display()),
+            json!({"diagnostics": errors}),
+        );
+    };
+    let effective = view::redacted(view::effective_value(&resolved, Some(&file_values)));
+    // 来源表里的键是规范写法（头名按需加引号），与用户怎么写这个键无关
+    let canonical = config::parse_key_path(key)
+        .map(|segments| {
+            segments
                 .iter()
-                .filter(|d| d.code == "config_unknown_key")
-                .filter_map(|d| d.key.as_deref())
-                .collect();
-            if !unknown.is_empty() {
-                eprintln!();
-                eprintln!("不认识的键可以这样删除:");
-                for key in unknown {
-                    eprintln!("  aproxy config --unset '{key}'");
-                }
+                .map(|s| config::quote_key(&s.name))
+                .collect::<Vec<_>>()
+                .join(".")
+        })
+        .unwrap_or_default();
+    let source = resolved.sources.get(&canonical);
+    if json {
+        let mut doc = json!({
+            "key": key,
+            "value": view::get(&effective, key).ok().flatten(),
+        });
+        if let Some(source) = source {
+            doc["source"] = json!(source);
+        }
+        print_doc(doc);
+        return;
+    }
+    let shown = view::for_display(effective);
+    match view::get(&shown, key)
+        .ok()
+        .flatten()
+        .and_then(view::json_to_toml)
+    {
+        Some(value) => {
+            println!("{value}");
+            eprintln!("（{}）", source_label(source.copied()));
+        }
+        None => eprintln!("(未设置)"),
+    }
+}
+
+/// 命令行上的值 → TOML 值。
+/// - `-`：从 stdin 读一行（传密钥用，不进命令行历史）。
+/// - 字符串类型的键可以直接写原文；以 `"` 开头时按 TOML 字符串字面量解析（用来写换行等）。
+///   写回一个占位（`{ secret = true }`）表示保持原值。
+/// - 其余的键只收 TOML 值。
+fn parse_value(key: &str, raw: &str, json: bool) -> toml_edit::Value {
+    let kind = require_known_key(key, json);
+    let raw = if raw == "-" {
+        crate::util::read_secret_line().unwrap_or_else(|e| {
+            eprintln!("{e}");
+            crate::util::exit(1)
+        })
+    } else {
+        raw.to_string()
+    };
+    match value_from_text(kind, &raw) {
+        Ok(value) => value,
+        Err(e) => fail(
+            json,
+            "usage",
+            EXIT_USAGE,
+            format!(
+                "{key} 的值要写成 TOML（例如 true、30、\"text\"、[\"a\"]、{{ k = 1 }}），解析失败: {e}"
+            ),
+            json!({"reason": "bad_value"}),
+        ),
+    }
+}
+
+fn value_from_text(kind: view::KeyKind, raw: &str) -> Result<toml_edit::Value, String> {
+    let parsed = raw.trim().parse::<toml_edit::Value>();
+    if kind == view::KeyKind::Text {
+        return match parsed {
+            Ok(value) if raw.starts_with('"') => Ok(value),
+            // 以引号开头却不是一个完整的字符串字面量：多半是引号没配对，不当原文收下
+            Err(e) if raw.starts_with('"') => Err(e.to_string()),
+            Ok(value) if aproxy_ipc::redact::is_placeholder(&view::toml_to_json(&value)) => {
+                Ok(value)
             }
-            crate::util::exit(aproxy_ipc::code::EXIT_CONFIG as i32)
+            _ => Ok(toml_edit::Value::from(raw)),
+        };
+    }
+    parsed.map_err(|e| e.to_string())
+}
+
+/// `config set` / `config unset`：只改这一个键，文件里的注释、键的顺序与其余内容原样保留。
+/// 会引入新错误的改动不写入；文件里原有的、与这次改动无关的错误不挡路，可以逐项修。
+async fn write(path: &Path, change: Change, json: bool) {
+    let key = match &change {
+        Change::Set { key, .. } | Change::Unset { key } => key.clone(),
+    };
+    let applied = match config::edit::apply(
+        path,
+        &aproxy_ipc::home::home(),
+        &global_defaults(),
+        &[change],
+    ) {
+        Ok(applied) => applied,
+        Err(EditError::BadKey(key)) => fail(
+            json,
+            "usage",
+            EXIT_USAGE,
+            format!(
+                "键路径写法不对: {key}（点号分隔，例如 timeouts.connect_secs、extra_headers.\"x-foo\"；数组表只能整体读写）"
+            ),
+            json!({"reason": "bad_key_path"}),
+        ),
+        Err(EditError::Syntax(diagnostics)) => {
+            eprintln!("现有配置文件有语法错误，没有修改:");
+            print_diagnostics(&diagnostics);
+            fail(
+                json,
+                "config_invalid",
+                EXIT_CONFIG,
+                format!("先修复或删除 {}", path.display()),
+                json!({"diagnostics": diagnostics}),
+            )
+        }
+        Err(EditError::Invalid(diagnostics)) => {
+            print_diagnostics(&diagnostics);
+            fail(
+                json,
+                "config_invalid",
+                EXIT_CONFIG,
+                "这次修改会让配置无效，没有保存".to_string(),
+                json!({"diagnostics": diagnostics}),
+            )
+        }
+        Err(EditError::Conflict) => fail(
+            json,
+            "write_conflict",
+            EXIT_FAILED,
+            format!(
+                "配置文件一直在被别的程序修改，没有保存（关掉正在编辑它的程序后重试）: {}",
+                path.display()
+            ),
+            json!({"file": path.display().to_string()}),
+        ),
+        Err(EditError::LockBusy) => fail(
+            json,
+            "write_conflict",
+            EXIT_FAILED,
+            "另一个 aproxy 正在写配置，等了 10 秒仍未结束，没有保存（稍后重试）".to_string(),
+            json!({"file": path.display().to_string()}),
+        ),
+        Err(EditError::Io(e)) => {
+            eprintln!("保存配置失败: {e}");
+            crate::util::exit(EXIT_FAILED as i32)
+        }
+    };
+
+    // 用着这份配置的运行中的实例：它们读的是启动时的配置，要重启才用上这次改动
+    let ports = if applied.changed {
+        instances_using(&applied.file, path).await
+    } else {
+        Vec::new()
+    };
+    if json {
+        // 写完之后文件里这个键的值（删掉了就是 null），密钥给的是占位
+        let value = std::fs::read_to_string(&applied.file)
+            .ok()
+            .and_then(|text| view::file_value(&text))
+            .map(view::redacted)
+            .and_then(|values| view::get(&values, &key).ok().flatten().cloned());
+        print_doc(json!({
+            "file": applied.file.display().to_string(),
+            "key": key,
+            "value": value,
+            "changed": applied.changed,
+            "instances_to_restart": ports,
+        }));
+        return;
+    }
+    if applied.changed {
+        println!("已保存到 {}", applied.file.display());
+    } else {
+        println!("没有变化: {}", applied.file.display());
+    }
+    if !ports.is_empty() {
+        eprintln!("运行中的实例要重启才用上这次改动:");
+        for port in ports {
+            eprintln!("  aproxy restart {port}");
         }
     }
+}
+
+/// 用着这份配置文件的运行中的实例的端口，从小到大。`written` 是实际写的文件（目标是符号
+/// 链接时是它指向的那个），`given` 是定位到的路径：实例记下的可能是任何一个。
+async fn instances_using(written: &Path, given: &Path) -> Vec<u16> {
+    let keys = [
+        settings::path_match_key(&written.display().to_string()),
+        settings::path_match_key(&given.display().to_string()),
+    ];
+    let survey = aproxy::daemon::survey_instances().await;
+    let mut ports: Vec<u16> = survey
+        .responsive
+        .iter()
+        .map(|status| &status.instance)
+        .chain(survey.unresponsive.iter())
+        .filter(|instance| {
+            instance
+                .config_path
+                .as_deref()
+                .is_some_and(|path| keys.contains(&settings::path_match_key(path)))
+        })
+        .filter_map(|instance| aproxy::daemon::port_of(&instance.listen_addr).parse().ok())
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 /// 逐条打印诊断（stderr）：`文件:行:列: 键: 说明 [码]`。
@@ -293,7 +485,7 @@ fn source_label(source: Option<Source>) -> &'static str {
 }
 
 /// 打印一份配置的生效值：每个键一行，后面注明它来自哪一层。密钥只显示打码后的样子。
-fn print_effective(path: &std::path::Path, resolved: &config::Resolved) {
+fn print_effective(path: &Path, resolved: &config::Resolved) {
     let cfg = &resolved.config;
     let line = |key: &str, value: String| {
         println!(
@@ -325,7 +517,7 @@ fn print_effective(path: &std::path::Path, resolved: &config::Resolved) {
     line("listen_addr", quoted(&cfg.listen_addr));
     line(
         "api_key",
-        optional(cfg.api_key.as_deref().map(|k| quoted(&mask_secret(k)))),
+        optional(cfg.api_key.as_deref().map(placeholder_text)),
     );
     line(
         "delivery",
@@ -483,7 +675,7 @@ fn print_effective(path: &std::path::Path, resolved: &config::Resolved) {
     line("proxy_username", optional(cfg.proxy_username.clone()));
     line(
         "proxy_password",
-        optional(cfg.proxy_password.as_ref().map(|_| "***".to_string())),
+        optional(cfg.proxy_password.as_deref().map(placeholder_text)),
     );
     for (table, headers) in [
         ("extra_headers", &cfg.extra_headers),
@@ -497,16 +689,17 @@ fn print_effective(path: &std::path::Path, resolved: &config::Resolved) {
         let mut names: Vec<&String> = headers.keys().collect();
         names.sort();
         for name in names {
-            // 头值常含完整鉴权令牌，与 api_key 一致做截断打码
+            // 名字像鉴权的头，值是密钥：与 api_key 一样只显示占位
             let source = resolved
                 .sources
                 .get(&format!("{table}.{}", config::quote_key(name)))
                 .copied();
-            println!(
-                "  {name} = \"{}\"  （{}）",
-                mask_secret(&headers[name]),
-                source_label(source)
-            );
+            let value = if aproxy_ipc::redact::is_secret_header(name) {
+                placeholder_text(&headers[name])
+            } else {
+                quoted(&headers[name])
+            };
+            println!("  {name} = {value}  （{}）", source_label(source));
         }
     }
 }
@@ -535,8 +728,8 @@ mod tests {
             [
                 "run",
                 "--api-key",
-                "SUPERS***",
-                "--TOKEN=tok-ab***",
+                "<secret>",
+                "--TOKEN=<secret>",
                 "--config",
                 "C:/agg.toml",
                 "https://***@h/x?key=***",

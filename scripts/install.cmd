@@ -212,8 +212,9 @@ if errorlevel 1 (
     echo   setx PATH "%%PATH%%;%BIN_DIR%"
 )
 echo Next: configure the upstream first ^(a fresh install has no base_url, so a plain start fails^), then start:
-echo   aproxy config --baseurl ^<upstream-url^> --api-key ^<key^>
-echo   aproxy    ^(or full path "%BIN_DIR%\aproxy.exe"^)
+echo   aproxy config set base_url ^<upstream-url^>
+echo   aproxy config set api_key ^<key^>
+echo   aproxy start    ^(or full path "%BIN_DIR%\aproxy.exe" start^)
 echo Status: aproxy status    Upgrade: aproxy install
 endlocal
 exit /b 0

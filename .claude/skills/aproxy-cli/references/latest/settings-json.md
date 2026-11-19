@@ -53,8 +53,8 @@ config.toml keys and follow the syntax in config-toml.md.
   aproxy writers, keep every other key and its order, and create the file (with `"schema": 1` first)
   when it does not exist. The file is re-serialized as pretty JSON, so hand-made spacing and line
   breaks are not preserved. Two commands never lose each other's updates.
-- `aproxy alias add|remove` and `aproxy config --set-default|--clear-default` still work and now edit
-  only their own key through the same writer. They no longer rewrite the file wholesale, so keys they
+- `aproxy alias add|remove` and `aproxy settings set|unset default_config` edit only their own key
+  through the same writer. They no longer rewrite the file wholesale, so keys they
   do not know are no longer dropped; a key this version does not know is an error until you remove it.
 - **Hand editing is the fallback, and it is strict.** Read by hand only when the file cannot be parsed
   at all: a JSON syntax error, a file that is not a JSON object, or a `schema` newer than this
@@ -160,17 +160,17 @@ to read.)
 
 ## default_config
 
-The config used when a command is given neither `--config` nor a target: `aproxy`,
-`aproxy start`, `aproxy config`, and the reserved target `default`. Unset, it is
-`<APROXY_HOME>/config.toml`. Set it with `aproxy config --set-default PATH` (the file must exist; the
-absolute path is stored) to make another file your everyday config.
+The config used when a command is given neither `--config` nor a target: `aproxy start`,
+`aproxy config`, and the reserved target `default`. Unset, it is `<APROXY_HOME>/config.toml`. Set it
+with `aproxy settings set default_config PATH` (the file must exist; the absolute path is stored) to
+make another file your everyday config.
 
-If the file it names is deleted or moved, the commands that would read it (`aproxy` or
-`aproxy start` without a target, and `aproxy config` when showing or editing the toml) exit with
+If the file it names is deleted or moved, the commands that would read it (`aproxy start` without a
+target, and `aproxy config` when showing or editing the toml) exit with
 `settings.json 指定的默认配置文件不存在: <path>` ("the default config named in settings.json does not
 exist") instead of silently using a different file. Other commands are unaffected. Restore the file,
-point the setting elsewhere with `aproxy config --set-default PATH`, or remove it with
-`aproxy config --clear-default`.
+point the setting elsewhere with `aproxy settings set default_config PATH`, or remove it with
+`aproxy settings unset default_config`.
 
 ## config_dirs
 
@@ -210,11 +210,11 @@ keeps the values it loaded until it restarts.
 - **Values are checked exactly like config.toml.** An invalid URL, regex, trigger or type is an error
   pointing at `defaults.<key>` in settings.json, and every instance that inherits it refuses to
   start. A default that is wrong therefore stops instances that were fine before; check a new global
-  default with `aproxy config --show` on one instance before relying on it.
-- **`aproxy config --show` names this layer.** A value inherited from here prints
+  default with `aproxy config show --effective` on one instance before relying on it.
+- **`aproxy config show --effective` names this layer.** A value inherited from here prints
   `（settings.json 全局默认）` ("settings.json global default"); one from the file prints `（config.toml）`,
-  and one nothing set prints `（内置默认）` ("built-in default"). Read `--show` first when you need to
-  know which layer a value comes from.
+  and one nothing set prints `（内置默认）` ("built-in default"). Read `show --effective` first when
+  you need to know which layer a value comes from.
 - In JSON, double every backslash: the regex `\?` is written `"\\?"`.
 
 ### Credentials in defaults follow their target
@@ -232,7 +232,7 @@ A credential must not reach an upstream it was not meant for, so `defaults` is n
 - Everything else is inherited as usual: all non-credential defaults, and headers that are not
   secrets.
 
-When an instance's target differs, `aproxy config --show` lists each withheld item after the values:
+When an instance's target differs, `aproxy config show --effective` lists each withheld item after the values:
 
 ```
 全局默认里的这些凭据没有继承（它们属于另一个目标）:
@@ -240,7 +240,7 @@ When an instance's target differs, `aproxy config --show` lists each withheld it
 ```
 
 ("these credentials in the global defaults were not inherited: they belong to another target"). If
-the instance also has no credential of its own, `--show` adds a warning with code
+the instance also has no credential of its own, the command adds a warning with code
 `default_credential_withheld` naming the key to set, because otherwise the upstream would answer 401
 and nothing would say why.
 
@@ -270,7 +270,7 @@ for a command that meets them depends on what the command is for:
 |---|---|
 | `aproxy settings …`, `aproxy doctor` | Run normally: they are how the file is inspected and repaired. `doctor` lists the errors; `settings show` still prints the effective values, then the errors, and exits 3 |
 | `aproxy status`, `aproxy stop`, `aproxy install` / `upgrade` | Run on built-in defaults and print the errors as `[WARN]` lines. Aliases are unavailable: address instances by port or `all`. Exit with the command's normal code |
-| every other command: `start`, `restart`, `logs`, `find`, `restore`, `config`, `alias`, `desktop`, bare `aproxy` | Print the errors as `[ERROR]` lines with repair hints and exit 3, without doing anything. A started instance never runs with settings it did not get |
+| every other command: `start`, `restart`, `logs`, `find`, `restore`, `config`, `alias`, `desktop` | Print the errors as `[ERROR]` lines with repair hints and exit 3, without doing anything. A started instance never runs with settings it did not get |
 
 The warning form ends with:
 
@@ -314,15 +314,15 @@ and `defaults`, so tell the user before you do it, and prefer `settings unset` f
 ## logs.rotate_mb
 
 Size limit for each instance's daemon log, in MB (default 8). Each instance checks its log every
-hour and empties it once it is larger; no rotated copies are kept, and `aproxy logs` keeps
+hour and empties it once it is larger; no rotated copies are kept, and `aproxy logs -f` keeps
 following the emptied file. `0` = never. Applies to custom `log_file` paths too (config-toml.md,
 log_file).
 
 ## instances.idle_threshold_secs
 
 How long an instance must go without activity to count as idle, in seconds (default 1800). Used by
-`aproxy status --idle` / `--busy` and `aproxy stop idle` / `aproxy restart idle`; a number after
-`idle` overrides it for that one command.
+`aproxy status --idle` / `--busy` and `aproxy stop idle` / `aproxy restart idle`;
+`--idle-threshold-secs SECS` overrides it for that one command.
 
 Activity is a new client request, the start of each retry, and in `delivery = "forward"` mode each
 relayed chunk. A single upstream attempt that runs longer than the threshold without a retry, such

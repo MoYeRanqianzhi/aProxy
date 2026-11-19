@@ -55,10 +55,10 @@ does not have. These development-line changes alter what you see or do on 0.1.0:
 
 | On 0.1.0 | These docs describe |
 |---|---|
-| A `default_config` pointing to a missing file makes every command without `--config` exit 1, `status`, `stop` and `config --clear-default` included; add `--config <any path>` to get past it | only commands that read the config fail (commands.md, Global options) |
+| A `default_config` pointing to a missing file makes every command without `--config` exit 1, `status`, `stop` and `config --clear-default` included; add `--config <any path>` to get past it | only commands that read the config fail (commands.md, Options for start) |
 | With a corrupt settings.json, `alias add` and `config --set-default/--clear-default` save the empty defaults over it, losing every alias | every command outside the tolerated group exits 3 before changing anything; the file is never rewritten from the defaults (commands.md, alias) |
 | A relative `log_file` / `--log-file` resolves against the working directory of the process that starts the instance; use absolute paths | relative paths resolve against `<home>` |
-| `--config` is used as given (no `~` expansion); a relative path is recorded relative, so `restart` or `restore` run from another directory cannot find it and `restore` deletes the record; pass absolute paths | `~` is expanded and the path made absolute (commands.md, Global options) |
+| `--config` is used as given (no `~` expansion); a relative path is recorded relative, so `restart` or `restore` run from another directory cannot find it and `restore` deletes the record; pass absolute paths | `~` is expanded and the path made absolute (commands.md, Options for start) |
 | `aproxy install VERSION --skills-only` is rejected; `--skills-only` always takes the channel's latest | a VERSION is accepted |
 | The hint about the client's stream idle timeout appears only after about 590 s of heartbeats and names Claude Code alone | it appears after 60 s for any client (troubleshooting.md) |
 | No heartbeats while a request or response transformer runs, so a slow format program can leave the client without a byte | transformers run within the heartbeat cycle (behaviors.md) |
@@ -250,10 +250,10 @@ start. Rename each key before the first start with the new CLI.
 The 0.1.x `upstream_url` name is older still and also no longer read; it is `base_url` in 0.2.0 and
 in 0.1.0's stable line (the "What these docs describe" table above).
 
-A rewrite that edits one key at a time with `aproxy config SETTER` and `aproxy config --unset OLD`
-is safe: an unknown key does not block unrelated edits, and `--unset` accepts any key, including
-one this version does not know. After the renames, `aproxy config --show` prints every effective
-value and exits 3 if anything is still wrong.
+A rewrite that edits one key at a time with `aproxy config set KEY VALUE` and
+`aproxy config unset OLD` is safe: an unknown key does not block unrelated edits, and `unset`
+accepts any key, including one this version does not know. After the renames, `aproxy config show`
+prints the file's values and exits 3 if anything is still wrong.
 
 If the binary was replaced while 0.1.x instances were still running, `aproxy status` lists them
 under `无响应的 aProxy 实例 (<n>)——进程仍在，但不应答控制通道` ("unresponsive instances: the process

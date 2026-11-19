@@ -22,6 +22,7 @@
 pub mod edit;
 pub mod file;
 pub mod resolve;
+pub mod view;
 
 use std::{collections::HashMap, path::PathBuf};
 

@@ -81,7 +81,7 @@ pub fn resolve_runtime_config(
         msg.push_str(&render_diagnostic(d));
     }
     msg.push_str(
-        "\n\n请修改后重试。上游地址可以这样设置:\n  aproxy config --baseurl https://api.anthropic.com",
+        "\n\n请修改后重试。上游地址可以这样设置:\n  aproxy config set base_url https://api.anthropic.com",
     );
     if let Some(path) = cfg_path {
         msg.push_str(&format!("\n  或手动编辑 {}", path.display()));

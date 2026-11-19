@@ -138,7 +138,7 @@ replaced, two live workers can share a number. In `spawn` mode it is always `0`.
 Caller-supplied data, passed through untouched. When the format is configured from config.toml it
 is always `""`: config.toml no longer has an `extra` key. Put configuration in the `env` table or in
 `args` instead. `env` values are available to your program as ordinary environment variables and
-are never printed by `aproxy config --show`; `args` are visible on the command line, so keep secrets
+are never printed by `aproxy config show`; `args` are visible on the command line, so keep secrets
 out of them. aProxy does not interpret either and does not expand `~` in them; if you pass a path,
 use an absolute one or expand `~` in your program. Each `[[format]]` entry has its own `args` and
 `env`.

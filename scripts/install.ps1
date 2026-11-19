@@ -209,8 +209,9 @@ function Install-AProxy {
         Write-Host ('  [Environment]::SetEnvironmentVariable(''Path'', $env:Path + '';' + $BinDir + ''', ''User'')')
     }
     Write-Host "下一步: 先配置上游（新装机没有 base_url，直接启动会失败），再启动："
-    Write-Host "  aproxy config --baseurl <上游地址> --api-key <密钥>"
-    Write-Host "  aproxy        （或完整路径 `"$exePath`"）"
+    Write-Host "  aproxy config set base_url <上游地址>"
+    Write-Host "  aproxy config set api_key <密钥>"
+    Write-Host "  aproxy start  （或完整路径 `"$exePath`" start）"
     Write-Host "状态: aproxy status    升级: aproxy install"
 }
 

@@ -151,6 +151,10 @@ fn parse_value(key: &str, raw: &str) -> Value {
             Ok(value) if raw.starts_with('"') || aproxy_ipc::redact::is_placeholder(&value) => {
                 value
             }
+            // 默认配置文件的路径展开 `~` 并按当前目录绝对化：它日后会在别的工作目录被读取
+            _ if key == "default_config" => {
+                Value::String(settings::expand_path(&raw).display().to_string())
+            }
             _ => Value::String(raw),
         };
     }

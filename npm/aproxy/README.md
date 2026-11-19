@@ -39,11 +39,12 @@ real state.
 ## Quick start
 
 ```sh
-# 1. Configure the upstream (writes ~/.aproxy/config.toml)
-aproxy config --baseurl https://api.anthropic.com --api-key sk-ant-...
+# 1. Configure the upstream (writes ~/.aproxy/config.toml; one key per command)
+aproxy config set base_url https://api.anthropic.com
+aproxy config set api_key sk-ant-...
 
 # 2. Start (background daemon)
-aproxy
+aproxy start
 
 # 3. Point your agent's API base URL at the local proxy
 #    https://api.anthropic.com  →  http://127.0.0.1:12345

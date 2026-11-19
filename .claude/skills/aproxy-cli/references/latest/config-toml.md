@@ -1,7 +1,7 @@
 # config.toml reference
 
 Every field of an instance's `config.toml`: type, default, what 0 or an empty value means, and how
-to choose a value; then how values combine with CLI flags and `settings.json`, what is checked at
+to choose a value; then how values combine with `start` override flags and `settings.json`, what is checked at
 start, and how values are normalized. Read it before writing or editing a config, or when a start
 fails with `配置错误` ("configuration error"). How each feature works at runtime is in
 behaviors.md; this file keeps only what you need to pick a value.
@@ -26,27 +26,26 @@ behaviors.md; this file keeps only what you need to pick a value.
 
 - **One file per instance.** The default config is `config.toml` in the aProxy home (`~/.aproxy/`,
   or the directory in `APROXY_HOME` when that is set), unless settings.json `default_config` names
-  another file. Each further instance has its own file, selected with `--config PATH`,
-  `aproxy start PATH` or an alias, and needs its own port in `listen_addr`, because instances are
+  another file. Each further instance has its own file, selected with `aproxy start PATH`,
+  `aproxy start --config PATH` or an alias, and needs its own port in `listen_addr`, because instances are
   identified by port. Keep extra configs in `~/.aproxy/configs/`: `aproxy find` and `aproxy doctor`
   scan it without setup (other directories: settings-json.md, `config_dirs`).
-- **Create or change a file with `aproxy config`, or by hand.** `aproxy config [--config PATH]
-  --baseurl URL --listen ADDR ...` writes the file and creates it if needed (all flags:
-  commands.md, `config`). Flags exist only for `base_url`, `listen_addr`, `api_key`,
-  `extra_headers`, `override_headers`, `keepalive.interval_secs` and the three proxy fields, plus
-  the repeatable `--unset KEY`; edit the rest by hand. A write changes only the target key and
-  keeps comments, key order and everything else in the file. Writes are serialized across
+- **Create or change a file with `aproxy config`, or by hand.** `aproxy config set KEY VALUE`
+  writes one key and creates the file if needed; `aproxy config --config PATH set KEY VALUE`
+  targets another file, and `aproxy config unset KEY` removes one key. Any dotted key path can be
+  set (the common ones: commands.md, `config`); array tables (`format`, `retry.rules`) can only be
+  set or removed as a whole. A write changes only the target key and keeps comments, key order and
+  everything else in the file. Writes are serialized across
   processes by a lock, and a change that would introduce a new error is refused with exit 3 while
   unrelated errors already in the file do not block it, so a broken file can be repaired one key
-  at a time. `--unset` removes any key, including one this version does not know; array tables
-  (`format`, `retry.rules`) can only be removed as a whole.
+  at a time. `unset` removes any key, including one this version does not know.
 - **Every key is checked strictly; an unknown key is an error.** A misspelled key, an old 0.1.x
   name, or a key from a later release produces `config_unknown_key`, naming the file, the key path
   and line:column, and the instance does not start. This is deliberate: an ignored matcher would
   make a retry rule wider than written, and silently dropping a key hides the typo until the
-  behavior matters. Remove a key you no longer want with `aproxy config --unset KEY`.
-- **A wrong type or value is an error too.** After editing, run `aproxy config --show [--config
-  PATH]`: it prints every effective value annotated with its source layer, then lists any
+  behavior matters. Remove a key you no longer want with `aproxy config unset KEY`.
+- **A wrong type or value is an error too.** After editing, run `aproxy config show --effective
+  [--config PATH]`: it prints every effective value annotated with its source layer, then lists any
   diagnostics as `file:line:col: key: message [code]` and exits 3 when the file has errors. The
   message is English; `[code]` is the stable part (see [Checks at start](#checks-at-start)).
 - **Apply a change with a restart.** An instance reads its config only when it starts. Run
@@ -55,7 +54,7 @@ behaviors.md; this file keeps only what you need to pick a value.
 - **Check without applying.** `aproxy doctor` validates every config an alias points to and every
   other `*.toml` in the config directories, but not the default config unless an alias points to
   it. For the default config, `aproxy restart` or `aproxy start` is the check, and `aproxy config
-  --show` reports its diagnostics without starting anything.
+  show --effective` reports its diagnostics without starting anything.
 
 ## Example
 
@@ -120,14 +119,15 @@ nesting in the `defaults` section of settings.json, whose built-in value is show
 
 Highest first:
 
-1. **Run-only CLI flags** `--baseurl`, `--listen`, `--proxy`, `--api-key` and `--log-file`, given
-   to `aproxy` before any subcommand, as in `aproxy --listen 127.0.0.1:12399 start work` (syntax:
-   commands.md). They are never written to a file, but they become part of the instance's launch
+1. **`start` override flags** `--base-url`, `--listen-addr`, `--proxy`, `--api-key` and
+   `--log-file`, given to `aproxy start`, as in `aproxy start --listen-addr 127.0.0.1:12399 work`
+   (syntax: commands.md, "Options for start"). They are never written to a file, but they become
+   part of the instance's launch
    spec, so `aproxy restart`, `aproxy restore` and watchdog restarts keep applying them.
    To drop one, stop the instance and start it again without the flag. Prefer the file over
    `--api-key`: the flag is visible in the shell history and is stored in plain text in the
    desired-state record (owner-only), even though it no longer appears on the instance's command
-   line.
+   line; `--api-key -` reads the key from stdin instead.
 2. **config.toml.**
 3. **The `defaults` section of settings.json.** It can hold any key of this file except
    `listen_addr`, `log_file` and `format`, under the same name and nesting, written as JSON
@@ -147,19 +147,19 @@ config.toml and `defaults`, with config.toml winning a conflict. `listen_addr`, 
 `base_url` points at the same target as `defaults.base_url`; `defaults.proxy_username` and
 `defaults.proxy_password` only when its final `proxy` names the same scheme, host and port as
 `defaults.proxy`. Otherwise they are withheld — a key meant for one vendor's API must not be sent to
-another. Everything else, including non-secret headers, is inherited as usual. `aproxy config --show`
-lists what was withheld and warns when the instance ends up with no credential of its own;
-settings-json.md, "Credentials in defaults follow their target", describes the comparison and which
-header names are recognized as secrets.
+another. Everything else, including non-secret headers, is inherited as usual.
+`aproxy config show --effective` lists what was withheld and warns when the instance ends up with no
+credential of its own; settings-json.md, "Credentials in defaults follow their target", describes the
+comparison and which header names are recognized as secrets.
 
-`aproxy config --show` prints each effective value with its source layer: `config.toml`,
+`aproxy config show --effective` prints each effective value with its source layer: `config.toml`,
 `settings.json 全局默认` (settings.json global default), `环境变量` (environment, `proxy` only),
-`内置默认` (built-in default) or `未设置` (unset). Run-only CLI flags are not visible to it; they
+`内置默认` (built-in default) or `未设置` (unset). `start` override flags are not visible to it; they
 are described in step 1 above.
 
 `proxy` has one extra source: with no `proxy` in either layer, the HTTP client reads the usual
 environment variables (`HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`, `ALL_PROXY`,
-`all_proxy`), and `--show` reports the source as `环境变量`.
+`all_proxy`), and `show --effective` reports the source as `环境变量`.
 
 ## Fields
 
@@ -229,8 +229,10 @@ override_headers = { "user-agent" = "my-agent/1.0" }
 - An entry whose name or value is not a legal HTTP header (a space in the name, a line break in the
   value) is skipped without any message; verify the upstream receives a header that matters. Do not
   list one header twice with different capitalization: which entry wins is unspecified.
-- CLI: `aproxy config --extra-header KEY=VALUE` and `--override-header KEY=VALUE` (repeatable) add
-  entries; `--clear-headers` empties both tables.
+- CLI: `aproxy config set extra_headers.KEY VALUE` and `aproxy config set override_headers.KEY
+  VALUE` add entries one at a time; `aproxy config unset extra_headers` and `aproxy config unset
+  override_headers` empty both tables. Quote a header name that contains dots, as in
+  `extra_headers."x.y"`.
 
 ### proxy / proxy_username / proxy_password
 
@@ -245,7 +247,8 @@ daemon inherited from the shell that started it (`HTTP_PROXY`, `HTTPS_PROXY`, `A
   `proxy_username` is ignored. Username or password without `proxy` fails start.
 - Downloads by `aproxy install` do not use this; they use settings.json
   `update.download_proxy`.
-- `aproxy config --clear-proxy` clears all three fields.
+- `aproxy config unset proxy` clears the URL; also `unset proxy_username` and `unset
+  proxy_password` when they were set.
 
 ### max_request_mb
 
@@ -304,10 +307,10 @@ heartbeat = ": keepalive\n\n"
 
 - `interval_secs` (default 15): the heartbeat period, and also how long aProxy waits for upstream
   headers before sending its own. Keep it below the shortest byte-level idle timeout between
-  client and aProxy. `0` turns keepalive off for the instance. CLI: `aproxy config
-  --keepalive-secs N` writes this key.
+  client and aProxy. `0` turns keepalive off for the instance. CLI: `aproxy config set
+  keepalive.interval_secs N` writes this key.
 - `trigger` (default `"any"`, or settings.json `defaults.keepalive.trigger`): which
-  requests qualify. No CLI flag.
+  requests qualify. Set it with `aproxy config set keepalive.trigger VALUE`.
 
 | Value | A request qualifies when |
 |---|---|
@@ -331,8 +334,9 @@ may ask for it per request.
   Claude Code drops both comments and `ping` events, so raise its timeout instead (clients.md).
   The value must leave the client's SSE parser at an event boundary, or the heartbeat merges with
   the first replayed event: it must be non-empty, end with a line break, and, if it has any field
-  line (`event:`, `data:` and so on), end with a blank line. `aproxy config --show` prints it with
-  `\n` escapes. No CLI flag.
+  line (`event:`, `data:` and so on), end with a blank line. `aproxy config show` prints it with
+  `\n` escapes. Set it with `aproxy config set keepalive.heartbeat VALUE` and a value starting with
+  `"` when it must contain newlines.
 - No keepalive for requests that do not qualify (notably `"stream": false`: the client's own
   timeout must cover the whole generation), for `delivery = "forward"` instances, and when
   `interval_secs = 0`.
@@ -428,7 +432,7 @@ Enable it only for a trusted upstream when the client needs true incremental str
 - Cannot be combined with any `[[format]]`: forward does not buffer the body and a format needs all
   of it. Start fails with `config_conflict` on `delivery`, also when `"forward"` comes from
   settings.json `defaults.delivery`.
-- No CLI flag. When it is on, `aproxy start` prints `仅转发模式：不缓冲、不重试` ("forward-only mode: no
+- Set it with `aproxy config set delivery "forward"`. When it is on, `aproxy start` prints `仅转发模式：不缓冲、不重试` ("forward-only mode: no
   buffering, no retries").
 
 Runtime details: behaviors.md, "Forward-only mode".
@@ -493,7 +497,7 @@ The path of the instance's daemon log. Unset (the default), every start, restart
 a new file with a random name in `<APROXY_HOME>/logs/`. The name carries no port, so get the path
 from `aproxy status` or `aproxy logs` rather than guessing it.
 
-- Precedence: `--log-file PATH` (that run) > `log_file` > random name. There is no settings.json
+- Precedence: `--log-file PATH` (a `start` option, that run) > `log_file` > random name. There is no settings.json
   default; each instance chooses its own.
 - `~` expands to the user's home directory; a relative path is resolved against `<APROXY_HOME>`,
   never against the working directory, which differs between `start`, `restart` and watchdog
@@ -566,10 +570,10 @@ stages = ["heartbeat"]
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `name` | string | file stem of `command` | Identifies the format in `--show`, logs and the error body's `details.format`; must be unique |
+| `name` | string | file stem of `command` | Identifies the format in `config show`, logs and the error body's `details.format`; must be unique |
 | `command` | string | required | The program. Run directly, not through a shell. A leading `~` expands to the user's home directory; a bare name is looked up on `PATH`. |
 | `args` | array of strings | `[]` | Arguments, passed verbatim (no `~` expansion). |
-| `env` | table of strings | `{}` | Extra environment variables for the program. `--show` lists the names only, never the values. |
+| `env` | table of strings | `{}` | Extra environment variables for the program. `config show` lists the names only, never the values. |
 | `process` | `"spawn"` \| `"persistent"` | `"spawn"` | `spawn`: a new process per message. `persistent`: a pool of long-running workers; required when the program keeps state between requests (key rotation, counters). |
 | `stages` | array of strings | required, non-empty | Which stages this format serves (see below). |
 | `required` | boolean | `true` | Parsed and validated; no effect in this version. |
@@ -626,8 +630,8 @@ troubleshooting.md.
 
 ## Checks at start
 
-`aproxy start`, and the precheck of `aproxy restart`, load the file strictly, apply CLI flags and
-settings.json defaults, and check the result. On failure the instance does not start and the error
+`aproxy start`, and the precheck of `aproxy restart`, load the file strictly, apply `start` override
+flags and settings.json defaults, and check the result. On failure the instance does not start and the error
 reads `配置错误:` ("configuration error") followed by one line per error:
 
 ```
@@ -637,12 +641,12 @@ reads `配置错误:` ("configuration error") followed by one line per error:
 Parts that do not apply are omitted (`<file>: <message> [<code>]` when there is no position, and
 no `<key>:` when the problem is the file itself). When the bad value came from settings.json, the
 line names settings.json and the key under `defaults.` instead of the toml file. `aproxy config
---show` prints the same diagnostics on stderr and exits 3.
+show` prints the same diagnostics on stderr and exits 3.
 
 | Code | Meaning and fix |
 |---|---|
 | `config_syntax` | Not valid TOML. The message includes the parser's location. |
-| `config_unknown_key` | A key this version does not know, including every old 0.1.x name. Remove it with `aproxy config --unset KEY` or rename it (compatibility.md lists the renames). |
+| `config_unknown_key` | A key this version does not know, including every old 0.1.x name. Remove it with `aproxy config unset KEY` or rename it (compatibility.md lists the renames). |
 | `config_type` | The value has the wrong type, for example a string where an integer belongs. |
 | `config_invalid_value` | A value outside its allowed set: `delivery` not `forward`/`retry`, `keepalive.trigger = "always"`, an invalid regex, a status outside 100-599, `pool_max = 0`, `breaker_cooldown_secs = 0`, a bad `base_url`, or a `keepalive.heartbeat` that breaks SSE framing. |
 | `config_missing_key` | A required key is absent: `base_url` at start, `max_attempts` in a retry rule, `command` or `stages` in a format. |

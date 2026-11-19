@@ -495,8 +495,9 @@ main() {
             ;;
     esac
     echo "下一步: 先配置上游（新装机没有 base_url，直接启动会失败），再启动："
-    echo "  aproxy config --baseurl <上游地址> --api-key <密钥>"
-    echo "  aproxy        （或完整路径 \"$BIN_DIR/$BIN_NAME\"）"
+    echo "  aproxy config set base_url <上游地址>"
+    echo "  aproxy config set api_key <密钥>"
+    echo "  aproxy start  （或完整路径 \"$BIN_DIR/$BIN_NAME\" start）"
     echo "状态: aproxy status    升级: aproxy install"
 }
 

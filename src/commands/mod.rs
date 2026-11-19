@@ -28,7 +28,7 @@ use aproxy::settings as app_settings;
 /// 配置会让用户在错误的配置文件上排障。但只有真正要读配置的命令（启动、
 /// `config` 查看/修改内容）才兑现这个 Err（见 `require_cfg_path`）——status、
 /// stop、doctor、自动拉起的 `install --continue` 等与配置文件无关的命令不能被
-/// 一个失效的 default_config 拦住，报错里推荐的 `aproxy config --clear-default`
+/// 一个失效的 default_config 拦住，报错里推荐的 `aproxy settings unset default_config`
 /// 自己更必须能执行。
 ///
 /// 显式给的路径在此展开 `~` 并按当前工作目录绝对化：这个路径会被转发给
@@ -48,7 +48,7 @@ pub(crate) fn resolve_cfg_path(explicit: Option<&std::path::Path>) -> Result<Pat
                 Ok(path)
             } else {
                 Err(format!(
-                    "settings.json 指定的默认配置文件不存在: {}\n用 aproxy config --set-default <路径> 重新指定，或 aproxy config --clear-default 取消",
+                    "settings.json 指定的默认配置文件不存在: {}\n用 aproxy settings set default_config <路径> 重新指定，或 aproxy settings unset default_config 取消",
                     path.display()
                 ))
             }

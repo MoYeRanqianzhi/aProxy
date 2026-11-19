@@ -9,7 +9,7 @@ troubleshooting.md.
 
 - [Before you run commands](#before-you-run-commands): home directory, isolated experiments,
   targets, output, exit codes, processes
-- [Global options](#global-options)
+- [Options for start](#options-for-start)
 - [start](#start) · [status](#status) · [stop](#stop) · [restart](#restart) · [logs](#logs) ·
   [restore](#restore)
 - [alias](#alias) · [find](#find) · [doctor](#doctor) · [config](#config) · [settings](#settings)
@@ -57,7 +57,8 @@ port that no other instance uses:
 ```sh
 # POSIX shell; keep these in one command line if each tool call gets a fresh shell
 export APROXY_HOME="$(mktemp -d)"
-aproxy config --baseurl https://api.example.com --listen 127.0.0.1:18080
+aproxy config set base_url https://api.example.com
+aproxy config set listen_addr 127.0.0.1:18080
 aproxy start && aproxy status
 aproxy stop 18080
 ```
@@ -91,36 +92,39 @@ instance on 12345. Address test instances only by their own port there.
 
 A number is always a port. Anything else is tried as an alias, then as `default`, then as a file
 path. Alias names may not be numbers or reserved words, so these forms never collide. When two
-running instances share one config file (started with different `--listen`), an alias or path
+running instances share one config file (started with different listen addresses), an alias or path
 reaches only one of them; use ports.
 
 ### Output and exit codes
 
 - Messages are in Chinese; this file quotes them verbatim with an English gloss. Results go to
   stdout, errors to stderr. The Windows console is switched to UTF-8 at startup.
-- Credentials are masked everywhere: keys and header values keep their first 6 characters then
-  `***`; URLs lose their userinfo (`***@`) and query values (`?key=***`).
+- Secrets are never printed. A redacted secret prints as `<secret>` in text, or as
+  `<secret sk-a…f3a9>` when it is at least 24 characters long (first and last four characters);
+  `--json` prints `{"secret":true}` with a `"hint"` field in the same form. URLs lose their
+  userinfo (`***@`) and query values (`?key=***`).
 - Every command checks `<home>/settings.json` at startup, before doing anything else. When it is
   invalid, `settings …` and `doctor` work normally, `status`, `stop` and `install`/`upgrade` run on
   built-in defaults with `[WARN]` lines (aliases unavailable), and every other command prints the
   errors as `[ERROR]` lines with repair hints and exits 3. settings-json.md, "When settings.json is
   invalid", lists which command falls in which group.
-- Argument errors exit 2. `aproxy <command> --help` prints the options (in Chinese).
+- Argument errors exit 2. `aproxy <command> --help` prints the options (in Chinese). A bare
+  `aproxy` with no command prints the help and exits 2; write `aproxy start` to start an instance.
 
 The table below describes a command's own outcome, assuming a valid settings.json; the startup
 check above can end a command with exit 3 before it runs (except the tolerated commands).
 
-| Command | Exit 0 | Exit 1 |
+| Command | Exit 0 | Failure |
 |---|---|---|
-| start, bare `aproxy` | started; already running on that port; a port-0 listener was started and the OS-assigned port reported | the config cannot be resolved, validated or bound, or the instance is not ready in 30 s |
+| start | started; already running on that port; a port-0 listener was started and the OS-assigned port reported | the config cannot be resolved, validated or bound, or the instance is not ready in 30 s |
 | status, find | always | never |
 | stop | every target confirmed stopped; nothing running for no target, `all` or `idle` | a stop not confirmed or `--force` failed; several instances and no target; unknown alias or port; target not running; target hung and no `--force` |
 | restart | every target restarted; nothing running for no target, `all` or `idle` | any target failed; target cannot be resolved |
-| logs | the followed instance stopped; nothing running | `all`, ambiguous or unknown target, foreground instance, unreadable log |
+| logs | the requested lines printed; with `-f`, the followed instance stopped; nothing running | `all`, ambiguous or unknown target, foreground instance, unreadable log |
 | restore | always, even when an instance fails to come back | never |
 | alias | success | invalid name, missing file, unknown alias, write failure (exit 3 instead when settings.json itself is invalid, before the command runs) |
 | doctor | always, **even when it reports errors** | never |
-| config | success | a missing config file on read or a write failure (1), a malformed key path (2), or a TOML syntax error / a change that introduces a config error (3) |
+| config | the values printed or the change saved | 1: write conflict or I/O failure; 2: a malformed key path or a value that is not TOML; 3: the result would be invalid, an unknown key, or the file has errors (`show` still prints, then exits 3); 4: the file does not exist (`get`, or `show` with an explicit `--config`) |
 | settings | show/get printed, set/unset stored or unchanged | a malformed key path or unparsable JSON value (2); the file cannot be read, or the change would make it invalid (3); write failure (1) |
 | desktop | the window was closed; a window is already open for this home; on Windows from a terminal, the window was opened | headless build; no web view runtime or no display; the window failed to start |
 | install | installed; already latest; channel empty; nothing to abort | any failure |
@@ -149,52 +153,57 @@ its desired-state record (owner-only permissions, like the handoff).
 aProxy version may start this one through `__serve`, so the names and their two arguments are
 fixed across versions.
 
-## Global options
+## Options for start
 
-| Option | Position | Effect |
-|---|---|---|
-| `--config PATH` | anywhere | config file for this command (see resolution below) |
-| `--log-file PATH` | anywhere | log file for the instance being started; overrides `log_file` |
-| `--foreground` | before the subcommand | run in this console instead of the background |
-| `--baseurl URL` | before the subcommand | overrides `base_url` for the instance being started |
-| `--listen ADDR` | before the subcommand | overrides `listen_addr` |
-| `--proxy URL` | before the subcommand | overrides `proxy` |
-| `--api-key KEY` | before the subcommand | overrides `api_key` |
-| `-h, --help` / `-V, --version` | | help / print `aproxy v<version> (<variant>; <target>[; x86-64-v3])` (compatibility.md) |
+Only `start` takes start options; each other command lists its own options with it. A bare
+`aproxy` prints the help and exits 2, so write `aproxy start`.
 
-- Only `--config` and `--log-file` may follow a subcommand. Write
-  `aproxy --listen 127.0.0.1:12346 start work`; `aproxy start work --listen …` is rejected.
+| Option | Effect |
+|---|---|
+| `ALIAS\|PATH` (positional) | the config to start: an alias, a config path, or `default`; omitted, the default config |
+| `--config PATH` | the config to start, equivalent to the positional path; force install prints this form in its recovery command |
+| `--base-url URL` | overrides `base_url` for the instance being started |
+| `--listen-addr ADDR` | overrides `listen_addr` |
+| `--proxy URL` | overrides `proxy` |
+| `--api-key KEY\|-` | overrides `api_key`; `-` reads one line from stdin |
+| `--log-file PATH` | log file for the instance being started; overrides `log_file` |
+| `--foreground` | run in this console instead of the background |
+| `-h, --help` / `-V, --version` | help / print `aproxy v<version> (<variant>; <target>[; x86-64-v3])` (compatibility.md) |
+
+- The positional target, `--config`, `--foreground` and the overrides all belong to `start`.
 - The override options matter only when starting. They are not written to config.toml, but they
   become part of the instance's launch spec (in its desired-state record), so `restart`, `restore`,
-  the watchdog and `install` reuse them. `config --show` does not show them; `status` shows the
-  effective listen address and upstream.
+  the watchdog and `install` reuse them. `config show` and `config show --effective` do not show
+  them; `status` shows the effective listen address and upstream.
 - `--api-key` does not appear on the instance's or the watchdog's command line: it travels in the launch-spec file and
   the desired-state record, both readable only by the current user. It is still in the shell history
   and briefly on the `aproxy start` command line, and it is stored in plain text in the record, so a
-  backup or a copied home contains it; prefer config.toml for long-lived keys.
+  backup or a copied home contains it; prefer config.toml for long-lived keys, and `--api-key -`
+  when the key must not appear on the command line at all.
 - The proxy environment (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and their lowercase
   forms on Unix) and `PATH` of the shell that runs `start` are captured in the launch spec.
   `restart`, `restore` and watchdog respawns therefore reach the network the same way and find the
   same format programs, even when they run from another shell. Change the environment by stopping
   and starting the instance again.
-- `--config` expands `~` and turns a relative path into an absolute one against the current
+- `start` expands `~` and turns a relative config path into an absolute one against the current
   directory; the instance records that absolute path. `--log-file` expands `~` and resolves a
   relative path against `<home>`, like `log_file`.
 
-**Which config file a command uses:** the `start` target, else `--config`, else `default_config`
-from settings.json, else `<home>/config.toml`. If `default_config` points to a file that no
-longer exists, the commands that need the config exit 1 with
+**Which config file a command uses:** `start` uses its positional target, else `--config`, else
+`default_config` from settings.json, else `<home>/config.toml`. `config …` uses its own `--config`
+(an alias or a path), else `default_config`, else `<home>/config.toml`. If `default_config` points
+to a file that no longer exists, the commands that need the config exit 1 with
 `settings.json 指定的默认配置文件不存在: <path>` ("the default config named in settings.json does
-not exist"): bare `aproxy`, `aproxy start` without a target, and `aproxy config` showing or
-editing a toml without `--config`. Every other command is unaffected; repair the setting with
-`aproxy config --set-default PATH` or `aproxy config --clear-default`.
+not exist"): `aproxy start` without a target and `aproxy config …` without `--config`. Every other
+command is unaffected; repair the setting with `aproxy settings set default_config PATH` or
+`aproxy settings unset default_config`.
 
 ## start
 
 ```
-aproxy [OPTIONS]                       # start the default config in the background
-aproxy [OPTIONS] start [ALIAS|PATH]    # start a specific config
-aproxy --foreground [start [ALIAS|PATH]]
+aproxy start [OPTIONS] [ALIAS|PATH]   # start a config; the default config when no target is given
+aproxy start --config PATH [OPTIONS]  # the same, with the path as an option
+aproxy start --foreground [ALIAS|PATH]
 ```
 
 What `start` checks, in order:
@@ -203,11 +212,11 @@ What `start` checks, in order:
    old 0.1.x name), an invalid value or a `listen_addr` without a valid port stops here with exit
    1, printing `配置错误: …` ("config error") followed by one `file:line:col: key: message [code]`
    line per problem; the codes are listed in config-toml.md, "Checks at start". A fresh install has no `base_url`, so
-   run `aproxy config --baseurl URL [--api-key KEY]` before the first start. Field rules:
-   config-toml.md. When neither `--config` nor a target is given and `<home>/config.toml` does not
-   exist, the instance starts with no config file: the override flags and settings.json
-   `defaults` supply everything, and `base_url` must come from one of them. Such an instance can
-   still be restarted and restored.
+   run `aproxy config set base_url URL` and `aproxy config set api_key KEY` before the first start.
+   Field rules: config-toml.md. When `start` is given neither `--config` nor a positional target and
+   `<home>/config.toml` does not exist, the instance starts with no config file: the override flags
+   and settings.json `defaults` supply everything, and `base_url` must come from one of them. Such
+   an instance can still be restarted and restored.
 2. **Same port.** If an aProxy instance already answers on the port with the same listen address,
    `start` prints `此端口已有 aProxy 在运行，无需重复启动：` ("already running on this port") and
    exits 0, so repeating `start` is safe. With a different listen address it refuses
@@ -277,7 +286,7 @@ time. `status` does not print log paths; see [logs](#logs).
 
 ```
 aproxy stop [PORT|ALIAS|PATH|default|all] [--force]
-aproxy stop idle [SECS] [--force]
+aproxy stop idle [--idle-threshold-secs SECS] [--force]
 ```
 
 Before stopping anything, run `aproxy status` and name the instance. Your own client may be
@@ -317,8 +326,10 @@ asking.
   desired-state records of instances that are already gone
   (`已删除不在运行的实例留下的期望状态记录（端口 …）。`) and leaves records it cannot read in
   place, saying which and why.
-- **`stop idle [SECS]`** stops instances idle for at least SECS (default
-  `instances.idle_threshold_secs`). A small SECS can include instances in active use. Prints `没有闲置超过 <n> 秒的实例。` ("no
+- **`stop idle --idle-threshold-secs SECS`** stops instances idle for at least SECS (default
+  `instances.idle_threshold_secs`). `--idle-threshold-secs` is valid only with the `idle` target; on
+  any other target it is a usage error (exit 2). A small SECS can include instances in active
+  use. Prints `没有闲置超过 <n> 秒的实例。` ("no
   instance idle longer than n s") when none qualify. The instance itself re-checks its idle time
   when the stop arrives: one that received a request after it was selected is left running, with
   `pid <pid>（端口 <port>）刚才又收到了请求（已闲置 <n> 秒），不再算闲置，未停止` ("just received a
@@ -335,7 +346,7 @@ asking.
 
 ```
 aproxy restart [PORT|ALIAS|PATH|default|all] [--force]
-aproxy restart idle [SECS] [--force]
+aproxy restart idle [--idle-threshold-secs SECS] [--force]
 ```
 
 Restarts running instances from their launch specs, which is how config.toml edits take effect.
@@ -380,24 +391,27 @@ your connection to the model.
 ## logs
 
 ```
-aproxy logs [PORT|ALIAS|PATH|default]
+aproxy logs [PORT|ALIAS|PATH|default] [-n N] [-f]
 ```
 
-Prints the last 30 lines of the instance's log and then follows it until the instance stops
-(`实例已停止，日志跟踪结束。`, "instance stopped, following ended") or you press Ctrl+C. It asks the
-instance for its log path, because log files get a new random name at every start.
+Prints the instance's most recent log lines (200 by default) and exits. `-n N` / `--lines N` sets
+the count; `-f` / `--follow` keeps printing new lines until the instance stops
+(`实例已停止，日志跟踪结束。`, "instance stopped, following ended") or you press Ctrl+C. Log lines
+go to stdout; the explanatory lines (`日志文件: <path>`, the follow notice) go to stderr, so a
+program reading the pipe receives only log lines. It asks the instance for its log path, because
+log files get a new random name at every start.
 
-- **It does not return while the instance runs.** In a non-interactive tool call, run it with a
-  timeout (`timeout 5 aproxy logs 12345` in a POSIX shell, Git Bash included), take the path from
-  its `日志文件: <path>` ("log file") line and read that file directly. The same path is the
-  `log_path` field of the instance record `<home>/run/<port>.instance.json` (one line of JSON; `null`
-  for a foreground instance).
+- **Without `-f` it returns by itself**, so it suits a tool call. With `-f` it does not return while
+  the instance runs: run it with a timeout (`timeout 5 aproxy logs -f 12345` in a POSIX shell, Git
+  Bash included), take the path from its `日志文件: <path>` ("log file") line and read that file
+  directly. The same path is the `log_path` field of the instance record
+  `<home>/run/<port>.instance.json` (one line of JSON; `null` for a foreground instance).
 - Several instances and no target exit 1; `all` is refused (`aproxy logs 不支持 all…`).
 - A `--foreground` instance has no log file:
   `该实例以前台模式运行（--foreground），日志输出在它的控制台…` ("runs in foreground; its log is in
   its console").
 - `── 日志文件已被截断，重新从头跟踪 ──` ("log file truncated, following from the start") appears
-  when log rotation empties the file.
+  while following when log rotation empties the file.
 
 ## restore
 
@@ -443,7 +457,8 @@ can address an instance by name even after its port changes.
   `idle`, `default`, `defult` in any case. Lookup is case-sensitive.
 - `remove` deletes the name only; a running instance keeps running. An unknown name exits 1.
 
-`alias add/remove` and `config --set-default/--clear-default` edit only their own key in
+`alias add/remove` and `settings set default_config` / `settings unset default_config` edit only
+their own key in
 settings.json through the same writer as `aproxy settings`: the rest of the file, including key order
 and any `ui` content, is kept, and a key this version does not know stays in the file (it is an
 error, not something the write may drop). A change that would introduce an error is refused and
@@ -486,66 +501,87 @@ it fully, give it an alias (`aproxy alias add main <path>`; without a path the a
 ## config
 
 ```
-aproxy [--config PATH] config [--show]
-aproxy [--config PATH] config SETTER...
-aproxy config --set-default PATH | --clear-default
+aproxy config [--config ALIAS|PATH] show [--effective] [--json]
+aproxy config [--config ALIAS|PATH] get KEY [--json]
+aproxy config [--config ALIAS|PATH] set KEY VALUE|- [--json]
+aproxy config [--config ALIAS|PATH] unset KEY [--json]
 ```
 
-Reads or edits one config.toml: `--config`, else `default_config`, else `<home>/config.toml`.
-Without setters it prints the effective values, as `--show` does.
+`--config` names the file to read or edit, by alias or path, and may go before or after the
+subcommand: `aproxy config --config work set listen_addr 127.0.0.1:12346` and `aproxy config get
+base_url --config work` are the same command. Without it the default config file is used. A `set`
+creates the file and its parent directories; `get` exits 4 when the file does not exist, and so does
+`show` when `--config` named the missing file explicitly (the default path may legitimately be
+absent before the first configuration).
 
-| Option | Effect |
+- **`show`** prints the values written in the file, with secrets masked. `--effective` also fills in
+  the keys the file does not write from the settings.json global defaults and the built-in
+  defaults, marks each value's source (`config.toml`, `settings.json 全局默认`, `环境变量`,
+  `内置默认` or `未设置`), and lists credentials withheld from a global default. If the file has
+  errors, `show` still prints the values, then lists the diagnostics on stderr as
+  `file:line:col: key: message [code]` and exits 3.
+- **`get KEY`** prints one key's effective value, with the layer it comes from.
+- **`set KEY VALUE`** changes one key; **`unset KEY`** removes one key. One key per command, so
+  setting several keys takes several commands.
+
+The keys the CLI most often writes, as spelled in config.toml:
+
+| KEY | Effect |
 |---|---|
-| `--show` | print every effective value with the layer it comes from and secrets masked; combine with setters to print the result |
-| `--baseurl URL` | `base_url`; a trailing `/` is removed; must start with `http://` or `https://` and contain no `?` or `#` (checked before saving) |
-| `--listen ADDR` | `listen_addr`; checked only at start |
-| `--api-key KEY` / `--clear-api-key` | set or remove `api_key` (what it injects: config-toml.md) |
-| `--extra-header K=V` | add or replace an `extra_headers` entry: sent only when the request lacks that header; repeatable |
-| `--override-header K=V` | add or replace an `override_headers` entry: always replaces the header; repeatable |
-| `--clear-headers` | empty both header maps, before any header given in the same command is added |
-| `--keepalive-secs N` | `[keepalive] interval_secs`; `0` turns heartbeats off |
-| `--proxy URL` | upstream proxy, e.g. `http://127.0.0.1:7890` or `socks5://user:pass@127.0.0.1:7890` |
-| `--proxy-username U`, `--proxy-password P` | proxy credentials; take precedence over those in the URL |
-| `--clear-proxy` | remove proxy URL, username and password |
-| `--unset KEY` | remove one key; repeatable. `KEY` is a dotted key path such as `timeouts.connect_secs` or `extra_headers."x-foo"`; it may name a key this version does not know, and array tables (`format`, `retry.rules`) can only be removed as a whole |
-| `--set-default PATH` | set `default_config` in settings.json; the file must exist |
-| `--clear-default` | remove `default_config` |
+| `base_url` | upstream base URL; a trailing `/` is ignored; must start with `http://` or `https://` and contain no `?` or `#` (checked before saving) |
+| `listen_addr` | listen address; checked only at start |
+| `api_key` | the key injected as `Authorization: Bearer` (what it injects: config-toml.md); `set api_key -` reads it from stdin |
+| `extra_headers.NAME` | send a header only when the request lacks it |
+| `override_headers.NAME` | always replace the header |
+| `keepalive.interval_secs` | heartbeat interval; `0` turns heartbeats off |
+| `proxy` | upstream proxy, e.g. `http://127.0.0.1:7890` or `socks5://user:pass@127.0.0.1:7890` |
+| `proxy_username`, `proxy_password` | proxy credentials; take precedence over those in the URL |
 
+- Quote a header name that contains dots: `aproxy config set extra_headers."x.y" v`. Any other key
+  is a dotted key path such as `timeouts.connect_secs`; array tables (`format`, `retry.rules`) can
+  only be set or removed as a whole.
+- **Values are TOML.** `true`, `30`, `["a"]`, `{ k = 1 }` are read as TOML; a key whose type is a
+  string accepts raw text without quotes (`aproxy config set base_url https://api.example.com`),
+  and a value starting with `"` is parsed as a TOML string literal (for a newline, as in
+  `keepalive.heartbeat`). Only known keys can be set.
 - **Setters edit only the target key.** Comments, key order and everything else in the file are
-  preserved. A missing file, and its parent directories, are created; this is how a config for a
-  new instance is made. Writes are serialized across processes with a lock in `<home>/run/`.
+  preserved. Writes are serialized across processes with a lock in `<home>/run/`.
 - **A change that would introduce a new error is refused**, with the diagnostics and exit 3; the
   file is not written. Errors already in the file that this edit does not touch do not block it, so
-  a broken file can be repaired one key at a time (`--unset` is the way to delete an unknown key).
-  A file with a TOML syntax error cannot be edited at all: fix the syntax first (exit 3).
-- Empty values for `--api-key`, `--proxy`, `--proxy-username` and `--proxy-password` are rejected;
-  use the `--clear-…` options. `--set-default` and `--clear-default` cannot be combined, and when
-  either is given, other setters in the same command are ignored.
-- **Running instances do not pick up changes.** Run `aproxy restart PORT|ALIAS` afterwards.
-- `--show` (and a bare `aproxy config`) reads the file, not a running instance: one-off start
-  options and edits not yet applied are invisible to it. Every value is printed with its source
-  layer (`config.toml`, `settings.json 全局默认`, `环境变量`, `内置默认` or `未设置`), so a value
-  inherited from settings.json is shown as effective, not left out. If the file has
-  errors, `--show` still prints every value, then lists the diagnostics on stderr as
-  `file:line:col: key: message [code]`, suggests `aproxy config --unset '<key>'` for unknown keys,
-  and exits 3. Reading a missing file named by `--config` exits 1 with `指定的配置文件不存在`.
-- Credentials in settings.json `defaults` are inherited only by an instance whose final `base_url`
-  (or `proxy`) points at the same target as the default's. When it does not, `--show` prints a
-  `全局默认里的这些凭据没有继承…` ("these credentials in the global defaults were not inherited")
-  block naming each withheld key and both targets, and warns with `default_credential_withheld` when
-  the instance has no credential of its own. settings-json.md, "Credentials in defaults follow their
-  target", explains the comparison and which header names count as credentials.
+  a broken file can be repaired one key at a time. A file with a TOML syntax error cannot be edited
+  at all: fix the syntax first (exit 3).
+- **Running instances do not pick up changes.** `set` prints the `aproxy restart <port>` command for
+  every running instance that uses this file on stderr, and `--json` returns the ports in
+  `instances_to_restart`; run the restart for the change to take effect.
+- **`show` and `get` read the file, not a running instance:** one-off `start` options and edits not
+  yet applied are invisible to them. `show --effective` reports what an instance started from this
+  file would use.
+- **Secrets are never printed.** `show` and `get` print a secret as `<secret>` or, at 24 characters
+  or more, `<secret sk-a…f3a9>`; `--json` prints `{"secret":true}` with a `"hint"`. Writing that
+  placeholder back through `set` keeps the stored value. Credentials in settings.json `defaults`
+  are inherited only by an instance whose final `base_url` (or `proxy`) points at the same target as
+  the default's. When it does not, `show --effective` prints a `全局默认里的这些凭据没有继承…`
+  ("these credentials in the global defaults were not inherited") block naming each withheld key
+  and both targets, and warns with `default_credential_withheld` when the instance has no credential
+  of its own. settings-json.md, "Credentials in defaults follow their target", explains the
+  comparison and which header names count as credentials.
 - Format `args` values after `--api-key`, `--api_key`, `--apikey`, `--key`, `--token`,
-  `--secret` or `--password` are masked in `--show`; `env` is shown as names only, never values.
+  `--secret` or `--password` are masked in `show`; `env` is shown as names only, never values.
 - Most fields (timeouts, retry, disk cache, `delivery`, `[keepalive]`, `[history]`, allow-lists,
-  `log_file`, `[[format]]`, size limits) have no dedicated option: edit config.toml
-  (config-toml.md) or the settings.json global default (settings-json.md). Use `--unset` to delete
-  a key, including an unknown one.
+  `log_file`, `[[format]]`, size limits) have no shortcut of their own: edit config.toml
+  (config-toml.md) or the settings.json global default (settings-json.md), or use `set` with the TOML key path.
+- **`--json`** is accepted by all four subcommands and prints one JSON document on stdout with
+  `"schema":1`. `set` and `unset` return
+  `{"schema":1,"file","key","value","changed","instances_to_restart":[ports]}`.
+- **Exit codes:** 0 done; 1 write conflict or I/O failure; 2 a malformed key path or a value that is
+  not TOML; 3 the result would be invalid, the key is unknown, or the file has errors (`show` still
+  prints, then exits 3); 4 the file does not exist (`get`, or `show` with an explicit `--config`).
 
 Adding a second instance, for example:
 
 ```sh
-aproxy --config "~/.aproxy/configs/work.toml" config --baseurl https://api.example.com --listen 127.0.0.1:12346
+aproxy config --config "~/.aproxy/configs/work.toml" set base_url https://api.example.com
+aproxy config --config "~/.aproxy/configs/work.toml" set listen_addr 127.0.0.1:12346
 aproxy alias add work "~/.aproxy/configs/work.toml"
 aproxy start work
 ```
@@ -579,8 +615,8 @@ one value as JSON, or `null` for a key that is neither stored nor built in.
   ("no change") when the value was already there. Exit 0 for those and for a successful `show`/`get`;
   2 for a malformed key path or a value that is not valid JSON; 3 when the file cannot be read or the
   change would make it invalid (nothing is written); 1 when the file cannot be written.
-- `aproxy alias add|remove` and `aproxy config --set-default|--clear-default` remain the commands for
-  their fields; both go through the same writer and touch only their own key.
+- `aproxy alias add|remove` and `aproxy settings set|unset default_config` remain the commands for
+  their fields; all go through the same writer and touch only their own key.
 
 Example: give every instance a global default without editing JSON by hand.
 

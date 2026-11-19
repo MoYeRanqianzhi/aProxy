@@ -77,8 +77,9 @@ Every other client, the reasoning behind the timeouts, and how to verify the set
 
 ### Start, inspect and stop instances
 
-- `aproxy` or `aproxy start [ALIAS|PATH]` starts an instance in the background; it keeps running
-  after the terminal closes. Add `--foreground` to watch it in the console while debugging.
+- `aproxy start [ALIAS|PATH]` starts an instance in the background; it keeps running
+  after the terminal closes. Add `--foreground` to watch it in the console while debugging. A
+  bare `aproxy` only prints the help and exits 2.
 - `aproxy status` lists running instances. When more than one runs, `stop`, `restart` and `logs`
   need a port or alias, because guessing the target would hit the wrong instance.
 - A target is resolved as: alias, then the reserved word `default` (the default config), then a
@@ -102,11 +103,11 @@ Every other client, the reasoning behind the timeouts, and how to verify the set
 - `config.toml` is the per-instance file people edit; several can coexist, one per instance.
   `settings.json` is aProxy's own state for the whole home (aliases, the default config, global
   defaults under `defaults`, the watchdog, log rotation, install updates). Change it with
-  `aproxy settings show|get|set|unset`, `aproxy alias ...` or `aproxy config --set-default`; hand-edit
+  `aproxy settings show|get|set|unset`, `aproxy alias ...` or `aproxy settings set default_config`; hand-edit
   it only when it cannot be parsed at all. It is read strictly: an unknown key or a wrong type is an
   error, and commands other than `settings`/`doctor`/`status`/`stop`/`install` then exit 3. This is
   deliberate: a silently ignored setting would look like it was in effect.
-- Precedence, highest first: CLI flags (this run only, never saved), config.toml, the `defaults`
+- Precedence, highest first: `start` flags (this run only, never saved), config.toml, the `defaults`
   section of settings.json (any config.toml key except `listen_addr`, `log_file` and `format`),
   built-in defaults. Credentials in `defaults` are inherited only by instances whose `base_url` (or
   `proxy`) points at the same target as the default's.
@@ -117,9 +118,10 @@ Every other client, the reasoning behind the timeouts, and how to verify the set
 
 ### Investigate a problem
 
-- `aproxy logs PORT|ALIAS` follows an instance's log and starts by printing the log file's path.
-  It never returns on its own, so from a non-interactive tool call run it under a timeout, take the
-  path, and read the file. Log files get a random name at each start; never guess the name from
+- `aproxy logs PORT|ALIAS` prints the instance's most recent 200 log lines and exits; `-n N` sets
+  the count and `-f` keeps following. Use `-f` only when you mean to watch live, and from a
+  non-interactive tool call run it under a timeout, take the log path it prints, and read the file.
+  Log files get a random name at each start; never guess the name from
   the port. Details: commands.md, logs.
 - Log lines are in Chinese. [troubleshooting.md](references/latest/troubleshooting.md) maps
   symptoms and the exact log strings to causes and fixes.

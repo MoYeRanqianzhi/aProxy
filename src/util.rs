@@ -1,8 +1,6 @@
-//! CLI 侧共用小工具：时间戳、时长人性化、敏感值展示打码、key=value 解析。
+//! CLI 侧共用小工具：进程退出与台账登记、时间戳与时长的人性化、从 stdin 读密钥。
 //!
-//! 全部是纯展示/纯解析函数（无 IO、无状态），供各子命令模块共用。
-//! URL 形态的凭据（base_url、代理 URL 等）一律走 lib 侧的统一出口
-//! `aproxy_ipc::redact::url`；本模块只管不透明的密钥值（api_key、头值等）。
+//! 密钥与 URL 里的凭据怎样显示不在这里：一律走 `aproxy_ipc::redact` 的统一出口。
 
 /// 删掉本进程的台账条目（永久兼容契约 C3）后退出进程。`std::process::exit` 不跑析构，
 /// `aproxy_ipc::ledger::Registration` 管不到这条路，所以登记过台账的进程一律经这里退出；没登记过
@@ -69,56 +67,4 @@ pub(crate) fn read_secret_line() -> Result<String, String> {
         .read_line(&mut line)
         .map_err(|e| format!("从 stdin 读取值失败: {e}"))?;
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
-}
-
-/// 密钥类值的展示打码：保留前 6 个字符 + "***"（按字符截断，避免多字节字符在字节边界 panic）。
-pub(crate) fn mask_secret(s: &str) -> String {
-    let prefix: String = s.chars().take(6).collect();
-    format!("{prefix}***")
-}
-
-/// 解析 `key=value` 形式的命令行参数（--extra-header/--override-header 共用）：
-/// 只按第一个 `=` 切分（值中允许出现 `=`），键去空白且不得为空。
-pub(crate) fn parse_kv(s: &str) -> Option<(String, String)> {
-    let (k, v) = s.split_once('=')?;
-    let k = k.trim();
-    let v = v.trim();
-    if k.is_empty() {
-        return None;
-    }
-    Some((k.to_string(), v.to_string()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mask_secret_keeps_prefix_and_masks_rest() {
-        // 保留前 6 个字符
-        assert_eq!(mask_secret("sk-ant-api03-abcdef"), "sk-ant***");
-        assert_eq!(mask_secret("abc"), "abc***");
-        assert_eq!(mask_secret(""), "***");
-    }
-
-    #[test]
-    fn mask_secret_multibyte_no_panic() {
-        // 按 char 截断，多字节字符不会在字节边界 panic
-        assert_eq!(mask_secret("你好世界，测试"), "你好世界，测***");
-    }
-
-    #[test]
-    fn parse_kv_variants() {
-        assert_eq!(
-            parse_kv("x-key = some value"),
-            Some(("x-key".into(), "some value".into()))
-        );
-        // 值中允许 '='：只按第一个 '=' 切分
-        assert_eq!(
-            parse_kv("authorization=Bearer a=b"),
-            Some(("authorization".into(), "Bearer a=b".into()))
-        );
-        assert_eq!(parse_kv("no-equals"), None);
-        assert_eq!(parse_kv("  =value"), None);
-    }
 }

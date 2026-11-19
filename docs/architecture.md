@@ -439,7 +439,7 @@ magic number，连「这是压缩体」都认不出；2026-09-14 的 Cloudflare 
 四级优先级：
 
 ```
-CLI 覆盖参数（--baseurl 等，仅本次） > config.toml 显式值 > settings.json 的 defaults 段 > 内置默认
+CLI 覆盖参数（`start` 的 `--base-url` 等，仅本次） > config.toml 显式值 > settings.json 的 defaults 段 > 内置默认
 ```
 
 settings.json 的 `defaults` 段收的就是 config.toml 的键（同名同嵌套，以 JSON 写出），所以除
@@ -451,7 +451,7 @@ settings.json 的 `defaults` 段收的就是 config.toml 的键（同名同嵌�
 `override_headers` 里的密钥头，只在这份配置最终的 `base_url` 与 `defaults.base_url` 指向同一目
 标时继承；`proxy_username`/`proxy_password` 只在 `proxy` 相同（scheme、主机、端口）时继承。
 比较前先规范化 URL（去空白与结尾斜杠、scheme 与主机小写、去默认端口；路径参与比较，userinfo
-不参与——它是凭据不是目标）。没继承的项进 `Resolved::withheld`，`config --show` 列出它们；这
+不参与——它是凭据不是目标）。没继承的项进 `Resolved::withheld`，`config show --effective` 列出它们；这
 份配置自己也没有该凭据时另发一条 `default_credential_withheld` 告警，否则用户只会看到上游
 401。密钥头按名字识别（`aproxy_ipc::redact::is_secret_header`）；名字不常见的凭据头不会被识别，
 会随每个目标继承，文档因此建议这类头写进各实例的 config.toml。
@@ -474,7 +474,7 @@ settings.json 的 `defaults` 段收的就是 config.toml 的键（同名同嵌�
 
 ## 守护进程模型
 
-- `aproxy`（默认）= 后台启动：父进程预检（IPC ping → TCP bind 探测）→ 把这次启动写成拉起规格
+- `aproxy start`（默认配置）= 后台启动；不给子命令的 `aproxy` 只打印帮助并以 2 退出：父进程预检（IPC ping → TCP bind 探测）→ 把这次启动写成拉起规格
   `InstanceSpec`（配置文件或 null、覆盖参数、启动者环境里的代理变量与 `PATH`、日志文件；端口为 0
   时首次启动后钉住实际端口）→ 经交接文件 `run/<纳秒>-<pid>.spec.json` 交给子进程
   `aproxy __serve --home <dir> --spec <file>`（`spawn_detached_with`，Windows 手写
@@ -606,8 +606,8 @@ CLI 覆盖、settings 注入、validate）干跑一遍，换监听地址时再�
   随机名；`~` 展开，相对路径相对 APROXY_HOME——守护 cwd 不可靠）→ 日志
   init → 实例经 IPC 上报 log_path（`InstanceRecord.log_path`），注册表与
   期望状态记录均携带
-- **地址以 IPC 为准**：`aproxy logs [PORT|别名]`（tail -f 语义：末尾 8KB/
-  30 行 + 增量轮询，实例停止自动退出）与 start 成功提示都向实例询问真实
+- **地址以 IPC 为准**：`aproxy logs [PORT|别名] [-n N] [-f]`（默认打印最近 N=200 行后退出；
+  `-f` 时按 tail -f 语义继续增量轮询，实例停止自动退出）与 start 成功提示都向实例询问真实
   路径，客户端不拼路径；`--foreground` 实例 log_path 为空，logs 立即报
   「日志输出在它的控制台」
 - 清理（`daemon::collect_garbage_in`，实例开始服务之后一次、看护者每轮一次；读路径不删文件）：
@@ -624,8 +624,9 @@ CLI 覆盖、settings 注入、validate）干跑一遍，换监听地址时再�
   `aproxy_ipc::redact::url`（base_url、代理 URL、上游目标 URL、请求的 `路径?查询串`、
   reqwest 错误里的 URL 一律走它）：
   userinfo（用户名或密码任一存在）整体 `***@`，查询串保留键名、值变 `***`，片段
-  整体遮掉，畸形 URL 保守多遮；api_key 与头值走 `util::mask_secret`（前 6 字符 +
-  `***`）。`config --show` 另对 format `args` 的密钥旗标之后的值打码，`env` 只列名字、不显示值
+  整体遮掉，畸形 URL 保守多遮；api_key 与头值走 `aproxy_ipc::redact` 的占位（文本形式
+  `<secret>`，值不短于 24 字符时为 `<secret sk-a…f3a9>`；`--json` 为 `{"secret":true}` 与
+  `"hint"`）。`config show` 另对 format `args` 的密钥旗标之后的值打码，`env` 只列名字、不显示值
 
 ## 安装与升级（install）
 

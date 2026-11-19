@@ -187,7 +187,7 @@ pub enum Commands {
     #[command(visible_alias = "upgrade")]
     Install(InstallArgs),
 
-    /// 查看或修改配置（配置文件位于 ~/.aproxy/config.toml）
+    /// 查看或修改一份配置文件（默认是 ~/.aproxy/config.toml；--config 指定别的）
     Config(ConfigArgs),
 
     /// [内部] 后台实例的入口：按交接文件里的拉起规格承载服务。由 start、restart、restore、
@@ -396,56 +396,53 @@ pub enum SettingsCmd {
 pub struct ConfigArgs {
     /// 要查看或修改的配置文件：别名或路径。不写时用默认配置文件（settings.json 的
     /// default_config，否则 ~/.aproxy/config.toml）
-    #[arg(long, value_name = "ALIAS|PATH")]
+    #[arg(long, value_name = "ALIAS|PATH", global = true)]
     pub config: Option<String>,
-    /// 设置上游 base URL，例如 https://api.anthropic.com
-    #[arg(long, value_name = "URL")]
-    pub baseurl: Option<String>,
-    /// 设置监听地址，例如 127.0.0.1:12345
-    #[arg(long, value_name = "ADDR")]
-    pub listen: Option<String>,
-    /// 快捷设置 api_key（等效覆盖 Authorization: Bearer <key>）
-    #[arg(long, value_name = "KEY")]
-    pub api_key: Option<String>,
-    /// 额外请求头（仅当未携带时追加），格式 key=value，可重复
-    #[arg(long = "extra-header", value_name = "KEY=VALUE")]
-    pub extra_headers: Vec<String>,
-    /// 覆盖请求头（无条件覆盖），格式 key=value，可重复
-    #[arg(long = "override-header", value_name = "KEY=VALUE")]
-    pub override_headers: Vec<String>,
-    /// 保活心跳间隔秒数，0 表示关闭
-    #[arg(long, value_name = "SECS")]
-    pub keepalive_secs: Option<u64>,
-    /// 设置上游代理 URL，例如 http://127.0.0.1:7890 或 socks5://user:pass@127.0.0.1:7890
-    #[arg(long, value_name = "URL")]
-    pub proxy: Option<String>,
-    /// 设置代理用户名（可选，优先于 URL 内嵌的用户名）
-    #[arg(long, value_name = "USER")]
-    pub proxy_username: Option<String>,
-    /// 设置代理密码（可选，优先于 URL 内嵌的密码）
-    #[arg(long, value_name = "PASS")]
-    pub proxy_password: Option<String>,
-    /// 清空已配置的 api_key
-    #[arg(long)]
-    pub clear_api_key: bool,
-    /// 清空 extra/override 头
-    #[arg(long)]
-    pub clear_headers: bool,
-    /// 清空代理配置（URL、用户名、密码）
-    #[arg(long)]
-    pub clear_proxy: bool,
-    /// 从配置文件里删除一个键，可重复。键是点号路径，例如 timeouts.connect_secs、
-    /// extra_headers."x-foo"；不认识的键也能删
-    #[arg(long, value_name = "KEY")]
-    pub unset: Vec<String>,
-    /// 把指定路径设为默认配置文件（写入 settings.json，不指定时默认
-    /// ~/.aproxy/config.toml；支持 ~ 展开）
-    #[arg(long, value_name = "PATH")]
-    pub set_default: Option<String>,
-    /// 取消默认配置文件设置（恢复用 ~/.aproxy/config.toml）
-    #[arg(long)]
-    pub clear_default: bool,
-    /// 打印当前配置及文件路径
-    #[arg(long)]
-    pub show: bool,
+
+    #[command(subcommand)]
+    pub cmd: ConfigCmd,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum ConfigCmd {
+    /// 打印配置文件里写了的值。密钥显示成占位，不给明文。文件有错误时照样显示，附上
+    /// 诊断，退出码 3
+    Show {
+        /// 打印生效的值：文件里没写的键补上 settings.json 的全局默认与内置默认，每个值
+        /// 注明来自哪一层；全局默认里没有继承的凭据单独列出
+        #[arg(long)]
+        effective: bool,
+        /// 输出一个 JSON 文档（给程序读）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 打印一个键的生效值。键是点号路径，例如 base_url、timeouts.connect_secs、
+    /// extra_headers."x-foo"
+    Get {
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// 输出一个 JSON 文档：值与它来自哪一层
+        #[arg(long)]
+        json: bool,
+    },
+    /// 设置一个键，只改这一个键：文件里的注释与其余内容原样保留。值写成 TOML（true、30、
+    /// ["a"]、{ k = 1 }）；字符串类型的键可以直接写原文。值写 - 表示从 stdin 读一行（传密钥
+    /// 用）。只能设置认识的键；会让配置无效的改动不写入。运行中的实例要重启才生效
+    Set {
+        #[arg(value_name = "KEY")]
+        key: String,
+        #[arg(value_name = "VALUE|-", allow_hyphen_values = true)]
+        value: String,
+        /// 输出一个 JSON 文档，里面列出要重启才生效的实例
+        #[arg(long)]
+        json: bool,
+    },
+    /// 删除一个键（回到全局默认或内置默认）。任何键都能删，包括不认识的键
+    Unset {
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// 输出一个 JSON 文档，里面列出要重启才生效的实例
+        #[arg(long)]
+        json: bool,
+    },
 }

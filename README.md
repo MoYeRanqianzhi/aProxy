@@ -13,7 +13,7 @@
 - **无限重试** —— 夫唯不争，故天下莫能与之争。网络错误、4xx/5xx、错误 JSON（200 携带 error）皆触发重试；客户端断开即中止上游请求（计费保护）。两个**显式出口**：`delivery = "forward"` 模式（显式放弃重试，换取请求体与响应的流式直通）与 `[[retry.rules]]`（对确定性报错的上游端点，达到 `max_attempts` 即透传真实响应，不再无限等待；仅当流式请求的响应头已被保活心跳提交时，改以终态 SSE error 事件告知）。
 - **完全透传** —— 大音希声，大象无形。路径、查询、请求头原样转发；控制通道走独立命名管道，代理端口只做透传一件事。
 - **外部转换器（可选）** —— 化而欲作，吾将镇之以无名之朴。请求/响应可整流交给外部 format 程序改写（一行 JSON 信封进出，任何能读写 stdin/stdout 的程序都行）：OpenAI ↔ Anthropic 协议转换、多 key 轮换、多模型多渠道聚合。本体只加编排代码，转换逻辑全部外置；官方示例 `aproxy-format` 二进制开箱即用（独立发版）。常驻进程池复用到已死的空闲 worker 时，会自动换新 worker 重试一次。**限制**：`aproxy-format` 的跨协议转换（如 Anthropic ↔ OpenAI）只支持**非流式**，跨协议的 SSE 流式响应不支持——响应侧转换报错后透传上游原始响应，客户端会收到渠道协议格式的流；同协议 SSE 原样直通，多 key 轮换与同协议聚合不受影响。
-- **守护进程** —— `aproxy` 后台启动（按拉起规格分离子进程，关终端不掉；密钥只在拉起规格与期望状态记录里，不出现在实例与看护者的进程命令行上）；`status` / `stop` / `logs` / `restore` 全套实例管理。
+- **守护进程** —— `aproxy start` 后台启动（按拉起规格分离子进程，关终端不掉；密钥只在拉起规格与期望状态记录里，不出现在实例与看护者的进程命令行上）；`status` / `stop` / `logs` / `restore` 全套实例管理。
 - **看门狗** —— 天网恢恢，疏而不失。全局看护进程自动重拉崩溃/挂死的实例（默认开启；实测 +2.4% 体积、+2.9MB 常驻、转发热路径零损耗）。身份按进程 ID + 创建时间核验，与二进制文件名无关。连续重拉失败不放弃：转入每 300 秒一次的慢速重试，直到实例起来或被 `aproxy stop` 删掉期望状态记录；重拉出的实例存活满 60 秒才清空之前的失败计数。每个扫描周期重读 settings，关掉 `watchdog.enabled` 即退出。macOS 暂不支持，见「平台支持」。
 - **多开** —— 万物并育而不相害。每份 config.toml 一实例，端口各自独立，并存不扰。
 - **自愈** —— 复命曰常，知常曰明。崩溃/断电/系统重启后 `aproxy restore` 一键恢复，空清单静默成功——可配开机自启。实例的期望状态记录（拉起规格：配置文件、覆盖参数、钉住的端口、启动时的代理环境与 PATH、日志路径）只有 `stop` 删除；`restart` 中途失败也留着记录，修好原因后 `restore` 或看门狗可把它拉回。配置文件暂时找不到时记录同样保留。
@@ -101,14 +101,16 @@ cargo build --release
 
 ## 起手
 
-新装机没有上游地址，直接运行 `aproxy` 会因 `base_url` 为空而启动失败——先配置再启动：
+新装机没有上游地址，直接运行 `aproxy start` 会因 `base_url` 为空而启动失败——先配置再启动：
 
 ```powershell
-# 1. 配置上游（交互写入 ~/.aproxy/config.toml）
-aproxy config --baseurl https://api.anthropic.com --api-key sk-ant-...
+# 1. 配置上游（写入 ~/.aproxy/config.toml；每次改一个键）
+aproxy config set base_url https://api.anthropic.com
+aproxy config set api_key sk-ant-...
+#    密钥不想留在 shell 历史里时：aproxy config set api_key -
 
 # 2. 启动（默认后台）
-aproxy
+aproxy start
 
 # 3. 把 agent 软件的 API base URL 指向本地代理
 #    https://api.anthropic.com  →  http://127.0.0.1:12345
@@ -182,23 +184,23 @@ Codex 的 `stream_idle_timeout_ms` 默认 300000（5 分钟），按 SSE 事件�
 
 | 命令 | 说明 |
 |---|---|
-| `aproxy [start]` | 后台启动代理（默认端口 127.0.0.1:12345） |
+| `aproxy start` | 后台启动代理（默认配置，默认端口 127.0.0.1:12345） |
 | `aproxy start <别名\|路径>` | 按别名或配置文件路径启动 |
-| `aproxy --foreground` | 前台运行（日志走控制台，Ctrl+C 停止） |
+| `aproxy start --foreground` | 前台运行（日志走控制台，Ctrl+C 停止） |
 | `aproxy status` | 列出运行中的实例（端口/pid/版本/上游/配置） |
 | `aproxy stop [PORT\|all\|别名]` | 停止实例；多实例必须指定端口、`all` 或别名；`--force` 立即强杀（不会被看门狗复活）；目标已崩溃时删掉它留下的期望状态记录 |
 | `aproxy restart [PORT\|all\|别名]` | 重启运行中的实例（只重启不启动；改配置生效用）；停旧实例前先预检新配置，不通过则旧实例保持运行；失败时记录保留，`restore` 或看门狗可拉回；`--force` 立即强杀重启 |
-| `aproxy logs [PORT\|别名]` | 连接实例实时输出日志；不支持 `all` |
+| `aproxy logs [PORT\|别名]` | 打印实例日志最近 200 行后退出；`-n N` 改行数，`-f` 持续跟随；不支持 `all` |
 | `aproxy restore` | 恢复崩溃/重启前在运行的实例（按期望状态记录）；配置文件暂时找不到时保留记录并说明；无实例则静默结束（开机自启友好） |
 | `aproxy alias add\|remove\|list` | 管理配置别名（存于 settings.json） |
 | `aproxy doctor` | 配置体检：settings.json error 级检查 + 别名配置与目录 toml 审查（warning） |
 | `aproxy find [关键字]` | 从配置目录发现全部配置；`--aliased/--unaliased --port PORT` 过滤 |
-| `aproxy config [选项]` | 查看或修改配置（`--show` 打印当前配置） |
+| `aproxy config show\|get\|set\|unset` | 查看或修改配置：`show` 打印文件里写的值，`--effective` 连全局默认与内置默认一起打印并注明来源；`set`/`unset` 每次改一个键 |
 | `aproxy settings show\|get\|set\|unset` | 查看或修改全局设置（`~/.aproxy/settings.json`）：别名、`defaults` 全局默认、看护者、日志、安装更新；settings.json 有错误时也能用，用来修复它 |
 | `aproxy install [版本]` | 安装或升级（别名 `upgrade`），逐实例滚动重启；`--variant` 换变体，`--force` 强制安装；见「入门」里的升级说明 |
 | `aproxy desktop` | 打开桌面界面（预览版，显示的是演示数据，见下） |
 
-通用参数：`--config <PATH>`（指定配置文件，多开用）、`--listen <ADDR>`、`--proxy <URL>`、`--api-key <KEY>`（只记录进这次启动的拉起规格，`restart`/`restore` 沿用，不写进 config.toml）。
+`start` 的参数：`<别名|路径>` 或 `--config <PATH>`（指定配置文件，多开用；两者等价）、`--listen-addr <ADDR>`、`--base-url <URL>`、`--proxy <URL>`、`--api-key <KEY|->`（只记录进这次启动的拉起规格，`restart`/`restore` 沿用，不写进 config.toml；`-` 表示从 stdin 读一行）、`--log-file <PATH>`、`--foreground`。不带命令的 `aproxy` 只打印帮助并以退出码 2 结束。
 
 ## 桌面界面（预览）
 
@@ -214,8 +216,8 @@ Codex 的 `stream_idle_timeout_ms` 默认 300000（5 分钟），按 SSE 事件�
 ## 多开与别名
 
 ```powershell
-aproxy --config ~/.aproxy/work.toml      # listen_addr = "127.0.0.1:12345"
-aproxy --config ~/.aproxy/personal.toml  # listen_addr = "127.0.0.1:12346"
+aproxy start ~/.aproxy/work.toml      # listen_addr = "127.0.0.1:12345"
+aproxy start ~/.aproxy/personal.toml  # listen_addr = "127.0.0.1:12346"
 aproxy status                            # 两个实例都可见
 aproxy stop 12346                        # 按端口管理
 ```
@@ -277,7 +279,7 @@ listen_addr = "127.0.0.1:12345"          # 本地监听（端口 0 = 系统分�
 # args = ["run", "--config", "~/.aproxy/agg.toml"]   # 不再有 extra 键，配置路径走 args 或 env
 # process = "persistent"                 # spawn（默认）/ persistent（有状态程序必须用）
 # stages = ["request", "retry"]          # request / response / heartbeat；加 retry = 每次重试前重新转换
-# env = { KEYS = '{"keys": ["sk-a", "sk-b"]}' }  # 额外环境变量（值不在 --show 中显示）
+# env = { KEYS = '{"keys": ["sk-a", "sk-b"]}' }  # 额外环境变量（值不在 config show 中显示）
 ```
 
 多 key 轮换默认只在**请求之间**生效：同一请求的重试沿用转换后的同一个 key（请求只转换一次，重试重放转换产物）。需要每次重试都重新转换时，在请求方的 `stages` 里加上 `"retry"`。
@@ -286,7 +288,7 @@ listen_addr = "127.0.0.1:12345"          # 本地监听（端口 0 = 系统分�
 `spool/<pid>-<短哈希>/`（磁盘缓存临时文件，每个实例进程一个目录；实例停止时删掉，崩溃留下的由下一个启动的实例或看门狗清理）、
 `settings.json`（整个 home 的程序状态：`aliases`、`default_config`、`config_dirs`，`defaults`（config.toml 键的全局默认），以及 `watchdog`、`logs`、`instances`、`update`、`ui` 各段）。
 
-`settings.json` 由 `aproxy settings show|get|set|unset` 读写（键是点号路径，例如 `watchdog.enabled`、`defaults.max_request_mb`）；也可以 `aproxy alias add|remove` 与 `aproxy config --set-default|--clear-default` 改各自的键。手工编辑只在文件无法解析时作为兜底：它被严格解析，不认识的键、类型不对的值都是错误，此时 `status`、`stop`、`install` 会按内置默认运行并告警（别名不可用），其余命令以退出码 3 结束并打印修法。`defaults` 里的凭据（`api_key`、密钥头、代理口令）只随它的目标继承：实例的 `base_url`/`proxy` 指向别处时不会带上它，`aproxy config --show` 会列出被扣下的项。字段说明见 skill 文档 [settings-json.md](.claude/skills/aproxy-cli/references/latest/settings-json.md)。
+`settings.json` 由 `aproxy settings show|get|set|unset` 读写（键是点号路径，例如 `watchdog.enabled`、`defaults.max_request_mb`）；也可以 `aproxy alias add|remove` 与 `aproxy settings set|unset default_config` 改各自的键。手工编辑只在文件无法解析时作为兜底：它被严格解析，不认识的键、类型不对的值都是错误，此时 `status`、`stop`、`install` 会按内置默认运行并告警（别名不可用），其余命令以退出码 3 结束并打印修法。`defaults` 里的凭据（`api_key`、密钥头、代理口令）只随它的目标继承：实例的 `base_url`/`proxy` 指向别处时不会带上它，`aproxy config show --effective` 会列出被扣下的项。字段说明见 skill 文档 [settings-json.md](.claude/skills/aproxy-cli/references/latest/settings-json.md)。
 
 ### 保活（SSE 心跳）
 

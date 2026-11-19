@@ -226,43 +226,15 @@ fn restore_placeholders(
 /// 读出口用的形状：密钥换成占位对象，URL 里的 userinfo 与查询串的值打码。`value` 是整份
 /// settings（文件里的键，或补上内置默认之后的）。
 pub fn redacted(mut value: Value) -> Value {
-    use aproxy_ipc::redact;
-    let secret = |value: &mut Value| {
-        if let Value::String(text) = value {
-            *value = redact::placeholder(text);
-        }
-    };
-    let url = |value: &mut Value| {
-        if let Value::String(text) = value {
-            *value = Value::String(redact::url(text));
-        }
-    };
+    // `defaults` 里是 config.toml 的键，密钥的规则与 config.toml 是同一份
     if let Some(defaults) = value.get_mut("defaults").and_then(Value::as_object_mut) {
-        for key in ["api_key", "proxy_password"] {
-            if let Some(item) = defaults.get_mut(key) {
-                secret(item);
-            }
-        }
-        for key in ["base_url", "proxy"] {
-            if let Some(item) = defaults.get_mut(key) {
-                url(item);
-            }
-        }
-        for table in ["extra_headers", "override_headers"] {
-            if let Some(headers) = defaults.get_mut(table).and_then(Value::as_object_mut) {
-                for (name, item) in headers.iter_mut() {
-                    if redact::is_secret_header(name) {
-                        secret(item);
-                    }
-                }
-            }
-        }
+        crate::config::view::redact_table(defaults);
     }
-    if let Some(item) = value
+    if let Some(Value::String(text)) = value
         .get_mut("update")
         .and_then(|update| update.get_mut("download_proxy"))
     {
-        url(item);
+        *text = aproxy_ipc::redact::url(text);
     }
     value
 }

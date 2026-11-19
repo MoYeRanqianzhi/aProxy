@@ -306,8 +306,8 @@ for. Startup logs a warning beginning `仅转发模式已启用` ("forward-only 
 - Not used: error-content detection (a 200 carrying an error JSON is passed on), `disk_cache`,
   `max_response_mb`, `keepalive.*`, `retry.*`. Formats cannot be combined with it; the instance
   refuses to start with `config_conflict` on `delivery`.
-- Set it in config.toml as `delivery = "forward"`, or as the settings.json `defaults.delivery`
-  default; there is no CLI flag. Apply it with `aproxy restart <port|alias>`.
+- Set it with `aproxy config set delivery forward`, by editing config.toml, or as the settings.json
+  `defaults.delivery` default. Apply it with `aproxy restart <port|alias>`.
 
 ## External transformers
 
@@ -373,7 +373,7 @@ response: attempt judged successful -> response format -> replay
   redone once on a fresh worker.
 - **Configuration and environment.** There is no `extra` key any more; pass data the program needs
   through `args` or the `env` table. The envelope's `extra` field is empty when configured from the
-  file. `env` values are never shown by `aproxy config --show`.
+  file. `env` values are never shown by `aproxy config show`.
 - **Parsed but inactive in this version:** `required`, `decide_timeout_secs`, `breaker_failures`
   and `breaker_cooldown_secs`. They are validated now so a later release can honor them; do not rely
   on any behavior from them yet.
@@ -456,7 +456,7 @@ minutes after its last instance stops.
   (restart, restore and watchdog respawns included). The name carries no port, so do not guess it:
   `aproxy logs <port|alias>` prints it as `日志文件: …` ("log file"), and `aproxy start` printed it as
   `日志: …`. A `--foreground` instance logs only to its console.
-- A custom path comes from `log_file` in config.toml or `--log-file` (the flag wins); a relative path is
+- A custom path comes from `log_file` in config.toml or `--log-file` (a `start` option; the flag wins); a relative path is
   resolved against `<home>`.
 - `<home>/logs/startup.log` collects what happens before an instance has its own log or without a
   console: configuration errors, bind failures, non-loopback warnings of daemon starts, the Windows
@@ -464,7 +464,7 @@ minutes after its last instance stops.
   first when an instance fails to start.
 - Size: at startup an existing log file over 2 MiB is emptied (this matters for a fixed `log_file`); a
   running daemon empties its log once an hourly check finds it over `settings.json logs.rotate_mb` (0
-  disables). `aproxy logs` keeps following across truncation.
+  disables). `aproxy logs -f` keeps following across truncation.
 - Cleanup happens in the background, never in a read-only command. An instance runs one cleanup
   right after it starts serving, and the watchdog does one on every scan. It removes an instance
   record `<port>.instance.json` only when the record is readable and the process that wrote it is

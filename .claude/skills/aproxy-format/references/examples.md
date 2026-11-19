@@ -71,7 +71,7 @@ env = { ROTATE = '{"keys": ["sk-a", "sk-b", "sk-c"], "header": "x-api-key"}' }
 ```
 
 - `process = "persistent"` is what makes rotation work: in spawn mode `handled` is always 0.
-- `env` values are never printed by `aproxy config --show`; the config file still holds them in
+- `env` values are never printed by `aproxy config show`; the config file still holds them in
   plain text, so protect its permissions.
 - The key is chosen once per client request. aProxy retries a failed request by replaying it with
   the same key, and it retries upstream 401/403 like any other error, so a revoked key makes every
@@ -196,7 +196,7 @@ CONVERT="$X" python scripts/test_format.py --format-spec anthropic --command pyt
 CONVERT="$X" python scripts/test_format.py --side response --format-spec openai-chat --command python3 -- convert.py
 ```
 
-This keeps the upstream key in plain text in config.toml (`aproxy config --show` lists `env` by
+This keeps the upstream key in plain text in config.toml (`aproxy config show` lists `env` by
 name only; the file does not mask it). To keep it out of the config, put a file path in `env` and
 read the key from that file.
 

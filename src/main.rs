@@ -208,7 +208,7 @@ async fn run(cli: Cli) {
             query,
             port,
         }) => commands::find::handle_find_cmd(aliased, unaliased, query, port),
-        Some(Commands::Config(args)) => commands::config::handle_config_cmd(args),
+        Some(Commands::Config(args)) => commands::config::handle_config_cmd(args).await,
         Some(Commands::Settings { cmd }) => commands::settings::handle_settings_cmd(cmd),
         Some(Commands::Install(args)) => commands::install::handle_install_cmd(args).await,
         Some(Commands::Desktop) => unreachable!("desktop 在 main 里、建运行时之前已经分派"),

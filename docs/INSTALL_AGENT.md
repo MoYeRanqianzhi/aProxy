@@ -232,11 +232,12 @@ local endpoint: **`http://127.0.0.1:12345`**.
   `base_url` fails. Configure it first, then start:
 
   ```sh
-  aproxy config --baseurl <UPSTREAM_URL> --api-key <KEY>
-  aproxy
+  aproxy config set base_url <UPSTREAM_URL>
+  aproxy config set api_key <KEY>
+  aproxy start
   ```
 
-- Start it: `aproxy` (background daemon) or `aproxy --foreground` (debugging).
+- Start it: `aproxy start` (background daemon) or `aproxy start --foreground` (debugging).
 - **Claude Code** — set both of these (shell environment variables, or the `env`
   field of Claude Code's `~/.claude/settings.json`):
 
@@ -285,7 +286,7 @@ local endpoint: **`http://127.0.0.1:12345`**.
   unchanged (e.g. `https://api.anthropic.com/v1/messages` becomes
   `http://127.0.0.1:12345/v1/messages`).
 - The upstream address is set in `~/.aproxy/config.toml` (`base_url = ...`);
-  edit it, then apply with `aproxy restart` (or `aproxy config --baseurl
+  edit it, then apply with `aproxy restart` (or `aproxy config set base_url
   <URL>` before starting). `restart` checks the new configuration before
   stopping the running instance, so a typo leaves the old instance running.
 - By default the proxy rejects requests that carry an `Origin` header (browser
@@ -318,7 +319,7 @@ troubleshooting — read them before improvising CLI flags.
 |---|---|
 | Start fails: port occupied | `netstat -ano \| findstr <port>` (Windows); another program owns it |
 | Start fails: permission / reserved range | Hyper-V/WinNAT excluded range — pick another port |
-| Start fails: `base_url` is empty | fresh install — run `aproxy config --baseurl <URL> --api-key <KEY>` first |
+| Start fails: `base_url` is empty | fresh install — run `aproxy config set base_url <URL>` and `aproxy config set api_key <KEY>` first |
 | Start fails: other | read `~/.aproxy/logs/startup.log` |
 | Client gets a local 403 mentioning `allowed_origins` / `allowed_hosts` | the inbound origin check rejected it (never forwarded upstream): add the Origin / host name from the message to `config.toml`, then `aproxy restart <port>` |
 | `install.ps1` fails to parse under Windows PowerShell 5.1 | run it via `irm ... \| iex` or `pwsh -File`, not `powershell -File` |

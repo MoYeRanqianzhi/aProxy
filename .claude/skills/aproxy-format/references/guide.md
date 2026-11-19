@@ -185,7 +185,7 @@ your request-side URL) or derive it from configuration.
 **Pass settings through `env`.** The `[[format]]` table has no `extra` key any more; the envelope's
 `extra` field is empty when the format is configured from the file. Put configuration in `env`
 (JSON is the most flexible encoding) and read it with `os.environ` / `process.env`. `env` values
-are never displayed by `aproxy config --show`, which also keeps secrets out of the printed config;
+are never displayed by `aproxy config show`, which also keeps secrets out of the printed config;
 a file path in `env` works for anything long. Keep secrets out of `args`: command lines are
 visible to other processes on the machine.
 
@@ -313,5 +313,5 @@ Confirm it is active:
   ("external transformer enabled") once per configured side at startup, and
   `请求已由外部转换器改写` ("request rewritten by the external transformer") with the new URL for
   every converted request.
-- `aproxy config --show` prints each format as aProxy parsed it: `args` values after a secret flag
+- `aproxy config show` prints each format as aProxy parsed it: `args` values after a secret flag
   are masked, and `env` is listed by name only, never by value.

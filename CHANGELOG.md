@@ -15,6 +15,24 @@
 - **安装状态挪到 `<home>/install/`**：状态文件由 `run/install.state` 改为 `install/state.json`，备料与下载暂存由 `staging/<版本>/` 改为 `install/staging/<版本>/`，一键安装脚本的下载暂存由 `staging/bootstrap` 改为 `install/bootstrap`。0.1.0 留下的 `run/install.state` 与 `staging/` 不再被读取。
 - **`aproxy install` 拒绝低于 0.2.0 的版本**：在线安装指定的版本号与 `--from` 的二进制都一样，`--allow-downgrade` 也不行，报 `目标版本 <版本> 低于 0.2.0，不能安装：…` 并说明怎样回到 0.1.x。0.2.0 的预发布（alpha、beta、rc）不受影响。
 - **`aproxy install` 的指令集档参数改名为 `--cpu`**：原来的 `--variant v3|baseline` 改为 `--cpu x86-64-v3|baseline`（与 `--version` 末段的写法一致）。`--variant` 改为选变体，取 `desktop|headless`（见「新增」里的两个版本）。
+- **命令行改版**：不带子命令的 `aproxy` 不再启动实例，改为打印帮助并以 2 退出；启动一律写 `aproxy start`。0.1.x 的写法按下表改：
+
+  | 0.1.x | 0.2.0 |
+  |---|---|
+  | `aproxy`、`aproxy --config <文件>` | `aproxy start`、`aproxy start <文件>`（`aproxy start --config <文件>` 同样接受） |
+  | `aproxy --foreground` | `aproxy start --foreground` |
+  | `aproxy --baseurl <URL>`、`--listen <地址>` | `aproxy start --base-url <URL>`、`--listen-addr <地址>` |
+  | 顶层的 `--proxy`、`--api-key`、`--log-file`、`--config` | 只属于 `start`，写在 `start` 之后；`--api-key -` 从标准输入读一行 |
+  | `aproxy stop idle 600`、`aproxy restart idle 600` | `aproxy stop idle --idle-threshold-secs 600`（`restart` 同） |
+  | `aproxy logs`（一直跟随） | `aproxy logs` 打印最近 200 行就退出，`-n <行数>` 定行数，`-f` 才跟随 |
+  | `aproxy config`、`aproxy config --show` | `aproxy config show`（文件里写了的值）、`aproxy config show --effective`（生效值与来源） |
+  | `aproxy config --baseurl <URL>`、`--listen`、`--api-key`、`--proxy`、`--proxy-username`、`--proxy-password`、`--keepalive-secs <秒>` | `aproxy config set <键> <值>`，键依次是 `base_url`、`listen_addr`、`api_key`、`proxy`、`proxy_username`、`proxy_password`、`keepalive.interval_secs`；一条命令改一个键 |
+  | `aproxy config --extra-header k=v`、`--override-header k=v` | `aproxy config set extra_headers.k v`、`aproxy config set override_headers.k v` |
+  | `aproxy config --clear-api-key`、`--clear-headers`、`--clear-proxy` | `aproxy config unset <键>` |
+  | `aproxy config --set-default <文件>`、`--clear-default` | `aproxy settings set default_config <文件>`、`aproxy settings unset default_config` |
+  | `aproxy --config <文件> config …` | `aproxy config --config <别名或文件> …`（写在子命令前后都可以） |
+
+  `aproxy logs` 的说明文字（连上了哪个实例、日志文件在哪、实例已停止）改写到标准错误，标准输出上只有日志行。`--idle-threshold-secs` 配在 `idle` 以外的目标上是用法错误（退出码 2）。读出来的密钥不再是「前 6 个字符加 `***`」：给人看的输出里是 `<secret>`（值不短于 24 个字符时带首尾各 4 个字符，如 `<secret sk-a…f3a9>`），`--json` 里是占位对象。
 - **config.toml 的键重新命名，并改为严格解析**：不认识的键、类型不对的值都是错误，指出文件、键与行列（形如 `config.toml:3:1: forward_only: unknown key forward_only [config_unknown_key]`），实例不启动；此前不认识的键被静默忽略，写错一个字母的键等于没写。0.1.x 的键按下表改名：
 
   | 0.1.x | 0.2.0 |
@@ -58,7 +76,7 @@
    - npm 装的：`npm i -g @meowo/aproxy@next`（无界面版装 `@meowo/aproxy-headless@next`；0.2.0 正式版之后用 `@latest`）。
    - cargo 装的：`cargo install aproxy --locked --force --version <版本>`（正式版之后可省略 `--version`）。
 4. 清理 0.1.0 的残留：`~/.aproxy/run/install.state`（如果有）、`~/.aproxy/staging/`，以及 `~/.aproxy/run/*.restore`。本版本只读 `run/<端口>.restore.json`，旧格式的 `.restore` 不会被当作恢复依据（此前崩溃的 0.1.x 实例不会被自动拉回）；删掉它们以免以后误读。第 2 步之前还在运行的实例如果崩了，用新 CLI 重新 `aproxy start` 即可。
-5. 配置文件 `config.toml` 与 `settings.json` 要按上面两张对照表改写：两者都改为严格解析，留着旧键时实例不启动、多数命令以退出码 3 结束。可以用新版本逐项改：`aproxy config --unset <旧键>` 与 `aproxy settings unset <旧键>` 能删掉不认识的键，再用 `aproxy config …` 与 `aproxy settings set <键> <值>` 写上新键；也可以直接手工编辑。改完运行 `aproxy config --show`（每个配置文件）与 `aproxy doctor` 检查。
+5. 配置文件 `config.toml` 与 `settings.json` 要按上面两张对照表改写：两者都改为严格解析，留着旧键时实例不启动、多数命令以退出码 3 结束。可以用新版本逐项改：`aproxy config unset <旧键>` 与 `aproxy settings unset <旧键>` 能删掉不认识的键，再用 `aproxy config set <键> <值>` 与 `aproxy settings set <键> <值>` 写上新键；也可以直接手工编辑。改完运行 `aproxy config show`（每个配置文件，用 `--config <文件>` 指定）与 `aproxy doctor` 检查。
 6. 用 `aproxy --version` 确认装的是 0.2.0 起的版本（首行形如 `aproxy v0.2.0-alpha.2 (desktop; …)`，0.1.x 的输出是 `aproxy 0.1.0`），再用它逐个启动：`aproxy start <别名|配置路径>`。端口不变，agent 客户端的 base URL 不用改。
 7. 更新 skill 文档：`aproxy install --skills-only`，再确认 agent 的 skills 目录链接或复制的是 `~/.aproxy/skills/` 里的新文档。
 
@@ -72,8 +90,7 @@
 - **进程台账 `<home>/ledger/`**：实例（后台与前台）、看护者、安装者与桌面界面在占用端口或拉起子进程之前写一条 `<pid>.json`（pid、进程启动标记、角色、版本，实例另记端口与配置文件），正常退出时删除；写失败只告警、照常运行。强制安装只按台账找进程，结束前核验启动标记，pid 已被别的进程复用时只删条目、不结束。0.1.x 不写台账，它启动的进程由强制安装列出、不结束。
 - **`aproxy settings show|get|set|unset`**：查看与修改 settings.json。`show` 打印生效的全部设置（文件里的键盖在内置默认上），`get` 取一个键（点号路径，如 `watchdog.enabled`、`defaults.timeouts.connect_secs`），`set` 只改目标键并拒绝会引入新错误的改动，`unset` 能删任何键（包括不认识的）。值写成 JSON，字符串类型的键可以直接写原文；值写 `-` 表示从标准输入读一行，密钥用它传，不进命令行历史。读出来的密钥一律是占位对象 `{"secret": true, "hint": "…"}`，把占位原样写回等于不改。settings.json 只有本用户可读写（unix 0600；Windows 上只保留当前用户、SYSTEM 与 Administrators）。
 - **全局默认可以放任何 config.toml 的键，凭据只发给它所属的上游**：settings.json 的 `defaults` 里能写 `base_url`、`api_key`、`proxy`、头表、超时、重试规则等（`listen_addr`、`log_file`、`[[format]]` 除外），所有实例在自己的配置没写时继承。`defaults.api_key` 与密钥类的头（`authorization`、`x-api-key` 等，按名字识别）只在实例最终的 `base_url` 与 `defaults.base_url` 是同一个目标时继承（比较前去掉末尾斜杠、scheme 与主机转小写、去掉默认端口，路径参与比较）；代理的用户名与口令同理跟着 `defaults.proxy` 走。没被继承的凭据在 `aproxy config --show` 里列出；实例自己也没有这项凭据时另给一条告警。`defaults` 里有凭据却没写它的目标时是错误。
-- **`aproxy config --show` 显示生效值与来源**：每个键的值来自命令行覆盖、config.toml、settings.json 的全局默认还是内置默认，一并列出配置的诊断；有错误时照样打印，以退出码 3 结束。
-- **`aproxy config --unset <键>`**：删掉配置文件里的一个键（点号路径），包括本版本不认识的键。`aproxy config` 的各项修改只动目标键，保留文件里的注释、键的顺序与其余内容；几个进程同时修改不丢更新；会引入新错误的修改被拒绝。
+- **`aproxy config show|get|set|unset`**：查看与修改一份 config.toml，取代原来的十几个专用旗标。`show` 打印文件里写了的值，`show --effective` 打印生效的值——每个键来自 config.toml、settings.json 的全局默认还是内置默认，以及全局默认里没有继承的凭据；两者都一并列出配置的诊断，有错误时照样打印，以退出码 3 结束。`get <键>` 取一个键的生效值（键是点号路径，如 `timeouts.connect_secs`、`extra_headers."x-foo"`）。`set <键> <值>` 只改目标键，保留文件里的注释、键的顺序与其余内容；值写成 TOML，字符串类型的键可以直接写原文，值写 `-` 表示从标准输入读一行（传密钥用）；只能设置认识的键，会引入新错误的修改被拒绝；几个进程同时修改不丢更新。`unset <键>` 能删任何键，包括本版本不认识的。`--config <别名|文件>` 指定改哪一份，不写时是默认配置文件。四个子命令都有 `--json`：标准输出上是一个带 `"schema":1` 的 JSON 文档，失败时是 `{"schema":1,"error":{"code","message","details"}}`；`set`、`unset` 的文档里有 `instances_to_restart`——用着这份配置、要重启才用上这次改动的运行中实例的端口（不带 `--json` 时把 `aproxy restart <端口>` 打印到标准错误）。读出来的密钥一律是占位（`{"secret":true}`，够长时带 `hint`），把占位原样写回等于不改，对不上原值时报 `secret_placeholder_unmatched`。退出码：2 键路径或值的写法不对，3 配置无效或键不认识，4 文件不存在（`get`，以及显式 `--config` 的 `show`）。
 - **按路径与状态码限定重试次数**：`[[retry.rules]]` 里第一条 `path`（正则）与可选的 `status`（状态码列表）都匹配的规则生效，`max_attempts` 是总尝试次数，`0` 表示这类请求不设上限；例如对某个路径的 404 只试 1 次。因规则放弃时错误码是 `retry_exhausted`，`details.by` 为 `rule:<序号>`。
 - **首字节超时与读空闲超时分开**：`[timeouts] first_byte_secs` 管发出请求后等响应头，`read_idle_secs` 管响应体两次读到数据之间的间隔，分别报 `upstream_first_byte_timeout` 与 `upstream_read_idle_timeout`。
 - **每个请求有 `request_id`**：形如 `<实例标识>-<序号>`，在错误响应的头与体、日志、以及交给 format 程序的信封里是同一个值，可用来对照一次请求的全程。
@@ -124,7 +141,7 @@
 - `aproxy install --skills-only` 可以同时指定版本（`aproxy install <版本> --skills-only`），与 latest 查询失败时的提示一致。
 - `aproxy stop` 等不到实例退出时，提示改为跨平台、会核验进程身份的 `aproxy stop <端口> --force`（此前在所有平台都建议 `taskkill`）。
 - `settings.json` 的 `default_config` 指向的文件不存在时，只有要读配置的命令（启动、`aproxy config` 查看或修改内容）报错退出；`status`、`stop`、`doctor`、自动拉起的 `install --continue` 等不再被拦，报错信息推荐的 `aproxy config --clear-default` 也能直接执行（此前所有不带 `--config` 的命令都在分发前退出 1）。
-- `settings.json` 不是合法的 JSON 时，所有会写它的命令（`aproxy alias add/remove`、`aproxy config --set-default/--clear-default`、`aproxy settings set/unset`）拒绝修改并原样保留文件，不再用默认值写回、冲掉原有的全部别名。这些命令现在只改自己的那个键，不再整份重写文件。
+- `settings.json` 不是合法的 JSON 时，所有会写它的命令（`aproxy alias add/remove`、`aproxy settings set/unset`）拒绝修改并原样保留文件，不再用默认值写回、冲掉原有的全部别名。这些命令现在只改自己的那个键，不再整份重写文件。
 - 相对路径的 `log_file` / `--log-file` 按文档相对 `APROXY_HOME` 解析（此前实际相对当前工作目录）。
 - **外部转换器纳入心跳节拍**：保活适用的请求，请求转换、响应转换与回放前解码期间照常提交骨架头并发心跳。此前 format 慢（`timeout_secs = 0` 时没有上界）时，客户端可能在收到任何字节之前一直干等。请求转换若在骨架头提交之后才失败，以 `proxy_transform_failed` 终态 error 事件收场（提交前失败仍是 502）。
 - `override_headers` 里配置的 `accept-encoding` 对保活适用的请求不生效（这些请求一律以 `identity` 发往上游），启动时 warn 一次说明，不再静默覆盖。

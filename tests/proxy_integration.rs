@@ -4730,24 +4730,24 @@ fn cli_config_flag_scopes_config_subcommand() {
     let cfg_file = home.path().join("instance.toml");
 
     // 多开工作流：为新实例创建独立配置，写入 --config 指定的文件
-    let out = home
-        .cmd()
-        .arg("config")
-        .arg("--config")
-        .arg(&cfg_file)
-        .args([
-            "--baseurl",
-            "https://multi-instance.example.com",
-            "--keepalive-secs",
-            "30",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "config 子命令应成功，stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    for (key, value) in [
+        ("base_url", "https://multi-instance.example.com"),
+        ("keepalive.interval_secs", "30"),
+    ] {
+        let out = home
+            .cmd()
+            .arg("config")
+            .arg("--config")
+            .arg(&cfg_file)
+            .args(["set", key, value])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "config set 应成功，stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     let saved = std::fs::read_to_string(&cfg_file).unwrap();
     assert!(
         saved.contains("multi-instance.example.com"),
@@ -4758,28 +4758,26 @@ fn cli_config_flag_scopes_config_subcommand() {
         "其他字段应一并保存，实际: {saved}"
     );
 
-    // --show 读取的也是同一份文件
+    // show 读取的也是同一份文件；--config 写在子命令前后都可以
     let out = home
         .cmd()
-        .arg("config")
-        .arg("--config")
+        .args(["config", "show", "--config"])
         .arg(&cfg_file)
-        .args(["--show"])
         .output()
         .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("multi-instance.example.com"),
-        "--show 应展示 --config 文件的内容，实际: {stdout}"
+        "show 应展示 --config 文件的内容，实际: {stdout}"
     );
 }
 
 #[test]
 fn stale_default_config_blocks_only_commands_that_read_it() {
     // settings.json 的 default_config 指向已删除的文件：要读配置的命令（这里用
-    // config --show，不用启动以免拉起守护）照旧报错；status 与报错信息里推荐的
-    // `config --clear-default` 不得被拦住——曾经所有不带 --config 的命令都在
+    // config show，不用启动以免拉起守护）照旧报错；status 与报错信息里推荐的
+    // `settings unset default_config` 不得被拦住——曾经所有不带 --config 的命令都在
     // 分发前退出 1，连修复命令本身都跑不了
     let home = TestHome::new();
     let gone = home
@@ -4792,10 +4790,13 @@ fn stale_default_config_blocks_only_commands_that_read_it() {
     std::fs::write(&settings_path, format!(r#"{{"default_config": "{gone}"}}"#)).unwrap();
     let run = |args: &[&str]| home.cmd().args(args).output().unwrap();
 
-    let show = run(&["config", "--show"]);
+    let show = run(&["config", "show"]);
     assert_eq!(show.status.code(), Some(1), "要读配置的命令应报错");
     let stderr = String::from_utf8_lossy(&show.stderr);
-    assert!(stderr.contains("默认配置文件不存在"), "{stderr}");
+    assert!(
+        stderr.contains("默认配置文件不存在") && stderr.contains("settings unset default_config"),
+        "{stderr}"
+    );
 
     let status = run(&["status"]);
     assert!(
@@ -4804,7 +4805,7 @@ fn stale_default_config_blocks_only_commands_that_read_it() {
         String::from_utf8_lossy(&status.stderr)
     );
 
-    let clear = run(&["config", "--clear-default"]);
+    let clear = run(&["settings", "unset", "default_config"]);
     assert!(
         clear.status.success(),
         "报错信息推荐的修复命令必须能执行: {}",
@@ -4830,7 +4831,7 @@ fn corrupt_settings_json_is_never_overwritten() {
 
     for args in [
         vec!["alias", "add", "x", cfg.to_str().unwrap()],
-        vec!["config", "--clear-default"],
+        vec!["settings", "unset", "default_config"],
         vec!["settings", "set", "language", "en"],
         vec!["settings", "unset", "aliases.keep"],
     ] {
@@ -5066,29 +5067,36 @@ fn daemon_without_its_control_endpoint_exits_without_registering() {
 
 #[test]
 fn cli_config_show_rejects_missing_explicit_file() {
-    // 与写操作对照：--show / 无修改参数对「显式 --config 指向的不存在文件」
-    // 必须报错——此时展示的只是内置默认值（抬头却是用户给的路径），静默回退
-    // 是纯粹的排障误导（实测：打错路径看到的是默认配置而非报错）。写操作
-    // 不在此限（上一测试固化的「--config 新路径 + 修改参数 = 创建新配置」）。
+    // 与写操作对照：show 与 get 对「显式 --config 指向的不存在文件」必须报错（退出码 4）
+    // ——此时展示的只是内置默认值（抬头却是用户给的路径），静默回退是纯粹的排障误导
+    // （实测：打错路径看到的是默认配置而非报错）。写操作不在此限（上一测试固化的
+    // 「--config 新路径 + set = 创建新配置」）。
     let home = TestHome::new();
     let missing = home.path().join("nope.toml");
-    let out = home
-        .cmd()
-        .arg("config")
-        .arg("--config")
-        .arg(&missing)
-        .args(["--show"])
-        .output()
-        .unwrap();
-    assert!(
-        !out.status.success(),
-        "--show 对不存在的显式 --config 必须报错（而非静默展示默认值）"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("不存在"),
-        "stderr 应提示文件不存在，实际: {stderr}"
-    );
+    for args in [
+        &["show"][..],
+        &["show", "--effective"],
+        &["get", "base_url"],
+    ] {
+        let out = home
+            .cmd()
+            .arg("config")
+            .arg("--config")
+            .arg(&missing)
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(4),
+            "{args:?} 对不存在的显式 --config 必须报错（而非静默展示默认值）"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("不存在"),
+            "stderr 应提示文件不存在，实际: {stderr}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6763,7 +6771,7 @@ fn credentials_masked_in_start_output_registry_and_daemon_log() {
 }
 
 // ---------------------------------------------------------------------------
-// 36. config --show：URL 凭据、format 的 args 密钥值与 env 的值一律不显示
+// 36. config show / get：URL 凭据、format 的 args 密钥值与 env 的值一律不显示
 // ---------------------------------------------------------------------------
 #[test]
 fn config_show_masks_url_credentials_and_transform_secrets() {
@@ -6782,37 +6790,77 @@ fn config_show_masks_url_credentials_and_transform_secrets() {
         ),
     )
     .unwrap();
-    let out = home
-        .cmd()
-        .arg("config")
-        .arg("--config")
-        .arg(&cfg_file)
-        .args(["--show"])
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    for secret in [
-        "TOKENUSER",
-        "PROXYPASS",
-        "QSECRET",
-        "SUPERSECRET2",
-        "TOKSECRET",
-        "EXTRASECRET",
-    ] {
-        assert!(!stdout.contains(secret), "--show 泄露 {secret}:\n{stdout}");
-    }
-    // 打码后的形态仍可对照 toml（不是整行消失）
-    for shape in [
-        "https://***@api.example.com/v1",
-        "http://***@127.0.0.1:7890?token=***",
-        "--api-key, SUPERS***",
-        "env              = KEYS（值不显示）",
-    ] {
+    // 每一种读法都不给明文；打码后的形态仍可对照 toml（不是整行消失）
+    let cases: [(&[&str], &[&str]); 5] = [
+        (
+            &["show"],
+            &[
+                "base_url = \"https://***@api.example.com/v1\"",
+                "proxy = \"http://***@127.0.0.1:7890?token=***\"",
+                "args = [\"run\", \"--api-key\", \"<secret>\", \"--token=<secret>\"]",
+                "KEYS = \"<secret>\"",
+            ],
+        ),
+        (
+            &["show", "--effective"],
+            &[
+                "https://***@api.example.com/v1",
+                "http://***@127.0.0.1:7890?token=***",
+                "--api-key, <secret>, --token=<secret>",
+                "env              = KEYS（值不显示）",
+            ],
+        ),
+        (
+            &["show", "--json"],
+            &[
+                r#""base_url":"https://***@api.example.com/v1""#,
+                r#""args":["run","--api-key",{"secret":true},"--token=<secret>"]"#,
+                r#""env":{"KEYS":{"secret":true}}"#,
+            ],
+        ),
+        (
+            &["get", "format", "--json"],
+            &[r#""args":["run","--api-key",{"secret":true},"--token=<secret>"]"#],
+        ),
+        (
+            &["get", "proxy"],
+            &["\"http://***@127.0.0.1:7890?token=***\""],
+        ),
+    ];
+    for (args, shapes) in cases {
+        let out = home
+            .cmd()
+            .arg("config")
+            .arg("--config")
+            .arg(&cfg_file)
+            .args(args)
+            .output()
+            .unwrap();
         assert!(
-            stdout.contains(shape),
-            "--show 应含脱敏形态 {shape}:\n{stdout}"
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
         );
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        for secret in [
+            "TOKENUSER",
+            "PROXYPASS",
+            "QSECRET",
+            "SUPERSECRET2",
+            "TOKSECRET",
+            "EXTRASECRET",
+        ] {
+            assert!(
+                !stdout.contains(secret),
+                "{args:?} 泄露 {secret}:\n{stdout}"
+            );
+        }
+        for shape in shapes {
+            assert!(
+                stdout.contains(shape),
+                "{args:?} 应含脱敏形态 {shape}:\n{stdout}"
+            );
+        }
     }
 }
 
@@ -7150,7 +7198,7 @@ fn unknown_config_keys_fail_start_naming_file_and_key() {
     );
 }
 
-/// `aproxy config` 只改目标键：注释、空行与键的顺序原样保留；`--unset` 删得掉不认识的键；
+/// `aproxy config set` 只改目标键：注释、空行与键的顺序原样保留；`unset` 删得掉不认识的键；
 /// 会让配置无效的改动不写入、退出码 3。
 #[test]
 fn config_command_edits_in_place_and_unsets_unknown_keys() {
@@ -7169,35 +7217,44 @@ fn config_command_edits_in_place_and_unsets_unknown_keys() {
     };
 
     // 文件里有一个不认识的键：展示照常，附上诊断与删除它的命令，退出码 3
-    let show = run(&["--show"]);
-    assert_eq!(show.status.code(), Some(3));
-    let stderr = String::from_utf8_lossy(&show.stderr);
+    for args in [&["show"][..], &["show", "--effective"]] {
+        let show = run(args);
+        assert_eq!(show.status.code(), Some(3), "{args:?}");
+        let stderr = String::from_utf8_lossy(&show.stderr);
+        assert!(
+            stderr.contains("legacy_key: unknown key")
+                && stderr.contains("aproxy config unset 'legacy_key'"),
+            "{stderr}"
+        );
+        assert!(String::from_utf8_lossy(&show.stdout).contains("old.example.com"));
+    }
+    // 只看文件里写了的值：不认识的键也在，一个默认值都没有
+    let stdout = String::from_utf8_lossy(&run(&["show"]).stdout).to_string();
     assert!(
-        stderr.contains("legacy_key: unknown key") && stderr.contains("--unset 'legacy_key'"),
-        "{stderr}"
+        stdout.contains("legacy_key = 1") && !stdout.contains("listen_addr"),
+        "{stdout}"
     );
-    assert!(String::from_utf8_lossy(&show.stdout).contains("old.example.com"));
 
     // 原有的错误不挡住无关的改动
-    let out = run(&[
-        "--baseurl",
-        "https://new.example.com/",
-        "--keepalive-secs",
-        "20",
-    ]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    for args in [
+        &["set", "base_url", "https://new.example.com"][..],
+        &["set", "keepalive.interval_secs", "20"],
+    ] {
+        let out = run(args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     assert_eq!(
         std::fs::read_to_string(&cfg_file).unwrap(),
         "# 我的上游\nbase_url = \"https://new.example.com\"  # 行尾注释\nlegacy_key = 1\n\n# 超时\n[timeouts]\nconnect_secs = 5\n\n[keepalive]\ninterval_secs = 20\n"
     );
 
     // 删掉不认识的键之后配置有效
-    assert!(run(&["--unset", "legacy_key"]).status.success());
-    let show = run(&["--show"]);
+    assert!(run(&["unset", "legacy_key"]).status.success());
+    let show = run(&["show", "--effective"]);
     assert!(
         show.status.success(),
         "{}",
@@ -7212,7 +7269,7 @@ fn config_command_edits_in_place_and_unsets_unknown_keys() {
 
     // 会让配置无效的改动不写入
     let before = std::fs::read_to_string(&cfg_file).unwrap();
-    let bad = run(&["--baseurl", "ftp://nope.example.com"]);
+    let bad = run(&["set", "base_url", "ftp://nope.example.com"]);
     assert_eq!(bad.status.code(), Some(3));
     assert!(
         String::from_utf8_lossy(&bad.stderr).contains("[config_invalid_value]"),
@@ -7221,7 +7278,28 @@ fn config_command_edits_in_place_and_unsets_unknown_keys() {
     );
     assert_eq!(std::fs::read_to_string(&cfg_file).unwrap(), before);
     // 删一个不存在的键也成功
-    assert!(run(&["--unset", "never.was.here"]).status.success());
+    assert!(run(&["unset", "never.was.here"]).status.success());
+    assert_eq!(std::fs::read_to_string(&cfg_file).unwrap(), before);
+    // 不认识的键设不上（退出码 3），写法不对的键路径与值是用法错误（退出码 2）
+    assert_eq!(run(&["set", "legacy_key", "1"]).status.code(), Some(3));
+    assert_eq!(run(&["set", "bad..path", "1"]).status.code(), Some(2));
+    assert_eq!(
+        run(&["set", "max_request_mb", "many"]).status.code(),
+        Some(2)
+    );
+    assert_eq!(run(&["set", "format[0].name", "x"]).status.code(), Some(2));
+    assert_eq!(run(&["get", "legacy_key"]).status.code(), Some(3));
+    assert_eq!(std::fs::read_to_string(&cfg_file).unwrap(), before);
+    // 旧的专用旗标一个不留
+    for args in [
+        &["--show"][..],
+        &["--baseurl", "https://x.example.com"],
+        &["--unset", "base_url"],
+        &["--clear-default"],
+        &[],
+    ] {
+        assert_eq!(run(args).status.code(), Some(2), "{args:?}");
+    }
     assert_eq!(std::fs::read_to_string(&cfg_file).unwrap(), before);
 }
 
@@ -7242,7 +7320,11 @@ fn concurrent_config_writers_do_not_lose_updates() {
                 .arg("config")
                 .arg("--config")
                 .arg(&cfg_file)
-                .args(["--extra-header", &format!("x-writer-{i}=v{i}")])
+                .args([
+                    "set",
+                    &format!("extra_headers.x-writer-{i}"),
+                    &format!("v{i}"),
+                ])
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -7572,7 +7654,7 @@ fn invalid_settings_block_start_but_not_stop_status_or_repair() {
     for args in [
         vec!["start", "--config", cfg_arg],
         vec!["alias", "list"],
-        vec!["config", "--config", cfg_arg, "--show"],
+        vec!["config", "--config", cfg_arg, "show"],
         vec!["restart", "all"],
     ] {
         let out = run(&args);
@@ -7801,7 +7883,7 @@ fn settings_defaults_reach_config_and_credentials_follow_their_target() {
             .arg("config")
             .arg("--config")
             .arg(&cfg_file)
-            .args(["--show"])
+            .args(["show", "--effective"])
             .output()
             .unwrap();
         assert!(
@@ -7823,7 +7905,7 @@ fn settings_defaults_reach_config_and_credentials_follow_their_target() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("api_key                    = \"sk-DEF"),
+        stdout.contains("api_key                    = <secret"),
         "{stdout}"
     );
     assert!(

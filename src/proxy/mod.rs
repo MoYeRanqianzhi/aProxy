@@ -113,7 +113,7 @@ use upstream::*;
 pub(crate) use body::RESIDENT_LIMIT;
 pub use body::RequestBody;
 pub use handler::router;
-pub(crate) use headers::is_hop_header;
+pub(crate) use headers::{is_hop_header, request_encoding};
 pub use spool::SpooledBody;
 pub(crate) use spool::{SpoolPath, unique_seq};
 use state::first_matching_rule;

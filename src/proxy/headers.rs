@@ -94,3 +94,53 @@ pub(super) fn body_encoding(value: Option<&[u8]>) -> Option<&str> {
     let value = std::str::from_utf8(value?).ok()?.trim();
     (!value.is_empty() && !value.eq_ignore_ascii_case("identity")).then_some(value)
 }
+
+/// 按到达顺序组合列表型编码头，不能仅解第一段后就把其余编码一同移除。
+/// 单值只借用原头；没有 format 的请求沿用原来的单值路径。
+pub(crate) fn request_encoding(
+    headers: &HeaderMap,
+    formatted: bool,
+) -> Option<std::borrow::Cow<'_, HeaderValue>> {
+    use std::borrow::Cow;
+    let first = headers.get(http::header::CONTENT_ENCODING)?;
+    if !formatted {
+        return Some(Cow::Borrowed(first));
+    }
+    let mut rest = headers
+        .get_all(http::header::CONTENT_ENCODING)
+        .iter()
+        .skip(1)
+        .peekable();
+    if rest.peek().is_none() {
+        return Some(Cow::Borrowed(first));
+    }
+    let mut bytes = first.as_bytes().to_vec();
+    for value in rest {
+        bytes.extend_from_slice(b", ");
+        bytes.extend_from_slice(value.as_bytes());
+    }
+    // 全部片段都是合法头值，分隔符也是可见 ASCII；不要求片段内容本身是 UTF-8。
+    Some(Cow::Owned(
+        HeaderValue::from_maybe_shared(Bytes::from(bytes)).expect("joined header values"),
+    ))
+}
+
+/// 请求记录和 format 必须做同一个深度判定；超限交给历史的未知编码分支，不误记明文。
+pub(super) fn request_history_encoding(raw: Option<&HeaderValue>, formatted: bool) -> Option<&str> {
+    let encoding = body_encoding(raw.map(HeaderValue::as_bytes))?;
+    Some(if formatted && !format_encoding_depth_allowed(encoding) {
+        "unsupported"
+    } else {
+        encoding
+    })
+}
+
+/// 在构造第一个缓冲解码器之前限制嵌套读与析构的深度；identity 无需建立一层。
+pub(super) fn format_encoding_depth_allowed(encoding: &str) -> bool {
+    encoding
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("identity"))
+        .nth(4)
+        .is_none()
+}

@@ -13,14 +13,14 @@ mod pool;
 pub(crate) use pool::{Fault, Pool};
 /// 头表 → 信封：键小写（HeaderMap 迭代即小写）、跳过 hop-by-hop 头（含
 /// content-length——由 aproxy 按实际字节回填，format 不该看到也不能改）。
-/// **多值头仅保留首值**（set-cookie 的 Expires 含逗号，逗号合并不合法；拒绝
+/// 编码头按顺序合并；**其余多值头仅保留首值**（set-cookie 的 Expires 含逗号，逗号合并不合法；拒绝
 /// 转换代价失衡——LLM API 请求侧无多值头，响应侧 set-cookie 在代理场景无
 /// 会话意义）；非可见 ASCII 的头值丢弃 + warn。
 pub(crate) fn headers_to_btreemap(headers: &axum::http::HeaderMap) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for (name, value) in headers.iter() {
         let key = name.as_str().to_string();
-        if is_hop_header(&key) {
+        if name == axum::http::header::CONTENT_ENCODING || is_hop_header(&key) {
             continue;
         }
         let Ok(v) = value.to_str() else {
@@ -34,6 +34,14 @@ pub(crate) fn headers_to_btreemap(headers: &axum::http::HeaderMap) -> BTreeMap<S
             Entry::Vacant(e) => {
                 e.insert(v.to_string());
             }
+        }
+    }
+    if let Some(encoding) = crate::proxy::request_encoding(headers, true) {
+        match encoding.to_str() {
+            Ok(v) => {
+                map.insert("content-encoding".into(), v.into());
+            }
+            Err(_) => tracing::warn!("non-ASCII header omitted from format input"),
         }
     }
     map

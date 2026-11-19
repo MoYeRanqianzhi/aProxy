@@ -224,6 +224,9 @@ impl RequestBody {
         dir: Option<PathBuf>,
         limit: u64,
     ) -> (Self, bool) {
+        if !format_encoding_depth_allowed(encoding) {
+            return (self, false);
+        }
         let mut out = SpillWriter::Memory {
             buf: Vec::new(),
             dir,

@@ -1372,6 +1372,7 @@ async fn request_format_headers_encoding_and_history_match_the_upstream() {
     let compressed = gz.finish().unwrap();
     for mode in [
         "decoded",
+        "two-fields",
         "bad-gzip",
         "header-only",
         "no-program",
@@ -1429,13 +1430,16 @@ async fn request_format_headers_encoding_and_history_match_the_upstream() {
         }
         let (client, url) = running(&home, up, &cfg);
         let mut req = client.post(&url).body(data.clone());
+        if mode == "two-fields" {
+            req = req.header("content-encoding", "identity");
+        }
         if mode != "header-only" {
             req = req.header("content-encoding", "gzip");
         }
         let res = req.send().await.unwrap();
         assert_eq!(res.status(), 200);
         res.bytes().await.unwrap();
-        let expected = if mode == "decoded" {
+        let expected = if matches!(mode, "decoded" | "two-fields") {
             b"original".as_slice()
         } else {
             data.as_slice()

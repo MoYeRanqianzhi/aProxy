@@ -872,88 +872,130 @@ fn uncompressed_responses_are_judged_without_decoding() {
 /// 池位被占用时两个方向都不能先读 spool；文件直到归还池位之前才出现，提前读会直接失败或跳层。
 #[tokio::test]
 async fn queued_format_calls_only_read_the_spool_after_admission() {
-    let temp = tempfile::tempdir().unwrap();
-    let (parsed, errors) = crate::config::file::parse(
-        "[[format]]\ncommand='f'\nprocess='persistent'\npool_max=1\nstages=['request','response']",
-        Path::new("unit.toml"),
-    );
-    assert!(errors.is_empty());
-    let mut entry = parsed.format.unwrap().pop().unwrap();
-    entry.command = crate::transform::format_echo_path().display().to_string();
-    entry.args = vec!["stateful".into()];
-    let pool = crate::transform::Pool::new(
-        entry,
-        temp.path().into(),
-        Default::default(),
-        Default::default(),
-        [1024 * 1024; 2],
-    );
-    let mut state = AppState::new(Config {
-        disk_cache: Some(false),
-        ..Config::default()
-    });
-    state.formats = vec![pool.clone()].into();
-    let response_state = state.clone();
-    let hold = pool.turn(false).await.unwrap();
-    let req_path = temp.path().join("request");
-    let resp_path = temp.path().join("response");
-    let make_req = |body| OutboundRequest {
-        method: http::Method::POST,
-        target_url: "http://localhost/test".into(),
-        headers: HeaderMap::new(),
-        body,
-        replacement: None,
-        client_accept: false,
-        body_stream: None,
-        client_encoding: None,
-        ctx: Some(ExchangeCtx::new(
-            "id".into(),
-            "/",
-            false,
-            crate::history::Recorder::none(),
-        )),
-    };
-    let mut req = make_req(RequestBody::Disk {
-        path: req_path.clone(),
-        len: 1,
-    });
-    let response_req = make_req(RequestBody::Memory(Bytes::new()));
-    let mut chain = RequestChain::new(&req);
-    let mut responder = Responder::buffered();
-    {
-        let mut run = std::pin::pin!(chain.run(&mut state, &mut req, 1, &mut responder));
-        let mut response = std::pin::pin!(transform_response_if_configured(
-            &response_state,
-            &response_req,
-            StatusCode::OK,
-            HeaderMap::new(),
-            SpooledBody::Disk {
-                path: resp_path.clone(),
-                len: 1
+    for encoded in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let (parsed, errors) = crate::config::file::parse(
+            "[[format]]\ncommand='f'\nprocess='persistent'\npool_max=1\nstages=['request','response']",
+            Path::new("unit.toml"),
+        );
+        assert!(errors.is_empty());
+        let mut entry = parsed.format.unwrap().pop().unwrap();
+        entry.command = crate::transform::format_echo_path().display().to_string();
+        entry.args = vec!["stateful".into()];
+        let pool = crate::transform::Pool::new(
+            entry,
+            temp.path().into(),
+            Default::default(),
+            Default::default(),
+            [1024 * 1024; 2],
+        );
+        let mut state = AppState::new(Config {
+            disk_cache: Some(false),
+            ..Config::default()
+        });
+        state.formats = vec![pool.clone()].into();
+        let response_state = state.clone();
+        let hold = pool.turn(false).await.unwrap();
+        let req_path = temp.path().join("request");
+        let resp_path = temp.path().join("response");
+        let make_req = |body| OutboundRequest {
+            method: http::Method::POST,
+            target_url: "http://localhost/test".into(),
+            headers: HeaderMap::new(),
+            body,
+            replacement: None,
+            client_accept: false,
+            body_stream: None,
+            client_encoding: None,
+            ctx: Some(ExchangeCtx::new(
+                "id".into(),
+                "/",
+                false,
+                crate::history::Recorder::none(),
+            )),
+        };
+        let mut req = make_req(RequestBody::Disk {
+            path: req_path.clone(),
+            len: 1,
+        });
+        let response_req = make_req(RequestBody::Memory(Bytes::new()));
+        if encoded {
+            req.headers.insert(
+                http::header::CONTENT_ENCODING,
+                HeaderValue::from_static("gzip"),
+            );
+        }
+        let mut chain = RequestChain::new(&req);
+        let mut responder = Responder::buffered();
+        {
+            let mut run = std::pin::pin!(chain.run(&mut state, &mut req, 1, &mut responder));
+            let mut response = std::pin::pin!(transform_response_if_configured(
+                &response_state,
+                &response_req,
+                StatusCode::OK,
+                HeaderMap::new(),
+                SpooledBody::Disk {
+                    path: resp_path.clone(),
+                    len: 1
+                }
+            ));
+            assert!(futures_util::poll!(&mut run).is_pending());
+            assert!(futures_util::poll!(&mut response).is_pending());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(80), &mut run)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(80), &mut response)
+                    .await
+                    .is_err()
+            );
+            use std::io::Write as _;
+            if encoded {
+                let mut compressed =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                compressed.write_all(b"r").unwrap();
+                std::fs::write(&req_path, compressed.finish().unwrap()).unwrap();
+            } else {
+                std::fs::write(&req_path, b"r").unwrap();
             }
-        ));
-        assert!(futures_util::poll!(&mut run).is_pending());
-        assert!(futures_util::poll!(&mut response).is_pending());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(80), &mut run)
-                .await
-                .is_err()
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(80), &mut response)
-                .await
-                .is_err()
-        );
-        std::fs::write(&req_path, b"r").unwrap();
-        std::fs::write(&resp_path, b"s").unwrap();
-        drop(hold);
-        let (sent, (_, headers, _)) = tokio::time::timeout(Duration::from_secs(8), async {
-            tokio::join!(run, response)
-        })
-        .await
-        .unwrap();
-        assert!(sent.is_ok());
-        assert!(headers.contains_key("x-stage-seen"));
+            std::fs::write(&resp_path, b"s").unwrap();
+            drop(hold);
+            let (sent, (_, headers, _)) = tokio::time::timeout(Duration::from_secs(8), async {
+                tokio::join!(run, response)
+            })
+            .await
+            .unwrap();
+            assert!(sent.is_ok());
+            assert!(headers.contains_key("x-stage-seen"));
+        }
+        assert!(req.headers.contains_key("x-stage-seen"));
+        if encoded {
+            assert!(matches!(&req.body, RequestBody::Memory(b) if b.as_ref() == b"r"));
+        }
     }
-    assert!(req.headers.contains_key("x-stage-seen"));
+}
+
+/// 四层以内的短样本正常解码，再多一层时保留原体，不构造部分解码器。
+#[test]
+fn format_request_decoding_bounds_nested_readers() {
+    use std::io::Write as _;
+    let mut bytes = b"sample".to_vec();
+    let mut layers = vec!["identity"];
+    for depth in 1..=5 {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&bytes).unwrap();
+        bytes = encoder.finish().unwrap();
+        layers.push("gzip");
+        let original = RequestBody::Memory(Bytes::copy_from_slice(&bytes));
+        let (body, decoded) = original.decode_for_format(&layers.join(","), None, 1024);
+        let expected = if depth <= 4 {
+            b"sample".as_slice()
+        } else {
+            bytes.as_slice()
+        };
+        assert_eq!(decoded, depth <= 4);
+        assert!(matches!(&body, RequestBody::Memory(b) if b.as_ref() == expected));
+    }
 }

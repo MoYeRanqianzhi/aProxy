@@ -350,11 +350,8 @@ fn record_try(
     same_body: bool,
     req: &OutboundRequest,
 ) {
-    let encoding = body_encoding(
-        req.headers
-            .get(http::header::CONTENT_ENCODING)
-            .map(|v| v.as_bytes()),
-    );
+    let raw = request_encoding(&req.headers, req.ctx.is_some());
+    let encoding = request_history_encoding(raw.as_deref(), req.ctx.is_some());
     let Some(mut history) = rec.try_started(attempt, sent, same_body, encoding) else {
         return;
     };
@@ -412,8 +409,8 @@ pub(super) async fn run_attempts(
     r.prepare_upstream_headers(&mut req.headers);
     log_proxied_request(&req.method, path_and_query, &req.target_url);
     let mut sent = sent_head(&rec, &req);
-    let mut same_body =
-        req.headers.get(http::header::CONTENT_ENCODING) == req.client_encoding.as_ref();
+    let mut same_body = request_encoding(&req.headers, req.ctx.is_some()).as_deref()
+        == req.client_encoding.as_ref();
     let mut attempt: u32 = 0;
     // 「重试中」的计数守卫：第二次尝试开始时拿到，交付之前放掉；别的出口随函数返回丢弃
     let mut retrying: Option<crate::daemon::Counted> = None;

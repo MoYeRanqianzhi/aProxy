@@ -69,6 +69,8 @@ pub(super) struct RequestChain {
     /// 保活触发条件只用客户端原样的 Accept 和请求体，不受上游改写影响。
     accept: bool,
     body_stream: Option<bool>,
+    /// 只让实际取得首次 worker 的消息准备原体，重试不再解码补丁指定的编码。
+    prepare_original: bool,
     /// 尚未成功的程序在配置里的位置。
     cursor: usize,
     /// 当前跑首轮 request 方向还是重跑 retry 方向，层失败时不变。
@@ -111,6 +113,7 @@ impl RequestChain {
             sent_encoding: req.client_encoding.clone(),
             accept: req.client_accept,
             body_stream: req.body_stream,
+            prepare_original: true,
             cursor: 0,
             stage: Stage::Request,
             last: None,
@@ -118,21 +121,19 @@ impl RequestChain {
             max_attempts: None,
         }
     }
-    /// 依次派发；在完成一层之后才移动游标。一个请求的局部配置不能通过共享的实例泄漏。
-    pub(super) async fn run(
+    /// 在进程接纳之后、首帧写出之前准备原体；所有后续层和重试都复用同一份表示。
+    async fn prepare_body(
         &mut self,
-        state: &mut AppState,
-        req: &mut OutboundRequest,
-        attempt: u32,
-        responder: &mut Responder,
-    ) -> Result<bool, ChainError> {
-        let ctx = req.ctx.as_ref().expect("format context");
-        if attempt == 1
-            && let Some(encoding) = self.headers.get(http::header::CONTENT_ENCODING).cloned()
+        state: &AppState,
+        body: &mut RequestBody,
+    ) -> Result<(), ChainError> {
+        if std::mem::take(&mut self.prepare_original)
+            && let Some(encoding) = request_encoding(&self.headers, true).map(|v| v.into_owned())
             && state.formats.iter().any(|pool| {
                 let hello = pool.negotiated.lock().unwrap();
                 [Stage::Request, Stage::Retry].into_iter().any(|stage| {
                     pool.entry.has_stage(stage)
+                        && hello.is_some()
                         && matches!(
                             hello
                                 .as_ref()
@@ -144,29 +145,42 @@ impl RequestChain {
         {
             let limit = state.config.body_limit_bytes() as u64;
             let dir = state.spool_dir.clone();
-            let original = std::mem::replace(&mut req.body, RequestBody::Memory(Bytes::new()));
+            let original = std::mem::replace(body, RequestBody::Memory(Bytes::new()));
             let task = tokio::task::spawn_blocking(move || match encoding.to_str() {
                 Ok(enc) => original.decode_for_format(enc, dir, limit),
                 Err(_) => (original, false),
             });
-            let (body, decoded) = responder
-                .wait(task, None, "format request decode")
-                .await
-                .ok_or(ChainError::Disconnected)?
-                .map_err(|e| {
-                    ChainError::stop(
-                        Terminal::local_storage_failed(StorageOp::ReadRequest, &e.to_string()),
-                        None,
-                    )
-                })?;
-            req.body = body;
+            let (prepared, decoded) = task.await.map_err(|e| {
+                ChainError::stop(
+                    Terminal::local_storage_failed(StorageOp::ReadRequest, &e.to_string()),
+                    None,
+                )
+            })?;
+            *body = prepared;
             if decoded {
                 self.headers.remove(http::header::CONTENT_ENCODING);
                 self.input.headers.remove("content-encoding");
                 self.body_version = self.next_body_version;
                 self.next_body_version += 1;
+                // 首个 retry 前缀可能在排队前已记下；它和原请求共用这份解码后的体。
+                if let Some(prefix) = &mut self.prefix {
+                    prefix.headers.remove(http::header::CONTENT_ENCODING);
+                    prefix.input.headers.remove("content-encoding");
+                    prefix.version = self.body_version;
+                }
             }
         }
+        Ok(())
+    }
+    /// 依次派发；在完成一层之后才移动游标。一个请求的局部配置不能通过共享的实例泄漏。
+    pub(super) async fn run(
+        &mut self,
+        state: &mut AppState,
+        req: &mut OutboundRequest,
+        attempt: u32,
+        responder: &mut Responder,
+    ) -> Result<bool, ChainError> {
+        let ctx = req.ctx.as_ref().expect("format context");
         if self.cursor == state.formats.len() {
             let Some(p) = &self.prefix else {
                 return Ok(false);
@@ -200,6 +214,7 @@ impl RequestChain {
                         Ok(turn) => turn,
                         Err(f) => return Ok(Err(f)),
                     };
+                    self.prepare_body(state, &mut req.body).await?;
                     let mut input = self.input.clone();
                     let bytes = match self.body.as_deref().unwrap_or(&req.body) {
                         RequestBody::Memory(b) => b.to_vec(),
@@ -348,10 +363,10 @@ impl RequestChain {
         // 游标也可能是从失败层恢复；此前各层留下的 input 必须交付，不能只看本轮是否有补丁。
         req.target_url = self.input.url.clone();
         req.headers = self.headers.clone();
-        let encoding = req.headers.get(http::header::CONTENT_ENCODING);
-        let changed =
-            self.body_version != self.sent_body_version || encoding != self.sent_encoding.as_ref();
-        self.sent_encoding = encoding.cloned();
+        let encoding = request_encoding(&req.headers, true);
+        let changed = self.body_version != self.sent_body_version
+            || encoding.as_deref() != self.sent_encoding.as_ref();
+        self.sent_encoding = encoding.map(|v| v.into_owned());
         self.sent_body_version = self.body_version;
         req.replacement = self.body.clone();
         Ok(changed)

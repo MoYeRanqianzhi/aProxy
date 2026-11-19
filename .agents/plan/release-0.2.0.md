@@ -1009,26 +1009,24 @@
     验证：headless 全量 783 过，headless 与 desktop 两种 clippy 干净（Linux 交叉未跑：这一步没有平台相关代码）。
     偏离：设计稿要每个命令一份 golden；status 的文档里有 pid、时刻等每次不同的值，测试改为断言结构与关键字段。
   - [x] B9-5 doctor：换成诊断类型，`--json`，码（`file_permissions_too_open`、`default_header_shared` 等）。
-    Doctor reports the settings file, distinct config paths, home permissions and unreadable records in that order.
-    It uses startup's layered config diagnostics, names the other files sharing a port, and shows an `unset` command
-    for unknown keys. Text and JSON both exit 3 only for errors; `gc_paused` comes from the same read-only scan as status.
-    Six warning codes extend §2.4 so consumers need not parse prose. Zero `watchdog.stale_after_cycles` is a settings
-    error rather than a silent clamp; both legal watchdog settings that disable or delay recovery remain warnings.
-    Verification (Windows, locked, headless): `cargo test -p aproxy-ipc --locked` (30); `cargo test --no-default-features
-    --locked` with `--test code_table` (1), `--lib doctor` (9), `--lib settings` (39), `--lib find` (3), `--test json_docs`
-    (9), `--test exit_codes doctor` (1) and `--test access_control` (2). No change to the §9.4 document or §9.5 exits.
-    The forward/format warnings still depend on B10d allowing that combination; user documentation is tracked by B9-8.
+    188de2e、3d9956d（Codex t04）。doctor 按文件给出诊断，顺序是 settings.json、各配置文件（去重）、home 的权限、
+    读不懂的记录；配置走 start 的分层管线，同端口的配置互相点名，不认识的键给出删除它的 `unset` 命令；文字与
+    `--json` 都只在有 error 时退出 3；`gc_paused` 与 status 出自同一次只读枚举。码表在 §2.4 之外加了六个 warning 码
+    （`listen_not_loopback`、`port_shared`、`config_dir_missing`、`config_file_unreadable`、
+    `watchdog_slow_hang_detection`、`watchdog_restarts_disabled`），调用方不必解析文字。`watchdog.stale_after_cycles = 0`
+    原来被看护者静默按 1 处理，现在是 settings 的错误；心跳周期过长与 `max_restarts = 0` 合法但会推迟或关掉自愈，
+    仍是 warning。验证（Windows、headless）：aproxy-ipc 30、code_table 1、`--lib doctor` 9、`--lib settings` 39、
+    `--lib find` 3、json_docs 9、exit_codes 的 doctor 1、access_control 2。§9.4 的文档与 §9.5 的退出码不变。
+    forward 与 format 同用的告警要等 B10d 放开这个组合；面向用户的文档归 B9-8。
   - [ ] B9-6 install：`--check`、`--json`（NDJSON）、预检（`install_precheck_failed`、`install_unmanaged_instances`）、
     A5 的四个字段、`halted` 时不拉起续作、与 `--force` 冲突的旗标进 force_contract 的命令行样本。
   - [x] B9-7 输出纪律（§9.6）：CLI 的 tracing 写 stderr、默认 WARN；遍历命令树的帮助测试；`RUST_LOG=info` 时 stdout
     没有日志行。
-    CLI tracing now goes to stderr (WARN unless `RUST_LOG` overrides it); captured stderr has no ANSI colours.
-    Foreground instances keep their console log. The detached watchdog, `__serve`, desktop and C7 force-install
-    retain their own logging; in particular a force install must keep its established write-error and exit behaviour.
-    The help walk covers the root plus 23 visible command paths. Seven JSON commands each returned one schema-1
-    line under `RUST_LOG=info`; the withheld-credential INFO appeared on stderr and was absent at the default level.
-    Verification (Windows): `cargo fmt --all` and `cargo clippy --workspace --exclude aproxy-desktop --all-targets
-    --no-default-features --locked -- -D warnings` passed. `cargo test --no-default-features --locked --test` targets:
-    `cli_tree` (9), `test_home_check` (2), `exit_codes` (22), `proxy_integration` (117), `restart_integration` (23).
-    No further logging changes pending here. The skill footer for help is tracked separately by W4 (§9.6).
+    6c254f2（Codex t04）。CLI 的 tracing 写 stderr（`init_cli_logging`），默认 WARN，`RUST_LOG` 可调；stderr 被捕获时
+    不带颜色。前台实例照旧把日志写在控制台；分离拉起的看护者、`__serve`、桌面与强制安装（C7，写失败不改退出码）
+    各自初始化日志，不变。去掉了 t03 在 main.rs 里给 `status --json` 开的特例。帮助遍历覆盖根命令与 23 个可见的
+    命令路径；`RUST_LOG=info` 时七个 `--json` 命令的 stdout 都只有一行带 schema 1 的文档，被扣下的凭据那条 INFO
+    出现在 stderr、默认级别时不出现。restart_integration 的并发看护者测试原来从 stdout 读 INFO，改为开 INFO 读 stderr。
+    验证（Windows、headless）：fmt、clippy 干净；cli_tree 9、test_home_check 2、exit_codes 22、proxy_integration 117、
+    restart_integration 23。帮助末尾的 skill 提示归 W4（§9.6）。
   - [ ] B9-8 文档：技能的 commands.md、compatibility.md（0.2.0 之内的命令行变化）、README、CHANGELOG、安装脚本。

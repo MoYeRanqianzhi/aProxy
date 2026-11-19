@@ -221,6 +221,16 @@ pub(super) async fn model_in_file(path: &Path) -> Option<String> {
     .flatten()
 }
 
+/// 只用正文触发且没有格式覆盖时，根本不读取 Accept；有覆盖机会则预留客户端原始判定。
+pub(super) fn original_accept(
+    headers: &HeaderMap,
+    trigger: crate::config::KeepaliveTrigger,
+    formatted: bool,
+) -> bool {
+    (formatted || trigger != crate::config::KeepaliveTrigger::BodyStream)
+        && accepts_event_stream(headers)
+}
+
 /// 请求的 Accept 里有没有 `text/event-stream`。
 pub(super) fn accepts_event_stream(headers: &HeaderMap) -> bool {
     headers

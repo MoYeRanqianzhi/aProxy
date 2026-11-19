@@ -989,7 +989,7 @@ fn format_request_decoding_bounds_nested_readers() {
         bytes = encoder.finish().unwrap();
         layers.push("gzip");
         let original = RequestBody::Memory(Bytes::copy_from_slice(&bytes));
-        let (body, decoded) = original.decode_for_format(&layers.join(","), None, 1024);
+        let (body, decoded) = original.decode_for_format(&layers.join(","), None, 1024, || false);
         let expected = if depth <= 4 {
             b"sample".as_slice()
         } else {
@@ -1009,4 +1009,85 @@ async fn static_only_keepalive_skips_dynamic_cancellation() {
         unreachable!()
     };
     assert!(!*replay_gate.lock().unwrap());
+}
+
+/// 实际发出之前打开 spool 失败时，这次尝试要留下本地原因，而不是两栏都空。
+#[tokio::test]
+async fn unavailable_outgoing_spool_records_its_attempt_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(Config {
+        spool_dir_override: Some(dir.path().into()),
+        ..Config::default()
+    });
+    let headers = HeaderMap::new();
+    let id: Arc<str> = format!("{}-1", state.instance_id).into();
+    let rec = state.history.begin(
+        1,
+        id.clone(),
+        crate::history::Start {
+            method: "POST",
+            path_and_query: "/",
+            headers: &headers,
+            delivery: "retry",
+            phase: crate::history::Phase::Attempting,
+        },
+    );
+    let req = OutboundRequest {
+        method: http::Method::POST,
+        target_url: "http://localhost/".into(),
+        headers,
+        body: RequestBody::Disk {
+            path: dir.path().join("absent"),
+            len: 20,
+        },
+        replacement: None,
+        client_encoding: None,
+        client_accept: false,
+        body_stream: None,
+        ctx: None,
+    };
+    run_attempts(
+        &state,
+        req,
+        "/",
+        1024,
+        &mut Responder::buffered(),
+        RequestTrace::recorded(id.clone(), rec),
+    )
+    .await;
+    let d: serde_json::Value =
+        serde_json::from_str(&state.history.detail_json(&id).unwrap()).unwrap();
+    assert_eq!(d["record"]["tries"][0]["code"], "local_storage_failed");
+    assert_eq!(d["tries"][0]["error"]["details"]["op"], "read_request");
+    assert_eq!(d["tries"][0]["response"], serde_json::Value::Null);
+}
+
+/// 输出刚开始溢写时模拟接收端离开；阻塞解码要停在下一块，临时半成品随之消失。
+#[test]
+fn cancelled_format_decode_discards_its_partial_spool() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = Bytes::from(vec![b'x'; RESIDENT_LIMIT * 2]);
+    let gone = || std::fs::read_dir(dir.path()).unwrap().next().is_some();
+    let (body, decoded) = RequestBody::Memory(bytes.clone()).decode_for_format(
+        "identity",
+        Some(dir.path().into()),
+        u64::MAX,
+        gone,
+    );
+    assert!(!decoded);
+    assert!(matches!(&body,RequestBody::Memory(b) if *b==bytes));
+    assert!(!gone());
+}
+
+/// 单靠正文的无程序实例不采集 Accept；可能逐请求改触发器的实例仍保留原判断。
+#[test]
+fn body_stream_without_formats_does_not_capture_accept() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::ACCEPT,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    let body = crate::config::KeepaliveTrigger::BodyStream;
+    assert!(!original_accept(&headers, body, false));
+    assert!(original_accept(&headers, body, true));
 }

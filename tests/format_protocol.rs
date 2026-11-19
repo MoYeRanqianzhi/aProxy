@@ -2577,3 +2577,101 @@ async fn local_response_decode_failure_keeps_the_admitted_worker() {
     assert_eq!(f[0]["stage"], "hello");
     assert_eq!(f[1]["stage"], "response");
 }
+
+/// 各层看到的 Accept-Encoding 跟随当前保活选择；关闭后恢复最近补丁提供的上游值。
+#[tokio::test]
+async fn request_layers_see_managed_encoding_as_keepalive_changes() {
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let app = axum::Router::new().fallback(|h: axum::http::HeaderMap| async move {
+        h["accept-encoding"].to_str().unwrap().to_owned()
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = String::from("[keepalive]\ninterval_secs=10\ntrigger='accept'\n")
+        + &layer(
+            &home,
+            "put",
+            "'request'",
+            &[
+                "reply",
+                r#"{"request":{"headers":{"Accept-Encoding":"gzip"}}}"#,
+            ],
+        )
+        + &layer(
+            &home,
+            "disable",
+            "'request'",
+            &[
+                "reply",
+                r#"{"overrides":{"keepalive":{"interval_secs":0}}}"#,
+            ],
+        )
+        + &layer(&home, "read", "'request','retry'", &["reply", "{}"]);
+    let (c, url) = running(&home, up, &cfg);
+    let r = c
+        .get(url)
+        .header("accept", "text/event-stream")
+        .header("accept-encoding", "br")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.text().await.unwrap(), "gzip");
+    for (name, seen) in [
+        ("put", "identity"),
+        ("disable", "identity"),
+        ("read", "gzip"),
+    ] {
+        let f = frames(&home, name);
+        assert_eq!(
+            f[1]["request"]["headers"]["accept-encoding"], seen,
+            "{name}"
+        );
+    }
+}
+/// 曾协商到 full、现在正熔断的可选层不能让另一个只要元数据的程序改写原压缩请求。
+#[tokio::test]
+async fn open_optional_full_layer_preserves_the_compressed_request() {
+    use std::io::Write as _;
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let app = axum::Router::new().fallback(
+        |h: axum::http::HeaderMap, b: axum::body::Bytes| async move {
+            (h.get("content-encoding")
+                .map(|v| v.to_str().unwrap())
+                .unwrap_or("identity")
+                .to_owned()
+                + ":"
+                + &b.len().to_string())
+                .into_bytes()
+        },
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = layer(&home, "full", "'request'", &["bad-seq"])
+        + "required=false\nbreaker_failures=1\nbreaker_cooldown_secs=86400\n"
+        + &layer(&home, "meta", "'request'", &["metadata-only"]);
+    let (c, url) = running(&home, up, &cfg);
+    assert_eq!(c.post(&url).send().await.unwrap().status(), 200);
+    assert_eq!(breaker(&home, &url).await["state"], "open");
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(b"abc").unwrap();
+    let compressed = gz.finish().unwrap();
+    let expected = format!("gzip:{}", compressed.len());
+    assert_eq!(
+        c.post(url)
+            .header("content-encoding", "gzip")
+            .body(compressed)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        expected
+    );
+}

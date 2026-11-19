@@ -246,16 +246,24 @@ impl Responder {
         }
     }
 
+    /// 只有当前还在发送保活心跳时才覆盖上游编码；层间视图与实际发送使用同一判定。
+    pub(super) fn needs_identity_encoding(&self) -> bool {
+        matches!(
+            self,
+            Self::Keepalive {
+                ticker: Some(_),
+                ..
+            }
+        )
+    }
+
     /// 发往上游的请求头的出口要求：保活出口会往响应体里插心跳注释，只有未压缩的体才能这样
     /// 插（往 gzip / br 流里插明文，客户端解压必坏），所以要求上游以 identity 编码回应。客户端
     /// 照旧拿到合法响应（未压缩永远是可接受的编码），代价只是上游到本机这一段多传些字节。
     /// 放在请求转换之后，覆盖 format 可能写入的同名头（override_headers 里配的同名头也被覆盖，
     /// 启动时 server.rs 会 warn 一次）。
     fn prepare_upstream_headers(&self, headers: &mut HeaderMap) {
-        if let Self::Keepalive {
-            ticker: Some(_), ..
-        } = self
-        {
+        if self.needs_identity_encoding() {
             headers.insert(
                 http::header::ACCEPT_ENCODING,
                 HeaderValue::from_static("identity"),
@@ -769,8 +777,12 @@ pub(super) async fn run_attempts(
                 return;
             }
             Outcome::SpoolFailed(op, e) => {
-                rec.try_ended(attempt, 0, None);
                 let terminal = Terminal::local_storage_failed(op, &e);
+                rec.try_ended(
+                    attempt,
+                    0,
+                    (op == StorageOp::ReadRequest).then(|| terminal.for_history()),
+                );
                 terminal.record_in(&state.stats);
                 tracing::error!(attempt, code = %terminal.code(), error = %e, "本地 spool 故障，终止重试");
                 r.finish(terminal, &trace).await;

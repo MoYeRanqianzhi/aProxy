@@ -132,7 +132,10 @@ impl RequestChain {
     ) -> Result<(), ChainError> {
         if std::mem::take(&mut self.prepare_original)
             && let Some(encoding) = request_encoding(&self.headers, true).map(|v| v.into_owned())
-            && state.formats.iter().any(|pool| {
+            && state.formats.iter().enumerate().any(|(i, pool)| {
+                if i != self.cursor && !pool.available_for_message() {
+                    return false;
+                }
                 let hello = pool.negotiated.lock().unwrap();
                 [Stage::Request, Stage::Retry].into_iter().any(|stage| {
                     pool.entry.has_stage(stage)
@@ -149,8 +152,9 @@ impl RequestChain {
             let limit = state.config.body_limit_bytes() as u64;
             let dir = state.spool_dir.clone();
             let original = std::mem::replace(body, RequestBody::Memory(Bytes::new()));
+            let (cancel, alive) = tokio::sync::oneshot::channel::<()>();
             let task = tokio::task::spawn_blocking(move || match encoding.to_str() {
-                Ok(enc) => original.decode_for_format(enc, dir, limit),
+                Ok(enc) => original.decode_for_format(enc, dir, limit, || cancel.is_closed()),
                 Err(_) => (original, false),
             });
             let (prepared, decoded) = task.await.map_err(|e| {
@@ -159,6 +163,7 @@ impl RequestChain {
                     None,
                 )
             })?;
+            drop(alive);
             *body = prepared;
             if decoded {
                 self.headers.remove(http::header::CONTENT_ENCODING);
@@ -212,6 +217,7 @@ impl RequestChain {
                 let name = &pool.entry.name;
                 let safe = state.history.secrets().replace(name);
                 let stage = self.stage.as_str();
+                let identity = responder.needs_identity_encoding();
                 let exchange = async {
                     let turn = match pool.turn(false).await {
                         Ok(turn) => turn,
@@ -219,6 +225,12 @@ impl RequestChain {
                     };
                     self.prepare_body(state, &mut req.body).await?;
                     let mut input = self.input.clone();
+                    // 前缀留程序给的原值；保活可被后续覆盖开关，每次派发再叠加当时的代理头。
+                    if identity {
+                        input
+                            .headers
+                            .insert("accept-encoding".into(), "identity".into());
+                    }
                     let bytes = match self.body.as_deref().unwrap_or(&req.body) {
                         RequestBody::Memory(b) => b.to_vec(),
                         RequestBody::Disk { path, .. } => {

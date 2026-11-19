@@ -17,6 +17,36 @@ pub(crate) const RESIDENT_LIMIT: usize = 1024 * 1024;
 // 溢写之前攒下的那一段正好这么大；请求历史循环使用的大缓冲区按同一个大小准备
 const _: () = assert!(RESIDENT_LIMIT == crate::history::LARGE_BUFFER);
 
+/// 阻塞解码不能靠丢弃 JoinHandle 取消；每次读原体、写输出前看一次客户端是否仍在等待。
+struct ConnectedIo<'a, T, F> {
+    /// 压缩输入或可溢写的输出，两边都可能先于对方出现大量小块。
+    io: T,
+    /// 使用外层 future 所持的接收端的生命期，不跨线程共享正文。
+    cancelled: &'a F,
+}
+impl<T: std::io::Read, F: Fn() -> bool> std::io::Read for ConnectedIo<'_, T, F> {
+    /// 非 Interrupted 的错误让 copy 停止，不会在客户端已经断开后重新读。
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if (self.cancelled)() {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        self.io.read(buf)
+    }
+}
+impl<T: std::io::Write, F: Fn() -> bool> std::io::Write for ConnectedIo<'_, T, F> {
+    /// 解码输出也逐块检查：压缩输入可能已经全被预读。
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if (self.cancelled)() {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        self.io.write(buf)
+    }
+    /// 向底层交付已接受的数据，不重新启动读取。
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.io.flush()
+    }
+}
+
 /// 请求体缓冲：支持无限重试的字节重放源。
 ///
 /// - Memory：单份 Bytes，重试间零拷贝共享（小请求体常态路径）
@@ -223,6 +253,7 @@ impl RequestBody {
         encoding: &str,
         dir: Option<PathBuf>,
         limit: u64,
+        cancelled: impl Fn() -> bool,
     ) -> (Self, bool) {
         if !format_encoding_depth_allowed(encoding) {
             return (self, false);
@@ -231,13 +262,26 @@ impl RequestBody {
             buf: Vec::new(),
             dir,
         };
+        let mut decode = |input: &mut dyn std::io::Read| {
+            crate::decode::decode_strict(
+                encoding,
+                ConnectedIo {
+                    io: input,
+                    cancelled: &cancelled,
+                },
+                &mut ConnectedIo {
+                    io: &mut out,
+                    cancelled: &cancelled,
+                },
+                limit,
+            )
+            .is_ok()
+        };
         let decoded = match &self {
-            Self::Memory(bytes) => {
-                crate::decode::decode_strict(encoding, bytes.as_ref(), &mut out, limit).is_ok()
+            Self::Memory(bytes) => decode(&mut bytes.as_ref()),
+            Self::Disk { path, .. } => {
+                std::fs::File::open(path).is_ok_and(|mut file| decode(&mut file))
             }
-            Self::Disk { path, .. } => std::fs::File::open(path).is_ok_and(|file| {
-                crate::decode::decode_strict(encoding, file, &mut out, limit).is_ok()
-            }),
         };
         if decoded && let Ok(mut body) = out.into_body() {
             let body = match &mut body {

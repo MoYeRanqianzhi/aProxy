@@ -613,6 +613,14 @@ impl Pool {
             self.open(&mut c, now);
         }
     }
+    /// 准备请求表示时只查看，不抢独占试探资格。已取到自己进程的一层直接使用实际握手。
+    pub(crate) fn available_for_message(&self) -> bool {
+        let c = self.circuit.lock().unwrap();
+        !c.probing
+            && c.window.as_ref().is_none_or(|w| {
+                w.start.elapsed() >= Duration::from_secs(self.entry.breaker_cooldown_secs)
+            })
+    }
     /// 打开的程序不排队。冷却后的首条消息抢到独占试探，即使用 persistent 也重新握手。
     fn admit(&self) -> Result<Admission<'_>, Fault> {
         let mut c = self.circuit.lock().unwrap();

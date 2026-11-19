@@ -108,8 +108,8 @@ async fn handle(
     // 缓冲请求体以支持重试重放；上限 max_body_mb（默认 128 MB，0=不限），
     // 超出直接 413。disk_cache 开启时超过内存驻留阈值（1 MiB）溢写磁盘，
     // 大请求体的进程内存在途占用恒定。
-    let client_accept = accepts_event_stream(req.headers());
     let formatted = !state.formats.is_empty();
+    let client_accept = original_accept(req.headers(), state.config.keepalive_trigger(), formatted);
     let client_encoding = request_encoding(req.headers(), formatted).map(|v| v.into_owned());
     let body_limit = state.config.body_limit_bytes();
     let history = trace.rec.request_body(request_history_encoding(

@@ -731,3 +731,25 @@ async fn half_open_probe_cancellation_timeout_and_invalid_reply_have_distinct_ou
         assert_eq!(wait_observed(&obs, "request", 1).await.len(), 1);
     }
 }
+
+/// 在首字节之前已经错过截止点：不用这张票，也不处罚这次握手得到的健康会话。
+#[tokio::test]
+async fn expired_unwritten_heartbeat_does_not_charge_the_breaker() {
+    let dir = tempfile::tempdir().unwrap();
+    let obs = dir.path().join("frames");
+    let p = pool(Process::Persistent, "echo", |e| {
+        e.env
+            .insert("ECHO_RECORD".into(), obs.display().to_string());
+    });
+    let turn = p.turn(false).await.unwrap();
+    assert!(matches!(
+        turn.send_until(request_frame("expired"), 0, Some(Instant::now()))
+            .await,
+        Err(Fault::Timeout)
+    ));
+    assert_eq!(p.snapshot().1["breaker"]["failures"], 0);
+    call(&p, "timely", false).await.unwrap();
+    let log = std::fs::read_to_string(obs).unwrap();
+    assert_eq!(log.lines().count(), 2);
+    assert!(!log.contains("expired"));
+}

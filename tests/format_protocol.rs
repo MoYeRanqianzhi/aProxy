@@ -1753,6 +1753,7 @@ async fn pending_heartbeat_does_not_delay_a_response_or_its_eof() {
             .expect("response waited on heartbeat")
             .unwrap();
         assert_eq!(text, body);
+        assert_eq!(breaker(&home, &url).await["failures"], 0);
         assert_eq!(
             frames(&home, "shared")
                 .iter()
@@ -1848,6 +1849,16 @@ async fn missed_beat_deadline_preserves_last_timely_fragment() {
         .unwrap()
         .unwrap();
     assert_eq!(first.as_ref(), b": keepalive\n\n: timely\n\n");
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if breaker(&home, &url).await["last_failure"]["details"]["kind"] == "timeout" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("written heartbeat deadline was not charged");
     release.add_permits(1);
     assert!(!res.text().await.unwrap().contains(": late"));
 }
@@ -2445,4 +2456,37 @@ async fn disabled_breaker_optional_startup_recovers_on_the_next_request() {
     assert_eq!(c.get(&url).send().await.unwrap().status(), 200);
     assert_eq!(breaker(&home, &url).await["failures"], 0);
     assert_eq!(frames(&home, "optional").len(), 2);
+}
+
+/// 上游已完成而响应程序仍被门闩挡住的各拍，复用最后的及时产物，不再咨询程序。
+#[tokio::test]
+async fn response_ready_heartbeat_reuses_last_timely_bytes_without_more_calls() {
+    let home = TestHome::new();
+    let (up, release, _) = held_upstream(&[200], "data: done\n\n").await;
+    let gate = home.path().join("gate");
+    let cfg = String::from("[keepalive]\ninterval_secs=1\n")
+        + &layer(&home, "beat", "'heartbeat'", &["append", "chosen"])
+        + &layer(
+            &home,
+            "slow",
+            "'response'",
+            &["gate-response", gate.to_str().unwrap()],
+        );
+    let (c, url) = running(&home, up, &cfg);
+    let mut res = c
+        .get(format!("{url}/hold"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    let first = res.chunk().await.unwrap().unwrap();
+    assert!(first.ends_with(b": chosen\n\n"));
+    release.add_permits(1);
+    observed_stage(&home, "slow", "response", 1).await;
+    let before = frames(&home, "beat").len();
+    assert_eq!(res.chunk().await.unwrap().unwrap(), first);
+    assert_eq!(res.chunk().await.unwrap().unwrap(), first);
+    assert_eq!(frames(&home, "beat").len(), before);
+    std::fs::write(gate, b"").unwrap();
+    assert!(res.text().await.unwrap().ends_with("data: done\n\n"));
 }

@@ -67,9 +67,41 @@ pub(super) struct DynamicHeartbeat {
     /// 当前第几次上游尝试，重试循环每轮更新
     pub(super) attempt: std::sync::atomic::AtomicU32,
     /// 在途心跳的序号及最近完成的一层的字节。到下一拍时可直接取走，旧任务不会再发第二份。
-    pub(super) pending: std::sync::Mutex<Option<(u64, Bytes)>>,
+    pub(super) pending: std::sync::Mutex<BeatProgress>,
     /// 本请求已就心跳转换失败 warn 过（只 warn 一次，免得每拍刷屏）
     pub(super) warned: std::sync::atomic::AtomicBool,
+}
+
+/// 一次在途拍的发布槽与本请求最后一次及时的字节，同一锁内决定哪一版可写。
+#[derive(Default)]
+pub(super) struct BeatProgress {
+    /// 当前拍从固定字节起步；旧拍即使刚拿到回信也不得覆盖新拍。
+    active: Option<(u64, Bytes)>,
+    /// 即使该拍已经发到客户端，转为只等待交付后仍复用的字节。
+    timely: Option<Bytes>,
+}
+impl BeatProgress {
+    /// 在持有发布锁以后取时间；先完成但还没有发布的结果不能跨过这一拍的截止点。
+    fn accept(
+        &mut self,
+        id: u64,
+        bytes: &Bytes,
+        now: tokio::time::Instant,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        if now >= deadline {
+            return false;
+        }
+        let Some((current, last)) = self.active.as_mut() else {
+            return false;
+        };
+        if *current != id {
+            return false;
+        }
+        *last = bytes.clone();
+        self.timely = Some(bytes.clone());
+        true
+    }
 }
 
 /// 在独立任务里跑完一次心跳转换并写出结果。不在 drive 的 select 里直接
@@ -85,14 +117,19 @@ pub(super) fn spawn_dynamic_heartbeat(
     deadline: tokio::time::Instant,
 ) {
     let id = d.seq.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-    tasks.abort_all();
+    // 旧拍自己按截止点结算；在这里 abort 会把已经写出的超时误作普通取消。
     while tasks.try_join_next().is_some() {}
     {
         let replaying = gate.lock().unwrap();
         if *replaying {
             return;
         }
-        if let Some((_, previous)) = d.pending.lock().unwrap().replace((id, fixed.clone()))
+        if let Some((_, previous)) = d
+            .pending
+            .lock()
+            .unwrap()
+            .active
+            .replace((id, fixed.clone()))
             && tx.try_send(Ok(previous)).is_ok()
         {
             d.ctx.rec.heartbeat();
@@ -113,35 +150,30 @@ pub(super) fn spawn_dynamic_heartbeat(
             .rev()
             .filter(|p| p.entry.has_stage(crate::config::file::Stage::Heartbeat))
         {
-            let exchange = async {
-                let turn = p.turn(false).await?;
-                let m = aproxy_envelope::HeartbeatMessage::new(
-                    d.ctx.context(&p.entry.name),
-                    info.clone(),
-                    d.ctx.client.clone(),
-                    aproxy_envelope::Fragment::from_bytes(bytes.to_vec()),
-                );
-                turn.send(aproxy_envelope::Stage::Heartbeat(m), p.entry.timeout_secs)
-                    .await
+            let turn = tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => break,
+                result = p.turn(false) => result,
             };
-            let reply = tokio::select! {biased;
-                _=tokio::time::sleep_until(deadline)=>break,
-                result=exchange=>result,
+            let reply = match turn {
+                Ok(turn) => {
+                    let m = aproxy_envelope::HeartbeatMessage::new(
+                        d.ctx.context(&p.entry.name), info.clone(), d.ctx.client.clone(),
+                        aproxy_envelope::Fragment::from_bytes(bytes.to_vec()),
+                    );
+                    turn.send_until(aproxy_envelope::Stage::Heartbeat(m), p.entry.timeout_secs, Some(deadline)).await
+                }
+                Err(e) => Err(e),
             };
             match reply {
                 _ if tokio::time::Instant::now() >= deadline => break,
                 Ok((reply, _)) if reply.fail.is_none() => {
                     if let Some(b) = reply.data.as_bytes() {
                         bytes = Bytes::copy_from_slice(b);
-                        let mut pending = d.pending.lock().unwrap();
-                        let Some((current, last)) = pending.as_mut() else {
-                            return;
-                        };
-                        if *current != id {
-                            return;
-                        }
-                        if tokio::time::Instant::now() >= deadline { break; }
-                        *last = bytes.clone();
+                    }
+                    let mut pending = d.pending.lock().unwrap();
+                    if !pending.accept(id, &bytes, tokio::time::Instant::now(), deadline) {
+                        break;
                     }
                 }
                 _ => {
@@ -157,8 +189,8 @@ pub(super) fn spawn_dynamic_heartbeat(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut pending = d.pending.lock().unwrap();
             // 超时或最后一层处理跨过节拍时，只发布在截止前已经接纳的结果。
-            if !*replaying && pending.as_ref().is_some_and(|(current, _)| *current == id)
-                    && let Some((_, bytes)) = pending.take()
+            if !*replaying && pending.active.as_ref().is_some_and(|(current, _)| *current == id)
+                    && let Some((_, bytes)) = pending.active.take()
                     && let Some(tx) = tx.upgrade()
                     && tx.try_send(Ok(bytes)).is_ok() {
                 d.ctx.rec.heartbeat();
@@ -293,7 +325,7 @@ impl KeepaliveSink {
         }
     }
 
-    /// 上游响应已就绪，转入交付；慢转换期间仍可用静态心跳，但不再争用 response 的进程。
+    /// 上游响应已就绪，不再咨询心跳程序；直到第一块真实数据之间仍发送最近的及时字节。
     pub(super) fn cancel_dynamic(&mut self) {
         match self {
             Self::Committed {
@@ -302,9 +334,17 @@ impl KeepaliveSink {
                 beat,
                 ..
             } => {
-                *replay_gate.lock().unwrap() = true;
+                let Some(dynamic) = beat.dynamic.take() else {
+                    return;
+                };
+                let mut gate = replay_gate.lock().unwrap();
+                *gate = true;
                 tasks.abort_all();
-                beat.dynamic = None;
+                let mut progress = dynamic.pending.lock().unwrap();
+                progress.active = None;
+                if let Some(bytes) = progress.timely.take() {
+                    beat.fixed = bytes;
+                }
             }
             Self::Pending { beat, .. } => beat.dynamic = None,
         }
@@ -569,5 +609,25 @@ pub(super) struct ClientGoneGuard {
 impl Drop for ClientGoneGuard {
     fn drop(&mut self) {
         let _ = self.tx.send(true);
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    //! 在发布锁处同时就绪的回信和截止点，以截止点为先，不靠线程调度或 sleep 制造竞态。
+    use super::*;
+    /// 两份回信都已经完成，同拍只发布截止前的那份。
+    #[test]
+    fn completed_heartbeat_at_deadline_keeps_only_timely_bytes() {
+        let deadline = tokio::time::Instant::now();
+        let timely = Bytes::from_static(b"timely");
+        let mut slot = BeatProgress {
+            active: Some((1, Bytes::new())),
+            timely: None,
+        };
+        assert!(slot.accept(1, &timely, deadline - Duration::from_nanos(1), deadline));
+        assert!(!slot.accept(1, &Bytes::from_static(b"late"), deadline, deadline));
+        assert_eq!(slot.active.unwrap().1, timely);
+        assert_eq!(slot.timely.unwrap(), timely);
     }
 }

@@ -284,6 +284,8 @@ struct Worker {
     hello: Option<Arc<HelloReply>>,
     /// 握手用 0，其余消息沿用这个进程各自的序列。
     seq: u64,
+    /// 本帧是否已经写出第一字节；等池位或尚未写出的心跳过期不计进程故障。
+    written: bool,
     /// 最后一次归还到池里的时刻。
     idle_since: Instant,
 }
@@ -349,6 +351,7 @@ impl Worker {
             if admission.is_some() && written == 0 {
                 return Err(Fault::Io);
             }
+            self.written = written != 0;
             stdin
                 .write_all(&line[written..])
                 .await
@@ -726,6 +729,7 @@ impl Pool {
             stdout,
             hello: None,
             seq: 0,
+            written: false,
             idle_since: Instant::now(),
         };
         self.handshake(&mut w, id, admission).await?;
@@ -1052,11 +1056,35 @@ impl Turn<'_> {
         }
     }
     /// 只从写出开始计时，已取得名额后的本地正文读取也不占管道时限。
-    pub(crate) async fn send(mut self, stage: Stage, timeout: u64) -> Result<PreparedReply, Fault> {
+    pub(crate) async fn send(self, stage: Stage, timeout: u64) -> Result<PreparedReply, Fault> {
+        self.send_until(stage, timeout, None).await
+    }
+    /// 心跳还受下一拍的硬截止点约束；只处罚已写出却未及时得到回信的会话。普通取消直接丢票。
+    pub(crate) async fn send_until(
+        mut self,
+        stage: Stage,
+        timeout: u64,
+        deadline: Option<Instant>,
+    ) -> Result<PreparedReply, Fault> {
         let pool = self.pool;
-        let result = pool
-            .exchange(&mut self.worker, stage, timeout, &self.ticket)
-            .await;
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            self.unused().await;
+            return Err(Fault::Timeout);
+        }
+        self.worker.written = false;
+        let exchange = pool.exchange(&mut self.worker, stage, timeout, &self.ticket);
+        let result = if let Some(d) = deadline {
+            tokio::select! {biased; _=tokio::time::sleep_until(d)=>None,r=exchange=>Some(r)}
+                .filter(|_| Instant::now() < d)
+        } else {
+            Some(exchange.await)
+        };
+        let Some(result) = result else {
+            if self.worker.written {
+                pool.complete(&self.ticket, Some(&Fault::Timeout));
+            }
+            return Err(Fault::Timeout);
+        };
         if matches!(result, Err(Fault::Open { .. })) {
             return result;
         }

@@ -999,3 +999,14 @@ fn format_request_decoding_bounds_nested_readers() {
         assert!(matches!(&body, RequestBody::Memory(b) if b.as_ref() == expected));
     }
 }
+
+/// 只发固定心跳的实例没有在途程序，响应就绪不应去关回放闸门。
+#[tokio::test]
+async fn static_only_keepalive_skips_dynamic_cancellation() {
+    let (mut sink, _rx, _gone) = committed_sink(Duration::ZERO, true);
+    sink.cancel_dynamic();
+    let KeepaliveSink::Committed { replay_gate, .. } = sink else {
+        unreachable!()
+    };
+    assert!(!*replay_gate.lock().unwrap());
+}

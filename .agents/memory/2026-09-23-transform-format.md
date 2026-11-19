@@ -1,6 +1,33 @@
-> **2026-11-17 更新**：0.2.0 起配置里没有 `[request_transform]`、`[response_transform]`、`[heartbeat_transform]` 三个表，统一写 `[[format]]` 条目，用 `stages` 声明参与的阶段（`every_attempt` = `stages` 里的 `"retry"`，`mode` 改叫 `process`，`extra` 没有对应物）。见 [[config-settings-shape-0-2-0]]；协议 1 与链在 B10 落地后本条还要再更新。
+---
+name: transform-format
+description: 改 format worker 的生命周期、体的处理、重试语义，或 envelope 的发版线之前读
+metadata:
+  type: project
+  scope: aproxy 里的 format 协议 1（0.2.0 起）；更早的旧信封行为与发版决定在下面分开标明
+  status: active
+  last_verified: 2026-11-20
+---
 
-# 外部转换器（format）+ aproxy-format：设计决策留档
+# format 的 worker：协议 1，以及更早的发版线
+
+**Why:** 池子里的一个位置保护的是「同一个操作系统进程的一次对话」，不是请求在队里的位置。排队中的调用者还没拿到 worker，
+不该把溢写的体读进内存，也不该开始计管道的时限。阶段消息一旦写出，放弃它的回信就得放弃这个 worker，否则下一个请求会读到
+错位的回信。记录与历史里的密钥替换是另一条边界：程序自己给的终态响应是交给客户端的数据，既不是上游响应，也不是诊断信息。
+
+**How to apply:** 旧进程被回收之前保留它的编号；逐进程核对 `seq`；区分正常的 EOF 退役与强制剔除。还没回来的心跳要把
+worker 让给响应的交付，这次取消不计入熔断。测这些边界时，看夹具实际收到的帧、pid、EOF 与放行的应答，不要靠 sleep 推断
+先后。请求链里给出的终态响应，让这次尝试的上游响应保持为 null：分别核对客户端收到的字节原样、历史里没有留体、错误字段
+经过替换。协议与历史的契约见 `.agents/plan/w2-contracts.md` 的 §6 与 §10。
+
+**Evidence:** `src/transform/pool.rs`、`src/proxy/keepalive.rs`，以及 `tests/format_protocol.rs` 里用真实 worker 的测试
+`disconnected_format_request_releases_the_only_worker_without_heartbeat`、
+`pending_heartbeat_does_not_delay_a_response_or_its_eof`、`program_terminal_bytes_stay_private_to_the_client`。
+
+**Recheck when:** 进程或流的生命周期、留体的契约有变；官方 `aproxy-format` 迁到协议 1。下面更早的运行时记录讲的是旧信封，
+不是 aproxy 现在的实现；独立二进制与发版、envelope 预发布版本号的决定仍然有效。见 [[config-settings-shape-0-2-0]] 与
+[[release-engineering]]。
+
+## 外部转换器（format）+ aproxy-format：设计决策留档
 
 2026-09-23 定稿。功能：aProxy 支持把请求/响应交给外部 format 程序转换
 （一行 JSON 信封 stdin/stdout 进出，类 OJ 判题机），另构建官方示例二进制

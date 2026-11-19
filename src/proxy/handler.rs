@@ -100,7 +100,7 @@ async fn handle(
         let target_url = upstream_url(&state.config, &uri);
         // 日志里的 URL 一律经 redact::url：base_url 可能内嵌 user:pass，客户端
         // 查询串可能带 key（Gemini 式 ?key=），日志常被整段粘贴求助
-        tracing::info!(method = %method, target = %aproxy_ipc::redact::url(&target_url), "代理请求（仅转发）");
+        tracing::info!(method = %method, target = %state.history.redacted_url(&target_url), "代理请求（仅转发）");
         return forward_only_proxy(state, method, target_url, headers, req.into_body(), trace)
             .await;
     }

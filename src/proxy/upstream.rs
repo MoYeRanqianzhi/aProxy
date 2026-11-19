@@ -5,11 +5,16 @@ use super::*;
 /// 「代理请求」日志：请求转换之后、首轮之前各通道各记一次。URL 一律经
 /// redact::url：base_url 可能内嵌 user:pass，查询串可能带 key（Gemini 式
 /// ?key=），日志常被整段粘贴求助
-pub(super) fn log_proxied_request(method: &http::Method, path_and_query: &str, target_url: &str) {
+pub(super) fn log_proxied_request(
+    history: &crate::history::History,
+    method: &http::Method,
+    path_and_query: &str,
+    target_url: &str,
+) {
     tracing::info!(
         method = %method,
-        path = %aproxy_ipc::redact::url(path_and_query),
-        target = %aproxy_ipc::redact::url(target_url),
+        path = %history.redacted_url(path_and_query),
+        target = %history.redacted_url(target_url),
         "代理请求"
     );
 }
@@ -98,7 +103,7 @@ pub(super) async fn forward_once(
         }
     };
 
-    let resp = match send_with_timeout(&state.config, builder.send()).await {
+    let resp = match send_with_timeout(state, builder.send()).await {
         Ok(r) => r,
         // 在源头归类并脱敏：失败原因会流向日志、status 的最近错误与各通道
         Err(failure) => return ForwardResult::NetworkError(failure),
@@ -144,7 +149,7 @@ pub(super) async fn forward_once(
     let mut scanner = StreamErrorScanner::new();
     let mut resp_stream = resp;
     loop {
-        match next_chunk(&mut resp_stream, &state.config, spool.len()).await {
+        match next_chunk(&mut resp_stream, state, spool.len()).await {
             Ok(Some(chunk)) => {
                 // 各提前返回路径上 spool 随之 drop，半截磁盘文件由 SpoolPath 删除
                 if spool.len() + chunk.len() as u64 > max_spool_bytes as u64 {
@@ -185,15 +190,15 @@ pub(super) async fn forward_once(
 /// 包含连接建立与请求体上传；到点时这次尝试以 `upstream_first_byte_timeout` 失败，在途的
 /// 请求随 future 被丢弃而中止。
 pub(super) async fn send_with_timeout(
-    config: &Config,
+    state: &AppState,
     send: impl Future<Output = Result<reqwest::Response, reqwest::Error>>,
 ) -> Result<reqwest::Response, AttemptFailure> {
-    let limit = Duration::from_secs(config.first_byte_timeout_secs);
+    let limit = Duration::from_secs(state.config.first_byte_timeout_secs);
     if limit.is_zero() {
-        return send.await.map_err(|e| send_failure(e, config));
+        return send.await.map_err(|e| send_failure(e, state));
     }
     match tokio::time::timeout(limit, send).await {
-        Ok(result) => result.map_err(|e| send_failure(e, config)),
+        Ok(result) => result.map_err(|e| send_failure(e, state)),
         Err(_) => Err(AttemptFailure::first_byte_timeout(limit)),
     }
 }
@@ -203,14 +208,14 @@ pub(super) async fn send_with_timeout(
 /// `upstream_read_idle_timeout` 失败。`received_bytes` 是此前已经收到的响应体字节数。
 pub(super) async fn next_chunk(
     resp: &mut reqwest::Response,
-    config: &Config,
+    state: &AppState,
     received_bytes: u64,
 ) -> Result<Option<Bytes>, AttemptFailure> {
-    let limit = Duration::from_secs(config.read_timeout_secs);
+    let limit = Duration::from_secs(state.config.read_timeout_secs);
     let read = async {
         resp.chunk()
             .await
-            .map_err(|e| body_failure(e, received_bytes, config))
+            .map_err(|e| body_failure(e, received_bytes, state))
     };
     if limit.is_zero() {
         return read.await;
@@ -226,17 +231,17 @@ pub(super) async fn next_chunk(
 /// - 连接阶段的其他失败（DNS、被拒绝、TLS）→ `upstream_connect_failed`；
 /// - 连接已建立、等响应头超时 → `upstream_first_byte_timeout`；
 /// - 其余（连接建立之后、响应头之前断开等）→ `upstream_body_interrupted`，已收 0 字节。
-pub(super) fn send_failure(e: reqwest::Error, config: &Config) -> AttemptFailure {
+pub(super) fn send_failure(e: reqwest::Error, state: &AppState) -> AttemptFailure {
     let (connect, timeout) = (e.is_connect(), e.is_timeout());
-    let reason = redact_reqwest_error(e);
+    let reason = redact_reqwest_error(e, state.history.secrets());
     match (connect, timeout) {
         (true, true) => {
-            AttemptFailure::connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+            AttemptFailure::connect_timeout(Duration::from_secs(state.config.connect_timeout_secs))
         }
         (true, false) => AttemptFailure::connect_failed(reason),
-        (false, true) => {
-            AttemptFailure::first_byte_timeout(Duration::from_secs(config.first_byte_timeout_secs))
-        }
+        (false, true) => AttemptFailure::first_byte_timeout(Duration::from_secs(
+            state.config.first_byte_timeout_secs,
+        )),
         (false, false) => AttemptFailure::body_interrupted(0, reason),
     }
 }
@@ -246,15 +251,18 @@ pub(super) fn send_failure(e: reqwest::Error, config: &Config) -> AttemptFailure
 pub(super) fn body_failure(
     e: reqwest::Error,
     received_bytes: u64,
-    config: &Config,
+    state: &AppState,
 ) -> AttemptFailure {
     if e.is_timeout() {
         AttemptFailure::read_idle_timeout(
-            Duration::from_secs(config.read_timeout_secs),
+            Duration::from_secs(state.config.read_timeout_secs),
             received_bytes,
         )
     } else {
-        AttemptFailure::body_interrupted(received_bytes, redact_reqwest_error(e))
+        AttemptFailure::body_interrupted(
+            received_bytes,
+            redact_reqwest_error(e, state.history.secrets()),
+        )
     }
 }
 
@@ -262,12 +270,18 @@ pub(super) fn body_failure(
 /// （`error sending request for url (URL)`），URL 的查询串里可能带客户端的 key
 /// （`?key=...`），而这段文本会进日志、status 的最近错误和 502 正文。先剥掉 URL
 /// 再按原有形态附上脱敏版本——保留「for url (...)」便于排障时看出打到了哪里。
-pub(super) fn redact_reqwest_error(e: reqwest::Error) -> String {
+fn redact_reqwest_error(e: reqwest::Error, secrets: &aproxy_ipc::redact::Secrets) -> String {
     let url = e.url().map(|u| aproxy_ipc::redact::url(u.as_str()));
     let e = e.without_url();
-    match url {
+    let reason = match url {
         Some(u) => format!("{e} for url ({u})"),
         None => e.to_string(),
+    };
+    // URL 遮住用户信息和查询值后，路径或底层诊断里仍可能含有配置里的凭据。
+    if secrets.is_empty() {
+        reason
+    } else {
+        secrets.replace(&reason)
     }
 }
 

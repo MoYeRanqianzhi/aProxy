@@ -3017,3 +3017,62 @@ async fn committed_stop_limits_disk_json_conversion() {
     assert!(b.len() < 4096, "terminal response was {} bytes", b.len());
     assert!(std::str::from_utf8(&b).unwrap().contains("retry_stopped"));
 }
+
+/// 路由写入 URL 路径的已知凭据不能从自动生成的停止诊断回到客户端或进入实例日志。
+#[tokio::test]
+async fn decide_stop_masks_configured_secret_in_upstream_failure() {
+    let home = TestHome::new();
+    let reservation = tokio::net::TcpSocket::new_v4().unwrap();
+    let addr = loop {
+        let addr = ([127, 0, 0, 1], free_port()).into();
+        match reservation.bind(addr) {
+            Ok(()) => break addr,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(e) => panic!("{e}"),
+        }
+    };
+    let secret = "fixture-private-route-segment";
+    let patch = serde_json::json!({"request":{"url":format!("http://{addr}/{secret}")}});
+    let cfg = layer(&home, "route", "'request'", &["reply", &patch.to_string()])
+        .replace("env={", &format!("env={{ TOKEN='{secret}',"))
+        + &layer(
+            &home,
+            "stop",
+            "'decide'",
+            &["reply", r#"{"decision":"stop"}"#],
+        );
+    let (port, out) = launch(&home, addr.port(), &cfg);
+    assert!(out.status.success(), "{out:?}");
+    let startup: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let url = format!("http://127.0.0.1:{port}");
+    let r = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .unwrap()
+        .get(&url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 502);
+    let id = r.headers()["x-aproxy-request-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let json = r.json::<Value>().await.unwrap();
+    assert_eq!(json["error"]["aproxy"]["code"], "retry_stopped");
+    assert!(
+        !json.to_string().contains(secret),
+        "credential in generated 502"
+    );
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("<secret>")
+    );
+    let history = request_detail(&home, &url, &id).await;
+    assert!(!history.to_string().contains(secret));
+    let log = std::fs::read_to_string(startup["log_path"].as_str().unwrap()).unwrap();
+    assert!(!log.contains(secret));
+}

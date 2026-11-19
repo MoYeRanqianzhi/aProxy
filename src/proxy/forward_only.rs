@@ -198,11 +198,11 @@ pub(super) async fn forward_only_proxy(
     // 缓冲），content-length 无从回填——这是本模式的代价之一，也是必然后果。
     builder = builder.body(reqwest::Body::wrap_stream(counted));
 
-    let resp = match send_with_timeout(&state.config, builder.send()).await {
+    let resp = match send_with_timeout(&state, builder.send()).await {
         Ok(r) => r,
         Err(failure) => {
             // 错误文本与目标 URL 都会进日志 / 最近错误 / 502 正文，已在源头归类、脱敏
-            let masked_target = aproxy_ipc::redact::url(&target_url);
+            let masked_target = state.history.redacted_url(&target_url);
             // send() 的失败有三种来源：上游真的失败，或请求体适配器产出 Err 令
             // reqwest 主动中止（超限 / 客户端上传中断，各有一个标记）。判定顺序
             // 是刻意的：超限排在最前——它同时也会让适配器产出 Err，而「你的请求体
@@ -304,7 +304,7 @@ pub(super) async fn forward_only_proxy(
                     return None;
                 }
                 let forwarded = tap.forwarded;
-                match next_chunk(&mut resp, &state.config, forwarded).await {
+                match next_chunk(&mut resp, &state, forwarded).await {
                     Ok(Some(chunk)) => {
                         state.touch_activity();
                         tap.forwarded += chunk.len() as u64;

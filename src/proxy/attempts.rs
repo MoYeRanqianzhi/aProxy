@@ -440,7 +440,7 @@ pub(super) async fn run_attempts(
     };
     r.arm_dynamic_heartbeat(state, &req);
     r.prepare_upstream_headers(&mut req.headers);
-    log_proxied_request(&req.method, path_and_query, &req.target_url);
+    log_proxied_request(&state.history, &req.method, path_and_query, &req.target_url);
     let mut sent = sent_head(&rec, &req);
     let mut same_body = request_encoding(&req.headers, req.ctx.is_some()).as_deref()
         == req.client_encoding.as_ref();

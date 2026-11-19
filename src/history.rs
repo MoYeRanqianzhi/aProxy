@@ -1027,6 +1027,16 @@ impl History {
         &self.secrets
     }
 
+    /// URL 中的用户信息和查询值按位置遮住；路径中若含实例已知的凭据，也不能写进记录或日志。
+    pub(crate) fn redacted_url(&self, url: &str) -> String {
+        let masked = redact::url(url);
+        if self.secrets.is_empty() {
+            masked
+        } else {
+            self.secrets.replace(&masked)
+        }
+    }
+
     /// 把一组头变成入库的形状：密钥头的值换成占位对象，其余的值里出现的已知密钥换掉。
     fn headers<'a>(&self, headers: impl Iterator<Item = (&'a str, &'a [u8])>) -> HeaderList {
         // serde_json 往字节缓冲里写的都是合法的 UTF-8；往 Vec 里写不会失败
@@ -1068,7 +1078,7 @@ impl History {
             started_at: now,
             ended_at: None,
             method: start.method.to_string(),
-            path: redact::url(start.path_and_query),
+            path: self.redacted_url(start.path_and_query),
             model: None,
             stream: false,
             user_agent,
@@ -1747,7 +1757,7 @@ impl Recorder {
         let live = self.0.as_ref()?;
         Some(Arc::new(SentHead {
             method: method.to_string(),
-            url: redact::url(url),
+            url: live.history.redacted_url(url),
             headers: live.history.headers(headers),
         }))
     }

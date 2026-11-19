@@ -528,7 +528,7 @@ pub(super) fn head_is_committable(status: StatusCode, headers: &HeaderMap) -> bo
 ///     （默认 300s，两次读到数据的间隔上限）——非 SSE 的流本就没有可用的
 ///     保活手段，这与不保活路径的等待特性一致
 ///   - 可直接提交（2xx + 未压缩 SSE，且 `real_head_allowed`：未配置
-///     response_transform）→ 立即提交上游真实 status 与响应头
+///     能改头的响应层或能否决尝试的决定层）→ 立即提交上游真实 status 与响应头
 /// - 客户端断开或心跳发送失败 → 返回 None：`fut` 随本函数返回被 drop，在途的
 ///   reqwest 连接关闭，上游停止生成（计费保护）
 pub(super) async fn drive<F: std::future::Future>(

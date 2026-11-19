@@ -261,6 +261,7 @@ fn main() {
                 {
                     wait_gate(std::path::Path::new(arg));
                 }
+                "gate-decide" if stage == "decide" => wait_gate(std::path::Path::new(arg)),
                 "gate-request" if m["request"]["body"] == "blocked" => {
                     wait_gate(std::path::Path::new(arg))
                 }

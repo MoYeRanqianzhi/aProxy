@@ -126,7 +126,7 @@ pub(super) enum Responder {
         /// 整个请求共用一个节拍：既是「一个间隔内仍无可提交的结果就提交骨架」的计时器，
         /// 也是提交后的心跳节拍
         ticker: Option<tokio::time::Interval>,
-        /// 上游真实的 SSE 响应头能不能先行提交：配置了响应转换时不能（转换可能改头）
+        /// 上游真实的 SSE 响应头能不能先行提交：转换能改头，决定也可能否决整次响应。
         real_head_allowed: bool,
     },
 }
@@ -160,7 +160,9 @@ impl Responder {
                 },
             },
             ticker: enabled.then(|| Self::ticker(interval)),
-            real_head_allowed: !state.has_format(Stage::Response),
+            // 不能用某个旧 worker 的 hello 排除成功咨询：其他会话可以在上游体到齐前重新握手。
+            real_head_allowed: !state.has_format(Stage::Response)
+                && !state.has_format(Stage::Decide),
         }
     }
 
@@ -227,6 +229,24 @@ impl Responder {
                 Some(ticker) => drive(sink, ticker, fut, head_rx, *real_head_allowed, during).await,
                 None => tokio::select! {result=fut => Some(result), _=sink.client_gone() => None},
             },
+        }
+    }
+
+    /// 已确认的非 SSE 成功保留原媒体类型直到被否决。暂停的是提交而非断开检测；
+    /// 积欠的骨架心跳保留给可能发生的下一次尝试，而不是写进这个响应。
+    async fn wait_after_head<F: std::future::Future>(
+        &mut self,
+        fut: F,
+        preserve_non_sse: bool,
+        during: &str,
+    ) -> Option<F::Output> {
+        if preserve_non_sse
+            && let Self::Keepalive { sink, .. } = self
+            && !sink.is_committed()
+        {
+            tokio::select! {result=fut => Some(result), _=sink.client_gone() => None}
+        } else {
+            self.wait(fut, None, during).await
         }
     }
 
@@ -567,7 +587,12 @@ pub(super) async fn run_attempts(
                 started.elapsed(),
                 override_max,
             );
-            let Some(votes) = r.wait(query, None, "format decide").await else {
+            let preserve_non_sse =
+                matches!(&outcome, Outcome::Deliver(v) if !is_event_stream(&v.headers));
+            let Some(votes) = r
+                .wait_after_head(query, preserve_non_sse, "format decide")
+                .await
+            else {
                 return;
             };
             reroute = chain_failed || votes.reroute.unwrap_or(true);
@@ -823,17 +848,9 @@ async fn deliver(
         rec.phase(Phase::Transforming);
     }
     let transform = transform_response_if_configured(state, req, status, headers, body);
-    let transformed = if !r.is_committed() && !upstream_sse {
-        match r {
-            Responder::Buffered { .. } => Some(transform.await),
-            // 非 SSE 响应不能插入心跳，仍须在下游断开时撤销这次管道往返。
-            Responder::Keepalive { sink, .. } => {
-                tokio::select! { result=transform => Some(result), _=sink.client_gone()=>None }
-            }
-        }
-    } else {
-        r.wait(transform, None, "响应转换").await
-    };
+    let transformed = r
+        .wait_after_head(transform, !upstream_sse, "响应转换")
+        .await;
     let Some((status, headers, body)) = transformed else {
         return;
     };

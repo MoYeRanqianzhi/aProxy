@@ -2765,3 +2765,111 @@ async fn observing_start_preserves_a_static_handshake_failure() {
     assert_eq!(errors[0], errors[1]);
     assert_eq!(frames(&home, "gate").len(), 1);
 }
+
+/// 成功的非 SSE 体已经到齐，等策略表态时不能改发骨架头或往正文插心跳。
+#[tokio::test]
+async fn pending_success_vote_preserves_non_sse() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[200]).await;
+    let gate = home.path().join("decision.release");
+    let cfg = String::from("[keepalive]\ntrigger='accept'\ninterval_secs=1\n")
+        + &layer(
+            &home,
+            "policy",
+            "'decide'",
+            &["gate-decide", gate.to_str().unwrap()],
+        )
+        .replace(
+            "env={",
+            "decide_timeout_secs=0\nenv={ ECHO_DECIDE_SUCCESS='1',",
+        );
+    let (c, url) = running(&home, up, &cfg);
+    let mut client = tokio::spawn(c.get(url).header("accept", "text/event-stream").send());
+    observed_stage(&home, "policy", "decide", 1).await;
+    // 从已收到咨询的时刻起跨过真正的心跳间隔；若响应头已发出，不能再恢复原媒体类型。
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(1250), &mut client)
+            .await
+            .is_err(),
+        "SSE headers escaped while a non-SSE success was being voted on"
+    );
+    std::fs::write(gate, b"").unwrap();
+    let response = client.await.unwrap().unwrap();
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/plain; charset=utf-8"
+    );
+    assert_eq!(response.text().await.unwrap(), "upstream bytes");
+}
+
+/// 慢 SSE 的首个尝试随后被否决，它的 Cookie 和其他响应头不能先抵达客户端。
+#[tokio::test]
+async fn pending_success_vote_uses_neutral_headers_for_sse() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = release.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let app = axum::Router::new().fallback(move || {
+        let gate = gate.clone();
+        let i = count.fetch_add(1, Ordering::Relaxed);
+        async move {
+            let chunk = futures_util::stream::once(async move {
+                if i == 0 {
+                    gate.acquire().await.unwrap().forget();
+                }
+                Ok::<_, std::convert::Infallible>(if i == 0 {
+                    "data: first\n\n"
+                } else {
+                    "data: second\n\n"
+                })
+            });
+            (
+                [
+                    ("content-type", "text/event-stream"),
+                    ("set-cookie", "unsettled=yes"),
+                ],
+                axum::body::Body::from_stream(chunk),
+            )
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let script = home.path().join("votes.json");
+    std::fs::write(
+        &script,
+        r#"{"decide:1":{"decision":"retry"},"decide:2":{"decision":"stop"}}"#,
+    )
+    .unwrap();
+    let cfg = String::from("[keepalive]\ntrigger='accept'\ninterval_secs=1\n")
+        + &layer(
+            &home,
+            "policy",
+            "'decide'",
+            &["reply-by-stage", script.to_str().unwrap()],
+        )
+        .replace("env={", "env={ ECHO_DECIDE_SUCCESS='1',");
+    let (c, url) = running(&home, up, &cfg);
+    let response = c
+        .get(url)
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    release.add_permits(1);
+    assert!(
+        !response.headers().contains_key("set-cookie"),
+        "headers of a vetoed attempt escaped"
+    );
+    let body = response.text().await.unwrap();
+    assert!(!body.contains("data: first"));
+    assert!(body.ends_with("data: second\n\n"), "{body:?}");
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+}

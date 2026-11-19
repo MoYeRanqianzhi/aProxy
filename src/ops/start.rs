@@ -148,18 +148,37 @@ pub fn resolve_runtime_config(
 
 /// 一条诊断写成一行：`文件:行:列: 键: 说明 [码]`，没有的部分省略。
 pub fn render_diagnostic(d: &aproxy_ipc::diag::Diagnostic) -> String {
-    let mut line = d.file.clone();
-    if let Some(l) = d.line {
+    render_diagnostic_fields(
+        &d.file,
+        d.line,
+        d.column,
+        d.key.as_deref(),
+        &d.message,
+        d.code,
+    )
+}
+
+/// 也能排版接手版本留在状态里的诊断：码是文本，不要求等待者认识更高版本的码。
+pub fn render_diagnostic_fields(
+    file: &str,
+    row: Option<u32>,
+    column: Option<u32>,
+    key: Option<&str>,
+    message: &str,
+    code: &str,
+) -> String {
+    let mut line = file.to_owned();
+    if let Some(l) = row {
         line.push_str(&format!(":{l}"));
-        if let Some(c) = d.column {
+        if let Some(c) = column {
             line.push_str(&format!(":{c}"));
         }
     }
     line.push_str(": ");
-    if let Some(key) = &d.key {
+    if let Some(key) = key {
         line.push_str(&format!("{key}: "));
     }
-    line.push_str(&format!("{} [{}]", d.message, d.code));
+    line.push_str(&format!("{message} [{code}]"));
     line
 }
 

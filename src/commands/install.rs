@@ -33,6 +33,12 @@ fn refusal(error: &InstallFailure) -> Option<String> {
                 ))
             }
         }
+        "install_precheck_failed" => {
+            let port = error.details["port"].as_u64()?;
+            Some(format!(
+                "安装前的预检没有通过：端口 {port} 的实例按新版本解析配置时出错。什么都没有改动：实例照常运行，二进制没换。"
+            ))
+        }
         _ => None,
     }
 }
@@ -43,6 +49,22 @@ fn fail(error: InstallFailure) -> ! {
         "[ERROR] {}",
         refusal(&error).as_deref().unwrap_or(&error.message)
     );
+    if error.code == "install_precheck_failed" {
+        if let Some(ds) = error.details["diagnostics"].as_array() {
+            for d in ds {
+                let line = aproxy::ops::start::render_diagnostic_fields(
+                    d["file"].as_str().unwrap_or_default(),
+                    d["line"].as_u64().and_then(|n| n.try_into().ok()),
+                    d["column"].as_u64().and_then(|n| n.try_into().ok()),
+                    d["key"].as_str(),
+                    d["message"].as_str().unwrap_or_default(),
+                    d["code"].as_str().unwrap_or_default(),
+                );
+                eprintln!("  {line}");
+            }
+        }
+        eprintln!("修正上面的问题后重新执行 aproxy install。");
+    }
     crate::util::exit(error.exit_code())
 }
 

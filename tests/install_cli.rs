@@ -230,3 +230,81 @@ async fn continuation_fails_before_broadcast_with_foreground_instances() {
         0,
     );
 }
+
+/// 无效 settings 在安装入口只是告警，但目标版本不能拿它去停掉仍在服务的实例。
+#[tokio::test]
+async fn install_precheck_failure_changes_nothing() {
+    let (h, from, bin) = fixture();
+    binary(&bin);
+    let (p, child) = instance(&h, &bin, false).await;
+    let before = fs::metadata(&bin).unwrap().modified().unwrap();
+    h.settings(r#"{"schema":1,"nope":1}"#);
+    let out = run(
+        &h,
+        &["install", "--from", from.to_str().unwrap(), "--no-skills"],
+        3,
+    );
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        err.contains("安装前的预检没有通过")
+            && err.contains("config_unknown_key")
+            && !err.contains("滚动已中止"),
+        "{err}"
+    );
+    let st = state::load_in(h.path()).unwrap();
+    assert!(st.halted);
+    assert_eq!(st.phase, InstallPhase::Failed);
+    assert_eq!(st.failed_at, Some(InstallPhase::Downloaded));
+    assert_eq!(st.error_code.as_deref(), Some("install_precheck_failed"));
+    let details = st.error_details.unwrap();
+    assert_eq!(details["port"], p);
+    let d = &details["diagnostics"][0];
+    assert_eq!(d["severity"], "error");
+    assert_eq!(d["key"], "nope");
+    assert_eq!(
+        st.last_error.unwrap(),
+        format!(
+            "precheck failed for the instance on port {p}: {}",
+            d["message"].as_str().unwrap()
+        )
+    );
+    assert_eq!(pid(&h, p).await, child.0.id());
+    assert_eq!(fs::metadata(bin).unwrap().modified().unwrap(), before);
+}
+
+/// 没有应重启的端口就没有预检目标；settings 的错误不妨碍安装能修好它的版本。
+#[test]
+fn install_with_invalid_settings_and_no_instances_completes() {
+    let (h, from, _) = fixture();
+    h.settings(r#"{"schema":1,"nope":1}"#);
+    let out = run(
+        &h,
+        &["install", "--from", from.to_str().unwrap(), "--no-skills"],
+        0,
+    );
+    assert!(String::from_utf8(out.stderr).unwrap().contains("[WARN]"));
+}
+
+/// 上一轮记下的端口即便此刻没有应答，也不能漏掉它损坏的期望状态。
+#[test]
+fn continuation_prechecks_an_unreadable_record_on_a_down_port() {
+    let (h, _, bin) = fixture();
+    downloaded(&h);
+    let p = free_port();
+    let mut st = state::load_in(h.path()).unwrap();
+    st.instance_snapshot = vec![p.to_string()];
+    state::write_in(h.path(), &mut st).unwrap();
+    let dir = h.path().join("run");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(aproxy::spec::restore_path_in(&dir, &p.to_string()), "bad").unwrap();
+    run(&h, &["install", "--continue"], 3);
+    let st = halted(
+        &h,
+        &bin,
+        "install_precheck_failed",
+        "precheck failed for the instance on port",
+    );
+    let d = st.error_details.unwrap();
+    assert_eq!(d["port"], p);
+    assert_eq!(d["diagnostics"][0]["code"], "install_restore_unreadable");
+}

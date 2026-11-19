@@ -249,10 +249,13 @@ pub fn remove_restore_in(run_dir: &Path, port: &str) {
 /// 读一个端口的期望状态记录。`Ok(None)` = 没有这份记录。
 pub fn read_restore_in(run_dir: &Path, port: &str) -> Result<Option<RestoreEntry>, Unreadable> {
     let path = restore_path_in(run_dir, port);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let record: RestoreRecord = read_record(&path, SCHEMA)?;
+    // 只有路径不存在才表示没有恢复义务；权限等错误不能把尚在的记录变成空。
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Unreadable::Io(e.to_string())),
+    };
+    let record: RestoreRecord = parse_record(&text, SCHEMA)?;
     Ok(Some(RestoreEntry {
         port: port.to_string(),
         spec: record.spec,

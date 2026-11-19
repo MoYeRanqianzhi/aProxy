@@ -743,6 +743,18 @@ pub const TABLE: &[Code] = &[
         "settings.json sets `watchdog.max_restarts` to 0, so the watchdog never restarts a crashed or hung instance.",
         &[],
     ),
+    diagnostic(
+        "install_restore_unreadable",
+        Severity::Error,
+        "The desired-state record needed for the rolling restart cannot be read.",
+        &[],
+    ),
+    diagnostic(
+        "install_config_unreadable",
+        Severity::Error,
+        "The instance configuration needed for the rolling restart is missing or unreadable.",
+        &[],
+    ),
     // ----- 记录码 -----
     plain(
         "record_unreadable",

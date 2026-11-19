@@ -152,6 +152,65 @@ async fn snapshot_with_pending(run_dir: &Path, state: &InstallState) -> (Vec<Str
     (live, snapshot)
 }
 
+/// 不能读出重启所需文件时也给出定位到文件的 error 诊断，不能把没有诊断误当作通过。
+fn unreadable(code: &'static str, path: &Path, message: String) -> aproxy_ipc::diag::Diagnostic {
+    aproxy_ipc::diag::Diagnostic {
+        code,
+        severity: aproxy_ipc::diag::Level::Error,
+        file: path.display().to_string(),
+        key: None,
+        line: None,
+        column: None,
+        message,
+        details: Default::default(),
+    }
+}
+
+/// 仅解析期望规格及此刻的配置，不探测监听地址（运行中的实例占着它）。按快照顺序报告首错。
+fn precheck_snapshot(run_dir: &Path, snapshot: &[String]) -> Result<(), InstallFailure> {
+    use crate::ops::start::{ConfigError, resolve_runtime_config};
+    for port in snapshot {
+        let diagnostics = match crate::spec::read_restore_in(run_dir, port) {
+            Ok(None) => continue,
+            Err(e) => vec![unreadable(
+                "install_restore_unreadable",
+                &crate::spec::restore_path_in(run_dir, port),
+                e.to_string(),
+            )],
+            Ok(Some(record)) => {
+                let spec = record.spec;
+                match resolve_runtime_config(&spec.overrides, spec.config_file().as_deref()) {
+                    Ok(_) => continue,
+                    Err(
+                        ConfigError::Settings { diagnostics, .. }
+                        | ConfigError::Invalid { diagnostics, .. },
+                    ) => diagnostics,
+                    Err(ConfigError::Missing(file)) => vec![unreadable(
+                        "install_config_unreadable",
+                        &file,
+                        "The configuration file does not exist.".into(),
+                    )],
+                    Err(ConfigError::Read { file, error }) => vec![unreadable(
+                        "install_config_unreadable",
+                        &file,
+                        format!("Cannot read the configuration file: {error}"),
+                    )],
+                }
+            }
+        };
+        let mut error = InstallFailure::new(
+            "install_precheck_failed",
+            format!(
+                "precheck failed for the instance on port {port}: {}",
+                diagnostics[0].message
+            ),
+        );
+        error.details = serde_json::json!({"port":port.parse::<u16>().map_err(|e| e.to_string())?,"diagnostics":diagnostics});
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// 回滚用旧二进制：本次交换记下的 old_path（`aproxy.old-…`：Windows 是让位的原文件，
 /// unix 是交换前保留的硬链接或副本）。不存在（首次安装、已被清理）→ None，实例起不来
 /// 时实例下线，期望状态记录还在。
@@ -969,6 +1028,11 @@ async fn run_forward_from_staged(
     let (live, snapshot) = snapshot_with_pending(run_dir, state).await;
     state.instance_snapshot = snapshot.clone();
     write_in(home, state).map_err(|e| format!("install/state.json 写入失败: {e}"))?;
+
+    if let Err(e) = precheck_snapshot(run_dir, &snapshot) {
+        state.halted = true;
+        return Err(e);
+    }
 
     // ---- broadcasting：ACK 齐了才交换（铁律 3）。无实例 → 跳过（快路径）
     if !snapshot.is_empty() {

@@ -115,6 +115,8 @@ Problems found in config.toml and settings.json. Each diagnostic is an object wi
 | `config_file_unreadable` | warning | A config file named by an alias or by `default_config` does not exist or cannot be read. | `reason` (string) |
 | `watchdog_slow_hang_detection` | warning | settings.json sets `watchdog.heartbeat_secs` so high that a hung instance is detected only after minutes. | `heartbeat_secs` (integer) |
 | `watchdog_restarts_disabled` | warning | settings.json sets `watchdog.max_restarts` to 0, so the watchdog never restarts a crashed or hung instance. | — |
+| `install_restore_unreadable` | error | The desired-state record needed for the rolling restart cannot be read. | — |
+| `install_config_unreadable` | error | The instance configuration needed for the rolling restart is missing or unreadable. | — |
 
 ## Record codes
 

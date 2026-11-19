@@ -565,11 +565,7 @@ fn abort_rejected_after_swap_phase() {
 }
 
 // ---------------------------------------------------------------------------
-// 6b. 滚动重启实例级失败（审查 install-01 原始复现）：实例运行中配置被改坏
-//     → install 滚动到它时新旧二进制都起不来。修复前：.restore 被守护优雅
-//     退出删除、实例永久丢失；Windows 接力路径打印「交换完成」并以 0 退出。
-//     修复后：CLI（等接手者跑到终点）以非零退出并给出原因与指引，
-//     .restore 以原参数保住，状态 halted（自动续作不再重试）。
+// 6b. 实例运行中配置被改坏，目标版本应在交换之前报告诊断；配置、原实例与恢复记录都保住。
 // ---------------------------------------------------------------------------
 #[test]
 fn install_instance_failure_exits_nonzero_and_keeps_restore() {
@@ -633,12 +629,12 @@ fn install_instance_failure_exits_nonzero_and_keeps_restore() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         out.status.code(),
-        Some(1),
+        Some(3),
         "实例级失败必须非零退出（Windows 接力路径修复前为 0）; stdout: {stdout} stderr: {stderr}"
     );
     assert!(
-        stderr.contains("滚动已中止") && stderr.contains("aproxy restore"),
-        "应给出中止说明与 restore 指引: {stderr}"
+        stderr.contains("安装前的预检没有通过") && !stderr.contains("滚动已中止"),
+        "应给出预检诊断: {stderr}"
     );
     // 失败发生在接手的目标版本进程里，经 CLI 轮询 install.state 转告
     assert!(
@@ -649,7 +645,7 @@ fn install_instance_failure_exits_nonzero_and_keeps_restore() {
         started.elapsed() < Duration::from_secs(120),
         "失败应在有限时间内报告"
     );
-    let _ = child.wait();
+    assert!(child.try_wait().unwrap().is_none(), "原进程应继续服务");
 
     // .restore 以原参数保住（修复前被删）
     let restore_after = std::fs::read_to_string(aproxy::spec::restore_path_in(

@@ -109,6 +109,12 @@ Problems found in config.toml and settings.json. Each diagnostic is an object wi
 | `format_handshake_failed` | varies | A format's handshake failed at startup. | `format` (string), `kind` (string) |
 | `format_stage_unsupported` | error | A format does not support a stage the config declares for it. | `format` (string), `stages` (string list) |
 | `file_permissions_too_open` | warning | The group or others can access the home or a config file. | — |
+| `listen_not_loopback` | warning | The config listens on a non-loopback address, so other hosts can reach the proxy. | `listen_addr` (string) |
+| `port_shared` | warning | Several config files listen on the same port, so they cannot run at the same time. | `port` (integer), `files` (string list) |
+| `config_dir_missing` | warning | A directory listed in settings.json `config_dirs` does not exist. | `dir` (path) |
+| `config_file_unreadable` | warning | A config file named by an alias or by `default_config` does not exist or cannot be read. | `reason` (string) |
+| `watchdog_slow_hang_detection` | warning | settings.json sets `watchdog.heartbeat_secs` so high that a hung instance is detected only after minutes. | `heartbeat_secs` (integer) |
+| `watchdog_restarts_disabled` | warning | settings.json sets `watchdog.max_restarts` to 0, so the watchdog never restarts a crashed or hung instance. | — |
 
 ## Record codes
 

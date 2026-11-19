@@ -132,7 +132,17 @@ pub fn parse(text: &str, file: &Path) -> (Settings, Vec<Diagnostic>) {
             }
         }
         if let Some(v) = w.integer(&mut ctx, "stale_after_cycles") {
-            settings.watchdog_stale_after_cycles = v;
+            // 看护者把 0 按 1 处理；在这里报错才不会让用户误以为写下的值生效了。
+            if v == 0 {
+                ctx.push(
+                    "config_invalid_value",
+                    &w.key_path("stale_after_cycles"),
+                    "watchdog.stale_after_cycles must be at least 1".to_string(),
+                    json!({ "reason": "out_of_range" }),
+                );
+            } else {
+                settings.watchdog_stale_after_cycles = v;
+            }
         }
         if let Some(v) = w.integer(&mut ctx, "max_restarts") {
             match u32::try_from(v) {
@@ -747,6 +757,24 @@ mod tests {
         assert_eq!(settings.aliases.len(), 1);
         assert_eq!(settings.language, "system");
         assert_eq!(settings.watchdog_heartbeat_secs, 30);
+    }
+
+    /// 挂死容忍周期不能写成零；诊断指到该键，解析结果保留可用的默认值。
+    #[test]
+    fn zero_stale_after_cycles_is_rejected() {
+        let (settings, diagnostics) = parse_text(r#"{"watchdog":{"stale_after_cycles":0}}"#);
+        assert_eq!(
+            brief(&diagnostics),
+            ["config_invalid_value watchdog.stale_after_cycles"]
+        );
+        let d = &diagnostics[0];
+        assert!(d.is_error());
+        assert_eq!(d.message, "watchdog.stale_after_cycles must be at least 1");
+        assert_eq!(d.details["reason"], "out_of_range");
+        assert_eq!(
+            settings.watchdog_stale_after_cycles,
+            Settings::default().watchdog_stale_after_cycles
+        );
     }
 
     /// `ui` 里放什么都不报错。

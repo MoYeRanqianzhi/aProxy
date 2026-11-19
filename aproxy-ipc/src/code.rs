@@ -707,6 +707,42 @@ pub const TABLE: &[Code] = &[
         "The group or others can access the home or a config file.",
         &[],
     ),
+    diagnostic(
+        "listen_not_loopback",
+        Severity::Warning,
+        "The config listens on a non-loopback address, so other hosts can reach the proxy.",
+        &[req("listen_addr", T::String)],
+    ),
+    diagnostic(
+        "port_shared",
+        Severity::Warning,
+        "Several config files listen on the same port, so they cannot run at the same time.",
+        &[req("port", T::Integer), req("files", T::StringList)],
+    ),
+    diagnostic(
+        "config_dir_missing",
+        Severity::Warning,
+        "A directory listed in settings.json `config_dirs` does not exist.",
+        &[req("dir", T::Path)],
+    ),
+    diagnostic(
+        "config_file_unreadable",
+        Severity::Warning,
+        "A config file named by an alias or by `default_config` does not exist or cannot be read.",
+        &[req("reason", T::String)],
+    ),
+    diagnostic(
+        "watchdog_slow_hang_detection",
+        Severity::Warning,
+        "settings.json sets `watchdog.heartbeat_secs` so high that a hung instance is detected only after minutes.",
+        &[req("heartbeat_secs", T::Integer)],
+    ),
+    diagnostic(
+        "watchdog_restarts_disabled",
+        Severity::Warning,
+        "settings.json sets `watchdog.max_restarts` to 0, so the watchdog never restarts a crashed or hung instance.",
+        &[],
+    ),
     // ----- 记录码 -----
     plain(
         "record_unreadable",

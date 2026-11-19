@@ -1,7 +1,7 @@
 //! The official aproxy-format speaks this envelope until its migration to protocol 1.
 //! This module is removed when that migration is complete.
 //!
-//! aproxy 外部转换器的信封契约：aproxy 与 format 程序之间的唯一接口。
+//! Earlier one-line transform envelope; protocol 1 types live at the crate root.
 //!
 //! 一次转换 = 一行 JSON 信封（stdin 进 stdout 出）。aproxy 把请求（或上游响应）
 //! 装进信封写给 format 进程，format 改写后写一行信封回来。本 crate 是两个

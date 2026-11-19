@@ -12,10 +12,27 @@ fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     Option::<T>::deserialize(d).map(Some)
 }
 
+/// Serde's default enum reader also accepts externally tagged objects. Protocol tokens
+/// are strings, so reject the alternative spelling before matching their vocabulary.
+macro_rules! string_token {
+    ($ty:ident, $($word:literal => $variant:ident),+ $(,)?) => {
+        impl TryFrom<String> for $ty {
+            type Error = &'static str;
+            fn try_from(word: String) -> Result<Self, Self::Error> {
+                match word.as_str() { $($word => Ok(Self::$variant),)+ _ => Err(concat!("unknown ",stringify!($ty)," token")) }
+            }
+        }
+    };
+}
+string_token!(BodyNeed, "none"=>None, "digest"=>Digest, "full"=>Full);
+string_token!(Process, "spawn"=>Spawn, "persistent"=>Persistent);
+string_token!(Delivery, "retry"=>Retry, "forward"=>Forward);
+string_token!(Decision, "retry"=>Retry, "stop"=>Stop);
+
 /// How much of the original request a stage needs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", try_from = "String")]
 pub enum BodyNeed {
     /// Do not send a body or digest.
     None,
@@ -28,7 +45,7 @@ pub enum BodyNeed {
 /// Worker lifetime selected by the instance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", try_from = "String")]
 pub enum Process {
     /// One stage message per process after hello.
     Spawn,
@@ -39,7 +56,7 @@ pub enum Process {
 /// Active delivery mode of this request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", try_from = "String")]
 pub enum Delivery {
     /// Buffer and retry before delivery.
     Retry,
@@ -50,7 +67,7 @@ pub enum Delivery {
 /// Disposition of a finished attempt.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", try_from = "String")]
 pub enum Decision {
     /// Make another attempt.
     Retry,
@@ -104,6 +121,7 @@ impl Hello {
 /// Worker selection and capabilities, returned before any stage can be sent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
+#[serde(try_from = "serde_json::Map<String, serde_json::Value>")]
 pub struct HelloReply {
     /// Version of the hello framing itself, always one.
     pub v: u32,
@@ -122,6 +140,36 @@ pub struct HelloReply {
     pub name: String,
     /// Program version for the instance snapshot.
     pub version: String,
+}
+impl TryFrom<serde_json::Map<String, serde_json::Value>> for HelloReply {
+    type Error = serde_json::Error;
+    fn try_from(mut obj: serde_json::Map<String, serde_json::Value>) -> Result<Self, Self::Error> {
+        use serde::de::Error;
+        // Consume only known fields. Positional arrays and scalars are not hello frames.
+        fn field<T: serde::de::DeserializeOwned>(
+            obj: &mut serde_json::Map<String, serde_json::Value>,
+            key: &'static str,
+        ) -> Result<T, serde_json::Error> {
+            serde_json::from_value(
+                obj.remove(key)
+                    .ok_or_else(|| serde_json::Error::missing_field(key))?,
+            )
+        }
+        let request_body = match obj.remove("request_body") {
+            None | Some(serde_json::Value::Null) => BTreeMap::new(),
+            Some(v) => serde_json::from_value(v)?,
+        };
+        Ok(Self {
+            v: field(&mut obj, "v")?,
+            seq: field(&mut obj, "seq")?,
+            protocol: field(&mut obj, "protocol")?,
+            stages: field(&mut obj, "stages")?,
+            request_body,
+            features: field(&mut obj, "features")?,
+            name: field(&mut obj, "name")?,
+            version: field(&mut obj, "version")?,
+        })
+    }
 }
 impl HelloReply {
     /// Construct the wire object from its required context.

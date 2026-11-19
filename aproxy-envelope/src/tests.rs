@@ -207,3 +207,50 @@ fn public_constructors_and_retry_input() {
     );
     roundtrip::<Message>(wire);
 }
+
+/// Framing never guesses field order or accepts an uncorrelated reply.
+#[test]
+fn frames_require_objects_and_both_replies_require_seq() {
+    let array = json!([1, 0, 1, [], {}, [], "tool", "1"]);
+    for value in [array, json!(false), json!(null)] {
+        assert!(serde_json::from_value::<HelloReply>(value.clone()).is_err());
+        assert!(serde_json::from_value::<Reply>(value.clone()).is_err());
+        assert!(serde_json::from_value::<Message>(value).is_err());
+    }
+    assert!(serde_json::from_value::<Reply>(json!({"v":1})).is_err());
+    assert!(
+        serde_json::from_value::<HelloReply>(
+            json!({"v":1,"protocol":1,"stages":[],"features":[],"name":"tool","version":"1"})
+        )
+        .is_err()
+    );
+}
+
+/// A vocabulary member is a bare string, not an externally tagged unit variant.
+#[test]
+fn tokens_reject_object_spellings_and_unknown_words() {
+    fn check<T: serde::de::DeserializeOwned>(word: &str) {
+        assert!(serde_json::from_value::<T>(json!(word)).is_ok());
+        assert!(serde_json::from_value::<T>(json!({(word):null})).is_err());
+        assert!(serde_json::from_value::<T>(json!("unnegotiated")).is_err());
+    }
+    check::<Decision>("retry");
+    check::<Delivery>("retry");
+    check::<Process>("persistent");
+    check::<BodyNeed>("digest");
+}
+
+/// A null optional patch leaves the value alone and does not conflict with real bytes.
+#[test]
+fn null_reply_fields_mean_absence() {
+    let binary: ResponsePatch =
+        serde_json::from_value(json!({"body":null,"body_b64":"/w=="})).unwrap();
+    assert_eq!(binary.body, Body::Binary(vec![255]));
+    let unchanged: RequestPatch = serde_json::from_value(json!({"body":null})).unwrap();
+    assert_eq!(unchanged.body, Body::Absent);
+    let r: Reply = serde_json::from_value(
+        json!({"v":1,"seq":3,"decision":null,"delay_ms":null,"state":null,"response":null}),
+    )
+    .unwrap();
+    assert_eq!(r, Reply::new(3));
+}

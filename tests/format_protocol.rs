@@ -2873,3 +2873,66 @@ async fn pending_success_vote_uses_neutral_headers_for_sse() {
     assert!(body.ends_with("data: second\n\n"), "{body:?}");
     assert_eq!(calls.load(Ordering::Relaxed), 2);
 }
+
+/// 无法解码也必须咨询，错误的编码头和原始字节让程序自己判断；大输入只保留首尾。
+#[tokio::test]
+async fn decide_receives_raw_bounded_bytes_when_decoding_fails() {
+    use base64::Engine as _;
+    for coding in ["unknown", "gzip"] {
+        let home = TestHome::new();
+        let up = free_port();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+            .await
+            .unwrap();
+        let expected = [vec![b'h'; 65536], vec![b't'; 1024 * 1024 - 65536]].concat();
+        let raw = bytes::Bytes::from(
+            [
+                vec![b'h'; 65536],
+                vec![b'x'; 16384],
+                vec![b't'; 1024 * 1024 - 65536],
+            ]
+            .concat(),
+        );
+        let app = axum::Router::new().fallback(move || {
+            let raw = raw.clone();
+            async move {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    [("content-encoding", coding), ("x-policy", "visible")],
+                    raw,
+                )
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cfg = String::from("[[retry.rules]]\nstatus=[503]\nmax_attempts=1\n")
+            + &layer(
+                &home,
+                "policy",
+                "'decide'",
+                &[
+                    "reply",
+                    r#"{"decision":"stop","response":{"body":"consulted"}}"#,
+                ],
+            );
+        let (c, url) = running(&home, up, &cfg);
+        let response = c.get(url).send().await.unwrap();
+        assert_eq!(
+            response.headers()["x-aproxy-error"],
+            "retry_stopped",
+            "{coding}"
+        );
+        assert_eq!(response.text().await.unwrap(), "consulted");
+        let f = frames(&home, "policy");
+        let r = &f[1]["response"];
+        assert!(r.get("body").is_none());
+        assert_eq!(r["headers"]["content-encoding"], coding);
+        assert_eq!(r["headers"]["x-policy"], "visible");
+        assert_eq!(r["truncated"], 16384);
+        assert!(
+            base64::engine::general_purpose::STANDARD
+                .decode(r["body_b64"].as_str().unwrap())
+                .unwrap()
+                == expected
+        );
+    }
+}

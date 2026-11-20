@@ -111,19 +111,56 @@ pub struct Route {
     /// 加载后按优先级稳定排序，组内保留配置顺序作为故障转移次序。
     channel: Vec<Channel>,
 }
+/// 针对路径的每一层解码都检查边界；已编码的分隔符也不能把普通段变成父段。
+/// 八层后仍有可解码字符时保守拒绝，限制重复扫描的成本。实际转发始终使用未解码的路径。
+fn safe_child_path(path: &[u8]) -> bool {
+    let unsafe_layer = |p: &[u8]| {
+        p.iter().any(|b| *b == b'\\' || b.is_ascii_control())
+            || p.split(|b| *b == b'/').any(|s| matches!(s, b"." | b".."))
+    };
+    if unsafe_layer(path) {
+        return false;
+    }
+    if !path.contains(&b'%') {
+        return true;
+    }
+    let mut layer = path.to_vec();
+    for depth in 0..=8 {
+        let mut read = 0;
+        let mut write = 0;
+        while read < layer.len() {
+            if layer[read] == b'%'
+                && let Some(pair) = layer.get(read + 1..read + 3)
+                && let (Some(hi), Some(lo)) = (
+                    (pair[0] as char).to_digit(16),
+                    (pair[1] as char).to_digit(16),
+                )
+            {
+                if depth == 8 {
+                    return false;
+                }
+                layer[write] = (hi * 16 + lo) as u8;
+                read += 3;
+            } else {
+                layer[write] = layer[read];
+                read += 1;
+            }
+            write += 1;
+        }
+        if write == layer.len() {
+            return true;
+        }
+        layer.truncate(write);
+        if unsafe_layer(&layer) {
+            return false;
+        }
+    }
+    true
+}
 /// 保留客户端路径时只允许普通路径段。URL 写入时会解释点段与反斜线，必须先检查原文。
 fn preserved_path(raw: &str) -> Result<&str, Fault> {
     let path = raw.split_once('?').map_or(raw, |(p, _)| p);
-    if !path.starts_with('/')
-        || path.contains('\\')
-        || path.bytes().any(|c| c.is_ascii_control())
-        || path.split('/').any(|s| {
-            matches!(s, "." | "..")
-                || ["%2e", ".%2e", "%2e.", "%2e%2e"]
-                    .iter()
-                    .any(|dot| s.eq_ignore_ascii_case(dot))
-        })
-    {
+    if !path.starts_with('/') || !safe_child_path(path.as_bytes()) {
         return Err(Fault::new(
             "保留的客户端路径包含无效路径段",
             "invalid preserved client path segment",
@@ -425,7 +462,22 @@ mod tests {
         for segment in [".", "..", "%2E", ".%2E", "%2e.", "%2e%2E", "a\\b"] {
             assert!(preserved_path(&format!("/safe/{segment}/leaf")).is_err());
         }
-        for path in ["/a/.../leaf", "/.well-known/v1", "/%2ejson"] {
+        // 点号的十六进制数字本身也可被编码，不能只替换固定的 %252e 拼法。
+        for path in [
+            "/a/%252e%252E/b",
+            "/a/%25%32%45./b",
+            "/a%252f..%252fb",
+            "/a/%2525252525252525252e/b",
+        ] {
+            assert!(preserved_path(path).is_err());
+        }
+        for path in [
+            "/a/.../leaf",
+            "/.well-known/v1",
+            "/%2ejson",
+            "/%252ejson",
+            "/%E7%A7%9F%E6%88%B7",
+        ] {
             assert_eq!(
                 preserved_path(&format!("{path}?q=..")).map_err(|e| e.wire),
                 Ok(path)

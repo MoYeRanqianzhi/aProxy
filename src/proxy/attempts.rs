@@ -1137,6 +1137,7 @@ async fn deliver(
             req.ctx.as_ref().expect("format context"),
             &meta,
             logical_attempt,
+            &trace.upstream_join,
             committed,
             status,
             headers,

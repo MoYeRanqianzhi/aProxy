@@ -385,6 +385,7 @@ pub(super) async fn chain(
     ctx: &ExchangeCtx,
     meta: &wire::RequestMeta,
     attempt: u32,
+    accounting: &std::sync::Weak<UpstreamJoin>,
     committed: Option<Arc<std::sync::atomic::AtomicBool>>,
     mut status: StatusCode,
     mut headers: HeaderMap,
@@ -513,10 +514,14 @@ pub(super) async fn chain(
             drop(content);
             content = Content::Saved(SpooledBody::Memory(Bytes::new()));
             let mut layer = layer;
-            // 丢弃的是字节而不是状态和报告。正常 close 仍受该层的消息时限约束。
-            if layer.send(wire::StreamEvent::Close).await.is_ok() {
-                layer.worker.finish();
-            }
+            // HTTP 没有正文可等，立即交付头。只把历史和 notify 的结算留到 close 处理完毕。
+            let finalization = accounting.upgrade();
+            tokio::spawn(async move {
+                if layer.send(wire::StreamEvent::Close).await.is_ok() {
+                    layer.worker.finish();
+                }
+                drop(finalization);
+            });
             break;
         }
         let mut f = content.flow().await;

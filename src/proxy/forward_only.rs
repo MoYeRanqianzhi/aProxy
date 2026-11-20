@@ -606,6 +606,7 @@ pub(super) async fn forward_response(
             ctx.expect("response chain context"),
             &meta,
             attempt,
+            &trace.upstream_join,
             None,
             status,
             headers,

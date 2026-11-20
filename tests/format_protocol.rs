@@ -6603,10 +6603,17 @@ async fn bodyless_close_state_reaches_notify_after_a_held_reply() {
     let request = tokio::spawn(c.get(&url).send());
     let stream = observed_stage(&home, "suppress", "stream", 2).await;
     clock.advance(3);
-    std::fs::write(&gate, []).unwrap();
     let r = request.await.unwrap().unwrap();
     assert_eq!(r.status(), 204);
     assert!(r.bytes().await.unwrap().is_empty());
+    let pending = request_detail(&home, &url, stream[0]["request_id"].as_str().unwrap()).await;
+    assert!(pending["record"]["ended_at"].is_null(), "{pending}");
+    assert!(
+        !frames(&home, "suppress")
+            .iter()
+            .any(|f| f["stage"] == "notify")
+    );
+    std::fs::write(&gate, []).unwrap();
     let end = &observed_stage(&home, "suppress", "notify", 1).await[0];
     assert_eq!(end["state"], "finished close");
     let record = request_detail(&home, &url, stream[0]["request_id"].as_str().unwrap()).await;

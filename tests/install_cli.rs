@@ -98,13 +98,24 @@ async fn instance(h: &TestHome, exe: &Path, foreground: bool) -> (u16, ChildGuar
     } else {
         h.serve_cmd_with(exe, &cfg)
     };
-    let child = ChildGuard(
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // 另一个测试线程 fork 的子进程在 exec 之前仍可能持有刚复制镜像的写句柄。
+    // 只重试这个暂时的执行冲突；路径、权限、架构错误仍由第一次 spawn 原样报告。
+    let mut waits = [25, 50, 100, 200, 400, 800].into_iter();
+    let child = ChildGuard(loop {
+        match cmd.spawn() {
+            Err(e)
+                if cfg!(unix)
+                    && e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && let Some(ms) = waits.next() =>
+            {
+                tokio::time::sleep(Duration::from_millis(ms)).await
+            }
+            other => break other.unwrap(),
+        }
+    });
     let dir = h.path().join("run");
     for _ in 0..100 {
         if let Ok(status) = aproxy::daemon::ipc_ping_in(&dir, &port.to_string()).await

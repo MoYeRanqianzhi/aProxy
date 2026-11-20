@@ -241,7 +241,7 @@ jobs:
             sep: ":"
     runs-on: ${{ matrix.os }}
     env:
-      PREV_VERSIONS: v0.2.0-alpha.1 v0.2.0-alpha.2 v0.2.0-alpha.3
+      PREV_VERSIONS: v0.2.0-alpha.1 v0.2.0-alpha.2 v0.2.0-alpha.3 v0.2.0-alpha.4
     steps:
       - uses: actions/checkout@v7.0.1
         with:

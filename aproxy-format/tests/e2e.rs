@@ -1141,6 +1141,130 @@ fn stream_frame(w: &mut Worker, event: &str, bytes: &str) -> Value {
     }
     w.frame(frame)
 }
+/// 双向经过真实请求帧，文字/图片的顺序、工具名、调用标识以及每条结果的归属都保留。
+#[test]
+fn multipart_image_and_tool_results_roundtrip_over_the_wire() {
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=";
+    let body = json!({"model":"m","max_tokens":16,"messages":[{"role":"user","content":[{"type":"text","text":"look"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":png}},{"type":"text","text":"after"}]},{"role":"assistant","content":[{"type":"tool_use","id":"call_a","name":"left","input":{"p":"a"}},{"type":"tool_use","id":"call_b","name":"right","input":{"p":"b"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_a","content":"left output"},{"type":"tool_result","tool_use_id":"call_b","content":"right output"}]}]});
+    let convert = |from, to, v| {
+        let mut w = Worker::new(&["convert", "--from", from, "--to", to]);
+        let r = w.frame(request("https://relay.test/custom", "/custom", v));
+        serde_json::from_str::<Value>(r["request"]["body"].as_str().unwrap()).unwrap()
+    };
+    for target in ["openai_chat", "openai_responses"] {
+        let outgoing = convert("anthropic_messages", target, body.clone());
+        let image = if target == "openai_chat" {
+            &outgoing["messages"][0]["content"][1]["image_url"]["url"]
+        } else {
+            &outgoing["input"][0]["content"][1]["image_url"]
+        };
+        assert_eq!(*image, format!("data:image/png;base64,{png}"));
+        let restored = convert(target, "anthropic_messages", outgoing);
+        assert_eq!(restored["messages"][0], body["messages"][0]);
+        let parts: Vec<_> = restored["messages"].as_array().unwrap()[1..]
+            .iter()
+            .flat_map(|m| m["content"].as_array().unwrap())
+            .collect();
+        assert_eq!(parts.len(), 4);
+        for expected in body["messages"].as_array().unwrap()[1..]
+            .iter()
+            .flat_map(|m| m["content"].as_array().unwrap())
+        {
+            assert!(parts.contains(&expected), "{restored}");
+        }
+    }
+}
+/// 混合发送两个工具的参数片段；分别核对输出项和内容块的索引、完整 JSON、起止次数与次序。
+#[test]
+fn parallel_tool_deltas_have_exact_target_lifecycles() {
+    let chunks = vec![
+        json!({"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"left","arguments":"{\"p\":"}},{"index":1,"id":"call_b","type":"function","function":{"name":"right","arguments":"{\"q\":"}}]}),
+        json!({"tool_calls":[{"index":1,"function":{"arguments":"2}"}},{"index":0,"function":{"arguments":"1}"}}]}),
+        json!({}),
+    ];
+    let input:Vec<_>=chunks.into_iter().map(|delta|json!({"id":"c","model":"m","created":1,"choices":[{"index":0,"finish_reason":if delta==json!({}){Some("tool_calls")}else{None},"delta":delta}]})).collect();
+    for target in ["anthropic_messages", "openai_responses"] {
+        let mut w = Worker::new(&["convert", "--from", target, "--to", "openai_chat"]);
+        open_stream(&mut w, "text/event-stream");
+        let ev = translated_events(&mut w, &input, true);
+        let kinds: Vec<_> = ev.iter().map(|e| e["type"].as_str().unwrap()).collect();
+        if target == "anthropic_messages" {
+            assert_eq!(
+                kinds,
+                [
+                    "message_start",
+                    "content_block_start",
+                    "content_block_delta",
+                    "content_block_stop",
+                    "content_block_start",
+                    "content_block_delta",
+                    "content_block_stop",
+                    "message_delta",
+                    "message_stop"
+                ]
+            );
+            for (i, (id, name, args)) in [
+                ("call_a", "left", json!({"p":1})),
+                ("call_b", "right", json!({"q":2})),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let group = &ev[1 + 3 * i..4 + 3 * i];
+                assert!(group.iter().all(|e| e["index"] == i));
+                assert_eq!(group[0]["content_block"]["id"], id);
+                assert_eq!(group[0]["content_block"]["name"], name);
+                assert_eq!(
+                    serde_json::from_str::<Value>(
+                        group[1]["delta"]["partial_json"].as_str().unwrap()
+                    )
+                    .unwrap(),
+                    args
+                );
+            }
+        } else {
+            assert_eq!(
+                kinds,
+                [
+                    "response.created",
+                    "response.output_item.added",
+                    "response.function_call_arguments.delta",
+                    "response.output_item.added",
+                    "response.function_call_arguments.delta",
+                    "response.function_call_arguments.done",
+                    "response.output_item.done",
+                    "response.function_call_arguments.done",
+                    "response.output_item.done",
+                    "response.completed"
+                ]
+            );
+            for (i, e) in ev.iter().enumerate() {
+                assert_eq!(e["sequence_number"], i);
+            }
+            for (i, (id, name, args)) in [
+                ("call_a", "left", json!({"p":1})),
+                ("call_b", "right", json!({"q":2})),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let added = &ev[1 + i * 2];
+                let done = &ev[6 + i * 2];
+                assert_eq!(added["item"]["call_id"], id);
+                assert_eq!(done["output_index"], i);
+                assert_eq!(done["item"]["id"], added["item"]["id"]);
+                assert_eq!(done["item"]["name"], name);
+                assert_eq!(
+                    serde_json::from_str::<Value>(done["item"]["arguments"].as_str().unwrap())
+                        .unwrap(),
+                    args
+                );
+                assert_eq!(ev[9]["response"]["output"][i], done["item"]);
+            }
+        }
+    }
+}
+
 /// 已选择目标协议后，坏事件只交付一次目标错误，不回 fail，也不让后续原文穿过可选层。
 #[test]
 fn malformed_stream_ends_in_the_client_protocol_only_once() {

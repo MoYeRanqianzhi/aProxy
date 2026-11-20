@@ -30,7 +30,16 @@ worker 让给响应的交付，这次取消不计入熔断；已经写给 worker
 那一帧中间：先在限时内收完它的回信，再把 abort 发给同一个进程。进程台账不是外部 worker 的兜底：停机时确认不了退出的，
 要趁实例还知道子进程 pid 的时候记进日志。
 
-**Evidence:** `tests/format_protocol.rs` 的 `client_disconnect_aborts_open_streams_on_their_own_workers`、
+HTTP 的交付与 worker 的完成是两条边界。双工的 forward 响应可以在上传还没结束时就开流，这时没有 `stream` 标志表示不知道，
+不表示不是流式。响应头一旦写出，投递方式的表态就改不了它。先登记正在上传的原始请求体，再让尝试共享它的 `sent` 引用；
+事后登记补不回那个引用。不能只凭客户端的体被丢弃就封存记录：客户端断开时，上游字节数还在 forward 的旁路计数器手里；
+发完成通知之前要等的是这两个生命期都结束，而不是旁观程序或 worker 的收尾。要测某一拍或半开探测，等真实的子进程或上游
+确认收到那一帧之后再拨代理的时钟；把客户端和它的防挂死期限也冻住，会把卡住的交互藏起来。
+
+**Evidence:** `tests/history_integration.rs` 的 `forwarded_requests_are_recorded_as_they_stream`；`tests/format_protocol.rs` 的
+`forward_stream_can_open_before_the_client_finishes_its_upload`、`forward_vote_on_either_side_of_commitment`、
+`forward_disconnect_during_data_preserves_upstream_counts_before_notify` 与用手动时钟的心跳、notify 回归；
+`tests/format_protocol.rs` 的 `client_disconnect_aborts_open_streams_on_their_own_workers`、
 `stream_workers_do_not_count_toward_pool_max` 与停机限时的各个测试（另见 `src/transform/tests.rs`）；`src/proxy/decide.rs`；`tests/format_protocol.rs` 的 `large_upstream_body_reaches_decide_truncated`、
 `decide_success_can_fail_a_200`；`src/transform/tests.rs` 的 `breaker_generation_retains_the_fault_after_recovery`；
 `src/transform/pool.rs`、`src/proxy/keepalive.rs`，以及 `tests/format_protocol.rs` 里用真实 worker 的测试

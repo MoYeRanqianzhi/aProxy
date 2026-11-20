@@ -297,6 +297,7 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     /// 排空开始时立即释放尚未派发的状态，不等占着同一个 worker 的业务归还名额。
     #[tokio::test]
     async fn begin_drain_releases_queued_notices_before_data_returns() {

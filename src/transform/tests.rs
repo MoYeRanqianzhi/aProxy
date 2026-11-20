@@ -2,7 +2,7 @@
 use super::super::{format_echo_path, headers_from_btreemap, headers_to_btreemap};
 use super::*;
 use aproxy_envelope as wire;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 /// 独立的挂死保护，不用完成耗时判定行为；调用处核对同时持有的租约、进程帧或实际 EOF。
 async fn until_observed<T>(work: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(30), work)

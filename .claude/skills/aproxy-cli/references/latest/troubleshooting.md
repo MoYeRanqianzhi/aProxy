@@ -14,7 +14,7 @@ the aproxy-format skill's troubleshooting.md.
 - [Starting and stopping](#starting-and-stopping)
 - [Slow, hanging or failing requests](#slow-hanging-or-failing-requests)
 - [Client disconnects and parse errors](#client-disconnects-and-parse-errors)
-- [Transformers and forward-only mode](#transformers-and-forward-only-mode)
+- [Format programs and forward-only mode](#format-programs-and-forward-only-mode)
 - [Logs and files](#logs-and-files)
 - [Crash recovery, watchdog and upgrades](#crash-recovery-watchdog-and-upgrades)
 - [Desktop window and variants](#desktop-window-and-variants)
@@ -98,16 +98,22 @@ the aproxy-format skill's troubleshooting.md.
 | Gemini CLI fails with `Incomplete JSON segment at the end` | An SSE comment reached its pinned `@google/genai` 1.30.0 parser. aProxy never sends heartbeats to Gemini CLI's requests, so another hop in the chain inserted it | Remove or reconfigure the other proxy; do not try to enable heartbeats for Gemini CLI (clients.md, Gemini CLI) |
 | Gemini CLI fails on long generations or during upstream outages | Its hard-coded response-header timeout (60 s in 0.62.0) runs out, because aProxy sends the head only after a complete successful attempt | No fix in aProxy or the client today (clients.md, Gemini CLI) |
 
-## Transformers and forward-only mode
+## Format programs and forward-only mode
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| 422 with `x-aproxy-error: format_rejected`, or 502 with `x-aproxy-error: format_failed` | The request-stage format failed; the request was not sent upstream and is not retried | `format_rejected` means the program replied with an `error` envelope; the reason after `rejected the request: ` is its own text. `format_failed` means the program itself failed; `details.kind` is `spawn` (check `command`), `died` (exited without output), `io` (pipe failure), `timeout` (raise `timeout_secs` or fix a stuck format) or `protocol` (extra stdout lines, invalid JSON, bad base64). A keepalive request already past the commit gets the same code as an SSE frame. Details: aproxy-format skill, troubleshooting.md |
-| A transformer is configured but responses come back untransformed | No `[[format]]` entry declares `response` (it is separate from the request format); or it failed and the original was passed through (log `响应转换失败，透传上游原始响应`); or the response was a retry-rule pass-through, which is never transformed | Add a format with `stages = ["response"]`, fix it, or accept that pass-through failures stay raw |
-| Header changes from the response transform are missing on streaming requests | A skeleton head was already committed, because retries or the response transform itself outlasted one keepalive interval; after that only the body transform applies | Expected (behaviors.md, External transformers) |
-| Start fails with `config_conflict` on `delivery`: `delivery = "forward"` cannot be combined with a format | Forward-only does not buffer bodies, formats need them whole | Keep one of the two |
+| 422 with `x-aproxy-error: format_rejected` | A request-side format program refused the request on purpose (`fail` with `retry: false`), typically because it cannot convert the body, no channel matches the model, or the destination is in no key pool. Not retried | The message carries the program's own reason and `details.format` names it. Fix the request or the role's configuration; `aproxy-format try <config.toml> --request <sample>` rehearses the chain offline |
+| 503 with `x-aproxy-error: format_unavailable` | A `required` program failed `breaker_failures` times in a row and its breaker is open; `details.kind` is the failure that opened it and `details.probe_at` when aProxy tries it again | Read the instance log for the program's stderr and the failure lines, fix the program or its configuration, then wait for the probe or `aproxy restart`. A judge that must never block traffic belongs in `required = false` |
+| 502 with `x-aproxy-error: format_failed` | A forward request's request-side program broke or asked for a retry, and nothing upgraded the request to retry delivery | Same diagnosis as above; with the default `delivery = "retry"` such failures are retried instead |
+| The instance does not start: `format_handshake_failed` or `format_stage_unsupported` | A program could not be started, did not answer the handshake within 10 s, speaks another protocol version, or does not support a stage listed in `stages` | Check `command` (bare names are looked up in `<home>/bin/`, then `PATH`; `.cmd`/`.bat` are rejected on Windows), run the program by hand, and compare `stages` with what the role supports (aproxy-format skill). `aproxy doctor` reports the same without starting anything |
+| Start fails with `config_conflict` on a format | `response` and `stream` on one entry; `stream` or `notify` without `process = "persistent"`; a request-side entry after a `retry` entry that does not declare `retry` itself; duplicate names | Fix the entry (config-toml.md, format) |
+| Requests are converted but responses come back in the upstream's protocol | The converter declares only `request`; or its response side failed and the layer was skipped (a warning in the log); or the response was a retry-rule pass-through or a non-2xx forward response, which are never converted | Add `stream` (or `response`) to the converter's `stages` and keep it `required = true`; rewrite upstream errors with a `decide` program |
+| Key rotation does not switch keys between retries | The retry chain was not rerun: a `decide` program answered `reroute: false`, or the keys entry does not declare `retry` | Declare `retry` on the keys entry and let the policy answer `reroute = true` for the statuses that should rotate |
+| Cooldowns or learned decisions seem forgotten | The program's state is per process: several pooled workers each keep their own, and an idle worker is retired | `pool_max = 1` and `worker_idle_secs = 0` on that entry |
+| Header changes from a response-side program are missing on streaming requests | A skeleton head was already committed, because retries or the program itself outlasted one keepalive interval; after that only the body is used | Expected (behaviors.md, Format programs) |
+| A streaming conversion from Chat shows no tool-call progress until the end, or a continued conversation with thinking is refused after converting Messages to Chat | Two known limits of the conversion library used by `aproxy-format convert` | See the aproxy-format skill, known conversion limits |
 | The user wants retries off and true incremental streaming | That is forward-only mode | `delivery = "forward"` in that instance's config.toml (or settings.json `defaults.delivery`), then `aproxy restart <port\|alias>`. Make sure the user accepts losing retries, buffering and heartbeats |
-| Forward-only instance: 502 with `x-aproxy-error: upstream_failed` (`details.last_code`), or a stream cut off midway | Expected: forward-only never retries and never injects bytes the upstream did not send | Nothing to fix in aProxy; switch back to the default mode if retries are needed |
+| Forward request: 502 with `x-aproxy-error: upstream_failed` (`details.last_code`), or a stream cut off midway | Expected: a forward request is not retried unless a `decide` program upgrades it before any byte was written, and aProxy never injects bytes the upstream did not send | Nothing to fix in aProxy; use the default `delivery = "retry"` (optionally with the `adaptive` role) if retries are needed |
 
 ## Logs and files
 

@@ -33,21 +33,17 @@ by keepalive ends with a terminal SSE error event; see Configuration.)
 - **Total passthrough** — Transparency as a principle. Paths, queries, and
   headers forwarded untouched; control traffic rides a separate named pipe,
   so the proxy port does exactly one thing.
-- **External transformers (optional)** — Requests and responses can be
-  handed whole to an external format program that rewrites them (one JSON
-  envelope line in, one out; any program that reads stdin and writes stdout
-  works): OpenAI ↔ Anthropic protocol conversion, multi-key rotation,
-  multi-model / multi-channel aggregation. The core only adds orchestration;
-  all conversion logic lives outside it, and the official example binary
-  `aproxy-format` works out of the box (released separately). When the
-  persistent pool reuses an idle worker that has died, it transparently
-  retries once with a fresh worker. **Limitation**: `aproxy-format` converts
-  across protocols (e.g. Anthropic ↔ OpenAI) for **non-streaming** requests
-  only; cross-protocol SSE responses are not supported — the response-side
-  conversion fails and the original upstream response is passed through, so
-  the client receives a stream in the channel's protocol. Same-protocol SSE
-  passes through untouched, and key rotation / same-protocol aggregation are
-  unaffected.
+- **Format programs (optional)** — Requests, responses, retry decisions and
+  heartbeats can be handed to external format programs (one JSON line in, one
+  out; any program that reads stdin and writes stdout works), and several
+  programs form a chain in configuration order. The core only orchestrates;
+  all conversion logic lives outside it. The official `aproxy-format` works
+  out of the box: protocol conversion between OpenAI Chat, OpenAI Responses
+  and Anthropic Messages (**streaming and non-streaming**), key rotation with
+  cooldown, multi-channel routing and failover by model, retry policy, and a
+  per-request choice between true streaming and unlimited retries. A broken
+  program trips a circuit breaker: a judging program is skipped and requests
+  fall back to unlimited retries.
 - **Background daemon** — `aproxy start` launches detached from a launch spec (survives terminal close;
   secrets stay in the spec file, not on the instance's command line); `status` / `stop` / `logs` /
   `restore` for full instance management.
@@ -453,7 +449,7 @@ listen_addr = "127.0.0.1:12345"          # local listener (port 0 = OS-assigned;
 # max_request_mb = 128                   # request body cap (MB; 0 = unlimited; defaults to settings.json defaults.max_request_mb)
 # max_response_mb = 256                  # upstream response buffer cap (MB; 0 is treated as 1)
 # disk_cache = true                      # spool large bodies/responses to disk
-# delivery = "retry"                     # "retry" (default: buffer and retry) / "forward" (stream both ways, no retries/buffering/heartbeats)
+# delivery = "retry"                     # the mode a request starts in: "retry" (default: buffer and retry) / "forward" (stream both ways, no retries, no heartbeats); format programs can change it per request
 # log_file = "D:/aproxy-logs/a.log"      # custom log file (~ expanded; relative paths resolve against APROXY_HOME; default is a random per-start name, resolved via IPC)
 # allowed_hosts = ["myproxy.local"]      # extra Hosts to allow (DNS-rebinding guard; appended to the built-in list, "*" disables the check)
 # allowed_origins = ["http://localhost:5173"] # browser Origins to allow (any request carrying Origin is rejected by default, "*" disables the check)
@@ -477,19 +473,14 @@ listen_addr = "127.0.0.1:12345"          # local listener (port 0 = OS-assigned;
 [history]
 # body_budget_mb = 64                   # cap on request/response bodies kept in the request history (MB of memory; 0 = keep none)
 
-# [[format]]                             # external transformer: at most one per stage (request/response/heartbeat)
-# name = "convert"
-# command = "~/.aproxy/bin/aproxy-format"
-# args = ["run", "--config", "~/.aproxy/agg.toml"]   # no extra key any more: pass configuration through args or env
-# process = "persistent"                 # spawn (default) / persistent (required for stateful programs)
-# stages = ["request", "retry"]          # request / response / heartbeat; adding retry re-runs it before every retry
-# env = { KEYS = '{"keys": ["sk-a", "sk-b"]}' }  # extra environment variables (values are never shown by config show)
+# [[format]]                             # format programs, any number; list order is the request direction (see "Format programs" below)
+# name = "keys"
+# command = "aproxy-format"              # a bare name is looked up in ~/.aproxy/bin/, then PATH
+# args = ["keys", "--config", "keys.toml"]   # relative paths resolve against ~/.aproxy
+# process = "persistent"                 # spawn (default) / persistent (required for stream, notify and stateful programs)
+# stages = ["request", "retry"]          # request / retry / decide / response / stream / heartbeat / notify
+# env = { RELAY_KEY_A = "sk-a", RELAY_KEY_B = "sk-b" }   # extra environment variables (values are never shown by config show)
 ```
-
-Multi-key rotation takes effect **between requests** by default: retries of the
-same request keep the same transformed key (a request is transformed once and
-the result is replayed on every retry). Add `"retry"` to the request format's
-`stages` to transform again before every retry.
 
 Runtime data lives in `~/.aproxy/`: `run/` (instance records `<port>.instance.json`, desired-state
 records `<port>.restore.json`, the watchdog record `watchdog.json`, and a short-lived launch-spec
@@ -526,7 +517,8 @@ the **first** attempt:
 
 - If any attempt gets a 2xx with an uncompressed `text/event-stream` from the
   upstream, its real status and headers are forwarded to the client immediately
-  (when no `response`-stage format is configured); otherwise, after about one
+  (when no format program declares
+  `response`, `stream` or `decide`); otherwise, after about one
   keepalive interval, skeleton headers (200 + SSE) are committed. Needing a
   retry does not commit anything by itself, so a request that succeeds after a
   few quick retries still gets the real upstream response.
@@ -545,7 +537,166 @@ the **first** attempt:
   exception to "total passthrough" that only costs some extra bytes between the
   upstream and this machine; ineligible requests are not rewritten.
 - Ordinary `"stream": false` requests have no keepalive channel, nor do
-  `delivery = "forward"` instances or `keepalive.interval_secs = 0`.
+  requests delivered in `forward` mode or instances with
+  `keepalive.interval_secs = 0`.
+
+### Format programs and the official aproxy-format
+
+A `[[format]]` entry makes aProxy call an external program at fixed points of a
+request's life: to rewrite the request before it goes upstream (protocol
+conversion, picking a key, choosing a channel by model), to rewrite the response
+before it returns to the client, to decide after a failed attempt whether to
+retry, to generate heartbeats while the client waits, and to be told how the
+request ended. aProxy contains no conversion logic of its own; it talks to the
+program over stdin/stdout, one JSON line per question and one per answer, so any
+language will do.
+
+**List order is the request direction**: the first entry is closest to the
+client, the last closest to the upstream; responses pass through them in
+reverse.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `name` | file stem of `command` | Unique in the list, 1 to 64 bytes; shown in logs, `status` and the error body's `details.format` |
+| `command` | required | Run directly, never through a shell. A relative path resolves against `~/.aproxy`; a bare name is looked up in `~/.aproxy/bin/`, then on `PATH`. On Windows `.cmd` and `.bat` are rejected: to run a script, put the interpreter in `command` and the script in `args` |
+| `args` | `[]` | Passed verbatim; the worker's working directory is `~/.aproxy`, so relative paths resolve there |
+| `env` | `{}` | Extra environment variables for the program; put secrets here. `config show` lists names only |
+| `process` | `"spawn"` | `spawn` starts a process per message; `persistent` keeps a worker pool and is required for `stream`, `notify` and programs that keep state between requests |
+| `stages` | required | The stages this program takes part in, see below |
+| `required` | `true` | What happens when the program itself breaks (crash, timeout, invalid reply, open breaker): with `true` the attempt fails on the request side and is retried as usual, and once the breaker opens requests end with 503 `format_unavailable`; with `false` the layer is skipped |
+| `pool_max` | `4` | Upper bound of the `persistent` pool; workers busy with a stream are not counted. Use `1` for a program whose state must be shared by all requests |
+| `worker_idle_secs` | `300` | Idle time after which a worker is retired; `0` = never |
+| `timeout_secs` | `30` | Time limit for one reply; `0` = none |
+| `decide_timeout_secs` | `2` | Time limit at the `decide` stage; a late answer counts as "no opinion" and never ends the request |
+| `breaker_failures` | `5` | This many process-level failures in a row open the breaker; `0` = no breaker |
+| `breaker_cooldown_secs` | `30` | How long an open breaker waits before probing with one message; must not be `0` |
+
+The seven stages:
+
+| Stage | When | What for |
+|---|---|---|
+| `request` | Once per request, before the first attempt | Convert the protocol, pick a key and a channel, choose this request's delivery mode |
+| `retry` | Before a retry whose request is rebuilt, with the previous failure and the upstream's status and response headers | Switch key or channel after a failure |
+| `decide` | After a failed attempt | Retry or stop, how long to wait, whether to rebuild the request |
+| `response` | On a whole successful response before delivery | Convert non-streaming responses |
+| `stream` | On a successful response, chunk by chunk | Convert streaming responses as they flow |
+| `heartbeat` | On every keepalive tick | Emit a heartbeat the client's protocol recognises |
+| `notify` | After the request ended; aProxy does not wait for the answer | Learn from outcomes |
+
+Three shapes are refused at start with `config_conflict`:
+
+- one program declaring both `response` and `stream`;
+- a program declaring `stream` or `notify` that is not `persistent`;
+- in the request direction, a program listed after one that declares `retry`
+  without declaring `retry` itself (on a retry the earlier program produces a
+  new request; the later one would send out the previous result).
+
+**Delivery and formats**: `delivery` is only where each request starts. A
+program at the `request` stage may switch a single request to `forward` or
+`retry`, and when a `forward` request fails before any byte was written to the
+client, a program that declares `decide` can turn it into a `retry` request on
+the spot. The recommended setup therefore keeps the default `retry` and lets
+the official `adaptive` role move requests that have not failed before to
+truly streamed `forward`: when it is unavailable, everything falls back to
+unlimited retries. With `delivery = "forward"` the request body streams
+straight to the upstream (unless a program in the chain wants the body or
+declares `decide`; then it is read in full first) and the response is converted
+on the fly by programs that declare `stream`; a program that declares
+`response` needs the whole response, so that layer loses true streaming. With
+only request-side conversion configured and neither `stream` nor `response`,
+the client still receives the upstream's protocol.
+
+**The official `aproxy-format`** packages the common functions as roles, one
+subcommand per role, each in its own `[[format]]` entry, freely mixed with
+programs of your own:
+
+| Role | What it does | Minimal `args` | `stages` |
+|---|---|---|---|
+| `convert` | Converts between Anthropic Messages, OpenAI Chat and OpenAI Responses, streaming and non-streaming | `["convert", "--from", "anthropic_messages", "--to", "openai_chat"]` | `request`, `stream` (plus `retry` when placed after `route`) |
+| `keys` | Rotates several keys: round robin, weighted or random, cools down a failing key (honouring `Retry-After`), optional per-conversation stickiness | `["keys", "--config", "keys.toml"]` | `request`, `retry` |
+| `route` | Chooses a channel by model: aliases, priority, weight, failover, per-channel credentials and timeout overrides | `["route", "--config", "route.toml"]` | `request`, `retry` |
+| `policy` | Rules over status, failure reason and response body that retry or stop; a stop can answer with an error in the client's protocol | `["policy", "--config", "policy.toml"]` | `decide` |
+| `adaptive` | Chooses `forward` or `retry` per request: requests that never failed stream for real, ones that failed are pinned to retry | `["adaptive", "--config", "adaptive.toml"]` | `request`, `decide`, `notify` |
+| `rewrite` | Adds and removes request headers, edits the body by JSON Pointer, renames models | `["rewrite", "--config", "rewrite.toml"]` | `request` (plus `retry` when placed after `route`) |
+| `heartbeat` | Replaces the keepalive heartbeat with an event of the client's protocol (Anthropic Messages `ping`) | `["heartbeat"]` | `heartbeat` |
+
+A complete chain (Claude Code in front of a relay that only speaks OpenAI Chat
+and has two keys):
+
+```toml
+base_url = "https://relay.example.com"
+
+[[format]]
+name = "adaptive"
+command = "aproxy-format"
+args = ["adaptive", "--config", "adaptive.toml"]
+process = "persistent"
+stages = ["request", "decide", "notify"]
+required = false          # a judge: when it breaks, skip it; requests keep retrying without limit
+pool_max = 1              # what it has learned lives in one process
+worker_idle_secs = 0
+
+[[format]]
+name = "convert"
+command = "aproxy-format"
+args = ["convert", "--from", "anthropic_messages", "--to", "openai_chat"]
+process = "persistent"
+stages = ["request", "stream"]
+
+[[format]]
+name = "keys"
+command = "aproxy-format"
+args = ["keys", "--config", "keys.toml"]
+process = "persistent"
+stages = ["request", "retry"]
+pool_max = 1              # key cooldowns live in one process
+worker_idle_secs = 0
+```
+
+You need not write this by hand; four tool subcommands generate and verify it.
+
+```bash
+aproxy-format init adaptive-relay --output ~/.aproxy   # generate a starter set and list the next steps; other scenarios: claude-relay, key-rotation, openrouter
+aproxy-format check ~/.aproxy/config.toml              # validate the chain and each role's file; runs none of the configured commands
+aproxy-format try ~/.aproxy/config.toml --request sample.json   # rehearse the whole chain on a local sample, without contacting an upstream
+aproxy-format translate --from anthropic_messages --to openai_chat < request.json   # convert one request, once
+```
+
+`init` writes no secrets (the files hold only the names of environment
+variables) and overwrites nothing. When `check` passes it says what it checked
+and what it did not: whether the environment variables are set and the rest of
+the instance's configuration are outside its scope; use `aproxy doctor` for the
+latter. `try` simulates the official roles in-process by default and shows
+third-party programs in the chain as skipped; only `--allow-external` starts
+them, and then the sample and the environment are handed to that program.
+`check` and `try` accept `--home <dir>` to name the instance's home, so that
+relative paths resolve the way the instance resolves them. Every subcommand
+answers `--help`.
+
+Known limits:
+
+- **Streaming tool calls from a Chat upstream**: when an OpenAI Chat stream is
+  converted to Messages or Responses, a tool call's arguments are delivered
+  together when that call finishes, so the client sees no progress while long
+  arguments are generated; nothing is lost.
+- **Thinking from a Messages upstream to a Chat client**: the Chat protocol has
+  no place for the thinking signature. When the client continues with a tool
+  result, the unsigned thinking block is dropped, and an upstream with thinking
+  enabled may refuse that continuation.
+- **Heartbeats on Chat and Responses paths are transport keepalive only**: on
+  these two protocols the `heartbeat` role leaves aProxy's heartbeat bytes (an
+  SSE comment) as they are and invents no event, so the connection stays open
+  but a client watchdog that counts events is not fed. On Anthropic Messages
+  paths the heartbeat is the native `ping` event.
+- Each worker keeps its own state, so `keys` and `adaptive` need
+  `pool_max = 1` and `worker_idle_secs = 0`; cooldowns and learned decisions
+  start from scratch after an instance restart.
+
+The protocol field by field, each role's configuration file, and how to write
+a format program of your own are in the
+[aproxy-format skill](.claude/skills/aproxy-format/SKILL.md); everything
+`[[format]]` does on the aProxy side is in
+[config-toml.md](.claude/skills/aproxy-cli/references/latest/config-toml.md).
 
 ### Inbound origin checks
 
@@ -589,7 +740,7 @@ into every forwarded request, and the proxy port itself has no authentication.
 - The control channel between commands such as `status` and `stop` and the
   instance accepts only the user who started the instance (plus root on
   Unix), and it never opens a network port.
-- External transformers (`[[format]]` entries) run
+- Format programs (`[[format]]` entries) run
   arbitrary commands from the config; only configure programs you trust and do
   not let others edit your `config.toml`.
 - Logs and `status` mask URL-embedded credentials and query-string values

@@ -12,7 +12,7 @@
 
 - **无限重试** —— 夫唯不争，故天下莫能与之争。网络错误、4xx/5xx、错误 JSON（200 携带 error）皆触发重试；客户端断开即中止上游请求（计费保护）。两个**显式出口**：`delivery = "forward"` 模式（显式放弃重试，换取请求体与响应的流式直通）与 `[[retry.rules]]`（对确定性报错的上游端点，达到 `max_attempts` 即透传真实响应，不再无限等待；仅当流式请求的响应头已被保活心跳提交时，改以终态 SSE error 事件告知）。
 - **完全透传** —— 大音希声，大象无形。路径、查询、请求头原样转发；控制通道走独立命名管道，代理端口只做透传一件事。
-- **外部转换器（可选）** —— 化而欲作，吾将镇之以无名之朴。请求/响应可整流交给外部 format 程序改写（一行 JSON 信封进出，任何能读写 stdin/stdout 的程序都行）：OpenAI ↔ Anthropic 协议转换、多 key 轮换、多模型多渠道聚合。本体只加编排代码，转换逻辑全部外置；官方示例 `aproxy-format` 二进制开箱即用（独立发版）。常驻进程池复用到已死的空闲 worker 时，会自动换新 worker 重试一次。**限制**：`aproxy-format` 的跨协议转换（如 Anthropic ↔ OpenAI）只支持**非流式**，跨协议的 SSE 流式响应不支持——响应侧转换报错后透传上游原始响应，客户端会收到渠道协议格式的流；同协议 SSE 原样直通，多 key 轮换与同协议聚合不受影响。
+- **format 程序（可选）** —— 化而欲作，吾将镇之以无名之朴。请求、响应、重试的决定与心跳都可以交给外部 format 程序（一行 JSON 一问一答，任何能读写 stdin/stdout 的程序都行），多个程序按配置顺序串成一条链。本体只做编排，转换逻辑全部外置；官方的 `aproxy-format` 开箱即用：OpenAI Chat、OpenAI Responses 与 Anthropic Messages 之间的协议转换（**流式与非流式**），多 key 轮换与冷却，按模型的多渠道路由与故障切换，重试策略，按请求在真流式与无限重试之间选择。程序坏了有熔断：判断类程序被跳过，请求回到无限重试。
 - **守护进程** —— `aproxy start` 后台启动（按拉起规格分离子进程，关终端不掉；密钥只在拉起规格与期望状态记录里，不出现在实例与看护者的进程命令行上）；`status` / `stop` / `logs` / `restore` 全套实例管理。
 - **看门狗** —— 天网恢恢，疏而不失。全局看护进程自动重拉崩溃/挂死的实例（默认开启；实测 +2.4% 体积、+2.9MB 常驻、转发热路径零损耗）。身份按进程 ID + 创建时间核验，与二进制文件名无关。连续重拉失败不放弃：转入每 300 秒一次的慢速重试，直到实例起来或被 `aproxy stop` 删掉期望状态记录；重拉出的实例存活满 60 秒才清空之前的失败计数。每个扫描周期重读 settings，关掉 `watchdog.enabled` 即退出。macOS 暂不支持，见「平台支持」。
 - **多开** —— 万物并育而不相害。每份 config.toml 一实例，端口各自独立，并存不扰。
@@ -249,7 +249,7 @@ listen_addr = "127.0.0.1:12345"          # 本地监听（端口 0 = 系统分�
 # max_request_mb = 128                   # 请求体上限（MB；0 = 不设限。未设时取 settings.json 的 defaults.max_request_mb）
 # max_response_mb = 256                  # 上游响应缓冲上限（MB；0 按 1 处理）
 # disk_cache = true                      # 磁盘缓存：大请求体/响应溢写磁盘，内存与负载解耦
-# delivery = "retry"                     # "retry"（默认，缓冲并重试）/ "forward"（仅转发：流式直通，无重试/缓冲/心跳）
+# delivery = "retry"                     # 请求起始的投递方式："retry"（默认，缓冲并重试）/ "forward"（仅转发：流式直通，不重试、不发心跳）；format 程序可以按请求改
 # log_file = "D:/aproxy-logs/a.log"      # 自定义日志文件（~ 展开，相对路径相对 APROXY_HOME；缺省按启动随机命名，地址经 IPC 获取）
 # allowed_hosts = ["myproxy.local"]      # 额外放行的 Host（防 DNS 重绑定；追加到内置名单，"*" 关闭校验）
 # allowed_origins = ["http://localhost:5173"] # 放行的浏览器 Origin（默认拒绝一切带 Origin 的请求，"*" 关闭校验）
@@ -273,16 +273,15 @@ listen_addr = "127.0.0.1:12345"          # 本地监听（端口 0 = 系统分�
 [history]
 # body_budget_mb = 64                   # 请求历史里保留的请求体与响应体合计上限（MB，占内存；0 = 不保留体）
 
-# [[format]]                             # 外部转换器：请求/响应/心跳每阶段至多一个
-# name = "convert"
-# command = "~/.aproxy/bin/aproxy-format"
-# args = ["run", "--config", "~/.aproxy/agg.toml"]   # 不再有 extra 键，配置路径走 args 或 env
-# process = "persistent"                 # spawn（默认）/ persistent（有状态程序必须用）
-# stages = ["request", "retry"]          # request / response / heartbeat；加 retry = 每次重试前重新转换
-# env = { KEYS = '{"keys": ["sk-a", "sk-b"]}' }  # 额外环境变量（值不在 config show 中显示）
+# [[format]]                             # format 程序，可以有多条；列表顺序就是请求方向的顺序（见下文「format 程序」）
+# name = "keys"
+# command = "aproxy-format"              # 裸命令名先找 ~/.aproxy/bin/，再找 PATH
+# args = ["keys", "--config", "keys.toml"]   # 相对路径相对 ~/.aproxy
+# process = "persistent"                 # spawn（默认）/ persistent（stream、notify 与有状态的程序必须用）
+# stages = ["request", "retry"]          # request / retry / decide / response / stream / heartbeat / notify
+# env = { RELAY_KEY_A = "sk-a", RELAY_KEY_B = "sk-b" }   # 追加的环境变量（值不在 config show 中显示）
 ```
 
-多 key 轮换默认只在**请求之间**生效：同一请求的重试沿用转换后的同一个 key（请求只转换一次，重试重放转换产物）。需要每次重试都重新转换时，在请求方的 `stages` 里加上 `"retry"`。
 
 运行数据在 `~/.aproxy/`：`run/`（实例记录 `<端口>.instance.json`、期望状态记录 `<端口>.restore.json`、看护者记录 `watchdog.json`；启动瞬间还有短暂存在的拉起规格交接文件）、`logs/`（守护日志，按启动随机命名、自动清理与轮转，地址经 IPC 向实例询问；可用 `log_file` 自定义去向）、
 `spool/<pid>-<短哈希>/`（磁盘缓存临时文件，每个实例进程一个目录；实例停止时删掉，崩溃留下的由下一个启动的实例或看门狗清理）、
@@ -294,11 +293,117 @@ listen_addr = "127.0.0.1:12345"          # 本地监听（端口 0 = 系统分�
 
 保活适用的请求（`keepalive.interval_secs` > 0、`delivery` 不是 `"forward"`，且按 `keepalive.trigger` 命中：`Accept` 含 `text/event-stream`，或请求体顶层 `"stream": true`；默认 `any` 任一即可）从**首轮**起就走保活通道：
 
-- 任一次尝试上游回 2xx + 未压缩的 `text/event-stream` 时，立即把上游真实的状态码与响应头转给客户端（未配 `response` 阶段的 format 时）；否则约一个保活间隔后先提交骨架头（200 + SSE）。「需要重试」本身不提交，重试几次后很快成功的请求拿到的仍是上游真实响应。
+- 任一次尝试上游回 2xx + 未压缩的 `text/event-stream` 时，立即把上游真实的状态码与响应头转给客户端（没有 format 程序声明 `response`、`stream` 或 `decide` 时）；否则约一个保活间隔后先提交骨架头（200 + SSE）。「需要重试」本身不提交，重试几次后很快成功的请求拿到的仍是上游真实响应。
 - `"stream": true` 的非 SSE 流（如 Ollama 原生 API 的 NDJSON）在不重试时原样直通；若该上游常需重试（重试拖过一个保活间隔会提交 SSE 骨架头，改写 content-type 并混入心跳），建议该实例设 `[keepalive] trigger = "accept"`。
 - 提交之后，无论是在等首字节、上游在途、缓冲上游流还是退避，都按 `keepalive.interval_secs` 发 SSE 注释心跳；响应体仍是缓冲完整、校验无误后才回放，失败尝试的数据不会混入。
 - 为避免往压缩流里插入明文心跳，保活适用的请求发往上游时 `accept-encoding` 一律改为 `identity`——这是对「完全透传」的一个有意例外，代价只是上游到本机这一段多传一些字节；不适用保活的请求不改写。
-- `"stream": false` 的普通请求没有保活通道；`delivery = "forward"` 实例与 `keepalive.interval_secs = 0` 同样没有。
+- `"stream": false` 的普通请求没有保活通道；以 `forward` 方式投递的请求与 `keepalive.interval_secs = 0` 同样没有。
+
+### format 程序与官方 aproxy-format
+
+`[[format]]` 条目让 aProxy 在请求的几个固定时刻调用一个外部程序：发往上游之前改写请求（协议转换、选 key、按模型选渠道），返回客户端之前改写响应，一次尝试失败之后决定要不要重试，等待期间生成心跳，请求结束之后得到通知。aProxy 本体不含任何转换逻辑；它与程序之间走 stdin/stdout，一行 JSON 一问一答，任何语言都能写。
+
+**列表顺序就是请求方向的顺序**：写在最前面的离客户端最近，最后面的离上游最近；响应按相反的顺序经过它们。
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `name` | `command` 的文件名主干 | 列表内唯一，1 到 64 字节；出现在日志、`status` 与错误响应的 `details.format` 里 |
+| `command` | 必填 | 直接执行，不经过 shell。相对路径相对 `~/.aproxy`；裸命令名先找 `~/.aproxy/bin/`，再找 `PATH`。Windows 上不接受 `.cmd` 与 `.bat`：要用脚本，就把解释器写在 `command`、脚本写在 `args` |
+| `args` | `[]` | 原样传给程序；worker 的工作目录是 `~/.aproxy`，相对路径相对它 |
+| `env` | `{}` | 追加给程序的环境变量，密钥放这里；`config show` 只列名字 |
+| `process` | `"spawn"` | `spawn` 每条消息起一个进程；`persistent` 是常驻进程池，`stream`、`notify` 与要跨请求记状态的程序必须用它 |
+| `stages` | 必填 | 这个程序参与的阶段，见下 |
+| `required` | `true` | 程序自己出错（崩溃、超时、回信不合法、已熔断）时怎么办：`true` 时请求侧的这次尝试失败并照常重试，连续出错到熔断后以 503 `format_unavailable` 结束；`false` 时跳过这一层 |
+| `pool_max` | `4` | `persistent` 进程池的上限；正在处理流的 worker 不计入。状态要在所有请求之间共享的程序配 `1` |
+| `worker_idle_secs` | `300` | 空闲多久回收一个 worker；`0` 表示不回收 |
+| `timeout_secs` | `30` | 一条消息等回信的时限；`0` 表示不限 |
+| `decide_timeout_secs` | `2` | `decide` 阶段的时限；超时按「不表态」处理，不会因此结束请求 |
+| `breaker_failures` | `5` | 连续这么多次进程级失败就熔断；`0` 表示不熔断 |
+| `breaker_cooldown_secs` | `30` | 熔断之后过多久放一条消息试探；不能为 `0` |
+
+七个阶段：
+
+| 阶段 | 什么时候 | 用来做什么 |
+|---|---|---|
+| `request` | 每个请求一次，第一次尝试之前 | 转换协议、选 key 与渠道、为这个请求选投递方式 |
+| `retry` | 重试之前要重做请求时，带上一次的失败原因与上游的状态、响应头 | 失败后换 key、换渠道 |
+| `decide` | 一次尝试失败之后 | 重试还是停止、等多久、要不要重做请求 |
+| `response` | 成功的响应交付之前，整体处理 | 转换非流式响应 |
+| `stream` | 成功的响应逐块经过 | 边收边转换流式响应 |
+| `heartbeat` | 每一拍保活心跳 | 发出客户端协议认得的心跳 |
+| `notify` | 请求结束之后，aProxy 不等回信 | 按结果积累判断 |
+
+下面三种写法在启动时报 `config_conflict`：
+
+- 同一个程序同时声明 `response` 与 `stream`；
+- 声明 `stream` 或 `notify` 的程序不是 `persistent`；
+- 请求方向上，排在声明了 `retry` 的程序之后的程序没有声明 `retry`（前面的程序在重试时给出了新的请求，后面的不重做，发出去的就是上一次的结果）。
+
+**投递方式与 format**：`delivery` 只是每个请求的起点。`request` 阶段的程序可以把单个请求改成 `forward` 或 `retry`；`forward` 请求在一个字节都没写给客户端之前失败时，声明了 `decide` 的程序可以让它当场转为 `retry`。所以推荐保持默认的 `retry`，由官方的 `adaptive` 把没失败过的请求改成真流式的 `forward`：它不可用时，一切回到无限重试。把 `delivery` 配成 `"forward"` 时，请求体直接流向上游（链上有程序要请求体或声明了 `decide` 时除外，那时先读完），响应经过声明了 `stream` 的程序边收边转；声明 `response` 的程序要整个响应，那一层会失去真流式。只配了请求侧的转换、没有配 `stream` 或 `response` 时，客户端收到的仍是上游协议的响应。
+
+**官方 `aproxy-format`** 把常用的功能做成角色，一个子命令一个角色，各占一个 `[[format]]` 条目，也能与自己写的程序混用：
+
+| 角色 | 做什么 | `args` 的最小写法 | `stages` |
+|---|---|---|---|
+| `convert` | Anthropic Messages、OpenAI Chat、OpenAI Responses 三种协议互转，流式与非流式都支持 | `["convert", "--from", "anthropic_messages", "--to", "openai_chat"]` | `request`、`stream`（排在 `route` 之后时加 `retry`） |
+| `keys` | 多个 key 轮换：轮询、加权或随机，失败的 key 冷却（尊重 `Retry-After`），可按对话粘性 | `["keys", "--config", "keys.toml"]` | `request`、`retry` |
+| `route` | 按模型选渠道：别名、优先级、权重、故障切换，每个渠道可带自己的凭据与超时覆盖 | `["route", "--config", "route.toml"]` | `request`、`retry` |
+| `policy` | 按状态码、失败原因与响应体的规则决定重试或停止，停止时可以回一个客户端协议的错误 | `["policy", "--config", "policy.toml"]` | `decide` |
+| `adaptive` | 按请求在 `forward` 与 `retry` 之间选：没失败过的走真流式，失败过的固定用重试 | `["adaptive", "--config", "adaptive.toml"]` | `request`、`decide`、`notify` |
+| `rewrite` | 增删请求头，用 JSON Pointer 改请求体，给模型改名 | `["rewrite", "--config", "rewrite.toml"]` | `request`（排在 `route` 之后时加 `retry`） |
+| `heartbeat` | 把保活心跳换成客户端协议的事件（Anthropic Messages 的 `ping`） | `["heartbeat"]` | `heartbeat` |
+
+一条完整的链（Claude Code 接到一个只有 OpenAI Chat 接口、有两个 key 的中转）：
+
+```toml
+base_url = "https://relay.example.com"
+
+[[format]]
+name = "adaptive"
+command = "aproxy-format"
+args = ["adaptive", "--config", "adaptive.toml"]
+process = "persistent"
+stages = ["request", "decide", "notify"]
+required = false          # 判断类程序：坏了就跳过，请求照常无限重试
+pool_max = 1              # 它的判断记在一个进程里
+worker_idle_secs = 0
+
+[[format]]
+name = "convert"
+command = "aproxy-format"
+args = ["convert", "--from", "anthropic_messages", "--to", "openai_chat"]
+process = "persistent"
+stages = ["request", "stream"]
+
+[[format]]
+name = "keys"
+command = "aproxy-format"
+args = ["keys", "--config", "keys.toml"]
+process = "persistent"
+stages = ["request", "retry"]
+pool_max = 1              # key 的冷却记在一个进程里
+worker_idle_secs = 0
+```
+
+不必手写：四个工具子命令负责生成与验证。
+
+```powershell
+aproxy-format init adaptive-relay --output ~/.aproxy   # 生成一套起步配置并列出下一步；场景还有 claude-relay、key-rotation、openrouter
+aproxy-format check ~/.aproxy/config.toml              # 校验整条链与各角色的配置，不执行配置里的命令
+aproxy-format try ~/.aproxy/config.toml --request sample.json   # 拿本地样例干跑整条链，不连上游
+aproxy-format translate --from anthropic_messages --to openai_chat < request.json   # 一次性转换一个请求
+```
+
+`init` 不写密钥（配置里只有环境变量的名字），也不覆盖已有的文件。`check` 通过时会说明查了什么、没查什么：环境变量有没有设置、实例的其余配置都不在它的范围内，后者用 `aproxy doctor` 检查。`try` 默认只在进程内模拟官方角色，链上的第三方程序显示为跳过；加 `--allow-external` 才会启动它们，这时样例与环境变量会交给那个程序。`check` 与 `try` 可以用 `--home <目录>` 指明实例的 home，相对路径就按实例的方式解析。每个子命令都有 `--help`。
+
+已知的限制：
+
+- **Chat 上游的流式工具调用**：把 OpenAI Chat 的流转成 Messages 或 Responses 时，工具调用的参数要到这次调用结束才一起交付，生成很长的参数期间客户端看不到进度；内容不丢。
+- **Messages 上游转给 Chat 客户端的 thinking**：Chat 协议没有地方放 thinking 的签名。带着工具结果续接时，没有签名的 thinking 块被丢掉，开着 thinking 的上游可能拒绝这次续接。
+- **Chat 与 Responses 路径上的心跳只是传输层保活**：`heartbeat` 角色在这两种协议上原样保留 aProxy 的心跳字节（SSE 注释），不造事件，所以连接不会断，但喂不住按事件计时的客户端看门狗。Anthropic Messages 路径上发的是原生的 `ping` 事件。
+- 多个 worker 各记各的状态，所以 `keys` 与 `adaptive` 要配 `pool_max = 1`、`worker_idle_secs = 0`；实例重启后冷却与判断记录从头开始。
+
+协议的逐字段说明、各角色配置文件的写法、怎样自己写一个 format 程序，见 skill 文档 [aproxy-format](.claude/skills/aproxy-format/SKILL.md)；`[[format]]` 在 aProxy 一侧的全部行为见 [config-toml.md](.claude/skills/aproxy-cli/references/latest/config-toml.md)。
 
 ### 入站来源校验
 
@@ -317,7 +422,7 @@ aProxy 是本机单用户代理：它持有并向每个转发请求注入上游�
 - 默认只监听回环地址（`127.0.0.1`）。**不要把 `listen_addr` 改成 `0.0.0.0` 或局域网地址**——那等于让同网段的任何主机免鉴权使用你的密钥；确需对外开放时，启动、`startup.log` 与 `aproxy doctor` 会给出警告。
 - `api_key` 以明文存放在 `config.toml`。aProxy 的主目录（默认 `~/.aproxy`）只让当前用户访问：新建时就是这样，已有而权限过宽的会在下一次写入时被收紧，`aproxy doctor` 会指出别的用户读得到的主目录。放在主目录之外的配置文件（`--config` 指向别处）请自己收紧权限。
 - 控制通道（`status`、`stop` 等命令与实例之间）只接受启动实例的那个用户（unix 上另外放行 root），不开网络端口。
-- 外部转换器（`[[format]]` 条目）会按配置执行任意命令；只配置你信任的程序，且不要让他人能修改你的 `config.toml`。
+- format 程序（`[[format]]` 条目）会按配置执行任意命令；只配置你信任的程序，且不要让他人能修改你的 `config.toml`。
 - 日志与 `status` 对 URL 内嵌凭据与查询串的值打码（`?key=***`），可安全粘贴分享。
 
 完整的威胁模型与漏洞报告方式见 [SECURITY.md](SECURITY.md)。

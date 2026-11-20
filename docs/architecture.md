@@ -134,8 +134,8 @@ home 本身同样只让属主访问——里面有明文密钥（config.toml、s
 | `src/ops/` | 操作层：选目标（`target`）、启动（`start`）、停止（`stop`）、重启（`restart`）、恢复（`restore`）、别名（`alias`）、列举（`list`）、只读清点（`enumerate`）。每个动作把带数据的结果交回调用方，自己不打印、不结束进程——命令行与桌面界面共用；`tests/lib_is_quiet.rs` 守着「库里没有 `println!` 与 `process::exit`」 |
 | `src/spec.rs` | 拉起规格 `InstanceSpec`（配置文件、覆盖参数、钉住的端口、启动者环境里的代理变量与 `PATH`、日志文件）与期望状态记录 `run/<端口>.restore.json`；交接文件 `run/<纳秒>-<pid>.spec.json`。两种文件都以私有权限写；读路径（status/restore/list/看护者）遇到读不懂的记录只报告不删除，`stop <端口>` 按文件名删记录、不读内容 |
 | `src/server.rs` | 服务承载：`serve_forever` 主循环、停止信号、日志初始化、期望状态记录的写与「用户要求停止」语义、配置错误落盘 startup.log |
-| `src/proxy/` | 转发核心，按职责分文件：入站来源校验（Host/Origin）、hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、尝试结局分类（`attempts::classify`）与唯一的尝试循环（`attempts::run_attempts`）、保活通道与提交点、断开保护、仅转发模式 |
-| `src/transform.rs` | 外部转换器编排：stdin/stdout 一行 JSON 信封交给外部 format 程序改写（spawn 与 persistent 统一进程池、空闲 reaper、超时/崩溃 worker 剔除）；信封契约在独立 crate `aproxy-envelope` |
+| `src/proxy/` | 转发核心，按职责分文件：入站来源校验（Host/Origin）、hop-by-hop 过滤、内存+磁盘双模 spool、错误判定、尝试结局分类（`attempts::classify`）与唯一的尝试循环（`attempts::run_attempts`）、保活通道与提交点、断开保护、仅转发模式；format 链在这里接入：请求方向的重试游标与逐层补丁（`transforms.rs`）、decide 的表决（`decide.rs`）、响应方向的整包层与逐块会话（`streams.rs`）、直流上传里对顶层 `stream` 的扫描（`live_flag.rs`） |
+| `src/transform.rs`、`src/transform/` | format 程序的运行时：协议 1 只走子进程的 stdin/stdout（一行 JSON 一问一答，`seq` 对回信），stderr 另读、打码后进实例日志；`pool.rs` 是每个 `[[format]]` 条目的进程池（握手、spawn 与 persistent、空闲回收、超时与坏回信的 worker 换新、流独占的 worker、熔断器），`pool/notify.rs` 是完成通知的队列与它自己的熔断器；线上类型在独立 crate `aproxy-envelope` |
 | `src/history.rs` | 请求历史：记录（最近 1000 条）、体的保留与预算、已知密钥的替换、读取（列表、详情、分块读体）、事件与订阅者；转发路径经 `Recorder` 与 `BodyWriter` 往里写，控制通道的读 op 从这里取。见「请求历史」 |
 | `src/decode.rs` | 检查用解码：按 `content-encoding`（gzip/deflate/br/zstd，多层逆序）解出一份**仅供检查/预览**的副本，转发字节不受影响 |
 | `src/retry.rs` | 重试判定：状态码、错误 JSON（含流式 NDJSON/SSE 形态） |
@@ -149,23 +149,25 @@ home 本身同样只让属主访问——里面有明文密钥（config.toml、s
 | `aproxy-ipc/` | aproxy 与同它打交道的程序（桌面界面、第三方客户端）共用的契约，独立 crate，依赖很少。`code.rs`：错误码表（名字、族、`details` 的键与类型、HTTP 状态与退出码），`docs/error-codes.md` 由它生成、`tests/code_table.rs` 比对；`redact.rs`：打码的唯一出口（URL、密钥头、占位对象、已知密钥替换）；`endpoint.rs`：控制端点、心跳节、安装宣告节的名字与 `home_id`；`home.rs`：home 的解析（永久兼容契约 C1）；`ledger.rs`：进程台账 `<home>/ledger/`（永久兼容契约 C3），长期运行的进程登记 pid、启动标记与角色，强制安装据此核验后结束进程 |
 | `src/util.rs` | bin 侧共用小工具：时间戳、时长人性化、凭据打码、key=value 解析 |
 
-## workspace 四成员
+## workspace 五成员
 
 - **aproxy**（根包）：代理本体。编译闭包不含 switchyard 等转换库——本体
-  体积不受外部转换器功能影响。
-- **aproxy-envelope**：信封契约 crate（一行 JSON 的 serde 类型 + base64
-  携带），aproxy 与 aproxy-format 共同依赖，单源维护防契约漂移。信封带
-  `stage`（`request`/`retry`/`response`/`heartbeat`，字符串而非枚举——新增阶段时
-  旧 format 照样能解析）、`request_id`（实例内第 N 个请求，即 status 的请求计数）与不透明的
-  `state`：请求与响应转换器是不同进程、无共享内存，跨阶段的信息由 aproxy
-  按请求保存（`transform::ExchangeCtx`，随 `OutboundRequest` 走完各通道）并
-  转交，回信缺省 `state` = 不变。aproxy 0.2.0 正式版之前，它与 aproxy、aproxy-desktop
-  同号发预发布版（发布前 `.github/scripts/align-version.py` 一起对齐），正式版时才发
-  0.2.0：正式版号一经发布就永久占用，而信封在 0.2.0 定稿之前还要改。
-- **aproxy-format**：官方示例 format 二进制（协议转换 switchyard-translation
-  + key 轮换/加权轮换 + 多模型多渠道聚合）。版本独立于 aproxy 主线，
-  单独发 Release（format tag 触发独立 workflow）；它稳定后几乎不更新——
-  更多功能用户直接让 agent 写 format（见 aproxy-format skill）。
+  体积不受 format 程序的功能影响。
+- **aproxy-envelope**：format 协议 1 的线上类型（一行 JSON 的 serde 类型、hello、各阶段的
+  消息与回信、补丁、报告），aproxy 与 aproxy-format 共同依赖，单源维护防契约漂移；第三方用
+  Rust 写 format 程序时也可以直接用它。阶段名与决定类字段在线上是字符串，新增阶段只发给在
+  hello 里声明了它的程序，旧程序永远收不到它不懂的消息。aproxy 0.2.0 正式版之前，它与
+  aproxy、aproxy-desktop 同号发预发布版（发布前 `.github/scripts/align-version.py` 一起对齐），
+  正式版时才发 0.2.0：正式版号一经发布就永久占用，而协议在 0.2.0 定稿之前还要改。
+- **aproxy-format**：官方的 format 程序，按角色拆成子命令（`convert`、`keys`、`route`、
+  `policy`、`adaptive`、`rewrite`、`heartbeat`），每个角色各占一个 `[[format]]` 条目、各有自己的
+  worker 池；另有不走协议的工具子命令 `init`、`check`、`try`、`translate`。协议转换用
+  switchyard-translation（钉住版本的第三方库），它只在这个包的依赖树里。`check` 与 `try`
+  复用 `aproxy-ipc` 的配置解析（`config-file` 特性），所以与实例启动时用的是同一套校验。
+  单独发 Release（format tag 触发独立 workflow）。角色的行为见 aproxy-format skill。
+- **aproxy-ipc**：aproxy 与同它打交道的程序共用的契约：错误码、打码规则、端点命名、进程台账、
+  home 的布局；配置文件的解析在可选的 `config-file` 特性后面。依赖刻意保持很少，因为本体、
+  桌面界面与 aproxy-format 都链接它。版本与 aproxy 同步。
 - **aproxy-desktop**：桌面界面（Tauri 2 外壳与嵌入的前端），aproxy 的 `desktop` 特性引入它，
   版本与 aproxy 同步。它不依赖 aproxy（否则成环）。见「桌面界面」。
 
@@ -262,11 +264,9 @@ CLI 定义（cli.rs）、动作本身（ops/）与子命令的渲染（commands/
 缓冲期间客户端什么也收不到，所以保活适用的请求要靠心跳维持连接：默认是 SSE 注释
 （`: keepalive`），`[keepalive] heartbeat` 可换成任意字节（aProxy 不认识协议，心跳的形态
 由用户按客户端决定；`heartbeat_problem` 只把关「写完后 SSE 解析器停在事件边界」）。
-配置了带 `heartbeat` 阶段的 `[[format]]` 时，请求转换完成后的每一拍交给它生成（信封
-`stage = "heartbeat"`）：每拍 `tokio::spawn` 一个任务跑完整次转换（drive 返回时不会
-drop 在途转换，persistent worker 不会因此被剔除），上一拍未回来就发固定心跳；任务写
-通道前在 `replay_gate` 锁内确认回放尚未开始，`send` 写第一块真实字节前在同一把锁内
-关闸——迟到的动态心跳一律丢弃，不会插进回放的事件中间。**适用判定**（`keepalive_triggered`，在请求转换之前、按客户端视角）：
+配置了声明 `heartbeat` 阶段的 `[[format]]` 时，每一拍的字节依次交给这些程序，各自可以换掉它
+（见「format 链」）：一拍的时限就是到下一拍为止，迟到、出错或熔断的那一层按跳过处理，照发它
+收到的字节；上游的响应到了、要交付时，还没回来的那一拍作废，不会插进回放的事件中间。**适用判定**（`keepalive_triggered`，在请求转换之前、按客户端视角）：
 `keepalive.interval_secs` > 0、`delivery` 不是 `"forward"`，且按 `keepalive.trigger`
 命中——`accept`（Accept 含 `text/event-stream`，旧判定）/ `body_stream`（请求体
 JSON 对象顶层 `"stream": true`，磁盘溢写的大请求体同样只看顶层键）/ `any`（任一，
@@ -278,7 +278,8 @@ JSON 对象顶层 `"stream": true`，磁盘溢写的大请求体同样只看顶�
 **提交点**是个只发生一次、不可撤回的三态机：未提交 → 提交上游真实头 / 提交
 骨架头。推动提交的只有时间与上游响应头，「需要重试」本身不提交——重试几次后
 很快成功的请求照样拿到上游真实头。尚未提交时（每一次尝试、每一段退避）：
-- 上游 2xx + 未压缩的 `text/event-stream`（且未配 `response` 阶段的 format）→ 立即
+- 上游 2xx + 未压缩的 `text/event-stream`（且没有 format 程序声明 `response`、`stream` 或
+  `decide`：它们还可能改写或否决这个响应）→ 立即
   把这次尝试的上游真实 status 与响应头转给客户端（去掉 content-length 与
   hop-by-hop）；
 - 一个保活间隔到点仍无可提交的结果 → 提交骨架头（200 + `text/event-stream`），
@@ -296,22 +297,15 @@ JSON 对象顶层 `"stream": true`，磁盘溢写的大请求体同样只看顶�
 信号一起）实现。完整缓冲、判定无误后才把成功那一次的字节写进同一个响应；
 期间的重试客户端只见到心跳。
 
-请求转换默认每个请求只做一次、各次重试重放产物；请求方的 `[[format]]` 在 `stages`
-里带上 `"retry"` 时（`proxy::PerAttemptTransform`），客户端的原始请求留在内存里，
-每次重试之前再转换一次（`stage = "retry"`，附上一次的状态码或失败原因），用于故障
-转移。这次转换失败只沿用上一次的请求、不终止——format 没有让请求停止重试的途径，
-这是有意的：重试判定交给 format 会让核心承诺取决于外部程序。
-
-外部转换器同样在这个节拍内：请求转换在保活通道的后台任务里、首轮之前进行，
-响应转换与「上游无视 identity 的压缩体」的回放前解码也经同一个 select 驱动。
-format 慢（`timeout_secs = 0` 时没有上界）时客户端照样在一个间隔后收到骨架头
-与心跳；请求转换在提交之后才失败时以终态 error 事件（`format_rejected` 或
-`format_failed`）收场。唯一例外是「尚未提交 + 上游回 2xx 非 SSE」时的响应转换——与上面的暂停
-同理，此时提交骨架会把非 SSE 的响应改坏，只能直接等转换完成。
+format 链同样在这个节拍内：请求链在保活通道的后台任务里、首轮之前进行，重试链、decide、
+响应方向的各层与「上游无视 identity 的压缩体」的回放前解码也经同一个 select 驱动。程序慢
+（`timeout_secs = 0` 时没有上界）时客户端照样在一个间隔后收到骨架头与心跳；请求侧在提交之后
+才失败时以终态 error 事件收场。唯一例外是「尚未提交 + 上游回 2xx 非 SSE」时的 response
+阶段——与上面的暂停同理，此时提交骨架会把非 SSE 的响应改坏，只能直接等它完成。
 
 取舍：
 - **上游编码改写**：保活适用的请求发往上游时 `accept-encoding` 一律改为
-  `identity`（放在请求转换之后，覆盖 format 可能写入的同名头；`override_headers`
+  `identity`（放在请求链之后，覆盖 format 可能写入的同名头；`override_headers`
   里配的同名头同样被覆盖，启动时 warn 一次）——往压缩流里插
   明文心跳会让客户端解压失败，所以这是对「保真透传」的有意例外；上游无视该要求
   仍压缩时（`head_is_committable` 兜底）不提交真实头，成功体回放前经
@@ -352,6 +346,63 @@ format 慢（`timeout_secs = 0` 时没有上界）时客户端照样在一个间
 SSE `event: error` 事件收场。透传的响应状态码与体保真，只多 `x-aproxy-error:
 retry_exhausted`（`details.by` 为 `rule:<序号>`）与 `x-aproxy-request-id` 两个头。
 
+## format 链（协议 1）
+
+`[[format]]` 的每个条目是一个外部程序。aproxy 与它之间只有 stdin/stdout：一行 JSON 发过去，一行
+JSON 回来，带同一个 `seq`；回信对不上、多出一行、不是合法 JSON，这个 worker 就被换掉——否则
+下一个请求会读到上一个请求的回信。每个进程启动后先握手一次（hello）：协议版本、它支持的阶段、
+各阶段要多少请求体（`full`、`digest`、`none`）、可选的能力；实例启动时对每个程序握手一遍，
+配置声明的阶段它不支持就不启动。
+
+**链**：列表顺序就是请求方向的顺序，离客户端最近的在前；响应方向逆序。同一个阶段可以有多个
+程序，前一个的输出是后一个的输入（洋葱）。每个程序有自己按请求保存的不透明 `state`，由 aproxy
+存着、在之后的阶段交还给同一个程序，落在哪个 worker 上都一样；程序之间不互相读 `state`。
+
+| 阶段 | 时机 | 回信能做什么 |
+|---|---|---|
+| `request` | 请求体读完（或直流开始）之后、第一次尝试之前 | 请求补丁（方法、URL、头、体）、`delivery`、按请求覆盖、`fail` |
+| `retry` | 重试之前重跑重试链时；带上一次的失败与上游的状态、响应头 | 同上（不含 `delivery`） |
+| `decide` | 尝试失败之后；声明了 `decide.success` 的程序在成功之后也问 | `decision`（retry 或 stop）、`delay_ms`、`reroute`、stop 附带的响应 |
+| `response` | 判定成功的响应交付之前，整体 | 响应补丁，或 `fail` |
+| `stream` | 判定成功的响应逐块：open、data、close、abort | 每块的输出字节；open 时可改头并给出 `abort_tail` |
+| `heartbeat` | 每一拍保活 | 这一拍的字节 |
+| `notify` | 请求结束之后 | 空回信；aproxy 不在数据通路上等它 |
+
+几条贯穿各阶段的规则：
+
+- **决定类字段取第一个表态的程序**（`delivery`、`decision`、`reroute`）：配置里的顺序就是
+  优先级，排在后面的程序不会悄悄推翻前面的决定。decide 问到两项都有着落为止。
+- **重试链**：声明了 `retry` 的程序在请求方向上必须连成后段（配置校验）。重试时默认重跑这一段，
+  每个程序从链的原始输入重新给出请求；decide 回 `reroute:false` 时沿用上一次发出的请求，不调
+  任何程序。按请求覆盖（超时、重试上限等）属于这一轮的输出，重跑时上一轮的覆盖作废。
+- **`fail` 是决定，出错是故障**：`fail` 不论程序是否 required 都照办（`retry:false` 结束请求，
+  `retry:true` 让这次尝试失败并重试）。进程级故障（起不来、退出、超时、回信不合法）才看
+  `required`：请求方向上 required 程序让这次尝试失败（`format_error`），可选程序被跳过；decide
+  出错一律算不表态；响应方向出错一律跳过这一层、把上游的响应原样交付并告警；心跳出错这一拍
+  用输入的字节。**绝不因为 decide、响应侧或心跳的程序出错而结束请求。**
+- **熔断**：每个条目一个熔断器，只在内存里。连续 `breaker_failures` 次进程级故障后打开，杀掉空闲
+  worker，`breaker_cooldown_secs` 之后放一条消息试探。打开期间，required 程序在请求方向上让
+  请求立即以 503 `format_unavailable` 结束，其余情况按跳过处理。notify 另有自己的熔断器，
+  观察路径出问题不会把判断路径一起关掉。
+- **stream 的 worker**：一条流固定由一个 worker 处理，独占到 close 或 abort，不计入 `pool_max`
+  （进程数等于池子大小加并发的流数）。流中途某一层失败时，aproxy 停读上游，向它外侧的各层发
+  abort；写给客户端的收尾只有一个来源：最外层对 abort 的回信，最外层自己失败时才是它在 open
+  时存下的 `abort_tail`。
+- **notify 只发不等**：有空闲 worker 且没有数据通路的消息排队时才派发，固定 2 秒时限，队列有
+  条数与字节上限，超出丢最旧的并计数（快照的 `formats[].notify_dropped_total`）。
+
+**投递方式按请求选**：`delivery` 的配置值只是起点。request 阶段第一个给出 `delivery` 的程序
+决定这个请求按 `retry`（缓冲、重试、保活）还是 `forward`（真流式、不重试）处理；响应头一旦
+写给客户端就不再换。forward 请求在一个字节都没写出之前失败时问一次 decide，回 `retry` 就当场
+升级为 retry，此后与一开始就是 retry 完全一样。起始是 retry 的请求总是先读完请求体；起始是
+forward 的请求，链上有程序要请求体或摘要、或有程序声明了 decide 时也先读完（升级之后要重发），
+否则请求体直流上游。forward 请求只有 2xx 的响应经过 response 与 stream；response 程序要整个
+响应，那一层会先攒齐。默认保持 retry、由判断类程序把安全的请求改成 forward，是有意的：判断
+程序坏了，退路是无限重试而不是不重试。
+
+官方角色与这些阶段的对应（`convert`、`keys`、`route`、`policy`、`adaptive`、`rewrite`、
+`heartbeat`）见 aproxy-format skill；配置键见 aproxy-cli skill 的 `config-toml.md`。
+
 ## 数据面的错误出口
 
 aproxy 自己结束一个请求时说的话只在 `src/proxy/errors.rs` 构造，码取自码表
@@ -369,7 +420,7 @@ aproxy 自己结束一个请求时说的话只在 `src/proxy/errors.rs` 构造�
   `x-aproxy-error` 的响应就是 aproxy 已经放弃、不会再重试的最终结果。
 - **请求标识** `request_id` = `<instance_id>-<序号>`：`instance_id` 是 16 位十六进制
   （启动时刻毫秒的低 48 位与 pid 的低 16 位），序号是实例内第几个请求。响应头、错误
-  体、交给 format 的信封里是同一个串；这个请求的每一行日志都挂在带
+  体、交给 format 程序的消息里是同一个串；这个请求的每一行日志都挂在带
   `request_id=` 的 span 下（保活通道的后台任务也是）。入站校验拒掉的请求不计入
   请求数，标识用单独的序号（`<instance_id>-x<n>`）。
 - **尝试失败码**：每次上游尝试没成功都归成一个码（`AttemptFailure`）——连不上、
@@ -379,9 +430,14 @@ aproxy 自己结束一个请求时说的话只在 `src/proxy/errors.rs` 构造�
 现在能触发的终态：`inbound_host_rejected`、`inbound_origin_rejected`（403）、
 `request_too_large`（413）、`client_body_aborted`（400）、`upgrade_unsupported`
 （501，只拦 WebSocket 升级）、`local_storage_failed`（507）、`response_too_large`
-（502）、`retry_exhausted`（透传）、`format_rejected`（422，请求侧 format 用 error 行
-拒绝）、`format_failed`（502，format 程序本身的故障）、`upstream_failed`（502，仅转发
-模式）、`decode_failed`（只作 SSE 事件）、`internal`（500）。
+（502）、`retry_exhausted`（透传）、`retry_stopped`（format 的 decide 叫停：它给的响应，或
+透传，都没有时 502）、`format_rejected`（请求侧 format 回 `fail` 且 `retry:false`：它给的
+响应，否则 422）、`format_unavailable`（503，required 程序已熔断）、`format_failed`（502，
+forward 请求的请求侧 format 失败且没有升级为 retry）、`upstream_failed`（502，forward 请求的
+上游尝试失败且没有升级）、`decode_failed`（只作 SSE 事件）、`internal`（500）。尝试一级另有
+三个来自 format 的失败码：`format_error`（程序出错）、`format_fail`（回 `fail` 且
+`retry:true`）、`format_decision`（decide 把成功的尝试判为失败）。完整的表由
+`aproxy-ipc/src/code.rs` 生成在 [error-codes.md](error-codes.md)。
 
 仅转发模式整体旁路本节：不缓冲完整请求体、不进重试循环、不发心跳——
 见下一节。
@@ -404,8 +460,10 @@ magic number，连「这是压缩体」都认不出；2026-09-14 的 Cloudflare 
 
 ## 仅转发模式（delivery = "forward"）
 
-`delivery = "forward"`（toml 显式值，或 settings.json 的 `defaults.delivery`）时，实例走一条与
-上面主流程完全不同的极简路径：**不缓冲、不重试、不保活**。请求体边收边发上游，
+`delivery = "forward"`（toml 显式值，或 settings.json 的 `defaults.delivery`）时，实例的请求
+起始就按仅转发处理；默认 `retry` 的实例上，format 程序也可以把单个请求改成 forward（见
+「format 链」的「投递方式按请求选」）。下面先说没有 format 程序时的路径，它与上面的主流程
+完全不同：**不缓冲、不重试、不保活**。请求体边收边发上游，
 响应边收边回客户端。这是给「上游可信、且要真流式」场景的**显式取舍**——它放弃
 了本产品最核心的重试保障，请勿当作普通开关随手打开。
 
@@ -429,7 +487,11 @@ magic number，连「这是压缩体」都认不出；2026-09-14 的 Cloudflare 
 - **不进入的路径**：重试循环、SSE 保活骨架、错误内容拦截
   （`is_error_body`/`is_stream_error_body`）、spool、`keepalive.trigger` 判定。
 - **本模式下不生效**：`disk_cache`/`max_response_mb`/`keepalive.*`/`retry.*`
-  （磁盘 spool 完全不参与；与任何 `[[format]]` 同配是 `config_conflict`）。
+  （没有 format 程序时磁盘 spool 完全不参与）。
+- **与 format 共存**：需要整包的层在它的输入处缓冲（请求体被程序要走、或有 decide 程序时先
+  读完；response 程序那一层攒齐响应），其余照旧直流；失败且未写出字节时可由 decide 升级为
+  retry。「200 但内容是错误」不拦截，但在旁路上照做判定并记入请求记录与完成通知
+  （`upstream_error_body`），判断类程序才看得见这类失败。
 - 消费方一律走 `Config::forward_only_enabled()`（`unwrap_or(DEFAULT_FORWARD_ONLY)`），
   **不得 `unwrap()`**——doctor 的 `parse_config_file`、`find::discover` 与大量
   测试的 `AppState::new` 都不经 settings 注入。`proxy::router(AppState)` 签名不变。

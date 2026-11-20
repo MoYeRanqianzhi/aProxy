@@ -1,7 +1,7 @@
 # Runtime behavior
 
 What a running aProxy instance does with each request and how instances look after themselves:
-retries, keepalive heartbeats, buffering, forward-only mode, transformers, instance identity, logs,
+retries, keepalive heartbeats, buffering, forward-only mode, format programs, instance identity, logs,
 crash recovery, the watchdog and upgrades. Read it to explain or predict aProxy's behavior, or before
 acting on a running instance. Field syntax and defaults are in config-toml.md and settings-json.md,
 client setup in clients.md, symptom lookup in troubleshooting.md.
@@ -17,7 +17,7 @@ client setup in clients.md, symptom lookup in troubleshooting.md.
 - [Disk cache (spool)](#disk-cache-spool)
 - [Request history](#request-history) (what an instance remembers, memory use)
 - [Forward-only mode](#forward-only-mode)
-- [External transformers](#external-transformers)
+- [Format programs](#format-programs)
 - [Instances, ports and the control channel](#instances-ports-and-the-control-channel) (stopping, isolated experiments)
 - [Logs](#logs)
 - [Crash recovery and the watchdog](#crash-recovery-and-the-watchdog)
@@ -43,13 +43,15 @@ through these steps:
    discards the rest of the upload (for at most 10 s) so that the client can read the 413 instead of a
    reset connection.
 4. **Keepalive decision**, made on the request as the client sent it (see Keepalive heartbeats).
-5. **Request transform**, if configured, runs once; every retry replays its output.
+5. **Request chain**, if `[[format]]` programs are configured: each program that declares
+   `request` runs once, in list order. Retries replay the result unless the retry chain is rerun
+   (see Format programs).
 6. **Upstream URL** = `base_url` without a trailing `/`, followed by the client's path and query
    verbatim. aProxy adds nothing, so a path prefix such as `/v1` belongs on exactly one side: either in
    `base_url` or in the client's base URL, not both (clients.md, Setup checklist).
 7. **Attempts.** Each attempt buffers the complete upstream response and then judges it (see Retry
    decisions). A failed attempt is discarded and retried; its bytes never reach the client.
-8. **Replay.** The successful response, after the response transform if one is configured, goes to
+8. **Replay.** The successful response, after the `response` or `stream` programs if any are configured, goes to
    the client with the upstream's status, headers and body bytes. Streaming responses are replayed as a
    chunked stream; compressed bodies are forwarded still compressed.
 
@@ -97,8 +99,8 @@ matters more than load on the upstream.
 ### Retry rules
 
 `[[retry.rules]]` (config-toml.md) stop retrying for failures that will not improve. A rule matches
-on `path` (a regex over the client's `path?query`, anchored at both ends, before any request
-transform), `status` (a list of HTTP status codes), or both; `max_attempts` is required.
+on `path` (a regex over the client's `path?query`, anchored at both ends, before any format
+program), `status` (a list of HTTP status codes), or both; `max_attempts` is required.
 
 - Rules are checked in order. The first rule whose matchers all hold decides; a `max_attempts = 0`
   rule is an exemption and keeps retrying, so place it before a wider rule.
@@ -140,7 +142,7 @@ All of the following must hold:
 - `keepalive.trigger` matches: `accept` means the `Accept` header contains `text/event-stream`;
   `body_stream` means the JSON body has a top-level `"stream": true`; `any` means either.
 
-The trigger looks at the request as the client sent it, before any request transform, because the
+The trigger looks at the request as the client sent it, before any format program, because the
 question is whether the client is waiting for a stream. Every other request (a non-streaming call, or
 a streaming request that matches neither test, such as Gemini CLI's) receives nothing until its final
 response is ready, so the client's own HTTP timeout must cover all retries plus generation.
@@ -151,7 +153,7 @@ Nothing is written before the commit, and the commit happens once per request:
 
 | Before any commit | Result |
 |---|---|
-| An attempt returns a 2xx head with an uncompressed `text/event-stream` content type, and no `response` format is configured | The upstream's real status and headers go to the client at once (without `content-length` and hop-by-hop headers) |
+| An attempt returns a 2xx head with an uncompressed `text/event-stream` content type, and no format program declares `response`, `stream` or `decide` | The upstream's real status and headers go to the client at once (without `content-length` and hop-by-hop headers) |
 | One keepalive interval passes without such a head | A skeleton head is committed (`200`, `content-type: text/event-stream`, `cache-control: no-cache`) and a heartbeat follows immediately; the first byte therefore arrives within one interval |
 | An attempt succeeds first | Replayed exactly like a request without keepalive, real status and headers included |
 | An attempt returns a 2xx head that is not SSE (NDJSON, plain JSON) | The skeleton commit is paused for that attempt, so the content type is not rewritten. Success is replayed unchanged; if the attempt needs a retry, the skeleton is committed right after. During such an attempt the client may receive nothing for up to `timeouts.read_idle_secs` |
@@ -162,7 +164,7 @@ retries still gets the upstream's real head.
 ### After the commit
 
 - A heartbeat goes out every interval while aProxy waits for upstream headers, buffers an upstream
-  body, waits between retries, or runs a transform or a decode.
+  body, waits between retries, or runs a format program or a decode.
 - Status and headers can no longer change. The successful attempt's complete, validated body is
   written into the committed response; bytes of failed attempts never appear.
 - A successful body that is not SSE is still written, since dropping a good result would be worse, and
@@ -194,7 +196,7 @@ When aProxy itself ends a request, every response has this shape:
 - `request_id` is opaque: it looks like `01a1e0eef745bd28-42`, 16 hex digits of an instance id, a
   hyphen, and the request's sequence number in that instance. Requests refused by the inbound
   Host/Origin check end in `-x<n>` instead. It is the same string in the header, in the body, in the
-  envelope's `request_id` given to format programs, and in every log line of the request, prefixed
+  `request_id` given to format programs, and in every log line of the request, prefixed
   `request{request_id=<id>}:`.
 
 | `code` | Status | When | `details` |
@@ -206,23 +208,27 @@ When aProxy itself ends a request, every response has this shape:
 | `local_storage_failed` | 507 | A spool file could not be written or read | `op` = `write_request`, `read_request` or `write_response` |
 | `response_too_large` | 502 | The upstream response exceeds `max_response_mb` | `limit_bytes` |
 | `retry_exhausted` | the upstream's, else 502 | A retry rule used its attempts up | `by` = `rule:<1-based index>`, `last_code` |
-| `format_rejected` | 422 | The request-side format replied with `error` | `format`, `stage` |
-| `format_failed` | 502 | The request-side format itself failed | `format`, `stage`, `kind` = `spawn`, `died`, `io`, `timeout` or `protocol` |
-| `upstream_failed` | 502 | Forward-only mode: the single upstream attempt failed | `last_code` |
+| `retry_stopped` | the response in hand, else 502 | A format's `decide` stage stopped the retries | `format`, `last_code` |
+| `format_rejected` | the format's response, else 422 | A request-side format answered `fail` with `retry: false` | `format`, `stage`, `fail_code`? |
+| `format_unavailable` | 503 | A required format's breaker is open at a request-side stage | `format`, `stage`, `kind`, `probe_at` (Unix ms) |
+| `format_failed` | 502 | A forward request's request-side format failed or asked for a retry, and the request was not upgraded to retry | `format`, `stage`, `kind`?, `fail_code`? |
+| `upstream_failed` | 502 | A forward request's upstream attempt failed and the request was not upgraded to retry | `last_code` |
 | `decode_failed` | SSE frame only | The upstream compressed the body despite `identity` and decoding failed | `encoding` |
 | `upgrade_unsupported` | 501 | A WebSocket upgrade request; it is refused on the spot, not forwarded or retried. Other upgrades such as `h2c` are ignored and proxied normally | `upgrade` |
 | `internal` | 500 | A defect in aProxy | none |
 
 Why one upstream attempt failed is a separate set of codes, shown as `last_code` and in logs:
 `upstream_connect_failed`, `upstream_connect_timeout`, `upstream_first_byte_timeout`,
-`upstream_read_idle_timeout`, `upstream_body_interrupted`, `upstream_status` and
-`upstream_error_body`.
+`upstream_read_idle_timeout`, `upstream_body_interrupted`, `upstream_status`,
+`upstream_error_body`, and three that come from format programs: `format_error` (the program broke),
+`format_fail` (it answered `fail` with `retry: true`) and `format_decision` (its `decide` stage judged
+a successful attempt as failed). The full table is `docs/error-codes.md` in the repository.
 
 ### Compression
 
 For requests that get heartbeats, aProxy sends `accept-encoding: identity` upstream, because plain-text
 heartbeats cannot be inserted into a gzip or brotli stream. This overrides the client's value, a
-request transform's value and `override_headers`; when `override_headers` sets another
+request-side format's value and `override_headers`; when `override_headers` sets another
 `accept-encoding`, startup logs `override_headers 里的 accept-encoding 对保活适用的请求不生效…`
 ("accept-encoding in override_headers does not apply to keepalive requests"). If the upstream
 compresses anyway, its head is not committed, the skeleton goes out at the interval, and the
@@ -288,100 +294,119 @@ decision, heartbeats sent, byte counts and the outcome. Forward-only instances r
 
 ## Forward-only mode
 
-`delivery = "forward"` turns an instance into a plain streaming pass-through: no buffering, no retries,
-no heartbeats. Use it only when the upstream is trusted and the client needs true incremental
-streaming and copes with upstream errors itself, because it gives up the retry guarantee aProxy exists
-for. Startup logs a warning beginning `仅转发模式已启用` ("forward-only mode enabled").
+A request in `forward` delivery is a plain streaming pass-through: no retries and no heartbeats. An
+instance starts all its requests that way with `delivery = "forward"`; with the default
+`delivery = "retry"`, a format program can still move single requests to `forward` (the official
+`adaptive` role does that for requests that have not failed before). Make `forward` the instance
+default only when the upstream is trusted and the client copes with upstream errors itself, because
+it gives up the retry guarantee aProxy exists for.
 
 - Still applied: the inbound check, the header rewrite, and `max_request_mb`, counted while the body
   streams; over the limit the upstream request is aborted and the client gets 413.
-- The request body streams upstream chunked. The response streams back with the upstream's status and
-  headers; `content-length` is kept unless the upstream used `transfer-encoding`.
-- Upstream request fails: `502` `upstream_failed`; its message ends `(this request is not retried)`,
-  and `details.last_code` says why the attempt failed. It is recorded as the latest error in
-  `aproxy status` as `<code>: <English message>`.
-- Response stream breaks: the client connection is cut at that point, and aProxy never injects bytes
-  the upstream did not send. Log: `上游响应流中断，连接就此截断（仅转发模式不重试）` ("upstream response
-  stream broke; connection truncated").
-- Not used: error-content detection (a 200 carrying an error JSON is passed on), `disk_cache`,
-  `max_response_mb`, `keepalive.*`, `retry.*`. Formats cannot be combined with it; the instance
-  refuses to start with `config_conflict` on `delivery`.
-- Set it with `aproxy config set delivery forward`, by editing config.toml, or as the settings.json
-  `defaults.delivery` default. Apply it with `aproxy restart <port|alias>`.
+- The request body streams upstream chunked, unless a format program needs the body or its digest
+  at the `request` stage or some program declares `decide`; then it is read in full first. The
+  response streams back with the upstream's status and headers; `content-length` is kept unless
+  the upstream used `transfer-encoding`.
+- Upstream request fails before any byte reached the client: programs that declare `decide` are
+  asked once. Answering `retry` upgrades the request to `retry` delivery for the rest of its life
+  (heartbeats and retry rules apply from then on). Otherwise the upstream's response is passed
+  through, or, when there is none, the client gets `502` `upstream_failed`, whose message ends
+  `(this request is not retried)` and whose `details.last_code` says why the attempt failed. It is
+  recorded as the latest error in `aproxy status` as `<code>: <English message>`.
+- Response stream breaks after bytes were written: no upgrade is possible. The connection ends
+  there, and aProxy injects nothing the upstream did not send; only a `stream` program may write a
+  closing event in the client's protocol.
+- A 200 whose body is an error object is passed on unchanged but recorded as a failed request
+  (`upstream_error_body`), so the request history and `notify` programs see it as a failure.
+- Not used: `keepalive.*`, `retry.*`, and the `heartbeat` and `retry` stages. Responses reach
+  `response` and `stream` programs only when they are 2xx; a `response` program makes aProxy gather
+  the whole response for that layer, so prefer `stream` on forward instances.
+- Set the default with `aproxy config set delivery forward`, by editing config.toml, or as the
+  settings.json `defaults.delivery` default. Apply it with `aproxy restart <port|alias>`.
 
-## External transformers
+## Format programs
 
-A `[[format]]` entry hands a request or a response to an external format program as a one-line JSON
-envelope and uses what comes back. This section is aProxy's side; the envelope fields and how to
-write a format program are in the aproxy-format skill, and the fields in config-toml.md (per instance
-in config.toml only: no settings.json default, no CLI flag).
+A `[[format]]` entry names an external program that aProxy talks to over stdin and stdout, one JSON
+line per message and one JSON line back. This section is aProxy's side of that; the message fields
+and how to write a program are in the aproxy-format skill, and the configuration keys are in
+config-toml.md, "format" (per instance in config.toml only: no settings.json default, no CLI flag).
 
 ```
-request:  buffered -> keepalive decision -> request format -> attempts replay the transformed request
-response: attempt judged successful -> response format -> replay
+request direction:   client -> format[0] -> format[1] -> ... -> upstream
+response direction:  client <- format[0] <- format[1] <- ... <- upstream
 ```
 
-- **Stages in this version.** A format declares one or more of `request`, `response` and
-  `heartbeat` in `stages`; each stage accepts at most one format. Adding `retry` to a request format
-  makes it run again before every retry, from the client's original request (envelope
-  `stage = "retry"`), instead of replaying the first output. `decide`, `stream`, `notify`, `admit`,
-  a second format for the same stage, and `retry` without `request` report `config_not_supported`.
-- **What can change.** A request format may rewrite method, URL, headers and body; rewriting the URL
-  is how protocol conversion changes path and host. A response format may rewrite headers and body.
-  aProxy applies `api_key`, `override_headers` and `extra_headers` before the request format, so the
-  format sees them and its output headers are final, except `accept-encoding` on keepalive requests
-  (see Compression).
-- **Once per request by default.** Every retry replays the same transformed request. A format that
-  rotates keys therefore switches keys between requests, never between retries of one request.
-  With `retry` in its stages it is asked again before each retry and may move to another key or
-  channel; a failed call at that point does not end the request — aProxy sends the request it sent
-  last time and logs one warning per request.
-- **Request-side failure.** The request is neither sent upstream nor retried, and if a keepalive
-  response was already committed the client gets the error as a terminal SSE frame instead of a
-  status (behaviors.md, After the commit). A format that replies with an `error` envelope produces
-  `422` `format_rejected`, with `details.format` (the format's `name`) and `details.stage` and the
-  message `format '<name>' rejected the request: <reason>`. A format that fails on its own — spawn
-  failure, crash without output, pipe error, timeout, protocol violation — produces `502`
-  `format_failed`, with `details.kind` naming the kind and the message
-  `format '<name>' failed (<kind>): <detail>`. The reason becomes the latest error in `aproxy
-  status`. The aproxy-format skill's troubleshooting.md maps each reason.
-- **Response-side failure**: the original upstream response is replayed unchanged and the log warns
-  `响应转换失败，透传上游原始响应` ("response transform failed; passing the original upstream response
-  through"). The response is already in hand, so availability wins.
-- **Heartbeat format.** While a keepalive response waits for a usable upstream result, a format with
-  the `heartbeat` stage is called once per tick after the response head is committed and until the
-  first real byte is replayed; its reply body is that tick's heartbeat. A failed, slow or malformed
-  reply sends `keepalive.heartbeat` instead, with one warn per request, and never delays the tick.
-- **Keepalive.** On keepalive requests the formats run within the heartbeat cadence, so a slow
-  format does not leave the client without bytes: if nothing has been committed when the interval
-  ends, the skeleton head goes out and heartbeats continue. The exception is a successful 2xx
-  response that is not SSE, arriving before any commit: committing a skeleton would corrupt it, so
-  the response format runs to completion first and the client receives nothing meanwhile. With a
-  `response` format configured, aProxy never commits the upstream's real head early, because the
-  format may change it; once the skeleton is committed (before or during the response format),
-  header changes from the format are ignored and only its body is used.
-- **Response body.** The response format receives the decoded body when the upstream compressed it
-  (up to 8 MiB decoded; larger bodies arrive as received), and aProxy drops `content-length` and
-  `content-encoding` from its output headers, since the bytes changed.
-- **Not transformed:** failures passed through by a retry rule. Forward-only instances cannot have
-  formats.
+- **A chain, in list order.** Every program that declares a stage takes part in it; the output of
+  one is the input of the next. Each program can keep a small opaque `state` per request, which
+  aProxy stores and hands back to that same program at later stages, even on another worker.
+- **Handshake.** Each process starts with a `hello` exchange that fixes the protocol version, the
+  stages the program supports and how much of the request body it wants (`full`, `digest` or
+  `none`). A program that only judges never receives the conversation's content.
+- **`request` and `retry`.** A request-side program may rewrite method, URL, headers and body;
+  rewriting the URL is how routing and protocol conversion change host and path. aProxy applies
+  `api_key`, `override_headers` and `extra_headers` first, so programs see them, and their output
+  headers are final except `accept-encoding` on keepalive requests (see Compression). The chain
+  runs once per request. Before a retry, the programs that declare `retry` run again only when the
+  retry chain is rerun: a `decide` program asks for that with `reroute: true`, and it is the
+  default when nobody says otherwise. With `reroute: false` aProxy resends the request it prepared
+  last time, so a key-rotating program is not consulted and does not rotate.
+- **`decide`.** After each failed attempt of a `retry` request aProxy asks the programs that
+  declare `decide`, in order, until both the decision (`retry` or `stop`) and `reroute` are
+  settled. A program may also set the wait, and a `stop` may carry a response for the client
+  (`retry_stopped`). A program that asked for it is also consulted after successful attempts, to
+  reject a "200 that is really an error". No answer, a late answer or a crash counts as no
+  opinion: the retry rules and the default backoff then apply, so a broken decision program never
+  ends a request.
+- **`response` and `stream`.** Only a response judged successful and about to be delivered goes
+  through them. `response` receives the whole decoded body. `stream` receives the response as
+  `open`, `data` chunks, then `close` or `abort`, on one worker held for the whole stream, and can
+  emit converted bytes as they flow: on a `forward` request truly incrementally, on a `retry`
+  request while the buffered response is replayed. aProxy drops `content-length` and
+  `content-encoding` from the output, since the bytes changed. Once the response head has been
+  committed (by a heartbeat skeleton, for example) a program's changes to status and headers are
+  ignored and only its body is used.
+- **`heartbeat`.** On every keepalive tick the programs receive the bytes about to be sent and may
+  replace them. A tick is never delayed: a reply that is late, failed or malformed sends the input
+  bytes instead, and once the real response is ready pending ticks are abandoned.
+- **`notify`.** After a request ended, each program that declares `notify` gets one message with
+  the outcome (delivery mode, attempts, last upstream status, whether the stream completed).
+  aProxy does not wait on the data path for the answer; under load notifications are dropped and
+  counted (`notify_dropped_total` in the status snapshot).
+- **Delivery per request.** The first program whose `request` reply names a `delivery` decides
+  whether this request is handled in `retry` or `forward` mode; see Forward-only mode.
+- **Failures and the breaker.** A deliberate `fail` reply is obeyed: `retry: false` ends the
+  request with `422` `format_rejected` or the response the program supplied; `retry: true` fails
+  the attempt (`format_fail`) and it is retried. A program that breaks (cannot start, exits, times
+  out, replies with something invalid) is a different matter and depends on `required`: on the
+  request side a required program fails the attempt (`format_error`, retried), an optional one is
+  skipped; on the response side, at `decide`, `heartbeat` and `notify`, any broken program is
+  skipped. `breaker_failures` such failures in a row open the program's breaker: its idle workers
+  are killed and no message is sent to it until a probe after `breaker_cooldown_secs` succeeds.
+  While a required program's breaker is open, requests that need it on the request side end at
+  once with `503` `format_unavailable`. If a keepalive response was already committed, any of
+  these errors reaches the client as the terminal SSE frame instead of a status (see After the
+  commit).
+- **Keepalive.** On keepalive requests the programs run within the heartbeat cadence, so a slow
+  one does not leave the client without bytes: if nothing has been committed when the interval
+  ends, the skeleton head goes out and heartbeats continue. When any program declares `response`,
+  `stream` or `decide`, aProxy never commits the upstream's real head early, because a program may
+  still change or reject the response.
 - **Process pool.** `process = "spawn"` starts one process per message. `process = "persistent"`
-  keeps worker processes that handle one message at a time each, grows to `pool_max` (beyond that,
-  messages queue), retires workers idle for `worker_idle_secs`, and kills a worker that exceeds
-  `timeout_secs`. When the instance exits, workers see end of input on stdin and are expected to
-  exit. If a reused idle worker turns out to have died before producing any output, the request is
-  redone once on a fresh worker.
-- **Configuration and environment.** There is no `extra` key any more; pass data the program needs
-  through `args` or the `env` table. The envelope's `extra` field is empty when configured from the
-  file. `env` values are never shown by `aproxy config show`.
-- **Parsed but inactive in this version:** `required`, `decide_timeout_secs`, `breaker_failures`
-  and `breaker_cooldown_secs`. They are validated now so a later release can honor them; do not rely
-  on any behavior from them yet.
-- **Output discipline.** A worker answers each message with exactly one line on stdout. An extra
-  line, invalid JSON, or output while idle gets the worker removed from the pool; otherwise the next
-  request would read the previous request's output and one session's body or key would go to
-  another. The format's stderr is discarded.
-- `command` expands a leading `~/`. Apply changes with `aproxy restart <port|alias>`.
+  keeps workers that handle one message at a time each, grows to `pool_max` (beyond that, messages
+  queue), retires workers idle for `worker_idle_secs`, and kills a worker that exceeds its time
+  limit. Workers that own a stream are outside `pool_max`. When the instance exits, workers see
+  end of input on stdin and are expected to exit; aProxy kills the ones that do not.
+- **Output discipline.** A worker answers each message with exactly one line on stdout, echoing the
+  message's sequence number. A missing or wrong number, an extra line, invalid JSON or output while
+  idle gets the worker replaced; otherwise one request could read another's reply, and with it
+  another session's body or key. stderr is copied to the instance log with known secrets replaced.
+- **State across requests** (key cooldowns, learned decisions) lives in the program's own process.
+  Such a program needs `process = "persistent"`, `pool_max = 1` and `worker_idle_secs = 0`, and
+  loses that state when the instance restarts.
+- **Not sent through `response`/`stream`:** failures passed through because a retry rule gave up,
+  and non-2xx responses of forward requests.
+- Apply configuration changes with `aproxy restart <port|alias>`. `aproxy doctor` checks the chain
+  the way `start` would; `aproxy-format check <config.toml>` checks the official roles' own files.
 
 ## Instances, ports and the control channel
 

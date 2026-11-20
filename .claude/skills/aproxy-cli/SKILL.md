@@ -163,7 +163,7 @@ own session included. Exit codes 10, 11 and 12 each call for a different next st
 | A config.toml field: type, default, what 0 or empty means | [config-toml.md](references/latest/config-toml.md) |
 | Aliases, the default config, global defaults and the other settings.json keys (`aproxy settings`) | [settings-json.md](references/latest/settings-json.md) |
 | Setting up Claude Code, Codex, Gemini CLI or another client | [clients.md](references/latest/clients.md) |
-| How retries, heartbeats, streaming, disk cache, forward-only mode, transformers, IPC, logs, watchdog and install work | [behaviors.md](references/latest/behaviors.md) |
+| How retries, heartbeats, streaming, disk cache, forward-only mode, format programs, IPC, logs, watchdog and install work | [behaviors.md](references/latest/behaviors.md) |
 | A symptom or log message to explain | [troubleshooting.md](references/latest/troubleshooting.md) |
 | Whether these docs match the installed version; moving from 0.1.x to 0.2.0 | [compatibility.md](references/latest/compatibility.md) |
 

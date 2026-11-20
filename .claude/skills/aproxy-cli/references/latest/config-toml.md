@@ -74,11 +74,13 @@ path = '/v1/messages/count_tokens(\?.*)?' # path?query, anchored at both ends
 max_attempts = 3
 
 # [[format]]
-# name = "convert"
-# command = "~/.aproxy/bin/aproxy-format"
-# args = ["run", "--config", "~/.aproxy/agg.toml"]
+# name = "keys"
+# command = "aproxy-format"               # bare name: <home>/bin/ first, then PATH
+# args = ["keys", "--config", "keys.toml"] # relative paths resolve against <home>
 # process = "persistent"
 # stages = ["request", "retry"]
+# pool_max = 1
+# worker_idle_secs = 0
 ```
 
 ## Field summary
@@ -113,7 +115,7 @@ nesting in the `defaults` section of settings.json, whose built-in value is show
 | `allowed_hosts` | array of strings | settings.json (`defaults.allowed_hosts`), `[]` | empty = built-in policy; `["*"]` = check off |
 | `allowed_origins` | array of strings | settings.json (`defaults.allowed_origins`), `[]` | empty = built-in policy; `["*"]` = check off |
 | `log_file` | string (path) | unset: random name in `<APROXY_HOME>/logs/` | |
-| `[[format]]` | array of tables | `[]` | no external transformer |
+| `[[format]]` | array of tables | `[]` | no format program |
 
 ## Precedence
 
@@ -326,7 +328,7 @@ retry, a non-SSE body no longer fits the response. `"always"` cannot be written 
 would put SSE headers on every request and break non-streaming clients, so only a format program
 may ask for it per request.
 
-- The decision uses what the client sent, before any request transformer.
+- The decision uses what the client sent, before any format program.
 - `heartbeat` (default `": keepalive\n\n"`): the bytes written on every tick, as they are. aProxy
   knows no protocol, so pick what the client tolerates: a blank line (`"\n"`) for a client whose
   SSE parser chokes on comments, or a whole event such as `"event: ping\ndata: {}\n\n"`. A
@@ -381,7 +383,7 @@ upstream that is down; for fast recovery prefer a small cap such as 10.
 - If heartbeat headers were already committed, the client gets the terminal SSE error frame with
   code `retry_exhausted` instead, because the real status line can no longer be sent.
 - `path` is a regular expression over the real request target, percent-encoding included and
-  before any request transform. Write a literal `?` as `\?`; escape regex metacharacters when you
+  before any format program. Write a literal `?` as `\?`; escape regex metacharacters when you
   mean the character. Matching is case-sensitive. Logs mask query values (`?beta=***`), but
   matching sees the real ones.
 - A `body` matcher is reserved for a later release: writing it reports `config_not_supported`.
@@ -419,21 +421,46 @@ code. Look for it to confirm a rule matched. Runtime details: behaviors.md, "Ret
 
 ### delivery
 
-`"retry"` (the default, or settings.json `defaults.delivery`) buffers the request and
-the upstream response and retries failures. `"forward"` turns the instance into a plain streaming
-pass-through: request and response bytes are relayed as they arrive, with no buffering, no retries,
-no heartbeats and no error-body detection. This gives up aProxy's core guarantee: an upstream
-failure becomes a 502 to the client, and a stream that breaks mid-way is cut off where it broke.
-Enable it only for a trusted upstream when the client needs true incremental streaming.
+The delivery mode every request of this instance starts in.
+
+- `"retry"` (the default, or settings.json `defaults.delivery`): the request body is read in full,
+  each upstream response is buffered and judged, failures are retried without limit, and waiting
+  streaming clients get heartbeats. This is the guarantee aProxy exists for.
+- `"forward"`: request and response bytes are relayed as they arrive, with no retries and no
+  heartbeats. An upstream failure becomes a `502` `upstream_failed`, and a stream that breaks
+  mid-way is cut off where it broke. Choose it only for a trusted upstream when the client needs
+  true incremental streaming.
+
+The configured value is only the starting point. A format program may change the mode of a single
+request (its `request` reply can carry `delivery`), and a `forward` request that fails before any
+byte reached the client can be upgraded to `retry` by a program that declares `decide`. The
+recommended setup therefore keeps `"retry"` here and lets the official `adaptive` role move
+requests that have not failed before to `forward`: if that program breaks, everything falls back to
+retrying. With `delivery = "forward"` as the default, a broken or absent decision program means
+requests are simply not retried; `aproxy doctor` warns about that combination
+(`forward_default_unguarded`).
+
+In forward mode:
 
 - Still applied: `api_key`, `extra_headers`, `override_headers`, the inbound checks, and
   `max_request_mb` (counted while streaming).
-- Ignored: `disk_cache`, `max_response_mb`, `keepalive.*`, `retry.*`.
-- Cannot be combined with any `[[format]]`: forward does not buffer the body and a format needs all
-  of it. Start fails with `config_conflict` on `delivery`, also when `"forward"` comes from
-  settings.json `defaults.delivery`.
-- Set it with `aproxy config set delivery "forward"`. When it is on, `aproxy start` prints `仅转发模式：不缓冲、不重试` ("forward-only mode: no
-  buffering, no retries").
+- Not used: `keepalive.*` and `retry.*`. `disk_cache` and `max_response_mb` matter only where a
+  format forces buffering (below).
+- A 200 whose body is an error object is still passed on unchanged, but it is recorded as a failed
+  request (`upstream_error_body`) in the request history.
+
+Forward mode and `[[format]]` can be combined:
+
+- The request body streams straight to the upstream unless some program needs it: one that asks for
+  the body or its digest at the `request` stage, or any program that declares `decide` (an upgrade
+  to `retry` has to resend the body). Then aProxy reads the whole body first.
+- The response streams through programs that declare `stream`, converted chunk by chunk. A program
+  that declares `response` needs the whole response, so that layer buffers it and the client loses
+  incremental streaming for those responses (`aproxy doctor`: `forward_response_buffered`).
+- Only 2xx responses go through `response` and `stream`; other statuses pass through as they are.
+
+Set it with `aproxy config set delivery "forward"`. When it is on, `aproxy start` prints
+`仅转发模式：不缓冲、不重试` ("forward-only mode: no buffering, no retries").
 
 Runtime details: behaviors.md, "Forward-only mode".
 
@@ -542,91 +569,125 @@ response body. `body_budget_mb` caps the memory those bodies take together (defa
 
 ### format
 
-Hand each request before forwarding, or each successful response before replay, to an external
-"format" program that rewrites it: protocol conversion (OpenAI to Anthropic and back), key
-rotation, routing models to different channels. aProxy has no transformer built in. The official
-`aproxy-format` binary, the envelope protocol and how to write your own program are in the
-aproxy-format skill; this section covers only the aProxy side.
+A `[[format]]` entry runs an external "format" program at chosen points of a request's life: it can
+rewrite the request before it goes upstream (protocol conversion, key rotation, routing by model),
+rewrite the response on its way back, decide whether a failed attempt is retried, generate
+heartbeats, and observe how requests ended. aProxy itself contains no conversion logic. The
+official `aproxy-format` binary provides one subcommand per role; the wire protocol and how to
+write your own program are in the aproxy-format skill. This section covers the aProxy side.
 
-`[[format]]` is an array of tables. In this version the stages `request`, `response` and
-`heartbeat` can each be served by at most one format, and `retry` is a modifier on a request
-format. Everything else is reported as `config_not_supported` until a later release.
+`[[format]]` is an array of tables, and **the order of the list is the order of the request
+direction**: the first entry is closest to the client, the last one closest to the upstream.
+Responses travel the list in reverse. Any number of programs may declare the same stage.
 
 ```toml
 [[format]]
-name = "convert"
-command = "~/.aproxy/bin/aproxy-format"
-args = ["run", "--config", "~/.aproxy/agg.toml"]
+name = "adaptive"
+command = "aproxy-format"
+args = ["adaptive", "--config", "adaptive.toml"]
 process = "persistent"
-stages = ["request", "retry"]
+stages = ["request", "decide", "notify"]
+required = false          # a judge: when it breaks, skip it and keep retrying as usual
+pool_max = 1              # its memory of past requests lives in one process
+worker_idle_secs = 0      # ... which must not be retired for being idle
 
 [[format]]
-name = "heartbeat"
-command = "~/.aproxy/bin/aproxy-format"
-args = ["run", "--config", "~/.aproxy/agg.toml"]
+name = "convert"
+command = "aproxy-format"
+args = ["convert", "--from", "anthropic_messages", "--to", "openai_chat"]
 process = "persistent"
-stages = ["heartbeat"]
+stages = ["request", "stream"]
+
+[[format]]
+name = "keys"
+command = "aproxy-format"
+args = ["keys", "--config", "keys.toml"]
+process = "persistent"
+stages = ["request", "retry"]
+pool_max = 1
+worker_idle_secs = 0
 ```
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `name` | string | file stem of `command` | Identifies the format in `config show`, logs and the error body's `details.format`; must be unique |
-| `command` | string | required | The program. Run directly, not through a shell. A leading `~` expands to the user's home directory; a bare name is looked up on `PATH`. |
-| `args` | array of strings | `[]` | Arguments, passed verbatim (no `~` expansion). |
-| `env` | table of strings | `{}` | Extra environment variables for the program. `config show` lists the names only, never the values. |
-| `process` | `"spawn"` \| `"persistent"` | `"spawn"` | `spawn`: a new process per message. `persistent`: a pool of long-running workers; required when the program keeps state between requests (key rotation, counters). |
-| `stages` | array of strings | required, non-empty | Which stages this format serves (see below). |
-| `required` | boolean | `true` | Parsed and validated; no effect in this version. |
-| `pool_max` | integer | `4` | Most workers in `persistent` mode; further messages queue. `0` fails start. Unused in `spawn` mode. |
-| `worker_idle_secs` | integer | `300` | A `persistent` worker idle this long is stopped. `0` = never. |
-| `timeout_secs` | integer | `30` | Limit for one transformation. `0` = none. A worker that times out is killed and replaced, and that transformation counts as failed. |
-| `decide_timeout_secs` | integer | `2` | Parsed and validated; no effect in this version. |
-| `breaker_failures` | integer | `5` | Parsed and validated; no effect in this version. |
-| `breaker_cooldown_secs` | integer | `30` | Parsed and validated; no effect in this version. `0` is rejected. |
+| `name` | string | file stem of `command` | Identifies the program in `config show`, logs, status and the error body's `details.format`. Unique in the list, 1 to 64 bytes, no control characters. |
+| `command` | string | required | The program, run directly and never through a shell. A leading `~` expands to the user's home directory; a relative path resolves against `<home>`; a bare name is looked up in `<home>/bin/` and then on `PATH` (the `PATH` in this entry's `env` if it sets one). On Windows a bare name without an extension means `<name>.exe`, and `.cmd` and `.bat` files are rejected: they only run through cmd.exe, and killing cmd.exe leaves the real program alive. To run a script, put the interpreter in `command` and the script in `args`. |
+| `args` | array of strings | `[]` | Arguments, passed verbatim (no `~` expansion). The worker's working directory is `<home>`, so a relative path in `args` resolves there. |
+| `env` | table of strings | `{}` | Extra environment variables for the program; the place for secrets. `config show` lists the names only, never the values. |
+| `process` | `"spawn"` \| `"persistent"` | `"spawn"` | `spawn`: a new process per message. `persistent`: a pool of long-running workers. Required for `stream` and `notify`, and for any program that keeps state between requests. |
+| `stages` | array of strings | required, non-empty | Which stages this program serves (below). |
+| `required` | boolean | `true` | What happens when the program itself breaks (crash, timeout, invalid reply, open breaker) at the `request` or `retry` stage: a required program fails the attempt, an optional one is skipped. It does not affect a deliberate `fail` reply, which is always obeyed. |
+| `pool_max` | integer | `4` | Most pooled workers in `persistent` mode; further messages queue. `0` is rejected. Workers that own a stream in progress are not counted, so the process count can reach `pool_max` plus the number of concurrent streams. Use `1` for a program whose in-memory state must be shared by all requests. |
+| `worker_idle_secs` | integer | `300` | A `persistent` worker idle this long is stopped. `0` = never; use it together with `pool_max = 1` when losing the state would matter. |
+| `timeout_secs` | integer | `30` | Time limit for one reply. `0` = none. A worker that times out is killed and replaced. Not used for `decide` and `notify`. |
+| `decide_timeout_secs` | integer | `2` | Time limit for a `decide` reply. A late answer counts as "no opinion"; a decision program never ends a request by being slow. |
+| `breaker_failures` | integer | `5` | This many process-level failures in a row open the program's circuit breaker. `0` = no breaker. |
+| `breaker_cooldown_secs` | integer | `30` | How long an open breaker waits before letting one message through as a probe. `0` is rejected. |
 
-The official `aproxy-format` expands a leading `~/` in its own `--config` argument; for any other
-program, put an absolute path in `args`, which aProxy passes verbatim (it does not expand `~` there).
+Stages:
 
-Stages in this version:
+| Stage | When the program is called | Typical use |
+|---|---|---|
+| `request` | Once per request, before the first upstream attempt | Convert the protocol, choose a key or channel, pick the delivery mode |
+| `retry` | Before a retry whose request is rebuilt, with the previous failure and the previous response's status and headers | Switch key or channel after a failure |
+| `decide` | After a failed attempt (and after a successful one for programs that ask) | Retry or stop, how long to wait, whether to rebuild the request |
+| `response` | On a whole successful response before it is delivered | Convert a non-streaming response |
+| `stream` | On a successful response chunk by chunk (`open`, `data`, `close`, `abort`) | Convert a streaming response as it flows |
+| `heartbeat` | On every keepalive tick, with the bytes about to be sent | Emit a heartbeat the client's protocol understands |
+| `notify` | After a request ended; aProxy does not wait for the answer | Learn from outcomes |
 
-- `request` runs on the client request after its body is buffered, before the first upstream
-  attempt. Every retry replays its output.
-- Adding `retry` to a request format means the format is called again before each retry, with the
-  client's original request and the previous attempt's failure (envelope `stage = "retry"`). A
-  format that declares `retry` without `request` is `config_not_supported`.
-- `response` runs on an upstream response aProxy judged successful, before replay.
-- `heartbeat` generates each keepalive tick after the response head is committed and until the real
-  bytes are replayed. Prefer `process = "persistent"`: it is called every interval for every
-  waiting request, and `spawn` starts a process each time. Its reply must obey the same
-  event-boundary rule as `keepalive.heartbeat`.
-- `decide`, `stream`, `notify` and `admit`, a second format for the same stage, and `retry` without
-  `request` are reported as `config_not_supported` (they arrive in a later release). A format
-  cannot declare both `response` and `stream`, and one that declares `stream` or `notify` must use
-  `process = "persistent"`.
+Rules checked at start (`config_conflict`):
 
-Other rules:
+- One program cannot declare both `response` and `stream`.
+- A program that declares `stream` or `notify` must use `process = "persistent"`.
+- In the request direction, every program listed after one that declares `retry` and that serves
+  `request` must declare `retry` too. On a retry the earlier program produces a new request; a
+  later one that did not run again would send the previous attempt's output. For example a
+  `convert` or `rewrite` placed after `route` declares `retry`.
+- Names are unique.
 
-- In the request direction, a format that serves `request` and is listed after one that declares
-  `retry` must declare `retry` too: on a retry the earlier format produces a new request, and a
-  later request format that did not run again would forward the previous attempt's output. This is
-  reported as `config_conflict`.
-- There is no `extra` key any more. Pass such data through `args` or `env`; the envelope's `extra`
-  field is empty when the format is configured from the file.
-- A request-side failure returns `422` `format_rejected` when the program replied with `error`, or
-  `502` `format_failed` when the program itself failed (spawn, crash, pipe, timeout or protocol);
-  the request is not sent upstream and not retried. If heartbeat headers were already sent, the
-  same error arrives as the SSE frame instead. `details.format` is the format's `name`. A
-  response-side failure logs a warn and passes the upstream response through untransformed. Full
-  code table: behaviors.md, After the commit.
+`admit` is reserved and reported as `config_not_supported`. Any other stage name is
+`config_invalid_value`.
+
+At start aProxy runs a handshake with every program (it must answer within 10 seconds). If a
+program does not support a stage the entry declares, or speaks another protocol version, the
+instance does not start (`format_stage_unsupported`, `format_handshake_failed`). If it cannot be
+started at all, a required program stops the start and an optional one only produces a warning and
+begins with its breaker open.
+
+What a broken program does to requests:
+
+| Situation | `required = true` | `required = false` |
+|---|---|---|
+| Crash, timeout or invalid reply at `request`/`retry` | The attempt fails with `format_error` and is retried like any failed attempt | The layer is skipped: its input is used as its output, with a warning in the log |
+| Breaker open at `request`/`retry` | The request ends at once with `503` `format_unavailable` (`details.probe_at` says when the next probe is due) | The layer is skipped |
+| Any failure at `decide` | Counts as "no opinion"; the retry rules and the default backoff apply | same |
+| Any failure at `response` or when a stream opens | The layer is skipped and the upstream response is delivered unconverted | same |
+| Any failure at `heartbeat` | That tick sends the bytes it was given | same |
+| Any failure at `notify` | The notification is dropped and counted | same |
+
+A deliberate answer is different from a failure: a program that replies `fail` with `retry: false`
+ends the request with `422` `format_rejected` (or with the response it supplies), and `fail` with
+`retry: true` makes the attempt fail with `format_fail` and be retried.
+
+Other points:
+
+- Because a skipped cross-protocol converter would hand the client the upstream's protocol, keep
+  protocol converters `required = true` and make only judges (`policy`, `adaptive`) optional.
+- A request-side converter alone does not convert responses. If only `request` is declared, the
+  client receives the upstream's protocol; add `stream` (or `response`) to the same entry.
 - Choose `timeout_secs` by how long a stuck program may hold one request, not by client timeouts:
-  keepalive requests keep receiving heartbeats while a transformation runs. With `0`, a program
-  that hangs holds that request indefinitely and its worker is never replaced.
-- A response passed through by a retry rule is not transformed.
-- aProxy discards the program's stderr; have the program write its own log file.
-- Cannot be combined with `delivery = "forward"`.
+  keepalive requests keep receiving heartbeats while a program works.
+- A response passed through because a retry rule gave up is not sent through `response` or
+  `stream`. To rewrite such errors in the client's protocol, use a `decide` program that stops with
+  a response of its own (the official `policy` role does this).
+- A program's stderr goes to the instance log, one line per line, with known secrets replaced.
+  stdout carries only protocol lines.
+- There is no `extra` key. Pass data through `args` or `env`.
+- Apply changes with `aproxy restart <port|alias>`.
 
-Runtime behavior and the error codes: behaviors.md, "External transformers"; aproxy-format skill,
-troubleshooting.md.
+Runtime behavior and the error codes: behaviors.md, "Format programs"; ready-made roles, `init`,
+`check` and `try`: the aproxy-format skill.
 
 ## Checks at start
 
@@ -650,8 +711,8 @@ show` prints the same diagnostics on stderr and exits 3.
 | `config_type` | The value has the wrong type, for example a string where an integer belongs. |
 | `config_invalid_value` | A value outside its allowed set: `delivery` not `forward`/`retry`, `keepalive.trigger = "always"`, an invalid regex, a status outside 100-599, `pool_max = 0`, `breaker_cooldown_secs = 0`, a bad `base_url`, or a `keepalive.heartbeat` that breaks SSE framing. |
 | `config_missing_key` | A required key is absent: `base_url` at start, `max_attempts` in a retry rule, `command` or `stages` in a format. |
-| `config_conflict` | Two settings cannot hold together: `delivery = "forward"` with a format, two formats with the same name, or a request format after a `retry` format without declaring `retry`. |
-| `config_not_supported` | A shape this version parses but does not implement: the retry-rule `body` matcher, a format stage outside `request`/`response`/`heartbeat` (`decide`, `stream`, `notify`, `admit`), `retry` without `request`, or a second format for the same stage. |
+| `config_conflict` | Two settings cannot hold together: two formats with the same name, one format declaring both `response` and `stream`, `stream` or `notify` without `process = "persistent"`, or a request format after a `retry` format without declaring `retry`. |
+| `config_not_supported` | A shape this version parses but does not implement: the retry-rule `body` matcher, or the format stage `admit`. |
 
 Other start checks that are not file diagnostics: the file named by `--config` must exist
 (`指定的配置文件不存在`), and the listen address must bind. Both exit 1.

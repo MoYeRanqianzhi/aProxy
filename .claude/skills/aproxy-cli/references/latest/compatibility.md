@@ -61,7 +61,7 @@ does not have. These development-line changes alter what you see or do on 0.1.0:
 | `--config` is used as given (no `~` expansion); a relative path is recorded relative, so `restart` or `restore` run from another directory cannot find it and `restore` deletes the record; pass absolute paths | `~` is expanded and the path made absolute (commands.md, Options for start) |
 | `aproxy install VERSION --skills-only` is rejected; `--skills-only` always takes the channel's latest | a VERSION is accepted |
 | The hint about the client's stream idle timeout appears only after about 590 s of heartbeats and names Claude Code alone | it appears after 60 s for any client (troubleshooting.md) |
-| No heartbeats while a request or response transformer runs, so a slow format program can leave the client without a byte | transformers run within the heartbeat cycle (behaviors.md) |
+| No heartbeats while a request or response transformer runs, so a slow format program can leave the client without a byte | format programs run within the heartbeat cycle (behaviors.md) |
 | `status` deletes the record of an instance that does not answer even if its process is alive (hung), after which `stop --force` cannot find it; `stop` exits 0 even when a stop was not confirmed | hung instances are listed as unresponsive and `stop --force` reaches them; `stop` exits 1 when a target was not confirmed stopped (commands.md, status and stop) |
 | An instance whose control channel cannot be created keeps proxying without it (logging `IPC 控制通道启动失败…`); `stop` and `status` cannot reach it, and its registry record may replace another instance's | it refuses to start (troubleshooting.md, Starting and stopping) |
 | The watchdog respawns a crashed instance at its next scan, up to `watchdog_heartbeat_secs` (30 s) later | it respawns at once (behaviors.md) |
@@ -72,7 +72,7 @@ does not have. These development-line changes alter what you see or do on 0.1.0:
 | `upstream_url` is accepted as another name for `base_url` | only `base_url` is read; rename the key |
 | `settings.json` is a flat object whose unknown fields are ignored, and a corrupt one makes commands warn and run on built-in defaults | it is sectioned (aliases, `defaults`, `watchdog`, `logs`, `instances`, `update`, `ui`) and parsed strictly: any unknown or 0.1.x field is an error, and commands outside `settings`/`doctor`/`status`/`stop`/`install` exit 3 (settings-json.md) |
 | `keepalive_heartbeat` is ignored; heartbeats are always `: keepalive` | the heartbeat is configurable (config-toml.md) |
-| `heartbeat_transform` is ignored, and transformer envelopes carry no `stage`, `request_id` or `state` | heartbeats can come from a format program, and both transformer sides of a request share `request_id` and `state` (aproxy-format skill) |
+| A transformer is one program per direction, fed a 0.1.x envelope without `stage`, `request_id` or `state`; `heartbeat_transform` is ignored | format programs form a chain and speak protocol 1: a `hello` handshake, seven stages (`request`, `retry`, `decide`, `response`, `stream`, `heartbeat`, `notify`), a `request_id` and per-program `state` on every message. A 0.1.x transformer does not work unchanged (aproxy-format skill) |
 | There is no `aproxy desktop` | builds with the desktop interface open a window with it; in the 0.2.0 alpha releases it shows demo data only (commands.md, desktop) |
 | There is no `aproxy install --force` and no process ledger | force install stops every process of the home through `<home>/ledger/` and replaces the binary (commands.md, Force install) |
 | The CPU build option is `--variant v3\|baseline`, and the swap renames the old binary to the fixed name `aproxy.old(.exe)` | the option is `--cpu x86-64-v3\|baseline` (`--variant` now picks `desktop` or `headless`), and the swap uses unique names `aproxy.old-<nanoseconds>-<pid>[.exe]` (commands.md, install / upgrade) |
@@ -278,11 +278,11 @@ start. Rename each key before the first start with the new CLI.
 | `keepalive_heartbeat = "..."` | `[keepalive] heartbeat = "..."` |
 | `max_retry_backoff_secs = N` | `[retry] max_backoff_secs = N` |
 | `bounded_retry_paths = ["..."]` | `[[retry.rules]]` entries with `path` (regex) and `max_attempts` (required; `0` = no limit), plus optional `status` |
-| `[request_transform]`, `[response_transform]`, `[heartbeat_transform]` tables | `[[format]]` array entries with `command`, `args`, `process`, and `stages` (`request`, `response` or `heartbeat`) |
+| `[request_transform]`, `[response_transform]`, `[heartbeat_transform]` tables | `[[format]]` array entries with `command`, `args`, `process`, and `stages` (config-toml.md, format). The program itself must speak protocol 1; the official `aproxy-format run` command is replaced by one subcommand per role |
 | format `mode = "spawn"\|"persistent"` | `process = "spawn"\|"persistent"` |
 | format `idle_timeout_secs = N` | `worker_idle_secs = N` |
 | format `every_attempt = true` | add `"retry"` to `stages` next to `"request"` |
-| format `extra = "..."` | pass the data through `args` or `env`; the envelope's `extra` field is empty when configured from config.toml |
+| format `extra = "..."` | pass the data through `args` or `env` |
 
 The 0.1.x `upstream_url` name is older still and also no longer read; it is `base_url` in 0.2.0 and
 in 0.1.0's stable line (the "What these docs describe" table above).

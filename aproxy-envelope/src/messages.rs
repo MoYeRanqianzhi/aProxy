@@ -570,7 +570,9 @@ pub enum StreamEvent {
     Close,
     /// Produce a protocol-correct error ending.
     Abort {
-        /// Why the stream stopped.
+        /// The upstream attempt's failure code, an inner layer's `format_error` or
+        /// `format_fail`, or `client_gone` when the client disconnected. The latter
+        /// is an outcome, not an error code. Treat unknown codes as a plain abort.
         reason: Failure,
     },
 }

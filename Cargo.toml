@@ -99,7 +99,7 @@ http = "1"
 http-body = "1"
 # 请求历史的体经控制通道分块读出时用 base64（src/history.rs）
 base64 = "0.22"
-tokio-util = { version = "0.7", features = ["io"] }
+tokio-util = { version = "0.7", features = ["io", "io-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 # install 下载校验：github 渠道 .sha256 强校验 / npm integrity 换算 / --from 完整性记录
 sha2 = "0.11"

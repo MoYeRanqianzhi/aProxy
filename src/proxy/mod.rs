@@ -89,6 +89,7 @@ mod keepalive;
 mod replay;
 mod spool;
 mod state;
+mod streams;
 #[cfg(test)]
 mod tests;
 mod transforms;

@@ -271,16 +271,19 @@ struct Slot {
     /// 这个程序仍在使用的所有编号。
     used: Arc<Mutex<BTreeMap<u32, Option<u32>>>>,
     /// 进程数上限与并发请求数分别计数，前者包括正在退出的进程。
-    _permit: OwnedSemaphorePermit,
+    capacity: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
 }
 impl Drop for Slot {
     fn drop(&mut self) {
         self.used.lock().unwrap().remove(&self.id);
+        self.capacity.lock().unwrap().take();
     }
 }
 
 /// stdin、stdout 与序号作为一组移动；读缓冲在同一进程的各帧之间保持不变。
 struct Worker {
+    /// 池进程占一个名额，独占流不占；进程所有者在 wait 完成后收回最后一个名额。
+    capacity: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
     /// 管道使用者与进程回收分开；即使管道被未完成的 Turn 借走，池关闭时仍能等到 wait。
     exited: tokio::task::JoinHandle<()>,
     /// 强制丢弃管道时立即停止日志读取，不让继承 stderr 的后代拖住它。
@@ -522,7 +525,9 @@ pub(crate) struct Pool {
     stderr_window: Arc<Mutex<LogWindow>>,
     /// 同时进池的请求数；空闲进程可由持票者直接取走。
     turns: Semaphore,
-    /// 已启动但仍未退出的进程数上限。
+    /// 归还的流可能拿走空闲名额，唤醒同时等待名额的普通请求重新检查池。
+    parked: tokio::sync::Notify,
+    /// 已启动但仍未退出的普通进程数上限，不包括独占流。
     capacity: Arc<Semaphore>,
     /// 开始排空后不再留空闲会话，仍在途的请求可完成后续阶段。
     draining: std::sync::atomic::AtomicBool,
@@ -573,6 +578,7 @@ impl Pool {
             frame_limits: body_limits.map(|n| n.saturating_mul(2).saturating_add(FRAME_OVERHEAD)),
             stderr_window: Arc::new(Mutex::new(LogWindow::new())),
             turns: Semaphore::new(n),
+            parked: Default::default(),
             capacity: Arc::new(Semaphore::new(n)),
             draining: Default::default(),
             stopping: tokio::sync::watch::channel(false).0,
@@ -678,8 +684,12 @@ impl Pool {
     }
     /// 每个已写出的消息按完成顺序登记；程序的显式拒绝是合法回信，不是进程故障。
     fn complete(&self, a: &Admission<'_>, fault: Option<&Fault>) {
+        self.complete_at(a.epoch, a.probe, fault);
+    }
+    /// 流开始后的事件仍更新故障计数，但只有被选中的 open 才能完成半开试探。
+    fn complete_at(&self, epoch: u64, probe: bool, fault: Option<&Fault>) {
         let mut c = self.circuit.lock().unwrap();
-        let current_probe = a.probe && c.epoch == a.epoch;
+        let current_probe = probe && c.epoch == epoch;
         if let Some(f) = fault {
             let now = crate::daemon::now_millis();
             c.failures = c.failures.saturating_add(1);
@@ -709,6 +719,14 @@ impl Pool {
             .acquire_owned()
             .await
             .expect("pool is never closed");
+        self.spawn_with(admission, Some(permit)).await
+    }
+    /// 有普通名额或是独占流时才创建进程；编号和关闭通知覆盖两种会话。
+    async fn spawn_with(
+        &self,
+        admission: Option<&Admission<'_>>,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<Worker, Fault> {
         let mut stopping = self.stopping.subscribe();
         if *stopping.borrow() {
             return Err(Fault::Died);
@@ -736,10 +754,11 @@ impl Pool {
             ids.insert(id, None);
             id
         };
+        let capacity = Arc::new(Mutex::new(permit));
         let slot = Slot {
             id,
             used: self.ids.clone(),
-            _permit: permit,
+            capacity: capacity.clone(),
         };
         let mut child = {
             let c = self.circuit.lock().unwrap();
@@ -791,8 +810,10 @@ impl Pool {
             }
             stderr.abort();
             drop(slot);
+            drop(stopping);
         });
         let mut w = Worker {
+            capacity,
             exited,
             stderr_abort,
             kill: Some(kill),
@@ -911,17 +932,8 @@ impl Pool {
         let mut retired = std::mem::take(&mut *self.retiring.lock().unwrap());
         while retired.join_next().await.is_some() {}
         self.terminate_remaining();
-        // 在途/握手/已丢弃的会话不一定在退役队列里，它们的名额也必须全部收齐。
-        let slots = if self.entry.process == Process::Spawn {
-            1
-        } else {
-            self.entry.pool_max
-        };
-        let _all = self
-            .capacity
-            .acquire_many(slots)
-            .await
-            .expect("process capacity stays open");
+        // 每个进程所有者从拉起前到 wait 之后持有接收端；独占流没有普通名额，也必须等它。
+        self.stopping.closed().await;
     }
     /// 只有刚检查过输出的健康会话可以归还；第二次检查放在取用一刻，截住迟到的杂字节。
     fn park(self: &Arc<Self>, mut w: Worker) {
@@ -936,6 +948,7 @@ impl Pool {
                 return;
             }
             idle.push(w);
+            self.parked.notify_waiters();
         }
         let timeout = Duration::from_secs(self.entry.worker_idle_secs);
         if timeout.is_zero() {
@@ -999,13 +1012,19 @@ impl Pool {
             turn=self.turns.acquire()=>turn.map_err(|_| Fault::Died)?,
         };
         let borrow = async {
-            let old = self.take();
-            if fresh || ticket.probe {
-                drop(old);
-            } else if let Some(w) = old {
-                return Ok(w);
+            loop {
+                let parked = self.parked.notified();
+                let old = self.take();
+                if fresh || ticket.probe {
+                    drop(old);
+                } else if let Some(w) = old {
+                    return Ok(w);
+                }
+                tokio::select! {biased;
+                    _=parked=>continue,
+                    permit=self.capacity.clone().acquire_owned()=> return self.spawn_with(Some(&ticket), Some(permit.expect("pool is never closed"))).await,
+                }
             }
-            self.spawn(Some(&ticket)).await
         };
         let worker = tokio::select! {biased;
             f=ticket.revoked()=>return Err(f),
@@ -1026,6 +1045,44 @@ impl Pool {
             }
         }
     }
+    /// open 才查熔断门。借走首个已握手的进程即释放其普通名额；没有空闲进程时直接为流建会话。
+    pub(crate) async fn open_stream(
+        self: &Arc<Self>,
+        stage: Stage,
+        fresh: bool,
+    ) -> Result<(StreamWorker, PreparedReply), Fault> {
+        let ticket = self.admit()?;
+        let obtain = async {
+            if let Some(w) = self.take()
+                && !fresh
+                && !ticket.probe
+            {
+                w.capacity.lock().unwrap().take();
+                return Ok(w);
+            }
+            self.spawn_with(Some(&ticket), None).await
+        };
+        let result = async {
+            let mut w = tokio::select! {biased; f=ticket.revoked()=>return Err(f), r=obtain=>r?};
+            let reply = self
+                .exchange(&mut w, stage, self.entry.timeout_secs, Some(&ticket))
+                .await?;
+            w.reusable()?;
+            Ok((
+                StreamWorker {
+                    pool: self.clone(),
+                    worker: w,
+                    epoch: ticket.epoch,
+                },
+                reply,
+            ))
+        }
+        .await;
+        if !matches!(result, Err(Fault::Open { .. })) {
+            self.complete(&ticket, result.as_ref().err());
+        }
+        result
+    }
     /// 管道单元测试只传很小的合成帧，生产路径先取得 turn 再构造可能很大的消息。
     #[cfg(test)]
     async fn call(
@@ -1042,7 +1099,7 @@ impl Pool {
         w: &mut Worker,
         stage: Stage,
         timeout: u64,
-        a: &Admission<'_>,
+        a: Option<&Admission<'_>>,
     ) -> Result<PreparedReply, Fault> {
         let limit = match &stage {
             Stage::Request(_) | Stage::Retry(_) => self.frame_limits[0],
@@ -1050,7 +1107,7 @@ impl Pool {
             _ => FRAME_OVERHEAD,
         };
         let request_stage = matches!(&stage, Stage::Request(_) | Stage::Retry(_));
-        let line = w.frame(stage, timeout, Some(a), limit).await?;
+        let line = w.frame(stage, timeout, a, limit).await?;
         /// 先核对回信的版本和序列再解释补丁，以免把其他请求的回信应用到本次。
         #[derive(serde::Deserialize)]
         struct Sequence {
@@ -1119,6 +1176,46 @@ impl Pool {
     }
 }
 
+/// 从 open 至 close/abort 都留在一个进程；不会把另一条流的序号或状态带进来。
+pub(crate) struct StreamWorker {
+    /// 进程回收与按程序计数的归属。
+    pool: Arc<Pool>,
+    /// 只在完整收尾后允许归还的管道。
+    worker: Worker,
+    /// 开始流时所处的代，进行中的流不受后续熔断的开关影响。
+    epoch: u64,
+}
+impl StreamWorker {
+    /// 已接纳的流不经过普通队列，也不因别的流触发熔断而拒绝收尾。
+    pub(crate) async fn event(&mut self, stage: Stage) -> Result<PreparedReply, Fault> {
+        let result = self
+            .pool
+            .exchange(&mut self.worker, stage, self.pool.entry.timeout_secs, None)
+            .await
+            .and_then(|r| {
+                self.worker.reusable()?;
+                Ok(r)
+            });
+        self.pool
+            .complete_at(self.epoch, false, result.as_ref().err());
+        result
+    }
+    /// 健康会话按空闲名额数归还，不按编号截断；池满则关 stdin 正常退役。
+    pub(crate) fn finish(self) {
+        let Self {
+            pool, mut worker, ..
+        } = self;
+        if matches!(worker.reusable(), Ok(true))
+            && let Ok(permit) = pool.capacity.clone().try_acquire_owned()
+        {
+            *worker.capacity.lock().unwrap() = Some(permit);
+            pool.park(worker);
+        } else {
+            pool.retire(worker);
+        }
+    }
+}
+
 /// HTTP 头与回信一起通过容量校验；调用方接收同一份头表，不在终态路径重新转换。
 type PreparedReply = (Reply, Option<http::HeaderMap>);
 
@@ -1169,7 +1266,7 @@ impl Turn<'_> {
             return Err(Fault::Timeout);
         }
         self.worker.written = false;
-        let exchange = pool.exchange(&mut self.worker, stage, timeout, &self.ticket);
+        let exchange = pool.exchange(&mut self.worker, stage, timeout, Some(&self.ticket));
         let result = if let Some(d) = deadline {
             tokio::select! {biased; _=tokio::time::sleep_until(d)=>None,r=exchange=>Some(r)}
                 .filter(|_| Instant::now() < d)

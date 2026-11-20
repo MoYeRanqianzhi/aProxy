@@ -616,7 +616,7 @@ fn check_supported_stages(
 ) {
     for (index, format) in formats.iter().enumerate() {
         for stage in &format.stages {
-            if matches!(stage, Stage::Stream | Stage::Notify) {
+            if matches!(stage, Stage::Notify) {
                 let key = format!("format[{index}].stages");
                 let position = text.and_then(|text| file::locate(text, &key));
                 diagnostics.push(Diagnostic {
@@ -984,10 +984,7 @@ stages = ["request"]
         let resolved = run(text, &Overrides::default(), FileConfig::default());
         assert_eq!(
             brief(&resolved),
-            [
-                "config_not_supported format[0].stages config.toml 6",
-                "config_not_supported format[0].stages config.toml 6",
-            ]
+            ["config_not_supported format[0].stages config.toml 6",]
         );
     }
 

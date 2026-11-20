@@ -471,130 +471,139 @@ pub(super) async fn transform_response_if_configured(
         return (status, headers, body);
     }
     let ctx = req.ctx.as_ref().expect("format context");
-    for (layer, p) in state
-        .formats
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(_, p)| p.entry.has_stage(Stage::Response))
-    {
-        // 每个层界按当前头解释当前的体：上一层可以刚刚重新编码，而外层也可能完全跳过。
-        let raw_encoding = request_encoding(&headers, true);
-        let encoding = raw_encoding
-            .as_deref()
-            .map(|v| v.to_str().unwrap_or("unsupported"))
-            .filter(|v| {
-                v.split(',')
-                    .map(str::trim)
-                    .any(|e| !e.is_empty() && !e.eq_ignore_ascii_case("identity"))
-            });
-        let mut decoded_spool = None;
-        let name = &p.entry.name;
-        let mut fresh = false;
-        let reply = loop {
-            let result = match p.turn(fresh).await {
-                Err(f) => Err(f),
-                Ok(turn) => {
-                    // 已拿到进程才展开当前响应；重发走同一入口，无故障时不准备第二帧。
-                    let mut raw = match decoded_spool.as_ref().unwrap_or(&body) {
-                        SpooledBody::Memory(b) => b.to_vec(),
-                        SpooledBody::Disk { path, .. } => match tokio::fs::read(path).await {
-                            Ok(b) => b,
-                            Err(e) => {
-                                tracing::warn!(error=%e,"could not read response spool; format skipped");
-                                turn.unused().await;
-                                return (status, headers, body);
-                            }
-                        },
-                    };
-                    if let Some(enc) = encoding
-                        && decoded_spool.is_none()
-                    {
-                        let mut decoded = Vec::new();
-                        if !format_encoding_depth_allowed(enc)
-                            || crate::decode::decode_strict(
-                                enc,
-                                raw.as_slice(),
-                                &mut decoded,
-                                spool_limit_bytes(&state.config) as u64,
-                            )
-                            .is_err()
-                        {
-                            tracing::warn!("could not decode response body; format skipped");
+    let meta = wire::RequestMeta::new(req.method.to_string(), req.target_url.clone());
+    for (layer, p) in state.formats.iter().enumerate().rev() {
+        if p.entry.has_stage(Stage::Response) {
+            (status, headers, body) =
+                transform_response_layer(state, ctx, &meta, layer, status, headers, body).await;
+        }
+    }
+    (status, headers, body)
+}
+
+/// 仅在走到声明 response 的这一层时处理整体正文，内侧或外侧的流仍按块运转。
+pub(super) async fn transform_response_layer(
+    state: &AppState,
+    ctx: &ExchangeCtx,
+    meta: &wire::RequestMeta,
+    layer: usize,
+    mut status: StatusCode,
+    mut headers: HeaderMap,
+    mut body: SpooledBody,
+) -> (StatusCode, HeaderMap, SpooledBody) {
+    let p = &state.formats[layer];
+    // 每个层界按当前头解释当前的体：上一层可以刚刚重新编码，而外层也可能完全跳过。
+    let raw_encoding = request_encoding(&headers, true);
+    let encoding = raw_encoding
+        .as_deref()
+        .map(|v| v.to_str().unwrap_or("unsupported"))
+        .filter(|v| {
+            v.split(',')
+                .map(str::trim)
+                .any(|e| !e.is_empty() && !e.eq_ignore_ascii_case("identity"))
+        });
+    let mut decoded_spool = None;
+    let name = &p.entry.name;
+    let mut fresh = false;
+    let reply = loop {
+        let result = match p.turn(fresh).await {
+            Err(f) => Err(f),
+            Ok(turn) => {
+                // 已拿到进程才展开当前响应；重发走同一入口，无故障时不准备第二帧。
+                let mut raw = match decoded_spool.as_ref().unwrap_or(&body) {
+                    SpooledBody::Memory(b) => b.to_vec(),
+                    SpooledBody::Disk { path, .. } => match tokio::fs::read(path).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!(error=%e,"could not read response spool; format skipped");
                             turn.unused().await;
                             return (status, headers, body);
                         }
-                        raw = decoded;
-                        decoded_spool = Some(
-                            transform::spool_response_body(&raw, state.spool_dir.as_deref()).await,
-                        );
+                    },
+                };
+                if let Some(enc) = encoding
+                    && decoded_spool.is_none()
+                {
+                    let mut decoded = Vec::new();
+                    if !format_encoding_depth_allowed(enc)
+                        || crate::decode::decode_strict(
+                            enc,
+                            raw.as_slice(),
+                            &mut decoded,
+                            spool_limit_bytes(&state.config) as u64,
+                        )
+                        .is_err()
+                    {
+                        tracing::warn!("could not decode response body; format skipped");
+                        turn.unused().await;
+                        return (status, headers, body);
                     }
-                    let mut current = wire::Response::new(status.as_u16());
-                    current.headers = transform::headers_to_btreemap(&headers);
-                    if decoded_spool.is_some() {
-                        current.headers.remove("content-encoding");
-                    }
-                    current.body = wire::Body::from_bytes(raw);
-                    let m = wire::ResponseMessage::new(
-                        ctx.context(name),
-                        wire::RequestMeta::new(req.method.to_string(), req.target_url.clone()),
-                        current,
+                    raw = decoded;
+                    decoded_spool = Some(
+                        transform::spool_response_body(&raw, state.spool_dir.as_deref()).await,
                     );
-                    turn.send(wire::Stage::Response(m), p.entry.timeout_secs)
-                        .await
                 }
-            };
-            match result {
-                Ok(r) => break Some(r),
-                Err(e) if !fresh && !matches!(e, Fault::Open { .. }) => fresh = true,
-                Err(e) => {
-                    tracing::warn!(format=%state.history.secrets().replace(name),error=%e,"response format layer skipped");
-                    break None;
+                let mut current = wire::Response::new(status.as_u16());
+                current.headers = transform::headers_to_btreemap(&headers);
+                if decoded_spool.is_some() {
+                    current.headers.remove("content-encoding");
                 }
+                current.body = wire::Body::from_bytes(raw);
+                let m = wire::ResponseMessage::new(ctx.context(name), meta.clone(), current);
+                turn.send(wire::Stage::Response(m), p.entry.timeout_secs)
+                    .await
             }
         };
-        let Some((r, prepared_headers)) = reply else {
-            continue;
+        match result {
+            Ok(r) => break Some(r),
+            Err(e) if !fresh && !matches!(e, Fault::Open { .. }) => fresh = true,
+            Err(e) => {
+                tracing::warn!(format=%state.history.secrets().replace(name),error=%e,"response format layer skipped");
+                break None;
+            }
+        }
+    };
+    let Some((r, prepared_headers)) = reply else {
+        return (status, headers, body);
+    };
+    if let wire::ReportField::Present(report) = r.report {
+        ctx.rec
+            .format_report((layer, name), "response", None, report);
+    }
+    ctx.absorb(name, r.state);
+    let (code, replacement) = if let Some(f) = r.fail {
+        let Some(response) = f.response else {
+            return (status, headers, body);
         };
-        if let wire::ReportField::Present(report) = r.report {
-            ctx.rec
-                .format_report((layer, name), "response", None, report);
-        }
-        ctx.absorb(name, r.state);
-        let (code, replacement) = if let Some(f) = r.fail {
-            let Some(response) = f.response else {
-                continue;
-            };
-            (Some(response.status), Some(response.body))
-        } else if let Some(patch) = r.response {
-            (
-                patch.status,
-                (patch.body != wire::Body::Absent).then_some(patch.body),
-            )
-        } else {
-            (None, None)
-        };
-        if let Some(code) = code {
-            status = StatusCode::from_u16(code).expect("validated response status");
-        }
-        if decoded_spool.is_some() {
-            headers.remove(http::header::CONTENT_ENCODING);
-            headers.remove(http::header::CONTENT_LENGTH);
-        }
-        if let Some(h) = prepared_headers {
-            headers = h;
-            headers.remove(http::header::CONTENT_LENGTH);
-        }
-        if let Some(bytes) = replacement {
-            body = transform::spool_response_body(
-                bytes.as_bytes().unwrap_or_default(),
-                state.spool_dir.as_deref(),
-            )
-            .await;
-            headers.remove(http::header::CONTENT_LENGTH);
-        } else if let Some(decoded) = decoded_spool {
-            body = decoded;
-        }
+        (Some(response.status), Some(response.body))
+    } else if let Some(patch) = r.response {
+        (
+            patch.status,
+            (patch.body != wire::Body::Absent).then_some(patch.body),
+        )
+    } else {
+        (None, None)
+    };
+    if let Some(code) = code {
+        status = StatusCode::from_u16(code).expect("validated response status");
+    }
+    if decoded_spool.is_some() {
+        headers.remove(http::header::CONTENT_ENCODING);
+        headers.remove(http::header::CONTENT_LENGTH);
+    }
+    if let Some(h) = prepared_headers {
+        headers = h;
+        headers.remove(http::header::CONTENT_LENGTH);
+    }
+    if let Some(bytes) = replacement {
+        body = transform::spool_response_body(
+            bytes.as_bytes().unwrap_or_default(),
+            state.spool_dir.as_deref(),
+        )
+        .await;
+        headers.remove(http::header::CONTENT_LENGTH);
+    } else if let Some(decoded) = decoded_spool {
+        body = decoded;
     }
     (status, headers, body)
 }

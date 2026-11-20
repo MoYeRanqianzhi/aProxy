@@ -153,7 +153,7 @@ fn main() {
             if mode == "slow-hello" {
                 std::thread::sleep(delay);
             }
-            r = json!({"v":1,"seq":0,"name":"format-echo","version":"1.0","protocol":1,"features":[],"stages":["request","retry","decide","response","heartbeat"]});
+            r = json!({"v":1,"seq":0,"name":"format-echo","version":"1.0","protocol":1,"features":[],"stages":["request","retry","decide","response","heartbeat","stream"]});
             if std::env::var_os("ECHO_DECIDE_SUCCESS").is_some() {
                 r["features"] = json!(["decide.success"]);
             }
@@ -204,6 +204,9 @@ fn main() {
                 )
             {
                 r[obj] = m[obj].clone();
+                r["state"] = json!(format!("{worker}/{}", std::process::id()));
+            }
+            if mode == "echo" && stage == "stream" {
                 r["state"] = json!(format!("{worker}/{}", std::process::id()));
             }
             match mode {
@@ -266,6 +269,33 @@ fn main() {
                     wait_gate(std::path::Path::new(arg))
                 }
                 "no-stage-reply" => continue,
+                "stream-echo" | "stream-fault" | "stream-reject" | "stream-gate"
+                    if stage == "stream" =>
+                {
+                    match m["event"].as_str() {
+                        Some("open") => {
+                            r["abort_tail"] = json!("[aborted]");
+                            r["data"] = json!("[");
+                        }
+                        Some("data") if mode == "stream-fault" => break,
+                        Some("data") if mode == "stream-reject" => {
+                            r["fail"] = json!({"retry":false,"reason":"refused"})
+                        }
+                        Some("data") => {
+                            if mode == "stream-gate" {
+                                wait_gate(std::path::Path::new(arg));
+                            }
+                            for key in ["data", "data_b64"] {
+                                if let Some(v) = m.get(key) {
+                                    r[key] = v.clone();
+                                }
+                            }
+                        }
+                        Some("close") => r["data"] = json!("]"),
+                        Some("abort") => r["data"] = json!("[abort reply]"),
+                        _ => unreachable!(),
+                    }
+                }
                 "sleep" => std::thread::sleep(delay),
                 "oneshot" if count > 1 || dead => break,
                 "exit1" => std::process::exit(1),
@@ -297,6 +327,8 @@ fn main() {
                         serde_json::from_slice(&std::fs::read(arg).unwrap()).unwrap();
                     let key = if stage == "retry" {
                         format!("retry:{}", m["retry"]["attempt"])
+                    } else if stage == "stream" {
+                        format!("stream:{}", m["event"].as_str().unwrap())
                     } else if stage == "decide" {
                         format!("decide:{}", m["attempt"])
                     } else {

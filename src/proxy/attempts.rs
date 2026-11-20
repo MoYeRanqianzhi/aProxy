@@ -162,7 +162,8 @@ impl Responder {
             ticker: enabled.then(|| Self::ticker(interval)),
             // 不能用某个旧 worker 的 hello 排除成功咨询：其他会话可以在上游体到齐前重新握手。
             real_head_allowed: !state.has_format(Stage::Response)
-                && !state.has_format(Stage::Decide),
+                && !state.has_format(Stage::Decide)
+                && !state.has_format(Stage::Stream),
         }
     }
 
@@ -853,6 +854,48 @@ async fn deliver(
     }
     let upstream_sse = is_event_stream(&headers);
     let rec = &trace.rec;
+    if state.has_format(Stage::Stream) {
+        rec.phase(Phase::Transforming);
+        let meta =
+            aproxy_envelope::RequestMeta::new(req.method.to_string(), req.target_url.clone());
+        let setup = streams::chain(
+            state,
+            req.ctx.as_ref().expect("format context"),
+            &meta,
+            attempt,
+            status,
+            headers,
+            streams::Content::Saved(body),
+        );
+        let result = r.wait_after_head(setup, !upstream_sse, "stream open").await;
+        let Some(result) = result else { return };
+        match result {
+            Ok(response) if !r.is_committed() => {
+                rec.phase(Phase::Replaying);
+                r.respond(response);
+            }
+            Ok(response) => {
+                rec.phase(Phase::Replaying);
+                let mut stream = streams::committed_body(response, max_spool_bytes);
+                // 等流层下一块期间也要观察断开；不能等卡住的程序再产出一块才释放上游。
+                let Responder::Keepalive { sink, .. } = r else {
+                    unreachable!()
+                };
+                while let Some(chunk) =
+                    tokio::select! {biased; _=sink.client_gone()=>None, item=stream.next()=>item}
+                {
+                    if !sink.send(chunk).await {
+                        break;
+                    }
+                }
+            }
+            Err(t) => {
+                t.record_in(&state.stats);
+                r.finish(t, trace).await;
+            }
+        }
+        return;
+    }
     if state.has_format(Stage::Response) {
         rec.phase(Phase::Transforming);
     }

@@ -573,7 +573,7 @@ async fn return_check_distinguishes_stray_bytes_from_clean_eof() {
         wire::Request::new("POST".into(), "http://localhost/".into()),
         wire::Client::new("/".into(), false),
     ));
-    p.exchange(&mut turn.worker, frame, 2, &turn.ticket)
+    p.exchange(&mut turn.worker, frame, 2, Some(&turn.ticket))
         .await
         .unwrap();
     let pid = wait_observed(&obs, "hello", 1).await[0]["pid"]
@@ -796,4 +796,90 @@ async fn spawn_rejects_extra_stdout_at_hello_and_after_stage() {
         };
         assert!(matches!(result, Err(Fault::Protocol)), "{result:?}");
     }
+}
+
+/// 用真实管道上的 open/close 校验独占期间和归还之后的进程身份。
+fn stream_frame(id: &str, open: bool) -> Stage {
+    let event = if open {
+        wire::StreamEvent::Open(wire::StreamOpen::new(
+            wire::Context::new(id.into()),
+            wire::RequestMeta::new("GET".into(), "http://localhost/".into()),
+            wire::Response::new(200),
+        ))
+    } else {
+        wire::StreamEvent::Close
+    };
+    Stage::Stream(wire::StreamMessage::new(format!("{id}/1"), event))
+}
+/// 普通池只有一个名额时，长流不妨碍另一条普通 request 得到不同的进程。
+#[tokio::test]
+async fn stream_workers_do_not_count_toward_pool_max() {
+    let p = pool(Process::Persistent, "echo", |e| e.pool_max = 1);
+    p.probe().await.unwrap();
+    let (mut stream, (hello, _)) = p.open_stream(stream_frame("a", true), false).await.unwrap();
+    let other = tokio::time::timeout(Duration::from_secs(3), call(&p, "other", false))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(other.state, hello.state);
+    let end = stream.event(stream_frame("a", false)).await.unwrap().0;
+    assert_eq!(end.state, hello.state);
+    stream.finish();
+    p.shutdown().await;
+}
+/// 两条尚未关闭的流各有一个不冲突的编号；第二个可以超出 pool_max 的编号范围。
+#[tokio::test]
+async fn stream_worker_ids_stay_unique_beyond_pool_max() {
+    let p = pool(Process::Persistent, "echo", |e| e.pool_max = 1);
+    let (mut a, (first, _)) = p.open_stream(stream_frame("a", true), false).await.unwrap();
+    let (mut b, (second, _)) = tokio::time::timeout(
+        Duration::from_secs(3),
+        p.open_stream(stream_frame("b", true), false),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let id = |r: &Reply| {
+        r.state
+            .as_ref()
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+    };
+    assert_eq!((id(&first), id(&second)), (0, 1));
+    assert_eq!(
+        b.event(stream_frame("b", false)).await.unwrap().0.state,
+        second.state
+    );
+    b.finish();
+    assert_eq!(
+        a.event(stream_frame("a", false)).await.unwrap().0.state,
+        first.state
+    );
+    a.finish();
+    p.shutdown().await;
+}
+/// 先关掉编号较大的流，再关小编号；池按会话个数而不是按编号保留先归还者。
+#[tokio::test]
+async fn stream_worker_returns_to_the_pool_or_exits_after_close() {
+    let p = pool(Process::Persistent, "echo", |e| e.pool_max = 1);
+    let (mut a, _) = p.open_stream(stream_frame("a", true), false).await.unwrap();
+    let (mut b, (second, _)) = p.open_stream(stream_frame("b", true), false).await.unwrap();
+    b.event(stream_frame("b", false)).await.unwrap();
+    b.finish();
+    a.event(stream_frame("a", false)).await.unwrap();
+    a.finish();
+    assert_eq!(call(&p, "reuse", false).await.unwrap().state, second.state);
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while p.ids.lock().unwrap().len() != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(p.ids.lock().unwrap().contains_key(&1));
+    p.shutdown().await;
 }

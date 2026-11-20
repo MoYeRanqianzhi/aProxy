@@ -3141,3 +3141,143 @@ async fn stop_deadline_reaps_a_worker_with_an_unanswered_message() {
     assert_eq!(exited, Some(true));
     let _ = request.await;
 }
+
+/// 首轮 503 不进入转换；成功回放中的四种帧字段按实际 attempt 编号分配。
+#[tokio::test]
+async fn retry_replay_runs_through_the_stream_program() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[503, 200]).await;
+    let (client, url) = running(
+        &home,
+        up,
+        &layer(&home, "convert", "'stream'", &["stream-echo"]),
+    );
+    let resp = client.get(url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("content-length").is_none());
+    assert_eq!(resp.text().await.unwrap(), "[upstream bytes]");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    let frames = frames(&home, "convert");
+    let events = &frames[1..];
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| e["event"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["open", "data", "close"]
+    );
+    let id = format!("{}/2", events[0]["request_id"].as_str().unwrap());
+    for e in events {
+        assert_eq!(e["stream_id"], id);
+    }
+    assert!(events[1].get("request_id").is_none());
+    assert!(events[2].get("state").is_none());
+}
+/// 必选的最外层在 data 崩溃：先交付已提交的前缀，再写 open 约定的收尾，不重试上游。
+#[tokio::test]
+async fn mid_stream_failure_writes_abort_tail() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[200]).await;
+    let (client, url) = running(
+        &home,
+        up,
+        &format!(
+            "{}required=true\n",
+            layer(&home, "broken", "'stream'", &["stream-fault"])
+        ),
+    );
+    assert_eq!(
+        client.get(url).send().await.unwrap().text().await.unwrap(),
+        "[[aborted]"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+/// 可选层失败后仍交付当前块与其余块；外层正常关闭而不是收到 abort。
+#[tokio::test]
+async fn optional_stream_program_failing_mid_stream_is_skipped() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[200]).await;
+    let cfg = layer(&home, "outer", "'stream'", &["stream-echo"])
+        + &layer(&home, "inner", "'stream'", &["stream-fault"])
+        + "required=false\n";
+    let (client, url) = running(&home, up, &cfg);
+    assert_eq!(
+        client.get(url).send().await.unwrap().text().await.unwrap(),
+        "[[upstream bytes]"
+    );
+    assert_eq!(frames(&home, "outer").last().unwrap()["event"], "close");
+}
+
+/// 客户端在内层 data 往返中断开：先观察外层 abort 再放行内层，禁止把迟到的 data 回信读成 abort 回信。
+#[tokio::test]
+async fn client_disconnect_aborts_open_streams_on_their_own_workers() {
+    use tokio::io::AsyncWriteExt as _;
+    let home = TestHome::new();
+    let (up, _) = upstream(&[200]).await;
+    let gate = home.path().join("release");
+    let cfg = layer(&home, "outer", "'stream'", &["stream-echo"])
+        + &layer(
+            &home,
+            "inner",
+            "'stream'",
+            &["stream-gate", gate.to_str().unwrap()],
+        )
+        .replace(
+            "env={",
+            &format!(
+                "env={{ECHO_OBSERVE={},",
+                serde_json::to_string(&home.path().join("pids")).unwrap()
+            ),
+        );
+    let (_, url) = running(&home, up, &cfg);
+    let mut conn = tokio::net::TcpStream::connect(url.strip_prefix("http://").unwrap())
+        .await
+        .unwrap();
+    conn.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    observed_stage(&home, "inner", "stream", 2).await;
+    observed_stage(&home, "outer", "stream", 2).await;
+    drop(conn);
+    let outer = observed_stage(&home, "outer", "stream", 3).await;
+    assert_eq!(
+        outer[2]["reason"],
+        serde_json::json!({"code":"client_gone"})
+    );
+    std::fs::write(gate, b"release").unwrap();
+    let inner = observed_stage(&home, "inner", "stream", 3).await;
+    for f in [&outer, &inner] {
+        assert_eq!(f[2]["event"], "abort");
+        assert_eq!(f[2]["reason"], serde_json::json!({"code":"client_gone"}));
+        assert_eq!(f[2]["stream_id"], f[0]["stream_id"]);
+        assert_eq!(f[2]["seq"], 3);
+    }
+    let pids: Vec<_> = frames(&home, "pids")
+        .into_iter()
+        .filter(|o| o["event"] == "stream")
+        .collect();
+    assert_eq!(pids.len(), 3);
+    assert!(pids.iter().all(|o| o["pid"] == pids[0]["pid"]));
+}
+/// 内层拒绝与进程故障是不同的中断；外层收到 abort 而不是 close，使用自己的协议生成结尾。
+#[tokio::test]
+async fn inner_stream_failures_reach_the_outer_abort_with_their_own_code() {
+    for (mode, code) in [
+        ("stream-reject", "format_fail"),
+        ("stream-fault", "format_error"),
+    ] {
+        let home = TestHome::new();
+        let (up, _) = upstream(&[200]).await;
+        let cfg = layer(&home, "outer", "'stream'", &["stream-echo"])
+            + &layer(&home, "inner", "'stream'", &[mode])
+            + "required=true\n";
+        let (client, url) = running(&home, up, &cfg);
+        assert_eq!(
+            client.get(url).send().await.unwrap().text().await.unwrap(),
+            "[[[abort reply]"
+        );
+        let f = frames(&home, "outer");
+        assert_eq!(f.last().unwrap()["event"], "abort");
+        assert_eq!(f.last().unwrap()["reason"]["code"], code);
+    }
+}

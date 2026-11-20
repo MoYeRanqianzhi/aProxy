@@ -27,8 +27,6 @@ pub(super) struct Votes {
     pub(super) decision: Option<Verdict>,
     /// 与决定独立；失败停在链内时这一票不能令游标跳过失败层。
     pub(super) reroute: Option<bool>,
-    /// 将咨询实际发送的头表移交给 retry，不重做编码处理，也不留住正文预览。
-    pub(super) head: Option<wire::ResponseHead>,
 }
 
 /// 正文预览的总预算；先保留开头，剩余预算给结尾。
@@ -354,10 +352,6 @@ pub(super) async fn consult(
         {
             break;
         }
-    }
-    if state.has_format(Stage::Retry) {
-        votes.head =
-            preview.map(|p| wire::ResponseHead::new(p.response.status, p.response.headers));
     }
     Ok(votes)
 }

@@ -700,7 +700,6 @@ pub(super) async fn run_attempts(
             if forward { &[] } else { &rules },
             override_max,
         );
-        let mut observed_head = None;
         let mut voted_by = None;
         let mut explicit_reroute = None;
         reroute = true;
@@ -735,7 +734,6 @@ pub(super) async fn run_attempts(
                     return;
                 }
             };
-            observed_head = votes.head;
             explicit_reroute = votes.reroute;
             reroute = chain_failed || votes.reroute.unwrap_or(true);
             if let Some(verdict) = votes.decision {
@@ -871,18 +869,21 @@ pub(super) async fn run_attempts(
                     if let Some(c) = &mut chain {
                         c.last = Some(f.clone());
                         c.last_response = if reroute && state.has_format(Stage::Retry) {
-                            observed_head.or_else(|| {
-                                // 没有程序看过 decide 时只取头，不为一次重试解码或复制响应体。
-                                let (status, headers) = response
-                                    .as_ref()
-                                    .map(|r| (r.status, &r.headers))
-                                    .or_else(|| partial_head.as_deref().map(|(s, h)| (*s, h)))?;
-                                let view = decide::response_view(status, headers);
-                                Some(aproxy_envelope::ResponseHead::new(
-                                    view.status,
-                                    view.headers,
-                                ))
-                            })
+                            // retry 观察上游原头；decide 所见的解码预览不改变长度或编码元数据。
+                            response
+                                .as_ref()
+                                .map(|r| (r.status, &r.raw_headers))
+                                .or_else(|| partial_head.as_deref().map(|(s, h)| (*s, h)))
+                                .map(|(status, headers)| {
+                                    let mut table = crate::transform::headers_to_btreemap(headers);
+                                    if let Some(len) = headers
+                                        .get(http::header::CONTENT_LENGTH)
+                                        .and_then(|v| v.to_str().ok())
+                                    {
+                                        table.insert("content-length".into(), len.into());
+                                    }
+                                    aproxy_envelope::ResponseHead::new(status.as_u16(), table)
+                                })
                         } else {
                             None
                         };

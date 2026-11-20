@@ -570,7 +570,7 @@ pub(super) async fn forward_response(
                                 && tx
                                     .send(ForwardResult::NetworkError(
                                         failure.clone(),
-                                        Some(Box::new((status, attempt_headers(resp.headers())))),
+                                        Some(Box::new((status, resp.headers().clone()))),
                                     ))
                                     .is_ok()
                         });

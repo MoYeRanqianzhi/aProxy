@@ -307,6 +307,10 @@ async fn retry_last_response_carries_each_upstream_head_without_the_body() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
             .await
             .unwrap();
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gzip, b"no").unwrap();
+        let compressed = gzip.finish().unwrap();
+        let compressed_len = compressed.len().to_string();
         let server = tokio::spawn(async move {
             for (status, wait, body) in [
                 (429, 5, "no"),
@@ -317,10 +321,20 @@ async fn retry_last_response_carries_each_upstream_head_without_the_body() {
                 let (mut sock, _) = listener.accept().await.unwrap();
                 let mut lines = tokio::io::BufReader::new(&mut sock).lines();
                 while !lines.next_line().await.unwrap().unwrap().is_empty() {}
+                let (encoding, len, payload) = if wait == 5 {
+                    (
+                        "Content-Encoding: gzip\r\n",
+                        compressed.len(),
+                        compressed.as_slice(),
+                    )
+                } else {
+                    ("", 2, body.as_bytes())
+                };
                 let reply = format!(
-                    "HTTP/1.1 {status} Test\r\nConnection: close\r\nRetry-After: {wait}\r\nX-Multi: first\r\nX-Multi: second\r\nContent-Length: 2\r\n\r\n{body}"
+                    "HTTP/1.1 {status} Test\r\nConnection: close\r\nRetry-After: {wait}\r\nX-Multi: first\r\nX-Multi: second\r\n{encoding}Content-Length: {len}\r\n\r\n"
                 );
                 sock.write_all(reply.as_bytes()).await.unwrap();
+                sock.write_all(payload).await.unwrap();
                 sock.shutdown().await.unwrap();
             }
         });
@@ -348,9 +362,26 @@ async fn retry_last_response_carries_each_upstream_head_without_the_body() {
             assert_eq!(head.as_object().unwrap().len(), 2);
             assert_eq!(head["headers"]["retry-after"], wait);
             assert_eq!(head["headers"]["x-multi"], "first");
-            if policy {
+            if i == 0 {
+                assert_eq!(head["headers"]["content-encoding"], "gzip");
+                assert_eq!(head["headers"]["content-length"], compressed_len);
+                if policy {
+                    let decide = &frames(&home, "policy")[i + 1]["response"];
+                    assert!(decide["headers"].get("content-encoding").is_none());
+                    assert_eq!(decide["body"], "no");
+                }
+            } else if policy {
+                let mut expected = head["headers"].clone();
                 assert_eq!(
-                    head["headers"],
+                    expected
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("content-length")
+                        .unwrap(),
+                    "2"
+                );
+                assert_eq!(
+                    expected,
                     frames(&home, "policy")[i + 1]["response"]["headers"]
                 );
             }

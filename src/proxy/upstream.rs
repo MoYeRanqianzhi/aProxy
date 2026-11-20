@@ -184,7 +184,7 @@ pub(super) async fn gather_response(
                 // 头已经到达但半截实体不能用于 stop 的回放。仅在 decide 或 retry 有订阅者时保留这份观测。
                 let head = (state.has_format(crate::config::file::Stage::Decide)
                     || state.has_format(crate::config::file::Stage::Retry))
-                .then(|| Box::new((status, resp_headers)));
+                .then(|| Box::new((status, raw_headers)));
                 return ForwardResult::NetworkError(failure, head);
             }
         }

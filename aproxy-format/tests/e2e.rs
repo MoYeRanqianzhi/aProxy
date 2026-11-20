@@ -610,6 +610,13 @@ fn convert_preserves_text_tools_usage_and_stop_in_all_six_directions() {
                 let r=w.frame(json!({"stage":"stream","event":"data","stream_id":"r/1","data":format!("data: {event}\r\n\r\n")}));
                 output.push_str(r["data"].as_str().unwrap());
             }
+            if upstream == "openai_chat" {
+                output.push_str(
+                    stream_frame(&mut w, "data", "data: [DONE]\n\n")["data"]
+                        .as_str()
+                        .unwrap(),
+                );
+            }
             assert!(
                 output.contains("hello λ"),
                 "must emit before close: {upstream}->{client}"
@@ -1017,5 +1024,61 @@ fn semantic_budget_counts_complete_events_across_frames() {
         !stream_frame(&mut w, "close", "")
             .to_string()
             .contains("response.completed")
+    );
+}
+
+/// Chat 的原因不是运输层终点；Messages 不接受 Chat 的哨兵。真终点之后连半帧也不能影响结果。
+#[test]
+fn only_native_terminal_events_complete_a_stream() {
+    let mut w = Worker::new(&[
+        "convert",
+        "--from",
+        "openai_responses",
+        "--to",
+        "openai_chat",
+    ]);
+    let finish = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+    open_stream(&mut w, "text/event-stream");
+    assert!(
+        !stream_frame(&mut w, "data", finish)
+            .to_string()
+            .contains("response.completed")
+    );
+    assert!(
+        stream_frame(&mut w, "close", "")["data"]
+            .as_str()
+            .unwrap()
+            .contains("event: error")
+    );
+    open_stream(&mut w, "text/event-stream");
+    stream_frame(&mut w, "data", finish);
+    stream_frame(
+        &mut w,
+        "data",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":3}}\n\n",
+    );
+    let mut out = stream_frame(&mut w, "data", "data: [DONE]\n\ndata: ignored")["data"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    out.push_str(
+        stream_frame(&mut w, "close", "")["data"]
+            .as_str()
+            .unwrap_or(""),
+    );
+    assert!(out.contains("response.completed") && out.contains("\"input_tokens\":8"));
+    let mut m = Worker::new(&[
+        "convert",
+        "--from",
+        "openai_chat",
+        "--to",
+        "anthropic_messages",
+    ]);
+    open_stream(&mut m, "text/event-stream");
+    assert!(
+        stream_frame(&mut m, "data", "data: [DONE]\n\n")["data"]
+            .as_str()
+            .unwrap()
+            .contains("\"error\"")
     );
 }

@@ -30,8 +30,8 @@ pub(super) struct Events {
     first: bool,
     /// 已见协议结束标志；Chat 的 usage 块可能在 finish_reason 之后。
     terminal: bool,
-    /// 显式 [DONE] 之后不再接纳数据。
-    done: bool,
+    /// Chat 的 finish_reason 可能早于最后一个 usage 块；只保留原因，到 [DONE] 才交给编解码器。
+    chat_finishes: Vec<Value>,
 }
 impl Events {
     /// 每次 open 初始化，不把上一条流的输出索引或 usage 带到下一条。
@@ -46,13 +46,16 @@ impl Events {
             after_cr: false,
             first: true,
             terminal: false,
-            done: false,
+            chat_finishes: Vec::new(),
         }
     }
     /// 将已经完整的事件变成立即可交付的目标帧，不等待下一次 data 或 close。
     pub(super) fn feed(&mut self, bytes: &[u8]) -> Result<String, Fault> {
         let mut output = String::new();
         for &b in bytes {
+            if self.terminal {
+                break;
+            }
             if std::mem::take(&mut self.after_cr) && b == b'\n' {
                 continue;
             }
@@ -91,23 +94,36 @@ impl Events {
             }
         }
         let data = data.trim();
-        if data.is_empty() || self.done {
+        if data.is_empty() {
             return Ok(());
         }
         if data == "[DONE]" {
-            self.done = true;
+            if self.source != F::OpenAiChat {
+                return Err(malformed());
+            }
             self.terminal = true;
-            return Ok(());
+            let finishes = std::mem::take(&mut self.chat_finishes);
+            if finishes.is_empty() {
+                return Ok(());
+            }
+            return self.translate(&serde_json::json!({"choices":finishes}), output);
         }
         self.remaining = self.remaining.checked_sub(data.len()).ok_or_else(budget)?;
-        let event: Value = serde_json::from_str(data).map_err(|_| malformed())?;
+        let mut event: Value = serde_json::from_str(data).map_err(|_| malformed())?;
         if !event.is_object() {
             return Err(malformed());
         }
-        self.terminal |= match self.source {
-            F::OpenAiChat => event["choices"]
-                .as_array()
-                .is_some_and(|rows| rows.iter().any(|v| v["finish_reason"].is_string())),
+        self.terminal = match self.source {
+            F::OpenAiChat => {
+                if let Some(rows) = event.get_mut("choices").and_then(Value::as_array_mut) {
+                    for row in rows {
+                        if row["finish_reason"].is_string() {
+                            self.chat_finishes.push(serde_json::json!({"index":row["index"],"delta":{},"finish_reason":row["finish_reason"].take()}));
+                        }
+                    }
+                }
+                false
+            }
             F::AnthropicMessages => {
                 matches!(event["type"].as_str(), Some("message_stop" | "error"))
             }
@@ -116,9 +132,13 @@ impl Events {
                 Some("response.completed" | "response.incomplete" | "response.failed" | "error")
             ),
         } || event.get("error").is_some();
+        self.translate(&event, output)
+    }
+    /// 已确认的源事件才进入语义层，目标端的终态不能早于源端的完成标志。
+    fn translate(&mut self, event: &Value, output: &mut String) -> Result<(), Fault> {
         let events = self
             .engine
-            .translate_event(&mut self.state, self.source, self.target, &event)
+            .translate_event(&mut self.state, self.source, self.target, event)
             .map_err(|_| malformed())?;
         render(self.target, events, output)
     }
@@ -227,6 +247,9 @@ mod tests {
                         input.push_str(eol);
                     }
                     input.push_str(eol);
+                }
+                if source == F::OpenAiChat {
+                    input.push_str("data: [DONE]\n\n");
                 }
                 let run = |step| {
                     let mut s = Events::new(source, target);

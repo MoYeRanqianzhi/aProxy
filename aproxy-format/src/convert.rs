@@ -59,7 +59,10 @@ enum Entity {
     /// 直接转发每个数据片段。
     Pass,
     /// 已交付客户端协议的错误结尾，继续消费上游但绝不再转出字节。
-    Ended,
+    Ended(
+        /// 前缀填满回信时留给下一次 data、close 或 abort 的错误尾部。
+        Option<String>,
+    ),
     /// 跨协议 SSE：持有单个未结束事件和各协议的语义状态。
     Sse(Box<crate::events::Events>),
     /// 只在跨协议非 SSE 实体结束后转换 JSON。
@@ -398,12 +401,21 @@ impl Convert {
                 .ok_or(Fault::new("流未打开", "stream is not open"))?
             {
                 Entity::Pass => r.data = w::Data::from_bytes(d.as_bytes().to_vec()),
-                Entity::Ended => r.data = w::Data::Text(String::new()),
+                Entity::Ended(tail) => r.data = w::Data::Text(tail.take().unwrap_or_default()),
                 Entity::Sse(events) => match events.feed(d.as_bytes(), capacity) {
                     Ok(out) => r.data = w::Data::Text(out),
-                    Err(fault) => {
-                        r.data = w::Data::Text(events.ending(&fault));
-                        self.stream = Some(Entity::Ended);
+                    Err((mut prefix, fault)) => {
+                        let ending = events.ending(&fault);
+                        let remaining =
+                            capacity.saturating_sub(crate::events::escaped_bytes(&prefix));
+                        let tail = if crate::events::escaped_bytes(&ending) <= remaining {
+                            prefix.push_str(&ending);
+                            None
+                        } else {
+                            Some(ending)
+                        };
+                        r.data = w::Data::Text(prefix);
+                        self.stream = Some(Entity::Ended(tail));
                     }
                 },
                 Entity::InvalidJson(_) => r.data = w::Data::Text(String::new()),
@@ -417,6 +429,7 @@ impl Convert {
                 }
             },
             w::StreamEvent::Close => match self.stream.take() {
+                Some(Entity::Ended(tail)) => r.data = w::Data::Text(tail.unwrap_or_default()),
                 Some(Entity::Json(client, upstream, b)) => {
                     r.data = w::Data::Text(match Self::json(client, upstream, &b) {
                         Ok(v) if crate::events::escaped_bytes(&v) <= capacity => v,
@@ -440,6 +453,7 @@ impl Convert {
                 _ => (),
             },
             w::StreamEvent::Abort { .. } => match self.stream.take() {
+                Some(Entity::Ended(tail)) => r.data = w::Data::Text(tail.unwrap_or_default()),
                 Some(Entity::Sse(events)) => r.data = w::Data::Text(events.abort()),
                 Some(Entity::Json(client, _, _) | Entity::InvalidJson(client)) => {
                     r.data = w::Data::Text(Self::error_json(client))

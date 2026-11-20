@@ -71,8 +71,23 @@ impl Events {
         }
     }
     /// 将已经完整的事件变成立即可交付的目标帧，不等待下一次 data 或 close。
-    pub(super) fn feed(&mut self, bytes: &[u8], capacity: usize) -> Result<String, Fault> {
+    pub(super) fn feed(
+        &mut self,
+        bytes: &[u8],
+        capacity: usize,
+    ) -> Result<String, (String, Fault)> {
         let mut output = Bounded::new(capacity);
+        let result = self.read_events(bytes, &mut output);
+        if let Some(next) = output.next_sequence {
+            self.next_sequence = next;
+        }
+        match result {
+            Ok(()) => Ok(output.text),
+            Err(fault) => Err((output.text, fault)),
+        }
+    }
+    /// 以源事件而非管道消息为交付边界。单个失败事件的部分渲染撤回，前面完整事件仍可交付。
+    fn read_events(&mut self, bytes: &[u8], output: &mut Bounded) -> Result<(), Fault> {
         for &b in bytes {
             if self.terminal {
                 break;
@@ -83,7 +98,12 @@ impl Events {
             if matches!(b, b'\r' | b'\n') {
                 self.after_cr = b == b'\r';
                 if self.frame.is_empty() || self.frame.ends_with(b"\n") {
-                    self.dispatch(&mut output)?;
+                    let start = (output.text.len(), output.next_sequence);
+                    if let Err(fault) = self.dispatch(output) {
+                        output.text.truncate(start.0);
+                        output.next_sequence = start.1;
+                        return Err(fault);
+                    }
                     self.frame.clear();
                     continue;
                 }
@@ -98,10 +118,7 @@ impl Events {
                 ));
             }
         }
-        if let Some(next) = output.next_sequence {
-            self.next_sequence = next;
-        }
-        Ok(output.text)
+        Ok(())
     }
     /// 逐行提取 data；注释、重连参数和空事件不是提供方的 JSON，不能送入语义层。
     fn dispatch(&mut self, output: &mut Bounded) -> Result<(), Fault> {
@@ -598,7 +615,7 @@ mod tests {
                     let mut s = Events::new(source, target, false, 64 << 20);
                     let mut out = String::new();
                     for b in input.as_bytes().chunks(step) {
-                        out += &s.feed(b, 64 << 20).map_err(|e| e.wire).unwrap();
+                        out += &s.feed(b, 64 << 20).map_err(|(_, e)| e.wire).unwrap();
                     }
                     out += &s.finish(64 << 20).map_err(|e| e.wire).unwrap();
                     out
@@ -662,7 +679,7 @@ mod tests {
                 let mut feed = |s: &str| {
                     stream
                         .feed(s.as_bytes(), 64 << 20)
-                        .map_err(|f| f.wire)
+                        .map_err(|(_, f)| f.wire)
                         .unwrap()
                 };
                 feed(&format!("data: {start}\n\n"));
@@ -709,7 +726,7 @@ mod tests {
             json!({"type":"response.created","response":{"id":"fixture","model":"m".repeat(256)}});
         stream
             .feed(format!("data: {start}\n\n").as_bytes(), 2048)
-            .map_err(|f| f.wire)
+            .map_err(|(_, f)| f.wire)
             .unwrap();
         let parts = vec![json!({"type":"output_text","text":"part"}); 12];
         let end = json!({"type":"response.completed","response":{"output":[{"type":"message","content":parts}]}});
@@ -717,6 +734,7 @@ mod tests {
             stream
                 .feed(format!("data: {end}\n\n").as_bytes(), 2048)
                 .unwrap_err()
+                .1
                 .wire,
             LIMIT_REASON
         );

@@ -1046,6 +1046,48 @@ fn malformed_stream_ends_in_the_client_protocol_only_once() {
     );
 }
 
+/// 相同 SSE 字节合在一帧或拆开发送，都应先交付正常增量，再以客户端协议报错。
+#[test]
+fn valid_prefix_before_bad_event_is_independent_of_pipe_framing() {
+    let delta = "data: {\"id\":\"c\",\"model\":\"m\",\"created\":1,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"visible text\"}}]}\n\n";
+    for bad in ["data: broken\n\n", "data: {\"error\":{}}\n\n"] {
+        let mut w = Worker::new(&[
+            "convert",
+            "--from",
+            "openai_responses",
+            "--to",
+            "openai_chat",
+        ]);
+        for split in [true, false] {
+            open_stream(&mut w, "text/event-stream");
+            let mut transcript = String::new();
+            for chunk in if split {
+                vec![delta.into(), bad.into()]
+            } else {
+                vec![format!("{delta}{bad}")]
+            } {
+                transcript += stream_frame(&mut w, "data", &chunk)["data"]
+                    .as_str()
+                    .unwrap();
+            }
+            transcript += stream_frame(&mut w, "close", "")["data"]
+                .as_str()
+                .unwrap_or("");
+            let events: Vec<Value> = transcript
+                .lines()
+                .filter_map(|l| l.strip_prefix("data: "))
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            assert!(events.iter().any(|e| e["delta"] == "visible text"));
+            for (i, e) in events.iter().enumerate() {
+                assert_eq!(e["sequence_number"], i);
+            }
+            assert_eq!(events.last().unwrap()["type"], "error");
+            assert_eq!(events.iter().filter(|e| e["type"] == "error").count(), 1);
+        }
+    }
+}
+
 /// 六个方向都把源协议的失败变成一个有类型的本地错误；正常 EOF 和随后的断线均不再重复。
 #[test]
 fn provider_errors_emit_one_typed_client_error() {

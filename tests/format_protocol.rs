@@ -3602,11 +3602,15 @@ async fn forward_without_request_programs_streams_the_request_body() {
         let first = first.clone();
         async move {
             let mut f = req.into_body().into_data_stream();
-            let a = f.next().await.unwrap().unwrap();
-            assert_eq!(a, "one");
-            first.notify_one();
-            let b = f.next().await.unwrap().unwrap();
-            assert_eq!(b, "two");
+            // HTTP 不保留应用的分块边界；先确认前缀，再读到真正 EOF，免得早关上传吞掉响应。
+            let mut received = Vec::new();
+            while let Some(chunk) = f.next().await {
+                received.extend_from_slice(&chunk.unwrap());
+                if received == b"one" {
+                    first.notify_one();
+                }
+            }
+            assert_eq!(received, b"onetwo");
             "received"
         }
     });

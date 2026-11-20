@@ -312,3 +312,160 @@ fn translate_is_a_one_off_request_converter() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(v["messages"].is_array() && v.get("seq").is_none());
 }
+
+/// 同一语义的三种原生样本：六条路径分别核对请求、整包响应、实时数据与截断收尾。
+#[test]
+fn convert_preserves_text_tools_usage_and_stop_in_all_six_directions() {
+    let fixtures: Value = serde_json::from_str(include_str!("fixtures/protocols.json")).unwrap();
+    let formats = ["anthropic_messages", "openai_chat", "openai_responses"];
+    for client in formats {
+        for upstream in formats {
+            if upstream == client {
+                continue;
+            }
+            let mut w = Worker::new(&["convert", "--from", client, "--to", upstream]);
+            let req = w.frame(request(
+                "https://relay.test/custom",
+                "/custom",
+                fixtures[client]["request"].clone(),
+            ));
+            let body: Value =
+                serde_json::from_str(req["request"]["body"].as_str().unwrap()).unwrap();
+            let tool = &body["tools"][0];
+            assert_eq!(
+                tool.get("name").unwrap_or(&tool["function"]["name"]),
+                "lookup"
+            );
+            let messages = if upstream == "openai_responses" {
+                &body["input"]
+            } else {
+                &body["messages"]
+            };
+            assert!(
+                messages.to_string().contains("hello λ"),
+                "{client}->{upstream}: {body}"
+            );
+            let reply = w.frame(response(
+                &req["state"],
+                &fixtures[upstream]["response"].to_string(),
+            ));
+            let buf: Value =
+                serde_json::from_str(reply["response"]["body"].as_str().unwrap()).unwrap();
+            let (text, name, args, stop, a, b) = match client {
+                "anthropic_messages" => (
+                    &buf["content"][0]["text"],
+                    &buf["content"][1]["name"],
+                    buf["content"][1]["input"].clone(),
+                    &buf["stop_reason"],
+                    &buf["usage"]["input_tokens"],
+                    &buf["usage"]["output_tokens"],
+                ),
+                "openai_chat" => {
+                    let c = &buf["choices"][0];
+                    let tool = &c["message"]["tool_calls"][0]["function"];
+                    (
+                        &c["message"]["content"],
+                        &tool["name"],
+                        serde_json::from_value::<String>(tool["arguments"].clone())
+                            .ok()
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or(Value::Null),
+                        &c["finish_reason"],
+                        &buf["usage"]["prompt_tokens"],
+                        &buf["usage"]["completion_tokens"],
+                    )
+                }
+                _ => {
+                    let out = buf["output"].as_array().unwrap();
+                    let msg = out.iter().find(|x| x["type"] == "message").unwrap();
+                    let tool = out.iter().find(|x| x["type"] == "function_call").unwrap();
+                    (
+                        &msg["content"][0]["text"],
+                        &tool["name"],
+                        serde_json::from_str(tool["arguments"].as_str().unwrap()).unwrap(),
+                        &buf["status"],
+                        &buf["usage"]["input_tokens"],
+                        &buf["usage"]["output_tokens"],
+                    )
+                }
+            };
+            assert_eq!(
+                (text, name, args, stop, a, b),
+                (
+                    &json!("hello λ"),
+                    &json!("lookup"),
+                    json!({"q":"x"}),
+                    &json!(match client {
+                        "anthropic_messages" => "tool_use",
+                        "openai_chat" => "tool_calls",
+                        _ => "completed",
+                    }),
+                    &json!(7),
+                    &json!(3)
+                ),
+                "{upstream}->{client}: {buf}"
+            );
+            let open = json!({"stage":"stream","event":"open","request_id":"r","stream_id":"r/1","state":req["state"],"request":{"method":"POST","url":"https://relay.test/custom"},"response":{"status":200,"headers":{"content-type":"text/event-stream; charset=utf-8"}}});
+            let tail = w.frame(open.clone())["abort_tail"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let mut output = String::new();
+            for event in fixtures[upstream]["events"].as_array().unwrap() {
+                let r=w.frame(json!({"stage":"stream","event":"data","stream_id":"r/1","data":format!("data: {event}\r\n\r\n")}));
+                output.push_str(r["data"].as_str().unwrap());
+            }
+            assert!(
+                output.contains("hello λ"),
+                "must emit before close: {upstream}->{client}"
+            );
+            let close = w.frame(json!({"stage":"stream","event":"close","stream_id":"r/1"}));
+            output.push_str(close["data"].as_str().unwrap_or(""));
+            assert!(
+                output.contains("lookup") && output.contains("\\\"q\\\""),
+                "{upstream}->{client}: {output}"
+            );
+            let events: Vec<Value> = output
+                .lines()
+                .filter_map(|l| l.strip_prefix("data: "))
+                .filter(|s| *s != "[DONE]")
+                .map(|s| serde_json::from_str(s).unwrap())
+                .collect();
+            let terminal = match client {
+                "anthropic_messages" => events.iter().find(|e| {
+                    e["type"] == "message_delta"
+                        && e["delta"]["stop_reason"] == "tool_use"
+                        && e["usage"]["input_tokens"] == 7
+                        && e["usage"]["output_tokens"] == 3
+                }),
+                "openai_chat" => {
+                    assert!(
+                        output.ends_with("data: [DONE]\n\n")
+                            && events
+                                .iter()
+                                .any(|e| e["choices"][0]["finish_reason"] == "tool_calls")
+                    );
+                    events.iter().find(|e| {
+                        e["usage"]["prompt_tokens"] == 7 && e["usage"]["completion_tokens"] == 3
+                    })
+                }
+                _ => events.iter().find(|e| {
+                    e["type"] == "response.completed"
+                        && e["response"]["usage"]["input_tokens"] == 7
+                        && e["response"]["usage"]["output_tokens"] == 3
+                }),
+            };
+            assert!(terminal.is_some(), "{upstream}->{client}: {output}");
+            w.frame(open);
+            let partial=w.frame(json!({"stage":"stream","event":"data","stream_id":"r/1","data":"data: {\"partial\":"}));
+            assert_eq!(partial["data"], "");
+            let abort=w.frame(json!({"stage":"stream","event":"abort","stream_id":"r/1","reason":{"code":"upstream_body_interrupted"}}));
+            assert_eq!(abort["data"], tail);
+            assert!(
+                tail.contains("stream conversion aborted")
+                    && tail.ends_with("\n\n")
+                    && !tail.contains("[DONE]")
+            );
+        }
+    }
+}

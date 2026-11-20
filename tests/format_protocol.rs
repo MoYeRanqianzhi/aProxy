@@ -5968,3 +5968,45 @@ async fn interrupted_forward_gather_consults_decide_before_exposing_a_prefix() {
         }
     }
 }
+
+/// 真实转发链：上游尚不许结束时客户端已经收到目标协议的文本；随后中断只产生目标协议错误。
+#[tokio::test]
+async fn official_convert_delivers_live_text_then_protocol_abort() {
+    use axum::body::{Body, Bytes};
+    use futures_util::StreamExt as _;
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let halt = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = halt.clone();
+    let app=axum::Router::new().fallback(move |_: Bytes| {let gate=gate.clone(); async move {
+        let events=futures_util::stream::once(async {Ok::<_,std::io::Error>(Bytes::from_static(b"data: {\"id\":\"chatcmpl-test\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"live now\"}}]}\n\n"))}).chain(futures_util::stream::once(async move {gate.acquire().await.unwrap().forget();Err(std::io::Error::other("cut"))}));
+        axum::response::Response::builder().header("content-type","text/event-stream").body(Body::from_stream(events)).unwrap()
+    }});
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = String::from("delivery='forward'\n")
+        + &official_layer(
+            "convert",
+            "'request','stream'",
+            &["convert", "--from", "auto", "--to", "openai_chat"],
+        )
+        + "required=true\n";
+    let (client, url) = running(&home, up, &cfg);
+    let mut res=client.post(format!("{url}/v1/messages")).json(&serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":20,"stream":true})).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    let mut bytes = Vec::new();
+    while !String::from_utf8_lossy(&bytes).contains("live now") {
+        bytes.extend(res.chunk().await.unwrap().expect("no real-time text"));
+    }
+    assert!(String::from_utf8_lossy(&bytes).contains("event: content_block_delta"));
+    halt.add_permits(1);
+    bytes.extend(res.bytes().await.unwrap());
+    let body = String::from_utf8(bytes).unwrap();
+    assert!(
+        body.contains("event: error\ndata:")
+            && body.contains("stream conversion aborted")
+            && !body.contains("message_stop")
+    );
+}

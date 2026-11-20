@@ -3,6 +3,7 @@
 mod config;
 mod convert;
 mod detect;
+mod events;
 mod keys;
 mod route;
 mod translate;

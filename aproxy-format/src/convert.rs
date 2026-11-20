@@ -22,6 +22,8 @@ pub struct Convert {
 enum Entity {
     /// 直接转发每个数据片段。
     Pass,
+    /// 跨协议 SSE：持有单个未结束事件和各协议的语义状态。
+    Sse(Box<crate::events::Events>),
     /// 只在跨协议非 SSE 实体结束后转换 JSON。
     Json(F, Vec<u8>),
 }
@@ -167,10 +169,9 @@ impl Convert {
                         .next()
                         .is_some_and(|t| t.trim().eq_ignore_ascii_case("text/event-stream"))
                 }) {
-                    return Err(Fault::new(
-                        "暂不支持跨协议事件流",
-                        "cross-protocol streaming is not supported",
-                    ));
+                    let events = crate::events::Events::new(self.to, client);
+                    r.abort_tail = Some(events.abort().into());
+                    Entity::Sse(Box::new(events))
                 } else {
                     Entity::Json(client, Vec::new())
                 });
@@ -181,6 +182,7 @@ impl Convert {
                 .ok_or(Fault::new("流未打开", "stream is not open"))?
             {
                 Entity::Pass => r.data = w::Data::from_bytes(d.as_bytes().to_vec()),
+                Entity::Sse(events) => r.data = w::Data::Text(events.feed(d.as_bytes())?),
                 Entity::Json(_, b) => {
                     if b.len().saturating_add(d.as_bytes().len()) > 64 * 1024 * 1024 {
                         return Err(Fault::new(
@@ -192,13 +194,15 @@ impl Convert {
                     r.data = w::Data::Text(String::new());
                 }
             },
-            w::StreamEvent::Close => {
-                if let Some(Entity::Json(client, b)) = self.stream.take() {
-                    r.data = w::Data::Text(self.json(client, &b)?);
-                }
-            }
+            w::StreamEvent::Close => match self.stream.take() {
+                Some(Entity::Json(client, b)) => r.data = w::Data::Text(self.json(client, &b)?),
+                Some(Entity::Sse(events)) => r.data = w::Data::Text(events.finish()?),
+                _ => (),
+            },
             w::StreamEvent::Abort { .. } => {
-                self.stream = None;
+                if let Some(Entity::Sse(events)) = self.stream.take() {
+                    r.data = w::Data::Text(events.abort().into());
+                }
             }
             _ => return Err(Fault::new("不支持的流事件", "unsupported stream event")),
         };

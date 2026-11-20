@@ -142,7 +142,10 @@ impl Route {
             url.set_path(&format!(
                 "{}{}",
                 url.path().trim_end_matches('/'),
-                incoming.path()
+                m.client
+                    .path
+                    .split_once('?')
+                    .map_or(m.client.path.as_str(), |(path, _)| path)
             ));
             if url.origin() == incoming.origin() {
                 url.set_query(incoming.query());

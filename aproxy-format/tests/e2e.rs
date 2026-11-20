@@ -661,3 +661,22 @@ fn auto_detect_refuses_overlapping_message_shapes_on_custom_paths() {
         assert_eq!(r["state"], state);
     }
 }
+
+/// 上一上游的租户路径不属于客户端，两个基址各带前缀时只保留目标前缀一次。
+#[test]
+fn preserved_path_comes_from_the_client_not_the_previous_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("route.toml");
+    std::fs::write(
+        &file,
+        "[[channel]]\nid='b'\nurl='https://b.test/tenant-b'\npreserve_path=true",
+    )
+    .unwrap();
+    let mut w = Worker::new(&["route", "--config", file.to_str().unwrap()]);
+    let r = w.frame(request(
+        "https://a.test/tenant-a/v1/messages?q=secret",
+        "/v1/messages?q=secret",
+        json!({"model":"m"}),
+    ));
+    assert_eq!(r["request"]["url"], "https://b.test/tenant-b/v1/messages");
+}

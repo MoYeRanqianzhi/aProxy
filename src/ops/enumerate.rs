@@ -530,7 +530,7 @@ mod tests {
                 r#"{"instances":["#,
                 r#"{"port":12346,"liveness":"live","instance":{"pid":4321,"start":"w:1","instance_id":"19ac3f2e8b5d1a2b","version":"0.2.0","listen_addr":"127.0.0.1:12346","config_path":null,"base_url":"https://api.example.com","started_at":1760190000000,"log_path":null,"foreground":false},"#,
                 r#""status":{"state":"serving","behavior":{"delivery":"retry","disk_cache":true,"keepalive":{"trigger":"any","interval_secs":15},"retry_rules":1,"history":{"body_budget_mb":64}},"#,
-                r#""activity":{"last_request_at":1760190000000,"requests_total":3,"retries_total":1,"rescued_total":1,"in_flight":0,"retrying":0,"by_code":{},"buckets":{"width_secs":0,"requests":[],"retries":[],"failures":[]},"last_error":null},"#,
+                r#""activity":{"last_request_at":1760190000000,"requests_total":3,"retries_total":1,"rescued_total":1,"upgraded_total":0,"in_flight":0,"retrying":0,"by_code":{},"buckets":{"width_secs":0,"requests":[],"retries":[],"failures":[]},"last_error":null},"#,
                 r#""ops":["ping"],"features":[]},"restore_pending":false},"#,
                 r#"{"port":12347,"liveness":"unresponsive","instance":{"pid":4400,"start":"w:2","instance_id":"19ac3f2e8b5d1a2b","version":"0.2.0","listen_addr":"127.0.0.1:12347","config_path":null,"base_url":"https://api.example.com","started_at":1760190000000,"log_path":null,"foreground":false},"restore_pending":false},"#,
                 r#"{"port":12348,"liveness":"incompatible","instance":null,"reason":{"code":"unsupported_version","details":{"supported":[2]}},"restore_pending":false},"#,

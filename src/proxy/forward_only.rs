@@ -121,13 +121,13 @@ impl RequestTap {
             ExchangeCtx::finish_digest(&out, hash);
         }
         if let Some(out) = self.flag_out.take() {
-            self.exact = if let Some(parser) = self.parser.take() {
-                parser.finish()
-            } else {
-                Some(json_requests_stream(serde_json::Deserializer::from_slice(
-                    &self.prefix,
-                )))
-            };
+            // 无论正文是否超过历史前缀，都只把完整文档的判定发布给后续层。
+            let parser = self.parser.take().unwrap_or_else(|| {
+                let mut parser = super::live_flag::LiveFlag::new();
+                parser.feed(&self.prefix);
+                parser
+            });
+            self.exact = parser.finish();
             if let Some(flag) = self.exact {
                 let _ = out.set(flag);
             }

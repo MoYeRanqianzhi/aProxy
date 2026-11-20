@@ -123,7 +123,7 @@ impl Text {
     }
 }
 
-/// 未完成的实时 JSON 探针。超过深度预算时保留未知，坏 JSON 与普通非流请求同样判为 false。
+/// 未完成的实时 JSON 探针。超深、损坏或不完整的文档都保留未知，完整非流请求才为 false。
 pub(super) struct LiveFlag {
     /// 每层一个语法状态；仅对实际出现的嵌套分配，最多 128 层。
     stack: Vec<Want>,
@@ -268,8 +268,11 @@ impl LiveFlag {
     }
     /// 只有内容完整的根对象能给出 true；取消上传的调用方根本不结算。
     pub(super) fn finish(self) -> Option<bool> {
-        (!self.unknown)
-            .then_some(self.flag && self.stack == [Want::End] && matches!(self.token, Token::None))
+        let complete = matches!(
+            self.token,
+            Token::None | Token::Number(Number::Zero | Number::Int | Number::Frac | Number::Exp)
+        );
+        (!self.unknown && self.stack == [Want::End] && complete).then_some(self.flag)
     }
 }
 
@@ -297,18 +300,23 @@ mod tests {
             br#"{"stream":true,"x":"\uDC00"}"#,
             b"{\"stream\":true,\"x\":\"\xC0\xBD\"}",
             br#"{"stream":true"#,
+            b"null",
+            b"0",
+            b"3.5",
+            b"1e+4",
+            b"3e",
+            b"",
         ];
         for &bytes in cases {
             let expected = serde_json::from_slice::<serde_json::Value>(bytes)
                 .ok()
-                .and_then(|v| v.get("stream").and_then(|x| x.as_bool()))
-                .unwrap_or(false);
+                .map(|v| v["stream"] == true);
             for step in [1, 2, 7, 256] {
                 let mut probe = LiveFlag::new();
                 for part in bytes.chunks(step) {
                     probe.feed(part);
                 }
-                assert_eq!(probe.finish(), Some(expected), "{bytes:?}, split {step}");
+                assert_eq!(probe.finish(), expected, "{bytes:?}, split {step}");
             }
         }
     }

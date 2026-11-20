@@ -1,7 +1,7 @@
 //! Session negotiation, stage inputs and replies. Optional fields are never emitted merely to fill a slot.
 use crate::{
     Data, DecideRequest, Fragment, ReportField, Request, RequestMeta, RequestPatch, Response,
-    ResponsePatch,
+    ResponseHead, ResponsePatch,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -311,6 +311,9 @@ pub struct Retry {
     pub attempt: u32,
     /// Why the previous attempt did not succeed.
     pub last_failure: Failure,
+    /// Previous upstream head; absent if the attempt failed before receiving one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_response: Option<ResponseHead>,
     /// Elapsed request time in milliseconds.
     pub elapsed_ms: u64,
 }
@@ -320,6 +323,7 @@ impl Retry {
         Self {
             attempt,
             last_failure,
+            last_response: None,
             elapsed_ms,
         }
     }

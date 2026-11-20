@@ -79,6 +79,8 @@ pub(super) struct RequestChain {
     stage: Stage,
     /// 下一轮的 retry 信封带着上一次失败；保活也只读这份故障。
     pub(super) last: Option<wire::Failure>,
+    /// 只属于紧邻的上次尝试，不交给心跳；链内失败时清空。
+    pub(super) last_response: Option<wire::ResponseHead>,
     /// retry.elapsed_ms 使用单调时钟，系统对时不会让它倒退。
     started: tokio::time::Instant,
     /// 程序对此请求给出的重试上限，0 是显式无限制。
@@ -124,6 +126,7 @@ impl RequestChain {
             cursor: 0,
             stage: Stage::Request,
             last: None,
+            last_response: None,
             started: tokio::time::Instant::now(),
             max_attempts: None,
             delivery_chosen: false,
@@ -300,14 +303,13 @@ impl RequestChain {
                         ctx.wire_client(),
                     );
                     let frame = if self.stage == Stage::Retry {
-                        wire::Stage::Retry(wire::RetryMessage::new(
-                            m,
-                            wire::Retry::new(
-                                attempt,
-                                self.last.clone().expect("retry follows a failure"),
-                                self.started.elapsed().as_millis() as u64,
-                            ),
-                        ))
+                        let mut retry = wire::Retry::new(
+                            attempt,
+                            self.last.clone().expect("retry follows a failure"),
+                            self.started.elapsed().as_millis() as u64,
+                        );
+                        retry.last_response = self.last_response.clone();
+                        wire::Stage::Retry(wire::RetryMessage::new(m, retry))
                     } else {
                         wire::Stage::Request(m)
                     };

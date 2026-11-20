@@ -297,6 +297,116 @@ async fn program_before_the_retry_segment_is_not_called_again_on_retries() {
     assert_eq!(f[2]["request"]["body"], "prefix");
 }
 
+/// retry 独立订阅就能区分两次限流和一次读到半截的实体；有 decide 时两者看到同一张头表。
+#[tokio::test]
+async fn retry_last_response_carries_each_upstream_head_without_the_body() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    for policy in [false, true] {
+        let home = TestHome::new();
+        let up = free_port();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            for (status, wait, body) in [
+                (429, 5, "no"),
+                (429, 600, "no"),
+                (503, 9, "x"),
+                (200, 0, "ok"),
+            ] {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut lines = tokio::io::BufReader::new(&mut sock).lines();
+                while !lines.next_line().await.unwrap().unwrap().is_empty() {}
+                let reply = format!(
+                    "HTTP/1.1 {status} Test\r\nConnection: close\r\nRetry-After: {wait}\r\nX-Multi: first\r\nX-Multi: second\r\nContent-Length: 2\r\n\r\n{body}"
+                );
+                sock.write_all(reply.as_bytes()).await.unwrap();
+                sock.shutdown().await.unwrap();
+            }
+        });
+        let mut cfg = layer(&home, "keys", "'retry'", &["echo"]);
+        if policy {
+            cfg += &layer(
+                &home,
+                "policy",
+                "'decide'",
+                &["reply", r#"{"decision":"retry","reroute":true}"#],
+            );
+        }
+        let (c, url) = running(&home, up, &cfg);
+        assert_eq!(c.get(url).send().await.unwrap().text().await.unwrap(), "ok");
+        server.await.unwrap();
+        let input = frames(&home, "keys");
+        assert_eq!(input.len(), 4);
+        for (i, (status, wait)) in [(429, "5"), (429, "600"), (503, "9")]
+            .into_iter()
+            .enumerate()
+        {
+            let retry = &input[i + 1]["retry"];
+            let head = &retry["last_response"];
+            assert_eq!(head["status"], status, "{retry}");
+            assert_eq!(head.as_object().unwrap().len(), 2);
+            assert_eq!(head["headers"]["retry-after"], wait);
+            assert_eq!(head["headers"]["x-multi"], "first");
+            if policy {
+                assert_eq!(
+                    head["headers"],
+                    frames(&home, "policy")[i + 1]["response"]["headers"]
+                );
+            }
+        }
+        assert_eq!(
+            input[3]["retry"]["last_failure"]["code"],
+            "upstream_body_interrupted"
+        );
+    }
+}
+
+/// 相邻尝试分别收到头、在链内失败、连接失败；无头的尝试不能继承更早的响应。
+#[tokio::test]
+async fn retry_last_response_omitted_after_chain_and_connect_failures() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[429, 200]).await;
+    let port = free_port();
+    let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+    reserved
+        .bind((std::net::Ipv4Addr::LOCALHOST, port).into())
+        .unwrap();
+    let script = home.path().join("steps.json");
+    std::fs::write(
+        &script,
+        serde_json::json!({
+            "retry:2":{"fail":{"retry":true,"reason":"no dispatch"}},
+            "retry:3":{"request":{"url":format!("http://127.0.0.1:{port}/")}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let cfg = layer(
+        &home,
+        "keys",
+        "'retry'",
+        &["reply-by-stage", script.to_str().unwrap()],
+    );
+    let (c, url) = running(&home, up, &cfg);
+    assert_eq!(c.get(url).send().await.unwrap().status(), 200);
+    let input = frames(&home, "keys");
+    assert_eq!(input.len(), 4);
+    assert_eq!(input[1]["retry"]["last_response"]["status"], 429);
+    for (frame, code) in input[2..]
+        .iter()
+        .zip(["format_fail", "upstream_connect_failed"])
+    {
+        assert_eq!(frame["retry"]["last_failure"]["code"], code);
+        assert!(
+            !frame["retry"]
+                .as_object()
+                .unwrap()
+                .contains_key("last_response")
+        );
+    }
+}
+
 /// 两种主动拒绝都没有上游尝试；程序给的状态、头和体保持原样。
 #[tokio::test]
 async fn fail_without_retry_returns_the_given_response_or_422() {

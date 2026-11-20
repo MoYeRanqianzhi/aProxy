@@ -38,7 +38,7 @@ pub(super) enum Outcome {
         response_bytes: u64,
         /// 有响应的失败也可被 decide 选择原样返回。
         response: Option<UpstreamResponse>,
-        /// 实体没读完时，仅供咨询的头；不能冒充完整响应。
+        /// 实体没读完时，供 decide 和 retry 观察的头；不能冒充完整响应。
         partial_head: Option<Box<(StatusCode, HeaderMap)>>,
     },
     /// 一条重试规则给的尝试次数用完了：不再重试，交付这次失败的响应——客户端拿到真实的
@@ -681,6 +681,7 @@ pub(super) async fn run_attempts(
             if forward { &[] } else { &rules },
             override_max,
         );
+        let mut observed_head = None;
         let mut voted_by = None;
         let mut explicit_reroute = None;
         reroute = true;
@@ -715,25 +716,27 @@ pub(super) async fn run_attempts(
                     return;
                 }
             };
+            observed_head = votes.head;
             explicit_reroute = votes.reroute;
             reroute = chain_failed || votes.reroute.unwrap_or(true);
             if let Some(verdict) = votes.decision {
-                let (original, previous, received) = match outcome {
+                let (original, partial_head, previous, received) = match outcome {
                     Outcome::Retry {
                         response,
                         failure,
                         response_bytes,
+                        partial_head,
                         ..
-                    } => (response, Some(failure), response_bytes),
+                    } => (response, partial_head, Some(failure), response_bytes),
                     Outcome::Exhausted {
                         response, failure, ..
                     } => {
                         let len = response.body.len();
-                        (Some(response), Some(failure), len)
+                        (Some(response), None, Some(failure), len)
                     }
                     Outcome::Deliver(r) => {
                         let len = r.body.len();
-                        (Some(r), None, len)
+                        (Some(r), None, None, len)
                     }
                     _ => unreachable!("local terminal outcomes are not submitted to decide"),
                 };
@@ -774,7 +777,7 @@ pub(super) async fn run_attempts(
                             voted_by = Some(by);
                             outcome = Outcome::Retry {
                                 response: original,
-                                partial_head: None,
+                                partial_head,
                                 failure,
                                 rule: None,
                                 response_bytes: received,
@@ -825,7 +828,7 @@ pub(super) async fn run_attempts(
                 rule,
                 response_bytes,
                 response,
-                ..
+                partial_head,
             } => {
                 if forward && voted_by.is_none() {
                     finish_forward_failure(
@@ -848,6 +851,22 @@ pub(super) async fn run_attempts(
                     f.details = Some(failure.details.clone());
                     if let Some(c) = &mut chain {
                         c.last = Some(f.clone());
+                        c.last_response = if reroute && state.has_format(Stage::Retry) {
+                            observed_head.or_else(|| {
+                                // 没有程序看过 decide 时只取头，不为一次重试解码或复制响应体。
+                                let (status, headers) = response
+                                    .as_ref()
+                                    .map(|r| (r.status, &r.headers))
+                                    .or_else(|| partial_head.as_deref().map(|(s, h)| (*s, h)))?;
+                                let view = decide::response_view(status, headers);
+                                Some(aproxy_envelope::ResponseHead::new(
+                                    view.status,
+                                    view.headers,
+                                ))
+                            })
+                        } else {
+                            None
+                        };
                     }
                     if let Responder::Keepalive { sink, .. } = r {
                         let beat = match sink {

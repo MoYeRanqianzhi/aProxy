@@ -224,6 +224,23 @@ impl RequestPatch {
     }
 }
 
+/// The upstream status and headers from a previous attempt, never its body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ResponseHead {
+    /// HTTP status from the upstream, even if reading the body subsequently failed.
+    pub status: u16,
+    /// The same complete header table supplied to deciding programs.
+    #[serde(deserialize_with = "response_headers")]
+    pub headers: Headers,
+}
+impl ResponseHead {
+    /// Construct a header-only observation without retaining any entity bytes.
+    pub fn new(status: u16, headers: Headers) -> Self {
+        Self { status, headers }
+    }
+}
+
 /// A response as observed at this position in the chain.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]

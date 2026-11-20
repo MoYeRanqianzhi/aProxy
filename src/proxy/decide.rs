@@ -27,6 +27,8 @@ pub(super) struct Votes {
     pub(super) decision: Option<Verdict>,
     /// 与决定独立；失败停在链内时这一票不能令游标跳过失败层。
     pub(super) reroute: Option<bool>,
+    /// 将咨询实际发送的头表移交给 retry，不重做编码处理，也不留住正文预览。
+    pub(super) head: Option<wire::ResponseHead>,
 }
 
 /// 正文预览的总预算；先保留开头，剩余预算给结尾。
@@ -106,10 +108,16 @@ fn read_preview(
     Some((wire::Body::Binary(raw), len - keep as u64, false))
 }
 
+/// 完整响应和半截响应的管道表都来自同一套多值头与编码规则。
+pub(super) fn response_view(status: StatusCode, headers: &HeaderMap) -> wire::Response {
+    let mut response = wire::Response::new(status.as_u16());
+    response.headers = crate::transform::headers_to_btreemap(headers);
+    response
+}
+
 /// 读取上游副本而不是拿走随后要交付的 spool。原始体始终留给停止透传或正常交付。
 async fn observed(upstream: &UpstreamResponse) -> Option<wire::ObservedResponse> {
-    let mut r = wire::Response::new(upstream.status.as_u16());
-    r.headers = crate::transform::headers_to_btreemap(&upstream.headers);
+    let mut r = response_view(upstream.status, &upstream.headers);
     let encoding = request_encoding(&upstream.headers, true);
     let encoding = encoding
         .as_deref()
@@ -240,8 +248,7 @@ pub(super) async fn consult(
         } = outcome
             && preview.is_none()
         {
-            let mut r = wire::Response::new(head.0.as_u16());
-            r.headers = crate::transform::headers_to_btreemap(&head.1);
+            let r = response_view(head.0, &head.1);
             preview = Some(wire::ObservedResponse::new(r));
         }
         if let Some(response) = response
@@ -347,6 +354,10 @@ pub(super) async fn consult(
         {
             break;
         }
+    }
+    if state.has_format(Stage::Retry) {
+        votes.head =
+            preview.map(|p| wire::ResponseHead::new(p.response.status, p.response.headers));
     }
     Ok(votes)
 }

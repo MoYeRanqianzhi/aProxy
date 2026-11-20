@@ -3501,56 +3501,56 @@ async fn optional_stream_program_failing_mid_stream_is_skipped() {
     );
 }
 
-/// 客户端在内层 data 往返中断开：先观察外层 abort 再放行内层，禁止把迟到的 data 回信读成 abort 回信。
+/// 从真实连接看到两层的输出后断开，检查各自独占的进程和连续序号；上游不会先发 EOF。
 #[tokio::test]
 async fn client_disconnect_aborts_open_streams_on_their_own_workers() {
-    use tokio::io::AsyncWriteExt as _;
     let home = TestHome::new();
-    let (up, _) = upstream(&[200]).await;
-    let gate = home.path().join("release");
-    let cfg = layer(&home, "outer", "'stream'", &["stream-echo"])
-        + &layer(
-            &home,
-            "inner",
-            "'stream'",
-            &["stream-gate", gate.to_str().unwrap()],
-        )
-        .replace(
+    let (up, _last) = split_forward_upstream().await;
+    let mut cfg = String::from("delivery='forward'\n");
+    for name in ["outer", "inner"] {
+        cfg += &layer(&home, name, "'stream'", &["stream-echo"]).replace(
             "env={",
             &format!(
                 "env={{ECHO_OBSERVE={},",
-                serde_json::to_string(&home.path().join("pids")).unwrap()
+                serde_json::to_string(&home.path().join(format!("{name}-pids"))).unwrap()
             ),
         );
-    let (_, url) = running(&home, up, &cfg);
-    let mut conn = tokio::net::TcpStream::connect(url.strip_prefix("http://").unwrap())
-        .await
-        .unwrap();
-    conn.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
-        .await
-        .unwrap();
-    observed_stage(&home, "inner", "stream", 2).await;
-    observed_stage(&home, "outer", "stream", 2).await;
-    drop(conn);
-    let outer = observed_stage(&home, "outer", "stream", 3).await;
-    assert_eq!(
-        outer[2]["reason"],
-        serde_json::json!({"code":"client_gone"})
-    );
-    std::fs::write(gate, b"release").unwrap();
-    let inner = observed_stage(&home, "inner", "stream", 3).await;
-    for f in [&outer, &inner] {
-        assert_eq!(f[2]["event"], "abort");
-        assert_eq!(f[2]["reason"], serde_json::json!({"code":"client_gone"}));
-        assert_eq!(f[2]["stream_id"], f[0]["stream_id"]);
-        assert_eq!(f[2]["seq"], 3);
     }
-    let pids: Vec<_> = frames(&home, "pids")
-        .into_iter()
-        .filter(|o| o["event"] == "stream")
-        .collect();
-    assert_eq!(pids.len(), 3);
-    assert!(pids.iter().all(|o| o["pid"] == pids[0]["pid"]));
+    let (client, url) = running(&home, up, &cfg);
+    let mut res = client.get(url).send().await.unwrap();
+    let mut prefix = Vec::new();
+    while prefix.len() < 7 {
+        prefix.extend_from_slice(&res.chunk().await.unwrap().unwrap());
+    }
+    assert_eq!(prefix, b"[[first");
+    drop(res);
+    for name in ["outer", "inner"] {
+        let messages = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let messages = observed_stage(&home, name, "stream", 1).await;
+                if messages.last().is_some_and(|v| v["event"] == "abort") {
+                    break messages;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            messages.last().unwrap()["reason"],
+            serde_json::json!({"code":"client_gone"})
+        );
+        for (idx, frame) in messages.iter().enumerate() {
+            assert_eq!(frame["seq"], idx + 1);
+            assert_eq!(frame["stream_id"], messages[0]["stream_id"]);
+        }
+        let pids: Vec<_> = frames(&home, &format!("{name}-pids"))
+            .into_iter()
+            .filter(|v| v["event"] == "stream")
+            .collect();
+        assert_eq!(pids.len(), messages.len());
+        assert!(pids.iter().all(|v| v["pid"] == pids[0]["pid"]));
+    }
 }
 /// 内层拒绝与进程故障是不同的中断；外层收到 abort 而不是 close，使用自己的协议生成结尾。
 #[tokio::test]
@@ -3577,6 +3577,12 @@ async fn inner_stream_failures_reach_the_outer_abort_with_their_own_code() {
 
 /// 第一块立刻发送，只有测试亲眼见到目标层的进展后才准发第二块；不用睡眠模拟流。
 async fn split_forward_upstream() -> (u16, std::sync::Arc<tokio::sync::Notify>) {
+    split_forward_upstream_tail(b"last").await
+}
+/// 客户端上传作为首块；以指定的末块测试跨 UTF-8 边界和物理 EOF 的顺序。
+async fn split_forward_upstream_tail(
+    tail: &'static [u8],
+) -> (u16, std::sync::Arc<tokio::sync::Notify>) {
     use futures_util::StreamExt as _;
     let port = free_port();
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
@@ -3598,13 +3604,141 @@ async fn split_forward_upstream() -> (u16, std::sync::Arc<tokio::sync::Notify>) 
             let chunks = futures_util::stream::once(async move { Ok::<_, std::io::Error>(first) })
                 .chain(futures_util::stream::once(async move {
                     gate.notified().await;
-                    Ok(bytes::Bytes::from_static(b"last"))
+                    Ok(bytes::Bytes::from_static(tail))
                 }));
             axum::body::Body::from_stream(chunks)
         }
     });
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (port, resume)
+}
+/// 字符跨两个网络块，末尾还剩不完整的 UTF-8。空回信不复制输入，真正的 EOF 先清 carry 再 close。
+#[tokio::test]
+async fn stream_eof_flushes_binary_carry_after_an_empty_reply() {
+    let home = TestHome::new();
+    let (up, last) = split_forward_upstream_tail(b"\x98\x80\xe2").await;
+    let cfg = String::from("delivery='forward'\n")
+        + &layer(&home, "wire", "'stream'", &["stream-skip-x"]);
+    let (client, url) = running(&home, up, &cfg);
+    let response = client
+        .post(url)
+        .body(b"X\xf0\x9f".as_slice())
+        .send()
+        .await
+        .unwrap();
+    let data = observed_stage(&home, "wire", "stream", 2).await;
+    assert_eq!(data[1]["data"], "X");
+    last.notify_one();
+    assert_eq!(
+        &response.bytes().await.unwrap()[..],
+        b"[\xf0\x9f\x98\x80\xe2]"
+    );
+    let wire = observed_stage(&home, "wire", "stream", 5).await;
+    assert_eq!(wire.len(), 5);
+    assert_eq!(wire[2]["data"], "😀");
+    assert!(wire[2].get("data_b64").is_none());
+    assert_eq!(wire[3]["data_b64"], "4g==");
+    assert!(wire[3].get("data").is_none());
+    assert_eq!(wire[4]["event"], "close");
+}
+
+/// 第一次 open 的进程故障要在不同进程重试；打开的门不拉起进程，已经在门内的流还能继续。
+#[tokio::test]
+async fn stream_open_retries_fresh_but_an_open_breaker_only_preserves_existing_leases() {
+    for fresh in [true, false] {
+        let home = TestHome::new();
+        let flag = home.path().join("once");
+        let cfg = String::from("delivery='forward'\n")
+            + &layer(
+                &home,
+                "wire",
+                "'stream'",
+                &["stream-admit", flag.to_str().unwrap()],
+            )
+            .replace(
+                "env={",
+                &format!(
+                    "env={{ECHO_OBSERVE={},",
+                    serde_json::to_string(&home.path().join("pids")).unwrap()
+                ),
+            )
+            + &format!(
+                "breaker_failures={}\nbreaker_cooldown_secs=86400\n",
+                if fresh { 2 } else { 1 }
+            );
+        let (up, last) = split_forward_upstream().await;
+        let (client, url) = running(&home, up, &cfg);
+        let url = url.trim_end_matches('/');
+        if fresh {
+            last.notify_one();
+            assert_eq!(
+                client
+                    .get(format!("{url}/fresh"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap(),
+                "[firstlast]"
+            );
+            let pids: Vec<_> = frames(&home, "pids")
+                .into_iter()
+                .filter(|p| p["event"] == "stream")
+                .collect();
+            assert_eq!(pids[0]["seq"], 1);
+            assert_eq!(pids[1]["seq"], 1);
+            assert_ne!(pids[0]["pid"], pids[1]["pid"]);
+        } else {
+            let mut live = client.get(format!("{url}/live")).send().await.unwrap();
+            let mut first = Vec::new();
+            while first.len() < 6 {
+                first.extend_from_slice(&live.chunk().await.unwrap().unwrap())
+            }
+            assert_eq!(first, b"[first");
+            // 另外两个请求只取响应头和第一块，第二块仍由各自的上游等待者持有。
+            for path in ["trip", "refused"] {
+                let mut plain = client.get(format!("{url}/{path}")).send().await.unwrap();
+                let mut prefix = Vec::new();
+                while prefix.len() < 5 {
+                    prefix.extend_from_slice(&plain.chunk().await.unwrap().unwrap());
+                }
+                assert_eq!(prefix, b"first");
+            }
+            let before = frames(&home, "wire");
+            assert_eq!(before.iter().filter(|v| v["stage"] == "hello").count(), 2);
+            assert_eq!(before.iter().filter(|v| v["event"] == "open").count(), 2);
+            assert_eq!(breaker(&home, url).await["state"], "open");
+            last.notify_waiters();
+            assert_eq!(live.bytes().await.unwrap(), "last]");
+            let wire = frames(&home, "wire");
+            let close = wire.last().unwrap();
+            assert_eq!(close["event"], "close");
+            assert_eq!(close["stream_id"], before[1]["stream_id"]);
+            let pids: Vec<_> = frames(&home, "pids")
+                .into_iter()
+                .filter(|v| v["event"] == "stream")
+                .collect();
+            assert_eq!(pids.last().unwrap()["pid"], pids[0]["pid"]);
+            assert_eq!(breaker(&home, url).await["state"], "open");
+        }
+    }
+}
+/// 真正启动的实例说明按阶段缓冲，不会承诺 forward 下磁盘缓存和响应限额失效。
+#[test]
+fn forward_startup_warns_about_format_buffering() {
+    let home = TestHome::new();
+    let cfg =
+        String::from("delivery='forward'\n") + &layer(&home, "buffer", "'response'", &["echo"]);
+    let (_, out) = launch(&home, free_port(), &cfg);
+    assert!(out.status.success(), "{out:?}");
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let log = std::fs::read_to_string(doc["log_path"].as_str().unwrap()).unwrap();
+    assert!(
+        log.contains("response programs and failure decisions can buffer responses"),
+        "{log}"
+    );
+    assert!(log.contains("Disk cache and size limits apply to buffered bodies"));
 }
 /// 请求只改写一次，响应的第一块在上游仍打开时到客户端，最后由同一进程收尾。
 #[tokio::test]

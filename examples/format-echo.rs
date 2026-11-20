@@ -327,9 +327,19 @@ fn main() {
                 "invalid-notify" if stage == "notify" => r["seq"] = json!(0),
                 "no-stage-reply" => continue,
                 "stream-echo" | "stream-fault" | "stream-reject" | "stream-gate"
+                | "stream-skip-x" | "stream-admit"
                     if stage == "stream" =>
                 {
                     match m["event"].as_str() {
+                        Some("open")
+                            if mode == "stream-admit"
+                                && (m["client"]["path"] == "/trip"
+                                    || (m["client"]["path"] == "/fresh"
+                                        && std::fs::File::create_new(arg).is_ok())) =>
+                        {
+                            break;
+                        }
+                        Some("data") if mode == "stream-skip-x" && m["data"] == "X" => (),
                         Some("open") => {
                             r["abort_tail"] = json!("[aborted]");
                             r["data"] = json!("[");

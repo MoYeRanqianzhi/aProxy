@@ -403,13 +403,11 @@ pub(crate) async fn serve_forever(
         pid = %std::process::id(),
         "启动 aProxy"
     );
-    // 仅转发模式是「主动放弃重试保障」的取舍，不是无害开关：用 warn 级（而非
-    // info）显式提示，并列出本模式下失效的配置项——按老习惯调过的参数不再生效
-    // 这件事，用户必须知道，否则排障时会往错误的方向找。取值一律走
-    // forward_only_enabled()（settings 注入已完成）。
+    // forward 是默认投递方式而非关闭缓存的全局开关。按协商的正文需求缓冲上传；
+    // response 层或错误响应的 decide 可收齐下载，均受相应的磁盘策略与大小上限约束。
     if state.config.forward_only_enabled() {
         tracing::warn!(
-            "仅转发模式已启用：请求体与响应均不缓冲、不重试（上游失败直接 502、响应流中断直接截断）；disk_cache / max_response_mb / keepalive.interval_secs / retry.max_backoff_secs 在本模式下不生效"
+            "Default delivery is forward: no keepalive or retry while forwarding. A request body requirement or decide program can buffer uploads; response programs and failure decisions can buffer responses. Disk cache and size limits apply to buffered bodies."
         );
     }
     // 保活适用的请求发往上游时 accept-encoding 一律改为 identity（往压缩流里插

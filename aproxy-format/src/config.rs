@@ -4,6 +4,21 @@ use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use url::Url;
 
+/// 同一故障在本地诊断中用中文，在所有协议 1 消费者可见的 fail.reason 中用英文。
+/// 两者都只接受静态文案，解析器、环境变量和原始输入不能进入诊断。
+pub struct Fault {
+    /// 给操作者的 stderr 说明。
+    pub local: &'static str,
+    /// 不随运行环境语言改变的协议说明。
+    pub wire: &'static str,
+}
+impl Fault {
+    /// 在出错的位置一起指定两条消息，避免从一种语言的文本反查另一种。
+    pub fn new(local: &'static str, wire: &'static str) -> Self {
+        Self { local, wire }
+    }
+}
+
 /// 工具与工作进程都按相同规则读取配置，不向标准错误复制可能含凭据的路径或原文。
 pub fn load<T: DeserializeOwned>(path: &str) -> Result<T, &'static str> {
     let path = if let Some(rest) = path.strip_prefix("~/") {
@@ -47,20 +62,27 @@ pub fn strip_credentials(h: &mut Headers) {
 }
 
 /// 凭据取自用户指名的环境变量，只进入将发给上游的请求头。
-pub fn credential(env: &str, scheme: &str) -> Result<String, &'static str> {
+pub fn credential(env: &str, scheme: &str) -> Result<String, Fault> {
     if env.is_empty() || env.contains(['=', '\0']) {
-        return Err("密钥环境变量名无效");
+        return Err(Fault::new(
+            "密钥环境变量名无效",
+            "invalid credential environment variable name",
+        ));
     }
     let key = std::env::var(env)
         .ok()
         .filter(|v| !v.is_empty())
-        .ok_or("密钥环境变量未设置")?;
+        .ok_or(Fault::new(
+            "密钥环境变量未设置",
+            "credential environment variable is unset",
+        ))?;
     let value = if scheme.is_empty() {
         key
     } else {
         format!("{scheme} {key}")
     };
-    http::HeaderValue::from_str(&value).map_err(|_| "鉴权头的值无效")?;
+    http::HeaderValue::from_str(&value)
+        .map_err(|_| Fault::new("鉴权头的值无效", "invalid authentication header value"))?;
     Ok(value)
 }
 

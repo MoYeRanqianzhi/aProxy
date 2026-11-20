@@ -6,6 +6,7 @@ mod detect;
 mod keys;
 mod route;
 mod translate;
+use crate::config::Fault;
 use aproxy_envelope as w;
 use serde::Deserialize;
 use std::io::{BufRead, Read, Write};
@@ -140,11 +141,11 @@ impl Role {
             w::Stage::Response(response) => match self {
                 Self::Convert(c) => c.response(response, &mut r),
                 Self::Route(route) => route.response(response, &mut r),
-                _ => Err("阶段不受支持"),
+                _ => Err(Fault::new("阶段不受支持", "unsupported stage")),
             },
             w::Stage::Stream(s) => match self {
                 Self::Convert(c) => c.stream(s, &mut r),
-                _ => Err("阶段不受支持"),
+                _ => Err(Fault::new("阶段不受支持", "unsupported stage")),
             },
             w::Stage::Decide(_) if matches!(self, Self::Adaptive | Self::Policy) => Ok(()),
             w::Stage::Notify(_) if matches!(self, Self::Adaptive) => Ok(()),
@@ -152,16 +153,17 @@ impl Role {
                 r.data = w::Data::from_bytes(h.data.as_bytes().to_vec());
                 Ok(())
             }
-            _ => Err("阶段不受支持"),
+            _ => Err(Fault::new("阶段不受支持", "unsupported stage")),
         };
         if let Err(reason) = result {
             r = w::Reply::new(m.seq);
-            r.fail = Some(w::Fail::new(false, reason.into()));
+            let _ = writeln!(std::io::stderr().lock(), "aproxy-format: {}", reason.local);
+            r.fail = Some(w::Fail::new(false, reason.wire.into()));
         }
         r
     }
     /// 同一请求的后续阶段可能换进程，只使用信封携带的私有状态。
-    fn request(&mut self, m: &w::RequestMessage, r: &mut w::Reply) -> Result<(), &'static str> {
+    fn request(&mut self, m: &w::RequestMessage, r: &mut w::Reply) -> Result<(), Fault> {
         match self {
             Self::Convert(c) => c.request(m, r),
             Self::Keys(k) => k.request(m, r),
@@ -171,7 +173,7 @@ impl Role {
                 r.delivery = Some("forward".into());
                 Ok(())
             }
-            _ => Err("阶段不受支持"),
+            _ => Err(Fault::new("阶段不受支持", "unsupported stage")),
         }
     }
 }

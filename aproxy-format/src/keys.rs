@@ -1,5 +1,6 @@
 //! 每个上游 origin 单独选 key，只有返回请求的头部能看到值，私有状态与报告只写公开 ID。
 use crate::config;
+use crate::config::Fault;
 use aproxy_envelope as w;
 use serde::Deserialize;
 
@@ -91,8 +92,9 @@ impl Keys {
         Ok(cfg)
     }
     /// 只向当前 origin 返回凭据；失败不推进游标，下一次可继续原轮次。
-    pub fn request(&mut self, m: &w::RequestMessage, r: &mut w::Reply) -> Result<(), &'static str> {
-        let origin = config::endpoint(&m.request.url)?
+    pub fn request(&mut self, m: &w::RequestMessage, r: &mut w::Reply) -> Result<(), Fault> {
+        let origin = config::endpoint(&m.request.url)
+            .map_err(|e| Fault::new(e, "invalid upstream URL"))?
             .origin()
             .ascii_serialization();
         let mut headers = m.request.headers.clone();
@@ -104,7 +106,10 @@ impl Keys {
             .pool
             .iter_mut()
             .find(|p| p.origin == origin)
-            .ok_or("上游没有对应的密钥池")?;
+            .ok_or(Fault::new(
+                "上游没有对应的密钥池",
+                "no credential pool matches the upstream origin",
+            ))?;
         let weight = |k: &Key| {
             if self.strategy == Strategy::Weighted {
                 k.weight
@@ -134,7 +139,7 @@ impl Keys {
         r.request = Some(patch);
         r.state = Some(serde_json::json!([p.origin, key.id]).to_string());
         r.report = config::report(
-            "已选择密钥",
+            "Selected an upstream key",
             w::StandardAction::KeySelect {
                 key_id: key.id.clone(),
             },

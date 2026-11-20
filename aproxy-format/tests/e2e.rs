@@ -82,6 +82,7 @@ fn cross_format_request_conversion_end_to_end() {
         "anthropic_messages",
     ]);
     let r=w.frame(request("https://relay.test/v1/chat/completions?q=1","/v1/chat/completions",json!({"model":"gpt","max_tokens":30,"messages":[{"role":"system","content":"be nice"},{"role":"user","content":"hi"}]})));
+    assert_eq!(r["report"]["summary"], "Selected the protocol conversion");
     let p = &r["request"];
     assert_eq!(p["url"], "https://relay.test/v1/messages?q=1");
     assert_eq!(p["headers"]["anthropic-version"], "2023-06-01");
@@ -120,6 +121,10 @@ fn auto_detect_rejects_unknown_input_and_requires_response_state() {
         "/custom",
         json!({"other":1}),
     ));
+    assert_eq!(
+        bad["fail"]["reason"],
+        "unknown client protocol; specify --from"
+    );
     assert_eq!(bad["fail"]["retry"], false);
     assert!(bad.get("request").is_none());
     let good = w.frame(request(

@@ -6009,6 +6009,79 @@ async fn adaptive_unavailable_falls_back_to_retry() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
 }
 
+/// 两次已经交付的 forward 失败由真实完成通知记账。第三次同体进入 retry，而另一个摘要仍可直通。
+#[tokio::test]
+async fn official_adaptive_pins_twice_failed_digest_but_forwards_a_fresh_one() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[503, 503, 503, 200, 200]).await;
+    let cfg = layer(
+        &home,
+        "adaptive",
+        "'request','notify'",
+        &[
+            "record-worker",
+            official_binary().to_str().unwrap(),
+            "adaptive",
+        ],
+    ) + "pool_max=1\nrequired=false\n"
+        + &layer(&home, "observe", "'request'", &["echo"]);
+    let (client, url) = running(&home, up, &cfg);
+    for (i, (body, status, mode)) in [
+        ("same", 503, "forward"),
+        ("same", 503, "forward"),
+        ("same", 200, "retry"),
+        ("fresh", 200, "forward"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let r = client.post(&url).body(body).send().await.unwrap();
+        assert_eq!(r.status(), status);
+        r.bytes().await.unwrap();
+        let notes = observed_stage(&home, "adaptive", "notify", i + 1).await;
+        assert_eq!(notes[i]["delivery"], mode);
+        assert_eq!(
+            observed_stage(&home, "observe", "request", i + 1).await[i]["delivery"],
+            mode
+        );
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 5);
+}
+/// forward 尚未提交时，真实判定程序把同一请求升级，重放成功且只记一次升级。
+#[tokio::test]
+async fn official_adaptive_upgrades_forward_before_client_bytes() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[503, 200]).await;
+    let cfg = layer(
+        &home,
+        "adaptive",
+        "'request','decide','notify'",
+        &[
+            "record-worker",
+            official_binary().to_str().unwrap(),
+            "adaptive",
+        ],
+    ) + "pool_max=1\nrequired=false\n";
+    let (c, url) = running(&home, up, &cfg);
+    assert_eq!(
+        c.post(url)
+            .body("same")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "upstream bytes"
+    );
+    let decide = observed_stage(&home, "adaptive", "decide", 1).await;
+    assert_eq!(decide[0]["delivery"], "forward");
+    let notify = observed_stage(&home, "adaptive", "notify", 1).await;
+    assert_eq!(notify[0]["upgraded"], true);
+    assert_eq!(notify[0]["attempts"], 2);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+}
+
 /// 仅声明检查成功响应的规则会接到 200。错误藏在普通文本里，代理自己的兜底不会重试它。
 #[tokio::test]
 async fn official_policy_retries_a_200_with_an_error_marker() {

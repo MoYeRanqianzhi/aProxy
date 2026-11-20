@@ -1,5 +1,6 @@
 //! 每个角色是独立的协议 1 工作进程。首行协商、逐行应答，直到 aproxy 关闭标准输入。
 //! `translate` 只读一个 JSON 请求，既不参与握手也不运行处理链。
+mod adaptive;
 mod config;
 mod convert;
 mod detect;
@@ -13,7 +14,6 @@ mod selection;
 mod translate;
 use crate::config::Fault;
 use aproxy_envelope as w;
-use serde::Deserialize;
 use std::io::{BufRead, Read, Write};
 
 /// 用公开命令名选择职责，不按帧内容或 URL 猜测某个进程扮演的角色。
@@ -29,14 +29,10 @@ enum Role {
     /// 只对尝试结果投票。
     Policy(policy::Policy),
     /// 按摘要决定 forward 或 retry，并接收完成通知。
-    Adaptive,
+    Adaptive(adaptive::Adaptive),
     /// 只处理保活帧。
     Heartbeat(heartbeat::Heartbeat),
 }
-/// 没有配置项的角色也拒绝未知键，拼写错误不能默默被吞。
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Empty {}
 /// 命令行选项形式两种都接受，不把未知参数（可能是误填的密钥）写入错误。
 #[derive(Default)]
 struct Options<'a> {
@@ -96,15 +92,8 @@ impl Role {
             "route" => Self::Route(route::Route::load(
                 opt.config.ok_or("route 需要 --config")?,
             )?),
-            name => {
-                if let Some(p) = opt.config {
-                    config::load::<Empty>(p)?;
-                }
-                match name {
-                    "adaptive" => Self::Adaptive,
-                    _ => return Err(USAGE.into()),
-                }
-            }
+            "adaptive" => Self::Adaptive(adaptive::Adaptive::load(opt.config)?),
+            _ => return Err(USAGE.into()),
         })
     }
     /// 能力同时约束握手与消息分派，配置不启用的回程也不能进入角色处理器。
@@ -114,7 +103,7 @@ impl Role {
             Self::Keys(_) | Self::Rewrite(_) => &["request", "retry"],
             Self::Route(route) => route.stages(),
             Self::Policy(_) => &["decide"],
-            Self::Adaptive => &["request", "decide", "notify"],
+            Self::Adaptive(_) => &["request", "decide", "notify"],
             Self::Heartbeat(_) => &["heartbeat"],
         }
     }
@@ -127,7 +116,7 @@ impl Role {
             Self::Keys(k) if k.sticky => &[("request", Full), ("retry", Full)],
             Self::Keys(_) | Self::Rewrite(_) => &[("request", None), ("retry", None)],
             Self::Policy(_) => &[("decide", None)],
-            Self::Adaptive => &[("request", Digest), ("decide", None), ("notify", Digest)],
+            Self::Adaptive(_) => &[("request", Digest), ("decide", None), ("notify", Digest)],
             Self::Heartbeat(_) => &[],
         };
         let mut reply = w::HelloReply::new(
@@ -179,10 +168,20 @@ impl Role {
                     p.decide(m, &mut r);
                     Ok(())
                 }
-                Self::Adaptive => Ok(()),
+                Self::Adaptive(a) => {
+                    a.decide(m, &mut r);
+                    Ok(())
+                }
                 _ => Err(Fault::new("阶段不受支持", "unsupported stage")),
             },
-            w::Stage::Notify(_) if matches!(self, Self::Adaptive) => Ok(()),
+            w::Stage::Notify(w::NotifyEvent::RequestEnd(m))
+                if matches!(self, Self::Adaptive(_)) =>
+            {
+                if let Self::Adaptive(a) = self {
+                    a.completed(m, std::time::Instant::now());
+                }
+                Ok(())
+            }
             w::Stage::Heartbeat(h) => match self {
                 Self::Heartbeat(heartbeat) => {
                     heartbeat.beat(h, &mut r);
@@ -223,8 +222,8 @@ impl Role {
             Self::Keys(k) => k.request(m, retry, r),
             Self::Route(route) => route.request(m, retry, r),
             Self::Rewrite(rewrite) => rewrite.request(m, r),
-            Self::Adaptive => {
-                r.delivery = Some("forward".into());
+            Self::Adaptive(a) => {
+                a.request(m, r);
                 Ok(())
             }
             _ => Err(Fault::new("阶段不受支持", "unsupported stage")),
@@ -350,21 +349,53 @@ mod frame_tests {
     fn bounded_frames_require_a_delimiter_before_eof() {
         let hello=br#"{"v":1,"seq":0,"stage":"hello","protocols":[1],"aproxy_version":"test","name":"role","process":"persistent","stages":[],"worker_id":0,"features":[],"overrides":[]}"#;
         let mut out = Vec::new();
-        assert!(worker("adaptive", Role::Adaptive, &hello[..], &mut out).is_err());
+        assert!(
+            worker(
+                "adaptive",
+                Role::Adaptive(adaptive::Adaptive::load(None).unwrap()),
+                &hello[..],
+                &mut out
+            )
+            .is_err()
+        );
         assert!(out.is_empty());
         let mut input = hello.to_vec();
         input.push(b'\n');
-        assert!(worker("adaptive", Role::Adaptive, &input[..], Vec::new()).is_ok());
+        assert!(
+            worker(
+                "adaptive",
+                Role::Adaptive(adaptive::Adaptive::load(None).unwrap()),
+                &input[..],
+                Vec::new()
+            )
+            .is_ok()
+        );
         let mut data = input.clone();
         data.extend_from_slice(br#"{"v":1,"seq":1,"stage":"request","request_id":"r","delivery":"retry","client":{"path":"/"},"request":{"method":"GET","url":"https://a.test/"}}"#);
         let mut out = Vec::new();
-        assert!(worker("adaptive", Role::Adaptive, &data[..], &mut out).is_err());
+        assert!(
+            worker(
+                "adaptive",
+                Role::Adaptive(adaptive::Adaptive::load(None).unwrap()),
+                &data[..],
+                &mut out
+            )
+            .is_err()
+        );
         assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1);
         for (prefix, cap) in [(&[][..], 64 * 1024), (&input[..], 8 * 1024 * 1024)] {
             let mut over = prefix.to_vec();
             over.resize(prefix.len() + cap + 4096, b' ');
             let mut cursor = std::io::Cursor::new(over);
-            assert!(worker("adaptive", Role::Adaptive, &mut cursor, Vec::new()).is_err());
+            assert!(
+                worker(
+                    "adaptive",
+                    Role::Adaptive(adaptive::Adaptive::load(None).unwrap()),
+                    &mut cursor,
+                    Vec::new()
+                )
+                .is_err()
+            );
             assert!(cursor.position() as usize <= prefix.len() + cap + 1);
         }
     }

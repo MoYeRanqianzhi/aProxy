@@ -3037,7 +3037,7 @@ async fn request_layers_see_managed_encoding_as_keepalive_changes() {
             ],
         )
         + &layer(&home, "read", "'request','retry'", &["reply", "{}"]);
-    let (c, url) = running(&home, up, &cfg);
+    let (c, url, _clock) = Clock::start(&home, up, &cfg);
     let r = c
         .get(url)
         .header("accept", "text/event-stream")
@@ -4885,8 +4885,27 @@ async fn first_delivery_vote_wins() {
 #[tokio::test]
 async fn forward_503_upgrades_through_decide_and_the_client_sees_only_the_retried_success() {
     let home = TestHome::new();
-    let (up, calls) = upstream(&[503, 200]).await;
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let received = bodies.clone();
+    let app = axum::Router::new().fallback(move |method: http::Method, body: axum::body::Bytes| {
+        let mut seen = received.lock().unwrap();
+        seen.push((method, body));
+        let first = seen.len() == 1;
+        async move {
+            if first {
+                (http::StatusCode::SERVICE_UNAVAILABLE, "failed prefix")
+            } else {
+                (http::StatusCode::OK, "successful prefix")
+            }
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let cfg = String::from("delivery='forward'\n")
+        + &layer(&home, "prefix", "'request'", &["echo"])
         + &layer(
             &home,
             "policy",
@@ -4895,13 +4914,14 @@ async fn forward_503_upgrades_through_decide_and_the_client_sees_only_the_retrie
         )
         + &layer(&home, "finished", "'notify'", &["echo"]);
     let (c, url) = running(&home, up, &cfg);
-    let resp = c.get(&url).send().await.unwrap();
+    let raw = &b"retry my exact bytes\x00\xff"[..];
+    let resp = c.post(&url).body(raw).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     assert!(!resp.headers().contains_key("x-aproxy-error"));
-    assert_eq!(resp.text().await.unwrap(), "upstream bytes");
-    let frames = frames(&home, "policy");
-    assert_eq!(frames.len(), 2);
-    let m = &frames[1];
+    assert_eq!(resp.text().await.unwrap(), "successful prefix");
+    let policy_frames = frames(&home, "policy");
+    assert_eq!(policy_frames.len(), 2);
+    let m = &policy_frames[1];
     assert_eq!(m["delivery"], "forward");
     assert_eq!(m["fallback"]["decision"], "stop");
     assert_eq!(m["response"]["status"], 503);
@@ -4923,7 +4943,15 @@ async fn forward_503_upgrades_through_decide_and_the_client_sees_only_the_retrie
     assert_eq!(end["attempts"], 2);
     assert_eq!(end["upstream_status"], 200);
     assert_eq!(ping.activity.upgraded_total, 1);
-    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    let seen = bodies.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(
+        seen.iter()
+            .all(|(method, b)| method == http::Method::POST && b.as_ref() == raw)
+    );
+    let prefix = frames(&home, "prefix");
+    assert_eq!(prefix.iter().filter(|m| m["stage"] == "request").count(), 1);
+    assert!(prefix.iter().all(|m| m["stage"] != "retry"));
 }
 
 /// 上游在交付前缀后才报错，客户端已经收到的字节不能撤回；不发 decide，不重试。
@@ -5040,7 +5068,7 @@ async fn forward_200_error_body_is_recorded_as_upstream_error() {
 }
 
 /// 客户端已经读到心跳才给出第一票时不能收回 200；反之必须把重定向头原样交付。
-/// 用客户端是否订阅事件和手动开门分别确定先后，不要求子进程抢在某个真实节拍之前运行完。
+/// 两次请求均启动保活；手动时钟隔开首拍与实际工作进程的投票，及时投票后仍跨过两拍。
 #[tokio::test]
 async fn forward_vote_on_either_side_of_commitment() {
     let home = TestHome::new();
@@ -5048,13 +5076,22 @@ async fn forward_vote_on_either_side_of_commitment() {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
         .await
         .unwrap();
-    let app = axum::Router::new().fallback(|body: String| async move {
-        assert_eq!(body, "blocked");
-        (
-            axum::http::StatusCode::TEMPORARY_REDIRECT,
-            [("location", "/redirected")],
-            "redirect body",
-        )
+    let hold = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let gate_up = hold.clone();
+    let (sent, mut arrived) = tokio::sync::mpsc::unbounded_channel();
+    let app = axum::Router::new().fallback(move |body: String| {
+        let sent = sent.clone();
+        let gate = gate_up.clone();
+        async move {
+            sent.send(()).unwrap();
+            gate.acquire().await.unwrap().forget();
+            assert_eq!(body, "blocked");
+            (
+                axum::http::StatusCode::TEMPORARY_REDIRECT,
+                [("location", "/redirected")],
+                "redirect body",
+            )
+        }
     });
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let gate = home.path().join("release-vote");
@@ -5072,20 +5109,25 @@ async fn forward_vote_on_either_side_of_commitment() {
             &["reply", r#"{"delivery":"forward"}"#],
         )
         + &layer(&home, "observer", "'request'", &["reply", "{}"]);
-    let (_, url) = running(&home, up, &cfg);
+    let (_, url, mut clock) = Clock::start(&home, up, &cfg);
     let c = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .unwrap();
-    let mut response = c
-        .post(&url)
-        .header("accept", "text/event-stream")
-        .body("blocked")
-        .send()
-        .await
-        .unwrap();
+    let send = || {
+        tokio::spawn(
+            c.post(&url)
+                .header("accept", "text/event-stream")
+                .body("blocked")
+                .send(),
+        )
+    };
+    let first = send();
+    observed_stage(&home, "wait", "request", 1).await;
+    clock.advance(1);
+    let mut response = first.await.unwrap().unwrap();
     assert_eq!(response.status(), 200);
     assert!(response.headers().get("location").is_none());
     let beat = response.chunk().await.unwrap().unwrap();
@@ -5104,13 +5146,15 @@ async fn forward_vote_on_either_side_of_commitment() {
     assert_eq!(record["record"]["tries"][0]["upstream_status"], 307);
     assert_eq!(record["record"]["upgraded"], false);
 
-    let response = c
-        .post(&url)
-        .header("accept", "application/json")
-        .body("blocked")
-        .send()
+    arrived.recv().await.unwrap();
+    let second = send();
+    tokio::time::timeout(std::time::Duration::from_secs(30), arrived.recv())
         .await
+        .unwrap()
         .unwrap();
+    clock.advance(2);
+    hold.add_permits(1);
+    let response = second.await.unwrap().unwrap();
     assert_eq!(response.status(), 307);
     assert_eq!(response.headers()["location"], "/redirected");
     assert_eq!(response.text().await.unwrap(), "redirect body");

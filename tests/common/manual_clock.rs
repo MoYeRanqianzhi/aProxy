@@ -13,7 +13,7 @@ pub(super) struct Clock {
     /// 仅作异常退出的最后保障；正常退出通过控制管道 EOF。
     child: ChildGuard,
     /// 子进程完成推进后发回确认，避免将操作系统调度时间算作一拍。
-    replies: std::io::BufReader<std::process::ChildStdout>,
+    replies: std::sync::mpsc::Receiver<String>,
 }
 impl Clock {
     /// 和 CLI 一样解析配置、握手；父测试不改变自己的环境或时钟。
@@ -38,7 +38,18 @@ impl Clock {
                 .spawn()
                 .unwrap(),
         );
-        let replies = std::io::BufReader::new(child.0.stdout.take().unwrap());
+        let pipe = std::io::BufReader::new(child.0.stdout.take().unwrap());
+        let (send, replies) = std::sync::mpsc::sync_channel(2);
+        std::thread::spawn(move || {
+            for line in pipe.lines().map_while(Result::ok) {
+                if (line.trim_end().ends_with("clock ready")
+                    || line.trim_end().ends_with("clock advanced"))
+                    && send.send(line).is_err()
+                {
+                    break;
+                }
+            }
+        });
         let mut clock = Self { child, replies };
         clock.ack("clock ready");
         (
@@ -53,18 +64,14 @@ impl Clock {
     }
     /// libtest 也会往同一管道写测试名；只用约定的行尾作屏障。
     fn ack(&mut self, marker: &str) {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            assert_ne!(
-                self.replies.read_line(&mut line).unwrap(),
-                0,
-                "clock fixture exited before {marker}"
-            );
-            if line.trim_end().ends_with(marker) {
-                return;
-            }
-        }
+        let line = self
+            .replies
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|e| panic!("no {marker} acknowledgement from clock fixture: {e}"));
+        assert!(
+            line.trim_end().ends_with(marker),
+            "expected {marker}, got {line}"
+        );
     }
     /// 一个时刻最多显式推进到下一拍；不会在等操作系统读写期间追赶另一个截止点。
     pub(super) fn advance(&mut self, secs: u64) {
@@ -93,7 +100,12 @@ impl Clock {
 impl Drop for Clock {
     fn drop(&mut self) {
         drop(self.child.0.stdin.take());
-        let _ = self.child.0.wait();
+        // 启动卡死时即使 stdin 已关也可能无法自行退役；不能让失败断言的析构再次无限等待。
+        let end = std::time::Instant::now() + Duration::from_secs(15);
+        while matches!(self.child.0.try_wait(), Ok(None)) && std::time::Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // 仍未退出时由 ChildGuard 按本测试持有的子进程句柄收回。
     }
 }
 

@@ -636,6 +636,18 @@ impl<W: Write> Trial<'_, W> {
         resp.body = w::Body::from_bytes(chunks.concat());
         Ok(())
     }
+    /// 业务拒绝在接触上游之前终结尝试；自定义响应覆盖默认状态，但诊断仍归属于格式拒绝。
+    fn rejected(&mut self, fail: &w::Fail, attempt: u32, upgraded: bool) -> Result<(), String> {
+        trace(
+            self.out,
+            "result",
+            "proxy",
+            Value::Null,
+            json!({"status":fail.response.as_ref().map_or(422,|r|r.status),"code":"format_rejected"}),
+            vec!["rejected"],
+        )?;
+        self.notify(attempt, None, upgraded, None, "failed")
+    }
     /// 完成只发给订阅者；通知不是可以再改变交付结果的一票。
     fn notify(
         &mut self,
@@ -876,6 +888,9 @@ fn rehearse(
     }
     let mut refused = t.request(&mut req, None)?;
     let mut upgraded = false;
+    if let Some(fail) = refused.as_ref().filter(|f| !f.retry) {
+        return t.rejected(fail, 1, false);
+    }
     if sample.attempts.is_empty() {
         trace(
             t.out,
@@ -931,18 +946,11 @@ fn rehearse(
             });
         if let Some(rejection) = refused.take() {
             if !rejection.retry {
-                trace(
-                    t.out,
-                    "result",
-                    "proxy",
-                    Value::Null,
-                    json!({"status":rejection.response.as_ref().map_or(502,|r|r.status)}),
-                    vec!["rejected"],
-                )?;
-                t.notify(n, None, upgraded, None, "failed")?;
-                return Ok(());
+                return t.rejected(&rejection, n, upgraded);
             }
-            failure = Some(json!({"code":"format_failed"}));
+            failure = Some(
+                json!({"code":"format_fail","details":{"format":t.units[t.cursor].layer.entry.name,"stage":t.request_stage.as_str()}}),
+            );
             resp = None;
             chunks.clear();
         }
@@ -971,6 +979,9 @@ fn rehearse(
             }
             if reroute || t.cursor != t.units.len() {
                 refused = t.request(&mut req, Some(info))?;
+                if let Some(fail) = refused.as_ref().filter(|f| !f.retry) {
+                    return t.rejected(fail, n + 1, upgraded);
+                }
             }
             continue;
         }
@@ -1101,6 +1112,21 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(votes.len(), 1);
         assert_eq!(votes[0]["changed"], json!(["stop"]));
+    }
+    /// 请求层的终端拒绝不伪造成上游 502；无须等待上游样本即可得到 422。
+    #[test]
+    fn default_request_rejection_is_422_without_an_upstream() {
+        for attempts in [json!([]), json!([{"status":200}])] {
+            let (result, rows) = trace_sample(
+                "[[format]]\ncommand='aproxy-format'\nargs=['rewrite','--config','rules']\nstages=['request']",
+                json!({"path":"/","body":"invalid json","attempts":attempts}),
+                &[("rules", "remove=['/x']")],
+            );
+            result.unwrap();
+            let end = rows.iter().find(|r| r["stage"] == "result").unwrap();
+            assert_eq!(end["output"]["status"], 422);
+            assert_eq!(end["output"]["code"], "format_rejected");
+        }
     }
     /// 规则按声明先后生效，不对没有上游头的故障套状态规则；覆盖、直通与成功分别说明来源。
     #[test]

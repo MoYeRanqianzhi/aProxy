@@ -325,6 +325,83 @@ fn decode_reader<R: Read>(reader: R) -> Option<Vec<u8>> {
     }
 }
 
+/// 正文预览的总预算；先保留开头，剩余预算给结尾。
+pub const PREVIEW_BYTES: usize = 1024 * 1024;
+/// 预览中始终可见的前缀，独立于输入采用的编码与 spool 形式。
+const PREVIEW_HEAD: usize = 64 * 1024;
+
+/// 先保留 64 KiB 头，再用环形队列保留其余预算所能容纳的尾部。即使来自压缩流，
+/// 总长也按解码后的字节计；中间丢掉的部分不分配内存，断开时阻塞线程在下一块退出。
+struct Preview<F> {
+    /// 前缀固定不动，保留序列的开头与协议标记。
+    head: Vec<u8>,
+    /// 滚动保存最近的字节，它与前缀合起来不超过 1 MiB。
+    tail: std::collections::VecDeque<u8>,
+    /// 解码后的总长，用来计算被跳过的字节，而非输入流长。
+    count: u64,
+    /// 请求被取消后不再扫描剩余输入。
+    cancel: F,
+}
+impl<F: Fn(u64) -> bool> std::io::Write for Preview<F> {
+    /// 只追加仍在头尾预算内的部分，向解码器确认整块已消费。
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        const TAIL: usize = PREVIEW_BYTES - PREVIEW_HEAD;
+        self.count += buf.len() as u64;
+        if (self.cancel)(self.count) {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        let first = (PREVIEW_HEAD - self.head.len()).min(buf.len());
+        self.head.extend_from_slice(&buf[..first]);
+        let rest = &buf[first..];
+        let keep = rest.len().min(TAIL);
+        self.tail
+            .drain(..(self.tail.len() + keep).saturating_sub(TAIL));
+        self.tail.extend(&rest[rest.len() - keep..]);
+        Ok(buf.len())
+    }
+    /// 预览位于内存中，无需将任何数据刷回上游 spool。
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 尝试按完整编码表解码。无效编码或损坏的流不妨碍投票：丢弃部分解码结果，
+/// 从不可变的原始 spool 直接取头尾，始终写 body_b64，即使这些字节恰好是 UTF-8。
+pub fn read_preview(
+    mut reader: impl std::io::Read + std::io::Seek,
+    len: u64,
+    encoding: Option<&str>,
+    cancel: impl Fn(u64) -> bool,
+) -> Option<(Vec<u8>, u64, bool)> {
+    use std::io::SeekFrom;
+    let mut preview = Preview {
+        head: Vec::new(),
+        tail: Default::default(),
+        count: 0,
+        cancel,
+    };
+    if let Some(encoding) = encoding
+        && decode_strict(encoding, &mut reader, &mut preview, u64::MAX).is_ok()
+    {
+        preview.head.extend(preview.tail);
+        let skipped = preview.count - preview.head.len() as u64;
+        return Some((preview.head, skipped, true));
+    }
+    if (preview.cancel)(preview.count) {
+        return None;
+    }
+    drop(preview);
+    let keep = len.min(PREVIEW_BYTES as u64) as usize;
+    let head = PREVIEW_HEAD.min(keep);
+    let mut raw = vec![0; keep];
+    reader.rewind().ok()?;
+    reader.read_exact(&mut raw[..head]).ok()?;
+    let tail = keep - head;
+    reader.seek(SeekFrom::Start(len - tail as u64)).ok()?;
+    reader.read_exact(&mut raw[head..]).ok()?;
+    Some((raw, len - keep as u64, false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

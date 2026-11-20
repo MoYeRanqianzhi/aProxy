@@ -523,25 +523,37 @@ impl<W: Write> Trial<'_, W> {
             }
             if let Some(resp) = response {
                 let mut obs = resp.clone();
-                obs.headers.remove("content-encoding");
-                if self.mode == "forward" {
-                    // 直通模式只观察头，不给决策单元它在真实流上还不可能看到的正文。
-                    obs.body = w::Body::Absent;
-                    msg["response"] = json!(obs);
-                } else {
-                    let data = obs.body.as_bytes().unwrap_or_default();
-                    let missing = data.len().saturating_sub(128 * 1024);
-                    if missing > 0 {
-                        obs.body = w::Body::from_bytes(
-                            [&data[..64 * 1024], &data[data.len() - 64 * 1024..]].concat(),
-                        );
-                    }
-                    msg["response"] = json!(obs);
-                    msg["response"]["truncated"] = if missing > 0 {
-                        missing.into()
+                if let Some(data) = resp.body.as_bytes() {
+                    let encoding = resp
+                        .headers
+                        .get("content-encoding")
+                        .map_or("", String::as_str);
+                    let (preview, missing, decoded) = aproxy_ipc::decode::read_preview(
+                        std::io::Cursor::new(data),
+                        data.len() as u64,
+                        Some(encoding),
+                        |n| n > 8 * 1024 * 1024,
+                    )
+                    .ok_or_else(|| {
+                        CliError::Unsimulated(
+                            "超过 8 MiB 的解码预览；真实实例会流式扫描完整实体".into(),
+                        )
+                    })?;
+                    obs.body = if decoded {
+                        obs.headers.remove("content-encoding");
+                        w::Body::from_bytes(preview)
                     } else {
-                        Value::Null
+                        w::Body::Binary(preview)
                     };
+                    msg["response"] = json!(obs);
+                    msg["response"]["truncated"] = if missing == 0 {
+                        Value::Null
+                    } else {
+                        missing.into()
+                    };
+                } else {
+                    // 只收到头时不猜测正文或截断量；编码和长度仍属于上游原响应。
+                    msg["response"] = json!(obs);
                 }
             }
             let r = self.call(i, "decide", msg)?;
@@ -1141,7 +1153,9 @@ fn rehearse(
         let mut resp = attempt.status.map(|status| {
             let mut r = w::Response::new(status);
             r.headers = attempt.headers;
-            r.body = w::Body::from_bytes(chunks.concat());
+            if !attempt.interrupted && attempt.failure.is_none() {
+                r.body = w::Body::from_bytes(chunks.concat());
+            }
             r
         });
         let mut failure = attempt
@@ -1440,6 +1454,35 @@ mod tests {
             );
         }
     }
+    /// 完整的失败响应在直通与重试下给策略同一份头尾预览，不能只保留最后 64 KiB。
+    #[test]
+    fn complete_decide_preview_includes_the_large_tail_in_both_modes() {
+        let body = format!(
+            "{}preview-marker{}",
+            "x".repeat(1024 * 1024),
+            "y".repeat(300 * 1024)
+        );
+        for mode in ["forward", "retry"] {
+            let cfg = format!(
+                "delivery='{mode}'\n[[format]]\ncommand='aproxy-format'\nargs=['policy','--config','p.toml']\nstages=['decide']"
+            );
+            let (result, rows) = trace_sample(
+                &cfg,
+                json!({"path":"/","body":{},"attempts":[{"status":503,"body":body}]}),
+                &[(
+                    "p.toml",
+                    "[[rule]]\nbody_regex='preview-marker'\ndecision='stop'\nresponse='context_too_long'",
+                )],
+            );
+            result.unwrap();
+            assert!(
+                rows.iter()
+                    .any(|r| r["stage"] == "result" && r["output"]["status"] == 400),
+                "{mode}: {rows:?}"
+            );
+        }
+    }
+
     /// 规则按声明先后生效，不对没有上游头的故障套状态规则；覆盖、直通与成功分别说明来源。
     #[test]
     fn dry_fallback_preserves_sources_and_backoff() {

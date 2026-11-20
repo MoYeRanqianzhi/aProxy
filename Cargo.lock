@@ -108,7 +108,6 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "brotli",
- "brotli-decompressor",
  "bytes",
  "clap",
  "flate2",
@@ -119,7 +118,6 @@ dependencies = [
  "libc",
  "regex",
  "reqwest 0.12.28",
- "ruzstd",
  "semver",
  "serde",
  "serde_json",
@@ -186,9 +184,13 @@ dependencies = [
 name = "aproxy-ipc"
 version = "0.2.0-alpha.3"
 dependencies = [
+ "brotli",
+ "brotli-decompressor",
+ "flate2",
  "libc",
  "memchr",
  "regex",
+ "ruzstd",
  "serde",
  "serde_json",
  "sha2 0.11.1",

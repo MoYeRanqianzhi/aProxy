@@ -22,7 +22,25 @@ include = ["/src/**", "/Cargo.toml"]
 # 只使用 IPC、台账或脱敏的客户端不必链接配置解析器。
 config-file = ["dep:toml_edit", "dep:regex"]
 
+# 只有会检查上游响应的程序需要内容解码器。
+body-inspection = ["dep:flate2", "dep:brotli-decompressor", "dep:ruzstd"]
+
 [dependencies]
+flate2 = { version = "1", optional = true }
+# 响应体检查用解码器（src/decode.rs）：把压缩响应解出一份副本供「错误判定 +
+# 日志预览」使用——转发给客户端的字节始终是上游原样，本模块不参与转发路径。
+# 两者均为**纯 Rust**实现（无 C 依赖，故 musl/aarch64 交叉编译与 CI 各平台不受
+# 影响）；gzip/deflate 复用上面的 flate2，不重复引依赖。
+#
+# br 直接依赖解码器 crate 而非门面包 brotli：门面包把**编码器**和**解码器**编在
+# 同一个库里，没有只留解码器的特性（它的 default = ["std"] 同时控制两者的 std
+# 接口，关掉 default 会让 Decompressor 与 CompressorWriter 一起消失），生产路径
+# 却只用 Decompressor。故常规依赖取纯解码器，编码器只在单测里造样本，放
+# dev-dependencies——二进制不再编译编码器那一半。两者版本有约束关系：brotli
+# 9.0.0 依赖 `brotli-decompressor ~6.0`，升 brotli 时需核对本行。
+brotli-decompressor = { version = "6.0.0", optional = true }
+ruzstd = { version = "0.9.0", optional = true }
+
 toml_edit = { version = "0.25", optional = true }
 regex = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
@@ -49,4 +67,6 @@ windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Secu
 libc = "0.2"
 
 [dev-dependencies]
+# 仅单测构造 brotli 样本时链接编码器。
+brotli = "9.0.0"
 tempfile = "3"

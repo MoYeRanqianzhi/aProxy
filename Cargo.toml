@@ -24,7 +24,7 @@ resolver = "3"
 [package]
 name = "aproxy"
 version = "0.2.0-alpha.3"
-# edition 2024 本身要 1.85，依赖树把下限抬到 1.88：src/decode.rs 引入的 ruzstd
+# edition 2024 本身要 1.85，依赖树把下限抬到 1.88：aproxy-ipc/src/decode.rs 引入的 ruzstd
 # 要 1.87，url→idna→idna_adapter 拖进来的 icu_* 一族要 1.88（这些 crate 在依赖图里
 # 是实打实被编译的，非可选）。本包自己再抬到 1.89：安装锁（永久兼容契约 C4 的
 # `<home>/install/lock`）用标准库的 File::lock / try_lock，它们在 1.89 稳定——Windows
@@ -124,7 +124,7 @@ regex = "1"
 aproxy-envelope = { version = "=0.2.0-alpha.3", path = "aproxy-envelope" }
 # aproxy 与同它打交道的程序共用的契约（home 的解析、进程台账）。version + path 双写、
 # `=` 精确钉住、由 align-version.py 改写，理由都同上。
-aproxy-ipc = { version = "=0.2.0-alpha.3", path = "aproxy-ipc", features = ["config-file"] }
+aproxy-ipc = { version = "=0.2.0-alpha.3", path = "aproxy-ipc", features = ["config-file", "body-inspection"] }
 # 桌面界面（desktop 特性）：Tauri 外壳与嵌入的前端。version + path 双写，理由同上；
 # 版本与本包同步。它不依赖本包（否则成环），需要的东西（home、运行时）由 bin 在启动
 # 界面时传进去。版本要求用 `=` 精确钉住：两者总是同号一起发布，aproxy-desktop 的接口
@@ -132,19 +132,6 @@ aproxy-ipc = { version = "=0.2.0-alpha.3", path = "aproxy-ipc", features = ["con
 # 别的版本。发布前 .github/scripts/align-version.py 按正则把这一行与两边的版本一起改成
 # tag 版本：改这一行的写法（换行、调换键的顺序）要同步改那个脚本，否则发布在对齐这步失败。
 aproxy-desktop = { version = "=0.2.0-alpha.3", path = "aproxy-desktop", optional = true }
-# 响应体检查用解码器（src/decode.rs）：把压缩响应解出一份副本供「错误判定 +
-# 日志预览」使用——转发给客户端的字节始终是上游原样，本模块不参与转发路径。
-# 两者均为**纯 Rust**实现（无 C 依赖，故 musl/aarch64 交叉编译与 CI 各平台不受
-# 影响）；gzip/deflate 复用上面的 flate2，不重复引依赖。
-#
-# br 直接依赖解码器 crate 而非门面包 brotli：门面包把**编码器**和**解码器**编在
-# 同一个库里，没有只留解码器的特性（它的 default = ["std"] 同时控制两者的 std
-# 接口，关掉 default 会让 Decompressor 与 CompressorWriter 一起消失），生产路径
-# 却只用 Decompressor。故常规依赖取纯解码器，编码器只在单测里造样本，放
-# dev-dependencies——二进制不再编译编码器那一半。两者版本有约束关系：brotli
-# 9.0.0 依赖 `brotli-decompressor ~6.0`，升 brotli 时需核对本行。
-brotli-decompressor = "6.0.0"
-ruzstd = "0.9.0"
 # config.toml 的严格解析与写回：解析结果带每个键在原文里的位置（诊断要报行列），改写时保留
 # 用户的注释、空行与键的顺序。上面的 toml 包两样都不给。
 toml_edit = "0.25"

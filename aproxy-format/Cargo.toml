@@ -27,7 +27,7 @@ switchyard-translation = "0.3"
 # 按正则把它与 envelope 的版本一起改，改这一行的写法要同步改那个脚本。
 aproxy-envelope = { version = "0.2.0-alpha.3", path = "../aproxy-envelope" }
 # 跨 origin 与回程的凭据边界复用代理记录所用的头名判定，不能分别枚举。
-aproxy-ipc = { version = "0.2.0-alpha.3", path = "../aproxy-ipc", features = ["config-file"] }
+aproxy-ipc = { version = "0.2.0-alpha.3", path = "../aproxy-ipc", features = ["config-file", "body-inspection"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 serde_path_to_error = "0.1"

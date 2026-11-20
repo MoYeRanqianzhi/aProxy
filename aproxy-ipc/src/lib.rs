@@ -15,6 +15,8 @@
 pub mod code;
 #[cfg(feature = "config-file")]
 pub mod config_file;
+#[cfg(feature = "body-inspection")]
+pub mod decode;
 pub mod diag;
 pub mod endpoint;
 pub mod home;

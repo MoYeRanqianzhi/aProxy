@@ -4907,18 +4907,28 @@ async fn forward_stream_can_open_before_the_client_finishes_its_upload() {
             while let Some(c) = input.next().await {
                 body.extend_from_slice(&c.unwrap());
             }
-            let doc: Value = serde_json::from_slice(&body).unwrap();
-            Ok(format!("received-{}", doc["stream"]))
+            let parsed = serde_json::from_slice::<Value>(&body)
+                .map(|doc| doc["stream"].to_string())
+                .unwrap_or_else(|_| "malformed".into());
+            Ok(format!("received-{parsed}"))
         });
         axum::body::Body::from_stream(start.chain(tail))
     });
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let cfg = String::from("delivery='forward'\nkeepalive.trigger='body_stream'\n")
         + &layer(&home, "meta", "'request'", &["metadata-only"])
-        + &layer(&home, "convert", "'stream'", &["stream-echo"]);
+        + &layer(&home, "convert", "'stream'", &["stream-echo"])
+        + &layer(&home, "observer", "'notify'", &["notify-digest"]);
     let (_, url) = running(&home, port, &cfg);
     let addr = url.strip_prefix("http://").unwrap();
-    for (suffix, value) in [("true }", "true"), ("false}", "false")] {
+    for (i, (suffix, value)) in [
+        ("true }", "true"),
+        ("false}", "false"),
+        ("true} trailing", "malformed"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
         let head = format!(
             "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -4943,6 +4953,13 @@ async fn forward_stream_can_open_before_the_client_finishes_its_upload() {
         let stages = frames(&home, "convert");
         let open = stages.iter().rfind(|f| f["event"] == "open").unwrap();
         assert_eq!(open["client"], serde_json::json!({"path":"/"}));
+        assert_eq!(
+            frames(&home, "observer")
+                .iter()
+                .filter(|f| f["stage"] == "notify")
+                .count(),
+            i
+        );
         client.write_all(suffix.as_bytes()).await.unwrap();
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -4953,6 +4970,18 @@ async fn forward_stream_can_open_before_the_client_finishes_its_upload() {
         .unwrap();
         let wire = String::from_utf8(wire).unwrap();
         assert!(wire.contains(&format!("received-{value}")), "{wire}");
+        let completed = &observed_stage(&home, "observer", "notify", i + 1).await[i];
+        assert_eq!(completed["request_id"], open["request_id"]);
+        if value == "malformed" {
+            // 摘要覆盖末尾垃圾：此处缺标记表示解析失败，而非上传仍在途中。
+            assert_eq!(
+                completed["digest"],
+                "a3051400ac3e91791b05a936e9c313daaf61088e044891542c2a962dd5aa55d6"
+            );
+            assert!(completed["client"].get("stream").is_none());
+        } else {
+            assert_eq!(completed["client"]["stream"], value == "true");
+        }
     }
 }
 

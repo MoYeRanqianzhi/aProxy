@@ -7172,3 +7172,24 @@ fn rehearsal_omitted_body_need_matches_each_stage() {
         }
     }
 }
+
+/// 运行中的进程回信损坏时不能继续编造跳过或成功的轨迹，必需与可选项均须说明边界。
+#[test]
+fn rehearsal_worker_failure_ends_with_distinct_unsimulated_status() {
+    for required in [false, true] {
+        let home = TestHome::new();
+        let cfg =
+            layer(&home, "broken", "'request'", &["bad-seq"]) + &format!("required={required}\n");
+        let out = format_trial(&home, &cfg, serde_json::json!({"path":"/","body":{}}));
+        assert_eq!(out.status.code(), Some(2), "{out:?}");
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            err.contains("未模拟：") && err.contains("；真实实例会") && err.contains("request")
+        );
+        assert!(
+            !String::from_utf8(out.stdout)
+                .unwrap()
+                .contains("request_only")
+        );
+    }
+}

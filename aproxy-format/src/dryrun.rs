@@ -1,6 +1,9 @@
 //! 试跑只消费用户提供的请求与模拟上游尝试。不建网络客户端；输出从白名单字段另行构造。
 mod peer;
-use crate::tools::{self, Layer};
+use crate::{
+    CliError,
+    tools::{self, Layer},
+};
 use aproxy_envelope as w;
 use aproxy_ipc::config_file::{self as f, Stage};
 use serde::Deserialize;
@@ -267,34 +270,28 @@ struct Trial<'a, W> {
 }
 impl<W: Write> Trial<'_, W> {
     /// 程序业务拒绝与进程失败分开；发生进程故障的可选层不会继续吃样本。
-    fn call(&mut self, i: usize, stage: &str, msg: Value) -> Result<w::Reply, String> {
-        match self.units[i].call(stage, msg, &self.digest, self.dir) {
-            Ok(r) => Ok(r),
-            Err(_)
-                if !self.units[i].layer.entry.required
-                    || matches!(stage, "notify" | "decide" | "heartbeat") =>
-            {
-                self.units[i].peer = None;
-                self.units[i].hello = None;
-                trace(
-                    self.out,
-                    stage,
-                    self.units[i].layer.label,
-                    Value::Null,
-                    Value::Null,
-                    vec!["skipped"],
-                )?;
-                Ok(w::Reply::new(0))
-            }
-            Err(_) => Err("试跑角色未能完成本阶段".into()),
-        }
+    fn call(&mut self, i: usize, stage: &str, msg: Value) -> Result<w::Reply, CliError> {
+        self.units[i]
+            .call(stage, msg, &self.digest, self.dir)
+            .map_err(|_| {
+                let behavior = if matches!(stage, "notify" | "decide" | "heartbeat") {
+                    "记录故障，按此控制阶段的回退规则继续"
+                } else if self.units[i].layer.entry.required {
+                    "记录必需程序故障，按交付阶段重试或结束请求"
+                } else {
+                    "记录可选程序故障并按该阶段的旁路规则继续"
+                };
+                CliError::Unsimulated(format!(
+                    "{stage} 阶段的工作进程故障、替换与熔断；真实实例会{behavior}"
+                ))
+            })
     }
     /// 请求补丁按次序串联，投递方式只取第一票，重跑只更新参与的后段。
     fn request(
         &mut self,
         req: &mut w::Request,
         retry: Option<Value>,
-    ) -> Result<Option<w::Fail>, String> {
+    ) -> Result<Option<w::Fail>, CliError> {
         if self.cursor == self.units.len() {
             let Some((i, prefix)) = &self.prefix else {
                 return Ok(None);
@@ -387,7 +384,7 @@ impl<W: Write> Trial<'_, W> {
         failure: Option<&Value>,
         attempt: u32,
         fallback: w::Fallback,
-    ) -> Result<(bool, bool, Option<w::ResponsePatch>), String> {
+    ) -> Result<(bool, bool, Option<w::ResponsePatch>), CliError> {
         let mut decision = None;
         let mut reroute = None;
         let mut stop = None;
@@ -493,7 +490,7 @@ impl<W: Write> Trial<'_, W> {
         ))
     }
     /// 心跳走反向链；输出只说明数据是否改变，不回显事件内容。
-    fn heartbeat(&mut self, n: u32, initial: &str) -> Result<(), String> {
+    fn heartbeat(&mut self, n: u32, initial: &str) -> Result<(), CliError> {
         let mut data = initial.as_bytes().to_vec();
         for i in (0..self.units.len()).rev() {
             if self.units[i].has(Stage::Heartbeat) {
@@ -533,7 +530,7 @@ impl<W: Write> Trial<'_, W> {
         mut chunks: Vec<Vec<u8>>,
         cut: bool,
         attempt: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), CliError> {
         let stream_id = format!("sample/{attempt}");
         let meta = json!({"method":req.method,"url":req.url});
         for i in (0..self.units.len()).rev() {
@@ -641,7 +638,7 @@ impl<W: Write> Trial<'_, W> {
         Ok(())
     }
     /// 业务拒绝在接触上游之前终结尝试；自定义响应覆盖默认状态，但诊断仍归属于格式拒绝。
-    fn rejected(&mut self, fail: &w::Fail, attempt: u32, upgraded: bool) -> Result<(), String> {
+    fn rejected(&mut self, fail: &w::Fail, attempt: u32, upgraded: bool) -> Result<(), CliError> {
         trace(
             self.out,
             "result",
@@ -660,7 +657,7 @@ impl<W: Write> Trial<'_, W> {
         upgraded: bool,
         completed: Option<bool>,
         outcome: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), CliError> {
         for i in 0..self.units.len() {
             if self.units[i].has(Stage::Notify) {
                 self.call(i,"notify",json!({"event":"request_end","client":self.client,"delivery":self.mode,"upgraded":upgraded,"attempts":n,"duration_ms":0,"upstream_status":status,"stream_completed":completed,"outcome":outcome,"code":null}))?;
@@ -743,7 +740,7 @@ pub(super) fn run(
     sample: &Path,
     home: Option<&Path>,
     external: bool,
-) -> Result<(), String> {
+) -> Result<(), CliError> {
     if external {
         eprintln!(
             "注意：试跑工具自身不打开网络连接。外部程序会收到样例和环境变量，能任意使用它们，包括访问网络；只运行你信任的程序。"
@@ -761,7 +758,7 @@ fn rehearse(
     home: Option<&Path>,
     external: bool,
     out: &mut impl Write,
-) -> Result<(), String> {
+) -> Result<(), CliError> {
     let chain = tools::chain(path, home, false)?;
     let base = chain
         .config
@@ -1033,6 +1030,7 @@ fn rehearse(
         Value::Null,
         vec!["more_attempts_needed"],
     )
+    .map_err(CliError::from)
 }
 
 #[cfg(test)]
@@ -1044,7 +1042,7 @@ mod tests {
         proxy: &str,
         sample: Value,
         files: &[(&str, &str)],
-    ) -> (Result<(), String>, Vec<Value>) {
+    ) -> (Result<(), CliError>, Vec<Value>) {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("proxy.toml");
         std::fs::write(&p, format!("base_url='https://relay.test'\n{proxy}")).unwrap();

@@ -409,7 +409,7 @@ fn help(name: &str) -> Result<(), String> {
         ),
         "try" => (
             "代理配置 --request 样例 [--home 目录] [--allow-external]",
-            "--request 指定 JSON 请求与模拟上游结果；--home 指定实例工作目录。试跑工具自身不打开网络连接。--allow-external 启动第三方程序，它会收到样例和环境变量，能任意使用它们，包括访问网络。",
+            "--request 指定 JSON 请求与模拟上游结果；--home 指定实例工作目录。试跑工具自身不打开网络连接。--allow-external 启动第三方程序，它会收到样例和环境变量，能任意使用它们，包括访问网络。遇到未模拟的步骤时退出码为 2，不继续输出推测结果。",
             "proxy.toml --request sample.json --home instance",
         ),
         _ => return Err(USAGE.into()),
@@ -418,6 +418,32 @@ fn help(name: &str) -> Result<(), String> {
         "用法：aproxy-format {name} {usage}\n{options}\n-h、--help 显示本说明。\n示例：aproxy-format {name} {example}"
     );
     Ok(())
+}
+/// 普通参数或输入错误与试跑明确不模拟的路径有不同的退出状态，调用者不需解析中文文案。
+#[derive(Debug)]
+enum CliError {
+    /// 命令或角色无法处理输入。
+    Invalid(String),
+    /// 已到达需要真实实例才能给出答案的步骤。
+    Unsimulated(String),
+}
+impl From<String> for CliError {
+    fn from(s: String) -> Self {
+        Self::Invalid(s)
+    }
+}
+impl From<&str> for CliError {
+    fn from(s: &str) -> Self {
+        Self::Invalid(s.into())
+    }
+}
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(s) => f.write_str(s),
+            Self::Unsimulated(s) => write!(f, "未模拟：{s}"),
+        }
+    }
 }
 /// 失败诊断始终写 stderr，不破坏 stdout 上的逐行协议。
 pub fn run() {
@@ -432,26 +458,32 @@ pub fn run() {
                 .iter()
                 .any(|arg| matches!(arg.as_str(), "--help" | "-h")) =>
         {
-            help(name)
+            help(name).map_err(CliError::from)
         }
         Some((name, rest)) if matches!(name.as_str(), "init" | "check" | "try") => {
             tools::run(name, rest)
         }
-        Some((name, rest)) if name == "translate" => translate_once(rest).map_err(String::from),
-        Some((name, rest)) => Role::load(name, rest).and_then(|role| {
-            worker(
-                name,
-                role,
-                std::io::stdin().lock(),
-                std::io::stdout().lock(),
-            )
-            .map_err(String::from)
-        }),
+        Some((name, rest)) if name == "translate" => translate_once(rest).map_err(CliError::from),
+        Some((name, rest)) => Role::load(name, rest)
+            .and_then(|role| {
+                worker(
+                    name,
+                    role,
+                    std::io::stdin().lock(),
+                    std::io::stdout().lock(),
+                )
+                .map_err(String::from)
+            })
+            .map_err(CliError::from),
         None => Err(USAGE.into()),
     };
     if let Err(e) = result {
         eprintln!("aproxy-format: {e}");
-        std::process::exit(1);
+        std::process::exit(if matches!(e, CliError::Unsimulated(_)) {
+            2
+        } else {
+            1
+        });
     }
 }
 

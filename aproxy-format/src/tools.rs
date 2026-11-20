@@ -558,7 +558,7 @@ fn unchecked<'a>(roles: impl IntoIterator<Item = &'a Role>, proxy: bool, externa
     }
 }
 /// 工具的参数与角色协议分开解析，未知参数可能含密钥，不在用法错误中回显。
-pub(super) fn run(name: &str, args: &[String]) -> Result<(), String> {
+pub(super) fn run(name: &str, args: &[String]) -> Result<(), crate::CliError> {
     let mut words = Vec::new();
     let mut home = None;
     let mut args = args.iter().map(String::as_str);
@@ -576,7 +576,7 @@ pub(super) fn run(name: &str, args: &[String]) -> Result<(), String> {
         }
     }
     match (name, words.as_slice()) {
-        ("init", [s, "--output", p]) => init(s, Path::new(p)),
+        ("init", [s, "--output", p]) => init(s, Path::new(p)).map_err(crate::CliError::from),
         ("check", [p]) => {
             let c = chain(Path::new(p), home, true)?;
             for n in c.notes { println!("提示：{n}"); }

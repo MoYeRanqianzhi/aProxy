@@ -407,7 +407,7 @@ async fn retry_last_response_omitted_after_chain_and_connect_failures() {
     std::fs::write(
         &script,
         serde_json::json!({
-            "retry:2":{"fail":{"retry":true,"reason":"no dispatch"}},
+            "retry:2":{"fail":{"retry":true,"reason":"no dispatch"},"overrides":{"retry":{"max_attempts":3}}},
             "retry:3":{"request":{"url":format!("http://127.0.0.1:{port}/")}}
         })
         .to_string(),
@@ -605,6 +605,62 @@ async fn overrides_apply_to_one_request_and_unknown_keys_are_ignored() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 3);
 }
 
+/// 渠道 A 的首字节时限不属于下一轮；B 不给值时恢复实例或未重跑前缀的时限。
+#[tokio::test]
+async fn rerouting_restores_timeout_before_channel_b_omits_it() {
+    use std::sync::atomic::Ordering;
+    for prefix in [false, true] {
+        let home = TestHome::new();
+        let (a, _) = upstream(&[503]).await;
+        let (b, release, busy) = held_upstream(&[200], "wrong timeout").await;
+        let (c, finished) = upstream(&[200]).await;
+        let script = home.path().join("route.json");
+        std::fs::write(&script, serde_json::json!({
+            "request":{"request":{"url":format!("http://127.0.0.1:{a}/")},"overrides":{"timeouts":{"first_byte_secs":40}}},
+            "retry:2":{"request":{"url":format!("http://127.0.0.1:{b}/")}},
+            "retry:3":{"request":{"url":format!("http://127.0.0.1:{c}/")}}
+        }).to_string()).unwrap();
+        let mut cfg = format!("timeouts.first_byte_secs={}\n", if prefix { 80 } else { 4 });
+        if prefix {
+            cfg += &layer(
+                &home,
+                "prefix",
+                "'request'",
+                &[
+                    "reply",
+                    r#"{"overrides":{"timeouts":{"first_byte_secs":4}}}"#,
+                ],
+            );
+        }
+        cfg += &layer(
+            &home,
+            "route",
+            "'request','retry'",
+            &["reply-by-stage", script.to_str().unwrap()],
+        );
+        let (client, url, mut clock) = Clock::start(&home, a, &cfg);
+        let response = tokio::spawn(client.get(url).send());
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while busy.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        clock.advance(5);
+        release.add_permits(1);
+        assert_eq!(
+            response.await.unwrap().unwrap().text().await.unwrap(),
+            "upstream bytes",
+            "prefix={prefix}"
+        );
+        assert_eq!(finished.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            frames(&home, "route")[3]["retry"]["last_failure"]["code"],
+            "upstream_first_byte_timeout"
+        );
+    }
+}
 /// 第一层能在静默请求上开启保活；另一层慢到已提交后才返回，不能把流改用另一种心跳。
 #[tokio::test]
 async fn keepalive_overrides_observe_the_commit_between_layers() {

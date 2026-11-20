@@ -34,9 +34,49 @@ impl OutboundRequest {
         self.replacement.as_deref().unwrap_or(&self.body)
     }
 }
+/// 只在程序确实给出覆盖时保留入口配置；重跑时只恢复可覆盖的叶键，不撤销投递升级。
+#[derive(Clone)]
+struct OverrideInput {
+    /// 共享当时的配置，不因普通的无覆盖请求复制配置或凭据。
+    config: Arc<Config>,
+    /// 连接超时属于连接池；恢复原 client 也保留其可复用的连接。
+    client: reqwest::Client,
+    /// 程序设置的次数上限独立于配置文件中的重试规则。
+    max_attempts: Option<u32>,
+}
+impl OverrideInput {
+    /// 在改写前记录重试段或失败层的有效输入。
+    fn capture(state: &AppState, max_attempts: Option<u32>) -> Self {
+        Self {
+            config: state.config.clone(),
+            client: state.client.clone(),
+            max_attempts,
+        }
+    }
+    /// 还原程序可以修改的字段。已提交的 SSE 保活不能因切换渠道而变回未提交配置。
+    fn restore(self, state: &mut AppState, chain: &mut RequestChain, responder: &mut Responder) {
+        let cfg = Arc::make_mut(&mut state.config);
+        cfg.connect_timeout_secs = self.config.connect_timeout_secs;
+        cfg.first_byte_timeout_secs = self.config.first_byte_timeout_secs;
+        cfg.read_timeout_secs = self.config.read_timeout_secs;
+        cfg.max_retry_backoff_secs = self.config.max_retry_backoff_secs;
+        state.client = self.client;
+        chain.max_attempts = self.max_attempts;
+        if !responder.is_committed() {
+            cfg.keepalive_interval_secs = self.config.keepalive_interval_secs;
+            cfg.keepalive_trigger
+                .clone_from(&self.config.keepalive_trigger);
+            cfg.keepalive_heartbeat
+                .clone_from(&self.config.keepalive_heartbeat);
+            responder.configure_beats(cfg, chain.accept, chain.body_stream.unwrap_or(false));
+        }
+    }
+}
 /// 首个 retry 层前的输入。磁盘正文只留句柄，不因排队或保留前缀而整份进内存。
 #[derive(Clone)]
 struct Prefix {
+    /// 重试段第一次改变覆盖之前的有效配置；前缀已经生效的值属于输入。
+    overrides: Option<OverrideInput>,
     /// 重试段的首层位置。
     cursor: usize,
     /// 正文之外的协议字段。
@@ -58,6 +98,8 @@ pub(super) struct RequestChain {
     input: wire::Request,
     /// 首个 retry 程序之前的缓存，与该层后续改写互不影响。
     prefix: Option<Prefix>,
+    /// 失败回信仍可限制当次尝试，但重跑同一层之前必须撤掉该回信的覆盖。
+    failed_overrides: Option<OverrideInput>,
     /// 当前改写体与重试前缀、上游重放共享；未改写时从客户端原体读取。
     body: Option<Arc<RequestBody>>,
     /// 未被补丁整表替换的头保留原来的多值和非 ASCII 字节。
@@ -114,6 +156,7 @@ impl RequestChain {
         Self {
             input,
             prefix: None,
+            failed_overrides: None,
             body: None,
             headers: req.headers.clone(),
             body_version: 0,
@@ -210,7 +253,7 @@ impl RequestChain {
         pending: &mut Option<ClientUpload>,
     ) -> Result<bool, ChainError> {
         if self.cursor == state.formats.len() {
-            let Some(p) = &self.prefix else {
+            let Some(p) = &mut self.prefix else {
                 return Ok(false);
             };
             self.cursor = p.cursor;
@@ -221,11 +264,17 @@ impl RequestChain {
             self.body = p.body.clone();
             self.prepare_original = p.prepare_original;
             self.stage = Stage::Retry;
+            if let Some(previous) = p.overrides.take() {
+                previous.restore(state, self, responder);
+            }
+        } else if let Some(previous) = self.failed_overrides.take() {
+            previous.restore(state, self, responder);
         }
         while self.cursor < state.formats.len() {
             let pool = state.formats[self.cursor].clone();
             if self.prefix.is_none() && pool.entry.has_stage(Stage::Retry) {
                 self.prefix = Some(Prefix {
+                    overrides: None,
                     cursor: self.cursor,
                     method: req.method.clone(),
                     input: self.input.clone(),
@@ -364,6 +413,15 @@ impl RequestChain {
                                 && overrides.contains_key("keepalive")
                             {
                                 self.body_stream = Some(request_body_wants_stream(&req.body).await);
+                            }
+                            if let Some(prefix) = &mut self.prefix {
+                                prefix.overrides.get_or_insert_with(|| {
+                                    OverrideInput::capture(state, self.max_attempts)
+                                });
+                            }
+                            if reply.fail.as_ref().is_some_and(|f| f.retry) {
+                                self.failed_overrides =
+                                    Some(OverrideInput::capture(state, self.max_attempts));
                             }
                             self.apply_overrides(state, overrides, responder);
                         }

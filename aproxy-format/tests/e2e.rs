@@ -2443,3 +2443,49 @@ fn check_requires_request_state_for_auto_return_conversion() {
         }
     }
 }
+
+/// 模板供操作者直接编辑；文字说明与磁盘文件一致，带空格的路径仍能作 TOML 参数解析。
+#[test]
+fn init_explains_files_and_generates_editable_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("with spaces");
+    let out = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+        .args(["init", "adaptive-relay", "--output"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    for term in [
+        "已生成",
+        "adaptive.toml",
+        "keys.toml",
+        "config.toml",
+        "下一步",
+        "RELAY_KEY_A、RELAY_KEY_B",
+        "aproxy-format check",
+        "启动或重启",
+    ] {
+        assert!(text.contains(term), "{text}");
+    }
+    let proxy = std::fs::read_to_string(root.join("config.toml")).unwrap();
+    assert!(proxy.contains("first_byte_secs = 600"));
+    let mut prev = "";
+    for line in proxy.lines() {
+        if line == "[[format]]" {
+            assert!(prev.starts_with("# "), "{proxy}");
+        }
+        prev = line;
+    }
+    assert!(!proxy.contains(r"\\?\"));
+    if cfg!(windows) {
+        assert!(proxy.contains(&format!("'{}'", root.join("keys.toml").display())));
+    }
+    let parsed: toml::Value = toml::from_str(&proxy).unwrap();
+    assert_eq!(parsed["format"].as_array().unwrap().len(), 3);
+    assert!(
+        std::fs::read_to_string(root.join("keys.toml"))
+            .unwrap()
+            .contains("# ")
+    );
+}

@@ -336,55 +336,155 @@ fn init(scenario: &str, dir: &Path) -> Result<(), String> {
     }
     fs::create_dir_all(dir).map_err(|_| "无法创建输出目录")?;
     let base = dir.canonicalize().map_err(|_| "输出目录无效")?;
+    // 短盘符路径仅在普通拼写仍然指向同一目录时去掉 verbatim 前缀；长路径和特殊名称保留原样。
+    #[cfg(windows)]
+    let base = base
+        .to_str()
+        .and_then(|p| p.strip_prefix(r"\\?\"))
+        .filter(|p| {
+            Path::new(p).is_absolute() && p.encode_utf16().count() + "\\adaptive.toml".len() < 260
+        })
+        .map(PathBuf::from)
+        .filter(|p| p.canonicalize().is_ok_and(|actual| actual == base))
+        .unwrap_or(base);
     let mut files = Vec::new();
     let mut proxy = if scenario == "openrouter" {
-        String::from("base_url = 'https://openrouter.ai'\n")
+        String::from(
+            "# OpenRouter 的上游地址；使用自建网关时同步修改 route.toml。\nbase_url = 'https://openrouter.ai'\n",
+        )
     } else {
-        String::from("base_url = 'https://relay.example.com'\n")
+        String::from(
+            "# 替换为实际中继地址；使用密钥池时也要修改 keys.toml 的 origin。\nbase_url = 'https://relay.example.com'\n",
+        )
     };
-    // 角色配置用绝对位置，生成的代理由不同工作目录启动时仍然引用同一文件。
-    let file_arg =
-        |name: &str| serde_json::to_string(&base.join(name)).map_err(|_| "角色配置路径无效");
+    // TOML 字面串保留 Windows 反斜杠。遇到单引号或控制字符才转为带转义的基本串。
+    let file_arg = |name: &str| -> Result<String, &'static str> {
+        let joined = base.join(name);
+        let path = joined.to_str().ok_or("角色配置路径无效")?;
+        if !path.contains('\'') && !path.chars().any(char::is_control) {
+            Ok(format!("'{path}'"))
+        } else {
+            serde_json::to_string(path).map_err(|_| "角色配置路径无效")
+        }
+    };
     if scenario == "adaptive-relay" {
-        proxy += "\n[timeouts]\nfirst_byte_secs=600\n\n[[retry.rules]]\npath='/v1/messages/count_tokens(\\?.*)?'\nmax_attempts=3\n";
-        files.push(("adaptive.toml", "failure_threshold = 2\n".to_owned()));
+        proxy += r#"
+[timeouts]
+# 慢模型可适当延长首字节时限，单位为秒。
+first_byte_secs = 600
+
+[[retry.rules]]
+# 只限制计数接口的尝试次数，其他请求沿用实例策略。
+path = '/v1/messages/count_tokens(\?.*)?'
+max_attempts = 3
+"#;
+        files.push((
+            "adaptive.toml",
+            "# 连续失败达到次数后切换交付模式；按中继稳定性调整。\nfailure_threshold = 2\n"
+                .to_owned(),
+        ));
         proxy += &format!(
-            "\n[[format]]\nname='adaptive'\ncommand='aproxy-format'\nargs=['adaptive','--config',{}]\nprocess='persistent'\nstages=['request','decide','notify']\nrequired=false\npool_max=1\nworker_idle_secs=0\n",
+            r#"
+# 根据近期失败情况选择交付模式；阈值在 adaptive.toml 中设置。
+[[format]]
+name = 'adaptive'
+command = 'aproxy-format'
+args = ['adaptive', '--config', {}]
+process = 'persistent'
+stages = ['request', 'decide', 'notify']
+required = false
+pool_max = 1
+worker_idle_secs = 0
+"#,
             file_arg("adaptive.toml")?
         );
     }
     if scenario == "openrouter" {
-        files.push(("route.toml","[[channel]]\nid='openrouter'\nurl='https://openrouter.ai/api/v1/chat/completions'\ncredential_env='OPENROUTER_API_KEY'\n".into()));
+        files.push((
+            "route.toml",
+            r#"[[channel]]
+# 渠道标识用来区分候选上游，可自行命名。
+id = 'openrouter'
+# 替换为接收 Chat Completions 的完整上游地址。
+url = 'https://openrouter.ai/api/v1/chat/completions'
+# 只写存放凭据的环境变量名，不要填入密钥本身。
+credential_env = 'OPENROUTER_API_KEY'
+"#
+            .into(),
+        ));
         proxy += &format!(
-            "\n[[format]]\nname='route'\ncommand='aproxy-format'\nargs=['route','--config',{}]\nprocess='persistent'\nstages=['request','retry']\n",
+            r#"
+# 选用 route.toml 中的渠道；重试时重新选择。
+[[format]]
+name = 'route'
+command = 'aproxy-format'
+args = ['route', '--config', {}]
+process = 'persistent'
+stages = ['request', 'retry']
+"#,
             file_arg("route.toml")?
         );
     }
     if scenario != "key-rotation" {
         let (from, stages) = if scenario == "openrouter" {
-            ("auto", "'request','retry','stream'")
+            ("auto", "'request', 'retry', 'stream'")
         } else {
-            ("anthropic_messages", "'request','stream'")
+            ("anthropic_messages", "'request', 'stream'")
         };
         proxy += &format!(
-            "\n[[format]]\nname='convert'\ncommand='aproxy-format'\nargs=['convert','--from','{from}','--to','openai_chat']\nprocess='persistent'\nstages=[{stages}]\nrequired=true\n"
+            r#"
+# 在客户端与中继的协议间转换；按两端协议修改 --from 和 --to。
+[[format]]
+name = 'convert'
+command = 'aproxy-format'
+args = ['convert', '--from', '{from}', '--to', 'openai_chat']
+process = 'persistent'
+stages = [{stages}]
+required = true
+"#
         );
     }
     if matches!(scenario, "key-rotation" | "adaptive-relay") {
-        files.push(("keys.toml","[[pool]]\norigin='https://relay.example.com'\nheader='authorization'\nscheme='Bearer'\nkeys=[{id='a',env='RELAY_KEY_A'},{id='b',env='RELAY_KEY_B'}]\n".into()));
+        files.push((
+            "keys.toml",
+            r#"[[pool]]
+# 替换为允许接收这些密钥的来源，须与实际中继的协议、主机和端口一致。
+origin = 'https://relay.example.com'
+# 按中继要求选择鉴权头和前缀。
+header = 'authorization'
+scheme = 'Bearer'
+keys = [
+    # 第一把密钥：可修改标识和变量名，变量值在环境中设置。
+    { id = 'a', env = 'RELAY_KEY_A' },
+    # 第二把密钥：按需增删条目，不在文件里写入密钥。
+    { id = 'b', env = 'RELAY_KEY_B' },
+]
+"#
+            .into(),
+        ));
         proxy += &format!(
-            "\n[[format]]\nname='keys'\ncommand='aproxy-format'\nargs=['keys','--config',{}]\nprocess='persistent'\nstages=['request','retry']\npool_max=1\nworker_idle_secs=0\n",
+            r#"
+# 在同一中继的密钥之间轮换；在 keys.toml 中设置来源和环境变量名。
+[[format]]
+name = 'keys'
+command = 'aproxy-format'
+args = ['keys', '--config', {}]
+process = 'persistent'
+stages = ['request', 'retry']
+pool_max = 1
+worker_idle_secs = 0
+"#,
             file_arg("keys.toml")?
         );
     }
-    files.push(("config.toml", proxy));
+    files.insert(0, ("config.toml", proxy));
     if files
         .iter()
         .any(|(n, _)| base.join(n).symlink_metadata().is_ok())
     {
         return Err("输出文件已存在，不覆盖".into());
     }
-    for (name, text) in files {
+    for (name, text) in &files {
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -392,6 +492,27 @@ fn init(scenario: &str, dir: &Path) -> Result<(), String> {
             .map_err(|_| "无法新建输出文件")?;
         f.write_all(text.as_bytes()).map_err(|_| "写入配置失败")?;
     }
+    println!("已生成（{}）：", base.display());
+    for (name, _) in files {
+        let purpose = match name {
+            "config.toml" => "实例配置里的 [[format]] 链",
+            "keys.toml" => "keys 的配置",
+            "route.toml" => "route 的配置",
+            _ => "adaptive 的配置",
+        };
+        println!("  {name}   {purpose}");
+    }
+    println!("下一步：");
+    match scenario {
+        "openrouter" => println!("  1. 设置环境变量 OPENROUTER_API_KEY（密钥不写进文件）"),
+        "claude-relay" => println!("  1. 把 base_url 改为实际中继地址"),
+        _ => println!("  1. 设置环境变量 RELAY_KEY_A、RELAY_KEY_B（密钥不写进文件）"),
+    }
+    println!(
+        "  2. 检查：aproxy-format check \"{}\"",
+        base.join("config.toml").display()
+    );
+    println!("  3. 把 config.toml 的内容并入实例的配置，然后启动或重启实例");
     Ok(())
 }
 /// 按名字去重列出未检查的凭据；控制字符转义，诊断不能被配置里的换行或转义序列伪造。

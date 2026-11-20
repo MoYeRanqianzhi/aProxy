@@ -55,12 +55,24 @@ impl UsageTotals {
                 )
             }
             F::OpenAiResponses => {
-                let details = &usage["input_tokens_details"];
+                let prompt = &usage["prompt_tokens_details"];
+                let details = usage.get("input_tokens_details").unwrap_or(prompt);
+                // 读取缓存量按整张明细表取别名，写入量则按各表中的计数字段回退。
+                let write = [
+                    &usage["input_tokens_details"]["cache_write_tokens"],
+                    &prompt["cache_write_tokens"],
+                    &prompt["cache_creation_tokens"],
+                ];
                 (
-                    &usage["input_tokens"],
-                    &usage["output_tokens"],
+                    usage.get("input_tokens").unwrap_or(&usage["prompt_tokens"]),
+                    usage
+                        .get("output_tokens")
+                        .unwrap_or(&usage["completion_tokens"]),
                     &details["cached_tokens"],
-                    &details["cache_write_tokens"],
+                    write
+                        .into_iter()
+                        .find(|v| !v.is_null())
+                        .unwrap_or(&Value::Null),
                 )
             }
         };

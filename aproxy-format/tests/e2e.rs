@@ -1332,6 +1332,31 @@ fn token_usage_is_checked_before_encoding() {
         "--to",
         "openai_responses",
     ]);
+    // 缓冲解码器同时接受 Chat 拼法；首选字段存在时不能再把别名计入总量。
+    for (usage, valid) in [
+        (
+            json!({"prompt_tokens":u64::MAX,"completion_tokens":1}),
+            false,
+        ),
+        (
+            json!({"prompt_tokens":1,"prompt_tokens_details":{"cached_tokens":2}}),
+            false,
+        ),
+        (
+            json!({"input_tokens":1,"input_tokens_details":{},"prompt_tokens_details":{"cache_creation_tokens":2}}),
+            false,
+        ),
+        (
+            json!({"input_tokens":1,"prompt_tokens":u64::MAX,"output_tokens":1,"completion_tokens":u64::MAX,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":1},"prompt_tokens_details":{"cached_tokens":20,"cache_creation_tokens":20}}),
+            true,
+        ),
+    ] {
+        let reply = w.frame(response(
+            &Value::Null,
+            &json!({"model":"m","output":[],"usage":usage}).to_string(),
+        ));
+        assert_eq!(reply["fail"].is_null(), valid, "{reply}");
+    }
     for usage in [
         json!({"input_tokens":5,"output_tokens":3,"total_tokens":7}),
         json!({"input_tokens":1,"output_tokens":1,"input_tokens_details":{"cached_tokens":2}}),

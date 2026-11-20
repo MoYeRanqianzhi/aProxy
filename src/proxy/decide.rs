@@ -48,7 +48,7 @@ async fn observed(upstream: &UpstreamResponse) -> Option<wire::ObservedResponse>
         .ok()
         .map(|v| v.unwrap_or("").to_owned());
     let len = upstream.body.len();
-    let (cancel, alive) = tokio::sync::oneshot::channel();
+    let (cancel, alive) = tokio::sync::oneshot::channel::<()>();
     let task = match &upstream.body {
         SpooledBody::Memory(b) => {
             let bytes = b.clone();

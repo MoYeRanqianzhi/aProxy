@@ -6476,6 +6476,8 @@ async fn interrupted_forward_gather_consults_decide_before_exposing_a_prefix() {
                     },
                 ],
             )
+            // stop 分支的外层永不答 open，即使它已取得 worker，也不能阻塞内层已经报告的中断。
+            + &if retry {String::new()} else {layer(&home,"outer","'stream'", &["no-stage-reply"]) + "timeout_secs=0\n"}
             + &layer(&home, "buffer", "'response'", &["echo"]);
         let (c, url) = running(&home, port, &cfg);
         let response = c.get(&url).send().await.unwrap();

@@ -643,7 +643,7 @@ pub(super) async fn run_attempts(
                             || started.is_none()) =>
                 {
                     // 只在可能升级的响应链上设交接点。不拉取首块来探测错误，否则会破坏实时转发。
-                    let (tx, mut failure) = if started.is_some()
+                    let (tx, failure) = if started.is_some()
                         && resp.status().is_success()
                         && (state.has_format(Stage::Response) || state.has_format(Stage::Stream))
                     {
@@ -662,21 +662,33 @@ pub(super) async fn run_attempts(
                         resp,
                         tx,
                     );
-                    let Some(response) = r.wait(stream, None, "forward response").await else {
-                        return;
-                    };
-                    // close 与发送错误二者必有其一先成功；在此交付边界之后不再咨询或回放。
-                    if let Some(rx) = &mut failure {
-                        rx.close();
-                    }
-                    if let Some(f) = failure.and_then(|mut rx| rx.try_recv().ok()) {
-                        f
-                    } else {
-                        match response {
-                            Ok(resp) => r.respond(resp),
-                            Err(t) => r.finish(t, &trace).await,
+                    // 外层 open 可以无限等待。整包层一旦报告上游中断，马上释放未交付的链；
+                    // 若两边同时就绪，已经送达的错误仍先于响应头；交付之后则关闭这条回路。
+                    let delivery = async {
+                        tokio::pin!(stream);
+                        if let Some(mut rx) = failure {
+                            tokio::select! {
+                                biased;
+                                outcome = &mut rx => if let Ok(f) = outcome { return Err(f); },
+                                response = &mut stream => {
+                                    rx.close();
+                                    if let Ok(f) = rx.try_recv() { return Err(f); }
+                                    return Ok(response);
+                                }
+                            }
                         }
-                        return;
+                        Ok(stream.await)
+                    };
+                    match r.wait(delivery, None, "forward response").await {
+                        None => return,
+                        Some(Err(f)) => f,
+                        Some(Ok(response)) => {
+                            match response {
+                                Ok(resp) => r.respond(resp),
+                                Err(t) => r.finish(t, &trace).await,
+                            }
+                            return;
+                        }
                     }
                 }
                 Ok(resp) => {

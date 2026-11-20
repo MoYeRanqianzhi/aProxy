@@ -6,6 +6,10 @@ use switchyard_translation::{StreamTranslationState, TranslationEngine, WireForm
 /// 单个尚未结束的 SSE 事件上限，与整条流的长度无关。
 const MAX_EVENT: usize = 8 * 1024 * 1024;
 
+/// 编解码器可能保留整轮文本和工具参数，Responses 的最后一帧还会重复这些数据。
+/// 分别限制累计送入语义层的 JSON 字节、单条回信的目标字节；为 8 MiB 管道帧中的 JSON 转义留余量。
+pub(super) const SEMANTIC_BYTES: usize = 1024 * 1024;
+
 /// 当前事件跨协议转换所需的字节边界、语义状态和终止标记。
 pub(super) struct Events {
     /// 上游返回的协议。
@@ -16,6 +20,8 @@ pub(super) struct Events {
     engine: TranslationEngine,
     /// 工具调用、usage 与结束原因在多个源事件间关联。
     state: StreamTranslationState,
+    /// 只对有语义的完整事件扣费，注释与网络分片不改变预算。
+    remaining: usize,
     /// 只积累尚未被空行分隔的一帧，行结束已统一成 LF。
     frame: Vec<u8>,
     /// CR 已结束上一行，下一字节若是 LF 则属于同一换行。
@@ -35,6 +41,7 @@ impl Events {
             target,
             engine: TranslationEngine::default(),
             state: Default::default(),
+            remaining: SEMANTIC_BYTES,
             frame: Vec::new(),
             after_cr: false,
             first: true,
@@ -92,6 +99,7 @@ impl Events {
             self.terminal = true;
             return Ok(());
         }
+        self.remaining = self.remaining.checked_sub(data.len()).ok_or_else(budget)?;
         let event: Value = serde_json::from_str(data).map_err(|_| malformed())?;
         if !event.is_object() {
             return Err(malformed());
@@ -129,7 +137,8 @@ impl Events {
             .map_err(|_| malformed())?;
         render(self.target, events, &mut output)?;
         if self.target == F::OpenAiChat && !self.state.errored {
-            output.push_str("data: [DONE]\n\n");
+            std::fmt::Write::write_str(&mut Bounded(&mut output), "data: [DONE]\n\n")
+                .map_err(|_| budget())?;
         }
         Ok(output)
     }
@@ -152,18 +161,38 @@ impl Events {
 fn malformed() -> Fault {
     Fault::new("无法转换流事件", "invalid stream event")
 }
+/// 不暴露内容或长度，工作进程在超限后直接输出目标协议的错误结尾。
+fn budget() -> Fault {
+    Fault::new(
+        "流转换超过 1 MiB 语义预算",
+        "stream conversion exceeds the semantic budget",
+    )
+}
+/// 直接限制渲染目的地，而不是等终态快照与多份 done 事件全部写进字符串后才检查。
+struct Bounded<'a>(&'a mut String);
+impl std::fmt::Write for Bounded<'_> {
+    /// 格式化器可分多次写片段，总是先检查余量再分配目标空间。
+    fn write_str(&mut self, chunk: &str) -> std::fmt::Result {
+        if chunk.len() > SEMANTIC_BYTES.saturating_sub(self.0.len()) {
+            return Err(std::fmt::Error);
+        }
+        self.0.push_str(chunk);
+        Ok(())
+    }
+}
 /// Chat 使用匿名 data 事件，其余两种协议都以 JSON 的 type 命名 SSE 事件。
 fn render(target: F, events: Vec<Value>, output: &mut String) -> Result<(), Fault> {
     use std::fmt::Write as _;
+    let mut output = Bounded(output);
     for event in events {
         if target != F::OpenAiChat {
             let name = event["type"].as_str().ok_or_else(malformed)?;
             if name.contains(['\r', '\n']) {
                 return Err(malformed());
             }
-            writeln!(output, "event: {name}").expect("write to String");
+            writeln!(output, "event: {name}").map_err(|_| budget())?;
         }
-        write!(output, "data: {event}\n\n").expect("write to String");
+        write!(output, "data: {event}\n\n").map_err(|_| budget())?;
     }
     Ok(())
 }

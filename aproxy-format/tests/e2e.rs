@@ -985,3 +985,37 @@ fn malformed_stream_ends_in_the_client_protocol_only_once() {
             .is_empty()
     );
 }
+
+/// 逐个发送的小事件也会让 Responses 保留整轮文本；到达总预算必须错误结束而不是等到 close 爆帧。
+#[test]
+fn semantic_budget_counts_complete_events_across_frames() {
+    let mut w = Worker::new(&[
+        "convert",
+        "--from",
+        "openai_responses",
+        "--to",
+        "openai_chat",
+    ]);
+    open_stream(&mut w, "text/event-stream");
+    let event = json!({"choices":[{"index":0,"delta":{"content":"x".repeat(32*1024)}}]});
+    let bytes = format!("data: {event}\n\n");
+    let mut ended = false;
+    for _ in 0..34 {
+        let reply = stream_frame(&mut w, "data", &bytes);
+        assert!(reply["fail"].is_null());
+        let data = reply["data"].as_str().unwrap();
+        if ended {
+            assert!(data.is_empty());
+        } else if data.contains("event: error\n") {
+            ended = true;
+        } else {
+            assert!(data.contains("response.output_text.delta"));
+        }
+    }
+    assert!(ended);
+    assert!(
+        !stream_frame(&mut w, "close", "")
+            .to_string()
+            .contains("response.completed")
+    );
+}

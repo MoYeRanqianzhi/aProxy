@@ -576,6 +576,7 @@ impl<W: Write> Trial<'_, W> {
             }
             if let Some(resp) = response {
                 let mut obs = resp.clone();
+                obs.headers.remove("content-length");
                 if let Some(data) = resp.body.as_bytes() {
                     let encoding = resp
                         .headers
@@ -714,6 +715,7 @@ impl<W: Write> Trial<'_, W> {
         cut: bool,
         attempt: u32,
     ) -> Result<bool, CliError> {
+        resp.headers.remove("content-length");
         let mut converted = false;
         let nested = self.units.iter().filter(|u| u.has(Stage::Stream)).count() > 1;
         let nested_end = || {
@@ -1262,14 +1264,28 @@ fn rehearse(
             || attempt.body.as_ref().map(bytes).into_iter().collect(),
             |c| c.into_iter().map(String::into_bytes).collect(),
         );
-        let mut resp = attempt.status.map(|status| {
+        let mut resp = if let Some(status) = attempt.status {
             let mut r = w::Response::new(status);
-            r.headers = attempt.headers;
+            // 样本不是 reqwest 的 HeaderMap，先恢复大小写无关的 HTTP 语义。长度仍留给下一次 retry 的原头。
+            for (k, v) in attempt.headers {
+                let key =
+                    http::HeaderName::from_bytes(k.as_bytes()).map_err(|_| "样例头名称无效")?;
+                let val = http::HeaderValue::from_str(&v).map_err(|_| "样例头值无效")?;
+                val.to_str().map_err(|_| "样例头值无效")?;
+                if (!aproxy_ipc::redact::is_managed_request_header(key.as_str())
+                    || key == http::header::CONTENT_LENGTH)
+                    && r.headers.insert(key.to_string(), v).is_some()
+                {
+                    return Err("样例存在大小写重复的响应头".into());
+                }
+            }
             if !attempt.interrupted && attempt.failure.is_none() {
                 r.body = w::Body::from_bytes(chunks.concat());
             }
-            r
-        });
+            Some(r)
+        } else {
+            None
+        };
         let forward = t.mode == "forward";
         let has_decide = t.units.iter().any(|u| u.has(Stage::Decide));
         let has_response = t.units.iter().any(|u| u.has(Stage::Response));
@@ -1641,6 +1657,13 @@ mod tests {
         let policy = "[[format]]\ncommand='aproxy-format'\nargs=['policy','--config','p.toml']\nstages=['decide']";
         let buffered = "\n[[format]]\nname='buffer'\ncommand='aproxy-format'\nargs=['convert','--from','openai_chat','--to','openai_chat']\nstages=['response']";
         for (mode, layers, attempt, code, votes) in [
+            (
+                "retry",
+                "",
+                json!({"status":200,"headers":{"Content-Type":"application/x-ndjson"},"body":"{\"ok\":true}\n{\"error\":\"sample\"}\n"}),
+                "upstream_error_body",
+                true,
+            ),
             (
                 "retry",
                 "",

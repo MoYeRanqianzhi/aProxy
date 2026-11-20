@@ -137,6 +137,17 @@ impl Events {
         if !event.is_object() {
             return Err(malformed());
         }
+        // 只看源协议正式的错误形状。私有提供方错误页和诊断永不直接进入客户端协议。
+        let failed = match self.source {
+            F::OpenAiChat => event["error"].is_object(),
+            F::AnthropicMessages => event["type"] == "error",
+            F::OpenAiResponses => {
+                matches!(event["type"].as_str(), Some("error" | "response.failed"))
+            }
+        };
+        if failed {
+            return Err(Fault::new("上游事件流报告失败", "upstream stream failed"));
+        }
         visible_refusal(self.source, &mut event);
         if self.source == F::OpenAiResponses && event["type"] == "response.incomplete" {
             self.incomplete_reason = Some(match event["response"]["incomplete_details"]["reason"]
@@ -165,18 +176,15 @@ impl Events {
                 }
                 // Chat 只有 error 对象表示错误；某些兼容服务会在普通块写 error:null。
                 // 宽松的源解码器仅检查键是否存在，不能把这个占位误译成终态。
-                let error = event["error"].is_object();
-                if !error && let Some(obj) = event.as_object_mut() {
+                if let Some(obj) = event.as_object_mut() {
                     obj.remove("error");
                 }
-                error
+                false
             }
-            F::AnthropicMessages => {
-                matches!(event["type"].as_str(), Some("message_stop" | "error"))
-            }
+            F::AnthropicMessages => event["type"] == "message_stop",
             F::OpenAiResponses => matches!(
                 event["type"].as_str(),
-                Some("response.completed" | "response.incomplete" | "response.failed" | "error")
+                Some("response.completed" | "response.incomplete")
             ),
         };
         if self.source == F::AnthropicMessages && self.target == F::OpenAiChat {
@@ -361,10 +369,10 @@ impl Events {
     }
     /// 已提交后不能更改 HTTP 状态，原因使用本地固定文本而非上游响应。
     pub(super) fn ending(&self, fault: &Fault) -> String {
-        self.error_event(if fault.wire == LIMIT_REASON {
-            LIMIT_REASON
-        } else {
-            "stream conversion aborted"
+        self.error_event(match fault.wire {
+            LIMIT_REASON => LIMIT_REASON,
+            "upstream stream failed" => fault.wire,
+            _ => "stream conversion aborted",
         })
     }
     /// 活 worker 知道已交付的位置。附带的 error 对象让 SDK 在聚合生命周期前就报告错误。

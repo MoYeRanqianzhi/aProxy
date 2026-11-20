@@ -1046,6 +1046,60 @@ fn malformed_stream_ends_in_the_client_protocol_only_once() {
     );
 }
 
+/// 六个方向都把源协议的失败变成一个有类型的本地错误；正常 EOF 和随后的断线均不再重复。
+#[test]
+fn provider_errors_emit_one_typed_client_error() {
+    for (source, error) in [
+        (
+            "openai_chat",
+            json!({"error":{"message":"private-fixture"}}),
+        ),
+        (
+            "anthropic_messages",
+            json!({"type":"error","error":{"type":"api_error","message":"private-fixture"}}),
+        ),
+        (
+            "openai_responses",
+            json!({"type":"response.failed","response":{"error":{"message":"private-fixture"}}}),
+        ),
+        (
+            "openai_responses",
+            json!({"type":"error","message":"private-fixture"}),
+        ),
+    ] {
+        for target in ["openai_chat", "anthropic_messages", "openai_responses"]
+            .into_iter()
+            .filter(|t| *t != source)
+        {
+            let mut w = Worker::new(&["convert", "--from", target, "--to", source]);
+            for end in ["close", "abort"] {
+                open_stream(&mut w, "text/event-stream");
+                let r = stream_frame(&mut w, "data", &format!("data: {error}\n\n"));
+                let text = r["data"].as_str().unwrap();
+                assert!(!text.contains("private-fixture"));
+                let fields: Vec<Value> = text
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("data: "))
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect();
+                assert_eq!(fields.len(), 1, "{text}");
+                assert_eq!(fields[0]["error"]["type"], "api_error");
+                assert_eq!(fields[0]["error"]["message"], "upstream stream failed");
+                if target != "openai_chat" {
+                    assert_eq!(fields[0]["type"], "error");
+                }
+                assert_eq!(stream_frame(&mut w, "data", "ignored")["data"], "");
+                assert!(
+                    stream_frame(&mut w, end, "")["data"]
+                        .as_str()
+                        .unwrap_or("")
+                        .is_empty()
+                );
+            }
+        }
+    }
+}
+
 /// 逐个发送的小事件也会让 Responses 保留整轮文本；到达总预算必须错误结束而不是等到 close 爆帧。
 #[test]
 fn semantic_budget_counts_complete_events_across_frames() {

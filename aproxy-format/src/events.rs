@@ -708,7 +708,7 @@ fn malformed() -> Fault {
 /// 客户端可区分限制与网络中断，不披露原始正文。
 pub(super) const LIMIT_REASON: &str = "response exceeds the configured limit";
 /// 输入与输出限制都按协议错误结束，不计入进程熔断。
-fn budget() -> Fault {
+pub(super) fn budget() -> Fault {
     Fault::new("转换响应超过配置的限制", LIMIT_REASON)
 }
 /// serde_json 在字符串中只转义控制字符、双引号和反斜杠；其余 UTF-8 字节原样写出。
@@ -746,11 +746,11 @@ pub(super) fn escaped_bytes(text: &str) -> usize {
     string_cost::<false>(text)
 }
 /// 原始增量在嵌套 JSON 字符串中的实际字节数。
-fn nested_string_bytes(text: &str) -> usize {
+pub(super) fn nested_string_bytes(text: &str) -> usize {
     string_cost::<true>(text)
 }
 /// 签名载荷本身是 JSON 字符串，比普通文本多一层转义（包括 JSON 转义符本身）。
-fn signed_bytes(text: &str) -> usize {
+pub(super) fn signed_bytes(text: &str) -> usize {
     text.bytes()
         .map(|b| match b {
             b'"' | b'\\' => 8,
@@ -792,6 +792,13 @@ impl std::fmt::Write for Bounded {
         self.text.push_str(chunk);
         Ok(())
     }
+}
+/// 目标 JSON 逐段写入，先扣外层字符串转义的字节，不构造超限的完整字符串。
+pub(super) fn bounded_json(value: &Value, capacity: usize) -> Result<String, Fault> {
+    use std::fmt::Write as _;
+    let mut out = Bounded::new(capacity);
+    write!(out, "{value}").map_err(|_| budget())?;
+    Ok(out.text)
 }
 /// Chat 使用匿名 data 事件，其余两种协议都以 JSON 的 type 命名 SSE 事件。
 fn render(target: F, events: Vec<Value>, output: &mut Bounded) -> Result<(), Fault> {

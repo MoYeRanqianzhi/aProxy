@@ -42,6 +42,17 @@ pub struct Convert {
 fn default_budget() -> usize {
     64 * 1024 * 1024
 }
+/// 只计算信封固定部分的实际序列化长度，不为体积未定的响应头再分配一行。
+struct LineSize(usize);
+impl std::io::Write for LineSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 /// 匹配规范化后的 origin 和路径段，避免 `/tenant` 也命中 `/tenant2`。
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -270,7 +281,7 @@ impl Convert {
     }
     /// 回程失败要替换整份实体；裸 fail 会让代理原样透传上游私有错误页和鉴权头。
     /// 丢失协商状态时只用两族 SDK 都能读的 error 对象，不从原正文猜协议或复制原文。
-    pub fn error_response(&self, ctx: &w::Context) -> w::Response {
+    pub fn error_response(&self, ctx: &w::Context, fault: &Fault) -> w::Response {
         let client = self
             .pair(ctx)
             .map(|s| s.0)
@@ -280,7 +291,11 @@ impl Convert {
         response
             .headers
             .insert("content-type".into(), "application/json".into());
-        response.body = w::Body::Text(Self::error_json(client));
+        response.body = w::Body::Text(if fault.wire == crate::events::LIMIT_REASON {
+            Self::json_error_message(client, fault.wire)
+        } else {
+            Self::error_json(client)
+        });
         response
     }
     /// 两种交付路径只在能否改状态码上不同；协议错误正文始终由本地生成。
@@ -295,7 +310,7 @@ impl Convert {
         }.to_string()
     }
     /// 缓冲转换只解释成功实体，不把源正文或库错误中的字段值带到日志。
-    fn json(client: F, upstream: F, bytes: &[u8]) -> Result<String, Fault> {
+    fn json(client: F, upstream: F, bytes: &[u8], capacity: usize) -> Result<String, Fault> {
         if std::str::from_utf8(bytes).is_ok_and(detect::looks_like_sse) {
             return Err(Fault::new(
                 "跨协议事件流需要 stream 阶段",
@@ -335,9 +350,28 @@ impl Convert {
             ));
         }
         crate::events::UsageTotals::default().check(upstream, &body["usage"])?;
-        Ok(translate::translate_response(upstream, client, &body)
-            .map_err(|_| Fault::new("响应协议转换失败", "response protocol conversion failed"))?
-            .to_string())
+        // Responses 将签名封装为内嵌的 JSON 文档，还会在 summary 中重复思考文本。
+        // 这些副本的字节数已知，先拒绝不可能装入的载荷，不让编解码器分配它们。
+        if upstream == F::AnthropicMessages && client == F::OpenAiResponses {
+            let mut left = capacity;
+            for part in body["content"].as_array().into_iter().flatten() {
+                if part["type"] == "thinking"
+                    && let Some(sig) = part["signature"].as_str()
+                {
+                    let text = part["thinking"].as_str().unwrap_or("");
+                    left = left
+                        .checked_sub(
+                            crate::events::nested_string_bytes(text)
+                                + crate::events::signed_bytes(text)
+                                + crate::events::signed_bytes(sig),
+                        )
+                        .ok_or_else(crate::events::budget)?;
+                }
+            }
+        }
+        let converted = translate::translate_response(upstream, client, &body)
+            .map_err(|_| Fault::new("响应协议转换失败", "response protocol conversion failed"))?;
+        crate::events::bounded_json(&converted, capacity)
     }
     /// 无论是否转换都剔除上游的鉴权头，不能回传给客户端。
     fn response_headers(&self, headers: &w::Headers) -> w::ResponsePatch {
@@ -352,13 +386,25 @@ impl Convert {
         let Session(client, upstream, _) = self.pair(&m.context)?;
         let mut p = self.response_headers(&m.response.headers);
         if client != upstream {
-            p.body = w::Body::Text(Self::json(
+            p.body = w::Body::Text(String::new());
+            r.response = Some(p);
+            // 空正文的实际回信包含已过滤的所有响应头、seq、字段名和引号，换行再占一字节。
+            let mut overhead = LineSize(1);
+            serde_json::to_writer(&mut overhead, &r).expect("空正文回信可序列化");
+            let capacity = self
+                .reply_bytes
+                .checked_sub(overhead.0)
+                .ok_or_else(crate::events::budget)?;
+            let body = Self::json(
                 client,
                 upstream,
                 m.response.body.as_bytes().unwrap_or_default(),
-            )?);
+                capacity,
+            )?;
+            r.response.as_mut().unwrap().body = w::Body::Text(body);
+        } else {
+            r.response = Some(p);
         }
-        r.response = Some(p);
         Ok(())
     }
     /// 头部在 open 即交付。跨协议 JSON 在 close 处理，半截实体绝不作为完整响应提交。
@@ -432,9 +478,11 @@ impl Convert {
             w::StreamEvent::Close => match self.stream.take() {
                 Some(Entity::Ended(tail)) => r.data = w::Data::Text(tail.unwrap_or_default()),
                 Some(Entity::Json(client, upstream, b)) => {
-                    r.data = w::Data::Text(match Self::json(client, upstream, &b) {
-                        Ok(v) if crate::events::escaped_bytes(&v) <= capacity => v,
-                        Ok(_) => Self::json_error_message(client, crate::events::LIMIT_REASON),
+                    r.data = w::Data::Text(match Self::json(client, upstream, &b, capacity) {
+                        Ok(v) => v,
+                        Err(f) if f.wire == crate::events::LIMIT_REASON => {
+                            Self::json_error_message(client, f.wire)
+                        }
                         Err(_) => Self::error_json(client),
                     })
                 }

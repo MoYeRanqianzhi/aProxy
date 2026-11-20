@@ -220,7 +220,7 @@ impl Role {
                     },
                     _ => None,
                 };
-                fail.response = context.map(|ctx| c.error_response(ctx));
+                fail.response = context.map(|ctx| c.error_response(ctx, &reason));
             }
             r.fail = Some(fail);
         }

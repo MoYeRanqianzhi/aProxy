@@ -22,10 +22,10 @@ impl Worker {
     fn new(args: &[&str]) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_aproxy-format"));
         cmd.args(args);
-        Self::connect(cmd, args[0], false)
+        Self::connect(cmd, args[0], false, None)
     }
     /// 固定时钟的子进程也读写真正的协议管道；仅先跳过 libtest 自己的启动横幅。
-    fn connect(mut cmd: Command, role: &str, frozen: bool) -> Self {
+    fn connect(mut cmd: Command, role: &str, frozen: bool, limit: Option<usize>) -> Self {
         let mut child = cmd
             .env("FORMAT_A", "fixture-private-A")
             .env("FORMAT_B", "fixture-private-B")
@@ -51,7 +51,7 @@ impl Worker {
             seq: 0,
             hello: Value::Null,
         };
-        let h=w.frame(json!({"stage":"hello","protocols":[1],"aproxy_version":"test","name":"role","process":"persistent","stages":[],"worker_id":0,"features":["decide.success"],"overrides":[]}));
+        let h=w.frame(json!({"stage":"hello","protocols":[1],"aproxy_version":"test","name":"role","process":"persistent","stages":[],"worker_id":0,"limits":limit.map(|n| json!({"response":n})),"features":["decide.success"],"overrides":[]}));
         assert_eq!(h["protocol"], 1);
         assert_eq!(h["name"], role);
         w.hello = h;
@@ -299,7 +299,7 @@ fn sticky_key_negotiation_and_exhausted_pool_retry() {
     command
         .args(["--exact", "frozen_key_worker", "--ignored", "--nocapture"])
         .env("FORMAT_SAMPLE_CONFIG", &file);
-    let mut w = Worker::connect(command, "keys", true);
+    let mut w = Worker::connect(command, "keys", true, None);
     assert_eq!(
         w.hello["request_body"],
         json!({"request":"full","retry":"full"})
@@ -1295,6 +1295,37 @@ fn malformed_stream_ends_in_the_client_protocol_only_once() {
     );
 }
 
+/// 有签名的推理会出现在摘要和封装载荷中；协商上限包括真实响应头、序号和换行。
+#[test]
+fn buffered_replies_fit_the_negotiated_line() {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aproxy-format"));
+    cmd.args([
+        "convert",
+        "--from",
+        "openai_responses",
+        "--to",
+        "anthropic_messages",
+    ]);
+    let mut w = Worker::connect(cmd, "convert", false, Some(4096));
+    let body = json!({"role":"assistant","model":"m","content":[{"type":"thinking","thinking":"\\".repeat(380),"signature":"signed"}]}).to_string();
+    let rejected = w.frame(response(&Value::Null, &body));
+    assert_eq!(rejected["fail"]["response"]["status"], 502);
+    assert!(
+        rejected["fail"]["response"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("configured limit")
+    );
+    open_stream(&mut w, "application/json");
+    stream_frame(&mut w, "data", &body);
+    let close = stream_frame(&mut w, "close", "");
+    assert!(close["data"].as_str().unwrap().contains("configured limit"));
+    let small = json!({"role":"assistant","content":[{"type":"text","text":"ok"}]}).to_string();
+    let mut headers = response(&Value::Null, &small);
+    headers["response"]["headers"]["x-long"] = "h".repeat(4000).into();
+    assert_eq!(w.frame(headers)["fail"]["response"]["status"], 502);
+    assert!(w.frame(response(&Value::Null, &small))["response"]["body"].is_string());
+}
 /// 合法边界与分帧用量合计都经过同一工作进程；不一致的计数只结束该流，不能污染下一条。
 #[test]
 fn token_usage_is_checked_before_encoding() {

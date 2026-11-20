@@ -3102,10 +3102,7 @@ fn stderr_rendered_utf8_observes_the_byte_limit() {
 /// 本地无法解码不表示进程出错；下一次合法响应继续使用原握手的进程。
 #[tokio::test]
 async fn local_response_decode_failure_keeps_the_admitted_worker() {
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, free_port()))
-        .await
-        .unwrap();
-    let up = listener.local_addr().unwrap().port();
+    let (up, listener) = mock_listener().await;
     let app = axum::Router::new()
         .route(
             "/broken",
@@ -6258,7 +6255,7 @@ async fn official_route_failover_swaps_url_and_credentials_together() {
 #[tokio::test]
 async fn official_keys_cool_the_previous_key_on_429() {
     let home = TestHome::new();
-    let up = free_port();
+    let (up, listener) = mock_listener().await;
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let log = seen.clone();
     let app = axum::Router::new().fallback(move |h: axum::http::HeaderMap| {
@@ -6277,9 +6274,6 @@ async fn official_keys_cool_the_previous_key_on_429() {
             )
         }
     });
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let file = home.path().join("keys.toml");
     std::fs::write(&file,format!("cooldown_secs=0\n[[pool]]\norigin='http://127.0.0.1:{up}'\nheader='x-api-key'\nkeys=[{{id='a',env='KEY_A'}},{{id='b',env='KEY_B'}}]")).unwrap();

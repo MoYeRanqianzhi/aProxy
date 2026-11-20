@@ -39,6 +39,8 @@ pub enum Stopped {
 /// 没能确认实例停下。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopFailure {
+    /// restart 选中的实例已被另一代替换，端口不再能指向所选实例。
+    GenerationChanged,
     /// 停止请求已送达，但在时限内没有退出：进程可能还在
     StillRunning,
     /// 停止请求发不出去，而进程还在（不应答控制通道）。`error` 是 IPC 的错误文字
@@ -84,7 +86,19 @@ pub async fn stop_with_intent(
     let run_dir = daemon::run_dir();
     match mode {
         StopMode::Graceful => {
-            let sent = graceful_shutdown(&run_dir, &port, intent).await;
+            let sent = if intent == Intent::Restart {
+                match daemon::ipc_ping_in(&run_dir, &port).await {
+                    Ok(live) if live.instance.instance_id != info.instance_id => {
+                        return Err(StopFailure::GenerationChanged);
+                    }
+                    Ok(live) => shutdown_for_restart(&run_dir, &port, &live).await,
+                    Err(e) => Err(e),
+                }
+            } else {
+                daemon::ipc_request_in(&run_dir, &port, daemon::IpcOp::STOP)
+                    .await
+                    .map(|_| ())
+            };
             settle_graceful(info, &run_dir, &port, intent, sent).await
         }
         // 强制终止之后进程不在、期望状态记录还在，正是「崩溃」的样子：看护者收到死亡事件
@@ -207,17 +221,11 @@ pub async fn stop_if_idle(info: &InstanceRecord, idle_secs: u64) -> Result<IdleS
 /// 发 shutdown。要留着期望状态记录（[`Intent::Restart`]）时先看实例认不认 `keep_restore`：
 /// 不认这个参数的实例发不带参数的 shutdown（它会删掉记录），等它退出后由这里把记录原样
 /// 写回。
-async fn graceful_shutdown(
+async fn shutdown_for_restart(
     run_dir: &std::path::Path,
     port: &str,
-    intent: Intent,
+    live: &daemon::InstanceStatus,
 ) -> Result<(), daemon::IpcError> {
-    if intent == Intent::Stop {
-        return daemon::ipc_request_in(run_dir, port, daemon::IpcOp::STOP)
-            .await
-            .map(|_| ());
-    }
-    let live = daemon::ipc_ping_in(run_dir, port).await?;
     if live
         .features
         .iter()

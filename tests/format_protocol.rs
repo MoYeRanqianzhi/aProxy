@@ -141,6 +141,60 @@ async fn failed_start_exits_while_descendant_still_holds_stderr() {
     );
 }
 
+/// 在临时 home 的独立进程重放过期的选择，测试进程本身不改环境或触及真实注册表。
+#[tokio::test]
+#[ignore = "driven by restart_keeps_the_replacement_generation"]
+async fn restart_stale_selection() {
+    use aproxy::ops::{restart::restart_instance, stop::StopMode};
+    let port = std::env::var("FIXTURE_STALE_PORT").unwrap();
+    let mut selected = aproxy::daemon::ipc_ping(&port).await.unwrap().instance;
+    selected.instance_id.push_str("-earlier");
+    let error = restart_instance(
+        &selected,
+        StopMode::Graceful,
+        std::path::Path::new("missing-fixture.exe"),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(matches!(
+        error,
+        aproxy::ops::restart::RestartFailure::Stop(
+            aproxy::ops::stop::StopFailure::GenerationChanged
+        )
+    ));
+}
+
+/// 选中之后同一端口的实例已更替，不能因仍有恢复记录就停掉当前应答者。
+#[tokio::test]
+async fn restart_keeps_the_replacement_generation() {
+    let home = TestHome::new();
+    let (port, result) = launch(&home, free_port(), "");
+    assert!(result.status.success(), "{result:?}");
+    let run = home.path().join("run");
+    let port = port.to_string();
+    let before = aproxy::daemon::ipc_ping_in(&run, &port).await.unwrap();
+    let replay = home
+        .cmd_with(std::env::current_exe().unwrap())
+        .args(["--exact", "restart_stale_selection", "--ignored"])
+        .env("FIXTURE_STALE_PORT", &port)
+        .output()
+        .unwrap();
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stdout)
+    );
+    assert_eq!(
+        before.instance.instance_id,
+        aproxy::daemon::ipc_ping_in(&run, &port)
+            .await
+            .unwrap()
+            .instance
+            .instance_id
+    );
+}
+
 /// 从实例日志而不是测试进程捕获 stderr，逐行检查名字、级别和密钥替换。
 #[test]
 fn stderr_lines_reach_the_instance_log_with_secrets_replaced() {

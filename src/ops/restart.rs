@@ -90,8 +90,10 @@ pub async fn restart_instance(
     let mut record = spec::read_restore_in(&run_dir, &port);
     if !info.foreground
         && let Ok(live) = daemon::ipc_ping_in(&run_dir, &port).await
-        && live.instance.instance_id == info.instance_id
     {
+        if live.instance.instance_id != info.instance_id {
+            return Err(RestartFailure::Stop(StopFailure::GenerationChanged));
+        }
         if live.state == daemon::InstanceState::Starting {
             return Err(RestartFailure::Starting);
         }

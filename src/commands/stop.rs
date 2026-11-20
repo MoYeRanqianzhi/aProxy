@@ -265,6 +265,13 @@ pub(crate) fn stop_failure(info: &InstanceRecord, failure: &StopFailure) -> Fail
     // 强制结束指向 `stop --force`：跨平台，且终止前按 pid + 创建时间核验身份，不会像手敲
     // taskkill/kill 那样误杀复用了该 pid 的其他进程
     match failure {
+        StopFailure::GenerationChanged => Failure::new(
+            "command_failed",
+            format!(
+                "The selected instance on port {port} was replaced; the current instance was not stopped."
+            ),
+            json!({"port":port_value(port),"reason":"generation_changed"}),
+        ),
         StopFailure::StillRunning => Failure::new(
             "stop_failed",
             format!(

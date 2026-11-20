@@ -8,7 +8,7 @@
 
 use aproxy::daemon::{self, InstanceRecord};
 use aproxy::ops::restart::{PrecheckError, RestartFailure, restart_instance};
-use aproxy::ops::stop::StopMode;
+use aproxy::ops::stop::{StopFailure, StopMode};
 use aproxy::ops::target::{self, Empty, SelectError};
 use serde_json::json;
 
@@ -108,6 +108,9 @@ pub(crate) async fn handle_restart_cmd(
                     }
                     RestartFailure::Unsupported => "没有可用来重新拉起它的记录，旧实例保持运行",
                     RestartFailure::Precheck(_) => "预检未通过，旧实例保持运行",
+                    RestartFailure::Stop(StopFailure::GenerationChanged) => {
+                        "The current instance was not stopped."
+                    }
                     RestartFailure::Stop(_) => "停止未确认，未启动新实例",
                     RestartFailure::Start { .. } => "旧实例已停止、新实例未就绪，服务已中断",
                 };
@@ -160,6 +163,7 @@ fn restart_failure(
             );
             failure
         }
+        RestartFailure::Stop(stop @ StopFailure::GenerationChanged) => stop_failure(info, &stop),
         RestartFailure::Stop(stop) => {
             let mut failure = stop_failure(info, &stop);
             failure.message = format!(

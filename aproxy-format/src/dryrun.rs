@@ -434,6 +434,17 @@ impl<W: Write> Trial<'_, W> {
             }
             let r = self.call(i, "decide", msg)?;
             let mut changes = Vec::new();
+            if r.fail.is_some() {
+                trace(
+                    self.out,
+                    "decide",
+                    self.units[i].layer.label,
+                    view(&req.url, &req.headers),
+                    Value::Null,
+                    changes,
+                )?;
+                continue;
+            }
             if let Some(d) = r.decision {
                 changes.push(if d == w::Decision::Retry {
                     "retry"
@@ -460,6 +471,16 @@ impl<W: Write> Trial<'_, W> {
                 Value::Null,
                 changes,
             )?;
+            if decision == Some(false)
+                || (decision.is_some()
+                    && (reroute.is_some()
+                        || !self
+                            .units
+                            .iter()
+                            .any(|u| u.layer.entry.has_stage(Stage::Retry))))
+            {
+                break;
+            }
         }
         Ok((
             decision.unwrap_or(fallback.decision == w::Decision::Retry),
@@ -1059,6 +1080,28 @@ mod tests {
         }
     }
 
+    /// 第一张终局票已确定结果后，后续策略连消息也不应收到。
+    #[test]
+    fn two_policies_stop_dispatch_at_the_settled_vote() {
+        let mut p = String::new();
+        for name in ["first", "second"] {
+            p += &format!(
+                "[[format]]\nname='{name}'\ncommand='aproxy-format'\nargs=['policy','--config','p']\nstages=['decide']\n"
+            );
+        }
+        let (result, rows) = trace_sample(
+            &p,
+            json!({"path":"/","body":{},"attempts":[{"status":503}]}),
+            &[("p", "[[rule]]\nstatus=[503]\ndecision='stop'")],
+        );
+        result.unwrap();
+        let votes = rows
+            .iter()
+            .filter(|r| r["stage"] == "decide")
+            .collect::<Vec<_>>();
+        assert_eq!(votes.len(), 1);
+        assert_eq!(votes[0]["changed"], json!(["stop"]));
+    }
     /// 规则按声明先后生效，不对没有上游头的故障套状态规则；覆盖、直通与成功分别说明来源。
     #[test]
     fn dry_fallback_preserves_sources_and_backoff() {

@@ -165,6 +165,14 @@ fn running(home: &TestHome, upstream: u16, config: &str) -> (reqwest::Client, St
     )
 }
 
+/// 先绑定再公布端口；监听器本身保留分配结果，不留关闭后被其他测试抢占的窗口。
+async fn mock_listener() -> (u16, tokio::net::TcpListener) {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    (listener.local_addr().unwrap().port(), listener)
+}
+
 /// 测试上游按调用次数依次给出状态码，最后一个状态码持续生效。
 async fn upstream(
     statuses: &'static [u16],
@@ -186,10 +194,7 @@ async fn upstream(
             )
         }
     });
-    let port = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-        .await
-        .unwrap();
+    let (port, listener) = mock_listener().await;
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (port, calls)
 }
@@ -303,10 +308,7 @@ async fn retry_last_response_carries_each_upstream_head_without_the_body() {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
     for policy in [false, true] {
         let home = TestHome::new();
-        let up = free_port();
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-            .await
-            .unwrap();
+        let (up, listener) = mock_listener().await;
         let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         std::io::Write::write_all(&mut gzip, b"no").unwrap();
         let compressed = gzip.finish().unwrap();
@@ -727,10 +729,7 @@ async fn keepalive_overrides_observe_the_commit_between_layers() {
 #[tokio::test]
 async fn chain_runs_request_in_order_and_response_and_heartbeat_in_reverse() {
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     let gate = release.clone();
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -988,10 +987,7 @@ async fn breaker_closes_after_a_successful_probe() {
 async fn network_failures_do_not_trip_the_breaker() {
     use tokio::io::AsyncReadExt;
     let home = TestHome::new();
-    let up = free_port();
-    let socket = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, socket) = mock_listener().await;
     tokio::spawn(async move {
         for _ in 0..6 {
             let (mut stream, _) = socket.accept().await.unwrap();
@@ -1757,10 +1753,7 @@ async fn request_format_headers_encoding_and_history_match_the_upstream() {
         } else {
             compressed.clone()
         };
-        let up = free_port();
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-            .await
-            .unwrap();
+        let (up, listener) = mock_listener().await;
         let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = observations.clone();
         let app =
@@ -2063,10 +2056,7 @@ async fn held_upstream(
     std::sync::Arc<tokio::sync::Semaphore>,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
-    let port = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-        .await
-        .unwrap();
+    let (port, listener) = mock_listener().await;
     let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     let gate = release.clone();
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2448,10 +2438,7 @@ async fn response_program_encoding_replaces_only_the_upstream_encoding() {
     gz.write_all(b"decoded").unwrap();
     let raw = gz.finish().unwrap();
     let encoded = raw.clone();
-    let port = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-        .await
-        .unwrap();
+    let (port, listener) = mock_listener().await;
     let app = axum::Router::new().fallback(move || {
         let b = encoded.clone();
         async move {
@@ -2559,10 +2546,7 @@ async fn first_decide_vote_wins() {
 /// 用两层分别给出 decision 和 reroute，确保第一票不会短路尚未取得的另一个字段。
 async fn exercise_reroute(again: bool) {
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured = sent.clone();
     let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
@@ -2819,10 +2803,7 @@ async fn decide_delay_overrides_the_backoff() {
 #[tokio::test]
 async fn large_upstream_body_reaches_decide_truncated() {
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let text = format!(
         "{}{}{}",
         "a".repeat(65536),
@@ -3107,10 +3088,7 @@ async fn local_response_decode_failure_keeps_the_admitted_worker() {
 #[tokio::test]
 async fn request_layers_see_managed_encoding_as_keepalive_changes() {
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let app = axum::Router::new().fallback(|h: axum::http::HeaderMap| async move {
         h["accept-encoding"].to_str().unwrap().to_owned()
     });
@@ -3161,10 +3139,7 @@ async fn request_layers_see_managed_encoding_as_keepalive_changes() {
 async fn recovered_full_layer_decodes_the_original_after_a_metadata_layer() {
     use std::io::Write as _;
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let app = axum::Router::new().fallback(|h: http::HeaderMap, b: axum::body::Bytes| async move {
         (h.get("content-encoding")
             .map_or("identity", |v| v.to_str().unwrap())
@@ -3211,10 +3186,7 @@ async fn recovered_full_layer_decodes_the_original_after_a_metadata_layer() {
 async fn open_optional_full_layer_preserves_the_compressed_request() {
     use std::io::Write as _;
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let app = axum::Router::new().fallback(
         |h: axum::http::HeaderMap, b: axum::body::Bytes| async move {
             (h.get("content-encoding")
@@ -3314,10 +3286,7 @@ async fn observing_start_preserves_a_static_handshake_failure() {
 #[tokio::test]
 async fn pending_success_vote_preserves_non_sse() {
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     const MIME: &str = r#"application/json; profile="text/event-stream""#;
     let app = axum::Router::new()
         .fallback(|| async { ([("content-type", MIME)], r#"{"accepted":true}"#) });
@@ -3353,10 +3322,7 @@ async fn pending_success_vote_uses_neutral_headers_for_sse() {
         atomic::{AtomicUsize, Ordering},
     };
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let gate = release.clone();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -3423,10 +3389,7 @@ async fn decide_receives_raw_bounded_bytes_when_decoding_fails() {
     use base64::Engine as _;
     for coding in ["unknown", "gzip"] {
         let home = TestHome::new();
-        let up = free_port();
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-            .await
-            .unwrap();
+        let (up, listener) = mock_listener().await;
         let expected = [vec![b'h'; 65536], vec![b't'; 1024 * 1024 - 65536]].concat();
         let raw = bytes::Bytes::from(
             [
@@ -3487,10 +3450,7 @@ async fn committed_stop_body(
     raw: Vec<u8>,
 ) -> bytes::Bytes {
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     let gate = release.clone();
     let raw = bytes::Bytes::from(raw);
@@ -3858,10 +3818,7 @@ async fn split_forward_upstream_tail(
     tail: &'static [u8],
 ) -> (u16, std::sync::Arc<tokio::sync::Notify>) {
     use futures_util::StreamExt as _;
-    let port = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-        .await
-        .unwrap();
+    let (port, listener) = mock_listener().await;
     let resume = std::sync::Arc::new(tokio::sync::Notify::new());
     let gate = resume.clone();
     let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
@@ -4103,10 +4060,7 @@ async fn forward_with_a_response_program_gathers_the_response_at_that_layer() {
 async fn forward_without_request_programs_streams_the_request_body() {
     use futures_util::StreamExt as _;
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let first = std::sync::Arc::new(tokio::sync::Notify::new());
     let observed = first.clone();
     let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
@@ -4191,10 +4145,7 @@ async fn forward_format_failures_do_not_enter_the_retry_chain() {
 #[tokio::test]
 async fn retry_stream_never_opens_for_an_error_disguised_as_200() {
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let app = axum::Router::new().fallback(move || {
         let i = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4227,10 +4178,7 @@ async fn decide_sees_interrupted_head_but_stop_does_not_inherit_it() {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
     for patch in [false, true] {
         let home = TestHome::new();
-        let up = free_port();
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-            .await
-            .unwrap();
+        let (up, listener) = mock_listener().await;
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut r = tokio::io::BufReader::new(&mut sock);
@@ -4569,10 +4517,7 @@ async fn digest_upstream(expected: usize) -> (u16, std::sync::Arc<std::sync::ato
             }
         }
     });
-    let port = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-        .await
-        .unwrap();
+    let (port, listener) = mock_listener().await;
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (port, calls)
 }
@@ -4688,10 +4633,7 @@ async fn metadata_only_forward_request_keeps_the_upload_live() {
             doc["stream"].to_string()
         }
     });
-    let port = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-        .await
-        .unwrap();
+    let (port, listener) = mock_listener().await;
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     for (trigger, accept, head) in [
         ("body_stream", "application/json", None),
@@ -4788,10 +4730,7 @@ async fn forward_stream_can_open_before_the_client_finishes_its_upload() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let home = TestHome::new();
     const PREFIX: &[u8] = br#"{"stream":"#;
-    let port = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-        .await
-        .unwrap();
+    let (port, listener) = mock_listener().await;
     let app = axum::Router::new().fallback(|req: axum::extract::Request| async move {
         let mut input = req.into_body().into_data_stream();
         let mut body = Vec::new();
@@ -4869,10 +4808,7 @@ async fn committed_replay_after_skipped_open_validates_all_codings_before_output
         ("too-deep", false),
     ] {
         let home = TestHome::new();
-        let port = free_port();
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-            .await
-            .unwrap();
+        let (port, listener) = mock_listener().await;
         let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
         let allow = gate.clone();
         let plain = b"data: validated-member\n\n".repeat(8192);
@@ -4994,10 +4930,7 @@ async fn first_delivery_vote_wins() {
 #[tokio::test]
 async fn forward_503_upgrades_through_decide_and_the_client_sees_only_the_retried_success() {
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let received = bodies.clone();
     let app = axum::Router::new().fallback(move |method: http::Method, body: axum::body::Bytes| {
@@ -5068,10 +5001,7 @@ async fn forward_503_upgrades_through_decide_and_the_client_sees_only_the_retrie
 async fn forward_stream_cut_mid_way_does_not_upgrade() {
     use futures_util::StreamExt as _;
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let release = std::sync::Arc::new(tokio::sync::Notify::new());
     let gate = release.clone();
     let app = axum::Router::new().fallback(move || {
@@ -5132,10 +5062,7 @@ async fn forward_200_error_body_is_recorded_as_upstream_error() {
         ("identity", large),
     ] {
         let home = TestHome::new();
-        let up = free_port();
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-            .await
-            .unwrap();
+        let (up, listener) = mock_listener().await;
         let raw = bytes::Bytes::from(bytes);
         let copy = raw.clone();
         let app = axum::Router::new().fallback(move || {
@@ -5181,10 +5108,7 @@ async fn forward_200_error_body_is_recorded_as_upstream_error() {
 #[tokio::test]
 async fn forward_vote_on_either_side_of_commitment() {
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let hold = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
     let gate_up = hold.clone();
     let (sent, mut arrived) = tokio::sync::mpsc::unbounded_channel();
@@ -5808,10 +5732,7 @@ async fn only_the_outer_abort_reply_reaches_the_client_even_when_empty() {
 #[tokio::test]
 async fn forward_redirect_bypasses_both_response_and_stream_programs() {
     let home = TestHome::new();
-    let port = free_port();
-    let l = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-        .await
-        .unwrap();
+    let (port, l) = mock_listener().await;
     let app = axum::Router::new().fallback(|| async {
         (
             axum::http::StatusCode::TEMPORARY_REDIRECT,
@@ -5962,10 +5883,7 @@ async fn adaptive_gets_only_the_digest() {
 #[tokio::test]
 async fn sample_chain_of_section_7_2_runs_end_to_end() {
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let (sent, observed) = tokio::sync::oneshot::channel();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(sent)));
     let app=axum::Router::new().fallback(move|uri:axum::http::Uri,h:axum::http::HeaderMap,b:axum::body::Bytes|{let sent=slot.lock().unwrap().take();async move{if let Some(sent)=sent{sent.send((uri,h,b)).unwrap();}axum::Json(serde_json::json!({"id":"chatcmpl-local","object":"chat.completion","model":"local","created":0,"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"fixture answer"}}],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}))}});
@@ -6136,10 +6054,7 @@ async fn official_adaptive_upgrades_forward_before_client_bytes() {
 async fn official_policy_retries_a_200_with_an_error_marker() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let calls = std::sync::Arc::new(AtomicUsize::new(0));
     let seen = calls.clone();
     let app = axum::Router::new().fallback(move || {
@@ -6176,10 +6091,7 @@ async fn official_policy_retries_a_200_with_an_error_marker() {
 #[tokio::test]
 async fn full_config_roundtrip_routes_mixed_protocols_and_reconverts_on_failover() {
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let (send, mut observed) = tokio::sync::mpsc::unbounded_channel();
     let app=axum::Router::new().fallback(move |u:axum::http::Uri, axum::Json(b):axum::Json<Value>| {let model=b["model"].as_str().unwrap().to_owned();let anth=u.path()=="/messages-tenant/run";send.send((u,b)).unwrap();async move {
         let (status,reply)=if anth {(200,serde_json::json!({"id":"m2","type":"message","role":"assistant","model":model,"content":[{"type":"text","text":"second"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":1}}))}else if model=="switch"{(503,serde_json::json!({"error":"busy"}))}else{(200,serde_json::json!({"id":"m1","object":"chat.completion","model":model,"choices":[{"index":0,"message":{"role":"assistant","content":"first"},"finish_reason":"stop"}]}))};(axum::http::StatusCode::from_u16(status).unwrap(),axum::Json(reply))
@@ -6230,10 +6142,7 @@ async fn official_route_failover_swaps_url_and_credentials_together() {
         ("a", 1, 503, "authorization", "KEY_A"),
         ("b", 2, 200, "x-api-key", "KEY_B"),
     ] {
-        let port = free_port();
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-            .await
-            .unwrap();
+        let (port, listener) = mock_listener().await;
         let send = send.clone();
         let app = axum::Router::new().fallback(
             move |u: axum::http::Uri, h: axum::http::HeaderMap, b: axum::body::Bytes| {
@@ -6450,10 +6359,7 @@ async fn interrupted_forward_gather_consults_decide_before_exposing_a_prefix() {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
     for retry in [false, true] {
         let home = TestHome::new();
-        let port = free_port();
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-            .await
-            .unwrap();
+        let (port, listener) = mock_listener().await;
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut lines = tokio::io::BufReader::new(&mut sock).lines();
@@ -6515,10 +6421,7 @@ async fn official_convert_delivers_live_text_then_protocol_abort() {
     use axum::body::{Body, Bytes};
     use futures_util::StreamExt as _;
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let halt = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     let gate = halt.clone();
     let app=axum::Router::new().fallback(move |_: Bytes| {let gate=gate.clone(); async move {
@@ -6557,10 +6460,7 @@ async fn forward_completion_observes_media_type_and_all_codings() {
     use std::io::Write as _;
     for compressed in [true, false] {
         let home = TestHome::new();
-        let port = free_port();
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-            .await
-            .unwrap();
+        let (port, listener) = mock_listener().await;
         let mut bytes = if compressed {
             br#"{"error":"busy"}"#.to_vec()
         } else {
@@ -6662,10 +6562,7 @@ async fn fresh_stream_open_reads_client_flag_after_its_hello() {
     use futures_util::StreamExt as _;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let (uploaded, mut seen) = tokio::sync::mpsc::unbounded_channel();
     let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
         let uploaded = uploaded.clone();
@@ -6720,10 +6617,7 @@ async fn fresh_stream_open_reads_client_flag_after_its_hello() {
 #[tokio::test]
 async fn replaced_forward_upload_is_drained_and_post_entry_413_is_notified() {
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let (tx, mut sent) = tokio::sync::mpsc::unbounded_channel();
     let app = axum::Router::new().fallback(move |b: axum::body::Bytes| {
         tx.send(b).unwrap();
@@ -6773,10 +6667,7 @@ async fn notify_only_waits_for_live_upload_accounting_after_response_end() {
     use futures_util::StreamExt as _;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let (tx, mut observed) = tokio::sync::mpsc::unbounded_channel();
     let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
         let done = tx.clone();
@@ -6830,10 +6721,7 @@ async fn notify_only_waits_for_live_upload_accounting_after_response_end() {
 #[tokio::test]
 async fn committed_json_stream_returns_sanitized_client_error() {
     let home = TestHome::new();
-    let up = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
-        .await
-        .unwrap();
+    let (up, listener) = mock_listener().await;
     let app = axum::Router::new().fallback(|| async {
         (
             [

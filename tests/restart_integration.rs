@@ -421,9 +421,10 @@ fn restart_all_skips_failed_instance_and_exits_nonzero() {
 // ---------------------------------------------------------------------------
 #[test]
 fn restart_refuses_port_change_onto_occupied_port() {
-    let (port_a, port_c) = (free_port(), free_port());
     // 本测试自己占住目标端口（模拟被其他程序占用）
-    let _hold = std::net::TcpListener::bind(("127.0.0.1", port_c)).expect("占位端口绑定失败");
+    let hold = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("占位端口绑定失败");
+    let port_c = hold.local_addr().unwrap().port();
+    let port_a = free_port();
     let test_home = TestHome::new();
     let home = test_home.path();
     let cfg = home.join("c.toml");

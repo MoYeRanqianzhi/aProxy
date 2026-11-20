@@ -2,7 +2,9 @@
 use crate::config::Fault;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use switchyard_translation::{StreamTranslationState, TranslationEngine, WireFormat as F};
+use switchyard_translation::{
+    LlmResponseChunk, StreamTranslationState, TranslationEngine, WireFormat as F,
+};
 
 /// 单个尚未结束的 SSE 事件上限，与整条流的长度无关。
 const MAX_EVENT: usize = 8 * 1024 * 1024;
@@ -107,6 +109,16 @@ impl UsageTotals {
     }
 }
 
+/// 签名到达时，之前的推理文本也要进入两份内嵌 JSON；不保留文本的第二份拷贝。
+#[derive(Default)]
+struct ReasoningSize {
+    /// 两份签名载荷中的文本开销，首次收到签名前暂不扣费。
+    signed_text: usize,
+    /// 有签名后不再输出原生加密载荷，后续文本直接计费。
+    signed: bool,
+    /// 原生加密载荷是替换而非增量。
+    encrypted: usize,
+}
 /// 当前事件跨协议转换所需的字节边界、语义状态和终止标记。
 pub(super) struct Events {
     /// 上游返回的协议。
@@ -123,6 +135,10 @@ pub(super) struct Events {
     remaining: usize,
     /// 已输出的 Responses 增量在同一次终态回信中必须重现的最少字节（含双层 JSON 转义）。
     snapshot_min: usize,
+    /// 工具 ID 可被后续增量替换，只计最后一个值。
+    call_ids: BTreeMap<usize, usize>,
+    /// 推理块分别保留签名或原生加密载荷。
+    reasoning_sizes: BTreeMap<usize, ReasoningSize>,
     /// 只根据已经交给客户端的完整回信推进；被拒的事件不能占用错误帧的序号。
     next_sequence: u64,
     /// 只积累尚未被空行分隔的一帧，行结束已统一成 LF。
@@ -159,6 +175,8 @@ impl Events {
             state: Default::default(),
             remaining: budget,
             snapshot_min: 0,
+            call_ids: Default::default(),
+            reasoning_sizes: Default::default(),
             next_sequence: 0,
             frame: Vec::new(),
             after_cr: false,
@@ -291,6 +309,18 @@ impl Events {
             F::OpenAiChat => {
                 if let Some(rows) = event.get_mut("choices").and_then(Value::as_array_mut) {
                     for row in rows {
+                        // Chat 工具名按片到达，到结束原因才释放；不能等目标编码器真正开块才计费。
+                        if self.target == F::OpenAiResponses
+                            && let Some(calls) = row["delta"]["tool_calls"].as_array()
+                        {
+                            for name in calls.iter().filter_map(|c| c["function"]["name"].as_str())
+                            {
+                                self.snapshot_min += nested_string_bytes(name) * 3;
+                            }
+                            if self.snapshot_min > output.capacity {
+                                return Err(budget());
+                            }
+                        }
                         if row["finish_reason"].is_string() {
                             self.incomplete_reason = match row["finish_reason"].as_str() {
                                 Some("length") => Some("max_output_tokens"),
@@ -353,6 +383,9 @@ impl Events {
             self.render_events(checked, output)?;
         }
         for chunk in chunks {
+            if self.target == F::OpenAiResponses {
+                self.charge_retained(&chunk, output.capacity)?;
+            }
             let encoded = self
                 .engine
                 .encode_stream_event(&mut self.state, self.target, chunk.into())
@@ -371,6 +404,74 @@ impl Events {
         }
         Ok(())
     }
+    /// 在目标编码器保留数据前按终态副本计费。工具参数可能尚未生成任何可见增量。
+    fn charge_retained(&mut self, chunk: &LlmResponseChunk, capacity: usize) -> Result<(), Fault> {
+        match chunk {
+            LlmResponseChunk::ToolCallDelta {
+                index,
+                id,
+                name,
+                arguments_delta,
+            } => {
+                if let Some(id) = id {
+                    let size = nested_string_bytes(id) * 2;
+                    self.snapshot_min -= self.call_ids.insert(*index, size).unwrap_or(0);
+                    self.snapshot_min += size;
+                }
+                if self.source != F::OpenAiChat
+                    && let Some(name) = name
+                {
+                    self.snapshot_min += nested_string_bytes(name) * 3;
+                }
+                if let Some(args) = arguments_delta {
+                    self.snapshot_min += nested_string_bytes(args) * 3;
+                }
+            }
+            LlmResponseChunk::ReasoningDelta { index, text }
+            | LlmResponseChunk::ReasoningDetailsDelta { index, text, .. } => {
+                let size = self.reasoning_sizes.entry(*index).or_default();
+                let extra = signed_bytes(text) * 2;
+                size.signed_text += extra;
+                if size.signed {
+                    self.snapshot_min += extra;
+                }
+                if let LlmResponseChunk::ReasoningDetailsDelta { details, .. } = chunk {
+                    for d in details {
+                        if d["type"] == "anthropic.signature_delta"
+                            && let Some(sig) = d["signature"].as_str()
+                        {
+                            if !size.signed {
+                                self.snapshot_min -= size.encrypted;
+                                self.snapshot_min += size.signed_text;
+                                size.signed = true;
+                            }
+                            self.snapshot_min += signed_bytes(sig) * 2;
+                        }
+                    }
+                    if !size.signed
+                        && let Some(encrypted) = details
+                            .iter()
+                            .find_map(|d| match d["type"].as_str() {
+                                Some("reasoning.encrypted") => d["data"].as_str(),
+                                Some("reasoning") => d["encrypted_content"].as_str(),
+                                _ => None,
+                            })
+                            .filter(|s| !s.is_empty())
+                    {
+                        self.snapshot_min -= size.encrypted;
+                        size.encrypted = nested_string_bytes(encrypted) * 2;
+                        self.snapshot_min += size.encrypted;
+                    }
+                }
+            }
+            _ => (),
+        }
+        if self.snapshot_min > capacity {
+            Err(budget())
+        } else {
+            Ok(())
+        }
+    }
     /// 按客户端的选项调整目标帧；最后只发一个独立用量块，且不能再带工具或文本。
     fn render_events(&mut self, mut events: Vec<Value>, output: &mut Bounded) -> Result<(), Fault> {
         if self.target == F::OpenAiResponses {
@@ -381,8 +482,20 @@ impl Events {
                     Some(
                         "response.output_text.delta" | "response.reasoning_summary_text.delta",
                     ) => (&e["delta"], 4),
-                    Some("response.function_call_arguments.delta") => (&e["delta"], 3),
-                    Some("response.output_item.added") => (&e["item"]["id"], 2),
+                    Some("response.created") => {
+                        self.snapshot_min += ["id", "model"]
+                            .iter()
+                            .filter_map(|k| e["response"][k].as_str())
+                            .map(nested_string_bytes)
+                            .sum::<usize>();
+                        continue;
+                    }
+                    Some("response.output_item.added") => {
+                        // 即使所有字符串均为空，done 帧和最终 output 仍重复项的类型、状态和结构。
+                        let tool = e["item"]["type"] == "function_call";
+                        self.snapshot_min += if tool { 240 } else { 128 };
+                        (&e["item"]["id"], if tool { 3 } else { 2 })
+                    }
                     _ => continue,
                 };
                 if let Some(text) = value.as_str() {
@@ -481,6 +594,9 @@ impl Events {
             ));
         }
         let mut output = Bounded::new(capacity);
+        if self.snapshot_min > capacity {
+            return Err(budget());
+        }
         let events = self
             .engine
             .finish_stream(&mut self.state, self.target)
@@ -632,6 +748,17 @@ pub(super) fn escaped_bytes(text: &str) -> usize {
 /// 原始增量在嵌套 JSON 字符串中的实际字节数。
 fn nested_string_bytes(text: &str) -> usize {
     string_cost::<true>(text)
+}
+/// 签名载荷本身是 JSON 字符串，比普通文本多一层转义（包括 JSON 转义符本身）。
+fn signed_bytes(text: &str) -> usize {
+    text.bytes()
+        .map(|b| match b {
+            b'"' | b'\\' => 8,
+            b'\n' | b'\r' | b'\t' | 8 | 12 => 5,
+            0..=31 => 9,
+            _ => 1,
+        })
+        .sum()
 }
 /// 只为能写入当前回信的字节分配空间，逐笔按外层序列化后的长度扣费。
 struct Bounded {
@@ -826,6 +953,46 @@ mod tests {
                 .len()
                 - 2
         );
+    }
+    /// 不等终态才发现签名、延迟工具参数和一组小项不能放进同一行。
+    #[test]
+    fn retained_fields_exhaust_the_snapshot_before_close() {
+        use serde_json::json;
+        let text = "x".repeat(300);
+        for (source, make) in [
+            (F::AnthropicMessages, 0),
+            (F::OpenAiChat, 1),
+            (F::OpenAiChat, 2),
+            (F::AnthropicMessages, 3),
+            (F::AnthropicMessages, 4),
+        ] {
+            let mut stream = Events::new(source, F::OpenAiResponses, false, 1 << 20);
+            let mut fault = None;
+            for i in 0..24 {
+                let event = match make {
+                    0 => {
+                        json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":text}})
+                    }
+                    1 => {
+                        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":text}}]}}]})
+                    }
+                    2 => {
+                        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":text}}]}}]})
+                    }
+                    3 => {
+                        json!({"type":"content_block_start","index":i,"content_block":{"type":"tool_use","id":format!("{text}{i}"),"name":"t","input":{}}})
+                    }
+                    _ => {
+                        json!({"type":"content_block_start","index":i,"content_block":{"type":"tool_use","id":"x","name":"t","input":{}}})
+                    }
+                };
+                if let Err((_, f)) = stream.feed(format!("data: {event}\n\n").as_bytes(), 4096) {
+                    fault = Some(f.wire);
+                    break;
+                }
+            }
+            assert_eq!(fault, Some(LIMIT_REASON), "case {make}");
+        }
     }
     /// 完成快照可一次提供多个文本片段；目标 ID 与模型只能逐块复制到预算之内。
     #[test]

@@ -220,12 +220,29 @@ fn emit(out: &mut impl Write, value: &impl serde::Serialize) -> Result<(), &'sta
 fn worker(
     name: &str,
     mut role: Role,
-    input: impl BufRead,
+    mut input: impl BufRead,
     mut out: impl Write,
 ) -> Result<(), &'static str> {
-    for (next, line) in (0u64..).zip(input.lines()) {
-        let m: w::Message = serde_json::from_str(&line.map_err(|_| "无法读取标准输入")?)
-            .map_err(|_| "协议帧无效")?;
+    let mut limit = 64 * 1024;
+    for next in 0u64.. {
+        let mut line = Vec::new();
+        // 按线上的字节数限制，而不是先读完整行（攻击性输入可以一直没有换行）。
+        input
+            .by_ref()
+            .take(limit)
+            .read_until(b'\n', &mut line)
+            .map_err(|_| "无法读取标准输入")?;
+        if line.is_empty() {
+            return Ok(());
+        }
+        if !line.ends_with(b"\n") {
+            return Err(if line.len() as u64 == limit {
+                "协议帧超过长度上限"
+            } else {
+                "协议帧缺少结尾换行"
+            });
+        }
+        let m: w::Message = serde_json::from_slice(&line).map_err(|_| "协议帧无效")?;
         if m.v != 1 || m.seq != next {
             return Err("协议版本或序号不匹配");
         }
@@ -236,7 +253,19 @@ fn worker(
             if !offer.protocols.contains(&1) {
                 return Err("不支持此协议版本");
             }
-            emit(&mut out, &role.hello(name))?;
+            let hello = role.hello(name);
+            // 正文可能经 base64 或 JSON 转义；纯元数据角色的最大项是 decide 的 1 MiB 解码预览。
+            limit = if hello.request_body.values().any(|n| *n == w::BodyNeed::Full)
+                || hello
+                    .stages
+                    .iter()
+                    .any(|s| matches!(s.as_str(), "response" | "stream"))
+            {
+                257 * 1024 * 1024
+            } else {
+                8 * 1024 * 1024
+            };
+            emit(&mut out, &hello)?;
         } else {
             if matches!(m.stage, w::Stage::Hello(_)) {
                 return Err("重复的 hello");
@@ -284,5 +313,34 @@ fn main() {
     if let Err(e) = result {
         eprintln!("aproxy-format: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+/// 在内存管道直接检查读取游标，无换行的输入不能被整份吞下后才报错。
+mod frame_tests {
+    use super::*;
+    /// 首帧与数据帧都按换行定界，达到预算即拒绝；最后一个完整帧之后的 EOF 是正常关闭。
+    #[test]
+    fn bounded_frames_require_a_delimiter_before_eof() {
+        let hello=br#"{"v":1,"seq":0,"stage":"hello","protocols":[1],"aproxy_version":"test","name":"role","process":"persistent","stages":[],"worker_id":0,"features":[],"overrides":[]}"#;
+        let mut out = Vec::new();
+        assert!(worker("adaptive", Role::Adaptive, &hello[..], &mut out).is_err());
+        assert!(out.is_empty());
+        let mut input = hello.to_vec();
+        input.push(b'\n');
+        assert!(worker("adaptive", Role::Adaptive, &input[..], Vec::new()).is_ok());
+        let mut data = input.clone();
+        data.extend_from_slice(br#"{"v":1,"seq":1,"stage":"request","request_id":"r","delivery":"retry","client":{"path":"/"},"request":{"method":"GET","url":"https://a.test/"}}"#);
+        let mut out = Vec::new();
+        assert!(worker("adaptive", Role::Adaptive, &data[..], &mut out).is_err());
+        assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1);
+        for (prefix, cap) in [(&[][..], 64 * 1024), (&input[..], 8 * 1024 * 1024)] {
+            let mut over = prefix.to_vec();
+            over.resize(prefix.len() + cap + 4096, b' ');
+            let mut cursor = std::io::Cursor::new(over);
+            assert!(worker("adaptive", Role::Adaptive, &mut cursor, Vec::new()).is_err());
+            assert!(cursor.position() as usize <= prefix.len() + cap + 1);
+        }
     }
 }

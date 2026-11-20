@@ -23,6 +23,8 @@ W2c 的设计稿：`aproxy-format <角色>` 每个子命令做什么、要哪些
   - 跨请求的状态只在进程里。要它不丢，就配 persistent、`pool_max = 1`、`worker_idle_secs = 0`。
   - worker 没了，丢的只能是偏好与计数；不能因此弄错一个请求的协议，也不能漏出凭据。
 
+The worker accepts newline-terminated frames only; clean EOF between frames retires it. Limits include the newline: 64 KiB for hello, 8 MiB for metadata-only roles (including a JSON-escaped decide preview), or 257 MiB for roles that accept full bodies or response entities. The latter is a wire-size bound, not a promise that arbitrary escaping or an unlimited proxy body budget will fit.
+
 `keys.header` and `route.auth_header` must be valid HTTP header names protected by the proxy's secret-header predicate. A credential read from a worker's inherited environment may not be a value the proxy knows; using an unprotected name could put it in request history. Stripping credentials uses that same predicate, including cookies and custom token or session headers.
 
 ## convert

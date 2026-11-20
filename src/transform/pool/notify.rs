@@ -296,6 +296,42 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 排空开始时立即释放尚未派发的状态，不等占着同一个 worker 的业务归还名额。
+    #[tokio::test]
+    async fn begin_drain_releases_queued_notices_before_data_returns() {
+        let (cfg, diags) = crate::config::file::parse(
+            "[[format]]\ncommand='unstarted'\nstages=['notify']\nprocess='persistent'",
+            Path::new("unit.toml"),
+        );
+        assert!(diags.is_empty());
+        let p = Pool::new(
+            cfg.format.unwrap().pop().unwrap(),
+            PathBuf::new(),
+            Secrets::default(),
+            None,
+            [1024; 2],
+        );
+        let _waiting = p.waiting_data();
+        let send = || {
+            p.enqueue_notify(Completion::new(
+                aproxy_envelope::Context::new("r".into()),
+                aproxy_envelope::Delivery::Retry,
+                1,
+                1,
+                "ok".into(),
+            ))
+        };
+        send();
+        send();
+        tokio::task::yield_now().await;
+        p.begin_drain();
+        send();
+        let (len, bytes, dropped) = {
+            let lane = p.notices.as_ref().unwrap().lock().unwrap();
+            (lane.queue.len(), lane.bytes, lane.dropped)
+        };
+        assert_eq!((len, bytes, dropped), (0, 0, 3));
+    }
     /// 不放行业务等待者，检查双重容量按旧到新淘汰；数据熔断清队列而不处罚观察方向。
     #[tokio::test]
     async fn notify_queue_yields_to_waiting_data_and_charges_private_state() {

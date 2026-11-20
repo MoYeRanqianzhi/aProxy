@@ -963,6 +963,12 @@ impl Pool {
         for w in idle.drain(..) {
             self.retire(w);
         }
+        drop(idle);
+        // 通知消费者在队列锁内选取空闲进程，不能反向持有 idle 去拿队列锁。
+        if let Some(notices) = &self.notices {
+            notices.lock().unwrap().discard_all(self);
+            self.parked.notify_waiters();
+        }
     }
     /// 截止点到了不再接收工作；直接唤醒持有 OS 句柄的任务，排空已经给过空闲进程宽限。
     pub(crate) fn terminate_remaining(&self) {

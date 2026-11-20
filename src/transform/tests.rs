@@ -3,6 +3,12 @@ use super::super::{format_echo_path, headers_from_btreemap, headers_to_btreemap}
 use super::*;
 use aproxy_envelope as wire;
 use std::collections::BTreeMap;
+/// 独立的挂死保护，不用完成耗时判定行为；调用处核对同时持有的租约、进程帧或实际 EOF。
+async fn until_observed<T>(work: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(30), work)
+        .await
+        .expect("worker observation never arrived")
+}
 /// 构造与正式配置相同的条目；绝对路径保证示例与运行测试的构建一致。
 fn pool(mode: Process, sub: &str, edit: impl FnOnce(&mut FormatEntry)) -> Arc<Pool> {
     let (cfg, diags) = crate::config::file::parse(
@@ -448,11 +454,7 @@ async fn one_handshake_per_pool_and_sequences_per_live_worker() {
         e.env
             .insert("ECHO_OBSERVE".into(), obs.display().to_string());
     });
-    let (a, b) = tokio::time::timeout(Duration::from_secs(4), async {
-        tokio::join!(p.probe(), p.probe())
-    })
-    .await
-    .unwrap();
+    let (a, b) = until_observed(async { tokio::join!(p.probe(), p.probe()) }).await;
     a.unwrap();
     b.unwrap();
     for (body, fresh) in [("a", false), ("b", false), ("c", true)] {
@@ -602,9 +604,8 @@ async fn return_check_distinguishes_stray_bytes_from_clean_eof() {
         .unwrap();
     std::fs::write(dir.path().join(format!("release-{pid}")), b"").unwrap();
     assert!(
-        !tokio::time::timeout(Duration::from_secs(2), turn.worker.stdout.fill_buf())
+        !until_observed(turn.worker.stdout.fill_buf())
             .await
-            .unwrap()
             .unwrap()
             .is_empty()
     );
@@ -613,13 +614,12 @@ async fn return_check_distinguishes_stray_bytes_from_clean_eof() {
     let mut t = p.turn(false).await.unwrap();
     t.worker.stdin.take();
     // 空切片不会像非空数据留在 BufReader 里；探测函数自己观察到第一次 EOF 即可。
-    tokio::time::timeout(Duration::from_secs(2), async {
+    until_observed(async {
         while t.worker.reusable().unwrap() {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .unwrap();
+    .await;
 }
 
 /// 持有 Turn 的任务可以仍在准备本地数据；停止池不能靠该任务主动归还进程。
@@ -638,9 +638,7 @@ async fn shutdown_reaps_a_checked_out_worker_before_returning() {
         .as_u64()
         .unwrap() as u32;
     assert_eq!(p.ids.lock().unwrap().get(&0), Some(&Some(pid)));
-    tokio::time::timeout(Duration::from_secs(5), p.shutdown())
-        .await
-        .unwrap();
+    p.shutdown().await;
     assert!(
         p.ids.lock().unwrap().is_empty(),
         "shutdown returned before the child exited"
@@ -910,10 +908,7 @@ async fn stream_workers_do_not_count_toward_pool_max() {
         .open_stream(stream_frame("a", true), false, None)
         .await
         .unwrap();
-    let other = tokio::time::timeout(Duration::from_secs(3), call(&p, "other", false))
-        .await
-        .unwrap()
-        .unwrap();
+    let other = until_observed(call(&p, "other", false)).await.unwrap();
     assert_ne!(other.state, hello.state);
     let end = stream.event(stream_frame("a", false)).await.unwrap().0;
     assert_eq!(end.state, hello.state);
@@ -928,13 +923,9 @@ async fn stream_worker_ids_stay_unique_beyond_pool_max() {
         .open_stream(stream_frame("a", true), false, None)
         .await
         .unwrap();
-    let (mut b, (second, _)) = tokio::time::timeout(
-        Duration::from_secs(3),
-        p.open_stream(stream_frame("b", true), false, None),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let (mut b, (second, _)) = until_observed(p.open_stream(stream_frame("b", true), false, None))
+        .await
+        .unwrap();
     let id = |r: &Reply| {
         r.state
             .as_ref()

@@ -242,18 +242,55 @@ fn heartbeat_only_disconnect_logs_generic_client_hint() {
     );
 }
 
+/// 只按完整的子进程记录判定事件，短暂读到半行不算收到。
+fn echo_observed(path: &Path, kind: &str) -> bool {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|e| e["event"] == kind)
+}
+/// 停住单线程执行器直到外部进程写完记录，避免它回信后立即被收回、来不及记下 flush。
+fn release_and_observe_flush(gate: &Path, observed: &Path) {
+    std::fs::write(gate, b"").unwrap();
+    let limit = std::time::Instant::now() + Duration::from_secs(30);
+    while !echo_observed(observed, "reply-flushed") {
+        assert!(
+            std::time::Instant::now() < limit,
+            "worker did not flush its heartbeat"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+/// 真实时间只作防挂死保护，不把启动或调度开销算进心跳的逻辑期限。
+async fn wait_echo(path: &Path, kind: &str) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !echo_observed(path, kind) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no {kind}: {:?}", std::fs::read_to_string(path)));
+}
+
 #[tokio::test]
 async fn dynamic_heartbeat_arriving_after_replay_started_is_dropped() {
-    // 心跳转换器慢（400ms）：这一拍的调用还没回来，回放已写出第一块真实
-    // 字节。迟到的动态心跳必须丢弃——写出去就插进了回放的事件中间
+    // 等真实 worker 读到这一拍，先回放真实字节，再放行动态回信。
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("release");
+    let obs = dir.path().join("observed");
     let echo = crate::transform::format_echo_path();
     let (cfg, diags) = crate::config::file::parse(
-        "[[format]]\ncommand='f'\nstages=['heartbeat']\nargs=['heartbeat','400']\ntimeout_secs=10",
+        "[[format]]\ncommand='f'\nstages=['heartbeat']\nprocess='persistent'\ntimeout_secs=0",
         Path::new("unit.toml"),
     );
     assert!(diags.is_empty());
     let mut entry = cfg.format.unwrap().pop().unwrap();
     entry.command = echo.display().to_string();
+    entry.args = vec!["race-beat".into(), gate.display().to_string()];
+    entry
+        .env
+        .insert("ECHO_OBSERVE".into(), obs.display().to_string());
     let pool = crate::transform::Pool::new(
         entry,
         PathBuf::new(),
@@ -278,14 +315,22 @@ async fn dynamic_heartbeat_arriving_after_replay_started_is_dropped() {
         warned: Default::default(),
     }));
     assert!(
-        sink.heartbeat(tokio::time::Instant::now() + Duration::from_secs(1)),
+        sink.heartbeat(tokio::time::Instant::now() + Duration::from_secs(3600)),
         "发起这一拍的动态心跳（在途）"
     );
+    wait_echo(&obs, "heartbeat").await;
     let real = Bytes::from_static(b"data: real\n\n");
     assert!(sink.send(Ok(real.clone())).await);
     assert_eq!(rx.recv().await.unwrap().unwrap(), real);
-    // 等心跳转换回来（400ms + 进程启动）后，通道里不应再出现任何字节
-    tokio::time::sleep(Duration::from_millis(2000)).await;
+    release_and_observe_flush(&gate, &obs);
+    let KeepaliveSink::Committed { tasks, .. } = &mut sink else {
+        unreachable!()
+    };
+    tokio::time::timeout(Duration::from_secs(30), tasks.join_next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert!(rx.try_recv().is_err(), "回放开始后到达的心跳不应写出");
 }
 
@@ -332,28 +377,10 @@ async fn completed_late_heartbeat_and_next_tick_publish_only_eligible_bytes() {
     }));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3600);
     assert!(sink.heartbeat(deadline));
-    let saw = |event: &str| {
-        std::fs::read_to_string(&obs)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .any(|v| v["event"] == event)
-    };
-    tokio::time::timeout(Duration::from_secs(15), async {
-        while !saw("heartbeat") {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .unwrap();
+    wait_echo(&obs, "heartbeat").await;
     // 阻塞本测试自己的 runtime，禁止旧拍抢先运行；通过子进程 flush 后的标记确认两个输入都已就绪。
     tokio::time::pause();
-    std::fs::write(&gate, b"").unwrap();
-    let limit = std::time::Instant::now() + Duration::from_secs(3);
-    while !saw("reply-flushed") {
-        assert!(std::time::Instant::now() < limit);
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    release_and_observe_flush(&gate, &obs);
     tokio::time::advance(Duration::from_secs(3601)).await;
     tokio::time::resume();
     assert!(sink.heartbeat(tokio::time::Instant::now() + Duration::from_secs(3600)));
@@ -362,7 +389,7 @@ async fn completed_late_heartbeat_and_next_tick_publish_only_eligible_bytes() {
         Bytes::from_static(b": keepalive\n\n")
     );
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(4), rx.recv())
+        tokio::time::timeout(Duration::from_secs(30), rx.recv())
             .await
             .unwrap()
             .unwrap()

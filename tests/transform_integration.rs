@@ -430,28 +430,13 @@ async fn request_transform_crash_opens_the_breaker() {
 #[tokio::test]
 async fn request_transform_timeout_opens_the_breaker() {
     isolate_env_proxy();
-    let (upstream, _count, _jh) = fixed_upstream(StatusCode::OK, "ok").await;
-    let mut cfg = proxy_config_for(&upstream);
-    cfg.formats.push(FormatEntry {
-        args: vec!["sleep".to_string(), "5000".to_string()],
-        timeout_secs: 1,
-        breaker_failures: 1,
-        ..transform_config("sleep", Process::Spawn, &[Stage::Request])
-    });
-    let (proxy, _pj) = start_proxy(cfg).await;
-
-    let start = std::time::Instant::now();
-    let resp = local_client()
-        .post(format!("{proxy}/v1/x"))
-        .body("q")
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        start.elapsed() < std::time::Duration::from_secs(4),
-        "超时应在 ~1s 触发而非等满 sleep: {:?}",
-        start.elapsed()
-    );
+    let home = TestHome::new();
+    let (upstream, calls, _jh) = fixed_upstream(StatusCode::OK, "ok").await;
+    let (mut clock, reply) =
+        observed_stage_request(&home, &upstream, "request", "no-stage-reply", 1, false).await;
+    clock.advance(2);
+    let resp = reply.await.unwrap().unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
     let (aproxy, _) =
         aproxy_error(resp, StatusCode::SERVICE_UNAVAILABLE, "format_unavailable").await;
     assert_eq!(aproxy["details"]["kind"], "timeout");
@@ -589,30 +574,18 @@ async fn transform_stages_share_request_id_and_state() {
     assert_ne!(ids[0], ids[1], "不同请求的 request_id 不同");
 }
 
-/// 慢上游：等 `delay_ms` 后回一个 SSE 事件（保活通道在等待期间提交骨架、发心跳）
-async fn slow_sse_upstream(delay_ms: u64) -> (String, tokio::task::JoinHandle<()>) {
-    let app = Router::new().fallback(move || async move {
-        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-        (
-            StatusCode::OK,
-            [("content-type", "text/event-stream")],
-            "data: {\"ok\":true}\n\n",
-        )
-            .into_response()
-    });
-    bind_router(app).await
-}
-
-#[tokio::test]
-async fn heartbeat_reply_cannot_change_state() {
-    // 心跳始终只读本程序的 state 且不带请求体；响应层追加它收到的状态以供核对。
-    // 回放的上游事件完整出现在所有心跳之后。
-    let home = TestHome::new();
+/// 上游收到了请求才让父测试拨钟；回复由父测试在读完预期心跳后单独放行。
+async fn gated_sse_upstream() -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<tokio::sync::Notify>,
+    tokio::task::JoinHandle<()>,
+) {
     let release = Arc::new(tokio::sync::Notify::new());
     let calls = Arc::new(AtomicUsize::new(0));
     let seen = calls.clone();
     let gate = release.clone();
-    let (up, _up) = bind_router(Router::new().fallback(move || {
+    let (up, task) = bind_router(Router::new().fallback(move || {
         let gate = gate.clone();
         seen.fetch_add(1, Ordering::Relaxed);
         async move {
@@ -624,6 +597,15 @@ async fn heartbeat_reply_cannot_change_state() {
         }
     }))
     .await;
+    (up, calls, release, task)
+}
+
+#[tokio::test]
+async fn heartbeat_reply_cannot_change_state() {
+    // 心跳始终只读本程序的 state 且不带请求体；响应层追加它收到的状态以供核对。
+    // 回放的上游事件完整出现在所有心跳之后。
+    let home = TestHome::new();
+    let (up, calls, release, _up) = gated_sse_upstream().await;
     let config = format!(
         "[keepalive]\ninterval_secs=1\n[[format]]\nname='echo'\ncommand={}\nargs=['heartbeat']\nprocess='persistent'\nstages=['heartbeat','response']\n",
         serde_json::to_string(&format_echo_path()).unwrap()
@@ -679,25 +661,35 @@ async fn heartbeat_reply_cannot_change_state() {
 #[tokio::test]
 async fn heartbeat_transform_failure_falls_back_to_fixed_heartbeat() {
     // 心跳转换器每拍都回 error：照常发固定心跳，请求本身不受影响
-    isolate_env_proxy();
-    let (upstream, _jh) = slow_sse_upstream(2500).await;
-    let mut cfg = keepalive_1s_config_for(&upstream);
-    cfg.formats.push(transform_config(
-        "error",
-        Process::Persistent,
-        &[Stage::Heartbeat],
-    ));
-    let (proxy, _pj) = start_proxy(cfg).await;
-
-    let resp = local_client()
-        .post(format!("{proxy}/v1/messages"))
-        .header("accept", "text/event-stream")
-        .body(r#"{"stream":true}"#)
-        .send()
-        .await
-        .unwrap();
+    let home = TestHome::new();
+    let (upstream, calls, release, _up) = gated_sse_upstream().await;
+    let cfg = format!(
+        "[keepalive]\ninterval_secs=1\n[[format]]\ncommand={}\nargs=['error']\nprocess='persistent'\nstages=['heartbeat']",
+        serde_json::to_string(&format_echo_path()).unwrap()
+    );
+    let (client, proxy, mut clock) = manual_clock::Clock::start(
+        &home,
+        upstream.rsplit(':').next().unwrap().parse().unwrap(),
+        &cfg,
+    );
+    let mut resp = clock
+        .first_head(
+            client
+                .post(format!("{proxy}/v1/messages"))
+                .header("accept", "text/event-stream")
+                .body(r#"{"stream":true}"#),
+            &calls,
+            1,
+        )
+        .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = resp.text().await.unwrap();
+    let mut bytes = Vec::new();
+    while !bytes.ends_with(b": keepalive\n\n") {
+        bytes.extend_from_slice(&resp.chunk().await.unwrap().unwrap());
+    }
+    release.notify_one();
+    bytes.extend_from_slice(&resp.bytes().await.unwrap());
+    let body = String::from_utf8(bytes).unwrap();
     assert!(body.contains(": keepalive\n\n"), "应退回固定心跳: {body:?}");
     assert!(
         body.ends_with("data: {\"ok\":true}\n\n"),
@@ -875,19 +867,71 @@ fn keepalive_1s_config_for(upstream: &str) -> Config {
     }
 }
 
-/// 发一个走保活通道的请求，返回（拿到响应头的耗时、状态、完整 body）
-async fn timed_sse_post(proxy: &str) -> (std::time::Duration, StatusCode, String) {
-    let started = std::time::Instant::now();
-    let resp = local_client()
-        .post(format!("{proxy}/v1/x"))
-        .header("accept", "text/event-stream")
-        .body("q")
-        .send()
-        .await
-        .unwrap();
-    let head_after = started.elapsed();
-    let status = resp.status();
-    (head_after, status, resp.text().await.unwrap())
+/// 真实 worker 读到消息之后才交回手动时钟；握手或进程调度不能吃掉保活与超时的先后关系。
+async fn observed_stage_request(
+    home: &TestHome,
+    upstream: &str,
+    stage: &str,
+    mode: &str,
+    timeout: u64,
+    sse: bool,
+) -> (
+    manual_clock::Clock,
+    tokio::task::JoinHandle<reqwest::Result<reqwest::Response>>,
+) {
+    let file = home.path().join("observed");
+    let cfg = format!(
+        "[keepalive]\ninterval_secs=1\n[[format]]\nname='echo'\ncommand={}\nargs=['{mode}',{}]\nprocess='spawn'\nstages=['{stage}']\nrequired=true\ntimeout_secs={timeout}\nbreaker_failures=1\nenv={{ECHO_OBSERVE={}}}",
+        serde_json::to_string(&format_echo_path()).unwrap(),
+        serde_json::to_string(&home.path().join("release")).unwrap(),
+        serde_json::to_string(&file).unwrap()
+    );
+    let (client, proxy, clock) = manual_clock::Clock::start(
+        home,
+        upstream.rsplit(':').next().unwrap().parse().unwrap(),
+        &cfg,
+    );
+    let mut req = client.post(format!("{proxy}/hold")).body("blocked");
+    if sse {
+        req = req.header("accept", "text/event-stream");
+    }
+    let response = tokio::spawn(req.send());
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if std::fs::read_to_string(&file)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .any(|v| v["event"] == stage)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    (clock, response)
+}
+
+/// 在尚未放行的转换进程之外真正读到骨架头和完整一拍，再让程序回信并收取回放。
+async fn heartbeat_before_stage_release(
+    home: &TestHome,
+    upstream: &str,
+    stage: &str,
+    mode: &str,
+) -> String {
+    let (mut clock, reply) = observed_stage_request(home, upstream, stage, mode, 0, true).await;
+    clock.advance(1);
+    let mut resp = reply.await.unwrap().unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = Vec::new();
+    while !body.ends_with(b": keepalive\n\n") {
+        body.extend_from_slice(&resp.chunk().await.unwrap().unwrap());
+    }
+    std::fs::write(home.path().join("release"), b"").unwrap();
+    body.extend_from_slice(&resp.bytes().await.unwrap());
+    String::from_utf8(body).unwrap()
 }
 
 /// 记录收到的 `x-retry-seen` 头的上游（every_attempt 故障转移的备用上游）
@@ -995,24 +1039,9 @@ async fn retry_stage_rejection_does_not_resend_the_previous_request() {
 
 #[tokio::test]
 async fn keepalive_covers_slow_request_transform() {
-    // 请求转换耗时 2.5s、保活间隔 1s：请求转换在保活通道内经心跳节拍驱动，
-    // 骨架头约 1s 到达、早于转换完成，之后照常心跳——而不是让客户端在拿到任何
-    // 字节之前干等转换（timeout_secs = 0 时这段等待没有上界）
-    isolate_env_proxy();
+    let home = TestHome::new();
     let (upstream, count, _jh) = fixed_upstream(StatusCode::OK, "ok-payload").await;
-    let mut cfg = keepalive_1s_config_for(&upstream);
-    cfg.formats.push(FormatEntry {
-        args: vec!["sleep".to_string(), "2500".to_string()],
-        ..transform_config("sleep", Process::Spawn, &[Stage::Request])
-    });
-    let (proxy, _pj) = start_proxy(cfg).await;
-
-    let (head_after, status, text) = timed_sse_post(&proxy).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(
-        head_after < std::time::Duration::from_millis(2200),
-        "骨架头应在约一个保活间隔后到达、早于请求转换完成（2.5s）: {head_after:?}"
-    );
+    let text = heartbeat_before_stage_release(&home, &upstream, "request", "gate-request").await;
     assert!(text.contains(": keepalive"), "转换期间应有心跳: {text}");
     assert!(
         text.contains("ok-payload"),
@@ -1025,19 +1054,15 @@ async fn keepalive_covers_slow_request_transform() {
 async fn keepalive_request_transform_failure_after_commit_ends_with_error_event() {
     // 请求转换在骨架头提交之后才失败（超时 2s > 保活间隔 1s）：状态行已发出，
     // 不能再回 502，以终态 SSE error 事件收场；请求未发往上游
-    isolate_env_proxy();
+    let home = TestHome::new();
     let (upstream, count, _jh) = fixed_upstream(StatusCode::OK, "never").await;
-    let mut cfg = keepalive_1s_config_for(&upstream);
-    cfg.formats.push(FormatEntry {
-        args: vec!["sleep".to_string(), "5000".to_string()],
-        timeout_secs: 2,
-        breaker_failures: 1,
-        ..transform_config("sleep", Process::Spawn, &[Stage::Request])
-    });
-    let (proxy, _pj) = start_proxy(cfg).await;
-
-    let (_, status, text) = timed_sse_post(&proxy).await;
-    assert_eq!(status, StatusCode::OK, "骨架头已提交");
+    let (mut clock, reply) =
+        observed_stage_request(&home, &upstream, "request", "no-stage-reply", 2, true).await;
+    clock.advance(1);
+    let resp = reply.await.unwrap().unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "骨架头已提交");
+    clock.advance(2);
+    let text = resp.text().await.unwrap();
     // 终态事件的 data 与错误体是同一个 JSON
     let data = text
         .lines()
@@ -1059,9 +1084,7 @@ async fn keepalive_request_transform_failure_after_commit_ends_with_error_event(
 
 #[tokio::test]
 async fn keepalive_covers_slow_response_transform() {
-    // 上游很快回 SSE 成功、响应转换耗时 2.5s：转换经心跳节拍驱动，骨架头约 1s
-    // 到达、之后心跳，转换完成后回放转换后的 body
-    isolate_env_proxy();
+    let home = TestHome::new();
     let app = Router::new().fallback(|| async {
         (
             [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
@@ -1070,19 +1093,7 @@ async fn keepalive_covers_slow_response_transform() {
             .into_response()
     });
     let (upstream, _jh) = bind_router(app).await;
-    let mut cfg = keepalive_1s_config_for(&upstream);
-    cfg.formats.push(FormatEntry {
-        args: vec!["sleep".to_string(), "2500".to_string()],
-        ..transform_config("sleep", Process::Spawn, &[Stage::Response])
-    });
-    let (proxy, _pj) = start_proxy(cfg).await;
-
-    let (head_after, status, text) = timed_sse_post(&proxy).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(
-        head_after < std::time::Duration::from_millis(2200),
-        "骨架头应在约一个保活间隔后到达、早于响应转换完成（2.5s）: {head_after:?}"
-    );
+    let text = heartbeat_before_stage_release(&home, &upstream, "response", "gate-response").await;
     assert!(text.contains(": keepalive"), "转换期间应有心跳: {text}");
     assert!(text.contains("data: ok"), "应回放转换后的 body: {text}");
 }

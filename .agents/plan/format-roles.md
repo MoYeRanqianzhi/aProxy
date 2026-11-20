@@ -1,0 +1,220 @@
+# 官方 aproxy-format 的各个角色
+
+W2c 的设计稿：`aproxy-format <角色>` 每个子命令做什么、要哪些阶段与请求体、配置长什么样、状态放在哪里。
+协议一侧的契约在 [w2-contracts](w2-contracts.md) 的 §10（各角色用到的阶段见 §10.14）；这里只写角色自己的行为。
+由 Codex 在 t06 第五段起草（2026-11-20），主代理改写成中文；实现分在 t06 的第五到第九段。
+
+**现状（2026-11-20，第五段做完）**：各角色的协议 1 入口、请求与非流式响应的转换、基本的 key 轮换与按模型路由已经实现。
+下面写到的流式转换、冷却、决策与工具子命令属于之后几段，起步的骨架还不都接受这些配置。
+
+## 共同约定
+
+- 一个子命令只做一个角色。重试、传输与投递归 aproxy，角色不重复实现。
+- 角色读一行协议 1 的 hello，回它支持的阶段与各阶段要多少请求体；之后每收一帧回一帧，带上 `v` 与 `seq`，直到 EOF。
+  `[[format]]` 里配的 `stages` 是从它声明的阶段里选，不是让 aproxy 调别的阶段的许可。
+  只有双方都声明了 `decide.success`，成功的尝试才会来问。类型用 `aproxy-envelope` 的协议 1 类型。
+- 给本机看的（命令行输出、stderr 的诊断）用中文；写进协议的 `fail.reason` 与 `report.summary` 用英文，因为读它们的是别的程序。
+- 诊断不上 stdout。报错里不引用坏掉的帧、TOML 的原文行、环境变量的值、认证头。
+- 配置是严格的 TOML：`--config FILE` 指向这个角色自己的文件（下面每个样例是一个单独的文件，不是 config.toml 里的一节），
+  不认识的键报错。样例里的密钥写的是**环境变量的名字**，值由 worker 的环境给出，从不写进文件。
+- 状态：
+  - 同一个请求的后一个阶段可能落在另一个 worker 上，所以请求内要传的东西放进协议的 `state`，不放进程里按请求编号的表。
+    `state` 要小，用稳定的、不是密钥的 ID 作键。
+  - 跨请求的状态只在进程里。要它不丢，就配 persistent、`pool_max = 1`、`worker_idle_secs = 0`。
+  - worker 没了，丢的只能是偏好与计数；不能因此弄错一个请求的协议，也不能漏出凭据。
+
+## convert
+
+`aproxy-format convert --from anthropic_messages --to openai_chat`，或 `convert --config convert.toml`：
+
+```toml
+from = "auto"
+to = "openai_chat"
+```
+
+- **阶段**：request 与 retry（请求体 `full`）、response、stream。一个条目在 response 与 stream 里只订一个。
+  不参与 decide 与 notify。
+- **认协议**：`from = "auto"` 时按原始的客户端路径与体逐个请求判断；判断不了就拒绝，不悄悄交付错的形状。
+  上游与客户端协议不同时，`to` 必须写明。
+- **回程**：认出的客户端协议记在 `state` 里（不塞进体），配置的上游协议是另一半。响应方向转回 `state` 记的协议，
+  不从上游的响应体去猜。只订了请求方向的条目不转响应，这是有意的。
+- 保留现有的非流式转换与同协议直通。回给客户端的响应补丁里去掉上游的凭据头。报告只写协议名，不写内容。
+- **流式**：一条流独占的那个 worker 持有源协议的帧解码器与转换状态，直到 close 或 abort。
+  - 管道里的一帧 data 不等于一个 SSE 事件：要处理半行、一帧里的多个事件、各协议自己的事件名与结束方式。
+  - 不把整条流攒起来。
+  - 流被截断时按 abort 的规则收尾，不补一个正常的结束。
+  - 上游回的是非流式的整体、却进了 stream 订阅时，在整体的边界上用非流式的转换。
+- 上游的错误不走成功响应的转换；要按客户端协议改写错误，用 policy 的 stop 附带响应。
+
+## keys
+
+`aproxy-format keys --config keys.toml`：
+
+```toml
+strategy = "weighted" # round_robin、weighted、random
+sticky = false
+cooldown_status = [401, 403, 429]
+cooldown_secs = 30
+[[pool]]
+origin = "https://relay.example.com"
+header = "authorization"
+scheme = "Bearer"
+keys = [{ id = "a", env = "RELAY_A", weight = 2 }, { id = "b", env = "RELAY_B", weight = 1 }]
+```
+
+- **阶段**：request 与 retry，请求体都是 `none`；开了粘性才要 `full`。
+- **选哪个池**：按**当前要去的上游**选，不按客户端带来的凭据。比的是解析后的 origin（含实际端口），不是字符串前缀。
+  去向不在任何池里就拒绝。
+- **怎么改请求**：无关的头不动；一组凭据作为整体替换。不在返回的请求补丁之外轮换或追加认证值。
+- **状态与报告**：选中的池与 key 的 ID 记进 `state`；报告里只用 ID 指代 key。
+- **冷却**：
+  - 重试时记账的是上一次用的 key，不是换了渠道之后新选的那个。
+  - 每个 key 留一个单调时钟的「何时可再用」。按权重选不必展开一张与权重成正比的表。
+  - 读 `retry.last_response`（上一次尝试的状态与头，体中途断了也有）与 `last_failure`；连不上、或请求在链里就失败时没有头。
+    对配置的冷却状态尊重 `Retry-After`，不改 aproxy 自己的退避。
+  - **冷却只在重试链真的重跑时发生**。decide 表态 `reroute:false` 时 aproxy 重发的是上次准备好的请求：keys 不被调用，
+    不轮换，也记不到那次失败。要让每次失败都记账，就让 policy 表态 `reroute:true`。
+  - 可用性、轮换位置与粘性都只在一个进程里：池子大于 1 时，一个 worker 冷却掉的 key 另一个 worker 还会选。
+    所以 `init` 给 keys 生成 `pool_max = 1`、persistent、不因闲置回收（与 adaptive 一样）。worker 重启之后没有冷却记录。
+- **粘性**：在可用的 key 里按对话的稳定前缀的哈希选；不保留对话内容；让位于冷却。
+
+## route
+
+`aproxy-format route --config route.toml`：
+
+```toml
+[aliases]
+small = "provider-small"
+[[channel]]
+id = "primary"
+url = "https://relay.example.com/v1/messages"
+models = [{ exact = "provider-small" }, { prefix = "team-" }, { regex = "^chat-[0-9]+$" }]
+priority = 1
+weight = 2
+preserve_path = false
+credential_env = "PRIMARY_KEY"
+auth_header = "x-api-key"
+[channel.overrides]
+"timeouts.first_byte_secs" = 90
+[[rule]]
+model = "small"
+[rule.overrides]
+"retry.max_attempts" = 3
+```
+
+- **阶段**：request 与 retry，请求体 `full`。不对 decide 表态，不订 notify。
+- **选渠道**：先把模型别名换成真名，再匹配渠道；在优先级最高（数字最小）的可用组里选，同级按权重。
+- **重试**：收到 retry 就是重试链真的在重跑，这时用上一次的渠道与 `last_failure` 做故障切换。
+  `reroute:false` 时 aproxy 重发准备好的请求，任何角色都不该自己换。
+- **换上游时的凭据**：去向变了就去掉 authorization、API key、cookie 与代理凭据，哪怕后面还排着 keys。
+  然后用这个渠道自己的凭据，或交给绑定去向的 keys 来填。
+- **地址**：用渠道写明的 URL；配了 `preserve_path` 就接上原来的路径与查询串。
+- **覆盖**：只回 hello 里列出的覆盖键。同一个键上，精确匹配原始模型的规则压过所选渠道的默认值。
+- **状态与报告**：原始模型与选中的渠道 ID 记进 `state`；报告写路由与模型映射，不写凭据，也不写带 userinfo 的 URL。
+- **把别名换回来**：配了别名时，另外提供一个可选的 response 订阅（要缓冲响应）。只有上游回的是映射后的那个模型名时，
+  才换回 `state` 里记的原始别名，这样几个别名指向同一个模型时客户端看到的仍是它自己用的那个。
+  真正流式的客户端不要订这个阶段。
+
+## policy
+
+`aproxy-format policy --config policy.toml`：
+
+```toml
+[[rule]]
+status = [429, 503]
+decision = "retry"
+reroute = true
+respect_retry_after = true
+[[rule]]
+failure = "upstream_error_body"
+body_regex = "context length"
+decision = "stop"
+response = "context_too_long"
+```
+
+- **阶段**：只有 decide，**请求体**要 `none`。没有跨请求的状态。
+- **规则**：按顺序求值，一条规则里的条件要同时成立；都不命中就不表态。有规则要看成功的响应时才声明 `decide.success`。
+- **看响应体**：看的是 decide 给的预览，连同它是否完整的标记。预览被截短时，没匹配上不能说明整个体里没有。
+- **重试**：`Retry-After` 从这条消息的响应头里读，不超过协议允许的延迟上限；给不出可用的值时保留 fallback 的延迟。
+- **停止并给响应**：按原始的客户端路径（非标准路径时按配置写明的协议）选客户端的协议，不按路由之后的 URL。
+  响应是新生成的、安全的说明，不照抄上游的体或凭据。
+- **报告**：规则的 ID 与动作。
+
+## adaptive
+
+`aproxy-format adaptive --config adaptive.toml`：
+
+```toml
+failure_threshold = 2
+max_entries = 4096
+ttl_secs = 900
+hold_secs = 60
+recovery_samples = 10
+recovery_success_ratio = 0.9
+recovery_latency_ms = 1000
+```
+
+- **阶段**：request（`digest`）、decide（`none`）、notify（`digest`）。
+- **判断**：没见过的摘要回 forward。反复失败或升级的摘要固定用 retry。还没向客户端写出字节的 forward 失败，
+  在 decide 上回 retry；已经在重试的请求上，不去推翻别的重试策略。
+- **学习**：用 `request_end` 的结果、是否升级、耗时与流是否完整，在交付**之后**更新历史。
+  摘要为 null 不等于空体的哈希。
+- **存什么**：只存摘要、有界的计数、上一次的结果与时间。过期的先淘汰，满了淘汰最久没用的。
+  回到 forward 之前要过一段保持时间和一个有界的恢复窗口。
+- **状态与报告**：阶段之间需要时用 `state` 带摘要；报告写模式的变化，不写内容。
+- **推荐配法**：`required = false`、`pool_max = 1`、`worker_idle_secs = 0`，实例的默认投递方式保持 retry：
+  这个旁观者没了，普通的重试必须还在。
+
+## rewrite
+
+`aproxy-format rewrite --config rewrite.toml`：
+
+```toml
+remove_headers = ["x-legacy"]
+set_headers = { "x-service" = "chat" }
+remove = ["/metadata/debug"]
+set = { "/temperature" = 0.5 }
+models = { small = "provider-small" }
+```
+
+- **阶段**：request 与 retry。配了体的指针或模型规则时请求体要 `full`，只改头时要 `none`。
+  不需要请求内的状态、失败详情、decide 或 notify。
+- 没提到的字段不动。JSON Pointer 的转义与数组下标按规范解释；目标不存在与值是 JSON null 是两回事。
+- 报告写做了哪些操作，不写旧值与新值。
+
+## heartbeat
+
+`aproxy-format heartbeat --config heartbeat.toml`：
+
+```toml
+[[preset]]
+path = "/v1/messages"
+protocol = "anthropic_messages"
+event = "ping"
+```
+
+- **阶段**：只有 heartbeat。不协商请求体，不写 `state`，不参与 decide 与 notify，报告里不带与 key 有关的东西。
+- **选预设**：按原始的客户端路径与写明的协议选，不从路由之后的请求去猜，也不把不知道的 `client.stream` 当成 false。
+  没有预设匹配时，原样留下收到的字节。
+- **输出**：每次输出都停在 SSE 的事件边界上（例如 `event: ping\ndata: {"type":"ping"}\n\n`）。
+  预设不能编造文本、工具调用、用量或结束事件。
+- 一个预设要先与真实转换出来的事件交错着喂给目标 SDK 的解析器，验证通过，才能写成「支持」。
+
+## 工具子命令与验证
+
+- `init <场景> --output <目录>`：生成最小的一组角色配置与 config.toml。
+  - 投递方式保持 retry；只含这个场景用到的角色；排在 route 之后的 convert 或 rewrite 要声明 retry。
+  - 不写密钥，不悄悄覆盖已有的配置。
+- `check <文件>` 检查一条链，`check <角色> --config <文件>` 检查一个角色：
+  - 用 worker 启动时的同一套模型解析：不认识的键、不认识的取值、非法的正则、指针、权重与阶段组合都报错。
+  - 检查重试链的后段是否合规；只转了请求方向、响应一侧没有转换器时报出来。
+  - 检查静态配置时不执行配置里的命令。
+- `try <链> --request <样例>`：拿本地的样例按声明的阶段干跑一遍，照 §10.14 的方向用 hello、序号、`state` 与表态驱动各角色。
+  样例绝不发往上游。配置里的密钥、凭据头的值与 URL 里的敏感部分，在**每一步打印之前**就遮住，报错里也一样。
+- `translate --from <协议> --to <协议>`：一次性的转换，从 stdin 读一个 JSON 请求。与 `convert` 不同，它不读 hello，也不输出信封。
+- **验证**：
+  - 协议抄本覆盖每个角色单独运行，以及 §7.2 的链对着本机的上游。核对的是管道里实际的字段、上游收到的 URL 与凭据、
+    客户端收到的响应，不只是退出码。
+  - 留一条直接的测试：默认 retry 之下可选的 adaptive 不可用时，普通的重试还在。
+  - 流式：每个方向都跑，并把每个心跳预设交错进去，用官方 Python SDK 的解析器断言文本、工具、结束与用量；不调真实的 API。
+    SDK 那套验证做出来之后，把确切的调用方式记在它旁边。

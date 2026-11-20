@@ -36,7 +36,14 @@ HTTP 的交付与 worker 的完成是两条边界。双工的 forward 响应可�
 发完成通知之前要等的是这两个生命期都结束，而不是旁观程序或 worker 的收尾。要测某一拍或半开探测，等真实的子进程或上游
 确认收到那一帧之后再拨代理的时钟；把客户端和它的防挂死期限也冻住，会把卡住的交互藏起来。
 
-**Evidence:** `tests/history_integration.rs` 的 `forwarded_requests_are_recorded_as_they_stream`；`tests/format_protocol.rs` 的
+worker 的内存不是请求的身份。同一个链条目的 request 与 response 都可能落在不同的进程上：官方角色把认出的客户端协议、
+选中的凭据的公开 ID 放进这个条目按请求的 `state`，不放进程里按请求编号的表，更不放密钥。反过来，重发时没被调用的 keys
+没法立刻冷却那个 key：只有重跑的重试链才收到上一次的上游响应头。各角色订哪些阶段、怎么带状态，见
+`.agents/plan/format-roles.md`。
+
+**Evidence:** `aproxy-format/tests/e2e.rs` 的 `cross_format_response_conversion_end_to_end`；`tests/format_protocol.rs` 的
+`sample_chain_of_section_7_2_runs_end_to_end`、`retry_last_response_omitted_after_chain_and_connect_failures`；
+`tests/history_integration.rs` 的 `forwarded_requests_are_recorded_as_they_stream`；`tests/format_protocol.rs` 的
 `forward_stream_can_open_before_the_client_finishes_its_upload`、`forward_vote_on_either_side_of_commitment`、
 `forward_disconnect_during_data_preserves_upstream_counts_before_notify` 与用手动时钟的心跳、notify 回归；
 `tests/format_protocol.rs` 的 `client_disconnect_aborts_open_streams_on_their_own_workers`、
@@ -46,7 +53,7 @@ HTTP 的交付与 worker 的完成是两条边界。双工的 forward 响应可�
 `disconnected_format_request_releases_the_only_worker_without_heartbeat`、
 `pending_heartbeat_does_not_delay_a_response_or_its_eof`、`program_terminal_bytes_stay_private_to_the_client`。
 
-**Recheck when:** 进程或流的生命周期、留体的契约有变；官方 `aproxy-format` 迁到协议 1。下面更早的运行时记录讲的是旧信封，
+**Recheck when:** 进程或流的生命周期、留体的契约有变；官方角色改变协商或携带 state 的方式。下面更早的运行时记录讲的是旧信封，
 不是 aproxy 现在的实现；独立二进制与发版、envelope 预发布版本号的决定仍然有效。见 [[config-settings-shape-0-2-0]] 与
 [[release-engineering]]。
 

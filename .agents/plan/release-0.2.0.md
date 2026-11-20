@@ -1149,3 +1149,21 @@
     下载、留体预算为 0 时私有内存涨 3.4 MiB（上限 32）；上游每 100 ms 一块时，转换后的首块在 0.6 到 0.8 ms 内到客户端。
   - **验证**（Codex 在 Windows 上跑的，bdb1f19）：`cargo fmt --all` 无改动；headless 全量 1009 通过、0 失败、9 忽略；
     headless、desktop 与 Linux 交叉三种 clippy 零输出。
+- B11（2026-11-20，Codex 实现；提交「retry 阶段的输入带上一次尝试的上游响应头」「官方 aproxy-format 改说协议 1，
+  每个角色一个子命令」「aproxy-envelope 删去旧信封」）：官方 aproxy-format 迁到协议 1。
+  - **按角色拆开**：`aproxy-format <角色>` 一个子命令一个角色（convert、keys、route、policy、adaptive、rewrite、heartbeat），
+    没有大一统的 `run`，也没有旧信封了；原来不走信封的一次性转换改名 `translate`。这一段搬过来的是已有的能力：
+    请求与非流式响应的协议转换、key 轮换、按模型路由；policy、adaptive、rewrite、heartbeat 只有握手与最小行为，
+    流式转换、冷却、决策与工具子命令在之后几段。各角色的设计在 [format-roles](format-roles.md)。
+  - **状态放哪里**：同一个请求的 request 与 response 可能落在不同的 worker 上，所以 convert 把认出的客户端协议、keys 把
+    选中的 key 的 ID 放进协议的 `state`，不放进程里按请求编号的表，也不放密钥本身。keys 按解析后的 origin 选池，不按主机名前缀。
+    route 换上游时连同认证一起换；配了别名的 route 可以多订一个缓冲的 response，把模型名换回客户端用的那个别名。
+  - **`retry.last_response`**（§10.4）：重跑重试链时，带上一次尝试的上游状态与头（体中途断了也带）；连不上或在链里失败时没有；
+    心跳不带。不为了拼这个头去读请求体。两条由此而来的限制写进了角色设计：decide 表态 `reroute:false` 时 keys 不被调用，
+    记不到那次失败；冷却只在一个 worker 里，所以 keys 配 `pool_max = 1`。
+  - **给谁看用什么语言**：命令行与 stderr 的诊断用中文；写进协议的 `fail.reason` 与 `report.summary` 用英文。
+  - **实测**（用真实的 aproxy-format 二进制，本机上游）：§7.2 的链把 Anthropic 请求转成 Chat、带上凭据发给上游、
+    把响应转回 Anthropic；adaptive 的管道上只有摘要、没有正文；可选的 adaptive 不可用时普通的重试还在；
+    七个角色各自单独握手，只声明自己要的阶段与请求体粒度。跨协议的 SSE 与各角色的进阶行为不在这次的结果里。
+  - **验证**（Codex 在 Windows 上跑的，c0b91c7）：`cargo fmt --all` 无改动；headless 全量 985 通过、0 失败、9 忽略
+    （比上一段少，是旧信封的测试随旧信封删了）；headless、desktop 与 Linux 交叉三种 clippy 零输出。

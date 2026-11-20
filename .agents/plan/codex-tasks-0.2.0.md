@@ -20,8 +20,9 @@
 
 | 任务 | 做什么 | 状态（2026-11-20） |
 |---|---|---|
-| t06-format | format 一线到 alpha.4：九个阶段（B10a、B10b、B10c、B10d、B11、W2c 的四段） | 第一段到第四段（B10a、B10b decide、B10c stream 与 forward 过链、B10d 按请求选投递方式与 notify）做完，gate 过了，都已挑进 master 并推送；第五段（W2c 的角色设计）在做，开头停下问 keys 怎么拿到 Retry-After，已裁定（retry 阶段带上一次尝试的响应头，任务书 Revision 18）。原会话 2026-11-20 被接口报错打断且续不上，换了新会话接手（Revision 17） |
+| t06-format | format 一线到 alpha.4：九个阶段（B10a、B10b、B10c、B10d、B11、W2c 的四段） | 第一段到第五段（B10a、B10b decide、B10c stream 与 forward 过链、B10d 按请求选投递方式与 notify、B11 官方 aproxy-format 改说协议 1 并删去旧信封）做完，gate 过了，都已挑进 master 并推送；第六段（W2c：convert 与 heartbeat）在做，开工前先修第四段审查的 7 条 P1（任务书 Revision 19）。原会话 2026-11-20 被接口报错打断且续不上，换了新会话接手（Revision 17） |
 | p01-perf-hw1 | 在服务器上给 0.2.0-alpha.3 与 0.1.0 测性能基线，交出能重跑的测量脚本 | S1（启动）、S2（静默）测完，在做 S3（低并发）。原会话 2026-11-20 被接口报错打断且续不上，换了新会话接手（任务书 Revision 2）；服务器上的测量没有中断 |
+| v13 | 审查第五段：`retry.last_response`、官方 aproxy-format 的角色入口、删旧信封，以及角色设计稿 | 2026-11-20 派出 |
 | v01 到 v12 | 审查第一段到第四段 | 做完；结论已写进 t06 的 Revision 4、5、8、10、13、19 |
 
 ## 排好的任务（按先后）

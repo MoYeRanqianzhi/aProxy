@@ -445,7 +445,7 @@ pub struct Fallback {
     pub decision: Decision,
     /// Origin of the fallback decision.
     pub by: String,
-    /// Wait before retry, absent when stopping.
+    /// Current backoff if the attempt is retried, even on a stop decision. Older peers may omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay_ms: Option<u64>,
 }

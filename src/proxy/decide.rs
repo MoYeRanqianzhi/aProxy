@@ -200,13 +200,12 @@ pub(super) async fn consult(
     } else {
         wire::Fallback::new(action, by)
     };
-    if fallback.decision == Retry {
-        fallback.delay_ms = Some(
-            retry::delay_for_attempt(attempt, state.config.max_retry_backoff_secs)
-                .as_millis()
-                .min(u128::from(u64::MAX)) as u64,
-        );
-    }
+    // 即使本次兜底是停止，程序仍可投重试票；它需要知道重试原本应等待多久。
+    fallback.delay_ms = Some(
+        retry::delay_for_attempt(attempt, state.config.max_retry_backoff_secs)
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+    );
     let ctx = req.ctx.as_ref().expect("format context");
     let mut preview = None;
     for (layer, pool) in state

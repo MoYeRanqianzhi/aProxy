@@ -2874,7 +2874,7 @@ async fn decision_and_reports_are_recorded_in_the_attempt() {
     let f = frames(&home, "voter");
     assert_eq!(
         f[1]["fallback"],
-        serde_json::json!({"decision":"stop","by":"rule:1"})
+        serde_json::json!({"decision":"stop","by":"rule:1","delay_ms":0})
     );
     let d = request_detail(&home, &url, f[1]["request_id"].as_str().unwrap()).await;
     let tries = &d["record"]["tries"];
@@ -4461,7 +4461,7 @@ async fn decide_wire_fallback_exposes_nonzero_backoff_and_exhausted_override() {
                 &home,
                 "limits",
                 "'request'",
-                &["reply", r#"{"overrides":{"retry":{"max_attempts":1}}}"#],
+                &["reply", r#"{"overrides":{"retry":{"max_attempts":4}}}"#],
             );
         }
         cfg += &layer(
@@ -4488,9 +4488,14 @@ async fn decide_wire_fallback_exposes_nonzero_backoff_and_exhausted_override() {
         let f = frames(&home, "vote");
         assert_eq!(f[6]["attempt"], 6);
         if capped {
+            assert_eq!(f[4]["attempt"], 4);
+            assert_eq!(
+                f[4]["fallback"],
+                serde_json::json!({"decision":"stop","by":"override","delay_ms":5000})
+            );
             assert_eq!(
                 f[6]["fallback"],
-                serde_json::json!({"decision":"stop","by":"override"})
+                serde_json::json!({"decision":"stop","by":"override","delay_ms":20000})
             );
         } else {
             assert_eq!(

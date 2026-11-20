@@ -668,7 +668,21 @@ fn simulate_swap(home: &Path, new_bin: impl FnOnce(&Path)) -> std::path::PathBuf
     let old = aproxy::install::swap::bin_dir_in(home).join(aproxy::install::swap::unique_name(
         aproxy::install::swap::OLD_PREFIX,
     ));
-    std::fs::rename(&bin, &old).unwrap();
+    // Windows 的活镜像可以改名，但别的临时读句柄可能不共享删除权限。只等共享冲突，
+    // 不掩盖路径、权限等错误，更不为一次改名中止正在验证的旧实例。
+    let mut waits = [25, 50, 100, 200, 400, 800].into_iter();
+    loop {
+        match std::fs::rename(&bin, &old) {
+            Err(e)
+                if cfg!(windows)
+                    && e.raw_os_error() == Some(32)
+                    && let Some(ms) = waits.next() =>
+            {
+                std::thread::sleep(Duration::from_millis(ms))
+            }
+            other => break other.unwrap(),
+        }
+    }
     new_bin(&bin);
     make_exec(&bin);
     old

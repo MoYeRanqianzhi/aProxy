@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 /// 中断在层间不是正常 EOF：外层需要 abort 而不是 close，只有最后的客户端读者才拿收尾字节。
 pub(super) struct End {
     /// 传给外层 abort 的稳定原因，不把任意管道文本写进诊断。
-    reason: wire::Failure,
+    reason: Box<wire::Failure>,
     /// 已经转换到当前协议的中断结尾。
     tail: Option<Bytes>,
 }
@@ -19,7 +19,7 @@ impl End {
     /// 上游中断还没有客户端协议的收尾，由外层决定。
     fn upstream() -> Self {
         Self {
-            reason: wire::Failure::new("upstream_body_interrupted".into()),
+            reason: Box::new(wire::Failure::new("upstream_body_interrupted".into())),
             tail: None,
         }
     }
@@ -27,7 +27,10 @@ impl End {
     pub(super) fn attempt(f: AttemptFailure) -> Self {
         let mut reason = wire::Failure::new(f.code.into());
         reason.details = Some(f.details);
-        Self { reason, tail: None }
+        Self {
+            reason: Box::new(reason),
+            tail: None,
+        }
     }
 }
 /// 每项是一块完整的转换输出或一个中断；容量受 HTTP 与子进程两侧的背压限制。
@@ -275,7 +278,7 @@ impl Layer {
                             drop(input);
                             let _ = tx
                                 .send(Err(End {
-                                    reason,
+                                    reason: Box::new(reason),
                                     tail: Some(self.tail),
                                 }))
                                 .await;
@@ -302,7 +305,7 @@ impl Layer {
         drop(input);
         let event = match &end {
             Some(e) => wire::StreamEvent::Abort {
-                reason: e.reason.clone(),
+                reason: e.reason.as_ref().clone(),
             },
             None => wire::StreamEvent::Close,
         };
@@ -324,7 +327,7 @@ impl Layer {
                 if self.required {
                     let _ = tx
                         .send(Err(End {
-                            reason,
+                            reason: Box::new(reason),
                             tail: Some(self.tail),
                         }))
                         .await;

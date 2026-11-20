@@ -6009,6 +6009,50 @@ async fn adaptive_unavailable_falls_back_to_retry() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
 }
 
+/// 429 使 A 冷却；下一次尝试和另一个请求都走 B，而不只是恰好轮转一次。
+#[tokio::test]
+async fn official_keys_cool_the_previous_key_on_429() {
+    let home = TestHome::new();
+    let up = free_port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let app = axum::Router::new().fallback(move |h: axum::http::HeaderMap| {
+        let mut guard = log.lock().unwrap();
+        let first = guard.is_empty();
+        guard.push(h["x-api-key"].to_str().unwrap().to_string());
+        async move {
+            (
+                if first {
+                    axum::http::StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    axum::http::StatusCode::OK
+                },
+                [("retry-after", "600")],
+                "reply",
+            )
+        }
+    });
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let file = home.path().join("keys.toml");
+    std::fs::write(&file,format!("cooldown_secs=0\n[[pool]]\norigin='http://127.0.0.1:{up}'\nheader='x-api-key'\nkeys=[{{id='a',env='KEY_A'}},{{id='b',env='KEY_B'}}]")).unwrap();
+    let cfg = official_layer(
+        "keys",
+        "'request','retry'",
+        &["keys", "--config", file.to_str().unwrap()],
+    ) + "env={ KEY_A='fixture-one', KEY_B='fixture-two' }\n";
+    let (client, url) = running(&home, up, &cfg);
+    for _ in 0..2 {
+        assert_eq!(client.get(&url).send().await.unwrap().status(), 200);
+    }
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["fixture-one", "fixture-two", "fixture-two"]
+    );
+}
+
 /// 已经成功给过 forward 的真实角色失去配置后打开熔断。后续请求不能沿用上一请求的表态。
 #[tokio::test]
 async fn previously_healthy_adaptive_unavailable_falls_back_to_retry() {

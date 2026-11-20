@@ -241,7 +241,7 @@ impl RequestPatch {
 pub struct ResponseHead {
     /// HTTP status from the upstream, even if reading the body subsequently failed.
     pub status: u16,
-    /// The same complete header table supplied to deciding programs.
+    /// Original upstream headers, including encoding and declared length, independent of a decoded decision preview.
     #[serde(deserialize_with = "response_headers")]
     pub headers: Headers,
 }

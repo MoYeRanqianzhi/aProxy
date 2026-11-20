@@ -7,6 +7,7 @@ mod events;
 mod heartbeat;
 mod keys;
 mod route;
+mod selection;
 mod translate;
 use crate::config::Fault;
 use aproxy_envelope as w;
@@ -120,6 +121,7 @@ impl Role {
         use w::BodyNeed::{Digest, Full, None};
         let needs: &[(&str, w::BodyNeed)] = match self {
             Self::Convert(_) | Self::Route(_) => &[("request", Full), ("retry", Full)],
+            Self::Keys(k) if k.sticky => &[("request", Full), ("retry", Full)],
             Self::Keys(_) | Self::Rewrite => &[("request", None), ("retry", None)],
             Self::Policy => &[("decide", None)],
             Self::Adaptive => &[("request", Digest), ("decide", None), ("notify", Digest)],
@@ -153,8 +155,8 @@ impl Role {
             _ if !self.stages().contains(&stage) => {
                 Err(Fault::new("阶段不受支持", "unsupported stage"))
             }
-            w::Stage::Request(input) => self.request(input, &mut r),
-            w::Stage::Retry(retry) => self.request(&retry.input, &mut r),
+            w::Stage::Request(input) => self.request(input, None, &mut r),
+            w::Stage::Retry(retry) => self.request(&retry.input, Some(&retry.retry), &mut r),
             w::Stage::Response(response) => match self {
                 Self::Convert(c) => c.response(response, &mut r),
                 Self::Route(route) => route.response(response, &mut r),
@@ -195,10 +197,15 @@ impl Role {
         r
     }
     /// 同一请求的后续阶段可能换进程，只使用信封携带的私有状态。
-    fn request(&mut self, m: &w::RequestMessage, r: &mut w::Reply) -> Result<(), Fault> {
+    fn request(
+        &mut self,
+        m: &w::RequestMessage,
+        retry: Option<&w::Retry>,
+        r: &mut w::Reply,
+    ) -> Result<(), Fault> {
         match self {
             Self::Convert(c) => c.request(m, r),
-            Self::Keys(k) => k.request(m, r),
+            Self::Keys(k) => k.request(m, retry, r),
             Self::Route(route) => route.request(m, r),
             Self::Rewrite => Ok(()),
             Self::Adaptive => {

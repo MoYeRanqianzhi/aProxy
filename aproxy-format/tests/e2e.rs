@@ -173,6 +173,37 @@ fn persistent_keys_keep_weighted_and_round_robin_orders_after_rejection() {
         }
     }
 }
+/// 粘性才声明 full；用相同首轮的不同请求确认选择不轮转，全部冷却时不能发出旧凭据。
+#[test]
+fn sticky_key_negotiation_and_exhausted_pool_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("keys.toml");
+    std::fs::write(&file,"sticky=true\n[[pool]]\norigin='https://relay.test'\nheader='x-api-key'\nkeys=[{id='one',env='FORMAT_A'},{id='two',env='FORMAT_B'}]").unwrap();
+    let mut w = Worker::new(&["keys", "--config", file.to_str().unwrap()]);
+    assert_eq!(
+        w.hello["request_body"],
+        json!({"request":"full","retry":"full"})
+    );
+    let mut m = request("https://relay.test/", "/", json!({"input":"hello"}));
+    let first = w.frame(m.clone());
+    m["request"]["body"] =
+        json!({"messages":[{"role":"user","content":"hello"},{"role":"user","content":"more"}]})
+            .to_string()
+            .into();
+    for _ in 0..3 {
+        assert_eq!(w.frame(m.clone())["state"], first["state"]);
+    }
+    m["stage"] = "retry".into();
+    m["state"] = first["state"].clone();
+    m["retry"] = json!({"attempt":2,"elapsed_ms":0,"last_failure":{"code":"upstream_status"},"last_response":{"status":429,"headers":{}}});
+    let second = w.frame(m.clone());
+    assert_ne!(first["state"], second["state"]);
+    assert!(second.get("request").is_some());
+    m["state"] = second["state"].clone();
+    let exhausted = w.frame(m);
+    assert_eq!(exhausted["fail"]["retry"], true);
+    assert!(exhausted.get("request").is_none());
+}
 /// 模型别名、渠道路径与查询串、未命中和反向别名都在实际角色上验证。
 #[test]
 fn route_alias_paths_and_reverse_alias_survive_worker_boundaries() {

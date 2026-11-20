@@ -5,26 +5,26 @@ use sha2::{Digest, Sha256};
 /// 首条用户消息的首段文本是稳定前缀；忽略模型、后续轮次、系统提示与供应商的文本包装。
 pub fn conversation_ticket(body: &Value) -> Option<u64> {
     let messages = body.get("messages").or_else(|| body.get("input"))?;
-    let content = if messages.is_string() {
-        messages
-    } else {
+    let usable = |v: &Value| v.as_str().is_some_and(|s| !s.is_empty());
+    let text = messages.as_str().filter(|s| !s.is_empty()).or_else(|| {
         messages
             .as_array()?
             .iter()
-            .find(|m| m["role"] == "user")?
-            .get("content")?
-    };
-    let text = content.as_str().or_else(|| {
-        content.as_array()?.iter().find_map(|b| {
-            matches!(b["type"].as_str(), Some("text" | "input_text"))
-                .then(|| b["text"].as_str())
-                .flatten()
-        })
+            .filter(|m| m["role"] == "user")
+            .find_map(|m| {
+                let c = &m["content"];
+                c.as_str().filter(|s| !s.is_empty()).or_else(|| {
+                    c.as_array()?
+                        .iter()
+                        .find(|part| {
+                            matches!(part["type"].as_str(), Some("text" | "input_text"))
+                                && usable(&part["text"])
+                        })
+                        .and_then(|p| p["text"].as_str())
+                })
+            })
     })?;
-    if text.is_empty() {
-        return None;
-    }
-    let hash = Sha256::digest(&text.as_bytes()[..text.len().min(4096)]);
+    let hash = Sha256::digest(&text.as_bytes()[..text.floor_char_boundary(4096)]);
     Some(u64::from_be_bytes(hash[..8].try_into().unwrap()))
 }
 
@@ -70,6 +70,7 @@ mod tests {
     fn stable_user_prefix_is_protocol_independent() {
         let first = conversation_ticket(&json!({"input":"hello"})).unwrap();
         for v in [
+            json!({"messages":[{"role":"user","content":[{"type":"image"}]},{"role":"user","content":[{"type":"text","text":""},{"type":"text","text":"hello"}]}]}),
             json!({"messages":[{"role":"system","content":"policy"},{"role":"user","content":"hello"},{"role":"assistant","content":"more"}]}),
             json!({"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}),
             json!({"model":"alias","input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]},{"role":"user","content":"new"}]}),
@@ -81,5 +82,10 @@ mod tests {
             Some(first)
         );
         assert_eq!(conversation_ticket(&json!({"messages":[]})), None);
+        let prefix = "x".repeat(4095);
+        assert_eq!(
+            conversation_ticket(&json!({"input":format!("{prefix}界")})),
+            conversation_ticket(&json!({"input":prefix}))
+        );
     }
 }

@@ -775,6 +775,10 @@ fn rehearse(
     url.set_path(&format!("{}{path_part}", url.path().trim_end_matches('/')));
     url.set_query(query);
     let raw = bytes(&sample.body);
+    let max_request = chain.config.max_request_mb.unwrap_or(128);
+    if max_request != 0 && raw.len() as u64 > max_request.saturating_mul(1024 * 1024) {
+        return Err("样例请求正文超过实例的 max_request_mb（413）".into());
+    }
     let stream_body = serde_json::from_slice::<Value>(&raw).is_ok_and(|v| v["stream"] == true);
     let mut req = w::Request::new(sample.method.unwrap_or_else(|| "POST".into()), url.into());
     http::Method::from_bytes(req.method.as_bytes()).map_err(|_| "样例的 HTTP 方法无效")?;
@@ -1126,6 +1130,21 @@ mod tests {
             let end = rows.iter().find(|r| r["stage"] == "result").unwrap();
             assert_eq!(end["output"]["status"], 422);
             assert_eq!(end["output"]["code"], "format_rejected");
+        }
+    }
+    /// 请求预算按原始正文而非样例文件长度检查，等于上限仍可进入第一层。
+    #[test]
+    fn sample_request_obeys_instance_body_limit() {
+        for (size, valid) in [(1024 * 1024, true), (1024 * 1024 + 1, false)] {
+            let (result, rows) = trace_sample(
+                "max_request_mb=1",
+                json!({"path":"/","body":"x".repeat(size)}),
+                &[],
+            );
+            assert_eq!(result.is_ok(), valid);
+            if !valid {
+                assert!(rows.is_empty());
+            }
         }
     }
     /// 规则按声明先后生效，不对没有上游头的故障套状态规则；覆盖、直通与成功分别说明来源。

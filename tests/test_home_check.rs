@@ -46,11 +46,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          文件里只有一个测试，值是 TestHome 的路径",
     ),
     (
-        "format_protocol.rs",
-        "let mut build = std::process::Command::new(env!(\"CARGO\"));",
-        "只启动编译测试的 Cargo 离线构建 format-official：定向 --test 不构建 example，不能因同名文件存在就运行旧版本",
-    ),
-    (
         "access_control.rs",
         "Command::new(\"icacls\")",
         "Windows 自带的权限工具，用来把测试的 home 放宽给别的用户，不是 aproxy",
@@ -95,6 +90,12 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// `rel` 文件的这一行是否在例外里
 fn allowed(rel: &str, line: &str) -> bool {
+    // 只允许离线构建夹具的这一整句，同一行上其他操作仍须经过普通规则。
+    if rel == "format_protocol.rs"
+        && line.trim() == r#"let mut build = std::process::Command::new(env!("CARGO"));"#
+    {
+        return true;
+    }
     ALLOWED
         .iter()
         .any(|(file, snippet, _)| *file == rel && line.contains(snippet))
@@ -187,6 +188,11 @@ fn the_check_recognizes_what_it_should() {
     ] {
         assert!(violations_in(good).is_empty(), "不应判为违规: {good}");
     }
+    let constructor = r#"let mut build = std::process::Command::new(env!("CARGO"));"#;
+    assert!(allowed("format_protocol.rs", &format!("  {constructor}")));
+    let appended = format!(r#"{constructor} build.env("APROXY_HOME", elsewhere);"#);
+    assert!(!allowed("format_protocol.rs", &appended));
+    assert!(!violations_in(&appended).is_empty());
     assert!(allowed("force_contract.rs", "任何一行"));
     assert!(!allowed(
         "install_flow.rs",

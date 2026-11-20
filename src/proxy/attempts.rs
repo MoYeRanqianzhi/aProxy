@@ -665,16 +665,17 @@ pub(super) async fn run_attempts(
                 };
                 let by = format!("format:{name}");
                 let retry = matches!(verdict, decide::Verdict::Retry { .. });
-                tracing::info!(
-                    attempt,
-                    by,
-                    decision = if retry { "retry" } else { "stop" },
-                    "format decided attempt"
-                );
                 if !retry
                     && previous.is_none()
                     && matches!(verdict, decide::Verdict::Stop { patch: None, .. })
                 {
+                    tracing::info!(
+                        attempt,
+                        by,
+                        decision = "stop",
+                        reason = "accepted the successful response",
+                        "format decided attempt"
+                    );
                     rec.decided_with_reroute(attempt, by, false, explicit_reroute);
                     outcome = Outcome::Deliver(original.expect("successful upstream response"));
                 } else {
@@ -700,6 +701,7 @@ pub(super) async fn run_attempts(
                             };
                         }
                         decide::Verdict::Stop { name, patch } => {
+                            tracing::info!(attempt,by,decision="stop",code=failure.code,reason=%failure.message,"format decided attempt");
                             let terminal = Terminal::retry_stopped(&name, &failure);
                             rec.try_ended(attempt, received, Some(failure.for_history()));
                             rec.decided_with_reroute(attempt, by, false, explicit_reroute);
@@ -756,6 +758,8 @@ pub(super) async fn run_attempts(
                         attempt,
                         by = "override",
                         decision = "stop",
+                        code = failure.code,
+                        reason = %failure.message,
                         "retry attempt limit reached"
                     );
                     rec.decided_with_reroute(attempt, "override".into(), false, explicit_reroute);
@@ -813,7 +817,7 @@ pub(super) async fn run_attempts(
                 // 这次尝试也是一次失败的尝试；随后的终态成为「最近一次失败」
                 failure.record_in(&state.stats);
                 terminal.record_in(&state.stats);
-                tracing::warn!(attempt, code = %terminal.code(), last_code = failure.code, status = %status, by, decision = "stop", "retry attempt limit reached");
+                tracing::warn!(attempt, code = %terminal.code(), last_code = failure.code, status = %status, by, decision = "stop", reason = %failure.message, "retry attempt limit reached");
                 rec.decided_with_reroute(attempt, by, false, explicit_reroute);
                 if !r.is_committed() {
                     // 尚未向客户端写出任何字节：原样交付最后一次失败响应（状态码与体保真），

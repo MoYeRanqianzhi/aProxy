@@ -1216,7 +1216,7 @@ impl StreamWorker {
     }
 }
 
-/// HTTP 头与回信一起通过容量校验；调用方接收同一份头表，不在终态路径重新转换。
+/// 回信与通过容量校验的 HTTP 头表不可分开；交付终态不再重新解析头表。
 type PreparedReply = (Reply, Option<http::HeaderMap>);
 
 /// 已获接纳的一次往返；取消或未发出就丢弃时，进程与试探资格一起回收。

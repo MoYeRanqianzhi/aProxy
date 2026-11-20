@@ -125,10 +125,19 @@ fn layer(home: &TestHome, name: &str, stages: &str, args: &[&str]) -> String {
 
 /// 实例仅在临时 home 内注册，裸 HTTP 请求走环回地址，不使用环境代理。
 fn launch(home: &TestHome, upstream: u16, config: &str) -> (u16, std::process::Output) {
+    launch_with_backoff(home, upstream, config, 0)
+}
+/// 指定实例的真实退避上限，让程序检查 fallback 后用零等待票覆盖，不拖慢测试。
+fn launch_with_backoff(
+    home: &TestHome,
+    upstream: u16,
+    config: &str,
+    cap: u64,
+) -> (u16, std::process::Output) {
     let port = free_port();
     home.stop_on_drop(port);
     let cfg = home.path().join("chain.toml");
-    std::fs::write(&cfg,format!("base_url='http://127.0.0.1:{upstream}'\nlisten_addr='127.0.0.1:{port}'\nretry.max_backoff_secs=0\n{config}")).unwrap();
+    std::fs::write(&cfg,format!("base_url='http://127.0.0.1:{upstream}'\nlisten_addr='127.0.0.1:{port}'\nretry.max_backoff_secs={cap}\n{config}")).unwrap();
     let out = home
         .cmd()
         .env("NO_PROXY", "127.0.0.1,localhost")
@@ -2339,11 +2348,24 @@ async fn decide_stop_with_response_returns_it_as_retry_stopped() {
         );
     }
 }
+/// 只占住端口而不 listen，确保整个尝试期间都拒绝连接，不误连另一个测试的监听器。
+fn refused_address() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
+    let reservation = tokio::net::TcpSocket::new_v4().unwrap();
+    loop {
+        let addr = ([127, 0, 0, 1], free_port()).into();
+        match reservation.bind(addr) {
+            Ok(()) => return (reservation, addr),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
 /// 有上游时保留原错体，没有上游时生成带 last_code 的 502。
 #[tokio::test]
 async fn decide_stop_without_response_passes_the_upstream_response_through() {
     let (up, _) = upstream(&[503]).await;
-    for (port, status) in [(up, 503), (free_port(), 502)] {
+    let (_reservation, addr) = refused_address();
+    for (port, status) in [(up, 503), (addr.port(), 502)] {
         let home = TestHome::new();
         let cfg = layer(
             &home,
@@ -3070,15 +3092,7 @@ async fn committed_stop_limits_disk_json_conversion() {
 #[tokio::test]
 async fn decide_stop_masks_configured_secret_in_upstream_failure() {
     let home = TestHome::new();
-    let reservation = tokio::net::TcpSocket::new_v4().unwrap();
-    let addr = loop {
-        let addr = ([127, 0, 0, 1], free_port()).into();
-        match reservation.bind(addr) {
-            Ok(()) => break addr,
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
-            Err(e) => panic!("{e}"),
-        }
-    };
+    let (_reservation, addr) = refused_address();
     let secret = "fixture-private-route-segment";
     let patch = serde_json::json!({"request":{"url":format!("http://{addr}/{secret}")}});
     let cfg = layer(&home, "route", "'request'", &["reply", &patch.to_string()])
@@ -3732,4 +3746,118 @@ async fn decide_unreadable_request_spool_is_a_local_terminal() {
     assert_eq!(frames(&home, "late").len(), 1);
     assert_eq!(frames(&home, "full").len(), 1);
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+/// 一个程序的 stop 即使别的字段合法，也不能从非法 delay 中抢救出来；改用下一票并记录 invalid_output。
+#[tokio::test]
+async fn decide_invalid_delay_discards_vote_and_counts_invalid_output() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[503, 200]).await;
+    let cfg = layer(
+        &home,
+        "bad",
+        "'decide'",
+        &["reply", r#"{"decision":"stop","delay_ms":86400001}"#],
+    ) + "breaker_failures=1\n"
+        + &layer(
+            &home,
+            "next",
+            "'decide'",
+            &["reply", r#"{"decision":"retry"}"#],
+        );
+    let (c, url) = running(&home, up, &cfg);
+    assert_eq!(c.get(&url).send().await.unwrap().status(), 200);
+    assert_eq!(frames(&home, "next").len(), 2);
+    let b = breaker(&home, &url).await;
+    assert_eq!(b["last_failure"]["details"]["kind"], "invalid_output");
+    assert_eq!(b["state"], "open");
+}
+/// 第六次失败的非零退避和请求上限的 stop 都应出现在管道里，而不是取代理的实际零等待投票。
+#[tokio::test]
+async fn decide_wire_fallback_exposes_nonzero_backoff_and_exhausted_override() {
+    for capped in [false, true] {
+        let home = TestHome::new();
+        let (up, _) = upstream(&[503, 503, 503, 503, 503, 503, 200]).await;
+        let mut cfg = String::new();
+        if capped {
+            cfg += &layer(
+                &home,
+                "limits",
+                "'request'",
+                &["reply", r#"{"overrides":{"retry":{"max_attempts":1}}}"#],
+            );
+        }
+        cfg += &layer(
+            &home,
+            "vote",
+            "'decide'",
+            &["reply", r#"{"decision":"retry","delay_ms":0}"#],
+        );
+        let (port, out) = launch_with_backoff(&home, up, &cfg, 320);
+        assert!(out.status.success(), "{out:?}");
+        let c = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .unwrap();
+        assert_eq!(
+            c.get(format!("http://127.0.0.1:{port}/"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        let f = frames(&home, "vote");
+        assert_eq!(f[6]["attempt"], 6);
+        if capped {
+            assert_eq!(
+                f[6]["fallback"],
+                serde_json::json!({"decision":"stop","by":"override"})
+            );
+        } else {
+            assert_eq!(
+                f[6]["fallback"],
+                serde_json::json!({"decision":"retry","delay_ms":20000,"by":"default"})
+            );
+        }
+    }
+}
+/// 每张有效票在日志只有一行，且这一行同时给出程序和失败原因，不能靠拼两条日志猜。
+#[tokio::test]
+async fn decide_log_has_one_source_and_reason_per_effective_vote() {
+    for vote in ["retry", "stop"] {
+        let home = TestHome::new();
+        let (up, _) = upstream(&[503, 200]).await;
+        let patch = serde_json::json!({"decision":vote}).to_string();
+        let (port, out) = launch(
+            &home,
+            up,
+            &layer(&home, "policy", "'decide'", &["reply", &patch]),
+        );
+        assert!(out.status.success(), "{out:?}");
+        let d: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let c = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .unwrap();
+        let resp = c
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap();
+        resp.bytes().await.unwrap();
+        let log = std::fs::read_to_string(d["log_path"].as_str().unwrap()).unwrap();
+        let lines: Vec<_> = log
+            .lines()
+            .filter(|l| l.contains("format:policy") && l.contains("decision"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("upstream_status") && lines[0].contains("503"),
+            "{}",
+            lines[0]
+        );
+    }
 }

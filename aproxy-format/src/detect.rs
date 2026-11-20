@@ -24,12 +24,36 @@ pub fn detect_request(body: &Value) -> Option<WireFormat> {
             Some("system" | "developer" | "tool" | "function")
         )
     });
-    if obj.contains_key("system") {
-        return (obj.contains_key("max_tokens") && !chat_role)
-            .then_some(WireFormat::AnthropicMessages);
+    let tools = obj
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    let chat = chat_role
+        || tools
+            .clone()
+            .any(|t| t["type"] == "function" && t["function"]["name"].is_string())
+        || messages.iter().any(|m| m["tool_calls"].is_array());
+    let anthropic = obj.contains_key("system")
+        || tools
+            .clone()
+            .any(|t| t["name"].is_string() && t["input_schema"].is_object())
+        || messages.iter().any(|m| {
+            m["content"].as_array().is_some_and(|parts| {
+                parts.iter().any(|p| {
+                    matches!(
+                        p["type"].as_str(),
+                        Some("tool_result" | "tool_use" | "thinking" | "redacted_thinking")
+                    )
+                })
+            })
+        });
+    // 共享的文本消息不够定协议；若两类专有证据同时存在，也不能靠检查顺序猜测。
+    match (chat, anthropic, obj.contains_key("max_tokens")) {
+        (false, true, true) => Some(WireFormat::AnthropicMessages),
+        (true, false, _) | (false, false, false) => Some(WireFormat::OpenAiChat),
+        _ => None,
     }
-    // Messages 要求 max_tokens，Chat 也允许相同字段；只有共有字段时请调用方显式给协议。
-    (!obj.contains_key("max_tokens") || chat_role).then_some(WireFormat::OpenAiChat)
 }
 
 /// SSE 流的形态粗判：content-type 判定不可得时按 data: 行形态。
@@ -42,6 +66,20 @@ pub fn looks_like_sse(body: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// 非标准路径只在工具定义或历史消息携带排他证据时决定；互相矛盾的证据仍拒绝。
+    #[test]
+    fn tool_shapes_disambiguate_custom_routes() {
+        let mut body = serde_json::json!({"model":"m","max_tokens":1,"messages":[{"role":"user","content":"hi"}]});
+        assert_eq!(detect_request(&body), None);
+        body["tools"] =
+            serde_json::json!([{"type":"function","function":{"name":"read","parameters":{}}}]);
+        assert_eq!(detect_request(&body), Some(WireFormat::OpenAiChat));
+        body["messages"][0]["content"] =
+            serde_json::json!([{"type":"tool_result","tool_use_id":"one","content":"hi"}]);
+        assert_eq!(detect_request(&body), None);
+        body.as_object_mut().unwrap().remove("tools");
+        assert_eq!(detect_request(&body), Some(WireFormat::AnthropicMessages));
+    }
     #[test]
     fn detects_anthropic_messages_request() {
         let body: Value = serde_json::from_str(

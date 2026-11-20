@@ -355,23 +355,17 @@ impl Worker {
     async fn finish(mut self) {
         let _ = self.retire_pipe(false).await;
     }
-    /// 一次性进程的最后回复不能带多余 stdout。关 stdin 后顺便等 EOF 和所有者的 wait，
-    /// 两项共用同一宽限期；正常空闲进程退役时不再把任何输出交给请求。
-    async fn retire_pipe(&mut self, check_stdout: bool) -> Result<(), Fault> {
+    /// 一次性进程的最后回复不能带多余 stdout；给它 EOF 后在宽限期内读完管道。
+    async fn final_stdout(&mut self, end: Instant) -> Result<(), Fault> {
         self.stdin.take();
-        let end = Instant::now() + RETIRE_GRACE;
-        let checked = if check_stdout {
-            match tokio::time::timeout_at(end, self.stdout.fill_buf()).await {
-                Ok(Ok([])) | Err(_) => Ok(()),
-                Ok(Ok(_)) => Err(Fault::Protocol),
-                Ok(Err(_)) => Err(Fault::Io),
-            }
-        } else {
-            Ok(())
-        };
-        if checked.is_err() {
-            self.kill.take();
+        match tokio::time::timeout_at(end, self.stdout.fill_buf()).await {
+            Ok(Ok([])) | Err(_) => Ok(()),
+            Ok(Ok(_)) => Err(Fault::Protocol),
+            Ok(Err(_)) => Err(Fault::Io),
         }
+    }
+    /// 超过从关 stdin 起算的宽限仍未退出才强退；系统 wait 之前不能交还进程名额。
+    async fn reap_until(&mut self, end: Instant) {
         if tokio::time::timeout_at(end, &mut self.exited)
             .await
             .is_err()
@@ -379,6 +373,20 @@ impl Worker {
             self.kill.take();
             let _ = (&mut self.exited).await;
         }
+    }
+    /// 握手和普通消息在同一个宽限内检查 stdout 并回收；空闲退役不用核对最后的帧。
+    async fn retire_pipe(&mut self, check_stdout: bool) -> Result<(), Fault> {
+        let end = Instant::now() + RETIRE_GRACE;
+        self.stdin.take();
+        let checked = if check_stdout {
+            self.final_stdout(end).await
+        } else {
+            Ok(())
+        };
+        if checked.is_err() {
+            self.kill.take();
+        }
+        self.reap_until(end).await;
         checked
     }
     /// 排队与序列化不算在时限内，堵在写管道则算；调用被取消时不复用 worker。
@@ -1260,43 +1268,72 @@ impl Turn<'_> {
         mut self,
         stage: Stage,
         timeout: u64,
-        deadline: Option<Instant>,
+        deadline: Option<(Instant, &Mutex<bool>)>,
     ) -> Result<PreparedReply, Fault> {
         let pool = self.pool;
-        if deadline.is_some_and(|d| Instant::now() >= d) {
+        if deadline.is_some_and(|(d, _)| Instant::now() >= d) {
             self.unused().await;
             return Err(Fault::Timeout);
         }
         self.worker.written = false;
-        let exchange = pool.exchange(&mut self.worker, stage, timeout, Some(&self.ticket));
-        let result = if let Some(d) = deadline {
-            tokio::select! {biased; _=tokio::time::sleep_until(d)=>None,r=exchange=>Some(r)}
-                .filter(|_| Instant::now() < d)
-        } else {
-            Some(exchange.await)
-        };
-        let Some(result) = result else {
-            if self.worker.written {
-                pool.complete(&self.ticket, Some(&Fault::Timeout));
+        let mut retiring = None;
+        let exchange = async {
+            let reply = pool
+                .exchange(&mut self.worker, stage, timeout, Some(&self.ticket))
+                .await?;
+            if pool.entry.process == Process::Spawn {
+                if deadline.is_some() {
+                    let end = Instant::now() + RETIRE_GRACE;
+                    self.worker.final_stdout(end).await?;
+                    retiring = Some(end);
+                } else {
+                    self.worker.retire_pipe(true).await?;
+                }
             }
-            return Err(Fault::Timeout);
+            Ok(reply)
+        };
+        let result = if let Some((d, _)) = deadline {
+            tokio::select! {biased; _=tokio::time::sleep_until(d)=>Err(Fault::Timeout),r=exchange=> {
+                if Instant::now() < d { r } else { Err(Fault::Timeout) }
+            }}
+        } else {
+            exchange.await
         };
         if matches!(result, Err(Fault::Open { .. })) {
             return result;
         }
-        if pool.entry.process == Process::Spawn {
-            let result = match result {
-                Ok(r) => self.worker.retire_pipe(true).await.map(|()| r),
-                Err(e) => Err(e),
-            };
-            pool.complete(&self.ticket, result.as_ref().err());
-            return result;
+        let result = result.and_then(|r| {
+            Ok((
+                r,
+                pool.entry.process != Process::Spawn && self.worker.reusable()?,
+            ))
+        });
+        {
+            // abort 不会打断另一线程正在执行的 poll；结算和响应就绪必须在同一把闸锁下排序。
+            let cancelled = deadline.map(|(_, gate)| gate.lock().unwrap());
+            if !cancelled.as_deref().copied().unwrap_or(false)
+                && !(deadline.is_some()
+                    && !self.worker.written
+                    && matches!(result, Err(Fault::Timeout)))
+            {
+                pool.complete(&self.ticket, result.as_ref().err());
+            }
         }
-        let result = result.and_then(|r| Ok((r, self.worker.reusable()?)));
-        pool.complete(&self.ticket, result.as_ref().err());
         let (reply, reuse) = result?;
-        if !reuse {
-            self.worker.finish().await;
+        if let Some(end) = retiring {
+            // stdout 已经验完；只转交回收，槽位仍随真正的进程所有者走。
+            let mut tasks = pool.retiring.lock().unwrap();
+            while tasks.try_join_next().is_some() {}
+            tasks.spawn(async move { self.worker.reap_until(end).await });
+        } else if !reuse && pool.entry.process != Process::Spawn {
+            if deadline.is_some() {
+                pool.retire(self.worker);
+            } else {
+                self.worker.finish().await;
+            }
+        } else if !reuse {
+            // 普通 spawn 的退出已在管道检查之后等待完成。
+            return Ok(reply);
         } else {
             let c = pool.circuit.lock().unwrap();
             if c.epoch == self.ticket.epoch && c.window.is_none() {

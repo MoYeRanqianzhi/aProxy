@@ -753,6 +753,26 @@ async fn half_open_probe_cancellation_timeout_and_invalid_reply_have_distinct_ou
     }
 }
 
+/// 正在 poll 的已写往返不会被 abort 同步打断；响应先关闸时，即便随后执行超时分支也不能记账。
+#[tokio::test]
+async fn cancelled_written_heartbeat_cannot_charge_a_later_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let obs = dir.path().join("observed");
+    let p = pool(Process::Persistent, "no-stage-reply", |e| {
+        e.env
+            .insert("ECHO_OBSERVE".into(), obs.display().to_string());
+    });
+    let turn = p.turn(false).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let cancelled = Mutex::new(false);
+    let send = turn.send_until(request_frame("held"), 0, Some((deadline, &cancelled)));
+    tokio::pin!(send);
+    tokio::select! { result = &mut send => panic!("early result: {result:?}"), _ = wait_observed(&obs,"request",1) => {} }
+    *cancelled.lock().unwrap() = true;
+    assert!(matches!(send.await, Err(Fault::Timeout)));
+    assert_eq!(p.snapshot().1["breaker"]["failures"], 0);
+}
+
 /// 在首字节之前已经错过截止点：不用这张票，也不处罚这次握手得到的健康会话。
 #[tokio::test]
 async fn expired_unwritten_heartbeat_does_not_charge_the_breaker() {
@@ -764,8 +784,12 @@ async fn expired_unwritten_heartbeat_does_not_charge_the_breaker() {
     });
     let turn = p.turn(false).await.unwrap();
     assert!(matches!(
-        turn.send_until(request_frame("expired"), 0, Some(Instant::now()))
-            .await,
+        turn.send_until(
+            request_frame("expired"),
+            0,
+            Some((Instant::now(), &Mutex::new(false)))
+        )
+        .await,
         Err(Fault::Timeout)
     ));
     assert_eq!(p.snapshot().1["breaker"]["failures"], 0);

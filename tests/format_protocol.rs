@@ -1907,6 +1907,34 @@ async fn heartbeat_skips_failed_or_open_layers_and_keeps_each_client() {
     }
 }
 
+/// 一次性进程已经关闭 stdout，首拍不能为等待它的退出而退回固定字节。
+#[tokio::test]
+async fn spawn_heartbeat_is_delivered_while_its_worker_is_still_cleaning_up() {
+    let home = TestHome::new();
+    let (up, release, _) = held_upstream(&[200], "data: done\n\n").await;
+    let gate = home.path().join("cleanup");
+    let cfg = String::from("[keepalive]\ninterval_secs=1\n")
+        + &layer(
+            &home,
+            "beat",
+            "'heartbeat'",
+            &["cleanup-beat", gate.to_str().unwrap()],
+        )
+        .replace("process='persistent'", "process='spawn'");
+    let (client, url) = running(&home, up, &cfg);
+    let mut response = client
+        .get(&url)
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    let first = response.chunk().await.unwrap().unwrap();
+    std::fs::write(&gate, b"").unwrap();
+    release.add_permits(1);
+    assert_eq!(&first[..], b": timely spawn\n\n");
+    assert!(response.text().await.unwrap().ends_with("data: done\n\n"));
+}
+
 /// 慢外层错过截止时，只能写已及时返回的内层字节；上游不会等迟到的回信。
 #[tokio::test]
 async fn missed_beat_deadline_preserves_last_timely_fragment() {

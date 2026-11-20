@@ -161,7 +161,7 @@ pub(super) fn spawn_dynamic_heartbeat(
                         d.ctx.context(&p.entry.name), info.clone(), d.ctx.client.clone(),
                         aproxy_envelope::Fragment::from_bytes(bytes.to_vec()),
                     );
-                    turn.send_until(aproxy_envelope::Stage::Heartbeat(m), p.entry.timeout_secs, Some(deadline)).await
+                    turn.send_until(aproxy_envelope::Stage::Heartbeat(m), p.entry.timeout_secs, Some((deadline, &gate))).await
                 }
                 Err(e) => Err(e),
             };

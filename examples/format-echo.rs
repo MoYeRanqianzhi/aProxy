@@ -92,6 +92,22 @@ fn main() {
         };
         let Some(line) = line else {
             observe("eof", None);
+            if mode == "cleanup-beat" && count != 0 {
+                // 回信已 flush；仅关闭测试进程自己的 stdout，清理完之前仍然占着原进程。
+                #[cfg(unix)]
+                unsafe {
+                    libc::close(libc::STDOUT_FILENO);
+                }
+                #[cfg(windows)]
+                unsafe {
+                    use windows_sys::Win32::{
+                        Foundation::CloseHandle,
+                        System::Console::{GetStdHandle, STD_OUTPUT_HANDLE},
+                    };
+                    CloseHandle(GetStdHandle(STD_OUTPUT_HANDLE));
+                }
+                wait_gate(std::path::Path::new(arg));
+            }
             if mode == "stray-on-eof" || (mode == "stage-stray-on-eof" && count != 0) {
                 println!("unexpected diagnostic on stdout");
             }
@@ -215,6 +231,15 @@ fn main() {
                         .map(|i| (format!("x-{i}"), json!("x")))
                         .collect::<serde_json::Map<_, _>>();
                     r[obj] = json!({"headers":headers});
+                }
+                "cleanup-beat" if stage == "heartbeat" => r["data"] = json!(": timely spawn\n\n"),
+                "race-beat" if stage == "heartbeat" => {
+                    wait_gate(std::path::Path::new(arg));
+                    r["data"] = if m["heartbeat"]["beat"] == 1 {
+                        json!(": late\n\n")
+                    } else {
+                        json!(": fresh\n\n")
+                    };
                 }
                 "held-beat" if stage == "heartbeat" => {
                     wait_gate(std::path::Path::new(arg));
@@ -436,6 +461,9 @@ fn main() {
             writeln!(out, "{r}").unwrap();
         }
         out.flush().unwrap();
+        if stage == "heartbeat" && mode == "race-beat" {
+            observe("reply-flushed", Some(seq));
+        }
         if count != 0 && mode == "late-stray" {
             let dir = std::path::Path::new(arg);
             wait_gate(&dir.join(format!("release-{}", std::process::id())));

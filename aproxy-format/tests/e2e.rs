@@ -941,3 +941,47 @@ fn key_pool_rejects_unusable_environment_values_before_hello() {
         );
     }
 }
+
+/// 明确指定两端的流可由另一进程只凭 open 开始，不需要借用请求阶段的内存。
+fn open_stream(w: &mut Worker, content_type: &str) -> Value {
+    w.frame(json!({"stage":"stream","event":"open","stream_id":"r/1","request_id":"r","request":{"method":"POST","url":"https://relay.test/v1"},"response":{"status":200,"headers":{"content-type":content_type,"content-length":"32","set-cookie":"fixture-private-A"}}}))
+}
+/// data 与 close、abort 均由同一个工作进程顺序确认，测试无需模拟 HTTP 连接。
+fn stream_frame(w: &mut Worker, event: &str, bytes: &str) -> Value {
+    let mut frame = json!({"stage":"stream","event":event,"stream_id":"r/1"});
+    if event == "data" {
+        frame["data"] = bytes.into();
+    } else if event == "abort" {
+        frame["reason"] = "upstream_body".into();
+    }
+    w.frame(frame)
+}
+/// 已选择目标协议后，坏事件只交付一次目标错误，不回 fail，也不让后续原文穿过可选层。
+#[test]
+fn malformed_stream_ends_in_the_client_protocol_only_once() {
+    let mut w = Worker::new(&[
+        "convert",
+        "--from",
+        "anthropic_messages",
+        "--to",
+        "openai_chat",
+    ]);
+    open_stream(&mut w, "text/event-stream");
+    let valid = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n";
+    assert!(
+        stream_frame(&mut w, "data", valid)["data"]
+            .as_str()
+            .unwrap()
+            .contains("message_start")
+    );
+    let err = stream_frame(&mut w, "data", "data: not JSON\n\n");
+    assert!(err["fail"].is_null());
+    assert!(err["data"].as_str().unwrap().starts_with("event: error\n"));
+    assert_eq!(stream_frame(&mut w, "data", valid)["data"], "");
+    assert!(
+        stream_frame(&mut w, "close", "")["data"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty()
+    );
+}

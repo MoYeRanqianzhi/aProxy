@@ -37,6 +37,8 @@ struct Destination {
 enum Entity {
     /// 直接转发每个数据片段。
     Pass,
+    /// 已交付客户端协议的错误结尾，继续消费上游但绝不再转出字节。
+    Ended,
     /// 跨协议 SSE：持有单个未结束事件和各协议的语义状态。
     Sse(Box<crate::events::Events>),
     /// 只在跨协议非 SSE 实体结束后转换 JSON。
@@ -282,7 +284,14 @@ impl Convert {
                 .ok_or(Fault::new("流未打开", "stream is not open"))?
             {
                 Entity::Pass => r.data = w::Data::from_bytes(d.as_bytes().to_vec()),
-                Entity::Sse(events) => r.data = w::Data::Text(events.feed(d.as_bytes())?),
+                Entity::Ended => r.data = w::Data::Text(String::new()),
+                Entity::Sse(events) => match events.feed(d.as_bytes()) {
+                    Ok(out) => r.data = w::Data::Text(out),
+                    Err(_) => {
+                        r.data = w::Data::Text(events.abort().into());
+                        self.stream = Some(Entity::Ended);
+                    }
+                },
                 Entity::Json(_, _, b) => {
                     if b.len().saturating_add(d.as_bytes().len()) > 64 * 1024 * 1024 {
                         return Err(Fault::new(
@@ -298,7 +307,10 @@ impl Convert {
                 Some(Entity::Json(client, upstream, b)) => {
                     r.data = w::Data::Text(Self::json(client, upstream, &b)?)
                 }
-                Some(Entity::Sse(events)) => r.data = w::Data::Text(events.finish()?),
+                Some(Entity::Sse(events)) => {
+                    let tail = events.abort();
+                    r.data = w::Data::Text(events.finish().unwrap_or_else(|_| tail.into()));
+                }
                 _ => (),
             },
             w::StreamEvent::Abort { .. } => {

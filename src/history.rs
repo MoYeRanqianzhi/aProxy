@@ -763,6 +763,8 @@ struct Decision {
     decision: &'static str,
     /// 下一次尝试之前实际等了多久；还没开始等时为 None
     delay_ms: Option<u64>,
+    /// 只有程序明确表态才有这一项，不把默认重跑冒充投票。
+    reroute: Option<bool>,
 }
 
 /// 一次尝试收到的上游响应（体另存）。
@@ -1544,6 +1546,9 @@ struct DecisionView<'a> {
     decision: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     delay_ms: Option<u64>,
+    /// 缺省和投了 false 有不同含义。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reroute: Option<bool>,
 }
 
 /// 一条记录（RequestRecord）的线上形状，序列化用。字段的次序就是线上的次序。
@@ -1635,6 +1640,7 @@ fn record_json(record: &Record, inner: &RecordInner) -> String {
                         by: &d.by,
                         decision: d.decision,
                         delay_ms: d.delay_ms,
+                        reroute: d.reroute,
                     }),
                     reports: if i < skip { &[] } else { &t.reports },
                 })
@@ -1899,12 +1905,23 @@ impl Recorder {
 
     /// 第 `attempt` 次尝试失败之后的决定：`by` 是谁决定的，`retry` 为真是再试、为假是停。
     pub fn decided(&self, attempt: u32, by: String, retry: bool) {
+        self.decided_with_reroute(attempt, by, retry, None);
+    }
+    /// 决定与重跑请求链各取第一票，哪怕它们来自不同的程序也属于同一次尝试。
+    pub(crate) fn decided_with_reroute(
+        &self,
+        attempt: u32,
+        by: String,
+        retry: bool,
+        reroute: Option<bool>,
+    ) {
         self.update(|inner, _| {
             if let Some(t) = inner.try_mut(attempt) {
                 t.decision = Some(Decision {
                     by,
                     decision: if retry { "retry" } else { "stop" },
                     delay_ms: None,
+                    reroute,
                 });
             }
         });

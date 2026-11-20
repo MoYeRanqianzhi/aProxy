@@ -229,6 +229,16 @@ pub(super) async fn consult(
             turn.unused().await;
             continue;
         }
+        if let Outcome::Retry {
+            partial_head: Some(head),
+            ..
+        } = outcome
+            && preview.is_none()
+        {
+            let mut r = wire::Response::new(head.0.as_u16());
+            r.headers = crate::transform::headers_to_btreemap(&head.1);
+            preview = Some(wire::ObservedResponse::new(r));
+        }
         if let Some(response) = response
             && preview.is_none()
         {

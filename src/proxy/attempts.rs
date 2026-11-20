@@ -38,6 +38,8 @@ pub(super) enum Outcome {
         response_bytes: u64,
         /// 有响应的失败也可被 decide 选择原样返回。
         response: Option<UpstreamResponse>,
+        /// 实体没读完时，仅供咨询的头；不能冒充完整响应。
+        partial_head: Option<Box<(StatusCode, HeaderMap)>>,
     },
     /// 一条重试规则给的尝试次数用完了：不再重试，交付这次失败的响应——客户端拿到真实的
     /// 404 自行处理，好过永远等不到终态（compact 事故，见记忆 bounded-retry-paths）。
@@ -67,7 +69,8 @@ pub(super) fn classify(
     override_max: Option<u32>,
 ) -> Outcome {
     match result {
-        ForwardResult::NetworkError(failure) => Outcome::Retry {
+        ForwardResult::NetworkError(failure, partial_head) => Outcome::Retry {
+            partial_head,
             response_bytes: failure.received_bytes(),
             response: None,
             failure,
@@ -109,6 +112,7 @@ pub(super) fn classify(
                     // 这次尝试收到了完整的响应体，只是内容算失败
                     response_bytes: response.body.len(),
                     response: Some(response),
+                    partial_head: None,
                 },
             }
         }
@@ -569,7 +573,7 @@ pub(super) async fn run_attempts(
         same_body = true;
         let chain_failed = failed.is_some();
         let result = if let Some(f) = failed {
-            ForwardResult::NetworkError(f)
+            ForwardResult::NetworkError(f, None)
         } else {
             trace.attempts += 1;
             let (head_tx, head_rx) = r.head_channel();
@@ -592,6 +596,7 @@ pub(super) async fn run_attempts(
         let override_max = chain.as_ref().and_then(|c| c.max_attempts);
         let mut outcome = classify(attempt, result, &rules, override_max);
         let mut voted_by = None;
+        let mut explicit_reroute = None;
         reroute = true;
         if let Some(started) = started {
             let query = decide::consult(
@@ -610,6 +615,7 @@ pub(super) async fn run_attempts(
             else {
                 return;
             };
+            explicit_reroute = votes.reroute;
             reroute = chain_failed || votes.reroute.unwrap_or(true);
             if let Some(verdict) = votes.decision {
                 let (original, previous, received) = match outcome {
@@ -648,7 +654,7 @@ pub(super) async fn run_attempts(
                     && previous.is_none()
                     && matches!(verdict, decide::Verdict::Stop { patch: None, .. })
                 {
-                    rec.decided(attempt, by, false);
+                    rec.decided_with_reroute(attempt, by, false, explicit_reroute);
                     outcome = Outcome::Deliver(original.expect("successful upstream response"));
                 } else {
                     let failure = previous.unwrap_or_else(|| {
@@ -666,6 +672,7 @@ pub(super) async fn run_attempts(
                             voted_by = Some(by);
                             outcome = Outcome::Retry {
                                 response: original,
+                                partial_head: None,
                                 failure,
                                 rule: None,
                                 response_bytes: received,
@@ -674,7 +681,7 @@ pub(super) async fn run_attempts(
                         decide::Verdict::Stop { name, patch } => {
                             let terminal = Terminal::retry_stopped(&name, &failure);
                             rec.try_ended(attempt, received, Some(failure.for_history()));
-                            rec.decided(attempt, by, false);
+                            rec.decided_with_reroute(attempt, by, false, explicit_reroute);
                             failure.record_in(&state.stats);
                             terminal.record_in(&state.stats);
                             decide::finish(
@@ -730,7 +737,7 @@ pub(super) async fn run_attempts(
                         decision = "stop",
                         "retry attempt limit reached"
                     );
-                    rec.decided(attempt, "override".into(), false);
+                    rec.decided_with_reroute(attempt, "override".into(), false, explicit_reroute);
                     r.finish(t, &trace).await;
                     return;
                 }
@@ -759,7 +766,7 @@ pub(super) async fn run_attempts(
                     reason = %failure.message,
                     "本次尝试失败，重试"
                 );
-                rec.decided(attempt, by, true);
+                rec.decided_with_reroute(attempt, by, true, explicit_reroute);
                 // 需要重试时不在这里提交——保活出口的提交只由节拍与可提交的上游响应头推动，
                 // 下一轮尝试很快成功时客户端仍拿到上游真实头
             }
@@ -786,7 +793,7 @@ pub(super) async fn run_attempts(
                 failure.record_in(&state.stats);
                 terminal.record_in(&state.stats);
                 tracing::warn!(attempt, code = %terminal.code(), last_code = failure.code, status = %status, by, decision = "stop", "retry attempt limit reached");
-                rec.decided(attempt, by, false);
+                rec.decided_with_reroute(attempt, by, false, explicit_reroute);
                 if !r.is_committed() {
                     // 尚未向客户端写出任何字节：原样交付最后一次失败响应（状态码与体保真），
                     // 只加两个头，让调用方分得清「aproxy 已经放弃」与上游的普通回应
@@ -1070,9 +1077,10 @@ mod tests {
         for attempt in [1, 3, 100] {
             let out = classify(
                 attempt,
-                ForwardResult::NetworkError(AttemptFailure::connect_failed(
-                    "connection refused".into(),
-                )),
+                ForwardResult::NetworkError(
+                    AttemptFailure::connect_failed("connection refused".into()),
+                    None,
+                ),
                 &[(1, &limit)],
                 None,
             );

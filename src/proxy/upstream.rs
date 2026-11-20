@@ -25,7 +25,7 @@ pub(super) fn log_proxied_request(
 #[allow(clippy::large_enum_variant)]
 pub(super) enum ForwardResult {
     /// 没拿到完整的上游响应：连不上、超时、连接中途断开。原因已归成尝试失败码
-    NetworkError(AttemptFailure),
+    NetworkError(AttemptFailure, Option<Box<(StatusCode, HeaderMap)>>),
     /// 上游响应体超出 spool 上限：确定性失败，重试无意义，各通道直接终态处理。
     TooLarge,
     /// 本地磁盘 spool 写入失败（磁盘满/IO 故障）：磁盘模式专属的确定性失败。
@@ -106,7 +106,7 @@ pub(super) async fn forward_once(
     let resp = match send_with_timeout(state, builder.send()).await {
         Ok(r) => r,
         // 在源头归类并脱敏：失败原因会流向日志、status 的最近错误与各通道
-        Err(failure) => return ForwardResult::NetworkError(failure),
+        Err(failure) => return ForwardResult::NetworkError(failure, None),
     };
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -168,7 +168,13 @@ pub(super) async fn forward_once(
                 }
             }
             Ok(None) => break,
-            Err(failure) => return ForwardResult::NetworkError(failure),
+            Err(failure) => {
+                // 头已经到达但半截实体不能用于 stop 的回放。仅有 decide 时才保留这份观测。
+                let head = state
+                    .has_format(crate::config::file::Stage::Decide)
+                    .then(|| Box::new((status, resp_headers)));
+                return ForwardResult::NetworkError(failure, head);
+            }
         }
     }
 

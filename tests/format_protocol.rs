@@ -2150,32 +2150,74 @@ async fn first_decide_vote_wins() {
 /// 用两层分别给出 decision 和 reroute，确保第一票不会短路尚未取得的另一个字段。
 async fn exercise_reroute(again: bool) {
     let home = TestHome::new();
-    let (up, calls) = upstream(&[503, 200]).await;
-    let cfg = layer(&home, "route", "'request','retry'", &["reply", "{}"])
-        + &layer(
-            &home,
-            "vote",
-            "'decide'",
-            &["reply", r#"{"decision":"retry"}"#],
-        )
-        + &layer(
-            &home,
-            "choose",
-            "'decide'",
-            &[
-                "reply",
-                &serde_json::json!({"decision":"stop","reroute":again}).to_string(),
-            ],
-        );
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = sent.clone();
+    let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+        let sent = captured.clone();
+        async move {
+            let key = req.headers()["authorization"].to_str().unwrap().to_owned();
+            let body = axum::body::to_bytes(req.into_body(), 1024).await.unwrap();
+            let mut sent = sent.lock().unwrap();
+            sent.push((key, body));
+            if sent.len() == 1 {
+                http::StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                http::StatusCode::OK
+            }
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = layer(
+        &home,
+        "route",
+        "'request','retry'",
+        &["rotate", r#"["first","second"]"#],
+    ) + &layer(
+        &home,
+        "vote",
+        "'decide'",
+        &["reply", r#"{"decision":"retry"}"#],
+    ) + &layer(
+        &home,
+        "choose",
+        "'decide'",
+        &[
+            "reply",
+            &serde_json::json!({"decision":"stop","reroute":again}).to_string(),
+        ],
+    );
     let (c, url) = running(&home, up, &cfg);
-    assert_eq!(c.post(url).send().await.unwrap().status(), 200);
-    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert_eq!(
+        c.post(&url).body("payload").send().await.unwrap().status(),
+        200
+    );
+    {
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].0, "Bearer first");
+        assert_eq!(
+            sent[1].0,
+            if again {
+                "Bearer second"
+            } else {
+                "Bearer first"
+            }
+        );
+        assert_eq!(sent[0].1, "payload");
+        assert_eq!(sent[0].1, sent[1].1);
+    }
     let f = frames(&home, "route");
     assert_eq!(f.iter().filter(|v| v["stage"] == "request").count(), 1);
     assert_eq!(
         f.iter().filter(|v| v["stage"] == "retry").count(),
         usize::from(again)
     );
+    let d = request_detail(&home, &url, f[1]["request_id"].as_str().unwrap()).await;
+    assert_eq!(d["record"]["tries"][0]["decision"]["reroute"], again);
     assert_eq!(frames(&home, "choose").len(), 2);
 }
 /// false 保留请求段最后发出的完整表示。
@@ -3484,4 +3526,62 @@ async fn retry_stream_never_opens_for_an_error_disguised_as_200() {
     let f = frames(&home, "convert");
     assert_eq!(f.iter().filter(|v| v["event"] == "open").count(), 1);
     assert!(f[1]["stream_id"].as_str().unwrap().ends_with("/2"));
+}
+
+/// 读到 503 的头但实体没读完：程序可按头投票，停止时却没有完整响应可以继承。
+#[tokio::test]
+async fn decide_sees_interrupted_head_but_stop_does_not_inherit_it() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    for patch in [false, true] {
+        let home = TestHome::new();
+        let up = free_port();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut r = tokio::io::BufReader::new(&mut sock);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert!(r.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            sock.write_all(b"HTTP/1.1 503 Unavailable\r\nRetry-After: 7\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nbad\r\n").await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
+        let cfg = layer(
+            &home,
+            "policy",
+            "'decide'",
+            &[
+                "reply",
+                if patch {
+                    r#"{"decision":"stop","response":{"body":"patched"}}"#
+                } else {
+                    r#"{"decision":"stop"}"#
+                },
+            ],
+        );
+        let (c, url) = running(&home, up, &cfg);
+        let resp = c.get(url).send().await.unwrap();
+        assert_eq!(resp.status(), 502);
+        assert!(!resp.headers().contains_key("retry-after"));
+        if patch {
+            assert_eq!(resp.text().await.unwrap(), "patched");
+        } else {
+            assert_eq!(
+                resp.json::<Value>().await.unwrap()["error"]["aproxy"]["code"],
+                "retry_stopped"
+            );
+        }
+        let f = frames(&home, "policy");
+        assert_eq!(f[1]["failure"]["code"], "upstream_body_interrupted");
+        let h = &f[1]["response"];
+        assert_eq!(h["status"], 503);
+        assert_eq!(h["headers"]["retry-after"], "7");
+        assert!(h.get("body").is_none() && h.get("body_b64").is_none());
+    }
 }

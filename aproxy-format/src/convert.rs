@@ -191,7 +191,8 @@ impl Convert {
                     })?
                     .to_string(),
             );
-            if url.path() == path(from) {
+            // auto 只选协议；即使路径看起来是标准端点，也由路由独占地址。
+            if self.to != "auto" && url.path() == path(from) {
                 url.set_path(path(to));
                 patch.url = Some(url.into());
             }

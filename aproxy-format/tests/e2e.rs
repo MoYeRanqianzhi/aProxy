@@ -155,10 +155,14 @@ fn auto_detect_rejects_unknown_input_and_requires_response_state() {
 fn automatic_upstream_uses_route_origin_and_longest_prefix() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("convert.toml");
-    std::fs::write(&f,"from='openai_chat'\nto='auto'\n[[upstream]]\norigin='https://mixed.test'\nprotocol='openai_chat'\n[[upstream]]\norigin='https://mixed.test:443'\npath_prefix='/tenant'\nprotocol='anthropic_messages'").unwrap();
+    std::fs::write(&f,"from='openai_chat'\nto='auto'\n[[upstream]]\norigin='https://mixed.test'\nprotocol='openai_chat'\n[[upstream]]\norigin='https://mixed.test:443'\npath_prefix='/tenant'\nprotocol='anthropic_messages'\n[[upstream]]\norigin='https://other-provider.test'\nprotocol='anthropic_messages'").unwrap();
     let args = ["convert", "--config", f.to_str().unwrap()];
     let mut w = Worker::new(&args);
     for (url, proto) in [
+        (
+            "https://other-provider.test/v1/chat/completions?tenant=1",
+            "anthropic_messages",
+        ),
         ("https://mixed.test/tenant/custom", "anthropic_messages"),
         (
             "https://mixed.test/tenant/v1/responses",
@@ -176,6 +180,7 @@ fn automatic_upstream_uses_route_origin_and_longest_prefix() {
             serde_json::from_str::<Value>(r["state"].as_str().unwrap()).unwrap(),
             json!(["openai_chat", proto])
         );
+        assert!(r["request"].get("url").is_none(), "{url}: {r}");
         if proto == "anthropic_messages" {
             let r=Worker::new(&args).frame(response(&r["state"],r#"{"role":"assistant","content":[{"type":"text","text":"answer"}],"model":"served","stop_reason":"end_turn"}"#));
             let body: Value =

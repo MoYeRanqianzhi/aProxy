@@ -36,10 +36,15 @@ impl Rewrite {
             *h = name(h)?;
         }
         for (key, value) in std::mem::take(&mut cfg.set_headers) {
+            let key = name(&key)?;
+            // 此角色不拥有目标 origin；认证值必须由选定渠道或密钥池写入，重试时才不会串用。
+            if aproxy_ipc::redact::is_secret_header(&key) {
+                return Err("set_headers 不接受凭据头，请使用 keys 或 route");
+            }
             if !http::HeaderValue::from_str(&value).is_ok_and(|v| v.to_str().is_ok()) {
                 return Err("改写头的值无效");
             }
-            if cfg.set_headers.insert(name(&key)?, value).is_some() {
+            if cfg.set_headers.insert(key, value).is_some() {
                 return Err("改写头名称重复");
             }
         }

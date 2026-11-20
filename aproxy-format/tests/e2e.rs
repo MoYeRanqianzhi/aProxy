@@ -1613,3 +1613,32 @@ fn buffered_and_streamed_json_require_an_assistant_message_not_a_shell() {
         assert_eq!(body.get("error").is_none(), valid, "{body}");
     }
 }
+
+/// 配置加载区分删除和写入；即使头名大小写混用也不能让固定密钥跨渠道继承。
+#[test]
+fn rewrite_refuses_secret_assignments_but_can_remove_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rewrite.toml");
+    for header in ["Authorization", "COOKIE", "X-Custom-Token"] {
+        std::fs::write(
+            &path,
+            format!("set_headers={{'{header}'='private-fixture'}}"),
+        )
+        .unwrap();
+        let result = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+            .args(["rewrite", "--config", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let diagnostic = String::from_utf8(result.stderr).unwrap();
+        assert!(
+            !result.status.success()
+                && result.stdout.is_empty()
+                && diagnostic.contains("set_headers")
+                && !diagnostic.contains("private-fixture")
+        );
+    }
+    std::fs::write(&path, "remove_headers=['Authorization','Cookie']").unwrap();
+    let mut worker = Worker::new(&["rewrite", "--config", path.to_str().unwrap()]);
+    let r = worker.frame(request("https://a.test/", "/", json!({})));
+    assert_eq!(r["request"]["headers"], json!({}));
+}

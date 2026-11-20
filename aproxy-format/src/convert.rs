@@ -141,23 +141,37 @@ impl Convert {
     }
     /// 只改写标准协议端点的路径，自定义上游路径与查询串保持原样。
     pub fn request(&self, m: &w::RequestMessage, r: &mut w::Reply) -> Result<(), Fault> {
-        let body: Value = serde_json::from_slice(m.request.body.as_bytes().unwrap_or_default())
-            .map_err(|_| Fault::new("请求体不是 JSON", "request body is not valid JSON"))?;
+        // 路径或显式协议足够时，同协议请求的原始表示不必是可解析的 JSON。
+        let parse = || {
+            serde_json::from_slice::<Value>(m.request.body.as_bytes().unwrap_or_default())
+                .map_err(|_| Fault::new("请求体不是 JSON", "request body is not valid JSON"))
+        };
+        let mut detected_body = None;
         let from = if self.from == "auto" {
-            [F::AnthropicMessages, F::OpenAiChat, F::OpenAiResponses]
+            if let Some(f) = [F::AnthropicMessages, F::OpenAiChat, F::OpenAiResponses]
                 .into_iter()
                 .find(|f| Some(path(*f)) == m.client.path.split('?').next())
-                .or_else(|| detect::detect_request(&body))
-                .ok_or(Fault::new(
+            {
+                f
+            } else {
+                let body = parse()?;
+                let f = detect::detect_request(&body).ok_or(Fault::new(
                     "无法识别客户端协议，请指定 --from",
                     "unknown client protocol; specify --from",
-                ))?
+                ))?;
+                detected_body = Some(body);
+                f
+            }
         } else {
             protocol(&self.from).map_err(|e| Fault::new(e, "invalid client protocol"))?
         };
-        let mut url =
-            config::endpoint(&m.request.url).map_err(|e| Fault::new(e, "invalid upstream URL"))?;
+        // 运行时的地址不是新增渠道配置。映射只读 origin 和 path，不复制其中的凭据。
+        let url = || {
+            url::Url::parse(&m.request.url)
+                .map_err(|_| Fault::new("上游地址无效", "invalid upstream URL"))
+        };
         let to = if self.to == "auto" {
+            let url = url()?;
             let origin = url.origin().ascii_serialization();
             self.upstream
                 .iter()
@@ -181,9 +195,13 @@ impl Convert {
         } else {
             protocol(&self.to).map_err(|e| Fault::new(e, "invalid upstream protocol"))?
         };
-        let mut patch = w::RequestPatch::new();
-        let mut headers = m.request.headers.clone();
-        if from != to {
+        let usage = if from != to {
+            let body = match detected_body {
+                Some(body) => body,
+                None => parse()?,
+            };
+            let mut patch = w::RequestPatch::new();
+            let mut headers = m.request.headers.clone();
             patch.body = w::Body::Text(
                 translate::translate_request(from, to, &body)
                     .map_err(|_| {
@@ -192,26 +210,31 @@ impl Convert {
                     .to_string(),
             );
             // auto 只选协议；即使路径看起来是标准端点，也由路由独占地址。
-            if self.to != "auto" && url.path() == path(from) {
-                url.set_path(path(to));
-                patch.url = Some(url.into());
+            if self.to != "auto" {
+                let mut url = url()?;
+                if url.path() == path(from) {
+                    url.set_path(path(to));
+                    patch.url = Some(url.into());
+                }
             }
             headers.remove("content-encoding");
             headers.remove("content-length");
-        }
-        headers
-            .entry("content-type".into())
-            .or_insert_with(|| "application/json".into());
-        if to == F::AnthropicMessages {
             headers
-                .entry("anthropic-version".into())
-                .or_insert_with(|| "2023-06-01".into());
-        }
-        patch.headers = Some(headers);
-        r.request = Some(patch);
-        let usage = from == F::OpenAiChat
-            && body["stream"] == true
-            && body["stream_options"]["include_usage"] == true;
+                .entry("content-type".into())
+                .or_insert_with(|| "application/json".into());
+            if to == F::AnthropicMessages {
+                headers
+                    .entry("anthropic-version".into())
+                    .or_insert_with(|| "2023-06-01".into());
+            }
+            patch.headers = Some(headers);
+            r.request = Some(patch);
+            from == F::OpenAiChat
+                && body["stream"] == true
+                && body["stream_options"]["include_usage"] == true
+        } else {
+            false
+        };
         r.state =
             Some(serde_json::to_string(&Session(from, to, usage)).expect("可序列化的协议与布尔值"));
         r.report = config::report(

@@ -150,6 +150,31 @@ fn auto_detect_rejects_unknown_input_and_requires_response_state() {
     let missing = w.frame(response(&Value::Null, "{}"));
     assert_eq!(missing["fail"]["retry"], false);
 }
+/// 协议相同不改 HTTP 表示，不解析私有扩展或压缩字节，也不复制地址中的用户信息。
+#[test]
+fn explicit_and_detected_same_protocol_leave_http_untouched() {
+    for (from, to) in [
+        ("anthropic_messages", "anthropic_messages"),
+        ("auto", "auto"),
+    ] {
+        let mut w = Worker::new(&["convert", "--from", from, "--to", to]);
+        let mut m = request(
+            "https://account:fixture-private@relay.test/v1/messages",
+            "/v1/messages",
+            Value::Null,
+        );
+        m["request"]["headers"] =
+            json!({"content-encoding":"gzip","content-type":"application/vendor+json"});
+        m["request"]["body"] = "opaque entity".into();
+        let r = w.frame(m);
+        assert_eq!(
+            r["state"],
+            json!(["anthropic_messages", "anthropic_messages"]).to_string()
+        );
+        assert!(r.get("request").is_none() && r.get("fail").is_none(), "{r}");
+        assert!(!r.to_string().contains("fixture-private"));
+    }
+}
 /// 目的端先按 origin 与最长路径段匹配，再看标准端点；回程在另一进程不重猜当前 URL。
 #[test]
 fn automatic_upstream_uses_route_origin_and_longest_prefix() {

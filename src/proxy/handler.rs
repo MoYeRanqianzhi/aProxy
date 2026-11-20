@@ -11,6 +11,9 @@ pub fn router(state: AppState) -> Router {
 
 /// 核心代理处理器：完整透传 + 无限重试 + 流式 spool 后回放 + 保活心跳
 pub(super) async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response {
+    let decide_started = state
+        .has_format(crate::config::file::Stage::Decide)
+        .then(tokio::time::Instant::now);
     let method = req.method().clone();
     let uri = req.uri().clone();
 
@@ -52,7 +55,8 @@ pub(super) async fn proxy_handler(State(state): State<AppState>, req: Request) -
     );
     // 处理函数被取消（客户端在拿到响应之前断开）时，它随 future 一起被丢弃，照样收尾
     let delivery = Delivery::new(rec.clone(), in_flight);
-    let trace = RequestTrace::recorded(request_id, rec);
+    let mut trace = RequestTrace::recorded(request_id, rec);
+    trace.decide_started = decide_started;
     let bodiless = method == http::Method::HEAD;
 
     // 这个请求的全部日志都带 request_id：与响应头 x-aproxy-request-id、错误体里的是同一个串，

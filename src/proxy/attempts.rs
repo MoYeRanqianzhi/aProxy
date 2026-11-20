@@ -496,8 +496,7 @@ pub(super) async fn run_attempts(
     let mut sent = sent_head(&rec, &req);
     let mut same_body = request_encoding(&req.headers, req.ctx.is_some()).as_deref()
         == req.client_encoding.as_ref();
-    let deciding = state.has_format(Stage::Decide);
-    let started = deciding.then(tokio::time::Instant::now);
+    let started = trace.decide_started;
     let mut next_delay = None;
     let mut reroute = true;
     let mut attempt: u32 = 0;
@@ -538,6 +537,7 @@ pub(super) async fn run_attempts(
                 {
                     return;
                 }
+                rec.finish_backoff();
             }
         }
 
@@ -599,6 +599,19 @@ pub(super) async fn run_attempts(
         let mut explicit_reroute = None;
         reroute = true;
         if let Some(started) = started {
+            // 投票可能一直等到客户端断开：已知事实先落到记录，不造一张还没投出的票。
+            match &outcome {
+                Outcome::Deliver(v) => rec.try_ended(attempt, v.body.len(), None),
+                Outcome::Retry {
+                    failure,
+                    response_bytes,
+                    ..
+                } => rec.try_ended(attempt, *response_bytes, Some(failure.for_history())),
+                Outcome::Exhausted {
+                    response, failure, ..
+                } => rec.try_ended(attempt, response.body.len(), Some(failure.for_history())),
+                Outcome::TooLarge | Outcome::SpoolFailed(..) => (),
+            }
             let query = decide::consult(
                 state,
                 &req,
@@ -614,6 +627,14 @@ pub(super) async fn run_attempts(
                 .await
             else {
                 return;
+            };
+            let votes = match votes {
+                Ok(v) => v,
+                Err(t) => {
+                    t.record_in(&state.stats);
+                    r.finish(t, &trace).await;
+                    return;
+                }
             };
             explicit_reroute = votes.reroute;
             reroute = chain_failed || votes.reroute.unwrap_or(true);

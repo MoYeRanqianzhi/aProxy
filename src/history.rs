@@ -763,6 +763,8 @@ struct Decision {
     decision: &'static str,
     /// 下一次尝试之前实际等了多久；还没开始等时为 None
     delay_ms: Option<u64>,
+    /// 等待期间的单调起点；正常结束或客户端取消时结算实际时长。
+    backoff_started: Option<Instant>,
     /// 只有程序明确表态才有这一项，不把默认重跑冒充投票。
     reroute: Option<bool>,
 }
@@ -856,6 +858,14 @@ struct RecordInner {
 }
 
 impl RecordInner {
+    /// 等待中保留预计的下次尝试时刻；请求提前结束也只记真正等过的时间。
+    fn finish_backoff(&mut self) {
+        if let Some(d) = self.tries.back_mut().and_then(|t| t.decision.as_mut())
+            && let Some(start) = d.backoff_started.take()
+        {
+            d.delay_ms = Some(start.elapsed().as_millis() as u64);
+        }
+    }
     /// 格式程序可能在发送之前就报告本轮工作；先建一个无发出头、无上游响应的尝试，
     /// 随后真正发送时补写头和体，不重复计数，也不会在断开时丢掉早到的报告。
     fn enter_try(&mut self, attempt: u32) -> &mut Try {
@@ -1888,7 +1898,8 @@ impl Recorder {
             let Some(t) = inner.try_mut(attempt) else {
                 return;
             };
-            t.duration_ms = Some(t.started.elapsed().as_millis() as u64);
+            t.duration_ms
+                .get_or_insert_with(|| t.started.elapsed().as_millis() as u64);
             t.response_bytes = response_bytes;
             if let Some(failure) = failure {
                 t.code = Some(failure.code);
@@ -1921,6 +1932,7 @@ impl Recorder {
                     by,
                     decision: if retry { "retry" } else { "stop" },
                     delay_ms: None,
+                    backoff_started: None,
                     reroute,
                 });
             }
@@ -1933,12 +1945,18 @@ impl Recorder {
             let delay_ms = delay.as_millis() as u64;
             if let Some(decision) = inner.tries.back_mut().and_then(|t| t.decision.as_mut()) {
                 decision.delay_ms = Some(delay_ms);
+                decision.backoff_started = (delay_ms > 0).then(Instant::now);
             }
             if delay_ms > 0 {
                 inner.phase = Phase::Backoff;
                 inner.next_attempt_at = Some(now_millis() + delay_ms);
             }
         });
+    }
+
+    /// 实际等待已结束，之后的请求改写、排队和上游调用都不属于 delay_ms。
+    pub(crate) fn finish_backoff(&self) {
+        self.update(|inner, _| inner.finish_backoff());
     }
 
     /// 给客户端发了一个心跳。
@@ -1973,6 +1991,7 @@ impl Recorder {
         if inner.phase == Phase::Done {
             return;
         }
+        inner.finish_backoff();
         let (outcome, code) = inner.settled.take().unwrap_or(if delivered {
             (Outcome::Ok, None)
         } else {

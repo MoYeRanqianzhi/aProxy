@@ -150,7 +150,7 @@ pub(super) async fn consult(
     attempt: u32,
     elapsed: Duration,
     limit: Option<u32>,
-) -> Votes {
+) -> Result<Votes, Terminal> {
     use wire::Decision::{Retry, Stop};
     let mut votes = Votes::default();
     let (action, rule, failure, response) = match outcome {
@@ -175,7 +175,7 @@ pub(super) async fn consult(
             response,
         } => (Stop, *rule, Some(failure), Some(response)),
         Outcome::Deliver(response) => (Stop, None, None, Some(response)),
-        Outcome::TooLarge | Outcome::SpoolFailed(..) => return votes,
+        Outcome::TooLarge | Outcome::SpoolFailed(..) => return Ok(votes),
     };
     let by = rule.map_or_else(
         || {
@@ -254,9 +254,12 @@ pub(super) async fn consult(
                 RequestBody::Memory(b) => b.to_vec(),
                 RequestBody::Disk { path, .. } => match tokio::fs::read(path).await {
                     Ok(b) => b,
-                    Err(_) => {
+                    Err(e) => {
                         turn.unused().await;
-                        continue;
+                        return Err(Terminal::local_storage_failed(
+                            StorageOp::ReadRequest,
+                            &e.to_string(),
+                        ));
                     }
                 },
             };
@@ -330,7 +333,7 @@ pub(super) async fn consult(
             break;
         }
     }
-    votes
+    Ok(votes)
 }
 
 /// 决定阶段的响应补丁应用于真实上游体，而不是给程序看的有界预览。停止以后不进响应转换链。

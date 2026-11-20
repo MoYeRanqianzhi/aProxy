@@ -2385,7 +2385,13 @@ async fn decide_delay_overrides_the_backoff() {
     assert!(start.elapsed() >= std::time::Duration::from_millis(180));
     let f = frames(&home, "delay");
     let d = request_detail(&home, &url, f[1]["request_id"].as_str().unwrap()).await;
-    assert_eq!(d["record"]["tries"][0]["decision"]["delay_ms"], 180);
+    let waited = d["record"]["tries"][0]["decision"]["delay_ms"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        waited >= 180 && u128::from(waited) <= start.elapsed().as_millis(),
+        "{waited}"
+    );
 }
 /// 真正的磁盘体越过 1 MiB 后只给首尾，转发字节不受预览截断影响。
 #[tokio::test]
@@ -3584,4 +3590,146 @@ async fn decide_sees_interrupted_head_but_stop_does_not_inherit_it() {
         assert_eq!(h["headers"]["retry-after"], "7");
         assert!(h.get("body").is_none() && h.get("body_b64").is_none());
     }
+}
+
+/// 等待的是实例报告的实际阶段，而不是假定一个固定等待后代理已进入那一阶段。
+async fn in_phase(home: &TestHome, url: &str, id: &str, phase: &str) -> Value {
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        loop {
+            let doc = request_detail(home, url, id).await;
+            if doc["record"]["phase"] == phase {
+                return doc["record"].clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+/// 客户端断开时只取消未完成的咨询或等待，已经完成的尝试仍保留真实字节和失败码。
+#[tokio::test]
+async fn decide_disconnect_preserves_attempt_and_actual_backoff() {
+    use tokio::io::AsyncWriteExt as _;
+    for during_wait in [false, true] {
+        let home = TestHome::new();
+        let (up, calls) = upstream(&[503]).await;
+        let gate = home.path().join("hold");
+        let args = if during_wait {
+            ["reply", r#"{"decision":"retry","delay_ms":86400000}"#]
+        } else {
+            ["gate-decide", gate.to_str().unwrap()]
+        };
+        let (_, url) = running(&home, up, &layer(&home, "policy", "'decide'", &args));
+        let mut sock = tokio::net::TcpStream::connect(url.strip_prefix("http://").unwrap())
+            .await
+            .unwrap();
+        sock.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let f = observed_stage(&home, "policy", "decide", 1).await;
+        let id = f[0]["request_id"].as_str().unwrap();
+        if during_wait {
+            in_phase(&home, &url, id, "backoff").await;
+        }
+        drop(sock);
+        let r = in_phase(&home, &url, id, "done").await;
+        assert_eq!(r["outcome"], "client_gone");
+        let t = &r["tries"][0];
+        assert_eq!(t["response_bytes"], 14);
+        assert_eq!(t["code"], "upstream_status");
+        assert!(t["duration_ms"].is_number());
+        if during_wait {
+            assert!(t["decision"]["delay_ms"].as_u64().unwrap() < 86400000);
+        } else {
+            assert!(t["decision"].is_null());
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+}
+/// 实例确认正在读上传后才刻意暂停；这段时间必须出现在 decide 的 elapsed_ms 里。
+#[tokio::test]
+async fn decide_clock_includes_client_upload() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+    let home = TestHome::new();
+    let (up, _) = upstream(&[503]).await;
+    let (_, url) = running(
+        &home,
+        up,
+        &layer(
+            &home,
+            "policy",
+            "'decide'",
+            &["reply", r#"{"decision":"stop"}"#],
+        ),
+    );
+    let mut sock = tokio::net::TcpStream::connect(url.strip_prefix("http://").unwrap())
+        .await
+        .unwrap();
+    sock.write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 1\r\nExpect: 100-continue\r\n\r\n").await.unwrap();
+    let mut reader = tokio::io::BufReader::new(&mut sock);
+    let mut line = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        reader.read_line(&mut line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(line.contains("100 Continue"), "{line}");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    sock.write_all(b"x").await.unwrap();
+    let mut rest = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(6),
+        sock.read_to_end(&mut rest),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let f = frames(&home, "policy");
+    assert!(f[1]["elapsed_ms"].as_u64().unwrap() >= 150, "{}", f[1]);
+}
+/// 第一层确认上游已结束后移开这一个临时请求文件；后续 full 层不能把本地存储失败当作弃权。
+#[tokio::test]
+async fn decide_unreadable_request_spool_is_a_local_terminal() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[503]).await;
+    let gate = home.path().join("release");
+    let cfg = layer(
+        &home,
+        "gate",
+        "'decide'",
+        &["gate-decide", gate.to_str().unwrap()],
+    ) + &layer(&home, "full", "'decide'", &["reply", "{}"])
+        .replace("env={", "env={ ECHO_DECIDE_FULL='1',")
+        + &layer(
+            &home,
+            "late",
+            "'decide'",
+            &["reply", r#"{"decision":"stop"}"#],
+        );
+    let (c, url) = running(&home, up, &cfg);
+    let req = tokio::spawn(c.post(url).body(vec![b'x'; 1024 * 1024 + 8]).send());
+    observed_stage(&home, "gate", "decide", 1).await;
+    let mut files = Vec::new();
+    for dir in std::fs::read_dir(home.path().join("spool"))
+        .unwrap()
+        .flatten()
+    {
+        for entry in std::fs::read_dir(dir.path()).unwrap().flatten() {
+            if entry.file_name().to_string_lossy().starts_with("req-") {
+                files.push(entry.path());
+            }
+        }
+    }
+    assert_eq!(files.len(), 1);
+    std::fs::rename(&files[0], home.path().join("saved-body")).unwrap();
+    std::fs::write(gate, b"release").unwrap();
+    let resp = req.await.unwrap().unwrap();
+    assert_eq!(resp.headers()["x-aproxy-error"], "local_storage_failed");
+    let e = resp.json::<Value>().await.unwrap();
+    assert_eq!(e["error"]["aproxy"]["details"]["op"], "read_request");
+    assert_eq!(frames(&home, "late").len(), 1);
+    assert_eq!(frames(&home, "full").len(), 1);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
 }

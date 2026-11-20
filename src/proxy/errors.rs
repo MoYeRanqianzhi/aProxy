@@ -28,6 +28,8 @@ pub(super) struct RequestTrace {
     pub(super) request_id: Arc<str>,
     /// 已进行的上游尝试数（还没发往上游就结束的请求为 0）
     pub(super) attempts: u32,
+    /// 只有 decide 链才计请求总耗时；在开始读取客户端的上传之前取单调时钟。
+    pub(super) decide_started: Option<tokio::time::Instant>,
     /// 这个请求在请求历史里的记录；不进历史的请求（入站校验拒掉的）是空句柄
     pub(super) rec: Recorder,
 }
@@ -43,6 +45,7 @@ impl RequestTrace {
         Self {
             request_id: request_id.into(),
             attempts: 0,
+            decide_started: None,
             rec,
         }
     }
@@ -460,6 +463,7 @@ mod tests {
         RequestTrace {
             request_id: Arc::from("19ac3f2e8b5d1a2b-41"),
             attempts,
+            decide_started: None,
             rec: Recorder::none(),
         }
     }

@@ -6737,6 +6737,8 @@ async fn committed_json_stream_returns_sanitized_client_error() {
             [
                 ("content-type", "application/octet-stream"),
                 ("set-cookie", "private-fixture"),
+                ("etag", "old-entity"),
+                ("content-digest", "old-digest"),
                 ("x-api-key", "private-fixture"),
             ],
             "{}",
@@ -6758,7 +6760,7 @@ async fn committed_json_stream_returns_sanitized_client_error() {
     let r=c.post(format!("{url}/v1/messages")).json(&serde_json::json!({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hello"}]})).send().await.unwrap();
     assert_eq!(r.status(), 200);
     assert_eq!(r.headers()["content-type"], "application/json");
-    for key in ["x-api-key", "set-cookie"] {
+    for key in ["x-api-key", "set-cookie", "etag", "content-digest"] {
         assert!(!r.headers().contains_key(key));
     }
     assert!(!r.headers().get("content-length").is_some_and(|v| v == "2"));

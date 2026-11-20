@@ -359,14 +359,11 @@ impl Convert {
                     r.abort_tail = Some(events.abort().into());
                     Entity::Sse(Box::new(events))
                 } else {
-                    let h = r
-                        .response
-                        .as_mut()
-                        .and_then(|p| p.headers.as_mut())
-                        .expect("已构造完整头补丁");
-                    h.remove("content-length");
-                    h.remove("content-encoding");
-                    h.insert("content-type".into(), "application/json".into());
+                    // close 之前无法确定将交付成功实体还是本地错误。两者都不能沿用上游实体的校验信息。
+                    let mut head = w::ResponsePatch::new();
+                    head.headers =
+                        Some([("content-type".into(), "application/json".into())].into());
+                    r.response = Some(head);
                     r.abort_tail = Some(Self::error_json(client));
                     Entity::Json(client, upstream, Vec::new())
                 });

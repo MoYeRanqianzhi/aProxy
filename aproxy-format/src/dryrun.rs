@@ -616,6 +616,15 @@ impl<W: Write> Trial<'_, W> {
         cut: bool,
         attempt: u32,
     ) -> Result<(), CliError> {
+        let nested = self.units.iter().filter(|u| u.has(Stage::Stream)).count() > 1;
+        let nested_end = || {
+            CliError::Unsimulated(
+                "多层流的中断或失败；真实实例会按已打开的流租约传递中止、回退或终止交付".into(),
+            )
+        };
+        if cut && nested {
+            return Err(nested_end());
+        }
         let stream_id = format!("sample/{attempt}");
         let meta = json!({"method":req.method,"url":req.url});
         for i in (0..self.units.len()).rev() {
@@ -704,6 +713,9 @@ impl<W: Write> Trial<'_, W> {
                     );
                     let r = self.call(i, "stream", m)?;
                     if r.fail.is_some() {
+                        if nested {
+                            return Err(nested_end());
+                        }
                         return Err("流角色拒绝样例数据".into());
                     }
                     let b = r.data.as_bytes().unwrap_or_default();
@@ -725,6 +737,9 @@ impl<W: Write> Trial<'_, W> {
                     json!({"stream_id":stream_id,"event":"close"})
                 };
                 let r = self.call(i, "stream", end)?;
+                if nested && r.fail.is_some() {
+                    return Err(nested_end());
+                }
                 if !matches!(resp.status, 100..=199 | 204 | 304)
                     && let Some(b) = r.data.as_bytes().filter(|b| !b.is_empty())
                 {
@@ -1303,6 +1318,23 @@ mod tests {
         );
         assert!(matches!(result, Err(CliError::Unsimulated(_))));
         assert!(!rows.iter().any(|r| r["stage"] == "sample"));
+    }
+    /// 多层流在途时需要真实租约决定 abort 和剩余输出，试跑不能给出虚构的终态。
+    #[test]
+    fn nested_stream_interruption_is_explicitly_unsimulated() {
+        let mut cfg = String::from("delivery='forward'\n");
+        for name in ["a", "b"] {
+            cfg += &format!(
+                "[[format]]\nname='{name}'\ncommand='aproxy-format'\nargs=['convert','--from','openai_chat','--to','openai_chat']\nprocess='persistent'\nstages=['stream']\n"
+            );
+        }
+        let (result, rows) = trace_sample(
+            &cfg,
+            json!({"path":"/","body":{},"attempts":[{"status":200,"chunks":["head"],"interrupted":true}]}),
+            &[],
+        );
+        assert!(matches!(result,Err(CliError::Unsimulated(ref s)) if s.contains("多层流")));
+        assert!(!rows.iter().any(|r| r["stage"] == "result"));
     }
     /// 规则按声明先后生效，不对没有上游头的故障套状态规则；覆盖、直通与成功分别说明来源。
     #[test]

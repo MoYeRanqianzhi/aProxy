@@ -1,314 +1,482 @@
-# Envelope protocol
+# Format protocol 1
 
-The contract between aProxy and a format program: line framing, every envelope field in each
-direction, what aProxy does with your reply, complete samples, and security notes. Read it when
-you implement a format program in any language or need to know exactly what a field means.
+The complete contract between aProxy and a format program. Read it when writing a program,
+checking a field, or working out why aProxy rejected a reply. In the samples, `->` is a line
+aProxy writes to the program's stdin and `<-` is the program's reply on stdout; each is a single
+line on the wire.
 
-## Framing
+## Contents
 
-- An envelope is one JSON object serialized on one line, UTF-8 without a byte-order mark, ending
-  in `\n`. JSON string escaping keeps newlines inside a body from breaking the frame, so do not
-  escape anything yourself. aProxy tolerates a trailing `\r` on your line (Windows text-mode
-  output); a blank line or a BOM is a protocol error.
-- aProxy writes one envelope and waits for exactly one envelope back before it sends that worker
-  anything else. A reply carries no framing id: the Nth line out answers the Nth line in. (The
-  `request_id` field below is data inside the envelope, not a tag on the line.) Any other
-  output on stdout (a banner, a log line, a second line, pretty-printed JSON) breaks the pairing,
-  so aProxy evicts the worker and fails the request (see troubleshooting.md).
-- Lines can be large. The whole request body travels in one line (up to the instance's
-  `max_request_mb`, default 128), and binary bodies grow by a third in base64. Read lines with a
-  growable buffer, never a fixed-size one.
-- Write non-ASCII characters as UTF-8 or as `\uXXXX` escapes; both are valid JSON. On Windows,
-  set your stdin/stdout encoding to UTF-8 explicitly (see guide.md, language pitfalls).
+- [Transport](#transport): framing, limits, timing, process lifetime
+- [hello](#hello): the handshake and what is negotiated
+- [Common fields](#common-fields): `v`, `seq`, `request_id`, `state`, `digest`, `report`, HTTP objects
+- [The chain](#the-chain): order, who decides, retry reruns
+- [request and retry](#request-and-retry)
+- [fail](#fail): rejecting on purpose
+- [decide](#decide)
+- [response](#response)
+- [stream](#stream)
+- [heartbeat](#heartbeat)
+- [notify](#notify)
+- [report](#report)
+- [Delivery: forward and retry](#delivery-forward-and-retry)
+- [Errors, `required` and the circuit breaker](#errors-required-and-the-circuit-breaker)
+- [Security](#security)
 
-## Fields
+## Transport
 
-| Field | Type | Request side, in | Request side, out | Response side, in | Response side, out |
-|---|---|---|---|---|---|
-| `url` | string | Upstream URL aProxy computed (`base_url` + path + query) | New upstream URL; omitted = keep | Final upstream URL from the request side | Ignored |
-| `method` | string | HTTP method, always present | New method; omitted = keep | **Absent** | Ignored |
-| `headers` | object of string to string | Full header table, lowercase names | **Required.** Replaces the whole table | Upstream response headers | **Required.** Replaces the whole table |
-| `body` | string | Body as UTF-8 text (`""` when empty) | New body as text | Same | Same |
-| `body_b64` | string | Body as base64 when it is not valid UTF-8 | New body as base64 | Same | Same |
-| `worker_id` | integer | Pool slot of this worker | Ignored | Same | Ignored |
-| `extra` | string | Caller-supplied data, passed verbatim; always `""` when the format is configured from config.toml | Ignored | Same | Ignored |
-| `error` | string | Never present | Marks this request as failed | Never present | Marks this conversion as failed |
-| `stage` | string | `"request"` (`"retry"` before a retry, see "Retry stage") | Ignored | `"response"` | Ignored |
-| `request_id` | string | Identifies the client request | Ignored | Same value as on the request side | Ignored |
-| `state` | string | Absent (nothing earlier sets it) | Saved for later stages; omitted = keep | The latest value a request or heartbeat reply left, if any | Ignored |
+- **Frame.** One JSON object per line, UTF-8, ended by `\n`. Arrays and scalars are not frames.
+  Vocabulary values (`decision`, `delivery`, `process`, `request_body` grades) are JSON strings.
+- **One reply per message, in order, echoing `seq`.** `seq` starts at 0 for each process and
+  increases by one. A reply with a missing or different `seq` is a protocol error and the worker
+  is replaced; this is what keeps replies from ever being paired with the wrong request.
+- **Null means omitted** in a reply: `{"body":null,"body_b64":"..."}` gives only `body_b64`.
+  In messages from aProxy, `null` appears only where this document says so.
+- **Reply size.** A reply line longer than the limit is treated as invalid output without being
+  read to the end. The hello reply may be 64 KiB; `request` and `retry` replies twice
+  `max_request_mb` plus 1 MiB; `response` and `stream` replies twice `max_response_mb` plus 1 MiB
+  (no limit when the setting is unlimited); every other reply 1 MiB. The instance's actual
+  numbers arrive in hello's `limits`.
+- **Deadlines** run from the moment aProxy writes the message: `timeout_secs` (default 30) per
+  message, `decide_timeout_secs` (default 2) for `decide`, a fixed 2 seconds for `notify`, the
+  time to the next beat for `heartbeat`, at least 10 seconds for hello. A worker that misses a
+  deadline is replaced, because a late reply would be paired with the next message.
+- **stderr** goes to the instance log, line by line, prefixed `format[<name>]`, after known
+  secrets are replaced. Lines are cut at 8 KiB and limited to 50 per second per program.
+- **Lifetime.** Every process, in either mode, reads `hello` first. A `persistent` worker then
+  answers messages until stdin reaches EOF and must exit on EOF (aProxy waits up to 2 seconds
+  before killing it). A `spawn` process gets `hello`, one stage message, then EOF. Both modes are
+  the same loop: read a line, write a line, until EOF. A partial line before EOF is not a frame.
 
-A third stage, `"heartbeat"`, exists when a `[[format]]` entry declares `heartbeat` in `stages`;
-its envelope and reply are described under "Heartbeat stage" below. A fourth, `"retry"`, reaches a
-request format before each retry when its `stages` include `retry` ("Retry stage" below).
+## hello
 
-`stage` names the side. The presence of `method` tells them apart too (request envelopes always
-carry it, response envelopes never do), and it is the only signal on aProxy 0.1.0, which sends
-neither `stage`, `request_id` nor `state`; check for `method` if your program must also run there.
+```json
+-> {"v":1,"seq":0,"stage":"hello","protocols":[1],"aproxy_version":"0.2.0","name":"adaptive","process":"persistent","stages":["request","decide","notify"],"worker_id":0,"features":["decide.success"],"limits":{"hello":65536,"request":68157440,"response":269484032,"control":1048576},"overrides":["timeouts.connect_secs","timeouts.first_byte_secs","timeouts.read_idle_secs","keepalive.interval_secs","keepalive.trigger","keepalive.heartbeat","retry.max_backoff_secs","retry.max_attempts"]}
+<- {"v":1,"seq":0,"protocol":1,"stages":["request","decide","notify"],"request_body":{"request":"digest","decide":"none","notify":"digest"},"features":[],"name":"adaptive","version":"1.0.0"}
+```
 
-### Rules for your reply
+The shape of this line never changes, and its `v` is always 1.
 
-| Rule | Detail |
+| Field (from aProxy) | Meaning |
 |---|---|
-| `headers` is required | A reply without it fails to parse: ``信封 JSON 解析失败: missing field `headers` `` ("envelope JSON parse failed"). `{}` is valid. |
-| An omitted body means an empty body | `url` and `method` fall back to the originals when omitted, but if neither `body` nor `body_b64` is present the body becomes empty. To change only headers, write the received envelope back with your edits. |
-| `body` and `body_b64` are mutually exclusive | Both present is a protocol error. |
-| Types are strict | Header names and values are strings; `extra`, `stage`, `request_id` and `state` are strings; `worker_id` is a non-negative integer that fits in 32 bits. A wrong type fails the parse. |
-| `null` | Allowed for `url`, `method`, `body`, `body_b64`, `error`, `stage`, `request_id` and `state` (same as omitting). Not allowed for `headers`, `extra` or `worker_id`. |
-| Unknown keys | Ignored. Echoing back `worker_id`, `extra`, `stage`, `request_id` and `state` is harmless (an echoed `state` keeps the saved value). |
-| `error` wins | If `error` is present (any string, even empty), aProxy ignores every other field and treats the request as failed. |
+| `protocols` | Versions the instance speaks. Pick one and return it in `protocol`. |
+| `aproxy_version` | For diagnostics. |
+| `name` | The `[[format]]` entry's `name`. |
+| `process` | `"spawn"` or `"persistent"`. |
+| `stages` | The stages this entry is configured for. |
+| `worker_id` | Unique among this program's live workers, fixed for the life of the process; always 0 in spawn mode. Workers holding a stream are not counted in `pool_max`, so the number can reach `pool_max` or more. |
+| `features` | Optional behaviors the instance supports. |
+| `limits` | Optional. Largest reply line, in bytes including the newline, per group: `hello`, `request` (request and retry replies), `response` (response and stream replies), `control` (all others). A missing key means no limit. |
+| `overrides` | The config keys a reply's `overrides` may set for one request. |
 
-The simplest correct strategy is to modify the envelope you received and write it back whole.
-
-## Field details
-
-### url
-
-On the request side `url` is where aProxy will send the request; rewriting it moves the request to
-another host or path, which is the core of protocol conversion and multi-channel routing. Write an
-absolute `http`/`https` URL. A malformed or unreachable URL is not caught at transform time: it
-fails like a network error, and aProxy retries network errors indefinitely.
-
-On the response side `url` is the URL the request was actually sent to, after your request-side
-rewrite. The request and response transformers are separate processes with no shared memory; the
-URL tells a response transformer which upstream answered, and `state` (below) can carry anything
-else the request side decided.
-
-### method
-
-Present only on the request side. A replacement that is not a valid HTTP method token is ignored
-and the original kept, with the warning `format 输出的 method 非法，沿用原方法` ("format output
-method is invalid; keeping the original").
-
-### headers
-
-What you receive:
-
-- Names are lowercase. Values are the client's (or upstream's) values.
-- On the request side the table already includes the instance's `api_key`, `override_headers`
-  and `extra_headers`; aProxy applies them before calling you.
-- Hop-by-hop headers and `content-length` are removed: `connection`, `keep-alive`,
-  `proxy-authenticate`, `proxy-authorization`, `te`, `trailer`, `transfer-encoding`, `upgrade`,
-  `host`, `content-length`.
-- A header that appears several times keeps only its first value
-  (`多值头仅保留首值，后续值不进信封`, "multi-value header: only the first value enters the
-  envelope"). A value that is not visible ASCII is dropped (`头值非可见 ASCII，转换器信封中丢弃`).
-  LLM API requests do not depend on either case.
-
-What you return replaces the table completely: a header you leave out is not sent. aProxy then:
-
-- ignores any hop-by-hop header or `content-length` you return (`format 输出的头属自动管理范畴，忽略`,
-  "header is managed automatically; ignored") and computes framing from the actual body;
-- drops header names or values that are not valid HTTP (`format 输出的头名非法，丢弃` /
-  `format 输出的头值非法，丢弃`);
-- on the response side, always removes `content-length` and `content-encoding`, because the body
-  you return is uncompressed;
-- on the request side, sets `accept-encoding: identity` after your transform for requests that use
-  the keepalive channel, so heartbeats can be inserted into an uncompressed stream.
-
-### body and body_b64
-
-aProxy sends `body` when the bytes are valid UTF-8 and `body_b64` otherwise. Use the same rule for
-your reply. `body_b64` uses the standard base64 alphabet (`A-Z a-z 0-9 + /`) with `=` padding and
-no line breaks:
-
-| Language | Use | Not |
+| Field (your reply) | Required | Meaning |
 |---|---|---|
-| Python | `base64.b64encode` / `b64decode` | `urlsafe_b64encode` |
-| Go | `base64.StdEncoding` | `URLEncoding`, `RawStdEncoding` |
-| Node | `Buffer.from(s, "base64")` / `buf.toString("base64")` | `"base64url"` |
-| Any | single-line output | MIME-style 76-column wrapping |
+| `v`, `seq` | yes | `1` and `0`. |
+| `protocol` | yes | The chosen version: `1`. Every later line carries it in `v`. |
+| `stages` | yes | Every stage the program implements, not only those configured. A configured stage missing from this list stops the instance from starting (`format_stage_unsupported`). |
+| `request_body` | no | Per stage, how much of the client's request body to send: `"none"`, `"digest"` or `"full"`. Only `request`, `retry`, `decide` and `notify` are read; other keys are ignored. Defaults: `full` for request and retry, `none` for decide and notify. `notify` cannot be `full`. An unknown value makes the hello reply invalid. |
+| `features` | yes | Features the program wants; a feature is active only when both sides list it. Protocol 1 defines `decide.success`. |
+| `name`, `version` | yes | The program's own name and version, shown in diagnostics. |
 
-Response bodies are decoded before you see them: aProxy undoes `gzip`, `deflate`, `br` and `zstd`
-even though the `content-encoding` header is still in the table you receive. If decoding fails or
-the decoded body would exceed 8 MiB, you receive the raw compressed bytes in `body_b64` instead.
+About `request_body`:
 
-A streaming (SSE) response arrives as one body containing the complete event stream: aProxy
-buffers the whole response before calling you, so convert it as text, event by event.
+- `digest` is the SHA-256 of the body exactly as the client sent it (before content decoding and
+  before any program changed it), 64 lowercase hex digits, in the message's `digest` field. The
+  same request sent again has the same digest.
+- With `none` or `digest`, the `request` object has no `body`; the reply may still patch the
+  URL and headers.
+- It is a performance contract and a privacy one: a program that only votes never sees the
+  conversation.
 
-### worker_id
+If a line your reply must fit in one frame cannot fit under `limits` (a stream ending that
+repeats all output, for example), end with an in-protocol error for the client instead of
+sending a line aProxy will drop and count against the worker.
 
-In `persistent` mode, the pool slot of the worker that handles the request: aProxy numbers workers
-`0, 1, ... pool_max - 1` as it starts them, wrapping around, and a worker keeps its number for its
-lifetime. Use it as a starting offset for rotation (`(worker_id + n) % len(keys)`) so pool workers
-do not all begin with the same key. Do not treat it as a unique identity: after a worker is
-replaced, two live workers can share a number. In `spawn` mode it is always `0`.
+At startup aProxy shakes hands with every entry once, in parallel:
 
-### extra
-
-Caller-supplied data, passed through untouched. When the format is configured from config.toml it
-is always `""`: config.toml no longer has an `extra` key. Put configuration in the `env` table or in
-`args` instead. `env` values are available to your program as ordinary environment variables and
-are never printed by `aproxy config show`; `args` are visible on the command line, so keep secrets
-out of them. aProxy does not interpret either and does not expand `~` in them; if you pass a path,
-use an absolute one or expand `~` in your program. Each `[[format]]` entry has its own `args` and
-`env`.
-
-### stage, request_id and state
-
-aProxy versions after 0.1.0 add these three fields so that the two sides of one client request can
-cooperate.
-
-- `stage` is `"request"`, `"retry"`, `"response"` or `"heartbeat"`. Treat any other value as a
-  stage you do not handle and reply with the envelope unchanged: later aProxy versions may add
-  stages.
-- `request_id` is an opaque string, the same on both sides of one client request and different
-  between requests. It looks like `01a1e0eef745bd28-42`: 16 hex digits of an instance id, a
-  hyphen, and the request's sequence number in that instance; requests refused by the inbound
-  Host/Origin check end in `-x<n>`. It is the same string as the `x-aproxy-request-id` response
-  header and appears in every log line of the request as `request{request_id=<id>}:`. Use it to
-  correlate your logs; it is not a secret and carries no meaning beyond identity.
-- `state` is an opaque string aProxy keeps for the request without reading it. A request-side,
-  retry or heartbeat reply that includes `state` sets it; every later stage receives the latest value. Omitting it, or replying with
-  `null`, leaves the saved value unchanged. Typical use: the request side records which channel or
-  key it picked (for example as a small JSON string), and the response side reads it instead of
-  looking the channel up again by `url`. It travels on every envelope line of that request, so keep
-  it small, and do not put credentials in it if your program logs envelopes.
-
-### Heartbeat stage
-
-Configured with a `[[format]]` entry whose `stages` include `heartbeat` (aproxy-cli skill,
-config-toml.md). While a keepalive response waits for a usable upstream result, aProxy calls the
-program once per keepalive tick, after the response head is committed and the request side is done,
-until the first real byte is replayed.
-
-| Field | In | Reply |
+| Failure | `required = true` | `required = false` |
 |---|---|---|
-| `stage` | `"heartbeat"` | Ignored |
-| `method`, `url`, `headers` | The request as sent upstream (after any request transform) | Ignored |
-| `body` / `body_b64` | The request body, **only when `heartbeat.seq` is 1**; absent afterwards | The bytes to write to the client as this tick's heartbeat; empty or absent = write nothing this tick |
-| `heartbeat` | Object: `seq` (1 for the first call of this request), `elapsed_ms` (since the response head was committed), `attempt` (current upstream attempt, above 1 while aProxy retries) | Ignored |
-| `request_id`, `state`, `worker_id`, `extra` | As on the other stages | `state` sets the saved value, as on the request side |
-| `error` | Never present | This tick fails |
+| A configured stage is not in the reply | Instance does not start, `format_stage_unsupported`, exit code 3 | Same |
+| Wrong protocol version, invalid hello reply | Instance does not start, `format_handshake_failed`, exit code 3 | Same |
+| Cannot start, no reply in 10 s, exits midway | Instance does not start, `format_handshake_failed`, exit code 1 | Warning; the entry starts with its breaker open and is probed after the cooldown |
 
-- The reply body must be UTF-8 and must leave the client's SSE parser at an event boundary, the same
-  rule as `keepalive.heartbeat`: end with a line break, and end with a blank line if it has any
-  field line (`event:`, `data:`). Otherwise the heartbeat would merge with the first replayed
-  event, so aProxy rejects it.
-- A failed tick (error reply, timeout, bad bytes, crash) sends the fixed `keepalive.heartbeat`
-  instead and logs one warn per request. The request itself is unaffected.
-- aProxy does not wait for you: if the previous call has not returned when the next tick comes,
-  that tick sends the fixed heartbeat. A reply that arrives after the real response has started is
-  dropped.
-- Read what you need from the body on `seq` 1 and keep it in `state`; later ticks do not carry
-  the body.
-- If your heartbeats are protocol events rather than comments, the client sees them before the
-  real response, which aProxy replays unchanged. Configure a format with the `response` stage that
-  reads `state` and removes what the heartbeats already sent (for example a duplicate
-  `message_start`).
+## Common fields
 
-### Retry stage
+From aProxy, on every stage message: `v`, `seq`, `stage`, `request_id` (shared by the whole
+chain), `state` when this program stored one for this request, and `digest` when the program
+asked for it on this stage. Exception: the `data`, `close` and `abort` events of a stream carry
+only `stream_id`.
 
-Sent to a request format whose `stages` include `retry` (aproxy-cli skill, config-toml.md). Before
-every retry, from the second upstream attempt on, aProxy calls the program again with the client's
-original request and sends your reply upstream as that attempt.
+In every reply: `v`, `seq`, and optionally:
 
-| Field | In | Reply |
+| Field | Meaning |
+|---|---|
+| `state` | A string of at most 64 KiB kept per program and request. A string replaces it, `""` clears it, omission keeps it. It comes back on every later message of the request, whichever worker receives it. Ignored in heartbeat replies. |
+| `report` | What the program did, for display ([report](#report)). |
+| `fail` | A deliberate rejection ([fail](#fail)). |
+
+**HTTP objects.** A request is `{"method","url","headers":{lowercase-name: value},"body"|"body_b64"}`;
+a response is `{"status","headers","body"|"body_b64"}`.
+
+- `body` holds UTF-8 text; `body_b64` holds any bytes in standard base64 with padding. Never both.
+- Objects from aProxy always carry `headers` (`{}` when empty). Only the first value of a
+  repeated header is kept, except `content-encoding`, whose values are joined with `, `.
+- In `decide`, `response` and `stream` messages, `request` is only `{"method","url"}`: no
+  headers, and a body only for a program that asked for `full` on `decide`.
+- The same-named object in a reply is a **patch**: an omitted field is unchanged; `headers`,
+  when given, replaces the whole table; omitting both `body` and `body_b64` keeps the body, and
+  `"body":""` empties it.
+- Bodies reach programs decoded. When any program asks for `full`, aProxy decodes a
+  `content-encoding` it knows and removes that header; the upstream receives the decoded body.
+  `content-length` is always recomputed by aProxy. A `content-encoding` you set yourself is sent
+  as written: you answer for those bytes.
+
+**Byte streams** (`stream`, `heartbeat`) use `data` (UTF-8) or `data_b64`. aProxy never splits a
+UTF-8 sequence across two `data` values. Messages always carry one of the two (`"data":""` for
+an empty piece); only replies may omit both.
+
+## The chain
+
+- `request` and `retry` run in list order; `response`, `stream` and `heartbeat` in reverse
+  order; `decide` in list order. Each stage calls only the programs that declared it, and one
+  layer's output is the next layer's input.
+- **Decisions** (`delivery` in a request reply; `decision` and `reroute` in a decide reply) are
+  taken from the first program in list order that gives one. **Content** (request and response
+  patches) accumulates layer by layer.
+- `state` is private to one program and one request. Programs cannot read each other's state.
+- Messages of one request, and of different requests, may reach different workers. A stream is
+  the exception: one worker handles it from `open` to `close` or `abort`.
+- **Retries.** Programs that declare `retry` must form the tail of the chain. When the retry
+  segment reruns, it starts at the first program that declared `retry`, which receives
+  `stage: "retry"` with the cached output of the layer before it. Programs before that point
+  handle each request once. Whether the segment reruns is decided by `reroute` in `decide`; when
+  nobody votes, it reruns whenever some program declared `retry`. With `reroute: false`, aProxy
+  resends the request it sent last time and calls nobody.
+- If a request-direction layer itself fails (a process error, or `fail` with `retry: true`), the
+  next attempt resumes at that layer with the same stage and input; earlier layers are not
+  called again.
+
+## request and retry
+
+```json
+-> {"v":1,"seq":3,"stage":"request","request_id":"19ac3f2e8b5d1a2b-42","delivery":"retry","request":{"method":"POST","url":"https://relay.example.com/v1/messages?beta=true","headers":{"content-type":"application/json","x-api-key":"sk-client"},"body":"{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":64,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"},"client":{"path":"/v1/messages?beta=true","stream":true}}
+<- {"v":1,"seq":3,"state":"[\"anthropic_messages\",\"openai_chat\"]","request":{"url":"https://relay.example.com/v1/chat/completions?beta=true","body":"{\"model\":\"claude-sonnet-4-5\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_completion_tokens\":64,\"stream\":true}"},"overrides":{"timeouts":{"first_byte_secs":900}},"report":{"summary":"anthropic_messages -> openai_chat","actions":[{"type":"protocol_convert","from":"anthropic_messages","to":"openai_chat"}]}}
+```
+
+```json
+-> {"v":1,"seq":9,"stage":"retry","request_id":"19ac3f2e8b5d1a2b-42","state":"[\"https://relay.example.com\",\"a\"]","delivery":"retry","request":{"method":"POST","url":"https://relay.example.com/v1/chat/completions","headers":{"content-type":"application/json"}},"client":{"path":"/v1/messages","stream":true},"retry":{"attempt":2,"last_failure":{"code":"upstream_status","details":{"status":429}},"last_response":{"status":429,"headers":{"retry-after":"30"}},"elapsed_ms":1200}}
+<- {"v":1,"seq":9,"state":"[\"https://relay.example.com\",\"b\"]","request":{"headers":{"content-type":"application/json","authorization":"Bearer sk-b"}},"report":{"summary":"Selected an upstream key","actions":[{"type":"key_select","key_id":"b"}]}}
+```
+
+Message fields beyond the common ones:
+
+| Field | Meaning |
+|---|---|
+| `delivery` | The request's current delivery mode, `"retry"` or `"forward"`. |
+| `request` | The request as it will be sent upstream after the previous layer: header names lowercase, headers aProxy manages itself already removed. No body unless this stage's grade is `full`. |
+| `client.path` | The path and query exactly as the client sent it; the same for every layer, whatever earlier layers did to the URL. Use it, not `request.url`, to tell which protocol the client speaks. |
+| `client.stream` | Whether the client asked for a streaming response. **Omitted when aProxy does not know yet**, never as a stand-in for `false`: with a forward request whose body is streamed straight to the upstream, or a body that is not one valid JSON document. A program that needs the answer at `request` asks for `digest` or `full`, which makes aProxy read the body first. |
+| `retry` (retry stage only) | `attempt`: the number of the attempt about to run. `last_failure`: `{"code","details"}` of the previous attempt (codes below). `last_response`: `{"status","headers"}` of the previous upstream response, without a body, with headers as the upstream sent them; omitted when no response headers arrived. `elapsed_ms`: time since aProxy received the request. Read `Retry-After` and rate-limit headers here. |
+
+Reply fields:
+
+| Field | Meaning |
+|---|---|
+| `request` | A patch. `url` must be an absolute `http` or `https` URL, or the reply is invalid output. |
+| `delivery` | `"forward"` or `"retry"`: how this request's response should be delivered ([below](#delivery-forward-and-retry)). Only read from `request` replies; the first program to give it wins. |
+| `overrides` | Settings for this request only, written as nested tables with config.toml's names: `{"retry":{"max_attempts":3}}`. Hello's `overrides` lists the allowed leaves in dotted form (`retry.max_attempts`); anything else, and any value of the wrong type, is ignored with a warning without spoiling the rest of the reply. A `keepalive.*` override that arrives after the keepalive has already committed the response headers has no effect. Overrides belong to this run of the program: when the retry segment reruns, the previous run's overrides are dropped and this run's replace them. |
+| `fail` | Reject ([fail](#fail)). |
+
+Attempt failure codes seen in `last_failure.code`, in `decide`'s `failure.code` and in a stream
+`abort`: `upstream_connect_failed`, `upstream_connect_timeout`, `upstream_first_byte_timeout`,
+`upstream_read_idle_timeout`, `upstream_body_interrupted`, `upstream_status` (`details.status`),
+`upstream_error_body` (a 2xx whose body is an error), `format_error`, `format_fail`,
+`format_decision`. Treat an unknown code as a generic failure; the list grows.
+
+## fail
+
+```json
+<- {"v":1,"seq":7,"fail":{"retry":false,"code":"model_not_routed","reason":"no channel configured for model gpt-9","response":{"status":404,"headers":{"content-type":"application/json"},"body":"{\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"model gpt-9 is not configured\"}}"}}}
+```
+
+| Field | Meaning |
+|---|---|
+| `retry` | Required. `true`: this attempt failed (`format_fail`) and goes through the normal retry loop, including backoff, `decide` and retry rules. `false`: the request ends now. |
+| `reason` | Required. Short English text, at most 512 characters; it is shown to the client and written to logs. |
+| `code` | Optional machine-readable string of your own: 1 to 64 of ASCII letters, digits, `_`, `.`, `-`. It appears as `details.fail_code`. A code of another shape is dropped; the `fail` still applies. |
+| `response` | Optional complete response for the client, in the client's protocol. |
+
+- `retry: false` with `response`: the client receives that response with aProxy's two
+  `x-aproxy-*` headers; the terminal code is `format_rejected`. Without `response`: 422
+  `format_rejected`.
+- On a forward request there is no retry loop: `retry: true` leads to one `decide` round about
+  upgrading, and to 502 `format_failed` when nobody upgrades it.
+- `fail` is a decision, not an error. It applies whether the entry is `required` or not, and it
+  resets the breaker's failure count like any valid reply. `state`, `overrides` and `report` in
+  the same reply still take effect.
+- In `response` and at stream `open`, `fail` with `response` substitutes that response, and
+  `fail` without one skips the layer (the response passes on unchanged, which includes upstream
+  headers). `fail.retry` has no meaning there.
+- A `fail.response` is data-plane bytes: it reaches the client as written, with no secret
+  replacement. Build it from scratch rather than from the upstream's response.
+
+## decide
+
+```json
+-> {"v":1,"seq":12,"stage":"decide","request_id":"19ac3f2e8b5d1a2b-44","client":{"path":"/v1/messages","stream":true},"attempt":6,"elapsed_ms":42000,"delivery":"retry","outcome":"failure","failure":{"code":"upstream_status","details":{"status":429}},"request":{"method":"POST","url":"https://relay.example.com/v1/chat/completions"},"response":{"status":429,"headers":{"retry-after":"60"},"body":"{\"error\":{\"message\":\"rate limited\"}}","truncated":null},"fallback":{"decision":"retry","by":"default","delay_ms":20000}}
+<- {"v":1,"seq":12,"decision":"retry","delay_ms":60000,"reroute":true,"report":{"summary":"429; upstream asks 60s; switch key and wait","actions":[{"type":"custom","label":"cooldown 60s"}]}}
+```
+
+**When.** After each failed attempt of a retry-mode request. A program that listed
+`decide.success` in its hello features (and the instance lists it too) is also asked after a
+successful attempt, with `outcome: "success"` and no `failure`; this is how a "200 but the body
+is an error" case can be judged a failure. For a forward request, `decide` is asked once, only
+when the attempt failed before a single byte was written to the client, with `delivery:
+"forward"` and a fallback of stop: voting `retry` upgrades the request to retry mode.
+
+| Field | Meaning |
+|---|---|
+| `attempt` | The attempt that just finished. |
+| `elapsed_ms` | Since aProxy received the request, including reading its body. |
+| `outcome` | `"failure"` or `"success"`. |
+| `failure` | `{"code","details"}`; absent on success. |
+| `request` | `{"method","url"}` of the request that was sent; plus the body when this program asked for `full` on decide. |
+| `response` | Present when the upstream answered. The body is decoded and capped at 1 MiB: beyond that, the first 64 KiB and the end are kept and `truncated` is the number of bytes left out. `"truncated": null` means the body is complete. When headers arrived but the body broke off, there is only `status` and `headers`, and no `truncated` key. A body that could not be decoded is given raw as `body_b64` with `content-encoding` left in the headers. |
+| `fallback` | What aProxy will do if nobody votes: `decision`, `by` (where it came from), and `delay_ms`, the wait the current backoff gives. `delay_ms` is present even when the decision is stop, so a program that overrules a stop knows the baseline. |
+
+Reply:
+
+| Field | Meaning |
+|---|---|
+| `decision` | `"retry"` or `"stop"`. Omit it to abstain. |
+| `delay_ms` | With retry: wait before the next attempt, an integer from 0 to 86400000 (24 h). Omitted: the fallback's delay. A value out of range makes the reply invalid; it is not clamped. |
+| `reroute` | With retry: `true` reruns the retry segment (new key, new channel), `false` resends the request sent last time. Has no effect when no program declared `retry`, or when the last attempt failed inside the chain. |
+| `response` | With stop: a response patch for the client. Applied on top of the upstream response when there is one, otherwise on an empty 502. |
+
+- `stop` without `response` passes the upstream response through; when there is none, the client
+  gets 502 `retry_stopped`. `stop` with `response` returns it with code `retry_stopped`.
+- `retry` on a successful attempt judges it failed (`format_decision`). `stop` without
+  `response` on a successful attempt confirms it; with `response` it replaces it.
+- Programs are asked in list order until both `decision` and `reroute` are settled (after a stop,
+  `reroute` no longer matters). Later programs are not asked: `decide` is a question, not a
+  notification. A program that only wants to watch uses `notify`.
+- A timeout, a crash or an invalid reply counts as abstaining (and toward the breaker). A
+  `decide` error never ends a request.
+- To rewrite an upstream error into the client's protocol, vote stop with a `response`; failed
+  responses do not go through the `response` or `stream` stage.
+
+## response
+
+```json
+-> {"v":1,"seq":15,"stage":"response","request_id":"19ac3f2e8b5d1a2b-42","state":"[\"anthropic_messages\",\"openai_chat\"]","client":{"path":"/v1/messages","stream":false},"request":{"method":"POST","url":"https://relay.example.com/v1/chat/completions"},"response":{"status":200,"headers":{"content-type":"application/json"},"body":"{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello.\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11}}"}}
+<- {"v":1,"seq":15,"response":{"headers":{"content-type":"application/json"},"body":"{\"id\":\"chatcmpl-1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-4o\",\"content\":[{\"type\":\"text\",\"text\":\"Hello.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":9,\"output_tokens\":2}}"}}
+```
+
+- Runs only on a response judged successful and about to be delivered. Errors passed through
+  after retries were given up do not come here. For a forward request, only 2xx responses do.
+- The whole body is in one message, decoded; aProxy drops the upstream's `content-encoding` and
+  recomputes `content-length` on the way out.
+- The reply's `response` is a patch (remember: `headers` replaces the table).
+- A program cannot declare both `response` and `stream`. A program that declares `response` in
+  a chain whose requests are delivered forward makes that layer gather each response first, so
+  true streaming is lost there; prefer `stream`.
+- On a process-level failure aProxy tries once more on a fresh worker, then skips the layer.
+
+## stream
+
+```json
+-> {"v":1,"seq":20,"stage":"stream","event":"open","stream_id":"19ac3f2e8b5d1a2b-42/2","request_id":"19ac3f2e8b5d1a2b-42","state":"[\"anthropic_messages\",\"openai_chat\"]","client":{"path":"/v1/messages","stream":true},"request":{"method":"POST","url":"https://relay.example.com/v1/chat/completions"},"response":{"status":200,"headers":{"content-type":"text/event-stream"}}}
+<- {"v":1,"seq":20,"response":{"headers":{"content-type":"text/event-stream"}},"abort_tail":"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"stream conversion aborted\"}}\n\n"}
+-> {"v":1,"seq":21,"stage":"stream","event":"data","stream_id":"19ac3f2e8b5d1a2b-42/2","data":"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n"}
+<- {"v":1,"seq":21,"data":"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_chatcmpl-1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-4o\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n"}
+-> {"v":1,"seq":30,"stage":"stream","event":"close","stream_id":"19ac3f2e8b5d1a2b-42/2"}
+<- {"v":1,"seq":30,"data":"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"}
+```
+
+```json
+-> {"v":1,"seq":31,"stage":"stream","event":"abort","stream_id":"19ac3f2e8b5d1a2b-45/1","reason":{"code":"upstream_body_interrupted"}}
+<- {"v":1,"seq":31,"data":"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"upstream stream interrupted\"}}\n\n"}
+```
+
+Only a `persistent` program can declare `stream`. One worker owns a stream from `open` until
+`close` or `abort`, so it may keep parser state in memory for that time. Workers holding a
+stream do not count toward `pool_max`: the number of processes is the pool size plus the number
+of concurrent streams.
+
+| Event | Message | Reply |
 |---|---|---|
-| `stage` | `"retry"` | Ignored |
-| `method`, `url`, `headers`, `body` / `body_b64` | The client's original request, exactly what the `"request"` stage received (not your earlier output) | The request for this attempt, with the same rules as the request side |
-| `retry` | Object: `attempt` (the attempt about to be made, 2 or more), `status` (the previous attempt's upstream status; absent after a network error), `error` (a short reason the previous attempt failed) | Ignored |
-| `request_id`, `state`, `worker_id`, `extra` | As on the other stages | `state` sets the saved value |
-| `error` | Never present | aProxy keeps the previous attempt's request |
+| `open` | `stream_id` (`<request_id>/<attempt>`), `request_id`, `state`, `client`, `request` (`method`, `url`), `response` (`status`, `headers`) | May patch `response` status and headers, give `abort_tail`, give first `data`. Once the response headers have already been sent to the client, a status or headers patch is ignored. |
+| `data` | `stream_id`, `data` or `data_b64` | `data` or `data_b64`: the bytes to pass on. A reply with neither passes on nothing, which is how a program buffers until it has a whole event. |
+| `close` | `stream_id` | Final `data`, if any. Sent when the upstream ended normally. |
+| `abort` | `stream_id`, `reason` (`{"code"}`) | A protocol-correct error ending in `data`. Sent when the upstream broke off, an inner layer failed, or the client left. |
 
-- Use it for failover: after a failure, pick another key or channel. Keep what you need across
-  attempts in `state` (for example the keys already tried); in `persistent` mode the worker's own
-  memory works too.
-- A failed call (error reply, timeout, bad output, crash) does not end the request, because aProxy
-  never gives up retrying: it sends the request it sent last time and logs one warn per request.
-  Only the `"request"` stage can fail a request.
-- The official binary handles a retry envelope exactly like a request (it carries `method`), so with
-  `retry` in the stages each retry goes through its routing and key rotation again.
-- Replying with the envelope unchanged sends the client's untransformed request, so only add
-  `retry` to the stages of a program that handles this stage.
-- The whole original body travels to you on every retry. Retries back off up to
-  `retry.max_backoff_secs`, so the rate is bounded, but a large body costs a large envelope each
-  time.
+- **Piece borders are not event borders.** One `data` value may hold half an SSE event or
+  several; keep the unfinished tail until the next piece.
+- Bytes arrive decoded; aProxy removes `content-length` and `content-encoding` on output.
+- `abort.reason.code` is the attempt's failure code when the upstream broke off, `format_error`
+  or `format_fail` when an inner layer failed, and `client_gone` when the client disconnected
+  (the reply is then discarded). Treat unknown codes as a plain abort.
+- **`abort_tail`** is what aProxy writes to the client if *this* layer dies mid-stream and it is
+  the outermost stream layer. As long as the outermost layer can still answer, the ending is
+  whatever it returns for `abort` (nothing, if it returns no bytes). Bytes that inner layers
+  return for `abort` are discarded: only the outermost layer speaks the client's protocol.
+- A response with no body to deliver (HEAD, 204, 304) opens no stream.
+- A non-streaming upstream response also goes through `stream` when that is the stage the
+  program declared: the JSON body arrives as `data` pieces after `open`. By then the status
+  and headers are committed, so the program must decide at `open` what headers the converted
+  entity needs, and can only signal a late problem inside the body.
+- If an optional layer fails mid-stream, later pieces skip it. If a required one does, aProxy
+  stops reading the upstream and sends `abort` to the layers outside it.
+- An open breaker blocks only new streams (`open`); running streams continue.
 
-### error
-
-Reply `{"headers": {}, "error": "<reason>"}` to fail one request without failing the process. Keep
-running afterwards: a persistent worker that replies with `error` stays in the pool. The reason
-reaches the user:
-
-- Request side: the request fails with `422` `x-aproxy-error: format_rejected`, and the error
-  message is `format '<name>' rejected the request: <reason>`; `details` names `format` (the
-  entry's `name`) and `stage`. If keepalive headers were already sent, the same error arrives as a
-  final SSE `event: error` frame instead (behaviors.md, After the commit).
-- Response side: the client receives the upstream response unchanged, and the daemon log records
-  `响应转换失败，透传上游原始响应` ("response transform failed; passing the upstream response
-  through") with the reason.
-
-aProxy never reads your exit code. What it sees is whether a line arrived: a process that exits or
-crashes without replying fails the request with `502` `format_failed`, `details.kind` `died`, and
-the message `format '<name>' failed (died): format 进程意外退出且无输出` ("format process
-exited unexpectedly without output"); your reason is lost.
-
-## When aProxy calls you
-
-- **Request side:** once per client request, after aProxy has buffered the body and before the
-  first upstream attempt. Every retry replays the transformed request unchanged, including the key
-  you chose. aProxy retries upstream 4xx and 5xx responses as well as network errors (a request
-  that matches a `[[retry.rules]]` entry stops when its `max_attempts` is reached), so a request
-  you converted into something the upstream rejects is retried indefinitely rather than failing.
-- **Response side:** only for the upstream response aProxy accepts as successful, just before it
-  is replayed to the client. Error responses never reach you, including a final error that a retry
-  rule passes through.
-- **Heartbeat side:** only for a format whose `stages` include `heartbeat`, once per keepalive tick
-  while a keepalive response waits (see "Heartbeat stage").
-- **Keepalive:** for a request that uses the keepalive channel (a streaming request, by default),
-  aProxy sends the client skeleton headers (`200`, `text/event-stream`) and heartbeats whenever a
-  keepalive interval (default 15 s) passes without a result, including time spent in your request
-  transform and, for SSE responses, your response transform. Once those headers are out, only your
-  response `body` takes effect and header changes are ignored. A request-side failure after that
-  point reaches the client as a final SSE `event: error` frame carrying the same error JSON that a
-  `422` `format_rejected` or a `502` `format_failed` response would have had, instead of an HTTP
-  status (behaviors.md, After the commit).
-
-## Samples
-
-Request side, in (shown wrapped; on the wire it is one line):
+## heartbeat
 
 ```json
-{"url":"https://api.anthropic.com/v1/messages","method":"POST",
- "headers":{"anthropic-version":"2023-06-01","content-type":"application/json","x-api-key":"sk-client"},
- "body":"{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":100,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
- "worker_id":2,"extra":"","stage":"request","request_id":"01a1e0eef745bd28-42"}
+-> {"v":1,"seq":40,"stage":"heartbeat","request_id":"19ac3f2e8b5d1a2b-42","heartbeat":{"beat":3,"elapsed_ms":45000,"attempt":2,"last_failure":{"code":"upstream_status","details":{"status":529}}},"client":{"path":"/v1/messages","stream":true},"data":": keepalive\n\n"}
+<- {"v":1,"seq":40,"data":"event: ping\ndata: {\"type\":\"ping\"}\n\n"}
 ```
 
-Request side, out (moved to another endpoint with a channel key; body rewritten; the chosen channel
-saved for the response side):
+Sent at each keepalive beat of a retry-mode request while the client waits; never for forward
+requests. The innermost layer receives the instance's configured `keepalive.heartbeat` bytes,
+each outer layer the output of the one inside it.
+
+- `heartbeat`: `beat` (from 1), `elapsed_ms` since waiting began, `attempt`, and `last_failure`
+  when there was one. `client` is on every beat, enough to tell the protocol.
+- Reply `data` or `data_b64` to replace the bytes; omit both to keep them. `state` in the reply
+  is ignored: beats run alongside other stages and would overwrite their state.
+- End the output on an SSE event boundary (a blank line), and invent nothing the client's
+  parser would take for model output.
+- A beat must be answered before the next one. A late or failed beat sends the input bytes;
+  a beat still unanswered at the next beat replaces the worker and counts toward the breaker.
+  When the real response arrives, a beat in flight is abandoned and never delays it.
+
+## notify
 
 ```json
-{"url":"https://relay.example.com/v1/chat/completions","method":"POST","headers":{"authorization":"Bearer sk-relay-1","content-type":"application/json"},"body":"{\"model\":\"gpt-4o\",\"max_tokens\":100,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}","state":"{\"channel\":\"relay\"}"}
+-> {"v":1,"seq":51,"stage":"notify","event":"request_end","request_id":"19ac3f2e8b5d1a2b-42","digest":"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08","client":{"path":"/v1/messages","stream":true},"delivery":"retry","upgraded":true,"attempts":2,"upstream_status":200,"stream_completed":true,"duration_ms":48210,"outcome":"ok","code":null}
+<- {"v":1,"seq":51}
 ```
 
-Response side, in (no `method`; `url` is the rewritten request URL):
+Sent once after a request that entered the chain has ended (delivered, client gone, or terminal
+error), to each program that declared `notify`. Only `persistent` programs may declare it.
+
+| Field | Meaning |
+|---|---|
+| `event` | `"request_end"`. Ignore events you do not know. |
+| `state` | The program's last state for the request; the state is discarded afterwards. |
+| `digest` | Only with grade `digest`; `null` when the request body was incomplete. |
+| `delivery`, `upgraded` | Final delivery mode, and whether the request was upgraded from forward to retry on the way. |
+| `attempts` | Total attempts. |
+| `upstream_status` | Status of the last upstream response, or `null`. |
+| `stream_completed` | Whether a streaming response ended normally; `null` for a non-streaming one. |
+| `duration_ms` | Total lifetime of the request. |
+| `outcome`, `code` | As in request records: `outcome` is `"ok"` on success; `code` is the terminal code, `null` on success. |
+
+- Reply with the empty reply `{"v","seq"}`; nothing in it is used except `seq`.
+- Notifications never slow the data path. They are sent only when the program has an idle
+  worker and no data-path message is waiting, they have a fixed 2-second deadline, and they are
+  dropped (oldest first) when the queue exceeds 1024 entries or 16 MiB, or while a breaker is
+  open. A learning program must therefore tolerate gaps; a digest seen again soon is a useful
+  second signal that the earlier request failed.
+- `notify` failures count toward a separate breaker, so a broken observer path does not close
+  the program's decision path.
+
+## report
 
 ```json
-{"url":"https://relay.example.com/v1/chat/completions",
- "headers":{"content-type":"application/json","x-request-id":"req_1"},
- "body":"{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"choices\":[...]}",
- "worker_id":0,"extra":"",
- "stage":"response","request_id":"01a1e0eef745bd28-42","state":"{\"channel\":\"relay\"}"}
+"report": {"summary": "anthropic_messages -> openai_chat", "actions": [{"type": "protocol_convert", "from": "anthropic_messages", "to": "openai_chat"}]}
 ```
 
-Failure, either side:
+A report tells people what the program did; it appears in logs, request records and the desktop
+UI. `summary` is one English sentence of at most 512 characters; `actions` holds at most 32
+entries, each string cut to 256 characters. Both `summary` and `actions` are required when a
+report is given. A malformed report or action is dropped with a warning and never invalidates
+the rest of the reply.
 
-```json
-{"headers":{},"error":"model gpt-nope matches no channel"}
-```
+| `type` | Fields |
+|---|---|
+| `protocol_convert` | `from`, `to` (open vocabulary: `anthropic_messages`, `openai_chat`, `openai_responses`, ...) |
+| `key_select` | `key_id`: an id or alias, never the key |
+| `route` | `channel`, optional `model_from`, `model_to` |
+| `header_edit` | `name`, `op` (`"set"` or `"remove"`) |
+| `body_edit` | `path` (JSON Pointer), `op` (`"set"` or `"remove"`) |
+| `custom` | `label` (required) |
+
+Every action may carry a `label`. An unknown `type` is displayed by its `label`. Never put
+credentials, header values or body content in a report.
+
+## Delivery: forward and retry
+
+Every request has a delivery mode:
+
+- **`retry`** (the default): aProxy reads the whole request body, buffers each response and
+  replays it once it is judged good, retries failures by its rules and `decide`, and can send
+  keepalive heartbeats.
+- **`forward`**: the response is passed on as it arrives (true streaming). No keepalive, no
+  `heartbeat` or `retry` stage, and no `decide` after a success.
+
+The starting mode is the instance's `delivery` setting. A `request` reply can change it with
+`delivery`; the first program in the chain to give one wins and later programs see it in their
+input. Once response headers have gone to the client (a retry request's keepalive may commit a
+200 while the chain is still running), the mode is fixed and a later `forward` is ignored. So a
+program that wants to choose `forward` belongs at the front of the chain and should answer fast,
+which a digest-only program does naturally.
+
+**Upgrade within a request.** When a forward request's attempt fails before any byte was
+written to the client, aProxy asks `decide` once. A `retry` vote turns the request into a retry
+request on the spot (that attempt counts as the first). `stop` with a `response` returns it.
+Otherwise the forward default applies: the upstream response is passed through, or the client
+gets 502 `upstream_failed` (502 `format_failed` when a request-side program failed). After bytes
+were written there is no upgrade; a stream that breaks midway ends as the stream stage dictates.
+
+**Request bodies.** A request that starts in retry mode is always read in full first. A request
+that starts in forward mode (instance `delivery = "forward"`) is streamed straight to the
+upstream unless a program asked for `full` or `digest` at `request`, or some program declared
+`decide` (the body must be kept for a possible resend).
+
+## Errors, `required` and the circuit breaker
+
+A **process-level failure** is: cannot start, I/O error, exit midway, timeout, protocol error
+(`seq`), invalid output. It is different from `fail`, which is a valid reply.
+
+- One failure in `request` or `retry`: for a required program the attempt fails with
+  `format_error` and is retried; an optional program is skipped, its input passing on unchanged.
+- Each `[[format]]` entry has a breaker per instance. Consecutive process-level failures on
+  data-path messages are counted across requests and stages; any valid reply (including `fail`
+  and an abstention) resets the count. At `breaker_failures` (default 5; 0 disables the breaker)
+  it opens: idle workers are killed and no new message is sent to the program for
+  `breaker_cooldown_secs` (default 30).
+
+| While open | `required = true` | `required = false` |
+|---|---|---|
+| request, retry | The request ends at once: 503 `format_unavailable` (or the same code as a terminal SSE event), no retries | The layer is skipped; the request uses the default delivery mode |
+| decide | No vote | Same |
+| response, stream `open` | The layer is skipped | Same |
+| heartbeat | The beat uses the input bytes | Same |
+| notify | Dropped and counted | Same |
+
+- After the cooldown one message is let through as a probe on a fresh worker. Success closes the
+  breaker; failure reopens it for another cooldown.
+- Network failures never trip a breaker: an unreachable upstream is still retried forever.
+- State is visible in `aproxy status --json` under `formats[]` (`breaker`, `notify_breaker`,
+  `notify_dropped_total`).
+- With an optional judging program unavailable, requests follow the instance's default
+  delivery. Keep that default at `retry`: then losing the judge costs only true streaming. With
+  default `forward`, requests are not retried while the judge is down, and `aproxy doctor`
+  warns with `forward_default_unguarded`.
 
 ## Security
 
-- The request envelope carries the client's credentials (`authorization`, `x-api-key`, cookies)
-  and, if the instance sets `api_key` or credential headers, those too. Do not log them, and do
-  not send them anywhere except the upstream in `url`. When you switch a request to another
-  upstream, build the credential headers from scratch rather than editing the client's table, so
-  the client's key never reaches a third party.
-- Response headers you return go straight to the client. If your request side injected an
-  upstream key, make sure no credential header comes back on the response side; the official
-  aproxy-format removes `authorization`, `x-api-key`, `cookie` and `proxy-authorization` from
-  responses for this reason.
-- aProxy starts `command` directly with `args` as an argument vector, never through a shell, so
-  configuration values cannot inject shell commands. Your program should apply the same care to
-  anything it runs.
+- Request messages carry the client's credentials and any the instance adds. Do not log them,
+  and send them nowhere but the upstream in `url`. When a program moves a request to another
+  origin, remove every credential header (authorization, API keys, cookies) and attach that
+  origin's own; do not carry the query string across origins unless a parameter is known to be
+  needed there.
+- Response headers a program returns go to the client. Never let an upstream credential header
+  travel back; a `fail` without `response` on the response side passes the upstream response
+  through, headers included.
+- `report`, `fail.reason` and stderr are for people and logs: no keys, no header values, no
+  conversation content.
+- aProxy starts `command` directly with `args` as an argument vector, never through a shell.
+  Put secrets a program needs in the entry's `env`, which is write-only in every aProxy read
+  path, rather than in `args`.

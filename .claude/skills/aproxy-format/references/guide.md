@@ -1,317 +1,335 @@
 # Writing a format program
 
-How to build a format program that aProxy can run: choosing spawn or persistent mode, the duties
-every program has, loop templates, testing without aProxy, and wiring the program into an
-instance. Read it before writing a new program or when adapting one to aProxy. Field-level rules
-for the envelope are in protocol.md; complete working programs are in examples.md.
+How to write, test and install a program of your own. Read it after SKILL.md when the official
+roles do not cover the job. The exact shape of every frame is in [protocol.md](protocol.md).
 
 ## Contents
 
-- [Choose a mode](#choose-a-mode)
-- [Protocol duties](#protocol-duties)
-- [Loop templates](#loop-templates)
-- [Language pitfalls](#language-pitfalls)
+- [Plan the program](#plan-the-program)
+- [Choose a process model](#choose-a-process-model)
+- [A minimal program](#a-minimal-program)
+- [A deciding program with state](#a-deciding-program-with-state)
 - [Techniques](#techniques)
+- [Language pitfalls](#language-pitfalls)
 - [Test without aProxy](#test-without-aproxy)
 - [Configure it in aProxy](#configure-it-in-aproxy)
 
-## Choose a mode
+## Plan the program
 
-| | `spawn` (default) | `persistent` |
+Answer three questions before writing code; they become the hello reply.
+
+1. **Which stages?** Subscribe to the fewest that do the job: every stage is one more pipe
+   round trip on the request path.
+
+   | Goal | Stages |
+   |---|---|
+   | Change the URL, headers or body sent upstream | `request` (add `retry` to choose again on each retry) |
+   | Switch key or channel after a failure | `request`, `retry` |
+   | Decide whether and when to retry, or replace an error | `decide` |
+   | Rewrite a whole non-streaming response | `response` |
+   | Rewrite a response as it streams | `stream` |
+   | Send protocol-native keepalives | `heartbeat` |
+   | Learn from how requests ended | `notify` (with `request` or `decide` to act on it) |
+
+2. **How much request body per stage?** `none` when you only touch the URL and headers or only
+   vote, `digest` when you need to recognise the same request again, `full` when you read or
+   rewrite the body. Asking for less keeps megabytes off your pipe and conversation content out
+   of your process.
+3. **What must be remembered, and for how long?** Within one request: `state`. Across requests:
+   process memory, with the constraints in [Techniques](#techniques).
+
+One program should do one job. Two small programs in a chain each get their own worker pool
+and breaker, so a slow or broken one does not take the other down.
+
+## Choose a process model
+
+| | `process = "spawn"` (default) | `process = "persistent"` |
 |---|---|---|
-| Process lifetime | One process per conversion; aProxy kills it after reading the reply | A pool of long-lived workers, each looping over lines |
-| Concurrency | One conversion at a time per stage (request, response and heartbeat each) | Up to `pool_max` (default 4) at once; further messages wait for a free worker |
-| State between requests | None: every request sees a fresh process | Kept in each worker's memory |
-| `worker_id` | Always `0` | Slot number `0 .. pool_max - 1` |
-| Cost per request | A process start | A pipe round trip |
+| Lifetime | A new process per message: hello, one message, EOF | Workers answer messages until EOF; up to `pool_max` (default 4) run at once |
+| Cost | Process start plus handshake on every message | One handshake per worker |
+| Stages | All except `stream` and `notify` | All |
+| Memory between messages | None | Per worker; see below |
 
-Use `persistent` when the program keeps state (a rotation counter, a loaded config file, a cache)
-or when the instance serves concurrent requests; use `spawn` for a quick stateless script on a
-lightly used instance.
+Use `persistent` unless the program is rarely called. The loop is the same in both modes (read
+a line, answer it, until EOF), so a program written for one runs in the other.
 
-How the persistent pool behaves, so you can reason about your program's lifetime:
+## A minimal program
 
-- Workers start on demand, not at instance start, and an idle worker is reused before a new one is
-  started. Requests beyond `pool_max` queue; the time spent queueing does not count toward
-  `timeout_secs`.
-- A worker idle for `worker_idle_secs` (default 300; `0` = never) is killed. State held in
-  memory is lost with it, so a rotation counter restarts from the beginning.
-- A worker that times out, breaks the protocol, or dies is killed and removed; the next request
-  starts a fresh one.
-- If an idle worker turns out to be dead when reused (it exited while idle), aProxy retries that
-  request once on a fresh worker. If the fresh worker also dies without replying, the request
-  fails; aProxy does not keep restarting a program that cannot start.
-
-Write the loop form regardless of mode. A program that loops until EOF also works in spawn mode,
-where aProxy simply kills it after one reply.
-
-## Protocol duties
-
-| Duty | If you break it |
-|---|---|
-| Read stdin one line at a time; one line is one envelope | aProxy keeps stdin open between requests, so a program that reads all of stdin (`sys.stdin.read()`, `json.load(sys.stdin)`) never gets past the read; the request times out. |
-| Write exactly one envelope line per request, and nothing else, to stdout | Protocol error: the worker is evicted and the request fails. |
-| Flush stdout after every reply | aProxy waits until `timeout_secs` (default 30), kills the worker, and the request fails with a timeout. |
-| Send logs and diagnostics to stderr | aProxy discards stderr, so this is safe; on stdout they break the pairing. |
-| Always include `headers` in a reply, and write the body back even if unchanged | A missing `headers` fails the parse; a missing body sends an empty body. |
-| Report a per-request failure as `{"headers":{},"error":"..."}` and keep running | A crash or exit without a reply fails the request with no reason and costs a process restart. |
-| Exit when stdin reaches EOF | aProxy normally kills its workers itself, but if the aProxy process dies without cleaning up (crash, forced stop), EOF is the only signal your worker gets; a program that ignores it keeps running as an orphan. |
-| Catch errors around the conversion, not just around parsing | An unhandled exception is a crash (see above). |
-
-The exact messages each violation produces are in troubleshooting.md.
-
-## Loop templates
-
-Each template echoes the envelope unchanged. Put your conversion in `transform`; the presence of
-`method` tells you which side you are on (see protocol.md).
-
-### Python
+It tags every upstream request with a header. It asks for no request body, handles `retry` the
+same way as `request`, and answers anything else with an empty reply.
 
 ```python
 #!/usr/bin/env python3
+"""Minimal protocol 1 format program: tags every upstream request with a header."""
 import json
 import sys
 
-# Windows pipes default to the system code page; force UTF-8 both ways.
+# Windows pipes default to the system code page; force UTF-8 both ways, and
+# keep "\n" from being rewritten to "\r\n".
 sys.stdin.reconfigure(encoding="utf-8")
-sys.stdout.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+
+HELLO = {
+    "protocol": 1,
+    "stages": ["request", "retry"],
+    # Only headers are edited, so do not ask for the body.
+    "request_body": {"request": "none", "retry": "none"},
+    "features": [],
+    "name": "tag-team",
+    "version": "1.0.0",
+}
 
 
-def transform(env: dict) -> dict:
-    return env
+def handle(msg):
+    """Return the reply fields for one stage message; {} changes nothing."""
+    if msg["stage"] in ("request", "retry"):
+        headers = dict(msg["request"]["headers"])  # a headers patch replaces the whole table
+        headers["x-team"] = "search"
+        return {
+            "request": {"headers": headers},
+            "report": {
+                "summary": "tagged the request",
+                "actions": [{"type": "header_edit", "name": "x-team", "op": "set"}],
+            },
+        }
+    return {}
 
 
-for line in sys.stdin:  # the loop ends at EOF and the program exits
-    try:
-        reply = transform(json.loads(line))
-    except Exception as e:
-        reply = {"headers": {}, "error": f"{type(e).__name__}: {e}"}
+for line in sys.stdin:  # one message per line, until aProxy closes stdin
+    msg = json.loads(line)
+    reply = dict(HELLO) if msg["stage"] == "hello" else handle(msg)
+    reply["v"], reply["seq"] = 1, msg["seq"]  # every reply echoes seq
     sys.stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 ```
 
-### Node.js
+What the skeleton gets right, and why each matters:
 
-```javascript
-#!/usr/bin/env node
-const readline = require('readline');
+- It answers `hello` with every stage it implements. aProxy only sends the stages configured for
+  the entry, but refuses to start if a configured stage is missing from this list.
+- It copies the header table before adding to it. A `headers` patch replaces the table, so
+  returning only the new header would drop `content-type` and the credentials.
+- It writes one compact line per message and flushes. Pretty-printed JSON is several lines, and
+  an unflushed reply looks like a timeout.
+- It ends when the `for` loop sees EOF. That is how aProxy retires workers.
+- It never prints anything else to stdout. Use `print(..., file=sys.stderr)` for diagnostics;
+  those lines land in the instance log as `format[<name>] ...`.
 
-function transform(env) {
-  return env;
+## A deciding program with state
+
+This one stops the retries when the upstream reports that the prompt exceeds the context
+window, and answers the client in the client's own protocol. It shows three things: carrying a
+fact from `request` to `decide` in `state`, abstaining, and a stop with a response.
+
+```python
+#!/usr/bin/env python3
+"""Stops retrying when the upstream says the prompt is too long, in the client's protocol."""
+import json
+import re
+import sys
+
+sys.stdin.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+
+HELLO = {
+    "protocol": 1,
+    "stages": ["request", "decide"],
+    # request: only the path is needed; decide: the response preview is enough.
+    "request_body": {"request": "none", "decide": "none"},
+    "features": [],
+    "name": "context-guard",
+    "version": "1.0.0",
 }
+TOO_LONG = re.compile(r"context.{0,20}(length|window)|prompt is too long", re.I)
 
-const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-rl.on('line', (line) => {
-  let reply;
-  try {
-    reply = transform(JSON.parse(line));
-  } catch (e) {
-    reply = { headers: {}, error: String(e) };
-  }
-  process.stdout.write(JSON.stringify(reply) + '\n');
-});
-// No exit handler needed: when stdin closes, Node exits after pending writes drain.
+
+def handle(msg):
+    stage = msg["stage"]
+    if stage == "request":
+        # Remember which protocol the client speaks. The decide message may be
+        # answered by another worker, so the fact travels in state, not in memory.
+        anthropic = msg["client"]["path"].startswith("/v1/messages")
+        return {"state": json.dumps({"anthropic": anthropic})}
+    if stage == "decide":
+        body = (msg.get("response") or {}).get("body") or ""
+        if msg["outcome"] != "failure" or not TOO_LONG.search(body):
+            return {}  # no vote: the next program, or aProxy's own rules, decide
+        state = json.loads(msg.get("state") or "{}")
+        text = "The conversation is longer than the model's context window."
+        if state.get("anthropic"):
+            error = {"type": "error", "error": {"type": "invalid_request_error", "message": text}}
+        else:
+            error = {"error": {"type": "invalid_request_error", "code": "context_length_exceeded", "message": text}}
+        return {
+            "decision": "stop",
+            "response": {
+                "status": 400,
+                "headers": {"content-type": "application/json"},
+                "body": json.dumps(error),
+            },
+            "report": {
+                "summary": "context too long; stopped retrying",
+                "actions": [{"type": "custom", "label": "stop: context too long"}],
+            },
+        }
+    return {}
+
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    reply = dict(HELLO) if msg["stage"] == "hello" else handle(msg)
+    reply["v"], reply["seq"] = 1, msg["seq"]
+    sys.stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
 ```
 
-Both templates pass `scripts/test_format.py`, including the EOF check.
+Notes on it:
 
-### Rust
+- The response is written from scratch. Never echo the upstream's body or headers to the client
+  from a program: they can hold another provider's error format or credentials.
+- `decide` is answered within `decide_timeout_secs` (default 2 seconds). Keep it to a lookup and
+  a comparison; a slow vote is treated as no vote.
+- The official `policy` role covers this case with a rule table and no code
+  ([examples.md](examples.md)); write a program only when the rule needs logic.
 
-The `aproxy-envelope` crate (crates.io) is the envelope type aProxy itself uses, so parsing,
-serialization and the `body`/`body_b64` checks match aProxy exactly. While 0.2.0 is in
-pre-release the crate's interface can still change, so pin it exactly, as the `Cargo.toml` line
-below does; once 0.2.0 is released, switch to `"0.2"`.
+## Techniques
 
-```rust
-// Cargo.toml: aproxy-envelope = "=0.2.0-alpha.2"
-use std::io::{BufRead, Write};
+**Carry facts in `state`.** `state` is a string (serialize your own JSON into it) of at most
+64 KiB, private to your program and the request. Set it in any reply and it comes back on every
+later message of that request, on any worker. Keep it small and free of secrets: store a key's
+id, never the key.
 
-use aproxy_envelope::TransformEnvelope;
+**Memory across requests.** A counter, a cooldown table or a learned history lives in one
+process only. If every request must see it, configure `pool_max = 1` and `worker_idle_secs = 0`
+(never retire the worker for being idle). Even then the worker is replaced after a timeout, a
+protocol error or an open breaker, so losing the memory may make decisions worse but must never
+make a reply wrong.
 
-fn transform(env: TransformEnvelope) -> Result<TransformEnvelope, String> {
-    // body_bytes() decodes body or body_b64; set env.body or env.body_b64 on the way out.
-    Ok(env)
-}
+**Reject with `fail`.** `{"fail":{"retry":false,"reason":"..."}}` ends the request with 422
+`format_rejected` and your reason, or with the response you attach. `"retry":true` fails only
+this attempt and lets the retry loop continue, which is the right answer for "every key is
+cooling down right now". Do not exit or raise: a crash loses the reason and counts toward the
+breaker.
 
-fn main() {
-    let stdin = std::io::stdin();
-    let mut out = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break }; // EOF or a broken pipe ends the loop
-        let reply = TransformEnvelope::from_line(line.trim_end())
-            .map_err(|e| e.to_string())
-            .and_then(transform)
-            .unwrap_or_else(|reason| TransformEnvelope {
-                error: Some(reason),
-                ..Default::default()
-            });
-        let text = reply
-            .to_line()
-            .unwrap_or_else(|_| r#"{"headers":{},"error":"serialize failed"}"#.to_string());
-        let _ = writeln!(out, "{text}");
-        let _ = out.flush();
-    }
-}
-```
+**Catch your own errors.** Wrap the handler so that an unexpected exception becomes a `fail`
+reply with the right `seq` (or an empty reply in `decide`, `heartbeat` and `notify`, where
+abstaining is the safe answer) and the loop goes on.
 
-### Other languages
+**Change behavior for one request with `overrides`.** A `request` or `retry` reply can set
+`{"overrides":{"timeouts":{"first_byte_secs":900}}}`; the allowed keys arrive in hello's
+`overrides`.
 
-Any language works the same way: read a line with a growable buffer (envelope lines can be many
-megabytes), parse it with a JSON library, write one compact line, flush. In C or C++ use
-`getline` rather than a fixed `fgets` buffer, and remember that C/C++ have no standard base64 for
-`body_b64`.
+**Choose retries per failure.** In `retry`, `retry.last_failure.code` and
+`retry.last_response` (status and headers, including `retry-after`) say what happened; pick
+another key or channel accordingly and record your choice in `state`. A `retry` message arrives
+only when the retry segment is actually rerun; when a `decide` program voted `reroute: false`,
+aProxy resends the previous request and your program is not called.
+
+**Streams.** In `stream`, one worker owns the stream from `open` to `close`/`abort`, so parser
+state can live in a dictionary keyed by `stream_id`. A `data` piece can end in the middle of an
+SSE event: append to a buffer, emit only complete events, and reply with no `data` when nothing
+is complete yet. Give an `abort_tail` at `open` (a complete error event in the client's
+protocol) so that the client gets a clean ending even if your process dies. Answer `abort`
+with an error ending, never with a normal end-of-stream.
+
+**Never guess `client.stream`.** It is omitted when aProxy does not know yet. If the program
+must know at `request`, ask for `digest` or `full` there.
+
+**One program, several entries.** The same command can appear in several `[[format]]` entries
+with different `args` and `stages`; each entry has its own workers, state and breaker.
 
 ## Language pitfalls
 
 | Language | Pitfall | Fix |
 |---|---|---|
-| Python on Windows | Pipes use the system code page (GBK and the like): non-ASCII text is garbled or raises `UnicodeEncodeError` | `reconfigure(encoding="utf-8")` on stdin and stdout, as in the template |
-| Python | `print` without `flush=True`, or `sys.stdout.write` without `flush()` | Flush after each reply |
-| bash + jq | `jq` pretty-prints over several lines by default | Always `jq -c` |
-| Node.js | Mixing `console.log` debugging with replies on stdout | `console.error` for diagnostics |
+| Python on Windows | Pipes use the system code page: non-ASCII text is garbled or raises `UnicodeEncodeError` | `reconfigure(encoding="utf-8")` on stdin and stdout, as in the template |
+| Python | Reading with `sys.stdin.read()` or `json.load(sys.stdin)` waits for EOF, which a persistent worker never gets between messages | Iterate over lines |
+| Python | `print` without `flush=True` | Flush after each reply |
+| bash + jq | `jq` pretty-prints over several lines by default | Always `jq -c`; and remember the hello line needs its own reply |
+| Node.js | `console.log` debugging mixed with replies on stdout | `console.error` for diagnostics |
 | Go | `bufio.Scanner` stops at lines over 64 KiB | `scanner.Buffer(make([]byte, 0, 1<<20), 512<<20)` or `bufio.Reader.ReadString('\n')` |
 | Go, Rust, C | Buffered writer never flushed | Flush after each line |
-| PowerShell | `ConvertTo-Json` is multi-line by default and truncates nesting at depth 2 | `ConvertTo-Json -Compress -Depth 100`; set `[Console]::OutputEncoding` to UTF-8 |
-| Any | A library or runtime prints a banner or warning on stdout at startup | Silence it or redirect it to stderr; the first line aProxy reads must be your reply |
+| PowerShell | `ConvertTo-Json` is multi-line and truncates nesting at depth 2 | `ConvertTo-Json -Compress -Depth 100`; set `[Console]::OutputEncoding` to UTF-8 |
+| Any | A runtime or library prints a banner or warning on stdout at startup | Silence it or send it to stderr; the first line aProxy reads must be the hello reply |
+| Any | JSON library writes absent values as `null` | Harmless: in replies `null` means omitted |
 
-## Techniques
+In Rust, the `aproxy-envelope` crate has typed messages and replies for protocol 1 (`Message`,
+`Stage`, `Reply`, `HelloReply`, the HTTP objects and patches), so a program can deserialize a
+line into `Message` and serialize a `Reply`.
 
-**One program for both sides.** Branch on whether `method` is present and configure the same
-command in two `[[format]]` entries, one with `stages = ["request"]` and one with
-`stages = ["response"]`. Each stage still runs in its own process pool, so the two halves cannot
-share memory; carry anything the response side needs in the URL (the response envelope's `url` is
-your request-side URL) or derive it from configuration.
-
-**Pass settings through `env`.** The `[[format]]` table has no `extra` key any more; the envelope's
-`extra` field is empty when the format is configured from the file. Put configuration in `env`
-(JSON is the most flexible encoding) and read it with `os.environ` / `process.env`. `env` values
-are never displayed by `aproxy config show`, which also keeps secrets out of the printed config;
-a file path in `env` works for anything long. Keep secrets out of `args`: command lines are
-visible to other processes on the machine.
-
-**Rewrite the URL, keep the path when it matters.** To change only the host, replace the scheme
-and host and keep the rest of `url`, so every endpoint the client calls (for example
-`/v1/messages/count_tokens` beside `/v1/messages`) keeps its own path. Replacing the whole URL
-sends every request to the same endpoint.
-
-**Spread rotation across workers.** Start each worker's key index at `worker_id` (examples.md, Key
-rotation).
-
-**SSE bodies.** A streaming response arrives as the complete event text. Split it on blank lines
-into events, convert each `data:` payload, and join the result with the same framing. Keep the
-`content-type: text/event-stream` header.
-
-**Binary bodies.** Check for `body_b64` before assuming `body` exists. Return binary output in
-`body_b64`.
+Messages can be many megabytes when a stage asked for the `full` body, so read lines into a
+growable buffer in any language.
 
 ## Test without aProxy
 
-`scripts/test_format.py` (in this skill) starts your program, sends one mock envelope, prints the
-reply, then closes stdin and checks that the program exits. The mock bodies are realistic
-Anthropic Messages, OpenAI Chat and OpenAI Responses payloads with non-ASCII text, so encoding
-problems show up immediately.
+`scripts/test_format.py` plays aProxy's side of the pipe. It sends `hello`, checks the reply,
+sends a realistic message for each stage the program declared, checks every reply (one line,
+`seq`, field shapes, patch rules, vote ranges), threads `state` from reply to message as aProxy
+does, then closes stdin and checks that the program exits.
 
 ```bash
-# request side: a client request envelope
-python scripts/test_format.py --format-spec anthropic --command python -- my_format.py
+# every stage the program declares; arguments after -- go to the program
+python scripts/test_format.py --command python -- my_format.py
 
-# response side: an upstream response envelope (no method)
-python scripts/test_format.py --side response --format-spec openai-chat --command python -- my_format.py
+# see every frame in both directions
+python scripts/test_format.py -v --command ./my-format
 
-# response side, streaming: the body is a complete SSE event sequence
-python scripts/test_format.py --side response --sse --format-spec anthropic --command ./my-format
+# only some stages, in spawn mode (a fresh process and hello per message)
+python scripts/test_format.py --stage request,retry --process spawn --command ./my-format
 
-# pass configuration the way config.toml env does, in the environment
-ROTATE='{"keys":["sk-a"]}' python scripts/test_format.py --format-spec anthropic --command ./my-format
-# --extra sets the envelope field; config.toml leaves it empty, so use it only for a program
-# that accepts it when run by hand
-python scripts/test_format.py --format-spec anthropic --extra '{"demo":true}' --command ./my-format
-python scripts/test_format.py --format-spec anthropic --body-file payload.bin --command ./my-format
+# OpenAI-shaped client traffic; a converter whose upstream speaks another protocol
+python scripts/test_format.py --protocol openai-chat --upstream anthropic --command ./my-format
+
+# your own request body, addressed to an upstream your program knows
+python scripts/test_format.py --body-file payload.json --url https://relay.example.com/v1/messages --command ./my-format
 ```
 
-| Flag | Meaning |
-|---|---|
-| `--format-spec` | `anthropic`, `openai-chat` or `openai-responses`: protocol of the mock body (required) |
-| `--side` | `request` (default), `retry` (the same request before a retry, with a mock `retry` object; for a request format with `retry` in its stages), `response`, or `heartbeat` (the first tick of a format with the `heartbeat` stage, body included; the reply body is checked against the event-boundary rule) |
-| `--sse` | Response side only: an SSE body instead of JSON |
-| `--command` | Program to run (required); its arguments go after `--` |
-| `--url` | Envelope `url` (default: the protocol's usual endpoint) |
-| `--extra` | Envelope `extra` (default empty). config.toml has no `extra` key, so a format it launches always receives `""`; use the environment for configuration |
-| `--worker-id` | Envelope `worker_id` (default 0) |
-| `--body-file` | Use a file as the body; non-UTF-8 content is sent as `body_b64` |
-| `--raw` | Print the reply as received instead of pretty-printing it |
-| `--timeout` | Seconds to wait for the reply (default 10) |
+Exit code 0 means every check passed. Lines marked `warn` are things aProxy tolerates but
+ignores or drops (a malformed report, `state` in a heartbeat reply). The program's stderr is
+shown at the end. Pass the program its configuration the way config.toml will: arguments after
+`--`, secrets in the environment.
 
-The harness reports `[FAIL]` when the program cannot start, never replies, dies, or replies with
-invalid JSON, and `[WARN]` for an `error` reply or a program that ignores EOF. It prints a
-checklist for the rest but does not verify it: confirm by eye that `headers` is present, the body
-is there, and nothing else was printed.
-
-To check the one-line rule directly, pipe two envelopes in and count the lines out:
+To look at one exchange by hand, pipe two lines in:
 
 ```bash
-E='{"method":"POST","url":"https://up.example.com/v1/x","headers":{},"body":"{}","worker_id":0,"extra":""}'
-printf '%s\n' "$E" "$E" | python my_format.py | wc -l   # expect 2
+printf '%s\n' \
+  '{"v":1,"seq":0,"stage":"hello","protocols":[1],"aproxy_version":"0.2.0","name":"x","process":"persistent","stages":["request"],"worker_id":0,"features":[],"overrides":[]}' \
+  '{"v":1,"seq":1,"stage":"request","request_id":"r-1","delivery":"retry","request":{"method":"POST","url":"https://relay.example.com/v1/messages","headers":{"content-type":"application/json"},"body":"{\"model\":\"m\",\"messages\":[]}"},"client":{"path":"/v1/messages","stream":false}}' \
+  | python my_format.py
 ```
 
-Also feed an input that should fail and confirm you get an `error` reply rather than a crash.
+Expect exactly two lines back, with `seq` 0 and 1.
+
+The harness checks the protocol, not the meaning of your output. For a converter, also send
+the result through the target SDK's parser or a real endpoint once. To see a whole chain work
+together, including the official roles, use `aproxy-format try` ([examples.md](examples.md)).
 
 ## Configure it in aProxy
 
-Formats are per instance, set as `[[format]]` entries in that instance's config.toml (there is no
-global default and no command-line flag):
-
 ```toml
 [[format]]
-name = "convert-request"
-command = "/usr/bin/python3"
-args = ["/home/me/formats/convert.py"]
+name = "tag-team"                 # shown in logs, errors and reports
+command = "python"                # bare name: <home>/bin/ first, then PATH
+args = ["formats/tag_team.py"]    # relative paths resolve against the aProxy home
 process = "persistent"
 stages = ["request", "retry"]
-env = { CONVERT = '{"model": "gpt-4o"}' }
-
-[[format]]
-name = "convert-response"
-command = "/usr/bin/python3"
-args = ["/home/me/formats/convert.py"]
-process = "persistent"
-stages = ["response"]
-env = { CONVERT = '{"model": "gpt-4o"}' }
+# required = true                 # default; false = skip this layer when the program is broken
+# env = { TEAM_TOKEN = "..." }    # secrets go here, not in args
 ```
 
-`pool_max`, `worker_idle_secs` and `timeout_secs` are shown at their defaults; the full field
-reference is in the aproxy-cli skill, config-toml.md. Points that trip up format authors:
-
-- **The stages are separate entries.** A protocol converter needs both the `request` and
-  `response` stages; with only `request`, responses reach the client unconverted. Each entry has
-  its own `args` and `env`, and at most one format may serve a given stage in this version.
-- **Use absolute paths.** aProxy runs `command` directly, without a shell. A bare name is looked
-  up on PATH; a relative path resolves against the daemon's working directory, which is wherever
-  the instance happened to be started. `~/` at the start of `command` expands to the user's home
-  directory, but `args` and `env` are passed untouched, so a script path in `args` must be
-  absolute. On Windows, write paths with forward slashes or in single-quoted TOML strings
-  (`'C:\fmt\convert.py'`); a bare command name is found on PATH only as an `.exe`.
-- **Stateful programs need `process = "persistent"`.** In spawn mode every message starts a fresh
-  process, so a rotation counter is always zero.
-- **Not with `delivery = "forward"`.** An instance in forward-only mode (set in config.toml, or
-  inherited from settings.json `defaults.delivery`) refuses to start with a format, because it never
-  buffers the body; the error is `config_conflict` on `delivery`.
-- **Every request on the instance goes through the format**, including requests your program was
-  not written for (model listing, token counting, `GET` requests with an empty body). Pass those
-  through unchanged or reply with a clear `error`.
-
-Apply the change with `aproxy restart <port|alias>`. Restarting cuts every connection through that
-instance. If you are an agent whose own model traffic goes through it, that includes your session
-and the user's other sessions; ask before restarting it, or try the transformer first on a
-separate instance with its own config file and a spare port (`aproxy start <config path>`).
-
-Confirm it is active:
-
-- `aproxy start` prints a line beginning `外部转换器：请求/响应将交给 format 程序改写` ("external
-  transformer: requests/responses will be rewritten by the format program").
-- The daemon log (`aproxy logs <port|alias>`) records `外部转换器已启用（信封协议交给外部 format 程序改写）`
-  ("external transformer enabled") once per configured side at startup, and
-  `请求已由外部转换器改写` ("request rewritten by the external transformer") with the new URL for
-  every converted request.
-- `aproxy config show` prints each format as aProxy parsed it: `args` values after a secret flag
-  are masked, and `env` is listed by name only, never by value.
+- The order of `[[format]]` entries is the order of the chain on the way upstream; the first
+  entry is nearest the client.
+- Rules aProxy enforces at startup (`config_conflict` otherwise): a program cannot declare both
+  `response` and `stream`; a program declaring `stream` or `notify` must be `persistent`; after
+  the first entry that declares `retry`, every later request-direction entry must declare
+  `retry` too.
+- On Windows `command` must be an executable: `.cmd` and `.bat` files are refused. Put the
+  interpreter in `command` and the script in `args`.
+- Tuning keys: `pool_max` (4), `worker_idle_secs` (300; 0 = never retire), `timeout_secs` (30),
+  `decide_timeout_secs` (2), `breaker_failures` (5; 0 = no breaker), `breaker_cooldown_secs`
+  (30). The full table is in the aproxy-cli skill, `references/latest/config-toml.md`.
+- After editing, run `aproxy doctor` to validate the file, then restart the instance; a format
+  chain is fixed for the life of an instance. A restart cuts the connections going through that
+  instance, so pick a quiet moment.
+- Watch it work with `aproxy logs <port|alias>`: your stderr lines carry the prefix
+  `format[<name>]`, and breaker changes are logged as warnings.

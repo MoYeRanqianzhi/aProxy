@@ -328,3 +328,11 @@ pub fn format_echo_path() -> PathBuf {
     );
     path
 }
+
+/// 实际启动路径的可控时钟副本，只替换服务子进程的运行时，不修改产品的 hello 时限。
+pub fn start_clock_path() -> PathBuf {
+    Path::new(APROXY).with_file_name("examples").join(format!(
+        "format-start-clock{}",
+        std::env::consts::EXE_SUFFIX
+    ))
+}

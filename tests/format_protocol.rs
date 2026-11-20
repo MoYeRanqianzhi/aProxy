@@ -1395,7 +1395,7 @@ fn background_start(
     )
     .unwrap();
     let child = home
-        .cmd()
+        .cmd_with(common::start_clock_path())
         .env("NO_PROXY", "127.0.0.1,localhost")
         .args(["start", "--json", "--config"])
         .arg(&cfg)
@@ -1514,6 +1514,7 @@ async fn startup_probes_run_in_parallel_and_respect_worker_lifetimes() {
         aproxy::daemon::ipc_ping_in(&run, &key).await.unwrap().state,
         aproxy::daemon::InstanceState::Serving
     );
+    std::fs::write(home.path().join("resume-clock"), b"").unwrap();
     let once = frames(&home, "once-obs");
     assert_eq!(once[0]["event"], "hello");
     assert_eq!(once[1]["event"], "eof");
@@ -1540,7 +1541,13 @@ async fn startup_probes_run_in_parallel_and_respect_worker_lifetimes() {
 async fn second_start_waits_for_failed_hello_and_prepare_swap_changes_nothing() {
     let home = TestHome::new();
     let port = free_port();
-    let cfg = layer(&home, "stuck", "'request'", &["no-hello"]);
+    let gate = home.path().join("never-release");
+    let cfg = layer(
+        &home,
+        "stuck",
+        "'request'",
+        &["gate-hello", gate.to_str().unwrap()],
+    );
     let (first, path) = background_start(&home, port, free_port(), &cfg);
     observed_hello(&home, "stuck").await;
     let run = home.path().join("run");
@@ -1554,6 +1561,7 @@ async fn second_start_waits_for_failed_hello_and_prepare_swap_changes_nothing() 
         matches!(err,aproxy::daemon::IpcError::Remote{code,details,..} if code=="invalid_state" && details["state"]=="starting")
     );
     let second = observing_start(&home, &path).await;
+    std::fs::write(home.path().join("advance-hello"), b"").unwrap();
     let original = first.wait_with_output().unwrap();
     let observer = second.wait_with_output().unwrap();
     assert_eq!(
@@ -1628,7 +1636,14 @@ async fn stopping_during_hello_cancels_the_probe_and_child() {
     let home = TestHome::new();
     let port = free_port();
     let obs = serde_json::to_string(&home.path().join("probe-obs")).unwrap();
-    let cfg = layer(&home, "probe", "'request'", &["no-hello"]).replace(
+    let gate = home.path().join("never-release");
+    let cfg = layer(
+        &home,
+        "probe",
+        "'request'",
+        &["gate-hello", gate.to_str().unwrap()],
+    )
+    .replace(
         "env={ ECHO_RECORD=",
         &format!("env={{ ECHO_OBSERVE={obs}, ECHO_RECORD="),
     );
@@ -1666,6 +1681,7 @@ async fn stopping_during_hello_cancels_the_probe_and_child() {
             .await
             .unwrap();
     }
+    std::fs::write(home.path().join("resume-clock"), b"").unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while aproxy::process::process_exited(child_pid) != Some(true) {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

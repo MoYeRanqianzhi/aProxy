@@ -200,7 +200,11 @@ fn main() {
                 wait_gate(std::path::Path::new(arg));
             }
             if mode == "gate-hello" {
-                wait_gate(std::path::Path::new(arg));
+                // 启动中的状态由父测试放行，不让调度暂停或真实的经过时间改变握手结果。
+                let gate = std::path::Path::new(arg);
+                while gate.parent().is_some_and(|p| p.is_dir()) && !gate.is_file() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
             }
             if mode == "reject-with-descendant" {
                 // 只继承 stderr。孙进程由测试直接控制，代理退出不应依赖它先关日志句柄。

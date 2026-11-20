@@ -19,9 +19,9 @@ macro_rules! eprintln {
     }};
 }
 
-mod commands;
-mod server;
-mod util;
+pub(crate) mod commands;
+pub(crate) mod server;
+pub(crate) mod util;
 
 use clap::Parser;
 use std::io::Write as _;
@@ -30,7 +30,7 @@ use aproxy::cli::{Cli, Commands};
 
 use aproxy::settings;
 
-fn main() -> std::process::ExitCode {
+pub(crate) fn main() -> std::process::ExitCode {
     // 永久兼容契约 C5（见 aproxy::VERSION_LINE）：安装器以 `<二进制> --version` 认
     // 版本，这一行必须先于一切副作用输出——不切控制台代码页、不读 settings 与
     // home、不建运行时、不拉起续作，以后解析参数之前要读的任何东西（例如按 settings

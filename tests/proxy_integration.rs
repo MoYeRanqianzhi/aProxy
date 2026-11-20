@@ -6223,7 +6223,11 @@ fn watchdog_readiness_does_not_accept_a_starting_ping() {
         .enable_all()
         .build()
         .unwrap();
-    let _daemon = ChildGuard(home.serve_cmd(&cfg).spawn().unwrap());
+    let _daemon = ChildGuard(
+        home.serve_cmd_with(common::start_clock_path(), &cfg)
+            .spawn()
+            .unwrap(),
+    );
     let end = std::time::Instant::now() + Duration::from_secs(5);
     while !observed.is_file() {
         assert!(std::time::Instant::now() < end, "未观察到握手");
@@ -6233,6 +6237,7 @@ fn watchdog_readiness_does_not_accept_a_starting_ping() {
     let early = wait_watchdog_serving(&rt, port, home.path(), Duration::from_millis(100));
     std::fs::write(&gate, b"ready").unwrap();
     let ready = wait_watchdog_serving(&rt, port, home.path(), Duration::from_secs(5));
+    std::fs::write(home.path().join("resume-clock"), b"").unwrap();
     assert_eq!(observed_state, aproxy::daemon::InstanceState::Starting);
     assert!(
         early.is_err(),

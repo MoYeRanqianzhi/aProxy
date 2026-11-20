@@ -274,8 +274,19 @@ pub(super) fn chain(path: &Path, home: Option<&Path>, structural: bool) -> Resul
                 overlay: entry.env.clone(),
                 structural,
             };
-            let role = load(name, &entry.args[1..], &directory, vars)
-                .map_err(|e| format!("第 {} 项的 {name}：{}", i + 1, safe_issue(e)))?;
+            let role = match load(name, &entry.args[1..], &directory, vars) {
+                Ok(role) => role,
+                Err(_) if !structural && !entry.required => {
+                    // 未能读配置或取得凭据的工作进程在 hello 之前退出，不能当作握手不兼容。
+                    layers.push(Layer {
+                        entry,
+                        role: None,
+                        label: name,
+                    });
+                    continue;
+                }
+                Err(e) => return Err(format!("第 {} 项的 {name}：{}", i + 1, safe_issue(e))),
+            };
             if entry
                 .stages
                 .iter()

@@ -844,7 +844,7 @@ fn rehearse(
     req.body = w::Body::from_bytes(raw);
     for layer in chain.layers {
         if external
-            && layer.role.is_none()
+            && layer.label == "external"
             && home.is_none()
             && !Path::new(&layer.entry.command).is_absolute()
         {
@@ -858,11 +858,11 @@ fn rehearse(
             state: None,
             overrides: None,
         };
-        if u.layer.role.is_none() && !external {
+        if u.layer.role.is_none() && (!external || u.layer.label != "external") {
             trace(
                 t.out,
                 "hello",
-                "external",
+                u.layer.label,
                 Value::Null,
                 Value::Null,
                 vec!["skipped"],
@@ -1146,6 +1146,22 @@ mod tests {
                 assert!(rows.is_empty());
             }
         }
+    }
+    /// 必需密钥缺失时可选官方程序无法启动；它不能变成外部程序，也不能终止整条链。
+    #[test]
+    fn optional_unavailable_official_worker_is_skipped() {
+        let p = "[[format]]\ncommand='aproxy-format'\nargs=['keys','--config','pool']\nstages=['request']\nrequired=false";
+        let (result, rows) = trace_sample(
+            p,
+            json!({"path":"/","body":{}}),
+            &[(
+                "pool",
+                "[[pool]]\norigin='https://relay.test'\nheader='authorization'\nkeys=[{id='a',env='APROXY_OFFLINE_MISSING_CREDENTIAL_TEST_379'}]",
+            )],
+        );
+        result.unwrap();
+        assert_eq!(rows[0]["role"], "keys");
+        assert_eq!(rows[0]["changed"], json!(["skipped"]));
     }
     /// 规则按声明先后生效，不对没有上游头的故障套状态规则；覆盖、直通与成功分别说明来源。
     #[test]

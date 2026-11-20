@@ -269,12 +269,16 @@ impl Context {
 pub struct Client {
     /// Original request path including the query.
     pub path: String,
-    /// Whether the client requested streaming.
-    pub stream: bool,
+    /// Whether the original client requested streaming under the configured trigger.
+    /// Omitted when unknown at dispatch, never a substitute for `false`. A duplex
+    /// response can start while the upload is still in progress. Request layers that
+    /// need the exact value before routing should negotiate `digest` or `full`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
 }
 impl Client {
     /// Construct the wire object from its required context.
-    pub fn new(path: String, stream: bool) -> Self {
+    pub fn new(path: String, stream: Option<bool>) -> Self {
         Self { path, stream }
     }
 }
@@ -440,6 +444,9 @@ pub struct DecideMessage {
     /// Request identity and state.
     #[serde(flatten)]
     pub context: Context,
+    /// Original client metadata; independent of any upstream rewrites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<Client>,
     /// Completed attempt number.
     pub attempt: u32,
     /// Elapsed time since request start.
@@ -472,6 +479,7 @@ impl DecideMessage {
     ) -> Self {
         Self {
             context,
+            client: None,
             attempt,
             elapsed_ms,
             delivery,
@@ -491,6 +499,9 @@ pub struct ResponseMessage {
     /// Request identity and private state.
     #[serde(flatten)]
     pub context: Context,
+    /// Original client metadata; independent of any upstream rewrites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<Client>,
     /// Final upstream request metadata.
     pub request: RequestMeta,
     /// Response to be delivered after patching.
@@ -501,6 +512,7 @@ impl ResponseMessage {
     pub fn new(context: Context, request: RequestMeta, response: Response) -> Self {
         Self {
             context,
+            client: None,
             request,
             response,
         }
@@ -541,6 +553,9 @@ pub struct StreamOpen {
     /// Request identity and private state.
     #[serde(flatten)]
     pub context: Context,
+    /// Original client metadata; independent of any upstream rewrites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<Client>,
     /// Final upstream request metadata.
     pub request: RequestMeta,
     /// Status and headers before stream conversion.
@@ -551,6 +566,7 @@ impl StreamOpen {
     pub fn new(context: Context, request: RequestMeta, response: Response) -> Self {
         Self {
             context,
+            client: None,
             request,
             response,
         }
@@ -601,6 +617,9 @@ pub struct Completion {
     /// Identity, final state and negotiated digest.
     #[serde(flatten)]
     pub context: Context,
+    /// Original client metadata; independent of any upstream rewrites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<Client>,
     /// Final mode of this request.
     pub delivery: Delivery,
     /// Whether this request switched from forward to retry.
@@ -629,6 +648,7 @@ impl Completion {
     ) -> Self {
         Self {
             context,
+            client: None,
             delivery,
             upgraded: false,
             attempts,

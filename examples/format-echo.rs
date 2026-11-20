@@ -176,6 +176,9 @@ fn main() {
             if std::env::var_os("ECHO_DECIDE_FULL").is_some() {
                 r["request_body"] = json!({"decide":"full"});
             }
+            if mode == "digest-only" {
+                r["request_body"] = json!({"request":"digest","retry":"digest","decide":"digest"});
+            }
             if mode == "metadata-only" {
                 r["request_body"] = json!({"request":"none","retry":"digest"});
             }

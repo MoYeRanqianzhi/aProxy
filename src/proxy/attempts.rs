@@ -544,7 +544,7 @@ pub(super) async fn run_attempts(
         let mut failed = None;
         if reroute && let (Some(c), Some(local)) = (chain.as_mut(), local.as_mut()) {
             rec.phase(Phase::Transforming);
-            match c.run(local, &mut req, attempt, r).await {
+            match c.run(local, &mut req, attempt, r, &mut None).await {
                 Err(ChainError::Disconnected) => return,
                 Ok(changed) => {
                     r.prepare_upstream_headers(&mut req.headers);

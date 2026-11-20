@@ -393,9 +393,11 @@ pub(super) async fn chain(
         let mut head = wire::Response::new(status.as_u16());
         head.headers = transform::headers_to_btreemap(&headers);
         head.headers.remove("content-encoding");
+        let mut start = wire::StreamOpen::new(ctx.context(name), meta.clone(), head);
+        start.client = Some(ctx.wire_client());
         let open = wire::Stage::Stream(wire::StreamMessage::new(
             id.clone(),
-            wire::StreamEvent::Open(wire::StreamOpen::new(ctx.context(name), meta.clone(), head)),
+            wire::StreamEvent::Open(start),
         ));
         let first = p.open_stream(open.clone(), false).await;
         let result = match first {

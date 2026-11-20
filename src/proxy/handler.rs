@@ -94,113 +94,90 @@ async fn handle(
     // 在本地侧先应用覆盖/追加，避免重试间重复计算
     apply_header_overrides(&mut headers, &state.config);
 
-    // 没有请求阶段的仅转发模式：分支点必须在 read_request_body **之前**——缓冲一旦发生，本模式
-    // 就丢掉了全部意义（内存随负载增长、下游要等请求体读完才见到首字节）；
-    // 同时它位于 requests_total.fetch_add 与 apply_header_overrides **之后**，
-    // 所以 status 的请求计数与鉴权/头改写行为与常规模式完全一致。
-    // 这条路径不进重试循环、保活心跳或错误内容拦截；只有响应方向的 format 需要时才解码或缓冲下载。
+    use crate::config::file::Stage;
+    use axum::body::HttpBody as _;
     let forward = state.config.forward_only_enabled();
-    if forward && !state.has_format(crate::config::file::Stage::Request) {
-        let target_url = upstream_url(&state.config, &uri);
-        // 日志里的 URL 一律经 redact::url：base_url 可能内嵌 user:pass，客户端
-        // 查询串可能带 key（Gemini 式 ?key=），日志常被整段粘贴求助
-        tracing::info!(method = %method, target = %state.history.redacted_url(&target_url), "代理请求（仅转发）");
-        let ctx = (state.has_format(crate::config::file::Stage::Stream)
-            || state.has_format(crate::config::file::Stage::Response))
-        .then(|| {
-            ExchangeCtx::new(
-                trace.request_id.clone(),
-                uri.path_and_query().map_or("/", |p| p.as_str()),
-                accepts_event_stream(req.headers()),
-                trace.rec.clone(),
-            )
+    let formatted = !state.formats.is_empty();
+    let trigger = state.config.keepalive_trigger();
+    // 不含 format 的直通请求沿用转发头取历史摘要；程序眼中的客户端元数据则始终来自入站头。
+    let source = if forward && !formatted {
+        &headers
+    } else {
+        req.headers()
+    };
+    let client_accept = original_accept(source, trigger, formatted);
+    let client_encoding = request_encoding(source, formatted).map(|v| v.into_owned());
+    let target_url = upstream_url(&state.config, &uri);
+    let path_and_query = uri.path_and_query().map_or("/", |p| p.as_str());
+    let head_stream = match trigger {
+        crate::config::KeepaliveTrigger::Accept => Some(client_accept),
+        crate::config::KeepaliveTrigger::Any if client_accept => Some(true),
+        _ if req.body().is_end_stream() || req.body().size_hint().exact() == Some(0) => Some(false),
+        _ => None,
+    };
+    let ctx = formatted.then(|| {
+        ExchangeCtx::new(
+            trace.request_id.clone(),
+            path_and_query,
+            head_stream,
+            trace.rec.clone(),
+        )
+    });
+    // request 只看头时先让它改路由，客户端正文还在连接上。decide 可能要求重发，所以即便
+    // 它自己不要正文也必须先留体。若替换进程的 hello 改为要正文，则派发前再读。
+    let live = forward
+        && !state.has_format(Stage::Decide)
+        && !state.formats.iter().any(|p| {
+            p.entry.has_stage(Stage::Request)
+                && p.negotiated.lock().unwrap().as_ref().is_none_or(|h| {
+                    h.request_body.get("request") != Some(&aproxy_envelope::BodyNeed::None)
+                })
         });
+    let upload = ClientUpload {
+        body: req.into_body(),
+        trigger,
+        accept: client_accept,
+        encoding: client_encoding.clone(),
+    };
+    if live && !state.has_format(Stage::Request) {
+        tracing::info!(method = %method, target = %state.history.redacted_url(&target_url), "代理请求（仅转发）");
         return forward_only_proxy(
             state,
             &method,
             &target_url,
             &headers,
-            ForwardBody::Live(req.into_body()),
-            ctx.as_ref(),
+            ForwardBody::Live(upload),
+            ctx,
             trace,
         )
         .await;
     }
-
-    // 缓冲请求体以支持重试重放；上限 max_body_mb（默认 128 MB，0=不限），
-    // 超出直接 413。disk_cache 开启时超过内存驻留阈值（1 MiB）溢写磁盘，
-    // 大请求体的进程内存在途占用恒定。
-    let formatted = !state.formats.is_empty();
-    let client_accept = original_accept(req.headers(), state.config.keepalive_trigger(), formatted);
-    let client_encoding = request_encoding(req.headers(), formatted).map(|v| v.into_owned());
-    let body_limit = state.config.body_limit_bytes();
-    let history = trace.rec.request_body(request_history_encoding(
-        client_encoding.as_ref(),
-        formatted,
-    ));
-    let (req_body, model) = match read_request_body(
-        req.into_body(),
-        body_limit,
-        state.spool_dir.as_deref(),
-        history,
-    )
-    .await
-    {
-        Ok(b) => b,
-        Err(ReadBodyError::TooLarge) => return body_too_large_response(body_limit, &trace),
-        // 客户端没把请求体发完：不是上游失败，不记「最近错误」
-        Err(ReadBodyError::ClientAborted(e)) => {
-            tracing::error!(code = %"client_body_aborted", error = %e, "读取请求体失败：客户端在上传途中断开");
-            return Terminal::client_body_aborted().into_response(&trace);
-        }
-        Err(ReadBodyError::Storage(e)) => {
-            let terminal = Terminal::local_storage_failed(StorageOp::WriteRequest, &e.to_string());
-            terminal.record_in(&state.stats);
-            tracing::error!(code = %terminal.code(), error = %e, "请求体写入磁盘缓存失败");
-            return terminal.into_response(&trace);
-        }
-    };
-
-    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-    // 是否「保活适用」（走保活通道：先提交响应头、再以 SSE 注释心跳维持连接）：
-    // keepalive 开启且 keepalive_trigger 判定命中。必须在请求转换前判定——
-    // 判定语义是「客户端视角」，转换器改写 Accept/请求体不影响保活选择
-    let keepalive_dur = state.config.keepalive_interval();
-    let keepalive_enabled = state.config.keepalive_enabled() && keepalive_dur.as_secs() > 0;
-    // 「客户端是不是在要一个流」不管保活开没开都判：请求记录的 `stream` 用的是同一个结论
-    let (wants_stream, body_stream) =
-        keepalive_triggered(state.config.keepalive_trigger(), client_accept, &req_body).await;
-    let keepalive_applies = !forward && keepalive_enabled && wants_stream;
-    trace.rec.request_bytes(match &req_body {
-        RequestBody::Memory(bytes) => bytes.len() as u64,
-        RequestBody::Disk { len, .. } => *len,
-    });
-    trace.rec.request_shape(model, wants_stream);
-    if keepalive_applies {
-        trace.rec.keepalive();
-    }
-
-    let req = OutboundRequest {
+    let mut req = OutboundRequest {
         method,
-        target_url: upstream_url(&state.config, &uri),
+        target_url,
         headers,
-        body: req_body,
+        body: RequestBody::Memory(Bytes::new()),
         replacement: None,
         client_encoding,
         client_accept,
-        body_stream,
-        // 交给 format 的信封里是同一个请求标识
-        ctx: (!state.formats.is_empty()).then(|| {
-            ExchangeCtx::new(
-                trace.request_id.clone(),
-                path_and_query,
-                wants_stream,
-                trace.rec.clone(),
-            )
-        }),
+        body_stream: None,
+        ctx,
+    };
+    if live {
+        return forward_after_chain(state, req, Some(upload), trace).await;
+    }
+    let wants_stream = match upload.buffer(&state, &mut req, &trace.rec).await {
+        Ok(stream) => stream,
+        Err(t) => return t.into_response(&trace),
     };
     if forward {
-        return forward_after_chain(state, req, trace).await;
+        return forward_after_chain(state, req, None, trace).await;
+    }
+    let keepalive_applies = state.config.keepalive_enabled()
+        && !state.config.keepalive_interval().is_zero()
+        && wants_stream;
+    if keepalive_applies {
+        trace.rec.keepalive();
     }
     let max_spool_bytes = spool_limit_bytes(&state.config);
 

@@ -7,11 +7,19 @@ use crate::history::{BodyWriter, Phase, Recorder};
 const SHAPE_PREFIX: usize = 64 * 1024;
 
 /// 请求体转发途中顺带做的记录：每一块交给请求历史一份，并留住开头的一段——本模式不缓冲
-/// 请求体，`model` 与 `stream` 只能从这一段里读，`model` 通常就在最前面。请求体流结束或被
+/// 请求体。仅有历史时从这一段取样；格式程序要确切标记时额外顺序扫描到 EOF。请求体流结束或被
 /// 丢弃时，把读到的结果与字节数记进请求记录。
 struct RequestTap {
     rec: Recorder,
     history: Option<BodyWriter>,
+    /// 只改写编码头时，两份历史按各自的编码解读同一串上传字节。
+    sent_history: Option<BodyWriter>,
+    /// 完整上传解析结束时才通知响应方向，不能把没读到当作 false。
+    flag_out: Option<Arc<std::sync::OnceLock<bool>>>,
+    /// 大体通过有界管道交给增量 JSON 解析器，不积攒整个上传；小时直接复用头部样本。
+    parser: Option<(tokio::io::DuplexStream, tokio::task::JoinHandle<bool>)>,
+    /// 上传结束后的解析结果，同时用于程序和请求记录。
+    exact: Option<bool>,
     /// 请求体开头的至多 [`SHAPE_PREFIX`] 字节
     prefix: Vec<u8>,
     /// 已经收到的请求体字节数
@@ -21,13 +29,47 @@ struct RequestTap {
 }
 
 impl RequestTap {
-    fn chunk(&mut self, chunk: &Bytes) {
+    /// 边转发边取样。程序要确切标记时要看到整个 JSON 的结尾，后面的重复键或语法错误也算数。
+    async fn chunk(&mut self, chunk: &Bytes) {
+        if self.flag_out.is_some()
+            && self.parser.is_none()
+            && chunk.len() > SHAPE_PREFIX - self.prefix.len()
+        {
+            let (mut writer, reader) = tokio::io::duplex(SHAPE_PREFIX);
+            let job = tokio::task::spawn_blocking(move || {
+                json_requests_stream(serde_json::Deserializer::from_reader(
+                    std::io::BufReader::new(tokio_util::io::SyncIoBridge::new(reader)),
+                ))
+            });
+            // 解析器遇到非法 JSON 可以提前结束；关闭读端不是上传失败。
+            let _ = writer.write_all(&self.prefix).await;
+            self.parser = Some((writer, job));
+        }
+        if let Some((writer, _)) = &mut self.parser {
+            let _ = writer.write_all(chunk).await;
+        }
+        if let Some(history) = self.sent_history.as_mut() {
+            history.feed_copy(chunk);
+        }
         self.seen += chunk.len() as u64;
         let room = SHAPE_PREFIX.saturating_sub(self.prefix.len());
         self.prefix
             .extend_from_slice(&chunk[..chunk.len().min(room)]);
         if let Some(history) = self.history.as_mut() {
             history.feed_copy(chunk);
+        }
+    }
+    /// 只在客户端上传抵达 EOF 时结算，不让取消的流被认作完整 JSON。
+    async fn finish(&mut self) {
+        if let Some(out) = self.flag_out.take() {
+            let flag = if let Some((writer, job)) = self.parser.take() {
+                drop(writer);
+                job.await.expect("stream flag parser")
+            } else {
+                json_requests_stream(serde_json::Deserializer::from_slice(&self.prefix))
+            };
+            self.exact = Some(flag);
+            let _ = out.set(flag);
         }
     }
 }
@@ -37,8 +79,8 @@ impl Drop for RequestTap {
         use crate::config::KeepaliveTrigger;
         let (model, body_stream) =
             probe_shape(serde_json::Deserializer::from_slice(&self.prefix), true);
-        let body_stream = body_stream == Some(true);
-        // 与缓冲路径同一套判定（见 keepalive_triggered），只是请求体那一半看的是开头一段
+        let body_stream = self.exact.unwrap_or(body_stream == Some(true));
+        // 与缓冲路径同一套判定；没有确切结果时，历史仍按原有的开头样本展示。
         let stream = match self.trigger {
             KeepaliveTrigger::Accept => self.accept_sse,
             KeepaliveTrigger::BodyStream => body_stream,
@@ -81,7 +123,7 @@ impl Drop for ResponseTap {
 /// 没有 request 层就直通；需要完整输入的程序已经检查过上限并保存了最终正文。
 pub(super) enum ForwardBody<'a> {
     /// 尚未读取的客户端上传。
-    Live(Body),
+    Live(ClientUpload),
     /// 请求链改写后的内存或磁盘体，不再记录为客户端原体。
     Prepared(&'a RequestBody),
 }
@@ -89,20 +131,35 @@ pub(super) enum ForwardBody<'a> {
 pub(super) async fn forward_after_chain(
     mut state: AppState,
     mut req: OutboundRequest,
+    mut pending: Option<ClientUpload>,
     trace: RequestTrace,
 ) -> Response {
     let mut chain = RequestChain::new(&req);
     let mut r = Responder::buffered();
     let head = req.method == http::Method::HEAD;
     trace.rec.phase(Phase::Transforming);
-    match chain.run(&mut state, &mut req, 1, &mut r).await {
-        Ok(changed) => record_try(
-            &trace.rec,
-            1,
-            sent_head(&trace.rec, &req).as_ref(),
-            !changed,
-            &req,
-        ),
+    match chain
+        .run(&mut state, &mut req, 1, &mut r, &mut pending)
+        .await
+    {
+        Ok(changed) => {
+            // 正文被替换时，上游不会再拉客户端上传。此时仍需检查原始请求的容量、记录与流标记。
+            if req.replacement.is_some()
+                && let Some(upload) = pending.take()
+                && let Err(t) = upload.buffer(&state, &mut req, &trace.rec).await
+            {
+                return t.into_response(&trace);
+            }
+            if pending.is_none() {
+                record_try(
+                    &trace.rec,
+                    1,
+                    sent_head(&trace.rec, &req).as_ref(),
+                    !changed,
+                    &req,
+                );
+            }
+        }
         Err(ChainError::Stop(stop)) => {
             finish_chain_stop(&state, &mut r, &trace, &req, 1, head, *stop).await;
             return r.into_response(&trace);
@@ -120,13 +177,14 @@ pub(super) async fn forward_after_chain(
         }
     }
     trace.rec.phase(Phase::Attempting);
+    let ctx = req.ctx.take();
     forward_only_proxy(
         state,
         &req.method,
         &req.target_url,
         &req.headers,
-        ForwardBody::Prepared(req.sent_body()),
-        req.ctx.as_ref(),
+        pending.map_or_else(|| ForwardBody::Prepared(req.sent_body()), ForwardBody::Live),
+        ctx,
         trace,
     )
     .await
@@ -138,7 +196,7 @@ pub(super) async fn forward_only_proxy(
     target_url: &str,
     headers: &HeaderMap,
     body: ForwardBody<'_>,
-    ctx: Option<&ExchangeCtx>,
+    mut ctx: Option<ExchangeCtx>,
     mut trace: RequestTrace,
 ) -> Response {
     // 本模式恰好尝试一次：请求一发出就算一次上游尝试
@@ -190,19 +248,20 @@ pub(super) async fn forward_only_proxy(
                 return t.into_response(&trace);
             }
         },
-        ForwardBody::Live(body) => {
-            let tap = RequestTap {
-                history: rec.request_body(body_encoding(
-                    headers
-                        .get(http::header::CONTENT_ENCODING)
-                        .map(|v| v.as_bytes()),
-                )),
-                rec: rec.clone(),
-                prefix: Vec::new(),
-                seen: 0,
-                accept_sse: accepts_event_stream(headers),
-                trigger: state.config.keepalive_trigger(),
-            };
+        ForwardBody::Live(upload) => {
+            let formatted = ctx.is_some();
+            let need_flag = ctx.as_ref().is_some_and(|ctx| ctx.client.stream.is_none())
+                && [
+                    crate::config::file::Stage::Stream,
+                    crate::config::file::Stage::Response,
+                    crate::config::file::Stage::Notify,
+                ]
+                .into_iter()
+                .any(|stage| state.has_format(stage));
+            let flag_out = need_flag.then(|| Arc::new(std::sync::OnceLock::new()));
+            if let Some(ctx) = &mut ctx {
+                ctx.live_stream = flag_out.clone();
+            }
             let sent = rec.sent_head(
                 method.as_str(),
                 target_url,
@@ -211,7 +270,30 @@ pub(super) async fn forward_only_proxy(
                     .filter(|(name, _)| !is_hop_header(name.as_str()))
                     .map(|(name, value)| (name.as_str(), value.as_bytes())),
             );
-            rec.try_started(1, sent.as_ref(), true, None);
+            let sent_encoding = request_encoding(headers, formatted);
+            let changed = formatted && sent_encoding.as_deref() != upload.encoding.as_ref();
+            let sent_history = rec.try_started(
+                1,
+                sent.as_ref(),
+                !changed,
+                request_history_encoding(sent_encoding.as_deref(), formatted),
+            );
+            let tap = RequestTap {
+                history: rec.request_body(request_history_encoding(
+                    upload.encoding.as_ref(),
+                    formatted,
+                )),
+                sent_history,
+                rec: rec.clone(),
+                prefix: Vec::new(),
+                seen: 0,
+                accept_sse: upload.accept,
+                trigger: upload.trigger,
+                flag_out,
+                parser: None,
+                exact: None,
+            };
+            let body = upload.body;
             let flag = too_large.clone();
             let gone_flag = client_gone.clone();
             // unfold 状态 = (上游流, 已见字节数, 请求历史的记录)；产出的就是同一份 chunk（移动，
@@ -223,7 +305,10 @@ pub(super) async fn forward_only_proxy(
                     let gone_flag = gone_flag.clone();
                     async move {
                         // 流结束时 tap 随这个 future 一起被丢弃，请求体的记录就此收尾
-                        let chunk = stream.next().await?;
+                        let Some(chunk) = stream.next().await else {
+                            tap.finish().await;
+                            return None;
+                        };
                         let chunk = match chunk {
                             Ok(c) => c,
                             Err(e) => {
@@ -233,7 +318,7 @@ pub(super) async fn forward_only_proxy(
                                 return Some((Err(e), (stream, seen, tap)));
                             }
                         };
-                        tap.chunk(&chunk);
+                        tap.chunk(&chunk).await;
                         let seen = seen.saturating_add(chunk.len());
                         if seen > limit {
                             flag.store(true, AtomicOrdering::Relaxed);
@@ -270,7 +355,7 @@ pub(super) async fn forward_only_proxy(
             // 太大」比「你断开了」更接近事实、更可操作。两个标记都没置位才是真·上游失败。
             if too_large.load(AtomicOrdering::Relaxed) {
                 rec.try_ended(1, 0, None);
-                return body_too_large_response(limit, &trace);
+                return body_too_large(limit).into_response(&trace);
             }
             // 客户端上传途中断开：**不记 last_error、不打「上游请求失败」**——
             // 那一头根本没有失败，是我们应客户端断开而主动中止了上游请求。
@@ -416,7 +501,7 @@ pub(super) async fn forward_only_proxy(
             streams::Content::Flow(stream.map(|r| r.map_err(streams::End::attempt)).boxed());
         return match streams::chain(
             &state,
-            ctx.expect("response chain context"),
+            ctx.as_ref().expect("response chain context"),
             &meta,
             1,
             status,

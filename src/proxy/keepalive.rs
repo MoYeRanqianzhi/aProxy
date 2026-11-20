@@ -158,7 +158,7 @@ pub(super) fn spawn_dynamic_heartbeat(
             let reply = match turn {
                 Ok(turn) => {
                     let m = aproxy_envelope::HeartbeatMessage::new(
-                        d.ctx.context(&p.entry.name), info.clone(), d.ctx.client.clone(),
+                        d.ctx.context(&p.entry.name), info.clone(), d.ctx.wire_client(),
                         aproxy_envelope::Fragment::from_bytes(bytes.to_vec()),
                     );
                     turn.send_until(aproxy_envelope::Stage::Heartbeat(m), p.entry.timeout_secs, Some((deadline, &gate))).await

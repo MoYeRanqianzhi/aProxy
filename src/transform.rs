@@ -199,6 +199,10 @@ pub(crate) struct ExchangeCtx {
     pub(crate) request_id: Arc<str>,
     /// 客户端路径与流标记不受路由改写影响。
     pub(crate) client: wire::Client,
+    /// 双向转发的上传与下载可同时推进；各阶段在派发时取值，不缓存上游响应头到达时的旧值。
+    pub(crate) live_stream: Option<Arc<std::sync::OnceLock<bool>>>,
+    /// 客户端上传完成后的原始 SHA-256；程序只有明确选择摘要时才会收到它。
+    pub(crate) digest: Option<Arc<str>>,
     /// 只在读取一份状态或写入一个回信时持锁。
     states: Arc<Mutex<BTreeMap<String, String>>>,
     /// 报告写进原请求的同一份记录。
@@ -209,20 +213,38 @@ impl ExchangeCtx {
     pub(crate) fn new(
         request_id: Arc<str>,
         path: &str,
-        stream: bool,
+        stream: impl Into<Option<bool>>,
         rec: crate::history::Recorder,
     ) -> Self {
         Self {
             request_id,
-            client: wire::Client::new(path.into(), stream),
+            client: wire::Client::new(path.into(), stream.into()),
+            live_stream: None,
+            digest: None,
             states: Default::default(),
             rec,
         }
+    }
+    /// 已由请求头或缓冲体决定时直接取值，否则查看并行上传是否已经解析到了 EOF。
+    pub(crate) fn wire_client(&self) -> wire::Client {
+        let mut client = self.client.clone();
+        client.stream = client
+            .stream
+            .or_else(|| self.live_stream.as_ref()?.get().copied());
+        client
     }
     /// 本层只收到自己之前给出的字符串。
     pub(crate) fn context(&self, name: &str) -> wire::Context {
         let mut c = wire::Context::new(self.request_id.to_string());
         c.state = self.states.lock().unwrap().get(name).cloned();
+        c
+    }
+    /// 与普通阶段上下文分开：未协商摘要不发这个键，未完成的上传则用显式 null。
+    pub(crate) fn body_context(&self, name: &str, need: &wire::BodyNeed) -> wire::Context {
+        let mut c = self.context(name);
+        if *need == wire::BodyNeed::Digest {
+            c.digest = Some(self.digest.as_deref().map(str::to_owned));
+        }
         c
     }
     /// 缺省时不改动，显式空串清除状态。

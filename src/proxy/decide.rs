@@ -249,7 +249,12 @@ pub(super) async fn consult(
                 break;
             }
         }
-        let body = if turn.hello().request_body.get("decide") == Some(&wire::BodyNeed::Full) {
+        let need = turn
+            .hello()
+            .request_body
+            .get("decide")
+            .unwrap_or(&wire::BodyNeed::None);
+        let body = if *need == wire::BodyNeed::Full {
             let bytes = match req.sent_body() {
                 RequestBody::Memory(b) => b.to_vec(),
                 RequestBody::Disk { path, .. } => match tokio::fs::read(path).await {
@@ -268,7 +273,7 @@ pub(super) async fn consult(
             wire::Body::Absent
         };
         let mut msg = wire::DecideMessage::new(
-            ctx.context(name),
+            ctx.body_context(name, need),
             attempt,
             elapsed.as_millis() as u64,
             wire::Delivery::Retry,
@@ -284,6 +289,7 @@ pub(super) async fn consult(
             ),
             fallback.clone(),
         );
+        msg.client = Some(ctx.wire_client());
         msg.failure = failure.map(|f| {
             let mut x = wire::Failure::new(f.code.into());
             x.details = Some(f.details.clone());

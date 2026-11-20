@@ -37,7 +37,7 @@ fn request_frame(body: &str) -> Stage {
         wire::Context::new("r".into()),
         wire::Delivery::Retry,
         req,
-        wire::Client::new("/test".into(), false),
+        wire::Client::new("/test".into(), Some(false)),
     ))
 }
 /// 假程序的 state 携带槽号与 pid；顺带核对正文确实经过了管道。
@@ -571,7 +571,7 @@ async fn return_check_distinguishes_stray_bytes_from_clean_eof() {
         wire::Context::new("q".into()),
         wire::Delivery::Retry,
         wire::Request::new("POST".into(), "http://localhost/".into()),
-        wire::Client::new("/".into(), false),
+        wire::Client::new("/".into(), Some(false)),
     ));
     p.exchange(&mut turn.worker, frame, 2, Some(&turn.ticket))
         .await

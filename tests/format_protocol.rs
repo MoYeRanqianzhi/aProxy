@@ -4023,3 +4023,314 @@ async fn decide_log_has_one_source_and_reason_per_effective_vote() {
         );
     }
 }
+
+/// 先收完整次上传，再回一次 503 和之后的 200；不让半途关连接掩盖真实的管道字节数。
+async fn digest_upstream(expected: usize) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use futures_util::StreamExt as _;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let app = axum::Router::new().fallback(move |r: axum::extract::Request| {
+        let count = count.clone();
+        async move {
+            let mut bytes = 0;
+            let mut body = r.into_body().into_data_stream();
+            while let Some(chunk) = body.next().await {
+                bytes += chunk.unwrap().len();
+            }
+            assert_eq!(bytes, expected);
+            if count.fetch_add(1, Ordering::Relaxed) == 0 {
+                http::StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                http::StatusCode::OK
+            }
+        }
+    });
+    let port = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (port, calls)
+}
+
+/// 请求和重试共用原始字节的摘要；以程序实际读到的 JSONL 字节数检查正文没有走入管道。
+#[tokio::test]
+async fn digest_program_gets_the_right_sha256_and_no_body_on_its_pipe() {
+    let home = TestHome::new();
+    let (up, calls) = digest_upstream(4 * 1024 * 1024).await;
+    let cfg = layer(
+        &home,
+        "digest",
+        "'request','retry','decide'",
+        &["digest-only"],
+    );
+    let (client, url) = running(&home, up, &cfg);
+    let response = client
+        .post(url)
+        .body(vec![b'x'; 4 * 1024 * 1024])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    let line_bytes = std::fs::metadata(home.path().join("digest")).unwrap().len();
+    eprintln!("digest worker stdin: {line_bytes} bytes");
+    assert!(
+        line_bytes < 8192,
+        "four messages should carry only metadata, got {line_bytes} bytes"
+    );
+    let seen = frames(&home, "digest");
+    assert_eq!(
+        seen.iter()
+            .map(|f| f["stage"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["hello", "request", "decide", "retry"]
+    );
+    for frame in &seen[1..] {
+        assert_eq!(frame["client"]["stream"], false);
+        assert_eq!(
+            frame["digest"],
+            "baa7a6d36ffa957552df230235c2d51d735f28d49c58a5f3438a3a973a25a37d"
+        );
+        for key in ["body", "body_b64"] {
+            assert!(frame["request"].get(key).is_none());
+        }
+    }
+}
+
+/// 即使前一层已解码并改写请求，后面看到的摘要仍以压缩上传为准，不随 retry 改变。
+#[tokio::test]
+async fn digest_uses_original_compressed_bytes_before_request_rewrites() {
+    use std::io::Write as _;
+    let home = TestHome::new();
+    let (up, _) = digest_upstream(b"replacement".len()).await;
+    let cfg = layer(
+        &home,
+        "rewrite",
+        "'request'",
+        &["reply", r#"{"request":{"body":"replacement"}}"#],
+    ) + &layer(&home, "d", "'request','retry','decide'", &["digest-only"])
+        + &layer(&home, "last", "'request','retry'", &["inspect"]);
+    let (c, url) = running(&home, up, &cfg);
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gzip.write_all(b"original").unwrap();
+    let compressed = gzip.finish().unwrap();
+    let hash = <sha2::Sha256 as sha2::Digest>::digest(&compressed)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(
+        c.post(url)
+            .header("content-encoding", "gzip")
+            .body(compressed)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(frames(&home, "rewrite")[1]["request"]["body"], "original");
+    let messages = frames(&home, "d");
+    assert_eq!(messages.len(), 4);
+    for f in &messages[1..] {
+        assert_eq!(f["digest"], hash);
+        assert!(f["request"].get("body").is_none() && f["request"].get("body_b64").is_none());
+    }
+    for f in &frames(&home, "last")[1..] {
+        assert_eq!(f["request"]["body"], "replacement");
+        assert!(f.get("digest").is_none());
+    }
+}
+
+/// 客户端在上游确认前缀以后才发尾部；在同一请求上核对 request 与 response 所见的标记。
+#[tokio::test]
+async fn metadata_only_forward_request_keeps_the_upload_live() {
+    use futures_util::StreamExt as _;
+    let first = std::sync::Arc::new(tokio::sync::Notify::new());
+    let observed = first.clone();
+    const PREFIX: &str = r#"{"stream":"#;
+    let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+        let first = first.clone();
+        async move {
+            let mut body = req.into_body().into_data_stream();
+            let mut received = Vec::new();
+            while let Some(chunk) = body.next().await {
+                received.extend_from_slice(&chunk.unwrap());
+                if received == PREFIX.as_bytes() {
+                    first.notify_one();
+                }
+            }
+            let doc: Value = serde_json::from_slice(&received).unwrap();
+            doc["stream"].to_string()
+        }
+    });
+    let port = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for (trigger, accept, head) in [
+        ("body_stream", "application/json", None),
+        ("accept", "application/json", Some(false)),
+        ("any", "text/event-stream", Some(true)),
+    ] {
+        let home = TestHome::new();
+        let cfg = format!("delivery='forward'\n[keepalive]\ntrigger='{trigger}'\n")
+            + &layer(&home, "meta", "'request','response'", &["metadata-only"]);
+        let (client, url) = running(&home, port, &cfg);
+        for (suffix, bit) in [
+            ("true }".to_string(), true),
+            ("false}".to_string(), false),
+            (
+                format!(
+                    r#"false,"padding":"{}","stream":true}}"#,
+                    "x".repeat(128 * 1024)
+                ),
+                true,
+            ),
+        ] {
+            let ack = observed.clone();
+            let upload =
+                futures_util::stream::once(async { Ok::<_, std::io::Error>(PREFIX.to_owned()) })
+                    .chain(futures_util::stream::once(async move {
+                        ack.notified().await;
+                        Ok(suffix)
+                    }));
+            let res = client
+                .post(&url)
+                .header("accept", accept)
+                .body(reqwest::Body::wrap_stream(upload))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 200);
+            assert_eq!(res.text().await.unwrap(), bit.to_string());
+            let f = frames(&home, "meta");
+            let req = &f[f.len() - 2];
+            let response = &f[f.len() - 1];
+            assert_eq!(req["stage"], "request");
+            assert_eq!(req["client"]["path"], "/");
+            assert_eq!(req["client"].get("stream"), head.map(Value::Bool).as_ref());
+            assert!(
+                req.get("digest").is_none()
+                    && req["request"].get("body").is_none()
+                    && req["request"].get("body_b64").is_none()
+            );
+            assert_eq!(response["stage"], "response");
+            assert_eq!(response["client"]["stream"], head.unwrap_or(bit));
+            assert_eq!(response["request_id"], req["request_id"]);
+        }
+    }
+}
+
+/// 选择摘要的程序不收正文，但可以在 request 阶段就依赖从完整上传读出的客户端流标记。
+#[tokio::test]
+async fn forward_and_format_start_together_with_digest_programs() {
+    let home = TestHome::new();
+    let (port, _) = upstream(&[200]).await;
+    let cfg = String::from("delivery='forward'\n[keepalive]\ntrigger='body_stream'\n")
+        + &layer(&home, "digest", "'request'", &["digest-only"])
+        + &layer(&home, "other", "'request','stream'", &["digest-only"]);
+    let (client, url) = running(&home, port, &cfg);
+    for bit in [true, false] {
+        let response = client
+            .post(&url)
+            .json(&serde_json::json!({"stream":bit}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        response.bytes().await.unwrap();
+        for name in ["digest", "other"] {
+            let f = frames(&home, name);
+            let last = f.iter().rfind(|f| f["stage"] == "request").unwrap();
+            assert_eq!(last["client"]["stream"], bit);
+            assert_eq!(last["digest"].as_str().unwrap().len(), 64);
+            assert!(
+                last["request"].get("body").is_none() && last["request"].get("body_b64").is_none()
+            );
+            if name == "other" {
+                let open = f.iter().rfind(|f| f["event"] == "open").unwrap();
+                assert_eq!(open["client"], last["client"]);
+            }
+        }
+    }
+}
+
+/// 双向直通：上游先对已收到的请求前缀给出确认，客户端看到响应的第一块以后才给出 JSON 尾部。
+#[tokio::test]
+async fn forward_stream_can_open_before_the_client_finishes_its_upload() {
+    use futures_util::StreamExt as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let home = TestHome::new();
+    const PREFIX: &[u8] = br#"{"stream":"#;
+    let port = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    let app = axum::Router::new().fallback(|req: axum::extract::Request| async move {
+        let mut input = req.into_body().into_data_stream();
+        let mut body = Vec::new();
+        while body.len() < PREFIX.len() {
+            body.extend_from_slice(&input.next().await.unwrap().unwrap());
+        }
+        assert_eq!(body, PREFIX);
+        let start = futures_util::stream::once(async {
+            Ok::<_, std::io::Error>("upstream-ack".to_owned())
+        });
+        let tail = futures_util::stream::once(async move {
+            while let Some(c) = input.next().await {
+                body.extend_from_slice(&c.unwrap());
+            }
+            let doc: Value = serde_json::from_slice(&body).unwrap();
+            Ok(format!("received-{}", doc["stream"]))
+        });
+        axum::body::Body::from_stream(start.chain(tail))
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = String::from("delivery='forward'\nkeepalive.trigger='body_stream'\n")
+        + &layer(&home, "meta", "'request'", &["metadata-only"])
+        + &layer(&home, "convert", "'stream'", &["stream-echo"]);
+    let (_, url) = running(&home, port, &cfg);
+    let addr = url.strip_prefix("http://").unwrap();
+    for (suffix, value) in [("true }", "true"), ("false}", "false")] {
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!(
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            PREFIX.len() + suffix.len()
+        );
+        client.write_all(head.as_bytes()).await.unwrap();
+        client.write_all(PREFIX).await.unwrap();
+        let mut wire = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut buf = [0; 512];
+            while !wire
+                .windows(b"upstream-ack".len())
+                .any(|w| w == b"upstream-ack")
+            {
+                let n = client.read(&mut buf).await.unwrap();
+                assert!(n > 0, "unexpected EOF: {wire:?}");
+                wire.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await
+        .expect("upstream confirmation must reach the client while the upload is live");
+        let stages = frames(&home, "convert");
+        let open = stages.iter().rfind(|f| f["event"] == "open").unwrap();
+        assert_eq!(open["client"], serde_json::json!({"path":"/"}));
+        client.write_all(suffix.as_bytes()).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut wire),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let wire = String::from_utf8(wire).unwrap();
+        assert!(wire.contains(&format!("received-{value}")), "{wire}");
+    }
+}

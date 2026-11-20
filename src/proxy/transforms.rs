@@ -200,8 +200,8 @@ impl RequestChain {
         req: &mut OutboundRequest,
         attempt: u32,
         responder: &mut Responder,
+        pending: &mut Option<ClientUpload>,
     ) -> Result<bool, ChainError> {
-        let ctx = req.ctx.as_ref().expect("format context");
         if self.cursor == state.formats.len() {
             let Some(p) = &self.prefix else {
                 return Ok(false);
@@ -238,8 +238,26 @@ impl RequestChain {
                         Ok(turn) => turn,
                         Err(f) => return Ok(Err(f)),
                     };
-                    self.prepare_body(state, &mut req.body, turn.hello())
-                        .await?;
+                    let need = turn
+                        .hello()
+                        .request_body
+                        .get(stage)
+                        .unwrap_or(&wire::BodyNeed::Full);
+                    if *need != wire::BodyNeed::None
+                        && let Some(upload) = pending.take()
+                    {
+                        let rec = req.ctx.as_ref().expect("format context").rec.clone();
+                        upload
+                            .buffer(state, req, &rec)
+                            .await
+                            .map_err(|t| ChainError::stop(t, None))?;
+                        self.body_stream = req.body_stream;
+                    }
+                    if pending.is_none() {
+                        self.prepare_body(state, &mut req.body, turn.hello())
+                            .await?;
+                    }
+                    let ctx = req.ctx.as_ref().expect("format context");
                     let mut input = self.input.clone();
                     // 前缀留程序给的原值；保活可被后续覆盖开关，每次派发再叠加当时的代理头。
                     if identity {
@@ -247,33 +265,35 @@ impl RequestChain {
                             .headers
                             .insert("accept-encoding".into(), "identity".into());
                     }
-                    let bytes = match self.body.as_deref().unwrap_or(&req.body) {
-                        RequestBody::Memory(b) => b.to_vec(),
-                        RequestBody::Disk { path, .. } => {
-                            tokio::fs::read(path).await.map_err(|e| {
-                                ChainError::stop(
-                                    Terminal::local_storage_failed(
-                                        StorageOp::ReadRequest,
-                                        &e.to_string(),
-                                    ),
-                                    None,
-                                )
-                            })?
-                        }
-                    };
-                    self.body_stream.get_or_insert_with(|| {
-                        json_requests_stream(serde_json::Deserializer::from_slice(&bytes))
-                    });
-                    input.body = wire::Body::from_bytes(bytes);
+                    if *need == wire::BodyNeed::Full {
+                        let bytes = match self.body.as_deref().unwrap_or(&req.body) {
+                            RequestBody::Memory(b) => b.to_vec(),
+                            RequestBody::Disk { path, .. } => {
+                                tokio::fs::read(path).await.map_err(|e| {
+                                    ChainError::stop(
+                                        Terminal::local_storage_failed(
+                                            StorageOp::ReadRequest,
+                                            &e.to_string(),
+                                        ),
+                                        None,
+                                    )
+                                })?
+                            }
+                        };
+                        self.body_stream.get_or_insert_with(|| {
+                            json_requests_stream(serde_json::Deserializer::from_slice(&bytes))
+                        });
+                        input.body = wire::Body::from_bytes(bytes);
+                    }
                     let m = wire::RequestMessage::new(
-                        ctx.context(name),
+                        ctx.body_context(name, need),
                         if state.config.forward_only_enabled() {
                             wire::Delivery::Forward
                         } else {
                             wire::Delivery::Retry
                         },
                         input,
-                        ctx.client.clone(),
+                        ctx.wire_client(),
                     );
                     let frame = if self.stage == Stage::Retry {
                         wire::Stage::Retry(wire::RetryMessage::new(
@@ -295,6 +315,7 @@ impl RequestChain {
                     .ok_or(ChainError::Disconnected)??
                 {
                     Ok((reply, headers)) => {
+                        let ctx = req.ctx.as_ref().expect("format context");
                         if self.stage == Stage::Request
                             && reply
                                 .delivery
@@ -313,6 +334,12 @@ impl RequestChain {
                         }
                         ctx.absorb(name, reply.state);
                         if let Some(overrides) = reply.overrides {
+                            if pending.is_none()
+                                && self.body_stream.is_none()
+                                && overrides.contains_key("keepalive")
+                            {
+                                self.body_stream = Some(request_body_wants_stream(&req.body).await);
+                            }
                             self.apply_overrides(state, overrides, responder);
                         }
                         if let Some(f) = reply.fail {
@@ -573,7 +600,8 @@ pub(super) async fn transform_response_layer(
                     current.headers.remove("content-encoding");
                 }
                 current.body = wire::Body::from_bytes(raw);
-                let m = wire::ResponseMessage::new(ctx.context(name), meta.clone(), current);
+                let mut m = wire::ResponseMessage::new(ctx.context(name), meta.clone(), current);
+                m.client = Some(ctx.wire_client());
                 turn.send(wire::Stage::Response(m), p.entry.timeout_secs)
                     .await
             }

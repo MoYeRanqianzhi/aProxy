@@ -505,6 +505,7 @@ async fn request_body_dropped_mid_upload_leaves_no_file() {
             usize::MAX,
             Some(dir.path()),
             None,
+            None,
         );
         tokio::pin!(fut);
         // 逐次 poll：文件出现后再推进一段时间，让溢写写完、future 停到
@@ -1003,7 +1004,9 @@ async fn queued_format_calls_only_read_the_spool_after_admission() {
         let mut chain = RequestChain::new(&req);
         let mut responder = Responder::buffered();
         {
-            let mut run = std::pin::pin!(chain.run(&mut state, &mut req, 1, &mut responder));
+            let mut upload = None;
+            let mut run =
+                std::pin::pin!(chain.run(&mut state, &mut req, 1, &mut responder, &mut upload));
             let mut response = std::pin::pin!(transform_response_if_configured(
                 &response_state,
                 &response_req,

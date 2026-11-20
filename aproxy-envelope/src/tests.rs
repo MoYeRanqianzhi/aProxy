@@ -177,6 +177,17 @@ fn hello_checks_only_negotiated_body_need_keys() {
     assert!(serde_json::from_value::<HelloReply>(hello).is_err());
 }
 
+/// Unknown stream intent is absent, never a false boolean or an explicit null.
+#[test]
+fn client_stream_distinguishes_unknown_from_false() {
+    for stream in [None, Some(false), Some(true)] {
+        let client = Client::new("/upload".into(), stream);
+        let frame = serde_json::to_value(&client).unwrap();
+        assert_eq!(frame.get("stream"), stream.map(Value::Bool).as_ref());
+        assert_eq!(serde_json::from_value::<Client>(frame).unwrap(), client);
+    }
+}
+
 /// Non-exhaustive objects must remain constructible without downstream struct literals.
 #[test]
 fn public_constructors_and_retry_input() {
@@ -217,7 +228,7 @@ fn public_constructors_and_retry_input() {
             Context::new("id".into()),
             Delivery::Retry,
             Request::new("POST".into(), "https://example.test/".into()),
-            Client::new("/".into(), false),
+            Client::new("/".into(), Some(false)),
         ),
         Retry::new(2, Failure::new("upstream_status".into()), 80),
     );

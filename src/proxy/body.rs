@@ -123,6 +123,7 @@ pub(super) async fn read_request_body(
     limit: usize,
     spool_dir: Option<&Path>,
     mut history: Option<crate::history::BodyWriter>,
+    mut digest: Option<&mut sha2::Sha256>,
 ) -> Result<(RequestBody, Option<String>), ReadBodyError> {
     // 客户端声明了长度时按它预留（封顶到内存驻留阈值）：缓冲不必一次次翻倍搬家，读完时
     // 容量正好等于长度——这份内存接着要与请求历史共用，多出来的容量会白白算在历史头上。
@@ -152,6 +153,10 @@ pub(super) async fn read_request_body(
         if limit != usize::MAX && total + chunk.len() > limit {
             drain_rejected_body(&mut body).await;
             return Err(ReadBodyError::TooLarge);
+        }
+        // 散列的是客户端原始字节，不是后面的解码体、代理改写体或历史里保留的副本。
+        if let Some(h) = digest.as_deref_mut() {
+            sha2::Digest::update(h, &chunk);
         }
         match &mut disk {
             Some((file, _, len)) => {
@@ -331,12 +336,76 @@ impl Drop for RequestBody {
     }
 }
 
+/// 尚未读取的上传和决定客户端视角的原始头。请求链改写路由或头也不能改变这份输入。
+pub(super) struct ClientUpload {
+    /// 网络流只消费一次；需要重放时改用内存或磁盘体。
+    pub(super) body: Body,
+    /// 只按实例的初始触发器判定 client.stream，不接受程序反向改写。
+    pub(super) trigger: crate::config::KeepaliveTrigger,
+    /// 入站 Accept 的 SSE 标记，不看目标服务器的头覆盖。
+    pub(super) accept: bool,
+    /// 客户端发来的编码链，供请求历史按原始字节解码。
+    pub(super) encoding: Option<HeaderValue>,
+}
+impl ClientUpload {
+    /// 在重放、正文或摘要真正需要时接管网络流；先按原始字节记历史与摘要，再供各层改写。
+    pub(super) async fn buffer(
+        self,
+        state: &AppState,
+        req: &mut OutboundRequest,
+        rec: &crate::history::Recorder,
+    ) -> Result<bool, Terminal> {
+        use crate::config::file::Stage;
+        let formatted = req.ctx.is_some();
+        let history = rec.request_body(request_history_encoding(self.encoding.as_ref(), formatted));
+        let limit = state.config.body_limit_bytes();
+        let mut digest = (formatted
+            && [Stage::Request, Stage::Retry, Stage::Decide, Stage::Notify]
+                .into_iter()
+                .any(|stage| state.has_format(stage)))
+        .then(sha2::Sha256::default);
+        let (body, model) = read_request_body(self.body, limit, state.spool_dir.as_deref(), history, digest.as_mut()).await.map_err(|e| match e {
+            ReadBodyError::TooLarge => body_too_large(limit),
+            ReadBodyError::ClientAborted(e) => {
+                tracing::error!(code = %"client_body_aborted", error = %e, "读取请求体失败：客户端在上传途中断开");
+                Terminal::client_body_aborted()
+            }
+            ReadBodyError::Storage(e) => {
+                let t = Terminal::local_storage_failed(StorageOp::WriteRequest, &e.to_string());
+                t.record_in(&state.stats);
+                tracing::error!(code = %t.code(), error = %e, "请求体写入磁盘缓存失败");
+                t
+            }
+        })?;
+        let (stream, flag) = keepalive_triggered(self.trigger, self.accept, &body).await;
+        rec.request_bytes(match &body {
+            RequestBody::Memory(b) => b.len() as u64,
+            RequestBody::Disk { len, .. } => *len,
+        });
+        rec.request_shape(model, stream);
+        req.body = body;
+        req.body_stream = flag;
+        if let Some(ctx) = &mut req.ctx {
+            ctx.client.stream = Some(stream);
+            ctx.digest = digest.map(|h| {
+                use std::fmt::Write as _;
+                let mut hex = String::with_capacity(64);
+                for byte in sha2::Digest::finalize(h) {
+                    write!(hex, "{byte:02x}").expect("writing to a string");
+                }
+                hex.into()
+            });
+        }
+        Ok(stream)
+    }
+}
+
 /// 请求体超限的 413 终态：判定、日志与响应收敛在一处，缓冲路径与仅转发路径共用。
-pub(super) fn body_too_large_response(body_limit: usize, trace: &RequestTrace) -> Response {
+pub(super) fn body_too_large(body_limit: usize) -> Terminal {
     tracing::warn!(
         code = %"request_too_large",
         limit_bytes = body_limit,
         "请求体超出上限"
     );
-    Terminal::request_too_large(body_limit).into_response(trace)
+    Terminal::request_too_large(body_limit)
 }

@@ -1553,6 +1553,10 @@ aproxy desktop                  W5
   - 下一层看到的头表，就是会发给上游的那一份：名字小写，aproxy 自己管的头与不合法的头已经去掉。
 - **`delivery`**：输入是当前的投递方式；回信可以给 `forward` 或 `retry`，链上第一个给出的生效（§10.10）。
 - **`client`**：客户端视角的路径与是否流式，链上每一层看到的都一样。
+  `stream` 在 aproxy 还不知道时省略（2026-11-20 补）：forward 请求的体直接流向上游（§10.10）、而是否流式只能从体里看出来
+  （`keepalive.trigger` 要看体）时，request 阶段的程序收到的 `client` 没有 `stream`。从请求头就能定的照常给出。
+  省略表示不知道，不表示不是流式；需要确切答案的程序在 request 阶段要 `digest` 或 `full`，aproxy 就会先读完请求体。
+  同一个请求之后的阶段（response、stream、heartbeat、decide、notify）里，体已经读过，`stream` 总是给出。
 - **retry 阶段**的输入多一个 `retry` 对象：`{"attempt":3,"last_failure":{"code","details"},"elapsed_ms"}`，其中 `attempt` 是即将进行的尝试序号。
 - **`overrides`**：键是 config.toml 的键，范围见 hello 的 `overrides`。
   - 回信是宽容的读者（§1.1）：不认识的键或非法的值被忽略并告警，不让请求因此失败。

@@ -116,7 +116,7 @@ pub struct Route {
 }
 /// 针对路径的每一层解码都检查边界；已编码的分隔符也不能把普通段变成父段。
 /// 八层后仍有可解码字符时保守拒绝，限制重复扫描的成本。实际转发始终使用未解码的路径。
-fn safe_child_path(path: &[u8]) -> bool {
+pub(super) fn safe_child_path(path: &[u8]) -> bool {
     let unsafe_layer = |p: &[u8]| {
         p.iter().any(|b| *b == b'\\' || b.is_ascii_control())
             || p.split(|b| *b == b'/').any(|s| matches!(s, b"." | b".."))

@@ -139,7 +139,7 @@ impl Convert {
             if !d.path_prefix.is_empty()
                 && (!d.path_prefix.starts_with('/')
                     || d.path_prefix.contains(['?', '#', '\\'])
-                    || d.path_prefix.split('/').any(|v| matches!(v, "." | "..")))
+                    || !crate::route::safe_child_path(d.path_prefix.as_bytes()))
             {
                 return Err("目的端路径前缀无效");
             }
@@ -512,5 +512,23 @@ impl Convert {
             _ => return Err(Fault::new("不支持的流事件", "unsupported stream event")),
         };
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// 点段不能经 URL 归一化变成整站匹配；包含点号的普通段和非 ASCII 路径不受影响。
+    #[test]
+    fn mapping_prefix_rejects_encoded_traversal() {
+        for (prefix, valid) in [
+            ("/tenant/%2e%2E", false),
+            ("/tenant/.%2e", false),
+            ("/tenant/%252e", false),
+            ("/租户/%2efile", true),
+        ] {
+            let mut c: Convert = toml::from_str(&format!("from='auto'\nto='auto'\n[[upstream]]\norigin='https://relay.test'\nprotocol='openai_chat'\npath_prefix='{prefix}'")).unwrap();
+            assert_eq!(c.validate().is_ok(), valid, "{prefix}");
+        }
     }
 }

@@ -22,8 +22,7 @@
 |---|---|---|
 | t06-format | format 一线到 alpha.4：九个阶段（B10a、B10b、B10c、B10d、B11、W2c 的四段） | 第一段到第五段（B10a、B10b decide、B10c stream 与 forward 过链、B10d 按请求选投递方式与 notify、B11 官方 aproxy-format 改说协议 1 并删去旧信封）做完，gate 过了，都已挑进 master 并推送；第六段（W2c：convert 与 heartbeat）在做，开工前先修第四段审查的 7 条 P1（任务书 Revision 19）。原会话 2026-11-20 被接口报错打断且续不上，换了新会话接手（Revision 17） |
 | p01-perf-hw1 | 在服务器上给 0.2.0-alpha.3 与 0.1.0 测性能基线，交出能重跑的测量脚本 | S1（启动）、S2（静默）测完，在做 S3（低并发）。原会话 2026-11-20 被接口报错打断且续不上，换了新会话接手（任务书 Revision 2）；服务器上的测量没有中断 |
-| v13 | 审查第五段：`retry.last_response`、官方 aproxy-format 的角色入口、删旧信封，以及角色设计稿 | 2026-11-20 派出 |
-| v01 到 v12 | 审查第一段到第四段 | 做完；结论已写进 t06 的 Revision 4、5、8、10、13、19 |
+| v01 到 v13 | 审查第一段到第五段 | 做完；结论已写进 t06 的 Revision 4、5、8、10、13、19、21 |
 
 ## 排好的任务（按先后）
 
@@ -40,6 +39,9 @@
    所以 master 与 `codex/t06-format` 分支的历史从那里起不同、内容相同：以后各段用 `git cherry-pick` 逐个摘，不合并分支。
 4. **主代理：文档**。`aproxy-format` 技能按协议 1 重写（握手的两类失败、worker 编号、回信与 stderr 的上限、`null` 等于省略、
    Windows 不接受 `.cmd` 与 `.bat`、请求体先解码），`aproxy-cli` 技能里 `[[format]]` 的配置，`docs/architecture.md`，CHANGELOG。
+   第五段删了 `run` 与旧信封之后，这些地方现在是错的（第五段的审查列出）：README 里 `aproxy-format run` 的样例、
+   `aproxy-cli` 技能的 `references/latest/config-toml.md`、`aproxy-format` 技能的 `references/examples.md`、
+   `references/guide.md`（还在教 `TransformEnvelope`）与 `scripts/test_format.py`（还在发旧的帧）、`docs/architecture.md` 的阶段说明。
 5. **tag alpha.4**：步骤见 [release-0.2.0](release-0.2.0.md) 的「打 tag 的步骤」。发布之后把 tag 加进 ci.yml 的 `PREV_VERSIONS`。
 
 ### alpha.4 到 beta.1（阶段 3）

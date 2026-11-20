@@ -157,7 +157,7 @@ pub(super) struct Chain {
     pub config: f::FileConfig,
     /// 顺序就是请求出站顺序。
     pub layers: Vec<Layer>,
-    /// 外部命令的相对配置路径以用户选择的文件目录为基准。
+    /// 外部命令的相对配置路径以选定的实例工作目录为基准。
     pub directory: PathBuf,
     /// 不妨碍运行、但容易误以为回程也会转换的情形。
     pub notes: Vec<&'static str>,
@@ -234,7 +234,17 @@ fn safe_issue(error: String) -> String {
     }
 }
 /// 使用与代理同源的严格 TOML 解析；只报告固定错误码、位置，不转发可能含环境值的解析器原话。
-pub(super) fn chain(path: &Path, structural: bool) -> Result<Chain, String> {
+pub(super) fn chain(path: &Path, home: Option<&Path>, structural: bool) -> Result<Chain, String> {
+    let directory = match home {
+        Some(dir) => dir,
+        None => {
+            eprintln!("提示：未指定 --home，相对路径以代理配置所在目录为准。");
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+        }
+    };
+    let directory = std::path::absolute(directory).map_err(|_| "无法确定角色工作目录")?;
     let text = String::from_utf8(offline_read(path)?).map_err(|_| "代理配置不是 UTF-8")?;
     let (mut cfg, diags) = f::parse(&text, path);
     if let Some(d) = diags.iter().find(|d| d.is_error()) {
@@ -248,7 +258,6 @@ pub(super) fn chain(path: &Path, structural: bool) -> Result<Chain, String> {
     if let Some(base) = &cfg.base_url {
         base_url(base)?;
     }
-    let directory = path.parent().unwrap_or(Path::new(".")).to_owned();
     let mut layers = Vec::new();
     let mut notes = Vec::new();
     let mut routed = false;
@@ -411,22 +420,38 @@ fn unchecked<'a>(roles: impl IntoIterator<Item = &'a Role>, proxy: bool, externa
 }
 /// 工具的参数与角色协议分开解析，未知参数可能含密钥，不在用法错误中回显。
 pub(super) fn run(name: &str, args: &[String]) -> Result<(), String> {
-    let words: Vec<_> = args.iter().map(String::as_str).collect();
-    match (name,words.as_slice()) {
-        ("init",[s,"--output",p])=>init(s,Path::new(p)),
-        ("check",[p])=>{
-            let c=chain(Path::new(p),true)?;
-            for n in c.notes{println!("提示：{n}");}
-            println!("format 链与官方角色配置有效（{} 个程序）。",c.layers.len());
-            unchecked(c.layers.iter().filter_map(|l| l.role.as_ref()),true,c.layers.iter().any(|l| l.role.is_none()));Ok(())
-        },
-        ("check",[r,"--config",p])=>{
-            let role=load(r,&["--config".into(),(*p).into()],Path::new("."),config::Variables{structural:true,..Default::default()}).map_err(safe_issue)?;
-            println!("{r} 角色配置结构有效。");unchecked([&role],false,false);Ok(())
-        },
-        ("try",[p,"--request",sample])=>crate::dryrun::run(Path::new(p),Path::new(sample),false),
-        ("try",[p,"--request",sample,"--allow-external"])=>crate::dryrun::run(Path::new(p),Path::new(sample),true),
-        _=>Err("用法：init 场景 --output 目录；check 代理配置 或 check 角色 --config 文件；try 代理配置 --request 样例 [--allow-external]".into()),
+    let mut words = Vec::new();
+    let mut home = None;
+    let mut args = args.iter().map(String::as_str);
+    while let Some(word) = args.next() {
+        if name != "init" && word == "--home" {
+            let dir = args
+                .next()
+                .filter(|v| !v.is_empty() && !v.starts_with("--"))
+                .ok_or("--home 缺少目录")?;
+            if home.replace(Path::new(dir)).is_some() {
+                return Err("--home 重复".into());
+            }
+        } else {
+            words.push(word);
+        }
+    }
+    match (name, words.as_slice()) {
+        ("init", [s, "--output", p]) => init(s, Path::new(p)),
+        ("check", [p]) => {
+            let c = chain(Path::new(p), home, true)?;
+            for n in c.notes { println!("提示：{n}"); }
+            println!("format 链与官方角色配置有效（{} 个程序）。", c.layers.len());
+            unchecked(c.layers.iter().filter_map(|l| l.role.as_ref()), true, c.layers.iter().any(|l| l.role.is_none()));
+            Ok(())
+        }
+        ("check", [r, "--config", p]) => {
+            let role = load(r, &["--config".into(), (*p).into()], home.unwrap_or(Path::new(".")), config::Variables { structural: true, ..Default::default() }).map_err(safe_issue)?;
+            println!("{r} 角色配置结构有效。"); unchecked([&role], false, false); Ok(())
+        }
+        ("try", [p, "--request", sample]) => crate::dryrun::run(Path::new(p), Path::new(sample), home, false),
+        ("try", [p, "--request", sample, "--allow-external"]) => crate::dryrun::run(Path::new(p), Path::new(sample), home, true),
+        _ => Err("用法：init 场景 --output 目录；check 代理配置 [--home 目录] 或 check 角色 --config 文件；try 代理配置 --request 样例 [--home 目录] [--allow-external]".into()),
     }
 }
 
@@ -446,7 +471,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             init(scenario, dir.path()).unwrap();
             let file = dir.path().join("config.toml");
-            let c = chain(&file, true).unwrap();
+            let c = chain(&file, None, true).unwrap();
             assert_eq!(c.layers.iter().map(|l| l.label).collect::<Vec<_>>(), names);
             assert_eq!(
                 c.config.delivery.unwrap_or(f::Delivery::Retry),
@@ -485,7 +510,7 @@ mod tests {
         };
         let file = dir.path().join("config.toml");
         fs::write(&file,format!("[[format]]\nname='r'\ncommand='aproxy-format'\nargs=['route','--config','route.toml']\nstages=['request']\n[[format]]\nname='after'\ncommand='aproxy-format'\nargs=[{args}]\nstages=['request']")).unwrap();
-        chain(&file, true).err().unwrap()
+        chain(&file, None, true).err().unwrap()
     }
     /// 换渠道后客户端体须按新的目标协议再次转换。
     #[test]

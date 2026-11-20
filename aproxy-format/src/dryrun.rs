@@ -693,23 +693,29 @@ fn fallback(
     answer
 }
 /// 协议体是有限样例；限制样例文件本身避免把无限输入作为一次 dry run。
-pub(super) fn run(path: &Path, sample: &Path, external: bool) -> Result<(), String> {
+pub(super) fn run(
+    path: &Path,
+    sample: &Path,
+    home: Option<&Path>,
+    external: bool,
+) -> Result<(), String> {
     if external {
         eprintln!("注意：外部程序会收到样例和环境变量；只运行你信任的程序。");
     }
     let input = tools::offline_read(sample)?;
     let sample: Sample =
         serde_json::from_slice(&input).map_err(|_| "试跑样例不是有效的请求描述")?;
-    rehearse(path, sample, external, &mut std::io::stdout().lock())
+    rehearse(path, sample, home, external, &mut std::io::stdout().lock())
 }
 /// 模拟有限次数的尝试；耗尽样例不是一次成功交付，明确报告仍需更多上游样本。
 fn rehearse(
     path: &Path,
     sample: Sample,
+    home: Option<&Path>,
     external: bool,
     out: &mut impl Write,
 ) -> Result<(), String> {
-    let chain = tools::chain(path, false)?;
+    let chain = tools::chain(path, home, false)?;
     let base = chain
         .config
         .base_url

@@ -2388,3 +2388,36 @@ fn check_lists_only_structural_guarantees_and_credential_names() {
         assert!(!text.contains("private"));
     }
 }
+
+/// 代理文件与实例 home 各有不同的角色文件；明确选定的目录不能退回另一个有效或无效的副本。
+#[test]
+fn tools_resolve_role_configs_from_the_selected_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let proxy = dir.path().join("proxy.toml");
+    std::fs::write(&proxy,"base_url='https://example.test'\n[[format]]\nname='r'\ncommand='./bin/aproxy-format'\nargs=['rewrite','--config','role.toml']\nstages=['request']").unwrap();
+    std::fs::write(home.join("role.toml"), "remove=['/x']").unwrap();
+    let sample = dir.path().join("sample");
+    std::fs::write(&sample, r#"{"path":"/","body":{}}"#).unwrap();
+    for name in ["check", "try"] {
+        for explicit in [false, true] {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_aproxy-format"));
+            cmd.arg(name).arg(&proxy);
+            if explicit {
+                cmd.arg("--home").arg(&home);
+            }
+            if name == "try" {
+                cmd.arg("--request").arg(&sample);
+            }
+            let out = cmd.output().unwrap();
+            assert_eq!(out.status.success(), explicit, "{out:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stderr)
+                    .matches("代理配置所在目录")
+                    .count(),
+                usize::from(!explicit)
+            );
+        }
+    }
+}

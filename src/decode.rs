@@ -176,7 +176,7 @@ fn decode_layers(
         let decoded: Box<dyn Read + '_> = match layer.to_ascii_lowercase().as_str() {
             // MultiGz：多个 gzip member 首尾相接也是合法 gzip 流；每个 member 都
             // 校验尾部 CRC 与长度，截断即报错
-            "gzip" | "x-gzip" => Box::new(flate2::bufread::MultiGzDecoder::new(reader)),
+            "gzip" | "x-gzip" => Box::new(flate2::bufread::MultiGzDecoder::new(&mut *reader)),
             // zlib 包装与裸 deflate 只能看头两字节区分（不能像 for_inspection 那样
             // 「失败再换一种」重试——输入是流，读过就回不去了）
             "deflate" => {
@@ -185,7 +185,7 @@ fn decode_layers(
                 reader.read_exact(&mut prefix).map_err(|e| e.to_string())?;
                 let zlib = looks_like_zlib(&prefix);
                 let reader = Box::new(std::io::BufReader::new(
-                    std::io::Cursor::new(prefix).chain(reader),
+                    std::io::Cursor::new(prefix).chain(&mut *reader),
                 ));
                 Box::new(StrictInflate {
                     inner: reader,
@@ -193,9 +193,12 @@ fn decode_layers(
                     done: false,
                 })
             }
-            "br" => Box::new(brotli_decompressor::Decompressor::new(reader, BROTLI_BUF)),
+            "br" => Box::new(brotli_decompressor::Decompressor::new(
+                &mut *reader,
+                BROTLI_BUF,
+            )),
             "zstd" => Box::new(
-                ruzstd::decoding::StreamingDecoder::new(reader)
+                ruzstd::decoding::StreamingDecoder::new(&mut *reader)
                     .map_err(|e| format!("zstd 帧头无效: {e}"))?,
             ),
             other => return Err(format!("不支持的 content-encoding「{other}」")),
@@ -203,6 +206,15 @@ fn decode_layers(
         let mut wrapped = std::io::BufReader::new(decoded);
         let written = decode_layers(&mut wrapped, layers, output, max_output)?;
         if !wrapped
+            .fill_buf()
+            .map_err(|e| format!("invalid coding trailer: {e}"))?
+            .is_empty()
+        {
+            return Err("unexpected bytes after a coding layer".into());
+        }
+        // 解码输出已读完，还要检查编码输入。按块读取的解码器未必会自行取下一块。
+        drop(wrapped);
+        if !reader
             .fill_buf()
             .map_err(|e| format!("invalid coding trailer: {e}"))?
             .is_empty()
@@ -257,6 +269,13 @@ impl<R: std::io::BufRead> Read for StrictInflate<R> {
             let produced = (self.state.total_out() - out_before) as usize;
             self.inner.consume(consumed);
             if status == flate2::Status::StreamEnd {
+                // 私有读缓冲可能已从外层预取 member 之后的字节；释放它之前必须核对。
+                if !self.inner.fill_buf()?.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "unexpected bytes after deflate stream",
+                    ));
+                }
                 self.done = true;
                 return Ok(produced);
             }
@@ -530,6 +549,28 @@ mod tests {
         ] {
             let got = strict(enc, &data, u64::MAX).unwrap_or_else(|e| panic!("{enc}: {e}"));
             assert!(got == long.as_bytes(), "{enc}: 解码结果与原文不符");
+        }
+    }
+
+    /// 外层校验和正确也不能覆盖内层尾随的字节；合法编码在同一组合中照常解出。
+    #[test]
+    fn strict_checks_each_decoders_remaining_encoded_input() {
+        let (zlib, raw) = deflate_variants(SAMPLE.as_bytes());
+        for (enc, mut body) in [
+            ("deflate", zlib),
+            ("deflate", raw),
+            ("br", brotli(SAMPLE.as_bytes())),
+            ("zstd", zstd(SAMPLE.as_bytes())),
+            ("gzip", gzip(SAMPLE.as_bytes())),
+        ] {
+            let layers = format!("{enc}, gzip");
+            assert_eq!(
+                strict(&layers, &gzip(&body), u64::MAX).unwrap(),
+                SAMPLE.as_bytes()
+            );
+            body.extend_from_slice(b"remainder");
+            assert!(strict(&layers, &gzip(&body), u64::MAX).is_err(), "{enc}");
+            assert!(strict(enc, &body, u64::MAX).is_err(), "{enc}");
         }
     }
 

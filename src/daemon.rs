@@ -2473,76 +2473,34 @@ where
     // 这一轮要写出去的事件行
     let mut batch = String::new();
     loop {
-        // 这一轮要发的事件：名字与 data 的 JSON 文本；`closing` 发完就结束。`at` 是事件自带
-        // 的时刻，没有的取写出的此刻
-        let mut at = None;
-        let (event, data, last) = tokio::select! {
-            received = subscription.events.recv() => match received {
-                Ok(Event::Request { at: happened, record }) => {
-                    at = Some(happened);
-                    ("request", record.to_string(), false)
-                }
-                Ok(Event::Format { at: happened, index, revision, snapshot }) => {
-                    if !view.apply(index, revision, &snapshot) { continue; }
-                    at = Some(happened);
-                    ("state", view.json(), false)
-                }
-                Ok(Event::Closing(reason)) => {
-                    ("closing", format!(r#"{{"reason":"{reason}"}}"#), true)
-                }
-                Err(RecvError::Lagged(dropped)) => {
-                    view.refresh(&state, true);
-                    ("lagged", format!(r#"{{"dropped":{dropped}}}"#), false)
-                }
-                Err(RecvError::Closed) => return Ok(()),
-            },
-            // 状态变了（进入更换阶段、开始退出）：立即发。到期自己回到 serving 的那一次由
-            // 下面每秒一次的检查发出
-            _ = state.stats.state_changed.notified() => ("state", String::new(), false),
-            changed = stopping.changed() => match changed {
-                Ok(()) => ("state", String::new(), false),
-                Err(_) => return Ok(()),
-            },
-            // 计数的变化合并到这里；没有任何东西可发、又静了够久，就发一个心跳
-            _ = every_second.tick() => {
-                if last_line.elapsed() >= EVENT_IDLE {
-                    ("heartbeat", "{}".to_string(), false)
-                } else {
-                    ("state", String::new(), false)
-                }
-            }
-            // 客户端关了连接。它在请求行之后发来的别的东西一概不看
-            read = reader.read(&mut scratch) => match read {
-                Ok(0) | Err(_) => return Ok(()),
-                Ok(_) => continue,
-            },
-        };
-        let data = if event == "state" {
-            let now = if data.is_empty() {
-                view.refresh(&state, false);
-                let now = view.json();
-                if now == sent_snapshot {
-                    continue;
-                }
-                now
-            } else {
-                data
-            };
-            sent_snapshot.clone_from(&now);
-            now
-        } else {
-            data
-        };
         batch.clear();
-        if last {
+        // 唤醒时收到的第一项和批内后续项走同一条路径，尤其不能漏算在批内发现的溢出。
+        let mut first = tokio::select! {
+            received = subscription.events.recv() => Some(match received {
+                Ok(event) => Ok(event),
+                Err(RecvError::Lagged(n)) => Err(TryRecvError::Lagged(n)),
+                Err(RecvError::Closed) => return Ok(()),
+            }),
+            _ = state.stats.state_changed.notified() => None,
+            changed = stopping.changed() => match changed { Ok(()) => None, Err(_) => return Ok(()) },
+            _ = every_second.tick() => {
+                if last_line.elapsed() >= EVENT_IDLE { push_event(&mut batch, &mut seq, "heartbeat", None, "{}"); }
+                None
+            },
+            // 客户端关了连接。它在请求行之后发来的别的东西一概不看。
+            read = reader.read(&mut scratch) => match read { Ok(0) | Err(_) => return Ok(()), Ok(_) => continue },
+        };
+        if first.is_none() && batch.is_empty() {
             push_state_if_changed(&mut batch, &mut seq, &state, &mut view, &mut sent_snapshot);
         }
-        push_event(&mut batch, &mut seq, event, at, &data);
         // 队列里已经排着的事件一并带上，一次写出去。实例忙的时候，每写一次都要等运行时再排到
-        // 这个任务；一次只写一个事件的话，每秒几百个事件就跟不上，订阅者会不停地收到 lagged
-        let mut last = last;
+        // 这个任务；一次只写一个事件的话，每秒几百个事件就跟不上，订阅者会不停地收到 lagged。
+        let mut last = false;
         while !last && batch.len() < EVENT_BATCH_BYTES {
-            match subscription.events.try_recv() {
+            match first
+                .take()
+                .unwrap_or_else(|| subscription.events.try_recv())
+            {
                 Ok(Event::Request { at, record }) => {
                     push_event(&mut batch, &mut seq, "request", Some(at), &record);
                 }
@@ -2569,14 +2527,62 @@ where
                     push_event(&mut batch, &mut seq, "closing", None, &data);
                     last = true;
                 }
-                Err(TryRecvError::Lagged(dropped)) => {
+                Err(TryRecvError::Lagged(mut dropped)) => {
                     view.refresh(&state, true);
-                    let data = format!(r#"{{"dropped":{dropped}}}"#);
-                    push_event(&mut batch, &mut seq, "lagged", None, &data);
+                    // 固定本次追赶的边界，不因生产者一直写而饿死订阅者。并发再次溢出的部分也算丢失。
+                    let mut remaining = subscription.events.len() as u64;
+                    let mut closing = None;
+                    while remaining != 0 {
+                        let skipped = match subscription.events.try_recv() {
+                            Ok(Event::Closing(reason)) => {
+                                closing = Some(reason);
+                                break;
+                            }
+                            Ok(Event::Format {
+                                index,
+                                revision,
+                                snapshot,
+                                ..
+                            }) => {
+                                view.apply(index, revision, &snapshot);
+                                1
+                            }
+                            Ok(Event::Request { .. }) => 1,
+                            Err(TryRecvError::Lagged(n)) => {
+                                view.refresh(&state, true);
+                                n
+                            }
+                            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                        };
+                        dropped += skipped;
+                        remaining = remaining.saturating_sub(skipped);
+                    }
+                    push_event(
+                        &mut batch,
+                        &mut seq,
+                        "lagged",
+                        None,
+                        &format!(r#"{{"dropped":{dropped}}}"#),
+                    );
+                    sent_snapshot = view.json();
+                    push_event(&mut batch, &mut seq, "state", None, &sent_snapshot);
+                    if let Some(reason) = closing {
+                        push_event(
+                            &mut batch,
+                            &mut seq,
+                            "closing",
+                            None,
+                            &format!(r#"{{"reason":"{reason}"}}"#),
+                        );
+                        last = true;
+                    }
                 }
                 // 队列关了的那一种留给下一轮的 recv 去结束
                 Err(TryRecvError::Empty | TryRecvError::Closed) => break,
             }
+        }
+        if batch.is_empty() {
+            continue;
         }
         let write = async {
             writer.write_all(batch.as_bytes()).await?;
@@ -2652,7 +2658,7 @@ impl SubscriberStatus {
     }
 }
 
-/// `closing` 之前调用：快照与上一次发给这个订阅者的不一样时，先补一个 `state` 事件。
+/// 定时采样、状态唤醒和 `closing` 之前：快照与上一次发送的不一样时补一个 `state` 事件。
 ///
 /// 实例是先改状态（`stopping`、更换阶段）、再宣布关闭的，但两件事可能在这个任务被排到之前
 /// 都已经发生，那时先处理哪一个没有定数。在这里补发，订阅者就总是先看到状态的变化、再看到
@@ -3872,6 +3878,35 @@ mod tests {
             .unwrap();
         assert!(line.ends_with('\n'), "连接提前关闭：{line:?}");
         serde_json::from_str(&line).unwrap()
+    }
+
+    /// 单线程运行时先填满队列，再让订阅任务运行；快照相同也须重新发，不能重放旧事件。
+    #[tokio::test]
+    async fn lagged_subscription_counts_all_skipped_events_then_sends_current_state() {
+        let (state, _rx) = control(sample_info("0"));
+        let (client, server) = tokio::io::duplex(64);
+        let (r, w) = tokio::io::split(server);
+        let handler = tokio::spawn(serve_events(r, w, state.clone()));
+        let mut lines = tokio::io::BufReader::new(client);
+        let first = next_event(&mut lines).await;
+        assert_eq!(first["ok"], true);
+        for revision in 1..=2048 {
+            state
+                .history
+                .format_transition(0, revision, || serde_json::json!({}));
+        }
+        state.history.announce_closing("shutdown");
+        let lag = next_event(&mut lines).await;
+        assert_eq!(lag["event"], "lagged");
+        assert_eq!(lag["data"]["dropped"], 2048);
+        let snapshot = next_event(&mut lines).await;
+        assert_eq!(snapshot["event"], "state");
+        assert_eq!(
+            snapshot["data"]["state"],
+            first["result"]["snapshot"]["state"]
+        );
+        assert_eq!(next_event(&mut lines).await["event"], "closing");
+        handler.await.unwrap().unwrap();
     }
 
     /// `subscribe`：先回快照与在途的记录，之后是事件——记录的开始与结束、状态变化、实例

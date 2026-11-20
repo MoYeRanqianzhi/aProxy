@@ -168,6 +168,7 @@ pub(super) async fn drain_original(
         let part = part.map_err(|_| Terminal::client_body_aborted())?;
         tap.chunk(&part);
         if tap.seen > limit as u64 {
+            drain_rejected_body(&mut input).await;
             return Err(body_too_large(limit));
         }
     }

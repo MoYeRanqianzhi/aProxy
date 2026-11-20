@@ -1245,6 +1245,38 @@ async fn forward_replacement_does_not_retain_the_original_upload() {
         "original uploaded bytes retained for replay"
     );
     assert!(matches!(req.sent_body(),RequestBody::Memory(b) if b.as_ref()==b"replacement"));
+    // 超过限额的块并非最后一块。即使交给上游的是小替换体，客户端也要能收全 413。
+    let limited = AppState::new(Config {
+        max_body_mb: Some(1),
+        forward_only: Some(true),
+        ..Config::default()
+    });
+    let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = polled.clone();
+    let chunks = futures_util::stream::iter([
+        Bytes::from(vec![0; 1024 * 1024]),
+        Bytes::from_static(b"over"),
+        Bytes::from_static(b"remainder"),
+    ])
+    .map(move |chunk| {
+        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok::<_, std::io::Error>(chunk)
+    });
+    let upload = ClientUpload {
+        body: Body::from_stream(chunks),
+        encoding: None,
+        trigger: crate::config::KeepaliveTrigger::Accept,
+        accept: false,
+    };
+    assert_eq!(
+        upload
+            .buffer(&limited, &mut req, &rec)
+            .await
+            .unwrap_err()
+            .code(),
+        "request_too_large"
+    );
+    assert_eq!(polled.load(std::sync::atomic::Ordering::Relaxed), 3);
 }
 
 /// 协商表内未挂进链的阶段不能让整份上传付出 SHA-256 成本；真正订阅的阶段仍取原始字节。

@@ -282,6 +282,11 @@ pub(super) async fn forward_only_proxy(
         );
         let sent_encoding = request_encoding(headers, formatted);
         let changed = formatted && sent_encoding.as_deref() != upload.encoding.as_ref();
+        // try_started 对相同的实体直接引用已登记的原始体，必须在创建尝试前登记它。
+        let history = rec.request_body(request_history_encoding(
+            upload.encoding.as_ref(),
+            formatted,
+        ));
         let sent_history = rec.try_started(
             attempt,
             sent.as_ref(),
@@ -289,10 +294,7 @@ pub(super) async fn forward_only_proxy(
             request_history_encoding(sent_encoding.as_deref(), formatted),
         );
         let tap = RequestTap {
-            history: rec.request_body(request_history_encoding(
-                upload.encoding.as_ref(),
-                formatted,
-            )),
+            history,
             sent_history,
             rec: rec.clone(),
             prefix: Vec::new(),

@@ -2533,15 +2533,15 @@ async fn response_runs_only_on_the_delivered_success_buffered_or_committed() {
             }
             cfg += &layer(&home, "outer", "'response'", &["append", "A"]);
             cfg += &layer(&home, "inner", "'response'", &["append", "B"]);
-            let (c, url) = running(&home, up, &cfg);
-            if !committed {
+            let (c, url, mut clock) = Clock::start(&home, up, &cfg);
+            let mut res = if committed {
+                clock
+                    .first_head(c.get(url).header("accept", "text/event-stream"), &calls, 1)
+                    .await
+            } else {
                 release.add_permits(2);
-            }
-            let mut req = c.get(url);
-            if committed {
-                req = req.header("accept", "text/event-stream");
-            }
-            let mut res = req.send().await.unwrap();
+                c.get(url).send().await.unwrap()
+            };
             if committed {
                 let first = res.chunk().await.unwrap().unwrap();
                 assert!(first.starts_with(b":"));
@@ -5743,17 +5743,14 @@ async fn committed_open_patches_do_not_change_the_next_stream_layers_input() {
         } else {
             r#"{"response":{"status":409,"headers":{"x-hidden":"ignored"}}}"#.into()
         };
-        let (up, release, _) = held_upstream(&[200], "data: ok\n\n").await;
+        let (up, release, calls) = held_upstream(&[200], "data: ok\n\n").await;
         let cfg = String::from("keepalive.trigger='accept'\nkeepalive.interval_secs=1\n")
             + &layer(&home, "outer", "'stream'", &["stream-echo"])
             + &layer(&home, "inner", "'stream'", &["reply", &patch]);
-        let (c, url) = running(&home, up, &cfg);
-        let mut response = c
-            .get(&url)
-            .header("accept", "text/event-stream")
-            .send()
-            .await
-            .unwrap();
+        let (c, url, mut clock) = Clock::start(&home, up, &cfg);
+        let mut response = clock
+            .first_head(c.get(&url).header("accept", "text/event-stream"), &calls, 1)
+            .await;
         assert!(response.chunk().await.unwrap().is_some());
         release.add_permits(1);
         let tail = response.bytes().await.unwrap();

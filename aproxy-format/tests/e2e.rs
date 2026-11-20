@@ -218,6 +218,40 @@ fn route_alias_paths_and_reverse_alias_survive_worker_boundaries() {
         assert_eq!(r["response"]["body"], r#"{"model":"other"}"#);
     }
 }
+/// 无过滤的末级渠道应接住前级未匹配的模型，而不只是另一个精确匹配。
+#[test]
+fn unfiltered_channel_accepts_unmatched_models() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("route.toml");
+    std::fs::write(&file, "[[channel]]\nid='specific'\nurl='https://one.test/'\nmodels=[{exact='known'}]\n[[channel]]\nid='fallback'\nurl='https://two.test/'").unwrap();
+    let mut w = Worker::new(&["route", "--config", file.to_str().unwrap()]);
+    let r = w.frame(request(
+        "https://client.test/",
+        "/",
+        json!({"model":"unlisted"}),
+    ));
+    assert_eq!(r["request"]["url"], "https://two.test/", "{r}");
+}
+/// 单独订阅响应时显式协议足以翻译；未声明别名的模型仍由实际服务端决定。
+#[test]
+fn explicit_response_only_preserves_served_model_without_state() {
+    let mut w = Worker::new(&[
+        "convert",
+        "--from",
+        "openai_chat",
+        "--to",
+        "anthropic_messages",
+    ]);
+    let mut m = response(
+        &Value::Null,
+        r#"{"role":"assistant","content":[{"type":"text","text":"hello"}],"model":"served-model","stop_reason":"end_turn"}"#,
+    );
+    m.as_object_mut().unwrap().remove("state");
+    let r = w.frame(m);
+    let b: Value = serde_json::from_str(r["response"]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(b["model"], "served-model");
+    assert_eq!(b["choices"][0]["message"]["content"], "hello");
+}
 /// 配置错误不会把 TOML 原行里的值或环境秘密复制到 stderr；旧 run 命令不再可用。
 #[test]
 fn invalid_role_configuration_does_not_echo_secrets() {

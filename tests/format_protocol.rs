@@ -6009,6 +6009,45 @@ async fn adaptive_unavailable_falls_back_to_retry() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
 }
 
+/// 已经成功给过 forward 的真实角色失去配置后打开熔断。后续请求不能沿用上一请求的表态。
+#[tokio::test]
+async fn previously_healthy_adaptive_unavailable_falls_back_to_retry() {
+    use std::sync::atomic::Ordering;
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[200, 200, 503, 200]).await;
+    let file = home.path().join("adaptive.toml");
+    std::fs::write(&file, "").unwrap();
+    let cfg = official_layer(
+        "adaptive",
+        "'request'",
+        &["adaptive", "--config", file.to_str().unwrap()],
+    )
+    .replace("process='persistent'", "process='spawn'")
+        + "required=false\nbreaker_failures=1\nbreaker_cooldown_secs=3600\n"
+        + &layer(&home, "observe", "'request'", &["echo"]);
+    let (client, url) = running(&home, up, &cfg);
+    assert_eq!(
+        client.get(&url).send().await.unwrap().text().await.unwrap(),
+        "upstream bytes"
+    );
+    assert_eq!(frames(&home, "observe")[1]["delivery"], "forward");
+    assert_eq!(breaker(&home, &url).await["state"], "closed");
+    // 下一次真实握手读取这份测试自有的文件，失败发生在成功服务之后。
+    std::fs::write(file, "invalid = [").unwrap();
+    assert_eq!(
+        client.get(&url).send().await.unwrap().text().await.unwrap(),
+        "upstream bytes"
+    );
+    assert_eq!(breaker(&home, &url).await["state"], "open");
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        client.get(&url).send().await.unwrap().text().await.unwrap(),
+        "upstream bytes"
+    );
+    assert_eq!(frames(&home, "observe")[3]["delivery"], "retry");
+    assert_eq!(calls.load(Ordering::Relaxed), 4);
+}
+
 /// 链内的一次拒绝已触发 forward 升级；恢复后的请求层不能再次选择 forward 并重复计数。
 #[tokio::test]
 async fn upgrade_locks_delivery_before_resuming_the_failed_request_layer() {

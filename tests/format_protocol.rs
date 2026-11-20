@@ -498,11 +498,8 @@ async fn retry_last_response_carries_each_upstream_head_without_the_body() {
 async fn retry_last_response_omitted_after_chain_and_connect_failures() {
     let home = TestHome::new();
     let (up, _) = upstream(&[429, 200]).await;
-    let port = free_port();
-    let reserved = tokio::net::TcpSocket::new_v4().unwrap();
-    reserved
-        .bind((std::net::Ipv4Addr::LOCALHOST, port).into())
-        .unwrap();
+    let (reserved, addr) = refused_address();
+    let port = addr.port();
     let script = home.path().join("steps.json");
     std::fs::write(
         &script,
@@ -521,6 +518,7 @@ async fn retry_last_response_omitted_after_chain_and_connect_failures() {
     );
     let (c, url) = running(&home, up, &cfg);
     assert_eq!(c.get(url).send().await.unwrap().status(), 200);
+    drop(reserved);
     let input = frames(&home, "keys");
     assert_eq!(input.len(), 4);
     assert_eq!(input[1]["retry"]["last_response"]["status"], 429);
@@ -2888,14 +2886,9 @@ async fn decide_stop_with_response_returns_it_as_retry_stopped() {
 /// 只占住端口而不 listen，确保整个尝试期间都拒绝连接，不误连另一个测试的监听器。
 fn refused_address() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
     let reservation = tokio::net::TcpSocket::new_v4().unwrap();
-    loop {
-        let addr = ([127, 0, 0, 1], free_port()).into();
-        match reservation.bind(addr) {
-            Ok(()) => return (reservation, addr),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
-            Err(e) => panic!("{e}"),
-        }
-    }
+    reservation.bind(([127, 0, 0, 1], 0).into()).unwrap();
+    let addr = reservation.local_addr().unwrap();
+    (reservation, addr)
 }
 /// 有上游时保留原错体，没有上游时生成带 last_code 的 502。
 #[tokio::test]

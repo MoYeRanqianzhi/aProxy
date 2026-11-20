@@ -3930,16 +3930,9 @@ async fn forward_only_enforces_max_body_mb() {
 #[tokio::test]
 async fn forward_only_unreachable_upstream_returns_502() {
     // 绑定但不 listen：连接会被拒绝，而端口在请求结束前不会被并行测试的监听器拿走。
-    // free_port 与 bind 之间若有竞争就换端口；绝不向没有占住的地址发请求。
     let reservation = tokio::net::TcpSocket::new_v4().unwrap();
-    let dead_addr = loop {
-        let addr = ([127, 0, 0, 1], common::free_port()).into();
-        match reservation.bind(addr) {
-            Ok(()) => break addr,
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
-            Err(e) => panic!("不能保留未监听的测试端口：{e}"),
-        }
-    };
+    reservation.bind(([127, 0, 0, 1], 0).into()).unwrap();
+    let dead_addr = reservation.local_addr().unwrap();
 
     let mut cfg = proxy_config_for(&format!("http://{dead_addr}"));
     cfg.forward_only = Some(true);

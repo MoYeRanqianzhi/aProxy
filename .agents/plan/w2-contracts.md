@@ -478,6 +478,8 @@ data: {"type":"error","error":{"type":"aproxy_format_unavailable","message":"for
   - 它的体是 JSON：压成一行，作为 `event: error` 的 data 写出；
   - 都不是：写 aproxy 的标准终态事件。
   - 要压成 `event: error` 的 JSON 体超过 1 MiB 时，也写标准终态事件：不为一条错误事件把整个大体读进内存（2026-11-20 补）。
+    1 MiB 按解码后的大小算；边解码边数，超出就停。
+  - 这几条对任何阶段给出的终态响应都一样：request、retry 阶段的 `fail.response`，decide 叫停时附带的 `response`。
   - 体带着 `content-encoding` 时先解码再按上面三条判断；解不了就写标准终态事件（2026-11-20 补）。
 
 **为什么**：
@@ -1556,7 +1558,8 @@ aproxy desktop                  W5
   `stream` 在 aproxy 还不知道时省略（2026-11-20 补）：forward 请求的体直接流向上游（§10.10）、而是否流式只能从体里看出来
   （`keepalive.trigger` 要看体）时，request 阶段的程序收到的 `client` 没有 `stream`。从请求头就能定的照常给出。
   省略表示不知道，不表示不是流式；需要确切答案的程序在 request 阶段要 `digest` 或 `full`，aproxy 就会先读完请求体。
-  同一个请求之后的阶段（response、stream、heartbeat、decide、notify）里，体已经读过，`stream` 总是给出。
+  之后的阶段同理：派发那一刻还不知道就省略。forward 请求的上传与响应可以同时进行，stream 的 open 可能早于上传结束
+  （2026-11-20 实测）；请求体读完之后派发的消息总是给出。
 - **retry 阶段**的输入多一个 `retry` 对象：`{"attempt":3,"last_failure":{"code","details"},"elapsed_ms"}`，其中 `attempt` 是即将进行的尝试序号。
 - **`overrides`**：键是 config.toml 的键，范围见 hello 的 `overrides`。
   - 回信是宽容的读者（§1.1）：不认识的键或非法的值被忽略并告警，不让请求因此失败。
@@ -1643,6 +1646,8 @@ aproxy desktop                  W5
 ```
 
 - **范围**：只处理判定为成功、要交给客户端的响应。放弃之后透传的错误不经过它（X-3）；要按客户端协议改写错误，用 decide 的 `stop` 附带 `response`。
+  forward 请求只有 2xx 的响应经过 response 与 stream 阶段，其余状态（包括 3xx）原样透传（2026-11-20 补）。
+  没有体可交付的响应（HEAD 请求、204、304）不开流；open 的回信把状态改成这类状态时，随即发 close，丢弃其后的字节。
 - **forward 请求**：响应要先在这一层攒齐再交给它，这一段失去真流式（§10.10）。
 - **编码**：交给程序的体是解码后的字节，所以输出时去掉上游的 `content-encoding`、重算 `content-length`；
   程序自己在头表里写了 `content-encoding`，就照它写的发（同 §10.4，2026-11-20 补）。
@@ -1687,6 +1692,9 @@ aproxy desktop                  W5
 - **失败**：
   - open 时的失败，同 response 阶段的处理；
   - 流中途某一层失败，aproxy 停读上游，向失败层外侧的各层依次发 abort；失败的是最外层，就写它的 `abort_tail`；
+    写给客户端的收尾只有一个来源（2026-11-20 补）：最外层还能回话时，是它对 abort 的回信里的字节，回信没带字节就什么都不写，
+    不拿它的 `abort_tail` 顶替；最外层自己就是失败的那一层时，才写它在 open 时存下的 `abort_tail`。
+    中间各层对 abort 的回信里的字节丢弃：只有最外层说的是客户端的协议。
   - 可选程序在流中途失败，之后的块跳过这一层。
 - **熔断**只拦新的阶段入口（open）；进行中的流继续由原来的 worker 处理。
 

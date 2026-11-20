@@ -934,6 +934,17 @@ pub enum Event {
     Closing(&'static str),
 }
 
+/// 队尾与广播发布在同一把锁下移动。只留每个池的最新快照，不另存请求记录。
+#[derive(Default)]
+struct EventHead {
+    /// 广播尾序号；与读者的未读长度合起来确定本次放弃的区间。
+    seq: u64,
+    /// 被广播环覆盖的状态也能成为重新同步的基线。
+    formats: BTreeMap<usize, (u64, Arc<Value>)>,
+    /// 即使 closing 本身已被覆盖，也要在重新同步之后告知读者。
+    closing: Option<(u64, &'static str)>,
+}
+
 /// 一个订阅：事件的接收端，以及订阅那一刻在途的记录。丢掉它就是退订。
 pub struct Subscription {
     history: Arc<History>,
@@ -941,6 +952,27 @@ pub struct Subscription {
     pub events: tokio::sync::broadcast::Receiver<Event>,
     /// 订阅那一刻在途的记录：一个 JSON 数组的文本，元素是 RequestRecord
     pub in_flight: String,
+}
+
+impl Subscription {
+    /// 一次跳到确定的队尾；即使生产者再次填满广播环，计数也包括已覆盖和仍保留的两部分。
+    pub(crate) fn resync(
+        &mut self,
+        lost: u64,
+        mut format: impl FnMut(usize, u64, &Value),
+    ) -> (u64, Option<&'static str>) {
+        let head = lock(&self.history.event_head);
+        let skipped = lost + self.events.len() as u64;
+        self.events = self.events.resubscribe();
+        for (&index, (revision, snapshot)) in &head.formats {
+            format(index, *revision, snapshot);
+        }
+        let closing = head
+            .closing
+            .filter(|(seq, _)| *seq > head.seq.saturating_sub(skipped))
+            .map(|(_, reason)| reason);
+        (skipped - u64::from(closing.is_some()), closing)
+    }
 }
 
 impl Drop for Subscription {
@@ -983,6 +1015,8 @@ pub struct History {
     /// 记录。给旧记录挂上新的体时把它往回拨
     evict_floor: AtomicU64,
     events: tokio::sync::broadcast::Sender<Event>,
+    /// 发布与溢出读者的游标切换互斥，不在锁内生成记录或获取进程池锁。
+    event_head: Mutex<EventHead>,
     /// 此刻有多少个订阅者。热路径每次改记录都要问一句「有人在听吗」，所以自己数：问广播
     /// 通道要拿它的锁，所有请求会挤在那一把锁上
     subscribers: AtomicUsize,
@@ -1029,6 +1063,7 @@ impl History {
             records: Mutex::new(BTreeMap::new()),
             evict_floor: AtomicU64::new(0),
             events,
+            event_head: Mutex::default(),
             subscribers: AtomicUsize::new(0),
             dirty: Mutex::new(Vec::new()),
             flushing: AtomicBool::new(false),
@@ -1151,7 +1186,7 @@ impl History {
         }
         if self.subscribers.load(Ordering::Relaxed) > 0 {
             let line = record_json(&record, &lock(&record.inner));
-            let _ = self.events.send(Event::Request {
+            self.publish(Event::Request {
                 at: now,
                 record: line.into(),
             });
@@ -1173,7 +1208,7 @@ impl History {
         if urgent || now.saturating_sub(inner.last_event_at) >= REQUEST_EVENT_INTERVAL_MS {
             inner.last_event_at = now;
             inner.queued = false;
-            let _ = self.events.send(Event::Request {
+            self.publish(Event::Request {
                 at: now,
                 record: record_json(record, inner).into(),
             });
@@ -1202,7 +1237,7 @@ impl History {
             if now.saturating_sub(inner.last_event_at) >= REQUEST_EVENT_INTERVAL_MS {
                 inner.last_event_at = now;
                 inner.queued = false;
-                let _ = self.events.send(Event::Request {
+                self.publish(Event::Request {
                     at: now,
                     record: record_json(&record, &inner).into(),
                 });
@@ -1276,6 +1311,25 @@ impl History {
         self.subscribers.load(Ordering::Acquire)
     }
 
+    /// 所有事件在同一队尾发布，以便丢失的数目和随后的状态对应同一条界线。
+    fn publish(&self, event: Event) {
+        let mut head = lock(&self.event_head);
+        head.seq += 1;
+        match &event {
+            Event::Format {
+                index,
+                revision,
+                snapshot,
+                ..
+            } => {
+                head.formats.insert(*index, (*revision, snapshot.clone()));
+            }
+            Event::Closing(reason) => head.closing = Some((head.seq, reason)),
+            Event::Request { .. } => (),
+        }
+        let _ = self.events.send(event);
+    }
+
     /// 没有实时读者就不序列化。新读者从订阅后的初始快照和它的修订号接着读。
     pub(crate) fn format_transition(
         &self,
@@ -1284,7 +1338,7 @@ impl History {
         snapshot: impl FnOnce() -> Value,
     ) {
         if self.events.receiver_count() != 0 {
-            let _ = self.events.send(Event::Format {
+            self.publish(Event::Format {
                 at: crate::daemon::now_millis(),
                 index,
                 revision,
@@ -1295,7 +1349,7 @@ impl History {
 
     /// 告诉订阅者实例要退出了。
     pub fn announce_closing(&self, reason: &'static str) {
-        let _ = self.events.send(Event::Closing(reason));
+        self.publish(Event::Closing(reason));
     }
 
     /// 从请求标识里认出序号。不是本实例的标识时为 None。

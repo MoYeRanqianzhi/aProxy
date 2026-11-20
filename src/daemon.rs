@@ -2533,36 +2533,10 @@ where
                     push_event(&mut batch, &mut seq, "closing", None, &data);
                     last = true;
                 }
-                Err(TryRecvError::Lagged(mut dropped)) => {
+                Err(TryRecvError::Lagged(lost)) => {
                     view.refresh(&state, true);
-                    // 固定本次追赶的边界，不因生产者一直写而饿死订阅者。并发再次溢出的部分也算丢失。
-                    let mut remaining = subscription.events.len() as u64;
-                    let mut closing = None;
-                    while remaining != 0 {
-                        let skipped = match subscription.events.try_recv() {
-                            Ok(Event::Closing(reason)) => {
-                                closing = Some(reason);
-                                break;
-                            }
-                            Ok(Event::Format {
-                                index,
-                                revision,
-                                snapshot,
-                                ..
-                            }) => {
-                                view.apply(index, revision, &snapshot);
-                                1
-                            }
-                            Ok(Event::Request { .. }) => 1,
-                            Err(TryRecvError::Lagged(n)) => {
-                                view.refresh(&state, true);
-                                n
-                            }
-                            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
-                        };
-                        dropped += skipped;
-                        remaining = remaining.saturating_sub(skipped);
-                    }
+                    let (dropped, closing) =
+                        recover_subscription(&mut subscription, &mut view, &state, lost);
                     push_event(
                         &mut batch,
                         &mut seq,
@@ -2603,6 +2577,21 @@ where
             return Ok(());
         }
     }
+}
+
+/// 处理一次广播溢出；返回未送达的总数以及应在快照之后送出的关闭原因。
+fn recover_subscription(
+    subscription: &mut crate::history::Subscription,
+    view: &mut SubscriberStatus,
+    state: &ControlState,
+    lost: u64,
+) -> (u64, Option<&'static str>) {
+    let result = subscription.resync(lost, |index, rev, data| {
+        view.apply(index, rev, data);
+    });
+    // 关闭可能就发生在取得初始快照时；closing 之前也要送上此刻的实例状态。
+    view.refresh(state, false);
+    result
 }
 
 /// 订阅者看过的每个池的修订号。定时刷新可带上同一代的失败次数，但不能抢发队列里
@@ -3913,6 +3902,36 @@ mod tests {
         );
         assert_eq!(next_event(&mut lines).await["event"], "closing");
         handler.await.unwrap().unwrap();
+    }
+
+    /// 在取过旧队尾之后再写满两轮并关机；保留的后半轮也不能漏计，closing 前要看到 stopping。
+    #[tokio::test]
+    async fn second_overflow_accounts_for_retained_events_and_closing_state() {
+        let (state, _keep) = control(sample_info("0"));
+        let mut sub = state.history.subscribe().unwrap();
+        let mut view = SubscriberStatus::new(&state);
+        for rev in 1..=2048 {
+            state
+                .history
+                .format_transition(0, rev, || serde_json::json!({}));
+        }
+        let Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) = sub.events.try_recv()
+        else {
+            panic!("expected first overflow")
+        };
+        view.refresh(&state, true);
+        for rev in 2049..=4096 {
+            state
+                .history
+                .format_transition(0, rev, || serde_json::json!({}));
+        }
+        state.on_shutdown.send(true).unwrap();
+        state.history.announce_closing("shutdown");
+        let (lost, closing) = recover_subscription(&mut sub, &mut view, &state, n);
+        assert_eq!(lost, 4096);
+        assert_eq!(closing, Some("shutdown"));
+        assert_eq!(view.snapshot.state, InstanceState::Stopping);
+        assert!(sub.events.is_empty());
     }
 
     /// `subscribe`：先回快照与在途的记录，之后是事件——记录的开始与结束、状态变化、实例

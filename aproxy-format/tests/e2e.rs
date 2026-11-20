@@ -1158,3 +1158,79 @@ fn valid_json_without_source_response_fields_is_a_clean_502() {
         );
     }
 }
+
+/// Chat 能呈现 thinking 文本和工具调用，但没有可回放的 Anthropic 签名字段。续轮保留工具关联，不能伪造签名。
+#[test]
+fn streamed_thinking_tool_continuation_preserves_tools_but_not_the_signature() {
+    let mut w = Worker::new(&[
+        "convert",
+        "--from",
+        "openai_chat",
+        "--to",
+        "anthropic_messages",
+    ]);
+    open_stream(&mut w, "text/event-stream");
+    let corpus: Value = serde_json::from_str(include_str!("fixtures/protocols.json")).unwrap();
+    let native = corpus["anthropic_messages"]["events"].as_array().unwrap();
+    let mut events = vec![
+        native[0].clone(),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"checking"}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"fixture-signed"}}),
+    ];
+    events.extend_from_slice(&native[3..]);
+    let mut text = String::new();
+    for e in events {
+        text.push_str(
+            stream_frame(&mut w, "data", &format!("data: {e}\n\n"))["data"]
+                .as_str()
+                .unwrap(),
+        );
+    }
+    text.push_str(
+        stream_frame(&mut w, "close", "")["data"]
+            .as_str()
+            .unwrap_or(""),
+    );
+    let mut thinking = String::new();
+    let mut id = String::new();
+    let mut name = String::new();
+    let mut args = String::new();
+    for data in text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|s| *s != "[DONE]")
+    {
+        let chunk: Value = serde_json::from_str(data).unwrap();
+        let delta = &chunk["choices"][0]["delta"];
+        thinking.push_str(delta["reasoning_content"].as_str().unwrap_or(""));
+        let call = &delta["tool_calls"][0];
+        id.push_str(call["id"].as_str().unwrap_or(""));
+        name.push_str(call["function"]["name"].as_str().unwrap_or(""));
+        args.push_str(call["function"]["arguments"].as_str().unwrap_or(""));
+    }
+    assert_eq!(
+        (&*thinking, &*id, &*name),
+        ("checking", "call_one", "lookup")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&args).unwrap(),
+        json!({"q":"x"})
+    );
+    assert!(!text.contains("fixture-signed"));
+    let continuation = json!({"model":"fixture-model","max_tokens":128,"messages":[{"role":"user","content":"hello"},{"role":"assistant","reasoning_content":thinking,"tool_calls":[{"id":id,"type":"function","function":{"name":name,"arguments":args}}]},{"role":"tool","tool_call_id":id,"content":"found"}]});
+    let r = w.frame(request(
+        "https://relay.test/v1/chat/completions",
+        "/v1/chat/completions",
+        continuation,
+    ));
+    let body: Value = serde_json::from_str(r["request"]["body"].as_str().unwrap()).unwrap();
+    assert!(
+        body["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["type"] != "thinking")
+    );
+    assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], id);
+}

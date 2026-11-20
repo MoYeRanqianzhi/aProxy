@@ -2303,8 +2303,8 @@ fn dry_run_external_execution_requires_opt_in_and_discloses_the_boundary() {
             cmd.arg("--allow-external");
         }
         let out = cmd.output().unwrap();
+        assert_eq!(marker.join("config.toml").exists(), allow, "{out:?}");
         assert_eq!(out.status.success(), !allow, "{out:?}");
-        assert_eq!(marker.join("config.toml").exists(), allow);
         let err = String::from_utf8(out.stderr).unwrap();
         assert_eq!(err.contains("外部程序会收到样例和环境变量"), allow);
         let text = String::from_utf8(out.stdout).unwrap();

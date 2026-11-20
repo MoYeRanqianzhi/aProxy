@@ -12,9 +12,9 @@ use std::{
 /// 静态不兼容不能因条目可选而忽略；没拿到协议行的进程死亡或超时才是不可用。
 #[derive(Clone, Copy, Debug)]
 pub(super) enum PeerFault {
-    /// 未启动、未能交付输入、没有读到完整的一行或超时。
+    /// 未启动、未收到任何完整协议行就失联，或收发超时。
     Unavailable,
-    /// 已读到超限行、损坏的 JSON 或与声明冲突的握手。
+    /// 行超限、回信未经请求、JSON 损坏或握手与声明冲突。
     Invalid,
 }
 impl From<PeerFault> for String {
@@ -56,11 +56,12 @@ impl ChildPeer {
         std::thread::spawn(move || {
             for (line, limit) in recv {
                 let result = (|| {
-                    stdin
+                    // 子进程可能已留下诊断行再退出；写管道先报错也必须检查 stdout，
+                    // 不能把已经收到的非协议输出按可选程序不可用跳过。
+                    let written = stdin
                         .write_all(&line)
                         .and_then(|_| stdin.write_all(b"\n"))
-                        .and_then(|_| stdin.flush())
-                        .map_err(|_| PeerFault::Unavailable)?;
+                        .and_then(|_| stdin.flush());
                     let mut out = Vec::new();
                     stdout
                         .by_ref()
@@ -74,6 +75,8 @@ impl ChildPeer {
                             PeerFault::Unavailable
                         });
                     }
+                    // 请求未完整交付时，哪怕对端留下的是 JSON，也不是本帧的应答。
+                    written.map_err(|_| PeerFault::Invalid)?;
                     serde_json::from_slice(&out).map_err(|_| PeerFault::Invalid)
                 })();
                 let failed = result.is_err();
@@ -117,5 +120,35 @@ impl Drop for ChildPeer {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// 先回收子进程，固定「写 hello 前对端已关闭 stdin」的顺序，不靠操作系统调度碰运气。
+#[cfg(test)]
+#[test]
+fn exited_peer_distinguishes_buffered_output_from_silent_eof() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, _) = aproxy_ipc::config_file::parse(
+        "[[format]]\ncommand='fixture'\nstages=['request']",
+        &dir.path().join("config.toml"),
+    );
+    let mut entry = config.format.unwrap().remove(0);
+    entry.command = std::env::current_exe().unwrap().to_str().unwrap().into();
+    // libtest 列出一个测试后正常退出；不认识的选项只向 stderr 报错。两次都不会读 stdin。
+    for (args, banner) in [
+        (&["--list", "exited_peer_distinguishes"][..], true),
+        (&["--unknown-fixture-option"][..], false),
+    ] {
+        entry.args = args.iter().map(|s| (*s).to_owned()).collect();
+        let mut peer = ChildPeer::start(&entry, dir.path()).unwrap();
+        assert_eq!(peer.child.wait().unwrap().success(), banner);
+        let result = peer.frame(&serde_json::json!({"stage":"hello"}), 64 * 1024, 10);
+        assert!(
+            matches!(
+                (&result, banner),
+                (Err(PeerFault::Invalid), true) | (Err(PeerFault::Unavailable), false)
+            ),
+            "banner={banner}: {result:?}"
+        );
     }
 }

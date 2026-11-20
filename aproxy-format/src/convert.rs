@@ -1,4 +1,4 @@
-//! convert 为每个请求记住客户端协议。回程即使换了 worker，也不从上游响应内容反推客户端。
+//! convert 为每个请求记住客户端与上游的协议。回程即使换了 worker，也不从上游响应内容反推客户端。
 use crate::config::Fault;
 use crate::{config, detect, translate};
 use aproxy_envelope as w;
@@ -13,10 +13,25 @@ pub struct Convert {
     /// `auto` 或明确的客户端协议。
     pub from: String,
     /// 上游使用的协议。
-    pub to: F,
+    pub to: String,
+    /// to=auto 的目的端协议表，加载后按路径前缀从长到短排好。
+    #[serde(default)]
+    upstream: Vec<Destination>,
     /// 每个在途流独占进程，仅在 open 和终止帧之间保留这份状态。
     #[serde(skip)]
     stream: Option<Entity>,
+}
+/// 匹配规范化后的 origin 和路径段，避免 `/tenant` 也命中 `/tenant2`。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Destination {
+    /// 必须是完整 HTTP(S) origin，不可含路径、凭据或查询。
+    origin: String,
+    /// 空或根表示整个 origin；其他值必须从完整路径段开始。
+    #[serde(default)]
+    path_prefix: String,
+    /// 该地址真正使用的上游协议。
+    protocol: F,
 }
 /// 非流式实体也能经过 stream 阶段；同协议的流则无需收集正文。
 enum Entity {
@@ -25,7 +40,7 @@ enum Entity {
     /// 跨协议 SSE：持有单个未结束事件和各协议的语义状态。
     Sse(Box<crate::events::Events>),
     /// 只在跨协议非 SSE 实体结束后转换 JSON。
-    Json(F, Vec<u8>),
+    Json(F, F, Vec<u8>),
 }
 /// 不向诊断复制用户输入的协议名。
 pub fn protocol(s: &str) -> Result<F, &'static str> {
@@ -42,19 +57,48 @@ fn path(f: F) -> &'static str {
 impl Convert {
     /// 指定方向的命令行与配置文件使用同样的协议校验。
     pub fn new(from: &str, to: &str) -> Result<Self, &'static str> {
-        let c = Self {
+        let mut c = Self {
             from: from.into(),
-            to: protocol(to)?,
+            to: to.into(),
+            upstream: Vec::new(),
             stream: None,
         };
         c.validate()?;
         Ok(c)
     }
-    /// 检查显式输入协议；auto 留到实际请求再确定。
-    pub fn validate(&self) -> Result<(), &'static str> {
+    /// 握手前校验协议、映射唯一性与匹配边界，auto 留到看到实际请求再解析。
+    pub fn validate(&mut self) -> Result<(), &'static str> {
         if self.from != "auto" {
             protocol(&self.from)?;
         }
+        if self.to != "auto" {
+            protocol(&self.to)?;
+            if !self.upstream.is_empty() {
+                return Err("目的端协议表只用于 to=auto");
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for d in &mut self.upstream {
+            let url = config::endpoint(&d.origin)?;
+            if url.path() != "/" || url.query().is_some() {
+                return Err("目的端映射必须给出 origin");
+            }
+            d.origin = url.origin().ascii_serialization();
+            if !d.path_prefix.is_empty()
+                && (!d.path_prefix.starts_with('/')
+                    || d.path_prefix.contains(['?', '#', '\\'])
+                    || d.path_prefix.split('/').any(|v| matches!(v, "." | "..")))
+            {
+                return Err("目的端路径前缀无效");
+            }
+            d.path_prefix
+                .truncate(d.path_prefix.trim_end_matches('/').len());
+            if !seen.insert((d.origin.clone(), d.path_prefix.clone())) {
+                return Err("目的端协议映射重复");
+            }
+        }
+        self.upstream
+            .sort_by_key(|d| std::cmp::Reverse(d.path_prefix.len()));
         Ok(())
     }
     /// 只改写标准协议端点的路径，自定义上游路径与查询串保持原样。
@@ -73,20 +117,44 @@ impl Convert {
         } else {
             protocol(&self.from).map_err(|e| Fault::new(e, "invalid client protocol"))?
         };
+        let mut url =
+            config::endpoint(&m.request.url).map_err(|e| Fault::new(e, "invalid upstream URL"))?;
+        let to = if self.to == "auto" {
+            let origin = url.origin().ascii_serialization();
+            self.upstream
+                .iter()
+                .find(|d| {
+                    d.origin == origin
+                        && url
+                            .path()
+                            .strip_prefix(&d.path_prefix)
+                            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+                })
+                .map(|d| d.protocol)
+                .or_else(|| {
+                    [F::AnthropicMessages, F::OpenAiChat, F::OpenAiResponses]
+                        .into_iter()
+                        .find(|f| url.path().ends_with(path(*f)))
+                })
+                .ok_or(Fault::new(
+                    "无法识别上游协议，请配置目的端映射",
+                    "unknown upstream protocol; configure a destination mapping",
+                ))?
+        } else {
+            protocol(&self.to).map_err(|e| Fault::new(e, "invalid upstream protocol"))?
+        };
         let mut patch = w::RequestPatch::new();
         let mut headers = m.request.headers.clone();
-        if from != self.to {
+        if from != to {
             patch.body = w::Body::Text(
-                translate::translate_request(from, self.to, &body)
+                translate::translate_request(from, to, &body)
                     .map_err(|_| {
                         Fault::new("请求协议转换失败", "request protocol conversion failed")
                     })?
                     .to_string(),
             );
-            let mut url = config::endpoint(&m.request.url)
-                .map_err(|e| Fault::new(e, "invalid upstream URL"))?;
             if url.path() == path(from) {
-                url.set_path(path(self.to));
+                url.set_path(path(to));
                 patch.url = Some(url.into());
             }
             headers.remove("content-encoding");
@@ -95,39 +163,49 @@ impl Convert {
         headers
             .entry("content-type".into())
             .or_insert_with(|| "application/json".into());
-        if self.to == F::AnthropicMessages {
+        if to == F::AnthropicMessages {
             headers
                 .entry("anthropic-version".into())
                 .or_insert_with(|| "2023-06-01".into());
         }
         patch.headers = Some(headers);
         r.request = Some(patch);
-        r.state = Some(from.to_string());
+        r.state = Some(serde_json::json!([from, to]).to_string());
         r.report = config::report(
             "Selected the protocol conversion",
             w::StandardAction::ProtocolConvert {
                 from: from.to_string(),
-                to: self.to.to_string(),
+                to: to.to_string(),
             },
         );
         Ok(())
     }
-    /// 响应专用配置可直接声明客户端协议；自动检测则必须拿到请求留下的状态。
-    fn client(&self, ctx: &w::Context) -> Result<F, Fault> {
-        ctx.state
-            .as_deref()
-            .or((self.from != "auto").then_some(self.from.as_str()))
-            .ok_or(Fault::new(
+    /// 回程的两端协议来自同一个请求的状态；无状态的独立响应仅限两端都显式指定。
+    fn pair(&self, ctx: &w::Context) -> Result<(F, F), Fault> {
+        if let Some(s) = &ctx.state {
+            return serde_json::from_str(s)
+                .map_err(|_| Fault::new("协议状态无效", "invalid protocol state"));
+        }
+        if self.from == "auto" || self.to == "auto" {
+            return Err(Fault::new(
                 "响应缺少客户端协议状态",
                 "client protocol state is missing",
-            ))
-            .and_then(|name| protocol(name).map_err(|e| Fault::new(e, "invalid client protocol")))
+            ));
+        }
+        Ok((
+            protocol(&self.from).map_err(|e| Fault::new(e, "invalid client protocol"))?,
+            protocol(&self.to).map_err(|e| Fault::new(e, "invalid upstream protocol"))?,
+        ))
     }
     /// 回程失败要替换整份实体；裸 fail 会让代理原样透传上游私有错误页和鉴权头。
     /// 丢失协商状态时只用两族 SDK 都能读的 error 对象，不从原正文猜协议或复制原文。
     pub fn error_response(&self, ctx: &w::Context) -> w::Response {
         let message = "The upstream response could not be converted.";
-        let body = match self.client(ctx) {
+        let body = match self
+            .pair(ctx)
+            .map(|(client, _)| client)
+            .or_else(|_| protocol(&self.from))
+        {
             Ok(F::OpenAiChat | F::OpenAiResponses) => {
                 serde_json::json!({"error":{"type":"server_error","message":message,"code":"conversion_failed","param":null}})
             }
@@ -143,7 +221,7 @@ impl Convert {
         response
     }
     /// 缓冲转换只解释成功实体，不把源正文或库错误中的字段值带到日志。
-    fn json(&self, client: F, bytes: &[u8]) -> Result<String, Fault> {
+    fn json(client: F, upstream: F, bytes: &[u8]) -> Result<String, Fault> {
         if std::str::from_utf8(bytes).is_ok_and(detect::looks_like_sse) {
             return Err(Fault::new(
                 "跨协议事件流需要 stream 阶段",
@@ -152,7 +230,7 @@ impl Convert {
         }
         let body = serde_json::from_slice(bytes)
             .map_err(|_| Fault::new("响应体不是 JSON", "response body is not valid JSON"))?;
-        Ok(translate::translate_response(self.to, client, &body)
+        Ok(translate::translate_response(upstream, client, &body)
             .map_err(|_| Fault::new("响应协议转换失败", "response protocol conversion failed"))?
             .to_string())
     }
@@ -166,11 +244,14 @@ impl Convert {
     }
     /// 同协议不解析实体，保留原字节（含 SSE 与二进制）。
     pub fn response(&self, m: &w::ResponseMessage, r: &mut w::Reply) -> Result<(), Fault> {
-        let client = self.client(&m.context)?;
+        let (client, upstream) = self.pair(&m.context)?;
         let mut p = self.response_headers(&m.response.headers);
-        if client != self.to {
-            p.body =
-                w::Body::Text(self.json(client, m.response.body.as_bytes().unwrap_or_default())?);
+        if client != upstream {
+            p.body = w::Body::Text(Self::json(
+                client,
+                upstream,
+                m.response.body.as_bytes().unwrap_or_default(),
+            )?);
         }
         r.response = Some(p);
         Ok(())
@@ -179,20 +260,20 @@ impl Convert {
     pub fn stream(&mut self, m: &w::StreamMessage, r: &mut w::Reply) -> Result<(), Fault> {
         match &m.event {
             w::StreamEvent::Open(o) => {
-                let client = self.client(&o.context)?;
+                let (client, upstream) = self.pair(&o.context)?;
                 r.response = Some(self.response_headers(&o.response.headers));
-                self.stream = Some(if client == self.to {
+                self.stream = Some(if client == upstream {
                     Entity::Pass
                 } else if o.response.headers.get("content-type").is_some_and(|s| {
                     s.split(';')
                         .next()
                         .is_some_and(|t| t.trim().eq_ignore_ascii_case("text/event-stream"))
                 }) {
-                    let events = crate::events::Events::new(self.to, client);
+                    let events = crate::events::Events::new(upstream, client);
                     r.abort_tail = Some(events.abort().into());
                     Entity::Sse(Box::new(events))
                 } else {
-                    Entity::Json(client, Vec::new())
+                    Entity::Json(client, upstream, Vec::new())
                 });
             }
             w::StreamEvent::Data(d) => match self
@@ -202,7 +283,7 @@ impl Convert {
             {
                 Entity::Pass => r.data = w::Data::from_bytes(d.as_bytes().to_vec()),
                 Entity::Sse(events) => r.data = w::Data::Text(events.feed(d.as_bytes())?),
-                Entity::Json(_, b) => {
+                Entity::Json(_, _, b) => {
                     if b.len().saturating_add(d.as_bytes().len()) > 64 * 1024 * 1024 {
                         return Err(Fault::new(
                             "非流式响应超过 64 MiB",
@@ -214,7 +295,9 @@ impl Convert {
                 }
             },
             w::StreamEvent::Close => match self.stream.take() {
-                Some(Entity::Json(client, b)) => r.data = w::Data::Text(self.json(client, &b)?),
+                Some(Entity::Json(client, upstream, b)) => {
+                    r.data = w::Data::Text(Self::json(client, upstream, &b)?)
+                }
                 Some(Entity::Sse(events)) => r.data = w::Data::Text(events.finish()?),
                 _ => (),
             },

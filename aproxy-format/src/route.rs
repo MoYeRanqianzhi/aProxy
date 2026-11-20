@@ -208,7 +208,7 @@ impl Route {
             .map(String::as_str)
             .unwrap_or(original);
         let prior = retry
-            .and_then(|_| m.context.state.as_deref())
+            .and(m.context.state.as_deref())
             .and_then(|v| serde_json::from_str::<(String, Option<String>, u64)>(v).ok());
         let ticket = prior
             .as_ref()

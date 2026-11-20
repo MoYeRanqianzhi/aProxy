@@ -102,7 +102,10 @@ fn cross_format_response_conversion_end_to_end() {
         "/v1/chat/completions",
         json!({"model":"gpt","messages":[{"role":"user","content":"hi"}],"max_tokens":30}),
     ));
-    assert_eq!(r["state"], "openai_chat");
+    assert_eq!(
+        r["state"],
+        json!(["openai_chat", "anthropic_messages"]).to_string()
+    );
     assert!(r["request"].get("url").is_none());
     drop(first);
     let mut second = Worker::new(&args);
@@ -132,14 +135,63 @@ fn auto_detect_rejects_unknown_input_and_requires_response_state() {
         "/v1/messages",
         json!({"model":"m","messages":[],"max_tokens":10}),
     ));
-    assert_eq!(good["state"], "anthropic_messages");
+    assert_eq!(
+        good["state"],
+        json!(["anthropic_messages", "anthropic_messages"]).to_string()
+    );
     assert!(good["request"].get("body").is_none());
     let same = w.frame(response(&good["state"], "event: ping\ndata: {}\n\n"));
     assert!(same.get("fail").is_none() && same["response"].get("body").is_none());
-    let cross = w.frame(response(&json!("openai_chat"), "data: {}\n\n"));
+    let cross = w.frame(response(
+        &json!(json!(["openai_chat", "anthropic_messages"]).to_string()),
+        "data: {}\n\n",
+    ));
     assert!(cross["fail"]["reason"].as_str().unwrap().contains("stream"));
     let missing = w.frame(response(&Value::Null, "{}"));
     assert_eq!(missing["fail"]["retry"], false);
+}
+/// 目的端先按 origin 与最长路径段匹配，再看标准端点；回程在另一进程不重猜当前 URL。
+#[test]
+fn automatic_upstream_uses_route_origin_and_longest_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("convert.toml");
+    std::fs::write(&f,"from='openai_chat'\nto='auto'\n[[upstream]]\norigin='https://mixed.test'\nprotocol='openai_chat'\n[[upstream]]\norigin='https://mixed.test:443'\npath_prefix='/tenant'\nprotocol='anthropic_messages'").unwrap();
+    let args = ["convert", "--config", f.to_str().unwrap()];
+    let mut w = Worker::new(&args);
+    for (url, proto) in [
+        ("https://mixed.test/tenant/custom", "anthropic_messages"),
+        (
+            "https://mixed.test/tenant/v1/responses",
+            "anthropic_messages",
+        ),
+        ("https://mixed.test/tenantX/custom", "openai_chat"),
+        ("https://other.test/v1/responses", "openai_responses"),
+    ] {
+        let r = w.frame(request(
+            url,
+            "/v1/chat/completions",
+            json!({"model":"m","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}),
+        ));
+        assert_eq!(
+            serde_json::from_str::<Value>(r["state"].as_str().unwrap()).unwrap(),
+            json!(["openai_chat", proto])
+        );
+        if proto == "anthropic_messages" {
+            let r=Worker::new(&args).frame(response(&r["state"],r#"{"role":"assistant","content":[{"type":"text","text":"answer"}],"model":"served","stop_reason":"end_turn"}"#));
+            let body: Value =
+                serde_json::from_str(r["response"]["body"].as_str().unwrap()).unwrap();
+            assert_eq!(body["choices"][0]["message"]["content"], "answer");
+        }
+    }
+    let r = w.frame(request(
+        "https://mixed.test:444/custom",
+        "/v1/chat/completions",
+        json!({"model":"m","messages":[]}),
+    ));
+    assert_eq!(
+        r["fail"]["reason"],
+        "unknown upstream protocol; configure a destination mapping"
+    );
 }
 /// 未知 origin 不能占掉轮换名额，更不能借地址前缀骗取其他源的 key。
 #[test]
@@ -753,7 +805,7 @@ fn auto_detect_refuses_overlapping_message_shapes_on_custom_paths() {
         ("/v1/chat/completions", "openai_chat"),
     ] {
         let r = worker.frame(request("https://a.test/custom", path, body.clone()));
-        assert_eq!(r["state"], state);
+        assert_eq!(r["state"], json!([state, "openai_chat"]).to_string());
     }
 }
 

@@ -32,7 +32,14 @@ def exchange(binary, role, args, frames):
 def translated(binary, source, target, sample):
     """模拟一个真实的成功 stream；按不规则块切分，不能假定一条管道消息恰是一条事件。"""
     stream = dict(stage="stream", stream_id="r/1")
-    frames = [dict(stream, event="open", request_id="r", state=target,
+    args = ["--from", target, "--to", source]
+    body = {"model": "fixture", "input": "hello"} if target == "openai_responses" else {
+        "model": "fixture", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 8}
+    req = dict(stage="request", request_id="r", delivery="retry", client={"path": PATHS[target]},
+               request={"method": "POST", "url": "https://fixture.invalid" + PATHS[source],
+                        "headers": {}, "body": json.dumps(body)})
+    state = exchange(binary, "convert", args, [req])[0]["state"]
+    frames = [dict(stream, event="open", request_id="r", state=state,
                    request={"method": "POST", "url": "https://fixture.invalid"},
                    response={"status": 200, "headers": {"content-type": "text/event-stream"}})]
     native = "".join((f"event: {e['type']}\r\n" if "type" in e else "") +
@@ -41,7 +48,7 @@ def translated(binary, source, target, sample):
         native += "data: [DONE]\n\n"
     frames.extend(dict(stream, event="data", data=native[i:i+47]) for i in range(0, len(native), 47))
     frames.append(dict(stream, event="close"))
-    replies = exchange(binary, "convert", ["--from", target, "--to", source], frames)
+    replies = exchange(binary, "convert", args, frames)
     assert replies[0]["abort_tail"].endswith("\n\n")
     return "".join(r.get("data", "") for r in replies[1:])
 

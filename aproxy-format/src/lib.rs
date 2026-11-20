@@ -75,7 +75,7 @@ impl Role {
         if name == "convert" {
             return Ok(Self::Convert(match (opt.config, opt.from, opt.to) {
                 (Some(p), None, None) => {
-                    let c: convert::Convert = config::load(p)?;
+                    let mut c: convert::Convert = config::load(p)?;
                     c.validate()?;
                     c
                 }

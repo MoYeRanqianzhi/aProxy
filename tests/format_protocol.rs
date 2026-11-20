@@ -6009,6 +6009,54 @@ async fn adaptive_unavailable_falls_back_to_retry() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
 }
 
+/// 同一链的 Chat 渠道能原样返回；它在第二种模型上失败后，另一租户收到重新生成的 Messages 请求。
+#[tokio::test]
+async fn full_config_roundtrip_routes_mixed_protocols_and_reconverts_on_failover() {
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let (send, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let app=axum::Router::new().fallback(move |u:axum::http::Uri, axum::Json(b):axum::Json<Value>| {let model=b["model"].as_str().unwrap().to_owned();let anth=u.path()=="/messages-tenant/run";send.send((u,b)).unwrap();async move {
+        let (status,reply)=if anth {(200,serde_json::json!({"id":"m2","type":"message","role":"assistant","model":model,"content":[{"type":"text","text":"second"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":1}}))}else if model=="switch"{(503,serde_json::json!({"error":"busy"}))}else{(200,serde_json::json!({"id":"m1","object":"chat.completion","model":model,"choices":[{"index":0,"message":{"role":"assistant","content":"first"},"finish_reason":"stop"}]}))};(axum::http::StatusCode::from_u16(status).unwrap(),axum::Json(reply))
+    }});
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let origin = format!("http://127.0.0.1:{up}");
+    let route = home.path().join("route.toml");
+    let convert = home.path().join("convert.toml");
+    std::fs::write(&route,format!("[[channel]]\nid='chat'\npriority=1\nurl='{origin}/chat-tenant/run'\n[[channel]]\nid='messages'\npriority=2\nurl='{origin}/messages-tenant/run'\n")).unwrap();
+    std::fs::write(&convert,format!("from='auto'\nto='auto'\n[[upstream]]\norigin='{origin}'\npath_prefix='/chat-tenant'\nprotocol='openai_chat'\n[[upstream]]\norigin='{origin}'\npath_prefix='/messages-tenant'\nprotocol='anthropic_messages'\n")).unwrap();
+    let cfg = official_layer(
+        "route",
+        "'request','retry'",
+        &["route", "--config", route.to_str().unwrap()],
+    ) + &official_layer(
+        "convert",
+        "'request','retry','response'",
+        &["convert", "--config", convert.to_str().unwrap()],
+    );
+    let (client, url) = running(&home, up, &cfg);
+    for (model, answer) in [("ordinary", "first"), ("switch", "second")] {
+        let r=client.post(format!("{url}/v1/chat/completions")).json(&serde_json::json!({"model":model,"max_tokens":10,"messages":[{"role":"system","content":"instructions"},{"role":"user","content":"hi"}]})).send().await.unwrap().json::<Value>().await.unwrap();
+        assert_eq!(r["choices"][0]["message"]["content"], answer, "{r}");
+    }
+    for expected in [
+        "/chat-tenant/run",
+        "/chat-tenant/run",
+        "/messages-tenant/run",
+    ] {
+        let (uri, b) = observed.try_recv().unwrap();
+        assert_eq!(uri.path(), expected);
+        if expected.starts_with("/chat") {
+            assert_eq!(b["messages"][0]["role"], "system");
+        } else {
+            assert_eq!(b["system"], "instructions");
+            assert_eq!(b["messages"][0]["role"], "user");
+        }
+    }
+}
+
 /// 两个不同 origin 的真实上游分别观察地址、模型和认证；503 的下一次尝试不能沿用 A 的凭据。
 #[tokio::test]
 async fn official_route_failover_swaps_url_and_credentials_together() {

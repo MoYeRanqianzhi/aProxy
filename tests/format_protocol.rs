@@ -7231,3 +7231,26 @@ fn rehearsal_validates_peer_http_patches_before_dispatch() {
         }
     }
 }
+
+/// 流单元可消费输入而不产生任何输出；外层不能收到原块或虚构的空数据帧。
+#[test]
+fn rehearsal_omitted_stream_output_does_not_forward_the_input() {
+    let home = TestHome::new();
+    let cfg = layer(&home, "outer", "'stream'", &["noop"])
+        + &layer(&home, "inner", "'stream'", &["noop"]);
+    let out = format_trial(
+        &home,
+        &cfg,
+        serde_json::json!({"path":"/","body":{},"attempts":[{"status":200,"chunks":["consumed"]}]}),
+    );
+    assert!(out.status.success(), "{out:?}");
+    for (name, expected) in [("outer", 0), ("inner", 1)] {
+        assert_eq!(
+            frames(&home, name)
+                .iter()
+                .filter(|m| m["event"] == "data")
+                .count(),
+            expected
+        );
+    }
+}

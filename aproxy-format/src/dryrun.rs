@@ -667,7 +667,7 @@ impl<W: Write> Trial<'_, W> {
                 let mut result = Vec::new();
                 if matches!(resp.status, 100..=199 | 204 | 304) {
                     chunks.clear();
-                } else if let Some(prefix) = open.data.as_bytes() {
+                } else if let Some(prefix) = open.data.as_bytes().filter(|b| !b.is_empty()) {
                     result.push(prefix.to_vec());
                 }
                 for chunk in chunks {
@@ -682,7 +682,7 @@ impl<W: Write> Trial<'_, W> {
                     if r.fail.is_some() {
                         return Err("流角色拒绝样例数据".into());
                     }
-                    let b = r.data.as_bytes().unwrap_or(&chunk);
+                    let b = r.data.as_bytes().unwrap_or_default();
                     trace(
                         self.out,
                         "stream:data",
@@ -691,7 +691,9 @@ impl<W: Write> Trial<'_, W> {
                         Value::Null,
                         if b == chunk { vec![] } else { vec!["data"] },
                     )?;
-                    result.push(b.to_vec());
+                    if !b.is_empty() {
+                        result.push(b.to_vec());
+                    }
                 }
                 let end = if cut {
                     json!({"stream_id":stream_id,"event":"abort","reason":{"code":"upstream_body_interrupted"}})
@@ -700,7 +702,7 @@ impl<W: Write> Trial<'_, W> {
                 };
                 let r = self.call(i, "stream", end)?;
                 if !matches!(resp.status, 100..=199 | 204 | 304)
-                    && let Some(b) = r.data.as_bytes()
+                    && let Some(b) = r.data.as_bytes().filter(|b| !b.is_empty())
                 {
                     result.push(b.to_vec());
                 }

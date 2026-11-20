@@ -385,8 +385,27 @@ struct Settlement {
     /// 是程序投了决定票，还是只有实例保底决定。
     decided: bool,
 }
+/// 客户端最终拿到的分类，不用上游状态或客户端流偏好替代真实交付结果。
+struct Delivered {
+    /// 与请求历史使用同一组公开终态名。
+    outcome: &'static str,
+    /// 成功没有错误码，其余终态携带稳定的分类码。
+    code: Option<&'static str>,
+    /// 最外层实际由流程序交付，媒体类型可以不是 SSE。
+    converted: bool,
+    /// 已提交的响应在交付途中截断，即使没有流媒体头也要通知。
+    aborted: bool,
+    /// 操作者只看到固定类别，不泄露程序自定义的名称。
+    by: &'static str,
+}
 /// 共享的只读上下文与有限试跑状态；没有网络或实际时间退避。
 struct Trial<'a, W> {
+    /// 最后真正收到的上游头，链内失败和连接失败不清除过去的观察。
+    last_upstream: Option<u16>,
+    /// 是否已经按样例节拍发送了 SSE 骨架头，后续终态不能再撤回它。
+    committed: bool,
+    /// 实际客户端使用 HEAD 时不交付正文，即使某层改了出站方法。
+    client_head: bool,
     /// 投影写入端；测试可以直接审查所有输出。
     out: &'a mut W,
     /// 声明顺序，响应与心跳倒序遍历。
@@ -691,7 +710,8 @@ impl<W: Write> Trial<'_, W> {
         mut chunks: Vec<Vec<u8>>,
         cut: bool,
         attempt: u32,
-    ) -> Result<(), CliError> {
+    ) -> Result<bool, CliError> {
+        let mut converted = false;
         let nested = self.units.iter().filter(|u| u.has(Stage::Stream)).count() > 1;
         let nested_end = || {
             CliError::Unsimulated(
@@ -706,6 +726,7 @@ impl<W: Write> Trial<'_, W> {
         for i in (0..self.units.len()).rev() {
             let label = self.units[i].layer.label;
             if self.units[i].has(Stage::Response) {
+                converted = false;
                 resp.body = w::Body::from_bytes(chunks.concat());
                 let before = view(&req.url, &resp.headers);
                 let r = self.call(
@@ -746,6 +767,7 @@ impl<W: Write> Trial<'_, W> {
                 let open=self.call(i,"stream",json!({"event":"open","stream_id":stream_id,"client":self.client,"request":meta,"response":{"status":resp.status,"headers":resp.headers}}))?;
                 if let Some(f) = open.fail {
                     let changed = if let Some(replacement) = f.response {
+                        converted = false;
                         *resp = replacement;
                         chunks = vec![resp.body.as_bytes().unwrap_or_default().to_vec()];
                         "response"
@@ -762,6 +784,7 @@ impl<W: Write> Trial<'_, W> {
                     )?;
                     continue;
                 }
+                converted = true;
                 if let Some(p) = open.response {
                     resp.apply(p);
                 }
@@ -837,32 +860,80 @@ impl<W: Write> Trial<'_, W> {
             }
         }
         resp.body = w::Body::from_bytes(chunks.concat());
-        Ok(())
+        Ok(converted)
     }
     /// 业务拒绝在接触上游之前终结尝试；自定义响应覆盖默认状态，但诊断仍归属于格式拒绝。
     fn rejected(&mut self, fail: &w::Fail, attempt: u32, upgraded: bool) -> Result<(), CliError> {
+        let default = w::Response::new(422);
+        self.finish(
+            attempt,
+            upgraded,
+            fail.response.as_ref().unwrap_or(&default),
+            Delivered {
+                outcome: if fail.response.is_some() {
+                    "format_response"
+                } else {
+                    "aproxy_error"
+                },
+                code: Some("format_rejected"),
+                converted: false,
+                aborted: false,
+                by: "format",
+            },
+        )
+    }
+    /// 终态投影和订阅者来自同一份交付事实；不把客户端请求的流偏好误作已经收到的流。
+    fn finish(
+        &mut self,
+        n: u32,
+        upgraded: bool,
+        response: &w::Response,
+        end: Delivered,
+    ) -> Result<(), CliError> {
+        let status = if self.committed { 200 } else { response.status };
+        let has_body = !self.client_head && !matches!(status, 100..=199 | 204 | 304);
+        let media = response
+            .headers
+            .get("content-type")
+            .and_then(|s| s.split(';').next())
+            .map(str::trim);
+        let streamed = self.committed
+            || end.converted
+            || media.is_some_and(|v| {
+                v.eq_ignore_ascii_case("text/event-stream")
+                    || v.eq_ignore_ascii_case("application/x-ndjson")
+            });
+        let completed = (has_body && (end.aborted || streamed)).then_some(!end.aborted);
+        let mut outcome = end.outcome;
+        if self.committed && outcome == "format_response" {
+            if response.headers.contains_key("content-encoding") {
+                return Err(CliError::Unsimulated(
+                    "已提交保活后的编码终态；真实实例会先严格解码再决定终态事件".into(),
+                ));
+            }
+            let body = response.body.as_bytes().unwrap_or_default();
+            if !media.is_some_and(|v| v.eq_ignore_ascii_case("text/event-stream"))
+                && (body.len() > aproxy_ipc::decode::PREVIEW_BYTES
+                    || serde_json::from_slice::<serde::de::IgnoredAny>(body).is_err())
+            {
+                outcome = "aproxy_error";
+            }
+        }
         trace(
             self.out,
             "result",
             "proxy",
             Value::Null,
-            json!({"status":fail.response.as_ref().map_or(422,|r|r.status),"code":"format_rejected"}),
-            vec!["rejected"],
+            json!({"status":status,"decided_by":end.by,"outcome":outcome,"code":end.code}),
+            if end.code == Some("format_rejected") {
+                vec!["rejected"]
+            } else {
+                vec![]
+            },
         )?;
-        self.notify(attempt, None, upgraded, None, "failed")
-    }
-    /// 完成只发给订阅者；通知不是可以再改变交付结果的一票。
-    fn notify(
-        &mut self,
-        n: u32,
-        status: Option<u16>,
-        upgraded: bool,
-        completed: Option<bool>,
-        outcome: &str,
-    ) -> Result<(), CliError> {
         for i in 0..self.units.len() {
             if self.units[i].has(Stage::Notify) {
-                self.call(i,"notify",json!({"event":"request_end","client":self.client,"delivery":self.mode,"upgraded":upgraded,"attempts":n,"duration_ms":self.elapsed_ms,"upstream_status":status,"stream_completed":completed,"outcome":outcome,"code":null}))?;
+                self.call(i,"notify",json!({"event":"request_end","client":self.client,"delivery":self.mode,"upgraded":upgraded,"attempts":n,"duration_ms":self.elapsed_ms,"upstream_status":self.last_upstream,"stream_completed":completed,"outcome":outcome,"code":end.code}))?;
                 trace(
                     self.out,
                     "notify",
@@ -1034,6 +1105,9 @@ fn rehearse(
         f::KeepaliveTrigger::Any => stream_body || accept,
     };
     let mut t = Trial {
+        last_upstream: None,
+        client_head: req.method == "HEAD",
+        committed: false,
         out,
         units: Vec::new(),
         dir: &chain.directory,
@@ -1171,6 +1245,7 @@ fn rehearse(
                 }
             }
             if let Some(text) = &committed_beat {
+                t.committed = true;
                 t.heartbeat(n, text)?;
             }
         }
@@ -1235,6 +1310,9 @@ fn rehearse(
             live = false;
             chunks.clear();
         }
+        if let Some(r) = &resp {
+            t.last_upstream = Some(r.status);
+        }
         let base_retry = fallback(
             &chain.config,
             &t.units,
@@ -1281,34 +1359,47 @@ fn rehearse(
             }
             continue;
         }
+        let original = resp.is_some() && (live || !partial);
         let mut response = resp
-            .filter(|_| live || !partial)
+            .filter(|_| original)
             .unwrap_or_else(|| w::Response::new(502));
+        let mut end = Delivered {
+            outcome: "ok",
+            code: None,
+            converted: false,
+            aborted: live && partial,
+            by: if settled.decided {
+                "format"
+            } else {
+                "fallback"
+            },
+        };
         if let Some(p) = settled.stop {
             response.apply(p);
-        } else if (failure.is_none() || live) && (!forward || success) {
-            t.deliver(&req, &mut response, chunks, live && partial, n)?;
+            end.outcome = "format_response";
+            end.code = Some("retry_stopped");
+        } else {
+            if let Some(f) = failure.as_ref() {
+                end.outcome = if original && !t.committed {
+                    "upstream_error"
+                } else {
+                    "aproxy_error"
+                };
+                end.code = Some(if forward && f["code"] == "format_fail" {
+                    "format_failed"
+                } else if forward {
+                    "upstream_failed"
+                } else if settled.decided {
+                    "retry_stopped"
+                } else {
+                    "retry_exhausted"
+                });
+            }
+            if (failure.is_none() || live) && (!forward || success) {
+                end.converted = t.deliver(&req, &mut response, chunks, live && partial, n)?;
+            }
         }
-        trace(
-            t.out,
-            "result",
-            "proxy",
-            Value::Null,
-            json!({"status":response.status,"decided_by":if settled.decided {"format"} else {"fallback"}}),
-            vec![],
-        )?;
-        t.notify(
-            n,
-            attempt.status,
-            upgraded,
-            streaming.then_some(!attempt.interrupted),
-            if failure.is_some() || attempt.interrupted {
-                "upstream_error"
-            } else {
-                "ok"
-            },
-        )?;
-        return Ok(());
+        return t.finish(n, upgraded, &response, end);
     }
     trace(
         t.out,

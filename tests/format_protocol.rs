@@ -7307,3 +7307,113 @@ fn rehearsal_elapsed_time_advances_by_the_winning_delay() {
         90000
     );
 }
+
+/// 通知按客户端实际收到的实体和终态填写，不从流偏好或最后一次样本的状态反推。
+#[test]
+fn rehearsal_notify_describes_delivered_response_and_terminal() {
+    for (method, pref, attempt, stop, outcome, code, stream) in [
+        (
+            "POST",
+            true,
+            serde_json::json!({"status":200,"body":{}}),
+            false,
+            "ok",
+            None,
+            None,
+        ),
+        (
+            "POST",
+            false,
+            serde_json::json!({"status":200,"headers":{"content-type":"Text/Event-Stream; charset=utf-8"}}),
+            false,
+            "ok",
+            None,
+            Some(true),
+        ),
+        (
+            "HEAD",
+            true,
+            serde_json::json!({"status":200,"headers":{"content-type":"text/event-stream"}}),
+            false,
+            "ok",
+            None,
+            None,
+        ),
+        (
+            "POST",
+            true,
+            serde_json::json!({"status":204,"headers":{"content-type":"application/x-ndjson"}}),
+            false,
+            "ok",
+            None,
+            None,
+        ),
+        (
+            "POST",
+            false,
+            serde_json::json!({"status":200,"interrupted":true}),
+            false,
+            "upstream_error",
+            Some("upstream_failed"),
+            Some(false),
+        ),
+        (
+            "POST",
+            false,
+            serde_json::json!({"status":200,"body":{"error":{}}}),
+            false,
+            "upstream_error",
+            Some("upstream_failed"),
+            None,
+        ),
+        (
+            "POST",
+            true,
+            serde_json::json!({"status":200,"body":{}}),
+            true,
+            "format_response",
+            Some("retry_stopped"),
+            None,
+        ),
+    ] {
+        let home = TestHome::new();
+        let mut cfg = if stop {
+            String::from("delivery='retry'\n")
+        } else {
+            String::from("delivery='forward'\n")
+        };
+        cfg += &layer(&home, "observer", "'notify'", &["noop"]);
+        if stop {
+            cfg += "[[format]]\nname='policy'\ncommand='aproxy-format'\nargs=['policy','--config','policy.toml']\nstages=['decide']\n";
+            std::fs::write(
+                home.path().join("policy.toml"),
+                "[[rule]]\nstatus=[200]\ndecision='stop'\nresponse='context_too_long'",
+            )
+            .unwrap();
+        }
+        let out = format_trial(
+            &home,
+            &cfg,
+            serde_json::json!({"path":"/","method":method,"body":{"stream":pref},"attempts":[attempt]}),
+        );
+        assert!(out.status.success(), "{out:?}");
+        let obs = frames(&home, "observer")
+            .into_iter()
+            .find(|m| m["stage"] == "notify")
+            .unwrap();
+        assert_eq!(
+            (
+                &obs["outcome"],
+                &obs["code"],
+                &obs["stream_completed"],
+                &obs["upstream_status"]
+            ),
+            (
+                &serde_json::json!(outcome),
+                &serde_json::json!(code),
+                &serde_json::json!(stream),
+                &attempt["status"]
+            )
+        );
+    }
+}

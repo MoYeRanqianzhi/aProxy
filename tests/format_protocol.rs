@@ -5552,32 +5552,46 @@ async fn later_decide_elapsed_includes_the_previous_voters_wait() {
 /// 骨架头先真正交付，内层 open 随后试改状态和头。外层看到的必须仍是未打补丁的上游元数据。
 #[tokio::test]
 async fn committed_open_patches_do_not_change_the_next_stream_layers_input() {
-    let home = TestHome::new();
-    let (up, release, _) = held_upstream(&[200], "data: ok\n\n").await;
-    let cfg = String::from("keepalive.trigger='accept'\nkeepalive.interval_secs=1\n")
-        + &layer(&home, "outer", "'stream'", &["stream-echo"])
-        + &layer(
-            &home,
-            "inner",
-            "'stream'",
-            &[
-                "reply",
-                r#"{"response":{"status":409,"headers":{"x-hidden":"ignored"}}}"#,
-            ],
+    use base64::Engine as _;
+    use std::io::Write as _;
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gzip.write_all(b"replacement").unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(gzip.finish().unwrap());
+    for code in [None, Some(204), Some(409)] {
+        let home = TestHome::new();
+        let patch = if let Some(status) = code {
+            serde_json::json!({"fail":{"retry":false,"reason":"replacement","response":{"status":status,"headers":{"x-hidden":"ignored","content-encoding":"gzip"},"body_b64":encoded}}}).to_string()
+        } else {
+            r#"{"response":{"status":409,"headers":{"x-hidden":"ignored"}}}"#.into()
+        };
+        let (up, release, _) = held_upstream(&[200], "data: ok\n\n").await;
+        let cfg = String::from("keepalive.trigger='accept'\nkeepalive.interval_secs=1\n")
+            + &layer(&home, "outer", "'stream'", &["stream-echo"])
+            + &layer(&home, "inner", "'stream'", &["reply", &patch]);
+        let (c, url) = running(&home, up, &cfg);
+        let mut response = c
+            .get(&url)
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .unwrap();
+        assert!(response.chunk().await.unwrap().is_some());
+        release.add_permits(1);
+        let tail = response.bytes().await.unwrap();
+        let outer: Vec<_> = frames(&home, "outer")
+            .into_iter()
+            .filter(|v| v["stage"] == "stream")
+            .collect();
+        assert!(
+            !outer.is_empty(),
+            "outer skipped on committed replacement {code:?}"
         );
-    let (c, url) = running(&home, up, &cfg);
-    let mut response = c
-        .get(&url)
-        .header("accept", "text/event-stream")
-        .send()
-        .await
-        .unwrap();
-    assert!(response.chunk().await.unwrap().is_some());
-    release.add_permits(1);
-    response.bytes().await.unwrap();
-    let outer = observed_stage(&home, "outer", "stream", 1).await;
-    assert_eq!(outer[0]["response"]["status"], 200);
-    assert!(outer[0]["response"]["headers"].get("x-hidden").is_none());
+        if code.is_some() {
+            assert_eq!(tail, "[replacement]");
+        }
+        assert_eq!(outer[0]["response"]["status"], 200);
+        assert!(outer[0]["response"]["headers"].get("x-hidden").is_none());
+    }
 }
 
 /// 不等最后一块才产出：先由客户端确认真正的转换数据，再放行下一块；墙钟数字另作负载测量。
@@ -6130,4 +6144,32 @@ async fn stopped_forward_attempt_has_no_reroute_in_history() {
     let d = &record["record"]["tries"][0]["decision"];
     assert_eq!(d["decision"], "stop");
     assert!(d.get("reroute").is_none(), "{d}");
+}
+
+/// 204 不交付实体，但 close 是正常阶段：它的状态与报告先于完成通知，并不适用断连宽限。
+#[tokio::test]
+async fn bodyless_close_state_reaches_notify_after_a_held_reply() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[200]).await;
+    let gate = home.path().join("close.release");
+    let cfg = String::from("delivery='forward'\n")
+        + &layer(
+            &home,
+            "suppress",
+            "'stream','notify'",
+            &["suppress-and-close", gate.to_str().unwrap()],
+        )
+        + "timeout_secs=0\n";
+    let (c, url, mut clock) = Clock::start(&home, up, &cfg);
+    let request = tokio::spawn(c.get(&url).send());
+    let stream = observed_stage(&home, "suppress", "stream", 2).await;
+    clock.advance(3);
+    std::fs::write(&gate, []).unwrap();
+    let r = request.await.unwrap().unwrap();
+    assert_eq!(r.status(), 204);
+    assert!(r.bytes().await.unwrap().is_empty());
+    let end = &observed_stage(&home, "suppress", "notify", 1).await[0];
+    assert_eq!(end["state"], "finished close");
+    let record = request_detail(&home, &url, stream[0]["request_id"].as_str().unwrap()).await;
+    assert!(record.to_string().contains("closed bodyless response"));
 }

@@ -464,11 +464,25 @@ pub(super) async fn chain(
             tail: reply.abort_tail.take().unwrap_or_default().into(),
         };
         layer.absorb(&mut reply);
+        // 正常 open 补丁与拒绝替换共享同一提交点；等工作进程回信的时间也算在内。
+        let fixed = committed
+            .as_ref()
+            .is_some_and(|sent| sent.load(std::sync::atomic::Ordering::Acquire));
         if let Some(f) = reply.fail {
             layer.worker.finish();
             if let Some(replacement) = f.response {
-                status = StatusCode::from_u16(replacement.status).expect("validated status");
-                headers = prepared.unwrap_or_default();
+                let replacement_headers = prepared.unwrap_or_default();
+                if fixed {
+                    // 交付的头不可改，替换实体却可能自带编码；只传递解码所需的表示信息。
+                    headers.remove(http::header::CONTENT_ENCODING);
+                    headers.remove(http::header::CONTENT_LENGTH);
+                    if let Some(enc) = request_encoding(&replacement_headers, true) {
+                        headers.insert(http::header::CONTENT_ENCODING, enc.into_owned());
+                    }
+                } else {
+                    status = StatusCode::from_u16(replacement.status).expect("validated status");
+                    headers = replacement_headers;
+                }
                 converted_stream = false;
                 content = Content::Saved(
                     transform::spool_response_body(
@@ -480,11 +494,7 @@ pub(super) async fn chain(
             }
             continue;
         }
-        // 等 open 回信期间仍在保活；此时的头归属才决定外层能否看到补丁。
-        if !committed
-            .as_ref()
-            .is_some_and(|sent| sent.load(std::sync::atomic::Ordering::Acquire))
-        {
+        if !fixed {
             if let Some(code) = reply.response.and_then(|p| p.status) {
                 status = StatusCode::from_u16(code).expect("validated status");
             }
@@ -499,14 +509,10 @@ pub(super) async fn chain(
             drop(content);
             content = Content::Saved(SpooledBody::Memory(Bytes::new()));
             let mut layer = layer;
-            tokio::spawn(async move {
-                if matches!(
-                    tokio::time::timeout(CANCEL_GRACE, layer.send(wire::StreamEvent::Close)).await,
-                    Ok(Ok(_))
-                ) {
-                    layer.worker.finish();
-                }
-            });
+            // 丢弃的是字节而不是状态和报告。正常 close 仍受该层的消息时限约束。
+            if layer.send(wire::StreamEvent::Close).await.is_ok() {
+                layer.worker.finish();
+            }
             break;
         }
         let mut f = content.flow().await;

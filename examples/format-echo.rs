@@ -335,6 +335,15 @@ fn main() {
                 {
                     wait_gate(std::path::Path::new(arg));
                 }
+                "suppress-and-close" if stage == "stream" && m["event"] == "open" => {
+                    r["response"] = json!({"status":204});
+                }
+                "suppress-and-close" if stage == "stream" && m["event"] == "close" => {
+                    wait_gate(std::path::Path::new(arg));
+                    r["state"] = json!("finished close");
+                    r["report"] = json!({"summary":"closed bodyless response","actions":[]});
+                    r["data"] = json!("must not deliver");
+                }
                 "gate-open" if stage == "stream" && m["event"] == "open" => {
                     wait_gate(std::path::Path::new(arg))
                 }

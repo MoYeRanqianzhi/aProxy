@@ -138,9 +138,9 @@ impl Adaptive {
             r.delivery = Some(mode.into());
             r.report = w::ReportField::Present(w::Report::new(
                 if pinned {
-                    "Kept retry delivery for a previously failing request"
+                    "Voted for retry delivery after previous failures"
                 } else {
-                    "Selected forward delivery"
+                    "Voted for forward delivery"
                 }
                 .into(),
             ));
@@ -151,7 +151,7 @@ impl Adaptive {
         if m.delivery == w::Delivery::Forward && m.outcome == "failure" {
             r.decision = Some(w::Decision::Retry);
             r.report = w::ReportField::Present(w::Report::new(
-                "Upgraded a failed forward attempt to retry".into(),
+                "Voted to upgrade a failed forward attempt to retry".into(),
             ));
         }
     }
@@ -263,6 +263,26 @@ mod tests {
         assert!(a.records[&[1; 32]].pinned.is_some());
         a.completed(&good, later);
         assert!(a.records[&[1; 32]].pinned.is_none());
+    }
+    /// 投票不是已经交付的事实；报告需让另一个程序赢得表决的场景也成立。
+    #[test]
+    fn delivery_reports_describe_votes() {
+        let mut a = Adaptive::load(None).unwrap();
+        let mut m:w::RequestMessage=serde_json::from_value(serde_json::json!({"request_id":"r","digest":"ab".repeat(32),"delivery":"retry","request":{"method":"POST","url":"https://a.test"},"client":{"path":"/"}})).unwrap();
+        let mut r = w::Reply::new(1);
+        a.request(&m, &mut r);
+        assert_eq!(
+            serde_json::to_value(&r).unwrap()["report"]["summary"],
+            "Voted for forward delivery"
+        );
+        m.delivery = w::Delivery::Forward;
+        let d:w::DecideMessage=serde_json::from_value(serde_json::json!({"request_id":"r","attempt":1,"elapsed_ms":0,"delivery":m.delivery,"outcome":"failure","request":{"method":"POST","url":"https://a.test"},"fallback":{"decision":"stop","by":"default","delay_ms":0}})).unwrap();
+        let mut r = w::Reply::new(2);
+        a.decide(&d, &mut r);
+        assert_eq!(
+            serde_json::to_value(r).unwrap()["report"]["summary"],
+            "Voted to upgrade a failed forward attempt to retry"
+        );
     }
     /// 容量淘汰最久未用项，过期时连索引一起清理；无效摘要永不进表。
     #[test]

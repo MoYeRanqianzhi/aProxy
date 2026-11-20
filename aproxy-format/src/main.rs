@@ -1,767 +1,253 @@
-//! aproxy-format：官方示例 format 程序。
-//!
-//! 子命令：
-//! - `run [--config <路径>]`：信封循环（aproxy 的 transform command 指向它）。
-//!   配置路径缺省回落**首个信封的 extra**（用户把聚合配置路径放 transform
-//!   extra），读入后缓存于进程内存——persistent 模式下每 worker 一份。
-//! - `convert --from <fmt> --to <fmt>`：定向协议转换（stdin 收请求 JSON，
-//!   stdout 吐转换后 JSON；不走信封，独立于 aproxy 也能用）。
-//!
-//! 请求侧/响应侧的区分：信封带 `method` = 请求侧（aproxy 请求转换约定）；
-//! 无 `method` = 响应侧。响应侧按信封 url 反查渠道表（无跨进程状态——
-//! request/response 转换器是不同进程，设计铁律）。
-
-mod aggregate;
+//! 每个角色是独立的协议 1 工作进程。首行协商、逐行应答，直到 aproxy 关闭标准输入。
+//! `translate` 只读一个 JSON 请求，既不参与握手也不运行处理链。
 mod config;
+mod convert;
 mod detect;
+mod keys;
+mod route;
 mod translate;
+use aproxy_envelope as w;
+use serde::Deserialize;
+use std::io::{BufRead, Read, Write};
 
-use std::io::{BufRead, Write};
-
-use aproxy_envelope::legacy::TransformEnvelope;
-use config::{AggConfig, ClientFormat};
-use switchyard_translation::WireFormat;
-
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("run") => run(&args[1..]),
-        Some("convert") => convert(&args[1..]),
-        _ => {
-            eprintln!(
-                "用法: aproxy-format run [--config <路径>] | convert --from <fmt> --to <fmt>"
-            );
-            std::process::exit(1);
+/// 用公开命令名选择职责，不按帧内容或 URL 猜测某个进程扮演的角色。
+enum Role {
+    /// 转换请求与返回实体。
+    Convert(convert::Convert),
+    /// 按目标 origin 选择认证信息。
+    Keys(keys::Keys),
+    /// 根据模型选择渠道。
+    Route(route::Route),
+    /// 只在请求方向改写字段。
+    Rewrite,
+    /// 只对尝试结果投票。
+    Policy,
+    /// 按摘要决定 forward 或 retry，并接收完成通知。
+    Adaptive,
+    /// 只处理保活帧。
+    Heartbeat,
+}
+/// 没有配置项的角色也拒绝未知键，拼写错误不能默默被吞。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Empty {}
+/// 命令行选项形式两种都接受，不把未知参数（可能是误填的密钥）写入错误。
+#[derive(Default)]
+struct Options<'a> {
+    /// 角色 TOML 文件。
+    config: Option<&'a str>,
+    /// 客户端协议或 auto。
+    from: Option<&'a str>,
+    /// 上游协议。
+    to: Option<&'a str>,
+}
+impl<'a> Options<'a> {
+    /// 重复、缺值或未知选项都是配置错误。
+    fn parse(args: &'a [String]) -> Result<Self, &'static str> {
+        let mut result = Self::default();
+        let mut iter = args.iter().map(String::as_str);
+        while let Some(arg) = iter.next() {
+            let (name, value) = match arg.split_once('=') {
+                Some(pair) => pair,
+                None => (arg, iter.next().ok_or("参数缺少值")?),
+            };
+            let slot = match name {
+                "--config" => &mut result.config,
+                "--from" => &mut result.from,
+                "--to" => &mut result.to,
+                _ => return Err("未知参数"),
+            };
+            if value.is_empty() || slot.replace(value).is_some() {
+                return Err("参数重复或为空");
+            }
         }
+        Ok(result)
     }
 }
-
-fn error_envelope(reason: &str) -> String {
-    // error 行：单请求失败（exit 0）——进程不崩，aproxy 按方向取失败语义
-    let env = TransformEnvelope {
-        headers: Default::default(),
-        error: Some(reason.to_string()),
-        ..Default::default()
-    };
-    env.to_line()
-        .unwrap_or_else(|_| r#"{"headers":{},"error":"内部序列化失败"}"#.to_string())
-}
-
-fn print_line(s: &str) {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    let _ = out.write_all(s.as_bytes());
-    let _ = out.write_all(b"\n");
-    let _ = out.flush();
-}
-
-fn run(args: &[String]) {
-    // --config 双形式：`--config <路径>` 与 `--config=<路径>`（与 aproxy CLI 同款惯例）
-    let explicit_config = args
-        .iter()
-        .position(|a| a == "--config")
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .or_else(|| {
-            args.iter()
-                .find(|a| a.starts_with("--config="))
-                .map(|a| a["--config=".len()..].to_string())
-        });
-
-    let stdin = std::io::stdin();
-    let mut lines = stdin.lock().lines();
-    let mut state: Option<aggregate::AggState> = None;
-
-    // while 循环逐行处理直到 EOF——**persistent 模式的协议义务**：实例退出
-    // 靠 aproxy 关闭 stdin 管道（EOF → exit），worker 回收主机制依赖它
-    while let Some(Ok(line)) = lines.next() {
-        let env = match TransformEnvelope::from_line(line.trim_end()) {
-            Ok(e) => e,
-            Err(e) => {
-                print_line(&error_envelope(&format!("信封解析失败: {e}")));
-                continue;
-            }
-        };
-
-        // 配置惰性加载：--config 优先；缺省回落首个信封的 extra 并缓存
-        if state.is_none() {
-            let path = explicit_config
-                .clone()
-                .or_else(|| (!env.extra.is_empty()).then(|| env.extra.clone()));
-            let Some(path) = path else {
-                print_line(&error_envelope(
-                    "未提供聚合配置（--config 或 transform extra 均为空）",
-                ));
-                continue;
-            };
-            match load_config(&path).and_then(|cfg| cfg.validate().map(|_| cfg)) {
-                Ok(cfg) => state = Some(aggregate::AggState::new(cfg)),
-                Err(e) => {
-                    // 配置坏是持续状态：输出 error 行（本请求失败），下一请求
-                    // 仍会重试加载——用户修好配置后无需重启 worker
-                    print_line(&error_envelope(&format!("聚合配置加载失败: {e}")));
-                    continue;
+impl Role {
+    /// 握手前完成静态配置检查，不会用半套配置处理请求。
+    fn load(name: &str, args: &[String]) -> Result<Self, &'static str> {
+        let opt = Options::parse(args)?;
+        if name == "convert" {
+            return Ok(Self::Convert(match (opt.config, opt.from, opt.to) {
+                (Some(p), None, None) => {
+                    let c: convert::Convert = config::load(p)?;
+                    c.validate()?;
+                    c
+                }
+                (None, Some(f), Some(t)) => convert::Convert::new(f, t)?,
+                _ => return Err("convert 需指定 --config 或 --from 与 --to"),
+            }));
+        }
+        if opt.from.is_some() || opt.to.is_some() {
+            return Err("此角色不接受协议参数");
+        }
+        Ok(match name {
+            "keys" => Self::Keys(keys::Keys::load(opt.config.ok_or("keys 需要 --config")?)?),
+            "route" => Self::Route(route::Route::load(
+                opt.config.ok_or("route 需要 --config")?,
+            )?),
+            name => {
+                if let Some(p) = opt.config {
+                    config::load::<Empty>(p)?;
+                }
+                match name {
+                    "policy" => Self::Policy,
+                    "adaptive" => Self::Adaptive,
+                    "rewrite" => Self::Rewrite,
+                    "heartbeat" => Self::Heartbeat,
+                    _ => return Err(USAGE),
                 }
             }
-        }
-
-        let out = match handle_envelope(state.as_ref().unwrap(), &env) {
-            Ok(e) => match e.to_line() {
-                Ok(l) => l,
-                Err(err) => error_envelope(&format!("内部序列化失败: {err}")),
+        })
+    }
+    /// 订阅声明是上限；实例最终只向配置选中的阶段写帧。摘要协商不能退化为默认的 full。
+    fn hello(&self, name: &str) -> w::HelloReply {
+        use w::BodyNeed::{Digest, Full, None};
+        let (stages, needs): (&[&str], &[(&str, w::BodyNeed)]) = match self {
+            Self::Convert(_) => (
+                &["request", "retry", "response", "stream"],
+                &[("request", Full), ("retry", Full)],
+            ),
+            Self::Keys(_) | Self::Rewrite => {
+                (&["request", "retry"], &[("request", None), ("retry", None)])
+            }
+            Self::Route(route) => (route.stages(), &[("request", Full), ("retry", Full)]),
+            Self::Policy => (&["decide"], &[("decide", None)]),
+            Self::Adaptive => (
+                &["request", "decide", "notify"],
+                &[("request", Digest), ("decide", None), ("notify", Digest)],
+            ),
+            Self::Heartbeat => (&["heartbeat"], &[]),
+        };
+        let mut reply = w::HelloReply::new(
+            stages.iter().map(|s| s.to_string()).collect(),
+            name.into(),
+            env!("CARGO_PKG_VERSION").into(),
+        );
+        reply.request_body = needs
+            .iter()
+            .map(|(s, v)| (s.to_string(), v.clone()))
+            .collect();
+        reply
+    }
+    /// 只在角色声明过的方向产生补丁；业务拒绝是带 seq 的正常回信，不打断持久进程。
+    fn handle(&mut self, m: &w::Message) -> w::Reply {
+        let mut r = w::Reply::new(m.seq);
+        let result = match &m.stage {
+            w::Stage::Request(input) => self.request(input, &mut r),
+            w::Stage::Retry(retry) => self.request(&retry.input, &mut r),
+            w::Stage::Response(response) => match self {
+                Self::Convert(c) => c.response(response, &mut r),
+                Self::Route(route) => route.response(response, &mut r),
+                _ => Err("阶段不受支持"),
             },
-            Err(reason) => error_envelope(&reason),
+            w::Stage::Stream(s) => match self {
+                Self::Convert(c) => c.stream(s, &mut r),
+                _ => Err("阶段不受支持"),
+            },
+            w::Stage::Decide(_) if matches!(self, Self::Adaptive | Self::Policy) => Ok(()),
+            w::Stage::Notify(_) if matches!(self, Self::Adaptive) => Ok(()),
+            w::Stage::Heartbeat(h) if matches!(self, Self::Heartbeat) => {
+                r.data = w::Data::from_bytes(h.data.as_bytes().to_vec());
+                Ok(())
+            }
+            _ => Err("阶段不受支持"),
         };
-        print_line(&out);
+        if let Err(reason) = result {
+            r = w::Reply::new(m.seq);
+            r.fail = Some(w::Fail::new(false, reason.into()));
+        }
+        r
     }
-}
-
-fn load_config(path: &str) -> Result<AggConfig, String> {
-    let expanded = if let Some(rest) = path.strip_prefix("~/") {
-        dirs_home().join(rest)
-    } else {
-        std::path::PathBuf::from(path)
-    };
-    let content = std::fs::read_to_string(&expanded)
-        .map_err(|e| format!("读取 {}: {e}", expanded.display()))?;
-    toml::from_str(&content).map_err(|e| format!("解析失败: {e}"))
-}
-
-/// `convert --from <fmt> --to <fmt>`：stdin 收一个请求 JSON（纯 body，非信封）
-/// → 协议转换 → stdout 吐转换后 JSON。独立便利命令，不经 aproxy 也能用。
-fn convert(args: &[String]) {
-    let mut from = None;
-    let mut to = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--from" if i + 1 < args.len() => {
-                from = Some(args[i + 1].clone());
-                i += 2;
+    /// 同一请求的后续阶段可能换进程，只使用信封携带的私有状态。
+    fn request(&mut self, m: &w::RequestMessage, r: &mut w::Reply) -> Result<(), &'static str> {
+        match self {
+            Self::Convert(c) => c.request(m, r),
+            Self::Keys(k) => k.request(m, r),
+            Self::Route(route) => route.request(m, r),
+            Self::Rewrite => Ok(()),
+            Self::Adaptive => {
+                r.delivery = Some("forward".into());
+                Ok(())
             }
-            "--to" if i + 1 < args.len() => {
-                to = Some(args[i + 1].clone());
-                i += 2;
-            }
-            other => {
-                eprintln!("未知参数: {other}");
-                std::process::exit(1);
-            }
+            _ => Err("阶段不受支持"),
         }
     }
-    let (Some(from), Some(to)) = (from, to) else {
-        eprintln!(
-            "用法: aproxy-format convert --from <fmt> --to <fmt>（fmt 为 anthropic_messages / openai_chat / openai_responses）"
-        );
+}
+/// 只在标准输出写一行 JSON 并立即 flush；管道断开直接结束，不循环输出错误。
+fn emit(out: &mut impl Write, value: &impl serde::Serialize) -> Result<(), &'static str> {
+    serde_json::to_writer(&mut *out, value).map_err(|_| "无法写入标准输出")?;
+    out.write_all(b"\n")
+        .and_then(|_| out.flush())
+        .map_err(|_| "无法写入标准输出")
+}
+/// 首帧是固定 hello，后续序号只在本进程内有意义。EOF 在握手后是正常退役。
+fn worker(
+    name: &str,
+    mut role: Role,
+    input: impl BufRead,
+    mut out: impl Write,
+) -> Result<(), &'static str> {
+    for (next, line) in (0u64..).zip(input.lines()) {
+        let m: w::Message = serde_json::from_str(&line.map_err(|_| "无法读取标准输入")?)
+            .map_err(|_| "协议帧无效")?;
+        if m.v != 1 || m.seq != next {
+            return Err("协议版本或序号不匹配");
+        }
+        if next == 0 {
+            let w::Stage::Hello(offer) = m.stage else {
+                return Err("首帧必须是 hello");
+            };
+            if !offer.protocols.contains(&1) {
+                return Err("不支持此协议版本");
+            }
+            emit(&mut out, &role.hello(name))?;
+        } else {
+            if matches!(m.stage, w::Stage::Hello(_)) {
+                return Err("重复的 hello");
+            }
+            emit(&mut out, &role.handle(&m))?;
+        }
+    }
+    Ok(())
+}
+/// 无信封的一次性协议转换。出错只给诊断类别，不回显含消息或密钥的原始输入。
+fn translate_once(args: &[String]) -> Result<(), &'static str> {
+    let opt = Options::parse(args)?;
+    let (None, Some(from), Some(to)) = (opt.config, opt.from, opt.to) else {
+        return Err("用法: aproxy-format translate --from <协议> --to <协议>");
+    };
+    let from = convert::protocol(from)?;
+    let to = convert::protocol(to)?;
+    let mut input = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut input)
+        .map_err(|_| "无法读取标准输入")?;
+    let body = serde_json::from_slice(&input).map_err(|_| "请求体不是 JSON")?;
+    let value = translate::translate_request(from, to, &body).map_err(|_| "请求协议转换失败")?;
+    emit(&mut std::io::stdout().lock(), &value)
+}
+/// 角色命令只选一个职责；工具子命令不入协议循环。
+const USAGE: &str =
+    "用法: aproxy-format <convert|keys|route|policy|adaptive|rewrite|heartbeat|translate> [参数]";
+/// 失败诊断始终写 stderr，不破坏 stdout 上的逐行协议。
+fn main() {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let result = match args.split_first() {
+        Some((name, rest)) if name == "translate" => translate_once(rest),
+        Some((name, rest)) => Role::load(name, rest).and_then(|role| {
+            worker(
+                name,
+                role,
+                std::io::stdin().lock(),
+                std::io::stdout().lock(),
+            )
+        }),
+        None => Err(USAGE),
+    };
+    if let Err(e) = result {
+        eprintln!("aproxy-format: {e}");
         std::process::exit(1);
-    };
-    let parse = |s: &str| -> Result<WireFormat, String> {
-        serde_json::from_value(serde_json::Value::String(s.to_string()))
-            .map_err(|_| format!("未知 wire format: {s}"))
-    };
-    let from = parse(&from).unwrap_or_else(|e| die(&e));
-    let to = parse(&to).unwrap_or_else(|e| die(&e));
-
-    let mut input = String::new();
-    if std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).is_err() {
-        die("stdin 读取失败");
-    }
-    let body: serde_json::Value = serde_json::from_str(input.trim())
-        .unwrap_or_else(|e| die(&format!("输入不是合法 JSON: {e}")));
-    let out = translate::translate_request(from, to, &body)
-        .unwrap_or_else(|e| die(&format!("转换失败: {e}")));
-    print_line(&out.to_string());
-}
-
-fn die(msg: &str) -> ! {
-    eprintln!("aproxy-format: {msg}");
-    std::process::exit(1);
-}
-
-/// `~` 展开的 home 基准（无 dirs 依赖的精简实现：HOME / USERPROFILE）。
-fn dirs_home() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
-}
-
-fn handle_envelope(
-    state: &aggregate::AggState,
-    env: &TransformEnvelope,
-) -> Result<TransformEnvelope, String> {
-    // 请求侧/响应侧区分：信封带 method = 请求侧（aproxy 约定）
-    if env.method.is_some() {
-        handle_request(state, env)
-    } else {
-        handle_response(state, env)
-    }
-}
-
-/// 请求侧：body 提 model → 路由渠道 → 选 key → 协议转换 → 改写 url+鉴权头。
-fn handle_request(
-    state: &aggregate::AggState,
-    env: &TransformEnvelope,
-) -> Result<TransformEnvelope, String> {
-    let body_bytes = env
-        .body_bytes()
-        .map_err(|e| format!("body 提取失败: {e}"))?;
-    let body: serde_json::Value = if body_bytes.is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::from_slice(&body_bytes).map_err(|e| format!("body 非 JSON: {e}"))?
-    };
-
-    let model = aggregate::extract_model(&body).ok_or("body 缺少 model 字段")?;
-    let channel = state
-        .route(model)
-        .ok_or_else(|| format!("model {model} 未命中任何渠道（检查渠道表的 models 模式）"))?;
-    let channel_idx = state
-        .cfg
-        .channels
-        .iter()
-        .position(|c| c.name == channel.name)
-        .expect("渠道来自同一表必有索引");
-
-    // 协议转换：client_format（显式/auto 检测）→ channel.format
-    let client_format = translate::resolve_client_format(state.cfg.client_format, &body)
-        .ok_or("client_format=auto 检测失败：请求形态不像已知协议（检查字段名）")?;
-    // auto 只支持同协议：响应侧拿不到客户端协议——信封没有请求→响应的上下文
-    // 透传，响应体只能检测出渠道协议——跨协议的响应无法转回，客户端会静默
-    // 收到错协议的 body。所以在请求侧（发往上游之前、不产生计费）拒绝并指明
-    // 改法；同协议（如不同客户端各走同协议渠道、纯 key 轮换）不受影响。
-    // 放在选 key 之前：被拒的请求不占轮换名额
-    if state.cfg.client_format == ClientFormat::Auto && client_format != channel.format {
-        return Err(format!(
-            "client_format = \"auto\" 只支持同协议：本请求检测为 {client_format}，路由到的渠道 {} \
-             是 {}，响应侧无法得知客户端协议、无法转回。请在聚合配置中显式声明 client_format\
-             （如 client_format = \"{client_format}\"）；检测若有误（不带 system 的 Anthropic \
-             请求会被判为 openai_chat），同样以显式声明解决",
-            channel.name, channel.format
-        ));
-    }
-    let key = state.pick_key(channel_idx);
-    let translated = if client_format == channel.format {
-        body.clone()
-    } else {
-        translate::translate_request(client_format, channel.format, &body)
-            .map_err(|e| format!("协议转换失败: {e}"))?
-    };
-
-    // url 改写：完整替换；preserve_path 时拼接原 path+query
-    let new_url = if channel.preserve_path {
-        format!(
-            "{}{}",
-            channel.url.trim_end_matches('/'),
-            path_and_query(env.url.as_deref().unwrap_or(""))
-        )
-    } else {
-        channel.url.clone()
-    };
-
-    // 鉴权头：先剥客户端原头，再按渠道协议写（防泄漏 + 防冲突）。
-    // cookie / proxy-authorization 同属凭据面（浏览器会话/代理凭据不应
-    // 跟随转发到渠道上游），一并剥离
-    let mut headers = env.headers.clone();
-    for h in [
-        "authorization",
-        "x-api-key",
-        "cookie",
-        "proxy-authorization",
-    ] {
-        headers.remove(h);
-    }
-    match channel.format {
-        WireFormat::AnthropicMessages => {
-            headers.insert("x-api-key".to_string(), key);
-            headers.insert("anthropic-version".to_string(), "2023-06-01".to_string());
-        }
-        _ => {
-            headers.insert("authorization".to_string(), format!("Bearer {key}"));
-        }
-    }
-    // content-type 对齐渠道协议（同为 JSON 无需变，但显式写明语义）
-    headers
-        .entry("content-type".to_string())
-        .or_insert_with(|| "application/json".to_string());
-
-    // 模型名映射：别名表里的客户端名 → 上游名（转换产物或原 body 上改写）
-    let mut out_body = translated;
-    if let Some(obj) = out_body.as_object_mut()
-        && let Some(m) = obj.get("model").and_then(|m| m.as_str())
-        && let Some(mapped) = state.cfg.models.get(m)
-    {
-        obj.insert(
-            "model".to_string(),
-            serde_json::Value::String(mapped.clone()),
-        );
-    }
-
-    let mut out = TransformEnvelope {
-        headers,
-        extra: env.extra.clone(),
-        ..Default::default()
-    };
-    out.url = Some(new_url);
-    out.method = Some(env.method.clone().unwrap_or_else(|| "POST".to_string()));
-    out.body = Some(out_body.to_string());
-    Ok(out)
-}
-
-/// 取 origin 从 host 后开始的 path+query（preserve_path 拼接用）。
-fn path_and_query(origin: &str) -> String {
-    match origin.split_once("://") {
-        Some((_, rest)) => match rest.find('/') {
-            Some(i) => rest[i..].to_string(),
-            None => String::new(),
-        },
-        None => String::new(),
-    }
-}
-
-/// 响应侧：按信封 url 反查渠道表 → 渠道协议转回 client_format →
-/// **剔除鉴权头**（上游真实 key 不得漏给客户端——安全决策）。
-fn handle_response(
-    state: &aggregate::AggState,
-    env: &TransformEnvelope,
-) -> Result<TransformEnvelope, String> {
-    let upstream_url = env.url.as_deref().ok_or("响应信封缺 url（无法反查渠道）")?;
-    // 反查按**最长 url 前缀优先**：渠道 A `https://a.com` 与 B `https://a.com.evil.com`
-    // 并存时，指向 B 的请求不得被 A 的短前缀抢先命中
-    let mut channels_by_len: Vec<&config::ChannelConfig> = state.cfg.channels.iter().collect();
-    channels_by_len.sort_by_key(|c| std::cmp::Reverse(c.url.len()));
-    let channel = channels_by_len
-        .into_iter()
-        .find(|c| upstream_url == c.url || upstream_url.starts_with(c.url.trim_end_matches('/')))
-        .ok_or_else(|| format!("url {upstream_url} 反查不到渠道（检查渠道表的 url 配置）"))?;
-
-    let body_bytes = env
-        .body_bytes()
-        .map_err(|e| format!("body 提取失败: {e}"))?;
-    let text = String::from_utf8_lossy(&body_bytes);
-
-    // 客户端协议：显式声明直接用；auto 时**就是渠道协议**——请求侧已拒绝
-    // auto 下的跨协议路由（见 handle_request），能走到这里的 auto 请求必然
-    // 客户端协议 = 渠道协议，响应原样同协议回放。注意不能靠检测响应体来
-    // 推断客户端协议：上游按渠道协议回复，检测出的永远是渠道协议
-    let client_format = match state.cfg.client_format {
-        ClientFormat::Explicit(f) => f,
-        ClientFormat::Auto => channel.format,
-    };
-
-    let mut headers = env.headers.clone();
-    // 安全决策：上游真实 key 与凭据面头不回传客户端
-    for h in [
-        "authorization",
-        "x-api-key",
-        "cookie",
-        "proxy-authorization",
-    ] {
-        headers.remove(h);
-    }
-
-    let mut out = TransformEnvelope {
-        headers,
-        extra: env.extra.clone(),
-        ..Default::default()
-    };
-    out.url = env.url.clone();
-
-    if detect::looks_like_sse(&text) {
-        // **流式（SSE）v1 划界：直通原样**——switchyard 的流 API 产出 wire
-        // 事件对象，需按目标协议自行分帧（event 名/[DONE] 终态等帧格式是
-        // 协议特定语义），v1 不引入这层分帧。协议不等时显式报错而非给出
-        // 错协议的流（客户端拿到错格式 SSE 更难排障）
-        if channel.format != client_format {
-            return Err(format!(
-                "SSE 流式响应的跨协议转换尚未支持（渠道协议 {} ≠ 客户端协议 {}）——非流式请求不受影响",
-                channel.format, client_format
-            ));
-        }
-        out.body = env.body.clone();
-        out.body_b64 = env.body_b64.clone();
-        return Ok(out);
-    }
-    let v: serde_json::Value =
-        serde_json::from_str(text.trim()).map_err(|e| format!("响应 body 非 JSON: {e}"))?;
-    let translated = translate::translate_response(channel.format, client_format, &v)
-        .map_err(|e| format!("协议转换失败: {e}"))?;
-    // 模型名反向映射：上游名 → 客户端别名（[models] 表反向查询）
-    let mut out_v = translated;
-    if let Some(obj) = out_v.as_object_mut()
-        && let Some(m) = obj.get("model").and_then(|m| m.as_str())
-        && let Some((client_name, _)) = state.cfg.models.iter().find(|(_, up)| up.as_str() == m)
-    {
-        obj.insert(
-            "model".to_string(),
-            serde_json::Value::String(client_name.clone()),
-        );
-    }
-    out.body = Some(out_v.to_string());
-    Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{AggConfig, ChannelConfig, ClientFormat, KeyStrategy};
-    use std::collections::BTreeMap;
-
-    /// 双渠道固定配置：anthropic 渠道（双 key 供轮换断言）+ openai 渠道。
-    fn two_channel_state() -> aggregate::AggState {
-        let cfg = AggConfig {
-            client_format: ClientFormat::Auto,
-            models: BTreeMap::from([(
-                "claude-sonnet".to_string(),
-                "claude-sonnet-4-5".to_string(),
-            )]),
-            channels: vec![
-                ChannelConfig {
-                    name: "ant".to_string(),
-                    format: WireFormat::AnthropicMessages,
-                    url: "https://ant.example.com".to_string(),
-                    keys: vec!["k1".to_string(), "k2".to_string()],
-                    strategy: KeyStrategy::RoundRobin,
-                    weights: vec![],
-                    models: Some(vec!["claude-*".to_string()]),
-                    preserve_path: false,
-                },
-                ChannelConfig {
-                    name: "oai".to_string(),
-                    format: WireFormat::OpenAiChat,
-                    url: "https://oai.example.com/v1/chat/completions".to_string(),
-                    keys: vec!["ok1".to_string()],
-                    strategy: KeyStrategy::RoundRobin,
-                    weights: vec![],
-                    models: None,
-                    preserve_path: false,
-                },
-            ],
-        };
-        aggregate::AggState::new(cfg)
-    }
-
-    fn anthropic_request_env(model: &str) -> TransformEnvelope {
-        TransformEnvelope {
-            method: Some("POST".to_string()),
-            url: Some("https://client-upstream.example.com/v1/messages".to_string()),
-            headers: BTreeMap::from([
-                ("content-type".to_string(), "application/json".to_string()),
-                (
-                    "authorization".to_string(),
-                    "Bearer client-secret".to_string(),
-                ),
-                ("x-api-key".to_string(), "client-key".to_string()),
-            ]),
-            body: Some(format!(
-                r#"{{"system":"s","messages":[{{"role":"user","content":"hi"}}],"max_tokens":50,"model":"{model}"}}"#
-            )),
-            extra: String::new(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn request_same_format_rewrites_url_and_injects_channel_key() {
-        let state = two_channel_state();
-        let out = handle_request(&state, &anthropic_request_env("claude-3")).unwrap();
-        // url 完整替换为渠道 url
-        assert_eq!(out.url.as_deref(), Some("https://ant.example.com"));
-        // 鉴权：客户端双头被剥，渠道 x-api-key 注入（轮换首 key）
-        assert_eq!(out.headers.get("x-api-key").unwrap(), "k1");
-        assert!(
-            !out.headers.contains_key("authorization"),
-            "客户端 Bearer 头必须剥离"
-        );
-        assert_eq!(out.headers.get("anthropic-version").unwrap(), "2023-06-01");
-        // 同协议不转换：body 保持 anthropic 形态
-        let body: serde_json::Value = serde_json::from_str(out.body.as_deref().unwrap()).unwrap();
-        assert_eq!(body["model"], "claude-3");
-        assert!(body.get("max_tokens").is_some());
-    }
-
-    #[test]
-    fn request_rotates_keys_across_calls() {
-        let state = two_channel_state();
-        let k1 = handle_request(&state, &anthropic_request_env("claude-3"))
-            .unwrap()
-            .headers
-            .get("x-api-key")
-            .unwrap()
-            .clone();
-        let k2 = handle_request(&state, &anthropic_request_env("claude-3"))
-            .unwrap()
-            .headers
-            .get("x-api-key")
-            .unwrap()
-            .clone();
-        assert_eq!(k1, "k1");
-        assert_eq!(k2, "k2", "轮换序列钉死：k1 → k2");
-    }
-
-    #[test]
-    fn request_cross_format_translates_to_channel_protocol() {
-        let state = two_channel_state();
-        // openai_chat 请求 → openai_chat 渠道：url 改写 + Bearer 注入；
-        // 渠道协议与请求相同故 body 不转换（跨协议转换由 convert 命令端到端覆盖）
-        let env = TransformEnvelope {
-            method: Some("POST".to_string()),
-            url: Some("https://client-upstream.example.com/v1/chat/completions".to_string()),
-            headers: BTreeMap::new(),
-            body: Some(
-                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"max_tokens":30}"#
-                    .to_string(),
-            ),
-            ..Default::default()
-        };
-        let out = handle_request(&state, &env).unwrap();
-        assert_eq!(
-            out.url.as_deref(),
-            Some("https://oai.example.com/v1/chat/completions")
-        );
-        assert_eq!(out.headers.get("authorization").unwrap(), "Bearer ok1");
-        let body: serde_json::Value = serde_json::from_str(out.body.as_deref().unwrap()).unwrap();
-        assert_eq!(body["model"], "gpt-4o");
-    }
-
-    #[test]
-    fn request_model_alias_maps_to_upstream_name() {
-        let state = two_channel_state();
-        let out = handle_request(&state, &anthropic_request_env("claude-sonnet")).unwrap();
-        let body: serde_json::Value = serde_json::from_str(out.body.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            body["model"], "claude-sonnet-4-5",
-            "别名表应把客户端名映射为上游名"
-        );
-    }
-
-    #[test]
-    fn request_model_miss_yields_error_reason() {
-        // 两渠道都带 models 过滤（oai 渠道在 two_channel_state 里是全匹配，
-        // 故这里单独构造全过滤配置才能构造「未命中」）
-        let mut state = two_channel_state();
-        state.cfg.channels[1].models = Some(vec!["gpt-*".to_string()]);
-        let err = handle_request(&state, &anthropic_request_env("llama-3")).unwrap_err();
-        assert!(err.contains("未命中任何渠道"), "{err}");
-    }
-
-    #[test]
-    fn request_unknown_shape_yields_detect_error() {
-        let state = two_channel_state();
-        let env = TransformEnvelope {
-            method: Some("POST".to_string()),
-            url: Some("https://x.example.com/".to_string()),
-            headers: BTreeMap::new(),
-            body: Some(r#"{"foo":1,"model":"claude-3"}"#.to_string()),
-            ..Default::default()
-        };
-        let err = handle_request(&state, &env).unwrap_err();
-        assert!(err.contains("检测失败"), "{err}");
-    }
-
-    #[test]
-    fn request_preserve_path_appends_original_path() {
-        let mut state = two_channel_state();
-        state.cfg.channels[0].preserve_path = true;
-        state.cfg.channels[0].url = "https://ant-gw.example.com/anthropic".to_string();
-        let out = handle_request(&state, &anthropic_request_env("claude-3")).unwrap();
-        assert_eq!(
-            out.url.as_deref(),
-            Some("https://ant-gw.example.com/anthropic/v1/messages"),
-            "preserve_path 应拼接原 path"
-        );
-    }
-
-    #[test]
-    fn path_and_query_extracts_path_and_keeps_query() {
-        assert_eq!(
-            path_and_query("https://h.example.com/v1/x?a=1"),
-            "/v1/x?a=1"
-        );
-        assert_eq!(path_and_query("https://h.example.com"), "");
-        assert_eq!(path_and_query("not-a-url"), "");
-    }
-
-    fn response_env(url: &str, body: &str) -> TransformEnvelope {
-        TransformEnvelope {
-            url: Some(url.to_string()),
-            headers: BTreeMap::from([
-                ("content-type".to_string(), "application/json".to_string()),
-                ("x-api-key".to_string(), "upstream-real-key".to_string()),
-                (
-                    "authorization".to_string(),
-                    "Bearer upstream-real".to_string(),
-                ),
-            ]),
-            body: Some(body.to_string()),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn response_strips_upstream_auth_headers() {
-        let state = two_channel_state();
-        let body =
-            r#"{"role":"assistant","content":[{"type":"text","text":"hi"}],"model":"claude-3"}"#;
-        let out = handle_response(&state, &response_env("https://ant.example.com", body)).unwrap();
-        assert!(
-            !out.headers.contains_key("x-api-key"),
-            "上游 x-api-key 不得回传客户端"
-        );
-        assert!(
-            !out.headers.contains_key("authorization"),
-            "上游 authorization 不得回传客户端"
-        );
-        assert!(out.headers.contains_key("content-type"));
-    }
-
-    #[test]
-    fn response_translates_back_when_client_format_explicit() {
-        let mut state = two_channel_state();
-        state.cfg.client_format = ClientFormat::Explicit(WireFormat::OpenAiChat);
-        let body =
-            r#"{"role":"assistant","content":[{"type":"text","text":"hi"}],"model":"claude-3"}"#;
-        let out = handle_response(&state, &response_env("https://ant.example.com", body)).unwrap();
-        let v: serde_json::Value = serde_json::from_str(out.body.as_deref().unwrap()).unwrap();
-        assert!(v.get("choices").is_some(), "应转换为 openai_chat 形态: {v}");
-        // served_model：别名表无 claude-3 反查 → 保留上游报告 id
-        assert_eq!(v["model"], "claude-3");
-    }
-
-    #[test]
-    fn response_reverse_maps_model_alias() {
-        let state = two_channel_state();
-        // 上游报 claude-sonnet-4-5 → 客户端别名 claude-sonnet
-        let body = r#"{"role":"assistant","content":[{"type":"text","text":"hi"}],"model":"claude-sonnet-4-5"}"#;
-        let out = handle_response(&state, &response_env("https://ant.example.com", body)).unwrap();
-        let v: serde_json::Value = serde_json::from_str(out.body.as_deref().unwrap()).unwrap();
-        assert_eq!(v["model"], "claude-sonnet");
-    }
-
-    #[test]
-    fn response_url_reverse_lookup_miss_is_error() {
-        let state = two_channel_state();
-        let body = r#"{"role":"assistant","content":[],"model":"m"}"#;
-        let err = handle_response(&state, &response_env("https://unknown.example.com", body))
-            .unwrap_err();
-        assert!(err.contains("反查不到渠道"), "{err}");
-    }
-
-    #[test]
-    fn response_longest_url_prefix_wins() {
-        // 渠道 short `https://a.com` 与 long `https://a.com.evil.com` 并存：
-        // 指向 long 的请求不得被 short 的短前缀抢先命中（最长前缀优先）
-        let cfg = AggConfig {
-            client_format: ClientFormat::Explicit(WireFormat::OpenAiChat),
-            models: BTreeMap::new(),
-            channels: vec![
-                ChannelConfig {
-                    name: "short".to_string(),
-                    format: WireFormat::AnthropicMessages,
-                    url: "https://a.com".to_string(),
-                    keys: vec!["k".to_string()],
-                    strategy: KeyStrategy::RoundRobin,
-                    weights: vec![],
-                    models: None,
-                    preserve_path: false,
-                },
-                ChannelConfig {
-                    name: "long".to_string(),
-                    format: WireFormat::OpenAiChat,
-                    url: "https://a.com.evil.com".to_string(),
-                    keys: vec!["k".to_string()],
-                    strategy: KeyStrategy::RoundRobin,
-                    weights: vec![],
-                    models: None,
-                    preserve_path: false,
-                },
-            ],
-        };
-        let state = aggregate::AggState::new(cfg);
-        // openai_chat 形态响应 + 显式客户端协议 openai_chat：命中 long（同协议
-        // 直通，choices 保留）——若误命中 short（anthropic）会被转成 anthropic 形态
-        let body = r#"{"choices":[],"model":"m"}"#;
-        let out =
-            handle_response(&state, &response_env("https://a.com.evil.com/v1/x", body)).unwrap();
-        let v: serde_json::Value = serde_json::from_str(out.body.as_deref().unwrap()).unwrap();
-        assert!(v.get("choices").is_some(), "应命中 long 渠道且不转换: {v}");
-    }
-
-    #[test]
-    fn response_sse_same_format_passes_through() {
-        let state = two_channel_state();
-        let sse = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n";
-        let out = handle_response(&state, &response_env("https://ant.example.com", sse)).unwrap();
-        assert_eq!(out.body.as_deref(), Some(sse), "同协议 SSE 直通原样");
-    }
-
-    #[test]
-    fn response_sse_cross_format_is_explicit_error() {
-        let mut state = two_channel_state();
-        state.cfg.client_format = ClientFormat::Explicit(WireFormat::OpenAiChat);
-        let sse = "data: {\"choices\":[]}\n\n";
-        let err =
-            handle_response(&state, &response_env("https://ant.example.com", sse)).unwrap_err();
-        assert!(err.contains("尚未支持"), "{err}");
-    }
-
-    #[test]
-    fn response_auto_replays_channel_protocol_unchanged() {
-        // auto 的响应侧取渠道协议原样回放（SSE 不报错、不检测）：请求侧已
-        // 保证 auto 只放行「客户端协议 = 渠道协议」的请求，回放渠道协议即
-        // 回放客户端协议。跨协议的 auto 请求根本到不了这里，见
-        // request_auto_rejects_cross_protocol_routing
-        let state = two_channel_state();
-        let sse = "event: message_start\ndata: {}\n\n";
-        let out = handle_response(&state, &response_env("https://ant.example.com", sse)).unwrap();
-        assert_eq!(out.body.as_deref(), Some(sse));
-    }
-
-    #[test]
-    fn request_auto_rejects_cross_protocol_routing() {
-        // auto + 跨协议路由：openai_chat 形态的请求（无 system）被路由到
-        // anthropic 渠道。旧版照转不误：请求转成 anthropic 发出，响应侧却
-        // 检测出渠道协议、恒等直通，客户端静默收到错协议的 body。现在请求侧
-        // 当场报错（发上游之前），文案指明显式声明 client_format
-        let state = two_channel_state();
-        let env = TransformEnvelope {
-            method: Some("POST".to_string()),
-            url: Some("https://client.example.com/v1/chat/completions".to_string()),
-            headers: BTreeMap::new(),
-            body: Some(
-                r#"{"model":"claude-3","messages":[{"role":"user","content":"hi"}]}"#.to_string(),
-            ),
-            ..Default::default()
-        };
-        let err = handle_request(&state, &env).unwrap_err();
-        assert!(err.contains("client_format"), "{err}");
-        assert!(
-            err.contains("openai_chat") && err.contains("anthropic_messages"),
-            "文案应点明两侧协议: {err}"
-        );
-        // 被拒的请求不占轮换名额：随后的同协议请求仍拿首 key
-        let ok = handle_request(&state, &anthropic_request_env("claude-3")).unwrap();
-        assert_eq!(ok.headers.get("x-api-key").unwrap(), "k1");
-    }
-
-    #[test]
-    fn request_explicit_client_format_still_translates_cross_protocol() {
-        // 显式声明不受 auto 的同协议约束：openai_chat 客户端 → anthropic 渠道
-        // 照常放行（转换本身的真实执行由 tests/e2e.rs 覆盖）
-        let mut state = two_channel_state();
-        state.cfg.client_format = ClientFormat::Explicit(WireFormat::OpenAiChat);
-        let env = TransformEnvelope {
-            method: Some("POST".to_string()),
-            url: Some("https://client.example.com/v1/chat/completions".to_string()),
-            headers: BTreeMap::new(),
-            body: Some(
-                r#"{"model":"claude-3","messages":[{"role":"user","content":"hi"}],"max_tokens":20}"#
-                    .to_string(),
-            ),
-            ..Default::default()
-        };
-        let out = handle_request(&state, &env).unwrap();
-        assert_eq!(out.url.as_deref(), Some("https://ant.example.com"));
-        assert_eq!(out.headers.get("x-api-key").unwrap(), "k1");
     }
 }

@@ -47,10 +47,38 @@ fn wait_gate(path: &std::path::Path) {
     }
 }
 
+/// 透明记录真实角色收到的行。它自己的 stdout 直连代理，握手和阶段回信都不是夹具伪造的。
+fn record_worker(args: &[String]) {
+    let mut child = std::process::Command::new(&args[0])
+        .args(&args[1..])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(std::env::var_os("ECHO_RECORD").unwrap())
+        .unwrap();
+    for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+        let mut bytes = line.into_bytes();
+        bytes.push(b'\n');
+        file.write_all(&bytes).unwrap();
+        if input.write_all(&bytes).is_err() {
+            break;
+        }
+    }
+    drop(input);
+    let _ = child.wait();
+}
+
 /// 每个进程按行处理到 EOF；同批多余帧和延迟多余帧要区分，才能测出两种错位。
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let mode = args.first().map_or("echo", String::as_str);
+    if mode == "record-worker" {
+        return record_worker(&args[1..]);
+    }
     let arg = args.get(1).map_or("", String::as_str);
     let delay = Duration::from_millis(arg.parse().unwrap_or(100));
     if mode == "banner" {

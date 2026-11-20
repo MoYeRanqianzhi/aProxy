@@ -1,264 +1,309 @@
-//! aproxy-format 端到端测试：真实二进制 × 真实 switchyard 转换。
-//!
-//! 覆盖单测够不到的两条路径：
-//! 1. **跨协议转换真的发生**（anthropic_messages ↔ openai_chat，单测全是
-//!    同协议直通——switchyard 集成未经真实执行是此前最大的验证缺口）
-//! 2. run 循环的 persistent 语义（逐行处理、跨请求轮换连续、error 行不退出）
-
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-
-struct FormatProc {
+//! 用真实工作进程验证协议方向、私有状态、错误隔离和鉴权边界；不连接任何上游。
+use serde_json::{Value, json};
+use std::{
+    io::{BufRead, BufReader, Write},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+};
+/// 持久进程，按流水号来回交换一行。
+struct Worker {
+    /// 测试创建的子进程，结束时先关闭 stdin 再等待退出。
     child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// 提前释放触发协议的 EOF 退役。
+    input: Option<ChildStdin>,
+    /// 单次只读一行，不把下一帧拿走。
+    output: BufReader<ChildStdout>,
+    /// 期望程序原样回显的序号。
+    seq: u64,
+    /// 首帧公布的能力上限，不由测试进程代为构造。
+    hello: Value,
 }
-
-impl Drop for FormatProc {
+impl Worker {
+    /// 启动编译出来的角色程序，给两个虚构的 key，不依赖父进程的密钥。
+    fn new(args: &[&str]) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+            .args(args)
+            .env("FORMAT_A", "fixture-private-A")
+            .env("FORMAT_B", "fixture-private-B")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take();
+        let output = BufReader::new(child.stdout.take().unwrap());
+        let mut w = Self {
+            child,
+            input,
+            output,
+            seq: 0,
+            hello: Value::Null,
+        };
+        let h=w.frame(json!({"stage":"hello","protocols":[1],"aproxy_version":"test","name":"role","process":"persistent","stages":[],"worker_id":0,"features":["decide.success"],"overrides":[]}));
+        assert_eq!(h["protocol"], 1);
+        assert_eq!(h["name"], args[0]);
+        w.hello = h;
+        w
+    }
+    /// 消息写入后立即要求回信，错误不能把后续请求串线。
+    fn frame(&mut self, mut m: Value) -> Value {
+        m["v"] = 1.into();
+        m["seq"] = self.seq.into();
+        writeln!(self.input.as_mut().unwrap(), "{m}").unwrap();
+        let mut s = String::new();
+        assert_ne!(self.output.read_line(&mut s).unwrap(), 0, "角色未应答");
+        let r: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(r["seq"], self.seq);
+        self.seq += 1;
+        r
+    }
+}
+impl Drop for Worker {
+    /// 关闭管道是正常退出，不用按进程名结束任何后台程序。
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        drop(self.input.take());
         let _ = self.child.wait();
     }
 }
-
-fn spawn_run(args: &[&str]) -> FormatProc {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
-        .arg("run")
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("aproxy-format spawn 失败");
-    let stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-    FormatProc {
-        child,
-        stdin,
-        stdout: BufReader::new(stdout),
-    }
+/// 客户端路径与当前目标分开，能检出拿渠道的协议反推客户端的错误。
+fn request(url: &str, path: &str, body: Value) -> Value {
+    json!({"stage":"request","request_id":"r","delivery":"retry","client":{"path":path},"request":{"method":"POST","url":url,"headers":{"authorization":"from-client","cookie":"old"},"body":body.to_string()}})
 }
-
-fn send_and_read(proc: &mut FormatProc, line: &str) -> serde_json::Value {
-    proc.stdin.write_all(line.as_bytes()).unwrap();
-    proc.stdin.write_all(b"\n").unwrap();
-    proc.stdin.flush().unwrap();
-    let mut out = String::new();
-    proc.stdout.read_line(&mut out).unwrap();
-    assert!(!out.is_empty(), "format 未回行（EOF 过早）");
-    serde_json::from_str(out.trim()).expect("回行非 JSON")
+/// 模拟另一进程拿到上一阶段给出的私有状态，与 URL 无关。
+fn response(state: &Value, body: &str) -> Value {
+    json!({"stage":"response","request_id":"r","state":state,"request":{"method":"POST","url":"https://custom.test/elsewhere"},"response":{"status":200,"headers":{"x-api-key":"fixture-private-A","authorization":"fixture-private-B","x-keep":"ok"},"body":body}})
 }
-
-fn agg_config_for_cross_format() -> String {
-    // 客户端显式 openai_chat，渠道 anthropic：请求方向做真实跨协议转换
-    r#"
-client_format = "openai_chat"
-
-[[channel]]
-name = "ant"
-format = "anthropic_messages"
-url = "https://ant.example.com/v1/messages"
-keys = ["sk-cross-1"]
-"#
-    .to_string()
-}
-
-fn envelope_line(body: &str, url: &str) -> String {
-    let env = serde_json::json!({
-        "method": "POST",
-        "url": url,
-        "headers": {"content-type": "application/json"},
-        "body": body,
-        "worker_id": 0,
-        "extra": "",
-    });
-    env.to_string()
-}
-
+/// Chat 的 system 消息提升为 Anthropic 顶层 system；标准路径换协议时保留查询。
 #[test]
 fn cross_format_request_conversion_end_to_end() {
-    let dir = tempfile::tempdir().unwrap();
-    let cfg_path = dir.path().join("agg.toml");
-    std::fs::write(&cfg_path, agg_config_for_cross_format()).unwrap();
-    let cfg_arg = format!("--config={}", cfg_path.display());
-
-    let mut proc = spawn_run(&[&cfg_arg]);
-    // 输入带 system+user 两条消息（验证多消息保留，不预设 switchyard 的
-    // system 放置形态——顶层字段或 messages 内条目均为合法转换产物）
-    let req = r#"{"model":"gpt-4o","messages":[{"role":"system","content":"be nice"},{"role":"user","content":"hi"}],"max_tokens":30}"#;
-    let out = send_and_read(
-        &mut proc,
-        &envelope_line(req, "https://client.example.com/v1/chat/completions"),
-    );
-
-    // 转换后信封：url 改写到渠道、鉴权头为 anthropic 形态
-    assert_eq!(out["url"], "https://ant.example.com/v1/messages");
-    assert_eq!(out["headers"]["x-api-key"], "sk-cross-1");
-    assert!(out["headers"].get("authorization").is_none());
-    assert_eq!(out["headers"]["anthropic-version"], "2023-06-01");
-
-    // **body 完成了 anthropic_messages 形态转换**（跨协议转换发生的实锤）：
-    // openai 的 messages → anthropic 的 messages + max_tokens 保留
-    let body: serde_json::Value = serde_json::from_str(out["body"].as_str().unwrap()).unwrap();
-    assert_eq!(body["model"], "gpt-4o");
-    assert_eq!(body["max_tokens"], 30);
-    let msgs = body["messages"].as_array().expect("转换产物应有 messages");
-    assert_eq!(msgs.len(), 1, "user 消息保留: {body}");
-    assert_eq!(
-        body["system"], "be nice",
-        "openai 的 system role 消息应提升为 anthropic 顶层 system 字段: {body}"
-    );
+    let mut w = Worker::new(&[
+        "convert",
+        "--from",
+        "openai_chat",
+        "--to",
+        "anthropic_messages",
+    ]);
+    let r=w.frame(request("https://relay.test/v1/chat/completions?q=1","/v1/chat/completions",json!({"model":"gpt","max_tokens":30,"messages":[{"role":"system","content":"be nice"},{"role":"user","content":"hi"}]})));
+    let p = &r["request"];
+    assert_eq!(p["url"], "https://relay.test/v1/messages?q=1");
+    assert_eq!(p["headers"]["anthropic-version"], "2023-06-01");
+    let b: Value = serde_json::from_str(p["body"].as_str().unwrap()).unwrap();
+    assert_eq!(b["system"], "be nice");
+    assert_eq!(b["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(b["max_tokens"], 30);
+    assert_eq!(b["model"], "gpt");
 }
-
+/// auto 可跨协议；回程运行在不同工作进程，只依赖前程交出的私有状态。
 #[test]
 fn cross_format_response_conversion_end_to_end() {
-    let dir = tempfile::tempdir().unwrap();
-    let cfg_path = dir.path().join("agg.toml");
-    std::fs::write(&cfg_path, agg_config_for_cross_format()).unwrap();
-    let cfg_arg = format!("--config={}", cfg_path.display());
-
-    let mut proc = spawn_run(&[&cfg_arg]);
-    // 响应侧信封（无 method）：url 反查渠道 → anthropic 响应转回 openai_chat
-    let resp = r#"{"role":"assistant","content":[{"type":"text","text":"hello"}],"model":"gpt-4o","stop_reason":"end_turn"}"#;
-    let out = send_and_read(
-        &mut proc,
-        &serde_json::json!({
-            "url": "https://ant.example.com/v1/messages",
-            "headers": {"content-type": "application/json", "x-api-key": "sk-upstream-real"},
-            "body": resp,
-        })
-        .to_string(),
-    );
-    assert_eq!(out["url"], "https://ant.example.com/v1/messages");
-    assert!(
-        out["headers"].get("x-api-key").is_none(),
-        "上游 key 不得回传: {out}"
-    );
-    let body: serde_json::Value = serde_json::from_str(out["body"].as_str().unwrap()).unwrap();
-    assert!(
-        body.get("choices").is_some(),
-        "响应应转回 openai_chat 形态: {body}"
-    );
+    let args = ["convert", "--from", "auto", "--to", "anthropic_messages"];
+    let mut first = Worker::new(&args);
+    let r = first.frame(request(
+        "https://relay.test/custom",
+        "/v1/chat/completions",
+        json!({"model":"gpt","messages":[{"role":"user","content":"hi"}],"max_tokens":30}),
+    ));
+    assert_eq!(r["state"], "openai_chat");
+    assert!(r["request"].get("url").is_none());
+    drop(first);
+    let mut second = Worker::new(&args);
+    let r=second.frame(response(&r["state"],r#"{"role":"assistant","content":[{"type":"text","text":"hello"}],"model":"gpt","stop_reason":"end_turn"}"#));
+    assert_eq!(r["response"]["headers"], json!({"x-keep":"ok"}));
+    let b: Value = serde_json::from_str(r["response"]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(b["choices"][0]["message"]["content"], "hello");
+    assert!(!r.to_string().contains("fixture-private"));
 }
-
+/// 不可辨认的请求只拒绝这一帧；新的同协议请求与 SSE 均原样通过，不猜响应格式。
 #[test]
-fn run_loop_survives_error_lines_and_keeps_rotating() {
-    let dir = tempfile::tempdir().unwrap();
-    let cfg_path = dir.path().join("agg.toml");
-    std::fs::write(
-        &cfg_path,
-        r#"
-client_format = "auto"
-
-[[channel]]
-name = "ant"
-format = "anthropic_messages"
-url = "https://ant.example.com"
-keys = ["k1", "k2"]
-models = ["claude-*"]
-"#,
-    )
-    .unwrap();
-    let cfg_arg = format!("--config={}", cfg_path.display());
-
-    let mut proc = spawn_run(&[&cfg_arg]);
-    // 1. 未命中模型 → error 行（进程不退）
-    let miss = send_and_read(
-        &mut proc,
-        &envelope_line(
-            r#"{"system":"s","messages":[],"max_tokens":1,"model":"llama-nope"}"#,
-            "https://c.example.com/v1/messages",
-        ),
-    );
-    assert!(
-        miss["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("未命中"),
-        "error 行应带未命中原因: {miss}"
-    );
-    // 2. 后续请求照常（error 行不影响 worker 状态）且轮换跨请求连续
-    let a = send_and_read(
-        &mut proc,
-        &envelope_line(
-            r#"{"system":"s","messages":[],"max_tokens":1,"model":"claude-3"}"#,
-            "https://c.example.com/v1/messages",
-        ),
-    );
-    let b = send_and_read(
-        &mut proc,
-        &envelope_line(
-            r#"{"system":"s","messages":[],"max_tokens":1,"model":"claude-3"}"#,
-            "https://c.example.com/v1/messages",
-        ),
-    );
-    assert_eq!(a["headers"]["x-api-key"], "k1");
-    assert_eq!(b["headers"]["x-api-key"], "k2", "error 行后轮换序列应连续");
+fn auto_detect_rejects_unknown_input_and_requires_response_state() {
+    let mut w = Worker::new(&["convert", "--from", "auto", "--to", "anthropic_messages"]);
+    let bad = w.frame(request(
+        "https://relay.test/",
+        "/custom",
+        json!({"other":1}),
+    ));
+    assert_eq!(bad["fail"]["retry"], false);
+    assert!(bad.get("request").is_none());
+    let good = w.frame(request(
+        "https://relay.test/v1/messages",
+        "/v1/messages",
+        json!({"model":"m","messages":[],"max_tokens":10}),
+    ));
+    assert_eq!(good["state"], "anthropic_messages");
+    assert!(good["request"].get("body").is_none());
+    let same = w.frame(response(&good["state"], "event: ping\ndata: {}\n\n"));
+    assert!(same.get("fail").is_none() && same["response"].get("body").is_none());
+    let cross = w.frame(response(&json!("openai_chat"), "data: {}\n\n"));
+    assert!(cross["fail"]["reason"].as_str().unwrap().contains("stream"));
+    let missing = w.frame(response(&Value::Null, "{}"));
+    assert_eq!(missing["fail"]["retry"], false);
 }
-
+/// 未知 origin 不能占掉轮换名额，更不能借地址前缀骗取其他源的 key。
 #[test]
-fn auto_client_format_rejects_cross_protocol_routing() {
-    // 官方示例曾经的形态：auto + anthropic/openai_chat 混合渠道。Anthropic
-    // 客户端的请求被路由到 openai_chat 渠道 = 跨协议：响应侧无从得知客户端
-    // 协议，旧版会把 OpenAI 响应原样回给 Anthropic 客户端（静默错协议）。
-    // 现在请求侧当场输出 error 行（aproxy 侧 502、不发上游）；同协议路由
-    // 照常放行，进程不退
+fn persistent_keys_keep_weighted_and_round_robin_orders_after_rejection() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg_path = dir.path().join("agg.toml");
-    std::fs::write(
-        &cfg_path,
-        r#"
-client_format = "auto"
-
-[[channel]]
-name = "ant"
-format = "anthropic_messages"
-url = "https://ant.example.com/v1/messages"
-keys = ["k-ant"]
-models = ["claude-*"]
-
-[[channel]]
-name = "relay"
-format = "openai_chat"
-url = "https://relay.example.com/v1/chat/completions"
-keys = ["k-relay"]
-models = ["gpt-*"]
-"#,
-    )
-    .unwrap();
-    let cfg_arg = format!("--config={}", cfg_path.display());
-    let mut proc = spawn_run(&[&cfg_arg]);
-
-    let anthropic_body = |model: &str| {
-        format!(
-            r#"{{"system":"s","messages":[{{"role":"user","content":"hi"}}],"max_tokens":8,"model":"{model}"}}"#
+    let file = dir.path().join("keys.toml");
+    for (mode, expected) in [
+        ("round_robin", ["A", "B", "A", "B", "A", "B"]),
+        ("weighted", ["A", "A", "B", "A", "A", "B"]),
+    ] {
+        std::fs::write(&file,format!("strategy='{mode}'\n[[pool]]\norigin='https://relay.test'\nheader='x-api-key'\nkeys=[{{id='A',env='FORMAT_A',weight=2}},{{id='B',env='FORMAT_B'}}]")).unwrap();
+        let mut w = Worker::new(&["keys", &format!("--config={}", file.display())]);
+        for url in [
+            "https://relay.test.evil.test/",
+            "https://relay.test:8443/",
+            "http://relay.test/",
+        ] {
+            let r = w.frame(request(url, "/", Value::Null));
+            assert_eq!(r["fail"]["retry"], false);
+            assert!(r.get("request").is_none());
+        }
+        for id in expected {
+            let mut r = w.frame(request("https://relay.test:443/path", "/", Value::Null));
+            let h = r.as_object_mut().unwrap().remove("request").unwrap();
+            assert_eq!(
+                h["headers"],
+                json!({"x-api-key":format!("fixture-private-{id}")})
+            );
+            assert!(!r.to_string().contains("fixture-private"));
+            assert_eq!(r["report"]["actions"][0]["key_id"], id);
+        }
+    }
+}
+/// 模型别名、渠道路径与查询串、未命中和反向别名都在实际角色上验证。
+#[test]
+fn route_alias_paths_and_reverse_alias_survive_worker_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("route.toml");
+    std::fs::write(&f,"[aliases]\nsmall='up-small'\nother='up-small'\n[[channel]]\nid='one'\nurl='https://relay.test/base'\npreserve_path=true\nmodels=[{prefix='up-'}]\ncredential_env='FORMAT_A'\nauth_header='x-api-key'\n[[channel]]\nid='two'\nurl='https://other.test/endpoint'\nmodels=[{exact='gpt'}]\n").unwrap();
+    let args = ["route", "--config", f.to_str().unwrap()];
+    let mut w = Worker::new(&args);
+    let make = |model: &str| {
+        request(
+            "https://client.test/v1/messages?q=1",
+            "/v1/messages?q=1",
+            json!({"model":model}),
         )
     };
-    let cross = send_and_read(
-        &mut proc,
-        &envelope_line(
-            &anthropic_body("gpt-4o"),
-            "https://c.example.com/v1/messages",
-        ),
+    let miss = w.frame(make("missing"));
+    assert_eq!(miss["fail"]["retry"], false);
+    let fallback = w.frame(make("gpt"));
+    assert_eq!(fallback["request"]["url"], "https://other.test/endpoint");
+    assert_eq!(fallback["request"]["headers"], json!({}));
+    let r = w.frame(make("other"));
+    assert_eq!(
+        r["request"]["url"],
+        "https://relay.test/base/v1/messages?q=1"
     );
-    let reason = cross["error"].as_str().unwrap_or_default();
+    assert_eq!(
+        r["request"]["headers"],
+        json!({"x-api-key":"fixture-private-A"})
+    );
+    let b: Value = serde_json::from_str(r["request"]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(b["model"], "up-small");
+    drop(w);
+    let mut w = Worker::new(&args);
+    let r = w.frame(response(&r["state"], r#"{"model":"up-small"}"#));
+    assert_eq!(r["response"]["body"], r#"{"model":"other"}"#);
+}
+/// 配置错误不会把 TOML 原行里的值或环境秘密复制到 stderr；旧 run 命令不再可用。
+#[test]
+fn invalid_role_configuration_does_not_echo_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("bad");
+    for toml in [
+        "unexpected='fixture-private-A'",
+        "[[pool]]\norigin='https://x.test'\nheader='authorization'\nkeys=[]",
+        "[[pool]]\norigin='https://x.test'\nheader='authorization'\nkeys=[{id='x',env='FORMAT_A',weight=0}]",
+    ] {
+        std::fs::write(&f, toml).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+            .args(["keys", "--config", f.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(!out.status.success() && out.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("fixture-private"));
+    }
     assert!(
-        reason.contains("client_format") && reason.contains("openai_chat"),
-        "auto 跨协议应报错并指明改法: {cross}"
+        !Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+            .arg("run")
+            .output()
+            .unwrap()
+            .status
+            .success()
     );
-    assert!(
-        cross.get("url").is_none(),
-        "error 行不得携带改写产物: {cross}"
-    );
+}
 
-    let same = send_and_read(
-        &mut proc,
-        &envelope_line(
-            &anthropic_body("claude-3"),
-            "https://c.example.com/v1/messages",
+/// 每个子命令只公布它能处理的阶段；未参与正文协商的阶段不能擅自宣称 full。
+#[test]
+fn role_hello_declares_exact_stages_and_body_grades() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys = dir.path().join("keys.toml");
+    let route = dir.path().join("route.toml");
+    std::fs::write(&keys,"[[pool]]\norigin='https://test.invalid'\nheader='x-api-key'\nkeys=[{id='one',env='FORMAT_A'}]").unwrap();
+    std::fs::write(
+        &route,
+        "[[channel]]\nid='test'\nurl='https://test.invalid/'",
+    )
+    .unwrap();
+    for (args, stages, body) in [
+        (
+            vec!["adaptive"],
+            json!(["request", "decide", "notify"]),
+            json!({"request":"digest","decide":"none","notify":"digest"}),
         ),
-    );
-    assert!(same.get("error").is_none(), "同协议路由应放行: {same}");
-    assert_eq!(same["url"], "https://ant.example.com/v1/messages");
-    assert_eq!(same["headers"]["x-api-key"], "k-ant");
+        (vec!["policy"], json!(["decide"]), json!({"decide":"none"})),
+        (vec!["heartbeat"], json!(["heartbeat"]), json!({})),
+        (
+            vec!["rewrite"],
+            json!(["request", "retry"]),
+            json!({"request":"none","retry":"none"}),
+        ),
+        (
+            vec!["keys", "--config", keys.to_str().unwrap()],
+            json!(["request", "retry"]),
+            json!({"request":"none","retry":"none"}),
+        ),
+        (
+            vec!["route", "--config", route.to_str().unwrap()],
+            json!(["request", "retry"]),
+            json!({"request":"full","retry":"full"}),
+        ),
+        (
+            vec!["convert", "--from", "auto", "--to", "openai_chat"],
+            json!(["request", "retry", "response", "stream"]),
+            json!({"request":"full","retry":"full"}),
+        ),
+    ] {
+        let w = Worker::new(&args);
+        assert_eq!(w.hello["stages"], stages, "{args:?}");
+        assert_eq!(
+            w.hello.get("request_body").cloned().unwrap_or(json!({})),
+            body
+        );
+    }
+}
+/// translate 的输入没有 hello 或 seq，只转换一个 JSON 请求后在 EOF 退出。
+#[test]
+fn translate_is_a_one_off_request_converter() {
+    let mut worker = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+        .args([
+            "translate",
+            "--from",
+            "openai_responses",
+            "--to",
+            "openai_chat",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    worker
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"model":"m","input":"hello"}"#)
+        .unwrap();
+    let out = worker.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["messages"].is_array() && v.get("seq").is_none());
 }

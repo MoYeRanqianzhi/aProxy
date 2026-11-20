@@ -5645,3 +5645,161 @@ async fn forward_redirect_bypasses_both_response_and_stream_programs() {
         assert_eq!(frames(&home, n).len(), 1);
     }
 }
+
+/// 官方工作进程与代理是同一目标目录里的两个 workspace 二进制。
+fn official_binary() -> std::path::PathBuf {
+    let path = std::path::Path::new(common::APROXY)
+        .with_file_name(format!("aproxy-format{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        path.is_file(),
+        "先运行 cargo build -p aproxy-format: {}",
+        path.display()
+    );
+    path
+}
+/// 配置真正的角色，不依赖 PATH 或机器上另装的版本。
+fn official_layer(name: &str, stages: &str, args: &[&str]) -> String {
+    format!(
+        "\n[[format]]\nname='{name}'\ncommand={}\nargs={}\nprocess='persistent'\npool_max=1\nworker_idle_secs=0\nstages=[{stages}]\n",
+        serde_json::to_string(&official_binary()).unwrap(),
+        serde_json::to_string(args).unwrap()
+    )
+}
+/// 完整 hello 来自每个独立子命令；能力全集与体粒度另外在直接协议测试中逐项核对。
+#[test]
+fn every_role_handshakes_alone_in_a_chain() {
+    for (name, stages) in [
+        ("convert", "'request','retry','stream'"),
+        ("route", "'request','retry'"),
+        ("keys", "'request','retry'"),
+        ("policy", "'decide'"),
+        ("adaptive", "'request','decide','notify'"),
+        ("rewrite", "'request','retry'"),
+        ("heartbeat", "'heartbeat'"),
+    ] {
+        let home = TestHome::new();
+        let cfg = home.path().join("role.toml");
+        let path = cfg.to_str().unwrap();
+        let args = match name {
+            "convert" => vec![name, "--from", "auto", "--to", "openai_chat"],
+            "route" => {
+                std::fs::write(&cfg, "[[channel]]\nid='local'\nurl='http://127.0.0.1/'").unwrap();
+                vec![name, "--config", path]
+            }
+            "keys" => {
+                std::fs::write(&cfg,"[[pool]]\norigin='http://127.0.0.1'\nheader='x-api-key'\nkeys=[{id='test',env='KEY'}]").unwrap();
+                vec![name, "--config", path]
+            }
+            _ => vec![name],
+        };
+        let (_, out) = launch(&home, free_port(), &official_layer(name, stages, &args));
+        assert!(out.status.success(), "{name}: {out:?}");
+        let snapshot: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(snapshot["instance"]["formats"][0]["protocol"], 1);
+        assert_eq!(
+            snapshot["instance"]["formats"][0]["breaker"]["state"],
+            "closed"
+        );
+    }
+}
+/// 真实 adaptive 协商 digest；在管道上核对 request 和异步完成帧均无对话正文。
+#[tokio::test]
+async fn adaptive_gets_only_the_digest() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[200]).await;
+    let bin = official_binary();
+    let cfg = layer(
+        &home,
+        "adaptive",
+        "'request','decide','notify'",
+        &["record-worker", bin.to_str().unwrap(), "adaptive"],
+    );
+    let (c, url) = running(&home, up, &cfg);
+    let bytes = "private fixture text";
+    assert_eq!(
+        c.post(&url)
+            .body(bytes)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "upstream bytes"
+    );
+    let notify = observed_stage(&home, "adaptive", "notify", 1).await;
+    let request = observed_stage(&home, "adaptive", "request", 1).await;
+    let expected = "85056b4d36b70a6a8f4b73cb8896af293dd047a185f96363f44a7113cdde4b7d";
+    for m in [&request[0], &notify[0]] {
+        assert_eq!(m["digest"], expected);
+        assert!(!m.to_string().contains(bytes));
+        assert!(m["request"].get("body").is_none() && m["request"].get("body_b64").is_none());
+    }
+    assert_eq!(notify[0]["delivery"], "forward");
+}
+/// 从 Anthropic 客户端经三角色走到 Chat 上游，再从 stream 方向送回完整的 Anthropic 消息。
+#[tokio::test]
+async fn sample_chain_of_section_7_2_runs_end_to_end() {
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let (sent, observed) = tokio::sync::oneshot::channel();
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(sent)));
+    let app=axum::Router::new().fallback(move|uri:axum::http::Uri,h:axum::http::HeaderMap,b:axum::body::Bytes|{let sent=slot.lock().unwrap().take();async move{if let Some(sent)=sent{sent.send((uri,h,b)).unwrap();}axum::Json(serde_json::json!({"id":"chatcmpl-local","object":"chat.completion","model":"local","created":0,"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"fixture answer"}}],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}))}});
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let keys = home.path().join("keys.toml");
+    std::fs::write(&keys,format!("[[pool]]\norigin='http://127.0.0.1:{up}'\nheader='authorization'\nscheme='Bearer'\nkeys=[{{id='local',env='LOCAL_KEY'}}]" )).unwrap();
+    let cfg = official_layer("adaptive", "'request','decide','notify'", &["adaptive"])
+        + "required=false\n"
+        + &official_layer(
+            "convert",
+            "'request','stream'",
+            &[
+                "convert",
+                "--from",
+                "anthropic_messages",
+                "--to",
+                "openai_chat",
+            ],
+        )
+        + &official_layer(
+            "keys",
+            "'request','retry'",
+            &["keys", "--config", keys.to_str().unwrap()],
+        )
+        + "env={LOCAL_KEY='fictional-sample-key'}\n";
+    let (c, url) = running(&home, up, &cfg);
+    let response=c.post(format!("{url}/v1/messages")).header("x-api-key","incoming-client-key").json(&serde_json::json!({"model":"local","max_tokens":32,"system":"be nice","messages":[{"role":"user","content":"hello"}]})).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let value: Value = response.json().await.unwrap();
+    assert_eq!(value["content"][0]["text"], "fixture answer", "{value}");
+    assert_eq!(value["stop_reason"], "end_turn");
+    let (uri, h, b) = observed.await.unwrap();
+    assert_eq!(uri.path(), "/v1/chat/completions");
+    assert_eq!(h["authorization"], "Bearer fictional-sample-key");
+    assert!(!h.contains_key("x-api-key"));
+    let req: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(req["messages"][0]["role"], "system");
+    assert_eq!(req["messages"][1]["content"], "hello");
+}
+/// 可选判断程序握手失败时默认投递仍为 retry：熔断器真实打开，上游 503 后成功。
+#[tokio::test]
+async fn adaptive_unavailable_falls_back_to_retry() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[503, 200]).await;
+    let missing = home.path().join("unavailable.toml");
+    let cfg = official_layer(
+        "adaptive",
+        "'request','decide','notify'",
+        &["adaptive", "--config", missing.to_str().unwrap()],
+    ) + "required=false\nbreaker_cooldown_secs=3600\n";
+    let (c, url) = running(&home, up, &cfg);
+    assert_eq!(breaker(&home, &url).await["state"], "open");
+    assert_eq!(
+        c.get(&url).send().await.unwrap().text().await.unwrap(),
+        "upstream bytes"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+}

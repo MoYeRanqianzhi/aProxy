@@ -422,15 +422,16 @@ fn json_commands_finish_with_one_document_even_without_stderr() {
     ] {
         for relative in [true, false] {
             for broken in [false, true] {
-                let mut command = home.cmd();
+                let mut command = if relative {
+                    home.cmd_with_relative_home()
+                } else {
+                    home.cmd()
+                };
                 command
                     .current_dir(home.path())
                     .args(args)
                     .arg("--json")
                     .stdin(Stdio::null());
-                if relative {
-                    command.env("APROXY_HOME", "relative");
-                }
                 if broken {
                     let (reader, writer) = std::io::pipe().unwrap();
                     drop(reader);

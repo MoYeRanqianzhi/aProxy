@@ -134,6 +134,14 @@ impl TestHome {
         self.cmd_with(APROXY)
     }
 
+    /// 故意给出相对 home，让预检失败。即使被测程序误把它当有效路径，也只能写进临时目录。
+    pub fn cmd_with_relative_home(&self) -> Command {
+        let mut cmd = self.cmd();
+        cmd.current_dir(self.path())
+            .env(aproxy_ipc::home::HOME_ENV, "relative");
+        cmd
+    }
+
     /// 在这个 home 里运行 `exe`：aproxy 的副本（放进 `<home>/bin/` 的已安装形态、改成发布
     /// 资产名的副本、别的版本），或者会转而运行 aproxy 的程序（例如经 `cmd /c` 运行 bin 里的
     /// `aproxy.bat`）。返回的 `Command` 已经：

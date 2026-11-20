@@ -930,7 +930,13 @@ impl Pool {
         self.stopping.send_replace(true);
     }
     /// 截止后只报告仍未 wait 成功的 OS PID；协议编号与 PID 不同，日志也不用于事后杀进程。
-    pub(crate) fn warn_unconfirmed_exits(&self) {
+    pub(crate) async fn confirm_exits_until(&self, deadline: Instant) {
+        if tokio::time::timeout_at(deadline, self.stopping.closed())
+            .await
+            .is_ok()
+        {
+            return;
+        }
         for pid in self.ids.lock().unwrap().values().flatten() {
             tracing::warn!(format = %self.secrets.replace(&self.entry.name), pid, "format worker exit unconfirmed at shutdown deadline");
         }
@@ -940,10 +946,14 @@ impl Pool {
         self.turns.close();
         self.begin_drain();
         let mut retired = std::mem::take(&mut *self.retiring.lock().unwrap());
-        while retired.join_next().await.is_some() {}
+        // 健康的空闲进程先有 EOF 宽限；所有者无法确认 OS 退出时，不能让握手失败或 stop 卡在这里。
+        let _ = tokio::time::timeout(RETIRE_GRACE, async {
+            while retired.join_next().await.is_some() {}
+        })
+        .await;
         self.terminate_remaining();
-        // 每个进程所有者从拉起前到 wait 之后持有接收端；独占流没有普通名额，也必须等它。
-        self.stopping.closed().await;
+        self.confirm_exits_until(Instant::now() + Duration::from_secs(1))
+            .await;
     }
     /// 只有刚检查过输出的健康会话可以归还；第二次检查放在取用一刻，截住迟到的杂字节。
     fn park(self: &Arc<Self>, mut w: Worker) {

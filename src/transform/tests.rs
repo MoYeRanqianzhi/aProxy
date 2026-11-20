@@ -907,3 +907,21 @@ async fn stream_worker_returns_to_the_pool_or_exits_after_close() {
     assert!(p.ids.lock().unwrap().contains_key(&1));
     p.shutdown().await;
 }
+
+/// 模拟握手所有者收到终止信号却尚不能确认退出；不能用这种未确认状态挡住启动注册表清理。
+#[tokio::test(start_paused = true)]
+async fn startup_retirement_returns_with_an_unconfirmed_owner() {
+    let p = pool(Process::Persistent, "echo", |_| {});
+    let mut unconfirmed = p.stopping.subscribe();
+    let mut state = crate::proxy::AppState::new(crate::config::Config {
+        disk_cache: Some(false),
+        ..Default::default()
+    });
+    state.formats = vec![p].into();
+    let wait = tokio::spawn(async move { state.retire_formats().await });
+    unconfirmed.wait_for(|stop| *stop).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), wait)
+        .await
+        .expect("one shared second for exit confirmation")
+        .unwrap();
+}

@@ -401,21 +401,21 @@ pub(super) async fn finish(
         r.respond(out);
         return;
     }
-    let sse = terminal_is_sse(&response.headers);
-    // 已提交的头没有编码。必须先严格解完整条流，不能写完一些字节才发现尾部校验失败。
-    // 非 SSE 只打算生成单个 JSON 事件，对输入文件与解码后的单值都执行同一个上限。
-    if !sse && response.body.len() > PREVIEW_BYTES as u64 {
-        r.finish(terminal, trace).await;
-        return;
-    }
-    let encoding = request_encoding(&response.headers, true);
-    let encoding = encoding
-        .as_deref()
-        .map(|v| String::from_utf8_lossy(v.as_bytes()));
-    let mut body = if let Some(enc) = encoding.filter(|v| {
-        v.split(',')
-            .any(|e| !e.trim().is_empty() && !e.trim().eq_ignore_ascii_case("identity"))
-    }) {
+    committed_terminal(state, r, trace, terminal, &response.headers, response.body).await;
+}
+
+/// 头已提交时各阶段遵守同一条规则：完整解码 SSE、限长解码 JSON，否则只写标准错误事件。
+pub(super) async fn committed_terminal(
+    state: &AppState,
+    r: &mut Responder,
+    trace: &RequestTrace,
+    terminal: Terminal,
+    headers: &HeaderMap,
+    raw: SpooledBody,
+) {
+    let rec = &trace.rec;
+    let sse = is_event_stream(headers);
+    let mut body = if let Some(enc) = encoding_to_undo(headers) {
         if !format_encoding_depth_allowed(&enc) {
             r.finish(terminal, trace).await;
             return;
@@ -425,13 +425,8 @@ pub(super) async fn finish(
         } else {
             PREVIEW_BYTES
         };
-        let decode = decode_for_committed_replay(
-            response.body,
-            enc.into_owned(),
-            state.spool_dir.clone(),
-            limit,
-        );
-        match r.wait(decode, None, "decode stop response").await {
+        let decode = decode_for_committed_replay(raw, enc, state.spool_dir.clone(), limit);
+        match r.wait(decode, None, "decode terminal response").await {
             Some(Ok(body)) => body,
             Some(Err(_)) => {
                 r.finish(terminal, trace).await;
@@ -440,8 +435,13 @@ pub(super) async fn finish(
             None => return,
         }
     } else {
-        response.body
+        raw
     };
+    // 磁盘上的原体可能用了零压缩；传输长度不是 JSON 的长度。只在解码后决定是否读取这个单值。
+    if !sse && body.len() > PREVIEW_BYTES as u64 {
+        r.finish(terminal, trace).await;
+        return;
+    }
     if sse {
         let mut stream = body.into_stream().await;
         while let Some(chunk) = stream.next().await {

@@ -176,7 +176,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 # 仅测试用：造 brotli 压缩样本需要编码器（CompressorWriter），生产路径不需要。
 # 放在这里既让 `cargo test` 拿得到，又让常规/release 构建完全不编译编码器。

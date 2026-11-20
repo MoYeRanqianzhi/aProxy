@@ -216,14 +216,11 @@ impl AppState {
         for pool in self.formats.iter() {
             pool.terminate_remaining();
         }
-        if tokio::time::timeout(std::time::Duration::from_secs(1), self.retire_formats())
-            .await
-            .is_err()
-        {
-            for pool in self.formats.iter() {
-                pool.warn_unconfirmed_exits();
-            }
-        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        futures_util::future::join_all(
+            self.formats.iter().map(|p| p.confirm_exits_until(deadline)),
+        )
+        .await;
     }
 
     /// 所有程序同时收到 EOF，正常关闭的宽限不随链长或池大小累加。

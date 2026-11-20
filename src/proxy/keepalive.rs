@@ -454,14 +454,6 @@ pub(super) fn is_event_stream(headers: &HeaderMap) -> bool {
     headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"))
-}
-
-/// 程序给的终态体仅在媒体类型确实是 SSE 时原样转发，参数和大小写不影响判断。
-pub(super) fn terminal_is_sse(headers: &HeaderMap) -> bool {
-    headers
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
         .is_some_and(|v| {
             v.split(';')
                 .next()

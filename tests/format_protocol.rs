@@ -1692,6 +1692,51 @@ async fn committed_format_rejection_uses_the_terminal_event_rules() {
     }
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
+/// 先等客户端实际收到保活头，再让拒绝程序发送压缩 SSE 或解码后超限的 JSON。
+#[tokio::test]
+async fn committed_request_refusal_decodes_sse_and_bounds_json() {
+    use base64::Engine as _;
+    use std::io::Write as _;
+    for mime in ["text/event-stream", "application/json"] {
+        let home = TestHome::new();
+        let (up, calls) = upstream(&[200]).await;
+        let gate = home.path().join("allow");
+        let plain = if mime == "application/json" {
+            format!("\"{}\"", "x".repeat(1024 * 1024))
+        } else {
+            "event: denied\ndata: x\n\n".into()
+        };
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        gz.write_all(plain.as_bytes()).unwrap();
+        let body = base64::engine::general_purpose::STANDARD.encode(gz.finish().unwrap());
+        let reply = serde_json::json!({"fail":{"retry":false,"reason":"denied","response":{"status":422,"headers":{"content-type":mime,"content-encoding":"gzip"},"body_b64":body}}});
+        let cfg = String::from("[keepalive]\ntrigger='accept'\ninterval_secs=1\n")
+            + &layer(
+                &home,
+                "hold",
+                "'request'",
+                &["gate-request", gate.to_str().unwrap()],
+            )
+            + "timeout_secs=0\n"
+            + &layer(&home, "stop", "'request'", &["reply", &reply.to_string()]);
+        let (client, url) = running(&home, up, &cfg);
+        let response = client
+            .post(url)
+            .header("accept", "text/event-stream")
+            .body("blocked")
+            .send()
+            .await
+            .unwrap();
+        std::fs::write(gate, b"").unwrap();
+        let b = response.bytes().await.unwrap();
+        if mime == "application/json" {
+            assert!(b.len() < 4096 && String::from_utf8_lossy(&b).contains("format_rejected"));
+        } else {
+            assert!(b.ends_with(plain.as_bytes()));
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+}
 /// 关闭尚未提交的真实 HTTP 连接：不启动心跳也能取消卡在请求或非 SSE 响应阶段的进程。
 #[tokio::test]
 async fn disconnected_format_request_releases_the_only_worker_without_heartbeat() {
@@ -2998,7 +3043,14 @@ async fn observing_start_preserves_a_static_handshake_failure() {
 #[tokio::test]
 async fn pending_success_vote_preserves_non_sse() {
     let home = TestHome::new();
-    let (up, _) = upstream(&[200]).await;
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    const MIME: &str = r#"application/json; profile="text/event-stream""#;
+    let app = axum::Router::new()
+        .fallback(|| async { ([("content-type", MIME)], r#"{"accepted":true}"#) });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let gate = home.path().join("decision.release");
     let cfg = String::from("[keepalive]\ntrigger='accept'\ninterval_secs=1\n")
         + &layer(
@@ -3023,11 +3075,8 @@ async fn pending_success_vote_preserves_non_sse() {
     );
     std::fs::write(gate, b"").unwrap();
     let response = client.await.unwrap().unwrap();
-    assert_eq!(
-        response.headers()["content-type"],
-        "text/plain; charset=utf-8"
-    );
-    assert_eq!(response.text().await.unwrap(), "upstream bytes");
+    assert_eq!(response.headers()["content-type"], MIME);
+    assert_eq!(response.text().await.unwrap(), r#"{"accepted":true}"#);
 }
 
 /// 慢 SSE 的首个尝试随后被否决，它的 Cookie 和其他响应头不能先抵达客户端。
@@ -3246,6 +3295,18 @@ async fn committed_stop_limits_disk_json_conversion() {
     assert!(std::str::from_utf8(&b).unwrap().contains("retry_stopped"));
 }
 
+/// JSON 恰好 1 MiB 时，压缩帧的开销可能让传输长度大于上限；上限只约束解码后的单值。
+#[tokio::test]
+async fn committed_stop_json_limit_measures_decoded_bytes() {
+    use std::io::Write as _;
+    let json = format!("\"{}\"", "x".repeat(1024 * 1024 - 2));
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+    gz.write_all(json.as_bytes()).unwrap();
+    let encoded = gz.finish().unwrap();
+    assert!(encoded.len() > 1024 * 1024);
+    let body = committed_stop_body("application/json", "gzip", encoded).await;
+    assert!(body.ends_with(format!("event: error\ndata: {json}\n\n").as_bytes()));
+}
 /// 路由写入 URL 路径的已知凭据不能从自动生成的停止诊断回到客户端或进入实例日志。
 #[tokio::test]
 async fn decide_stop_masks_configured_secret_in_upstream_failure() {

@@ -435,18 +435,15 @@ pub(super) async fn finish_chain_stop(
         rec.settle(crate::history::Outcome::FormatResponse, Some(t.code()));
         let bytes = response.body.as_bytes().unwrap_or_default();
         if r.is_committed() {
-            let data = if terminal_is_sse(&headers) {
-                Bytes::copy_from_slice(bytes)
-            } else if let Some(event) = terminal_json_event(bytes) {
-                event
-            } else {
-                r.finish(t, trace).await;
-                return;
-            };
-            let size = data.len() as u64;
-            if r.send(Ok(data)).await {
-                rec.response_bytes(size);
-            }
+            decide::committed_terminal(
+                state,
+                r,
+                trace,
+                t,
+                &headers,
+                SpooledBody::Memory(Bytes::copy_from_slice(bytes)),
+            )
+            .await;
         } else if let Ok(status) = StatusCode::from_u16(response.status) {
             mark_given_up(&mut headers, t.code(), trace);
             if delivers_body(client_head, status) {

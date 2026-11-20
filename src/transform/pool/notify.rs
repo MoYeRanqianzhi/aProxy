@@ -94,15 +94,16 @@ impl Pool {
             Waiting(self)
         })
     }
-    /// 没有握手结果时保留计算机会；已经明确不要摘要的程序不会增加直通上传的哈希成本。
-    pub(crate) fn wants_notify_digest(&self) -> bool {
-        self.notices.is_some()
-            && self
-                .negotiated
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_none_or(|h| h.request_body.get("notify") == Some(&BodyNeed::Digest))
+    /// 上传原始字节只读一次。按配置与最近一次成功 hello 的交集算摘要，不预测替换进程会更改订阅。
+    /// 从未握手成功的可选项是例外：首次冷却试探可能发生在上传结束后，届时已无法补算原始字节。
+    pub(crate) fn may_need_upload_digest(&self, stages: &[crate::config::file::Stage]) -> bool {
+        let hello = self.negotiated.lock().unwrap();
+        stages.iter().any(|&stage| {
+            self.entry.has_stage(stage)
+                && hello
+                    .as_ref()
+                    .is_none_or(|h| h.request_body.get(stage.as_str()) == Some(&BodyNeed::Digest))
+        })
     }
     /// 只有 notify 的可选程序握手不可用时，由观察方向负责冷却和恢复，业务熔断保持关闭。
     pub(super) fn notify_failure_at_start(&self, f: Fault) {

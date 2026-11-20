@@ -1219,3 +1219,56 @@ async fn forward_replacement_does_not_retain_the_original_upload() {
     );
     assert!(matches!(req.sent_body(),RequestBody::Memory(b) if b.as_ref()==b"replacement"));
 }
+
+/// 协商表内未挂进链的阶段不能让整份上传付出 SHA-256 成本；真正订阅的阶段仍取原始字节。
+#[tokio::test]
+async fn buffered_digest_requires_a_subscribed_stage_in_the_last_hello() {
+    for (stages, want) in [("'request'", false), ("'request','retry'", true)] {
+        let temp = tempfile::tempdir().unwrap();
+        let (parsed, errors) = crate::config::file::parse(
+            &format!("[[format]]\ncommand='f'\nprocess='persistent'\nstages=[{stages}]"),
+            Path::new("unit.toml"),
+        );
+        assert!(errors.is_empty());
+        let mut entry = parsed.format.unwrap().pop().unwrap();
+        entry.command = crate::transform::format_echo_path().display().to_string();
+        entry.args = vec!["metadata-only".into()];
+        let pool = crate::transform::Pool::new(
+            entry,
+            temp.path().into(),
+            Default::default(),
+            Default::default(),
+            [1024; 2],
+        );
+        pool.probe().await.unwrap();
+        let mut state = AppState::new(Config {
+            disk_cache: Some(false),
+            ..Config::default()
+        });
+        state.formats = vec![pool].into();
+        let rec = crate::history::Recorder::none();
+        let mut req = OutboundRequest {
+            method: http::Method::POST,
+            target_url: "http://localhost/test".into(),
+            headers: Default::default(),
+            body: RequestBody::Memory(Bytes::new()),
+            replacement: None,
+            client_encoding: None,
+            client_accept: false,
+            body_stream: None,
+            ctx: Some(ExchangeCtx::new("r".into(), "/", false, None, rec.clone())),
+        };
+        let upload = ClientUpload {
+            body: Body::from("abc"),
+            trigger: crate::config::KeepaliveTrigger::Accept,
+            accept: false,
+            encoding: None,
+        };
+        upload.buffer(&state, &mut req, &rec).await.unwrap();
+        assert_eq!(
+            req.ctx.as_ref().unwrap().digest.get().map(String::as_str),
+            want.then_some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+            "{stages}"
+        );
+    }
+}

@@ -52,7 +52,12 @@ impl RequestTap {
             .and_then(|c| c.live_stream.clone())
             .filter(|_| need_flag);
         let digest = ctx
-            .filter(|_| state.formats.iter().any(|p| p.wants_notify_digest()))
+            .filter(|_| {
+                state
+                    .formats
+                    .iter()
+                    .any(|p| p.may_need_upload_digest(&[crate::config::file::Stage::Notify]))
+            })
             .and_then(|c| {
                 use axum::body::HttpBody as _;
                 let hash = sha2::Sha256::default();

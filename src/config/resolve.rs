@@ -988,12 +988,12 @@ stages = ["request"]
         );
     }
 
-    /// forward 与 format 现在还不能同配。
+    /// forward 的请求层在需要时读取正文，不再与默认交付方式冲突。
     #[test]
-    fn forward_and_format_conflict() {
+    fn forward_and_format_are_valid() {
         let text = "base_url = \"https://a.example\"\ndelivery = \"forward\"\n[[format]]\ncommand = \"f\"\nstages = [\"request\"]\n";
         let resolved = run(text, &Overrides::default(), FileConfig::default());
-        assert_eq!(brief(&resolved), ["config_conflict delivery config.toml 2"]);
+        assert!(brief(&resolved).is_empty());
         assert!(resolved.config.forward_only_enabled());
     }
 
@@ -1153,7 +1153,7 @@ stages = ["request"]
     fn diagnostics_match_the_code_table() {
         let text = "base_url = \"ftp://x\"\nlisten_addr = \"x\"\nproxy_username = \"u\"\ndelivery = \"forward\"\n[extra_headers]\n\"bad name\" = \"v\"\n[[format]]\ncommand = \"f\"\nstages = [\"request\"]\n";
         let resolved = run(text, &Overrides::default(), FileConfig::default());
-        assert!(resolved.diagnostics.len() >= 5, "{:?}", brief(&resolved));
+        assert!(resolved.diagnostics.len() >= 4, "{:?}", brief(&resolved));
         for d in &resolved.diagnostics {
             let entry = aproxy_ipc::code::lookup(d.code).unwrap_or_else(|| panic!("{}", d.code));
             assert!(

@@ -128,7 +128,7 @@ fn launch(home: &TestHome, upstream: u16, config: &str) -> (u16, std::process::O
     let port = free_port();
     home.stop_on_drop(port);
     let cfg = home.path().join("chain.toml");
-    std::fs::write(&cfg,format!("base_url='http://127.0.0.1:{upstream}'\nlisten_addr='127.0.0.1:{port}'\n[retry]\nmax_backoff_secs=0\n{config}")).unwrap();
+    std::fs::write(&cfg,format!("base_url='http://127.0.0.1:{upstream}'\nlisten_addr='127.0.0.1:{port}'\nretry.max_backoff_secs=0\n{config}")).unwrap();
     let out = home
         .cmd()
         .env("NO_PROXY", "127.0.0.1,localhost")
@@ -3280,4 +3280,208 @@ async fn inner_stream_failures_reach_the_outer_abort_with_their_own_code() {
         assert_eq!(f.last().unwrap()["event"], "abort");
         assert_eq!(f.last().unwrap()["reason"]["code"], code);
     }
+}
+
+/// 第一块立刻发送，只有测试亲眼见到目标层的进展后才准发第二块；不用睡眠模拟流。
+async fn split_forward_upstream() -> (u16, std::sync::Arc<tokio::sync::Notify>) {
+    use futures_util::StreamExt as _;
+    let port = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    let resume = std::sync::Arc::new(tokio::sync::Notify::new());
+    let gate = resume.clone();
+    let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+        let gate = gate.clone();
+        async move {
+            let body = axum::body::to_bytes(request.into_body(), 4096)
+                .await
+                .unwrap();
+            let first = if body.is_empty() {
+                bytes::Bytes::from_static(b"first")
+            } else {
+                body
+            };
+            let chunks = futures_util::stream::once(async move { Ok::<_, std::io::Error>(first) })
+                .chain(futures_util::stream::once(async move {
+                    gate.notified().await;
+                    Ok(bytes::Bytes::from_static(b"last"))
+                }));
+            axum::body::Body::from_stream(chunks)
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (port, resume)
+}
+/// 请求只改写一次，响应的第一块在上游仍打开时到客户端，最后由同一进程收尾。
+#[tokio::test]
+async fn forward_stream_conversion_end_to_end() {
+    let home = TestHome::new();
+    let (up, resume) = split_forward_upstream().await;
+    let cfg = String::from("delivery='forward'\n")
+        + &layer(
+            &home,
+            "req",
+            "'request','retry','decide','heartbeat'",
+            &["upper"],
+        )
+        + &layer(&home, "stream", "'stream'", &["stream-echo"]);
+    let (client, url) = running(&home, up, &cfg);
+    let mut res = client.post(&url).body("hello").send().await.unwrap();
+    let mut prefix = Vec::new();
+    while prefix.len() < 6 {
+        prefix.extend_from_slice(&res.chunk().await.unwrap().unwrap())
+    }
+    assert_eq!(&prefix, b"[HELLO");
+    resume.notify_one();
+    assert_eq!(res.text().await.unwrap(), "last]");
+    let sent = frames(&home, "req");
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1]["stage"], "request");
+    assert_eq!(sent[1]["delivery"], "forward");
+    let d = request_detail(&home, &url, sent[1]["request_id"].as_str().unwrap()).await;
+    assert_eq!(d["record"]["response_bytes"], 11);
+    assert_eq!(d["record"]["tries"][0]["response_bytes"], 9);
+    assert_eq!(frames(&home, "stream").last().unwrap()["event"], "close");
+}
+/// 内侧先收到 data，整包层还没有输入；EOF 后它只处理一次，外层处理它的输出。
+#[tokio::test]
+async fn forward_with_a_response_program_gathers_the_response_at_that_layer() {
+    let home = TestHome::new();
+    let (up, resume) = split_forward_upstream().await;
+    let cfg = String::from("delivery='forward'\n")
+        + &layer(&home, "outer", "'stream'", &["stream-echo"])
+        + &layer(&home, "whole", "'response'", &["upper"])
+        + &layer(&home, "inner", "'stream'", &["stream-echo"]);
+    let (client, url) = running(&home, up, &cfg);
+    let req = tokio::spawn(client.get(url).send());
+    let events = observed_stage(&home, "inner", "stream", 2).await;
+    assert_eq!(events[1]["data"], "first");
+    for name in ["whole", "outer"] {
+        assert_eq!(frames(&home, name).len(), 1);
+    }
+    resume.notify_one();
+    assert_eq!(
+        req.await.unwrap().unwrap().text().await.unwrap(),
+        "[[FIRSTLAST]]"
+    );
+    assert_eq!(frames(&home, "whole")[1]["response"]["body"], "[firstlast]");
+}
+/// 没有 request 阶段的链不等上传 EOF；上游先确认收到前缀，客户端才发送最后一块。
+#[tokio::test]
+async fn forward_without_request_programs_streams_the_request_body() {
+    use futures_util::StreamExt as _;
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let first = std::sync::Arc::new(tokio::sync::Notify::new());
+    let observed = first.clone();
+    let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+        let first = first.clone();
+        async move {
+            let mut f = req.into_body().into_data_stream();
+            let a = f.next().await.unwrap().unwrap();
+            assert_eq!(a, "one");
+            first.notify_one();
+            let b = f.next().await.unwrap().unwrap();
+            assert_eq!(b, "two");
+            "received"
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (client, url) = running(
+        &home,
+        up,
+        &(String::from("delivery='forward'\n")
+            + &layer(&home, "convert", "'stream'", &["stream-echo"])),
+    );
+    let body = futures_util::stream::once(async { Ok::<_, std::io::Error>("one") }).chain(
+        futures_util::stream::once(async move {
+            observed.notified().await;
+            Ok("two")
+        }),
+    );
+    assert_eq!(
+        client
+            .post(url)
+            .body(reqwest::Body::wrap_stream(body))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "[received]"
+    );
+}
+
+/// 上游的错误响应原样透传；请求侧要求重试却不能升级时本地返回 502，不能暗中再请求一次。
+#[tokio::test]
+async fn forward_format_failures_do_not_enter_the_retry_chain() {
+    let (up, calls) = upstream(&[503]).await;
+    for (mode, status, code) in [
+        ("{}", 503, None),
+        (
+            r#"{"fail":{"retry":true,"reason":"not ready"}}"#,
+            502,
+            Some("format_failed"),
+        ),
+        (
+            r#"{"fail":{"retry":false,"reason":"blocked"}}"#,
+            422,
+            Some("format_rejected"),
+        ),
+    ] {
+        let home = TestHome::new();
+        let cfg = String::from("delivery='forward'\n")
+            + &layer(&home, "req", "'request','retry'", &["reply", mode])
+            + &layer(&home, "convert", "'stream'", &["stream-echo"]);
+        let (client, url) = running(&home, up, &cfg);
+        let resp = client.get(url).send().await.unwrap();
+        assert_eq!(resp.status(), status);
+        if let Some(code) = code {
+            let d: Value = resp.json().await.unwrap();
+            assert_eq!(d["error"]["aproxy"]["code"], code);
+        } else {
+            assert_eq!(resp.text().await.unwrap(), "upstream bytes");
+        }
+        assert_eq!(frames(&home, "req").len(), 2);
+        assert_eq!(frames(&home, "convert").len(), 1);
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+/// 伪成功的 JSON 在原始输入上判定；它即使经过转换就不再像错误，也不得进入回放层。
+#[tokio::test]
+async fn retry_stream_never_opens_for_an_error_disguised_as_200() {
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = axum::Router::new().fallback(move || {
+        let i = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        async move {
+            axum::Json(if i == 0 {
+                serde_json::json!({"error":{"message":"busy"}})
+            } else {
+                serde_json::json!({"ok":true})
+            })
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (client, url) = running(
+        &home,
+        up,
+        &layer(&home, "convert", "'stream'", &["stream-echo"]),
+    );
+    assert_eq!(
+        client.get(url).send().await.unwrap().text().await.unwrap(),
+        r#"[{"ok":true}]"#
+    );
+    let f = frames(&home, "convert");
+    assert_eq!(f.iter().filter(|v| v["event"] == "open").count(), 1);
+    assert!(f[1]["stream_id"].as_str().unwrap().ends_with("/2"));
 }

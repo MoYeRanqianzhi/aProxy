@@ -90,19 +90,37 @@ async fn handle(
     // 在本地侧先应用覆盖/追加，避免重试间重复计算
     apply_header_overrides(&mut headers, &state.config);
 
-    // 仅转发模式：分支点必须在 read_request_body **之前**——缓冲一旦发生，本模式
+    // 没有请求阶段的仅转发模式：分支点必须在 read_request_body **之前**——缓冲一旦发生，本模式
     // 就丢掉了全部意义（内存随负载增长、下游要等请求体读完才见到首字节）；
     // 同时它位于 requests_total.fetch_add 与 apply_header_overrides **之后**，
     // 所以 status 的请求计数与鉴权/头改写行为与常规模式完全一致。
-    // 这条路径整体不进重试循环、保活心跳、错误内容拦截、spool 与 keepalive_trigger
-    // 判定，也不做响应体解码（本模式不对响应内容做任何检查，无需解码）。
-    if state.config.forward_only_enabled() {
+    // 这条路径不进重试循环、保活心跳或错误内容拦截；只有响应方向的 format 需要时才解码或缓冲下载。
+    let forward = state.config.forward_only_enabled();
+    if forward && !state.has_format(crate::config::file::Stage::Request) {
         let target_url = upstream_url(&state.config, &uri);
         // 日志里的 URL 一律经 redact::url：base_url 可能内嵌 user:pass，客户端
         // 查询串可能带 key（Gemini 式 ?key=），日志常被整段粘贴求助
         tracing::info!(method = %method, target = %state.history.redacted_url(&target_url), "代理请求（仅转发）");
-        return forward_only_proxy(state, method, target_url, headers, req.into_body(), trace)
-            .await;
+        let ctx = (state.has_format(crate::config::file::Stage::Stream)
+            || state.has_format(crate::config::file::Stage::Response))
+        .then(|| {
+            ExchangeCtx::new(
+                trace.request_id.clone(),
+                uri.path_and_query().map_or("/", |p| p.as_str()),
+                accepts_event_stream(req.headers()),
+                trace.rec.clone(),
+            )
+        });
+        return forward_only_proxy(
+            state,
+            &method,
+            &target_url,
+            &headers,
+            ForwardBody::Live(req.into_body()),
+            ctx.as_ref(),
+            trace,
+        )
+        .await;
     }
 
     // 缓冲请求体以支持重试重放；上限 max_body_mb（默认 128 MB，0=不限），
@@ -148,7 +166,7 @@ async fn handle(
     // 「客户端是不是在要一个流」不管保活开没开都判：请求记录的 `stream` 用的是同一个结论
     let (wants_stream, body_stream) =
         keepalive_triggered(state.config.keepalive_trigger(), client_accept, &req_body).await;
-    let keepalive_applies = keepalive_enabled && wants_stream;
+    let keepalive_applies = !forward && keepalive_enabled && wants_stream;
     trace.rec.request_bytes(match &req_body {
         RequestBody::Memory(bytes) => bytes.len() as u64,
         RequestBody::Disk { len, .. } => *len,
@@ -177,6 +195,9 @@ async fn handle(
             )
         }),
     };
+    if forward {
+        return forward_after_chain(state, req, trace).await;
+    }
     let max_spool_bytes = spool_limit_bytes(&state.config);
 
     // 保活适用：整个尝试循环（从请求转换起）交给后台任务，经保活出口交付——请求转换也

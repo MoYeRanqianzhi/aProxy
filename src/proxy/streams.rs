@@ -13,15 +13,21 @@ pub(super) struct End {
     /// 传给外层 abort 的稳定原因，不把任意管道文本写进诊断。
     reason: wire::Failure,
     /// 已经转换到当前协议的中断结尾。
-    tail: Bytes,
+    tail: Option<Bytes>,
 }
 impl End {
     /// 上游中断还没有客户端协议的收尾，由外层决定。
     fn upstream() -> Self {
         Self {
             reason: wire::Failure::new("upstream_body_interrupted".into()),
-            tail: Bytes::new(),
+            tail: None,
         }
+    }
+    /// 转发期间的读空闲、断流等沿用尝试的失败码；程序不会把读超时误诊为传输中断。
+    pub(super) fn attempt(f: AttemptFailure) -> Self {
+        let mut reason = wire::Failure::new(f.code.into());
+        reason.details = Some(f.details);
+        Self { reason, tail: None }
     }
 }
 /// 每项是一块完整的转换输出或一个中断；容量受 HTTP 与子进程两侧的背压限制。
@@ -46,18 +52,21 @@ impl Content {
         }
     }
     /// 只有声明 response 的层才需要读到尾；沿用响应上限和磁盘溢写。
-    async fn gather(self, state: &AppState) -> Result<SpooledBody, Terminal> {
+    async fn gather(self, state: &AppState) -> Result<(SpooledBody, Option<End>), Terminal> {
         let mut f = match self {
-            Self::Saved(b) => return Ok(b),
+            Self::Saved(b) => return Ok((b, None)),
             Self::Flow(f) => f,
         };
         let limit = spool_limit_bytes(&state.config);
         let mut buf = SpoolBuffer::Memory(Vec::new());
+        let mut interrupted = None;
         while let Some(item) = f.next().await {
-            let eof = item.is_err();
             let bytes = match item {
                 Ok(b) => b,
-                Err(end) => end.tail,
+                Err(end) => {
+                    interrupted = Some(end);
+                    break;
+                }
             };
             if buf.len().saturating_add(bytes.len() as u64) > limit as u64 {
                 return Err(Terminal::response_too_large(limit));
@@ -69,13 +78,10 @@ impl Content {
                     "could not write response spool",
                 ));
             }
-            if eof {
-                break;
-            }
         }
         buf.finish(StreamErrorScanner::new())
             .await
-            .map(|(b, _)| b)
+            .map(|(b, _)| (b, interrupted))
             .map_err(|e| Terminal::local_storage_failed(StorageOp::WriteResponse, &e))
     }
 }
@@ -122,21 +128,25 @@ impl std::io::Write for DecodeOutput {
 fn decode(input: Flow, encoding: String, limit: usize) -> Flow {
     let (tx, rx) = mpsc::channel(1);
     let out = tx.clone();
-    let stream = futures_util::stream::unfold((input, tx), |(mut f, tx)| async move {
-        let item = tokio::select! {biased; _=tx.closed()=>None,v=f.next()=>v};
-        item.map(|v| {
-            (
-                v.map_err(|_| std::io::Error::other("upstream body interrupted")),
-                (f, tx),
-            )
-        })
-    })
-    .boxed();
-    let reader = tokio_util::io::SyncIoBridge::new(tokio_util::io::StreamReader::new(stream));
     tokio::task::spawn_blocking(move || {
+        let mut failure = None;
+        let stream = futures_util::stream::unfold((input, tx), |(mut f, tx)| async move {
+            let item = tokio::select! {biased; _=tx.closed()=>None,v=f.next()=>v};
+            item.map(|v| (v, (f, tx)))
+        })
+        .map(|v| {
+            v.map_err(|end| {
+                failure = Some(end);
+                std::io::Error::other("upstream body interrupted")
+            })
+        })
+        .boxed();
+        let reader = tokio_util::io::SyncIoBridge::new(tokio_util::io::StreamReader::new(stream));
         let mut output = DecodeOutput(out);
         if crate::decode::decode_strict(&encoding, reader, &mut output, limit as u64).is_err() {
-            let _ = output.0.blocking_send(Err(End::upstream()));
+            let _ = output
+                .0
+                .blocking_send(Err(failure.unwrap_or_else(End::upstream)));
         }
     });
     receive(rx)
@@ -266,7 +276,7 @@ impl Layer {
                             let _ = tx
                                 .send(Err(End {
                                     reason,
-                                    tail: self.tail,
+                                    tail: Some(self.tail),
                                 }))
                                 .await;
                             return;
@@ -304,7 +314,7 @@ impl Layer {
             Ok(b) => {
                 self.worker.finish();
                 if let Some(mut end) = end {
-                    end.tail = b;
+                    end.tail = Some(b);
                     let _ = tx.send(Err(end)).await;
                 } else if !b.is_empty() {
                     let _ = tx.send(Ok(b)).await;
@@ -315,7 +325,7 @@ impl Layer {
                     let _ = tx
                         .send(Err(End {
                             reason,
-                            tail: self.tail,
+                            tail: Some(self.tail),
                         }))
                         .await;
                 } else if let Some(end) = end {
@@ -341,7 +351,17 @@ pub(super) async fn chain(
     let (client, gone) = tokio::sync::watch::channel(());
     for (index, p) in state.formats.iter().enumerate().rev() {
         if p.entry.has_stage(Stage::Response) && p.available_for_message() {
-            let body = content.gather(state).await?;
+            let (body, interrupted) = content.gather(state).await?;
+            if let Some(end) = interrupted {
+                // 整包层不处理半截响应；已收前缀和真实中断继续向外，逐块层仍须发 abort。
+                let prefix = Content::Saved(body).flow().await;
+                content = Content::Flow(
+                    prefix
+                        .chain(futures_util::stream::once(async move { Err(end) }))
+                        .boxed(),
+                );
+                continue;
+            }
             let (code, h, b) =
                 transform_response_layer(state, ctx, meta, index, status, headers, body).await;
             status = code;
@@ -434,16 +454,18 @@ pub(super) async fn chain(
     }
     let f = content.flow().await;
     let rec = ctx.rec.clone();
-    let out = futures_util::stream::unfold((client, f, 0u64), move |mut output| {
+    let out = futures_util::stream::unfold((client, f), move |mut output| {
         let rec = rec.clone();
         async move {
             let item = output.1.next().await?;
             let b = match item {
                 Ok(b) => b,
-                Err(end) => end.tail,
+                Err(end) => match end.tail {
+                    Some(b) => b,
+                    None => return Some((Err(std::io::Error::other(end.reason.code)), output)),
+                },
             };
-            output.2 += b.len() as u64;
-            rec.response_bytes(output.2);
+            rec.response_bytes(b.len() as u64);
             Some((Ok::<_, std::io::Error>(b), output))
         }
     });
@@ -494,5 +516,20 @@ mod tests {
             b"\xff"
         );
         assert_eq!(carry, b"\xe2");
+    }
+    /// zlib 的前两字节分属不同网络块仍应识别包装，而不是把第一个单字节当成裸 deflate。
+    #[tokio::test]
+    async fn split_zlib_header_is_decoded_before_stream_data() {
+        use std::io::Write as _;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(b"decoded").unwrap();
+        let data = Bytes::from(z.finish().unwrap());
+        let input = futures_util::stream::iter([Ok(data.slice(..1)), Ok(data.slice(1..))]).boxed();
+        let mut f = decode(input, "deflate".into(), 1024);
+        let mut out = Vec::new();
+        while let Some(b) = f.next().await {
+            out.extend_from_slice(&b.ok().expect("valid zlib"));
+        }
+        assert_eq!(out, b"decoded");
     }
 }

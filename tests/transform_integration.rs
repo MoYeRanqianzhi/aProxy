@@ -4,7 +4,7 @@
 //! mock 上游为 axum Router。核心断言面：spawn/persistent 两模式 × 请求/响应
 //! 两方向、url 改写、多 key 轮换（persistent 连续 / spawn 重置）、失败语义
 //! （请求侧失败不重试：format 拒绝回 422、format 本身故障回 502 / 响应透传原样）、超时、b64 保真、大 body 磁盘路径、
-//! forward_only 互斥拦截、保活通道透传、进程池加固（format 多写 stdout 时
+//! forward 与格式程序同配、保活通道透传、进程池加固（format 多写 stdout 时
 //! 不串包 / 复用到死 worker 时换新重试）。
 
 mod common;
@@ -1309,42 +1309,26 @@ async fn request_persistent_reused_worker_dying_on_write_is_retried_once() {
 }
 
 // ---------------------------------------------------------------------------
-// 互斥拦截
+// forward 与格式程序同配
 // ---------------------------------------------------------------------------
 
+/// 临时实例完成请求程序的启动握手；不需要真实上游或默认监听地址。
 #[test]
-fn forward_only_with_transform_start_fails() {
+fn forward_and_format_start_together() {
     isolate_env_proxy();
     let home = TestHome::new();
-    let cfg_path = home.path().join("mutual.toml");
-    let raw = format!(
-        concat!(
-            "base_url = \"https://api.example.com\"\n",
-            "delivery = \"forward\"\n",
-            "[[format]]\n",
-            "command = \"{}\"\n",
-            "stages = [\"request\"]\n",
-            "args = [\"echo\"]\n",
-        ),
-        format_echo_path()
-            .display()
-            .to_string()
-            .replace('\\', "\\\\")
-    );
-    std::fs::write(&cfg_path, raw).unwrap();
-
-    // 无子命令 = start：validate 在预检之前，报互斥错误退出且不产生任何进程
+    let port = common::free_port();
+    home.stop_on_drop(port);
+    let cfg_path = home.path().join("forward.toml");
+    std::fs::write(&cfg_path,format!("base_url='http://127.0.0.1:{}'\nlisten_addr='127.0.0.1:{port}'\ndelivery='forward'\n[[format]]\ncommand={}\nstages=['request']\nargs=['echo']\n",common::free_port(),serde_json::to_string(&format_echo_path()).unwrap())).unwrap();
     let out = home
         .cmd()
-        .arg("start")
-        .arg("--config")
-        .arg(&cfg_path)
+        .args(["start", "--json", "--config"])
+        .arg(cfg_path)
         .output()
         .unwrap();
-    assert!(!out.status.success(), "互斥配置应启动失败");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("config_conflict") && stderr.contains("delivery"),
-        "错误应指出冲突的键: {stderr}"
-    );
+    assert!(out.status.success(), "{out:?}");
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["instance"]["state"], "serving");
+    assert_eq!(doc["instance"]["formats"][0]["protocol"], 1);
 }

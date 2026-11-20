@@ -564,15 +564,6 @@ impl Config {
                 );
             }
         }
-        // forward 不缓冲请求体，转换器需要全量 body：两者同开是配置矛盾
-        if self.forward_only_enabled() && !self.formats.is_empty() {
-            push(
-                "config_conflict",
-                "delivery",
-                None,
-                "delivery = \"forward\" cannot be combined with a format: forward does not buffer the request body, and a format needs all of it".to_string(),
-            );
-        }
         out
     }
 

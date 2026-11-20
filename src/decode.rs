@@ -164,7 +164,13 @@ pub fn decode_strict<'a, R: Read + 'a, W: std::io::Write>(
             // zlib 包装与裸 deflate 只能看头两字节区分（不能像 for_inspection 那样
             // 「失败再换一种」重试——输入是流，读过就回不去了）
             "deflate" => {
-                let zlib = looks_like_zlib(reader.fill_buf().map_err(|e| e.to_string())?);
+                // 流式输入的第一次 read 可能只有一个字节，不能据此把合法 zlib 错判成裸 deflate。
+                let mut prefix = [0; 2];
+                reader.read_exact(&mut prefix).map_err(|e| e.to_string())?;
+                let zlib = looks_like_zlib(&prefix);
+                let reader = Box::new(std::io::BufReader::new(
+                    std::io::Cursor::new(prefix).chain(reader),
+                ));
                 Box::new(StrictInflate {
                     inner: reader,
                     state: flate2::Decompress::new(zlib),

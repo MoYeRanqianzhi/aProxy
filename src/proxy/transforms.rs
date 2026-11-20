@@ -83,7 +83,7 @@ pub(super) struct RequestChain {
     pub(super) max_attempts: Option<u32>,
 }
 /// 主动结束时交付程序的响应以及通过容量校验的 HTTP 头。
-type ProgramResponse = (wire::Response, HeaderMap);
+pub(super) type ProgramResponse = (wire::Response, HeaderMap);
 
 /// 程序可以否决请求、使本次尝试失败，或无法读取本地 spool；上游尚未收到请求。
 pub(super) enum ChainError {
@@ -251,7 +251,11 @@ impl RequestChain {
                     input.body = wire::Body::from_bytes(bytes);
                     let m = wire::RequestMessage::new(
                         ctx.context(name),
-                        wire::Delivery::Retry,
+                        if state.config.forward_only_enabled() {
+                            wire::Delivery::Forward
+                        } else {
+                            wire::Delivery::Retry
+                        },
                         input,
                         ctx.client.clone(),
                     );

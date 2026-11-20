@@ -363,7 +363,7 @@ impl Responder {
 
 /// 把要发往上游的请求行与头交给请求历史，返回入库的那一份（发出的请求不变时，各次尝试
 /// 共用它）。只留真正发出去的头：逐跳头在发送时会被剥掉。
-fn sent_head(rec: &Recorder, req: &OutboundRequest) -> Option<Arc<SentHead>> {
+pub(super) fn sent_head(rec: &Recorder, req: &OutboundRequest) -> Option<Arc<SentHead>> {
     rec.sent_head(
         req.method.as_str(),
         &req.target_url,
@@ -376,7 +376,7 @@ fn sent_head(rec: &Recorder, req: &OutboundRequest) -> Option<Arc<SentHead>> {
 
 /// 在请求历史里记下第 `attempt` 次尝试开始。`same_body` 为假（这次发出的体与上一次不同）
 /// 时把体也交过去：内存里的整块交，不拷贝；落盘的在阻塞线程池里读。
-fn record_try(
+pub(super) fn record_try(
     rec: &Recorder,
     attempt: u32,
     sent: Option<&Arc<SentHead>>,
@@ -409,6 +409,53 @@ fn record_try(
                 }
             });
         }
+    }
+}
+
+/// 请求方向的终态不依赖交付方式；保活已提交时发事件，否则保留程序的状态、头和正文。
+pub(super) async fn finish_chain_stop(
+    state: &AppState,
+    r: &mut Responder,
+    trace: &RequestTrace,
+    req: &OutboundRequest,
+    attempt: u32,
+    client_head: bool,
+    stop: (Terminal, Option<ProgramResponse>),
+) {
+    let (t, custom) = stop;
+    let rec = &trace.rec;
+    t.record_in(&state.stats);
+    record_try(rec, attempt, None, true, req);
+    rec.try_ended(attempt, 0, Some(t.for_history()));
+    if let Some((response, mut headers)) = custom {
+        rec.settle(crate::history::Outcome::FormatResponse, Some(t.code()));
+        let bytes = response.body.as_bytes().unwrap_or_default();
+        if r.is_committed() {
+            let data = if terminal_is_sse(&headers) {
+                Bytes::copy_from_slice(bytes)
+            } else if let Some(event) = terminal_json_event(bytes) {
+                event
+            } else {
+                r.finish(t, trace).await;
+                return;
+            };
+            let size = data.len() as u64;
+            if r.send(Ok(data)).await {
+                rec.response_bytes(size);
+            }
+        } else if let Ok(status) = StatusCode::from_u16(response.status) {
+            mark_given_up(&mut headers, t.code(), trace);
+            if delivers_body(client_head, status) {
+                rec.response_bytes(bytes.len() as u64);
+            }
+            r.respond(build_response(
+                status,
+                headers,
+                Bytes::copy_from_slice(bytes),
+            ));
+        }
+    } else {
+        r.finish(t, trace).await;
     }
 }
 
@@ -502,40 +549,7 @@ pub(super) async fn run_attempts(
                 }
                 Err(ChainError::Retry(f)) => failed = Some(f),
                 Err(ChainError::Stop(stop)) => {
-                    let (t, custom) = *stop;
-                    t.record_in(&state.stats);
-                    record_try(&rec, attempt, None, true, &req);
-                    rec.try_ended(attempt, 0, Some(t.for_history()));
-                    if let Some((response, mut headers)) = custom {
-                        rec.settle(crate::history::Outcome::FormatResponse, Some(t.code()));
-                        let bytes = response.body.as_bytes().unwrap_or_default();
-                        if r.is_committed() {
-                            let data = if terminal_is_sse(&headers) {
-                                Bytes::copy_from_slice(bytes)
-                            } else if let Some(event) = terminal_json_event(bytes) {
-                                event
-                            } else {
-                                r.finish(t, &trace).await;
-                                return;
-                            };
-                            let size = data.len() as u64;
-                            if r.send(Ok(data)).await {
-                                rec.response_bytes(size);
-                            }
-                        } else if let Ok(status) = StatusCode::from_u16(response.status) {
-                            mark_given_up(&mut headers, t.code(), &trace);
-                            if delivers_body(client_head, status) {
-                                rec.response_bytes(bytes.len() as u64);
-                            }
-                            r.respond(build_response(
-                                status,
-                                headers,
-                                Bytes::copy_from_slice(bytes),
-                            ));
-                        }
-                    } else {
-                        r.finish(t, &trace).await;
-                    }
+                    finish_chain_stop(state, r, &trace, &req, attempt, client_head, *stop).await;
                     return;
                 }
             }

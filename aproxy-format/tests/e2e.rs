@@ -203,8 +203,20 @@ fn route_alias_paths_and_reverse_alias_survive_worker_boundaries() {
     assert_eq!(b["model"], "up-small");
     drop(w);
     let mut w = Worker::new(&args);
-    let r = w.frame(response(&r["state"], r#"{"model":"up-small"}"#));
-    assert_eq!(r["response"]["body"], r#"{"model":"other"}"#);
+    let state = r["state"].clone();
+    let mut input = response(&state, r#"{ "model" : "up-small" }"#);
+    for media in ["text/plain", "text/event-stream", "application/jsonish", ""] {
+        input["response"]["headers"]["content-type"] = media.into();
+        assert!(w.frame(input.clone()).get("response").is_none(), "{media}");
+    }
+    for media in [
+        "Application/JSON; charset=utf-8",
+        "application/vnd.example+json",
+    ] {
+        input["response"]["headers"]["content-type"] = media.into();
+        let r = w.frame(input.clone());
+        assert_eq!(r["response"]["body"], r#"{"model":"other"}"#);
+    }
 }
 /// 配置错误不会把 TOML 原行里的值或环境秘密复制到 stderr；旧 run 命令不再可用。
 #[test]

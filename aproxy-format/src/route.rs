@@ -75,6 +75,22 @@ impl Route {
         let Some(mapped) = self.aliases.get(&alias) else {
             return Ok(());
         };
+        let json = m
+            .response
+            .headers
+            .get("content-type")
+            .and_then(|v| v.split(';').next())
+            .and_then(|v| v.trim().split_once('/'))
+            .is_some_and(|(family, subtype)| {
+                family.eq_ignore_ascii_case("application")
+                    && (subtype.eq_ignore_ascii_case("json")
+                        || subtype.rsplit_once('+').is_some_and(|(name, suffix)| {
+                            !name.is_empty() && suffix.eq_ignore_ascii_case("json")
+                        }))
+            });
+        if !json {
+            return Ok(());
+        }
         let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(
             m.response.body.as_bytes().unwrap_or_default(),
         ) else {

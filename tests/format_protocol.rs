@@ -6010,3 +6010,80 @@ async fn official_convert_delivers_live_text_then_protocol_abort() {
             && !body.contains("message_stop")
     );
 }
+
+/// 完成通知按实体的真实媒体类型与全部编码字段判定，不把参数中的 SSE 字样当作流。
+#[tokio::test]
+async fn forward_completion_observes_media_type_and_all_codings() {
+    use std::io::Write as _;
+    for compressed in [true, false] {
+        let home = TestHome::new();
+        let port = free_port();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let mut bytes = if compressed {
+            br#"{"error":"busy"}"#.to_vec()
+        } else {
+            br#"{"ok":true}"#.to_vec()
+        };
+        if compressed {
+            for _ in 0..2 {
+                let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                gz.write_all(&bytes).unwrap();
+                bytes = gz.finish().unwrap();
+            }
+        }
+        let payload = bytes.clone();
+        let app = axum::Router::new().fallback(move || {
+            let raw = payload.clone();
+            async move {
+                let mut head = axum::response::Response::builder();
+                if compressed {
+                    head = head
+                        .header("content-type", "application/json")
+                        .header("content-encoding", "gzip")
+                        .header("content-encoding", "gzip");
+                } else {
+                    head = head.header(
+                        "content-type",
+                        r#"application/json; profile="text/event-stream""#,
+                    );
+                }
+                head.body(axum::body::Body::from(raw)).unwrap()
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (client, url) = running(
+            &home,
+            port,
+            &(String::from("delivery='forward'\n")
+                + &layer(&home, "observer", "'notify'", &["echo"])),
+        );
+        let response = client.get(url).send().await.unwrap();
+        assert_eq!(response.bytes().await.unwrap().as_ref(), bytes.as_slice());
+        let end = &observed_stage(&home, "observer", "notify", 1).await[0];
+        assert_eq!(end.get("stream_completed"), Some(&Value::Null));
+        if compressed {
+            assert_eq!(end["code"], "upstream_failed");
+        } else {
+            assert_eq!(end["outcome"], "ok");
+        }
+    }
+}
+/// 只有真正重试才登记 reroute；转发失败且只投重跑路由票时仍停在第一次上游响应。
+#[tokio::test]
+async fn stopped_forward_attempt_has_no_reroute_in_history() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[503]).await;
+    let cfg = String::from("delivery='forward'\n")
+        + &layer(&home, "vote", "'decide'", &["reply", r#"{"reroute":true}"#]);
+    let (c, url) = running(&home, up, &cfg);
+    let r = c.get(&url).send().await.unwrap();
+    assert_eq!(r.status(), 503);
+    assert_eq!(r.text().await.unwrap(), "upstream bytes");
+    let msg = &observed_stage(&home, "vote", "decide", 1).await[0];
+    let record = request_detail(&home, &url, msg["request_id"].as_str().unwrap()).await;
+    let d = &record["record"]["tries"][0]["decision"];
+    assert_eq!(d["decision"], "stop");
+    assert!(d.get("reroute").is_none(), "{d}");
+}

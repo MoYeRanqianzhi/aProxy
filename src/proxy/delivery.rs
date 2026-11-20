@@ -83,7 +83,16 @@ impl Delivery {
         self.end.streamed = self.end.notify.is_some()
             && delivers_body(bodiless, status)
             && (response.extensions().get::<ConvertedStream>().is_some()
-                || retry::is_streaming_content_type(response.headers()));
+                || response
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.split(';').next())
+                    .is_some_and(|t| {
+                        ["text/event-stream", "application/x-ndjson"]
+                            .iter()
+                            .any(|v| t.trim().eq_ignore_ascii_case(v))
+                    }));
         // 未缓冲的 forward 体没有自己的精确 size_hint；HTTP 定长帧写满时，连接层不会再来取 EOF。
         let remaining = response
             .headers()

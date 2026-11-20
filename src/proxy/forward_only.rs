@@ -128,8 +128,9 @@ impl PassiveCheck {
     fn finish(self, headers: &HeaderMap) -> bool {
         match self {
             Self::Resident(raw) => {
+                let encoding = request_encoding(headers, true);
                 let decoded = crate::decode::for_inspection(
-                    header_opt(headers, http::header::CONTENT_ENCODING),
+                    encoding.as_deref().and_then(|v| v.to_str().ok()),
                     &raw,
                 );
                 let body = decoded.as_deref().unwrap_or(&raw);
@@ -471,8 +472,8 @@ pub(super) async fn forward_response(
         }
     }
 
-    // 响应流：直回客户端。成功块只累加已转发字节数（供中断日志定位断点），不
-    // 复制、不缓存、不检查内容。客户端断开时本 Body 被 drop，reqwest 连接随之
+    // 响应原块直回客户端；旁路最多保留驻留上限的原始字节，越过上限只扫描行，
+    // 判定只进历史与通知，不改变交付的内容。客户端断开时本 Body 被 drop，reqwest 连接随之
     // 关闭、上游生成立即停止——既有的计费保护靠 Drop 天然成立，无需额外代码。
     //
     // 每转发一个 chunk 顺带刷新 last_activity_secs：本模式下小时级长流是常态

@@ -2005,7 +2005,7 @@ impl Recorder {
                     decision: if retry { "retry" } else { "stop" },
                     delay_ms: None,
                     backoff_started: None,
-                    reroute,
+                    reroute: if retry { reroute } else { None },
                 });
             }
         });

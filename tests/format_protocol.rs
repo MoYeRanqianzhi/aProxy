@@ -7110,7 +7110,7 @@ fn format_trial(home: &TestHome, config: &str, sample: Value) -> std::process::O
     let input = home.path().join("sample.json");
     std::fs::write(&proxy, format!("base_url='https://relay.test'\n{config}")).unwrap();
     std::fs::write(&input, sample.to_string()).unwrap();
-    std::process::Command::new(official_binary())
+    home.cmd_with(official_binary())
         .arg("try")
         .arg(proxy)
         .arg("--request")

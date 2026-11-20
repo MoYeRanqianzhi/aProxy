@@ -56,8 +56,24 @@ fn bytes(value: &Value) -> Vec<u8> {
         .as_str()
         .map_or_else(|| value.to_string().into_bytes(), |s| s.as_bytes().to_vec())
 }
+/// 只计数不留存，进程内角色不能因省略真实管道而越过实例的行长限制。
+struct LineBudget(usize);
+impl Write for LineBudget {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_sub(bytes.len())
+            .ok_or(std::io::ErrorKind::FileTooLarge)?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 /// 一个处理位置的协商能力、序号与私有状态。程序之间不共享任何这些字段。
 struct Unit {
+    /// 握手公布的实例上限，同时约束管道和进程内回信，按实际阶段选择预算。
+    limits: w::ReplyLimits,
     /// 在链中的角色与配置。
     layer: Layer,
     /// 外部显式授权后使用的进程管道。
@@ -115,6 +131,7 @@ impl Unit {
             stages,
             0,
         );
+        offer.limits = Some(self.limits.clone());
         offer.features = vec!["decide.success".into()];
         offer.overrides = [
             "timeouts.connect_secs",
@@ -210,20 +227,31 @@ impl Unit {
         msg["v"] = 1.into();
         msg["seq"] = self.seq.into();
         msg["stage"] = stage.into();
+        let limit = match stage {
+            "request" | "retry" => self.limits.request,
+            "response" | "stream" => self.limits.response,
+            _ => self.limits.control,
+        }
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(usize::MAX);
         let reply = if let Some(role) = &mut self.layer.role {
             let m = serde_json::from_value(msg).map_err(|_| "样例不能构成该阶段的消息")?;
-            role.handle(&m)
+            let reply = role.handle(&m);
+            // 不再分配一份序列化回信；逐段扣除 JSON 字节，最后一字节留给换行。
+            let mut budget = LineBudget(limit.saturating_sub(1));
+            serde_json::to_writer(&mut budget, &reply).map_err(|_| "试跑回信超过实例上限")?;
+            reply
         } else {
             let timeout = match stage {
                 "notify" => 2,
                 "decide" => self.layer.entry.decide_timeout_secs,
                 _ => self.layer.entry.timeout_secs,
             };
-            let value = self.peer.as_ref().ok_or("外部程序未连接")?.frame(
-                &msg,
-                8 * 1024 * 1024,
-                timeout,
-            )?;
+            let value = self
+                .peer
+                .as_ref()
+                .ok_or("外部程序未连接")?
+                .frame(&msg, limit, timeout)?;
             serde_json::from_value(value).map_err(|_| "外部程序回信无效")?
         };
         if reply.v != 1 || reply.seq != self.seq {
@@ -843,6 +871,18 @@ fn rehearse(
         voted: false,
     };
     req.body = w::Body::from_bytes(raw);
+    let group = |mb: u64| {
+        let bytes = mb
+            .saturating_mul(2 * 1024 * 1024)
+            .saturating_add(1024 * 1024);
+        (mb != 0 && bytes < usize::MAX as u64).then_some(bytes)
+    };
+    let limits = w::ReplyLimits::new(
+        Some(64 * 1024),
+        group(max_request),
+        group(chain.config.max_response_mb.unwrap_or(256)),
+        Some(1024 * 1024),
+    );
     for layer in chain.layers {
         if external
             && layer.label == "external"
@@ -852,6 +892,7 @@ fn rehearse(
             return Err("运行外部相对命令需要 --home；未启动程序".into());
         }
         let mut u = Unit {
+            limits: limits.clone(),
             layer,
             peer: None,
             hello: None,
@@ -1168,6 +1209,18 @@ mod tests {
         assert_eq!(rows[0]["role"], "keys");
         assert_eq!(rows[0]["changed"], json!(["skipped"]));
     }
+    /// 输入很小也可能展开成超长请求补丁，进程内处理不得绕开真实管道的行长预算。
+    #[test]
+    fn in_process_request_reply_obeys_negotiated_group_limit() {
+        let rules = format!("[set]\n'/x'='{}'", "x".repeat(3 * 1024 * 1024));
+        let (result, rows) = trace_sample(
+            "max_request_mb=1\n[[format]]\ncommand='aproxy-format'\nargs=['rewrite','--config','rules']\nstages=['request']",
+            json!({"path":"/","body":{}}),
+            &[("rules", &rules)],
+        );
+        assert!(matches!(result, Err(CliError::Unsimulated(_))));
+        assert!(!rows.iter().any(|r| r["stage"] == "sample"));
+    }
     /// 规则按声明先后生效，不对没有上游头的故障套状态规则；覆盖、直通与成功分别说明来源。
     #[test]
     fn dry_fallback_preserves_sources_and_backoff() {
@@ -1177,6 +1230,7 @@ mod tests {
         );
         assert!(diags.is_empty());
         let mut unit = Unit {
+            limits: w::ReplyLimits::default(),
             layer: Layer {
                 entry: f::parse(
                     "[[format]]\ncommand='example'\nstages=['request']",

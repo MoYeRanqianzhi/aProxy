@@ -881,23 +881,42 @@ fn concurrent_start_with_release_asset_name_converges_to_one_watchdog() {
         wait_for(Duration::from_secs(10), || claim_holder().is_some()),
         "应有在任看护者"
     );
-    std::thread::sleep(Duration::from_secs(3));
-    let holder = claim_holder().expect("在任看护者应持续在任").pid;
-    let alive: Vec<u32> = spawned
-        .iter()
-        .copied()
-        .filter(|pid| aproxy::process::process_exited(*pid) == Some(false))
-        .collect();
-    assert_eq!(
-        alive,
-        vec![holder],
-        "被拉起的看护者 {spawned:?} 中应恰好剩下看护者记录的属主"
+    let holder = claim_holder().expect("在任看护者应持续在任");
+    let asset = std::fs::canonicalize(&bin).unwrap();
+    // 只观察这批拉起的进程。PID 若已复用于别的测试的程序，不是本次选举的落败者；
+    // 镜像暂时不可读则保守地继续等，不能单凭读失败认定进程已退出。
+    let contenders = || {
+        spawned
+            .iter()
+            .copied()
+            .filter(|pid| {
+                aproxy::process::process_exited(*pid) != Some(true)
+                    && aproxy::process::process_image_path(*pid)
+                        .and_then(|path| std::fs::canonicalize(path).ok())
+                        .is_none_or(|path| path == asset)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        wait_for(Duration::from_secs(15), || contenders() == [holder.pid]),
+        "看护者选举未收敛：spawned={spawned:?}, live={:?}, holder={holder:?}",
+        contenders()
     );
-    std::thread::sleep(Duration::from_secs(2));
-    assert_eq!(
-        claim_holder().map(|c| c.pid),
-        Some(holder),
-        "看护者记录不得在看护者之间翻转"
+    let after = claim_holder().expect("选举收敛后在任记录应存在");
+    assert!(after.same_owner(&holder));
+    // 收敛后同一属主确实又完成了一次扫描，才验证收养和重拉；固定等待并不能证明运行过扫描。
+    assert!(
+        wait_for(Duration::from_secs(15), || claim_holder().is_some_and(
+            |now| {
+                assert!(
+                    now.same_owner(&holder),
+                    "看护者记录不得在看护者之间翻转：{now:?}"
+                );
+                now.last_scan_at > after.last_scan_at
+            }
+        )),
+        "收敛后未观察到同一看护者的下一次扫描：{:?}",
+        claim_holder()
     );
 
     // 唯一的看护者收养了资产名运行的实例：杀掉一个，应被重拉

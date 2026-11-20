@@ -1127,6 +1127,7 @@ async fn unavailable_outgoing_spool_records_its_attempt_cause() {
     run_attempts(
         &state,
         req,
+        None,
         "/",
         1024,
         &mut Responder::buffered(),

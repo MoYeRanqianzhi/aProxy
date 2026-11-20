@@ -74,7 +74,7 @@ async fn handle(
     req: Request,
     method: http::Method,
     uri: http::Uri,
-    trace: RequestTrace,
+    mut trace: RequestTrace,
 ) -> Response {
     // WebSocket 升级：代理按请求—响应转发，承载不了升级后的双向流。Upgrade 是逐跳头，转发时
     // 会被剥掉，上游看到的是一个普通请求，多半回 4xx，然后被无限重试——不如当场说清楚。
@@ -125,7 +125,7 @@ async fn handle(
     });
     // request 只看头时先让它改路由，客户端正文还在连接上。decide 可能要求重发，所以即便
     // 它自己不要正文也必须先留体。若替换进程的 hello 改为要正文，则派发前再读。
-    let live = forward
+    let live = (forward || state.has_format(Stage::Request))
         && !state.has_format(Stage::Decide)
         && !state.formats.iter().any(|p| {
             p.entry.has_stage(Stage::Request)
@@ -141,16 +141,19 @@ async fn handle(
     };
     if live && !state.has_format(Stage::Request) {
         tracing::info!(method = %method, target = %state.history.redacted_url(&target_url), "代理请求（仅转发）");
+        trace.attempts = 1;
         return forward_only_proxy(
             state,
             &method,
             &target_url,
             &headers,
-            ForwardBody::Live(upload),
+            upload,
             ctx,
-            trace,
+            &trace,
+            1,
         )
-        .await;
+        .await
+        .unwrap_or_else(|t| t.into_response(&trace));
     }
     let mut req = OutboundRequest {
         method,
@@ -163,17 +166,16 @@ async fn handle(
         body_stream: None,
         ctx,
     };
-    if live {
-        return forward_after_chain(state, req, Some(upload), trace).await;
-    }
-    let wants_stream = match upload.buffer(&state, &mut req, &trace.rec).await {
-        Ok(stream) => stream,
-        Err(t) => return t.into_response(&trace),
+    let (pending, wants_stream) = if live {
+        (Some(upload), head_stream.unwrap_or(false))
+    } else {
+        match upload.buffer(&state, &mut req, &trace.rec).await {
+            Ok(stream) => (None, stream),
+            Err(t) => return t.into_response(&trace),
+        }
     };
-    if forward {
-        return forward_after_chain(state, req, None, trace).await;
-    }
-    let keepalive_applies = state.config.keepalive_enabled()
+    let keepalive_applies = !forward
+        && state.config.keepalive_enabled()
         && !state.config.keepalive_interval().is_zero()
         && wants_stream;
     if keepalive_applies {
@@ -204,6 +206,7 @@ async fn handle(
                 run_attempts(
                     &state,
                     req,
+                    pending,
                     &path_and_query,
                     max_spool_bytes,
                     &mut r,
@@ -229,6 +232,7 @@ async fn handle(
     run_attempts(
         &state,
         req,
+        pending,
         path_and_query,
         max_spool_bytes,
         &mut r,

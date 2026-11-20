@@ -430,6 +430,7 @@ mod tests {
                 requests_total: 3,
                 retries_total: 1,
                 rescued_total: 1,
+                upgraded_total: 0,
                 in_flight: 0,
                 retrying: 0,
                 by_code: Default::default(),

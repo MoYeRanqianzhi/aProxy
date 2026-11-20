@@ -4463,3 +4463,267 @@ async fn committed_replay_after_skipped_open_validates_all_codings_before_output
         }
     }
 }
+
+/// 两种默认值都由第一个合法表态改变；另一层既看见已选方式，也不能把它改回去。
+#[tokio::test]
+async fn first_delivery_vote_wins() {
+    for (default, first, expected_status, calls_expected) in
+        [("retry", "forward", 503, 1), ("forward", "retry", 200, 2)]
+    {
+        let home = TestHome::new();
+        let (up, calls) = upstream(&[503, 200]).await;
+        let cfg = format!("delivery='{default}'\n")
+            + &layer(
+                &home,
+                "first",
+                "'request'",
+                &["reply", &format!(r#"{{"delivery":"{first}"}}"#)],
+            )
+            + &layer(
+                &home,
+                "second",
+                "'request'",
+                &["reply", &format!(r#"{{"delivery":"{default}"}}"#)],
+            );
+        let (client, url) = running(&home, up, &cfg);
+        let res = client.get(&url).send().await.unwrap();
+        assert_eq!(frames(&home, "first")[1]["delivery"], default);
+        assert_eq!(frames(&home, "second")[1]["delivery"], first);
+        assert_eq!(res.status(), expected_status);
+        assert_eq!(res.text().await.unwrap(), "upstream bytes");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            calls_expected
+        );
+        let id = frames(&home, "first")[1]["request_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let record = request_detail(&home, &url, &id).await;
+        assert_eq!(record["record"]["delivery"], first);
+        assert_eq!(record["record"]["upgraded"], false);
+    }
+}
+
+/// 503 还没有向客户端写过头；决定重试才计一次升级，下一次成功保留上游实体。
+#[tokio::test]
+async fn forward_503_upgrades_through_decide_and_the_client_sees_only_the_retried_success() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[503, 200]).await;
+    let cfg = String::from("delivery='forward'\n")
+        + &layer(
+            &home,
+            "policy",
+            "'decide'",
+            &["reply", r#"{"decision":"retry","delay_ms":0}"#],
+        );
+    let (c, url) = running(&home, up, &cfg);
+    let resp = c.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(!resp.headers().contains_key("x-aproxy-error"));
+    assert_eq!(resp.text().await.unwrap(), "upstream bytes");
+    let frames = frames(&home, "policy");
+    assert_eq!(frames.len(), 2);
+    let m = &frames[1];
+    assert_eq!(m["delivery"], "forward");
+    assert_eq!(m["fallback"]["decision"], "stop");
+    assert_eq!(m["response"]["status"], 503);
+    assert_eq!(m["attempt"], 1);
+    let d = request_detail(&home, &url, m["request_id"].as_str().unwrap()).await;
+    let rec = &d["record"];
+    assert_eq!(rec["delivery"], "retry");
+    assert_eq!(rec["upgraded"], true);
+    assert_eq!(rec["tries"].as_array().unwrap().len(), 2);
+    assert_eq!(rec["tries"][0]["decision"]["by"], "format:policy");
+    let ping =
+        aproxy::daemon::ipc_ping_in(&home.path().join("run"), url.rsplit(':').next().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(ping.activity.upgraded_total, 1);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+}
+
+/// 上游在交付前缀后才报错，客户端已经收到的字节不能撤回；不发 decide，不重试。
+#[tokio::test]
+async fn forward_stream_cut_mid_way_does_not_upgrade() {
+    use futures_util::StreamExt as _;
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let gate = release.clone();
+    let app = axum::Router::new().fallback(move || {
+        let gate = gate.clone();
+        async move {
+            axum::body::Body::from_stream(
+                futures_util::stream::once(async { Ok::<_, std::io::Error>("prefix") }).chain(
+                    futures_util::stream::once(async move {
+                        gate.notified().await;
+                        Err(std::io::Error::other("interrupted"))
+                    }),
+                ),
+            )
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = String::from("delivery='forward'\n")
+        + &layer(
+            &home,
+            "policy",
+            "'request','decide'",
+            &["reply", r#"{"decision":"retry"}"#],
+        );
+    let (c, url) = running(&home, up, &cfg);
+    let mut resp = c.get(&url).send().await.unwrap();
+    let mut bytes = Vec::new();
+    while bytes.len() < 6 {
+        bytes.extend_from_slice(&resp.chunk().await.unwrap().unwrap());
+    }
+    assert_eq!(bytes, b"prefix");
+    release.notify_one();
+    assert!(resp.chunk().await.is_err());
+    let messages = frames(&home, "policy");
+    assert_eq!(messages.len(), 2);
+    let rec = request_detail(&home, &url, messages[1]["request_id"].as_str().unwrap()).await;
+    assert_eq!(rec["record"]["code"], "upstream_failed");
+    assert_eq!(rec["record"]["upgraded"], false);
+}
+
+/// 压缩和大体都只旁路检查；历史预算为零也应知道伪成功，客户端则逐字节收到原表示。
+#[tokio::test]
+async fn forward_200_error_body_is_recorded_as_upstream_error() {
+    use std::io::Write as _;
+    let plain = br#"{"error":"busy"}"#;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(plain).unwrap();
+    let mut large = b"data: 0\n".repeat(128 * 1024);
+    large.extend_from_slice(b"data: {\"error\":\"last\"}\n\n");
+    for (encoding, bytes) in [
+        ("identity", plain.to_vec()),
+        ("gzip", gz.finish().unwrap()),
+        ("identity", large),
+    ] {
+        let home = TestHome::new();
+        let up = free_port();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+            .await
+            .unwrap();
+        let raw = bytes::Bytes::from(bytes);
+        let copy = raw.clone();
+        let app = axum::Router::new().fallback(move || {
+            let b = copy.clone();
+            async move { ([("content-encoding", encoding)], b) }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cfg = String::from("delivery='forward'\nhistory.body_budget_mb=0\n")
+            + &layer(
+                &home,
+                "watch",
+                "'decide'",
+                &["reply", r#"{"decision":"retry"}"#],
+            );
+        let (c, url) = running(&home, up, &cfg);
+        let resp = c.get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.bytes().await.unwrap(), raw);
+        let out = aproxy::daemon::ipc_read_in(
+            &home.path().join("run"),
+            url.rsplit(':').next().unwrap(),
+            &aproxy::daemon::ReadOp::Requests {
+                before: None,
+                limit: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        let rec = &out["requests"][0];
+        assert_eq!(rec["outcome"], "upstream_error", "{out}");
+        assert_eq!(rec["code"], "upstream_failed");
+        assert_eq!(rec["tries"][0]["code"], "upstream_error_body");
+        assert_eq!(frames(&home, "watch").len(), 1);
+    }
+}
+
+/// 客户端已经读到心跳才给出第一票时不能收回 200；反之必须把重定向头原样交付。
+/// 用客户端是否订阅事件和手动开门分别确定先后，不要求子进程抢在某个真实节拍之前运行完。
+#[tokio::test]
+async fn forward_vote_on_either_side_of_commitment() {
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let app = axum::Router::new().fallback(|body: String| async move {
+        assert_eq!(body, "blocked");
+        (
+            axum::http::StatusCode::TEMPORARY_REDIRECT,
+            [("location", "/redirected")],
+            "redirect body",
+        )
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let gate = home.path().join("release-vote");
+    let cfg = String::from("delivery='retry'\n[keepalive]\ntrigger='accept'\ninterval_secs=1\n")
+        + &layer(
+            &home,
+            "wait",
+            "'request'",
+            &["gate-request", gate.to_str().unwrap()],
+        )
+        + &layer(
+            &home,
+            "voter",
+            "'request'",
+            &["reply", r#"{"delivery":"forward"}"#],
+        )
+        + &layer(&home, "observer", "'request'", &["reply", "{}"]);
+    let (_, url) = running(&home, up, &cfg);
+    let c = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .unwrap();
+    let mut response = c
+        .post(&url)
+        .header("accept", "text/event-stream")
+        .body("blocked")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.headers().get("location").is_none());
+    let beat = response.chunk().await.unwrap().unwrap();
+    assert!(beat.starts_with(b":"), "{beat:?}");
+    assert_eq!(
+        frames(&home, "voter").len(),
+        1,
+        "vote preceded the observed heartbeat"
+    );
+    std::fs::write(&gate, []).unwrap();
+    assert!(response.text().await.unwrap().ends_with("redirect body"));
+    let observer = frames(&home, "observer");
+    assert_eq!(observer[1]["delivery"], "retry");
+    let record = request_detail(&home, &url, observer[1]["request_id"].as_str().unwrap()).await;
+    assert_eq!(record["record"]["delivery"], "retry");
+    assert_eq!(record["record"]["tries"][0]["upstream_status"], 307);
+    assert_eq!(record["record"]["upgraded"], false);
+
+    let response = c
+        .post(&url)
+        .header("accept", "application/json")
+        .body("blocked")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 307);
+    assert_eq!(response.headers()["location"], "/redirected");
+    assert_eq!(response.text().await.unwrap(), "redirect body");
+    let observer = frames(&home, "observer");
+    assert_eq!(observer[2]["delivery"], "forward");
+    let record = request_detail(&home, &url, observer[2]["request_id"].as_str().unwrap()).await;
+    assert_eq!(record["record"]["delivery"], "forward");
+    assert_eq!(record["record"]["heartbeats"], 0);
+}

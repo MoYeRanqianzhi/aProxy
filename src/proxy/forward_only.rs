@@ -93,17 +93,82 @@ impl Drop for RequestTap {
     }
 }
 
+/// 小实体可解码后整体检查；越过驻留界限时只向单行扫描器移交前缀，不落盘也不保留整串。
+enum PassiveCheck {
+    /// 原始表示，不同于程序改写后交给客户端的字节。
+    Resident(Vec<u8>),
+    /// 与 retry 磁盘路径的原始 SSE / NDJSON 行判定一致，不解码超大下载。
+    Lines(StreamErrorScanner),
+}
+impl PassiveCheck {
+    /// 只有跨过界限时才付逐行扫描的成本；分小段喂前缀，不把一大块误当成一条过长的行。
+    fn feed(&mut self, bytes: &[u8]) {
+        if let Self::Resident(prefix) = self {
+            if bytes.len() <= RESIDENT_LIMIT - prefix.len() {
+                prefix.extend_from_slice(bytes);
+                return;
+            }
+            let mut lines = StreamErrorScanner::new();
+            for piece in prefix.chunks(16 * 1024) {
+                lines.feed(piece);
+            }
+            *self = Self::Lines(lines);
+        }
+        if let Self::Lines(lines) = self {
+            for piece in bytes.chunks(16 * 1024) {
+                lines.feed(piece);
+            }
+        }
+    }
+    /// 只有 HTTP 实体完整时才判伪成功；中断可能截在合法 JSON 当中，不能被误报为错误体。
+    fn is_error(self, headers: &HeaderMap) -> bool {
+        match self {
+            Self::Resident(raw) => {
+                let decoded = crate::decode::for_inspection(
+                    header_opt(headers, http::header::CONTENT_ENCODING),
+                    &raw,
+                );
+                let body = decoded.as_deref().unwrap_or(&raw);
+                if retry::is_streaming_response(headers, body) {
+                    retry::is_stream_error_body(body)
+                } else {
+                    retry::is_error_body(body)
+                }
+            }
+            Self::Lines(lines) => lines.finish(),
+        }
+    }
+}
+
 /// 响应转发途中顺带做的记录：每一块交给请求历史一份，数着已经转给客户端多少字节。响应流
 /// 结束、出错或被丢弃（客户端断开）时，把这唯一的一次尝试记完。
 struct ResponseTap {
     /// 输出长度由响应链单独记录；尝试长度始终只算原上游字节。
     transformed: bool,
+    /// 请求方向本地失败不算上游请求，但占一次逻辑尝试。
+    attempt: u32,
     rec: Recorder,
     history: Option<BodyWriter>,
     /// 已经转给客户端的响应体字节数
     forwarded: u64,
     /// 这次尝试算失败的原因：上游回了错误状态码，或响应流中途断了
     failure: Option<AttemptFailure>,
+    /// 只在成功状态检查一次；状态错误和断流本身已足以说明失败。
+    check: Option<PassiveCheck>,
+}
+impl ResponseTap {
+    /// 定长实体最后一块交付后 hyper 可以不再轮询 EOF，按实际累计长度在那一块完成旁路判定。
+    fn complete(&mut self, state: &AppState, status: StatusCode, headers: &HeaderMap) {
+        if self.check.take().is_some_and(|c| c.is_error(headers)) {
+            let failure = AttemptFailure::response(status);
+            failure.record_in(&state.stats);
+            self.rec.settle(
+                crate::history::Outcome::UpstreamError,
+                Some("upstream_failed"),
+            );
+            self.failure = Some(failure);
+        }
+    }
 }
 
 impl Drop for ResponseTap {
@@ -113,94 +178,25 @@ impl Drop for ResponseTap {
             self.rec.response_bytes(self.forwarded);
         }
         self.rec.try_ended(
-            1,
+            self.attempt,
             self.forwarded,
             self.failure.as_ref().map(AttemptFailure::for_history),
         );
     }
 }
 
-/// 没有 request 层就直通；需要完整输入的程序已经检查过上限并保存了最终正文。
-pub(super) enum ForwardBody<'a> {
-    /// 尚未读取的客户端上传。
-    Live(ClientUpload),
-    /// 请求链改写后的内存或磁盘体，不再记录为客户端原体。
-    Prepared(&'a RequestBody),
-}
-/// forward 只经过一次请求方向；即使程序要求重试也不重发，拒绝仍保留它给的客户端响应。
-pub(super) async fn forward_after_chain(
-    mut state: AppState,
-    mut req: OutboundRequest,
-    mut pending: Option<ClientUpload>,
-    trace: RequestTrace,
-) -> Response {
-    let mut chain = RequestChain::new(&req);
-    let mut r = Responder::buffered();
-    let head = req.method == http::Method::HEAD;
-    trace.rec.phase(Phase::Transforming);
-    match chain
-        .run(&mut state, &mut req, 1, &mut r, &mut pending)
-        .await
-    {
-        Ok(changed) => {
-            // 正文被替换时，上游不会再拉客户端上传。此时仍需检查原始请求的容量、记录与流标记。
-            if req.replacement.is_some()
-                && let Some(upload) = pending.take()
-                && let Err(t) = upload.buffer(&state, &mut req, &trace.rec).await
-            {
-                return t.into_response(&trace);
-            }
-            if pending.is_none() {
-                record_try(
-                    &trace.rec,
-                    1,
-                    sent_head(&trace.rec, &req).as_ref(),
-                    !changed,
-                    &req,
-                );
-            }
-        }
-        Err(ChainError::Stop(stop)) => {
-            finish_chain_stop(&state, &mut r, &trace, &req, 1, head, *stop).await;
-            return r.into_response(&trace);
-        }
-        Err(ChainError::Retry(f)) => {
-            record_try(&trace.rec, 1, None, true, &req);
-            trace.rec.try_ended(1, 0, Some(f.for_history()));
-            f.record_in(&state.stats);
-            let terminal = Terminal::new("format_failed", f.message, f.details.into());
-            terminal.record_in(&state.stats);
-            return terminal.into_response(&trace);
-        }
-        Err(ChainError::Disconnected) => {
-            unreachable!("buffered responder follows handler lifetime")
-        }
-    }
-    trace.rec.phase(Phase::Attempting);
-    let ctx = req.ctx.take();
-    forward_only_proxy(
-        state,
-        &req.method,
-        &req.target_url,
-        &req.headers,
-        pending.map_or_else(|| ForwardBody::Prepared(req.sent_body()), ForwardBody::Live),
-        ctx,
-        trace,
-    )
-    .await
-}
 /// 不使用重试、保活或内容拦截。没有对应方向的转换程序时，上传和下载都是真流式。
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn forward_only_proxy(
     state: AppState,
     method: &http::Method,
     target_url: &str,
     headers: &HeaderMap,
-    body: ForwardBody<'_>,
+    upload: ClientUpload,
     mut ctx: Option<ExchangeCtx>,
-    mut trace: RequestTrace,
-) -> Response {
-    // 本模式恰好尝试一次：请求一发出就算一次上游尝试
-    trace.attempts = 1;
+    trace: &RequestTrace,
+    attempt: u32,
+) -> Result<Response, Terminal> {
     // 请求历史：发出的体就是客户端的请求体（边收边发，同一份），所以这次尝试记为
     // 「与原始请求体相同」，体只存一份
     let rec = trace.rec.clone();
@@ -238,111 +234,100 @@ pub(super) async fn forward_only_proxy(
     // `ReadBodyError::ClientAborted` → 400 且**不碰** last_error（见 `read_request_body` 的
     // 错误分支），两条路径归因必须一致——仅转发模式此前是异常的那一侧。
     let client_gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    match body {
-        ForwardBody::Prepared(b) => match b.apply_to(builder).await {
-            Ok(prepared) => builder = prepared,
-            Err(e) => {
-                let t = Terminal::local_storage_failed(StorageOp::ReadRequest, &e.to_string());
-                t.record_in(&state.stats);
-                rec.try_ended(1, 0, Some(t.for_history()));
-                return t.into_response(&trace);
-            }
-        },
-        ForwardBody::Live(upload) => {
-            let formatted = ctx.is_some();
-            let need_flag = ctx.as_ref().is_some_and(|ctx| ctx.client.stream.is_none())
-                && [
-                    crate::config::file::Stage::Stream,
-                    crate::config::file::Stage::Response,
-                    crate::config::file::Stage::Notify,
-                ]
-                .into_iter()
-                .any(|stage| state.has_format(stage));
-            let flag_out = need_flag.then(|| Arc::new(std::sync::OnceLock::new()));
-            if let Some(ctx) = &mut ctx {
-                ctx.live_stream = flag_out.clone();
-            }
-            let sent = rec.sent_head(
-                method.as_str(),
-                target_url,
-                headers
-                    .iter()
-                    .filter(|(name, _)| !is_hop_header(name.as_str()))
-                    .map(|(name, value)| (name.as_str(), value.as_bytes())),
-            );
-            let sent_encoding = request_encoding(headers, formatted);
-            let changed = formatted && sent_encoding.as_deref() != upload.encoding.as_ref();
-            let sent_history = rec.try_started(
-                1,
-                sent.as_ref(),
-                !changed,
-                request_history_encoding(sent_encoding.as_deref(), formatted),
-            );
-            let tap = RequestTap {
-                history: rec.request_body(request_history_encoding(
-                    upload.encoding.as_ref(),
-                    formatted,
-                )),
-                sent_history,
-                rec: rec.clone(),
-                prefix: Vec::new(),
-                seen: 0,
-                accept_sse: upload.accept,
-                trigger: upload.trigger,
-                flag_out,
-                parser: None,
-                exact: None,
-            };
-            let body = upload.body;
-            let flag = too_large.clone();
-            let gone_flag = client_gone.clone();
-            // unfold 状态 = (上游流, 已见字节数, 请求历史的记录)；产出的就是同一份 chunk（移动，
-            // 不拷贝、不累积），故在途内存与负载大小无关
-            let counted = futures_util::stream::unfold(
-                (body.into_data_stream(), 0usize, tap),
-                move |(mut stream, seen, mut tap)| {
-                    let flag = flag.clone();
-                    let gone_flag = gone_flag.clone();
-                    async move {
-                        // 流结束时 tap 随这个 future 一起被丢弃，请求体的记录就此收尾
-                        let Some(chunk) = stream.next().await else {
-                            tap.finish().await;
-                            return None;
-                        };
-                        let chunk = match chunk {
-                            Ok(c) => c,
-                            Err(e) => {
-                                // 这里的 Err 只可能来自客户端侧（body 即客户端请求体）；
-                                // 原样透传给 reqwest 以中止上游请求，真实原因由标记承载
-                                gone_flag.store(true, AtomicOrdering::Relaxed);
-                                return Some((Err(e), (stream, seen, tap)));
-                            }
-                        };
-                        tap.chunk(&chunk).await;
-                        let seen = seen.saturating_add(chunk.len());
-                        if seen > limit {
-                            flag.store(true, AtomicOrdering::Relaxed);
-                            // 先把客户端剩下的请求体读掉，再用 Err 中止上游请求、回 413：
-                            // 理由见 REJECTED_BODY_DRAIN_TOTAL。此间上游请求停在等下一块
-                            // 数据上，不会多发任何字节
-                            drain_rejected_body(&mut stream).await;
-                            // axum::Error 满足 wrap_stream 的错误约束（Into<BoxError>），
-                            // 无需 map_err；真实原因由 too_large 标记承载
-                            return Some((
-                                Err(axum::Error::new(std::io::Error::other(
-                                    "the request body exceeds the limit",
-                                ))),
-                                (stream, seen, tap),
-                            ));
-                        }
-                        Some((Ok(chunk), (stream, seen, tap)))
-                    }
-                },
-            );
-            // 以 chunked 发往上游：我们不再持有完整长度（长度要读完才知道，而读完即
-            // 缓冲），content-length 无从回填——这是本模式的代价之一，也是必然后果。
-            builder = builder.body(reqwest::Body::wrap_stream(counted));
+    {
+        let formatted = ctx.is_some();
+        let need_flag = ctx.as_ref().is_some_and(|ctx| ctx.client.stream.is_none())
+            && [
+                crate::config::file::Stage::Stream,
+                crate::config::file::Stage::Response,
+                crate::config::file::Stage::Notify,
+            ]
+            .into_iter()
+            .any(|stage| state.has_format(stage));
+        let flag_out = need_flag.then(|| Arc::new(std::sync::OnceLock::new()));
+        if let Some(ctx) = &mut ctx {
+            ctx.live_stream = flag_out.clone();
         }
+        let sent = rec.sent_head(
+            method.as_str(),
+            target_url,
+            headers
+                .iter()
+                .filter(|(name, _)| !is_hop_header(name.as_str()))
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        );
+        let sent_encoding = request_encoding(headers, formatted);
+        let changed = formatted && sent_encoding.as_deref() != upload.encoding.as_ref();
+        let sent_history = rec.try_started(
+            attempt,
+            sent.as_ref(),
+            !changed,
+            request_history_encoding(sent_encoding.as_deref(), formatted),
+        );
+        let tap = RequestTap {
+            history: rec.request_body(request_history_encoding(
+                upload.encoding.as_ref(),
+                formatted,
+            )),
+            sent_history,
+            rec: rec.clone(),
+            prefix: Vec::new(),
+            seen: 0,
+            accept_sse: upload.accept,
+            trigger: upload.trigger,
+            flag_out,
+            parser: None,
+            exact: None,
+        };
+        let body = upload.body;
+        let flag = too_large.clone();
+        let gone_flag = client_gone.clone();
+        // unfold 状态 = (上游流, 已见字节数, 请求历史的记录)；产出的就是同一份 chunk（移动，
+        // 不拷贝、不累积），故在途内存与负载大小无关
+        let counted = futures_util::stream::unfold(
+            (body.into_data_stream(), 0usize, tap),
+            move |(mut stream, seen, mut tap)| {
+                let flag = flag.clone();
+                let gone_flag = gone_flag.clone();
+                async move {
+                    // 流结束时 tap 随这个 future 一起被丢弃，请求体的记录就此收尾
+                    let Some(chunk) = stream.next().await else {
+                        tap.finish().await;
+                        return None;
+                    };
+                    let chunk = match chunk {
+                        Ok(c) => c,
+                        Err(e) => {
+                            // 这里的 Err 只可能来自客户端侧（body 即客户端请求体）；
+                            // 原样透传给 reqwest 以中止上游请求，真实原因由标记承载
+                            gone_flag.store(true, AtomicOrdering::Relaxed);
+                            return Some((Err(e), (stream, seen, tap)));
+                        }
+                    };
+                    tap.chunk(&chunk).await;
+                    let seen = seen.saturating_add(chunk.len());
+                    if seen > limit {
+                        flag.store(true, AtomicOrdering::Relaxed);
+                        // 先把客户端剩下的请求体读掉，再用 Err 中止上游请求、回 413：
+                        // 理由见 REJECTED_BODY_DRAIN_TOTAL。此间上游请求停在等下一块
+                        // 数据上，不会多发任何字节
+                        drain_rejected_body(&mut stream).await;
+                        // axum::Error 满足 wrap_stream 的错误约束（Into<BoxError>），
+                        // 无需 map_err；真实原因由 too_large 标记承载
+                        return Some((
+                            Err(axum::Error::new(std::io::Error::other(
+                                "the request body exceeds the limit",
+                            ))),
+                            (stream, seen, tap),
+                        ));
+                    }
+                    Some((Ok(chunk), (stream, seen, tap)))
+                }
+            },
+        );
+        // 以 chunked 发往上游：我们不再持有完整长度（长度要读完才知道，而读完即
+        // 缓冲），content-length 无从回填——这是本模式的代价之一，也是必然后果。
+        builder = builder.body(reqwest::Body::wrap_stream(counted));
     }
     let resp = match send_with_timeout(&state, builder.send()).await {
         Ok(r) => r,
@@ -354,8 +339,8 @@ pub(super) async fn forward_only_proxy(
             // 是刻意的：超限排在最前——它同时也会让适配器产出 Err，而「你的请求体
             // 太大」比「你断开了」更接近事实、更可操作。两个标记都没置位才是真·上游失败。
             if too_large.load(AtomicOrdering::Relaxed) {
-                rec.try_ended(1, 0, None);
-                return body_too_large(limit).into_response(&trace);
+                rec.try_ended(attempt, 0, None);
+                return Err(body_too_large(limit));
             }
             // 客户端上传途中断开：**不记 last_error、不打「上游请求失败」**——
             // 那一头根本没有失败，是我们应客户端断开而主动中止了上游请求。
@@ -363,8 +348,8 @@ pub(super) async fn forward_only_proxy(
             // 中间观测看的，取与缓冲路径同一事件一致的 400。
             if client_gone.load(AtomicOrdering::Relaxed) {
                 tracing::error!(code = %"client_body_aborted", error = %failure.message, target = %masked_target, "客户端请求体传输中断，已中止上游请求");
-                rec.try_ended(1, 0, None);
-                return Terminal::client_body_aborted().into_response(&trace);
+                rec.try_ended(attempt, 0, None);
+                return Err(Terminal::client_body_aborted());
             }
             // 上游失败不重试（本模式的定义），但必须记进实例的观测值，否则 status 的
             // 「最近错误」对这类实例永久显示「无」。这一次尝试记一次失败的尝试，随后的
@@ -372,24 +357,38 @@ pub(super) async fn forward_only_proxy(
             let terminal = Terminal::upstream_failed(&failure);
             failure.record_in(&state.stats);
             terminal.record_in(&state.stats);
-            rec.try_ended(1, 0, Some(failure.for_history()));
-            rec.decided(1, "default".to_string(), false);
+            rec.try_ended(attempt, 0, Some(failure.for_history()));
+            rec.decided(attempt, "default".to_string(), false);
             tracing::warn!(code = %terminal.code(), last_code = failure.code, error = %failure.message, target = %masked_target, "上游请求失败（仅转发模式不重试）");
-            return terminal.into_response(&trace);
+            return Err(terminal);
         }
     };
 
+    forward_response(state, method, target_url, ctx, trace, attempt, resp).await
+}
+
+/// 收到上游头后才选择真流式交付；保留原尝试序号，不因请求层在本地失败过而少算。
+pub(super) async fn forward_response(
+    state: AppState,
+    method: &http::Method,
+    target_url: &str,
+    ctx: Option<ExchangeCtx>,
+    trace: &RequestTrace,
+    attempt: u32,
+    resp: reqwest::Response,
+) -> Result<Response, Terminal> {
+    let rec = &trace.rec;
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     // 请求历史：上游实际回的响应头（逐跳头也在内），响应体边转边交一份。上游回了错误
     // 状态码时照样原样转给客户端，记录的结局是「上游错误」
     let mut tap = ResponseTap {
-        transformed: !status.is_client_error()
-            && !status.is_server_error()
+        transformed: status.is_success()
             && ctx.is_some()
             && (state.has_format(crate::config::file::Stage::Stream)
                 || state.has_format(crate::config::file::Stage::Response)),
+        attempt,
         history: rec.response_head(
-            1,
+            attempt,
             status.as_u16(),
             resp.headers()
                 .iter()
@@ -403,6 +402,9 @@ pub(super) async fn forward_only_proxy(
         rec: rec.clone(),
         forwarded: 0,
         failure: None,
+        check: status
+            .is_success()
+            .then(|| PassiveCheck::Resident(Vec::new())),
     };
     rec.phase(Phase::Forwarding);
     if status.is_client_error() || status.is_server_error() {
@@ -447,6 +449,7 @@ pub(super) async fn forward_only_proxy(
     // 逐块读、逐块交出：两次读到数据之间的时限（`timeouts.read_idle_secs`）在每一块上重新
     // 计时。流在第一个错误之后结束（`done`）。`tap` 跟着状态走：流结束、出错之后或客户端
     // 断开时它被丢弃，这次尝试就此记完。
+    let expected = resp.content_length();
     let transformed = tap.transformed;
     let stream_state = state.clone();
     let stream =
@@ -464,9 +467,18 @@ pub(super) async fn forward_only_proxy(
                         if let Some(history) = tap.history.as_mut() {
                             history.feed_copy(&chunk);
                         }
+                        if let Some(check) = &mut tap.check {
+                            check.feed(&chunk);
+                        }
+                        if expected == Some(tap.forwarded) {
+                            tap.complete(&state, status, resp.headers());
+                        }
                         Some((Ok(chunk), (resp, tap, false)))
                     }
-                    Ok(None) => None,
+                    Ok(None) => {
+                        tap.complete(&state, status, resp.headers());
+                        None
+                    }
                     Err(failure) => {
                         // 上游响应流中断：**直接截断**——绝不注入任何上游未发出的字节（那
                         // 是伪造数据），也不重试（本模式已放弃重试能力）。错误记进实例的
@@ -503,7 +515,7 @@ pub(super) async fn forward_only_proxy(
             &state,
             ctx.as_ref().expect("response chain context"),
             &meta,
-            1,
+            attempt,
             status,
             headers,
             content,
@@ -511,24 +523,24 @@ pub(super) async fn forward_only_proxy(
         .await
         {
             Ok(output) => match output.response(&state, false).await {
-                Ok(response) => response,
+                Ok(response) => Ok(response),
                 Err(t) => {
                     t.record_in(&state.stats);
-                    t.into_response(&trace)
+                    Err(t)
                 }
             },
             Err(t) => {
                 t.record_in(&state.stats);
-                t.into_response(&trace)
+                Err(t)
             }
         };
     }
     // 与 build_replay_response 同款收尾：header 逐条经 from_bytes 校验过、status
     // 已降级兜底，body() 的错误态不可能出现（框架保证，不做不可达分支）
-    resp_builder
+    Ok(resp_builder
         .body(Body::from_stream(
             stream.map(|r| r.map_err(|f| std::io::Error::other(f.message))),
         ))
         .unwrap()
-        .into_response()
+        .into_response())
 }

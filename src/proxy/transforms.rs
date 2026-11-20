@@ -70,7 +70,7 @@ pub(super) struct RequestChain {
     sent_encoding: Option<HeaderValue>,
     /// 保活触发条件只用客户端原样的 Accept 和请求体，不受上游改写影响。
     accept: bool,
-    body_stream: Option<bool>,
+    pub(super) body_stream: Option<bool>,
     /// 原体直到遇到需要 full 的层才准备，之后不解码程序指定的表示。
     prepare_original: bool,
     /// 尚未成功的程序在配置里的位置。
@@ -83,6 +83,8 @@ pub(super) struct RequestChain {
     started: tokio::time::Instant,
     /// 程序对此请求给出的重试上限，0 是显式无限制。
     pub(super) max_attempts: Option<u32>,
+    /// 第一次有效表态后锁定；从失败层重入时也不能重复选。
+    delivery_chosen: bool,
 }
 /// 主动结束时交付程序的响应以及通过容量校验的 HTTP 头。
 pub(super) type ProgramResponse = (wire::Response, HeaderMap);
@@ -124,6 +126,7 @@ impl RequestChain {
             last: None,
             started: tokio::time::Instant::now(),
             max_attempts: None,
+            delivery_chosen: false,
         }
     }
     /// 在进程接纳之后、首帧写出之前准备原体；所有后续层和重试都复用同一份表示。
@@ -317,12 +320,31 @@ impl RequestChain {
                     Ok((reply, headers)) => {
                         let ctx = req.ctx.as_ref().expect("format context");
                         if self.stage == Stage::Request
-                            && reply
-                                .delivery
-                                .as_ref()
-                                .is_some_and(|v| !matches!(v.as_str(), Some("forward" | "retry")))
+                            && let Some(vote) = &reply.delivery
                         {
-                            tracing::warn!(format=%safe,"invalid format delivery ignored");
+                            match vote.as_str() {
+                                Some("forward")
+                                    if !self.delivery_chosen && responder.is_committed() =>
+                                {
+                                    // 已经发出真实的 HTTP 头；不接受需要撤回心跳或改状态行的表态。
+                                    self.delivery_chosen = true;
+                                    tracing::debug!(format=%safe, "forward delivery vote ignored after response commitment");
+                                }
+                                Some(value @ ("forward" | "retry")) if !self.delivery_chosen => {
+                                    self.delivery_chosen = true;
+                                    let forward = value == "forward";
+                                    let cfg = Arc::make_mut(&mut state.config);
+                                    cfg.forward_only = Some(forward);
+                                    ctx.rec.set_delivery(forward, false);
+                                    responder.configure_beats(
+                                        cfg,
+                                        self.accept,
+                                        self.body_stream.unwrap_or(false),
+                                    );
+                                }
+                                Some("forward" | "retry") => (),
+                                _ => tracing::warn!(format=%safe,"invalid format delivery ignored"),
+                            }
                         }
                         if let wire::ReportField::Present(report) = reply.report {
                             ctx.rec.format_report(

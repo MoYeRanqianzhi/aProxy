@@ -54,27 +54,13 @@ pub(super) fn spool_limit_bytes(config: &Config) -> usize {
     }
 }
 
-/// 一次上游尝试：发出请求、完整缓冲响应（内存/磁盘 spool）并做增量错误扫描。
-///
-/// `on_head`：拿到上游响应头（status + 已滤 hop-by-hop 的头）时立即通知调用方，
-/// 早于缓冲响应体——保活通道据此在首轮把上游真实头先行提交给客户端。接收方已
-/// 不关心（已提交、已结束）时发送失败，忽略即可。
-///
-/// `rec` 与 `attempt`：请求历史里这个请求的记录，以及这是第几次尝试。响应头一到就记下，
-/// 响应体边收边交一份——中途断开的那次尝试，已经收到的部分也留得下来。
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn forward_once(
+/// 用可重放的请求体发一次，只等响应头；之后选择边转发还是缓冲。
+pub(super) async fn send_prepared(
     state: &AppState,
-    method: &http::Method,
-    url: &str,
-    headers: &HeaderMap,
-    req_body: &RequestBody,
-    max_spool_bytes: usize,
-    on_head: Option<tokio::sync::oneshot::Sender<(StatusCode, HeaderMap)>>,
-    rec: &crate::history::Recorder,
-    attempt: u32,
-) -> ForwardResult {
-    let spool_dir = state.spool_dir.as_deref();
+    req: &OutboundRequest,
+) -> Result<reqwest::Response, ForwardResult> {
+    let (method, url, headers, req_body) =
+        (&req.method, &req.target_url, &req.headers, req.sent_body());
     let reqwest_method =
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
 
@@ -99,16 +85,36 @@ pub(super) async fn forward_once(
         Ok(b) => b,
         Err(e) => {
             // 请求体临时文件打不开 = 本地确定性故障，重试同样打不开
-            return ForwardResult::SpoolFailed(StorageOp::ReadRequest, e.to_string());
+            return Err(ForwardResult::SpoolFailed(
+                StorageOp::ReadRequest,
+                e.to_string(),
+            ));
         }
     };
 
-    let resp = match send_with_timeout(state, builder.send()).await {
-        Ok(r) => r,
-        // 在源头归类并脱敏：失败原因会流向日志、status 的最近错误与各通道
-        Err(failure) => return ForwardResult::NetworkError(failure, None),
-    };
+    send_with_timeout(state, builder.send())
+        .await
+        .map_err(|failure| ForwardResult::NetworkError(failure, None))
+}
 
+/// 可重试的响应（或 forward 尚未交付、要问 decide 的失败）才缓冲实体。
+/// 提交点与原始历史都从同一份响应头起算，不会为决定投递方式再发一次请求。
+///
+/// `on_head`：拿到上游响应头（status + 已滤 hop-by-hop 的头）时立即通知调用方，
+/// 早于缓冲响应体——保活通道据此在首轮把上游真实头先行提交给客户端。接收方已
+/// 不关心（已提交、已结束）时发送失败，忽略即可。
+///
+/// `rec` 与 `attempt`：请求历史里这个请求的记录，以及这是第几次尝试。响应头一到就记下，
+/// 响应体边收边交一份——中途断开的那次尝试，已经收到的部分也留得下来。
+pub(super) async fn gather_response(
+    state: &AppState,
+    resp: reqwest::Response,
+    max_spool_bytes: usize,
+    on_head: Option<tokio::sync::oneshot::Sender<(StatusCode, HeaderMap)>>,
+    rec: &crate::history::Recorder,
+    attempt: u32,
+) -> ForwardResult {
+    let spool_dir = state.spool_dir.as_deref();
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let raw_headers = resp.headers().clone();
 

@@ -833,6 +833,8 @@ struct RecordInner {
     stream: bool,
     user_agent: Option<String>,
     delivery: &'static str,
+    /// 已经失败的 forward 尝试被 decide 救回并改走重试，不含初始 request 投票。
+    upgraded: bool,
     outcome: Outcome,
     /// 结局已定、响应还没交付完时先记在这里；交付完（或客户端断开）时成为 `outcome`
     settled: Option<(Outcome, Option<&'static str>)>,
@@ -1095,6 +1097,7 @@ impl History {
             stream: false,
             user_agent,
             delivery: start.delivery,
+            upgraded: false,
             outcome: Outcome::InFlight,
             settled: None,
             code: None,
@@ -1627,7 +1630,7 @@ fn record_json(record: &Record, inner: &RecordInner) -> String {
                 .as_deref()
                 .map(|text| clip(text, clip_text)),
             delivery: inner.delivery,
-            upgraded: false,
+            upgraded: inner.upgraded,
             outcome: inner.outcome.as_str(),
             code: inner.code,
             client_status: inner.client_status,
@@ -1749,6 +1752,14 @@ impl Recorder {
         self.update(|inner, _| {
             inner.model = model;
             inner.stream = stream;
+        });
+    }
+
+    /// request 初选与失败后的升级都改变当前方式，只有后者置位升级标记。
+    pub(crate) fn set_delivery(&self, forward: bool, upgraded: bool) {
+        self.update(|inner, _| {
+            inner.delivery = if forward { "forward" } else { "retry" };
+            inner.upgraded |= upgraded;
         });
     }
 

@@ -197,7 +197,7 @@ impl Responder {
             _ => accept || body_stream,
         };
         let interval = cfg.keepalive_interval();
-        let enabled = triggered && !interval.is_zero();
+        let enabled = !cfg.forward_only_enabled() && triggered && !interval.is_zero();
         if ticker.as_ref().map(|t| t.period()) != enabled.then_some(interval) {
             *ticker = enabled.then(|| Self::ticker(interval));
             *skeleton_due = false;
@@ -469,6 +469,7 @@ pub(super) async fn finish_chain_stop(
 pub(super) async fn run_attempts(
     state: &AppState,
     req: OutboundRequest,
+    mut pending: Option<ClientUpload>,
     path_and_query: &str,
     max_spool_bytes: usize,
     r: &mut Responder,
@@ -481,7 +482,7 @@ pub(super) async fn run_attempts(
     let client_head = req.method == http::Method::HEAD;
     let mut req = req;
     let needs_chain = state.has_format(Stage::Request) || state.has_format(Stage::Retry);
-    let mut local = needs_chain.then(|| state.clone());
+    let mut local = (needs_chain || state.has_format(Stage::Decide)).then(|| state.clone());
     let mut chain = if needs_chain {
         Some(RequestChain::new(&req))
     } else {
@@ -494,12 +495,28 @@ pub(super) async fn run_attempts(
     let mut same_body = request_encoding(&req.headers, req.ctx.is_some()).as_deref()
         == req.client_encoding.as_ref();
     let started = trace.decide_started;
+    let mut upgrade = false;
     let mut next_delay = None;
     let mut reroute = true;
     let mut attempt: u32 = 0;
     // 「重试中」的计数守卫：第二次尝试开始时拿到，交付之前放掉；别的出口随函数返回丢弃
     let mut retrying: Option<crate::daemon::Counted> = None;
     loop {
+        if std::mem::take(&mut upgrade) {
+            let cfg = Arc::make_mut(
+                &mut local
+                    .as_mut()
+                    .expect("decide has request-local config")
+                    .config,
+            );
+            cfg.forward_only = Some(false);
+            rec.set_delivery(false, true);
+            state
+                .stats
+                .upgraded_total
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            r.configure_beats(cfg, req.client_accept, req.body_stream.unwrap_or(false));
+        }
         attempt += 1;
         r.note_attempt(attempt);
         if attempt > 1 {
@@ -541,7 +558,7 @@ pub(super) async fn run_attempts(
         let mut failed = None;
         if reroute && let (Some(c), Some(local)) = (chain.as_mut(), local.as_mut()) {
             rec.phase(Phase::Transforming);
-            match c.run(local, &mut req, attempt, r, &mut None).await {
+            match c.run(local, &mut req, attempt, r, &mut pending).await {
                 Err(ChainError::Disconnected) => return,
                 Ok(changed) => {
                     r.prepare_upstream_headers(&mut req.headers);
@@ -556,6 +573,50 @@ pub(super) async fn run_attempts(
             }
         }
         let state = local.as_ref().unwrap_or(state);
+        let forward = state.config.forward_only_enabled();
+        // 改为 retry 后必须保留原体；程序替换了正文时也要把客户端上传读完并检查容量。
+        if (!forward || req.replacement.is_some())
+            && let Some(upload) = pending.take()
+        {
+            let Some(result) = r
+                .wait(upload.buffer(state, &mut req, &rec), None, "client upload")
+                .await
+            else {
+                return;
+            };
+            if let Err(t) = result {
+                r.finish(t, &trace).await;
+                return;
+            }
+            if let Some(c) = &mut chain {
+                c.body_stream = req.body_stream;
+            }
+            r.configure_beats(
+                &state.config,
+                req.client_accept,
+                req.body_stream.unwrap_or(false),
+            );
+            r.prepare_upstream_headers(&mut req.headers);
+            sent = sent_head(&rec, &req);
+        }
+        if forward
+            && failed.is_none()
+            && let Some(upload) = pending.take()
+        {
+            trace.attempts += 1;
+            let live = forward_only_proxy(
+                state.clone(),
+                &req.method,
+                &req.target_url,
+                &req.headers,
+                upload,
+                req.ctx.take(),
+                &trace,
+                attempt,
+            );
+            finish_forward(r, live, &trace).await;
+            return;
+        }
         record_try(
             &rec,
             attempt,
@@ -574,24 +635,51 @@ pub(super) async fn run_attempts(
         } else {
             trace.attempts += 1;
             let (head_tx, head_rx) = r.head_channel();
-            let attempt_fut = forward_once(
-                state,
-                &req.method,
-                &req.target_url,
-                &req.headers,
-                req.sent_body(),
-                max_spool_bytes,
-                head_tx,
-                &rec,
-                attempt,
-            );
-            let Some(result) = r.wait(attempt_fut, head_rx, "等待上游").await else {
+            let Some(head) = r
+                .wait(send_prepared(state, &req), None, "upstream head")
+                .await
+            else {
                 return;
             };
-            result
+            match head {
+                Ok(resp)
+                    if forward
+                        && (!retry::is_retryable_status(resp.status().as_u16())
+                            || started.is_none()) =>
+                {
+                    let stream = forward_response(
+                        state.clone(),
+                        &req.method,
+                        &req.target_url,
+                        req.ctx.take(),
+                        &trace,
+                        attempt,
+                        resp,
+                    );
+                    finish_forward(r, stream, &trace).await;
+                    return;
+                }
+                Ok(resp) => {
+                    let gather =
+                        gather_response(state, resp, max_spool_bytes, head_tx, &rec, attempt);
+                    let Some(result) = r.wait(gather, head_rx, "upstream body").await else {
+                        return;
+                    };
+                    result
+                }
+                Err(f) => f,
+            }
         };
-        let override_max = chain.as_ref().and_then(|c| c.max_attempts);
-        let mut outcome = classify(attempt, result, &rules, override_max);
+        let override_max = chain
+            .as_ref()
+            .and_then(|c| c.max_attempts)
+            .filter(|_| !forward);
+        let mut outcome = classify(
+            attempt,
+            result,
+            if forward { &[] } else { &rules },
+            override_max,
+        );
         let mut voted_by = None;
         let mut explicit_reroute = None;
         reroute = true;
@@ -687,6 +775,7 @@ pub(super) async fn run_attempts(
                     });
                     match verdict {
                         decide::Verdict::Retry { delay, .. } => {
+                            upgrade = forward;
                             next_delay = delay;
                             voted_by = Some(by);
                             outcome = Outcome::Retry {
@@ -699,6 +788,22 @@ pub(super) async fn run_attempts(
                         }
                         decide::Verdict::Stop { name, patch } => {
                             tracing::info!(attempt,by,decision="stop",code=failure.code,reason=%failure.message,"format decided attempt");
+                            if forward && patch.is_none() {
+                                finish_forward_failure(
+                                    state,
+                                    r,
+                                    &trace,
+                                    attempt,
+                                    original,
+                                    &failure,
+                                    received,
+                                    chain_failed,
+                                    by,
+                                    explicit_reroute,
+                                )
+                                .await;
+                                return;
+                            }
                             let terminal = Terminal::retry_stopped(&name, &failure);
                             rec.try_ended(attempt, received, Some(failure.for_history()));
                             rec.decided_with_reroute(attempt, by, false, explicit_reroute);
@@ -725,8 +830,25 @@ pub(super) async fn run_attempts(
                 failure,
                 rule,
                 response_bytes,
+                response,
                 ..
             } => {
+                if forward && voted_by.is_none() {
+                    finish_forward_failure(
+                        state,
+                        r,
+                        &trace,
+                        attempt,
+                        response,
+                        &failure,
+                        response_bytes,
+                        chain_failed,
+                        "default".into(),
+                        explicit_reroute,
+                    )
+                    .await;
+                    return;
+                }
                 if chain.is_some() || state.has_format(Stage::Heartbeat) {
                     let mut f = aproxy_envelope::Failure::new(failure.code.into());
                     f.details = Some(failure.details.clone());
@@ -867,6 +989,62 @@ pub(super) async fn run_attempts(
                 return;
             }
         }
+    }
+}
+
+/// forward 一定在提交前选定；只在等待上游或转换时监测客户端断开，不启动保活。
+async fn finish_forward(
+    r: &mut Responder,
+    response: impl std::future::Future<Output = Result<Response, Terminal>>,
+    trace: &RequestTrace,
+) {
+    let Some(response) = r.wait(response, None, "forward response").await else {
+        return;
+    };
+    match response {
+        Err(t) => r.finish(t, trace).await,
+        Ok(resp) => r.respond(resp),
+    }
+}
+
+/// 没有升级的失败仍是一次仅转发：有完整响应不加代理头，无响应才把失败翻成 502。
+#[allow(clippy::too_many_arguments)]
+async fn finish_forward_failure(
+    state: &AppState,
+    r: &mut Responder,
+    trace: &RequestTrace,
+    attempt: u32,
+    original: Option<UpstreamResponse>,
+    failure: &AttemptFailure,
+    received: u64,
+    chain_failed: bool,
+    by: String,
+    reroute: Option<bool>,
+) {
+    let rec = &trace.rec;
+    rec.try_ended(attempt, received, Some(failure.for_history()));
+    rec.decided_with_reroute(attempt, by, false, reroute);
+    failure.record_in(&state.stats);
+    if let Some(v) = original {
+        rec.settle(
+            crate::history::Outcome::UpstreamError,
+            Some("upstream_failed"),
+        );
+        rec.phase(Phase::Forwarding);
+        rec.response_bytes(v.body.len());
+        r.respond(replay_failure_as_is(v.status, v.headers, &v.raw_headers, v.body).await);
+    } else {
+        let t = if chain_failed {
+            Terminal::new(
+                "format_failed",
+                failure.message.clone(),
+                failure.details.clone().into(),
+            )
+        } else {
+            Terminal::upstream_failed(failure)
+        };
+        t.record_in(&state.stats);
+        r.finish(t, trace).await;
     }
 }
 

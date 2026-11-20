@@ -188,7 +188,12 @@ pub(super) async fn consult(
         },
         |i| format!("rule:{i}"),
     );
-    let mut fallback = wire::Fallback::new(action, by);
+    let forward = state.config.forward_only_enabled();
+    let mut fallback = if forward {
+        wire::Fallback::new(Stop, "default".into())
+    } else {
+        wire::Fallback::new(action, by)
+    };
     if fallback.decision == Retry {
         fallback.delay_ms = Some(
             retry::delay_for_attempt(attempt, state.config.max_retry_backoff_secs)
@@ -276,7 +281,11 @@ pub(super) async fn consult(
             ctx.body_context(name, need),
             attempt,
             elapsed.as_millis() as u64,
-            wire::Delivery::Retry,
+            if forward {
+                wire::Delivery::Forward
+            } else {
+                wire::Delivery::Retry
+            },
             if failure.is_some() {
                 "failure"
             } else {

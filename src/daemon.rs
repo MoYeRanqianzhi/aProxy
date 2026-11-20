@@ -323,6 +323,9 @@ pub struct Activity {
     /// 经过至少一次重试、最终成功的请求数
     #[serde(default)]
     pub rescued_total: u64,
+    /// 失败后由 decide 从 forward 改为 retry 的请求总数，不含初选。
+    #[serde(default)]
+    pub upgraded_total: u64,
     /// 已收到、响应还没交付完的请求数（等上游、退避、重试、回放都算）
     #[serde(default)]
     pub in_flight: u64,
@@ -1303,6 +1306,8 @@ pub struct IpcStats {
     pub retries_total: std::sync::atomic::AtomicU64,
     /// 经过至少一次重试、最终成功的请求数
     pub rescued_total: std::sync::atomic::AtomicU64,
+    /// 每次请求内升级只计一次；与第几次实际发送无关。
+    pub upgraded_total: std::sync::atomic::AtomicU64,
     /// 已收到、响应还没交付完的请求数（由 [`IpcStats::enter`] 的守卫维护）
     pub in_flight: std::sync::atomic::AtomicU64,
     /// 正处在第二次及以后的尝试里的请求数（由 [`IpcStats::begin_retrying`] 的守卫维护）
@@ -1520,6 +1525,7 @@ impl IpcStats {
             requests_total: self.requests_total.load(Relaxed),
             retries_total: self.retries_total.load(Relaxed),
             rescued_total: self.rescued_total.load(Relaxed),
+            upgraded_total: self.upgraded_total.load(Relaxed),
             in_flight: self.in_flight.load(Relaxed),
             retrying: self.retrying.load(Relaxed),
             by_code: tally.by_code.clone(),
@@ -4151,7 +4157,7 @@ mod tests {
                 r#""instance":{"pid":42,"start":"","instance_id":"19ac3f2e8b5d1a2b","version":"0.0.0-test","listen_addr":"127.0.0.1:12345","config_path":"C:/tmp/config.toml","base_url":"https://api.example.com","started_at":1700000000000,"log_path":null,"foreground":false},"#,
                 r#""state":"serving","#,
                 r#""behavior":{"delivery":"retry","disk_cache":true,"keepalive":{"trigger":"any","interval_secs":15},"retry_rules":1,"history":{"body_budget_mb":64}},"#,
-                r#""activity":{"last_request_at":1700000000000,"requests_total":120,"retries_total":7,"rescued_total":0,"in_flight":0,"retrying":0,"by_code":{},"#,
+                r#""activity":{"last_request_at":1700000000000,"requests_total":120,"retries_total":7,"rescued_total":0,"upgraded_total":0,"in_flight":0,"retrying":0,"by_code":{},"#,
                 r#""buckets":{"width_secs":120,"requests":[ZEROS],"retries":[ZEROS],"failures":[ZEROS]},"last_error":null},"#,
                 r#""formats":[],"#,
                 r#""ops":["ping","shutdown","prepare_swap","requests","request","body","subscribe"],"#,

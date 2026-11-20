@@ -1126,6 +1126,7 @@ impl Pool {
             Stage::Response(_) | Stage::Stream(_) => self.frame_limits[1],
             _ => FRAME_OVERHEAD,
         };
+        let may_choose_delivery = matches!(&stage, Stage::Request(_));
         let request_stage = matches!(&stage, Stage::Request(_) | Stage::Retry(_));
         let line = w.frame(stage, timeout, a, limit).await?;
         /// 先核对回信的版本和序列再解释补丁，以免把其他请求的回信应用到本次。
@@ -1167,6 +1168,9 @@ impl Pool {
                 })
         {
             return Err(Fault::Invalid);
+        }
+        if !may_choose_delivery && r.delivery.is_some() {
+            tracing::warn!(format=%self.secrets.replace(&self.entry.name),"format delivery outside request ignored");
         }
         if r.fail.as_ref().is_some_and(|f| f.discarded_code) {
             tracing::warn!(format=%self.secrets.replace(&self.entry.name),"invalid format fail code ignored");

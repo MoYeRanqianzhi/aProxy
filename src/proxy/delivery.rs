@@ -39,13 +39,20 @@ impl Delivery {
     pub(super) fn attach(mut self, response: Response, bodiless: bool) -> Response {
         let status = response.status();
         self.rec.client_status(status.as_u16());
+        // 未缓冲的 forward 体没有自己的精确 size_hint；HTTP 定长帧写满时，连接层不会再来取 EOF。
+        let remaining = response
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
         response.map(|body| {
             use axum::body::HttpBody as _;
             // 没有体可写的响应，连接层一次都不读就丢掉它：这不是客户端断开
-            self.delivered = !delivers_body(bodiless, status) || body.is_end_stream();
+            self.delivered =
+                !delivers_body(bodiless, status) || body.is_end_stream() || remaining == Some(0);
             Body::new(Delivered {
                 body,
                 delivery: self,
+                remaining,
             })
         })
     }
@@ -62,6 +69,8 @@ impl Drop for Delivery {
 struct Delivered {
     body: Body,
     delivery: Delivery,
+    /// 定长响应到 HTTP 消息末尾还差的字节；chunked 仍以真实 EOF 为准。
+    remaining: Option<u64>,
 }
 
 impl axum::body::HttpBody for Delivered {
@@ -77,8 +86,11 @@ impl axum::body::HttpBody for Delivered {
         match &polled {
             Poll::Ready(None) => this.delivery.delivered = true,
             // 长度已知的体写完最后一帧就算到头，连接层不会再来读一次
-            Poll::Ready(Some(Ok(_))) if this.body.is_end_stream() => {
-                this.delivery.delivered = true;
+            Poll::Ready(Some(Ok(frame))) => {
+                if let (Some(left), Some(data)) = (&mut this.remaining, frame.data_ref()) {
+                    *left = left.saturating_sub(data.len() as u64);
+                }
+                this.delivery.delivered |= this.body.is_end_stream() || this.remaining == Some(0);
             }
             _ => {}
         }

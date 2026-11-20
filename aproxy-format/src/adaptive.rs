@@ -44,6 +44,8 @@ impl Default for Settings {
 struct Record {
     /// 最近一次真实访问的单调时间，也是过期索引的键。
     seen: Instant,
+    /// 时间分辨率内多次访问的先后次序，不能用摘要排序替代。
+    order: u64,
     /// 尚未固定模式时的连续失败数，成功归零。
     failures: u32,
     /// 从此时起固定 retry；None 表示允许尝试 forward。
@@ -60,7 +62,9 @@ pub struct Adaptive {
     /// 解码后的 32 字节摘要保证无效数据不能被存成用户文本。
     records: HashMap<[u8; 32], Record>,
     /// 按最后访问时间淘汰，不为查到一个摘要而扫描整个表。
-    age: BTreeSet<(Instant, [u8; 32])>,
+    age: BTreeSet<(Instant, u64, [u8; 32])>,
+    /// 单进程访问序列，只用于同一时刻的次序。
+    order: u64,
 }
 /// null 或不规范的摘要不具有身份，不能与完整空体的 SHA-256 混同。
 fn digest(ctx: &w::Context) -> Option<[u8; 32]> {
@@ -93,11 +97,12 @@ impl Adaptive {
             settings,
             records: HashMap::new(),
             age: BTreeSet::new(),
+            order: 0,
         })
     }
     /// 刷新已有条目而不占第二个位；只淘汰确已过期或为新身份腾空间的最旧记录。
     fn touch(&mut self, key: [u8; 32], now: Instant) -> &mut Record {
-        while let Some(&(at, id)) = self.age.first() {
+        while let Some(&(at, _, id)) = self.age.first() {
             if now.duration_since(at) < Duration::from_secs(self.settings.ttl_secs) {
                 break;
             }
@@ -105,21 +110,24 @@ impl Adaptive {
             self.records.remove(&id);
         }
         if let Some(r) = self.records.get(&key) {
-            self.age.remove(&(r.seen, key));
+            self.age.remove(&(r.seen, r.order, key));
         } else if self.records.len() == self.settings.max_entries
-            && let Some((_, old)) = self.age.pop_first()
+            && let Some((_, _, old)) = self.age.pop_first()
         {
             self.records.remove(&old);
         }
-        self.age.insert((now, key));
+        self.order += 1;
+        self.age.insert((now, self.order, key));
         let r = self.records.entry(key).or_insert(Record {
             seen: now,
+            order: self.order,
             failures: 0,
             pinned: None,
             samples: 0,
             healthy: 0,
         });
         r.seen = now;
+        r.order = self.order;
         r
     }
     /// 没有可用摘要时弃权；有摘要也只报告投递策略，不报告摘要或用户内容。
@@ -263,8 +271,8 @@ mod tests {
         a.settings.max_entries = 2;
         a.settings.ttl_secs = 5;
         let t = Instant::now();
-        for (s, k) in [(0, 1), (1, 2), (2, 1), (3, 3)] {
-            a.completed(&event(k, false, 0), t + Duration::from_secs(s));
+        for k in [1, 2, 1, 3] {
+            a.completed(&event(k, false, 0), t);
         }
         assert!(!a.records.contains_key(&[2; 32]));
         assert_eq!(a.age.len(), 2);

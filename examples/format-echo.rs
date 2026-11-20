@@ -210,6 +210,12 @@ fn main() {
                 r["state"] = json!(format!("{worker}/{}", std::process::id()));
             }
             match mode {
+                "oversized-headers" if stage == "request" => {
+                    let headers = (0..40000)
+                        .map(|i| (format!("x-{i}"), json!("x")))
+                        .collect::<serde_json::Map<_, _>>();
+                    r[obj] = json!({"headers":headers});
+                }
                 "held-beat" if stage == "heartbeat" => {
                     wait_gate(std::path::Path::new(arg));
                     r["data"] = json!(": late\n\n");
@@ -437,6 +443,9 @@ fn main() {
             out.flush().unwrap();
             observe("stray-written", Some(seq));
         }
+    }
+    if mode == "die-idle" {
+        eprintln!("final idle diagnostic pid={}", std::process::id());
     }
     if mode == "stderr-on-eof" {
         eprintln!("last diagnostic after stdin EOF");

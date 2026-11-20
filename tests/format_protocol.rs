@@ -977,6 +977,67 @@ async fn stderr_truncates_redacts_and_reports_suppressed_lines() {
     assert_eq!(log.matches("small-stderr-line").count(), 49);
 }
 
+/// 真实程序能在合法 JSON 帧内给出超出 HTTP 容量的头表；拒绝回信，不能让请求任务 panic。
+#[tokio::test]
+async fn oversized_worker_header_table_is_invalid_output() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[200]).await;
+    let cfg = layer(&home, "many", "'request'", &["oversized-headers"]) + "breaker_failures=1\n";
+    let (client, url) = running(&home, up, &cfg);
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 503);
+    assert_eq!(resp.headers()["x-aproxy-error"], "format_unavailable");
+    assert_eq!(
+        breaker(&home, &url).await["last_failure"]["details"]["kind"],
+        "invalid_output"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+/// 持久进程自己正常退出时，日志所有者先排空 stderr；下一条请求握手的是另一个进程。
+#[tokio::test]
+async fn persistent_idle_exit_drains_its_final_stderr_and_replaces_the_worker() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[200]).await;
+    let cfg = layer(&home, "idle", "'request'", &["die-idle", "300"]).replace(
+        "env={",
+        &format!(
+            "env={{ ECHO_OBSERVE={},",
+            serde_json::to_string(&home.path().join("obs")).unwrap()
+        ),
+    );
+    let (client, url) = running(&home, up, &cfg);
+    assert_eq!(client.get(&url).send().await.unwrap().status(), 200);
+    let pid = frames(&home, "obs")
+        .into_iter()
+        .find(|v| v["event"] == "request")
+        .unwrap()["pid"]
+        .as_u64()
+        .unwrap() as u32;
+    let ping =
+        aproxy::daemon::ipc_ping_in(&home.path().join("run"), url.rsplit(':').next().unwrap())
+            .await
+            .unwrap();
+    let log = ping.instance.log_path.unwrap();
+    let diagnostic = format!("format[idle] final idle diagnostic pid={pid}");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while aproxy::process::process_exited(pid) != Some(true)
+            || !std::fs::read_to_string(&log).unwrap().contains(&diagnostic)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("old worker must exit with its final diagnostic");
+    assert_eq!(client.get(&url).send().await.unwrap().status(), 200);
+    let requests: Vec<_> = frames(&home, "obs")
+        .into_iter()
+        .filter(|v| v["event"] == "request")
+        .collect();
+    assert_eq!(requests.len(), 2);
+    assert_ne!(requests[0]["pid"], requests[1]["pid"]);
+}
+
 /// 探测用的一次性进程会在 stdin 关闭后临退出时写最后一行，正常回收要读完它。
 #[test]
 fn normal_spawn_exit_drains_the_final_stderr_line() {

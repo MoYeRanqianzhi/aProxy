@@ -123,6 +123,25 @@ impl Convert {
             ))
             .and_then(|name| protocol(name).map_err(|e| Fault::new(e, "invalid client protocol")))
     }
+    /// 回程失败要替换整份实体；裸 fail 会让代理原样透传上游私有错误页和鉴权头。
+    /// 丢失协商状态时只用两族 SDK 都能读的 error 对象，不从原正文猜协议或复制原文。
+    pub fn error_response(&self, ctx: &w::Context) -> w::Response {
+        let message = "The upstream response could not be converted.";
+        let body = match self.client(ctx) {
+            Ok(F::OpenAiChat | F::OpenAiResponses) => {
+                serde_json::json!({"error":{"type":"server_error","message":message,"code":"conversion_failed","param":null}})
+            }
+            Ok(F::AnthropicMessages) | Err(_) => {
+                serde_json::json!({"type":"error","error":{"type":"api_error","message":message}})
+            }
+        };
+        let mut response = w::Response::new(502);
+        response
+            .headers
+            .insert("content-type".into(), "application/json".into());
+        response.body = w::Body::Text(body.to_string());
+        response
+    }
     /// 缓冲转换只解释成功实体，不把源正文或库错误中的字段值带到日志。
     fn json(&self, client: F, bytes: &[u8]) -> Result<String, Fault> {
         if std::str::from_utf8(bytes).is_ok_and(detect::looks_like_sse) {

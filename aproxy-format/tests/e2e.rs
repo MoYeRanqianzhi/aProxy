@@ -593,3 +593,28 @@ fn route_drops_cross_origin_query_except_listed_parameters() {
         assert_eq!(r["request"]["url"], expected);
     }
 }
+
+/// 上游的 200 损坏时不能用裸 fail 让代理回传其凭据与私有错误页。
+#[test]
+fn failed_response_conversion_replaces_the_entire_upstream_entity() {
+    for (from, to) in [
+        ("openai_chat", "anthropic_messages"),
+        ("openai_responses", "openai_chat"),
+        ("anthropic_messages", "openai_chat"),
+        ("auto", "openai_chat"),
+    ] {
+        let mut w = Worker::new(&["convert", "--from", from, "--to", to]);
+        let r = w.frame(response(&Value::Null, "fixture-private error page"));
+        let fail = &r["fail"];
+        let replacement = &fail["response"];
+        assert_eq!(replacement["status"], 502, "{r}");
+        assert_eq!(replacement["headers"]["content-type"], "application/json");
+        assert!(!r.to_string().contains("fixture-private"));
+        let body: Value = serde_json::from_str(replacement["body"].as_str().unwrap()).unwrap();
+        assert!(body["error"]["message"].is_string());
+        if from == "anthropic_messages" || from == "auto" {
+            assert_eq!(body["type"], "error");
+            assert_eq!(body["error"]["type"], "api_error");
+        }
+    }
+}

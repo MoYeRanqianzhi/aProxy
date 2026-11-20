@@ -163,7 +163,19 @@ impl Role {
         if let Err(reason) = result {
             r = w::Reply::new(m.seq);
             let _ = writeln!(std::io::stderr().lock(), "aproxy-format: {}", reason.local);
-            r.fail = Some(w::Fail::new(false, reason.wire.into()));
+            let mut fail = w::Fail::new(false, reason.wire.into());
+            if let Self::Convert(c) = self {
+                let context = match &m.stage {
+                    w::Stage::Response(response) => Some(&response.context),
+                    w::Stage::Stream(stream) => match &stream.event {
+                        w::StreamEvent::Open(open) => Some(&open.context),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                fail.response = context.map(|ctx| c.error_response(ctx));
+            }
+            r.fail = Some(fail);
         }
         r
     }

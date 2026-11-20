@@ -1515,3 +1515,52 @@ fn responses_function_done_closes_the_messages_block_before_later_text() {
     assert_eq!(stops, starts);
     assert!(active.is_none());
 }
+
+/// 非终态帧可以携带名为 error 的扩展；只能按源协议判定终止，否则后续正文会被整个丢弃。
+#[test]
+fn native_termination_ignores_unrelated_error_fields() {
+    let corpus: Value = serde_json::from_str(include_str!("fixtures/protocols.json")).unwrap();
+    for (source, target, extension) in [
+        (
+            "anthropic_messages",
+            "openai_chat",
+            json!({"type":"ping","error":null}),
+        ),
+        (
+            "openai_responses",
+            "openai_chat",
+            json!({"type":"response.in_progress","error":{"tag":"extension"}}),
+        ),
+        (
+            "openai_chat",
+            "anthropic_messages",
+            json!({"choices":[],"error":null}),
+        ),
+    ] {
+        let mut w = Worker::new(&["convert", "--from", target, "--to", source]);
+        open_stream(&mut w, "text/event-stream");
+        let mut bytes = String::new();
+        for event in std::iter::once(&extension).chain(corpus[source]["events"].as_array().unwrap())
+        {
+            let r = stream_frame(&mut w, "data", &format!("data: {event}\n\n"));
+            bytes.push_str(r["data"].as_str().unwrap());
+        }
+        if source == "openai_chat" {
+            bytes.push_str(
+                stream_frame(&mut w, "data", "data: [DONE]\n\n")["data"]
+                    .as_str()
+                    .unwrap(),
+            );
+        }
+        bytes.push_str(stream_frame(&mut w, "close", "")["data"].as_str().unwrap());
+        assert!(
+            bytes.contains("hello λ") && !bytes.contains("\"error\""),
+            "{source}: {bytes}"
+        );
+        assert!(bytes.contains(if target == "openai_chat" {
+            "data: [DONE]"
+        } else {
+            "event: message_stop"
+        }));
+    }
+}

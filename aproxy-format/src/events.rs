@@ -157,7 +157,13 @@ impl Events {
                         }
                     }
                 }
-                false
+                // Chat 只有 error 对象表示错误；某些兼容服务会在普通块写 error:null。
+                // 宽松的源解码器仅检查键是否存在，不能把这个占位误译成终态。
+                let error = event["error"].is_object();
+                if !error && let Some(obj) = event.as_object_mut() {
+                    obj.remove("error");
+                }
+                error
             }
             F::AnthropicMessages => {
                 matches!(event["type"].as_str(), Some("message_stop" | "error"))
@@ -166,7 +172,7 @@ impl Events {
                 event["type"].as_str(),
                 Some("response.completed" | "response.incomplete" | "response.failed" | "error")
             ),
-        } || event.get("error").is_some();
+        };
         if self.source == F::AnthropicMessages && self.target == F::OpenAiChat {
             if event["type"] == "message_delta" && event["delta"]["stop_reason"].is_string() {
                 self.message_finish = Some(event);

@@ -96,6 +96,9 @@ pub struct Channel {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
+    /// 每个路由单元自己的执行环境，仅用于该渠道显式配置的凭据。
+    #[serde(skip)]
+    pub variables: config::Variables,
     /// 原模型名到上游模型名。
     #[serde(default)]
     aliases: BTreeMap<String, String>,
@@ -397,6 +400,7 @@ impl Route {
                 } else {
                     ""
                 },
+                &self.variables,
             )?;
             headers.insert(header, value);
         }

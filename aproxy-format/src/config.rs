@@ -38,7 +38,7 @@ pub fn load<T: DeserializeOwned>(path: &str) -> Result<T, &'static str> {
         err.path().iter().filter_map(|segment|match segment {
             serde_path_to_error::Segment::Map{key}=>known!(key.as_str();"aliases","auth_header","body_regex","carry_query","channel","cooldown_secs","cooldown_status","credential_env","decision","delay_ms","env","event","failure","failure_threshold","from","header","hold_secs","id","keys","max_entries","model","models","origin","overrides","path","path_prefix","pool","preserve_path","preset","priority","protocol","recovery_latency_ms","recovery_samples","recovery_success_ratio","regex","remove","remove_headers","reroute","respect_retry_after","response","rule","scheme","set","set_headers","status","sticky","strategy","stream_budget_bytes","to","ttl_secs","upstream","url","weight"),
             _=>None,
-        }).last().unwrap_or(generic)
+        }).next_back().unwrap_or(generic)
     })
 }
 
@@ -86,16 +86,28 @@ pub fn credential_header(name: &str) -> Result<http::HeaderName, &'static str> {
     Ok(header)
 }
 
+/// 工作进程继承真实环境；离线角色另外看到自己条目的环境，不修改整个检查进程的环境。
+#[derive(Default, Clone)]
+pub struct Variables {
+    /// 只在这个角色内可见的覆盖，不能向其他角色传播。
+    pub overlay: std::collections::BTreeMap<String, String>,
+    /// 静态检查不要求提供密钥；实际执行或试跑遇到缺失凭据仍报错。
+    pub structural: bool,
+}
 /// 凭据取自用户指名的环境变量，只进入将发给上游的请求头。
-pub fn credential(env: &str, scheme: &str) -> Result<String, Fault> {
+pub fn credential(env: &str, scheme: &str, variables: &Variables) -> Result<String, Fault> {
     if env.is_empty() || env.contains(['=', '\0']) {
         return Err(Fault::new(
             "密钥环境变量名无效",
             "invalid credential environment variable name",
         ));
     }
-    let key = std::env::var(env)
-        .ok()
+    let key = variables
+        .overlay
+        .get(env)
+        .cloned()
+        .or_else(|| std::env::var(env).ok())
+        .or_else(|| variables.structural.then(|| "offline-placeholder".into()))
         .filter(|v| !v.is_empty())
         .ok_or(Fault::new(
             "密钥环境变量未设置",

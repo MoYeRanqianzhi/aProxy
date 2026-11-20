@@ -5,31 +5,7 @@
 //!   （配置项 `max_retry_backoff_secs`，默认 320）后固定该值；设为 0 则全部零延迟
 //! - attempt 从 1 开始计数（第 1 次重试对应 attempt=1）
 
-/// 根据重试次数计算延迟时长。
-///
-/// `attempt` 为 1-based：第一次重试为 1，第二次为 2……
-/// `max_backoff_secs` 为退避封顶（配置项，0 = 所有重试立即执行）。
-/// 指数增长按封顶动态截断：封顶 1000 时序列可增长到 5s…640s、1280s→1000，
-/// 而非被写死的 min(6) 卡在 320——否则用户配了更大封顶却完全无效。
-pub fn delay_for_attempt(attempt: u32, max_backoff_secs: u64) -> std::time::Duration {
-    if max_backoff_secs == 0 {
-        return std::time::Duration::ZERO;
-    }
-    if attempt <= 3 {
-        std::time::Duration::ZERO
-    } else {
-        // attempt 4 -> 5s, 5 -> 10s, 6 -> 20s, ...
-        let exp = attempt - 4;
-        // exp 钳位到「5*2^exp 首次 ≥ 封顶」处：超过后 min(cap) 恒为 cap，再增大
-        // 只会溢出。cap/5 取 log2；cap<5 时钳到 0（恒返回 cap）。另受 1<<exp
-        // 不溢出约束（exp ≤ 63），双 min 保证 saturating_mul 不会真的溢出。
-        let cap_exp = u64::BITS - (max_backoff_secs / 5).max(1).leading_zeros();
-        let overflow_exp = u64::BITS - 1 - 2; // 5 * 2^exp ≤ u64::MAX ⇒ exp ≤ 61
-        let exp = exp.min(cap_exp).min(overflow_exp);
-        let secs = 5u64.saturating_mul(1u64 << exp);
-        std::time::Duration::from_secs(secs.min(max_backoff_secs))
-    }
-}
+pub use aproxy_ipc::config_file::delay_for_attempt;
 
 /// 判断 HTTP 状态码是否应重试。
 ///

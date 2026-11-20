@@ -124,7 +124,7 @@ regex = "1"
 aproxy-envelope = { version = "=0.2.0-alpha.3", path = "aproxy-envelope" }
 # aproxy 与同它打交道的程序共用的契约（home 的解析、进程台账）。version + path 双写、
 # `=` 精确钉住、由 align-version.py 改写，理由都同上。
-aproxy-ipc = { version = "=0.2.0-alpha.3", path = "aproxy-ipc" }
+aproxy-ipc = { version = "=0.2.0-alpha.3", path = "aproxy-ipc", features = ["config-file"] }
 # 桌面界面（desktop 特性）：Tauri 外壳与嵌入的前端。version + path 双写，理由同上；
 # 版本与本包同步。它不依赖本包（否则成环），需要的东西（home、运行时）由 bin 在启动
 # 界面时传进去。版本要求用 `=` 精确钉住：两者总是同号一起发布，aproxy-desktop 的接口

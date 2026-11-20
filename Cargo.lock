@@ -186,10 +186,12 @@ version = "0.2.0-alpha.3"
 dependencies = [
  "libc",
  "memchr",
+ "regex",
  "serde",
  "serde_json",
  "sha2 0.11.1",
  "tempfile",
+ "toml_edit 0.25.17+spec-1.1.0",
  "windows-sys 0.52.0",
 ]
 

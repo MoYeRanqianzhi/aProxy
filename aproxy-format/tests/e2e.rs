@@ -2089,3 +2089,98 @@ fn rewrite_refuses_secret_assignments_but_can_remove_them() {
     let r = worker.frame(request("https://a.test/", "/", json!({})));
     assert_eq!(r["request"]["headers"], json!({}));
 }
+
+/// 从生成物到有限上游样例完整试跑。路径与正文可以携带私有值，但所有可见步骤只能给出结构投影。
+#[test]
+fn tools_try_runs_the_sample_chain_without_exposing_the_sample() {
+    let d = tempfile::tempdir().unwrap();
+    let binary = env!("CARGO_BIN_EXE_aproxy-format");
+    let init = Command::new(binary)
+        .args(["init", "adaptive-relay", "--output"])
+        .arg(d.path())
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    let config = d.path().join("config.toml");
+    let sample = d.path().join("request.json");
+    let check = Command::new(binary)
+        .arg("check")
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(check.status.success(), "{check:?}");
+    let token = "private-fixture-392";
+    let corpus: Value = serde_json::from_str(include_str!("fixtures/protocols.json")).unwrap();
+    let request = json!({"path":format!("/v1/messages?auth={token}"),"headers":{"authorization":token},"body":{"model":"m","messages":[{"role":"user","content":token}],"max_tokens":8},"attempts":[{"status":503,"headers":{"retry-after":"0"}},{"status":200,"headers":{"content-type":"application/json"},"body":corpus["openai_chat"]["response"]}]});
+    std::fs::write(&sample, request.to_string()).unwrap();
+    let result = Command::new(binary)
+        .arg("try")
+        .arg(&config)
+        .arg("--request")
+        .arg(&sample)
+        .env("RELAY_KEY_A", token)
+        .env("RELAY_KEY_B", token)
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{result:?}");
+    let text = String::from_utf8(result.stdout).unwrap();
+    assert!(
+        !text.contains(token) && !text.contains("relay.example.com") && !text.contains("\"state\"")
+    );
+    assert!(!String::from_utf8_lossy(&result.stderr).contains(token));
+    let rows: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let steps: Vec<_> = rows
+        .iter()
+        .map(|r| (r["stage"].as_str().unwrap(), r["role"].as_str().unwrap()))
+        .collect();
+    for step in [
+        ("hello", "adaptive"),
+        ("request", "adaptive"),
+        ("request", "convert"),
+        ("request", "keys"),
+        ("decide", "adaptive"),
+        ("retry", "keys"),
+        ("stream:open", "convert"),
+        ("stream:data", "convert"),
+        ("stream:close", "convert"),
+        ("notify", "adaptive"),
+    ] {
+        assert!(steps.contains(&step), "{step:?} {text}");
+    }
+    assert!(
+        rows.iter()
+            .any(|r| r["stage"] == "result" && r["output"]["status"] == 200)
+    );
+}
+/// 默认连外部进程都不启动。显式授权后同一份无害测试命令留下标记，但它不懂握手，不能取得后续帧。
+#[test]
+fn dry_run_external_execution_requires_opt_in_and_discloses_the_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let fixture = root.join(format!("sample-peer{}", std::env::consts::EXE_SUFFIX));
+    let binary = env!("CARGO_BIN_EXE_aproxy-format");
+    std::fs::copy(binary, &fixture).unwrap();
+    let marker = root.join("observed");
+    let file = root.join("config.toml");
+    let sample = root.join("s.json");
+    std::fs::write(&sample, r#"{"path":"/","body":"private-fixture"}"#).unwrap();
+    std::fs::write(&file,format!("base_url='https://relay.test'\n[[format]]\nname='peer'\ncommand={}\nargs=['init','key-rotation','--output',{}]\nstages=['request']\nrequired=false",json!(fixture),json!(marker))).unwrap();
+    for allow in [false, true] {
+        let mut cmd = Command::new(binary);
+        cmd.arg("try").arg(&file).arg("--request").arg(&sample);
+        if allow {
+            cmd.arg("--allow-external");
+        }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(marker.join("config.toml").exists(), allow);
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(err.contains("外部程序会收到样例和环境变量"), allow);
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(text.contains("skipped"));
+        assert!(!text.contains("private-fixture") && !err.contains("private-fixture"));
+    }
+}

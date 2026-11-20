@@ -140,7 +140,7 @@ impl Pool {
 }
 impl Keys {
     /// 在 hello 前检查份额总数、认证名与 origin 的唯一性。
-    pub fn load(path: &str) -> Result<Self, String> {
+    pub fn load(path: &str, variables: &config::Variables) -> Result<Self, String> {
         let mut cfg: Self = config::load(path)?;
         let mut origins = std::collections::HashSet::new();
         if cfg.pool.is_empty() {
@@ -156,7 +156,7 @@ impl Keys {
             }
             pool.origin = url.origin().ascii_serialization();
             for key in &mut pool.keys {
-                key.value = config::credential(&key.env, &pool.scheme)
+                key.value = config::credential(&key.env, &pool.scheme, variables)
                     .map_err(|f| format!("环境变量 {:?}：{}", key.env, f.local))?;
             }
             pool.header = config::credential_header(&pool.header)?.to_string();

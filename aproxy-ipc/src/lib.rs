@@ -13,6 +13,8 @@
 //! 本包不打印、不结束进程：这两件事属于调用它的程序。
 
 pub mod code;
+#[cfg(feature = "config-file")]
+pub mod config_file;
 pub mod diag;
 pub mod endpoint;
 pub mod home;

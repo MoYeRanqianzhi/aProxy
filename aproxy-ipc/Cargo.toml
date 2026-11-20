@@ -18,7 +18,13 @@ include = ["/src/**", "/Cargo.toml"]
 
 # 依赖刻意保持很少：本包会被 aproxy 本体、桌面界面与第三方的客户端一起链接，这里每多一个
 # 依赖，它们的编译闭包就都多一个。新增依赖之前先看能不能用标准库写。
+[features]
+# 只使用 IPC、台账或脱敏的客户端不必链接配置解析器。
+config-file = ["dep:toml_edit", "dep:regex"]
+
 [dependencies]
+toml_edit = { version = "0.25", optional = true }
+regex = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # home_id：run 目录规范化路径的 SHA-256（src/endpoint.rs）。与 aproxy 用同一个版本线

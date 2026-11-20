@@ -4,6 +4,7 @@ mod adaptive;
 mod config;
 mod convert;
 mod detect;
+mod dryrun;
 mod events;
 mod heartbeat;
 mod keys;
@@ -11,6 +12,7 @@ mod policy;
 mod rewrite;
 mod route;
 mod selection;
+mod tools;
 mod translate;
 use crate::config::Fault;
 use aproxy_envelope as w;
@@ -69,7 +71,10 @@ impl<'a> Options<'a> {
 impl Role {
     /// 握手前完成静态配置检查，不会用半套配置处理请求。
     fn load(name: &str, args: &[String]) -> Result<Self, String> {
-        let opt = Options::parse(args)?;
+        Self::configured(name, Options::parse(args)?, config::Variables::default())
+    }
+    /// 工具与协议进程复用同一份加载与校验；只隔离角色文件的位置和环境作用域。
+    fn configured(name: &str, opt: Options<'_>, vars: config::Variables) -> Result<Self, String> {
         if name == "convert" {
             return Ok(Self::Convert(match (opt.config, opt.from, opt.to) {
                 (Some(p), None, None) => {
@@ -88,10 +93,15 @@ impl Role {
             "heartbeat" => Self::Heartbeat(heartbeat::Heartbeat::load(opt.config)?),
             "policy" => Self::Policy(policy::Policy::load(opt.config)?),
             "rewrite" => Self::Rewrite(rewrite::Rewrite::load(opt.config)?),
-            "keys" => Self::Keys(keys::Keys::load(opt.config.ok_or("keys 需要 --config")?)?),
-            "route" => Self::Route(route::Route::load(
-                opt.config.ok_or("route 需要 --config")?,
+            "keys" => Self::Keys(keys::Keys::load(
+                opt.config.ok_or("keys 需要 --config")?,
+                &vars,
             )?),
+            "route" => {
+                let mut r = route::Route::load(opt.config.ok_or("route 需要 --config")?)?;
+                r.variables = vars;
+                Self::Route(r)
+            }
             "adaptive" => Self::Adaptive(adaptive::Adaptive::load(opt.config)?),
             _ => return Err(USAGE.into()),
         })
@@ -339,12 +349,14 @@ fn translate_once(args: &[String]) -> Result<(), &'static str> {
     emit(&mut std::io::stdout().lock(), &value)
 }
 /// 角色命令只选一个职责；工具子命令不入协议循环。
-const USAGE: &str =
-    "用法: aproxy-format <convert|keys|route|policy|adaptive|rewrite|heartbeat|translate> [参数]";
+const USAGE: &str = "用法: aproxy-format <convert|keys|route|policy|adaptive|rewrite|heartbeat|init|check|try|translate> [参数]";
 /// 失败诊断始终写 stderr，不破坏 stdout 上的逐行协议。
 pub fn run() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
+        Some((name, rest)) if matches!(name.as_str(), "init" | "check" | "try") => {
+            tools::run(name, rest)
+        }
         Some((name, rest)) if name == "translate" => translate_once(rest).map_err(String::from),
         Some((name, rest)) => Role::load(name, rest).and_then(|role| {
             worker(

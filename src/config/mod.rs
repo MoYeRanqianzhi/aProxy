@@ -25,7 +25,7 @@ pub mod view;
 
 use std::{collections::HashMap, path::PathBuf};
 
-pub use file::RetryRule;
+pub use file::{KeepaliveTrigger, KeySegment, RetryRule, parse_key_path};
 pub use resolve::{Overrides, Resolved, Source, resolve};
 
 /// 心跳的内置默认值：SSE 注释，合法 SSE 客户端按规范忽略。
@@ -67,46 +67,6 @@ pub const DEFAULT_DISK_CACHE: bool = true;
 /// 仅转发模式的内置默认值（关）。语义与代价见 Config::forward_only——
 /// 开启即放弃本产品最核心的重试保障，故默认必须为关。
 pub const DEFAULT_FORWARD_ONLY: bool = false;
-/// 保活触发条件（`keepalive_trigger` 的取值）：哪些请求在等待上游与重试期间走
-/// 「先向客户端提交响应头、再用 SSE 注释心跳保活」的通道。语义详见
-/// `Config::keepalive_trigger` 字段说明。
-///
-/// 配置层存的是原始字符串（toml / settings.json 都是），由本枚举的 `parse`
-/// 统一解释：非法值要在 validate() 里点名字段报错——若直接让 serde 解析成
-/// 枚举，settings.json 里的一个笔误会让整个文件解析失败、静默回退成全默认
-/// （连别名一起丢），用户看不到是哪个字段错了。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeepaliveTrigger {
-    /// 客户端 Accept 头含 `text/event-stream`（0.1.0 之前的唯一判定）
-    Accept,
-    /// 客户端原始请求体是 JSON 对象且顶层 `"stream": true`
-    BodyStream,
-    /// 两者任一（内置默认）
-    Any,
-}
-
-impl KeepaliveTrigger {
-    /// 配置里的写法 → 枚举；不认识的写法返回 None（validate 据此报错）。
-    /// 只认小写原文，与 `mode = "persistent"` 等枚举字段的严格程度一致。
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "accept" => Some(Self::Accept),
-            "body_stream" => Some(Self::BodyStream),
-            "any" => Some(Self::Any),
-            _ => None,
-        }
-    }
-
-    /// 枚举 → 配置里的写法（`parse` 的逆）
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Accept => "accept",
-            Self::BodyStream => "body_stream",
-            Self::Any => "any",
-        }
-    }
-}
-
 /// 保活触发条件的内置默认值：`any`。真实 Claude Code 的流式主请求是
 /// `Accept: application/json` + 请求体 `"stream": true`（2026-10-04 实测），
 /// 只看 Accept 的旧判定让它永远进不了保活通道——默认必须把请求体也算进来。
@@ -300,7 +260,7 @@ fn default_keepalive_secs() -> u64 {
 }
 
 fn default_max_backoff_secs() -> u64 {
-    320
+    aproxy_ipc::config_file::DEFAULT_BACKOFF_SECS
 }
 
 fn default_spool_limit_mb() -> u64 {
@@ -707,7 +667,7 @@ impl Config {
     /// ——不含元字符的普通路径即精准匹配，通配需显式写 `.*`。配置的解析与
     /// AppState::new 共用此入口，两处语义不可能分叉。
     pub fn compile_bounded_retry_pattern(pattern: &str) -> Result<regex::Regex, regex::Error> {
-        regex::Regex::new(&format!("^(?:{pattern})$"))
+        file::compile_retry_pattern(pattern)
     }
 
     /// 入站 Host 白名单条目（同 bounded_retry_paths 的注入/回退语义：toml 显式
@@ -910,59 +870,6 @@ pub struct Problem {
     pub reason: Option<&'static str>,
     /// 一句英文说明，URL 已打码
     pub message: String,
-}
-
-/// 键路径里的一段：名字，以及（数组里的条目）下标。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeySegment {
-    pub name: String,
-    pub index: Option<usize>,
-}
-
-/// 解析键路径：点号分隔，名字里有点号等字符时加引号，数组条目带下标，例如
-/// `retry.max_backoff_secs`、`extra_headers."x.y"`、`format[1].stages`。写法不对时返回 None。
-pub fn parse_key_path(path: &str) -> Option<Vec<KeySegment>> {
-    let mut segments = Vec::new();
-    let mut rest = path;
-    loop {
-        let name;
-        if let Some(quoted) = rest.strip_prefix('"') {
-            // 带引号的一段：反斜杠转义它后面的一个字符
-            let mut out = String::new();
-            let mut chars = quoted.char_indices();
-            let end = loop {
-                match chars.next()? {
-                    (i, '"') => break i,
-                    (_, '\\') => out.push(chars.next()?.1),
-                    (_, c) => out.push(c),
-                }
-            };
-            name = out;
-            rest = &quoted[end + 1..];
-        } else {
-            let end = rest.find(['.', '[']).unwrap_or(rest.len());
-            name = rest[..end].to_string();
-            let bare = !name.is_empty()
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
-            if !bare {
-                return None;
-            }
-            rest = &rest[end..];
-        }
-        let mut index = None;
-        if let Some(after) = rest.strip_prefix('[') {
-            let close = after.find(']')?;
-            index = Some(after[..close].parse().ok()?);
-            rest = &after[close + 1..];
-        }
-        segments.push(KeySegment { name, index });
-        if rest.is_empty() {
-            return Some(segments);
-        }
-        rest = rest.strip_prefix('.')?;
-    }
 }
 
 /// 把一个名字写成 TOML 键路径里的一段：裸键原样，其余加引号（`x-api-key` 是裸键，

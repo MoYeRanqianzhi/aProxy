@@ -104,27 +104,29 @@ impl Role {
             }
         })
     }
+    /// 能力同时约束握手与消息分派，配置不启用的回程也不能进入角色处理器。
+    fn stages(&self) -> &'static [&'static str] {
+        match self {
+            Self::Convert(_) => &["request", "retry", "response", "stream"],
+            Self::Keys(_) | Self::Rewrite => &["request", "retry"],
+            Self::Route(route) => route.stages(),
+            Self::Policy => &["decide"],
+            Self::Adaptive => &["request", "decide", "notify"],
+            Self::Heartbeat(_) => &["heartbeat"],
+        }
+    }
     /// 订阅声明是上限；实例最终只向配置选中的阶段写帧。摘要协商不能退化为默认的 full。
     fn hello(&self, name: &str) -> w::HelloReply {
         use w::BodyNeed::{Digest, Full, None};
-        let (stages, needs): (&[&str], &[(&str, w::BodyNeed)]) = match self {
-            Self::Convert(_) => (
-                &["request", "retry", "response", "stream"],
-                &[("request", Full), ("retry", Full)],
-            ),
-            Self::Keys(_) | Self::Rewrite => {
-                (&["request", "retry"], &[("request", None), ("retry", None)])
-            }
-            Self::Route(route) => (route.stages(), &[("request", Full), ("retry", Full)]),
-            Self::Policy => (&["decide"], &[("decide", None)]),
-            Self::Adaptive => (
-                &["request", "decide", "notify"],
-                &[("request", Digest), ("decide", None), ("notify", Digest)],
-            ),
-            Self::Heartbeat(_) => (&["heartbeat"], &[]),
+        let needs: &[(&str, w::BodyNeed)] = match self {
+            Self::Convert(_) | Self::Route(_) => &[("request", Full), ("retry", Full)],
+            Self::Keys(_) | Self::Rewrite => &[("request", None), ("retry", None)],
+            Self::Policy => &[("decide", None)],
+            Self::Adaptive => &[("request", Digest), ("decide", None), ("notify", Digest)],
+            Self::Heartbeat(_) => &[],
         };
         let mut reply = w::HelloReply::new(
-            stages.iter().map(|s| s.to_string()).collect(),
+            self.stages().iter().map(|s| s.to_string()).collect(),
             name.into(),
             env!("CARGO_PKG_VERSION").into(),
         );
@@ -137,7 +139,20 @@ impl Role {
     /// 只在角色声明过的方向产生补丁；业务拒绝是带 seq 的正常回信，不打断持久进程。
     fn handle(&mut self, m: &w::Message) -> w::Reply {
         let mut r = w::Reply::new(m.seq);
+        let stage = match &m.stage {
+            w::Stage::Request(_) => "request",
+            w::Stage::Retry(_) => "retry",
+            w::Stage::Response(_) => "response",
+            w::Stage::Stream(_) => "stream",
+            w::Stage::Decide(_) => "decide",
+            w::Stage::Notify(_) => "notify",
+            w::Stage::Heartbeat(_) => "heartbeat",
+            _ => "",
+        };
         let result = match &m.stage {
+            _ if !self.stages().contains(&stage) => {
+                Err(Fault::new("阶段不受支持", "unsupported stage"))
+            }
             w::Stage::Request(input) => self.request(input, &mut r),
             w::Stage::Retry(retry) => self.request(&retry.input, &mut r),
             w::Stage::Response(response) => match self {

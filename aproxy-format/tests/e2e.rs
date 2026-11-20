@@ -618,3 +618,22 @@ fn failed_response_conversion_replaces_the_entire_upstream_entity() {
         }
     }
 }
+
+/// 同一套分派入口不能让共享处理函数的阶段悄悄越过 hello 的能力上限。
+#[test]
+fn dispatch_rejects_stages_not_in_the_configured_hello() {
+    let mut a = Worker::new(&["adaptive"]);
+    let mut m = request("https://a.test/", "/", Value::Null);
+    m["stage"] = "retry".into();
+    m["retry"] = json!({"attempt":2,"elapsed_ms":10,"last_failure":{"code":"upstream_failed"}});
+    let r = a.frame(m);
+    assert_eq!(r["fail"]["reason"], "unsupported stage", "{r}");
+    assert!(r.get("delivery").is_none());
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("route.toml");
+    std::fs::write(&file, "[[channel]]\nid='b'\nurl='https://b.test'").unwrap();
+    let mut route = Worker::new(&["route", "--config", file.to_str().unwrap()]);
+    let r = route.frame(response(&Value::Null, "{}"));
+    assert_eq!(r["fail"]["reason"], "unsupported stage");
+    assert!(r.get("response").is_none());
+}

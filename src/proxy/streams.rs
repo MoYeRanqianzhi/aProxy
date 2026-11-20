@@ -127,6 +127,15 @@ impl std::io::Write for DecodeOutput {
         Ok(())
     }
 }
+/// 解码器与结尾校验都会读到 EOF。Read 允许重复读取 EOF，底层 unfold 却不能再次 poll。
+fn decoder_input(input: Flow, out: mpsc::Sender<Result<Bytes, End>>) -> Flow {
+    futures_util::stream::unfold((input, out), |(mut f, tx)| async move {
+        let item = tokio::select! {biased; _=tx.closed()=>None,v=f.next()=>v};
+        item.map(|v| (v, (f, tx)))
+    })
+    .fuse()
+    .boxed()
+}
 /// 用流读端桥接既有的严格 gzip/br/zstd/deflate 解码器。等上游的 read 也能被下游断开唤醒。
 fn decode(input: Flow, encoding: String, limit: usize) -> Flow {
     let (tx, rx) = mpsc::channel(1);
@@ -147,11 +156,7 @@ fn decode(input: Flow, encoding: String, limit: usize) -> Flow {
                 let mut failure = None;
                 let mut output = DecodeOutput(out.clone());
                 let result = {
-                    let stream =
-                        futures_util::stream::unfold((input, out), |(mut f, tx)| async move {
-                            let item = tokio::select! {biased; _=tx.closed()=>None,v=f.next()=>v};
-                            item.map(|v| (v, (f, tx)))
-                        })
+                    let stream = decoder_input(input, out)
                         .map(|v| {
                             v.map_err(|end| {
                                 failure = Some(end);
@@ -852,6 +857,14 @@ mod tests {
             b"\xff"
         );
         assert_eq!(carry, b"\xe2");
+    }
+    /// 严格解码器确认成员结束之后，排空检查再次读取同一个输入仍得到 EOF。
+    #[tokio::test]
+    async fn decode_input_eof_can_be_read_twice() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut input = decoder_input(futures_util::stream::empty().boxed(), tx);
+        assert!(input.next().await.is_none());
+        assert!(input.next().await.is_none());
     }
     /// zlib 的前两字节分属不同网络块仍应识别包装，而不是把第一个单字节当成裸 deflate。
     #[tokio::test]

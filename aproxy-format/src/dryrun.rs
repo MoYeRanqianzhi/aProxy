@@ -934,8 +934,11 @@ fn rehearse(
             failure.is_some(),
             t.mode,
         );
-        let (retry, reroute, stop) =
-            t.decide(&req, resp.as_ref(), failure.as_ref(), n, base_retry)?;
+        let (retry, reroute, stop) = if t.mode == "forward" && failure.is_none() {
+            (false, false, None)
+        } else {
+            t.decide(&req, resp.as_ref(), failure.as_ref(), n, base_retry)?
+        };
         if retry {
             if t.mode == "forward" {
                 upgraded = true;
@@ -953,7 +956,9 @@ fn rehearse(
         let mut response = resp.unwrap_or_else(|| w::Response::new(502));
         if let Some(p) = stop {
             response.apply(p);
-        } else if failure.is_none() {
+        } else if failure.is_none()
+            && (t.mode != "forward" || (200..300).contains(&response.status))
+        {
             t.deliver(&req, &mut response, chunks, attempt.interrupted, n)?;
         }
         trace(
@@ -1034,6 +1039,26 @@ mod tests {
         );
         assert!(!json!(rows).to_string().contains("secret-fixture"));
     }
+    /// 直通成功不征询要求观察成功的策略；重定向也不能误入回程转换。
+    #[test]
+    fn forward_success_never_votes_and_redirects_bypass_return_layers() {
+        let p = "delivery='forward'\n[[format]]\nname='policy'\ncommand='aproxy-format'\nargs=['policy','--config','policy.toml']\nstages=['decide']\n[[format]]\nname='convert'\ncommand='aproxy-format'\nargs=['convert','--from','openai_chat','--to','openai_chat']\nstages=['response']";
+        for status in [200, 302] {
+            let (result, rows) = trace_sample(
+                p,
+                json!({"path":"/","body":{},"attempts":[{"status":status,"body":{}}]}),
+                &[(
+                    "policy.toml",
+                    "[[rule]]\nstatus=[200,302]\ndecision='retry'",
+                )],
+            );
+            result.unwrap();
+            assert!(!rows.iter().any(|r| r["stage"] == "decide"));
+            assert_eq!(rows.iter().any(|r| r["stage"] == "response"), status == 200);
+            assert_eq!(rows.last().unwrap()["output"]["status"], status);
+        }
+    }
+
     /// 规则按声明先后生效，不对没有上游头的故障套状态规则；覆盖、直通与成功分别说明来源。
     #[test]
     fn dry_fallback_preserves_sources_and_backoff() {

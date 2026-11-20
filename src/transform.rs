@@ -197,6 +197,8 @@ impl std::fmt::Display for StartupError {
 pub(crate) struct ExchangeCtx {
     /// 请求链共享的请求标识。
     pub(crate) request_id: Arc<str>,
+    /// 客户端 HEAD 响应不交付正文，不受上游方法改写影响。
+    pub(crate) client_head: bool,
     /// 客户端路径与流标记不受路由改写影响。
     pub(crate) client: wire::Client,
     /// 双向转发的上传与下载可同时推进；各阶段在派发时取值，不缓存上游响应头到达时的旧值。
@@ -213,12 +215,14 @@ impl ExchangeCtx {
     pub(crate) fn new(
         request_id: Arc<str>,
         path: &str,
+        client_head: bool,
         stream: impl Into<Option<bool>>,
         rec: crate::history::Recorder,
     ) -> Self {
         let stream = stream.into();
         Self {
             request_id,
+            client_head,
             client: wire::Client::new(path.into(), stream),
             live_stream: stream.is_none().then(Default::default),
             digest: Default::default(),

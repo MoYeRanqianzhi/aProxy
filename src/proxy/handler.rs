@@ -120,6 +120,7 @@ async fn handle(
         ExchangeCtx::new(
             trace.request_id.clone(),
             path_and_query,
+            method == http::Method::HEAD,
             head_stream,
             trace.rec.clone(),
         )

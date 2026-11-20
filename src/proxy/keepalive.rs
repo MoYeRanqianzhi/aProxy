@@ -50,6 +50,8 @@ pub(super) enum KeepaliveSink {
 #[derive(Clone)]
 pub(super) struct Heartbeat {
     pub(super) fixed: Bytes,
+    /// open 等待期间仍可能提交骨架；仅含流程序的请求把提交点共享给每层的头补丁判定。
+    pub(super) stream_commit: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub(super) dynamic: Option<Arc<DynamicHeartbeat>>,
     /// 这个请求在请求历史里的记录：每发出一个心跳记一次
     pub(super) rec: crate::history::Recorder,
@@ -255,6 +257,9 @@ impl KeepaliveSink {
             .into_response();
         if resp_tx.send(resp).is_err() {
             return false;
+        }
+        if let Some(sent) = &beat.stream_commit {
+            sent.store(true, std::sync::atomic::Ordering::Release);
         }
         *self = Self::Committed {
             tx,

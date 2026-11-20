@@ -160,6 +160,7 @@ impl Responder {
                 beat: Heartbeat {
                     fixed: Bytes::copy_from_slice(state.config.keepalive_heartbeat()),
                     dynamic: None,
+                    stream_commit: state.has_format(Stage::Stream).then(Default::default),
                     rec,
                 },
             },
@@ -697,14 +698,7 @@ pub(super) async fn run_attempts(
                 } => rec.try_ended(attempt, response.body.len(), Some(failure.for_history())),
                 Outcome::TooLarge | Outcome::SpoolFailed(..) => (),
             }
-            let query = decide::consult(
-                state,
-                &req,
-                &outcome,
-                attempt,
-                started.elapsed(),
-                override_max,
-            );
+            let query = decide::consult(state, &req, &outcome, attempt, started, override_max);
             let preserve_non_sse =
                 matches!(&outcome, Outcome::Deliver(v) if !is_event_stream(&v.headers));
             let Some(votes) = r
@@ -920,7 +914,7 @@ pub(super) async fn run_attempts(
                 if retrying.take().is_some() {
                     state.stats.note_rescued();
                 }
-                deliver(state, r, &req, &trace, response, max_spool_bytes).await;
+                deliver(state, r, &req, &trace, attempt, response, max_spool_bytes).await;
                 return;
             }
             Outcome::Exhausted {
@@ -1060,6 +1054,7 @@ async fn deliver(
     r: &mut Responder,
     req: &OutboundRequest,
     trace: &RequestTrace,
+    logical_attempt: u32,
     response: UpstreamResponse,
     max_spool_bytes: usize,
 ) {
@@ -1079,11 +1074,19 @@ async fn deliver(
         rec.phase(Phase::Transforming);
         let meta =
             aproxy_envelope::RequestMeta::new(req.method.to_string(), req.target_url.clone());
+        let committed = match &*r {
+            Responder::Keepalive {
+                sink: KeepaliveSink::Pending { beat, .. } | KeepaliveSink::Committed { beat, .. },
+                ..
+            } => beat.stream_commit.clone(),
+            Responder::Buffered { .. } => None,
+        };
         let setup = streams::chain(
             state,
             req.ctx.as_ref().expect("format context"),
             &meta,
-            attempt,
+            logical_attempt,
+            committed,
             status,
             headers,
             streams::Content::Saved(body),

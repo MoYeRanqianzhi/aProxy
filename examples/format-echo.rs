@@ -369,6 +369,9 @@ fn main() {
                     }
                     r["seq"] = json!(seq + 1);
                 }
+                "reject-first-request" if count == 1 && stage == "request" => {
+                    r["fail"] = json!({"retry":true,"reason":"first request"})
+                }
                 "error" => r["fail"] = json!({"retry":false,"reason":reason}),
                 // 大状态与二进制样例从临时文件读，不受系统命令行长度上限影响。
                 "reply-by-stage" => {

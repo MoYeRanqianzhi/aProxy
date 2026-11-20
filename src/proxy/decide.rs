@@ -138,7 +138,7 @@ async fn observed(upstream: &UpstreamResponse) -> Option<wire::ObservedResponse>
     }
     r.body = body;
     let mut observed = wire::ObservedResponse::new(r);
-    observed.truncated = (skipped != 0).then_some(skipped);
+    observed.truncated = Some((skipped != 0).then_some(skipped));
     Some(observed)
 }
 
@@ -148,7 +148,7 @@ pub(super) async fn consult(
     req: &OutboundRequest,
     outcome: &Outcome,
     attempt: u32,
-    elapsed: Duration,
+    started: tokio::time::Instant,
     limit: Option<u32>,
 ) -> Result<Votes, Terminal> {
     use wire::Decision::{Retry, Stop};
@@ -280,7 +280,7 @@ pub(super) async fn consult(
         let mut msg = wire::DecideMessage::new(
             ctx.body_context(name, need),
             attempt,
-            elapsed.as_millis() as u64,
+            started.elapsed().as_millis() as u64,
             if forward {
                 wire::Delivery::Forward
             } else {

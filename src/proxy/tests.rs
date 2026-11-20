@@ -185,6 +185,7 @@ fn committed_sink(
         at: tokio::time::Instant::now() - waited,
         heartbeats_only,
         beat: Heartbeat {
+            stream_commit: None,
             fixed: Bytes::from_static(b": keepalive\n\n"),
             dynamic: None,
             rec: crate::history::Recorder::none(),
@@ -213,6 +214,7 @@ fn heartbeat_only_disconnect_logs_generic_client_hint() {
         resp_tx: None,
         skeleton_due: false,
         beat: Heartbeat {
+            stream_commit: None,
             fixed: Bytes::new(),
             dynamic: None,
             rec: crate::history::Recorder::none(),
@@ -265,6 +267,7 @@ async fn dynamic_heartbeat_arriving_after_replay_started_is_dropped() {
         ctx: ExchangeCtx::new(
             "1".into(),
             "/v1/messages",
+            false,
             true,
             crate::history::Recorder::none(),
         ),
@@ -314,7 +317,13 @@ async fn completed_late_heartbeat_and_next_tick_publish_only_eligible_bytes() {
     let (mut sink, mut rx, _gone) = committed_sink(Duration::ZERO, true);
     sink.arm_dynamic_heartbeat(Arc::new(DynamicHeartbeat {
         pools: vec![pool].into(),
-        ctx: ExchangeCtx::new("1".into(), "/test", true, crate::history::Recorder::none()),
+        ctx: ExchangeCtx::new(
+            "1".into(),
+            "/test",
+            false,
+            true,
+            crate::history::Recorder::none(),
+        ),
         last: Default::default(),
         seq: Default::default(),
         attempt: Default::default(),
@@ -986,6 +995,7 @@ async fn queued_format_calls_only_read_the_spool_after_admission() {
             ctx: Some(ExchangeCtx::new(
                 "id".into(),
                 "/",
+                false,
                 false,
                 crate::history::Recorder::none(),
             )),

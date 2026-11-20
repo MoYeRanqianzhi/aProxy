@@ -151,6 +151,7 @@ impl RequestChain {
                 if i == self.cursor {
                     needs_full(current)
                 } else {
+                    // 尚未借到的后续层以最近一次成功 hello 为准，不为预测将来换进程而占池。
                     pool.available_for_message()
                         && pool
                             .negotiated

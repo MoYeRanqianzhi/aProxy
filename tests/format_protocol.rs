@@ -3477,16 +3477,28 @@ async fn mid_stream_failure_writes_abort_tail() {
 #[tokio::test]
 async fn optional_stream_program_failing_mid_stream_is_skipped() {
     let home = TestHome::new();
-    let (up, _) = upstream(&[200]).await;
-    let cfg = layer(&home, "outer", "'stream'", &["stream-echo"])
+    let (up, release) = split_forward_upstream().await;
+    let cfg = String::from("delivery='forward'\n")
+        + &layer(&home, "outer", "'stream'", &["stream-echo"])
         + &layer(&home, "inner", "'stream'", &["stream-fault"])
         + "required=false\n";
     let (client, url) = running(&home, up, &cfg);
-    assert_eq!(
-        client.get(url).send().await.unwrap().text().await.unwrap(),
-        "[[upstream bytes]"
-    );
+    let mut resp = client.get(url).send().await.unwrap();
+    let mut prefix = Vec::new();
+    while prefix.len() < 7 {
+        prefix.extend_from_slice(&resp.chunk().await.unwrap().unwrap());
+    }
+    assert_eq!(prefix, b"[[first");
+    release.notify_one();
+    assert_eq!(resp.text().await.unwrap(), "last]");
     assert_eq!(frames(&home, "outer").last().unwrap()["event"], "close");
+    assert_eq!(
+        frames(&home, "inner")
+            .iter()
+            .filter(|m| m["event"] == "data")
+            .count(),
+        1
+    );
 }
 
 /// 客户端在内层 data 往返中断开：先观察外层 abort 再放行内层，禁止把迟到的 data 回信读成 abort 回信。
@@ -3825,6 +3837,10 @@ async fn decide_sees_interrupted_head_but_stop_does_not_inherit_it() {
         let h = &f[1]["response"];
         assert_eq!(h["status"], 503);
         assert_eq!(h["headers"]["retry-after"], "7");
+        assert!(
+            h.get("truncated").is_none(),
+            "head alone does not describe a body: {h}"
+        );
         assert!(h.get("body").is_none() && h.get("body_b64").is_none());
     }
 }
@@ -4636,7 +4652,8 @@ async fn forward_200_error_body_is_recorded_as_upstream_error() {
                 "watch",
                 "'decide'",
                 &["reply", r#"{"decision":"retry"}"#],
-            );
+            )
+            + &layer(&home, "end", "'notify'", &["echo"]);
         let (c, url) = running(&home, up, &cfg);
         let resp = c.get(&url).send().await.unwrap();
         assert_eq!(resp.status(), 200);
@@ -4654,6 +4671,9 @@ async fn forward_200_error_body_is_recorded_as_upstream_error() {
         let rec = &out["requests"][0];
         assert_eq!(rec["outcome"], "upstream_error", "{out}");
         assert_eq!(rec["code"], "upstream_failed");
+        let end = &observed_stage(&home, "end", "notify", 1).await[0];
+        assert_eq!(end["outcome"], rec["outcome"]);
+        assert_eq!(end["code"], rec["code"]);
         assert_eq!(rec["tries"][0]["code"], "upstream_error_body");
         assert_eq!(frames(&home, "watch").len(), 1);
     }
@@ -5059,4 +5079,228 @@ async fn live_empty_upload_notify_hashes_the_empty_representation() {
         observed_stage(&home, "empty", "notify", 1).await[0]["digest"],
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     );
+}
+
+/// 第一次仅被程序拒绝、没有发上游；回放帧的编号仍与实际尝试记录而非发送次数相同。
+#[tokio::test]
+async fn replay_stream_id_after_a_request_stage_failure_uses_the_logical_attempt() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[200]).await;
+    let cfg = layer(
+        &home,
+        "gate",
+        "'request','retry'",
+        &["reject-first-request"],
+    ) + &layer(&home, "convert", "'stream'", &["stream-echo"]);
+    let (c, url) = running(&home, up, &cfg);
+    assert_eq!(
+        c.get(&url).send().await.unwrap().text().await.unwrap(),
+        "[upstream bytes]"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    let events = observed_stage(&home, "convert", "stream", 3).await;
+    let id = events[0]["request_id"].as_str().unwrap();
+    let rec = request_detail(&home, &url, id).await;
+    assert_eq!(rec["record"]["tries"].as_array().unwrap().len(), 2);
+    assert!(
+        events.iter().all(|m| m["stream_id"] == format!("{id}/2")),
+        "{events:?}"
+    );
+}
+
+/// 第一位策略程序实际持有票时才开始暂停；后一位必须计入这段等待，不得复用第一帧的毫秒数。
+#[tokio::test]
+async fn later_decide_elapsed_includes_the_previous_voters_wait() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[503]).await;
+    let gate = home.path().join("release-vote");
+    let cfg = layer(
+        &home,
+        "first",
+        "'decide'",
+        &["gate-decide", gate.to_str().unwrap()],
+    ) + &layer(
+        &home,
+        "last",
+        "'decide'",
+        &["reply", r#"{"decision":"stop"}"#],
+    );
+    let (c, url) = running(&home, up, &cfg);
+    let request = tokio::spawn(c.get(url).send());
+    let first = observed_stage(&home, "first", "decide", 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    std::fs::write(gate, b"ready").unwrap();
+    request.await.unwrap().unwrap().bytes().await.unwrap();
+    let last = observed_stage(&home, "last", "decide", 1).await;
+    assert!(
+        last[0]["elapsed_ms"].as_u64().unwrap() >= first[0]["elapsed_ms"].as_u64().unwrap() + 119,
+        "first {first:?}; last {last:?}"
+    );
+}
+
+/// 骨架头先真正交付，内层 open 随后试改状态和头。外层看到的必须仍是未打补丁的上游元数据。
+#[tokio::test]
+async fn committed_open_patches_do_not_change_the_next_stream_layers_input() {
+    let home = TestHome::new();
+    let (up, release, _) = held_upstream(&[200], "data: ok\n\n").await;
+    let cfg = String::from("keepalive.trigger='accept'\nkeepalive.interval_secs=1\n")
+        + &layer(&home, "outer", "'stream'", &["stream-echo"])
+        + &layer(
+            &home,
+            "inner",
+            "'stream'",
+            &[
+                "reply",
+                r#"{"response":{"status":409,"headers":{"x-hidden":"ignored"}}}"#,
+            ],
+        );
+    let (c, url) = running(&home, up, &cfg);
+    let mut response = c
+        .get(&url)
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert!(response.chunk().await.unwrap().is_some());
+    release.add_permits(1);
+    response.bytes().await.unwrap();
+    let outer = observed_stage(&home, "outer", "stream", 1).await;
+    assert_eq!(outer[0]["response"]["status"], 200);
+    assert!(outer[0]["response"]["headers"].get("x-hidden").is_none());
+}
+
+/// 不等最后一块才产出：先由客户端确认真正的转换数据，再放行下一块；墙钟数字另作负载测量。
+#[tokio::test]
+async fn forward_stream_conversion_does_not_batch_chunks() {
+    let home = TestHome::new();
+    let (up, release) = split_forward_upstream().await;
+    let (c, url) = running(
+        &home,
+        up,
+        &(String::from("delivery='forward'\n")
+            + &layer(&home, "convert", "'stream'", &["stream-echo"])),
+    );
+    let mut response = c.get(url).send().await.unwrap();
+    let mut prefix = Vec::new();
+    while prefix.len() < 6 {
+        prefix.extend_from_slice(&response.chunk().await.unwrap().unwrap());
+    }
+    assert_eq!(prefix, b"[first");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    release.notify_one();
+    assert_eq!(response.text().await.unwrap(), "last]");
+}
+
+/// 无正文是 HTTP 的正常结束，而不是 client_gone；open 自己改成 204 也应立刻 close。
+#[tokio::test]
+async fn bodyless_responses_never_open_streams_and_suppressed_open_closes_immediately() {
+    for mode in ["retry", "forward"] {
+        let home = TestHome::new();
+        let (up, _) = upstream(&[200, 204, 304, 200]).await;
+        let (c, url) = running(
+            &home,
+            up,
+            &(format!("delivery='{mode}'\n")
+                + &layer(&home, "shape", "'stream'", &["stream-echo"])),
+        );
+        for (method, status) in [
+            (reqwest::Method::HEAD, 200),
+            (reqwest::Method::GET, 204),
+            (reqwest::Method::GET, 304),
+        ] {
+            let r = c.request(method, &url).send().await.unwrap();
+            assert_eq!(r.status(), status);
+            assert!(r.bytes().await.unwrap().is_empty());
+        }
+        assert_eq!(
+            c.get(&url).send().await.unwrap().text().await.unwrap(),
+            "[upstream bytes]"
+        );
+        assert_eq!(
+            frames(&home, "shape")
+                .iter()
+                .filter(|m| m["event"] == "open")
+                .count(),
+            1,
+            "{mode}"
+        );
+    }
+    let home = TestHome::new();
+    let (up, _hold_open) = split_forward_upstream().await;
+    let cfg = String::from("delivery='forward'\n")
+        + &layer(&home, "outer", "'stream'", &["stream-echo"])
+        + &layer(
+            &home,
+            "suppress",
+            "'stream'",
+            &["reply", r#"{"response":{"status":204},"data":"not sent"}"#],
+        );
+    let (c, url) = running(&home, up, &cfg);
+    let r = c.get(url).send().await.unwrap();
+    assert_eq!(r.status(), 204);
+    assert!(r.bytes().await.unwrap().is_empty());
+    let seen = observed_stage(&home, "suppress", "stream", 2).await;
+    assert_eq!(seen[1]["event"], "close");
+    assert_eq!(frames(&home, "outer").len(), 1);
+}
+
+/// 中间层 abort 的字节只对它自己的协议有意义；外层健康却不回字节时也不得套用备用尾部。
+#[tokio::test]
+async fn only_the_outer_abort_reply_reaches_the_client_even_when_empty() {
+    for ending in ["", "outer-end"] {
+        let home = TestHome::new();
+        let (up, _) = upstream(&[200]).await;
+        let script = home.path().join("abort.json");
+        std::fs::write(&script,serde_json::json!({"stream:open":{"abort_tail":"unused"},"stream:abort":if ending.is_empty(){serde_json::json!({})}else{serde_json::json!({"data":ending})}}).to_string()).unwrap();
+        let cfg = layer(
+            &home,
+            "outer",
+            "'stream'",
+            &["reply-by-stage", script.to_str().unwrap()],
+        ) + &layer(&home, "middle", "'stream'", &["stream-echo"])
+            + &layer(&home, "break", "'stream'", &["stream-fault"]);
+        let (c, url) = running(&home, up, &cfg);
+        assert_eq!(
+            c.get(url).send().await.unwrap().text().await.unwrap(),
+            ending
+        );
+        for n in ["middle", "outer"] {
+            assert_eq!(frames(&home, n).last().unwrap()["event"], "abort");
+        }
+    }
+}
+
+/// Location 和原实体在 forward 的 307 上不经整包或流式转换，即使这两个程序都会改动成功响应。
+#[tokio::test]
+async fn forward_redirect_bypasses_both_response_and_stream_programs() {
+    let home = TestHome::new();
+    let port = free_port();
+    let l = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    let app = axum::Router::new().fallback(|| async {
+        (
+            axum::http::StatusCode::TEMPORARY_REDIRECT,
+            [("location", "/target")],
+            "original redirect",
+        )
+    });
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let cfg = String::from("delivery='forward'\n")
+        + &layer(&home, "whole", "'response'", &["upper"])
+        + &layer(&home, "stream", "'stream'", &["stream-echo"]);
+    let (_, url) = running(&home, port, &cfg);
+    let c = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .unwrap();
+    let r = c.get(url).send().await.unwrap();
+    assert_eq!(r.status(), 307);
+    assert_eq!(r.headers()["location"], "/target");
+    assert_eq!(r.text().await.unwrap(), "original redirect");
+    for n in ["whole", "stream"] {
+        assert_eq!(frames(&home, n).len(), 1);
+    }
 }

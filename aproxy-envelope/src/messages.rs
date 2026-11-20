@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 /// Format-specific overrides remain an open object; aproxy validates each leaf independently.
 pub type Overrides = serde_json::Map<String, serde_json::Value>;
-/// Preserve the distinction between a missing digest and an explicitly incomplete upload.
+/// Preserve the distinction between a missing field and an explicitly null observation.
 fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     d: D,
 ) -> Result<Option<Option<T>>, D::Error> {
@@ -424,15 +424,20 @@ pub struct ObservedResponse {
     /// Status, headers and decoded preview.
     #[serde(flatten)]
     pub response: Response,
-    /// Omitted byte count, null when the preview is complete.
-    pub truncated: Option<u64>,
+    /// Omitted byte count. Null means a complete preview; absent means only a head was observed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub truncated: Option<Option<u64>>,
 }
 impl ObservedResponse {
     /// Construct the wire object from its required context.
     pub fn new(response: Response) -> Self {
         Self {
+            truncated: (!matches!(response.body, crate::Body::Absent)).then_some(None),
             response,
-            truncated: None,
         }
     }
 }

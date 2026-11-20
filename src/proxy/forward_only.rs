@@ -540,6 +540,7 @@ pub(super) async fn forward_response(
             ctx.as_ref().expect("response chain context"),
             &meta,
             attempt,
+            None,
             status,
             headers,
             content,

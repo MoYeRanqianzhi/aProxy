@@ -371,6 +371,7 @@ pub(super) async fn chain(
     ctx: &ExchangeCtx,
     meta: &wire::RequestMeta,
     attempt: u32,
+    committed: Option<Arc<std::sync::atomic::AtomicBool>>,
     mut status: StatusCode,
     mut headers: HeaderMap,
     mut content: Content,
@@ -396,7 +397,9 @@ pub(super) async fn chain(
             content = Content::Saved(b);
             continue;
         }
-        if !p.entry.has_stage(Stage::Stream) {
+        if !p.entry.has_stage(Stage::Stream)
+            || !delivery::delivers_body(ctx.client_head || meta.method == "HEAD", status)
+        {
             continue;
         }
         let encoding = request_encoding(&headers, true)
@@ -460,14 +463,35 @@ pub(super) async fn chain(
             }
             continue;
         }
-        if let Some(code) = reply.response.and_then(|p| p.status) {
-            status = StatusCode::from_u16(code).expect("validated status");
-        }
-        if let Some(h) = prepared {
-            headers = h;
+        // 等 open 回信期间仍在保活；此时的头归属才决定外层能否看到补丁。
+        if !committed
+            .as_ref()
+            .is_some_and(|sent| sent.load(std::sync::atomic::Ordering::Acquire))
+        {
+            if let Some(code) = reply.response.and_then(|p| p.status) {
+                status = StatusCode::from_u16(code).expect("validated status");
+            }
+            if let Some(h) = prepared {
+                headers = h;
+            }
         }
         headers.remove(http::header::CONTENT_ENCODING);
         headers.remove(http::header::CONTENT_LENGTH);
+        if !delivery::delivers_body(ctx.client_head, status) {
+            // HTTP 不会轮询 204/304 的响应体；显式收尾，不经依赖消费正文的泵。
+            drop(content);
+            content = Content::Saved(SpooledBody::Memory(Bytes::new()));
+            let mut layer = layer;
+            tokio::spawn(async move {
+                if matches!(
+                    tokio::time::timeout(CANCEL_GRACE, layer.send(wire::StreamEvent::Close)).await,
+                    Ok(Ok(_))
+                ) {
+                    layer.worker.finish();
+                }
+            });
+            break;
+        }
         let mut f = content.flow().await;
         if let Some(encoding) = encoding
             && encoding

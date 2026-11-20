@@ -1469,3 +1469,47 @@ fn chat_tool_name_fragments_and_argument_delivery_boundary() {
         assert_eq!(args, "{}");
     }
 }
+
+/// Responses 的函数项在后续文本之前已经结束；Messages 客户端不应同时看见两个打开的内容块。
+#[test]
+fn responses_function_done_closes_the_messages_block_before_later_text() {
+    let mut w = Worker::new(&[
+        "convert",
+        "--from",
+        "anthropic_messages",
+        "--to",
+        "openai_responses",
+    ]);
+    open_stream(&mut w, "text/event-stream");
+    let events = [
+        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"fc1","type":"function_call","call_id":"c1","name":"one","arguments":""}}),
+        json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc1","delta":"{}"}),
+        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"fc1","type":"function_call","call_id":"c1","name":"one","arguments":"{}"}}),
+        json!({"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"after"}),
+        json!({"type":"response.completed","response":{"output":[]}}),
+    ];
+    let out = translated_events(&mut w, &events, false);
+    let mut active = None;
+    let mut starts = Vec::new();
+    let mut stops = Vec::new();
+    for e in &out {
+        match e["type"].as_str() {
+            Some("content_block_start") => {
+                assert!(active.is_none(), "overlap: {e}");
+                let index = e["index"].as_u64().unwrap();
+                active = Some(index);
+                starts.push(index);
+            }
+            Some("content_block_stop") => {
+                let index = e["index"].as_u64().unwrap();
+                assert_eq!(active.take(), Some(index));
+                stops.push(index);
+            }
+            Some("content_block_delta") => assert_eq!(active, e["index"].as_u64()),
+            _ => (),
+        }
+    }
+    assert_eq!(starts, [0, 1]);
+    assert_eq!(stops, starts);
+    assert!(active.is_none());
+}

@@ -1,6 +1,7 @@
 //! SSE 负责切事件，switchyard 负责语义。两份状态都属于一条已经 open 的流。
 use crate::config::Fault;
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use switchyard_translation::{StreamTranslationState, TranslationEngine, WireFormat as F};
 
 /// 单个尚未结束的 SSE 事件上限，与整条流的长度无关。
@@ -38,6 +39,10 @@ pub(super) struct Events {
     usage_chunk: Option<Value>,
     /// Messages 的 stop_reason 提示原因而不保证完整；转成 Chat 时，须等 message_stop 再把这一帧交给编码器。
     message_finish: Option<Value>,
+    /// Responses 的 call_id 对应已经向 Messages 客户端打开的块索引。
+    open_tools: BTreeMap<String, u64>,
+    /// 已按源项终点关闭的块，不重复输出编解码器在流末补的 stop。
+    closed_tools: BTreeSet<u64>,
     /// 两个协议的终态快照并不共享同一组原因，暂存可映射的 Responses 原因直到目标终态。
     incomplete_reason: Option<&'static str>,
 }
@@ -58,6 +63,8 @@ impl Events {
             include_usage,
             usage_chunk: None,
             message_finish: None,
+            open_tools: Default::default(),
+            closed_tools: Default::default(),
             incomplete_reason: None,
         }
     }
@@ -180,10 +187,50 @@ impl Events {
             .engine
             .translate_event(&mut self.state, self.source, self.target, event)
             .map_err(|_| malformed())?;
-        self.render_events(events, output)
+        self.render_events(events, output)?;
+        if self.source == F::OpenAiResponses
+            && self.target == F::AnthropicMessages
+            && event["type"] == "response.output_item.done"
+            && event["item"]["type"] == "function_call"
+            && let Some(id) = event["item"]["call_id"].as_str()
+            && let Some(index) = self.open_tools.remove(id)
+        {
+            self.closed_tools.insert(index);
+            render(
+                self.target,
+                vec![serde_json::json!({"type":"content_block_stop","index":index})],
+                output,
+            )?;
+        }
+        Ok(())
     }
     /// 按客户端的选项调整目标帧；最后只发一个独立用量块，且不能再带工具或文本。
     fn render_events(&mut self, mut events: Vec<Value>, output: &mut String) -> Result<(), Fault> {
+        if self.source == F::OpenAiResponses && self.target == F::AnthropicMessages {
+            events.retain(|e| {
+                let Some(index) = e["index"].as_u64() else {
+                    return true;
+                };
+                match e["type"].as_str() {
+                    Some("content_block_start") if e["content_block"]["type"] == "tool_use" => {
+                        if let Some(id) = e["content_block"]["id"].as_str() {
+                            self.open_tools.insert(id.to_owned(), index);
+                        }
+                    }
+                    Some("content_block_stop") => {
+                        if self.closed_tools.remove(&index) {
+                            return false;
+                        }
+                        self.open_tools.retain(|_, i| *i != index);
+                    }
+                    Some("content_block_delta") if self.closed_tools.contains(&index) => {
+                        return false;
+                    }
+                    _ => (),
+                }
+                true
+            });
+        }
         if let Some(reason) = self.incomplete_reason {
             for e in &mut events {
                 match self.target {

@@ -157,8 +157,8 @@ pub(super) struct Events {
     usage_chunk: Option<Value>,
     /// Messages 的 stop_reason 提示原因而不保证完整；转成 Chat 时，须等 message_stop 再把这一帧交给编码器。
     message_finish: Option<Value>,
-    /// Responses 的 call_id 对应已经向 Messages 客户端打开的块索引。
-    open_tools: BTreeMap<String, u64>,
+    /// Responses 源输出位置对应实际打开的 Messages 块，不依赖两端工具 ID 的字符编码。
+    open_tools: BTreeMap<usize, u64>,
     /// 已按源项终点关闭的块，不重复输出编解码器在流末补的 stop。
     closed_tools: BTreeSet<u64>,
     /// 两个协议的终态快照并不共享同一组原因，暂存可映射的 Responses 原因直到目标终态。
@@ -364,9 +364,11 @@ impl Events {
         let closing_tool = (self.source == F::OpenAiResponses
             && self.target == F::AnthropicMessages
             && event["type"] == "response.output_item.done"
-            && event["item"]["type"] == "function_call")
-            .then(|| event["item"]["call_id"].as_str().map(str::to_owned))
-            .flatten();
+            && matches!(
+                event["item"]["type"].as_str(),
+                Some("function_call" | "custom_tool_call")
+            ))
+        .then(|| event["output_index"].as_u64().unwrap_or(0) as usize);
         let decoded = self
             .engine
             .decode_stream_event(&mut self.state, self.source, event)
@@ -386,10 +388,28 @@ impl Events {
             if self.target == F::OpenAiResponses {
                 self.charge_retained(&chunk, output.capacity)?;
             }
+            let source_tool = match &chunk {
+                LlmResponseChunk::ToolCallDelta { index, .. }
+                    if self.source == F::OpenAiResponses && self.target == F::AnthropicMessages =>
+                {
+                    Some(*index)
+                }
+                _ => None,
+            };
             let encoded = self
                 .engine
                 .encode_stream_event(&mut self.state, self.target, chunk.into())
                 .map_err(|_| malformed())?;
+            if let Some(source) = source_tool {
+                for event in &encoded {
+                    if event["type"] == "content_block_start"
+                        && event["content_block"]["type"] == "tool_use"
+                        && let Some(index) = event["index"].as_u64()
+                    {
+                        self.open_tools.insert(source, index);
+                    }
+                }
+            }
             self.render_events(encoded, output)?;
         }
         if let Some(id) = closing_tool
@@ -523,11 +543,6 @@ impl Events {
                     return true;
                 };
                 match e["type"].as_str() {
-                    Some("content_block_start") if e["content_block"]["type"] == "tool_use" => {
-                        if let Some(id) = e["content_block"]["id"].as_str() {
-                            self.open_tools.insert(id.to_owned(), index);
-                        }
-                    }
                     Some("content_block_stop") => {
                         if self.closed_tools.remove(&index) {
                             return false;

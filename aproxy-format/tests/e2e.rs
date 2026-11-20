@@ -2035,38 +2035,48 @@ fn responses_function_done_closes_the_messages_block_before_later_text() {
         "--to",
         "openai_responses",
     ]);
-    open_stream(&mut w, "text/event-stream");
-    let events = [
-        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"fc1","type":"function_call","call_id":"c1","name":"one","arguments":""}}),
-        json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc1","delta":"{}"}),
-        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"fc1","type":"function_call","call_id":"c1","name":"one","arguments":"{}"}}),
-        json!({"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"after"}),
-        json!({"type":"response.completed","response":{"output":[]}}),
-    ];
-    let out = translated_events(&mut w, &events, false);
-    let mut active = None;
-    let mut starts = Vec::new();
-    let mut stops = Vec::new();
-    for e in &out {
-        match e["type"].as_str() {
-            Some("content_block_start") => {
-                assert!(active.is_none(), "overlap: {e}");
-                let index = e["index"].as_u64().unwrap();
-                active = Some(index);
-                starts.push(index);
-            }
-            Some("content_block_stop") => {
-                let index = e["index"].as_u64().unwrap();
-                assert_eq!(active.take(), Some(index));
-                stops.push(index);
-            }
-            Some("content_block_delta") => assert_eq!(active, e["index"].as_u64()),
-            _ => (),
+    for (kind, id) in [
+        ("function_call", "c1"),
+        ("function_call", "call/a"),
+        ("custom_tool_call", "call/b"),
+    ] {
+        open_stream(&mut w, "text/event-stream");
+        let mut events = vec![
+            json!({"type":"response.output_item.added","output_index":0,"item":{"id":"fc1","type":kind,"call_id":id,"name":"one","arguments":""}}),
+            json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc1","delta":"{}"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"id":"fc1","type":kind,"call_id":id,"name":"one","arguments":"{}"}}),
+            json!({"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"after"}),
+            json!({"type":"response.completed","response":{"output":[]}}),
+        ];
+        if kind == "custom_tool_call" {
+            events.remove(1);
+            events[1]["item"]["input"] = "opaque".into();
         }
+        let out = translated_events(&mut w, &events, false);
+        let mut active = None;
+        let mut starts = Vec::new();
+        let mut stops = Vec::new();
+        for e in &out {
+            match e["type"].as_str() {
+                Some("content_block_start") => {
+                    assert!(active.is_none(), "overlap: {e}");
+                    let index = e["index"].as_u64().unwrap();
+                    active = Some(index);
+                    starts.push(index);
+                }
+                Some("content_block_stop") => {
+                    let index = e["index"].as_u64().unwrap();
+                    assert_eq!(active.take(), Some(index));
+                    stops.push(index);
+                }
+                Some("content_block_delta") => assert_eq!(active, e["index"].as_u64()),
+                _ => (),
+            }
+        }
+        assert_eq!(starts, [0, 1]);
+        assert_eq!(stops, starts);
+        assert!(active.is_none());
     }
-    assert_eq!(starts, [0, 1]);
-    assert_eq!(stops, starts);
-    assert!(active.is_none());
 }
 
 /// 非终态帧可以携带名为 error 的扩展；只能按源协议判定终止，否则后续正文会被整个丢弃。

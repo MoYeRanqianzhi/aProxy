@@ -263,6 +263,9 @@ impl Route {
             if c.id.is_empty() || !ids.insert(&c.id) {
                 return Err("渠道标识为空或重复");
             }
+            if let Some(name) = &c.credential_env {
+                config::credential_name(name).map_err(|fault| fault.local)?;
+            }
             if let Some(h) = &c.auth_header {
                 config::credential_header(h)?;
             }
@@ -557,5 +560,20 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+}
+
+/// 路由加载只检查凭据来源的名字，不以离线机器是否设置了这个变量作为有效性条件。
+#[cfg(test)]
+#[test]
+fn route_validates_credential_source_before_hello() {
+    for (name, valid) in [
+        ("", false),
+        ("BROKEN=NAME", false),
+        ("NOT_SET_FOR_THIS_TEST", true),
+    ] {
+        let text =
+            format!("[[channel]]\nid='one'\nurl='https://relay.test'\ncredential_env='{name}'");
+        assert_eq!(Route::load(config::Source::Offline(&text)).is_ok(), valid);
     }
 }

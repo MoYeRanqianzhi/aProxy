@@ -117,14 +117,19 @@ pub struct Variables {
     /// 静态检查不要求提供密钥；实际执行或试跑遇到缺失凭据仍报错。
     pub structural: bool,
 }
-/// 凭据取自用户指名的环境变量，只进入将发给上游的请求头。
-pub fn credential(env: &str, scheme: &str, variables: &Variables) -> Result<String, Fault> {
+/// 环境变量名是系统接口的一部分，空名、等号与 NUL 不能表示一个凭据来源。
+pub fn credential_name(env: &str) -> Result<(), Fault> {
     if env.is_empty() || env.contains(['=', '\0']) {
         return Err(Fault::new(
             "密钥环境变量名无效",
             "invalid credential environment variable name",
         ));
     }
+    Ok(())
+}
+/// 凭据取自用户指名的环境变量，只进入将发给上游的请求头。
+pub fn credential(env: &str, scheme: &str, variables: &Variables) -> Result<String, Fault> {
+    credential_name(env)?;
     let key = if variables.structural {
         Some("offline-placeholder".to_owned())
     } else {

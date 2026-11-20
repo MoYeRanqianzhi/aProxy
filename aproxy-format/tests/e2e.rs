@@ -1423,3 +1423,49 @@ fn refusal_text_survives_deltas_and_snapshot_reconciliation() {
         "No thanks"
     );
 }
+
+/// 工具名也由 Chat 分片传入，参数开始后名称仍可能继续；目标工具开头不能撤销或更名。
+#[test]
+fn chat_tool_name_fragments_and_argument_delivery_boundary() {
+    for client in ["anthropic_messages", "openai_responses"] {
+        let mut w = Worker::new(&["convert", "--from", client, "--to", "openai_chat"]);
+        open_stream(&mut w, "text/event-stream");
+        let mut early = String::new();
+        for tool in [
+            json!({"index":0,"id":"c1","function":{"name":"look","arguments":"{"}}),
+            json!({"index":0,"function":{"name":"up","arguments":"}"}}),
+        ] {
+            let event = json!({"choices":[{"index":0,"delta":{"tool_calls":[tool]}}]});
+            early.push_str(
+                stream_frame(&mut w, "data", &format!("data: {event}\n\n"))["data"]
+                    .as_str()
+                    .unwrap(),
+            );
+        }
+        assert!(
+            !early.contains("input_json_delta")
+                && !early.contains("response.function_call_arguments.delta"),
+            "{client}: {early}"
+        );
+        let out = translated_events(
+            &mut w,
+            &[json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})],
+            true,
+        );
+        assert!(
+            out.iter()
+                .any(|e| e["content_block"]["name"] == "lookup" || e["item"]["name"] == "lookup")
+        );
+        let args = out
+            .iter()
+            .filter_map(|e| {
+                if e["type"] == "response.function_call_arguments.delta" {
+                    e["delta"].as_str()
+                } else {
+                    e["delta"]["partial_json"].as_str()
+                }
+            })
+            .collect::<String>();
+        assert_eq!(args, "{}");
+    }
+}

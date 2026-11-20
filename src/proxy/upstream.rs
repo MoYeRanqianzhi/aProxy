@@ -98,6 +98,24 @@ pub(super) async fn send_prepared(
         .map_err(|failure| Box::new(ForwardResult::NetworkError(failure, None)))
 }
 
+/// 用同一套规则过滤完整与半截尝试的响应头；不保留逐跳字段，保留重复的端到端字段。
+pub(super) fn attempt_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut resp_headers = HeaderMap::new();
+    for (name, value) in headers {
+        let name_str = name.as_str();
+        if is_hop_header(name_str) {
+            continue;
+        }
+        if let Ok(n) = HeaderName::from_bytes(name_str.as_bytes())
+            && let Ok(v) = HeaderValue::from_bytes(value.as_bytes())
+        {
+            // append 而非 insert：Set-Cookie 等同名多值头不能坍缩为最后一个
+            resp_headers.append(n, v);
+        }
+    }
+    resp_headers
+}
+
 /// 可重试的响应（或 forward 尚未交付、要问 decide 的失败）才缓冲实体。
 /// 提交点与原始历史都从同一份响应头起算，不会为决定投递方式再发一次请求。
 ///
@@ -119,20 +137,7 @@ pub(super) async fn gather_response(
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let raw_headers = resp.headers().clone();
 
-    // 过滤后的响应头（透传用）
-    let mut resp_headers = HeaderMap::new();
-    for (name, value) in resp.headers().iter() {
-        let name_str = name.as_str();
-        if is_hop_header(name_str) {
-            continue;
-        }
-        if let Ok(n) = HeaderName::from_bytes(name_str.as_bytes())
-            && let Ok(v) = HeaderValue::from_bytes(value.as_bytes())
-        {
-            // append 而非 insert：Set-Cookie 等同名多值头不能坍缩为最后一个
-            resp_headers.append(n, v);
-        }
-    }
+    let resp_headers = attempt_headers(resp.headers());
     if let Some(tx) = on_head {
         let _ = tx.send((status, resp_headers.clone()));
     }

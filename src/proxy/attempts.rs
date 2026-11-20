@@ -651,17 +651,42 @@ pub(super) async fn run_attempts(
                         && (!retry::is_retryable_status(resp.status().as_u16())
                             || started.is_none()) =>
                 {
+                    // 只在可能升级的响应链上设交接点。不拉取首块来探测错误，否则会破坏实时转发。
+                    let (tx, mut failure) = if started.is_some()
+                        && resp.status().is_success()
+                        && (state.has_format(Stage::Response) || state.has_format(Stage::Stream))
+                    {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        (Some(tx), Some(rx))
+                    } else {
+                        (None, None)
+                    };
                     let stream = forward_response(
                         state.clone(),
                         &req.method,
                         &req.target_url,
-                        req.ctx.take(),
+                        req.ctx.as_ref(),
                         &trace,
                         attempt,
                         resp,
+                        tx,
                     );
-                    finish_forward(r, stream, &trace).await;
-                    return;
+                    let Some(response) = r.wait(stream, None, "forward response").await else {
+                        return;
+                    };
+                    // close 与发送错误二者必有其一先成功；在此交付边界之后不再咨询或回放。
+                    if let Some(rx) = &mut failure {
+                        rx.close();
+                    }
+                    if let Some(f) = failure.and_then(|mut rx| rx.try_recv().ok()) {
+                        f
+                    } else {
+                        match response {
+                            Ok(resp) => r.respond(resp),
+                            Err(t) => r.finish(t, &trace).await,
+                        }
+                        return;
+                    }
                 }
                 Ok(resp) => {
                     let gather =

@@ -5879,3 +5879,66 @@ async fn retry_reads_body_and_beats_while_a_metadata_request_worker_is_held() {
     std::fs::write(gate, b"go").unwrap();
     assert_eq!(response.bytes().await.unwrap(), "upstream bytes");
 }
+
+/// 整包响应层尚未交付任何字节时遇到上游中断：可以升级，也能按 forward 规则无响应停止。
+#[tokio::test]
+async fn interrupted_forward_gather_consults_decide_before_exposing_a_prefix() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    for retry in [false, true] {
+        let home = TestHome::new();
+        let port = free_port();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut lines = tokio::io::BufReader::new(&mut sock).lines();
+            while !lines.next_line().await.unwrap().unwrap().is_empty() {}
+            sock.write_all(b"HTTP/1.1 200 OK\r\nRetry-After: 19\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nbad\r\n").await.unwrap();
+            sock.shutdown().await.unwrap();
+            drop(sock);
+            if retry {
+                axum::serve(listener, axum::Router::new().fallback(|| async { "whole" }))
+                    .await
+                    .unwrap();
+            }
+        });
+        let cfg = String::from("delivery='forward'\n")
+            + &layer(
+                &home,
+                "policy",
+                "'decide'",
+                &[
+                    "reply",
+                    if retry {
+                        r#"{"decision":"retry","delay_ms":0}"#
+                    } else {
+                        r#"{"decision":"stop"}"#
+                    },
+                ],
+            )
+            + &layer(&home, "buffer", "'response'", &["echo"]);
+        let (c, url) = running(&home, port, &cfg);
+        let response = c.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), if retry { 200 } else { 502 });
+        let body = response.bytes().await.unwrap();
+        if retry {
+            assert_eq!(body, "whole");
+        } else {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["error"]["aproxy"]["code"],
+                "upstream_failed"
+            );
+        }
+        let f = frames(&home, "policy");
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[1]["failure"]["code"], "upstream_body_interrupted");
+        assert_eq!(f[1]["response"]["headers"]["retry-after"], "19");
+        assert!(f[1]["response"].get("body").is_none());
+        let record = request_detail(&home, &url, f[1]["request_id"].as_str().unwrap()).await;
+        assert_eq!(record["record"]["upgraded"], retry);
+        if retry {
+            assert_eq!(record["record"]["outcome"], "ok");
+        }
+    }
+}

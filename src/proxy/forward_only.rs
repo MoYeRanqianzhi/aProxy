@@ -151,6 +151,8 @@ impl PassiveCheck {
 /// 响应转发途中顺带做的记录：每一块交给请求历史一份，数着已经转给客户端多少字节。响应流
 /// 结束、出错或被丢弃（客户端断开）时，把这唯一的一次尝试记完。
 struct ResponseTap {
+    /// 管道接收端只活到 HTTP 出口选定响应。在此之前上游读错交回尝试循环，之后只能截断。
+    precommit: Option<tokio::sync::oneshot::Sender<ForwardResult>>,
     /// 原始字节数和耗时在 Drop 中先落定，随后释放这张封存票。
     _join: Option<Arc<UpstreamJoin>>,
     /// 输出长度由响应链单独记录；尝试长度始终只算原上游字节。
@@ -391,24 +393,37 @@ pub(super) async fn forward_only_proxy(
         }
     };
 
-    forward_response(state, method, target_url, ctx, trace, attempt, resp).await
+    forward_response(
+        state,
+        method,
+        target_url,
+        ctx.as_ref(),
+        trace,
+        attempt,
+        resp,
+        None,
+    )
+    .await
 }
 
 /// 收到上游头后才选择真流式交付；保留原尝试序号，不因请求层在本地失败过而少算。
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn forward_response(
     state: AppState,
     method: &http::Method,
     target_url: &str,
-    ctx: Option<ExchangeCtx>,
+    ctx: Option<&ExchangeCtx>,
     trace: &RequestTrace,
     attempt: u32,
     resp: reqwest::Response,
+    precommit: Option<tokio::sync::oneshot::Sender<ForwardResult>>,
 ) -> Result<Response, Terminal> {
     let rec = &trace.rec;
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     // 请求历史：上游实际回的响应头（逐跳头也在内），响应体边转边交一份。上游回了错误
     // 状态码时照样原样转给客户端，记录的结局是「上游错误」
     let mut tap = ResponseTap {
+        precommit,
         _join: trace.upstream_join.upgrade(),
         transformed: status.is_success()
             && ctx.is_some()
@@ -480,8 +495,9 @@ pub(super) async fn forward_response(
     let expected = resp.content_length();
     let transformed = tap.transformed;
     let stream_state = state.clone();
-    let stream =
-        futures_util::stream::unfold((resp, tap, false), move |(mut resp, mut tap, done)| {
+    let stream = futures_util::stream::unfold(
+        (resp, tap, false),
+        move |(mut resp, mut tap, done)| {
             let state = stream_state.clone();
             async move {
                 if done {
@@ -508,28 +524,33 @@ pub(super) async fn forward_response(
                         None
                     }
                     Err(failure) => {
-                        // 上游响应流中断：**直接截断**——绝不注入任何上游未发出的字节（那
-                        // 是伪造数据），也不重试（本模式已放弃重试能力）。错误记进实例的
-                        // 观测值并带上已转发字节数，便于判断断在了哪里。
-                        failure.record_in(&state.stats);
-                        tracing::warn!(
-                            code = %failure.code,
-                            error = %failure.message,
-                            forwarded_bytes = forwarded,
-                            "上游响应流中断，连接就此截断（仅转发模式不重试）"
-                        );
-                        // 请求记录：这次尝试断在半路，结局是「上游错误」
-                        tap.rec.settle(
-                            crate::history::Outcome::UpstreamError,
-                            Some("upstream_failed"),
-                        );
-                        tap.rec.stream_aborted();
+                        // 已有 decide 且响应仍在整包层中，错误可以回到尝试循环；
+                        // 接收端在交付前关闭，此后即使后台流正在预取也不能撤回响应。
+                        let handed_back = tap.precommit.take().is_some_and(|tx| {
+                            !tx.is_closed()
+                                && tx
+                                    .send(ForwardResult::NetworkError(
+                                        failure.clone(),
+                                        Some(Box::new((status, attempt_headers(resp.headers())))),
+                                    ))
+                                    .is_ok()
+                        });
+                        if !handed_back {
+                            failure.record_in(&state.stats);
+                            tracing::warn!(code=%failure.code, error=%failure.message, forwarded_bytes=forwarded, "forward upstream response interrupted");
+                            tap.rec.settle(
+                                crate::history::Outcome::UpstreamError,
+                                Some("upstream_failed"),
+                            );
+                            tap.rec.stream_aborted();
+                        }
                         tap.failure = Some(failure.clone());
                         Some((Err(failure), (resp, tap, true)))
                     }
                 }
             }
-        });
+        },
+    );
 
     if transformed {
         let meta = aproxy_envelope::RequestMeta::new(method.to_string(), target_url.to_owned());
@@ -542,7 +563,7 @@ pub(super) async fn forward_response(
             streams::Content::Flow(stream.map(|r| r.map_err(streams::End::attempt)).boxed());
         return match streams::chain(
             &state,
-            ctx.as_ref().expect("response chain context"),
+            ctx.expect("response chain context"),
             &meta,
             attempt,
             None,

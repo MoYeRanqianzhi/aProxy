@@ -7,6 +7,94 @@ use switchyard_translation::{StreamTranslationState, TranslationEngine, WireForm
 /// 单个尚未结束的 SSE 事件上限，与整条流的长度无关。
 const MAX_EVENT: usize = 8 * 1024 * 1024;
 
+/// Messages 的用量可分多次发送，保留已知计数；OpenAI 的输入计数则包含缓存部分。
+#[derive(Default)]
+pub(super) struct UsageTotals {
+    /// 输入计数，是否包含缓存取决于源协议。
+    input: Option<u64>,
+    /// 最新的累计输出，不把不同事件的累计值再次相加。
+    output: Option<u64>,
+    /// 从缓存读取的输入量。
+    read: u64,
+    /// 写入缓存的输入量。
+    write: u64,
+}
+impl UsageTotals {
+    /// 在送入编解码器之前检查它会重组的合计；允许缺少可选计数，不把非法数值解释为零。
+    pub(super) fn check(&mut self, source: F, usage: &Value) -> Result<(), Fault> {
+        if usage.is_null() {
+            return Ok(());
+        }
+        let invalid = || Fault::new("上游用量计数无效", "invalid upstream usage counts");
+        if !usage.is_object() {
+            return Err(invalid());
+        }
+        let number = |v: &Value| {
+            if v.is_null() {
+                Ok(None)
+            } else {
+                v.as_u64().map(Some).ok_or_else(invalid)
+            }
+        };
+        let (input, output, read, write) = match source {
+            F::AnthropicMessages => (
+                &usage["input_tokens"],
+                &usage["output_tokens"],
+                &usage["cache_read_input_tokens"],
+                &usage["cache_creation_input_tokens"],
+            ),
+            F::OpenAiChat => {
+                let details = &usage["prompt_tokens_details"];
+                (
+                    &usage["prompt_tokens"],
+                    &usage["completion_tokens"],
+                    &details["cached_tokens"],
+                    details
+                        .get("cache_write_tokens")
+                        .unwrap_or(&details["cache_creation_tokens"]),
+                )
+            }
+            F::OpenAiResponses => {
+                let details = &usage["input_tokens_details"];
+                (
+                    &usage["input_tokens"],
+                    &usage["output_tokens"],
+                    &details["cached_tokens"],
+                    &details["cache_write_tokens"],
+                )
+            }
+        };
+        if source != F::AnthropicMessages {
+            *self = Self::default();
+        }
+        self.input = number(input)?.or(self.input);
+        self.output = number(output)?.or(self.output);
+        self.read = number(read)?.unwrap_or(self.read);
+        self.write = number(write)?.unwrap_or(self.write);
+        let cached = self.read.checked_add(self.write).ok_or_else(invalid)?;
+        let input = if source == F::AnthropicMessages {
+            self.input
+                .unwrap_or(0)
+                .checked_add(cached)
+                .ok_or_else(invalid)?
+        } else {
+            if self.input.is_some_and(|n| n < cached) {
+                return Err(invalid());
+            }
+            self.input.unwrap_or(cached)
+        };
+        let sum = input
+            .checked_add(self.output.unwrap_or(0))
+            .ok_or_else(invalid)?;
+        if let Some(total) = number(&usage["total_tokens"])?
+            && (total < sum || self.input.is_some() && self.output.is_some() && total != sum)
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+}
+
 /// 当前事件跨协议转换所需的字节边界、语义状态和终止标记。
 pub(super) struct Events {
     /// 上游返回的协议。
@@ -15,6 +103,8 @@ pub(super) struct Events {
     target: F,
     /// 默认注册的三个协议编解码器，每条活跃流复用一份。
     engine: TranslationEngine,
+    /// 源协议尚未成套的用量也须在下一次编码前检查。
+    counts: UsageTotals,
     /// 工具调用、usage 与结束原因在多个源事件间关联。
     state: StreamTranslationState,
     /// 只对有语义的完整事件扣费，注释与网络分片不改变预算。
@@ -53,6 +143,7 @@ impl Events {
             source,
             target,
             engine: TranslationEngine::default(),
+            counts: UsageTotals::default(),
             state: Default::default(),
             remaining: budget,
             snapshot_min: 0,
@@ -165,6 +256,13 @@ impl Events {
         if failed {
             return Err(Fault::new("上游事件流报告失败", "upstream stream failed"));
         }
+        let usage = match self.source {
+            F::OpenAiChat => &event["usage"],
+            F::AnthropicMessages if event["type"] == "message_start" => &event["message"]["usage"],
+            F::AnthropicMessages => &event["usage"],
+            F::OpenAiResponses => &event["response"]["usage"],
+        };
+        self.counts.check(self.source, usage)?;
         visible_refusal(self.source, &mut event);
         if self.source == F::OpenAiResponses && event["type"] == "response.incomplete" {
             self.incomplete_reason = Some(match event["response"]["incomplete_details"]["reason"]

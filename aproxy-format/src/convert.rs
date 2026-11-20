@@ -334,6 +334,7 @@ impl Convert {
                 "response does not match the upstream protocol",
             ));
         }
+        crate::events::UsageTotals::default().check(upstream, &body["usage"])?;
         Ok(translate::translate_response(upstream, client, &body)
             .map_err(|_| Fault::new("响应协议转换失败", "response protocol conversion failed"))?
             .to_string())

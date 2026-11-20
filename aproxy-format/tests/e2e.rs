@@ -1046,6 +1046,60 @@ fn malformed_stream_ends_in_the_client_protocol_only_once() {
     );
 }
 
+/// 合法边界与分帧用量合计都经过同一工作进程；不一致的计数只结束该流，不能污染下一条。
+#[test]
+fn token_usage_is_checked_before_encoding() {
+    let mut w = Worker::new(&[
+        "convert",
+        "--from",
+        "openai_chat",
+        "--to",
+        "anthropic_messages",
+    ]);
+    for (input, cache, output, valid) in [
+        (u64::MAX - 3, 2, 1, true),
+        (10, 1, 2, true),
+        (u64::MAX - 2, 2, 1, false),
+    ] {
+        open_stream(&mut w, "text/event-stream");
+        let start = json!({"type":"message_start","message":{"id":"m","model":"m","role":"assistant","content":[],"usage":{"input_tokens":input,"cache_read_input_tokens":cache}}});
+        let delta = json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":output}});
+        let mut data = String::new();
+        for event in [start, delta, json!({"type":"message_stop"})] {
+            data += stream_frame(&mut w, "data", &format!("data: {event}\n\n"))["data"]
+                .as_str()
+                .unwrap();
+        }
+        data += stream_frame(&mut w, "close", "")["data"]
+            .as_str()
+            .unwrap_or("");
+        assert_eq!(data.contains("[DONE]"), valid);
+        assert_eq!(data.contains("stream conversion aborted"), !valid);
+    }
+    let mut w = Worker::new(&[
+        "convert",
+        "--from",
+        "anthropic_messages",
+        "--to",
+        "openai_responses",
+    ]);
+    for usage in [
+        json!({"input_tokens":5,"output_tokens":3,"total_tokens":7}),
+        json!({"input_tokens":1,"output_tokens":1,"input_tokens_details":{"cached_tokens":2}}),
+        json!({"input_tokens":u64::MAX,"output_tokens":1}),
+    ] {
+        open_stream(&mut w, "text/event-stream");
+        let event =
+            json!({"type":"response.completed","response":{"model":"m","output":[],"usage":usage}});
+        assert!(
+            stream_frame(&mut w, "data", &format!("data: {event}\n\n"))["data"]
+                .as_str()
+                .unwrap()
+                .contains("event: error")
+        );
+    }
+}
+
 /// 相同 SSE 字节合在一帧或拆开发送，都应先交付正常增量，再以客户端协议报错。
 #[test]
 fn valid_prefix_before_bad_event_is_independent_of_pipe_framing() {

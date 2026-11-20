@@ -3,7 +3,7 @@
 use super::*;
 
 /// 请求侧的逐跳头及长度、主机由代理管理；与格式程序配置拒绝的槽位共用同一判据。
-pub(crate) use aproxy_envelope::is_managed_request_header as is_hop_header;
+pub(crate) use aproxy_ipc::redact::is_managed_request_header as is_hop_header;
 
 /// 响应侧的 hop-by-hop 过滤：同 `is_hop_header`，但**在上游未用
 /// transfer-encoding 分帧时排除 content-length**（即把它保留下来）。

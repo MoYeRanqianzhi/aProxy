@@ -41,7 +41,7 @@ impl Rewrite {
             if aproxy_ipc::redact::is_secret_header(&key) {
                 return Err("set_headers 不接受凭据头，请使用 keys 或 route");
             }
-            if aproxy_envelope::is_managed_request_header(&key) {
+            if aproxy_ipc::redact::is_managed_request_header(&key) {
                 return Err("set_headers 不接受代理管理的头");
             }
             if !http::HeaderValue::from_str(&value).is_ok_and(|v| v.to_str().is_ok()) {

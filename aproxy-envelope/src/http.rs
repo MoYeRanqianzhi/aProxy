@@ -5,25 +5,6 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Whether an HTTP request header is hop-by-hop or managed by the proxy's transport.
-/// Format programs cannot use these names for end-to-end credentials or overrides.
-pub fn is_managed_request_header(name: &str) -> bool {
-    [
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-        "host",
-        "content-length",
-    ]
-    .iter()
-    .any(|h| name.eq_ignore_ascii_case(h))
-}
-
 /// Header names are lowercase. The wire protocol keeps only the first value.
 pub type Headers = BTreeMap<String, String>;
 

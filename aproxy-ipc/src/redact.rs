@@ -176,6 +176,24 @@ fn numeric_host_is_ipv4(host: &str) -> bool {
     !numeric || host.parse::<std::net::Ipv4Addr>().is_ok()
 }
 
+/// 逐跳或由传输层维护的请求头不能用作端到端覆盖或凭据，与头名的 ASCII 大小写无关。
+pub fn is_managed_request_header(name: &str) -> bool {
+    [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "host",
+        "content-length",
+    ]
+    .iter()
+    .any(|h| name.eq_ignore_ascii_case(h))
+}
+
 /// 这个请求头的值是不是密钥（「密钥头」）。名字不分大小写：`authorization`、
 /// `proxy-authorization`、`cookie`、`set-cookie`，以及名字里含 `key`、`token`、`secret`、
 /// `auth`、`session`、`signature` 的头。
@@ -646,4 +664,14 @@ mod tests {
         assert_eq!(redactor.feed(b"abc"), b"abc");
         assert_eq!(redactor.finish(), b"");
     }
+}
+
+/// 管理头与密钥头并非同一集合，两个谓词分别决定传输和展示边界。
+#[cfg(test)]
+#[test]
+fn managed_header_boundary_is_distinct_from_redaction() {
+    assert!(is_managed_request_header("CoNtEnT-LeNgTh"));
+    assert!(is_managed_request_header("Proxy-Authorization"));
+    assert!(!is_managed_request_header("Authorization"));
+    assert!(is_secret_header("Authorization"));
 }

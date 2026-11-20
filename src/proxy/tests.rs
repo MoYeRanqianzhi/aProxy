@@ -989,7 +989,7 @@ async fn queued_format_calls_only_read_the_spool_after_admission() {
     for encoded in [false, true] {
         let temp = tempfile::tempdir().unwrap();
         let (parsed, errors) = crate::config::file::parse(
-            "[[format]]\ncommand='f'\nprocess='persistent'\npool_max=1\nstages=['request','response']",
+            "[[format]]\ncommand='f'\nprocess='persistent'\npool_max=1\ntimeout_secs=0\nstages=['request','response']",
             Path::new("unit.toml"),
         );
         assert!(errors.is_empty());
@@ -1079,11 +1079,8 @@ async fn queued_format_calls_only_read_the_spool_after_admission() {
             }
             std::fs::write(&resp_path, b"s").unwrap();
             drop(hold);
-            let (sent, (_, headers, _)) = tokio::time::timeout(Duration::from_secs(8), async {
-                tokio::join!(run, response)
-            })
-            .await
-            .unwrap();
+            // 已观察到两个调用都在等同一张票；放行后的文件 IO 和进程调度不参与判定。
+            let (sent, (_, headers, _)) = tokio::join!(run, response);
             assert!(sent.is_ok());
             assert!(headers.contains_key("x-stage-seen"));
         }

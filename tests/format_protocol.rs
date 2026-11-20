@@ -1152,7 +1152,7 @@ async fn fresh_response_worker_cannot_exceed_the_reply_limit() {
         "bounded",
         "'response'",
         &["crash-then-unfinished", marker.to_str().unwrap()],
-    ) + "timeout_secs=3\n";
+    ) + "timeout_secs=0\n";
     let (client, url) = running(&home, up, &cfg);
     let response = client.get(&url).send().await.unwrap();
     assert_eq!(response.text().await.unwrap(), "upstream bytes");
@@ -1700,28 +1700,26 @@ async fn optional_format_faults_preserve_input_and_warn_once() {
     let (up, calls) = upstream(&[200]).await;
     for args in [
         &["exit1"][..],
-        &["sleep", "1800"],
+        &["no-stage-reply"],
         &["invalid"],
         &["reply", r#"{"request":{"url":"relative"}}"#],
         &["error"],
     ] {
         let home = TestHome::new();
         let cfg = layer(&home, "optional", "'request'", args)
-            + "required=false\ntimeout_secs=1\n"
+            + if args[0] == "no-stage-reply" {
+                "required=false\ntimeout_secs=1\n"
+            } else {
+                "required=false\ntimeout_secs=0\n"
+            }
             + &layer(&home, "suffix", "'request'", &["reply", "{}"]);
-        let (port, out) = launch(&home, up, &cfg);
-        assert!(out.status.success(), "{out:?}");
-        let startup: Value = serde_json::from_slice(&out.stdout).unwrap();
-        let res = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap()
-            .post(format!("http://127.0.0.1:{port}/"))
-            .body("input")
-            .send()
-            .await
-            .unwrap();
+        let (client, url, mut clock) = Clock::start(&home, up, &cfg);
+        let response = tokio::spawn(client.post(&url).body("input").send());
+        if args[0] == "no-stage-reply" {
+            observed_stage(&home, "optional", "request", 1).await;
+            clock.advance(1);
+        }
+        let res = response.await.unwrap().unwrap();
         let rejected = args[0] == "error";
         assert_eq!(res.status().as_u16(), if rejected { 422 } else { 200 });
         res.bytes().await.unwrap();
@@ -1731,7 +1729,7 @@ async fn optional_format_faults_preserve_input_and_warn_once() {
         } else {
             assert_eq!(f[1]["request"]["body"], "input");
         }
-        let log = std::fs::read_to_string(startup["log_path"].as_str().unwrap()).unwrap();
+        let log = std::fs::read_to_string(home.path().join("clock.log")).unwrap();
         assert_eq!(
             log.matches("optional format layer skipped").count(),
             usize::from(!rejected)
@@ -2683,10 +2681,13 @@ async fn reroute_true_reruns_the_retry_segment() {
 async fn decide_timeout_falls_back_and_counts_toward_the_breaker() {
     let home = TestHome::new();
     let (up, calls) = upstream(&[503, 503, 200]).await;
-    let cfg = layer(&home, "slow", "'decide'", &["sleep", "2500"])
+    let cfg = layer(&home, "slow", "'decide'", &["no-stage-reply"])
         + "decide_timeout_secs=1\ntimeout_secs=0\nbreaker_failures=1\n";
-    let (c, url) = running(&home, up, &cfg);
-    assert_eq!(c.get(&url).send().await.unwrap().status(), 200);
+    let (c, url, mut clock) = Clock::start(&home, up, &cfg);
+    let response = tokio::spawn(c.get(&url).send());
+    observed_stage(&home, "slow", "decide", 1).await;
+    clock.advance(1);
+    assert_eq!(response.await.unwrap().unwrap().status(), 200);
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 3);
     let b = breaker(&home, &url).await;
     assert_eq!(b["state"], "open");

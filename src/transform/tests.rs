@@ -170,11 +170,19 @@ async fn crashed_worker_is_evicted_and_next_request_respawns() {
 /// 超时后即使回复稍后到达，也不会被下个请求拿走。
 #[tokio::test]
 async fn per_request_timeout_evicts_stuck_worker() {
-    let p = pool(Process::Persistent, "sleep", |e| {
-        e.args.push("3000".into());
-        e.timeout_secs = 1
+    let temp = tempfile::tempdir().unwrap();
+    let seen = temp.path().join("events");
+    let p = pool(Process::Persistent, "no-stage-reply", |e| {
+        e.timeout_secs = 3600;
+        e.env
+            .insert("ECHO_OBSERVE".into(), seen.display().to_string());
     });
-    assert!(matches!(call(&p, "s", false).await, Err(Fault::Timeout)));
+    let pending = p.clone();
+    let task = tokio::spawn(async move { call(&pending, "s", false).await });
+    wait_observed(&seen, "request", 1).await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(3601)).await;
+    assert!(matches!(task.await.unwrap(), Err(Fault::Timeout)));
     assert!(p.idle.lock().unwrap().is_empty());
 }
 /// 两个重叠的往返使用不同的槽位。
@@ -596,7 +604,7 @@ async fn return_check_distinguishes_stray_bytes_from_clean_eof() {
         wire::Request::new("POST".into(), "http://localhost/".into()),
         wire::Client::new("/".into(), Some(false)),
     ));
-    p.exchange(&mut turn.worker, frame, 2, Some(&turn.ticket))
+    p.exchange(&mut turn.worker, frame, 0, Some(&turn.ticket))
         .await
         .unwrap();
     let pid = wait_observed(&obs, "hello", 1).await[0]["pid"]

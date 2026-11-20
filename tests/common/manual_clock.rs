@@ -150,6 +150,14 @@ async fn serve() {
         false,
     );
     assert!(config.is_valid(), "{:?}", config.diagnostics);
+    // 记录实际可选层跳过的警告，不把日志混到时钟的确认管道。
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(std::sync::Mutex::new(
+            std::fs::File::create(file.with_extension("log")).unwrap(),
+        ))
+        .init();
     let state = proxy::AppState::new(config.config);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let reader = tokio::task::spawn_blocking(move || {

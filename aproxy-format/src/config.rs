@@ -35,10 +35,15 @@ pub fn load<T: DeserializeOwned>(path: &str) -> Result<T, &'static str> {
     serde_path_to_error::deserialize(de).map_err(|err| {
         // 路径中可能有用户自定义的头名、模型名或 JSON 指针。只从公开配置词表选一个诊断，绝不回显原段。
         macro_rules! known { ($key:expr; $($name:literal),+) => { match $key {$($name=>Some(concat!("角色配置字段无效：",$name)),)+ _=>None} }; }
-        err.path().iter().filter_map(|segment|match segment {
-            serde_path_to_error::Segment::Map{key}=>known!(key.as_str();"aliases","auth_header","body_regex","carry_query","channel","cooldown_secs","cooldown_status","credential_env","decision","delay_ms","env","event","failure","failure_threshold","from","header","hold_secs","id","keys","max_entries","model","models","origin","overrides","path","path_prefix","pool","preserve_path","preset","priority","protocol","recovery_latency_ms","recovery_samples","recovery_success_ratio","regex","remove","remove_headers","reroute","respect_retry_after","response","rule","scheme","set","set_headers","status","sticky","strategy","stream_budget_bytes","to","ttl_secs","upstream","url","weight"),
-            _=>None,
-        }).next_back().unwrap_or(generic)
+        let mut field = None;
+        for (depth, segment) in err.path().iter().enumerate() {
+            let serde_path_to_error::Segment::Map { key } = segment else { continue; };
+            field = known!(key.as_str();"aliases","auth_header","body_regex","carry_query","channel","cooldown_secs","cooldown_status","credential_env","decision","delay_ms","env","event","failure","failure_threshold","from","header","hold_secs","id","keys","max_entries","model","models","origin","overrides","path","path_prefix","pool","preserve_path","preset","priority","protocol","recovery_latency_ms","recovery_samples","recovery_success_ratio","regex","remove","remove_headers","reroute","respect_retry_after","response","rule","scheme","set","set_headers","status","sticky","strategy","stream_budget_bytes","to","ttl_secs","upstream","url","weight").or(field);
+            // 根级 models 是改写映射，channel 中的 models 则是匹配器列表。
+            // 表边界之后的成员名是操作者的数据，即便恰好与别处的字段同名也不能回显。
+            if matches!(key.as_str(), "aliases" | "overrides" | "set" | "set_headers") || depth == 0 && key == "models" { break; }
+        }
+        field.unwrap_or(generic)
     })
 }
 

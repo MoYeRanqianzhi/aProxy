@@ -865,6 +865,9 @@ fn config_diagnostic_names_the_field_not_the_value() {
             "[set_headers]\nprivate-fixture=123",
             "set_headers",
         ),
+        ("rewrite", "[set_headers]\nmodel=123", "set_headers"),
+        ("rewrite", "[models]\nweight=123", "models"),
+        ("route", "[aliases]\nurl=123", "aliases"),
     ] {
         std::fs::write(&f, text).unwrap();
         let r = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))

@@ -47,7 +47,7 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # 在读取任何数据之前排除映射的网络盘、设备与重解析点。
-windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming"] }
+windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming"] }
 
 [dev-dependencies]
 # 端到端测试的临时配置目录

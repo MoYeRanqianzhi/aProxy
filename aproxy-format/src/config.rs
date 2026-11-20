@@ -117,6 +117,34 @@ pub struct Variables {
     /// 静态检查不要求提供密钥；实际执行或试跑遇到缺失凭据仍报错。
     pub structural: bool,
 }
+impl Variables {
+    /// 与启动子进程时的 envs 覆盖次序一致；Windows 环境名按系统序数比较，不按当前语言排序。
+    fn get(&self, name: &str) -> Option<&String> {
+        #[cfg(not(windows))]
+        {
+            self.overlay.get(name)
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+            let needle: Vec<_> = name.encode_utf16().collect();
+            self.overlay.iter().rev().find_map(|(key, value)| {
+                let key: Vec<_> = key.encode_utf16().collect();
+                // SAFETY: 长度按 UTF-16 单元计数，两个缓冲区均活过整个调用。
+                let same = unsafe {
+                    CompareStringOrdinal(
+                        key.as_ptr(),
+                        key.len().try_into().ok()?,
+                        needle.as_ptr(),
+                        needle.len().try_into().ok()?,
+                        1,
+                    )
+                };
+                (same == CSTR_EQUAL).then_some(value)
+            })
+        }
+    }
+}
 /// 环境变量名是系统接口的一部分，空名、等号与 NUL 不能表示一个凭据来源。
 pub fn credential_name(env: &str) -> Result<(), Fault> {
     if env.is_empty() || env.contains(['=', '\0']) {
@@ -134,7 +162,6 @@ pub fn credential(env: &str, scheme: &str, variables: &Variables) -> Result<Stri
         Some("offline-placeholder".to_owned())
     } else {
         variables
-            .overlay
             .get(env)
             .cloned()
             .or_else(|| std::env::var(env).ok())
@@ -163,4 +190,22 @@ pub fn report(summary: &str, action: StandardAction) -> ReportField {
     let mut r = Report::new(summary.into());
     r.actions.push(Action::new(action, None));
     ReportField::Present(r)
+}
+
+/// Windows 创建的子进程只有一个不分大小写的变量槽；试跑覆盖顺序须与 Command::envs 相同。
+#[cfg(all(test, windows))]
+#[test]
+fn credential_overlay_uses_windows_name_ordering() {
+    let variables = Variables {
+        overlay: [
+            ("T06_Ä_KEY".into(), "first".into()),
+            ("t06_ä_key".into(), "last".into()),
+        ]
+        .into(),
+        structural: false,
+    };
+    assert_eq!(
+        credential("T06_Ä_KEY", "", &variables).map_err(|e| e.local),
+        Ok("last".into())
+    );
 }

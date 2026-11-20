@@ -330,7 +330,7 @@ async fn completed_late_heartbeat_and_next_tick_publish_only_eligible_bytes() {
         pending: Default::default(),
         warned: Default::default(),
     }));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3600);
     assert!(sink.heartbeat(deadline));
     let saw = |event: &str| {
         std::fs::read_to_string(&obs)
@@ -339,7 +339,7 @@ async fn completed_late_heartbeat_and_next_tick_publish_only_eligible_bytes() {
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .any(|v| v["event"] == event)
     };
-    tokio::time::timeout_at(deadline, async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         while !saw("heartbeat") {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -347,14 +347,16 @@ async fn completed_late_heartbeat_and_next_tick_publish_only_eligible_bytes() {
     .await
     .unwrap();
     // 阻塞本测试自己的 runtime，禁止旧拍抢先运行；通过子进程 flush 后的标记确认两个输入都已就绪。
-    std::thread::sleep(deadline.saturating_duration_since(tokio::time::Instant::now()));
+    tokio::time::pause();
     std::fs::write(&gate, b"").unwrap();
     let limit = std::time::Instant::now() + Duration::from_secs(3);
     while !saw("reply-flushed") {
         assert!(std::time::Instant::now() < limit);
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert!(sink.heartbeat(tokio::time::Instant::now() + Duration::from_secs(3)));
+    tokio::time::advance(Duration::from_secs(3601)).await;
+    tokio::time::resume();
+    assert!(sink.heartbeat(tokio::time::Instant::now() + Duration::from_secs(3600)));
     assert_eq!(
         rx.recv().await.unwrap().unwrap(),
         Bytes::from_static(b": keepalive\n\n")

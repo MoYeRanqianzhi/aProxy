@@ -8,6 +8,8 @@
 //! 不串包 / 复用到死 worker 时换新重试）。
 
 mod common;
+#[path = "common/manual_clock.rs"]
+mod manual_clock;
 use common::{TestHome, format_echo_path};
 
 use std::sync::{Arc, Mutex, atomic::AtomicUsize, atomic::Ordering};
@@ -605,26 +607,55 @@ async fn slow_sse_upstream(delay_ms: u64) -> (String, tokio::task::JoinHandle<()
 async fn heartbeat_reply_cannot_change_state() {
     // 心跳始终只读本程序的 state 且不带请求体；响应层追加它收到的状态以供核对。
     // 回放的上游事件完整出现在所有心跳之后。
-    isolate_env_proxy();
-    let (upstream, _jh) = slow_sse_upstream(2500).await;
-    let mut cfg = keepalive_1s_config_for(&upstream);
-    cfg.formats.push(transform_config(
-        "heartbeat",
-        Process::Persistent,
-        &[Stage::Heartbeat, Stage::Response],
-    ));
-    let (proxy, _pj) = start_proxy(cfg).await;
-
-    let body = local_client()
-        .post(format!("{proxy}/v1/messages"))
-        .header("accept", "text/event-stream")
-        .body(r#"{"stream":true}"#)
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let home = TestHome::new();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let gate = release.clone();
+    let (up, _up) = bind_router(Router::new().fallback(move || {
+        let gate = gate.clone();
+        seen.fetch_add(1, Ordering::Relaxed);
+        async move {
+            gate.notified().await;
+            (
+                [("content-type", "text/event-stream")],
+                "data: {\"ok\":true}\n\n",
+            )
+        }
+    }))
+    .await;
+    let config = format!(
+        "[keepalive]\ninterval_secs=1\n[[format]]\nname='echo'\ncommand={}\nargs=['heartbeat']\nprocess='persistent'\nstages=['heartbeat','response']\n",
+        serde_json::to_string(&format_echo_path()).unwrap()
+    );
+    let (client, proxy, mut clock) = manual_clock::Clock::start(
+        &home,
+        up.rsplit(':').next().unwrap().parse().unwrap(),
+        &config,
+    );
+    let mut res = clock
+        .first_head(
+            client
+                .post(format!("{proxy}/v1/messages"))
+                .header("accept", "text/event-stream")
+                .body(r#"{"stream":true}"#),
+            &calls,
+            1,
+        )
+        .await;
+    let mut bytes = Vec::new();
+    for i in [1, 2] {
+        if i == 2 {
+            clock.advance(1);
+        }
+        let end = format!(": hb seq={i} attempt=1 body=false\n\n");
+        while !bytes.ends_with(end.as_bytes()) {
+            bytes.extend_from_slice(&res.chunk().await.unwrap().unwrap());
+        }
+    }
+    release.notify_one();
+    bytes.extend_from_slice(&res.bytes().await.unwrap());
+    let body = String::from_utf8(bytes).unwrap();
     assert!(
         body.contains(": hb seq=1 attempt=1 body=false\n\n"),
         "首拍应由心跳转换器生成且不带请求体: {body:?}"

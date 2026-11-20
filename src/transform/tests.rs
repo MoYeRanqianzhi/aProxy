@@ -174,12 +174,21 @@ async fn per_request_timeout_evicts_stuck_worker() {
 /// 两个重叠的往返使用不同的槽位。
 #[tokio::test]
 async fn concurrent_requests_within_pool_max() {
-    let p = pool(Process::Persistent, "sleep", |e| {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("release");
+    let obs = dir.path().join("seen");
+    let p = pool(Process::Persistent, "gate-request", |e| {
         e.pool_max = 2;
-        e.args.push("150".into());
+        e.timeout_secs = 0;
+        e.args.push(gate.display().to_string());
+        e.env
+            .insert("ECHO_OBSERVE".into(), obs.display().to_string());
     });
-    let (a, b) = tokio::join!(call(&p, "a", false), call(&p, "b", false));
-    let ids = [worker(a.unwrap(), "a"), worker(b.unwrap(), "b")];
+    let mut a = std::pin::pin!(call(&p, "blocked", false));
+    tokio::select! {_=&mut a=>panic!("completed before release"),_=wait_observed(&obs,"request",1)=>{}}
+    let b = call(&p, "b", false).await.unwrap();
+    std::fs::write(gate, b"ok").unwrap();
+    let ids = [worker(a.await.unwrap(), "blocked"), worker(b, "b")];
     for n in ["0/", "1/"] {
         assert!(ids.iter().any(|s| s.starts_with(n)));
     }
@@ -368,9 +377,13 @@ async fn evicted_worker_aborts_even_a_stderr_reader_that_never_reaches_eof() {
 
 /// 读取由进程自己确认的事件；未写完整的一行留给下次轮询，不用睡眠猜测进程进度。
 async fn wait_observed(path: &Path, event: &str, count: usize) -> Vec<serde_json::Value> {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let path = path.to_owned();
+    let event = event.to_owned();
+    // 文件由独立进程写入，使用真实的挂死保护。等待文件不会推进被测试的 Tokio 时钟。
+    tokio::task::spawn_blocking(move || {
+        let end = std::time::Instant::now() + Duration::from_secs(15);
         loop {
-            let text = std::fs::read_to_string(path).unwrap_or_default();
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
             let events: Vec<_> = text
                 .lines()
                 .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -379,7 +392,8 @@ async fn wait_observed(path: &Path, event: &str, count: usize) -> Vec<serde_json
             if events.len() >= count {
                 return events;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert!(std::time::Instant::now() < end, "no {event} in {path:?}");
+            std::thread::sleep(Duration::from_millis(5));
         }
     })
     .await
@@ -394,7 +408,7 @@ async fn cancellation_or_timeout_drops_the_exchange_and_queued_cancellation_rele
         let obs = dir.path().join("observations");
         let p = pool(Process::Persistent, "gate-request", |e| {
             e.pool_max = 1;
-            e.timeout_secs = 1;
+            e.timeout_secs = 3600;
             e.args
                 .push(dir.path().join("release").display().to_string());
             e.env
@@ -411,7 +425,10 @@ async fn cancellation_or_timeout_drops_the_exchange_and_queued_cancellation_rele
             first.abort();
             assert!(first.await.unwrap_err().is_cancelled());
         } else {
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(3601)).await;
             assert!(matches!(first.await.unwrap(), Err(Fault::Timeout)));
+            tokio::time::resume();
         }
         let b = worker(call(&p, "second", false).await.unwrap(), "second");
         assert_ne!(b.split_once('/').unwrap().1, a[0]["pid"].to_string());
@@ -467,20 +484,24 @@ async fn one_handshake_per_pool_and_sequences_per_live_worker() {
 async fn normal_retirement_sends_parallel_eof_and_drop_ends_the_reaper() {
     let dir = tempfile::tempdir().unwrap();
     let obs = dir.path().join("observed");
-    let p = pool(Process::Persistent, "slow-eof", |e| {
+    let gate = dir.path().join("release");
+    let p = pool(Process::Persistent, "gated-eof", |e| {
         e.pool_max = 2;
         e.worker_idle_secs = 86400;
+        e.args.push(gate.display().to_string());
         e.env
             .insert("ECHO_OBSERVE".into(), obs.display().to_string());
     });
-    let (a, b) = tokio::join!(call(&p, "a", false), call(&p, "b", false));
-    let a = worker(a.unwrap(), "a");
-    let b = worker(b.unwrap(), "b");
-    assert_ne!(a, b);
-    tokio::time::timeout(Duration::from_millis(3400), p.shutdown())
-        .await
-        .unwrap();
-    assert_eq!(wait_observed(&obs, "eof", 2).await.len(), 2);
+    let a = p.turn(false).await.unwrap();
+    let b = p.turn(false).await.unwrap();
+    let (a, b) = tokio::join!(a.send(request_frame("a"), 0), b.send(request_frame("b"), 0));
+    assert_ne!(worker(a.unwrap().0, "a"), worker(b.unwrap().0, "b"));
+    tokio::time::pause();
+    let mut shutdown = std::pin::pin!(p.shutdown());
+    tokio::select! {_=&mut shutdown=>panic!("returned before both gated workers received EOF"), eof=wait_observed(&obs,"eof",2)=>assert_eq!(eof.len(),2)}
+    std::fs::write(gate, b"finish").unwrap();
+    tokio::time::resume();
+    shutdown.await;
     let p = pool(Process::Persistent, "echo", |e| e.worker_idle_secs = 86400);
     p.probe().await.unwrap();
     let h = p.reaper.get().unwrap().abort_handle();
@@ -711,15 +732,17 @@ async fn half_open_probe_cancellation_timeout_and_invalid_reply_have_distinct_ou
         let dir = tempfile::tempdir().unwrap();
         let obs = dir.path().join("observations");
         let p = pool(Process::Persistent, mode, |e| {
-            e.timeout_secs = 1;
-            e.breaker_cooldown_secs = 1;
+            e.timeout_secs = 3600;
+            e.breaker_cooldown_secs = 86400;
             e.args.push(dir.path().join("gate").display().to_string());
             e.env
                 .insert("ECHO_OBSERVE".into(), obs.display().to_string());
         });
         p.open_at_startup(Fault::Spawn);
         let opened = p.snapshot().1["breaker"]["probe_at"].clone();
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(86401)).await;
+        tokio::time::resume();
         let test_pool = p.clone();
         let send = tokio::spawn(async move { call(&test_pool, "blocked", false).await });
         wait_observed(&obs, "request", 1).await;
@@ -727,7 +750,14 @@ async fn half_open_probe_cancellation_timeout_and_invalid_reply_have_distinct_ou
             send.abort();
             assert!(send.await.unwrap_err().is_cancelled());
         } else {
+            if mode != "bad-seq" {
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(3601)).await;
+            }
             let f = send.await.unwrap().unwrap_err();
+            if mode != "bad-seq" {
+                tokio::time::resume();
+            }
             assert_eq!(
                 f.kind(),
                 if mode == "bad-seq" {
@@ -743,9 +773,14 @@ async fn half_open_probe_cancellation_timeout_and_invalid_reply_have_distinct_ou
         if cancel {
             assert_eq!(b["probe_at"], opened);
         } else {
-            assert!(b["probe_at"].as_u64() > opened.as_u64());
+            assert_eq!(
+                b["probe_at"].as_u64().unwrap() - b["opened_at"].as_u64().unwrap(),
+                86_400_000
+            );
             assert!(matches!(p.admit(), Err(Fault::Open { .. })));
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(86401)).await;
+            tokio::time::resume();
         }
         assert!(p.admit().unwrap().probe);
         assert_eq!(wait_observed(&obs, "hello", 1).await.len(), 1);

@@ -1,6 +1,9 @@
 //! 真正通过启动命令协商协议，区分子进程不可用与静态不兼容。每个实例都有自己的 home。
 mod common;
+#[path = "common/manual_clock.rs"]
+mod manual_clock;
 use common::{TestHome, format_echo_path, free_port};
+use manual_clock::Clock;
 use serde_json::Value;
 
 /// 用裸名从 home/bin 找到本地测试程序。真实命令、注册记录与 IPC 应答共用同一个临时 home。
@@ -466,6 +469,8 @@ async fn overrides_apply_to_one_request_and_unknown_keys_are_ignored() {
 async fn keepalive_overrides_observe_the_commit_between_layers() {
     let home = TestHome::new();
     let (up, _) = upstream(&[200]).await;
+    let slow = home.path().join("slow.release");
+    let wait = home.path().join("wait.release");
     let cfg = String::from("[keepalive]\ninterval_secs=0\n")
         + &layer(
             &home,
@@ -476,7 +481,12 @@ async fn keepalive_overrides_observe_the_commit_between_layers() {
                 r#"{"overrides":{"keepalive":{"trigger":"always","interval_secs":1,"heartbeat":": first\n\n"}}}"#,
             ],
         )
-        + &layer(&home, "slow", "'request'", &["sleep", "1400"])
+        + &layer(
+            &home,
+            "slow",
+            "'request'",
+            &["gate-request", slow.to_str().unwrap()],
+        )
         + &layer(
             &home,
             "late",
@@ -486,11 +496,32 @@ async fn keepalive_overrides_observe_the_commit_between_layers() {
                 r#"{"overrides":{"keepalive":{"heartbeat":": late\n\n"}}}"#,
             ],
         )
-        + &layer(&home, "wait", "'request'", &["sleep", "1200"]);
-    let (client, url) = running(&home, up, &cfg);
-    let res = client.post(url).send().await.unwrap();
+        + &layer(
+            &home,
+            "wait",
+            "'request'",
+            &["gate-request", wait.to_str().unwrap()],
+        );
+    let (client, url, mut clock) = Clock::start(&home, up, &cfg);
+    let sending = tokio::spawn(client.post(url).body("blocked").send());
+    observed_stage(&home, "slow", "request", 1).await;
+    clock.advance(1);
+    let mut res = sending.await.unwrap().unwrap();
     assert_eq!(res.headers()["content-type"], "text/event-stream");
-    let body = res.text().await.unwrap();
+    let mut bytes = Vec::new();
+    while !bytes.ends_with(b": first\n\n") {
+        bytes.extend_from_slice(&res.chunk().await.unwrap().unwrap());
+    }
+    std::fs::write(slow, b"ok").unwrap();
+    observed_stage(&home, "wait", "request", 1).await;
+    clock.advance(1);
+    let before = bytes.len();
+    while bytes.len() == before {
+        bytes.extend_from_slice(&res.chunk().await.unwrap().unwrap());
+    }
+    std::fs::write(wait, b"ok").unwrap();
+    bytes.extend_from_slice(&res.bytes().await.unwrap());
+    let body = String::from_utf8(bytes).unwrap();
     assert!(body.matches(": first\n\n").count() >= 2, "{body}");
     assert!(!body.contains(": late"));
 }
@@ -505,7 +536,10 @@ async fn chain_runs_request_in_order_and_response_and_heartbeat_in_reverse() {
         .unwrap();
     let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     let gate = release.clone();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = calls.clone();
     let app = axum::Router::new().fallback(move |body: String| {
+        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let gate = gate.clone();
         async move {
             assert_eq!(body, "qAB");
@@ -521,14 +555,17 @@ async fn chain_runs_request_in_order_and_response_and_heartbeat_in_reverse() {
     let config = String::from("[keepalive]\ninterval_secs=1\n")
         + &layer(&home, "outer", stages, &["append", "A"])
         + &layer(&home, "inner", stages, &["append", "B"]);
-    let (client, url) = running(&home, up, &config);
-    let mut res = client
-        .post(format!("{url}/stream"))
-        .header("accept", "text/event-stream")
-        .body("q")
-        .send()
-        .await
-        .unwrap();
+    let (client, url, mut clock) = Clock::start(&home, up, &config);
+    let mut res = clock
+        .first_head(
+            client
+                .post(format!("{url}/stream"))
+                .header("accept", "text/event-stream")
+                .body("q"),
+            &calls,
+            1,
+        )
+        .await;
     let mut bytes = Vec::new();
     let beat = b": keepalive\n\n: B\n\n: A\n\n";
     while !bytes.windows(beat.len()).any(|w| w == beat) {
@@ -698,7 +735,7 @@ async fn breaker_closes_after_a_successful_probe() {
         "'request'",
         &["bad-until-file", stamp.to_str().unwrap()],
     ) + "breaker_failures=1\nbreaker_cooldown_secs=1\n";
-    let (c, url) = running(&home, up, &cfg);
+    let (c, url, mut clock) = Clock::start(&home, up, &cfg);
     let (snapshot, mut events) =
         aproxy::daemon::ipc_subscribe_in(&home.path().join("run"), url.rsplit(':').next().unwrap())
             .await
@@ -710,7 +747,7 @@ async fn breaker_closes_after_a_successful_probe() {
     assert_eq!(c.post(&url).send().await.unwrap().status(), 503);
     assert_eq!(breaker(&home, &url).await["state"], "open");
     std::fs::write(stamp, b"ok").unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(1050)).await;
+    clock.advance(1);
     for _ in 0..2 {
         assert_eq!(c.post(&url).send().await.unwrap().status(), 200);
     }
@@ -1651,25 +1688,34 @@ async fn committed_format_rejection_uses_the_terminal_event_rules() {
     ] {
         let home = TestHome::new();
         let json = serde_json::json!({"fail":{"retry":false,"reason":"stop","response":{"status":409,"headers":{"content-type":mime},"body":body}},"overrides":{"keepalive":{"unknown":"never-log-late","interval_secs":"bad-late-value"}}});
+        let gate = home.path().join("release");
         let cfg = String::from(
             "[keepalive]\ninterval_secs=1\ntrigger='accept'\n[override_headers]\naccept='text/plain'\n",
-        ) + &layer(&home, "wait", "'request'", &["sleep", "1300"])
-            + &layer(&home, "stop", "'request'", &["reply", &json.to_string()]);
+        ) + &layer(
+            &home,
+            "wait",
+            "'request'",
+            &["gate-request", gate.to_str().unwrap()],
+        ) + &layer(&home, "stop", "'request'", &["reply", &json.to_string()]);
         let (port, out) = launch(&home, up, &cfg);
         assert!(out.status.success(), "{out:?}");
         let start: Value = serde_json::from_slice(&out.stdout).unwrap();
         let url = format!("http://127.0.0.1:{port}");
-        let res = reqwest::Client::builder()
+        let mut res = reqwest::Client::builder()
             .no_proxy()
             .timeout(std::time::Duration::from_secs(6))
             .build()
             .unwrap()
-            .get(&url)
+            .post(&url)
+            .body("blocked")
             .header("accept", "text/event-stream")
             .send()
             .await
             .unwrap();
         assert_eq!(res.status(), 200);
+        let first = res.chunk().await.unwrap().unwrap();
+        assert!(first.starts_with(b":"));
+        std::fs::write(gate, b"ok").unwrap();
         let bytes = res.text().await.unwrap();
         if tail.is_empty() {
             assert!(bytes.contains("event: error\ndata:") && bytes.contains("format_rejected"));
@@ -1860,7 +1906,7 @@ async fn observed_stage(home: &TestHome, name: &str, stage: &str, count: usize) 
 async fn pending_heartbeat_does_not_delay_a_response_or_its_eof() {
     for body in ["data: result\n\n", ""] {
         let home = TestHome::new();
-        let (up, release, _) = held_upstream(&[200], body).await;
+        let (up, release, calls) = held_upstream(&[200], body).await;
         let cfg = String::from("[keepalive]\ninterval_secs=3\ntrigger='accept'\n")
             + &layer(
                 &home,
@@ -1869,16 +1915,17 @@ async fn pending_heartbeat_does_not_delay_a_response_or_its_eof() {
                 &["held-beat", home.path().join("never").to_str().unwrap()],
             )
             + "pool_max=1\ntimeout_secs=0\n";
-        let (client, url) = running(&home, up, &cfg);
-        let res = client
-            .post(&url)
-            .header("accept", "text/event-stream")
-            .send()
-            .await
-            .unwrap();
+        let (client, url, mut clock) = Clock::start(&home, up, &cfg);
+        let res = clock
+            .first_head(
+                client.post(&url).header("accept", "text/event-stream"),
+                &calls,
+                3,
+            )
+            .await;
         observed_stage(&home, "shared", "heartbeat", 1).await;
         release.add_permits(1);
-        let text = tokio::time::timeout(std::time::Duration::from_millis(1500), res.text())
+        let text = tokio::time::timeout(std::time::Duration::from_secs(15), res.text())
             .await
             .expect("response waited on heartbeat")
             .unwrap();
@@ -1899,28 +1946,36 @@ async fn pending_heartbeat_does_not_delay_a_response_or_its_eof() {
 #[tokio::test]
 async fn heartbeat_skips_failed_or_open_layers_and_keeps_each_client() {
     let home = TestHome::new();
-    let (up, release, _) = held_upstream(&[200], "data: done\n\n").await;
+    let (up, release, calls) = held_upstream(&[200], "data: done\n\n").await;
     let cfg = String::from("[keepalive]\ninterval_secs=1\n")
         + &layer(&home, "outer", "'heartbeat'", &["append", "outer"])
         + &layer(&home, "fault", "'heartbeat'", &["bad-beat"])
         + "breaker_failures=1\nbreaker_cooldown_secs=30\n"
         + &layer(&home, "inner", "'heartbeat'", &["alternate-beat"]);
-    let (client, url) = running(&home, up, &cfg);
-    let mut res = client
-        .get(format!("{url}/beats"))
-        .header("accept", "text/event-stream")
-        .send()
-        .await
-        .unwrap();
+    let (client, url, mut clock) = Clock::start(&home, up, &cfg);
+    let mut res = clock
+        .first_head(
+            client
+                .get(format!("{url}/beats"))
+                .header("accept", "text/event-stream"),
+            &calls,
+            1,
+        )
+        .await;
     let mut text = String::new();
-    let expected = ": keepalive\n\n: outer\n\n: second\n\n: outer\n\n";
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !text.contains(expected) {
+    for (i, expected) in [": keepalive\n\n: outer\n\n", ": second\n\n: outer\n\n"]
+        .into_iter()
+        .enumerate()
+    {
+        if i != 0 {
+            clock.advance(1);
+        }
+        text.clear();
+        while !text.ends_with(expected) {
             text.push_str(std::str::from_utf8(&res.chunk().await.unwrap().unwrap()).unwrap());
         }
-    })
-    .await
-    .unwrap();
+        assert_eq!(text, expected);
+    }
     release.add_permits(1);
     assert!(res.text().await.unwrap().ends_with("data: done\n\n"));
     assert_eq!(
@@ -1956,7 +2011,7 @@ async fn heartbeat_skips_failed_or_open_layers_and_keeps_each_client() {
 #[tokio::test]
 async fn spawn_heartbeat_is_delivered_while_its_worker_is_still_cleaning_up() {
     let home = TestHome::new();
-    let (up, release, _) = held_upstream(&[200], "data: done\n\n").await;
+    let (up, release, calls) = held_upstream(&[200], "data: done\n\n").await;
     let gate = home.path().join("cleanup");
     let cfg = String::from("[keepalive]\ninterval_secs=1\n")
         + &layer(
@@ -1966,13 +2021,14 @@ async fn spawn_heartbeat_is_delivered_while_its_worker_is_still_cleaning_up() {
             &["cleanup-beat", gate.to_str().unwrap()],
         )
         .replace("process='persistent'", "process='spawn'");
-    let (client, url) = running(&home, up, &cfg);
-    let mut response = client
-        .get(&url)
-        .header("accept", "text/event-stream")
-        .send()
-        .await
-        .unwrap();
+    let (client, url, mut clock) = Clock::start(&home, up, &cfg);
+    let mut response = clock
+        .first_head(
+            client.get(&url).header("accept", "text/event-stream"),
+            &calls,
+            1,
+        )
+        .await;
     let first = response.chunk().await.unwrap().unwrap();
     std::fs::write(&gate, b"").unwrap();
     release.add_permits(1);
@@ -1984,7 +2040,7 @@ async fn spawn_heartbeat_is_delivered_while_its_worker_is_still_cleaning_up() {
 #[tokio::test]
 async fn missed_beat_deadline_preserves_last_timely_fragment() {
     let home = TestHome::new();
-    let (up, release, _) = held_upstream(&[200], "data: done\n\n").await;
+    let (up, release, calls) = held_upstream(&[200], "data: done\n\n").await;
     let cfg = String::from("[keepalive]\ninterval_secs=1\n")
         + &layer(
             &home,
@@ -1993,21 +2049,23 @@ async fn missed_beat_deadline_preserves_last_timely_fragment() {
             &["held-beat", home.path().join("hold").to_str().unwrap()],
         )
         + &layer(&home, "inner", "'heartbeat'", &["append", "timely"]);
-    let (client, url) = running(&home, up, &cfg);
-    let mut res = client
-        .get(&url)
-        .header("accept", "text/event-stream")
-        .send()
-        .await
-        .unwrap();
+    let (client, url, mut clock) = Clock::start(&home, up, &cfg);
+    let mut res = clock
+        .first_head(
+            client.get(&url).header("accept", "text/event-stream"),
+            &calls,
+            1,
+        )
+        .await;
     observed_stage(&home, "slow", "heartbeat", 1).await;
-    let first = tokio::time::timeout(std::time::Duration::from_secs(3), res.chunk())
+    clock.advance(1);
+    let first = tokio::time::timeout(std::time::Duration::from_secs(15), res.chunk())
         .await
         .unwrap()
         .unwrap()
         .unwrap();
     assert_eq!(first.as_ref(), b": keepalive\n\n: timely\n\n");
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {
             if breaker(&home, &url).await["last_failure"]["details"]["kind"] == "timeout" {
                 break;
@@ -2050,7 +2108,7 @@ async fn response_recovery_and_breaker_admission_use_only_allowed_workers() {
         if mode == "probe-response" {
             cfg += "breaker_failures=1\nbreaker_cooldown_secs=2\n";
         }
-        let (c, url) = running(&home, up, &cfg);
+        let (c, url, mut clock) = Clock::start(&home, up, &cfg);
         let get = || c.get(&url).send();
         assert_eq!(get().await.unwrap().text().await.unwrap(), expected);
         assert_eq!(
@@ -2067,12 +2125,7 @@ async fn response_recovery_and_breaker_admission_use_only_allowed_workers() {
         }
         if mode == "probe-response" {
             std::fs::write(&flag, b"").unwrap();
-            let at = breaker(&home, &url).await["probe_at"].as_u64().unwrap();
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-            tokio::time::sleep(std::time::Duration::from_millis(at.saturating_sub(now) + 1)).await;
+            clock.advance(2);
             let probe = tokio::spawn(get());
             observed_stage(&home, "res", "response", 2).await;
             assert_eq!(breaker(&home, &url).await["state"], "half_open");
@@ -2703,10 +2756,16 @@ async fn exercise_optional_startup_recovery(enabled: bool) {
     } else {
         "required=false\nbreaker_failures=0\n"
     };
-    let (c, url) = running(&home, up, &cfg);
-    if enabled {
+    let (c, url, mut clock) = if enabled {
+        let (c, url, clock) = Clock::start(&home, up, &cfg);
+        (c, url, Some(clock))
+    } else {
+        let (c, url) = running(&home, up, &cfg);
+        (c, url, None)
+    };
+    if let Some(clock) = clock.as_mut() {
         assert_eq!(breaker(&home, &url).await["state"], "open");
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        clock.advance(1);
     } else {
         let ping =
             aproxy::daemon::ipc_ping_in(&home.path().join("run"), url.rsplit(':').next().unwrap())
@@ -2737,7 +2796,7 @@ async fn exercise_optional_startup_recovery(enabled: bool) {
 #[tokio::test]
 async fn response_ready_heartbeat_reuses_last_timely_bytes_without_more_calls() {
     let home = TestHome::new();
-    let (up, release, _) = held_upstream(&[200], "data: done\n\n").await;
+    let (up, release, calls) = held_upstream(&[200], "data: done\n\n").await;
     let gate = home.path().join("gate");
     let cfg = String::from("[keepalive]\ninterval_secs=1\n")
         + &layer(&home, "beat", "'heartbeat'", &["append", "chosen"])
@@ -2747,19 +2806,23 @@ async fn response_ready_heartbeat_reuses_last_timely_bytes_without_more_calls() 
             "'response'",
             &["gate-response", gate.to_str().unwrap()],
         );
-    let (c, url) = running(&home, up, &cfg);
-    let mut res = c
-        .get(format!("{url}/hold"))
-        .header("accept", "text/event-stream")
-        .send()
-        .await
-        .unwrap();
+    let (c, url, mut clock) = Clock::start(&home, up, &cfg);
+    let mut res = clock
+        .first_head(
+            c.get(format!("{url}/hold"))
+                .header("accept", "text/event-stream"),
+            &calls,
+            1,
+        )
+        .await;
     let first = res.chunk().await.unwrap().unwrap();
     assert!(first.ends_with(b": chosen\n\n"));
     release.add_permits(1);
     observed_stage(&home, "slow", "response", 1).await;
     let before = frames(&home, "beat").len();
+    clock.advance(1);
     assert_eq!(res.chunk().await.unwrap().unwrap(), first);
+    clock.advance(1);
     assert_eq!(res.chunk().await.unwrap().unwrap(), first);
     assert_eq!(frames(&home, "beat").len(), before);
     std::fs::write(gate, b"").unwrap();
@@ -3063,16 +3126,11 @@ async fn pending_success_vote_preserves_non_sse() {
             "env={",
             "decide_timeout_secs=0\nenv={ ECHO_DECIDE_SUCCESS='1',",
         );
-    let (c, url) = running(&home, up, &cfg);
-    let mut client = tokio::spawn(c.get(url).header("accept", "text/event-stream").send());
+    let (c, url, mut clock) = Clock::start(&home, up, &cfg);
+    let client = tokio::spawn(c.get(url).header("accept", "text/event-stream").send());
     observed_stage(&home, "policy", "decide", 1).await;
-    // 从已收到咨询的时刻起跨过真正的心跳间隔；若响应头已发出，不能再恢复原媒体类型。
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(1250), &mut client)
-            .await
-            .is_err(),
-        "SSE headers escaped while a non-SSE success was being voted on"
-    );
+    // 咨询已写出且上游返回的内容确定；明确推进两拍再放行，排除初始请求本身耗时的影响。
+    clock.advance(2);
     std::fs::write(gate, b"").unwrap();
     let response = client.await.unwrap().unwrap();
     assert_eq!(response.headers()["content-type"], MIME);
@@ -3361,7 +3419,7 @@ async fn decide_stop_masks_configured_secret_in_upstream_failure() {
 /// 在途消息无回信时，从真正的停止命令观察截止时间；正常空闲的另一进程应该在排空开始时看到 EOF。
 #[tokio::test]
 async fn stop_deadline_reaps_a_worker_with_an_unanswered_message() {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     let home = TestHome::new();
     let watched = |name: &str, stage: &str, args: &[&str]| {
         let obs = serde_json::to_string(&home.path().join(format!("{name}.events"))).unwrap();
@@ -3404,21 +3462,23 @@ async fn stop_deadline_reaps_a_worker_with_an_unanswered_message() {
     assert_eq!(aproxy::process::process_exited(pid), Some(false));
     let mut stop = home.cmd();
     stop.args(["stop", &port.to_string(), "--json"]);
-    let start = Instant::now();
+    let (_, mut events) =
+        aproxy::daemon::ipc_subscribe_in(&home.path().join("run"), &port.to_string())
+            .await
+            .unwrap();
     let stopping = tokio::task::spawn_blocking(move || stop.output().unwrap());
-    let early_eof = tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while events.next().await.unwrap().unwrap()["event"] != "closing" {}
+        // 以实例发出的排空事件为界，不把命令本身排队启动的时间当作清理延迟。
         while event("idle", "eof") != Some(idle) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .is_ok();
+    .expect("no drain announcement or idle EOF");
     let out = stopping.await.unwrap();
-    let elapsed = start.elapsed();
-    let exited = aproxy::process::process_exited(pid);
     assert!(out.status.success(), "{out:?}");
-    assert!(elapsed < Duration::from_secs(12), "stop took {elapsed:?}");
-    assert!(early_eof, "idle EOF waited for the request drain deadline");
+    let exited = aproxy::process::process_exited(pid);
     assert_eq!(exited, Some(true));
     let _ = request.await;
 }
@@ -5009,12 +5069,13 @@ async fn stuck_notify_is_replaced_after_two_seconds() {
     let (up, _) = upstream(&[200]).await;
     let cfg = layer(&home, "hung", "'request','notify'", &["stuck-notify"])
         + "pool_max=1\ntimeout_secs=0\ndecide_timeout_secs=0\n";
-    let (c, url) = running(&home, up, &cfg);
+    let (c, url, mut clock) = Clock::start(&home, up, &cfg);
     assert_eq!(
         c.get(&url).send().await.unwrap().text().await.unwrap(),
         "upstream bytes"
     );
     observed_stage(&home, "hung", "notify", 1).await;
+    clock.advance(2);
     assert_eq!(
         c.get(&url).send().await.unwrap().text().await.unwrap(),
         "upstream bytes"
@@ -5030,7 +5091,7 @@ async fn notify_timeouts_do_not_touch_the_data_path_breaker() {
     for (mode, kind) in [("stuck-notify", "timeout"), ("invalid-notify", "protocol")] {
         let home = TestHome::new();
         let (up, _) = upstream(&[200]).await;
-        let (c, url) = running(
+        let (c, url, mut clock) = Clock::start(
             &home,
             up,
             &(layer(&home, "mixed", "'request','notify'", &[mode])
@@ -5041,6 +5102,10 @@ async fn notify_timeouts_do_not_touch_the_data_path_breaker() {
                 c.get(&url).send().await.unwrap().text().await.unwrap(),
                 "upstream bytes"
             );
+            observed_stage(&home, "mixed", "notify", i as usize).await;
+            if mode == "stuck-notify" {
+                clock.advance(2);
+            }
             let snap = notify_snapshot(&home, &url, |f| f["notify_breaker"]["failures"] == i).await;
             assert_eq!(
                 snap["breaker"],
@@ -5073,7 +5138,7 @@ async fn notify_breaker_opens_after_five_timeouts_and_probes_after_cooldown() {
     let home = TestHome::new();
     let (up, _) = upstream(&[200]).await;
     let gate = home.path().join("reply-ok");
-    let (c, url) = running(
+    let (c, url, mut clock) = Clock::start(
         &home,
         up,
         &(layer(
@@ -5088,6 +5153,8 @@ async fn notify_breaker_opens_after_five_timeouts_and_probes_after_cooldown() {
             c.get(&url).send().await.unwrap().text().await.unwrap(),
             "upstream bytes"
         );
+        observed_stage(&home, "observer", "notify", i as usize).await;
+        clock.advance(2);
         let snap = notify_snapshot(&home, &url, |f| f["notify_breaker"]["failures"] == i).await;
         assert_eq!(
             snap["notify_breaker"]["state"],
@@ -5095,7 +5162,7 @@ async fn notify_breaker_opens_after_five_timeouts_and_probes_after_cooldown() {
         );
     }
     std::fs::write(&gate, b"ready").unwrap();
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    clock.advance(1);
     assert_eq!(
         c.get(&url).send().await.unwrap().text().await.unwrap(),
         "upstream bytes"
@@ -5120,12 +5187,12 @@ async fn notify_only_program_recovers_after_its_breaker_opens() {
         &serde_json::to_string(&format_echo_path()).unwrap(),
         &serde_json::to_string(&path).unwrap(),
     ) + "required=false\nbreaker_cooldown_secs=1\n";
-    let (c, url) = running(&home, up, &cfg);
+    let (c, url, mut clock) = Clock::start(&home, up, &cfg);
     let snap = notify_snapshot(&home, &url, |_| true).await;
     assert_eq!(snap["breaker"]["state"], "closed");
     assert_eq!(snap["notify_breaker"]["state"], "open");
     std::fs::copy(format_echo_path(), &path).unwrap();
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    clock.advance(1);
     assert_eq!(
         c.get(&url).send().await.unwrap().text().await.unwrap(),
         "upstream bytes"

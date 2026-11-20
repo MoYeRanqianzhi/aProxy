@@ -117,8 +117,8 @@ fn main() {
             if mode == "stray-on-eof" || (mode == "stage-stray-on-eof" && count != 0) {
                 println!("unexpected diagnostic on stdout");
             }
-            if mode == "slow-eof" {
-                std::thread::sleep(Duration::from_secs(6));
+            if mode == "gated-eof" {
+                wait_gate(std::path::Path::new(arg));
             }
             break;
         };
@@ -223,7 +223,7 @@ fn main() {
                         | "inspect"
                         | "gate-hello"
                         | "gate-request"
-                        | "slow-eof"
+                        | "gated-eof"
                         | "sleep"
                         | "multiline"
                         | "late-stray"

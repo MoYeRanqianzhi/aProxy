@@ -2421,3 +2421,25 @@ fn tools_resolve_role_configs_from_the_selected_home() {
         }
     }
 }
+
+/// 只订阅回程时没有首轮状态，固定协议对仍可直接用于响应。
+#[test]
+fn check_requires_request_state_for_auto_return_conversion() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("proxy.toml");
+    for stage in ["response", "stream"] {
+        for (from, to, valid) in [
+            ("auto", "openai_chat", false),
+            ("openai_chat", "auto", false),
+            ("openai_chat", "anthropic_messages", true),
+        ] {
+            std::fs::write(&file,format!("[[format]]\nname='c'\ncommand='aproxy-format'\nargs=['convert','--from','{from}','--to','{to}']\nprocess='persistent'\nrequired=true\nstages=['{stage}']")).unwrap();
+            let out = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+                .arg("check")
+                .arg(&file)
+                .output()
+                .unwrap();
+            assert_eq!(out.status.success(), valid, "{out:?}");
+        }
+    }
+}

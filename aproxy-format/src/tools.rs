@@ -291,6 +291,13 @@ pub(super) fn chain(path: &Path, home: Option<&Path>, structural: bool) -> Resul
                 return Err("路由后的请求转换或改写必须声明 retry".into());
             }
             if let Role::Convert(c) = &role {
+                // 决定回程协议的 state 只来自本层自己的 request；首轮不能指望 retry 补上它。
+                if (c.from == "auto" || c.to == "auto")
+                    && !entry.has_stage(Stage::Request)
+                    && (entry.has_stage(Stage::Response) || entry.has_stage(Stage::Stream))
+                {
+                    return Err("自动协议转换的回程需要声明 request".into());
+                }
                 if !entry.required && (c.from != c.to || c.from == "auto") {
                     return Err("跨协议转换必须设置 required=true".into());
                 }

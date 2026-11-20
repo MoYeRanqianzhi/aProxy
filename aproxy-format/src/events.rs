@@ -474,6 +474,15 @@ impl Events {
     }
     /// 按客户端的选项调整目标帧；最后只发一个独立用量块，且不能再带工具或文本。
     fn render_events(&mut self, mut events: Vec<Value>, output: &mut Bounded) -> Result<(), Fault> {
+        // 保留检查和普通增量都可能以成功返回的事件表达译码错误；原始错误不直接发给客户端。
+        if self.state.errored
+            || events.iter().any(|e| match self.target {
+                F::OpenAiChat => e["error"].is_object(),
+                _ => e["type"] == "error",
+            })
+        {
+            return Err(malformed());
+        }
         if self.target == F::OpenAiResponses {
             // 文本和推理文本出现在四个 done/终态位置，工具参数出现在三个位置。
             // 在已确定一行装不下时立即结束，而非先在 finish 中构造全部重复快照。

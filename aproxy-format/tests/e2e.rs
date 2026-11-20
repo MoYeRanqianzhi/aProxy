@@ -1295,6 +1295,42 @@ fn malformed_stream_ends_in_the_client_protocol_only_once() {
     );
 }
 
+/// 编解码器既可能拒绝原生项，也可能发现完成快照撤回了已经发出的文本；两者都是一次类型化错误。
+#[test]
+fn codec_errors_have_one_typed_ending_even_on_abort() {
+    let mut w = Worker::new(&[
+        "convert",
+        "--from",
+        "anthropic_messages",
+        "--to",
+        "openai_responses",
+    ]);
+    for (prefix, event) in [
+        (
+            None,
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"image_generation_call"}}),
+        ),
+        (
+            Some(
+                json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hello"}),
+            ),
+            json!({"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"different"}]}]}}),
+        ),
+    ] {
+        open_stream(&mut w, "text/event-stream");
+        if let Some(p) = prefix {
+            stream_frame(&mut w, "data", &format!("data: {p}\n\n"));
+        }
+        let reply = stream_frame(&mut w, "data", &format!("data: {event}\n\n"));
+        let data = reply["data"].as_str().unwrap();
+        let frame: Value =
+            serde_json::from_str(data.strip_prefix("event: error\ndata: ").unwrap().trim())
+                .unwrap();
+        assert_eq!(frame["error"]["type"], "api_error");
+        assert_eq!(stream_frame(&mut w, "abort", "")["data"], "");
+    }
+}
+
 /// 有签名的推理会出现在摘要和封装载荷中；协商上限包括真实响应头、序号和换行。
 #[test]
 fn buffered_replies_fit_the_negotiated_line() {

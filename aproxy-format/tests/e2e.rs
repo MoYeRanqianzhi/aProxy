@@ -1564,3 +1564,47 @@ fn native_termination_ignores_unrelated_error_fields() {
         }));
     }
 }
+
+/// 空对象不能靠解码器的默认角色变成成功；工具调用和纯 thinking 回复不需要可见文本。
+#[test]
+fn buffered_and_streamed_json_require_an_assistant_message_not_a_shell() {
+    for (source, client, msg, valid) in [
+        (
+            "openai_chat",
+            "anthropic_messages",
+            json!({"choices":[{"message":{}}]}),
+            false,
+        ),
+        (
+            "openai_chat",
+            "anthropic_messages",
+            json!({"choices":[{"message":{"role":"assistant"}}]}),
+            false,
+        ),
+        (
+            "openai_chat",
+            "anthropic_messages",
+            json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"t","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
+            true,
+        ),
+        (
+            "anthropic_messages",
+            "openai_chat",
+            json!({"type":"message","role":"assistant","id":"i","model":"m","content":[{"type":"thinking","thinking":"checking","signature":"s"}]}),
+            true,
+        ),
+    ] {
+        let mut worker = Worker::new(&["convert", "--from", client, "--to", source]);
+        let reply = worker.frame(response(&Value::Null, &msg.to_string()));
+        if valid {
+            assert!(reply["response"]["body"].is_string(), "{reply}");
+        } else {
+            assert_eq!(reply["fail"]["response"]["status"], 502);
+        }
+        open_stream(&mut worker, "application/json");
+        stream_frame(&mut worker, "data", &msg.to_string());
+        let tail = stream_frame(&mut worker, "close", "");
+        let body: Value = serde_json::from_str(tail["data"].as_str().unwrap()).unwrap();
+        assert_eq!(body.get("error").is_none(), valid, "{body}");
+    }
+}

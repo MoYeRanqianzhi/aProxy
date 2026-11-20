@@ -279,7 +279,23 @@ impl Convert {
         // 编解码器允许缺字段以兼容不同提供方，但缺少协议的响应容器不能被补成一次成功的空回复。
         let valid = match upstream {
             F::OpenAiChat => body["choices"].as_array().is_some_and(|rows| {
-                !rows.is_empty() && rows.iter().all(|choice| choice["message"].is_object())
+                !rows.is_empty()
+                    && rows.iter().all(|choice| {
+                        let msg = &choice["message"];
+                        msg["role"] == "assistant"
+                            && (msg["content"].is_string()
+                                || msg["content"].is_array()
+                                || msg["tool_calls"]
+                                    .as_array()
+                                    .is_some_and(|calls| !calls.is_empty())
+                                || msg["function_call"]["name"].is_string()
+                                || ["refusal", "reasoning", "reasoning_content"]
+                                    .into_iter()
+                                    .any(|k| msg[k].is_string())
+                                || msg["reasoning_details"]
+                                    .as_array()
+                                    .is_some_and(|v| !v.is_empty()))
+                    })
             }),
             F::AnthropicMessages => body["role"] == "assistant" && body["content"].is_array(),
             F::OpenAiResponses => body["output"].is_array(),

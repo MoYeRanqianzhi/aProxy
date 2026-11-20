@@ -1107,7 +1107,8 @@ stages = ["request", "retry"]
 - 前 3 次立即重试，之后从 5 秒开始翻倍，封顶 `retry.max_backoff_secs`；
 - 不读上游的 Retry-After，不加抖动。
 
-等多久的动态决定只来自 format：decide 回信里的 `delay_ms`，aproxy 照办。format 想尊重 Retry-After，就自己从 decide 收到的响应头里读。
+等多久的动态决定只来自 format：decide 回信里的 `delay_ms`，aproxy 照办。format 想尊重 Retry-After，就自己从 decide 收到的响应头里读；
+只在 retry 阶段的程序从 `retry.last_response` 读（§10.4）。
 
 ### 7.4 `[[format]]`
 
@@ -1561,6 +1562,10 @@ aproxy desktop                  W5
   之后的阶段同理：派发那一刻还不知道就省略。forward 请求的上传与响应可以同时进行，stream 的 open 可能早于上传结束
   （2026-11-20 实测）；请求体读完之后派发的消息总是给出。
 - **retry 阶段**的输入多一个 `retry` 对象：`{"attempt":3,"last_failure":{"code","details"},"elapsed_ms"}`，其中 `attempt` 是即将进行的尝试序号。
+  上一次尝试收到过上游的响应头时，`retry` 里再带 `last_response`：`{"status":429,"headers":{…}}`，只有状态与头，不带体；
+  头表与 decide 的 `response.headers` 是同一份、同样的规则（§10.1）。没有收到响应头（连不上、超时、请求在链里就失败了）时省略。
+  Retry-After 与各家的限流头都从这里读：要按 key 冷却的程序不必为此声明 decide，而 decide 问到有着落为止（§10.5），
+  排在后面的程序本来也不一定被问到（2026-11-20 补）。
 - **`overrides`**：键是 config.toml 的键，范围见 hello 的 `overrides`。
   - 回信是宽容的读者（§1.1）：不认识的键或非法的值被忽略并告警，不让请求因此失败。
   - 保活已经提交之后才到的 `keepalive.*` 覆盖不生效。
@@ -1919,7 +1924,7 @@ aproxy-format 是官方单元的合集：`aproxy-format <角色>` 只启用一�
 | 角色 | 阶段 | 请求体 | 依赖 aproxy 一侧的契约 |
 |---|---|---|---|
 | `convert` | request、stream；排在 route 之后时加 retry | full | 请求补丁；stream 的四种事件与 `abort_tail`，forward 下实时转换，retry 下回放时转换（§10.6、§10.10） |
-| `keys` | request、retry | none；开会话粘性时 full | 只改头的请求补丁；retry 输入里的 `last_failure` 用来冷却 key；`state` 记下这次用的 key |
+| `keys` | request、retry | none；开会话粘性时 full | 只改头的请求补丁；retry 输入里的 `last_failure` 与 `last_response`（状态、Retry-After 与限流头）用来冷却 key；`state` 记下这次用的 key |
 | `route` | request、retry | full | 读 model、改写 url 与 model；换不换渠道由 decide 的 `reroute` 定；换上游时凭据由 keys 一起换（§7.5） |
 | `policy` | decide | none | `decision`、`delay_ms`、`reroute`、stop 附带的 `response`；`decide.success` |
 | `adaptive` | request、decide、notify | request 与 notify 要 digest | `delivery`：默认 retry 之下，对没失败过的请求回 forward；forward 请求失败时用 decide 升级；完成通知。配 `required = false`、`pool_max = 1`、`worker_idle_secs = 0` |

@@ -696,7 +696,21 @@ fn convert_preserves_text_tools_usage_and_stop_in_all_six_directions() {
             let partial=w.frame(json!({"stage":"stream","event":"data","stream_id":"r/1","data":"data: {\"partial\":"}));
             assert_eq!(partial["data"], "");
             let abort=w.frame(json!({"stage":"stream","event":"abort","stream_id":"r/1","reason":{"code":"upstream_body_interrupted"}}));
-            assert_eq!(abort["data"], tail);
+            if client == "openai_responses" {
+                let event = abort["data"]
+                    .as_str()
+                    .unwrap()
+                    .lines()
+                    .find_map(|l| l.strip_prefix("data: "))
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(event).unwrap()["sequence_number"],
+                    0
+                );
+                assert!(!tail.contains("sequence_number"));
+            } else {
+                assert_eq!(abort["data"], tail);
+            }
             assert!(
                 tail.contains("stream conversion aborted")
                     && tail.ends_with("\n\n")

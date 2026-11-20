@@ -380,7 +380,7 @@ impl Convert {
                         usage,
                         self.stream_budget_bytes,
                     );
-                    r.abort_tail = Some(events.abort().into());
+                    r.abort_tail = Some(events.fallback());
                     Entity::Sse(Box::new(events))
                 } else {
                     // close 之前无法确定将交付成功实体还是本地错误。两者都不能沿用上游实体的校验信息。
@@ -440,7 +440,7 @@ impl Convert {
                 _ => (),
             },
             w::StreamEvent::Abort { .. } => match self.stream.take() {
-                Some(Entity::Sse(events)) => r.data = w::Data::Text(events.abort().into()),
+                Some(Entity::Sse(events)) => r.data = w::Data::Text(events.abort()),
                 Some(Entity::Json(client, _, _) | Entity::InvalidJson(client)) => {
                     r.data = w::Data::Text(Self::error_json(client))
                 }

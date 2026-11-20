@@ -21,6 +21,8 @@ pub(super) struct Events {
     remaining: usize,
     /// 已输出的 Responses 增量在同一次终态回信中必须重现的最少字节（含双层 JSON 转义）。
     snapshot_min: usize,
+    /// 只根据已经交给客户端的完整回信推进；被拒的事件不能占用错误帧的序号。
+    next_sequence: u64,
     /// 只积累尚未被空行分隔的一帧，行结束已统一成 LF。
     frame: Vec<u8>,
     /// CR 已结束上一行，下一字节若是 LF 则属于同一换行。
@@ -54,6 +56,7 @@ impl Events {
             state: Default::default(),
             remaining: budget,
             snapshot_min: 0,
+            next_sequence: 0,
             frame: Vec::new(),
             after_cr: false,
             first: true,
@@ -94,6 +97,9 @@ impl Events {
                     "stream event exceeds 8 MiB",
                 ));
             }
+        }
+        if let Some(next) = output.next_sequence {
+            self.next_sequence = next;
         }
         Ok(output.text)
     }
@@ -353,27 +359,39 @@ impl Events {
         }
         Ok(output.text)
     }
-    /// 超限是转换结果，不让代理把它误认为管道故障；其他损坏事件保持通用诊断。
+    /// 已提交后不能更改 HTTP 状态，原因使用本地固定文本而非上游响应。
     pub(super) fn ending(&self, fault: &Fault) -> String {
-        if fault.wire == LIMIT_REASON {
-            self.abort()
-                .replace("stream conversion aborted", LIMIT_REASON)
+        self.error_event(if fault.wire == LIMIT_REASON {
+            LIMIT_REASON
         } else {
-            self.abort().into()
+            "stream conversion aborted"
+        })
+    }
+    /// 活 worker 知道已交付的位置。附带的 error 对象让 SDK 在聚合生命周期前就报告错误。
+    fn error_event(&self, message: &str) -> String {
+        let error = serde_json::json!({"type":"api_error","message":message});
+        match self.target {
+            F::AnthropicMessages => format!(
+                "event: error\ndata: {}\n\n",
+                serde_json::json!({"type":"error","error":error})
+            ),
+            F::OpenAiChat => format!("data: {}\n\n", serde_json::json!({"error":error})),
+            F::OpenAiResponses => format!(
+                "event: error\ndata: {}\n\n",
+                serde_json::json!({"type":"error","code":"stream_interrupted","message":message,"param":null,"sequence_number":self.next_sequence,"error":error})
+            ),
         }
     }
-    /// 同一条错误收尾既交给 open 备用，也在收到 abort 时直接返回，绝不伪造正常结束。
-    pub(super) fn abort(&self) -> &'static str {
-        match self.target {
-            F::AnthropicMessages => {
-                "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"stream conversion aborted\"}}\n\n"
-            }
-            F::OpenAiChat => {
-                "data: {\"error\":{\"type\":\"api_error\",\"message\":\"stream conversion aborted\"}}\n\n"
-            }
-            F::OpenAiResponses => {
-                "event: error\ndata: {\"type\":\"error\",\"code\":\"stream_interrupted\",\"message\":\"stream conversion aborted\",\"param\":null,\"sequence_number\":0}\n\n"
-            }
+    /// 传输中断时不伪造成功事件或结束原因。
+    pub(super) fn abort(&self) -> String {
+        self.error_event("stream conversion aborted")
+    }
+    /// 保存的回退字节无法预知哪个事件是最后一帧；不捏造 Responses 序号，用 SDK 的错误信封。
+    pub(super) fn fallback(&self) -> String {
+        if self.target == F::OpenAiResponses {
+            "data: {\"error\":{\"type\":\"api_error\",\"message\":\"stream conversion aborted\"}}\n\n".into()
+        } else {
+            self.abort()
         }
     }
 }
@@ -488,6 +506,8 @@ struct Bounded {
     capacity: usize,
     /// 当前回信余量。
     left: usize,
+    /// 当前回信最后一个完整 Responses 事件之后的位置，回信实际交付才推进流状态。
+    next_sequence: Option<u64>,
 }
 impl Bounded {
     /// 从实际序号和行长算出的可用字节开始计费。
@@ -496,6 +516,7 @@ impl Bounded {
             text: String::new(),
             capacity,
             left: capacity,
+            next_sequence: None,
         }
     }
 }
@@ -522,6 +543,11 @@ fn render(target: F, events: Vec<Value>, output: &mut Bounded) -> Result<(), Fau
             writeln!(output, "event: {name}").map_err(|_| budget())?;
         }
         write!(output, "data: {event}\n\n").map_err(|_| budget())?;
+        if target == F::OpenAiResponses
+            && let Some(seq) = event["sequence_number"].as_u64()
+        {
+            output.next_sequence = Some(seq.saturating_add(1));
+        }
     }
     Ok(())
 }

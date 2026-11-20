@@ -99,12 +99,41 @@ def parse(target, data):
         return text, tool.name, json.loads(tool.arguments), final.usage.input_tokens, final.usage.output_tokens
 
 
+def check_interrupted_responses(binary):
+    """真实 SDK 在首帧之前及增量之后都须报告同一中断；只有活进程能给出正确的序号。"""
+    base = dict(stage="stream", stream_id="r/1")
+    opening = dict(base, event="open", request_id="r", request={"method": "POST", "url": "https://fixture.invalid"},
+                   response={"status": 200, "headers": {"content-type": "text/event-stream"}})
+    delta = {"id": "c", "model": "m", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "visible"}}]}
+    for started in [False, True]:
+        frames = [opening]
+        if started:
+            frames.append(dict(base, event="data", data="data: " + json.dumps(delta) + "\n\n"))
+        frames.append(dict(base, event="abort", reason={"code": "upstream_body_interrupted"}))
+        replies = exchange(binary, "convert", ["--from", "openai_responses", "--to", "openai_chat"], frames)
+        prefix = replies[1]["data"] if started else ""
+        previous = [json.loads(l[6:])["sequence_number"] for l in prefix.splitlines() if l.startswith("data: ")]
+        assert not started or "visible" in prefix
+        live = replies[-1]["data"]
+        event = json.loads(next(l[6:] for l in live.splitlines() if l.startswith("data: ")))
+        assert event["sequence_number"] == (previous[-1] + 1 if previous else 0)
+        for ending in [live, replies[0]["abort_tail"]]:
+            try:
+                parse("openai_responses", prefix + ending)
+            except openai.APIError as exc:
+                assert "stream conversion aborted" in str(exc), str(exc)
+            else:
+                raise AssertionError("interrupted Responses stream returned normally")
+    print("Responses before and after output: live and saved endings all raised APIError")
+
+
 def main():
     """每个目标的基线与穿插心跳版本必须保留相同的、由源样本预先约定的语义。"""
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("binary", type=Path, help="已编译的 aproxy-format 可执行文件")
     binary = cli.parse_args().binary.resolve(strict=True)
     fixtures = json.loads((Path(__file__).resolve().parents[1] / "fixtures/protocols.json").read_text(encoding="utf-8"))
+    check_interrupted_responses(binary)
     for target in PATHS:
         beat = heartbeat(binary, target)
         for source, sample in fixtures.items():

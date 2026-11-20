@@ -36,6 +36,8 @@ pub struct Restarted {
 /// 重启失败所处的阶段——决定旧实例此刻是否还在运行（用户最关心的是「服务还在不在」）。
 #[derive(Debug)]
 pub enum RestartFailure {
+    /// 后台实例正在握手，还没发布可用于重启的规格；未发送停止命令。
+    Starting,
     /// 这个实例没有期望状态记录，没有可用来重新拉起它的规格：前台实例（它的日志在控制台，
     /// 重启要在那个终端里做），或记录已被删除。旧实例未被触碰
     Unsupported,
@@ -85,7 +87,19 @@ pub async fn restart_instance(
 ) -> Result<Restarted, RestartFailure> {
     let port = daemon::port_of(&info.listen_addr).to_string();
     let run_dir = daemon::run_dir();
-    let spec = match spec::read_restore_in(&run_dir, &port) {
+    let mut record = spec::read_restore_in(&run_dir, &port);
+    if matches!(record, Ok(None))
+        && !info.foreground
+        && let Ok(live) = daemon::ipc_ping_in(&run_dir, &port).await
+        && live.instance.instance_id == info.instance_id
+    {
+        if live.state == daemon::InstanceState::Starting {
+            return Err(RestartFailure::Starting);
+        }
+        // serving 发布在写记录之后；第一次读空与这次 ping 之间可能刚完成握手。
+        record = spec::read_restore_in(&run_dir, &port);
+    }
+    let spec = match record {
         Ok(Some(entry)) => entry.spec,
         Ok(None) => return Err(RestartFailure::Unsupported),
         Err(reason) => {

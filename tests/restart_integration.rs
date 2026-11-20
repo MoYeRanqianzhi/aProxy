@@ -39,12 +39,13 @@ fn ipc_ping_in_dir(
     ))
 }
 
-/// 等待端口就绪：TCP 可连 + IPC ping 确认是自家守护（端点名含端口，
+/// 等待端口就绪：TCP 可连 + IPC 确认自家实例已进入 serving（端点名含端口，
 /// 只有我们的 --daemon-child 子进程会创建它），最多 10 秒。
 fn wait_daemon_ready(rt: &tokio::runtime::Runtime, port: u16, home_dir: &std::path::Path) -> bool {
     for _ in 0..100 {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
-            && ipc_ping_in_dir(rt, port, home_dir).is_ok()
+            && ipc_ping_in_dir(rt, port, home_dir)
+                .is_ok_and(|s| s.state == aproxy::daemon::InstanceState::Serving)
         {
             return true;
         }
@@ -387,6 +388,10 @@ fn restart_all_skips_failed_instance_and_exits_nonzero() {
     test_home.stop_on_drop(port_a);
     test_home.stop_on_drop(port_b);
     assert!(wait_daemon_ready(&rt, port_a, home) && wait_daemon_ready(&rt, port_b, home));
+    assert!(
+        has_restore(home, port_a) && has_restore(home, port_b),
+        "两个后台实例都应在就绪前写好恢复记录"
+    );
     let orig_a = ipc_ping_in_dir(&rt, port_a, home).unwrap().instance.pid;
     let orig_b = ipc_ping_in_dir(&rt, port_b, home).unwrap().instance.pid;
 

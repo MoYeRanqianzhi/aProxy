@@ -1360,6 +1360,17 @@ async fn startup_probes_run_in_parallel_and_respect_worker_lifetimes() {
     assert!(
         matches!(aproxy::daemon::ipc_request_in(&run,&key,aproxy::daemon::IpcOp::PREPARE_SWAP).await,Err(aproxy::daemon::IpcError::Remote{code,details,..}) if code=="invalid_state" && details["state"]=="starting")
     );
+    let out = home
+        .cmd()
+        .args(["restart", &key, "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("is still starting")
+    );
     std::fs::write(gate, b"").unwrap();
     let out = parent.wait_with_output().unwrap();
     assert!(out.status.success(), "{out:?}");

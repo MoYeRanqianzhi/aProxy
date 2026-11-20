@@ -103,6 +103,9 @@ pub(crate) async fn handle_restart_cmd(
             }
             Err(failure) => {
                 let state = match &failure {
+                    RestartFailure::Starting => {
+                        "Instance is still starting; no restart was attempted."
+                    }
                     RestartFailure::Unsupported => "没有可用来重新拉起它的记录，旧实例保持运行",
                     RestartFailure::Precheck(_) => "预检未通过，旧实例保持运行",
                     RestartFailure::Stop(_) => "停止未确认，未启动新实例",
@@ -137,6 +140,11 @@ fn restart_failure(
     json: bool,
 ) -> Failure {
     match failure {
+        RestartFailure::Starting => Failure::new(
+            "command_failed",
+            format!("Instance on port {port} is still starting; retry after it begins serving."),
+            json!({}),
+        ),
         RestartFailure::Unsupported => Failure::new(
             "restart_unsupported",
             format!(

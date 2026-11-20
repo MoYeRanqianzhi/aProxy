@@ -1566,7 +1566,8 @@ aproxy desktop                  W5
   （`keepalive.trigger` 要看体）时，request 阶段的程序收到的 `client` 没有 `stream`。从请求头就能定的照常给出。
   省略表示不知道，不表示不是流式；需要确切答案的程序在 request 阶段要 `digest` 或 `full`，aproxy 就会先读完请求体。
   之后的阶段同理：派发那一刻还不知道就省略。forward 请求的上传与响应可以同时进行，stream 的 open 可能早于上传结束
-  （2026-11-20 实测）；请求体读完之后派发的消息总是给出。
+  （2026-11-20 实测）；请求体读完之后派发的消息总是给出，只有一种例外：体不是一个合法的 JSON 文档、
+  或嵌套深到超出扫描的上限时，读完了也判断不出来，仍然省略（2026-11-21 补）。省略始终表示不知道。
 - **retry 阶段**的输入多一个 `retry` 对象：`{"attempt":3,"last_failure":{"code","details"},"elapsed_ms"}`，其中 `attempt` 是即将进行的尝试序号。
   上一次尝试收到过上游的响应头时，`retry` 里再带 `last_response`：`{"status":429,"headers":{…}}`，只有状态与头，不带体；
   头表按 §10.1 的规则构造，内容是上游发来的样子：`content-encoding` 与 `content-length` 都保留，因为这里不带体、也没有解码

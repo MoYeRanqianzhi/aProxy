@@ -194,10 +194,7 @@ fn route_alias_paths_and_reverse_alias_survive_worker_boundaries() {
     assert_eq!(fallback["request"]["url"], "https://other.test/endpoint");
     assert_eq!(fallback["request"]["headers"], json!({}));
     let r = w.frame(make("other"));
-    assert_eq!(
-        r["request"]["url"],
-        "https://relay.test/base/v1/messages?q=1"
-    );
+    assert_eq!(r["request"]["url"], "https://relay.test/base/v1/messages");
     assert_eq!(
         r["request"]["headers"],
         json!({"x-api-key":"fixture-private-A"})
@@ -557,5 +554,42 @@ fn credential_slots_require_history_protected_names() {
             "{role}: {error}"
         );
         assert!(!error.contains("fixture-private"));
+    }
+}
+
+/// 真实 origin（含端口）决定查询串边界；跨域只传点名的参数，重复值不能丢。
+#[test]
+fn route_drops_cross_origin_query_except_listed_parameters() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("route.toml");
+    for (target, extra, expected) in [
+        (
+            "https://a.test/base",
+            "",
+            "https://a.test/base/chat?token=private&view=a&view=b",
+        ),
+        (
+            "https://a.test:9443/base",
+            "",
+            "https://a.test:9443/base/chat",
+        ),
+        (
+            "https://b.test/base",
+            "carry_query=['view']",
+            "https://b.test/base/chat?view=a&view=b",
+        ),
+    ] {
+        std::fs::write(
+            &file,
+            format!("[[channel]]\nid='b'\nurl='{target}'\npreserve_path=true\n{extra}"),
+        )
+        .unwrap();
+        let mut w = Worker::new(&["route", "--config", file.to_str().unwrap()]);
+        let r = w.frame(request(
+            "https://a.test/chat?token=private&view=a&view=b",
+            "/chat?token=private&view=a&view=b",
+            json!({"model":"m"}),
+        ));
+        assert_eq!(r["request"]["url"], expected);
     }
 }

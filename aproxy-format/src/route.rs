@@ -35,6 +35,9 @@ pub struct Channel {
     /// 按客户端原路径与查询串访问配置的根地址。
     #[serde(default)]
     preserve_path: bool,
+    /// 只允许这些名称的查询参数跟随跨 origin 请求；列表为空时原查询串不会离开它的来源。
+    #[serde(default)]
+    carry_query: std::collections::BTreeSet<String>,
     /// 可交给后置 keys，也可在本渠道直接指定凭据。
     credential_env: Option<String>,
     /// 省略时使用 Bearer authorization。
@@ -133,15 +136,27 @@ impl Route {
             ))?;
         let mut url =
             config::endpoint(&channel.url).map_err(|e| Fault::new(e, "invalid channel URL"))?;
+        let incoming =
+            config::endpoint(&m.request.url).map_err(|e| Fault::new(e, "invalid upstream URL"))?;
         if channel.preserve_path {
-            let incoming = config::endpoint(&m.request.url)
-                .map_err(|e| Fault::new(e, "invalid upstream URL"))?;
             url.set_path(&format!(
                 "{}{}",
                 url.path().trim_end_matches('/'),
                 incoming.path()
             ));
-            url.set_query(incoming.query());
+            if url.origin() == incoming.origin() {
+                url.set_query(incoming.query());
+            }
+        }
+        if url.origin() != incoming.origin() && !channel.carry_query.is_empty() {
+            // 显式目标 URL 的参数不接受覆盖；原查询中同名的多个允许值则按顺序一起传递。
+            let fixed: std::collections::BTreeSet<_> =
+                url.query_pairs().map(|(k, _)| k.into_owned()).collect();
+            for (k, v) in incoming.query_pairs() {
+                if channel.carry_query.contains(k.as_ref()) && !fixed.contains(k.as_ref()) {
+                    url.query_pairs_mut().append_pair(&k, &v);
+                }
+            }
         }
         let mut headers = m.request.headers.clone();
         config::strip_credentials(&mut headers);

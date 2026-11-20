@@ -16,6 +16,7 @@ mod server;
 mod util;
 
 use clap::Parser;
+use std::io::Write as _;
 
 use aproxy::cli::{Cli, Commands};
 
@@ -73,6 +74,32 @@ fn main() {
         .block_on(run(cli));
 }
 
+/// home 还未被接受，不能查台账或设置；按已解析的命令构造它约定的 JSON 错误。
+fn invalid_home_output(
+    command: Option<&Commands>,
+    error: &str,
+    value: &str,
+) -> (Option<serde_json::Value>, i32) {
+    match command {
+        Some(Commands::Status { json: true, .. }) => (
+            Some(
+                serde_json::json!({"error":{"code":"home_invalid","message":"APROXY_HOME does not satisfy the home rules.","details":{"value":value}}}),
+            ),
+            i32::from(aproxy_ipc::code::EXIT_USAGE),
+        ),
+        Some(Commands::Install(args)) if args.json => {
+            let error = serde_json::json!({"code":"install_failed","message":error,"details":{}});
+            let body = if args.check {
+                serde_json::json!({"error":error})
+            } else {
+                serde_json::json!({"event":"result","outcome":"failed","version":null,"error":error})
+            };
+            (Some(body), 1)
+        }
+        _ => (None, 1),
+    }
+}
+
 /// 除 `--version` 与 `desktop` 之外的一切命令，在 tokio 运行时里执行。
 async fn run(cli: Cli) {
     // 强制安装（永久兼容契约 C7、C8，见 aproxy::install::force）在这里分流，排在定位
@@ -91,19 +118,14 @@ async fn run(cli: Cli) {
     // 错误的目录里读写强。`--version`、`--help` 不读 home，在上面已经结束；强制安装在
     // 上面自己报告（退出码 10）
     if let Err(e) = aproxy_ipc::home::resolve_home() {
-        if let Some(Commands::Install(args)) = &cli.command
-            && args.json
-        {
-            let error = serde_json::json!({"code":"install_failed","message":e,"details":{}});
-            let body = if args.check {
-                serde_json::json!({"error":error})
-            } else {
-                serde_json::json!({"event":"result","outcome":"failed","version":null,"error":error})
-            };
-            commands::print_doc(body);
+        let value = std::env::var_os(aproxy_ipc::home::HOME_ENV).unwrap_or_default();
+        let (document, exit) =
+            invalid_home_output(cli.command.as_ref(), &e, &value.to_string_lossy());
+        if let Some(doc) = document {
+            commands::print_doc(doc);
         }
-        eprintln!("[ERROR] {e}");
-        std::process::exit(1);
+        let _ = writeln!(std::io::stderr(), "[ERROR] {e}");
+        std::process::exit(exit);
     }
 
     // 后台实例：按交接文件里的拉起规格承载服务，日志由它自己按规格初始化。排在
@@ -157,13 +179,19 @@ async fn run(cli: Cli) {
             cli.command,
             Some(Commands::Status { .. } | Commands::Stop { .. } | Commands::Install(_))
         );
+        // 诊断接收端可能已经关闭；它不能让 stdout 上独立的命令结果也丢失。
         let level = if tolerated { "WARN" } else { "ERROR" };
-        eprintln!("[{level}] settings.json 有错误:");
+        let _ = writeln!(std::io::stderr(), "[{level}] settings.json 有错误:");
         for d in loaded.diagnostics.iter().filter(|d| d.is_error()) {
-            eprintln!("[{level}]   {}", aproxy::ops::start::render_diagnostic(d));
+            let _ = writeln!(
+                std::io::stderr(),
+                "[{level}]   {}",
+                aproxy::ops::start::render_diagnostic(d)
+            );
         }
         if tolerated {
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr(),
                 "[{level}] 本次按内置默认运行（别名不可用，请按端口或 all 指定实例）。用 aproxy settings show 查看、aproxy settings unset <键> 修复"
             );
         } else {
@@ -175,7 +203,7 @@ async fn run(cli: Cli) {
     // 汇总输出，这里跳过以免重复
     if loaded.is_valid() && !matches!(cli.command, Some(Commands::Doctor { .. })) {
         for e in settings::missing_alias_targets(&loaded.settings) {
-            eprintln!("[ERROR] {e}");
+            let _ = writeln!(std::io::stderr(), "[ERROR] {e}");
         }
     }
 
@@ -285,5 +313,23 @@ fn resumes_install(command: &Commands) -> bool {
         | Commands::Desktop
         | Commands::Serve { .. }
         | Commands::Watchdog { .. } => false,
+    }
+}
+
+#[cfg(test)]
+mod home_output_tests {
+    use super::*;
+    /// 用 C1 的纯函数拒绝相对 home，不改变测试进程或任何子进程的真实 home。
+    #[test]
+    fn status_json_home_failure_returns_its_document_before_dispatch() {
+        let value = std::ffi::OsStr::new("relative");
+        let error = aproxy_ipc::home::home_from(Some(value), || unreachable!()).unwrap_err();
+        let cli = Cli::try_parse_from(["aproxy", "status", "--json"]).unwrap();
+        let (doc, exit) =
+            invalid_home_output(cli.command.as_ref(), &error, value.to_str().unwrap());
+        assert_eq!(exit, 2);
+        let doc = doc.unwrap();
+        assert_eq!(doc["error"]["code"], "home_invalid");
+        assert_eq!(doc["error"]["details"]["value"], "relative");
     }
 }

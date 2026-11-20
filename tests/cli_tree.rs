@@ -303,7 +303,12 @@ fn cli_logs_stay_off_stdout() {
         let out = with_logs(args);
         let stdout = text(&out.stdout);
         let stderr = text(&out.stderr);
-        assert_eq!(stdout.lines().count(), 1, "{args:?}: {stdout}");
+        assert_eq!(
+            stdout.lines().count(),
+            1,
+            "{args:?}: status={}, stdout={stdout:?}, stderr={stderr:?}",
+            out.status
+        );
         let doc: serde_json::Value = serde_json::from_str(&stdout).unwrap();
         assert_eq!(doc["schema"], 1, "{args:?}: {doc}");
         assert!(out.status.success(), "{args:?}: {doc} {stderr}");
@@ -335,6 +340,31 @@ fn cli_logs_stay_off_stdout() {
         text(&quiet.stderr)
     );
     assert!(!text(&quiet.stderr).contains(INFO) && !text(&quiet.stdout).contains(INFO));
+}
+
+/// 探测应容忍失效的设置，即使日志消费者已关掉 stderr，仍要在另一条管道上答复 JSON。
+#[test]
+fn status_json_survives_a_closed_diagnostic_pipe() {
+    let home = TestHome::new();
+    home.settings("{");
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let out = home
+        .cmd()
+        .args(["status", "--json"])
+        .env("RUST_LOG", "info")
+        .stderr(writer)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "status={}, stdout={:?}",
+        out.status,
+        text(&out.stdout)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["schema"], 1);
+    assert_eq!(doc["instances"], serde_json::json!([]));
 }
 
 /// 用法错误必须在解析层结束：连安装目录与 bin 都不能出现。

@@ -61,6 +61,14 @@ pub(crate) fn resolved_daemon_log() -> Option<PathBuf> {
     RESOLVED_DAEMON_LOG.get().cloned().flatten()
 }
 
+/// 实例启动失败：绑定错误已经在本地记录，握手错误还要按协议交还父进程。
+pub(crate) enum ServeFailure {
+    /// 监听或 IPC 创建失败，诊断已经写出。
+    Reported,
+    /// 工作进程握手失败，仍须传回静态/暂时失败的类别。
+    Format(aproxy::transform::StartupError),
+}
+
 /// 服务主循环：前台实例与后台实例共用。bind、注册实例、启动 IPC 控制通道，
 /// 一直服务到停止信号（Ctrl+C/SIGTERM 或 `aproxy stop` 经 IPC 触发）。
 ///
@@ -70,7 +78,7 @@ pub(crate) async fn serve_forever(
     cfg: Config,
     cfg_path: Option<&std::path::Path>,
     spec: Option<aproxy::spec::InstanceSpec>,
-) -> Result<(), aproxy::transform::StartupError> {
+) -> Result<(), ServeFailure> {
     let daemon_child = spec.is_some();
     let listen_addr = cfg.listen_addr.clone();
     let base_url = cfg.base_url.clone();
@@ -108,7 +116,7 @@ pub(crate) async fn serve_forever(
             // 走 report_config_error 落盘（startup.log），否则父进程超时提示指向
             // 的日志里查不到任何线索
             report_config_error(&bind_error_message(&listen_addr, &e), daemon_child);
-            crate::util::exit(1);
+            return Err(ServeFailure::Reported);
         }
     };
     let actual_addr = listener.local_addr().expect("获取监听地址失败").to_string();
@@ -146,7 +154,7 @@ pub(crate) async fn serve_forever(
                 ),
                 daemon_child,
             );
-            crate::util::exit(1);
+            return Err(ServeFailure::Reported);
         }
     };
 
@@ -222,7 +230,7 @@ pub(crate) async fn serve_forever(
             if let Some(dir) = &state.spool_dir {
                 daemon::remove_spool_dir(dir);
             }
-            return outcome.unwrap_or(Ok(()));
+            return outcome.unwrap_or(Ok(())).map_err(ServeFailure::Format);
         }
     }
 
@@ -436,7 +444,7 @@ pub(crate) async fn serve_forever(
 
     if state.serve_until_stopped(listener, app, stopping).await {
         daemon::remove_registry_files(&actual_addr);
-        crate::util::exit(0);
+        crate::util::exit_after_shutdown_deadline();
     }
     // 订阅连接各自把 `closing` 那一行写出去就断开；最多等半秒，不为一个不读的客户端拖住退出
     let closing_deadline = tokio::time::Instant::now() + Duration::from_millis(500);

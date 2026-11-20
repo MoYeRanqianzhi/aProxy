@@ -155,6 +155,11 @@ impl Failure {
     /// 报告并退出：原因写到 stderr；`json` 为真时 stdout 上是错误文档
     /// `{"schema":1,"error":{"code","message","details"}}`。
     pub(crate) fn exit(self, json: bool) -> ! {
+        crate::util::exit(i32::from(self.report(json)))
+    }
+
+    /// 写出同一份错误文档并返回退出码，让需要收回运行时的命令走正常返回路径。
+    pub(crate) fn report(self, json: bool) -> u8 {
         let exit = self.exit_code();
         eprintln!("{}", self.message);
         if json {
@@ -162,7 +167,7 @@ impl Failure {
                 "error": {"code": self.code, "message": self.message, "details": self.details},
             }));
         }
-        crate::util::exit(exit as i32)
+        exit
     }
 }
 

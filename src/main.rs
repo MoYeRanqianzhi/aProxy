@@ -30,14 +30,14 @@ use aproxy::cli::{Cli, Commands};
 
 use aproxy::settings;
 
-fn main() {
+fn main() -> std::process::ExitCode {
     // 永久兼容契约 C5（见 aproxy::VERSION_LINE）：安装器以 `<二进制> --version` 认
     // 版本，这一行必须先于一切副作用输出——不切控制台代码页、不读 settings 与
     // home、不建运行时、不拉起续作，以后解析参数之前要读的任何东西（例如按 settings
     // 判定界面语言）也都排在它后面。
     if version_requested() {
         print_version_line();
-        return;
+        return std::process::ExitCode::SUCCESS;
     }
 
     // Windows 控制台默认代码页（如 936/GBK）会把 Rust 输出的 UTF-8 中文显示为
@@ -56,7 +56,7 @@ fn main() {
     // 安装器只用单独的 `--version`，由上面第一句兑现「先于一切副作用」
     if cli.version {
         print_version_line();
-        return;
+        return std::process::ExitCode::SUCCESS;
     }
 
     // 桌面界面在建 tokio 运行时之前分派：Tauri 的事件循环要占住主线程（macOS 硬性要求），
@@ -75,11 +75,16 @@ fn main() {
         unsafe { std::env::set_var("APROXY_HOME", home) };
     }
 
-    tokio::runtime::Builder::new_multi_thread()
+    // 命令先把退出状态交回主线程，再让运行时撤销 I/O、回收工作和阻塞线程；
+    // Windows 不应在这些线程仍可能持有管道或分配器状态时执行进程析构。
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("无法建立 tokio 运行时")
-        .block_on(run(cli));
+        .expect("无法建立 tokio 运行时");
+    let code = runtime.block_on(run(cli));
+    drop(runtime);
+    commands::finish_json(i32::from(code));
+    std::process::ExitCode::from(code)
 }
 
 /// home 还未被接受，不能查台账或设置；按已解析的命令构造它约定的 JSON 错误。
@@ -100,7 +105,7 @@ fn invalid_home_output(
 }
 
 /// 除 `--version` 与 `desktop` 之外的一切命令，在 tokio 运行时里执行。
-async fn run(cli: Cli) {
+async fn run(cli: Cli) -> u8 {
     let output = commands::JsonOutput::for_command(cli.command.as_ref());
     if let Some(mode) = output {
         mode.bind();
@@ -127,14 +132,14 @@ async fn run(cli: Cli) {
             commands::print_doc(doc);
         }
         let _ = writeln!(std::io::stderr(), "[ERROR] {e}");
-        std::process::exit(exit);
+        return exit as u8;
     }
 
     // 后台实例：按交接文件里的拉起规格承载服务，日志由它自己按规格初始化。排在
     // settings 检查与续作拉起之前：这两件事都是给坐在终端前的人准备的，实例自己在解析
     // 配置时检查 settings，结果写进 startup.log
     if let Some(Commands::Serve { spec, .. }) = &cli.command {
-        commands::start::handle_serve_cmd(spec).await;
+        return commands::start::handle_serve_cmd(spec).await;
     }
 
     // 前台实例没有日志文件，控制台就是它的日志；分离拉起的看护者沿用这一模式，输出不继承。
@@ -201,7 +206,7 @@ async fn run(cli: Cli) {
             if let Some(mode) = output {
                 commands::print_doc(mode.error_document(serde_json::json!({"code":"config_invalid","message":"The configuration has error-level diagnostics.","details":{"diagnostics":loaded.diagnostics}})));
             }
-            util::exit(aproxy_ipc::code::EXIT_CONFIG as i32);
+            return aproxy_ipc::code::EXIT_CONFIG;
         }
     }
     // 指向不存在的文件的别名：start/stop 按这个名字操作会失败，每次运行都提醒。doctor 会
@@ -230,7 +235,7 @@ async fn run(cli: Cli) {
         Some(Commands::Status { idle, busy, json }) => {
             commands::status::handle_status_cmd(idle, busy, json).await
         }
-        Some(Commands::Start(args)) => commands::start::handle_start_cmd(args).await,
+        Some(Commands::Start(args)) => return commands::start::handle_start_cmd(args).await,
         Some(Commands::Stop {
             target,
             threshold,
@@ -269,6 +274,7 @@ async fn run(cli: Cli) {
         // 别的参数写在一起的情形，上面已经处理
         None => unreachable!("没有子命令的调用在参数解析时已经结束"),
     }
+    0
 }
 
 /// 输出版本行（永久兼容契约 C5，见 aproxy::VERSION_LINE）。写失败（管道已关闭、终端已

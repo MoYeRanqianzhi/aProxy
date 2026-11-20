@@ -11,6 +11,23 @@ pub(crate) fn exit(code: i32) -> ! {
     std::process::exit(code)
 }
 
+/// 仅在已耗尽停机宽限并回收子进程时放弃仍未完成的任务。Windows 的普通进程退出会
+/// 在其他线程被终止后继续运行 DLL 清理；此处不能等待阻塞线程，也不能让清理代码再使用其堆。
+pub(crate) fn exit_after_shutdown_deadline() -> ! {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        aproxy_ipc::ledger::remove_own();
+        // SAFETY: 伪句柄始终代表本进程，不按 PID 打开或终止任何其他进程。
+        unsafe {
+            TerminateProcess(GetCurrentProcess(), 0);
+        }
+        std::process::abort();
+    }
+    #[cfg(not(windows))]
+    exit(0)
+}
+
 /// 把本进程登记进台账（永久兼容契约 C3，见 `aproxy_ipc::ledger::register`），登记不成时
 /// 告警。登记不成不是错误，进程照常运行，只是强制安装看不见它——所以要留下一条日志。
 pub(crate) fn register_in_ledger(

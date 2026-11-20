@@ -18,7 +18,7 @@ use aproxy::spec::{self, InstanceSpec};
 use serde_json::json;
 
 use super::{Failure, port_value, print_doc};
-use crate::server::{report_config_error, serve_forever};
+use crate::server::{ServeFailure, report_config_error, serve_forever};
 
 /// `aproxy start [别名|路径]`：后台启动实例；--foreground 前台运行。
 ///
@@ -27,7 +27,7 @@ use crate::server::{report_config_error, serve_forever};
 ///
 /// 端口冲突的情况严格区分（同端口已有实例 / 同端口不同地址的另一实例 / 绑定失败），
 /// 判定在 `aproxy::ops::start::preflight`。
-pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
+pub(crate) async fn handle_start_cmd(mut args: StartArgs) -> u8 {
     let json = args.json;
     // `--api-key -`：密钥从 stdin 读一行，不出现在命令行上
     if args.api_key.as_deref() == Some("-") {
@@ -35,24 +35,24 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
             Ok(key) => args.api_key = Some(key),
             Err(e) => {
                 eprintln!("{e}");
-                crate::util::exit(1);
+                return 1;
             }
         }
     }
     let target = args.target.clone();
     // 给了 target 就不需要默认配置——失效的 default_config 只拦无 target 的启动
     let cfg_path = match target.as_deref() {
-        None => super::require_cfg_path(super::resolve_cfg_path(args.config.as_deref()), json),
+        None => match super::resolve_cfg_path(args.config.as_deref()) { Ok(path) => path, Err(f) => return f.report(json) },
         Some(t) => match resolve_config_target(t) {
             Some(p) => p,
-            None => Failure::new(
+            None => return Failure::new(
                 "target_not_found",
                 format!(
                     "未知的别名或配置文件: {t}\n用 aproxy alias list 查看已有别名，或 aproxy alias add {t} <路径> 添加"
                 ),
                 json!({"target": t}),
             )
-            .exit(json),
+            .report(json),
         },
     };
     // 这个实例有没有配置文件：命令行指定的、别名或路径给出的，必须在（打错路径时明确
@@ -63,7 +63,7 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
     let overrides = overrides_from_cli(&args);
     let cfg = match resolve_runtime_config(&overrides, cfg_file) {
         Ok(c) => c,
-        Err(e) => config_failure(&e).exit(json),
+        Err(e) => return config_failure(&e).report(json),
     };
     let listen_addr = cfg.listen_addr.clone();
     let port = daemon::port_of(&listen_addr).to_string();
@@ -87,13 +87,13 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
                     info.instance.pid, info.instance.listen_addr
                 );
             }
-            return;
+            return 0;
         }
-        Err(PreflightError::Startup(e)) => super::spawn_failure(&e, e.to_string()).exit(json),
+        Err(PreflightError::Startup(e)) => return super::spawn_failure(&e, e.to_string()).report(json),
         Ok(Preflight::AlreadyRunning(info)) => {
             if json {
                 print_doc(start_document("already_running", &info));
-                return;
+                return 0;
             }
             println!("此端口已有 aProxy 在运行，无需重复启动：");
             println!(
@@ -101,30 +101,31 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
                 info.instance.pid, info.instance.listen_addr, info.instance.version
             );
             println!("查看实例: aproxy status    停止: aproxy stop {port}");
-            return;
+            return 0;
         }
         Err(PreflightError::PortHeldByOtherAddress {
             port,
             listen_addr,
             other_listen_addr,
-        }) => Failure::new(
+        }) => return Failure::new(
             "port_in_use",
             format!(
                 "端口 {port} 已被监听地址 {other_listen_addr} 的 aProxy 实例使用（本进程将监听 {listen_addr}），两者不能并存。\n实例按端口号区分，请为其中一个更换监听地址/端口。"
             ),
             json!({"port": port_value(&port), "owner": "aproxy"}),
         )
-        .exit(json),
+        .report(json),
         Err(PreflightError::Bind { listen_addr, error }) => {
-            super::bind_failure(&listen_addr, &error).exit(json)
+            return super::bind_failure(&listen_addr, &error).report(json)
         }
     }
 
     if args.foreground {
-        if let Err(e) = serve_forever(cfg, cfg_file, None).await {
-            Failure::handshake(&e).exit(json);
-        }
-        return;
+        return match serve_forever(cfg, cfg_file, None).await {
+            Ok(()) => 0,
+            Err(ServeFailure::Reported) => 1,
+            Err(ServeFailure::Format(e)) => Failure::handshake(&e).report(json),
+        };
     }
 
     // 后台：把这次启动写成拉起规格，交给分离的子进程（见 aproxy::spawn）。覆盖旗标与环境
@@ -138,12 +139,12 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
         Ok(info) => info,
         Err(e) => {
             let excerpt = e.startup_log().map(|l| l.excerpt()).unwrap_or_default();
-            super::spawn_failure(&e, format!("{e}{excerpt}")).exit(json)
+            return super::spawn_failure(&e, format!("{e}{excerpt}")).report(json);
         }
     };
     if json {
         print_doc(start_document("started", &info));
-        return;
+        return 0;
     }
     let actual_port = daemon::port_of(&info.instance.listen_addr).to_string();
     println!("aProxy 已在后台启动");
@@ -176,6 +177,7 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
         println!("  日志: {log_path}");
     }
     println!("查看实例: aproxy status    停止: aproxy stop {actual_port}");
+    0
 }
 
 /// `start --json` 的文档：`outcome` 是 `started` 或 `already_running`，`instance` 是实例应答的
@@ -218,7 +220,7 @@ pub(crate) fn config_failure(error: &ConfigError) -> Failure {
 ///
 /// 这个进程没有控制台：在日志初始化之前出的错（规格读不出来）与配置错误都写进
 /// startup.log，拉起方在子进程退出后从那里摘录原因。
-pub(crate) async fn handle_serve_cmd(spec_path: &Path) -> ! {
+pub(crate) async fn handle_serve_cmd(spec_path: &Path) -> u8 {
     let mut spec = match spec::read_spec_file(spec_path) {
         Ok(spec) => spec,
         Err(e) => {
@@ -226,7 +228,7 @@ pub(crate) async fn handle_serve_cmd(spec_path: &Path) -> ! {
                 &format!("cannot read the launch spec {}: {e}", spec_path.display()),
                 true,
             );
-            crate::util::exit(1)
+            return 1;
         }
     };
     let cfg_file = spec.config_file();
@@ -245,7 +247,7 @@ pub(crate) async fn handle_serve_cmd(spec_path: &Path) -> ! {
         Ok(cfg) => cfg,
         Err(e) => {
             report_config_error(&e.to_string(), true);
-            crate::util::exit(1)
+            return 1;
         }
     };
     // 配置解析出的端口是 0（由系统分配）而规格里钉着上次拿到的端口：回到那个端口，客户端
@@ -263,7 +265,10 @@ pub(crate) async fn handle_serve_cmd(spec_path: &Path) -> ! {
         tracing::warn!("{w}");
         report_config_error(&format!("警告: {w}"), true);
     }
-    if let Err(e) = serve_forever(cfg, cfg_file, Some(spec)).await {
+    if let Err(failure) = serve_forever(cfg, cfg_file, Some(spec)).await {
+        let ServeFailure::Format(e) = failure else {
+            return 1;
+        };
         report_config_error(&e.to_string(), true);
         // 规格已读完，原文件仅本次拉起方可读。只覆盖已有文件：若父进程已超时清理，
         // 不得重新留下交接文件。父进程只在确认子进程退出之后读取错误。
@@ -274,9 +279,9 @@ pub(crate) async fn handle_serve_cmd(spec_path: &Path) -> ! {
         {
             let _ = serde_json::to_writer(file, &e);
         }
-        crate::util::exit(e.exit_code().into());
+        return e.exit_code();
     }
-    crate::util::exit(0)
+    0
 }
 
 /// 把监听地址里的端口换成 `port`（地址部分原样保留，含 IPv6 的方括号）。

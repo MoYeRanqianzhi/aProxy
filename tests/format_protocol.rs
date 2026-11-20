@@ -1416,8 +1416,18 @@ async fn second_start_waits_for_failed_hello_and_prepare_swap_changes_nothing() 
     let second = observing_start(&home, &path).await;
     let original = first.wait_with_output().unwrap();
     let observer = second.wait_with_output().unwrap();
-    assert_eq!(original.status.code(), Some(1));
-    assert_eq!(observer.status.code(), Some(1));
+    assert_eq!(
+        original.status.code(),
+        Some(1),
+        "start stderr: {}",
+        String::from_utf8_lossy(&original.stderr)
+    );
+    assert_eq!(
+        observer.status.code(),
+        Some(1),
+        "observer stderr: {}",
+        String::from_utf8_lossy(&observer.stderr)
+    );
     let result: Value = serde_json::from_slice(&observer.stdout).unwrap();
     let first: Value = serde_json::from_slice(&original.stdout).unwrap();
     assert_eq!(result["error"], first["error"]);

@@ -30,6 +30,8 @@ pub(super) struct RequestTrace {
     pub(super) attempts: u32,
     /// 只有 decide 链才计请求总耗时；在开始读取客户端的上传之前取单调时钟。
     pub(super) decide_started: Option<tokio::time::Instant>,
+    /// 只让实际持有 forward 响应体的读者参与收尾，弱引用不会延长尝试的生命。
+    pub(super) upstream_join: std::sync::Weak<UpstreamJoin>,
     /// 这个请求在请求历史里的记录；不进历史的请求（入站校验拒掉的）是空句柄
     pub(super) rec: Recorder,
 }
@@ -46,6 +48,7 @@ impl RequestTrace {
             request_id: request_id.into(),
             attempts: 0,
             decide_started: None,
+            upstream_join: Default::default(),
             rec,
         }
     }
@@ -464,6 +467,7 @@ mod tests {
             request_id: Arc::from("19ac3f2e8b5d1a2b-41"),
             attempts,
             decide_started: None,
+            upstream_join: Default::default(),
             rec: Recorder::none(),
         }
     }

@@ -3637,6 +3637,36 @@ async fn forward_stream_conversion_end_to_end() {
     assert_eq!(d["record"]["tries"][0]["response_bytes"], 9);
     assert_eq!(frames(&home, "stream").last().unwrap()["event"], "close");
 }
+/// 客户端在已观测的 data 往返中断开：未交付的上游前缀仍计入该次尝试，完成通知不能先于它。
+#[tokio::test]
+async fn forward_disconnect_during_data_preserves_upstream_counts_before_notify() {
+    let home = TestHome::new();
+    let (up, _resume) = split_forward_upstream().await;
+    let gate = home.path().join("release");
+    let cfg = String::from("delivery='forward'\n")
+        + &layer(
+            &home,
+            "stream",
+            "'stream'",
+            &["stream-gate", gate.to_str().unwrap()],
+        )
+        + &layer(&home, "notice", "'notify'", &["echo"]);
+    let (client, url) = running(&home, up, &cfg);
+    let mut resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.chunk().await.unwrap().unwrap(), "[");
+    let data = observed_stage(&home, "stream", "stream", 2).await;
+    assert_eq!(data[1]["data"], "first");
+    drop(resp);
+    let notice = observed_stage(&home, "notice", "notify", 1).await;
+    let rec =
+        &request_detail(&home, &url, notice[0]["request_id"].as_str().unwrap()).await["record"];
+    assert_eq!(rec["tries"][0]["response_bytes"], 5);
+    assert!(rec["tries"][0]["duration_ms"].is_number());
+    assert_eq!(rec["response_bytes"], 1);
+    assert_eq!(notice[0]["outcome"], "client_gone");
+    assert_eq!(notice[0]["stream_completed"], false);
+    std::fs::write(gate, b"done").unwrap();
+}
 /// 内侧先收到 data，整包层还没有输入；EOF 后它只处理一次，外层处理它的输出。
 #[tokio::test]
 async fn forward_with_a_response_program_gathers_the_response_at_that_layer() {

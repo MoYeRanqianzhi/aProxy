@@ -151,6 +151,8 @@ impl PassiveCheck {
 /// 响应转发途中顺带做的记录：每一块交给请求历史一份，数着已经转给客户端多少字节。响应流
 /// 结束、出错或被丢弃（客户端断开）时，把这唯一的一次尝试记完。
 struct ResponseTap {
+    /// 原始字节数和耗时在 Drop 中先落定，随后释放这张封存票。
+    _join: Option<Arc<UpstreamJoin>>,
     /// 输出长度由响应链单独记录；尝试长度始终只算原上游字节。
     transformed: bool,
     /// 请求方向本地失败不算上游请求，但占一次逻辑尝试。
@@ -405,6 +407,7 @@ pub(super) async fn forward_response(
     // 请求历史：上游实际回的响应头（逐跳头也在内），响应体边转边交一份。上游回了错误
     // 状态码时照样原样转给客户端，记录的结局是「上游错误」
     let mut tap = ResponseTap {
+        _join: trace.upstream_join.upgrade(),
         transformed: status.is_success()
             && ctx.is_some()
             && (state.has_format(crate::config::file::Stage::Stream)

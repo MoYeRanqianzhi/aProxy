@@ -275,12 +275,16 @@ impl Layer {
                 let event = wire::StreamEvent::Data(wire::Fragment::from_bytes(bytes.to_vec()));
                 let reply = {
                     let mut frame = std::pin::pin!(self.send(event));
-                    tokio::select! {biased; result=&mut frame=>Some(result), _=tx.closed()=>{
-                        // 先停读上游，再限时收回已发帧；不能让旧序号的回信冒充 abort 的回信。
+                    tokio::select! {biased; _=tx.closed()=>{
+                        // 先停读上游，再限时收回原序号的帧。显式 fail 同样是完整回信，管道没有失步。
                         drop(input.take());
-                        if gone.has_changed().is_ok() || !matches!(tokio::time::timeout(CANCEL_GRACE, frame).await, Ok(Ok(_))) {return}
-                        None
-                    }}
+                        if gone.has_changed().is_ok() { return }
+                        match tokio::time::timeout(CANCEL_GRACE, frame).await {
+                            Ok(Ok(_)) => None,
+                            Ok(Err(reason)) if reason.code == "format_fail" => None,
+                            _ => return,
+                        }
+                    }, result=&mut frame=>Some(result)}
                 };
                 match reply {
                     None => {
@@ -298,6 +302,13 @@ impl Layer {
                     }
                     Some(Ok(_)) => (),
                     Some(Err(reason)) => {
+                        if tx.is_closed() && gone.has_changed().is_err() {
+                            drop(input);
+                            if reason.code == "format_fail" {
+                                self.abort_client().await;
+                            }
+                            return;
+                        }
                         if self.required {
                             drop(input);
                             let _ = tx
@@ -377,6 +388,7 @@ pub(super) async fn chain(
     mut content: Content,
 ) -> Result<Output, Terminal> {
     let (client, gone) = tokio::sync::watch::channel(());
+    let mut converted_stream = false;
     for (index, p) in state.formats.iter().enumerate().rev() {
         if p.entry.has_stage(Stage::Response) && p.available_for_message() {
             let (body, interrupted) = content.gather(state).await?;
@@ -394,6 +406,7 @@ pub(super) async fn chain(
                 transform_response_layer(state, ctx, meta, index, status, headers, body).await;
             status = code;
             headers = h;
+            converted_stream = false;
             content = Content::Saved(b);
             continue;
         }
@@ -453,6 +466,7 @@ pub(super) async fn chain(
             if let Some(replacement) = f.response {
                 status = StatusCode::from_u16(replacement.status).expect("validated status");
                 headers = prepared.unwrap_or_default();
+                converted_stream = false;
                 content = Content::Saved(
                     transform::spool_response_body(
                         replacement.body.as_bytes().unwrap_or_default(),
@@ -502,10 +516,12 @@ pub(super) async fn chain(
         }
         let (tx, rx) = mpsc::channel(1);
         let data = Bytes::copy_from_slice(reply.data.as_bytes().unwrap_or_default());
+        converted_stream = true;
         tokio::spawn(layer.pump(f, data, tx, gone.clone()));
         content = Content::Flow(receive(rx));
     }
     Ok(Output {
+        converted_stream,
         status,
         headers,
         content,
@@ -516,6 +532,8 @@ pub(super) async fn chain(
 
 /// 先保留可重放表示，等响应头归属确定再选保真直回或已提交的明文回放。
 pub(super) struct Output {
+    /// 最外层实际以流交付，即使程序选择的媒体类型不是 SSE。
+    converted_stream: bool,
     /// 头尚未提交时放行末层的状态。
     status: StatusCode,
     /// 当前正文的表示头，决定是否还需要解码。
@@ -535,6 +553,7 @@ impl Output {
         committed: bool,
     ) -> Result<Response, Terminal> {
         let Self {
+            converted_stream,
             status,
             headers,
             mut content,
@@ -584,6 +603,9 @@ impl Output {
             }
         });
         let mut response = Response::new(Body::from_stream(out));
+        if converted_stream {
+            response.extensions_mut().insert(ConvertedStream);
+        }
         *response.status_mut() = status;
         *response.headers_mut() = headers;
         Ok(response)
@@ -593,6 +615,94 @@ impl Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 在 data 已写出后让消费端离开；成功和显式拒绝都是可收回的完整帧，应在原会话上 abort。
+    #[tokio::test]
+    async fn abandoned_data_drains_success_and_valid_refusal_before_abort() {
+        for mode in ["stream-gate", "gate-data-fail"] {
+            let dir = tempfile::tempdir().unwrap();
+            let frames = dir.path().join("frames");
+            let gate = dir.path().join("go");
+            let (cfg, diagnostics) = crate::config::file::parse(
+                "[[format]]\ncommand='fixture'\nstages=['stream']\nprocess='persistent'",
+                Path::new("unit.toml"),
+            );
+            assert!(diagnostics.is_empty());
+            let mut entry = cfg.format.unwrap().pop().unwrap();
+            entry.command = crate::transform::format_echo_path().display().to_string();
+            entry.args = vec![mode.into(), gate.display().to_string()];
+            entry
+                .env
+                .insert("ECHO_RECORD".into(), frames.display().to_string());
+            let pool = crate::transform::Pool::new(
+                entry,
+                dir.path().into(),
+                Default::default(),
+                None,
+                [4096; 2],
+            );
+            let ctx = ExchangeCtx::new(
+                "r".into(),
+                "/",
+                false,
+                false,
+                crate::history::Recorder::none(),
+            );
+            let open = wire::StreamOpen::new(
+                ctx.context("fixture"),
+                wire::RequestMeta::new("GET".into(), "http://localhost/".into()),
+                wire::Response::new(200),
+            );
+            let (worker, _) = pool
+                .open_stream(
+                    wire::Stage::Stream(wire::StreamMessage::new(
+                        "r/1".into(),
+                        wire::StreamEvent::Open(open),
+                    )),
+                    false,
+                )
+                .await
+                .unwrap();
+            let layer = Layer {
+                worker,
+                ctx,
+                name: "fixture".into(),
+                index: 0,
+                id: "r/1".into(),
+                required: true,
+                tail: Bytes::new(),
+            };
+            let (tx, rx) = mpsc::channel(1);
+            let (client, gone) = tokio::sync::watch::channel(());
+            let input = futures_util::stream::iter([Ok(Bytes::from_static(b"upstream"))]).boxed();
+            let mut pump = std::pin::pin!(layer.pump(input, Bytes::new(), tx, gone));
+            let seen = |event: &str| {
+                std::fs::read_to_string(&frames)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                    .find(|v| v["event"] == event)
+            };
+            tokio::select! { _=&mut pump=>panic!("ended before release"), _=tokio::time::timeout(Duration::from_secs(10), async {while seen("data").is_none(){tokio::time::sleep(Duration::from_millis(5)).await;}})=>assert!(seen("data").is_some()) }
+            drop(client);
+            drop(rx);
+            tokio::time::pause();
+            assert!(futures_util::poll!(&mut pump).is_pending());
+            std::fs::write(gate, b"reply").unwrap();
+            // 真实管道仍在工作；同时运行的阻塞任务抑制虚拟时间自动跳到截止点。
+            let (done, wait) = std::sync::mpsc::channel();
+            let hold =
+                tokio::task::spawn_blocking(move || wait.recv_timeout(Duration::from_secs(10)));
+            pump.await;
+            done.send(()).unwrap();
+            hold.await.unwrap().unwrap();
+            tokio::time::resume();
+            let abort = seen("abort").unwrap_or_else(|| panic!("no abort for {mode}"));
+            assert_eq!(abort["seq"], 3);
+            assert_eq!(abort["stream_id"], "r/1");
+            assert_eq!(abort["reason"]["code"], "client_gone");
+            pool.shutdown().await;
+        }
+    }
     /// 编码成员收完后 HTTP 仍可能断流；只有运输层的 EOF 才能让外层发送 close。
     #[tokio::test]
     async fn valid_deflate_member_does_not_hide_a_later_transport_error() {

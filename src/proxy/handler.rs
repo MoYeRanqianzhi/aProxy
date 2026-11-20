@@ -57,6 +57,11 @@ pub(super) async fn proxy_handler(State(state): State<AppState>, req: Request) -
     let mut delivery = Delivery::new(rec.clone(), in_flight);
     let mut trace = RequestTrace::recorded(request_id, rec);
     trace.decide_started = decide_started;
+    if state.has_format(crate::config::file::Stage::Stream) {
+        let join = Arc::new(UpstreamJoin::default());
+        trace.upstream_join = Arc::downgrade(&join);
+        delivery.join = Some(join);
+    }
     let bodiless = method == http::Method::HEAD;
 
     // 这个请求的全部日志都带 request_id：与响应头 x-aproxy-request-id、错误体里的是同一个串，

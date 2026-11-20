@@ -6818,3 +6818,46 @@ async fn notify_only_waits_for_live_upload_accounting_after_response_end() {
     let record = request_detail(&home, &url, end["request_id"].as_str().unwrap()).await;
     assert_eq!(record["record"]["request_bytes"], actual.len());
 }
+
+/// stream 在 open 已提交头；损坏的非流式实体保持原状态码，但绝不交付空正文、旧长度或上游凭据。
+#[tokio::test]
+async fn committed_json_stream_returns_sanitized_client_error() {
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let app = axum::Router::new().fallback(|| async {
+        (
+            [
+                ("content-type", "application/octet-stream"),
+                ("set-cookie", "private-fixture"),
+                ("x-api-key", "private-fixture"),
+            ],
+            "{}",
+        )
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = official_layer(
+        "convert",
+        "'request','stream'",
+        &[
+            "convert",
+            "--from",
+            "anthropic_messages",
+            "--to",
+            "openai_chat",
+        ],
+    );
+    let (c, url) = running(&home, up, &cfg);
+    let r=c.post(format!("{url}/v1/messages")).json(&serde_json::json!({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hello"}]})).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["content-type"], "application/json");
+    for key in ["x-api-key", "set-cookie"] {
+        assert!(!r.headers().contains_key(key));
+    }
+    assert!(!r.headers().get("content-length").is_some_and(|v| v == "2"));
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "api_error");
+}

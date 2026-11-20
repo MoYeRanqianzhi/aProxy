@@ -43,6 +43,8 @@ enum Entity {
     Sse(Box<crate::events::Events>),
     /// 只在跨协议非 SSE 实体结束后转换 JSON。
     Json(F, F, Vec<u8>),
+    /// 已释放超限的非流式实体；已提交的响应头不能更改，close 时只写目标协议错误。
+    InvalidJson(F),
 }
 /// 不向诊断复制用户输入的协议名。
 pub fn protocol(s: &str) -> Result<F, &'static str> {
@@ -202,25 +204,25 @@ impl Convert {
     /// 回程失败要替换整份实体；裸 fail 会让代理原样透传上游私有错误页和鉴权头。
     /// 丢失协商状态时只用两族 SDK 都能读的 error 对象，不从原正文猜协议或复制原文。
     pub fn error_response(&self, ctx: &w::Context) -> w::Response {
-        let message = "The upstream response could not be converted.";
-        let body = match self
+        let client = self
             .pair(ctx)
             .map(|(client, _)| client)
             .or_else(|_| protocol(&self.from))
-        {
-            Ok(F::OpenAiChat | F::OpenAiResponses) => {
-                serde_json::json!({"error":{"type":"server_error","message":message,"code":"conversion_failed","param":null}})
-            }
-            Ok(F::AnthropicMessages) | Err(_) => {
-                serde_json::json!({"type":"error","error":{"type":"api_error","message":message}})
-            }
-        };
+            .unwrap_or(F::AnthropicMessages);
         let mut response = w::Response::new(502);
         response
             .headers
             .insert("content-type".into(), "application/json".into());
-        response.body = w::Body::Text(body.to_string());
+        response.body = w::Body::Text(Self::error_json(client));
         response
+    }
+    /// 两种交付路径只在能否改状态码上不同；协议错误正文始终由本地生成。
+    fn error_json(client: F) -> String {
+        let message = "The upstream response could not be converted.";
+        match client {
+            F::OpenAiChat | F::OpenAiResponses => serde_json::json!({"error":{"type":"server_error","message":message,"code":"conversion_failed","param":null}}),
+            F::AnthropicMessages => serde_json::json!({"type":"error","error":{"type":"api_error","message":message}}),
+        }.to_string()
     }
     /// 缓冲转换只解释成功实体，不把源正文或库错误中的字段值带到日志。
     fn json(client: F, upstream: F, bytes: &[u8]) -> Result<String, Fault> {
@@ -289,6 +291,15 @@ impl Convert {
                     r.abort_tail = Some(events.abort().into());
                     Entity::Sse(Box::new(events))
                 } else {
+                    let h = r
+                        .response
+                        .as_mut()
+                        .and_then(|p| p.headers.as_mut())
+                        .expect("已构造完整头补丁");
+                    h.remove("content-length");
+                    h.remove("content-encoding");
+                    h.insert("content-type".into(), "application/json".into());
+                    r.abort_tail = Some(Self::error_json(client));
                     Entity::Json(client, upstream, Vec::new())
                 });
             }
@@ -306,20 +317,27 @@ impl Convert {
                         self.stream = Some(Entity::Ended);
                     }
                 },
-                Entity::Json(_, _, b) => {
-                    if b.len().saturating_add(d.as_bytes().len()) > 64 * 1024 * 1024 {
-                        return Err(Fault::new(
-                            "非流式响应超过 64 MiB",
-                            "non-stream response exceeds 64 MiB",
-                        ));
+                Entity::InvalidJson(_) => r.data = w::Data::Text(String::new()),
+                Entity::Json(client, _, b) => {
+                    if d.as_bytes().len() > crate::events::SEMANTIC_BYTES.saturating_sub(b.len()) {
+                        self.stream = Some(Entity::InvalidJson(*client));
+                    } else {
+                        b.extend_from_slice(d.as_bytes());
                     }
-                    b.extend_from_slice(d.as_bytes());
                     r.data = w::Data::Text(String::new());
                 }
             },
             w::StreamEvent::Close => match self.stream.take() {
                 Some(Entity::Json(client, upstream, b)) => {
-                    r.data = w::Data::Text(Self::json(client, upstream, &b)?)
+                    r.data = w::Data::Text(
+                        Self::json(client, upstream, &b)
+                            .ok()
+                            .filter(|v| v.len() <= crate::events::SEMANTIC_BYTES)
+                            .unwrap_or_else(|| Self::error_json(client)),
+                    )
+                }
+                Some(Entity::InvalidJson(client)) => {
+                    r.data = w::Data::Text(Self::error_json(client))
                 }
                 Some(Entity::Sse(events)) => {
                     let tail = events.abort();
@@ -327,11 +345,13 @@ impl Convert {
                 }
                 _ => (),
             },
-            w::StreamEvent::Abort { .. } => {
-                if let Some(Entity::Sse(events)) = self.stream.take() {
-                    r.data = w::Data::Text(events.abort().into());
+            w::StreamEvent::Abort { .. } => match self.stream.take() {
+                Some(Entity::Sse(events)) => r.data = w::Data::Text(events.abort().into()),
+                Some(Entity::Json(client, _, _) | Entity::InvalidJson(client)) => {
+                    r.data = w::Data::Text(Self::error_json(client))
                 }
-            }
+                _ => (),
+            },
             _ => return Err(Fault::new("不支持的流事件", "unsupported stream event")),
         };
         Ok(())

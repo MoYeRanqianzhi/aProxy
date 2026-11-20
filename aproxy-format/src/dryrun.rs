@@ -622,6 +622,7 @@ impl<W: Write> Trial<'_, W> {
                 )?;
                 continue;
             }
+            let mut winning = Value::Null;
             if let Some(d) = r.decision {
                 changes.push(if d == w::Decision::Retry {
                     "retry"
@@ -629,6 +630,8 @@ impl<W: Write> Trial<'_, W> {
                     "stop"
                 });
                 if decision.is_none() {
+                    winning =
+                        json!({"winning_vote":if d == w::Decision::Retry {"retry"} else {"stop"}});
                     decision = Some(d == w::Decision::Retry);
                     if let Some(delay) = r.delay_ms {
                         delay_ms = delay.millis();
@@ -648,7 +651,7 @@ impl<W: Write> Trial<'_, W> {
                 "decide",
                 self.units[i].layer.label,
                 view(&req.url, &req.headers),
-                Value::Null,
+                winning,
                 changes,
             )?;
             if decision == Some(false)

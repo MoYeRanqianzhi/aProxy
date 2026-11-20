@@ -2257,23 +2257,30 @@ fn tools_try_runs_the_sample_chain_without_exposing_the_sample() {
         .iter()
         .map(|r| (r["stage"].as_str().unwrap(), r["role"].as_str().unwrap()))
         .collect();
-    for step in [
-        ("hello", "adaptive"),
-        ("request", "adaptive"),
-        ("request", "convert"),
-        ("request", "keys"),
-        ("decide", "adaptive"),
-        ("retry", "keys"),
-        ("stream:open", "convert"),
-        ("stream:data", "convert"),
-        ("stream:close", "convert"),
-        ("notify", "adaptive"),
-    ] {
-        assert!(steps.contains(&step), "{step:?} {text}");
-    }
-    assert!(
-        rows.iter()
-            .any(|r| r["stage"] == "result" && r["output"]["status"] == 200)
+    assert_eq!(
+        steps,
+        [
+            ("hello", "adaptive"),
+            ("hello", "convert"),
+            ("hello", "keys"),
+            ("request", "adaptive"),
+            ("request", "convert"),
+            ("request", "keys"),
+            ("decide", "adaptive"),
+            ("retry", "keys"),
+            ("stream:open", "convert"),
+            ("stream:data", "convert"),
+            ("stream:close", "convert"),
+            ("result", "proxy"),
+            ("notify", "adaptive"),
+        ]
+    );
+    let vote = rows.iter().find(|r| r["stage"] == "decide").unwrap();
+    assert_eq!(vote["output"]["winning_vote"], "retry");
+    let terminal = rows.iter().find(|r| r["stage"] == "result").unwrap();
+    assert_eq!(
+        terminal["output"],
+        json!({"status":200,"decided_by":"fallback","outcome":"ok","code":null})
     );
 }
 /// 默认连外部进程都不启动。显式授权后同一份无害测试命令留下标记，但它不懂握手，不能取得后续帧。

@@ -206,7 +206,7 @@ impl Role {
         match self {
             Self::Convert(c) => c.request(m, r),
             Self::Keys(k) => k.request(m, retry, r),
-            Self::Route(route) => route.request(m, r),
+            Self::Route(route) => route.request(m, retry, r),
             Self::Rewrite => Ok(()),
             Self::Adaptive => {
                 r.delivery = Some("forward".into());

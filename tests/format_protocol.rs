@@ -6009,6 +6009,71 @@ async fn adaptive_unavailable_falls_back_to_retry() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
 }
 
+/// 两个不同 origin 的真实上游分别观察地址、模型和认证；503 的下一次尝试不能沿用 A 的凭据。
+#[tokio::test]
+async fn official_route_failover_swaps_url_and_credentials_together() {
+    let home = TestHome::new();
+    let (send, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let mut config = String::from("[aliases]\nsmall='provider-small'\n");
+    for (id, priority, status, header, env) in [
+        ("a", 1, 503, "authorization", "KEY_A"),
+        ("b", 2, 200, "x-api-key", "KEY_B"),
+    ] {
+        let port = free_port();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let send = send.clone();
+        let app = axum::Router::new().fallback(
+            move |u: axum::http::Uri, h: axum::http::HeaderMap, b: axum::body::Bytes| {
+                send.send((id, u, h, b)).unwrap();
+                async move { (axum::http::StatusCode::from_u16(status).unwrap(), "reply") }
+            },
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        config += &format!(
+            "[[channel]]\nid='{id}'\npriority={priority}\nurl='http://127.0.0.1:{port}/{id}'\ncredential_env='{env}'\nauth_header='{header}'\n"
+        );
+    }
+    let file = home.path().join("route.toml");
+    std::fs::write(&file, config).unwrap();
+    let cfg = official_layer(
+        "route",
+        "'request','retry'",
+        &["route", "--config", file.to_str().unwrap()],
+    ) + "env={KEY_A='fixture-one', KEY_B='fixture-two'}\n";
+    let (client, url) = running(&home, free_port(), &cfg);
+    let res = client
+        .post(url)
+        .header("authorization", "old")
+        .json(&serde_json::json!({"model":"small"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.text().await.unwrap(), "reply");
+    for (name, path, selected, value, absent) in [
+        (
+            "a",
+            "/a",
+            "authorization",
+            "Bearer fixture-one",
+            "x-api-key",
+        ),
+        ("b", "/b", "x-api-key", "fixture-two", "authorization"),
+    ] {
+        let (id, u, h, b) = observed.try_recv().unwrap();
+        assert_eq!(id, name);
+        assert_eq!(u.path(), path);
+        assert_eq!(h[selected], value);
+        assert!(!h.contains_key(absent));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&b).unwrap()["model"],
+            "provider-small"
+        );
+    }
+    assert!(observed.try_recv().is_err());
+}
+
 /// 429 使 A 冷却；下一次尝试和另一个请求都走 B，而不只是恰好轮转一次。
 #[tokio::test]
 async fn official_keys_cool_the_previous_key_on_429() {

@@ -249,6 +249,24 @@ fn route_alias_paths_and_reverse_alias_survive_worker_boundaries() {
         assert_eq!(r["response"]["body"], r#"{"model":"other"}"#);
     }
 }
+/// 不同进程与增长的会话落到同一渠道，重试票仍切走，不受粘性阻止。
+#[test]
+fn sticky_route_survives_worker_changes_and_yields_to_failover() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("route.toml");
+    std::fs::write(&file,"sticky=true\n[[channel]]\nid='a'\nurl='https://a.test/'\n[[channel]]\nid='b'\nurl='https://b.test/'").unwrap();
+    let args = ["route", "--config", file.to_str().unwrap()];
+    let mut m = request("https://up.test/", "/", json!({"model":"m","input":"same"}));
+    let r = Worker::new(&args).frame(m.clone());
+    m["request"]["body"]=json!({"model":"m","messages":[{"role":"user","content":"same"},{"role":"user","content":"later"}]}).to_string().into();
+    let mut other = Worker::new(&args);
+    assert_eq!(other.frame(m.clone())["state"], r["state"]);
+    m["stage"] = "retry".into();
+    m["state"] = r["state"].clone();
+    m["retry"] =
+        json!({"attempt":2,"elapsed_ms":0,"last_failure":{"code":"upstream_connect_failed"}});
+    assert_ne!(other.frame(m)["request"]["url"], r["request"]["url"]);
+}
 /// 无过滤的末级渠道应接住前级未匹配的模型，而不只是另一个精确匹配。
 #[test]
 fn unfiltered_channel_accepts_unmatched_models() {

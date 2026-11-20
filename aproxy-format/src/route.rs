@@ -21,12 +21,22 @@ fn read_regex<'de, D: serde::Deserializer<'de>>(d: D) -> Result<regex::Regex, D:
     regex::Regex::new(&String::deserialize(d)?)
         .map_err(|_| serde::de::Error::custom("模型正则无效"))
 }
+/// 渠道在同优先级内缺省占一份，最低优先级数字先尝试。
+fn unit_weight() -> u64 {
+    1
+}
 /// 路由项只存环境变量名，绝不把密钥放进可见的渠道标识。
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Channel {
     /// 配置中的公开标识。
     id: String,
+    /// 数字越小越先尝试；同组内不靠配置先后决定所有流量。
+    #[serde(default)]
+    priority: u32,
+    /// 相同优先级下，此渠道作为首次选择的份额。
+    #[serde(default = "unit_weight")]
+    weight: u64,
     /// 完整的上游 URL，必要时在它的路径之后拼接客户端路径。
     url: String,
     /// 空集合为兜底。
@@ -50,7 +60,10 @@ pub struct Route {
     /// 原模型名到上游模型名。
     #[serde(default)]
     aliases: BTreeMap<String, String>,
-    /// 顺序用于区分特定匹配和最后的兜底。
+    /// 开启后与 keys 独立计算相同的用户前缀票号，不传递摘要或会话正文。
+    #[serde(default)]
+    sticky: bool,
+    /// 加载后按优先级稳定排序，组内保留配置顺序作为故障转移次序。
     channel: Vec<Channel>,
 }
 impl Route {
@@ -64,11 +77,11 @@ impl Route {
     }
     /// 使用请求阶段记下的别名，两个别名同指一个模型时也不会反查到另一个客户端的名称。
     pub fn response(&self, m: &w::ResponseMessage, r: &mut w::Reply) -> Result<(), Fault> {
-        let Some((_, Some(alias))) = m
+        let Some((_, Some(alias), _)) = m
             .context
             .state
             .as_deref()
-            .and_then(|v| serde_json::from_str::<(String, Option<String>)>(v).ok())
+            .and_then(|v| serde_json::from_str::<(String, Option<String>, u64)>(v).ok())
         else {
             return Ok(());
         };
@@ -106,7 +119,7 @@ impl Route {
     }
     /// 在握手之前发现重复标识、非法 URL 和无效头名。
     pub fn load(path: &str) -> Result<Self, &'static str> {
-        let cfg: Self = config::load(path)?;
+        let mut cfg: Self = config::load(path)?;
         let mut ids = std::collections::HashSet::new();
         if cfg.channel.is_empty() {
             return Err("至少需要一个渠道");
@@ -119,8 +132,13 @@ impl Route {
             .max()
             .unwrap_or(0)
             .max(4);
+        let mut total = 0u64;
         for c in &cfg.channel {
-            if config::state_string_bytes(&c.id) + alias_bytes + 3 > config::STATE_BYTES {
+            total = total
+                .checked_add(c.weight)
+                .filter(|_| c.weight != 0)
+                .ok_or("渠道权重须为正数且总和不能溢出")?;
+            if config::state_string_bytes(&c.id) + alias_bytes + 24 > config::STATE_BYTES {
                 return Err("渠道标识与别名生成的状态超过 64 KiB");
             }
             config::endpoint(&c.url)?;
@@ -131,10 +149,53 @@ impl Route {
                 config::credential_header(h)?;
             }
         }
+        cfg.channel.sort_by_key(|c| c.priority);
         Ok(cfg)
     }
+    /// 每组先按权重确定起点，再遍历其余匹配项。重试沿同一票号继续，避免两个坏高优先级渠道相互切换。
+    fn choose(&self, model: &str, ticket: u64, previous: Option<&str>) -> Option<&Channel> {
+        let mut eligible: Vec<_> = self
+            .channel
+            .iter()
+            .filter(|c| {
+                c.models.is_empty()
+                    || c.models.iter().any(|p| match p {
+                        Matcher::Exact(s) => s == model,
+                        Matcher::Prefix(s) => model.starts_with(s),
+                        Matcher::Regex(re) => re.is_match(model),
+                    })
+            })
+            .collect();
+        if eligible.is_empty() {
+            return None;
+        }
+        for group in eligible.chunk_by_mut(|a, b| a.priority == b.priority) {
+            let mut slot = ticket % group.iter().map(|c| c.weight).sum::<u64>();
+            let first = group
+                .iter()
+                .position(|c| {
+                    if slot < c.weight {
+                        true
+                    } else {
+                        slot -= c.weight;
+                        false
+                    }
+                })
+                .expect("非空组的正权重总和已验证");
+            group.rotate_left(first);
+        }
+        let i = previous
+            .and_then(|id| eligible.iter().position(|c| c.id == id))
+            .map_or(0, |i| (i + 1) % eligible.len());
+        Some(eligible[i])
+    }
     /// 用当前请求体匹配渠道；只返回必要字段，公开报告不带 URL 或凭据。
-    pub fn request(&self, m: &w::RequestMessage, r: &mut w::Reply) -> Result<(), Fault> {
+    pub fn request(
+        &self,
+        m: &w::RequestMessage,
+        retry: Option<&w::Retry>,
+        r: &mut w::Reply,
+    ) -> Result<(), Fault> {
         let mut body: serde_json::Value =
             serde_json::from_slice(m.request.body.as_bytes().unwrap_or_default())
                 .map_err(|_| Fault::new("请求体不是 JSON", "request body is not valid JSON"))?;
@@ -146,17 +207,20 @@ impl Route {
             .get(original)
             .map(String::as_str)
             .unwrap_or(original);
-        let channel = self
-            .channel
-            .iter()
-            .find(|c| {
-                c.models.is_empty()
-                    || c.models.iter().any(|p| match p {
-                        Matcher::Exact(s) => s == model,
-                        Matcher::Prefix(s) => model.starts_with(s),
-                        Matcher::Regex(re) => re.is_match(model),
-                    })
+        let prior = retry
+            .and_then(|_| m.context.state.as_deref())
+            .and_then(|v| serde_json::from_str::<(String, Option<String>, u64)>(v).ok());
+        let ticket = prior
+            .as_ref()
+            .map(|p| p.2)
+            .or_else(|| {
+                self.sticky
+                    .then(|| crate::selection::conversation_ticket(&body))
+                    .flatten()
             })
+            .unwrap_or_else(rand::random);
+        let channel = self
+            .choose(model, ticket, prior.as_ref().map(|p| p.0.as_str()))
             .ok_or(Fault::new(
                 "模型未命中任何渠道",
                 "no channel matches the model",
@@ -215,7 +279,8 @@ impl Route {
         patch.url = Some(url.into());
         patch.headers = Some(headers);
         r.state = Some(
-            serde_json::json!([channel.id, (original != model).then_some(original)]).to_string(),
+            serde_json::json!([channel.id, (original != model).then_some(original), ticket])
+                .to_string(),
         );
         r.report = config::report(
             "Selected an upstream channel",
@@ -231,5 +296,33 @@ impl Route {
         }
         r.request = Some(patch);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+/// 注入固定票号验证匹配、份额和故障转移，而非靠随机请求数估计配置对错。
+mod tests {
+    use super::*;
+    /// 低优先级虽写在配置首行仍然只在前组全部失败后入选；三种 matcher 分别控制资格。
+    #[test]
+    fn priorities_and_weights_only_apply_to_matching_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("route.toml");
+        std::fs::write(&file,"[[channel]]\nid='last'\nurl='https://last.test'\npriority=8\nmodels=[{regex='^m[0-9]$'}]\n[[channel]]\nid='a'\nurl='https://a.test'\nweight=2\nmodels=[{exact='m1'}]\n[[channel]]\nid='b'\nurl='https://b.test'\nmodels=[{prefix='m'}]").unwrap();
+        let route = Route::load(file.to_str().unwrap()).unwrap();
+        for (model, ticket, prev, id) in [
+            ("m1", 0, None, "a"),
+            ("m1", 1, None, "a"),
+            ("m1", 2, None, "b"),
+            ("m1", 2, Some("b"), "a"),
+            ("m1", 2, Some("a"), "last"),
+            ("m1", 2, Some("last"), "b"),
+            ("m2", 0, None, "b"),
+            ("m2", 0, Some("b"), "last"),
+            ("model", 0, Some("b"), "b"),
+        ] {
+            assert_eq!(route.choose(model, ticket, prev).unwrap().id, id);
+        }
+        assert!(route.choose("unknown", 0, None).is_none());
     }
 }

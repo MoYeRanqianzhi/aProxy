@@ -1619,6 +1619,8 @@ aproxy desktop                  W5
     头表不动，程序从 `content-encoding` 看得出来；照常问，不因此跳过 decide（2026-11-20 补）。
   - 响应头到了、体没收全就断了（`upstream_body_interrupted` 之类）时，`response` 只带 `status` 与 `headers`，不带体。
     这种尝试在 stop 的处理里按没有上游响应算：不带 `response` 的 stop 回 502 `retry_stopped`，补丁的底是空的 502（2026-11-20 补）。
+    这说的是 retry 请求。没有升级的 forward 请求被叫停而不带 `response` 时，按 §10.10 的默认结束：没有可交付的上游响应就回
+    502 `upstream_failed`，不是 `retry_stopped`。
 - **`fallback`**：不问 format 时 aproxy 会怎么做，即覆盖、规则表与默认三者得出的结论。
 - **回信**（`decision` 与 `reroute` 各自取第一个表态的程序）：
   - `decision:"retry"`：重试。`delay_ms` 可选，取值 0–86 400 000；省略就用 `fallback.delay_ms`，fallback 是 stop 时按现行退避算。
@@ -1813,6 +1815,11 @@ aproxy desktop                  W5
 **forward 请求的请求体**：
 - 链上有程序在 request 阶段要 `full` 或 `digest`，或者有程序声明了 decide（升级之后要重发），aproxy 就先读完整个请求体，大的照现行做法溢写；
 - 否则请求体直接流向上游，与现行的仅转发一致。这时没有程序能让它升级，也就不必留体。
+- 这里的 forward 请求，指起始投递方式（配置的 `delivery`）是 forward 的请求。起始是 retry 的请求总是先读完请求体：
+  保活的触发条件可能要看体，重发也要它；链上的程序再慢，保活照常。request 阶段的程序把它改成 forward，
+  改的是响应怎么投递，这时请求体已经读完了。想要请求体直流，就把 `delivery` 配成 forward（2026-11-20 补）。
+- 请求体直流时，程序给了替换的体，原来的体就读完即弃：限额、计数与 notify 要的摘要照做，但不为重发把它留在内存或磁盘里。
+- 直流的请求体不占共享资源：看体里的 `stream` 不占运行时的阻塞线程池，解析它用的内存有上限，与体的大小、键名的长度无关。
 
 **请求内升级**：
 - forward 请求的这次尝试失败，并且还没有向客户端写出任何字节（响应头也算）时，aproxy 问一次 decide。
@@ -1824,7 +1831,7 @@ aproxy desktop                  W5
   - `stop` 并带 `response`：返回它，码为 `retry_stopped`。
   - 其余情况（`stop` 不带响应、不表态、decide 出错或熔断）按 forward 的默认结束：透传上游响应，不加 `x-aproxy-*` 头；
     没有上游响应时回 502 `upstream_failed`；请求侧 format 失败时回 502 `format_failed`。
-- 已经向客户端写出字节之后不再升级，与现行一致。例如 2xx 的流中途断开：连接照现行做法结束（经过 stream 程序时写出 `abort_tail`，§10.6），
+- 已经向客户端写出字节之后不再升级，与现行一致。例如 2xx 的流中途断开：连接照现行做法结束（经过 stream 程序时，写给客户端的收尾按 §10.6：最外层对 abort 的回信，它自己失败时才是 `abort_tail`），
   记录的终态码为 `upstream_failed`，完成通知的 `stream_completed` 为 false。
 
 **forward 请求的「200 但内容是错误」**（R-S3-8）：
@@ -1857,6 +1864,8 @@ aproxy desktop                  W5
 
 - **时机**：请求结束之后（响应交付完毕、客户端断开或终态错误），给每个声明了 notify 的程序发一条。发完，这个请求的 state 就丢弃。
   进链之前就被拒绝的请求（403 的 Host 或 Origin、413、`client_body_aborted`）不发：它们没进过链，format 也没见过它们（R-S3-7 ①）。
+  判据是进没进过链，不是终态码：请求体直流时，程序先看到了请求、之后上传才超限或中断，这样的 413 与 `client_body_aborted`
+  照发（2026-11-20 补）。
 - **字段**：
   - `delivery`、`upgraded` 见 §10.10；`attempts` 是总尝试数；
   - `upstream_status` 是最后一次上游响应的状态码，没有时为 null；

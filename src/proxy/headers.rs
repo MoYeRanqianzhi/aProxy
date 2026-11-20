@@ -2,24 +2,8 @@
 
 use super::*;
 
-/// 需要过滤的 hop-by-hop 头，避免透传导致协议错误或与 hyper/reqwest 的
-/// 自动管理（content-length / transfer-encoding / host / connection）冲突。
-pub(crate) const HOP_HEADERS: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-    "host",
-    "content-length",
-];
-
-pub(crate) fn is_hop_header(name: &str) -> bool {
-    HOP_HEADERS.contains(&name.to_ascii_lowercase().as_str())
-}
+/// 请求侧的逐跳头及长度、主机由代理管理；与格式程序配置拒绝的槽位共用同一判据。
+pub(crate) use aproxy_envelope::is_managed_request_header as is_hop_header;
 
 /// 响应侧的 hop-by-hop 过滤：同 `is_hop_header`，但**在上游未用
 /// transfer-encoding 分帧时排除 content-length**（即把它保留下来）。

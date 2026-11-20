@@ -68,6 +68,9 @@ pub fn strip_credentials(h: &mut Headers) {
 /// 配置指定的凭据头既要能写入 HTTP 请求，也要能在请求历史里仅凭头名就被脱敏。
 pub fn credential_header(name: &str) -> Result<http::HeaderName, &'static str> {
     let header = http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| "鉴权头名称无效")?;
+    if aproxy_envelope::is_managed_request_header(header.as_str()) {
+        return Err("鉴权头不能使用代理管理的名称");
+    }
     if !aproxy_ipc::redact::is_secret_header(header.as_str()) {
         return Err("鉴权头必须使用请求历史会脱敏的名称");
     }

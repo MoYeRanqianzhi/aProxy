@@ -810,6 +810,41 @@ fn credential_slots_require_history_protected_names() {
     }
 }
 
+/// 即使语法合法，代理不会转交的头也不能作认证或改写的赋值目标。
+#[test]
+fn managed_header_slots_fail_before_hello() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("role.toml");
+    for (role, text) in [
+        (
+            "keys",
+            "[[pool]]\norigin='https://a.test'\nheader='Proxy-Authorization'\nkeys=[{id='a',env='KEY'}]",
+        ),
+        (
+            "route",
+            "[[channel]]\nid='a'\nurl='https://a.test'\nauth_header='Proxy-Authenticate'\ncredential_env='KEY'",
+        ),
+        (
+            "rewrite",
+            "[set_headers]\nTransfer-Encoding='private-fixture'",
+        ),
+    ] {
+        std::fs::write(&file, text).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+            .args([role, "--config"])
+            .arg(&file)
+            .env("KEY", "private-fixture")
+            .output()
+            .unwrap();
+        assert!(!out.status.success() && out.stdout.is_empty());
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            err.contains("代理管理") && !err.contains("private-fixture"),
+            "{err}"
+        );
+    }
+}
+
 /// 真实 origin（含端口）决定查询串边界；跨域只传点名的参数，重复值不能丢。
 #[test]
 fn route_drops_cross_origin_query_except_listed_parameters() {

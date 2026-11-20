@@ -17,7 +17,15 @@ pub fn translate_request(from: WireFormat, to: WireFormat, body: &Value) -> Resu
     let mut out = switchyard_translation::encode_request(&req, to).map_err(|e| e.to_string())?;
     // Chat 上游只在明确请求时给流的最终用量，其他协议的客户端不需要也无法替它设置这个开关。
     if to == WireFormat::OpenAiChat && body["stream"] == true {
-        out["stream_options"]["include_usage"] = true.into();
+        let options = out
+            .as_object_mut()
+            .and_then(|obj| {
+                obj.entry("stream_options")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+            })
+            .ok_or("stream_options 必须是对象")?;
+        options.insert("include_usage".into(), true.into());
     }
     Ok(out)
 }

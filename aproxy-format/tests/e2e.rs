@@ -1695,6 +1695,15 @@ fn translating_a_stream_to_chat_requests_native_usage() {
     let corpus: Value = serde_json::from_str(include_str!("fixtures/protocols.json")).unwrap();
     for client in ["anthropic_messages", "openai_responses"] {
         let mut w = Worker::new(&["convert", "--from", client, "--to", "openai_chat"]);
+        if client == "openai_responses" {
+            let mut invalid = corpus[client]["request"].clone();
+            invalid["stream"] = true.into();
+            invalid["stream_options"] = false.into();
+            assert!(
+                w.frame(request("https://relay.test/custom", "/custom", invalid))["fail"]
+                    .is_object()
+            );
+        }
         for stream in [true, false] {
             let mut body = corpus[client]["request"].clone();
             body["stream"] = stream.into();

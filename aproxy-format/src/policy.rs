@@ -192,7 +192,7 @@ impl Policy {
                 .map(w::RetryDelay::millis)
                 .or(m.fallback.delay_ms)
                 .unwrap_or_default();
-            r.delay_ms = w::RetryDelay::new(ms.max(base.min(w::MAX_DELAY_MS))).ok();
+            r.delay_ms = w::RetryDelay::new(ms.max(base)).ok();
         }
         if let Some(template) = rule.response {
             let proto = m
@@ -256,6 +256,17 @@ mod tests {
             p.decide(&m, &mut r);
             assert_eq!(r.delay_ms.map(w::RetryDelay::millis), expected);
         }
+        // 实例自己的退避不受票的上限约束；不能用一天的显式票把它截短。
+        m.fallback.delay_ms = Some(100_000_000);
+        m.response
+            .as_mut()
+            .unwrap()
+            .response
+            .headers
+            .insert("retry-after".into(), "1".into());
+        let mut inherited = w::Reply::new(3);
+        p.decide(&m, &mut inherited);
+        assert!(inherited.delay_ms.is_none());
         let mut wrong = message(503, "busy");
         let mut r = w::Reply::new(1);
         p.decide(&wrong, &mut r);

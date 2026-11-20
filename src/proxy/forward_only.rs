@@ -16,8 +16,8 @@ struct RequestTap {
     sent_history: Option<BodyWriter>,
     /// 完整上传解析结束时才通知响应方向，不能把没读到当作 false。
     flag_out: Option<Arc<std::sync::OnceLock<bool>>>,
-    /// 大体通过有界管道交给增量 JSON 解析器，不积攒整个上传；小时直接复用头部样本。
-    parser: Option<(tokio::io::DuplexStream, tokio::task::JoinHandle<bool>)>,
+    /// 超过样本上限时只保留有界的增量语法状态，不等待尚未到达的输入。
+    parser: Option<super::live_flag::LiveFlag>,
     /// 仅完成通知协商摘要时顺手哈希，不把请求体留作重放。
     digest: Option<(sha2::Sha256, Arc<std::sync::OnceLock<String>>)>,
     /// 上传结束后的解析结果，同时用于程序和请求记录。
@@ -32,7 +32,7 @@ struct RequestTap {
 
 impl RequestTap {
     /// 边转发边取样。程序要确切标记时要看到整个 JSON 的结尾，后面的重复键或语法错误也算数。
-    async fn chunk(&mut self, chunk: &Bytes) {
+    fn chunk(&mut self, chunk: &Bytes) {
         if let Some((hash, _)) = &mut self.digest {
             sha2::Digest::update(hash, chunk);
         }
@@ -40,18 +40,12 @@ impl RequestTap {
             && self.parser.is_none()
             && chunk.len() > SHAPE_PREFIX - self.prefix.len()
         {
-            let (mut writer, reader) = tokio::io::duplex(SHAPE_PREFIX);
-            let job = tokio::task::spawn_blocking(move || {
-                json_requests_stream(serde_json::Deserializer::from_reader(
-                    std::io::BufReader::new(tokio_util::io::SyncIoBridge::new(reader)),
-                ))
-            });
-            // 解析器遇到非法 JSON 可以提前结束；关闭读端不是上传失败。
-            let _ = writer.write_all(&self.prefix).await;
-            self.parser = Some((writer, job));
+            let mut parser = super::live_flag::LiveFlag::new();
+            parser.feed(&self.prefix);
+            self.parser = Some(parser);
         }
-        if let Some((writer, _)) = &mut self.parser {
-            let _ = writer.write_all(chunk).await;
+        if let Some(parser) = &mut self.parser {
+            parser.feed(chunk);
         }
         if let Some(history) = self.sent_history.as_mut() {
             history.feed_copy(chunk);
@@ -65,19 +59,21 @@ impl RequestTap {
         }
     }
     /// 只在客户端上传抵达 EOF 时结算，不让取消的流被认作完整 JSON。
-    async fn finish(&mut self) {
+    fn finish(&mut self) {
         if let Some((hash, out)) = self.digest.take() {
             ExchangeCtx::finish_digest(&out, hash);
         }
         if let Some(out) = self.flag_out.take() {
-            let flag = if let Some((writer, job)) = self.parser.take() {
-                drop(writer);
-                job.await.expect("stream flag parser")
+            self.exact = if let Some(parser) = self.parser.take() {
+                parser.finish()
             } else {
-                json_requests_stream(serde_json::Deserializer::from_slice(&self.prefix))
+                Some(json_requests_stream(serde_json::Deserializer::from_slice(
+                    &self.prefix,
+                )))
             };
-            self.exact = Some(flag);
-            let _ = out.set(flag);
+            if let Some(flag) = self.exact {
+                let _ = out.set(flag);
+            }
         }
     }
 }
@@ -321,7 +317,7 @@ pub(super) async fn forward_only_proxy(
                 async move {
                     // 流结束时 tap 随这个 future 一起被丢弃，请求体的记录就此收尾
                     let Some(chunk) = stream.next().await else {
-                        tap.finish().await;
+                        tap.finish();
                         return None;
                     };
                     let chunk = match chunk {
@@ -333,7 +329,7 @@ pub(super) async fn forward_only_proxy(
                             return Some((Err(e), (stream, seen, tap)));
                         }
                     };
-                    tap.chunk(&chunk).await;
+                    tap.chunk(&chunk);
                     let seen = seen.saturating_add(chunk.len());
                     if seen > limit {
                         flag.store(true, AtomicOrdering::Relaxed);
@@ -594,4 +590,54 @@ pub(super) async fn forward_response(
         ))
         .unwrap()
         .into_response())
+}
+
+/// 上传探针的资源隔离与最终结果。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 未收完的上传停在一个任意长的属性名中间；其它请求的文件任务不依赖其 EOF。
+    #[test]
+    fn idle_live_upload_does_not_occupy_a_shared_blocking_thread() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let out = Arc::new(std::sync::OnceLock::new());
+            let mut tap = RequestTap {
+                rec: Recorder::none(),
+                history: None,
+                sent_history: None,
+                flag_out: Some(out.clone()),
+                parser: None,
+                digest: None,
+                exact: None,
+                prefix: Vec::new(),
+                seen: 0,
+                accept_sse: false,
+                trigger: crate::config::KeepaliveTrigger::BodyStream,
+            };
+            tap.chunk(&Bytes::from_static(b"{\""));
+            let part = Bytes::from(vec![b'x'; SHAPE_PREFIX]);
+            for _ in 0..16 {
+                tap.chunk(&part);
+            }
+            let result =
+                tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(|| 7))
+                    .await;
+            tap.chunk(&Bytes::from_static(br#"":null,"stream":true}"#));
+            tap.finish();
+            assert_eq!(
+                result
+                    .expect("idle upload held the shared blocking pool")
+                    .unwrap(),
+                7
+            );
+            assert_eq!(out.get(), Some(&true));
+        });
+    }
 }

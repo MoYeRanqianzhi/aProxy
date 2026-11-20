@@ -4,8 +4,8 @@ W2c 的设计稿：`aproxy-format <角色>` 每个子命令做什么、要哪些
 协议一侧的契约在 [w2-contracts](w2-contracts.md) 的 §10（各角色用到的阶段见 §10.14）；这里只写角色自己的行为。
 由 Codex 在 t06 第五段起草（2026-11-20），主代理改写成中文；实现分在 t06 的第五到第九段。
 
-**现状（2026-11-20，第五段做完）**：各角色的协议 1 入口、请求与非流式响应的转换、基本的 key 轮换与按模型路由已经实现。
-下面写到的流式转换、冷却、决策与工具子命令属于之后几段，起步的骨架还不都接受这些配置。
+**现状（2026-11-20，第六段做完）**：各角色的协议 1 入口，三种协议之间请求、响应与流式的转换，Messages 的原生心跳，
+基本的 key 轮换与按模型路由已经实现。下面写到的冷却、粘性、决策与工具子命令属于之后几段，起步的骨架还不都接受这些配置。
 
 ## 共同约定
 
@@ -15,6 +15,10 @@ W2c 的设计稿：`aproxy-format <角色>` 每个子命令做什么、要哪些
   只有双方都声明了 `decide.success`，成功的尝试才会来问。类型用 `aproxy-envelope` 的协议 1 类型。
 - 给本机看的（命令行输出、stderr 的诊断）用中文；写进协议的 `fail.reason` 与 `report.summary` 用英文，因为读它们的是别的程序。
 - 诊断不上 stdout。报错里不引用坏掉的帧、TOML 的原文行、环境变量的值、认证头。
+- 一帧必须以换行结束；两帧之间的 EOF 是正常退出，EOF 前的残行不算一帧。读一行有上限（含换行）：hello 64 KiB；
+  只要元数据的角色 8 MiB（decide 的预览经 JSON 转义之后也在内）；收完整请求体或响应体的角色 257 MiB。
+  后一个是线上字节数的上限，不保证任意转义之后、或 aproxy 不限体大小时都放得下。
+- 只回应自己在 hello 里声明过的阶段。
 - 配置是严格的 TOML：`--config FILE` 指向这个角色自己的文件（下面每个样例是一个单独的文件，不是 config.toml 里的一节），
   不认识的键报错。样例里的密钥写的是**环境变量的名字**，值由 worker 的环境给出，从不写进文件。
 - 状态：
@@ -22,10 +26,6 @@ W2c 的设计稿：`aproxy-format <角色>` 每个子命令做什么、要哪些
     `state` 要小，用稳定的、不是密钥的 ID 作键。
   - 跨请求的状态只在进程里。要它不丢，就配 persistent、`pool_max = 1`、`worker_idle_secs = 0`。
   - worker 没了，丢的只能是偏好与计数；不能因此弄错一个请求的协议，也不能漏出凭据。
-
-The worker accepts newline-terminated frames only; clean EOF between frames retires it. Limits include the newline: 64 KiB for hello, 8 MiB for metadata-only roles (including a JSON-escaped decide preview), or 257 MiB for roles that accept full bodies or response entities. The latter is a wire-size bound, not a promise that arbitrary escaping or an unlimited proxy body budget will fit.
-
-`keys.header` and `route.auth_header` must be valid HTTP header names protected by the proxy's secret-header predicate. A credential read from a worker's inherited environment may not be a value the proxy knows; using an unprotected name could put it in request history. Stripping credentials uses that same predicate, including cookies and custom token or session headers.
 
 ## convert
 
@@ -45,10 +45,13 @@ to = "openai_chat"
 - 保留现有的非流式转换与同协议直通。回给客户端的响应补丁里去掉上游的凭据头。报告只写协议名，不写内容。
 - **流式**：一条流独占的那个 worker 持有源协议的帧解码器与转换状态，直到 close 或 abort。
   - 管道里的一帧 data 不等于一个 SSE 事件：要处理半行、一帧里的多个事件、各协议自己的事件名与结束方式。
-  - 不把整条流攒起来。
+  - 不把整条流攒起来：每个完整的事件立即发出；一个没收完的源事件最多留 8 MiB。转换器留的是各协议的语义状态
+    （例如工具参数、Responses 结束快照里要的输出），不是上游的原始字节。
   - 流被截断时按 abort 的规则收尾，不补一个正常的结束。
   - 上游回的是非流式的整体、却进了 stream 订阅时，在整体的边界上用非流式的转换。
-- 上游的错误不走成功响应的转换；要按客户端协议改写错误，用 policy 的 stop 附带响应。
+- 成功的响应转不了（体坏了、流开不起来）时，回一个新生成的 502：客户端协议的 JSON 错误，不带上游的头，也不带上游的字节。
+  `state` 里没有客户端协议时，用通用的嵌套错误对象。这不是重试的表态，重不重试仍由那次尝试的判定决定。
+- 上游的非成功响应不走成功响应的转换；要按客户端协议改写错误，用 policy 的 stop 附带响应。
 
 ## keys
 
@@ -112,7 +115,10 @@ model = "small"
   `reroute:false` 时 aproxy 重发准备好的请求，任何角色都不该自己换。
 - **换上游时的凭据**：去向变了就去掉 authorization、API key、cookie 与代理凭据，哪怕后面还排着 keys。
   然后用这个渠道自己的凭据，或交给绑定去向的 keys 来填。
-- **地址**：用渠道写明的 URL；配了 `preserve_path` 就接上原来的路径与查询串。
+- **地址**：用渠道写明的 URL；配了 `preserve_path` 就接上客户端原始路径（`client.path`）的路径部分，
+  不是上一个上游地址里已经拼好的路径。
+- **查询串**：同一个 origin 之内整段保留。跨 origin 时只带渠道的 `carry_query` 列出的参数名（默认一个都不带）：
+  保持它们的顺序与重复值，不覆盖渠道 URL 里写死的参数。
 - **覆盖**：只回 hello 里列出的覆盖键。同一个键上，精确匹配原始模型的规则压过所选渠道的默认值。
 - **状态与报告**：原始模型与选中的渠道 ID 记进 `state`；报告写路由与模型映射，不写凭据，也不写带 userinfo 的 URL。
 - **把别名换回来**：配了别名时，另外提供一个可选的 response 订阅（要缓冲响应）。只有上游回的是映射后的那个模型名时，
@@ -203,6 +209,13 @@ event = "ping"
 - **输出**：每次输出都停在 SSE 的事件边界上（例如 `event: ping\ndata: {"type":"ping"}\n\n`）。
   预设不能编造文本、工具调用、用量或结束事件。
 - 一个预设要先与真实转换出来的事件交错着喂给目标 SDK 的解析器，验证通过，才能写成「支持」。
+- **现有的预设**（2026-11-20，主代理认可）：
+  - 不给配置文件时，`/v1/messages` 用 `anthropic_messages` 的 `ping`：这是上游还没回任何东西时也安全的原生事件。
+    给了配置文件，就只对文件里列出的路径生效。
+  - Chat 与 Responses 的路径上原样留下收到的字节（通常是 aproxy 发的 SSE 注释），不造事件：实测 Chat 的 SDK 会记住第一个块的
+    ID，哪怕它的 delta 是空的；Responses 的 SDK 要求第一个事件是 `response.created`。在上游的第一个真实事件之前造一个事件，
+    要么给了假的响应身份，要么违反事件顺序。
+  - 所以对这两种协议，心跳只是传输层的保活，不保证喂得住按事件计时的看门狗。
 
 ## 工具子命令与验证
 
@@ -221,11 +234,15 @@ event = "ping"
     客户端收到的响应，不只是退出码。
   - 留一条直接的测试：默认 retry 之下可选的 adaptive 不可用时，普通的重试还在。
   - 流式：每个方向都跑，并把每个心跳预设交错进去，用官方 Python SDK 的解析器断言文本、工具、结束与用量；不调真实的 API。
-    SDK 那套验证做出来之后，把确切的调用方式记在它旁边。
+    怎么跑：先 `cargo build -p aproxy-format --locked`，再在一个单独的 Python 环境里（`anthropic==2.8.0`、`openai==3.51.0`）
+    运行 `python aproxy-format/tests/sdk/check_streams.py <构建出的 aproxy-format 的路径>`。脚本只同角色进程与 SDK 的
+    内存 HTTP 传输打交道；除了不带心跳的对照，还检查心跳插在第一个事件之前与事件之间两种情况。
 
 ## 第五段审查之后定下的（2026-11-20）
 
-这些是对上文的修正，实现在 t06 的第六到第九段；配置键的名字由实现定，定了之后并进上面各节。
+这些是对上文的修正。第六段已经实现、并且并进了上面各节的：凭据不跨去向的四条、convert 认客户端协议、`preserve_path`、
+别名只在 JSON 响应里换回、keys 握手前检查凭据、ID 上限、协议循环。还没实现的：convert 的 `to = "auto"` 与 route 的粘性
+（第七段），`try` 的两条（第九段）；它们的配置键由实现定，定了之后并进上面各节。
 
 - **凭据不跨去向**（convert、keys、route 共同）：
   - 去向变了，或把上游的响应交还客户端时，去掉的是全部「密钥头」（[w2-contracts](w2-contracts.md) §1.5 的名字规则，

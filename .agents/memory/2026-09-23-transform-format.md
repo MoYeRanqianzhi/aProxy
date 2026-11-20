@@ -41,7 +41,13 @@ worker 的内存不是请求的身份。同一个链条目的 request 与 respon
 没法立刻冷却那个 key：只有重跑的重试链才收到上一次的上游响应头。各角色订哪些阶段、怎么带状态，见
 `.agents/plan/format-roles.md`。
 
-**Evidence:** `aproxy-format/tests/e2e.rs` 的 `cross_format_response_conversion_end_to_end`；`tests/format_protocol.rs` 的
+赶在上游第一个真实事件之前到的心跳，不能替上游编造响应的身份。SDK 会留住第一个 Chat 块的 ID，哪怕它的 delta 是空的；
+Responses 要求先有 `response.created`。SSE 注释、协议原生的 ping 与一个空的模型事件，三者不能互换。验证时既看交错之后的事件流，
+也看 SDK 最后攒出来的响应，不能只看 JSON 合不合法。同样，decide 的预览说的是解码后的字节，重试带的头说的是上游原来的头：
+一个 gzip 的失败响应，不该因为有 decide 程序看过它，就丢了 `content-encoding` 与长度。
+
+**Evidence:** `aproxy-format/tests/sdk/check_streams.py`；`tests/format_protocol.rs` 的
+`retry_last_response_carries_each_upstream_head_without_the_body`；`aproxy-format/tests/e2e.rs` 的 `cross_format_response_conversion_end_to_end`；`tests/format_protocol.rs` 的
 `sample_chain_of_section_7_2_runs_end_to_end`、`retry_last_response_omitted_after_chain_and_connect_failures`；
 `tests/history_integration.rs` 的 `forwarded_requests_are_recorded_as_they_stream`；`tests/format_protocol.rs` 的
 `forward_stream_can_open_before_the_client_finishes_its_upload`、`forward_vote_on_either_side_of_commitment`、

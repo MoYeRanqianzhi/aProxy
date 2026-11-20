@@ -117,7 +117,7 @@ impl Convert {
         }
         let mut seen = std::collections::HashSet::new();
         for d in &mut self.upstream {
-            let url = config::endpoint(&d.origin)?;
+            let mut url = config::endpoint(&d.origin)?;
             if url.path() != "/" || url.query().is_some() {
                 return Err("目的端映射必须给出 origin");
             }
@@ -129,8 +129,9 @@ impl Convert {
             {
                 return Err("目的端路径前缀无效");
             }
-            d.path_prefix
-                .truncate(d.path_prefix.trim_end_matches('/').len());
+            // URL.path() 使用百分号编码。配置也按 URL 的路径表示归一化，再比较完整段。
+            url.set_path(&d.path_prefix);
+            d.path_prefix = url.path().trim_end_matches('/').to_owned();
             if !seen.insert((d.origin.clone(), d.path_prefix.clone())) {
                 return Err("目的端协议映射重复");
             }

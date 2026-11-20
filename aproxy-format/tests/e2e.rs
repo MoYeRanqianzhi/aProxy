@@ -180,7 +180,7 @@ fn explicit_and_detected_same_protocol_leave_http_untouched() {
 fn automatic_upstream_uses_route_origin_and_longest_prefix() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("convert.toml");
-    std::fs::write(&f,"from='openai_chat'\nto='auto'\n[[upstream]]\norigin='https://mixed.test'\nprotocol='openai_chat'\n[[upstream]]\norigin='https://mixed.test:443'\npath_prefix='/tenant'\nprotocol='anthropic_messages'\n[[upstream]]\norigin='https://other-provider.test'\nprotocol='anthropic_messages'").unwrap();
+    std::fs::write(&f,"from='openai_chat'\nto='auto'\n[[upstream]]\norigin='https://mixed.test'\nprotocol='openai_chat'\n[[upstream]]\norigin='https://mixed.test:443'\npath_prefix='/tenant'\nprotocol='anthropic_messages'\n[[upstream]]\norigin='https://mixed.test'\npath_prefix='/租户/'\nprotocol='anthropic_messages'\n[[upstream]]\norigin='https://other-provider.test'\nprotocol='anthropic_messages'").unwrap();
     let args = ["convert", "--config", f.to_str().unwrap()];
     let mut w = Worker::new(&args);
     for (url, proto) in [
@@ -189,6 +189,10 @@ fn automatic_upstream_uses_route_origin_and_longest_prefix() {
             "anthropic_messages",
         ),
         ("https://mixed.test/tenant/custom", "anthropic_messages"),
+        (
+            "https://mixed.test/%E7%A7%9F%E6%88%B7/v1/responses",
+            "anthropic_messages",
+        ),
         (
             "https://mixed.test/tenant/v1/responses",
             "anthropic_messages",

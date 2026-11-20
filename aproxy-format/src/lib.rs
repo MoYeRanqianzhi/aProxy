@@ -243,6 +243,19 @@ fn emit(out: &mut impl Write, value: &impl serde::Serialize) -> Result<(), &'sta
         .and_then(|_| out.flush())
         .map_err(|_| "无法写入标准输出")
 }
+/// 纯元数据帧包括 decide 预览；协商整包或订阅回程的角色须容纳经 JSON 或 base64 转义的实体。
+fn input_limit(hello: &w::HelloReply) -> u64 {
+    if hello.request_body.values().any(|n| *n == w::BodyNeed::Full)
+        || hello
+            .stages
+            .iter()
+            .any(|s| matches!(s.as_str(), "response" | "stream"))
+    {
+        257 * 1024 * 1024
+    } else {
+        8 * 1024 * 1024
+    }
+}
 /// 首帧是固定 hello，后续序号只在本进程内有意义。EOF 在握手后是正常退役。
 fn worker(
     name: &str,
@@ -281,17 +294,7 @@ fn worker(
                 return Err("不支持此协议版本");
             }
             let hello = role.hello(name, &offer);
-            // 正文可能经 base64 或 JSON 转义；纯元数据角色的最大项是 decide 的 1 MiB 解码预览。
-            limit = if hello.request_body.values().any(|n| *n == w::BodyNeed::Full)
-                || hello
-                    .stages
-                    .iter()
-                    .any(|s| matches!(s.as_str(), "response" | "stream"))
-            {
-                257 * 1024 * 1024
-            } else {
-                8 * 1024 * 1024
-            };
+            limit = input_limit(&hello);
             emit(&mut out, &hello)?;
         } else {
             if matches!(m.stage, w::Stage::Hello(_)) {
@@ -389,6 +392,32 @@ mod frame_tests {
             .is_err()
         );
         assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1);
+        // 换行本身占最后一个允许字节；下一行不应被预读或算进当前预算。
+        let mut boundary = hello.to_vec();
+        boundary.resize(64 * 1024 - 1, b' ');
+        boundary.push(b'\n');
+        let header = boundary.len();
+        boundary.extend_from_slice(&data[input.len()..]);
+        boundary.resize(header + (8 << 20) - 1, b' ');
+        boundary.push(b'\n');
+        let adaptive = || Role::Adaptive(adaptive::Adaptive::load(None).unwrap());
+        assert!(worker("adaptive", adaptive(), &boundary[..], Vec::new()).is_ok());
+        boundary.insert(boundary.len() - 1, b' ');
+        assert_eq!(
+            worker("adaptive", adaptive(), &boundary[..], Vec::new()),
+            Err("协议帧超过长度上限")
+        );
+        let mut convert =
+            Role::Convert(convert::Convert::new("openai_chat", "openai_chat").unwrap());
+        let msg: w::Message = serde_json::from_slice(hello).unwrap();
+        let w::Stage::Hello(offer) = msg.stage else {
+            unreachable!()
+        };
+        assert_eq!(input_limit(&convert.hello("convert", &offer)), 257 << 20);
+        assert_eq!(input_limit(&adaptive().hello("adaptive", &offer)), 8 << 20);
+        let mut full = Vec::new();
+        assert!(worker("convert", convert, &boundary[..], &mut full).is_ok());
+        assert_eq!(full.iter().filter(|&&b| b == b'\n').count(), 2);
         for (prefix, cap) in [(&[][..], 64 * 1024), (&input[..], 8 * 1024 * 1024)] {
             let mut over = prefix.to_vec();
             over.resize(prefix.len() + cap + 4096, b' ');

@@ -346,17 +346,25 @@ fn init(scenario: &str, dir: &Path) -> Result<(), String> {
         return Err("未知场景，可用 claude-relay、key-rotation、openrouter、adaptive-relay".into());
     }
     fs::create_dir_all(dir).map_err(|_| "无法创建输出目录")?;
-    let base = dir.canonicalize().map_err(|_| "输出目录无效")?;
-    // 短盘符路径仅在普通拼写仍然指向同一目录时去掉 verbatim 前缀；长路径和特殊名称保留原样。
+    // 配置供操作者继续编辑：固定相对路径的基准，但保留短文件名与目录链接的拼写。
+    let base = std::path::absolute(dir).map_err(|_| "输出目录无效")?;
+    // 只有显式的 verbatim 路径才需要核对两种拼写的目标。生成物用普通拼写，不用规范化的目标名。
     #[cfg(windows)]
     let base = base
         .to_str()
         .and_then(|p| p.strip_prefix(r"\\?\"))
-        .filter(|p| {
-            Path::new(p).is_absolute() && p.encode_utf16().count() + "\\adaptive.toml".len() < 260
+        .map(|p| match p.strip_prefix(r"UNC\") {
+            Some(share) => PathBuf::from(format!(r"\\{share}")),
+            None => PathBuf::from(p),
         })
-        .map(PathBuf::from)
-        .filter(|p| p.canonicalize().is_ok_and(|actual| actual == base))
+        .filter(|p| {
+            use std::os::windows::ffi::OsStrExt;
+            p.is_absolute() && p.join("adaptive.toml").as_os_str().encode_wide().count() < 260
+        })
+        .filter(|p| {
+            p.canonicalize()
+                .is_ok_and(|plain| base.canonicalize().is_ok_and(|original| plain == original))
+        })
         .unwrap_or(base);
     let mut files = Vec::new();
     let mut proxy = if scenario == "openrouter" {

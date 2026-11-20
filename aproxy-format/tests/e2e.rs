@@ -2458,7 +2458,23 @@ fn check_requires_request_state_for_auto_return_conversion() {
 #[test]
 fn init_explains_files_and_generates_editable_toml() {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("with spaces");
+    // 同一目录有两种拼写：即使临时盘没启用 8.3 名称，也能检出擅自展开路径的回归。
+    let target = dir.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    let alias = dir.path().join("alias");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &alias).unwrap();
+    #[cfg(windows)]
+    {
+        // NTFS 目录联接不需要创建符号链接的特权；传给命令解释器的参数都是常量。
+        let link = Command::new("cmd.exe")
+            .current_dir(dir.path())
+            .args(["/d", "/c", "mklink", "/j", "alias", "target"])
+            .output()
+            .unwrap();
+        assert!(link.status.success(), "{link:?}");
+    }
+    let root = alias.join("with spaces");
     let out = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
         .args(["init", "adaptive-relay", "--output"])
         .arg(&root)
@@ -2488,16 +2504,25 @@ fn init_explains_files_and_generates_editable_toml() {
         prev = line;
     }
     assert!(!proxy.contains(r"\\?\"));
-    if cfg!(windows) {
-        assert!(proxy.contains(&format!("'{}'", root.join("keys.toml").display())));
-    }
     let parsed: toml::Value = toml::from_str(&proxy).unwrap();
-    assert_eq!(parsed["format"].as_array().unwrap().len(), 3);
-    assert!(
-        std::fs::read_to_string(root.join("keys.toml"))
-            .unwrap()
-            .contains("# ")
-    );
+    let chain = parsed["format"].as_array().unwrap();
+    assert_eq!(chain.len(), 3);
+    for role in ["adaptive", "keys"] {
+        let args = &chain
+            .iter()
+            .find(|entry| entry["name"].as_str() == Some(role))
+            .unwrap()["args"];
+        let path = args[2].as_str().unwrap();
+        let file = format!("{role}.toml");
+        assert_eq!(path, root.join(&file).to_str().unwrap());
+        assert!(proxy.contains(&format!("args = ['{role}', '--config', '{path}']")));
+        let generated = target.join("with spaces").join(file);
+        assert_eq!(
+            std::fs::canonicalize(path).unwrap(),
+            generated.canonicalize().unwrap()
+        );
+        assert!(std::fs::read_to_string(generated).unwrap().contains("# "));
+    }
 }
 
 /// 两种帮助拼写都必须先于角色配置与标准输入，退出码、输出通道和选项说明都属于 CLI 契约。

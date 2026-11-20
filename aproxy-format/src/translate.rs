@@ -14,7 +14,12 @@ pub fn translate_request(from: WireFormat, to: WireFormat, body: &Value) -> Resu
         return Ok(body.clone());
     }
     let req = switchyard_translation::decode_request(from, body).map_err(|e| e.to_string())?;
-    switchyard_translation::encode_request(&req, to).map_err(|e| e.to_string())
+    let mut out = switchyard_translation::encode_request(&req, to).map_err(|e| e.to_string())?;
+    // Chat 上游只在明确请求时给流的最终用量，其他协议的客户端不需要也无法替它设置这个开关。
+    if to == WireFormat::OpenAiChat && body["stream"] == true {
+        out["stream_options"]["include_usage"] = true.into();
+    }
+    Ok(out)
 }
 
 /// 非流式响应转换：`from` 格式的缓冲响应 → `to` 格式。格式相同则原样返回。

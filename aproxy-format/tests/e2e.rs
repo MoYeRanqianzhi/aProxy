@@ -1234,3 +1234,23 @@ fn streamed_thinking_tool_continuation_preserves_tools_but_not_the_signature() {
     );
     assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], id);
 }
+
+/// Chat 的计量开关只属于流式请求；Messages 和 Responses 不应要求操作者手工补上游字段。
+#[test]
+fn translating_a_stream_to_chat_requests_native_usage() {
+    let corpus: Value = serde_json::from_str(include_str!("fixtures/protocols.json")).unwrap();
+    for client in ["anthropic_messages", "openai_responses"] {
+        let mut w = Worker::new(&["convert", "--from", client, "--to", "openai_chat"]);
+        for stream in [true, false] {
+            let mut body = corpus[client]["request"].clone();
+            body["stream"] = stream.into();
+            let r = w.frame(request("https://relay.test/custom", "/custom", body));
+            let patch: Value =
+                serde_json::from_str(r["request"]["body"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                patch["stream_options"]["include_usage"].as_bool(),
+                stream.then_some(true)
+            );
+        }
+    }
+}

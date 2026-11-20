@@ -1104,3 +1104,24 @@
     产品代码没动。本地改之前两种变体各 20 次都没有复现。macOS 上的存活判断改为信号 0，没有在 macOS 上运行过。
   - **验证**（Codex 在 Windows 上跑的，4cc4994）：`cargo fmt --all` 无改动；headless 全量 925 通过、0 失败、7 忽略；
     headless、desktop 与 Linux 交叉三种 clippy 零输出。
+- B10c（2026-11-20，Codex 实现；提交「format 的 stream 阶段」「forward 与 [[format]] 可以同配」及其前后的修复）：stream 阶段，
+  以及 forward 请求过链。
+  - **stream**：一条流从 open 到 close 或 abort 固定由一个 persistent worker 处理。forward 请求的响应边收边交给 stream 程序；
+    response 程序只在它自己那一层攒齐。没有 request 阶段的程序要跑时，forward 的请求体直接流向上游。retry 请求先对上游的
+    原始响应做判定，再开回放的流。required 程序在流中途失败，向外侧各层发 abort；可选程序失败，保留它当前的输入，之后的块
+    跳过这一层。块尾不完整的 UTF-8 留到下一块；解码与交接有界、有背压。
+  - **占用与断开**：流占的是一次对话，不占池子的名额（否则 `pool_max = 1` 加一条长流就挡住所有请求）：流拿走空闲 worker 时
+    把名额还回去，但子进程的句柄与 worker 编号留到操作系统确认它退出。客户端断开时，abort 发给同一个 worker，不另起；
+    有一帧正在途中就先在限时内等它的回信，不把 abort 写进那一帧中间；收不完的 worker 丢弃。abort 的 `reason.code`
+    在客户端断开时是 `client_gone`。
+  - **停机**：一开始停机就退役空闲的 worker；排空期限一到，杀掉还占着消息的，最多等 1 秒确认，确认不了的逐个告警（format
+    名与 pid）。format 的 worker 不进进程台账（C3 不为它扩充），实例退出之后没有东西再去找它，这是有意留下的缺口。
+  - **第二段审查引出的修复**：成功响应的保活头等 decide 表态之后再交付；decide 的终态先解码再写进 SSE，单个 JSON 事件限
+    1 MiB；解不了的上游体原样（base64）交给 decide；`elapsed_ms` 从收到请求算起；断开时保留这次尝试已知的事实与实际等待的
+    时长；记录里区分明确的 `reroute` 表态；上游失败的诊断与请求记录的路径里遮住已知密钥；订阅者跟不上时报出全部漏掉的
+    条数、再给一份当前状态，不补发；可选程序恢复之后按实际握手决定要不要解码请求体。
+  - **还没做的**：forward 请求仍不升级、不对投递方式表态、不发 notify（归 B10d）。
+  - **CI**：第二段合入后 windows (desktop) 红在 `observing_start_preserves_a_static_handshake_failure`（靠固定 sleep 当同步），
+    已改成等第二个 start 进入就绪等待；同类的几个测试一并改了（并发启动、流式上传、Unix 管道残帧）。
+  - **验证**（Codex 在 Windows 上跑的，17cfe73）：`cargo fmt --all` 无改动；headless 全量 964 通过、0 失败、7 忽略；
+    headless、desktop 与 Linux 交叉三种 clippy 零输出。临时 home 里用 CLI 实测：带一个不回信的 worker 时 `stop` 在等待期限内完成。

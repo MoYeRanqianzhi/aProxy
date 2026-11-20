@@ -25,7 +25,13 @@ worker 让给响应的交付，这次取消不计入熔断；已经写给 worker
 一个推断另一个。熔断的计数说的是阶段消息的回信，不是握手成功。放行用单调时钟算经过的时间；墙上时间与让排队的票作废的
 那次故障留着只为报告，恢复之后也留。
 
-**Evidence:** `src/proxy/decide.rs`；`tests/format_protocol.rs` 的 `large_upstream_body_reaches_decide_truncated`、
+流租用的是一次对话，不是池子里的一个普通名额：否则 `pool_max = 1` 加一条长流，别的请求连 open 都发不出去。流拿走空闲 worker
+时把名额还回去，但子进程的句柄与 worker 编号要留到操作系统确认它退出。有一帧在途中时客户端断开，不等于可以把 abort 写进
+那一帧中间：先在限时内收完它的回信，再把 abort 发给同一个进程。进程台账不是外部 worker 的兜底：停机时确认不了退出的，
+要趁实例还知道子进程 pid 的时候记进日志。
+
+**Evidence:** `tests/format_protocol.rs` 的 `client_disconnect_aborts_open_streams_on_their_own_workers`、
+`stream_workers_do_not_count_toward_pool_max` 与停机限时的各个测试（另见 `src/transform/tests.rs`）；`src/proxy/decide.rs`；`tests/format_protocol.rs` 的 `large_upstream_body_reaches_decide_truncated`、
 `decide_success_can_fail_a_200`；`src/transform/tests.rs` 的 `breaker_generation_retains_the_fault_after_recovery`；
 `src/transform/pool.rs`、`src/proxy/keepalive.rs`，以及 `tests/format_protocol.rs` 里用真实 worker 的测试
 `disconnected_format_request_releases_the_only_worker_without_heartbeat`、

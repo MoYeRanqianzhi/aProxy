@@ -108,8 +108,11 @@ impl Role {
         }
     }
     /// 订阅声明是上限；实例最终只向配置选中的阶段写帧。摘要协商不能退化为默认的 full。
-    fn hello(&self, name: &str, offer: &w::Hello) -> w::HelloReply {
+    fn hello(&mut self, name: &str, offer: &w::Hello) -> w::HelloReply {
         use w::BodyNeed::{Digest, Full, None};
+        if let Self::Route(route) = self {
+            route.negotiate(&offer.overrides);
+        }
         let needs: &[(&str, w::BodyNeed)] = match self {
             Self::Convert(_) | Self::Route(_) => &[("request", Full), ("retry", Full)],
             Self::Rewrite(r) if r.needs_body() => &[("request", Full), ("retry", Full)],

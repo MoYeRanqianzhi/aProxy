@@ -25,6 +25,42 @@ fn read_regex<'de, D: serde::Deserializer<'de>>(d: D) -> Result<regex::Regex, D:
 fn unit_weight() -> u64 {
     1
 }
+/// TOML 使用带点的公开叶键，协议回信则按组组织；两种表示只在这里转换。
+type Leaves = BTreeMap<String, serde_json::Value>;
+/// 原始模型的规则优先于渠道默认值，避免模型别名合并后失去独立设置。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelRule {
+    /// 别名映射以前的客户端模型名。
+    model: String,
+    /// 在本请求有效的稀疏覆盖表。
+    overrides: Leaves,
+}
+/// 配置边界只接受协议公开的叶键，错误不含原始值（心跳文本可能有私有内容）。
+fn valid_leaves(map: &Leaves) -> bool {
+    map.iter().all(|(key, v)| match key.as_str() {
+        "timeouts.connect_secs"
+        | "timeouts.first_byte_secs"
+        | "timeouts.read_idle_secs"
+        | "retry.max_backoff_secs" => v.as_u64().is_some(),
+        "retry.max_attempts" => v.as_u64().is_some_and(|n| u32::try_from(n).is_ok()),
+        "keepalive.interval_secs" => v.as_u64().is_some_and(|n| {
+            std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(n))
+                .is_some()
+        }),
+        "keepalive.trigger" => matches!(
+            v.as_str(),
+            Some("always" | "accept" | "body_stream" | "any")
+        ),
+        "keepalive.heartbeat" => v.as_str().is_some_and(|h| {
+            let s = h.replace("\r\n", "\n").replace('\r', "\n");
+            s.ends_with('\n')
+                && (s.ends_with("\n\n") || s.lines().all(|l| l.is_empty() || l.starts_with(':')))
+        }),
+        _ => false,
+    })
+}
 /// 路由项只存环境变量名，绝不把密钥放进可见的渠道标识。
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,6 +73,9 @@ pub struct Channel {
     /// 相同优先级下，此渠道作为首次选择的份额。
     #[serde(default = "unit_weight")]
     weight: u64,
+    /// 选中该渠道时生效，仅回送本次 hello 接受的键。
+    #[serde(default)]
+    overrides: Leaves,
     /// 完整的上游 URL，必要时在它的路径之后拼接客户端路径。
     url: String,
     /// 空集合为兜底。
@@ -63,6 +102,12 @@ pub struct Route {
     /// 开启后与 keys 独立计算相同的用户前缀票号，不传递摘要或会话正文。
     #[serde(default)]
     sticky: bool,
+    /// 同一个原始模型只允许一条精确规则。
+    #[serde(default)]
+    rule: Vec<ModelRule>,
+    /// 仅来自当前进程的 hello，绝不从角色配置伪造能力。
+    #[serde(skip)]
+    offered: std::collections::BTreeSet<String>,
     /// 加载后按优先级稳定排序，组内保留配置顺序作为故障转移次序。
     channel: Vec<Channel>,
 }
@@ -132,6 +177,15 @@ impl Route {
             .max()
             .unwrap_or(0)
             .max(4);
+        let mut models = std::collections::HashSet::new();
+        if cfg
+            .rule
+            .iter()
+            .any(|r| r.model.is_empty() || !models.insert(&r.model) || !valid_leaves(&r.overrides))
+            || cfg.channel.iter().any(|c| !valid_leaves(&c.overrides))
+        {
+            return Err("模型规则重复、为空或覆盖项无效");
+        }
         let mut total = 0u64;
         for c in &cfg.channel {
             total = total
@@ -151,6 +205,28 @@ impl Route {
         }
         cfg.channel.sort_by_key(|c| c.priority);
         Ok(cfg)
+    }
+    /// hello 所给的清单是能力边界；即使配置知道更多叶键也不能写入回信。
+    pub fn negotiate(&mut self, names: &[String]) {
+        self.offered = names.iter().cloned().collect();
+    }
+    /// 按渠道、再按模型逐个覆写叶键；没有双方同意的项就整个省略。
+    fn overrides(&self, channel: &Channel, original: &str) -> Option<w::Overrides> {
+        let entries = channel.overrides.iter().chain(
+            self.rule
+                .iter()
+                .find(|r| r.model == original)
+                .into_iter()
+                .flat_map(|r| &r.overrides),
+        );
+        let mut wire = w::Overrides::new();
+        for (name, v) in entries {
+            if self.offered.contains(name) {
+                let (group, leaf) = name.split_once('.').expect("加载时校验叶键");
+                wire.entry(group).or_insert_with(|| serde_json::json!({}))[leaf] = v.clone();
+            }
+        }
+        (!wire.is_empty()).then_some(wire)
     }
     /// 每组先按权重确定起点，再遍历其余匹配项。重试沿同一票号继续，避免两个坏高优先级渠道相互切换。
     fn choose(&self, model: &str, ticket: u64, previous: Option<&str>) -> Option<&Channel> {
@@ -282,6 +358,7 @@ impl Route {
             serde_json::json!([channel.id, (original != model).then_some(original), ticket])
                 .to_string(),
         );
+        r.overrides = self.overrides(channel, original);
         r.report = config::report(
             "Selected an upstream channel",
             w::StandardAction::Route {
@@ -324,5 +401,38 @@ mod tests {
             assert_eq!(route.choose(model, ticket, prev).unwrap().id, id);
         }
         assert!(route.choose("unknown", 0, None).is_none());
+    }
+    /// 只回双方同意的叶键；模型覆盖渠道同名项，别名对应的上游模型不误中原始模型规则。
+    #[test]
+    fn overrides_are_sparse_negotiated_and_model_specific() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("route.toml");
+        let cfg = "[[channel]]\nid='a'\nurl='https://a.test'\n[channel.overrides]\n'retry.max_attempts'=4\n'keepalive.interval_secs'=2\n'keepalive.trigger'='always'\n[[rule]]\nmodel='small'\n[rule.overrides]\n'retry.max_attempts'=1\n 'timeouts.first_byte_secs'=12\n";
+        std::fs::write(&file, cfg).unwrap();
+        let mut route = Route::load(file.to_str().unwrap()).unwrap();
+        assert!(route.overrides(&route.channel[0], "small").is_none());
+        route.negotiate(&[
+            "retry.max_attempts".into(),
+            "keepalive.trigger".into(),
+            "timeouts.first_byte_secs".into(),
+        ]);
+        assert_eq!(
+            serde_json::Value::Object(route.overrides(&route.channel[0], "small").unwrap()),
+            serde_json::json!({"retry":{"max_attempts":1},"keepalive":{"trigger":"always"},"timeouts":{"first_byte_secs":12}})
+        );
+        assert_eq!(
+            serde_json::Value::Object(route.overrides(&route.channel[0], "mapped").unwrap()),
+            serde_json::json!({"retry":{"max_attempts":4},"keepalive":{"trigger":"always"}})
+        );
+        for bad in [
+            "'retry.max_attempts'=4294967296",
+            "'keepalive.trigger'='unexpected'",
+            "'keepalive.heartbeat'='data: partial'",
+            "'timeouts.connect_secs'=-1",
+            "'retry.unknown'=0",
+        ] {
+            std::fs::write(&file, cfg.replace("'retry.max_attempts'=4", bad)).unwrap();
+            assert!(Route::load(file.to_str().unwrap()).is_err(), "{bad}");
+        }
     }
 }

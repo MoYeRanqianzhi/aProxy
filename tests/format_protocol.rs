@@ -6009,6 +6009,39 @@ async fn adaptive_unavailable_falls_back_to_retry() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
 }
 
+/// 同一渠道默认允许重试，只有原始模型 limited 的 cap=1；实际 HTTP 结果与上游调用数均受覆盖约束。
+#[tokio::test]
+async fn official_route_model_override_caps_only_the_matching_request() {
+    let home = TestHome::new();
+    let (up, count) = upstream(&[503, 503, 200]).await;
+    let file = home.path().join("route.toml");
+    std::fs::write(&file,format!("[aliases]\nlimited='actual'\n[[channel]]\nid='one'\nurl='http://127.0.0.1:{up}/'\n[channel.overrides]\n'retry.max_attempts'=5\n[[rule]]\nmodel='limited'\n[rule.overrides]\n'retry.max_attempts'=1")).unwrap();
+    let cfg = official_layer(
+        "route",
+        "'request','retry'",
+        &["route", "--config", file.to_str().unwrap()],
+    );
+    let (c, url) = running(&home, up, &cfg);
+    let limited = c
+        .post(&url)
+        .json(&serde_json::json!({"model":"limited"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), 503);
+    assert_eq!(limited.headers()["x-aproxy-error"], "retry_exhausted");
+    assert_eq!(
+        c.post(url)
+            .json(&serde_json::json!({"model":"actual"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 3);
+}
+
 /// 两次已经交付的 forward 失败由真实完成通知记账。第三次同体进入 retry，而另一个摘要仍可直通。
 #[tokio::test]
 async fn official_adaptive_pins_twice_failed_digest_but_forwards_a_fresh_one() {

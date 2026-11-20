@@ -283,7 +283,7 @@ impl Route {
         }
         (!wire.is_empty()).then_some(wire)
     }
-    /// 每组先按权重确定起点，再遍历其余匹配项。重试沿同一票号继续，避免两个坏高优先级渠道相互切换。
+    /// 只对初始优先级组按权重确定首选，然后按配置顺序遍历其余匹配项。重试沿同一票号继续，避免两个坏高优先级渠道相互切换。
     fn choose(&self, model: &str, ticket: u64, previous: Option<&str>) -> Option<&Channel> {
         let mut eligible: Vec<_> = self
             .channel
@@ -300,14 +300,17 @@ impl Route {
         if eligible.is_empty() {
             return None;
         }
-        for group in eligible.chunk_by_mut(|a, b| a.priority == b.priority) {
+        if let Some(group) = eligible
+            .chunk_by_mut(|a, b| a.priority == b.priority)
+            .next()
+        {
             let selected =
                 crate::selection::preferred(b"route", ticket, group.iter().copied(), |c| {
                     (&c.id, c.weight)
                 })
                 .expect("组非空");
             let first = group.iter().position(|c| c.id == selected.id).unwrap();
-            group.rotate_left(first);
+            group[..=first].rotate_right(1);
         }
         let i = previous
             .and_then(|id| eligible.iter().position(|c| c.id == id))
@@ -447,6 +450,39 @@ mod tests {
             assert_eq!(route.choose(model, ticket, prev).unwrap().id, id);
         }
         assert!(route.choose("unknown", 0, None).is_none());
+    }
+    /// 首选位于中间时，其余候选按配置顺序，而不是从首选之后循环排列。
+    #[test]
+    fn failover_follows_configuration_after_middle_winner() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("channels");
+        std::fs::write(
+            &f,
+            ["a", "b", "c", "d", "e"]
+                .iter()
+                .map(|id| {
+                    format!(
+                        "[[channel]]\nid='{id}'\nurl='https://{id}.test'\npriority={}\n",
+                        if *id >= "d" { 2 } else { 1 }
+                    )
+                })
+                .collect::<String>(),
+        )
+        .unwrap();
+        let route = Route::load(f.to_str().unwrap()).unwrap();
+        let t = (0..100)
+            .find(|&t| route.choose("m", t, None).unwrap().id == "b")
+            .unwrap();
+        for (prev, next) in [
+            (None, "b"),
+            (Some("b"), "a"),
+            (Some("a"), "c"),
+            (Some("c"), "d"),
+            (Some("d"), "e"),
+            (Some("e"), "b"),
+        ] {
+            assert_eq!(route.choose("m", t, prev).unwrap().id, next);
+        }
     }
     /// 拒绝会被 URL 归一化的完整段，不影响普通文件名和查询中的点号。
     #[test]

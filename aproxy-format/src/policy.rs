@@ -243,6 +243,7 @@ mod tests {
         for (header, expected) in [
             ("0", Some(2500)),
             ("99999999", Some(w::MAX_DELAY_MS)),
+            ("99999999999999999999999999999999999", Some(w::MAX_DELAY_MS)),
             ("invalid", None),
         ] {
             m.response

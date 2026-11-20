@@ -3638,7 +3638,7 @@ async fn decide_stop_masks_configured_secret_in_upstream_failure() {
     assert!(!log.contains(secret));
 }
 
-/// 在途消息无回信时，从真正的停止命令观察截止时间；正常空闲的另一进程应该在排空开始时看到 EOF。
+/// 在途消息无回信时，从停止 IPC 与排空事件观察服务端截止时间；正常空闲的另一进程应该在排空开始时看到 EOF。
 #[tokio::test]
 async fn stop_deadline_reaps_a_worker_with_an_unanswered_message() {
     use std::time::Duration;
@@ -3683,13 +3683,18 @@ async fn stop_deadline_reaps_a_worker_with_an_unanswered_message() {
     .unwrap();
     let idle = event("idle", "hello").unwrap();
     assert_eq!(aproxy::process::process_exited(pid), Some(false));
-    let mut stop = home.cmd();
-    stop.args(["stop", &port.to_string(), "--json"]);
     let (_, mut events) =
         aproxy::daemon::ipc_subscribe_in(&home.path().join("run"), &port.to_string())
             .await
             .unwrap();
-    let stopping = tokio::task::spawn_blocking(move || stop.output().unwrap());
+    // 直接发送同一停止操作，不让 CLI 等待退出的真实时限与冻结的服务端时钟比赛。
+    aproxy::daemon::ipc_request_in(
+        &home.path().join("run"),
+        &port.to_string(),
+        aproxy::daemon::IpcOp::STOP,
+    )
+    .await
+    .unwrap();
     tokio::time::timeout(Duration::from_secs(30), async {
         while events.next().await.unwrap().unwrap()["event"] != "closing" {}
         // 以实例发出的排空事件为界，不把命令本身排队启动的时间当作清理延迟。
@@ -3704,8 +3709,6 @@ async fn stop_deadline_reaps_a_worker_with_an_unanswered_message() {
     clock.advance(9);
     assert_eq!(aproxy::process::process_exited(pid), Some(false));
     clock.step(1, true);
-    let out = stopping.await.unwrap();
-    assert!(out.status.success(), "{out:?}");
     let exited = aproxy::process::process_exited(pid);
     assert_eq!(exited, Some(true));
     let _ = request.await;

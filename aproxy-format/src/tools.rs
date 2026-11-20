@@ -7,6 +7,141 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// 诊断不回显可能含凭据的路径；三类离线输入使用同一限额和边界。
+const OFFLINE_TYPE: &str = "离线输入必须是可读的本地普通文件";
+/// 超限的文本不能进入 TOML 或 JSON 解析器。
+const OFFLINE_SIZE: &str = "离线输入超过 8 MiB";
+/// 先取得文件句柄，再按同一句柄的类型和长度读取；多读一个字节可以发现并发增长。
+pub(super) fn offline_read(path: &Path) -> Result<Vec<u8>, &'static str> {
+    use std::io::Read;
+    const LIMIT: u64 = 8 * 1024 * 1024;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(path)
+    };
+    #[cfg(windows)]
+    let file = local_disk_file(path);
+    let file = file.map_err(|_| OFFLINE_TYPE)?;
+    let meta = file.metadata().map_err(|_| OFFLINE_TYPE)?;
+    if !meta.is_file() {
+        return Err(OFFLINE_TYPE);
+    }
+    if meta.len() > LIMIT {
+        return Err(OFFLINE_SIZE);
+    }
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| OFFLINE_TYPE)?;
+    if bytes.len() as u64 > LIMIT {
+        return Err(OFFLINE_SIZE);
+    }
+    Ok(bytes)
+}
+/// 只从本机盘符打开目录与文件。逐级持有不可改写或换名的目录句柄，不跟随能跳到网络的联接点；
+/// 普通和 verbatim 盘符同等对待，不能把 UNC、管道或 DOS 设备名交给文件打开操作。
+#[cfg(windows)]
+fn local_disk_file(path: &Path) -> std::io::Result<fs::File> {
+    use std::{
+        io,
+        os::windows::{
+            fs::{MetadataExt, OpenOptionsExt},
+            io::AsRawHandle,
+        },
+        path::{Component, Prefix},
+    };
+    use windows_sys::Win32::{
+        Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_TYPE_DISK, GetDriveTypeW, GetFileType,
+        },
+        System::WindowsProgramming::{DRIVE_CDROM, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOVABLE},
+    };
+    let invalid = || io::Error::from(io::ErrorKind::InvalidInput);
+    let absolute = std::path::absolute(path)?;
+    let mut parts = absolute.components();
+    let Some(Component::Prefix(prefix)) = parts.next() else {
+        return Err(invalid());
+    };
+    let (Prefix::Disk(letter) | Prefix::VerbatimDisk(letter)) = prefix.kind() else {
+        return Err(invalid());
+    };
+    if parts.next() != Some(Component::RootDir) {
+        return Err(invalid());
+    }
+    let drive = [u16::from(letter), b':' as u16, b'\\' as u16, 0];
+    // SAFETY: 盘符根路径是以 NUL 结尾的 UTF-16 数组，调用不保留它。
+    if !matches!(
+        unsafe { GetDriveTypeW(drive.as_ptr()) },
+        DRIVE_FIXED | DRIVE_REMOVABLE | DRIVE_CDROM | DRIVE_RAMDISK
+    ) {
+        return Err(invalid());
+    }
+    let mut parent = PathBuf::from(prefix.as_os_str());
+    parent.push(r"\");
+    let mut guards = Vec::new();
+    let mut parts = parts.peekable();
+    while let Some(Component::Normal(name)) = parts.next() {
+        // DOS 保留名称也可以带扩展名；冒号会让普通文件名指向另一个数据流。
+        let name_text = name.to_string_lossy();
+        let stem = name_text
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(' ')
+            .to_ascii_uppercase();
+        if name_text.contains(':')
+            || matches!(
+                stem.as_str(),
+                "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+            )
+            || stem
+                .strip_prefix("COM")
+                .or_else(|| stem.strip_prefix("LPT"))
+                .is_some_and(|s| {
+                    matches!(
+                        s,
+                        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                    )
+                })
+        {
+            return Err(invalid());
+        }
+        parent.push(name);
+        let mut open = fs::OpenOptions::new();
+        open.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
+        if parts.peek().is_none() {
+            open.read(true);
+        } else {
+            open.access_mode(FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ);
+        }
+        let handle = open.open(&parent)?;
+        let meta = handle.metadata()?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(invalid());
+        }
+        if parts.peek().is_none() {
+            // SAFETY: 类型查询仅借用仍由 File 持有的句柄。
+            if unsafe { GetFileType(handle.as_raw_handle() as isize) } != FILE_TYPE_DISK
+                || !meta.is_file()
+            {
+                return Err(invalid());
+            }
+            return Ok(handle);
+        }
+        if !meta.is_dir() {
+            return Err(invalid());
+        }
+        guards.push(handle);
+    }
+    Err(invalid())
+}
+
 /// 校验过的条目只持有本角色的状态。未识别的外部命令永远不因静态检查而执行。
 pub(super) struct Layer {
     /// 与代理共享的严格配置，包括环境、进程方式和阶段。
@@ -58,15 +193,20 @@ pub(super) fn load(
     dir: &Path,
     vars: config::Variables,
 ) -> Result<Role, String> {
-    let mut opt = Options::parse(args)?;
-    let resolved = opt
+    let opt = Options::parse(args)?;
+    let text = opt
         .config
-        .filter(|p| !p.starts_with("~/"))
-        .map(|p| dir.join(p));
-    if let Some(p) = &resolved {
-        opt.config = Some(p.to_str().ok_or("角色配置路径无效")?);
-    }
-    Role::configured(role, opt, vars)
+        .map(|p| -> Result<String, &'static str> {
+            let bytes = offline_read(&dir.join(config::role_path(p)?))?;
+            String::from_utf8(bytes).map_err(|_| "角色配置不是 UTF-8")
+        })
+        .transpose()?;
+    Role::configured(
+        role,
+        opt,
+        text.as_deref().map(config::Source::Offline),
+        vars,
+    )
 }
 /// 代理的基础地址允许自己的凭据，但不能带查询或片段；试跑用同一解析结果追加客户端路径。
 pub(super) fn base_url(text: &str) -> Result<url::Url, &'static str> {
@@ -82,7 +222,12 @@ pub(super) fn base_url(text: &str) -> Result<url::Url, &'static str> {
 }
 /// 配置字段诊断来自公开词表，其余加载错误可能含用户提供的环境名称，不展示在工具输出中。
 fn safe_issue(error: String) -> String {
-    if error.starts_with("角色配置字段无效：") {
+    if error.starts_with("角色配置字段无效：")
+        || matches!(
+            error.as_str(),
+            OFFLINE_TYPE | OFFLINE_SIZE | "角色配置不是 UTF-8"
+        )
+    {
         error
     } else {
         "角色配置无效".into()
@@ -90,7 +235,7 @@ fn safe_issue(error: String) -> String {
 }
 /// 使用与代理同源的严格 TOML 解析；只报告固定错误码、位置，不转发可能含环境值的解析器原话。
 pub(super) fn chain(path: &Path, structural: bool) -> Result<Chain, String> {
-    let text = fs::read_to_string(path).map_err(|_| "无法读取代理配置")?;
+    let text = String::from_utf8(offline_read(path)?).map_err(|_| "代理配置不是 UTF-8")?;
     let (mut cfg, diags) = f::parse(&text, path);
     if let Some(d) = diags.iter().find(|d| d.is_error()) {
         return Err(format!(
@@ -320,4 +465,39 @@ mod tests {
     fn check_rejects_rewrite_after_route_without_retry() {
         assert!(after_route("rewrite").contains("必须声明 retry"));
     }
+}
+
+/// 命名空间必须在打开前拒绝；verbatim 本地盘符仍能读取真实的配置。
+#[cfg(all(test, windows))]
+#[test]
+fn offline_accepts_verbatim_disk_but_not_device_or_share_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let local = dir.path().join("sample");
+    fs::write(&local, b"local").unwrap();
+    assert_eq!(
+        offline_read(&local.canonicalize().unwrap()).unwrap(),
+        b"local"
+    );
+    for name in [
+        r"\\localhost\unused-share\s",
+        r"\\?\UNC\localhost\unused-share\s",
+        r"\\.\pipe\unused",
+        r"\\?\GLOBALROOT\Device\Null",
+        "NUL.txt",
+    ] {
+        assert_eq!(offline_read(Path::new(name)), Err(OFFLINE_TYPE));
+    }
+    assert_eq!(offline_read(dir.path()), Err(OFFLINE_TYPE));
+}
+/// FIFO 的写端无需存在；打开后在同一句柄上拒绝它，而不是等待另一进程写入。
+#[cfg(all(test, unix))]
+#[test]
+fn offline_refuses_fifo_without_a_writer() {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fifo");
+    let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: 名称以 NUL 结尾且只在测试私有目录内创建节点。
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    assert_eq!(offline_read(&path), Err(OFFLINE_TYPE));
 }

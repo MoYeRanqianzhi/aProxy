@@ -135,7 +135,7 @@ impl Template {
 }
 impl Policy {
     /// 无配置的 policy 只弃权；配置错误在 hello 前报告。
-    pub fn load(path: Option<&str>) -> Result<Self, &'static str> {
+    pub fn load(path: Option<config::Source<'_>>) -> Result<Self, &'static str> {
         let p: Self = match path {
             Some(p) => config::load(p)?,
             None => Self::default(),

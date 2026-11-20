@@ -6,10 +6,7 @@ use aproxy_ipc::config_file::{self as f, Stage};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{
-    io::{Read, Write},
-    path::Path,
-};
+use std::{io::Write, path::Path};
 
 /// 样例保留原始路径以及每轮上游的实测或手写结果；没有上游样本时只走请求方向。
 #[derive(Deserialize)]
@@ -700,16 +697,7 @@ pub(super) fn run(path: &Path, sample: &Path, external: bool) -> Result<(), Stri
     if external {
         eprintln!("注意：外部程序会收到样例和环境变量；只运行你信任的程序。");
     }
-    let mut input = Vec::new();
-    const LIMIT: usize = 8 * 1024 * 1024;
-    std::fs::File::open(sample)
-        .map_err(|_| "无法读取试跑样例")?
-        .take((LIMIT + 1) as u64)
-        .read_to_end(&mut input)
-        .map_err(|_| "无法读取试跑样例")?;
-    if input.len() > LIMIT {
-        return Err("试跑样例超过 8 MiB".into());
-    }
+    let input = tools::offline_read(sample)?;
     let sample: Sample =
         serde_json::from_slice(&input).map_err(|_| "试跑样例不是有效的请求描述")?;
     rehearse(path, sample, external, &mut std::io::stdout().lock())

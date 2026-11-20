@@ -168,6 +168,7 @@ dependencies = [
  "aproxy-ipc",
  "http",
  "httpdate",
+ "libc",
  "rand",
  "regex",
  "serde",
@@ -178,6 +179,7 @@ dependencies = [
  "tempfile",
  "toml 1.1.8+spec-1.1.0",
  "url",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

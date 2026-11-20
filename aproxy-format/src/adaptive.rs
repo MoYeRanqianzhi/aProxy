@@ -80,7 +80,7 @@ fn digest(ctx: &w::Context) -> Option<[u8; 32]> {
 }
 impl Adaptive {
     /// 在公布健康之前校验所有阈值；空文件使用和无文件相同的默认值。
-    pub fn load(path: Option<&str>) -> Result<Self, &'static str> {
+    pub fn load(path: Option<config::Source<'_>>) -> Result<Self, &'static str> {
         let settings: Settings = match path {
             Some(p) => config::load(p)?,
             None => Default::default(),
@@ -228,7 +228,10 @@ mod tests {
             ("1.0", true),
         ] {
             std::fs::write(&path, format!("recovery_success_ratio={ratio}")).unwrap();
-            assert_eq!(Adaptive::load(path.to_str()).is_ok(), valid);
+            assert_eq!(
+                Adaptive::load(path.to_str().map(config::Source::Worker)).is_ok(),
+                valid
+            );
         }
     }
     /// 正常完成清零，升级与流中断各算一次；保留期后要求完整且健康的恢复窗口。

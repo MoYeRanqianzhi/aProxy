@@ -19,19 +19,37 @@ impl Fault {
     }
 }
 
-/// 工具与工作进程都按相同规则读取配置，不向标准错误复制可能含凭据的路径或原文。
-pub fn load<T: DeserializeOwned>(path: &str) -> Result<T, &'static str> {
-    let path = if let Some(rest) = path.strip_prefix("~/") {
+/// 工具提供已安全读取的文本，而工作进程仍按操作者原有的路径规则打开文件。
+#[derive(Clone, Copy)]
+pub enum Source<'a> {
+    /// 真正的工作进程自行读取配置，保留对其部署文件系统的支持。
+    Worker(&'a str),
+    /// 离线工具只解析已经过大小和文件类型检查的同一份内容，不再按名称重开。
+    Offline(&'a str),
+}
+/// 工具与工作进程使用同一套用户目录简写。
+pub fn role_path(path: &str) -> Result<PathBuf, &'static str> {
+    if let Some(rest) = path.strip_prefix("~/") {
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .ok_or("找不到用户目录")?;
-        PathBuf::from(home).join(rest)
+        Ok(PathBuf::from(home).join(rest))
     } else {
-        Path::new(path).into()
+        Ok(Path::new(path).into())
+    }
+}
+/// 工具与工作进程共用配置校验，不向标准错误复制可能含凭据的路径或原文。
+pub fn load<T: DeserializeOwned>(source: Source<'_>) -> Result<T, &'static str> {
+    let owned;
+    let text = match source {
+        Source::Worker(path) => {
+            owned = std::fs::read_to_string(role_path(path)?).map_err(|_| "无法读取角色配置")?;
+            &owned
+        }
+        Source::Offline(text) => text,
     };
-    let text = std::fs::read_to_string(path).map_err(|_| "无法读取角色配置")?;
     let generic = "角色配置无效，请检查字段名称与类型";
-    let de = toml::de::Deserializer::parse(&text).map_err(|_| generic)?;
+    let de = toml::de::Deserializer::parse(text).map_err(|_| generic)?;
     serde_path_to_error::deserialize(de).map_err(|err| {
         // 路径中可能有用户自定义的头名、模型名或 JSON 指针。只从公开配置词表选一个诊断，绝不回显原段。
         macro_rules! known { ($key:expr; $($name:literal),+) => { match $key {$($name=>Some(concat!("角色配置字段无效：",$name)),)+ _=>None} }; }

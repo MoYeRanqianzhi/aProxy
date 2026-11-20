@@ -71,12 +71,19 @@ impl<'a> Options<'a> {
 impl Role {
     /// 握手前完成静态配置检查，不会用半套配置处理请求。
     fn load(name: &str, args: &[String]) -> Result<Self, String> {
-        Self::configured(name, Options::parse(args)?, config::Variables::default())
+        let opt = Options::parse(args)?;
+        let file = opt.config.map(config::Source::Worker);
+        Self::configured(name, opt, file, config::Variables::default())
     }
     /// 工具与协议进程复用同一份加载与校验；只隔离角色文件的位置和环境作用域。
-    fn configured(name: &str, opt: Options<'_>, vars: config::Variables) -> Result<Self, String> {
+    fn configured(
+        name: &str,
+        opt: Options<'_>,
+        file: Option<config::Source<'_>>,
+        vars: config::Variables,
+    ) -> Result<Self, String> {
         if name == "convert" {
-            return Ok(Self::Convert(match (opt.config, opt.from, opt.to) {
+            return Ok(Self::Convert(match (file, opt.from, opt.to) {
                 (Some(p), None, None) => {
                     let mut c: convert::Convert = config::load(p)?;
                     c.validate()?;
@@ -90,19 +97,16 @@ impl Role {
             return Err("此角色不接受协议参数".into());
         }
         Ok(match name {
-            "heartbeat" => Self::Heartbeat(heartbeat::Heartbeat::load(opt.config)?),
-            "policy" => Self::Policy(policy::Policy::load(opt.config)?),
-            "rewrite" => Self::Rewrite(rewrite::Rewrite::load(opt.config)?),
-            "keys" => Self::Keys(keys::Keys::load(
-                opt.config.ok_or("keys 需要 --config")?,
-                &vars,
-            )?),
+            "heartbeat" => Self::Heartbeat(heartbeat::Heartbeat::load(file)?),
+            "policy" => Self::Policy(policy::Policy::load(file)?),
+            "rewrite" => Self::Rewrite(rewrite::Rewrite::load(file)?),
+            "keys" => Self::Keys(keys::Keys::load(file.ok_or("keys 需要 --config")?, &vars)?),
             "route" => {
-                let mut r = route::Route::load(opt.config.ok_or("route 需要 --config")?)?;
+                let mut r = route::Route::load(file.ok_or("route 需要 --config")?)?;
                 r.variables = vars;
                 Self::Route(r)
             }
-            "adaptive" => Self::Adaptive(adaptive::Adaptive::load(opt.config)?),
+            "adaptive" => Self::Adaptive(adaptive::Adaptive::load(file)?),
             _ => return Err(USAGE.into()),
         })
     }

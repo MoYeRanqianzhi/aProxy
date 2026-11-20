@@ -22,7 +22,7 @@ pub struct Rewrite {
 }
 impl Rewrite {
     /// 在 hello 之前拒绝无效的指针转义和不能由代理送出的 HTTP 值。
-    pub fn load(path: Option<&str>) -> Result<Self, &'static str> {
+    pub fn load(path: Option<config::Source<'_>>) -> Result<Self, &'static str> {
         let mut cfg: Self = match path {
             Some(p) => config::load(p)?,
             None => Self::default(),
@@ -314,7 +314,7 @@ mod tests {
         ] {
             std::fs::write(&file, text).unwrap();
             assert!(
-                Rewrite::load(Some(file.to_str().unwrap())).is_err(),
+                Rewrite::load(Some(config::Source::Worker(file.to_str().unwrap()))).is_err(),
                 "{text}"
             );
         }

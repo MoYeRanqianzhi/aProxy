@@ -2327,3 +2327,30 @@ fn translate_help_distinguishes_single_requests_from_chain_roles() {
         assert!(help.contains(term));
     }
 }
+
+/// 三种离线入口共用输入边界；合法的 TOML/JSON 用空白填充，不能依靠解析恰巧失败来通过测试。
+#[test]
+fn offline_files_are_bounded_before_parsing() {
+    let dir = tempfile::tempdir().unwrap();
+    let big = dir.path().join("big");
+    let proxy = dir.path().join("proxy.toml");
+    let sample = dir.path().join("sample.json");
+    let padding = " ".repeat(8 * 1024 * 1024 + 1);
+    std::fs::write(&big, &padding).unwrap();
+    std::fs::write(&sample, format!("{padding}{{\"path\":\"/\"}}")).unwrap();
+    std::fs::write(&proxy, "base_url='https://relay.test'\n[[format]]\nname='rewrite'\ncommand='aproxy-format'\nargs=['rewrite','--config','big']\nstages=['request']").unwrap();
+    let p = proxy.to_str().unwrap();
+    let b = big.to_str().unwrap();
+    for args in [
+        vec!["check", b],
+        vec!["check", "rewrite", "--config", b],
+        vec!["check", p],
+        vec!["try", p, "--request", sample.to_str().unwrap()],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{args:?}: {out:?}");
+    }
+}

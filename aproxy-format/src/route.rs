@@ -223,7 +223,7 @@ impl Route {
         Ok(())
     }
     /// 在握手之前发现重复标识、非法 URL 和无效头名。
-    pub fn load(path: &str) -> Result<Self, &'static str> {
+    pub fn load(path: config::Source<'_>) -> Result<Self, &'static str> {
         let mut cfg: Self = config::load(path)?;
         let mut ids = std::collections::HashSet::new();
         if cfg.channel.is_empty() {
@@ -439,7 +439,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("route.toml");
         std::fs::write(&file,"[[channel]]\nid='last'\nurl='https://last.test'\npriority=8\nmodels=[{regex='^m[0-9]$'}]\n[[channel]]\nid='a'\nurl='https://a.test'\nweight=2\nmodels=[{exact='m1'}]\n[[channel]]\nid='b'\nurl='https://b.test'\nmodels=[{prefix='m'}]").unwrap();
-        let route = Route::load(file.to_str().unwrap()).unwrap();
+        let route = Route::load(config::Source::Worker(file.to_str().unwrap())).unwrap();
         for (model, ticket, prev, id) in [
             ("m1", 0, None, "a"),
             ("m1", 1, None, "a"),
@@ -473,7 +473,7 @@ mod tests {
                 .collect::<String>(),
         )
         .unwrap();
-        let route = Route::load(f.to_str().unwrap()).unwrap();
+        let route = Route::load(config::Source::Worker(f.to_str().unwrap())).unwrap();
         let t = (0..100)
             .find(|&t| route.choose("m", t, None).unwrap().id == "b")
             .unwrap();
@@ -523,7 +523,7 @@ mod tests {
         let file = dir.path().join("route.toml");
         let cfg = "[[channel]]\nid='a'\nurl='https://a.test'\n[channel.overrides]\n'retry.max_attempts'=4\n'keepalive.interval_secs'=2\n'keepalive.trigger'='always'\n[[rule]]\nmodel='small'\n[rule.overrides]\n'retry.max_attempts'=1\n 'timeouts.first_byte_secs'=12\n";
         std::fs::write(&file, cfg).unwrap();
-        let mut route = Route::load(file.to_str().unwrap()).unwrap();
+        let mut route = Route::load(config::Source::Worker(file.to_str().unwrap())).unwrap();
         assert!(route.overrides(&route.channel[0], "small").is_none());
         route.negotiate(&[
             "retry.max_attempts".into(),
@@ -546,7 +546,10 @@ mod tests {
             "'retry.unknown'=0",
         ] {
             std::fs::write(&file, cfg.replace("'retry.max_attempts'=4", bad)).unwrap();
-            assert!(Route::load(file.to_str().unwrap()).is_err(), "{bad}");
+            assert!(
+                Route::load(config::Source::Worker(file.to_str().unwrap())).is_err(),
+                "{bad}"
+            );
         }
     }
 }

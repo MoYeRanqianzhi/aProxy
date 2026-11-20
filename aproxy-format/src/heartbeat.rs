@@ -27,7 +27,7 @@ struct Preset {
 const PING: &str = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
 impl Heartbeat {
     /// 无配置使用标准 Messages 入口；显式配置只启用列出的路径。
-    pub fn load(file: Option<&str>) -> Result<Self, &'static str> {
+    pub fn load(file: Option<config::Source<'_>>) -> Result<Self, &'static str> {
         let config: Self = match file {
             Some(path) => config::load(path)?,
             None => Self {

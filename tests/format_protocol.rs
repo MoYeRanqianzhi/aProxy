@@ -1335,6 +1335,10 @@ async fn startup_probes_run_in_parallel_and_respect_worker_lifetimes() {
     let (up, _) = upstream(&[200]).await;
     let gate = home.path().join("release");
     let args = ["gate-hello", gate.to_str().unwrap()];
+    // 同一 home 中已就绪的实例应照常重启，不能被卡在握手的邻居拖住。
+    let (sibling, started) = launch(&home, up, "");
+    assert!(started.status.success(), "{started:?}");
+    let sibling = sibling.to_string();
     let mut cfg = String::new();
     for (name, process) in [("persist", "persistent"), ("once", "spawn")] {
         let obs = serde_json::to_string(&home.path().join(format!("{name}-obs"))).unwrap();
@@ -1346,7 +1350,7 @@ async fn startup_probes_run_in_parallel_and_respect_worker_lifetimes() {
             );
     }
     let port = free_port();
-    let (parent, _) = background_start(&home, port, up, &cfg);
+    let (parent, config_path) = background_start(&home, port, up, &cfg);
     tokio::join!(
         observed_hello(&home, "persist"),
         observed_hello(&home, "once")
@@ -1366,6 +1370,46 @@ async fn startup_probes_run_in_parallel_and_respect_worker_lifetimes() {
         String::from_utf8(out.stderr)
             .unwrap()
             .contains("is still starting")
+    );
+    // 重启替换期间上一代的记录仍在。它证明有启动规格，不证明本代已完成握手。
+    let mut spec = aproxy::spec::read_restore_in(&run, &sibling)
+        .unwrap()
+        .unwrap()
+        .spec;
+    spec.config_path = Some(config_path.display().to_string());
+    aproxy::spec::write_restore_in(&run, &key, &spec).unwrap();
+    let starting_pid = aproxy::daemon::ipc_ping_in(&run, &key)
+        .await
+        .unwrap()
+        .instance
+        .pid;
+    let serving_pid = aproxy::daemon::ipc_ping_in(&run, &sibling)
+        .await
+        .unwrap()
+        .instance
+        .pid;
+    for (target, code) in [(key.as_str(), 1), ("all", 5)] {
+        let out = home
+            .cmd()
+            .args(["restart", target, "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(code), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("is still starting"),
+            "{out:?}"
+        );
+        let live = aproxy::daemon::ipc_ping_in(&run, &key).await.unwrap();
+        assert_eq!(live.instance.pid, starting_pid);
+        assert_eq!(live.state, aproxy::daemon::InstanceState::Starting);
+    }
+    assert_ne!(
+        aproxy::daemon::ipc_ping_in(&run, &sibling)
+            .await
+            .unwrap()
+            .instance
+            .pid,
+        serving_pid
     );
     std::fs::write(gate, b"").unwrap();
     let out = parent.wait_with_output().unwrap();

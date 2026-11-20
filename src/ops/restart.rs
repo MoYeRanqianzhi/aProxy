@@ -88,8 +88,7 @@ pub async fn restart_instance(
     let port = daemon::port_of(&info.listen_addr).to_string();
     let run_dir = daemon::run_dir();
     let mut record = spec::read_restore_in(&run_dir, &port);
-    if matches!(record, Ok(None))
-        && !info.foreground
+    if !info.foreground
         && let Ok(live) = daemon::ipc_ping_in(&run_dir, &port).await
         && live.instance.instance_id == info.instance_id
     {
@@ -97,7 +96,9 @@ pub async fn restart_instance(
             return Err(RestartFailure::Starting);
         }
         // serving 发布在写记录之后；第一次读空与这次 ping 之间可能刚完成握手。
-        record = spec::read_restore_in(&run_dir, &port);
+        if matches!(record, Ok(None)) {
+            record = spec::read_restore_in(&run_dir, &port);
+        }
     }
     let spec = match record {
         Ok(Some(entry)) => entry.spec,

@@ -2184,3 +2184,25 @@ fn dry_run_external_execution_requires_opt_in_and_discloses_the_boundary() {
         assert!(!text.contains("private-fixture") && !err.contains("private-fixture"));
     }
 }
+
+/// 帮助模式不消费标准输入，不与协议 hello 混用，并指出独立转换与链中角色的区别。
+#[test]
+fn translate_help_distinguishes_single_requests_from_chain_roles() {
+    let run = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+        .args(["translate", "--help"])
+        .output()
+        .unwrap();
+    assert!(run.status.success() && run.stderr.is_empty());
+    let help = String::from_utf8(run.stdout).unwrap();
+    for term in [
+        "--from",
+        "--to",
+        "openai_responses",
+        "标准输入",
+        "convert",
+        "check",
+        "try",
+    ] {
+        assert!(help.contains(term));
+    }
+}

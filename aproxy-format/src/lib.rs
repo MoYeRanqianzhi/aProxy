@@ -331,6 +331,12 @@ fn worker(
 }
 /// 无信封的一次性协议转换。出错只给诊断类别，不回显含消息或密钥的原始输入。
 fn translate_once(args: &[String]) -> Result<(), &'static str> {
+    if matches!(args,[flag] if flag=="--help" || flag=="-h") {
+        println!(
+            "用法：aproxy-format translate --from <协议> --to <协议>\n从标准输入读取一个 JSON 请求，向标准输出写入转换结果，不启动代理。\n协议：anthropic_messages、openai_chat、openai_responses。代理链使用 convert 角色；验证配置用 check，试跑链用 try。"
+        );
+        return Ok(());
+    }
     let opt = Options::parse(args)?;
     let (None, Some(from), Some(to)) = (opt.config, opt.from, opt.to) else {
         return Err("用法: aproxy-format translate --from <协议> --to <协议>");
@@ -354,6 +360,10 @@ const USAGE: &str = "用法: aproxy-format <convert|keys|route|policy|adaptive|r
 pub fn run() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
+        Some((name, [])) if name == "--help" || name == "-h" => {
+            println!("{USAGE}");
+            Ok(())
+        }
         Some((name, rest)) if matches!(name.as_str(), "init" | "check" | "try") => {
             tools::run(name, rest)
         }

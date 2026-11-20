@@ -84,7 +84,35 @@ jobs:
       - run: cargo clippy --workspace ${{ matrix.flags }} --all-targets --locked -- -D warnings
       # 不带目标过滤的 cargo test 会顺带编译 examples——transform_integration
       # 依赖已编译的 examples/format-echo，加 --lib/--test 过滤时须另行构建
+      # 让系统在 aproxy.exe 异常终止时留下完整的转储：测试里出现过 aproxy 以 0xC0000374（堆损坏）
+      # 退出，退出码之外没有任何输出，没有转储就无从查起。只对这两个可执行文件名生效，
+      # 写的是这台一次性 runner 的注册表。
+      - name: Keep crash dumps of aproxy
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\dumps" | Out-Null
+          foreach ($exe in 'aproxy.exe', 'aproxy-format.exe') {
+            $key = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\$exe"
+            New-Item -Force -Path $key | Out-Null
+            Set-ItemProperty -Path $key -Name DumpFolder -Type ExpandString -Value "$env:RUNNER_TEMP\dumps"
+            Set-ItemProperty -Path $key -Name DumpType -Type DWord -Value 2
+            Set-ItemProperty -Path $key -Name DumpCount -Type DWord -Value 4
+          }
       - run: cargo test --workspace ${{ matrix.flags }} --locked --no-fail-fast --verbose
+      # 转储要配上同一次构建的可执行文件与符号才读得出调用栈
+      - name: Upload crash dumps
+        if: failure()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: crash-dumps-windows-${{ matrix.variant }}
+          path: |
+            ${{ runner.temp }}/dumps/
+            target/debug/aproxy.exe
+            target/debug/aproxy.pdb
+            target/debug/aproxy-format.exe
+            target/debug/aproxy_format.pdb
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Smoke-test --version (C5)
         shell: bash
         run: bash .github/scripts/version-smoke.sh target/debug/aproxy.exe ${{ matrix.variant }}

@@ -889,9 +889,31 @@ struct ReceivedFail {
     /// Program's explanation.
     reason: String,
     /// Raw optional field, including a value of the wrong JSON type.
+    #[serde(default, deserialize_with = "receive_fail_code")]
     code: Option<serde_json::Value>,
     /// Optional terminal bytes and metadata.
     response: Option<Response>,
+}
+/// A wrong type is still a parsed diagnostic, but an out-of-range JSON number is a
+/// wire error. Keep that distinction even if a consumer enables arbitrary-precision
+/// numbers in serde_json for unrelated JSON bodies. Never echo the rejected value.
+fn receive_fail_code<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    /// A discarded array or object must satisfy the same numeric boundary as a scalar.
+    fn in_range(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Number(n) => n.as_f64().is_some_and(f64::is_finite),
+            serde_json::Value::Array(a) => a.iter().all(in_range),
+            serde_json::Value::Object(o) => o.values().all(in_range),
+            _ => true,
+        }
+    }
+    let code = Option::<serde_json::Value>::deserialize(d)?;
+    if code.as_ref().is_some_and(|v| !in_range(v)) {
+        return Err(serde::de::Error::custom("number out of range in fail.code"));
+    }
+    Ok(code)
 }
 impl From<ReceivedFail> for Fail {
     fn from(input: ReceivedFail) -> Self {

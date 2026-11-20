@@ -684,6 +684,12 @@ pub const TABLE: &[Code] = &[
         &[],
     ),
     diagnostic(
+        "forward_response_buffered",
+        Severity::Info,
+        "The default delivery is forward and the chain has a response program; that layer gathers each response, so those responses are not streamed. Declare stream instead where the program supports it.",
+        &[req("format", T::String)],
+    ),
+    diagnostic(
         "settings_schema_too_new",
         Severity::Error,
         "settings.json has a schema newer than this version understands.",

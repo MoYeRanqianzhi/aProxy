@@ -296,6 +296,41 @@ fn config_reports(home: &Path, settings: &Settings, defaults: &Defaults) -> Vec<
                 file.diagnostics = resolved.diagnostics;
                 if !has_errors(&file.diagnostics) {
                     let cfg = resolved.config;
+                    if cfg.forward_only_enabled() {
+                        use config::file::Stage;
+                        // required 的请求层不可用会直接终止请求，不会无声地改走直通。
+                        if cfg.formats.iter().any(|f| {
+                            f.has_stage(Stage::Decide)
+                                || (!f.required && f.has_stage(Stage::Request))
+                        }) {
+                            let code = aproxy_ipc::code::lookup("forward_default_unguarded")
+                                .expect("registered diagnostic");
+                            file.push(
+                                code.name,
+                                Level::Warning,
+                                Some("delivery"),
+                                code.summary,
+                                json!({}),
+                            );
+                        }
+                        let secrets = cfg.known_secrets();
+                        for (index, f) in cfg
+                            .formats
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, f)| f.has_stage(Stage::Response))
+                        {
+                            let code = aproxy_ipc::code::lookup("forward_response_buffered")
+                                .expect("registered diagnostic");
+                            file.push(
+                                code.name,
+                                Level::Info,
+                                Some(&format!("format[{index}].stages")),
+                                code.summary,
+                                json!({"format":secrets.replace(&f.name)}),
+                            );
+                        }
+                    }
                     let addr = &cfg.listen_addr;
                     if !cfg.listen_is_loopback() {
                         let suffix = if cfg.injects_credentials() {
@@ -411,6 +446,60 @@ mod tests {
         let file = found.next().unwrap();
         assert!(found.next().is_none(), "{report:?}");
         file
+    }
+
+    /// 默认 forward 才有此风险；只要有 decide 或可选 request 就报告，required request 不算。
+    #[tokio::test]
+    async fn doctor_warns_forward_default_unguarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        let settings = settings_path_in_tmp(dir.path());
+        for (delivery, stages, required, expected) in [
+            ("forward", "'request'", true, false),
+            ("forward", "'request'", false, true),
+            ("forward", "'decide'", true, true),
+            ("forward", "'request','decide'", false, true),
+            ("retry", "'request','decide'", false, false),
+        ] {
+            std::fs::write(&cfg,format!("base_url='http://localhost'\ndelivery='{delivery}'\n[[format]]\ncommand='observer'\nstages=[{stages}]\nrequired={required}\n")).unwrap();
+            let report = run(&settings).await;
+            assert_eq!(report.errors(), 0, "{report:?}");
+            let ds: Vec<_> = one_file(&report, &cfg)
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == "forward_default_unguarded")
+                .collect();
+            assert_eq!(ds.len(), usize::from(expected), "{report:?}");
+            if expected {
+                assert_eq!(ds[0].severity, Level::Warning);
+                assert!(ds[0].details.is_empty());
+            }
+        }
+    }
+    /// 每一层整包响应都单独列出，流层不算；诊断里的显示名与程序快照一样替换密钥。
+    #[tokio::test]
+    async fn doctor_notes_forward_response_buffered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let settings = settings_path_in_tmp(dir.path());
+        for delivery in ["retry", "forward"] {
+            std::fs::write(&path,format!("base_url='http://localhost'\napi_key='test-secret'\ndelivery='{delivery}'\n[[format]]\ncommand='pack-test-secret'\nstages=['response']\n[[format]]\ncommand='incremental'\nprocess='persistent'\nstages=['stream']\n[[format]]\ncommand='another'\nstages=['response']\n")).unwrap();
+            let report = run(&settings).await;
+            assert_eq!(report.errors(), 0, "{report:?}");
+            let ds: Vec<_> = one_file(&report, &path)
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == "forward_response_buffered")
+                .collect();
+            if delivery == "retry" {
+                assert!(ds.is_empty());
+            } else {
+                assert_eq!(ds.len(), 2);
+                assert!(ds.iter().all(|d| d.severity == Level::Info));
+                assert_eq!(ds[0].details["format"], "pack-<secret>");
+                assert_eq!(ds[1].details["format"], "another");
+            }
+        }
     }
 
     /// 两个别名指到同端口时各自指出另一份文件；语法错则保留解析器的错误与位置。

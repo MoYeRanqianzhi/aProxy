@@ -105,6 +105,7 @@ Problems found in config.toml and settings.json. Each diagnostic is an object wi
 | `default_credential_withheld` | warning | A credential in the settings defaults was not inherited because the target differs, and this config has none of its own. | `key` (string), `reason` (string) |
 | `default_header_shared` | info | The defaults' header tables contain non-secret headers, which are sent to every target. | — |
 | `forward_default_unguarded` | warning | The default delivery is forward while the chain has a decide program or an optional request program: when they are unavailable, requests are not retried. | — |
+| `forward_response_buffered` | info | The default delivery is forward and the chain has a response program; that layer gathers each response, so those responses are not streamed. Declare stream instead where the program supports it. | `format` (string) |
 | `settings_schema_too_new` | error | settings.json has a schema newer than this version understands. | — |
 | `format_handshake_failed` | varies | A format's handshake failed at startup. | `format` (string), `kind` (string) |
 | `format_stage_unsupported` | error | A format does not support a stage the config declares for it. | `format` (string), `stages` (string list) |

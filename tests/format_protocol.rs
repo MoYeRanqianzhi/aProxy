@@ -6280,7 +6280,7 @@ async fn official_keys_cool_the_previous_key_on_429() {
     let cfg = official_layer(
         "keys",
         "'request','retry'",
-        &["keys", "--config", file.to_str().unwrap()],
+        &["--replay-keys", "--config", file.to_str().unwrap()],
     ) + "env={ KEY_A='fixture-one', KEY_B='fixture-two' }\n";
     let (client, url) = running(&home, up, &cfg);
     for _ in 0..2 {

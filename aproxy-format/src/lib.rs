@@ -236,6 +236,20 @@ impl Role {
         }
     }
 }
+/// 在指定的时间快照上重放密钥角色的标准流协议。冷却不受读取样例或外部进程调度的真实耗时影响。
+pub fn replay_keys_at(
+    args: &[String],
+    input: impl BufRead,
+    output: impl Write,
+    now: std::time::Instant,
+    wall: std::time::SystemTime,
+) -> Result<(), String> {
+    let Role::Keys(mut keys) = Role::load("keys", args)? else {
+        unreachable!()
+    };
+    keys.sample_time = Some((now, wall));
+    worker("keys", Role::Keys(keys), input, output).map_err(String::from)
+}
 /// 只在标准输出写一行 JSON 并立即 flush；管道断开直接结束，不循环输出错误。
 fn emit(out: &mut impl Write, value: &impl serde::Serialize) -> Result<(), &'static str> {
     serde_json::to_writer(&mut *out, value).map_err(|_| "无法写入标准输出")?;

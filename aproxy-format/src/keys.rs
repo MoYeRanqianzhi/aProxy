@@ -72,6 +72,9 @@ pub struct Keys {
     /// 一次冷却的最短秒数；上游可用 Retry-After 要求更长间隔。
     #[serde(default = "default_cooldown")]
     cooldown_secs: u64,
+    /// 离线演练可固定同一时刻；普通工作进程每次读取当前单调时钟与 HTTP 日期时钟。
+    #[serde(skip)]
+    pub(super) sample_time: Option<(Instant, SystemTime)>,
     /// 按目标来源隔离密钥。
     pool: Vec<Pool>,
 }
@@ -227,9 +230,11 @@ impl Keys {
         retry: Option<&w::Retry>,
         r: &mut w::Reply,
     ) -> Result<(), Fault> {
-        let now = Instant::now();
+        let (now, wall) = self
+            .sample_time
+            .unwrap_or_else(|| (Instant::now(), SystemTime::now()));
         if let Some(retry) = retry {
-            self.charge(m.context.state.as_deref(), retry, now, SystemTime::now());
+            self.charge(m.context.state.as_deref(), retry, now, wall);
         }
         let sticky = if self.sticky {
             m.request

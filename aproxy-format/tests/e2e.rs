@@ -20,8 +20,13 @@ struct Worker {
 impl Worker {
     /// 启动编译出来的角色程序，给两个虚构的 key，不依赖父进程的密钥。
     fn new(args: &[&str]) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
-            .args(args)
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_aproxy-format"));
+        cmd.args(args);
+        Self::connect(cmd, args[0], false)
+    }
+    /// 固定时钟的子进程也读写真正的协议管道；仅先跳过 libtest 自己的启动横幅。
+    fn connect(mut cmd: Command, role: &str, frozen: bool) -> Self {
+        let mut child = cmd
             .env("FORMAT_A", "fixture-private-A")
             .env("FORMAT_B", "fixture-private-B")
             .stdin(Stdio::piped())
@@ -29,7 +34,16 @@ impl Worker {
             .spawn()
             .unwrap();
         let input = child.stdin.take();
-        let output = BufReader::new(child.stdout.take().unwrap());
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        if frozen {
+            loop {
+                let mut line = String::new();
+                assert_ne!(output.read_line(&mut line).unwrap(), 0);
+                if line.trim_end().ends_with("replay ready") {
+                    break;
+                }
+            }
+        }
         let mut w = Self {
             child,
             input,
@@ -39,7 +53,7 @@ impl Worker {
         };
         let h=w.frame(json!({"stage":"hello","protocols":[1],"aproxy_version":"test","name":"role","process":"persistent","stages":[],"worker_id":0,"features":["decide.success"],"overrides":[]}));
         assert_eq!(h["protocol"], 1);
-        assert_eq!(h["name"], args[0]);
+        assert_eq!(h["name"], role);
         w.hello = h;
         w
     }
@@ -62,6 +76,22 @@ impl Drop for Worker {
         drop(self.input.take());
         let _ = self.child.wait();
     }
+}
+/// 只在测试二进制显式选中时运行；单调时间与日期固定，不给正式命令引入环境开关。
+#[test]
+#[ignore = "the parent drives the worker protocol over stdin"]
+fn frozen_key_worker() {
+    let config = std::env::var("FORMAT_SAMPLE_CONFIG").unwrap();
+    println!("replay ready");
+    std::io::stdout().flush().unwrap();
+    aproxy_format::replay_keys_at(
+        &["--config".into(), config],
+        std::io::stdin().lock(),
+        std::io::stdout().lock(),
+        std::time::Instant::now(),
+        std::time::SystemTime::UNIX_EPOCH,
+    )
+    .unwrap();
 }
 /// 客户端路径与当前目标分开，能检出拿渠道的协议反推客户端的错误。
 fn request(url: &str, path: &str, body: Value) -> Value {
@@ -265,7 +295,11 @@ fn sticky_key_negotiation_and_exhausted_pool_retry() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("keys.toml");
     std::fs::write(&file,"sticky=true\n[[pool]]\norigin='https://relay.test'\nheader='x-api-key'\nkeys=[{id='one',env='FORMAT_A'},{id='two',env='FORMAT_B'}]").unwrap();
-    let mut w = Worker::new(&["keys", "--config", file.to_str().unwrap()]);
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "frozen_key_worker", "--ignored", "--nocapture"])
+        .env("FORMAT_SAMPLE_CONFIG", &file);
+    let mut w = Worker::connect(command, "keys", true);
     assert_eq!(
         w.hello["request_body"],
         json!({"request":"full","retry":"full"})

@@ -54,7 +54,7 @@ struct Pool {
     keys: Vec<Key>,
     /// 每个 worker 独立持有游标，不随请求状态走。
     #[serde(skip)]
-    cursor: u64,
+    cursor: u128,
 }
 /// 目的地未知时拒绝请求，不能回退到第一池。
 #[derive(Deserialize)]
@@ -98,7 +98,7 @@ impl Pool {
         strategy: &Strategy,
         sticky: Option<u64>,
         now: Instant,
-        random: impl FnOnce(u64) -> u64,
+        random: impl FnOnce(u128) -> u128,
     ) -> Option<&Key> {
         let weight = |k: &Key| {
             if *strategy == Strategy::Weighted {
@@ -108,13 +108,16 @@ impl Pool {
             }
         };
         let eligible = || self.keys.iter().filter(|k| k.remaining(now).is_zero());
-        let total: u64 = eligible().map(weight).sum();
+        if let Some(ticket) = sticky {
+            return crate::selection::preferred(b"keys", ticket, eligible(), |k| {
+                (&k.id, weight(k))
+            });
+        }
+        let total: u128 = eligible().map(|k| u128::from(weight(k))).sum();
         if total == 0 {
             return None;
         }
-        let mut slot = if let Some(ticket) = sticky {
-            ticket % total
-        } else if *strategy == Strategy::Random {
+        let mut slot = if *strategy == Strategy::Random {
             random(total)
         } else {
             let index = self.cursor % total;
@@ -122,7 +125,7 @@ impl Pool {
             index
         };
         eligible().find(|k| {
-            let n = weight(k);
+            let n = u128::from(weight(k));
             if slot < n {
                 true
             } else {
@@ -168,11 +171,6 @@ impl Keys {
                     .keys
                     .iter()
                     .any(|k| k.id.is_empty() || !ids.insert(&k.id) || k.weight == 0)
-                || pool
-                    .keys
-                    .iter()
-                    .try_fold(0u64, |n, k| n.checked_add(k.weight))
-                    .is_none()
             {
                 return Err("密钥池为空、标识重复或权重无效".into());
             }
@@ -324,7 +322,7 @@ mod tests {
         }
         for _ in 0..3 {
             assert_eq!(
-                p.select(&Strategy::Weighted, Some(2), now, |_| unreachable!())
+                p.select(&Strategy::Weighted, Some(0), now, |_| unreachable!())
                     .unwrap()
                     .id,
                 "b"
@@ -352,7 +350,16 @@ mod tests {
                 k.pool[0]
                     .select(
                         &Strategy::RoundRobin,
-                        Some(0),
+                        Some(
+                            (0..100u64)
+                                .find(|&t| crate::selection::preferred(
+                                    b"keys",
+                                    t,
+                                    ["a", "b"].iter(),
+                                    |id| (*id, 1)
+                                ) == Some(&"a"))
+                                .unwrap()
+                        ),
                         now + Duration::from_secs(secs),
                         |_| unreachable!()
                     )

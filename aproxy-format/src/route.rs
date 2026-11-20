@@ -243,12 +243,10 @@ impl Route {
         {
             return Err("模型规则重复、为空或覆盖项无效");
         }
-        let mut total = 0u64;
         for c in &cfg.channel {
-            total = total
-                .checked_add(c.weight)
-                .filter(|_| c.weight != 0)
-                .ok_or("渠道权重须为正数且总和不能溢出")?;
+            if c.weight == 0 {
+                return Err("渠道权重须为正数");
+            }
             if config::state_string_bytes(&c.id) + alias_bytes + 24 > config::STATE_BYTES {
                 return Err("渠道标识与别名生成的状态超过 64 KiB");
             }
@@ -303,18 +301,12 @@ impl Route {
             return None;
         }
         for group in eligible.chunk_by_mut(|a, b| a.priority == b.priority) {
-            let mut slot = ticket % group.iter().map(|c| c.weight).sum::<u64>();
-            let first = group
-                .iter()
-                .position(|c| {
-                    if slot < c.weight {
-                        true
-                    } else {
-                        slot -= c.weight;
-                        false
-                    }
+            let selected =
+                crate::selection::preferred(b"route", ticket, group.iter().copied(), |c| {
+                    (&c.id, c.weight)
                 })
-                .expect("非空组的正权重总和已验证");
+                .expect("组非空");
+            let first = group.iter().position(|c| c.id == selected.id).unwrap();
             group.rotate_left(first);
         }
         let i = previous

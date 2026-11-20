@@ -20,6 +20,8 @@ pub mod decode;
 pub mod diag;
 pub mod endpoint;
 pub mod home;
+#[cfg(feature = "body-inspection")]
+pub mod inspection;
 pub mod ledger;
 pub mod program;
 pub mod redact;

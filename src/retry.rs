@@ -24,87 +24,7 @@ pub fn is_retryable_status(status: u16) -> bool {
 /// 确定性错误则在秒级拿到真实响应，因此不设为 1。
 pub const BOUNDED_RETRY_MAX_ATTEMPTS: u32 = 3;
 
-/// 判断响应体是否表示“错误内容”而非正常业务响应。
-///
-/// 启发式：若响应体为 JSON 且包含明确的错误字段，则视为可重试的错误。
-/// 该检查用于“自动拦截一切内容为报错的内容并重试”的需求：
-/// 即使 HTTP 状态码为 200，若 body 本身是错误 JSON，也应重试。
-///
-/// 规则：
-/// - body 必须能解析为 JSON 对象
-/// - 且包含 `error` 键（值为对象或字符串）或 `type == "error"`，则判定为错误内容
-pub fn is_error_body(body: &[u8]) -> bool {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return false;
-    };
-    let Some(obj) = v.as_object() else {
-        return false;
-    };
-    if obj.contains_key("error") {
-        // error: null 视为未携带有效错误——某些上游成功体会带 error:null 字段，
-        // 若判为错误会导致 200 成功响应被无限重试
-        if !obj.get("error").map(|v| v.is_null()).unwrap_or(false) {
-            return true;
-        }
-    }
-    obj.get("type").and_then(|t| t.as_str()) == Some("error")
-}
-
-/// 判断流式缓冲体中是否包含错误事件。
-///
-/// 流式场景下，即使 HTTP 状态为 200，流内的某个 SSE/NDJSON 数据块也可能
-/// 携带错误（如 `data: {"type":"error",...}`）。若直接管道透传，客户端
-/// 已收到部分数据便无法重试；因此需要在缓冲完成后扫描整个流内容，命中
-/// 错误即视为可重试。
-///
-/// 检测策略（启发式，按优先级）：
-/// 1. 扫描 SSE `data:` 行：对每一行 `data: <json>` 尝试 `is_error_body`
-/// 2. 若未发现 SSE 结构，则按 NDJSON 逐行尝试 `is_error_body`
-/// 3. 兜底：对整体 body 尝试 `is_error_body`
-pub fn is_stream_error_body(body: &[u8]) -> bool {
-    // SSE 路径：只要出现过 `data:` 就认为是 SSE 流，扫描其 data 载荷
-    if let Ok(text) = std::str::from_utf8(body) {
-        let mut saw_data_line = false;
-        let mut sse_has_error = false;
-        for line in text.lines() {
-            let trimmed = line.trim();
-            // SSE 允许 `data:` 后紧跟空格或直接跟 JSON
-            let Some(rest) = trimmed
-                .strip_prefix("data:")
-                .or_else(|| trimmed.strip_prefix("data :"))
-            else {
-                continue;
-            };
-            let data = rest.trim();
-            if data.is_empty() || data == "[DONE]" {
-                continue;
-            }
-            saw_data_line = true;
-            if is_error_body(data.as_bytes()) {
-                sse_has_error = true;
-                break;
-            }
-        }
-        if saw_data_line {
-            return sse_has_error;
-        }
-
-        // NDJSON 路径：逐行 JSON 检测
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            // 仅对看起来像 JSON 的行做检测，避免对普通 text 误判
-            if line.starts_with('{') && is_error_body(line.as_bytes()) {
-                return true;
-            }
-        }
-    }
-
-    // 兜底：整体作为 JSON 检测
-    is_error_body(body)
-}
+pub use aproxy_ipc::inspection::{is_error_body, is_stream_error_body};
 
 /// 判断上游响应是否为流式。
 ///
@@ -114,16 +34,7 @@ pub fn is_streaming_response(headers: &reqwest::header::HeaderMap, body: &[u8]) 
     if is_streaming_content_type(headers) {
         return true;
     }
-    // 嗅探 body：包含 SSE data 行则视为流式
-    if let Ok(text) = std::str::from_utf8(body) {
-        for line in text.lines() {
-            let t = line.trim();
-            if t.starts_with("data:") || t.starts_with("data :") {
-                return true;
-            }
-        }
-    }
-    false
+    aproxy_ipc::inspection::sniffs_stream(body)
 }
 
 /// 仅凭响应头的流式判定（磁盘模式：全量 body 不可即时获得，嗅探不可用）
@@ -131,11 +42,7 @@ pub fn is_streaming_content_type(headers: &reqwest::header::HeaderMap) -> bool {
     headers
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|ct| {
-            let lower = ct.to_ascii_lowercase();
-            lower.contains("text/event-stream") || lower.contains("application/x-ndjson")
-        })
-        .unwrap_or(false)
+        .is_some_and(aproxy_ipc::inspection::stream_content_type)
 }
 
 #[cfg(test)]

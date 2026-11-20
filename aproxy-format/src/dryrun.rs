@@ -60,6 +60,40 @@ fn bytes(value: &Value) -> Vec<u8> {
         .as_str()
         .map_or_else(|| value.to_string().into_bytes(), |s| s.as_bytes().to_vec())
 }
+/// 样本与实例使用同一套 JSON/SSE 和行扫描判据；大实体的磁盘路径不先解压再误作完整 JSON。
+fn sample_error_body(r: &w::Response, chunks: &[Vec<u8>], forward: bool, disk: bool) -> bool {
+    use aproxy_ipc::inspection as inspect;
+    let raw = r.body.as_bytes().unwrap_or_default();
+    if raw.len() > inspect::RESIDENT_LIMIT && (forward || disk) {
+        let mut scan = inspect::StreamErrorScanner::new();
+        if forward {
+            for chunk in chunks {
+                for piece in chunk.chunks(16 * 1024) {
+                    scan.feed(piece);
+                }
+            }
+        } else {
+            for chunk in chunks {
+                scan.feed(chunk);
+            }
+        }
+        return scan.finish();
+    }
+    let decoded = aproxy_ipc::decode::for_inspection(
+        r.headers.get("content-encoding").map(String::as_str),
+        raw,
+    );
+    let body = decoded.as_deref().unwrap_or(raw);
+    if r.headers
+        .get("content-type")
+        .is_some_and(|ct| inspect::stream_content_type(ct))
+        || inspect::sniffs_stream(body)
+    {
+        inspect::is_stream_error_body(body)
+    } else {
+        inspect::is_error_body(body)
+    }
+}
 /// 只计数不留存，进程内角色不能因省略真实管道而越过实例的行长限制。
 struct LineBudget(usize);
 impl Write for LineBudget {
@@ -1158,15 +1192,38 @@ fn rehearse(
             }
             r
         });
-        let mut failure = attempt
-            .failure
-            .map(|code| json!({"code":code}))
-            .or_else(|| {
-                attempt
-                    .status
-                    .filter(|s| *s >= 400)
-                    .map(|s| json!({"code":"upstream_status","details":{"status":s}}))
-            });
+        let forward = t.mode == "forward";
+        let has_decide = t.units.iter().any(|u| u.has(Stage::Decide));
+        let has_response = t.units.iter().any(|u| u.has(Stage::Response));
+        let success = attempt.status.is_some_and(|s| (200..300).contains(&s));
+        let partial = attempt.interrupted || attempt.failure.is_some();
+        let mut live = forward
+            && attempt.status.is_some()
+            && (!attempt.status.is_some_and(|s| s >= 400) || !has_decide);
+        if live && partial && success && has_response && !has_decide {
+            return Err(CliError::Unsimulated(
+                "整包层读取未完成的直通实体；真实实例会按实际流故障结束交付".into(),
+            ));
+        }
+        if live && partial && success && has_response && has_decide {
+            // 纯整包层要等到 EOF 才能交付头；混合链中已经打开的内层还持有租约。
+            if t.units.iter().any(|u| u.has(Stage::Stream)) {
+                return Err(CliError::Unsimulated(
+                    "混合回程链在提交前中断；真实实例会先释放已打开的流，再交回决定层".into(),
+                ));
+            }
+            live = false;
+        }
+        let mut failure = attempt.failure.map(|code| json!({"code":code})).or_else(|| {
+            if attempt.interrupted {
+                let received = chunks.iter().map(Vec::len).sum::<usize>();
+                Some(json!({"code":"upstream_body_interrupted","details":{"received_bytes":received,"reason":"sample interrupted"}}))
+            } else {
+                let r = resp.as_ref()?;
+                let code = if r.status >= 400 {"upstream_status"} else if (!forward || success) && sample_error_body(r, &chunks, forward, chain.config.disk_cache.unwrap_or(true)) {"upstream_error_body"} else {return None};
+                Some(json!({"code":code,"details":{"status":r.status}}))
+            }
+        });
         if let Some(rejection) = refused.take() {
             if !rejection.retry {
                 return t.rejected(&rejection, n, upgraded);
@@ -1175,6 +1232,7 @@ fn rehearse(
                 json!({"code":"format_fail","details":{"format":t.units[t.cursor].layer.entry.name,"stage":t.request_stage.as_str()}}),
             );
             resp = None;
+            live = false;
             chunks.clear();
         }
         let base_retry = fallback(
@@ -1186,7 +1244,7 @@ fn rehearse(
             failure.is_some(),
             t.mode,
         );
-        let settled = if t.mode == "forward" && failure.is_none() {
+        let settled = if live {
             Settlement {
                 retry: false,
                 reroute: false,
@@ -1223,13 +1281,13 @@ fn rehearse(
             }
             continue;
         }
-        let mut response = resp.unwrap_or_else(|| w::Response::new(502));
+        let mut response = resp
+            .filter(|_| live || !partial)
+            .unwrap_or_else(|| w::Response::new(502));
         if let Some(p) = settled.stop {
             response.apply(p);
-        } else if failure.is_none()
-            && (t.mode != "forward" || (200..300).contains(&response.status))
-        {
-            t.deliver(&req, &mut response, chunks, attempt.interrupted, n)?;
+        } else if (failure.is_none() || live) && (!forward || success) {
+            t.deliver(&req, &mut response, chunks, live && partial, n)?;
         }
         trace(
             t.out,
@@ -1479,6 +1537,85 @@ mod tests {
                 rows.iter()
                     .any(|r| r["stage"] == "result" && r["output"]["status"] == 400),
                 "{mode}: {rows:?}"
+            );
+        }
+    }
+
+    /// 完整错误体和缓冲中断可以投票；直通已提交的响应不能再交给决定层。
+    #[test]
+    fn sampled_failures_only_vote_before_forward_commit() {
+        let policy = "[[format]]\ncommand='aproxy-format'\nargs=['policy','--config','p.toml']\nstages=['decide']";
+        let buffered = "\n[[format]]\nname='buffer'\ncommand='aproxy-format'\nargs=['convert','--from','openai_chat','--to','openai_chat']\nstages=['response']";
+        for (mode, layers, attempt, code, votes) in [
+            (
+                "retry",
+                "",
+                json!({"status":200,"body":{"error":"bad"}}),
+                "upstream_error_body",
+                true,
+            ),
+            (
+                "retry",
+                "",
+                json!({"status":200,"chunks":["data: {\"type\":\"error\"}\n\n"]}),
+                "upstream_error_body",
+                true,
+            ),
+            (
+                "retry",
+                "",
+                json!({"status":200,"interrupted":true}),
+                "upstream_body_interrupted",
+                true,
+            ),
+            (
+                "forward",
+                buffered,
+                json!({"status":200,"interrupted":true}),
+                "upstream_body_interrupted",
+                true,
+            ),
+            (
+                "forward",
+                "",
+                json!({"status":200,"interrupted":true}),
+                "upstream_body_interrupted",
+                false,
+            ),
+            (
+                "forward",
+                "",
+                json!({"status":200,"body":{"error":"bad"}}),
+                "upstream_error_body",
+                false,
+            ),
+            (
+                "retry",
+                "",
+                json!({"status":200,"body":{"error":null}}),
+                "upstream_error_body",
+                false,
+            ),
+        ] {
+            let (result, rows) = trace_sample(
+                &format!("delivery='{mode}'\n{policy}{layers}"),
+                json!({"path":"/","body":{},"attempts":[attempt]}),
+                &[(
+                    "p.toml",
+                    &format!(
+                        "[[rule]]\nfailure='{code}'\ndecision='stop'\nresponse='context_too_long'"
+                    ),
+                )],
+            );
+            result.unwrap();
+            assert_eq!(
+                rows.iter().any(|r| r["stage"] == "decide"),
+                votes,
+                "{mode}: {rows:?}"
+            );
+            assert_eq!(
+                rows.last().unwrap()["output"]["status"],
+                if votes { 400 } else { 200 }
             );
         }
     }

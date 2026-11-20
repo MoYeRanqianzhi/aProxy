@@ -9,10 +9,7 @@ use super::*;
 // Bytes 块产出。磁盘模式的内存在途占用为流式缓冲级（常数），与负载大小解耦。
 // ---------------------------------------------------------------------------
 
-/// 内存驻留阈值：缓冲超过即溢写磁盘（disk_cache 开启时）。
-/// 1 MiB：覆盖真实 agent 流量（SSE/JSON 错误体 KB 级）使其零磁盘开销，
-/// 大请求体/大响应才进入磁盘路径。
-pub(crate) const RESIDENT_LIMIT: usize = 1024 * 1024;
+pub(crate) use aproxy_ipc::inspection::RESIDENT_LIMIT;
 
 // 溢写之前攒下的那一段正好这么大；请求历史循环使用的大缓冲区按同一个大小准备
 const _: () = assert!(RESIDENT_LIMIT == crate::history::LARGE_BUFFER);

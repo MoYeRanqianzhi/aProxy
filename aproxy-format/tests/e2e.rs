@@ -353,6 +353,57 @@ fn explicit_response_only_preserves_served_model_without_state() {
     assert_eq!(b["model"], "served-model");
     assert_eq!(b["choices"][0]["message"]["content"], "hello");
 }
+/// 头部改写不读正文；正文规则在 retry 也重跑，报告不包含新旧字段值。
+#[test]
+fn rewrite_negotiates_only_needed_data_and_reports_positions() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("rewrite.toml");
+    let headers = "remove_headers=['Cookie']\nset_headers={ 'X-Service'='private-header-value' }\n";
+    std::fs::write(&f, headers).unwrap();
+    let args = ["rewrite", "--config", f.to_str().unwrap()];
+    let mut w = Worker::new(&args);
+    assert_eq!(w.hello["request_body"]["retry"], "none");
+    let mut m = request("https://relay.test/", "/", Value::Null);
+    m["request"].as_object_mut().unwrap().remove("body");
+    let r = w.frame(m.clone());
+    assert_eq!(
+        r["request"]["headers"],
+        json!({"authorization":"from-client","x-service":"private-header-value"})
+    );
+    assert!(r["request"].get("body").is_none());
+    drop(w);
+    std::fs::write(
+        &f,
+        format!("{headers}remove=['/debug']\nset={{ '/nested/n'=4 }}\nmodels={{ small='served' }}"),
+    )
+    .unwrap();
+    let mut w = Worker::new(&args);
+    assert_eq!(
+        w.hello["request_body"],
+        json!({"request":"full","retry":"full"})
+    );
+    m["request"]["body"] =
+        json!({"model":"small","debug":null,"nested":{},"retain":"private-content"})
+            .to_string()
+            .into();
+    for stage in ["request", "retry"] {
+        m["stage"] = stage.into();
+        if stage == "retry" {
+            m["retry"] =
+                json!({"attempt":2,"elapsed_ms":0,"last_failure":{"code":"upstream_status"}});
+        }
+        let r = w.frame(m.clone());
+        assert_eq!(
+            serde_json::from_str::<Value>(r["request"]["body"].as_str().unwrap()).unwrap(),
+            json!({"model":"served","nested":{"n":4},"retain":"private-content"})
+        );
+        assert_eq!(r["report"]["actions"].as_array().unwrap().len(), 5);
+        let report = r["report"].to_string();
+        for absent in ["private", "served", "from-client"] {
+            assert!(!report.contains(absent), "{report}");
+        }
+    }
+}
 /// 配置错误不会把 TOML 原行里的值或环境秘密复制到 stderr；旧 run 命令不再可用。
 #[test]
 fn invalid_role_configuration_does_not_echo_secrets() {

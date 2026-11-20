@@ -6,6 +6,7 @@ mod detect;
 mod events;
 mod heartbeat;
 mod keys;
+mod rewrite;
 mod route;
 mod selection;
 mod translate;
@@ -23,7 +24,7 @@ enum Role {
     /// 根据模型选择渠道。
     Route(route::Route),
     /// 只在请求方向改写字段。
-    Rewrite,
+    Rewrite(rewrite::Rewrite),
     /// 只对尝试结果投票。
     Policy,
     /// 按摘要决定 forward 或 retry，并接收完成通知。
@@ -88,6 +89,7 @@ impl Role {
         }
         Ok(match name {
             "heartbeat" => Self::Heartbeat(heartbeat::Heartbeat::load(opt.config)?),
+            "rewrite" => Self::Rewrite(rewrite::Rewrite::load(opt.config)?),
             "keys" => Self::Keys(keys::Keys::load(opt.config.ok_or("keys 需要 --config")?)?),
             "route" => Self::Route(route::Route::load(
                 opt.config.ok_or("route 需要 --config")?,
@@ -99,7 +101,6 @@ impl Role {
                 match name {
                     "policy" => Self::Policy,
                     "adaptive" => Self::Adaptive,
-                    "rewrite" => Self::Rewrite,
                     _ => return Err(USAGE.into()),
                 }
             }
@@ -109,7 +110,7 @@ impl Role {
     fn stages(&self) -> &'static [&'static str] {
         match self {
             Self::Convert(_) => &["request", "retry", "response", "stream"],
-            Self::Keys(_) | Self::Rewrite => &["request", "retry"],
+            Self::Keys(_) | Self::Rewrite(_) => &["request", "retry"],
             Self::Route(route) => route.stages(),
             Self::Policy => &["decide"],
             Self::Adaptive => &["request", "decide", "notify"],
@@ -121,8 +122,9 @@ impl Role {
         use w::BodyNeed::{Digest, Full, None};
         let needs: &[(&str, w::BodyNeed)] = match self {
             Self::Convert(_) | Self::Route(_) => &[("request", Full), ("retry", Full)],
+            Self::Rewrite(r) if r.needs_body() => &[("request", Full), ("retry", Full)],
             Self::Keys(k) if k.sticky => &[("request", Full), ("retry", Full)],
-            Self::Keys(_) | Self::Rewrite => &[("request", None), ("retry", None)],
+            Self::Keys(_) | Self::Rewrite(_) => &[("request", None), ("retry", None)],
             Self::Policy => &[("decide", None)],
             Self::Adaptive => &[("request", Digest), ("decide", None), ("notify", Digest)],
             Self::Heartbeat(_) => &[],
@@ -207,7 +209,7 @@ impl Role {
             Self::Convert(c) => c.request(m, r),
             Self::Keys(k) => k.request(m, retry, r),
             Self::Route(route) => route.request(m, retry, r),
-            Self::Rewrite => Ok(()),
+            Self::Rewrite(rewrite) => rewrite.request(m, r),
             Self::Adaptive => {
                 r.delivery = Some("forward".into());
                 Ok(())

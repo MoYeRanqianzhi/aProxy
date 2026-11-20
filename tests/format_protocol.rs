@@ -3076,3 +3076,68 @@ async fn decide_stop_masks_configured_secret_in_upstream_failure() {
     let log = std::fs::read_to_string(startup["log_path"].as_str().unwrap()).unwrap();
     assert!(!log.contains(secret));
 }
+
+/// 在途消息无回信时，从真正的停止命令观察截止时间；正常空闲的另一进程应该在排空开始时看到 EOF。
+#[tokio::test]
+async fn stop_deadline_reaps_a_worker_with_an_unanswered_message() {
+    use std::time::{Duration, Instant};
+    let home = TestHome::new();
+    let watched = |name: &str, stage: &str, args: &[&str]| {
+        let obs = serde_json::to_string(&home.path().join(format!("{name}.events"))).unwrap();
+        layer(&home, name, stage, args).replace(
+            "env={",
+            &format!("timeout_secs=0\nenv={{ ECHO_OBSERVE={obs},"),
+        )
+    };
+    let cfg = watched("busy", "'request'", &["no-stage-reply"])
+        + &watched("idle", "'response'", &["echo"]);
+    let (port, out) = launch(&home, free_port(), &cfg);
+    assert!(out.status.success(), "{out:?}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let request = tokio::spawn(client.get(format!("http://127.0.0.1:{port}/")).send());
+    observed_stage(&home, "busy", "request", 1).await;
+    let event = |name: &str, what: &str| -> Option<u32> {
+        std::fs::read_to_string(home.path().join(format!("{name}.events")))
+            .ok()?
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|v| v["event"] == what)?["pid"]
+            .as_u64()
+            .map(|v| v as u32)
+    };
+    let pid = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Some(pid) = event("busy", "request") {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let idle = event("idle", "hello").unwrap();
+    assert_eq!(aproxy::process::process_exited(pid), Some(false));
+    let mut stop = home.cmd();
+    stop.args(["stop", &port.to_string(), "--json"]);
+    let start = Instant::now();
+    let stopping = tokio::task::spawn_blocking(move || stop.output().unwrap());
+    let early_eof = tokio::time::timeout(Duration::from_secs(5), async {
+        while event("idle", "eof") != Some(idle) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    let out = stopping.await.unwrap();
+    let elapsed = start.elapsed();
+    let exited = aproxy::process::process_exited(pid);
+    assert!(out.status.success(), "{out:?}");
+    assert!(elapsed < Duration::from_secs(12), "stop took {elapsed:?}");
+    assert!(early_eof, "idle EOF waited for the request drain deadline");
+    assert_eq!(exited, Some(true));
+    let _ = request.await;
+}

@@ -265,6 +265,7 @@ fn main() {
                 "gate-request" if m["request"]["body"] == "blocked" => {
                     wait_gate(std::path::Path::new(arg))
                 }
+                "no-stage-reply" => continue,
                 "sleep" => std::thread::sleep(delay),
                 "oneshot" if count > 1 || dead => break,
                 "exit1" => std::process::exit(1),

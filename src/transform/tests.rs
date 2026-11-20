@@ -613,10 +613,10 @@ async fn shutdown_reaps_a_checked_out_worker_before_returning() {
     });
     let held = p.turn(false).await.unwrap();
     assert_eq!(p.ids.lock().unwrap().len(), 1);
-    #[cfg(any(windows, target_os = "linux"))]
     let pid = wait_observed(&obs, "hello", 1).await[0]["pid"]
         .as_u64()
         .unwrap() as u32;
+    assert_eq!(p.ids.lock().unwrap().get(&0), Some(&Some(pid)));
     tokio::time::timeout(Duration::from_secs(5), p.shutdown())
         .await
         .unwrap();

@@ -205,6 +205,27 @@ impl AppState {
         Ok(())
     }
 
+    /// 停机开始先并行退役空闲进程；在途请求仍可使用其余会话。
+    pub fn drain_idle_formats(&self) {
+        for pool in self.formats.iter() {
+            pool.begin_drain();
+        }
+    }
+    /// 已达到排空截止点，立即结束剩余进程。等操作系统确认退出的时间由实例共用，而非每层一秒。
+    pub async fn terminate_remaining_formats(&self) {
+        for pool in self.formats.iter() {
+            pool.terminate_remaining();
+        }
+        if tokio::time::timeout(std::time::Duration::from_secs(1), self.retire_formats())
+            .await
+            .is_err()
+        {
+            for pool in self.formats.iter() {
+                pool.warn_unconfirmed_exits();
+            }
+        }
+    }
+
     /// 所有程序同时收到 EOF，正常关闭的宽限不随链长或池大小累加。
     pub async fn retire_formats(&self) {
         futures_util::future::join_all(self.formats.iter().map(|p| p.shutdown())).await;

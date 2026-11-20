@@ -5,7 +5,7 @@ use crate::config::file::{FormatEntry, Process};
 use aproxy_envelope::{Hello, HelloReply, Message, Reply, Stage};
 use aproxy_ipc::redact::Secrets;
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex, OnceLock},
@@ -269,7 +269,7 @@ struct Slot {
     /// 发给该进程的永久 worker_id。
     id: u32,
     /// 这个程序仍在使用的所有编号。
-    used: Arc<Mutex<BTreeSet<u32>>>,
+    used: Arc<Mutex<BTreeMap<u32, Option<u32>>>>,
     /// 进程数上限与并发请求数分别计数，前者包括正在退出的进程。
     _permit: OwnedSemaphorePermit,
 }
@@ -524,10 +524,12 @@ pub(crate) struct Pool {
     turns: Semaphore,
     /// 已启动但仍未退出的进程数上限。
     capacity: Arc<Semaphore>,
+    /// 开始排空后不再留空闲会话，仍在途的请求可完成后续阶段。
+    draining: std::sync::atomic::AtomicBool,
     /// 关闭信号也送给已借出和正在握手的进程，与持有管道的任务是否继续运行无关。
     stopping: tokio::sync::watch::Sender<bool>,
-    /// 活进程的编号，空洞总是优先复用。
-    ids: Arc<Mutex<BTreeSet<u32>>>,
+    /// 协议编号映射到未确认退出的 OS PID；拉起前与退出后的日志收尾期保留编号，但没有 PID。
+    ids: Arc<Mutex<BTreeMap<u32, Option<u32>>>>,
     /// 仅在收发全部完成后归还，这把同步锁不跨 await。
     idle: Mutex<Vec<Worker>>,
     /// 回收任务只持弱引用，实例退出不被它阻挡。
@@ -572,6 +574,7 @@ impl Pool {
             stderr_window: Arc::new(Mutex::new(LogWindow::new())),
             turns: Semaphore::new(n),
             capacity: Arc::new(Semaphore::new(n)),
+            draining: Default::default(),
             stopping: tokio::sync::watch::channel(false).0,
             ids: Default::default(),
             idle: Default::default(),
@@ -728,9 +731,9 @@ impl Pool {
         let id = {
             let mut ids = self.ids.lock().unwrap();
             let id = (0..)
-                .find(|id| !ids.contains(id))
+                .find(|id| !ids.contains_key(id))
                 .expect("worker count fits u32");
-            ids.insert(id);
+            ids.insert(id, None);
             id
         };
         let slot = Slot {
@@ -755,6 +758,7 @@ impl Pool {
                 .spawn()
                 .map_err(|_| Fault::Spawn)?
         };
+        *slot.used.lock().unwrap().get_mut(&id).unwrap() = Some(child.id().expect("fresh child"));
         let stderr = tokio::spawn(log_stderr(
             child.stderr.take().unwrap(),
             self.secrets.clone(),
@@ -768,21 +772,22 @@ impl Pool {
         // 只有此任务持有 OS 句柄和槽位。交还全部槽位因此也证明所有子进程都已 wait，
         // 不需要按 pid 寻找进程，更不依赖即将强退的服务端执行各请求的析构函数。
         let exited = tokio::spawn(async move {
-            let grace = async {
-                let _ = stopping.wait_for(|stop| *stop).await;
-                tokio::time::sleep(RETIRE_GRACE).await;
-            };
             let normal = tokio::select! {
                 result = child.wait() => result.is_ok(),
                 _ = force => false,
-                _ = grace => false,
+                _ = stopping.wait_for(|stop| *stop) => false,
             };
+            if !normal {
+                let _ = child.start_kill();
+                // wait 出错不能当作已退出；始终只用原句柄等待，截止点由整个实例共用。
+                while child.wait().await.is_err() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+            *slot.used.lock().unwrap().get_mut(&id).unwrap() = None;
             let mut stderr = stderr;
             if normal {
                 let _ = tokio::time::timeout(Duration::from_millis(100), &mut stderr).await;
-            } else {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
             }
             stderr.abort();
             drop(slot);
@@ -876,19 +881,36 @@ impl Pool {
         while tasks.try_join_next().is_some() {}
         tasks.spawn(w.finish());
     }
-    /// 停止回收计时器，发出所有空闲进程的 EOF，与已经退役的进程并行等待。
-    pub(crate) async fn shutdown(&self) {
-        self.turns.close();
-        self.stopping.send_replace(true);
+    /// 停机开始就给空闲会话 EOF，不消耗在途请求的排空期限；随后归还的进程也直接退役。
+    pub(crate) fn begin_drain(&self) {
+        let mut idle = self.idle.lock().unwrap();
+        self.draining
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(t) = self.reaper.get() {
             t.abort();
         }
-        let workers = std::mem::take(&mut *self.idle.lock().unwrap());
-        let mut retired = std::mem::take(&mut *self.retiring.lock().unwrap());
-        for w in workers {
-            retired.spawn(w.finish());
+        for w in idle.drain(..) {
+            self.retire(w);
         }
+    }
+    /// 截止点到了不再接收工作；直接唤醒持有 OS 句柄的任务，排空已经给过空闲进程宽限。
+    pub(crate) fn terminate_remaining(&self) {
+        self.turns.close();
+        self.stopping.send_replace(true);
+    }
+    /// 截止后只报告仍未 wait 成功的 OS PID；协议编号与 PID 不同，日志也不用于事后杀进程。
+    pub(crate) fn warn_unconfirmed_exits(&self) {
+        for pid in self.ids.lock().unwrap().values().flatten() {
+            tracing::warn!(format = %self.secrets.replace(&self.entry.name), pid, "format worker exit unconfirmed at shutdown deadline");
+        }
+    }
+    /// 无在途请求时优先等空闲进程清理；已借出的会话不再等待回答。
+    pub(crate) async fn shutdown(&self) {
+        self.turns.close();
+        self.begin_drain();
+        let mut retired = std::mem::take(&mut *self.retiring.lock().unwrap());
         while retired.join_next().await.is_some() {}
+        self.terminate_remaining();
         // 在途/握手/已丢弃的会话不一定在退役队列里，它们的名额也必须全部收齐。
         let slots = if self.entry.process == Process::Spawn {
             1
@@ -909,6 +931,10 @@ impl Pool {
             if *self.stopping.borrow() {
                 return;
             }
+            if self.draining.load(std::sync::atomic::Ordering::Relaxed) {
+                self.retire(w);
+                return;
+            }
             idle.push(w);
         }
         let timeout = Duration::from_secs(self.entry.worker_idle_secs);
@@ -922,6 +948,9 @@ impl Pool {
                     let Some(p) = pool.upgrade() else { break };
                     let delay = {
                         let mut idle = p.idle.lock().unwrap();
+                        if p.draining.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
                         let mut i = 0;
                         while i < idle.len() {
                             if idle[i].idle_since.elapsed() >= timeout {

@@ -441,32 +441,35 @@ pub(crate) async fn serve_forever(
     // 停止信号一到就告诉订阅事件的客户端「实例要退出了」：处在二进制更换阶段时原因是 swap
     // （随后会有新版本的实例起来），否则是 shutdown
     let graceful = {
-        let history = state.history.clone();
-        let stats = state.stats.clone();
+        let drain_state = state.clone();
         let stopping = stopping.clone();
         async move {
             stopping.await;
-            let swapping = stats
+            drain_state.drain_idle_formats();
+            let swapping = drain_state
+                .stats
                 .swap_until_ms
                 .load(std::sync::atomic::Ordering::Relaxed)
                 > daemon::now_millis();
-            history.announce_closing(if swapping { "swap" } else { "shutdown" });
+            drain_state
+                .history
+                .announce_closing(if swapping { "swap" } else { "shutdown" });
         }
     };
     tokio::select! {
-        result = axum::serve(listener, app).with_graceful_shutdown(graceful) => {
-            result.unwrap();
-        }
+        () = async {
+            axum::serve(listener, app).with_graceful_shutdown(graceful).await.unwrap();
+            state.retire_formats().await;
+        } => {}
         _ = async {
             stopping.await;
             tracing::info!("10 秒后强制退出（在途请求将中断）");
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            state.retire_formats().await;
+            state.terminate_remaining_formats().await;
             daemon::remove_registry_files(&actual_addr);
             crate::util::exit(0);
         } => {}
     }
-    state.retire_formats().await;
     // 订阅连接各自把 `closing` 那一行写出去就断开；最多等半秒，不为一个不读的客户端拖住退出
     let closing_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     while state.history.subscribers() > 0 && tokio::time::Instant::now() < closing_deadline {

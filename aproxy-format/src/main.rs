@@ -4,6 +4,7 @@ mod config;
 mod convert;
 mod detect;
 mod events;
+mod heartbeat;
 mod keys;
 mod route;
 mod translate;
@@ -27,7 +28,7 @@ enum Role {
     /// 按摘要决定 forward 或 retry，并接收完成通知。
     Adaptive,
     /// 只处理保活帧。
-    Heartbeat,
+    Heartbeat(heartbeat::Heartbeat),
 }
 /// 没有配置项的角色也拒绝未知键，拼写错误不能默默被吞。
 #[derive(Deserialize)]
@@ -85,6 +86,7 @@ impl Role {
             return Err("此角色不接受协议参数");
         }
         Ok(match name {
+            "heartbeat" => Self::Heartbeat(heartbeat::Heartbeat::load(opt.config)?),
             "keys" => Self::Keys(keys::Keys::load(opt.config.ok_or("keys 需要 --config")?)?),
             "route" => Self::Route(route::Route::load(
                 opt.config.ok_or("route 需要 --config")?,
@@ -97,7 +99,6 @@ impl Role {
                     "policy" => Self::Policy,
                     "adaptive" => Self::Adaptive,
                     "rewrite" => Self::Rewrite,
-                    "heartbeat" => Self::Heartbeat,
                     _ => return Err(USAGE),
                 }
             }
@@ -120,7 +121,7 @@ impl Role {
                 &["request", "decide", "notify"],
                 &[("request", Digest), ("decide", None), ("notify", Digest)],
             ),
-            Self::Heartbeat => (&["heartbeat"], &[]),
+            Self::Heartbeat(_) => (&["heartbeat"], &[]),
         };
         let mut reply = w::HelloReply::new(
             stages.iter().map(|s| s.to_string()).collect(),
@@ -150,10 +151,13 @@ impl Role {
             },
             w::Stage::Decide(_) if matches!(self, Self::Adaptive | Self::Policy) => Ok(()),
             w::Stage::Notify(_) if matches!(self, Self::Adaptive) => Ok(()),
-            w::Stage::Heartbeat(h) if matches!(self, Self::Heartbeat) => {
-                r.data = w::Data::from_bytes(h.data.as_bytes().to_vec());
-                Ok(())
-            }
+            w::Stage::Heartbeat(h) => match self {
+                Self::Heartbeat(heartbeat) => {
+                    heartbeat.beat(h, &mut r);
+                    Ok(())
+                }
+                _ => Err(Fault::new("阶段不受支持", "unsupported stage")),
+            },
             _ => Err(Fault::new("阶段不受支持", "unsupported stage")),
         };
         if let Err(reason) = result {

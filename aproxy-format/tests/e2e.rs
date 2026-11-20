@@ -469,3 +469,35 @@ fn convert_preserves_text_tools_usage_and_stop_in_all_six_directions() {
         }
     }
 }
+
+/// 自定义入口的已知协议产生原生事件，未选路径与不明协议不能被静默变成 Messages 流。
+#[test]
+fn heartbeat_matches_only_explicit_client_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("beats.toml");
+    let p = "[[preset]]\npath='/custom/messages'\nprotocol='anthropic_messages'\nevent='ping'\n";
+    std::fs::write(&path, p).unwrap();
+    let args = ["heartbeat", "--config", path.to_str().unwrap()];
+    let mut w = Worker::new(&args);
+    let beat = |path: &str| json!({"stage":"heartbeat","request_id":"r","heartbeat":{"beat":1,"elapsed_ms":50,"attempt":1},"client":{"path":path},"data":": keepalive\n\n"});
+    assert_eq!(
+        w.frame(beat("/custom/messages?q=x"))["data"],
+        "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+    );
+    for path in ["/custom/messages/extra", "/v1/responses", "/v1/messages"] {
+        let r = w.frame(beat(path));
+        assert!(r.get("data").is_none() && r.get("state").is_none());
+    }
+    for invalid in [
+        p.repeat(2),
+        p.replace("'ping'", "'message_stop'"),
+        p.replace("'anthropic_messages'", "'openai_responses'"),
+    ] {
+        std::fs::write(&path, invalid).unwrap();
+        let r = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!r.status.success() && r.stdout.is_empty());
+    }
+}

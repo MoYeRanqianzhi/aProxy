@@ -2067,12 +2067,7 @@ impl Recorder {
         use aproxy_envelope::{Completion, Context, Delivery};
         let live = self.0.as_ref()?;
         let inner = lock(&live.record.inner);
-        if matches!(
-            inner.code,
-            Some("request_too_large" | "client_body_aborted")
-        ) {
-            return None;
-        }
+        // 是否已进入链由交付端登记通知时决定，同一个上传错误也可能发生在程序已经收帧之后。
         let end = inner.ended_at?;
         let mut m = Completion::new(
             Context::new(live.record.id.to_string()),

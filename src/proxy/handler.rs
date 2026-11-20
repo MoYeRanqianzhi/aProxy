@@ -140,6 +140,12 @@ async fn handle(
                     h.request_body.get("request") != Some(&aproxy_envelope::BodyNeed::None)
                 })
         });
+    // 允许双工的上传可能比已交付的整个响应更长；即使没有 stream 层，历史也得等上传真正退出。
+    if live && delivery.join.is_none() {
+        let join = Arc::new(UpstreamJoin::default());
+        trace.upstream_join = Arc::downgrade(&join);
+        delivery.join = Some(join);
+    }
     let upload = ClientUpload {
         body: req.into_body(),
         trigger,

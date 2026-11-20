@@ -218,7 +218,7 @@ fn main() {
             if matches!(mode, "digest-only" | "digest-forward") {
                 r["request_body"] = json!({"request":"digest","retry":"digest","decide":"digest","notify":"digest"});
             }
-            if mode == "notify-digest" {
+            if matches!(mode, "notify-digest" | "replace-metadata") {
                 r["request_body"] = json!({"request":"none","notify":"digest"});
             }
             if matches!(mode, "metadata-only" | "gate-metadata") {
@@ -376,6 +376,10 @@ fn main() {
                     break;
                 }
                 "digest-forward" if stage == "request" => r["delivery"] = json!("forward"),
+                "replace-metadata" if stage == "request" => {
+                    r["request"] = json!({"body":"replacement"});
+                    r["state"] = json!("rewritten");
+                }
                 "notify-digest" if stage == "request" => r["state"] = json!("observer state"),
                 "invalid-notify" if stage == "notify" => r["seq"] = json!(0),
                 "no-stage-reply" => continue,

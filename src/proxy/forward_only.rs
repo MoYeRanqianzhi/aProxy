@@ -28,9 +28,61 @@ struct RequestTap {
     seen: u64,
     accept_sse: bool,
     trigger: crate::config::KeepaliveTrigger,
+    /// 最后释放，先让两个历史写者析构并结算原上传，再允许封存通知。
+    join: Option<Arc<UpstreamJoin>>,
 }
 
 impl RequestTap {
+    /// 两种消费实时上传的路径共用同一份原始历史、客户端流标记与按需摘要。
+    fn new(
+        upload: &ClientUpload,
+        state: &AppState,
+        ctx: Option<&ExchangeCtx>,
+        rec: &Recorder,
+    ) -> Self {
+        let need_flag = ctx.is_some_and(|ctx| ctx.client.stream.is_none())
+            && [
+                crate::config::file::Stage::Stream,
+                crate::config::file::Stage::Response,
+                crate::config::file::Stage::Notify,
+            ]
+            .into_iter()
+            .any(|stage| state.has_format(stage));
+        let flag_out = ctx
+            .and_then(|c| c.live_stream.clone())
+            .filter(|_| need_flag);
+        let digest = ctx
+            .filter(|_| state.formats.iter().any(|p| p.wants_notify_digest()))
+            .and_then(|c| {
+                use axum::body::HttpBody as _;
+                let hash = sha2::Sha256::default();
+                // HTTP 可以不拉取已知为空的上传；此时已确认 EOF，不是传到一半的 null。
+                if upload.body.is_end_stream() || upload.body.size_hint().exact() == Some(0) {
+                    ExchangeCtx::finish_digest(&c.digest, hash);
+                    None
+                } else {
+                    Some((hash, c.digest.clone()))
+                }
+            });
+        let history = rec.request_body(request_history_encoding(
+            upload.encoding.as_ref(),
+            ctx.is_some(),
+        ));
+        Self {
+            history,
+            sent_history: None,
+            rec: rec.clone(),
+            prefix: Vec::new(),
+            seen: 0,
+            accept_sse: upload.accept,
+            trigger: upload.trigger,
+            join: None,
+            flag_out,
+            digest,
+            parser: None,
+            exact: None,
+        }
+    }
     /// 边转发边取样。程序要确切标记时要看到整个 JSON 的结尾，后面的重复键或语法错误也算数。
     fn chunk(&mut self, chunk: &Bytes) {
         if let Some((hash, _)) = &mut self.digest {
@@ -95,6 +147,32 @@ impl Drop for RequestTap {
         self.rec.request_bytes(self.seen);
         self.rec.request_shape(model, stream);
     }
+}
+
+/// 程序已经选定替换正文：仍要消费原始上传以检查限额并结算历史、摘要，但绝不保留重放体。
+pub(super) async fn drain_original(
+    upload: ClientUpload,
+    state: &AppState,
+    req: &mut OutboundRequest,
+    rec: &Recorder,
+) -> Result<bool, Terminal> {
+    let mut tap = RequestTap::new(&upload, state, req.ctx.as_ref(), rec);
+    let limit = state.config.body_limit_bytes();
+    let mut input = upload.body.into_data_stream();
+    while let Some(part) = input.next().await {
+        let part = part.map_err(|_| Terminal::client_body_aborted())?;
+        tap.chunk(&part);
+        if tap.seen > limit as u64 {
+            return Err(body_too_large(limit));
+        }
+    }
+    tap.finish();
+    req.body_stream = tap.exact;
+    Ok(req
+        .ctx
+        .as_ref()
+        .and_then(|c| c.wire_client().stream)
+        .unwrap_or(false))
 }
 
 /// 小实体可解码后整体检查；越过驻留界限时只向单行扫描器移交前缀，不落盘也不保留整串。
@@ -245,32 +323,6 @@ pub(super) async fn forward_only_proxy(
     let client_gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let formatted = ctx.is_some();
-        let need_flag = ctx.as_ref().is_some_and(|ctx| ctx.client.stream.is_none())
-            && [
-                crate::config::file::Stage::Stream,
-                crate::config::file::Stage::Response,
-                crate::config::file::Stage::Notify,
-            ]
-            .into_iter()
-            .any(|stage| state.has_format(stage));
-        let flag_out = ctx
-            .as_ref()
-            .and_then(|c| c.live_stream.clone())
-            .filter(|_| need_flag);
-        let digest = ctx
-            .as_ref()
-            .filter(|_| state.formats.iter().any(|p| p.wants_notify_digest()))
-            .and_then(|c| {
-                use axum::body::HttpBody as _;
-                let hash = sha2::Sha256::default();
-                // HTTP 可以不拉取已知为空的上传；此时已确认 EOF，不是传到一半的 null。
-                if upload.body.is_end_stream() || upload.body.size_hint().exact() == Some(0) {
-                    ExchangeCtx::finish_digest(&c.digest, hash);
-                    None
-                } else {
-                    Some((hash, c.digest.clone()))
-                }
-            });
         let sent = rec.sent_head(
             method.as_str(),
             target_url,
@@ -282,29 +334,14 @@ pub(super) async fn forward_only_proxy(
         let sent_encoding = request_encoding(headers, formatted);
         let changed = formatted && sent_encoding.as_deref() != upload.encoding.as_ref();
         // try_started 对相同的实体直接引用已登记的原始体，必须在创建尝试前登记它。
-        let history = rec.request_body(request_history_encoding(
-            upload.encoding.as_ref(),
-            formatted,
-        ));
-        let sent_history = rec.try_started(
+        let mut tap = RequestTap::new(&upload, &state, ctx.as_ref(), &rec);
+        tap.join = trace.upstream_join.upgrade();
+        tap.sent_history = rec.try_started(
             attempt,
             sent.as_ref(),
             !changed,
             request_history_encoding(sent_encoding.as_deref(), formatted),
         );
-        let tap = RequestTap {
-            history,
-            sent_history,
-            rec: rec.clone(),
-            prefix: Vec::new(),
-            seen: 0,
-            accept_sse: upload.accept,
-            trigger: upload.trigger,
-            flag_out,
-            digest,
-            parser: None,
-            exact: None,
-        };
         let body = upload.body;
         let flag = too_large.clone();
         let gone_flag = client_gone.clone();
@@ -621,6 +658,7 @@ mod tests {
                 seen: 0,
                 accept_sse: false,
                 trigger: crate::config::KeepaliveTrigger::BodyStream,
+                join: None,
             };
             tap.chunk(&Bytes::from_static(b"{\""));
             let part = Bytes::from(vec![b'x'; SHAPE_PREFIX]);

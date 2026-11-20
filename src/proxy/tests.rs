@@ -1182,3 +1182,40 @@ fn body_stream_without_formats_does_not_capture_accept() {
     assert!(!original_accept(&headers, body, false));
     assert!(original_accept(&headers, body, true));
 }
+
+/// 替换后的正文无需留存被替换的大上传，内存和磁盘均不应出现另一份重放体。
+#[tokio::test]
+async fn forward_replacement_does_not_retain_the_original_upload() {
+    let state = AppState::new(Config {
+        forward_only: Some(true),
+        disk_cache: Some(false),
+        ..Config::default()
+    });
+    let rec = crate::history::Recorder::none();
+    let ctx = ExchangeCtx::new("r".into(), "/", false, None, rec.clone());
+    let mut req = OutboundRequest {
+        method: http::Method::POST,
+        target_url: "http://localhost/path".into(),
+        headers: Default::default(),
+        body: RequestBody::Memory(Bytes::new()),
+        replacement: Some(Arc::new(RequestBody::Memory(Bytes::from_static(
+            b"replacement",
+        )))),
+        client_encoding: None,
+        client_accept: false,
+        body_stream: None,
+        ctx: Some(ctx),
+    };
+    let upload = ClientUpload {
+        body: Body::from(vec![b'x'; 2 * 1024 * 1024]),
+        encoding: None,
+        trigger: crate::config::KeepaliveTrigger::BodyStream,
+        accept: false,
+    };
+    upload.buffer(&state, &mut req, &rec).await.unwrap();
+    assert!(
+        matches!(&req.body,RequestBody::Memory(b) if b.is_empty()),
+        "original uploaded bytes retained for replay"
+    );
+    assert!(matches!(req.sent_body(),RequestBody::Memory(b) if b.as_ref()==b"replacement"));
+}

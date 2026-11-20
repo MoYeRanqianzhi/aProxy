@@ -36,7 +36,7 @@ struct DeliveryEnd {
     streamed: bool,
 }
 
-/// 只有交付端和读取上游原始字节的 tap 强持有；二者都退出后才封存记录，不延长 HTTP 连接。
+/// 交付端、上游原始字节和实时上传的 tap 各持一票；全部退出才封存记录，不延长 HTTP 连接。
 #[derive(Default)]
 pub(super) struct UpstreamJoin(std::sync::Mutex<Option<DeliveryEnd>>);
 impl Drop for UpstreamJoin {

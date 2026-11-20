@@ -6233,3 +6233,113 @@ async fn fresh_stream_open_reads_client_flag_after_its_hello() {
     assert!(opens[0]["client"].get("stream").is_none());
     assert_eq!(opens[1]["client"]["stream"], true);
 }
+
+/// 元数据程序已经运行，替换的正文不改变原上传的大小限制、历史或完成通知摘要。
+#[tokio::test]
+async fn replaced_forward_upload_is_drained_and_post_entry_413_is_notified() {
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let (tx, mut sent) = tokio::sync::mpsc::unbounded_channel();
+    let app = axum::Router::new().fallback(move |b: axum::body::Bytes| {
+        tx.send(b).unwrap();
+        async { "ok" }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = String::from(
+        "delivery='forward'\ndisk_cache=false\nmax_request_mb=1\nkeepalive.trigger='body_stream'\n",
+    ) + &layer(
+        &home,
+        "rewrite",
+        "'request','notify'",
+        &["replace-metadata"],
+    );
+    let (c, url) = running(&home, up, &cfg);
+    let raw = format!(r#"{{"pad":"{}","stream":true}}"#, "x".repeat(256 * 1024));
+    let ok = c.post(&url).body(raw.clone()).send().await.unwrap();
+    assert_eq!(ok.text().await.unwrap(), "ok");
+    assert_eq!(sent.recv().await.unwrap(), "replacement");
+    let m = &observed_stage(&home, "rewrite", "notify", 1).await[0];
+    assert_eq!(m["state"], "rewritten");
+    assert_eq!(
+        m["digest"],
+        "d2174028b1de8c73a15c53fffc35f392fc2e998279d8fafb4c60ec52432b21d2"
+    );
+    assert_eq!(m["client"]["stream"], true);
+    let history = request_detail(&home, &url, m["request_id"].as_str().unwrap()).await;
+    assert_eq!(history["record"]["request_bytes"], raw.len());
+    let over = c
+        .post(&url)
+        .body(vec![b'x'; 1024 * 1024 + 1])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(over.status(), 413);
+    over.bytes().await.unwrap();
+    let m = &observed_stage(&home, "rewrite", "notify", 2).await[1];
+    assert_eq!(m["state"], "rewritten");
+    assert_eq!(m["code"], "request_too_large");
+    assert_eq!(m.get("digest"), Some(&Value::Null));
+    assert!(sent.try_recv().is_err());
+}
+
+/// 不订阅 stream 也可双工：先收到完整响应，仍在传输的原始上传才是最终字节数与摘要的来源。
+#[tokio::test]
+async fn notify_only_waits_for_live_upload_accounting_after_response_end() {
+    use futures_util::StreamExt as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let (tx, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+        let done = tx.clone();
+        async move {
+            let mut input = req.into_body().into_data_stream();
+            let mut b = input.next().await.unwrap().unwrap().to_vec();
+            tokio::spawn(async move {
+                while let Some(part) = input.next().await {
+                    b.extend_from_slice(&part.unwrap());
+                }
+                let _ = done.send(b);
+            });
+            "duplex-response"
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = String::from("delivery='forward'\nkeepalive.trigger='body_stream'\n")
+        + &layer(&home, "observer", "'notify'", &["notify-digest"]);
+    let (_, url) = running(&home, up, &cfg);
+    let addr = url.strip_prefix("http://").unwrap();
+    let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    tcp.write_all(format!("POST / HTTP/1.1\r\nHost: {addr}\r\nTransfer-Encoding: chunked\r\n\r\na\r\n{{\"stream\":\r\n").as_bytes()).await.unwrap();
+    let mut received = vec![];
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let mut buf = [0; 512];
+        while !received.ends_with(b"duplex-response") {
+            let n = tcp.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            received.extend_from_slice(&buf[..n]);
+        }
+    })
+    .await
+    .unwrap();
+    tcp.write_all(b"5\r\ntrue}\r\n0\r\n\r\n").await.unwrap();
+    let actual = tokio::time::timeout(std::time::Duration::from_secs(20), observed.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual, br#"{"stream":true}"#);
+    let end = &observed_stage(&home, "observer", "notify", 1).await[0];
+    assert_eq!(
+        end["digest"],
+        "cf8db77a15bbcc48ba1b0836d18c5875053b7f036993b5ef66d2f1ec8150dd3a"
+    );
+    assert_eq!(end["client"]["stream"], true);
+    let record = request_detail(&home, &url, end["request_id"].as_str().unwrap()).await;
+    assert_eq!(record["record"]["request_bytes"], actual.len());
+}

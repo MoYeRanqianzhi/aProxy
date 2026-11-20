@@ -356,6 +356,12 @@ impl ClientUpload {
         rec: &crate::history::Recorder,
     ) -> Result<bool, Terminal> {
         use crate::config::file::Stage;
+        if state.config.forward_only_enabled()
+            && req.replacement.is_some()
+            && !state.has_format(Stage::Decide)
+        {
+            return forward_only::drain_original(self, state, req, rec).await;
+        }
         let formatted = req.ctx.is_some();
         let history = rec.request_body(request_history_encoding(self.encoding.as_ref(), formatted));
         let limit = state.config.body_limit_bytes();

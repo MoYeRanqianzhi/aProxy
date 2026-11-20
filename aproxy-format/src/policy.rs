@@ -97,8 +97,7 @@ impl Rule {
             Some(None) => re.is_match(b),
             Some(Some(_)) => {
                 let (head, tail) = b.split_at(b.len().min(64 * 1024));
-                re.find_iter(head).any(|m| m.end() < head.len())
-                    || re.find_iter(tail).any(|m| m.start() > 0)
+                re.is_match(head) || re.is_match(tail)
             }
         }
     }
@@ -283,10 +282,16 @@ mod tests {
         let mut r = w::Reply::new(1);
         p.decide(&m, &mut r);
         assert!(r.decision.is_none());
-        m.response.as_mut().unwrap().response.body =
-            w::Body::Text(format!("{}xBROKEN", "x".repeat(64 * 1024)));
-        p.decide(&m, &mut r);
-        assert_eq!(r.decision, Some(w::Decision::Retry));
+        for body in [
+            format!("{}BROKENtail", "x".repeat(64 * 1024 - 6)),
+            format!("{}BROKEN", "x".repeat(64 * 1024)),
+            format!("{}xBROKEN", "x".repeat(64 * 1024)),
+        ] {
+            m.response.as_mut().unwrap().response.body = w::Body::Text(body);
+            let mut r = w::Reply::new(1);
+            p.decide(&m, &mut r);
+            assert_eq!(r.decision, Some(w::Decision::Retry));
+        }
     }
     /// 每种错误模板为客户端生成独立错误而非复用上游错误页，响应只带自己的类型头。
     #[test]

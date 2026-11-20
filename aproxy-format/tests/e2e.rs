@@ -1254,3 +1254,42 @@ fn translating_a_stream_to_chat_requests_native_usage() {
         }
     }
 }
+
+/// 独立的流进程只读请求交回的状态；即使上游在结束前报了用量，Chat 也恰好收到一个最后的空 choices 块。
+#[test]
+fn requested_chat_usage_is_one_empty_choices_chunk_before_done() {
+    let corpus: Value = serde_json::from_str(include_str!("fixtures/protocols.json")).unwrap();
+    for source in ["anthropic_messages", "openai_responses"] {
+        let args = ["convert", "--from", "openai_chat", "--to", source];
+        let mut req = Worker::new(&args);
+        let mut body = corpus["openai_chat"]["request"].clone();
+        body["stream"] = true.into();
+        body["stream_options"] = json!({"include_usage":true});
+        let state =
+            req.frame(request("https://relay.test/custom", "/custom", body))["state"].clone();
+        drop(req);
+        let mut w = Worker::new(&args);
+        w.frame(json!({"stage":"stream","event":"open","stream_id":"r/1","request_id":"r","state":state,"request":{"method":"POST","url":"https://relay.test/"},"response":{"status":200,"headers":{"content-type":"text/event-stream"}}}));
+        let mut text = String::new();
+        for e in corpus[source]["events"].as_array().unwrap() {
+            text.push_str(
+                stream_frame(&mut w, "data", &format!("data: {e}\n\n"))["data"]
+                    .as_str()
+                    .unwrap(),
+            );
+        }
+        text.push_str(stream_frame(&mut w, "close", "")["data"].as_str().unwrap());
+        let chunks: Vec<Value> = text
+            .strip_suffix("data: [DONE]\n\n")
+            .unwrap()
+            .lines()
+            .filter_map(|s| s.strip_prefix("data: "))
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        let (last, rest) = chunks.split_last().unwrap();
+        assert_eq!(last["choices"], json!([]));
+        assert_eq!(last["usage"]["prompt_tokens"], 7);
+        assert_eq!(last["usage"]["completion_tokens"], 3);
+        assert!(rest.iter().all(|c| c["usage"].is_null()));
+    }
+}

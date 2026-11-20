@@ -32,12 +32,16 @@ pub(super) struct Events {
     terminal: bool,
     /// Chat 的 finish_reason 可能早于最后一个 usage 块；只保留原因，到 [DONE] 才交给编解码器。
     chat_finishes: Vec<Value>,
+    /// Chat 客户端显式要求把用量放在空 choices 块，而不是工具完成块上。
+    include_usage: bool,
+    /// 最近一个有真实用量的目标头与用量；不把生成内容带入该块。
+    usage_chunk: Option<Value>,
     /// Messages 的 stop_reason 提示原因而不保证完整；转成 Chat 时，须等 message_stop 再把这一帧交给编码器。
     message_finish: Option<Value>,
 }
 impl Events {
     /// 每次 open 初始化，不把上一条流的输出索引或 usage 带到下一条。
-    pub(super) fn new(source: F, target: F) -> Self {
+    pub(super) fn new(source: F, target: F, include_usage: bool) -> Self {
         Self {
             source,
             target,
@@ -49,6 +53,8 @@ impl Events {
             first: true,
             terminal: false,
             chat_finishes: Vec::new(),
+            include_usage,
+            usage_chunk: None,
             message_finish: None,
         }
     }
@@ -154,6 +160,24 @@ impl Events {
             .engine
             .translate_event(&mut self.state, self.source, self.target, event)
             .map_err(|_| malformed())?;
+        self.render_events(events, output)
+    }
+    /// 按客户端的选项调整目标帧；最后只发一个独立用量块，且不能再带工具或文本。
+    fn render_events(&mut self, mut events: Vec<Value>, output: &mut String) -> Result<(), Fault> {
+        if self.include_usage && self.target == F::OpenAiChat {
+            events.retain_mut(|e| {
+                if e["usage"].is_object() {
+                    let mut chunk = e.clone();
+                    chunk["choices"] = serde_json::json!([]);
+                    self.usage_chunk = Some(chunk);
+                    if let Some(o) = e.as_object_mut() {
+                        o.remove("usage");
+                    }
+                    return !e["choices"].as_array().is_some_and(Vec::is_empty);
+                }
+                true
+            });
+        }
         render(self.target, events, output)
     }
     /// 运输层正常 EOF 不代表协议完整。只在源协议已结束且没有半帧时合成剩余的结束事件。
@@ -169,8 +193,11 @@ impl Events {
             .engine
             .finish_stream(&mut self.state, self.target)
             .map_err(|_| malformed())?;
-        render(self.target, events, &mut output)?;
+        self.render_events(events, &mut output)?;
         if self.target == F::OpenAiChat && !self.state.errored {
+            if let Some(usage) = self.usage_chunk.take() {
+                render(self.target, vec![usage], &mut output)?;
+            }
             std::fmt::Write::write_str(&mut Bounded(&mut output), "data: [DONE]\n\n")
                 .map_err(|_| budget())?;
         }
@@ -266,7 +293,7 @@ mod tests {
                     input.push_str("data: [DONE]\n\n");
                 }
                 let run = |step| {
-                    let mut s = Events::new(source, target);
+                    let mut s = Events::new(source, target, false);
                     let mut out = String::new();
                     for b in input.as_bytes().chunks(step) {
                         out += &s.feed(b).map_err(|e| e.wire).unwrap();
@@ -283,7 +310,7 @@ mod tests {
     /// 输入不完整、非法或无界时不得补出成功的协议结束事件。
     #[test]
     fn malformed_partial_or_oversized_events_fail_closed() {
-        let create = || Events::new(F::OpenAiChat, F::AnthropicMessages);
+        let create = || Events::new(F::OpenAiChat, F::AnthropicMessages, false);
         for bad in [
             b"data: {x}\n\n".as_slice(),
             b"data:\xff\n\n",

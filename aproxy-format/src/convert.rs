@@ -6,6 +6,17 @@ use serde::Deserialize;
 use serde_json::Value;
 use switchyard_translation::WireFormat as F;
 
+/// 客户端协议、目标协议及可选的 Chat 用量块偏好随请求传回，流进程与请求进程不必相同。
+#[derive(serde::Serialize, Deserialize)]
+struct Session(
+    /// 客户端等待的协议。
+    F,
+    /// 本轮上游的协议。
+    F,
+    /// 仅显式请求独立用量块时才占用状态字节。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    bool,
+);
 /// 输入格式逐请求检测，输出格式由上游契约决定。
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -174,7 +185,11 @@ impl Convert {
         }
         patch.headers = Some(headers);
         r.request = Some(patch);
-        r.state = Some(serde_json::json!([from, to]).to_string());
+        let usage = from == F::OpenAiChat
+            && body["stream"] == true
+            && body["stream_options"]["include_usage"] == true;
+        r.state =
+            Some(serde_json::to_string(&Session(from, to, usage)).expect("可序列化的协议与布尔值"));
         r.report = config::report(
             "Selected the protocol conversion",
             w::StandardAction::ProtocolConvert {
@@ -185,7 +200,7 @@ impl Convert {
         Ok(())
     }
     /// 回程的两端协议来自同一个请求的状态；无状态的独立响应仅限两端都显式指定。
-    fn pair(&self, ctx: &w::Context) -> Result<(F, F), Fault> {
+    fn pair(&self, ctx: &w::Context) -> Result<Session, Fault> {
         if let Some(s) = &ctx.state {
             return serde_json::from_str(s)
                 .map_err(|_| Fault::new("协议状态无效", "invalid protocol state"));
@@ -196,9 +211,10 @@ impl Convert {
                 "client protocol state is missing",
             ));
         }
-        Ok((
+        Ok(Session(
             protocol(&self.from).map_err(|e| Fault::new(e, "invalid client protocol"))?,
             protocol(&self.to).map_err(|e| Fault::new(e, "invalid upstream protocol"))?,
+            false,
         ))
     }
     /// 回程失败要替换整份实体；裸 fail 会让代理原样透传上游私有错误页和鉴权头。
@@ -206,7 +222,7 @@ impl Convert {
     pub fn error_response(&self, ctx: &w::Context) -> w::Response {
         let client = self
             .pair(ctx)
-            .map(|(client, _)| client)
+            .map(|s| s.0)
             .or_else(|_| protocol(&self.from))
             .unwrap_or(F::AnthropicMessages);
         let mut response = w::Response::new(502);
@@ -262,7 +278,7 @@ impl Convert {
     }
     /// 同协议不解析实体，保留原字节（含 SSE 与二进制）。
     pub fn response(&self, m: &w::ResponseMessage, r: &mut w::Reply) -> Result<(), Fault> {
-        let (client, upstream) = self.pair(&m.context)?;
+        let Session(client, upstream, _) = self.pair(&m.context)?;
         let mut p = self.response_headers(&m.response.headers);
         if client != upstream {
             p.body = w::Body::Text(Self::json(
@@ -278,7 +294,7 @@ impl Convert {
     pub fn stream(&mut self, m: &w::StreamMessage, r: &mut w::Reply) -> Result<(), Fault> {
         match &m.event {
             w::StreamEvent::Open(o) => {
-                let (client, upstream) = self.pair(&o.context)?;
+                let Session(client, upstream, usage) = self.pair(&o.context)?;
                 r.response = Some(self.response_headers(&o.response.headers));
                 self.stream = Some(if client == upstream {
                     Entity::Pass
@@ -287,7 +303,7 @@ impl Convert {
                         .next()
                         .is_some_and(|t| t.trim().eq_ignore_ascii_case("text/event-stream"))
                 }) {
-                    let events = crate::events::Events::new(upstream, client);
+                    let events = crate::events::Events::new(upstream, client, usage);
                     r.abort_tail = Some(events.abort().into());
                     Entity::Sse(Box::new(events))
                 } else {

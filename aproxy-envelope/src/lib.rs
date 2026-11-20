@@ -3,7 +3,6 @@
 //! inputs, [`HelloReply`] for negotiation, and [`Reply`] for stage results.
 
 mod http;
-pub mod legacy;
 mod messages;
 mod reports;
 

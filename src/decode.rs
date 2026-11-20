@@ -165,9 +165,9 @@ pub fn decode_strict<R: Read, W: std::io::Write>(
 }
 
 /// 每层借用外层的读端。内层结束后再向外层取 EOF，校验它自己的校验和，而不是只排空原始运输流。
-fn decode_layers<'a>(
+fn decode_layers(
     reader: &mut dyn std::io::BufRead,
-    layers: &mut dyn Iterator<Item = &'a str>,
+    layers: &mut dyn Iterator<Item = &str>,
     output: &mut dyn std::io::Write,
     max_output: u64,
 ) -> Result<u64, String> {

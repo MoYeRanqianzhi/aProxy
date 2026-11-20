@@ -195,14 +195,16 @@ impl Policy {
             r.delay_ms = w::RetryDelay::new(ms.max(base.min(w::MAX_DELAY_MS))).ok();
         }
         if let Some(template) = rule.response {
-            let proto =
-                self.protocol
-                    .or_else(|| match m.client.as_ref()?.path.split('?').next()? {
-                        "/v1/messages" => Some(F::AnthropicMessages),
-                        "/v1/chat/completions" => Some(F::OpenAiChat),
-                        "/v1/responses" => Some(F::OpenAiResponses),
-                        _ => None,
-                    });
+            let proto = m
+                .client
+                .as_ref()
+                .and_then(|client| match client.path.split('?').next()? {
+                    "/v1/messages" => Some(F::AnthropicMessages),
+                    "/v1/chat/completions" => Some(F::OpenAiChat),
+                    "/v1/responses" => Some(F::OpenAiResponses),
+                    _ => None,
+                })
+                .or(self.protocol);
             r.response = Some(template.response(proto));
         }
         let id = rule.id.clone().unwrap_or_else(|| (i + 1).to_string());
@@ -297,9 +299,16 @@ mod tests {
     #[test]
     fn stop_templates_follow_the_client_not_the_target() {
         for (name, status) in [("context_too_long", 400), ("model_not_configured", 404)] {
-            let p: Policy =
-                toml::from_str(&format!("[[rule]]\ndecision='stop'\nresponse='{name}'")).unwrap();
-            for path in ["/v1/messages?q=1", "/v1/chat/completions", "/v1/responses"] {
+            let p: Policy = toml::from_str(&format!(
+                "protocol='openai_chat'\n[[rule]]\ndecision='stop'\nresponse='{name}'"
+            ))
+            .unwrap();
+            for path in [
+                "/v1/messages?q=1",
+                "/v1/chat/completions",
+                "/v1/responses",
+                "/custom",
+            ] {
                 let mut m = message(429, "not for the client");
                 m.client = Some(w::Client::new(path.into(), None));
                 let mut r = w::Reply::new(1);

@@ -2531,3 +2531,39 @@ fn all_commands_explain_options_and_an_example_before_io() {
         }
     }
 }
+
+/// 外部程序只在明确选择的实例目录内按运行时优先级查找；拒绝无 home 的相对命令发生在启动前。
+#[test]
+fn opted_in_executable_uses_instance_lookup_not_the_driver_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("instance");
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let exe = env!("CARGO_BIN_EXE_aproxy-format");
+    let name = format!("format-role{}", std::env::consts::EXE_SUFFIX);
+    std::fs::copy(exe, bin.join(&name)).unwrap();
+    let cfg = tmp.path().join("p.toml");
+    let sample = tmp.path().join("s");
+    std::fs::write(&sample, r#"{"path":"/","body":{}}"#).unwrap();
+    for program in [name.clone(), format!("bin/{name}")] {
+        std::fs::write(&cfg,format!("base_url='https://example.test'\n[[format]]\ncommand='{program}'\nargs=['heartbeat']\nstages=['heartbeat']\nrequired=true")).unwrap();
+        for selected in [false, true] {
+            let mut cmd = Command::new(exe);
+            cmd.arg("try")
+                .arg(&cfg)
+                .arg("--request")
+                .arg(&sample)
+                .arg("--allow-external");
+            if selected {
+                cmd.arg("--home").arg(&home);
+            }
+            let out = cmd.output().unwrap();
+            assert_eq!(out.status.success(), selected, "{out:?}");
+            if selected {
+                assert!(String::from_utf8_lossy(&out.stdout).contains("negotiated"));
+            } else {
+                assert!(String::from_utf8_lossy(&out.stderr).contains("相对命令需要 --home"));
+            }
+        }
+    }
+}

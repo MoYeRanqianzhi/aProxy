@@ -730,29 +730,7 @@ impl Config {
     }
 }
 
-/// `~` 前缀展开：`~/x`、`~\x`、裸 `~` → 用户目录；其余原样。用户目录是 C1 的那一个
-/// （见 `aproxy_ipc::home::user_dir`）：`~` 在 aproxy 里处处指同一个目录，配置里的 `~` 与命令行
-/// 路径参数里的 `~`、home 的默认位置 `~/.aproxy` 不会落在两个地方。
-/// 展开产物统一用 `/` 分隔（Windows API 同样接受）。
-pub fn expand_tilde(s: &str) -> String {
-    let home = || {
-        aproxy_ipc::home::user_dir()
-            .map(|p| {
-                p.display()
-                    .to_string()
-                    .trim_end_matches(['/', '\\'])
-                    .to_string()
-            })
-            .unwrap_or_default()
-    };
-    if s == "~" {
-        return home();
-    }
-    if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
-        return format!("{}/{}", home(), rest);
-    }
-    s.to_string()
-}
+pub use aproxy_ipc::program::expand_tilde;
 
 /// 返回配置文件路径：`~/.aproxy/config.toml`。
 pub fn config_path() -> PathBuf {

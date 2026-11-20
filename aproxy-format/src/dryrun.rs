@@ -780,6 +780,13 @@ fn rehearse(
     };
     req.body = w::Body::from_bytes(raw);
     for layer in chain.layers {
+        if external
+            && layer.role.is_none()
+            && home.is_none()
+            && !Path::new(&layer.entry.command).is_absolute()
+        {
+            return Err("运行外部相对命令需要 --home；未启动程序".into());
+        }
         let mut u = Unit {
             layer,
             peer: None,

@@ -525,49 +525,6 @@ async fn normal_retirement_sends_parallel_eof_and_drop_ends_the_reaper() {
     .unwrap();
 }
 
-/// 命令搜索忽略不可执行的影子，home/bin 胜过显式 PATH；不存在的 PATH 不补当前目录。
-#[test]
-fn command_lookup_uses_runnable_candidates_and_the_supplied_path() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path();
-    let bin = home.join("bin");
-    let other = home.join("path");
-    std::fs::create_dir(&bin).unwrap();
-    std::fs::create_dir(&other).unwrap();
-    #[cfg(windows)]
-    {
-        std::fs::write(bin.join("tool"), b"shadow").unwrap();
-        std::fs::write(other.join("tool.exe"), b"fixture").unwrap();
-        assert_eq!(
-            program_path("tool", home, Some(other.as_os_str())).unwrap(),
-            other.join("tool.exe")
-        );
-        assert!(program_path("tool", home, None).is_err());
-        std::fs::write(bin.join("tool.exe"), b"fixture").unwrap();
-        assert_eq!(
-            program_path("tool", home, Some(other.as_os_str())).unwrap(),
-            bin.join("tool.exe")
-        );
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let earlier = home.join("first");
-        std::fs::create_dir(&earlier).unwrap();
-        for d in [&bin, &earlier, &other] {
-            std::fs::write(d.join("tool"), b"fixture").unwrap();
-        }
-        std::fs::set_permissions(other.join("tool"), std::fs::Permissions::from_mode(0o700))
-            .unwrap();
-        let path = std::env::join_paths([earlier, other.clone()]).unwrap();
-        assert_eq!(
-            program_path("tool", home, Some(&path)).unwrap(),
-            other.join("tool")
-        );
-        assert!(program_path("tool", home, None).is_err());
-    }
-}
-
 /// 仅条目自己的 PATH 包含这个工具，验证实际创建进程时也用该环境来解析裸名。
 #[tokio::test]
 async fn probe_resolves_a_bare_name_from_the_entry_path() {

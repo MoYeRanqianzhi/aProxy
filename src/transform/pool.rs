@@ -6,7 +6,7 @@ use aproxy_envelope::{Hello, HelloReply, Message, Reply, Stage};
 use aproxy_ipc::redact::Secrets;
 use std::{
     collections::BTreeMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::Stdio,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
@@ -269,41 +269,6 @@ impl std::fmt::Display for Fault {
             Self::Stages(_) => "worker does not support the configured stages",
         })
     }
-}
-
-/// 程序名只在 home/bin 与 PATH 中查，不让后台进程的当前目录意外参与解析。
-fn program_path(
-    command: &str,
-    home: &Path,
-    path: Option<&std::ffi::OsStr>,
-) -> Result<PathBuf, Fault> {
-    let expanded = crate::config::expand_tilde(command);
-    let p = Path::new(&expanded);
-    if p.file_name().is_none_or(|name| name != p.as_os_str()) {
-        return Ok(home.join(p));
-    }
-    #[cfg(windows)]
-    let exe = p.extension().is_none().then(|| p.with_extension("exe"));
-    #[cfg(windows)]
-    let p = exe.as_deref().unwrap_or(p);
-    for dir in
-        std::iter::once(home.join("bin")).chain(path.into_iter().flat_map(std::env::split_paths))
-    {
-        let file = dir.join(p);
-        if let Ok(meta) = file.metadata()
-            && meta.is_file()
-        {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if meta.permissions().mode() & 0o111 == 0 {
-                    continue;
-                }
-            }
-            return Ok(file);
-        }
-    }
-    Err(Fault::Spawn)
 }
 
 /// 直到操作系统确认进程退出才释放编号与进程名额；取消往返也不能造成两个活进程同号。
@@ -820,21 +785,8 @@ impl Pool {
         if *stopping.borrow() {
             return Err(Fault::Died);
         }
-        let env_path = self.entry.env.iter().rev().find(|(key, _)| {
-            if cfg!(windows) {
-                key.eq_ignore_ascii_case("PATH")
-            } else {
-                key.as_str() == "PATH"
-            }
-        });
-        let inherited = std::env::var_os("PATH");
-        let exe = program_path(
-            &self.entry.command,
-            &self.home,
-            env_path
-                .map(|(_, v)| std::ffi::OsStr::new(v))
-                .or(inherited.as_deref()),
-        )?;
+        let exe = aproxy_ipc::program::resolve(&self.entry.command, &self.home, &self.entry.env)
+            .ok_or(Fault::Spawn)?;
         let id = {
             let mut ids = self.ids.lock().unwrap();
             let id = (0..)

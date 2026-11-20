@@ -19,6 +19,7 @@ pub mod diag;
 pub mod endpoint;
 pub mod home;
 pub mod ledger;
+pub mod program;
 pub mod redact;
 
 /// 本包的版本。与 aproxy 同号发版，台账条目的 `version` 字段写的就是它。

@@ -21,20 +21,10 @@ pub(super) struct ChildPeer {
 impl ChildPeer {
     /// 不经过 shell。私有参数与子进程的 stderr 都不出现在试跑的诊断中。
     pub fn start(entry: &FormatEntry, dir: &Path) -> Result<Self, String> {
-        let command = Path::new(&entry.command);
-        let cmd = if command.is_relative() && command.components().count() > 1 {
-            dir.join(command)
-                .canonicalize()
-                .map_err(|_| "无法定位外部程序")?
-        } else {
-            command.to_owned()
-        };
+        let cmd = aproxy_ipc::program::resolve(&entry.command, dir, &entry.env)
+            .ok_or("无法定位外部程序")?;
         let mut child = Command::new(cmd)
-            .current_dir(if dir.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                dir
-            })
+            .current_dir(dir)
             .args(&entry.args)
             .envs(&entry.env)
             .stdin(Stdio::piped())

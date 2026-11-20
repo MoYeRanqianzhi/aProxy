@@ -788,6 +788,11 @@ fn route_drops_cross_origin_query_except_listed_parameters() {
             "carry_query=['view']",
             "https://b.test/base/chat?view=a&view=b",
         ),
+        (
+            "https://b.test/base?view=fixed",
+            "carry_query=['view']",
+            "https://b.test/base/chat?view=fixed",
+        ),
     ] {
         std::fs::write(
             &file,

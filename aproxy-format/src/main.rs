@@ -69,7 +69,7 @@ impl<'a> Options<'a> {
 }
 impl Role {
     /// 握手前完成静态配置检查，不会用半套配置处理请求。
-    fn load(name: &str, args: &[String]) -> Result<Self, &'static str> {
+    fn load(name: &str, args: &[String]) -> Result<Self, String> {
         let opt = Options::parse(args)?;
         if name == "convert" {
             return Ok(Self::Convert(match (opt.config, opt.from, opt.to) {
@@ -79,11 +79,11 @@ impl Role {
                     c
                 }
                 (None, Some(f), Some(t)) => convert::Convert::new(f, t)?,
-                _ => return Err("convert 需指定 --config 或 --from 与 --to"),
+                _ => return Err("convert 需指定 --config 或 --from 与 --to".into()),
             }));
         }
         if opt.from.is_some() || opt.to.is_some() {
-            return Err("此角色不接受协议参数");
+            return Err("此角色不接受协议参数".into());
         }
         Ok(match name {
             "heartbeat" => Self::Heartbeat(heartbeat::Heartbeat::load(opt.config)?),
@@ -99,7 +99,7 @@ impl Role {
                     "policy" => Self::Policy,
                     "adaptive" => Self::Adaptive,
                     "rewrite" => Self::Rewrite,
-                    _ => return Err(USAGE),
+                    _ => return Err(USAGE.into()),
                 }
             }
         })
@@ -269,7 +269,7 @@ const USAGE: &str =
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
-        Some((name, rest)) if name == "translate" => translate_once(rest),
+        Some((name, rest)) if name == "translate" => translate_once(rest).map_err(String::from),
         Some((name, rest)) => Role::load(name, rest).and_then(|role| {
             worker(
                 name,
@@ -277,8 +277,9 @@ fn main() {
                 std::io::stdin().lock(),
                 std::io::stdout().lock(),
             )
+            .map_err(String::from)
         }),
-        None => Err(USAGE),
+        None => Err(USAGE.into()),
     };
     if let Err(e) = result {
         eprintln!("aproxy-format: {e}");

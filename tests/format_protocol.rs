@@ -5782,7 +5782,11 @@ fn every_role_handshakes_alone_in_a_chain() {
             }
             _ => vec![name],
         };
-        let (_, out) = launch(&home, free_port(), &official_layer(name, stages, &args));
+        let mut layer = official_layer(name, stages, &args);
+        if name == "keys" {
+            layer.push_str("env={KEY='fixture-key'}\n");
+        }
+        let (_, out) = launch(&home, free_port(), &layer);
         assert!(out.status.success(), "{name}: {out:?}");
         let snapshot: Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(snapshot["instance"]["formats"][0]["protocol"], 1);

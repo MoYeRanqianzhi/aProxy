@@ -728,3 +728,30 @@ fn oversized_role_state_is_refused_during_configuration() {
         );
     }
 }
+
+/// 有一把可用钥匙不代表整个池健康；缺值、非法字符与代理无法转交的非 ASCII 必须在 hello 前报出变量名。
+#[test]
+fn key_pool_rejects_unusable_environment_values_before_hello() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("keys.toml");
+    std::fs::write(&file,"[[pool]]\norigin='https://a.test'\nheader='authorization'\nkeys=[{id='a',env='FORMAT_A'},{id='b',env='FORMAT_B'}]").unwrap();
+    for invalid in [None, Some(""), Some("private\r\nvalue"), Some("privateé")] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_aproxy-format"));
+        cmd.args(["keys", "--config", file.to_str().unwrap()])
+            .env("FORMAT_A", "first-private")
+            .env_remove("FORMAT_B");
+        if let Some(v) = invalid {
+            cmd.env("FORMAT_B", v);
+        }
+        let out = cmd.output().unwrap();
+        let error = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            !out.status.success()
+                && out.stdout.is_empty()
+                && error.contains("FORMAT_B")
+                && !error.contains("private"),
+            "status={}, {error}",
+            out.status
+        );
+    }
+}

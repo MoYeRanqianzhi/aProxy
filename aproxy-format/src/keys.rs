@@ -26,6 +26,9 @@ struct Key {
     id: String,
     /// 环境变量名，不是认证值。
     env: String,
+    /// 握手前验证并取好的出站值。只交给所选 origin 的请求头，不参与 state 或报告。
+    #[serde(skip)]
+    value: String,
     /// 加权轮转时的连续份额。
     #[serde(default = "one")]
     weight: u64,
@@ -59,18 +62,22 @@ pub struct Keys {
 }
 impl Keys {
     /// 在 hello 前检查份额总数、认证名与 origin 的唯一性。
-    pub fn load(path: &str) -> Result<Self, &'static str> {
+    pub fn load(path: &str) -> Result<Self, String> {
         let mut cfg: Self = config::load(path)?;
         let mut origins = std::collections::HashSet::new();
         if cfg.pool.is_empty() {
-            return Err("至少需要一个密钥池");
+            return Err("至少需要一个密钥池".into());
         }
         for pool in &mut cfg.pool {
             let url = config::endpoint(&pool.origin)?;
             if url.path() != "/" || url.query().is_some() || !origins.insert(url.origin()) {
-                return Err("密钥池的 origin 无效或重复");
+                return Err("密钥池的 origin 无效或重复".into());
             }
             pool.origin = url.origin().ascii_serialization();
+            for key in &mut pool.keys {
+                key.value = config::credential(&key.env, &pool.scheme)
+                    .map_err(|f| format!("环境变量 {:?}：{}", key.env, f.local))?;
+            }
             pool.header = config::credential_header(&pool.header)?.to_string();
             let origin_bytes = config::state_string_bytes(&pool.origin);
             if pool
@@ -78,7 +85,7 @@ impl Keys {
                 .iter()
                 .any(|k| origin_bytes + config::state_string_bytes(&k.id) + 3 > config::STATE_BYTES)
             {
-                return Err("密钥标识生成的状态超过 64 KiB");
+                return Err("密钥标识生成的状态超过 64 KiB".into());
             }
             let mut ids = std::collections::HashSet::new();
             if pool.keys.is_empty()
@@ -92,7 +99,7 @@ impl Keys {
                     .try_fold(0u64, |n, k| n.checked_add(k.weight))
                     .is_none()
             {
-                return Err("密钥池为空、标识重复或权重无效");
+                return Err("密钥池为空、标识重复或权重无效".into());
             }
         }
         Ok(cfg)
@@ -138,7 +145,7 @@ impl Keys {
                 }
             })
             .expect("已验证非空且权重总和有效");
-        headers.insert(p.header.clone(), config::credential(&key.env, &p.scheme)?);
+        headers.insert(p.header.clone(), key.value.clone());
         p.cursor = (p.cursor % total + 1) % total;
         let mut patch = w::RequestPatch::new();
         patch.headers = Some(headers);

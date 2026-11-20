@@ -94,8 +94,12 @@ pub fn credential(env: &str, scheme: &str) -> Result<String, Fault> {
     } else {
         format!("{scheme} {key}")
     };
-    http::HeaderValue::from_str(&value)
-        .map_err(|_| Fault::new("鉴权头的值无效", "invalid authentication header value"))?;
+    if !http::HeaderValue::from_str(&value).is_ok_and(|h| h.to_str().is_ok()) {
+        return Err(Fault::new(
+            "鉴权头的值无效",
+            "invalid authentication header value",
+        ));
+    }
     Ok(value)
 }
 

@@ -143,21 +143,37 @@ fn decode_one(encoding: &str, body: &[u8]) -> Option<Vec<u8>> {
 /// 流式解码：`input` 与 `output` 都按块处理，内存占用与 body 大小无关（调用方
 /// 对大 body 传文件读写端）。多层编码按逆序逐层解；identity 与空层跳过。
 /// 返回的 Err 是人类可读的原因，供日志与终态错误事件使用。
-pub fn decode_strict<'a, R: Read + 'a, W: std::io::Write>(
+pub fn decode_strict<R: Read, W: std::io::Write>(
     content_encoding: &str,
     input: R,
     output: &mut W,
     max_output: u64,
 ) -> Result<u64, String> {
-    use std::io::BufRead;
-    let mut reader: Box<dyn BufRead + 'a> = Box::new(std::io::BufReader::new(input));
-    let layers = content_encoding
-        .split(',')
+    let mut layers = content_encoding
+        .rsplit(',')
         .map(str::trim)
-        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("identity"))
-        .rev();
-    for layer in layers {
-        let decoded: Box<dyn Read + 'a> = match layer.to_ascii_lowercase().as_str() {
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("identity"));
+    if layers.clone().nth(4).is_some() {
+        return Err("content encoding exceeds four layers".into());
+    }
+    decode_layers(
+        &mut std::io::BufReader::new(input),
+        &mut layers,
+        output,
+        max_output,
+    )
+}
+
+/// 每层借用外层的读端。内层结束后再向外层取 EOF，校验它自己的校验和，而不是只排空原始运输流。
+fn decode_layers<'a>(
+    reader: &mut dyn std::io::BufRead,
+    layers: &mut dyn Iterator<Item = &'a str>,
+    output: &mut dyn std::io::Write,
+    max_output: u64,
+) -> Result<u64, String> {
+    use std::io::BufRead as _;
+    if let Some(layer) = layers.next() {
+        let decoded: Box<dyn Read + '_> = match layer.to_ascii_lowercase().as_str() {
             // MultiGz：多个 gzip member 首尾相接也是合法 gzip 流；每个 member 都
             // 校验尾部 CRC 与长度，截断即报错
             "gzip" | "x-gzip" => Box::new(flate2::bufread::MultiGzDecoder::new(reader)),
@@ -184,7 +200,16 @@ pub fn decode_strict<'a, R: Read + 'a, W: std::io::Write>(
             ),
             other => return Err(format!("不支持的 content-encoding「{other}」")),
         };
-        reader = Box::new(std::io::BufReader::new(decoded));
+        let mut wrapped = std::io::BufReader::new(decoded);
+        let written = decode_layers(&mut wrapped, layers, output, max_output)?;
+        if !wrapped
+            .fill_buf()
+            .map_err(|e| format!("invalid coding trailer: {e}"))?
+            .is_empty()
+        {
+            return Err("unexpected bytes after a coding layer".into());
+        }
+        return Ok(written);
     }
     // take(max+1)：多读 1 字节才能区分「恰好等于上限」与「已超限」
     let written = std::io::copy(&mut reader.take(max_output.saturating_add(1)), output)

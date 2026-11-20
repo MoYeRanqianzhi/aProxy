@@ -4750,7 +4750,15 @@ async fn forward_stream_can_open_before_the_client_finishes_its_upload() {
 #[tokio::test]
 async fn committed_replay_after_skipped_open_validates_all_codings_before_output() {
     use std::io::Write as _;
-    for case in ["bad-trailer", "separate-fields", "too-deep"] {
+    for (case, stream) in [
+        ("bad-trailer", true),
+        ("separate-fields", true),
+        ("bad-wrapper", true),
+        ("four", true),
+        ("too-deep", true),
+        ("four", false),
+        ("too-deep", false),
+    ] {
         let home = TestHome::new();
         let port = free_port();
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
@@ -4759,10 +4767,23 @@ async fn committed_replay_after_skipped_open_validates_all_codings_before_output
         let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
         let allow = gate.clone();
         let plain = b"data: validated-member\n\n".repeat(8192);
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        gz.write_all(&plain).unwrap();
-        let mut raw = gz.finish().unwrap();
-        if case == "bad-trailer" {
+        let mut raw = plain.clone();
+        if case == "bad-wrapper" {
+            let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            z.write_all(&raw).unwrap();
+            raw = z.finish().unwrap();
+        }
+        let count = match case {
+            "too-deep" => 5,
+            "four" => 4,
+            _ => 1,
+        };
+        for _ in 0..count {
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            gz.write_all(&raw).unwrap();
+            raw = gz.finish().unwrap();
+        }
+        if matches!(case, "bad-trailer" | "bad-wrapper") {
             let crc = raw.len() - 8;
             raw[crc] ^= 1;
         }
@@ -4776,8 +4797,11 @@ async fn committed_replay_after_skipped_open_validates_all_codings_before_output
                 if case == "separate-fields" {
                     response = response.header("content-encoding", "identity");
                 }
-                if case == "too-deep" {
-                    response = response.header("content-encoding", "gzip,gzip,gzip,gzip");
+                if case == "bad-wrapper" {
+                    response = response.header("content-encoding", "deflate");
+                }
+                for _ in 1..count {
+                    response = response.header("content-encoding", "gzip");
                 }
                 response
                     .header("content-encoding", "gzip")
@@ -4786,9 +4810,11 @@ async fn committed_replay_after_skipped_open_validates_all_codings_before_output
             }
         });
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let cfg = String::from("[keepalive]\ntrigger='accept'\ninterval_secs=1\n")
-            + &layer(&home, "skip", "'stream'", &["bad-seq"])
-            + "breaker_failures=1\n";
+        let mut cfg = String::from("[keepalive]\ntrigger='accept'\ninterval_secs=1\n");
+        if stream {
+            cfg += &layer(&home, "skip", "'stream'", &["bad-seq"]);
+            cfg += "breaker_failures=1\n";
+        }
         let (client, url) = running(&home, port, &cfg);
         let res = client
             .get(url)
@@ -4802,7 +4828,7 @@ async fn committed_replay_after_skipped_open_validates_all_codings_before_output
             .bytes()
             .await
             .expect("must end as SSE, not a body I/O error");
-        if case == "separate-fields" {
+        if matches!(case, "separate-fields" | "four") {
             assert!(body.ends_with(&plain));
         } else {
             let body = std::str::from_utf8(&body).unwrap();

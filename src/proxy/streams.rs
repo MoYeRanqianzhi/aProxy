@@ -743,6 +743,27 @@ mod tests {
             "input destructor lost its runtime"
         );
     }
+    /// 内层 zlib 已产出全部明文也不能让损坏的外层 gzip 校验尾变成正常结束。
+    #[tokio::test]
+    async fn inner_deflate_eof_does_not_hide_a_damaged_outer_gzip() {
+        use std::io::Write as _;
+        let mut inner = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        inner.write_all(b"complete inner member").unwrap();
+        let mut outer = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        outer.write_all(&inner.finish().unwrap()).unwrap();
+        let mut bytes = outer.finish().unwrap();
+        let crc = bytes.len() - 8;
+        bytes[crc] ^= 1;
+        let input = futures_util::stream::iter([Ok(Bytes::from(bytes))]).boxed();
+        let mut flow = decode(input, "deflate, gzip".into(), 4096);
+        while let Some(item) = flow.next().await {
+            if let Err(end) = item {
+                assert_eq!(end.reason.code, "upstream_body_interrupted");
+                return;
+            }
+        }
+        panic!("corrupt outer coding produced clean EOF");
+    }
     /// 编码成员收完后 HTTP 仍可能断流；只有运输层的 EOF 才能让外层发送 close。
     #[tokio::test]
     async fn valid_deflate_member_does_not_hide_a_later_transport_error() {

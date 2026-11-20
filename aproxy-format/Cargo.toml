@@ -29,7 +29,7 @@ aproxy-envelope = { version = "0.2.0-alpha.3", path = "../aproxy-envelope" }
 # 跨 origin 与回程的凭据边界复用代理记录所用的头名判定，不能分别枚举。
 aproxy-ipc = { version = "0.2.0-alpha.3", path = "../aproxy-ipc" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 toml = "1"
 # 路由按解析后的 origin 隔离凭据，头名与头值先通过 HTTP 语法验证。
 url = "2"

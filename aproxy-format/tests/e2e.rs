@@ -810,6 +810,22 @@ fn credential_slots_require_history_protected_names() {
     }
 }
 
+/// 未编辑的整数与小数不得经 f64 舍入，删除中间成员也不能改变其他成员的顺序。
+#[test]
+fn rewrite_preserves_untouched_numbers_and_member_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("rewrite.toml");
+    std::fs::write(&file, "remove=['/drop']\n[set]\n'/edited'='new'").unwrap();
+    let mut w = Worker::new(&["rewrite", "--config", file.to_str().unwrap()]);
+    let mut m = request("https://a.test/", "/", Value::Null);
+    let original = r#"{"z":184467440737095516161111,"drop":0,"f":0.123456789012345678901,"edited":"old","a":{"z":7,"b":2}}"#;
+    m["request"]["body"] = original.into();
+    assert_eq!(
+        w.frame(m)["request"]["body"],
+        original.replace("\"drop\":0,", "").replace("old", "new")
+    );
+}
+
 /// 即使语法合法，代理不会转交的头也不能作认证或改写的赋值目标。
 #[test]
 fn managed_header_slots_fail_before_hello() {

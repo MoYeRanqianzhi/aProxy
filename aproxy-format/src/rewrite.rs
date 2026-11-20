@@ -177,7 +177,8 @@ fn edit(body: &mut Value, path: &str, value: Option<&Value>) -> Result<bool, Fau
                     Ok(true)
                 }
             } else {
-                Ok(map.remove(&key).is_some())
+                // 移除目标不能把最后一个成员交换到中间；其余兄弟仍按客户端顺序发送。
+                Ok(map.shift_remove(&key).is_some())
             }
         }
         Some(Value::Array(items)) => {

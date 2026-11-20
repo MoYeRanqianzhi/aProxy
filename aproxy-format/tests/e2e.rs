@@ -637,3 +637,27 @@ fn dispatch_rejects_stages_not_in_the_configured_hello() {
     assert_eq!(r["fail"]["reason"], "unsupported stage");
     assert!(r.get("response").is_none());
 }
+
+/// 非标准端点没有协议先验，Messages 与 Chat 都接受的形态不能得到凑巧正确的回程。
+#[test]
+fn auto_detect_refuses_overlapping_message_shapes_on_custom_paths() {
+    let mut worker = Worker::new(&["convert", "--from", "auto", "--to", "openai_chat"]);
+    let body = json!({"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":12});
+    for ambiguous in [
+        body.clone(),
+        json!({"model":"m","messages":[],"input":"hi"}),
+    ] {
+        let r = worker.frame(request("https://a.test/custom", "/custom", ambiguous));
+        assert_eq!(
+            r["fail"]["reason"], "unknown client protocol; specify --from",
+            "{r}"
+        );
+    }
+    for (path, state) in [
+        ("/v1/messages", "anthropic_messages"),
+        ("/v1/chat/completions", "openai_chat"),
+    ] {
+        let r = worker.frame(request("https://a.test/custom", path, body.clone()));
+        assert_eq!(r["state"], state);
+    }
+}

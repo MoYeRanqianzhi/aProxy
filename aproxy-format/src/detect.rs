@@ -11,20 +11,25 @@ use switchyard_translation::WireFormat;
 /// （不猜——调用方输出 error 行）。
 pub fn detect_request(body: &Value) -> Option<WireFormat> {
     let obj = body.as_object()?;
-    // Anthropic Messages：system + messages + max_tokens 三特征
-    if obj.contains_key("system") && obj.contains_key("messages") && obj.contains_key("max_tokens")
-    {
-        return Some(WireFormat::AnthropicMessages);
-    }
-    // OpenAI Responses：input / instructions 是其独有入口字段
+    // Responses 的入口与 messages 互斥；混用两种形态不能用检查顺序决定回程。
     if obj.contains_key("input") || obj.contains_key("instructions") {
-        return Some(WireFormat::OpenAiResponses);
+        return (!obj.contains_key("messages")).then_some(WireFormat::OpenAiResponses);
     }
-    // OpenAI Chat：messages + model（且未被上两者命中）
-    if obj.contains_key("messages") {
-        return Some(WireFormat::OpenAiChat);
+    let messages = obj.get("messages")?.as_array()?;
+    obj.get("model")?.as_str()?;
+    // 顶层 system 是 Messages 的标志；Chat 的 system/developer/tool 在消息列表中。
+    let chat_role = messages.iter().any(|m| {
+        matches!(
+            m["role"].as_str(),
+            Some("system" | "developer" | "tool" | "function")
+        )
+    });
+    if obj.contains_key("system") {
+        return (obj.contains_key("max_tokens") && !chat_role)
+            .then_some(WireFormat::AnthropicMessages);
     }
-    None
+    // Messages 要求 max_tokens，Chat 也允许相同字段；只有共有字段时请调用方显式给协议。
+    (!obj.contains_key("max_tokens") || chat_role).then_some(WireFormat::OpenAiChat)
 }
 
 /// SSE 流的形态粗判：content-type 判定不可得时按 data: 行形态。

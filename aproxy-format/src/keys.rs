@@ -71,9 +71,7 @@ impl Keys {
                 return Err("密钥池的 origin 无效或重复");
             }
             pool.origin = url.origin().ascii_serialization();
-            pool.header = http::HeaderName::from_bytes(pool.header.as_bytes())
-                .map_err(|_| "鉴权头名称无效")?
-                .to_string();
+            pool.header = config::credential_header(&pool.header)?.to_string();
             let mut ids = std::collections::HashSet::new();
             if pool.keys.is_empty()
                 || pool

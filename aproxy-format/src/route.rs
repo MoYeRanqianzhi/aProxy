@@ -98,7 +98,7 @@ impl Route {
                 return Err("渠道标识为空或重复");
             }
             if let Some(h) = &c.auth_header {
-                http::HeaderName::from_bytes(h.as_bytes()).map_err(|_| "鉴权头名称无效")?;
+                config::credential_header(h)?;
             }
         }
         Ok(cfg)

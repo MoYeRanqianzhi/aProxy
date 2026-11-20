@@ -52,6 +52,15 @@ pub fn strip_credentials(h: &mut Headers) {
     h.retain(|name, _| !aproxy_ipc::redact::is_secret_header(name));
 }
 
+/// 配置指定的凭据头既要能写入 HTTP 请求，也要能在请求历史里仅凭头名就被脱敏。
+pub fn credential_header(name: &str) -> Result<http::HeaderName, &'static str> {
+    let header = http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| "鉴权头名称无效")?;
+    if !aproxy_ipc::redact::is_secret_header(header.as_str()) {
+        return Err("鉴权头必须使用请求历史会脱敏的名称");
+    }
+    Ok(header)
+}
+
 /// 凭据取自用户指名的环境变量，只进入将发给上游的请求头。
 pub fn credential(env: &str, scheme: &str) -> Result<String, Fault> {
     if env.is_empty() || env.contains(['=', '\0']) {

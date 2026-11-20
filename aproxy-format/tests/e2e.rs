@@ -529,3 +529,33 @@ fn credential_headers_do_not_cross_role_boundaries() {
     let r = worker.frame(m);
     assert_eq!(r["response"]["headers"], json!({"x-keep":"ok"}));
 }
+
+/// 环境凭据只能放进历史与日志都会脱敏的槽位，错误不回显配置里的值。
+#[test]
+fn credential_slots_require_history_protected_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("config");
+    for (role, toml) in [
+        (
+            "keys",
+            "[[pool]]\norigin='https://a.test'\nheader='x-access-code'\nkeys=[{id='a',env='FORMAT_A'}]",
+        ),
+        (
+            "route",
+            "[[channel]]\nid='b'\nurl='https://b.test'\nauth_header='X-Access-Code'\ncredential_env='FORMAT_A'",
+        ),
+    ] {
+        std::fs::write(&file, toml).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+            .args([role, "--config", file.to_str().unwrap()])
+            .env("FORMAT_A", "fixture-private")
+            .output()
+            .unwrap();
+        let error = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            !out.status.success() && out.stdout.is_empty() && error.contains("脱敏"),
+            "{role}: {error}"
+        );
+        assert!(!error.contains("fixture-private"));
+    }
+}

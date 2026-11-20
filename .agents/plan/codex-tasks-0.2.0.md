@@ -20,9 +20,11 @@
 
 | 任务 | 做什么 | 状态（2026-11-20） |
 |---|---|---|
-| t06-format | format 一线到 alpha.4：九个阶段（B10a、B10b、B10c、B10d、B11、W2c 的四段） | 第一段到第五段（B10a、B10b decide、B10c stream 与 forward 过链、B10d 按请求选投递方式与 notify、B11 官方 aproxy-format 改说协议 1 并删去旧信封）做完，gate 过了，第六段（W2c：convert 的流式转换与 heartbeat，连同第四、第五段审查的修复）也做完，gate 过了，都已挑进 master 并推送；第七段（W2c：keys、route、rewrite，含混合渠道的协议选择）在做。原会话 2026-11-20 被接口报错打断且续不上，换了新会话接手（Revision 17） |
+| t06-format | format 一线到 alpha.4：九个阶段（B10a、B10b、B10c、B10d、B11、W2c 的四段） | 第一段到第五段（B10a、B10b decide、B10c stream 与 forward 过链、B10d 按请求选投递方式与 notify、B11 官方 aproxy-format 改说协议 1 并删去旧信封）做完，gate 过了，第六段（W2c：convert 的流式转换与 heartbeat，连同第四、第五段审查的修复）与第七段（W2c：keys、route、rewrite，含混合渠道的协议选择）也做完，gate 过了，都已挑进 master 并推送；第八段（W2c：policy、adaptive、按请求覆盖）在做。第六段合入后 main 的四个门槛任务红在守卫测试上（轻量 gate 没跑它），已要求立刻修（任务书 Revision 23）。原会话 2026-11-20 被接口报错打断且续不上，换了新会话接手（Revision 17） |
 | p01-perf-hw1 | 在服务器上给 0.2.0-alpha.3 与 0.1.0 测性能基线，交出能重跑的测量脚本 | S1（启动）、S2（静默）测完，在做 S3（低并发）。原会话 2026-11-20 被接口报错打断且续不上，换了新会话接手（任务书 Revision 2）；服务器上的测量没有中断 |
-| v14、v15 | 审查第六段：convert 的流式转换与 heartbeat，以及第四、第五段审查（Revision 19、21）之后的全部修复 | 2026-11-20 派出 |
+| v16 | 审查第七段：keys 的冷却与粘性、route 的选择与故障切换、convert 的 `to = "auto"`、rewrite | 2026-11-20 派出 |
+| v15 | 逐条复核第四、第五段审查（Revision 19、21）之后的全部修复 | 2026-11-20 派出，还在跑 |
+| v14 | 审查第六段：convert 的流式转换与 heartbeat | 做完；结论已写进 t06 的 Revision 23 |
 | v01 到 v13 | 审查第一段到第五段 | 做完；结论已写进 t06 的 Revision 4、5、8、10、13、19、21 |
 
 ## 排好的任务（按先后）

@@ -46,7 +46,12 @@ Responses 要求先有 `response.created`。SSE 注释、协议原生的 ping �
 也看 SDK 最后攒出来的响应，不能只看 JSON 合不合法。同样，decide 的预览说的是解码后的字节，重试带的头说的是上游原来的头：
 一个 gzip 的失败响应，不该因为有 decide 程序看过它，就丢了 `content-encoding` 与长度。
 
-**Evidence:** `aproxy-format/tests/sdk/check_streams.py`；`tests/format_protocol.rs` 的
+完整上传的摘要认的是同一个请求的重放，不是跨轮的同一段对话。要让同一段对话落在同一个渠道与 key 上（提示缓存的亲和），
+route 与 keys 各自用稳定的用户文本前缀，前缀本身不保留。429 记在失败那次尝试的 `state` 里的 origin 与 key 上，
+不是记在已经为下一次尝试选好的去向上。
+
+**Evidence:** `tests/format_protocol.rs` 的 `official_keys_cool_the_previous_key_on_429`、
+`full_config_roundtrip_routes_mixed_protocols_and_reconverts_on_failover`；`aproxy-format/tests/sdk/check_streams.py`；`tests/format_protocol.rs` 的
 `retry_last_response_carries_each_upstream_head_without_the_body`；`aproxy-format/tests/e2e.rs` 的 `cross_format_response_conversion_end_to_end`；`tests/format_protocol.rs` 的
 `sample_chain_of_section_7_2_runs_end_to_end`、`retry_last_response_omitted_after_chain_and_connect_failures`；
 `tests/history_integration.rs` 的 `forwarded_requests_are_recorded_as_they_stream`；`tests/format_protocol.rs` 的

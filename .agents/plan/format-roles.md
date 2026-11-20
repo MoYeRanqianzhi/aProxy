@@ -4,8 +4,9 @@ W2c 的设计稿：`aproxy-format <角色>` 每个子命令做什么、要哪些
 协议一侧的契约在 [w2-contracts](w2-contracts.md) 的 §10（各角色用到的阶段见 §10.14）；这里只写角色自己的行为。
 由 Codex 在 t06 第五段起草（2026-11-20），主代理改写成中文；实现分在 t06 的第五到第九段。
 
-**现状（2026-11-20，第六段做完）**：各角色的协议 1 入口，三种协议之间请求、响应与流式的转换，Messages 的原生心跳，
-基本的 key 轮换与按模型路由已经实现。下面写到的冷却、粘性、决策与工具子命令属于之后几段，起步的骨架还不都接受这些配置。
+**现状（2026-11-20，第七段做完）**：各角色的协议 1 入口，三种协议之间请求、响应与流式的转换（含混合渠道），
+Messages 的原生心跳，带冷却与粘性的 key 选择，带权重、优先级与故障切换的渠道选择，改头与 JSON Pointer 的改写，都已经实现。
+下面写到的决策规则、adaptive 的学习与工具子命令属于之后两段。
 
 ## 共同约定
 
@@ -39,7 +40,22 @@ to = "openai_chat"
 - **阶段**：request 与 retry（请求体 `full`）、response、stream。一个条目在 response 与 stream 里只订一个。
   不参与 decide 与 notify。
 - **认协议**：`from = "auto"` 时按原始的客户端路径与体逐个请求判断；判断不了就拒绝，不悄悄交付错的形状。
-  上游与客户端协议不同时，`to` 必须写明。
+  `to` 写明时，每个请求都用这个上游协议。
+- **混合渠道**（`to = "auto"`）：把 convert 排在 route 之后，并让它也声明 retry。上游协议按请求每次到达 convert 时的去向定：
+  先查配置里的 `[[upstream]]` 表（`origin`、可选的 `path_prefix`、`protocol`），按归一化的 origin 加上按路径段对齐的最长前缀匹配；
+  没有匹配的再看标准端点的路径后缀；都定不了就拒绝，不猜。
+
+  ```toml
+  from = "auto"
+  to = "auto"
+  [[upstream]]
+  origin = "https://relay.example.com"
+  path_prefix = "/anthropic"
+  protocol = "anthropic_messages"
+  ```
+
+  `state` 里存的是「客户端协议、上游协议」这一对，缓冲的与流式的回程都照它转，落在别的 worker 上也一样。不读 route 的状态。
+  两端都写明的、只订响应方向的配置照旧可用，不需要 `state`。
 - **回程**：认出的客户端协议记在 `state` 里（不塞进体），配置的上游协议是另一半。响应方向转回 `state` 记的协议，
   不从上游的响应体去猜。只订了请求方向的条目不转响应，这是有意的。
 - 保留现有的非流式转换与同协议直通。回给客户端的响应补丁里去掉上游的凭据头。报告只写协议名，不写内容。
@@ -83,13 +99,19 @@ keys = [{ id = "a", env = "RELAY_A", weight = 2 }, { id = "b", env = "RELAY_B", 
     不轮换，也记不到那次失败。要让每次失败都记账，就让 policy 表态 `reroute:true`。
   - 可用性、轮换位置与粘性都只在一个进程里：池子大于 1 时，一个 worker 冷却掉的 key 另一个 worker 还会选。
     所以 `init` 给 keys 生成 `pool_max = 1`、persistent、不因闲置回收（与 adaptive 一样）。worker 重启之后没有冷却记录。
-- **粘性**：在可用的 key 里按对话的稳定前缀的哈希选；不保留对话内容；让位于冷却。
+- **冷却多久**：取配置的间隔与 `Retry-After`（秒数或 HTTP 日期都认）里较长的那个。记在上一次尝试用的那个 origin 与 key 上
+  （从 `state` 里认），不是下一次要去的去向。池里的 key 都在冷却时，这次尝试以可重试的 `fail` 结束，不拿冷却中的凭据去发。
+- **选法**：`random` 是均匀的；`weighted` 的轮换按连续的份额数，不展开成一张表。
+- **粘性**：取第一条用户文本的前 4096 个 UTF-8 字节算 SHA-256，用摘要的前 8 个字节（大端）当票，在可用的 key 里选。
+  文本直接是字符串、或包在各协议标准的文本块里，得到的票相同；没有可用的文本就退回普通的选法。
+  不保留对话内容；让位于冷却。用完整请求体的摘要不行：它认的是同一个请求的重放，对话每多一轮就变了。
 
 ## route
 
 `aproxy-format route --config route.toml`：
 
 ```toml
+sticky = false
 [aliases]
 small = "provider-small"
 [[channel]]
@@ -99,6 +121,7 @@ models = [{ exact = "provider-small" }, { prefix = "team-" }, { regex = "^chat-[
 priority = 1
 weight = 2
 preserve_path = false
+carry_query = [] # 跨 origin 时允许带过去的查询参数名
 credential_env = "PRIMARY_KEY"
 auth_header = "x-api-key"
 [channel.overrides]
@@ -111,6 +134,9 @@ model = "small"
 
 - **阶段**：request 与 retry，请求体 `full`。不对 decide 表态，不订 notify。
 - **选渠道**：先把模型别名换成真名，再匹配渠道；在优先级最高（数字最小）的可用组里选，同级按权重。
+  - 每个请求有一张票：`sticky = true` 时是与 keys 同一种算法的对话票（两边各算各的），否则是随机数。
+    票在每个匹配的优先级组里按权重定出起始渠道。
+  - 重跑时按配置顺序走完这一组里别的渠道，再到下一个优先级；所有匹配的去向都轮过一遍之后才回头。
 - **重试**：收到 retry 就是重试链真的在重跑，这时用上一次的渠道与 `last_failure` 做故障切换。
   `reroute:false` 时 aproxy 重发准备好的请求，任何角色都不该自己换。
 - **换上游时的凭据**：去向变了就去掉 authorization、API key、cookie 与代理凭据，哪怕后面还排着 keys。
@@ -120,7 +146,8 @@ model = "small"
 - **查询串**：同一个 origin 之内整段保留。跨 origin 时只带渠道的 `carry_query` 列出的参数名（默认一个都不带）：
   保持它们的顺序与重复值，不覆盖渠道 URL 里写死的参数。
 - **覆盖**：只回 hello 里列出的覆盖键。同一个键上，精确匹配原始模型的规则压过所选渠道的默认值。
-- **状态与报告**：原始模型与选中的渠道 ID 记进 `state`；报告写路由与模型映射，不写凭据，也不写带 userinfo 的 URL。
+- **状态与报告**：选中的渠道 ID、原始别名（没有就是 null）与票记进 `state`，换了 worker 也接着原来的顺序走；
+  最坏情况下编码后的长度在握手之前就检查。报告写路由与模型映射，不写凭据，也不写带 userinfo 的 URL。
 - **把别名换回来**：配了别名时，另外提供一个可选的 response 订阅（要缓冲响应）。只有上游回的是映射后的那个模型名时，
   才换回 `state` 里记的原始别名，这样几个别名指向同一个模型时客户端看到的仍是它自己用的那个。
   真正流式的客户端不要订这个阶段。
@@ -190,6 +217,8 @@ models = { small = "provider-small" }
 - **阶段**：request 与 retry。配了体的指针或模型规则时请求体要 `full`，只改头时要 `none`。
   不需要请求内的状态、失败详情、decide 或 notify。
 - 没提到的字段不动。JSON Pointer 的转义与数组下标按规范解释；目标不存在与值是 JSON null 是两回事。
+- 顺序：先删，再设，最后做模型名的精确改名。设值时父节点必须已经存在；数组下标必须已经存在，`-` 表示追加。
+  删一个不存在的目标什么都不做；不能删根；对空指针设值就是换掉整个文档。
 - 报告写做了哪些操作，不写旧值与新值。
 
 ## heartbeat
@@ -241,8 +270,8 @@ event = "ping"
 ## 第五段审查之后定下的（2026-11-20）
 
 这些是对上文的修正。第六段已经实现、并且并进了上面各节的：凭据不跨去向的四条、convert 认客户端协议、`preserve_path`、
-别名只在 JSON 响应里换回、keys 握手前检查凭据、ID 上限、协议循环。还没实现的：convert 的 `to = "auto"` 与 route 的粘性
-（第七段），`try` 的两条（第九段）；它们的配置键由实现定，定了之后并进上面各节。
+别名只在 JSON 响应里换回、keys 握手前检查凭据、ID 上限、协议循环。第七段实现了 convert 的 `to = "auto"` 与 route 的粘性，
+也并进去了。还没实现的只剩 `try` 的两条（第九段）。
 
 - **凭据不跨去向**（convert、keys、route 共同）：
   - 去向变了，或把上游的响应交还客户端时，去掉的是全部「密钥头」（[w2-contracts](w2-contracts.md) §1.5 的名字规则，

@@ -1189,3 +1189,22 @@
   - **验证**（Codex 在 Windows 上跑的，217b578；这一段按任务书只跑轻量 gate）：`cargo fmt --all` 无改动；headless 的工作区 clippy
     零输出；锁定依赖的测试 841 通过、0 失败、2 忽略（时钟夹具的入口，由父测试驱动）。desktop 与 Linux 交叉的 clippy、
     全量测试留给下一次完整 gate 与 CI。
+  - **合入之后 main 红了**（CI 44718520924，四个门槛任务）：守卫测试 `every_aproxy_child_process_is_spawned_through_test_home`
+    拦下了这一段新加的两处测试代码（`format_protocol.rs` 里用 `Command::new(env!("CARGO"))` 构建官方角色、`cli_tree.rs` 里
+    自己给子进程设 `APROXY_HOME`）。轻量 gate 不含这个测试，所以没在本机发现；已要求 Codex 立刻修，并把它加进轻量 gate
+    （任务书 Revision 23）。同一轮 windows (desktop) 还红了旧测试 `restart_all_skips_failed_instance_and_exits_nonzero`
+    （实例刚起来、还没写下可重新拉起它的记录时就去重启），一并交给它查。
+- W2c 第二部分（2026-11-20，Codex 实现；提交「aproxy-format keys：随机轮换、按上游退避冷却与会话粘性」「aproxy-format route：
+  加权优先级、粘性渠道与重试切换」「aproxy-format convert 按路由后的目的端选择协议」「aproxy-format rewrite：按请求改头、
+  编辑 JSON 指针与模型名」）：keys、route、rewrite，以及混合渠道的协议选择。
+  - **keys**：冷却取配置的间隔与 `Retry-After`（秒数或 HTTP 日期）里较长的那个，记在失败那次尝试用的 origin 与 key 上，
+    哪怕下一次已经换了去向；都在冷却时这次尝试以可重试的失败结束，不拿冷却中的凭据去发。
+  - **粘性**：keys 与 route 各自用第一条用户文本的前缀算同一张票，不用完整请求体的摘要（那个认的是重放，对话每多一轮就变）。
+  - **route**：票在每个优先级组里按权重定出起始渠道；重跑时走完同组别的渠道再到下一个优先级，都轮过一遍才回头。
+  - **混合渠道**：convert 的 `to = "auto"` 按请求到达时的去向定上游协议（先查配置里的表，再看标准端点），两种协议都随请求走；
+    route 与 convert 不共享状态。旧版每个渠道各有协议的能力由此恢复。
+  - **rewrite**：只改头时不要请求体；JSON Pointer 的编辑先删、再设、最后改模型名，报告只写位置不写值。
+  - **实测**（真实的官方角色，本机上游）：两个去向在故障切换前后各自只见到自己的凭据；一条链把 Chat 请求重试成 Messages、
+    交回 Chat 的响应；一次 429 让 key 从 A 换到 B，下一个独立的请求仍用 B；12 组离线 SDK 解析都过。
+  - **验证**（Codex 在 Windows 上跑的，1843b58；轻量 gate）：`cargo fmt --all` 无改动；headless 的工作区 clippy 零输出；
+    锁定依赖的测试 854 通过、0 失败、2 忽略。

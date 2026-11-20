@@ -6009,6 +6009,47 @@ async fn adaptive_unavailable_falls_back_to_retry() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
 }
 
+/// 仅声明检查成功响应的规则会接到 200。错误藏在普通文本里，代理自己的兜底不会重试它。
+#[tokio::test]
+async fn official_policy_retries_a_200_with_an_error_marker() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let app = axum::Router::new().fallback(move || {
+        let i = seen.fetch_add(1, Ordering::Relaxed);
+        async move {
+            if i == 0 {
+                "local busy marker"
+            } else {
+                "complete"
+            }
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let file = home.path().join("policy.toml");
+    std::fs::write(
+        &file,
+        "[[rule]]\nid='busy'\nstatus=[200]\nbody_regex='busy marker'\ndecision='retry'\ndelay_ms=0",
+    )
+    .unwrap();
+    let cfg = official_layer(
+        "policy",
+        "'decide'",
+        &["policy", "--config", file.to_str().unwrap()],
+    );
+    let (c, url) = running(&home, up, &cfg);
+    assert_eq!(
+        c.get(url).send().await.unwrap().text().await.unwrap(),
+        "complete"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+}
+
 /// 同一链的 Chat 渠道能原样返回；它在第二种模型上失败后，另一租户收到重新生成的 Messages 请求。
 #[tokio::test]
 async fn full_config_roundtrip_routes_mixed_protocols_and_reconverts_on_failover() {

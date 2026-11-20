@@ -6,6 +6,7 @@ mod detect;
 mod events;
 mod heartbeat;
 mod keys;
+mod policy;
 mod rewrite;
 mod route;
 mod selection;
@@ -26,7 +27,7 @@ enum Role {
     /// 只在请求方向改写字段。
     Rewrite(rewrite::Rewrite),
     /// 只对尝试结果投票。
-    Policy,
+    Policy(policy::Policy),
     /// 按摘要决定 forward 或 retry，并接收完成通知。
     Adaptive,
     /// 只处理保活帧。
@@ -89,6 +90,7 @@ impl Role {
         }
         Ok(match name {
             "heartbeat" => Self::Heartbeat(heartbeat::Heartbeat::load(opt.config)?),
+            "policy" => Self::Policy(policy::Policy::load(opt.config)?),
             "rewrite" => Self::Rewrite(rewrite::Rewrite::load(opt.config)?),
             "keys" => Self::Keys(keys::Keys::load(opt.config.ok_or("keys 需要 --config")?)?),
             "route" => Self::Route(route::Route::load(
@@ -99,7 +101,6 @@ impl Role {
                     config::load::<Empty>(p)?;
                 }
                 match name {
-                    "policy" => Self::Policy,
                     "adaptive" => Self::Adaptive,
                     _ => return Err(USAGE.into()),
                 }
@@ -112,20 +113,20 @@ impl Role {
             Self::Convert(_) => &["request", "retry", "response", "stream"],
             Self::Keys(_) | Self::Rewrite(_) => &["request", "retry"],
             Self::Route(route) => route.stages(),
-            Self::Policy => &["decide"],
+            Self::Policy(_) => &["decide"],
             Self::Adaptive => &["request", "decide", "notify"],
             Self::Heartbeat(_) => &["heartbeat"],
         }
     }
     /// 订阅声明是上限；实例最终只向配置选中的阶段写帧。摘要协商不能退化为默认的 full。
-    fn hello(&self, name: &str) -> w::HelloReply {
+    fn hello(&self, name: &str, offer: &w::Hello) -> w::HelloReply {
         use w::BodyNeed::{Digest, Full, None};
         let needs: &[(&str, w::BodyNeed)] = match self {
             Self::Convert(_) | Self::Route(_) => &[("request", Full), ("retry", Full)],
             Self::Rewrite(r) if r.needs_body() => &[("request", Full), ("retry", Full)],
             Self::Keys(k) if k.sticky => &[("request", Full), ("retry", Full)],
             Self::Keys(_) | Self::Rewrite(_) => &[("request", None), ("retry", None)],
-            Self::Policy => &[("decide", None)],
+            Self::Policy(_) => &[("decide", None)],
             Self::Adaptive => &[("request", Digest), ("decide", None), ("notify", Digest)],
             Self::Heartbeat(_) => &[],
         };
@@ -134,6 +135,11 @@ impl Role {
             name.into(),
             env!("CARGO_PKG_VERSION").into(),
         );
+        if matches!(self,Self::Policy(p) if p.needs_success())
+            && offer.features.iter().any(|s| s == "decide.success")
+        {
+            reply.features.push("decide.success".into());
+        }
         reply.request_body = needs
             .iter()
             .map(|(s, v)| (s.to_string(), v.clone()))
@@ -168,7 +174,14 @@ impl Role {
                 Self::Convert(c) => c.stream(s, &mut r),
                 _ => Err(Fault::new("阶段不受支持", "unsupported stage")),
             },
-            w::Stage::Decide(_) if matches!(self, Self::Adaptive | Self::Policy) => Ok(()),
+            w::Stage::Decide(m) => match self {
+                Self::Policy(p) => {
+                    p.decide(m, &mut r);
+                    Ok(())
+                }
+                Self::Adaptive => Ok(()),
+                _ => Err(Fault::new("阶段不受支持", "unsupported stage")),
+            },
             w::Stage::Notify(_) if matches!(self, Self::Adaptive) => Ok(()),
             w::Stage::Heartbeat(h) => match self {
                 Self::Heartbeat(heartbeat) => {
@@ -262,7 +275,7 @@ fn worker(
             if !offer.protocols.contains(&1) {
                 return Err("不支持此协议版本");
             }
-            let hello = role.hello(name);
+            let hello = role.hello(name, &offer);
             // 正文可能经 base64 或 JSON 转义；纯元数据角色的最大项是 decide 的 1 MiB 解码预览。
             limit = if hello.request_body.values().any(|n| *n == w::BodyNeed::Full)
                 || hello

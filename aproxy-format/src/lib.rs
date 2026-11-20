@@ -335,12 +335,6 @@ fn worker(
 }
 /// 无信封的一次性协议转换。出错只给诊断类别，不回显含消息或密钥的原始输入。
 fn translate_once(args: &[String]) -> Result<(), &'static str> {
-    if matches!(args,[flag] if flag=="--help" || flag=="-h") {
-        println!(
-            "用法：aproxy-format translate --from <协议> --to <协议>\n从标准输入读取一个 JSON 请求，向标准输出写入转换结果，不启动代理。\n协议：anthropic_messages、openai_chat、openai_responses。代理链使用 convert 角色；验证配置用 check，试跑链用 try。"
-        );
-        return Ok(());
-    }
     let opt = Options::parse(args)?;
     let (None, Some(from), Some(to)) = (opt.config, opt.from, opt.to) else {
         return Err("用法: aproxy-format translate --from <协议> --to <协议>");
@@ -360,6 +354,71 @@ fn translate_once(args: &[String]) -> Result<(), &'static str> {
 }
 /// 角色命令只选一个职责；工具子命令不入协议循环。
 const USAGE: &str = "用法: aproxy-format <convert|keys|route|policy|adaptive|rewrite|heartbeat|init|check|try|translate> [参数]";
+/// 同一入口处理帮助，不触碰配置或标准流协议；示例可独立阅读，不要求先启动实例。
+fn help(name: &str) -> Result<(), String> {
+    let (usage, options, example) = match name {
+        "convert" => (
+            "(--from 客户端协议 --to 上游协议 | --config 文件)",
+            "--from、--to 选择两端协议，可用 auto；--config 改用 TOML 指定协议与转换预算。",
+            "--from anthropic_messages --to openai_chat",
+        ),
+        "translate" => (
+            "--from 源协议 --to 目标协议",
+            "--from、--to 可用 anthropic_messages、openai_chat、openai_responses。从标准输入读取一个 JSON 请求，向标准输出写入转换结果。代理链使用 convert，验证用 check，试跑用 try。",
+            "--from openai_chat --to openai_responses < request.json",
+        ),
+        "keys" => (
+            "--config 文件",
+            "--config 指定密钥池、来源及环境变量名。",
+            "--config keys.toml",
+        ),
+        "route" => (
+            "--config 文件",
+            "--config 指定渠道、模型匹配与重试选路规则。",
+            "--config route.toml",
+        ),
+        "rewrite" => (
+            "[--config 文件]",
+            "--config 指定模型、请求头和 JSON 字段的改写规则。",
+            "--config rewrite.toml",
+        ),
+        "heartbeat" => (
+            "[--config 文件]",
+            "--config 指定保活帧的样式。",
+            "--config heartbeat.toml",
+        ),
+        "adaptive" => (
+            "[--config 文件]",
+            "--config 指定故障阈值与恢复条件。",
+            "--config adaptive.toml",
+        ),
+        "policy" => (
+            "[--config 文件]",
+            "--config 指定尝试结束时的判定规则。",
+            "--config policy.toml",
+        ),
+        "init" => (
+            "场景 --output 目录",
+            "--output 指定输出目录，不覆盖已有文件。场景：claude-relay、key-rotation、openrouter、adaptive-relay。",
+            "key-rotation --output relay",
+        ),
+        "check" => (
+            "代理配置 [--home 目录] 或 check 角色 --config 文件 [--home 目录]",
+            "--config 指定单个角色文件；--home 指定实例工作目录。未指定时，链内相对路径以代理配置所在目录为准。只检查结构，不验证密钥是否可用。",
+            "proxy.toml --home instance",
+        ),
+        "try" => (
+            "代理配置 --request 样例 [--home 目录] [--allow-external]",
+            "--request 指定 JSON 请求与模拟上游结果；--home 指定实例工作目录。试跑工具自身不打开网络连接。--allow-external 启动第三方程序，它会收到样例和环境变量，能任意使用它们，包括访问网络。",
+            "proxy.toml --request sample.json --home instance",
+        ),
+        _ => return Err(USAGE.into()),
+    };
+    println!(
+        "用法：aproxy-format {name} {usage}\n{options}\n-h、--help 显示本说明。\n示例：aproxy-format {name} {example}"
+    );
+    Ok(())
+}
 /// 失败诊断始终写 stderr，不破坏 stdout 上的逐行协议。
 pub fn run() {
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -367,6 +426,13 @@ pub fn run() {
         Some((name, [])) if name == "--help" || name == "-h" => {
             println!("{USAGE}");
             Ok(())
+        }
+        Some((name, rest))
+            if rest
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--help" | "-h")) =>
+        {
+            help(name)
         }
         Some((name, rest)) if matches!(name.as_str(), "init" | "check" | "try") => {
             tools::run(name, rest)

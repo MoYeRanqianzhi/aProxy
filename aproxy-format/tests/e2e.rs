@@ -2489,3 +2489,45 @@ fn init_explains_files_and_generates_editable_toml() {
             .contains("# ")
     );
 }
+
+/// 两种帮助拼写都必须先于角色配置与标准输入，退出码、输出通道和选项说明都属于 CLI 契约。
+#[test]
+fn all_commands_explain_options_and_an_example_before_io() {
+    for cmd in [
+        "convert",
+        "keys",
+        "route",
+        "rewrite",
+        "policy",
+        "adaptive",
+        "heartbeat",
+        "init",
+        "check",
+        "try",
+        "translate",
+    ] {
+        for flag in ["--help", "-h"] {
+            let out = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+                .args([cmd, "--config", "does-not-exist", flag])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success() && out.stderr.is_empty(),
+                "{cmd}: {out:?}"
+            );
+            let text = String::from_utf8(out.stdout).unwrap();
+            for term in ["用法", "示例", cmd, "--help"] {
+                assert!(text.contains(term), "{cmd}: {text}");
+            }
+            for term in match cmd {
+                "init" => vec!["--output"],
+                "check" => vec!["--config", "--home"],
+                "try" => vec!["--request", "--home", "--allow-external", "网络"],
+                "translate" | "convert" => vec!["--from", "--to"],
+                _ => vec!["--config"],
+            } {
+                assert!(text.contains(term), "{cmd}: {text}");
+            }
+        }
+    }
+}

@@ -700,7 +700,9 @@ pub(super) fn run(
     external: bool,
 ) -> Result<(), String> {
     if external {
-        eprintln!("注意：外部程序会收到样例和环境变量；只运行你信任的程序。");
+        eprintln!(
+            "注意：试跑工具自身不打开网络连接。外部程序会收到样例和环境变量，能任意使用它们，包括访问网络；只运行你信任的程序。"
+        );
     }
     let input = tools::offline_read(sample)?;
     let sample: Sample =

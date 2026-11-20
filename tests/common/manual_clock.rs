@@ -198,7 +198,8 @@ async fn serve() {
                 listener,
                 router,
                 async move {
-                    stopped.wait_for(|v| *v).await.unwrap();
+                    // 普通时钟夹具通过控制管道 EOF 收场，IPC 发送端也会随之关闭。
+                    let _ = stopped.wait_for(|v| *v).await;
                 }
                 .shared(),
             )

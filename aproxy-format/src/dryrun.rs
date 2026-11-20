@@ -936,13 +936,17 @@ fn rehearse(
             req.headers.insert(key.as_str().into(), v.clone());
         }
     }
-    let accept = req.headers.get("accept").is_some_and(|v| {
-        v.split(',').any(|s| {
-            s.split(';')
-                .next()
-                .is_some_and(|t| t.trim().eq_ignore_ascii_case("text/event-stream"))
-        })
-    });
+    let accept = sample
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("accept"))
+        .is_some_and(|(_, v)| {
+            v.split(',').any(|s| {
+                s.split(';')
+                    .next()
+                    .is_some_and(|t| t.trim().eq_ignore_ascii_case("text/event-stream"))
+            })
+        });
     let streaming = match chain
         .config
         .keepalive
@@ -1053,18 +1057,44 @@ fn rehearse(
         )?;
         return Ok(());
     }
+    let mut committed_beat: Option<String> = None;
     for (index, attempt) in sample.attempts.into_iter().enumerate() {
         let n = index as u32 + 1;
-        if sample.heartbeat && streaming {
-            t.heartbeat(
-                n,
-                chain
-                    .config
-                    .keepalive
-                    .heartbeat
-                    .as_deref()
-                    .unwrap_or(": keepalive\n\n"),
-            )?;
+        if sample.heartbeat && t.mode == "retry" {
+            // 首次提交后实例不再接受改变保活通道的覆盖，下一次尝试继续使用已提交的帧。
+            if committed_beat.is_none() {
+                let values = |leaf: &'static str| {
+                    t.units
+                        .iter()
+                        .rev()
+                        .filter_map(move |u| u.overrides.as_ref()?.get("keepalive")?.get(leaf))
+                };
+                let interval = values("interval_secs")
+                    .find_map(Value::as_u64)
+                    .or(chain.config.keepalive.interval_secs)
+                    .unwrap_or(15);
+                let eligible = values("trigger")
+                    .find_map(|v| match v.as_str()? {
+                        "always" => Some(true),
+                        "accept" => Some(accept),
+                        "body_stream" => Some(stream_body),
+                        "any" => Some(accept || stream_body),
+                        _ => None,
+                    })
+                    .unwrap_or(streaming);
+                if interval != 0 && eligible {
+                    committed_beat = Some(
+                        values("heartbeat")
+                            .find_map(Value::as_str)
+                            .or(chain.config.keepalive.heartbeat.as_deref())
+                            .unwrap_or(": keepalive\n\n")
+                            .into(),
+                    );
+                }
+            }
+            if let Some(text) = &committed_beat {
+                t.heartbeat(n, text)?;
+            }
         }
         if attempt.status.is_some_and(|s| !(100..=599).contains(&s))
             || (attempt.status.is_none() && attempt.failure.is_none())
@@ -1335,6 +1365,33 @@ mod tests {
         );
         assert!(matches!(result,Err(CliError::Unsimulated(ref s)) if s.contains("多层流")));
         assert!(!rows.iter().any(|r| r["stage"] == "result"));
+    }
+    /// 保活由当前交付模式和叠加后的配置决定；always 可启用非流式请求，零间隔不可被样例强行打开。
+    #[test]
+    fn sample_heartbeat_respects_mode_interval_and_request_overrides() {
+        let beat = "\n[[format]]\nname='h'\ncommand='aproxy-format'\nargs=['heartbeat']\nstages=['heartbeat']";
+        let route = "\n[[format]]\nname='r'\ncommand='aproxy-format'\nargs=['route','--config','routes']\nstages=['request']";
+        for (prefix, stream, enabled) in [
+            ("delivery='forward'", true, false),
+            ("keepalive.interval_secs=0", true, false),
+            ("", true, true),
+            (route, false, true),
+        ] {
+            let (result, rows) = trace_sample(
+                &(prefix.to_owned() + beat),
+                json!({"path":"/","body":{"stream":stream,"model":"demo"},"heartbeat":true,"attempts":[{"status":200}]}),
+                &[(
+                    "routes",
+                    "[[channel]]\nid='c'\nurl='https://test.invalid'\noverrides={'keepalive.trigger'='always'}",
+                )],
+            );
+            result.unwrap();
+            assert_eq!(
+                rows.iter().any(|r| r["stage"] == "heartbeat"),
+                enabled,
+                "{prefix}"
+            );
+        }
     }
     /// 规则按声明先后生效，不对没有上游头的故障套状态规则；覆盖、直通与成功分别说明来源。
     #[test]

@@ -37,7 +37,7 @@ url = "2"
 http = "1"
 regex = "1"
 # 粘性选择仅散列会话前缀；随机轮转和 Retry-After 使用现成的抽样与 HTTP 日期解析。
-sha2 = "0.10"
+sha2 = "0.11"
 rand = "0.10"
 httpdate = "1"
 

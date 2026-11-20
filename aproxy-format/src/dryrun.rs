@@ -770,7 +770,10 @@ fn rehearse(
         out,
         units: Vec::new(),
         dir: &chain.directory,
-        digest: format!("{:x}", Sha256::digest(&raw)),
+        digest: Sha256::digest(&raw)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
         client: json!({"path":sample.path,"stream":streaming}),
         mode: chain.config.delivery.unwrap_or(f::Delivery::Retry).as_str(),
         prefix: None,

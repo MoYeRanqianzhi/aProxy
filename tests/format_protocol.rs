@@ -5767,22 +5767,46 @@ async fn forward_redirect_bypasses_both_response_and_stream_programs() {
     }
 }
 
-/// 官方工作进程与代理是同一目标目录里的两个 workspace 二进制。
-fn official_binary() -> std::path::PathBuf {
-    let path = std::path::Path::new(common::APROXY)
-        .with_file_name(format!("aproxy-format{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        path.is_file(),
-        "先运行 cargo build -p aproxy-format: {}",
-        path.display()
-    );
-    path
+/// 普通根包测试会编译 example；定向测试也请 Cargo 核对指纹，文件存在并不能证明是本次源码。
+fn official_binary() -> &'static std::path::Path {
+    static BINARY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    BINARY.get_or_init(|| {
+        let profile_dir = std::path::Path::new(common::APROXY).parent().unwrap();
+        let profile = profile_dir.file_name().unwrap().to_str().unwrap();
+        let target = env!("APROXY_BUILD_TARGET");
+        let mut build = std::process::Command::new(env!("CARGO"));
+        build.current_dir(env!("CARGO_MANIFEST_DIR")).args([
+            "build",
+            "--offline",
+            "--locked",
+            "--example",
+            "format-official",
+            "--profile",
+            if profile == "debug" { "dev" } else { profile },
+        ]);
+        let mut target_dir = profile_dir.parent().unwrap();
+        if target_dir.file_name() == Some(std::ffi::OsStr::new(target)) {
+            build.args(["--target", target]);
+            target_dir = target_dir.parent().unwrap();
+        }
+        build.arg("--target-dir").arg(target_dir);
+        if !cfg!(feature = "desktop") {
+            build.arg("--no-default-features");
+        }
+        assert!(
+            build.status().unwrap().success(),
+            "official worker example build failed"
+        );
+        profile_dir
+            .join("examples")
+            .join(format!("format-official{}", std::env::consts::EXE_SUFFIX))
+    })
 }
 /// 配置真正的角色，不依赖 PATH 或机器上另装的版本。
 fn official_layer(name: &str, stages: &str, args: &[&str]) -> String {
     format!(
         "\n[[format]]\nname='{name}'\ncommand={}\nargs={}\nprocess='persistent'\npool_max=1\nworker_idle_secs=0\nstages=[{stages}]\n",
-        serde_json::to_string(&official_binary()).unwrap(),
+        serde_json::to_string(official_binary()).unwrap(),
         serde_json::to_string(args).unwrap()
     )
 }

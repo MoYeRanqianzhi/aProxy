@@ -175,6 +175,8 @@ windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Syst
 libc = "0.2"
 
 [dev-dependencies]
+# 官方角色只链接进测试用的 example，不进入发布的代理。
+aproxy-format = { path = "aproxy-format" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"

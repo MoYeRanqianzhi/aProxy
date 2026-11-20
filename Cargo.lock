@@ -103,6 +103,7 @@ version = "0.2.0-alpha.3"
 dependencies = [
  "aproxy-desktop",
  "aproxy-envelope",
+ "aproxy-format",
  "aproxy-ipc",
  "axum",
  "base64 0.22.1",

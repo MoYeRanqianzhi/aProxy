@@ -7150,3 +7150,25 @@ fn rehearsal_resumes_failed_request_layer_for_both_reroute_votes() {
         }
     }
 }
+
+/// 没声明粒度的外部程序在请求和重试获得完整正文，判定阶段沿用无正文默认值。
+#[test]
+fn rehearsal_omitted_body_need_matches_each_stage() {
+    let home = TestHome::new();
+    let chain = layer(&home, "sub", "'request','retry','decide'", &["noop"]);
+    let out = format_trial(
+        &home,
+        &chain,
+        serde_json::json!({"path":"/","body":"sample-bytes","attempts":[{"status":503},{"status":200}]}),
+    );
+    assert!(out.status.success(), "{out:?}");
+    let actual = frames(&home, "sub");
+    for stage in ["request", "retry", "decide"] {
+        let frame = actual.iter().find(|m| m["stage"] == stage).unwrap();
+        if stage == "decide" {
+            assert!(frame["request"].get("body").is_none());
+        } else {
+            assert_eq!(frame["request"]["body"], "sample-bytes");
+        }
+    }
+}

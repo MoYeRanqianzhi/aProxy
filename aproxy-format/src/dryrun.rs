@@ -184,8 +184,12 @@ impl Unit {
             self.connect(dir)?;
         }
         let need = self.hello.as_ref().and_then(|h| h.request_body.get(stage));
+        // 省略粒度时请求与重试为 full；观察阶段默认不接收正文。
+        let full = need.map_or(matches!(stage, "request" | "retry"), |v| {
+            *v == w::BodyNeed::Full
+        });
         if matches!(stage, "request" | "retry" | "decide")
-            && !matches!(need, Some(w::BodyNeed::Full))
+            && !full
             && let Some(r) = msg["request"].as_object_mut()
         {
             r.remove("body");

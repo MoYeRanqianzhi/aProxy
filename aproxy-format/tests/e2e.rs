@@ -959,7 +959,7 @@ fn stream_frame(w: &mut Worker, event: &str, bytes: &str) -> Value {
     if event == "data" {
         frame["data"] = bytes.into();
     } else if event == "abort" {
-        frame["reason"] = "upstream_body".into();
+        frame["reason"] = json!({"code":"upstream_body_interrupted"});
     }
     w.frame(frame)
 }
@@ -1081,4 +1081,52 @@ fn only_native_terminal_events_complete_a_stream() {
             .unwrap()
             .contains("\"error\"")
     );
+}
+
+/// 客户端看到工具完成后可以立即执行它；Messages 在原因帧与真正终点之间断开时不能先宣布成功。
+#[test]
+fn chat_finish_waits_for_messages_stop() {
+    let mut w = Worker::new(&[
+        "convert",
+        "--from",
+        "openai_chat",
+        "--to",
+        "anthropic_messages",
+    ]);
+    let corpus: Value = serde_json::from_str(include_str!("fixtures/protocols.json")).unwrap();
+    let events = corpus["anthropic_messages"]["events"].as_array().unwrap();
+    for cut in [true, false] {
+        open_stream(&mut w, "text/event-stream");
+        for e in &events[..events.len() - 1] {
+            let r = stream_frame(&mut w, "data", &format!("data: {e}\n\n"));
+            assert!(
+                !r["data"]
+                    .as_str()
+                    .unwrap()
+                    .contains("\"finish_reason\":\"tool_calls\"")
+            );
+        }
+        if cut {
+            let r = stream_frame(&mut w, "abort", "");
+            assert!(r["data"].as_str().unwrap().contains("\"error\""));
+        } else {
+            let r = stream_frame(
+                &mut w,
+                "data",
+                &format!("data: {}\n\n", events.last().unwrap()),
+            );
+            assert!(
+                r["data"]
+                    .as_str()
+                    .unwrap()
+                    .contains("\"finish_reason\":\"tool_calls\"")
+            );
+            assert!(
+                stream_frame(&mut w, "close", "")["data"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("data: [DONE]\n\n")
+            );
+        }
+    }
 }

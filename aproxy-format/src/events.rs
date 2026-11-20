@@ -32,6 +32,8 @@ pub(super) struct Events {
     terminal: bool,
     /// Chat 的 finish_reason 可能早于最后一个 usage 块；只保留原因，到 [DONE] 才交给编解码器。
     chat_finishes: Vec<Value>,
+    /// Messages 的 stop_reason 提示原因而不保证完整；转成 Chat 时，须等 message_stop 再把这一帧交给编码器。
+    message_finish: Option<Value>,
 }
 impl Events {
     /// 每次 open 初始化，不把上一条流的输出索引或 usage 带到下一条。
@@ -47,6 +49,7 @@ impl Events {
             first: true,
             terminal: false,
             chat_finishes: Vec::new(),
+            message_finish: None,
         }
     }
     /// 将已经完整的事件变成立即可交付的目标帧，不等待下一次 data 或 close。
@@ -132,6 +135,17 @@ impl Events {
                 Some("response.completed" | "response.incomplete" | "response.failed" | "error")
             ),
         } || event.get("error").is_some();
+        if self.source == F::AnthropicMessages && self.target == F::OpenAiChat {
+            if event["type"] == "message_delta" && event["delta"]["stop_reason"].is_string() {
+                self.message_finish = Some(event);
+                return Ok(());
+            }
+            if event["type"] == "message_stop"
+                && let Some(delta) = self.message_finish.take()
+            {
+                self.translate(&delta, output)?;
+            }
+        }
         self.translate(&event, output)
     }
     /// 已确认的源事件才进入语义层，目标端的终态不能早于源端的完成标志。

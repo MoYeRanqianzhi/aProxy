@@ -111,6 +111,26 @@ pub struct Route {
     /// 加载后按优先级稳定排序，组内保留配置顺序作为故障转移次序。
     channel: Vec<Channel>,
 }
+/// 保留客户端路径时只允许普通路径段。URL 写入时会解释点段与反斜线，必须先检查原文。
+fn preserved_path(raw: &str) -> Result<&str, Fault> {
+    let path = raw.split_once('?').map_or(raw, |(p, _)| p);
+    if !path.starts_with('/')
+        || path.contains('\\')
+        || path.bytes().any(|c| c.is_ascii_control())
+        || path.split('/').any(|s| {
+            matches!(s, "." | "..")
+                || ["%2e", ".%2e", "%2e.", "%2e%2e"]
+                    .iter()
+                    .any(|dot| s.eq_ignore_ascii_case(dot))
+        })
+    {
+        return Err(Fault::new(
+            "保留的客户端路径包含无效路径段",
+            "invalid preserved client path segment",
+        ));
+    }
+    Ok(path)
+}
 impl Route {
     /// 只在配置了别名时支持可选的缓冲回程：客户端可保留它请求的模型名。
     pub fn stages(&self) -> &'static [&'static str] {
@@ -309,10 +329,7 @@ impl Route {
             url.set_path(&format!(
                 "{}{}",
                 url.path().trim_end_matches('/'),
-                m.client
-                    .path
-                    .split_once('?')
-                    .map_or(m.client.path.as_str(), |(path, _)| path)
+                preserved_path(&m.client.path)?
             ));
             if url.origin() == incoming.origin() {
                 url.set_query(incoming.query());
@@ -401,6 +418,19 @@ mod tests {
             assert_eq!(route.choose(model, ticket, prev).unwrap().id, id);
         }
         assert!(route.choose("unknown", 0, None).is_none());
+    }
+    /// 拒绝会被 URL 归一化的完整段，不影响普通文件名和查询中的点号。
+    #[test]
+    fn preserved_path_only_accepts_literal_child_segments() {
+        for segment in [".", "..", "%2E", ".%2E", "%2e.", "%2e%2E", "a\\b"] {
+            assert!(preserved_path(&format!("/safe/{segment}/leaf")).is_err());
+        }
+        for path in ["/a/.../leaf", "/.well-known/v1", "/%2ejson"] {
+            assert_eq!(
+                preserved_path(&format!("{path}?q=..")).map_err(|e| e.wire),
+                Ok(path)
+            );
+        }
     }
     /// 只回双方同意的叶键；模型覆盖渠道同名项，别名对应的上游模型不误中原始模型规则。
     #[test]

@@ -6173,3 +6173,63 @@ async fn bodyless_close_state_reaches_notify_after_a_held_reply() {
     let record = request_detail(&home, &url, stream[0]["request_id"].as_str().unwrap()).await;
     assert!(record.to_string().contains("closed bodyless response"));
 }
+
+/// 原 worker 的 open 时上传未完，在替换 worker 握手期间收完；第二次真实写帧必须看到已知值。
+#[tokio::test]
+async fn fresh_stream_open_reads_client_flag_after_its_hello() {
+    use futures_util::StreamExt as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let (uploaded, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+        let uploaded = uploaded.clone();
+        async move {
+            let mut stream = req.into_body().into_data_stream();
+            let mut original = stream.next().await.unwrap().unwrap().to_vec();
+            let tail = futures_util::stream::once(async move {
+                while let Some(b) = stream.next().await {
+                    original.extend_from_slice(&b.unwrap());
+                }
+                uploaded.send(original).unwrap();
+                Ok::<_, std::io::Error>("complete")
+            });
+            axum::body::Body::from_stream(
+                futures_util::stream::once(async { Ok("prefix") }).chain(tail),
+            )
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let gate = home.path().join("fresh.release");
+    let cfg = String::from("delivery='forward'\nkeepalive.trigger='body_stream'\n")
+        + &layer(
+            &home,
+            "open",
+            "'stream'",
+            &["fresh-open-upload", gate.to_str().unwrap()],
+        );
+    let (_, url) = running(&home, up, &cfg);
+    let addr = url.strip_prefix("http://").unwrap();
+    let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+    client.write_all(format!("POST / HTTP/1.1\r\nHost: {addr}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\na\r\n{{\"stream\":\r\n").as_bytes()).await.unwrap();
+    observed_stage(&home, "open", "hello", 2).await;
+    client.write_all(b"5\r\ntrue}\r\n0\r\n\r\n").await.unwrap();
+    let bytes = tokio::time::timeout(std::time::Duration::from_secs(15), seen.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    std::fs::write(gate, []).unwrap();
+    let mut out = Vec::new();
+    client.read_to_end(&mut out).await.unwrap();
+    assert_eq!(bytes, br#"{"stream":true}"#);
+    let opens: Vec<_> = frames(&home, "open")
+        .into_iter()
+        .filter(|m| m["event"] == "open")
+        .collect();
+    assert_eq!(opens.len(), 2);
+    assert!(opens[0]["client"].get("stream").is_none());
+    assert_eq!(opens[1]["client"]["stream"], true);
+}

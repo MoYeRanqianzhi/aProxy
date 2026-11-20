@@ -906,7 +906,10 @@ fn stream_frame(id: &str, open: bool) -> Stage {
 async fn stream_workers_do_not_count_toward_pool_max() {
     let p = pool(Process::Persistent, "echo", |e| e.pool_max = 1);
     p.probe().await.unwrap();
-    let (mut stream, (hello, _)) = p.open_stream(stream_frame("a", true), false).await.unwrap();
+    let (mut stream, (hello, _)) = p
+        .open_stream(stream_frame("a", true), false, None)
+        .await
+        .unwrap();
     let other = tokio::time::timeout(Duration::from_secs(3), call(&p, "other", false))
         .await
         .unwrap()
@@ -921,10 +924,13 @@ async fn stream_workers_do_not_count_toward_pool_max() {
 #[tokio::test]
 async fn stream_worker_ids_stay_unique_beyond_pool_max() {
     let p = pool(Process::Persistent, "echo", |e| e.pool_max = 1);
-    let (mut a, (first, _)) = p.open_stream(stream_frame("a", true), false).await.unwrap();
+    let (mut a, (first, _)) = p
+        .open_stream(stream_frame("a", true), false, None)
+        .await
+        .unwrap();
     let (mut b, (second, _)) = tokio::time::timeout(
         Duration::from_secs(3),
-        p.open_stream(stream_frame("b", true), false),
+        p.open_stream(stream_frame("b", true), false, None),
     )
     .await
     .unwrap()
@@ -956,8 +962,14 @@ async fn stream_worker_ids_stay_unique_beyond_pool_max() {
 #[tokio::test]
 async fn stream_worker_returns_to_the_pool_or_exits_after_close() {
     let p = pool(Process::Persistent, "echo", |e| e.pool_max = 1);
-    let (mut a, _) = p.open_stream(stream_frame("a", true), false).await.unwrap();
-    let (mut b, (second, _)) = p.open_stream(stream_frame("b", true), false).await.unwrap();
+    let (mut a, _) = p
+        .open_stream(stream_frame("a", true), false, None)
+        .await
+        .unwrap();
+    let (mut b, (second, _)) = p
+        .open_stream(stream_frame("b", true), false, None)
+        .await
+        .unwrap();
     b.event(stream_frame("b", false)).await.unwrap();
     b.finish();
     a.event(stream_frame("a", false)).await.unwrap();
@@ -1015,6 +1027,7 @@ async fn cancelled_written_open_drains_then_aborts_on_the_same_worker() {
             wire::StreamEvent::Open(open),
         )),
         false,
+        None,
     ));
     tokio::select! {_=&mut operation=>panic!("completed before the fixture released open"),_=wait_observed(&frames,"open",1)=>{}}
     tokio::time::pause();

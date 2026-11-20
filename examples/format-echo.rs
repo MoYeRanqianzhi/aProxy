@@ -186,6 +186,11 @@ fn main() {
                 unfinished_frame(64 * 1024);
                 break;
             }
+            if mode == "fresh-open-upload"
+                && std::path::Path::new(arg).with_extension("first").exists()
+            {
+                wait_gate(std::path::Path::new(arg));
+            }
             if mode == "gate-hello" {
                 wait_gate(std::path::Path::new(arg));
             }
@@ -343,6 +348,16 @@ fn main() {
                     r["state"] = json!("finished close");
                     r["report"] = json!({"summary":"closed bodyless response","actions":[]});
                     r["data"] = json!("must not deliver");
+                }
+                "fresh-open-upload"
+                    if stage == "stream"
+                        && m["event"] == "open"
+                        && std::fs::File::create_new(
+                            std::path::Path::new(arg).with_extension("first"),
+                        )
+                        .is_ok() =>
+                {
+                    break;
                 }
                 "gate-open" if stage == "stream" && m["event"] == "open" => {
                     wait_gate(std::path::Path::new(arg))

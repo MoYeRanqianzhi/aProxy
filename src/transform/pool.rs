@@ -1118,6 +1118,7 @@ impl Pool {
         self: &Arc<Self>,
         stage: Stage,
         fresh: bool,
+        live_stream: Option<Arc<std::sync::OnceLock<bool>>>,
     ) -> Result<(StreamWorker, PreparedReply), Fault> {
         let Stage::Stream(ref message) = stage else {
             unreachable!("expected stream open")
@@ -1128,7 +1129,7 @@ impl Pool {
         let written = phase.clone();
         let mut pending = PendingOpen {
             work: Some(Box::pin(async move {
-                pool.open_inner(stage, fresh, written).await
+                pool.open_inner(stage, fresh, live_stream, written).await
             })),
             id,
             phase,
@@ -1140,8 +1141,9 @@ impl Pool {
     /// 仅在接纳并取得进程后挂上首字节标记；取消排队或握手不能向未开始的流发送 abort。
     async fn open_inner(
         self: &Arc<Self>,
-        stage: Stage,
+        mut stage: Stage,
         fresh: bool,
+        live_stream: Option<Arc<std::sync::OnceLock<bool>>>,
         phase: Arc<std::sync::atomic::AtomicU8>,
     ) -> OpenResult {
         let waiting = self.waiting_data();
@@ -1159,6 +1161,14 @@ impl Pool {
         let result = async {
             let mut w = tokio::select! {biased; f=ticket.revoked()=>return Err(f), r=obtain=>r?};
             drop(waiting);
+            // 等待或替换进程时客户端可能刚上传完。在这个进程真正收 open 前再读一次，不等 EOF。
+            if let Some(flag) = live_stream.as_deref().and_then(|s| s.get()).copied()
+                && let Stage::Stream(message) = &mut stage
+                && let aproxy_envelope::StreamEvent::Open(open) = &mut message.event
+                && let Some(client) = &mut open.client
+            {
+                client.stream.get_or_insert(flag);
+            }
             w.opening = Some(phase.clone());
             let reply = self
                 .exchange(&mut w, stage, self.entry.timeout_secs, Some(&ticket))

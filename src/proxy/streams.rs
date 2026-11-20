@@ -442,9 +442,13 @@ pub(super) async fn chain(
             id.clone(),
             wire::StreamEvent::Open(start),
         ));
-        let first = p.open_stream(open.clone(), false).await;
+        let first = p
+            .open_stream(open.clone(), false, ctx.live_stream.clone())
+            .await;
         let result = match first {
-            Err(f) if !matches!(f, Fault::Open { .. }) => p.open_stream(open, true).await,
+            Err(f) if !matches!(f, Fault::Open { .. }) => {
+                p.open_stream(open, true, ctx.live_stream.clone()).await
+            }
             other => other,
         };
         let (worker, (mut reply, prepared)) = match result {
@@ -668,6 +672,7 @@ mod tests {
                         wire::StreamEvent::Open(open),
                     )),
                     false,
+                    None,
                 )
                 .await
                 .unwrap();

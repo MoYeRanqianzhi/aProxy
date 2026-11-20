@@ -98,7 +98,7 @@ fn trace(
 }
 impl Unit {
     /// 能力声明须覆盖要求的每个阶段；不通过时不能发送样本正文。
-    fn connect(&mut self, dir: &Path) -> Result<(), String> {
+    fn connect(&mut self, dir: &Path) -> Result<(), peer::PeerFault> {
         let e = &self.layer.entry;
         let stages = e.stages.iter().map(|s| s.as_str().to_owned()).collect();
         let mut offer = w::Hello::new(
@@ -131,13 +131,13 @@ impl Unit {
             }
             role.hello(self.layer.label, &offer)
         } else {
-            let p = peer::ChildPeer::start(e, dir)?;
-            let mut h = serde_json::to_value(&offer).map_err(|_| "无法编码握手")?;
+            let p = peer::ChildPeer::start(e, dir).map_err(|_| peer::PeerFault::Unavailable)?;
+            let mut h = serde_json::to_value(&offer).map_err(|_| peer::PeerFault::Invalid)?;
             h["v"] = 1.into();
             h["seq"] = 0.into();
             h["stage"] = "hello".into();
-            let hr = serde_json::from_value(p.frame(&h, 64 * 1024, e.timeout_secs)?)
-                .map_err(|_| "外部程序握手无效")?;
+            let hr = serde_json::from_value(p.frame(&h, 64 * 1024, 10)?)
+                .map_err(|_| peer::PeerFault::Invalid)?;
             self.peer = Some(p);
             hr
         };
@@ -148,7 +148,7 @@ impl Unit {
                 .iter()
                 .any(|s| !hello.stages.iter().any(|h| h == s.as_str()))
         {
-            return Err("角色协商的阶段或协议不符".into());
+            return Err(peer::PeerFault::Invalid);
         }
         self.hello = Some(hello);
         self.seq = 1;
@@ -877,7 +877,10 @@ fn rehearse(
                     Value::Null,
                     vec!["negotiated"],
                 )?,
-                Err(_) if !u.layer.entry.required => trace(
+                Err(peer::PeerFault::Invalid) => {
+                    return Err("试跑握手不兼容，请检查协议和阶段".into());
+                }
+                Err(peer::PeerFault::Unavailable) if !u.layer.entry.required => trace(
                     t.out,
                     "hello",
                     u.layer.label,

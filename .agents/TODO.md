@@ -25,6 +25,12 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] **Windows 上 `aproxy start` 以堆损坏（`0xC0000374`）退出**：CI 上出现过一次（run 44732134169，
   `second_start_waits_for_failed_hello_and_prepare_swap_changes_nothing`），没有复现。已把启动失败的退出改成先收回运行时，
   但没能证明这就是原因。再出现时：留下那个进程的 stderr，考虑在 CI 的 Windows 任务上开 page heap 跑这一个测试
+  - **第二次出现**（2026-11-21，run 44782198678，`decide_disconnect_preserves_attempt_and_actual_backoff`）：这次是一个本该
+    成功的 `aproxy start`，没有任何输出，所以「启动失败时带着活线程退出」解释不了。两次都是 Windows headless、
+    `tests/format_protocol.rs`、发起启动的那个 CLI 进程。Codex 在本机单测循环 300 次、整个文件并行 13 轮都没复现
+    （第 14 轮暴露的是另一个端口复用竞态，已修）。CI 的 Windows 任务现在会在失败时上传转储与 PDB
+    （artifact `crash-dumps-windows-<variant>`）；启动失败的断言现在带上日志与台账。**下一次出现先取转储看调用栈**。
+    在此之前 alpha.4 是否照发由用户定
 - [ ] **协议转换的两条已知限制**（出在 `switchyard-translation` 里，记在 [format-roles](plan/format-roles.md)）：写进给用户的文档
   （`aproxy-format` 技能与 README），并报给上游。Messages 的 thinking 签名过不了 Chat 这一条，以后可以考虑在 convert 里
   按工具调用 ID 暂存签名、下一轮请求转回 Messages 时补上（跨请求的进程内状态，worker 重启就丢），0.2.0 不做。

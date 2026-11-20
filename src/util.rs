@@ -6,6 +6,7 @@
 /// `aproxy_ipc::ledger::Registration` 管不到这条路，所以登记过台账的进程一律经这里退出；没登记过
 /// 的进程调用它也无妨（没有条目可删）。
 pub(crate) fn exit(code: i32) -> ! {
+    crate::commands::finish_json(code);
     aproxy_ipc::ledger::remove_own();
     std::process::exit(code)
 }

@@ -11,6 +11,14 @@
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{GetConsoleOutputCP, SetConsoleOutputCP};
 
+/// 诊断不是命令结果。管道读端关闭时忽略写错误，让 stdout 上独立的文档与退出码照常交付。
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+    }};
+}
+
 mod commands;
 mod server;
 mod util;
@@ -77,31 +85,26 @@ fn main() {
 /// home 还未被接受，不能查台账或设置；按已解析的命令构造它约定的 JSON 错误。
 fn invalid_home_output(
     command: Option<&Commands>,
-    error: &str,
     value: &str,
 ) -> (Option<serde_json::Value>, i32) {
-    match command {
-        Some(Commands::Status { json: true, .. }) => (
-            Some(
-                serde_json::json!({"error":{"code":"home_invalid","message":"APROXY_HOME does not satisfy the home rules.","details":{"value":value}}}),
-            ),
-            i32::from(aproxy_ipc::code::EXIT_USAGE),
-        ),
-        Some(Commands::Install(args)) if args.json => {
-            let error = serde_json::json!({"code":"install_failed","message":error,"details":{}});
-            let body = if args.check {
-                serde_json::json!({"error":error})
-            } else {
-                serde_json::json!({"event":"result","outcome":"failed","version":null,"error":error})
-            };
-            (Some(body), 1)
-        }
-        _ => (None, 1),
-    }
+    let mode = commands::JsonOutput::for_command(command);
+    let error = serde_json::json!({"code":"home_invalid","message":"APROXY_HOME does not satisfy the home rules.","details":{"value":value}});
+    (
+        mode.map(|m| m.error_document(error)),
+        if mode.is_some() {
+            i32::from(aproxy_ipc::code::EXIT_USAGE)
+        } else {
+            1
+        },
+    )
 }
 
 /// 除 `--version` 与 `desktop` 之外的一切命令，在 tokio 运行时里执行。
 async fn run(cli: Cli) {
+    let output = commands::JsonOutput::for_command(cli.command.as_ref());
+    if let Some(mode) = output {
+        mode.bind();
+    }
     // 强制安装（永久兼容契约 C7、C8，见 aproxy::install::force）在这里分流，排在定位
     // 配置文件、settings 检查与拉起续作之前：它不读配置与 settings.json——要修的
     // 可能正是它们，损坏的 settings.json 不能挡住修复它的手段；它也不能拉起续作，
@@ -119,8 +122,7 @@ async fn run(cli: Cli) {
     // 上面自己报告（退出码 10）
     if let Err(e) = aproxy_ipc::home::resolve_home() {
         let value = std::env::var_os(aproxy_ipc::home::HOME_ENV).unwrap_or_default();
-        let (document, exit) =
-            invalid_home_output(cli.command.as_ref(), &e, &value.to_string_lossy());
+        let (document, exit) = invalid_home_output(cli.command.as_ref(), &value.to_string_lossy());
         if let Some(doc) = document {
             commands::print_doc(doc);
         }
@@ -196,6 +198,9 @@ async fn run(cli: Cli) {
             );
         } else {
             commands::settings::print_repair_hints(&settings_path);
+            if let Some(mode) = output {
+                commands::print_doc(mode.error_document(serde_json::json!({"code":"config_invalid","message":"The configuration has error-level diagnostics.","details":{"diagnostics":loaded.diagnostics}})));
+            }
             util::exit(aproxy_ipc::code::EXIT_CONFIG as i32);
         }
     }
@@ -323,10 +328,9 @@ mod home_output_tests {
     #[test]
     fn status_json_home_failure_returns_its_document_before_dispatch() {
         let value = std::ffi::OsStr::new("relative");
-        let error = aproxy_ipc::home::home_from(Some(value), || unreachable!()).unwrap_err();
+        assert!(aproxy_ipc::home::home_from(Some(value), || unreachable!()).is_err());
         let cli = Cli::try_parse_from(["aproxy", "status", "--json"]).unwrap();
-        let (doc, exit) =
-            invalid_home_output(cli.command.as_ref(), &error, value.to_str().unwrap());
+        let (doc, exit) = invalid_home_output(cli.command.as_ref(), value.to_str().unwrap());
         assert_eq!(exit, 2);
         let doc = doc.unwrap();
         assert_eq!(doc["error"]["code"], "home_invalid");

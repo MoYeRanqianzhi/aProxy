@@ -197,7 +197,7 @@ async fn running_ports() -> Vec<u16> {
     ports
 }
 
-/// 编辑失败的两种输出共用错误码与说明；I/O 错误没有文档，只报告原因并以 1 退出。
+/// 编辑失败的两种输出共用错误码与说明；I/O 错误以 1 退出，由命令出口补齐错误文档。
 fn fail(error: &EditError, path: &Path, json: bool) -> ! {
     let message = settings::describe_edit_error(error, path);
     let (code, details) = match error {

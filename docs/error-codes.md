@@ -75,6 +75,7 @@ Why an operation started from the command line or the desktop window failed. Wit
 | `target_not_found` | 4 | The alias, port or config file does not exist. | `target` (string) |
 | `target_not_running` | 4 | The target is not running. | `target` (string) |
 | `config_invalid` | 3 | The configuration has error-level diagnostics. | `diagnostics` (diagnostic list) |
+| `command_failed` | 1 | The command could not complete. | — |
 | `write_conflict` | 1 | The config file was modified externally while writing, and retrying still conflicted. | `file` (path) |
 | `port_in_use` | 1 | The port is taken. | `port` (integer), `owner` (string) |
 | `start_failed` | the child's code, else 1 | The daemon could not start. | `code`? (integer), `startup_log` (string list) |

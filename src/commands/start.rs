@@ -35,7 +35,7 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) {
             Ok(key) => args.api_key = Some(key),
             Err(e) => {
                 eprintln!("{e}");
-                std::process::exit(1);
+                crate::util::exit(1);
             }
         }
     }

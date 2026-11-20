@@ -385,3 +385,129 @@ fn install_check_and_json_reject_conflicting_modes() {
         assert!(!h.path().join("install").exists() && !h.path().join("bin").exists());
     }
 }
+
+/// 逐个已解析的 JSON 入口走 C1、设置预检及命令本身；诊断管道断开不能吞掉 stdout 文档。
+#[test]
+fn json_commands_finish_with_one_document_even_without_stderr() {
+    let home = TestHome::new();
+    home.settings("{");
+    for (args, malformed) in [
+        (&["start"][..], "config_invalid"),
+        (&["status"], "instances"),
+        (&["stop", "missing-alias"], "target_not_found"),
+        (&["restart"], "config_invalid"),
+        (&["restore"], "config_invalid"),
+        (&["doctor"], "files"),
+        (&["find"], "config_invalid"),
+        (&["alias", "list"], "config_invalid"),
+        (&["config", "show"], "config_invalid"),
+        (&["config", "get", "base_url"], "config_invalid"),
+        (&["config", "set", "base_url", "x"], "config_invalid"),
+        (&["config", "unset", "base_url"], "config_invalid"),
+        (&["settings", "show"], "config_invalid"),
+        (&["settings", "get", "default_config"], "config_invalid"),
+        (
+            &["settings", "set", "default_config", "x"],
+            "config_invalid",
+        ),
+        (&["settings", "unset", "default_config"], "config_invalid"),
+        (
+            &["install", "--check", "--download-proxy", "http://["],
+            "install_download_failed",
+        ),
+        (
+            &["install", "--from", "./missing-test-binary"],
+            "install_probe_failed",
+        ),
+    ] {
+        for relative in [true, false] {
+            for broken in [false, true] {
+                let mut command = home.cmd();
+                command
+                    .current_dir(home.path())
+                    .args(args)
+                    .arg("--json")
+                    .stdin(Stdio::null());
+                if relative {
+                    command.env("APROXY_HOME", "relative");
+                }
+                if broken {
+                    let (reader, writer) = std::io::pipe().unwrap();
+                    drop(reader);
+                    command.stderr(writer);
+                }
+                let out = command.output().unwrap();
+                let stdout = text(&out.stdout);
+                assert_eq!(
+                    stdout.lines().count(),
+                    1,
+                    "{args:?} relative={relative} closed={broken} {}: {stdout:?} {}",
+                    out.status,
+                    text(&out.stderr)
+                );
+                let doc: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+                assert_eq!(doc["schema"], 1);
+                if args.starts_with(&["install", "--from"]) {
+                    assert_eq!(doc["event"], "result");
+                    assert_eq!(doc["outcome"], "failed");
+                } else {
+                    assert!(doc.get("event").is_none());
+                }
+                let expected = if relative { "home_invalid" } else { malformed };
+                if ["instances", "files"].contains(&expected) {
+                    assert!(doc[expected].is_array(), "{args:?}: {doc}");
+                } else {
+                    assert!(!out.status.success());
+                    assert_eq!(doc["error"]["code"], expected, "{args:?}: {doc}");
+                    assert!(
+                        doc["error"]["message"].is_string() && doc["error"]["details"].is_object()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// 配置与设置的文件读取失败、三处 stdin 读取失败都发生在预检之后，不能退化为空 stdout。
+#[test]
+fn json_command_io_errors_keep_a_result_after_preflight() {
+    let home = TestHome::new();
+    let directory = home.path().to_str().unwrap();
+    for args in [
+        &["config", "show", "--config", directory][..],
+        &["start", "--api-key", "-"],
+        &["config", "set", "base_url", "-"],
+        &["settings", "set", "default_config", "-"],
+    ] {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(b"\xff\n").unwrap();
+        drop(writer);
+        let (closed, diagnostic) = std::io::pipe().unwrap();
+        drop(closed);
+        let out = home
+            .cmd()
+            .args(args)
+            .arg("--json")
+            .stdin(reader)
+            .stderr(diagnostic)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{args:?}: {}",
+            text(&out.stdout)
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["schema"], 1);
+        assert_eq!(doc["error"]["code"], "command_failed", "{args:?}: {doc}");
+    }
+    // 目录在各平台都不能当设置文件读，不依赖用户权限或 chmod。
+    let file = home.path().join("settings.json");
+    std::fs::rename(&file, home.path().join("initial-settings.json")).unwrap();
+    std::fs::create_dir(file).unwrap();
+    let out = run(&home, &["settings", "show", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["error"]["code"], "command_failed");
+}

@@ -533,6 +533,13 @@ pub const TABLE: &[Code] = &[
         &[req("diagnostics", T::Diagnostics)],
     ),
     exiting(
+        "command_failed",
+        OPERATION,
+        Exit(EXIT_FAILED),
+        "The command could not complete.",
+        &[],
+    ),
+    exiting(
         "write_conflict",
         OPERATION,
         Exit(EXIT_FAILED),

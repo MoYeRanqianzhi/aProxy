@@ -22,6 +22,91 @@ use std::path::PathBuf;
 use aproxy::settings as app_settings;
 use serde_json::{Value, json};
 
+/// 由 clap 已解析的命令选择输出协议，不从原始参数里猜测（值本身也可能是 `--json`）。
+#[derive(Clone, Copy)]
+pub(crate) enum JsonOutput {
+    /// 普通命令和只读安装检查输出一个文档。
+    Document,
+    /// 普通安装的进度按行追加，最后一行才表示完成。
+    InstallEvents,
+}
+
+/// 一个 CLI 进程只执行一个面向用户的命令；异步子任务也应看到同一种输出协议。
+static JSON_OUTPUT: std::sync::OnceLock<JsonOutput> = std::sync::OnceLock::new();
+/// 某些有诊断或逐项失败的完整报告也用非零码退出，退出兜底不能再输出第二份文档。
+static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+impl JsonOutput {
+    /// 只在命令声明并实际解析到 JSON 旗标时启用，不改变无旗标与内部子命令的 stdout。
+    pub(crate) fn for_command(command: Option<&aproxy::cli::Commands>) -> Option<Self> {
+        use aproxy::cli::{AliasCmd, Commands, ConfigCmd, SettingsCmd};
+        let json = match command? {
+            Commands::Install(a) if a.json && !a.check => return Some(Self::InstallEvents),
+            Commands::Install(a) => a.json,
+            Commands::Start(a) => a.json,
+            Commands::Stop { json, .. }
+            | Commands::Restart { json, .. }
+            | Commands::Restore { json }
+            | Commands::Doctor { json }
+            | Commands::Status { json, .. }
+            | Commands::Find { json, .. }
+            | Commands::Alias {
+                cmd: AliasCmd::List { json },
+            } => *json,
+            Commands::Config(a) => match &a.cmd {
+                ConfigCmd::Show { json, .. }
+                | ConfigCmd::Get { json, .. }
+                | ConfigCmd::Set { json, .. }
+                | ConfigCmd::Unset { json, .. } => *json,
+            },
+            Commands::Settings { cmd } => match cmd {
+                SettingsCmd::Show { json }
+                | SettingsCmd::Get { json, .. }
+                | SettingsCmd::Set { json, .. }
+                | SettingsCmd::Unset { json, .. } => *json,
+            },
+            Commands::Alias { .. }
+            | Commands::Logs { .. }
+            | Commands::Desktop
+            | Commands::Serve { .. }
+            | Commands::Watchdog { .. } => false,
+        };
+        json.then_some(Self::Document)
+    }
+
+    /// 在读 home 和设置之前选定输出，入口拒绝也能带回与子命令相同的结果格式。
+    pub(crate) fn bind(self) {
+        let _ = JSON_OUTPUT.set(self);
+    }
+
+    /// 安装在尚未选定目标时失败，版本为 null；普通错误没有事件外壳。
+    pub(crate) fn error_document(self, error: Value) -> Value {
+        match self {
+            Self::Document => json!({"error": error}),
+            Self::InstallEvents => {
+                json!({"event":"result","outcome":"failed","version":null,"error":error})
+            }
+        }
+    }
+}
+
+/// 没有更具体的结构化结果时才补整条命令的错误。不要从任意 stderr 文本反推结构化字段或泄露输入。
+pub(crate) fn finish_json(code: i32) {
+    if code != 0
+        && let Some(mode) = JSON_OUTPUT.get()
+        && !REPORTED.load(std::sync::atomic::Ordering::Acquire)
+    {
+        let name = match mode {
+            JsonOutput::InstallEvents => "install_failed",
+            JsonOutput::Document => "command_failed",
+        };
+        let message = aproxy_ipc::code::lookup(name)
+            .expect("registered error")
+            .summary;
+        print_doc(mode.error_document(json!({"code":name,"message":message,"details":{}})));
+    }
+}
+
 /// 一条命令整体失败的原因：码表里的码、它的 `details`、给人看的一段话。
 ///
 /// 退出码取自码表（`aproxy_ipc::code`）；诊断码（例如 `config_unknown_key`）作为整条命令的
@@ -227,6 +312,9 @@ pub(crate) fn bind_failure(listen_addr: &str, error: &std::io::Error) -> Failure
 
 /// 把 `--json` 的文档写到 stdout：一行，`schema` 在最前面，其余的键照 `body` 的顺序。
 pub(crate) fn print_doc(body: Value) {
+    if body.get("event").is_none() || body["event"] == "result" {
+        REPORTED.store(true, std::sync::atomic::Ordering::Release);
+    }
     let mut doc = serde_json::Map::new();
     doc.insert("schema".to_string(), 1.into());
     if let Value::Object(body) = body {

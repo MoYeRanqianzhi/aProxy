@@ -253,7 +253,13 @@ struct Trial<'a, W> {
     /// 请求模式投票与后续升级的当前结果。
     mode: &'static str,
     /// 在第一个 retry 单元之前缓存的请求，重跑不能重用上次渠道的输出。
-    prefix: Option<w::Request>,
+    prefix: Option<(usize, w::Request)>,
+    /// 未完成的层仍使用原阶段；只有到达末尾后才从第一个 retry 订阅者重新开始。
+    cursor: usize,
+    /// 首轮发生链内拒绝后恢复执行，不能切换到 retry 消息。
+    request_stage: Stage,
+    /// 每个逻辑请求只接受一次 delivery 选择，恢复游标不重新开票。
+    voted: bool,
 }
 impl<W: Write> Trial<'_, W> {
     /// 程序业务拒绝与进程失败分开；发生进程故障的可选层不会继续吃样本。
@@ -285,41 +291,42 @@ impl<W: Write> Trial<'_, W> {
         req: &mut w::Request,
         retry: Option<Value>,
     ) -> Result<Option<w::Fail>, String> {
-        let stage = if retry.is_some() {
-            Stage::Retry
-        } else {
-            Stage::Request
-        };
-        let mut voted = false;
-        if retry.is_some()
-            && let Some(prefix) = &self.prefix
-        {
+        if self.cursor == self.units.len() {
+            let Some((i, prefix)) = &self.prefix else {
+                return Ok(None);
+            };
             *req = prefix.clone();
-            // 后段整段重跑。先撤旧覆盖，避免某层提前拒绝时沿用尚未运行的下一层的旧值。
-            for unit in &mut self.units {
-                if unit.layer.entry.has_stage(Stage::Retry) {
-                    unit.overrides = None;
-                }
+            self.cursor = *i;
+            self.request_stage = Stage::Retry;
+            // 正常结束后才回滚整个后缀；尚未完成的请求链只撤掉失败层的覆盖。
+            for u in &mut self.units[*i..] {
+                u.overrides = None;
             }
+        } else if retry.is_some() {
+            self.units[self.cursor].overrides = None;
         }
-        for i in 0..self.units.len() {
-            if retry.is_none()
-                && self.prefix.is_none()
-                && self.units[i].layer.entry.has_stage(Stage::Retry)
-            {
-                self.prefix = Some(req.clone());
+        let stage = self.request_stage;
+        while self.cursor < self.units.len() {
+            let i = self.cursor;
+            if self.prefix.is_none() && self.units[i].layer.entry.has_stage(Stage::Retry) {
+                self.prefix = Some((i, req.clone()));
             }
             if !self.units[i].has(stage) {
+                self.cursor += 1;
                 continue;
             }
             let mut msg = json!({"delivery":self.mode,"client":self.client,"request":req});
-            if let Some(r) = &retry {
+            if stage == Stage::Retry
+                && let Some(r) = &retry
+            {
                 msg["retry"] = r.clone();
             }
             let before = req.clone();
             let mut r = self.call(i, stage.as_str(), msg)?;
             let mut changed = Vec::new();
-            if let Some(p) = r.request.take() {
+            if r.fail.is_none()
+                && let Some(p) = r.request.take()
+            {
                 req.apply(p);
             }
             if req.url != before.url {
@@ -334,8 +341,8 @@ impl<W: Write> Trial<'_, W> {
             if req.method != before.method {
                 changed.push("method");
             }
-            if !voted
-                && retry.is_none()
+            if !self.voted
+                && stage == Stage::Request
                 && let Some(mode) = match r.delivery.as_ref().and_then(Value::as_str) {
                     Some("forward") => Some("forward"),
                     Some("retry") => Some("retry"),
@@ -343,7 +350,7 @@ impl<W: Write> Trial<'_, W> {
                 }
             {
                 self.mode = mode;
-                voted = true;
+                self.voted = true;
                 changed.push(mode);
             }
             if r.overrides.is_some() {
@@ -364,6 +371,7 @@ impl<W: Write> Trial<'_, W> {
             if r.fail.is_some() {
                 return Ok(r.fail);
             }
+            self.cursor += 1;
         }
         Ok(None)
     }
@@ -792,6 +800,9 @@ fn rehearse(
         client: json!({"path":sample.path,"stream":streaming}),
         mode: chain.config.delivery.unwrap_or(f::Delivery::Retry).as_str(),
         prefix: None,
+        cursor: 0,
+        request_stage: Stage::Request,
+        voted: false,
     };
     req.body = w::Body::from_bytes(raw);
     for layer in chain.layers {
@@ -934,7 +945,7 @@ fn rehearse(
             if let Some(r) = resp {
                 info["last_response"] = json!({"status":r.status,"headers":r.headers});
             }
-            if reroute {
+            if reroute || t.cursor != t.units.len() {
                 refused = t.request(&mut req, Some(info))?;
             }
             continue;

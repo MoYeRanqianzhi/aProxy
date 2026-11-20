@@ -7103,3 +7103,50 @@ async fn responses_snapshot_obeys_instance_reply_limit_without_breaker_failure()
         json!({"state":"closed","failures":0})
     );
 }
+
+/// 真实试跑命令只消费临时 home 中的显式样例；外部程序是随仓库编译的协议夹具，不访问上游。
+fn format_trial(home: &TestHome, config: &str, sample: Value) -> std::process::Output {
+    let proxy = home.path().join("trial.toml");
+    let input = home.path().join("sample.json");
+    std::fs::write(&proxy, format!("base_url='https://relay.test'\n{config}")).unwrap();
+    std::fs::write(&input, sample.to_string()).unwrap();
+    std::process::Command::new(official_binary())
+        .arg("try")
+        .arg(proxy)
+        .arg("--request")
+        .arg(input)
+        .arg("--home")
+        .arg(home.path())
+        .arg("--allow-external")
+        .output()
+        .unwrap()
+}
+/// 两种重选票都不能跳过尚未完成的请求层，也不能重新执行已成功的前缀。
+#[test]
+fn rehearsal_resumes_failed_request_layer_for_both_reroute_votes() {
+    for reroute in [false, true] {
+        let home = TestHome::new();
+        let mut chain = layer(&home, "prefix", "'request'", &["echo"]);
+        chain += &layer(&home, "reject", "'request'", &["reject-first-request"]);
+        chain += &layer(&home, "tail", "'request'", &["echo"]);
+        let vote =
+            serde_json::json!({"decision":"retry","delay_ms":0,"reroute":reroute}).to_string();
+        chain += &layer(&home, "vote", "'decide'", &["reply", &vote]);
+        let run = format_trial(
+            &home,
+            &chain,
+            serde_json::json!({"path":"/","body":{},"attempts":[{"status":200},{"status":200}]}),
+        );
+        assert!(run.status.success(), "{run:?}");
+        for (name, count) in [("prefix", 1), ("reject", 2), ("tail", 1)] {
+            assert_eq!(
+                frames(&home, name)
+                    .iter()
+                    .filter(|m| m["stage"] == "request")
+                    .count(),
+                count,
+                "{name}, reroute={reroute}"
+            );
+        }
+    }
+}

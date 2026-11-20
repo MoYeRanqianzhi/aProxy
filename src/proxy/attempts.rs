@@ -668,7 +668,7 @@ pub(super) async fn run_attempts(
                     };
                     result
                 }
-                Err(f) => f,
+                Err(f) => *f,
             }
         };
         let override_max = chain

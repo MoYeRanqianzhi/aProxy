@@ -129,7 +129,7 @@ impl PassiveCheck {
         }
     }
     /// 只有 HTTP 实体完整时才判伪成功；中断可能截在合法 JSON 当中，不能被误报为错误体。
-    fn is_error(self, headers: &HeaderMap) -> bool {
+    fn finish(self, headers: &HeaderMap) -> bool {
         match self {
             Self::Resident(raw) => {
                 let decoded = crate::decode::for_inspection(
@@ -169,7 +169,7 @@ struct ResponseTap {
 impl ResponseTap {
     /// 定长实体最后一块交付后 hyper 可以不再轮询 EOF，按实际累计长度在那一块完成旁路判定。
     fn complete(&mut self, state: &AppState, status: StatusCode, headers: &HeaderMap) {
-        if self.check.take().is_some_and(|c| c.is_error(headers)) {
+        if self.check.take().is_some_and(|c| c.finish(headers)) {
             let failure = AttemptFailure::response(status);
             failure.record_in(&state.stats);
             self.rec.settle(

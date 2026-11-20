@@ -54,11 +54,12 @@ pub(super) fn spool_limit_bytes(config: &Config) -> usize {
     }
 }
 
-/// 用可重放的请求体发一次，只等响应头；之后选择边转发还是缓冲。
+/// 用可重放的请求体发一次，只等响应头；之后选择边转发还是缓冲。错误单独装箱，
+/// 不把缓冲结果的双头表尺寸带进每次等响应头的 future。
 pub(super) async fn send_prepared(
     state: &AppState,
     req: &OutboundRequest,
-) -> Result<reqwest::Response, ForwardResult> {
+) -> Result<reqwest::Response, Box<ForwardResult>> {
     let (method, url, headers, req_body) =
         (&req.method, &req.target_url, &req.headers, req.sent_body());
     let reqwest_method =
@@ -85,16 +86,16 @@ pub(super) async fn send_prepared(
         Ok(b) => b,
         Err(e) => {
             // 请求体临时文件打不开 = 本地确定性故障，重试同样打不开
-            return Err(ForwardResult::SpoolFailed(
+            return Err(Box::new(ForwardResult::SpoolFailed(
                 StorageOp::ReadRequest,
                 e.to_string(),
-            ));
+            )));
         }
     };
 
     send_with_timeout(state, builder.send())
         .await
-        .map_err(|failure| ForwardResult::NetworkError(failure, None))
+        .map_err(|failure| Box::new(ForwardResult::NetworkError(failure, None)))
 }
 
 /// 可重试的响应（或 forward 尚未交付、要问 decide 的失败）才缓冲实体。

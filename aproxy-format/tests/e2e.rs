@@ -692,3 +692,39 @@ fn preserved_path_comes_from_the_client_not_the_previous_base() {
     ));
     assert_eq!(r["request"]["url"], "https://b.test/tenant-b/v1/messages");
 }
+
+/// 长标识、转义字符及别名要按最终 state 的 JSON 字节计数，而不是仅按一个配置值计数。
+#[test]
+fn oversized_role_state_is_refused_during_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("roles.toml");
+    let quoted = "\"".repeat(32768);
+    for (role, txt) in [
+        (
+            "keys",
+            format!(
+                "[[pool]]\norigin='https://x.test'\nheader='authorization'\nkeys=[{{id='{quoted}',env='FORMAT_A'}}]"
+            ),
+        ),
+        (
+            "route",
+            format!("[[channel]]\nid='{quoted}'\nurl='https://x.test'"),
+        ),
+        (
+            "route",
+            format!("[aliases]\n'{quoted}'='m'\n[[channel]]\nid='c'\nurl='https://x.test'"),
+        ),
+    ] {
+        std::fs::write(&file, txt).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+            .args([role, "--config", file.to_str().unwrap()])
+            .env("FORMAT_A", "test")
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("64 KiB"),
+            "{role}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

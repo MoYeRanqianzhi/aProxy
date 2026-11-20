@@ -47,6 +47,19 @@ pub fn endpoint(value: &str) -> Result<Url, &'static str> {
     Ok(u)
 }
 
+/// 私有 state 受协议字节上限约束，两个字符串、分隔符与转义字节都算在内。
+pub const STATE_BYTES: usize = 64 * 1024;
+/// 只为可能装得下的字符串展开转义；明显超限时不分配第二份超长配置值。
+pub fn state_string_bytes(value: &str) -> usize {
+    if value.len() > STATE_BYTES {
+        STATE_BYTES + 1
+    } else {
+        serde_json::to_string(value)
+            .expect("字符串总能编码为 JSON")
+            .len()
+    }
+}
+
 /// 跨边界转交前按代理日志与历史的同一规则删除全部凭据头，其余元数据保持原样。
 pub fn strip_credentials(h: &mut Headers) {
     h.retain(|name, _| !aproxy_ipc::redact::is_secret_header(name));

@@ -111,7 +111,18 @@ impl Route {
         if cfg.channel.is_empty() {
             return Err("至少需要一个渠道");
         }
+        // 未匹配别名时编码 null；预先取最长的别名，不必逐项枚举渠道与别名的笛卡尔积。
+        let alias_bytes = cfg
+            .aliases
+            .keys()
+            .map(|k| config::state_string_bytes(k))
+            .max()
+            .unwrap_or(0)
+            .max(4);
         for c in &cfg.channel {
+            if config::state_string_bytes(&c.id) + alias_bytes + 3 > config::STATE_BYTES {
+                return Err("渠道标识与别名生成的状态超过 64 KiB");
+            }
             config::endpoint(&c.url)?;
             if c.id.is_empty() || !ids.insert(&c.id) {
                 return Err("渠道标识为空或重复");

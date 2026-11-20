@@ -72,6 +72,14 @@ impl Keys {
             }
             pool.origin = url.origin().ascii_serialization();
             pool.header = config::credential_header(&pool.header)?.to_string();
+            let origin_bytes = config::state_string_bytes(&pool.origin);
+            if pool
+                .keys
+                .iter()
+                .any(|k| origin_bytes + config::state_string_bytes(&k.id) + 3 > config::STATE_BYTES)
+            {
+                return Err("密钥标识生成的状态超过 64 KiB");
+            }
             let mut ids = std::collections::HashSet::new();
             if pool.keys.is_empty()
                 || pool

@@ -7193,3 +7193,41 @@ fn rehearsal_worker_failure_ends_with_distinct_unsimulated_status() {
         );
     }
 }
+
+/// 对实际收到的回信做与池一致的校验；合法补丁过滤管理头和无效值后再给下一层。
+#[test]
+fn rehearsal_validates_peer_http_patches_before_dispatch() {
+    for (patch, valid) in [
+        (serde_json::json!({"method":"X Y"}), false),
+        (serde_json::json!({"url":"relative"}), false),
+        (
+            serde_json::json!({"headers":{"Host":"evil","bad name":"x","ok":"visible","bad":"a\nb"}}),
+            true,
+        ),
+    ] {
+        let home = TestHome::new();
+        let arg = serde_json::json!({"request":patch}).to_string();
+        let chain = String::from("max_request_mb=1\nmax_response_mb=2\n")
+            + &layer(&home, "patch", "'request'", &["reply", &arg])
+            + &layer(&home, "next", "'request'", &["noop"]);
+        let out = format_trial(&home, &chain, serde_json::json!({"path":"/","body":{}}));
+        assert_eq!(
+            out.status.code(),
+            Some(if valid { 0 } else { 2 }),
+            "{out:?}"
+        );
+        let rows = frames(&home, "next");
+        assert_eq!(
+            rows[0]["limits"],
+            serde_json::json!({"hello":65536,"control":1048576,"request":3145728,"response":5242880})
+        );
+        if valid {
+            assert_eq!(
+                rows[1]["request"]["headers"],
+                serde_json::json!({"ok":"visible"})
+            );
+        } else {
+            assert_eq!(rows.len(), 1);
+        }
+    }
+}

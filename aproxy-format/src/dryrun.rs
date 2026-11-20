@@ -234,7 +234,7 @@ impl Unit {
         }
         .and_then(|n| usize::try_from(n).ok())
         .unwrap_or(usize::MAX);
-        let reply = if let Some(role) = &mut self.layer.role {
+        let mut reply = if let Some(role) = &mut self.layer.role {
             let m = serde_json::from_value(msg).map_err(|_| "样例不能构成该阶段的消息")?;
             let reply = role.handle(&m);
             // 不再分配一份序列化回信；逐段扣除 JSON 字节，最后一字节留给换行。
@@ -257,13 +257,70 @@ impl Unit {
         if reply.v != 1 || reply.seq != self.seq {
             return Err("角色回信序号不符".into());
         }
+        if reply
+            .request
+            .as_ref()
+            .and_then(|p| p.method.as_deref())
+            .is_some_and(|m| http::Method::from_bytes(m.as_bytes()).is_err())
+            || reply
+                .request
+                .as_ref()
+                .and_then(|p| p.url.as_deref())
+                .is_some_and(|u| {
+                    !url::Url::parse(u).is_ok_and(|url| {
+                        matches!(url.scheme(), "http" | "https") && url.host().is_some()
+                    })
+                })
+            || reply
+                .response
+                .as_ref()
+                .and_then(|p| p.status)
+                .into_iter()
+                .chain(
+                    reply
+                        .fail
+                        .as_ref()
+                        .and_then(|f| f.response.as_ref())
+                        .map(|r| r.status),
+                )
+                .any(|s| !(100..=599).contains(&s))
+            || reply.state.as_ref().is_some_and(|s| s.len() > 64 * 1024)
+        {
+            return Err("角色回信的 HTTP 元数据或状态无效".into());
+        }
+        // 只检查本阶段真正生效的整张替换表；非法单头丢弃，表容量不足则视为进程回信故障。
+        let headers = if let Some(f) = &mut reply.fail {
+            f.response.as_mut().map(|r| &mut r.headers)
+        } else if matches!(stage, "request" | "retry") {
+            reply.request.as_mut().and_then(|r| r.headers.as_mut())
+        } else {
+            reply.response.as_mut().and_then(|r| r.headers.as_mut())
+        };
+        if let Some(table) = headers {
+            let mut parsed = http::HeaderMap::new();
+            for (k, v) in std::mem::take(table) {
+                if aproxy_ipc::redact::is_managed_request_header(&k) {
+                    continue;
+                }
+                if let Ok(k) = http::HeaderName::from_bytes(k.as_bytes())
+                    && let Ok(v) = http::HeaderValue::from_str(&v)
+                    && v.to_str().is_ok()
+                {
+                    parsed.try_insert(k, v).map_err(|_| "回信头表超过限制")?;
+                }
+            }
+            parsed.try_reserve(8).map_err(|_| "回信头表超过限制")?;
+            table.extend(parsed.iter().map(|(k, v)| {
+                (
+                    k.as_str().to_owned(),
+                    v.to_str().expect("已检查可打印的头值").to_owned(),
+                )
+            }));
+        }
         self.seq += 1;
         if !matches!(stage, "heartbeat" | "notify")
             && let Some(state) = &reply.state
         {
-            if state.len() > 64 * 1024 {
-                return Err("角色状态超过限制".into());
-            }
             self.state = (!state.is_empty()).then(|| state.clone());
         }
         Ok(reply)

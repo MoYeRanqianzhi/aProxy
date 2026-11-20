@@ -915,6 +915,17 @@ async fn deliver(
         );
         let result = r.wait_after_head(setup, !upstream_sse, "stream open").await;
         let Some(result) = result else { return };
+        let result = match result {
+            Ok(output) => {
+                // 已按当前头选择表示；打开回放文件期间不能再改成另一种提交方式。
+                let finish = output.response(state, r.is_committed());
+                let Some(response) = r.wait_after_head(finish, true, "stream replay").await else {
+                    return;
+                };
+                response
+            }
+            Err(t) => Err(t),
+        };
         match result {
             Ok(response) if !r.is_committed() => {
                 rec.phase(Phase::Replaying);
@@ -922,7 +933,7 @@ async fn deliver(
             }
             Ok(response) => {
                 rec.phase(Phase::Replaying);
-                let mut stream = streams::committed_body(response, max_spool_bytes);
+                let mut stream = response.into_body().into_data_stream();
                 // 等流层下一块期间也要观察断开；不能等卡住的程序再产出一块才释放上游。
                 let Responder::Keepalive { sink, .. } = r else {
                     unreachable!()
@@ -930,7 +941,7 @@ async fn deliver(
                 while let Some(chunk) =
                     tokio::select! {biased; _=sink.client_gone()=>None, item=stream.next()=>item}
                 {
-                    if !sink.send(chunk).await {
+                    if !sink.send(chunk.map_err(std::io::Error::other)).await {
                         break;
                     }
                 }

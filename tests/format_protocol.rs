@@ -4334,3 +4334,71 @@ async fn forward_stream_can_open_before_the_client_finishes_its_upload() {
         assert!(wire.contains(&format!("received-{value}")), "{wire}");
     }
 }
+
+/// 就算流层在 open 被跳过，已提交的 SSE 也只能收到经整体验证的明文，不能先泄出损坏体的半段。
+#[tokio::test]
+async fn committed_replay_after_skipped_open_validates_all_codings_before_output() {
+    use std::io::Write as _;
+    for case in ["bad-trailer", "separate-fields", "too-deep"] {
+        let home = TestHome::new();
+        let port = free_port();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let allow = gate.clone();
+        let plain = b"data: validated-member\n\n".repeat(8192);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&plain).unwrap();
+        let mut raw = gz.finish().unwrap();
+        if case == "bad-trailer" {
+            let crc = raw.len() - 8;
+            raw[crc] ^= 1;
+        }
+        let app = axum::Router::new().fallback(move || {
+            let allow = allow.clone();
+            let raw = raw.clone();
+            async move {
+                allow.acquire().await.unwrap().forget();
+                let mut response =
+                    axum::response::Response::builder().header("content-type", "text/event-stream");
+                if case == "separate-fields" {
+                    response = response.header("content-encoding", "identity");
+                }
+                if case == "too-deep" {
+                    response = response.header("content-encoding", "gzip,gzip,gzip,gzip");
+                }
+                response
+                    .header("content-encoding", "gzip")
+                    .body(axum::body::Body::from(raw))
+                    .unwrap()
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cfg = String::from("[keepalive]\ntrigger='accept'\ninterval_secs=1\n")
+            + &layer(&home, "skip", "'stream'", &["bad-seq"])
+            + "breaker_failures=1\n";
+        let (client, url) = running(&home, port, &cfg);
+        let res = client
+            .get(url)
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.headers()["content-type"], "text/event-stream");
+        gate.add_permits(1);
+        let body = res
+            .bytes()
+            .await
+            .expect("must end as SSE, not a body I/O error");
+        if case == "separate-fields" {
+            assert!(body.ends_with(&plain));
+        } else {
+            let body = std::str::from_utf8(&body).unwrap();
+            assert!(
+                body.contains("decode_failed") && !body.contains("validated-member"),
+                "{case}: not an atomic decode failure"
+            );
+        }
+    }
+}

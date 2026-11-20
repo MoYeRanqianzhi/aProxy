@@ -510,7 +510,13 @@ pub(super) async fn forward_only_proxy(
         )
         .await
         {
-            Ok(response) => response,
+            Ok(output) => match output.response(&state, false).await {
+                Ok(response) => response,
+                Err(t) => {
+                    t.record_in(&state.stats);
+                    t.into_response(&trace)
+                }
+            },
             Err(t) => {
                 t.record_in(&state.stats);
                 t.into_response(&trace)

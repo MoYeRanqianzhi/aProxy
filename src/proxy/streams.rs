@@ -112,7 +112,7 @@ fn receive<T: Send + 'static>(rx: mpsc::Receiver<T>) -> BoxStream<'static, T> {
     futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|v| (v, rx)) })
         .boxed()
 }
-/// 严格解码器的逐块写端；阻塞工作在线程池，通道满时只阻塞这一段解码。
+/// 严格解码器的逐块写端；通道满时只阻塞这条流的专属解码线程。
 struct DecodeOutput(mpsc::Sender<Result<Bytes, End>>);
 impl std::io::Write for DecodeOutput {
     /// 复制解码器稍后要复用的缓冲区；客户端走了就立刻停止解码。
@@ -130,26 +130,50 @@ impl std::io::Write for DecodeOutput {
 /// 用流读端桥接既有的严格 gzip/br/zstd/deflate 解码器。等上游的 read 也能被下游断开唤醒。
 fn decode(input: Flow, encoding: String, limit: usize) -> Flow {
     let (tx, rx) = mpsc::channel(1);
-    let out = tx.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut failure = None;
-        let stream = futures_util::stream::unfold((input, tx), |(mut f, tx)| async move {
-            let item = tokio::select! {biased; _=tx.closed()=>None,v=f.next()=>v};
-            item.map(|v| (v, (f, tx)))
-        })
-        .map(|v| {
-            v.map_err(|end| {
-                failure = Some(end);
-                std::io::Error::other("upstream body interrupted")
+    // 这些同步 codec 可能等待一条长连接数小时，不能占用 tokio::fs 和短计算共用的线程。
+    // 进程内至多 64 条解码线程，其余在异步信号量排队，不读数据，也能被客户端取消。
+    static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
+    tokio::spawn(async move {
+        let slot = tokio::select! {biased; _=tx.closed()=>return, p=SLOTS.acquire()=>p.expect("static semaphore")};
+        let handle = tokio::runtime::Handle::current();
+        let out = tx.clone();
+        if std::thread::Builder::new()
+            .name("format-stream-decoder".into())
+            .spawn(move || {
+                let _slot = slot;
+                let mut failure = None;
+                let mut output = DecodeOutput(out.clone());
+                let result = {
+                    let stream =
+                        futures_util::stream::unfold((input, out), |(mut f, tx)| async move {
+                            let item = tokio::select! {biased; _=tx.closed()=>None,v=f.next()=>v};
+                            item.map(|v| (v, (f, tx)))
+                        })
+                        .map(|v| {
+                            v.map_err(|end| {
+                                failure = Some(end);
+                                std::io::Error::other("upstream body interrupted")
+                            })
+                        })
+                        .boxed();
+                    let mut reader = tokio_util::io::SyncIoBridge::new_with_handle(
+                        tokio_util::io::StreamReader::new(stream),
+                        handle,
+                    );
+                    // 编码的结束标记不是 HTTP EOF。读到真正的消息结尾才发 close，保留延迟到来的运输层中断。
+                    crate::decode::decode_strict(&encoding, &mut reader, &mut output, limit as u64)
+                        .is_ok()
+                        && std::io::copy(&mut reader, &mut std::io::sink()).is_ok()
+                };
+                if !result {
+                    let _ = output
+                        .0
+                        .blocking_send(Err(failure.unwrap_or_else(End::upstream)));
+                }
             })
-        })
-        .boxed();
-        let reader = tokio_util::io::SyncIoBridge::new(tokio_util::io::StreamReader::new(stream));
-        let mut output = DecodeOutput(out);
-        if crate::decode::decode_strict(&encoding, reader, &mut output, limit as u64).is_err() {
-            let _ = output
-                .0
-                .blocking_send(Err(failure.unwrap_or_else(End::upstream)));
+            .is_err()
+        {
+            let _ = tx.send(Err(End::upstream())).await;
         }
     });
     receive(rx)
@@ -350,7 +374,7 @@ pub(super) async fn chain(
     mut status: StatusCode,
     mut headers: HeaderMap,
     mut content: Content,
-) -> Result<Response, Terminal> {
+) -> Result<Output, Terminal> {
     let (client, gone) = tokio::sync::watch::channel(());
     for (index, p) in state.formats.iter().enumerate().rev() {
         if p.entry.has_stage(Stage::Response) && p.available_for_message() {
@@ -457,51 +481,142 @@ pub(super) async fn chain(
         tokio::spawn(layer.pump(f, data, tx, gone.clone()));
         content = Content::Flow(receive(rx));
     }
-    let f = content.flow().await;
-    let rec = ctx.rec.clone();
-    let out = futures_util::stream::unfold((client, f), move |mut output| {
-        let rec = rec.clone();
-        async move {
-            let item = output.1.next().await?;
-            let b = match item {
-                Ok(b) => b,
-                Err(end) => match end.tail {
-                    Some(b) => b,
-                    None => return Some((Err(std::io::Error::other(end.reason.code)), output)),
-                },
-            };
-            rec.response_bytes(b.len() as u64);
-            Some((Ok::<_, std::io::Error>(b), output))
-        }
-    });
-    let mut response = Response::new(Body::from_stream(out));
-    *response.status_mut() = status;
-    *response.headers_mut() = headers;
-    Ok(response)
+    Ok(Output {
+        status,
+        headers,
+        content,
+        client,
+        rec: ctx.rec.clone(),
+    })
 }
 
-/// 已提交的头没有编码字段；即使所有流层都跳过，压缩字节也不能当作明文写进保活流。
-pub(super) fn committed_body(
-    response: Response,
-    limit: usize,
-) -> BoxStream<'static, Result<Bytes, std::io::Error>> {
-    let encoding = encoding_to_undo(response.headers());
-    let input = response.into_body().into_data_stream();
-    if let Some(encoding) = encoding {
-        return decode(
-            input.map(|r| r.map_err(|_| End::upstream())).boxed(),
-            encoding,
-            limit,
-        )
-        .map(|r| r.map_err(|_| std::io::Error::other("stream decoding failed")))
-        .boxed();
+/// 先保留可重放表示，等响应头归属确定再选保真直回或已提交的明文回放。
+pub(super) struct Output {
+    /// 头尚未提交时放行末层的状态。
+    status: StatusCode,
+    /// 当前正文的表示头，决定是否还需要解码。
+    headers: HeaderMap,
+    /// 没有流层接手时保留已有的 spool，不重复缓冲。
+    content: Content,
+    /// 客户端丢弃响应后，唤醒这条链仍在等待的层。
+    client: tokio::sync::watch::Sender<()>,
+    /// 只数真正交付的字节，不把编码输入也算一遍。
+    rec: crate::history::Recorder,
+}
+impl Output {
+    /// 已经提交的 SSE 无法补发编码头。先完整校验压缩成员，校验失败不向客户端泄出半截明文。
+    pub(super) async fn response(
+        self,
+        state: &AppState,
+        committed: bool,
+    ) -> Result<Response, Terminal> {
+        let Self {
+            status,
+            headers,
+            mut content,
+            client,
+            rec,
+        } = self;
+        if committed && let Some(encoding) = encoding_to_undo(&headers) {
+            let decode_failure =
+                || Terminal::decode_failed(&state.history.secrets().replace(&encoding));
+            if !format_encoding_depth_allowed(&encoding) {
+                return Err(decode_failure());
+            }
+            let (raw, end) = content.gather(state).await?;
+            if end.is_some() {
+                return Err(decode_failure());
+            }
+            content = Content::Saved(
+                decode_for_committed_replay(
+                    raw,
+                    encoding.clone(),
+                    state.spool_dir.clone(),
+                    spool_limit_bytes(&state.config),
+                )
+                .await
+                .map_err(|_| decode_failure())?,
+            );
+        }
+        let f = content.flow().await;
+        let out = futures_util::stream::unfold((client, f), move |mut output| {
+            let rec = rec.clone();
+            async move {
+                let item = output.1.next().await?;
+                let b = match item {
+                    Ok(b) => b,
+                    Err(end) => match end.tail {
+                        Some(b) => b,
+                        None => return Some((Err(std::io::Error::other(end.reason.code)), output)),
+                    },
+                };
+                rec.response_bytes(b.len() as u64);
+                Some((Ok::<_, std::io::Error>(b), output))
+            }
+        });
+        let mut response = Response::new(Body::from_stream(out));
+        *response.status_mut() = status;
+        *response.headers_mut() = headers;
+        Ok(response)
     }
-    input.map(|r| r.map_err(std::io::Error::other)).boxed()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 编码成员收完后 HTTP 仍可能断流；只有运输层的 EOF 才能让外层发送 close。
+    #[tokio::test]
+    async fn valid_deflate_member_does_not_hide_a_later_transport_error() {
+        use std::io::Write as _;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        z.write_all(b"decoded before HTTP EOF").unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(Ok(Bytes::from(z.finish().unwrap())))
+            .await
+            .ok()
+            .unwrap();
+        let mut decoded = decode(receive(rx), "deflate".into(), 4096);
+        assert_eq!(
+            decoded.next().await.unwrap().ok().unwrap(),
+            "decoded before HTTP EOF"
+        );
+        let _ = tx.send(Err(End::upstream())).await;
+        drop(tx);
+        assert!(
+            matches!(decoded.next().await,Some(Err(e)) if e.reason.code=="upstream_body_interrupted")
+        );
+    }
+
+    /// 在确实等待读取压缩字节的时刻，唯一一个 Tokio 阻塞名额仍可服务无关的文件操作。
+    #[test]
+    fn idle_compressed_stream_leaves_the_shared_blocking_pool_free() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (seen, active) = tokio::sync::oneshot::channel();
+            let feed = futures_util::stream::once(async move {
+                let _ = seen.send(());
+                std::future::pending::<Result<Bytes, End>>().await
+            })
+            .boxed();
+            let live = decode(feed, "gzip".into(), 4096);
+            active.await.unwrap();
+            let result =
+                tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(|| 17))
+                    .await;
+            drop(live);
+            assert_eq!(
+                result
+                    .expect("idle decoder occupied the only shared blocking thread")
+                    .unwrap(),
+                17
+            );
+        });
+    }
     /// 三个分块跨一个四字节字符时，文本片段保持 UTF-8；真正无效的字节不被吞掉。
     #[test]
     fn split_utf8_is_carried_to_the_next_chunk() {

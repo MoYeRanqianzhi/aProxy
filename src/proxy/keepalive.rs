@@ -488,7 +488,7 @@ pub(super) fn terminal_json_event(bytes: &[u8]) -> Option<Bytes> {
 
 /// 响应声明的、回放前必须解掉的编码；无该头或只有 identity 层 → None
 pub(super) fn encoding_to_undo(headers: &HeaderMap) -> Option<String> {
-    let raw = headers.get(http::header::CONTENT_ENCODING)?;
+    let raw = request_encoding(headers, true)?;
     // 非 ASCII 的头值原样交给严格解码器，由它按「不支持的编码」报错
     let value = raw.to_str().map_or_else(
         |_| String::from_utf8_lossy(raw.as_bytes()).to_string(),

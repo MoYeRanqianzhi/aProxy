@@ -208,13 +208,15 @@ fn main() {
             }
             if mode == "reject-with-descendant" {
                 // 只继承 stderr。孙进程由测试直接控制，代理退出不应依赖它先关日志句柄。
-                let _descendant = std::process::Command::new(std::env::current_exe().unwrap())
+                let mut descendant = std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["hold-inherited-stderr", arg])
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::inherit())
                     .spawn()
                     .unwrap();
+                // 孙进程若先结束则回收它；夹具本身不等其关闭继承的句柄。
+                std::thread::spawn(move || descendant.wait());
                 println!("not JSON");
                 return;
             }

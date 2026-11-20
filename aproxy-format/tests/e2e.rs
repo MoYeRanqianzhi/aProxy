@@ -501,3 +501,31 @@ fn heartbeat_matches_only_explicit_client_paths() {
         assert!(!r.status.success() && r.stdout.is_empty());
     }
 }
+
+/// 密钥名与 Cookie 采用和代理历史相同的识别边界；请求跨 origin 及转换回程都不透传。
+#[test]
+fn credential_headers_do_not_cross_role_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("role.toml");
+    let headers = json!({"X-Access-Token":"hidden", "x-secret-thing":"hidden", "auth-info":"hidden", "x-session":"hidden", "x-signature":"hidden", "Set-Cookie":"hidden", "x-keep":"ok"});
+    for (role, toml) in [
+        ("route", "[[channel]]\nid='b'\nurl='https://b.test/v1'"),
+        (
+            "keys",
+            "[[pool]]\norigin='https://a.test'\nheader='authorization'\nkeys=[{id='a',env='FORMAT_A'}]",
+        ),
+    ] {
+        std::fs::write(&config, toml).unwrap();
+        let mut worker = Worker::new(&[role, "--config", config.to_str().unwrap()]);
+        let mut m = request("https://a.test/v1", "/v1", json!({"model":"gpt"}));
+        m["request"]["headers"] = headers.clone();
+        let r = worker.frame(m);
+        assert_eq!(r["request"]["headers"]["x-keep"], "ok");
+        assert!(!r.to_string().contains("hidden"), "{role}: {r}");
+    }
+    let mut worker = Worker::new(&["convert", "--from", "openai_chat", "--to", "openai_chat"]);
+    let mut m = response(&Value::Null, "unchanged");
+    m["response"]["headers"] = headers;
+    let r = worker.frame(m);
+    assert_eq!(r["response"]["headers"], json!({"x-keep":"ok"}));
+}

@@ -164,6 +164,7 @@ name = "aproxy-format"
 version = "0.1.1"
 dependencies = [
  "aproxy-envelope",
+ "aproxy-ipc",
  "http",
  "regex",
  "serde",

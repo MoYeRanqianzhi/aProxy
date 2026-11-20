@@ -47,18 +47,9 @@ pub fn endpoint(value: &str) -> Result<Url, &'static str> {
     Ok(u)
 }
 
-/// 整表替换鉴权时去掉常用凭据与 Cookie，其余头沿链传递。
+/// 跨边界转交前按代理日志与历史的同一规则删除全部凭据头，其余元数据保持原样。
 pub fn strip_credentials(h: &mut Headers) {
-    for name in [
-        "authorization",
-        "x-api-key",
-        "api-key",
-        "x-goog-api-key",
-        "cookie",
-        "proxy-authorization",
-    ] {
-        h.remove(name);
-    }
+    h.retain(|name, _| !aproxy_ipc::redact::is_secret_header(name));
 }
 
 /// 凭据取自用户指名的环境变量，只进入将发给上游的请求头。

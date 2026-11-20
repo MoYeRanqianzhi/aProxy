@@ -6861,3 +6861,52 @@ async fn committed_json_stream_returns_sanitized_client_error() {
     assert_eq!(body["type"], "error");
     assert_eq!(body["error"]["type"], "api_error");
 }
+
+/// 小实例的 3 MiB 回信容不下四次重复的 Responses 完成快照。转换层在仍收增量时正常报错，进程不熔断。
+#[tokio::test]
+async fn responses_snapshot_obeys_instance_reply_limit_without_breaker_failure() {
+    use serde_json::json;
+    let home = TestHome::new();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let delta = json!({"choices":[{"index":0,"delta":{"content":"x".repeat(4096)}}]});
+    let bytes = format!("data: {delta}\n\n").repeat(208)
+        + "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let app = axum::Router::new().fallback(move || {
+        let bytes = bytes.clone();
+        async move { ([("content-type", "text/event-stream")], bytes) }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let config = String::from("max_response_mb=1\ndelivery='forward'\n")
+        + &official_layer(
+            "convert",
+            "'stream'",
+            &[
+                "convert",
+                "--from",
+                "openai_responses",
+                "--to",
+                "openai_chat",
+            ],
+        )
+        + "breaker_failures=1\n";
+    let (client, url) = running(&home, port, &config);
+    let body = client
+        .post(&url)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("response.output_text.delta"));
+    assert!(body.contains("response exceeds the configured limit"));
+    assert_eq!(body.matches("event: error").count(), 1);
+    assert!(!body.contains("response.completed"));
+    assert_eq!(
+        breaker(&home, &url).await,
+        json!({"state":"closed","failures":0})
+    );
+}

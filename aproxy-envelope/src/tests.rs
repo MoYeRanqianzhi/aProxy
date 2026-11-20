@@ -9,6 +9,36 @@ fn roundtrip<T: DeserializeOwned + Serialize>(value: Value) {
     assert_eq!(serde_json::to_value(typed).unwrap(), value);
 }
 
+/// Old offers omit the object; a new offer omits only groups that are unlimited.
+#[test]
+fn optional_reply_limits_preserve_unlimited_groups() {
+    let mut hello = Hello::new(
+        "test".into(),
+        "convert".into(),
+        Process::Persistent,
+        vec![],
+        0,
+    );
+    assert!(
+        serde_json::to_value(&hello)
+            .unwrap()
+            .get("limits")
+            .is_none()
+    );
+    hello.limits = Some(ReplyLimits::new(
+        Some(65536),
+        None,
+        Some(3145728),
+        Some(1048576),
+    ));
+    let wire = serde_json::to_value(hello).unwrap();
+    assert_eq!(
+        wire["limits"],
+        json!({"hello":65536,"response":3145728,"control":1048576})
+    );
+    roundtrip::<Hello>(wire);
+}
+
 /// Check the full published instance messages including absent and explicitly null fields.
 #[test]
 fn instance_messages_roundtrip() {

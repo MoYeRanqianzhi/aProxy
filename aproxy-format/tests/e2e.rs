@@ -996,13 +996,14 @@ fn malformed_stream_ends_in_the_client_protocol_only_once() {
 /// 逐个发送的小事件也会让 Responses 保留整轮文本；到达总预算必须错误结束而不是等到 close 爆帧。
 #[test]
 fn semantic_budget_counts_complete_events_across_frames() {
-    let mut w = Worker::new(&[
-        "convert",
-        "--from",
-        "openai_responses",
-        "--to",
-        "openai_chat",
-    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("convert.toml");
+    std::fs::write(
+        &config,
+        "from='openai_responses'\nto='openai_chat'\nstream_budget_bytes=1048576",
+    )
+    .unwrap();
+    let mut w = Worker::new(&["convert", "--config", config.to_str().unwrap()]);
     open_stream(&mut w, "text/event-stream");
     let event = json!({"choices":[{"index":0,"delta":{"content":"x".repeat(32*1024)}}]});
     let bytes = format!("data: {event}\n\n");
@@ -1014,6 +1015,7 @@ fn semantic_budget_counts_complete_events_across_frames() {
         if ended {
             assert!(data.is_empty());
         } else if data.contains("event: error\n") {
+            assert!(data.contains("response exceeds the configured limit"));
             ended = true;
         } else {
             assert!(data.contains("response.output_text.delta"));

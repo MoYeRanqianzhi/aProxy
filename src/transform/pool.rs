@@ -898,6 +898,15 @@ impl Pool {
                 .collect(),
             id,
         );
+        let [request, response] = self
+            .frame_limits
+            .map(|n| (n != usize::MAX).then_some(n as u64));
+        hello.limits = Some(aproxy_envelope::ReplyLimits::new(
+            Some(HELLO_BYTES as u64),
+            request,
+            response,
+            Some(FRAME_OVERHEAD as u64),
+        ));
         hello.features.push("decide.success".into());
         hello.overrides = OVERRIDES.iter().map(|k| (*k).into()).collect();
         let line = w

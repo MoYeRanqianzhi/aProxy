@@ -110,6 +110,9 @@ impl Role {
     /// 订阅声明是上限；实例最终只向配置选中的阶段写帧。摘要协商不能退化为默认的 full。
     fn hello(&mut self, name: &str, offer: &w::Hello) -> w::HelloReply {
         use w::BodyNeed::{Digest, Full, None};
+        if let Self::Convert(c) = self {
+            c.negotiate(offer.limits.as_ref());
+        }
         if let Self::Route(route) = self {
             route.negotiate(&offer.overrides);
         }

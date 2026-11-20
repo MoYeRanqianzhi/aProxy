@@ -7,10 +7,6 @@ use switchyard_translation::{StreamTranslationState, TranslationEngine, WireForm
 /// 单个尚未结束的 SSE 事件上限，与整条流的长度无关。
 const MAX_EVENT: usize = 8 * 1024 * 1024;
 
-/// 编解码器可能保留整轮文本和工具参数，Responses 的最后一帧还会重复这些数据。
-/// 分别限制累计送入语义层的 JSON 字节、单条回信的目标字节；为 8 MiB 管道帧中的 JSON 转义留余量。
-pub(super) const SEMANTIC_BYTES: usize = 1024 * 1024;
-
 /// 当前事件跨协议转换所需的字节边界、语义状态和终止标记。
 pub(super) struct Events {
     /// 上游返回的协议。
@@ -23,6 +19,8 @@ pub(super) struct Events {
     state: StreamTranslationState,
     /// 只对有语义的完整事件扣费，注释与网络分片不改变预算。
     remaining: usize,
+    /// 已输出的 Responses 增量在同一次终态回信中必须重现的最少字节（含双层 JSON 转义）。
+    snapshot_min: usize,
     /// 只积累尚未被空行分隔的一帧，行结束已统一成 LF。
     frame: Vec<u8>,
     /// CR 已结束上一行，下一字节若是 LF 则属于同一换行。
@@ -48,13 +46,14 @@ pub(super) struct Events {
 }
 impl Events {
     /// 每次 open 初始化，不把上一条流的输出索引或 usage 带到下一条。
-    pub(super) fn new(source: F, target: F, include_usage: bool) -> Self {
+    pub(super) fn new(source: F, target: F, include_usage: bool, budget: usize) -> Self {
         Self {
             source,
             target,
             engine: TranslationEngine::default(),
             state: Default::default(),
-            remaining: SEMANTIC_BYTES,
+            remaining: budget,
+            snapshot_min: 0,
             frame: Vec::new(),
             after_cr: false,
             first: true,
@@ -69,8 +68,8 @@ impl Events {
         }
     }
     /// 将已经完整的事件变成立即可交付的目标帧，不等待下一次 data 或 close。
-    pub(super) fn feed(&mut self, bytes: &[u8]) -> Result<String, Fault> {
-        let mut output = String::new();
+    pub(super) fn feed(&mut self, bytes: &[u8], capacity: usize) -> Result<String, Fault> {
+        let mut output = Bounded::new(capacity);
         for &b in bytes {
             if self.terminal {
                 break;
@@ -96,10 +95,10 @@ impl Events {
                 ));
             }
         }
-        Ok(output)
+        Ok(output.text)
     }
     /// 逐行提取 data；注释、重连参数和空事件不是提供方的 JSON，不能送入语义层。
-    fn dispatch(&mut self, output: &mut String) -> Result<(), Fault> {
+    fn dispatch(&mut self, output: &mut Bounded) -> Result<(), Fault> {
         let mut frame = std::str::from_utf8(&self.frame).map_err(|_| malformed())?;
         if std::mem::take(&mut self.first) {
             frame = frame.trim_start_matches('\u{feff}');
@@ -125,7 +124,7 @@ impl Events {
             if finishes.is_empty() {
                 return Ok(());
             }
-            return self.translate(&serde_json::json!({"choices":finishes}), output);
+            return self.translate(serde_json::json!({"choices":finishes}), output);
         }
         self.remaining = self.remaining.checked_sub(data.len()).ok_or_else(budget)?;
         let mut event: Value = serde_json::from_str(data).map_err(|_| malformed())?;
@@ -176,24 +175,45 @@ impl Events {
             if event["type"] == "message_stop"
                 && let Some(delta) = self.message_finish.take()
             {
-                self.translate(&delta, output)?;
+                self.translate(delta, output)?;
             }
         }
-        self.translate(&event, output)
+        self.translate(event, output)
     }
     /// 已确认的源事件才进入语义层，目标端的终态不能早于源端的完成标志。
-    fn translate(&mut self, event: &Value, output: &mut String) -> Result<(), Fault> {
-        let events = self
-            .engine
-            .translate_event(&mut self.state, self.source, self.target, event)
-            .map_err(|_| malformed())?;
-        self.render_events(events, output)?;
-        if self.source == F::OpenAiResponses
+    fn translate(&mut self, event: Value, output: &mut Bounded) -> Result<(), Fault> {
+        // 一份完成快照可解成很多中间块；目标块各自复制模型、ID 等上下文。
+        // 保留原生输出类型的校验，但逐个编码、计费，绝不先收集整份放大后的目标事件数组。
+        let closing_tool = (self.source == F::OpenAiResponses
             && self.target == F::AnthropicMessages
             && event["type"] == "response.output_item.done"
-            && event["item"]["type"] == "function_call"
-            && let Some(id) = event["item"]["call_id"].as_str()
-            && let Some(index) = self.open_tools.remove(id)
+            && event["item"]["type"] == "function_call")
+            .then(|| event["item"]["call_id"].as_str().map(str::to_owned))
+            .flatten();
+        let decoded = self
+            .engine
+            .decode_stream_event(&mut self.state, self.source, event)
+            .map_err(|_| malformed())?;
+        let (original, chunks) = decoded.into_parts();
+        if let Some(original) = original {
+            let (source, raw) = original.into_parts();
+            let check =
+                switchyard_translation::LlmResponseStreamEvent::preserved(source, raw, Vec::new());
+            let checked = self
+                .engine
+                .encode_stream_event(&mut self.state, self.target, check)
+                .map_err(|_| malformed())?;
+            self.render_events(checked, output)?;
+        }
+        for chunk in chunks {
+            let encoded = self
+                .engine
+                .encode_stream_event(&mut self.state, self.target, chunk.into())
+                .map_err(|_| malformed())?;
+            self.render_events(encoded, output)?;
+        }
+        if let Some(id) = closing_tool
+            && let Some(index) = self.open_tools.remove(&id)
         {
             self.closed_tools.insert(index);
             render(
@@ -205,7 +225,29 @@ impl Events {
         Ok(())
     }
     /// 按客户端的选项调整目标帧；最后只发一个独立用量块，且不能再带工具或文本。
-    fn render_events(&mut self, mut events: Vec<Value>, output: &mut String) -> Result<(), Fault> {
+    fn render_events(&mut self, mut events: Vec<Value>, output: &mut Bounded) -> Result<(), Fault> {
+        if self.target == F::OpenAiResponses {
+            // 文本和推理文本出现在四个 done/终态位置，工具参数出现在三个位置。
+            // 在已确定一行装不下时立即结束，而非先在 finish 中构造全部重复快照。
+            for e in &events {
+                let (value, copies) = match e["type"].as_str() {
+                    Some(
+                        "response.output_text.delta" | "response.reasoning_summary_text.delta",
+                    ) => (&e["delta"], 4),
+                    Some("response.function_call_arguments.delta") => (&e["delta"], 3),
+                    Some("response.output_item.added") => (&e["item"]["id"], 2),
+                    _ => continue,
+                };
+                if let Some(text) = value.as_str() {
+                    self.snapshot_min = self
+                        .snapshot_min
+                        .saturating_add(nested_string_bytes(text).saturating_mul(copies));
+                    if self.snapshot_min > output.capacity {
+                        return Err(budget());
+                    }
+                }
+            }
+        }
         if self.source == F::OpenAiResponses && self.target == F::AnthropicMessages {
             events.retain(|e| {
                 let Some(index) = e["index"].as_u64() else {
@@ -284,14 +326,14 @@ impl Events {
         render(self.target, events, output)
     }
     /// 运输层正常 EOF 不代表协议完整。只在源协议已结束且没有半帧时合成剩余的结束事件。
-    pub(super) fn finish(mut self) -> Result<String, Fault> {
+    pub(super) fn finish(&mut self, capacity: usize) -> Result<String, Fault> {
         if !self.frame.is_empty() || !self.terminal {
             return Err(Fault::new(
                 "事件流没有完整结束",
                 "incomplete upstream event stream",
             ));
         }
-        let mut output = String::new();
+        let mut output = Bounded::new(capacity);
         let events = self
             .engine
             .finish_stream(&mut self.state, self.target)
@@ -301,10 +343,18 @@ impl Events {
             if let Some(usage) = self.usage_chunk.take() {
                 render(self.target, vec![usage], &mut output)?;
             }
-            std::fmt::Write::write_str(&mut Bounded(&mut output), "data: [DONE]\n\n")
-                .map_err(|_| budget())?;
+            std::fmt::Write::write_str(&mut output, "data: [DONE]\n\n").map_err(|_| budget())?;
         }
-        Ok(output)
+        Ok(output.text)
+    }
+    /// 超限是转换结果，不让代理把它误认为管道故障；其他损坏事件保持通用诊断。
+    pub(super) fn ending(&self, fault: &Fault) -> String {
+        if fault.wire == LIMIT_REASON {
+            self.abort()
+                .replace("stream conversion aborted", LIMIT_REASON)
+        } else {
+            self.abort().into()
+        }
     }
     /// 同一条错误收尾既交给 open 备用，也在收到 abort 时直接返回，绝不伪造正常结束。
     pub(super) fn abort(&self) -> &'static str {
@@ -380,29 +430,83 @@ fn visible_part(part: &mut Value) {
 fn malformed() -> Fault {
     Fault::new("无法转换流事件", "invalid stream event")
 }
-/// 不暴露内容或长度，工作进程在超限后直接输出目标协议的错误结尾。
+/// 客户端可区分限制与网络中断，不披露原始正文。
+pub(super) const LIMIT_REASON: &str = "response exceeds the configured limit";
+/// 输入与输出限制都按协议错误结束，不计入进程熔断。
 fn budget() -> Fault {
-    Fault::new(
-        "流转换超过 1 MiB 语义预算",
-        "stream conversion exceeds the semantic budget",
-    )
+    Fault::new("转换响应超过配置的限制", LIMIT_REASON)
 }
-/// 直接限制渲染目的地，而不是等终态快照与多份 done 事件全部写进字符串后才检查。
-struct Bounded<'a>(&'a mut String);
-impl std::fmt::Write for Bounded<'_> {
-    /// 格式化器可分多次写片段，总是先检查余量再分配目标空间。
-    fn write_str(&mut self, chunk: &str) -> std::fmt::Result {
-        if chunk.len() > SEMANTIC_BYTES.saturating_sub(self.0.len()) {
-            return Err(std::fmt::Error);
+/// serde_json 在字符串中只转义控制字符、双引号和反斜杠；其余 UTF-8 字节原样写出。
+/// 两层字符串（目标事件放入回信 data）时，第一层引入的反斜杠也须计费。
+fn string_cost<const NESTED: bool>(text: &str) -> usize {
+    text.bytes()
+        .map(|b| match b {
+            b'"' | b'\\' => {
+                if NESTED {
+                    4
+                } else {
+                    2
+                }
+            }
+            b'\n' | b'\r' | b'\t' | 8 | 12 => {
+                if NESTED {
+                    3
+                } else {
+                    2
+                }
+            }
+            0..=31 => {
+                if NESTED {
+                    7
+                } else {
+                    6
+                }
+            }
+            _ => 1,
+        })
+        .sum()
+}
+/// 已格式化 SSE 或 JSON 放入 data 时的实际字节数，不含字符串两端引号。
+pub(super) fn escaped_bytes(text: &str) -> usize {
+    string_cost::<false>(text)
+}
+/// 原始增量在嵌套 JSON 字符串中的实际字节数。
+fn nested_string_bytes(text: &str) -> usize {
+    string_cost::<true>(text)
+}
+/// 只为能写入当前回信的字节分配空间，逐笔按外层序列化后的长度扣费。
+struct Bounded {
+    /// 尚未转义的目标 SSE 字节。
+    text: String,
+    /// 单独保存初始容量，供将来终态回信的下界检查使用。
+    capacity: usize,
+    /// 当前回信余量。
+    left: usize,
+}
+impl Bounded {
+    /// 从实际序号和行长算出的可用字节开始计费。
+    fn new(capacity: usize) -> Self {
+        Self {
+            text: String::new(),
+            capacity,
+            left: capacity,
         }
-        self.0.push_str(chunk);
+    }
+}
+impl std::fmt::Write for Bounded {
+    /// 序列化可以分多次写片段；拒绝本次写入后不再扩容。
+    fn write_str(&mut self, chunk: &str) -> std::fmt::Result {
+        self.left = self
+            .left
+            .checked_sub(escaped_bytes(chunk))
+            .ok_or(std::fmt::Error)?;
+        self.text.push_str(chunk);
         Ok(())
     }
 }
 /// Chat 使用匿名 data 事件，其余两种协议都以 JSON 的 type 命名 SSE 事件。
-fn render(target: F, events: Vec<Value>, output: &mut String) -> Result<(), Fault> {
+fn render(target: F, events: Vec<Value>, output: &mut Bounded) -> Result<(), Fault> {
     use std::fmt::Write as _;
-    let mut output = Bounded(output);
     for event in events {
         if target != F::OpenAiChat {
             let name = event["type"].as_str().ok_or_else(malformed)?;
@@ -451,12 +555,12 @@ mod tests {
                     input.push_str("data: [DONE]\n\n");
                 }
                 let run = |step| {
-                    let mut s = Events::new(source, target, false);
+                    let mut s = Events::new(source, target, false, 64 << 20);
                     let mut out = String::new();
                     for b in input.as_bytes().chunks(step) {
-                        out += &s.feed(b).map_err(|e| e.wire).unwrap();
+                        out += &s.feed(b, 64 << 20).map_err(|e| e.wire).unwrap();
                     }
-                    out += &s.finish().map_err(|e| e.wire).unwrap();
+                    out += &s.finish(64 << 20).map_err(|e| e.wire).unwrap();
                     out
                 };
                 let out = run(1);
@@ -468,20 +572,113 @@ mod tests {
     /// 输入不完整、非法或无界时不得补出成功的协议结束事件。
     #[test]
     fn malformed_partial_or_oversized_events_fail_closed() {
-        let create = || Events::new(F::OpenAiChat, F::AnthropicMessages, false);
+        let create = || Events::new(F::OpenAiChat, F::AnthropicMessages, false, 64 << 20);
         for bad in [
             b"data: {x}\n\n".as_slice(),
             b"data:\xff\n\n",
             b"data: []\n\n",
         ] {
-            assert!(create().feed(bad).is_err());
+            assert!(create().feed(bad, 64 << 20).is_err());
         }
         let mut partial = create();
-        assert!(partial.feed(b"data: {\"choices\":[").is_ok());
-        assert!(partial.finish().is_err());
-        assert!(create().feed(&vec![b' '; MAX_EVENT + 1]).is_err());
+        assert!(partial.feed(b"data: {\"choices\":[", 64 << 20).is_ok());
+        assert!(partial.finish(64 << 20).is_err());
+        assert!(create().feed(&vec![b' '; MAX_EVENT + 1], 64 << 20).is_err());
         let mut no_stop = create();
-        assert!(no_stop.feed(b"data: {\"choices\":[]}\n\n").is_ok());
-        assert!(no_stop.finish().is_err());
+        assert!(
+            no_stop
+                .feed(b"data: {\"choices\":[]}\n\n", 64 << 20)
+                .is_ok()
+        );
+        assert!(no_stop.finish(64 << 20).is_err());
+    }
+    /// 六个方向都传足 4 MiB 正文而非用注释填充；逐块验增量并检查真正的协议终点。
+    #[test]
+    fn four_mib_of_small_deltas_completes_in_every_direction() {
+        use serde_json::json;
+        let corpus: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/protocols.json")).unwrap();
+        let formats = [F::OpenAiChat, F::OpenAiResponses, F::AnthropicMessages];
+        let text = "x".repeat(4096);
+        for source in formats {
+            let start = &corpus[source.to_string()]["events"][0];
+            let (delta, end) = match source {
+                F::OpenAiChat => (
+                    json!({"choices":[{"index":0,"delta":{"content":text}}]}),
+                    json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+                ),
+                F::OpenAiResponses => (
+                    json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":text}),
+                    json!({"type":"response.completed","response":{"output":[]}}),
+                ),
+                F::AnthropicMessages => (
+                    json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}),
+                    json!({"type":"message_stop"}),
+                ),
+            };
+            let delta = format!("data: {delta}\n\n");
+            for target in formats.into_iter().filter(|t| *t != source) {
+                let mut stream = Events::new(source, target, false, 64 << 20);
+                let mut feed = |s: &str| {
+                    stream
+                        .feed(s.as_bytes(), 64 << 20)
+                        .map_err(|f| f.wire)
+                        .unwrap()
+                };
+                feed(&format!("data: {start}\n\n"));
+                for _ in 0..1024 {
+                    assert!(feed(&delta).contains(&text), "{source} -> {target}");
+                }
+                let mut tail = feed(&format!("data: {end}\n\n"));
+                if source == F::OpenAiChat {
+                    tail.push_str(&feed("data: [DONE]\n\n"));
+                }
+                tail.push_str(&stream.finish(64 << 20).map_err(|f| f.wire).unwrap());
+                assert!(!tail.contains("event: error"));
+                assert!(
+                    tail.contains(match target {
+                        F::OpenAiChat => "data: [DONE]",
+                        F::AnthropicMessages => "event: message_stop",
+                        F::OpenAiResponses => "event: response.completed",
+                    }),
+                    "{source} -> {target}"
+                );
+            }
+        }
+    }
+    /// 比较标准序列化器的实际字节，覆盖内外两层转义以及 UTF-8 多字节字符。
+    #[test]
+    fn escaped_sizes_match_wire_serialization() {
+        let text: String = (0..=127).map(char::from).chain("字λ".chars()).collect();
+        let once = serde_json::to_string(&text).unwrap();
+        assert_eq!(escaped_bytes(&text), once.len() - 2);
+        assert_eq!(
+            nested_string_bytes(&text),
+            serde_json::to_string(&once[1..once.len() - 1])
+                .unwrap()
+                .len()
+                - 2
+        );
+    }
+    /// 完成快照可一次提供多个文本片段；目标 ID 与模型只能逐块复制到预算之内。
+    #[test]
+    fn completed_parts_share_one_encoded_reply_budget() {
+        use serde_json::json;
+        let mut stream = Events::new(F::OpenAiResponses, F::OpenAiChat, false, 1 << 20);
+        let start =
+            json!({"type":"response.created","response":{"id":"fixture","model":"m".repeat(256)}});
+        stream
+            .feed(format!("data: {start}\n\n").as_bytes(), 2048)
+            .map_err(|f| f.wire)
+            .unwrap();
+        let parts = vec![json!({"type":"output_text","text":"part"}); 12];
+        let end = json!({"type":"response.completed","response":{"output":[{"type":"message","content":parts}]}});
+        assert_eq!(
+            stream
+                .feed(format!("data: {end}\n\n").as_bytes(), 2048)
+                .unwrap_err()
+                .wire,
+            LIMIT_REASON
+        );
     }
 }

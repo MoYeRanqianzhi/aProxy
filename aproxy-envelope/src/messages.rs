@@ -107,6 +107,41 @@ pub enum Decision {
     Stop,
 }
 
+/// Inclusive reply-line sizes, in bytes (including the terminating LF).
+/// A missing group has no advertised limit; peers may impose their own smaller cap.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ReplyLimits {
+    /// Hello replies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hello: Option<u64>,
+    /// Request and retry replies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<u64>,
+    /// Response and stream replies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<u64>,
+    /// All other stage replies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<u64>,
+}
+impl ReplyLimits {
+    /// Build an offer with only the bounded groups present.
+    pub fn new(
+        hello: Option<u64>,
+        request: Option<u64>,
+        response: Option<u64>,
+        control: Option<u64>,
+    ) -> Self {
+        Self {
+            hello,
+            request,
+            response,
+            control,
+        }
+    }
+}
+
 /// The immutable session offer; stage names and features are open vocabularies.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -125,6 +160,9 @@ pub struct Hello {
     pub worker_id: u32,
     /// Optional behavior supported by the instance.
     pub features: Vec<String>,
+    /// Optional instance-specific limits. Older instances do not send this object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ReplyLimits>,
     /// Configuration keys accepted from this program.
     pub overrides: Vec<String>,
 }
@@ -138,6 +176,7 @@ impl Hello {
         worker_id: u32,
     ) -> Self {
         Self {
+            limits: None,
             protocols: vec![1],
             aproxy_version,
             name,

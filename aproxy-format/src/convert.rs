@@ -28,9 +28,19 @@ pub struct Convert {
     /// to=auto 的目的端协议表，加载后按路径前缀从长到短排好。
     #[serde(default)]
     upstream: Vec<Destination>,
+    /// 完整源事件累计预算，非 SSE 订阅收齐一个 JSON 实体时也按此限制分配。
+    #[serde(default = "default_budget")]
+    stream_budget_bytes: usize,
+    /// 工作进程自己的回信硬上限，还须服从实例在 hello 公布的更小上限。
+    #[serde(skip, default = "default_budget")]
+    reply_bytes: usize,
     /// 每个在途流独占进程，仅在 open 和终止帧之间保留这份状态。
     #[serde(skip)]
     stream: Option<Entity>,
+}
+/// 默认给长回答留出 64 MiB，不依赖实例是否公布回信上限。
+fn default_budget() -> usize {
+    64 * 1024 * 1024
 }
 /// 匹配规范化后的 origin 和路径段，避免 `/tenant` 也命中 `/tenant2`。
 #[derive(Deserialize)]
@@ -76,13 +86,26 @@ impl Convert {
             from: from.into(),
             to: to.into(),
             upstream: Vec::new(),
+            stream_budget_bytes: default_budget(),
+            reply_bytes: default_budget(),
             stream: None,
         };
         c.validate()?;
         Ok(c)
     }
+    /// 未公布上限的旧实例仍受本地内存预算保护；较小的实例限制优先。
+    pub(super) fn negotiate(&mut self, limits: Option<&w::ReplyLimits>) {
+        self.reply_bytes = limits
+            .and_then(|l| l.response)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(usize::MAX)
+            .min(default_budget());
+    }
     /// 握手前校验协议、映射唯一性与匹配边界，auto 留到看到实际请求再解析。
     pub fn validate(&mut self) -> Result<(), &'static str> {
+        if self.stream_budget_bytes == 0 {
+            return Err("stream_budget_bytes 必须大于零");
+        }
         if self.from != "auto" {
             protocol(&self.from)?;
         }
@@ -234,7 +257,10 @@ impl Convert {
     }
     /// 两种交付路径只在能否改状态码上不同；协议错误正文始终由本地生成。
     fn error_json(client: F) -> String {
-        let message = "The upstream response could not be converted.";
+        Self::json_error_message(client, "The upstream response could not be converted.")
+    }
+    /// 大小限制和协议错误共用目标形状，但向客户端给出不同的可处理原因。
+    fn json_error_message(client: F, message: &str) -> String {
         match client {
             F::OpenAiChat | F::OpenAiResponses => serde_json::json!({"error":{"type":"server_error","message":message,"code":"conversion_failed","param":null}}),
             F::AnthropicMessages => serde_json::json!({"type":"error","error":{"type":"api_error","message":message}}),
@@ -292,6 +318,10 @@ impl Convert {
     }
     /// 头部在 open 即交付。跨协议 JSON 在 close 处理，半截实体绝不作为完整响应提交。
     pub fn stream(&mut self, m: &w::StreamMessage, r: &mut w::Reply) -> Result<(), Fault> {
+        // data 的 JSON 字符串已由渲染器逐段计费；固定信封、实际序号和 LF 也占行长。
+        let capacity = self.reply_bytes.saturating_sub(
+            br#"{"v":1,"seq":,"data":""}"#.len() + 2 + r.seq.checked_ilog10().unwrap_or(0) as usize,
+        );
         match &m.event {
             w::StreamEvent::Open(o) => {
                 let Session(client, upstream, usage) = self.pair(&o.context)?;
@@ -303,7 +333,12 @@ impl Convert {
                         .next()
                         .is_some_and(|t| t.trim().eq_ignore_ascii_case("text/event-stream"))
                 }) {
-                    let events = crate::events::Events::new(upstream, client, usage);
+                    let events = crate::events::Events::new(
+                        upstream,
+                        client,
+                        usage,
+                        self.stream_budget_bytes,
+                    );
                     r.abort_tail = Some(events.abort().into());
                     Entity::Sse(Box::new(events))
                 } else {
@@ -326,16 +361,16 @@ impl Convert {
             {
                 Entity::Pass => r.data = w::Data::from_bytes(d.as_bytes().to_vec()),
                 Entity::Ended => r.data = w::Data::Text(String::new()),
-                Entity::Sse(events) => match events.feed(d.as_bytes()) {
+                Entity::Sse(events) => match events.feed(d.as_bytes(), capacity) {
                     Ok(out) => r.data = w::Data::Text(out),
-                    Err(_) => {
-                        r.data = w::Data::Text(events.abort().into());
+                    Err(fault) => {
+                        r.data = w::Data::Text(events.ending(&fault));
                         self.stream = Some(Entity::Ended);
                     }
                 },
                 Entity::InvalidJson(_) => r.data = w::Data::Text(String::new()),
                 Entity::Json(client, _, b) => {
-                    if d.as_bytes().len() > crate::events::SEMANTIC_BYTES.saturating_sub(b.len()) {
+                    if d.as_bytes().len() > self.stream_budget_bytes.saturating_sub(b.len()) {
                         self.stream = Some(Entity::InvalidJson(*client));
                     } else {
                         b.extend_from_slice(d.as_bytes());
@@ -345,19 +380,24 @@ impl Convert {
             },
             w::StreamEvent::Close => match self.stream.take() {
                 Some(Entity::Json(client, upstream, b)) => {
-                    r.data = w::Data::Text(
-                        Self::json(client, upstream, &b)
-                            .ok()
-                            .filter(|v| v.len() <= crate::events::SEMANTIC_BYTES)
-                            .unwrap_or_else(|| Self::error_json(client)),
-                    )
+                    r.data = w::Data::Text(match Self::json(client, upstream, &b) {
+                        Ok(v) if crate::events::escaped_bytes(&v) <= capacity => v,
+                        Ok(_) => Self::json_error_message(client, crate::events::LIMIT_REASON),
+                        Err(_) => Self::error_json(client),
+                    })
                 }
                 Some(Entity::InvalidJson(client)) => {
-                    r.data = w::Data::Text(Self::error_json(client))
+                    r.data = w::Data::Text(Self::json_error_message(
+                        client,
+                        crate::events::LIMIT_REASON,
+                    ))
                 }
-                Some(Entity::Sse(events)) => {
-                    let tail = events.abort();
-                    r.data = w::Data::Text(events.finish().unwrap_or_else(|_| tail.into()));
+                Some(Entity::Sse(mut events)) => {
+                    r.data = w::Data::Text(
+                        events
+                            .finish(capacity)
+                            .unwrap_or_else(|fault| events.ending(&fault)),
+                    );
                 }
                 _ => (),
             },

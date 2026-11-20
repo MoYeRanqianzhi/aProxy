@@ -205,6 +205,47 @@ impl AppState {
         Ok(())
     }
 
+    /// 承载 HTTP 直到停止。截止前允许在途连接排空；返回 true 表示已强退进程，不可再等待在途请求。
+    pub async fn serve_until_stopped(
+        &self,
+        listener: tokio::net::TcpListener,
+        app: Router,
+        stopping: impl std::future::Future<Output = ()> + Clone + Send + 'static,
+    ) -> bool {
+        // 优雅关闭 + 宽限强退：keepalive 后台重试任务不会主动结束，axum::serve 等待
+        // 在途连接完成时可能被其无限期挂起，收到停止信号后给 10 秒宽限窗口即强制退出。
+        // 停止信号一到就告诉订阅事件的客户端「实例要退出了」：处在二进制更换阶段时原因是 swap
+        // （随后会有新版本的实例起来），否则是 shutdown
+        let graceful = {
+            let drain_state = self.clone();
+            let stopping = stopping.clone();
+            async move {
+                stopping.await;
+                drain_state.drain_idle_formats();
+                let swapping = drain_state
+                    .stats
+                    .swap_until_ms
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    > crate::daemon::now_millis();
+                drain_state
+                    .history
+                    .announce_closing(if swapping { "swap" } else { "shutdown" });
+            }
+        };
+        tokio::select! {
+            () = async {
+                axum::serve(listener, app).with_graceful_shutdown(graceful).await.unwrap();
+                self.retire_formats().await;
+            } => false,
+            _ = async {
+                stopping.await;
+                tracing::info!("10 秒后强制退出（在途请求将中断）");
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                self.terminate_remaining_formats().await;
+            } => true,
+        }
+    }
+
     /// 停机开始先并行退役空闲进程；在途请求仍可使用其余会话。
     pub fn drain_idle_formats(&self) {
         for pool in self.formats.iter() {

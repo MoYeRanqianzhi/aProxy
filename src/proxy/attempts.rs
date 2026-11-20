@@ -536,6 +536,8 @@ pub(super) async fn run_attempts(
             rec.backoff(delay);
             if delay.is_zero() {
                 tracing::warn!(attempt, "立即重试");
+                // 进程池关闭后取位可立即失败；零退避的连续失败也要把执行机会还给停机与断连任务。
+                tokio::task::consume_budget().await;
             } else {
                 tracing::warn!(attempt, delay_ms = delay.as_millis() as u64, "重试延迟");
                 if r.wait(tokio::time::sleep(delay), None, "退避等待")

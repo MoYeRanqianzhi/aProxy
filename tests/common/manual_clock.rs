@@ -43,7 +43,8 @@ impl Clock {
         std::thread::spawn(move || {
             for line in pipe.lines().map_while(Result::ok) {
                 if (line.trim_end().ends_with("clock ready")
-                    || line.trim_end().ends_with("clock advanced"))
+                    || line.trim_end().ends_with("clock advanced")
+                    || line.trim_end().ends_with("clock drained"))
                     && send.send(line).is_err()
                 {
                     break;
@@ -75,8 +76,31 @@ impl Clock {
     }
     /// 一个时刻最多显式推进到下一拍；不会在等操作系统读写期间追赶另一个截止点。
     pub(super) fn advance(&mut self, secs: u64) {
-        writeln!(self.child.0.stdin.as_mut().unwrap(), "{secs}").unwrap();
-        self.ack("clock advanced");
+        self.step(secs, false);
+    }
+    /// 最后一拨等服务自身的强退分支收回进程，不用测试夹具析构造成的退出冒充停机成功。
+    pub(super) fn step(&mut self, secs: u64, finish: bool) {
+        if !finish {
+            writeln!(self.child.0.stdin.as_mut().unwrap(), "{secs}").unwrap();
+            self.ack("clock advanced");
+            return;
+        }
+        let mut pipe = self.child.0.stdin.take().unwrap();
+        writeln!(pipe, "finish {secs}").unwrap();
+        drop(pipe);
+        self.ack("clock drained");
+        let guard = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = self.child.0.try_wait().unwrap() {
+                assert!(status.success(), "{status}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < guard,
+                "drained server did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
     /// 请求已到达尚未放行的上游；之后的推进必定落在这条请求的生命期内。
     pub(super) async fn first_head(
@@ -130,7 +154,7 @@ async fn serve() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let reader = tokio::task::spawn_blocking(move || {
         for line in std::io::stdin().lock().lines().map_while(Result::ok) {
-            if tx.send(line.parse::<u64>().unwrap()).is_err() {
+            if tx.send(line).is_err() {
                 break;
             }
         }
@@ -142,7 +166,7 @@ async fn serve() {
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     std::fs::create_dir_all(daemon::run_dir()).unwrap();
     let endpoint = daemon::bind_ipc(port).await.unwrap();
-    let (stop, _rx) = tokio::sync::watch::channel(false);
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
     let control = Arc::new(daemon::ControlState {
         record: daemon::InstanceRecord {
             pid: std::process::id(),
@@ -163,11 +187,40 @@ async fn serve() {
         on_shutdown: stop,
         stop_requested: Default::default(),
     });
+    daemon::write_instance_file(&control.record).unwrap();
     let ipc = tokio::spawn(daemon::serve_ipc(endpoint, control));
     let router = proxy::router(state.clone());
-    let http = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    use futures_util::FutureExt as _;
+    let serving = state.clone();
+    let http = tokio::spawn(async move {
+        serving
+            .serve_until_stopped(
+                listener,
+                router,
+                async move {
+                    stopped.wait_for(|v| *v).await.unwrap();
+                }
+                .shared(),
+            )
+            .await
+    });
     println!("clock ready");
-    while let Some(secs) = rx.recv().await {
+    while let Some(line) = rx.recv().await {
+        if let Some(secs) = line.strip_prefix("finish ") {
+            tokio::time::advance(
+                Duration::from_secs(secs.parse().unwrap()) + Duration::from_millis(2),
+            )
+            .await;
+            // 截止点已由父测试越过；只把之后的进程退出确认放回真实时钟。
+            tokio::time::resume();
+            assert!(http.await.unwrap(), "server did not take its deadline exit");
+            ipc.abort();
+            daemon::remove_registry_files(&state.config.listen_addr);
+            reader.await.unwrap();
+            println!("clock drained");
+            return;
+        }
+        let secs = line.parse().unwrap();
         // 定时轮把子毫秒截止点向上取整；跨过边界而不是卡在取整前的那个瞬间。
         tokio::time::advance(Duration::from_secs(secs) + Duration::from_millis(2)).await;
         tokio::task::yield_now().await;

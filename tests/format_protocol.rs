@@ -3540,14 +3540,15 @@ async fn stop_deadline_reaps_a_worker_with_an_unanswered_message() {
     };
     let cfg = watched("busy", "'request'", &["no-stage-reply"])
         + &watched("idle", "'response'", &["echo"]);
-    let (port, out) = launch(&home, free_port(), &cfg);
-    assert!(out.status.success(), "{out:?}");
+    let (_, url, mut clock) = Clock::start(&home, free_port(), &cfg);
+    // 保持在途请求直到实例退出，客户端自己的超时不能先触发正常排空。
     let client = reqwest::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(120))
         .build()
         .unwrap();
-    let request = tokio::spawn(client.get(format!("http://127.0.0.1:{port}/")).send());
+    let port = reqwest::Url::parse(&url).unwrap().port().unwrap();
+    let request = tokio::spawn(client.get(&url).send());
     observed_stage(&home, "busy", "request", 1).await;
     let event = |name: &str, what: &str| -> Option<u32> {
         std::fs::read_to_string(home.path().join(format!("{name}.events")))
@@ -3558,7 +3559,7 @@ async fn stop_deadline_reaps_a_worker_with_an_unanswered_message() {
             .as_u64()
             .map(|v| v as u32)
     };
-    let pid = tokio::time::timeout(Duration::from_secs(4), async {
+    let pid = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Some(pid) = event("busy", "request") {
                 break pid;
@@ -3585,7 +3586,12 @@ async fn stop_deadline_reaps_a_worker_with_an_unanswered_message() {
         }
     })
     .await
-    .expect("no drain announcement or idle EOF");
+    .expect("no idle EOF while the drain clock was frozen");
+    // 在首个逻辑时刻就已交付 idle EOF；在途 worker 的无应答帧仍占着自己的进程。
+    assert_eq!(aproxy::process::process_exited(pid), Some(false));
+    clock.advance(9);
+    assert_eq!(aproxy::process::process_exited(pid), Some(false));
+    clock.step(1, true);
     let out = stopping.await.unwrap();
     assert!(out.status.success(), "{out:?}");
     let exited = aproxy::process::process_exited(pid);

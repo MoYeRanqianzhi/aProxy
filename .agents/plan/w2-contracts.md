@@ -1478,6 +1478,9 @@ aproxy desktop                  W5
   - aproxy 在 `protocols` 里列出它会说的协议版本，format 选一个，回在 `protocol`。之后每一行的 `v` 都是选定的版本。
   - aproxy 至少等 10 秒的 hello 回信。
 - **`stages`**：aproxy 发出的是配置声明的阶段，format 回的是它支持的全部阶段。
+- **`limits`**（aproxy 发，可选，2026-11-20 补）：这个实例对回信行长的上限，按 §10.1 的分组给出，单位字节；不限时省略那一项。
+  程序据此知道一行回信最多能带多少：要在一行里交付的内容放不下时（例如流结束时要重复全部输出的协议），
+  它应当自己以协议内的错误收尾，而不是发一行会被 aproxy 丢掉、并算作它出错的回信。
 - **`overrides`**：aproxy 接受的按请求覆盖键。format 据此知道哪些覆盖会生效；回信里不在列表中的覆盖，被忽略并告警。
 - **`worker_id`**：这个程序在世的 worker 之间唯一的编号，起进程时取最小的空闲号，进程一生不变（hello 只发一次）；spawn 模式恒为 0。
   进行中的流独占的 worker 不计入 `pool_max`（§10.6），所以编号可以到 `pool_max` 或更大；流结束回到池里的 worker 保留原来的编号，
@@ -1629,6 +1632,9 @@ aproxy desktop                  W5
     这说的是 retry 请求。没有升级的 forward 请求被叫停而不带 `response` 时，按 §10.10 的默认结束：没有可交付的上游响应就回
     502 `upstream_failed`，不是 `retry_stopped`。
 - **`fallback`**：不问 format 时 aproxy 会怎么做，即覆盖、规则表与默认三者得出的结论。
+  `delay_ms` 总是给出，`decision` 是 stop 时也给（2026-11-20 补）：它是「这次要是重试，按现行退避该等多久」。
+  程序要「至少等这么久、上游要求更久就更久」（例如尊重 Retry-After）时拿它当基线；否则规则表判了 stop 的那次，
+  程序改判 retry 时不知道退避已经涨到多少，只能当成零。
 - **回信**（`decision` 与 `reroute` 各自取第一个表态的程序）：
   - `decision:"retry"`：重试。`delay_ms` 可选，取值 0–86 400 000；省略就用 `fallback.delay_ms`，fallback 是 stop 时按现行退避算。
     不是整数或超出这个范围，按回信不合法处理（见护栏），不截到上限（2026-11-20 补）。

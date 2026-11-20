@@ -22,8 +22,7 @@
 |---|---|---|
 | t06-format | format 一线到 alpha.4：九个阶段（B10a、B10b、B10c、B10d、B11、W2c 的四段） | 第一段到第五段（B10a、B10b decide、B10c stream 与 forward 过链、B10d 按请求选投递方式与 notify、B11 官方 aproxy-format 改说协议 1 并删去旧信封）做完，gate 过了，第六段（W2c：convert 的流式转换与 heartbeat，连同第四、第五段审查的修复）与第七段（W2c：keys、route、rewrite，含混合渠道的协议选择）与第八段（W2c：policy、adaptive、按请求覆盖，连同 main 变红的修复）也做完，gate 过了（含全量测试），都已挑进 master 并推送；第九段（W2c：`init`、`check`、`try` 与最后的完整 gate）在做，同时修第六、七段审查的问题（任务书 Revision 24）。原会话 2026-11-20 被接口报错打断且续不上，换了新会话接手（Revision 17） |
 | p01-perf-hw1 | 在服务器上给 0.2.0-alpha.3 与 0.1.0 测性能基线，交出能重跑的测量脚本 | S1（启动）、S2（静默）测完，在做 S3（低并发）。原会话 2026-11-20 被接口报错打断且续不上，换了新会话接手（任务书 Revision 2）；服务器上的测量没有中断 |
-| v17 | 审查第八段：policy、adaptive、按请求覆盖，以及 Revision 23 的修复 | 2026-11-20 派出 |
-| v14 到 v16 | 审查第六、第七段，复核 Revision 19、21 的修复 | 做完；结论已写进 t06 的 Revision 23、24 |
+| v14 到 v17 | 审查第六到第八段，复核 Revision 19、21、23 的修复 | 做完；结论已写进 t06 的 Revision 23、24、25 |
 | v01 到 v13 | 审查第一段到第五段 | 做完；结论已写进 t06 的 Revision 4、5、8、10、13、19、21 |
 
 ## 排好的任务（按先后）

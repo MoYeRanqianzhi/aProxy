@@ -6170,8 +6170,8 @@ async fn full_config_roundtrip_routes_mixed_protocols_and_reconverts_on_failover
     );
     let (client, url) = running(&home, up, &cfg);
     for (model, answer) in [("ordinary", "first"), ("switch", "second")] {
-        let r=client.post(format!("{url}/v1/chat/completions")).json(&serde_json::json!({"model":model,"max_tokens":10,"messages":[{"role":"system","content":"instructions"},{"role":"user","content":"hi"}]})).send().await.unwrap().json::<Value>().await.unwrap();
-        assert_eq!(r["choices"][0]["message"]["content"], answer, "{r}");
+        let r=client.post(format!("{url}/v1/responses")).json(&serde_json::json!({"model":model,"max_output_tokens":10,"instructions":"instructions","input":"hi"})).send().await.unwrap().json::<Value>().await.unwrap();
+        assert_eq!(r["output"][0]["content"][0]["text"], answer, "{r}");
     }
     for expected in [
         "/chat-tenant/run",
@@ -6180,8 +6180,10 @@ async fn full_config_roundtrip_routes_mixed_protocols_and_reconverts_on_failover
     ] {
         let (uri, b) = observed.try_recv().unwrap();
         assert_eq!(uri.path(), expected);
+        assert!(b.get("input").is_none() && b.get("instructions").is_none());
         if expected.starts_with("/chat") {
             assert_eq!(b["messages"][0]["role"], "system");
+            assert_eq!(b["messages"][1]["content"], "hi");
         } else {
             assert_eq!(b["system"], "instructions");
             assert_eq!(b["messages"][0]["role"], "user");

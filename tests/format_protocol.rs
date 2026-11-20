@@ -7272,3 +7272,38 @@ fn rehearsal_return_fail_without_replacement_skips_only_its_layer() {
         assert!(String::from_utf8_lossy(&out.stdout).contains("skipped"));
     }
 }
+
+/// 一个长等待只推进样例时钟；下一次重试、判定和最终通知都看到同一段经过时间。
+#[test]
+fn rehearsal_elapsed_time_advances_by_the_winning_delay() {
+    let home = TestHome::new();
+    let cfg = layer(&home, "time", "'request','retry','notify'", &["noop"])
+        + &layer(
+            &home,
+            "vote",
+            "'decide'",
+            &["reply", r#"{"decision":"retry","delay_ms":90000}"#],
+        );
+    let out = format_trial(
+        &home,
+        &cfg,
+        serde_json::json!({"path":"/","body":{},"attempts":[{"status":503},{"status":503},{"status":200}]}),
+    );
+    assert!(out.status.success(), "{out:?}");
+    let times = frames(&home, "time");
+    assert_eq!(
+        times.iter().find(|m| m["stage"] == "retry").unwrap()["retry"]["elapsed_ms"],
+        90000
+    );
+    assert_eq!(
+        times.iter().find(|m| m["stage"] == "notify").unwrap()["duration_ms"],
+        180000
+    );
+    assert_eq!(
+        frames(&home, "vote")
+            .iter()
+            .find(|m| m["attempt"] == 2)
+            .unwrap()["elapsed_ms"],
+        90000
+    );
+}

@@ -8,6 +8,9 @@ use switchyard_translation::WireFormat as F;
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Policy {
+    /// 离线试跑推进的墙钟，用来解释 HTTP 日期；工作进程读取当前时间。
+    #[serde(skip)]
+    pub(super) sample_time: Option<std::time::SystemTime>,
     /// 非标准客户端路径可显式给出错误响应的协议。
     protocol: Option<F>,
     /// 空规则表不改变任何决定，也不订阅成功响应。
@@ -184,7 +187,12 @@ impl Policy {
                 .response
                 .as_ref()
                 .and_then(|v| v.response.headers.get("retry-after"))
-                .and_then(|v| crate::selection::retry_after(v, std::time::SystemTime::now()))
+                .and_then(|v| {
+                    crate::selection::retry_after(
+                        v,
+                        self.sample_time.unwrap_or_else(std::time::SystemTime::now),
+                    )
+                })
         {
             let ms = d.as_millis().min(u128::from(w::MAX_DELAY_MS)) as u64;
             let base = rule

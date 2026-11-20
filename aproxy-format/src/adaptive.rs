@@ -57,6 +57,8 @@ struct Record {
 }
 /// 单个持久进程拥有的摘要与过期索引；不同 worker 不假装共享内存。
 pub struct Adaptive {
+    /// 离线试跑的单调时间，真实工作进程不覆盖时钟。
+    pub(super) sample_time: Option<Instant>,
     /// 固定在本次握手的判定阈值。
     settings: Settings,
     /// 解码后的 32 字节摘要保证无效数据不能被存成用户文本。
@@ -94,6 +96,7 @@ impl Adaptive {
             return Err("自适应阈值、容量、寿命或恢复比例无效");
         }
         Ok(Self {
+            sample_time: None,
             settings,
             records: HashMap::new(),
             age: BTreeSet::new(),
@@ -133,7 +136,10 @@ impl Adaptive {
     /// 没有可用摘要时弃权；有摘要也只报告投递策略，不报告摘要或用户内容。
     pub fn request(&mut self, m: &w::RequestMessage, r: &mut w::Reply) {
         if let Some(key) = digest(&m.context) {
-            let pinned = self.touch(key, Instant::now()).pinned.is_some();
+            let pinned = self
+                .touch(key, self.sample_time.unwrap_or_else(Instant::now))
+                .pinned
+                .is_some();
             let mode = if pinned { "retry" } else { "forward" };
             r.delivery = Some(mode.into());
             r.report = w::ReportField::Present(w::Report::new(

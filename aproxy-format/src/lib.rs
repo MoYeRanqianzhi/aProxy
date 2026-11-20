@@ -198,7 +198,7 @@ impl Role {
                 if matches!(self, Self::Adaptive(_)) =>
             {
                 if let Self::Adaptive(a) = self {
-                    a.completed(m, std::time::Instant::now());
+                    a.completed(m, a.sample_time.unwrap_or_else(std::time::Instant::now));
                 }
                 Ok(())
             }

@@ -9,7 +9,11 @@ use aproxy_ipc::config_file::{self as f, Stage};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{io::Write, path::Path};
+use std::{
+    io::Write,
+    path::Path,
+    time::{Duration, Instant, SystemTime},
+};
 
 /// 样例保留原始路径以及每轮上游的实测或手写结果；没有上游样本时只走请求方向。
 #[derive(Deserialize)]
@@ -146,9 +150,6 @@ impl Unit {
         .map(str::to_owned)
         .into();
         let hello = if let Some(role) = &mut self.layer.role {
-            if let crate::Role::Keys(keys) = role {
-                keys.sample_time = Some((std::time::Instant::now(), std::time::SystemTime::now()));
-            }
             role.hello(self.layer.label, &offer)
         } else {
             let p = peer::ChildPeer::start(e, dir).map_err(|_| peer::PeerFault::Unavailable)?;
@@ -181,6 +182,7 @@ impl Unit {
         mut msg: Value,
         digest: &str,
         dir: &Path,
+        now: (Instant, SystemTime),
     ) -> Result<w::Reply, String> {
         if self.seq > 1
             && self.layer.entry.process == f::Process::Spawn
@@ -235,6 +237,12 @@ impl Unit {
         .and_then(|n| usize::try_from(n).ok())
         .unwrap_or(usize::MAX);
         let mut reply = if let Some(role) = &mut self.layer.role {
+            match role {
+                crate::Role::Keys(k) => k.sample_time = Some(now),
+                crate::Role::Policy(p) => p.sample_time = Some(now.1),
+                crate::Role::Adaptive(a) => a.sample_time = Some(now.0),
+                _ => {}
+            }
             let m = serde_json::from_value(msg).map_err(|_| "样例不能构成该阶段的消息")?;
             let reply = role.handle(&m);
             // 不再分配一份序列化回信；逐段扣除 JSON 字节，最后一字节留给换行。
@@ -330,6 +338,19 @@ impl Unit {
         self.hello.is_some() && self.layer.entry.has_stage(stage)
     }
 }
+/// 最先有效的决定、重选和等待，各自保持实例的优先级，供下一次尝试与终态使用。
+struct Settlement {
+    /// 是否再次尝试。
+    retry: bool,
+    /// 已跑完请求链时是否重新选路。
+    reroute: bool,
+    /// stop 票可随附完整的替代响应补丁。
+    stop: Option<w::ResponsePatch>,
+    /// 胜出 retry 票指定的等待，否则采用实例给出的默认退避。
+    delay_ms: u64,
+    /// 是程序投了决定票，还是只有实例保底决定。
+    decided: bool,
+}
 /// 共享的只读上下文与有限试跑状态；没有网络或实际时间退避。
 struct Trial<'a, W> {
     /// 投影写入端；测试可以直接审查所有输出。
@@ -352,12 +373,16 @@ struct Trial<'a, W> {
     request_stage: Stage,
     /// 每个逻辑请求只接受一次 delivery 选择，恢复游标不重新开票。
     voted: bool,
+    /// 只累计实际选中的等待值，不用外部进程调度时间模拟网络耗时。
+    elapsed_ms: u64,
+    /// 同步推进单调时间和 HTTP 日期时间；所有进程内角色观察同一个时刻。
+    now: (Instant, SystemTime),
 }
 impl<W: Write> Trial<'_, W> {
     /// 程序业务拒绝与进程失败分开；发生进程故障的可选层不会继续吃样本。
     fn call(&mut self, i: usize, stage: &str, msg: Value) -> Result<w::Reply, CliError> {
         self.units[i]
-            .call(stage, msg, &self.digest, self.dir)
+            .call(stage, msg, &self.digest, self.dir, self.now)
             .map_err(|_| {
                 let behavior = if matches!(stage, "notify" | "decide" | "heartbeat") {
                     "记录故障，按此控制阶段的回退规则继续"
@@ -469,7 +494,8 @@ impl<W: Write> Trial<'_, W> {
         failure: Option<&Value>,
         attempt: u32,
         fallback: w::Fallback,
-    ) -> Result<(bool, bool, Option<w::ResponsePatch>), CliError> {
+    ) -> Result<Settlement, CliError> {
+        let mut delay_ms = fallback.delay_ms.unwrap_or(0);
         let mut decision = None;
         let mut reroute = None;
         let mut stop = None;
@@ -483,7 +509,7 @@ impl<W: Write> Trial<'_, W> {
             {
                 continue;
             }
-            let mut msg = json!({"client":self.client,"attempt":attempt,"elapsed_ms":0,"delivery":self.mode,"outcome":if failure.is_some(){"failure"}else{"success"},"request":{"method":req.method,"url":req.url},"fallback":fallback});
+            let mut msg = json!({"client":self.client,"attempt":attempt,"elapsed_ms":self.elapsed_ms,"delivery":self.mode,"outcome":if failure.is_some(){"failure"}else{"success"},"request":{"method":req.method,"url":req.url},"fallback":fallback});
             if let Some(b) = req.body.as_bytes() {
                 let body = serde_json::to_value(w::Body::from_bytes(b.to_vec()))
                     .map_err(|_| "样例正文无法编码")?;
@@ -539,6 +565,9 @@ impl<W: Write> Trial<'_, W> {
                 });
                 if decision.is_none() {
                     decision = Some(d == w::Decision::Retry);
+                    if let Some(delay) = r.delay_ms {
+                        delay_ms = delay.millis();
+                    }
                     stop = r.response;
                 }
             }
@@ -568,19 +597,20 @@ impl<W: Write> Trial<'_, W> {
                 break;
             }
         }
-        Ok((
-            decision.unwrap_or(fallback.decision == w::Decision::Retry),
-            reroute.unwrap_or(true),
+        Ok(Settlement {
+            retry: decision.unwrap_or(fallback.decision == w::Decision::Retry),
+            reroute: reroute.unwrap_or(true),
             stop,
-        ))
+            delay_ms,
+            decided: decision.is_some(),
+        })
     }
     /// 心跳走反向链；输出只说明数据是否改变，不回显事件内容。
     fn heartbeat(&mut self, n: u32, initial: &str) -> Result<(), CliError> {
         let mut data = initial.as_bytes().to_vec();
         for i in (0..self.units.len()).rev() {
             if self.units[i].has(Stage::Heartbeat) {
-                let mut m =
-                    json!({"client":self.client,"heartbeat":{"beat":n,"elapsed_ms":0,"attempt":n}});
+                let mut m = json!({"client":self.client,"heartbeat":{"beat":n,"elapsed_ms":self.elapsed_ms,"attempt":n}});
                 m.as_object_mut().unwrap().extend(
                     json!(w::Data::from_bytes(data.clone()))
                         .as_object()
@@ -786,7 +816,7 @@ impl<W: Write> Trial<'_, W> {
     ) -> Result<(), CliError> {
         for i in 0..self.units.len() {
             if self.units[i].has(Stage::Notify) {
-                self.call(i,"notify",json!({"event":"request_end","client":self.client,"delivery":self.mode,"upgraded":upgraded,"attempts":n,"duration_ms":0,"upstream_status":status,"stream_completed":completed,"outcome":outcome,"code":null}))?;
+                self.call(i,"notify",json!({"event":"request_end","client":self.client,"delivery":self.mode,"upgraded":upgraded,"attempts":n,"duration_ms":self.elapsed_ms,"upstream_status":status,"stream_completed":completed,"outcome":outcome,"code":null}))?;
                 trace(
                     self.out,
                     "notify",
@@ -971,6 +1001,8 @@ fn rehearse(
         cursor: 0,
         request_stage: Stage::Request,
         voted: false,
+        elapsed_ms: 0,
+        now: (Instant::now(), SystemTime::now()),
     };
     req.body = w::Body::from_bytes(raw);
     let group = |mb: u64| {
@@ -1140,21 +1172,36 @@ fn rehearse(
             failure.is_some(),
             t.mode,
         );
-        let (retry, reroute, stop) = if t.mode == "forward" && failure.is_none() {
-            (false, false, None)
+        let settled = if t.mode == "forward" && failure.is_none() {
+            Settlement {
+                retry: false,
+                reroute: false,
+                stop: None,
+                delay_ms: 0,
+                decided: false,
+            }
         } else {
             t.decide(&req, resp.as_ref(), failure.as_ref(), n, base_retry)?
         };
-        if retry {
+        if settled.retry {
+            let delta = Duration::from_millis(settled.delay_ms);
+            let overflow = || {
+                CliError::Unsimulated("逻辑时钟超出可表示范围；真实实例会按配置的退避等待".into())
+            };
+            t.now = (
+                t.now.0.checked_add(delta).ok_or_else(overflow)?,
+                t.now.1.checked_add(delta).ok_or_else(overflow)?,
+            );
+            t.elapsed_ms = t.elapsed_ms.saturating_add(settled.delay_ms);
             if t.mode == "forward" {
                 upgraded = true;
                 t.mode = "retry";
             }
-            let mut info = json!({"attempt":n+1,"last_failure":failure.unwrap_or_else(||json!({"code":"format_decision"})),"elapsed_ms":0});
+            let mut info = json!({"attempt":n+1,"last_failure":failure.unwrap_or_else(||json!({"code":"format_decision"})),"elapsed_ms":t.elapsed_ms});
             if let Some(r) = resp {
                 info["last_response"] = json!({"status":r.status,"headers":r.headers});
             }
-            if reroute || t.cursor != t.units.len() {
+            if settled.reroute || t.cursor != t.units.len() {
                 refused = t.request(&mut req, Some(info))?;
                 if let Some(fail) = refused.as_ref().filter(|f| !f.retry) {
                     return t.rejected(fail, n + 1, upgraded);
@@ -1163,7 +1210,7 @@ fn rehearse(
             continue;
         }
         let mut response = resp.unwrap_or_else(|| w::Response::new(502));
-        if let Some(p) = stop {
+        if let Some(p) = settled.stop {
             response.apply(p);
         } else if failure.is_none()
             && (t.mode != "forward" || (200..300).contains(&response.status))
@@ -1175,7 +1222,7 @@ fn rehearse(
             "result",
             "proxy",
             Value::Null,
-            json!({"status":response.status}),
+            json!({"status":response.status,"decided_by":if settled.decided {"format"} else {"fallback"}}),
             vec![],
         )?;
         t.notify(

@@ -172,6 +172,12 @@ fn preserved_path(raw: &str) -> Result<&str, Fault> {
     Ok(path)
 }
 impl Route {
+    /// 结构检查只列出凭据的来源名称，不读环境值。
+    pub fn credential_names(&self) -> impl Iterator<Item = &str> {
+        self.channel
+            .iter()
+            .filter_map(|c| c.credential_env.as_deref())
+    }
     /// 只在配置了别名时支持可选的缓冲回程：客户端可保留它请求的模型名。
     pub fn stages(&self) -> &'static [&'static str] {
         if self.aliases.is_empty() {

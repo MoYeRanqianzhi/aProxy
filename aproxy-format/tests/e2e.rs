@@ -2354,3 +2354,37 @@ fn offline_files_are_bounded_before_parsing() {
         assert!(!out.status.success(), "{args:?}: {out:?}");
     }
 }
+
+/// 结构检查即使环境里有不可用的头值也能完成，只公布变量名，不能把尚未检查的实例说成可启动。
+#[test]
+fn check_lists_only_structural_guarantees_and_credential_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = env!("CARGO_BIN_EXE_aproxy-format");
+    assert!(
+        Command::new(exe)
+            .args(["init", "key-rotation", "--output"])
+            .arg(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    for args in [vec!["config.toml"], vec!["keys", "--config", "keys.toml"]] {
+        let out = Command::new(exe)
+            .current_dir(dir.path())
+            .arg("check")
+            .args(&args)
+            .env("RELAY_KEY_A", "private\nvalue")
+            .env_remove("RELAY_KEY_B")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        for word in ["没有检查", "RELAY_KEY_A、RELAY_KEY_B"] {
+            assert!(text.contains(word), "{text}");
+        }
+        if args.len() == 1 {
+            assert!(text.contains("1 个程序") && text.contains("aproxy doctor"));
+        }
+        assert!(!text.contains("private"));
+    }
+}

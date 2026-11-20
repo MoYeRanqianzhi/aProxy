@@ -125,17 +125,20 @@ pub fn credential(env: &str, scheme: &str, variables: &Variables) -> Result<Stri
             "invalid credential environment variable name",
         ));
     }
-    let key = variables
-        .overlay
-        .get(env)
-        .cloned()
-        .or_else(|| std::env::var(env).ok())
-        .or_else(|| variables.structural.then(|| "offline-placeholder".into()))
-        .filter(|v| !v.is_empty())
-        .ok_or(Fault::new(
-            "密钥环境变量未设置",
-            "credential environment variable is unset",
-        ))?;
+    let key = if variables.structural {
+        Some("offline-placeholder".to_owned())
+    } else {
+        variables
+            .overlay
+            .get(env)
+            .cloned()
+            .or_else(|| std::env::var(env).ok())
+    }
+    .filter(|v| !v.is_empty())
+    .ok_or(Fault::new(
+        "密钥环境变量未设置",
+        "credential environment variable is unset",
+    ))?;
     let value = if scheme.is_empty() {
         key
     } else {

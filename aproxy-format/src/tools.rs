@@ -378,6 +378,37 @@ fn init(scenario: &str, dir: &Path) -> Result<(), String> {
     }
     Ok(())
 }
+/// 按名字去重列出未检查的凭据；控制字符转义，诊断不能被配置里的换行或转义序列伪造。
+fn unchecked<'a>(roles: impl IntoIterator<Item = &'a Role>, proxy: bool, external: bool) {
+    let mut names = std::collections::BTreeSet::new();
+    for role in roles {
+        match role {
+            Role::Keys(k) => names.extend(k.credential_names()),
+            Role::Route(r) => names.extend(r.credential_names()),
+            _ => {}
+        }
+    }
+    if names.is_empty() && !proxy {
+        return;
+    }
+    println!("没有检查：");
+    if !names.is_empty() {
+        println!(
+            "  - 环境变量 {} 是否已设置（启动密钥角色或选用渠道时需要）",
+            names
+                .into_iter()
+                .map(|s| s.escape_debug().to_string())
+                .collect::<Vec<_>>()
+                .join("、")
+        );
+    }
+    if external {
+        println!("  - 第三方程序的能力与配置（未启动程序）");
+    }
+    if proxy {
+        println!("  - 实例的其余配置（监听地址、超时等），由 aproxy doctor 检查");
+    }
+}
 /// 工具的参数与角色协议分开解析，未知参数可能含密钥，不在用法错误中回显。
 pub(super) fn run(name: &str, args: &[String]) -> Result<(), String> {
     let words: Vec<_> = args.iter().map(String::as_str).collect();
@@ -386,11 +417,12 @@ pub(super) fn run(name: &str, args: &[String]) -> Result<(), String> {
         ("check",[p])=>{
             let c=chain(Path::new(p),true)?;
             for n in c.notes{println!("提示：{n}");}
-            println!("配置有效");Ok(())
+            println!("format 链与官方角色配置有效（{} 个程序）。",c.layers.len());
+            unchecked(c.layers.iter().filter_map(|l| l.role.as_ref()),true,c.layers.iter().any(|l| l.role.is_none()));Ok(())
         },
         ("check",[r,"--config",p])=>{
-            load(r,&["--config".into(),(*p).into()],Path::new("."),config::Variables{structural:true,..Default::default()}).map_err(safe_issue)?;
-            println!("配置有效");Ok(())
+            let role=load(r,&["--config".into(),(*p).into()],Path::new("."),config::Variables{structural:true,..Default::default()}).map_err(safe_issue)?;
+            println!("{r} 角色配置结构有效。");unchecked([&role],false,false);Ok(())
         },
         ("try",[p,"--request",sample])=>crate::dryrun::run(Path::new(p),Path::new(sample),false),
         ("try",[p,"--request",sample,"--allow-external"])=>crate::dryrun::run(Path::new(p),Path::new(sample),true),

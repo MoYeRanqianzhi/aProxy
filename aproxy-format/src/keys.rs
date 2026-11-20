@@ -139,6 +139,12 @@ impl Pool {
     }
 }
 impl Keys {
+    /// 结构检查只列出凭据的来源名称，不读环境值。
+    pub fn credential_names(&self) -> impl Iterator<Item = &str> {
+        self.pool
+            .iter()
+            .flat_map(|p| p.keys.iter().map(|k| k.env.as_str()))
+    }
     /// 在 hello 前检查份额总数、认证名与 origin 的唯一性。
     pub fn load(path: config::Source<'_>, variables: &config::Variables) -> Result<Self, String> {
         let mut cfg: Self = config::load(path)?;

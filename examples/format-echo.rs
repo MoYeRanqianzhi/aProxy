@@ -81,6 +81,14 @@ fn main() {
     }
     let arg = args.get(1).map_or("", String::as_str);
     let delay = Duration::from_millis(arg.parse().unwrap_or(100));
+    if mode == "hold-inherited-stderr" {
+        use std::io::Read as _;
+        let mut gate = std::net::TcpStream::connect(arg).unwrap();
+        gate.set_read_timeout(Some(Duration::from_secs(90)))
+            .unwrap();
+        let _ = gate.read(&mut [0]);
+        return;
+    }
     if mode == "banner" {
         println!("format-echo banner: ready");
     }
@@ -193,6 +201,18 @@ fn main() {
             }
             if mode == "gate-hello" {
                 wait_gate(std::path::Path::new(arg));
+            }
+            if mode == "reject-with-descendant" {
+                // 只继承 stderr。孙进程由测试直接控制，代理退出不应依赖它先关日志句柄。
+                let _descendant = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["hold-inherited-stderr", arg])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn()
+                    .unwrap();
+                println!("not JSON");
+                return;
             }
             if mode == "malformed-hello" {
                 println!("not JSON");

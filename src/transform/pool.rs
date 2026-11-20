@@ -13,10 +13,51 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{ChildStdin, ChildStdout, Command},
+    process::Command,
     sync::{OwnedSemaphorePermit, Semaphore},
     time::Instant,
 };
+
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::NamedPipeServer;
+#[cfg(not(windows))]
+use tokio::process::{ChildStdin, ChildStdout};
+
+/// 父端必须可取消：同步匿名管道的内核读取不能由取消 Tokio 任务唤醒，会阻塞运行时析构。
+#[cfg(windows)]
+type ChildStdout = NamedPipeServer;
+/// 子进程或其后代也可能不再读 stdin；写入同样不应占住阻塞线程。
+#[cfg(windows)]
+type ChildStdin = NamedPipeServer;
+
+/// 先在本进程连好唯一实例，再把同步客户端句柄传给子进程；只有代理一端需要重叠 I/O。
+#[cfg(windows)]
+async fn worker_pipe(
+    security: &crate::daemon::PipeSecurity,
+    child_reads: bool,
+) -> std::io::Result<(NamedPipeServer, Stdio)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::net::windows::named_pipe::ServerOptions;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = format!(
+        r"\\.\pipe\aproxy-format-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let server = security.create(
+        ServerOptions::new()
+            .first_pipe_instance(true)
+            .max_instances(1)
+            .reject_remote_clients(true),
+        &name,
+    )?;
+    let client = std::fs::OpenOptions::new()
+        .read(child_reads)
+        .write(!child_reads)
+        .open(name)?;
+    server.connect().await?;
+    Ok((server, Stdio::from(client)))
+}
 
 mod notify;
 /// 能逐请求改变的键在握手时逐项公布；未协商的键不会成为隐式配置入口。
@@ -809,6 +850,32 @@ impl Pool {
             parked: self.notices.as_ref().map(|_| self.parked.clone()),
             capacity: capacity.clone(),
         };
+        let mut command = Command::new(exe);
+        command
+            .args(&self.entry.args)
+            .envs(&self.entry.env)
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        let (stdin, stdout, stderr) = {
+            let security =
+                crate::daemon::PipeSecurity::for_current_user().map_err(|_| Fault::Spawn)?;
+            let (stdin, input) = worker_pipe(&security, true)
+                .await
+                .map_err(|_| Fault::Spawn)?;
+            let (stdout, output) = worker_pipe(&security, false)
+                .await
+                .map_err(|_| Fault::Spawn)?;
+            let (stderr, log) = worker_pipe(&security, false)
+                .await
+                .map_err(|_| Fault::Spawn)?;
+            command.stdin(input).stdout(output).stderr(log);
+            (Some(stdin), stdout, stderr)
+        };
+        #[cfg(not(windows))]
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = {
             let c = self.circuit.lock().unwrap();
             if let Some(a) = admission
@@ -816,25 +883,24 @@ impl Pool {
             {
                 return Err(a.refusal());
             }
-            Command::new(exe)
-                .args(&self.entry.args)
-                .envs(&self.entry.env)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .map_err(|_| Fault::Spawn)?
+            command.spawn().map_err(|_| Fault::Spawn)?
         };
+        // 父进程不保留子端的重复句柄，否则即使 worker 正常退出也不会看到 EOF。
+        drop(command);
+        #[cfg(not(windows))]
+        let (stdin, stdout, stderr) = (
+            child.stdin.take(),
+            child.stdout.take().unwrap(),
+            child.stderr.take().unwrap(),
+        );
         *slot.used.lock().unwrap().get_mut(&id).unwrap() = Some(child.id().expect("fresh child"));
         let stderr = tokio::spawn(log_stderr(
-            child.stderr.take().unwrap(),
+            stderr,
             self.secrets.clone(),
             self.secrets.replace(&self.entry.name).into(),
             self.stderr_window.clone(),
         ));
-        let stdin = child.stdin.take();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let stdout = BufReader::new(stdout);
         let stderr_abort = stderr.abort_handle();
         let (kill, force) = tokio::sync::oneshot::channel();
         // 只有此任务持有 OS 句柄和槽位。交还全部槽位因此也证明所有子进程都已 wait，

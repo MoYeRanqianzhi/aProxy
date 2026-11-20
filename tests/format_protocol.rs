@@ -97,6 +97,50 @@ fn required_program_exiting_during_hello_fails_start() {
     );
 }
 
+/// 孙进程握有真正的 stderr 写端直到测试放行；前台代理应先完成握手失败后的整个运行时析构。
+#[tokio::test]
+async fn failed_start_exits_while_descendant_still_holds_stderr() {
+    use std::time::Duration;
+    let home = TestHome::new();
+    let gate = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = gate.local_addr().unwrap().to_string();
+    let cfg = home.path().join("inherited.toml");
+    let format = layer(
+        &home,
+        "descendant",
+        "'request'",
+        &["reject-with-descendant", &addr],
+    );
+    std::fs::write(
+        &cfg,
+        format!(
+            "base_url='http://127.0.0.1:1'\nlisten_addr='127.0.0.1:{}'\n{format}",
+            free_port()
+        ),
+    )
+    .unwrap();
+    let mut command = tokio::process::Command::from(home.cmd());
+    let mut child = command
+        .args(["start", "--foreground", "--config"])
+        .arg(cfg)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let (held, _) = tokio::time::timeout(Duration::from_secs(30), gate.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let exited = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
+    drop(held);
+    assert_eq!(
+        exited
+            .expect("runtime waited for descendant EOF")
+            .unwrap()
+            .code(),
+        Some(3)
+    );
+}
+
 /// 从实例日志而不是测试进程捕获 stderr，逐行检查名字、级别和密钥替换。
 #[test]
 fn stderr_lines_reach_the_instance_log_with_secrets_replaced() {

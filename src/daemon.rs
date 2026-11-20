@@ -2771,6 +2771,8 @@ where
 // 平台实现：windows 命名管道 / unix domain socket，上层不感知差异。
 // ---------------------------------------------------------------------------
 #[cfg(windows)]
+pub(crate) use imp::PipeSecurity;
+#[cfg(windows)]
 mod imp {
     use super::{ControlState, IpcError, exchange_over, handle_conn};
     use std::{io, sync::Arc, time::Duration};
@@ -2851,7 +2853,11 @@ mod imp {
         }
 
         /// 按 `options` 建一个带这份描述符的管道实例。
-        fn create(&self, options: &ServerOptions, endpoint: &str) -> io::Result<NamedPipeServer> {
+        pub(crate) fn create(
+            &self,
+            options: &ServerOptions,
+            endpoint: &str,
+        ) -> io::Result<NamedPipeServer> {
             let mut attributes = self.0.attributes();
             // SAFETY: attributes 是一个有效的 SECURITY_ATTRIBUTES，它指向的描述符在 self
             // 存活期间有效；CreateNamedPipe 在调用期间拷贝描述符，不保留指针

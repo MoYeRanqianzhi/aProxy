@@ -30,6 +30,7 @@ pub fn detect_request(body: &Value) -> Option<WireFormat> {
         .into_iter()
         .flatten();
     let chat = chat_role
+        || obj.get("response_format").is_some_and(Value::is_object)
         || tools
             .clone()
             .any(|t| t["type"] == "function" && t["function"]["name"].is_string())
@@ -71,6 +72,9 @@ mod tests {
     fn tool_shapes_disambiguate_custom_routes() {
         let mut body = serde_json::json!({"model":"m","max_tokens":1,"messages":[{"role":"user","content":"hi"}]});
         assert_eq!(detect_request(&body), None);
+        body["response_format"] = serde_json::json!({"type":"json_object"});
+        assert_eq!(detect_request(&body), Some(WireFormat::OpenAiChat));
+        body.as_object_mut().unwrap().remove("response_format");
         body["tools"] =
             serde_json::json!([{"type":"function","function":{"name":"read","parameters":{}}}]);
         assert_eq!(detect_request(&body), Some(WireFormat::OpenAiChat));

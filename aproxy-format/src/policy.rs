@@ -295,6 +295,25 @@ mod tests {
             assert_eq!(r.decision, Some(w::Decision::Retry));
         }
     }
+    /// 两条都能命中时保留首票；只见头时正文规则不能把未知正文当空串。
+    #[test]
+    fn competing_rules_distinguish_head_only_from_empty_body() {
+        let p:Policy = toml::from_str("[[rule]]\nstatus=[503]\nbody_regex='^$'\ndecision='stop'\n[[rule]]\nstatus=[503]\ndecision='retry'").unwrap();
+        let mut m = message(503, "");
+        let mut r = w::Reply::new(1);
+        p.decide(&m, &mut r);
+        assert_eq!(r.decision, Some(w::Decision::Stop));
+        let obs = m.response.as_mut().unwrap();
+        obs.truncated = None;
+        obs.response.body = w::Body::Absent;
+        let mut r = w::Reply::new(2);
+        p.decide(&m, &mut r);
+        assert_eq!(r.decision, Some(w::Decision::Retry));
+        m.response.as_mut().unwrap().response.status = 502;
+        let mut r = w::Reply::new(3);
+        p.decide(&m, &mut r);
+        assert!(serde_json::to_value(r).unwrap().get("decision").is_none());
+    }
     /// 每种错误模板为客户端生成独立错误而非复用上游错误页，响应只带自己的类型头。
     #[test]
     fn stop_templates_follow_the_client_not_the_target() {

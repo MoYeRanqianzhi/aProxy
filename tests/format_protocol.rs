@@ -6554,6 +6554,12 @@ async fn interrupted_forward_gather_consults_decide_before_exposing_a_prefix() {
                 "upstream_failed"
             );
         }
+        if !retry {
+            assert!(
+                frames(&home, "outer").iter().all(|f| f["event"] != "open"),
+                "discarded prefix reached outer open"
+            );
+        }
         let f = frames(&home, "policy");
         assert_eq!(f.len(), 2);
         assert_eq!(f[1]["failure"]["code"], "upstream_body_interrupted");

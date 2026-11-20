@@ -575,16 +575,21 @@ pub(super) async fn forward_response(
                                     ))
                                     .is_ok()
                         });
-                        if !handed_back {
-                            failure.record_in(&state.stats);
-                            tracing::warn!(code=%failure.code, error=%failure.message, forwarded_bytes=forwarded, "forward upstream response interrupted");
-                            tap.rec.settle(
-                                crate::history::Outcome::UpstreamError,
-                                Some("upstream_failed"),
-                            );
-                            tap.rec.stream_aborted();
-                        }
                         tap.failure = Some(failure.clone());
+                        if handed_back {
+                            // 接收方将取消这次交付。先结清历史、释放连接，再停在这一层；
+                            // 不能返回 EOF 或 End，否则同一轮 poll 就可能把半截实体送进外层 open。
+                            drop(tap);
+                            drop(resp);
+                            return std::future::pending().await;
+                        }
+                        failure.record_in(&state.stats);
+                        tracing::warn!(code=%failure.code, error=%failure.message, forwarded_bytes=forwarded, "forward upstream response interrupted");
+                        tap.rec.settle(
+                            crate::history::Outcome::UpstreamError,
+                            Some("upstream_failed"),
+                        );
+                        tap.rec.stream_aborted();
                         Some((Err(failure), (resp, tap, true)))
                     }
                 }

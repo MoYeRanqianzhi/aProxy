@@ -254,10 +254,20 @@ struct StrictInflate<R> {
 
 impl<R: std::io::BufRead> Read for StrictInflate<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.done || buf.is_empty() {
+        if buf.is_empty() {
             return Ok(0);
         }
         loop {
+            if self.done {
+                // 私有读缓冲可能已从外层预取 member 之后的字节；释放它之前必须核对。
+                if !self.inner.fill_buf()?.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "unexpected bytes after deflate stream",
+                    ));
+                }
+                return Ok(0);
+            }
             let input = self.inner.fill_buf()?;
             let eof = input.is_empty();
             let (in_before, out_before) = (self.state.total_in(), self.state.total_out());
@@ -269,15 +279,12 @@ impl<R: std::io::BufRead> Read for StrictInflate<R> {
             let produced = (self.state.total_out() - out_before) as usize;
             self.inner.consume(consumed);
             if status == flate2::Status::StreamEnd {
-                // 私有读缓冲可能已从外层预取 member 之后的字节；释放它之前必须核对。
-                if !self.inner.fill_buf()?.is_empty() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "unexpected bytes after deflate stream",
-                    ));
-                }
                 self.done = true;
-                return Ok(produced);
+                // 解码已产出的最后一块先交付；下一次读再等 HTTP EOF，不能让迟到的中断扣住此前的明文。
+                if produced > 0 {
+                    return Ok(produced);
+                }
+                continue;
             }
             if produced > 0 {
                 return Ok(produced);

@@ -7254,3 +7254,21 @@ fn rehearsal_omitted_stream_output_does_not_forward_the_input() {
         );
     }
 }
+
+/// 回程层拒绝而不提供替代响应时，外侧缓冲单元仍收到完整的原实体。
+#[test]
+fn rehearsal_return_fail_without_replacement_skips_only_its_layer() {
+    for stage in ["'response'", "'stream'"] {
+        let home = TestHome::new();
+        let cfg = layer(&home, "seen", "'response'", &["noop"])
+            + &layer(&home, "declines", stage, &["error"]);
+        let out = format_trial(
+            &home,
+            &cfg,
+            serde_json::json!({"path":"/","body":{},"attempts":[{"status":200,"body":"original"}]}),
+        );
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(frames(&home, "seen")[1]["response"]["body"], "original");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("skipped"));
+    }
+}

@@ -629,7 +629,18 @@ impl<W: Write> Trial<'_, W> {
                     json!({"client":self.client,"request":meta,"response":resp}),
                 )?;
                 if let Some(f) = r.fail {
-                    *resp = f.response.ok_or("响应角色拒绝样例")?;
+                    let Some(replacement) = f.response else {
+                        trace(
+                            self.out,
+                            "response",
+                            label,
+                            before,
+                            view(&req.url, &resp.headers),
+                            vec!["skipped"],
+                        )?;
+                        continue;
+                    };
+                    *resp = replacement;
                 } else if let Some(p) = r.response {
                     resp.apply(p);
                 }
@@ -649,8 +660,21 @@ impl<W: Write> Trial<'_, W> {
                 let before = view(&req.url, &resp.headers);
                 let open=self.call(i,"stream",json!({"event":"open","stream_id":stream_id,"client":self.client,"request":meta,"response":{"status":resp.status,"headers":resp.headers}}))?;
                 if let Some(f) = open.fail {
-                    *resp = f.response.ok_or("流角色拒绝打开样例")?;
-                    chunks = vec![resp.body.as_bytes().unwrap_or_default().to_vec()];
+                    let changed = if let Some(replacement) = f.response {
+                        *resp = replacement;
+                        chunks = vec![resp.body.as_bytes().unwrap_or_default().to_vec()];
+                        "response"
+                    } else {
+                        "skipped"
+                    };
+                    trace(
+                        self.out,
+                        "stream:open",
+                        label,
+                        before,
+                        view(&req.url, &resp.headers),
+                        vec![changed],
+                    )?;
                     continue;
                 }
                 if let Some(p) = open.response {

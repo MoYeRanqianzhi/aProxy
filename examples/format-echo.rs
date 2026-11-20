@@ -61,9 +61,15 @@ fn main() {
         eprintln!("value={}", std::env::var("ECHO_SECRET").unwrap_or_default());
     }
     let (tx, rx) = std::sync::mpsc::channel();
+    let deaf = mode == "deaf-notify";
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines().map_while(Result::ok) {
             if tx.send(line).is_err() {
+                break;
+            }
+            // 握手后不再读 stdin；不把通知偷偷读进测试程序自己的消息队列。
+            if deaf {
+                std::thread::park();
                 break;
             }
         }
@@ -169,7 +175,7 @@ fn main() {
             if mode == "slow-hello" {
                 std::thread::sleep(delay);
             }
-            r = json!({"v":1,"seq":0,"name":"format-echo","version":"1.0","protocol":1,"features":[],"stages":["request","retry","decide","response","heartbeat","stream"]});
+            r = json!({"v":1,"seq":0,"name":"format-echo","version":"1.0","protocol":1,"features":[],"stages":["request","retry","decide","response","heartbeat","stream","notify"]});
             if std::env::var_os("ECHO_DECIDE_SUCCESS").is_some() {
                 r["features"] = json!(["decide.success"]);
             }
@@ -177,7 +183,10 @@ fn main() {
                 r["request_body"] = json!({"decide":"full"});
             }
             if mode == "digest-only" {
-                r["request_body"] = json!({"request":"digest","retry":"digest","decide":"digest"});
+                r["request_body"] = json!({"request":"digest","retry":"digest","decide":"digest","notify":"digest"});
+            }
+            if mode == "notify-digest" {
+                r["request_body"] = json!({"request":"none","notify":"digest"});
             }
             if mode == "metadata-only" {
                 r["request_body"] = json!({"request":"none","retry":"digest"});
@@ -302,6 +311,12 @@ fn main() {
                 "gate-request" if m["request"]["body"] == "blocked" => {
                     wait_gate(std::path::Path::new(arg))
                 }
+                "stuck-notify" if stage == "notify" && !std::path::Path::new(arg).is_file() => {
+                    std::thread::park();
+                    break;
+                }
+                "notify-digest" if stage == "request" => r["state"] = json!("observer state"),
+                "invalid-notify" if stage == "notify" => r["seq"] = json!(0),
                 "no-stage-reply" => continue,
                 "stream-echo" | "stream-fault" | "stream-reject" | "stream-gate"
                     if stage == "stream" =>

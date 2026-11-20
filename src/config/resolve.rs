@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::Config;
-use super::file::{self, Delivery, FileConfig, FormatEntry, Stage};
+use super::file::{self, Delivery, FileConfig};
 use crate::settings::Settings;
 
 /// 启动时在命令行上给的覆盖，优先于文件。
@@ -300,7 +300,6 @@ pub fn resolve_text(
         super::DEFAULT_KEEPALIVE_HEARTBEAT.to_string(),
     );
     let formats = pick_or(s, "format", &f.format, &None, Vec::new());
-    check_supported_stages(&formats, text, path, &mut diagnostics);
 
     let config = Config {
         base_url: base_url.unwrap_or_default(),
@@ -607,38 +606,9 @@ fn merge_headers(
         .collect()
 }
 
-/// 文件层校验链的结构；运行时还不能处理的阶段单独诊断，避免静默跳过配置。
-fn check_supported_stages(
-    formats: &[FormatEntry],
-    text: Option<&str>,
-    path: &Path,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    for (index, format) in formats.iter().enumerate() {
-        for stage in &format.stages {
-            if matches!(stage, Stage::Notify) {
-                let key = format!("format[{index}].stages");
-                let position = text.and_then(|text| file::locate(text, &key));
-                diagnostics.push(Diagnostic {
-                    code: "config_not_supported",
-                    severity: Level::Error,
-                    file: path.display().to_string(),
-                    key: Some(key),
-                    line: position.map(|p| p.0),
-                    column: position.map(|p| p.1),
-                    message: format!(
-                        "the {} stage is not implemented in this version",
-                        stage.as_str()
-                    ),
-                    details: Map::new(),
-                });
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::file::Stage;
     use super::*;
     use crate::config::{KeepaliveTrigger, RetryRule};
 
@@ -967,9 +937,9 @@ stages = ["response", "heartbeat"]
         assert_eq!(resolved.sources["format"], Source::Toml);
     }
 
-    /// 这个版本还不支持的 format 写法是 error，指到条目的 stages。
+    /// persistent 程序可同时声明请求、逐块响应和完成通知。
     #[test]
-    fn unsupported_format_shapes_are_errors() {
+    fn completion_notifications_are_supported() {
         let text = r#"base_url = "https://a.example"
 [[format]]
 name = "a"
@@ -982,10 +952,7 @@ command = "f"
 stages = ["request"]
 "#;
         let resolved = run(text, &Overrides::default(), FileConfig::default());
-        assert_eq!(
-            brief(&resolved),
-            ["config_not_supported format[0].stages config.toml 6",]
-        );
+        assert!(brief(&resolved).is_empty());
     }
 
     /// forward 的请求层在需要时读取正文，不再与默认交付方式冲突。

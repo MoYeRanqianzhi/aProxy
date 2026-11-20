@@ -14,6 +14,10 @@ pub(super) struct Delivery {
     rec: Recorder,
     /// 响应已经完整交给了客户端
     delivered: bool,
+    /// 仅在请求进入配置的格式链之后才登记，丢弃响应也能发出最终结果。
+    notify: Option<(Arc<[Arc<crate::transform::Pool>]>, ExchangeCtx)>,
+    /// 以客户端实际拿到的媒体类型判断是否应给出流的完成状态。
+    streamed: bool,
     /// 在途数的守卫：从收到请求算起，到这里被丢弃为止
     _in_flight: crate::daemon::Counted,
 }
@@ -30,15 +34,29 @@ impl Delivery {
         Self {
             rec,
             delivered: false,
+            notify: None,
+            streamed: false,
             _in_flight: in_flight,
         }
     }
 
+    /// 没有订阅程序时不克隆上下文，也不在完成路径构造或排队任何消息。
+    pub(super) fn arm_notify(&mut self, state: &AppState, ctx: Option<&ExchangeCtx>) {
+        if state.has_format(crate::config::file::Stage::Notify) {
+            self.notify = Some((
+                state.formats.clone(),
+                ctx.expect("notify has format context").clone(),
+            ));
+        }
+    }
     /// 处理函数交出了响应：从这里起由响应体接着计。`bodiless`：这个响应按协议没有体可写
     /// （HEAD 请求的响应），连接层不会去读它。
     pub(super) fn attach(mut self, response: Response, bodiless: bool) -> Response {
         let status = response.status();
         self.rec.client_status(status.as_u16());
+        self.streamed = self.notify.is_some()
+            && delivers_body(bodiless, status)
+            && retry::is_streaming_content_type(response.headers());
         // 未缓冲的 forward 体没有自己的精确 size_hint；HTTP 定长帧写满时，连接层不会再来取 EOF。
         let remaining = response
             .headers()
@@ -61,6 +79,19 @@ impl Delivery {
 impl Drop for Delivery {
     fn drop(&mut self) {
         self.rec.end(self.delivered);
+        if let Some((pools, ctx)) = &self.notify
+            && let Some(mut end) = self.rec.completion(self.delivered, self.streamed)
+        {
+            end.client = Some(ctx.wire_client());
+            for pool in pools
+                .iter()
+                .filter(|p| p.entry.has_stage(crate::config::file::Stage::Notify))
+            {
+                end.context =
+                    ctx.body_context(&pool.entry.name, &aproxy_envelope::BodyNeed::Digest);
+                pool.enqueue_notify(end.clone());
+            }
+        }
     }
 }
 

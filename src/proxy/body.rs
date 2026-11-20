@@ -387,14 +387,12 @@ impl ClientUpload {
         req.body_stream = flag;
         if let Some(ctx) = &mut req.ctx {
             ctx.client.stream = Some(stream);
-            ctx.digest = digest.map(|h| {
-                use std::fmt::Write as _;
-                let mut hex = String::with_capacity(64);
-                for byte in sha2::Digest::finalize(h) {
-                    write!(hex, "{byte:02x}").expect("writing to a string");
-                }
-                hex.into()
-            });
+            if let Some(out) = &ctx.live_stream {
+                let _ = out.set(stream);
+            }
+            if let Some(hash) = digest {
+                ExchangeCtx::finish_digest(&ctx.digest, hash);
+            }
         }
         Ok(stream)
     }

@@ -545,10 +545,15 @@ impl Output {
                 let item = output.1.next().await?;
                 let b = match item {
                     Ok(b) => b,
-                    Err(end) => match end.tail {
-                        Some(b) => b,
-                        None => return Some((Err(std::io::Error::other(end.reason.code)), output)),
-                    },
+                    Err(end) => {
+                        rec.stream_aborted();
+                        match end.tail {
+                            Some(b) => b,
+                            None => {
+                                return Some((Err(std::io::Error::other(end.reason.code)), output));
+                            }
+                        }
+                    }
                 };
                 rec.response_bytes(b.len() as u64);
                 Some((Ok::<_, std::io::Error>(b), output))

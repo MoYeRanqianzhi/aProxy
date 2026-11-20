@@ -18,6 +18,7 @@ use tokio::{
     time::Instant,
 };
 
+mod notify;
 /// 能逐请求改变的键在握手时逐项公布；未协商的键不会成为隐式配置入口。
 const OVERRIDES: [&str; 8] = [
     "timeouts.connect_secs",
@@ -270,6 +271,8 @@ struct Slot {
     id: u32,
     /// 这个程序仍在使用的所有编号。
     used: Arc<Mutex<BTreeMap<u32, Option<u32>>>>,
+    /// 没有普通会话可归还时，最后一个退出的进程也要唤醒等空闲进程的观察者。
+    parked: Option<Arc<tokio::sync::Notify>>,
     /// 进程数上限与并发请求数分别计数，前者包括正在退出的进程。
     capacity: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
 }
@@ -277,6 +280,9 @@ impl Drop for Slot {
     fn drop(&mut self) {
         self.used.lock().unwrap().remove(&self.id);
         self.capacity.lock().unwrap().take();
+        if let Some(wake) = &self.parked {
+            wake.notify_waiters();
+        }
     }
 }
 
@@ -481,6 +487,22 @@ struct Circuit {
     /// 最近一次失败分类与时刻，不记录任意进程输出。
     last: Option<(Fault, u64)>,
 }
+impl Circuit {
+    /// 两种熔断器在快照使用相同的计数、冷却和故障词表。
+    fn view(&self) -> serde_json::Value {
+        use serde_json::json;
+        let mut breaker = json!({"state":if self.probing{"half_open"}else if self.window.is_some(){"open"}else{"closed"},"failures":self.failures});
+        if let Some(window) = &self.window {
+            breaker["opened_at"] = json!(window.opened_at);
+            breaker["probe_at"] = json!(window.probe_at);
+        }
+        if let Some((f, at)) = &self.last {
+            breaker["last_failure"] =
+                json!({"code":"format_error","details":{"kind":f.kind()},"at":at});
+        }
+        breaker
+    }
+}
 /// 客户端取消时释放试探资格，不计故障，也不让半开的状态永远卡住。
 struct Admission<'a> {
     /// 这次派发所属的池。
@@ -534,7 +556,7 @@ pub(crate) struct Pool {
     /// 同时进池的请求数；空闲进程可由持票者直接取走。
     turns: Semaphore,
     /// 归还的流可能拿走空闲名额，唤醒同时等待名额的普通请求重新检查池。
-    parked: tokio::sync::Notify,
+    parked: Arc<tokio::sync::Notify>,
     /// 已启动但仍未退出的普通进程数上限，不包括独占流。
     capacity: Arc<Semaphore>,
     /// 开始排空后不再留空闲会话，仍在途的请求可完成后续阶段。
@@ -553,6 +575,8 @@ pub(crate) struct Pool {
     retiring: Mutex<tokio::task::JoinSet<()>>,
     /// 首次 poll_write 与打开熔断器在同一锁内排序；从不持锁跨越 await。
     circuit: Mutex<Circuit>,
+    /// 只有声明 notify 的程序才分配观察队列与独立的故障计数。
+    notices: Option<Mutex<notify::Lane>>,
     /// 上报状态的配置序号和有界事件队列；不用脱敏后的名字作为身份。
     events: Option<(usize, std::sync::Weak<crate::history::History>)>,
     /// 最近一次成功握手的身份与能力，握手失败时不杜撰版本。
@@ -580,6 +604,9 @@ impl Pool {
             entry.pool_max as usize
         };
         Arc::new(Self {
+            notices: entry
+                .has_stage(crate::config::file::Stage::Notify)
+                .then(Default::default),
             entry,
             home,
             secrets,
@@ -617,16 +644,13 @@ impl Pool {
     /// 读者和状态事件共用同一份字段选择和脱敏逻辑。
     fn circuit_snapshot(&self, c: &Circuit) -> serde_json::Value {
         use serde_json::json;
-        let mut breaker = json!({"state":if c.probing{"half_open"}else if c.window.is_some(){"open"}else{"closed"},"failures":c.failures});
-        if let Some(window) = &c.window {
-            breaker["opened_at"] = json!(window.opened_at);
-            breaker["probe_at"] = json!(window.probe_at);
-        }
-        if let Some((f, at)) = &c.last {
-            breaker["last_failure"] =
-                json!({"code":"format_error","details":{"kind":f.kind()},"at":at});
-        }
+        let breaker = c.view();
         let mut snap = json!({"name":self.secrets.replace(&self.entry.name),"process":if self.entry.process==Process::Spawn{"spawn"}else{"persistent"},"required":self.entry.required,"stages":self.entry.stages.iter().map(|s|s.as_str()).collect::<Vec<_>>(),"breaker":breaker});
+        if let Some(n) = &self.notices {
+            let lane = n.lock().unwrap();
+            snap["notify_breaker"] = lane.breaker.view();
+            snap["notify_dropped_total"] = json!(lane.dropped);
+        }
         if let Some(h) = self.negotiated.lock().unwrap().as_ref() {
             snap["protocol"] = json!(h.protocol);
             snap["version"] = json!(self.secrets.replace(&h.version));
@@ -646,11 +670,20 @@ impl Pool {
         c.window = Some(window);
         c.probing = false;
         self.idle.lock().unwrap().clear();
+        if let Some(n) = &self.notices {
+            let mut lane = n.lock().unwrap();
+            lane.breaker.probing = false;
+            lane.discard_all(self);
+        }
         self.transition(c);
         tracing::warn!(format=%self.secrets.replace(&self.entry.name),failures=c.failures,cooldown_secs=self.entry.breaker_cooldown_secs,kind=c.last.as_ref().map(|(f,_)|f.kind()),"format circuit opened");
     }
     /// 可选程序启动时暂不可用，与静态不匹配不同；冷却后允许一次真正的数据往返。
     pub(crate) fn open_at_startup(&self, f: Fault) {
+        if self.entry.stages.as_slice() == [crate::config::file::Stage::Notify] {
+            self.notify_failure_at_start(f);
+            return;
+        }
         let mut c = self.circuit.lock().unwrap();
         let now = crate::daemon::now_millis();
         c.failures = 1;
@@ -768,6 +801,7 @@ impl Pool {
         let slot = Slot {
             id,
             used: self.ids.clone(),
+            parked: self.notices.as_ref().map(|_| self.parked.clone()),
             capacity: capacity.clone(),
         };
         let mut child = {
@@ -1026,6 +1060,7 @@ impl Pool {
     }
     /// 先拿到已握手的独占进程，再让上一层读取磁盘与构造业务帧；等待者只持有轻量上下文。
     pub(crate) async fn turn(self: &Arc<Self>, fresh: bool) -> Result<Turn<'_>, Fault> {
+        let waiting = self.waiting_data();
         let ticket = self.admit()?;
         let _turn = tokio::select! {biased;
             f=ticket.revoked()=>return Err(f),
@@ -1050,6 +1085,7 @@ impl Pool {
             f=ticket.revoked()=>return Err(f),
             result=borrow=>result,
         };
+        drop(waiting);
         match worker {
             Ok(worker) => Ok(Turn {
                 pool: self,
@@ -1071,6 +1107,7 @@ impl Pool {
         stage: Stage,
         fresh: bool,
     ) -> Result<(StreamWorker, PreparedReply), Fault> {
+        let waiting = self.waiting_data();
         let ticket = self.admit()?;
         let obtain = async {
             if let Some(w) = self.take()
@@ -1084,6 +1121,7 @@ impl Pool {
         };
         let result = async {
             let mut w = tokio::select! {biased; f=ticket.revoked()=>return Err(f), r=obtain=>r?};
+            drop(waiting);
             let reply = self
                 .exchange(&mut w, stage, self.entry.timeout_secs, Some(&ticket))
                 .await?;

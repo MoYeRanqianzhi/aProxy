@@ -202,7 +202,7 @@ pub(crate) struct ExchangeCtx {
     /// 双向转发的上传与下载可同时推进；各阶段在派发时取值，不缓存上游响应头到达时的旧值。
     pub(crate) live_stream: Option<Arc<std::sync::OnceLock<bool>>>,
     /// 客户端上传完成后的原始 SHA-256；程序只有明确选择摘要时才会收到它。
-    pub(crate) digest: Option<Arc<str>>,
+    pub(crate) digest: Arc<std::sync::OnceLock<String>>,
     /// 只在读取一份状态或写入一个回信时持锁。
     states: Arc<Mutex<BTreeMap<String, String>>>,
     /// 报告写进原请求的同一份记录。
@@ -216,11 +216,12 @@ impl ExchangeCtx {
         stream: impl Into<Option<bool>>,
         rec: crate::history::Recorder,
     ) -> Self {
+        let stream = stream.into();
         Self {
             request_id,
-            client: wire::Client::new(path.into(), stream.into()),
-            live_stream: None,
-            digest: None,
+            client: wire::Client::new(path.into(), stream),
+            live_stream: stream.is_none().then(Default::default),
+            digest: Default::default(),
             states: Default::default(),
             rec,
         }
@@ -233,6 +234,15 @@ impl ExchangeCtx {
             .or_else(|| self.live_stream.as_ref()?.get().copied());
         client
     }
+    /// 在确认原始请求体收完整之后才发布摘要；收尾与各阶段共享同一份不可变结果。
+    pub(crate) fn finish_digest(slot: &std::sync::OnceLock<String>, hash: sha2::Sha256) {
+        use std::fmt::Write as _;
+        let mut hex = String::with_capacity(64);
+        for byte in sha2::Digest::finalize(hash) {
+            write!(hex, "{byte:02x}").expect("writing to a string");
+        }
+        let _ = slot.set(hex);
+    }
     /// 本层只收到自己之前给出的字符串。
     pub(crate) fn context(&self, name: &str) -> wire::Context {
         let mut c = wire::Context::new(self.request_id.to_string());
@@ -243,7 +253,7 @@ impl ExchangeCtx {
     pub(crate) fn body_context(&self, name: &str, need: &wire::BodyNeed) -> wire::Context {
         let mut c = self.context(name);
         if *need == wire::BodyNeed::Digest {
-            c.digest = Some(self.digest.as_deref().map(str::to_owned));
+            c.digest = Some(self.digest.get().cloned());
         }
         c
     }

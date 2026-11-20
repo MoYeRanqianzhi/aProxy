@@ -54,7 +54,7 @@ pub(super) async fn proxy_handler(State(state): State<AppState>, req: Request) -
         },
     );
     // 处理函数被取消（客户端在拿到响应之前断开）时，它随 future 一起被丢弃，照样收尾
-    let delivery = Delivery::new(rec.clone(), in_flight);
+    let mut delivery = Delivery::new(rec.clone(), in_flight);
     let mut trace = RequestTrace::recorded(request_id, rec);
     trace.decide_started = decide_started;
     let bodiless = method == http::Method::HEAD;
@@ -62,7 +62,7 @@ pub(super) async fn proxy_handler(State(state): State<AppState>, req: Request) -
     // 这个请求的全部日志都带 request_id：与响应头 x-aproxy-request-id、错误体里的是同一个串，
     // 拿着其中任何一个都能在日志里找到这个请求的经过
     let span = tracing::info_span!("request", request_id = %trace.request_id);
-    let response = handle(state, req, method, uri, trace)
+    let response = handle(state, req, method, uri, trace, &mut delivery)
         .instrument(span)
         .await;
     delivery.attach(response, bodiless)
@@ -75,6 +75,7 @@ async fn handle(
     method: http::Method,
     uri: http::Uri,
     mut trace: RequestTrace,
+    delivery: &mut Delivery,
 ) -> Response {
     // WebSocket 升级：代理按请求—响应转发，承载不了升级后的双向流。Upgrade 是逐跳头，转发时
     // 会被剥掉，上游看到的是一个普通请求，多半回 4xx，然后被无限重试——不如当场说清楚。
@@ -140,6 +141,7 @@ async fn handle(
         encoding: client_encoding.clone(),
     };
     if live && !state.has_format(Stage::Request) {
+        delivery.arm_notify(&state, ctx.as_ref());
         tracing::info!(method = %method, target = %state.history.redacted_url(&target_url), "代理请求（仅转发）");
         trace.attempts = 1;
         return forward_only_proxy(
@@ -174,6 +176,7 @@ async fn handle(
             Err(t) => return t.into_response(&trace),
         }
     };
+    delivery.arm_notify(&state, req.ctx.as_ref());
     let keepalive_applies = !forward
         && state.config.keepalive_enabled()
         && !state.config.keepalive_interval().is_zero()

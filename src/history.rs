@@ -833,6 +833,10 @@ struct RecordInner {
     stream: bool,
     user_agent: Option<String>,
     delivery: &'static str,
+    /// 最近一次确实收到的上游响应头，尝试被裁掉也不丢失。
+    last_upstream: Option<u16>,
+    /// 流被截断后外层可以合法地给出结尾字节，但这不算上游正常结束。
+    stream_aborted: bool,
     /// 已经失败的 forward 尝试被 decide 救回并改走重试，不含初始 request 投票。
     upgraded: bool,
     outcome: Outcome,
@@ -1097,6 +1101,8 @@ impl History {
             stream: false,
             user_agent,
             delivery: start.delivery,
+            last_upstream: None,
+            stream_aborted: false,
             upgraded: false,
             outcome: Outcome::InFlight,
             settled: None,
@@ -1890,6 +1896,7 @@ impl Recorder {
         let body = live.history.new_body(live.record.seq, encoding);
         let headers = live.history.headers(headers);
         self.update(|inner, _| {
+            inner.last_upstream = Some(status);
             if let Some(t) = inner.try_mut(attempt) {
                 t.upstream_status = Some(status);
                 t.response = Some(TryResponse {
@@ -1992,6 +1999,45 @@ impl Recorder {
         self.update(|inner, _| inner.settled = Some((outcome, code)));
     }
 
+    /// 只记交付流的中断，不把重试时已丢弃的半截实体算进最终完成通知。
+    pub(crate) fn stream_aborted(&self) {
+        self.update(|inner, _| inner.stream_aborted = true);
+    }
+
+    /// 交付结束后取同一份已经定案的结果。通知不接触请求头、体或历史预算。
+    pub(crate) fn completion(
+        &self,
+        delivered: bool,
+        streamed: bool,
+    ) -> Option<aproxy_envelope::Completion> {
+        use aproxy_envelope::{Completion, Context, Delivery};
+        let live = self.0.as_ref()?;
+        let inner = lock(&live.record.inner);
+        if matches!(
+            inner.code,
+            Some("request_too_large" | "client_body_aborted")
+        ) {
+            return None;
+        }
+        let end = inner.ended_at?;
+        let mut m = Completion::new(
+            Context::new(live.record.id.to_string()),
+            if inner.delivery == "forward" {
+                Delivery::Forward
+            } else {
+                Delivery::Retry
+            },
+            inner.attempts,
+            end.saturating_sub(inner.started_at),
+            inner.outcome.as_str().into(),
+        );
+        m.upgraded = inner.upgraded;
+        m.upstream_status = inner.last_upstream;
+        m.stream_completed =
+            (streamed || inner.stream_aborted).then_some(delivered && !inner.stream_aborted);
+        m.code = inner.code.map(str::to_owned);
+        Some(m)
+    }
     /// 请求结束。`delivered`：响应完整交给了客户端。结局没有另外定过的，交付完就是 `ok`，
     /// 没交付完就是客户端先走了。只有第一次调用生效。
     pub fn end(&self, delivered: bool) {

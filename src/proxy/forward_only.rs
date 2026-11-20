@@ -18,6 +18,8 @@ struct RequestTap {
     flag_out: Option<Arc<std::sync::OnceLock<bool>>>,
     /// 大体通过有界管道交给增量 JSON 解析器，不积攒整个上传；小时直接复用头部样本。
     parser: Option<(tokio::io::DuplexStream, tokio::task::JoinHandle<bool>)>,
+    /// 仅完成通知协商摘要时顺手哈希，不把请求体留作重放。
+    digest: Option<(sha2::Sha256, Arc<std::sync::OnceLock<String>>)>,
     /// 上传结束后的解析结果，同时用于程序和请求记录。
     exact: Option<bool>,
     /// 请求体开头的至多 [`SHAPE_PREFIX`] 字节
@@ -31,6 +33,9 @@ struct RequestTap {
 impl RequestTap {
     /// 边转发边取样。程序要确切标记时要看到整个 JSON 的结尾，后面的重复键或语法错误也算数。
     async fn chunk(&mut self, chunk: &Bytes) {
+        if let Some((hash, _)) = &mut self.digest {
+            sha2::Digest::update(hash, chunk);
+        }
         if self.flag_out.is_some()
             && self.parser.is_none()
             && chunk.len() > SHAPE_PREFIX - self.prefix.len()
@@ -61,6 +66,9 @@ impl RequestTap {
     }
     /// 只在客户端上传抵达 EOF 时结算，不让取消的流被认作完整 JSON。
     async fn finish(&mut self) {
+        if let Some((hash, out)) = self.digest.take() {
+            ExchangeCtx::finish_digest(&out, hash);
+        }
         if let Some(out) = self.flag_out.take() {
             let flag = if let Some((writer, job)) = self.parser.take() {
                 drop(writer);
@@ -193,7 +201,7 @@ pub(super) async fn forward_only_proxy(
     target_url: &str,
     headers: &HeaderMap,
     upload: ClientUpload,
-    mut ctx: Option<ExchangeCtx>,
+    ctx: Option<ExchangeCtx>,
     trace: &RequestTrace,
     attempt: u32,
 ) -> Result<Response, Terminal> {
@@ -244,10 +252,24 @@ pub(super) async fn forward_only_proxy(
             ]
             .into_iter()
             .any(|stage| state.has_format(stage));
-        let flag_out = need_flag.then(|| Arc::new(std::sync::OnceLock::new()));
-        if let Some(ctx) = &mut ctx {
-            ctx.live_stream = flag_out.clone();
-        }
+        let flag_out = ctx
+            .as_ref()
+            .and_then(|c| c.live_stream.clone())
+            .filter(|_| need_flag);
+        let digest = ctx
+            .as_ref()
+            .filter(|_| state.formats.iter().any(|p| p.wants_notify_digest()))
+            .and_then(|c| {
+                use axum::body::HttpBody as _;
+                let hash = sha2::Sha256::default();
+                // HTTP 可以不拉取已知为空的上传；此时已确认 EOF，不是传到一半的 null。
+                if upload.body.is_end_stream() || upload.body.size_hint().exact() == Some(0) {
+                    ExchangeCtx::finish_digest(&c.digest, hash);
+                    None
+                } else {
+                    Some((hash, c.digest.clone()))
+                }
+            });
         let sent = rec.sent_head(
             method.as_str(),
             target_url,
@@ -276,6 +298,7 @@ pub(super) async fn forward_only_proxy(
             accept_sse: upload.accept,
             trigger: upload.trigger,
             flag_out,
+            digest,
             parser: None,
             exact: None,
         };
@@ -495,6 +518,7 @@ pub(super) async fn forward_response(
                             crate::history::Outcome::UpstreamError,
                             Some("upstream_failed"),
                         );
+                        tap.rec.stream_aborted();
                         tap.failure = Some(failure.clone());
                         Some((Err(failure), (resp, tap, true)))
                     }

@@ -4516,7 +4516,8 @@ async fn forward_503_upgrades_through_decide_and_the_client_sees_only_the_retrie
             "policy",
             "'decide'",
             &["reply", r#"{"decision":"retry","delay_ms":0}"#],
-        );
+        )
+        + &layer(&home, "finished", "'notify'", &["echo"]);
     let (c, url) = running(&home, up, &cfg);
     let resp = c.get(&url).send().await.unwrap();
     assert_eq!(resp.status(), 200);
@@ -4539,6 +4540,12 @@ async fn forward_503_upgrades_through_decide_and_the_client_sees_only_the_retrie
         aproxy::daemon::ipc_ping_in(&home.path().join("run"), url.rsplit(':').next().unwrap())
             .await
             .unwrap();
+    let end = &observed_stage(&home, "finished", "notify", 1).await[0];
+    assert_eq!(end["request_id"], m["request_id"]);
+    assert_eq!(end["delivery"], "retry");
+    assert_eq!(end["upgraded"], true);
+    assert_eq!(end["attempts"], 2);
+    assert_eq!(end["upstream_status"], 200);
     assert_eq!(ping.activity.upgraded_total, 1);
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
 }
@@ -4574,7 +4581,8 @@ async fn forward_stream_cut_mid_way_does_not_upgrade() {
             "policy",
             "'request','decide'",
             &["reply", r#"{"decision":"retry"}"#],
-        );
+        )
+        + &layer(&home, "finished", "'notify'", &["echo"]);
     let (c, url) = running(&home, up, &cfg);
     let mut resp = c.get(&url).send().await.unwrap();
     let mut bytes = Vec::new();
@@ -4589,6 +4597,11 @@ async fn forward_stream_cut_mid_way_does_not_upgrade() {
     let rec = request_detail(&home, &url, messages[1]["request_id"].as_str().unwrap()).await;
     assert_eq!(rec["record"]["code"], "upstream_failed");
     assert_eq!(rec["record"]["upgraded"], false);
+    let end = &observed_stage(&home, "finished", "notify", 1).await[0];
+    assert_eq!(end["request_id"], messages[1]["request_id"]);
+    assert_eq!(end["stream_completed"], false);
+    assert_eq!(end["code"], "upstream_failed");
+    assert_eq!(end["delivery"], "forward");
 }
 
 /// 压缩和大体都只旁路检查；历史预算为零也应知道伪成功，客户端则逐字节收到原表示。
@@ -4726,4 +4739,324 @@ async fn forward_vote_on_either_side_of_commitment() {
     let record = request_detail(&home, &url, observer[2]["request_id"].as_str().unwrap()).await;
     assert_eq!(record["record"]["delivery"], "forward");
     assert_eq!(record["record"]["heartbeats"], 0);
+}
+
+/// 等观察方向公布对应的状态；数据交付不等通知，不能拿 HTTP 返回当作通知已处理的证明。
+async fn notify_snapshot(home: &TestHome, url: &str, ready: impl Fn(&Value) -> bool) -> Value {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let f = aproxy::daemon::ipc_ping_in(
+                &home.path().join("run"),
+                url.rsplit(':').next().unwrap(),
+            )
+            .await
+            .unwrap()
+            .formats
+            .remove(0);
+            if ready(&f) {
+                return f;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .expect("notify state did not converge")
+}
+
+/// 直通和缓冲路径都在收齐原始上传后发摘要；另一个程序只见自己的私有状态，不见摘要或正文。
+#[tokio::test]
+async fn completion_notify_digest_and_state_match_each_finished_request() {
+    let raw = br#"{"stream":false,"value":"before any patches"}"#;
+    for mode in ["retry", "forward"] {
+        let home = TestHome::new();
+        let (up, release) = split_forward_upstream().await;
+        let cfg = format!("delivery='{mode}'\n")
+            + &layer(&home, "digest", "'request','notify'", &["notify-digest"])
+            + &layer(&home, "private", "'notify'", &["echo"]);
+        let (client, url) = running(&home, up, &cfg);
+        release.notify_one();
+        let r = client
+            .post(format!("{url}/sample"))
+            .body(raw.as_slice())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let id = observed_stage(&home, "digest", "request", 1).await[0]["request_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(r.bytes().await.unwrap().starts_with(raw));
+        let record = request_detail(&home, &url, &id).await;
+        for name in ["digest", "private"] {
+            let m = &observed_stage(&home, name, "notify", 1).await[0];
+            assert_eq!(m["event"], "request_end");
+            assert_eq!(m["request_id"], id);
+            assert_eq!(m["delivery"], mode);
+            assert_eq!(m["upgraded"], false);
+            assert_eq!(m["attempts"], 1);
+            assert_eq!(m["upstream_status"], 200);
+            assert_eq!(m.get("stream_completed"), Some(&Value::Null));
+            assert_eq!(m["outcome"], record["record"]["outcome"]);
+            assert_eq!(m["code"], record["record"]["code"]);
+            assert!(m["duration_ms"].as_u64().is_some());
+            assert_eq!(m["client"]["stream"], false);
+            assert_eq!(m["client"]["path"], "/sample");
+            for k in ["request", "body", "body_b64"] {
+                assert!(m.get(k).is_none());
+            }
+            if name == "digest" {
+                assert_eq!(
+                    m["digest"],
+                    "abbb2acd0576a7257ee5962fb7f4207e0eccc99cbf5498607f81fd3002da9f5c"
+                );
+                assert_eq!(m["state"], "observer state");
+            } else {
+                assert!(m.get("digest").is_none() && m.get("state").is_none());
+            }
+        }
+    }
+}
+
+/// 一条通知卡死只处罚观察方向；两个时限均为零时仍然换掉旧会话，业务继续有回信。
+#[tokio::test]
+async fn stuck_notify_is_replaced_after_two_seconds() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[200]).await;
+    let cfg = layer(&home, "hung", "'request','notify'", &["stuck-notify"])
+        + "pool_max=1\ntimeout_secs=0\ndecide_timeout_secs=0\n";
+    let (c, url) = running(&home, up, &cfg);
+    assert_eq!(
+        c.get(&url).send().await.unwrap().text().await.unwrap(),
+        "upstream bytes"
+    );
+    observed_stage(&home, "hung", "notify", 1).await;
+    assert_eq!(
+        c.get(&url).send().await.unwrap().text().await.unwrap(),
+        "upstream bytes"
+    );
+    let msgs = observed_stage(&home, "hung", "request", 2).await;
+    assert_eq!(msgs[1]["seq"], 1, "request did not use a fresh worker");
+    assert_eq!(observed_stage(&home, "hung", "hello", 2).await.len(), 2);
+}
+
+/// 通知坏回信或超时都要丢弃会话；成功的业务不把通知的连续失败数清掉。
+#[tokio::test]
+async fn notify_timeouts_do_not_touch_the_data_path_breaker() {
+    for (mode, kind) in [("stuck-notify", "timeout"), ("invalid-notify", "protocol")] {
+        let home = TestHome::new();
+        let (up, _) = upstream(&[200]).await;
+        let (c, url) = running(
+            &home,
+            up,
+            &(layer(&home, "mixed", "'request','notify'", &[mode])
+                + "pool_max=1\nbreaker_failures=2\nbreaker_cooldown_secs=86400\n"),
+        );
+        for i in 1..=2 {
+            assert_eq!(
+                c.get(&url).send().await.unwrap().text().await.unwrap(),
+                "upstream bytes"
+            );
+            let snap = notify_snapshot(&home, &url, |f| f["notify_breaker"]["failures"] == i).await;
+            assert_eq!(
+                snap["breaker"],
+                serde_json::json!({"state":"closed","failures":0})
+            );
+            assert_eq!(
+                snap["notify_breaker"]["last_failure"]["details"]["kind"],
+                kind
+            );
+        }
+        assert_eq!(
+            c.get(&url).send().await.unwrap().text().await.unwrap(),
+            "upstream bytes"
+        );
+        let snap = notify_snapshot(&home, &url, |f| f["notify_dropped_total"] == 1).await;
+        assert_eq!(snap["notify_breaker"]["state"], "open");
+        assert_eq!(
+            frames(&home, "mixed")
+                .iter()
+                .filter(|m| m["stage"] == "notify")
+                .count(),
+            2
+        );
+    }
+}
+
+/// 达到第五次真实超时才开窗；经过冷却后下一条通知能完成握手和探测，不需要触发业务帧。
+#[tokio::test]
+async fn notify_breaker_opens_after_five_timeouts_and_probes_after_cooldown() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[200]).await;
+    let gate = home.path().join("reply-ok");
+    let (c, url) = running(
+        &home,
+        up,
+        &(layer(
+            &home,
+            "observer",
+            "'notify'",
+            &["stuck-notify", gate.to_str().unwrap()],
+        ) + "breaker_cooldown_secs=1\n"),
+    );
+    for i in 1..=5 {
+        assert_eq!(
+            c.get(&url).send().await.unwrap().text().await.unwrap(),
+            "upstream bytes"
+        );
+        let snap = notify_snapshot(&home, &url, |f| f["notify_breaker"]["failures"] == i).await;
+        assert_eq!(
+            snap["notify_breaker"]["state"],
+            if i == 5 { "open" } else { "closed" }
+        );
+    }
+    std::fs::write(&gate, b"ready").unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    assert_eq!(
+        c.get(&url).send().await.unwrap().text().await.unwrap(),
+        "upstream bytes"
+    );
+    let snap = notify_snapshot(&home, &url, |f| f["notify_breaker"]["state"] == "closed").await;
+    assert_eq!(snap["notify_breaker"]["failures"], 0);
+    assert_eq!(
+        observed_stage(&home, "observer", "notify", 6).await.len(),
+        6
+    );
+}
+
+/// 可选纯观察程序一开始不存在，不妨碍就绪；放好程序后只靠完成通知恢复。
+#[tokio::test]
+async fn notify_only_program_recovers_after_its_breaker_opens() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[200]).await;
+    let path = home
+        .path()
+        .join(format!("later{}", std::env::consts::EXE_SUFFIX));
+    let cfg = layer(&home, "later-log", "'notify'", &["echo"]).replace(
+        &serde_json::to_string(&format_echo_path()).unwrap(),
+        &serde_json::to_string(&path).unwrap(),
+    ) + "required=false\nbreaker_cooldown_secs=1\n";
+    let (c, url) = running(&home, up, &cfg);
+    let snap = notify_snapshot(&home, &url, |_| true).await;
+    assert_eq!(snap["breaker"]["state"], "closed");
+    assert_eq!(snap["notify_breaker"]["state"], "open");
+    std::fs::copy(format_echo_path(), &path).unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    assert_eq!(
+        c.get(&url).send().await.unwrap().text().await.unwrap(),
+        "upstream bytes"
+    );
+    observed_stage(&home, "later-log", "notify", 1).await;
+    assert_eq!(
+        notify_snapshot(&home, &url, |f| f["notify_breaker"]["state"] == "closed").await["notify_breaker"]
+            ["failures"],
+        0
+    );
+}
+
+/// Host、Origin、体积和不完整上传都在链前拒绝；随后的一条正常请求作为队尾标记。
+#[tokio::test]
+async fn requests_rejected_before_the_chain_send_no_notify() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[200]).await;
+    let cfg = String::from("max_request_mb=1\n")
+        + &layer(&home, "accepted", "'request','notify'", &["echo"]);
+    let (c, url) = running(&home, up, &cfg);
+    for (header, value) in [
+        ("host", "unexpected.invalid"),
+        ("origin", "https://unexpected.invalid"),
+    ] {
+        assert_eq!(
+            c.get(&url)
+                .header(header, value)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+    assert_eq!(
+        c.post(&url)
+            .body(vec![1; 1024 * 1024 + 1])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        413
+    );
+    let addr = url.trim_start_matches("http://");
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(
+        format!("POST /partial HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 100\r\n\r\nshort")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    s.shutdown().await.unwrap();
+    let mut raw = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        s.read_to_string(&mut raw),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(raw.contains("client_body_aborted"), "{raw}");
+    let response = c.get(&url).send().await.unwrap();
+    let id = observed_stage(&home, "accepted", "request", 1).await[0]["request_id"].clone();
+    assert_eq!(response.text().await.unwrap(), "upstream bytes");
+    let ends = observed_stage(&home, "accepted", "notify", 1).await;
+    assert_eq!(ends.len(), 1);
+    assert_eq!(ends[0]["request_id"], id);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+/// 故意不读下一帧的纯观察进程不在请求路径上；业务请求能全部交付，故障留在独立熔断器。
+#[tokio::test]
+async fn notify_program_that_never_reads_does_not_slow_the_data_path() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[200]).await;
+    let (c, url) = running(
+        &home,
+        up,
+        &(layer(&home, "deaf", "'notify'", &["deaf-notify"])
+            + "breaker_failures=1\nbreaker_cooldown_secs=86400\n"),
+    );
+    for result in futures_util::future::join_all(
+        (0..64).map(|_| async { c.get(&url).send().await.unwrap().text().await.unwrap() }),
+    )
+    .await
+    {
+        assert_eq!(result, "upstream bytes");
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 64);
+    let snap = notify_snapshot(&home, &url, |f| {
+        f["notify_breaker"]["state"] == "open" && f["notify_dropped_total"] == 63
+    })
+    .await;
+    assert_eq!(snap["breaker"]["failures"], 0);
+    assert!(frames(&home, "deaf").iter().all(|f| f["stage"] == "hello"));
+}
+
+/// 空上传已有完整表示（空串的 SHA-256），区别于上游在客户端还没传完时就结束的 null。
+#[tokio::test]
+async fn live_empty_upload_notify_hashes_the_empty_representation() {
+    let home = TestHome::new();
+    let (up, _) = upstream(&[200]).await;
+    let (c, url) = running(
+        &home,
+        up,
+        &(String::from("delivery='forward'\n")
+            + &layer(&home, "empty", "'notify'", &["notify-digest"])),
+    );
+    assert_eq!(
+        c.get(&url).send().await.unwrap().text().await.unwrap(),
+        "upstream bytes"
+    );
+    assert_eq!(
+        observed_stage(&home, "empty", "notify", 1).await[0]["digest"],
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
 }

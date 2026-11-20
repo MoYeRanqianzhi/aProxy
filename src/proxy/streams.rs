@@ -140,6 +140,9 @@ fn decode(input: Flow, encoding: String, limit: usize) -> Flow {
         if std::thread::Builder::new()
             .name("format-stream-decoder".into())
             .spawn(move || {
+                // SyncIoBridge 只在 read 期间进入运行时。流在回压写失败后才析构时，
+                // 最后一张记账票仍要在同一运行时调度异步完成通知。
+                let _runtime = handle.enter();
                 let _slot = slot;
                 let mut failure = None;
                 let mut output = DecodeOutput(out.clone());
@@ -158,7 +161,7 @@ fn decode(input: Flow, encoding: String, limit: usize) -> Flow {
                         .boxed();
                     let mut reader = tokio_util::io::SyncIoBridge::new_with_handle(
                         tokio_util::io::StreamReader::new(stream),
-                        handle,
+                        handle.clone(),
                     );
                     // 编码的结束标记不是 HTTP EOF。读到真正的消息结尾才发 close，保留延迟到来的运输层中断。
                     crate::decode::decode_strict(&encoding, &mut reader, &mut output, limit as u64)
@@ -702,6 +705,43 @@ mod tests {
             assert_eq!(abort["reason"]["code"], "client_gone");
             pool.shutdown().await;
         }
+    }
+    /// 回压中取消解码时，持有 HTTP 流的最后一张票会在专属线程析构；完成回调仍须能派发通知。
+    #[tokio::test]
+    async fn decoder_drops_backpressured_input_with_a_runtime_context() {
+        use std::io::Write as _;
+        /// 代替真实响应记账票，在原始输入被释放而不是读到 EOF 时观测运行时。
+        struct Ticket(Option<tokio::sync::oneshot::Sender<bool>>);
+        impl Drop for Ticket {
+            fn drop(&mut self) {
+                let _ = self
+                    .0
+                    .take()
+                    .unwrap()
+                    .send(tokio::runtime::Handle::try_current().is_ok());
+            }
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&vec![b'x'; 512 * 1024]).unwrap();
+        let first = Bytes::from(gz.finish().unwrap());
+        let input =
+            futures_util::stream::unfold((Some(first), Ticket(Some(tx))), |(b, t)| async move {
+                match b {
+                    Some(bytes) => Some((Ok(bytes), (None, t))),
+                    None => std::future::pending().await,
+                }
+            });
+        let mut output = decode(input.boxed(), "gzip".into(), 1024 * 1024);
+        assert!(matches!(output.next().await, Some(Ok(_))));
+        drop(output);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(8), rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            "input destructor lost its runtime"
+        );
     }
     /// 编码成员收完后 HTTP 仍可能断流；只有运输层的 EOF 才能让外层发送 close。
     #[tokio::test]

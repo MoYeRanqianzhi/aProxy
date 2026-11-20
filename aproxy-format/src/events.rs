@@ -38,6 +38,8 @@ pub(super) struct Events {
     usage_chunk: Option<Value>,
     /// Messages 的 stop_reason 提示原因而不保证完整；转成 Chat 时，须等 message_stop 再把这一帧交给编码器。
     message_finish: Option<Value>,
+    /// 两个协议的终态快照并不共享同一组原因，暂存可映射的 Responses 原因直到目标终态。
+    incomplete_reason: Option<&'static str>,
 }
 impl Events {
     /// 每次 open 初始化，不把上一条流的输出索引或 usage 带到下一条。
@@ -56,6 +58,7 @@ impl Events {
             include_usage,
             usage_chunk: None,
             message_finish: None,
+            incomplete_reason: None,
         }
     }
     /// 将已经完整的事件变成立即可交付的目标帧，不等待下一次 data 或 close。
@@ -122,11 +125,27 @@ impl Events {
         if !event.is_object() {
             return Err(malformed());
         }
+        if self.source == F::OpenAiResponses && event["type"] == "response.incomplete" {
+            self.incomplete_reason = Some(match event["response"]["incomplete_details"]["reason"]
+                .as_str()
+            {
+                Some("content_filter") => "content_filter",
+                Some("max_output_tokens") => "max_output_tokens",
+                _ => return Err(malformed()),
+            });
+            // completed 的译码会对齐快照与已有增量并读取 usage；目标终因在渲染之前单独还原。
+            event["type"] = "response.completed".into();
+        }
         self.terminal = match self.source {
             F::OpenAiChat => {
                 if let Some(rows) = event.get_mut("choices").and_then(Value::as_array_mut) {
                     for row in rows {
                         if row["finish_reason"].is_string() {
+                            self.incomplete_reason = match row["finish_reason"].as_str() {
+                                Some("length") => Some("max_output_tokens"),
+                                Some("content_filter") => Some("content_filter"),
+                                _ => self.incomplete_reason,
+                            };
                             self.chat_finishes.push(serde_json::json!({"index":row["index"],"delta":{},"finish_reason":row["finish_reason"].take()}));
                         }
                     }
@@ -164,6 +183,42 @@ impl Events {
     }
     /// 按客户端的选项调整目标帧；最后只发一个独立用量块，且不能再带工具或文本。
     fn render_events(&mut self, mut events: Vec<Value>, output: &mut String) -> Result<(), Fault> {
+        if let Some(reason) = self.incomplete_reason {
+            for e in &mut events {
+                match self.target {
+                    F::OpenAiChat if e["choices"][0]["finish_reason"].is_string() => {
+                        e["choices"][0]["finish_reason"] = if reason == "content_filter" {
+                            "content_filter"
+                        } else {
+                            "length"
+                        }
+                        .into()
+                    }
+                    F::AnthropicMessages
+                        if e["type"] == "message_delta"
+                            && e["delta"]["stop_reason"].is_string() =>
+                    {
+                        e["delta"]["stop_reason"] = if reason == "content_filter" {
+                            "refusal"
+                        } else {
+                            "max_tokens"
+                        }
+                        .into()
+                    }
+                    F::OpenAiResponses
+                        if matches!(
+                            e["type"].as_str(),
+                            Some("response.completed" | "response.incomplete")
+                        ) =>
+                    {
+                        e["type"] = "response.incomplete".into();
+                        e["response"]["status"] = "incomplete".into();
+                        e["response"]["incomplete_details"] = serde_json::json!({"reason":reason});
+                    }
+                    _ => (),
+                }
+            }
+        }
         if self.include_usage && self.target == F::OpenAiChat {
             events.retain_mut(|e| {
                 if e["usage"].is_object() {

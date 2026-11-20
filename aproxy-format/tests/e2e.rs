@@ -1293,3 +1293,85 @@ fn requested_chat_usage_is_one_empty_choices_chunk_before_done() {
         assert!(rest.iter().all(|c| c["usage"].is_null()));
     }
 }
+
+/// 把同一批源事件逐个交给独占进程。解析真实 SSE 而非匹配转义后的协议管道字符串。
+fn translated_events(w: &mut Worker, events: &[Value], chat_sentinel: bool) -> Vec<Value> {
+    let mut text = String::new();
+    for e in events {
+        text.push_str(
+            stream_frame(w, "data", &format!("data: {e}\n\n"))["data"]
+                .as_str()
+                .unwrap(),
+        );
+    }
+    if chat_sentinel {
+        text.push_str(
+            stream_frame(w, "data", "data: [DONE]\n\n")["data"]
+                .as_str()
+                .unwrap(),
+        );
+    }
+    text.push_str(stream_frame(w, "close", "")["data"].as_str().unwrap_or(""));
+    text.lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|s| *s != "[DONE]")
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect()
+}
+/// Responses 的 incomplete 可带最终快照和用量；过滤与 token 限额不是同一种停止原因。
+#[test]
+fn incomplete_reason_usage_and_terminal_snapshot_cross_both_directions() {
+    let corpus: Value = serde_json::from_str(include_str!("fixtures/protocols.json")).unwrap();
+    for (reason, chat, messages) in [
+        ("content_filter", "content_filter", "refusal"),
+        ("max_output_tokens", "length", "max_tokens"),
+    ] {
+        let mut snapshot = corpus["openai_responses"]["response"].clone();
+        snapshot["status"] = "incomplete".into();
+        snapshot["incomplete_details"] = json!({"reason":reason});
+        for (client, stop) in [("openai_chat", chat), ("anthropic_messages", messages)] {
+            let mut w = Worker::new(&["convert", "--from", client, "--to", "openai_responses"]);
+            open_stream(&mut w, "text/event-stream");
+            let out = translated_events(
+                &mut w,
+                &[json!({"type":"response.incomplete","response":snapshot})],
+                false,
+            );
+            assert!(
+                out.iter().any(|c| c["choices"][0]["finish_reason"] == stop
+                    || c["delta"]["stop_reason"] == stop),
+                "{client} {reason}"
+            );
+            assert!(
+                out.iter()
+                    .any(|c| c["usage"]["input_tokens"] == 7 || c["usage"]["prompt_tokens"] == 7)
+            );
+            assert!(
+                out.iter()
+                    .any(|c| c["usage"]["output_tokens"] == 3
+                        || c["usage"]["completion_tokens"] == 3)
+            );
+            assert!(out.iter().any(|c| c["delta"]["text"] == "hello λ"
+                || c["choices"][0]["delta"]["content"] == "hello λ"));
+        }
+        let mut w = Worker::new(&[
+            "convert",
+            "--from",
+            "openai_responses",
+            "--to",
+            "openai_chat",
+        ]);
+        open_stream(&mut w, "text/event-stream");
+        let out = translated_events(
+            &mut w,
+            &[
+                json!({"choices":[{"index":0,"delta":{"content":"text"},"finish_reason":chat}],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+            ],
+            true,
+        );
+        let end = out.last().unwrap();
+        assert_eq!(end["type"], "response.incomplete");
+        assert_eq!(end["response"]["incomplete_details"]["reason"], reason);
+        assert_eq!(end["response"]["usage"]["input_tokens"], 7);
+    }
+}

@@ -1847,7 +1847,7 @@ impl Recorder {
                             .take(256)
                             .collect()
                     } else {
-                        secrets.replace(s)
+                        secrets.replace(s).chars().take(256).collect()
                     };
                 }
             }

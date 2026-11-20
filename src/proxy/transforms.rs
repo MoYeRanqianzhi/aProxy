@@ -47,6 +47,8 @@ struct Prefix {
     headers: HeaderMap,
     /// 前缀改写体；缺省时仍是客户端原体。
     body: Option<Arc<RequestBody>>,
+    /// 回到这个前缀时，正文和编码是否仍是客户端原样。
+    prepare_original: bool,
     /// 对应的请求历史版本。
     version: u64,
 }
@@ -69,7 +71,7 @@ pub(super) struct RequestChain {
     /// 保活触发条件只用客户端原样的 Accept 和请求体，不受上游改写影响。
     accept: bool,
     body_stream: Option<bool>,
-    /// 只让实际取得首次 worker 的消息准备原体，重试不再解码补丁指定的编码。
+    /// 原体直到遇到需要 full 的层才准备，之后不解码程序指定的表示。
     prepare_original: bool,
     /// 尚未成功的程序在配置里的位置。
     cursor: usize,
@@ -129,26 +131,37 @@ impl RequestChain {
         &mut self,
         state: &AppState,
         body: &mut RequestBody,
+        current: &wire::HelloReply,
     ) -> Result<(), ChainError> {
-        if std::mem::take(&mut self.prepare_original)
+        if self.prepare_original
             && let Some(encoding) = request_encoding(&self.headers, true).map(|v| v.into_owned())
             && state.formats.iter().enumerate().any(|(i, pool)| {
-                if i != self.cursor && !pool.available_for_message() {
-                    return false;
+                let needs_full = |hello: &wire::HelloReply| {
+                    [Stage::Request, Stage::Retry].into_iter().any(|stage| {
+                        pool.entry.has_stage(stage)
+                            && matches!(
+                                hello.request_body.get(stage.as_str()),
+                                None | Some(wire::BodyNeed::Full)
+                            )
+                    })
+                };
+                if i == self.cursor {
+                    needs_full(current)
+                } else {
+                    pool.available_for_message()
+                        && pool
+                            .negotiated
+                            .lock()
+                            .unwrap()
+                            .as_deref()
+                            .is_some_and(needs_full)
                 }
-                let hello = pool.negotiated.lock().unwrap();
-                [Stage::Request, Stage::Retry].into_iter().any(|stage| {
-                    pool.entry.has_stage(stage)
-                        && hello.is_some()
-                        && matches!(
-                            hello
-                                .as_ref()
-                                .and_then(|h| h.request_body.get(stage.as_str())),
-                            None | Some(wire::BodyNeed::Full)
-                        )
-                })
             })
         {
+            self.prepare_original = false;
+            if let Some(prefix) = &mut self.prefix {
+                prefix.prepare_original = false;
+            }
             let limit = state.config.body_limit_bytes() as u64;
             let dir = state.spool_dir.clone();
             let original = std::mem::replace(body, RequestBody::Memory(Bytes::new()));
@@ -199,6 +212,7 @@ impl RequestChain {
             self.headers = p.headers.clone();
             self.body_version = p.version;
             self.body = p.body.clone();
+            self.prepare_original = p.prepare_original;
             self.stage = Stage::Retry;
         }
         while self.cursor < state.formats.len() {
@@ -211,6 +225,7 @@ impl RequestChain {
                     headers: self.headers.clone(),
                     body: self.body.clone(),
                     version: self.body_version,
+                    prepare_original: self.prepare_original,
                 });
             }
             if pool.entry.has_stage(self.stage) {
@@ -223,7 +238,8 @@ impl RequestChain {
                         Ok(turn) => turn,
                         Err(f) => return Ok(Err(f)),
                     };
-                    self.prepare_body(state, &mut req.body).await?;
+                    self.prepare_body(state, &mut req.body, turn.hello())
+                        .await?;
                     let mut input = self.input.clone();
                     // 前缀留程序给的原值；保活可被后续覆盖开关，每次派发再叠加当时的代理头。
                     if identity {
@@ -333,10 +349,14 @@ impl RequestChain {
                                 req.method = method;
                             }
                             if let Some(h) = &mut patch.headers {
-                                self.headers = headers.expect("validated request headers");
+                                let next = headers.expect("validated request headers");
+                                self.prepare_original &= request_encoding(&self.headers, true)
+                                    == request_encoding(&next, true);
+                                self.headers = next;
                                 *h = transform::headers_to_btreemap(&self.headers);
                             }
                             if let Some(bytes) = std::mem::take(&mut patch.body).as_bytes() {
+                                self.prepare_original = false;
                                 self.body = Some(Arc::new(
                                     responder
                                         .wait(

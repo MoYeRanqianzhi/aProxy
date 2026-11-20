@@ -298,7 +298,7 @@ struct Worker {
     hello: Option<Arc<HelloReply>>,
     /// 握手用 0，其余消息沿用这个进程各自的序列。
     seq: u64,
-    /// 本帧是否已经写出第一字节；等池位或尚未写出的心跳过期不计进程故障。
+    /// 异步 writer 是否已接受本帧的首字节；Windows 无法观察底层写入。等池位不计心跳故障。
     written: bool,
     /// 最后一次归还到池里的时刻。
     idle_since: Instant,
@@ -649,6 +649,8 @@ impl Pool {
         c.last = Some((f, now));
         if self.entry.breaker_failures != 0 {
             self.open(&mut c, now);
+        } else {
+            tracing::warn!(format=%self.secrets.replace(&self.entry.name),kind=c.last.as_ref().expect("startup fault").0.kind(),"optional format unavailable at startup");
         }
     }
     /// 准备请求表示时只查看，不抢独占试探资格。已取到自己进程的一层直接使用实际握手。

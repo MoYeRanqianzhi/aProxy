@@ -587,6 +587,7 @@ async fn reports_land_in_the_request_record() {
     let (up, _) = upstream(&[503, 200]).await;
     let mut actions = vec![serde_json::json!({"type":"other","label":"seen fictional-token"}); 35];
     actions[1]["label"] = format!("{}fictional-token", "界".repeat(249)).into();
+    actions[2]["label"] = format!("{}密匙甲", "x".repeat(252)).into();
     let report = serde_json::json!({"report":{"summary":format!("fictional-token {}","界".repeat(520)),"actions":actions}});
     let cfg = layer(
         &home,
@@ -594,7 +595,7 @@ async fn reports_land_in_the_request_record() {
         "'request','retry','response'",
         &["reply", &report.to_string()],
     )
-    .replace("env={", "env={ TOKEN='fictional-token',");
+    .replace("env={", "env={ KEY='密匙甲', TOKEN='fictional-token',");
     let (client, url) = running(&home, up, &cfg);
     let res = client.post(&url).send().await.unwrap();
     assert_eq!(res.status(), 200);
@@ -624,6 +625,10 @@ async fn reports_land_in_the_request_record() {
         assert_eq!(report["format"], "reporter");
         assert_eq!(report["summary"].as_str().unwrap().chars().count(), 512);
         assert_eq!(report["actions"].as_array().unwrap().len(), 32);
+        assert_eq!(
+            report["actions"][2]["label"],
+            format!("{}<sec", "x".repeat(252))
+        );
         let clipped = report["actions"][1]["label"].as_str().unwrap();
         assert!(!clipped.contains("fiction"));
         assert!(clipped.chars().count() <= 256);
@@ -2569,6 +2574,20 @@ async fn exercise_optional_startup_recovery(enabled: bool) {
         assert_eq!(breaker(&home, &url).await["state"], "open");
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     } else {
+        let ping =
+            aproxy::daemon::ipc_ping_in(&home.path().join("run"), url.rsplit(':').next().unwrap())
+                .await
+                .unwrap();
+        let log = std::fs::read_to_string(ping.instance.log_path.unwrap()).unwrap();
+        assert_eq!(
+            log.lines()
+                .filter(|l| l.contains("optional format unavailable at startup")
+                    && l.contains("optional")
+                    && l.contains("spawn"))
+                .count(),
+            1,
+            "{log}"
+        );
         assert_eq!(breaker(&home, &url).await["state"], "closed");
         assert_eq!(c.get(&url).send().await.unwrap().status(), 200);
         assert_eq!(breaker(&home, &url).await["failures"], 2);
@@ -2732,6 +2751,56 @@ async fn request_layers_see_managed_encoding_as_keepalive_changes() {
         );
     }
 }
+/// 元数据层入场时后续可选程序尚无握手；真正取得恢复进程后仍须按它的 full 约定准备原体。
+#[tokio::test]
+async fn recovered_full_layer_decodes_the_original_after_a_metadata_layer() {
+    use std::io::Write as _;
+    let home = TestHome::new();
+    let up = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, up))
+        .await
+        .unwrap();
+    let app = axum::Router::new().fallback(|h: http::HeaderMap, b: axum::body::Bytes| async move {
+        (h.get("content-encoding")
+            .map_or("identity", |v| v.to_str().unwrap())
+            .to_owned()
+            + ":")
+            .into_bytes()
+            .into_iter()
+            .chain(b)
+            .collect::<Vec<_>>()
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let exe = home
+        .path()
+        .join(format!("later{}", std::env::consts::EXE_SUFFIX));
+    let cfg = layer(&home, "meta", "'request'", &["metadata-only"])
+        + &layer(&home, "full", "'request'", &["inspect"]).replace(
+            &serde_json::to_string(&format_echo_path()).unwrap(),
+            &serde_json::to_string(&exe).unwrap(),
+        )
+        + "required=false\nbreaker_failures=0\n";
+    let (client, url) = running(&home, up, &cfg);
+    std::fs::copy(format_echo_path(), exe).unwrap();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(b"original").unwrap();
+    let reply = client
+        .post(url)
+        .header("content-encoding", "gzip")
+        .body(gz.finish().unwrap())
+        .send()
+        .await
+        .unwrap();
+    let msgs = frames(&home, "full");
+    assert_eq!(msgs[1]["request"]["body"], "original");
+    assert!(
+        msgs[1]["request"]["headers"]
+            .get("content-encoding")
+            .is_none()
+    );
+    assert_eq!(reply.bytes().await.unwrap().as_ref(), b"identity:original");
+}
+
 /// 曾协商到 full、现在正熔断的可选层不能让另一个只要元数据的程序改写原压缩请求。
 #[tokio::test]
 async fn open_optional_full_layer_preserves_the_compressed_request() {

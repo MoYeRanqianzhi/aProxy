@@ -1227,3 +1227,21 @@
     提交之前的失败被升级；只对一个模型生效的尝试上限。
   - **验证**（Codex 在 Windows 上跑的，0f0ab3b）：`cargo fmt --all` 无改动；headless 的工作区 clippy 零输出；轻量 gate
     （这次起含守卫测试）874 通过、0 失败、2 忽略；headless 全量 1056 通过、0 失败、9 忽略；12 组离线 SDK 解析都过。
+- W2c 第四部分（2026-11-20 到 21，Codex 实现；提交「aproxy-format init、check、try」「aproxy-format translate 的说明跟上角色命令」
+  「decide 的 fallback 总是带上现行退避」，以及第六到第八段审查引出的四十来个修复）：工具子命令，t06 到此九段全部做完。
+  - **工具**：`init` 生成四个场景的起步配置（`claude-relay`、`key-rotation`、`openrouter`、`adaptive-relay`），不覆盖已有文件、不写密钥；
+    `check` 用 worker 启动时的同一套类型校验角色配置与整条链，不执行配置里的命令；`try` 拿本地样例干跑（含重试、forward 升级、
+    流的回信与 notify），只打印结构上的变化，默认不启动第三方命令，要启动得显式加旗标并提示样例与环境会交给它。
+  - **流式转换的预算**：`convert.stream_budget_bytes` 默认 64 MiB（先前的 1 MiB 已废）；单次回信以实例在 hello 的 `limits` 里
+    给的行长上限为准，放不下时以客户端协议的错误收尾，已交付的增量保留，不触发熔断。
+  - **协议一侧的两处补充**：hello 带可选的 `limits`（§10.2）；decide 的 `fallback.delay_ms` 总是给出（§10.5）。
+  - **粘性与故障切换**：keys 与 route 各自用带权重的 rendezvous 哈希，去掉或冷却一个成员只挪动原来落在它身上的对话；
+    `[A, B, C]` 选中 B 之后依次是 A、C；`to = "auto"` 不改 route 选定的地址；rewrite 不能设密钥头与 aproxy 自己管的头；
+    改体时保持数字精度与成员顺序。
+  - **Windows 上启动失败的退出**（CI 上出现过一次以 `0xC0000374` 堆损坏退出）：改成先收回运行时再退出进程，
+    去掉了「在运行时线程还活着时结束进程」这个已知的隐患。**原来那次崩溃没有复现，也没能证明就是这个原因**，再出现要接着查。
+  - **测试**：测试自己的监听直接绑定系统分配的端口（先选端口后绑定在 CI 上撞过一次）；守卫测试的 Cargo 例外按整句匹配。
+  - **两条转换限制**不变（见 [format-roles](format-roles.md)）。第四段两项吞吐没过线也仍然留给服务器上的重测。
+  - **验证**（Codex 在 Windows 上跑的，aeb902b）：`cargo fmt --all` 无改动；headless 全量 1094 通过、0 失败、10 忽略；
+    headless、desktop 与 Linux 交叉三种 clippy 零输出；离线 SDK 16 组（12 组解析、4 组中止）都过。
+    合入后 main 的 CI（44751631017）九个门槛任务全绿。

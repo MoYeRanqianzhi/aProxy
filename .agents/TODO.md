@@ -22,6 +22,9 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   [plan/perf-0.2.0.md](plan/perf-0.2.0.md)
 - [ ] **已知缺口**（B9 留下，归 W6）：`start_failed` 的 `details.code` 没填；没有路径产生 `instance_incompatible`；
   `EditError::Io` 没有操作码；桌面界面拉起强制安装时 stdio 为 null（归 W5）
+- [ ] **Windows 上 `aproxy start` 以堆损坏（`0xC0000374`）退出**：CI 上出现过一次（run 44732134169，
+  `second_start_waits_for_failed_hello_and_prepare_swap_changes_nothing`），没有复现。已把启动失败的退出改成先收回运行时，
+  但没能证明这就是原因。再出现时：留下那个进程的 stderr，考虑在 CI 的 Windows 任务上开 page heap 跑这一个测试
 - [ ] **协议转换的两条已知限制**（出在 `switchyard-translation` 里，记在 [format-roles](plan/format-roles.md)）：写进给用户的文档
   （`aproxy-format` 技能与 README），并报给上游。Messages 的 thinking 签名过不了 Chat 这一条，以后可以考虑在 convert 里
   按工具调用 ID 暂存签名、下一轮请求转回 Messages 时补上（跨请求的进程内状态，worker 重启就丢），0.2.0 不做。

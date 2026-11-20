@@ -1479,6 +1479,7 @@ aproxy desktop                  W5
   - aproxy 至少等 10 秒的 hello 回信。
 - **`stages`**：aproxy 发出的是配置声明的阶段，format 回的是它支持的全部阶段。
 - **`limits`**（aproxy 发，可选，2026-11-20 补）：这个实例对回信行长的上限，按 §10.1 的分组给出，单位字节；不限时省略那一项。
+  四个键：`hello`、`request`（request 与 retry 的回信）、`response`（response 与 stream 的回信）、`control`（其余），数值含行尾的换行。
   程序据此知道一行回信最多能带多少：要在一行里交付的内容放不下时（例如流结束时要重复全部输出的协议），
   它应当自己以协议内的错误收尾，而不是发一行会被 aproxy 丢掉、并算作它出错的回信。
 - **`overrides`**：aproxy 接受的按请求覆盖键。format 据此知道哪些覆盖会生效；回信里不在列表中的覆盖，被忽略并告警。

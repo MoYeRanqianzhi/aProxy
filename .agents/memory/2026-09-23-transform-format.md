@@ -54,7 +54,12 @@ stream 订阅对一个普通的 JSON 整体也会提交响应头。缓冲的坏�
 所以头要在 open 时、还不知道转换结果之前就清理好。`request_end` 说的是最终的交付，不是每一次失败的尝试：升级过的请求
 最后可能成功，但那正是「下次同样的请求不该再走 forward」的证据；在请求结束时记一次，不按重试次数记。
 
-**Evidence:** `committed_json_stream_returns_sanitized_client_error`、`repeated_failures_hold_retry_until_a_healthy_window`；
+没有体的响应有两个各自独立的完成点：204 不等 worker 对 close 的回信就交付，但 close 那个任务要握着请求的记账句柄，
+直到 state 与报告更新完；否则响应体一断开，记录就被过早封存、通知过早发出。反过来，不要等 HTTP 的 EOF 才发出一条还活着的
+上游的最后一块解码结果：之后的传输错误与已经拿到的明文是两回事。Responses 的中止收尾若是事先存下的，就不可能知道下一个序号：
+活着的 worker 可以按已交付的事件编号，存下的回退必须与位置无关；光是 SSE 语法合法不够，要拿 SDK 在两个位置上各验一次。
+
+**Evidence:** `aproxy-format/tests/sdk/check_streams.py` 的四组中止用例；`committed_json_stream_returns_sanitized_client_error`、`repeated_failures_hold_retry_until_a_healthy_window`；
 `tests/format_protocol.rs` 的 `official_keys_cool_the_previous_key_on_429`、
 `full_config_roundtrip_routes_mixed_protocols_and_reconverts_on_failover`；`aproxy-format/tests/sdk/check_streams.py`；`tests/format_protocol.rs` 的
 `retry_last_response_carries_each_upstream_head_without_the_body`；`aproxy-format/tests/e2e.rs` 的 `cross_format_response_conversion_end_to_end`；`tests/format_protocol.rs` 的

@@ -29,8 +29,17 @@ pub fn load<T: DeserializeOwned>(path: &str) -> Result<T, &'static str> {
     } else {
         Path::new(path).into()
     };
-    toml::from_str(&std::fs::read_to_string(path).map_err(|_| "无法读取角色配置")?)
-        .map_err(|_| "角色配置无效，请检查字段名称与类型")
+    let text = std::fs::read_to_string(path).map_err(|_| "无法读取角色配置")?;
+    let generic = "角色配置无效，请检查字段名称与类型";
+    let de = toml::de::Deserializer::parse(&text).map_err(|_| generic)?;
+    serde_path_to_error::deserialize(de).map_err(|err| {
+        // 路径中可能有用户自定义的头名、模型名或 JSON 指针。只从公开配置词表选一个诊断，绝不回显原段。
+        macro_rules! known { ($key:expr; $($name:literal),+) => { match $key {$($name=>Some(concat!("角色配置字段无效：",$name)),)+ _=>None} }; }
+        err.path().iter().filter_map(|segment|match segment {
+            serde_path_to_error::Segment::Map{key}=>known!(key.as_str();"aliases","auth_header","body_regex","carry_query","channel","cooldown_secs","cooldown_status","credential_env","decision","delay_ms","env","event","failure","failure_threshold","from","header","hold_secs","id","keys","max_entries","model","models","origin","overrides","path","path_prefix","pool","preserve_path","preset","priority","protocol","recovery_latency_ms","recovery_samples","recovery_success_ratio","regex","remove","remove_headers","reroute","respect_retry_after","response","rule","scheme","set","set_headers","status","sticky","strategy","stream_budget_bytes","to","ttl_secs","upstream","url","weight"),
+            _=>None,
+        }).last().unwrap_or(generic)
+    })
 }
 
 /// 只允许绝对 HTTP(S) 目的地，不把 URL 自带的凭据或片段带到其他渠道。

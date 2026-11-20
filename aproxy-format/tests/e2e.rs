@@ -844,6 +844,46 @@ fn credential_slots_require_history_protected_names() {
     }
 }
 
+/// 诊断指出配置所有者能修正的字段；不能显示错误的原值、原始行或自定义头名。
+#[test]
+fn config_diagnostic_names_the_field_not_the_value() {
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("config.toml");
+    for (role, text, key) in [
+        (
+            "rewrite",
+            "remove_headers=123 # private-fixture",
+            "remove_headers",
+        ),
+        (
+            "route",
+            "[[channel]]\nid='private-fixture'\nurl='https://a.test'\nweight='private-fixture'",
+            "weight",
+        ),
+        (
+            "rewrite",
+            "[set_headers]\nprivate-fixture=123",
+            "set_headers",
+        ),
+    ] {
+        std::fs::write(&f, text).unwrap();
+        let r = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+            .args([role, "--config"])
+            .arg(&f)
+            .output()
+            .unwrap();
+        let err = String::from_utf8(r.stderr).unwrap();
+        assert!(
+            !r.status.success()
+                && r.stdout.is_empty()
+                && err.contains(key)
+                && !err.contains("private-fixture")
+                && !err.contains("123"),
+            "{err}"
+        );
+    }
+}
+
 /// 未编辑的整数与小数不得经 f64 舍入，删除中间成员也不能改变其他成员的顺序。
 #[test]
 fn rewrite_preserves_untouched_numbers_and_member_order() {

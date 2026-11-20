@@ -314,7 +314,7 @@ fn translate_is_a_one_off_request_converter() {
         .stdin
         .take()
         .unwrap()
-        .write_all(br#"{"model":"m","input":"hello"}"#)
+        .write_all("\u{a0}{\"model\":\"m\",\"input\":\"hello\"}\u{2003}".as_bytes())
         .unwrap();
     let out = worker.wait_with_output().unwrap();
     assert!(out.status.success());

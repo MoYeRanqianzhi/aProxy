@@ -287,7 +287,10 @@ fn translate_once(args: &[String]) -> Result<(), &'static str> {
     std::io::stdin()
         .read_to_end(&mut input)
         .map_err(|_| "无法读取标准输入")?;
-    let body = serde_json::from_slice(&input).map_err(|_| "请求体不是 JSON")?;
+    let body = std::str::from_utf8(&input)
+        .ok()
+        .and_then(|s| serde_json::from_str(s.trim()).ok())
+        .ok_or("请求体不是 JSON")?;
     let value = translate::translate_request(from, to, &body).map_err(|_| "请求协议转换失败")?;
     emit(&mut std::io::stdout().lock(), &value)
 }

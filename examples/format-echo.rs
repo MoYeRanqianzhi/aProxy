@@ -307,6 +307,13 @@ fn main() {
                 {
                     wait_gate(std::path::Path::new(arg));
                 }
+                "gate-open" if stage == "stream" && m["event"] == "open" => {
+                    wait_gate(std::path::Path::new(arg))
+                }
+                "gate-data-fail" if stage == "stream" && m["event"] == "data" => {
+                    wait_gate(std::path::Path::new(arg));
+                    r["fail"] = json!({"retry":false,"reason":"refused"});
+                }
                 "gate-decide" if stage == "decide" => wait_gate(std::path::Path::new(arg)),
                 "gate-request" if m["request"]["body"] == "blocked" => {
                     wait_gate(std::path::Path::new(arg))

@@ -306,6 +306,8 @@ struct Worker {
     seq: u64,
     /// 异步 writer 是否已接受本帧的首字节；Windows 无法观察底层写入。等池位不计心跳故障。
     written: bool,
+    /// 仅在 open 首次写入时通知持有该操作的取消守卫，握手写入不算。
+    opening: Option<Arc<std::sync::atomic::AtomicU8>>,
     /// 最后一次归还到池里的时刻。
     idle_since: Instant,
 }
@@ -427,6 +429,9 @@ impl Worker {
                 return Err(Fault::Io);
             }
             self.written = written != 0;
+            if let Some(phase) = self.opening.take() {
+                phase.store(OPEN_WRITTEN, std::sync::atomic::Ordering::Release);
+            }
             stdin
                 .write_all(&line[written..])
                 .await
@@ -866,6 +871,7 @@ impl Pool {
             hello: None,
             seq: 0,
             written: false,
+            opening: None,
             idle_since: Instant::now(),
         };
         self.handshake(&mut w, id, admission).await?;
@@ -1107,6 +1113,31 @@ impl Pool {
         stage: Stage,
         fresh: bool,
     ) -> Result<(StreamWorker, PreparedReply), Fault> {
+        let Stage::Stream(ref message) = stage else {
+            unreachable!("expected stream open")
+        };
+        let id = message.stream_id.clone();
+        let phase = Arc::new(std::sync::atomic::AtomicU8::default());
+        let pool = self.clone();
+        let written = phase.clone();
+        let mut pending = PendingOpen {
+            work: Some(Box::pin(async move {
+                pool.open_inner(stage, fresh, written).await
+            })),
+            id,
+            phase,
+        };
+        let result = pending.work.as_mut().unwrap().await;
+        pending.work.take();
+        result
+    }
+    /// 仅在接纳并取得进程后挂上首字节标记；取消排队或握手不能向未开始的流发送 abort。
+    async fn open_inner(
+        self: &Arc<Self>,
+        stage: Stage,
+        fresh: bool,
+        phase: Arc<std::sync::atomic::AtomicU8>,
+    ) -> OpenResult {
         let waiting = self.waiting_data();
         let ticket = self.admit()?;
         let obtain = async {
@@ -1122,6 +1153,7 @@ impl Pool {
         let result = async {
             let mut w = tokio::select! {biased; f=ticket.revoked()=>return Err(f), r=obtain=>r?};
             drop(waiting);
+            w.opening = Some(phase.clone());
             let reply = self
                 .exchange(&mut w, stage, self.entry.timeout_secs, Some(&ticket))
                 .await?;
@@ -1136,7 +1168,9 @@ impl Pool {
             ))
         }
         .await;
-        if !matches!(result, Err(Fault::Open { .. })) {
+        if phase.load(std::sync::atomic::Ordering::Acquire) != OPEN_ABANDONED
+            && !matches!(result, Err(Fault::Open { .. }))
+        {
             self.complete(&ticket, result.as_ref().err());
         }
         result
@@ -1235,6 +1269,59 @@ impl Pool {
             .transpose()?;
         w.seq += 1;
         Ok((r, headers))
+    }
+}
+
+/// 尚未写入时为零；只有已发给程序的 open 需要按原序号收尾。
+const OPEN_WRITTEN: u8 = 1;
+/// 客户端不再等这个 open，后台收回的结果不计入熔断。
+const OPEN_ABANDONED: u8 = 2;
+/// 成功的 open 把会话连同它在该进程上的第一份回信一并交付。
+type OpenResult = Result<(StreamWorker, PreparedReply), Fault>;
+/// 通常由请求自己轮询；只在写出后被取消时，才把未完成的同一次交换交给限时清理任务。
+struct PendingOpen {
+    /// 不重新发送 open，保留原写入位置、读缓冲和序号。
+    work: Option<futures_util::future::BoxFuture<'static, OpenResult>>,
+    /// abort 与 open 共用流标识。
+    id: String,
+    /// 首字节写入、放弃与熔断结算的边界。
+    phase: Arc<std::sync::atomic::AtomicU8>,
+}
+impl Drop for PendingOpen {
+    fn drop(&mut self) {
+        let Some(work) = self.work.take() else { return };
+        if self
+            .phase
+            .swap(OPEN_ABANDONED, std::sync::atomic::Ordering::AcqRel)
+            != OPEN_WRITTEN
+        {
+            return;
+        }
+        let id = std::mem::take(&mut self.id);
+        let end = Instant::now() + Duration::from_secs(2);
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout_at(end, async move {
+                let Ok((mut lease, (reply, _))) = work.await else {
+                    return;
+                };
+                if reply.fail.is_none() {
+                    let abort = aproxy_envelope::StreamEvent::Abort {
+                        reason: aproxy_envelope::Failure::new("client_gone".into()),
+                    };
+                    let frame = Stage::Stream(aproxy_envelope::StreamMessage::new(id, abort));
+                    if lease
+                        .pool
+                        .exchange(&mut lease.worker, frame, 0, None)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                lease.finish();
+            })
+            .await;
+        });
     }
 }
 
@@ -1363,10 +1450,13 @@ impl Turn<'_> {
         {
             // abort 不会打断另一线程正在执行的 poll；结算和响应就绪必须在同一把闸锁下排序。
             let cancelled = deadline.map(|(_, gate)| gate.lock().unwrap());
-            if !cancelled.as_deref().copied().unwrap_or(false)
-                && !(deadline.is_some()
-                    && !self.worker.written
-                    && matches!(result, Err(Fault::Timeout)))
+            if cancelled.as_deref().copied().unwrap_or(false) {
+                // 响应已经先关闸：即便管道恰好读到完整回信，也丢弃这条会话，不结算、不归池。
+                return result.map(|(reply, _)| reply);
+            }
+            if !(deadline.is_some()
+                && !self.worker.written
+                && matches!(result, Err(Fault::Timeout)))
             {
                 pool.complete(&self.ticket, result.as_ref().err());
             }

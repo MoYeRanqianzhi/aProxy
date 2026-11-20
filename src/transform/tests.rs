@@ -763,14 +763,45 @@ async fn cancelled_written_heartbeat_cannot_charge_a_later_deadline() {
             .insert("ECHO_OBSERVE".into(), obs.display().to_string());
     });
     let turn = p.turn(false).await.unwrap();
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + Duration::from_secs(3600);
     let cancelled = Mutex::new(false);
     let send = turn.send_until(request_frame("held"), 0, Some((deadline, &cancelled)));
     tokio::pin!(send);
     tokio::select! { result = &mut send => panic!("early result: {result:?}"), _ = wait_observed(&obs,"request",1) => {} }
     *cancelled.lock().unwrap() = true;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(3601)).await;
     assert!(matches!(send.await, Err(Fault::Timeout)));
     assert_eq!(p.snapshot().1["breaker"]["failures"], 0);
+}
+
+/// 已经写出的心跳在关闸后收到合法回信：不能让下一阶段借走这条已放弃的会话。
+#[tokio::test]
+async fn response_ready_cancellation_discards_even_a_valid_heartbeat_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let obs = dir.path().join("seen");
+    let gate = dir.path().join("release");
+    let p = pool(Process::Persistent, "gate-request", |e| {
+        e.pool_max = 1;
+        e.args.push(gate.display().to_string());
+        e.env
+            .insert("ECHO_OBSERVE".into(), obs.display().to_string());
+    });
+    let turn = p.turn(false).await.unwrap();
+    let cancelled = Mutex::new(false);
+    let send = turn.send_until(
+        request_frame("blocked"),
+        0,
+        Some((Instant::now() + Duration::from_secs(3600), &cancelled)),
+    );
+    tokio::pin!(send);
+    let sent = tokio::select! {r=&mut send=>panic!("reply before release: {r:?}"),s=wait_observed(&obs,"request",1)=>s};
+    *cancelled.lock().unwrap() = true;
+    std::fs::write(gate, b"ok").unwrap();
+    send.await.unwrap();
+    assert_eq!(p.snapshot().1["breaker"]["failures"], 0);
+    let next = worker(call(&p, "next", false).await.unwrap(), "next");
+    assert_ne!(next.split_once('/').unwrap().1, sent[0]["pid"].to_string());
 }
 
 /// 在首字节之前已经错过截止点：不用这张票，也不处罚这次握手得到的健康会话。
@@ -924,4 +955,56 @@ async fn startup_retirement_returns_with_an_unconfirmed_owner() {
         .await
         .expect("one shared second for exit confirmation")
         .unwrap();
+}
+
+/// 在真进程读到 open 后才取消；暂停代理的时钟，测试驱动的调度延迟不吃掉两秒协议宽限。
+#[tokio::test]
+async fn cancelled_written_open_drains_then_aborts_on_the_same_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let frames = dir.path().join("frames");
+    let gate = dir.path().join("release");
+    let p = pool(Process::Persistent, "gate-open", |e| {
+        e.stages = vec![crate::config::file::Stage::Stream];
+        e.args.push(gate.display().to_string());
+        e.env
+            .insert("ECHO_RECORD".into(), frames.display().to_string());
+    });
+    let open = wire::StreamOpen::new(
+        wire::Context::new("r".into()),
+        wire::RequestMeta::new("GET".into(), "http://localhost/".into()),
+        wire::Response::new(200),
+    );
+    let mut operation = Box::pin(p.open_stream(
+        Stage::Stream(wire::StreamMessage::new(
+            "r/1".into(),
+            wire::StreamEvent::Open(open),
+        )),
+        false,
+    ));
+    tokio::select! {_=&mut operation=>panic!("completed before the fixture released open"),_=wait_observed(&frames,"open",1)=>{}}
+    tokio::time::pause();
+    drop(operation);
+    std::fs::write(gate, b"reply").unwrap();
+    // 外部进程使用真实文件确认；blocking 任务在等待时禁止运行时自动推进虚拟时钟。
+    let abort = tokio::task::spawn_blocking(move || {
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(v) = std::fs::read_to_string(&frames)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .find(|m| m["event"] == "abort")
+            {
+                break v;
+            }
+            assert!(std::time::Instant::now() < end, "no abort after open");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(abort["seq"], 2);
+    assert_eq!(abort["stream_id"], "r/1");
+    assert_eq!(abort["reason"]["code"], "client_gone");
+    assert_eq!(p.snapshot().1["breaker"]["failures"], 0);
 }

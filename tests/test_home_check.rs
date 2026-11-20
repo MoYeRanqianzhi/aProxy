@@ -46,6 +46,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          文件里只有一个测试，值是 TestHome 的路径",
     ),
     (
+        "format_protocol.rs",
+        "let mut build = std::process::Command::new(env!(\"CARGO\"));",
+        "只启动编译测试的 Cargo 离线构建 format-official：定向 --test 不构建 example，不能因同名文件存在就运行旧版本",
+    ),
+    (
         "access_control.rs",
         "Command::new(\"icacls\")",
         "Windows 自带的权限工具，用来把测试的 home 放宽给别的用户，不是 aproxy",

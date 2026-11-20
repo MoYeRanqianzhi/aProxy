@@ -5803,3 +5803,42 @@ async fn adaptive_unavailable_falls_back_to_retry() {
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
 }
+
+/// 链内的一次拒绝已触发 forward 升级；恢复后的请求层不能再次选择 forward 并重复计数。
+#[tokio::test]
+async fn upgrade_locks_delivery_before_resuming_the_failed_request_layer() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[503, 200]).await;
+    let cfg = String::from("delivery='forward'\n")
+        + &layer(&home, "gate", "'request'", &["reject-first-request"])
+        + &layer(
+            &home,
+            "late",
+            "'request'",
+            &["reply", r#"{"delivery":"forward"}"#],
+        )
+        + &layer(
+            &home,
+            "policy",
+            "'decide'",
+            &["reply", r#"{"decision":"retry","delay_ms":0}"#],
+        );
+    let (c, url) = running(&home, up, &cfg);
+    assert_eq!(
+        c.get(&url).send().await.unwrap().text().await.unwrap(),
+        "upstream bytes"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    let votes = frames(&home, "policy");
+    assert_eq!(votes.len(), 3);
+    assert_eq!(votes[1]["failure"]["code"], "format_fail");
+    assert_eq!(votes[2]["delivery"], "retry");
+    let rec = request_detail(&home, &url, votes[1]["request_id"].as_str().unwrap()).await;
+    assert_eq!(rec["record"]["delivery"], "retry");
+    assert_eq!(rec["record"]["upgraded"], true);
+    let ping =
+        aproxy::daemon::ipc_ping_in(&home.path().join("run"), url.rsplit(':').next().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(ping.activity.upgraded_total, 1);
+}

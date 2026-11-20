@@ -85,8 +85,8 @@ pub(super) struct RequestChain {
     started: tokio::time::Instant,
     /// 程序对此请求给出的重试上限，0 是显式无限制。
     pub(super) max_attempts: Option<u32>,
-    /// 第一次有效表态后锁定；从失败层重入时也不能重复选。
-    delivery_chosen: bool,
+    /// 第一次有效表态或 decide 升级后锁定；从失败层重入时也不能重复选。
+    pub(super) delivery_chosen: bool,
 }
 /// 主动结束时交付程序的响应以及通过容量校验的 HTTP 头。
 pub(super) type ProgramResponse = (wire::Response, HeaderMap);

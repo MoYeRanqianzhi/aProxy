@@ -511,6 +511,9 @@ pub(super) async fn run_attempts(
                     .config,
             );
             cfg.forward_only = Some(false);
+            if let Some(chain) = &mut chain {
+                chain.delivery_chosen = true;
+            }
             rec.set_delivery(false, true);
             state
                 .stats

@@ -182,7 +182,7 @@ fn main() {
             if std::env::var_os("ECHO_DECIDE_FULL").is_some() {
                 r["request_body"] = json!({"decide":"full"});
             }
-            if mode == "digest-only" {
+            if matches!(mode, "digest-only" | "digest-forward") {
                 r["request_body"] = json!({"request":"digest","retry":"digest","decide":"digest","notify":"digest"});
             }
             if mode == "notify-digest" {
@@ -315,6 +315,7 @@ fn main() {
                     std::thread::park();
                     break;
                 }
+                "digest-forward" if stage == "request" => r["delivery"] = json!("forward"),
                 "notify-digest" if stage == "request" => r["state"] = json!("observer state"),
                 "invalid-notify" if stage == "notify" => r["seq"] = json!(0),
                 "no-stage-reply" => continue,

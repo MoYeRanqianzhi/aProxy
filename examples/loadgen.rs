@@ -16,6 +16,8 @@ struct Args {
     target: String,
     concurrency: usize,
     requests: usize,
+    /// 指定测量窗口时，各槽到点停止领取下一条，仍完整接收已经发出的请求。
+    duration: Option<Duration>,
     timeout: Duration,
     query: String,
 }
@@ -25,6 +27,7 @@ fn parse_args() -> Args {
         target: "http://127.0.0.1:25990".into(),
         concurrency: 10,
         requests: 10,
+        duration: None,
         timeout: Duration::from_secs(600),
         query: String::new(),
     };
@@ -35,7 +38,14 @@ fn parse_args() -> Args {
             "--target" => a.target = val(),
             "-c" => a.concurrency = val().parse().expect("-c 需数字"),
             "-n" => a.requests = val().parse().expect("-n 需数字"),
-            "--timeout-secs" => a.timeout = Duration::from_secs(val().parse().expect("需数字")),
+            "--duration-secs" => {
+                a.duration = Some(Duration::from_secs(
+                    val().parse().expect("expected integer seconds"),
+                ))
+            }
+            "--timeout-secs" => {
+                a.timeout = Duration::from_secs(val().parse().expect("expected integer seconds"))
+            }
             "--query" => a.query = val(),
             other => panic!("未知参数: {other}"),
         }
@@ -64,10 +74,13 @@ async fn main() {
     let args = Arc::new(parse_args());
     let body = Arc::new(Bytes::from(build_body()));
     eprintln!(
-        "loadgen: target={} c={} n={} body={} KiB query='{}'",
+        "loadgen: target={} c={} {} body={} KiB query='{}'",
         args.target,
         args.concurrency,
-        args.requests,
+        args.duration.map_or_else(
+            || format!("n={}", args.requests),
+            |d| format!("duration={}s", d.as_secs())
+        ),
         body.len() / 1024,
         args.query
     );
@@ -84,6 +97,8 @@ async fn main() {
         args.query
     );
     let mut handles = Vec::with_capacity(args.concurrency);
+    let t_start = Instant::now();
+    let deadline = args.duration.map(|d| t_start + d);
     for slot in 0..args.concurrency {
         let client = client.clone();
         let url = url.clone();
@@ -94,7 +109,7 @@ async fn main() {
             let mut bytes_rx = 0u64;
             let mut errors = Vec::new();
             let mut i = slot;
-            while i < args.requests {
+            while deadline.map_or(i < args.requests, |end| Instant::now() < end) {
                 let t0 = Instant::now();
                 let req = client
                     .post(&url)
@@ -112,10 +127,20 @@ async fn main() {
                         } else {
                             // 流式接收至结束：内存恒定（逐 chunk 丢弃），计入总接收量
                             let mut resp = resp;
-                            while let Ok(Some(chunk)) = resp.chunk().await {
-                                bytes_rx += chunk.len() as u64;
+                            loop {
+                                match resp.chunk().await {
+                                    Ok(Some(chunk)) => bytes_rx += chunk.len() as u64,
+                                    Ok(None) => {
+                                        latencies.push(t0.elapsed());
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        errors
+                                            .push(format!("{} body {e}", t0.elapsed().as_millis()));
+                                        break;
+                                    }
+                                }
                             }
-                            latencies.push(t0.elapsed());
                         }
                     }
                     Err(e) => errors.push(format!("{} net {}", t0.elapsed().as_millis(), e)),
@@ -126,7 +151,6 @@ async fn main() {
         }));
     }
 
-    let t_start = Instant::now();
     let mut all_lat = Vec::new();
     let mut total_rx = 0u64;
     let mut all_err = Vec::new();
@@ -147,7 +171,7 @@ async fn main() {
     };
     let stats = serde_json::json!({
         "concurrency": args.concurrency,
-        "requests": args.requests,
+        "requests": all_lat.len() + all_err.len(),
         "elapsed_s": elapsed.as_secs_f64(),
         "rps": all_lat.len() as f64 / elapsed.as_secs_f64(),
         "ok": all_lat.len(),

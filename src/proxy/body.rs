@@ -360,9 +360,10 @@ impl ClientUpload {
         let history = rec.request_body(request_history_encoding(self.encoding.as_ref(), formatted));
         let limit = state.config.body_limit_bytes();
         let mut digest = (formatted
-            && [Stage::Request, Stage::Retry, Stage::Decide, Stage::Notify]
+            && ([Stage::Request, Stage::Retry, Stage::Decide]
                 .into_iter()
-                .any(|stage| state.has_format(stage)))
+                .any(|stage| state.has_format(stage))
+                || state.formats.iter().any(|p| p.wants_notify_digest())))
         .then(sha2::Sha256::default);
         let (body, model) = read_request_body(self.body, limit, state.spool_dir.as_deref(), history, digest.as_mut()).await.map_err(|e| match e {
             ReadBodyError::TooLarge => body_too_large(limit),

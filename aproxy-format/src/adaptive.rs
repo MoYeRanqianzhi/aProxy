@@ -85,7 +85,7 @@ impl Adaptive {
             || settings.max_entries == 0
             || settings.ttl_secs == 0
             || settings.recovery_samples == 0
-            || !(0.0..=1.0).contains(&settings.recovery_success_ratio)
+            || !(settings.recovery_success_ratio > 0.0 && settings.recovery_success_ratio <= 1.0)
         {
             return Err("自适应阈值、容量、寿命或恢复比例无效");
         }
@@ -205,6 +205,23 @@ mod tests {
             ms,
             if ok { "ok" } else { "upstream_error" }.into(),
         )
+    }
+    /// 恢复必须有实际成功的样本，零比例或非有限值不得在握手时通过。
+    #[test]
+    fn recovery_needs_positive_finite_ratio() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("adaptive.toml");
+        for (ratio, valid) in [
+            ("0.0", false),
+            ("-0.1", false),
+            ("nan", false),
+            ("1.1", false),
+            ("0.01", true),
+            ("1.0", true),
+        ] {
+            std::fs::write(&path, format!("recovery_success_ratio={ratio}")).unwrap();
+            assert_eq!(Adaptive::load(path.to_str()).is_ok(), valid);
+        }
     }
     /// 正常完成清零，升级与流中断各算一次；保留期后要求完整且健康的恢复窗口。
     #[test]

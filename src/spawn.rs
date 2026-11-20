@@ -208,9 +208,11 @@ pub fn publish_startup_failure(
     instance: &daemon::InstanceRecord,
     error: &crate::transform::StartupError,
 ) -> std::io::Result<()> {
+    let mut result = serde_json::to_value(error)?;
+    result["writer_start"] = serde_json::json!(instance.start);
     crate::fsx::write_atomic_private(
         &observed_result(run_dir, instance),
-        &serde_json::to_vec(error)?,
+        &serde_json::to_vec(&result)?,
     )
 }
 
@@ -253,11 +255,16 @@ async fn wait_ready(
         {
             return Ok(live);
         }
-        if crate::process::process_exited(pid) == Some(true) {
-            // 子进程退出后文件不会再变化；无握手诊断时仍报告普通启动失败。
-            let format = std::fs::File::open(result_path)
+        let exited = crate::process::process_exited(pid) == Some(true);
+        // 旁观者只看本次运行原子发布的终态；拉起者的交接文件在退出前还可能含有原始规格。
+        let format = if exited || expected_id.is_some() {
+            std::fs::File::open(result_path)
                 .ok()
-                .and_then(|f| serde_json::from_reader(f).ok());
+                .and_then(|f| serde_json::from_reader(f).ok())
+        } else {
+            None
+        };
+        if exited || format.is_some() {
             return Err(SpawnError::Exited {
                 pid,
                 format,

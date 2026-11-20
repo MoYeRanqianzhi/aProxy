@@ -1960,7 +1960,8 @@ pub fn collect_garbage_in(run_dir: &std::path::Path, logs_dir: &std::path::Path)
             hearts.push((port.to_string(), path));
         } else if let Some(writer) = leftover_writer_pid(&name)
             && older_than(&path, GC_MIN_AGE_SECS)
-            && crate::process::process_exited(writer) != Some(false)
+            && (crate::process::process_exited(writer) != Some(false)
+                || (name.ends_with(".result") && startup_writer_reused(&path, writer)))
             && std::fs::remove_file(&path).is_ok()
         {
             report.removed.push(path);
@@ -2000,6 +2001,25 @@ pub fn collect_garbage_in(run_dir: &std::path::Path, logs_dir: &std::path::Path)
         }
     }
     report
+}
+
+/// 诊断已过保护期但 pid 仍在时，只有可比较的写者标记才证明旧进程已退出。
+fn startup_writer_reused(path: &std::path::Path, pid: u32) -> bool {
+    /// 只取身份字段，诊断结构的扩展不影响清理。
+    #[derive(serde::Deserialize)]
+    struct Writer {
+        /// 与实例登记同源的启动标记；旧结果没有这个字段，保守地等 pid 退出。
+        writer_start: String,
+    }
+    let Some(writer) = std::fs::File::open(path)
+        .ok()
+        .and_then(|f| serde_json::from_reader::<_, Writer>(std::io::Read::take(f, 65536)).ok())
+    else {
+        return false;
+    };
+    !writer.writer_start.is_empty()
+        && aproxy_ipc::ledger::start_marker(pid)
+            .is_some_and(|current| current != writer.writer_start)
 }
 
 /// run 目录里一个文件若是交接文件或原子写的临时文件，返回名字里写者的 pid。
@@ -4810,6 +4830,75 @@ mod tests {
         let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         file.set_modified(std::time::SystemTime::now() - Duration::from_secs(secs))
             .unwrap();
+    }
+
+    /// 错误属于原来的握手；旁观者不必等待复用 pid 的进程退出，也不能回收这个进程。
+    #[tokio::test]
+    async fn observed_startup_failure_survives_a_reused_pid() {
+        let home = tempfile::tempdir().unwrap();
+        let run = home.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        let mut instance = sample_info("0");
+        instance.pid = std::process::id();
+        instance.start = "another-run".into();
+        crate::spawn::publish_startup_failure(
+            &run,
+            &instance,
+            &crate::transform::StartupError {
+                name: "fixture".into(),
+                fault: crate::transform::Fault::Protocol,
+            },
+        )
+        .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::spawn::wait_existing(home.path(), &instance),
+        )
+        .await
+        .expect("ignored published result")
+        .unwrap_err();
+        assert!(
+            matches!(error, crate::spawn::SpawnError::Exited { format: Some(e), .. } if e.exit_code() == 3 && e.name == "fixture")
+        );
+    }
+
+    /// 保护期内谁都能读；超过保护期则按创建标记区分写者与占用同一 pid 的其他进程。
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn expired_startup_result_distinguishes_reused_and_live_writers() {
+        let home = tempfile::tempdir().unwrap();
+        let run = home.path().join("run");
+        let logs = home.path().join("logs");
+        std::fs::create_dir(&run).unwrap();
+        let mut instance = sample_info("0");
+        instance.pid = std::process::id();
+        let file = run.join(format!(
+            "startup-{}-{}.result",
+            instance.started_at, instance.pid
+        ));
+        for (start, keep) in [
+            (
+                aproxy_ipc::ledger::start_marker(instance.pid).unwrap(),
+                true,
+            ),
+            ("another-run".into(), false),
+        ] {
+            instance.start = start;
+            crate::spawn::publish_startup_failure(
+                &run,
+                &instance,
+                &crate::transform::StartupError {
+                    name: "fixture".into(),
+                    fault: crate::transform::Fault::Spawn,
+                },
+            )
+            .unwrap();
+            collect_garbage_in(&run, &logs);
+            assert!(file.exists());
+            age(&file, GC_MIN_AGE_SECS + 60);
+            collect_garbage_in(&run, &logs);
+            assert_eq!(file.exists(), keep);
+        }
     }
 
     #[test]

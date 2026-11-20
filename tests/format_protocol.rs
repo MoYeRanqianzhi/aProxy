@@ -6,6 +6,68 @@ use common::{TestHome, format_echo_path, free_port};
 use manual_clock::Clock;
 use serde_json::Value;
 
+/// 启动器来不及输出 JSON 时，保留销毁临时 home 前的子进程侧证据。只读这次测试的日志和台账，
+/// 不枚举系统进程，不输出配置、环境或请求样例；每份日志只取末尾 4 KiB。
+fn launch_evidence(home: &TestHome, port: u16) -> String {
+    use std::fmt::Write as _;
+    use std::io::{Read, Seek, SeekFrom};
+    let entries = aproxy_ipc::ledger::read_all_in(home.path());
+    let mut text = format!("port={port} ledger_entries={}", entries.len());
+    for found in entries {
+        let e = found.entry;
+        let _ = write!(
+            text,
+            "\nledger: pid={} start={} role={} port={:?}",
+            e.pid, e.start, e.role, e.port
+        );
+    }
+    let logs = std::fs::read_dir(home.path().join("logs"));
+    let mut count = 0;
+    for file in logs.into_iter().flatten().flatten() {
+        if file.path().extension().is_none_or(|ext| ext != "log")
+            || !file.file_type().is_ok_and(|t| t.is_file())
+        {
+            continue;
+        }
+        count += 1;
+        let tail = (|| -> std::io::Result<Vec<u8>> {
+            let mut f = std::fs::File::open(file.path())?;
+            let start = f.metadata()?.len().saturating_sub(4096);
+            f.seek(SeekFrom::Start(start))?;
+            let mut bytes = Vec::new();
+            f.take(4096).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })();
+        let _ = write!(
+            text,
+            "\n{:?}: {}",
+            file.file_name(),
+            tail.as_deref()
+                .map(String::from_utf8_lossy)
+                .unwrap_or("<unreadable>".into())
+        );
+    }
+    let _ = write!(text, "\nlog_files={count}");
+    text
+}
+
+/// 从测试目录捕获启动日志尾部而非整份文件；未注册的子进程也留下明确的空台账计数。
+#[test]
+fn failed_launcher_evidence_preserves_child_log_tail_without_config() {
+    let home = TestHome::new();
+    let logs = home.path().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(
+        logs.join("startup.log"),
+        format!("prefix{}final marker", "x".repeat(5000)),
+    )
+    .unwrap();
+    std::fs::write(home.path().join("chain.toml"), "not for diagnostics").unwrap();
+    let evidence = launch_evidence(&home, 0);
+    assert!(evidence.contains("final marker") && evidence.contains("ledger_entries=0"));
+    assert!(!evidence.contains("prefix") && !evidence.contains("not for diagnostics"));
+}
+
 /// 用裸名从 home/bin 找到本地测试程序。真实命令、注册记录与 IPC 应答共用同一个临时 home。
 fn start(mode: &str, required: bool) -> (TestHome, std::process::Output) {
     let home = TestHome::new();
@@ -26,6 +88,9 @@ fn start(mode: &str, required: bool) -> (TestHome, std::process::Output) {
         .arg(cfg)
         .output()
         .unwrap();
+    if !out.status.success() {
+        eprintln!("{}", launch_evidence(&home, port));
+    }
     (home, out)
 }
 /// 绑定成功不能代表已就绪；透过启动命令验证子进程的错误不被折叠成 start_failed。
@@ -246,6 +311,9 @@ fn launch_with_backoff(
         .arg(cfg)
         .output()
         .unwrap();
+    if !out.status.success() {
+        eprintln!("{}", launch_evidence(home, port));
+    }
     (port, out)
 }
 

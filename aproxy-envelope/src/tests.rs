@@ -534,3 +534,18 @@ fn terminal_response_accepts_null_headers() {
     let reply: Reply = serde_json::from_value(json!({"v":1,"seq":1,"fail":{"retry":false,"reason":"stop","response":{"status":409,"headers":null}}})).unwrap();
     assert!(reply.fail.unwrap().response.unwrap().headers.is_empty());
 }
+
+/// A refused body can already exceed the terminal JSON limit. Moving either spelling keeps its backing allocation.
+#[test]
+fn owned_response_body_transfers_the_original_allocation() {
+    for body in [
+        Body::Text("q".repeat(1024 * 1024 + 1)),
+        Body::Binary(vec![0xfe; 1024 * 1024 + 1]),
+    ] {
+        let ptr = body.as_bytes().unwrap().as_ptr();
+        let moved = body.into_bytes().unwrap();
+        assert_eq!(ptr, moved.as_ptr());
+    }
+    assert!(Body::Absent.into_bytes().is_none());
+    assert_eq!(Body::Text(String::new()).into_bytes(), Some(Vec::new()));
+}

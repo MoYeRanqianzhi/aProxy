@@ -434,27 +434,16 @@ pub(super) async fn finish_chain_stop(
     rec.try_ended(attempt, 0, Some(t.for_history()));
     if let Some((response, mut headers)) = custom {
         rec.settle(crate::history::Outcome::FormatResponse, Some(t.code()));
-        let bytes = response.body.as_bytes().unwrap_or_default();
+        let bytes = Bytes::from(response.body.into_bytes().unwrap_or_default());
         if r.is_committed() {
-            decide::committed_terminal(
-                state,
-                r,
-                trace,
-                t,
-                &headers,
-                SpooledBody::Memory(Bytes::copy_from_slice(bytes)),
-            )
-            .await;
+            decide::committed_terminal(state, r, trace, t, &headers, SpooledBody::Memory(bytes))
+                .await;
         } else if let Ok(status) = StatusCode::from_u16(response.status) {
             mark_given_up(&mut headers, t.code(), trace);
             if delivers_body(client_head, status) {
                 rec.response_bytes(bytes.len() as u64);
             }
-            r.respond(build_response(
-                status,
-                headers,
-                Bytes::copy_from_slice(bytes),
-            ));
+            r.respond(build_response(status, headers, bytes));
         }
     } else {
         r.finish(t, trace).await;

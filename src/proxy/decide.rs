@@ -387,8 +387,8 @@ pub(super) async fn finish(
         if let Some(status) = patch.status {
             response.status = StatusCode::from_u16(status).expect("validated response status");
         }
-        if let Some(bytes) = patch.body.as_bytes() {
-            response.body = SpooledBody::Memory(Bytes::copy_from_slice(bytes));
+        if let Some(bytes) = patch.body.into_bytes() {
+            response.body = SpooledBody::Memory(bytes.into());
             response.headers.remove(http::header::CONTENT_ENCODING);
             response.headers.remove(http::header::CONTENT_LENGTH);
         }

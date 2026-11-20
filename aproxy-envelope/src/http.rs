@@ -91,6 +91,17 @@ bytes_field!(
     "body_b64",
     "The entity body of an HTTP request, response or patch."
 );
+impl Body {
+    /// Move an owned HTTP payload into its recipient without another full-size allocation.
+    /// Omission and an explicitly empty payload remain distinct.
+    pub fn into_bytes(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Absent => None,
+            Self::Text(s) => Some(s.into_bytes()),
+            Self::Binary(b) => Some(b),
+        }
+    }
+}
 bytes_field!(
     Data,
     "data",

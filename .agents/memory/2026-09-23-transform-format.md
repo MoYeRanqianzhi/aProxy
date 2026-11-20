@@ -50,7 +50,12 @@ Responses 要求先有 `response.created`。SSE 注释、协议原生的 ping �
 route 与 keys 各自用稳定的用户文本前缀，前缀本身不保留。429 记在失败那次尝试的 `state` 里的 origin 与 key 上，
 不是记在已经为下一次尝试选好的去向上。
 
-**Evidence:** `tests/format_protocol.rs` 的 `official_keys_cool_the_previous_key_on_429`、
+stream 订阅对一个普通的 JSON 整体也会提交响应头。缓冲的坏响应可以换成 502，但到流 close 才发现的坏整体只能换体：
+所以头要在 open 时、还不知道转换结果之前就清理好。`request_end` 说的是最终的交付，不是每一次失败的尝试：升级过的请求
+最后可能成功，但那正是「下次同样的请求不该再走 forward」的证据；在请求结束时记一次，不按重试次数记。
+
+**Evidence:** `committed_json_stream_returns_sanitized_client_error`、`repeated_failures_hold_retry_until_a_healthy_window`；
+`tests/format_protocol.rs` 的 `official_keys_cool_the_previous_key_on_429`、
 `full_config_roundtrip_routes_mixed_protocols_and_reconverts_on_failover`；`aproxy-format/tests/sdk/check_streams.py`；`tests/format_protocol.rs` 的
 `retry_last_response_carries_each_upstream_head_without_the_body`；`aproxy-format/tests/e2e.rs` 的 `cross_format_response_conversion_end_to_end`；`tests/format_protocol.rs` 的
 `sample_chain_of_section_7_2_runs_end_to_end`、`retry_last_response_omitted_after_chain_and_connect_failures`；

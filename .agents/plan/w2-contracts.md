@@ -1076,6 +1076,8 @@ command = "aproxy-format"
 args = ["keys", "--config", "keys.toml"]
 process = "persistent"
 stages = ["request", "retry"]
+pool_max = 1                   # key 的冷却记在一个进程里；多个 worker 会各选各的，把刚冷却的 key 又发出去
+worker_idle_secs = 0           # 不因闲置回收，冷却记录不会白白丢掉
 ```
 
 ### 7.3 重试（D-1、D-15）

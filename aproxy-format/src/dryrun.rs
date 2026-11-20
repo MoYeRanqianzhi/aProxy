@@ -737,17 +737,32 @@ fn rehearse(
     let stream_body = serde_json::from_slice::<Value>(&raw).is_ok_and(|v| v["stream"] == true);
     let mut req = w::Request::new(sample.method.unwrap_or_else(|| "POST".into()), url.into());
     http::Method::from_bytes(req.method.as_bytes()).map_err(|_| "样例的 HTTP 方法无效")?;
+    // 按真实出站优先级叠放：缺省补充、客户端、api_key 快捷设置、显式覆盖。代理管理头不进角色输入。
+    let mut credentials = w::Headers::new();
+    if let Some(key) = &chain.config.api_key {
+        for (name, value) in [
+            ("authorization", format!("Bearer {key}")),
+            ("x-api-key", key.clone()),
+        ] {
+            if http::HeaderValue::from_str(&value).is_ok() {
+                credentials.insert(name.into(), value);
+            }
+        }
+    }
     for (k, v) in chain
         .config
         .extra_headers
         .iter()
         .flatten()
         .chain(&sample.headers)
+        .chain(&credentials)
         .chain(chain.config.override_headers.iter().flatten())
     {
         let key = http::HeaderName::from_bytes(k.as_bytes()).map_err(|_| "样例头名称无效")?;
         http::HeaderValue::from_str(v).map_err(|_| "样例头值无效")?;
-        req.headers.insert(key.as_str().into(), v.clone());
+        if !aproxy_ipc::redact::is_managed_request_header(key.as_str()) {
+            req.headers.insert(key.as_str().into(), v.clone());
+        }
     }
     let accept = req.headers.get("accept").is_some_and(|v| {
         v.split(',').any(|s| {
@@ -965,6 +980,49 @@ fn rehearse(
 /// 决策的静态兜底与生产配置共用退避计算；即使 stop 也为可能覆盖它的票提供原等待值。
 mod tests {
     use super::*;
+    /// 在独立目录重放样例，检查的就是面向操作者的逐行投影，不需要真的访问上游。
+    fn trace_sample(
+        proxy: &str,
+        sample: Value,
+        files: &[(&str, &str)],
+    ) -> (Result<(), String>, Vec<Value>) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("proxy.toml");
+        std::fs::write(&p, format!("base_url='https://relay.test'\n{proxy}")).unwrap();
+        for (name, text) in files {
+            std::fs::write(dir.path().join(name), text).unwrap();
+        }
+        let mut out = Vec::new();
+        let result = rehearse(
+            &p,
+            serde_json::from_value(sample).unwrap(),
+            Some(dir.path()),
+            false,
+            &mut out,
+        );
+        let rows = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        (result, rows)
+    }
+    /// 第一层只能看到真正发往上游的头，鉴权快捷配置注入两种鉴权头，但投影不包含值。
+    #[test]
+    fn first_layer_observes_outbound_header_names_not_values() {
+        let (result, rows) = trace_sample(
+            "api_key='secret-fixture'\n[[format]]\ncommand='aproxy-format'\nargs=['rewrite']\nstages=['request']",
+            json!({"path":"/","body":{},"headers":{"Content-Length":"2","Host":"private-host"}}),
+            &[],
+        );
+        result.unwrap();
+        let request = rows.iter().find(|r| r["stage"] == "request").unwrap();
+        assert_eq!(
+            request["input"]["headers"],
+            json!(["authorization", "x-api-key"])
+        );
+        assert!(!json!(rows).to_string().contains("secret-fixture"));
+    }
     /// 规则按声明先后生效，不对没有上游头的故障套状态规则；覆盖、直通与成功分别说明来源。
     #[test]
     fn dry_fallback_preserves_sources_and_backoff() {

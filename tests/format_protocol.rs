@@ -1500,9 +1500,24 @@ async fn startup_probes_run_in_parallel_and_respect_worker_lifetimes() {
     let gate = home.path().join("release");
     let args = ["gate-hello", gate.to_str().unwrap()];
     // 同一 home 中已就绪的实例应照常重启，不能被卡在握手的邻居拖住。
-    let (sibling, started) = launch(&home, up, "");
+    // 两代服务分别让内核选择监听端口。重启会先关闭旧套接字，不能假设旧端口仍无人使用。
+    let sibling_cfg = home.path().join("sibling.toml");
+    std::fs::write(
+        &sibling_cfg,
+        format!("base_url='http://127.0.0.1:{up}'\nlisten_addr='127.0.0.1:0'"),
+    )
+    .unwrap();
+    let started = home
+        .cmd()
+        .args(["start", "--json", "--config"])
+        .arg(sibling_cfg)
+        .output()
+        .unwrap();
     assert!(started.status.success(), "{started:?}");
-    let sibling = sibling.to_string();
+    let port_from = |value: &Value| u16::try_from(value.as_u64().unwrap()).unwrap();
+    let old = port_from(&serde_json::from_slice::<Value>(&started.stdout).unwrap()["port"]);
+    home.stop_on_drop(old);
+    let sibling = old.to_string();
     let mut cfg = String::new();
     for (name, process) in [("persist", "persistent"), ("once", "spawn")] {
         let obs = serde_json::to_string(&home.path().join(format!("{name}-obs"))).unwrap();
@@ -1552,6 +1567,7 @@ async fn startup_probes_run_in_parallel_and_respect_worker_lifetimes() {
         .unwrap()
         .instance
         .pid;
+    let mut restarted = None;
     for (target, code) in [(key.as_str(), 1), ("all", 5)] {
         let out = home
             .cmd()
@@ -1563,12 +1579,24 @@ async fn startup_probes_run_in_parallel_and_respect_worker_lifetimes() {
             String::from_utf8_lossy(&out.stderr).contains("is still starting"),
             "{out:?}"
         );
+        if target == "all" {
+            let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+            let serving = result["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["outcome"] == "restarted")
+                .unwrap();
+            let port = port_from(&serving["port"]);
+            home.stop_on_drop(port);
+            restarted = Some(port.to_string());
+        }
         let live = aproxy::daemon::ipc_ping_in(&run, &key).await.unwrap();
         assert_eq!(live.instance.pid, starting_pid);
         assert_eq!(live.state, aproxy::daemon::InstanceState::Starting);
     }
     assert_ne!(
-        aproxy::daemon::ipc_ping_in(&run, &sibling)
+        aproxy::daemon::ipc_ping_in(&run, &restarted.unwrap())
             .await
             .unwrap()
             .instance

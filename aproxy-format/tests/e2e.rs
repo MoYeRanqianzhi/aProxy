@@ -898,6 +898,13 @@ fn rewrite_preserves_untouched_numbers_and_member_order() {
         w.frame(m)["request"]["body"],
         original.replace("\"drop\":0,", "").replace("old", "new")
     );
+    for value in ["7", "not-a-number"] {
+        let original = r#"{"meta":{"\u0024serde_json::private::Number":"VALUE","$$serde_json::private::Number":0},"dup":1,"dup":2,"escape":"\u03bb","literal":"\"$key\":","edited":"old"}"#.replace("VALUE", value);
+        let expected = r#"{"meta":{"$serde_json::private::Number":"VALUE","$$serde_json::private::Number":0},"dup":2,"escape":"λ","literal":"\"$key\":","edited":"new"}"#.replace("VALUE", value);
+        let mut m = request("https://a.test/", "/", Value::Null);
+        m["request"]["body"] = original.into();
+        assert_eq!(w.frame(m)["request"]["body"], expected);
+    }
 }
 
 /// 即使语法合法，代理不会转交的头也不能作认证或改写的赋值目标。

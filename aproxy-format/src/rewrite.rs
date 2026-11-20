@@ -108,9 +108,8 @@ impl Rewrite {
             }
         }
         if self.needs_body() {
-            let mut body: Value =
-                serde_json::from_slice(m.request.body.as_bytes().unwrap_or_default())
-                    .map_err(|_| Fault::new("请求体不是 JSON", "request body is not valid JSON"))?;
+            let mut body = parse_body(m.request.body.as_bytes().unwrap_or_default())
+                .map_err(|_| Fault::new("请求体不是 JSON", "request body is not valid JSON"))?;
             let before = report.actions.len();
             for (path, value) in self
                 .remove
@@ -153,6 +152,61 @@ impl Rewrite {
             r.request = Some(patch);
         }
         Ok(())
+    }
+}
+/// arbitrary_precision 用特殊对象传递大数，普通 JSON 对象不能被误认成这种内部表示。
+/// 在词法层仅给以美元符号开头的成员名追加一个美元符号（因此没有别名碰撞）；数值仍由原解析器读取。
+fn parse_body(bytes: &[u8]) -> serde_json::Result<Value> {
+    let mut escaped = Vec::new();
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let dollar = bytes[i..].starts_with(b"$") || bytes[i..].starts_with(br"\u0024");
+        while i < bytes.len() && bytes[i] != b'"' {
+            i += if bytes[i] == b'\\' { 2 } else { 1 };
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if dollar && bytes[i + 1..].iter().find(|b| !b.is_ascii_whitespace()) == Some(&b':') {
+            escaped.extend_from_slice(&bytes[copied..i]);
+            escaped.push(b'$');
+            copied = i;
+        }
+        i += 1;
+    }
+    if escaped.is_empty() {
+        return serde_json::from_slice(bytes);
+    }
+    escaped.extend_from_slice(&bytes[copied..]);
+    let mut value = serde_json::from_slice(&escaped)?;
+    restore_keys(&mut value);
+    Ok(value)
+}
+/// 先恢复真实名字再执行 JSON Pointer；只重建改过名字的表，保留所有成员的原次序。
+fn restore_keys(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if map.keys().any(|k| k.starts_with('$')) {
+                *map = std::mem::take(map)
+                    .into_iter()
+                    .map(|(mut key, v)| {
+                        if key.starts_with('$') {
+                            key.pop();
+                        }
+                        (key, v)
+                    })
+                    .collect();
+            }
+            map.values_mut().for_each(restore_keys);
+        }
+        Value::Array(items) => items.iter_mut().for_each(restore_keys),
+        _ => (),
     }
 }
 /// 在已存在的父容器内操作。移除不存在的目标是幂等的；设置不存在的父对象不猜测容器类型。

@@ -5842,3 +5842,40 @@ async fn upgrade_locks_delivery_before_resuming_the_failed_request_layer() {
             .unwrap();
     assert_eq!(ping.activity.upgraded_total, 1);
 }
+
+/// 默认 retry 即使所有请求层只看头，也先读完原体并在等待程序时维持 body_stream 保活。
+#[tokio::test]
+async fn retry_reads_body_and_beats_while_a_metadata_request_worker_is_held() {
+    let home = TestHome::new();
+    let (up, calls) = upstream(&[200]).await;
+    let gate = home.path().join("metadata.release");
+    let cfg = String::from(
+        "[keepalive]\ntrigger='body_stream'\ninterval_secs=1\nheartbeat=\": waiting\\n\\n\"\n",
+    ) + &layer(
+        &home,
+        "held",
+        "'request'",
+        &["gate-metadata", gate.to_str().unwrap()],
+    );
+    let (c, url, mut clock) = Clock::start(&home, up, &cfg);
+    let task = tokio::spawn(c.post(url).body(r#"{"stream":true}"#).send());
+    let input = observed_stage(&home, "held", "request", 1).await;
+    if input[0]["client"]["stream"] != true {
+        std::fs::write(&gate, b"go").unwrap();
+        let _ = task.await.unwrap().unwrap().bytes().await;
+        panic!(
+            "request frame did not identify completed upload: {}",
+            input[0]
+        );
+    }
+    assert!(input[0]["request"].get("body").is_none());
+    clock.advance(1);
+    let mut response = task.await.unwrap().unwrap();
+    let mut first = Vec::new();
+    while !first.ends_with(b": waiting\n\n") {
+        first.extend_from_slice(&response.chunk().await.unwrap().unwrap());
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    std::fs::write(gate, b"go").unwrap();
+    assert_eq!(response.bytes().await.unwrap(), "upstream bytes");
+}

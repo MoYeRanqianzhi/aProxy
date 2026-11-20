@@ -216,7 +216,7 @@ fn main() {
             if mode == "notify-digest" {
                 r["request_body"] = json!({"request":"none","notify":"digest"});
             }
-            if mode == "metadata-only" {
+            if matches!(mode, "metadata-only" | "gate-metadata") {
                 r["request_body"] = json!({"request":"none","retry":"digest"});
             }
             if mode == "missing-seq" {
@@ -343,6 +343,7 @@ fn main() {
                     r["fail"] = json!({"retry":false,"reason":"refused"});
                 }
                 "gate-decide" if stage == "decide" => wait_gate(std::path::Path::new(arg)),
+                "gate-metadata" if stage == "request" => wait_gate(std::path::Path::new(arg)),
                 "gate-request" if m["request"]["body"] == "blocked" => {
                     wait_gate(std::path::Path::new(arg))
                 }

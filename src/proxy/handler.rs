@@ -130,9 +130,9 @@ async fn handle(
             trace.rec.clone(),
         )
     });
-    // request 只看头时先让它改路由，客户端正文还在连接上。decide 可能要求重发，所以即便
-    // 它自己不要正文也必须先留体。若替换进程的 hello 改为要正文，则派发前再读。
-    let live = (forward || state.has_format(Stage::Request))
+    // 只有默认 forward 可以边上传边选路。默认 retry 要在请求层之前知道 body_stream，
+    // 才能在慢程序持有该帧时保活；decide 可能要求重发，即使它不读正文也要先留体。
+    let live = forward
         && !state.has_format(Stage::Decide)
         && !state.formats.iter().any(|p| {
             p.entry.has_stage(Stage::Request)

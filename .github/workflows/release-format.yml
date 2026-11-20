@@ -7,7 +7,7 @@ name: Release Format
 # 产物命名（与 aproxy 主程序同款 11 变体矩阵，互不混合）：
 #   aproxy-format-<target>[-v3][.exe]  + .sha256 → GitHub Release（本 workflow）
 #   npm @meowo/aproxy-format 主包 + 平台子包 → publish-format-npm job
-#   crates.io aproxy-envelope + aproxy-format（envelope 先发——format 依赖它）
+#   crates.io aproxy-envelope + aproxy-ipc + aproxy-format（前两个先发——format 依赖它们）
 #     → publish-format-crates job
 #
 # 下载后建议落 ~/.aproxy/bin/（config.toml 的 command 指向它）。
@@ -335,10 +335,12 @@ jobs:
           EOF
       # 幂等判定与主线共用 .github/scripts/plan-crates.sh（原理见那里的注释）。envelope 版本
       # 独立于 format：format 发新版而 envelope 未变时（常态），envelope 查得 200 被跳过，只发
-      # aproxy-format。
+      # aproxy-format。aproxy-ipc 同理：format 的 check 与 try 用它的配置解析（config-file
+      # 特性），它平时随主线发版，这里查得 200 就跳过；主线还没发过工作区里这个版本时由本线补发，
+      # 否则 format 的包在 registry 上解析不出依赖。
       - name: Plan crates to publish
         id: plan
-        run: bash .github/scripts/plan-crates.sh aproxy-envelope aproxy-format
+        run: bash .github/scripts/plan-crates.sh aproxy-envelope aproxy-ipc aproxy-format
       # 多个 -p 时 cargo（1.90+）按依赖顺序打包，并用本地刚打好的包校验后续包
       - name: Dry run
         if: steps.plan.outputs.args != ''

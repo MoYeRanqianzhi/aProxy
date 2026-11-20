@@ -15,7 +15,7 @@ v…t1 发出去的产物仍自报旧版本，按版本安装的全部渠道自�
 - 根 Cargo.toml 的 [package] version，以及它对 aproxy-desktop、aproxy-envelope、aproxy-ipc 的版本要求
   （`=` 精确钉住）；
 - aproxy-desktop/Cargo.toml、aproxy-envelope/Cargo.toml 与 aproxy-ipc/Cargo.toml 的 version；
-- aproxy-format/Cargo.toml 对 aproxy-envelope 的版本要求（普通的 caret 要求，与 envelope 同号）；
+- aproxy-format/Cargo.toml 对 aproxy-envelope 与 aproxy-ipc 的版本要求（普通的 caret 要求，与它们同号）；
 - Cargo.lock 里 aproxy、aproxy-desktop、aproxy-envelope、aproxy-ipc 四个条目的 version。
 aproxy-format 自己的版本属于它独立的发版线（release-format workflow），不动。
 
@@ -83,15 +83,16 @@ def main():
         text = substitute(read(path), r'^version = "[^"]*"', f'version = "{version}"', f"{path} 的 version", re.M)
         write(path, text)
 
-    # aproxy-format 不钉死：caret 要求与 envelope 同号，工作区解析得了，将来的正式版也满足
+    # aproxy-format 不钉死：caret 要求与 envelope、ipc 同号，工作区解析得了，将来的正式版也满足
     fmt = read("aproxy-format/Cargo.toml")
-    fmt = substitute(
-        fmt,
-        r'^(aproxy-envelope = \{ version = )"[^"]*"',
-        rf'\g<1>"{version}"',
-        "aproxy-format/Cargo.toml 对 aproxy-envelope 的依赖行",
-        re.M,
-    )
+    for dep in ("aproxy-envelope", "aproxy-ipc"):
+        fmt = substitute(
+            fmt,
+            rf'^({dep} = \{{ version = )"[^"]*"',
+            rf'\g<1>"{version}"',
+            f"aproxy-format/Cargo.toml 对 {dep} 的依赖行",
+            re.M,
+        )
     write("aproxy-format/Cargo.toml", fmt)
 
     lock = read("Cargo.lock")

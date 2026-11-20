@@ -125,6 +125,7 @@ impl Events {
         if !event.is_object() {
             return Err(malformed());
         }
+        visible_refusal(self.source, &mut event);
         if self.source == F::OpenAiResponses && event["type"] == "response.incomplete" {
             self.incomplete_reason = Some(match event["response"]["incomplete_details"]["reason"]
                 .as_str()
@@ -271,6 +272,61 @@ impl Events {
                 "event: error\ndata: {\"type\":\"error\",\"code\":\"stream_interrupted\",\"message\":\"stream conversion aborted\",\"param\":null,\"sequence_number\":0}\n\n"
             }
         }
+    }
+}
+/// 把拒绝的可见文字放在编码器认识的文本位置；只改规范列出的字段，不递归修改工具参数。
+fn visible_refusal(source: F, event: &mut Value) {
+    if source == F::OpenAiChat {
+        if let Some(rows) = event.get_mut("choices").and_then(Value::as_array_mut) {
+            for row in rows {
+                if let Some(delta) = row.get_mut("delta").and_then(Value::as_object_mut)
+                    && let Some(Value::String(refusal)) = delta.remove("refusal")
+                {
+                    let mut text = delta
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    text.push_str(&refusal);
+                    delta.insert("content".into(), text.into());
+                }
+            }
+        }
+    } else if source == F::OpenAiResponses {
+        match event["type"].as_str() {
+            Some("response.refusal.delta") => event["type"] = "response.output_text.delta".into(),
+            Some("response.refusal.done") => {
+                event["type"] = "response.output_text.done".into();
+                event["text"] = event["refusal"].take();
+            }
+            _ => (),
+        }
+        if let Some(part) = event.get_mut("part") {
+            visible_part(part);
+        }
+        if let Some(parts) = event
+            .pointer_mut("/item/content")
+            .and_then(Value::as_array_mut)
+        {
+            parts.iter_mut().for_each(visible_part);
+        }
+        if let Some(items) = event
+            .pointer_mut("/response/output")
+            .and_then(Value::as_array_mut)
+        {
+            for item in items {
+                if let Some(parts) = item.get_mut("content").and_then(Value::as_array_mut) {
+                    parts.iter_mut().for_each(visible_part);
+                }
+            }
+        }
+    }
+}
+/// Responses 增量与最终快照使用相同的内容位置，让编解码器按索引去重。
+fn visible_part(part: &mut Value) {
+    if part["type"] == "refusal" && part["refusal"].is_string() {
+        part["text"] = part["refusal"].take();
+        part["type"] = "output_text".into();
     }
 }
 /// 不把可能带敏感字段的上游事件或第三方库诊断复制到协议原因或 stderr。

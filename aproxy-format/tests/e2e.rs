@@ -1375,3 +1375,51 @@ fn incomplete_reason_usage_and_terminal_snapshot_cross_both_directions() {
         assert_eq!(end["response"]["usage"]["input_tokens"], 7);
     }
 }
+
+/// 拒绝文本有时只在终态快照里，有时先逐段发送；目标端都应看到一次完整文本而非空消息或重复。
+#[test]
+fn refusal_text_survives_deltas_and_snapshot_reconciliation() {
+    for deltas in [false, true] {
+        let mut w = Worker::new(&[
+            "convert",
+            "--from",
+            "anthropic_messages",
+            "--to",
+            "openai_responses",
+        ]);
+        open_stream(&mut w, "text/event-stream");
+        let mut events = Vec::new();
+        if deltas {
+            events.push(json!({"type":"response.refusal.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"No thanks"}));
+        }
+        events.push(json!({"type":"response.completed","response":{"id":"r","output":[{"type":"message","id":"m1","role":"assistant","content":[{"type":"refusal","refusal":"No thanks"}]}]}}));
+        let out = translated_events(&mut w, &events, false);
+        let text = out
+            .iter()
+            .filter_map(|e| e["delta"]["text"].as_str())
+            .collect::<String>();
+        assert_eq!(text, "No thanks");
+    }
+    let mut w = Worker::new(&[
+        "convert",
+        "--from",
+        "openai_responses",
+        "--to",
+        "openai_chat",
+    ]);
+    open_stream(&mut w, "text/event-stream");
+    let out = translated_events(
+        &mut w,
+        &[
+            json!({"choices":[{"index":0,"delta":{"refusal":"No thanks"},"finish_reason":"content_filter"}]}),
+        ],
+        true,
+    );
+    assert_eq!(
+        out.iter()
+            .filter(|c| c["type"] == "response.output_text.delta")
+            .filter_map(|c| c["delta"].as_str())
+            .collect::<String>(),
+        "No thanks"
+    );
+}

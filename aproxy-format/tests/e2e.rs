@@ -1130,3 +1130,31 @@ fn chat_finish_waits_for_messages_stop() {
         }
     }
 }
+
+/// 合法的 JSON 文档也可能不是成功的模型回复，不能让宽松的解码器虚构空消息。
+#[test]
+fn valid_json_without_source_response_fields_is_a_clean_502() {
+    for (client, source, bad) in [
+        ("anthropic_messages", "openai_chat", json!({})),
+        (
+            "openai_chat",
+            "anthropic_messages",
+            json!({"role":"assistant"}),
+        ),
+        (
+            "openai_chat",
+            "openai_responses",
+            json!({"output":"not an array"}),
+        ),
+        ("openai_responses", "openai_chat", json!({"choices":[{}]})),
+    ] {
+        let mut w = Worker::new(&["convert", "--from", client, "--to", source]);
+        let r = w.frame(response(&Value::Null, &bad.to_string()));
+        assert_eq!(r["fail"]["response"]["status"], 502);
+        assert!(r["response"].is_null());
+        assert_eq!(
+            r["fail"]["response"]["headers"],
+            json!({"content-type":"application/json"})
+        );
+    }
+}

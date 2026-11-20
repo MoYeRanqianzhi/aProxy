@@ -230,8 +230,22 @@ impl Convert {
                 "cross-protocol SSE requires the stream stage",
             ));
         }
-        let body = serde_json::from_slice(bytes)
+        let body: Value = serde_json::from_slice(bytes)
             .map_err(|_| Fault::new("响应体不是 JSON", "response body is not valid JSON"))?;
+        // 编解码器允许缺字段以兼容不同提供方，但缺少协议的响应容器不能被补成一次成功的空回复。
+        let valid = match upstream {
+            F::OpenAiChat => body["choices"].as_array().is_some_and(|rows| {
+                !rows.is_empty() && rows.iter().all(|choice| choice["message"].is_object())
+            }),
+            F::AnthropicMessages => body["role"] == "assistant" && body["content"].is_array(),
+            F::OpenAiResponses => body["output"].is_array(),
+        };
+        if !valid {
+            return Err(Fault::new(
+                "响应缺少上游协议的必要字段",
+                "response does not match the upstream protocol",
+            ));
+        }
         Ok(translate::translate_response(upstream, client, &body)
             .map_err(|_| Fault::new("响应协议转换失败", "response protocol conversion failed"))?
             .to_string())

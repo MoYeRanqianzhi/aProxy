@@ -180,6 +180,16 @@ fn replace(
             Err(e) => return Err(e),
         }
     }
+    // 清单位置也可能被用户目录占据；这个名字只预留给标记文件，不授权删除目录树。
+    match fs::symlink_metadata(root.join(MARKER)) {
+        Ok(m) if !m.is_file() => {
+            return Err(io::Error::other(
+                "manifest.json 不是普通文件；请移走它后执行 aproxy skill install",
+            ));
+        }
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
     let mut names = incoming.clone();
     if let Some(prev) = previous {
         names.extend(prev.names());

@@ -497,3 +497,21 @@ fn unrelated_workspace_is_not_adopted() {
     assert!(super::private_root(&root, &mut guard).is_err());
     assert!(private.join("spent").is_dir());
 }
+
+/// 清单本身的位置若是用户目录，不能作为损坏的标记文件移走并随备份清理。
+#[test]
+fn directory_at_marker_survives() {
+    let h = tempfile::tempdir().unwrap();
+    let occupied = h.path().join("skills").join(MARKER);
+    fs::create_dir_all(&occupied).unwrap();
+    fs::write(occupied.join("note"), b"keep").unwrap();
+    let f = docs();
+    let z = package(h.path(), Some(&manifest_for(&f)), &f);
+    assert!(
+        archive::install(h.path(), &z, "1.0.0")
+            .unwrap_err()
+            .to_string()
+            .contains(MARKER)
+    );
+    assert_eq!(fs::read(occupied.join("note")).unwrap(), b"keep");
+}

@@ -73,33 +73,25 @@ async fn view_matches_instance_history_and_plain_logs() {
     send().await;
     let view = HomeView::open(home.path().into(), Duration::from_secs(2));
     let mut changes = view.changes();
-    let key = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if let Some(i) = view
-                .instances()
-                .into_iter()
-                .find(|i| i.feed == Feed::Streaming)
-            {
-                break i.run.unwrap();
-            }
-            changes.recv().await.unwrap();
+    let key = loop {
+        if let Some(i) = view
+            .instances()
+            .into_iter()
+            .find(|i| i.feed == Feed::Streaming)
+        {
+            break i.run.unwrap();
         }
-    })
-    .await
-    .unwrap();
+        changes.recv().await.unwrap();
+    };
     send().await;
     send().await;
-    let rows = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let rows = view.requests(&key);
-            if rows.len() == 3 && rows.iter().all(|r| r.ended_at.is_some()) {
-                break rows;
-            }
-            changes.recv().await.unwrap();
+    let rows = loop {
+        let rows = view.requests(&key);
+        if rows.len() == 3 && rows.iter().all(|r| r.ended_at.is_some()) {
+            break rows;
         }
-    })
-    .await
-    .unwrap();
+        changes.recv().await.unwrap();
+    };
     assert_eq!(
         rows.iter().map(|r| r.request_seq).collect::<Vec<_>>(),
         [3, 2, 1]

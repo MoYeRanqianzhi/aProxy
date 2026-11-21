@@ -319,13 +319,15 @@ fn classify(
                 details: serde_json::json!({ "port": port, "reason": format!("ping rejected: {code}") }),
             },
         )),
-        Err(IpcError::Protocol(_) | IpcError::RunChanged) => Some(incompatible(
-            on_disk.instance,
-            Reason {
-                code: CODE_INSTANCE_INCOMPATIBLE.to_string(),
-                details: serde_json::json!({ "port": port, "reason": "the reply could not be trusted" }),
-            },
-        )),
+        Err(IpcError::Protocol(_) | IpcError::RunChanged | IpcError::LineTooLong) => {
+            Some(incompatible(
+                on_disk.instance,
+                Reason {
+                    code: CODE_INSTANCE_INCOMPATIBLE.to_string(),
+                    details: serde_json::json!({ "port": port, "reason": "the reply could not be trusted" }),
+                },
+            ))
+        }
         Err(IpcError::Unreachable(_) | IpcError::Transient(_)) => {
             // 不应答不等于已死：记录里的进程经「pid + 启动标记」核验还在，就是挂死
             if let Some(record) = on_disk.instance.filter(|record| {

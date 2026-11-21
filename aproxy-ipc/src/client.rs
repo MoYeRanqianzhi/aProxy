@@ -15,6 +15,8 @@ pub enum IpcError {
     Protocol(String),
     /// The endpoint now belongs to a different run than the reader selected.
     RunChanged,
+    /// An acknowledgment or event did not fit in its bounded frame.
+    LineTooLong,
     /// 实例明确拒绝了请求。`details` 是这个码带的数据（没有时为 null）
     Remote {
         code: String,
@@ -27,6 +29,7 @@ impl std::fmt::Display for IpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unreachable(e) | Self::Transient(e) | Self::Protocol(e) => f.write_str(e),
+            Self::LineTooLong => f.write_str("应答超过长度上限"),
             Self::RunChanged => f.write_str("instance run changed"),
             Self::Remote { code, message, .. } => {
                 write!(f, "实例拒绝了请求（{code}）：{message}")
@@ -246,10 +249,41 @@ pub async fn read_for_run_in(
     }
 }
 
+/// A request event carries one record (normally at most 64 KiB); a state event
+/// carries a full snapshot, so allow the same 16 MiB envelope as a unary reply.
+const MAX_EVENT_LINE: usize = 16 * 1024 * 1024;
+/// The opening also carries all in-flight summaries. Budget a snapshot plus
+/// 1,000 records at the history's 64 KiB record budget, including separators.
+/// Excess in-flight concurrency is not a license for unbounded allocation.
+const MAX_ACK_LINE: usize = MAX_EVENT_LINE + 1000 * (64 * 1024 + 1);
+
+/// Consume at most `limit` bytes including the newline. `read_until` preserves
+/// partial bytes in `buffer` if the consumer cancels and later resumes `next`.
+async fn subscription_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+    limit: usize,
+) -> Result<bool, IpcError> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    reader
+        .take((limit - buffer.len()) as u64)
+        .read_until(b'\n', buffer)
+        .await
+        .map_err(|error| IpcError::Transient(error.to_string()))?;
+    if buffer.last() == Some(&b'\n') {
+        Ok(true)
+    } else if buffer.len() == limit {
+        Err(IpcError::LineTooLong)
+    } else {
+        Ok(false)
+    }
+}
+
 /// 一条订阅连接：[`ipc_subscribe_in`] 的返回值，之后每调一次 [`EventStream::next`] 读一个
 /// 事件。丢掉它就是退订。
 pub struct EventStream {
     run: RunIdentity,
+    buffer: Vec<u8>,
     lines: Option<tokio::io::BufReader<imp::Stream>>,
 }
 
@@ -264,21 +298,29 @@ impl EventStream {
     ///
     /// 不认识的事件照样返回，由调用方忽略；`lagged` 之后调用方该重取快照与记录。
     pub async fn next(&mut self) -> Result<Option<serde_json::Value>, IpcError> {
-        use tokio::io::AsyncBufReadExt;
         const SILENCE: Duration = Duration::from_secs(45);
-        let mut line = String::new();
         let Some(lines) = &mut self.lines else {
             return Ok(None);
         };
-        let read = tokio::time::timeout(SILENCE, lines.read_line(&mut line))
-            .await
-            .map_err(|_| IpcError::Transient("订阅连接 45 秒没有收到任何事件".to_string()))?
-            .map_err(|e| IpcError::Transient(e.to_string()))?;
-        if read == 0 || !line.ends_with('\n') {
-            return Ok(None);
+        let read = tokio::time::timeout(
+            SILENCE,
+            subscription_line(lines, &mut self.buffer, MAX_EVENT_LINE),
+        )
+        .await
+        .map_err(|_| IpcError::Transient("订阅连接 45 秒没有收到任何事件".to_string()))
+        .and_then(|r| r);
+        match read {
+            Ok(true) => {}
+            end => {
+                self.lines = None;
+                self.buffer = Vec::new();
+                return end.map(|_| None);
+            }
         }
-        let event: serde_json::Value = serde_json::from_str(&line)
-            .map_err(|e| IpcError::Protocol(format!("事件不是 JSON：{e}")))?;
+        let event = serde_json::from_slice::<serde_json::Value>(&self.buffer)
+            .map_err(|e| IpcError::Protocol(format!("事件不是 JSON：{e}")));
+        self.buffer.clear();
+        let event = event?;
         let identity = match event["event"].as_str() {
             Some("state") => snapshot_run(&event["data"], self.run.pid)
                 .and_then(|run| run.check(Some(&self.run))),
@@ -309,7 +351,7 @@ pub async fn subscribe_for_run_in(
     port: &str,
     expected: Option<&RunIdentity>,
 ) -> Result<(serde_json::Value, EventStream), IpcError> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     let endpoint = endpoint_for_in(run_dir, port);
     let open = async {
         let (mut stream, peer) = imp::connect(&endpoint).await?;
@@ -321,12 +363,13 @@ pub async fn subscribe_for_run_in(
         stream.write_all(request.as_bytes()).await.map_err(failed)?;
         stream.write_all(b"\n").await.map_err(failed)?;
         let mut lines = tokio::io::BufReader::new(stream);
-        let mut line = String::new();
-        lines.read_line(&mut line).await.map_err(failed)?;
-        if !line.ends_with('\n') {
+        let mut line = Vec::new();
+        if !subscription_line(&mut lines, &mut line, MAX_ACK_LINE).await? {
             return Err(IpcError::Transient("连接在应答完整之前关闭".to_string()));
         }
-        let ack = parse_result(&line)?;
+        let ack = parse_result(
+            std::str::from_utf8(&line).map_err(|e| IpcError::Protocol(e.to_string()))?,
+        )?;
         let run = snapshot_run(&ack["snapshot"], peer)?;
         run.check(expected)?;
         let records = ack["requests"]
@@ -340,6 +383,7 @@ pub async fn subscribe_for_run_in(
             EventStream {
                 run,
                 lines: Some(lines),
+                buffer: Vec::new(),
             },
         ))
     };
@@ -635,5 +679,25 @@ mod tests {
             first.verify_record(&json!({"request_id":"second-1"})),
             Err(IpcError::RunChanged)
         ));
+    }
+    #[test]
+    fn overlong_subscription_line_stops_at_the_limit() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut input = &b"12345678\nnext\n"[..];
+                let mut buffer = Vec::new();
+                assert!(matches!(
+                    subscription_line(&mut input, &mut buffer, 8).await,
+                    Err(IpcError::LineTooLong)
+                ));
+                assert_eq!(input, b"\nnext\n");
+                buffer.clear();
+                assert!(subscription_line(&mut input, &mut buffer, 1).await.unwrap());
+                buffer.clear();
+                assert!(subscription_line(&mut input, &mut buffer, 5).await.unwrap());
+                assert_eq!(buffer, b"next\n");
+            });
     }
 }

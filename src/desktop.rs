@@ -1,4 +1,5 @@
 //! 绑定单个主目录的桌面业务逻辑。私有文件只在宿主侧打开，界面只见字段投影与不透明令牌。
+mod forms;
 mod instances;
 use crate::{config, settings, spec};
 use aproxy_ipc::{
@@ -15,11 +16,12 @@ use std::{
 };
 
 /// 一个窗口持有一个宿主：所有观察与之后的写入都由同一主目录和同一令牌密钥约束。
+#[derive(Clone)]
 pub struct DesktopHome {
     home: PathBuf,
     key: [u8; 32],
     exe: PathBuf,
-    listing: std::sync::Mutex<Option<[u8; 16]>>,
+    listing: Arc<std::sync::Mutex<Option<[u8; 16]>>>,
 }
 impl DesktopHome {
     /// 启动命令传入已解析的绝对目录；不借助修改全局环境隔离不同窗口。

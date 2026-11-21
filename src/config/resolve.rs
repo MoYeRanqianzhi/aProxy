@@ -147,7 +147,7 @@ pub fn resolve_without_file(overrides: &Overrides, defaults: &Defaults) -> Resol
 }
 
 /// HTTP 客户端在没配置代理时会读的环境变量里，有没有设了值的。
-fn env_proxy_is_set() -> bool {
+pub(crate) fn env_proxy_is_set() -> bool {
     [
         "HTTPS_PROXY",
         "https_proxy",

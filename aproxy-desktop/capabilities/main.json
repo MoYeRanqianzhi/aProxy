@@ -27,6 +27,11 @@
     "allow-restart-instance",
     "allow-force-stop-instance",
     "allow-restore-instance",
-    "allow-forget-restore"
+    "allow-forget-restore",
+    "allow-read-config",
+    "allow-validate-config",
+    "allow-write-config",
+    "allow-read-settings",
+    "allow-set-watchdog"
   ]
 }

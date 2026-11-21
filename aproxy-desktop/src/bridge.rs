@@ -123,6 +123,12 @@ impl Bridge {
         }
         self.view.shutdown().await;
     }
+    fn offer(&self, event: DesktopEvent) {
+        if let Some(a) = self.attached.lock().unwrap().as_mut() {
+            a.frames.offer(event);
+            a.wake.notify_one();
+        }
+    }
     fn change(&self, c: Change) -> Option<DesktopEvent> {
         match c {
             Change::Instance(_) | Change::Home => Some(DesktopEvent::InstancesChanged),
@@ -573,7 +579,7 @@ struct DesireArgs {
 #[tauri::command]
 pub(crate) async fn list_configs(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn InstanceOps>>,
+    ops: State<'_, Arc<dyn ConfigOps>>,
 ) -> R<Vec<Choice>> {
     let _: Empty = args(&request)?;
     ops.list_configs().await
@@ -583,7 +589,7 @@ pub(crate) async fn list_configs(
 #[tauri::command]
 pub(crate) async fn start_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn InstanceOps>>,
+    ops: State<'_, Arc<dyn ConfigOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Run> {
     let a: TargetArgs = args(&request)?;
@@ -596,7 +602,7 @@ pub(crate) async fn start_instance(
 #[tauri::command]
 pub(crate) async fn stop_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn InstanceOps>>,
+    ops: State<'_, Arc<dyn ConfigOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<()> {
     let a: RunArgs = args(&request)?;
@@ -609,7 +615,7 @@ pub(crate) async fn stop_instance(
 #[tauri::command]
 pub(crate) async fn restart_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn InstanceOps>>,
+    ops: State<'_, Arc<dyn ConfigOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Run> {
     let a: RunArgs = args(&request)?;
@@ -622,7 +628,7 @@ pub(crate) async fn restart_instance(
 #[tauri::command]
 pub(crate) async fn force_stop_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn InstanceOps>>,
+    ops: State<'_, Arc<dyn ConfigOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<()> {
     let a: RunArgs = args(&request)?;
@@ -635,7 +641,7 @@ pub(crate) async fn force_stop_instance(
 #[tauri::command]
 pub(crate) async fn restore_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn InstanceOps>>,
+    ops: State<'_, Arc<dyn ConfigOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Run> {
     let a: DesireArgs = args(&request)?;
@@ -648,11 +654,94 @@ pub(crate) async fn restore_instance(
 #[tauri::command]
 pub(crate) async fn forget_restore(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn InstanceOps>>,
+    ops: State<'_, Arc<dyn ConfigOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<()> {
     let a: DesireArgs = args(&request)?;
     let result = ops.forget_restore(a.port, a.expected_restore).await;
     b.view.rescan();
     result
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileArg {
+    target: ConfigTarget,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidateArg {
+    target: ConfigTarget,
+    changes: Vec<Edit>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct WriteArg {
+    target: ConfigTarget,
+    changes: Vec<Edit>,
+    acknowledge_external_acl: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Switch {
+    enabled: bool,
+}
+
+/// 读取经过脱敏的生效文件字段，不向页面公开原文。
+#[tauri::command]
+pub(crate) async fn read_config(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn ConfigOps>>,
+) -> R<ConfigView> {
+    let a: FileArg = args(&request)?;
+    ops.read_config(a.target).await
+}
+
+/// 在内存中验证本次编辑，不落盘。
+#[tauri::command]
+pub(crate) async fn validate_config(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn ConfigOps>>,
+) -> R<Validation> {
+    let a: ValidateArg = args(&request)?;
+    ops.validate_config(a.target, a.changes).await
+}
+
+/// 提交一次持锁写入；只提示应重启的实例，不自动重启。
+#[tauri::command]
+pub(crate) async fn write_config(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn ConfigOps>>,
+    b: State<'_, Arc<Bridge>>,
+) -> R<Saved> {
+    let a: WriteArg = args(&request)?;
+    let result = ops
+        .write_config(a.target, a.changes, a.acknowledge_external_acl)
+        .await?;
+    b.view.rescan();
+    Ok(result)
+}
+
+/// 全局设置的只读行不携带配置凭据。
+#[tauri::command]
+pub(crate) async fn read_settings(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn ConfigOps>>,
+) -> R<SettingsView> {
+    let _: Empty = args(&request)?;
+    ops.read_settings().await
+}
+
+/// 切换本主目录看护开关，当前进程是否在任仍以发现结果为准。
+#[tauri::command]
+pub(crate) async fn set_watchdog(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn ConfigOps>>,
+    b: State<'_, Arc<Bridge>>,
+) -> R<bool> {
+    let a: Switch = args(&request)?;
+    let result = ops.set_watchdog(a.enabled).await?;
+    b.offer(DesktopEvent::SettingsChanged);
+    b.view.rescan();
+    Ok(result)
 }

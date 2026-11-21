@@ -199,10 +199,10 @@ pub enum ScalarKey {
     Trigger(TriggerKey),
 }
 /// Each accepted key determines its value type before entering the operation.
-#[derive(Clone, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum Assignment {
-    /// Full replacement text may contain a secret; intentionally not Debug or Serialize.
+    /// Full replacement text may contain a secret; never included in a result or a diagnostic.
     Text { key: TextKey, value: String },
     /// No implicit string or fractional conversion.
     Seconds { key: SecondsKey, value: SafeUint },
@@ -213,7 +213,7 @@ pub enum Assignment {
     },
 }
 /// Narrow edits; patch contents flow from the window to the backend only.
-#[derive(Clone, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Edit {
     /// Change a single scalar.
@@ -764,7 +764,7 @@ pub trait InstanceOps: Send + Sync + 'static {
 }
 /// Complete window service. Instance operations share the same home and authority
 /// boundary as the configuration, update and registration methods.
-pub trait DesktopOps: InstanceOps {
+pub trait ConfigOps: InstanceOps {
     /// Resolve allowed target afresh; resolve effective file layers exactly as the CLI (not a dump of live process memory).
     fn read_config(&self, target: ConfigTarget) -> Task<'_, ConfigView>;
     /// Validate typed patch against the on-disk target/defaults in memory.
@@ -780,6 +780,9 @@ pub trait DesktopOps: InstanceOps {
     fn read_settings(&self) -> Task<'_, SettingsView>;
     /// Set only `watchdog.enabled` through settings edit; result is stored switch, not a claim a watchdog process is running.
     fn set_watchdog(&self, enabled: bool) -> Task<'_, bool>;
+}
+/// Interface state, installation and login operations of the same injected home.
+pub trait DesktopOps: ConfigOps {
     /// Reload bookmark/preference projection.
     fn read_desktop_state(&self) -> Task<'_, DesktopState>;
     /// Validate supplied preference keys, merge under lock and return effective preferences.

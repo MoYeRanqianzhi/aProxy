@@ -255,3 +255,146 @@ async fn force_targets_only_the_owned_unresponsive_test_process() {
     result.unwrap();
     assert!(aproxy::daemon::read_instance_file_in(&dir, &port.to_string()).is_none());
 }
+
+#[tokio::test]
+async fn file_form_preserves_unedited_text_and_never_echoes_credentials() {
+    use aproxy_ipc::desktop::{ConfigOps, ConfigTarget, Edit, Fault, InstanceOps};
+    let home = TestHome::new();
+    let host = DesktopHome::new(home.path().into(), env!("CARGO_BIN_EXE_aproxy").into()).unwrap();
+    let p = home.path().join("config.toml");
+    let old = r#"# keep this comment
+base_url = 'https://example.invalid/v1?token=private-query'
+api_key = 'private-"\long-key' # private
+proxy = 'http://proxy-user:private-password@localhost:8080'
+[extra_headers]
+'x.team' = 'private-header' # keep header comment
+"#;
+    std::fs::write(&p, old).unwrap();
+    home.settings(r#"{"ui":{"raw":"ui-private-text"},"watchdog":{"enabled":false}}"#);
+    let target = ConfigTarget::Default {
+        id: host.list_configs().await.unwrap()[0].target.id.clone(),
+    };
+    let read = host.read_config(target.clone()).await.unwrap();
+    assert!(!read.external_acl);
+    let assert_safe = |v: serde_json::Value| {
+        let raw = v.to_string();
+        for secret in [
+            r#"private-\"\\long-key"#,
+            "private-query",
+            "proxy-user",
+            "private-password",
+            "private-header",
+            "private-new-header",
+            "ui-private-text",
+        ] {
+            assert!(!raw.contains(secret), "secret escaped projection");
+        }
+    };
+    assert!(read.fields.iter().any(|f| f.key == "api_key"
+        && matches!(f.value, aproxy_ipc::desktop::Cell::Secret { set: true })));
+    assert_safe(json!(read));
+    assert_safe(json!(host.read_settings().await.unwrap()));
+    let patch = || -> Vec<Edit> {
+        serde_json::from_value(json!([{ "op":"set-header","key":"extra_headers","name":"x.team","value":"private-new-header"},{"op":"set","key":"timeouts.connect_secs","value":19}])).unwrap()
+    };
+    let validation = host.validate_config(target.clone(), patch()).await.unwrap();
+    assert!(validation.can_save);
+    assert_safe(json!(validation));
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), old);
+    let saved = host
+        .write_config(target.clone(), patch(), false)
+        .await
+        .unwrap();
+    assert!(saved.changed && saved.instances_to_restart.is_empty());
+    let updated = std::fs::read_to_string(&p).unwrap();
+    assert!(updated.starts_with(old.split("'x.team'").next().unwrap()));
+    assert!(updated.contains("# keep header comment") && updated.contains("private-new-header"));
+    assert!(
+        !host
+            .write_config(target.clone(), patch(), false)
+            .await
+            .unwrap()
+            .changed
+    );
+    let invalid: Vec<Edit> = serde_json::from_value(
+        json!([{"op":"set","key":"listen_addr","value":"private-new-header"}]),
+    )
+    .unwrap();
+    let fault = host.write_config(target, invalid, false).await.unwrap_err();
+    assert!(matches!(fault, Fault::DesktopConfig { .. }));
+    assert_safe(json!(fault));
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), updated);
+    assert!(host.set_watchdog(true).await.unwrap());
+    assert!(host.read_settings().await.unwrap().watchdog_enabled);
+    assert!(
+        std::fs::read_to_string(home.path().join("settings.json"))
+            .unwrap()
+            .contains("ui-private-text")
+    );
+}
+
+#[tokio::test]
+async fn implicit_default_can_be_created_but_external_target_needs_windows_acknowledgement() {
+    use aproxy_ipc::desktop::{ConfigOps, ConfigTarget, Edit, Fault, InstanceOps};
+    let home = TestHome::new();
+    let elsewhere = TestHome::new();
+    let host = DesktopHome::new(home.path().into(), env!("CARGO_BIN_EXE_aproxy").into()).unwrap();
+    let patch = || -> Vec<Edit> {
+        serde_json::from_value(json!([{"op":"set","key":"base_url","value":"http://127.0.0.1:9"}]))
+            .unwrap()
+    };
+    let target = ConfigTarget::Default {
+        id: host.list_configs().await.unwrap()[0].target.id.clone(),
+    };
+    assert!(
+        host.read_config(target.clone())
+            .await
+            .unwrap()
+            .fields
+            .iter()
+            .any(|f| f.key == "base_url" && f.editable)
+    );
+    assert!(
+        host.write_config(target, patch(), false)
+            .await
+            .unwrap()
+            .changed
+    );
+    let external = elsewhere.path().join("outside.toml");
+    std::fs::write(&external, "# external\n").unwrap();
+    home.settings(&json!({"aliases":{"outside":external}}).to_string());
+    let alias = host
+        .list_configs()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|c| c.label == "outside")
+        .unwrap();
+    let t = ConfigTarget::Alias {
+        id: alias.target.id,
+    };
+    let v = host.validate_config(t.clone(), patch()).await.unwrap();
+    assert_eq!(v.external_acl, cfg!(windows));
+    assert_eq!(
+        host.read_config(t.clone()).await.unwrap().external_acl,
+        cfg!(windows)
+    );
+    if cfg!(windows) {
+        assert!(matches!(
+            host.write_config(t.clone(), patch(), false).await,
+            Err(Fault::DesktopExternalAcl {})
+        ));
+        assert_eq!(std::fs::read_to_string(&external).unwrap(), "# external\n");
+    }
+    assert!(
+        host.write_config(t.clone(), patch(), true)
+            .await
+            .unwrap()
+            .changed
+    );
+    home.settings(&json!({"aliases":{"outside":home.path().join("config.toml")}}).to_string());
+    assert!(matches!(
+        host.write_config(t, patch(), true).await,
+        Err(Fault::DesktopChanged {})
+    ));
+}

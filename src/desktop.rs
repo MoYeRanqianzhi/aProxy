@@ -65,17 +65,7 @@ impl DesktopHome {
             Err(_) => return BTreeMap::new(),
         };
         let mut common = Vec::new();
-        collect_config_secrets(&raw["defaults"], &mut common);
-        if let Some(url) = raw["download_proxy"].as_str() {
-            collect_url(url, &mut common);
-        }
-        if let Some(chain) = raw["download_chain"].as_array() {
-            for step in chain {
-                if let Some(url) = step["url"].as_str() {
-                    collect_url(url, &mut common);
-                }
-            }
-        }
+        collect_settings_secrets(&raw, &mut common);
         let aliases = raw["aliases"].as_object();
         let run_dir = self.home.join("run");
         members
@@ -159,6 +149,19 @@ impl DesktopHome {
 }
 
 /// 原始层也要收集：继承被拒或被覆盖的凭据仍可能被复制进另一个普通字段。
+fn collect_settings_secrets(raw: &Value, out: &mut Vec<String>) {
+    collect_config_secrets(&raw["defaults"], out);
+    if let Some(url) = raw["update"]["download_proxy"].as_str() {
+        collect_url(url, out);
+    }
+    if let Some(chain) = raw["update"]["download_chain"].as_array() {
+        for step in chain {
+            if let Some(url) = step["url"].as_str() {
+                collect_url(url, out);
+            }
+        }
+    }
+}
 fn collect_config_secrets(doc: &Value, out: &mut Vec<String>) {
     for key in ["api_key", "proxy_username", "proxy_password"] {
         if let Some(s) = doc[key].as_str() {

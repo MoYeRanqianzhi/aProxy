@@ -14,7 +14,7 @@ fn discovery_secrets_and_desire_tokens_are_bound_to_the_home_and_window() {
     std::fs::write(&file,"base_url='https://api.invalid'\nproxy='http://user:pa%22ssword-long@proxy.invalid/?q=query-credential'\napi_key='file-credential'\n[extra_headers]\nx-safe-name='header-credential'\n").unwrap();
     std::fs::write(
         home.path().join("settings.json"),
-        serde_json::to_vec(&json!({"defaults":{"base_url":"https://other.invalid", "api_key":"withheld-credential"}})).unwrap(),
+        serde_json::to_vec(&json!({"defaults":{"base_url":"https://other.invalid", "api_key":"withheld-credential"},"update":{"download_proxy":"http://user:update-proxy-secret@localhost","download_chain":[{"url":"https://example.invalid/{asset}?key=chain-credential"}]}})).unwrap(),
     )
     .unwrap();
     let mut desired = spec::InstanceSpec {
@@ -45,6 +45,8 @@ fn discovery_secrets_and_desire_tokens_are_bound_to_the_home_and_window() {
         "file-credential",
         "header-credential",
         "withheld-credential",
+        "update-proxy-secret",
+        "chain-credential",
         r#"private-"\credential"#,
     ] {
         assert!(!f.secrets.replace(secret).contains(secret));

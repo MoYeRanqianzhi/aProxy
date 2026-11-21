@@ -53,12 +53,12 @@ struct Fake {
     calls: Tx<Call>,
 }
 impl Source for Fake {
-    fn scan(&self) -> BoxFuture<'_, Option<Vec<InstanceSummary>>> {
+    fn scan(&self) -> BoxFuture<'_, Option<Scan>> {
         future::ready(
             (!self
                 .fail_scan
                 .swap(false, std::sync::atomic::Ordering::SeqCst))
-            .then(|| self.home.lock().unwrap().clone()),
+            .then(|| (self.home.lock().unwrap().clone(), false)),
         )
         .boxed()
     }
@@ -633,5 +633,29 @@ fn explicit_rescan_and_archive_reads_share_the_driver_not_the_cache() {
         .await;
         assert_eq!(result.unwrap_err(), ReadFailure::RunChanged);
         v.shutdown().await;
+    });
+}
+
+#[test]
+fn empty_home_observer_receives_a_discovery_and_no_subscription() {
+    rt(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = Mutex::new(Some(tx));
+        let view = HomeView::open_observed(
+            tmp.path().into(),
+            Duration::from_secs(60),
+            Some(Arc::new(move |members, watchdog| {
+                assert!(members.is_empty() && watchdog.is_none());
+                if let Some(tx) = tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                true
+            })),
+        );
+        let mut changes = view.changes();
+        rx.await.unwrap();
+        assert_eq!(changes.recv().await.unwrap(), Change::Home);
+        view.shutdown().await;
     });
 }

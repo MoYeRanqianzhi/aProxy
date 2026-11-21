@@ -80,6 +80,8 @@ pub enum Feed {
 #[serde(tag = "kind", content = "target", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Change {
+    /// Host-projected discovery data changed independently of a run (e.g. watchdog).
+    Home,
     /// A port appeared, disappeared, changed run or changed state. Reread instances.
     Instance(u16),
     /// The named run's records changed or were evicted. Reread requests.
@@ -121,8 +123,14 @@ type Result<T> = std::result::Result<T, IpcError>;
 type Events = BoxStream<'static, Result<Value>>;
 type Records = BTreeMap<u64, Arc<RequestSummary>>;
 
+/// Trusted host projection evaluated on discovery's blocking worker. Raw membership
+/// and watchdog records stay on the Rust side. Return true to invalidate home cards.
+pub type ScanObserver =
+    Arc<dyn Fn(&[enumerate::Enumerated], Option<enumerate::WatchdogView>) -> bool + Send + Sync>;
+
+type Scan = (Vec<InstanceSummary>, bool);
 trait Source: Send + Sync + 'static {
-    fn scan(&self) -> BoxFuture<'_, Option<Vec<InstanceSummary>>>;
+    fn scan(&self) -> BoxFuture<'_, Option<Scan>>;
     fn subscribe<'a>(
         &'a self,
         port: u16,
@@ -136,6 +144,7 @@ trait Source: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<Value>>;
 }
 struct Local {
+    observer: Option<ScanObserver>,
     dir: PathBuf,
 }
 fn instance_summary(i: enumerate::Enumerated) -> InstanceSummary {
@@ -197,17 +206,27 @@ fn instance_summary(i: enumerate::Enumerated) -> InstanceSummary {
     }
 }
 impl Source for Local {
-    fn scan(&self) -> BoxFuture<'_, Option<Vec<InstanceSummary>>> {
+    fn scan(&self) -> BoxFuture<'_, Option<Scan>> {
         async {
-            Some(
-                enumerate::membership_in(&self.dir)
-                    .await
-                    .ok()?
-                    .0
-                    .into_iter()
-                    .map(instance_summary)
-                    .collect(),
-            )
+            let members = match enumerate::membership_in(&self.dir).await {
+                Ok((members, _)) => members,
+                // A pristine home has no run directory yet, but it still has an empty
+                // membership. Other IO errors are inconclusive, not removals.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(_) => return None,
+            };
+            let (members, changed) = if let Some(observer) = self.observer.clone() {
+                let dir = self.dir.clone();
+                enumerate::discovery_io(move |_| {
+                    let watchdog = enumerate::read_watchdog(&dir, &mut Vec::new());
+                    let changed = observer(&members, watchdog);
+                    (members, changed)
+                })
+                .await
+            } else {
+                (members, false)
+            };
+            Some((members.into_iter().map(instance_summary).collect(), changed))
         }
         .boxed()
     }
@@ -528,9 +547,19 @@ fn discovery_timer(interval: Duration) -> tokio::time::Interval {
 impl HomeView {
     /// Start discovery immediately, then rescan at the requested interval (minimum two seconds).
     pub fn open(home: PathBuf, interval: Duration) -> Self {
+        Self::open_observed(home, interval, None)
+    }
+    /// Open the same single-driver view with an optional host-side projection of the
+    /// discovery sample. The observer never runs on a window callback or holds a cache lock.
+    pub fn open_observed(
+        home: PathBuf,
+        interval: Duration,
+        observer: Option<ScanObserver>,
+    ) -> Self {
         let timer = discovery_timer(interval);
         Self::start(
             Arc::new(Local {
+                observer,
                 dir: home.join("run"),
             }),
             stream::unfold(timer, |mut timer| async move {
@@ -761,7 +790,12 @@ async fn drive(source: Arc<dyn Source>, shared: Arc<Shared>, ticks: BoxStream<'s
             }
         };
         let Some(scan) = scan else { break };
-        let Some(scan) = scan else { continue };
+        let Some((scan, home_changed)) = scan else {
+            continue;
+        };
+        if home_changed {
+            shared.notify(Change::Home);
+        }
         let mut store = shared.data.lock().unwrap();
         let mut previous = std::mem::take(&mut store.ports);
         for mut info in scan {

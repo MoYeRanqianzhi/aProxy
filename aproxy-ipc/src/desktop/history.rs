@@ -56,7 +56,7 @@ pub enum Delivery {
     Unknown,
 }
 impl Delivery {
-    fn classify(s: &str) -> Self {
+    pub(super) fn classify(s: &str) -> Self {
         match s {
             "forward" => Self::Forward,
             "retry" => Self::Retry,
@@ -187,7 +187,7 @@ impl<'a> Projection<'a> {
             names: secrets.for_header_names(),
         }
     }
-    fn text(&self, s: &str) -> String {
+    pub(super) fn text(&self, s: &str) -> String {
         self.secrets.replace(s)
     }
     fn name(&self, s: &str) -> String {

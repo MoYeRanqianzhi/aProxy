@@ -189,7 +189,7 @@ pub async fn enumerate_in(home: &Path) -> Enumeration {
 
 // Blocking jobs own only paths and record data, never a connection or view. A
 // cancelled scan releases its receiver; at most the current file read finishes.
-async fn discovery_io<T: Send + 'static>(
+pub(crate) async fn discovery_io<T: Send + 'static>(
     work: impl FnOnce(&tokio::sync::oneshot::Sender<T>) -> T + Send + 'static,
 ) -> T {
     let (send, recv) = tokio::sync::oneshot::channel();
@@ -392,7 +392,10 @@ fn classify(
 
 /// 读看护者记录。属主进程已经不在的记录是上一个看护者留下的，等同于没有看护者；读不懂的
 /// 记录（损坏，或更新的版本写的）记进 `unreadable`，这里同样给不出看护者是谁。
-fn read_watchdog(run_dir: &Path, unreadable: &mut Vec<UnreadableFile>) -> Option<WatchdogView> {
+pub(crate) fn read_watchdog(
+    run_dir: &Path,
+    unreadable: &mut Vec<UnreadableFile>,
+) -> Option<WatchdogView> {
     let path = registry::record_path_in(run_dir);
     if !path.exists() {
         return None;

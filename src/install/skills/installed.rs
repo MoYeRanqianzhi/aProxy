@@ -1,3 +1,4 @@
+//! 逐级检查路径但不固定祖先目录的句柄：不防有权写入 skills/ 的属主并发替换目录。
 //! 本地清单是读取白名单，不是文件未被改动的证明。输出的必须是刚校验的那块内存。
 use super::manifest::{self, MARKER, MAX_MANIFEST, Manifest};
 use serde::Serialize;
@@ -85,8 +86,17 @@ fn legacy(root: &Path) -> io::Result<bool> {
     }
     for e in fs::read_dir(root)? {
         let e = e?;
-        if !manifest::reserved(&e.file_name().to_string_lossy()) && e.file_type()?.is_dir() {
-            return Ok(true);
+        if manifest::reserved(&e.file_name().to_string_lossy()) {
+            continue;
+        }
+        let meta = fs::symlink_metadata(e.path())?;
+        if !linked(&meta) && meta.is_dir() {
+            match fs::symlink_metadata(e.path().join("SKILL.md")) {
+                Ok(m) if m.is_file() && !linked(&m) => return Ok(true),
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
     }
     Ok(false)

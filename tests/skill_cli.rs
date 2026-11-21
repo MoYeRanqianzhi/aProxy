@@ -144,6 +144,7 @@ async fn missing_legacy_and_version_mismatch() {
     for (code, state) in [(4, "not_installed"), (1, "without_manifest")] {
         if code == 1 {
             fs::create_dir_all(h.path().join("skills/old")).unwrap();
+            fs::write(h.path().join("skills/old/SKILL.md"), b"old").unwrap();
         }
         let doc: Value =
             serde_json::from_slice(&run(&h, &["skill", "list", "--json"], code).stdout).unwrap();

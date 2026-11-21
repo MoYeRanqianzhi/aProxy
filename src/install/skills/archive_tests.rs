@@ -204,6 +204,8 @@ fn reads_only_the_current_verified_utf8_buffer() {
     f.push(("s/nonutf", b"\xff"));
     assert!(matches!(list(home).unwrap(), Listing::Absent));
     fs::create_dir_all(home.join("skills/old")).unwrap();
+    assert!(matches!(list(home).unwrap(), Listing::Absent));
+    fs::write(home.join("skills/old/SKILL.md"), b"old").unwrap();
     assert!(matches!(list(home).unwrap(), Listing::Legacy));
     let zip = package(home, Some(&manifest_for(&f)), &f);
     archive::install(home, &zip, "1.0.0").unwrap();

@@ -87,6 +87,7 @@ serde = { version = "1", features = ["derive"] }
 # preserve_order：settings.json 按键路径打补丁后写回，其余键的顺序要原样保留。
 serde_json = { version = "1", features = ["preserve_order"] }
 url = "2"
+percent-encoding = "2"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -103,6 +104,8 @@ tokio-util = { version = "0.7", features = ["io", "io-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 # install 下载校验：github 渠道 .sha256 强校验 / npm integrity 换算 / --from 完整性记录
 sha2 = "0.11"
+# 桌面窗口的比较令牌以系统随机数为密钥，不把配置散列暴露给页面。
+getrandom = "0.4"
 # skill 解包区在目标卷独占创建，正常退出自动回收。
 tempfile = "3"
 # install 下载链条：npm/cargo 渠道的 tgz/.crate 解包 + 版本比较（降级防呆）
@@ -126,7 +129,7 @@ regex = "1"
 aproxy-envelope = { version = "=0.2.0-alpha.4", path = "aproxy-envelope" }
 # aproxy 与同它打交道的程序共用的契约（home 的解析、进程台账）。version + path 双写、
 # `=` 精确钉住、由 align-version.py 改写，理由都同上。
-aproxy-ipc = { version = "=0.2.0-alpha.4", path = "aproxy-ipc", features = ["config-file", "body-inspection", "client"] }
+aproxy-ipc = { version = "=0.2.0-alpha.4", path = "aproxy-ipc", features = ["config-file", "body-inspection", "desktop"] }
 # 桌面界面（desktop 特性）：Tauri 外壳与嵌入的前端。version + path 双写，理由同上；
 # 版本与本包同步。它不依赖本包（否则成环），需要的东西（home、运行时）由 bin 在启动
 # 界面时传进去。版本要求用 `=` 精确钉住：两者总是同号一起发布，aproxy-desktop 的接口

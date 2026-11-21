@@ -247,7 +247,7 @@ pub fn is_placeholder(value: &Value) -> bool {
 ///
 /// 收什么由调用方决定（`api_key`、代理口令、format 的 `env` 值、鉴权头的值等）；短于
 /// [`MIN_KNOWN_SECRET_LEN`] 字节的不收。第三方程序自己配置里的密钥这里无从知道，替换不到。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Secrets {
     /// 去重后的密钥，按长度从长到短：同一位置既能匹配长的也能匹配短的时，换掉长的那个
     known: Vec<Vec<u8>>,

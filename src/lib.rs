@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod daemon;
 pub use aproxy_ipc::decode;
+pub mod desktop;
 pub mod doctor;
 pub mod find;
 pub mod fsx;

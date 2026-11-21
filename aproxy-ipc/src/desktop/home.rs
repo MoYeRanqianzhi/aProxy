@@ -354,6 +354,94 @@ impl Watchdog {
     }
 }
 
+/// Rust-only facts resolved against the host's explicit home. They can contain clear
+/// secrets for substitution; unlike bridge DTOs, these types never implement Serialize.
+pub struct LocalFacts {
+    /// All source and private override values needed to scrub this port's display.
+    pub secrets: std::sync::Arc<redact::Secrets>,
+    /// Alias names already joined by file identity, not by displayed text.
+    pub aliases: Vec<String>,
+    /// Opaque comparison with this observed desired record, when safe to act on it.
+    pub restore: Option<Token>,
+}
+/// Bulk file observation on discovery's blocking worker. Absence means that a port's
+/// local strings cannot be certified, not permission to send them unsanitized.
+pub type InspectHome =
+    std::sync::Arc<dyn Fn(&[enumerate::Enumerated]) -> BTreeMap<u16, LocalFacts> + Send + Sync>;
+#[derive(PartialEq)]
+struct Sample {
+    run: Option<view::RunKey>,
+    pid: Option<u32>,
+    secrets: std::sync::Arc<redact::Secrets>,
+    meta: Option<RunMeta>,
+    restore: Option<Token>,
+}
+/// One replaceable memory sample for the whole window; never read files on snapshot
+/// or look up old secrets by port after the run has been replaced.
+#[derive(Default, PartialEq)]
+pub struct Survey {
+    ports: BTreeMap<u16, Sample>,
+    watchdog: Option<Watchdog>,
+}
+impl Survey {
+    /// Produce a full replacement; no handles for retired ports grow unbounded.
+    pub fn observe(
+        members: &[enumerate::Enumerated],
+        watchdog: Option<enumerate::WatchdogView>,
+        mut local: BTreeMap<u16, LocalFacts>,
+    ) -> Self {
+        Self {
+            ports: members
+                .iter()
+                .filter_map(|m| {
+                    let f = local.remove(&m.port)?;
+                    let p = Projection::new(&f.secrets);
+                    let meta = p.metadata(m, &f.aliases);
+                    Some((
+                        m.port,
+                        Sample {
+                            run: m.instance.as_ref().map(|r| view::RunKey {
+                                port: m.port,
+                                instance_id: r.instance_id.clone(),
+                            }),
+                            pid: m.instance.as_ref().map(|r| r.pid),
+                            secrets: f.secrets,
+                            meta,
+                            restore: f.restore,
+                        },
+                    ))
+                })
+                .collect(),
+            watchdog: watchdog.and_then(|w| Watchdog::project(w).ok()),
+        }
+    }
+    /// Current credentials for an exact generation, never serialized or returned to JS.
+    pub fn secrets(&self, key: &view::RunKey) -> Option<std::sync::Arc<redact::Secrets>> {
+        self.ports
+            .get(&key.port)
+            .filter(|p| p.run.as_ref() == Some(key))
+            .map(|p| p.secrets.clone())
+    }
+    /// Memory-only card projection. On missing/mismatched local facts suppress all
+    /// local strings and capabilities, but preserve non-sensitive membership and counts.
+    pub fn card(&self, mut item: view::InstanceSummary) -> R<Card> {
+        if let Some(p) = self
+            .ports
+            .get(&item.port)
+            .filter(|p| p.run == item.run && p.pid == item.pid)
+        {
+            return Projection::new(&p.secrets).card(item, p.meta.as_ref(), p.restore.clone());
+        }
+        item.run = None;
+        item.version = None;
+        Projection::new(&redact::Secrets::default()).card(item, None, None)
+    }
+    /// Latest watchdog projection; an absent owner is distinct from a disabled setting.
+    pub fn watchdog(&self) -> Option<Watchdog> {
+        self.watchdog.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

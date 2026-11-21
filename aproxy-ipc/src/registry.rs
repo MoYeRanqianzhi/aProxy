@@ -433,12 +433,45 @@ pub fn parse_record<T: serde::de::DeserializeOwned>(
     serde_json::from_value(value).map_err(|e| Unreadable::Parse(e.to_string()))
 }
 
+// Validate the opened handle, not just the directory entry: a FIFO swapped
+// in between lookup and open must not block the discovery worker either.
+fn record_text(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    if !path.symlink_metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular record file"));
+    }
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular record file"));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+#[cfg(unix)]
+#[test]
+fn non_regular_record_is_an_io_error_not_bad_json() {
+    assert!(matches!(
+        read_record::<InstanceFile>(Path::new("/dev/null"), 1),
+        Err(Unreadable::Io(_))
+    ));
+}
+
 /// 读一条带 `schema` 的记录文件，见 [`parse_record`]。
 pub fn read_record<T: serde::de::DeserializeOwned>(
     path: &Path,
     newest: u32,
 ) -> Result<T, Unreadable> {
-    let text = std::fs::read_to_string(path).map_err(|e| Unreadable::Io(e.to_string()))?;
+    let text = record_text(path).map_err(|e| Unreadable::Io(e.to_string()))?;
     parse_record(&text, newest)
 }
 
@@ -559,7 +592,7 @@ pub fn read_optional_record<T: serde::de::DeserializeOwned>(
     schema: u32,
 ) -> Result<Option<T>, Unreadable> {
     // 只有路径不存在才表示没有恢复义务；权限等错误不能把尚在的记录变成空。
-    let text = match std::fs::read_to_string(path) {
+    let text = match record_text(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(Unreadable::Io(e.to_string())),

@@ -773,7 +773,10 @@ async fn subscribers_see_each_request_start_and_end() {
     cfg.max_retry_backoff_secs = 0;
     let (proxy_url, state) = proxy(cfg).await;
     let mut subscription = state.history.subscribe().expect("第一个订阅者");
-    assert_eq!(subscription.in_flight, "[]");
+    assert_eq!(
+        subscription.opening_requests(1024, 0),
+        (String::new(), false)
+    );
 
     // 一个一直失败、一直重试的请求，跑 2.6 秒后客户端放弃
     let started = std::time::Instant::now();

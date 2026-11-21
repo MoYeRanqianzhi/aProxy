@@ -1234,6 +1234,25 @@ const EVENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 一次写出去的事件攒到这么多字节就不再往里加：一批写不完的留给下一轮
 const EVENT_BATCH_BYTES: usize = 256 * 1024;
 
+/// 信封与换行也占行长预算；只有省略了记录才写标记。
+fn opening_reply(
+    sub: &crate::history::Subscription,
+    snapshot: &str,
+    limit: usize,
+) -> io::Result<String> {
+    const MARK: &str = r#","requests_truncated":true"#;
+    let prefix = format!(r#"{{"snapshot":{snapshot},"requests":["#);
+    let fixed = ok_reply("").len() + prefix.len() + 3; // ]} 与换行
+    let too_long = || io::Error::new(io::ErrorKind::InvalidData, "snapshot exceeds reply limit");
+    let budget = limit.checked_sub(fixed).ok_or_else(too_long)?;
+    let (rows, truncated) = sub.opening_requests(budget, MARK.len());
+    if truncated && budget < MARK.len() {
+        return Err(too_long());
+    }
+    let mark = if truncated { MARK } else { "" };
+    Ok(ok_reply(&format!("{prefix}{rows}]{mark}}}")))
+}
+
 /// `subscribe`：先回一行应答（快照与在途的记录），之后每行一个事件，直到任一方关闭连接、
 /// 写不出去或实例退出。
 ///
@@ -1264,10 +1283,11 @@ where
     let mut view = SubscriberStatus::new(&state);
     // 最近一次发给这个订阅者的快照：之后只在它变了的时候再发
     let mut sent_snapshot = view.json();
-    let first = ok_reply(&format!(
-        r#"{{"snapshot":{sent_snapshot},"requests":{}}}"#,
-        subscription.in_flight
-    ));
+    let first = opening_reply(
+        &subscription,
+        &sent_snapshot,
+        aproxy_ipc::wire::MAX_REPLY_LINE,
+    )?;
     write_line(&mut writer, &first).await?;
 
     let mut seq = 0u64;
@@ -2390,6 +2410,35 @@ mod tests {
 
     /// `subscribe`：先回快照与在途的记录，之后是事件——记录的开始与结束、状态变化、实例
     /// 退出。每条连接上 `seq` 从 1 起递增。
+    #[tokio::test]
+    async fn opening_fits_exact_limit_and_marks_only_an_omitted_suffix() {
+        let (state, _keep) = control(sample_info("0"));
+        let begin = |seq| {
+            state.history.begin(
+                seq,
+                format!("run-{seq}").into(),
+                crate::history::Start {
+                    method: "GET",
+                    path_and_query: "/",
+                    headers: &http::HeaderMap::new(),
+                    delivery: "retry",
+                    phase: crate::history::Phase::ReadingBody,
+                },
+            )
+        };
+        let _first = begin(41);
+        let sub = state.history.subscribe().unwrap();
+        let one = opening_reply(&sub, "{}", usize::MAX).unwrap();
+        assert_eq!(opening_reply(&sub, "{}", one.len() + 1).unwrap(), one);
+        let _second = begin(42);
+        let limit = one.len() + 1 + r#","requests_truncated":true"#.len();
+        let cut = opening_reply(&sub, "{}", limit).unwrap();
+        assert_eq!(cut.len() + 1, limit);
+        let doc: serde_json::Value = serde_json::from_str(&cut).unwrap();
+        assert_eq!(doc["result"]["requests_truncated"], true);
+        assert_eq!(doc["result"]["requests"][0]["request_seq"], 41);
+    }
+
     #[tokio::test]
     async fn subscribe_streams_snapshot_then_events() {
         use tokio::io::AsyncWriteExt;

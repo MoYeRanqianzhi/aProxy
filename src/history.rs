@@ -934,11 +934,37 @@ pub struct Subscription {
     history: Arc<History>,
     /// 事件。跟不上时收到的是「丢了几个」（`RecvError::Lagged`），之后接着收新的
     pub events: tokio::sync::broadcast::Receiver<Event>,
-    /// 订阅那一刻在途的记录：一个 JSON 数组的文本，元素是 RequestRecord
-    pub in_flight: String,
 }
 
 impl Subscription {
+    /// 在接收端登记后取在途列表。给定的预算已扣除信封、快照、方括号和换行；
+    /// 若确有遗漏，退回到最后一个还能放下截断标志的完整记录边界。
+    pub fn opening_requests(&self, budget: usize, marker_bytes: usize) -> (String, bool) {
+        let records: Vec<_> = lock(&self.history.records)
+            .values()
+            .filter(|r| !r.done.load(Ordering::Relaxed))
+            .cloned()
+            .collect();
+        let mut rows = String::new();
+        let mut marked_end = 0;
+        for r in records {
+            let line = record_json(&r, &lock(&r.inner));
+            let len = rows.len() + usize::from(!rows.is_empty()) + line.len();
+            if len > budget {
+                rows.truncate(marked_end);
+                return (rows, true);
+            }
+            if !rows.is_empty() {
+                rows.push(',');
+            }
+            rows.push_str(&line);
+            if len + marker_bytes <= budget {
+                marked_end = len;
+            }
+        }
+        (rows, false)
+    }
+
     /// 一次跳到确定的队尾；即使生产者再次填满广播环，计数也包括已覆盖和仍保留的两部分。
     pub(crate) fn resync(
         &mut self,
@@ -1301,19 +1327,9 @@ impl History {
                 }
             });
         }
-        let records: Vec<Arc<Record>> = lock(&self.records)
-            .values()
-            .filter(|r| !r.done.load(Ordering::Relaxed))
-            .cloned()
-            .collect();
-        let lines: Vec<String> = records
-            .iter()
-            .map(|record| record_json(record, &lock(&record.inner)))
-            .collect();
         Some(Subscription {
             history: self.clone(),
             events,
-            in_flight: format!("[{}]", lines.join(",")),
         })
     }
 
@@ -3336,8 +3352,10 @@ mod tests {
         assert!(lock(&history.dirty).is_empty());
 
         let mut subscription = history.subscribe().unwrap();
+        let (rows, truncated) = subscription.opening_requests(usize::MAX, 0);
+        assert!(!truncated);
+        let in_flight: Value = serde_json::from_str(&format!("[{rows}]")).unwrap();
         let events = &mut subscription.events;
-        let in_flight: Value = serde_json::from_str(&subscription.in_flight).unwrap();
         assert_eq!(in_flight.as_array().unwrap().len(), 1);
         assert_eq!(in_flight[0]["request_seq"], 1);
 

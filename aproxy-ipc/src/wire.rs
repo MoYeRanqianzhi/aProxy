@@ -722,6 +722,9 @@ impl Rejection {
 pub const MAX_BODY_READ: u64 = 1024 * 1024;
 /// 列记录时一次最多多少条
 pub const MAX_LIST: usize = 200;
+/// Maximum size in bytes of any reply or event, including its terminating newline.
+pub const MAX_REPLY_LINE: usize = 16 * 1024 * 1024;
+
 /// 列记录时不给 `limit` 就是多少条
 pub const DEFAULT_LIST: usize = 50;
 

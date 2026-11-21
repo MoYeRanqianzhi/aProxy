@@ -249,14 +249,6 @@ pub async fn read_for_run_in(
     }
 }
 
-/// A request event carries one record (normally at most 64 KiB); a state event
-/// carries a full snapshot, so allow the same 16 MiB envelope as a unary reply.
-const MAX_EVENT_LINE: usize = 16 * 1024 * 1024;
-/// The opening also carries all in-flight summaries. Budget a snapshot plus
-/// 1,000 records at the history's 64 KiB record budget, including separators.
-/// Excess in-flight concurrency is not a license for unbounded allocation.
-const MAX_ACK_LINE: usize = MAX_EVENT_LINE + 1000 * (64 * 1024 + 1);
-
 /// Consume at most `limit` bytes including the newline. `read_until` preserves
 /// partial bytes in `buffer` if the consumer cancels and later resumes `next`.
 async fn subscription_line<R: tokio::io::AsyncBufRead + Unpin>(
@@ -304,7 +296,7 @@ impl EventStream {
         };
         let read = tokio::time::timeout(
             SILENCE,
-            subscription_line(lines, &mut self.buffer, MAX_EVENT_LINE),
+            subscription_line(lines, &mut self.buffer, crate::wire::MAX_REPLY_LINE),
         )
         .await
         .map_err(|_| IpcError::Transient("订阅连接 45 秒没有收到任何事件".to_string()))
@@ -364,7 +356,7 @@ pub async fn subscribe_for_run_in(
         stream.write_all(b"\n").await.map_err(failed)?;
         let mut lines = tokio::io::BufReader::new(stream);
         let mut line = Vec::new();
-        if !subscription_line(&mut lines, &mut line, MAX_ACK_LINE).await? {
+        if !subscription_line(&mut lines, &mut line, crate::wire::MAX_REPLY_LINE).await? {
             return Err(IpcError::Transient("连接在应答完整之前关闭".to_string()));
         }
         let ack = parse_result(
@@ -483,7 +475,6 @@ where
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     // 应答行长度上限：端点名可以预测，应答者未必是 aProxy，不能让它把客户端
     // 内存撑爆。快照只有几百字节到几千字节；上限留给以后一行带一批请求记录的 op
-    const MAX_RESPONSE_LINE: u64 = 16 * 1024 * 1024;
     let failed = |e: io::Error| IpcError::Transient(e.to_string());
     let (reader, mut writer) = tokio::io::split(stream);
     writer
@@ -493,12 +484,12 @@ where
     writer.write_all(b"\n").await.map_err(failed)?;
     let mut line = String::new();
     BufReader::new(reader)
-        .take(MAX_RESPONSE_LINE)
+        .take(crate::wire::MAX_REPLY_LINE as u64)
         .read_line(&mut line)
         .await
         .map_err(failed)?;
     if !line.ends_with('\n') {
-        return Err(if line.len() as u64 >= MAX_RESPONSE_LINE {
+        return Err(if line.len() as u64 >= crate::wire::MAX_REPLY_LINE as u64 {
             IpcError::Protocol("应答超过长度上限".to_string())
         } else {
             IpcError::Transient("连接在应答完整之前关闭".to_string())

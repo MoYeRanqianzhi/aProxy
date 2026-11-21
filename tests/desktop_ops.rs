@@ -612,6 +612,33 @@ async fn update_children_are_home_bound_confirmed_bounded_and_terminal_only_afte
             .unwrap()
             .contains("checkCredential")
     );
+    // Introducing a credential after admission must still protect the terminal version.
+    home.settings("{}");
+    std::fs::write(&mode_file, "private-terminal").unwrap();
+    let token = host
+        .check_update(ChannelChoice::Auto)
+        .await
+        .unwrap()
+        .check
+        .unwrap();
+    let settings = home.path().join("settings.json");
+    let collect = progress.clone();
+    let first = std::sync::atomic::AtomicBool::new(true);
+    let update: aproxy_ipc::desktop::Progress = std::sync::Arc::new(move |job| {
+        if first.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            std::fs::write(
+                &settings,
+                r#"{"defaults":{"base_url":"http://127.0.0.1:9","api_key":"checkCredential"}}"#,
+            )
+            .unwrap();
+        }
+        collect(job);
+    });
+    assert!(matches!(
+        host.install_update(token, update).await,
+        Err(Fault::DesktopInstallProtocol {})
+    ));
+    assert!(jobs.lock().unwrap().last().unwrap().end.is_none());
     std::fs::write(&mode_file, "inherited-writer").unwrap();
     let token = host
         .check_update(ChannelChoice::Auto)

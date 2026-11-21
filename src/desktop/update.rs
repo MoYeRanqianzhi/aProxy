@@ -443,16 +443,22 @@ impl UpdateOps for DesktopHome {
                 Ok(())
             })
             .await;
-            let result = status.and_then(|status| match terminal {
-                Some(Ok(end)) if status.success() => {
-                    if let Some(v) = &end.version {
-                        public_version(&secrets, v)?;
+            // The user can edit settings during a transaction. Check the terminal child's new
+            // version against both observations before it can enter the promise or the last job.
+            let result = async {
+                match (status?, terminal) {
+                    (status, Some(Ok(end))) if status.success() => {
+                        if let Some(v) = &end.version {
+                            public_version(&secrets, v)?;
+                            public_version(&version_privacy(self).await?, v)?;
+                        }
+                        Ok(end)
                     }
-                    Ok(end)
+                    (status, Some(Err(fault))) if !status.success() => Err(fault),
+                    _ => Err(protocol()),
                 }
-                Some(Err(fault)) if !status.success() => Err(fault),
-                _ => Err(protocol()),
-            });
+            }
+            .await;
             match &result {
                 Ok(end) => job.end = Some(end.clone()),
                 Err(f) => job.fault = Some(f.clone()),

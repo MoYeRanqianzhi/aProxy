@@ -13,6 +13,13 @@ fn os(e: io::Error) -> Fault {
         RegistrationReason::SystemUnavailable
     })
 }
+fn binary_available(metadata: io::Result<std::fs::Metadata>) -> R<bool> {
+    match metadata {
+        Ok(m) => Ok(m.is_file()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(os(e)),
+    }
+}
 fn encoded(p: &Path) -> R<&str> {
     p.to_str()
         .filter(|t| !t.chars().any(char::is_control))
@@ -53,7 +60,7 @@ impl DesktopHome {
         Ok(Item {
             label,
             expected,
-            binary: exe.is_file(),
+            binary: binary_available(exe.metadata())?,
         })
     }
     fn registration(&self, change: Option<bool>) -> R<Registration> {
@@ -237,28 +244,7 @@ mod platform {
         Ok(encoded(p)?.to_owned())
     }
     #[cfg(not(target_os = "macos"))]
-    fn desktop_arg(s: &str) -> String {
-        let mut out = String::from("\"");
-        for ch in s.chars() {
-            if matches!(ch, '"' | '$' | '`' | '\\') {
-                out.push('\\')
-            }
-            out.push(ch);
-        }
-        out.push('"');
-        out.replace('\\', "\\\\")
-    }
-    #[cfg(not(target_os = "macos"))]
-    pub(super) fn document(_label: &str, exe: &str, home: &str) -> R<String> {
-        if exe.contains('%') || home.contains('%') {
-            return Err(fault(RegistrationReason::UnsupportedPath));
-        }
-        Ok(format!(
-            "[Desktop Entry]\nType=Application\nName=aProxy\nExec={} restore-at-login --home {}\nTerminal=false\nHidden=false\n",
-            desktop_arg(exe),
-            desktop_arg(home)
-        ))
-    }
+    pub(super) use super::xdg::document;
     #[cfg(target_os = "macos")]
     pub(super) fn document(label: &str, exe: &str, home: &str) -> R<String> {
         let xml = |v: &str| {
@@ -380,5 +366,63 @@ mod platform {
         aproxy_ipc::home::user_dir()
             .map(|p| p.join("Library/LaunchAgents"))
             .ok_or_else(|| fault(RegistrationReason::SystemUnavailable))
+    }
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+mod xdg {
+    use super::*;
+    fn desktop_arg(s: &str) -> String {
+        let mut out = String::from("\"");
+        for ch in s.chars() {
+            if matches!(ch, '"' | '$' | '`' | '\\') {
+                out.push('\\')
+            }
+            out.push(ch);
+        }
+        out.push('"');
+        out.replace('\\', "\\\\")
+    }
+    pub(crate) fn document(_label: &str, exe: &str, home: &str) -> R<String> {
+        if exe.contains(['%', '=']) || home.contains('%') {
+            return Err(fault(RegistrationReason::UnsupportedPath));
+        }
+        Ok(format!(
+            "[Desktop Entry]\nType=Application\nName=aProxy\nExec={} restore-at-login --home {}\nTerminal=false\nHidden=false\n",
+            desktop_arg(exe),
+            desktop_arg(home)
+        ))
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn permission_is_not_a_missing_binary() {
+        assert!(matches!(
+            binary_available(Err(io::ErrorKind::PermissionDenied.into())),
+            Err(Fault::DesktopRegistration {
+                reason: RegistrationReason::Permission
+            })
+        ));
+        assert!(!binary_available(Err(io::ErrorKind::NotFound.into())).unwrap());
+    }
+    #[test]
+    fn xdg_checks_the_executable_token_and_quotes_each_argument_twice() {
+        for exe in ["/a=b/bin/aproxy", "/x%f/bin/aproxy"] {
+            assert!(matches!(
+                xdg::document("label", exe, "/home"),
+                Err(Fault::DesktopRegistration {
+                    reason: RegistrationReason::UnsupportedPath
+                })
+            ));
+        }
+        let doc = xdg::document("label", "/space here/bin/aproxy", r#"/home/a=b $`"\x"#).unwrap();
+        assert_eq!(
+            doc.lines().find(|l| l.starts_with("Exec=")),
+            Some(
+                r#"Exec="/space here/bin/aproxy" restore-at-login --home "/home/a=b \\$\\`\\"\\\\x""#
+            )
+        );
     }
 }

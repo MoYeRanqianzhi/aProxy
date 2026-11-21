@@ -180,6 +180,7 @@ pub fn run(options: Options) -> Result<i32, Error> {
     let setup_failure = failure.clone();
     let data_dir = options.data_dir;
 
+    let close_ops = options.ops.clone();
     let builder = tauri::Builder::default()
         .manage(Mutex::new(DesktopInfo::default()))
         .manage(bridge.clone())
@@ -216,7 +217,7 @@ pub fn run(options: Options) -> Result<i32, Error> {
             ..
         } = event
             && label == MAIN_WINDOW
-            && on_close.close_requested()
+            && on_close.close_requested(close_ops.as_ref())
         {
             api.prevent_close();
             if let Some(window) = app.get_webview_window(MAIN_WINDOW) {

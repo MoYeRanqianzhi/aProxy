@@ -18,6 +18,15 @@ pub(super) struct Checks {
     serial: u64,
     offer: Option<Offer>,
     busy: bool,
+    check: Option<tokio::sync::watch::Sender<()>>,
+    closing: bool,
+}
+/// Release admission on every return path, including a failed fingerprint or a cancelled invoke.
+struct CheckLease<'a>(&'a std::sync::Mutex<Checks>);
+impl Drop for CheckLease<'_> {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().check = None;
+    }
 }
 struct Offer {
     token: Token,
@@ -126,41 +135,93 @@ fn command(home: &Path, exe: &Path) -> Command {
     c.creation_flags(0x08000000);
     c
 }
-// 过长或非法的行不让子进程堵在写管道上：标记协议失败，继续丢弃到 EOF，再等真实退出。
-async fn lines(mut cmd: Command, mut consume: impl FnMut(Value) -> R<()>) -> R<ExitStatus> {
+// The owner process, not an inherited pipe handle, is the transaction's lifetime.
+// Continue draining during execution even after a protocol failure. Only a check has a cancellation path.
+async fn lines(
+    mut cmd: Command,
+    mut cancel: Option<tokio::sync::watch::Receiver<()>>,
+    mut consume: impl FnMut(Value) -> R<()>,
+) -> R<ExitStatus> {
+    if cancel
+        .as_ref()
+        .is_some_and(|r| r.has_changed().unwrap_or(true))
+    {
+        return Err(Fault::DesktopCancelled {});
+    }
+    cmd.kill_on_drop(cancel.is_some());
     let mut child = cmd.spawn().map_err(|_| Fault::DesktopBinary {})?;
     let mut reader = BufReader::new(child.stdout.take().expect("管道已配置"));
     let mut bad = false;
-    loop {
-        let mut bytes = Vec::new();
-        let n = match (&mut reader)
-            .take((LINE + 1) as u64)
-            .read_until(b'\n', &mut bytes)
-            .await
-        {
-            Ok(n) => n,
-            Err(_) => {
-                bad = true;
-                break;
+    let mut bytes = Vec::new();
+    let status = {
+        let drain = async {
+            loop {
+                bytes.clear();
+                match (&mut reader)
+                    .take((LINE + 1) as u64)
+                    .read_until(b'\n', &mut bytes)
+                    .await
+                {
+                    Ok(0) => break,
+                    Ok(n) if n <= LINE => {
+                        if !bad {
+                            bad = serde_json::from_slice(&bytes)
+                                .map_err(|_| protocol())
+                                .and_then(&mut consume)
+                                .is_err();
+                        }
+                    }
+                    Ok(_) => {
+                        bad = true;
+                        let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+                        break;
+                    }
+                    Err(_) => {
+                        bad = true;
+                        break;
+                    }
+                }
             }
         };
-        if n == 0 {
-            break;
+        tokio::pin!(drain);
+        let observe = async {
+            tokio::select! {
+                status=child.wait()=>{
+                    let _=tokio::time::timeout(std::time::Duration::from_millis(500),&mut drain).await;
+                    status
+                },
+                ()=&mut drain=>child.wait().await,
+            }
+        };
+        tokio::select! {biased;
+            ()=async {match &mut cancel {Some(rx)=>{let _=rx.changed().await;},None=>std::future::pending().await}}=>None,
+            status=observe=>Some(status),
         }
-        if n > LINE {
-            bad = true;
-            let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
-            break;
-        }
-        if !bad {
-            bad = serde_json::from_slice(&bytes)
-                .map_err(|_| protocol())
-                .and_then(&mut consume)
-                .is_err();
-        }
+    };
+    let Some(status) = status else {
+        let _ = child.start_kill();
+        child.wait().await.map_err(|_| protocol())?;
+        return Err(Fault::DesktopCancelled {});
+    };
+    // A partial trailing line left by a surviving writer cannot certify a valid document.
+    if bad || !bytes.is_empty() {
+        return Err(protocol());
     }
-    let code = child.wait().await.map_err(|_| protocol())?;
-    if bad { Err(protocol()) } else { Ok(code) }
+    status.map_err(|_| protocol())
+}
+async fn version_privacy(home: &DesktopHome) -> R<aproxy_ipc::redact::Secrets> {
+    let home = home.clone();
+    tokio::task::spawn_blocking(move || home.display_secrets())
+        .await
+        .map_err(|_| protocol())?
+        .ok_or_else(protocol)
+}
+fn public_version(secrets: &aproxy_ipc::redact::Secrets, v: &str) -> R<()> {
+    if secrets.find(v.as_bytes()).is_some() {
+        Err(protocol())
+    } else {
+        Ok(())
+    }
 }
 fn check_doc(v: Value, success: bool) -> R<UpdateInfo> {
     if !success {
@@ -261,17 +322,30 @@ fn fold(job: &mut Job, terminal: &mut Option<R<InstallEnd>>, v: Value) -> R<bool
     Ok(true)
 }
 impl UpdateOps for DesktopHome {
+    fn close_checks(&self) {
+        let mut st = self.updates.lock().unwrap();
+        st.closing = true;
+        if let Some(check) = &st.check {
+            check.send_replace(());
+        }
+    }
     fn check_update(&self, channel: ChannelChoice) -> Task<'_, UpdateInfo> {
         Box::pin(async move {
-            let n = {
+            let (n, cancel) = {
                 let mut st = self.updates.lock().unwrap();
-                if st.busy {
+                if st.busy || st.check.is_some() {
                     return Err(Fault::DesktopBusy {});
                 }
+                if st.closing {
+                    return Err(Fault::DesktopCancelled {});
+                }
+                let (tx, rx) = tokio::sync::watch::channel(());
+                st.check = Some(tx);
                 st.serial = st.serial.wrapping_add(1);
                 st.offer = None;
-                st.serial
+                (st.serial, rx)
             };
+            let _lease = CheckLease(&self.updates);
             let exe = crate::install::swap::bin_path_in(&self.home);
             let hash = fingerprint(exe.clone()).await?;
             let mut c = command(&self.home, &exe);
@@ -280,7 +354,7 @@ impl UpdateOps for DesktopHome {
                 c.arg("--pre");
             }
             let mut doc = None;
-            let code = lines(c, |value| {
+            let code = lines(c, Some(cancel), |value| {
                 if doc.replace(value).is_some() {
                     Err(protocol())
                 } else {
@@ -289,10 +363,18 @@ impl UpdateOps for DesktopHome {
             })
             .await?;
             let mut result = check_doc(doc.ok_or_else(protocol)?, code.success())?;
+            let secrets = version_privacy(self).await?;
+            public_version(&secrets, &result.current)?;
+            if let Some(latest) = &result.latest {
+                public_version(&secrets, latest)?;
+            }
             if fingerprint(exe).await? != hash {
                 return Err(Fault::DesktopChanged {});
             }
             let mut st = self.updates.lock().unwrap();
+            if st.closing {
+                return Err(Fault::DesktopCancelled {});
+            }
             if st.serial != n {
                 return Err(Fault::DesktopChanged {});
             }
@@ -313,7 +395,7 @@ impl UpdateOps for DesktopHome {
         Box::pin(async move {
             {
                 let st = self.updates.lock().unwrap();
-                if st.busy {
+                if st.busy || st.check.is_some() {
                     return Err(Fault::DesktopBusy {});
                 }
                 if !st.offer.as_ref().is_some_and(|o| o.token == check) {
@@ -322,9 +404,10 @@ impl UpdateOps for DesktopHome {
             }
             let exe = crate::install::swap::bin_path_in(&self.home);
             let hash = fingerprint(exe.clone()).await?;
+            let secrets = version_privacy(self).await?;
             let offer = {
                 let mut st = self.updates.lock().unwrap();
-                if st.busy {
+                if st.busy || st.check.is_some() {
                     return Err(Fault::DesktopBusy {});
                 }
                 if !st.offer.as_ref().is_some_and(|o| o.token == check) {
@@ -334,6 +417,7 @@ impl UpdateOps for DesktopHome {
                 if hash != o.fingerprint {
                     return Err(Fault::DesktopChanged {});
                 }
+                public_version(&secrets, &o.version)?;
                 st.busy = true;
                 o
             };
@@ -352,7 +436,7 @@ impl UpdateOps for DesktopHome {
             let mut c = command(&self.home, &exe);
             c.args(["install", "--json", &offer.version]);
             let mut terminal = None;
-            let status = lines(c, |value| {
+            let status = lines(c, None, |value| {
                 if fold(&mut job, &mut terminal, value)? {
                     progress(job.clone())
                 }
@@ -360,7 +444,12 @@ impl UpdateOps for DesktopHome {
             })
             .await;
             let result = status.and_then(|status| match terminal {
-                Some(Ok(end)) if status.success() => Ok(end),
+                Some(Ok(end)) if status.success() => {
+                    if let Some(v) = &end.version {
+                        public_version(&secrets, v)?;
+                    }
+                    Ok(end)
+                }
                 Some(Err(fault)) if !status.success() => Err(fault),
                 _ => Err(protocol()),
             });

@@ -110,10 +110,22 @@ impl Bridge {
         })
     }
     /// 与接受安装共用一把锁，关闭之后不能再启动新事务；在途子进程由自己的任务读到退出。
-    pub(crate) fn close_requested(&self) -> bool {
+    pub(crate) fn close_requested(&self, ops: &dyn DesktopOps) -> bool {
         let mut u = self.update.lock().unwrap();
         u.closing = true;
+        ops.close_checks();
         u.active
+    }
+    /// Hide-on-close retains just one worker. Exit only once its own child has been reaped.
+    fn finish_update(&self, app: &tauri::AppHandle) {
+        let close = {
+            let mut u = self.update.lock().unwrap();
+            u.active = false;
+            u.closing
+        };
+        if close {
+            app.exit(0);
+        }
     }
     fn serial(&self) -> u64 {
         self.serial.fetch_add(1, Ordering::Relaxed)
@@ -915,9 +927,27 @@ struct InstallArg {
 pub(crate) async fn check_update(
     request: Request<'_>,
     ops: State<'_, Arc<dyn DesktopOps>>,
+    b: State<'_, Arc<Bridge>>,
+    app: tauri::AppHandle,
 ) -> R<UpdateInfo> {
     let a: UpdateArg = args(&request)?;
-    ops.check_update(a.channel).await
+    {
+        let mut u = b.update.lock().unwrap();
+        if u.active || u.closing {
+            return Err(Fault::DesktopBusy {});
+        }
+        u.active = true;
+    }
+    let bridge = b.inner().clone();
+    let ops = ops.inner().clone();
+    b.runtime
+        .spawn(async move {
+            let result = ops.check_update(a.channel).await;
+            bridge.finish_update(&app);
+            result
+        })
+        .await
+        .map_err(|_| Fault::DesktopUnavailable {})?
 }
 /// 安装不随页面卸载取消；进度和结果在子进程结束之前由独立于 invoke 的任务持有。
 #[tauri::command]
@@ -949,14 +979,7 @@ pub(crate) async fn install_update(
                     }),
                 )
                 .await;
-            let close = {
-                let mut u = bridge.update.lock().unwrap();
-                u.active = false;
-                u.closing
-            };
-            if close {
-                app.exit(0)
-            }
+            bridge.finish_update(&app);
             end
         })
         .await

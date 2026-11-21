@@ -800,6 +800,8 @@ pub trait StateOps: ConfigOps {
 }
 /// Update checks and transactions share the home and window state already in use.
 pub trait UpdateOps: StateOps {
+    /// Close admission to checks and signal the active check to kill and reap its own child. Never cancel an install.
+    fn close_checks(&self);
     /// Run only installed home executable, parse its check JSON, issue a confirmation token only for an available candidate.
     fn check_update(&self, channel: ChannelChoice) -> Task<'_, UpdateInfo>;
     /// Confirm last check token; install exactly the offered version, one job per window, observe `update-progress` and terminal promise.

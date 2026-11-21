@@ -502,6 +502,52 @@ async fn update_children_are_home_bound_confirmed_bounded_and_terminal_only_afte
         "{}",
         String::from_utf8_lossy(&built.stderr)
     );
+    home.settings(
+        &json!({"defaults":{"base_url":"http://127.0.0.1:9","api_key":"checkCredential"}})
+            .to_string(),
+    );
+    let mode_file = home.path().join("fixture.mode");
+    for mode in ["private-current", "private-latest"] {
+        std::fs::write(&mode_file, mode).unwrap();
+        assert!(matches!(
+            host.check_update(ChannelChoice::Auto).await,
+            Err(Fault::DesktopInstallProtocol {})
+        ));
+    }
+    // A separate window shares only this isolated home. Close must not resolve until the child is reaped.
+    std::fs::write(&mode_file, "check-hold").unwrap();
+    let closing =
+        DesktopHome::new(home.path().into(), env!("CARGO_BIN_EXE_aproxy").into()).unwrap();
+    let worker = closing.clone();
+    let check = tokio::spawn(async move { worker.check_update(ChannelChoice::Auto).await });
+    let pid = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if let Some(pid) = std::fs::read_to_string(home.path().join("checking.pid"))
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                break pid;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        closing.check_update(ChannelChoice::Auto).await,
+        Err(Fault::DesktopBusy {})
+    ));
+    closing.close_checks();
+    assert!(matches!(
+        check.await.unwrap(),
+        Err(Fault::DesktopCancelled {})
+    ));
+    assert_eq!(aproxy::process::process_exited(pid), Some(true));
+    assert!(matches!(
+        closing.check_update(ChannelChoice::Auto).await,
+        Err(Fault::DesktopCancelled {})
+    ));
+    std::fs::write(&mode_file, "").unwrap();
     let one = host.check_update(ChannelChoice::Pre).await.unwrap();
     assert_eq!(one.published_at.unwrap().get(), 1767225600000);
     let token = one.check.unwrap();
@@ -539,6 +585,7 @@ async fn update_children_are_home_bound_confirmed_bounded_and_terminal_only_afte
         "missing",
         "failed",
         "future-error",
+        "private-terminal",
     ] {
         std::fs::write(home.path().join("fixture.mode"), mode).unwrap();
         let token = host
@@ -560,6 +607,32 @@ async fn update_children_are_home_bound_confirmed_bounded_and_terminal_only_afte
         }
         assert_eq!(jobs.lock().unwrap().last().unwrap().fault, Some(err));
     }
+    assert!(
+        !serde_json::to_string(&*jobs.lock().unwrap())
+            .unwrap()
+            .contains("checkCredential")
+    );
+    std::fs::write(&mode_file, "inherited-writer").unwrap();
+    let token = host
+        .check_update(ChannelChoice::Auto)
+        .await
+        .unwrap()
+        .check
+        .unwrap();
+    host.install_update(token, progress.clone()).await.unwrap();
+    let done = home.path().join("writer.done");
+    assert!(
+        !done.exists(),
+        "inherited output writer had to exit before the installer settled"
+    );
+    std::fs::write(home.path().join("writer.release"), "").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while !done.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
     let token = host
         .check_update(ChannelChoice::Auto)
         .await

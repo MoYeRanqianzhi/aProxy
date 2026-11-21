@@ -304,3 +304,20 @@ fn skill_lock_refuses_link_and_non_file() {
     fs::write(&target, b"keep").unwrap();
     assert!(super::skill_lock(h.path()).is_err());
 }
+
+/// 清单在目录表内但本地头不可读时，不能给出旧版没有清单的提示。
+#[test]
+fn unreadable_marker_is_not_a_missing_marker() {
+    let h = tempfile::tempdir().unwrap();
+    let f = docs();
+    let z = package(h.path(), Some(&manifest_for(&f)), &f);
+    let mut bytes = fs::read(&z).unwrap();
+    bytes[0] = 0;
+    fs::write(&z, bytes).unwrap();
+    assert_eq!(
+        archive::verify_package(&z, "1.0.0")
+            .unwrap_err()
+            .to_string(),
+        "skill 压缩包无效"
+    );
+}

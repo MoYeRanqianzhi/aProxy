@@ -22,9 +22,10 @@ fn unpack(zip: &Path, dest: &Path, version: &str) -> io::Result<(Manifest, usize
     }
     let mut archive = zip::ZipArchive::new(f).map_err(|_| io::Error::other("skill 压缩包无效"))?;
     let bytes = {
-        let mut entry = archive
-            .by_name(MARKER)
-            .map_err(|_| io::Error::other(MISSING))?;
+        let mut entry = archive.by_name(MARKER).map_err(|e| match e {
+            zip::result::ZipError::FileNotFound => io::Error::other(MISSING),
+            _ => io::Error::other("skill 压缩包无效"),
+        })?;
         check_entry(&entry, MAX_MANIFEST)?;
         let mut buf = Vec::new();
         (&mut entry).take(MAX_MANIFEST + 1).read_to_end(&mut buf)?;

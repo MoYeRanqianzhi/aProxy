@@ -2203,6 +2203,29 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn busy_subscription_is_not_attributed_to_another_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = endpoint_for_in(dir.path(), "busy-peer");
+        let listener = imp::bind(&endpoint).await.unwrap();
+        let mut info = sample_info("0");
+        info.pid = std::process::id();
+        let (state, _rx) = control(info);
+        let _occupied: Vec<_> = (0..crate::history::MAX_SUBSCRIBERS)
+            .map(|_| state.history.subscribe().unwrap())
+            .collect();
+        let server = tokio::spawn(imp::accept_loop(listener, state));
+        let expected = aproxy_ipc::client::RunIdentity {
+            pid: std::process::id(),
+            instance_id: "retired".into(),
+        };
+        let result =
+            aproxy_ipc::client::subscribe_for_run_in(dir.path(), "busy-peer", Some(&expected))
+                .await;
+        assert!(matches!(result, Err(IpcError::RunChanged)));
+        server.abort();
+    }
+
     /// `requests`、`request`、`body` 经真实的端点走一遍：结果的形状，以及体里的密钥已经
     /// 在入库时换掉。
     #[tokio::test]

@@ -359,9 +359,20 @@ pub async fn subscribe_for_run_in(
         if !subscription_line(&mut lines, &mut line, crate::wire::MAX_REPLY_LINE).await? {
             return Err(IpcError::Transient("连接在应答完整之前关闭".to_string()));
         }
-        let ack = parse_result(
+        let response = parse_result(
             std::str::from_utf8(&line).map_err(|e| IpcError::Protocol(e.to_string()))?,
-        )?;
+        );
+        // An error frame has no run ID. Keep this connection open while checking
+        // the peer of a fresh ping before assigning a refusal to a selected run.
+        if let (Some(expected), Err(IpcError::Remote { .. })) = (expected, &response) {
+            let status = request_raw(&endpoint, IpcOp::Ping).await?;
+            RunIdentity {
+                pid: status.instance.pid,
+                instance_id: status.instance.instance_id,
+            }
+            .check(Some(expected))?;
+        }
+        let ack = response?;
         let run = snapshot_run(&ack["snapshot"], peer)?;
         run.check(expected)?;
         let records = ack["requests"]

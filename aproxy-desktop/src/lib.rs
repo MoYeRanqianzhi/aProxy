@@ -82,6 +82,8 @@ const MASCOT_SANDBOX: &str = "/mascot-sandbox.html";
 pub struct Options {
     /// 启动时解析的绝对主目录；所有页面共享一个实例视图。
     pub home: PathBuf,
+    /// 发现时由宿主解析私有配置，供本窗口的内存投影使用。
+    pub inspect: aproxy_ipc::desktop::InspectHome,
     /// webview 的数据目录（WebView2 的用户数据目录、WebKitGTK 的网站数据）。aproxy 给
     /// `<home>/desktop/webview`：不显式指定的话，Tauri 在 Windows 与 Linux 上会强制用
     /// app_local_data_dir（按 tauri.conf.json 的 identifier 建在用户的应用数据目录下），
@@ -166,12 +168,9 @@ pub fn preflight() -> Result<(), Error> {
 pub fn run(options: Options) -> Result<i32, Error> {
     tauri::async_runtime::set(options.runtime.clone());
     let runtime = options.runtime;
-    let view = {
+    let bridge = {
         let _enter = runtime.enter();
-        Arc::new(aproxy_ipc::view::HomeView::open(
-            options.home,
-            Duration::from_secs(2),
-        ))
+        bridge::Bridge::open(options.home, options.inspect, runtime.clone())
     };
 
     // setup 里出的错不能交还给 Tauri（它会 panic），记在这里，请事件循环退出后再报告
@@ -181,7 +180,7 @@ pub fn run(options: Options) -> Result<i32, Error> {
 
     let builder = tauri::Builder::default()
         .manage(Mutex::new(DesktopInfo::default()))
-        .manage(view.clone())
+        .manage(bridge.clone())
         .invoke_handler(with_commands!(handler))
         .setup(move |app| {
             if let Err(e) = open_main_window(app, data_dir) {
@@ -208,7 +207,7 @@ pub fn run(options: Options) -> Result<i32, Error> {
 
     let code = app.run_return(|_, _| {});
     // 事件循环已退场，可以等视图释放套接字；不要在窗口回调里阻塞运行时。
-    runtime.block_on(view.shutdown());
+    runtime.block_on(bridge.shutdown());
     match failure.lock().unwrap_or_else(|e| e.into_inner()).take() {
         Some(e) => Err(e),
         None => Ok(code),

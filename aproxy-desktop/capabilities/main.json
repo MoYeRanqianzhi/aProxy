@@ -12,6 +12,14 @@
     "allow-desktop-info",
     "allow-titlebar-insets",
     "allow-set-caption-color",
-    "allow-rescan"
+    "allow-rescan",
+    "allow-attach",
+    "allow-detach",
+    "allow-ack",
+    "allow-snapshot",
+    "allow-query-logs",
+    "allow-request-detail",
+    "allow-body-chunk",
+    "allow-cancel-detail"
   ]
 }

@@ -198,6 +198,23 @@ impl<'a> Projection<'a> {
             self.text(s)
         }
     }
+    /// A bookmark can address an evicted row but cannot invent an arbitrary peer
+    /// argument. Request IDs consist of this exact run followed by a canonical sequence.
+    pub fn check_ref(&self, reference: &Ref) -> R<view::RunKey> {
+        let key = reference.run.key();
+        self.run(&key).ok_or(Fault::DesktopChanged {})?;
+        let seq = reference
+            .request_id
+            .strip_prefix(&key.instance_id)
+            .and_then(|s| s.strip_prefix('-'))
+            .and_then(|s| s.parse::<u64>().ok());
+        if self.secrets.find(reference.request_id.as_bytes()).is_some()
+            || !seq.is_some_and(|n| reference.request_id == format!("{}-{n}", key.instance_id))
+        {
+            return Err(Fault::DesktopBadInput {});
+        }
+        Ok(key)
+    }
     /// The process-generated 16 lowercase hex digits are a precondition, not authority.
     pub fn run(&self, k: &view::RunKey) -> Option<Run> {
         (k.instance_id.len() == 16
@@ -643,7 +660,7 @@ impl Projection<'_> {
         };
         Header {
             name: self.name(&r.name),
-            value: value,
+            value,
         }
     }
 

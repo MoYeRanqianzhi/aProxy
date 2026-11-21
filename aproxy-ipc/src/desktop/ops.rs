@@ -17,6 +17,16 @@ pub struct Run {
     pub instance_id: String,
 }
 
+impl Run {
+    /// Build a comparison key for the view. The view independently verifies current
+    /// membership and the connected peer; this conversion grants no authority.
+    pub fn key(&self) -> crate::view::RunKey {
+        crate::view::RunKey {
+            port: self.port,
+            instance_id: self.instance_id.clone(),
+        }
+    }
+}
 /// A request remains tied to its original run, even after port reuse.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

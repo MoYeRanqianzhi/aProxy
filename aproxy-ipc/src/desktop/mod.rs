@@ -7,11 +7,13 @@ mod frames;
 mod history;
 mod home;
 mod ops;
+mod paging;
 pub use codes::*;
 pub use frames::*;
 pub use history::*;
 pub use home::*;
 pub use ops::*;
+pub use paging::*;
 use serde::{Deserialize, Serialize};
 
 /// Unsigned bridge quantity. Saturate Rust outputs at the last exactly representable

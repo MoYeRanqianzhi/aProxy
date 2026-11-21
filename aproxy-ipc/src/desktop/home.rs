@@ -384,6 +384,11 @@ pub struct Survey {
     watchdog: Option<Watchdog>,
 }
 impl Survey {
+    /// Cursor pages must not reuse display strings from a superseded privacy context.
+    pub fn same_ports(&self, other: &Self) -> bool {
+        self.ports == other.ports
+    }
+
     /// Produce a full replacement; no handles for retired ports grow unbounded.
     pub fn observe(
         members: &[enumerate::Enumerated],

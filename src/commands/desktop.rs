@@ -169,8 +169,11 @@ pub(crate) fn handle_desktop_cmd() -> ! {
         .build()
         .unwrap_or_else(|e| fail(&format!("无法建立 tokio 运行时：{e}")));
     let _entered = runtime.enter();
+    let host = aproxy::desktop::DesktopHome::new(home.clone())
+        .unwrap_or_else(|_| fail("无法初始化桌面主目录"));
     let code = match aproxy_desktop::run(aproxy_desktop::Options {
         data_dir: home.join("desktop").join("webview"),
+        inspect: std::sync::Arc::new(move |members| host.inspect(members)),
         home,
         runtime: runtime.handle().clone(),
     }) {

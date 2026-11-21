@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-read-desktop-state"
+description = "Enables the read_desktop_state command without any pre-configured scope."
+commands.allow = ["read_desktop_state"]
+
+[[permission]]
+identifier = "deny-read-desktop-state"
+description = "Denies the read_desktop_state command without any pre-configured scope."
+commands.deny = ["read_desktop_state"]

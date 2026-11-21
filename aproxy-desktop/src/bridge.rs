@@ -579,7 +579,7 @@ struct DesireArgs {
 #[tauri::command]
 pub(crate) async fn list_configs(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn ConfigOps>>,
+    ops: State<'_, Arc<dyn StateOps>>,
 ) -> R<Vec<Choice>> {
     let _: Empty = args(&request)?;
     ops.list_configs().await
@@ -589,7 +589,7 @@ pub(crate) async fn list_configs(
 #[tauri::command]
 pub(crate) async fn start_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn ConfigOps>>,
+    ops: State<'_, Arc<dyn StateOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Run> {
     let a: TargetArgs = args(&request)?;
@@ -602,7 +602,7 @@ pub(crate) async fn start_instance(
 #[tauri::command]
 pub(crate) async fn stop_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn ConfigOps>>,
+    ops: State<'_, Arc<dyn StateOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<()> {
     let a: RunArgs = args(&request)?;
@@ -615,7 +615,7 @@ pub(crate) async fn stop_instance(
 #[tauri::command]
 pub(crate) async fn restart_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn ConfigOps>>,
+    ops: State<'_, Arc<dyn StateOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Run> {
     let a: RunArgs = args(&request)?;
@@ -628,7 +628,7 @@ pub(crate) async fn restart_instance(
 #[tauri::command]
 pub(crate) async fn force_stop_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn ConfigOps>>,
+    ops: State<'_, Arc<dyn StateOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<()> {
     let a: RunArgs = args(&request)?;
@@ -641,7 +641,7 @@ pub(crate) async fn force_stop_instance(
 #[tauri::command]
 pub(crate) async fn restore_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn ConfigOps>>,
+    ops: State<'_, Arc<dyn StateOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Run> {
     let a: DesireArgs = args(&request)?;
@@ -654,7 +654,7 @@ pub(crate) async fn restore_instance(
 #[tauri::command]
 pub(crate) async fn forget_restore(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn ConfigOps>>,
+    ops: State<'_, Arc<dyn StateOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<()> {
     let a: DesireArgs = args(&request)?;
@@ -691,7 +691,7 @@ struct Switch {
 #[tauri::command]
 pub(crate) async fn read_config(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn ConfigOps>>,
+    ops: State<'_, Arc<dyn StateOps>>,
 ) -> R<ConfigView> {
     let a: FileArg = args(&request)?;
     ops.read_config(a.target).await
@@ -701,7 +701,7 @@ pub(crate) async fn read_config(
 #[tauri::command]
 pub(crate) async fn validate_config(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn ConfigOps>>,
+    ops: State<'_, Arc<dyn StateOps>>,
 ) -> R<Validation> {
     let a: ValidateArg = args(&request)?;
     ops.validate_config(a.target, a.changes).await
@@ -711,7 +711,7 @@ pub(crate) async fn validate_config(
 #[tauri::command]
 pub(crate) async fn write_config(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn ConfigOps>>,
+    ops: State<'_, Arc<dyn StateOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Saved> {
     let a: WriteArg = args(&request)?;
@@ -726,7 +726,7 @@ pub(crate) async fn write_config(
 #[tauri::command]
 pub(crate) async fn read_settings(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn ConfigOps>>,
+    ops: State<'_, Arc<dyn StateOps>>,
 ) -> R<SettingsView> {
     let _: Empty = args(&request)?;
     ops.read_settings().await
@@ -736,7 +736,7 @@ pub(crate) async fn read_settings(
 #[tauri::command]
 pub(crate) async fn set_watchdog(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn ConfigOps>>,
+    ops: State<'_, Arc<dyn StateOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<bool> {
     let a: Switch = args(&request)?;
@@ -744,4 +744,84 @@ pub(crate) async fn set_watchdog(
     b.offer(DesktopEvent::SettingsChanged);
     b.view.rescan();
     Ok(result)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrefArgs {
+    changes: PreferencesPatch,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PinArgs {
+    r#ref: Ref,
+    pinned: bool,
+}
+/// 窗口只接收已验证的偏好和书签；重置通知与内容一起返回。
+#[tauri::command]
+pub(crate) async fn read_desktop_state(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn StateOps>>,
+) -> R<DesktopState> {
+    let _: Empty = args(&request)?;
+    ops.read_desktop_state().await
+}
+/// 偏好合并成功后才让其他页面重读。
+#[tauri::command]
+pub(crate) async fn set_preferences(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn StateOps>>,
+    b: State<'_, Arc<Bridge>>,
+) -> R<Preferences> {
+    let a: PrefArgs = args(&request)?;
+    let p = ops.set_preferences(a.changes).await?;
+    b.offer(DesktopEvent::DesktopStateChanged);
+    Ok(p)
+}
+/// 新书签必须取自已核验的摘要；删除离线书签只比较身份，不读取实例或请求体。
+#[tauri::command]
+pub(crate) async fn set_pinned(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn StateOps>>,
+    b: State<'_, Arc<Bridge>>,
+) -> R<Vec<Bookmark>> {
+    let a: PinArgs = args(&request)?;
+    let change = if a.pinned {
+        let key = a.r#ref.run.key();
+        let facts = b.sample();
+        let secrets = facts.secrets(&key).ok_or(Fault::DesktopChanged {})?;
+        let p = Projection::new(&secrets);
+        p.check_ref(&a.r#ref)?;
+        let raw = match b
+            .view
+            .requests(&key)
+            .into_iter()
+            .find(|r| r.request_id == a.r#ref.request_id)
+        {
+            Some(r) => r,
+            None => {
+                b.view
+                    .detail(&key, &a.r#ref.request_id)
+                    .await
+                    .map_err(read_failure)?
+                    .record
+            }
+        };
+        let row = p.row(&key, raw)?;
+        if row.r#ref != a.r#ref || !facts.same_ports(&b.sample()) {
+            return Err(Fault::DesktopChanged {});
+        }
+        PinChange::Pin(p.bookmark(row))
+    } else {
+        PinChange::Unpin(a.r#ref)
+    };
+    let list = ops.set_pinned(change).await?;
+    b.offer(DesktopEvent::DesktopStateChanged);
+    Ok(list)
+}
+/// 返回运行中二进制的版本，不从安装位置探测或联网。
+#[tauri::command]
+pub(crate) async fn about(request: Request<'_>, ops: State<'_, Arc<dyn StateOps>>) -> R<About> {
+    let _: Empty = args(&request)?;
+    ops.about()
 }

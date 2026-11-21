@@ -398,3 +398,72 @@ async fn implicit_default_can_be_created_but_external_target_needs_windows_ackno
         Err(Fault::DesktopChanged {})
     ));
 }
+
+#[tokio::test]
+async fn private_window_state_is_bounded_resettable_and_write_only_for_secrets() {
+    use aproxy_ipc::desktop::{Bookmark, Fault, PinChange, PreferencesPatch, StateFile, StateOps};
+    let home = TestHome::new();
+    home.settings(
+        r#"{"defaults":{"base_url":"http://127.0.0.1:9","api_key":"private-state-key"}}"#,
+    );
+    let host = DesktopHome::new(home.path().into(), env!("CARGO_BIN_EXE_aproxy").into()).unwrap();
+    assert_eq!(
+        host.about().unwrap().variant,
+        aproxy_ipc::desktop::Variant::Headless
+    );
+    let initial = host.read_desktop_state().await.unwrap();
+    assert!(initial.reset.is_empty() && initial.bookmarks.is_empty());
+    assert_eq!(initial.preferences.mascot, "tumbler");
+    let patch = |v| serde_json::from_value::<PreferencesPatch>(v).unwrap();
+    let p=host.set_preferences(patch(json!({"lang":"zh-Hant-TW","mascot":"future-cat","theme":"aproxy-theme-v1:{\"unknown\":true}"}))).await.unwrap();
+    assert_eq!(p.lang, "zh-Hant-TW");
+    assert_eq!(p.mascot, "future-cat");
+    assert!(p.theme.is_some());
+    assert!(matches!(
+        host.set_preferences(patch(json!({"theme":"aproxy-theme-v1:not json"})))
+            .await,
+        Err(Fault::DesktopBadInput {})
+    ));
+    assert!(matches!(
+        host.set_preferences(patch(json!({"lang":"EN bad"}))).await,
+        Err(Fault::DesktopBadInput {})
+    ));
+    let p = host
+        .set_preferences(patch(
+            json!({"theme":"aproxy-theme-v1:\"private-state-key\""}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(p.theme, None);
+    let item:Bookmark=serde_json::from_value(json!({"ref":{"run":{"port":free_port(),"instanceId":"000000000000ba11"},"requestId":"000000000000ba11-1"},"startedAt":1,"method":"GET","path":"/private-state-key","model":null,"outcome":"ok","attempts":1})).unwrap();
+    let list = host.set_pinned(PinChange::Pin(item.clone())).await.unwrap();
+    assert_eq!(list.len(), 1);
+    assert!(!list[0].path.contains("private-state-key"));
+    assert_eq!(
+        host.set_pinned(PinChange::Pin(item.clone())).await.unwrap(),
+        list
+    );
+    assert!(
+        host.set_pinned(PinChange::Unpin(item.r#ref))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let dir = home.path().join("desktop");
+    std::fs::write(dir.join("preferences.json"), b"[").unwrap();
+    std::fs::write(dir.join("bookmarks.json"), vec![b' '; 256 * 1024 + 1]).unwrap();
+    let repaired = host.read_desktop_state().await.unwrap();
+    assert_eq!(
+        repaired.reset,
+        vec![StateFile::Preferences, StateFile::Bookmarks]
+    );
+    assert_eq!(repaired.preferences, initial.preferences);
+    assert!(host.read_desktop_state().await.unwrap().reset.is_empty());
+    std::fs::write(dir.join("preferences.json"), b"{}").unwrap();
+    assert!(matches!(
+        host.set_preferences(patch(json!({"mica":true}))).await,
+        Err(Fault::DesktopStateReset {
+            file: StateFile::Preferences
+        })
+    ));
+}

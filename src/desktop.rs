@@ -1,6 +1,7 @@
 //! 绑定单个主目录的桌面业务逻辑。私有文件只在宿主侧打开，界面只见字段投影与不透明令牌。
 mod forms;
 mod instances;
+mod state;
 use crate::{config, settings, spec};
 use aproxy_ipc::{
     desktop::{Fault, LocalFacts, R},
@@ -19,6 +20,7 @@ use std::{
 #[derive(Clone)]
 pub struct DesktopHome {
     home: PathBuf,
+    display_home: String,
     key: [u8; 32],
     exe: PathBuf,
     listing: Arc<std::sync::Mutex<Option<[u8; 16]>>>,
@@ -31,12 +33,17 @@ impl DesktopHome {
         }
         let mut key = [0; 32];
         getrandom::fill(&mut key).map_err(|_| Fault::DesktopUnavailable {})?;
-        Ok(Self {
+        let mut host = Self {
+            display_home: String::new(),
             home,
             key,
             exe,
             listing: Default::default(),
-        })
+        };
+        host.display_home = host
+            .display_secrets()
+            .map_or_else(|| "***".into(), |s| s.replace(&host.home.to_string_lossy()));
+        Ok(host)
     }
     fn restore_token(&self, entry: &spec::RestoreEntry) -> String {
         // 外层只有固定长度的随机密钥与内部摘要，原始序列化及其无密钥散列均不离开宿主。

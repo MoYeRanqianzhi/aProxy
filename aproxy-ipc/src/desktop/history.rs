@@ -199,6 +199,29 @@ impl<'a> Projection<'a> {
         }
     }
     /// A bookmark can address an evicted row but cannot invent an arbitrary peer
+    /// Keep a bounded immutable summary only after projecting a verified record.
+    /// Cutting may remove the rest of a credential, so mask a matching prefix too.
+    pub fn bookmark(&self, row: Row) -> super::Bookmark {
+        let cut = |s: String| {
+            if s.len() <= 256 {
+                return s;
+            }
+            let end = s.floor_char_boundary(256);
+            let bytes = self.secrets.replace_cut_prefix(&s.as_bytes()[..end]);
+            let mut out = String::from_utf8_lossy(&bytes).into_owned();
+            out.truncate(out.floor_char_boundary(256));
+            out
+        };
+        super::Bookmark {
+            r#ref: row.r#ref,
+            started_at: row.started_at,
+            method: cut(row.method),
+            path: cut(row.path),
+            model: row.model.map(cut),
+            outcome: row.outcome,
+            attempts: row.attempts,
+        }
+    }
     /// argument. Request IDs consist of this exact run followed by a canonical sequence.
     pub fn check_ref(&self, reference: &Ref) -> R<view::RunKey> {
         let key = reference.run.key();

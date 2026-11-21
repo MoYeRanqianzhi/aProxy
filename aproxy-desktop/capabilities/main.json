@@ -32,6 +32,10 @@
     "allow-validate-config",
     "allow-write-config",
     "allow-read-settings",
-    "allow-set-watchdog"
+    "allow-set-watchdog",
+    "allow-read-desktop-state",
+    "allow-set-preferences",
+    "allow-set-pinned",
+    "allow-about"
   ]
 }

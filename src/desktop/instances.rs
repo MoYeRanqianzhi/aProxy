@@ -70,7 +70,7 @@ fn stop_error(port: u16, e: stop::StopFailure) -> Fault {
 
 impl DesktopHome {
     // 令牌密钥每次列举都替换。重算文件候选而非永久保存每次列举的路径，窗口的表恒定大小。
-    fn offers(&self, nonce: [u8; 16]) -> R<Vec<Offered>> {
+    fn offers(&self, nonce: [u8; 16]) -> R<(Vec<Offered>, Option<Secrets>)> {
         let settings_path = settings::settings_path_in(&self.home);
         let loaded = settings::read(&settings_path);
         if !loaded.is_valid() {
@@ -167,8 +167,12 @@ impl DesktopHome {
                 choice,
             });
         }
-        Ok(result)
+        Ok((result, trusted.then_some(secrets)))
     }
+    pub(super) fn display_secrets(&self) -> Option<Secrets> {
+        self.offers([0; 16]).ok()?.1
+    }
+
     pub(super) fn resolve_choice(&self, t: &StartTarget) -> R<Offered> {
         let nonce = self
             .listing
@@ -177,6 +181,7 @@ impl DesktopHome {
             .ok_or(Fault::DesktopChanged {})?;
         let value = self
             .offers(nonce)?
+            .0
             .into_iter()
             .find(|v| v.choice.target == *t)
             .ok_or(Fault::DesktopChanged {})?;
@@ -252,7 +257,7 @@ impl InstanceOps for DesktopHome {
         Box::pin(async move {
             let mut nonce = [0; 16];
             getrandom::fill(&mut nonce).map_err(|_| Fault::DesktopUnavailable {})?;
-            let offered = self.offers(nonce)?;
+            let (offered, _) = self.offers(nonce)?;
             *self.listing.lock().unwrap() = Some(nonce);
             Ok(offered.into_iter().map(|v| v.choice).collect())
         })

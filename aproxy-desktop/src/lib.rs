@@ -85,7 +85,7 @@ pub struct Options {
     /// 发现时由宿主解析私有配置，供本窗口的内存投影使用。
     pub inspect: aproxy_ipc::desktop::InspectHome,
     /// 只提供绑定此主目录的操作；窗口没有可执行路径或进程选择权。
-    pub ops: Arc<dyn aproxy_ipc::desktop::ConfigOps>,
+    pub ops: Arc<dyn aproxy_ipc::desktop::StateOps>,
     /// webview 的数据目录（WebView2 的用户数据目录、WebKitGTK 的网站数据）。aproxy 给
     /// `<home>/desktop/webview`：不显式指定的话，Tauri 在 Windows 与 Linux 上会强制用
     /// app_local_data_dir（按 tauri.conf.json 的 identifier 建在用户的应用数据目录下），

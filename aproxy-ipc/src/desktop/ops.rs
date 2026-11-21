@@ -782,23 +782,29 @@ pub trait ConfigOps: InstanceOps {
     fn set_watchdog(&self, enabled: bool) -> Task<'_, bool>;
 }
 /// Interface state, installation and login operations of the same injected home.
-pub trait DesktopOps: ConfigOps {
+pub trait StateOps: ConfigOps {
     /// Reload bookmark/preference projection.
     fn read_desktop_state(&self) -> Task<'_, DesktopState>;
     /// Validate supplied preference keys, merge under lock and return effective preferences.
     fn set_preferences(&self, changes: PreferencesPatch) -> Task<'_, Preferences>;
     /// Pin resolves the ref to a currently verified, redacted record (cache or metadata read); unpin compares stored identity only and also works offline.
     fn set_pinned(&self, change: PinChange) -> Task<'_, Vec<Bookmark>>;
-    /// Inspect this home's current-user OS registration and installed executable every time.
-    fn read_autostart(&self) -> Task<'_, Registration>;
-    /// Set/remove just this home's fixed registration, reread and verify.
-    fn set_autostart(&self, enabled: bool) -> Task<'_, Registration>;
+    /// Use calling binary metadata and the injected home's display path.
+    fn about(&self) -> R<About>;
+}
+/// Update checks and transactions share the home and window state already in use.
+pub trait UpdateOps: StateOps {
     /// Run only installed home executable, parse its check JSON, issue a confirmation token only for an available candidate.
     fn check_update(&self, channel: ChannelChoice) -> Task<'_, UpdateInfo>;
     /// Confirm last check token; install exactly the offered version, one job per window, observe `update-progress` and terminal promise.
     fn install_update(&self, check: Token, progress: Progress) -> Task<'_, InstallEnd>;
-    /// Use calling binary's build metadata and injected home (display only), not an online check or the installed executable's version.
-    fn about(&self) -> R<About>;
+}
+/// The complete injected desktop service, including explicit opt-in login registration.
+pub trait DesktopOps: UpdateOps {
+    /// Inspect this home's current-user OS registration and installed executable every time.
+    fn read_autostart(&self) -> Task<'_, Registration>;
+    /// Set/remove just this home's fixed registration, reread and verify.
+    fn set_autostart(&self, enabled: bool) -> Task<'_, Registration>;
 }
 
 #[cfg(test)]

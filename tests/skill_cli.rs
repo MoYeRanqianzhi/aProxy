@@ -357,7 +357,10 @@ async fn non_unicode_home_has_display_locations() {
 async fn checksum_response_is_bounded() {
     let h = TestHome::new();
     let zip = archive(VERSION);
-    let mut sum = format!("{:x}  aproxy-skills.zip\n", Sha256::digest(&zip));
+    let mut sum = format!(
+        "{}  aproxy-skills.zip\n",
+        aproxy::install::download::sha256_bytes(&zip)
+    );
     sum.push_str(&" ".repeat(4096));
     let path = format!("/{VERSION}/aproxy-skills.zip");
     serve(

@@ -1083,7 +1083,7 @@ impl History {
     }
 
     /// URL 中的用户信息和查询值按位置遮住；路径中若含实例已知的凭据，也不能写进记录或日志。
-    pub(crate) fn redacted_url(&self, url: &str) -> String {
+    pub fn redacted_url(&self, url: &str) -> String {
         let masked = redact::url(url);
         if self.secrets.is_empty() {
             masked

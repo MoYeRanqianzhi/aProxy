@@ -515,6 +515,7 @@ async fn follow(source: &dyn Source, shared: &Shared, port: u16, run: &RunIdenti
 
 /// The sole owner of background IO for a home. Create on a Tokio runtime with IO and time enabled.
 pub struct HomeView {
+    wake: Arc<tokio::sync::Notify>,
     source: Arc<dyn Source>,
     shared: Arc<Shared>,
     driver: tokio::task::JoinHandle<()>,
@@ -545,12 +546,28 @@ impl HomeView {
             data: Mutex::default(),
             changes: broadcast::channel(128).0,
         });
-        let driver = tokio::spawn(drive(source.clone(), shared.clone(), ticks));
+        // Notify retains at most one permit while enumeration is in progress. A manual
+        // refresh wakes this same driver; it never opens a second subscription.
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let manual = stream::unfold(wake.clone(), |wake| async move {
+            wake.notified().await;
+            Some(((), wake))
+        });
+        let driver = tokio::spawn(drive(
+            source.clone(),
+            shared.clone(),
+            stream::select(ticks, manual).boxed(),
+        ));
         Self {
             source,
             shared,
             driver,
+            wake,
         }
+    }
+    /// Schedule a discovery pass without waiting for enumeration or a successful join.
+    pub fn rescan(&self) {
+        self.wake.notify_one();
     }
     /// Subscribe before taking an initial snapshot. Lagged receivers can reread without reconnecting.
     pub fn changes(&self) -> broadcast::Receiver<Change> {
@@ -602,6 +619,47 @@ impl HomeView {
                     instance_id: key.instance_id.clone(),
                 })
             })
+    }
+    /// Read one exclusive descending archive page without caching it or subscribing.
+    /// The caller keeps a sequence, not a path or an arbitrary request ID. An empty
+    /// recent cache may still have an archive: `None` asks the verified run for its head.
+    pub async fn older_requests(
+        &self,
+        key: &RunKey,
+        before: Option<u64>,
+        limit: usize,
+    ) -> std::result::Result<(Vec<RequestSummary>, bool), ReadFailure> {
+        if !(1..=MAX_LIST).contains(&limit) {
+            return Err(ReadFailure::Unavailable);
+        }
+        let run = self.identity(key, |r| r.history_feed)?;
+        let page: Page = decode(
+            self.source
+                .read(
+                    key.port,
+                    &run,
+                    ReadOp::Requests {
+                        before: before.map(|seq| format!("{}-{seq}", run.instance_id)),
+                        limit: Some(limit as u64),
+                    },
+                )
+                .await?,
+        )?;
+        if self.identity(key, |r| r.history_feed)?.pid != run.pid {
+            return Err(ReadFailure::RunChanged);
+        }
+        if page.requests.len() > limit || (page.more && page.requests.is_empty()) {
+            return Err(ReadFailure::Unavailable);
+        }
+        let mut bound = before;
+        for row in &page.requests {
+            check_record(&run, row)?;
+            if bound.is_some_and(|b| row.request_seq >= b) {
+                return Err(ReadFailure::Unavailable);
+            }
+            bound = Some(row.request_seq);
+        }
+        Ok((page.requests, page.more))
     }
     /// Fetch metadata without retaining it or reading any body.
     pub async fn detail(

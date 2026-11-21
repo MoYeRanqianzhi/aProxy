@@ -591,3 +591,47 @@ fn truncated_opening_recovers_omitted_active_rows_via_pages() {
         );
     })
 }
+
+#[test]
+fn explicit_rescan_and_archive_reads_share_the_driver_not_the_cache() {
+    rt(async {
+        let (v, mut s) = Script::start();
+        let k = instance(80, "a", 0).run.unwrap();
+        v.rescan();
+        let _stream = s.ack("a", vec![]).await;
+        s.page("a", None)
+            .await
+            .send(Ok(page(vec![row("a", 9, true)], false)))
+            .unwrap();
+        until(&v, |v| v.requests(&k).len() == 1).await;
+        for (rows, valid) in [
+            (vec![row("a", 8, true)], true),
+            (vec![row("a", 9, true)], false),
+            (vec![row("b", 8, true)], false),
+            (vec![], false),
+        ] {
+            let (result, ()) = future::join(v.older_requests(&k, Some(9), 1), async {
+                s.page("a", Some("a-9"))
+                    .await
+                    .send(Ok(page(rows, true)))
+                    .unwrap();
+            })
+            .await;
+            assert_eq!(result.is_ok(), valid);
+            assert_eq!(v.requests(&k)[0].request_seq, 9);
+            assert_eq!(v.requests(&k).len(), 1);
+        }
+        let (result, ()) = future::join(v.older_requests(&k, None, 1), async {
+            let reply = s.page("a", None).await;
+            s.source.home.lock().unwrap().clear();
+            v.rescan();
+            until(&v, |v| v.instances().is_empty()).await;
+            reply
+                .send(Ok(page(vec![row("a", 1, true)], false)))
+                .unwrap();
+        })
+        .await;
+        assert_eq!(result.unwrap_err(), ReadFailure::RunChanged);
+        v.shutdown().await;
+    });
+}

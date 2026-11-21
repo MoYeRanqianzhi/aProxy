@@ -2864,15 +2864,15 @@ mod tests {
             serde_json::json!({ "status": 502 }).as_object().unwrap(),
             "the upstream returned 502",
         );
-        let server = tokio::spawn(serve_endpoint(endpoint.clone(), state.clone()));
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let listener = imp::bind(&endpoint).await.unwrap();
+        let server = tokio::spawn(imp::accept_loop(listener, state.clone()));
 
         // ping：状态快照带实时观测值与能力清单
         let status = request_raw(&endpoint, IpcOp::Ping).await.unwrap();
         assert_eq!(status.instance.pid, std::process::id());
         assert_eq!(status.state, InstanceState::Serving);
         assert_eq!(status.behavior, sample_behavior());
-        assert_eq!(status.features.len(), 3);
+        assert_eq!(status.features, IpcOp::FEATURES);
         assert_eq!(
             status.ops,
             [

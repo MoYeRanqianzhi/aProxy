@@ -3271,14 +3271,14 @@ mod tests {
 
     #[test]
     fn normalized_header_name_does_not_change_value_matching() {
-        let h = history(0, &["UPPER-KEY"]);
+        let h = history(0, &["MiXeD-SpElLiNg"]);
         let mut headers = http::HeaderMap::new();
-        headers.insert("X-UPPER-KEY", "upper-key".parse().unwrap());
+        headers.insert("X-MiXeD-SpElLiNg", "mixed-spelling".parse().unwrap());
         let _rec = begin_with(&h, 1, "/", &headers);
         let detail: Value = serde_json::from_str(&h.detail_json(&id(1)).unwrap()).unwrap();
         assert_eq!(
             detail["request"]["headers"][0],
-            json!({"name":"x-<secret>","value":"upper-key"})
+            json!({"name":"x-<secret>","value":"mixed-spelling"})
         );
     }
 

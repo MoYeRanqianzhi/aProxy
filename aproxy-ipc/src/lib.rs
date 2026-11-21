@@ -19,6 +19,8 @@ pub mod code;
 pub mod config_file;
 #[cfg(feature = "body-inspection")]
 pub mod decode;
+#[cfg(feature = "desktop")]
+pub mod desktop;
 pub mod diag;
 pub mod endpoint;
 #[cfg(feature = "client")]

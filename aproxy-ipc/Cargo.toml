@@ -19,6 +19,8 @@ include = ["/src/**", "/Cargo.toml"]
 # 依赖刻意保持很少：本包会被 aproxy 本体、桌面界面与第三方的客户端一起链接，这里每多一个
 # 依赖，它们的编译闭包就都多一个。新增依赖之前先看能不能用标准库写。
 [features]
+# 随内置窗口一起发布的应用接口；独立客户端和格式程序不需要它。
+desktop = ["client"]
 client = ["dep:tokio", "dep:futures-util", "serde_json/preserve_order", "windows-sys/Win32_System_Pipes"]
 # 只使用 IPC、台账或脱敏的客户端不必链接配置解析器。
 config-file = ["dep:toml_edit", "dep:regex"]

@@ -300,3 +300,27 @@ fn alias_conflicts_with_binary_continuation() {
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }
+
+/// 非 Unicode home 的成功、列表和失败也必须各交付一份 JSON，而非在安装完成后 panic。
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_unicode_home_has_display_locations() {
+    let h = TestHome::non_unicode();
+    mirror(&h, VERSION).await;
+    let document =
+        |args: &[&str], code| serde_json::from_slice::<Value>(&run(&h, args, code).stdout).unwrap();
+    let root = h.path().join("skills");
+    assert_eq!(
+        document(&["skill", "install", "--json"], 0)["location"],
+        root.display().to_string()
+    );
+    assert_eq!(
+        document(&["skill", "list", "--json"], 0)["skills"][0]["location"],
+        root.join("a").display().to_string()
+    );
+    fs::write(root.join("manifest.json"), b"bad").unwrap();
+    assert_eq!(
+        document(&["skill", "install", "--json"], 1)["location"],
+        root.display().to_string()
+    );
+}

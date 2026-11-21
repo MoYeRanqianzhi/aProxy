@@ -18,7 +18,8 @@ use std::io::Write;
 pub(crate) async fn install(proxy: Option<&str>, json_output: bool) -> u8 {
     let version = env!("CARGO_PKG_VERSION");
     let home = aproxy_ipc::home::home();
-    let location = home.join("skills");
+    // JSON 的位置是供显示的字符串，非 Unicode 路径用替代字符，不影响实际安装路径。
+    let location = home.join("skills").display().to_string();
     let settings = aproxy::settings::load();
     let result = async {
         let ctx = DownloadCtx::build(version, proxy.or(settings.download_proxy.as_deref()), None)
@@ -35,7 +36,7 @@ pub(crate) async fn install(proxy: Option<&str>, json_output: bool) -> u8 {
             } else {
                 println!(
                     "已安装 {version} 的 skill 文档（{file_count} 个文件）：{}",
-                    location.display()
+                    location
                 );
             }
             EXIT_OK
@@ -101,7 +102,7 @@ pub(crate) async fn run(cmd: SkillCmd) -> u8 {
                         s.name,
                         s.version,
                         if s.matches_binary { "是" } else { "否" },
-                        s.location.display(),
+                        s.location,
                         s.files.join(", ")
                     );
                 }

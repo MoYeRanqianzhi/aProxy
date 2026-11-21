@@ -80,6 +80,17 @@ impl TestHome {
         Self::in_temp_dir(|dir| dir.join("home"))
     }
 
+    /// 非 Unicode 的绝对路径仍位于受控临时目录内，用于核对 JSON 显示与实际读写的区别。
+    #[cfg(unix)]
+    pub fn non_unicode() -> Self {
+        use std::os::unix::ffi::OsStrExt;
+        Self::in_temp_dir(|dir| {
+            let home = dir.join(OsStr::from_bytes(b"home-\xff"));
+            std::fs::create_dir(&home).unwrap();
+            home
+        })
+    }
+
     /// 新建临时目录并核对它的位置；`home_of` 由临时目录给出注入的 APROXY_HOME。
     fn in_temp_dir(home_of: impl FnOnce(&Path) -> PathBuf) -> Self {
         let dir = tempfile::tempdir().unwrap();

@@ -7,7 +7,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{self, Read},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 /// 不回显解析错误或正文：即使被换成含凭据的文件，诊断也只给修复办法。
@@ -113,8 +113,8 @@ pub struct Skill {
     pub version: String,
     /// 与正在运行的二进制严格比较，包括预发布标记。
     pub matches_binary: bool,
-    /// 供有目录访问权限的读者使用的位置。
-    pub location: PathBuf,
+    /// 供人查看的绝对位置；非 Unicode 路径以替代字符显示，不能用来重新打开文件。
+    pub location: String,
     /// 按字节排序的文件相对路径。
     pub files: Vec<String>,
 }
@@ -151,7 +151,7 @@ pub fn list(home: &Path) -> io::Result<Listing> {
                 name: name.into(),
                 version: m.version.clone(),
                 matches_binary: m.version == env!("CARGO_PKG_VERSION"),
-                location: root.join(name),
+                location: root.join(name).display().to_string(),
                 files: Vec::new(),
             })
             .files

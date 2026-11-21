@@ -18,7 +18,8 @@ W5 的总体要求（窗口外观、主题、吉祥物、安全边界、构建�
   每个活实例一条订阅、订阅时的快照与在途记录同翻页结果合并、`lagged` 与断线之后重取、有界的记录缓存，产出已经脱敏的
   DTO。主 crate 的 CLI 改用同一个客户端与枚举，只留一份实现。B6 当时为枚举开的「经注入」例外随之取消。
   理由：status、请求历史与事件流要认同一个运行身份、同一条安全边界、同一套重取算法，而且都能脱离 Tauri 测试。
-- **写的一侧经注入**：`aproxy-desktop` 定义 `DesktopOps` 接口，主 crate 实现，`aproxy desktop` 启动时传进去：
+- **写的一侧经注入**：`DesktopOps` 接口与过桥的 DTO 定义在 `aproxy-ipc` 的 `desktop` 特性后面（2026-11-22 改：原定放在
+  `aproxy-desktop`，但 headless 的测试不链接它，实现就没法对着临时 home 测），主 crate 实现，`aproxy desktop` 启动时传进去：
   启动、停止、重启、强制停止、恢复；配置的读（脱敏投影）、校验与修改（与 `aproxy config set/unset` 同一条加锁写回）；
   settings 的读与改（只放行界面用到的键）；更新（拉起这个 home 的 `bin/aproxy install --check --json` 与
   `install --json`，把 NDJSON 事件转成界面事件）；界面自己的状态（`<home>/desktop/` 下：置顶与界面偏好）。
@@ -80,8 +81,10 @@ W5 的总体要求（窗口外观、主题、吉祥物、安全边界、构建�
 - Windows：当前用户的 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 值，或任务计划程序里当前用户的登录触发任务，
   实现时选不闪窗口的那种：aproxy.exe 是控制台程序，直接登记会在登录时弹出控制台窗口，`aproxy desktop` 用的「分离出自身
   再退出」或无窗口的创建方式要实测。
-- Linux：`~/.config/autostart/` 下的 XDG `.desktop` 文件（`Exec` 里用 `env APROXY_HOME=<home>`，`Hidden=false`）。
-- macOS：`~/Library/LaunchAgents/` 下的 LaunchAgent plist（`RunAtLoad`，`EnvironmentVariables` 带 `APROXY_HOME`），用
+- home 不经环境变量传（2026-11-22 改）：Windows 的 `Run` 值设不了环境变量，所以三个平台登记的都是同一条隐藏命令，
+  home 的绝对路径作为参数；它做的事与 `aproxy restore` 相同，`restore` 本身不变。
+- Linux：`~/.config/autostart/` 下的 XDG `.desktop` 文件（`Hidden=false`）。
+- macOS：`~/Library/LaunchAgents/` 下的 LaunchAgent plist（`RunAtLoad`），用
   `launchctl` 装载与卸载。macOS 的发布构建还不在 0.2.0 的验证范围里，这一项按文档实现、在 CI 的 macOS 构建里编译通过即可，
   实测留给 macOS 进入范围之后。
 - 失败（没有权限、登记项被别的程序删掉、二进制已不在）要在设置页说清楚，不能显示成已开启。
@@ -90,7 +93,7 @@ W5 的总体要求（窗口外观、主题、吉祥物、安全边界、构建�
 
 - **W5a（Codex）**：把 IPC 客户端、事件流读取、只读枚举与 home 视图抽进 aproxy-ipc，CLI 改用它；测试在 aproxy-ipc。
 - **W5b（Codex）**：`DesktopOps`、Tauri 命令与事件、capability、开机自启的三种登记；主 crate 实现并注入。DTO 的形状先写成
-  文档，主代理审过再实现。
+  文档，主代理审过再实现。形状文档是 [w5b-desktop-api](w5b-desktop-api.md)（2026-11-22 裁定，W5c 的前端照它写）。
 - **W5c（主代理）**：前端的 Tauri Backend 实现，界面类型的调整（状态与阶段的词表、救回统计、置顶），去掉原型工具。
 - **W5d（主代理）**：在真实应用里逐页过外观与交互，改文字与 i18n。
 - **W5e（Codex 做 Rust 与宿主侧的协议，主代理做确认框与设置页）**：扩展包的清单与发现、沙箱 iframe 的宿主、扩展 API、

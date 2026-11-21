@@ -33,6 +33,30 @@ fn workspace(parent: &Path) -> std::io::Result<tempfile::TempDir> {
     builder.tempdir_in(parent)
 }
 
+/// 锁文件还保存工作区凭据，写入前要排除硬链接，否则空的外部文件也会被改写。
+fn single_link(file: &fs::File) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(file.metadata()?.nlink() == 1)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+        // 成功返回时系统已填好整份结构，句柄在调用期间由 file 持有。
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as isize, info.as_mut_ptr()) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { info.assume_init() }.nNumberOfLinks == 1)
+    }
+}
+
 /// 从下载开始直到发布完成一直持有独立的文件锁；进程退出后内核释放，不按 pid 猜测过期。
 fn skill_lock(home: &Path) -> Result<super::InstallLock, String> {
     let root = home.join("skills");
@@ -49,6 +73,9 @@ fn skill_lock(home: &Path) -> Result<super::InstallLock, String> {
             opts.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
         }
         let file = installed::open_regular(&root.join(".lock"), &mut opts)?;
+        if !single_link(&file)? {
+            return Err(io::Error::other("skill 锁文件有其他硬链接"));
+        }
         Ok(super::try_lock_exclusive(&file)?.then_some(super::InstallLock { file }))
     };
     lock()
@@ -177,6 +204,18 @@ pub async fn install(
 mod tests {
     use super::*;
 
+    /// 硬链接虽然是普通文件，也不能借工作区登记过程给另一处空文件写入内容。
+    #[test]
+    fn skill_lock_refuses_hard_link() {
+        let h = tempfile::tempdir().unwrap();
+        let root = h.path().join("skills");
+        fs::create_dir(&root).unwrap();
+        let outside = h.path().join("note");
+        fs::write(&outside, b"").unwrap();
+        fs::hard_link(&outside, root.join(".lock")).unwrap();
+        assert!(super::skill_lock(h.path()).is_err());
+        assert!(fs::read(outside).unwrap().is_empty());
+    }
     /// 即使锁链接的目标尚不存在也不能在 skill 目录外建文件；已有目标也不能充当锁。
     #[test]
     fn skill_lock_refuses_link_and_non_file() {

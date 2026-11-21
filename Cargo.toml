@@ -103,6 +103,8 @@ tokio-util = { version = "0.7", features = ["io", "io-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 # install 下载校验：github 渠道 .sha256 强校验 / npm integrity 换算 / --from 完整性记录
 sha2 = "0.11"
+# skill 解包区在目标卷独占创建，正常退出自动回收。
+tempfile = "3"
 # install 下载链条：npm/cargo 渠道的 tgz/.crate 解包 + 版本比较（降级防呆）
 tar = "0.4"
 flate2 = "1"
@@ -166,7 +168,6 @@ libc = "0.2"
 aproxy-format = { path = "aproxy-format" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full", "test-util"] }
-tempfile = "3"
 # 仅测试用：造 brotli 压缩样本需要编码器（CompressorWriter），生产路径不需要。
 # 放在这里既让 `cargo test` 拿得到，又让常规/release 构建完全不编译编码器。
 brotli = "9.0.0"

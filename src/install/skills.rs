@@ -10,6 +10,9 @@
 //! 落位 = 目录原子替换：解压到 staging 子目录 → 旧目录 rename 走 → 新目录
 //! rename 进 → 删旧；Windows 上 agent 正读 skill 文件的冲突短重试。
 
+pub mod archive;
+pub mod manifest;
+
 use super::download::{self, Artifact, DownloadCtx};
 use crate::install::state::SkillPhase;
 use std::path::{Path, PathBuf};
@@ -43,9 +46,12 @@ pub async fn update_skills(
     let attempt = 1u32;
     let result = download::fetch_artifact(ctx, chain, Artifact::Skills, &dl).await;
     let outcome = match result {
-        Ok(fetched) => match install_skill_dir(home, &fetched.path) {
-            Ok(installed) => {
-                tracing::info!(skills = ?installed, "skill 文档已随版本落位");
+        Ok(fetched) => match archive::install(home, &fetched.path, &ctx.version) {
+            Ok((manifest, ignored)) => {
+                if ignored != 0 {
+                    tracing::warn!(ignored, "已跳过 skill 包中未登记的条目");
+                }
+                tracing::info!(skills = ?manifest.names(), "skill 文档已随版本落位");
                 SkillOutcome {
                     phase: SkillPhase::Done,
                     failure: None,
@@ -56,7 +62,7 @@ pub async fn update_skills(
                 tracing::warn!(error = %e, "skill 落位失败（下次 install 重试）");
                 SkillOutcome {
                     phase: SkillPhase::Failed,
-                    failure: Some(e.into()),
+                    failure: Some(e.to_string().into()),
                     attempt,
                 }
             }
@@ -72,110 +78,6 @@ pub async fn update_skills(
     };
     let _ = std::fs::remove_dir_all(&dl);
     outcome
-}
-
-/// zip 落位为 skill 目录（原子替换）：解包到 .staging/ → 遍历顶层目录逐个
-/// 「旧目录 rename 走 → 新目录 rename 进」→ 清理。多 skill 总包（每 skill
-/// 一个顶层目录）与单 skill 单包（历史形态）统一走此入口。Windows 上 agent
-/// 正读文件导致的 rename 冲突短重试 3 次，失败放弃（下次 install 再覆盖）。
-/// 返回落位的 skill 名列表（调用方输出提示用）。
-fn install_skill_dir(home: &Path, zip: &Path) -> Result<Vec<String>, String> {
-    // zip 内条目自带各自的顶层前缀（每 skill 一个，发布组包同款）——
-    // 解包到 .staging 本身，逐个顶层目录 rename 进位，不产生双层嵌套
-    let staging = home.join("skills").join(".staging");
-    let _ = std::fs::remove_dir_all(&staging);
-    crate::fsx::create_dir_all(&staging).map_err(|e| format!("skill staging 创建失败: {e}"))?;
-    unpack_zip(zip, &staging)?;
-
-    // 顶层目录清单：staging 下全部非隐藏目录（zip 无顶层目录条目 = 组包形态不符）
-    let mut incoming: Vec<PathBuf> = Vec::new();
-    let entries =
-        std::fs::read_dir(&staging).map_err(|e| format!("skill staging 读取失败: {e}"))?;
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let p = entry.path();
-        if p.is_dir()
-            && p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| !n.starts_with('.'))
-        {
-            incoming.push(p);
-        }
-    }
-    if incoming.is_empty() {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err("skills zip 缺 skill 顶层目录（组包形态不符）".into());
-    }
-    incoming.sort();
-
-    let skills_root = home.join("skills");
-    crate::fsx::create_dir_all(&skills_root).map_err(|e| format!("skills 目录创建失败: {e}"))?;
-    let mut installed = Vec::new();
-    for src in incoming {
-        let name = src
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("read_dir 条目必有文件名")
-            .to_string();
-        let dir = skills_root.join(&name);
-        // 旧目录 rename 走（Windows 冲突短重试）
-        if dir.exists() {
-            let old = staging.join(format!("old-{name}"));
-            let mut renamed = false;
-            for attempt in 0..3 {
-                if std::fs::rename(&dir, &old).is_ok() {
-                    renamed = true;
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(300 * (attempt as u64 + 1)));
-            }
-            if !renamed {
-                let _ = std::fs::remove_dir_all(&staging);
-                return Err(format!(
-                    "旧 skill 目录被占用（agent 正读 {name}？），放弃本次覆盖"
-                ));
-            }
-        }
-        // 新目录 rename 进（同卷原子）
-        std::fs::rename(&src, &dir).map_err(|e| format!("skill {name} 目录落位失败: {e}"))?;
-        installed.push(name);
-    }
-    let _ = std::fs::remove_dir_all(&staging);
-    Ok(installed)
-}
-
-/// zip 解包（**路径穿越防护**：entry 名剥盘符/绝对前缀后拼接，`..` 段
-/// 拒绝——zip 是系统边界输入，恶意条目不得逃出目标目录）。
-fn unpack_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
-    let f = std::fs::File::open(zip_path).map_err(|e| format!("zip 打开失败: {e}"))?;
-    let mut archive = zip::ZipArchive::new(f).map_err(|e| format!("zip 解析失败: {e}"))?;
-    for i in 0..archive.len() {
-        let mut entry = archive
-            .by_index(i)
-            .map_err(|e| format!("zip 条目读取失败: {e}"))?;
-        // zip 9 起 name() 会校验条目名（非法编码等）并返回 Result，校验失败按坏包处理
-        let raw = entry
-            .name()
-            .map_err(|e| format!("zip 条目名无效: {e}"))?
-            .into_owned();
-        // 归一路径：拒绝绝对路径与 ..
-        let rel = raw.replace('\\', "/");
-        if rel.starts_with('/') || rel.contains(':') || rel.split('/').any(|seg| seg == "..") {
-            return Err(format!("zip 内含非法路径条目: {raw}（疑似路径穿越）"));
-        }
-        let target = dest.join(&rel);
-        if entry.is_dir() {
-            crate::fsx::create_dir_all(&target).map_err(|e| format!("目录创建失败: {e}"))?;
-        } else {
-            if let Some(parent) = target.parent() {
-                crate::fsx::create_dir_all(parent).map_err(|e| format!("目录创建失败: {e}"))?;
-            }
-            let mut out = std::fs::File::create(&target)
-                .map_err(|e| format!("{} 创建失败: {e}", target.display()))?;
-            std::io::copy(&mut entry, &mut out).map_err(|e| format!("zip 条目提取失败: {e}"))?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -217,131 +119,7 @@ mod tests {
         }
         assert!(checked >= 2, "应至少检查 aproxy-cli 与 aproxy-format");
     }
-
-    #[test]
-    fn install_skill_dir_consumes_zip_top_prefix() {
-        // 真实发布 zip 的形态：条目自带 aproxy-cli/ 顶层前缀（alpha.9
-        // aproxy-skills.zip 实测）——落位后不得双层嵌套
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path();
-        let zip_path = home.join("skills.zip");
-        let f = std::fs::File::create(&zip_path).unwrap();
-        let mut w = zip::ZipWriter::new(f);
-        let opts = zip::write::SimpleFileOptions::default();
-        w.start_file("aproxy-cli/SKILL.md", opts).unwrap();
-        std::io::Write::write_all(&mut w, b"# aProxy CLI").unwrap();
-        w.start_file("aproxy-cli/references/latest/commands.md", opts)
-            .unwrap();
-        std::io::Write::write_all(&mut w, b"# commands").unwrap();
-        w.finish().unwrap();
-
-        let installed = install_skill_dir(home, &zip_path).unwrap();
-        assert_eq!(installed, vec!["aproxy-cli".to_string()]);
-        let dir_out = skill_dir_in(home);
-        assert!(dir_out.join("SKILL.md").is_file(), "SKILL.md 应落位一层");
-        assert!(
-            dir_out
-                .join("references")
-                .join("latest")
-                .join("commands.md")
-                .is_file(),
-            "references 子树应完整"
-        );
-        assert!(
-            !dir_out.join("aproxy-cli").exists(),
-            "不得产生 aproxy-cli/aproxy-cli 双层嵌套"
-        );
-        assert!(
-            !home.join("skills").join(".staging").exists(),
-            "staging 应清理"
-        );
-    }
-
-    #[test]
-    fn install_skill_dir_places_every_top_level_dir() {
-        // 多 skill 总包（每 skill 一个顶层目录）：全部落位、互不嵌套
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path();
-        let zip_path = home.join("multi.zip");
-        let f = std::fs::File::create(&zip_path).unwrap();
-        let mut w = zip::ZipWriter::new(f);
-        let opts = zip::write::SimpleFileOptions::default();
-        for (skill, file, body) in [
-            ("aproxy-cli", "SKILL.md", "# cli"),
-            ("aproxy-format", "SKILL.md", "# format"),
-        ] {
-            w.start_file(format!("{skill}/{file}"), opts).unwrap();
-            std::io::Write::write_all(&mut w, body.as_bytes()).unwrap();
-        }
-        w.finish().unwrap();
-
-        let mut installed = install_skill_dir(home, &zip_path).unwrap();
-        installed.sort();
-        assert_eq!(
-            installed,
-            vec!["aproxy-cli".to_string(), "aproxy-format".to_string()]
-        );
-        assert!(skill_dir_in(home).join("SKILL.md").is_file());
-        assert!(
-            home.join("skills")
-                .join("aproxy-format")
-                .join("SKILL.md")
-                .is_file(),
-            "第二个 skill 应各自落位"
-        );
-        assert!(!home.join("skills").join(".staging").exists());
-    }
-
-    #[test]
-    fn install_skill_dir_replaces_old_and_rejects_empty() {
-        // 覆盖语义：已有目录被整目录替换；无顶层目录的 zip 拒绝
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path();
-        let zip_path = home.join("s.zip");
-        let f = std::fs::File::create(&zip_path).unwrap();
-        let mut w = zip::ZipWriter::new(f);
-        w.start_file(
-            "aproxy-cli/SKILL.md",
-            zip::write::SimpleFileOptions::default(),
-        )
-        .unwrap();
-        std::io::Write::write_all(&mut w, b"# v2").unwrap();
-        w.finish().unwrap();
-        install_skill_dir(home, &zip_path).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(skill_dir_in(home).join("SKILL.md")).unwrap(),
-            "# v2",
-            "覆盖安装应替换旧内容"
-        );
-
-        // 空包：无任何顶层目录 → 拒绝且 staging 清理
-        let empty = home.join("empty.zip");
-        let f = std::fs::File::create(&empty).unwrap();
-        let mut w = zip::ZipWriter::new(f);
-        w.start_file("loose.txt", zip::write::SimpleFileOptions::default())
-            .unwrap();
-        std::io::Write::write_all(&mut w, b"x").unwrap();
-        w.finish().unwrap();
-        let err = install_skill_dir(home, &empty).unwrap_err();
-        assert!(err.contains("顶层目录"), "{err}");
-        assert!(!home.join("skills").join(".staging").exists());
-    }
-
-    #[test]
-    fn unpack_zip_rejects_path_traversal() {
-        // 手工构造含 .. 条目的 zip（内存中写 zip）
-        let dir = tempfile::tempdir().unwrap();
-        let zip_path = dir.path().join("evil.zip");
-        let f = std::fs::File::create(&zip_path).unwrap();
-        let mut w = zip::ZipWriter::new(f);
-        w.start_file("../evil.txt", zip::write::SimpleFileOptions::default())
-            .unwrap();
-        std::io::Write::write_all(&mut w, b"payload").unwrap();
-        w.finish().unwrap();
-        let dest = dir.path().join("out");
-        std::fs::create_dir_all(&dest).unwrap();
-        let err = unpack_zip(&zip_path, &dest).unwrap_err();
-        assert!(err.contains("路径穿越"), "{err}");
-        assert!(!dir.path().join("evil.txt").exists(), "穿越文件不得落盘");
-    }
 }
+
+#[cfg(test)]
+mod archive_tests;

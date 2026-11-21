@@ -209,7 +209,7 @@ impl Bridge {
                 let event = tokio::select! {
                     _ = w.notified() => continue,
                     _ = timer => continue,
-                    change = changes.recv() => match change {
+                    change = window_change(&mut changes) => match change {
                         Ok(change) => this.change(change),
                         Err(broadcast::error::RecvError::Lagged(_)) => Some(DesktopEvent::Resync),
                         Err(broadcast::error::RecvError::Closed) => return,
@@ -265,14 +265,16 @@ impl Bridge {
                 }
                 continue;
             };
-            let rows = self
-                .view
-                .requests(key)
+            let (raw, bound) = self.view.recent_window(key);
+            let rows = raw
                 .into_iter()
-                .map(|r| p.row(key, r))
-                .collect::<R<Vec<_>>>()?;
+                .map(|r| {
+                    let seq = r.request_seq;
+                    Ok((seq, p.list_row(key, r)?))
+                })
+                .collect::<R<_>>()?;
             let live = item.liveness == Presence::Live;
-            t.seed(run.clone(), rows, live);
+            t.seed(run.clone(), rows, bound, live);
             if !live || item.feed == Feed::Disconnected {
                 t.missing(run, MissingReason::Disconnected);
             }
@@ -382,12 +384,14 @@ pub(crate) async fn query_logs(request: Request<'_>, b: State<'_, Arc<Bridge>>) 
         let mut slots = b.cursors.lock().unwrap();
         let s = &mut slots[index];
         let t = if let Some(id) = q.cursor {
-            if !s.next.as_ref().is_some_and(|(old, run, _, facts)| {
-                *old == id && run == &q.run && facts.same_ports(&f)
-            }) {
+            if !s
+                .next
+                .as_ref()
+                .is_some_and(|(old, run, _, _)| *old == id && run == &q.run)
+            {
                 return Err(Fault::DesktopCursor {});
             }
-            s.next.take().map(|v| v.2)
+            s.next.take().map(|v| (v.2, v.3))
         } else {
             s.next = None;
             None
@@ -395,10 +399,11 @@ pub(crate) async fn query_logs(request: Request<'_>, b: State<'_, Arc<Bridge>>) 
         s.epoch = epoch;
         t
     };
-    let mut t = match previous {
-        Some(t) => t,
-        None => b.traversal(&f, q.run.as_ref())?,
+    let (mut t, initial) = match previous {
+        Some(v) => v,
+        None => (b.traversal(&f, q.run.as_ref())?, f.clone()),
     };
+    t.recheck(|run| initial.source_status(run, &f));
     let mut rows = Vec::new();
     while rows.len() < q.limit {
         if remote && let Some((run, before)) = t.needs_head() {
@@ -407,8 +412,12 @@ pub(crate) async fn query_logs(request: Request<'_>, b: State<'_, Arc<Bridge>>) 
                 Ok((page, more)) => {
                     let secrets = f.secrets(&key).ok_or(Fault::DesktopChanged {})?;
                     let p = Projection::new(&secrets);
-                    let page = page.into_iter().map(|r| p.row(&key, r)).collect::<R<_>>()?;
-                    t.supply(&run, page, more);
+                    let before = page.last().map(|r| r.request_seq);
+                    let page = page
+                        .into_iter()
+                        .filter_map(|r| p.list_row(&key, r).transpose())
+                        .collect::<R<_>>()?;
+                    t.supply(&run, page, before, more);
                 }
                 Err(e) => {
                     let reason = if e == ReadFailure::RunChanged {
@@ -426,12 +435,15 @@ pub(crate) async fn query_logs(request: Request<'_>, b: State<'_, Arc<Bridge>>) 
     }
     let mut slots = b.cursors.lock().unwrap();
     let s = &mut slots[index];
-    if s.epoch != epoch || !f.same_ports(&b.sample()) {
+    if s.epoch != epoch {
         return Err(Fault::DesktopCursor {});
     }
+    let latest = b.sample();
+    t.recheck(|run| initial.source_status(run, &latest));
+    rows.retain(|r| initial.source_status(&r.r#ref.run, &latest).0);
     let next = t.more().then(|| format!("p{epoch:x}"));
     let page = t.page(rows, next.clone());
-    s.next = next.map(|id| (id, q.run, t, f));
+    s.next = next.map(|id| (id, q.run, t, initial));
     Ok(page)
 }
 
@@ -860,23 +872,14 @@ pub(crate) async fn set_pinned(
         let secrets = facts.secrets(&key).ok_or(Fault::DesktopChanged {})?;
         let p = Projection::new(&secrets);
         p.check_ref(&a.r#ref)?;
-        let raw = match b
+        let raw = b
             .view
-            .requests(&key)
-            .into_iter()
-            .find(|r| r.request_id == a.r#ref.request_id)
-        {
-            Some(r) => r,
-            None => {
-                b.view
-                    .detail(&key, &a.r#ref.request_id)
-                    .await
-                    .map_err(read_failure)?
-                    .record
-            }
-        };
+            .detail(&key, &a.r#ref.request_id)
+            .await
+            .map_err(read_failure)?
+            .record;
         let row = p.row(&key, raw)?;
-        if row.r#ref != a.r#ref || !facts.same_ports(&b.sample()) {
+        if row.r#ref != a.r#ref || !facts.source_status(&a.r#ref.run, &b.sample()).0 {
             return Err(Fault::DesktopChanged {});
         }
         PinChange::Pin(p.bookmark(row))

@@ -668,6 +668,13 @@ impl Projection<'_> {
         })
     }
 
+    /// An unsafe address hides only this list row; its raw sequence still advances the archive cursor.
+    pub fn list_row(&self, key: &view::RunKey, r: view::RequestSummary) -> R<Option<Row>> {
+        if self.secrets.find(r.request_id.as_bytes()).is_some() {
+            return Ok(None);
+        }
+        self.row(key, r).map(Some)
+    }
     /// One summary scoped to its verified run; never contains headers or body bytes.
     pub fn row(&self, key: &view::RunKey, r: view::RequestSummary) -> R<Row> {
         let run = self.run(key).ok_or(Fault::DesktopChanged {})?;
@@ -860,6 +867,24 @@ mod tests {
     }
     fn summary() -> Value {
         json!({"request_id":format!("{ID}-1"),"request_seq":1,"started_at":1000,"ended_at":16000,"method":"GET","path":"/a?key=do-not-copy","stream":false,"delivery":"retry","upgraded":false,"outcome":"ok","phase":"done","attempts":2,"tries_omitted":0,"tries":[],"keepalive":false,"heartbeats":0,"request_bytes":0,"response_bytes":0})
+    }
+    #[test]
+    fn unaddressable_request_does_not_poison_neighboring_list_rows() {
+        let secrets = Secrets::new(["abcdef-1"]);
+        let p = Projection::new(&secrets);
+        let mut v = summary();
+        assert!(
+            p.list_row(&key(), serde_json::from_value(v.clone()).unwrap())
+                .unwrap()
+                .is_none()
+        );
+        v["request_seq"] = json!(2);
+        v["request_id"] = json!(format!("{ID}-2"));
+        assert!(
+            p.list_row(&key(), serde_json::from_value(v).unwrap())
+                .unwrap()
+                .is_some()
+        );
     }
     #[test]
     fn configured_short_headers_and_overlapping_body_margins_are_private() {

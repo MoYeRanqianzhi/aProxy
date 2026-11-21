@@ -268,6 +268,11 @@ fn busy_polls_verification_fails_closed_and_reads_cancel() {
                 .requests_total,
             17
         );
+        let k = v.instances()[0].run.clone().unwrap();
+        assert_eq!(
+            (v.recent_window(&k).0.len(), v.recent_window(&k).1),
+            (0, 17)
+        );
         assert!(open.send(Err(IpcError::RunChanged)).is_ok());
         until(&v, |v| feed(v) == Feed::Disconnected).await;
         s.tick();
@@ -328,6 +333,7 @@ fn both_eviction_limits_keep_in_flight_records() {
             p,
             Entry {
                 info: instance(p, "a", 0),
+                high_water: 0,
                 records: Records::new(),
             },
         );
@@ -592,6 +598,37 @@ fn truncated_opening_recovers_omitted_active_rows_via_pages() {
     })
 }
 
+#[test]
+fn bookmark_metadata_rejects_a_now_offline_cached_record() {
+    rt(async {
+        let (v, mut s) = Script::start();
+        let k = instance(80, "a", 0).run.unwrap();
+        v.rescan();
+        let _events = s.ack("a", vec![]).await;
+        s.page("a", None)
+            .await
+            .send(Ok(page(vec![row("a", 1, true)], false)))
+            .unwrap();
+        until(&v, |v| v.requests(&k).len() == 1).await;
+        let (result, ()) = future::join(v.detail(&k, "a-1"), async {
+            let Some(Call::Read(_, ReadOp::Request { .. }, reply)) = s.calls.next().await else {
+                panic!("expected metadata")
+            };
+            s.source.home.lock().unwrap()[0].liveness = Presence::Unresponsive;
+            s.tick();
+            until(&v, |v| v.instances()[0].liveness == Presence::Unresponsive).await;
+            assert_eq!(v.requests(&k).len(), 1);
+            reply
+                .send(Ok(
+                    json!({"record":row("a",1,true),"request":{"headers":[]},"tries":[]}),
+                ))
+                .unwrap();
+        })
+        .await;
+        assert!(matches!(result, Err(ReadFailure::RunChanged)));
+        v.shutdown().await;
+    });
+}
 #[test]
 fn explicit_rescan_and_archive_reads_share_the_driver_not_the_cache() {
     rt(async {

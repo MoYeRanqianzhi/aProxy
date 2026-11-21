@@ -370,6 +370,7 @@ pub type InspectHome =
     std::sync::Arc<dyn Fn(&[enumerate::Enumerated]) -> BTreeMap<u16, LocalFacts> + Send + Sync>;
 #[derive(PartialEq)]
 struct Sample {
+    history_allowed: bool,
     run: Option<view::RunKey>,
     pid: Option<u32>,
     secrets: std::sync::Arc<redact::Secrets>,
@@ -385,8 +386,22 @@ pub struct Survey {
 }
 impl Survey {
     /// Cursor pages must not reuse display strings from a superseded privacy context.
-    pub fn same_ports(&self, other: &Self) -> bool {
-        self.ports == other.ports
+    pub fn source_status(&self, run: &Run, other: &Self) -> (bool, bool) {
+        let key = run.key();
+        let current = other.ports.get(&key.port);
+        let display = current.is_none_or(|s| Projection::new(&s.secrets).run(&key).is_some());
+        let same = self
+            .ports
+            .get(&key.port)
+            .zip(current)
+            .is_some_and(|(a, b)| {
+                a.run.as_ref() == Some(&key)
+                    && a.run == b.run
+                    && b.history_allowed
+                    && a.pid == b.pid
+                    && a.secrets == b.secrets
+            });
+        (same, display)
     }
 
     /// Produce a full replacement; no handles for retired ports grow unbounded.
@@ -405,6 +420,11 @@ impl Survey {
                     Some((
                         m.port,
                         Sample {
+                            history_allowed: m.status.as_ref().is_none_or(|s| {
+                                s.features
+                                    .iter()
+                                    .any(|f| f == crate::wire::FEATURE_REDACTED_CLIENT_FIELDS)
+                            }),
                             run: m.instance.as_ref().map(|r| view::RunKey {
                                 port: m.port,
                                 instance_id: r.instance_id.clone(),

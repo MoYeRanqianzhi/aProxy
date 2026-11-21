@@ -7,6 +7,21 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Lag invalidates even those old completions that still fit in the broadcast ring.
+/// Resubscribe at the current tail *before* publishing the resync barrier.
+pub async fn window_change(
+    rx: &mut tokio::sync::broadcast::Receiver<crate::view::Change>,
+) -> Result<crate::view::Change, tokio::sync::broadcast::error::RecvError> {
+    let change = rx.recv().await;
+    if matches!(
+        change,
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+    ) {
+        *rx = rx.resubscribe();
+    }
+    change
+}
+
 const STALL: Duration = Duration::from_secs(10);
 const RATE: Duration = Duration::from_millis(250);
 const LIMIT: usize = 128;
@@ -145,6 +160,29 @@ impl Frames {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lag_barrier_discards_the_remaining_old_broadcast_tail() {
+        use crate::view::Change;
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (tx, mut rx) = tokio::sync::broadcast::channel(2);
+                for i in 0..4 {
+                    tx.send(Change::Instance(i)).unwrap();
+                }
+                assert!(matches!(
+                    super::window_change(&mut rx).await,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+                ));
+                tx.send(Change::Instance(9)).unwrap();
+                assert!(matches!(
+                    super::window_change(&mut rx).await,
+                    Ok(Change::Instance(9))
+                ));
+            });
+    }
+
     use super::*;
     fn change(port: u16) -> DesktopEvent {
         DesktopEvent::RequestsChanged {

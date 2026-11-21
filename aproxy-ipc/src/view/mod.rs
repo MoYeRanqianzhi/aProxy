@@ -354,6 +354,8 @@ fn records(run: &RunIdentity, rows: Vec<RequestSummary>) -> Result<Vec<Arc<Reque
 }
 
 struct Entry {
+    // Largest observed sequence survives cache eviction, but never a run replacement.
+    high_water: u64,
     info: InstanceSummary,
     records: Records,
 }
@@ -397,6 +399,9 @@ impl Shared {
             old.retain(|n, r| r.ended_at.is_some() || rows.contains_key(n));
         }
         entry.records = merge(old, rows.into_values(), []);
+        entry.high_water = entry
+            .high_water
+            .max(entry.records.last_key_value().map_or(0, |(seq, _)| *seq));
         trim(&mut entry.records, PER_RUN_LIMIT);
         if let Some(s) = state {
             entry.info.feed = Feed::Streaming;
@@ -615,16 +620,28 @@ impl HomeView {
     }
     /// Recent summaries newest first; a retired run never aliases its successor.
     pub fn requests(&self, key: &RunKey) -> Vec<RequestSummary> {
-        self.shared
-            .data
-            .lock()
-            .unwrap()
+        self.recent_window(key).0
+    }
+    /// Atomically sample both the cache and its run-local upper sequence. Accepted request
+    /// numbers are allocated from requests_total; a state-only sample is enough to bound an empty cache.
+    pub fn recent_window(&self, key: &RunKey) -> (Vec<RequestSummary>, u64) {
+        let store = self.shared.data.lock().unwrap();
+        let Some(e) = store
             .ports
             .get(&key.port)
             .filter(|e| e.info.run.as_ref() == Some(key))
-            .into_iter()
-            .flat_map(|e| e.records.values().rev().map(|r| (**r).clone()))
-            .collect()
+        else {
+            return Default::default();
+        };
+        (
+            e.records.values().rev().map(|r| (**r).clone()).collect(),
+            e.high_water.max(
+                e.info
+                    .state
+                    .as_ref()
+                    .map_or(0, |s| s.activity.requests_total),
+            ),
+        )
     }
     fn identity(
         &self,
@@ -708,6 +725,9 @@ impl HomeView {
                 )
                 .await?,
         )?;
+        if self.identity(key, |r| r.detail)?.pid != run.pid {
+            return Err(ReadFailure::RunChanged);
+        }
         check_record(&run, &detail.record)?;
         if detail.record.request_id != id {
             return Err(ReadFailure::Unavailable);
@@ -867,6 +887,10 @@ async fn drive(source: Arc<dyn Source>, shared: Arc<Shared>, ticks: BoxStream<'s
             store.ports.insert(
                 p,
                 Entry {
+                    high_water: old
+                        .as_ref()
+                        .filter(|_| same && safe)
+                        .map_or(0, |e| e.high_water),
                     info,
                     records: old
                         .filter(|_| same && safe)

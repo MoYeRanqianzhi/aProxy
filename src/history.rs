@@ -221,7 +221,7 @@ impl Body {
 
     /// 体对象：`{"bytes","state","cause"?,"encoding"?}`。`same` 为真时状态写成
     /// `same_as_previous`（这次发出的体与上一次是同一份）。
-    fn view(&self, same: bool) -> Value {
+    fn view(&self, same: bool, secrets: &Secrets) -> Value {
         let inner = lock(&self.inner);
         let mut view = Map::new();
         let (state, cause) = match inner.state {
@@ -240,7 +240,7 @@ impl Body {
             view.insert("cause".into(), cause.as_str().into());
         }
         if let Some(encoding) = &inner.encoding {
-            view.insert("encoding".into(), (&**encoding).into());
+            view.insert("encoding".into(), secrets.replace(encoding).into());
         }
         Value::Object(view)
     }
@@ -1087,7 +1087,12 @@ impl History {
                 out.push(b',');
             }
             out.extend_from_slice(br#"{"name":"#);
-            push(&mut out, &name);
+            // 密钥头的判定仍用原名，公开的名字单独替换。
+            if self.secrets.find(name.as_bytes()).is_some() {
+                push(&mut out, &self.secrets.replace(name));
+            } else {
+                push(&mut out, &name);
+            }
             out.extend_from_slice(br#","value":"#);
             let text = String::from_utf8_lossy(value);
             if redact::is_secret_header(name) {
@@ -1110,11 +1115,11 @@ impl History {
         let user_agent = start
             .headers
             .get(http::header::USER_AGENT)
-            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+            .map(|v| self.secrets.replace(&String::from_utf8_lossy(v.as_bytes())));
         let inner = RecordInner {
             started_at: now,
             ended_at: None,
-            method: start.method.to_string(),
+            method: self.secrets.replace(start.method),
             path: self.redacted_url(start.path_and_query),
             model: None,
             stream: false,
@@ -1381,7 +1386,10 @@ impl History {
         let inner = lock(&record.inner);
         // 头入库时已经是 JSON 文本，记录也直接写成文本：整份明细按文本拼，不搭 JSON 树
         let body = |body: Option<&Arc<Body>>, same: bool| {
-            body.map_or_else(|| "null".to_string(), |b| b.view(same).to_string())
+            body.map_or_else(
+                || "null".to_string(),
+                |b| b.view(same, &self.secrets).to_string(),
+            )
         };
         let tries: Vec<String> = inner
             .tries
@@ -1793,8 +1801,8 @@ impl Recorder {
 
     /// 从请求里读出来的两样：顶层的 `model`，以及客户端是不是在要一个流。
     pub fn request_shape(&self, model: Option<String>, stream: bool) {
-        self.update(|inner, _| {
-            inner.model = model;
+        self.update(|inner, live| {
+            inner.model = model.map(|text| live.history.secrets.replace(&text));
             inner.stream = stream;
         });
     }
@@ -1827,7 +1835,7 @@ impl Recorder {
     ) -> Option<Arc<SentHead>> {
         let live = self.0.as_ref()?;
         Some(Arc::new(SentHead {
-            method: method.to_string(),
+            method: live.history.secrets.replace(method),
             url: live.history.redacted_url(url),
             headers: live.history.headers(headers),
         }))
@@ -3192,6 +3200,46 @@ mod tests {
         );
         assert_eq!(detail["tries"][0]["response"]["upstream_status"], 200);
         assert_eq!(detail["record"]["path"], "/v1/models?key=***");
+    }
+
+    /// 客户端可以把凭据放在任意 HTTP token 里，不只是通常带密钥的头值。
+    #[test]
+    fn client_text_is_redacted_in_records_and_details() {
+        let history = history(0, &["client-token"]);
+        let mut headers = http::HeaderMap::new();
+        headers.insert("user-agent", "agent/client-token".parse().unwrap());
+        headers.insert("x-client-token", "ordinary".parse().unwrap());
+        let rec = history.begin(
+            1,
+            id(1).into(),
+            Start {
+                method: "client-token",
+                path_and_query: "/client-token?q=private",
+                headers: &headers,
+                delivery: "retry",
+                phase: Phase::ReadingBody,
+            },
+        );
+        rec.request_shape(Some("model-client-token".into()), false);
+        rec.request_body(Some("client-token"));
+        let sent = rec.sent_head("client-token", "/client-token", std::iter::empty());
+        rec.try_started(1, sent.as_ref(), true, None);
+        let detail: Value = serde_json::from_str(&history.detail_json(&id(1)).unwrap()).unwrap();
+        let record = &detail["record"];
+        assert_eq!(record["user_agent"], "agent/<secret>");
+        assert_eq!(record["model"], "model-<secret>");
+        assert_eq!(record["method"], "<secret>");
+        assert_eq!(record["path"], "/<secret>?q=***");
+        assert!(
+            detail["request"]["headers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["name"] == "x-<secret>")
+        );
+        assert_eq!(detail["request"]["body"]["encoding"], "<secret>");
+        assert_eq!(detail["tries"][0]["sent"]["method"], "<secret>");
+        assert!(!detail.to_string().contains("client-token"));
     }
 
     /// 事件：没有订阅者时不发；开始与结束立即发；中间的变化每条每秒最多一个。

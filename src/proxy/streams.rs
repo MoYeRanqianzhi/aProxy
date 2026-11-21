@@ -584,8 +584,7 @@ impl Output {
             rec,
         } = self;
         if committed && let Some(encoding) = encoding_to_undo(&headers) {
-            let decode_failure =
-                || Terminal::decode_failed(&state.history.secrets().replace(&encoding));
+            let decode_failure = || Terminal::decode_failed(&encoding, state.history.secrets());
             if !format_encoding_depth_allowed(&encoding) {
                 return Err(decode_failure());
             }

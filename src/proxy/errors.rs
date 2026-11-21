@@ -343,7 +343,9 @@ impl Terminal {
     }
 
     /// 流已提交，上游的压缩编码无法携带，解码又失败了
-    pub(super) fn decode_failed(encoding: &str) -> Self {
+    pub(super) fn decode_failed(encoding: &str, secrets: &aproxy_ipc::redact::Secrets) -> Self {
+        // Debug 转义会改变引号和反斜杠的拼写，必须先替换原值。
+        let encoding = secrets.replace(encoding);
         Self::new(
             "decode_failed",
             format!(
@@ -472,6 +474,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn decode_error_redacts_before_debug_escaping() {
+        let key = r#"secret\with"quote"#;
+        let terminal = Terminal::decode_failed(key, &aproxy_ipc::redact::Secrets::new([key]));
+        assert_eq!(terminal.details["encoding"], "<secret>");
+        assert!(terminal.message.contains("\"<secret>\""));
+    }
+
     /// 每个构造函数给出的 `details` 的键，都是码表为这个码登记的键；必填的键一个不少。
     #[test]
     fn details_match_the_code_table() {
@@ -487,7 +497,7 @@ mod tests {
             Terminal::retry_exhausted("rule:1", 3, &failure),
             Terminal::format_rejected("keys", "no", json!({"format":"keys", "stage":"request"})),
             Terminal::upstream_failed(&failure),
-            Terminal::decode_failed("br"),
+            Terminal::decode_failed("br", &Default::default()),
             Terminal::internal("x"),
         ];
         let failures = [

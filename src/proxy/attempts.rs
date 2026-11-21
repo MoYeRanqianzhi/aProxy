@@ -1242,7 +1242,7 @@ async fn deliver(
                     decoded
                 }
                 Err(e) => {
-                    let terminal = Terminal::decode_failed(&encoding);
+                    let terminal = Terminal::decode_failed(&encoding, state.history.secrets());
                     terminal.record_in(&state.stats);
                     tracing::warn!(
                         attempt,

@@ -134,7 +134,7 @@ pub(crate) async fn run(cmd: SkillCmd) -> u8 {
                 eprintln!("{e}");
                 return EXIT_NOT_FOUND;
             }
-            match bytes.and_then(|b| std::io::stdout().lock().write_all(&b)) {
+            match bytes.and_then(|b| write_document(std::io::stdout().lock(), &b)) {
                 Ok(()) => EXIT_OK,
                 Err(e) => {
                     eprintln!("{e}");
@@ -142,5 +142,22 @@ pub(crate) async fn run(cmd: SkillCmd) -> u8 {
                 }
             }
         }
+    }
+}
+
+/// 缓冲输出在 flush 后才算交付；短文档没有尾换行也必须报告底层写入错误。
+fn write_document(mut out: impl Write, bytes: &[u8]) -> std::io::Result<()> {
+    out.write_all(bytes)?;
+    out.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// 写入缓冲区成功而最终提交失败，不得把它当作已交付。
+    #[test]
+    fn buffered_failure_is_propagated() {
+        let sink = &mut [0u8; 0][..];
+        assert!(write_document(std::io::BufWriter::new(sink), b"short").is_err());
     }
 }

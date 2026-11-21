@@ -187,14 +187,7 @@ impl Source for Local {
                                 Feed::Offline
                             },
                             state: i.status.map(|s| StateSnapshot {
-                                state: match s.state {
-                                    crate::wire::InstanceState::Starting => "starting",
-                                    crate::wire::InstanceState::Serving => "serving",
-                                    crate::wire::InstanceState::SwapPrepared => "swap_prepared",
-                                    crate::wire::InstanceState::Stopping => "stopping",
-                                    crate::wire::InstanceState::Unknown => "unknown",
-                                }
-                                .into(),
+                                state: lifecycle(s.state),
                                 activity: s.activity.into(),
                             }),
                         }

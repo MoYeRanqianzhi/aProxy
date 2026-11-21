@@ -68,9 +68,25 @@ pub struct InstanceSummary {
 #[non_exhaustive]
 pub struct StateSnapshot {
     /// Lifecycle phase; unrecognized phases are not evidence of death.
+    #[serde(deserialize_with = "deserialize_lifecycle")]
     pub state: String,
     /// Counters since this run started.
     pub activity: RunActivity,
+}
+
+pub(super) fn lifecycle(state: crate::wire::InstanceState) -> String {
+    use crate::wire::InstanceState::*;
+    match state {
+        Starting => "starting",
+        Serving => "serving",
+        SwapPrepared => "swap_prepared",
+        Stopping => "stopping",
+        Unknown => "unknown",
+    }
+    .into()
+}
+fn deserialize_lifecycle<'de, D: serde::Deserializer<'de>>(input: D) -> Result<String, D::Error> {
+    crate::wire::InstanceState::deserialize(input).map(lifecycle)
 }
 
 /// Run-local activity; these counters never span restarts.

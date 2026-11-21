@@ -503,3 +503,12 @@ fn inconclusive_scan_does_not_retire_a_streaming_run() {
         assert!(!events.is_closed());
     })
 }
+
+#[test]
+fn unknown_lifecycle_means_the_same_on_every_snapshot_path() {
+    let mut state = state(1);
+    state["state"] = json!("draining");
+    let expected = lifecycle(decode(state["state"].clone()).unwrap());
+    assert_eq!(expected, "unknown");
+    assert_eq!(decode::<StateSnapshot>(state).unwrap().state, expected);
+}

@@ -311,6 +311,7 @@ fn merging_terminal_replays_is_idempotent() {
 #[test]
 fn both_eviction_limits_keep_in_flight_records() {
     let shared = Shared {
+        join_slot: tokio::sync::Semaphore::new(1),
         data: Mutex::default(),
         changes: broadcast::channel(1).0,
     };
@@ -451,5 +452,22 @@ fn unadvertised_reads_remain_polling_without_opening_connections() {
         let _newly_supported = s.open("a").await;
         assert!(s.calls.next().now_or_never().is_none());
         v.shutdown().await;
+    })
+}
+
+#[test]
+fn joins_wait_before_opening_but_completed_streams_share_the_home() {
+    rt(async {
+        let (v, mut s) = Script::start();
+        *s.source.home.lock().unwrap() = vec![instance(80, "a", 0), instance(81, "b", 0)];
+        s.tick();
+        let a = s.ack("a", vec![]).await;
+        let first = s.page("a", None).await;
+        assert!(s.calls.next().now_or_never().is_none());
+        first.send(Ok(page(vec![], false))).unwrap();
+        let b = s.ack("b", vec![]).await;
+        assert!(!a.is_closed());
+        v.shutdown().await;
+        assert!(b.is_closed());
     })
 }

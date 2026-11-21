@@ -334,6 +334,7 @@ struct Store {
     ports: BTreeMap<u16, Entry>,
 }
 struct Shared {
+    join_slot: tokio::sync::Semaphore,
     data: Mutex<Store>,
     changes: broadcast::Sender<Change>,
 }
@@ -407,6 +408,9 @@ fn observation(run: &RunIdentity, frame: Option<Result<Value>>) -> Result<Observ
 }
 
 async fn follow(source: &dyn Source, shared: &Shared, port: u16, run: &RunIdentity) -> Result<()> {
+    // One staged window per home rather than one extra window per discovered run.
+    // Wait before subscribing so a queued join holds neither a socket nor an ack.
+    let permit = shared.join_slot.acquire().await.unwrap();
     let (ack, mut events) = source.subscribe(port, run).await?;
     let Opening {
         mut snapshot,
@@ -459,6 +463,7 @@ async fn follow(source: &dyn Source, shared: &Shared, port: u16, run: &RunIdenti
         }
     }
     shared.commit(port, cut, true, Some(snapshot));
+    drop(permit);
     loop {
         match observation(run, events.next().await)? {
             Observation::Request(r) => {
@@ -508,6 +513,7 @@ impl HomeView {
     }
     fn start(source: Arc<dyn Source>, ticks: BoxStream<'static, ()>) -> Self {
         let shared = Arc::new(Shared {
+            join_slot: tokio::sync::Semaphore::new(1),
             data: Mutex::default(),
             changes: broadcast::channel(128).0,
         });

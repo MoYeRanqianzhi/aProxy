@@ -65,7 +65,7 @@ pub fn registry_instances_in(run_dir: &std::path::Path) -> Vec<InstanceRecord> {
         {
             continue;
         }
-        if let Ok(content) = std::fs::read_to_string(entry.path())
+        if let Ok(content) = record_text(&entry.path())
             && let Some(info) = parse_instance_file(&content)
         {
             out.push(info);
@@ -87,7 +87,7 @@ pub fn registry_pids_in(run_dir: &std::path::Path) -> Vec<u32> {
 
 /// 读取单个端口的注册表记录（只读，不探活；不存在/读不懂 → None）。
 pub fn read_instance_file_in(run_dir: &std::path::Path, port: &str) -> Option<InstanceRecord> {
-    let content = std::fs::read_to_string(instance_file_path_in(run_dir, port)).ok()?;
+    let content = record_text(&instance_file_path_in(run_dir, port)).ok()?;
     parse_instance_file(&content)
 }
 
@@ -148,7 +148,7 @@ pub async fn survey_instances_in(dir: &std::path::Path) -> InstanceSurvey {
         {
             continue;
         }
-        let info = std::fs::read_to_string(entry.path())
+        let info = record_text(&entry.path())
             .ok()
             .and_then(|c| parse_instance_file(&c));
         // 读不懂的记录（损坏，或更新的版本写的）定位不了端口，跳过
@@ -206,7 +206,7 @@ pub fn registry_find_pid_in(dir: &std::path::Path, pid: u32) -> Option<InstanceR
         {
             return None;
         }
-        std::fs::read_to_string(entry.path())
+        record_text(&entry.path())
             .ok()
             .and_then(|c| parse_instance_file(&c))
             .filter(|info| info.pid == pid)
@@ -414,6 +414,19 @@ fn non_regular_record_is_an_io_error_not_bad_json() {
         read_record::<InstanceFile>(Path::new("/dev/null"), 1),
         Err(Unreadable::Io(_))
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn simple_registry_readers_also_reject_symlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let ordinary = dir.path().join("payload");
+    let record = serde_json::json!({"schema":1,"pid":71,"start":"s","instance_id":"r","version":"v","listen_addr":"127.0.0.1:80","base_url":"","started_at":1,"foreground":true});
+    std::fs::write(&ordinary, record.to_string()).unwrap();
+    std::os::unix::fs::symlink(&ordinary, instance_file_path_in(dir.path(), "80")).unwrap();
+    assert!(read_instance_file_in(dir.path(), "80").is_none());
+    assert!(registry_instances_in(dir.path()).is_empty());
+    assert!(registry_find_pid_in(dir.path(), 71).is_none());
 }
 
 /// 读一条带 `schema` 的记录文件，见 [`parse_record`]。

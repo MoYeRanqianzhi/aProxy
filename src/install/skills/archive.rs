@@ -148,6 +148,7 @@ fn replace(
 pub(super) fn install(home: &Path, zip: &Path, version: &str) -> io::Result<(Manifest, usize)> {
     let root = home.join("skills");
     crate::fsx::create_dir_all(&root)?;
+    super::installed::directory(&root)?;
     let stage = tempfile::Builder::new()
         .prefix(".staging-")
         .tempdir_in(&root)?;
@@ -155,11 +156,7 @@ pub(super) fn install(home: &Path, zip: &Path, version: &str) -> io::Result<(Man
     fs::create_dir(&src)?;
     let (m, ignored) = unpack(zip, &src, version)?;
     // 损坏的旧清单不能授权清理任何目录，但不妨碍重新安装修复当前这组文件。
-    let prev = fs::File::open(root.join(MARKER)).ok().and_then(|f| {
-        let mut buf = Vec::new();
-        f.take(MAX_MANIFEST + 1).read_to_end(&mut buf).ok()?;
-        Manifest::parse(&buf).ok()
-    });
+    let prev = super::installed::load(&root).ok();
     replace(&root, stage, &m, prev.as_ref())?;
     Ok((m, ignored))
 }

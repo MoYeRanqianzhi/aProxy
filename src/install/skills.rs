@@ -11,6 +11,7 @@
 //! rename 进 → 删旧；Windows 上 agent 正读 skill 文件的冲突短重试。
 
 pub mod archive;
+pub mod installed;
 pub mod manifest;
 
 use super::download::{self, Artifact, DownloadCtx};

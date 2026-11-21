@@ -193,3 +193,88 @@ fn zip_symlink_is_not_a_document() {
     w.finish().unwrap();
     assert!(archive::install(h.path(), &zip, "1.0.0").is_err());
 }
+
+/// 列表不读正文；随后即便被同长度的硬链接替换，输出路径也要重新核对原始字节。
+#[test]
+fn reads_only_the_current_verified_utf8_buffer() {
+    use super::installed::{Listing, list, show};
+    let h = tempfile::tempdir().unwrap();
+    let home = h.path();
+    let mut f = docs().to_vec();
+    f.push(("s/nonutf", b"\xff"));
+    assert!(matches!(list(home).unwrap(), Listing::Absent));
+    fs::create_dir_all(home.join("skills/old")).unwrap();
+    assert!(matches!(list(home).unwrap(), Listing::Legacy));
+    let zip = package(home, Some(&manifest_for(&f)), &f);
+    archive::install(home, &zip, "1.0.0").unwrap();
+    assert!(
+        matches!(list(home).unwrap(),Listing::Installed(s) if s.len()==3 && !s[0].matches_binary)
+    );
+    assert_eq!(show(home, "aproxy-cli", None).unwrap(), f[0].1);
+    assert!(show(home, "aproxy-cli/references", Some("a.md")).is_err());
+    assert!(show(home, "APROXY-cli", None).is_err());
+    assert!(show(home, "s", Some("nonutf")).is_err());
+    let doc = home.join("skills").join(f[0].0);
+    fs::remove_file(&doc).unwrap();
+    let secret = home.join("other");
+    fs::write(&secret, b"other").unwrap();
+    fs::hard_link(&secret, &doc).unwrap();
+    let err = show(home, "aproxy-cli", None).unwrap_err().to_string();
+    assert!(err.contains("aproxy skill install") && !err.contains("other"));
+}
+/// 目标内容完全匹配也不允许文件链接或目录链接；Windows 无建链接权限时明确报告跳过。
+#[test]
+fn rejects_link_at_file_manifest_and_root() {
+    use super::installed::{list, show};
+    #[cfg(unix)]
+    use std::os::unix::fs::{symlink as link_file, symlink as link_dir};
+    #[cfg(windows)]
+    use std::os::windows::fs::{symlink_dir as link_dir, symlink_file as link_file};
+    let h = tempfile::tempdir().unwrap();
+    let home = h.path();
+    let f = docs();
+    let zip = package(home, Some(&manifest_for(&f)), &f);
+    archive::install(home, &zip, "1.0.0").unwrap();
+    let root = home.join("skills");
+    let doc = root.join(f[0].0);
+    let target = home.join("original");
+    fs::rename(&doc, &target).unwrap();
+    if let Err(e) = link_file(&target, &doc) {
+        eprintln!("跳过符号链接检查：{e}");
+        return;
+    }
+    assert!(show(home, "aproxy-cli", None).is_err());
+    fs::remove_file(&doc).unwrap();
+    fs::rename(&target, &doc).unwrap();
+    let marker = root.join(MARKER);
+    fs::rename(&marker, &target).unwrap();
+    link_file(&target, &marker).unwrap();
+    assert!(list(home).is_err());
+    fs::remove_file(&marker).unwrap();
+    fs::rename(&target, &marker).unwrap();
+    fs::rename(&root, &target).unwrap();
+    link_dir(&target, &root).unwrap();
+    assert!(show(home, "aproxy-cli", None).is_err());
+}
+/// Windows 的目录联接可以将清单中的整棵子树重定向，即使内容一样也不能跟随。
+#[test]
+#[cfg(windows)]
+fn rejects_junction_inside_skill() {
+    let h = tempfile::tempdir().unwrap();
+    let home = h.path();
+    let f = docs();
+    let zip = package(home, Some(&manifest_for(&f)), &f);
+    archive::install(home, &zip, "1.0.0").unwrap();
+    let dir = home.join("skills/aproxy-cli/references");
+    let other = home.join("references");
+    fs::rename(&dir, &other).unwrap();
+    let result=std::process::Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command","$ErrorActionPreference='Stop'; New-Item -ItemType Junction -Path $env:TEST_LINK -Target $env:TEST_TARGET | Out-Null"]).env("TEST_LINK",dir).env("TEST_TARGET",other).output().unwrap();
+    if !result.status.success() {
+        eprintln!(
+            "跳过目录联接检查：{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
+    assert!(super::installed::show(home, "aproxy-cli", Some("references/a.md")).is_err());
+}

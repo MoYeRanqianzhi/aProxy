@@ -8,7 +8,7 @@ use serde_json::json;
 #[test]
 fn discovery_secrets_and_desire_tokens_are_bound_to_the_home_and_window() {
     let home = TestHome::new();
-    let host = DesktopHome::new(home.path().into()).unwrap();
+    let host = DesktopHome::new(home.path().into(), env!("CARGO_BIN_EXE_aproxy").into()).unwrap();
     let port = free_port();
     let file = home.path().join("test.toml");
     std::fs::write(&file,"base_url='https://api.invalid'\nproxy='http://user:pa%22ssword-long@proxy.invalid/?q=query-credential'\napi_key='file-credential'\n[extra_headers]\nx-safe-name='header-credential'\n").unwrap();
@@ -53,7 +53,7 @@ fn discovery_secrets_and_desire_tokens_are_bound_to_the_home_and_window() {
     }
     let token = f.restore.unwrap();
     assert_eq!(Some(token.clone()), observe(&host).restore);
-    let other = DesktopHome::new(home.path().into()).unwrap();
+    let other = DesktopHome::new(home.path().into(), env!("CARGO_BIN_EXE_aproxy").into()).unwrap();
     assert_ne!(Some(token.clone()), observe(&other).restore);
     desired.overrides.api_key = Some("different-credential".into());
     spec::write_restore_in(&run, &port.to_string(), &desired).unwrap();
@@ -112,4 +112,146 @@ async fn explicit_home_control_keeps_the_selected_process_alive_on_identity_mism
     assert!(
         aproxy::daemon::wait_until_gone_in(&dir, port, std::time::Duration::from_secs(12)).await
     );
+}
+
+#[tokio::test]
+async fn window_operations_refuse_stale_choices_replaced_runs_and_responsive_force() {
+    use aproxy_ipc::desktop::{ChoiceKind, Fault, InstanceOps};
+    let home = TestHome::new();
+    home.settings(r#"{"watchdog":{"enabled":false},"aliases":{"primary":"unused"}}"#);
+    let file = home.path().join("config.toml");
+    std::fs::write(
+        &file,
+        "base_url='http://127.0.0.1:9'\nlisten_addr='127.0.0.1:0'\napi_key='test-private-key'\n",
+    )
+    .unwrap();
+    let host = DesktopHome::new(home.path().into(), env!("CARGO_BIN_EXE_aproxy").into()).unwrap();
+    let ops: &dyn InstanceOps = &host;
+    let first = ops.list_configs().await.unwrap();
+    let stale = first[0].target.clone();
+    let fresh = ops.list_configs().await.unwrap();
+    assert!(matches!(
+        ops.start_instance(stale).await,
+        Err(Fault::DesktopChanged {})
+    ));
+    let start = fresh
+        .iter()
+        .find(|o| o.target.kind == ChoiceKind::Default)
+        .unwrap();
+    let one = ops.start_instance(start.target.clone()).await.unwrap();
+    home.stop_on_drop(one.port);
+    assert!(matches!(
+        ops.force_stop_instance(one.clone()).await,
+        Err(Fault::DesktopForceRefused { .. })
+    ));
+    let two = ops.restart_instance(one.clone()).await.unwrap();
+    home.stop_on_drop(two.port);
+    assert_ne!(one.instance_id, two.instance_id);
+    assert!(matches!(
+        ops.stop_instance(one.clone()).await,
+        Err(Fault::DesktopChanged {})
+    ));
+    assert!(matches!(
+        ops.restart_instance(one.clone()).await,
+        Err(Fault::DesktopChanged {})
+    ));
+    assert!(matches!(
+        ops.force_stop_instance(one).await,
+        Err(Fault::DesktopChanged {})
+    ));
+    let dir = home.path().join("run");
+    let p = two.port.to_string();
+    let saved = spec::read_restore_in(&dir, &p).unwrap().unwrap().spec;
+    assert_eq!(
+        aproxy::daemon::ipc_ping_in(&dir, &p)
+            .await
+            .unwrap()
+            .instance
+            .instance_id,
+        two.instance_id
+    );
+    ops.stop_instance(two.clone()).await.unwrap();
+    assert!(matches!(
+        ops.forget_restore(two.port, String::new()).await,
+        Err(Fault::DesktopTarget {})
+    ));
+    spec::write_restore_in(&dir, &p, &saved).unwrap();
+    let sample = aproxy_ipc::enumerate::enumerate_in(home.path())
+        .await
+        .instances;
+    let observe = || {
+        host.inspect(&sample)
+            .remove(&two.port)
+            .unwrap()
+            .restore
+            .unwrap()
+    };
+    let token = observe();
+    let mut other = saved.clone();
+    other.overrides.api_key = Some("replaced-private-key".into());
+    spec::write_restore_in(&dir, &p, &other).unwrap();
+    assert!(matches!(
+        ops.forget_restore(two.port, token.clone()).await,
+        Err(Fault::DesktopChanged {})
+    ));
+    assert!(matches!(
+        ops.restore_instance(two.port, token).await,
+        Err(Fault::DesktopChanged {})
+    ));
+    let three = ops.restore_instance(two.port, observe()).await.unwrap();
+    home.stop_on_drop(three.port);
+    ops.stop_instance(three).await.unwrap();
+    spec::write_restore_in(&dir, &p, &saved).unwrap();
+    ops.forget_restore(two.port, observe()).await.unwrap();
+    assert!(spec::read_restore_in(&dir, &p).unwrap().is_none());
+}
+
+#[test]
+fn unresponsive_test_child() {
+    if std::env::var_os("APROXY_TEST_SLEEP_FOR_PARENT").is_some() {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+}
+
+#[tokio::test]
+async fn force_targets_only_the_owned_unresponsive_test_process() {
+    use aproxy_ipc::desktop::{InstanceOps, Run};
+    let home = TestHome::new();
+    let port = free_port();
+    let dir = home.path().join("run");
+    let mut child = home
+        .cmd_with(std::env::current_exe().unwrap())
+        .args(["--exact", "unresponsive_test_child"])
+        .env("APROXY_TEST_SLEEP_FOR_PARENT", "1")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let start = aproxy_ipc::ledger::start_marker(pid).unwrap();
+    let id = "aced000000000001".to_owned();
+    let rec = aproxy::daemon::InstanceRecord {
+        pid,
+        start,
+        instance_id: id.clone(),
+        version: "0.2.0".into(),
+        listen_addr: format!("127.0.0.1:{port}"),
+        config_path: None,
+        base_url: "http://127.0.0.1:9".into(),
+        started_at: 1,
+        log_path: None,
+        foreground: false,
+    };
+    aproxy::daemon::write_instance_file_in(&dir, &rec).unwrap();
+    let host = DesktopHome::new(home.path().into(), env!("CARGO_BIN_EXE_aproxy").into()).unwrap();
+    let result = host
+        .force_stop_instance(Run {
+            port,
+            instance_id: id,
+        })
+        .await;
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    child.wait().unwrap();
+    result.unwrap();
+    assert!(aproxy::daemon::read_instance_file_in(&dir, &port.to_string()).is_none());
 }

@@ -746,7 +746,7 @@ pub type Task<'a, T> = Pin<Box<dyn Future<Output = R<T>> + Send + 'a>>;
 pub type Progress = Arc<dyn Fn(Job) + Send + Sync>;
 /// Operations of one explicitly bound home. Implemented by the application library;
 /// the Tauri shell knows neither the private configuration nor how to launch a process.
-pub trait DesktopOps: Send + Sync + 'static {
+pub trait InstanceOps: Send + Sync + 'static {
     /// Enumerate discovered TOMLs, configured aliases including outside scan directories, and the default target.
     fn list_configs(&self) -> Task<'_, Vec<Choice>>;
     /// Re-resolve the offered choice inside this home, run the CLI's start preflight, launch with the running executable; return the verified run actually ready.
@@ -761,6 +761,10 @@ pub trait DesktopOps: Send + Sync + 'static {
     fn restore_instance(&self, port: u16, expected_restore: Token) -> Task<'_, Run>;
     /// Resolve only this port’s pending desire in the supplied home.
     fn forget_restore(&self, port: u16, expected_restore: Token) -> Task<'_, ()>;
+}
+/// Complete window service. Instance operations share the same home and authority
+/// boundary as the configuration, update and registration methods.
+pub trait DesktopOps: InstanceOps {
     /// Resolve allowed target afresh; resolve effective file layers exactly as the CLI (not a dump of live process memory).
     fn read_config(&self, target: ConfigTarget) -> Task<'_, ConfigView>;
     /// Validate typed patch against the on-disk target/defaults in memory.

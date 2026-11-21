@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-forget-restore"
+description = "Enables the forget_restore command without any pre-configured scope."
+commands.allow = ["forget_restore"]
+
+[[permission]]
+identifier = "deny-forget-restore"
+description = "Denies the forget_restore command without any pre-configured scope."
+commands.deny = ["forget_restore"]

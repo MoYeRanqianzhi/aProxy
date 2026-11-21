@@ -551,3 +551,108 @@ pub(crate) fn cancel_detail(request: Request<'_>, b: State<'_, Arc<Bridge>>) -> 
     }
     Ok(())
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TargetArgs {
+    target: StartTarget,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunArgs {
+    run: Run,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DesireArgs {
+    port: u16,
+    expected_restore: Token,
+}
+
+/// 列举宿主认可的启动目标，显示路径不是操作参数。
+#[tauri::command]
+pub(crate) async fn list_configs(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn InstanceOps>>,
+) -> R<Vec<Choice>> {
+    let _: Empty = args(&request)?;
+    ops.list_configs().await
+}
+
+/// 从授权选择启动；返回实际就绪实例而不是请求里的身份。
+#[tauri::command]
+pub(crate) async fn start_instance(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn InstanceOps>>,
+    b: State<'_, Arc<Bridge>>,
+) -> R<Run> {
+    let a: TargetArgs = args(&request)?;
+    let result = ops.start_instance(a.target).await;
+    b.view.rescan();
+    result
+}
+
+/// 只停止仍与页面观察相符的一代实例。
+#[tauri::command]
+pub(crate) async fn stop_instance(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn InstanceOps>>,
+    b: State<'_, Arc<Bridge>>,
+) -> R<()> {
+    let a: RunArgs = args(&request)?;
+    let result = ops.stop_instance(a.run).await;
+    b.view.rescan();
+    result
+}
+
+/// 重新核验、预检、停旧实例，返回实际启动的新一代。
+#[tauri::command]
+pub(crate) async fn restart_instance(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn InstanceOps>>,
+    b: State<'_, Arc<Bridge>>,
+) -> R<Run> {
+    let a: RunArgs = args(&request)?;
+    let result = ops.restart_instance(a.run).await;
+    b.view.rescan();
+    result
+}
+
+/// 只有仍不应答且进程身份可以核验的实例才允许强制停止。
+#[tauri::command]
+pub(crate) async fn force_stop_instance(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn InstanceOps>>,
+    b: State<'_, Arc<Bridge>>,
+) -> R<()> {
+    let a: RunArgs = args(&request)?;
+    let result = ops.force_stop_instance(a.run).await;
+    b.view.rescan();
+    result
+}
+
+/// 按当前端口的已观察到的期望状态恢复，而非按路径启动。
+#[tauri::command]
+pub(crate) async fn restore_instance(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn InstanceOps>>,
+    b: State<'_, Arc<Bridge>>,
+) -> R<Run> {
+    let a: DesireArgs = args(&request)?;
+    let result = ops.restore_instance(a.port, a.expected_restore).await;
+    b.view.rescan();
+    result
+}
+
+/// 只撤销同一端口未被替换的期望，不停止进程。
+#[tauri::command]
+pub(crate) async fn forget_restore(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn InstanceOps>>,
+    b: State<'_, Arc<Bridge>>,
+) -> R<()> {
+    let a: DesireArgs = args(&request)?;
+    let result = ops.forget_restore(a.port, a.expected_restore).await;
+    b.view.rescan();
+    result
+}

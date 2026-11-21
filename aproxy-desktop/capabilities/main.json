@@ -20,6 +20,13 @@
     "allow-query-logs",
     "allow-request-detail",
     "allow-body-chunk",
-    "allow-cancel-detail"
+    "allow-cancel-detail",
+    "allow-list-configs",
+    "allow-start-instance",
+    "allow-stop-instance",
+    "allow-restart-instance",
+    "allow-force-stop-instance",
+    "allow-restore-instance",
+    "allow-forget-restore"
   ]
 }

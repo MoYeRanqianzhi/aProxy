@@ -341,13 +341,46 @@ async fn shutdown_for_restart(
 /// 或看护者关着），删掉记录，restore 与看护者就不再拉它。返回是否删了记录。
 /// 端口上还有实例进程（包括不应答的）时不动：那要先把进程停下。
 pub async fn forget_stopped_port(port: &str) -> bool {
-    let run_dir = daemon::run_dir();
-    if aproxy_ipc::registry::port_has_instance_in(&run_dir, port).await {
-        return false;
+    forget_port_in(&daemon::run_dir(), port, None).await == Forget::Removed
+}
+
+/// 端口的期望记录不同于正在运行的进程；核验之后只删除前者。
+#[derive(PartialEq, Eq)]
+pub enum Forget {
+    /// 已删除选中的期望记录。
+    Removed,
+    /// 已经没有记录。
+    Absent,
+    /// 端口已有实例、期望被替换、或无法确认所有权。
+    Changed,
+    /// 仍是选中的记录，但操作系统拒绝删除。
+    Failed,
+}
+
+/// 带上观察时的整份记录可拒绝删除后继实例的期望；CLI 直接按端口操作则不给前置条件。
+pub async fn forget_port_in(
+    run_dir: &std::path::Path,
+    port: &str,
+    expected: Option<&crate::spec::RestoreEntry>,
+) -> Forget {
+    if aproxy_ipc::registry::port_has_instance_in(run_dir, port).await {
+        return Forget::Changed;
     }
-    let had = crate::spec::restore_path_in(&run_dir, port).is_file();
-    crate::spec::remove_restore_in(&run_dir, port);
-    had
+    if let Some(expected) = expected {
+        match crate::spec::read_restore_in(run_dir, port) {
+            Ok(Some(e)) if &e == expected => {}
+            Ok(None) => return Forget::Absent,
+            _ => return Forget::Changed,
+        }
+    }
+    let path = crate::spec::restore_path_in(run_dir, port);
+    let existed = path.is_file();
+    match std::fs::remove_file(path) {
+        Ok(()) => Forget::Removed,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Forget::Absent,
+        Err(_) if expected.is_none() && existed => Forget::Removed,
+        Err(_) => Forget::Failed,
+    }
 }
 
 /// stop 一个按配置文件（别名或路径）指定、已经不在运行的目标：删掉规格指向这个配置文件、

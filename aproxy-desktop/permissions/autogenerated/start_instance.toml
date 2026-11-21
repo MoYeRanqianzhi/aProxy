@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-start-instance"
+description = "Enables the start_instance command without any pre-configured scope."
+commands.allow = ["start_instance"]
+
+[[permission]]
+identifier = "deny-start-instance"
+description = "Denies the start_instance command without any pre-configured scope."
+commands.deny = ["start_instance"]

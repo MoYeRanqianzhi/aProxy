@@ -33,34 +33,56 @@ pub async fn restore_entry(entry: &RestoreEntry, exe: &Path) -> Restore {
 
 /// 从同一个主目录检查、拉起并交接端口记录，避免操作启动者环境里的另一套实例。
 pub async fn restore_entry_in(home: &Path, entry: &RestoreEntry, exe: &Path) -> Restore {
+    restore_current(home, entry, exe, false)
+        .await
+        .expect("按端口恢复不检查观察令牌")
+}
+
+/// 根据一次观察恢复，ping 之后、启动之前重读期望记录；等待期间发生的换代不是这次操作的目标。
+pub async fn restore_observed_in(home: &Path, entry: &RestoreEntry, exe: &Path) -> Option<Restore> {
+    restore_current(home, entry, exe, true).await
+}
+async fn restore_current(
+    home: &Path,
+    entry: &RestoreEntry,
+    exe: &Path,
+    compare: bool,
+) -> Option<Restore> {
     let run_dir = home.join("run");
     // 幂等：记录存在而实例已在运行时，不重复启动
     if daemon::ipc_ping_in(&run_dir, &entry.port).await.is_ok() {
-        return Restore::AlreadyRunning;
+        return Some(Restore::AlreadyRunning);
+    }
+    if compare
+        && !matches!(crate::spec::read_restore_in(&run_dir,&entry.port),Ok(Some(ref e)) if e==entry)
+    {
+        return None;
     }
     // 没有配置文件的规格（只靠覆盖参数与全局默认启动的实例）不做这项检查
     if let Some(cfg) = entry.spec.config_file()
         && !cfg.exists()
     {
-        return Restore::ConfigMissing {
+        return Some(Restore::ConfigMissing {
             config: cfg.display().to_string(),
-        };
+        });
     }
     // 就绪的判定按新 pid 在注册表里定位实际端口（见 crate::spawn）。不能 ping 记录里的
     // 端口：实例监听哪个端口由它此刻读到的配置决定——用户改了 config.toml 的端口却没
     // restart，新实例就落在别的端口，ping 原端口只会误报「未就绪」
-    match spawn::spawn_from_spec(home, exe, &entry.spec, spawn::READY_TIMEOUT).await {
-        Ok(live) => {
-            let port = daemon::port_of(&live.instance.listen_addr).to_string();
-            // 实例落在新端口：它已按实际端口写了自己的记录，原端口那份被接替。不删的话
-            // stop 新端口之后，下一次 restore（或看护者）会凭旧记录把实例再拉起来
-            let moved = daemon::retire_moved_port_records_in(&run_dir, &entry.port, &port);
-            Restore::Restored {
-                pid: live.instance.pid,
-                port,
-                moved,
+    Some(
+        match spawn::spawn_from_spec(home, exe, &entry.spec, spawn::READY_TIMEOUT).await {
+            Ok(live) => {
+                let port = daemon::port_of(&live.instance.listen_addr).to_string();
+                // 实例落在新端口：它已按实际端口写了自己的记录，原端口那份被接替。不删的话
+                // stop 新端口之后，下一次 restore（或看护者）会凭旧记录把实例再拉起来
+                let moved = daemon::retire_moved_port_records_in(&run_dir, &entry.port, &port);
+                Restore::Restored {
+                    pid: live.instance.pid,
+                    port,
+                    moved,
+                }
             }
-        }
-        Err(e) => Restore::Failed(e),
-    }
+            Err(e) => Restore::Failed(e),
+        },
+    )
 }

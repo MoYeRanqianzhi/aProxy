@@ -1,4 +1,5 @@
 //! 绑定单个主目录的桌面业务逻辑。私有文件只在宿主侧打开，界面只见字段投影与不透明令牌。
+mod instances;
 use crate::{config, settings, spec};
 use aproxy_ipc::{
     desktop::{Fault, LocalFacts, R},
@@ -17,21 +18,31 @@ use std::{
 pub struct DesktopHome {
     home: PathBuf,
     key: [u8; 32],
+    exe: PathBuf,
+    listing: std::sync::Mutex<Option<[u8; 16]>>,
 }
 impl DesktopHome {
     /// 启动命令传入已解析的绝对目录；不借助修改全局环境隔离不同窗口。
-    pub fn new(home: PathBuf) -> R<Self> {
-        if !home.is_absolute() {
+    pub fn new(home: PathBuf, exe: PathBuf) -> R<Self> {
+        if !home.is_absolute() || !exe.is_absolute() {
             return Err(Fault::DesktopBadInput {});
         }
         let mut key = [0; 32];
         getrandom::fill(&mut key).map_err(|_| Fault::DesktopUnavailable {})?;
-        Ok(Self { home, key })
+        Ok(Self {
+            home,
+            key,
+            exe,
+            listing: Default::default(),
+        })
     }
     fn restore_token(&self, entry: &spec::RestoreEntry) -> String {
         // 外层只有固定长度的随机密钥与内部摘要，原始序列化及其无密钥散列均不离开宿主。
         let bytes = serde_json::to_vec(&(&entry.port, entry.written_at, &entry.spec))
             .expect("实例规格可序列化");
+        self.token(&bytes)
+    }
+    fn token(&self, bytes: &[u8]) -> String {
         let digest = Sha256::new()
             .chain_update(self.key)
             .chain_update(Sha256::digest(bytes))

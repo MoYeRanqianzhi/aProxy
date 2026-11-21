@@ -13,6 +13,7 @@ pub(crate) mod logs;
 pub(crate) mod restart;
 pub(crate) mod restore;
 pub(crate) mod settings;
+pub(crate) mod skill;
 pub(crate) mod start;
 pub(crate) mod status;
 pub(crate) mod stop;
@@ -44,6 +45,13 @@ impl JsonOutput {
             Commands::Install(a) if a.json && !a.check => return Some(Self::InstallEvents),
             Commands::Install(a) => a.json,
             Commands::Start(a) => a.json,
+            Commands::Skill {
+                cmd:
+                    aproxy::cli::SkillCmd::Install { json, .. } | aproxy::cli::SkillCmd::List { json },
+            } => *json,
+            Commands::Skill {
+                cmd: aproxy::cli::SkillCmd::Show { .. },
+            } => false,
             Commands::Stop { json, .. }
             | Commands::Restart { json, .. }
             | Commands::Restore { json }
@@ -393,7 +401,7 @@ mod tests {
 
     #[test]
     fn skills_only_accepts_a_version() {
-        // latest 查询失败时的提示让用户改用「--skills-only <具体版本号>」，
+        // 旧安装器可能显式传版本；解析时接受，由命令检查它是否就是当前版本，
         // 解析层必须接受这种写法
         assert!(
             aproxy::cli::Cli::try_parse_from(["aproxy", "install", "0.1.0", "--skills-only"])

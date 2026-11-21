@@ -311,16 +311,12 @@ async fn drive_with_skill(
 ) -> Result<FlowExit, InstallFailure> {
     let settings = crate::settings::load();
     let mut skill_handle = None;
-    if skill_enabled
-        && settings.skill_auto_update
-        && let Ok(ctx) = super::download::DownloadCtx::build(version, download_proxy, None)
-    {
+    if skill_enabled && settings.skill_auto_update {
+        let ctx = super::download::DownloadCtx::build(version, download_proxy, None);
         let chain = super::download::effective_chain(&settings);
         let home_buf = home.to_path_buf();
-        let version_buf = version.to_string();
         skill_handle = Some(tokio::spawn(async move {
-            let outcome = super::skills::update_skills(&ctx, &chain, &home_buf).await;
-            (outcome, version_buf)
+            super::skills::install(&ctx?, &chain, &home_buf).await
         }));
     }
 
@@ -333,14 +329,24 @@ async fn drive_with_skill(
         let joined = tokio::time::timeout(std::time::Duration::from_secs(90), handle).await;
         // 只在状态文件仍归本进程时补写：交棒之后它归接手者，这里的「读出 → 改
         // skill → 写回」会用旧内容盖掉接手者刚推进的阶段
-        if let Ok(Ok((outcome, ver))) = joined
-            && let Some(mut st) = super::state::load_in(home)
+        let phase = match joined {
+            Ok(Ok(Ok(_))) => super::state::SkillPhase::Done,
+            Ok(Ok(Err(e))) => {
+                tracing::warn!(error=%e,"skill 未更新，不影响二进制安装；请执行 aproxy skill install 重试");
+                super::state::SkillPhase::Failed
+            }
+            _ => {
+                tracing::warn!("skill 更新未完成，请执行 aproxy skill install 重试");
+                return result;
+            }
+        };
+        if let Some(mut st) = super::state::load_in(home)
             && st.installer_pid == std::process::id()
         {
             st.skill = Some(super::state::SkillState {
-                status: outcome.phase,
-                attempt: outcome.attempt,
-                version: ver,
+                status: phase,
+                attempt: 1,
+                version: version.to_owned(),
             });
             let _ = super::state::write_in(home, &mut st);
         }

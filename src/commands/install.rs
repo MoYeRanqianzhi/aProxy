@@ -183,9 +183,24 @@ async fn install(args: InstallArgs) {
     }
 
     // --skills-only：只更新 skill 文档（不动二进制、不建安装状态机）。
-    // skill 上次 failed 后的单独重试入口；无参版本默认 latest。
+    // 同版本的旧写法仍可用，不能为当前二进制装入另一版的文档。
     if args.skills_only {
-        return run_skills_only(&args).await;
+        if args
+            .version
+            .as_deref()
+            .is_some_and(|v| v != env!("CARGO_PKG_VERSION"))
+        {
+            eprintln!(
+                "skill 描述的是当前二进制，只能安装 {} 的文档。要使用新版文档，请先升级 aProxy。",
+                env!("CARGO_PKG_VERSION")
+            );
+            crate::util::exit(i32::from(aproxy_ipc::code::EXIT_USAGE));
+        }
+        let code = super::skill::install(args.download_proxy.as_deref(), false).await;
+        if code != 0 {
+            crate::util::exit(i32::from(code));
+        }
+        return;
     }
 
     // --from <路径>：目标版本 = 源二进制自报版本；版本下限与在线安装同一道
@@ -394,77 +409,6 @@ async fn run_check(args: &InstallArgs) {
             }
         }
         super::print_doc(doc);
-    }
-}
-
-/// --skills-only：只更新 skill 文档。版本默认 latest（按通道取最大，同
-/// 二进制安装）；通道内无版本时取当前运行版本（skill 与在跑的二进制对齐
-/// 是最合理的退路）。settings download_chain 与 --download-proxy 与主流程
-/// 同一语义。成功后输出落位位置与「安装到 agent 目录由用户/agent 自行链接」
-/// 提示。
-async fn run_skills_only(args: &InstallArgs) {
-    let home = aproxy_ipc::home::home();
-    let settings = aproxy::settings::load();
-    let proxy = args
-        .download_proxy
-        .as_deref()
-        .or(settings.download_proxy.as_deref());
-    let ctx = match aproxy::install::download::DownloadCtx::build(
-        env!("CARGO_PKG_VERSION"),
-        proxy,
-        args.cpu.as_deref(),
-    ) {
-        Ok(c) => c,
-        Err(e) => fail(InstallFailure::new("install_download_failed", e)),
-    };
-    let version = match args.version.as_deref() {
-        None | Some("latest") => {
-            let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
-                .expect("内置版本号必为合法 semver");
-            let channel = aproxy::install::download::Channel::resolve(args.pre, &current);
-            match query_latest(
-                &ctx,
-                channel,
-                aproxy::install::download::Artifact::Skills,
-                false,
-            )
-            .await
-            {
-                Ok(Some(v)) => v.version,
-                Ok(None) => {
-                    println!(
-                        "{} 通道暂无可用版本，skill 按当前版本 {current} 更新。",
-                        channel.label()
-                    );
-                    current.to_string()
-                }
-                Err(gh_err) => {
-                    eprintln!("[ERROR] {gh_err}");
-                    eprintln!("可尝试：--skills-only <具体版本号>（跳过 latest 查询）。");
-                    crate::util::exit(
-                        InstallFailure::new("install_download_failed", gh_err).exit_code(),
-                    );
-                }
-            }
-        }
-        Some(v) => v.to_string(),
-    };
-    let mut ctx = ctx;
-    ctx.version = version.clone();
-    println!("开始更新 skill 文档（版本 {version}）...");
-    let chain = aproxy::install::download::effective_chain(&settings);
-    match aproxy::install::skills::update_skills(&ctx, &chain, &home).await {
-        outcome if outcome.phase == aproxy::install::state::SkillPhase::Done => {
-            println!(
-                "skill 更新完成：{}\n安装到 agent 的 skills 目录由您自行链接（install 不越界触碰各 agent 的目录）：\n  例如 Claude Code: mklink /D ~/.claude/skills/aproxy-cli \"%USERPROFILE%\\.aproxy\\skills\\aproxy-cli\"",
-                aproxy::install::skills::skill_dir_in(&home).display()
-            );
-        }
-        outcome => {
-            fail(outcome.failure.expect("失败结局带原因").with_message(
-                "skill 更新失败（非强制支线，二进制安装不受影响）。可重试本命令或检查下载链条/代理配置。".into(),
-            ));
-        }
     }
 }
 

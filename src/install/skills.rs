@@ -15,24 +15,7 @@ pub mod installed;
 pub mod manifest;
 
 use super::download::{self, Artifact, DownloadCtx};
-use crate::install::state::SkillPhase;
-use std::path::{Path, PathBuf};
-
-/// skill 安装目录：`~/.aproxy/skills/aproxy-cli/`（agent 侧目录归各 agent
-/// 管，install 只落规范位置——链接/复制到 agent 的 skills 目录由用户/agent
-/// 自行执行，落位后输出提示）。
-pub fn skill_dir_in(home: &Path) -> PathBuf {
-    home.join("skills").join("aproxy-cli")
-}
-
-/// 支线任务结果（终态，写入 install.state.skill）。
-#[derive(Debug)]
-pub struct SkillOutcome {
-    pub phase: SkillPhase,
-    pub attempt: u32,
-    /// 单独执行 skill 更新时按失败码退出；随二进制安装的支线只记阶段。
-    pub failure: Option<super::InstallFailure>,
-}
+use std::path::Path;
 
 /// 从下载开始直到发布完成一直持有独立的文件锁；进程退出后内核释放，不按 pid 猜测过期。
 fn skill_lock(home: &Path) -> Result<super::InstallLock, String> {
@@ -66,40 +49,9 @@ pub async fn install(
     Ok(manifest.files.len())
 }
 
-/// 支线失败只更新自己的终态，不改变二进制安装的结果。下载链已负责逐级重试。
-pub async fn update_skills(
-    ctx: &DownloadCtx,
-    chain: &[download::ChainStep],
-    home: &Path,
-) -> SkillOutcome {
-    match install(ctx, chain, home).await {
-        Ok(_) => SkillOutcome {
-            phase: SkillPhase::Done,
-            attempt: 1,
-            failure: None,
-        },
-        Err(e) => {
-            tracing::warn!(error=%e,"skill 未更新，不影响二进制安装；请执行 aproxy skill install 重试");
-            SkillOutcome {
-                phase: SkillPhase::Failed,
-                attempt: 1,
-                failure: Some(e),
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn skill_dir_is_home_derived() {
-        assert_eq!(
-            skill_dir_in(Path::new("/tmp/h")),
-            Path::new("/tmp/h/skills/aproxy-cli")
-        );
-    }
 
     /// 随发布出去的每个 skill（仓库的 `.claude/skills/*/SKILL.md`），description 都不超过
     /// 1024 个字符：这是 Agent Skills 规范与 skill-creator 校验的上限，按上限校验的客户端

@@ -212,6 +212,13 @@ pub enum Commands {
     #[command(visible_alias = "upgrade")]
     Install(InstallArgs),
 
+    /// 安装、列出或读取与 aProxy 配套的 skill 文档
+    Skill {
+        /// 对 skill 文档执行的操作，不改动二进制。
+        #[command(subcommand)]
+        cmd: SkillCmd,
+    },
+
     /// 查看或修改一份配置文件（默认是 ~/.aproxy/config.toml；--config 指定别的）
     Config(ConfigArgs),
 
@@ -353,10 +360,8 @@ pub struct InstallArgs {
     #[arg(long)]
     pub no_skills: bool,
 
-    /// 只更新 skill 文档，不动二进制（跳过整个安装状态机；skill 上次
-    /// failed 后的单独重试入口）。可同时给出 VERSION 指定 skill 版本
-    /// （默认 latest，查询失败时报错提示改用具体版本号）
-    #[arg(long, conflicts_with_all = ["from", "adopt", "abort"])]
+    /// 只安装与当前二进制同版本的 skill；保留已发布安装器给用户的命令行。
+    #[arg(long, hide = true, conflicts_with_all = ["from", "adopt", "abort"])]
     pub skills_only: bool,
 
     /// 只查询 install 会装哪个版本：打印当前版本、通道里的最新版本与有没有更新，
@@ -388,6 +393,37 @@ pub struct InstallArgs {
     /// 拉起新版本，是永久接口，见 install::flow 模块文档。勿手动使用。
     #[arg(long, hide = true, value_name = "PID", requires = "continue_")]
     pub handover_from: Option<u32>,
+}
+
+/// 文档的版本随二进制，不提供独立选版或切换通道的入口。
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum SkillCmd {
+    /// 安装当前版本的 skill 文档；upgrade 执行同一操作
+    #[command(visible_alias = "upgrade")]
+    Install {
+        /// 仅本次下载使用的代理 URL，优先于设置中的下载代理
+        #[arg(long, value_name = "URL")]
+        download_proxy: Option<String>,
+        /// 输出一个 JSON 文档（给程序读）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出已安装的 skill、版本、位置和文件
+    List {
+        /// 输出一个 JSON 文档（给程序读）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 读取并核对清单中的文件，默认读取 SKILL.md
+    Show {
+        /// 清单中精确的 skill 名
+        name: String,
+        /// 相对 skill 目录的文件名，使用正斜杠
+        file: Option<String>,
+        /// 只列出这个 skill 的文件名
+        #[arg(long, conflicts_with = "file")]
+        files: bool,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]

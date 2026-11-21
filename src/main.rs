@@ -184,7 +184,12 @@ async fn run(cli: Cli) -> u8 {
     if !loaded.is_valid() && !reports_itself {
         let tolerated = matches!(
             cli.command,
-            Some(Commands::Status { .. } | Commands::Stop { .. } | Commands::Install(_))
+            Some(
+                Commands::Status { .. }
+                    | Commands::Stop { .. }
+                    | Commands::Install(_)
+                    | Commands::Skill { .. }
+            )
         );
         // 诊断接收端可能已经关闭；它不能让 stdout 上独立的命令结果也丢失。
         let level = if tolerated { "WARN" } else { "ERROR" };
@@ -266,6 +271,7 @@ async fn run(cli: Cli) -> u8 {
         Some(Commands::Config(args)) => commands::config::handle_config_cmd(args).await,
         Some(Commands::Settings { cmd }) => commands::settings::handle_settings_cmd(cmd).await,
         Some(Commands::Install(args)) => commands::install::handle_install_cmd(args).await,
+        Some(Commands::Skill { cmd }) => return commands::skill::run(cmd).await,
         Some(Commands::Desktop) => unreachable!("desktop 在 main 里、建运行时之前已经分派"),
         Some(Commands::Serve { .. } | Commands::Watchdog { .. }) => {
             unreachable!("内部入口在子命令分派之前已经处理")
@@ -321,6 +327,7 @@ fn resumes_install(command: &Commands) -> bool {
         | Commands::Find { .. }
         | Commands::Doctor { .. }
         | Commands::Install(_)
+        | Commands::Skill { .. }
         | Commands::Desktop
         | Commands::Serve { .. }
         | Commands::Watchdog { .. } => false,

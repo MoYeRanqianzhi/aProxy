@@ -13,7 +13,7 @@ fn record(b: &[u8]) -> Value {
     json!({"size":b.len(),"sha256":hex(&Sha256::digest(b))})
 }
 /// 小包带多个目录与嵌套文件，验证顶层目录不会再套一层。
-fn docs() -> [(&'static str, &'static [u8]); 3] {
+pub(super) fn docs() -> [(&'static str, &'static [u8]); 3] {
     [
         ("aproxy-cli/SKILL.md", b"# cli"),
         ("aproxy-cli/references/a.md", b"# reference"),
@@ -21,7 +21,7 @@ fn docs() -> [(&'static str, &'static [u8]); 3] {
     ]
 }
 /// 组装清单；未知属性也随原始清单保留。
-fn manifest_for(files: &[(&str, &[u8])]) -> Value {
+pub(super) fn manifest_for(files: &[(&str, &[u8])]) -> Value {
     let files: serde_json::Map<_, _> = files
         .iter()
         .map(|(k, b)| (k.to_string(), record(b)))
@@ -29,7 +29,7 @@ fn manifest_for(files: &[(&str, &[u8])]) -> Value {
     json!({"schema":1,"version":"1.0.0","files":files,"future":true})
 }
 /// 压缩正文与清单分开传入，以覆盖缺失、未列出、长度或摘要不一致等情况。
-fn package(home: &Path, manifest: Option<&Value>, files: &[(&str, &[u8])]) -> PathBuf {
+pub(super) fn package(home: &Path, manifest: Option<&Value>, files: &[(&str, &[u8])]) -> PathBuf {
     let path = home.join("test.zip");
     let mut w = zip::ZipWriter::new(fs::File::create(&path).unwrap());
     let opts = zip::write::SimpleFileOptions::default()
@@ -222,63 +222,6 @@ fn reads_only_the_current_verified_utf8_buffer() {
     let err = show(home, "aproxy-cli", None).unwrap_err().to_string();
     assert!(err.contains("aproxy skill install") && !err.contains("other"));
 }
-/// 目标内容完全匹配也不允许文件链接或目录链接；Windows 无建链接权限时明确报告跳过。
-#[test]
-fn rejects_link_at_file_manifest_and_root() {
-    use super::installed::{list, show};
-    #[cfg(unix)]
-    use std::os::unix::fs::{symlink as link_file, symlink as link_dir};
-    #[cfg(windows)]
-    use std::os::windows::fs::{symlink_dir as link_dir, symlink_file as link_file};
-    let h = tempfile::tempdir().unwrap();
-    let home = h.path();
-    let f = docs();
-    let zip = package(home, Some(&manifest_for(&f)), &f);
-    archive::install(home, &zip, "1.0.0").unwrap();
-    let root = home.join("skills");
-    let doc = root.join(f[0].0);
-    let target = home.join("original");
-    fs::rename(&doc, &target).unwrap();
-    if let Err(e) = link_file(&target, &doc) {
-        eprintln!("跳过符号链接检查：{e}");
-        return;
-    }
-    assert!(show(home, "aproxy-cli", None).is_err());
-    fs::remove_file(&doc).unwrap();
-    fs::rename(&target, &doc).unwrap();
-    let marker = root.join(MARKER);
-    fs::rename(&marker, &target).unwrap();
-    link_file(&target, &marker).unwrap();
-    assert!(list(home).is_err());
-    fs::remove_file(&marker).unwrap();
-    fs::rename(&target, &marker).unwrap();
-    fs::rename(&root, &target).unwrap();
-    link_dir(&target, &root).unwrap();
-    assert!(show(home, "aproxy-cli", None).is_err());
-}
-/// Windows 的目录联接可以将清单中的整棵子树重定向，即使内容一样也不能跟随。
-#[test]
-#[cfg(windows)]
-fn rejects_junction_inside_skill() {
-    let h = tempfile::tempdir().unwrap();
-    let home = h.path();
-    let f = docs();
-    let zip = package(home, Some(&manifest_for(&f)), &f);
-    archive::install(home, &zip, "1.0.0").unwrap();
-    let dir = home.join("skills/aproxy-cli/references");
-    let other = home.join("references");
-    fs::rename(&dir, &other).unwrap();
-    let result=std::process::Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command","$ErrorActionPreference='Stop'; New-Item -ItemType Junction -Path $env:TEST_LINK -Target $env:TEST_TARGET | Out-Null"]).env("TEST_LINK",dir).env("TEST_TARGET",other).output().unwrap();
-    if !result.status.success() {
-        eprintln!(
-            "跳过目录联接检查：{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        return;
-    }
-    assert!(super::installed::show(home, "aproxy-cli", Some("references/a.md")).is_err());
-}
-
 /// 两个写者同时竞争，拿锁者完成整包，另一个不碰它的工作区；旧进程残留的文件仍在原处。
 #[test]
 fn only_one_writer_publishes_and_stale_staging_is_ignored() {

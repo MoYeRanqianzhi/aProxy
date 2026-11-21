@@ -15,13 +15,31 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use aproxy_ipc::diag::{Diagnostic, Level};
-pub use aproxy_ipc::registry::Overrides;
-use serde::Serialize;
+
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::Config;
 use super::file::{self, Delivery, FileConfig};
 use crate::settings::Settings;
+
+/// 启动时在命令行上给的覆盖，优先于文件。
+///
+/// 它也是拉起规格（[`crate::spec::InstanceSpec`]）里 `overrides` 的落盘形式：字段名就是
+/// config.toml 的键，只写出给过的那些。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Overrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_file: Option<String>,
+}
 
 /// 一个键的值来自哪一层。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

@@ -1,6 +1,6 @@
 //! Home-scoped registry records and liveness probes. No function writes a record,
-//! removes a stale entry or terminates a process. Disk types describe the private
-//! launch format as well; they must not be used as UI DTOs.
+//! removes a stale entry or terminates a process. Discovery exposes only the restore configuration path,
+//! never launch overrides or the captured environment.
 use crate::{
     client::ipc_ping_in,
     wire::{InstanceRecord, InstanceStatus},
@@ -338,61 +338,11 @@ mod process_platform {
     }
 }
 
-/// 启动时在命令行上给的覆盖，优先于文件。
-///
-/// 它也是拉起规格（[`InstanceSpec`]）里 `overrides` 的落盘形式：字段名就是
-/// config.toml 的键，只写出给过的那些。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Overrides {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub listen_addr: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub log_file: Option<String>,
-}
-
 /// 本版本写出、也是本版本能读的最高记录格式版本。
 pub const SCHEMA: u32 = 1;
 
 /// 期望状态记录的文件名后缀：`<端口>.restore.json`。
 pub const RESTORE_SUFFIX: &str = ".restore.json";
-/// 拉起规格。
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct InstanceSpec {
-    pub schema: u32,
-    /// 配置文件的绝对路径。null = 没有配置文件，只靠覆盖参数与 settings.json 的全局默认
-    /// 启动；对这样的规格不做「配置文件还在不在」的检查
-    pub config_path: Option<String>,
-    /// 启动时在命令行上给过的覆盖，键就是 config.toml 的键
-    #[serde(default)]
-    pub overrides: Overrides,
-    /// 配置解析出的端口为 0（由系统分配）的实例，第一次启动后实际拿到的端口。再次拉起时，
-    /// 配置解析出的端口仍是 0 才用它：客户端配的是这个端口，恢复要回到同一个端口；配置
-    /// 已经改成固定端口时以配置为准。它不放进 `overrides`，因为覆盖的优先级高于配置，放在
-    /// 那里用户以后改的端口永远不生效
-    #[serde(default)]
-    pub pinned_port: Option<u16>,
-    /// 启动者环境里的代理变量与 `PATH`：null 表示启动者没设，拉起时在子进程里删掉它。
-    /// 重拉出来的实例因此走同一条网络路径，也找得到同一批 format 程序
-    #[serde(default)]
-    pub env: BTreeMap<String, Option<String>>,
-    /// 实例的日志文件。新启动时由拉起方生成随机名，restart、restore、看护者重拉都续写
-    /// 同一个文件。配置里写了 `log_file` 时实例用配置的路径，这个值只是没写时的去处
-    pub log_path: String,
-}
-
-impl InstanceSpec {
-    /// 配置文件路径；没有配置文件的规格返回 None。
-    pub fn config_file(&self) -> Option<PathBuf> {
-        self.config_path.as_deref().map(PathBuf::from)
-    }
-}
-
 /// 一条记录读不懂的原因。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unreadable {
@@ -475,13 +425,61 @@ pub fn read_record<T: serde::de::DeserializeOwned>(
     parse_record(&text, newest)
 }
 
-/// 期望状态记录的落盘形式。
-#[derive(Serialize, Deserialize)]
-pub struct RestoreRecord {
-    pub schema: u32,
-    pub spec: InstanceSpec,
-    /// 写下的时刻（Unix 毫秒）
-    pub written_at: u64,
+/// Read-only evidence of a pending restore. Private launch settings are not
+/// returned, even when a file contains environment or command-line credentials.
+/// ```compile_fail
+/// use aproxy_ipc::registry::{RestoreRecord, InstanceSpec, Overrides};
+/// ```
+#[derive(Debug, PartialEq, Eq)]
+pub struct RestorePresence {
+    /// Configuration to check for existence, if the launch had one.
+    pub config_path: Option<PathBuf>,
+}
+
+/// Read the canonical restore record, validating known fields but projecting only
+/// discovery data. Unknown additive fields have no bearing on restoration.
+pub fn read_restore_presence_in(
+    dir: &Path,
+    port: u16,
+) -> Result<Option<RestorePresence>, Unreadable> {
+    #[derive(Deserialize)]
+    struct Header {
+        spec: Spec,
+        #[serde(rename = "written_at")]
+        _written: u64,
+    }
+    #[derive(Deserialize)]
+    struct Spec {
+        #[serde(rename = "schema")]
+        _schema: u32,
+        config_path: Option<String>,
+        #[serde(rename = "log_path")]
+        _log: String,
+        #[serde(rename = "pinned_port")]
+        _port: Option<u16>,
+        #[serde(default, rename = "env")]
+        _env: BTreeMap<String, Option<String>>,
+        #[serde(default)]
+        overrides: serde_json::Map<String, serde_json::Value>,
+    }
+    let Some(header): Option<Header> =
+        read_optional_record(&restore_path_in(dir, &port.to_string()), SCHEMA)?
+    else {
+        return Ok(None);
+    };
+    for name in ["base_url", "listen_addr", "proxy", "api_key", "log_file"] {
+        if header
+            .spec
+            .overrides
+            .get(name)
+            .is_some_and(|v| !v.is_null() && !v.is_string())
+        {
+            return Err(Unreadable::Parse("invalid restore override".into()));
+        }
+    }
+    Ok(Some(RestorePresence {
+        config_path: header.spec.config_path.map(PathBuf::from),
+    }))
 }
 
 /// 期望状态记录的路径：`<run_dir>/<端口>.restore.json`。

@@ -20,10 +20,52 @@ use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 use aproxy_ipc::registry::parse_record;
-pub use aproxy_ipc::registry::{InstanceSpec, SCHEMA, Unreadable, restore_path_in};
-use aproxy_ipc::registry::{RESTORE_SUFFIX, RestoreRecord, read_optional_record, read_record};
+use aproxy_ipc::registry::{RESTORE_SUFFIX, read_optional_record, read_record};
+pub use aproxy_ipc::registry::{SCHEMA, Unreadable, restore_path_in};
 
 use crate::config::Overrides;
+use serde::{Deserialize, Serialize};
+
+/// 拉起规格。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct InstanceSpec {
+    pub schema: u32,
+    /// 配置文件的绝对路径。null = 没有配置文件，只靠覆盖参数与 settings.json 的全局默认
+    /// 启动；对这样的规格不做「配置文件还在不在」的检查
+    pub config_path: Option<String>,
+    /// 启动时在命令行上给过的覆盖，键就是 config.toml 的键
+    #[serde(default)]
+    pub overrides: Overrides,
+    /// 配置解析出的端口为 0（由系统分配）的实例，第一次启动后实际拿到的端口。再次拉起时，
+    /// 配置解析出的端口仍是 0 才用它：客户端配的是这个端口，恢复要回到同一个端口；配置
+    /// 已经改成固定端口时以配置为准。它不放进 `overrides`，因为覆盖的优先级高于配置，放在
+    /// 那里用户以后改的端口永远不生效
+    #[serde(default)]
+    pub pinned_port: Option<u16>,
+    /// 启动者环境里的代理变量与 `PATH`：null 表示启动者没设，拉起时在子进程里删掉它。
+    /// 重拉出来的实例因此走同一条网络路径，也找得到同一批 format 程序
+    #[serde(default)]
+    pub env: BTreeMap<String, Option<String>>,
+    /// 实例的日志文件。新启动时由拉起方生成随机名，restart、restore、看护者重拉都续写
+    /// 同一个文件。配置里写了 `log_file` 时实例用配置的路径，这个值只是没写时的去处
+    pub log_path: String,
+}
+
+impl InstanceSpec {
+    /// 配置文件路径；没有配置文件的规格返回 None。
+    pub fn config_file(&self) -> Option<PathBuf> {
+        self.config_path.as_deref().map(PathBuf::from)
+    }
+}
+
+/// 期望状态记录的落盘形式。
+#[derive(Serialize, Deserialize)]
+struct RestoreRecord {
+    pub schema: u32,
+    pub spec: InstanceSpec,
+    /// 写下的时刻（Unix 毫秒）
+    pub written_at: u64,
+}
 
 /// 交接文件的文件名后缀：`<纳秒>-<pid>.spec.json`。
 const SPEC_SUFFIX: &str = ".spec.json";

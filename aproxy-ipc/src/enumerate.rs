@@ -232,9 +232,9 @@ pub(crate) async fn membership_in(
                 if *name != format!("{port}{}", registry::RESTORE_SUFFIX) {
                     continue;
                 }
-                match registry::read_optional_record::<RestoreRecord>(&path, SCHEMA) {
+                match registry::read_restore_presence_in(&run_dir, port) {
                     Ok(Some(entry)) => {
-                        ports.entry(port).or_default().restore = Some(entry.spec.config_file())
+                        ports.entry(port).or_default().restore = Some(entry.config_path)
                     }
                     Ok(None) => {}
                     Err(reason) => {

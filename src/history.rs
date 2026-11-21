@@ -806,6 +806,8 @@ pub struct Record {
 
 #[derive(Debug)]
 struct RecordInner {
+    /// 同一条记录的变更序号。在锁里随内容递增，不靠时钟或事件的送达次序。
+    revision: u64,
     started_at: u64,
     ended_at: Option<u64>,
     method: String,
@@ -1135,6 +1137,7 @@ impl History {
             .get(http::header::USER_AGENT)
             .map(|v| self.secrets.replace(&String::from_utf8_lossy(v.as_bytes())));
         let inner = RecordInner {
+            revision: 0,
             started_at: now,
             ended_at: None,
             method: self.secrets.replace(start.method),
@@ -1207,6 +1210,7 @@ impl History {
     /// 记录变了。`urgent`（开始、结束）立即发事件；其余的变化，距上一个事件不到一秒就先
     /// 记下，由补发任务合并成一个。没有订阅者时什么都不做——连记录的 JSON 都不构造。
     fn changed(&self, record: &Record, inner: &mut RecordInner, urgent: bool) {
+        inner.revision += 1;
         if self.subscribers.load(Ordering::Relaxed) == 0 {
             inner.queued = false;
             return;
@@ -1636,6 +1640,8 @@ struct DecisionView<'a> {
 /// 一条记录（RequestRecord）的线上形状，序列化用。字段的次序就是线上的次序。
 #[derive(serde::Serialize)]
 struct RecordView<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revision: Option<u64>,
     request_id: &'a str,
     request_seq: u64,
     started_at: u64,
@@ -1686,6 +1692,7 @@ fn record_json(record: &Record, inner: &RecordInner) -> String {
             if truncated { clipped(text) } else { text }
         }
         RecordView {
+            revision: (inner.revision != 0).then_some(inner.revision),
             request_id: &record.id,
             request_seq: record.seq,
             started_at: inner.started_at,
@@ -2256,6 +2263,7 @@ mod tests {
         recorder.heartbeat();
         let list: Value = serde_json::from_str(&history.list_json(None, 50).unwrap()).unwrap();
         let record = &list["requests"][0];
+        assert!(record["revision"].as_u64().unwrap() >= 2);
         assert_eq!(record["model"], "claude-sonnet-4-5");
         assert_eq!(record["stream"], true);
         assert_eq!(record["keepalive"], true);

@@ -370,3 +370,19 @@ fn old_live_run_exposes_state_but_not_history_or_diagnostics() {
         v.shutdown().await;
     })
 }
+
+#[test]
+fn active_and_terminal_revisions_are_independent_of_arrival_order() {
+    for terminal in [false, true] {
+        let observation = |revision| {
+            let mut value = row("a", 1, terminal);
+            value["revision"] = json!(revision);
+            value["attempts"] = json!(revision);
+            Arc::new(decode::<RequestSummary>(value).unwrap())
+        };
+        for revisions in [[2, 1, 3], [3, 1, 2], [1, 3, 2]] {
+            let [a, b, c] = revisions.map(observation);
+            assert_eq!(merge([(1, a)].into(), [b], [c])[&1].attempts, 3);
+        }
+    }
+}

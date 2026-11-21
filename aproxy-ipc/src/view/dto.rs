@@ -125,6 +125,9 @@ pub struct Buckets {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct RequestSummary {
+    /// Run-local record mutation counter, independent of subscription delivery order.
+    #[serde(default)]
+    pub revision: u64,
     /// Server-generated identifier for detail and body reads.
     pub request_id: String,
     /// Sequence within this run; sorts newest first.

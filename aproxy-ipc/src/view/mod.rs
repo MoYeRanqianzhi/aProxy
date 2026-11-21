@@ -259,10 +259,9 @@ fn merge(
     events: impl IntoIterator<Item = Arc<RequestSummary>>,
 ) -> Records {
     for r in page.into_iter().chain(events) {
-        if !cached
-            .get(&r.request_seq)
-            .is_some_and(|old| old.ended_at.is_some() && r.ended_at.is_none())
-        {
+        if !cached.get(&r.request_seq).is_some_and(|old| {
+            (old.ended_at.is_some(), old.revision) > (r.ended_at.is_some(), r.revision)
+        }) {
             cached.insert(r.request_seq, r);
         }
     }

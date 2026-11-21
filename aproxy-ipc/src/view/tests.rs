@@ -26,6 +26,11 @@ fn instance(port: u16, id: &str, n: u64) -> InstanceSummary {
         liveness: Presence::Live,
         restore_pending: false,
         restore_reason: None,
+        reads: ReadCapabilities {
+            history_feed: true,
+            detail: true,
+            body: true,
+        },
         history_unavailable: None,
         feed: Feed::Joining,
         state: Some(decode(state(n)).unwrap()),
@@ -423,6 +428,28 @@ fn loss_during_paging_preserves_previous_cut() {
             assert_eq!(feed(&v), Feed::Disconnected);
             assert_eq!(v.requests(&key), good);
         }
+        v.shutdown().await;
+    })
+}
+
+#[test]
+fn unadvertised_reads_remain_polling_without_opening_connections() {
+    rt(async {
+        let (v, mut s) = Script::start();
+        s.source.home.lock().unwrap()[0].reads = ReadCapabilities::default();
+        s.tick();
+        until(&v, |v| !v.instances().is_empty()).await;
+        let k = v.instances()[0].run.clone().unwrap();
+        assert_eq!(feed(&v), Feed::Polling);
+        assert_eq!(v.detail(&k, "a-1").await, Err(ReadFailure::Unavailable));
+        assert_eq!(
+            v.body_chunk(&k, "a-1", Part::Request, None, 0, 1).await,
+            Err(ReadFailure::Unavailable)
+        );
+        s.source.home.lock().unwrap()[0].reads.history_feed = true;
+        s.tick();
+        let _newly_supported = s.open("a").await;
+        assert!(s.calls.next().now_or_never().is_none());
         v.shutdown().await;
     })
 }

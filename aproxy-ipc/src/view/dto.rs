@@ -21,6 +21,18 @@ pub enum HistoryUnavailable {
     SourceRedactionMissing,
 }
 
+/// Supported read paths derived from the verified snapshot's advertised operations.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ReadCapabilities {
+    /// The instance supports both a subscription and the pages needed to join it.
+    pub history_feed: bool,
+    /// A detail document can be requested independently of the history feed.
+    pub detail: bool,
+    /// On-demand body chunks are supported.
+    pub body: bool,
+}
+
 /// A discovered port, including stopped ports awaiting restoration.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -41,6 +53,8 @@ pub struct InstanceSummary {
     pub restore_pending: bool,
     /// Machine-readable reason restoration has not happened.
     pub restore_reason: Option<String>,
+    /// Read operations supported by this run (before applying redaction policy).
+    pub reads: ReadCapabilities,
     /// Machine-readable history restriction established by the verified snapshot.
     pub history_unavailable: Option<HistoryUnavailable>,
     /// Where state updates currently come from.

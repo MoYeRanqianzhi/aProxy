@@ -159,6 +159,18 @@ impl Source for Local {
                         liveness,
                         restore_pending: i.restore_pending,
                         restore_reason: i.restore_reason,
+                        reads: i
+                            .status
+                            .as_ref()
+                            .map(|s| {
+                                let has = |op| s.ops.iter().any(|o| o == op);
+                                ReadCapabilities {
+                                    history_feed: has("requests") && has("subscribe"),
+                                    detail: has("request"),
+                                    body: has("body"),
+                                }
+                            })
+                            .unwrap_or_default(),
                         history_unavailable: i
                             .status
                             .as_ref()
@@ -534,7 +546,11 @@ impl HomeView {
             .flat_map(|e| e.records.values().rev().map(|r| (**r).clone()))
             .collect()
     }
-    fn identity(&self, key: &RunKey) -> std::result::Result<RunIdentity, ReadFailure> {
+    fn identity(
+        &self,
+        key: &RunKey,
+        supports: impl FnOnce(ReadCapabilities) -> bool,
+    ) -> std::result::Result<RunIdentity, ReadFailure> {
         self.shared
             .data
             .lock()
@@ -544,7 +560,7 @@ impl HomeView {
             .filter(|e| e.info.run.as_ref() == Some(key) && e.info.liveness == Presence::Live)
             .ok_or(ReadFailure::RunChanged)
             .and_then(|e| {
-                if e.info.history_unavailable.is_some() {
+                if e.info.history_unavailable.is_some() || !supports(e.info.reads) {
                     return Err(ReadFailure::Unavailable);
                 }
                 Ok(RunIdentity {
@@ -559,7 +575,7 @@ impl HomeView {
         key: &RunKey,
         id: &str,
     ) -> std::result::Result<RequestDetail, ReadFailure> {
-        let run = self.identity(key)?;
+        let run = self.identity(key, |r| r.detail)?;
         let detail: RequestDetail = decode(
             self.source
                 .read(
@@ -587,7 +603,7 @@ impl HomeView {
         offset: u64,
         limit: u64,
     ) -> std::result::Result<BodyChunk, ReadFailure> {
-        let run = self.identity(key)?;
+        let run = self.identity(key, |r| r.body)?;
         Ok(decode(
             self.source
                 .read(
@@ -657,20 +673,24 @@ async fn drive(source: Arc<dyn Source>, shared: Arc<Shared>, ticks: BoxStream<'s
                 .as_ref()
                 .is_some_and(|e| e.info.run == info.run && e.info.pid == info.pid);
             let safe = info.history_unavailable.is_none();
-            if !safe {
+            let may_join = safe && info.reads.history_feed;
+            if !may_join && info.liveness == Presence::Live {
                 info.feed = Feed::Polling;
+            }
+            if !safe {
                 if let Some(state) = &mut info.state {
                     state.activity.last_error = None;
                 }
             }
-            if (!same || !safe || info.liveness != Presence::Live)
+            if (!same || !may_join || info.liveness != Presence::Live)
                 && let Some((_, h)) = handles.remove(&p)
             {
                 h.abort();
             }
             if let Some(e) = &old {
                 if same
-                    && safe
+                    && may_join
+                    && e.info.reads.history_feed
                     && e.info.history_unavailable.is_none()
                     && info.liveness == Presence::Live
                     && e.info.liveness == Presence::Live
@@ -684,7 +704,7 @@ async fn drive(source: Arc<dyn Source>, shared: Arc<Shared>, ticks: BoxStream<'s
                     shared.notify(Change::Requests(key.clone()));
                 }
             }
-            if safe
+            if may_join
                 && !handles.contains_key(&p)
                 && info.liveness == Presence::Live
                 && let (Some(key), Some(pid)) = (&info.run, info.pid)

@@ -773,18 +773,32 @@ impl OwnerExit {
             use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
             use windows_sys::Win32::System::Threading::{
                 GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+                PROCESS_SYNCHRONIZE, WaitForSingleObject,
             };
             if self.handle.as_ref().is_none_or(|(id, _)| *id != pid) {
-                let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+                let h = unsafe {
+                    OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                        0,
+                        pid,
+                    )
+                };
                 self.handle =
                     (h != 0).then(|| (pid, unsafe { OwnedHandle::from_raw_handle(h as _) }));
             }
             if let Some((_, handle)) = &self.handle {
+                let handle = handle.as_raw_handle() as _;
+                if unsafe { WaitForSingleObject(handle, 0) }
+                    != windows_sys::Win32::Foundation::WAIT_OBJECT_0
+                {
+                    return None;
+                }
                 let mut code = 0;
-                return (unsafe { GetExitCodeProcess(handle.as_raw_handle() as _, &mut code) }
-                    != 0
-                    && code != 259)
-                    .then(|| format!("exit status {code} (0x{code:08x})"));
+                return Some(if unsafe { GetExitCodeProcess(handle, &mut code) } != 0 {
+                    format!("exit status {code} (0x{code:08x})")
+                } else {
+                    "exit status unavailable".into()
+                });
             }
         }
         (aproxy::process::process_exited(pid) == Some(true))
@@ -935,6 +949,33 @@ fn handle_abort(home: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn signalled_owner_can_exit_with_still_active_as_its_real_code() {
+        use std::{
+            io::Write,
+            os::windows::process::CommandExt,
+            process::{Command, Stdio},
+        };
+        let mut c = Command::new("cmd.exe")
+            .creation_flags(0x08000000)
+            .args(["/d", "/c", "set /p answer= & exit /b 259"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut owner = super::OwnerExit::default();
+        let pid = c.id();
+        assert_eq!(owner.observe(pid), None);
+        c.stdin.take().unwrap().write_all(b"done\r\n").unwrap();
+        assert_eq!(c.wait().unwrap().code(), Some(259));
+        assert_eq!(
+            owner.observe(pid).as_deref(),
+            Some("exit status 259 (0x00000103)")
+        );
+        assert_eq!(aproxy::process::process_exited(pid), Some(true));
+    }
+
     use super::*;
 
     #[tokio::test]

@@ -280,32 +280,30 @@ pub fn process_exited(pid: u32) -> Option<bool> {
 
 mod process_platform {
     #[cfg(windows)]
-    /// 进程是否已退出：OpenProcess + GetExitCodeProcess。退出后即使进程
-    /// 对象被其他句柄（Rust Child 等）维持，退出码也已确定——终止确认的
+    /// 进程是否已退出：用零超时等待进程句柄，不把合法退出码 259 当成存活。即使进程
+    /// 对象被其他句柄（Rust Child 等）维持，是否已发信号也已确定——终止确认的
     /// 唯一可靠判据（start_time 查询在对象被引用期间会误报存活）。
     /// 只有无此 pid 才算退出；权限等其它错误不是死亡证据。
     pub fn process_exited(pid: u32) -> Option<bool> {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
         };
         unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
             if handle == 0 {
                 let error = std::io::Error::last_os_error();
                 return (error.raw_os_error()
                     == Some(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32))
                 .then_some(true);
             }
-            let mut code: u32 = 0;
-            let ok = GetExitCodeProcess(handle, &mut code);
+            let wait = WaitForSingleObject(handle, 0);
             let _ = CloseHandle(handle);
-            if ok == 0 {
-                return None;
+            match wait {
+                windows_sys::Win32::Foundation::WAIT_OBJECT_0 => Some(true),
+                windows_sys::Win32::Foundation::WAIT_TIMEOUT => Some(false),
+                _ => None,
             }
-            // STILL_ACTIVE(259) = 未退出；注意退出码恰为 259 的进程无法区分
-            // （Windows 文档明示的固有局限）——本仓库进程不用 259 作退出码
-            Some(code != 259)
         }
     }
     /// 进程是否已退出：/proc/<pid>/stat 的进程态——'Z'（zombie，已退出未

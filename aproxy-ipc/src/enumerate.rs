@@ -170,6 +170,9 @@ pub async fn enumerate_in(home: &Path) -> Enumeration {
                 Err(reason) => report_unreadable(&mut unreadable, &path, name, reason),
             }
         } else if let Some(port) = port_in_name(name, registry::RESTORE_SUFFIX) {
+            if *name != format!("{port}{}", registry::RESTORE_SUFFIX) {
+                continue;
+            }
             match registry::read_optional_record::<RestoreRecord>(&path, SCHEMA) {
                 Ok(Some(entry)) => {
                     ports.entry(port).or_default().restore = Some(entry.spec.config_file())

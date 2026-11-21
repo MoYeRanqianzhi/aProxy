@@ -75,6 +75,17 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn noncanonical_restore_name_is_not_a_restore_obligation() {
+        let home = tempfile::tempdir().unwrap();
+        let run = home.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        spec::write_restore_in(&run, "00080", &spec_with_config(None)).unwrap();
+        std::fs::write(run.join("00081.restore.json"), "invalid").unwrap();
+        let scan = enumerate_in(home.path()).await;
+        assert!(scan.instances.is_empty() && scan.gc_paused.is_none());
+    }
+
     /// 没有任何实例应答的 home：挂死的、等恢复的、死进程留下的、读不懂的各占一个端口，
     /// 清点把它们分清，并且不删任何文件。
     #[cfg(any(windows, target_os = "linux"))]

@@ -386,3 +386,43 @@ fn active_and_terminal_revisions_are_independent_of_arrival_order() {
         }
     }
 }
+
+#[test]
+fn loss_during_paging_preserves_previous_cut() {
+    rt(async {
+        let (v, mut s) = Script::start();
+        s.tick();
+        let events = s.ack("a", vec![]).await;
+        s.page("a", None)
+            .await
+            .send(Ok(page(vec![row("a", 1, true)], false)))
+            .unwrap();
+        until(&v, |v| feed(v) == Feed::Streaming).await;
+        let key = v.instances().remove(0).run.unwrap();
+        let good = v.requests(&key);
+        drop(events);
+        until(&v, |v| feed(v) == Feed::Disconnected).await;
+        for lag in [true, false] {
+            s.tick();
+            let events = s.ack("a", vec![]).await;
+            s.page("a", None)
+                .await
+                .send(Ok(page(vec![row("a", 3, true)], true)))
+                .unwrap();
+            let last = s.page("a", Some("a-3")).await;
+            if lag {
+                events.send(Ok(json!({"event":"lagged"}))).unwrap();
+            }
+            drop(events);
+            let mut changes = v.changes();
+            last.send(Ok(page(vec![], false))).unwrap();
+            assert!(matches!(
+                changes.recv().await.unwrap(),
+                Change::Instance(80)
+            ));
+            assert_eq!(feed(&v), Feed::Disconnected);
+            assert_eq!(v.requests(&key), good);
+        }
+        v.shutdown().await;
+    })
+}

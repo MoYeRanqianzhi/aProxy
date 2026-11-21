@@ -371,22 +371,62 @@ impl Shared {
     }
 }
 
+enum Observation {
+    Request(Arc<RequestSummary>),
+    State(StateSnapshot),
+    Lost,
+    Other,
+}
+fn observation(run: &RunIdentity, frame: Option<Result<Value>>) -> Result<Observation> {
+    let Some(mut event) = frame.transpose()? else {
+        return Ok(Observation::Lost);
+    };
+    Ok(match event["event"].as_str() {
+        Some("request") => {
+            let row = decode(event["data"].take())?;
+            check_record(run, &row)?;
+            Observation::Request(Arc::new(row))
+        }
+        Some("state") => Observation::State(decode(event["data"].take())?),
+        Some("lagged" | "closing") => Observation::Lost,
+        Some(_) => Observation::Other,
+        None => return Err(invalid()),
+    })
+}
+
 async fn follow(source: &dyn Source, shared: &Shared, port: u16, run: &RunIdentity) -> Result<()> {
     let (ack, mut events) = source.subscribe(port, run).await?;
-    let Opening { snapshot, requests } = decode(ack)?;
+    let Opening {
+        mut snapshot,
+        requests,
+    } = decode(ack)?;
     let mut cut = merge(Records::new(), records(run, requests)?, []);
     let mut cursor = None;
     loop {
-        let page = source
-            .read(
-                port,
-                run,
-                ReadOp::Requests {
-                    before: cursor.as_ref().map(|(_, id): &(u64, String)| id.clone()),
-                    limit: Some(MAX_LIST as u64),
+        let mut page = source.read(
+            port,
+            run,
+            ReadOp::Requests {
+                before: cursor.as_ref().map(|(_, id): &(u64, String)| id.clone()),
+                limit: Some(MAX_LIST as u64),
+            },
+        );
+        // A ready loss marker/EOF invalidates even a simultaneously ready final page.
+        // Keep the page future alive and fold events into the same bounded cut.
+        let page = loop {
+            match future::select(events.next(), page.as_mut()).await {
+                Either::Right((result, _)) => break result?,
+                Either::Left((event, _)) => match observation(run, event)? {
+                    Observation::Lost => return Ok(()),
+                    Observation::State(s) => snapshot = s,
+                    Observation::Request(r) => {
+                        cut = merge(cut, [], [r]);
+                        trim(&mut cut, PER_RUN_LIMIT);
+                    }
+                    Observation::Other => (),
                 },
-            )
-            .await?;
+            }
+        };
         let Page { more, requests } = decode(page)?;
         let rows = records(run, requests)?;
         let mut below = cursor.as_ref().map(|(n, _)| *n);
@@ -407,16 +447,12 @@ async fn follow(source: &dyn Source, shared: &Shared, port: u16, run: &RunIdenti
         }
     }
     shared.commit(port, cut, true, Some(snapshot));
-    while let Some(event) = events.next().await {
-        let mut event = event?;
-        match event["event"].as_str() {
-            Some("request") => {
-                let r: RequestSummary = decode(event["data"].take())?;
-                check_record(run, &r)?;
-                shared.commit(port, [(r.request_seq, Arc::new(r))].into(), false, None);
+    loop {
+        match observation(run, events.next().await)? {
+            Observation::Request(r) => {
+                shared.commit(port, [(r.request_seq, r)].into(), false, None);
             }
-            Some("state") => {
-                let state = decode(event["data"].take())?;
+            Observation::State(state) => {
                 shared
                     .data
                     .lock()
@@ -428,9 +464,8 @@ async fn follow(source: &dyn Source, shared: &Shared, port: u16, run: &RunIdenti
                     .state = Some(state);
                 shared.notify(Change::Instance(port));
             }
-            Some("lagged" | "closing") => break,
-            Some(_) => {}
-            None => return Err(invalid()),
+            Observation::Lost => break,
+            Observation::Other => (),
         }
     }
     Ok(())

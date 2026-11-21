@@ -245,6 +245,23 @@ fn lock_for_install(home: &Path, wait: std::time::Duration) -> Result<InstallLoc
     }
 }
 
+/// 在同一份短事务的锁上等候。锁竞争与打开错误分开，不能把未拿到的锁当作成功。
+pub(crate) fn wait_lock_path(
+    path: &Path,
+    wait: std::time::Duration,
+) -> std::io::Result<InstallLock> {
+    let until = std::time::Instant::now() + wait;
+    loop {
+        if let Some(lock) = try_lock_path(path)? {
+            return Ok(lock);
+        }
+        if std::time::Instant::now() >= until {
+            return Err(std::io::ErrorKind::WouldBlock.into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// 对任意路径的锁文件用同一套锁原语不等待地试一次：Ok(Some) 拿到了，Ok(None) 别人持有。
 /// 父目录不存在时先建好。给 home 里别的需要「同一时刻只有一个写者」的地方用；它们与安装
 /// 锁共用原语，但锁的是各自的文件，互不相干。

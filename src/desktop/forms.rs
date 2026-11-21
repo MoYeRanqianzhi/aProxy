@@ -89,7 +89,7 @@ fn at<'a>(v: &'a Value, k: &str) -> &'a Value {
     k.split('.').fold(v, |node, part| &node[part])
 }
 fn marked(s: &str) -> bool {
-    s.contains("<secret>") || s.contains("<secret ")
+    s.contains("***") || s.contains("<secret>") || s.contains("<secret ")
 }
 fn present(v: &Value) -> Cell {
     Cell::Secret {
@@ -111,7 +111,10 @@ fn cell(k: &str, v: &Value, s: &Secrets) -> Cell {
         },
         Value::Number(_) => Cell::None,
         Value::String(t) => Cell::Text {
-            text: if matches!(k, "base_url" | "proxy" | "url" | "update.download_proxy") {
+            text: if matches!(
+                k,
+                "base_url" | "proxy" | "url" | "update.download_proxy" | "args"
+            ) {
                 s.replace(&redact::url(t))
             } else {
                 s.replace(t)
@@ -147,8 +150,10 @@ fn cell(k: &str, v: &Value, s: &Secrets) -> Cell {
             Cell::List { items }
         }
         Value::Object(map) => {
-            let entries = map
-                .iter()
+            let mut sorted = map.iter().collect::<Vec<_>>();
+            sorted.sort_unstable_by_key(|(name, _)| *name);
+            let entries = sorted
+                .into_iter()
                 .filter_map(|(name, v)| {
                     if (k == "format" && !FORMAT_KEYS.contains(&name.as_str()))
                         || (k == "retry.rules"
@@ -179,7 +184,11 @@ fn cell(k: &str, v: &Value, s: &Secrets) -> Cell {
                         cell(&sub, v, s)
                     };
                     Some(MapCell {
-                        name: s.replace(name),
+                        name: if matches!(k, "extra_headers" | "override_headers") {
+                            Projection::new(s).name(name)
+                        } else {
+                            s.replace(name)
+                        },
                         value,
                     })
                 })
@@ -284,12 +293,15 @@ fn fields(doc: &Value, res: &config::Resolved, s: &Secrets) -> Vec<ConfigField> 
             _ => None,
         } && let Some(map) = v.as_object()
         {
-            for (n, value) in map {
+            let mut sorted = map.iter().collect::<Vec<_>>();
+            sorted.sort_unstable_by_key(|(n, _)| *n);
+            let projection = Projection::new(s);
+            for (n, value) in sorted {
                 let key = format!("{k}.{}", config::quote_key(n));
-                let safe = s.for_header_names().replace(n);
-                let ok = safe == *n && s.replace(n) == *n;
+                let safe = projection.name(n);
+                let ok = safe == *n;
                 result.push(ConfigField {
-                    key: format!("{k}.{}", config::quote_key(&s.replace(&safe))),
+                    key: format!("{k}.{}", config::quote_key(&safe)),
                     value: present(value),
                     source: res.sources.get(&key).map(source),
                     header: ok.then(|| HeaderKey {
@@ -390,6 +402,7 @@ fn inspect_patch(
     edits: &[Change],
     members: &[Enumerated],
     outside: bool,
+    context: &Secrets,
 ) -> R<(Validation, Option<String>)> {
     match edit::apply_to_text(old.unwrap_or(""), path, &layers.defaults, edits) {
         Ok(new) => {
@@ -407,7 +420,10 @@ fn inspect_patch(
                     && !users(path, members).contains(p)
             });
             let raw = config::view::file_value(&new);
-            let s = layers.secrets(raw.as_ref());
+            let s = layers
+                .secrets(raw.as_ref())
+                .union(&layers.secrets(old.and_then(config::view::file_value).as_ref()))
+                .union(context);
             let diagnostics = issues(&next.diagnostics, next.is_valid().then_some(&s));
             Ok((
                 Validation {
@@ -432,7 +448,11 @@ fn inspect_patch(
     }
 }
 impl DesktopHome {
-    async fn form_path(&self, t: &ConfigTarget) -> R<PathBuf> {
+    async fn form_path(
+        &self,
+        t: &ConfigTarget,
+        editing: bool,
+    ) -> R<(PathBuf, Secrets, Option<Token>)> {
         let choice = match t {
             ConfigTarget::Default { id } => StartTarget {
                 kind: ChoiceKind::Default,
@@ -446,31 +466,55 @@ impl DesktopHome {
                 kind: ChoiceKind::Config,
                 id: id.clone(),
             },
-            ConfigTarget::Run { run } => {
+            ConfigTarget::Run { run, expected_file } => {
                 let rec = self.selected_run(run, false).await?;
-                let path = rec.config_path.ok_or(Fault::DesktopTarget {})?;
-                return Path::new(&path)
+                let path = Path::new(rec.config_path.as_deref().ok_or(Fault::DesktopTarget {})?)
                     .canonicalize()
-                    .map_err(|_| Fault::DesktopTarget {});
+                    .map_err(|_| Fault::DesktopTarget {})?;
+                let token = self.token(
+                    &serde_json::to_vec(&(run, &path)).map_err(|_| Fault::DesktopTarget {})?,
+                );
+                if editing && expected_file.as_ref() != Some(&token) {
+                    return Err(Fault::DesktopChanged {});
+                }
+                let sample = Enumerated {
+                    port: run.port,
+                    instance: Some(rec),
+                    liveness: Liveness::Live,
+                    reason: None,
+                    status: None,
+                    restore_pending: false,
+                    restore_reason: None,
+                };
+                let facts = self
+                    .inspect(&[sample])
+                    .remove(&run.port)
+                    .ok_or(Fault::DesktopUnavailable {})?;
+                return Ok((path, (*facts.secrets).clone(), Some(token)));
             }
         };
-        Ok(self.resolve_choice(&choice)?.path)
+        Ok((
+            self.resolve_choice(&choice).await?.path,
+            Secrets::default(),
+            None,
+        ))
     }
 }
 impl ConfigOps for DesktopHome {
     fn read_config(&self, target: ConfigTarget) -> Task<'_, ConfigView> {
         Box::pin(async move {
-            let path = self.form_path(&target).await?;
+            let (path, context, file_token) = self.form_path(&target, false).await?;
             let layers = Layers::load(&self.home)?;
             let text = read_optional(&path)?;
             let resolved = layers.resolve(&path, text.as_deref());
             let raw = text.as_deref().and_then(config::view::file_value);
-            let s = layers.secrets(raw.as_ref());
+            let s = layers.secrets(raw.as_ref()).union(&context);
             let valid = text
                 .as_deref()
                 .is_none_or(|t| !config::file::parse(t, &path).1.iter().any(|d| d.is_error()));
             let doc = config::view::effective_value(&resolved, raw.as_ref());
             Ok(ConfigView {
+                file_token,
                 file: if valid {
                     s.replace(&path.to_string_lossy())
                 } else {
@@ -507,7 +551,7 @@ impl ConfigOps for DesktopHome {
     }
     fn validate_config(&self, target: ConfigTarget, edits: Vec<Edit>) -> Task<'_, Validation> {
         Box::pin(async move {
-            let path = self.form_path(&target).await?;
+            let (path, context, _) = self.form_path(&target, true).await?;
             let patch = changes(&edits)?;
             let members = aproxy_ipc::enumerate::enumerate_in(&self.home)
                 .await
@@ -519,13 +563,14 @@ impl ConfigOps for DesktopHome {
                 &patch,
                 &members,
                 external(&self.home, &path)?,
+                &context,
             )?;
             Ok(v)
         })
     }
     fn write_config(&self, target: ConfigTarget, edits: Vec<Edit>, ack: bool) -> Task<'_, Saved> {
         Box::pin(async move {
-            let observed = self.form_path(&target).await?;
+            let (observed, _, _) = self.form_path(&target, true).await?;
             let patch = changes(&edits)?;
             let host = self.clone();
             let runtime = tokio::runtime::Handle::current();
@@ -534,10 +579,11 @@ impl ConfigOps for DesktopHome {
                 let applied = edit::rewrite_locked(
                     &observed,
                     &host.home,
-                    true,
+                    false,
                     || {},
                     |old, file| -> Result<String, FormError> {
-                        let actual = runtime.block_on(host.form_path(&target))?;
+                        let (actual, context, _) =
+                            runtime.block_on(host.form_path(&target, true))?;
                         if actual != observed || actual != file {
                             return Err(Fault::DesktopChanged {}.into());
                         }
@@ -555,6 +601,7 @@ impl ConfigOps for DesktopHome {
                             &patch,
                             &members,
                             outside,
+                            &context,
                         )?;
                         if let Some(port) = v.occupied_port {
                             return Err(Fault::DesktopPort { port }.into());

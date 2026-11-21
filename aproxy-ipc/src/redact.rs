@@ -293,6 +293,12 @@ impl Secrets {
         Self::new(self.known.iter().map(|s| s.to_ascii_lowercase()))
     }
 
+    /// 联合两次观察的原文，避免一次编辑把旧凭据从错误出口的脱敏范围里抹掉。
+    #[cfg(feature = "desktop")]
+    pub fn union(&self, other: &Self) -> Self {
+        Self::new(self.known.iter().chain(&other.known))
+    }
+
     /// 一个密钥都没有：替换什么也不做
     pub fn is_empty(&self) -> bool {
         self.known.is_empty()

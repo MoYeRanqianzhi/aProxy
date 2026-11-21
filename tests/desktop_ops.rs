@@ -373,6 +373,8 @@ async fn implicit_default_can_be_created_but_external_target_needs_windows_ackno
     let t = ConfigTarget::Alias {
         id: alias.target.id,
     };
+    #[cfg(windows)]
+    let inherited = aproxy::fsx::dacl_sddl(&external).unwrap();
     let v = host.validate_config(t.clone(), patch()).await.unwrap();
     assert_eq!(v.external_acl, cfg!(windows));
     assert_eq!(
@@ -392,6 +394,8 @@ async fn implicit_default_can_be_created_but_external_target_needs_windows_ackno
             .unwrap()
             .changed
     );
+    #[cfg(windows)]
+    assert_eq!(aproxy::fsx::dacl_sddl(&external).unwrap(), inherited);
     home.settings(&json!({"aliases":{"outside":home.path().join("config.toml")}}).to_string());
     assert!(matches!(
         host.write_config(t, patch(), true).await,
@@ -711,4 +715,231 @@ async fn registration_reads_actual_per_home_slot_and_never_overwrites_a_foreign_
     assert!(!b.set_autostart(false).await.unwrap().enabled);
     #[cfg(windows)]
     assert_eq!(key.enum_values().count(), 0);
+}
+
+#[tokio::test]
+async fn file_and_settings_display_mask_urls_header_names_and_reject_masked_edits() {
+    use aproxy_ipc::desktop::*;
+    let home = TestHome::new();
+    let file = home.path().join("config.toml");
+    let raw = "base_url='https://example.invalid/?t=original-query'\napi_key='MiXeD-Private'\n[extra_headers]\nx-mixed-private='a'\n[[format]]\nname='demo'\ncommand='demo'\nstages=['request']\nargs=['https://me:q@example.invalid/?t=arg-credential']\n";
+    std::fs::write(&file, raw).unwrap();
+    home.settings(&json!({"aliases":{"z":"z.toml","a":"a.toml"},"defaults":{"base_url":"https://example.invalid","api_key":"MiXeD-Private","extra_headers":{"X-MIXED-PRIVATE":"b"}}}).to_string());
+    let host = DesktopHome::new(home.path().into(), env!("CARGO_BIN_EXE_aproxy").into()).unwrap();
+    let target = ConfigTarget::Default {
+        id: host.list_configs().await.unwrap()[0].target.id.clone(),
+    };
+    let form = host.read_config(target.clone()).await.unwrap();
+    let settings = host.read_settings().await.unwrap();
+    for result in [json!(form), json!(settings)] {
+        let txt = result.to_string().to_ascii_lowercase();
+        for forbidden in ["arg-credential", "mixed-private", "me:q@"] {
+            assert!(!txt.contains(forbidden), "{forbidden}");
+        }
+    }
+    assert!(
+        form.fields
+            .iter()
+            .any(|f| f.key.starts_with("extra_headers.") && !f.editable && f.header.is_none())
+    );
+    let aliases = &settings
+        .read_only
+        .iter()
+        .find(|v| v.key == "aliases")
+        .unwrap()
+        .value;
+    assert!(matches!(aliases,Cell::Map{entries} if entries[0].name=="a" && entries[1].name=="z"));
+    let Cell::Text { text: display } = &form
+        .fields
+        .iter()
+        .find(|f| f.key == "base_url")
+        .unwrap()
+        .value
+    else {
+        panic!()
+    };
+    for (key, text) in [
+        ("base_url", display.as_str()),
+        ("api_key", "***"),
+        ("proxy_password", "<secret>"),
+    ] {
+        let patch =
+            || serde_json::from_value(json!([{"op":"set","key":key,"value":text}])).unwrap();
+        assert!(matches!(
+            host.validate_config(target.clone(), patch()).await,
+            Err(Fault::DesktopBadInput {})
+        ));
+        assert!(matches!(
+            host.write_config(target.clone(), patch(), true).await,
+            Err(Fault::DesktopBadInput {})
+        ));
+    }
+    assert_eq!(std::fs::read_to_string(file).unwrap(), raw);
+}
+
+#[tokio::test]
+async fn changed_privacy_applies_to_about_raw_theme_and_old_diagnostic_path() {
+    use aproxy_ipc::desktop::*;
+    let home = TestHome::new();
+    let root = home.path().join("diagnostic-private");
+    std::fs::create_dir(&root).unwrap();
+    let host = DesktopHome::new(root.clone(), env!("CARGO_BIN_EXE_aproxy").into()).unwrap();
+    assert!(host.about().unwrap().home.contains("diagnostic-private"));
+    std::fs::write(root.join("settings.json"),r#"{"defaults":{"base_url":"https://other.invalid","extra_headers":{"authorization":"Bearer withheld-secret"}}}"#).unwrap();
+    std::fs::write(root.join("config.toml"),"base_url='https://local.invalid'\napi_key='diagnostic-private'\n[extra_headers]\nx-private='123456789'\n").unwrap();
+    assert!(!host.about().unwrap().home.contains("diagnostic-private"));
+    let theme = "aproxy-theme-v1:{\"value\":123456789}";
+    let patch: PreferencesPatch = serde_json::from_value(json!({"theme":theme})).unwrap();
+    assert!(host.set_preferences(patch).await.unwrap().theme.is_none());
+    assert!(
+        host.read_desktop_state()
+            .await
+            .unwrap()
+            .preferences
+            .theme
+            .is_none()
+    );
+    let t = ConfigTarget::Default {
+        id: host.list_configs().await.unwrap()[0].target.id.clone(),
+    };
+    let v = host
+        .validate_config(
+            t,
+            serde_json::from_value(
+                json!([{"op":"set","key":"api_key","value":"candidate-private"}]),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!v.diagnostics.is_empty());
+    assert!(!json!(v).to_string().contains("diagnostic-private"));
+}
+
+#[tokio::test]
+async fn run_form_binds_the_read_destination_and_keeps_launch_overrides_private() {
+    use aproxy::{config::Overrides, ops::start};
+    use aproxy_ipc::desktop::*;
+    let home = TestHome::new();
+    let secret = "launch-only-secret";
+    let dir = home.path().join(secret);
+    let replacement = home.path().join("replacement");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::create_dir(&replacement).unwrap();
+    let file = dir.join("config.toml");
+    let raw = "base_url='http://127.0.0.1:9'\nlisten_addr='127.0.0.1:0'\n";
+    std::fs::write(&file, raw).unwrap();
+    std::fs::write(replacement.join("config.toml"), raw).unwrap();
+    let exe = std::path::Path::new(env!("CARGO_BIN_EXE_aproxy"));
+    let host = DesktopHome::new(home.path().into(), exe.into()).unwrap();
+    let launch = spec::capture(
+        Some(&file),
+        Overrides {
+            api_key: Some(secret.into()),
+            ..Default::default()
+        },
+        &home.path().join("own.log"),
+    );
+    let live = start::launch_in(home.path(), exe, &launch)
+        .await
+        .unwrap()
+        .instance;
+    let port = aproxy::daemon::port_of(&live.listen_addr).parse().unwrap();
+    home.stop_on_drop(port);
+    let run = Run {
+        port,
+        instance_id: live.instance_id,
+    };
+    let view = host
+        .read_config(ConfigTarget::Run {
+            run: run.clone(),
+            expected_file: None,
+        })
+        .await
+        .unwrap();
+    assert!(!json!(view).to_string().contains(secret));
+    assert!(
+        view.fields
+            .iter()
+            .any(|f| f.key == "api_key" && matches!(f.value, Cell::Secret { set: false }))
+    );
+    let target = ConfigTarget::Run {
+        run,
+        expected_file: view.file_token,
+    };
+    let patch = || {
+        serde_json::from_value(json!([{"op":"set","key":"timeouts.connect_secs","value":17}]))
+            .unwrap()
+    };
+    assert!(
+        host.validate_config(target.clone(), patch())
+            .await
+            .unwrap()
+            .can_save
+    );
+    // 文件仍由同一个运行代引用，但读表单时看到的规范路径已经不同。
+    std::fs::rename(&dir, home.path().join("old")).unwrap();
+    #[cfg(windows)]
+    assert!(
+        home.cmd_with("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&dir)
+            .arg(&replacement)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&replacement, &dir).unwrap();
+    assert!(matches!(
+        host.write_config(target, patch(), true).await,
+        Err(Fault::DesktopChanged {})
+    ));
+    assert_eq!(
+        std::fs::read_to_string(replacement.join("config.toml")).unwrap(),
+        raw
+    );
+}
+
+#[test]
+fn config_discovery_yields_and_private_state_waits_for_another_lock_holder() {
+    use aproxy_ipc::desktop::{InstanceOps, StateOps};
+    let home = TestHome::new();
+    let host = DesktopHome::new(home.path().into(), env!("CARGO_BIN_EXE_aproxy").into()).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            let _ = started.send(());
+            let _ = hold.recv();
+        });
+        ready.await.unwrap();
+        let mut pending = host.list_configs();
+        let yielded =
+            tokio::select! {biased;_= &mut pending => false, _=std::future::ready(())=>true};
+        drop(release);
+        assert!(yielded);
+        pending.await.unwrap();
+        host.read_desktop_state().await.unwrap();
+        let lock = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(home.path().join("desktop/state.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(lock)
+        });
+        let (a, b) = tokio::join!(host.read_desktop_state(), host.read_desktop_state());
+        release.join().unwrap();
+        a.unwrap();
+        b.unwrap();
+    });
 }

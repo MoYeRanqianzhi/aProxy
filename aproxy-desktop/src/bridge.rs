@@ -837,7 +837,10 @@ pub(crate) async fn set_pinned(
 #[tauri::command]
 pub(crate) async fn about(request: Request<'_>, ops: State<'_, Arc<dyn DesktopOps>>) -> R<About> {
     let _: Empty = args(&request)?;
-    ops.about()
+    let ops = ops.inner().clone();
+    tokio::task::spawn_blocking(move || ops.about())
+        .await
+        .map_err(|_| Fault::DesktopUnavailable {})?
 }
 
 #[derive(Deserialize)]

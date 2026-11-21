@@ -103,9 +103,8 @@ impl Store {
         safe(&dir, f, true)?;
         let lock = dir.join("state.lock");
         safe(&lock, f, false)?;
-        let guard = crate::install::try_lock_path(&lock)
-            .map_err(|_| Fault::DesktopStateIo { file: f })?
-            .ok_or(Fault::DesktopConflict {})?;
+        let guard = crate::install::wait_lock_path(&lock, std::time::Duration::from_secs(1))
+            .map_err(|_| Fault::DesktopStateIo { file: f })?;
         Ok(Self { dir, _lock: guard })
     }
     fn save<T: Serialize + ?Sized>(&self, f: StateFile, data: &T) -> R<()> {
@@ -178,10 +177,11 @@ fn public_preferences(mut p: Preferences, s: Option<&aproxy_ipc::redact::Secrets
         }
     }
     if let Some(theme) = &p.theme
-        && theme
-            .strip_prefix("aproxy-theme-v1:")
-            .and_then(|t| serde_json::from_str(t).ok())
-            .is_some_and(|v| contains_secret(&v, s))
+        && (s.find(theme.as_bytes()).is_some()
+            || theme
+                .strip_prefix("aproxy-theme-v1:")
+                .and_then(|t| serde_json::from_str(t).ok())
+                .is_some_and(|v| contains_secret(&v, s)))
     {
         p.theme = None
     }
@@ -201,28 +201,42 @@ fn public_pins(mut list: Vec<Bookmark>, s: Option<&aproxy_ipc::redact::Secrets>)
     });
     list
 }
+impl DesktopHome {
+    async fn state_work<T: Send + 'static>(
+        &self,
+        f: StateFile,
+        work: impl FnOnce(DesktopHome, Store) -> R<T> + Send + 'static,
+    ) -> R<T> {
+        let _queue = self.state_serial.lock().await;
+        let host = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = Store::open(&host.home, f)?;
+            work(host, store)
+        })
+        .await
+        .map_err(|_| Fault::DesktopStateIo { file: f })?
+    }
+}
 impl StateOps for DesktopHome {
     fn read_desktop_state(&self) -> Task<'_, DesktopState> {
-        Box::pin(async move {
-            let store = Store::open(&self.home, StateFile::Preferences)?;
+        Box::pin(self.state_work(StateFile::Preferences, move |host, store| {
             let (preferences, p) = store.preferences()?;
             let (bookmarks, b) = store.bookmarks()?;
             let reset = [(p, StateFile::Preferences), (b, StateFile::Bookmarks)]
                 .into_iter()
                 .filter_map(|(v, k)| v.then_some(k))
                 .collect();
-            let mask = self.display_secrets();
+            let mask = host.display_secrets();
             Ok(DesktopState {
                 preferences: public_preferences(preferences, mask.as_ref()),
                 bookmarks: public_pins(bookmarks, mask.as_ref()),
                 reset,
             })
-        })
+        }))
     }
     fn set_preferences(&self, patch: PreferencesPatch) -> Task<'_, Preferences> {
-        Box::pin(async move {
+        Box::pin(self.state_work(StateFile::Preferences, move |host, store| {
             let f = StateFile::Preferences;
-            let store = Store::open(&self.home, f)?;
             let (mut p, reset) = store.preferences()?;
             if reset {
                 return Err(Fault::DesktopStateReset { file: f });
@@ -247,13 +261,12 @@ impl StateOps for DesktopHome {
             }
             prefs(&p)?;
             store.save(f, &p)?;
-            Ok(public_preferences(p, self.display_secrets().as_ref()))
-        })
+            Ok(public_preferences(p, host.display_secrets().as_ref()))
+        }))
     }
     fn set_pinned(&self, change: PinChange) -> Task<'_, Vec<Bookmark>> {
-        Box::pin(async move {
+        Box::pin(self.state_work(StateFile::Bookmarks, move |host, store| {
             let f = StateFile::Bookmarks;
-            let store = Store::open(&self.home, f)?;
             let (mut list, reset) = store.bookmarks()?;
             if reset {
                 return Err(Fault::DesktopStateReset { file: f });
@@ -265,20 +278,20 @@ impl StateOps for DesktopHome {
                         return Err(Fault::DesktopBadInput {});
                     }
                     if list.iter().any(|v| v.r#ref == b.r#ref) {
-                        return Ok(public_pins(list, self.display_secrets().as_ref()));
+                        return Ok(public_pins(list, host.display_secrets().as_ref()));
                     }
                     if list.len() >= COUNT {
                         return Err(limit(LimitResource::BookmarkCount, COUNT));
                     }
-                    let safe = public_pins(vec![b], self.display_secrets().as_ref())
+                    let safe = public_pins(vec![b], host.display_secrets().as_ref())
                         .pop()
                         .ok_or(Fault::DesktopUnavailable {})?;
                     list.insert(0, safe);
                 }
             }
             store.save(f, &list)?;
-            Ok(public_pins(list, self.display_secrets().as_ref()))
-        })
+            Ok(public_pins(list, host.display_secrets().as_ref()))
+        }))
     }
     fn about(&self) -> R<About> {
         Ok(About {
@@ -288,7 +301,9 @@ impl StateOps for DesktopHome {
             } else {
                 Variant::Headless
             },
-            home: self.display_home.clone(),
+            home: self
+                .display_secrets()
+                .map_or_else(|| "***".into(), |s| s.replace(&self.home.to_string_lossy())),
         })
     }
 }

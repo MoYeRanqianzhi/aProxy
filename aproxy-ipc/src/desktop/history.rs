@@ -190,7 +190,8 @@ impl<'a> Projection<'a> {
     pub(super) fn text(&self, s: &str) -> String {
         self.secrets.replace(s)
     }
-    fn name(&self, s: &str) -> String {
+    /// Normalize only for matching so unmasked HTTP names keep their original spelling.
+    pub fn name(&self, s: &str) -> String {
         let lower = s.to_ascii_lowercase();
         if self.names.find(lower.as_bytes()).is_some() {
             self.text(&self.names.replace(&lower))

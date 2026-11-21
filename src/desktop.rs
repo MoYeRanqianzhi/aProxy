@@ -22,9 +22,9 @@ use std::{
 #[derive(Clone)]
 pub struct DesktopHome {
     home: PathBuf,
-    display_home: String,
     key: [u8; 32],
     exe: PathBuf,
+    state_serial: Arc<tokio::sync::Mutex<()>>,
     login_test_slot: Option<String>,
     updates: Arc<std::sync::Mutex<update::Checks>>,
     listing: Arc<std::sync::Mutex<Option<[u8; 16]>>>,
@@ -37,18 +37,15 @@ impl DesktopHome {
         }
         let mut key = [0; 32];
         getrandom::fill(&mut key).map_err(|_| Fault::DesktopUnavailable {})?;
-        let mut host = Self {
-            display_home: String::new(),
+        let host = Self {
             home,
             key,
             exe,
+            state_serial: Default::default(),
             login_test_slot: None,
             listing: Default::default(),
             updates: Default::default(),
         };
-        host.display_home = host
-            .display_secrets()
-            .map_or_else(|| "***".into(), |s| s.replace(&host.home.to_string_lossy()));
         Ok(host)
     }
     fn restore_token(&self, entry: &spec::RestoreEntry) -> String {
@@ -224,6 +221,9 @@ fn collect_config_secrets(doc: &Value, out: &mut Vec<String>) {
                     if std::mem::take(&mut operand) {
                         out.push(arg.to_owned());
                         continue;
+                    }
+                    if url::Url::parse(arg).is_ok() {
+                        collect_url(arg, out);
                     }
                     let (name, value) = arg
                         .split_once('=')

@@ -173,14 +173,16 @@ impl DesktopHome {
         self.offers([0; 16]).ok()?.1
     }
 
-    pub(super) fn resolve_choice(&self, t: &StartTarget) -> R<Offered> {
+    pub(super) async fn resolve_choice(&self, t: &StartTarget) -> R<Offered> {
         let nonce = self
             .listing
             .lock()
             .unwrap()
             .ok_or(Fault::DesktopChanged {})?;
-        let value = self
-            .offers(nonce)?
+        let host = self.clone();
+        let value = tokio::task::spawn_blocking(move || host.offers(nonce))
+            .await
+            .map_err(|_| Fault::DesktopUnavailable {})??
             .0
             .into_iter()
             .find(|v| v.choice.target == *t)
@@ -257,14 +259,17 @@ impl InstanceOps for DesktopHome {
         Box::pin(async move {
             let mut nonce = [0; 16];
             getrandom::fill(&mut nonce).map_err(|_| Fault::DesktopUnavailable {})?;
-            let (offered, _) = self.offers(nonce)?;
+            let host = self.clone();
+            let (offered, _) = tokio::task::spawn_blocking(move || host.offers(nonce))
+                .await
+                .map_err(|_| Fault::DesktopUnavailable {})??;
             *self.listing.lock().unwrap() = Some(nonce);
             Ok(offered.into_iter().map(|v| v.choice).collect())
         })
     }
     fn start_instance(&self, target: StartTarget) -> Task<'_, Run> {
         Box::pin(async move {
-            let offer = self.resolve_choice(&target)?;
+            let offer = self.resolve_choice(&target).await?;
             let file = (!offer.implicit || offer.path.exists()).then_some(offer.path.as_path());
             let ov = config::Overrides::default();
             let cfg = start::resolve_runtime_config_in(&self.home, &ov, file)
@@ -280,7 +285,7 @@ impl InstanceOps for DesktopHome {
                 })? {
                 start::Preflight::AlreadyRunning(s) | start::Preflight::BecameReady(s) => *s,
                 start::Preflight::Clear => {
-                    self.resolve_choice(&target)?;
+                    self.resolve_choice(&target).await?;
                     let log = start::daemon_log_path_in(&self.home, cfg.log_file.as_deref());
                     let spec = spec::capture(file, ov, &log);
                     start::launch_in(&self.home, &self.exe, &spec)

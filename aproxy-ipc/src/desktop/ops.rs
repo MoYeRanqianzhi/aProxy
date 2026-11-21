@@ -72,7 +72,11 @@ pub enum ConfigTarget {
     /// A registered alias, not the CLI path fallback.
     Alias { id: Token },
     /// A file used by this exact run.
-    Run { run: Run },
+    Run {
+        run: Run,
+        #[serde(default, rename = "expectedFile")]
+        expected_file: Option<Token>,
+    },
 }
 
 /// One registered configuration choice; path and label are display text only.
@@ -324,6 +328,8 @@ pub struct Withheld {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConfigView {
+    /// Compare the canonical file observed for this run; choice IDs already bind the file.
+    pub file_token: Option<Token>,
     /// Redacted file display path.
     pub file: String,
     /// Projected scalar, list and header rows.

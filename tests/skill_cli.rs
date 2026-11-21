@@ -123,12 +123,12 @@ async fn roundtrip_and_aliases() {
     }
     assert_eq!(count, DOCS.len());
     fs::write(h.path().join("skills/a/SKILL.md"), "SECRET").unwrap();
-    for args in [
-        &["skill", "show", "a"][..],
-        &["skill", "show", "a", "MISSING"],
-        &["skill", "show", "unknown", "--files"],
+    for (args, code) in [
+        (&["skill", "show", "a"][..], 1),
+        (&["skill", "show", "a", "MISSING"], 4),
+        (&["skill", "show", "unknown", "--files"], 4),
     ] {
-        let o = run(&h, args, 1);
+        let o = run(&h, args, code);
         assert!(
             o.stdout.is_empty()
                 && !o.stderr.is_empty()
@@ -153,7 +153,7 @@ async fn missing_legacy_and_version_mismatch() {
                 .unwrap()
                 .contains("aproxy skill install")
         );
-        let o = run(&h, &["skill", "show", "old"], 1);
+        let o = run(&h, &["skill", "show", "old"], code);
         assert!(
             o.stdout.is_empty()
                 && String::from_utf8(o.stderr)

@@ -150,23 +150,26 @@ pub fn list(home: &Path) -> io::Result<Listing> {
 /// 名字和相对文件都必须精确命中；只有清单中的键才进入路径构造。
 pub fn show(home: &Path, name: &str, file: Option<&str>) -> io::Result<Vec<u8>> {
     let root = home.join("skills");
-    let m = load(&root).map_err(|e| {
-        if e.kind() == io::ErrorKind::NotFound {
-            io::Error::other(if legacy(&root).unwrap_or(false) {
-                LEGACY
+    let m = match load(&root) {
+        Ok(m) => m,
+        Err(e) => {
+            return Err(if e.kind() == io::ErrorKind::NotFound {
+                if legacy(&root)? {
+                    io::Error::other(LEGACY)
+                } else {
+                    io::Error::new(io::ErrorKind::NotFound, ABSENT)
+                }
             } else {
-                ABSENT
-            })
-        } else {
-            io::Error::other(DAMAGED)
+                io::Error::other(DAMAGED)
+            });
         }
-    })?;
+    };
     let file = file.unwrap_or("SKILL.md");
     let (key, record) = m
         .files
         .get_key_value(&format!("{name}/{file}"))
         .filter(|(k, _)| k.split_once('/') == Some((name, file)))
-        .ok_or_else(|| io::Error::other("skill 名或文件名不在清单中"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "skill 名或文件名不在清单中"))?;
     let read = || -> io::Result<Vec<u8>> {
         let f = open(&root, key)?;
         if f.metadata()?.len() != record.size {

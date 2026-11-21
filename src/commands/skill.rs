@@ -112,17 +112,28 @@ pub(crate) async fn run(cmd: SkillCmd) -> u8 {
         SkillCmd::Show { name, file, files } => {
             let bytes = if files {
                 installed::list(&home).and_then(|l| match l {
-                    Listing::Absent => Err(std::io::Error::other(installed::ABSENT)),
+                    Listing::Absent => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        installed::ABSENT,
+                    )),
                     Listing::Legacy => Err(std::io::Error::other(installed::LEGACY)),
                     Listing::Installed(s) => s
                         .into_iter()
                         .find(|s| s.name == name)
                         .map(|s| format!("{}\n", s.files.join("\n")).into_bytes())
-                        .ok_or_else(|| std::io::Error::other("skill 名不在清单中")),
+                        .ok_or_else(|| {
+                            std::io::Error::new(std::io::ErrorKind::NotFound, "skill 名不在清单中")
+                        }),
                 })
             } else {
                 installed::show(&home, &name, file.as_deref())
             };
+            if let Err(e) = &bytes
+                && e.kind() == std::io::ErrorKind::NotFound
+            {
+                eprintln!("{e}");
+                return EXIT_NOT_FOUND;
+            }
             match bytes.and_then(|b| std::io::stdout().lock().write_all(&b)) {
                 Ok(()) => EXIT_OK,
                 Err(e) => {

@@ -26,6 +26,7 @@ fn instance(port: u16, id: &str, n: u64) -> InstanceSummary {
         liveness: Presence::Live,
         restore_pending: false,
         restore_reason: None,
+        history_unavailable: None,
         feed: Feed::Joining,
         state: Some(decode(state(n)).unwrap()),
     }
@@ -342,4 +343,30 @@ fn both_eviction_limits_keep_in_flight_records() {
         .collect();
     trim(&mut active, 2);
     assert_eq!(active.len(), 4);
+}
+
+#[test]
+fn old_live_run_exposes_state_but_not_history_or_diagnostics() {
+    rt(async {
+        let (v, s) = Script::start();
+        {
+            let mut home = s.source.home.lock().unwrap();
+            home[0].history_unavailable = Some(HistoryUnavailable::SourceRedactionMissing);
+            home[0].state.as_mut().unwrap().activity.last_error =
+                Some(decode(json!({"message":"private", "at":5})).unwrap());
+        }
+        s.tick();
+        until(&v, |v| !v.instances().is_empty()).await;
+        let i = v.instances().remove(0);
+        let k = i.run.unwrap();
+        assert_eq!(i.feed, Feed::Polling);
+        assert!(i.state.unwrap().activity.last_error.is_none());
+        assert!(v.requests(&k).is_empty());
+        assert_eq!(v.detail(&k, "a-1").await, Err(ReadFailure::Unavailable));
+        assert_eq!(
+            v.body_chunk(&k, "a-1", Part::Request, None, 0, 4).await,
+            Err(ReadFailure::Unavailable)
+        );
+        v.shutdown().await;
+    })
 }

@@ -105,6 +105,8 @@ pub const FEATURE_SHUTDOWN_KEEP_RESTORE: &str = "shutdown.keep_restore";
 pub const FEATURE_SHUTDOWN_IF_IDLE_SECS: &str = "shutdown.if_idle_secs";
 /// 能力名：prepare_swap 认 `ttl_secs` 参数。
 pub const FEATURE_PREPARE_SWAP_TTL_SECS: &str = "prepare_swap.ttl_secs";
+/// The instance redacts client-supplied text at insertion, including diagnostics.
+pub const FEATURE_REDACTED_CLIENT_FIELDS: &str = "redacted_client_fields";
 
 /// 实例此刻所处的阶段。
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,10 +246,11 @@ impl IpcOp {
     ];
 
     /// 本版本认得的 op 参数（快照里的 `features`）
-    pub const FEATURES: [&'static str; 3] = [
+    pub const FEATURES: [&'static str; 4] = [
         FEATURE_SHUTDOWN_IF_IDLE_SECS,
         FEATURE_SHUTDOWN_KEEP_RESTORE,
         FEATURE_PREPARE_SWAP_TTL_SECS,
+        FEATURE_REDACTED_CLIENT_FIELDS,
     ];
 
     /// `aproxy stop` 用的 shutdown：不留期望状态记录
@@ -850,7 +853,8 @@ mod tests {
             [
                 "shutdown.if_idle_secs",
                 "shutdown.keep_restore",
-                "prepare_swap.ttl_secs"
+                "prepare_swap.ttl_secs",
+                "redacted_client_fields"
             ]
         );
     }

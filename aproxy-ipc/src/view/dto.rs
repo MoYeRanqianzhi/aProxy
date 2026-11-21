@@ -12,6 +12,15 @@ pub struct RunKey {
     pub instance_id: String,
 }
 
+/// Why request data cannot be exposed for an otherwise visible run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum HistoryUnavailable {
+    /// Restart with a version that guarantees source-side redaction.
+    SourceRedactionMissing,
+}
+
 /// A discovered port, including stopped ports awaiting restoration.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -32,6 +41,8 @@ pub struct InstanceSummary {
     pub restore_pending: bool,
     /// Machine-readable reason restoration has not happened.
     pub restore_reason: Option<String>,
+    /// Machine-readable history restriction established by the verified snapshot.
+    pub history_unavailable: Option<HistoryUnavailable>,
     /// Where state updates currently come from.
     pub feed: super::Feed,
     /// Verified operational state; absent when not live.

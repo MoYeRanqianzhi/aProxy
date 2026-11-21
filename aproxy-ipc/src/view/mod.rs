@@ -159,6 +159,15 @@ impl Source for Local {
                         liveness,
                         restore_pending: i.restore_pending,
                         restore_reason: i.restore_reason,
+                        history_unavailable: i
+                            .status
+                            .as_ref()
+                            .filter(|s| {
+                                !s.features
+                                    .iter()
+                                    .any(|f| f == crate::wire::FEATURE_REDACTED_CLIENT_FIELDS)
+                            })
+                            .map(|_| HistoryUnavailable::SourceRedactionMissing),
                         feed: if liveness == Presence::Live {
                             Feed::Joining
                         } else {
@@ -499,12 +508,16 @@ impl HomeView {
             .ports
             .get(&key.port)
             .filter(|e| e.info.run.as_ref() == Some(key) && e.info.liveness == Presence::Live)
-            .and_then(|e| e.info.pid)
-            .map(|pid| RunIdentity {
-                pid,
-                instance_id: key.instance_id.clone(),
-            })
             .ok_or(ReadFailure::RunChanged)
+            .and_then(|e| {
+                if e.info.history_unavailable.is_some() {
+                    return Err(ReadFailure::Unavailable);
+                }
+                Ok(RunIdentity {
+                    pid: e.info.pid.ok_or(ReadFailure::RunChanged)?,
+                    instance_id: key.instance_id.clone(),
+                })
+            })
     }
     /// Fetch metadata without retaining it or reading any body.
     pub async fn detail(
@@ -609,13 +622,25 @@ async fn drive(source: Arc<dyn Source>, shared: Arc<Shared>, ticks: BoxStream<'s
             let same = old
                 .as_ref()
                 .is_some_and(|e| e.info.run == info.run && e.info.pid == info.pid);
-            if (!same || info.liveness != Presence::Live)
+            let safe = info.history_unavailable.is_none();
+            if !safe {
+                info.feed = Feed::Polling;
+                if let Some(state) = &mut info.state {
+                    state.activity.last_error = None;
+                }
+            }
+            if (!same || !safe || info.liveness != Presence::Live)
                 && let Some((_, h)) = handles.remove(&p)
             {
                 h.abort();
             }
             if let Some(e) = &old {
-                if same && info.liveness == Presence::Live && e.info.liveness == Presence::Live {
+                if same
+                    && safe
+                    && e.info.history_unavailable.is_none()
+                    && info.liveness == Presence::Live
+                    && e.info.liveness == Presence::Live
+                {
                     info.feed = e.info.feed;
                     // A scan started before the last state event; don't regress a live stream.
                     if info.feed == Feed::Streaming {
@@ -625,7 +650,8 @@ async fn drive(source: Arc<dyn Source>, shared: Arc<Shared>, ticks: BoxStream<'s
                     shared.notify(Change::Requests(key.clone()));
                 }
             }
-            if !handles.contains_key(&p)
+            if safe
+                && !handles.contains_key(&p)
                 && info.liveness == Presence::Live
                 && let (Some(key), Some(pid)) = (&info.run, info.pid)
             {
@@ -661,7 +687,10 @@ async fn drive(source: Arc<dyn Source>, shared: Arc<Shared>, ticks: BoxStream<'s
                 p,
                 Entry {
                     info,
-                    records: old.filter(|_| same).map(|e| e.records).unwrap_or_default(),
+                    records: old
+                        .filter(|_| same && safe)
+                        .map(|e| e.records)
+                        .unwrap_or_default(),
                 },
             );
         }

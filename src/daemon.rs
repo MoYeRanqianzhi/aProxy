@@ -2634,7 +2634,7 @@ mod tests {
                 r#""buckets":{"width_secs":120,"requests":[ZEROS],"retries":[ZEROS],"failures":[ZEROS]},"last_error":null},"#,
                 r#""formats":[],"#,
                 r#""ops":["ping","shutdown","prepare_swap","requests","request","body","subscribe"],"#,
-                r#""features":["shutdown.if_idle_secs","shutdown.keep_restore","prepare_swap.ttl_secs"]}}"#
+                r#""features":["shutdown.if_idle_secs","shutdown.keep_restore","prepare_swap.ttl_secs","redacted_client_fields"]}}"#
             )
         );
         // 客户端读回同一份

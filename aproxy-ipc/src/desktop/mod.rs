@@ -3,6 +3,8 @@
 //! may gain fields; projection at this boundary must not make those fields public.
 
 mod codes;
+mod frames;
+pub use frames::*;
 mod history;
 pub use history::*;
 mod ops;

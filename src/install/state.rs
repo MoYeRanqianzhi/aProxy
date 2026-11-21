@@ -431,9 +431,51 @@ pub fn advance_in(home: &Path, state: &mut InstallState, to: InstallPhase) -> Re
     })
 }
 
+/// 私有的退出凭据：状态文件本身写坏时，等待者仍能读到原因。不参与判活、加锁或续作。
+#[derive(Serialize, Deserialize)]
+pub struct ExitEvidence {
+    /// 产生或观察到故障的安装事务属主。
+    pub pid: u32,
+    /// 标记这一次安装，避免旧诊断串到后一次操作。
+    pub started_at: u64,
+    /// 最后确认的阶段，区别于尝试写入但未成功的终态。
+    pub phase: InstallPhase,
+    /// 只留有界的失败原因，不复制可能含密钥的恢复规格。
+    pub reason: String,
+}
+
+impl ExitEvidence {
+    /// 只返回当前事务和属主的凭据；历史故障不能解释这一次退出。
+    pub fn read(home: &Path, state: &InstallState) -> Option<Self> {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(super::install_dir_in(home).join("last-exit.json"))
+            .ok()?
+            .take(32 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        let item: Self = serde_json::from_slice(&bytes).ok()?;
+        (item.pid == state.installer_pid && item.started_at == state.started_at).then_some(item)
+    }
+
+    /// 原子替换同一份有限大小的报告，不让多次失败无限占用空间。
+    pub fn record(home: &Path, state: &InstallState, reason: &str) -> std::io::Result<()> {
+        let item = Self {
+            pid: state.installer_pid,
+            started_at: state.started_at,
+            phase: state.failed_at.unwrap_or(state.phase),
+            reason: reason.chars().take(4096).collect(),
+        };
+        crate::fsx::write_atomic_private(
+            &super::install_dir_in(home).join("last-exit.json"),
+            &serde_json::to_vec(&item)?,
+        )
+    }
+}
+
 /// 失败落盘：记录原因并置 failed（保留现场）。已是 failed（续作重跑再次
 /// 失败）时只刷新原因——failed → failed 不是合法迁移，但原因必须是最新的。
-/// 落盘失败只能放弃（调用方本就在失败路径上，原错误已向上返回）。
+/// 写状态本身失败时另存原因；等待方不必猜测接手进程为什么退出。
 pub fn fail_in(home: &Path, state: &mut InstallState, error: &super::InstallFailure) {
     if state.phase != InstallPhase::Failed || state.failed_at.is_none() {
         state.failed_at = Some(state.phase);
@@ -442,7 +484,15 @@ pub fn fail_in(home: &Path, state: &mut InstallState, error: &super::InstallFail
     state.error_code = Some(error.code.clone());
     state.error_details = Some(error.details.clone());
     state.phase = InstallPhase::Failed;
-    let _ = write_in(home, state);
+    if let Err(io) = write_in(home, state) {
+        let reason = format!(
+            "{}: {}; saving install/state.json: {io}",
+            error.code, error.message
+        );
+        if let Err(other) = ExitEvidence::record(home, state, &reason) {
+            tracing::error!(%io, %other, "cannot persist installer failure");
+        }
+    }
 }
 
 /// 删除状态文件（done/aborted 后清场；不存在静默成功）。
@@ -453,6 +503,27 @@ pub fn remove_in(home: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_state_write_preserves_the_cause_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let mut st = InstallState::new_marking("x", InstallSource::From);
+        st.phase = InstallPhase::Verifying;
+        // 目录不能被临时文件 rename 替换，但同目录下的诊断文件仍可正常写入。
+        std::fs::create_dir_all(state_path_in(home)).unwrap();
+        fail_in(
+            home,
+            &mut st,
+            &super::super::InstallFailure::new("install_failed", "verification rejected"),
+        );
+        let evidence = ExitEvidence::read(home, &st).unwrap();
+        assert_eq!(evidence.phase, InstallPhase::Verifying);
+        assert!(evidence.reason.contains("verification rejected"));
+        assert!(evidence.reason.contains("state.json"));
+        st.started_at += 1;
+        assert!(ExitEvidence::read(home, &st).is_none());
+    }
 
     fn all_run_phases() -> impl Iterator<Item = InstallPhase> {
         InstallPhase::RUN_ORDER.iter().copied()

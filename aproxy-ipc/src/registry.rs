@@ -283,7 +283,7 @@ mod process_platform {
     /// 进程是否已退出：OpenProcess + GetExitCodeProcess。退出后即使进程
     /// 对象被其他句柄（Rust Child 等）维持，退出码也已确定——终止确认的
     /// 唯一可靠判据（start_time 查询在对象被引用期间会误报存活）。
-    /// OpenProcess 失败（对象已彻底回收）= 已退出 → Some(true)。
+    /// 只有无此 pid 才算退出；权限等其它错误不是死亡证据。
     pub fn process_exited(pid: u32) -> Option<bool> {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{
@@ -292,7 +292,10 @@ mod process_platform {
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if handle == 0 {
-                return Some(true);
+                let error = std::io::Error::last_os_error();
+                return (error.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32))
+                .then_some(true);
             }
             let mut code: u32 = 0;
             let ok = GetExitCodeProcess(handle, &mut code);

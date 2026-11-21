@@ -155,6 +155,22 @@ async fn install(args: InstallArgs) {
         )
     });
     if args.continue_ {
+        // 分离的接手者没有可读的 stderr；只记 panic 位置，不记可能含配置值的载荷。
+        let prior = std::panic::take_hook();
+        let panic_home = home.clone();
+        std::panic::set_hook(Box::new(move |info| {
+            use aproxy::install::state::{ExitEvidence, load_in};
+            if let Some(s) = load_in(&panic_home).filter(|s| s.installer_pid == std::process::id())
+            {
+                let location = info.location().map(|l| l.to_string()).unwrap_or_default();
+                let _ = ExitEvidence::record(
+                    &panic_home,
+                    &s,
+                    &format!("installer panic at {location}"),
+                );
+            }
+            prior(info);
+        }));
         // 续作模式：静默执行（由看护者/CLI 入口/交棒自动拉起）。失败落
         // failed 现场等下次续作，不打扰用户——但首轮失败输出到日志可查。
         // 硬退理由同 report_outcome：续作也可能再次交棒，后台任务不保证已结束
@@ -739,7 +755,48 @@ const HANDOVER_WAIT_SECS: u64 = aproxy::install::state::STALE_AFTER_SECS;
 /// 等待者退出才删得掉的 Windows 旧镜像由接手者在写成 done 后重试。失败判据：phase=failed、
 /// 接手进程已死而安装未终结、等待超时。
 async fn await_handover(home: &std::path::Path) -> Result<(), InstallFailure> {
-    use aproxy::install::state::{InstallPhase, is_stale, load_in, state_path_in};
+    let mut owner = OwnerExit::default();
+    wait_for_outcome(home, |pid| owner.observe(pid)).await
+}
+
+/// 首次看到属主便持有只读的 Windows 进程句柄：内核对象不随 pid 消失，退出后仍可查退出码。
+#[derive(Default)]
+struct OwnerExit {
+    #[cfg(windows)]
+    handle: Option<(u32, std::os::windows::io::OwnedHandle)>,
+}
+
+impl OwnerExit {
+    fn observe(&mut self, pid: u32) -> Option<String> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+            use windows_sys::Win32::System::Threading::{
+                GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            };
+            if self.handle.as_ref().is_none_or(|(id, _)| *id != pid) {
+                let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+                self.handle =
+                    (h != 0).then(|| (pid, unsafe { OwnedHandle::from_raw_handle(h as _) }));
+            }
+            if let Some((_, handle)) = &self.handle {
+                let mut code = 0;
+                return (unsafe { GetExitCodeProcess(handle.as_raw_handle() as _, &mut code) }
+                    != 0
+                    && code != 259)
+                    .then(|| format!("exit status {code} (0x{code:08x})"));
+            }
+        }
+        (aproxy::process::process_exited(pid) == Some(true))
+            .then(|| "exit status unavailable".to_owned())
+    }
+}
+
+async fn wait_for_outcome(
+    home: &std::path::Path,
+    mut exited: impl FnMut(u32) -> Option<String>,
+) -> Result<(), InstallFailure> {
+    use aproxy::install::state::{ExitEvidence, InstallPhase, load_in, state_path_in};
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(HANDOVER_WAIT_SECS);
     loop {
         if events::take_outcome(home)? {
@@ -759,7 +816,7 @@ async fn await_handover(home: &std::path::Path) -> Result<(), InstallFailure> {
                         aproxy::install::state::OBSERVER
                             .try_with(|o| o.id == id)
                             .unwrap_or(false)
-                    }) && !is_stale(&s, aproxy::watchdog::now_secs()) => {}
+                    }) && exited(s.installer_pid).is_none() => {}
                 InstallPhase::Done => return Ok(()),
                 InstallPhase::Failed => {
                     return Err(InstallFailure::recorded(
@@ -771,12 +828,27 @@ async fn await_handover(home: &std::path::Path) -> Result<(), InstallFailure> {
                 }
                 InstallPhase::Aborted => return Err("安装已被中止（--abort）".to_string().into()),
                 _ if s.installer_pid != std::process::id()
-                    && is_stale(&s, aproxy::watchdog::now_secs()) =>
+                    && let Some(status) = exited(s.installer_pid) =>
                 {
-                    return Err(format!(
-                        "接手进程（pid {}）已退出但安装停在 {:?}；现场已保留，重新执行 aproxy install 即可接着装完",
-                        s.installer_pid, s.phase
-                    ).into());
+                    // 读取与查判活之间可能已发布终态、再次交棒或清场；不能拿旧快照解释当前退出。
+                    if !load_in(home).is_some_and(|fresh| {
+                        (
+                            fresh.installer_pid,
+                            fresh.started_at,
+                            fresh.phase,
+                            fresh.updated_at,
+                        ) == (s.installer_pid, s.started_at, s.phase, s.updated_at)
+                    }) {
+                        continue;
+                    }
+                    let reason = ExitEvidence::read(home, &s)
+                        .map(|e| e.reason)
+                        .unwrap_or_else(|| {
+                            let reason = format!("no terminal state; {status}");
+                            let _ = ExitEvidence::record(home, &s, &reason);
+                            reason
+                        });
+                    return Err(format!("接手进程（pid {}）已退出但安装停在 {:?}：{reason}；重新执行 aproxy install 即可接着装完", s.installer_pid, s.phase).into());
                 }
                 _ => {}
             },
@@ -864,6 +936,37 @@ fn handle_abort(home: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn terminal_publish_between_state_and_exit_probe_wins() {
+        use aproxy::install::state::{self, InstallPhase, InstallSource, InstallState};
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        for success in [false, true] {
+            let mut st = InstallState::new_marking("x", InstallSource::From);
+            st.phase = InstallPhase::Verifying;
+            st.installer_pid = 1;
+            state::write_in(home, &mut st).unwrap();
+            let result = wait_for_outcome(home, |_| {
+                if success {
+                    state::remove_in(home);
+                } else {
+                    state::fail_in(
+                        home,
+                        &mut st,
+                        &InstallFailure::new("install_version_not_found", "terminal reason"),
+                    );
+                }
+                Some("exited".into())
+            })
+            .await;
+            if success {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().message, "terminal reason");
+            }
+        }
+    }
 
     /// cleaning 仍可能失败；等待者不能抢在失败落盘前退出，也不能丢掉接手者的退出码。
     #[tokio::test]

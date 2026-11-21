@@ -20,6 +20,28 @@ struct TestEnv {
     port: u16,
 }
 
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // 在 TestHome 清场前留证。完整现场可能含私有拉起规格，只打印阶段和错误。
+            use aproxy::install::state::{ExitEvidence, load_in};
+            if let Some(s) = load_in(self.home.path()) {
+                eprintln!(
+                    "installer pid={} phase={:?} failed_at={:?} code={:?} reason={:?} exit={:?}",
+                    s.installer_pid,
+                    s.phase,
+                    s.failed_at,
+                    s.error_code,
+                    s.last_error,
+                    ExitEvidence::read(self.home.path(), &s).map(|e| e.reason)
+                );
+            } else {
+                eprintln!("installer state absent or unreadable");
+            }
+        }
+    }
+}
+
 impl TestEnv {
     fn new() -> Self {
         let home = TestHome::new();

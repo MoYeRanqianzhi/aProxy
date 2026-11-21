@@ -71,7 +71,7 @@ async fn view_matches_instance_history_and_plain_logs() {
     };
     // 第一条在打开视图前就存在，另外两条从流来；不能只用订阅或只用启动时那一页。
     send().await;
-    let view = HomeView::open(home.path().into(), Duration::from_secs(1));
+    let view = HomeView::open(home.path().into(), Duration::from_secs(2));
     let mut changes = view.changes();
     let key = tokio::time::timeout(Duration::from_secs(30), async {
         loop {

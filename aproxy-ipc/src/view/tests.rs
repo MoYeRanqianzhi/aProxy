@@ -512,3 +512,15 @@ fn unknown_lifecycle_means_the_same_on_every_snapshot_path() {
     assert_eq!(expected, "unknown");
     assert_eq!(decode::<StateSnapshot>(state).unwrap().state, expected);
 }
+
+#[test]
+fn discovery_interval_has_a_floor_even_for_zero() {
+    rt(async {
+        for (input, effective) in [(0, 2), (1, 2), (2, 2), (7, 7)] {
+            assert_eq!(
+                discovery_timer(Duration::from_secs(input)).period(),
+                Duration::from_secs(effective)
+            );
+        }
+    })
+}

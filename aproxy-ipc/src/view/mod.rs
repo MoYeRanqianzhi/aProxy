@@ -489,11 +489,15 @@ pub struct HomeView {
     shared: Arc<Shared>,
     driver: tokio::task::JoinHandle<()>,
 }
+fn discovery_timer(interval: Duration) -> tokio::time::Interval {
+    let mut timer = tokio::time::interval(interval.max(Duration::from_secs(2)));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    timer
+}
 impl HomeView {
-    /// Start discovery immediately, then rescan with the supplied nonzero interval.
+    /// Start discovery immediately, then rescan at the requested interval (minimum two seconds).
     pub fn open(home: PathBuf, interval: Duration) -> Self {
-        let mut timer = tokio::time::interval(interval);
-        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let timer = discovery_timer(interval);
         Self::start(
             Arc::new(Local {
                 dir: home.join("run"),

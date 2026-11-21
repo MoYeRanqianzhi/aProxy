@@ -424,3 +424,76 @@ fn crate_verifier_checks_translated_contents_and_original_marker() {
         );
     }
 }
+
+/// 持锁模拟各个改名边界与清理中断。未提交的事务回滚，已提交的只回收备份。
+#[test]
+fn resume_interrupted_publication_at_each_boundary() {
+    for phase in 0..=6 {
+        let h = tempfile::tempdir().unwrap();
+        let root = h.path().join("skills");
+        let old = [("s/a", &b"old"[..])];
+        let new = [("s/a", &b"new"[..])];
+        let zip = package(h.path(), Some(&manifest_for(&old)), &old);
+        archive::install(h.path(), &zip, "1.0.0").unwrap();
+        let mine = root.join(".staging-other");
+        fs::create_dir(&mine).unwrap();
+        fs::write(mine.join("notes"), b"keep").unwrap();
+        let mut guard = super::skill_lock(h.path()).unwrap();
+        let private = super::private_root(&root, &mut guard).unwrap();
+        let active = private.join("active");
+        fs::create_dir(&active).unwrap();
+        let stage = super::workspace(&active).unwrap().keep();
+        let incoming = stage.join("incoming");
+        let previous = stage.join("previous");
+        if phase >= 1 {
+            fs::create_dir_all(incoming.join("s")).unwrap();
+            fs::write(incoming.join("s/a"), b"new").unwrap();
+            fs::write(
+                incoming.join(MARKER),
+                serde_json::to_vec(&manifest_for(&new)).unwrap(),
+            )
+            .unwrap();
+            fs::create_dir(&previous).unwrap();
+        }
+        if phase >= 2 {
+            fs::rename(root.join(MARKER), previous.join(MARKER)).unwrap();
+        }
+        if phase >= 3 {
+            fs::rename(root.join("s"), previous.join("s")).unwrap();
+        }
+        if phase >= 4 {
+            fs::rename(incoming.join("s"), root.join("s")).unwrap();
+        }
+        if phase >= 5 {
+            fs::rename(incoming.join(MARKER), root.join(MARKER)).unwrap();
+        }
+        if phase >= 6 {
+            fs::rename(&active, private.join("spent")).unwrap();
+        }
+        drop(guard);
+        let mut guard = super::skill_lock(h.path()).unwrap();
+        assert_eq!(super::private_root(&root, &mut guard).unwrap(), private);
+        super::recover(&root, &private).unwrap();
+        super::recover(&root, &private).unwrap();
+        assert_eq!(
+            super::installed::show(h.path(), "s", Some("a")).unwrap(),
+            if phase >= 5 { b"new" } else { b"old" }
+        );
+        assert!(!active.exists() && !private.join("spent").exists());
+        assert_eq!(fs::read(mine.join("notes")).unwrap(), b"keep");
+    }
+}
+/// 仅仅名字像工作区不构成清理授权；锁内记录与目录凭据不配套时不能接管。
+#[test]
+fn unrelated_workspace_is_not_adopted() {
+    let h = tempfile::tempdir().unwrap();
+    let mut guard = super::skill_lock(h.path()).unwrap();
+    let root = h.path().join("skills");
+    let private = super::private_root(&root, &mut guard).unwrap();
+    drop(guard);
+    fs::write(private.join("owner"), b"wrong").unwrap();
+    fs::create_dir(private.join("spent")).unwrap();
+    let mut guard = super::skill_lock(h.path()).unwrap();
+    assert!(super::private_root(&root, &mut guard).is_err());
+    assert!(private.join("spent").is_dir());
+}

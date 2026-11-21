@@ -161,13 +161,12 @@ fn check_entry<R: Read>(entry: &zip::read::ZipFile<'_, R>, limit: u64) -> io::Re
 /// 移走旧清单后才开始切换目录，最后发布标记。若某一步失败，逆序恢复已经移动的项目。
 fn replace(
     root: &Path,
-    stage: tempfile::TempDir,
+    stage: &Path,
     manifest: &Manifest,
     previous: Option<&Manifest>,
 ) -> io::Result<()> {
-    let src = stage.path().join("incoming");
-    let old = stage.path().join("previous");
-    fs::create_dir(&old)?;
+    let src = stage.join("incoming");
+    let old = stage.join("previous");
     let incoming = manifest.names();
     let owned = previous.map(Manifest::names).unwrap_or_default();
     for name in incoming.difference(&owned) {
@@ -185,6 +184,7 @@ fn replace(
     if let Some(prev) = previous {
         names.extend(prev.names());
     }
+    fs::create_dir(&old)?;
     let mut moved = Vec::new();
     let mut move_one = |from: std::path::PathBuf, to: std::path::PathBuf| -> io::Result<()> {
         // Windows 上 agent 正在短暂读取文档时可能阻止目录改名，留给它关闭句柄的机会。
@@ -222,7 +222,7 @@ fn replace(
             if fs::rename(to, from).is_err() {
                 return Err(io::Error::other(format!(
                     "skill 目录恢复失败，备份保存在 {}",
-                    stage.keep().display()
+                    stage.display()
                 )));
             }
         }
@@ -230,18 +230,73 @@ fn replace(
     result
 }
 
-/// 校验完所有文件才替换旧目录，未登记的其他目录仍属于用户。
+/// 只用公开路径和两个完整清单判断落位进度：新清单仍在 incoming 表示尚未提交。
+/// 先退回已发布的新目录，再恢复旧目录，最后恢复旧标记；恢复本身被中断也能重入。
+pub(super) fn restore_interrupted(root: &Path, stage: &Path) -> io::Result<()> {
+    let old = stage.join("previous");
+    let src = stage.join("incoming");
+    if !old.try_exists()? || !src.join(MARKER).try_exists()? {
+        return Ok(());
+    }
+    let incoming = super::installed::load(&src)?;
+    for name in incoming.names() {
+        if !src.join(name).try_exists()? {
+            fs::rename(root.join(name), src.join(name))?;
+        }
+    }
+    let prev = super::installed::load(&old).ok();
+    let owned = prev.as_ref().map(Manifest::names).unwrap_or_default();
+    // 不覆盖用户在中断期间放到目的地的内容；无法证明归属的备份保留给人工恢复。
+    for item in fs::read_dir(&old)?.take(super::manifest::MAX_FILES + 2) {
+        let name = item?.file_name();
+        if name == MARKER {
+            continue;
+        }
+        if !name.to_str().is_some_and(|n| owned.contains(n)) {
+            return Err(io::Error::other("skill 备份目录不在清单中"));
+        }
+        restore_one(&old.join(&name), &root.join(&name))?;
+    }
+    match fs::symlink_metadata(old.join(MARKER)) {
+        Ok(_) => restore_one(&old.join(MARKER), &root.join(MARKER))?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+/// 恢复改名不依赖各系统的覆盖语义，遇到冲突不删除目标。
+fn restore_one(from: &Path, to: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(to) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => fs::rename(from, to),
+        Ok(_) => Err(io::Error::other(format!(
+            "skill 恢复目标已存在：{}",
+            to.display()
+        ))),
+        Err(e) => Err(e),
+    }
+}
+/// 单测用独占的空目录直接检查发布结果；真正的安装由锁内工作区管理整个事务。
+#[cfg(test)]
 pub(super) fn install(home: &Path, zip: &Path, version: &str) -> io::Result<(Manifest, usize)> {
     let root = home.join("skills");
     crate::fsx::create_dir_all(&root)?;
     super::installed::directory(&root)?;
     let stage = super::workspace(&root)?;
-    let src = stage.path().join("incoming");
+    publish(&root, stage.path(), zip, version)
+}
+/// 校验完所有文件才替换旧目录，未登记的其他目录仍属于用户。
+pub(super) fn publish(
+    root: &Path,
+    stage: &Path,
+    zip: &Path,
+    version: &str,
+) -> io::Result<(Manifest, usize)> {
+    let src = stage.join("incoming");
     fs::create_dir(&src)?;
     let (m, ignored) = unpack(zip, &src, version)?;
     // 清单损坏时没有任何目录获准被替换。
-    let prev = super::installed::load(&root).ok();
-    replace(&root, stage, &m, prev.as_ref())?;
+    let prev = super::installed::load(root).ok();
+    replace(root, stage, &m, prev.as_ref())?;
     Ok((m, ignored))
 }
 

@@ -3,8 +3,8 @@
 //!
 //! 非强制语义（用户定调）：skill 不是二进制的依赖——下载失败重试后放弃，
 //! **安装照常成功**，主流程任何阶段都不等待/不受影响（唯一同步点：install
-//! 进程结束前 join 收尾并落终态）。下载是幂等覆盖操作，不建断电恢复状态机
-//! （半截文件下次重下即愈）；`--continue` 续作时 failed 不再自动重试
+//! 进程结束前 join 收尾并落终态）。未完成的下载重取；目录切换由持锁的下一次安装恢复。
+//! `--continue` 续作时 failed 不再自动重试
 //! （避免每次续作都拖一遍下载），`aproxy skill install` 手动重试。
 //!
 //! 落位 = 目录原子替换：解压到 staging 子目录 → 旧目录 rename 走 → 新目录
@@ -15,7 +15,11 @@ pub mod installed;
 pub mod manifest;
 
 use super::download::{self, Artifact, DownloadCtx};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    io::{self, Read, Write},
+};
 
 /// 同卷独占的临时目录。Unix 不依赖用户的 umask，Windows 继承私有 home 的 ACL。
 fn workspace(parent: &Path) -> std::io::Result<tempfile::TempDir> {
@@ -52,32 +56,120 @@ fn skill_lock(home: &Path) -> Result<super::InstallLock, String> {
         .ok_or_else(|| "另一个进程正在安装 skill，请稍后重试".into())
 }
 
-/// 只动 skill 的安装入口：下载与解包都在同卷独占的工作区，残留的半成品不复用也不清理。
+/// 锁内的定长令牌指向独占创建的私有目录。另半段令牌留在目录中作凭据，
+/// 不从目录名前缀猜所有权，不遍历 skills/。不确定归属（包括初始化中断）时停下而不清目录。
+fn private_root(root: &Path, lock: &mut super::InstallLock) -> io::Result<PathBuf> {
+    use std::hash::{BuildHasher, RandomState};
+    let file = &mut lock.file;
+    let mut token = String::new();
+    file.take(33).read_to_string(&mut token)?;
+    let invalid =
+        || io::Error::other("skill 工作区凭据无效；请移走 skills/ 后执行 aproxy skill install");
+    if token.is_empty() {
+        let rng = RandomState::new();
+        token = format!("{:016x}{:016x}", rng.hash_one(0u8), rng.hash_one(1u8));
+        let path = root.join(format!(".staging-{}", &token[..16]));
+        if fs::symlink_metadata(&path).is_ok() {
+            return Err(invalid());
+        }
+        file.write_all(token.as_bytes())?;
+        file.sync_data()?;
+    }
+    if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(invalid());
+    }
+    let path = root.join(format!(".staging-{}", &token[..16]));
+    match installed::directory(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let mut options = fs::DirBuilder::new();
+            let builder = &mut options;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder.create(&path)?;
+            fs::File::create_new(path.join("owner"))?.write_all(&token.as_bytes()[16..])?;
+        }
+        Err(e) => return Err(e),
+    }
+    let mut proof = Vec::new();
+    installed::open_regular(&path.join("owner"), fs::OpenOptions::new().read(true))
+        .map_err(|_| invalid())?
+        .take(17)
+        .read_to_end(&mut proof)?;
+    if proof != token.as_bytes()[16..] {
+        return Err(invalid());
+    }
+    Ok(path)
+}
+
+/// 私有目录里最多一份活动事务、一份待清理事务。先整体改名再删除；删除中断不再触发回滚。
+fn recover(root: &Path, private: &Path) -> io::Result<()> {
+    let active = private.join("active");
+    let spent = private.join("spent");
+    if spent.try_exists()? {
+        installed::directory(&spent)?;
+        fs::remove_dir_all(&spent)?;
+    }
+    if !active.try_exists()? {
+        return Ok(());
+    }
+    installed::directory(&active)?;
+    let mut entries = fs::read_dir(&active)?;
+    if let Some(entry) = entries.next().transpose()? {
+        if entries.next().is_some() || !entry.file_name().to_string_lossy().starts_with(".staging-")
+        {
+            return Err(io::Error::other("skill 工作区内容异常"));
+        }
+        let stage = entry.path();
+        installed::directory(&stage)?;
+        archive::restore_interrupted(root, &stage)?;
+    }
+    fs::rename(active, &spent)?;
+    fs::remove_dir_all(spent)
+}
+
+/// 在同一把锁里恢复上一次切换，再下载、核验与发布；失败也在释放锁之前收尾。
+
 pub async fn install(
     ctx: &DownloadCtx,
     chain: &[download::ChainStep],
     home: &Path,
 ) -> Result<usize, super::InstallFailure> {
-    let _lock = skill_lock(home)?;
-    let dl = workspace(&home.join("skills")).map_err(|e| format!("skill 下载目录创建失败：{e}"))?;
-    let fetched = download::fetch_artifact(ctx, chain, Artifact::Skills, dl.path())
-        .await
-        .map_err(|e| {
-            // 链条的文字可能已经拼接了多个来源。整段地址去掉，保留渠道与失败原因；
-            // 同一错误也可能写入普通安装的状态文件，不能只在 CLI 打印时做遮盖。
-            static URL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-                regex::Regex::new(r"(?i)[a-z][a-z0-9+.\-]*://\S+").unwrap()
-            });
-            let message = URL.replace_all(&e.message, "[URL 已隐去]").into_owned();
-            e.with_message(message)
-        })?;
-    let (manifest, ignored) = archive::install(home, &fetched.path, &ctx.version)
-        .map_err(|e| format!("skill 安装失败：{e}"))?;
-    if ignored != 0 {
-        tracing::warn!(ignored, "已跳过 skill 包中未登记的条目");
+    let mut lock = skill_lock(home)?;
+    let root = home.join("skills");
+    let private = private_root(&root, &mut lock).map_err(|e| e.to_string())?;
+    recover(&root, &private).map_err(|e| e.to_string())?;
+    let active = private.join("active");
+    fs::create_dir(&active).map_err(|e| e.to_string())?;
+    let stage = workspace(&active)
+        .map_err(|e| format!("skill 下载目录创建失败：{e}"))?
+        .keep();
+    let result = async {
+        let fetched = download::fetch_artifact(ctx, chain, Artifact::Skills, &stage)
+            .await
+            .map_err(|e| {
+                // 链条的文字可能已经拼接了多个来源。整段地址去掉，保留渠道与失败原因；
+                // 同一错误也可能写入普通安装的状态文件，不能只在 CLI 打印时做遮盖。
+                static URL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+                    regex::Regex::new(r"(?i)[a-z][a-z0-9+.\-]*://\S+").unwrap()
+                });
+                let message = URL.replace_all(&e.message, "[URL 已隐去]").into_owned();
+                e.with_message(message)
+            })?;
+        let (manifest, ignored) = archive::publish(&root, &stage, &fetched.path, &ctx.version)
+            .map_err(|e| format!("skill 安装失败：{e}"))?;
+        if ignored != 0 {
+            tracing::warn!(ignored, "已跳过 skill 包中未登记的条目");
+        }
+        tracing::info!(skills=?manifest.names(),"skill 文档已随版本落位");
+        Ok(manifest.files.len())
     }
-    tracing::info!(skills=?manifest.names(),"skill 文档已随版本落位");
-    Ok(manifest.files.len())
+    .await;
+    recover(&root, &private).map_err(|e| e.to_string())?;
+    result
 }
 
 #[cfg(test)]

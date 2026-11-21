@@ -209,6 +209,7 @@ fn fixture_checks_git_objects_attributes_and_zip_metadata() {
     let out = h.path().join("out");
     let run = || {
         h.cmd_with(py)
+            .env("PYTHONIOENCODING", "utf-8")
             .arg(&script)
             .arg(env!("CARGO_PKG_VERSION"))
             .arg(&out)
@@ -228,7 +229,7 @@ fn fixture_checks_git_objects_attributes_and_zip_metadata() {
     assert_eq!(z.len(), 3);
     for (index, key) in ["manifest.json", "s/a", "s/z"].into_iter().enumerate() {
         let mut e = z.by_index(index).unwrap();
-        assert_eq!(e.name(), key);
+        assert_eq!(e.name().unwrap(), key);
         assert_eq!(e.unix_mode(), Some(0o100644));
         assert_eq!(e.compression(), zip::CompressionMethod::Stored);
         let dt = e.last_modified().unwrap();

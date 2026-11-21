@@ -188,7 +188,7 @@ async fn serve() {
             log_path: None,
             foreground: true,
         },
-        behavior: daemon::Behavior::of(&state.config),
+        behavior: daemon::behavior_of(&state.config),
         run_dir: daemon::run_dir().display().to_string(),
         stats: state.stats.clone(),
         history: state.history.clone(),

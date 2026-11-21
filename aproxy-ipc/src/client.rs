@@ -365,7 +365,16 @@ pub async fn subscribe_for_run_in(
         // An error frame has no run ID. Keep this connection open while checking
         // the peer of a fresh ping before assigning a refusal to a selected run.
         if let (Some(expected), Err(IpcError::Remote { .. })) = (expected, &response) {
-            let status = request_raw(&endpoint, IpcOp::Ping).await?;
+            let status =
+                request_raw(&endpoint, IpcOp::Ping)
+                    .await
+                    .map_err(|error| match error {
+                        // A second refusal is still not evidence of the issuer's run ID.
+                        IpcError::Remote { .. } => {
+                            IpcError::Protocol("cannot verify subscription refusal".into())
+                        }
+                        other => other,
+                    })?;
             RunIdentity {
                 pid: status.instance.pid,
                 instance_id: status.instance.instance_id,
@@ -738,49 +747,131 @@ mod tests {
     }
     #[test]
     fn rejected_openings_and_events_close_the_real_connection() {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        runtime.block_on(async {
-            for case in ["missing", "replacement", "request", "state", "ack-size", "event-size", "exact"] {
-                let dir=tempfile::tempdir().unwrap(); let endpoint=endpoint_for_in(dir.path(), "frames");
-                #[cfg(unix)] let listener=tokio::net::UnixListener::bind(&endpoint).unwrap();
-                #[cfg(windows)] let listener=tokio::net::windows::named_pipe::ServerOptions::new().first_pipe_instance(true).create(&endpoint).unwrap();
-                let pid=std::process::id();
-                let server=tokio::spawn(async move {
-                    #[cfg(windows)] let mut pipe={listener.connect().await.unwrap();listener};
-                    #[cfg(unix)] let mut pipe=listener.accept().await.unwrap().0;
-                    let mut request=String::new(); BufReader::new(&mut pipe).read_line(&mut request).await.unwrap();
-                    assert_eq!(serde_json::from_str::<serde_json::Value>(&request).unwrap()["op"],"subscribe");
-                    let mut instance=json!({"pid":pid,"instance_id":"first","start":"s","version":"v","listen_addr":"local","base_url":"","started_at":1,"foreground":true});
-                    if case=="missing" {instance.as_object_mut().unwrap().remove("instance_id");}
-                    if case=="replacement" {instance["instance_id"]=json!("second");}
-                    let mut ack=json!({"v":1,"ok":true,"result":{"snapshot":{"instance":instance},"requests":[]}}).to_string().into_bytes();
-                    if case=="ack-size" {ack.resize(crate::wire::MAX_REPLY_LINE,b' ');} else if case=="exact" {ack.resize(crate::wire::MAX_REPLY_LINE-1,b' ');} ack.push(b'\n');
-                    let mut frames=ack;
-                    instance["instance_id"]=json!("second");
-                    let event=match case {"request"=>Some(json!({"event":"request","data":{"request_id":"second-1"}})),"state"=>Some(json!({"event":"state","data":{"instance":instance}})),"event-size"=>Some(json!({"event":"heartbeat"})), _=>None};
-                    if let Some(event)=event {let mut line=event.to_string().into_bytes();if case=="event-size" {line.resize(crate::wire::MAX_REPLY_LINE,b' ');} frames.extend(line);frames.push(b'\n');}
-                    let _=pipe.write_all(&frames).await;
-                    let mut byte=[0]; assert!(matches!(pipe.read(&mut byte).await,Ok(0)|Err(_)));
-                });
-                let run=RunIdentity {pid,instance_id:"first".into()};
-                let opened=subscribe_for_run_in(dir.path(),"frames",Some(&run)).await;
-                match case {
-                    "missing"=>assert!(matches!(opened,Err(IpcError::Protocol(_)))),
-                    "replacement"=>assert!(matches!(opened,Err(IpcError::RunChanged))),
-                    "ack-size"=>assert!(matches!(opened,Err(IpcError::LineTooLong))),
-                    "exact"=>drop(opened.unwrap()),
-                    _=>{let (_,mut stream)=opened.unwrap(); let result=stream.next().await;
-                        if case=="event-size" {assert!(matches!(result,Err(IpcError::LineTooLong)));} else {assert!(matches!(result,Err(IpcError::RunChanged)));}
-                        assert!(stream.next().await.unwrap().is_none());
-                    }
+        for case in [
+            "missing",
+            "replacement",
+            "request",
+            "state",
+            "ack-size",
+            "event-size",
+            "exact",
+            "refused-ping",
+        ] {
+            runtime.block_on(check_rejected_connection(case));
+        }
+    }
+
+    async fn check_rejected_connection(case: &'static str) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = endpoint_for_in(dir.path(), "frames");
+        #[cfg(unix)]
+        let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
+        #[cfg(windows)]
+        let listener = tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&endpoint)
+            .unwrap();
+        let pid = std::process::id();
+        let server = tokio::spawn(async move {
+            #[cfg(windows)]
+            let mut pipe = {
+                listener.connect().await.unwrap();
+                listener
+            };
+            #[cfg(unix)]
+            let mut pipe = listener.accept().await.unwrap().0;
+            let mut request = String::new();
+            BufReader::new(&mut pipe)
+                .read_line(&mut request)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request).unwrap()["op"],
+                "subscribe"
+            );
+            if case == "refused-ping" {
+                #[cfg(windows)]
+                let mut ping = tokio::net::windows::named_pipe::ServerOptions::new()
+                    .create(&endpoint)
+                    .unwrap();
+                let refusal = crate::wire::Rejection::Busy { limit: 8 }.reply() + "\n";
+                pipe.write_all(refusal.as_bytes()).await.unwrap();
+                #[cfg(unix)]
+                let mut ping = listener.accept().await.unwrap().0;
+                #[cfg(windows)]
+                ping.connect().await.unwrap();
+                request.clear();
+                BufReader::new(&mut ping)
+                    .read_line(&mut request)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&request).unwrap()["op"],
+                    "ping"
+                );
+                ping.write_all(refusal.as_bytes()).await.unwrap();
+            } else {
+                let mut instance = json!({"pid":pid,"instance_id":"first","start":"s","version":"v","listen_addr":"local","base_url":"","started_at":1,"foreground":true});
+                if case == "missing" {
+                    instance.as_object_mut().unwrap().remove("instance_id");
                 }
-                server.await.unwrap();
+                if case == "replacement" {
+                    instance["instance_id"] = json!("second");
+                }
+                let mut frames = json!({"v":1,"ok":true,"result":{"snapshot":{"instance":instance},"requests":[]}}).to_string().into_bytes();
+                match case {
+                    "ack-size" => frames.resize(crate::wire::MAX_REPLY_LINE, b' '),
+                    "exact" => frames.resize(crate::wire::MAX_REPLY_LINE - 1, b' '),
+                    _ => (),
+                }
+                frames.push(b'\n');
+                instance["instance_id"] = json!("second");
+                let event = match case {
+                    "request" => Some(json!({"event":"request","data":{"request_id":"second-1"}})),
+                    "state" => Some(json!({"event":"state","data":{"instance":instance}})),
+                    "event-size" => Some(json!({"event":"heartbeat"})),
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    let mut line = event.to_string().into_bytes();
+                    if case == "event-size" {
+                        line.resize(crate::wire::MAX_REPLY_LINE, b' ');
+                    }
+                    frames.extend(line);
+                    frames.push(b'\n');
+                }
+                let _ = pipe.write_all(&frames).await;
             }
-        })
+            let mut byte = [0];
+            assert!(matches!(pipe.read(&mut byte).await, Ok(0) | Err(_)));
+        });
+        let run = RunIdentity {
+            pid,
+            instance_id: "first".into(),
+        };
+        let opened = subscribe_for_run_in(dir.path(), "frames", Some(&run)).await;
+        match case {
+            "missing" | "refused-ping" => assert!(matches!(opened, Err(IpcError::Protocol(_)))),
+            "replacement" => assert!(matches!(opened, Err(IpcError::RunChanged))),
+            "ack-size" => assert!(matches!(opened, Err(IpcError::LineTooLong))),
+            "exact" => drop(opened.unwrap()),
+            _ => {
+                let (_, mut stream) = opened.unwrap();
+                let result = stream.next().await;
+                if case == "event-size" {
+                    assert!(matches!(result, Err(IpcError::LineTooLong)));
+                } else {
+                    assert!(matches!(result, Err(IpcError::RunChanged)));
+                }
+                assert!(stream.next().await.unwrap().is_none());
+            }
+        }
+        server.await.unwrap();
     }
 
     #[test]

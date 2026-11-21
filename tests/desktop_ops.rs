@@ -409,7 +409,11 @@ async fn private_window_state_is_bounded_resettable_and_write_only_for_secrets()
     let host = DesktopHome::new(home.path().into(), env!("CARGO_BIN_EXE_aproxy").into()).unwrap();
     assert_eq!(
         host.about().unwrap().variant,
-        aproxy_ipc::desktop::Variant::Headless
+        if cfg!(feature = "desktop") {
+            aproxy_ipc::desktop::Variant::Desktop
+        } else {
+            aproxy_ipc::desktop::Variant::Headless
+        }
     );
     let initial = host.read_desktop_state().await.unwrap();
     assert!(initial.reset.is_empty() && initial.bookmarks.is_empty());

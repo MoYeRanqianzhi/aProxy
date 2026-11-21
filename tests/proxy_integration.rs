@@ -5723,7 +5723,11 @@ fn port_zero_restore_record_uses_actual_port() {
     let out = home.cmd().args(["stop", &port]).output().unwrap();
     assert!(
         out.status.success(),
-        "stop 应成功: stdout {:?} stderr {:?}",
+        "stop 应成功: status {} (code {:?}) daemon pid {} port {} stdout {:?} stderr {:?}",
+        out.status,
+        out.status.code(),
+        info.pid,
+        port,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );

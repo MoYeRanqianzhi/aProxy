@@ -25,6 +25,7 @@ use std::{
 use aproxy::{config::Config, proxy::AppState};
 
 mod common;
+use common::CopiedExecutable;
 use common::{ChildGuard, TestHome, format_echo_path, free_port};
 
 // 本机环境常带 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY（指向外部代理），会把指向
@@ -6225,7 +6226,7 @@ fn watchdog_readiness_does_not_accept_a_starting_ping() {
         .unwrap();
     let _daemon = ChildGuard(
         home.serve_cmd_with(common::start_clock_path(), &cfg)
-            .spawn()
+            .spawn_ready()
             .unwrap(),
     );
     let end = std::time::Instant::now() + Duration::from_secs(5);
@@ -6409,7 +6410,7 @@ fn identity_check_tolerates_swapped_binary() {
 
     let mut daemon_child = home
         .serve_cmd_with(&bin, &cfg_file)
-        .spawn()
+        .spawn_ready()
         .expect("spawn 副本守护失败");
     let pid = daemon_child.id();
     let mut ready = false;

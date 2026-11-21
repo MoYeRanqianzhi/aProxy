@@ -8,6 +8,7 @@
 //! 进程只按这个临时 home 的台账（核验启动标记）或测试自己持有的子进程句柄，绝不按名字。
 
 mod common;
+use common::CopiedExecutable;
 use common::{TestHome, free_port};
 
 use aproxy::install::force::{self, Manifest, ManifestAsset, OnlineSpec};
@@ -84,7 +85,7 @@ impl ForceHome {
                 &bin_path_in(self.path()),
                 &["start", "--config", cfg.to_str().unwrap()],
             )
-            .output()
+            .output_ready()
             .unwrap();
         assert!(
             out.status.success(),
@@ -432,7 +433,7 @@ fn only_verified_ledger_processes_are_stopped() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_ready()
         .unwrap();
     let next = home.next_binary();
 

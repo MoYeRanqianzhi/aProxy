@@ -24,6 +24,7 @@
 //! 台账。
 
 mod common;
+use common::CopiedExecutable;
 use common::{TestHome, free_port};
 
 use aproxy::install::force;
@@ -66,7 +67,7 @@ fn version_of(home: &TestHome, exe: &Path) -> String {
         .cmd_with(exe)
         .arg("--version")
         .stdin(Stdio::null())
-        .output()
+        .output_ready()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     force::VersionLine::parse(&text)
@@ -137,7 +138,7 @@ fn force_install_across(installer: &Path, target: &Path, running: &Path) {
             .cmd_with(exe)
             .args(args)
             .stdin(Stdio::null())
-            .output()
+            .output_ready()
             .unwrap();
         let text = format!(
             "{}{}",

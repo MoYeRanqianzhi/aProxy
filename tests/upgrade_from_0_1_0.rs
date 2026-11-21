@@ -15,6 +15,7 @@
 //! 可能碰到它们。
 
 mod common;
+use common::CopiedExecutable;
 use common::{TestHome, free_port};
 
 use std::path::{Path, PathBuf};
@@ -49,7 +50,7 @@ fn installer_of_0_1_0_refuses_this_build_before_touching_anything() {
     copy_exe(&old_bin, &bin);
     let new_bin = home.join(format!("download-{}", exe_name()));
     copy_exe(Path::new(env!("CARGO_BIN_EXE_aproxy")), &new_bin);
-    let run = |args: &[&str]| test_home.cmd_with(&bin).args(args).output().unwrap();
+    let run = |args: &[&str]| test_home.cmd_with(&bin).args(args).output_ready().unwrap();
     let text = |out: &std::process::Output| {
         format!(
             "{}{}",

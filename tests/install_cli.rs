@@ -1,5 +1,28 @@
 //! 安装入口与交棒后的安全检查：实例、台账、控制端点与二进制都在独立的临时 home 中。
 mod common;
+use common::CopiedExecutable;
+
+#[test]
+fn copied_executable_retries_only_the_pre_exec_busy_error() {
+    use std::io::ErrorKind;
+    let mut attempts = 0;
+    common::retry_exec(|| {
+        attempts += 1;
+        if attempts == 1 {
+            Err(ErrorKind::ExecutableFileBusy.into())
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap();
+    assert_eq!(attempts, 2);
+    let err = common::retry_exec(|| {
+        attempts += 1;
+        Err::<(), _>(ErrorKind::PermissionDenied.into())
+    })
+    .unwrap_err();
+    assert_eq!((err.kind(), attempts), (ErrorKind::PermissionDenied, 3));
+}
 use aproxy::install::{
     state::{self, InstallPhase, InstallSource, InstallState},
     swap,
@@ -101,21 +124,7 @@ async fn instance(h: &TestHome, exe: &Path, foreground: bool) -> (u16, ChildGuar
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // 另一个测试线程 fork 的子进程在 exec 之前仍可能持有刚复制镜像的写句柄。
-    // 只重试这个暂时的执行冲突；路径、权限、架构错误仍由第一次 spawn 原样报告。
-    let mut waits = [25, 50, 100, 200, 400, 800].into_iter();
-    let child = ChildGuard(loop {
-        match cmd.spawn() {
-            Err(e)
-                if cfg!(unix)
-                    && e.kind() == std::io::ErrorKind::ExecutableFileBusy
-                    && let Some(ms) = waits.next() =>
-            {
-                tokio::time::sleep(Duration::from_millis(ms)).await
-            }
-            other => break other.unwrap(),
-        }
-    });
+    let child = ChildGuard(cmd.spawn_ready().unwrap());
     let dir = h.path().join("run");
     for _ in 0..100 {
         if let Ok(status) = aproxy::daemon::ipc_ping_in(&dir, &port.to_string()).await

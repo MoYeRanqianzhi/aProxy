@@ -2,6 +2,7 @@
 //! 进程内直接跑——子进程黑盒链路里看不到的卡点在此暴露）。
 
 mod common;
+use common::CopiedExecutable;
 use common::{TestHome, free_port};
 
 use std::path::Path;
@@ -68,7 +69,7 @@ async fn continue_from_restarting_reclaims_instance() {
         .serve_cmd_with(&bin, &cfg_file)
         .stdout(Stdio::null())
         .stderr(dbg_err)
-        .spawn()
+        .spawn_ready()
         .unwrap();
     std::thread::sleep(Duration::from_millis(500));
     println!(
@@ -223,7 +224,7 @@ async fn continue_from_swapping_with_live_instance_redoes_swap() {
         .serve_cmd_with(&bin, &cfg_file)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_ready()
         .unwrap();
     let old_pid = child.id();
     let mut ready = false;
@@ -643,7 +644,7 @@ fn start_instance(
         .serve_cmd_with(exe, &cfg)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_ready()
         .unwrap();
     let run_dir = home.join("run");
     let pid = child.id();

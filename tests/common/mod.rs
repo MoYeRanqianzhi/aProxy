@@ -19,6 +19,37 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, PoisonError};
 
+/// 另一个线程 fork 的子进程在 exec 之前可能短暂持有刚复制的镜像的写句柄。
+/// 只重试内核报的执行冲突；路径、权限和格式错误不等待，不重跑已执行的命令。
+pub fn retry_exec<T>(mut exec: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut waits = [25, 50, 100, 200, 400, 800].into_iter();
+    loop {
+        match exec() {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && let Some(ms) = waits.next() =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(ms))
+            }
+            result => return result,
+        }
+    }
+}
+
+/// 执行安装、恢复测试写入临时目录的镜像，并保留原有的标准流设置。
+pub trait CopiedExecutable {
+    fn spawn_ready(&mut self) -> std::io::Result<Child>;
+    fn output_ready(&mut self) -> std::io::Result<std::process::Output>;
+}
+impl CopiedExecutable for Command {
+    fn spawn_ready(&mut self) -> std::io::Result<Child> {
+        retry_exec(|| self.spawn())
+    }
+    fn output_ready(&mut self) -> std::io::Result<std::process::Output> {
+        retry_exec(|| self.output())
+    }
+}
+
 /// 当前构建出的 aproxy（cargo 为集成测试提供的绝对路径）
 pub const APROXY: &str = env!("CARGO_BIN_EXE_aproxy");
 
@@ -265,7 +296,8 @@ impl Drop for TestHome {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status();
+                .spawn_ready()
+                .and_then(|mut child| child.wait());
         }
         // 兜底：台账里仍在运行的进程。条目只可能由带着这个 APROXY_HOME 运行的进程（或测试
         // 自己）写进来；ledger::terminate 只认 pid 加启动标记，并核对属主是当前用户，核验

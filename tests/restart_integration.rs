@@ -19,6 +19,7 @@
 //! 进程前一律核对其镜像路径在本测试的临时目录或 cargo target 目录下。
 
 mod common;
+use common::CopiedExecutable;
 use common::{ChildGuard, TestHome, free_port};
 
 use std::path::{Path, PathBuf};
@@ -227,7 +228,7 @@ fn spawn_daemon_with(home: &TestHome, exe: &Path, cfg: &Path) -> ChildGuard {
         home.serve_cmd_with(exe, cfg)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
+            .spawn_ready()
             .expect("spawn 守护子进程失败"),
     )
 }
@@ -243,7 +244,7 @@ fn spawn_watchdog(home: &TestHome, exe: &Path, log: &Path) -> ChildGuard {
             .env("NO_COLOR", "1")
             .stdout(Stdio::from(out))
             .stderr(Stdio::null())
-            .spawn()
+            .spawn_ready()
             .expect("spawn 看护者失败"),
     )
 }
@@ -280,7 +281,9 @@ fn cli(home: &TestHome, exe: &Path, args: &[&str]) -> std::process::Command {
 }
 
 fn run_cli(home: &TestHome, exe: &Path, args: &[&str]) -> std::process::Output {
-    cli(home, exe, args).output().expect("运行 aproxy CLI 失败")
+    cli(home, exe, args)
+        .output_ready()
+        .expect("运行 aproxy CLI 失败")
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -487,7 +490,7 @@ fn restart_early_exit_shows_startup_log_excerpt() {
     let restart = {
         // Command 在本线程里建好再交给子线程：它带着 TestHome 注入的环境
         let mut cmd = cli(&test_home, &exe, &["restart", &port.to_string()]);
-        std::thread::spawn(move || cmd.output().expect("运行 aproxy CLI 失败"))
+        std::thread::spawn(move || cmd.output_ready().expect("运行 aproxy CLI 失败"))
     };
     // 预检是毫秒级的；此刻旧实例正在等在途连接，新实例尚未 spawn
     std::thread::sleep(Duration::from_millis(1500));
@@ -845,7 +848,7 @@ fn concurrent_start_with_release_asset_name_converges_to_one_watchdog() {
             );
             cmd.env("APROXY_WATCHDOG_SCAN_SECS", "1")
                 .env("RUST_LOG", "info");
-            std::thread::spawn(move || cmd.output().unwrap())
+            std::thread::spawn(move || cmd.output_ready().unwrap())
         })
         .collect();
     // start CLI 拉起看护者时向 stderr 写 INFO「看护者已随实例启动拉起 … pid=N」：收集全部
@@ -1043,7 +1046,7 @@ fn restart_keeps_the_launchers_proxy_environment() {
         &["start", "--config", cfg.to_str().unwrap()],
     )
     .env("HTTP_PROXY", &proxy_url)
-    .output()
+    .output_ready()
     .unwrap();
     assert!(out.status.success(), "start: {}", text(&out.stderr));
     let spec = restore_spec(home, port).expect("后台实例应有期望状态记录");
@@ -1102,7 +1105,7 @@ fn secrets_never_reach_the_instance_or_watchdog_command_line() {
         ],
     )
     .env("APROXY_WATCHDOG_SCAN_SECS", "1")
-    .output()
+    .output_ready()
     .unwrap();
     assert!(out.status.success(), "start: {}", text(&out.stderr));
 

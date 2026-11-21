@@ -9,6 +9,7 @@
 //! 状态机推进，不是版本差异；verifying 的 version==target 对同版本成立）。
 
 mod common;
+use common::CopiedExecutable;
 use common::{TestHome, free_port};
 
 use std::process::{Command, Stdio};
@@ -90,7 +91,7 @@ fn bin_works(home: &TestHome) -> bool {
     let bin = aproxy::install::swap::bin_path_in(home.path());
     home.cmd_with(&bin)
         .arg("--version")
-        .output()
+        .output_ready()
         .is_ok_and(|out| {
             out.status.success()
                 && aproxy::install::staging::version_of(&bin, &String::from_utf8_lossy(&out.stdout))
@@ -196,7 +197,7 @@ fn install_from_with_instance_rolling_restart() {
         .serve_cmd_with(&bin, &cfg_file)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_ready()
         .unwrap();
     let old_pid = child.id();
     std::mem::forget(child);
@@ -294,7 +295,7 @@ async fn jurisdiction_check_rejects_foreign_binary() {
         .serve_cmd_with(&foreign_bin, &cfg_file)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_ready()
         .unwrap();
     std::mem::forget(child);
     let run_dir = env.home().join("run");
@@ -395,7 +396,7 @@ async fn jurisdiction_accepts_an_instance_started_through_a_short_path() {
         .serve_cmd_with(&short_bin, &cfg_file)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_ready()
         .unwrap();
     let run_dir = env.home().join("run");
     let mut ready = false;
@@ -456,7 +457,7 @@ fn adopt_migrates_foreign_instance() {
         .serve_cmd_with(&foreign_bin, &cfg_file)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_ready()
         .unwrap();
     std::mem::forget(child);
     let run_dir = env.home().join("run");
@@ -595,7 +596,7 @@ fn install_instance_failure_exits_nonzero_and_keeps_restore() {
         .serve_cmd_with(&bin, &cfg_file)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_ready()
         .unwrap();
     let run_dir = env.home().join("run");
     let restore_file = aproxy::spec::restore_path_in(&run_dir, &env.port.to_string());
@@ -698,7 +699,7 @@ fn unix_install_rolls_back_instance_to_preserved_old_binary() {
         .serve_cmd_with(&bin, &cfg_file)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_ready()
         .unwrap();
     let old_pid = child.id();
     let run_dir = env.home().join("run");
@@ -779,7 +780,7 @@ fn start_bin_instance(env: &TestEnv, name: &str) -> std::process::Child {
         .serve_cmd_with(aproxy::install::swap::bin_path_in(&env.home()), &cfg_file)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_ready()
         .unwrap();
     let run_dir = env.home().join("run");
     for _ in 0..100 {

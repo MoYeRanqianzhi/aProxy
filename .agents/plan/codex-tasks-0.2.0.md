@@ -53,13 +53,13 @@
 
 三项 Rust 工作一个接一个做（内存所限），可以写成一份任务书的三个阶段，也可以分开；前端工作由主代理在独立 worktree 里并行。
 
-6. **t07：W4 `aproxy skill` 命令**（2026-11-21 派出，三个阶段：清单与核验读、命令、打包；`--skills-only` 保留为隐藏别名）
+6. **t07：W4 `aproxy skill` 命令**（做完并合入，2026-11-21；Codex 报告 headless 全量 1146 通过、0 失败、11 忽略，三种 clippy 干净。审查 v20 已派出。发版工作流改过，打 beta.1 之前要手动触发演练一次：`workflow_dispatch`，`version: 0.2.0-beta.1`，不打 tag。`--skills-only` 保留为隐藏别名，带 `--json` 时仍按已发布的行为以 2 退出）
    - 范围：`skill install`、`upgrade`、`list`、`show`；删掉 `install --skills-only`；带清单的 skills 包与按清单解包；
      所有 `--help` 末尾的提示行。
    - 依据：[release-0.2.0](release-0.2.0.md) 的 W4 一节，含审查补充的安全设计（`show` 先读进内存、核对大小与 sha256 再输出）。
    - 验收：路径穿越、符号链接、junction、硬链接、ADS、超大文件、非 UTF-8 各有测试；`skill show` 的输出逐字节等于清单里的文件。
    - 文字：帮助与提示由主代理审，Codex 把字符串列在回执里。
-7. **t08：W5a 读的一侧抽进 aproxy-ipc**（任务书已写好，四个阶段：客户端、枚举、home 视图、CLI 改用同一份实现；t07 做完之后派出）
+7. **t08：W5a 读的一侧抽进 aproxy-ipc**（任务书已写好，四个阶段：客户端、枚举、home 视图、CLI 改用同一份实现；2026-11-21 派出）
    - 范围：IPC 客户端、事件流读取、只读枚举与「home 视图」移进 aproxy-ipc，CLI 改用它；订阅绑定到核验过的那次运行；
      事件读取补上长度上限。
    - 依据：[w5-real-data](w5-real-data.md) 的架构与「留给实现时核对的」。

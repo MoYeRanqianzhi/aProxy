@@ -75,7 +75,8 @@ async fn restore_current(
                 let port = daemon::port_of(&live.instance.listen_addr).to_string();
                 // 实例落在新端口：它已按实际端口写了自己的记录，原端口那份被接替。不删的话
                 // stop 新端口之后，下一次 restore（或看护者）会凭旧记录把实例再拉起来
-                let moved = daemon::retire_moved_port_records_in(&run_dir, &entry.port, &port);
+                let moved =
+                    daemon::retire_port_if_observed(&run_dir, &entry.port, &port, Some(entry));
                 Restore::Restored {
                     pid: live.instance.pid,
                     port,

@@ -366,6 +366,12 @@ pub async fn forget_port_in(
     if aproxy_ipc::registry::port_has_instance_in(run_dir, port).await {
         return Forget::Changed;
     }
+    if !run_dir.exists() {
+        return Forget::Absent;
+    }
+    let Ok(_lock) = crate::spec::restore_lock(run_dir) else {
+        return Forget::Failed;
+    };
     if let Some(expected) = expected {
         match crate::spec::read_restore_in(run_dir, port) {
             Ok(Some(e)) if &e == expected => {}

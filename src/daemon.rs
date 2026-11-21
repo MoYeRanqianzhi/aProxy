@@ -1025,7 +1025,23 @@ pub fn retire_moved_port_records_in(
     old_port: &str,
     new_port: &str,
 ) -> bool {
+    retire_port_if_observed(run_dir, old_port, new_port, None)
+}
+
+/// 等待新进程就绪期间旧端口可能已有后继期望；只退役启动时那份记录。
+pub(crate) fn retire_port_if_observed(
+    run_dir: &std::path::Path,
+    old_port: &str,
+    new_port: &str,
+    observed: Option<&crate::spec::RestoreEntry>,
+) -> bool {
     if old_port == new_port {
+        return false;
+    }
+    let Ok(_lock) = crate::spec::restore_lock(run_dir) else {
+        return false;
+    };
+    if observed.is_some_and(|e| !matches!(crate::spec::read_restore_in(run_dir,old_port),Ok(Some(ref actual)) if actual==e)) {
         return false;
     }
     if let Some(rec) = read_instance_file_in(run_dir, old_port)
@@ -1034,7 +1050,7 @@ pub fn retire_moved_port_records_in(
     {
         return false;
     }
-    crate::spec::remove_restore_in(run_dir, old_port);
+    let _ = std::fs::remove_file(crate::spec::restore_path_in(run_dir, old_port));
     let _ = std::fs::remove_file(instance_file_path_in(run_dir, old_port));
     true
 }
@@ -1948,6 +1964,33 @@ mod tests {
     /// 进程 → 期望状态记录与实例记录一并删除；旧端口已被另一个在世实例接手（身份
     /// 核验通过，或旧版本记录 pid 在世无从核验）→ 记录归它，不动
     #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn port_move_does_not_remove_a_new_desire_published_during_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = "59207";
+        crate::spec::write_restore_in(dir.path(), port, &sample_spec("original")).unwrap();
+        let observed = crate::spec::read_restore_in(dir.path(), port)
+            .unwrap()
+            .unwrap();
+        crate::spec::write_restore_in(dir.path(), port, &sample_spec("successor")).unwrap();
+        assert!(!retire_port_if_observed(
+            dir.path(),
+            port,
+            "59208",
+            Some(&observed)
+        ));
+        let current = crate::spec::read_restore_in(dir.path(), port)
+            .unwrap()
+            .unwrap();
+        assert_ne!(current, observed);
+        assert!(retire_port_if_observed(
+            dir.path(),
+            port,
+            "59208",
+            Some(&current)
+        ));
+    }
+
     #[test]
     fn retire_moved_port_records_only_touches_dead_owner() {
         let dir = tempfile::tempdir().unwrap();

@@ -943,3 +943,39 @@ fn config_discovery_yields_and_private_state_waits_for_another_lock_holder() {
         b.unwrap();
     });
 }
+
+#[tokio::test]
+async fn restore_publication_and_conditional_forget_exclude_each_other() {
+    use aproxy::ops::stop::{Forget, forget_port_in};
+    let home = TestHome::new();
+    let dir = home.path().join("run");
+    let port = common::free_port().to_string();
+    let want = spec::capture(None, Default::default(), &home.path().join("test.log"));
+    spec::write_restore_in(&dir, &port, &want).unwrap();
+    let observed = spec::read_restore_in(&dir, &port).unwrap().unwrap();
+    let lock = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(dir.join(".restore.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    assert!(matches!(
+        forget_port_in(&dir, &port, Some(&observed)).await,
+        Forget::Failed
+    ));
+    assert_eq!(
+        spec::write_restore_in(&dir, &port, &want)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    drop(lock);
+    assert_eq!(
+        spec::read_restore_in(&dir, &port).unwrap(),
+        Some(observed.clone())
+    );
+    assert!(matches!(
+        forget_port_in(&dir, &port, Some(&observed)).await,
+        Forget::Removed
+    ));
+}

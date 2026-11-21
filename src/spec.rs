@@ -165,8 +165,17 @@ pub struct RestoreListing {
     pub unreadable: Vec<UnreadableRecord>,
 }
 
+/// 进程内的停机锁不保护其他实例或窗口。发布、比较删除和迁移退役都持有同一个短期文件锁。
+pub(crate) fn restore_lock(run_dir: &Path) -> std::io::Result<crate::install::InstallLock> {
+    crate::install::wait_lock_path(
+        &run_dir.join(".restore.lock"),
+        std::time::Duration::from_secs(2),
+    )
+}
+
 /// 写（或覆盖）一个端口的期望状态记录。
 pub fn write_restore_in(run_dir: &Path, port: &str, spec: &InstanceSpec) -> std::io::Result<()> {
+    let _lock = restore_lock(run_dir)?;
     let record = RestoreRecord {
         schema: SCHEMA,
         spec: spec.clone(),
@@ -179,7 +188,11 @@ pub fn write_restore_in(run_dir: &Path, port: &str, spec: &InstanceSpec) -> std:
 /// 删除一个端口的期望状态记录；没有时什么都不做。这是「用户要它停下」的落盘动作，只有
 /// stop 的各条路径与「记录被新端口的记录接替」可以调用。
 pub fn remove_restore_in(run_dir: &Path, port: &str) {
-    let _ = std::fs::remove_file(restore_path_in(run_dir, port));
+    if run_dir.is_dir()
+        && let Ok(_lock) = restore_lock(run_dir)
+    {
+        let _ = std::fs::remove_file(restore_path_in(run_dir, port));
+    }
 }
 
 /// 读一个端口的期望状态记录。`Ok(None)` = 没有这份记录。

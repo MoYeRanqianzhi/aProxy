@@ -52,8 +52,10 @@ fn open(root: &Path, key: &str) -> io::Result<fs::File> {
     if linked(&meta) || !meta.is_file() || !path.canonicalize()?.starts_with(root.canonicalize()?) {
         return Err(io::Error::other(DAMAGED));
     }
-    let mut opts = fs::OpenOptions::new();
-    opts.read(true);
+    open_regular(&path, fs::OpenOptions::new().read(true))
+}
+/// 只操作最终路径项本身，检查实际打开的句柄，而非打开前的路径快照。
+pub(super) fn open_regular(path: &Path, opts: &mut fs::OpenOptions) -> io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -226,6 +228,7 @@ mod link_tests {
             eprintln!("跳过符号链接检查：{e}");
             return;
         }
+        assert!(open_regular(&doc, fs::OpenOptions::new().read(true)).is_err());
         assert!(show(home, "aproxy-cli", None).is_err());
         fs::remove_file(&doc).unwrap();
         fs::rename(&target, &doc).unwrap();

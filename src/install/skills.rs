@@ -35,7 +35,19 @@ fn skill_lock(home: &Path) -> Result<super::InstallLock, String> {
     crate::fsx::create_dir_all(&root)
         .and_then(|()| installed::directory(&root))
         .map_err(|e| e.to_string())?;
-    super::try_lock_path(&root.join(".lock"))
+    let lock = || -> std::io::Result<Option<super::InstallLock>> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+            opts.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        }
+        let file = installed::open_regular(&root.join(".lock"), &mut opts)?;
+        Ok(super::try_lock_exclusive(&file)?.then_some(super::InstallLock { file }))
+    };
+    lock()
         .map_err(|e| format!("skill 加锁失败：{e}"))?
         .ok_or_else(|| "另一个进程正在安装 skill，请稍后重试".into())
 }

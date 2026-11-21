@@ -69,8 +69,10 @@ fn private_root(root: &Path, lock: &mut super::InstallLock) -> io::Result<PathBu
         let rng = RandomState::new();
         token = format!("{:016x}{:016x}", rng.hash_one(0u8), rng.hash_one(1u8));
         let path = root.join(format!(".staging-{}", &token[..16]));
-        if fs::symlink_metadata(&path).is_ok() {
-            return Err(invalid());
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Err(invalid()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
         file.write_all(token.as_bytes())?;
         file.sync_data()?;
@@ -132,7 +134,6 @@ fn recover(root: &Path, private: &Path) -> io::Result<()> {
 }
 
 /// 在同一把锁里恢复上一次切换，再下载、核验与发布；失败也在释放锁之前收尾。
-
 pub async fn install(
     ctx: &DownloadCtx,
     chain: &[download::ChainStep],

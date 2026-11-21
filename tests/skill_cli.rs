@@ -72,6 +72,11 @@ async fn roundtrip_and_aliases() {
     mirror(&h, VERSION).await;
     let install = run(&h, &["skill", "install", "--json"], 0).stdout;
     let doc: Value = serde_json::from_slice(&install).unwrap();
+    assert_eq!(doc["schema"], 1);
+    assert_eq!(
+        std::fs::canonicalize(doc["location"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(h.path().join("skills")).unwrap()
+    );
     assert_eq!(doc["version"], VERSION);
     assert_eq!(doc["file_count"], DOCS.len());
     assert_eq!(doc["result"], "installed");
@@ -91,10 +96,15 @@ async fn roundtrip_and_aliases() {
     run(&h, &["skill", "install", VERSION], 2);
     let list: Value =
         serde_json::from_slice(&run(&h, &["skill", "list", "--json"], 0).stdout).unwrap();
+    assert_eq!(list["schema"], 1);
     assert_eq!(list["state"], "installed");
     let mut count = 0;
     for skill in list["skills"].as_array().unwrap() {
         let name = skill["name"].as_str().unwrap();
+        assert_eq!(
+            fs::canonicalize(skill["location"].as_str().unwrap()).unwrap(),
+            fs::canonicalize(h.path().join("skills").join(name)).unwrap()
+        );
         assert_eq!(skill["version"], VERSION);
         assert_eq!(skill["matches_binary"], true);
         let results =
@@ -163,7 +173,18 @@ async fn missing_legacy_and_version_mismatch() {
                     .contains("aproxy skill install")
         );
     }
-    let fail = run(&h, &["skill", "install"], 1);
+    let fail = run(&h, &["skill", "install", "--json"], 1);
+    let doc: Value = serde_json::from_slice(&fail.stdout).unwrap();
+    assert_eq!(doc["schema"], 1);
+    assert_eq!(doc["result"], "failed");
+    assert_eq!(doc["version"], VERSION);
+    assert_eq!(doc["file_count"], 0);
+    assert_eq!(doc["error"]["code"], "install_failed");
+    assert!(doc["error"]["message"].is_string() && doc["error"]["details"].is_object());
+    assert_eq!(
+        fs::canonicalize(doc["location"].as_str().unwrap()).unwrap(),
+        fs::canonicalize(h.path().join("skills")).unwrap()
+    );
     assert!(String::from_utf8(fail.stderr).unwrap().contains("版本"));
     let o = run(&h, &["install", "--from", common::APROXY], 0);
     assert!(String::from_utf8_lossy(&o.stderr).contains("aproxy skill install"));

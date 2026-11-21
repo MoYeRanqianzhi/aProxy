@@ -60,7 +60,17 @@ pub async fn install(
 ) -> Result<usize, super::InstallFailure> {
     let _lock = skill_lock(home)?;
     let dl = workspace(&home.join("skills")).map_err(|e| format!("skill 下载目录创建失败：{e}"))?;
-    let fetched = download::fetch_artifact(ctx, chain, Artifact::Skills, dl.path()).await?;
+    let fetched = download::fetch_artifact(ctx, chain, Artifact::Skills, dl.path())
+        .await
+        .map_err(|e| {
+            // 链条的文字可能已经拼接了多个来源。整段地址去掉，保留渠道与失败原因；
+            // 同一错误也可能写入普通安装的状态文件，不能只在 CLI 打印时做遮盖。
+            static URL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+                regex::Regex::new(r"(?i)[a-z][a-z0-9+.\-]*://\S+").unwrap()
+            });
+            let message = URL.replace_all(&e.message, "[URL 已隐去]").into_owned();
+            e.with_message(message)
+        })?;
     let (manifest, ignored) = archive::install(home, &fetched.path, &ctx.version)
         .map_err(|e| format!("skill 安装失败：{e}"))?;
     if ignored != 0 {

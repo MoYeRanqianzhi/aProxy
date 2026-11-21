@@ -373,3 +373,27 @@ async fn checksum_response_is_bounded() {
     assert!(String::from_utf8_lossy(&run(&h, &["skill", "install"], 1).stderr).contains("超限"));
     assert!(!h.path().join("skills/manifest.json").exists());
 }
+
+/// 镜像传输失败时，普通错误与 JSON 模式的诊断都不能带出用户信息或签名值。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn download_errors_do_not_echo_urls() {
+    let h = TestHome::new();
+    let port = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        while let Ok((s, _)) = listener.accept().await {
+            drop(s);
+        }
+    });
+    h.settings(&json!({"update":{"download_chain":[{"url":format!("http://private-user:private-pass@127.0.0.1:{port}/{{asset}}?sig=private-signature")}]}}).to_string());
+    for args in [&["skill", "install"][..], &["skill", "install", "--json"]] {
+        let o = run(&h, args, 1);
+        for out in [&o.stdout, &o.stderr] {
+            assert!(!String::from_utf8_lossy(out).contains("private-"));
+        }
+        let msg = String::from_utf8_lossy(&o.stderr);
+        assert!(msg.contains("[url]") && msg.contains("请求失败"));
+    }
+}

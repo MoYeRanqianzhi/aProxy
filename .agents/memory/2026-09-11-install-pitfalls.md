@@ -5,7 +5,7 @@ metadata:
   type: project
   scope: install 滚动重启、守护与看护者的退出路径、库层集成测试
   status: active
-  last_verified: 2026-11-19
+  last_verified: 2026-11-22
 ---
 
 # 2026-09-11 install 实测深坑集（滚动重启轮）
@@ -20,8 +20,8 @@ metadata:
    活着不干活。
 
 2. **IPC 消失 ≠ 进程终止**：守护 shutdown 先关 IPC 再清理最后退出，
-   「ping 失败」只能证明服务停止。等进程终止要用退出码
-   （`GetExitCodeProcess != STILL_ACTIVE`，原语 `process::process_exited`，在 `src/process.rs`）；
+   A failed ping proves only that the IPC service stopped. On Windows, wait for the process handle
+   to become signalled before reading its exit code: 259 can be a real exit code as well as `STILL_ACTIVE`.
    `process_start_time(pid).is_none()` 在进程对象被任何句柄（Rust Child、
    看护 sync handle）维持时**永远误报存活**。另外终止等待预算必须覆盖
    守护的 10s 宽限强退（server.rs select 双臂）。
@@ -37,7 +37,7 @@ metadata:
    （还没创建 ≠ 已完成）——两段式先等出现再等消失；守护优雅退出会删
    `.restore`——restart 必须**先取恢复参数再 stop**。
 
-**Evidence:** 2026-09-11 滚动重启实测轮（四个测试驱动）；第 2 条的原语与说明在 `src/process.rs` 的 `process_exited`。
+**Evidence:** 2026-09-11 滚动重启实测轮（四个测试驱动）；For the Windows distinction see `aproxy-ipc/src/registry.rs` and the retained-handle test `signalled_owner_can_exit_with_still_active_as_its_real_code` in `src/commands/install.rs`.
 **Recheck when:** 退出路径不再硬退、分离拉起改为显式传环境，或测试改用别的端口分配方式。
 
 ### A responsive instance is not necessarily restartable

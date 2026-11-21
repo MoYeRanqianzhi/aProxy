@@ -3,7 +3,9 @@
 //! may gain fields; projection at this boundary must not make those fields public.
 
 mod codes;
+mod ops;
 pub use codes::*;
+pub use ops::*;
 use serde::{Deserialize, Serialize};
 
 /// Unsigned bridge quantity. Saturate Rust outputs at the last exactly representable

@@ -138,6 +138,64 @@ trait Source: Send + Sync + 'static {
 struct Local {
     dir: PathBuf,
 }
+fn instance_summary(i: enumerate::Enumerated) -> InstanceSummary {
+    let liveness = match i.liveness {
+        Liveness::Live => Presence::Live,
+        Liveness::Unresponsive => Presence::Unresponsive,
+        Liveness::Down => Presence::Down,
+        Liveness::Incompatible => Presence::Incompatible,
+        Liveness::Unknown => Presence::Unknown,
+    };
+    let history_unavailable = i
+        .status
+        .as_ref()
+        .filter(|s| {
+            !s.features
+                .iter()
+                .any(|f| f == crate::wire::FEATURE_REDACTED_CLIENT_FIELDS)
+        })
+        .map(|_| HistoryUnavailable::SourceRedactionMissing);
+    InstanceSummary {
+        port: i.port,
+        run: i.instance.as_ref().map(|r| RunKey {
+            port: i.port,
+            instance_id: r.instance_id.clone(),
+        }),
+        pid: i.instance.as_ref().map(|r| r.pid),
+        started_at: i.instance.as_ref().map(|r| r.started_at),
+        version: i.instance.map(|r| r.version),
+        liveness,
+        restore_pending: i.restore_pending,
+        restore_reason: i.restore_reason,
+        reads: i
+            .status
+            .as_ref()
+            .map(|s| {
+                let has = |op| s.ops.iter().any(|o| o == op);
+                ReadCapabilities {
+                    history_feed: has("requests") && has("subscribe"),
+                    detail: has("request"),
+                    body: has("body"),
+                }
+            })
+            .unwrap_or_default(),
+        history_unavailable,
+        feed: if liveness == Presence::Live {
+            Feed::Joining
+        } else {
+            Feed::Offline
+        },
+        state: i.status.map(|mut s| {
+            if history_unavailable.is_some() {
+                s.activity.last_error = None;
+            }
+            StateSnapshot {
+                state: lifecycle(s.state),
+                activity: s.activity.into(),
+            }
+        }),
+    }
+}
 impl Source for Local {
     fn scan(&self) -> BoxFuture<'_, Option<Vec<InstanceSummary>>> {
         async {
@@ -147,58 +205,7 @@ impl Source for Local {
                     .ok()?
                     .0
                     .into_iter()
-                    .map(|i| {
-                        let liveness = match i.liveness {
-                            Liveness::Live => Presence::Live,
-                            Liveness::Unresponsive => Presence::Unresponsive,
-                            Liveness::Down => Presence::Down,
-                            Liveness::Incompatible => Presence::Incompatible,
-                            Liveness::Unknown => Presence::Unknown,
-                        };
-                        InstanceSummary {
-                            port: i.port,
-                            run: i.instance.as_ref().map(|r| RunKey {
-                                port: i.port,
-                                instance_id: r.instance_id.clone(),
-                            }),
-                            pid: i.instance.as_ref().map(|r| r.pid),
-                            started_at: i.instance.as_ref().map(|r| r.started_at),
-                            version: i.instance.map(|r| r.version),
-                            liveness,
-                            restore_pending: i.restore_pending,
-                            restore_reason: i.restore_reason,
-                            reads: i
-                                .status
-                                .as_ref()
-                                .map(|s| {
-                                    let has = |op| s.ops.iter().any(|o| o == op);
-                                    ReadCapabilities {
-                                        history_feed: has("requests") && has("subscribe"),
-                                        detail: has("request"),
-                                        body: has("body"),
-                                    }
-                                })
-                                .unwrap_or_default(),
-                            history_unavailable: i
-                                .status
-                                .as_ref()
-                                .filter(|s| {
-                                    !s.features
-                                        .iter()
-                                        .any(|f| f == crate::wire::FEATURE_REDACTED_CLIENT_FIELDS)
-                                })
-                                .map(|_| HistoryUnavailable::SourceRedactionMissing),
-                            feed: if liveness == Presence::Live {
-                                Feed::Joining
-                            } else {
-                                Feed::Offline
-                            },
-                            state: i.status.map(|s| StateSnapshot {
-                                state: lifecycle(s.state),
-                                activity: s.activity.into(),
-                            }),
-                        }
-                    })
+                    .map(instance_summary)
                     .collect(),
             )
         }
@@ -704,9 +711,6 @@ async fn drive(source: Arc<dyn Source>, shared: Arc<Shared>, ticks: BoxStream<'s
             let may_join = safe && info.reads.history_feed;
             if !may_join && info.liveness == Presence::Live {
                 info.feed = Feed::Polling;
-            }
-            if !safe && let Some(state) = &mut info.state {
-                state.activity.last_error = None;
             }
             if (!same || !may_join || info.liveness != Presence::Live)
                 && let Some((_, h)) = handles.remove(&p)

@@ -365,9 +365,16 @@ fn old_live_run_exposes_state_but_not_history_or_diagnostics() {
         let (v, s) = Script::start();
         {
             let mut home = s.source.home.lock().unwrap();
-            home[0].history_unavailable = Some(HistoryUnavailable::SourceRedactionMissing);
-            home[0].state.as_mut().unwrap().activity.last_error =
-                Some(decode(json!({"message":"private", "at":5})).unwrap());
+            let mut status = state(0);
+            status["ops"] = json!(["ping", "requests", "subscribe", "request", "body"]);
+            status["behavior"] = json!({"disk_cache":false,"delivery":"retry","keepalive":{"trigger":"any","interval_secs":0},"retry_rules":1});
+            status["activity"]["last_error"] = json!({"message":"private","at":5});
+            let discovery = json!({"port":80,"liveness":"live","instance":{"pid":42,"start":"s","instance_id":"a","version":"v","listen_addr":"local","base_url":"","started_at":1,"foreground":true},"status":status});
+            home[0] = instance_summary(decode(discovery).unwrap());
+            assert_eq!(
+                home[0].history_unavailable,
+                Some(HistoryUnavailable::SourceRedactionMissing)
+            );
         }
         s.tick();
         until(&v, |v| !v.instances().is_empty()).await;
@@ -551,5 +558,36 @@ fn live_completion_is_distinct_from_recovery_even_for_a_delayed_reader() {
             }
         }
         assert_eq!(completed, ["a-2"]);
+    })
+}
+
+#[test]
+fn truncated_opening_recovers_omitted_active_rows_via_pages() {
+    rt(async {
+        let (v, mut s) = Script::start();
+        s.tick();
+        let tx = s.open("a").await;
+        let (_events, stream) = channel();
+        assert!(tx.send(Ok((json!({"snapshot":state(1),"requests":[row("a",1,false)],"requests_truncated":true}),stream))).is_ok());
+        s.page("a", None)
+            .await
+            .send(Ok(page(vec![row("a", 3, false)], true)))
+            .unwrap();
+        s.page("a", Some("a-3"))
+            .await
+            .send(Ok(page(
+                vec![row("a", 2, false), row("a", 1, false)],
+                false,
+            )))
+            .unwrap();
+        until(&v, |v| feed(v) == Feed::Streaming).await;
+        let key = v.instances().remove(0).run.unwrap();
+        assert_eq!(
+            v.requests(&key)
+                .iter()
+                .map(|r| r.request_seq)
+                .collect::<Vec<_>>(),
+            [3, 2, 1]
+        );
     })
 }

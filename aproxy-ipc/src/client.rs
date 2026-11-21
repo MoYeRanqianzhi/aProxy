@@ -328,7 +328,9 @@ impl EventStream {
 }
 
 /// 订阅实例的事件。返回订阅那一刻的 `{"snapshot":…,"requests":[在途的记录]}` 与事件流。
-/// 实例的流式连接已满时是 `Remote`，码为 `busy`。
+/// `requests_truncated: true` means the oldest in-flight records fit but the
+/// rest did not; page `requests` to complete the cut. A verified full server
+/// replies `Remote` with code `busy`.
 pub async fn ipc_subscribe_in(
     run_dir: &std::path::Path,
     port: &str,

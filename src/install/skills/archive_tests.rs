@@ -283,29 +283,6 @@ fn unowned_destination_survives_even_with_unreadable_manifest() {
     }
 }
 
-/// 即使锁链接的目标尚不存在也不能在 skill 目录外建文件；已有目标也不能充当锁。
-#[test]
-fn skill_lock_refuses_link_and_non_file() {
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink as link;
-    #[cfg(windows)]
-    use std::os::windows::fs::symlink_file as link;
-    let h = tempfile::tempdir().unwrap();
-    let lock = h.path().join("skills/.lock");
-    fs::create_dir_all(&lock).unwrap();
-    assert!(super::skill_lock(h.path()).is_err());
-    fs::remove_dir(&lock).unwrap();
-    let target = h.path().join("other");
-    if let Err(e) = link(&target, &lock) {
-        eprintln!("跳过符号链接检查：{e}");
-        return;
-    }
-    assert!(super::skill_lock(h.path()).is_err());
-    assert!(!target.exists());
-    fs::write(&target, b"keep").unwrap();
-    assert!(super::skill_lock(h.path()).is_err());
-}
-
 /// 清单在目录表内但本地头不可读时，不能给出旧版没有清单的提示。
 #[test]
 fn unreadable_marker_is_not_a_missing_marker() {

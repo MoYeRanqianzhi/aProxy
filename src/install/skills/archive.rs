@@ -21,6 +21,9 @@ fn unpack(zip: &Path, dest: &Path, version: &str) -> io::Result<(Manifest, usize
         return Err(io::Error::other("skill 压缩包过大"));
     }
     let mut archive = zip::ZipArchive::new(f).map_err(|_| io::Error::other("skill 压缩包无效"))?;
+    archive
+        .validate_header_consistency()
+        .map_err(|_| io::Error::other("skill 压缩包无效"))?;
     let bytes = {
         let mut entry = archive.by_name(MARKER).map_err(|e| match e {
             zip::result::ZipError::FileNotFound => io::Error::other(MISSING),

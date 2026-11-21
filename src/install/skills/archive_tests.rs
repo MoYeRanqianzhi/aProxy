@@ -321,3 +321,33 @@ fn unreadable_marker_is_not_a_missing_marker() {
         "skill 压缩包无效"
     );
 }
+
+/// 重名或两套头给出不同的名字时，连未登记成员也不能让不同读者看成不同的包。
+#[test]
+fn member_names_agree_and_are_unique() {
+    let h = tempfile::tempdir().unwrap();
+    let f = docs();
+    let mut members = f.to_vec();
+    members.extend([("extra-A", &b""[..]), ("extra-B", &b""[..])]);
+    let z = package(h.path(), Some(&manifest_for(&f)), &members);
+    let original = fs::read(&z).unwrap();
+    for duplicate in [false, true] {
+        let mut data = original.clone();
+        let indices: Vec<_> = data
+            .windows(7)
+            .enumerate()
+            .filter_map(|(i, w)| (w == b"extra-B").then_some(i))
+            .collect();
+        assert_eq!(indices.len(), 2);
+        for i in indices.into_iter().take(if duplicate { 2 } else { 1 }) {
+            data[i + 6] = b'A';
+        }
+        fs::write(&z, data).unwrap();
+        assert_eq!(
+            archive::install(h.path(), &z, "1.0.0")
+                .unwrap_err()
+                .to_string(),
+            "skill 压缩包无效"
+        );
+    }
+}

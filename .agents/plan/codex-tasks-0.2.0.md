@@ -65,6 +65,7 @@
    - 依据：[w5-real-data](w5-real-data.md) 的架构与「留给实现时核对的」。
    - 验收：测试在 aproxy-ipc 里，不依赖 Tauri；CLI 的行为与 `--json` 的 golden 不变。
 8. **t09：W5b 写的一侧与桌面命令**
+   - 状态：已派出（2026-11-22，分支 `codex/t09-desktop-ops`）。第一步交 `w5b-desktop-api.md`（命令、事件、DTO、注入接口、权限、原型对照表），停下等主代理裁定；裁定后做第二步的五个部分。
    - 范围：`DesktopOps` 接口与主 crate 的实现、Tauri 命令与事件通道、capability、开机自启的三种登记。
    - 先交 DTO 的形状文档，主代理审过再实现（任务书分两步，中间停一次）。
    - 验收：前端拿不到明文密钥（配置、settings、错误、事件、diff 都算）；写操作在执行时再核验身份；自启的登记以系统里实际的

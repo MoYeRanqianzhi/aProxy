@@ -4,6 +4,7 @@ use aproxy_ipc::{
     view::{Change, Feed, HomeView, Presence, ReadFailure},
     wire::Part,
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, de::DeserializeOwned};
 use std::{
     path::PathBuf,
@@ -35,7 +36,7 @@ struct Empty {}
 struct Selection {
     generation: SafeUint,
     reference: Ref,
-    opened: bool,
+    parts: Option<Vec<BodyPart>>,
     busy: bool,
     cancel: watch::Sender<()>,
 }
@@ -500,7 +501,7 @@ pub(crate) async fn request_detail(request: Request<'_>, b: State<'_, Arc<Bridge
         att.selection = Some(Selection {
             generation: a.generation,
             reference: a.r#ref.clone(),
-            opened: false,
+            parts: None,
             busy: false,
             cancel: tx,
         });
@@ -514,7 +515,7 @@ pub(crate) async fn request_detail(request: Request<'_>, b: State<'_, Arc<Bridge
     let secrets = f.secrets(&key).ok_or(Fault::DesktopChanged {})?;
     let detail = Projection::new(&secrets).detail(&key, raw)?;
     b.selected(&a.session, a.generation, &a.r#ref, |s| {
-        s.opened = true;
+        s.parts = Some(detail.readable_parts());
         Ok(())
     })?;
     Ok(detail)
@@ -527,8 +528,13 @@ pub(crate) async fn body_chunk(request: Request<'_>, b: State<'_, Arc<Bridge>>) 
         return Err(Fault::DesktopBadInput {});
     }
     let mut cancel = b.selected(&a.session, a.generation, &a.r#ref, |s| {
-        if !s.opened {
-            return Err(Fault::DesktopCancelled {});
+        if !s
+            .parts
+            .as_ref()
+            .ok_or(Fault::DesktopCancelled {})?
+            .contains(&a.part)
+        {
+            return Err(Fault::DesktopHistory {});
         }
         if s.busy {
             return Err(Fault::DesktopBusy {});
@@ -542,14 +548,62 @@ pub(crate) async fn body_chunk(request: Request<'_>, b: State<'_, Arc<Bridge>>) 
         BodyPart::Sent { attempt } => (Part::Sent, Some(attempt.get())),
         BodyPart::Response { attempt } => (Part::Response, Some(attempt.get())),
     };
-    let value = tokio::select! {biased;_=cancel.changed()=>return Err(Fault::DesktopCancelled{}),r=b.view.body_chunk(&key,&a.r#ref.request_id,part,attempt,a.offset.get(),a.limit)=>r.map_err(read_failure).and_then(|v|Chunk::project(v,a.offset,a.limit))};
+    let inspect = async {
+        let invalid = || Fault::DesktopHistory {};
+        let secrets = b.sample().secrets(&key).ok_or(Fault::DesktopChanged {})?;
+        Projection::new(&secrets).check_ref(&a.r#ref)?;
+        let margin = secrets.max_len().saturating_sub(1) as u64;
+        if margin > aproxy_ipc::wire::MAX_BODY_READ {
+            return Err(invalid());
+        }
+        let read = |offset: u64, limit| {
+            let fut = b
+                .view
+                .body_chunk(&key, &a.r#ref.request_id, part, attempt, offset, limit);
+            async move {
+                let chunk = Chunk::project(
+                    fut.await.map_err(read_failure)?,
+                    SafeUint::saturating(offset),
+                    limit,
+                )?;
+                let bytes = STANDARD.decode(&chunk.data_b64).map_err(|_| invalid())?;
+                Ok::<_, Fault>((chunk, bytes))
+            }
+        };
+        let offset = a.offset.get();
+        let (mut chunk, requested) = read(offset, a.limit).await?;
+        let end = offset + requested.len() as u64;
+        let left = offset.min(margin);
+        let right = (chunk.total_bytes.get() - end).min(margin);
+        // An unfinished tail could become the prefix of a secret on the next append.
+        if !chunk.complete && right < margin {
+            return Err(invalid());
+        }
+        let mut inspected = Vec::with_capacity(left as usize + requested.len() + right as usize);
+        for (at, len) in [(offset - left, left), (end, right)] {
+            if at == end {
+                inspected.extend_from_slice(&requested);
+            }
+            if len != 0 {
+                let (other, bytes) = read(at, len).await?;
+                if chunk.total_bytes != other.total_bytes || chunk.complete != other.complete {
+                    return Err(invalid());
+                }
+                inspected.extend(bytes);
+            }
+        }
+        if b.sample().secrets(&key).as_deref() != Some(secrets.as_ref()) {
+            return Err(Fault::DesktopChanged {});
+        }
+        chunk.data_b64 = STANDARD
+            .encode(secrets.body_bytes(&inspected, left as usize..left as usize + requested.len()));
+        Ok(chunk)
+    };
+    let value = tokio::select! {biased;_=cancel.changed()=>return Err(Fault::DesktopCancelled{}),r=inspect=>r};
     b.selected(&a.session, a.generation, &a.r#ref, |s| {
         s.busy = false;
         Ok(())
     })?;
-    if b.sample().secrets(&key).is_none() {
-        return Err(Fault::DesktopChanged {});
-    }
     value
 }
 /// 撤销直到指定代数；先到的取消也能拦住稍后到达的旧打开操作。

@@ -561,6 +561,37 @@ pub struct Detail {
     pub tries: Vec<TryDetail>,
 }
 
+impl Detail {
+    /// Store selectors, not message metadata or bytes. Unknown wire encodings cannot attest to plain bytes.
+    pub fn readable_parts(&self) -> Vec<BodyPart> {
+        let plain = |body: &Option<BodyInfo>| {
+            body.as_ref().is_some_and(|b| {
+                matches!(b.state, Retention::Retained | Retention::SameAsPrevious)
+                    && b.cause.is_none()
+                    && b.encoding
+                        .as_deref()
+                        .is_none_or(|s| s.eq_ignore_ascii_case("identity"))
+            })
+        };
+        let mut parts = Vec::new();
+        if plain(&self.request.body) {
+            parts.push(BodyPart::Request);
+        }
+        for t in &self.tries {
+            let Some(attempt) = std::num::NonZeroU32::new(t.attempt) else {
+                continue;
+            };
+            if t.sent.as_ref().is_some_and(|s| plain(&s.body)) {
+                parts.push(BodyPart::Sent { attempt });
+            }
+            if t.response.as_ref().is_some_and(|s| plain(&s.body)) {
+                parts.push(BodyPart::Response { attempt });
+            }
+        }
+        parts
+    }
+}
+
 impl Projection<'_> {
     /// Retry decision without program-private data.
     fn decision(&self, r: view::Decision) -> Decision {
@@ -686,7 +717,11 @@ impl Projection<'_> {
     /// One header in source order; classify the original name before scrubbing it.
     fn header(&self, r: view::Header) -> Header {
         let value = match r.value.as_str() {
-            Some(s) if !redact::is_secret_header(&r.name) => HeaderValue::Text(self.text(s)),
+            Some(s)
+                if !redact::is_secret_header(&r.name) && !self.secrets.protects_header(&r.name) =>
+            {
+                HeaderValue::Text(self.text(s))
+            }
             _ => HeaderValue::Secret { secret: true },
         };
         Header {
@@ -776,8 +811,7 @@ pub struct Chunk {
     pub complete: bool,
 }
 impl Chunk {
-    /// Check the peer's offset, byte count and encoding before forwarding its string.
-    /// Do not substitute secrets in base64 text: the peer scrubbed bytes before storage.
+    /// Validate the envelope before the desktop decodes and checks its contents.
     pub fn project(r: view::BodyChunk, offset: SafeUint, limit: u64) -> R<Self> {
         let invalid = || Fault::DesktopHistory {};
         let remaining = r
@@ -786,7 +820,8 @@ impl Chunk {
             .ok_or_else(invalid)?;
         let bytes = limit.min(remaining);
         let text = r.data_b64.as_bytes();
-        if !(1..=crate::wire::MAX_BODY_READ).contains(&limit)
+        if r.total_bytes > SafeUint::MAX
+            || !(1..=crate::wire::MAX_BODY_READ).contains(&limit)
             || r.offset != offset.get()
             || r.more != (bytes < remaining)
             || text.len() as u64 != bytes.div_ceil(3) * 4
@@ -825,6 +860,27 @@ mod tests {
     }
     fn summary() -> Value {
         json!({"request_id":format!("{ID}-1"),"request_seq":1,"started_at":1000,"ended_at":16000,"method":"GET","path":"/a?key=do-not-copy","stream":false,"delivery":"retry","upgraded":false,"outcome":"ok","phase":"done","attempts":2,"tries_omitted":0,"tries":[],"keepalive":false,"heartbeats":0,"request_bytes":0,"response_bytes":0})
+    }
+    #[test]
+    fn configured_short_headers_and_overlapping_body_margins_are_private() {
+        let secrets = Secrets::new(["abcdefgh", "efghijkl"]).with_headers(["X-Private".into()]);
+        let p = Projection::new(&secrets);
+        for (name, hidden) in [("x-pRiVaTe", true), ("X-Public", false)] {
+            let h = p.header(view::Header {
+                name: name.into(),
+                value: json!("x"),
+            });
+            assert_eq!(matches!(h.value, HeaderValue::Secret { .. }), hidden);
+        }
+        let body = b".abcdefghijkl!";
+        for offset in 0..body.len() {
+            let start = offset.saturating_sub(secrets.max_len() - 1);
+            let stop = (offset + secrets.max_len()).min(body.len());
+            assert_eq!(
+                secrets.body_bytes(&body[start..stop], offset - start..offset - start + 1),
+                b".************!"[offset..offset + 1]
+            );
+        }
     }
     #[test]
     fn details_project_values_before_json_escaping() {

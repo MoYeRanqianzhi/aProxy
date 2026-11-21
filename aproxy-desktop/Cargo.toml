@@ -52,6 +52,7 @@ doctest = false
 [dependencies]
 # 仅桌面应用使用投影与有界事件接口；无须引入 aproxy 包。
 aproxy-ipc = { version = "=0.2.0-alpha.4", path = "../aproxy-ipc", features = ["desktop"] }
+base64 = "0.22"
 serde_json = "1"
 # default-features = false 是为了关掉 common-controls-v6：它让 exe 静态导入只有 Common
 # Controls v6 才有的 TaskDialogIndirect，没有 v6 清单的 exe 在 main 之前就以 0xC0000139

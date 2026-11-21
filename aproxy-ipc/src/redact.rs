@@ -253,6 +253,8 @@ pub struct Secrets {
     known: Vec<Vec<u8>>,
     /// 以这个字节开头的密钥是否存在：扫描时先查它，绝大多数位置一步就过
     first_bytes: [bool; 256],
+    #[cfg(feature = "desktop")]
+    configured_headers: std::collections::BTreeSet<String>,
 }
 
 impl Default for Secrets {
@@ -261,6 +263,8 @@ impl Default for Secrets {
         Secrets {
             known: Vec::new(),
             first_bytes: [false; 256],
+            #[cfg(feature = "desktop")]
+            configured_headers: Default::default(),
         }
     }
 }
@@ -283,7 +287,12 @@ impl Secrets {
         for secret in &known {
             first_bytes[usize::from(secret[0])] = true;
         }
-        Secrets { known, first_bytes }
+        Secrets {
+            known,
+            first_bytes,
+            #[cfg(feature = "desktop")]
+            configured_headers: Default::default(),
+        }
     }
 
     /// HTTP parsers lowercase header names. Match this spelling only in names,
@@ -296,7 +305,41 @@ impl Secrets {
     /// 联合两次观察的原文，避免一次编辑把旧凭据从错误出口的脱敏范围里抹掉。
     #[cfg(feature = "desktop")]
     pub fn union(&self, other: &Self) -> Self {
-        Self::new(self.known.iter().chain(&other.known))
+        Self::new(self.known.iter().chain(&other.known)).with_headers(
+            self.configured_headers
+                .union(&other.configured_headers)
+                .cloned(),
+        )
+    }
+
+    /// Header tables protect by name even when the configured value is too short for text matching.
+    #[cfg(feature = "desktop")]
+    pub fn with_headers(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.configured_headers
+            .extend(names.into_iter().map(|n| n.to_ascii_lowercase()));
+        self
+    }
+
+    /// Classify the original wire spelling before projecting it for display.
+    #[cfg(feature = "desktop")]
+    pub fn protects_header(&self, name: &str) -> bool {
+        self.configured_headers.contains(&name.to_ascii_lowercase())
+    }
+
+    /// Preserve offsets and mask overlapping occurrences, including matches beginning in either margin.
+    #[cfg(feature = "desktop")]
+    pub fn body_bytes(&self, inspected: &[u8], range: std::ops::Range<usize>) -> Vec<u8> {
+        let mut out = inspected[range.clone()].to_vec();
+        let mut covered = 0;
+        for at in 0..range.end {
+            if let Some(len) = self.match_at(inspected, at) {
+                covered = covered.max(at + len);
+            }
+            if range.contains(&at) && at < covered {
+                out[at - range.start] = b'*';
+            }
+        }
+        out
     }
 
     /// 一个密钥都没有：替换什么也不做

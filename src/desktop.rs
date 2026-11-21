@@ -97,6 +97,7 @@ impl DesktopHome {
                 let port = item.port.to_string();
                 let desire = spec::read_restore_in(&run_dir, &port).ok()?;
                 let mut secrets = common.clone();
+                let mut headers = configured_headers(&raw["defaults"]);
                 let mut paths = std::collections::BTreeSet::new();
                 let record_path = item
                     .instance
@@ -105,10 +106,9 @@ impl DesktopHome {
                     .map(Path::new);
                 paths.extend(record_path);
                 if let Some(e) = &desire {
-                    collect_config_secrets(
-                        &serde_json::to_value(&e.spec.overrides).ok()?,
-                        &mut secrets,
-                    );
+                    let overrides = serde_json::to_value(&e.spec.overrides).ok()?;
+                    headers.extend(configured_headers(&overrides));
+                    collect_config_secrets(&overrides, &mut secrets);
                     paths.extend(e.spec.config_path.as_deref().map(Path::new));
                     for (k, v) in &e.spec.env {
                         if let Some(s) = v {
@@ -132,7 +132,9 @@ impl DesktopHome {
                             {
                                 return None;
                             }
-                            collect_config_secrets(&config::view::file_value(&text)?, &mut secrets)
+                            let doc = config::view::file_value(&text)?;
+                            headers.extend(configured_headers(&doc));
+                            collect_config_secrets(&doc, &mut secrets)
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         Err(_) => return None,
@@ -158,7 +160,7 @@ impl DesktopHome {
                 Some((
                     item.port,
                     LocalFacts {
-                        secrets: Arc::new(Secrets::new(secrets)),
+                        secrets: Arc::new(Secrets::new(secrets).with_headers(headers)),
                         aliases: names,
                         restore: desire
                             .as_ref()
@@ -184,6 +186,13 @@ fn collect_settings_secrets(raw: &Value, out: &mut Vec<String>) {
             }
         }
     }
+}
+fn configured_headers(doc: &Value) -> Vec<String> {
+    ["extra_headers", "override_headers"]
+        .into_iter()
+        .filter_map(|k| doc[k].as_object())
+        .flat_map(|m| m.keys().cloned())
+        .collect()
 }
 fn collect_config_secrets(doc: &Value, out: &mut Vec<String>) {
     for key in ["api_key", "proxy_username", "proxy_password"] {

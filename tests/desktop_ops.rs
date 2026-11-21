@@ -524,7 +524,14 @@ async fn update_children_are_home_bound_confirmed_bounded_and_terminal_only_afte
         );
         assert!(!json!(last).to_string().contains("private"));
     }
-    for mode in ["oversize", "wrong-exit", "duplicate", "missing", "failed"] {
+    for mode in [
+        "oversize",
+        "wrong-exit",
+        "duplicate",
+        "missing",
+        "failed",
+        "future-error",
+    ] {
         std::fs::write(home.path().join("fixture.mode"), mode).unwrap();
         let token = host
             .check_update(ChannelChoice::Auto)
@@ -538,6 +545,8 @@ async fn update_children_are_home_bound_confirmed_bounded_and_terminal_only_afte
             .unwrap_err();
         if mode == "failed" {
             assert!(matches!(err, Fault::InstallRestartFailed { port: 80 }))
+        } else if mode == "future-error" {
+            assert_eq!(json!(&err), json!({"code":"install_failed", "details":{}}));
         } else {
             assert!(matches!(err, Fault::DesktopInstallProtocol {}))
         }

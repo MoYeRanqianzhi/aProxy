@@ -48,8 +48,12 @@ fn optional_version(v: &Value) -> R<Option<String>> {
 fn child_error(v: &Value) -> Fault {
     use InstallCode as C;
     let d = &v["details"];
-    let Some(code) = v["code"].as_str().and_then(C::classify) else {
+    let Some(name) = v["code"].as_str() else {
         return protocol();
+    };
+    // 已报告失败的将来版本仍按失败收口，但未知代码、细节和原文不能交给页面。
+    let Some(code) = C::classify(name) else {
+        return Fault::InstallFailed {};
     };
     match code {
         C::InstallInProgress => Fault::InstallInProgress {},

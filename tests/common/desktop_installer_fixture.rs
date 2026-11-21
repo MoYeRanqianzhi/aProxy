@@ -37,6 +37,13 @@ fn main() {
     if mode == "oversize" {
         println!("{}", "x".repeat(1024 * 1024 + 2));
     }
+    if mode == "future-error" {
+        println!(
+            "{}",
+            r#"{"event":"result","outcome":"failed","error":{"code":"future_private_code","details":{"value":"private-exception"}}}"#
+        );
+        std::process::exit(1)
+    }
     if mode == "failed" {
         println!(
             "{}",

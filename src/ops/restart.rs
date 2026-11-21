@@ -19,8 +19,8 @@ use crate::daemon::{self, InstanceRecord, InstanceStatus};
 use crate::spawn::{self, SpawnError};
 use crate::spec::{self, InstanceSpec};
 
-use super::start::resolve_runtime_config;
-use super::stop::{Intent, StopFailure, StopMode, Stopped, stop_with_intent};
+use super::start::resolve_runtime_config_in;
+use super::stop::{Authority, Intent, StopFailure, StopMode, Stopped, stop_in};
 
 /// 重启成功。
 #[derive(Debug, Clone)]
@@ -85,8 +85,19 @@ pub async fn restart_instance(
     mode: StopMode,
     exe: &Path,
 ) -> Result<Restarted, RestartFailure> {
+    restart_in(&aproxy_ipc::home::home(), info, mode, exe, Authority::Cli).await
+}
+
+/// 配置预检、停旧实例和拉起同属一个主目录；桌面的观察到执行之间还要核验控制连接。
+pub async fn restart_in(
+    home: &Path,
+    info: &InstanceRecord,
+    mode: StopMode,
+    exe: &Path,
+    authority: Authority,
+) -> Result<Restarted, RestartFailure> {
     let port = daemon::port_of(&info.listen_addr).to_string();
-    let run_dir = daemon::run_dir();
+    let run_dir = home.join("run");
     let mut record = spec::read_restore_in(&run_dir, &port);
     if !info.foreground
         && let Ok(live) = daemon::ipc_ping_in(&run_dir, &port).await
@@ -112,16 +123,15 @@ pub async fn restart_instance(
         }
     };
 
-    let new_addr = precheck(info, &port, &spec)
+    let new_addr = precheck(home, info, &port, &spec)
         .await
         .map_err(RestartFailure::Precheck)?;
 
-    let stopped = stop_with_intent(info, mode, Intent::Restart)
+    let stopped = stop_in(home, info, mode, Intent::Restart, authority)
         .await
         .map_err(RestartFailure::Stop)?;
 
-    let home = aproxy_ipc::home::home();
-    match spawn::spawn_from_spec(&home, exe, &spec, spawn::READY_TIMEOUT).await {
+    match spawn::spawn_from_spec(home, exe, &spec, spawn::READY_TIMEOUT).await {
         Ok(live) => {
             // 配置改了端口：新实例按新端口写了自己的记录，旧端口那份被它接替
             let new_port = daemon::port_of(&live.instance.listen_addr).to_string();
@@ -135,7 +145,7 @@ pub async fn restart_instance(
         Err(error) => {
             // 看护者抢先按同一份记录把它拉起来了：我们的子进程绑不上端口而退出，但服务
             // 已在，用的也是同一份规格
-            if let Some(live) = raced_by_watchdog(&new_addr, &spec, info.pid).await {
+            if let Some(live) = raced_by_watchdog(&run_dir, &new_addr, &spec, info.pid).await {
                 return Ok(Restarted {
                     stopped,
                     old_pid: info.pid,
@@ -153,6 +163,7 @@ pub async fn restart_instance(
 
 /// 新实例没起来时，看它要监听的端口上是不是已经有了一个用同一配置的新实例。
 async fn raced_by_watchdog(
+    run_dir: &Path,
     new_addr: &str,
     spec: &InstanceSpec,
     old_pid: u32,
@@ -161,7 +172,7 @@ async fn raced_by_watchdog(
     if port == "0" {
         return None;
     }
-    let live = daemon::ipc_ping(port).await.ok()?;
+    let live = daemon::ipc_ping_in(run_dir, port).await.ok()?;
     // 两边都没有配置文件也算同一配置：同一份规格拉起的就是这样的实例
     let key = |path: &Option<String>| path.as_deref().map(super::target::config_path_key);
     let same_config = key(&live.instance.config_path) == key(&spec.config_path);
@@ -169,10 +180,11 @@ async fn raced_by_watchdog(
 }
 
 /// 停止旧实例之前的干跑预检：用新实例将走的同一条路径解析配置（规格里的覆盖 →
-/// [`resolve_runtime_config`]：严格解析、settings 的全局默认、校验），监听地址变了再探测
+/// [`resolve_runtime_config_in`]：严格解析、settings 的全局默认、校验），监听地址变了再探测
 /// 新地址可否绑定。只读，无副作用（bind 探测的 listener 随即释放）。通过返回新实例将
 /// 监听的地址（端口为 0、由系统分配时，规格里钉过端口就是那个端口）。
 async fn precheck(
+    home: &Path,
     info: &InstanceRecord,
     old_port: &str,
     spec: &InstanceSpec,
@@ -183,7 +195,7 @@ async fn precheck(
     {
         return Err(PrecheckError::ConfigMissing { path: path.clone() });
     }
-    let cfg = resolve_runtime_config(&spec.overrides, cfg_path.as_deref())
+    let cfg = resolve_runtime_config_in(home, &spec.overrides, cfg_path.as_deref())
         .map_err(PrecheckError::Config)?;
     // 配置解析出的端口仍是 0 时，新实例回到规格里钉住的端口
     let mut new_addr = cfg.listen_addr.clone();
@@ -199,7 +211,7 @@ async fn precheck(
     if new_addr != info.listen_addr && new_port != "0" {
         // 换到的端口上已有 aProxy 实例：新实例 bind 必败（IPC 探测不触碰代理端口）
         if new_port != old_port
-            && let Ok(other) = daemon::ipc_ping(&new_port).await
+            && let Ok(other) = daemon::ipc_ping_in(&home.join("run"), &new_port).await
         {
             return Err(PrecheckError::PortTaken {
                 port: new_port,

@@ -82,23 +82,70 @@ pub async fn stop_with_intent(
     mode: StopMode,
     intent: Intent,
 ) -> Result<Stopped, StopFailure> {
+    stop_in(
+        &aproxy_ipc::home::home(),
+        info,
+        mode,
+        intent,
+        Authority::Cli,
+    )
+    .await
+}
+
+/// 来自桌面的选择可能早已过期；控制请求核验的是即将发送请求的连接，而非页面传来的端口。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Authority {
+    /// 沿用命令行的目标选择、确认与强制语义。
+    Cli,
+    /// 对窗口上一次观察到的实例，执行前再次核验代际与控制连接。
+    Observed,
+}
+
+/// 只在指定 home 执行停止或重启的停机阶段，保留调用者对期望状态的原有语义。
+pub async fn stop_in(
+    home: &std::path::Path,
+    info: &InstanceRecord,
+    mode: StopMode,
+    intent: Intent,
+    authority: Authority,
+) -> Result<Stopped, StopFailure> {
     let port = daemon::port_of(&info.listen_addr).to_string();
-    let run_dir = daemon::run_dir();
+    let run_dir = home.join("run");
     match mode {
         StopMode::Graceful => {
             let sent = if intent == Intent::Restart {
                 match daemon::ipc_ping_in(&run_dir, &port).await {
-                    Ok(live) if live.instance.instance_id != info.instance_id => {
+                    Ok(live)
+                        if live.instance.instance_id != info.instance_id
+                            || (authority == Authority::Observed
+                                && (live.instance.pid != info.pid
+                                    || live.instance.start != info.start)) =>
+                    {
                         return Err(StopFailure::GenerationChanged);
                     }
-                    Ok(live) => shutdown_for_restart(&run_dir, &port, &live).await,
+                    Ok(live) => shutdown_for_restart(&run_dir, &port, &live, authority).await,
                     Err(e) => Err(e),
                 }
+            } else if authority == Authority::Observed {
+                aproxy_ipc::client::shutdown_for_run_in(&run_dir, &port, info, false).await
             } else {
                 daemon::ipc_request_in(&run_dir, &port, daemon::IpcOp::STOP)
                     .await
                     .map(|_| ())
             };
+            if authority == Authority::Observed {
+                match &sent {
+                    Err(daemon::IpcError::RunChanged) => {
+                        return Err(StopFailure::GenerationChanged);
+                    }
+                    Err(e) => {
+                        return Err(StopFailure::Unresponsive {
+                            error: e.to_string(),
+                        });
+                    }
+                    Ok(()) => {}
+                }
+            }
             settle_graceful(info, &run_dir, &port, intent, sent).await
         }
         // 强制终止之后进程不在、期望状态记录还在，正是「崩溃」的样子：看护者收到死亡事件
@@ -108,6 +155,18 @@ pub async fn stop_with_intent(
         // restart 的强制终止不删：调用方接着用这份记录拉起新实例；看护者抢先拉起的话，
         // 两边拉的是同一份规格，由调用方按「端口已被同一配置的实例占着」收敛。
         StopMode::Force => {
+            if authority == Authority::Observed {
+                match daemon::ipc_probe_in(&run_dir, &port).await {
+                    Err(daemon::IpcError::Unreachable(_) | daemon::IpcError::Transient(_)) => {}
+                    _ => return Err(StopFailure::GenerationChanged),
+                }
+                if !daemon::read_instance_file_in(&run_dir, &port).is_some_and(|r| {
+                    r.instance_id == info.instance_id && r.pid == info.pid && r.start == info.start
+                }) || record_identity(info.pid, &info.start) != RecordIdentity::Alive
+                {
+                    return Err(StopFailure::GenerationChanged);
+                }
+            }
             let saved = match intent {
                 Intent::Stop => {
                     let saved = crate::spec::read_restore_in(&run_dir, &port).ok().flatten();
@@ -119,15 +178,31 @@ pub async fn stop_with_intent(
             match daemon::force_terminate(info) {
                 Ok(()) => {
                     // 实例来不及自清的运行期文件（实例记录、socket、心跳）代它收掉
-                    daemon::remove_registry_files(&info.listen_addr);
+                    if authority == Authority::Cli {
+                        daemon::remove_stopped_files_in(&run_dir, &port);
+                    } else if daemon::read_instance_file_in(&run_dir, &port).is_some_and(|r| {
+                        r.pid == info.pid
+                            && r.start == info.start
+                            && r.instance_id == info.instance_id
+                    }) {
+                        // Unix 端点可能已绑定给尚未发布记录的后继；让下次 bind 自行回收残留 socket。
+                        let _ =
+                            std::fs::remove_file(daemon::instance_file_path_in(&run_dir, &port));
+                        crate::watchdog::remove_heartbeat_file(&run_dir, &port);
+                    }
                     Ok(Stopped::Forced)
                 }
                 Err(error) => {
-                    let restore_error = saved.and_then(|entry| {
-                        crate::spec::write_restore_in(&run_dir, &port, &entry.spec)
-                            .err()
-                            .map(|e| e.to_string())
-                    });
+                    let restore_error = saved
+                        .filter(|_| {
+                            authority == Authority::Cli
+                                || matches!(crate::spec::read_restore_in(&run_dir, &port), Ok(None))
+                        })
+                        .and_then(|entry| {
+                            crate::spec::write_restore_in(&run_dir, &port, &entry.spec)
+                                .err()
+                                .map(|e| e.to_string())
+                        });
                     Err(StopFailure::ForceFailed {
                         error,
                         restore_error,
@@ -149,7 +224,7 @@ async fn settle_graceful(
 ) -> Result<Stopped, StopFailure> {
     match sent {
         Ok(()) => {
-            if daemon::wait_until_gone(port, GRACEFUL_WAIT).await {
+            if daemon::wait_until_gone_in(run_dir, port, GRACEFUL_WAIT).await {
                 Ok(Stopped::Graceful)
             } else {
                 Err(StopFailure::StillRunning)
@@ -225,23 +300,39 @@ async fn shutdown_for_restart(
     run_dir: &std::path::Path,
     port: &str,
     live: &daemon::InstanceStatus,
+    authority: Authority,
 ) -> Result<(), daemon::IpcError> {
+    let send = |keep_restore| async move {
+        if authority == Authority::Observed {
+            aproxy_ipc::client::shutdown_for_run_in(run_dir, port, &live.instance, keep_restore)
+                .await
+        } else {
+            let op = if keep_restore {
+                daemon::IpcOp::STOP_KEEPING_RESTORE
+            } else {
+                daemon::IpcOp::STOP
+            };
+            daemon::ipc_request_in(run_dir, port, op).await.map(|_| ())
+        }
+    };
     if live
         .features
         .iter()
         .any(|f| f == daemon::FEATURE_SHUTDOWN_KEEP_RESTORE)
     {
-        return daemon::ipc_request_in(run_dir, port, daemon::IpcOp::STOP_KEEPING_RESTORE)
-            .await
-            .map(|_| ());
+        return send(true).await;
     }
     let saved = crate::spec::read_restore_in(run_dir, port).ok().flatten();
-    daemon::ipc_request_in(run_dir, port, daemon::IpcOp::STOP).await?;
+    send(false).await?;
     if let Some(entry) = saved {
         // 旧实例在应答之前就删了记录；它退出之前写回会被它的退出清理再删一次，所以等
         // 端点消失再写。等不到也写：记录在总比不在安全
-        daemon::wait_until_gone(port, GRACEFUL_WAIT).await;
-        let _ = crate::spec::write_restore_in(run_dir, port, &entry.spec);
+        daemon::wait_until_gone_in(run_dir, port, GRACEFUL_WAIT).await;
+        if authority == Authority::Cli
+            || matches!(crate::spec::read_restore_in(run_dir, port), Ok(None))
+        {
+            let _ = crate::spec::write_restore_in(run_dir, port, &entry.spec);
+        }
     }
     Ok(())
 }

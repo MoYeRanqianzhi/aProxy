@@ -101,6 +101,15 @@ pub fn resolve_runtime_config(
     overrides: &Overrides,
     cfg_path: Option<&Path>,
 ) -> Result<Config, ConfigError> {
+    resolve_runtime_config_in(&aproxy_ipc::home::home(), overrides, cfg_path)
+}
+
+/// 按启动者给定的主目录读取全局默认，校验与实际分层使用同一次读取的设置。
+pub fn resolve_runtime_config_in(
+    home: &Path,
+    overrides: &Overrides,
+    cfg_path: Option<&Path>,
+) -> Result<Config, ConfigError> {
     if let Some(path) = cfg_path
         && !path.exists()
     {
@@ -108,7 +117,7 @@ pub fn resolve_runtime_config(
     }
     // 实例只在启动时读 settings.json：它无效时不带着内置默认悄悄启动——那样全局默认里的
     // 上游、限额都不生效，用户看到的是一个行为不对的实例，而不是一条说得清的错误
-    let settings_path = settings::settings_path();
+    let settings_path = settings::settings_path_in(home);
     let loaded = settings::read(&settings_path);
     if !loaded.is_valid() {
         return Err(ConfigError::Settings {
@@ -120,10 +129,13 @@ pub fn resolve_runtime_config(
                 .collect(),
         });
     }
-    let resolved = resolve_layers(overrides, cfg_path).map_err(|error| ConfigError::Read {
-        file: cfg_path.unwrap_or_else(|| Path::new("")).to_path_buf(),
-        error,
-    })?;
+    let resolved =
+        resolve_layers(overrides, cfg_path, &loaded.settings, &settings_path).map_err(|error| {
+            ConfigError::Read {
+                file: cfg_path.unwrap_or_else(|| Path::new("")).to_path_buf(),
+                error,
+            }
+        })?;
     // 告警级的诊断（例如全局默认的凭据没有被继承）与扣下的凭据，记进日志
     for d in resolved.diagnostics.iter().filter(|d| !d.is_error()) {
         tracing::warn!(code = d.code, "{}", render_diagnostic(d));
@@ -187,9 +199,10 @@ pub fn render_diagnostic_fields(
 fn resolve_layers(
     overrides: &Overrides,
     cfg_path: Option<&Path>,
+    settings: &settings::Settings,
+    path: &Path,
 ) -> std::io::Result<config::Resolved> {
-    let defaults =
-        config::resolve::Defaults::from_settings(&settings::load(), &settings::settings_path());
+    let defaults = config::resolve::Defaults::from_settings(settings, path);
     match cfg_path {
         Some(path) => config::resolve(path, overrides, &defaults),
         None => Ok(config::resolve::resolve_without_file(overrides, &defaults)),
@@ -200,7 +213,8 @@ fn resolve_layers(
 /// 即使它有问题，也要能定出日志写到哪里，这样问题才有地方记。启动的严格路径是
 /// [`resolve_runtime_config`]，两者走同一条解析管线，对监听地址与日志路径的认知一致。
 pub fn load_lenient(overrides: &Overrides, cfg_path: Option<&Path>) -> Config {
-    match resolve_layers(overrides, cfg_path) {
+    let path = settings::settings_path();
+    match resolve_layers(overrides, cfg_path, &settings::load_from(&path), &path) {
         Ok(resolved) => resolved.config,
         Err(e) => {
             tracing::warn!(error = %e, "读取配置文件失败，使用默认配置");
@@ -241,6 +255,7 @@ pub enum PreflightError {
 
 /// 两次端口预检看到同一状态时走同一条路径，不把 starting 伪装成已就绪。
 async fn existing_instance(
+    home: &Path,
     listen_addr: &str,
     info: InstanceStatus,
 ) -> Result<Preflight, PreflightError> {
@@ -252,7 +267,7 @@ async fn existing_instance(
         });
     }
     if info.state == daemon::InstanceState::Starting {
-        return spawn::wait_existing(&aproxy_ipc::home::home(), &info.instance)
+        return spawn::wait_existing(home, &info.instance)
             .await
             .map(|i| Preflight::BecameReady(Box::new(i)))
             .map_err(PreflightError::Startup);
@@ -266,13 +281,19 @@ async fn existing_instance(
 ///   明确拒绝；
 /// - TCP bind 失败 → 把 io 错误交回调用方分类。
 pub async fn preflight(listen_addr: &str) -> Result<Preflight, PreflightError> {
+    preflight_in(&aproxy_ipc::home::home(), listen_addr).await
+}
+
+/// 端口预检只探测指定主目录的控制通道，不把其他 home 的实例误认为已有实例。
+pub async fn preflight_in(home: &Path, listen_addr: &str) -> Result<Preflight, PreflightError> {
+    let run_dir = home.join("run");
     let port = daemon::port_of(listen_addr).to_string();
     // 预检 1：本 home 同端口是否已有 aProxy 实例（IPC 探测，不经代理端口）。
     // 端点按 home + 端口命名，同端口不同监听地址的另一实例也会应答——此时实例键
     // （端口号）无法区分两者，注册表与 IPC 端点会互相顶替（stop 会停错实例），
     // 必须明确拒绝。别的 home 的同端口实例这里看不到，由预检 2 的 bind 失败拦下。
-    if let Ok(info) = daemon::ipc_ping(&port).await {
-        return existing_instance(listen_addr, info).await;
+    if let Ok(info) = daemon::ipc_ping_in(&run_dir, &port).await {
+        return existing_instance(home, listen_addr, info).await;
     }
 
     // 预检 2：端口能否绑定（探测 listener 随即释放，端口让给守护子进程）
@@ -281,8 +302,8 @@ pub async fn preflight(listen_addr: &str) -> Result<Preflight, PreflightError> {
         // 实例可能 TCP 已就绪但管道/注册表尚未落盘（预检 1 才会 ping 不通）。
         // 报「被占用」前再 ping 一次，避免把自家正在启动的实例误分类为其他程序占用。
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        if let Ok(info) = daemon::ipc_ping(&port).await {
-            return existing_instance(listen_addr, info).await;
+        if let Ok(info) = daemon::ipc_ping_in(&run_dir, &port).await {
+            return existing_instance(home, listen_addr, info).await;
         }
         return Err(PreflightError::Bind {
             listen_addr: listen_addr.to_string(),
@@ -296,23 +317,31 @@ pub async fn preflight(listen_addr: &str) -> Result<Preflight, PreflightError> {
 /// 系统分配时同样等到就绪、报出实际地址；子进程提前退出时立即报告，附上 startup.log 本次
 /// 新增的内容）。实例就绪后顺带确保看护者在任。
 pub async fn launch(exe: &Path, spec: &InstanceSpec) -> Result<InstanceStatus, SpawnError> {
-    let home = aproxy_ipc::home::home();
-    let live = spawn::spawn_from_spec(&home, exe, spec, spawn::READY_TIMEOUT).await?;
+    launch_in(&aproxy_ipc::home::home(), exe, spec).await
+}
+
+/// 实例和看护者都显式绑定同一主目录；子进程不依赖界面进程的工作目录。
+pub async fn launch_in(
+    home: &Path,
+    exe: &Path,
+    spec: &InstanceSpec,
+) -> Result<InstanceStatus, SpawnError> {
+    let live = spawn::spawn_from_spec(home, exe, spec, spawn::READY_TIMEOUT).await?;
     // 看护者出簇（watchdog 总开关，settings 层）：实例就绪后确保存在看护者。
     // 选举规范防止多实例并发 start 时的重复拉起：claim 有效让位；缺席时仅
     // 存活实例 PID 最小者有权 spawn；claim 原子接管最终裁决唯一性。
-    ensure_watchdog_if_enabled(exe);
+    ensure_watchdog_if_enabled(home, exe);
     Ok(live)
 }
 
 /// 确保看护者在任（settings.watchdog 开启时）。
 /// 失败静默（看护者缺失只是失去自愈保护，不应让 start 失败）。
-fn ensure_watchdog_if_enabled(exe: &Path) {
-    let settings = settings::load();
+fn ensure_watchdog_if_enabled(home: &Path, exe: &Path) {
+    let settings = settings::load_from(&settings::settings_path_in(home));
     if !settings.watchdog {
         return;
     }
-    let run_dir = daemon::run_dir();
+    let run_dir = home.join("run");
     let fresh = crate::watchdog::heartbeat_fresh_secs(&settings);
     if crate::watchdog::watchdog_in_effect_in(&run_dir, fresh, crate::watchdog::now_millis()) {
         return; // 已有在任看护者
@@ -321,8 +350,40 @@ fn ensure_watchdog_if_enabled(exe: &Path) {
         return; // 有更小 PID 的存活实例，拉起是它的事（其自检/该实例 start 兜底）
     }
     // 无效的看护者记录不在这里删：新看护者接管时自己处理，它要靠记录找到假死的前任
-    match crate::watchdog::spawn_watchdog(exe, &aproxy_ipc::home::home()) {
+    match crate::watchdog::spawn_watchdog(exe, home) {
         Ok(pid) => tracing::info!(pid, "看护者已随实例启动拉起"),
         Err(e) => tracing::warn!(error = %e, "看护者拉起失败（守护自检会补种）"),
+    }
+}
+
+/// 守护日志随机文件名：`<纳秒时间戳hex>-<pid低16位hex>.log`。
+/// 端口是易变标识（换端口重启后按端口命名找不到旧日志），文件名改用启动
+/// 时刻的随机标识；同 pid 同纳秒完成两次启动不可能，无需更强的随机源。
+/// 无 chrono/rand 依赖，std 时间 + pid 即可。
+fn generate_random_log_name() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos:x}-{:04x}.log", std::process::id() & 0xffff)
+}
+
+/// 定出后台实例的日志路径。`log_file` 是解析后的配置里的值（命令行 `--log-file` 的覆盖
+/// 已经并进去）；没有就在 logs 目录下生成一个随机名。`~` 展开；**相对路径相对 APROXY_HOME
+/// 解析**——日志路径会被记进拉起规格、在别的进程里再用，不能依赖谁的工作目录。返回
+/// 绝对路径。
+pub fn daemon_log_path_in(home: &Path, log_file: Option<&str>) -> PathBuf {
+    match log_file {
+        Some(raw) => {
+            // 只展开 `~`，不用 settings::expand_path：后者按当前工作目录绝对化，
+            // 而守护进程的工作目录不可靠——相对路径一律相对 APROXY_HOME
+            let expanded = PathBuf::from(config::expand_tilde(raw));
+            if expanded.is_absolute() {
+                expanded
+            } else {
+                home.join(expanded)
+            }
+        }
+        None => home.join("logs").join(generate_random_log_name()),
     }
 }

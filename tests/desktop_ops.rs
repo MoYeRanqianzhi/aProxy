@@ -59,3 +59,55 @@ fn discovery_secrets_and_desire_tokens_are_bound_to_the_home_and_window() {
     std::fs::write(&file, "api_key={ secret='private-credential' }").unwrap();
     assert!(!host.inspect(&sample).contains_key(&port));
 }
+
+#[tokio::test]
+async fn explicit_home_control_keeps_the_selected_process_alive_on_identity_mismatch() {
+    use aproxy::{config::Overrides, ops::start};
+    use aproxy_ipc::client::shutdown_for_run_in;
+    let home = TestHome::new();
+    home.settings(r#"{"watchdog":{"enabled":false},"defaults":{"base_url":"http://127.0.0.1:9"}}"#);
+    let file = home.path().join("config.toml");
+    std::fs::write(&file, "listen_addr='127.0.0.1:0'\n").unwrap();
+    let cfg =
+        start::resolve_runtime_config_in(home.path(), &Overrides::default(), Some(&file)).unwrap();
+    let log = start::daemon_log_path_in(home.path(), Some("logs/own.log"));
+    assert!(log.starts_with(home.path()));
+    let spec = spec::capture(Some(&file), Default::default(), &log);
+    let exe = std::path::Path::new(env!("CARGO_BIN_EXE_aproxy"));
+    assert!(matches!(
+        start::preflight_in(home.path(), &cfg.listen_addr)
+            .await
+            .unwrap(),
+        start::Preflight::Clear
+    ));
+    let live = start::launch_in(home.path(), exe, &spec)
+        .await
+        .unwrap()
+        .instance;
+    let port = aproxy::daemon::port_of(&live.listen_addr);
+    home.stop_on_drop(port.parse().unwrap());
+    let dir = home.path().join("run");
+    let mut old = live.clone();
+    old.instance_id.push('x');
+    assert!(matches!(
+        shutdown_for_run_in(&dir, port, &old, false).await,
+        Err(aproxy_ipc::client::IpcError::RunChanged)
+    ));
+    let mut recycled = live.clone();
+    recycled.start.push('x');
+    assert!(matches!(
+        shutdown_for_run_in(&dir, port, &recycled, false).await,
+        Err(aproxy_ipc::client::IpcError::RunChanged)
+    ));
+    assert_eq!(
+        aproxy::daemon::ipc_ping_in(&dir, port)
+            .await
+            .unwrap()
+            .instance,
+        live
+    );
+    shutdown_for_run_in(&dir, port, &live, false).await.unwrap();
+    assert!(
+        aproxy::daemon::wait_until_gone_in(&dir, port, std::time::Duration::from_secs(12)).await
+    );
+}

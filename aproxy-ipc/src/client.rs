@@ -225,28 +225,84 @@ pub async fn read_for_run_in(
         // History replies have no identity envelope. Keep their connection open
         // while asking the endpoint for a snapshot, then compare both peers before
         // sending the operation. This also works for body chunks and empty pages.
-        let (stream, peer) = imp::connect(&endpoint).await?;
-        if expected.is_some_and(|run| run.pid != peer) {
-            return Err(IpcError::RunChanged);
-        }
-        let (ping, ping_peer) = imp::exchange(&endpoint, &IpcOp::Ping.request_line()).await?;
-        if ping_peer != peer {
-            return Err(IpcError::RunChanged);
-        }
-        let record = parse_reply(&ping)?.instance;
-        verify_pid(record.pid, peer)?;
+        let (stream, snapshot) = verified_connection(&endpoint, expected).await?;
         let run = RunIdentity {
-            pid: peer,
-            instance_id: record.instance_id,
+            pid: snapshot.instance.pid,
+            instance_id: snapshot.instance.instance_id,
         };
-        run.check(expected)?;
         let result = parse_result(&exchange_over(stream, &op.request_line()).await?)?;
-        Ok((run, result))
+        Ok::<_, IpcError>((run, result))
     };
     match tokio::time::timeout(Duration::from_secs(3), exchange).await {
         Ok(result) => result.map_err(|e| e.at(&endpoint)),
         Err(_) => Err(IpcError::Transient(format!("{endpoint}: 请求超时"))),
     }
+}
+
+/// Keep the operation's transport open while verifying its OS peer against a
+/// snapshot. Endpoint reuse between the verification and the operation cannot
+/// redirect that held connection to a replacement process.
+async fn verified_connection(
+    endpoint: &str,
+    expected: Option<&RunIdentity>,
+) -> Result<(imp::Stream, InstanceStatus), IpcError> {
+    let (stream, peer) = imp::connect(endpoint).await?;
+    if expected.is_some_and(|run| run.pid != peer) {
+        return Err(IpcError::RunChanged);
+    }
+    let (ping, ping_peer) = imp::exchange(endpoint, &IpcOp::Ping.request_line()).await?;
+    if ping_peer != peer {
+        return Err(IpcError::RunChanged);
+    }
+    let status = parse_reply(&ping)?;
+    verify_pid(status.instance.pid, peer)?;
+    RunIdentity {
+        pid: peer,
+        instance_id: status.instance.instance_id.clone(),
+    }
+    .check(expected)?;
+    Ok((stream, status))
+}
+
+/// Send only shutdown on the already-held, verified control connection. The
+/// trusted record comes from the caller's home, never from a window argument.
+pub async fn shutdown_for_run_in(
+    run_dir: &std::path::Path,
+    port: &str,
+    record: &InstanceRecord,
+    keep_restore: bool,
+) -> Result<(), IpcError> {
+    let endpoint = endpoint_for_in(run_dir, port);
+    let expected = RunIdentity {
+        pid: record.pid,
+        instance_id: record.instance_id.clone(),
+    };
+    let exchange = async {
+        let (stream, seen) = verified_connection(&endpoint, Some(&expected)).await?;
+        if record.start.is_empty()
+            || seen.instance.start != record.start
+            || seen.instance.listen_addr != record.listen_addr
+        {
+            return Err(IpcError::RunChanged);
+        }
+        let op = if keep_restore {
+            IpcOp::STOP_KEEPING_RESTORE
+        } else {
+            IpcOp::STOP
+        };
+        let reply = parse_reply(&exchange_over(stream, &op.request_line()).await?)?;
+        if reply.instance.pid != record.pid
+            || reply.instance.instance_id != record.instance_id
+            || reply.instance.start != record.start
+        {
+            return Err(IpcError::RunChanged);
+        }
+        Ok(())
+    };
+    tokio::time::timeout(Duration::from_secs(3), exchange)
+        .await
+        .map_err(|_| IpcError::Transient(format!("{endpoint}: 请求超时")))?
+        .map_err(|e| e.at(&endpoint))
 }
 
 /// Consume at most `limit` bytes including the newline. `read_until` preserves

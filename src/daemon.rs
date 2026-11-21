@@ -561,9 +561,14 @@ pub fn append_startup_log(line: &str) {
 /// 忙、超时、应答无法采信都不算——挂死的实例正是「端点还在、却不应答」，
 /// 据此报「已停止」会掩盖一个仍占着端口的进程。
 pub async fn wait_until_gone(port: &str, timeout: Duration) -> bool {
+    wait_until_gone_in(&run_dir(), port, timeout).await
+}
+
+/// 只等待给定主目录的控制端点退出，不能用另一个 home 的同号端口判定成功。
+pub async fn wait_until_gone_in(run_dir: &std::path::Path, port: &str, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Err(IpcError::Unreachable(_)) = ipc_ping(port).await {
+        if let Err(IpcError::Unreachable(_)) = ipc_ping_in(run_dir, port).await {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -1063,6 +1068,14 @@ pub fn remove_registry_files(listen_addr: &str) {
     remove_instance_file(listen_addr);
     crate::watchdog::remove_heartbeat_file(&run_dir(), port_of(listen_addr));
     remove_socket_file(port_of(listen_addr));
+}
+
+/// 由外部停止者清理指定 home 的旧实例记录；不修改本进程监听器的退役标志。
+pub(crate) fn remove_stopped_files_in(run_dir: &std::path::Path, port: &str) {
+    let _ = std::fs::remove_file(instance_file_path_in(run_dir, port));
+    crate::watchdog::remove_heartbeat_file(run_dir, port);
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(endpoint_for_in(run_dir, port));
 }
 
 // ---------------------------------------------------------------------------

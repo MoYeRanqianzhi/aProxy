@@ -22,36 +22,9 @@ use crate::util::chrono_like_timestamp;
 /// 生成，注册表/恢复记录/轮转共用同一份，不会各自生成出不同的名字。
 static RESOLVED_DAEMON_LOG: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
-/// 守护日志随机文件名：`<纳秒时间戳hex>-<pid低16位hex>.log`。
-/// 端口是易变标识（换端口重启后按端口命名找不到旧日志），文件名改用启动
-/// 时刻的随机标识；同 pid 同纳秒完成两次启动不可能，无需更强的随机源。
-/// 无 chrono/rand 依赖，std 时间 + pid 即可。
-fn generate_random_log_name() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{nanos:x}-{:04x}.log", std::process::id() & 0xffff)
-}
-
-/// 定出后台实例的日志路径。`log_file` 是解析后的配置里的值（命令行 `--log-file` 的覆盖
-/// 已经并进去）；没有就在 logs 目录下生成一个随机名。`~` 展开；**相对路径相对 APROXY_HOME
-/// 解析**——日志路径会被记进拉起规格、在别的进程里再用，不能依赖谁的工作目录。返回
-/// 绝对路径。
+/// 当前命令采用进程主目录；路径与后台拉起时写进规格的算法一致。
 pub(crate) fn resolve_daemon_log_path(log_file: Option<&str>) -> PathBuf {
-    match log_file {
-        Some(raw) => {
-            // 只展开 `~`，不用 settings::expand_path：后者按当前工作目录绝对化，
-            // 而守护进程的工作目录不可靠——相对路径一律相对 APROXY_HOME
-            let expanded = PathBuf::from(aproxy::config::expand_tilde(raw));
-            if expanded.is_absolute() {
-                expanded
-            } else {
-                aproxy_ipc::home::home().join(expanded)
-            }
-        }
-        None => aproxy::daemon::logs_dir().join(generate_random_log_name()),
-    }
+    aproxy::ops::start::daemon_log_path_in(&aproxy_ipc::home::home(), log_file)
 }
 
 /// 本进程守护日志的最终路径（serve_forever 消费）。None = 前台实例。

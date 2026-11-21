@@ -28,8 +28,14 @@ pub enum Restore {
 /// 按一条期望状态记录拉起实例。幂等：已在运行的跳过，可重复执行。`exe` 是用来拉起实例的
 /// 二进制。
 pub async fn restore_entry(entry: &RestoreEntry, exe: &Path) -> Restore {
+    restore_entry_in(&aproxy_ipc::home::home(), entry, exe).await
+}
+
+/// 从同一个主目录检查、拉起并交接端口记录，避免操作启动者环境里的另一套实例。
+pub async fn restore_entry_in(home: &Path, entry: &RestoreEntry, exe: &Path) -> Restore {
+    let run_dir = home.join("run");
     // 幂等：记录存在而实例已在运行时，不重复启动
-    if daemon::ipc_ping(&entry.port).await.is_ok() {
+    if daemon::ipc_ping_in(&run_dir, &entry.port).await.is_ok() {
         return Restore::AlreadyRunning;
     }
     // 没有配置文件的规格（只靠覆盖参数与全局默认启动的实例）不做这项检查
@@ -43,14 +49,12 @@ pub async fn restore_entry(entry: &RestoreEntry, exe: &Path) -> Restore {
     // 就绪的判定按新 pid 在注册表里定位实际端口（见 crate::spawn）。不能 ping 记录里的
     // 端口：实例监听哪个端口由它此刻读到的配置决定——用户改了 config.toml 的端口却没
     // restart，新实例就落在别的端口，ping 原端口只会误报「未就绪」
-    let home = aproxy_ipc::home::home();
-    match spawn::spawn_from_spec(&home, exe, &entry.spec, spawn::READY_TIMEOUT).await {
+    match spawn::spawn_from_spec(home, exe, &entry.spec, spawn::READY_TIMEOUT).await {
         Ok(live) => {
             let port = daemon::port_of(&live.instance.listen_addr).to_string();
             // 实例落在新端口：它已按实际端口写了自己的记录，原端口那份被接替。不删的话
             // stop 新端口之后，下一次 restore（或看护者）会凭旧记录把实例再拉起来
-            let moved =
-                daemon::retire_moved_port_records_in(&daemon::run_dir(), &entry.port, &port);
+            let moved = daemon::retire_moved_port_records_in(&run_dir, &entry.port, &port);
             Restore::Restored {
                 pid: live.instance.pid,
                 port,

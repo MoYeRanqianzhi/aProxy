@@ -1818,8 +1818,17 @@ impl Recorder {
 
     /// 从请求里读出来的两样：顶层的 `model`，以及客户端是不是在要一个流。
     pub fn request_shape(&self, model: Option<String>, stream: bool) {
-        self.update(|inner, live| {
-            inner.model = model.map(|text| live.history.secrets.replace(&text));
+        let Some(live) = &self.0 else { return };
+        // 没有匹配时直接接过解析器的分配；匹配与替换都不占记录锁。
+        let model = model.map(|text| {
+            if live.history.secrets.find(text.as_bytes()).is_some() {
+                live.history.secrets.replace(&text)
+            } else {
+                text
+            }
+        });
+        self.update(|inner, _| {
+            inner.model = model;
             inner.stream = stream;
         });
     }
@@ -3217,6 +3226,23 @@ mod tests {
         );
         assert_eq!(detail["tries"][0]["response"]["upstream_status"], 200);
         assert_eq!(detail["record"]["path"], "/v1/models?key=***");
+    }
+
+    #[test]
+    fn unmatched_model_keeps_parser_allocation() {
+        let h = history(0, &["UPPER-KEY"]);
+        let rec = begin_with(&h, 1, "/", &http::HeaderMap::new());
+        let model = String::from("ordinary-model");
+        let address = model.as_ptr();
+        rec.request_shape(Some(model), false);
+        assert_eq!(
+            lock(&h.find(&id(1)).unwrap().inner)
+                .model
+                .as_ref()
+                .unwrap()
+                .as_ptr(),
+            address
+        );
     }
 
     #[test]

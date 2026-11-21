@@ -157,6 +157,8 @@ own session included. Exit codes 10, 11 and 12 each call for a different next st
 
 ## Where to look
 
+If you cannot open the files linked below (a sandbox, or the skill installed under another home), read them through the binary instead: `aproxy skill show aproxy-cli --files` lists them and `aproxy skill show aproxy-cli references/latest/commands.md` prints one. The output is the installed copy, checked against its manifest, so it matches the running version.
+
 | You need | Read |
 |---|---|
 | A command's exact syntax, flags, exit codes | [commands.md](references/latest/commands.md) |

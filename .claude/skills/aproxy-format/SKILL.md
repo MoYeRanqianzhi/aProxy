@@ -104,6 +104,8 @@ a program that only improves decisions (`policy`, `adaptive`) optional.
 
 ## Where to look
 
+If you cannot open the files linked below (a sandbox, or the skill installed under another home), read them through the binary instead: `aproxy skill show aproxy-format --files` lists them and `aproxy skill show aproxy-format references/protocol.md` prints one. The output is the installed copy, checked against its manifest, so it matches the running version.
+
 | You need | Read |
 |---|---|
 | Every frame field by field, with sample frames for each stage; limits; delivery modes; the breaker | [references/protocol.md](references/protocol.md) |

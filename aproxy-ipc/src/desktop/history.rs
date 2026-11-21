@@ -561,6 +561,20 @@ pub struct Detail {
     pub tries: Vec<TryDetail>,
 }
 
+// Retained bodies from the redacting peer are stored after strict decoding; encoding describes the
+// original wire bytes. Unknown codecs or redacted names cannot certify this representation.
+fn retained_encoding(s: &str) -> bool {
+    let mut layers = 0;
+    s.split(',')
+        .all(|name| match name.trim().to_ascii_lowercase().as_str() {
+            "identity" => true,
+            "gzip" | "x-gzip" | "deflate" | "br" | "zstd" => {
+                layers += 1;
+                layers <= 4
+            }
+            _ => false,
+        })
+}
 impl Detail {
     /// Store selectors, not message metadata or bytes. Unknown wire encodings cannot attest to plain bytes.
     pub fn readable_parts(&self) -> Vec<BodyPart> {
@@ -568,9 +582,7 @@ impl Detail {
             body.as_ref().is_some_and(|b| {
                 matches!(b.state, Retention::Retained | Retention::SameAsPrevious)
                     && b.cause.is_none()
-                    && b.encoding
-                        .as_deref()
-                        .is_none_or(|s| s.eq_ignore_ascii_case("identity"))
+                    && b.encoding.as_deref().is_none_or(retained_encoding)
             })
         };
         let mut parts = Vec::new();
@@ -818,6 +830,55 @@ pub struct Chunk {
     pub complete: bool,
 }
 impl Chunk {
+    /// Examine the requested bytes plus both margins. A range can be returned only when each
+    /// bounded read attests to the same body size/completion and supplies exactly the promised bytes.
+    pub async fn inspected<F: std::future::Future<Output = R<(Chunk, Vec<u8>)>>>(
+        offset: SafeUint,
+        limit: u64,
+        secrets: &Secrets,
+        read: impl Fn(u64, u64) -> F,
+        encode: impl FnOnce(&[u8]) -> String,
+    ) -> R<Self> {
+        let invalid = || Fault::DesktopHistory {};
+        let margin = secrets.max_len().saturating_sub(1) as u64;
+        if margin > crate::wire::MAX_BODY_READ || !(1..=crate::wire::MAX_BODY_READ).contains(&limit)
+        {
+            return Err(invalid());
+        }
+        let offset = offset.get();
+        let (mut chunk, requested) = read(offset, limit).await?;
+        let total = chunk.total_bytes.get();
+        let len = limit.min(total.checked_sub(offset).ok_or_else(invalid)?);
+        if requested.len() as u64 != len || chunk.offset.get() != offset {
+            return Err(invalid());
+        }
+        let end = offset + len;
+        let left = margin.min(offset);
+        let right = margin.min(total - end);
+        if !chunk.complete && right < margin {
+            return Err(invalid());
+        }
+        let mut inspected = Vec::with_capacity((left + len + right) as usize);
+        for (at, n, prefix) in [(offset - left, left, true), (end, right, false)] {
+            if !prefix {
+                inspected.extend_from_slice(&requested);
+            }
+            if n > 0 {
+                let (other, bytes) = read(at, n).await?;
+                if other.offset.get() != at
+                    || bytes.len() as u64 != n
+                    || chunk.total_bytes != other.total_bytes
+                    || chunk.complete != other.complete
+                {
+                    return Err(invalid());
+                }
+                inspected.extend(bytes);
+            }
+        }
+        chunk.data_b64 =
+            encode(&secrets.body_bytes(&inspected, left as usize..(left + len) as usize));
+        Ok(chunk)
+    }
     /// Validate the envelope before the desktop decodes and checks its contents.
     pub fn project(r: view::BodyChunk, offset: SafeUint, limit: u64) -> R<Self> {
         let invalid = || Fault::DesktopHistory {};
@@ -885,6 +946,64 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+    #[test]
+    fn chunk_rechecks_decoded_margins_and_withholds_unstable_or_unknown_representations() {
+        let secrets = Secrets::new(["abcdefgh", "efghijkl"]);
+        let body = b".abcdefghijkl!";
+        let read = |offset: u64, limit: u64, complete, changed| {
+            let n = (body.len() as u64 - offset).min(limit);
+            let chunk = Chunk {
+                total_bytes: SafeUint::saturating(body.len() as u64 + u64::from(changed)),
+                offset: SafeUint::saturating(offset),
+                data_b64: "unchecked".into(),
+                more: offset + n < body.len() as u64,
+                complete,
+            };
+            std::future::ready(Ok((
+                chunk,
+                body[offset as usize..(offset + n) as usize].to_vec(),
+            )))
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for offset in 0..body.len() {
+                    let chunk = Chunk::inspected(
+                        SafeUint::saturating(offset as u64),
+                        1,
+                        &secrets,
+                        |o, n| read(o, n, true, false),
+                        |v| String::from_utf8(v.to_vec()).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        chunk.data_b64.as_bytes(),
+                        &b".************!"[offset..offset + 1]
+                    );
+                }
+                for (complete, changed) in [(false, false), (true, true)] {
+                    assert!(
+                        Chunk::inspected(
+                            SafeUint::saturating(10),
+                            3,
+                            &secrets,
+                            |o, n| read(o, n, complete, changed && o != 10),
+                            |_| panic!("must withhold")
+                        )
+                        .await
+                        .is_err()
+                    );
+                }
+            });
+        for name in ["identity", "GZip, br", "deflate", "zstd"] {
+            assert!(retained_encoding(name));
+        }
+        for name in ["<secret>", "br, future", "br,br,br,br,br"] {
+            assert!(!retained_encoding(name));
+        }
     }
     #[test]
     fn configured_short_headers_and_overlapping_body_margins_are_private() {

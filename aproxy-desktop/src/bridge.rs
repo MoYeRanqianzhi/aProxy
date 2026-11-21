@@ -576,10 +576,6 @@ pub(crate) async fn body_chunk(request: Request<'_>, b: State<'_, Arc<Bridge>>) 
         let invalid = || Fault::DesktopHistory {};
         let secrets = b.sample().secrets(&key).ok_or(Fault::DesktopChanged {})?;
         Projection::new(&secrets).check_ref(&a.r#ref)?;
-        let margin = secrets.max_len().saturating_sub(1) as u64;
-        if margin > aproxy_ipc::wire::MAX_BODY_READ {
-            return Err(invalid());
-        }
         let read = |offset: u64, limit| {
             let fut = b
                 .view
@@ -594,33 +590,11 @@ pub(crate) async fn body_chunk(request: Request<'_>, b: State<'_, Arc<Bridge>>) 
                 Ok::<_, Fault>((chunk, bytes))
             }
         };
-        let offset = a.offset.get();
-        let (mut chunk, requested) = read(offset, a.limit).await?;
-        let end = offset + requested.len() as u64;
-        let left = offset.min(margin);
-        let right = (chunk.total_bytes.get() - end).min(margin);
-        // An unfinished tail could become the prefix of a secret on the next append.
-        if !chunk.complete && right < margin {
-            return Err(invalid());
-        }
-        let mut inspected = Vec::with_capacity(left as usize + requested.len() + right as usize);
-        for (at, len) in [(offset - left, left), (end, right)] {
-            if at == end {
-                inspected.extend_from_slice(&requested);
-            }
-            if len != 0 {
-                let (other, bytes) = read(at, len).await?;
-                if chunk.total_bytes != other.total_bytes || chunk.complete != other.complete {
-                    return Err(invalid());
-                }
-                inspected.extend(bytes);
-            }
-        }
+        let chunk =
+            Chunk::inspected(a.offset, a.limit, &secrets, read, |v| STANDARD.encode(v)).await?;
         if b.sample().secrets(&key).as_deref() != Some(secrets.as_ref()) {
             return Err(Fault::DesktopChanged {});
         }
-        chunk.data_b64 = STANDARD
-            .encode(secrets.body_bytes(&inspected, left as usize..left as usize + requested.len()));
         Ok(chunk)
     };
     let value = tokio::select! {biased;_=cancel.changed()=>return Err(Fault::DesktopCancelled{}),r=inspect=>r};

@@ -34,6 +34,13 @@ fn check_directory_budget(f: &mut fs::File, limit: u64) -> io::Result<()> {
         return Err(invalid());
     }
     let counts = if end >= 20 && &tail[end - 20..end - 16] == b"PK\x06\x07" {
+        // 库只在传统字段饱和时切到 ZIP64；两种读法都不得超过预算。
+        for off in [8, 10] {
+            let n = u16::from_le_bytes(tail[end + off..end + off + 2].try_into().unwrap());
+            if n != u16::MAX && u64::from(n) > limit {
+                return Err(io::Error::other("skill 压缩包条目过多"));
+            }
+        }
         let start = u64::from_le_bytes(tail[end - 12..end - 4].try_into().unwrap());
         // 小型发布包不用 ZIP64 的可扩展数据区，固定头也不会按外部长度分配内存。
         if start.checked_add(56 + 20 + 22) != Some(len) {
@@ -285,6 +292,11 @@ mod directory_tests {
                 }
                 f.write_all(&end).unwrap();
                 assert_eq!(check_directory_budget(&mut f, 2).is_ok(), count == 2);
+                if wide && count == 2 {
+                    f.seek(SeekFrom::End(-14)).unwrap();
+                    f.write_all(&[3, 0, 3, 0]).unwrap();
+                    assert!(check_directory_budget(&mut f, 2).is_err());
+                }
             }
         }
     }

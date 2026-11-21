@@ -739,7 +739,11 @@ mod tests {
     #[test]
     fn rejected_openings_and_events_close_the_real_connection() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
             for case in ["missing", "replacement", "request", "state", "ack-size", "event-size", "exact"] {
                 let dir=tempfile::tempdir().unwrap(); let endpoint=endpoint_for_in(dir.path(), "frames");
                 #[cfg(unix)] let listener=tokio::net::UnixListener::bind(&endpoint).unwrap();
@@ -754,7 +758,7 @@ mod tests {
                     if case=="missing" {instance.as_object_mut().unwrap().remove("instance_id");}
                     if case=="replacement" {instance["instance_id"]=json!("second");}
                     let mut ack=json!({"v":1,"ok":true,"result":{"snapshot":{"instance":instance},"requests":[]}}).to_string().into_bytes();
-                    if case=="ack-size" {ack.resize(crate::wire::MAX_REPLY_LINE,b' ');} if case=="exact" {ack.resize(crate::wire::MAX_REPLY_LINE-1,b' ');} ack.push(b'\n');
+                    if case=="ack-size" {ack.resize(crate::wire::MAX_REPLY_LINE,b' ');} else if case=="exact" {ack.resize(crate::wire::MAX_REPLY_LINE-1,b' ');} ack.push(b'\n');
                     let mut frames=ack;
                     instance["instance_id"]=json!("second");
                     let event=match case {"request"=>Some(json!({"event":"request","data":{"request_id":"second-1"}})),"state"=>Some(json!({"event":"state","data":{"instance":instance}})),"event-size"=>Some(json!({"event":"heartbeat"})), _=>None};

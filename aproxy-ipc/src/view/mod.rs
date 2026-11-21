@@ -404,7 +404,7 @@ impl Shared {
 
 enum Observation {
     Request(Arc<RequestSummary>),
-    State(StateSnapshot),
+    State(Box<StateSnapshot>),
     Lost,
     Other,
 }
@@ -452,7 +452,7 @@ async fn follow(source: &dyn Source, shared: &Shared, port: u16, run: &RunIdenti
                 Either::Right((result, _)) => break result?,
                 Either::Left((event, _)) => match observation(run, event)? {
                     Observation::Lost => return Ok(()),
-                    Observation::State(s) => snapshot = s,
+                    Observation::State(s) => snapshot = *s,
                     Observation::Request(r) => {
                         cut = merge(cut, [], [r]);
                         trim(&mut cut, PER_RUN_LIMIT);
@@ -496,7 +496,7 @@ async fn follow(source: &dyn Source, shared: &Shared, port: u16, run: &RunIdenti
                     .get_mut(&port)
                     .unwrap()
                     .info
-                    .state = Some(state);
+                    .state = Some(*state);
                 shared.notify(Change::Instance(port));
             }
             Observation::Lost => break,
@@ -705,10 +705,8 @@ async fn drive(source: Arc<dyn Source>, shared: Arc<Shared>, ticks: BoxStream<'s
             if !may_join && info.liveness == Presence::Live {
                 info.feed = Feed::Polling;
             }
-            if !safe {
-                if let Some(state) = &mut info.state {
-                    state.activity.last_error = None;
-                }
+            if !safe && let Some(state) = &mut info.state {
+                state.activity.last_error = None;
             }
             if (!same || !may_join || info.liveness != Presence::Live)
                 && let Some((_, h)) = handles.remove(&p)

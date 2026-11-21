@@ -36,6 +36,8 @@
     "allow-read-desktop-state",
     "allow-set-preferences",
     "allow-set-pinned",
-    "allow-about"
+    "allow-about",
+    "allow-check-update",
+    "allow-install-update"
   ]
 }

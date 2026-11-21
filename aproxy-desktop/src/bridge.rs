@@ -59,6 +59,12 @@ struct Cursor {
     epoch: u64,
     next: Option<(Token, Option<Run>, Traversal, Arc<Survey>)>,
 }
+#[derive(Default)]
+struct UpdateWindow {
+    active: bool,
+    closing: bool,
+    last: Option<Job>,
+}
 /// 单窗口持有所有易失状态；重新载入只换连接，不会另开视图或第二条实例订阅。
 pub(crate) struct Bridge {
     view: HomeView,
@@ -67,6 +73,7 @@ pub(crate) struct Bridge {
     serial: AtomicU64,
     attached: Mutex<Option<Attached>>,
     cursors: Mutex<[Cursor; 2]>,
+    update: Mutex<UpdateWindow>,
 }
 impl Bridge {
     /// 发现线程先取宿主私有数据再原子替换投影。同步读只需克隆一份 Arc。
@@ -98,7 +105,14 @@ impl Bridge {
             serial: AtomicU64::new(1),
             attached: Mutex::default(),
             cursors: Mutex::default(),
+            update: Mutex::default(),
         })
+    }
+    /// 与接受安装共用一把锁，关闭之后不能再启动新事务；在途子进程由自己的任务读到退出。
+    pub(crate) fn close_requested(&self) -> bool {
+        let mut u = self.update.lock().unwrap();
+        u.closing = true;
+        u.active
     }
     fn serial(&self) -> u64 {
         self.serial.fetch_add(1, Ordering::Relaxed)
@@ -342,7 +356,7 @@ pub(crate) async fn snapshot(request: Request<'_>, b: State<'_, Arc<Bridge>>) ->
             .collect::<R<_>>()?,
         recent: std::iter::from_fn(|| t.pop()).take(50).collect(),
         watchdog: f.watchdog(),
-        update: None,
+        update: b.update.lock().unwrap().last.clone(),
     })
 }
 #[derive(Deserialize)]
@@ -579,7 +593,7 @@ struct DesireArgs {
 #[tauri::command]
 pub(crate) async fn list_configs(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn StateOps>>,
+    ops: State<'_, Arc<dyn UpdateOps>>,
 ) -> R<Vec<Choice>> {
     let _: Empty = args(&request)?;
     ops.list_configs().await
@@ -589,7 +603,7 @@ pub(crate) async fn list_configs(
 #[tauri::command]
 pub(crate) async fn start_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn StateOps>>,
+    ops: State<'_, Arc<dyn UpdateOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Run> {
     let a: TargetArgs = args(&request)?;
@@ -602,7 +616,7 @@ pub(crate) async fn start_instance(
 #[tauri::command]
 pub(crate) async fn stop_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn StateOps>>,
+    ops: State<'_, Arc<dyn UpdateOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<()> {
     let a: RunArgs = args(&request)?;
@@ -615,7 +629,7 @@ pub(crate) async fn stop_instance(
 #[tauri::command]
 pub(crate) async fn restart_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn StateOps>>,
+    ops: State<'_, Arc<dyn UpdateOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Run> {
     let a: RunArgs = args(&request)?;
@@ -628,7 +642,7 @@ pub(crate) async fn restart_instance(
 #[tauri::command]
 pub(crate) async fn force_stop_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn StateOps>>,
+    ops: State<'_, Arc<dyn UpdateOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<()> {
     let a: RunArgs = args(&request)?;
@@ -641,7 +655,7 @@ pub(crate) async fn force_stop_instance(
 #[tauri::command]
 pub(crate) async fn restore_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn StateOps>>,
+    ops: State<'_, Arc<dyn UpdateOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Run> {
     let a: DesireArgs = args(&request)?;
@@ -654,7 +668,7 @@ pub(crate) async fn restore_instance(
 #[tauri::command]
 pub(crate) async fn forget_restore(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn StateOps>>,
+    ops: State<'_, Arc<dyn UpdateOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<()> {
     let a: DesireArgs = args(&request)?;
@@ -691,7 +705,7 @@ struct Switch {
 #[tauri::command]
 pub(crate) async fn read_config(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn StateOps>>,
+    ops: State<'_, Arc<dyn UpdateOps>>,
 ) -> R<ConfigView> {
     let a: FileArg = args(&request)?;
     ops.read_config(a.target).await
@@ -701,7 +715,7 @@ pub(crate) async fn read_config(
 #[tauri::command]
 pub(crate) async fn validate_config(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn StateOps>>,
+    ops: State<'_, Arc<dyn UpdateOps>>,
 ) -> R<Validation> {
     let a: ValidateArg = args(&request)?;
     ops.validate_config(a.target, a.changes).await
@@ -711,7 +725,7 @@ pub(crate) async fn validate_config(
 #[tauri::command]
 pub(crate) async fn write_config(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn StateOps>>,
+    ops: State<'_, Arc<dyn UpdateOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Saved> {
     let a: WriteArg = args(&request)?;
@@ -726,7 +740,7 @@ pub(crate) async fn write_config(
 #[tauri::command]
 pub(crate) async fn read_settings(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn StateOps>>,
+    ops: State<'_, Arc<dyn UpdateOps>>,
 ) -> R<SettingsView> {
     let _: Empty = args(&request)?;
     ops.read_settings().await
@@ -736,7 +750,7 @@ pub(crate) async fn read_settings(
 #[tauri::command]
 pub(crate) async fn set_watchdog(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn StateOps>>,
+    ops: State<'_, Arc<dyn UpdateOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<bool> {
     let a: Switch = args(&request)?;
@@ -761,7 +775,7 @@ struct PinArgs {
 #[tauri::command]
 pub(crate) async fn read_desktop_state(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn StateOps>>,
+    ops: State<'_, Arc<dyn UpdateOps>>,
 ) -> R<DesktopState> {
     let _: Empty = args(&request)?;
     ops.read_desktop_state().await
@@ -770,7 +784,7 @@ pub(crate) async fn read_desktop_state(
 #[tauri::command]
 pub(crate) async fn set_preferences(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn StateOps>>,
+    ops: State<'_, Arc<dyn UpdateOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Preferences> {
     let a: PrefArgs = args(&request)?;
@@ -782,7 +796,7 @@ pub(crate) async fn set_preferences(
 #[tauri::command]
 pub(crate) async fn set_pinned(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn StateOps>>,
+    ops: State<'_, Arc<dyn UpdateOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Vec<Bookmark>> {
     let a: PinArgs = args(&request)?;
@@ -821,7 +835,70 @@ pub(crate) async fn set_pinned(
 }
 /// 返回运行中二进制的版本，不从安装位置探测或联网。
 #[tauri::command]
-pub(crate) async fn about(request: Request<'_>, ops: State<'_, Arc<dyn StateOps>>) -> R<About> {
+pub(crate) async fn about(request: Request<'_>, ops: State<'_, Arc<dyn UpdateOps>>) -> R<About> {
     let _: Empty = args(&request)?;
     ops.about()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateArg {
+    channel: ChannelChoice,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallArg {
+    check: Token,
+}
+/// 调用安装位置的命令查询版本，页面只得到一次性确认凭据。
+#[tauri::command]
+pub(crate) async fn check_update(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn UpdateOps>>,
+) -> R<UpdateInfo> {
+    let a: UpdateArg = args(&request)?;
+    ops.check_update(a.channel).await
+}
+/// 安装不随页面卸载取消；进度和结果在子进程结束之前由独立于 invoke 的任务持有。
+#[tauri::command]
+pub(crate) async fn install_update(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn UpdateOps>>,
+    b: State<'_, Arc<Bridge>>,
+    app: tauri::AppHandle,
+) -> R<InstallEnd> {
+    let a: InstallArg = args(&request)?;
+    {
+        let mut state = b.update.lock().unwrap();
+        if state.active || state.closing {
+            return Err(Fault::DesktopBusy {});
+        }
+        state.active = true;
+    }
+    let bridge = b.inner().clone();
+    let ops = ops.inner().clone();
+    let publish = bridge.clone();
+    b.runtime
+        .spawn(async move {
+            let end = ops
+                .install_update(
+                    a.check,
+                    Arc::new(move |job| {
+                        publish.update.lock().unwrap().last = Some(job.clone());
+                        publish.offer(DesktopEvent::UpdateProgress { job: Box::new(job) });
+                    }),
+                )
+                .await;
+            let close = {
+                let mut u = bridge.update.lock().unwrap();
+                u.active = false;
+                u.closing
+            };
+            if close {
+                app.exit(0)
+            }
+            end
+        })
+        .await
+        .map_err(|_| Fault::DesktopUnavailable {})?
 }

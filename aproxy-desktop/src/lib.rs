@@ -85,7 +85,7 @@ pub struct Options {
     /// 发现时由宿主解析私有配置，供本窗口的内存投影使用。
     pub inspect: aproxy_ipc::desktop::InspectHome,
     /// 只提供绑定此主目录的操作；窗口没有可执行路径或进程选择权。
-    pub ops: Arc<dyn aproxy_ipc::desktop::StateOps>,
+    pub ops: Arc<dyn aproxy_ipc::desktop::UpdateOps>,
     /// webview 的数据目录（WebView2 的用户数据目录、WebKitGTK 的网站数据）。aproxy 给
     /// `<home>/desktop/webview`：不显式指定的话，Tauri 在 Windows 与 Linux 上会强制用
     /// app_local_data_dir（按 tauri.conf.json 的 identifier 建在用户的应用数据目录下），
@@ -208,7 +208,26 @@ pub fn run(options: Options) -> Result<i32, Error> {
         Err(panic) => return Err(Error::Startup(panic_message(&*panic))),
     };
 
-    let code = app.run_return(|_, _| {});
+    let on_close = bridge.clone();
+    let code = app.run_return(move |app, event| {
+        if let tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::CloseRequested { api, .. },
+            ..
+        } = event
+            && label == MAIN_WINDOW
+            && on_close.close_requested()
+        {
+            api.prevent_close();
+            if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+                let _ = window.hide();
+            }
+            let bridge = on_close.clone();
+            tauri::async_runtime::spawn(async move {
+                bridge.shutdown().await;
+            });
+        }
+    });
     // 事件循环已退场，可以等视图释放套接字；不要在窗口回调里阻塞运行时。
     runtime.block_on(bridge.shutdown());
     match failure.lock().unwrap_or_else(|e| e.into_inner()).take() {

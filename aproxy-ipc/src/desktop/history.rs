@@ -202,14 +202,21 @@ impl<'a> Projection<'a> {
     /// Keep a bounded immutable summary only after projecting a verified record.
     /// Cutting may remove the rest of a credential, so mask a matching prefix too.
     pub fn bookmark(&self, row: Row) -> super::Bookmark {
+        let boundary = |s: &str| {
+            let mut n = s.len().min(256);
+            while !s.is_char_boundary(n) {
+                n -= 1;
+            }
+            n
+        };
         let cut = |s: String| {
             if s.len() <= 256 {
                 return s;
             }
-            let end = s.floor_char_boundary(256);
+            let end = boundary(&s);
             let bytes = self.secrets.replace_cut_prefix(&s.as_bytes()[..end]);
             let mut out = String::from_utf8_lossy(&bytes).into_owned();
-            out.truncate(out.floor_char_boundary(256));
+            out.truncate(boundary(&out));
             out
         };
         super::Bookmark {

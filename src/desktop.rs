@@ -2,6 +2,7 @@
 mod forms;
 mod instances;
 mod state;
+mod update;
 use crate::{config, settings, spec};
 use aproxy_ipc::{
     desktop::{Fault, LocalFacts, R},
@@ -23,6 +24,7 @@ pub struct DesktopHome {
     display_home: String,
     key: [u8; 32],
     exe: PathBuf,
+    updates: Arc<std::sync::Mutex<update::Checks>>,
     listing: Arc<std::sync::Mutex<Option<[u8; 16]>>>,
 }
 impl DesktopHome {
@@ -39,6 +41,7 @@ impl DesktopHome {
             key,
             exe,
             listing: Default::default(),
+            updates: Default::default(),
         };
         host.display_home = host
             .display_secrets()

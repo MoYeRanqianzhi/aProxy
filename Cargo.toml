@@ -112,6 +112,8 @@ tempfile = "3"
 tar = "0.4"
 flate2 = "1"
 semver = "1"
+# 只把发布服务给出的 RFC 3339 时间转换为界面的 Unix 毫秒。
+time = { version = "0.3", features = ["parsing"] }
 # skill 更新支线：GitHub skills 资产的 zip 解包。9.0 起修掉了 extract() 的
 # 符号链接与 SUID 系列公告（RUSTSEC-2026-0367/0368/0369/0429）；解包走的是
 # install::skills 自己逐条写文件的循环，不调 extract()，升级是为了不带着有公告的

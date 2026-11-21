@@ -467,3 +467,91 @@ async fn private_window_state_is_bounded_resettable_and_write_only_for_secrets()
         })
     ));
 }
+
+#[tokio::test]
+async fn update_children_are_home_bound_confirmed_bounded_and_terminal_only_after_exit() {
+    use aproxy_ipc::desktop::{ChannelChoice, Fault, Job, UpdateOps};
+    let home = TestHome::new();
+    let exe = aproxy::install::swap::bin_path_in(home.path());
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    let host = DesktopHome::new(home.path().into(), env!("CARGO_BIN_EXE_aproxy").into()).unwrap();
+    assert!(matches!(
+        host.check_update(ChannelChoice::Auto).await,
+        Err(Fault::DesktopBinary {})
+    ));
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/common/desktop_installer_fixture.rs");
+    let built = home
+        .cmd_with("rustc")
+        .arg("--edition=2024")
+        .arg(fixture)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let one = host.check_update(ChannelChoice::Pre).await.unwrap();
+    assert_eq!(one.published_at.unwrap().get(), 1767225600000);
+    let token = one.check.unwrap();
+    let two = host.check_update(ChannelChoice::Auto).await.unwrap();
+    let jobs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Job>::new()));
+    let collected = jobs.clone();
+    let progress: aproxy_ipc::desktop::Progress =
+        std::sync::Arc::new(move |j| collected.lock().unwrap().push(j));
+    assert!(matches!(
+        host.install_update(token, progress.clone()).await,
+        Err(Fault::DesktopChanged {})
+    ));
+    let end = host
+        .install_update(two.check.unwrap(), progress.clone())
+        .await
+        .unwrap();
+    assert_eq!(end.version.as_deref(), Some("1.1.0"));
+    {
+        let frames = jobs.lock().unwrap();
+        let last = frames.last().unwrap();
+        assert_eq!(last.end.as_ref(), Some(&end));
+        assert!(last.fault.is_none());
+        assert_eq!(last.download.as_ref().unwrap().bytes.get(), (1 << 53) - 1);
+        assert!(
+            frames[..frames.len() - 1]
+                .iter()
+                .all(|j| j.end.is_none() && j.fault.is_none())
+        );
+        assert!(!json!(last).to_string().contains("private"));
+    }
+    for mode in ["oversize", "wrong-exit", "duplicate", "missing", "failed"] {
+        std::fs::write(home.path().join("fixture.mode"), mode).unwrap();
+        let token = host
+            .check_update(ChannelChoice::Auto)
+            .await
+            .unwrap()
+            .check
+            .unwrap();
+        let err = host
+            .install_update(token, progress.clone())
+            .await
+            .unwrap_err();
+        if mode == "failed" {
+            assert!(matches!(err, Fault::InstallRestartFailed { port: 80 }))
+        } else {
+            assert!(matches!(err, Fault::DesktopInstallProtocol {}))
+        }
+        assert_eq!(jobs.lock().unwrap().last().unwrap().fault, Some(err));
+    }
+    let token = host
+        .check_update(ChannelChoice::Auto)
+        .await
+        .unwrap()
+        .check
+        .unwrap();
+    std::fs::write(&exe, "replacement, do not execute").unwrap();
+    assert!(matches!(
+        host.install_update(token, progress).await,
+        Err(Fault::DesktopChanged {})
+    ));
+}

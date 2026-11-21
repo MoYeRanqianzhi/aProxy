@@ -246,21 +246,12 @@ async fn shutdown_for_restart(
     Ok(())
 }
 
-/// 一个端口上有没有本 home 的实例进程：应答控制通道的，或不应答但进程经核验仍在的。
-async fn port_has_instance(run_dir: &std::path::Path, port: &str) -> bool {
-    if daemon::ipc_ping_in(run_dir, port).await.is_ok() {
-        return true;
-    }
-    daemon::read_instance_file_in(run_dir, port)
-        .is_some_and(|info| record_identity(info.pid, &info.start) == RecordIdentity::Alive)
-}
-
 /// stop 一个已经不在运行的端口：它若还留着期望状态记录（崩溃之后、看护者还没拉回来，
 /// 或看护者关着），删掉记录，restore 与看护者就不再拉它。返回是否删了记录。
 /// 端口上还有实例进程（包括不应答的）时不动：那要先把进程停下。
 pub async fn forget_stopped_port(port: &str) -> bool {
     let run_dir = daemon::run_dir();
-    if port_has_instance(&run_dir, port).await {
+    if aproxy_ipc::registry::port_has_instance_in(&run_dir, port).await {
         return false;
     }
     let had = crate::spec::restore_path_in(&run_dir, port).is_file();
@@ -280,7 +271,7 @@ pub async fn forget_stopped_config(config_path: &std::path::Path) -> Vec<String>
             .config_path
             .as_deref()
             .is_some_and(|p| super::target::config_path_key(p) == key);
-        if same && !port_has_instance(&run_dir, &entry.port).await {
+        if same && !aproxy_ipc::registry::port_has_instance_in(&run_dir, &entry.port).await {
             crate::spec::remove_restore_in(&run_dir, &entry.port);
             removed.push(entry.port);
         }
@@ -295,7 +286,7 @@ pub async fn forget_all_stopped() -> (Vec<String>, Vec<crate::spec::UnreadableRe
     let listing = crate::spec::list_restore_in(&run_dir);
     let mut removed = Vec::new();
     for entry in listing.entries {
-        if !port_has_instance(&run_dir, &entry.port).await {
+        if !aproxy_ipc::registry::port_has_instance_in(&run_dir, &entry.port).await {
             crate::spec::remove_restore_in(&run_dir, &entry.port);
             removed.push(entry.port);
         }

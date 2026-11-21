@@ -639,11 +639,7 @@ async fn run_tail(
     let mut verify = Vec::new();
     for port in &snapshot {
         if matches!(crate::spec::read_restore_in(run_dir, port), Ok(None))
-            && crate::daemon::ipc_ping_in(run_dir, port).await.is_err()
-            && !crate::daemon::read_instance_file_in(run_dir, port).is_some_and(|rec| {
-                crate::process::record_identity(rec.pid, &rec.start)
-                    == crate::process::RecordIdentity::Alive
-            })
+            && !aproxy_ipc::registry::port_has_instance_in(run_dir, port).await
         {
             // 用户 stop 后没有期望状态，续作也不能把它拉回来，终验只检查剩余端口。
             if let Ok(port) = port.parse()

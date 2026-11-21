@@ -142,9 +142,7 @@ pub fn endpoint_for(port: &str) -> String {
 /// 进程级 APROXY_HOME 派生，测试进程与多 home 场景下会找到别的 home 的端点。
 ///
 /// 名字怎样取、为什么带上 run 目录的标识，见 [`aproxy_ipc::endpoint::instance`]。
-pub fn endpoint_for_in(run_dir: &std::path::Path, port: &str) -> String {
-    aproxy_ipc::endpoint::instance(run_dir, port)
-}
+pub use aproxy_ipc::endpoint::instance as endpoint_for_in;
 
 /// 从生效的配置取摘要。
 pub fn behavior_of(cfg: &crate::config::Config) -> Behavior {

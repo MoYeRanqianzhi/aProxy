@@ -86,7 +86,7 @@ pub async fn select(
         let instances: Vec<_> = daemon::list_instances()
             .await
             .into_iter()
-            .filter(|s| now.saturating_sub(s.activity.last_request_at) / 1000 >= idle_secs)
+            .filter(|s| s.activity.idle_secs_at(now) >= idle_secs)
             .map(|s| s.instance)
             .collect();
         let empty = instances
@@ -142,7 +142,7 @@ pub async fn select(
         let port = daemon::port_of(target).to_string();
         return match daemon::ipc_ping(&port).await {
             Ok(status) => Ok(Selection::of(vec![status.instance])),
-            Err(_) => match unresponsive_record(&port) {
+            Err(_) => match aproxy_ipc::registry::live_record_in(&daemon::run_dir(), &port) {
                 Some(info) if force => Ok(Selection::of(vec![info])),
                 Some(info) => Err(SelectError::Unresponsive {
                     target: None,
@@ -188,13 +188,4 @@ impl Selection {
             unresponsive_skipped: Vec::new(),
         }
     }
-}
-
-/// 按端口读注册表记录，且记录的进程经「pid + 创建时间」核验仍在——不应答
-/// 控制通道的实例（多半挂死）只能这样定位。
-fn unresponsive_record(port: &str) -> Option<InstanceRecord> {
-    let info = daemon::read_instance_file_in(&daemon::run_dir(), port)?;
-    (crate::process::record_identity(info.pid, &info.start)
-        == crate::process::RecordIdentity::Alive)
-        .then_some(info)
 }

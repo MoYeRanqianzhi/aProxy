@@ -154,6 +154,14 @@ pub struct Activity {
     pub last_error: Option<LastError>,
 }
 
+impl Activity {
+    /// Whole seconds since the last request at this sample time. A clock rollback
+    /// gives zero, not a huge idle interval that could select an active instance.
+    pub fn idle_secs_at(&self, now_ms: u64) -> u64 {
+        now_ms.saturating_sub(self.last_request_at) / 1000
+    }
+}
+
 /// 每个时间桶的宽度（秒）。
 pub const BUCKET_WIDTH_SECS: u64 = 120;
 /// 保留多少个时间桶。

@@ -91,6 +91,18 @@ pub fn read_instance_file_in(run_dir: &std::path::Path, port: &str) -> Option<In
     parse_instance_file(&content)
 }
 
+/// 按端口读注册表记录，且记录的进程经「pid + 创建时间」核验仍在——不应答
+/// 控制通道的实例（多半挂死）只能这样定位。
+pub fn live_record_in(run_dir: &Path, port: &str) -> Option<InstanceRecord> {
+    read_instance_file_in(run_dir, port)
+        .filter(|r| record_identity(r.pid, &r.start) == RecordIdentity::Alive)
+}
+
+/// 一个端口上有没有本 home 的实例进程：应答控制通道的，或不应答但进程经核验仍在的。
+pub async fn port_has_instance_in(run_dir: &Path, port: &str) -> bool {
+    ipc_ping_in(run_dir, port).await.is_ok() || live_record_in(run_dir, port).is_some()
+}
+
 /// 实例记录的文件名后缀：文件是 `<端口>.instance.json`。
 pub const INSTANCE_FILE_SUFFIX: &str = ".instance.json";
 

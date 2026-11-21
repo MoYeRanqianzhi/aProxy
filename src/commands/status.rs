@@ -27,7 +27,7 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool, json: bo
                     return true;
                 }
                 let status = entry.status.as_ref().unwrap();
-                let idle_secs = now.saturating_sub(status.activity.last_request_at) / 1000;
+                let idle_secs = status.activity.idle_secs_at(now);
                 (idle_secs >= idle_threshold_secs) == idle_only
             })
             .collect(),
@@ -145,7 +145,7 @@ fn print_live(live: &[&Enumerated], now: u64) {
         let info = entry.instance.as_ref().unwrap();
         let status = entry.status.as_ref().unwrap();
         let activity = &status.activity;
-        let idle_secs = now.saturating_sub(activity.last_request_at) / 1000;
+        let idle_secs = activity.idle_secs_at(now);
         println!(
             "  端口 {}  pid {}  v{}  已运行 {}  闲置 {}",
             daemon::port_of(&info.listen_addr),

@@ -149,7 +149,7 @@ pub struct ProcessView {
 /// [`ipc_probe_in`]）。
 pub async fn enumerate_in(home: &Path) -> Enumeration {
     let run_dir = home.join("run");
-    let (instances, mut unreadable) = membership_in(&run_dir).await;
+    let (instances, mut unreadable) = membership_in(&run_dir).await.unwrap_or_default();
     // 读不懂的实例记录或期望状态记录让日志清理暂停（清理靠它们知道哪些日志还有人用）
     let gc_paused = (!unreadable.is_empty()).then(|| GcPaused {
         reason: GC_PAUSED_UNREADABLE_RECORDS.to_string(),
@@ -202,7 +202,9 @@ async fn discovery_io<T: Send + 'static>(
     recv.await.expect("discovery worker panicked")
 }
 
-pub(crate) async fn membership_in(run_dir: &Path) -> (Vec<Enumerated>, Vec<UnreadableFile>) {
+pub(crate) async fn membership_in(
+    run_dir: &Path,
+) -> std::io::Result<(Vec<Enumerated>, Vec<UnreadableFile>)> {
     let dir = run_dir.to_owned();
     let (ports, unreadable) = discovery_io(move |job| {
         let run_dir = dir;
@@ -210,12 +212,9 @@ pub(crate) async fn membership_in(run_dir: &Path) -> (Vec<Enumerated>, Vec<Unrea
 
         // 每个端口在盘上有什么：实例记录、期望状态记录，各自读得懂与否
         let mut ports: BTreeMap<u16, OnDisk> = BTreeMap::new();
-        let mut names: Vec<String> = std::fs::read_dir(&run_dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect();
+        let mut names: Vec<String> = std::fs::read_dir(&run_dir)?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<_>>()?;
         names.sort();
         for name in &names {
             if job.is_closed() {
@@ -246,9 +245,9 @@ pub(crate) async fn membership_in(run_dir: &Path) -> (Vec<Enumerated>, Vec<Unrea
                 }
             }
         }
-        (ports, unreadable)
+        Ok::<_, std::io::Error>((ports, unreadable))
     })
-    .await;
+    .await?;
     let probes = ports.into_iter().map(|(port, on_disk)| async move {
         let answer = ipc_probe_in(run_dir, &port.to_string()).await;
         discovery_io(move |_| classify(port, on_disk, answer)).await
@@ -259,7 +258,7 @@ pub(crate) async fn membership_in(run_dir: &Path) -> (Vec<Enumerated>, Vec<Unrea
         .flatten()
         .collect();
 
-    (instances, unreadable)
+    Ok((instances, unreadable))
 }
 
 #[test]

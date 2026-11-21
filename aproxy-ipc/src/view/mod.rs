@@ -115,7 +115,7 @@ type Events = BoxStream<'static, Result<Value>>;
 type Records = BTreeMap<u64, Arc<RequestSummary>>;
 
 trait Source: Send + Sync + 'static {
-    fn scan(&self) -> BoxFuture<'_, Vec<InstanceSummary>>;
+    fn scan(&self) -> BoxFuture<'_, Option<Vec<InstanceSummary>>>;
     fn subscribe<'a>(
         &'a self,
         port: u16,
@@ -132,72 +132,75 @@ struct Local {
     dir: PathBuf,
 }
 impl Source for Local {
-    fn scan(&self) -> BoxFuture<'_, Vec<InstanceSummary>> {
+    fn scan(&self) -> BoxFuture<'_, Option<Vec<InstanceSummary>>> {
         async {
-            enumerate::membership_in(&self.dir)
-                .await
-                .0
-                .into_iter()
-                .map(|i| {
-                    let liveness = match i.liveness {
-                        Liveness::Live => Presence::Live,
-                        Liveness::Unresponsive => Presence::Unresponsive,
-                        Liveness::Down => Presence::Down,
-                        Liveness::Incompatible => Presence::Incompatible,
-                        Liveness::Unknown => Presence::Unknown,
-                    };
-                    InstanceSummary {
-                        port: i.port,
-                        run: i.instance.as_ref().map(|r| RunKey {
+            Some(
+                enumerate::membership_in(&self.dir)
+                    .await
+                    .ok()?
+                    .0
+                    .into_iter()
+                    .map(|i| {
+                        let liveness = match i.liveness {
+                            Liveness::Live => Presence::Live,
+                            Liveness::Unresponsive => Presence::Unresponsive,
+                            Liveness::Down => Presence::Down,
+                            Liveness::Incompatible => Presence::Incompatible,
+                            Liveness::Unknown => Presence::Unknown,
+                        };
+                        InstanceSummary {
                             port: i.port,
-                            instance_id: r.instance_id.clone(),
-                        }),
-                        pid: i.instance.as_ref().map(|r| r.pid),
-                        started_at: i.instance.as_ref().map(|r| r.started_at),
-                        version: i.instance.map(|r| r.version),
-                        liveness,
-                        restore_pending: i.restore_pending,
-                        restore_reason: i.restore_reason,
-                        reads: i
-                            .status
-                            .as_ref()
-                            .map(|s| {
-                                let has = |op| s.ops.iter().any(|o| o == op);
-                                ReadCapabilities {
-                                    history_feed: has("requests") && has("subscribe"),
-                                    detail: has("request"),
-                                    body: has("body"),
+                            run: i.instance.as_ref().map(|r| RunKey {
+                                port: i.port,
+                                instance_id: r.instance_id.clone(),
+                            }),
+                            pid: i.instance.as_ref().map(|r| r.pid),
+                            started_at: i.instance.as_ref().map(|r| r.started_at),
+                            version: i.instance.map(|r| r.version),
+                            liveness,
+                            restore_pending: i.restore_pending,
+                            restore_reason: i.restore_reason,
+                            reads: i
+                                .status
+                                .as_ref()
+                                .map(|s| {
+                                    let has = |op| s.ops.iter().any(|o| o == op);
+                                    ReadCapabilities {
+                                        history_feed: has("requests") && has("subscribe"),
+                                        detail: has("request"),
+                                        body: has("body"),
+                                    }
+                                })
+                                .unwrap_or_default(),
+                            history_unavailable: i
+                                .status
+                                .as_ref()
+                                .filter(|s| {
+                                    !s.features
+                                        .iter()
+                                        .any(|f| f == crate::wire::FEATURE_REDACTED_CLIENT_FIELDS)
+                                })
+                                .map(|_| HistoryUnavailable::SourceRedactionMissing),
+                            feed: if liveness == Presence::Live {
+                                Feed::Joining
+                            } else {
+                                Feed::Offline
+                            },
+                            state: i.status.map(|s| StateSnapshot {
+                                state: match s.state {
+                                    crate::wire::InstanceState::Starting => "starting",
+                                    crate::wire::InstanceState::Serving => "serving",
+                                    crate::wire::InstanceState::SwapPrepared => "swap_prepared",
+                                    crate::wire::InstanceState::Stopping => "stopping",
+                                    crate::wire::InstanceState::Unknown => "unknown",
                                 }
-                            })
-                            .unwrap_or_default(),
-                        history_unavailable: i
-                            .status
-                            .as_ref()
-                            .filter(|s| {
-                                !s.features
-                                    .iter()
-                                    .any(|f| f == crate::wire::FEATURE_REDACTED_CLIENT_FIELDS)
-                            })
-                            .map(|_| HistoryUnavailable::SourceRedactionMissing),
-                        feed: if liveness == Presence::Live {
-                            Feed::Joining
-                        } else {
-                            Feed::Offline
-                        },
-                        state: i.status.map(|s| StateSnapshot {
-                            state: match s.state {
-                                crate::wire::InstanceState::Starting => "starting",
-                                crate::wire::InstanceState::Serving => "serving",
-                                crate::wire::InstanceState::SwapPrepared => "swap_prepared",
-                                crate::wire::InstanceState::Stopping => "stopping",
-                                crate::wire::InstanceState::Unknown => "unknown",
-                            }
-                            .into(),
-                            activity: s.activity.into(),
-                        }),
-                    }
-                })
-                .collect()
+                                .into(),
+                                activity: s.activity.into(),
+                            }),
+                        }
+                    })
+                    .collect(),
+            )
         }
         .boxed()
     }
@@ -668,6 +671,7 @@ async fn drive(source: Arc<dyn Source>, shared: Arc<Shared>, ticks: BoxStream<'s
             }
         };
         let Some(scan) = scan else { break };
+        let Some(scan) = scan else { continue };
         let mut store = shared.data.lock().unwrap();
         let mut previous = std::mem::take(&mut store.ports);
         for mut info in scan {

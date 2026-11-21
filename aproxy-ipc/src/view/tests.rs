@@ -49,11 +49,18 @@ enum Call {
 }
 struct Fake {
     home: Mutex<Vec<InstanceSummary>>,
+    fail_scan: std::sync::atomic::AtomicBool,
     calls: Tx<Call>,
 }
 impl Source for Fake {
-    fn scan(&self) -> BoxFuture<'_, Vec<InstanceSummary>> {
-        future::ready(self.home.lock().unwrap().clone()).boxed()
+    fn scan(&self) -> BoxFuture<'_, Option<Vec<InstanceSummary>>> {
+        future::ready(
+            (!self
+                .fail_scan
+                .swap(false, std::sync::atomic::Ordering::SeqCst))
+            .then(|| self.home.lock().unwrap().clone()),
+        )
+        .boxed()
     }
     fn subscribe<'a>(
         &'a self,
@@ -93,6 +100,7 @@ impl Script {
         let source = Arc::new(Fake {
             home: Mutex::new(vec![instance(80, "a", 0)]),
             calls: c,
+            fail_scan: Default::default(),
         });
         (
             HomeView::start(source.clone(), t),
@@ -469,5 +477,29 @@ fn joins_wait_before_opening_but_completed_streams_share_the_home() {
         assert!(!a.is_closed());
         v.shutdown().await;
         assert!(b.is_closed());
+    })
+}
+
+#[test]
+fn inconclusive_scan_does_not_retire_a_streaming_run() {
+    rt(async {
+        let (v, mut s) = Script::start();
+        s.tick();
+        let events = s.ack("a", vec![]).await;
+        s.page("a", None)
+            .await
+            .send(Ok(page(vec![row("a", 1, false)], false)))
+            .unwrap();
+        until(&v, |v| feed(v) == Feed::Streaming).await;
+        s.source
+            .fail_scan
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        s.tick();
+        while s.source.fail_scan.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let k = v.instances().remove(0).run.unwrap();
+        assert_eq!(v.requests(&k).len(), 1);
+        assert!(!events.is_closed());
     })
 }

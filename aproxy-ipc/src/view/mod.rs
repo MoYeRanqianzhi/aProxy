@@ -129,15 +129,14 @@ trait Source: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<Value>>;
 }
 struct Local {
-    home: PathBuf,
     dir: PathBuf,
 }
 impl Source for Local {
     fn scan(&self) -> BoxFuture<'_, Vec<InstanceSummary>> {
         async {
-            enumerate::enumerate_in(&self.home)
+            enumerate::membership_in(&self.dir)
                 .await
-                .instances
+                .0
                 .into_iter()
                 .map(|i| {
                     let liveness = match i.liveness {
@@ -502,7 +501,6 @@ impl HomeView {
         Self::start(
             Arc::new(Local {
                 dir: home.join("run"),
-                home,
             }),
             stream::unfold(timer, |mut timer| async move {
                 timer.tick().await;

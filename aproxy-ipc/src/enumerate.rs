@@ -149,60 +149,11 @@ pub struct ProcessView {
 /// [`ipc_probe_in`]）。
 pub async fn enumerate_in(home: &Path) -> Enumeration {
     let run_dir = home.join("run");
-    let mut unreadable = Vec::new();
-
-    // 每个端口在盘上有什么：实例记录、期望状态记录，各自读得懂与否
-    let mut ports: BTreeMap<u16, OnDisk> = BTreeMap::new();
-    let mut names: Vec<String> = std::fs::read_dir(&run_dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    for name in &names {
-        let path = run_dir.join(name);
-        if let Some(port) = port_in_name(name, registry::INSTANCE_FILE_SUFFIX) {
-            // 读不懂的记录仍然占着这个端口：照样去问一次，上面也许有实例
-            let on_disk = ports.entry(port).or_default();
-            match registry::read_instance_record(&path) {
-                Ok(record) => on_disk.instance = Some(record),
-                Err(reason) => report_unreadable(&mut unreadable, &path, name, reason),
-            }
-        } else if let Some(port) = port_in_name(name, registry::RESTORE_SUFFIX) {
-            if *name != format!("{port}{}", registry::RESTORE_SUFFIX) {
-                continue;
-            }
-            match registry::read_optional_record::<RestoreRecord>(&path, SCHEMA) {
-                Ok(Some(entry)) => {
-                    ports.entry(port).or_default().restore = Some(entry.spec.config_file())
-                }
-                Ok(None) => {}
-                Err(reason) => {
-                    // 读不懂的记录仍然占着这个端口：照样去问一次，上面也许有实例
-                    ports.entry(port).or_default();
-                    report_unreadable(&mut unreadable, &path, name, reason);
-                }
-            }
-        }
-    }
+    let (instances, mut unreadable) = membership_in(&run_dir).await;
     // 读不懂的实例记录或期望状态记录让日志清理暂停（清理靠它们知道哪些日志还有人用）
     let gc_paused = (!unreadable.is_empty()).then(|| GcPaused {
         reason: GC_PAUSED_UNREADABLE_RECORDS.to_string(),
     });
-
-    let probes = ports.into_iter().map(|(port, on_disk)| {
-        let run_dir = &run_dir;
-        async move {
-            let answer = ipc_probe_in(run_dir, &port.to_string()).await;
-            classify(port, on_disk, answer)
-        }
-    });
-    let instances: Vec<Enumerated> = futures_util::future::join_all(probes)
-        .await
-        .into_iter()
-        .flatten()
-        .collect();
 
     let watchdog = read_watchdog(&run_dir, &mut unreadable);
 
@@ -234,6 +185,90 @@ pub async fn enumerate_in(home: &Path) -> Enumeration {
         watchdog,
         processes,
     }
+}
+
+// Blocking jobs own only paths and record data, never a connection or view. A
+// cancelled scan releases its receiver; at most the current file read finishes.
+async fn discovery_io<T: Send + 'static>(
+    work: impl FnOnce(&tokio::sync::oneshot::Sender<T>) -> T + Send + 'static,
+) -> T {
+    let (send, recv) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        if !send.is_closed() {
+            let result = work(&send);
+            let _ = send.send(result);
+        }
+    });
+    recv.await.expect("discovery worker panicked")
+}
+
+pub(crate) async fn membership_in(run_dir: &Path) -> (Vec<Enumerated>, Vec<UnreadableFile>) {
+    let dir = run_dir.to_owned();
+    let (ports, unreadable) = discovery_io(move |job| {
+        let run_dir = dir;
+        let mut unreadable = Vec::new();
+
+        // 每个端口在盘上有什么：实例记录、期望状态记录，各自读得懂与否
+        let mut ports: BTreeMap<u16, OnDisk> = BTreeMap::new();
+        let mut names: Vec<String> = std::fs::read_dir(&run_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        for name in &names {
+            if job.is_closed() {
+                break;
+            }
+            let path = run_dir.join(name);
+            if let Some(port) = port_in_name(name, registry::INSTANCE_FILE_SUFFIX) {
+                // 读不懂的记录仍然占着这个端口：照样去问一次，上面也许有实例
+                let on_disk = ports.entry(port).or_default();
+                match registry::read_instance_record(&path) {
+                    Ok(record) => on_disk.instance = Some(record),
+                    Err(reason) => report_unreadable(&mut unreadable, &path, name, reason),
+                }
+            } else if let Some(port) = port_in_name(name, registry::RESTORE_SUFFIX) {
+                if *name != format!("{port}{}", registry::RESTORE_SUFFIX) {
+                    continue;
+                }
+                match registry::read_optional_record::<RestoreRecord>(&path, SCHEMA) {
+                    Ok(Some(entry)) => {
+                        ports.entry(port).or_default().restore = Some(entry.spec.config_file())
+                    }
+                    Ok(None) => {}
+                    Err(reason) => {
+                        // 读不懂的记录仍然占着这个端口：照样去问一次，上面也许有实例
+                        ports.entry(port).or_default();
+                        report_unreadable(&mut unreadable, &path, name, reason);
+                    }
+                }
+            }
+        }
+        (ports, unreadable)
+    })
+    .await;
+    let probes = ports.into_iter().map(|(port, on_disk)| async move {
+        let answer = ipc_probe_in(run_dir, &port.to_string()).await;
+        discovery_io(move |_| classify(port, on_disk, answer)).await
+    });
+    let instances: Vec<Enumerated> = futures_util::future::join_all(probes)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+
+    (instances, unreadable)
+}
+
+#[test]
+fn filesystem_discovery_does_not_execute_on_the_runtime_thread() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let worker = rt.block_on(discovery_io(|_| std::thread::current().id()));
+    assert_ne!(std::thread::current().id(), worker);
 }
 
 /// 一个端口在 `run/` 里留下的东西。

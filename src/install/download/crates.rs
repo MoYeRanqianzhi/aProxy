@@ -184,7 +184,8 @@ async fn fetch_build_skills(ctx: &DownloadCtx, dest: &Path) -> Result<Fetched, S
     super::download_to(&ctx.client, &crate_url(&ctx.version), &tgz).await?;
     let input = std::fs::File::open(tgz).map_err(|e| format!("crate 打开失败：{e}"))?;
     let out = std::fs::File::create(dest).map_err(|e| format!("zip 创建失败：{e}"))?;
-    crate_skills_zip(input, out, &ctx.version).map_err(|e| format!("crate 文档读取失败：{e}"))?;
+    crate_skills_zip(input, out, &ctx.version, super::MAX_SKILL_TAR)
+        .map_err(|e| format!("crate 文档读取失败：{e}"))?;
     Ok(Fetched {
         path: dest.to_path_buf(),
         sha256: crate::install::staging::sha256_hex(dest)?,
@@ -197,9 +198,13 @@ fn crate_skills_zip(
     input: impl std::io::Read,
     out: impl std::io::Write + std::io::Seek,
     version: &str,
+    tar_limit: u64,
 ) -> std::io::Result<()> {
     use crate::install::skills::manifest::{MAX_FILE, MAX_FILES, MAX_MANIFEST, MAX_TOTAL};
-    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(input));
+    use std::io::Read;
+    let mut tar = tar::Archive::new(super::TarBudget(
+        flate2::read::GzDecoder::new(input).take(tar_limit),
+    ));
     let prefix = format!("aproxy-{version}/.claude/skills/");
     let mut zip = zip::ZipWriter::new(out);
     let mut total = 0;
@@ -274,7 +279,17 @@ mod tests {
         }
         let data = tar.into_inner().unwrap().finish().unwrap();
         let mut zip = Cursor::new(Vec::new());
-        crate_skills_zip(data.as_slice(), &mut zip, "1.0.0").unwrap();
+        // 正文都很小，限额只在读到后面的无关源码与 tar 填充时触发。
+        let err = crate_skills_zip(data.as_slice(), Cursor::new(Vec::new()), "1.0.0", 3 * 1024)
+            .unwrap_err();
+        assert!(err.to_string().contains("tar 解压大小超限"));
+        crate_skills_zip(
+            data.as_slice(),
+            &mut zip,
+            "1.0.0",
+            super::super::MAX_SKILL_TAR,
+        )
+        .unwrap();
         let mut archive = zip::ZipArchive::new(zip).unwrap();
         assert_eq!(archive.len(), 2);
         for (key, want) in [

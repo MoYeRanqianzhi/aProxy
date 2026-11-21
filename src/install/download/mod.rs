@@ -420,6 +420,21 @@ pub struct Fetched {
     pub source: &'static str,
 }
 
+/// crate 与 npm 除文档还带源码、包头和填充；限制整个解压流而不只限制挑中的条目。
+const MAX_SKILL_TAR: u64 = 64 << 20;
+
+/// 超出预算返回错误而非伪造 EOF（tar 在条目边界把 EOF 视为正常结束）。
+struct TarBudget<R>(std::io::Take<R>);
+impl<R: std::io::Read> std::io::Read for TarBudget<R> {
+    /// 到达预算时仅探测一个字节，以区分恰好读完与还有后续数据。
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.0.limit() == 0 && !buf.is_empty() && self.0.get_mut().read(&mut [0])? != 0 {
+            return Err(std::io::Error::other("文档 tar 解压大小超限"));
+        }
+        self.0.read(buf)
+    }
+}
+
 /// 下载 URL 到文件（流式落盘，不整载内存）。
 pub async fn download_to(client: &reqwest::Client, url: &str, dest: &Path) -> Result<(), String> {
     let resp = client

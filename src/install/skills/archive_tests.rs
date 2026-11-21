@@ -515,3 +515,111 @@ fn directory_at_marker_survives() {
     );
     assert_eq!(fs::read(occupied.join("note")).unwrap(), b"keep");
 }
+
+/// 键长度、深度和数量分别测量；恰等于上限是合法输入，不得误写成大于等于。
+#[test]
+fn exact_manifest_boundaries() {
+    let parse = |key: &str| {
+        Manifest::parse(&serde_json::to_vec(&manifest_for(&[(key, b"")])).unwrap()).is_ok()
+    };
+    for (n, ok) in [(1024, true), (1025, false)] {
+        assert_eq!(parse(&format!("s/{}", "a".repeat(n - 2))), ok);
+    }
+    for (n, ok) in [(32, true), (33, false)] {
+        assert_eq!(parse(&vec!["s"; n].join("/")), ok);
+    }
+    let mut m = manifest_for(&[]);
+    for j in 0..MAX_FILES {
+        m["files"][format!("s/{j}")] = record(b"");
+    }
+    for j in 0..MAX_TOTAL / MAX_FILE {
+        m["files"][format!("s/{j}")]["size"] = json!(MAX_FILE);
+    }
+    let mut b = serde_json::to_vec(&m).unwrap();
+    b.resize(MAX_MANIFEST as usize, b' ');
+    assert!(Manifest::parse(&b).is_ok());
+}
+/// 用合法的额外成员精确填满 ZIP 预算，比上限多一个字节时诊断才应是压缩包过大。
+#[test]
+fn zip_size_boundary_and_original_marker_bytes() {
+    let h = tempfile::tempdir().unwrap();
+    let f = docs();
+    let mut m = serde_json::to_vec_pretty(&manifest_for(&f)).unwrap();
+    m.extend_from_slice(b" \n");
+    let z = h.path().join("pad.zip");
+    let write_zip = |pad| {
+        let mut w = zip::ZipWriter::new(fs::File::create(&z).unwrap());
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        w.start_file(MARKER, opts).unwrap();
+        w.write_all(&m).unwrap();
+        for (k, b) in f {
+            w.start_file(k, opts).unwrap();
+            w.write_all(b).unwrap();
+        }
+        w.start_file("ignored", opts).unwrap();
+        std::io::copy(&mut std::io::Read::take(std::io::repeat(0), pad), &mut w).unwrap();
+        w.finish().unwrap();
+    };
+    write_zip(0);
+    let pad = archive::MAX_ARCHIVE - fs::metadata(&z).unwrap().len();
+    write_zip(pad);
+    assert_eq!(fs::metadata(&z).unwrap().len(), archive::MAX_ARCHIVE);
+    archive::install(h.path(), &z, "1.0.0").unwrap();
+    assert_eq!(fs::read(h.path().join("skills").join(MARKER)).unwrap(), m);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&z)
+        .unwrap()
+        .write_all(b"x")
+        .unwrap();
+    assert_eq!(
+        archive::install(h.path(), &z, "1.0.0")
+            .unwrap_err()
+            .to_string(),
+        "skill 压缩包过大"
+    );
+}
+/// 目录与设备/FIFO 的 Unix 类型位不能被普通文件名或完全匹配的摘要抵消。
+#[test]
+fn directory_and_special_members_are_not_documents() {
+    let h = tempfile::tempdir().unwrap();
+    let f = [("s/doc", &b""[..])];
+    let z = package(h.path(), Some(&manifest_for(&f)), &f);
+    let original = fs::read(&z).unwrap();
+    let last = original
+        .windows(4)
+        .rposition(|w| w == b"PK\x01\x02")
+        .unwrap();
+    for mode in [0o040755u32, 0o010644, 0o020644] {
+        let mut data = original.clone();
+        data[last + 5] = 3; // 条目由 Unix 写出，外部属性的高位才是 mode。
+        data[last + 38..last + 42].copy_from_slice(&(mode << 16).to_le_bytes());
+        fs::write(&z, data).unwrap();
+        assert!(
+            archive::install(h.path(), &z, "1.0.0")
+                .unwrap_err()
+                .to_string()
+                .contains("类型")
+        );
+    }
+}
+/// 两套头一致也不代表 stored 长度可信；正文与清单相配但声明的存储范围较短必须拒绝。
+#[test]
+fn stored_sizes_agree_independent_of_manifest_and_header_agreement() {
+    let h = tempfile::tempdir().unwrap();
+    let f = [("s/a", &b"abc"[..])];
+    let z = package(h.path(), Some(&manifest_for(&f)), &f);
+    let mut bytes = fs::read(&z).unwrap();
+    let local = bytes.windows(4).rposition(|w| w == b"PK\x03\x04").unwrap();
+    let central = bytes.windows(4).rposition(|w| w == b"PK\x01\x02").unwrap();
+    bytes[local + 18..local + 22].copy_from_slice(&2u32.to_le_bytes());
+    bytes[central + 20..central + 24].copy_from_slice(&2u32.to_le_bytes());
+    fs::write(&z, bytes).unwrap();
+    assert!(
+        archive::install(h.path(), &z, "1.0.0")
+            .unwrap_err()
+            .to_string()
+            .contains("压缩方式")
+    );
+}

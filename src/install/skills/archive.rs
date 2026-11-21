@@ -343,6 +343,35 @@ fn verified_marker(zip: &Path, version: &str) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod directory_tests {
     use super::*;
+    /// 最后一项发布改名失败时，已发布的新目录与所有旧项逐项退回，标记也保持原字节。
+    #[test]
+    fn publication_rename_failure_rolls_back() {
+        use super::super::archive_tests::{docs, manifest_for, package};
+        let h = tempfile::tempdir().unwrap();
+        let f = docs();
+        let m = manifest_for(&f);
+        let z = package(h.path(), Some(&m), &f);
+        let (manifest, _) = install(h.path(), &z, "1.0.0").unwrap();
+        let root = h.path().join("skills");
+        let marker = fs::read(root.join(MARKER)).unwrap();
+        let stage = super::super::workspace(&root).unwrap();
+        let src = stage.path().join("incoming");
+        fs::create_dir(&src).unwrap();
+        for name in manifest.names() {
+            fs::create_dir(src.join(name)).unwrap();
+        }
+        // incoming 没有完成标记：前面的目录改名真实成功，只有最后一个 rename 返回 NotFound。
+        assert_eq!(
+            replace(&root, stage.path(), &manifest, Some(&manifest))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(fs::read(root.join(MARKER)).unwrap(), marker);
+        for (k, b) in f {
+            assert_eq!(fs::read(root.join(k)).unwrap(), b);
+        }
+    }
     /// 用微型结束记录单测分配前的边界；64 位计数不经过 usize 或 u16 截断。
     #[test]
     fn budgets_before_index_allocation() {

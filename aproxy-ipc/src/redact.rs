@@ -286,6 +286,12 @@ impl Secrets {
         Secrets { known, first_bytes }
     }
 
+    /// HTTP parsers lowercase header names. Match this spelling only in names,
+    /// never in payloads or header values, which remain case-sensitive.
+    pub fn for_header_names(&self) -> Self {
+        Self::new(self.known.iter().map(|s| s.to_ascii_lowercase()))
+    }
+
     /// 一个密钥都没有：替换什么也不做
     pub fn is_empty(&self) -> bool {
         self.known.is_empty()

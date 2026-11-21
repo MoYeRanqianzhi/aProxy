@@ -994,6 +994,7 @@ pub struct History {
     /// 大缓冲区的空闲表
     buffers: Arc<BufferPool>,
     secrets: Secrets,
+    header_name_secrets: Secrets,
     records: Mutex<BTreeMap<u64, Arc<Record>>>,
     /// 序号比它小的记录都没有还留着的体：腾地方时从它开始找，不必每次从头扫过早已空了的
     /// 记录。给旧记录挂上新的体时把它往回拨
@@ -1043,6 +1044,7 @@ impl History {
                     .unwrap_or(MAX_FREE_BUFFERS)
                     .min(MAX_FREE_BUFFERS),
             }),
+            header_name_secrets: secrets.for_header_names(),
             secrets,
             records: Mutex::new(BTreeMap::new()),
             evict_floor: AtomicU64::new(0),
@@ -1106,8 +1108,8 @@ impl History {
             }
             out.extend_from_slice(br#"{"name":"#);
             // 密钥头的判定仍用原名，公开的名字单独替换。
-            if self.secrets.find(name.as_bytes()).is_some() {
-                push(&mut out, &self.secrets.replace(name));
+            if self.header_name_secrets.find(name.as_bytes()).is_some() {
+                push(&mut out, &self.header_name_secrets.replace(name));
             } else {
                 push(&mut out, &name);
             }
@@ -3218,6 +3220,19 @@ mod tests {
         );
         assert_eq!(detail["tries"][0]["response"]["upstream_status"], 200);
         assert_eq!(detail["record"]["path"], "/v1/models?key=***");
+    }
+
+    #[test]
+    fn normalized_header_name_does_not_change_value_matching() {
+        let h = history(0, &["UPPER-KEY"]);
+        let mut headers = http::HeaderMap::new();
+        headers.insert("X-UPPER-KEY", "upper-key".parse().unwrap());
+        let _rec = begin_with(&h, 1, "/", &headers);
+        let detail: Value = serde_json::from_str(&h.detail_json(&id(1)).unwrap()).unwrap();
+        assert_eq!(
+            detail["request"]["headers"][0],
+            json!({"name":"x-<secret>","value":"upper-key"})
+        );
     }
 
     /// 客户端可以把凭据放在任意 HTTP token 里，不只是通常带密钥的头值。

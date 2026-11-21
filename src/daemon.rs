@@ -2226,8 +2226,6 @@ mod tests {
         server.abort();
     }
 
-    /// `requests`、`request`、`body` 经真实的端点走一遍：结果的形状，以及体里的密钥已经
-    /// 在入库时换掉。
     #[tokio::test]
     async fn subscription_rejects_a_claimed_pid_other_than_the_pipe_peer() {
         let dir = tempfile::tempdir().unwrap();
@@ -2240,6 +2238,8 @@ mod tests {
         assert!(matches!(result, Err(IpcError::Protocol(_))));
     }
 
+    /// `requests`、`request`、`body` 经真实的端点走一遍：结果的形状，以及体里的密钥已经
+    /// 在入库时换掉。
     #[tokio::test]
     async fn read_ops_round_trip_over_a_real_endpoint() {
         use crate::history::Part;
@@ -2251,8 +2251,8 @@ mod tests {
         let (state, _rx) = control(record);
         let first = recorded_request(&state.history, 41);
         let second = recorded_request(&state.history, 42);
-        let server = tokio::spawn(serve_endpoint(endpoint.clone(), state.clone()));
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let listener = imp::bind(&endpoint).await.unwrap();
+        let server = tokio::spawn(imp::accept_loop(listener, state.clone()));
         let read = |op: ReadOp| {
             let run = dir.path();
             async move { ipc_read_in(run, "readops", &op).await }

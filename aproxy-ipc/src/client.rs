@@ -550,7 +550,61 @@ mod imp {
         };
         let peer = server_pid(&client)
             .ok_or_else(|| IpcError::Protocol("cannot verify peer pid".into()))?;
+        verify_server_owner(peer)?;
         Ok((client, peer))
+    }
+
+    // A kernel-reported PID identifies the server, not its user. Failure to
+    // inspect either token is a verification failure, before the first write.
+    fn verify_server_owner(pid: u32) -> Result<(), IpcError> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::{
+            Security::{EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser},
+            System::Threading::{
+                GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+            },
+        };
+        let failure = || IpcError::Protocol("cannot verify pipe server owner".into());
+        fn user(process: isize) -> Option<Vec<usize>> {
+            let mut token = 0;
+            // TOKEN_USER points into the same variable-length, pointer-aligned buffer.
+            unsafe {
+                if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
+                    return None;
+                }
+                let handle = OwnedHandle::from_raw_handle(token as _);
+                let token = handle.as_raw_handle() as isize;
+                let mut len = 0;
+                GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len);
+                if len < size_of::<TOKEN_USER>() as u32 {
+                    return None;
+                }
+                let mut buf = vec![0usize; (len as usize).div_ceil(size_of::<usize>())];
+                (GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len) != 0)
+                    .then_some(buf)
+            }
+        }
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle == 0 {
+                return Err(failure());
+            }
+            let process = OwnedHandle::from_raw_handle(handle as _);
+            let theirs = user(process.as_raw_handle() as isize).ok_or_else(failure)?;
+            let ours = user(GetCurrentProcess()).ok_or_else(failure)?;
+            let sid = |buf: &[usize]| (*(buf.as_ptr().cast::<TOKEN_USER>())).User.Sid;
+            if EqualSid(sid(&ours), sid(&theirs)) == 0 {
+                return Err(failure());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pipe_server_requires_a_verifiable_current_user() {
+        verify_server_owner(std::process::id()).unwrap();
+        assert!(matches!(verify_server_owner(0), Err(IpcError::Protocol(_))));
+        assert!(matches!(verify_server_owner(4), Err(IpcError::Protocol(_))));
     }
 
     fn server_pid(client: &NamedPipeClient) -> Option<u32> {

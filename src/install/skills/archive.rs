@@ -246,7 +246,23 @@ pub(super) fn install(home: &Path, zip: &Path, version: &str) -> io::Result<(Man
 }
 
 /// 发布端与安装端使用同一个解包器；发布物不能带额外条目，所有正文都必须能按 UTF-8 阅读。
-pub fn verify_package(zip: &Path, version: &str) -> io::Result<()> {
+pub fn verify_package(zip: &Path, version: &str, packaged_crate: Option<&Path>) -> io::Result<()> {
+    let expected = verified_marker(zip, version)?;
+    if let Some(path) = packaged_crate {
+        let input = fs::File::open(path)?;
+        if input.metadata()?.len() > MAX_ARCHIVE {
+            return Err(io::Error::other("文档下载大小超限"));
+        }
+        let tmp = tempfile::NamedTempFile::new()?;
+        crate::install::download::crates::translate_skills(input, tmp.as_file(), version)?;
+        if verified_marker(tmp.path(), version)? != expected {
+            return Err(io::Error::other("crate 文档清单与发布总包不同"));
+        }
+    }
+    Ok(())
+}
+/// 只在所有正文都通过安装端校验后返回原清单字节，让渠道比较也涵盖未知字段。
+fn verified_marker(zip: &Path, version: &str) -> io::Result<Vec<u8>> {
     let temp = super::workspace(&std::env::temp_dir())?;
     let (m, ignored) = unpack(zip, temp.path(), version)?;
     if ignored != 0 {
@@ -256,7 +272,7 @@ pub fn verify_package(zip: &Path, version: &str) -> io::Result<()> {
         fs::read_to_string(temp.path().join(key))
             .map_err(|_| io::Error::other("skill 正文不是 UTF-8 文本"))?;
     }
-    Ok(())
+    fs::read(temp.path().join(MARKER))
 }
 
 #[cfg(test)]

@@ -196,13 +196,21 @@ async fn fetch_build_skills(ctx: &DownloadCtx, dest: &Path) -> Result<Fetched, S
     .await?;
     let input = std::fs::File::open(tgz).map_err(|e| format!("crate 打开失败：{e}"))?;
     let out = std::fs::File::create(dest).map_err(|e| format!("zip 创建失败：{e}"))?;
-    crate_skills_zip(input, out, &ctx.version, super::MAX_SKILL_TAR)
-        .map_err(|e| format!("crate 文档读取失败：{e}"))?;
+    translate_skills(input, out, &ctx.version).map_err(|e| format!("crate 文档读取失败：{e}"))?;
     Ok(Fetched {
         path: dest.to_path_buf(),
         sha256: crate::install::staging::sha256_hex(dest)?,
         source: "cargo",
     })
+}
+
+/// 发布前检查和在线安装使用完全相同的容器转换和解压预算。
+pub(crate) fn translate_skills(
+    input: impl std::io::Read,
+    out: impl std::io::Write + std::io::Seek,
+    version: &str,
+) -> std::io::Result<()> {
+    crate_skills_zip(input, out, version, super::MAX_SKILL_TAR)
 }
 
 /// 只转换容器，不改清单和文档的字节。从 tar 取原始路径名，不用本机的路径分隔符重拼。

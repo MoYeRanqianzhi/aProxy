@@ -404,6 +404,9 @@ pub enum SkillCmd {
     VerifyPackage {
         /// 待核验的总包。
         archive: PathBuf,
+        /// 同时核对 cargo 打好的包与发布总包，而不读取工作副本的正文。
+        #[arg(long)]
+        packaged_crate: Option<PathBuf>,
         /// 发布者请求的精确版本。
         version: String,
     },

@@ -316,7 +316,7 @@ fn unreadable_marker_is_not_a_missing_marker() {
     bytes[0] = 0;
     fs::write(&z, bytes).unwrap();
     assert_eq!(
-        archive::verify_package(&z, "1.0.0")
+        archive::verify_package(&z, "1.0.0", None)
             .unwrap_err()
             .to_string(),
         "skill 压缩包无效"
@@ -380,4 +380,47 @@ fn deflate_not_accepted_for_verified_document() {
             .to_string()
             .contains("压缩方式")
     );
+}
+
+/// 渠道包即使能编译，少一个文档、内容不同或自带另一份有效清单也不能发布。
+#[test]
+fn crate_verifier_checks_translated_contents_and_original_marker() {
+    let h = tempfile::tempdir().unwrap();
+    let f = docs();
+    let m = manifest_for(&f);
+    let zip = package(h.path(), Some(&m), &f);
+    let path = h.path().join("dist.crate");
+    for case in ["same", "missing", "content", "marker"] {
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+            fs::File::create(&path).unwrap(),
+            flate2::Compression::fast(),
+        ));
+        let mut marker = m.clone();
+        if case == "marker" {
+            marker["future"] = json!(false);
+        }
+        let bytes = serde_json::to_vec(&marker).unwrap();
+        for (k, b) in f.into_iter().chain([(MARKER, bytes.as_slice())]) {
+            if case == "missing" && k == f[0].0 {
+                continue;
+            }
+            let b = if case == "content" && k == f[0].0 {
+                &b"wrong"[..]
+            } else {
+                b
+            };
+            let mut header = tar::Header::new_gnu();
+            header.set_size(b.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, format!("aproxy-1.0.0/.claude/skills/{k}"), b)
+                .unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+        assert_eq!(
+            archive::verify_package(&zip, "1.0.0", Some(&path)).is_ok(),
+            case == "same",
+            "{case}"
+        );
+    }
 }

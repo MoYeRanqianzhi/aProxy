@@ -95,6 +95,18 @@ fn replace(
     let old = stage.path().join("previous");
     fs::create_dir(&old)?;
     let incoming = manifest.names();
+    let owned = previous.map(Manifest::names).unwrap_or_default();
+    for name in incoming.difference(&owned) {
+        match fs::symlink_metadata(root.join(name)) {
+            Ok(_) => {
+                return Err(io::Error::other(format!(
+                    "目录 {name} 不属于上次安装；请移走该目录，或移走 skills/ 后执行 aproxy skill install"
+                )));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
     let mut names = incoming.clone();
     if let Some(prev) = previous {
         names.extend(prev.names());
@@ -153,7 +165,7 @@ pub(super) fn install(home: &Path, zip: &Path, version: &str) -> io::Result<(Man
     let src = stage.path().join("incoming");
     fs::create_dir(&src)?;
     let (m, ignored) = unpack(zip, &src, version)?;
-    // 损坏的旧清单不能授权清理任何目录，但不妨碍重新安装修复当前这组文件。
+    // 清单损坏时没有任何目录获准被替换。
     let prev = super::installed::load(&root).ok();
     replace(&root, stage, &m, prev.as_ref())?;
     Ok((m, ignored))

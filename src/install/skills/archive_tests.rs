@@ -250,3 +250,32 @@ fn only_one_writer_publishes_and_stale_staging_is_ignored() {
         assert_eq!(fs::read(home.join("skills").join(k)).unwrap(), b);
     }
 }
+
+/// 缺少所有权凭据时，即使升级包里有同名目录也不能移走用户的文件。
+#[test]
+fn unowned_destination_survives_even_with_unreadable_manifest() {
+    for broken in [false, true] {
+        let h = tempfile::tempdir().unwrap();
+        let f = docs();
+        let z = package(h.path(), Some(&manifest_for(&f[..1])), &f[..1]);
+        archive::install(h.path(), &z, "1.0.0").unwrap();
+        let root = h.path().join("skills");
+        let collision = if broken {
+            fs::write(root.join(MARKER), b"bad").unwrap();
+            "aproxy-cli"
+        } else {
+            fs::create_dir(root.join("aproxy-format")).unwrap();
+            "aproxy-format"
+        };
+        let note = root.join(collision).join("notes");
+        fs::write(&note, b"keep").unwrap();
+        let marker = fs::read(root.join(MARKER)).unwrap();
+        let z = package(h.path(), Some(&manifest_for(&f)), &f);
+        let msg = archive::install(h.path(), &z, "1.0.0")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains(collision) && msg.contains("aproxy skill install"));
+        assert_eq!(fs::read(note).unwrap(), b"keep");
+        assert_eq!(fs::read(root.join(MARKER)).unwrap(), marker);
+    }
+}

@@ -237,8 +237,7 @@ async fn binary_and_standalone_install_share_the_download_lock() {
                 async move {
                     if count.fetch_add(1, Ordering::SeqCst) == 0 {
                         arrived.notify_one();
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(20), release.notified()).await;
+                        release.notified().await;
                     }
                     archive(VERSION)
                 }
@@ -253,10 +252,19 @@ async fn binary_and_standalone_install_share_the_download_lock() {
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(15), arrived.notified())
+    tokio::time::timeout(Duration::from_secs(120), arrived.notified())
         .await
         .unwrap();
-    let contender = h.cmd().args(["skill", "upgrade"]).output().unwrap();
+    let contender = tokio::time::timeout(
+        Duration::from_secs(120),
+        tokio::process::Command::from(h.cmd())
+            .kill_on_drop(true)
+            .args(["skill", "upgrade"])
+            .output(),
+    )
+    .await
+    .expect("文档安装竞争者未退出")
+    .unwrap();
     release.notify_one();
     let first = first.wait_with_output().await.unwrap();
     assert!(

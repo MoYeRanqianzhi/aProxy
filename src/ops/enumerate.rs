@@ -319,7 +319,7 @@ fn classify(
                 details: serde_json::json!({ "port": port, "reason": format!("ping rejected: {code}") }),
             },
         )),
-        Err(IpcError::Protocol(_)) => Some(incompatible(
+        Err(IpcError::Protocol(_) | IpcError::RunChanged) => Some(incompatible(
             on_disk.instance,
             Reason {
                 code: CODE_INSTANCE_INCOMPATIBLE.to_string(),

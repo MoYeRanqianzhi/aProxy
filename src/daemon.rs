@@ -2366,12 +2366,26 @@ mod tests {
     /// `requests`、`request`、`body` 经真实的端点走一遍：结果的形状，以及体里的密钥已经
     /// 在入库时换掉。
     #[tokio::test]
+    async fn subscription_rejects_a_claimed_pid_other_than_the_pipe_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = endpoint_for_in(dir.path(), "wrong-peer");
+        let listener = imp::bind(&endpoint).await.unwrap();
+        let (state, _rx) = control(sample_info("0"));
+        let server = tokio::spawn(imp::accept_loop(listener, state));
+        let result = ipc_subscribe_in(dir.path(), "wrong-peer").await;
+        server.abort();
+        assert!(matches!(result, Err(IpcError::Protocol(_))));
+    }
+
+    #[tokio::test]
     async fn read_ops_round_trip_over_a_real_endpoint() {
         use crate::history::Part;
         use base64::Engine as _;
         let dir = tempfile::tempdir().unwrap();
         let endpoint = endpoint_for_in(dir.path(), "readops");
-        let (state, _rx) = control(sample_info("0"));
+        let mut record = sample_info("0");
+        record.pid = std::process::id();
+        let (state, _rx) = control(record);
         let first = recorded_request(&state.history, 41);
         let second = recorded_request(&state.history, 42);
         let server = tokio::spawn(serve_endpoint(endpoint.clone(), state.clone()));

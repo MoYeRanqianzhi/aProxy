@@ -13,6 +13,8 @@ pub enum IpcError {
     Transient(String),
     /// 有应答但无法采信：解析不了、协议版本不符、自报 pid 与连接对端不符
     Protocol(String),
+    /// The endpoint now belongs to a different run than the reader selected.
+    RunChanged,
     /// 实例明确拒绝了请求。`details` 是这个码带的数据（没有时为 null）
     Remote {
         code: String,
@@ -25,6 +27,7 @@ impl std::fmt::Display for IpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unreachable(e) | Self::Transient(e) | Self::Protocol(e) => f.write_str(e),
+            Self::RunChanged => f.write_str("instance run changed"),
             Self::Remote { code, message, .. } => {
                 write!(f, "实例拒绝了请求（{code}）：{message}")
             }
@@ -43,6 +46,57 @@ impl IpcError {
             IpcError::Protocol(e) => IpcError::Protocol(format!("{endpoint}: {e}")),
             other => other,
         }
+    }
+}
+
+/// Process and protocol identity of one run. A port or a PID alone can be reused.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunIdentity {
+    /// PID obtained from the transport, not just the payload.
+    pub pid: u32,
+    /// Opaque run identifier in the verified snapshot.
+    pub instance_id: String,
+}
+
+impl RunIdentity {
+    fn check(&self, expected: Option<&Self>) -> Result<(), IpcError> {
+        if expected.is_some_and(|run| run != self) {
+            Err(IpcError::RunChanged)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn verify_record(&self, record: &serde_json::Value) -> Result<(), IpcError> {
+        let (run, _) = record["request_id"]
+            .as_str()
+            .and_then(|id| id.rsplit_once('-'))
+            .ok_or_else(|| IpcError::Protocol("invalid request identity".into()))?;
+        if run == self.instance_id {
+            Ok(())
+        } else {
+            Err(IpcError::RunChanged)
+        }
+    }
+}
+
+fn snapshot_run(snapshot: &serde_json::Value, peer: u32) -> Result<RunIdentity, IpcError> {
+    let record: InstanceRecord = serde_json::from_value(snapshot["instance"].clone())
+        .map_err(|e| IpcError::Protocol(format!("应答格式不符：{e}")))?;
+    verify_pid(record.pid, peer)?;
+    Ok(RunIdentity {
+        pid: peer,
+        instance_id: record.instance_id,
+    })
+}
+
+fn verify_pid(claimed: u32, peer: u32) -> Result<(), IpcError> {
+    if claimed != peer {
+        Err(IpcError::Protocol(format!(
+            "应答者自报 pid {claimed} 与连接对端进程 {peer} 不一致"
+        )))
+    } else {
+        Ok(())
     }
 }
 
@@ -137,14 +191,7 @@ async fn request_raw_within(
     })?;
     // 应答者自报的 pid 必须就是连接对端的进程：普查与 stop 都按这个 pid 认
     // 实例，而端点名可以预测，任何本机进程都可能抢先占住它、冒充实例应答
-    if let Some(peer) = peer
-        && status.instance.pid != peer
-    {
-        return Err(IpcError::Protocol(format!(
-            "{endpoint}: 应答者自报 pid {} 与连接对端进程 {peer} 不一致",
-            status.instance.pid
-        )));
-    }
+    verify_pid(status.instance.pid, peer).map_err(|e| e.at(endpoint))?;
     Ok(status)
 }
 
@@ -157,27 +204,61 @@ pub async fn ipc_read_in(
     port: &str,
     op: &ReadOp,
 ) -> Result<serde_json::Value, IpcError> {
+    read_for_run_in(run_dir, port, op, None)
+        .await
+        .map(|(_, result)| result)
+}
+
+/// Read history and return the run that supplied it. If `expected` is set, a
+/// replacement on the same port is an error, even if its PID was recycled.
+pub async fn read_for_run_in(
+    run_dir: &std::path::Path,
+    port: &str,
+    op: &ReadOp,
+    expected: Option<&RunIdentity>,
+) -> Result<(RunIdentity, serde_json::Value), IpcError> {
     let endpoint = endpoint_for_in(run_dir, port);
-    let request = op.request_line();
     let exchange = async {
-        let (stream, _) = imp::connect(&endpoint).await?;
-        exchange_over(stream, &request).await
+        // History replies have no identity envelope. Keep their connection open
+        // while asking the endpoint for a snapshot, then compare both peers before
+        // sending the operation. This also works for body chunks and empty pages.
+        let (stream, peer) = imp::connect(&endpoint).await?;
+        if expected.is_some_and(|run| run.pid != peer) {
+            return Err(IpcError::RunChanged);
+        }
+        let (ping, ping_peer) = imp::exchange(&endpoint, &IpcOp::Ping.request_line()).await?;
+        if ping_peer != peer {
+            return Err(IpcError::RunChanged);
+        }
+        let record = parse_reply(&ping)?.instance;
+        verify_pid(record.pid, peer)?;
+        let run = RunIdentity {
+            pid: peer,
+            instance_id: record.instance_id,
+        };
+        run.check(expected)?;
+        let result = parse_result(&exchange_over(stream, &op.request_line()).await?)?;
+        Ok((run, result))
     };
-    let line = match tokio::time::timeout(Duration::from_secs(3), exchange).await {
-        Ok(Ok(line)) => line,
-        Ok(Err(e)) => return Err(e.at(&endpoint)),
-        Err(_) => return Err(IpcError::Transient(format!("{endpoint}: 请求超时"))),
-    };
-    parse_result(&line).map_err(|e| e.at(&endpoint))
+    match tokio::time::timeout(Duration::from_secs(3), exchange).await {
+        Ok(result) => result.map_err(|e| e.at(&endpoint)),
+        Err(_) => Err(IpcError::Transient(format!("{endpoint}: 请求超时"))),
+    }
 }
 
 /// 一条订阅连接：[`ipc_subscribe_in`] 的返回值，之后每调一次 [`EventStream::next`] 读一个
 /// 事件。丢掉它就是退订。
 pub struct EventStream {
-    lines: tokio::io::BufReader<imp::Stream>,
+    run: RunIdentity,
+    lines: Option<tokio::io::BufReader<imp::Stream>>,
 }
 
 impl EventStream {
+    /// Identity verified at the opening acknowledgment; reconnecting creates a different stream.
+    pub fn run(&self) -> &RunIdentity {
+        &self.run
+    }
+
     /// 下一个事件：`{"v":1,"event":…,"seq":n,"at":毫秒,"data":…}`。实例关了连接时为
     /// `Ok(None)`。45 秒收不到任何一行按失联报 `Transient`（实例至少每 15 秒发一行）。
     ///
@@ -186,16 +267,29 @@ impl EventStream {
         use tokio::io::AsyncBufReadExt;
         const SILENCE: Duration = Duration::from_secs(45);
         let mut line = String::new();
-        let read = tokio::time::timeout(SILENCE, self.lines.read_line(&mut line))
+        let Some(lines) = &mut self.lines else {
+            return Ok(None);
+        };
+        let read = tokio::time::timeout(SILENCE, lines.read_line(&mut line))
             .await
             .map_err(|_| IpcError::Transient("订阅连接 45 秒没有收到任何事件".to_string()))?
             .map_err(|e| IpcError::Transient(e.to_string()))?;
         if read == 0 || !line.ends_with('\n') {
             return Ok(None);
         }
-        serde_json::from_str(&line)
-            .map(Some)
-            .map_err(|e| IpcError::Protocol(format!("事件不是 JSON：{e}")))
+        let event: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|e| IpcError::Protocol(format!("事件不是 JSON：{e}")))?;
+        let identity = match event["event"].as_str() {
+            Some("state") => snapshot_run(&event["data"], self.run.pid)
+                .and_then(|run| run.check(Some(&self.run))),
+            Some("request") => self.run.verify_record(&event["data"]),
+            _ => Ok(()),
+        };
+        if let Err(error) = identity {
+            self.lines = None;
+            return Err(error);
+        }
+        Ok(Some(event))
     }
 }
 
@@ -205,10 +299,23 @@ pub async fn ipc_subscribe_in(
     run_dir: &std::path::Path,
     port: &str,
 ) -> Result<(serde_json::Value, EventStream), IpcError> {
+    subscribe_for_run_in(run_dir, port, None).await
+}
+
+/// Subscribe only to the selected run (or discover it from the acknowledgment).
+/// A rejected opening never exposes the snapshot or any buffered events.
+pub async fn subscribe_for_run_in(
+    run_dir: &std::path::Path,
+    port: &str,
+    expected: Option<&RunIdentity>,
+) -> Result<(serde_json::Value, EventStream), IpcError> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let endpoint = endpoint_for_in(run_dir, port);
     let open = async {
-        let (mut stream, _) = imp::connect(&endpoint).await?;
+        let (mut stream, peer) = imp::connect(&endpoint).await?;
+        if expected.is_some_and(|run| run.pid != peer) {
+            return Err(IpcError::RunChanged);
+        }
         let failed = |e: io::Error| IpcError::Transient(e.to_string());
         let request = ReadOp::Subscribe.request_line();
         stream.write_all(request.as_bytes()).await.map_err(failed)?;
@@ -219,7 +326,22 @@ pub async fn ipc_subscribe_in(
         if !line.ends_with('\n') {
             return Err(IpcError::Transient("连接在应答完整之前关闭".to_string()));
         }
-        Ok((parse_result(&line)?, EventStream { lines }))
+        let ack = parse_result(&line)?;
+        let run = snapshot_run(&ack["snapshot"], peer)?;
+        run.check(expected)?;
+        let records = ack["requests"]
+            .as_array()
+            .ok_or_else(|| IpcError::Protocol("invalid subscription acknowledgment".into()))?;
+        for record in records {
+            run.verify_record(record)?;
+        }
+        Ok((
+            ack,
+            EventStream {
+                run,
+                lines: Some(lines),
+            },
+        ))
     };
     match tokio::time::timeout(Duration::from_secs(3), open).await {
         Ok(Ok(opened)) => Ok(opened),
@@ -346,16 +468,13 @@ mod imp {
     use super::*;
     use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
     /// 端点不存在（无实例）时返回可读错误。成功时一并返回管道服务端的进程
-    /// pid（取不到为 None），供调用方核对应答者自报的 pid。
+    /// pid（取不到就拒绝），供调用方核对应答者自报的 pid。
     ///
     /// ERROR_PIPE_BUSY(231) 重试：serve 循环在 connect() 完成、重建下一个
     /// 监听实例之间存在零监听窗口，管道名存在但无空闲实例，此时 CreateFile
     /// 返回 busy 而非「端点不存在」。tokio 文档明确要求客户端对该错误
     /// sleep 后重试；封顶 2 秒（上层 ipc_request 的 3 秒超时之内）。
-    pub async fn exchange(
-        endpoint: &str,
-        req_line: &str,
-    ) -> Result<(String, Option<u32>), IpcError> {
+    pub async fn exchange(endpoint: &str, req_line: &str) -> Result<(String, u32), IpcError> {
         let (client, peer) = connect(endpoint).await?;
         Ok((exchange_over(client, req_line).await?, peer))
     }
@@ -363,8 +482,8 @@ mod imp {
     /// 客户端一侧的连接
     pub type Stream = NamedPipeClient;
 
-    /// 连上端点。一并返回管道服务端的进程 pid（取不到为 None）。重试的规矩见 [`exchange`]。
-    pub async fn connect(endpoint: &str) -> Result<(Stream, Option<u32>), IpcError> {
+    /// 连上端点。一并返回管道服务端的进程 pid（取不到就拒绝）。重试的规矩见 [`exchange`]。
+    pub async fn connect(endpoint: &str) -> Result<(Stream, u32), IpcError> {
         const ERROR_PIPE_BUSY: i32 = 231;
         const BUSY_RETRY_CAP: Duration = Duration::from_secs(2);
         const BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -385,7 +504,8 @@ mod imp {
                 Err(e) => return Err(IpcError::Transient(format!("无法连接（{e}）"))),
             }
         };
-        let peer = server_pid(&client);
+        let peer = server_pid(&client)
+            .ok_or_else(|| IpcError::Protocol("cannot verify peer pid".into()))?;
         Ok((client, peer))
     }
 
@@ -405,10 +525,7 @@ mod imp {
     use std::path::Path;
     /// 成功时一并返回对端进程 pid（SO_PEERCRED 一类机制；取不到为 None），
     /// 供调用方核对应答者自报的 pid。
-    pub async fn exchange(
-        endpoint: &str,
-        req_line: &str,
-    ) -> Result<(String, Option<u32>), IpcError> {
+    pub async fn exchange(endpoint: &str, req_line: &str) -> Result<(String, u32), IpcError> {
         let (client, peer) = connect(endpoint).await?;
         Ok((exchange_over(client, req_line).await?, peer))
     }
@@ -416,8 +533,8 @@ mod imp {
     /// 客户端一侧的连接
     pub type Stream = tokio::net::UnixStream;
 
-    /// 连上端点，核对在那里听的进程该不该信。一并返回对端进程 pid（取不到为 None）。
-    pub async fn connect(endpoint: &str) -> Result<(Stream, Option<u32>), IpcError> {
+    /// 连上端点，核对在那里听的进程该不该信。一并返回对端进程 pid（取不到就拒绝）。
+    pub async fn connect(endpoint: &str) -> Result<(Stream, u32), IpcError> {
         let client = tokio::net::UnixStream::connect(endpoint)
             .await
             .map_err(|e| {
@@ -431,10 +548,13 @@ mod imp {
                     _ => IpcError::Transient(msg),
                 }
             })?;
-        let cred = client.peer_cred().ok();
+        let cred = client
+            .peer_cred()
+            .map_err(|error| IpcError::Protocol(error.to_string()))?;
         // 在这个路径上听的进程必须是该信的用户，否则不发请求、也不读它的应答：socket
         // 的路径可以预测，目录权限过宽时别的用户能抢先在那里放一个自己的 socket
-        if let Some(server) = cred.as_ref().map(|cred| cred.uid()) {
+        {
+            let server = cred.uid();
             // SAFETY: geteuid 没有前置条件，也不会失败
             let me = unsafe { libc::geteuid() };
             let dir_owner = Path::new(endpoint)
@@ -448,9 +568,10 @@ mod imp {
             }
         }
         let peer = cred
-            .and_then(|cred| cred.pid())
+            .pid()
             .and_then(|pid| u32::try_from(pid).ok())
-            .filter(|&pid| pid != 0);
+            .filter(|&pid| pid != 0)
+            .ok_or_else(|| IpcError::Protocol("cannot verify peer pid".into()))?;
         Ok((client, peer))
     }
 
@@ -483,5 +604,36 @@ mod imp {
             "别人放在这个目录里的"
         );
         assert!(!trusted_server_uid(0, 1001, None), "目录属主读不出来时不认");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn verified_run_checks_peer_run_and_request_identity_separately() {
+        let snapshot = json!({"instance": {"pid":17,"start":"s","instance_id":"first","version":"v","listen_addr":"local","base_url":"","started_at":1,"foreground":true}});
+        assert!(matches!(
+            snapshot_run(&snapshot, 18),
+            Err(IpcError::Protocol(_))
+        ));
+        let first = snapshot_run(&snapshot, 17).unwrap();
+        let next = RunIdentity {
+            pid: 17,
+            instance_id: "second".into(),
+        };
+        assert!(matches!(
+            first.check(Some(&next)),
+            Err(IpcError::RunChanged)
+        ));
+        first
+            .verify_record(&json!({"request_id":"first-1"}))
+            .unwrap();
+        assert!(matches!(
+            first.verify_record(&json!({"request_id":"second-1"})),
+            Err(IpcError::RunChanged)
+        ));
     }
 }

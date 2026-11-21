@@ -524,3 +524,32 @@ fn discovery_interval_has_a_floor_even_for_zero() {
         }
     })
 }
+
+#[test]
+fn live_completion_is_distinct_from_recovery_even_for_a_delayed_reader() {
+    rt(async {
+        let (v, mut s) = Script::start();
+        let mut changes = v.changes();
+        s.tick();
+        let events = s.ack("a", vec![]).await;
+        s.page("a", None)
+            .await
+            .send(Ok(page(vec![row("a", 2, false), row("a", 1, true)], false)))
+            .unwrap();
+        until(&v, |v| feed(v) == Feed::Streaming).await;
+        for _ in 0..2 {
+            events
+                .send(Ok(json!({"event":"request","data":row("a",2,true)})))
+                .unwrap();
+        }
+        events.send(Ok(json!({"event":"lagged"}))).unwrap();
+        until(&v, |v| feed(v) == Feed::Disconnected).await;
+        let mut completed = vec![];
+        while let Ok(c) = changes.try_recv() {
+            if let Change::Completed { request_id, .. } = c {
+                completed.push(request_id);
+            }
+        }
+        assert_eq!(completed, ["a-2"]);
+    })
+}

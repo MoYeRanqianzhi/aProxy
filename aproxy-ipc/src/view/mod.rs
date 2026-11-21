@@ -84,6 +84,13 @@ pub enum Change {
     Instance(u16),
     /// The named run's records changed or were evicted. Reread requests.
     Requests(RunKey),
+    /// An active record finished on an established stream, never during resync.
+    Completed {
+        /// Run whose cache contains the transition.
+        run: RunKey,
+        /// Instance-generated ID of the finished request.
+        request_id: String,
+    },
 }
 
 /// Caller-facing failure categories. Transport diagnostics may contain paths or peer text and are not DTOs.
@@ -344,6 +351,22 @@ impl Shared {
         let entry = store.ports.get_mut(&port).unwrap();
         let key = entry.info.run.clone().unwrap();
         let mut old = std::mem::take(&mut entry.records);
+        if !full {
+            // A delayed receiver need not reconstruct whether a terminal record
+            // came from paging. Only an observed live transition is actionable.
+            for (seq, r) in &rows {
+                if r.ended_at.is_some()
+                    && old
+                        .get(seq)
+                        .is_some_and(|previous| previous.ended_at.is_none())
+                {
+                    self.notify(Change::Completed {
+                        run: key.clone(),
+                        request_id: r.request_id.clone(),
+                    });
+                }
+            }
+        }
         if full {
             old.retain(|n, r| r.ended_at.is_some() || rows.contains_key(n));
         }

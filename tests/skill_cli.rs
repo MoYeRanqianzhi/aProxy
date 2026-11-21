@@ -17,8 +17,8 @@ const DOCS: [(&str, &str); 3] = [
     ("a/refs/b.md", "\r\nB\r\n"),
     ("b/SKILL.md", "# b\n"),
 ];
-/// 只有精确版本和总包路径返回文档，其他请求均在本机立即返回 404。
-async fn mirror(h: &TestHome, version: &str) {
+/// 独立组包，既能正常回包，也能在发送正文之前暂停镜像请求。
+fn archive(version: &str) -> Vec<u8> {
     let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let opts = zip::write::SimpleFileOptions::default();
     let mut files = json!({});
@@ -30,15 +30,23 @@ async fn mirror(h: &TestHome, version: &str) {
     w.start_file("manifest.json", opts).unwrap();
     w.write_all(&serde_json::to_vec(&json!({"schema":1,"version":version,"files":files})).unwrap())
         .unwrap();
-    let bytes = w.finish().unwrap().into_inner();
-    let port = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-        .await
-        .unwrap();
+    w.finish().unwrap().into_inner()
+}
+/// 只有精确版本和总包路径返回文档，其他请求均在本机立即返回 404。
+async fn mirror(h: &TestHome, version: &str) {
+    let bytes = archive(version);
     let app = axum::Router::new().route(
         &format!("/{VERSION}/aproxy-skills.zip"),
         axum::routing::get(move || async move { bytes }),
     );
+    serve(h, app).await;
+}
+/// 每个 home 使用自己的环回镜像，不回退到外网的下载链。
+async fn serve(h: &TestHome, app: axum::Router) {
+    let port = free_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -199,4 +207,67 @@ fn every_help_ends_in_the_skill_pointer() {
                 .ends_with(LINE)
         );
     }
+}
+
+/// 让普通安装的支线停在下载中，再从另一个进程尝试单独更新：锁必须在首次请求之前就持有。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn binary_and_standalone_install_share_the_download_lock() {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+    let h = TestHome::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let app = axum::Router::new().route(
+        &format!("/{VERSION}/aproxy-skills.zip"),
+        axum::routing::get({
+            let count = count.clone();
+            let arrived = arrived.clone();
+            let release = release.clone();
+            move || {
+                let count = count.clone();
+                let arrived = arrived.clone();
+                let release = release.clone();
+                async move {
+                    if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        arrived.notify_one();
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(20), release.notified()).await;
+                    }
+                    archive(VERSION)
+                }
+            }
+        }),
+    );
+    serve(&h, app).await;
+    let first = tokio::process::Command::from(h.cmd())
+        .kill_on_drop(true)
+        .args(["install", "--from", common::APROXY])
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), arrived.notified())
+        .await
+        .unwrap();
+    let contender = h.cmd().args(["skill", "upgrade"]).output().unwrap();
+    release.notify_one();
+    let first = first.wait_with_output().await.unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(contender.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&contender.stderr).contains("另一个进程"));
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        run(&h, &["skill", "show", "a"], 0).stdout,
+        DOCS[0].1.as_bytes()
+    );
 }

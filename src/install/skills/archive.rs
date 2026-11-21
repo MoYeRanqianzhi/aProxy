@@ -4,7 +4,7 @@ use super::manifest::{MARKER, MAX_MANIFEST, Manifest};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
@@ -14,13 +14,72 @@ const MAX_ARCHIVE: u64 = 32 << 20;
 const MISSING: &str =
     "skill 包缺少 manifest.json；0.2.0-alpha.4 及更早的发布版不带清单，请使用带清单的后续版本";
 
+/// 索引里也包含不在清单中的条目；构造 ZIP 索引之前限制总数，不能只限制展开的文件数。
+const MAX_ENTRIES: u64 = 2 * super::manifest::MAX_FILES as u64 + 1;
+
+/// 发布包无前缀、无尾注。只允许一个候选结束记录，避免 ZIP 读者解析失败后回溯到未检查的索引。
+/// ZIP64 使用定位器中的绝对偏移，两个计数字段均从 64 位记录核对，不把占位的 0xffff 当成数量。
+fn check_directory_budget(f: &mut fs::File, limit: u64) -> io::Result<()> {
+    let invalid = || io::Error::other("skill 压缩包无效");
+    let len = f.metadata()?.len();
+    let span = len.min(22 + (1 << 16));
+    f.seek(SeekFrom::End(-(span as i64)))?;
+    let mut tail = vec![0; span as usize];
+    f.read_exact(&mut tail)?;
+    let end = tail.len().checked_sub(22).ok_or_else(invalid)?;
+    if &tail[end..end + 4] != b"PK\x05\x06"
+        || tail[end + 20..] != [0, 0]
+        || tail[..end].windows(4).any(|w| w == b"PK\x05\x06")
+    {
+        return Err(invalid());
+    }
+    let counts = if end >= 20 && &tail[end - 20..end - 16] == b"PK\x06\x07" {
+        let start = u64::from_le_bytes(tail[end - 12..end - 4].try_into().unwrap());
+        // 小型发布包不用 ZIP64 的可扩展数据区，固定头也不会按外部长度分配内存。
+        if start.checked_add(56 + 20 + 22) != Some(len) {
+            return Err(invalid());
+        }
+        f.seek(SeekFrom::Start(start))?;
+        let mut record = [0u8; 56];
+        f.read_exact(&mut record)?;
+        if &record[..4] != b"PK\x06\x06"
+            || u64::from_le_bytes(record[4..12].try_into().unwrap()) != 44
+        {
+            return Err(invalid());
+        }
+        [
+            u64::from_le_bytes(record[24..32].try_into().unwrap()),
+            u64::from_le_bytes(record[32..40].try_into().unwrap()),
+        ]
+    } else {
+        [
+            u16::from_le_bytes(tail[end + 8..end + 10].try_into().unwrap()) as u64,
+            u16::from_le_bytes(tail[end + 10..end + 12].try_into().unwrap()) as u64,
+        ]
+    };
+    if counts.iter().any(|&n| n > limit) {
+        return Err(io::Error::other("skill 压缩包条目过多"));
+    }
+    if counts[0] != counts[1] {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 /// 打包校验与安装共用解包器：目标目录须由调用者独占且为空。返回额外条目数供报告。
 fn unpack(zip: &Path, dest: &Path, version: &str) -> io::Result<(Manifest, usize)> {
-    let f = fs::File::open(zip)?;
+    let mut f = fs::File::open(zip)?;
     if f.metadata()?.len() > MAX_ARCHIVE {
         return Err(io::Error::other("skill 压缩包过大"));
     }
-    let mut archive = zip::ZipArchive::new(f).map_err(|_| io::Error::other("skill 压缩包无效"))?;
+    check_directory_budget(&mut f, MAX_ENTRIES)?;
+    let mut archive = zip::ZipArchive::with_config(
+        zip::read::Config {
+            archive_offset: zip::read::ArchiveOffset::Known(0),
+        },
+        f,
+    )
+    .map_err(|_| io::Error::other("skill 压缩包无效"))?;
     archive
         .validate_header_consistency()
         .map_err(|_| io::Error::other("skill 压缩包无效"))?;
@@ -191,4 +250,42 @@ pub fn verify_package(zip: &Path, version: &str) -> io::Result<()> {
             .map_err(|_| io::Error::other("skill 正文不是 UTF-8 文本"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::*;
+    /// 用微型结束记录单测分配前的边界；64 位计数不经过 usize 或 u16 截断。
+    #[test]
+    fn budgets_before_index_allocation() {
+        for wide in [false, true] {
+            for count in [2u64, 3, (1 << 32) + 2] {
+                if !wide && count > u16::MAX.into() {
+                    continue;
+                }
+                let mut f = tempfile::tempfile().unwrap();
+                let mut end = [0u8; 22];
+                end[..4].copy_from_slice(b"PK\x05\x06");
+                if wide {
+                    let mut rec = [0u8; 56];
+                    rec[..4].copy_from_slice(b"PK\x06\x06");
+                    rec[4] = 44;
+                    for off in [24, 32] {
+                        rec[off..off + 8].copy_from_slice(&count.to_le_bytes());
+                    }
+                    f.write_all(&rec).unwrap();
+                    let mut loc = [0; 20];
+                    loc[..4].copy_from_slice(b"PK\x06\x07");
+                    loc[16] = 1;
+                    f.write_all(&loc).unwrap();
+                } else {
+                    for off in [8, 10] {
+                        end[off..off + 2].copy_from_slice(&(count as u16).to_le_bytes());
+                    }
+                }
+                f.write_all(&end).unwrap();
+                assert_eq!(check_directory_budget(&mut f, 2).is_ok(), count == 2);
+            }
+        }
+    }
 }

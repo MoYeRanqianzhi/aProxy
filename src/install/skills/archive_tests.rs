@@ -211,7 +211,7 @@ fn reads_only_the_current_verified_utf8_buffer() {
     let zip = package(home, Some(&manifest_for(&f)), &f);
     archive::install(home, &zip, "1.0.0").unwrap();
     assert!(
-        matches!(list(home).unwrap(),Listing::Installed(s) if s.len()==3 && !s[0].matches_binary)
+        matches!(list(home).unwrap(),Listing::Installed(s) if s.len()==3 && s[0].matches_binary == (env!("CARGO_PKG_VERSION")=="1.0.0"))
     );
     assert_eq!(show(home, "aproxy-cli", None).unwrap(), f[0].1);
     assert!(show(home, "aproxy-cli/references", Some("a.md")).is_err());

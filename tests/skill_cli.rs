@@ -11,6 +11,12 @@ use std::{
 
 /// 预发布测试也必须向镜像请求自身的版本而非 latest。
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// 主版本与正在运行的二进制不同，不预留某个未来版本号。
+const OTHER_VERSION: &str = if env!("CARGO_PKG_VERSION_MAJOR").as_bytes()[0] == b'0' {
+    "1.0.0"
+} else {
+    "0.0.0"
+};
 /// 刻意混用有无尾换行、CRLF 和 UTF-8，输出不能做文本规范化。
 const DOCS: [(&str, &str); 3] = [
     ("a/SKILL.md", "# 一"),
@@ -91,7 +97,7 @@ async fn roundtrip_and_aliases() {
             .unwrap()
             .contains("--skills-only")
     );
-    let bad = run(&h, &["install", "1.0.0", "--skills-only"], 2);
+    let bad = run(&h, &["install", OTHER_VERSION, "--skills-only"], 2);
     assert!(String::from_utf8(bad.stderr).unwrap().contains("先升级"));
     run(&h, &["skill", "install", VERSION], 2);
     let list: Value =
@@ -151,7 +157,7 @@ async fn roundtrip_and_aliases() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_legacy_and_version_mismatch() {
     let h = TestHome::new();
-    mirror(&h, "1.0.0").await;
+    mirror(&h, OTHER_VERSION).await;
     for (code, state) in [(4, "not_installed"), (1, "without_manifest")] {
         if code == 1 {
             fs::create_dir_all(h.path().join("skills/old")).unwrap();

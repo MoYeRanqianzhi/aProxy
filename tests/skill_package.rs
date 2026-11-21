@@ -144,9 +144,17 @@ fn package_validation_precedes_publication() {
     );
     let initial = fs::read(out.join("aproxy-skills.zip")).unwrap();
     assert!(
-        !run("1.0.0", "--verified-archive", &reference)
-            .status
-            .success()
+        !run(
+            if env!("CARGO_PKG_VERSION_MAJOR") == "0" {
+                "1.0.0"
+            } else {
+                "0.0.0"
+            },
+            "--verified-archive",
+            &reference
+        )
+        .status
+        .success()
     );
     assert!(
         !run("not-a-version", "--validator", Path::new(common::APROXY))

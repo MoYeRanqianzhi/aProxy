@@ -99,7 +99,7 @@ pub(crate) async fn serve_forever(
         cfg_path.map(|_| cfg_display.as_str()),
         cfg_abs.as_deref(),
     );
-    let behavior = daemon::Behavior::of(&cfg);
+    let behavior = daemon::behavior_of(&cfg);
     let state = aproxy::proxy::AppState::new(cfg);
     // 磁盘缓存开着时，建出本进程自己的 spool 目录（按进程分，不按端口：见
     // daemon::spool_dir_name）。别的进程崩溃留下的目录不在这里清——这时还没 bind，本进程

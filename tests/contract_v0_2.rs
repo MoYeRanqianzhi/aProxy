@@ -29,14 +29,14 @@ const PINNED_IN_MODULES: &[(&str, &str)] = &[
     ("src/daemon.rs", "instance_record_shape_is_pinned"),
     // 每个 op 的请求行（含各个参数）
     (
-        "src/daemon.rs",
+        "aproxy-ipc/src/wire.rs",
         "request_lines_are_pinned_and_round_trip_through_the_server_parser",
     ),
     // 每种拒绝的应答行
-    ("src/daemon.rs", "rejections_are_pinned"),
+    ("aproxy-ipc/src/wire.rs", "rejections_are_pinned"),
     // 读请求历史的 op：请求行与拒绝
     (
-        "src/daemon.rs",
+        "aproxy-ipc/src/wire.rs",
         "read_request_lines_are_pinned_and_round_trip_through_the_server_parser",
     ),
     ("src/daemon.rs", "read_rejections_are_pinned"),

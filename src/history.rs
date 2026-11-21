@@ -35,12 +35,7 @@ pub const TRIES_TAIL: usize = 20;
 pub const MAX_RECORD_BYTES: usize = 64 * 1024;
 /// 记录超出上限时，`method`、`path`、`user_agent`、`model` 各截到多少个字符
 pub const TRUNCATED_TEXT_CHARS: usize = 256;
-/// 读体时一块最多多少字节（原始字节，base64 之前）
-pub const MAX_BODY_READ: u64 = 1024 * 1024;
-/// 列记录时一次最多多少条
-pub const MAX_LIST: usize = 200;
-/// 列记录时不给 `limit` 就是多少条
-pub const DEFAULT_LIST: usize = 50;
+pub use aproxy_ipc::wire::{DEFAULT_LIST, MAX_BODY_READ, MAX_LIST, Part};
 
 /// 同一个请求的两个 `request` 事件之间至少隔多久（开始与结束不受它限制）
 const REQUEST_EVENT_INTERVAL_MS: u64 = 1000;
@@ -315,17 +310,6 @@ impl ReadError {
             cause: cause.map(Cause::as_str),
         }
     }
-}
-
-/// 要读的是哪个体。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Part {
-    /// 客户端发来的请求体
-    Request,
-    /// 某次尝试发往上游的体
-    Sent,
-    /// 某次尝试从上游收到的响应体
-    Response,
 }
 
 /// 往一个体里写：转发路径每经过一块就交给它一份。

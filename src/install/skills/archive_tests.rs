@@ -278,3 +278,32 @@ fn rejects_junction_inside_skill() {
     }
     assert!(super::installed::show(home, "aproxy-cli", Some("references/a.md")).is_err());
 }
+
+/// 两个写者同时竞争，拿锁者完成整包，另一个不碰它的工作区；旧进程残留的文件仍在原处。
+#[test]
+fn only_one_writer_publishes_and_stale_staging_is_ignored() {
+    let h = tempfile::tempdir().unwrap();
+    let home = h.path();
+    let files = docs();
+    let zip = package(home, Some(&manifest_for(&files)), &files);
+    let stale = home.join("skills/.staging-dead");
+    fs::create_dir_all(&stale).unwrap();
+    fs::write(stale.join("partial"), b"old").unwrap();
+    let ready = std::sync::Barrier::new(2);
+    std::thread::scope(|s| {
+        let run = || {
+            let guard = super::skill_lock(home);
+            ready.wait();
+            let Ok(_guard) = guard else { return false };
+            archive::install(home, &zip, "1.0.0").unwrap();
+            true
+        };
+        let a = s.spawn(run);
+        let b = s.spawn(run);
+        assert_ne!(a.join().unwrap(), b.join().unwrap());
+    });
+    assert_eq!(fs::read(stale.join("partial")).unwrap(), b"old");
+    for (k, b) in files {
+        assert_eq!(fs::read(home.join("skills").join(k)).unwrap(), b);
+    }
+}

@@ -5,7 +5,7 @@
 //! **安装照常成功**，主流程任何阶段都不等待/不受影响（唯一同步点：install
 //! 进程结束前 join 收尾并落终态）。下载是幂等覆盖操作，不建断电恢复状态机
 //! （半截文件下次重下即愈）；`--continue` 续作时 failed 不再自动重试
-//! （避免每次续作都拖一遍下载），`--skills-only` 手动重试。
+//! （避免每次续作都拖一遍下载），`aproxy skill install` 手动重试。
 //!
 //! 落位 = 目录原子替换：解压到 staging 子目录 → 旧目录 rename 走 → 新目录
 //! rename 进 → 删旧；Windows 上 agent 正读 skill 文件的冲突短重试。
@@ -34,51 +34,59 @@ pub struct SkillOutcome {
     pub failure: Option<super::InstallFailure>,
 }
 
-/// 支线主任务：按链条下载 skills zip → 原子落位。失败重试已在链条级
-/// （每级 3 次）——此处整体只跑一遍，失败即 failed（非强制，不拖主流程）。
+/// 从下载开始直到发布完成一直持有独立的文件锁；进程退出后内核释放，不按 pid 猜测过期。
+fn skill_lock(home: &Path) -> Result<super::InstallLock, String> {
+    let root = home.join("skills");
+    crate::fsx::create_dir_all(&root)
+        .and_then(|()| installed::directory(&root))
+        .map_err(|e| e.to_string())?;
+    super::try_lock_path(&root.join(".lock"))
+        .map_err(|e| format!("skill 加锁失败：{e}"))?
+        .ok_or_else(|| "另一个进程正在安装 skill，请稍后重试".into())
+}
+
+/// 只动 skill 的安装入口：下载与解包都在同卷独占的工作区，残留的半成品不复用也不清理。
+pub async fn install(
+    ctx: &DownloadCtx,
+    chain: &[download::ChainStep],
+    home: &Path,
+) -> Result<usize, super::InstallFailure> {
+    let _lock = skill_lock(home)?;
+    let dl = tempfile::Builder::new()
+        .prefix(".staging-dl-")
+        .tempdir_in(home.join("skills"))
+        .map_err(|e| format!("skill 下载目录创建失败：{e}"))?;
+    let fetched = download::fetch_artifact(ctx, chain, Artifact::Skills, dl.path()).await?;
+    let (manifest, ignored) = archive::install(home, &fetched.path, &ctx.version)
+        .map_err(|e| format!("skill 安装失败：{e}"))?;
+    if ignored != 0 {
+        tracing::warn!(ignored, "已跳过 skill 包中未登记的条目");
+    }
+    tracing::info!(skills=?manifest.names(),"skill 文档已随版本落位");
+    Ok(manifest.files.len())
+}
+
+/// 支线失败只更新自己的终态，不改变二进制安装的结果。下载链已负责逐级重试。
 pub async fn update_skills(
     ctx: &DownloadCtx,
     chain: &[download::ChainStep],
     home: &Path,
 ) -> SkillOutcome {
-    // 下载目录独立于解包区（.staging）——install_skill_dir 开头会清空
-    // .staging，若 zip 下载进同一目录会在解包前被自己删掉（实测暴露）
-    let dl = home.join("skills").join(".dl");
-    let attempt = 1u32;
-    let result = download::fetch_artifact(ctx, chain, Artifact::Skills, &dl).await;
-    let outcome = match result {
-        Ok(fetched) => match archive::install(home, &fetched.path, &ctx.version) {
-            Ok((manifest, ignored)) => {
-                if ignored != 0 {
-                    tracing::warn!(ignored, "已跳过 skill 包中未登记的条目");
-                }
-                tracing::info!(skills = ?manifest.names(), "skill 文档已随版本落位");
-                SkillOutcome {
-                    phase: SkillPhase::Done,
-                    failure: None,
-                    attempt,
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "skill 落位失败（下次 install 重试）");
-                SkillOutcome {
-                    phase: SkillPhase::Failed,
-                    failure: Some(e.to_string().into()),
-                    attempt,
-                }
-            }
+    match install(ctx, chain, home).await {
+        Ok(_) => SkillOutcome {
+            phase: SkillPhase::Done,
+            attempt: 1,
+            failure: None,
         },
         Err(e) => {
-            tracing::warn!(error = %e, "skill 下载失败（非强制，不影响安装；--skills-only 可单独重试）");
+            tracing::warn!(error=%e,"skill 未更新，不影响二进制安装；请执行 aproxy skill install 重试");
             SkillOutcome {
                 phase: SkillPhase::Failed,
+                attempt: 1,
                 failure: Some(e),
-                attempt,
             }
         }
-    };
-    let _ = std::fs::remove_dir_all(&dl);
-    outcome
+    }
 }
 
 #[cfg(test)]

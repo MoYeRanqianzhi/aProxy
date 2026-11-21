@@ -163,3 +163,102 @@ fn package_validation_precedes_publication() {
     );
     assert_eq!(fs::read(out.join("aproxy-skills.zip")).unwrap(), initial);
 }
+
+/// 独立索引将 CRLF 对象、工作副本与链接类型分开控制，不依赖当前仓库或墙钟时间。
+#[test]
+fn fixture_checks_git_objects_attributes_and_zip_metadata() {
+    use std::io::Read;
+    let h = TestHome::new();
+    let Some(py) = python(&h) else { return };
+    let root = h.path().join("repo");
+    let dir = root.join(".claude/skills/s");
+    fs::create_dir_all(&dir).unwrap();
+    let script = root.join(".github/scripts/package-skills.py");
+    fs::create_dir_all(script.parent().unwrap()).unwrap();
+    fs::copy(".github/scripts/package-skills.py", &script).unwrap();
+    fs::copy(".gitattributes", root.join(".gitattributes")).unwrap();
+    let git = |args: &[&str]| {
+        let o = h
+            .cmd_with("git")
+            .current_dir(&root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap()
+    };
+    git(&["init", "-q"]);
+    fs::write(dir.join("z"), b"LF\r\n").unwrap();
+    git(&["add", "--", ".gitattributes", ".claude/skills/s/z"]);
+    assert!(
+        git(&["check-attr", "eol", "--", ".claude/skills/s/z"])
+            .trim_end()
+            .ends_with("eol: lf")
+    );
+    // 故意绕开 clean 过滤器构造 CRLF blob，保证打包器读对象而非磁盘上的文件。
+    let oid = git(&["hash-object", "-w", "--no-filters", ".claude/skills/s/z"]);
+    git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("100755,{},.claude/skills/s/a", oid.trim()),
+    ]);
+    fs::write(dir.join("a"), b"changed").unwrap();
+    fs::write(dir.join("z"), b"changed").unwrap();
+    fs::write(dir.join("untracked"), b"ignore").unwrap();
+    let out = h.path().join("out");
+    let run = || {
+        h.cmd_with(py)
+            .arg(&script)
+            .arg(env!("CARGO_PKG_VERSION"))
+            .arg(&out)
+            .args(["--validator", common::APROXY])
+            .output()
+            .unwrap()
+    };
+    let result = run();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let path = out.join("aproxy-skills.zip");
+    let saved = fs::read(&path).unwrap();
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(&saved)).unwrap();
+    assert_eq!(z.len(), 3);
+    for (index, key) in ["manifest.json", "s/a", "s/z"].into_iter().enumerate() {
+        let mut e = z.by_index(index).unwrap();
+        assert_eq!(e.name(), key);
+        assert_eq!(e.unix_mode(), Some(0o100644));
+        assert_eq!(e.compression(), zip::CompressionMethod::Stored);
+        let dt = e.last_modified().unwrap();
+        assert_eq!(
+            (
+                dt.year(),
+                dt.month(),
+                dt.day(),
+                dt.hour(),
+                dt.minute(),
+                dt.second()
+            ),
+            (1980, 1, 1, 0, 0, 0)
+        );
+        let mut body = Vec::new();
+        e.read_to_end(&mut body).unwrap();
+        if key == "s/a" {
+            assert_eq!(body, b"LF\r\n");
+        } else if key == "s/z" {
+            assert_eq!(body, b"LF\n");
+        }
+    }
+    git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("120000,{},.claude/skills/s/link", oid.trim()),
+    ]);
+    let result = run();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("普通文件"));
+    assert_eq!(fs::read(path).unwrap(), saved);
+}

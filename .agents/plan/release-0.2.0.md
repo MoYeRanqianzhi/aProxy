@@ -297,7 +297,8 @@
 - 先建基础设施，再随各模块重构迁移该模块的字符串，避免翻译要删的代码。
 
 ### W4 `aproxy skill` 命令（用户需求）
-- `skill install` / `skill upgrade`：只下载 skill；删掉 `install --skills-only`。默认取与当前二进制同版本的
+- `skill install` / `skill upgrade`：只下载 skill；~~删掉 `install --skills-only`~~（2026-11-21 改：不能删。
+  冻结的 `src/install/force.rs` 提示用户执行它，`tests/force_contract.rs` 也传它；改为不在帮助里显示的别名，行为同 `skill install`）。默认取与当前二进制同版本的
   skill（skill 描述的是这个二进制的行为）；`aproxy install` 仍随二进制更新 skill。
 - `skill list`：已装 skill、版本、与二进制版本是否一致、位置；没装就提示怎么装。
 - `skill show <name> [<file>]`：默认输出 SKILL.md，也能输出 references 等文件，给读不了目录的 agent 用。

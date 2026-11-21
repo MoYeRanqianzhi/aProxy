@@ -53,7 +53,7 @@
 
 三项 Rust 工作一个接一个做（内存所限），可以写成一份任务书的三个阶段，也可以分开；前端工作由主代理在独立 worktree 里并行。
 
-6. **t07：W4 `aproxy skill` 命令**
+6. **t07：W4 `aproxy skill` 命令**（2026-11-21 派出，三个阶段：清单与核验读、命令、打包；`--skills-only` 保留为隐藏别名）
    - 范围：`skill install`、`upgrade`、`list`、`show`；删掉 `install --skills-only`；带清单的 skills 包与按清单解包；
      所有 `--help` 末尾的提示行。
    - 依据：[release-0.2.0](release-0.2.0.md) 的 W4 一节，含审查补充的安全设计（`show` 先读进内存、核对大小与 sha256 再输出）。

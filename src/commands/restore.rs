@@ -1,7 +1,6 @@
 //! `aproxy restore`：一键恢复先前非正常退出的实例。
 
-use aproxy::daemon;
-use aproxy::ops::restore::{Restore, restore_entry};
+use aproxy::ops::restore::{Restore, restore_entry_in};
 
 use super::{Results, say};
 
@@ -14,8 +13,8 @@ use super::{Results, say};
 /// 每条记录一项结局：`restored`、`already_running`、`config_missing`、`failed`。全部失败时
 /// 退出码 1；有成有败，或有配置文件暂时不在的记录（`config_missing`，它没被恢复，但记录还
 /// 留着等文件回来）时退出码 5。
-pub(crate) async fn handle_restore_cmd(json: bool) {
-    let listing = aproxy::spec::list_restore_in(&daemon::run_dir());
+pub(crate) async fn handle_restore_cmd(home: &std::path::Path, json: bool) {
+    let listing = aproxy::spec::list_restore_in(&home.join("run"));
     for unreadable in &listing.unreadable {
         eprintln!(
             "跳过读不懂的记录 {}: {}",
@@ -31,7 +30,7 @@ pub(crate) async fn handle_restore_cmd(json: bool) {
     }
     let exe = std::env::current_exe().expect("无法定位自身可执行文件");
     for entry in entries {
-        match restore_entry(&entry, &exe).await {
+        match restore_entry_in(home, &entry, &exe).await {
             Restore::AlreadyRunning => {
                 say(json, format!("端口 {} 已在运行，跳过。", entry.port));
                 results.ok(&entry.port, "already_running", None);

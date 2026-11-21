@@ -555,3 +555,41 @@ async fn update_children_are_home_bound_confirmed_bounded_and_terminal_only_afte
         Err(Fault::DesktopChanged {})
     ));
 }
+
+#[test]
+fn hidden_login_restore_uses_the_argument_home_and_refuses_relative_paths() {
+    let decoy = TestHome::new();
+    let actual = TestHome::new();
+    decoy.settings("{not settings");
+    let restore = |args: &[&str]| decoy.cmd().args(args).output().unwrap();
+    let rel = restore(&["restore-at-login", "--home", "relative"]);
+    assert_ne!(rel.status.code(), Some(0));
+    let empty = restore(&[
+        "restore-at-login",
+        "--home",
+        actual.path().to_str().unwrap(),
+    ]);
+    assert_eq!(empty.status.code(), Some(0));
+    let port = free_port().to_string();
+    let desire = spec::capture(
+        Some(&actual.path().join("missing.toml")),
+        Default::default(),
+        &actual.path().join("logs/test.log"),
+    );
+    spec::write_restore_in(&actual.path().join("run"), &port, &desire).unwrap();
+    let login = restore(&[
+        "restore-at-login",
+        "--home",
+        actual.path().to_str().unwrap(),
+    ]);
+    let public = actual.cmd().arg("restore").output().unwrap();
+    assert_eq!(login.status.code(), public.status.code());
+    assert_eq!(login.stdout, public.stdout);
+    assert_eq!(login.stderr, public.stderr);
+    assert_eq!(login.status.code(), Some(5));
+    assert!(
+        spec::read_restore_in(&actual.path().join("run"), &port)
+            .unwrap()
+            .is_some()
+    );
+}

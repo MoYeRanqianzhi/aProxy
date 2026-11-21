@@ -77,6 +77,7 @@ impl JsonOutput {
             Commands::Alias { .. }
             | Commands::Logs { .. }
             | Commands::Desktop
+            | Commands::RestoreAtLogin { .. }
             | Commands::Serve { .. }
             | Commands::Watchdog { .. } => false,
         };

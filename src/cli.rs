@@ -167,6 +167,14 @@ pub enum Commands {
         json: bool,
     },
 
+    /// 登录登记专用的恢复入口，主目录来自系统登记项，不依赖登录环境中的变量。
+    #[command(name = "restore-at-login", hide = true)]
+    RestoreAtLogin {
+        /// 登录项所属的绝对主目录。
+        #[arg(long,value_name="DIR",value_parser=absolute_login_home)]
+        home: PathBuf,
+    },
+
     /// 管理配置别名（存于 ~/.aproxy/settings.json，内部配置不建议手改）。
     /// 别名指向某个 config.toml，让多开配置可以用名字快捷启停。
     Alias {
@@ -569,4 +577,13 @@ pub fn command_tree() -> clap::Command {
     let mut cmd = Cli::command();
     cmd.build();
     annotate(cmd)
+}
+
+fn absolute_login_home(raw: &str) -> Result<PathBuf, String> {
+    let p = PathBuf::from(raw);
+    if p.is_absolute() {
+        Ok(p)
+    } else {
+        Err("login home must be an absolute path".into())
+    }
 }

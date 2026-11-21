@@ -228,6 +228,7 @@ fn every_help_ends_in_the_skill_pointer() {
         &["skill", "upgrade", "--help"],
         &["help", "skill", "show"],
         &["__serve", "--help"],
+        &["restore-at-login", "--help"],
     ] {
         assert!(
             String::from_utf8(run(&h, args, 0).stdout)

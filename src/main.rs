@@ -126,15 +126,23 @@ async fn run(cli: Cli) -> u8 {
     // 要读 home 的命令都拒绝运行——相对路径随工作目录解析成不同的 home，在这里报错比在
     // 错误的目录里读写强。`--version`、`--help` 不读 home，在上面已经结束；强制安装在
     // 上面自己报告（退出码 10）
-    if let Err(e) = aproxy_ipc::home::resolve_home() {
-        let value = std::env::var_os(aproxy_ipc::home::HOME_ENV).unwrap_or_default();
-        let (document, exit) = invalid_home_output(cli.command.as_ref(), &value.to_string_lossy());
-        if let Some(doc) = document {
-            commands::print_doc(doc);
+    let resolved = match &cli.command {
+        Some(Commands::RestoreAtLogin { home }) => Ok(home.clone()),
+        _ => aproxy_ipc::home::resolve_home(),
+    };
+    let home = match resolved {
+        Ok(home) => home,
+        Err(e) => {
+            let value = std::env::var_os(aproxy_ipc::home::HOME_ENV).unwrap_or_default();
+            let (document, exit) =
+                invalid_home_output(cli.command.as_ref(), &value.to_string_lossy());
+            if let Some(doc) = document {
+                commands::print_doc(doc);
+            }
+            let _ = writeln!(std::io::stderr(), "[ERROR] {e}");
+            return exit as u8;
         }
-        let _ = writeln!(std::io::stderr(), "[ERROR] {e}");
-        return exit as u8;
-    }
+    };
 
     // 后台实例：按交接文件里的拉起规格承载服务，日志由它自己按规格初始化。排在
     // settings 检查与续作拉起之前：这两件事都是给坐在终端前的人准备的，实例自己在解析
@@ -176,7 +184,7 @@ async fn run(cli: Cli) -> u8 {
     // - stop、status、install 照常运行、用内置默认，把错误作为告警打印：任何时候都要能停
     //   实例、看状态、装上能修好问题的版本（别名这时不可用，按端口或 all 寻址）；
     // - 其余命令以退出码 3 结束，说清怎样修——带着一份没生效的设置去做事，比不做更糟。
-    let settings_path = settings::settings_path();
+    let settings_path = settings::settings_path_in(&home);
     let loaded = settings::read(&settings_path);
     let reports_itself = matches!(
         cli.command,
@@ -226,14 +234,24 @@ async fn run(cli: Cli) -> u8 {
     // 只有要改动实例或设置的请求才顺带恢复安装；观察现场的命令不应改变它。
     // halted 表示原因不会自行消失，必须让用户排除原因后显式安装。
     if cli.command.as_ref().is_some_and(resumes_install)
-        && aproxy::install::state::load()
+        && aproxy::install::state::load_in(&home)
             .is_some_and(|s| !(s.phase == aproxy::install::state::InstallPhase::Failed && s.halted))
         && let Ok(exe) = std::env::current_exe()
     {
-        let _ = aproxy::daemon::spawn_detached(
-            &exe,
-            &["install".to_string(), "--continue".to_string()],
-        );
+        let args = ["install".to_owned(), "--continue".to_owned()];
+        if matches!(cli.command, Some(Commands::RestoreAtLogin { .. })) {
+            let env = [("APROXY_HOME".to_owned(), Some(home.display().to_string()))];
+            let _ = aproxy::daemon::spawn_detached_with(
+                &exe,
+                &args,
+                &aproxy::daemon::Launch {
+                    env: &env,
+                    cwd: Some(&home),
+                },
+            );
+        } else {
+            let _ = aproxy::daemon::spawn_detached(&exe, &args);
+        }
     }
 
     // 子命令分派
@@ -259,7 +277,12 @@ async fn run(cli: Cli) -> u8 {
             lines,
             follow,
         }) => commands::logs::handle_logs_cmd(target, lines, follow).await,
-        Some(Commands::Restore { json }) => commands::restore::handle_restore_cmd(json).await,
+        Some(Commands::Restore { json }) => {
+            commands::restore::handle_restore_cmd(&home, json).await
+        }
+        Some(Commands::RestoreAtLogin { .. }) => {
+            commands::restore::handle_restore_cmd(&home, false).await
+        }
         Some(Commands::Alias { cmd }) => commands::alias::handle_alias_cmd(cmd),
         Some(Commands::Doctor { json }) => commands::doctor::handle_doctor_cmd(json).await,
         Some(Commands::Find {
@@ -310,7 +333,8 @@ fn resumes_install(command: &Commands) -> bool {
         Commands::Start(_)
         | Commands::Stop { .. }
         | Commands::Restart { .. }
-        | Commands::Restore { .. } => true,
+        | Commands::Restore { .. }
+        | Commands::RestoreAtLogin { .. } => true,
         Commands::Alias { cmd } => match cmd {
             AliasCmd::Add { .. } | AliasCmd::Remove { .. } => true,
             AliasCmd::List { .. } => false,

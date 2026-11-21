@@ -171,6 +171,7 @@ pub(crate) fn handle_desktop_cmd() -> ! {
     let _entered = runtime.enter();
     let code = match aproxy_desktop::run(aproxy_desktop::Options {
         data_dir: home.join("desktop").join("webview"),
+        home,
         runtime: runtime.handle().clone(),
     }) {
         Ok(code) => code,

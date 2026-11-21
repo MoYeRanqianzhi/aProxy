@@ -139,10 +139,13 @@ dependencies = [
 name = "aproxy-desktop"
 version = "0.2.0-alpha.4"
 dependencies = [
+ "aproxy-ipc",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "window-vibrancy",
  "windows",

@@ -54,6 +54,14 @@ use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 #[allow(unsafe_op_in_unsafe_fn)]
 mod titlebar;
 
+mod bridge;
+include!("command_list.rs");
+macro_rules! handler {
+    ([$($shell:ident),*],[$($bridge:ident),*],[$($native:ident),*]) => {
+        tauri::generate_handler![$($shell,)* $(bridge::$bridge,)* $(#[cfg(windows)] titlebar::$native,)*]
+    };
+}
+
 /// 窗口 label：capabilities/main.json 按它授权，前端的 `getCurrentWindow()` 就是它。
 const MAIN_WINDOW: &str = "main";
 
@@ -72,6 +80,8 @@ const MASCOT_SANDBOX: &str = "/mascot-sandbox.html";
 
 /// 调用方交给 [`run`] 的东西。
 pub struct Options {
+    /// 启动时解析的绝对主目录；所有页面共享一个实例视图。
+    pub home: PathBuf,
     /// webview 的数据目录（WebView2 的用户数据目录、WebKitGTK 的网站数据）。aproxy 给
     /// `<home>/desktop/webview`：不显式指定的话，Tauri 在 Windows 与 Linux 上会强制用
     /// app_local_data_dir（按 tauri.conf.json 的 identifier 建在用户的应用数据目录下），
@@ -154,7 +164,15 @@ pub fn preflight() -> Result<(), Error> {
 /// 打开桌面界面，阻塞到窗口关掉（事件循环结束），返回进程该用的退出码。必须在主线程上
 /// 调用，整个进程只调用一次（Tauri 的异步运行时只能设一次）。调用之前先过 [`preflight`]。
 pub fn run(options: Options) -> Result<i32, Error> {
-    tauri::async_runtime::set(options.runtime);
+    tauri::async_runtime::set(options.runtime.clone());
+    let runtime = options.runtime;
+    let view = {
+        let _enter = runtime.enter();
+        Arc::new(aproxy_ipc::view::HomeView::open(
+            options.home,
+            Duration::from_secs(2),
+        ))
+    };
 
     // setup 里出的错不能交还给 Tauri（它会 panic），记在这里，请事件循环退出后再报告
     let failure: Arc<Mutex<Option<Error>>> = Arc::default();
@@ -163,13 +181,8 @@ pub fn run(options: Options) -> Result<i32, Error> {
 
     let builder = tauri::Builder::default()
         .manage(Mutex::new(DesktopInfo::default()))
-        .invoke_handler(tauri::generate_handler![
-            desktop_info,
-            #[cfg(windows)]
-            titlebar::titlebar_insets,
-            #[cfg(windows)]
-            titlebar::set_caption_color,
-        ])
+        .manage(view.clone())
+        .invoke_handler(with_commands!(handler))
         .setup(move |app| {
             if let Err(e) = open_main_window(app, data_dir) {
                 *setup_failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
@@ -194,6 +207,8 @@ pub fn run(options: Options) -> Result<i32, Error> {
     };
 
     let code = app.run_return(|_, _| {});
+    // 事件循环已退场，可以等视图释放套接字；不要在窗口回调里阻塞运行时。
+    runtime.block_on(view.shutdown());
     match failure.lock().unwrap_or_else(|e| e.into_inner()).take() {
         Some(e) => Err(e),
         None => Ok(code),

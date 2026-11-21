@@ -518,7 +518,7 @@ pub struct HomeView {
     wake: Arc<tokio::sync::Notify>,
     source: Arc<dyn Source>,
     shared: Arc<Shared>,
-    driver: tokio::task::JoinHandle<()>,
+    driver: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 fn discovery_timer(interval: Duration) -> tokio::time::Interval {
     let mut timer = tokio::time::interval(interval.max(Duration::from_secs(2)));
@@ -561,7 +561,7 @@ impl HomeView {
         Self {
             source,
             shared,
-            driver,
+            driver: Mutex::new(Some(driver)),
             wake,
         }
     }
@@ -713,14 +713,19 @@ impl HomeView {
         )?)
     }
     /// Stop and wait for all IO futures to be dropped before returning.
-    pub async fn shutdown(mut self) {
-        self.driver.abort();
-        let _ = (&mut self.driver).await;
+    pub async fn shutdown(&self) {
+        let driver = self.driver.lock().unwrap().take();
+        if let Some(driver) = driver {
+            driver.abort();
+            let _ = driver.await;
+        }
     }
 }
 impl Drop for HomeView {
     fn drop(&mut self) {
-        self.driver.abort();
+        if let Some(driver) = self.driver.get_mut().unwrap().take() {
+            driver.abort();
+        }
     }
 }
 

@@ -50,6 +50,9 @@ test = false
 doctest = false
 
 [dependencies]
+# 仅桌面应用使用投影与有界事件接口；无须引入 aproxy 包。
+aproxy-ipc = { version = "=0.2.0-alpha.4", path = "../aproxy-ipc", features = ["desktop"] }
+serde_json = "1"
 # default-features = false 是为了关掉 common-controls-v6：它让 exe 静态导入只有 Common
 # Controls v6 才有的 TaskDialogIndirect，没有 v6 清单的 exe 在 main 之前就以 0xC0000139
 # 退出——连 `aproxy --version`（永久兼容契约 C5）都跑不了。清单在 tauri-build 编出的 Windows
@@ -99,4 +102,7 @@ window-vibrancy = "=0.8.1"
 windows-version = "0.1"
 
 [build-dependencies]
+# 独立解析已提交的授权文件，再让 tauri-build 生成平台资源。
+serde_json = "1"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 tauri-build = "2.7"

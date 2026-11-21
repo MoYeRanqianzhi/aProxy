@@ -32,6 +32,8 @@ pub mod redact;
 #[cfg(feature = "client")]
 pub mod registry;
 #[cfg(feature = "client")]
+pub mod view;
+#[cfg(feature = "client")]
 pub mod wire;
 
 /// 本包的版本。与 aproxy 同号发版，台账条目的 `version` 字段写的就是它。

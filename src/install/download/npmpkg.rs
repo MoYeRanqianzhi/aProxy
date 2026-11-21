@@ -98,10 +98,9 @@ async fn fetch_meta(ctx: &DownloadCtx, artifact: Artifact) -> Result<TarballMeta
         .map_err(|e| format!("registry 请求失败（{}）: {e}", registry))?
         .error_for_status()
         .map_err(|e| format!("registry 无此包/版本（{}）: {e}", registry))?;
-    let meta: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("registry 元数据解析失败: {e}"))?;
+    let bytes = super::response_bytes(resp, artifact.budget(super::MAX_ARCHIVE)).await?;
+    let meta: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("registry 元数据解析失败: {e}"))?;
     let version_meta = &meta["versions"][&ctx.version];
     if version_meta.is_null() {
         return Err(format!(
@@ -154,15 +153,23 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
 }
 
 /// tgz 解包：提取 tgz 内的指定文件（tar.gz 内 `package/<路径>`）到 dest。
-fn extract_from_tgz(tgz: &Path, inner_path: &str, dest: &Path) -> Result<(), String> {
+fn extract_from_tgz(
+    tgz: &Path,
+    inner_path: &str,
+    dest: &Path,
+    artifact: Artifact,
+) -> Result<(), String> {
     let f = std::fs::File::open(tgz).map_err(|e| format!("tgz 打开失败: {e}"))?;
     let gz = flate2::read::GzDecoder::new(f);
-    let mut archive = tar::Archive::new(gz);
+    use std::io::Read;
+    let mut archive = tar::Archive::new(super::TarBudget(
+        gz.take(artifact.budget(super::MAX_SKILL_TAR)),
+    ));
     for entry in archive
         .entries()
         .map_err(|e| format!("tar 解包失败: {e}"))?
     {
-        let mut entry = entry.map_err(|e| format!("tar 条目读取失败: {e}"))?;
+        let entry = entry.map_err(|e| format!("tar 条目读取失败: {e}"))?;
         let name = entry
             .path()
             .map_err(|e| format!("tar 路径读取失败: {e}"))?
@@ -172,9 +179,14 @@ fn extract_from_tgz(tgz: &Path, inner_path: &str, dest: &Path) -> Result<(), Str
         if name == format!("package/{inner_path}") || name == format!("package/{inner_path}/") {
             // **tar 路径穿越防护**：dest 是调用方指定的绝对路径，不拼接
             // entry 内路径——穿越无从谈起
+            let limit = artifact.budget(super::MAX_ARCHIVE);
+            if entry.size() > limit {
+                return Err("文档下载大小超限".into());
+            }
             let mut out = std::fs::File::create(dest)
                 .map_err(|e| format!("{} 创建失败: {e}", dest.display()))?;
-            std::io::copy(&mut entry, &mut out).map_err(|e| format!("tar 条目提取失败: {e}"))?;
+            std::io::copy(&mut super::TarBudget(entry.take(limit)), &mut out)
+                .map_err(|e| format!("tar 条目提取失败: {e}"))?;
             return Ok(());
         }
     }
@@ -246,7 +258,7 @@ pub async fn fetch(
     let meta = fetch_meta(ctx, artifact).await?;
     let tgz_dest = dest.with_extension("tgz");
     let result = async {
-        download_to(&ctx.client, &meta.url, &tgz_dest).await?;
+        download_to(&ctx.client, &meta.url, &tgz_dest, artifact).await?;
         // integrity（sha512）强校验
         if let Some(integrity) = &meta.integrity_sha512 {
             let Some(encoded) = integrity.strip_prefix("sha512-") else {
@@ -273,12 +285,12 @@ pub async fn fetch(
                 } else {
                     "bin/aproxy"
                 };
-                extract_from_tgz(&tgz_dest, inner, dest)?;
+                extract_from_tgz(&tgz_dest, inner, dest, artifact)?;
             }
             Artifact::Skills => {
                 // npm 路径沿用已发布的总包位置，不让旧安装器找不到它。
                 let inner = "skills/aproxy-skills.zip";
-                extract_from_tgz(&tgz_dest, inner, dest)?;
+                extract_from_tgz(&tgz_dest, inner, dest, artifact)?;
             }
         }
         let sum = crate::install::staging::sha256_hex(dest)?;

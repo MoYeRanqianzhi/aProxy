@@ -23,7 +23,13 @@ async fn fetch_and_unpack_crate(ctx: &DownloadCtx, dest_dir: &Path) -> Result<Pa
     crate::fsx::create_dir_all(dest_dir).map_err(|e| format!("crate 目录创建失败: {e}"))?;
     let tgz = dest_dir.join("crate.tgz");
     let result = async {
-        super::download_to(&ctx.client, &crate_url(&ctx.version), &tgz).await?;
+        super::download_to(
+            &ctx.client,
+            &crate_url(&ctx.version),
+            &tgz,
+            Artifact::Binary,
+        )
+        .await?;
         // crates.io checksum：下载 URL 本身即信任锚（官方 CDN）；
         // .crate 的 sha512 随 API 元数据分发——此处直接以 CDN 内容为准
         //（与 cargo 工具链同一信任级别）
@@ -79,7 +85,7 @@ pub async fn fetch(ctx: &DownloadCtx, artifact: Artifact, dest: &Path) -> Result
             Artifact::Binary.asset_name(ctx.target, ctx.variant, "")
         ),
     };
-    super::download_to(&ctx.client, &url, dest).await?;
+    super::download_to(&ctx.client, &url, dest, Artifact::Binary).await?;
     let sum = crate::install::staging::sha256_hex(dest)?;
     let _ = std::fs::remove_dir_all(&work);
     Ok(Fetched {
@@ -181,7 +187,13 @@ pub async fn fetch_build(
 /// 不把 tar 里的任意路径或链接展开到磁盘，也不为没有清单的旧版临时签发清单。
 async fn fetch_build_skills(ctx: &DownloadCtx, dest: &Path) -> Result<Fetched, String> {
     let tgz = dest.with_extension("crate");
-    super::download_to(&ctx.client, &crate_url(&ctx.version), &tgz).await?;
+    super::download_to(
+        &ctx.client,
+        &crate_url(&ctx.version),
+        &tgz,
+        Artifact::Skills,
+    )
+    .await?;
     let input = std::fs::File::open(tgz).map_err(|e| format!("crate 打开失败：{e}"))?;
     let out = std::fs::File::create(dest).map_err(|e| format!("zip 创建失败：{e}"))?;
     crate_skills_zip(input, out, &ctx.version, super::MAX_SKILL_TAR)
@@ -226,8 +238,10 @@ fn crate_skills_zip(
             MAX_FILE
         };
         count += 1;
-        if entry.size() > limit
-            || total + entry.size() > MAX_TOTAL + MAX_MANIFEST
+        // 路径还会进入 ZIP 的两个目录头；约束名字开销，防止转换产物先于校验超限。
+        if key.len() > 1024
+            || entry.size() > limit
+            || entry.size() > MAX_TOTAL + MAX_MANIFEST - total
             || count > MAX_FILES + 1
         {
             return Err(std::io::Error::other("crate 文档数量或大小超限"));

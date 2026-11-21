@@ -30,6 +30,7 @@ async fn api_get(
     ctx: &DownloadCtx,
     url: &str,
     exact_tag: bool,
+    artifact: Artifact,
 ) -> Result<serde_json::Value, crate::install::InstallFailure> {
     let resp = ctx
         .client
@@ -49,7 +50,8 @@ async fn api_get(
             format!("GitHub API HTTP {}", resp.status()),
         ));
     }
-    resp.json().await.map_err(|e| {
+    let body = super::response_bytes(resp, artifact.budget(super::MAX_ARCHIVE)).await?;
+    serde_json::from_slice(&body).map_err(|e| {
         crate::install::InstallFailure::new(
             "install_download_failed",
             format!("GitHub API 解析失败: {e}"),
@@ -61,11 +63,13 @@ async fn api_get(
 async fn release_by_version(
     ctx: &DownloadCtx,
     version: &str,
+    artifact: Artifact,
 ) -> Result<Release, crate::install::InstallFailure> {
     let item = api_get(
         ctx,
         &format!("https://api.github.com/repos/{REPO}/releases/tags/v{version}"),
         true,
+        artifact,
     )
     .await?;
     let mut assets = Vec::new();
@@ -197,14 +201,14 @@ pub async fn fetch(
     dest: &Path,
 ) -> Result<Fetched, crate::install::InstallFailure> {
     let asset = artifact.asset_name(ctx.target, ctx.variant, ctx.cpu_suffix);
-    let release = release_by_version(ctx, &ctx.version).await?;
+    let release = release_by_version(ctx, &ctx.version, artifact).await?;
     let url = release
         .assets
         .iter()
         .find(|(n, _)| *n == asset)
         .map(|(_, u)| u.clone())
         .ok_or_else(|| format!("release v{} 无资产 {asset}", ctx.version))?;
-    download_to(&ctx.client, &url, dest).await?;
+    download_to(&ctx.client, &url, dest, artifact).await?;
     // .sha256 强校验
     let sum_url = format!("{url}.sha256");
     let expected = ctx
@@ -214,10 +218,9 @@ pub async fn fetch(
         .await
         .map_err(|e| format!(".sha256 下载失败: {e}"))?
         .error_for_status()
-        .map_err(|e| format!(".sha256 资产不可用: {e}"))?
-        .text()
-        .await
-        .map_err(|e| format!(".sha256 读取失败: {e}"))?;
+        .map_err(|e| format!(".sha256 资产不可用: {e}"))?;
+    let body = super::response_bytes(expected, artifact.budget(super::MAX_CHECKSUM)).await?;
+    let expected = String::from_utf8_lossy(&body);
     let expected = expected
         .split_whitespace()
         .next()
@@ -256,6 +259,7 @@ pub async fn latest_version(
         ctx,
         &format!("https://api.github.com/repos/{REPO}/releases?per_page=100"),
         false,
+        artifact,
     )
     .await?;
     if !body.is_array() {

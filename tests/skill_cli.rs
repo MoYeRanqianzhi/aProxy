@@ -351,3 +351,25 @@ async fn non_unicode_home_has_display_locations() {
         root.display().to_string()
     );
 }
+
+/// 镜像能提供校验文件时必须完整且有界；即使其首行正确，过大的尾部也不能被忽略。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checksum_response_is_bounded() {
+    let h = TestHome::new();
+    let zip = archive(VERSION);
+    let mut sum = format!("{:x}  aproxy-skills.zip\n", Sha256::digest(&zip));
+    sum.push_str(&" ".repeat(4096));
+    let path = format!("/{VERSION}/aproxy-skills.zip");
+    serve(
+        &h,
+        axum::Router::new()
+            .route(&path, axum::routing::get(move || async move { zip }))
+            .route(
+                &format!("{path}.sha256"),
+                axum::routing::get(move || async move { sum }),
+            ),
+    )
+    .await;
+    assert!(String::from_utf8_lossy(&run(&h, &["skill", "install"], 1).stderr).contains("超限"));
+    assert!(!h.path().join("skills/manifest.json").exists());
+}

@@ -38,7 +38,19 @@ pub enum Artifact {
     Skills,
 }
 
+/// 校验文件只需一行摘要与资产名，保留少量空白余量。
+const MAX_CHECKSUM: u64 = 4096;
+use super::skills::archive::MAX_ARCHIVE;
+
 impl Artifact {
+    /// 文档响应的限额不施加给二进制、二进制元数据或其容器。
+    fn budget(self, skill_limit: u64) -> u64 {
+        if self == Self::Skills {
+            skill_limit
+        } else {
+            u64::MAX
+        }
+    }
     /// GitHub Release 资产名（发布资产命名用户定调：文件名不带版本号，
     /// 版本由 release tag 承载；无界面版本加 `headless-`，用户 2026-10-11 定）。
     /// `variant` 是 desktop / headless，`cpu_suffix` 是指令集档的后缀（`-v3` 或空）。
@@ -436,7 +448,12 @@ impl<R: std::io::Read> std::io::Read for TarBudget<R> {
 }
 
 /// 下载 URL 到文件（流式落盘，不整载内存）。
-pub async fn download_to(client: &reqwest::Client, url: &str, dest: &Path) -> Result<(), String> {
+async fn download_to(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    artifact: Artifact,
+) -> Result<(), String> {
     let resp = client
         .get(url)
         .send()
@@ -445,13 +462,28 @@ pub async fn download_to(client: &reqwest::Client, url: &str, dest: &Path) -> Re
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
-    save_download(resp, dest).await
+    save_download(resp, dest, artifact.budget(MAX_ARCHIVE)).await
 }
 
 /// 直接把响应体写入目标，按字节而不是分块数上报进度；写盘失败不发送完成通知。
-async fn save_download(resp: reqwest::Response, dest: &Path) -> Result<(), String> {
-    let mut file =
+async fn save_download(resp: reqwest::Response, dest: &Path, limit: u64) -> Result<(), String> {
+    let file =
         std::fs::File::create(dest).map_err(|e| format!("{} 创建失败: {e}", dest.display()))?;
+    receive(resp, file, limit, true).await
+}
+/// 元数据与校验响应也逐块过限额，不能先整载再量长度。
+async fn response_bytes(resp: reqwest::Response, limit: u64) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    receive(resp, &mut buf, limit, false).await?;
+    Ok(buf)
+}
+/// 声明长度可提前拒绝，但即使没有声明也必须在写当前块之前检查累计字节。
+async fn receive(
+    resp: reqwest::Response,
+    mut file: impl std::io::Write,
+    limit: u64,
+    progress: bool,
+) -> Result<(), String> {
     let total = resp.content_length().or_else(|| {
         resp.headers()
             .get(reqwest::header::CONTENT_LENGTH)?
@@ -460,21 +492,28 @@ async fn save_download(resp: reqwest::Response, dest: &Path) -> Result<(), Strin
             .parse()
             .ok()
     });
+    if total.is_some_and(|n| n > limit) {
+        return Err("文档下载大小超限".into());
+    }
     let mut bytes = 0;
     let mut last = std::time::Instant::now();
     let mut stream = resp;
-    use std::io::Write;
     while let Some(chunk) = stream.chunk().await.map_err(|e| format!("下载中断: {e}"))? {
+        if chunk.len() as u64 > limit - bytes {
+            return Err("文档下载大小超限".into());
+        }
         file.write_all(&chunk)
             .map_err(|e| format!("写入失败: {e}"))?;
         bytes += chunk.len() as u64;
-        if last.elapsed() >= std::time::Duration::from_millis(100) {
+        if progress && last.elapsed() >= std::time::Duration::from_millis(100) {
             let _ = super::state::OBSERVER.try_with(|o| (o.progress)(bytes, total));
             last = std::time::Instant::now();
         }
     }
     file.flush().map_err(|e| format!("flush 失败: {e}"))?;
-    let _ = super::state::OBSERVER.try_with(|o| (o.progress)(bytes, total));
+    if progress {
+        let _ = super::state::OBSERVER.try_with(|o| (o.progress)(bytes, total));
+    }
     Ok(())
 }
 
@@ -616,7 +655,7 @@ async fn fetch_url_template(
     dest: &Path,
 ) -> Result<Fetched, super::InstallFailure> {
     let url = ctx.fill_template(template, artifact);
-    download_to(&ctx.client, &url, dest).await?;
+    download_to(&ctx.client, &url, dest, artifact).await?;
     // 弱档校验尝试：<url>.sha256 拼得出且下载成功 → 比对
     let asset = artifact.asset_name(ctx.target, ctx.variant, ctx.cpu_suffix);
     let sum = crate::install::staging::sha256_hex(dest)?;
@@ -629,7 +668,8 @@ async fn fetch_url_template(
         .filter(|r| r.status().is_success())
     {
         Some(resp) => {
-            let expected = resp.text().await.unwrap_or_default();
+            let body = response_bytes(resp, artifact.budget(MAX_CHECKSUM)).await?;
+            let expected = String::from_utf8_lossy(&body);
             let expected = expected
                 .split_whitespace()
                 .next()
@@ -905,6 +945,26 @@ mod tests {
         );
     }
 
+    /// 超出的分块不能先写到目标；有长度头时连第一块也不用接收。
+    #[tokio::test]
+    async fn download_budget_precedes_write() {
+        for declared in [false, true] {
+            let mut response = http::Response::builder();
+            if declared {
+                response = response.header("content-length", 4);
+            }
+            let body = reqwest::Body::wrap_stream(futures_util::stream::iter(
+                [b"ab", b"cd"].map(|b| Ok::<_, std::io::Error>(bytes::Bytes::from_static(b))),
+            ));
+            let mut out = Vec::new();
+            let err = receive(response.body(body).unwrap().into(), &mut out, 3, false)
+                .await
+                .unwrap_err();
+            assert!(err.contains("超限"));
+            assert_eq!(out, if declared { &b""[..] } else { b"ab" });
+        }
+        assert_eq!(Artifact::Binary.budget(MAX_ARCHIVE), u64::MAX);
+    }
     /// 内存中的 HTTP 响应与真实响应走同一个落盘循环；不连网也能核对最后的字节数。
     #[tokio::test]
     async fn completed_download_reports_bytes_with_or_without_a_total() {
@@ -930,7 +990,7 @@ mod tests {
             SAMPLE
                 .scope(std::cell::Cell::new(None), async {
                     OBSERVER
-                        .scope(observer, save_download(resp, &dir.path().join("asset")))
+                        .scope(observer, save_download(resp, &dir.path().join("asset"), 3))
                         .await
                         .unwrap();
                     assert_eq!(SAMPLE.with(|s| s.get()), Some((3, total)));

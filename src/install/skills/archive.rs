@@ -9,7 +9,7 @@ use std::{
 };
 
 /// 限制压缩包目录表占用；合法包的原文总量上限还要低一半。
-const MAX_ARCHIVE: u64 = 32 << 20;
+pub(crate) const MAX_ARCHIVE: u64 = 32 << 20;
 /// 老发布包没有清单，不能用本地计算的摘要冒充随版本发布的白名单。
 const MISSING: &str =
     "skill 包缺少 manifest.json；0.2.0-alpha.4 及更早的发布版不带清单，请使用带清单的后续版本";

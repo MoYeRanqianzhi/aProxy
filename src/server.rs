@@ -175,7 +175,7 @@ pub(crate) async fn serve_forever(
         listen_addr: actual_addr.clone(),
         config_path: cfg_path.map(|_| cfg_display.clone()),
         // 注册表与 IPC ping 都会把它交给 status 展示（只用于展示），脱敏后再登记
-        base_url: aproxy_ipc::redact::url(&base_url),
+        base_url: state.history.redacted_url(&base_url),
         started_at: daemon::now_millis(),
         log_path: daemon_log_path.as_ref().map(|p| p.display().to_string()),
         foreground: !daemon_child,

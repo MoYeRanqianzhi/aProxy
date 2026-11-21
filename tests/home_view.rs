@@ -19,7 +19,10 @@ async fn view_matches_instance_history_and_plain_logs() {
     let server = tokio::spawn(async move {
         axum::serve(
             listener,
-            Router::new().route("/v1/messages", post(|| async { "local reply" })),
+            Router::new().route(
+                "/test-only-known-key/v1/messages",
+                post(|| async { "local reply" }),
+            ),
         )
         .await
         .unwrap()
@@ -29,7 +32,7 @@ async fn view_matches_instance_history_and_plain_logs() {
     std::fs::write(
         &cfg,
         format!(
-            "listen_addr = \"127.0.0.1:0\"\nbase_url = \"http://{upstream}\"\napi_key = \"{KEY}\"\n"
+            "listen_addr = \"127.0.0.1:0\"\nbase_url = \"http://{upstream}/{KEY}\"\napi_key = \"{KEY}\"\n"
         ),
     )
     .unwrap();
@@ -44,6 +47,13 @@ async fn view_matches_instance_history_and_plain_logs() {
     let doc: Value = serde_json::from_slice(&start.stdout).unwrap();
     let port = u16::try_from(doc["port"].as_u64().unwrap()).unwrap();
     home.stop_on_drop(port);
+    let status = aproxy_ipc::client::ipc_ping_in(&home.path().join("run"), &port.to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        status.instance.base_url,
+        format!("http://{upstream}/<secret>")
+    );
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
     let url = format!("http://127.0.0.1:{port}/v1/messages");
     let send = || async {

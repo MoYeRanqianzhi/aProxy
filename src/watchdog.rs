@@ -1187,7 +1187,7 @@ pub async fn serve(cfg: WatchdogConfig) {
                     old.pid
                 ),
             );
-            let entry = as_ledger_entry(&old);
+            let entry = as_ledger_entry(old);
             let outcome = tokio::task::spawn_blocking(move || {
                 aproxy_ipc::ledger::terminate(&entry, Duration::from_secs(5))
             })

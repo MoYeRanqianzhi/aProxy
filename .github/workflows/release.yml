@@ -8,7 +8,7 @@ name: Release
 #   带桌面界面的 desktop  aproxy-<target>[-v3][.exe]           9 个（musl 没有带界面版）
 #   无界面的 headless     aproxy-headless-<target>[-v3][.exe]  11 个
 #   aproxy-manifest.json  发布清单（永久兼容契约 C6）：强制安装靠它找资产
-#   aproxy-skills.zip + aproxy-skill-<名>.zip
+#   aproxy-skills.zip（内含 manifest.json）
 #   每个二进制与 skill 包附 .sha256
 # Release 说明由 .github/scripts/release-body.sh 生成（下载与更新链 + SHA256 表），变更记录由
 # GitHub generate_release_notes 叠在后面。
@@ -299,34 +299,28 @@ jobs:
           if-no-files-found: error
 
   skills:
-    # skill 文档打包：总包（解压得 ~/.aproxy/skills/ 内容）+ 每个 skill 单包。
-    # 泛化遍历 .claude/skills/*/：新增 skill 目录零改动自动进总包与单包。
-    # 单包顶层目录 = skill 名，解压到 ~/.aproxy/skills/ 即落位。
+    # 用发布版本的二进制在只读任务核对总包；其他渠道只接受相同的字节。
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - name: Package skills
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.3
+      - name: Align version with the release
+        run: python3 .github/scripts/align-version.py
+      - name: Package and verify skills
         run: |
-          mkdir -p stage
-          cp -r .claude/skills/* stage/
-          (cd stage && zip -qr ../aproxy-skills.zip */)
-          sha256sum aproxy-skills.zip > aproxy-skills.zip.sha256
-          for d in .claude/skills/*/; do
-            name=$(basename "$d")
-            (cd .claude/skills && zip -qr "../../aproxy-skill-${name}.zip" "$name")
-            sha256sum "aproxy-skill-${name}.zip" > "aproxy-skill-${name}.zip.sha256"
-          done
+          cargo build --locked --no-default-features --bin aproxy
+          python3 .github/scripts/package-skills.py "$RELEASE_VERSION" . --validator target/debug/aproxy
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: release-skills
+          if-no-files-found: error
           path: |
             aproxy-skills.zip
             aproxy-skills.zip.sha256
-            aproxy-skill-*.zip
-            aproxy-skill-*.zip.sha256
 
   manifest:
     # 发布清单（永久兼容契约 C6）：从 20 个二进制生成 aproxy-manifest.json，并用强制安装读清单的
@@ -442,6 +436,10 @@ jobs:
           pattern: release-bin-*
           path: artifacts
           merge-multiple: true
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: release-skills
+          path: artifacts
       # npm 要求 Node ≥22.14 / npm CLI ≥11.5.1（trusted publishing 门槛）
       - uses: actions/setup-node@v7.1.0
         with:
@@ -459,7 +457,7 @@ jobs:
     # 演练：两组 npm 包照常组包，npm publish 只带 --dry-run（不上传）。没有 id-token 权限、不进
     # release 环境，拿不到任何发布凭据。
     if: github.event_name == 'workflow_dispatch'
-    needs: manifest
+    needs: [manifest, skills]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
@@ -470,6 +468,10 @@ jobs:
           pattern: release-bin-*
           path: artifacts
           merge-multiple: true
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: release-skills
+          path: artifacts
       - uses: actions/setup-node@v7.1.0
         with:
           node-version: 24
@@ -503,6 +505,13 @@ jobs:
         with:
           name: frontend-dist
           path: aproxy-desktop/dist
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: release-skills
+          path: artifacts
+      # 保留 crate 的文档路径，只多带原包的清单；工作副本的 LF 由 .gitattributes 保证。
+      - name: Include the verified skills manifest in the crate
+        run: unzip -p artifacts/aproxy-skills.zip manifest.json > .claude/skills/manifest.json
       - name: Install WebKitGTK
         run: |
           sudo apt-get update
@@ -540,7 +549,7 @@ jobs:
     # 演练：与 publish-crates 相同的打包与校验构建，只跑 cargo publish --dry-run（不上传）。没有
     # id-token 权限、不进 release 环境，拿不到任何发布凭据。
     if: github.event_name == 'workflow_dispatch'
-    needs: test
+    needs: skills
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
@@ -551,6 +560,13 @@ jobs:
         with:
           name: frontend-dist
           path: aproxy-desktop/dist
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: release-skills
+          path: artifacts
+      # 保留 crate 的文档路径，只多带原包的清单；工作副本的 LF 由 .gitattributes 保证。
+      - name: Include the verified skills manifest in the crate
+        run: unzip -p artifacts/aproxy-skills.zip manifest.json > .claude/skills/manifest.json
       - name: Install WebKitGTK
         run: |
           sudo apt-get update

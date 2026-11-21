@@ -50,7 +50,8 @@ impl JsonOutput {
                     aproxy::cli::SkillCmd::Install { json, .. } | aproxy::cli::SkillCmd::List { json },
             } => *json,
             Commands::Skill {
-                cmd: aproxy::cli::SkillCmd::Show { .. },
+                cmd:
+                    aproxy::cli::SkillCmd::Show { .. } | aproxy::cli::SkillCmd::VerifyPackage { .. },
             } => false,
             Commands::Stop { json, .. }
             | Commands::Restart { json, .. }

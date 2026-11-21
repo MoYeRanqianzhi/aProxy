@@ -56,6 +56,15 @@ pub(crate) async fn install(proxy: Option<&str>, json_output: bool) -> u8 {
 pub(crate) async fn run(cmd: SkillCmd) -> u8 {
     let home = aproxy_ipc::home::home();
     match cmd {
+        SkillCmd::VerifyPackage { archive, version } => {
+            match skills::archive::verify_package(&archive, &version) {
+                Ok(()) => EXIT_OK,
+                Err(e) => {
+                    eprintln!("{e}");
+                    EXIT_FAILED
+                }
+            }
+        }
         SkillCmd::Install {
             download_proxy,
             json,

@@ -15,7 +15,7 @@ const MISSING: &str =
     "skill 包缺少 manifest.json；0.2.0-alpha.4 及更早的发布版不带清单，请使用带清单的后续版本";
 
 /// 打包校验与安装共用解包器：目标目录须由调用者独占且为空。返回额外条目数供报告。
-pub fn unpack(zip: &Path, dest: &Path, version: &str) -> io::Result<(Manifest, usize)> {
+fn unpack(zip: &Path, dest: &Path, version: &str) -> io::Result<(Manifest, usize)> {
     let f = fs::File::open(zip)?;
     if f.metadata()?.len() > MAX_ARCHIVE {
         return Err(io::Error::other("skill 压缩包过大"));
@@ -149,9 +149,7 @@ pub(super) fn install(home: &Path, zip: &Path, version: &str) -> io::Result<(Man
     let root = home.join("skills");
     crate::fsx::create_dir_all(&root)?;
     super::installed::directory(&root)?;
-    let stage = tempfile::Builder::new()
-        .prefix(".staging-")
-        .tempdir_in(&root)?;
+    let stage = super::workspace(&root)?;
     let src = stage.path().join("incoming");
     fs::create_dir(&src)?;
     let (m, ignored) = unpack(zip, &src, version)?;
@@ -159,4 +157,18 @@ pub(super) fn install(home: &Path, zip: &Path, version: &str) -> io::Result<(Man
     let prev = super::installed::load(&root).ok();
     replace(&root, stage, &m, prev.as_ref())?;
     Ok((m, ignored))
+}
+
+/// 发布端与安装端使用同一个解包器；发布物不能带额外条目，所有正文都必须能按 UTF-8 阅读。
+pub fn verify_package(zip: &Path, version: &str) -> io::Result<()> {
+    let temp = super::workspace(&std::env::temp_dir())?;
+    let (m, ignored) = unpack(zip, temp.path(), version)?;
+    if ignored != 0 {
+        return Err(io::Error::other("skill 发布包含有未登记的条目"));
+    }
+    for key in m.files.keys() {
+        fs::read_to_string(temp.path().join(key))
+            .map_err(|_| io::Error::other("skill 正文不是 UTF-8 文本"))?;
+    }
+    Ok(())
 }

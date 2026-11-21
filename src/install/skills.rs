@@ -17,6 +17,18 @@ pub mod manifest;
 use super::download::{self, Artifact, DownloadCtx};
 use std::path::Path;
 
+/// 同卷独占的临时目录。Unix 不依赖用户的 umask，Windows 继承私有 home 的 ACL。
+fn workspace(parent: &Path) -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".staging-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir_in(parent)
+}
+
 /// 从下载开始直到发布完成一直持有独立的文件锁；进程退出后内核释放，不按 pid 猜测过期。
 fn skill_lock(home: &Path) -> Result<super::InstallLock, String> {
     let root = home.join("skills");
@@ -35,10 +47,7 @@ pub async fn install(
     home: &Path,
 ) -> Result<usize, super::InstallFailure> {
     let _lock = skill_lock(home)?;
-    let dl = tempfile::Builder::new()
-        .prefix(".staging-dl-")
-        .tempdir_in(home.join("skills"))
-        .map_err(|e| format!("skill 下载目录创建失败：{e}"))?;
+    let dl = workspace(&home.join("skills")).map_err(|e| format!("skill 下载目录创建失败：{e}"))?;
     let fetched = download::fetch_artifact(ctx, chain, Artifact::Skills, dl.path()).await?;
     let (manifest, ignored) = archive::install(home, &fetched.path, &ctx.version)
         .map_err(|e| format!("skill 安装失败：{e}"))?;
@@ -63,6 +72,9 @@ mod tests {
             .join("skills");
         let mut checked = 0;
         for dir in std::fs::read_dir(&skills).unwrap().flatten() {
+            if !dir.file_type().unwrap().is_dir() {
+                continue;
+            }
             let doc_path = dir.path().join("SKILL.md");
             let doc = std::fs::read_to_string(&doc_path).unwrap();
             let description = doc

@@ -398,6 +398,14 @@ pub struct InstallArgs {
 /// 文档的版本随二进制，不提供独立选版或切换通道的入口。
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 pub enum SkillCmd {
+    /// 发布前用实际解包和正文读取规则校验文档，不改用户的安装。
+    #[command(name = "__verify-package", hide = true)]
+    VerifyPackage {
+        /// 待核验的总包。
+        archive: PathBuf,
+        /// 发布者请求的精确版本。
+        version: String,
+    },
     /// 安装当前版本的 skill 文档；upgrade 执行同一操作
     #[command(visible_alias = "upgrade")]
     Install {

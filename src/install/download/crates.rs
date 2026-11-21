@@ -130,8 +130,7 @@ pub async fn fetch_build(
         Artifact::Binary => {}
         Artifact::Skills => {
             // skill 随 crate 分发：从 .crate 提取 .claude/skills/（include 白名单
-            // 打包进 .crate）——打 zip 供统一落位（skills::install_skill_dir
-            // 吃 zip）
+            // 打包进 .crate），只转换容器，再与其他来源一样按清单解包。
             return fetch_build_skills(ctx, dest).await;
         }
     }
@@ -178,47 +177,66 @@ pub async fn fetch_build(
     })
 }
 
-/// 从 .crate 提取全部 skill 打包成 zip（统一走 skills 落位）：遍历
-/// .claude/skills/ 下全部顶层目录，每 skill 自带自身名前缀——与
-/// skills::install_skill_dir 的多顶层落位形态一致。
+/// crate 保留原有文档路径，发布包把同一份清单放在它们旁边。只取普通文件，
+/// 不把 tar 里的任意路径或链接展开到磁盘，也不为没有清单的旧版临时签发清单。
 async fn fetch_build_skills(ctx: &DownloadCtx, dest: &Path) -> Result<Fetched, String> {
-    let work = dest.parent().unwrap().join("cargo-skill");
-    let _ = std::fs::remove_dir_all(&work);
-    let src = fetch_and_unpack_crate(ctx, &work).await?;
-    let skills_src = src.join(".claude").join("skills");
-    if !skills_src.is_dir() {
-        return Err("crate 内未找到 skill 文件（include 白名单未包含？）".to_string());
-    }
-    // 目录 → zip（每 skill 一个顶层前缀）
-    let f = std::fs::File::create(dest).map_err(|e| format!("zip 创建失败: {e}"))?;
-    let mut w = zip::ZipWriter::new(f);
-    let mut any = false;
-    for entry in std::fs::read_dir(&skills_src).map_err(|e| format!("skills 目录读取失败: {e}"))?
-    {
-        let p = entry
-            .map_err(|e| format!("skills 目录条目读取失败: {e}"))?
-            .path();
-        if !p.is_dir() {
-            continue;
-        }
-        any = true;
-        let name = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or("skill 目录名非法")?
-            .to_string();
-        add_skill_tree(&mut w, &p, &p, &name)?;
-    }
-    if !any {
-        return Err("crate 内 skills 目录为空（include 白名单未包含？）".to_string());
-    }
-    w.finish().map_err(|e| format!("zip 收尾失败: {e}"))?;
-    let sum = crate::install::staging::sha256_hex(dest)?;
+    let tgz = dest.with_extension("crate");
+    super::download_to(&ctx.client, &crate_url(&ctx.version), &tgz).await?;
+    let input = std::fs::File::open(tgz).map_err(|e| format!("crate 打开失败：{e}"))?;
+    let out = std::fs::File::create(dest).map_err(|e| format!("zip 创建失败：{e}"))?;
+    crate_skills_zip(input, out, &ctx.version).map_err(|e| format!("crate 文档读取失败：{e}"))?;
     Ok(Fetched {
         path: dest.to_path_buf(),
-        sha256: sum,
+        sha256: crate::install::staging::sha256_hex(dest)?,
         source: "cargo",
     })
+}
+
+/// 只转换容器，不改清单和文档的字节。从 tar 取原始路径名，不用本机的路径分隔符重拼。
+fn crate_skills_zip(
+    input: impl std::io::Read,
+    out: impl std::io::Write + std::io::Seek,
+    version: &str,
+) -> std::io::Result<()> {
+    use crate::install::skills::manifest::{MAX_FILE, MAX_FILES, MAX_MANIFEST, MAX_TOTAL};
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(input));
+    let prefix = format!("aproxy-{version}/.claude/skills/");
+    let mut zip = zip::ZipWriter::new(out);
+    let mut total = 0;
+    let mut count = 0;
+    for entry in tar.entries()? {
+        let mut entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path_bytes();
+        let Some(key) = path.strip_prefix(prefix.as_bytes()) else {
+            continue;
+        };
+        let key =
+            std::str::from_utf8(key).map_err(|_| std::io::Error::other("crate 文档路径无效"))?;
+        let limit = if key == "manifest.json" {
+            MAX_MANIFEST
+        } else {
+            MAX_FILE
+        };
+        count += 1;
+        if entry.size() > limit
+            || total + entry.size() > MAX_TOTAL + MAX_MANIFEST
+            || count > MAX_FILES + 1
+        {
+            return Err(std::io::Error::other("crate 文档数量或大小超限"));
+        }
+        total += entry.size();
+        zip.start_file(
+            key,
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )?;
+        std::io::copy(&mut entry, &mut zip)?;
+    }
+    zip.finish()?;
+    Ok(())
 }
 
 fn binary_name() -> &'static str {
@@ -229,38 +247,49 @@ fn binary_name() -> &'static str {
     }
 }
 
-/// 递归把 skill 目录树写入 zip（条目名带 skill 名前缀——与
-/// skills::install_skill_dir 的解包布局一致）。
-fn add_skill_tree(
-    w: &mut zip::ZipWriter<std::fs::File>,
-    base: &Path,
-    dir: &Path,
-    skill_name: &str,
-) -> Result<(), String> {
-    let rd = std::fs::read_dir(dir).map_err(|e| format!("skill 目录读取失败: {e}"))?;
-    for entry in rd.flatten() {
-        let p = entry.path();
-        let rel = p
-            .strip_prefix(base)
-            .map_err(|e| format!("skill 路径处理失败: {e}"))?;
-        if p.is_dir() {
-            add_skill_tree(w, base, &p, skill_name)?;
-        } else {
-            w.start_file(
-                format!("{skill_name}/{}", rel.display()),
-                zip::write::SimpleFileOptions::default(),
-            )
-            .map_err(|e| format!("zip 写入失败: {e}"))?;
-            let data = std::fs::read(&p).map_err(|e| format!("skill 文件读取失败: {e}"))?;
-            std::io::Write::write_all(w, &data).map_err(|e| format!("zip 写入失败: {e}"))?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// crate 的同名旁支与普通源码都不进文档包；清单和正文必须保留原始字节。
+    #[test]
+    fn crate_channel_preserves_the_shipped_manifest_and_bytes() {
+        use std::io::{Cursor, Read};
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for (name, body) in [
+            (".claude/skills/manifest.json", &b"original manifest"[..]),
+            (".claude/skills/s/SKILL.md", &b"text\r\n"[..]),
+            (".claude/skills-old/s/SKILL.md", b"skip"),
+            ("src/lib.rs", b"skip"),
+        ] {
+            let mut h = tar::Header::new_gnu();
+            h.set_mode(0o644);
+            h.set_size(body.len() as u64);
+            h.set_cksum();
+            tar.append_data(&mut h, format!("aproxy-1.0.0/{name}"), body)
+                .unwrap();
+        }
+        let data = tar.into_inner().unwrap().finish().unwrap();
+        let mut zip = Cursor::new(Vec::new());
+        crate_skills_zip(data.as_slice(), &mut zip, "1.0.0").unwrap();
+        let mut archive = zip::ZipArchive::new(zip).unwrap();
+        assert_eq!(archive.len(), 2);
+        for (key, want) in [
+            ("manifest.json", "original manifest"),
+            ("s/SKILL.md", "text\r\n"),
+        ] {
+            let mut s = String::new();
+            archive
+                .by_name(key)
+                .unwrap()
+                .read_to_string(&mut s)
+                .unwrap();
+            assert_eq!(s, want);
+        }
+    }
 
     /// 只认 [package.metadata.binstall] 本身的 pkg-url / pkg-fmt。按目标的 overrides（根
     /// Cargo.toml 给 musl 目标指向无界面资产的那两段）不在其中：它们给的是用户手里的

@@ -265,9 +265,7 @@ pub async fn fetch(
                 ));
             }
         }
-        // 解包提取：二进制在平台包 `bin/aproxy[.exe]`；skill 在主包
-        // `skills/aproxy-cli/`（tgz 提取是整目录树，此处取 zip 后整目录——
-        // 第 8 步接线；二进制为单文件直取）
+        // 平台包只提供二进制；skill 从主包提取整个 zip，留给清单解包器核对。
         match artifact {
             Artifact::Binary => {
                 let inner = if cfg!(windows) {
@@ -278,10 +276,7 @@ pub async fn fetch(
                 extract_from_tgz(&tgz_dest, inner, dest)?;
             }
             Artifact::Skills => {
-                // 主包内 skill 目录打的是**多 skill 总包** aproxy-skills.zip
-                // （与 GH release 总包同形：条目自带各 skill 顶层前缀；alpha.17
-                // 起取代单包 skills/aproxy-cli.zip——消费侧 install_skill_dir
-                // 已泛化为遍历顶层目录落位）。整 zip 提取后走统一落位。
+                // npm 路径沿用已发布的总包位置，不让旧安装器找不到它。
                 let inner = "skills/aproxy-skills.zip";
                 extract_from_tgz(&tgz_dest, inner, dest)?;
             }

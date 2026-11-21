@@ -21,7 +21,7 @@ cat <<EOF
 - **cargo-binstall**：\`cargo binstall aproxy\`（带界面的预编译产物）
 - **cargo（源码编译）**：\`cargo install aproxy --locked --root ~/.aproxy\`（带界面，Linux 先装 \`libwebkit2gtk-4.1-dev\`）；无界面加 \`--no-default-features\`
 - **发布清单**：\`aproxy-manifest.json\` 列出每个二进制的目标、变体、指令集档与 SHA256，\`aproxy install --force\` 按它挑选资产
-- **skill 文档**：\`aproxy-skills.zip\`（总包，含全部 skill：aproxy-cli / aproxy-format）/\`aproxy-skill-<名>.zip\`（单包）——install 自动随版本更新 skill，通常无需手动下载
+- **skill 文档**：\`aproxy-skills.zip\` 含全部文档及校验清单。安装二进制时自动更新；也可运行 \`aproxy skill install\` 单独更新。
 
 安装/升级推荐直接用 install 指令：\`aproxy install\`（自动选指令集档与变体，并滚动重启实例）。
 

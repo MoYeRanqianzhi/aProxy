@@ -76,7 +76,6 @@ npm_version_exists() {
 }
 
 cd "$(dirname "$0")/.."
-ROOT=$(pwd)
 
 # 组名（空 = 带界面的 aproxy 主组）与 --dry-run，顺序不限
 GROUP=""
@@ -204,23 +203,13 @@ if [ "$GROUP" != "format" ] && [ -f "npm/aproxy/README.md" ]; then
   sed "1s|.*|# ${PKG_SCOPE}|" "npm/aproxy/README.md" >"$main_dir/README.md"
 fi
 
-# skill 支线：两个 aproxy 组都带（format 组不携带 skill；install 的 npm 通道只从
-# @meowo/aproxy 主包提取，headless 组带着是给装了它的用户本地翻看）。打**一个多 skill 总包**
-# aproxy-skills.zip（与 GH release 总包同源同形——条目自带各 skill 顶层目录前缀，消费侧
-# install_skill_dir 泛化后按顶层目录逐个落位）。
+# 两个 aproxy 主包都携带同一份文档。这里有发布凭据，不执行下载来的程序；
+# 用相同输入重打总包，与只读发布任务已核验的产物逐字节比较。
 if [ "$GROUP" != "format" ]; then
-  mkdir -p "$main_dir/skills"
-  (
-    cd .claude/skills
-    names=""
-    for d in */; do
-      names="$names $(basename "$d")"
-    done
-    # zip 输出走仓库根绝对路径——相对路径会按 cd 后的 cwd 解析（alpha.10
-    # 首跑曾因 "../../" 指到 .claude/skills/npm/ 下而创建失败）
-    # shellcheck disable=SC2086
-    zip -qr "$ROOT/$main_dir/skills/aproxy-skills.zip" $names -x '*.zip'
-  )
+  if [ -n "${RELEASE_TAG:-}" ] && [ ! -f "$ASSET_DIR/aproxy-skills.zip" ]; then
+    gh release download "$RELEASE_TAG" -R MoYeRanqianzhi/aProxy -p aproxy-skills.zip -D "$ASSET_DIR"
+  fi
+  python3 .github/scripts/package-skills.py "$VERSION" "$main_dir/skills" --verified-archive "$ASSET_DIR/aproxy-skills.zip"
 fi
 
 opt_deps=""

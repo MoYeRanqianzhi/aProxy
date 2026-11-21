@@ -173,12 +173,12 @@ struct BodyInner {
     state: BodyState,
     /// 不会再有字节进来了
     complete: bool,
-    /// 线上原来的 content-encoding；没有编码时为 None
-    encoding: Option<Arc<str>>,
+    /// 入库时已替换凭据的 content-encoding；没有编码时为 None
+    encoding: Option<String>,
 }
 
 impl Body {
-    fn new(budget: &Arc<Budget>, encoding: Option<&str>) -> Arc<Body> {
+    fn new(budget: &Arc<Budget>, encoding: Option<String>) -> Arc<Body> {
         let disabled = budget.limit == 0;
         Arc::new(Body {
             budget: budget.clone(),
@@ -192,7 +192,7 @@ impl Body {
                     BodyState::Retained
                 },
                 complete: disabled,
-                encoding: encoding.map(Arc::from),
+                encoding,
             }),
         })
     }
@@ -221,7 +221,7 @@ impl Body {
 
     /// 体对象：`{"bytes","state","cause"?,"encoding"?}`。`same` 为真时状态写成
     /// `same_as_previous`（这次发出的体与上一次是同一份）。
-    fn view(&self, same: bool, secrets: &Secrets) -> Value {
+    fn view(&self, same: bool) -> Value {
         let inner = lock(&self.inner);
         let mut view = Map::new();
         let (state, cause) = match inner.state {
@@ -240,7 +240,7 @@ impl Body {
             view.insert("cause".into(), cause.as_str().into());
         }
         if let Some(encoding) = &inner.encoding {
-            view.insert("encoding".into(), secrets.replace(encoding).into());
+            view.insert("encoding".into(), encoding.clone().into());
         }
         Value::Object(view)
     }
@@ -324,7 +324,7 @@ pub struct BodyWriter {
     /// 密钥才换得掉。它里面从来没有一个完整的密钥
     carry: Vec<u8>,
     /// 带 content-encoding：先攒原始字节，结束时解码、替换，再入库
-    encoded: bool,
+    encoding: Option<Box<str>>,
     /// [`BodyWriter::feed_copy`] 正在填的一块（[`COPY_BLOCK`] 字节，取自空闲表）、已经填了
     /// 多少，以及它里面最早的字节是什么时候进来的
     block: Option<Box<[u8]>>,
@@ -531,7 +531,7 @@ impl BodyWriter {
         if self.dead || chunk.is_empty() {
             return;
         }
-        if self.encoded {
+        if self.encoding.is_some() {
             self.store([Some(chunk.clone()), None], false);
             return;
         }
@@ -655,7 +655,7 @@ impl BodyWriter {
             lock(&self.body.inner).complete = true;
             return;
         }
-        if self.encoded {
+        if self.encoding.is_some() {
             self.decode();
             return;
         }
@@ -667,20 +667,18 @@ impl BodyWriter {
     /// 把攒着的原始字节解码、替换密钥，再入库。解码放到阻塞线程池里：大的体要算一阵子，
     /// 不能占着运行时的工作线程，更不能让转发等它。
     fn decode(&mut self) {
-        let (raw, encoding) = {
+        let raw = {
             let mut inner = lock(&self.body.inner);
             if inner.state != BodyState::Retained {
                 inner.complete = true;
                 return;
             }
             // 原始字节拿出来解码；它们占的预算（held）先留着，解码完再换成解码后的大小
-            (
-                std::mem::take(&mut inner.chunks),
-                inner.encoding.clone().unwrap_or_else(|| Arc::from("")),
-            )
+            std::mem::take(&mut inner.chunks)
         };
         let history = self.history.clone();
         let body = self.body.clone();
+        let encoding = self.encoding.take().unwrap();
         let job = move || history.store_decoded(&body, &raw, &encoding);
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
@@ -1406,10 +1404,7 @@ impl History {
         let inner = lock(&record.inner);
         // 头入库时已经是 JSON 文本，记录也直接写成文本：整份明细按文本拼，不搭 JSON 树
         let body = |body: Option<&Arc<Body>>, same: bool| {
-            body.map_or_else(
-                || "null".to_string(),
-                |b| b.view(same, &self.secrets).to_string(),
-            )
+            body.map_or_else(|| "null".to_string(), |b| b.view(same).to_string())
         };
         let tries: Vec<String> = inner
             .tries
@@ -1541,19 +1536,21 @@ impl History {
     /// 新建一个体，挂到序号为 `seq` 的记录名下之前调用。
     fn new_body(&self, seq: u64, encoding: Option<&str>) -> Arc<Body> {
         self.evict_floor.fetch_min(seq, Ordering::AcqRel);
-        Body::new(&self.budget, encoding)
+        Body::new(
+            &self.budget,
+            encoding.map(|name| self.secrets.replace(name)),
+        )
     }
 
-    fn writer(self: &Arc<Self>, body: &Arc<Body>) -> Option<BodyWriter> {
+    fn writer(self: &Arc<Self>, body: &Arc<Body>, encoding: Option<&str>) -> Option<BodyWriter> {
         if self.budget.limit == 0 {
             return None;
         }
-        let encoded = lock(&body.inner).encoding.is_some();
         Some(BodyWriter {
             history: self.clone(),
             body: body.clone(),
             carry: Vec::new(),
-            encoded,
+            encoding: encoding.map(Into::into),
             block: None,
             filled: 0,
             block_since: Instant::now(),
@@ -1811,7 +1808,7 @@ impl Recorder {
         let live = self.0.as_ref()?;
         let body = live.history.new_body(live.record.seq, encoding);
         lock(&live.record.inner).request_body = Some(body.clone());
-        live.history.writer(&body)
+        live.history.writer(&body, encoding)
     }
 
     /// 客户端发来的请求体有多少字节（线上的）。
@@ -1883,7 +1880,7 @@ impl Recorder {
                     .or_else(|| inner.request_body.clone())
             } else {
                 let body = live.history.new_body(live.record.seq, encoding);
-                writer = live.history.writer(&body);
+                writer = live.history.writer(&body, encoding);
                 Some(body)
             };
             inner.phase = Phase::Attempting;
@@ -1972,7 +1969,7 @@ impl Recorder {
                 });
             }
         });
-        live.history.writer(&body)
+        live.history.writer(&body, encoding)
     }
 
     /// 第 `attempt` 次尝试结束了。`response_bytes` 是这次从上游收到的响应体字节数；
@@ -3255,6 +3252,11 @@ mod tests {
         );
         rec.request_shape(Some("model-client-token".into()), false);
         rec.request_body(Some("client-token"));
+        let body = lock(&history.find(&id(1)).unwrap().inner)
+            .request_body
+            .clone()
+            .unwrap();
+        assert_eq!(lock(&body.inner).encoding.as_deref(), Some("<secret>"));
         let sent = rec.sent_head("client-token", "/client-token", std::iter::empty());
         rec.try_started(1, sent.as_ref(), true, None);
         let diagnostic = json!({"reason":"bad client-token"});

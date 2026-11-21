@@ -38,6 +38,8 @@
     "allow-set-pinned",
     "allow-about",
     "allow-check-update",
-    "allow-install-update"
+    "allow-install-update",
+    "allow-read-autostart",
+    "allow-set-autostart"
   ]
 }

@@ -593,7 +593,7 @@ struct DesireArgs {
 #[tauri::command]
 pub(crate) async fn list_configs(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn UpdateOps>>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
 ) -> R<Vec<Choice>> {
     let _: Empty = args(&request)?;
     ops.list_configs().await
@@ -603,7 +603,7 @@ pub(crate) async fn list_configs(
 #[tauri::command]
 pub(crate) async fn start_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn UpdateOps>>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Run> {
     let a: TargetArgs = args(&request)?;
@@ -616,7 +616,7 @@ pub(crate) async fn start_instance(
 #[tauri::command]
 pub(crate) async fn stop_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn UpdateOps>>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<()> {
     let a: RunArgs = args(&request)?;
@@ -629,7 +629,7 @@ pub(crate) async fn stop_instance(
 #[tauri::command]
 pub(crate) async fn restart_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn UpdateOps>>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Run> {
     let a: RunArgs = args(&request)?;
@@ -642,7 +642,7 @@ pub(crate) async fn restart_instance(
 #[tauri::command]
 pub(crate) async fn force_stop_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn UpdateOps>>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<()> {
     let a: RunArgs = args(&request)?;
@@ -655,7 +655,7 @@ pub(crate) async fn force_stop_instance(
 #[tauri::command]
 pub(crate) async fn restore_instance(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn UpdateOps>>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Run> {
     let a: DesireArgs = args(&request)?;
@@ -668,7 +668,7 @@ pub(crate) async fn restore_instance(
 #[tauri::command]
 pub(crate) async fn forget_restore(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn UpdateOps>>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<()> {
     let a: DesireArgs = args(&request)?;
@@ -705,7 +705,7 @@ struct Switch {
 #[tauri::command]
 pub(crate) async fn read_config(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn UpdateOps>>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
 ) -> R<ConfigView> {
     let a: FileArg = args(&request)?;
     ops.read_config(a.target).await
@@ -715,7 +715,7 @@ pub(crate) async fn read_config(
 #[tauri::command]
 pub(crate) async fn validate_config(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn UpdateOps>>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
 ) -> R<Validation> {
     let a: ValidateArg = args(&request)?;
     ops.validate_config(a.target, a.changes).await
@@ -725,7 +725,7 @@ pub(crate) async fn validate_config(
 #[tauri::command]
 pub(crate) async fn write_config(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn UpdateOps>>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Saved> {
     let a: WriteArg = args(&request)?;
@@ -740,7 +740,7 @@ pub(crate) async fn write_config(
 #[tauri::command]
 pub(crate) async fn read_settings(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn UpdateOps>>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
 ) -> R<SettingsView> {
     let _: Empty = args(&request)?;
     ops.read_settings().await
@@ -750,7 +750,7 @@ pub(crate) async fn read_settings(
 #[tauri::command]
 pub(crate) async fn set_watchdog(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn UpdateOps>>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<bool> {
     let a: Switch = args(&request)?;
@@ -775,7 +775,7 @@ struct PinArgs {
 #[tauri::command]
 pub(crate) async fn read_desktop_state(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn UpdateOps>>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
 ) -> R<DesktopState> {
     let _: Empty = args(&request)?;
     ops.read_desktop_state().await
@@ -784,7 +784,7 @@ pub(crate) async fn read_desktop_state(
 #[tauri::command]
 pub(crate) async fn set_preferences(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn UpdateOps>>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Preferences> {
     let a: PrefArgs = args(&request)?;
@@ -796,7 +796,7 @@ pub(crate) async fn set_preferences(
 #[tauri::command]
 pub(crate) async fn set_pinned(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn UpdateOps>>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
     b: State<'_, Arc<Bridge>>,
 ) -> R<Vec<Bookmark>> {
     let a: PinArgs = args(&request)?;
@@ -835,7 +835,7 @@ pub(crate) async fn set_pinned(
 }
 /// 返回运行中二进制的版本，不从安装位置探测或联网。
 #[tauri::command]
-pub(crate) async fn about(request: Request<'_>, ops: State<'_, Arc<dyn UpdateOps>>) -> R<About> {
+pub(crate) async fn about(request: Request<'_>, ops: State<'_, Arc<dyn DesktopOps>>) -> R<About> {
     let _: Empty = args(&request)?;
     ops.about()
 }
@@ -854,7 +854,7 @@ struct InstallArg {
 #[tauri::command]
 pub(crate) async fn check_update(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn UpdateOps>>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
 ) -> R<UpdateInfo> {
     let a: UpdateArg = args(&request)?;
     ops.check_update(a.channel).await
@@ -863,7 +863,7 @@ pub(crate) async fn check_update(
 #[tauri::command]
 pub(crate) async fn install_update(
     request: Request<'_>,
-    ops: State<'_, Arc<dyn UpdateOps>>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
     b: State<'_, Arc<Bridge>>,
     app: tauri::AppHandle,
 ) -> R<InstallEnd> {
@@ -901,4 +901,23 @@ pub(crate) async fn install_update(
         })
         .await
         .map_err(|_| Fault::DesktopUnavailable {})?
+}
+
+/// 每次读取系统中本 home 的登记，不用本地偏好冒充系统开关。
+#[tauri::command]
+pub(crate) async fn read_autostart(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<Registration> {
+    let _: Empty = args(&request)?;
+    ops.read_autostart().await
+}
+/// 只设置或删除这一 home 的精确登记，不能指定命令、路径或系统位置。
+#[tauri::command]
+pub(crate) async fn set_autostart(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<Registration> {
+    let a: Switch = args(&request)?;
+    ops.set_autostart(a.enabled).await
 }

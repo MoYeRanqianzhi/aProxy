@@ -135,6 +135,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "windows-sys 0.52.0",
+ "winreg",
  "zip",
 ]
 

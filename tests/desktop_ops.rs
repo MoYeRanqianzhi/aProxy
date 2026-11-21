@@ -116,7 +116,7 @@ async fn explicit_home_control_keeps_the_selected_process_alive_on_identity_mism
 
 #[tokio::test]
 async fn window_operations_refuse_stale_choices_replaced_runs_and_responsive_force() {
-    use aproxy_ipc::desktop::{ChoiceKind, Fault, InstanceOps};
+    use aproxy_ipc::desktop::{ChoiceKind, Fault};
     let home = TestHome::new();
     home.settings(r#"{"watchdog":{"enabled":false},"aliases":{"primary":"unused"}}"#);
     let file = home.path().join("config.toml");
@@ -126,7 +126,7 @@ async fn window_operations_refuse_stale_choices_replaced_runs_and_responsive_for
     )
     .unwrap();
     let host = DesktopHome::new(home.path().into(), env!("CARGO_BIN_EXE_aproxy").into()).unwrap();
-    let ops: &dyn InstanceOps = &host;
+    let ops: &dyn aproxy_ipc::desktop::DesktopOps = &host;
     let first = ops.list_configs().await.unwrap();
     let stale = first[0].target.clone();
     let fresh = ops.list_configs().await.unwrap();
@@ -592,4 +592,110 @@ fn hidden_login_restore_uses_the_argument_home_and_refuses_relative_paths() {
             .unwrap()
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn registration_reads_actual_per_home_slot_and_never_overwrites_a_foreign_entry() {
+    use aproxy_ipc::desktop::{DesktopOps, Fault, RegistrationIssue, RegistrationReason};
+    let home = TestHome::new();
+    let other = TestHome::new();
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes).unwrap();
+    let slot = bytes.iter().map(|n| format!("{n:02x}")).collect::<String>();
+    let service = |h: &TestHome| {
+        DesktopHome::new(h.path().into(), env!("CARGO_BIN_EXE_aproxy").into())
+            .unwrap()
+            .with_isolated_login_slot(&slot)
+            .unwrap()
+    };
+    let h = service(&home);
+    let b = service(&other);
+    #[cfg(windows)]
+    let (key, _guard) = {
+        use winreg::{RegKey, enums::HKEY_CURRENT_USER};
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let result = RegKey::predef(HKEY_CURRENT_USER).delete_subkey(&self.0);
+                if !std::thread::panicking() {
+                    result.unwrap()
+                }
+            }
+        }
+        let sub = format!(r"Software\aProxy-test-{slot}");
+        let hk = RegKey::predef(HKEY_CURRENT_USER);
+        assert!(hk.open_subkey(&sub).is_err());
+        let (k, _) = hk.create_subkey(&sub).unwrap();
+        (k, Cleanup(sub))
+    };
+    assert_eq!(
+        h.read_autostart().await.unwrap().issue,
+        Some(RegistrationIssue::BinaryMissing)
+    );
+    assert!(matches!(
+        h.set_autostart(true).await,
+        Err(Fault::DesktopRegistration {
+            reason: RegistrationReason::BinaryMissing
+        })
+    ));
+    for t in [&home, &other] {
+        let exe = aproxy::install::swap::bin_path_in(t.path());
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(exe, "inert installed marker").unwrap();
+    }
+    assert!(!h.read_autostart().await.unwrap().enabled);
+    assert!(h.set_autostart(true).await.unwrap().enabled);
+    #[cfg(windows)]
+    let (n, original) = {
+        let (n, _) = key.enum_values().next().unwrap().unwrap();
+        let text: String = key.get_value(&n).unwrap();
+        assert!(text.contains("restore-at-login --home \""));
+        assert!(!text.contains("APROXY_HOME"));
+        assert!(text.contains("aproxy.exe\""));
+        (n, text)
+    };
+    #[cfg(unix)]
+    let (file, original) = {
+        let d = home.path().join(format!("login-test-{slot}"));
+        let f = std::fs::read_dir(d)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert!(text.contains("restore-at-login") && !text.contains("APROXY_HOME"));
+        (f, text)
+    };
+    assert!(!b.read_autostart().await.unwrap().enabled);
+    assert!(b.set_autostart(true).await.unwrap().enabled);
+    #[cfg(windows)]
+    key.set_value(&n, &"unrelated content").unwrap();
+    #[cfg(unix)]
+    std::fs::write(&file, "unrelated content").unwrap();
+    assert_eq!(
+        h.read_autostart().await.unwrap().issue,
+        Some(RegistrationIssue::EntryMismatch)
+    );
+    assert!(matches!(
+        h.set_autostart(false).await,
+        Err(Fault::DesktopRegistration {
+            reason: RegistrationReason::EntryMismatch
+        })
+    ));
+    #[cfg(windows)]
+    key.set_value(&n, &original).unwrap();
+    #[cfg(unix)]
+    std::fs::write(&file, &original).unwrap();
+    let exe = aproxy::install::swap::bin_path_in(home.path());
+    std::fs::remove_file(exe).unwrap();
+    assert_eq!(
+        h.read_autostart().await.unwrap().issue,
+        Some(RegistrationIssue::BinaryMissing)
+    );
+    assert!(!h.set_autostart(false).await.unwrap().enabled);
+    assert!(b.read_autostart().await.unwrap().enabled);
+    assert!(!b.set_autostart(false).await.unwrap().enabled);
+    #[cfg(windows)]
+    assert_eq!(key.enum_values().count(), 0);
 }

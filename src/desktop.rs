@@ -1,6 +1,7 @@
 //! 绑定单个主目录的桌面业务逻辑。私有文件只在宿主侧打开，界面只见字段投影与不透明令牌。
 mod forms;
 mod instances;
+mod login;
 mod state;
 mod update;
 use crate::{config, settings, spec};
@@ -24,6 +25,7 @@ pub struct DesktopHome {
     display_home: String,
     key: [u8; 32],
     exe: PathBuf,
+    login_test_slot: Option<String>,
     updates: Arc<std::sync::Mutex<update::Checks>>,
     listing: Arc<std::sync::Mutex<Option<[u8; 16]>>>,
 }
@@ -40,6 +42,7 @@ impl DesktopHome {
             home,
             key,
             exe,
+            login_test_slot: None,
             listing: Default::default(),
             updates: Default::default(),
         };

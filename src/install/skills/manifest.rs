@@ -14,8 +14,6 @@ pub const MAX_FILE: u64 = 1 << 20;
 pub const MAX_TOTAL: u64 = 16 << 20;
 /// 清单本身也来自外部；解析 JSON 前先限制字节数。
 pub const MAX_MANIFEST: u64 = 256 << 10;
-/// 正常文档不需要极端压缩比，拒绝这种输入可以减少无用的解压工作。
-pub(super) const MAX_RATIO: u64 = 200;
 /// 安装的提交标记，包内与本地都在根目录下。
 pub(super) const MARKER: &str = "manifest.json";
 

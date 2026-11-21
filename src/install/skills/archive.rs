@@ -1,6 +1,6 @@
 //! 先在独占的同卷目录中展开整个白名单；公开目录直到最后才变动，清单最后落位。
 
-use super::manifest::{MARKER, MAX_MANIFEST, MAX_RATIO, Manifest};
+use super::manifest::{MARKER, MAX_MANIFEST, Manifest};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -81,9 +81,13 @@ fn check_entry<R: Read>(entry: &zip::read::ZipFile<'_, R>, limit: u64) -> io::Re
     if !entry.is_file()
         || !matches!(kind, 0 | 0o100000)
         || entry.size() > limit
-        || entry.size() > entry.compressed_size().saturating_mul(MAX_RATIO)
+        // 打包器只写 stored；数据长度就是占用的字节数，不依赖压缩头声称的比值。
+        || entry.compression() != zip::CompressionMethod::Stored
+        || entry.size() != entry.compressed_size()
     {
-        return Err(io::Error::other("skill 包条目的类型、大小或压缩比不合要求"));
+        return Err(io::Error::other(
+            "skill 包条目的类型、大小或压缩方式不合要求",
+        ));
     }
     Ok(())
 }

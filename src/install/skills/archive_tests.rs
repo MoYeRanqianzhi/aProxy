@@ -32,8 +32,8 @@ pub(super) fn manifest_for(files: &[(&str, &[u8])]) -> Value {
 pub(super) fn package(home: &Path, manifest: Option<&Value>, files: &[(&str, &[u8])]) -> PathBuf {
     let path = home.join("test.zip");
     let mut w = zip::ZipWriter::new(fs::File::create(&path).unwrap());
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     if let Some(m) = manifest {
         w.start_file(MARKER, opts).unwrap();
         w.write_all(&serde_json::to_vec(m).unwrap()).unwrap();
@@ -174,10 +174,10 @@ fn rejected_archives_do_not_change_installation() {
     }
     let repeated = vec![b'a'; MAX_FILE as usize];
     let large = [("s/f", repeated.as_slice())];
-    let zip = package(home, Some(&manifest_for(&large)), &large);
-    assert!(archive::install(home, &zip, "1.0.0").is_err());
     assert_eq!(fs::read(home.join("skills/manifest.json")).unwrap(), marker);
     assert_eq!(fs::read(home.join("skills").join(f[0].0)).unwrap(), f[0].1);
+    let zip = package(home, Some(&manifest_for(&large)), &large);
+    archive::install(home, &zip, "1.0.0").unwrap();
 }
 /// zip 内的链接不应当变成正文，即使链接文本的长度、摘要都与清单一致。
 #[test]
@@ -185,7 +185,8 @@ fn zip_symlink_is_not_a_document() {
     let h = tempfile::tempdir().unwrap();
     let zip = h.path().join("link.zip");
     let mut w = zip::ZipWriter::new(fs::File::create(&zip).unwrap());
-    let opts = zip::write::SimpleFileOptions::default();
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     w.start_file(MARKER, opts).unwrap();
     w.write_all(&serde_json::to_vec(&manifest_for(&[("s/a", b"target")])).unwrap())
         .unwrap();
@@ -350,4 +351,33 @@ fn member_names_agree_and_are_unique() {
             "skill 压缩包无效"
         );
     }
+}
+
+/// 即使解压结果与清单完全相符也不能接受打包器不写的压缩格式。
+#[test]
+fn deflate_not_accepted_for_verified_document() {
+    let h = tempfile::tempdir().unwrap();
+    let path = h.path().join("test.zip");
+    let mut w = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+    let opts = zip::write::SimpleFileOptions::default();
+    w.start_file(
+        MARKER,
+        opts.compression_method(zip::CompressionMethod::Stored),
+    )
+    .unwrap();
+    w.write_all(&serde_json::to_vec(&manifest_for(&[("s/a", b"a")])).unwrap())
+        .unwrap();
+    w.start_file(
+        "s/a",
+        opts.compression_method(zip::CompressionMethod::Deflated),
+    )
+    .unwrap();
+    w.write_all(b"a").unwrap();
+    w.finish().unwrap();
+    assert!(
+        archive::install(h.path(), &path, "1.0.0")
+            .unwrap_err()
+            .to_string()
+            .contains("压缩方式")
+    );
 }

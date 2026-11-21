@@ -20,7 +20,8 @@ const DOCS: [(&str, &str); 3] = [
 /// 独立组包，既能正常回包，也能在发送正文之前暂停镜像请求。
 fn archive(version: &str) -> Vec<u8> {
     let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let opts = zip::write::SimpleFileOptions::default();
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     let mut files = json!({});
     for (key, text) in DOCS {
         w.start_file(key, opts).unwrap();

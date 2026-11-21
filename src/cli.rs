@@ -361,7 +361,8 @@ pub struct InstallArgs {
     pub no_skills: bool,
 
     /// 只安装与当前二进制同版本的 skill；保留已发布安装器给用户的命令行。
-    #[arg(long, hide = true, conflicts_with_all = ["from", "adopt", "abort"])]
+    /// 旧入口与 --json 同用仍按参数错误退出（2）；文档结果请用 skill install --json。
+    #[arg(long, hide = true, conflicts_with_all = ["from", "adopt", "abort", "continue_", "handover_from"])]
     pub skills_only: bool,
 
     /// 只查询 install 会装哪个版本：打印当前版本、通道里的最新版本与有没有更新，

@@ -271,3 +271,22 @@ async fn binary_and_standalone_install_share_the_download_lock() {
         DOCS[0].1.as_bytes()
     );
 }
+
+/// 文档别名不能进入二进制续作流程，即使完整提供了交接参数也在解析时拒绝。
+#[test]
+fn alias_conflicts_with_binary_continuation() {
+    for extra in [
+        vec!["--continue"],
+        vec!["--continue", "--handover-from", "42"],
+        vec!["--handover-from", "42"],
+    ] {
+        let err = aproxy::cli::command_tree()
+            .try_get_matches_from(
+                ["aproxy", "install", "--skills-only"]
+                    .into_iter()
+                    .chain(extra),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+}

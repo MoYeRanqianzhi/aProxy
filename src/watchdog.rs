@@ -16,7 +16,10 @@
 
 use crate::process::{RecordIdentity, record_identity};
 use crate::settings;
-use serde::{Deserialize, Serialize};
+pub use aproxy_ipc::registry::{
+    FRESH_FLOOR_SECS, KIND_CRASH, KIND_HANG, RECORD_SCHEMA, RESTARTS_KEPT, RestartEvent,
+    WatchdogRecord, record_path_in,
+};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -24,110 +27,19 @@ use std::time::Duration;
 // 看护者记录：看护者在任的真相源
 // ---------------------------------------------------------------------------
 
-/// 看护者记录的 schema。读到更高的 schema 时不解读内容（见 [`RecordRead::Unreadable`]）。
-pub const RECORD_SCHEMA: u32 = 1;
-/// 记录里保留最近多少次重拉。
-pub const RESTARTS_KEPT: usize = 20;
-/// 重拉的起因：进程自己没了（崩溃、被信号结束、被强杀）。
-pub const KIND_CRASH: &str = "crash";
-/// 重拉的起因：进程还在、却不再调度（心跳过期且控制端点不应答），被看护者结束。
-pub const KIND_HANG: &str = "hang";
-/// 「最近一次扫描」早于这么久（秒）之前，才可能算看护者假死，不管扫描周期设得多短。
-/// 看护者的一个步进周期里可能要等重拉出来的实例就绪（每个最多
-/// [`crate::spawn::READY_TIMEOUT`]），窗口比这短的话，正忙着重拉的看护者会被当成假死、
-/// 在重拉途中被接管者结束。
-pub const FRESH_FLOOR_SECS: u64 = 90;
-
-/// 一次重拉。
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct RestartEvent {
-    /// 实例的端口
-    pub port: u16,
-    /// 重拉结束的时刻（Unix 毫秒）
-    pub at: u64,
-    /// 起因，[`KIND_CRASH`] 或 [`KIND_HANG`]（词表只增）
-    pub kind: String,
-    /// 实例有没有起来
-    pub ok: bool,
-}
-
-/// 看护者记录（`run/watchdog.json`，一行 JSON）：谁在任、多久扫一次、最近一次扫描在什么
-/// 时候、最近重拉过谁。在任的看护者每个步进周期整份重写它；别的进程据此判断有没有看护者
-/// 在任（见 [`watchdog_in_effect_in`]），status 与界面据此展示。
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct WatchdogRecord {
-    /// 恒为 [`RECORD_SCHEMA`]
-    pub schema: u32,
-    pub pid: u32,
-    /// 看护者进程的启动标记（台账用的同一个，见 [`aproxy_ipc::ledger::start_marker`]）：pid
-    /// 被别的进程复用之后标记必然不同。读不到标记的平台记空串，这时只能按 pid 判断。
-    pub start: String,
-    /// 看护者自己的版本（不带 v）
-    pub version: String,
-    /// 扫描周期（秒）。读者按它算新鲜窗口，不按自己的 settings：看护者启动之后周期不变，
-    /// 而 settings 可能已经被改过
-    pub heartbeat_secs: u64,
-    /// 看护者开始看护的时刻（Unix 毫秒）
-    pub created_at: u64,
-    /// 最近一次步进周期结束的时刻（Unix 毫秒）
-    pub last_scan_at: u64,
-    /// 最近 [`RESTARTS_KEPT`] 次重拉，旧的在前
-    #[serde(default)]
-    pub restarts: Vec<RestartEvent>,
-}
-
-impl WatchdogRecord {
-    /// 本进程的记录：刚开始看护，还没重拉过谁。
-    pub fn for_current_process(heartbeat_secs: u64) -> Self {
-        let pid = std::process::id();
-        let now = now_millis();
-        Self {
-            schema: RECORD_SCHEMA,
-            pid,
-            start: aproxy_ipc::ledger::start_marker(pid).unwrap_or_default(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            heartbeat_secs,
-            created_at: now,
-            last_scan_at: now,
-            restarts: Vec::new(),
-        }
-    }
-
-    /// 两份记录是不是同一个看护者进程写的。
-    pub fn same_owner(&self, other: &Self) -> bool {
-        self.pid == other.pid && self.start == other.start
-    }
-
-    /// 写下这份记录的进程是否还在：pid 现在的启动标记与记录一致，并且没有退出。记录里
-    /// 没有标记（平台读不到）时只看这个 pid 上的进程有没有退出。
-    pub fn owner_alive(&self) -> bool {
-        if crate::process::process_exited(self.pid) == Some(true) {
-            return false;
-        }
-        self.start.is_empty()
-            || aproxy_ipc::ledger::start_marker(self.pid).as_deref() == Some(self.start.as_str())
-    }
-
-    /// 最近一次扫描是否还算新鲜：距今不超过三个扫描周期（且不短于 [`FRESH_FLOOR_SECS`]）。
-    pub fn is_fresh(&self, now_ms: u64) -> bool {
-        let window_secs = self.heartbeat_secs.saturating_mul(3).max(FRESH_FLOOR_SECS);
-        now_ms.saturating_sub(self.last_scan_at) <= window_secs.saturating_mul(1000)
-    }
-
-    /// 结束这份记录的属主要用的台账条目：结束进程一律走台账的「核验 pid + 启动标记之后
-    /// 结束」（[`aproxy_ipc::ledger::terminate`]），这里只是把记录里的身份填进它要的形状。
-    fn as_ledger_entry(&self) -> aproxy_ipc::ledger::LedgerEntry {
-        aproxy_ipc::ledger::LedgerEntry {
-            ledger: aproxy_ipc::ledger::LEDGER_FORMAT,
-            pid: self.pid,
-            start: self.start.clone(),
-            role: aproxy_ipc::ledger::ROLE_WATCHDOG.to_string(),
-            version: self.version.clone(),
-            port: None,
-            label: None,
-            exe: None,
-            config: None,
-        }
+/// 结束这份记录的属主要用的台账条目：结束进程一律走台账的「核验 pid + 启动标记之后
+/// 结束」（[`aproxy_ipc::ledger::terminate`]），这里只是把记录里的身份填进它要的形状。
+fn as_ledger_entry(record: &WatchdogRecord) -> aproxy_ipc::ledger::LedgerEntry {
+    aproxy_ipc::ledger::LedgerEntry {
+        ledger: aproxy_ipc::ledger::LEDGER_FORMAT,
+        pid: record.pid,
+        start: record.start.clone(),
+        role: aproxy_ipc::ledger::ROLE_WATCHDOG.to_string(),
+        version: record.version.clone(),
+        port: None,
+        label: None,
+        exe: None,
+        config: None,
     }
 }
 
@@ -142,11 +54,6 @@ pub enum RecordRead {
     /// 进程刚建出、还没写完的文件。读不懂就不解读、也不覆盖，只按文件的修改时间判断它
     /// 新不新鲜。`age_secs` 是文件距上次修改的秒数，读不到修改时间为 None
     Unreadable { age_secs: Option<u64> },
-}
-
-/// 看护者记录的路径（run_dir 注入，测试绝不读写真实 run/）
-pub fn record_path_in(run_dir: &Path) -> PathBuf {
-    run_dir.join("watchdog.json")
 }
 
 /// 读看护者记录。
@@ -1280,7 +1187,7 @@ pub async fn serve(cfg: WatchdogConfig) {
                     old.pid
                 ),
             );
-            let entry = old.as_ledger_entry();
+            let entry = as_ledger_entry(&old);
             let outcome = tokio::task::spawn_blocking(move || {
                 aproxy_ipc::ledger::terminate(&entry, Duration::from_secs(5))
             })

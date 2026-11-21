@@ -7,25 +7,13 @@
 //! - **创建时间**（数字；Windows 为 FILETIME，unix 为 /proc/<pid>/stat 的 starttime）：只给
 //!   「刚拉起、还没写下任何记录的子进程」与安装状态用。
 
+pub use aproxy_ipc::registry::{RecordIdentity, process_exited, record_identity};
 use std::path::PathBuf;
 
 /// 查询进程创建时间（FILETIME/滴答）；进程不存在返回 None。
 /// 供 spawn 前登记与收养时建立身份基线。
 pub fn process_start_time(pid: u32) -> Option<u64> {
     imp_process::process_start_time(pid)
-}
-
-/// 进程是否已退出（终止确认）。与 `process_start_time(pid).is_none()` 的
-/// 本质区别：进程终止后只要还有任何句柄（Rust 的 Child、看门狗的 sync
-/// handle、调试器）维持内核对象，OpenProcess 就依然成功、start_time 查询
-/// 依旧返回原值——「停止后等进程终止」场景（install 滚动重启）用 start_time
-/// 判死会永远等不到。本原语查退出码（Windows）/进程态（unix），句柄存在
-/// 不影响结论。
-///
-/// 返回 None = 无法判定（进程对象已彻底回收后 OpenProcess 失败 → Some(true)；
-/// 权限不足等 → None，调用方保守处理）。
-pub fn process_exited(pid: u32) -> Option<bool> {
-    imp_process::process_exited(pid)
 }
 
 /// 进程镜像的完整路径（install 管辖检查用：实例 exe 是否在 ~/.aproxy/bin/
@@ -35,58 +23,6 @@ pub fn process_exited(pid: u32) -> Option<bool> {
 /// record_identity（pid + 创建时间），与二进制路径/名称无关。
 pub fn process_image_path(pid: u32) -> Option<PathBuf> {
     imp_process::process_image_path(pid)
-}
-
-// ---------------------------------------------------------------------------
-// 进程身份：pid + 进程创建时间戳（与二进制名称无关）
-// ---------------------------------------------------------------------------
-//
-// 身份问的是「这个 pid 现在是不是写下这条记录的那个进程」，由归属关系决定，
-// 与二进制叫什么无关（用户定调：名称判断是严重谬误——官方 Release 资产名
-// 本身就是 aproxy-<target>(.exe)，改名部署是合法形态；冒名进程改名即可绕过
-// 名称比对，它对安全零贡献）。项目里可用的锚点有三个：
-// 1. spawn 链：看护者亲手 spawn 并等到就绪的 pid 直接可信；
-// 2. IPC 端点归属：应答 `<端口>` 端点 ping、且自报 pid 与记录一致的进程，
-//    就是该端口的实例——但挂死实例不应答，所以它不能作为判据；
-// 3. 启动标记：实例注册时把自己的启动标记写进实例记录（InstanceRecord.start），看护者
-//    记录同理。pid 被复用后新进程的标记必然不同，比对它就能把「同一个进程」钉死，且
-//    不需要对方应答（挂死实例同样可判）。
-
-/// 一条记录（pid + 登记的启动标记）在当前系统上的身份核验结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecordIdentity {
-    /// 记录的进程仍在运行：现算的启动标记与登记值一致
-    Alive,
-    /// 该 pid 当前有在运行的进程，但启动标记与登记值不符：pid 已被系统
-    /// 回收后复用，记录的进程早已死亡
-    Reused,
-    /// 该 pid 当前没有在运行的进程（不存在、已退出未回收的 zombie、或只剩
-    /// 被句柄维持的已退出进程对象）
-    Gone,
-}
-
-/// 核验记录身份：`recorded_start` 为记录登记的启动标记。
-/// 「已退出但进程对象仍在」（unix zombie、Windows 被句柄维持的已退出对象）
-/// 一律算 Gone——它们的标记仍算得出且与登记一致，但进程已死，不能计入
-/// 选举的存活集合，也不该被收养或处决。
-///
-/// 空的登记值不是可比对的锚点（平台算不出标记时登记的就是空串）：这样的
-/// 记录证明不了任何进程是它，同样算 Gone——不计入选举、不收养、不处决。
-pub fn record_identity(pid: u32, recorded_start: &str) -> RecordIdentity {
-    if recorded_start.is_empty() {
-        return RecordIdentity::Gone;
-    }
-    let Some(actual) = aproxy_ipc::ledger::start_marker(pid) else {
-        return RecordIdentity::Gone;
-    };
-    if process_exited(pid) == Some(true) {
-        return RecordIdentity::Gone;
-    }
-    if actual == recorded_start {
-        RecordIdentity::Alive
-    } else {
-        RecordIdentity::Reused
-    }
 }
 
 /// 核验后终止：仅当 pid 当前对应进程的启动标记 == `expected_start` 时强制结束它，并等它
@@ -304,7 +240,7 @@ mod imp {
             }
             Some(_) => {}
         }
-        if super::imp_process::process_exited(pid) == Some(true) {
+        if super::process_exited(pid) == Some(true) {
             return Err(format!("pid {pid} 已退出"));
         }
         let r = unsafe { kill(pid as i32, 9) };
@@ -362,32 +298,6 @@ mod imp_process {
         Some(creation as u64)
     }
 
-    /// 进程是否已退出：OpenProcess + GetExitCodeProcess。退出后即使进程
-    /// 对象被其他句柄（Rust Child 等）维持，退出码也已确定——终止确认的
-    /// 唯一可靠判据（start_time 查询在对象被引用期间会误报存活）。
-    /// OpenProcess 失败（对象已彻底回收）= 已退出 → Some(true)。
-    pub fn process_exited(pid: u32) -> Option<bool> {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
-        unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if handle == 0 {
-                return Some(true);
-            }
-            let mut code: u32 = 0;
-            let ok = GetExitCodeProcess(handle, &mut code);
-            let _ = CloseHandle(handle);
-            if ok == 0 {
-                return None;
-            }
-            // STILL_ACTIVE(259) = 未退出；注意退出码恰为 259 的进程无法区分
-            // （Windows 文档明示的固有局限）——本仓库进程不用 259 作退出码
-            Some(code != 259)
-        }
-    }
-
     /// 进程镜像完整路径（QueryFullProcessImageNameW）。
     pub fn process_image_path(pid: u32) -> Option<std::path::PathBuf> {
         use windows_sys::Win32::Foundation::CloseHandle;
@@ -427,38 +337,6 @@ mod imp_process {
         let after = stat.rsplit(')').next()?;
         let fields: Vec<&str> = after.split_whitespace().collect();
         fields.get(19)?.parse().ok()
-    }
-
-    /// 进程是否已退出：/proc/<pid>/stat 的进程态——'Z'（zombie，已退出未
-    /// 收割）与文件不存在（已收割）都算已退出。macOS 无 /proc 回退
-    /// kill(pid,0)：ESRCH = 已退出；EPERM = 活着（权限拒绝但存在）。
-    #[cfg(not(target_os = "macos"))]
-    pub fn process_exited(pid: u32) -> Option<bool> {
-        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => {
-                // comm 可含空格与括号，取最后一个 ')' 之后的首字段为 state
-                let after = stat.rsplit(')').next()?;
-                let state = after.split_whitespace().next()?;
-                Some(state == "Z")
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(true),
-            Err(_) => None,
-        }
-    }
-
-    /// macOS 没有 procfs；信号 0 只查询正 pid 的存在性。这里只认 ESRCH 为已退出，
-    /// EPERM 说明进程仍在；未收割的僵尸要等父进程收割之后才能观察到退出。
-    #[cfg(target_os = "macos")]
-    pub fn process_exited(pid: u32) -> Option<bool> {
-        let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
-        if unsafe { libc::kill(pid, 0) } == 0 {
-            return Some(false);
-        }
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) => Some(true),
-            Some(libc::EPERM) => Some(false),
-            _ => None,
-        }
     }
 
     /// 进程镜像完整路径：/proc/<pid>/exe readlink。进程已死（ENOENT，含

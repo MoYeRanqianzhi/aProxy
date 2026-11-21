@@ -184,7 +184,7 @@ impl TestHome {
             .home
             .join("logs")
             .join(format!("test-{}-{seq}.log", std::process::id()));
-        let mut spec = aproxy::spec::InstanceSpec::capture(
+        let mut spec = aproxy::spec::capture(
             Some(cfg.as_ref()),
             aproxy::config::Overrides::default(),
             &log_path,

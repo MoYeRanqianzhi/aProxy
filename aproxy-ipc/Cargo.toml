@@ -19,7 +19,7 @@ include = ["/src/**", "/Cargo.toml"]
 # 依赖刻意保持很少：本包会被 aproxy 本体、桌面界面与第三方的客户端一起链接，这里每多一个
 # 依赖，它们的编译闭包就都多一个。新增依赖之前先看能不能用标准库写。
 [features]
-client = ["dep:tokio", "serde_json/preserve_order", "windows-sys/Win32_System_Pipes"]
+client = ["dep:tokio", "dep:futures-util", "serde_json/preserve_order", "windows-sys/Win32_System_Pipes"]
 # 只使用 IPC、台账或脱敏的客户端不必链接配置解析器。
 config-file = ["dep:toml_edit", "dep:regex"]
 
@@ -27,6 +27,7 @@ config-file = ["dep:toml_edit", "dep:regex"]
 body-inspection = ["dep:flate2", "dep:brotli-decompressor", "dep:ruzstd"]
 
 [dependencies]
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["alloc"] }
 tokio = { version = "1", features = ["net", "io-util", "time", "rt", "sync"], optional = true }
 flate2 = { version = "1", optional = true }
 # 响应体检查用解码器（src/decode.rs）：把压缩响应解出一份副本供「错误判定 +

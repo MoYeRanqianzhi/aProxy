@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use aproxy::config::Overrides;
 use aproxy::spawn::{READY_TIMEOUT, SpawnError, spawn_from_spec};
-use aproxy::spec::InstanceSpec;
+use aproxy::spec;
 
 #[tokio::test(flavor = "current_thread")]
 async fn spawn_from_spec_reports_an_early_exit_at_once_and_waits_for_a_healthy_instance() {
@@ -27,7 +27,7 @@ async fn spawn_from_spec_reports_an_early_exit_at_once_and_waits_for_a_healthy_i
     //    会在拉起之前就拦下这个错误，这里直接调用库函数绕过父进程的检查）
     let missing = home.path().join("missing-config.toml");
     let log_path = home.path().join("logs").join("spawn-test.log");
-    let spec = InstanceSpec::capture(Some(&missing), Overrides::default(), &log_path);
+    let spec = spec::capture(Some(&missing), Overrides::default(), &log_path);
     let started = Instant::now();
     let err = spawn_from_spec(home.path(), exe, &spec, READY_TIMEOUT)
         .await
@@ -62,7 +62,7 @@ async fn spawn_from_spec_reports_an_early_exit_at_once_and_waits_for_a_healthy_i
         api_key: Some("sk-SPAWNTESTSECRET-0123456789".to_string()),
         ..Overrides::default()
     };
-    let spec = InstanceSpec::capture(Some(&cfg), overrides, &log_path);
+    let spec = spec::capture(Some(&cfg), overrides, &log_path);
     let live = spawn_from_spec(home.path(), exe, &spec, READY_TIMEOUT)
         .await
         .expect("正常的配置应能就绪");

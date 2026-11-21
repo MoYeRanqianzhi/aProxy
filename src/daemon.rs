@@ -22,17 +22,14 @@ pub use aproxy_ipc::client::{
 };
 #[cfg(test)]
 use aproxy_ipc::client::{parse_reply, request_raw};
+pub use aproxy_ipc::registry::{
+    INSTANCE_FILE_SUFFIX, INSTANCE_SCHEMA, InstanceFile, InstanceSurvey, instance_file_path_in,
+    list_instances_in, now_millis, parse_instance_file, port_of, read_instance_file_in,
+    read_instance_record, registry_contains_pid_in, registry_find_pid_in, registry_instances_in,
+    registry_pids_in, survey_instances_in,
+};
 pub use aproxy_ipc::wire::*;
-use serde::{Deserialize, Serialize};
 use std::{io, path::PathBuf, sync::Arc, time::Duration};
-
-/// 现在的时刻（Unix 毫秒）。记录、快照与事件里的时刻都用这个单位。
-pub fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 /// 运行期记录的目录：`<home>/run/`。home 是唯一的根，寻址只有 `APROXY_HOME` 这一个变量。
 pub fn run_dir() -> PathBuf {
@@ -147,38 +144,6 @@ pub fn endpoint_for(port: &str) -> String {
 /// 名字怎样取、为什么带上 run 目录的标识，见 [`aproxy_ipc::endpoint::instance`]。
 pub fn endpoint_for_in(run_dir: &std::path::Path, port: &str) -> String {
     aproxy_ipc::endpoint::instance(run_dir, port)
-}
-
-/// 从监听地址提取端口（IPC 端点名、日志/注册文件名共用）
-pub fn port_of(listen_addr: &str) -> &str {
-    listen_addr.rsplit(':').next().unwrap_or("unknown")
-}
-
-/// 实例记录的 schema。读到更高的 schema 时不解读内容，那份记录算读不懂。
-pub const INSTANCE_SCHEMA: u32 = 1;
-
-/// 实例记录在盘上的形状：`schema` 在前，其余就是 [`InstanceRecord`]。
-#[derive(Serialize, Deserialize)]
-struct InstanceFile {
-    schema: u32,
-    #[serde(flatten)]
-    record: InstanceRecord,
-}
-
-/// 解析一份实例记录的文本。读不懂（不是这个形状，或 schema 比本版本高）→ None。
-pub fn parse_instance_file(text: &str) -> Option<InstanceRecord> {
-    serde_json::from_str::<InstanceFile>(text)
-        .ok()
-        .filter(|file| file.schema <= INSTANCE_SCHEMA)
-        .map(|file| file.record)
-}
-
-/// 读一份实例记录文件，读不懂时说明是哪一种读不懂（读不出、不是这个形状、schema 比本版本
-/// 高）。只想知道「读不读得懂」的调用方用 [`parse_instance_file`]。
-pub fn read_instance_record(
-    path: &std::path::Path,
-) -> Result<InstanceRecord, crate::spec::Unreadable> {
-    crate::spec::read_record::<InstanceFile>(path, INSTANCE_SCHEMA).map(|file| file.record)
 }
 
 /// 从生效的配置取摘要。
@@ -547,49 +512,6 @@ impl IpcStats {
     }
 }
 
-/// 注册表中登记的全部实例记录（只读 `*.instance.json`，不做 IPC 探活；读不懂的跳过），按 pid
-/// 升序。看门狗选举的输入：存活与身份由调用方用进程级手段（pid + 记录里
-/// 的启动标记比对现算的标记）判定——实例 IPC 不可达恰恰是需要
-/// 看护的信号，不能作为「死」的依据参与选举。
-pub fn registry_instances_in(run_dir: &std::path::Path) -> Vec<InstanceRecord> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(run_dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .ends_with(INSTANCE_FILE_SUFFIX)
-        {
-            continue;
-        }
-        if let Ok(content) = std::fs::read_to_string(entry.path())
-            && let Some(info) = parse_instance_file(&content)
-        {
-            out.push(info);
-        }
-    }
-    out.sort_by_key(|i| i.pid);
-    out
-}
-
-/// 注册表中登记的全部实例 PID（去重升序，只读文件不探活）。
-pub fn registry_pids_in(run_dir: &std::path::Path) -> Vec<u32> {
-    let mut out: Vec<u32> = registry_instances_in(run_dir)
-        .iter()
-        .map(|i| i.pid)
-        .collect();
-    out.dedup();
-    out
-}
-
-/// 读取单个端口的注册表记录（只读，不探活；不存在/读不懂 → None）。
-pub fn read_instance_file_in(run_dir: &std::path::Path, port: &str) -> Option<InstanceRecord> {
-    let content = std::fs::read_to_string(instance_file_path_in(run_dir, port)).ok()?;
-    parse_instance_file(&content)
-}
-
 /// 强制终止实例进程（`--force`）：跳过 IPC 优雅关闭直接终止。`info` 必须
 /// 是刚经 IPC ping 从该端口拿到的实例信息（stop 的 target 解析一律经 ping，
 /// 应答者自报的 pid 即端点归属证明）。
@@ -847,17 +769,9 @@ fn windows_env_block(changes: &[(String, Option<String>)]) -> Vec<u16> {
 // 实例注册表（~/.aproxy/run/<port>.instance.json）
 // ---------------------------------------------------------------------------
 
-/// 实例记录的文件名后缀：文件是 `<端口>.instance.json`。
-pub const INSTANCE_FILE_SUFFIX: &str = ".instance.json";
-
 /// 注册表文件路径：`<run_dir>/<port>.instance.json`
 pub fn instance_file_path(listen_addr: &str) -> PathBuf {
     instance_file_path_in(&run_dir(), listen_addr)
-}
-
-/// 同上，目录可指定（测试注入用）
-pub fn instance_file_path_in(run_dir: &std::path::Path, listen_addr: &str) -> PathBuf {
-    run_dir.join(format!("{}{INSTANCE_FILE_SUFFIX}", port_of(listen_addr)))
 }
 
 /// 写入实例注册（bind 成功后调用，避免留下死记录）
@@ -887,16 +801,6 @@ pub fn remove_instance_file(listen_addr: &str) {
 /// 列出注册表中应答控制通道的实例（见 `survey_instances_in`）。
 pub async fn list_instances() -> Vec<InstanceStatus> {
     survey_instances().await.responsive
-}
-
-/// 注册表普查结果：应答的实例，与「进程仍在、却不应答控制通道」的实例。
-pub struct InstanceSurvey {
-    /// IPC ping 成功：ping 应答里的实时状态
-    pub responsive: Vec<InstanceStatus>,
-    /// ping 失败但记录的进程经「pid + 创建时间」核验仍在（多为挂死）：信息
-    /// 取自注册表记录（启动时刻的快照）。aproxy 无法经 IPC 优雅停止它们，只能
-    /// `stop --force`（终止前同样核验身份）
-    pub unresponsive: Vec<InstanceRecord>,
 }
 
 /// 普查本 home 的注册表。只读：不删任何文件（清理见 [`collect_garbage_in`]）。
@@ -1085,102 +989,6 @@ fn older_than(path: &std::path::Path, secs: u64) -> bool {
         .ok()
         .and_then(|modified| modified.elapsed().ok())
         .is_some_and(|age| age.as_secs() >= secs)
-}
-
-/// 同上，目录可指定（测试注入用）
-pub async fn list_instances_in(dir: &std::path::Path) -> Vec<InstanceStatus> {
-    survey_instances_in(dir).await.responsive
-}
-
-/// 逐条读注册表、IPC ping 验活。只读，不删任何文件。ping 失败时按「pid + 创建时间」
-/// 核验记录的进程：仍在 → 归入 unresponsive；已退出、pid 已被复用、或记录没登记创建时间
-/// （证明不了身份）→ 不列出，残留的记录留给清理（[`collect_garbage_in`]）。
-/// **不应答 ≠ 已死**：挂死的实例进程还在，看门狗的挂死接管要靠这条记录核验身份，
-/// `stop --force` 也要靠它定位。读不懂的记录跳过。
-pub async fn survey_instances_in(dir: &std::path::Path) -> InstanceSurvey {
-    let mut out = Vec::new();
-    let mut unresponsive = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return InstanceSurvey {
-            responsive: out,
-            unresponsive,
-        };
-    };
-    for entry in entries.flatten() {
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .ends_with(INSTANCE_FILE_SUFFIX)
-        {
-            continue;
-        }
-        let info = std::fs::read_to_string(entry.path())
-            .ok()
-            .and_then(|c| parse_instance_file(&c));
-        // 读不懂的记录（损坏，或更新的版本写的）定位不了端口，跳过
-        let Some(info) = info else {
-            continue;
-        };
-        let port = port_of(&info.listen_addr).to_string();
-        match ipc_ping_in(dir, &port).await {
-            // ping 应答携带实例的实时状态（含最近活动时刻）——实例记录
-            // 是启动时刻的快照，闲置判定/展示必须用实时值
-            Ok(live) if live.instance.pid == info.pid => out.push(live),
-            // 应答的不是记录里的进程。新实例先建端点、后写记录，记录可能正被
-            // 重写——重读一次再比。仍对不上时，记录的进程若还在就按无响应
-            // 列出（它不在自己的端点上应答）；否则不列出、也不删：此刻删除
-            // 可能恰好删掉应答者刚写下的记录
-            Ok(live) => {
-                if read_instance_file_in(dir, &port).is_some_and(|f| f.pid == live.instance.pid) {
-                    out.push(live);
-                } else if crate::process::record_identity(info.pid, &info.start)
-                    == crate::process::RecordIdentity::Alive
-                {
-                    unresponsive.push(info);
-                }
-            }
-            Err(_) => {
-                if crate::process::record_identity(info.pid, &info.start)
-                    == crate::process::RecordIdentity::Alive
-                {
-                    unresponsive.push(info);
-                }
-            }
-        }
-    }
-    out.sort_by(|a, b| a.instance.listen_addr.cmp(&b.instance.listen_addr));
-    unresponsive.sort_by(|a, b| a.listen_addr.cmp(&b.listen_addr));
-    InstanceSurvey {
-        responsive: out,
-        unresponsive,
-    }
-}
-
-/// 只读检索注册表：是否存在 pid 匹配的实例记录。
-/// respawn 的就绪判定专用：就绪只需「新 pid 的注册记录已出现」，读文件即可，无需 IPC。
-pub fn registry_contains_pid_in(dir: &std::path::Path, pid: u32) -> bool {
-    registry_find_pid_in(dir, pid).is_some()
-}
-
-/// 只读检索注册表：取 pid 匹配的实例记录（无副作用，理由同上）。
-/// 重拉/恢复/重启按 spawn 返回的 pid 定位新实例，从记录里读它**实际**监听
-/// 的地址——配置可能已改端口（或 listen 端口为 0 由系统分配），新实例未必
-/// 落在原端口。
-pub fn registry_find_pid_in(dir: &std::path::Path, pid: u32) -> Option<InstanceRecord> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    entries.flatten().find_map(|entry| {
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .ends_with(INSTANCE_FILE_SUFFIX)
-        {
-            return None;
-        }
-        std::fs::read_to_string(entry.path())
-            .ok()
-            .and_then(|c| parse_instance_file(&c))
-            .filter(|info| info.pid == pid)
-    })
 }
 
 /// 按一份期望状态记录拉起的实例落在了另一个端口（配置里的端口改了）时，退役旧端口的

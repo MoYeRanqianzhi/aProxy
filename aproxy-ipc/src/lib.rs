@@ -21,12 +21,16 @@ pub mod config_file;
 pub mod decode;
 pub mod diag;
 pub mod endpoint;
+#[cfg(feature = "client")]
+pub mod enumerate;
 pub mod home;
 #[cfg(feature = "body-inspection")]
 pub mod inspection;
 pub mod ledger;
 pub mod program;
 pub mod redact;
+#[cfg(feature = "client")]
+pub mod registry;
 #[cfg(feature = "client")]
 pub mod wire;
 

@@ -18,119 +18,27 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use aproxy_ipc::registry::parse_record;
+pub use aproxy_ipc::registry::{InstanceSpec, SCHEMA, Unreadable, restore_path_in};
+use aproxy_ipc::registry::{RESTORE_SUFFIX, RestoreRecord, read_optional_record, read_record};
 
 use crate::config::Overrides;
 
-/// 本版本写出、也是本版本能读的最高记录格式版本。
-pub const SCHEMA: u32 = 1;
-
-/// 期望状态记录的文件名后缀：`<端口>.restore.json`。
-pub(crate) const RESTORE_SUFFIX: &str = ".restore.json";
 /// 交接文件的文件名后缀：`<纳秒>-<pid>.spec.json`。
 const SPEC_SUFFIX: &str = ".spec.json";
 
-/// 拉起规格。
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct InstanceSpec {
-    pub schema: u32,
-    /// 配置文件的绝对路径。null = 没有配置文件，只靠覆盖参数与 settings.json 的全局默认
-    /// 启动；对这样的规格不做「配置文件还在不在」的检查
-    pub config_path: Option<String>,
-    /// 启动时在命令行上给过的覆盖，键就是 config.toml 的键
-    #[serde(default)]
-    pub overrides: Overrides,
-    /// 配置解析出的端口为 0（由系统分配）的实例，第一次启动后实际拿到的端口。再次拉起时，
-    /// 配置解析出的端口仍是 0 才用它：客户端配的是这个端口，恢复要回到同一个端口；配置
-    /// 已经改成固定端口时以配置为准。它不放进 `overrides`，因为覆盖的优先级高于配置，放在
-    /// 那里用户以后改的端口永远不生效
-    #[serde(default)]
-    pub pinned_port: Option<u16>,
-    /// 启动者环境里的代理变量与 `PATH`：null 表示启动者没设，拉起时在子进程里删掉它。
-    /// 重拉出来的实例因此走同一条网络路径，也找得到同一批 format 程序
-    #[serde(default)]
-    pub env: BTreeMap<String, Option<String>>,
-    /// 实例的日志文件。新启动时由拉起方生成随机名，restart、restore、看护者重拉都续写
-    /// 同一个文件。配置里写了 `log_file` 时实例用配置的路径，这个值只是没写时的去处
-    pub log_path: String,
-}
-
-impl InstanceSpec {
-    /// 为一次新的启动建规格：记下此刻环境里的代理变量与 `PATH`。
-    pub fn capture(config_path: Option<&Path>, overrides: Overrides, log_path: &Path) -> Self {
-        Self {
-            schema: SCHEMA,
-            config_path: config_path.map(|p| p.display().to_string()),
-            overrides,
-            pinned_port: None,
-            env: capture_env(),
-            log_path: log_path.display().to_string(),
-        }
-    }
-
-    /// 配置文件路径；没有配置文件的规格返回 None。
-    pub fn config_file(&self) -> Option<PathBuf> {
-        self.config_path.as_deref().map(PathBuf::from)
-    }
-
-    /// 拉起子进程时要改的环境变量：`Some` 设成这个值，`None` 删掉。
-    pub fn env_changes(&self) -> Vec<(String, Option<String>)> {
-        self.env
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect()
+/// 为一次新的启动建规格：记下此刻环境里的代理变量与 `PATH`。
+pub fn capture(config_path: Option<&Path>, overrides: Overrides, log_path: &Path) -> InstanceSpec {
+    InstanceSpec {
+        schema: SCHEMA,
+        config_path: config_path.map(|p| p.display().to_string()),
+        overrides,
+        pinned_port: None,
+        env: capture_env(),
+        log_path: log_path.display().to_string(),
     }
 }
-
-/// 一条记录读不懂的原因。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Unreadable {
-    /// 读不出文件
-    Io(String),
-    /// 不是这种记录应有的 JSON
-    Parse(String),
-    /// `schema` 高于本版本认识的：写下它的是更新的版本
-    SchemaTooNew(u64),
-}
-
-impl std::fmt::Display for Unreadable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "cannot read: {e}"),
-            Self::Parse(e) => write!(f, "not a valid record: {e}"),
-            Self::SchemaTooNew(schema) => {
-                write!(f, "written by a newer aproxy (schema {schema})")
-            }
-        }
-    }
-}
-
-/// 解析一条带 `schema` 的记录；`newest` 是本版本读得懂的最高 schema（每种记录各有自己的）。
-/// 先只取 `schema`：更高的版本可能改了别的字段的形状，直接按本版本的结构解析会把「太新」
-/// 误报成「损坏」。
-pub(crate) fn parse_record<T: serde::de::DeserializeOwned>(
-    text: &str,
-    newest: u32,
-) -> Result<T, Unreadable> {
-    let value: serde_json::Value =
-        serde_json::from_str(text).map_err(|e| Unreadable::Parse(e.to_string()))?;
-    match value.get("schema").and_then(serde_json::Value::as_u64) {
-        Some(schema) if schema > u64::from(newest) => return Err(Unreadable::SchemaTooNew(schema)),
-        Some(_) => {}
-        None => return Err(Unreadable::Parse("missing schema".to_string())),
-    }
-    serde_json::from_value(value).map_err(|e| Unreadable::Parse(e.to_string()))
-}
-
-/// 读一条带 `schema` 的记录文件，见 [`parse_record`]。
-pub(crate) fn read_record<T: serde::de::DeserializeOwned>(
-    path: &Path,
-    newest: u32,
-) -> Result<T, Unreadable> {
-    let text = std::fs::read_to_string(path).map_err(|e| Unreadable::Io(e.to_string()))?;
-    parse_record(&text, newest)
-}
-
 // ---------------------------------------------------------------------------
 // 环境快照
 // ---------------------------------------------------------------------------
@@ -189,15 +97,6 @@ pub fn read_spec_file(path: &Path) -> Result<InstanceSpec, Unreadable> {
 // 期望状态记录
 // ---------------------------------------------------------------------------
 
-/// 期望状态记录的落盘形式。
-#[derive(Serialize, Deserialize)]
-struct RestoreRecord {
-    schema: u32,
-    spec: InstanceSpec,
-    /// 写下的时刻（Unix 毫秒）
-    written_at: u64,
-}
-
 /// 一条读得懂的期望状态记录。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreEntry {
@@ -224,11 +123,6 @@ pub struct RestoreListing {
     pub unreadable: Vec<UnreadableRecord>,
 }
 
-/// 期望状态记录的路径：`<run_dir>/<端口>.restore.json`。
-pub fn restore_path_in(run_dir: &Path, port: &str) -> PathBuf {
-    run_dir.join(format!("{port}{RESTORE_SUFFIX}"))
-}
-
 /// 写（或覆盖）一个端口的期望状态记录。
 pub fn write_restore_in(run_dir: &Path, port: &str, spec: &InstanceSpec) -> std::io::Result<()> {
     let record = RestoreRecord {
@@ -249,13 +143,9 @@ pub fn remove_restore_in(run_dir: &Path, port: &str) {
 /// 读一个端口的期望状态记录。`Ok(None)` = 没有这份记录。
 pub fn read_restore_in(run_dir: &Path, port: &str) -> Result<Option<RestoreEntry>, Unreadable> {
     let path = restore_path_in(run_dir, port);
-    // 只有路径不存在才表示没有恢复义务；权限等错误不能把尚在的记录变成空。
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(Unreadable::Io(e.to_string())),
+    let Some(record): Option<RestoreRecord> = read_optional_record(&path, SCHEMA)? else {
+        return Ok(None);
     };
-    let record: RestoreRecord = parse_record(&text, SCHEMA)?;
     Ok(Some(RestoreEntry {
         port: port.to_string(),
         spec: record.spec,

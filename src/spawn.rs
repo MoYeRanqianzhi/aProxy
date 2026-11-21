@@ -183,7 +183,12 @@ async fn launch_and_wait(
     // 子进程的 home 由 `--home` 定，不由继承来的 APROXY_HOME 定：拉起方操作的是哪个 home，
     // 实例就属于哪个 home。环境里的 APROXY_HOME 一并改掉，实例再拉起的子进程（看护者、
     // format 程序）看到的也是它
-    let mut env = spec.env_changes();
+    // 规格里 Some 的变量设成该值，None 的变量在子进程里删掉。
+    let mut env = spec
+        .env
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
     env.push(("APROXY_HOME".to_string(), Some(home.display().to_string())));
     let launch = daemon::Launch {
         env: &env,

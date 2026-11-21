@@ -51,7 +51,7 @@ const PINNED_IN_MODULES: &[(&str, &str)] = &[
     // 看护者记录 `run/watchdog.json`
     ("src/watchdog.rs", "record_shape_is_pinned"),
     // 只读清点的结果
-    ("src/ops/enumerate.rs", "enumeration_shape_is_pinned"),
+    ("aproxy-ipc/src/enumerate.rs", "enumeration_shape_is_pinned"),
     // HTTP 错误体与 SSE 终态事件
     ("src/proxy/errors.rs", "payload_has_the_documented_shape"),
     // 控制端点的名字

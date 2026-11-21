@@ -14,7 +14,7 @@ use aproxy::ops::start::{
     resolve_runtime_config,
 };
 use aproxy::ops::target::resolve_config_target;
-use aproxy::spec::{self, InstanceSpec};
+use aproxy::spec;
 use serde_json::json;
 
 use super::{Failure, port_value, print_doc};
@@ -134,7 +134,7 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) -> u8 {
     // 失败的原因只写在那里）。日志文件名在这里生成一次，重拉之后续写同一个文件
     let exe = std::env::current_exe().expect("无法定位自身可执行文件");
     let log_path = crate::server::resolve_daemon_log_path(cfg.log_file.as_deref());
-    let spec = InstanceSpec::capture(cfg_file, overrides, &log_path);
+    let spec = spec::capture(cfg_file, overrides, &log_path);
     let info = match launch(&exe, &spec).await {
         Ok(info) => info,
         Err(e) => {

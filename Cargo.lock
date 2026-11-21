@@ -187,6 +187,7 @@ dependencies = [
  "brotli",
  "brotli-decompressor",
  "flate2",
+ "futures-util",
  "libc",
  "memchr",
  "regex",

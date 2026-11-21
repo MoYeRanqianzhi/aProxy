@@ -313,7 +313,13 @@ fn unreadable_marker_is_not_a_missing_marker() {
     let f = docs();
     let z = package(h.path(), Some(&manifest_for(&f)), &f);
     let mut bytes = fs::read(&z).unwrap();
-    bytes[0] = 0;
+    // 目录头与本地头都标记为加密，结构一致性检查通过，但 by_name 无法打开清单。
+    let central = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+    bytes[6] |= 1;
+    bytes[central + 8] |= 1;
+    let mut index = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+    index.validate_header_consistency().unwrap();
+    assert!(index.by_name(MARKER).is_err());
     fs::write(&z, bytes).unwrap();
     assert_eq!(
         archive::verify_package(&z, "1.0.0", None)
@@ -621,5 +627,22 @@ fn stored_sizes_agree_independent_of_manifest_and_header_agreement() {
             .unwrap_err()
             .to_string()
             .contains("压缩方式")
+    );
+}
+
+/// 大量合法的未登记条目也会占索引；包本身远小于字节上限，白名单仅一篇。
+#[test]
+fn extra_members_count_toward_directory_budget() {
+    let h = tempfile::tempdir().unwrap();
+    let names: Vec<_> = (0..2 * MAX_FILES).map(|i| format!("x{i}")).collect();
+    let mut f = vec![("s/a", &b""[..])];
+    let m = manifest_for(&f);
+    f.extend(names.iter().map(|n| (n.as_str(), &b""[..])));
+    let z = package(h.path(), Some(&m), &f);
+    assert_eq!(
+        archive::install(h.path(), &z, "1.0.0")
+            .unwrap_err()
+            .to_string(),
+        "skill 压缩包条目过多"
     );
 }

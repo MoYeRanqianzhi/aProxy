@@ -288,6 +288,7 @@ impl Secrets {
 
     /// HTTP parsers lowercase header names. Match this spelling only in names,
     /// never in payloads or header values, which remain case-sensitive.
+    #[cfg(feature = "client")]
     pub fn for_header_names(&self) -> Self {
         Self::new(self.known.iter().map(|s| s.to_ascii_lowercase()))
     }

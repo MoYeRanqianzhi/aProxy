@@ -23,7 +23,7 @@ pub(crate) mod commands;
 pub(crate) mod server;
 pub(crate) mod util;
 
-use clap::Parser;
+use clap::FromArgMatches;
 use std::io::Write as _;
 
 use aproxy::cli::{Cli, Commands};
@@ -50,7 +50,8 @@ pub(crate) fn main() -> std::process::ExitCode {
         }
     }
 
-    let cli = Cli::parse();
+    let cli = Cli::from_arg_matches_mut(&mut aproxy::cli::command_tree().get_matches())
+        .unwrap_or_else(|e| e.exit());
     // `-V`/`--version` 与别的参数写在一起（`aproxy -V start`）时走到这里，输出同一行。
     // 这种写法要靠 clap 才分得清 `-V` 是版本参数还是别的参数的取值，所以排在解析之后；
     // 安装器只用单独的 `--version`，由上面第一句兑现「先于一切副作用」
@@ -342,6 +343,7 @@ mod home_output_tests {
     fn status_json_home_failure_returns_its_document_before_dispatch() {
         let value = std::ffi::OsStr::new("relative");
         assert!(aproxy_ipc::home::home_from(Some(value), || unreachable!()).is_err());
+        use clap::Parser;
         let cli = Cli::try_parse_from(["aproxy", "status", "--json"]).unwrap();
         let (doc, exit) = invalid_home_output(cli.command.as_ref(), value.to_str().unwrap());
         assert_eq!(exit, 2);

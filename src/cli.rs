@@ -543,3 +543,18 @@ pub enum ConfigCmd {
         json: bool,
     },
 }
+
+/// 构造实际解析用的完整命令树，包括 clap 自己生成的 help 子树，再统一附上文档入口。
+pub fn command_tree() -> clap::Command {
+    use clap::CommandFactory;
+    /// 内部命令也可能被单独查询帮助，不能只修饰用户可见的第一层。
+    fn annotate(cmd: clap::Command) -> clap::Command {
+        cmd.after_help(
+            "Agents: run 'aproxy skill list' and 'aproxy skill show <name>' for full docs.",
+        )
+        .mut_subcommands(annotate)
+    }
+    let mut cmd = Cli::command();
+    cmd.build();
+    annotate(cmd)
+}

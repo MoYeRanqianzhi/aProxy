@@ -170,3 +170,33 @@ async fn binary_install_also_refreshes_skills() {
         DOCS[0].1.as_bytes()
     );
 }
+
+/// 既检查整棵实际命令树（含隐藏入口与 help），也检查进程实际用这棵树输出帮助。
+#[test]
+fn every_help_ends_in_the_skill_pointer() {
+    const LINE: &str =
+        "Agents: run 'aproxy skill list' and 'aproxy skill show <name>' for full docs.";
+    /// 逐层查长帮助，避免只改根命令却漏掉孙命令。
+    fn walk(c: &mut clap::Command) {
+        let help = c.render_long_help().to_string();
+        assert!(help.trim_end().ends_with(LINE), "{}: {help}", c.get_name());
+        for child in c.get_subcommands_mut() {
+            walk(child);
+        }
+    }
+    walk(&mut aproxy::cli::command_tree());
+    let h = TestHome::new();
+    for args in [
+        &["--help"][..],
+        &["skill", "upgrade", "--help"],
+        &["help", "skill", "show"],
+        &["__serve", "--help"],
+    ] {
+        assert!(
+            String::from_utf8(run(&h, args, 0).stdout)
+                .unwrap()
+                .trim_end()
+                .ends_with(LINE)
+        );
+    }
+}

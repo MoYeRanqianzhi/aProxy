@@ -159,7 +159,7 @@ impl AppState {
             config.known_secrets(),
             instance_id.clone(),
         );
-        let mut stats = crate::daemon::IpcStats::sharing(last_activity_ms.clone());
+        let mut stats = crate::daemon::IpcStats::sharing(last_activity_ms.clone(), history.clone());
         let formats: Arc<[Arc<crate::transform::Pool>]> = config
             .formats
             .iter()

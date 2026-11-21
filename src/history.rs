@@ -1064,6 +1064,24 @@ impl History {
         &self.secrets
     }
 
+    /// 错误的 details 键由码表规定，值可能来自请求、上游或格式程序。保留结构与类型，
+    /// 只在文字里换掉凭据；最近错误与尝试明细都不能保存这类明文。
+    pub(crate) fn redacted_details(&self, details: &Map<String, Value>) -> Value {
+        fn clean(value: &mut Value, secrets: &Secrets) {
+            match value {
+                Value::String(text) => *text = secrets.replace(text),
+                Value::Object(map) => map.values_mut().for_each(|v| clean(v, secrets)),
+                Value::Array(items) => items.iter_mut().for_each(|v| clean(v, secrets)),
+                _ => (),
+            }
+        }
+        let mut value = Value::Object(details.clone());
+        if !self.secrets.is_empty() {
+            clean(&mut value, &self.secrets);
+        }
+        value
+    }
+
     /// URL 中的用户信息和查询值按位置遮住；路径中若含实例已知的凭据，也不能写进记录或日志。
     pub(crate) fn redacted_url(&self, url: &str) -> String {
         let masked = redact::url(url);
@@ -1970,7 +1988,7 @@ impl Recorder {
                 if !failure.has_response {
                     t.error = Some(json!({
                         "code": failure.code,
-                        "details": failure.details,
+                        "details": live.history.redacted_details(failure.details),
                         "message": live.history.secrets.replace(failure.message),
                     }));
                 }
@@ -3224,6 +3242,17 @@ mod tests {
         rec.request_body(Some("client-token"));
         let sent = rec.sent_head("client-token", "/client-token", std::iter::empty());
         rec.try_started(1, sent.as_ref(), true, None);
+        let diagnostic = json!({"reason":"bad client-token"});
+        rec.try_ended(
+            1,
+            0,
+            Some(Failure {
+                code: "upstream_connect_failed",
+                details: diagnostic.as_object().unwrap(),
+                message: "bad client-token",
+                has_response: false,
+            }),
+        );
         let detail: Value = serde_json::from_str(&history.detail_json(&id(1)).unwrap()).unwrap();
         let record = &detail["record"];
         assert_eq!(record["user_agent"], "agent/<secret>");
@@ -3239,6 +3268,10 @@ mod tests {
         );
         assert_eq!(detail["request"]["body"]["encoding"], "<secret>");
         assert_eq!(detail["tries"][0]["sent"]["method"], "<secret>");
+        assert_eq!(
+            detail["tries"][0]["error"]["details"]["reason"],
+            "bad <secret>"
+        );
         assert!(!detail.to_string().contains("client-token"));
     }
 

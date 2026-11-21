@@ -268,6 +268,8 @@ async fn serve_endpoint(endpoint: String, state: Arc<ControlState>) -> io::Resul
 /// 原子计数全部 Relaxed——只用于展示与告警，无跨线程因果序需求。
 #[derive(Debug, Default)]
 pub struct IpcStats {
+    /// 与请求记录使用同一组凭据做替换；没有请求历史的空计数器没有配置密钥。
+    history: Option<Arc<crate::history::History>>,
     /// 池的生命期由实例持有；IPC 仅读取快照，不延长进程生命期。
     pub(crate) formats: Vec<std::sync::Weak<crate::transform::Pool>>,
     /// 实例阶段变动唤醒状态读者；熔断变化另有带快照的有界队列。
@@ -372,9 +374,13 @@ impl Drop for Counted {
 
 impl IpcStats {
     /// 一份全新的观测值，活动时间戳用给定的那一个（代理层的 AppState 也持有它）。
-    pub fn sharing(last_activity_ms: Arc<std::sync::atomic::AtomicU64>) -> Self {
+    pub fn sharing(
+        last_activity_ms: Arc<std::sync::atomic::AtomicU64>,
+        history: Arc<crate::history::History>,
+    ) -> Self {
         IpcStats {
             last_activity_ms,
+            history: Some(history),
             ..Default::default()
         }
     }
@@ -465,6 +471,14 @@ impl IpcStats {
         message: &str,
         attempt: bool,
     ) {
+        // 解码错误里的 encoding 等信息来自对端。先替换再截断，也不在计数锁里做字符串扫描。
+        let (message, details) = match &self.history {
+            Some(h) => (h.secrets().replace(message), h.redacted_details(details)),
+            None => (
+                message.to_owned(),
+                serde_json::Value::Object(details.clone()),
+            ),
+        };
         let mut tally = self.tally();
         *tally.by_code.entry(code.to_string()).or_insert(0) += 1;
         if attempt {
@@ -473,7 +487,7 @@ impl IpcStats {
         }
         tally.last_error = Some(LastError {
             code: code.to_string(),
-            details: serde_json::Value::Object(details.clone()),
+            details,
             // 截断到 200 字符：说明进 IPC 应答与 status 展示，防止上游返回的超长错误文本
             // 把应答行撑大
             message: message.chars().take(200).collect(),
@@ -2938,6 +2952,25 @@ mod tests {
         // 超长的说明截断到 200 字符（按 char，多字节不撕裂）
         stats.note_failed_attempt("upstream_connect_failed", &none, &"长".repeat(500));
         assert_eq!(stats.last_error().unwrap().message.chars().count(), 200);
+    }
+
+    #[test]
+    fn snapshot_redacts_peer_text_before_truncation() {
+        let history = crate::history::History::new(
+            0,
+            aproxy_ipc::redact::Secrets::new(["test-key-012345"]),
+            "run".into(),
+        );
+        let stats = IpcStats::sharing(Arc::default(), history);
+        let details = serde_json::json!({"encoding":"test-key-012345"});
+        stats.note_terminal(
+            "decode_failed",
+            details.as_object().unwrap(),
+            &format!("{}test-key-012345", "x".repeat(190)),
+        );
+        let error = stats.activity(0).last_error.unwrap();
+        assert_eq!(error.details["encoding"], "<secret>");
+        assert!(error.message.ends_with("<secret>"));
     }
 
     /// 计数与时间桶：请求、重试、失败的尝试各进各的桶；终态码只进按码计数；窗口随时间

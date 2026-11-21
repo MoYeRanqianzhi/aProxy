@@ -94,6 +94,7 @@ W5 的总体要求（窗口外观、主题、吉祥物、安全边界、构建�
 - **W5a（Codex）**：把 IPC 客户端、事件流读取、只读枚举与 home 视图抽进 aproxy-ipc，CLI 改用它；测试在 aproxy-ipc。
 - **W5b（Codex）**：`DesktopOps`、Tauri 命令与事件、capability、开机自启的三种登记；主 crate 实现并注入。DTO 的形状先写成
   文档，主代理审过再实现。形状文档是 [w5b-desktop-api](w5b-desktop-api.md)（2026-11-22 裁定，W5c 的前端照它写）。
+  2026-11-22 已实现并合入（32 个命令）；Windows 的登记用 `conhost.exe --headless` 包裹（实测不出窗口，见记忆 desktop-login-carrier），macOS 只交叉编译过。
 - **W5c（主代理）**：前端的 Tauri Backend 实现，界面类型的调整（状态与阶段的词表、救回统计、置顶），去掉原型工具。
 - **W5d（主代理）**：在真实应用里逐页过外观与交互，改文字与 i18n。
 - **W5e（Codex 做 Rust 与宿主侧的协议，主代理做确认框与设置页）**：扩展包的清单与发现、沙箱 iframe 的宿主、扩展 API、

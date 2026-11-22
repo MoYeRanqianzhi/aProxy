@@ -124,8 +124,8 @@ fn status_json_document() {
 
     let plain = run(&home, &["status"]);
     let stdout = String::from_utf8_lossy(&plain.stdout);
-    assert!(stdout.contains("运行中的 aProxy 实例 (1):"), "{stdout}");
-    assert!(stdout.contains(&format!("端口 {port}")), "{stdout}");
+    assert!(stdout.contains("Running aProxy instances (1):"), "{stdout}");
+    assert!(stdout.contains(&format!("Port {port}")), "{stdout}");
 
     crash(pid, port);
     fs::remove_file(&path).unwrap();
@@ -144,16 +144,21 @@ fn status_json_document() {
 
     let plain = run(&home, &["status"]);
     let stdout = String::from_utf8_lossy(&plain.stdout);
-    assert!(stdout.contains("等待恢复的实例 (1)"), "{stdout}");
     assert!(
-        stdout.contains(&format!("端口 {port}（配置文件找不到）")),
+        stdout.contains("Instances awaiting restore (1)"),
         "{stdout}"
     );
     assert!(
-        stdout.contains(&format!("不再需要它时执行 aproxy stop {port}")),
+        stdout.contains(&format!("Port {port} (configuration file not found)")),
         "{stdout}"
     );
-    assert!(!stdout.contains("没有运行中的 aProxy 实例"), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Run aproxy stop {port} if you no longer need this instance."
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("No running aProxy instances"), "{stdout}");
 }
 
 /// 读不懂的记录带相对路径和原因列出，暂停日志清理的状态也必须对人和程序可见。
@@ -176,12 +181,12 @@ fn status_lists_unreadable_records() {
 
     let plain = run(&home, &["status"]);
     let stdout = String::from_utf8_lossy(&plain.stdout);
-    assert!(stdout.contains("读不懂的记录 (1)"), "{stdout}");
+    assert!(stdout.contains("Unreadable records (1)"), "{stdout}");
     assert!(
         stdout.contains(&format!("{file}  [record_unreadable]")),
         "{stdout}"
     );
-    assert!(stdout.contains("日志清理已暂停"), "{stdout}");
+    assert!(stdout.contains("Log cleanup is paused"), "{stdout}");
 }
 
 /// 别名按名称排序；目标消失只改变 exists，不会抹掉已登记的路径。
@@ -683,5 +688,48 @@ fn nested_diagnostics_localize_without_changing_public_documents() {
             .unwrap();
             assert!(human.contains(want) && !human.contains(other), "{human}");
         }
+    }
+}
+
+/// 日志可以由旧版本或外部程序留下：只翻译阅读器的说明，不重写记录的任何字节。
+#[test]
+fn log_replay_is_independent_of_notice_language() {
+    let home = TestHome::new();
+    let log = home.path().join("previous.log");
+    let content = "older log record\n旧日志原文\n";
+    fs::write(&log, content).unwrap();
+    let port = free_port().to_string();
+    let run = home.path().join("run");
+    fs::create_dir_all(&run).unwrap();
+    let spec = aproxy::spec::InstanceSpec {
+        schema: aproxy::spec::SCHEMA,
+        config_path: None,
+        overrides: Default::default(),
+        pinned_port: None,
+        env: Default::default(),
+        log_path: log.display().to_string(),
+    };
+    aproxy::spec::write_restore_in(&run, &port, &spec).unwrap();
+    for (lang, notice, pending) in [
+        ("en", "Log file:", "Instances awaiting restore (1)"),
+        ("zh-CN", "日志文件:", "等待恢复的实例 (1)"),
+    ] {
+        let out = home
+            .cmd()
+            .env("APROXY_LANG", lang)
+            .arg("logs")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, content.as_bytes());
+        assert!(String::from_utf8(out.stderr).unwrap().contains(notice));
+        let status = home
+            .cmd()
+            .env("APROXY_LANG", lang)
+            .arg("status")
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(String::from_utf8(status.stdout).unwrap().contains(pending));
     }
 }

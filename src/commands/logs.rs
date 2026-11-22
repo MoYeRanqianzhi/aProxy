@@ -4,6 +4,10 @@
 //! （`target_ambiguous`）；目标没在运行、也没有记录可读 4（`target_not_running`），别名不存在
 //! 也是 4（`target_not_found`）。
 
+#[path = "../i18n/logs.rs"]
+mod text;
+use aproxy_ipc::i18n::current;
+
 use aproxy::daemon::{self, InstanceStatus};
 use aproxy::ops::target::{config_path_key, resolve_config_target};
 use aproxy::spec::RestoreEntry;
@@ -36,48 +40,45 @@ pub(crate) async fn handle_logs_cmd(target: Option<String>, lines: usize, follow
             let port = daemon::port_of(&info.instance.listen_addr).to_string();
             let Some(log_path) = info.instance.log_path else {
                 // 前台实例经 IPC 上报的 log_path 为 null：日志在它的控制台
-                Failure::new(
+                Failure::rendered(
                     "no_log_file",
-                    format!(
-                        "端口 {port} 的实例以前台模式运行（--foreground），日志输出在它的控制台，没有日志文件。"
-                    ),
+                    |lang| text::foreground(lang, &port),
                     json!({"port": port_value(&port)}),
                 )
                 .exit(false)
             };
             if follow {
-                eprintln!(
-                    "正在连接 pid {}（端口 {port}）——Ctrl+C 退出。",
-                    info.instance.pid
-                );
+                eprintln!("{}", text::following(current(), info.instance.pid, &port));
             }
             (port, log_path, true)
         }
         Source::Stopped { port, log_path } => {
             if !std::path::Path::new(&log_path).exists() {
-                Failure::new(
+                Failure::rendered(
                     "target_not_running",
-                    format!(
-                        "端口 {port} 的实例没在运行；它的期望状态记录指向的日志文件不存在: {log_path}"
-                    ),
+                    |lang| text::record_missing(lang, &port, &log_path),
                     json!({"target": port}),
                 )
                 .exit(false)
             }
             eprintln!(
-                "端口 {port} 的实例没在运行，以下是它上次运行的日志{}。",
-                if follow {
-                    "（没在运行，不跟随）"
-                } else {
-                    ""
-                }
+                "{}",
+                text::stopped(
+                    current(),
+                    &port,
+                    if follow {
+                        text::no_follow(current())
+                    } else {
+                        ""
+                    }
+                )
             );
             (port, log_path, false)
         }
     };
     let path = std::path::PathBuf::from(log_path);
     // 说明写到 stderr：stdout 上只有日志本身，接在管道后面的程序拿到的就是日志行
-    eprintln!("日志文件: {}", path.display());
+    eprintln!("{}", text::file(current(), path.display()));
     if let Err(e) = print_log_file(&path, &port, lines, follow && running).await {
         eprintln!("{e}");
         crate::util::exit(1);
@@ -87,9 +88,9 @@ pub(crate) async fn handle_logs_cmd(target: Option<String>, lines: usize, follow
 /// 按 target 找到要读的日志。在运行的实例优先；找不到在运行的，再找它留下的期望状态记录。
 async fn locate(target: Option<&str>) -> Result<Source, Failure> {
     if target == Some("all") {
-        return Err(Failure::new(
+        return Err(Failure::rendered(
             "usage",
-            "aproxy logs 不支持 all：一次只读一个实例的日志，请指定端口号或配置别名。",
+            |lang| text::no_all(lang).to_owned(),
             json!({"reason": "logs_target_all"}),
         ));
     }
@@ -107,9 +108,9 @@ async fn locate(target: Option<&str>) -> Result<Source, Failure> {
             }
             match records.iter().find(|entry| entry.port == port) {
                 Some(entry) => Ok(stopped(entry)),
-                None => Err(Failure::new(
+                None => Err(Failure::rendered(
                     "target_not_running",
-                    format!("端口 {port} 上没有运行中的 aProxy 实例，也没有它上次运行留下的记录。"),
+                    |lang| text::no_port(lang, &port),
                     json!({"target": port}),
                 )),
             }
@@ -142,12 +143,9 @@ async fn locate(target: Option<&str>) -> Result<Source, Failure> {
                 .max_by_key(|entry| entry.written_at);
             match record {
                 Some(entry) => Ok(stopped(entry)),
-                None => Err(Failure::new(
+                None => Err(Failure::rendered(
                     "target_not_running",
-                    format!(
-                        "别名 {target}（配置 {}）当前未在运行，也没有它上次运行留下的记录。",
-                        cfg_path.display()
-                    ),
+                    |lang| text::no_alias(lang, target, cfg_path.display()),
                     json!({"target": target}),
                 )),
             }
@@ -161,10 +159,7 @@ async fn locate(target: Option<&str>) -> Result<Source, Failure> {
                     .map(|info| daemon::port_of(&info.instance.listen_addr).to_string())
                     .collect();
                 return Err(ambiguous(
-                    format!(
-                        "有 {} 个实例在运行，必须指定端口号或配置别名（一次只读一个实例的日志）：",
-                        ports.len()
-                    ),
+                    |lang| text::multi_live(lang, ports.len()),
                     &ports,
                 ));
             }
@@ -172,9 +167,9 @@ async fn locate(target: Option<&str>) -> Result<Source, Failure> {
                 return Ok(Source::Running(Box::new(info)));
             }
             match records.as_slice() {
-                [] => Err(Failure::new(
+                [] => Err(Failure::rendered(
                     "target_not_running",
-                    "没有运行中的 aProxy 实例，也没有实例上次运行留下的记录。",
+                    |lang| text::empty(lang).to_owned(),
                     json!({"target": null}),
                 )),
                 [entry] => Ok(stopped(entry)),
@@ -182,10 +177,7 @@ async fn locate(target: Option<&str>) -> Result<Source, Failure> {
                     let ports: Vec<String> =
                         records.iter().map(|entry| entry.port.clone()).collect();
                     Err(ambiguous(
-                        format!(
-                            "没有运行中的实例；有 {} 个实例留下了期望状态记录，指定端口查看它上次运行的日志：",
-                            ports.len()
-                        ),
+                        |lang| text::multi_stopped(lang, ports.len()),
                         &ports,
                     ))
                 }
@@ -195,13 +187,16 @@ async fn locate(target: Option<&str>) -> Result<Source, Failure> {
 }
 
 /// 没指定目标而可读的日志不止一份：`target_ambiguous`（2），说明里列出可以照抄的命令行。
-fn ambiguous(head: String, ports: &[String]) -> Failure {
-    let mut message = head;
-    for port in ports {
-        message.push_str(&format!("\n  aproxy logs {port}"));
-    }
-    let ports: Vec<_> = ports.iter().map(|port| port_value(port)).collect();
-    Failure::new("target_ambiguous", message, json!({"ports": ports}))
+fn ambiguous(head: impl Fn(aproxy_ipc::i18n::Lang) -> String, ports: &[String]) -> Failure {
+    let message = |lang| {
+        let mut message = head(lang);
+        for port in ports {
+            message.push_str(&format!("\n  aproxy logs {port}"));
+        }
+        message
+    };
+    let values: Vec<_> = ports.iter().map(|port| port_value(port)).collect();
+    Failure::rendered("target_ambiguous", message, json!({"ports": values}))
 }
 
 /// 输出日志文件末尾的 `tail_lines` 行；`follow` 为真时随后轮询增量输出（tail -f 语义），
@@ -232,13 +227,10 @@ async fn print_log_file(
             break;
         }
         if daemon::ipc_ping(port).await.is_err() {
-            return Err("实例已退出，日志文件未生成。".to_string());
+            return Err(text::no_file(current()).to_string());
         }
         if std::time::Instant::now() > wait_deadline {
-            return Err(format!(
-                "日志文件迟迟未生成: {}（该实例可能以 --foreground 运行，日志输出在它的控制台）",
-                path.display()
-            ));
+            return Err(text::file_timeout(current(), path.display()));
         }
         tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
     }
@@ -247,7 +239,7 @@ async fn print_log_file(
     let window = (tail_lines as u64)
         .saturating_mul(TAIL_BYTES_PER_LINE)
         .clamp(TAIL_WINDOW_MIN, TAIL_WINDOW_MAX);
-    let mut file = std::fs::File::open(path).map_err(|e| format!("无法打开日志文件: {e}"))?;
+    let mut file = std::fs::File::open(path).map_err(|e| text::open(current(), &e))?;
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
     let start = len.saturating_sub(window);
     file.seek(SeekFrom::Start(start))
@@ -289,13 +281,13 @@ async fn print_log_file(
                 let _ = out.flush();
             }
             eprintln!();
-            eprintln!("实例已停止，日志跟踪结束。");
+            eprintln!("{}", text::end(current()));
             return Ok(());
         }
         let cur_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(pos);
         if cur_len < pos {
             // 文件被截断（守护启动时 >2MiB 清空）：从头重新跟踪
-            eprintln!("── 日志文件已被截断，重新从头跟踪 ──");
+            eprintln!("{}", text::truncated(current()));
             pos = 0;
             pending.clear();
         }

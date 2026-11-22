@@ -181,9 +181,9 @@ fn logs_prints_recent_lines_and_exits() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let all = text(&out.stdout);
     assert!(all.contains("启动 aProxy"), "{all}");
-    assert!(!all.contains("日志文件"), "说明文字应在 stderr: {all}");
+    assert!(!all.contains("Log file:"), "说明文字应在 stderr: {all}");
     assert!(
-        text(&out.stderr).contains("日志文件"),
+        text(&out.stderr).contains("Log file:"),
         "{}",
         text(&out.stderr)
     );

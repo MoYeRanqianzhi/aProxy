@@ -2,6 +2,10 @@
 //!
 //! 密钥与 URL 里的凭据怎样显示不在这里：一律走 `aproxy_ipc::redact` 的统一出口。
 
+#[path = "i18n/terminal.rs"]
+mod text;
+use aproxy_ipc::i18n::current;
+
 /// 删掉本进程的台账条目（永久兼容契约 C3）后退出进程。`std::process::exit` 不跑析构，
 /// `aproxy_ipc::ledger::Registration` 管不到这条路，所以登记过台账的进程一律经这里退出；没登记过
 /// 的进程调用它也无妨（没有条目可删）。
@@ -64,16 +68,16 @@ pub(crate) fn chrono_like_timestamp() -> String {
     format!("unix+{}s", now_unix())
 }
 
-/// 时长人性化（秒 → 中文）：uptime 与闲置时长共用
+/// 时长人性化（以秒为输入）：uptime 与闲置时长共用
 pub(crate) fn humanize_duration(secs: u64) -> String {
     if secs < 60 {
-        format!("{secs} 秒")
+        text::seconds(current(), secs)
     } else if secs < 3600 {
-        format!("{} 分 {} 秒", secs / 60, secs % 60)
+        text::minutes(current(), secs / 60, secs % 60)
     } else if secs < 86400 {
-        format!("{} 小时 {} 分", secs / 3600, (secs % 3600) / 60)
+        text::hours(current(), secs / 3600, (secs % 3600) / 60)
     } else {
-        format!("{} 天 {} 小时", secs / 86400, (secs % 86400) / 3600)
+        text::days(current(), secs / 86400, (secs % 86400) / 3600)
     }
 }
 
@@ -83,6 +87,6 @@ pub(crate) fn read_secret_line() -> Result<String, String> {
     let mut line = String::new();
     std::io::stdin()
         .read_line(&mut line)
-        .map_err(|e| format!("从 stdin 读取值失败: {e}"))?;
+        .map_err(|e| text::stdin(current(), &e))?;
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }

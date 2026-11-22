@@ -4888,7 +4888,7 @@ fn hung_instance_is_reported_and_only_force_stops_it() {
     let status = run(&["status"]);
     let stdout = String::from_utf8_lossy(&status.stdout);
     assert!(
-        stdout.contains("无响应") && stdout.contains(&port_s),
+        stdout.contains("Unresponsive") && stdout.contains(&port_s),
         "{stdout}"
     );
     assert!(record.exists(), "status 不得删掉进程仍在的记录");
@@ -5442,7 +5442,7 @@ fn logs_follows_daemon_and_exits_on_stop() {
     let _ = notes.join();
     let out = collected.lock().unwrap();
     assert!(
-        out.contains("实例已停止，日志跟踪结束"),
+        out.contains("The instance stopped. Log following has ended."),
         "logs 退出前应说明原因，实际: {out}"
     );
 }
@@ -5493,7 +5493,7 @@ fn logs_requires_port_when_multiple_instances() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(text.contains("必须指定端口号"), "实际: {text}");
+    assert!(text.contains("Specify a port"), "实际: {text}");
     assert!(text.contains(&port_a.to_string()), "应列出端口 a: {text}");
     assert!(text.contains(&port_b.to_string()), "应列出端口 b: {text}");
 
@@ -5505,7 +5505,7 @@ fn logs_requires_port_when_multiple_instances() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(text.contains("不支持 all"), "实际: {text}");
+    assert!(text.contains("does not support all"), "实际: {text}");
 }
 
 // ---------------------------------------------------------------------------
@@ -5527,7 +5527,7 @@ fn logs_reports_missing_instance() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("没有运行中的 aProxy 实例"),
+        stderr.contains("No running aProxy instance"),
         "实际: {stderr}"
     );
 }
@@ -6048,7 +6048,7 @@ fn logs_via_alias_connects_and_follows() {
     for _ in 0..100 {
         let hit = {
             let c = collected.lock().unwrap();
-            c.contains("正在连接 pid") && c.contains("启动 aProxy")
+            c.contains("Following pid") && c.contains("启动 aProxy")
         };
         if hit {
             saw_startup = true;
@@ -6090,7 +6090,7 @@ fn logs_via_alias_connects_and_follows() {
     let _ = notes.join();
     let out = collected.lock().unwrap();
     assert!(
-        out.contains("实例已停止，日志跟踪结束"),
+        out.contains("The instance stopped. Log following has ended."),
         "logs 退出前应说明原因，实际: {out}"
     );
 
@@ -6102,7 +6102,7 @@ fn logs_via_alias_connects_and_follows() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(text.contains("当前未在运行"), "实际: {text}");
+    assert!(text.contains("has no running instance"), "实际: {text}");
 
     // 清理别名（隔离 home 内本就随 tempdir 删除，此处对齐既有别名测试的收尾）
     let _ = home.cmd().args(["alias", "remove", &alias]).output();

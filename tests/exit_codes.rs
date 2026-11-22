@@ -545,7 +545,7 @@ fn logs_exits_4_when_there_is_nothing_to_read() {
     let home = TestHome::new();
     plain_failure(&home, &["logs"], 4);
     let stderr = plain_failure(&home, &["logs", &free_port().to_string()], 4);
-    assert!(stderr.contains("没有运行中的 aProxy 实例"), "{stderr}");
+    assert!(stderr.contains("No running aProxy instance"), "{stderr}");
     plain_failure(&home, &["logs", "no-such-alias"], 4);
 }
 
@@ -576,7 +576,7 @@ fn restore_exits_0_when_everything_is_restored_or_there_is_nothing_to_do() {
             text(&out.stderr)
         );
         assert!(
-            text(&out.stderr).contains("没在运行"),
+            text(&out.stderr).contains("is not running"),
             "{args:?}: {}",
             text(&out.stderr)
         );

@@ -1,5 +1,9 @@
 //! `aproxy status [--idle|--busy] [--json]`：只读清点 home 里的实例、记录与其他进程。
 
+#[path = "../i18n/status.rs"]
+mod text;
+use aproxy_ipc::i18n::current;
+
 use aproxy::daemon;
 use aproxy::ops::enumerate::{
     Enumerated, Enumeration, Liveness, RESTORE_REASON_CONFIG_MISSING, WATCHDOG_RUNNING, enumerate,
@@ -55,15 +59,16 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool, json: bo
     if !live.is_empty() {
         print_live(&live, now);
     } else if had_live {
-        let which = if idle_only { "闲置" } else { "活跃" };
-        println!("没有{which}的 aProxy 实例（阈值 {idle_threshold_secs} 秒）。");
+        let which = if idle_only {
+            text::idle(current())
+        } else {
+            text::active(current())
+        };
+        println!("{}", text::filtered(current(), which, idle_threshold_secs));
     }
 
     if !incompatible.is_empty() {
-        println!(
-            "无法采信应答的 aProxy 实例 ({})——协议版本不同或身份对不上，用与实例同版本的 aproxy 操作它:",
-            incompatible.len()
-        );
+        println!("{}", text::incompatible(current(), incompatible.len()));
         for entry in &incompatible {
             let port = entry.port;
             let (pid, version) = match &entry.instance {
@@ -74,58 +79,58 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool, json: bo
                 .reason
                 .as_ref()
                 .map_or("unknown", |reason| reason.code.as_str());
-            println!("  端口 {port}  pid {pid}  v{version}  原因 {code}");
+            println!(
+                "{}",
+                text::incompatible_row(current(), port, &pid, version, code)
+            );
         }
     }
     if !down.is_empty() {
-        println!(
-            "等待恢复的实例 ({})——没在运行，留着期望状态记录，aproxy restore 或看护者会拉起它:",
-            down.len()
-        );
+        println!("{}", text::pending(current(), down.len()));
         for entry in &down {
             let port = entry.port;
             if entry.restore_reason.as_deref() == Some(RESTORE_REASON_CONFIG_MISSING) {
-                println!("  端口 {port}（配置文件找不到）");
+                println!("{}", text::missing(current(), port));
             } else {
-                println!("  端口 {port}");
+                println!("{}", text::down_port(current(), port));
             }
-            println!("    不再需要它时执行 aproxy stop {port}");
+            println!("{}", text::forget(current(), port));
         }
     }
     if !had_live && unresponsive.is_empty() && incompatible.is_empty() && down.is_empty() {
-        println!("没有运行中的 aProxy 实例。");
+        println!("{}", text::none(current()));
     }
 
     if !filtered_enumeration.unreadable.is_empty() {
         println!(
-            "读不懂的记录 ({})，原样保留（多半由更新版本的 aproxy 写下，请用那个版本处理）:",
-            filtered_enumeration.unreadable.len()
+            "{}",
+            text::unreadable(current(), filtered_enumeration.unreadable.len())
         );
         for entry in &filtered_enumeration.unreadable {
             println!("  {}  [{}]", entry.file, entry.reason.code);
         }
     }
     if filtered_enumeration.gc_paused.is_some() {
-        println!("日志清理已暂停：run/ 里有读不懂的记录。");
+        println!("{}", text::gc_paused(current()));
     }
     if let Some(w) = &filtered_enumeration.watchdog {
         let since_scan = humanize_duration(now.saturating_sub(w.last_scan_at) / 1000);
         if w.state == WATCHDOG_RUNNING {
             println!(
-                "看护者: pid {}  v{}  最近扫描 {since_scan} 前",
-                w.pid, w.version
+                "{}",
+                text::watchdog(current(), w.pid, &w.version, &since_scan)
             );
         } else {
             println!(
-                "看护者: pid {}  v{}  已 {since_scan} 没有扫描（可能卡住了）",
-                w.pid, w.version
+                "{}",
+                text::watchdog_stale(current(), w.pid, &w.version, &since_scan)
             );
         }
     }
     if !filtered_enumeration.processes.is_empty() {
         println!(
-            "台账里的其他 aProxy 进程 ({}):",
-            filtered_enumeration.processes.len()
+            "{}",
+            text::processes(current(), filtered_enumeration.processes.len())
         );
         for process in &filtered_enumeration.processes {
             println!(
@@ -138,7 +143,7 @@ pub(crate) async fn handle_status_cmd(idle_only: bool, busy_only: bool, json: bo
 
 /// 列出可采信的实时状态；运行时长、闲置时长与最近错误的时刻使用同一次清点的时间。
 fn print_live(live: &[&Enumerated], now: u64) {
-    println!("运行中的 aProxy 实例 ({}):", live.len());
+    println!("{}", text::running(current(), live.len()));
     let cli_version = env!("CARGO_PKG_VERSION");
     for entry in live {
         // 清点只在控制通道给出可采信的应答时标为 Live，此时两份数据都在。
@@ -147,52 +152,61 @@ fn print_live(live: &[&Enumerated], now: u64) {
         let activity = &status.activity;
         let idle_secs = activity.idle_secs_at(now);
         println!(
-            "  端口 {}  pid {}  v{}  已运行 {}  闲置 {}",
-            daemon::port_of(&info.listen_addr),
-            info.pid,
-            info.version,
-            humanize_duration(now.saturating_sub(info.started_at) / 1000),
-            humanize_duration(idle_secs)
+            "{}",
+            text::live(
+                current(),
+                daemon::port_of(&info.listen_addr),
+                info.pid,
+                &info.version,
+                &humanize_duration(now.saturating_sub(info.started_at) / 1000),
+                &humanize_duration(idle_secs)
+            )
         );
         println!(
-            "    监听 http://{}   上游 {}   配置 {}",
-            info.listen_addr,
-            aproxy_ipc::redact::url(&info.base_url),
-            config_label(&info.config_path)
+            "{}",
+            text::endpoints(
+                current(),
+                &info.listen_addr,
+                &aproxy_ipc::redact::url(&info.base_url),
+                config_label(&info.config_path)
+            )
         );
         let err_text = match &activity.last_error {
             // 码在前，便于按码检索；没有码的（更旧的实例）只显示说明
-            Some(e) => format!(
-                "\"{}{}\"（{} 前）",
-                if e.code.is_empty() {
+            Some(e) => text::recent(
+                current(),
+                &if e.code.is_empty() {
                     String::new()
                 } else {
                     format!("{}: ", e.code)
                 },
-                e.message,
-                humanize_duration(now.saturating_sub(e.at) / 1000)
+                &e.message,
+                &humanize_duration(now.saturating_sub(e.at) / 1000),
             ),
-            None => "无".to_string(),
+            None => text::no_error(current()).to_string(),
         };
         println!(
-            "    请求 {}  在途 {}  重试 {}  救回 {}  最近错误: {}",
-            activity.requests_total,
-            activity.in_flight,
-            activity.retries_total,
-            activity.rescued_total,
-            err_text
+            "{}",
+            text::requests(
+                current(),
+                activity.requests_total,
+                activity.in_flight,
+                activity.retries_total,
+                activity.rescued_total,
+                &err_text
+            )
         );
         match status.state {
             daemon::InstanceState::Serving => {}
-            daemon::InstanceState::Starting => println!("    正在启动（还没开始接收请求）"),
+            daemon::InstanceState::Starting => println!("{}", text::starting(current())),
             // install 广播 prepare_swap 之后：滚动重启中该实例随时会被停止、
             // 用新 exe 重拉——外部不要在此窗口 stop/kill
             daemon::InstanceState::SwapPrepared => {
-                println!("    二进制更换中（install 滚动重启阶段，请勿手动干预此实例）");
+                println!("{}", text::swapping(current()));
             }
-            daemon::InstanceState::Stopping => println!("    正在退出"),
+            daemon::InstanceState::Stopping => println!("{}", text::stopping(current())),
             daemon::InstanceState::Unknown => {
-                println!("    状态未知（实例比当前 CLI 新，用同版本的 aproxy 查看）");
+                println!("{}", text::unknown(current()));
             }
         }
         // 混版本检测：CLI 与实例版本不一致说明该实例还在跑旧二进制（替换 exe
@@ -201,9 +215,13 @@ fn print_live(live: &[&Enumerated], now: u64) {
         // 错误配置；restart 按期望状态记录里的拉起规格拉起，不会指错。
         if info.version != cli_version {
             println!(
-                "    注意: 实例版本 v{} 与当前 CLI v{cli_version} 不同，替换二进制后执行 aproxy restart {} 可完成升级",
-                info.version,
-                daemon::port_of(&info.listen_addr)
+                "{}",
+                text::version(
+                    current(),
+                    &info.version,
+                    cli_version,
+                    daemon::port_of(&info.listen_addr)
+                )
             );
         }
     }
@@ -216,22 +234,23 @@ fn print_unresponsive(unresponsive: &[&daemon::InstanceRecord]) {
     if unresponsive.is_empty() {
         return;
     }
-    println!(
-        "无响应的 aProxy 实例 ({})——进程仍在，但不应答控制通道:",
-        unresponsive.len()
-    );
+    println!("{}", text::unresponsive(current(), unresponsive.len()));
     for info in unresponsive {
         let port = daemon::port_of(&info.listen_addr);
         println!(
-            "  端口 {port}  pid {}  v{}  配置 {}\n    可用 aproxy stop {port} --force 结束（或 aproxy restart {port} --force 重启）",
-            info.pid,
-            info.version,
-            config_label(&info.config_path)
+            "{}",
+            text::unresponsive_row(
+                current(),
+                port,
+                info.pid,
+                &info.version,
+                config_label(&info.config_path)
+            )
         );
     }
 }
 
 /// 展示用的配置文件路径；没有配置文件的实例显示「（没有配置文件）」。
 fn config_label(config_path: &Option<String>) -> &str {
-    config_path.as_deref().unwrap_or("（没有配置文件）")
+    config_path.as_deref().unwrap_or(text::no_config(current()))
 }

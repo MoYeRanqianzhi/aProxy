@@ -128,7 +128,7 @@ pub(crate) fn finish_json(code: i32) {
 pub(crate) struct Failure {
     pub(crate) code: &'static str,
     pub(crate) message: String,
-    /// 仅在终端使用中文时保留其文字；公开文档始终取 message。
+    /// 中英文同时有读者时才保存第二种语言的文字。
     terminal: Option<String>,
     pub(crate) details: Box<Value>,
     /// 同一个握手诊断的退出码取决于故障能否自行恢复。
@@ -152,17 +152,40 @@ impl Failure {
         render: impl Fn(Lang) -> String,
         details: Value,
     ) -> Self {
-        let mut failure = Self::new(code, render(Lang::En), details);
-        if current() == Lang::Zh {
-            failure.terminal = Some(render(Lang::Zh));
+        Self::for_readers(
+            code,
+            render,
+            details,
+            current(),
+            JSON_OUTPUT.get().is_some(),
+        )
+    }
+
+    fn for_readers(
+        code: &'static str,
+        render: impl Fn(Lang) -> String,
+        details: Value,
+        terminal: Lang,
+        machine: bool,
+    ) -> Self {
+        let mut failure = Self::new(
+            code,
+            render(if machine { Lang::En } else { terminal }),
+            details,
+        );
+        if machine && terminal != Lang::En {
+            failure.terminal = Some(render(terminal));
         }
         failure
     }
 
-    /// 给两种输出补上同一个操作阶段，不改变原来的诊断码、细节或退出码。
+    /// 给实际存在的输出补上同一操作阶段，纯终端命令不构造英文副本。
     fn context(mut self, render: impl Fn(Lang, &str) -> String) -> Self {
-        self.terminal = (current() == Lang::Zh).then(|| render(Lang::Zh, self.terminal()));
-        self.message = render(Lang::En, &self.message);
+        let machine = JSON_OUTPUT.get().is_some();
+        if machine && current() == Lang::Zh {
+            self.terminal = Some(render(Lang::Zh, self.terminal()));
+        }
+        self.message = render(if machine { Lang::En } else { current() }, &self.message);
         self
     }
 
@@ -424,6 +447,28 @@ pub(crate) fn require_cfg_path(cfg_path: Result<PathBuf, Failure>, json: bool) -
 mod tests {
     use super::*;
     use clap::Parser as _;
+
+    #[test]
+    fn failure_formats_only_for_existing_readers() {
+        for (machine, expected) in [(false, vec![Lang::Zh]), (true, vec![Lang::En, Lang::Zh])] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let f = Failure::for_readers(
+                "command_failed",
+                |l| {
+                    calls.borrow_mut().push(l);
+                    format!("{l:?}")
+                },
+                json!({}),
+                Lang::Zh,
+                machine,
+            );
+            assert_eq!(f.terminal(), "Zh");
+            assert_eq!(calls.into_inner(), expected);
+            if machine {
+                assert_eq!(f.message, "En");
+            }
+        }
+    }
 
     #[test]
     fn explicit_config_path_is_made_absolute() {

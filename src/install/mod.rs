@@ -104,12 +104,34 @@ impl InstallFailure {
 
     /// 交棒后使用接手版本留下的失败记录；旧版本没写码时仍然按普通失败退出。
     pub fn recorded(state: &state::InstallState, message: String) -> Self {
+        let mut cause = state
+            .error_render
+            .clone()
+            .and_then(|v| serde_json::from_value::<Box<Cause>>(v).ok());
+        // 私有原因必须和同一位置的公开诊断一致；不能让错序、缺项的排版数据改写证据。
+        if let Some(Cause::Precheck { issues, .. }) = cause.as_deref_mut() {
+            let diagnostics = state
+                .error_details
+                .as_ref()
+                .and_then(|v| v["diagnostics"].as_array());
+            *issues = diagnostics
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(|(i, d)| {
+                    let text = d["message"].as_str().unwrap_or_default();
+                    issues
+                        .get(i)
+                        .filter(|r| r.render(Lang::En) == text)
+                        .cloned()
+                        .unwrap_or_else(|| aproxy_ipc::i18n::diagnostic::Reason::Verbatim {
+                            text: text.to_owned(),
+                        })
+                })
+                .collect();
+        }
         Self {
-            cause: state
-                .error_render
-                .clone()
-                .and_then(|v| serde_json::from_value::<Box<Cause>>(v).ok())
-                .filter(|c| c.render(Lang::En) == message),
+            cause: cause.filter(|c| c.render(Lang::En) == message),
             code: state
                 .error_code
                 .clone()

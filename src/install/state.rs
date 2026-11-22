@@ -877,6 +877,41 @@ mod tests {
     }
 
     #[test]
+    fn precheck_preserves_the_first_cause_and_matches_each_recorded_diagnostic() {
+        use super::super::{InstallFailure, reason::Cause};
+        use aproxy_ipc::i18n::{Lang, diagnostic::Reason};
+        let reasons = vec![
+            Reason::InstallMissing,
+            Reason::InstallRead {
+                error: "denied".into(),
+            },
+        ];
+        let failure = InstallFailure::because(
+            "install_precheck_failed",
+            Cause::Precheck {
+                port: 92,
+                issues: reasons.clone(),
+            },
+        );
+        assert!(failure.message.contains(&reasons[0].render(Lang::En)));
+        let mut state = InstallState::new_marking("v", InstallSource::Github);
+        state.error_details = Some(
+            serde_json::json!({"diagnostics":reasons.iter().map(|r|serde_json::json!({"message":r.render(Lang::En)})).collect::<Vec<_>>() }),
+        );
+        for issues in [vec![reasons[1].clone(), reasons[0].clone()], vec![]] {
+            state.error_render =
+                Some(serde_json::to_value(Cause::Precheck { port: 92, issues }).unwrap());
+            let saved = InstallFailure::recorded(&state, failure.message.clone());
+            let Some(Cause::Precheck { issues, .. }) = saved.cause.as_deref() else {
+                panic!("missing reconciled precheck")
+            };
+            for (r, actual) in reasons.iter().zip(issues) {
+                assert_eq!(actual.render(Lang::Zh), r.render(Lang::En));
+            }
+        }
+    }
+
+    #[test]
     fn remove_clears_lock() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();

@@ -227,7 +227,14 @@ impl Cause {
                         .join(if lang == Lang::Zh { "、" } else { ", " }),
                 ),
             },
-            Self::Precheck { port, .. } => precheck(lang, *port),
+            Self::Precheck { port, issues } => {
+                let mut summary = precheck(lang, *port);
+                if let Some(reason) = issues.first() {
+                    summary.push(' ');
+                    summary.push_str(&reason.render(lang));
+                }
+                summary
+            }
             Self::NoReason => no_reason(lang).into(),
             Self::Missing => successor_missing(lang).into(),
             Self::Aborted => aborted(lang).into(),

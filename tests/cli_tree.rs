@@ -643,3 +643,24 @@ fn json_command_io_errors_keep_a_result_after_preflight() {
     let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(doc["error"]["code"], "command_failed");
 }
+
+#[test]
+fn english_force_guidance_discloses_downgrade_and_process_scope() {
+    use aproxy::install::reason::Cause;
+    use aproxy_ipc::i18n::Lang;
+    let help = run(&TestHome::new(), &["install", "--help"]);
+    let help = text(&help.stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        help.contains("latest, cannot be older than the running version")
+            && help.contains("never below 0.2.0"),
+        "{help}"
+    );
+    let warning = Cause::Unmanaged(vec![17]).render(Lang::En);
+    assert!(
+        warning.contains("(pid 17)")
+            && warning.contains("stops all other aProxy processes in this home")
+    );
+}

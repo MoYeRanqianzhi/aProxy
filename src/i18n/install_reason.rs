@@ -5,11 +5,11 @@ use aproxy_ipc::{
     message,
 };
 use serde::{Deserialize, Serialize};
-message!(unmanaged(pids: &str), en: "live instances started by an older version are in this home (pid {pids}); stop them with the aproxy that started them (aproxy stop all), or run aproxy install --force", zh: "这个 home 里有旧版本启动、本次安装管不了的实例还在运行（pid {pids}）。先用启动它们的那个版本执行 aproxy stop all，再重新安装；或者改用 aproxy install --force（会结束全部 aproxy 进程）。");
+message!(unmanaged(pids: &str), en: "live instances started by an older version are in this home (pid {pids}); stop them with the aproxy that started them (aproxy stop all), then reinstall, or run aproxy install --force, which stops all other aProxy processes in this home", zh: "这个 home 里有旧版本启动、本次安装管不了的实例还在运行（pid {pids}）。先用启动它们的那个版本执行 aproxy stop all，再重新安装；或者改用 aproxy install --force（会结束全部 aproxy 进程）。");
 
-message!(foreground(p: u16), en: "The instance on port {p} is running in the foreground. Nothing was changed. Stop it in its terminal with Ctrl+C, with aproxy stop {p}, or with its service manager. Run aproxy install, then start it as before.", zh: "端口 {p} 上的实例在前台运行，安装无法替它重启。什么都没有改动：实例照常运行，二进制没换。先停掉它（在启动它的终端里按 Ctrl+C，或执行 aproxy stop {p}；交给服务管理器运行的，用服务管理器停止），再执行 aproxy install，装好之后照原来的方式启动它。");
+message!(foreground(p: u16), en: "The instance on port {p} is running in the foreground. The installer cannot restart it. The instance is still running and the binary was not replaced. Stop it in its terminal with Ctrl+C, with aproxy stop {p}, or with its service manager. Run aproxy install, then start it as before.", zh: "端口 {p} 上的实例在前台运行，安装无法替它重启。什么都没有改动：实例照常运行，二进制没换。先停掉它（在启动它的终端里按 Ctrl+C，或执行 aproxy stop {p}；交给服务管理器运行的，用服务管理器停止），再执行 aproxy install，装好之后照原来的方式启动它。");
 
-message!(foreground_many(ports: &str), en: "The instances on ports {ports} are running in the foreground. Nothing was changed. Stop each instance in its terminal with Ctrl+C, with aproxy stop <port>, or with its service manager. Run aproxy install, then start them as before.", zh: "端口 {ports} 上的实例在前台运行，安装无法替它们重启。什么都没有改动：实例照常运行，二进制没换。先停掉它们（在各自的终端里按 Ctrl+C，或逐个执行 aproxy stop <端口>；交给服务管理器运行的，用服务管理器停止），再执行 aproxy install，装好之后照原来的方式启动它们。");
+message!(foreground_many(ports: &str), en: "The instances on ports {ports} are running in the foreground. The installer cannot restart them. They are still running and the binary was not replaced. Stop each instance in its terminal with Ctrl+C, with aproxy stop <port>, or with its service manager. Run aproxy install, then start them as before.", zh: "端口 {ports} 上的实例在前台运行，安装无法替它们重启。什么都没有改动：实例照常运行，二进制没换。先停掉它们（在各自的终端里按 Ctrl+C，或逐个执行 aproxy stop <端口>；交给服务管理器运行的，用服务管理器停止），再执行 aproxy install，装好之后照原来的方式启动它们。");
 
 message!(precheck(port: u16), en: "Precheck failed for the instance on port {port}: the target version cannot load its configuration. Nothing was changed. The instance is still running and the binary was not replaced.", zh: "安装前的预检没有通过：端口 {port} 的实例按新版本解析配置时出错。什么都没有改动：实例照常运行，二进制没换。");
 

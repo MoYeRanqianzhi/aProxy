@@ -90,8 +90,7 @@ fn syntax(before: &str) -> TomlIssue {
 /// 锁内读出的可编辑文档，保存时沿用原来的行尾习惯。
 pub(super) struct DesktopToml {
     doc: DocumentMut,
-    crlf: bool,
-    trailing_newline: bool,
+    original: Option<String>,
 }
 impl DesktopToml {
     /// 同时限制读入大小与解析器输入；损坏的文件不触发写盘。
@@ -100,7 +99,7 @@ impl DesktopToml {
         let io = || issue(TomlIssueKind::Io);
         safe(&path, StateFile::Preferences, false).map_err(|_| io())?;
         let mut bytes = Vec::new();
-        let text = match File::open(path) {
+        let original = match File::open(path) {
             Ok(f) => {
                 f.take((LIMIT + 1) as u64)
                     .read_to_end(&mut bytes)
@@ -108,28 +107,58 @@ impl DesktopToml {
                 if bytes.len() > LIMIT {
                     return Err(issue(TomlIssueKind::TooLarge));
                 }
-                std::str::from_utf8(&bytes)
-                    .map_err(|e| syntax(std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap()))?
+                Some(
+                    std::str::from_utf8(&bytes)
+                        .map_err(|e| {
+                            syntax(std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap())
+                        })?
+                        .to_owned(),
+                )
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => TEMPLATE,
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
             Err(_) => return Err(io()),
         };
+        let text = original.as_deref().unwrap_or(TEMPLATE);
         let doc = text
             .parse::<DocumentMut>()
             .map_err(|e| syntax(text.get(..e.span().map_or(0, |s| s.start)).unwrap_or(text)))?;
-        Ok(Self {
-            doc,
-            crlf: text.contains("\r\n"),
-            trailing_newline: text.ends_with('\n') || text.is_empty(),
-        })
+        Ok(Self { doc, original })
     }
     /// 所有写者受同一份文件的上限约束，包括扩展设置。
     pub(super) fn save(&self, store: &Store) -> R<()> {
         let mut text = self.doc.to_string();
-        if self.crlf {
-            text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+        let original = self.original.as_deref().unwrap_or(TEMPLATE);
+        if original.contains("\r\n") {
+            // toml_edit 统一输出 LF。对混用行尾的手写文档，按未改行的内容顺序找回原来的分隔符。
+            let lines: Vec<_> = original.split_terminator('\n').collect();
+            let mut positions = std::collections::HashMap::<&str, Vec<usize>>::new();
+            for (n, line) in lines.iter().enumerate() {
+                positions
+                    .entry(line.trim_end_matches('\r'))
+                    .or_default()
+                    .push(n);
+            }
+            let mut rendered = String::with_capacity(text.len());
+            let mut next = 0;
+            for line in text.split_terminator('\n') {
+                let line = line.trim_end_matches('\r');
+                let found = positions
+                    .get(line)
+                    .and_then(|v| v.get(v.partition_point(|&i| i < next)))
+                    .copied();
+                let old = found.unwrap_or(next).min(lines.len() - 1);
+                rendered.push_str(line);
+                if lines[old].ends_with('\r') {
+                    rendered.push('\r');
+                }
+                rendered.push('\n');
+                if let Some(i) = found {
+                    next = i + 1;
+                }
+            }
+            text = rendered;
         }
-        if !self.trailing_newline && text.ends_with('\n') {
+        if !original.is_empty() && !original.ends_with('\n') && text.ends_with('\n') {
             text.pop();
             if text.ends_with('\r') {
                 text.pop();
@@ -140,6 +169,14 @@ impl DesktopToml {
         }
         crate::fsx::write_atomic_private(&store.dir.join("desktop.toml"), text.as_bytes())
             .map_err(|_| Fault::DesktopToml(issue(TomlIssueKind::Io)))
+    }
+    /// 来源记录提交失败时恢复精确原文；原来没有文档则不留下模板。
+    pub(super) fn restore(&self, store: &Store) -> std::io::Result<()> {
+        let path = store.dir.join("desktop.toml");
+        match &self.original {
+            Some(text) => crate::fsx::write_atomic_private(&path, text.as_bytes()),
+            None => std::fs::remove_file(path),
+        }
     }
     /// 缺键正常，只有已出现的坏值才提示；未知字段保留在语法树里。
     pub(super) fn preferences(&self) -> (Preferences, Vec<String>, Vec<TomlIssue>) {

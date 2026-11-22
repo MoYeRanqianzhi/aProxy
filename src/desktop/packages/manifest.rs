@@ -64,6 +64,7 @@ impl<'de> Visitor<'de> for Bounded {
         Ok(v.into())
     }
 }
+/// 逐层检查重复键与深度，最后才构建 JSON 对象。
 pub(super) fn object(bytes: &[u8], depth: u8) -> Option<Map<String, Value>> {
     let mut d = serde_json::Deserializer::from_slice(
         bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes),

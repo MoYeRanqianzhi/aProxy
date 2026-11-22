@@ -18,7 +18,6 @@ struct Records {
 }
 struct Ledger {
     path: PathBuf,
-    original: Option<Vec<u8>>,
     records: Records,
 }
 impl Ledger {
@@ -26,7 +25,11 @@ impl Ledger {
         let path = store.dir.join("packages.json");
         safe(&path, StateFile::Packages, false)?;
         let original = match fs::File::open(&path) {
-            Ok(f) => Some(read_bound(f, 32 << 20, "records-bytes", None)?),
+            Ok(f) => match read_bound(f, 32 << 20, "records-bytes", None) {
+                Ok(bytes) => Some(bytes),
+                Err(Fault::DesktopPackage(issue)) if issue.reason == "limit" => None,
+                Err(e) => return Err(e),
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => return Err(bad("io", None)),
         };
@@ -38,28 +41,22 @@ impl Ledger {
                 version: 1,
                 packages: BTreeMap::new(),
             });
-        Ok(Self {
-            path,
-            original,
-            records,
-        })
+        Ok(Self { path, records })
     }
-    // TOML 后写：拒绝手工文档的写入时，要还原原始记录字节，包括之前读不懂的版本。
+    // 先写至多 1 MiB 的用户文档；来源记录损坏或太大也无需读入内存备份。
     fn commit(&self, store: &Store, toml: Option<&DesktopToml>) -> R<()> {
         let bytes = serde_json::to_vec(&self.records).map_err(|_| bad("io", None))?;
         if bytes.len() > 32 << 20 {
             return Err(limit("records-bytes", 32 << 20, None));
         }
-        crate::fsx::write_atomic_private(&self.path, &bytes).map_err(|_| bad("io", None))?;
-        if let Some(doc) = toml
-            && let Err(e) = doc.save(store)
-        {
-            match &self.original {
-                Some(b) => crate::fsx::write_atomic_private(&self.path, b),
-                None => fs::remove_file(&self.path),
+        if let Some(doc) = toml {
+            doc.save(store)?;
+        }
+        if crate::fsx::write_atomic_private(&self.path, &bytes).is_err() {
+            if let Some(doc) = toml {
+                doc.restore(store).map_err(|_| bad("rollback", None))?;
             }
-            .map_err(|_| bad("rollback", None))?;
-            return Err(e);
+            return Err(bad("io", None));
         }
         Ok(())
     }
@@ -88,8 +85,7 @@ fn data_bytes(store: &Store, id: &str) -> R<u64> {
     let mut total = 0u64;
     while let Some(d) = dirs.pop() {
         for name in d.names().map_err(|e| file_error(e, None))? {
-            let Some(n) = name.to_str() else { continue };
-            match d.node(n) {
+            match d.node(&name) {
                 Ok(Some(Node::Dir(child))) => dirs.push(child),
                 Ok(Some(Node::File(f))) => {
                     total = total.saturating_add(f.metadata().map_err(|_| bad("io", None))?.len())
@@ -170,6 +166,7 @@ fn inspect(
         data_bytes: size,
     }
 }
+/// 只打开合法且已安装的包目录，把链接与内部暂存名字挡在数据操作之外。
 pub(super) fn read_dir_id(store: &Store, id: &str) -> R<Dir> {
     known(id)?;
     let base = Dir::open(&root(store)?).map_err(|e| file_error(e, None))?;

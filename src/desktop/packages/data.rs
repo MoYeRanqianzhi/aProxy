@@ -4,6 +4,7 @@ use serde_json::{Map, Value};
 const STORAGE: u64 = 4 << 20;
 const QUOTA: u64 = 512 << 20;
 const FILES: u64 = 1000;
+/// 验证磁盘上的入口与包种类，不能把主题或遗留数据目录当作已安装扩展。
 pub(super) fn extension(store: &Store, id: &str) -> R<()> {
     let d = lifecycle::read_dir_id(store, id)?;
     let m = installed_manifest(&d, id)?;
@@ -58,6 +59,7 @@ fn storage(d: &Dir) -> R<Map<String, Value>> {
         }
     }
 }
+/// 从该扩展的存储文件读出对象；尚未写入时返回空对象，不创建目录。
 pub(super) fn storage_read(store: &Store, id: &str) -> R<Map<String, Value>> {
     extension(store, id)?;
     match data_dir(store, id, false)? {
@@ -65,6 +67,7 @@ pub(super) fn storage_read(store: &Store, id: &str) -> R<Map<String, Value>> {
         None => Ok(Map::new()),
     }
 }
+/// 只在一次加锁的写入中合并改动并计算总配额，显式重置可以恢复损坏存储。
 pub(super) fn storage_write(
     store: &Store,
     id: &str,
@@ -122,13 +125,12 @@ fn inventory(d: &Dir) -> R<Inventory> {
         list: vec![],
     };
     for n in d.names().map_err(|e| file_error(e, None))? {
-        let Some(s) = n.to_str() else { continue };
-        match d.node(s) {
+        match d.node(&n) {
             Ok(Some(Node::File(f))) => {
                 let md = f.metadata().map_err(|_| bad("io", None))?;
                 v.count += 1;
                 v.bytes = v.bytes.saturating_add(md.len());
-                if valid_name(s) {
+                if let Some(s) = n.to_str().filter(|s| valid_name(s)) {
                     v.list.push(info(s, &md)?);
                 }
             }
@@ -139,6 +141,7 @@ fn inventory(d: &Dir) -> R<Inventory> {
     v.list.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(v)
 }
+/// 仅列出有效名称的普通文件；不把不受支持的手写条目暴露给页面。
 pub(super) fn list(store: &Store, id: &str) -> R<Vec<FileInfo>> {
     extension(store, id)?;
     if let Some(d) = data_dir(store, id, false)?
@@ -148,6 +151,7 @@ pub(super) fn list(store: &Store, id: &str) -> R<Vec<FileInfo>> {
     }
     Ok(vec![])
 }
+/// 返回原始字节，避免大文件经过 JSON 数组编码。
 pub(super) fn read(store: &Store, id: &str, n: &str) -> R<Vec<u8>> {
     name(n)?;
     extension(store, id)?;
@@ -156,6 +160,7 @@ pub(super) fn read(store: &Store, id: &str, n: &str) -> R<Vec<u8>> {
     let f = files(&d, false)?.ok_or_else(missing)?;
     read_bound(file(&f, n)?, FILE, "file-bytes", Some(n))
 }
+/// 对替换计入净增量，通过同目录换名一次交付完整文件。
 pub(super) fn write(store: &Store, id: &str, n: &str, bytes: Vec<u8>) -> R<FileInfo> {
     name(n)?;
     extension(store, id)?;
@@ -191,6 +196,7 @@ pub(super) fn write(store: &Store, id: &str, n: &str, bytes: Vec<u8>) -> R<FileI
     f.write(n, &bytes).map_err(|e| file_error(e, Some(n)))?;
     info(n, &file(&f, n)?.metadata().map_err(|_| bad("io", Some(n)))?)
 }
+/// 删除单个普通文件；重复删除已不存在的条目也是成功。
 pub(super) fn delete(store: &Store, id: &str, n: &str) -> R<()> {
     name(n)?;
     extension(store, id)?;

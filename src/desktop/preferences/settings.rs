@@ -104,7 +104,7 @@ impl DesktopToml {
         changes: Map<String, Json>,
     ) -> R<Map<String, Json>> {
         let mut item = self.doc.as_item_mut();
-        for k in ["extensions", "settings", id] {
+        for (depth, k) in ["extensions", "settings", id].into_iter().enumerate() {
             let inline = item.is_inline_table();
             let t = item
                 .as_table_like_mut()
@@ -114,7 +114,7 @@ impl DesktopToml {
                     Item::Value(InlineTable::new().into())
                 } else {
                     let mut t = Table::new();
-                    t.set_implicit(k != id);
+                    t.set_implicit(depth < 2);
                     Item::Table(t)
                 }
             });

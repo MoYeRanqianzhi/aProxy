@@ -468,7 +468,7 @@ async fn private_window_state_is_bounded_resettable_and_write_only_for_secrets()
             .unwrap()
             .contains("# installed extensions to load, in this order")
     );
-    let text = "# header\r\nmode  =  'dark'  # keep\r\nmascot = 42\r\n[extensions]\r\nenabled=['zzz','aaa']\r\n[unrelated]\r\nkey = 'strange' # leave alone";
+    let text = "# header\r\nmode  =  'dark'  # keep\r\nmascot = 42\n[extensions]\r\nenabled=['zzz','aaa']\r\n[unrelated]\r\nkey = 'strange' # leave alone";
     std::fs::write(&toml, text).unwrap();
     let state = host.read_desktop_state().await.unwrap();
     assert_eq!(state.desktop_toml.len(), 1);

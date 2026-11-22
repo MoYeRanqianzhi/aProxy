@@ -27,6 +27,7 @@ type Contents = (
     u64,
 );
 impl<'a> Tree<'a> {
+    /// 为独占暂存目录建立清单；所有输入共用相同的计数和路径检查。
     pub(super) fn new(stage: &'a Path) -> Self {
         Self {
             stage,
@@ -98,6 +99,7 @@ impl<'a> Tree<'a> {
         self.path(path, true)?;
         fs::create_dir_all(self.stage.join(path)).map_err(|_| bad("io", Some(path)))
     }
+    /// 逐项核验目录源，读取时以已打开的父目录定位，拒绝链接。
     pub(super) fn directory(&mut self, d: &Dir, prefix: &str) -> R<()> {
         for name in d.names().map_err(|e| file_error(e, Some(prefix)))? {
             let name = name.to_str().ok_or_else(|| bad("path", None))?;
@@ -130,6 +132,7 @@ impl<'a> Tree<'a> {
         }
         Ok(())
     }
+    /// 先核对中央目录的路径、编码及大小，再逐项解压到暂存区。
     pub(super) fn zip(&mut self, bytes: &[u8]) -> R<()> {
         let mut z = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|_| bad("archive", None))?;
         if z.has_duplicate_names() {
@@ -202,6 +205,7 @@ impl<'a> Tree<'a> {
         }
         Ok(())
     }
+    /// 从暂存副本核验清单与入口文件，保证安装的正是页面检查的内容。
     pub(super) fn finish(self) -> R<Contents> {
         let dir = Dir::open(self.stage).map_err(|e| file_error(e, None))?;
         let m = manifest::parse(&read_bound(

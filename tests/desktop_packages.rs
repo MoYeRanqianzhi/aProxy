@@ -216,6 +216,24 @@ async fn layouts_paths_links_and_formats_do_not_expand_the_install_surface() {
         m.push((name.into(), vec![]));
         assert!(check(&m).await.is_err(), "{name}");
     }
+    for path in [
+        format!("assets/{}", "a".repeat(101)),
+        format!("assets/{}/{}.png", "a".repeat(99), "b".repeat(95)),
+    ] {
+        let mut m = members("theme");
+        m.push((path, vec![]));
+        assert_eq!(check_error(check(&m).await.unwrap_err()).reason, "path");
+    }
+    for (p, bytes, issue) in [
+        ("theme.css", vec![0xff], "text"),
+        ("theme.css", vec![0; (1 << 20) + 1], "limit"),
+        ("theme.json", vec![b' '; 65537], "limit"),
+    ] {
+        let mut m = members("theme");
+        m.retain(|(n, _)| n != p);
+        m.push((p.into(), bytes));
+        assert_eq!(check_error(check(&m).await.unwrap_err()).reason, issue);
+    }
     let mut m = members("extension");
     m.retain(|(p, _)| p != "main.mjs");
     assert_eq!(check_error(check(&m).await.unwrap_err()).reason, "missing");
@@ -614,6 +632,20 @@ async fn lifecycle_preserves_data_order_and_provenance_but_not_removed_code() {
         check_error(check("theme", "sample.one", "3.0.0").await.unwrap_err()).reason,
         "kind-change"
     );
+    // 损坏、超过读入上限和未来版本的机器账本均不阻止使用磁盘上的包，安装会写出可读记录。
+    let ledger = desktop.join("packages.json");
+    for bytes in [b"{".as_slice(), br#"{"version":2,"packages":{}}"#] {
+        fs::write(&ledger, bytes).unwrap();
+        assert!(host.package_list().await.unwrap()[0].source.is_none());
+        let c = check("extension", "sample.one", "1.0.0").await.unwrap();
+        host.package_install(c.token, false).await.unwrap();
+        assert!(host.package_list().await.unwrap()[0].source.is_some());
+    }
+    fs::File::create(&ledger)
+        .unwrap()
+        .set_len((32 << 20) + 1)
+        .unwrap();
+    assert!(host.package_list().await.unwrap()[0].source.is_none());
     let c = check("theme", "theme.two", "1.0.0").await.unwrap();
     let e = host.package_install(c.token, true).await.unwrap();
     assert!(!e.enabled && e.theme.unwrap()["x"] == 42);

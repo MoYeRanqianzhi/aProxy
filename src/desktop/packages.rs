@@ -45,6 +45,7 @@ fn field(k: &str) -> Fault {
         ..issue("field", Some("manifest.json"))
     })
 }
+/// 限额与资源名是可翻译错误的参数，不用解析英文诊断。
 pub(super) fn limit(k: &str, max: u64, path: Option<&str>) -> Fault {
     Fault::DesktopPackage(PackageIssue {
         limit: Some(k.into()),
@@ -115,7 +116,7 @@ fn source_name(name: &str) -> R<String> {
     if name.is_empty() || name.contains(['/', '\\', '\0']) {
         return Err(Fault::DesktopBadInput {});
     }
-    Ok(manifest::clean(name).chars().take(200).collect())
+    Ok(manifest::clean(name))
 }
 
 /// 暂存目录由句柄持有；失败、取消与窗口退出都会释放未交付的副本。
@@ -124,6 +125,7 @@ pub(super) struct Pending {
     check: PackageCheck,
     expires: Instant,
     github: Option<GithubFacts>,
+    source_file_name: Option<String>,
 }
 impl Pending {
     fn expired(&self, now: Instant) -> bool {
@@ -165,23 +167,25 @@ impl DesktopHome {
                 .trim_start_matches(".staging-")
                 .to_owned();
             let mut tree = unpack::Tree::new(stage.path());
+            let mut source_file_name = None;
             let mut unzip = |name: String, bytes: Vec<u8>| -> R<PackageSource> {
                 if bytes.len() as u64 > FILE {
                     return Err(limit("zip-bytes", FILE, None));
                 }
                 let source = PackageSource::File {
-                    name,
+                    name: source_name(&name)?,
                     sha256: Sha256::digest(&bytes)
                         .iter()
                         .map(|b| format!("{b:02x}"))
                         .collect(),
                     bytes: bytes.len() as u64,
                 };
+                source_file_name = Some(name);
                 tree.zip(&bytes)?;
                 Ok(source)
             };
             let source = match source {
-                Source::Bytes(name, data) => unzip(source_name(&name)?, data)?,
+                Source::Bytes(name, data) => unzip(name, data)?,
                 Source::Path(p) => {
                     if !p.is_absolute() {
                         return Err(Fault::DesktopBadInput {});
@@ -199,7 +203,7 @@ impl DesktopHome {
                         .ok_or_else(|| bad("missing", None))?
                     {
                         Node::File(f) => {
-                            unzip(source_name(name)?, read_bound(f, FILE, "zip-bytes", None)?)?
+                            unzip(name.to_owned(), read_bound(f, FILE, "zip-bytes", None)?)?
                         }
                         Node::Dir(d) => {
                             tree.directory(&d, "")?;
@@ -244,6 +248,7 @@ impl DesktopHome {
                 check: check.clone(),
                 expires: Instant::now() + TTL,
                 github: None,
+                source_file_name,
             });
             Ok(check)
         }))
@@ -326,11 +331,18 @@ impl PackageOps for DesktopHome {
             let (manifest, source, proxy) = self
                 .state_work(StateFile::Packages, move |host, _| {
                     let mut guard = host.package.lock().unwrap();
-                    let c = &current(&mut guard, &t, Instant::now())?.check;
+                    let pending = current(&mut guard, &t, Instant::now())?;
+                    let c = &pending.check;
+                    let mut source = c.source.clone();
+                    if let (PackageSource::File { name, .. }, Some(original)) =
+                        (&mut source, &pending.source_file_name)
+                    {
+                        name.clone_from(original);
+                    }
                     let proxy =
                         crate::settings::load_from(&crate::settings::settings_path_in(&host.home))
                             .download_proxy;
-                    Ok((c.manifest.clone(), c.source.clone(), proxy))
+                    Ok((c.manifest.clone(), source, proxy))
                 })
                 .await?;
             let facts = github::facts(

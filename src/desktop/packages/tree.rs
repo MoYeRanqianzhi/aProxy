@@ -1,5 +1,6 @@
 //! 对目录的读取相对于已验证的父句柄；不能让检查和打开之间替换的链接改变实际读到的文件。
 use std::{ffi::OsString, fs::File, io, path::Path};
+/// 分类原生打开失败，不把操作系统诊断或本机路径传给页面。
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Why {
     Io,
@@ -12,6 +13,7 @@ pub(super) struct Dir {
     #[cfg(windows)]
     path: std::path::PathBuf,
 }
+/// 只返回已打开的普通文件或目录，后续读取不重新解析名字。
 pub(super) enum Node {
     Dir(Dir),
     File(File),
@@ -64,11 +66,11 @@ impl Dir {
             path: path.to_owned(),
         })
     }
-    // 名字由上层先按单个路径分量核验，不能让带斜线的外部输入直接到达 openat/join。
-    pub(super) fn node(&self, name: &str) -> Result<Option<Node>, Why> {
-        self.open_child(name, false)
+    /// 名字由上层先按单个路径分量核验，不能让带斜线的外部输入直接到达 openat/join。
+    pub(super) fn node(&self, name: impl AsRef<std::ffi::OsStr>) -> Result<Option<Node>, Why> {
+        self.open_child(name.as_ref(), false)
     }
-    fn open_child(&self, name: &str, mutable: bool) -> Result<Option<Node>, Why> {
+    fn open_child(&self, name: &std::ffi::OsStr, mutable: bool) -> Result<Option<Node>, Why> {
         #[cfg(unix)]
         let _ = mutable;
         #[cfg(windows)]
@@ -79,7 +81,8 @@ impl Dir {
         #[cfg(unix)]
         let opened = {
             use std::os::fd::{AsRawFd, FromRawFd};
-            let c = std::ffi::CString::new(name).map_err(|_| Why::FileType)?;
+            use std::os::unix::ffi::OsStrExt;
+            let c = std::ffi::CString::new(name.as_bytes()).map_err(|_| Why::FileType)?;
             let mut meta = std::mem::MaybeUninit::uninit();
             let fd = self.file.as_raw_fd();
             if unsafe {
@@ -146,7 +149,7 @@ impl Dir {
     }
     /// 目录由父句柄逐级建立；读操作传 false，不会因读到缺项就写磁盘。
     pub(super) fn directory(&self, name: &str, create: bool) -> Result<Option<Dir>, Why> {
-        match self.open_child(name, true)? {
+        match self.open_child(name.as_ref(), true)? {
             Some(Node::Dir(d)) => return Ok(Some(d)),
             Some(_) => return Err(Why::FileType),
             None if !create => return Ok(None),
@@ -171,7 +174,7 @@ impl Dir {
                 return Err(Why::Io);
             }
         }
-        match self.open_child(name, true)? {
+        match self.open_child(name.as_ref(), true)? {
             Some(Node::Dir(d)) => Ok(Some(d)),
             None => Err(Why::Io),
             _ => Err(Why::FileType),
@@ -251,6 +254,7 @@ impl Dir {
             }
         }
     }
+    /// 保留名称的原生编码，以便配额也计算无法显示的普通文件。
     pub(super) fn names(&self) -> Result<Vec<OsString>, Why> {
         let mut names = Vec::new();
         #[cfg(windows)]

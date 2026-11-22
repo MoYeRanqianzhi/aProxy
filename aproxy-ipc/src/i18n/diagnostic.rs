@@ -65,8 +65,8 @@ macro_rules! reasons {
     };
 }
 
-crate::message!(forward_default_unguarded(), en: "The default delivery is forward while the chain has a decide program or an optional request program: when they are unavailable, requests are not retried.", zh: "默认转发方式为 forward，且处理链含有 decide 程序或可选的 request 程序：这些程序不可用时，请求不会重试。");
-crate::message!(forward_response_buffered(), en: "The default delivery is forward and the chain has a response program; that layer gathers each response, so those responses are not streamed. Declare stream instead where the program supports it.", zh: "默认转发方式为 forward，且处理链含有 response 程序；该层会收集完整响应，因此这些响应不会流式传送。如果程序支持，请改为声明 stream。");
+crate::message!(forward_default_unguarded(), en: "The default delivery is forward while the chain has a decide program or an optional request program: when they are unavailable, requests are not retried.", zh: "默认投递方式为 forward，且处理链含有 decide 程序或可选的 request 程序：这些程序不可用时，请求不会重试。");
+crate::message!(forward_response_buffered(), en: "The default delivery is forward and the chain has a response program; that layer gathers each response, so those responses are not streamed. Declare stream instead where the program supports it.", zh: "默认投递方式为 forward，且处理链含有 response 程序；该层会收集完整响应，因此这些响应不会流式传送。如果程序支持，请改为声明 stream。");
 
 reasons! {
     AlwaysTrigger,
@@ -134,7 +134,7 @@ reasons! {
         zh: "format {name:?} 位于声明了 retry 的 {earlier:?} 之后，因此也必须声明 retry：重试时前一个 format 会生成新的请求，后一个必须重新处理该请求";
     TooLarge { value: u64 },
         en: "{value} is too large",
-        zh: "{value} 超出范围";
+        zh: "{value} 太大";
     Negative { key: String },
         en: "{key} must not be negative",
         zh: "{key} 不能为负数";

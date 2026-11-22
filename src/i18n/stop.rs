@@ -36,7 +36,7 @@ message!(gone(pid: u32, port: &str), en: "Pid {pid} (port {port}) is no longer r
 
 message!(killed(pid: u32, port: &str), en: "Terminated pid {pid} by force (port {port})", zh: "已强制终止 pid {pid}（端口 {port}）");
 
-message!(generation(port: &str), en: "The selected instance on port {port} was replaced; the current instance was not stopped.", zh: "端口 {port} 上的实例已换代，当前实例未停止。");
+message!(generation(port: &str), en: "The selected instance on port {port} was replaced; the current instance was not stopped.", zh: "选中的端口 {port} 上的实例已被替换，当前实例没有停止。");
 
 message!(still_running(pid: u32, port: &str), en: "Pid {pid} received the stop request but has not exited. Check with aproxy status, or run aproxy stop {port} --force.", zh: "pid {pid} 已收到停止请求但尚未退出，可用 aproxy status 稍后确认，或 aproxy stop {port} --force 强制结束");
 

@@ -4,6 +4,16 @@ use std::{
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
 };
+// 协议角色崩溃时可能来不及写出一帧；把系统状态留在测试日志而不是子进程的协议流。
+fn log_exit(status: std::process::ExitStatus) {
+    match status.code() {
+        Some(code) if cfg!(windows) && code < 0 => {
+            eprintln!("abnormal termination: 0x{:08X}", code as u32)
+        }
+        Some(code) => eprintln!("exit status: 0x{:08X}", code as u32),
+        None => eprintln!("abnormal termination: {status}"),
+    }
+}
 /// 离线工具与协议角色都从相同的英语环境启动，不继承测试机的界面语言。
 fn format_command() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aproxy-format"));
@@ -81,7 +91,7 @@ impl Drop for Worker {
     /// 关闭管道是正常退出，不用按进程名结束任何后台程序。
     fn drop(&mut self) {
         drop(self.input.take());
-        let _ = self.child.wait();
+        let _ = self.child.wait().inspect(|status| log_exit(*status));
     }
 }
 /// 只在测试二进制显式选中时运行；单调时间与日期固定，不给正式命令引入环境开关。
@@ -494,6 +504,7 @@ fn invalid_role_configuration_does_not_echo_secrets() {
         let out = format_command()
             .args(["keys", "--config", f.to_str().unwrap()])
             .output()
+            .inspect(|out| log_exit(out.status))
             .unwrap();
         assert!(!out.status.success() && out.stdout.is_empty());
         assert!(!String::from_utf8_lossy(&out.stderr).contains("fixture-private"));
@@ -502,6 +513,7 @@ fn invalid_role_configuration_does_not_echo_secrets() {
         !format_command()
             .arg("run")
             .output()
+            .inspect(|out| log_exit(out.status))
             .unwrap()
             .status
             .success()
@@ -578,7 +590,10 @@ fn translate_is_a_one_off_request_converter() {
         .unwrap()
         .write_all("\u{a0}{\"model\":\"m\",\"input\":\"hello\"}\u{2003}".as_bytes())
         .unwrap();
-    let out = worker.wait_with_output().unwrap();
+    let out = worker
+        .wait_with_output()
+        .inspect(|out| log_exit(out.status))
+        .unwrap();
     assert!(out.status.success());
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(v["messages"].is_array() && v.get("seq").is_none());
@@ -786,7 +801,11 @@ fn heartbeat_matches_only_explicit_client_paths() {
         p.replace("'anthropic_messages'", "'openai_responses'"),
     ] {
         std::fs::write(&path, invalid).unwrap();
-        let r = format_command().args(args).output().unwrap();
+        let r = format_command()
+            .args(args)
+            .output()
+            .inspect(|out| log_exit(out.status))
+            .unwrap();
         assert!(!r.status.success() && r.stdout.is_empty());
     }
 }
@@ -839,6 +858,7 @@ fn credential_slots_require_history_protected_names() {
             .args([role, "--config", file.to_str().unwrap()])
             .env("FORMAT_A", "fixture-private")
             .output()
+            .inspect(|out| log_exit(out.status))
             .unwrap();
         let error = String::from_utf8(out.stderr).unwrap();
         assert!(
@@ -883,7 +903,12 @@ fn config_diagnostic_names_the_field_not_the_value() {
             if tool {
                 command.arg("check");
             }
-            command.args([role, "--config"]).arg(&f).output().unwrap()
+            command
+                .args([role, "--config"])
+                .arg(&f)
+                .output()
+                .inspect(|out| log_exit(out.status))
+                .unwrap()
         };
         let r = run("en", false);
         let zh_worker = run("zh-CN", false);
@@ -964,6 +989,7 @@ fn managed_header_slots_fail_before_hello() {
             .arg(&file)
             .env("KEY", "private-fixture")
             .output()
+            .inspect(|out| log_exit(out.status))
             .unwrap();
         assert!(!out.status.success() && out.stdout.is_empty());
         let err = String::from_utf8(out.stderr).unwrap();
@@ -1130,6 +1156,7 @@ fn oversized_role_state_is_refused_during_configuration() {
             .args([role, "--config", file.to_str().unwrap()])
             .env("FORMAT_A", "test")
             .output()
+            .inspect(|out| log_exit(out.status))
             .unwrap();
         assert!(
             !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("64 KiB"),
@@ -1153,7 +1180,7 @@ fn key_pool_rejects_unusable_environment_values_before_hello() {
         if let Some(v) = invalid {
             cmd.env("FORMAT_B", v);
         }
-        let out = cmd.output().unwrap();
+        let out = cmd.output().inspect(|out| log_exit(out.status)).unwrap();
         let error = String::from_utf8(out.stderr).unwrap();
         assert!(
             !out.status.success()
@@ -2225,6 +2252,7 @@ fn rewrite_refuses_secret_assignments_but_can_remove_them() {
         let result = format_command()
             .args(["rewrite", "--config", path.to_str().unwrap()])
             .output()
+            .inspect(|out| log_exit(out.status))
             .unwrap();
         let diagnostic = String::from_utf8(result.stderr).unwrap();
         assert!(
@@ -2248,11 +2276,17 @@ fn tools_try_runs_the_sample_chain_without_exposing_the_sample() {
         .args(["init", "adaptive-relay", "--output"])
         .arg(d.path())
         .output()
+        .inspect(|out| log_exit(out.status))
         .unwrap();
     assert!(init.status.success(), "{init:?}");
     let config = d.path().join("config.toml");
     let sample = d.path().join("request.json");
-    let check = format_command().arg("check").arg(&config).output().unwrap();
+    let check = format_command()
+        .arg("check")
+        .arg(&config)
+        .output()
+        .inspect(|out| log_exit(out.status))
+        .unwrap();
     assert!(check.status.success(), "{check:?}");
     let token = "private-fixture-392";
     let corpus: Value = serde_json::from_str(include_str!("fixtures/protocols.json")).unwrap();
@@ -2266,6 +2300,7 @@ fn tools_try_runs_the_sample_chain_without_exposing_the_sample() {
         .env("RELAY_KEY_A", token)
         .env("RELAY_KEY_B", token)
         .output()
+        .inspect(|out| log_exit(out.status))
         .unwrap();
     assert!(result.status.success(), "{result:?}");
     let text = String::from_utf8(result.stdout).unwrap();
@@ -2325,7 +2360,7 @@ fn dry_run_external_execution_requires_opt_in_and_discloses_the_boundary() {
         if allow {
             cmd.arg("--allow-external");
         }
-        let out = cmd.output().unwrap();
+        let out = cmd.output().inspect(|out| log_exit(out.status)).unwrap();
         assert_eq!(marker.join("config.toml").exists(), allow, "{out:?}");
         assert_eq!(out.status.success(), !allow, "{out:?}");
         let err = String::from_utf8(out.stderr).unwrap();
@@ -2348,6 +2383,7 @@ fn translate_help_distinguishes_single_requests_from_chain_roles() {
     let run = format_command()
         .args(["translate", "--help"])
         .output()
+        .inspect(|out| log_exit(out.status))
         .unwrap();
     assert!(run.status.success() && run.stderr.is_empty());
     let help = String::from_utf8(run.stdout).unwrap();
@@ -2383,7 +2419,11 @@ fn offline_files_are_bounded_before_parsing() {
         vec!["check", p],
         vec!["try", p, "--request", sample.to_str().unwrap()],
     ] {
-        let out = format_command().args(&args).output().unwrap();
+        let out = format_command()
+            .args(&args)
+            .output()
+            .inspect(|out| log_exit(out.status))
+            .unwrap();
         assert!(!out.status.success(), "{args:?}: {out:?}");
     }
 }
@@ -2397,6 +2437,7 @@ fn check_lists_only_structural_guarantees_and_credential_names() {
             .args(["init", "key-rotation", "--output"])
             .arg(dir.path())
             .status()
+            .inspect(|status| log_exit(*status))
             .unwrap()
             .success()
     );
@@ -2408,6 +2449,7 @@ fn check_lists_only_structural_guarantees_and_credential_names() {
             .env("RELAY_KEY_A", "private\nvalue")
             .env_remove("RELAY_KEY_B")
             .output()
+            .inspect(|out| log_exit(out.status))
             .unwrap();
         assert!(out.status.success(), "{out:?}");
         let text = String::from_utf8(out.stdout).unwrap();
@@ -2442,7 +2484,7 @@ fn tools_resolve_role_configs_from_the_selected_home() {
             if name == "try" {
                 cmd.arg("--request").arg(&sample);
             }
-            let out = cmd.output().unwrap();
+            let out = cmd.output().inspect(|out| log_exit(out.status)).unwrap();
             assert_eq!(out.status.success(), explicit, "{out:?}");
             assert_eq!(
                 String::from_utf8_lossy(&out.stderr)
@@ -2466,7 +2508,12 @@ fn check_requires_request_state_for_auto_return_conversion() {
             ("openai_chat", "anthropic_messages", true),
         ] {
             std::fs::write(&file,format!("[[format]]\nname='c'\ncommand='aproxy-format'\nargs=['convert','--from','{from}','--to','{to}']\nprocess='persistent'\nrequired=true\nstages=['{stage}']")).unwrap();
-            let out = format_command().arg("check").arg(&file).output().unwrap();
+            let out = format_command()
+                .arg("check")
+                .arg(&file)
+                .output()
+                .inspect(|out| log_exit(out.status))
+                .unwrap();
             assert_eq!(out.status.success(), valid, "{out:?}");
         }
     }
@@ -2489,6 +2536,7 @@ fn init_explains_files_and_generates_editable_toml() {
             .current_dir(dir.path())
             .args(["/d", "/c", "mklink", "/j", "alias", "target"])
             .output()
+            .inspect(|out| log_exit(out.status))
             .unwrap();
         assert!(link.status.success(), "{link:?}");
     }
@@ -2497,6 +2545,7 @@ fn init_explains_files_and_generates_editable_toml() {
         .args(["init", "adaptive-relay", "--output"])
         .arg(&root)
         .output()
+        .inspect(|out| log_exit(out.status))
         .unwrap();
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
@@ -2557,6 +2606,7 @@ fn init_explains_files_and_generates_editable_toml() {
                 .args(["init", scenario, "--output"])
                 .arg(&dest)
                 .output()
+                .inspect(|out| log_exit(out.status))
                 .unwrap();
             assert!(run.status.success() && run.stderr.is_empty());
             assert!(String::from_utf8(run.stdout).unwrap().contains(heading));
@@ -2612,6 +2662,7 @@ fn all_commands_explain_options_and_an_example_before_io() {
                 .env("APROXY_LANG", lang)
                 .args([cmd, "--config", "does-not-exist", flag])
                 .output()
+                .inspect(|out| log_exit(out.status))
                 .unwrap();
             assert!(
                 out.status.success() && out.stderr.is_empty(),
@@ -2658,7 +2709,7 @@ fn opted_in_executable_uses_instance_lookup_not_the_driver_path() {
             if selected {
                 cmd.arg("--home").arg(&home);
             }
-            let out = cmd.output().unwrap();
+            let out = cmd.output().inspect(|out| log_exit(out.status)).unwrap();
             assert_eq!(out.status.success(), selected, "{out:?}");
             if selected {
                 assert!(String::from_utf8_lossy(&out.stdout).contains("negotiated"));

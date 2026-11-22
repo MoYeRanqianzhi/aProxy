@@ -234,7 +234,7 @@ pub async fn fetch(
         .next()
         .unwrap_or_default()
         .to_lowercase();
-    let actual = crate::install::staging::sha256_hex(dest)?;
+    let actual = crate::install::staging::hash_for_install(dest)?;
     if expected != actual {
         let _ = std::fs::remove_file(dest);
         return Err(crate::install::InstallFailure::because(

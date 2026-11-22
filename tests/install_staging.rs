@@ -63,7 +63,10 @@ fn stage_from_rejects_version_mismatch_and_cleans_up() {
     let err = aproxy::install::staging::stage_from_in(home.path(), &from, "0.0.0-definitely-not")
         .unwrap_err();
     assert_eq!(err.code, "install_probe_failed");
-    assert!(err.message.contains("版本不匹配"), "{err}");
+    assert!(matches!(
+        err.into_cause(),
+        aproxy::install::reason::Cause::Files(aproxy::install::files::FileIssue::Version { .. })
+    ));
     // 不带病留在 staging：拒绝时已清理 staged 副本
     let leftover = home
         .path()
@@ -123,4 +126,25 @@ fn version_flag_prints_the_permanent_line_and_touches_no_home() {
     if v3 {
         assert_eq!(parts[2], "x86-64-v3", "{line}");
     }
+}
+
+/// 同一个坏版本行在普通安装中分语言说明；强制安装的共享入口仍交付原来的字节。
+#[test]
+fn rejected_version_output_keeps_the_force_wording() {
+    use aproxy::install::staging::{parse_output, version_of};
+    use aproxy_ipc::i18n::Lang;
+    let home = TestHome::new();
+    let bin = home.path().join("candidate");
+    let raw = "other program\n";
+    let original = format!(
+        "{} --version 的输出不是 `aproxy v<版本> (…)`（0.2.0 起每个版本都这样输出）: {raw:?}",
+        bin.display()
+    );
+    let ordinary = parse_output(&bin, raw).unwrap_err();
+    assert_eq!(ordinary.render(Lang::Zh), original);
+    assert_eq!(ordinary.message, ordinary.render(Lang::En));
+    assert_ne!(ordinary.message, original);
+    let force = version_of(&bin, raw).unwrap_err();
+    assert_eq!(force.code, ordinary.code);
+    assert_eq!(force.message, original);
 }

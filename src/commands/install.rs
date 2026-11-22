@@ -207,10 +207,10 @@ async fn install(args: InstallArgs) {
     // 这个变体（与 install --force --from 同一语义）
     if let Some(from) = &args.from {
         let from_path = aproxy::settings::expand_path(from);
-        let probed = aproxy::install::staging::run_version(&from_path)
-            .map_err(|e| InstallFailure::new("install_probe_failed", e))
+        let probed = aproxy::install::staging::version_output(&from_path)
+            .map_err(|e| InstallFailure::because("install_probe_failed", e.into()))
             .and_then(|output| {
-                let target = aproxy::install::staging::version_of(&from_path, &output)?;
+                let target = aproxy::install::staging::parse_output(&from_path, &output)?;
                 Ok((target, output))
             });
         let (target, output) = match probed {
@@ -233,8 +233,8 @@ async fn install(args: InstallArgs) {
             }
         }
         let version = semver::Version::parse(&target).expect("validated version must be semver");
-        if let Err(e) = aproxy::install::check_floor(&version) {
-            fail(InstallFailure::new("install_below_floor", e));
+        if let Err(e) = aproxy::install::install_floor(&version) {
+            fail(InstallFailure::because("install_below_floor", e.into()));
         }
         let plan = aproxy::install::flow::InstallPlan {
             target_version: target,
@@ -570,16 +570,16 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
             Ok(f) => f,
             Err(e) => return DownloadOutcome::ChainFailed(e),
         };
-        let output = match aproxy::install::staging::run_version(&fetched.path) {
+        let output = match aproxy::install::staging::version_output(&fetched.path) {
             Ok(output) => output,
             Err(e) => {
                 return DownloadOutcome::VerifyFailed {
-                    loader: aproxy::install::staging::is_loader_failure(&e),
-                    cause: Cause::CannotRun(Box::new(Cause::Evidence(e))),
+                    loader: aproxy::install::staging::is_loader_failure(&e.render(Lang::En)),
+                    cause: Cause::CannotRun(Box::new(e.into())),
                 };
             }
         };
-        let line = match aproxy::install::staging::version_of(&fetched.path, &output) {
+        let line = match aproxy::install::staging::parse_output(&fetched.path, &output) {
             Ok(_) => aproxy::install::force::VersionLine::parse(&output)
                 .expect("validated version line must parse"),
             Err(e) => {

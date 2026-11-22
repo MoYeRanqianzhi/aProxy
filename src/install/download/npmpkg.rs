@@ -315,7 +315,7 @@ pub async fn fetch(
                 extract_from_tgz(&tgz_dest, inner, dest, artifact)?;
             }
         }
-        let sum = crate::install::staging::sha256_hex(dest)?;
+        let sum = crate::install::staging::hash_for_install(dest)?;
         Ok(Fetched {
             path: dest.to_path_buf(),
             sha256: sum,

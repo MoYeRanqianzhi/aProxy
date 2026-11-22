@@ -88,7 +88,7 @@ pub async fn fetch(ctx: &DownloadCtx, artifact: Artifact, dest: &Path) -> Result
         ),
     };
     super::download_to(&ctx.client, &url, dest, Artifact::Binary).await?;
-    let sum = crate::install::staging::sha256_hex(dest)?;
+    let sum = crate::install::staging::hash_for_install(dest)?;
     let _ = std::fs::remove_dir_all(&work);
     Ok(Fetched {
         path: dest.to_path_buf(),
@@ -179,7 +179,7 @@ pub async fn fetch_build(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755));
     }
-    let sum = crate::install::staging::sha256_hex(dest)?;
+    let sum = crate::install::staging::hash_for_install(dest)?;
     Ok(Fetched {
         path: dest.to_path_buf(),
         sha256: sum,
@@ -204,7 +204,7 @@ async fn fetch_build_skills(ctx: &DownloadCtx, dest: &Path) -> Result<Fetched, I
         .map_err(|e| Issue::Skill(Box::new(crate::install::skills::issue::Issue::from_io(&e))))?;
     Ok(Fetched {
         path: dest.to_path_buf(),
-        sha256: crate::install::staging::sha256_hex(dest)?,
+        sha256: crate::install::staging::hash_for_install(dest)?,
         source: "cargo",
     })
 }

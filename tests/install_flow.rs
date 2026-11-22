@@ -1088,7 +1088,7 @@ fn install_refuses_versions_below_0_2_0() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
         assert!(
-            stderr.contains("低于 0.2.0") && stderr.contains("0.1.x"),
+            stderr.contains("below the minimum 0.2.0") && stderr.contains("0.1.x"),
             "{args:?}: {stderr}"
         );
     }

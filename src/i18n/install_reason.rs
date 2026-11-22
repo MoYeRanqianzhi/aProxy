@@ -59,6 +59,8 @@ message!(cannot_abort(phase:InstallPhase), en: "The installation has reached bin
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "id", content = "args", rename_all = "snake_case")]
 pub enum Cause {
+    /// 备料、版本核对或二进制交换失败。
+    Files(super::files::FileIssue),
     /// 原始渠道的失败分类。
     Download(super::download::issue::Issue),
     /// 尝试顺序也是诊断的一部分；每个渠道只保留最后一次失败的原因。
@@ -153,6 +155,7 @@ impl Cause {
     /// 状态文件、事件和日志选英文，终端可以对相同的事实另选语言。
     pub fn render(&self, lang: Lang) -> String {
         match self {
+            Self::Files(e) => e.render(lang),
             Self::Download(e) => e.render(lang),
             Self::Sources { asset, failures } => sources(
                 lang,

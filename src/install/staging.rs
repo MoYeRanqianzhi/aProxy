@@ -5,7 +5,8 @@
 //! 原子性的同卷前提；备料文件保留至 done/abort 才清理（它是 swapping 中断
 //! 的恢复源）。
 
-use super::InstallFailure;
+use super::{InstallFailure, download::issue::Issue as DownloadIssue, files::FileIssue};
+use aproxy_ipc::i18n::Lang;
 use std::path::{Path, PathBuf};
 
 /// staging 备料目录：`<home>/install/staging/<目标版本>/`。在线渠道的下载暂存
@@ -33,10 +34,17 @@ pub fn binary_name() -> &'static str {
 /// sha256 十六进制摘要。校验通用件：github 渠道 `.sha256` 资产强校验、
 /// npm integrity（sha512 另算）换算的底座、`--from` 的完整性记录。
 pub fn sha256_hex(path: &Path) -> Result<String, String> {
+    hash_for_install(path).map_err(|e| e.render(Lang::Zh))
+}
+
+/// 以相同的算法计算摘要，失败时保留可随端点语言显示的路径与系统诊断。
+pub(crate) fn hash_for_install(path: &Path) -> Result<String, DownloadIssue> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("{} 无法读取: {e}", path.display()))?;
+    let mut file = std::fs::File::open(path).map_err(|e| DownloadIssue::OpenPath {
+        path: path.display().to_string(),
+        e: e.to_string(),
+    })?;
     let mut hasher = Sha256::new();
     // 分块读入（sha2 0.11 起哈希器不再实现 io::Write，不能直接 io::copy 进去）；二进制可达
     // 数十 MB，不整个读进内存
@@ -46,7 +54,12 @@ pub fn sha256_hex(path: &Path) -> Result<String, String> {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(format!("{} 读取失败: {e}", path.display())),
+            Err(e) => {
+                return Err(DownloadIssue::ReadPath {
+                    path: path.display().to_string(),
+                    e: e.to_string(),
+                });
+            }
         };
         hasher.update(&buf[..n]);
     }
@@ -61,9 +74,10 @@ pub const VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// 见 `crate::VERSION_LINE`）取版本号。不能运行、超时、或输出不是这一格式 → Err——它
 /// 不配作为安装源。
 pub fn probe_version(bin: &Path) -> Result<String, InstallFailure> {
-    version_of(
+    parse_output(
         bin,
-        &run_version(bin).map_err(|e| InstallFailure::new("install_probe_failed", e))?,
+        &version_output(bin)
+            .map_err(|e| InstallFailure::because("install_probe_failed", e.into()))?,
     )
 }
 
@@ -72,6 +86,11 @@ pub fn probe_version(bin: &Path) -> Result<String, InstallFailure> {
 /// 那里）。有时限，是因为调用方往往正持着安装锁（交换落位后的核对），而强制安装是最后的
 /// 手段：一个卡住的 `--version` 不能把它们也卡住。
 pub fn run_version(bin: &Path) -> Result<String, String> {
+    version_output(bin).map_err(|e| e.render(Lang::Zh))
+}
+
+/// 执行有时限的 --version；普通安装把失败原因传给最终展示的一端。
+pub fn version_output(bin: &Path) -> Result<String, FileIssue> {
     use std::io::Read;
     let spawn = || {
         std::process::Command::new(bin)
@@ -98,10 +117,20 @@ pub fn run_version(bin: &Path) -> Result<String, String> {
                     Some(wait) if std::time::Instant::now() + wait < deadline => {
                         std::thread::sleep(wait)
                     }
-                    _ => return Err(format!("{} 无法执行: {e}", bin.display())),
+                    _ => {
+                        return Err(FileIssue::Execute {
+                            path: bin.display().to_string(),
+                            e: e.to_string(),
+                        });
+                    }
                 }
             }
-            Err(e) => return Err(format!("{} 无法执行: {e}", bin.display())),
+            Err(e) => {
+                return Err(FileIssue::Execute {
+                    path: bin.display().to_string(),
+                    e: e.to_string(),
+                });
+            }
         }
     };
     // --version 只输出一行，管道写不满，等它退出再读不会互相卡住
@@ -114,11 +143,10 @@ pub fn run_version(bin: &Path) -> Result<String, String> {
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!(
-                    "{} --version 在 {} 秒内没有结束",
-                    bin.display(),
-                    VERSION_TIMEOUT.as_secs()
-                ));
+                return Err(FileIssue::Timeout {
+                    path: bin.display().to_string(),
+                    secs: VERSION_TIMEOUT.as_secs().to_string(),
+                });
             }
         }
     };
@@ -130,11 +158,11 @@ pub fn run_version(bin: &Path) -> Result<String, String> {
         let _ = err.read_to_string(&mut stderr);
     }
     if !status.success() {
-        return Err(format!(
-            "{} --version 失败（{status}）: {}",
-            bin.display(),
-            stderr.trim()
-        ));
+        return Err(FileIssue::Exit {
+            path: bin.display().to_string(),
+            status: status.to_string(),
+            stderr: stderr.trim().to_string(),
+        });
     }
     Ok(stdout)
 }
@@ -153,6 +181,11 @@ pub fn is_loader_failure(error: &str) -> bool {
 /// 从 `bin --version` 的输出里取版本号：首行是永久格式（C5）就取出来；是 0.1.x 的
 /// 格式就按版本下限说明它为什么装不了、怎样回到 0.1.x；其余的报格式不对。
 pub fn version_of(bin: &Path, stdout: &str) -> Result<String, InstallFailure> {
+    parse_output(bin, stdout).map_err(InstallFailure::for_force)
+}
+
+/// 校验普通安装探测到的输出，并保留无法安装的原因与路径。
+pub fn parse_output(bin: &Path, stdout: &str) -> Result<String, InstallFailure> {
     if let Some(version) = parse_version_line(stdout) {
         return Ok(version);
     }
@@ -164,18 +197,23 @@ pub fn version_of(bin: &Path, stdout: &str) -> Result<String, InstallFailure> {
         .and_then(|line| line.strip_prefix("aproxy "))
         .and_then(|rest| rest.split(char::is_whitespace).next())
         .and_then(|version| semver::Version::parse(version).ok());
-    if let Some(Err(e)) = legacy.map(|version| super::check_floor(&version)) {
-        return Err(InstallFailure::new(
+    if let Some(Err(e)) = legacy.map(|version| super::install_floor(&version)) {
+        return Err(InstallFailure::because(
             "install_below_floor",
-            format!("{}：{e}", bin.display()),
+            FileIssue::BelowFloor {
+                path: bin.display().to_string(),
+                e: Box::new(e.into()),
+            }
+            .into(),
         ));
     }
-    Err(InstallFailure::new(
+    Err(InstallFailure::because(
         "install_probe_failed",
-        format!(
-            "{} --version 的输出不是 `aproxy v<版本> (…)`（0.2.0 起每个版本都这样输出）: {stdout:?}",
-            bin.display()
-        ),
+        FileIssue::BadLine {
+            path: bin.display().to_string(),
+            stdout: stdout.to_string(),
+        }
+        .into(),
     ))
 }
 
@@ -204,24 +242,29 @@ pub fn stage_from_in(
     target_version: &str,
 ) -> Result<StagedBinary, InstallFailure> {
     if !from.is_file() {
-        return Err(format!("源二进制不存在: {}", from.display()).into());
+        return Err(FileIssue::Missing {
+            path: from.display().to_string(),
+        }
+        .into());
     }
     let dir = staging_dir_in(home, target_version);
-    crate::fsx::create_dir_all(&dir).map_err(|e| format!("staging 目录创建失败: {e}"))?;
+    crate::fsx::create_dir_all(&dir).map_err(|e| FileIssue::StageDir { e: e.to_string() })?;
     let staged = dir.join(binary_name());
-    std::fs::copy(from, &staged).map_err(|e| format!("复制到 staging 失败: {e}"))?;
+    std::fs::copy(from, &staged).map_err(|e| FileIssue::StageCopy { e: e.to_string() })?;
     ensure_executable(&staged);
-    let sum = sha256_hex(&staged)?;
+    let sum = hash_for_install(&staged)?;
     // 校验对象是 staged 副本本身（不是源）——校验的就是要装的东西
     let probed = probe_version(&staged)?;
     if probed != target_version {
         let _ = std::fs::remove_file(&staged);
-        return Err(InstallFailure::new(
+        return Err(InstallFailure::because(
             "install_probe_failed",
-            format!(
-                "版本不匹配：{} 自报 {probed}，目标 {target_version}",
-                from.display()
-            ),
+            FileIssue::Version {
+                path: from.display().to_string(),
+                probed: probed.to_string(),
+                target_version: target_version.to_string(),
+            }
+            .into(),
         ));
     }
     Ok(StagedBinary {
@@ -307,7 +350,10 @@ mod tests {
     fn stage_from_rejects_missing_source() {
         let dir = tempfile::tempdir().unwrap();
         let err = stage_from_in(dir.path(), &dir.path().join("no-such.exe"), "0.1.0").unwrap_err();
-        assert!(err.message.contains("不存在"), "{err}");
+        assert!(matches!(
+            err.into_cause(),
+            super::super::reason::Cause::Files(FileIssue::Missing { .. })
+        ));
     }
 
     /// 动态加载器的三种报错（glibc 的 ld.so 原样输出，经 run_version 包进错误里）才算缺系统库

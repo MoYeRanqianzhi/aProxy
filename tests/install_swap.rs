@@ -67,7 +67,7 @@ fn residues(home: &Path) -> Vec<PathBuf> {
 }
 
 fn swap_ok(home: &Path, staged: &Path) -> swap::SwapOutcome {
-    swap::swap_in(home, staged, env!("CARGO_PKG_VERSION"), None, |_| Ok(())).unwrap()
+    swap::swap_for_install(home, staged, env!("CARGO_PKG_VERSION"), None, |_| Ok(())).unwrap()
 }
 
 /// 升级形态：旧二进制让位到唯一名并先报给 before_retire，新二进制就位，没有临时名
@@ -79,7 +79,7 @@ fn swap_retires_the_old_binary_to_a_unique_name() {
     let staged = stage(home.path(), "upgrade");
 
     let mut announced = None;
-    let outcome = swap::swap_in(
+    let outcome = swap::swap_for_install(
         home.path(),
         &staged,
         env!("CARGO_PKG_VERSION"),
@@ -118,7 +118,7 @@ fn swap_retires_the_old_binary_to_a_unique_name() {
 fn first_install_has_no_old_binary() {
     let home = tempfile::tempdir().unwrap();
     let staged = stage(home.path(), "fresh");
-    let outcome = swap::swap_in(
+    let outcome = swap::swap_for_install(
         home.path(),
         &staged,
         env!("CARGO_PKG_VERSION"),
@@ -137,12 +137,16 @@ fn refusal_before_retiring_leaves_bin_untouched() {
     let home = tempfile::tempdir().unwrap();
     let old_bytes = seed_marked_bin(home.path());
     let staged = stage(home.path(), "refused");
-    let err = swap::swap_in(
+    let err = swap::swap_for_install(
         home.path(),
         &staged,
         env!("CARGO_PKG_VERSION"),
         None,
-        |_| Err("写不了状态".to_string()),
+        |_| {
+            Err(aproxy::install::reason::Cause::Evidence(
+                "写不了状态".into(),
+            ))
+        },
     )
     .unwrap_err();
     assert!(err.message.contains("写不了状态"), "{err}");
@@ -163,9 +167,12 @@ fn version_mismatch_after_placing_rolls_back() {
     let home = tempfile::tempdir().unwrap();
     let old_bytes = seed_marked_bin(home.path());
     let staged = stage(home.path(), "mismatch");
-    let err = swap::swap_in(home.path(), &staged, "99.0.0", None, |_| Ok(())).unwrap_err();
+    let err = swap::swap_for_install(home.path(), &staged, "99.0.0", None, |_| Ok(())).unwrap_err();
     assert_eq!(err.code, "install_rolled_back");
-    assert!(err.message.contains("已换回原来的二进制"), "{err}");
+    assert!(
+        err.message.contains("original binary was restored"),
+        "{err}"
+    );
     assert_eq!(
         std::fs::read(swap::bin_path_in(home.path())).unwrap(),
         old_bytes,
@@ -189,12 +196,12 @@ fn residues_are_swept_except_the_kept_one() {
     }
     std::fs::write(&kept, &old_bytes).unwrap();
     let staged = stage(home.path(), "sweep");
-    let outcome = swap::swap_in(
+    let outcome = swap::swap_for_install(
         home.path(),
         &staged,
         env!("CARGO_PKG_VERSION"),
         Some(&kept),
-        |_| -> Result<(), String> { panic!("续作重入不该再让位") },
+        |_| panic!("续作重入不该再让位"),
     )
     .unwrap();
     assert!(bin_works(home.path()));
@@ -214,12 +221,12 @@ fn a_resumed_swap_after_placing_does_not_retire_the_new_binary() {
     let staged = stage(home.path(), "resume");
     let first = swap_ok(home.path(), &staged);
     let kept = first.old_path.expect("bin 里原有二进制，应有让位的旧名");
-    let again = swap::swap_in(
+    let again = swap::swap_for_install(
         home.path(),
         &staged,
         env!("CARGO_PKG_VERSION"),
         Some(&kept),
-        |_| -> Result<(), String> { panic!("续作重入不该再让位") },
+        |_| panic!("续作重入不该再让位"),
     )
     .unwrap();
     assert_eq!(again.old_path.as_deref(), Some(kept.as_path()));
@@ -242,12 +249,12 @@ fn a_resumed_swap_with_bin_missing_places_the_new_binary() {
     let kept = swap::bin_dir_in(home.path()).join(swap::unique_name(swap::OLD_PREFIX));
     std::fs::rename(&bin, &kept).unwrap();
     let staged = stage(home.path(), "resume-missing");
-    let outcome = swap::swap_in(
+    let outcome = swap::swap_for_install(
         home.path(),
         &staged,
         env!("CARGO_PKG_VERSION"),
         Some(&kept),
-        |_| -> Result<(), String> { panic!("续作重入不该再让位") },
+        |_| panic!("续作重入不该再让位"),
     )
     .unwrap();
     assert!(bin_works(home.path()));
@@ -317,7 +324,7 @@ mod windows_swap {
         let old_bytes = seed_marked_bin(home.path());
         let handle = hold_without_share_delete(&swap::bin_path_in(home.path()));
         let staged = stage(home.path(), "held-bin");
-        let err = swap::swap_in(
+        let err = swap::swap_for_install(
             home.path(),
             &staged,
             env!("CARGO_PKG_VERSION"),
@@ -326,7 +333,7 @@ mod windows_swap {
         )
         .unwrap_err();
         assert_eq!(err.code, "install_swap_failed");
-        assert!(err.message.contains("bin 未改动"), "{err}");
+        assert!(err.message.contains("bin is unchanged"), "{err}");
         drop(handle);
         assert_eq!(
             std::fs::read(swap::bin_path_in(home.path())).unwrap(),

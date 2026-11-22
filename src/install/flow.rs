@@ -25,6 +25,7 @@
 //!
 //! 无实例快路径：broadcasting 直接跳过（restarting 为空）。
 
+use super::files::FileIssue;
 use aproxy_ipc::i18n::diagnostic::Reason;
 use std::path::Path;
 
@@ -411,10 +412,8 @@ async fn run_forward(
 ) -> Result<FlowExit, InstallFailure> {
     // ---- downloading：先下载后 rename（铁律 2）——备料校验全过才许动 bin
     super::state::advance_in(home, state, InstallPhase::Downloading)?;
-    let staged = stage_from_in(home, from, &state.target_version).map_err(|e| {
-        let message = format!("备料失败: {e}");
-        e.with_message(message)
-    })?;
+    let staged = stage_from_in(home, from, &state.target_version)
+        .map_err(|e| e.context(|e| FileIssue::Staging { e: Box::new(e) }))?;
     state.staged_path = Some(staged.path.display().to_string());
     state.sha256 = Some(staged.sha256.clone());
     super::state::advance_in(home, state, InstallPhase::Downloaded)?;
@@ -643,7 +642,7 @@ async fn run_tail(
                     port,
                     outcome: "skipped".into(),
                 });
-                write_in(home, state).map_err(|e| format!("install/state.json 写入失败: {e}"))?;
+                write_in(home, state).map_err(|e| FileIssue::WriteState { e: e.to_string() })?;
             }
             continue;
         }
@@ -676,7 +675,7 @@ async fn run_tail(
             Err(e) => return Err(e.failure(port, format!("实例 {port} 滚动重启失败: {e}"))),
         }
         // 每实例重启后推进状态文件（进度可观察 + updated_at 保活）
-        write_in(home, state).map_err(|e| format!("install/state.json 写入失败: {e}"))?;
+        write_in(home, state).map_err(|e| FileIssue::WriteState { e: e.to_string() })?;
     }
 
     // ---- verifying：全实例版本==target 且已退出更换阶段。不满足（restarting
@@ -799,7 +798,7 @@ pub async fn run_install_online(
         let result = async {
             super::state::advance_in(home, &mut state, InstallPhase::Downloading)?;
             state.staged_path = Some(staged.display().to_string());
-            state.sha256 = Some(crate::install::staging::sha256_hex(staged)?);
+            state.sha256 = Some(crate::install::staging::hash_for_install(staged)?);
             super::state::advance_in(home, &mut state, InstallPhase::Downloaded)?;
             run_forward_from_staged(home, run_dir, &mut state, staged, true).await
         }
@@ -919,7 +918,7 @@ pub async fn continue_install(
     tracing::info!(phase = ?state.phase, target = %state.target_version, named, "install 续作接管");
     state.installer_pid = std::process::id();
     state.installer_version = Some(env!("CARGO_PKG_VERSION").into());
-    write_in(home, &mut state).map_err(|e| format!("install/state.json 写入失败: {e}"))?;
+    write_in(home, &mut state).map_err(|e| FileIssue::WriteState { e: e.to_string() })?;
     let announcer = spawn_announcer(home, run_dir);
     // skill 支线：交到手里的安装，skill 归交出它的那个进程（它还活着、带着
     // 用户的 --no-skills/--download-proxy 在跑），这里不再跑一遍；接管死掉的
@@ -1059,7 +1058,7 @@ async fn run_forward_from_staged(
     // snapshot_with_pending）
     let (live, snapshot) = snapshot_with_pending(run_dir, state).await;
     state.instance_snapshot = snapshot.clone();
-    write_in(home, state).map_err(|e| format!("install/state.json 写入失败: {e}"))?;
+    write_in(home, state).map_err(|e| FileIssue::WriteState { e: e.to_string() })?;
 
     if let Err(e) = precheck_snapshot(run_dir, &snapshot) {
         state.halted = true;
@@ -1116,15 +1115,12 @@ async fn run_forward_from_staged(
     // 这是续作重入，不再让位——否则落位之后中断的那一次，新二进制会被当成旧的记下来
     let keep = state.old_path.as_ref().map(std::path::PathBuf::from);
     let target = state.target_version.clone();
-    swap::swap_in(home, staged_path, &target, keep.as_deref(), |old| {
+    swap::swap_for_install(home, staged_path, &target, keep.as_deref(), |old| {
         // 让位之前落盘：让位之后、写状态之前崩溃，续作就找不到回滚用的旧二进制
         state.old_path = Some(old.display().to_string());
-        write_in(home, state).map_err(|e| format!("install/state.json 写入失败: {e}"))
+        write_in(home, state).map_err(|e| FileIssue::WriteState { e: e.to_string() }.into())
     })
-    .map_err(|e| {
-        let message = format!("二进制交换失败: {e}");
-        e.with_message(message)
-    })?;
+    .map_err(|e| e.context(|e| FileIssue::Swap { e: Box::new(e) }))?;
     drop(lock);
     super::state::advance_in(home, state, InstallPhase::Swapped)?;
 

@@ -29,6 +29,8 @@ macro_rules! reasons {
 }
 message!(crate_skill(e:&str),en:"Could not read crate documentation: {e}",zh:"crate 文档读取失败：{e}");
 reasons! {
+OpenPath { path: String, e: String }, en: "Cannot open {path}: {e}", zh: "{path} 无法读取: {e}";
+ReadPath { path: String, e: String }, en: "Cannot read {path}: {e}", zh: "{path} 读取失败: {e}";
 Semver { target: String, e: String }, en: "Invalid version {target}: semver parsing failed: {e}", zh: "版本号 {target} 非法（semver 解析失败: {e}）";
 Downgrade { target: String, current: String }, en: "Target version {target} is older than the current version {current}. Use --allow-downgrade to downgrade.", zh: "目标版本 {target} 低于当前 {current}。确认要降级请加 --allow-downgrade。";
 Cpu { other: String }, en: "Unknown CPU level {other}; expected x86-64-v3 or baseline.", zh: "未知指令集档 {other}（取值 x86-64-v3 | baseline）";

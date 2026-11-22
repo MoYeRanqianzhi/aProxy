@@ -21,6 +21,7 @@
 //!
 //! 调用方负责在调用期间持有安装锁（永久兼容契约 C4，见 `super::lock_install_in`）。
 
+use super::{files::FileIssue, reason::Cause};
 use std::path::{Path, PathBuf};
 
 /// 安装二进制的唯一管辖目录：`<home>/bin/`（永久兼容契约 C2 的位置部分）。
@@ -133,15 +134,30 @@ pub fn swap_in(
     keep: Option<&Path>,
     before_retire: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<SwapOutcome, super::InstallFailure> {
-    let swap_error = |e| super::InstallFailure::new("install_swap_failed", e);
+    swap_for_install(home, source, expected_version, keep, |old| {
+        before_retire(old).map_err(Cause::Evidence)
+    })
+    .map_err(super::InstallFailure::for_force)
+}
+
+/// 普通安装保留交换与回滚的具体故障；旧文件让位前先由调用者保存其路径。
+pub fn swap_for_install(
+    home: &Path,
+    source: &Path,
+    expected_version: &str,
+    keep: Option<&Path>,
+    before_retire: impl FnOnce(&Path) -> Result<(), Cause>,
+) -> Result<SwapOutcome, super::InstallFailure> {
+    let swap_error = |e| super::InstallFailure::because("install_swap_failed", e);
     let dir = bin_dir_in(home);
     let bin = bin_path_in(home);
-    crate::fsx::create_dir_all(&dir).map_err(|e| swap_error(format!("bin 目录创建失败: {e}")))?;
+    crate::fsx::create_dir_all(&dir)
+        .map_err(|e| swap_error(FileIssue::BinDir { e: e.to_string() }.into()))?;
 
     // 入口兜底脚本先于交换就位：只在交换之后才写，就保护不了这一次的空窗
     #[cfg(windows)]
     ensure_fallback_scripts_in(home)
-        .map_err(|e| swap_error(format!("入口兜底脚本写入失败: {e}")))?;
+        .map_err(|e| swap_error(FileIssue::Fallback { e: e.to_string() }.into()))?;
 
     sweep_residue_in(home, keep);
 
@@ -181,19 +197,26 @@ pub fn swap_in(
     // 3. 新二进制就位。unix 是一步原子替换；Windows 上 bin 此刻已空，失败就把旧的改回去
     if let Err(e) = with_retries(|| std::fs::rename(&tmp, &bin)) {
         let _ = std::fs::remove_file(&tmp);
-        let unchanged = format!("新二进制落位失败，bin 未改动: {e}");
+        let unchanged = FileIssue::Placement { e: e.to_string() };
         #[cfg(windows)]
         if let Some(old) = &old {
             return match move_no_replace(old, &bin) {
-                Ok(()) => Err(super::InstallFailure::new("install_rolled_back", unchanged)),
-                Err(back) => Err(swap_error(format!(
-                    "新二进制落位失败（{e}），把旧二进制改回 {} 也失败（{back}）：旧二进制现在在 {}",
-                    bin.display(),
-                    old.display()
-                ))),
+                Ok(()) => Err(super::InstallFailure::because(
+                    "install_rolled_back",
+                    unchanged.into(),
+                )),
+                Err(back) => Err(swap_error(
+                    FileIssue::PlacementRecovery {
+                        e: e.to_string(),
+                        bin: bin.display().to_string(),
+                        back: back.to_string(),
+                        old: old.display().to_string(),
+                    }
+                    .into(),
+                )),
             };
         }
-        return Err(swap_error(unchanged));
+        return Err(swap_error(unchanged.into()));
     }
     crate::install::staging::ensure_executable(&bin);
 
@@ -213,21 +236,29 @@ fn verify_placed(
 ) -> Result<(), super::InstallFailure> {
     let verified = match crate::install::staging::probe_version(bin) {
         Ok(v) if v == expected_version => Ok(()),
-        Ok(v) => Err(format!("自报版本 {v}，应为 {expected_version}")),
-        Err(e) => Err(e.message),
+        Ok(v) => Err(FileIssue::Reports {
+            v: v.to_string(),
+            expected_version: expected_version.to_string(),
+        }
+        .into()),
+        Err(e) => Err(e.into_cause()),
     };
     verified.map_err(|e| match roll_back(bin, dir, old) {
-        Ok(()) => super::InstallFailure::new(
+        Ok(()) => super::InstallFailure::because(
             if old.is_some() {
                 "install_rolled_back"
             } else {
                 "install_probe_failed"
             },
-            format!("落位后核对失败，已换回原来的二进制: {e}"),
+            FileIssue::VerifiedRollback { e: Box::new(e) }.into(),
         ),
-        Err(back) => super::InstallFailure::new(
+        Err(back) => super::InstallFailure::because(
             "install_swap_failed",
-            format!("落位后核对失败（{e}），换回原来的二进制也失败: {back}"),
+            FileIssue::FailedRollback {
+                e: Box::new(e),
+                back: Box::new(back.into()),
+            }
+            .into(),
         ),
     })
 }
@@ -241,7 +272,7 @@ fn same_contents(a: &Path, b: &Path) -> bool {
 /// 把 `source` 复制成 `dir` 里的唯一中间文件（[`unique_name`]，目标已存在就换一个名字
 /// 再试），补可执行位，返回它的路径。用 create_new 打开目标：std::fs::copy 会覆盖已存在
 /// 的文件，唯一名要的是「已存在就失败」。
-fn copy_to_unique(source: &Path, dir: &Path, prefix: &str) -> Result<PathBuf, String> {
+fn copy_to_unique(source: &Path, dir: &Path, prefix: &str) -> Result<PathBuf, Cause> {
     for _ in 0..8 {
         let path = dir.join(unique_name(prefix));
         let mut out = match std::fs::OpenOptions::new()
@@ -251,7 +282,13 @@ fn copy_to_unique(source: &Path, dir: &Path, prefix: &str) -> Result<PathBuf, St
         {
             Ok(out) => out,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("{} 创建失败: {e}", path.display())),
+            Err(e) => {
+                return Err(super::download::issue::Issue::Create {
+                    path: path.display().to_string(),
+                    e: e.to_string(),
+                }
+                .into());
+            }
         };
         // 改名到位之前先落盘（sync_all）：交换刚完成几秒内断电，没落盘的新文件可能只剩一个
         // 全零的空壳——它占着 aproxy(.exe) 的名字，入口兜底脚本也就不会去找让位的旧二进制
@@ -261,16 +298,20 @@ fn copy_to_unique(source: &Path, dir: &Path, prefix: &str) -> Result<PathBuf, St
         drop(out);
         if let Err(e) = copied {
             let _ = std::fs::remove_file(&path);
-            return Err(format!(
-                "{} 复制到 {} 失败: {e}",
-                source.display(),
-                path.display()
-            ));
+            return Err(FileIssue::Copy {
+                source: source.display().to_string(),
+                path: path.display().to_string(),
+                e: e.to_string(),
+            }
+            .into());
         }
         crate::install::staging::ensure_executable(&path);
         return Ok(path);
     }
-    Err(format!("{} 里取不到不冲突的中间文件名", dir.display()))
+    Err(FileIssue::Collision {
+        dir: dir.display().to_string(),
+    }
+    .into())
 }
 
 /// 旧二进制让位到一个唯一的 `aproxy.old-…` 名字，返回它。先取名（已存在就换），交给
@@ -278,8 +319,8 @@ fn copy_to_unique(source: &Path, dir: &Path, prefix: &str) -> Result<PathBuf, St
 fn retire(
     bin: &Path,
     dir: &Path,
-    before_retire: impl FnOnce(&Path) -> Result<(), String>,
-) -> Result<PathBuf, String> {
+    before_retire: impl FnOnce(&Path) -> Result<(), Cause>,
+) -> Result<PathBuf, Cause> {
     let old = loop {
         let candidate = dir.join(unique_name(OLD_PREFIX));
         if std::fs::symlink_metadata(&candidate).is_err() {
@@ -290,9 +331,7 @@ fn retire(
     #[cfg(windows)]
     {
         // 改名不覆盖：取名之后若真有人抢先建了同名文件，这里失败而不是把它盖掉
-        move_no_replace(bin, &old).map_err(|e| {
-            format!("旧二进制让位失败（被不带共享删除权限的句柄占着？），bin 未改动: {e}")
-        })?;
+        move_no_replace(bin, &old).map_err(|e| FileIssue::Retire { e: e.to_string() })?;
     }
     #[cfg(not(windows))]
     {
@@ -308,9 +347,7 @@ fn retire(
                 });
             if let Err(e) = copied {
                 let _ = std::fs::remove_file(&old);
-                return Err(format!(
-                    "旧二进制保留失败（没有它，实例在新版本下起不来时无从回滚），bin 未改动: {e}"
-                ));
+                return Err(FileIssue::Retain { e: e.to_string() }.into());
             }
             crate::install::staging::ensure_executable(&old);
         }
@@ -320,18 +357,16 @@ fn retire(
 
 /// 核对失败后换回旧二进制：新文件改成一个唯一的临时名（成为残留，以后清掉），旧的
 /// 改回 bin。bin 里原本没有二进制（首次安装）时只把新文件挪开。
-fn roll_back(bin: &Path, dir: &Path, old: Option<&Path>) -> Result<(), String> {
+fn roll_back(bin: &Path, dir: &Path, old: Option<&Path>) -> Result<(), FileIssue> {
     #[cfg(windows)]
     {
         let aside = dir.join(unique_name(TMP_PREFIX));
-        move_no_replace(bin, &aside).map_err(|e| format!("挪开新二进制失败: {e}"))?;
+        move_no_replace(bin, &aside).map_err(|e| FileIssue::MoveAside { e: e.to_string() })?;
         if let Some(old) = old {
-            move_no_replace(old, bin).map_err(|e| {
-                format!(
-                    "旧二进制改回失败: {e}；旧二进制在 {}，新二进制在 {}",
-                    old.display(),
-                    aside.display()
-                )
+            move_no_replace(old, bin).map_err(|e| FileIssue::RestoreBoth {
+                e: e.to_string(),
+                old: old.display().to_string(),
+                aside: aside.display().to_string(),
             })?;
         }
     }
@@ -340,9 +375,13 @@ fn roll_back(bin: &Path, dir: &Path, old: Option<&Path>) -> Result<(), String> {
         let _ = dir;
         // unix：旧名是硬链接（或副本），一步 rename 原子地换回去
         match old {
-            Some(old) => std::fs::rename(old, bin)
-                .map_err(|e| format!("旧二进制改回失败: {e}；旧二进制在 {}", old.display()))?,
-            None => std::fs::remove_file(bin).map_err(|e| format!("挪开新二进制失败: {e}"))?,
+            Some(old) => std::fs::rename(old, bin).map_err(|e| FileIssue::RestoreOld {
+                e: e.to_string(),
+                old: old.display().to_string(),
+            })?,
+            None => {
+                std::fs::remove_file(bin).map_err(|e| FileIssue::MoveAside { e: e.to_string() })?
+            }
         }
     }
     Ok(())

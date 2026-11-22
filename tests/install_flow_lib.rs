@@ -812,7 +812,10 @@ async fn rollback_case(kind: BrokenNew) {
     let err2 = aproxy::install::flow::continue_install(home, &run_dir, None)
         .await
         .expect_err("halted 后续作应拒绝");
-    assert!(err2.message.contains("不自动重试"), "{err2}");
+    assert!(matches!(
+        err2.into_cause(),
+        aproxy::install::reason::Cause::Halted(_)
+    ));
     let again = aproxy::daemon::ipc_ping_in(&run_dir, &port.to_string())
         .await
         .expect("实例应仍在线");

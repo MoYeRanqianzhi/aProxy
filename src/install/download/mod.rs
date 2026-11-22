@@ -242,7 +242,8 @@ pub fn check_downgrade(
         target: target.to_string(),
         e: e.to_string(),
     })?;
-    super::check_floor(&t).map_err(|e| super::InstallFailure::new("install_below_floor", e))?;
+    super::install_floor(&t)
+        .map_err(|e| super::InstallFailure::because("install_below_floor", e.into()))?;
     if t < *current && !allow_downgrade {
         return Err(Issue::Downgrade {
             target: target.to_string(),
@@ -678,7 +679,7 @@ async fn fetch_url_template(
     download_to(&ctx.client, &url, dest, artifact).await?;
     // 弱档校验尝试：<url>.sha256 拼得出且下载成功 → 比对
     let asset = artifact.asset_name(ctx.target, ctx.variant, ctx.cpu_suffix);
-    let sum = crate::install::staging::sha256_hex(dest)?;
+    let sum = crate::install::staging::hash_for_install(dest)?;
     match ctx
         .client
         .get(format!("{url}.sha256"))

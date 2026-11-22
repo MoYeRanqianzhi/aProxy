@@ -12,7 +12,11 @@ use reason::Cause;
 pub mod announce;
 pub mod broadcast;
 pub mod download;
+/// 安装文件操作的原因：普通流程记录参数，强制流程只取原有措辞。
+#[path = "../i18n/install_files.rs"]
+pub mod files;
 pub mod flow;
+use files::FileIssue;
 pub mod force;
 pub mod restart;
 pub mod skills;
@@ -74,6 +78,24 @@ impl InstallFailure {
             cause: None,
             ..self
         }
+    }
+
+    /// 给操作阶段加一层说明，保持原有的码、详情及内层的跨进程排版参数。
+    pub(crate) fn context(mut self, wrap: impl FnOnce(Cause) -> FileIssue) -> Self {
+        let inner = self
+            .cause
+            .take()
+            .map(|v| *v)
+            .unwrap_or_else(|| Cause::Evidence(std::mem::take(&mut self.message)));
+        let cause = Cause::Files(wrap(inner));
+        self.message = cause.render(Lang::En);
+        self.cause = Some(Box::new(cause));
+        self
+    }
+    /// 强制安装的共享原语必须交付原有的字节，不把普通流程的语言策略带进冻结路径。
+    fn for_force(self) -> Self {
+        let message = self.render(Lang::Zh);
+        self.with_message(message)
     }
 
     /// 交棒后使用接手版本留下的失败记录；旧版本没写码时仍然按普通失败退出。
@@ -386,15 +408,19 @@ pub const INSTALL_FLOOR: semver::Version = semver::Version::new(0, 2, 0);
 
 /// 目标版本不低于 [`INSTALL_FLOOR`]；低于时的错误说明为什么、怎样回到 0.1.x。
 pub fn check_floor(target: &semver::Version) -> Result<(), String> {
+    install_floor(target).map_err(|e| e.render(Lang::Zh))
+}
+
+/// 版本门槛不受语言影响；普通安装把版本参数写入自己的私有错误记录。
+pub fn install_floor(target: &semver::Version) -> Result<(), FileIssue> {
     let floor = &INSTALL_FLOOR;
     if (target.major, target.minor, target.patch) >= (floor.major, floor.minor, floor.patch) {
         return Ok(());
     }
-    Err(format!(
-        "目标版本 {target} 低于 {floor}，不能安装：0.1.x 与 0.2.0 起的版本互不兼容（控制协议与磁盘布局都变了），\
-         --allow-downgrade 也越不过这条下限。要回到 0.1.x：先用当前版本执行 `aproxy stop all` 停掉全部实例，\
-         删掉 bin 目录里的 aproxy 二进制，再用 0.1.x 的安装脚本重新安装"
-    ))
+    Err(FileIssue::Floor {
+        target: target.to_string(),
+        floor: floor.to_string(),
+    })
 }
 
 #[cfg(test)]

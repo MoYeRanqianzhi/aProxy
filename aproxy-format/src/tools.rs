@@ -1,5 +1,5 @@
 //! 离线工具只解析显式给出的文件，不查找正在运行的实例，不写入代理 home。
-use crate::{Options, Role, config, config::LoadIssue};
+use crate::{Options, Role, config, config::LoadIssue, templates, tool_text as ui};
 use aproxy_ipc::config_file::{self as f, FormatEntry, Stage};
 use aproxy_ipc::i18n::{Lang, current};
 use std::{
@@ -181,7 +181,7 @@ fn official(command: &str, args: &[String]) -> Result<Option<&'static str>, Stri
     .into_iter()
     .find(|s| args.first().is_some_and(|a| a == s))
     .map(Some)
-    .ok_or_else(|| "官方命令缺少有效角色".into())
+    .ok_or_else(|| ui::official(current()).into())
 }
 /// 只重定位角色文件参数，不改进程全局工作目录。绝对路径与用户目录简写沿用角色自己的解析。
 pub(super) fn load(
@@ -207,13 +207,13 @@ pub(super) fn load(
 }
 /// 代理的基础地址允许自己的凭据，但不能带查询或片段；试跑用同一解析结果追加客户端路径。
 pub(super) fn base_url(text: &str) -> Result<url::Url, &'static str> {
-    let url = url::Url::parse(text).map_err(|_| "base_url 无效")?;
+    let url = url::Url::parse(text).map_err(|_| ui::base(current()))?;
     if !matches!(url.scheme(), "http" | "https")
         || url.host().is_none()
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err("base_url 无效");
+        return Err(ui::base(current()));
     }
     Ok(url)
 }
@@ -223,22 +223,22 @@ pub(super) fn chain(path: &Path, home: Option<&Path>, structural: bool) -> Resul
     let directory = match home {
         Some(dir) => dir,
         None => {
-            eprintln!("提示：未指定 --home，相对路径以代理配置所在目录为准。");
+            eprintln!("{}", ui::directory_hint(current()));
             path.parent()
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or(Path::new("."))
         }
     };
-    let directory = std::path::absolute(directory).map_err(|_| "无法确定角色工作目录")?;
+    let directory = std::path::absolute(directory).map_err(|_| ui::workdir(current()))?;
     let text = String::from_utf8(offline_read(path).map_err(|e| e.safe_issue(current()))?)
-        .map_err(|_| "代理配置不是 UTF-8")?;
+        .map_err(|_| ui::encoding(current()))?;
     let (mut cfg, diags) = f::parse(&text, path);
     if let Some(d) = diags.iter().find(|d| d.is_error()) {
-        return Err(format!(
-            "代理配置无效：{}（行 {}，列 {}）",
+        return Err(ui::invalid(
+            current(),
             d.code,
             d.line.unwrap_or(1),
-            d.column.unwrap_or(1)
+            d.column.unwrap_or(1),
         ));
     }
     if let Some(base) = &cfg.base_url {
@@ -272,11 +272,7 @@ pub(super) fn chain(path: &Path, home: Option<&Path>, structural: bool) -> Resul
                     continue;
                 }
                 Err(e) => {
-                    return Err(format!(
-                        "第 {} 项的 {name}：{}",
-                        i + 1,
-                        e.safe_issue(current())
-                    ));
+                    return Err(ui::issue(current(), i + 1, name, &e.safe_issue(current())));
                 }
             };
             if entry
@@ -284,14 +280,14 @@ pub(super) fn chain(path: &Path, home: Option<&Path>, structural: bool) -> Resul
                 .iter()
                 .any(|s| !role.stages().contains(&s.as_str()))
             {
-                return Err(format!("第 {} 项的 {name} 不支持所声明的阶段", i + 1));
+                return Err(ui::stages(current(), i + 1, name));
             }
             if routed
                 && matches!(name, "convert" | "rewrite")
                 && entry.has_stage(Stage::Request)
                 && !entry.has_stage(Stage::Retry)
             {
-                return Err("路由后的请求转换或改写必须声明 retry".into());
+                return Err(ui::retry(current()).into());
             }
             if let Role::Convert(c) = &role {
                 // 决定回程协议的 state 只来自本层自己的 request；首轮不能指望 retry 补上它。
@@ -299,16 +295,16 @@ pub(super) fn chain(path: &Path, home: Option<&Path>, structural: bool) -> Resul
                     && !entry.has_stage(Stage::Request)
                     && (entry.has_stage(Stage::Response) || entry.has_stage(Stage::Stream))
                 {
-                    return Err("自动协议转换的回程需要声明 request".into());
+                    return Err(ui::request(current()).into());
                 }
                 if !entry.required && (c.from != c.to || c.from == "auto") {
-                    return Err("跨协议转换必须设置 required=true".into());
+                    return Err(ui::require_convert(current()).into());
                 }
                 if entry.has_stage(Stage::Request)
                     && !entry.has_stage(Stage::Response)
                     && !entry.has_stage(Stage::Stream)
                 {
-                    notes.push("转换仅作用于请求，响应仍是上游协议");
+                    notes.push(ui::request_only(current()));
                 }
             }
             routed |= name == "route" && entry.has_stage(Stage::Request);
@@ -335,11 +331,11 @@ fn init(scenario: &str, dir: &Path) -> Result<(), String> {
         scenario,
         "claude-relay" | "key-rotation" | "openrouter" | "adaptive-relay"
     ) {
-        return Err("未知场景，可用 claude-relay、key-rotation、openrouter、adaptive-relay".into());
+        return Err(ui::scenario(current()).into());
     }
-    fs::create_dir_all(dir).map_err(|_| "无法创建输出目录")?;
+    fs::create_dir_all(dir).map_err(|_| ui::mkdir(current()))?;
     // 配置供操作者继续编辑：固定相对路径的基准，但保留短文件名与目录链接的拼写。
-    let base = std::path::absolute(dir).map_err(|_| "输出目录无效")?;
+    let base = std::path::absolute(dir).map_err(|_| ui::directory(current()))?;
     // 只有显式的 verbatim 路径才需要核对两种拼写的目标。生成物用普通拼写，不用规范化的目标名。
     #[cfg(windows)]
     let base = base
@@ -360,81 +356,28 @@ fn init(scenario: &str, dir: &Path) -> Result<(), String> {
         .unwrap_or(base);
     let mut files = Vec::new();
     let mut proxy = if scenario == "openrouter" {
-        String::from(
-            "# OpenRouter 的上游地址；使用自建网关时同步修改 route.toml。\nbase_url = 'https://openrouter.ai'\n",
-        )
+        String::from(templates::openrouter(current()))
     } else {
-        String::from(
-            "# 替换为实际中继地址；使用密钥池时也要修改 keys.toml 的 origin。\nbase_url = 'https://relay.example.com'\n",
-        )
+        String::from(templates::relay(current()))
     };
     // TOML 字面串保留 Windows 反斜杠。遇到单引号或控制字符才转为带转义的基本串。
     let file_arg = |name: &str| -> Result<String, &'static str> {
         let joined = base.join(name);
-        let path = joined.to_str().ok_or("角色配置路径无效")?;
+        let path = joined.to_str().ok_or(ui::role_path(current()))?;
         if !path.contains('\'') && !path.chars().any(char::is_control) {
             Ok(format!("'{path}'"))
         } else {
-            serde_json::to_string(path).map_err(|_| "角色配置路径无效")
+            serde_json::to_string(path).map_err(|_| ui::role_path(current()))
         }
     };
     if scenario == "adaptive-relay" {
-        proxy += r#"
-[timeouts]
-# 慢模型可适当延长首字节时限，单位为秒。
-first_byte_secs = 600
-
-[[retry.rules]]
-# 只限制计数接口的尝试次数，其他请求沿用实例策略。
-path = '/v1/messages/count_tokens(\?.*)?'
-max_attempts = 3
-"#;
-        files.push((
-            "adaptive.toml",
-            "# 连续失败达到次数后切换交付模式；按中继稳定性调整。\nfailure_threshold = 2\n"
-                .to_owned(),
-        ));
-        proxy += &format!(
-            r#"
-# 根据近期失败情况选择交付模式；阈值在 adaptive.toml 中设置。
-[[format]]
-name = 'adaptive'
-command = 'aproxy-format'
-args = ['adaptive', '--config', {}]
-process = 'persistent'
-stages = ['request', 'decide', 'notify']
-required = false
-pool_max = 1
-worker_idle_secs = 0
-"#,
-            file_arg("adaptive.toml")?
-        );
+        proxy += templates::timeouts(current());
+        files.push(("adaptive.toml", templates::threshold(current()).to_owned()));
+        proxy += &templates::adaptive(current(), &file_arg("adaptive.toml")?);
     }
     if scenario == "openrouter" {
-        files.push((
-            "route.toml",
-            r#"[[channel]]
-# 渠道标识用来区分候选上游，可自行命名。
-id = 'openrouter'
-# 替换为接收 Chat Completions 的完整上游地址。
-url = 'https://openrouter.ai/api/v1/chat/completions'
-# 只写存放凭据的环境变量名，不要填入密钥本身。
-credential_env = 'OPENROUTER_API_KEY'
-"#
-            .into(),
-        ));
-        proxy += &format!(
-            r#"
-# 选用 route.toml 中的渠道；重试时重新选择。
-[[format]]
-name = 'route'
-command = 'aproxy-format'
-args = ['route', '--config', {}]
-process = 'persistent'
-stages = ['request', 'retry']
-"#,
-            file_arg("route.toml")?
-        );
+        files.push(("route.toml", templates::channel(current()).into()));
+        proxy += &templates::route(current(), &file_arg("route.toml")?);
     }
     if scenario != "key-rotation" {
         let (from, stages) = if scenario == "openrouter" {
@@ -442,88 +385,49 @@ stages = ['request', 'retry']
         } else {
             ("anthropic_messages", "'request', 'stream'")
         };
-        proxy += &format!(
-            r#"
-# 在客户端与中继的协议间转换；按两端协议修改 --from 和 --to。
-[[format]]
-name = 'convert'
-command = 'aproxy-format'
-args = ['convert', '--from', '{from}', '--to', 'openai_chat']
-process = 'persistent'
-stages = [{stages}]
-required = true
-"#
-        );
+        proxy += &templates::convert(current(), from, stages);
     }
     if matches!(scenario, "key-rotation" | "adaptive-relay") {
-        files.push((
-            "keys.toml",
-            r#"[[pool]]
-# 替换为允许接收这些密钥的来源，须与实际中继的协议、主机和端口一致。
-origin = 'https://relay.example.com'
-# 按中继要求选择鉴权头和前缀。
-header = 'authorization'
-scheme = 'Bearer'
-keys = [
-    # 第一把密钥：可修改标识和变量名，变量值在环境中设置。
-    { id = 'a', env = 'RELAY_KEY_A' },
-    # 第二把密钥：按需增删条目，不在文件里写入密钥。
-    { id = 'b', env = 'RELAY_KEY_B' },
-]
-"#
-            .into(),
-        ));
-        proxy += &format!(
-            r#"
-# 在同一中继的密钥之间轮换；在 keys.toml 中设置来源和环境变量名。
-[[format]]
-name = 'keys'
-command = 'aproxy-format'
-args = ['keys', '--config', {}]
-process = 'persistent'
-stages = ['request', 'retry']
-pool_max = 1
-worker_idle_secs = 0
-"#,
-            file_arg("keys.toml")?
-        );
+        files.push(("keys.toml", templates::pool(current()).into()));
+        proxy += &templates::keys(current(), &file_arg("keys.toml")?);
     }
     files.insert(0, ("config.toml", proxy));
     if files
         .iter()
         .any(|(n, _)| base.join(n).symlink_metadata().is_ok())
     {
-        return Err("输出文件已存在，不覆盖".into());
+        return Err(ui::exists(current()).into());
     }
     for (name, text) in &files {
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(base.join(name))
-            .map_err(|_| "无法新建输出文件")?;
-        f.write_all(text.as_bytes()).map_err(|_| "写入配置失败")?;
+            .map_err(|_| ui::create(current()))?;
+        f.write_all(text.as_bytes())
+            .map_err(|_| ui::write(current()))?;
     }
-    println!("已生成（{}）：", base.display());
+    println!("{}", ui::generated(current(), base.display()));
     for (name, _) in files {
         let purpose = match name {
-            "config.toml" => "实例配置里的 [[format]] 链",
-            "keys.toml" => "keys 的配置",
-            "route.toml" => "route 的配置",
-            _ => "adaptive 的配置",
+            "config.toml" => ui::proxy_file(current()),
+            "keys.toml" => ui::keys_file(current()),
+            "route.toml" => ui::route_file(current()),
+            _ => ui::adaptive_file(current()),
         };
         println!("  {name}   {purpose}");
     }
-    println!("下一步：");
+    println!("{}", ui::next(current()));
     match scenario {
-        "openrouter" => println!("  1. 设置环境变量 OPENROUTER_API_KEY（密钥不写进文件）"),
-        "claude-relay" => println!("  1. 把 base_url 改为实际中继地址"),
-        _ => println!("  1. 设置环境变量 RELAY_KEY_A、RELAY_KEY_B（密钥不写进文件）"),
+        "openrouter" => println!("{}", ui::set_router(current())),
+        "claude-relay" => println!("{}", ui::set_base(current())),
+        _ => println!("{}", ui::set_keys(current())),
     }
     println!(
-        "  2. 检查：aproxy-format check \"{}\"",
-        base.join("config.toml").display()
+        "{}",
+        ui::check_file(current(), base.join("config.toml").display())
     );
-    println!("  3. 把 config.toml 的内容并入实例的配置，然后启动或重启实例");
+    println!("{}", ui::merge(current()));
     Ok(())
 }
 /// 按名字去重列出未检查的凭据；控制字符转义，诊断不能被配置里的换行或转义序列伪造。
@@ -539,22 +443,25 @@ fn unchecked<'a>(roles: impl IntoIterator<Item = &'a Role>, proxy: bool, externa
     if names.is_empty() && !proxy {
         return;
     }
-    println!("没有检查：");
+    println!("{}", ui::unchecked(current()));
     if !names.is_empty() {
         println!(
-            "  - 环境变量 {} 是否已设置（启动密钥角色或选用渠道时需要）",
-            names
-                .into_iter()
-                .map(|s| s.escape_debug().to_string())
-                .collect::<Vec<_>>()
-                .join("、")
+            "{}",
+            ui::variables(
+                current(),
+                &names
+                    .into_iter()
+                    .map(|s| s.escape_debug().to_string())
+                    .collect::<Vec<_>>()
+                    .join(ui::separator(current()))
+            )
         );
     }
     if external {
-        println!("  - 第三方程序的能力与配置（未启动程序）");
+        println!("{}", ui::external(current()));
     }
     if proxy {
-        println!("  - 实例的其余配置（监听地址、超时等），由 aproxy doctor 检查");
+        println!("{}", ui::rest(current()));
     }
 }
 /// 工具的参数与角色协议分开解析，未知参数可能含密钥，不在用法错误中回显。
@@ -567,9 +474,9 @@ pub(super) fn run(name: &str, args: &[String]) -> Result<(), crate::CliError> {
             let dir = args
                 .next()
                 .filter(|v| !v.is_empty() && !v.starts_with("--"))
-                .ok_or("--home 缺少目录")?;
+                .ok_or(ui::home_arg(current()))?;
             if home.replace(Path::new(dir)).is_some() {
-                return Err("--home 重复".into());
+                return Err(ui::duplicate_home(current()).into());
             }
         } else {
             words.push(word);
@@ -579,18 +486,39 @@ pub(super) fn run(name: &str, args: &[String]) -> Result<(), crate::CliError> {
         ("init", [s, "--output", p]) => init(s, Path::new(p)).map_err(crate::CliError::from),
         ("check", [p]) => {
             let c = chain(Path::new(p), home, true)?;
-            for n in c.notes { println!("提示：{n}"); }
-            println!("format 链与官方角色配置有效（{} 个程序）。", c.layers.len());
-            unchecked(c.layers.iter().filter_map(|l| l.role.as_ref()), true, c.layers.iter().any(|l| l.role.is_none()));
+            for n in c.notes {
+                println!("{}", ui::note(current(), n));
+            }
+            println!("{}", ui::valid_chain(current(), c.layers.len()));
+            unchecked(
+                c.layers.iter().filter_map(|l| l.role.as_ref()),
+                true,
+                c.layers.iter().any(|l| l.role.is_none()),
+            );
             Ok(())
         }
         ("check", [r, "--config", p]) => {
-            let role = load(r, &["--config".into(), (*p).into()], home.unwrap_or(Path::new(".")), config::Variables { structural: true, ..Default::default() }).map_err(|e|e.safe_issue(current()))?;
-            println!("{r} 角色配置结构有效。"); unchecked([&role], false, false); Ok(())
+            let role = load(
+                r,
+                &["--config".into(), (*p).into()],
+                home.unwrap_or(Path::new(".")),
+                config::Variables {
+                    structural: true,
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| e.safe_issue(current()))?;
+            println!("{}", ui::valid_role(current(), r));
+            unchecked([&role], false, false);
+            Ok(())
         }
-        ("try", [p, "--request", sample]) => crate::dryrun::run(Path::new(p), Path::new(sample), home, false),
-        ("try", [p, "--request", sample, "--allow-external"]) => crate::dryrun::run(Path::new(p), Path::new(sample), home, true),
-        _ => Err("用法：init 场景 --output 目录；check 代理配置 [--home 目录] 或 check 角色 --config 文件；try 代理配置 --request 样例 [--home 目录] [--allow-external]".into()),
+        ("try", [p, "--request", sample]) => {
+            crate::dryrun::run(Path::new(p), Path::new(sample), home, false)
+        }
+        ("try", [p, "--request", sample, "--allow-external"]) => {
+            crate::dryrun::run(Path::new(p), Path::new(sample), home, true)
+        }
+        _ => Err(ui::usage(current()).into()),
     }
 }
 
@@ -654,12 +582,12 @@ mod tests {
     /// 换渠道后客户端体须按新的目标协议再次转换。
     #[test]
     fn check_rejects_convert_after_route_without_retry() {
-        assert!(after_route("convert").contains("必须声明 retry"));
+        assert!(after_route("convert").contains("must declare retry"));
     }
     /// 换渠道也会更换模型别名和头，因此后置改写同样需要重跑。
     #[test]
     fn check_rejects_rewrite_after_route_without_retry() {
-        assert!(after_route("rewrite").contains("必须声明 retry"));
+        assert!(after_route("rewrite").contains("must declare retry"));
     }
 }
 

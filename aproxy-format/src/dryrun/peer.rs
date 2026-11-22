@@ -1,5 +1,7 @@
 //! 只在操作者明示同意后启动第三方程序。停止的是本对象持有的子进程，不按名称查找进程。
+use crate::trial_text as ui;
 use aproxy_ipc::config_file::FormatEntry;
+use aproxy_ipc::i18n::current;
 use serde_json::Value;
 use std::{
     io::{BufRead, BufReader, Read, Write},
@@ -20,8 +22,8 @@ pub(super) enum PeerFault {
 impl From<PeerFault> for String {
     fn from(fault: PeerFault) -> Self {
         match fault {
-            PeerFault::Unavailable => "外部程序未按时回答",
-            PeerFault::Invalid => "外部程序回信无效",
+            PeerFault::Unavailable => ui::timeout(current()),
+            PeerFault::Invalid => ui::invalid_peer(current()),
         }
         .into()
     }
@@ -39,7 +41,7 @@ impl ChildPeer {
     /// 不经过 shell。私有参数与子进程的 stderr 都不出现在试跑的诊断中。
     pub fn start(entry: &FormatEntry, dir: &Path) -> Result<Self, String> {
         let cmd = aproxy_ipc::program::resolve(&entry.command, dir, &entry.env)
-            .ok_or("无法定位外部程序")?;
+            .ok_or(ui::locate(current()))?;
         let mut child = Command::new(cmd)
             .current_dir(dir)
             .args(&entry.args)
@@ -48,9 +50,9 @@ impl ChildPeer {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|_| "无法启动外部程序")?;
-        let mut stdin = child.stdin.take().expect("管道输入");
-        let mut stdout = BufReader::new(child.stdout.take().expect("管道输出"));
+            .map_err(|_| ui::spawn(current()))?;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
         let (input, recv) = mpsc::channel::<(Vec<u8>, usize)>();
         let (send, reply) = mpsc::channel();
         std::thread::spawn(move || {
@@ -96,7 +98,7 @@ impl ChildPeer {
         let bytes = serde_json::to_vec(msg).map_err(|_| PeerFault::Invalid)?;
         self.input
             .as_ref()
-            .expect("子进程未退役")
+            .expect("child has not been retired")
             .send((bytes, limit))
             .map_err(|_| PeerFault::Unavailable)?;
         self.reply

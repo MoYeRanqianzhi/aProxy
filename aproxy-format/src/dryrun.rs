@@ -1,11 +1,13 @@
 //! 试跑只消费用户提供的请求与模拟上游尝试。不建网络客户端；输出从白名单字段另行构造。
 mod peer;
+use crate::trial_text as ui;
 use crate::{
     CliError,
     tools::{self, Layer},
 };
 use aproxy_envelope as w;
 use aproxy_ipc::config_file::{self as f, Stage};
+use aproxy_ipc::i18n::current;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -151,7 +153,7 @@ fn trace(
         "{}",
         json!({"stage":stage,"role":role,"input":input,"output":output,"changed":changes})
     )
-    .map_err(|_| "无法写出试跑结果".into())
+    .map_err(|_| ui::write(current()).into())
 }
 impl Unit {
     /// 能力声明须覆盖要求的每个阶段；不通过时不能发送样本正文。
@@ -234,7 +236,7 @@ impl Unit {
                             structural: false,
                         },
                     )
-                    .map_err(|_| "角色不能重新启动")?,
+                    .map_err(|_| ui::restart(current()))?,
                 );
             }
             self.connect(dir)?;
@@ -277,11 +279,11 @@ impl Unit {
                 crate::Role::Adaptive(a) => a.sample_time = Some(now.0),
                 _ => {}
             }
-            let m = serde_json::from_value(msg).map_err(|_| "样例不能构成该阶段的消息")?;
-            let reply = role.handle(&m, aproxy_ipc::i18n::current());
+            let m = serde_json::from_value(msg).map_err(|_| ui::frame(current()))?;
+            let reply = role.handle(&m, current());
             // 不再分配一份序列化回信；逐段扣除 JSON 字节，最后一字节留给换行。
             let mut budget = LineBudget(limit.saturating_sub(1));
-            serde_json::to_writer(&mut budget, &reply).map_err(|_| "试跑回信超过实例上限")?;
+            serde_json::to_writer(&mut budget, &reply).map_err(|_| ui::reply_size(current()))?;
             reply
         } else {
             let timeout = match stage {
@@ -292,12 +294,12 @@ impl Unit {
             let value = self
                 .peer
                 .as_ref()
-                .ok_or("外部程序未连接")?
+                .ok_or(ui::disconnected(current()))?
                 .frame(&msg, limit, timeout)?;
-            serde_json::from_value(value).map_err(|_| "外部程序回信无效")?
+            serde_json::from_value(value).map_err(|_| ui::invalid_peer(current()))?
         };
         if reply.v != 1 || reply.seq != self.seq {
-            return Err("角色回信序号不符".into());
+            return Err(ui::sequence(current()).into());
         }
         if reply
             .request
@@ -328,7 +330,7 @@ impl Unit {
                 .any(|s| !(100..=599).contains(&s))
             || reply.state.as_ref().is_some_and(|s| s.len() > 64 * 1024)
         {
-            return Err("角色回信的 HTTP 元数据或状态无效".into());
+            return Err(ui::reply(current()).into());
         }
         // 只检查本阶段真正生效的整张替换表；非法单头丢弃，表容量不足则视为进程回信故障。
         let headers = if let Some(f) = &mut reply.fail {
@@ -348,14 +350,20 @@ impl Unit {
                     && let Ok(v) = http::HeaderValue::from_str(&v)
                     && v.to_str().is_ok()
                 {
-                    parsed.try_insert(k, v).map_err(|_| "回信头表超过限制")?;
+                    parsed
+                        .try_insert(k, v)
+                        .map_err(|_| ui::headers_limit(current()))?;
                 }
             }
-            parsed.try_reserve(8).map_err(|_| "回信头表超过限制")?;
+            parsed
+                .try_reserve(8)
+                .map_err(|_| ui::headers_limit(current()))?;
             table.extend(parsed.iter().map(|(k, v)| {
                 (
                     k.as_str().to_owned(),
-                    v.to_str().expect("已检查可打印的头值").to_owned(),
+                    v.to_str()
+                        .expect("validated printable header value")
+                        .to_owned(),
                 )
             }));
         }
@@ -438,15 +446,13 @@ impl<W: Write> Trial<'_, W> {
             .call(stage, msg, &self.digest, self.dir, self.now)
             .map_err(|_| {
                 let behavior = if matches!(stage, "notify" | "decide" | "heartbeat") {
-                    "记录故障，按此控制阶段的回退规则继续"
+                    ui::control(current())
                 } else if self.units[i].layer.entry.required {
-                    "记录必需程序故障，按交付阶段重试或结束请求"
+                    ui::mandatory(current())
                 } else {
-                    "记录可选程序故障并按该阶段的旁路规则继续"
+                    ui::optional(current())
                 };
-                CliError::Unsimulated(format!(
-                    "{stage} 阶段的工作进程故障、替换与熔断；真实实例会{behavior}"
-                ))
+                CliError::Unsimulated(ui::worker(current(), stage, behavior))
             })
     }
     /// 请求补丁按次序串联，投递方式只取第一票，重跑只更新参与的后段。
@@ -565,7 +571,7 @@ impl<W: Write> Trial<'_, W> {
             let mut msg = json!({"client":self.client,"attempt":attempt,"elapsed_ms":self.elapsed_ms,"delivery":self.mode,"outcome":if failure.is_some(){"failure"}else{"success"},"request":{"method":req.method,"url":req.url},"fallback":fallback});
             if let Some(b) = req.body.as_bytes() {
                 let body = serde_json::to_value(w::Body::from_bytes(b.to_vec()))
-                    .map_err(|_| "样例正文无法编码")?;
+                    .map_err(|_| ui::body(current()))?;
                 msg["request"]
                     .as_object_mut()
                     .unwrap()
@@ -588,11 +594,7 @@ impl<W: Write> Trial<'_, W> {
                         Some(encoding),
                         |n| n > 8 * 1024 * 1024,
                     )
-                    .ok_or_else(|| {
-                        CliError::Unsimulated(
-                            "超过 8 MiB 的解码预览；真实实例会流式扫描完整实体".into(),
-                        )
-                    })?;
+                    .ok_or_else(|| CliError::Unsimulated(ui::preview(current()).into()))?;
                     obs.body = if decoded {
                         obs.headers.remove("content-encoding");
                         w::Body::from_bytes(preview)
@@ -718,11 +720,7 @@ impl<W: Write> Trial<'_, W> {
         resp.headers.remove("content-length");
         let mut converted = false;
         let nested = self.units.iter().filter(|u| u.has(Stage::Stream)).count() > 1;
-        let nested_end = || {
-            CliError::Unsimulated(
-                "多层流的中断或失败；真实实例会按已打开的流租约传递中止、回退或终止交付".into(),
-            )
-        };
+        let nested_end = || CliError::Unsimulated(ui::multistream(current()).into());
         if cut && nested {
             return Err(nested_end());
         }
@@ -820,7 +818,7 @@ impl<W: Write> Trial<'_, W> {
                         if nested {
                             return Err(nested_end());
                         }
-                        return Err("流角色拒绝样例数据".into());
+                        return Err(ui::rejected(current()).into());
                     }
                     let b = r.data.as_bytes().unwrap_or_default();
                     trace(
@@ -912,9 +910,7 @@ impl<W: Write> Trial<'_, W> {
         let mut outcome = end.outcome;
         if self.committed && outcome == "format_response" {
             if response.headers.contains_key("content-encoding") {
-                return Err(CliError::Unsimulated(
-                    "已提交保活后的编码终态；真实实例会先严格解码再决定终态事件".into(),
-                ));
+                return Err(CliError::Unsimulated(ui::encoded(current()).into()));
             }
             let body = response.body.as_bytes().unwrap_or_default();
             if !media.is_some_and(|v| v.eq_ignore_ascii_case("text/event-stream"))
@@ -1020,14 +1016,10 @@ pub(super) fn run(
     external: bool,
 ) -> Result<(), CliError> {
     if external {
-        eprintln!(
-            "注意：试跑工具自身不打开网络连接。外部程序会收到样例和环境变量，能任意使用它们，包括访问网络；只运行你信任的程序。"
-        );
+        eprintln!("{}", ui::external(current()));
     }
-    let input =
-        tools::offline_read(sample).map_err(|e| e.safe_issue(aproxy_ipc::i18n::current()))?;
-    let sample: Sample =
-        serde_json::from_slice(&input).map_err(|_| "试跑样例不是有效的请求描述")?;
+    let input = tools::offline_read(sample).map_err(|e| e.safe_issue(current()))?;
+    let sample: Sample = serde_json::from_slice(&input).map_err(|_| ui::sample(current()))?;
     rehearse(path, sample, home, external, &mut std::io::stdout().lock())
 }
 /// 模拟有限次数的尝试；耗尽样例不是一次成功交付，明确报告仍需更多上游样本。
@@ -1043,9 +1035,9 @@ fn rehearse(
         .config
         .base_url
         .as_deref()
-        .ok_or("试跑需要 base_url")?;
+        .ok_or(ui::base(current()))?;
     if !sample.path.starts_with('/') || sample.path.contains(['#', '\r', '\n']) {
-        return Err("试跑请求路径无效".into());
+        return Err(ui::path(current()).into());
     }
     let (path_part, query) = sample
         .path
@@ -1057,11 +1049,11 @@ fn rehearse(
     let raw = bytes(&sample.body);
     let max_request = chain.config.max_request_mb.unwrap_or(128);
     if max_request != 0 && raw.len() as u64 > max_request.saturating_mul(1024 * 1024) {
-        return Err("样例请求正文超过实例的 max_request_mb（413）".into());
+        return Err(ui::request_size(current()).into());
     }
     let stream_body = serde_json::from_slice::<Value>(&raw).is_ok_and(|v| v["stream"] == true);
     let mut req = w::Request::new(sample.method.unwrap_or_else(|| "POST".into()), url.into());
-    http::Method::from_bytes(req.method.as_bytes()).map_err(|_| "样例的 HTTP 方法无效")?;
+    http::Method::from_bytes(req.method.as_bytes()).map_err(|_| ui::method(current()))?;
     // 按真实出站优先级叠放：缺省补充、客户端、api_key 快捷设置、显式覆盖。代理管理头不进角色输入。
     let mut credentials = w::Headers::new();
     if let Some(key) = &chain.config.api_key {
@@ -1083,8 +1075,9 @@ fn rehearse(
         .chain(&credentials)
         .chain(chain.config.override_headers.iter().flatten())
     {
-        let key = http::HeaderName::from_bytes(k.as_bytes()).map_err(|_| "样例头名称无效")?;
-        http::HeaderValue::from_str(v).map_err(|_| "样例头值无效")?;
+        let key =
+            http::HeaderName::from_bytes(k.as_bytes()).map_err(|_| ui::header_name(current()))?;
+        http::HeaderValue::from_str(v).map_err(|_| ui::header_value(current()))?;
         if !aproxy_ipc::redact::is_managed_request_header(key.as_str()) {
             req.headers.insert(key.as_str().into(), v.clone());
         }
@@ -1149,7 +1142,7 @@ fn rehearse(
             && home.is_none()
             && !Path::new(&layer.entry.command).is_absolute()
         {
-            return Err("运行外部相对命令需要 --home；未启动程序".into());
+            return Err(ui::relative(current()).into());
         }
         let mut u = Unit {
             limits: limits.clone(),
@@ -1180,7 +1173,7 @@ fn rehearse(
                     vec!["negotiated"],
                 )?,
                 Err(peer::PeerFault::Invalid) => {
-                    return Err("试跑握手不兼容，请检查协议和阶段".into());
+                    return Err(ui::incompatible(current()).into());
                 }
                 Err(peer::PeerFault::Unavailable) if !u.layer.entry.required => trace(
                     t.out,
@@ -1190,7 +1183,7 @@ fn rehearse(
                     Value::Null,
                     vec!["skipped"],
                 )?,
-                Err(_) => return Err("试跑握手失败".into()),
+                Err(_) => return Err(ui::handshake(current()).into()),
             }
         }
         t.units.push(u);
@@ -1259,7 +1252,7 @@ fn rehearse(
             || (attempt.status.is_none() && attempt.failure.is_none())
             || attempt.body.is_some() && attempt.chunks.is_some()
         {
-            return Err("模拟尝试的状态、失败或实体无效".into());
+            return Err(ui::attempt(current()).into());
         }
         let mut chunks: Vec<Vec<u8>> = attempt.chunks.map_or_else(
             || attempt.body.as_ref().map(bytes).into_iter().collect(),
@@ -1269,15 +1262,16 @@ fn rehearse(
             let mut r = w::Response::new(status);
             // 样本不是 reqwest 的 HeaderMap，先恢复大小写无关的 HTTP 语义。长度仍留给下一次 retry 的原头。
             for (k, v) in attempt.headers {
-                let key =
-                    http::HeaderName::from_bytes(k.as_bytes()).map_err(|_| "样例头名称无效")?;
-                let val = http::HeaderValue::from_str(&v).map_err(|_| "样例头值无效")?;
-                val.to_str().map_err(|_| "样例头值无效")?;
+                let key = http::HeaderName::from_bytes(k.as_bytes())
+                    .map_err(|_| ui::header_name(current()))?;
+                let val =
+                    http::HeaderValue::from_str(&v).map_err(|_| ui::header_value(current()))?;
+                val.to_str().map_err(|_| ui::header_value(current()))?;
                 if (!aproxy_ipc::redact::is_managed_request_header(key.as_str())
                     || key == http::header::CONTENT_LENGTH)
                     && r.headers.insert(key.to_string(), v).is_some()
                 {
-                    return Err("样例存在大小写重复的响应头".into());
+                    return Err(ui::duplicate_header(current()).into());
                 }
             }
             if !attempt.interrupted && attempt.failure.is_none() {
@@ -1296,16 +1290,12 @@ fn rehearse(
             && attempt.status.is_some()
             && (!attempt.status.is_some_and(|s| s >= 400) || !has_decide);
         if live && partial && success && has_response && !has_decide {
-            return Err(CliError::Unsimulated(
-                "整包层读取未完成的直通实体；真实实例会按实际流故障结束交付".into(),
-            ));
+            return Err(CliError::Unsimulated(ui::unfinished(current()).into()));
         }
         if live && partial && success && has_response && has_decide {
             // 纯整包层要等到 EOF 才能交付头；混合链中已经打开的内层还持有租约。
             if t.units.iter().any(|u| u.has(Stage::Stream)) {
-                return Err(CliError::Unsimulated(
-                    "混合回程链在提交前中断；真实实例会先释放已打开的流，再交回决定层".into(),
-                ));
+                return Err(CliError::Unsimulated(ui::mixed(current()).into()));
             }
             live = false;
         }
@@ -1355,9 +1345,7 @@ fn rehearse(
         };
         if settled.retry {
             let delta = Duration::from_millis(settled.delay_ms);
-            let overflow = || {
-                CliError::Unsimulated("逻辑时钟超出可表示范围；真实实例会按配置的退避等待".into())
-            };
+            let overflow = || CliError::Unsimulated(ui::clock(current()).into());
             t.now = (
                 t.now.0.checked_add(delta).ok_or_else(overflow)?,
                 t.now.1.checked_add(delta).ok_or_else(overflow)?,
@@ -1593,7 +1581,9 @@ mod tests {
             json!({"path":"/","body":{},"attempts":[{"status":200,"chunks":["head"],"interrupted":true}]}),
             &[],
         );
-        assert!(matches!(result,Err(CliError::Unsimulated(ref s)) if s.contains("多层流")));
+        assert!(
+            matches!(result,Err(CliError::Unsimulated(ref s)) if s.contains("multi-layer stream"))
+        );
         assert!(!rows.iter().any(|r| r["stage"] == "result"));
     }
     /// 保活由当前交付模式和叠加后的配置决定；always 可启用非流式请求，零间隔不可被样例强行打开。

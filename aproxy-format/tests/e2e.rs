@@ -875,11 +875,35 @@ fn config_diagnostic_names_the_field_not_the_value() {
         ("route", "[aliases]\nurl=123", "aliases"),
     ] {
         std::fs::write(&f, text).unwrap();
-        let r = format_command()
-            .args([role, "--config"])
-            .arg(&f)
-            .output()
-            .unwrap();
+        let run = |lang, tool| {
+            let mut command = format_command();
+            command
+                .env("APROXY_HOME", d.path())
+                .env("APROXY_LANG", lang);
+            if tool {
+                command.arg("check");
+            }
+            command.args([role, "--config"]).arg(&f).output().unwrap()
+        };
+        let r = run("en", false);
+        let zh_worker = run("zh-CN", false);
+        assert_eq!(
+            (r.status, &r.stdout, &r.stderr),
+            (zh_worker.status, &zh_worker.stdout, &zh_worker.stderr)
+        );
+        for (lang, prefix) in [
+            ("en", "Invalid role configuration field: "),
+            ("zh-CN", "角色配置字段无效："),
+        ] {
+            let checked = run(lang, true);
+            assert!(!checked.status.success() && checked.stdout.is_empty());
+            let diagnostic = String::from_utf8(checked.stderr).unwrap();
+            assert!(
+                diagnostic.contains(&format!("{prefix}{key}"))
+                    && !diagnostic.contains("private-fixture"),
+                "{diagnostic}"
+            );
+        }
         let err = String::from_utf8(r.stderr).unwrap();
         assert!(
             !r.status.success()
@@ -2305,11 +2329,14 @@ fn dry_run_external_execution_requires_opt_in_and_discloses_the_boundary() {
         assert_eq!(marker.join("config.toml").exists(), allow, "{out:?}");
         assert_eq!(out.status.success(), !allow, "{out:?}");
         let err = String::from_utf8(out.stderr).unwrap();
-        assert_eq!(err.contains("外部程序会收到样例和环境变量"), allow);
+        assert_eq!(
+            err.contains("External programs receive the sample and environment variables"),
+            allow
+        );
         let text = String::from_utf8(out.stdout).unwrap();
         assert_eq!(text.contains("skipped"), !allow);
         if allow {
-            assert!(err.contains("握手不兼容"));
+            assert!(err.contains("Incompatible dry-run handshake"));
         }
         assert!(!text.contains("private-fixture") && !err.contains("private-fixture"));
     }
@@ -2384,11 +2411,11 @@ fn check_lists_only_structural_guarantees_and_credential_names() {
             .unwrap();
         assert!(out.status.success(), "{out:?}");
         let text = String::from_utf8(out.stdout).unwrap();
-        for word in ["没有检查", "RELAY_KEY_A、RELAY_KEY_B"] {
+        for word in ["Not checked", "RELAY_KEY_A, RELAY_KEY_B"] {
             assert!(text.contains(word), "{text}");
         }
         if args.len() == 1 {
-            assert!(text.contains("1 个程序") && text.contains("aproxy doctor"));
+            assert!(text.contains("1 program)") && text.contains("aproxy doctor"));
         }
         assert!(!text.contains("private"));
     }
@@ -2419,7 +2446,7 @@ fn tools_resolve_role_configs_from_the_selected_home() {
             assert_eq!(out.status.success(), explicit, "{out:?}");
             assert_eq!(
                 String::from_utf8_lossy(&out.stderr)
-                    .matches("代理配置所在目录")
+                    .matches("proxy configuration directory")
                     .count(),
                 usize::from(!explicit)
             );
@@ -2474,14 +2501,14 @@ fn init_explains_files_and_generates_editable_toml() {
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
     for term in [
-        "已生成",
+        "Generated in",
         "adaptive.toml",
         "keys.toml",
         "config.toml",
-        "下一步",
-        "RELAY_KEY_A、RELAY_KEY_B",
+        "Next steps",
+        "RELAY_KEY_A and RELAY_KEY_B",
         "aproxy-format check",
-        "启动或重启",
+        "start or restart",
     ] {
         assert!(text.contains(term), "{text}");
     }
@@ -2514,6 +2541,50 @@ fn init_explains_files_and_generates_editable_toml() {
         );
         assert!(std::fs::read_to_string(generated).unwrap().contains("# "));
     }
+    // 复用完全相同的输出目录，避免绝对路径的差别掩盖模板里的值变化。
+    for scenario in [
+        "openrouter",
+        "adaptive-relay",
+        "key-rotation",
+        "claude-relay",
+    ] {
+        let dest = dir.path().join(scenario);
+        let mut previous = std::collections::BTreeMap::new();
+        for (lang, heading) in [("en", "Next steps:"), ("zh-CN", "下一步：")] {
+            let run = format_command()
+                .env("APROXY_HOME", dir.path())
+                .env("APROXY_LANG", lang)
+                .args(["init", scenario, "--output"])
+                .arg(&dest)
+                .output()
+                .unwrap();
+            assert!(run.status.success() && run.stderr.is_empty());
+            assert!(String::from_utf8(run.stdout).unwrap().contains(heading));
+            let mut values = std::collections::BTreeMap::new();
+            for file in std::fs::read_dir(&dest).unwrap() {
+                let file = file.unwrap();
+                let body = std::fs::read_to_string(file.path()).unwrap();
+                let comments: Vec<_> = body
+                    .lines()
+                    .map(str::trim_start)
+                    .filter(|s| s.starts_with('#'))
+                    .collect();
+                assert!(
+                    !comments.is_empty() && comments.iter().all(|s| s.is_ascii() == (lang == "en"))
+                );
+                values.insert(
+                    file.file_name(),
+                    toml::from_str::<toml::Value>(&body).unwrap(),
+                );
+            }
+            if lang == "en" {
+                previous = values;
+                std::fs::rename(&dest, dir.path().join(format!("{scenario}-english"))).unwrap();
+            } else {
+                assert_eq!(previous, values);
+            }
+        }
+    }
 }
 
 /// 两种帮助拼写都必须先于角色配置与标准输入，退出码、输出通道和选项说明都属于 CLI 契约。
@@ -2532,8 +2603,13 @@ fn all_commands_explain_options_and_an_example_before_io() {
         "try",
         "translate",
     ] {
-        for flag in ["--help", "-h"] {
+        for (lang, flag, usage, example, network) in [
+            ("en", "--help", "Usage:", "Example:", "network"),
+            ("en", "-h", "Usage:", "Example:", "network"),
+            ("zh-CN", "--help", "用法：", "示例：", "网络"),
+        ] {
             let out = format_command()
+                .env("APROXY_LANG", lang)
                 .args([cmd, "--config", "does-not-exist", flag])
                 .output()
                 .unwrap();
@@ -2542,13 +2618,13 @@ fn all_commands_explain_options_and_an_example_before_io() {
                 "{cmd}: {out:?}"
             );
             let text = String::from_utf8(out.stdout).unwrap();
-            for term in ["Usage:", "Example:", cmd, "--help"] {
+            for term in [usage, example, cmd, "--help"] {
                 assert!(text.contains(term), "{cmd}: {text}");
             }
             for term in match cmd {
                 "init" => vec!["--output"],
                 "check" => vec!["--config", "--home"],
-                "try" => vec!["--request", "--home", "--allow-external", "network"],
+                "try" => vec!["--request", "--home", "--allow-external", network],
                 "translate" | "convert" => vec!["--from", "--to"],
                 _ => vec!["--config"],
             } {
@@ -2587,7 +2663,10 @@ fn opted_in_executable_uses_instance_lookup_not_the_driver_path() {
             if selected {
                 assert!(String::from_utf8_lossy(&out.stdout).contains("negotiated"));
             } else {
-                assert!(String::from_utf8_lossy(&out.stderr).contains("相对命令需要 --home"));
+                assert!(
+                    String::from_utf8_lossy(&out.stderr)
+                        .contains("relative external command requires --home")
+                );
             }
         }
     }

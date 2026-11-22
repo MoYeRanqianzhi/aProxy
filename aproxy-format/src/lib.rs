@@ -19,8 +19,14 @@ mod rewrite;
 mod role_text;
 mod route;
 mod selection;
+#[path = "i18n/templates.rs"]
+mod templates;
+#[path = "i18n/tools.rs"]
+mod tool_text;
 mod tools;
 mod translate;
+#[path = "i18n/dryrun.rs"]
+mod trial_text;
 use crate::config::Fault;
 use aproxy_envelope as w;
 use std::io::{BufRead, Read, Write};
@@ -455,7 +461,7 @@ impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Invalid(s) => f.write_str(s),
-            Self::Unsimulated(s) => write!(f, "未模拟：{s}"),
+            Self::Unsimulated(s) => f.write_str(&trial_text::unsimulated(current(), s)),
         }
     }
 }

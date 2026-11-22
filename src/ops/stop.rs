@@ -43,8 +43,8 @@ pub enum StopFailure {
     GenerationChanged,
     /// 停止请求已送达，但在时限内没有退出：进程可能还在
     StillRunning,
-    /// 停止请求发不出去，而进程还在（不应答控制通道）。`error` 是 IPC 的错误文字
-    Unresponsive { error: String },
+    /// 停止请求发不出去，而进程还在（不应答控制通道）。保留 IPC 的原因与参数，由最终读者选语言
+    Unresponsive { error: daemon::IpcError },
     /// 强制终止失败（身份核验不过、无权限）。恢复记录已放回，实例照旧受崩溃恢复保护；
     /// 放回失败时 `restore_error` 带着原因
     ForceFailed {
@@ -139,9 +139,7 @@ pub async fn stop_in(
                         return Err(StopFailure::GenerationChanged);
                     }
                     Err(e) => {
-                        return Err(StopFailure::Unresponsive {
-                            error: e.to_string(),
-                        });
+                        return Err(StopFailure::Unresponsive { error: e.clone() });
                     }
                     Ok(()) => {}
                 }
@@ -238,9 +236,7 @@ async fn settle_graceful(
                 }
                 Ok(Stopped::AlreadyGone)
             }
-            RecordIdentity::Alive => Err(StopFailure::Unresponsive {
-                error: e.to_string(),
-            }),
+            RecordIdentity::Alive => Err(StopFailure::Unresponsive { error: e }),
         },
     }
 }

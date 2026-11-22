@@ -77,6 +77,9 @@ HangDelay RestartsDisabled MissingDir MissingConfig UnreadableConfig FilePermiss
 WithAliases OwnedHome OtherHome ExposedKey ExposedProxy RecordRead RecordParse RecordSchema
 InstallMissing InstallRead
 """.split())
+    ipc_drafts = set("""identity unverified_refusal subscription_ack peer_pid pipe_owner run_changed
+incomplete not_json missing_v missing_op args_object required invalid unsupported_version unknown_op
+unknown_arg invalid_state idle_condition not_found busy""".split())
     for path in sorted(p for root in (ROOT, ROOT / "aproxy-format", ROOT / "aproxy-ipc") for p in (root / "src/i18n").glob("*.rs")):
         source = path.read_text(encoding="utf-8")
         tokens = [m for m in TOKEN.finditer(source) if not m[0].startswith(("//", "/*"))]
@@ -98,6 +101,7 @@ InstallMissing InstallRead
                 line = source.count("\n", 0, tok.start()) + 1
                 known = path.relative_to(ROOT).as_posix() == "src/i18n/help.rs" and name in english_only
                 diagnostic = path.relative_to(ROOT).as_posix() == "aproxy-ipc/src/i18n/diagnostic.rs" and name in diagnostic_drafts
+                diagnostic |= path.relative_to(ROOT).as_posix() == "aproxy-ipc/src/i18n/ipc.rs" and name in ipc_drafts
                 unexpected += not (known or diagnostic)
                 reason = "no previous Chinese help" if known else "English-only diagnostic" if diagnostic else "REVIEW"
                 print(f"{path.relative_to(ROOT)}:{line} {name}: {value!r} ({reason})")

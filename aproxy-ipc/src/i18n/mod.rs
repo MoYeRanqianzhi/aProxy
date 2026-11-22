@@ -2,6 +2,8 @@
 
 /// 严格配置解析和体检共用的诊断原因；序列化时只公开英文说明。
 pub mod diagnostic;
+#[cfg(feature = "client")]
+pub(crate) mod ipc;
 
 use std::{ffi::OsStr, path::Path, sync::OnceLock};
 

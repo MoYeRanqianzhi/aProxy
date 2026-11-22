@@ -637,17 +637,18 @@ impl Rejection {
 
     /// 要回给客户端的那一行应答（不含换行）
     pub fn reply(&self) -> String {
+        use crate::i18n::{Lang, ipc as text};
         use serde_json::json;
         let (code, message, details) = match self {
             Rejection::BadRequest { reason, arg } => {
                 let message = match (*reason, arg) {
-                    ("incomplete_line", _) => "the request line is too long or incomplete".into(),
-                    ("not_json", _) => "the request is not JSON".into(),
-                    ("missing_v", _) => "the request has no v".into(),
-                    ("missing_op", _) => "the request has no op".into(),
-                    ("args_not_object", _) => "args must be an object".into(),
-                    ("missing_arg", Some(arg)) => format!("arg {arg} is required"),
-                    (_, Some(arg)) => format!("arg {arg} has the wrong type or value"),
+                    ("incomplete_line", _) => text::incomplete(Lang::En).to_owned(),
+                    ("not_json", _) => text::not_json(Lang::En).to_owned(),
+                    ("missing_v", _) => text::missing_v(Lang::En).to_owned(),
+                    ("missing_op", _) => text::missing_op(Lang::En).to_owned(),
+                    ("args_not_object", _) => text::args_object(Lang::En).to_owned(),
+                    ("missing_arg", Some(arg)) => text::required(Lang::En, arg),
+                    (_, Some(arg)) => text::invalid(Lang::En, arg),
                     (other, None) => other.to_string(),
                 };
                 let details = match arg {
@@ -658,27 +659,27 @@ impl Rejection {
             }
             Rejection::UnsupportedVersion(v) => (
                 error_code::UNSUPPORTED_VERSION,
-                format!("unsupported protocol version {v}; this instance supports {IPC_VERSION}"),
+                text::unsupported_version(Lang::En, v, &IPC_VERSION.to_string()),
                 json!({ "supported": [IPC_VERSION] }),
             ),
             Rejection::UnknownOp(op) => (
                 error_code::UNKNOWN_OP,
-                format!("unknown op: {op}"),
+                text::unknown_op(Lang::En, op),
                 json!({ "op": op }),
             ),
             Rejection::UnsupportedArg(args) => (
                 error_code::UNSUPPORTED_ARG,
-                format!("unknown arg: {}", args.join(", ")),
+                text::unknown_arg(Lang::En, &args.join(", ")),
                 json!({ "args": args }),
             ),
             Rejection::InvalidState(state) => (
                 error_code::INVALID_STATE,
-                format!("not allowed while the instance is {state}"),
+                text::invalid_state(Lang::En, state),
                 json!({ "state": state }),
             ),
             Rejection::ConditionNotMet { idle_ms } => (
                 error_code::CONDITION_NOT_MET,
-                format!("the instance has been idle for only {idle_ms} ms"),
+                text::idle_condition(Lang::En, *idle_ms),
                 json!({ "idle_ms": idle_ms }),
             ),
             Rejection::NotFound {
@@ -694,13 +695,13 @@ impl Rejection {
                 };
                 (
                     error_code::NOT_FOUND,
-                    format!("nothing to return for request {request_id}: {reason}"),
+                    text::not_found(Lang::En, request_id, reason),
                     details,
                 )
             }
             Rejection::Busy { limit } => (
                 error_code::BUSY,
-                format!("all {limit} streaming connections are in use"),
+                text::busy(Lang::En, *limit as u64),
                 json!({ "limit": limit }),
             ),
         };
@@ -714,7 +715,7 @@ impl Rejection {
                 details,
             }),
         })
-        .expect("序列化 IPC 应答失败")
+        .expect("IPC reply is serializable")
     }
 }
 

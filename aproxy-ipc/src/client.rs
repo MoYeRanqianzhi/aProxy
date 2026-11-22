@@ -1,18 +1,105 @@
 //! Connect to an instance in an explicit run directory; a connection never uses TCP.
 //! One-shot commands and event subscriptions share the platform peer check.
 
+use crate::i18n::{Lang, ipc as text};
 use crate::{endpoint::instance as endpoint_for_in, wire::*};
 use std::{io, time::Duration};
 
+/// Transport failures are local facts, not wire codes. Keep endpoint and underlying
+/// evidence separate so callers can report them without parsing the English Display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportIssue {
+    /// Operating-system or external parser text with no local interpretation.
+    Evidence(String),
+    /// Endpoint supplied by the caller around a connection or protocol error.
+    At {
+        endpoint: String,
+        cause: Box<TransportIssue>,
+    },
+    /// Invalid reply format: {error}
+    ReplyFormat { error: String },
+    /// Reply claims pid {claimed}, but the connection peer is pid {peer}
+    PidMismatch { claimed: u32, peer: u32 },
+    /// {endpoint}: request timed out
+    Timeout { endpoint: String },
+    /// No subscription events received for 45 seconds
+    Silence,
+    /// Event is not JSON: {error}
+    EventJson { error: String },
+    /// Connection closed before the reply was complete
+    Closed,
+    /// Reply is not JSON: {error}
+    ReplyJson { error: String },
+    /// The instance uses control protocol v{v}; this program supports v{supported}. Use the same aProxy version as the instance.
+    Version { v: u64, supported: u32 },
+    /// Reply has no protocol version v
+    NoVersion,
+    /// Reply has neither result nor error
+    NoResult,
+    /// Reply exceeds the length limit
+    Oversize,
+    /// Cannot connect ({error})
+    Connect { error: String },
+    /// Control endpoint belongs to another user (uid {server}); its reply is not trusted
+    ForeignOwner { server: u32 },
+    /// invalid request identity
+    Identity,
+    /// cannot verify subscription refusal
+    UnverifiedRefusal,
+    /// invalid subscription acknowledgment
+    SubscriptionAck,
+    /// cannot verify peer pid
+    PeerPid,
+    /// cannot verify pipe server owner
+    PipeOwner,
+}
+impl TransportIssue {
+    fn at(self, endpoint: &str) -> Self {
+        Self::At {
+            endpoint: endpoint.to_owned(),
+            cause: Box::new(self),
+        }
+    }
+    fn render(&self, lang: Lang) -> String {
+        match self {
+            Self::Evidence(s) => s.clone(),
+            Self::At { endpoint, cause } => format!("{endpoint}: {}", cause.render(lang)),
+            Self::ReplyFormat { error } => text::reply_format(lang, error),
+            Self::PidMismatch { claimed, peer } => text::pid_mismatch(lang, *claimed, *peer),
+            Self::Timeout { endpoint } => text::timeout(lang, endpoint),
+            Self::Silence => text::silence(lang).to_owned(),
+            Self::EventJson { error } => text::event_json(lang, error),
+            Self::Closed => text::closed(lang).to_owned(),
+            Self::ReplyJson { error } => text::reply_json(lang, error),
+            Self::Version { v, supported } => text::version(lang, *v, *supported),
+            Self::NoVersion => text::no_version(lang).to_owned(),
+            Self::NoResult => text::no_result(lang).to_owned(),
+            Self::Oversize => text::oversize(lang).to_owned(),
+            Self::Connect { error } => text::connect(lang, error),
+            Self::ForeignOwner { server } => text::foreign_owner(lang, *server),
+            Self::Identity => text::identity(lang).to_owned(),
+            Self::UnverifiedRefusal => text::unverified_refusal(lang).to_owned(),
+            Self::SubscriptionAck => text::subscription_ack(lang).to_owned(),
+            Self::PeerPid => text::peer_pid(lang).to_owned(),
+            Self::PipeOwner => text::pipe_owner(lang).to_owned(),
+        }
+    }
+}
+impl From<&str> for TransportIssue {
+    fn from(s: &str) -> Self {
+        Self::Evidence(s.to_owned())
+    }
+}
+
 /// 一次 IPC 请求的失败，按「能据此下什么结论」分类。
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpcError {
     /// 端点不存在：确定没有实例在这里（不必重试；stop 据此确认已退出）
-    Unreachable(String),
+    Unreachable(TransportIssue),
     /// 管道忙、超时、读写出错：可能有实例，只是此刻没给出应答（挂死也是这样）
-    Transient(String),
+    Transient(TransportIssue),
     /// 有应答但无法采信：解析不了、协议版本不符、自报 pid 与连接对端不符
-    Protocol(String),
+    Protocol(TransportIssue),
     /// The endpoint now belongs to a different run than the reader selected.
     RunChanged,
     /// An acknowledgment or event did not fit in its bounded frame.
@@ -27,26 +114,39 @@ pub enum IpcError {
 
 impl std::fmt::Display for IpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unreachable(e) | Self::Transient(e) | Self::Protocol(e) => f.write_str(e),
-            Self::LineTooLong => f.write_str("应答超过长度上限"),
-            Self::RunChanged => f.write_str("instance run changed"),
-            Self::Remote { code, message, .. } => {
-                write!(f, "实例拒绝了请求（{code}）：{message}")
-            }
-        }
+        f.write_str(&self.render(Lang::En))
     }
 }
 
 impl std::error::Error for IpcError {}
 
 impl IpcError {
+    /// Render at the reader. Unknown remote errors retain the peer's evidence; never
+    /// classify a future peer's failure by matching the prose it sent.
+    pub fn render(&self, lang: Lang) -> String {
+        match self {
+            Self::Unreachable(e) | Self::Transient(e) | Self::Protocol(e) => e.render(lang),
+            Self::LineTooLong => text::oversize(lang).to_owned(),
+            Self::RunChanged => text::run_changed(lang).to_owned(),
+            Self::Remote {
+                code,
+                message,
+                details,
+            } => {
+                let localized = (lang == Lang::Zh)
+                    .then(|| text::remote(lang, code, details))
+                    .flatten();
+                text::refused(lang, code, localized.as_deref().unwrap_or(message))
+            }
+        }
+    }
+
     /// 给连接类与协议类的失败补上是哪个端点；实例明确的拒绝原样返回。
     fn at(self, endpoint: &str) -> Self {
         match self {
-            IpcError::Unreachable(e) => IpcError::Unreachable(format!("{endpoint}: {e}")),
-            IpcError::Transient(e) => IpcError::Transient(format!("{endpoint}: {e}")),
-            IpcError::Protocol(e) => IpcError::Protocol(format!("{endpoint}: {e}")),
+            IpcError::Unreachable(e) => IpcError::Unreachable(e.at(endpoint)),
+            IpcError::Transient(e) => IpcError::Transient(e.at(endpoint)),
+            IpcError::Protocol(e) => IpcError::Protocol(e.at(endpoint)),
             other => other,
         }
     }
@@ -74,7 +174,7 @@ impl RunIdentity {
         let (run, _) = record["request_id"]
             .as_str()
             .and_then(|id| id.rsplit_once('-'))
-            .ok_or_else(|| IpcError::Protocol("invalid request identity".into()))?;
+            .ok_or_else(|| IpcError::Protocol(TransportIssue::Identity))?;
         if run == self.instance_id {
             Ok(())
         } else {
@@ -84,8 +184,12 @@ impl RunIdentity {
 }
 
 fn snapshot_run(snapshot: &serde_json::Value, peer: u32) -> Result<RunIdentity, IpcError> {
-    let record: InstanceRecord = serde_json::from_value(snapshot["instance"].clone())
-        .map_err(|e| IpcError::Protocol(format!("应答格式不符：{e}")))?;
+    let record: InstanceRecord =
+        serde_json::from_value(snapshot["instance"].clone()).map_err(|e| {
+            IpcError::Protocol(TransportIssue::ReplyFormat {
+                error: e.to_string(),
+            })
+        })?;
     verify_pid(record.pid, peer)?;
     Ok(RunIdentity {
         pid: peer,
@@ -95,9 +199,10 @@ fn snapshot_run(snapshot: &serde_json::Value, peer: u32) -> Result<RunIdentity, 
 
 fn verify_pid(claimed: u32, peer: u32) -> Result<(), IpcError> {
     if claimed != peer {
-        Err(IpcError::Protocol(format!(
-            "应答者自报 pid {claimed} 与连接对端进程 {peer} 不一致"
-        )))
+        Err(IpcError::Protocol(TransportIssue::PidMismatch {
+            claimed,
+            peer,
+        }))
     } else {
         Ok(())
     }
@@ -180,16 +285,20 @@ async fn request_raw_within(
     let (line, peer) = match tokio::time::timeout(timeout, fut).await {
         Ok(Ok(reply)) => reply,
         Ok(Err(IpcError::Unreachable(e))) => {
-            return Err(IpcError::Unreachable(format!("{endpoint}: {e}")));
+            return Err(IpcError::Unreachable(e.at(endpoint)));
         }
         Ok(Err(IpcError::Transient(e))) => {
-            return Err(IpcError::Transient(format!("{endpoint}: {e}")));
+            return Err(IpcError::Transient(e.at(endpoint)));
         }
         Ok(Err(e)) => return Err(e),
-        Err(_) => return Err(IpcError::Transient(format!("{endpoint}: 请求超时"))),
+        Err(_) => {
+            return Err(IpcError::Transient(TransportIssue::Timeout {
+                endpoint: endpoint.to_string(),
+            }));
+        }
     };
     let status = parse_reply(&line).map_err(|e| match e {
-        IpcError::Protocol(m) => IpcError::Protocol(format!("{endpoint}: {m}")),
+        IpcError::Protocol(m) => IpcError::Protocol(m.at(endpoint)),
         other => other,
     })?;
     // 应答者自报的 pid 必须就是连接对端的进程：普查与 stop 都按这个 pid 认
@@ -235,7 +344,9 @@ pub async fn read_for_run_in(
     };
     match tokio::time::timeout(Duration::from_secs(3), exchange).await {
         Ok(result) => result.map_err(|e| e.at(&endpoint)),
-        Err(_) => Err(IpcError::Transient(format!("{endpoint}: 请求超时"))),
+        Err(_) => Err(IpcError::Transient(TransportIssue::Timeout {
+            endpoint: endpoint.to_string(),
+        })),
     }
 }
 
@@ -301,7 +412,11 @@ pub async fn shutdown_for_run_in(
     };
     tokio::time::timeout(Duration::from_secs(3), exchange)
         .await
-        .map_err(|_| IpcError::Transient(format!("{endpoint}: 请求超时")))?
+        .map_err(|_| {
+            IpcError::Transient(TransportIssue::Timeout {
+                endpoint: endpoint.to_string(),
+            })
+        })?
         .map_err(|e| e.at(&endpoint))
 }
 
@@ -317,7 +432,7 @@ async fn subscription_line<R: tokio::io::AsyncBufRead + Unpin>(
         .take((limit - buffer.len()) as u64)
         .read_until(b'\n', buffer)
         .await
-        .map_err(|error| IpcError::Transient(error.to_string()))?;
+        .map_err(|error| IpcError::Transient(TransportIssue::Evidence(error.to_string())))?;
     if buffer.last() == Some(&b'\n') {
         Ok(true)
     } else if buffer.len() == limit {
@@ -355,7 +470,7 @@ impl EventStream {
             subscription_line(lines, &mut self.buffer, crate::wire::MAX_REPLY_LINE),
         )
         .await
-        .map_err(|_| IpcError::Transient("订阅连接 45 秒没有收到任何事件".to_string()))
+        .map_err(|_| IpcError::Transient(TransportIssue::Silence))
         .and_then(|r| r);
         match read {
             Ok(true) => {}
@@ -365,8 +480,11 @@ impl EventStream {
                 return end.map(|_| None);
             }
         }
-        let event = serde_json::from_slice::<serde_json::Value>(&self.buffer)
-            .map_err(|e| IpcError::Protocol(format!("事件不是 JSON：{e}")));
+        let event = serde_json::from_slice::<serde_json::Value>(&self.buffer).map_err(|e| {
+            IpcError::Protocol(TransportIssue::EventJson {
+                error: e.to_string(),
+            })
+        });
         self.buffer.clear();
         let event = event?;
         let identity = match event["event"].as_str() {
@@ -408,17 +526,18 @@ pub async fn subscribe_for_run_in(
         if expected.is_some_and(|run| run.pid != peer) {
             return Err(IpcError::RunChanged);
         }
-        let failed = |e: io::Error| IpcError::Transient(e.to_string());
+        let failed = |e: io::Error| IpcError::Transient(TransportIssue::Evidence(e.to_string()));
         let request = ReadOp::Subscribe.request_line();
         stream.write_all(request.as_bytes()).await.map_err(failed)?;
         stream.write_all(b"\n").await.map_err(failed)?;
         let mut lines = tokio::io::BufReader::new(stream);
         let mut line = Vec::new();
         if !subscription_line(&mut lines, &mut line, crate::wire::MAX_REPLY_LINE).await? {
-            return Err(IpcError::Transient("连接在应答完整之前关闭".to_string()));
+            return Err(IpcError::Transient(TransportIssue::Closed));
         }
         let response = parse_result(
-            std::str::from_utf8(&line).map_err(|e| IpcError::Protocol(e.to_string()))?,
+            std::str::from_utf8(&line)
+                .map_err(|e| IpcError::Protocol(TransportIssue::Evidence(e.to_string())))?,
         );
         // An error frame has no run ID. Keep this connection open while checking
         // the peer of a fresh ping before assigning a refusal to a selected run.
@@ -429,7 +548,7 @@ pub async fn subscribe_for_run_in(
                     .map_err(|error| match error {
                         // A second refusal is still not evidence of the issuer's run ID.
                         IpcError::Remote { .. } => {
-                            IpcError::Protocol("cannot verify subscription refusal".into())
+                            IpcError::Protocol(TransportIssue::UnverifiedRefusal)
                         }
                         other => other,
                     })?;
@@ -444,7 +563,7 @@ pub async fn subscribe_for_run_in(
         run.check(expected)?;
         let records = ack["requests"]
             .as_array()
-            .ok_or_else(|| IpcError::Protocol("invalid subscription acknowledgment".into()))?;
+            .ok_or_else(|| IpcError::Protocol(TransportIssue::SubscriptionAck))?;
         for record in records {
             run.verify_record(record)?;
         }
@@ -460,14 +579,19 @@ pub async fn subscribe_for_run_in(
     match tokio::time::timeout(Duration::from_secs(3), open).await {
         Ok(Ok(opened)) => Ok(opened),
         Ok(Err(e)) => Err(e.at(&endpoint)),
-        Err(_) => Err(IpcError::Transient(format!("{endpoint}: 请求超时"))),
+        Err(_) => Err(IpcError::Transient(TransportIssue::Timeout {
+            endpoint: endpoint.to_string(),
+        })),
     }
 }
 
 /// 解析一行 v1 应答，取出 `result`；失败应答变成 `Remote`。
 fn parse_result(line: &str) -> Result<serde_json::Value, IpcError> {
-    let mut value: serde_json::Value = serde_json::from_str(line)
-        .map_err(|e| IpcError::Protocol(format!("应答不是 JSON：{e}")))?;
+    let mut value: serde_json::Value = serde_json::from_str(line).map_err(|e| {
+        IpcError::Protocol(TransportIssue::ReplyJson {
+            error: e.to_string(),
+        })
+    })?;
     let version = value.get("v").and_then(serde_json::Value::as_u64);
     let error = value.get("error");
     let field = |key: &str| error.and_then(|error| error.get(key));
@@ -486,23 +610,27 @@ fn parse_result(line: &str) -> Result<serde_json::Value, IpcError> {
     }
     if version != Some(u64::from(IPC_VERSION)) {
         return Err(IpcError::Protocol(match version {
-            Some(v) => format!(
-                "实例使用控制协议 v{v}，本程序只懂 v{IPC_VERSION}：请用与实例同版本的 aproxy 操作它"
-            ),
-            None => "应答没有协议版本 v".to_string(),
+            Some(v) => TransportIssue::Version {
+                v,
+                supported: IPC_VERSION,
+            },
+            None => TransportIssue::NoVersion,
         }));
     }
     let ok = value.get("ok").and_then(serde_json::Value::as_bool) == Some(true);
     match value.get_mut("result") {
         Some(result) if ok => Ok(result.take()),
-        _ => Err(IpcError::Protocol("应答缺少 result 或 error".to_string())),
+        _ => Err(IpcError::Protocol(TransportIssue::NoResult)),
     }
 }
 
 /// 解析一行 v1 应答。
 pub fn parse_reply(line: &str) -> Result<InstanceStatus, IpcError> {
-    let value: serde_json::Value = serde_json::from_str(line)
-        .map_err(|e| IpcError::Protocol(format!("应答不是 JSON：{e}")))?;
+    let value: serde_json::Value = serde_json::from_str(line).map_err(|e| {
+        IpcError::Protocol(TransportIssue::ReplyJson {
+            error: e.to_string(),
+        })
+    })?;
     // 先只看 `v`：别的版本的应答可能改了其余字段的形状，按 v1 的结构解析只会报出一句
     // 「格式不符」，说不出真正的原因
     let version = value.get("v").and_then(serde_json::Value::as_u64);
@@ -527,14 +655,18 @@ pub fn parse_reply(line: &str) -> Result<InstanceStatus, IpcError> {
             });
         }
         return Err(IpcError::Protocol(match version {
-            Some(v) => format!(
-                "实例使用控制协议 v{v}，本程序只懂 v{IPC_VERSION}：请用与实例同版本的 aproxy 操作它"
-            ),
-            None => "应答没有协议版本 v".to_string(),
+            Some(v) => TransportIssue::Version {
+                v,
+                supported: IPC_VERSION,
+            },
+            None => TransportIssue::NoVersion,
         }));
     }
-    let reply: WireResponse = serde_json::from_value(value)
-        .map_err(|e| IpcError::Protocol(format!("应答格式不符：{e}")))?;
+    let reply: WireResponse = serde_json::from_value(value).map_err(|e| {
+        IpcError::Protocol(TransportIssue::ReplyFormat {
+            error: e.to_string(),
+        })
+    })?;
     match (reply.ok, reply.result, reply.error) {
         (true, Some(status), _) => Ok(status),
         (false, _, Some(error)) => Err(IpcError::Remote {
@@ -542,7 +674,7 @@ pub fn parse_reply(line: &str) -> Result<InstanceStatus, IpcError> {
             message: error.message,
             details: error.details,
         }),
-        _ => Err(IpcError::Protocol("应答缺少 result 或 error".to_string())),
+        _ => Err(IpcError::Protocol(TransportIssue::NoResult)),
     }
 }
 /// 在已建立的连接上完成一次「发请求行、收响应行」。
@@ -553,7 +685,7 @@ where
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     // 应答行长度上限：端点名可以预测，应答者未必是 aProxy，不能让它把客户端
     // 内存撑爆。快照只有几百字节到几千字节；上限留给以后一行带一批请求记录的 op
-    let failed = |e: io::Error| IpcError::Transient(e.to_string());
+    let failed = |e: io::Error| IpcError::Transient(TransportIssue::Evidence(e.to_string()));
     let (reader, mut writer) = tokio::io::split(stream);
     writer
         .write_all(req_line.as_bytes())
@@ -568,9 +700,9 @@ where
         .map_err(failed)?;
     if !line.ends_with('\n') {
         return Err(if line.len() as u64 >= crate::wire::MAX_REPLY_LINE as u64 {
-            IpcError::Protocol("应答超过长度上限".to_string())
+            IpcError::Protocol(TransportIssue::Oversize)
         } else {
-            IpcError::Transient("连接在应答完整之前关闭".to_string())
+            IpcError::Transient(TransportIssue::Closed)
         });
     }
     Ok(line)
@@ -606,19 +738,27 @@ mod imp {
                 Ok(client) => break client,
                 Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
                     if tokio::time::Instant::now() >= deadline {
-                        return Err(IpcError::Transient(format!("无法连接（{e}）")));
+                        return Err(IpcError::Transient(TransportIssue::Connect {
+                            error: e.to_string(),
+                        }));
                     }
                     tokio::time::sleep(BUSY_RETRY_INTERVAL).await;
                 }
                 // 管道名不存在：确定没有实例在这个端点上听
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    return Err(IpcError::Unreachable(format!("无法连接（{e}）")));
+                    return Err(IpcError::Unreachable(TransportIssue::Connect {
+                        error: e.to_string(),
+                    }));
                 }
-                Err(e) => return Err(IpcError::Transient(format!("无法连接（{e}）"))),
+                Err(e) => {
+                    return Err(IpcError::Transient(TransportIssue::Connect {
+                        error: e.to_string(),
+                    }));
+                }
             }
         };
-        let peer = server_pid(&client)
-            .ok_or_else(|| IpcError::Protocol("cannot verify peer pid".into()))?;
+        let peer =
+            server_pid(&client).ok_or_else(|| IpcError::Protocol(TransportIssue::PeerPid))?;
         verify_server_owner(peer)?;
         Ok((client, peer))
     }
@@ -633,7 +773,7 @@ mod imp {
                 GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
             },
         };
-        let failure = || IpcError::Protocol("cannot verify pipe server owner".into());
+        let failure = || IpcError::Protocol(TransportIssue::PipeOwner);
         fn user(process: isize) -> Option<Vec<usize>> {
             let mut token = 0;
             // TOKEN_USER points into the same variable-length, pointer-aligned buffer.
@@ -707,7 +847,9 @@ mod imp {
             .map_err(|e| {
                 // socket 文件不存在，或文件还在但没有进程在听（崩溃残留）：
                 // 确定没有实例在这个端点上
-                let msg = format!("无法连接（{e}）");
+                let msg = TransportIssue::Connect {
+                    error: e.to_string(),
+                };
                 match e.kind() {
                     io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
                         IpcError::Unreachable(msg)
@@ -717,7 +859,7 @@ mod imp {
             })?;
         let cred = client
             .peer_cred()
-            .map_err(|error| IpcError::Protocol(error.to_string()))?;
+            .map_err(|error| IpcError::Protocol(TransportIssue::Evidence(error.to_string())))?;
         // 在这个路径上听的进程必须是该信的用户，否则不发请求、也不读它的应答：socket
         // 的路径可以预测，目录权限过宽时别的用户能抢先在那里放一个自己的 socket
         {
@@ -729,16 +871,14 @@ mod imp {
                 .and_then(|dir| std::fs::metadata(dir).ok())
                 .map(|meta| std::os::unix::fs::MetadataExt::uid(&meta));
             if !trusted_server_uid(me, server, dir_owner) {
-                return Err(IpcError::Protocol(format!(
-                    "控制端点上的进程属于另一个用户（uid {server}），不予采信"
-                )));
+                return Err(IpcError::Protocol(TransportIssue::ForeignOwner { server }));
             }
         }
         let peer = cred
             .pid()
             .and_then(|pid| u32::try_from(pid).ok())
             .filter(|&pid| pid != 0)
-            .ok_or_else(|| IpcError::Protocol("cannot verify peer pid".into()))?;
+            .ok_or_else(|| IpcError::Protocol(TransportIssue::PeerPid))?;
         Ok((client, peer))
     }
 
@@ -778,6 +918,59 @@ mod imp {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A changed phrase is not a change of error identity. Decode the actual reply, then
+    /// substitute unrelated prose to check that the Chinese reader uses only code/details.
+    #[test]
+    fn remote_display_uses_verified_details_and_preserves_unknown_evidence() {
+        for (rejection, zh) in [
+            (Rejection::bad("missing_op"), "请求缺少 op"),
+            (
+                Rejection::UnsupportedVersion(IPC_VERSION.to_string()),
+                "不支持协议版本 1",
+            ),
+            (Rejection::UnknownOp("future".into()), "未知操作：future"),
+            (
+                Rejection::UnsupportedArg(vec!["x".into(), "y".into()]),
+                "未知参数：x, y",
+            ),
+            (Rejection::InvalidState("starting"), "实例处于 starting"),
+            (Rejection::ConditionNotMet { idle_ms: 7 }, "只闲置了 7 毫秒"),
+            (
+                Rejection::NotFound {
+                    request_id: "r-7".into(),
+                    reason: "evicted",
+                    cause: None,
+                },
+                "请求 r-7 没有可返回的数据：evicted",
+            ),
+            (Rejection::Busy { limit: 2 }, "2 条流式连接已全部占用"),
+        ] {
+            let raw = rejection.reply();
+            let mut reply: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert!(reply["error"]["message"].as_str().unwrap().is_ascii());
+            reply["error"]["message"] = "opaque peer evidence".into();
+            let error = parse_reply(&reply.to_string()).unwrap_err();
+            assert!(error.render(Lang::Zh).contains(zh));
+            assert!(error.to_string().contains("opaque peer evidence"));
+            reply["error"]["details"] = serde_json::Value::Null;
+            assert!(
+                parse_result(&reply.to_string())
+                    .unwrap_err()
+                    .render(Lang::Zh)
+                    .contains("opaque peer evidence")
+            );
+        }
+        let e = verify_pid(17, 19).unwrap_err().at("local");
+        assert_eq!(
+            e.to_string(),
+            "local: Reply claims pid 17, but the connection peer is pid 19"
+        );
+        assert_eq!(
+            e.render(Lang::Zh),
+            "local: 应答者自报 pid 17 与连接对端进程 19 不一致"
+        );
+    }
 
     #[test]
     fn verified_run_checks_peer_run_and_request_identity_separately() {

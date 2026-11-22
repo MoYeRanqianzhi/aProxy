@@ -3207,7 +3207,10 @@ mod tests {
         ));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let err = request_raw(&endpoint, IpcOp::Ping).await.unwrap_err();
-        assert!(err.to_string().contains("不一致"), "{err}");
+        assert!(
+            matches!(&err, IpcError::Protocol(aproxy_ipc::client::TransportIssue::At { cause, .. }) if matches!(cause.as_ref(), aproxy_ipc::client::TransportIssue::PidMismatch { claimed: 42, .. })),
+            "{err}"
+        );
         server.abort();
     }
 

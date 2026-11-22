@@ -65,7 +65,30 @@ fn settings_language(home: &Path) -> Option<Lang> {
     struct Preference {
         language: String,
     }
-    let bytes = std::fs::read(home.join("settings.json")).ok()?;
+    use std::io::Read;
+    const LIMIT: u64 = 256 * 1024;
+    let path = home.join("settings.json");
+    if !path.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // 文件可能在检查后被替换；非阻塞打开 FIFO，再按实际打开的句柄核对类型。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > LIMIT {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    (&file).take(LIMIT).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 == LIMIT && file.metadata().ok()?.len() > LIMIT {
+        return None;
+    }
     match serde_json::from_slice::<Preference>(&bytes)
         .ok()?
         .language
@@ -241,6 +264,30 @@ mod tests {
         ] {
             std::fs::write(home.path().join("settings.json"), json).unwrap();
             assert_eq!(settings_language(home.path()), expected);
+        }
+    }
+
+    #[test]
+    fn preference_reads_only_a_bounded_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("absent");
+        assert_eq!(settings_language(&absent), None);
+        assert!(!absent.exists());
+        let path = dir.path().join("settings.json");
+        let mut data = br#"{"language":"zh-CN"}"#.to_vec();
+        data.resize(256 * 1024, b' ');
+        std::fs::write(&path, &data).unwrap();
+        assert_eq!(settings_language(dir.path()), Some(Lang::Zh));
+        data.push(b' ');
+        std::fs::write(&path, &data).unwrap();
+        assert_eq!(settings_language(dir.path()), None);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            std::fs::remove_file(&path).unwrap();
+            let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            assert_eq!(settings_language(dir.path()), None);
         }
     }
 

@@ -18,6 +18,7 @@
 #[path = "i18n/startup.rs"]
 pub mod startup;
 use aproxy_ipc::i18n::Lang;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -63,13 +64,19 @@ impl std::fmt::Display for SpawnError {
     }
 }
 
-impl SpawnError {
-    /// 单独排版故障摘要，使清点/日志和终端可以共用原因而不共用语言。
-    pub fn render(&self, lang: Lang) -> String {
+/// 启动摘要只存显示需要的事实，不保存 io::Error 里不可序列化的句柄。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum SpawnSummary {
+    Spawn(String),
+    Exited(u32),
+    TimedOut { pid: u32, alive: bool },
+}
+impl SpawnSummary {
+    fn render(&self, lang: Lang) -> String {
         match self {
-            Self::Spawn(e) => startup::spawn(lang, e),
-            Self::Exited { pid, .. } => startup::exited(lang, *pid),
-            Self::TimedOut { pid, alive, .. } => startup::timeout(
+            Self::Spawn(error) => startup::spawn(lang, error),
+            Self::Exited(pid) => startup::exited(lang, *pid),
+            Self::TimedOut { pid, alive } => startup::timeout(
                 lang,
                 *pid,
                 if *alive {
@@ -80,20 +87,62 @@ impl SpawnError {
             ),
         }
     }
+}
 
+/// 安装续作等待者不再持有子进程；摘要和采样时的日志片段足以重现原来的说明。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailedLaunch {
+    summary: SpawnSummary,
+    log: Option<StartupLog>,
+    report: Option<Box<startup::LaunchReport>>,
+}
+impl FailedLaunch {
+    /// 不重新读取当前日志；只在原来的块与私有报告吻合时翻译其中的行。
+    pub(crate) fn render(&self, lang: Lang) -> String {
+        let mut s = self.summary.render(lang);
+        if let Some(log) = &self.log {
+            s.push_str(&log.excerpt_with(lang, self.report.as_deref()));
+        }
+        s
+    }
+}
+impl SpawnError {
+    fn summary(&self) -> SpawnSummary {
+        match self {
+            Self::Spawn(e) => SpawnSummary::Spawn(e.to_string()),
+            Self::Exited { pid, .. } => SpawnSummary::Exited(*pid),
+            Self::TimedOut { pid, alive, .. } => SpawnSummary::TimedOut {
+                pid: *pid,
+                alive: *alive,
+            },
+        }
+    }
+    fn report(&self) -> Option<&startup::LaunchReport> {
+        match self {
+            Self::Exited { report, .. } => report.as_deref(),
+            _ => None,
+        }
+    }
+    /// 保留私有启动证据：路径仅供显示，写入非 Unicode 路径时也不能让安装状态序列化失败。
+    pub(crate) fn evidence(&self) -> FailedLaunch {
+        FailedLaunch {
+            summary: self.summary(),
+            log: self.startup_log().map(|l| StartupLog {
+                path: l.path.to_string_lossy().as_ref().into(),
+                lines: l.lines.clone(),
+            }),
+            report: self.report().cloned().map(Box::new),
+        }
+    }
+    /// 单独排版故障摘要，使清点/日志和终端可以共用原因而不共用语言。
+    pub fn render(&self, lang: Lang) -> String {
+        self.summary().render(lang)
+    }
     /// 公开证据始终是原始日志；只在能关联到本次交接槽时才在中文终端排版自己的记录。
     pub fn excerpt(&self, lang: Lang) -> String {
-        let Some(log) = self.startup_log() else {
-            return String::new();
-        };
-        let lines = match self {
-            Self::Exited {
-                report: Some(report),
-                ..
-            } if lang == Lang::Zh => report.localized_lines(&log.lines, lang),
-            _ => None,
-        };
-        log.excerpt_in(lang, lines.as_deref().unwrap_or(&log.lines))
+        self.startup_log()
+            .map(|log| log.excerpt_with(lang, self.report()))
+            .unwrap_or_default()
     }
 
     /// 这次拉起期间 startup.log 新增的内容（spawn 本身失败时没有）
@@ -108,7 +157,7 @@ impl SpawnError {
 }
 
 /// startup.log 在一次拉起期间新增的内容（最多末尾 [`StartupLog::MAX_LINES`] 行，去掉空行）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartupLog {
     pub path: PathBuf,
     pub lines: Vec<String>,
@@ -146,6 +195,12 @@ impl StartupLog {
         self.excerpt_in(Lang::En, &self.lines)
     }
 
+    fn excerpt_with(&self, lang: Lang, report: Option<&startup::LaunchReport>) -> String {
+        let lines = report
+            .filter(|_| lang == Lang::Zh)
+            .and_then(|r| r.localized_lines(&self.lines, lang));
+        self.excerpt_in(lang, lines.as_deref().unwrap_or(&self.lines))
+    }
     fn excerpt_in(&self, lang: Lang, lines: &[String]) -> String {
         if lines.is_empty() {
             return startup::look(

@@ -7,7 +7,7 @@ use std::{io, time::Duration};
 
 /// Transport failures are local facts, not wire codes. Keep endpoint and underlying
 /// evidence separate so callers can report them without parsing the English Display.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TransportIssue {
     /// Operating-system or external parser text with no local interpretation.
     Evidence(String),
@@ -92,7 +92,7 @@ impl From<&str> for TransportIssue {
 }
 
 /// 一次 IPC 请求的失败，按「能据此下什么结论」分类。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum IpcError {
     /// 端点不存在：确定没有实例在这里（不必重试；stop 据此确认已退出）
     Unreachable(TransportIssue),

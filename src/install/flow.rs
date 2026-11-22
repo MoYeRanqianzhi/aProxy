@@ -674,7 +674,12 @@ async fn run_tail(
             Ok(pid) => {
                 tracing::info!(port = %port, new_pid = pid, "Instance restarted on the target version");
             }
-            Err(e) => return Err(e.failure(port, format!("实例 {port} 滚动重启失败: {e}"))),
+            Err(e) => {
+                return Err(e.failure(port, |e| FlowIssue::Rolling {
+                    port: port.to_string(),
+                    e: Box::new(e),
+                }));
+            }
         }
         // 每实例重启后推进状态文件（进度可观察 + updated_at 保活）
         write_in(home, state).map_err(|e| FileIssue::WriteState { e: e.to_string() })?;
@@ -718,7 +723,12 @@ async fn run_tail(
             state.record_restart(port, &result);
             match result {
                 Ok(_) | Err(super::restart::RestartError::NotRestarted(_)) => {}
-                Err(e) => return Err(e.failure(port, format!("实例 {port} 终验补重启失败: {e}"))),
+                Err(e) => {
+                    return Err(e.failure(port, |e| FlowIssue::FinalRestart {
+                        port: port.to_string(),
+                        e: Box::new(e),
+                    }));
+                }
             }
         }
     }

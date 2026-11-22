@@ -22,7 +22,7 @@ message!(denied(addr: &str), en: "Cannot bind {addr}: permission denied or the p
 message!(bind(addr: &str, error: &str), en: "Cannot listen on {addr}: {error}", zh: "无法监听 {addr}: {error}");
 message!(control(endpoint: &str, port: &str, error: &str), en: "Cannot create control channel {endpoint}: {error}. Another aProxy instance in this APROXY_HOME may be using port {port} on a different address. On Unix, check the length of the run directory path.", zh: "控制通道 {endpoint} 创建失败：{error}。同一 APROXY_HOME 里可能已有使用端口 {port} 的 aProxy 实例（监听地址不同）；unix 上 run 目录路径过长也会导致失败");
 message!(exited(pid: u32), en: "The new instance (pid {pid}) exited immediately after startup", zh: "新实例（pid {pid}）启动后立即退出");
-message!(spawn(error: &std::io::Error), en: "Cannot start the process: {error}", zh: "spawn 失败: {error}");
+message!(spawn(error: &str), en: "Cannot start the process: {error}", zh: "spawn 失败: {error}");
 message!(timeout(pid: u32, state: &str), en: "The new instance (pid {pid}) did not become ready in time ({state})", zh: "新实例（pid {pid}）未在预期时间内就绪（{state}）");
 message!(alive(), en: "process is running", zh: "进程存活");
 message!(unknown(), en: "process state unknown", zh: "进程状态不可判");
@@ -30,7 +30,7 @@ message!(look(path: std::path::Display<'_>, dir: std::path::Display<'_>), en: ".
 message!(excerpt(path: std::path::Display<'_>), en: ". New lines in {path}:", zh: "。{path} 本次新增内容:");
 
 /// 启动时的一个解析错误；码与位置来自解析器，说明由读取交接文件的进程排版。
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Issue {
     code: String,
     file: String,
@@ -53,7 +53,7 @@ impl From<&Diagnostic> for Issue {
 }
 
 /// 只有本次启动的私有结果携带诊断，公共 `start_failed` 的码与 `details` 不由它决定。
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "id", content = "args", rename_all = "snake_case")]
 pub enum LaunchReason {
     /// 规格无法解析或读取。
@@ -147,14 +147,14 @@ impl LaunchReason {
 }
 
 /// 时间戳只用来定位本次故障在英文摘录中的原始行，不独自用来确定实例身份。
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchReport {
     code: String,
     details: ReportDetails,
     render: LaunchReason,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ReportDetails {
     stamp: String,
 }

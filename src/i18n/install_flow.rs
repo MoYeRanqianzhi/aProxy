@@ -43,10 +43,77 @@ message!(prepare(e: &str), en: "PrepareSwap broadcast failed ({e}).\nStop the af
 
 message!(fresh(e: &str), en: "An instance started after the broadcast failed to acknowledge it: {e}", zh: "广播后新启实例 ACK 失败: {e}");
 
+message!(rolled_back(reason: &str, path: &str, pid: u32), en: "The new version failed to start ({reason}). The old binary {path} restored the instance with its original configuration (pid {pid}). Rolling restarts stopped; remaining instances are unchanged.", zh: "新版本启动失败（{reason}）；已用旧二进制 {path} 按原来的规格拉回实例（pid {pid}），\
+                 滚动已中止，其余实例未动");
+
+message!(down(reason: &str, fallback_error: &str), en: "The new version failed to start ({reason}), and the old binary could not restore the instance ({fallback_error}). The instance is offline. Its desired state was retained; correct the cause and run `aproxy restore`.", zh: "新版本启动失败（{reason}），旧二进制拉回也失败（{fallback_error}）；\
+                 实例当前下线，期望状态记录已保留，排除原因后执行 `aproxy restore` 恢复");
+
+message!(no_restore(port: &str), en: "The instance on port {port} has no desired-state record (it may be a foreground instance).", zh: "实例 {port} 没有期望状态记录（前台实例？）");
+
+message!(unreadable(port: &str, reason: &str), en: "Cannot read the desired-state record for port {port} ({reason})", zh: "实例 {port} 的期望状态记录读不懂（{reason}）");
+
+message!(missing_config(path: &str), en: "The configuration file no longer exists: {path}", zh: "配置文件已不存在: {path}");
+
+message!(stop_timeout(port: &str), en: "The instance on port {port} did not exit in time; refusing to terminate it forcibly.", zh: "实例 {port} 未在预期时间内退出（仍拒绝强杀）");
+
+message!(exit_timeout(port: &str, pid: u32), en: "The process for port {port} (pid {pid}) did not exit in time; refusing to terminate it forcibly.", zh: "实例 {port} 的进程（pid {pid}）未在预期时间内终止（仍拒绝强杀）");
+
+message!(at_path(message: &str, path: &str), en: "{message} ({path})", zh: "{message}（{path}）");
+
+message!(no_fallback(), en: "No old binary is available.", zh: "没有可用的旧二进制");
+
+message!(not_prepared(state: &aproxy_ipc::wire::InstanceState), en: "The instance did not enter the replacement phase (state {state:?})", zh: "实例没有进入更换阶段（状态 {state:?}）");
+
+message!(converge(port: &str, e: &str), en: "Restarting the instance on port {port} to obtain its acknowledgment failed: {e}", zh: "实例 {port} 收敛重启失败: {e}");
+
+message!(unacked(unacked: &[String]), en: "Instances still have not acknowledged after retries and restarts: {unacked:?}", zh: "实例未表达（已按重试/restart 收敛）: {unacked:?}");
+
+message!(rolling(port: &str, e: &str), en: "Rolling restart failed for the instance on port {port}: {e}", zh: "实例 {port} 滚动重启失败: {e}");
+
+message!(final_restart(port: &str, e: &str), en: "The additional verification restart failed on port {port}: {e}", zh: "实例 {port} 终验补重启失败: {e}");
+
 /// 同一个事务的接手者和等待者可能使用不同的终端语言。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "id", content = "args", rename_all = "snake_case")]
 pub enum FlowIssue {
+    /// 旧镜像成功恢复服务；滚动就此停止。
+    RolledBack {
+        reason: Box<Cause>,
+        path: String,
+        pid: u32,
+    },
+    /// 新旧镜像均无法恢复实例。
+    Down {
+        reason: Box<Cause>,
+        fallback_error: Box<Cause>,
+    },
+    /// 实例没有可用于重启的期望状态。
+    NoRestore { port: String },
+    /// 恢复记录不兼容或读取失败。
+    Unreadable { port: String, reason: Box<Cause> },
+    /// 当初启动所用的配置已不在磁盘上。
+    MissingConfig { path: String },
+    /// 控制端点在停止期限内仍存在。
+    StopTimeout { port: String },
+    /// 控制端点消失但进程仍持有镜像。
+    ExitTimeout { port: String, pid: u32 },
+    /// 启动镜像本身失败时附上执行路径。
+    AtPath { message: Box<Cause>, path: String },
+    /// 没有可用于回滚的旧镜像。
+    NoFallback,
+    /// 控制应答未确认进入交换相位。
+    NotPrepared {
+        state: aproxy_ipc::wire::InstanceState,
+    },
+    /// 为取得确认而重启时失败。
+    Converge { port: String, e: Box<Cause> },
+    /// 重试与重启后仍未确认的端口。
+    Unacked { unacked: Vec<String> },
+    /// 逐端口滚动时的外层诊断。
+    Rolling { port: String, e: Box<Cause> },
+    /// 验证阶段补做的重启也失败。
+    FinalRestart { port: String, e: Box<Cause> },
     /// 锁文件的路径和打开错误。
     LockOpen { path: String, e: String },
     /// 竞争者在整个期限内一直持锁。
@@ -100,6 +167,25 @@ impl FlowIssue {
     /// 写状态或日志用英文；只有终端按调用者的语言排版。
     pub fn render(&self, lang: Lang) -> String {
         match self {
+            Self::RolledBack { reason, path, pid } => {
+                rolled_back(lang, &reason.render(lang), path, *pid)
+            }
+            Self::Down {
+                reason,
+                fallback_error,
+            } => down(lang, &reason.render(lang), &fallback_error.render(lang)),
+            Self::NoRestore { port } => no_restore(lang, port),
+            Self::Unreadable { port, reason } => unreadable(lang, port, &reason.render(lang)),
+            Self::MissingConfig { path } => missing_config(lang, path),
+            Self::StopTimeout { port } => stop_timeout(lang, port),
+            Self::ExitTimeout { port, pid } => exit_timeout(lang, port, *pid),
+            Self::AtPath { message, path } => at_path(lang, &message.render(lang), path),
+            Self::NoFallback => no_fallback(lang).to_owned(),
+            Self::NotPrepared { state } => not_prepared(lang, state),
+            Self::Converge { port, e } => converge(lang, port, &e.render(lang)),
+            Self::Unacked { unacked } => self::unacked(lang, unacked),
+            Self::Rolling { port, e } => rolling(lang, port, &e.render(lang)),
+            Self::FinalRestart { port, e } => final_restart(lang, port, &e.render(lang)),
             Self::LockOpen { path, e } => lock_open(lang, path, e),
             Self::Locked { path, secs } => locked(lang, path, *secs),
             Self::LockFailed { path, e } => lock_failed(lang, path, e),

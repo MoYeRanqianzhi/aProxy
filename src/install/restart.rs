@@ -27,6 +27,9 @@
 //! 只是**这一个实例的服务**——bin 里的二进制、状态机阶段都不回退（阶段照常
 //! 落 failed 保留现场），用户排除原因后重新执行 install 继续向前。
 
+use super::{flow_issue::FlowIssue, reason::Cause};
+use aproxy_ipc::i18n::Lang;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -34,22 +37,22 @@ use super::state::InstallState;
 use crate::spec::InstanceSpec;
 
 /// 实例重启失败的分类——调用方据此决定「中止滚动」还是「照常失败可续作」。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum RestartError {
     /// 实例未被本次重启动过（没有期望状态记录、停止超时等）：服务状态与调用
     /// 前一致，或停止未确认但期望状态记录还在，续作可重试。
-    NotRestarted(String),
+    NotRestarted(Box<Cause>),
     /// 新二进制起不来，已用回退二进制按同一份规格拉回（服务恢复，版本未升级）。
     RolledBack {
-        reason: String,
+        reason: Box<Cause>,
         pid: u32,
         fallback: PathBuf,
     },
     /// 新二进制起不来，回退也失败：实例下线，期望状态记录还在（排除原因后
     /// `aproxy restore` 可恢复）。
     Down {
-        reason: String,
-        fallback_error: String,
+        reason: Box<Cause>,
+        fallback_error: Box<Cause>,
     },
 }
 
@@ -74,58 +77,78 @@ impl InstallState {
 
 impl RestartError {
     /// 新版本拉不起实例才中止滚动；停止前的失败不声称换过二进制或回退过实例。
-    pub(super) fn failure(&self, port: &str, message: String) -> super::InstallFailure {
-        if !matches!(self, Self::NotRestarted(_))
-            && let Ok(port) = port.parse::<u16>()
-        {
-            let mut error = super::InstallFailure::new("install_restart_failed", message);
-            *error.details = serde_json::json!({"port": port});
+    pub(super) fn failure(
+        self,
+        port: &str,
+        wrap: impl FnOnce(Cause) -> FlowIssue,
+    ) -> super::InstallFailure {
+        let rolled = !matches!(self, Self::NotRestarted(_));
+        let cause = wrap(self.into_cause());
+        if rolled && let Ok(port) = port.parse::<u16>() {
+            let mut error = super::InstallFailure::because("install_restart_failed", cause.into());
+            *error.details = serde_json::json!({"port":port});
             error
         } else {
-            message.into()
+            cause.into()
         }
     }
-}
-
-impl std::fmt::Display for RestartError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn into_cause(self) -> Cause {
         match self {
-            RestartError::NotRestarted(e) => write!(f, "{e}"),
-            RestartError::RolledBack {
+            Self::NotRestarted(c) => *c,
+            Self::RolledBack {
                 reason,
                 pid,
                 fallback,
-            } => write!(
-                f,
-                "新版本启动失败（{reason}）；已用旧二进制 {} 按原来的规格拉回实例（pid {pid}），\
-                 滚动已中止，其余实例未动",
-                fallback.display()
-            ),
-            RestartError::Down {
+            } => FlowIssue::RolledBack {
+                reason,
+                path: fallback.display().to_string(),
+                pid,
+            }
+            .into(),
+            Self::Down {
                 reason,
                 fallback_error,
-            } => write!(
-                f,
-                "新版本启动失败（{reason}），旧二进制拉回也失败（{fallback_error}）；\
-                 实例当前下线，期望状态记录已保留，排除原因后执行 `aproxy restore` 恢复"
-            ),
+            } => FlowIssue::Down {
+                reason,
+                fallback_error,
+            }
+            .into(),
         }
+    }
+}
+impl std::fmt::Display for RestartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.clone().into_cause().render(Lang::En))
     }
 }
 
 /// 实例的拉起规格，取自它的期望状态记录。没有记录的实例（前台实例，或 stop 之后
 /// 残留在快照里的端口）无从重启。
-fn restore_spec(run_dir: &Path, port: &str) -> Result<InstanceSpec, String> {
+fn restore_spec(run_dir: &Path, port: &str) -> Result<InstanceSpec, Cause> {
     let spec = match crate::spec::read_restore_in(run_dir, port) {
         Ok(Some(entry)) => entry.spec,
-        Ok(None) => return Err(format!("实例 {port} 没有期望状态记录（前台实例？）")),
-        Err(reason) => return Err(format!("实例 {port} 的期望状态记录读不懂（{reason}）")),
+        Ok(None) => {
+            return Err(FlowIssue::NoRestore {
+                port: port.to_string(),
+            }
+            .into());
+        }
+        Err(reason) => {
+            return Err(FlowIssue::Unreadable {
+                port: port.to_string(),
+                reason: Box::new(Cause::Diagnostic(Box::new(reason.diagnostic()))),
+            }
+            .into());
+        }
     };
     // 配置文件不在的规格拉不起来：新旧二进制都会在读配置时失败
     if let Some(cfg) = spec.config_file()
         && !cfg.exists()
     {
-        return Err(format!("配置文件已不存在: {}", cfg.display()));
+        return Err(FlowIssue::MissingConfig {
+            path: cfg.display().to_string(),
+        }
+        .into());
     }
     Ok(spec)
 }
@@ -142,7 +165,7 @@ fn restore_spec(run_dir: &Path, port: &str) -> Result<InstanceSpec, String> {
 ///
 /// 超时 = Err（调用方决定处置，绝不强杀——绝对避免服务中断原则贯穿
 /// install 全流程）。
-pub async fn stop_and_wait(run_dir: &Path, port: &str, timeout: Duration) -> Result<(), String> {
+pub async fn stop_and_wait(run_dir: &Path, port: &str, timeout: Duration) -> Result<(), Cause> {
     // 停止前取 pid 锚点（注册表由守护 bind 时写入，停止后即删）
     let pid = crate::daemon::list_instances_in(run_dir)
         .await
@@ -151,7 +174,7 @@ pub async fn stop_and_wait(run_dir: &Path, port: &str, timeout: Duration) -> Res
         .map(|i| i.instance.pid);
     crate::daemon::ipc_request_in(run_dir, port, crate::daemon::IpcOp::STOP_KEEPING_RESTORE)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Cause::Control(Box::new(e)))?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
         // 只有端点消失才算退出：挂死的实例端点还在、只是不应答
@@ -161,7 +184,10 @@ pub async fn stop_and_wait(run_dir: &Path, port: &str, timeout: Duration) -> Res
             break;
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!("实例 {port} 未在预期时间内退出（仍拒绝强杀）"));
+            return Err(FlowIssue::StopTimeout {
+                port: port.to_string(),
+            }
+            .into());
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -173,9 +199,11 @@ pub async fn stop_and_wait(run_dir: &Path, port: &str, timeout: Duration) -> Res
                 None => break, // 不可判（权限等）——保守放行，后续步骤自会暴露
             }
             if std::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "实例 {port} 的进程（pid {pid}）未在预期时间内终止（仍拒绝强杀）"
-                ));
+                return Err(FlowIssue::ExitTimeout {
+                    port: port.to_string(),
+                    pid,
+                }
+                .into());
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -195,7 +223,7 @@ struct SpawnFailure {
     start: Option<u64>,
     /// 截止时子进程仍存活（启动中但未写注册表 / 挂死）
     alive: bool,
-    message: String,
+    cause: Box<Cause>,
 }
 
 /// 用 `exe` 在 `home` 里按 `spec` 拉起实例并等它就绪（见 crate::spawn：按新 pid 在注册表里
@@ -209,22 +237,25 @@ async fn spawn_and_wait_ready(
     match crate::spawn::spawn_from_spec(home, exe, spec, crate::spawn::READY_TIMEOUT).await {
         Ok(live) => Ok(live.instance.pid),
         Err(e) => {
-            let message = format!(
-                "{e}{}",
-                e.startup_log().map(|l| l.excerpt()).unwrap_or_default()
-            );
+            let launch = Cause::Launch(Box::new(e.evidence()));
             Err(match e {
                 SpawnError::Spawn(_) => SpawnFailure {
                     pid: None,
                     start: None,
                     alive: false,
-                    message: format!("{message}（{}）", exe.display()),
+                    cause: Box::new(
+                        FlowIssue::AtPath {
+                            message: Box::new(launch),
+                            path: exe.display().to_string(),
+                        }
+                        .into(),
+                    ),
                 },
                 SpawnError::Exited { pid, .. } => SpawnFailure {
                     pid: Some(pid),
                     start: None,
                     alive: false,
-                    message,
+                    cause: Box::new(launch),
                 },
                 SpawnError::TimedOut {
                     pid, start, alive, ..
@@ -232,7 +263,7 @@ async fn spawn_and_wait_ready(
                     pid: Some(pid),
                     start,
                     alive,
-                    message,
+                    cause: Box::new(launch),
                 },
             })
         }
@@ -249,12 +280,12 @@ async fn reap_unready_child(pid: u32, start: Option<u64>) {
     let Some(start) = start else {
         tracing::warn!(
             pid,
-            "未就绪的新进程读不到创建时间，无法核验身份，不终止；回退仍尝试"
+            "Cannot verify the unready process creation time; leaving it running and attempting rollback"
         );
         return;
     };
     if let Err(e) = crate::process::terminate_verified_process(pid, start) {
-        tracing::warn!(pid, error = %e, "未就绪的新进程终止失败，回退仍尝试");
+        tracing::warn!(pid, error = %e, "Could not terminate the unready process; attempting rollback");
         return;
     }
     for _ in 0..50 {
@@ -288,7 +319,7 @@ pub async fn restart_instance(
     exe: &Path,
     fallback: Option<&Path>,
 ) -> Result<u32, RestartError> {
-    let spec = restore_spec(run_dir, port).map_err(RestartError::NotRestarted)?;
+    let spec = restore_spec(run_dir, port).map_err(|e| RestartError::NotRestarted(Box::new(e)))?;
     let live = crate::daemon::ipc_ping_in(run_dir, port).await.ok();
     let image = live
         .as_ref()
@@ -297,7 +328,7 @@ pub async fn restart_instance(
     if live.is_some() {
         stop_and_wait(run_dir, port, Duration::from_secs(20))
             .await
-            .map_err(RestartError::NotRestarted)?;
+            .map_err(|e| RestartError::NotRestarted(Box::new(e)))?;
     }
     // 记录必须在：不认 `keep_restore` 的旧实例退出时会删掉它。新实例就绪时会用同样的
     // 规格覆盖它；起不来时它就是续作、`aproxy restore` 与看护者重拉的依据
@@ -305,7 +336,7 @@ pub async fn restart_instance(
         if !crate::spec::restore_path_in(run_dir, port).is_file()
             && let Err(e) = crate::spec::write_restore_in(run_dir, port, &spec)
         {
-            tracing::warn!(port = %port, error = %e, "期望状态记录写回失败");
+            tracing::warn!(port = %port, error = %e, "Failed to write the desired-state record");
         }
     };
     ensure_restore();
@@ -314,7 +345,7 @@ pub async fn restart_instance(
         Ok(pid) => return Ok(pid),
         Err(f) => f,
     };
-    tracing::error!(port = %port, error = %failure.message, "新二进制未能拉起实例，转入回滚");
+    tracing::error!(port = %port, error = %failure.cause.render(Lang::En), "The new binary failed to start the instance; rolling back");
     if failure.alive
         && let Some(pid) = failure.pid
     {
@@ -333,14 +364,14 @@ pub async fn restart_instance(
     let fallback = fallback.map(Path::to_path_buf).or(image);
     let result = match fallback.filter(|p| p.is_file()) {
         None => Err(RestartError::Down {
-            reason: failure.message,
-            fallback_error: "没有可用的旧二进制".to_string(),
+            reason: failure.cause,
+            fallback_error: Box::new(FlowIssue::NoFallback.into()),
         }),
         Some(old) => match spawn_and_wait_ready(home, &old, &spec).await {
             Ok(pid) => {
-                tracing::warn!(port = %port, pid, old = %old.display(), "已用旧二进制拉回实例");
+                tracing::warn!(port = %port, pid, old = %old.display(), "The old binary restored the instance");
                 Err(RestartError::RolledBack {
-                    reason: failure.message,
+                    reason: failure.cause,
                     pid,
                     fallback: old,
                 })
@@ -348,8 +379,8 @@ pub async fn restart_instance(
             Err(f2) => {
                 ensure_restore();
                 Err(RestartError::Down {
-                    reason: failure.message,
-                    fallback_error: f2.message,
+                    reason: failure.cause,
+                    fallback_error: f2.cause,
                 })
             }
         },

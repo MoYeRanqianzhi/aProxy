@@ -10,14 +10,16 @@
 //! 状态，重启到安装器版本即收敛）；终失败 → Err
 //! （调用方走 abort——绝不强杀，绝对避免服务中断原则贯穿始终）。
 
+use super::{flow_issue::FlowIssue, reason::Cause};
+
 use std::path::Path;
 use std::time::Duration;
 
 /// 单实例 ACK 判定：prepare_swap 的应答状态为 swap_prepared。
 /// 内部 3 次探测（间隔 500ms）吸收命名管道瞬时 busy 等瞬态失败。
 /// unix 端点按显式 run_dir 派生（与库层其他 IPC 调用同一纪律）。
-pub async fn ack_one(run_dir: &Path, port: &str) -> Result<(), String> {
-    let mut last = String::new();
+pub async fn ack_one(run_dir: &Path, port: &str) -> Result<(), Cause> {
+    let mut last = None;
     for attempt in 0..3 {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -28,11 +30,18 @@ pub async fn ack_one(run_dir: &Path, port: &str) -> Result<(), String> {
             Ok(status) if status.state == crate::daemon::InstanceState::SwapPrepared => {
                 return Ok(());
             }
-            Ok(status) => last = format!("实例没有进入更换阶段（状态 {:?}）", status.state),
-            Err(e) => last = e.to_string(),
+            Ok(status) => {
+                last = Some(
+                    FlowIssue::NotPrepared {
+                        state: status.state,
+                    }
+                    .into(),
+                )
+            }
+            Err(e) => last = Some(Cause::Control(Box::new(e))),
         }
     }
-    Err(last)
+    Err(last.expect("at least one acknowledgment attempt"))
 }
 
 /// 全实例广播 + 重试收敛。`ports` 为当前运行实例端口清单（ACK 阶段快照，
@@ -49,7 +58,9 @@ pub async fn broadcast_prepare_swap(
     ports: &[String],
     state: &mut super::state::InstallState,
 ) -> Result<(), super::InstallFailure> {
-    let exe = std::env::current_exe().map_err(|e| format!("无法定位自身可执行文件: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| {
+        super::InstallFailure::because("install_failed", Cause::SelfExe(e.to_string()))
+    })?;
     let mut unacked: Vec<String> = Vec::new();
     for round in 0..3 {
         unacked.clear();
@@ -72,13 +83,18 @@ pub async fn broadcast_prepare_swap(
             match super::restart::restart_instance(home, run_dir, state, port, &exe, None).await {
                 Ok(_) => {}
                 Err(e @ super::restart::RestartError::NotRestarted(_)) => {
-                    tracing::warn!(port = %port, error = %e, "ACK 收敛 restart 失败");
+                    tracing::warn!(port = %port, error = %e, "Restart to obtain swap acknowledgment failed");
                 }
-                Err(e) => return Err(e.failure(port, format!("实例 {port} 收敛重启失败: {e}"))),
+                Err(e) => {
+                    return Err(e.failure(port, |e| FlowIssue::Converge {
+                        port: port.to_string(),
+                        e: Box::new(e),
+                    }));
+                }
             }
         }
     }
-    Err(format!("实例未表达（已按重试/restart 收敛）: {unacked:?}").into())
+    Err(FlowIssue::Unacked { unacked }.into())
 }
 
 #[cfg(test)]

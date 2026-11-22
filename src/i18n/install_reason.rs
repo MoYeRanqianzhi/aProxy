@@ -59,6 +59,12 @@ message!(cannot_abort(phase:InstallPhase), en: "The installation has reached bin
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "id", content = "args", rename_all = "snake_case")]
 pub enum Cause {
+    /// 控制端点已判定的拒绝或传输原因，不匹配错误句子。
+    Control(Box<aproxy_ipc::client::IpcError>),
+    /// 恢复记录的诊断沿用解析器的原因。
+    Diagnostic(Box<aproxy_ipc::i18n::diagnostic::Reason>),
+    /// 重启接手者留下的启动证据；公开码不包含日志或本地化信息。
+    Launch(Box<crate::spawn::FailedLaunch>),
     /// 普通安装的协调、续作或实例重启阶段。
     Flow(super::flow_issue::FlowIssue),
     /// 备料、版本核对或二进制交换失败。
@@ -157,6 +163,9 @@ impl Cause {
     /// 状态文件、事件和日志选英文，终端可以对相同的事实另选语言。
     pub fn render(&self, lang: Lang) -> String {
         match self {
+            Self::Control(e) => e.render(lang),
+            Self::Diagnostic(e) => e.render(lang),
+            Self::Launch(e) => e.render(lang),
             Self::Flow(e) => e.render(lang),
             Self::Files(e) => e.render(lang),
             Self::Download(e) => e.render(lang),

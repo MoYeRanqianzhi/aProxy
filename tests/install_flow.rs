@@ -759,7 +759,7 @@ fn unix_install_rolls_back_instance_to_preserved_old_binary() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "应非零退出: {stderr}");
     assert!(
-        stderr.contains("旧二进制"),
+        stderr.contains("old binary"),
         "应说明已用旧二进制拉回: {stderr}"
     );
     let _ = child.wait();
@@ -951,8 +951,10 @@ fn staged_target_drives_the_install_and_its_failure_reaches_the_installer() {
     // 「实例 <端口> 滚动重启失败」只出现在接手者记下的 last_error 里（中止指引
     // 是安装者自己的文案），据此确认原因是从接手者转告过来的
     assert!(
-        stderr.contains(&format!("实例 {} 滚动重启失败", env.port))
-            && stderr.contains("Rolling restarts stopped"),
+        stderr.contains(&format!(
+            "Rolling restart failed for the instance on port {}",
+            env.port
+        )) && stderr.contains("Rolling restarts stopped"),
         "应转告接手者的失败原因与中止指引: {stderr}"
     );
     let log = std::fs::read_to_string(&calls).unwrap();

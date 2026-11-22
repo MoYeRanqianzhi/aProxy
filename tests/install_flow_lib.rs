@@ -765,7 +765,7 @@ async fn rollback_case(kind: BrokenNew) {
     .expect("续作不应挂死")
     .expect_err("新二进制起不来，续作应失败");
     assert!(
-        err.message.contains("旧二进制"),
+        err.code == "install_restart_failed",
         "错误应说明已用旧二进制拉回: {err}"
     );
 
@@ -802,7 +802,14 @@ async fn rollback_case(kind: BrokenNew) {
     assert_eq!(st.instance_outcomes[0].port, port);
     assert_eq!(st.instance_outcomes[0].outcome, "rolled_back");
     assert!(st.halted, "实例级失败应置 halted");
-    assert!(st.last_error.is_some_and(|e| e.contains("旧二进制")));
+    let replay = aproxy::install::InstallFailure::recorded(&st, st.last_error.clone().unwrap());
+    assert_eq!(replay.render(aproxy_ipc::i18n::Lang::En), replay.message);
+    assert!(replay.message.contains("old binary"));
+    let zh = replay.render(aproxy_ipc::i18n::Lang::Zh);
+    assert!(
+        zh.contains("已用旧二进制") && zh.contains("滚动重启失败"),
+        "{zh}"
+    );
     assert!(
         st.pending_restores.is_empty(),
         "安装状态不存启动参数：在途清单恒为空"

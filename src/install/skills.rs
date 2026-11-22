@@ -14,6 +14,11 @@ pub mod archive;
 pub mod installed;
 pub mod manifest;
 
+/// skill 文件错误保留语义类别和文件证据，验证器始终用英文，终端可自行选词。
+#[path = "../i18n/skill_issue.rs"]
+pub mod issue;
+use issue::Issue;
+
 use super::download::{self, Artifact, DownloadCtx};
 use std::path::{Path, PathBuf};
 use std::{
@@ -58,11 +63,11 @@ fn single_link(file: &fs::File) -> io::Result<bool> {
 }
 
 /// 从下载开始直到发布完成一直持有独立的文件锁；进程退出后内核释放，不按 pid 猜测过期。
-fn skill_lock(home: &Path) -> Result<super::InstallLock, String> {
+fn skill_lock(home: &Path) -> Result<super::InstallLock, Issue> {
     let root = home.join("skills");
     crate::fsx::create_dir_all(&root)
         .and_then(|()| installed::directory(&root))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Issue::from_io(&e))?;
     let lock = || -> std::io::Result<Option<super::InstallLock>> {
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true).write(true).create(true).truncate(false);
@@ -74,13 +79,13 @@ fn skill_lock(home: &Path) -> Result<super::InstallLock, String> {
         }
         let file = installed::open_regular(&root.join(".lock"), &mut opts)?;
         if !single_link(&file)? {
-            return Err(io::Error::other("skill 锁文件有其他硬链接"));
+            return Err(io::Error::other(Issue::LockLinks));
         }
         Ok(super::try_lock_exclusive(&file)?.then_some(super::InstallLock { file }))
     };
     lock()
-        .map_err(|e| format!("skill 加锁失败：{e}"))?
-        .ok_or_else(|| "另一个进程正在安装 skill，请稍后重试".into())
+        .map_err(|e| Issue::Locking(Box::new(Issue::from_io(&e))))?
+        .ok_or(Issue::Busy)
 }
 
 /// 锁内的定长令牌指向独占创建的私有目录。另半段令牌留在目录中作凭据，
@@ -90,8 +95,7 @@ fn private_root(root: &Path, lock: &mut super::InstallLock) -> io::Result<PathBu
     let file = &mut lock.file;
     let mut token = String::new();
     file.take(33).read_to_string(&mut token)?;
-    let invalid =
-        || io::Error::other("skill 工作区凭据无效；请移走 skills/ 后执行 aproxy skill install");
+    let invalid = || io::Error::other(Issue::WorkspaceKey);
     if token.is_empty() {
         let rng = RandomState::new();
         token = format!("{:016x}{:016x}", rng.hash_one(0u8), rng.hash_one(1u8));
@@ -150,7 +154,7 @@ fn recover(root: &Path, private: &Path) -> io::Result<()> {
     if let Some(entry) = entries.next().transpose()? {
         if entries.next().is_some() || !entry.file_name().to_string_lossy().starts_with(".staging-")
         {
-            return Err(io::Error::other("skill 工作区内容异常"));
+            return Err(io::Error::other(Issue::WorkspaceContents));
         }
         let stage = entry.path();
         installed::directory(&stage)?;
@@ -168,12 +172,12 @@ pub async fn install(
 ) -> Result<usize, super::InstallFailure> {
     let mut lock = skill_lock(home)?;
     let root = home.join("skills");
-    let private = private_root(&root, &mut lock).map_err(|e| e.to_string())?;
-    recover(&root, &private).map_err(|e| e.to_string())?;
+    let private = private_root(&root, &mut lock).map_err(|e| Issue::from_io(&e))?;
+    recover(&root, &private).map_err(|e| Issue::from_io(&e))?;
     let active = private.join("active");
-    fs::create_dir(&active).map_err(|e| e.to_string())?;
+    fs::create_dir(&active).map_err(|e| Issue::from_io(&e))?;
     let stage = workspace(&active)
-        .map_err(|e| format!("skill 下载目录创建失败：{e}"))?
+        .map_err(|e| Issue::Stage(Box::new(Issue::from_io(&e))))?
         .keep();
     let result = async {
         let fetched = download::fetch_artifact(ctx, chain, Artifact::Skills, &stage)
@@ -184,19 +188,19 @@ pub async fn install(
                 static URL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
                     regex::Regex::new(r"(?i)[a-z][a-z0-9+.\-]*://\S+").unwrap()
                 });
-                let message = URL.replace_all(&e.message, "[URL 已隐去]").into_owned();
+                let message = URL.replace_all(&e.message, "[URL redacted]").into_owned();
                 e.with_message(message)
             })?;
         let (manifest, ignored) = archive::publish(&root, &stage, &fetched.path, &ctx.version)
-            .map_err(|e| format!("skill 安装失败：{e}"))?;
+            .map_err(|e| Issue::Install(Box::new(Issue::from_io(&e))))?;
         if ignored != 0 {
-            tracing::warn!(ignored, "已跳过 skill 包中未登记的条目");
+            tracing::warn!(ignored, "skipped unlisted entries in the skill package");
         }
-        tracing::info!(skills=?manifest.names(),"skill 文档已随版本落位");
+        tracing::info!(skills=?manifest.names(),"skill documentation installed for this version");
         Ok(manifest.files.len())
     }
     .await;
-    recover(&root, &private).map_err(|e| e.to_string())?;
+    recover(&root, &private).map_err(|e| Issue::from_io(&e))?;
     result
 }
 

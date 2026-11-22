@@ -98,7 +98,11 @@ async fn roundtrip_and_aliases() {
             .contains("--skills-only")
     );
     let bad = run(&h, &["install", OTHER_VERSION, "--skills-only"], 2);
-    assert!(String::from_utf8(bad.stderr).unwrap().contains("Upgrade aProxy before installing newer documentation"));
+    assert!(
+        String::from_utf8(bad.stderr)
+            .unwrap()
+            .contains("Upgrade aProxy before installing newer documentation")
+    );
     run(&h, &["skill", "install", VERSION], 2);
     let list: Value =
         serde_json::from_slice(&run(&h, &["skill", "list", "--json"], 0).stdout).unwrap();
@@ -191,7 +195,7 @@ async fn missing_legacy_and_version_mismatch() {
         fs::canonicalize(doc["location"].as_str().unwrap()).unwrap(),
         fs::canonicalize(h.path().join("skills")).unwrap()
     );
-    assert!(String::from_utf8(fail.stderr).unwrap().contains("版本"));
+    assert!(String::from_utf8(fail.stderr).unwrap().contains("version"));
     let o = run(&h, &["install", "--from", common::APROXY], 0);
     assert!(String::from_utf8_lossy(&o.stderr).contains("aproxy skill install"));
     assert!(!h.path().join("skills/manifest.json").exists());
@@ -302,7 +306,7 @@ async fn binary_and_standalone_install_share_the_download_lock() {
         String::from_utf8_lossy(&first.stderr)
     );
     assert_eq!(contender.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&contender.stderr).contains("另一个进程"));
+    assert!(String::from_utf8_lossy(&contender.stderr).contains("Another process"));
     assert_eq!(count.load(Ordering::SeqCst), 1);
     assert_eq!(
         run(&h, &["skill", "show", "a"], 0).stdout,
@@ -399,5 +403,25 @@ async fn download_errors_do_not_echo_urls() {
         }
         let msg = String::from_utf8_lossy(&o.stderr);
         assert!(msg.contains("[url]") && msg.contains("请求失败"));
+    }
+}
+
+/// 无清单的失败由终端按同一类别解释；查看文档失败不往 stdout 写提示。
+#[test]
+fn absent_skills_follow_the_readers_language() {
+    let home = TestHome::new();
+    for (lang, wording) in [
+        ("en", "Skills are not installed."),
+        ("zh-CN", "未安装 skill"),
+    ] {
+        let show = home
+            .cmd()
+            .env("APROXY_LANG", lang)
+            .args(["skill", "show", "missing"])
+            .output()
+            .unwrap();
+        assert_eq!(show.status.code(), Some(4));
+        assert!(show.stdout.is_empty());
+        assert!(String::from_utf8(show.stderr).unwrap().contains(wording));
     }
 }

@@ -238,8 +238,8 @@ fn crate_skills_zip(
         let Some(key) = path.strip_prefix(prefix.as_bytes()) else {
             continue;
         };
-        let key =
-            std::str::from_utf8(key).map_err(|_| std::io::Error::other("crate 文档路径无效"))?;
+        let key = std::str::from_utf8(key)
+            .map_err(|_| std::io::Error::other(crate::install::skills::issue::Issue::TarName))?;
         let limit = if key == "manifest.json" {
             MAX_MANIFEST
         } else {
@@ -252,7 +252,9 @@ fn crate_skills_zip(
             || entry.size() > MAX_TOTAL + MAX_MANIFEST - total
             || count > MAX_FILES + 1
         {
-            return Err(std::io::Error::other("crate 文档数量或大小超限"));
+            return Err(std::io::Error::other(
+                crate::install::skills::issue::Issue::TarCount,
+            ));
         }
         total += entry.size();
         zip.start_file(
@@ -304,7 +306,10 @@ mod tests {
         // 正文都很小，限额只在读到后面的无关源码与 tar 填充时触发。
         let err = crate_skills_zip(data.as_slice(), Cursor::new(Vec::new()), "1.0.0", 3 * 1024)
             .unwrap_err();
-        assert!(err.to_string().contains("tar 解压大小超限"));
+        assert!(
+            err.to_string()
+                .contains("uncompressed documentation tar exceeds the size limit")
+        );
         crate_skills_zip(
             data.as_slice(),
             &mut zip,

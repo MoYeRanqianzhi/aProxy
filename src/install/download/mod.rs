@@ -441,7 +441,9 @@ impl<R: std::io::Read> std::io::Read for TarBudget<R> {
     /// 到达预算时仅探测一个字节，以区分恰好读完与还有后续数据。
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.0.limit() == 0 && !buf.is_empty() && self.0.get_mut().read(&mut [0])? != 0 {
-            return Err(std::io::Error::other("文档 tar 解压大小超限"));
+            return Err(std::io::Error::other(
+                crate::install::skills::issue::Issue::TarLimit,
+            ));
         }
         self.0.read(buf)
     }

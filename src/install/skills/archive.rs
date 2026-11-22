@@ -1,5 +1,6 @@
 //! 先在独占的同卷目录中展开整个白名单；公开目录直到最后才变动，清单最后落位。
 
+use super::issue::Issue;
 use super::manifest::{MARKER, MAX_MANIFEST, Manifest};
 use sha2::{Digest, Sha256};
 use std::{
@@ -10,9 +11,6 @@ use std::{
 
 /// 限制压缩包目录表占用；合法包的原文总量上限还要低一半。
 pub(crate) const MAX_ARCHIVE: u64 = 32 << 20;
-/// 老发布包没有清单，不能用本地计算的摘要冒充随版本发布的白名单。
-const MISSING: &str =
-    "skill 包缺少 manifest.json；0.2.0-alpha.4 及更早的发布版不带清单，请使用带清单的后续版本";
 
 /// 索引里也包含不在清单中的条目；构造 ZIP 索引之前限制总数，不能只限制展开的文件数。
 const MAX_ENTRIES: u64 = 2 * super::manifest::MAX_FILES as u64 + 1;
@@ -20,7 +18,7 @@ const MAX_ENTRIES: u64 = 2 * super::manifest::MAX_FILES as u64 + 1;
 /// 发布包无前缀、无尾注。只允许一个候选结束记录，避免 ZIP 读者解析失败后回溯到未检查的索引。
 /// ZIP64 使用定位器中的绝对偏移，两个计数字段均从 64 位记录核对，不把占位的 0xffff 当成数量。
 fn check_directory_budget(f: &mut fs::File, limit: u64) -> io::Result<()> {
-    let invalid = || io::Error::other("skill 压缩包无效");
+    let invalid = || io::Error::other(Issue::Archive);
     let len = f.metadata()?.len();
     let span = len.min(22 + (1 << 16));
     f.seek(SeekFrom::End(-(span as i64)))?;
@@ -38,7 +36,7 @@ fn check_directory_budget(f: &mut fs::File, limit: u64) -> io::Result<()> {
         for off in [8, 10] {
             let n = u16::from_le_bytes(tail[end + off..end + off + 2].try_into().unwrap());
             if n != u16::MAX && u64::from(n) > limit {
-                return Err(io::Error::other("skill 压缩包条目过多"));
+                return Err(io::Error::other(Issue::Entries));
             }
         }
         let start = u64::from_le_bytes(tail[end - 12..end - 4].try_into().unwrap());
@@ -65,7 +63,7 @@ fn check_directory_budget(f: &mut fs::File, limit: u64) -> io::Result<()> {
         ]
     };
     if counts.iter().any(|&n| n > limit) {
-        return Err(io::Error::other("skill 压缩包条目过多"));
+        return Err(io::Error::other(Issue::Entries));
     }
     if counts[0] != counts[1] {
         return Err(invalid());
@@ -77,7 +75,7 @@ fn check_directory_budget(f: &mut fs::File, limit: u64) -> io::Result<()> {
 fn unpack(zip: &Path, dest: &Path, version: &str) -> io::Result<(Manifest, usize)> {
     let mut f = fs::File::open(zip)?;
     if f.metadata()?.len() > MAX_ARCHIVE {
-        return Err(io::Error::other("skill 压缩包过大"));
+        return Err(io::Error::other(Issue::Size));
     }
     check_directory_budget(&mut f, MAX_ENTRIES)?;
     let mut archive = zip::ZipArchive::with_config(
@@ -86,14 +84,15 @@ fn unpack(zip: &Path, dest: &Path, version: &str) -> io::Result<(Manifest, usize
         },
         f,
     )
-    .map_err(|_| io::Error::other("skill 压缩包无效"))?;
+    .map_err(|_| io::Error::other(Issue::Archive))?;
     archive
         .validate_header_consistency()
-        .map_err(|_| io::Error::other("skill 压缩包无效"))?;
+        .map_err(|_| io::Error::other(Issue::Archive))?;
     let bytes = {
         let mut entry = archive.by_name(MARKER).map_err(|e| match e {
-            zip::result::ZipError::FileNotFound => io::Error::other(MISSING),
-            _ => io::Error::other("skill 压缩包无效"),
+            // 老发布包没有清单，不能用本地计算的摘要冒充随版本发布的白名单。
+            zip::result::ZipError::FileNotFound => io::Error::other(Issue::Missing),
+            _ => io::Error::other(Issue::Archive),
         })?;
         check_entry(&entry, MAX_MANIFEST)?;
         let mut buf = Vec::new();
@@ -102,15 +101,15 @@ fn unpack(zip: &Path, dest: &Path, version: &str) -> io::Result<(Manifest, usize
     };
     let manifest = Manifest::parse(&bytes)?;
     if manifest.version != version {
-        return Err(io::Error::other("skill 清单版本与请求版本不符"));
+        return Err(io::Error::other(Issue::Version));
     }
     for (key, record) in &manifest.files {
         let mut entry = archive
             .by_name(key)
-            .map_err(|_| io::Error::other("skill 包缺少清单中的文件"))?;
+            .map_err(|_| io::Error::other(Issue::FileMissing))?;
         check_entry(&entry, record.size)?;
         if entry.size() != record.size {
-            return Err(io::Error::other("skill 文件大小与清单不符"));
+            return Err(io::Error::other(Issue::FileSize));
         }
         let path = dest.join(key);
         fs::create_dir_all(path.parent().unwrap())?;
@@ -132,7 +131,7 @@ fn unpack(zip: &Path, dest: &Path, version: &str) -> io::Result<(Manifest, usize
             out.write_all(&buf[..n])?;
         }
         if count != record.size || super::manifest::hex(&digest.finalize()) != record.sha256 {
-            return Err(io::Error::other("skill 文件校验失败"));
+            return Err(io::Error::other(Issue::Digest));
         }
     }
     // 保留未知属性；本地副本与发布的清单逐字节相同。
@@ -151,9 +150,7 @@ fn check_entry<R: Read>(entry: &zip::read::ZipFile<'_, R>, limit: u64) -> io::Re
         || entry.compression() != zip::CompressionMethod::Stored
         || entry.size() != entry.compressed_size()
     {
-        return Err(io::Error::other(
-            "skill 包条目的类型、大小或压缩方式不合要求",
-        ));
+        return Err(io::Error::other(Issue::Entry));
     }
     Ok(())
 }
@@ -172,9 +169,7 @@ fn replace(
     for name in incoming.difference(&owned) {
         match fs::symlink_metadata(root.join(name)) {
             Ok(_) => {
-                return Err(io::Error::other(format!(
-                    "目录 {name} 不属于上次安装；请移走该目录，或移走 skills/ 后执行 aproxy skill install"
-                )));
+                return Err(io::Error::other(Issue::Unowned((*name).into())));
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
@@ -183,9 +178,7 @@ fn replace(
     // 清单位置也可能被用户目录占据；这个名字只预留给标记文件，不授权删除目录树。
     match fs::symlink_metadata(root.join(MARKER)) {
         Ok(m) if !m.is_file() => {
-            return Err(io::Error::other(
-                "manifest.json 不是普通文件；请移走它后执行 aproxy skill install",
-            ));
+            return Err(io::Error::other(Issue::Marker));
         }
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
         _ => {}
@@ -230,9 +223,8 @@ fn replace(
     if result.is_err() {
         for (from, to) in moved.into_iter().rev() {
             if fs::rename(to, from).is_err() {
-                return Err(io::Error::other(format!(
-                    "skill 目录恢复失败，备份保存在 {}",
-                    stage.display()
+                return Err(io::Error::other(Issue::Recovery(
+                    stage.display().to_string(),
                 )));
             }
         }
@@ -263,7 +255,7 @@ pub(super) fn restore_interrupted(root: &Path, stage: &Path) -> io::Result<()> {
             continue;
         }
         if !name.to_str().is_some_and(|n| owned.contains(n)) {
-            return Err(io::Error::other("skill 备份目录不在清单中"));
+            return Err(io::Error::other(Issue::Backup));
         }
         restore_one(&old.join(&name), &root.join(&name))?;
     }
@@ -278,10 +270,7 @@ pub(super) fn restore_interrupted(root: &Path, stage: &Path) -> io::Result<()> {
 fn restore_one(from: &Path, to: &Path) -> io::Result<()> {
     match fs::symlink_metadata(to) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => fs::rename(from, to),
-        Ok(_) => Err(io::Error::other(format!(
-            "skill 恢复目标已存在：{}",
-            to.display()
-        ))),
+        Ok(_) => Err(io::Error::other(Issue::Exists(to.display().to_string()))),
         Err(e) => Err(e),
     }
 }
@@ -316,12 +305,14 @@ pub fn verify_package(zip: &Path, version: &str, packaged_crate: Option<&Path>) 
     if let Some(path) = packaged_crate {
         let input = fs::File::open(path)?;
         if input.metadata()?.len() > MAX_ARCHIVE {
-            return Err(io::Error::other("文档下载大小超限"));
+            return Err(io::Error::other("document download exceeds the size limit"));
         }
         let tmp = tempfile::NamedTempFile::new()?;
         crate::install::download::crates::translate_skills(input, tmp.as_file(), version)?;
         if verified_marker(tmp.path(), version)? != expected {
-            return Err(io::Error::other("crate 文档清单与发布总包不同"));
+            return Err(io::Error::other(
+                "the crate documentation manifest differs from the release bundle",
+            ));
         }
     }
     Ok(())
@@ -331,11 +322,13 @@ fn verified_marker(zip: &Path, version: &str) -> io::Result<Vec<u8>> {
     let temp = super::workspace(&std::env::temp_dir())?;
     let (m, ignored) = unpack(zip, temp.path(), version)?;
     if ignored != 0 {
-        return Err(io::Error::other("skill 发布包含有未登记的条目"));
+        return Err(io::Error::other(
+            "the skill release package contains unlisted entries",
+        ));
     }
     for key in m.files.keys() {
         fs::read_to_string(temp.path().join(key))
-            .map_err(|_| io::Error::other("skill 正文不是 UTF-8 文本"))?;
+            .map_err(|_| io::Error::other("skill documentation is not UTF-8 text"))?;
     }
     fs::read(temp.path().join(MARKER))
 }

@@ -59,6 +59,8 @@ message!(cannot_abort(phase:InstallPhase), en: "The installation has reached bin
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "id", content = "args", rename_all = "snake_case")]
 pub enum Cause {
+    /// 独立 skill 命令及普通安装支线保留同一组故障事实。
+    Skill(super::skills::issue::Issue),
     /// 显式本地文件与要安装的变体不一致。
     LocalVariant {
         path: String,
@@ -122,6 +124,7 @@ impl Cause {
     /// 状态文件、事件和日志选英文，终端可以对相同的事实另选语言。
     pub fn render(&self, lang: Lang) -> String {
         match self {
+            Self::Skill(e) => e.render(lang),
             Self::LocalVariant { path, got, want } => local_variant(
                 lang,
                 path,

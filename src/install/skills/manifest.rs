@@ -1,5 +1,6 @@
 //! 发布包与本地副本共用一份文件清单。先验证整个命名空间，再允许其中的键参与路径拼接。
 
+use super::issue::Issue;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -46,14 +47,14 @@ fn unique_files<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<String, File
         type Value = BTreeMap<String, FileRecord>;
         /// 描述期望的 JSON 类型，供解析器产生错误。
         fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("文件索引")
+            f.write_str("a file index")
         }
         /// 数量超限或覆盖旧键都不是完整的白名单。
         fn visit_map<A: de::MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
             let mut files = BTreeMap::new();
             while let Some((k, v)) = a.next_entry()? {
                 if files.len() == MAX_FILES || files.insert(k, v).is_some() {
-                    return Err(de::Error::custom("文件索引无效"));
+                    return Err(de::Error::custom("invalid file index"));
                 }
             }
             Ok(files)
@@ -78,7 +79,7 @@ fn valid_segment(s: &str) -> bool {
 impl Manifest {
     /// 不传播 serde 的具体值：损坏的本地文件可能含有不应出现在错误输出中的文本。
     pub fn parse(bytes: &[u8]) -> io::Result<Self> {
-        let invalid = || io::Error::other("skill 清单无效");
+        let invalid = || io::Error::other(Issue::Manifest);
         if bytes.len() as u64 > MAX_MANIFEST {
             return Err(invalid());
         }

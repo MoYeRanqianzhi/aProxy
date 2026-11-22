@@ -298,12 +298,10 @@ fn unreadable_marker_is_not_a_missing_marker() {
     index.validate_header_consistency().unwrap();
     assert!(index.by_name(MARKER).is_err());
     fs::write(&z, bytes).unwrap();
-    assert_eq!(
-        archive::verify_package(&z, "1.0.0", None)
-            .unwrap_err()
-            .to_string(),
-        "skill 压缩包无效"
-    );
+    assert!(matches!(
+        super::issue::Issue::from_io(&archive::verify_package(&z, "1.0.0", None).unwrap_err()),
+        super::issue::Issue::Archive
+    ));
 }
 
 /// 重名或两套头给出不同的名字时，连未登记成员也不能让不同读者看成不同的包。
@@ -327,12 +325,10 @@ fn member_names_agree_and_are_unique() {
             data[i + 6] = b'A';
         }
         fs::write(&z, data).unwrap();
-        assert_eq!(
-            archive::install(h.path(), &z, "1.0.0")
-                .unwrap_err()
-                .to_string(),
-            "skill 压缩包无效"
-        );
+        assert!(matches!(
+            super::issue::Issue::from_io(&archive::install(h.path(), &z, "1.0.0").unwrap_err()),
+            super::issue::Issue::Archive
+        ));
     }
 }
 
@@ -361,7 +357,7 @@ fn deflate_not_accepted_for_verified_document() {
         archive::install(h.path(), &path, "1.0.0")
             .unwrap_err()
             .to_string()
-            .contains("压缩方式")
+            .contains("compression method")
     );
 }
 
@@ -556,12 +552,10 @@ fn zip_size_boundary_and_original_marker_bytes() {
         .unwrap()
         .write_all(b"x")
         .unwrap();
-    assert_eq!(
-        archive::install(h.path(), &z, "1.0.0")
-            .unwrap_err()
-            .to_string(),
-        "skill 压缩包过大"
-    );
+    assert!(matches!(
+        super::issue::Issue::from_io(&archive::install(h.path(), &z, "1.0.0").unwrap_err()),
+        super::issue::Issue::Size
+    ));
 }
 /// 目录与设备/FIFO 的 Unix 类型位不能被普通文件名或完全匹配的摘要抵消。
 #[test]
@@ -583,7 +577,7 @@ fn directory_and_special_members_are_not_documents() {
             archive::install(h.path(), &z, "1.0.0")
                 .unwrap_err()
                 .to_string()
-                .contains("类型")
+                .contains("entry type")
         );
     }
 }
@@ -603,7 +597,7 @@ fn stored_sizes_agree_independent_of_manifest_and_header_agreement() {
         archive::install(h.path(), &z, "1.0.0")
             .unwrap_err()
             .to_string()
-            .contains("压缩方式")
+            .contains("compression method")
     );
 }
 
@@ -616,10 +610,8 @@ fn extra_members_count_toward_directory_budget() {
     let m = manifest_for(&f);
     f.extend(names.iter().map(|n| (n.as_str(), &b""[..])));
     let z = package(h.path(), Some(&m), &f);
-    assert_eq!(
-        archive::install(h.path(), &z, "1.0.0")
-            .unwrap_err()
-            .to_string(),
-        "skill 压缩包条目过多"
-    );
+    assert!(matches!(
+        super::issue::Issue::from_io(&archive::install(h.path(), &z, "1.0.0").unwrap_err()),
+        super::issue::Issue::Entries
+    ));
 }

@@ -10,12 +10,7 @@ use std::{
     path::Path,
 };
 
-/// 不回显解析错误或正文：即使被换成含凭据的文件，诊断也只给修复办法。
-const DAMAGED: &str = "已安装的 skill 与清单不符，请执行 aproxy skill install 修复";
-/// 空目录或不存在的安装没有可读文档。
-pub const ABSENT: &str = "未安装 skill，请执行 aproxy skill install";
-/// 旧安装不能作为可信来源，先刷新它的完成标记。
-pub const LEGACY: &str = "已安装的 skill 没有清单，请执行 aproxy skill install 更新";
+use super::issue::Issue;
 
 /// 路径检查与打开后的句柄检查都拒绝所有重解析点，不只拒绝符号链接。
 fn linked(meta: &fs::Metadata) -> bool {
@@ -33,7 +28,7 @@ fn linked(meta: &fs::Metadata) -> bool {
 pub(super) fn directory(path: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if linked(&meta) || !meta.is_dir() {
-        return Err(io::Error::other(DAMAGED));
+        return Err(io::Error::other(Issue::Damaged));
     }
     Ok(())
 }
@@ -50,7 +45,7 @@ fn open(root: &Path, key: &str) -> io::Result<fs::File> {
     }
     let meta = fs::symlink_metadata(&path)?;
     if linked(&meta) || !meta.is_file() || !path.canonicalize()?.starts_with(root.canonicalize()?) {
-        return Err(io::Error::other(DAMAGED));
+        return Err(io::Error::other(Issue::Damaged));
     }
     open_regular(&path, fs::OpenOptions::new().read(true))
 }
@@ -69,7 +64,7 @@ pub(super) fn open_regular(path: &Path, opts: &mut fs::OpenOptions) -> io::Resul
     let f = opts.open(path)?;
     let meta = f.metadata()?;
     if linked(&meta) || !meta.is_file() {
-        return Err(io::Error::other(DAMAGED));
+        return Err(io::Error::other(Issue::Damaged));
     }
     Ok(f)
 }
@@ -78,7 +73,7 @@ pub(super) fn load(root: &Path) -> io::Result<Manifest> {
     let f = open(root, MARKER)?;
     let mut buf = Vec::new();
     f.take(MAX_MANIFEST + 1).read_to_end(&mut buf)?;
-    Manifest::parse(&buf).map_err(|_| io::Error::other(DAMAGED))
+    Manifest::parse(&buf).map_err(|_| io::Error::other(Issue::Damaged))
 }
 /// 只在缺标记时区分旧安装和空目录，临时工作区与锁不代表已经装好文档。
 fn legacy(root: &Path) -> io::Result<bool> {
@@ -140,7 +135,7 @@ pub fn list(home: &Path) -> io::Result<Listing> {
                 Listing::Absent
             });
         }
-        Err(_) => return Err(io::Error::other(DAMAGED)),
+        Err(_) => return Err(io::Error::other(Issue::Damaged)),
     };
     let mut skills = BTreeMap::new();
     for key in m.files.keys() {
@@ -167,12 +162,12 @@ pub fn show(home: &Path, name: &str, file: Option<&str>) -> io::Result<Vec<u8>> 
         Err(e) => {
             return Err(if e.kind() == io::ErrorKind::NotFound {
                 if legacy(&root)? {
-                    io::Error::other(LEGACY)
+                    io::Error::other(Issue::Legacy)
                 } else {
-                    io::Error::new(io::ErrorKind::NotFound, ABSENT)
+                    io::Error::new(io::ErrorKind::NotFound, Issue::Absent)
                 }
             } else {
-                io::Error::other(DAMAGED)
+                io::Error::other(Issue::Damaged)
             });
         }
     };
@@ -181,11 +176,11 @@ pub fn show(home: &Path, name: &str, file: Option<&str>) -> io::Result<Vec<u8>> 
         .files
         .get_key_value(&format!("{name}/{file}"))
         .filter(|(k, _)| k.split_once('/') == Some((name, file)))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "skill 名或文件名不在清单中"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, Issue::UnknownFile))?;
     let read = || -> io::Result<Vec<u8>> {
         let f = open(&root, key)?;
         if f.metadata()?.len() != record.size {
-            return Err(io::Error::other(DAMAGED));
+            return Err(io::Error::other(Issue::Damaged));
         }
         let mut buf = Vec::new();
         f.take(record.size + 1).read_to_end(&mut buf)?;
@@ -193,11 +188,11 @@ pub fn show(home: &Path, name: &str, file: Option<&str>) -> io::Result<Vec<u8>> 
             || manifest::hex(&Sha256::digest(&buf)) != record.sha256
             || std::str::from_utf8(&buf).is_err()
         {
-            return Err(io::Error::other(DAMAGED));
+            return Err(io::Error::other(Issue::Damaged));
         }
         Ok(buf)
     };
-    read().map_err(|_| io::Error::other(DAMAGED))
+    read().map_err(|_| io::Error::other(Issue::Damaged))
 }
 
 /// 实际的链接类型由操作系统决定；没有建链接权限时测试要保留可见的原因。

@@ -1,5 +1,9 @@
 //! `aproxy alias add/remove/list`：配置别名管理（存于 settings.json）。
 
+#[path = "../i18n/alias.rs"]
+mod text;
+use aproxy_ipc::i18n::current;
+
 use aproxy::cli::AliasCmd;
 use aproxy::ops::alias::{self, AliasError};
 use serde_json::json;
@@ -11,25 +15,22 @@ pub(crate) fn handle_alias_cmd(cmd: AliasCmd) {
         AliasCmd::Add { name, path } => match alias::add(&name, path.as_deref()) {
             Ok(added) => {
                 if added.replaced {
-                    println!("已更新别名 {} -> {}", name, added.path.display());
+                    println!("{}", text::updated(current(), &name, added.path.display()));
                 } else {
-                    println!("已添加别名 {} -> {}", name, added.path.display());
+                    println!("{}", text::added(current(), &name, added.path.display()));
                 }
-                println!("启动: aproxy start {name}    停止: aproxy stop {name}");
+                println!("{}", text::usage(current(), &name));
             }
             Err(e) => fail(&name, &e),
         },
         AliasCmd::Remove { name } => match alias::remove(&name) {
-            Ok(path) => println!("已删除别名 {name}（原指向 {path}）"),
+            Ok(path) => println!("{}", text::removed(current(), &name, &path)),
             Err(e) => fail(&name, &e),
         },
         AliasCmd::List { json } => {
             let entries = alias::list();
             if entries.is_empty() {
-                super::say(
-                    json,
-                    "暂无别名。添加: aproxy alias add <名称> <config.toml 路径>",
-                );
+                super::say(json, text::empty(current()));
                 if !json {
                     return;
                 }
@@ -51,7 +52,7 @@ pub(crate) fn handle_alias_cmd(cmd: AliasCmd) {
                 super::print_doc(json!({"aliases": aliases}));
                 return;
             }
-            println!("别名 ({}):", entries.len());
+            println!("{}", text::count(current(), entries.len()));
             for (name, path) in entries {
                 println!("  {name} -> {path}");
             }
@@ -62,11 +63,28 @@ pub(crate) fn handle_alias_cmd(cmd: AliasCmd) {
 /// 说明别名操作失败的原因，并以 1 退出。
 fn fail(name: &str, e: &AliasError) -> ! {
     match e {
-        AliasError::InvalidName { reason } => eprintln!("别名无效: {reason}"),
-        AliasError::ConfigMissing { path } => eprintln!("配置文件不存在: {}", path.display()),
-        AliasError::NotFound => eprintln!("别名 {name} 不存在。用 aproxy alias list 查看。"),
-        AliasError::SettingsUnreadable { reason } => eprintln!("{reason}"),
-        AliasError::SaveFailed { reason } => eprintln!("{reason}"),
+        AliasError::InvalidName { reason } => {
+            eprintln!("{}", text::invalid(current(), &reason.render(current())))
+        }
+        AliasError::ConfigMissing { path } => {
+            eprintln!("{}", super::config_text::missing(current(), path.display()))
+        }
+        AliasError::NotFound => eprintln!("{}", text::not_found(current(), name)),
+        AliasError::SettingsUnreadable { reason, path } => {
+            let why = reason
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| text::invalid_json(current()).to_owned());
+            eprintln!("{}", text::cannot_edit(current(), &why, path.display()));
+        }
+        AliasError::SaveFailed { reason } => eprintln!(
+            "{}",
+            aproxy::settings::describe_edit_error(
+                reason,
+                &aproxy::settings::settings_path(),
+                current()
+            )
+        ),
     }
     std::process::exit(1)
 }

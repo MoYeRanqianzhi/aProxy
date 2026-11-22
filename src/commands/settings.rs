@@ -16,7 +16,9 @@ use aproxy_ipc::code::EXIT_CONFIG;
 use aproxy_ipc::diag::Diagnostic;
 use serde_json::{Value, json};
 
-use super::{Failure, print_doc, say};
+use super::{Failure, config_text, print_doc, say};
+#[path = "../i18n/settings.rs"]
+mod text;
 
 /// 查看或修改当前 home 的设置；只有写入全局默认值时才需要异步查询运行中的实例。
 pub(crate) async fn handle_settings_cmd(cmd: SettingsCmd) {
@@ -64,15 +66,14 @@ fn effective_or_exit(path: &Path, json: bool) -> Value {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
-            eprintln!("读取 settings.json 失败: {e}\n文件: {}", path.display());
+            eprintln!("{}", text::read(current(), &e, path.display()));
             crate::util::exit(1)
         }
     };
     match edit::effective_value(text.as_deref()) {
         Some(value) => value,
         None => {
-            let message =
-                "settings.json 不是合法的 JSON 对象，只能手工修复（或删除它，回到内置默认）:";
+            let message = |lang| text::invalid_object(lang).to_owned();
             let errors: Vec<_> = settings::read(path)
                 .diagnostics
                 .into_iter()
@@ -80,9 +81,10 @@ fn effective_or_exit(path: &Path, json: bool) -> Value {
                 .collect();
             if json {
                 print_errors(&errors);
-                Failure::new("config_invalid", message, json!({"diagnostics": errors})).exit(json);
+                Failure::rendered("config_invalid", message, json!({"diagnostics": errors}))
+                    .exit(json);
             }
-            eprintln!("{message}");
+            eprintln!("{}", message(current()));
             print_errors(&errors);
             crate::util::exit(EXIT_CONFIG as i32)
         }
@@ -160,12 +162,15 @@ async fn apply(path: &Path, change: edit::Change, json: bool) {
         return;
     }
     if applied.changed {
-        say(json, format_args!("已保存到 {}", applied.file.display()));
+        say(json, config_text::saved(current(), applied.file.display()));
     } else {
-        say(json, format_args!("没有变化: {}", applied.file.display()));
+        say(
+            json,
+            config_text::unchanged(current(), applied.file.display()),
+        );
     }
     if !ports.is_empty() {
-        eprintln!("运行中的实例要重启才用上这次改动:");
+        eprintln!("{}", config_text::restart(current()));
         for port in ports {
             eprintln!("  aproxy restart {port}");
         }
@@ -198,7 +203,7 @@ async fn running_ports() -> Vec<u16> {
 
 /// 编辑失败的两种输出共用错误码与说明；I/O 错误以 1 退出，由命令出口补齐错误文档。
 fn fail(error: &EditError, path: &Path, json: bool) -> ! {
-    let message = settings::describe_edit_error(error, path);
+    let message = |lang| settings::describe_edit_error(error, path, lang);
     let (code, details) = match error {
         EditError::BadKey(_) => ("usage", json!({"reason": "bad_key_path"})),
         EditError::Syntax(d) | EditError::Invalid(d) => {
@@ -209,11 +214,11 @@ fn fail(error: &EditError, path: &Path, json: bool) -> ! {
             json!({"file": path.display().to_string()}),
         ),
         EditError::Io(_) => {
-            eprintln!("{message}");
+            eprintln!("{}", message(current()));
             crate::util::exit(1)
         }
     };
-    Failure::new(code, message, details).exit(json)
+    Failure::rendered(code, message, details).exit(json)
 }
 
 fn print_json(value: &Value) {
@@ -251,10 +256,12 @@ fn parse_value(key: &str, raw: &str, json: bool) -> Value {
         };
     }
     parsed.unwrap_or_else(|e| {
-        let message = format!(
-            "{key} 的值要写成 JSON（例如 true、30、\"text\"、[\"a\"]、{{\"k\":1}}），解析失败: {e}"
-        );
-        Failure::new("usage", message, json!({"reason": "bad_value"})).exit(json)
+        Failure::rendered(
+            "usage",
+            |lang| text::not_json(lang, key, &e),
+            json!({"reason": "bad_value"}),
+        )
+        .exit(json)
     })
 }
 

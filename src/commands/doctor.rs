@@ -1,5 +1,9 @@
 //! `aproxy doctor`：配置体检。
 
+#[path = "../i18n/doctor.rs"]
+mod text;
+use aproxy_ipc::i18n::current;
+
 use aproxy::{doctor, settings};
 use aproxy_ipc::diag::Level;
 use serde_json::json;
@@ -32,10 +36,10 @@ pub(crate) async fn handle_doctor_cmd(json: bool) {
         doc["summary"] = json!({"errors": errors, "warnings": warnings});
         super::print_doc(doc);
     } else {
-        println!("aProxy 配置体检");
+        println!("{}", text::title(current()));
         println!("════════════════");
         if errors == 0 && warnings == 0 && infos == 0 && report.gc_paused.is_none() {
-            println!("全部配置正常，未发现问题。");
+            println!("{}", text::healthy(current()));
             return;
         }
         for file in &report.files {
@@ -51,10 +55,10 @@ pub(crate) async fn handle_doctor_cmd(json: bool) {
                 {
                     let key = quoted(key);
                     match file.kind {
-                        "settings" => println!("    删除这个键: aproxy settings unset {key}"),
+                        "settings" => println!("{}", text::unset_setting(current(), &key)),
                         "config" => println!(
-                            "    删除这个键: aproxy config --config {} unset {key}",
-                            quoted(&file.file)
+                            "{}",
+                            text::unset_config(current(), &quoted(&file.file), &key)
                         ),
                         _ => (),
                     }
@@ -62,13 +66,11 @@ pub(crate) async fn handle_doctor_cmd(json: bool) {
             }
         }
         if report.gc_paused.is_some() {
-            println!("日志清理已暂停：run/ 里有读不懂的记录。");
+            println!("{}", text::paused(current()));
         }
-        println!("检查结果: {errors} error, {warnings} warning, {infos} info");
+        println!("{}", text::summary(current(), errors, warnings, infos));
         if errors > 0 {
-            println!(
-                "有 error 的配置不能用来启动；settings.json 有 error 时多数命令不能运行。warning 与 info 仅供参考。"
-            );
+            println!("{}", text::cannot_start(current()));
         }
     }
     if errors > 0 {

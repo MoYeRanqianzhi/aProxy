@@ -141,7 +141,7 @@ fn get_prints_the_effective_value_and_its_source() {
     let out = get(&["listen_addr"]);
     assert_eq!(text(&out.stdout).trim_end(), "\"127.0.0.1:12345\"");
     assert!(
-        text(&out.stderr).contains("内置默认"),
+        text(&out.stderr).contains("built-in default"),
         "{}",
         text(&out.stderr)
     );
@@ -423,7 +423,7 @@ fn writes_report_the_instances_to_restart() {
     let out = config(&home, &file, &["set", "max_request_mb", "32"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(
-        text(&out.stdout).contains("已保存到"),
+        text(&out.stdout).contains("Saved to"),
         "{}",
         text(&out.stdout)
     );

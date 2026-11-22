@@ -191,7 +191,7 @@ fn alias_list_json_document() {
     let args = ["alias", "list", "--json"];
     let empty = run(&home, &args);
     assert_eq!(document(&empty), json!({"schema": 1, "aliases": []}));
-    assert!(String::from_utf8_lossy(&empty.stderr).contains("暂无别名"));
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("No aliases"));
 
     let work = home.path().join("work.toml");
     let gone = home.path().join("gone.toml");
@@ -233,7 +233,7 @@ fn find_json_document() {
     let args = ["find", "--json"];
     let empty = run(&home, &args);
     assert_eq!(document(&empty), json!({"schema": 1, "configs": []}));
-    assert!(String::from_utf8_lossy(&empty.stderr).contains("没有找到配置文件"));
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("No configuration files found"));
 
     let dir = home.path().join("configs");
     fs::create_dir(&dir).unwrap();
@@ -512,9 +512,9 @@ fn doctor_json_document() {
     let stdout = String::from_utf8(plain.stdout).unwrap();
     for fragment in [
         "[ERROR] ",
-        "删除这个键: aproxy config --config '",
-        "检查结果: 1 error,",
-        "有 error 的配置不能用来启动",
+        "Remove this key: aproxy config --config '",
+        "Results: 1 error,",
+        "Instances cannot start with configuration errors",
     ] {
         assert!(stdout.contains(fragment), "{stdout}");
     }
@@ -544,7 +544,78 @@ fn doctor_reports_unreadable_records() {
     assert!(
         String::from_utf8(run(&home, &["doctor"]).stdout)
             .unwrap()
-            .contains("日志清理已暂停")
+            .contains("Log cleanup is paused")
     );
     assert_eq!(fs::read_to_string(path).unwrap(), "not json");
+}
+
+/// 同一进程在 stdout 写英文错误文档，同时在 stderr 向调用者说明同一条错误。
+#[test]
+fn machine_errors_do_not_inherit_the_terminal_language() {
+    let home = TestHome::new();
+    for (args, en, zh) in [
+        (
+            vec!["config", "get", "bogus", "--json"],
+            "Unknown key: bogus",
+            "不认识的键: bogus",
+        ),
+        (
+            vec!["settings", "set", "watchdog.enabled", "not-json", "--json"],
+            "Write the value of watchdog.enabled as JSON",
+            "watchdog.enabled 的值要写成 JSON",
+        ),
+    ] {
+        let call = |lang| {
+            home.cmd()
+                .env("APROXY_LANG", lang)
+                .args(&args)
+                .output()
+                .unwrap()
+        };
+        let english = call("en");
+        let chinese = call("zh-CN");
+        assert_eq!(english.status.code(), chinese.status.code());
+        assert!(!english.status.success());
+        assert_eq!(english.stdout, chinese.stdout);
+        let doc: serde_json::Value = serde_json::from_slice(&chinese.stdout).unwrap();
+        assert!(
+            doc["error"]["message"].as_str().unwrap().starts_with(en),
+            "{doc}"
+        );
+        assert!(String::from_utf8_lossy(&english.stderr).contains(en));
+        assert!(String::from_utf8_lossy(&chinese.stderr).contains(zh));
+    }
+}
+
+/// 只切换子进程的环境；别名、发现和体检的普通输出均不能继承测试机的语言。
+#[test]
+fn local_reports_follow_the_reader() {
+    let home = TestHome::new();
+    for (args, en, zh) in [
+        (vec!["alias", "list"], "No aliases", "暂无别名"),
+        (
+            vec!["find"],
+            "No configuration files found",
+            "没有找到配置文件",
+        ),
+        (
+            vec!["doctor"],
+            "aProxy configuration check",
+            "aProxy 配置体检",
+        ),
+    ] {
+        for (lang, expected) in [("en", en), ("zh-CN", zh)] {
+            let out = home
+                .cmd()
+                .env("APROXY_LANG", lang)
+                .args(&args)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8(out.stdout).unwrap();
+            assert!(
+                out.status.success() && stdout.contains(expected),
+                "{args:?}: {stdout}"
+            );
+        }
+    }
 }

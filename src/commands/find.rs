@@ -1,5 +1,9 @@
 //! `aproxy find`：从配置目录列表发现全部配置并列出。
 
+#[path = "../i18n/find.rs"]
+mod text;
+use aproxy_ipc::i18n::current;
+
 use aproxy::find;
 use aproxy::settings;
 use serde_json::json;
@@ -34,10 +38,7 @@ pub(crate) fn handle_find_cmd(
         .filter(|d| port.is_none_or(|p| d.matches_port(p)))
         .collect();
     if items.is_empty() {
-        super::say(
-            json,
-            "没有找到配置文件。配置目录列表见 settings.json 的 config_dirs（默认 ~/.aproxy/ 与 ~/.aproxy/configs/）。",
-        );
+        super::say(json, text::empty(current()));
         if !json {
             return;
         }
@@ -64,26 +65,33 @@ pub(crate) fn handle_find_cmd(
 
 /// 列出找到的配置（人类可读），保留别名与默认配置标记。
 fn print_list(items: &[find::DiscoveredConfig]) {
-    println!("找到 {} 个配置:", items.len());
+    println!("{}", text::found(current(), items.len()));
     for d in items {
         let alias_part = if d.aliases.is_empty() {
             String::new()
         } else {
-            format!("  别名: {}", d.aliases.join(", "))
+            text::aliases(current(), &d.aliases.join(", "))
         };
-        let default_part = if d.is_default { "  [默认]" } else { "" };
+        let default_part = if d.is_default {
+            text::default(current())
+        } else {
+            ""
+        };
         match &d.config {
             Some(c) => println!(
-                "  {}  端口 {}  上游 {}{}{}",
-                d.path.display(),
-                aproxy::daemon::port_of(&c.listen_addr),
-                aproxy_ipc::redact::url(&c.base_url),
-                alias_part,
-                default_part
+                "{}",
+                text::valid(
+                    current(),
+                    d.path.display(),
+                    aproxy::daemon::port_of(&c.listen_addr),
+                    &aproxy_ipc::redact::url(&c.base_url),
+                    &alias_part,
+                    default_part
+                )
             ),
             None => println!(
-                "  {}  （无法解析为有效 aProxy 配置）{alias_part}{default_part}",
-                d.path.display()
+                "{}",
+                text::invalid(current(), d.path.display(), &alias_part, default_part)
             ),
         }
     }

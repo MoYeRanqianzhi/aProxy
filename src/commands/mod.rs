@@ -5,6 +5,8 @@
 
 pub(crate) mod alias;
 pub(crate) mod config;
+#[path = "../i18n/config.rs"]
+mod config_text;
 pub(crate) mod desktop;
 pub(crate) mod doctor;
 pub(crate) mod find;
@@ -21,6 +23,7 @@ pub(crate) mod stop;
 use std::path::PathBuf;
 
 use aproxy::settings as app_settings;
+use aproxy_ipc::i18n::{Lang, current};
 use serde_json::{Value, json};
 
 /// 由 clap 已解析的命令选择输出协议，不从原始参数里猜测（值本身也可能是 `--json`）。
@@ -125,7 +128,9 @@ pub(crate) fn finish_json(code: i32) {
 pub(crate) struct Failure {
     pub(crate) code: &'static str,
     pub(crate) message: String,
-    pub(crate) details: Value,
+    /// 仅在终端使用中文时保留其文字；公开文档始终取 message。
+    terminal: Option<String>,
+    pub(crate) details: Box<Value>,
     /// 同一个握手诊断的退出码取决于故障能否自行恢复。
     exit_override: Option<u8>,
 }
@@ -135,9 +140,28 @@ impl Failure {
         Failure {
             code,
             message: message.into(),
-            details,
+            terminal: None,
+            details: Box::new(details),
             exit_override: None,
         }
+    }
+
+    /// 一条失败可以同时写入 stderr 与 JSON；两次显示从同一组参数和同一条定义取词。
+    pub(crate) fn rendered(
+        code: &'static str,
+        render: impl Fn(Lang) -> String,
+        details: Value,
+    ) -> Self {
+        let mut failure = Self::new(code, render(Lang::En), details);
+        if current() == Lang::Zh {
+            failure.terminal = Some(render(Lang::Zh));
+        }
+        failure
+    }
+
+    /// 终端没有独立的译文时，沿用原始故障证据。
+    fn terminal(&self) -> &str {
+        self.terminal.as_deref().unwrap_or(&self.message)
     }
 
     /// 前台与后台用同一份结构化诊断；静态协议不匹配和程序暂时不可用的退出码不同。
@@ -145,7 +169,8 @@ impl Failure {
         Self {
             code: e.code(),
             message: e.to_string(),
-            details: e.details(),
+            terminal: None,
+            details: Box::new(e.details()),
             exit_override: Some(e.exit_code()),
         }
     }
@@ -171,7 +196,7 @@ impl Failure {
     /// 写出同一份错误文档并返回退出码，让需要收回运行时的命令走正常返回路径。
     pub(crate) fn report(self, json: bool) -> u8 {
         let exit = self.exit_code();
-        eprintln!("{}", self.message);
+        eprintln!("{}", self.terminal());
         if json {
             print_doc(json!({
                 "error": {"code": self.code, "message": self.message, "details": self.details},
@@ -364,13 +389,9 @@ pub(crate) fn resolve_cfg_path(explicit: Option<&std::path::Path>) -> Result<Pat
             if path.is_file() {
                 Ok(path)
             } else {
-                Err(Failure::new(
+                Err(Failure::rendered(
                     "target_not_found",
-                    format!(
-                        "settings.json 指定的默认配置文件不存在: {}
-用 aproxy settings set default_config <路径> 重新指定，或 aproxy settings unset default_config 取消",
-                        path.display()
-                    ),
+                    |lang| config_text::default_missing(lang, path.display()),
                     json!({"target": path.display().to_string()}),
                 ))
             }

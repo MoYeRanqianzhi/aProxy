@@ -223,7 +223,8 @@ fn read_aliases(ctx: &mut Ctx, aliases: &Obj) -> HashMap<String, String> {
             );
             continue;
         };
-        if let Some(reason) = super::alias_name_problem(name) {
+        if let Err(problem) = super::validate_alias_name(name) {
+            let reason = problem.render(aproxy_ipc::i18n::Lang::En);
             ctx.push(
                 "config_invalid_value",
                 &key,

@@ -40,9 +40,9 @@ def baseline_texts():
         source = git("show", f"{BASELINE}:{name}")
         for m in TOKEN.finditer(source):
             token = m[0]
-            if not re.match(r'(?:b?r#*|b)?"', token) or not re.search(r"[\u3400-\u9fff]", token):
+            if not re.match(r'(?:b?r#*|b)?"', token) or not re.search(r"[\u3000-\u9fff\uff00-\uffef]", token):
                 continue
-            value = normalized(text(token))
+            value = normalized(text(token).replace("{{", "{").replace("}}", "}"))
             values.add(value)
             # The severity marker is still emitted by the sink, not by its translation.
             values.add(re.sub(r"^\[(?:ERROR|WARN|INFO|\{\})\]\s+", "", value))

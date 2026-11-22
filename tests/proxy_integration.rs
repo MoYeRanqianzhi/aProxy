@@ -4791,7 +4791,8 @@ fn stale_default_config_blocks_only_commands_that_read_it() {
     assert_eq!(show.status.code(), Some(4), "要读配置的命令应报错");
     let stderr = String::from_utf8_lossy(&show.stderr);
     assert!(
-        stderr.contains("默认配置文件不存在") && stderr.contains("settings unset default_config"),
+        stderr.contains("Default configuration file in settings.json does not exist")
+            && stderr.contains("settings unset default_config"),
         "{stderr}"
     );
 
@@ -5093,7 +5094,7 @@ fn cli_config_show_rejects_missing_explicit_file() {
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains("不存在"),
+            stderr.contains("does not exist"),
             "stderr 应提示文件不存在，实际: {stderr}"
         );
     }
@@ -5884,7 +5885,7 @@ fn alias_errors_on_unknown_names() {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(text.contains("别名无效"), "实际: {text}");
+        assert!(text.contains("Invalid alias"), "实际: {text}");
     }
 
     // add 不存在的配置路径：报错
@@ -5900,7 +5901,10 @@ fn alias_errors_on_unknown_names() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(text.contains("配置文件不存在"), "实际: {text}");
+    assert!(
+        text.contains("Configuration file does not exist"),
+        "实际: {text}"
+    );
 
     // remove 不存在的别名：报错
     let out = home
@@ -5914,7 +5918,7 @@ fn alias_errors_on_unknown_names() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(text.contains("不存在"), "实际: {text}");
+    assert!(text.contains("does not exist"), "实际: {text}");
 }
 
 // ---------------------------------------------------------------------------
@@ -5936,7 +5940,10 @@ fn tilde_expands_to_the_c1_user_dir() {
     assert!(!out.status.success(), "{stderr}");
     let expected = user.path().join("no-such-config.toml");
     assert!(
-        stderr.contains(&format!("配置文件不存在: {}", expected.display())),
+        stderr.contains(&format!(
+            "Configuration file does not exist: {}",
+            expected.display()
+        )),
         "实际: {stderr}"
     );
 }
@@ -6927,7 +6934,7 @@ fn config_show_masks_url_credentials_and_transform_secrets() {
                 "https://***@api.example.com/v1",
                 "http://***@127.0.0.1:7890?token=***",
                 "--api-key, <secret>, --token=<secret>",
-                "env              = KEYS（值不显示）",
+                "env              = KEYS (values hidden)",
             ],
         ),
         (
@@ -7382,8 +7389,8 @@ fn config_command_edits_in_place_and_unsets_unknown_keys() {
     );
     let stdout = String::from_utf8_lossy(&show.stdout);
     assert!(
-        stdout.contains("timeouts.connect_secs      = 5  （config.toml）")
-            && stdout.contains("timeouts.read_idle_secs    = 300  （内置默认）"),
+        stdout.contains("timeouts.connect_secs      = 5  (config.toml)")
+            && stdout.contains("timeouts.read_idle_secs    = 300  (built-in default)"),
         "每个值后面注明来源:\n{stdout}"
     );
 
@@ -8017,11 +8024,11 @@ fn settings_defaults_reach_config_and_credentials_follow_their_target() {
     // 没写 base_url：整套默认都继承
     let stdout = show("same.toml", "");
     assert!(
-        stdout.contains("\"https://api.example.com\"  （settings.json 全局默认）"),
+        stdout.contains("\"https://api.example.com\"  (settings.json global default)"),
         "{stdout}"
     );
     assert!(
-        stdout.contains("max_request_mb             = 7  （settings.json 全局默认）"),
+        stdout.contains("max_request_mb             = 7  (settings.json global default)"),
         "{stdout}"
     );
     assert!(
@@ -8032,18 +8039,18 @@ fn settings_defaults_reach_config_and_credentials_follow_their_target() {
         stdout.contains("x-api-key") && stdout.contains("x-team"),
         "{stdout}"
     );
-    assert!(!stdout.contains("没有继承"), "{stdout}");
+    assert!(!stdout.contains("were not inherited"), "{stdout}");
 
     // 指向别家上游：默认的 key 与密钥头不继承，列出来；不是密钥的头照常继承
     let stdout = show("other.toml", "base_url = \"https://relay.b.example\"\n");
     assert!(
-        stdout.contains("api_key                    = (未设置)"),
+        stdout.contains("api_key                    = (not set)"),
         "{stdout}"
     );
     assert!(!stdout.contains("x-api-key = "), "{stdout}");
     assert!(stdout.contains("x-team"), "{stdout}");
     assert!(
-        stdout.contains("没有继承")
+        stdout.contains("were not inherited")
             && stdout.contains("api_key")
             && stdout.contains("https://api.example.com")
             && stdout.contains("https://relay.b.example"),

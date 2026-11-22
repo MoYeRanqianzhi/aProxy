@@ -745,7 +745,9 @@ fn doctor_exit_codes() {
         let plain = run(&home, &["doctor"]);
         assert_eq!(plain.status.code(), Some(exit));
         if exit == 3 {
-            assert!(text(&plain.stdout).contains("    删除这个键: aproxy settings unset 'nope'"));
+            assert!(
+                text(&plain.stdout).contains("    Remove this key: aproxy settings unset 'nope'")
+            );
         }
     }
 }

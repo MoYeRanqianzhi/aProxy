@@ -16,25 +16,28 @@ pub struct Added {
 }
 
 /// 别名操作失败的原因。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum AliasError {
     /// 别名不合规。`reason` 说明哪里不合规
-    InvalidName { reason: String },
+    InvalidName { reason: settings::AliasNameProblem },
     /// 要指向的配置文件不存在
     ConfigMissing { path: PathBuf },
     /// 要删除的别名不存在
     NotFound,
     /// settings.json 读不出或解析不了，拒绝在它上面写回。`reason` 是完整说明
-    SettingsUnreadable { reason: String },
+    SettingsUnreadable {
+        reason: Option<std::io::Error>,
+        path: PathBuf,
+    },
     /// settings.json 没有写成。`reason` 是完整说明
-    SaveFailed { reason: String },
+    SaveFailed {
+        reason: crate::config::edit::EditError,
+    },
 }
 
 /// 添加别名；同名已存在则改它的指向。`path` 省略时指向默认配置文件。
 pub fn add(name: &str, path: Option<&str>) -> Result<Added, AliasError> {
-    settings::validate_alias_name(name).map_err(|e| AliasError::InvalidName {
-        reason: e.to_string(),
-    })?;
+    settings::validate_alias_name(name).map_err(|reason| AliasError::InvalidName { reason })?;
     let path = match path {
         Some(p) => settings::expand_path(p),
         None => config::config_path(),
@@ -66,19 +69,17 @@ fn alias_key(name: &str) -> String {
 /// [`AliasError::SettingsUnreadable`]。
 fn stored_alias(name: &str) -> Result<Option<String>, AliasError> {
     let path = settings::settings_path();
-    let unreadable = |reason: String| AliasError::SettingsUnreadable {
-        reason: format!(
-            "settings.json 读不懂（{reason}），本次不做修改。请先修复或删除该文件: {}",
-            path.display()
-        ),
+    let unreadable = |reason| AliasError::SettingsUnreadable {
+        reason,
+        path: path.clone(),
     };
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(unreadable(e.to_string())),
+        Err(e) => return Err(unreadable(Some(e))),
     };
-    let effective = settings::edit::effective_value(text.as_deref())
-        .ok_or_else(|| unreadable("不是合法的 JSON 对象".to_string()))?;
+    let effective =
+        settings::edit::effective_value(text.as_deref()).ok_or_else(|| unreadable(None))?;
     Ok(effective
         .get("aliases")
         .and_then(|aliases| aliases.get(name))

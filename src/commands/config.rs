@@ -3,6 +3,9 @@
 //! 读出口不给密钥的明文：`--json` 里密钥是占位对象 `{"secret":true}`，给人看的输出里是
 //! `<secret>`；URL 里的口令打码。
 
+use super::config_text as text;
+use aproxy_ipc::i18n::current;
+
 use std::path::{Path, PathBuf};
 
 use aproxy::cli::{ConfigArgs, ConfigCmd};
@@ -73,8 +76,13 @@ pub(crate) async fn handle_config_cmd(args: ConfigArgs) {
 }
 
 /// 整条命令失败（见 [`super::Failure`]）。
-fn fail(json: bool, code: &'static str, message: String, details: Value) -> ! {
-    super::Failure::new(code, message, details).exit(json)
+fn fail(
+    json: bool,
+    code: &'static str,
+    message: impl Fn(aproxy_ipc::i18n::Lang) -> String,
+    details: Value,
+) -> ! {
+    super::Failure::rendered(code, message, details).exit(json)
 }
 
 /// 读配置文件的文本；不存在时是 None。读不出来（权限、不是 UTF-8）时失败退出。
@@ -83,7 +91,7 @@ fn read_text(path: &Path) -> Option<String> {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
-            eprintln!("读取配置文件失败: {e}\n文件: {}", path.display());
+            eprintln!("{}", text::read(current(), &e, path.display()));
             crate::util::exit(1)
         }
     }
@@ -98,7 +106,7 @@ fn resolve(path: &Path) -> config::Resolved {
     match config::resolve(path, &config::Overrides::default(), &global_defaults()) {
         Ok(resolved) => resolved,
         Err(e) => {
-            eprintln!("读取配置文件失败: {e}\n文件: {}", path.display());
+            eprintln!("{}", text::read(current(), &e, path.display()));
             crate::util::exit(1)
         }
     }
@@ -115,7 +123,7 @@ fn show(path: &Path, explicit: bool, effective: bool, json: bool) {
         fail(
             json,
             "target_not_found",
-            format!("指定的配置文件不存在: {}", path.display()),
+            |lang| text::specified_missing(lang, path.display()),
             json!({"target": path.display().to_string()}),
         );
     }
@@ -143,40 +151,46 @@ fn show(path: &Path, explicit: bool, effective: bool, json: bool) {
         // 全局默认里没有继承的凭据：列出来，不然用户只会看到上游回 401
         if !resolved.withheld.is_empty() {
             println!();
-            println!("全局默认里的这些凭据没有继承（它们属于另一个目标）:");
+            println!("{}", text::withheld(current()));
             for item in &resolved.withheld {
                 println!(
-                    "  {}  默认值属于 {}，这份配置指向 {}",
-                    item.key,
-                    item.default_target,
-                    if item.target.is_empty() {
-                        "(未设置)"
-                    } else {
-                        item.target.as_str()
-                    }
+                    "{}",
+                    text::targets(
+                        current(),
+                        &item.key,
+                        &item.default_target,
+                        if item.target.is_empty() {
+                            text::unset(current())
+                        } else {
+                            &item.target
+                        }
+                    )
                 );
             }
         }
     } else {
         println!("# {}", path.display());
         if text.is_none() {
-            eprintln!("配置文件还不存在；用 aproxy config set <键> <值> 写入第一个键时创建。");
+            eprintln!("{}", text::create(current()));
         }
         print!("{}", view::to_document(&view::for_display(values)));
     }
 
     for d in resolved.diagnostics.iter().filter(|d| !d.is_error()) {
-        eprintln!("警告: {}", aproxy::ops::start::render_diagnostic(d));
+        eprintln!(
+            "{}",
+            text::warning(current(), &aproxy::ops::start::render_diagnostic(d))
+        );
     }
     if !resolved.is_valid() {
         // 这份配置现在启动不了
         eprintln!();
-        eprintln!("这份配置有错误，现在不能用来启动:");
+        eprintln!("{}", text::invalid(current()));
         let errors: Vec<_> = resolved.errors().cloned().collect();
         print_diagnostics(&errors);
         if resolved.config.base_url.is_empty() {
             eprintln!();
-            eprintln!("提示: base_url 为空，请设置:");
+            eprintln!("{}", text::base_url(current()));
             eprintln!("  aproxy config set base_url https://api.anthropic.com");
         }
         let unknown: Vec<&str> = errors
@@ -186,7 +200,7 @@ fn show(path: &Path, explicit: bool, effective: bool, json: bool) {
             .collect();
         if !unknown.is_empty() {
             eprintln!();
-            eprintln!("不认识的键可以这样删除:");
+            eprintln!("{}", text::unknown_keys(current()));
             for key in unknown {
                 eprintln!("  aproxy config unset '{key}'");
             }
@@ -206,16 +220,14 @@ fn require_known_key(key: &str, json: bool) -> view::KeyKind {
         fail(
             json,
             "usage",
-            format!(
-                "键路径写法不对: {key}（点号分隔，例如 timeouts.connect_secs、extra_headers.\"x-foo\"；数组表只能整体读写）"
-            ),
+            |lang| text::bad_key(lang, key),
             json!({"reason": "bad_key_path"}),
         );
     }
     fail(
         json,
         "config_unknown_key",
-        format!("不认识的键: {key}（aproxy config show --effective 列出全部的键）"),
+        |lang| text::unknown(lang, key),
         json!({"key": key}),
     )
 }
@@ -227,7 +239,7 @@ fn get(path: &Path, key: &str, json: bool) {
         fail(
             json,
             "target_not_found",
-            format!("配置文件不存在: {}", path.display()),
+            |lang| text::missing(lang, path.display()),
             json!({"target": path.display().to_string()}),
         );
     };
@@ -235,12 +247,12 @@ fn get(path: &Path, key: &str, json: bool) {
     let Some(file_values) = view::file_value(&text) else {
         // 语法错误：文件里的值一个都读不出来，给出的只会是默认值
         let errors: Vec<_> = resolved.errors().cloned().collect();
-        eprintln!("配置文件有语法错误:");
+        eprintln!("{}", text::syntax(current()));
         print_diagnostics(&errors);
         fail(
             json,
             "config_invalid",
-            format!("读不出 {key}：先修复 {}", path.display()),
+            |lang| text::cannot_get(lang, key, path.display()),
             json!({"diagnostics": errors}),
         );
     };
@@ -275,9 +287,9 @@ fn get(path: &Path, key: &str, json: bool) {
     {
         Some(value) => {
             println!("{value}");
-            eprintln!("（{}）", source_label(source.copied()));
+            eprintln!("{}", text::origin(current(), source_label(source.copied())));
         }
-        None => eprintln!("(未设置)"),
+        None => eprintln!("{}", text::unset(current())),
     }
 }
 
@@ -301,9 +313,7 @@ fn parse_value(key: &str, raw: &str, json: bool) -> toml_edit::Value {
         Err(e) => fail(
             json,
             "usage",
-            format!(
-                "{key} 的值要写成 TOML（例如 true、30、\"text\"、[\"a\"]、{{ k = 1 }}），解析失败: {e}"
-            ),
+            |lang| text::not_toml(lang, key, &e),
             json!({"reason": "bad_value"}),
         ),
     }
@@ -341,18 +351,16 @@ async fn write(path: &Path, change: Change, json: bool) {
         Err(EditError::BadKey(key)) => fail(
             json,
             "usage",
-            format!(
-                "键路径写法不对: {key}（点号分隔，例如 timeouts.connect_secs、extra_headers.\"x-foo\"；数组表只能整体读写）"
-            ),
+            |lang| text::bad_key(lang, key.as_ref()),
             json!({"reason": "bad_key_path"}),
         ),
         Err(EditError::Syntax(diagnostics)) => {
-            eprintln!("现有配置文件有语法错误，没有修改:");
+            eprintln!("{}", text::not_modified(current()));
             print_diagnostics(&diagnostics);
             fail(
                 json,
                 "config_invalid",
-                format!("先修复或删除 {}", path.display()),
+                |lang| text::repair(lang, path.display()),
                 json!({"diagnostics": diagnostics}),
             )
         }
@@ -361,27 +369,24 @@ async fn write(path: &Path, change: Change, json: bool) {
             fail(
                 json,
                 "config_invalid",
-                "这次修改会让配置无效，没有保存".to_string(),
+                |lang| text::refused(lang).to_string(),
                 json!({"diagnostics": diagnostics}),
             )
         }
         Err(EditError::Conflict) => fail(
             json,
             "write_conflict",
-            format!(
-                "配置文件一直在被别的程序修改，没有保存（关掉正在编辑它的程序后重试）: {}",
-                path.display()
-            ),
+            |lang| text::conflict(lang, path.display()),
             json!({"file": path.display().to_string()}),
         ),
         Err(EditError::LockBusy) => fail(
             json,
             "write_conflict",
-            "另一个 aproxy 正在写配置，等了 10 秒仍未结束，没有保存（稍后重试）".to_string(),
+            |lang| settings::describe_edit_error(&EditError::LockBusy, path, lang),
             json!({"file": path.display().to_string()}),
         ),
         Err(EditError::Io(e)) => {
-            eprintln!("保存配置失败: {e}");
+            eprintln!("{}", text::save_error(current(), &e));
             crate::util::exit(EXIT_FAILED as i32)
         }
     };
@@ -409,12 +414,12 @@ async fn write(path: &Path, change: Change, json: bool) {
         return;
     }
     if applied.changed {
-        println!("已保存到 {}", applied.file.display());
+        println!("{}", text::saved(current(), applied.file.display()));
     } else {
-        println!("没有变化: {}", applied.file.display());
+        println!("{}", text::unchanged(current(), applied.file.display()));
     }
     if !ports.is_empty() {
-        eprintln!("运行中的实例要重启才用上这次改动:");
+        eprintln!("{}", text::restart(current()));
         for port in ports {
             eprintln!("  aproxy restart {port}");
         }
@@ -454,15 +459,15 @@ fn print_diagnostics(diagnostics: &[aproxy_ipc::diag::Diagnostic]) {
     }
 }
 
-/// 来源的中文说法（展示在每个值后面）。
+/// 来源的终端说法（展示在每个值后面）。
 fn source_label(source: Option<Source>) -> &'static str {
     match source {
-        Some(Source::Override) => "命令行",
+        Some(Source::Override) => text::command_line(current()),
         Some(Source::Toml) => "config.toml",
-        Some(Source::Settings) => "settings.json 全局默认",
-        Some(Source::Env) => "环境变量",
-        Some(Source::Default) => "内置默认",
-        None => "未设置",
+        Some(Source::Settings) => text::global(current()),
+        Some(Source::Env) => text::environment(current()),
+        Some(Source::Default) => text::builtin(current()),
+        None => text::not_set(current()),
     }
 }
 
@@ -471,30 +476,35 @@ fn print_effective(path: &Path, resolved: &config::Resolved) {
     let cfg = &resolved.config;
     let line = |key: &str, value: String| {
         println!(
-            "{key:<26} = {value}  （{}）",
-            source_label(resolved.sources.get(key).copied())
+            "{}",
+            text::value(
+                current(),
+                key,
+                &value,
+                source_label(resolved.sources.get(key).copied())
+            )
         );
     };
     let quoted = |s: &str| format!("\"{s}\"");
-    let optional = |v: Option<String>| v.unwrap_or_else(|| "(未设置)".to_string());
+    let optional = |v: Option<String>| v.unwrap_or_else(|| text::unset(current()).to_string());
     // 0 在这几个键上有特别的含义，写在值后面
     let with_zero = |n: u64, zero: &str| {
         if n == 0 {
-            format!("0（{zero}）")
+            text::zero(current(), zero)
         } else {
             n.to_string()
         }
     };
     let list = |items: &[String], empty: &str| {
         if items.is_empty() {
-            format!("[]（{empty}）")
+            text::empty_list(current(), empty)
         } else {
             // 原样列出（不用 {:?}：Debug 会把正则里的 \? 写成 \\?，对照 toml 会被误导）
             format!("[{}]", items.join(", "))
         }
     };
 
-    println!("配置文件: {}", path.display());
+    println!("{}", text::file(current(), path.display()));
     line("base_url", quoted(&aproxy_ipc::redact::url(&cfg.base_url)));
     line("listen_addr", quoted(&cfg.listen_addr));
     line(
@@ -504,7 +514,7 @@ fn print_effective(path: &Path, resolved: &config::Resolved) {
     line(
         "delivery",
         if cfg.forward_only_enabled() {
-            "\"forward\"（边收边转：不缓冲、不重试）".to_string()
+            text::forward(current()).to_string()
         } else {
             "\"retry\"".to_string()
         },
@@ -513,60 +523,54 @@ fn print_effective(path: &Path, resolved: &config::Resolved) {
         "max_request_mb",
         with_zero(
             cfg.max_body_mb.unwrap_or(config::DEFAULT_MAX_BODY_MB),
-            "不设限",
+            text::unlimited(current()),
         ),
     );
-    line("max_response_mb", with_zero(cfg.spool_limit_mb, "不设限"));
+    line(
+        "max_response_mb",
+        with_zero(cfg.spool_limit_mb, text::unlimited(current())),
+    );
     line("disk_cache", cfg.disk_cache_enabled().to_string());
     line(
         "allowed_hosts",
-        list(
-            cfg.allowed_hosts(),
-            "内置默认：回环监听只放行 localhost / 127.0.0.1 / [::1]",
-        ),
+        list(cfg.allowed_hosts(), text::local_hosts(current())),
     );
     line(
         "allowed_origins",
-        list(
-            cfg.allowed_origins(),
-            "内置默认：拒绝一切携带 Origin 的浏览器请求",
-        ),
+        list(cfg.allowed_origins(), text::no_origins(current())),
     );
     line(
         "log_file",
         optional(cfg.log_file.clone())
             + if cfg.log_file.is_none() {
-                "（~/.aproxy/logs/ 下按启动随机命名，实际路径看 aproxy status）"
+                text::log_path(current())
             } else {
                 ""
             },
     );
     line(
         "timeouts.connect_secs",
-        with_zero(cfg.connect_timeout_secs, "不设限"),
+        with_zero(cfg.connect_timeout_secs, text::unlimited(current())),
     );
     line(
         "timeouts.first_byte_secs",
-        with_zero(cfg.first_byte_timeout_secs, "不设限"),
+        with_zero(cfg.first_byte_timeout_secs, text::unlimited(current())),
     );
     line(
         "timeouts.read_idle_secs",
-        with_zero(cfg.read_timeout_secs, "不设限"),
+        with_zero(cfg.read_timeout_secs, text::unlimited(current())),
     );
     line(
         "history.body_budget_mb",
-        with_zero(cfg.history_body_budget_mb, "不保留请求体与响应体"),
+        with_zero(cfg.history_body_budget_mb, text::no_bodies(current())),
     );
     line(
         "keepalive.interval_secs",
-        with_zero(cfg.keepalive_interval_secs, "保活关闭"),
+        with_zero(cfg.keepalive_interval_secs, text::no_keepalive(current())),
     );
     line(
         "keepalive.trigger",
-        format!(
-            "\"{}\"（accept=看 Accept 头 / body_stream=看请求体 stream:true / any=任一）",
-            cfg.keepalive_trigger().as_str()
-        ),
+        text::keepalive(current(), cfg.keepalive_trigger().as_str()),
     );
     // 心跳字节通常含换行：按字符串字面量形式（{:?}）打印，换行显示为 `\n`，与 toml 里的
     // 写法一一对应
@@ -576,29 +580,29 @@ fn print_effective(path: &Path, resolved: &config::Resolved) {
     );
     line(
         "retry.max_backoff_secs",
-        with_zero(cfg.max_retry_backoff_secs, "所有重试零延迟"),
+        with_zero(cfg.max_retry_backoff_secs, text::no_delay(current())),
     );
     line(
         "retry.rules",
         if cfg.retry_rules.is_empty() {
-            "[]（一切请求无限重试）".to_string()
+            text::no_rules(current()).to_string()
         } else {
-            format!("{} 条", cfg.retry_rules.len())
+            text::rules(current(), cfg.retry_rules.len())
         },
     );
     for (index, rule) in cfg.retry_rules.iter().enumerate() {
-        let path = rule.path.as_deref().unwrap_or("(任何路径)");
+        let path = rule.path.as_deref().unwrap_or(text::any_path(current()));
         let status = match &rule.status {
             Some(codes) => codes
                 .iter()
                 .map(u16::to_string)
                 .collect::<Vec<_>>()
                 .join(","),
-            None => "(任何状态码)".to_string(),
+            None => text::any_status(current()).to_string(),
         };
         let limit = match rule.max_attempts {
-            0 => "不限（豁免）".to_string(),
-            n => format!("第 {n} 次失败后透传"),
+            0 => text::exempt(current()).to_string(),
+            n => text::after(current(), n),
         };
         println!("  {}. path = {path}  status = {status}  {limit}", index + 1);
     }
@@ -614,7 +618,7 @@ fn print_effective(path: &Path, resolved: &config::Resolved) {
             .map(|s| s.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        println!("format \"{}\"（{stage} 阶段）:", t.name);
+        println!("{}", text::stage(current(), &t.name, &stage));
         println!("  command          = \"{}\"", t.command);
         if !t.args.is_empty() {
             // 多 key 轮换类 format 常把 key 直接写在 args 里
@@ -626,22 +630,28 @@ fn print_effective(path: &Path, resolved: &config::Resolved) {
         if !t.env.is_empty() {
             // 环境变量的值只写不读：只列名字
             let names: Vec<&str> = t.env.keys().map(String::as_str).collect();
-            println!("  env              = {}（值不显示）", names.join(", "));
+            println!("{}", text::env_names(current(), &names.join(", ")));
         }
         match t.process {
             config::file::Process::Spawn => {
-                println!("  process          = spawn（每条消息起一个进程）")
+                println!("{}", text::spawn(current()))
             }
             config::file::Process::Persistent => println!(
-                "  process          = persistent（进程池 pool_max={}，空闲 {}）",
-                t.pool_max,
-                match t.worker_idle_secs {
-                    0 => "永不回收".to_string(),
-                    secs => format!("{secs}s 后回收"),
-                }
+                "{}",
+                text::pool(
+                    current(),
+                    t.pool_max,
+                    &match t.worker_idle_secs {
+                        0 => text::never(current()).to_owned(),
+                        secs => text::reap(current(), secs),
+                    }
+                )
             ),
         }
-        println!("  timeout_secs     = {}", with_zero(t.timeout_secs, "不限"));
+        println!(
+            "  timeout_secs     = {}",
+            with_zero(t.timeout_secs, text::no_limit(current()))
+        );
     }
 
     line(
@@ -658,7 +668,7 @@ fn print_effective(path: &Path, resolved: &config::Resolved) {
         ("override_headers", &cfg.override_headers),
     ] {
         if headers.is_empty() {
-            println!("{table:<26} = (空)");
+            println!("{}", text::empty_table(current(), table));
             continue;
         }
         println!("{table}:");
@@ -675,7 +685,10 @@ fn print_effective(path: &Path, resolved: &config::Resolved) {
             } else {
                 quoted(&headers[name])
             };
-            println!("  {name} = {value}  （{}）", source_label(source));
+            println!(
+                "{}",
+                text::header(current(), name, &value, source_label(source))
+            );
         }
     }
 }

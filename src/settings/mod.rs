@@ -10,6 +10,9 @@
 //! `watchdog.enabled`、`logs.rotate_mb`、`instances.idle_threshold_secs`、`update.*`）；
 //! 对应关系见 [`file::parse`]。
 
+#[path = "../i18n/settings_edit.rs"]
+mod edit_text;
+use aproxy_ipc::i18n::Lang;
 pub mod edit;
 pub mod file;
 
@@ -270,16 +273,20 @@ pub fn default_config_path_for(settings: &Settings, home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join("config.toml"))
 }
 
-/// 把一组改动写进本 home 的 settings.json（见 [`edit::apply`]）。失败时 Err 是给用户看的
-/// 完整说明。
-pub fn update(changes: &[edit::Change]) -> Result<crate::config::edit::Applied, String> {
+/// 把一组改动写进本 home 的 settings.json（见 [`edit::apply`]）。保留错误分类，供显示端选择语言和修复提示。
+pub fn update(
+    changes: &[edit::Change],
+) -> Result<crate::config::edit::Applied, crate::config::edit::EditError> {
     let path = settings_path();
     edit::apply(&path, &crate::config::config_dir(), changes)
-        .map_err(|e| describe_edit_error(&e, &path))
 }
 
 /// 写 settings.json 失败的原因，写成给用户看的话。
-pub fn describe_edit_error(error: &crate::config::edit::EditError, path: &Path) -> String {
+pub fn describe_edit_error(
+    error: &crate::config::edit::EditError,
+    path: &Path,
+    lang: Lang,
+) -> String {
     use crate::config::edit::EditError;
     let list = |diagnostics: &[Diagnostic]| {
         diagnostics
@@ -288,28 +295,12 @@ pub fn describe_edit_error(error: &crate::config::edit::EditError, path: &Path) 
             .collect::<String>()
     };
     match error {
-        EditError::BadKey(key) => format!(
-            "键路径写法不对: {key}（点号分隔，例如 watchdog.enabled、aliases.work、defaults.extra_headers.\"x-foo\"）"
-        ),
-        EditError::Syntax(diagnostics) => format!(
-            "settings.json 现在读不懂，没有修改（请先手工修复或删除 {}）:{}",
-            path.display(),
-            list(diagnostics)
-        ),
-        EditError::Invalid(diagnostics) => {
-            format!(
-                "这次修改会让 settings.json 无效，没有保存:{}",
-                list(diagnostics)
-            )
-        }
-        EditError::Conflict => format!(
-            "settings.json 一直在被别的程序修改，没有保存（关掉正在编辑它的程序后重试）: {}",
-            path.display()
-        ),
-        EditError::LockBusy => {
-            "另一个 aproxy 正在写配置，等了 10 秒仍未结束，没有保存（稍后重试）".to_string()
-        }
-        EditError::Io(e) => format!("保存 settings.json 失败: {e}"),
+        EditError::BadKey(key) => edit_text::bad_key(lang, key),
+        EditError::Syntax(items) => edit_text::syntax(lang, path.display(), &list(items)),
+        EditError::Invalid(items) => edit_text::invalid(lang, &list(items)),
+        EditError::Conflict => edit_text::conflict(lang, path.display()),
+        EditError::LockBusy => edit_text::locked(lang).to_owned(),
+        EditError::Io(e) => edit_text::save(lang, e),
     }
 }
 
@@ -358,47 +349,51 @@ pub fn path_match_key(p: &str) -> String {
 /// 别名合法性与保留字冲突：纯数字会被 start/stop 当端口解析；all/idle/default
 /// 是 start/stop/status 的保留目标，均禁止作为别名（"defult" 一并拒绝并提示
 /// 正确拼写，避免用户注册后实际无法按预期解析）。
-pub fn validate_alias_name(name: &str) -> Result<(), String> {
+pub fn validate_alias_name(name: &str) -> Result<(), AliasNameProblem> {
     if name.trim().is_empty() {
-        return Err("别名不能为空".to_string());
+        return Err(AliasNameProblem::Empty);
     }
     if name.parse::<u16>().is_ok() {
-        return Err("别名不能是纯数字（会与端口号解析冲突）".to_string());
-    }
-    let lower = name.to_ascii_lowercase();
-    let reserved: &[(&str, &str)] = &[
-        ("all", "\"all\" 是 stop 的保留目标（停止全部实例）"),
-        ("idle", "\"idle\" 是 stop/status 的保留目标（空闲实例筛选）"),
-        (
-            "default",
-            "\"default\" 指代默认配置文件（settings 的 default_config），是保留字",
-        ),
-        (
-            "defult",
-            "\"defult\" 是 \"default\" 的常见笔误，两者都保留以免混淆",
-        ),
-    ];
-    for (word, why) in reserved {
-        if lower == *word {
-            return Err(format!("{why}，不能用作别名"));
-        }
-    }
-    Ok(())
-}
-
-/// 一个名字不能当别名的原因（一句英文，给诊断用）；可以用时为 None。规则同
-/// [`validate_alias_name`]。
-pub fn alias_name_problem(name: &str) -> Option<&'static str> {
-    if name.trim().is_empty() {
-        return Some("it is empty");
-    }
-    if name.parse::<u16>().is_ok() {
-        return Some("a number is read as a port");
+        return Err(AliasNameProblem::Numeric);
     }
     match name.to_ascii_lowercase().as_str() {
-        "all" | "idle" => Some("it is a reserved target of stop and status"),
-        "default" | "defult" => Some("it is reserved for the default config"),
-        _ => None,
+        "all" => Err(AliasNameProblem::All),
+        "idle" => Err(AliasNameProblem::Idle),
+        "default" => Err(AliasNameProblem::Default),
+        "defult" => Err(AliasNameProblem::Typo),
+        _ => Ok(()),
+    }
+}
+
+/// 名字被拒绝的具体原因；别名命令和设置诊断共用判定，但一个写终端、一个还要写文档。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasNameProblem {
+    /// 缺少名字。
+    Empty,
+    /// 能按端口解析的数值。
+    Numeric,
+    /// 全部实例。
+    All,
+    /// 闲置实例。
+    Idle,
+    /// 默认配置。
+    Default,
+    /// 默认配置的保留变体。
+    Typo,
+}
+
+impl AliasNameProblem {
+    /// 不从错误文字还原保留目标；同一枚举可由不同语言的接收端显示。
+    pub fn render(self, lang: Lang) -> String {
+        let why = match self {
+            Self::Empty => return edit_text::empty_name(lang).into(),
+            Self::Numeric => return edit_text::numeric_name(lang).into(),
+            Self::All => edit_text::all(lang),
+            Self::Idle => edit_text::idle(lang),
+            Self::Default => edit_text::default_name(lang),
+            Self::Typo => edit_text::typo(lang),
+        };
+        edit_text::reserved(lang, why)
     }
 }
 
@@ -663,11 +658,16 @@ mod tests {
 
     #[test]
     fn alias_name_problems_match_the_validator() {
+        let read_alias_error = |name: &str| {
+            let input = serde_json::json!({"aliases": {name: "config.toml"}});
+            let (_, diagnostics) = file::parse(&input.to_string(), Path::new("settings.json"));
+            diagnostics.iter().any(|d| d.is_error())
+        };
         for name in [
             "", " ", "12345", "all", "IDLE", "default", "Defult", "work", "my-relay",
         ] {
             assert_eq!(
-                alias_name_problem(name).is_some(),
+                read_alias_error(name),
                 validate_alias_name(name).is_err(),
                 "{name:?}"
             );

@@ -312,7 +312,7 @@ fn force_install_stops_everything_swaps_and_restores() {
     assert_ne!(back.pid, instance.pid);
     // restore 的输出经文件转写到强制安装自己的输出里
     assert!(
-        output.contains(&format!("已恢复 pid {}", back.pid)),
+        output.contains(&format!("Restored pid {}", back.pid)),
         "{output}"
     );
     let image = aproxy::process::process_image_path(back.pid).expect("新实例的镜像路径可查");

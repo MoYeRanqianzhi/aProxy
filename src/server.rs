@@ -16,6 +16,7 @@ use aproxy::spawn::startup::{LaunchReason, LaunchReport};
 use aproxy::watchdog;
 use aproxy_ipc::i18n::{Lang, current};
 
+use crate::commands::start::text;
 use crate::util::chrono_like_timestamp;
 
 /// 本进程守护日志的最终路径（resolve + init 后写入，serve_forever 读取）。
@@ -410,10 +411,13 @@ pub(crate) async fn serve_forever(
         tracing::info!(format=%state.history.secrets().replace(&entry.name),"format enabled");
     }
     if !daemon_child {
-        println!("aProxy 已启动（前台）");
-        println!("  监听: http://{actual_addr}");
-        println!("  Base URL: {}", aproxy_ipc::redact::url(&base_url));
-        println!("按 Ctrl+C 退出。");
+        println!("{}", text::foreground(current()));
+        println!("{}", text::listen(current(), &actual_addr));
+        println!(
+            "{}",
+            text::base(current(), &aproxy_ipc::redact::url(&base_url))
+        );
+        println!("{}", text::quit(current()));
     }
 
     if state.serve_until_stopped(listener, app, stopping).await {

@@ -733,3 +733,38 @@ fn log_replay_is_independent_of_notice_language() {
         assert!(String::from_utf8(status.stdout).unwrap().contains(pending));
     }
 }
+
+/// 同一空目录在终端按读者语言解释启动失败和恢复结果，机器文档不取终端说明。
+#[test]
+fn start_and_restore_choose_language_only_for_the_terminal() {
+    let home = TestHome::new();
+    let run = |language, args: &[&str]| {
+        home.cmd()
+            .env("APROXY_LANG", language)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let target = "absent-alias";
+    for (lang, missing, none) in [
+        (
+            "en",
+            "Unknown alias or configuration file",
+            "No instances to restore.",
+        ),
+        ("zh-CN", "未知的别名或配置文件", "没有需要恢复的实例。"),
+    ] {
+        let f = run(lang, &["start", target]);
+        assert_eq!(f.status.code(), Some(4));
+        assert!(f.stdout.is_empty() && String::from_utf8(f.stderr).unwrap().contains(missing));
+        let r = run(lang, &["restore"]);
+        assert!(r.status.success() && String::from_utf8(r.stdout).unwrap().contains(none));
+    }
+    let args = ["start", target, "--json"];
+    let en = run("en", &args);
+    let zh = run("zh-CN", &args);
+    assert_eq!(en.status.code(), Some(4));
+    assert_eq!(en.status.code(), zh.status.code());
+    assert_eq!(en.stdout, zh.stdout);
+    assert_eq!(document(&zh)["error"]["details"]["target"], target);
+}

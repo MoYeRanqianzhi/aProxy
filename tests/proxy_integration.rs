@@ -5052,7 +5052,10 @@ fn daemon_without_its_control_endpoint_exits_without_registering() {
     assert!(!exit.success());
     let startup =
         std::fs::read_to_string(home.path().join("logs").join("startup.log")).unwrap_or_default();
-    assert!(startup.contains("Cannot create control channel"), "startup.log: {startup}");
+    assert!(
+        startup.contains("Cannot create control channel"),
+        "startup.log: {startup}"
+    );
     let record = aproxy::daemon::read_instance_file_in(&run_dir, &port.to_string())
         .expect("前者的注册记录应还在");
     assert_eq!(record.pid, pid_a, "后来者不得覆盖前者的注册记录");
@@ -5094,7 +5097,7 @@ fn cli_config_show_rejects_missing_explicit_file() {
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains("does not exist"),
+            stderr.contains("nope.toml"),
             "stderr 应提示文件不存在，实际: {stderr}"
         );
     }
@@ -5348,7 +5351,7 @@ fn start_parent_command_output_returns() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("已在后台启动"),
+        stdout.contains("started in the background"),
         "start 父进程应报告后台启动，实际: {stdout}"
     );
 }
@@ -5609,7 +5612,7 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     assert!(out.status.success(), "restore 应成功");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("已恢复") && stdout.contains(&port_str),
+        stdout.contains("Restored pid") && stdout.contains(&port_str),
         "restore 应恢复实例: {stdout}"
     );
     // 就绪等待必须按隔离 home 的 run 目录寻址（unix 的 UDS 在其中），见
@@ -5622,7 +5625,7 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains(&format!("端口 {port} 已在运行，跳过")),
+        stdout.contains(&format!("Port {port} is already running. Skipping.")),
         "幂等跳过本端口: {stdout}"
     );
 
@@ -5634,7 +5637,7 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     assert!(out.status.success(), "restore 应静默成功（空目录）");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        !stdout.contains("已恢复") || !stdout.contains(&port_str),
+        !stdout.contains("Restored pid") || !stdout.contains(&port_str),
         "本端口已无记录，不应再被恢复: {stdout}"
     );
 }
@@ -5788,7 +5791,10 @@ fn alias_start_and_stop_roundtrip() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("已在后台启动"), "实际: {stdout}");
+    assert!(
+        stdout.contains("started in the background"),
+        "实际: {stdout}"
+    );
     // 就绪：隔离 home 的 IPC 寻址（unix UDS 在 home/run/ 下）
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -5859,7 +5865,10 @@ fn alias_errors_on_unknown_names() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(text.contains("未知的别名或配置文件"), "实际: {text}");
+    assert!(
+        text.contains("Unknown alias or configuration file"),
+        "实际: {text}"
+    );
 
     // stop 未知别名：报错
     let out = home.cmd().args(["stop", &unknown]).output().unwrap();
@@ -5902,7 +5911,7 @@ fn alias_errors_on_unknown_names() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        text.contains("Configuration file does not exist"),
+        text.contains("Configuration file not found"),
         "实际: {text}"
     );
 
@@ -5941,7 +5950,7 @@ fn tilde_expands_to_the_c1_user_dir() {
     let expected = user.path().join("no-such-config.toml");
     assert!(
         stderr.contains(&format!(
-            "Configuration file does not exist: {}",
+            "Configuration file not found: {}",
             expected.display()
         )),
         "实际: {stderr}"
@@ -6848,7 +6857,7 @@ fn credentials_masked_in_start_output_registry_and_daemon_log() {
         "start 输出泄露 base_url 凭据:\n{stdout}"
     );
     assert!(
-        stdout.contains("完整透传到 http://***@127.0.0.1"),
+        stdout.contains("forwarded unchanged to http://***@127.0.0.1"),
         "透传提示行应以脱敏形态展示 base_url:\n{stdout}"
     );
 
@@ -7018,7 +7027,7 @@ fn non_loopback_listen_warns_on_start_and_in_startup_log() {
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(!out.status.success(), "192.0.2.1 不可绑定，start 应失败");
     assert!(
-        stderr.contains("不是回环地址") && stderr.contains("共享给整个局域网"),
+        stderr.contains("not a loopback address") && stderr.contains("at your expense"),
         "配了 api_key 的非回环监听应以重措辞告警:\n{stderr}"
     );
     assert!(!stderr.contains("sk-LANSECRET"), "告警不得带出 key");
@@ -7048,7 +7057,8 @@ fn non_loopback_listen_warns_on_start_and_in_startup_log() {
     let startup_log =
         std::fs::read_to_string(home.path().join("logs").join("startup.log")).unwrap();
     assert!(
-        startup_log.contains("警告: 监听地址 192.0.2.1:46123 不是回环地址"),
+        startup_log
+            .contains("Warning: Listening address 192.0.2.1:46123 is not a loopback address"),
         "startup.log 应留下非回环告警:\n{startup_log}"
     );
     assert!(!startup_log.contains("sk-LANSECRET"));

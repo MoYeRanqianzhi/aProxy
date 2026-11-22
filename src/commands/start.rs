@@ -5,6 +5,10 @@
 //! `aproxy::ops::start`，这里把它们串起来并把结果说给用户；服务本身由
 //! `crate::server::serve_forever` 承载（后台实例经 [`handle_serve_cmd`] 进入其中）。
 
+#[path = "../i18n/start.rs"]
+pub(crate) mod text;
+use aproxy_ipc::i18n::current;
+
 use std::path::{Path, PathBuf};
 
 use aproxy::cli::StartArgs;
@@ -42,17 +46,20 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) -> u8 {
     let target = args.target.clone();
     // 给了 target 就不需要默认配置——失效的 default_config 只拦无 target 的启动
     let cfg_path = match target.as_deref() {
-        None => match super::resolve_cfg_path(args.config.as_deref()) { Ok(path) => path, Err(f) => return f.report(json) },
+        None => match super::resolve_cfg_path(args.config.as_deref()) {
+            Ok(path) => path,
+            Err(f) => return f.report(json),
+        },
         Some(t) => match resolve_config_target(t) {
             Some(p) => p,
-            None => return Failure::new(
-                "target_not_found",
-                format!(
-                    "未知的别名或配置文件: {t}\n用 aproxy alias list 查看已有别名，或 aproxy alias add {t} <路径> 添加"
-                ),
-                json!({"target": t}),
-            )
-            .report(json),
+            None => {
+                return Failure::rendered(
+                    "target_not_found",
+                    |lang| text::unknown(lang, t),
+                    json!({"target": t}),
+                )
+                .report(json);
+            }
         },
     };
     // 这个实例有没有配置文件：命令行指定的、别名或路径给出的，必须在（打错路径时明确
@@ -70,8 +77,8 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) -> u8 {
 
     // 非回环监听告警（不阻断启动——对外开放可能正是用户的意图）。后台实例自己还会把它
     // 写进日志与 startup.log，见 handle_serve_cmd
-    if let Some(w) = cfg.listen_exposure_warning() {
-        eprintln!("警告: {w}");
+    if let Some(w) = cfg.listen_exposure_warning(current()) {
+        eprintln!("{}", super::config_text::warning(current(), &w));
     }
 
     // 端口预检（见 aproxy::ops::start::preflight）：同端口同地址已有本 home 的实例就不
@@ -83,40 +90,47 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) -> u8 {
                 print_doc(start_document("started", &info));
             } else {
                 println!(
-                    "Instance ready: pid {} at {}",
-                    info.instance.pid, info.instance.listen_addr
+                    "{}",
+                    text::ready(current(), info.instance.pid, &info.instance.listen_addr)
                 );
             }
             return 0;
         }
-        Err(PreflightError::Startup(e)) => return super::spawn_failure(&e, |lang| e.render(lang)).report(json),
+        Err(PreflightError::Startup(e)) => {
+            return super::spawn_failure(&e, |lang| e.render(lang)).report(json);
+        }
         Ok(Preflight::AlreadyRunning(info)) => {
             if json {
                 print_doc(start_document("already_running", &info));
                 return 0;
             }
-            println!("此端口已有 aProxy 在运行，无需重复启动：");
+            println!("{}", text::already(current()));
             println!(
-                "  pid {}  监听 http://{}  v{}",
-                info.instance.pid, info.instance.listen_addr, info.instance.version
+                "{}",
+                text::existing(
+                    current(),
+                    info.instance.pid,
+                    &info.instance.listen_addr,
+                    &info.instance.version
+                )
             );
-            println!("查看实例: aproxy status    停止: aproxy stop {port}");
+            println!("{}", text::manage(current(), &port));
             return 0;
         }
         Err(PreflightError::PortHeldByOtherAddress {
             port,
             listen_addr,
             other_listen_addr,
-        }) => return Failure::new(
-            "port_in_use",
-            format!(
-                "端口 {port} 已被监听地址 {other_listen_addr} 的 aProxy 实例使用（本进程将监听 {listen_addr}），两者不能并存。\n实例按端口号区分，请为其中一个更换监听地址/端口。"
-            ),
-            json!({"port": port_value(&port), "owner": "aproxy"}),
-        )
-        .report(json),
+        }) => {
+            return Failure::rendered(
+                "port_in_use",
+                |lang| text::other_address(lang, &port, &other_listen_addr, &listen_addr),
+                json!({"port": port_value(&port), "owner": "aproxy"}),
+            )
+            .report(json);
+        }
         Err(PreflightError::Bind { listen_addr, error }) => {
-            return super::bind_failure(&listen_addr, &error).report(json)
+            return super::bind_failure(&listen_addr, &error).report(json);
         }
     }
 
@@ -135,7 +149,7 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) -> u8 {
     // 里的代理变量都记在规格里，以后 restart、restore、看护者重拉用的是同一份。子进程提前
     // 退出时立即报告，附上 startup.log 本次新增的内容（子进程没有控制台，配置错误、绑定
     // 失败的原因只写在那里）。日志文件名在这里生成一次，重拉之后续写同一个文件
-    let exe = std::env::current_exe().expect("无法定位自身可执行文件");
+    let exe = std::env::current_exe().expect("cannot locate the current executable");
     let log_path = crate::server::resolve_daemon_log_path(cfg.log_file.as_deref());
     let spec = spec::capture(cfg_file, overrides, &log_path);
     let info = match launch(&exe, &spec).await {
@@ -151,37 +165,37 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) -> u8 {
         print_doc(start_document("started", &info));
         return 0;
     }
-    let actual_port = daemon::port_of(&info.instance.listen_addr).to_string();
-    println!("aProxy 已在后台启动");
+    let port = daemon::port_of(&info.instance.listen_addr).to_string();
+    println!("{}", text::started(current()));
     println!("  pid: {}", info.instance.pid);
-    println!("  监听: http://{}", info.instance.listen_addr);
-    println!("  Base URL: {}", aproxy_ipc::redact::url(&cfg.base_url));
+    println!("{}", text::listen(current(), &info.instance.listen_addr));
+    println!(
+        "{}",
+        text::base(current(), &aproxy_ipc::redact::url(&cfg.base_url))
+    );
     if !cfg.base_url.is_empty() {
         // 与上一行同一出口：这一行同样会被整段粘贴求助
         let base = aproxy_ipc::redact::url(cfg.base_url.trim_end_matches('/'));
-        println!(
-            "  提示: 将你的 API base URL 指向 http://{}",
-            info.instance.listen_addr
-        );
-        println!("        上游路径与查询参数将完整透传到 {base}/<path>?<query>");
+        println!("{}", text::client(current(), &info.instance.listen_addr));
+        println!("{}", text::upstream(current(), &base));
     }
     // 仅转发模式是放弃重试保障的取舍，启动提示里必须显式说出来
     // （父进程的 cfg 已完成 settings 注入，取值与后台实例一致）
     if cfg.forward_only_enabled() {
-        println!("  仅转发模式：不缓冲、不重试");
+        println!("{}", text::forward(current()));
     }
     // 外部转换器改变了「原样透传」的承诺，启动提示必须显式说出来
     if !cfg.formats.is_empty() {
-        println!("  Format programs: {}", cfg.formats.len());
+        println!("{}", text::formats(current(), cfg.formats.len()));
     }
     match cfg_file {
-        Some(path) => println!("  配置: {}", path.display()),
-        None => println!("  配置: （没有配置文件，使用命令行参数与全局默认）"),
+        Some(path) => println!("{}", text::config(current(), path.display())),
+        None => println!("{}", text::no_config(current())),
     }
     if let Some(log_path) = &info.instance.log_path {
-        println!("  日志: {log_path}");
+        println!("{}", text::log(current(), log_path));
     }
-    println!("查看实例: aproxy status    停止: aproxy stop {actual_port}");
+    println!("{}", text::manage(current(), &port));
     0
 }
 
@@ -270,9 +284,12 @@ pub(crate) async fn handle_serve_cmd(spec_path: &Path) -> u8 {
     }
     // 重拉、restore、安装的滚动重启拉起的实例没有人在看控制台，startup.log 是这些启动
     // 唯一的留痕处
-    if let Some(w) = cfg.listen_exposure_warning() {
+    if let Some(w) = cfg.listen_exposure_warning(aproxy_ipc::i18n::Lang::En) {
         tracing::warn!("{w}");
-        report_config_error(&format!("警告: {w}"), true);
+        report_config_error(
+            &super::config_text::warning(aproxy_ipc::i18n::Lang::En, &w),
+            true,
+        );
     }
     if let Err(failure) = serve_forever(cfg, cfg_file, Some(spec)).await {
         let e = match failure {

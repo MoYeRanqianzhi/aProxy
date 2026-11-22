@@ -23,6 +23,9 @@ pub mod file;
 pub mod resolve;
 pub mod view;
 
+#[path = "../i18n/exposure.rs"]
+mod text;
+
 use aproxy_ipc::i18n::diagnostic::Reason;
 use std::{collections::HashMap, path::PathBuf};
 
@@ -697,20 +700,16 @@ impl Config {
 
     /// 非回环监听的告警文案；回环监听返回 None。start 输出、守护的
     /// startup.log 共用这一份文案；体检按相同的监听与凭据判定给出结构化诊断。
-    pub fn listen_exposure_warning(&self) -> Option<String> {
+    pub fn listen_exposure_warning(&self, lang: aproxy_ipc::i18n::Lang) -> Option<String> {
         if self.listen_is_loopback() {
             return None;
         }
         let addr = &self.listen_addr;
         let port = addr.rsplit(':').next().unwrap_or("12345");
         Some(if self.injects_credentials() {
-            format!(
-                "监听地址 {addr} 不是回环地址，且本实例配置了 api_key（或 Authorization / x-api-key 鉴权头）：代理会把它注入每一个入站请求——任何能连到该端口的主机都能用你的 key 调用上游、费用记在你的账上，等于把 key 共享给整个局域网。只给本机用请改回 127.0.0.1:{port}"
-            )
+            text::credentials(lang, addr, port)
         } else {
-            format!(
-                "监听地址 {addr} 不是回环地址：局域网/同网段内任何能连到该端口的主机都能经本代理访问上游。只给本机用请改回 127.0.0.1:{port}；确需对外开放请只在可信网络中使用"
-            )
+            text::exposed(lang, addr, port)
         })
     }
 }
@@ -1074,7 +1073,9 @@ mod tests {
     fn listen_exposure_warning_escalates_with_credentials() {
         let loopback = Config::default();
         assert!(
-            loopback.listen_exposure_warning().is_none(),
+            loopback
+                .listen_exposure_warning(aproxy_ipc::i18n::Lang::En)
+                .is_none(),
             "回环监听不告警"
         );
 
@@ -1082,7 +1083,9 @@ mod tests {
             listen_addr: "0.0.0.0:12345".to_string(),
             ..Default::default()
         };
-        let w = open.listen_exposure_warning().expect("非回环必须告警");
+        let w = open
+            .listen_exposure_warning(aproxy_ipc::i18n::Lang::En)
+            .expect("非回环必须告警");
         assert!(
             w.contains("0.0.0.0:12345") && w.contains("127.0.0.1:12345"),
             "{w}"
@@ -1094,9 +1097,11 @@ mod tests {
             api_key: Some("sk-test".to_string()),
             ..open.clone()
         };
-        let w = with_key.listen_exposure_warning().unwrap();
+        let w = with_key
+            .listen_exposure_warning(aproxy_ipc::i18n::Lang::En)
+            .unwrap();
         assert!(
-            w.contains("api_key") && w.contains("共享给整个局域网"),
+            w.contains("api_key") && w.contains("at your expense"),
             "{w}"
         );
         assert!(!w.contains("sk-test"), "告警文案不得带出 key 本身: {w}");
@@ -1108,9 +1113,9 @@ mod tests {
         };
         assert!(
             with_header
-                .listen_exposure_warning()
+                .listen_exposure_warning(aproxy_ipc::i18n::Lang::En)
                 .unwrap()
-                .contains("共享给整个局域网")
+                .contains("at your expense")
         );
     }
 

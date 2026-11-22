@@ -774,9 +774,9 @@ fn restore_onto_changed_port_retires_old_record() {
     let out = run_cli(&test_home, &exe, &["restore"]);
     let stdout = text(&out.stdout);
     assert!(
-        stdout.contains("已恢复")
+        stdout.contains("Restored pid")
             && stdout.contains(&port_b.to_string())
-            && stdout.contains("原端口的记录已由新端口接替"),
+            && stdout.contains("the record now belongs to the new port"),
         "restore 应报告实际端口并清理旧记录: {stdout}{}",
         text(&out.stderr)
     );
@@ -792,7 +792,7 @@ fn restore_onto_changed_port_retires_old_record() {
     assert!(out.status.success(), "stop 新端口应成功");
     let out = run_cli(&test_home, &exe, &["restore"]);
     assert!(
-        text(&out.stdout).contains("没有需要恢复的实例"),
+        text(&out.stdout).contains("No instances to restore"),
         "stop 后不应再有可恢复的实例: {}",
         text(&out.stdout)
     );
@@ -859,7 +859,7 @@ fn concurrent_start_with_release_asset_name_converges_to_one_watchdog() {
         let stdout = text(&out.stdout);
         let stderr = text(&out.stderr);
         assert!(
-            out.status.success() && stdout.contains("已在后台启动"),
+            out.status.success() && stdout.contains("started in the background"),
             "start 应成功: {stdout}{stderr}"
         );
         for line in stderr
@@ -1177,7 +1177,7 @@ fn restore_keeps_the_record_while_the_config_is_missing() {
     let out = run_cli(&test_home, &exe, &["restore"]);
     let stderr = text(&out.stderr);
     assert!(
-        stderr.contains("找不到") && stderr.contains("记录已保留"),
+        stderr.contains("not found") && stderr.contains("record is retained"),
         "应说明配置文件找不到、记录保留: {stderr}"
     );
     assert!(has_restore(home, port), "配置文件暂时不在时不得删记录");
@@ -1186,7 +1186,7 @@ fn restore_keeps_the_record_while_the_config_is_missing() {
     std::fs::rename(&parked, &cfg).unwrap();
     let out = run_cli(&test_home, &exe, &["restore"]);
     assert!(
-        text(&out.stdout).contains("已恢复"),
+        text(&out.stdout).contains("Restored pid"),
         "文件回来之后应能恢复: {}{}",
         text(&out.stdout),
         text(&out.stderr)
@@ -1214,7 +1214,7 @@ fn instance_without_a_config_file_restarts_and_restores() {
     let out = run_cli(&test_home, &exe, &["start", "--listen-addr", &listen]);
     assert!(out.status.success(), "start: {}", text(&out.stderr));
     assert!(
-        text(&out.stdout).contains("没有配置文件"),
+        text(&out.stdout).contains("no configuration file"),
         "{}",
         text(&out.stdout)
     );
@@ -1240,7 +1240,7 @@ fn instance_without_a_config_file_restarts_and_restores() {
     }));
     let out = run_cli(&test_home, &exe, &["restore"]);
     assert!(
-        text(&out.stdout).contains("已恢复"),
+        text(&out.stdout).contains("Restored pid"),
         "restore: {}{}",
         text(&out.stdout),
         text(&out.stderr)
@@ -1286,7 +1286,7 @@ fn stop_of_a_crashed_instance_deletes_its_record() {
         assert!(!has_restore(home, port), "stop {target} 应删掉记录");
         let out = run_cli(&test_home, &exe, &["restore"]);
         assert!(
-            text(&out.stdout).contains("没有需要恢复的实例"),
+            text(&out.stdout).contains("No instances to restore"),
             "stop {target} 之后 restore 不该再拉它: {}",
             text(&out.stdout)
         );

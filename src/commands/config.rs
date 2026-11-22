@@ -242,7 +242,7 @@ fn get(path: &Path, key: &str, json: bool) {
         fail(
             json,
             "target_not_found",
-            |lang| text::missing(lang, path.display()),
+            |lang| super::missing_config(lang, path),
             json!({"target": path.display().to_string()}),
         );
     };

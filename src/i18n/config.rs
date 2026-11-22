@@ -24,8 +24,6 @@ message!(bad_key(key: &str), en: "Invalid key path: {key}. Separate keys with do
 
 message!(unknown(key: &str), en: "Unknown key: {key}. Run aproxy config show --effective to list available keys.", zh: "不认识的键: {key}（aproxy config show --effective 列出全部的键）");
 
-message!(missing(path: std::path::Display<'_>), en: "Configuration file does not exist: {path}", zh: "配置文件不存在: {path}");
-
 message!(syntax(), en: "The configuration file has syntax errors:", zh: "配置文件有语法错误:");
 
 message!(cannot_get(key: &str, path: std::path::Display<'_>), en: "Cannot read {key}. Repair {path} first.", zh: "读不出 {key}：先修复 {path}");

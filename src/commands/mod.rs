@@ -309,6 +309,14 @@ pub(crate) fn port_value(port: &str) -> Value {
     port.parse::<u16>().map_or(Value::Null, |port| json!(port))
 }
 
+/// 配置、别名和启动命令用同一个原因报告找不到配置文件，JSON 也不另造一份措辞。
+pub(crate) fn missing_config(lang: Lang, path: &std::path::Path) -> String {
+    aproxy::spawn::startup::LaunchReason::Missing {
+        path: path.display().to_string(),
+    }
+    .render(lang)
+}
+
 /// 实例没能拉起来：时限内没就绪是 `ready_timeout`，其余（拉不起进程、进程起来就退出）是
 /// `start_failed`，`details` 里带 startup.log 这次新增的几行。`message` 是给人看的说明。
 pub(crate) fn spawn_failure(

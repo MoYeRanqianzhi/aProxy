@@ -3,6 +3,7 @@
 #[path = "../i18n/restore.rs"]
 mod restore_text;
 use aproxy::ops::restore::{Restore, restore_entry_in};
+use aproxy_ipc::i18n::current;
 
 use super::{Results, say};
 
@@ -19,29 +20,29 @@ pub(crate) async fn handle_restore_cmd(home: &std::path::Path, json: bool) {
     let listing = aproxy::spec::list_restore_in(&home.join("run"));
     for unreadable in &listing.unreadable {
         eprintln!(
-            "跳过读不懂的记录 {}: {}",
-            unreadable.path.display(),
-            unreadable.reason
+            "{}",
+            restore_text::skip(
+                current(),
+                unreadable.path.display(),
+                &unreadable.reason.diagnostic().render(current())
+            )
         );
     }
     let mut results = Results::new(None);
     let entries = listing.entries;
     if entries.is_empty() {
-        say(json, "没有需要恢复的实例。");
+        say(json, restore_text::none(current()));
         results.finish(json)
     }
-    let exe = std::env::current_exe().expect("无法定位自身可执行文件");
+    let exe = std::env::current_exe().expect("cannot locate the current executable");
     for entry in entries {
         match restore_entry_in(home, &entry, &exe).await {
             Restore::AlreadyRunning => {
-                say(json, format!("端口 {} 已在运行，跳过。", entry.port));
+                say(json, restore_text::running(current(), &entry.port));
                 results.ok(&entry.port, "already_running", None);
             }
             Restore::ConfigMissing { config } => {
-                eprintln!(
-                    "端口 {} 的配置文件找不到（{}），这次没有恢复；记录已保留，文件回来之后再执行 aproxy restore。不再需要这个实例时执行 aproxy stop {}",
-                    entry.port, config, entry.port
-                );
+                eprintln!("{}", restore_text::missing(current(), &entry.port, &config));
                 results.deferred(&entry.port, "config_missing");
             }
             // 这一项的端口是实例实际监听的：配置改过端口时与记录的不同
@@ -49,13 +50,10 @@ pub(crate) async fn handle_restore_cmd(home: &std::path::Path, json: bool) {
                 if moved {
                     say(
                         json,
-                        format!(
-                            "已恢复 pid {pid}（端口 {port}；配置的端口已从 {} 变更，原端口的记录已由新端口接替）",
-                            entry.port
-                        ),
+                        restore_text::moved(current(), pid, &port, &entry.port),
                     );
                 } else {
-                    say(json, format!("已恢复 pid {pid}（端口 {port}）"));
+                    say(json, restore_text::restored(current(), pid, &port));
                 }
                 results.ok(&port, "restored", None);
             }

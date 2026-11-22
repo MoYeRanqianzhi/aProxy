@@ -67,7 +67,7 @@ fn fail(name: &str, e: &AliasError) -> ! {
             eprintln!("{}", text::invalid(current(), &reason.render(current())))
         }
         AliasError::ConfigMissing { path } => {
-            eprintln!("{}", super::config_text::missing(current(), path.display()))
+            eprintln!("{}", super::missing_config(current(), path))
         }
         AliasError::NotFound => eprintln!("{}", text::not_found(current(), name)),
         AliasError::SettingsUnreadable { reason, path } => {

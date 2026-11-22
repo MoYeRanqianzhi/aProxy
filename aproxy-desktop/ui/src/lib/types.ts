@@ -260,7 +260,7 @@ export interface ThemeSpec {
   dark?: ThemeColors;
 }
 
-/** 用户偏好：持久化在 settings.json 的 ui 段（随 W2 定），由后端读写 */
+/** 旧数据源（legacy.svelte.ts 与 mock）用的偏好形状。真实的偏好见 backend/contract.ts 的 Preferences，存在 <home>/desktop/ */
 export interface UiPrefs {
   lang: 'system' | 'zh-CN' | 'en';
   /** 浅色 / 深色 / 跟随系统 */

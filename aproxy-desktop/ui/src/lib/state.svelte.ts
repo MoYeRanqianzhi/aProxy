@@ -4,7 +4,7 @@
  * 用户偏好（语言、模式、主题、Mica…）与「系统给出的事实」（系统语言、深浅色、减少动效偏好、
  * Mica 能力）分开存：偏好可以是「跟随系统」，最终生效值由 getter 推导。
  * 在桌面窗口里，Mica 能力与系统版本由 Rust 端判定后经 lib/shell.ts 写进来；浏览器里是审核工具条可切换的假值。
- * 偏好以后持久化到 settings.json 的 ui 段，现在只在内存里。
+ * 这里只放偏好在内存里的当前值；lib/store.svelte.ts 经桌面命令把它存进 <home>/desktop/（不在 settings.json）。
  */
 
 import type { Ref } from './backend/contract';

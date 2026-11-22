@@ -63,13 +63,14 @@ async fn observe(
             .unwrap(),
     );
     let run = h.path().join("run");
+    // 控制端点在启动期间就能回复 ping；只在两次运行都已开始服务后比较原始状态文档。
     let info = loop {
         if let Some(rec) = aproxy_ipc::registry::registry_instances_in(&run)
             .into_iter()
             .find(|r| r.pid == child.0.id())
             && aproxy::daemon::ipc_ping_in(&run, aproxy::daemon::port_of(&rec.listen_addr))
                 .await
-                .is_ok()
+                .is_ok_and(|live| live.state == aproxy::daemon::InstanceState::Serving)
         {
             break rec;
         }

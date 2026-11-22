@@ -1,7 +1,7 @@
 //! 在隔离 home 用环回镜像运行真正的 CLI，验证文档的原始字节、退出码与安装支线。
 mod common;
 use common::ReportExit as _;
-use common::{TestHome, free_port};
+use common::TestHome;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -51,10 +51,10 @@ async fn mirror(h: &TestHome, version: &str) {
 }
 /// 每个 home 使用自己的环回镜像，不回退到外网的下载链。
 async fn serve(h: &TestHome, app: axum::Router) {
-    let port = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
+    let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -412,10 +412,10 @@ async fn checksum_response_is_bounded() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn download_errors_do_not_echo_urls() {
     let h = TestHome::new();
-    let port = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
+    let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         while let Ok((s, _)) = listener.accept().await {
             drop(s);

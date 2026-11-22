@@ -1,6 +1,6 @@
 //! 把代理路由和 IPC 放在独立的测试运行时中，主测试只在看见真实的 HTTP 或进程事件后才推进节拍。
 //! 与数据链共用真正的管道与套接字；时钟命令只走测试进程的 stdin，不进入安装的可执行文件。
-use super::common::{ChildGuard, TestHome, free_port};
+use super::common::{ChildGuard, TestHome};
 use std::{
     io::{BufRead as _, Write as _},
     process::Stdio,
@@ -22,10 +22,9 @@ impl Clock {
         upstream: u16,
         config: &str,
     ) -> (reqwest::Client, String, Self) {
-        let port = free_port();
         let file = home.path().join("clock.toml");
         let text = format!(
-            "base_url='http://127.0.0.1:{upstream}'\nlisten_addr='127.0.0.1:{port}'\nretry.max_backoff_secs=0\n{config}"
+            "base_url='http://127.0.0.1:{upstream}'\nlisten_addr='127.0.0.1:0'\nretry.max_backoff_secs=0\n{config}"
         );
         std::fs::write(&file, text).unwrap();
         let mut child = ChildGuard(
@@ -52,7 +51,14 @@ impl Clock {
             }
         });
         let mut clock = Self { child, replies };
-        clock.ack("clock ready");
+        // 直接使用子进程实际绑定的端口，不在两个进程之间释放并重新抢占临时端口。
+        let ready = clock.ack("clock ready");
+        let port: u16 = ready
+            .trim_end()
+            .strip_suffix(" clock ready")
+            .and_then(|s| s.split_whitespace().last())
+            .and_then(|s| s.parse().ok())
+            .expect("bound clock fixture port");
         (
             reqwest::Client::builder()
                 .no_proxy()
@@ -64,7 +70,7 @@ impl Clock {
         )
     }
     /// libtest 也会往同一管道写测试名；只用约定的行尾作屏障。
-    fn ack(&mut self, marker: &str) {
+    fn ack(&mut self, marker: &str) -> String {
         let line = self
             .replies
             .recv_timeout(Duration::from_secs(30))
@@ -73,6 +79,7 @@ impl Clock {
             line.trim_end().ends_with(marker),
             "expected {marker}, got {line}"
         );
+        line
     }
     /// 一个时刻最多显式推进到下一拍；不会在等操作系统读写期间追赶另一个截止点。
     pub(super) fn advance(&mut self, secs: u64) {
@@ -142,7 +149,7 @@ async fn serve() {
         std::env::var_os("APROXY_TEST_CLOCK_CONFIG").expect("fixture configuration"),
     );
     assert_eq!(file.parent().unwrap(), aproxy_ipc::home::home());
-    let config = aproxy::config::resolve::resolve_text(
+    let mut config = aproxy::config::resolve::resolve_text(
         Some(&std::fs::read_to_string(&file).unwrap()),
         &file,
         &Default::default(),
@@ -158,6 +165,11 @@ async fn serve() {
             std::fs::File::create(file.with_extension("log")).unwrap(),
         ))
         .init();
+    let listener = tokio::net::TcpListener::bind(&config.config.listen_addr)
+        .await
+        .unwrap();
+    let bound = listener.local_addr().unwrap();
+    config.config.listen_addr = bound.to_string();
     let state = proxy::AppState::new(config.config);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let reader = tokio::task::spawn_blocking(move || {
@@ -171,7 +183,6 @@ async fn serve() {
     state.handshake_formats().await.unwrap();
     let addr = state.config.listen_addr.clone();
     let port = daemon::port_of(&addr);
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     std::fs::create_dir_all(daemon::run_dir()).unwrap();
     let endpoint = daemon::bind_ipc(port).await.unwrap();
     let (stop, mut stopped) = tokio::sync::watch::channel(false);
@@ -213,7 +224,7 @@ async fn serve() {
             )
             .await
     });
-    println!("clock ready");
+    println!("{} clock ready", bound.port());
     while let Some(line) = rx.recv().await {
         if let Some(secs) = line.strip_prefix("finish ") {
             tokio::time::advance(

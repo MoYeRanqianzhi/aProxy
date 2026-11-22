@@ -1,7 +1,7 @@
 //! 用仓库真实的 Git 对象生成发布包，再从环回镜像安装；没有 Python 时明确报告跳过。
 mod common;
 use common::ReportExit as _;
-use common::{TestHome, free_port};
+use common::TestHome;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -75,10 +75,10 @@ async fn packaged_index_installs_through_the_download_chain() {
     let Some(py) = python(&h) else { return };
     let zip = package(&h, py, "published");
     let bytes = fs::read(zip).unwrap();
-    let port = free_port();
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
+    let port = listener.local_addr().unwrap().port();
     let app = axum::Router::new().route(
         "/aproxy-skills.zip",
         axum::routing::get(move || async move { bytes }),

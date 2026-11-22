@@ -1,5 +1,39 @@
 # Desktop extension packages, host protocol and authorization
 
+## 2026-11-23 用户改了方向：不做沙箱，安装前把风险讲清楚（取代下文的 §3–§6 与 §8）
+
+用户裁定（2026-11-23）：扩展包与主题包这类风险属于社会工程学，技术手段挡不住；不做沙箱、不做逐项写授权，
+把力气花在**安装前的提醒**上。下文 §3–§6（iframe 沙箱、外壳文档、租约、逐项授权与审计）与 §8（真实窗口的隔离验证）
+作废，脚本扩展的编译开关不再等隔离验证。分支 `codex/t10-extensions` 上 Revision 3 的 12 个修复（`ffe02952..9ea0f241`，
+Gate F 已过）加深的正是这些，不合入，留作参考。master 上已有的 t10 第一轮代码按下面的设计简化。
+
+**包。** 主题包与扩展包用同一种包（一个文件，或解开的目录），`manifest.json` 里 `kind` 是 `theme` 或 `extension`：
+- 公共字段：`id`、`name`、`version`、`author`、`description`，以及 `repository`（开源时填 GitHub 仓库地址；不填即闭源）。
+- `theme`：主题字段（现在的 ThemeSpec：浅色与深色的颜色、圆角、字体、动效）＋可选的 `theme.css`（任意样式）＋可选的图片
+  （背景图、静态吉祥物图）。没有脚本。
+- `extension`：一个 ES module 入口＋可选的资源。直接在主窗口里运行，不进 iframe。
+
+**安装入口。** 设置页「安装…」选文件，或把文件拖进窗口。Rust 把包装进 `<home>/desktop/extensions/<id>/`，可以列出、
+启用、停用、卸载。只保留把文件写对所需的检查（不写出目标目录、大小有上限），这不是沙箱。
+
+**安装前的检查与弹窗。** 每条都是弹窗，要点「确认」才进入下一个；任何一个点了取消就不装。
+1. 总是有：信任提醒。写明名称、作者、版本、种类、包里有什么，以及扩展在窗口里运行，能做用户在窗口里能做的一切
+   （读请求内容、改配置、启停实例）；只安装来自可信来源的包。
+2. 没有 `repository`：额外提示闭源的风险。
+3. 有 `repository`（GitHub 地址）时，Rust 经 GitHub API 查（网络走更新下载用的同一套代理设置）：
+   - 仓库信息：star、fork、创建时间、最近推送、是否已归档、许可证。这些数字写在弹窗里给用户判断。
+   - 哈希验证：取 tag `v{version}`（没有就取 `{version}`）的 release，找与安装文件同名的 asset，比较 GitHub 给的
+     `digest`（sha256）与本地文件的 sha256。不一致，或找不到这个 release 或 asset，都算没通过，**额外弹窗**。
+   - star 低于阈值（先定 50）：**额外弹窗**。
+   - GitHub API 连不上、被限流、仓库不存在，或地址不是 GitHub：上面几项都没查成，**额外弹窗**说明没能校验。
+
+**接口暴露。** 扩展模块导出 `activate(api)`。`api` 是界面 store 的薄包装：读（实例卡片、最近请求、分页日志、请求详情）、
+订阅变化、写（启动、停止、重启实例，读写配置，检查与安装更新）。写操作不另加授权，安装时的提醒已经说清楚了。
+
+**分工。** Codex 做 Rust 侧：包的读取与安装、列出、启停、卸载，包文件的 sha256，GitHub 查询，相应的桌面命令（安装分两步：
+先「检查」返回清单摘要与可信度事实，再带检查时的句柄「安装」），并删掉 master 上 t10 的沙箱、租约、授权与审计代码。
+主代理做前端：弹窗、设置页的列表、主题包的样式与图片加载、扩展加载与 `api`。
+
 **Rust contract for 0.2.0. Baseline `9f372fc0`; the native boundary is implemented, not qualified by a real window.** This adds to [Desktop API](w5b-desktop-api.md) (W5b), not to daemon IPC v1, install C1–C8, CLI commands or their JSON. Three different acts: copying a directory discovers it; enabling trusts those exact bytes to read; authorizing permits one specified kind of write. None implies the next. There is no install-from-URL or package code in the shipped page.
 
 Trusted: the Rust process and the page shipped in the binary. Untrusted: every manifest field, directory entry, byte and message from a package, including what it calls itself. Rust cannot distinguish the shipped page from code the user injects into that same page. Private state protects against a package running through this interface, not a local user rewriting their own files. A redacted request can still contain a person's conversation or an *unknown* third-party secret: enabling a script is a meaningful disclosure, even with zero write permissions. Do not describe this as anonymous data.

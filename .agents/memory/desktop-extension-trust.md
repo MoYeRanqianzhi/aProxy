@@ -1,21 +1,28 @@
 ---
 name: desktop-extension-trust
-description: Where extension identity, permission to read, and authority to write come from
+description: How aProxy treats the risk of theme and extension packages - recall before designing anything about installing, loading or permissions of third-party packages
 metadata:
-  type: project
-  scope: Official desktop extension packages and the shipped host, starting in 0.2.0
+  type: feedback
+  scope: Desktop theme packages and extension packages, from 0.2.0 on
   status: active
-  last_verified: 2026-11-22
+  last_verified: 2026-11-23
 ---
 
-**Why:** Copying a directory, enabling its contents, and approving an operation answer different questions. The package name, version and permission declarations are claims by its author. The user enables particular bytes to read what the page can read; redaction of credentials does not make request text public. Consent to read is not consent to start a process, stop an instance or install an update.
+不给扩展包和主题包做沙箱、隔离或逐项写授权。安全上要做的是：安装前用弹窗把风险和可信度事实讲清楚，每条风险一个弹窗，
+要点「确认」才继续。
 
-**How to apply:** Keep the three checks independent:
+**Why:** 用户 2026-11-23 裁定：安装第三方包的风险属于社会工程学，技术手段挡不住；之前那套 iframe 沙箱、租约、逐项授权与
+审计（t10 的第一轮和 Revision 3）既重又费，挡不住真正的风险，还让「主题」退化成粘贴一段字符串。扩展包要有，但只需要
+安装入口和接口暴露。
 
-- **Which bytes?** Read a bounded snapshot from checked file handles and compare its digest with the user's opt-in. Names, versions and the timer's metadata hint are not identities. Changing one asset invalidates trust even if the manifest is untouched.
-- **Which caller?** The shipped page owns the Rust-issued lease. The host contract requires it to bind one opaque frame to a private message port and translate only the published methods, never an extension-supplied command, identity or consent token. An opaque origin isolates the parent DOM; it does not by itself prove that native IPC cannot dispatch. On Windows the key-bearing sender, fixed shell response and native WebView2 hooks are a separate boundary. Do not infer qualification from a successful build. DNS, speculative loads and WebRTC remain residual disclosure paths.
-- **Which operation?** Rust derives the confirmation target and rechecks the lease, package, authorization and exact target at admission to the side effect. A remembered instance verb applies only in that home to those bytes; install always asks. The private audit records execution before the effect and does not replay it after a crash. Neither an enabled flag, an old dialog nor a successful prior write substitutes for this check.
+**How to apply:**
+- 包里的 `manifest.json` 带 `repository`。不填即闭源，要额外提示闭源的风险。
+- 开源的经 GitHub API 取 star 等可信度数据，并用 release asset 的 sha256 摘要校验安装文件。哈希没过、star 低、
+  API 连不上，各自额外弹窗。
+- 扩展直接在主窗口运行，拿到的 `api` 与界面能做的一样，写操作不再另外授权。
+- 只保留把文件装对所需的检查（不写出目标目录、大小上限），不要把它扩成隔离方案。
+- 有人提议给扩展加隔离或授权时，先拿这条去问用户，不要自己加回来。
 
-**Evidence:** [The host contract, trust boundaries and real-window checks](../plan/w5e-extensions.md) distinguish what belongs to the page from what Rust can enforce. See `src/desktop/extensions/tree.rs` and `authority.rs`, `aproxy-desktop/src/top-sender.js` and `extension_frame.rs`, and `tests/desktop_extensions.rs`. The Rust tests exercise a temporary home, including changed bytes, stale answers and changed targets. The transport analysis is for Tauri 2.12.3 and Wry 0.57.0; no window was qualified by those tests.
+**Evidence:** 用户 2026-11-23 的原话（本会话）。设计写在 [w5e-extensions](../plan/w5e-extensions.md) 顶部那一节。
 
-**Recheck when:** Changing renderer or IPC versions, shell build/headers, window navigation or native hooks, host port dispatch, or what a resolved launch or update plan means. Recheck the page's disclosure when adding readable data. The trusted-page assumption does not cover code injected into that same page.
+**Recheck when:** 用户改变对扩展风险的看法，或扩展能拿到的能力超出窗口本身能做的事（例如直接执行本机程序）。

@@ -43,4 +43,4 @@
 - [请求历史](memory/2026-11-19-request-history.md) — 体为什么拷贝而不零拷贝、量出来的四处开销（1 MiB 缓冲的释放、多开一次文件、锁里释放、事件逐个写）、几个百分点的差别怎么量 [[request-history]]
 - [Windows login restore carrier](memory/desktop-login-carrier.md) -- Why the per-home Run command uses the headless system console host and how to remeasure it.
 - [CLI language and stored evidence](memory/cli-language-evidence.md) -- When a later reader can localize a recorded failure, and when the original evidence must survive.
-- [Desktop extension trust](memory/desktop-extension-trust.md) -- Why enabling bytes to read is not authority to write, and why an opaque frame alone is not an IPC boundary.
+- [Desktop extension trust](memory/desktop-extension-trust.md) -- 扩展包与主题包不做沙箱与授权，只在安装前逐条弹窗讲清风险（用户 2026-11-23 裁定）。

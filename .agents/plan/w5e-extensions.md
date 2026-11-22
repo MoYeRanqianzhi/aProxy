@@ -74,10 +74,8 @@ refresh_secs = 5
 - 别的地方都不是标准：`localStorage`、`sessionStorage`、IndexedDB、cookie、Cache Storage 与 service worker 和窗口页面
   共用一个来源，扩展写进去，用户看不到、删不掉，还碰得到界面与别的扩展的数据。不做限制，但审查 skill 把它当危险信号。
 
-**安装弹窗由 Rust 用系统对话框弹出（建议，待用户确认）。** 扩展在主窗口里没有沙箱，能直接调用窗口能调的每个桌面命令
-（`window.__TAURI_INTERNALS__.invoke`），也能点页面上的按钮；主题的 CSS 能把页面上的弹窗藏起来、改掉上面的字。弹窗若画在
-页面里，已经装上的扩展或主题就能悄悄装下一个包、跳过全部提醒，「安装前提醒」这条防线就没了。改由 Rust 在安装命令里
-弹系统原生对话框（每条提醒一个，要点确认），页面里的代码与样式都碰不到；页面另外展示详细信息。代价是原生对话框样式朴素。
+**安装提醒就是页面里的弹窗（用户 2026-11-23 裁定）。** 曾提议改由 Rust 弹系统原生对话框，防止已装的扩展或主题跳过或
+藏起后面的提醒；用户否决：装进一个危险的包本身就已经被攻陷了，防御只在安装之前有效，原生对话框挡不住什么，反而牺牲体验。
 提醒的文字要具体，例如「它能改实例的上游地址，把你的请求和 API key 发到别处」，比「能做你在窗口里能做的一切」更能让人停下来。
 
 **format 的数据目录（建议，待用户确认）。** 每个 `[[format]]` 条目一个目录（home 下新增的目录，名字由条目的 `name`
@@ -144,7 +142,7 @@ settings.json：这正是审查 format 时要盯的地方。
 
 **分工。** Codex 做 Rust 侧：包的读取与安装、列出、启停、卸载，包文件的 sha256，GitHub 查询，format 的 control 进程（hello 回复里的 control 参数、独立进程的启动与退役、实例 IPC、桌面命令），相应的桌面命令（安装分两步：
 先「检查」返回清单摘要与可信度事实，再带检查时的句柄「安装」），并删掉 master 上 t10 的沙箱、租约、授权与审计代码；按上面的标准校验 manifest 与文件；`desktop.toml` 换掉
-`preferences.json`；扩展的设置、键值与文件三组命令；（用户同意后）安装命令里弹系统对话框、format 的数据目录。
+`preferences.json`；扩展的设置、键值与文件三组命令；（用户同意后）format 的数据目录。
 主代理做前端：弹窗、设置页的列表、主题包的样式与图片加载、扩展加载与 `api`。
 
 **Rust contract for 0.2.0. Baseline `9f372fc0`; the native boundary is implemented, not qualified by a real window.** This adds to [Desktop API](w5b-desktop-api.md) (W5b), not to daemon IPC v1, install C1–C8, CLI commands or their JSON. Three different acts: copying a directory discovers it; enabling trusts those exact bytes to read; authorizing permits one specified kind of write. None implies the next. There is no install-from-URL or package code in the shipped page.

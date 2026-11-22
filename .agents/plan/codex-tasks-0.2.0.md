@@ -92,7 +92,7 @@
 9c. **t10c：format 的运行时控制**（t10b 之后，Rust 侧；设计见 [w5e-extensions](w5e-extensions.md) 顶部的「扩展与 format 互通」
    与「重启 format」）
    - 范围：control 进程（hello 回复里的 `control.args`、独立进程的启动与退役、实例 IPC 的转交、桌面命令）；单独重启 format
-     （实例 IPC、`aproxy restart` 的参数、桌面命令）；核实 `src/transform/pool.rs:618` 把 spawn 模式的并发名额设成 1 是否让 spawn 的
+     （实例 IPC、`aproxy restart <目标> --format all|<name>`、桌面命令；`name = "all"` 改为配置错误）；核实 `src/transform/pool.rs:618` 把 spawn 模式的并发名额设成 1 是否让 spawn 的
      format 串行处理所有请求（指南写的是每条消息起一个进程），是就修并补测试。
    - 验收：用测试 format 测有无 `control.args`、超时只换 control 进程、超长、control 进程崩溃不影响请求；重启全部或某个条目时
      在途请求与进行中的流不受影响、新消息落到新进程（看 pid）、改过的角色文件被新进程读到、熔断被清零、握手失败如实报告；

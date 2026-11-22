@@ -67,7 +67,8 @@ Gate F 已过）加深的正是这些，不合入，留作参考。master 上已
   重启。之后像启动时一样握手一次，把结果（成功，或握手失败的原因）报告给调用方；失败时这个条目照 `required` 的规则处理，
   实例不退出。在途请求不受影响。
 - 不重读 config.toml：`[[format]]` 本身的改动（command、args、stages 之类）仍要重启实例，输出里说一声。
-- 入口：实例 IPC 一个操作；`aproxy restart <目标> --formats`（全部）与 `--format <name>`（可重复）；桌面命令与实例页的按钮
+- 入口：实例 IPC 一个操作；`aproxy restart <目标> --format all`（全部）与 `--format <name>`（可重复）。`all` 因此成为保留字：
+  `[[format]]` 的 `name` 不能是 `all`（`[[format]]` 是 0.2.0 新加的，没有旧配置要兼容；和别名保留 `all` 同理）；桌面命令与实例页的按钮
   （每个条目一个，外加「重启全部 format」）；扩展 `api` 的 `formats.restart(run, names?)`。
 - 官方 aproxy-format 不做热重载（用户 2026-11-23）：只在进程启动时读一次角色文件，改了文件用上面的重启让它生效。文档按这个写。
 

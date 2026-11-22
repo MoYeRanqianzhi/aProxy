@@ -49,6 +49,11 @@ export class Engine {
     return this.scenario === 'empty' ? [] : this.instancesAll;
   }
 
+  /** 配置文件在的全部实例，不管当前场景里它们出不出现 */
+  get allInstances(): Instance[] {
+    return this.instancesAll;
+  }
+
   get visibleLogs(): SimEntry[] {
     return this.scenario === 'empty' ? [] : this.logs;
   }
@@ -59,6 +64,15 @@ export class Engine {
 
   entry(key: string): SimEntry | undefined {
     return this.logs.find((e) => e.key === key);
+  }
+
+  /** 看护者与救回计数的拷贝：「没有实例」场景下看护者也不在 */
+  get stats() {
+    return {
+      watchdog: this.scenario === 'empty' ? null : structuredClone(this.watchdog),
+      rescuedTotal: this.rescuedTotal,
+      rescuedToday: this.rescuedToday,
+    };
   }
 
   snapshot(): Snapshot {

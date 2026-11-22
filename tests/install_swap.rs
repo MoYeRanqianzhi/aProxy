@@ -5,7 +5,6 @@
 //! 测的是文件布局与改名步骤，不是版本差异）。
 
 mod common;
-use common::ReportExit as _;
 
 use std::path::{Path, PathBuf};
 
@@ -351,6 +350,7 @@ mod windows_swap {
     /// （名字倒序第一个）——更早的那个是坏文件，选错就跑不起来。
     #[test]
     fn fallback_bat_runs_the_newest_retired_binary() {
+        use common::ReportExit as _;
         // 要经 cmd 拉起 aproxy，所以用 TestHome：bat 转调的 aproxy 继承它注入的隔离环境
         let home = common::TestHome::new();
         seed_marked_bin(home.path());

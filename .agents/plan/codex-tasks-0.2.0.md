@@ -76,6 +76,7 @@
    - 范围：扩展包的清单与发现、沙箱 iframe 的宿主协议、Rust 侧的授权检查与记录。确认框与设置页由主代理做。
    - 依据：[w5-real-data](w5-real-data.md) 的「扩展」。先交设计文档，主代理审过再实现。
    - 状态：已派出（2026-11-22，分支 `codex/t10-extensions`）。第一步交 `w5e-extensions.md`（包格式、发现与启用、iframe 的加载方式与外泄分析、宿主协议、授权与确认流程），停下等裁定。任务书里点名要它分析后给建议的两处：扩展改配置（能把 `base_url`/`proxy` 指到自己的主机，拿走密钥与流量，所以不宜一次授权永久有效）与扩展执行安装。宿主一侧（iframe、确认框、设置页）由主代理按它写的协议实现。
+   - 写 Revision 1 时一并交给它的一处修复：`tests/worker_language.rs` 的 `worker_output_does_not_follow_the_launchers_language` 在 CI（run 44997744828，windows desktop）上不稳定，两次观察里 `status --json` 的 `state` 一次是 `starting` 一次是 `serving`，比较就不相等；取状态前要等到 `serving`（或比较时不看随时间变的字段）。与堆损坏无关，退出码都正常。
 10. **主代理：W5c、W5d**。前端的 Tauri Backend 实现、界面类型的调整、去掉原型工具；在真实应用里逐页过外观与交互。
 11. **t11：W3 i18n**
     - 状态：已派出（2026-11-22，分支 `codex/t11-i18n`，排在 t10 前面：它只动 Rust 侧，不与主代理在前端做的 W5c 冲突）。消息机制已定：每条消息在 Rust 里定义一次、中英并排、编译期检查、不加依赖、不与前端共用目录。第一步交 `w3-i18n.md`（清点与设计），停下等裁定。现有中文原样搬，英文由 Codex 起草、主代理按 `t11-i18n.strings.md` 修订。

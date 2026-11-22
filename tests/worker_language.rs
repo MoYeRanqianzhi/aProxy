@@ -37,15 +37,20 @@ struct Observed {
     status: String,
     http: String,
     ipc: Vec<u8>,
+    sse: String,
     log: String,
 }
 
-async fn observe(lang: &str, upstream: std::net::SocketAddr) -> Observed {
+async fn observe(
+    lang: &str,
+    upstream: std::net::SocketAddr,
+    release: &tokio::sync::Notify,
+) -> Observed {
     let h = TestHome::new();
     let cfg = h.path().join("test.toml");
     std::fs::write(
         &cfg,
-        format!("listen_addr = \"127.0.0.1:0\"\nbase_url = \"http://{upstream}\"\n"),
+        format!("listen_addr = \"127.0.0.1:0\"\nbase_url = \"http://{upstream}\"\n[keepalive]\ninterval_secs = 1\n[[retry.rules]]\npath = \"/locale-sse\"\nmax_attempts = 1\n"),
     )
     .unwrap();
     let child = ChildGuard(
@@ -155,10 +160,35 @@ async fn observe(lang: &str, upstream: std::net::SocketAddr) -> Observed {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
+    // 客户端收到骨架后才放行上游拒绝：错误只能出现在已提交的 SSE 流中。
+    let stream = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("http://{}/locale-sse", info.listen_addr))
+        .header("accept", "text/event-stream")
+        .json(&json!({"stream":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), 200);
+    release.notify_one();
+    let body = stream.text().await.unwrap();
+    let (_, frame) = body.split_once("event: error\n").expect(&body);
+    let data = frame
+        .strip_prefix("data: ")
+        .unwrap()
+        .strip_suffix("\n\n")
+        .unwrap();
+    let error: Value = serde_json::from_str(data).unwrap();
+    assert_eq!(error["error"]["aproxy"]["code"], "retry_exhausted");
+    let id2 = error["error"]["aproxy"]["request_id"].as_str().unwrap();
+    assert!(id2.starts_with(&info.instance_id));
     Observed {
         status: serde_json::to_string(&doc).unwrap(),
         http: raw.replace(&id, "<request-id>"),
         ipc,
+        sse: data.replace(id2, "<request-id>"),
         log,
     }
 }
@@ -168,8 +198,22 @@ async fn worker_output_does_not_follow_the_launchers_language() {
     // 不预选端口；两个实例共用的上游也完全留在环回，拒绝应发生在转发之前。
     let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = local.local_addr().unwrap();
-    let run = |lang| tokio::time::timeout(Duration::from_secs(60), observe(lang, addr));
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let notify = release.clone();
+    let app = axum::Router::new().route(
+        "/locale-sse",
+        axum::routing::post(move || {
+            let n = notify.clone();
+            async move {
+                n.notified().await;
+                (axum::http::StatusCode::NOT_FOUND, "not found")
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(local, app).await.unwrap() });
+    let run = |lang| tokio::time::timeout(Duration::from_secs(60), observe(lang, addr, &release));
     assert_eq!(run("en").await.unwrap(), run("zh-CN").await.unwrap());
+    server.abort();
 }
 
 #[test]

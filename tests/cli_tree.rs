@@ -317,8 +317,60 @@ skill show: --files -h --help
 start: --config --base-url --listen-addr --proxy --api-key --log-file --foreground --json -h --help
 status: --idle --busy --json -h --help
 stop: --idle-threshold-secs --force --json -h --help"#;
+    // 每个语言在独立进程里构建真正用于解析的树，含隐藏路径；clap 的 help 镜像不重复遍历。
+    if std::env::var_os("APROXY_TEST_WALK_TREE").is_some() {
+        use std::collections::BTreeMap;
+        aproxy_ipc::i18n::init_terminal(|| None);
+        fn walk(cmd: &clap::Command, path: &str, out: &mut BTreeMap<String, bool>) {
+            out.insert(path.to_owned(), cmd.is_hide_set());
+            if cmd.get_name() != "help" {
+                for child in cmd.get_subcommands() {
+                    let name = child.get_name();
+                    let next = if path == "." {
+                        name.to_owned()
+                    } else {
+                        format!("{path} {name}")
+                    };
+                    walk(child, &next, out);
+                }
+            }
+        }
+        let mut actual = BTreeMap::new();
+        walk(&aproxy::cli::command_tree(), ".", &mut actual);
+        let expected = BASELINE
+            .lines()
+            .map(|row| {
+                let (p, _) = row.split_once(':').unwrap();
+                (
+                    p.to_owned(),
+                    matches!(
+                        p,
+                        "restore-at-login" | "__serve" | "__watchdog" | "skill __verify-package"
+                    ) || (p == "desktop" && !cfg!(feature = "desktop")),
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected);
+        return;
+    }
     let home = TestHome::new();
     home.settings(r#"{"language":"zh-CN"}"#);
+    for lang in ["en", "zh-CN"] {
+        let out = home
+            .cmd_with(std::env::current_exe().unwrap())
+            .env("APROXY_TEST_WALK_TREE", "1")
+            .env("APROXY_LANG", lang)
+            .args(["--exact", "localized_help_preserves_baseline_option_order"])
+            .output()
+            .report_exit()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{} {}",
+            text(&out.stdout),
+            text(&out.stderr)
+        );
+    }
     for row in BASELINE.lines() {
         let (path, expected) = row.split_once(':').unwrap();
         let path: Vec<_> = path.split_whitespace().filter(|p| *p != ".").collect();
@@ -530,62 +582,101 @@ fn json_commands_finish_with_one_document_even_without_stderr() {
             &["install", "--from", "./missing-test-binary"],
             "install_probe_failed",
         ),
+        (&["skill", "list"], "absent"),
+        (
+            &["skill", "install", "--download-proxy", "http://["],
+            "install_download_failed",
+        ),
     ] {
         for relative in [true, false] {
             for broken in [false, true] {
-                let mut command = if relative {
-                    home.cmd_with_relative_home()
-                } else {
-                    home.cmd()
-                };
-                command
-                    .current_dir(home.path())
-                    .args(args)
-                    .arg("--json")
-                    .stdin(Stdio::null());
-                if broken {
-                    let (reader, writer) = std::io::pipe().unwrap();
-                    drop(reader);
-                    command.stderr(writer);
-                }
-                let out = command.output().report_exit().unwrap();
-                let stdout = text(&out.stdout);
-                assert_eq!(
-                    stdout.lines().count(),
-                    1,
-                    "{args:?} relative={relative} closed={broken} {}: {stdout:?} {}",
-                    out.status,
-                    text(&out.stderr)
-                );
-                let doc: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-                assert_eq!(doc["schema"], 1);
-                if args.starts_with(&["install", "--from"]) {
-                    assert_eq!(doc["event"], "result");
-                    assert_eq!(doc["outcome"], "failed");
-                } else {
-                    assert!(doc.get("event").is_none());
-                }
-                let expected = if relative { "home_invalid" } else { malformed };
-                if ["instances", "files"].contains(&expected) {
-                    assert!(doc[expected].is_array(), "{args:?}: {doc}");
-                } else {
-                    assert!(!out.status.success());
-                    assert_eq!(doc["error"]["code"], expected, "{args:?}: {doc}");
-                    if !broken && (relative || args == ["restore"]) {
-                        let message = doc["error"]["message"].as_str().unwrap();
-                        assert!(
-                            text(&out.stderr)
-                                .lines()
-                                .any(|line| line.strip_prefix("[ERROR] ") == Some(message)),
-                            "{args:?}: {doc}"
+                let mut english = None;
+                for lang in ["en", "zh-CN"] {
+                    let mut command = if relative {
+                        home.cmd_with_relative_home()
+                    } else {
+                        home.cmd()
+                    };
+                    command
+                        .env("APROXY_LANG", lang)
+                        .current_dir(home.path())
+                        .args(args)
+                        .arg("--json")
+                        .stdin(Stdio::null());
+                    if broken {
+                        let (reader, writer) = std::io::pipe().unwrap();
+                        drop(reader);
+                        command.stderr(writer);
+                    }
+                    let out = command.output().report_exit().unwrap();
+                    let stdout = text(&out.stdout);
+                    assert_eq!(
+                        stdout.lines().count(),
+                        1,
+                        "{args:?} relative={relative} closed={broken} {}: {stdout:?} {}",
+                        out.status,
+                        text(&out.stderr)
+                    );
+                    let doc: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+                    let (exit, expected) =
+                        expected_machine_output(&home, args, relative, malformed);
+                    assert_eq!(out.status.code(), Some(exit), "{args:?}: {doc}");
+                    assert_eq!(doc, expected, "{args:?} {lang}");
+                    if let Some(bytes) = &english {
+                        assert_eq!(bytes, &out.stdout, "{args:?}");
+                    } else {
+                        english = Some(out.stdout.clone());
+                    }
+                    // 断开的诊断管道只影响 stderr；doctor 自己在 stdout 的报告里列出全部诊断。
+                    assert_eq!(
+                        out.stderr.is_empty(),
+                        broken || (!relative && args == ["doctor"]),
+                        "{args:?}: {}",
+                        text(&out.stderr)
+                    );
+                    if relative && !broken {
+                        assert!(text(&out.stderr).starts_with("[ERROR] APROXY_HOME"));
+                        assert_eq!(
+                            text(&out.stderr).contains("must be an absolute path"),
+                            lang == "en"
                         );
                     }
-                    assert!(
-                        doc["error"]["message"].is_string() && doc["error"]["details"].is_object()
-                    );
                 }
             }
         }
+    }
+}
+
+fn expected_machine_output(
+    home: &TestHome,
+    args: &[&str],
+    relative: bool,
+    code: &str,
+) -> (i32, serde_json::Value) {
+    use serde_json::json;
+    let error = |code: &str, message: String, details| json!({"code":code,"message":message,"details":details});
+    let failed = |err| {
+        if args.starts_with(&["install", "--from"]) {
+            json!({"schema":1,"event":"result","outcome":"failed","version":null,"error":err})
+        } else {
+            json!({"schema":1,"error":err})
+        }
+    };
+    if relative {
+        return (2,failed(error("home_invalid", "APROXY_HOME must be an absolute path, not \"relative\". A relative path selects a different home in each working directory. Set an absolute path or unset the variable to use <user directory>/.aproxy.".into(),json!({"value":"relative"}))));
+    }
+    let settings = home.path().join("settings.json");
+    let syntax = "JSON syntax error: EOF while parsing an object at line 1 column 1";
+    let diag = json!({"code":"config_syntax","severity":"error","file":settings,"line":1,"column":1,"message":syntax,"details":{}});
+    match code {
+        "instances"=>(0,json!({"schema":1,"instances":[],"unreadable":[],"watchdog":null,"processes":[]})),
+        "files"=>(3,json!({"schema":1,"files":[{"file":settings,"kind":"settings","diagnostics":[diag]},{"file":home.path(),"kind":"home","diagnostics":[]}],"summary":{"errors":1,"warnings":0}})),
+        "absent"=>(4,json!({"schema":1,"state":"not_installed","skills":[],"next":"aproxy skill install"})),
+        "config_invalid"=>{let message=match args { ["settings","show"|"get",..]=>"settings.json is not a valid JSON object. Repair it manually or delete it to return to built-in defaults:".into(),["settings",..]=>format!("Cannot read settings.json. Nothing was changed. Repair or remove {p} first:\n  {p}:1:1: {syntax} [config_syntax]",p=settings.display()), _=>"settings.json has errors:".into()};(3,failed(error(code,message,json!({"diagnostics":[diag]}))))},
+        "target_not_found"=>(4,failed(error(code,"Unknown alias or port: missing-alias\nRun aproxy alias list to see the aliases, or aproxy alias add missing-alias <path> to add one.".into(),json!({"target":"missing-alias"})))),
+        "install_download_failed"=>{let e=error(code,"Invalid download proxy URL (credentials withheld).".into(),json!({}));(1,if args[0]=="skill" {json!({"schema":1,"result":"failed","version":env!("CARGO_PKG_VERSION"),"location":home.path().join("skills"),"file_count":0,"error":e})}else{failed(e)})},
+        "install_probe_failed"=>{let p=home.path().join("missing-test-binary");let io=std::fs::metadata(&p).unwrap_err();(1,failed(error(code,format!("Cannot execute {}: {io}",p.display()),json!({}))))},
+        _=>unreachable!(),
     }
 }
 

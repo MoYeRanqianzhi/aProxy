@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-package-verify"
+description = "Enables the package_verify command without any pre-configured scope."
+commands.allow = ["package_verify"]
+
+[[permission]]
+identifier = "deny-package-verify"
+description = "Denies the package_verify command without any pre-configured scope."
+commands.deny = ["package_verify"]

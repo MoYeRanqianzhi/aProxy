@@ -43,6 +43,7 @@
     "allow-set-autostart",
     "allow-package-check-file",
     "allow-package-check-path",
-    "allow-package-discard"
+    "allow-package-discard",
+    "allow-package-verify"
   ]
 }

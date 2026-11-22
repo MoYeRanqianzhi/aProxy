@@ -1,4 +1,5 @@
 //! 安装页展示的是暂存副本的事实；确认之后只交换目录，绝不回到用户选择的源路径再读一次。
+pub mod github;
 mod manifest;
 mod tree;
 mod unpack;
@@ -117,11 +118,22 @@ pub(super) struct Pending {
     stage: tempfile::TempDir,
     check: PackageCheck,
     expires: Instant,
+    github: Option<GithubFacts>,
 }
 impl Pending {
     fn expired(&self, now: Instant) -> bool {
         now >= self.expires
     }
+}
+/// 过期和已消费的句柄在页面看来一样；从不按外部提供的 token 拼接本机路径。
+fn current<'a>(pending: &'a mut Option<Pending>, token: &str, now: Instant) -> R<&'a mut Pending> {
+    if pending.as_ref().is_some_and(|p| p.expired(now)) {
+        pending.take();
+    }
+    pending
+        .as_mut()
+        .filter(|p| p.check.token == token)
+        .ok_or_else(|| bad("token", None))
 }
 enum Source {
     Bytes(String, Vec<u8>),
@@ -226,12 +238,44 @@ impl DesktopHome {
                 stage,
                 check: check.clone(),
                 expires: Instant::now() + TTL,
+                github: None,
             });
             Ok(check)
         }))
     }
 }
 impl PackageOps for DesktopHome {
+    fn package_verify(&self, token: String) -> Task<'_, GithubFacts> {
+        Box::pin(async move {
+            let t = token.clone();
+            let (manifest, source, proxy) = self
+                .state_work(StateFile::Packages, move |host, _| {
+                    let mut guard = host.package.lock().unwrap();
+                    let c = &current(&mut guard, &t, Instant::now())?.check;
+                    let proxy =
+                        crate::settings::load_from(&crate::settings::settings_path_in(&host.home))
+                            .download_proxy;
+                    Ok((c.manifest.clone(), c.source.clone(), proxy))
+                })
+                .await?;
+            let facts = github::facts(
+                manifest.repository.as_deref(),
+                &manifest.version,
+                &source,
+                "https://api.github.com",
+                proxy.as_deref(),
+                Duration::from_secs(15),
+            )
+            .await;
+            // 网络等待不占状态锁。后来的检查、取消或安装都可以先完成，不把过期的事实写给别的包。
+            self.state_work(StateFile::Packages, move |host, _| {
+                let mut guard = host.package.lock().unwrap();
+                current(&mut guard, &token, Instant::now())?.github = Some(facts.clone());
+                Ok(facts)
+            })
+            .await
+        })
+    }
     fn package_check_file(&self, name: String, bytes: Vec<u8>) -> Task<'_, PackageCheck> {
         self.check_package(Source::Bytes(name, bytes))
     }

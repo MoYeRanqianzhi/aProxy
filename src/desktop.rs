@@ -2,7 +2,7 @@
 mod forms;
 mod instances;
 mod login;
-mod packages;
+pub mod packages;
 mod preferences;
 mod state;
 mod update;

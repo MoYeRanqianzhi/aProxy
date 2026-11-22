@@ -116,10 +116,97 @@ pub struct PackageIssue {
 }
 /// Package operations are home-bound. File and archive work runs off the event loop.
 pub trait PackageOps: Send + Sync + 'static {
+    /// Fetch neutral publisher facts for exactly one unexpired check.
+    fn package_verify(&self, token: String) -> Task<'_, GithubFacts>;
     /// Stage picked bytes without trusting the filename as a path.
     fn package_check_file(&self, name: String, bytes: Vec<u8>) -> Task<'_, PackageCheck>;
     /// Stage a user-selected local zip or directory.
     fn package_check_path(&self, path: String) -> Task<'_, PackageCheck>;
     /// Cancel only the specified check; retries are harmless.
     fn package_discard(&self, token: String) -> Task<'_, ()>;
+}
+/// Why the service could not supply facts; status is recorded separately when available.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Unreachable {
+    /// Connection, DNS or TLS failed.
+    Network,
+    /// The request deadline elapsed.
+    Timeout,
+    /// GitHub reported rate exhaustion.
+    RateLimited,
+    /// Other HTTP failure or unusable response body.
+    Http,
+}
+/// Neutral repository metadata; only a matching release digest binds it to the picked file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoFacts {
+    /// Canonical owner and repository after redirects.
+    pub full_name: String,
+    /// Repository page.
+    pub url: String,
+    /// Stargazers at verification time.
+    pub stars: u64,
+    /// Fork count at verification time.
+    pub forks: u64,
+    /// Creation time, Unix milliseconds.
+    pub created_at: i64,
+    /// Last push time, Unix milliseconds.
+    pub pushed_at: i64,
+    /// Repository is read-only.
+    pub archived: bool,
+    /// Repository is a fork.
+    pub is_fork: bool,
+    /// SPDX identifier, if known.
+    pub license: Option<String>,
+    /// The canonical name differs beyond letter case.
+    pub renamed: bool,
+}
+/// Relationship of the actual source bytes to a release asset, independent of stars.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum ReleaseFacts {
+    /// Matching SHA-256, regardless of file name.
+    Match {
+        tag: String,
+        asset: String,
+        url: String,
+    },
+    /// Same name, different digest.
+    Mismatch { tag: String, asset: String },
+    /// Release exists without a relevant asset.
+    NoAsset { tag: String },
+    /// One or more assets had no digest for comparison.
+    NoDigest { tag: String },
+    /// Neither tag exists.
+    NoRelease,
+    /// A directory is not a release file.
+    NotAFile,
+    /// Preserve repository facts when only the release check fails.
+    Unreachable {
+        reason: Unreachable,
+        status: Option<u16>,
+    },
+}
+/// Facts obtained before installation; no trust threshold or policy verdict is implied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum GithubFacts {
+    /// Manifest supplies no source URL.
+    NoRepository,
+    /// A source URL outside GitHub.
+    NotGithub { url: String },
+    /// Repository endpoint returned 404.
+    RepoNotFound,
+    /// Repository facts could not be retrieved.
+    Unreachable {
+        reason: Unreachable,
+        status: Option<u16>,
+    },
+    /// Repository metadata and independent release outcome.
+    Checked {
+        repo: RepoFacts,
+        release: ReleaseFacts,
+    },
 }

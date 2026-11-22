@@ -1051,3 +1051,12 @@ pub(crate) async fn package_discard(
     ops.package_discard(args::<TokenArgs>(&request)?.token)
         .await
 }
+
+/// 独立查询可信度事实，首轮安装提示不必等待 GitHub，也不按 star 数替人作决定。
+#[tauri::command]
+pub(crate) async fn package_verify(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<GithubFacts> {
+    ops.package_verify(args::<TokenArgs>(&request)?.token).await
+}

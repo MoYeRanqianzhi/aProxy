@@ -325,3 +325,215 @@ async fn zip_headers_do_not_override_resource_and_content_checks() {
         );
     }
 }
+
+/// 回环代理直接回答 API 请求，不解析目标域名；记录原始请求以核验路径、重定向与请求头。
+#[tokio::test]
+async fn github_repo_and_release_facts_use_only_bounded_anonymous_api_requests() {
+    use aproxy::desktop::packages::github::facts;
+    use std::time::Duration;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpSocket},
+    };
+    let h = TestHome::new();
+    let host = host(&h);
+    let checked = host
+        .package_check_file("local.zip".into(), archive(&members("extension"), ""))
+        .await
+        .unwrap();
+    let PackageSource::File { sha256, .. } = &checked.source else {
+        panic!()
+    };
+    let digest = format!("sha256:{sha256}");
+    let directory = PackageSource::Directory {
+        name: "tree".into(),
+    };
+    let repository = Some("https://github.com/a/b");
+    let api = "http://github.invalid";
+    let timeout = Duration::from_secs(3);
+    let repo = json!({"full_name":"renamed/repo","html_url":"https://github.com/renamed/repo","stargazers_count":432,"forks_count":8,"created_at":"2020-01-01T00:00:00Z","pushed_at":"2026-01-01T22:00:00Z","archived":true,"fork":false,"license":{"spdx_id":"MIT"}});
+    let reply = |status: &str, headers: &str, body: &str| {
+        format!(
+            "HTTP/1.1 {status}\r\nConnection: close\r\n{headers}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let ok = |v: &Value| reply("200 OK", "", &v.to_string());
+    let missing = reply("404 Not Found", "", "");
+    assert!(matches!(
+        facts(None, "1.2.0", &directory, api, None, timeout).await,
+        GithubFacts::NoRepository
+    ));
+    assert!(matches!(
+        facts(
+            Some("https://a.invalid"),
+            "1.2.0",
+            &directory,
+            api,
+            None,
+            timeout
+        )
+        .await,
+        GithubFacts::NotGithub { .. }
+    ));
+    let asset = |name: &str, hash: Value| json!({"name":name,"digest":hash,"browser_download_url":"https://github.com/a/b/releases/download/v1.2.0/pkg.zip"});
+    let release = |tag: &str, assets: Value| ok(&json!({"tag_name":tag,"assets":assets}));
+    for (state, replies) in [
+        ("repo-not-found", vec![missing.clone()]),
+        (
+            "rate-403",
+            vec![reply("403 Forbidden", "x-ratelimit-remaining: 0\r\n", "")],
+        ),
+        ("rate-429", vec![reply("429 Rate Limited", "", "")]),
+        ("http", vec![reply("403 Forbidden", "", "")]),
+        (
+            "oversized",
+            vec![reply("200 OK", "", &"x".repeat((1 << 20) + 1))],
+        ),
+        ("not-a-file", vec![ok(&repo)]),
+        (
+            "match",
+            vec![
+                reply(
+                    "301 Moved",
+                    "Location: http://github.invalid/repositories/7\r\n",
+                    "",
+                ),
+                ok(&repo),
+                missing.clone(),
+                release("1.2.0", json!([asset("other.zip", json!(digest))])),
+            ],
+        ),
+        (
+            "mismatch",
+            vec![
+                ok(&repo),
+                release(
+                    "v1.2.0",
+                    json!([asset("local.zip", json!("sha256:different"))]),
+                ),
+            ],
+        ),
+        (
+            "no-digest",
+            vec![
+                ok(&repo),
+                release("v1.2.0", json!([asset("other.zip", Value::Null)])),
+            ],
+        ),
+        ("no-asset", vec![ok(&repo), release("v1.2.0", json!([]))]),
+        (
+            "no-release",
+            vec![ok(&repo), missing.clone(), missing.clone()],
+        ),
+        (
+            "release-unreachable",
+            vec![ok(&repo), reply("500 Internal Error", "", "")],
+        ),
+    ] {
+        let l = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let proxy = format!("http://{}", l.local_addr().unwrap());
+        let worker = tokio::spawn(async move {
+            let mut paths = Vec::new();
+            for response in replies {
+                let (mut s, _) = l.accept().await.unwrap();
+                let mut data = Vec::new();
+                while !data.windows(4).any(|s| s == b"\r\n\r\n") {
+                    let mut b = [0; 1024];
+                    let n = s.read(&mut b).await.unwrap();
+                    assert!(n > 0);
+                    data.extend_from_slice(&b[..n]);
+                    assert!(data.len() < 8192);
+                }
+                let raw = String::from_utf8(data).unwrap().to_ascii_lowercase();
+                assert!(
+                    raw.contains(concat!(
+                        "user-agent: aproxy-desktop/",
+                        env!("CARGO_PKG_VERSION")
+                    )) && raw.contains("accept: application/vnd.github+json")
+                        && raw.contains("x-github-api-version: 2022-11-28")
+                        && !raw.contains("authorization:")
+                );
+                paths.push(raw.lines().next().unwrap().to_owned());
+                let _ = s.write_all(response.as_bytes()).await;
+            }
+            paths
+        });
+        let value = serde_json::to_value(
+            facts(
+                repository,
+                "1.2.0",
+                if state == "not-a-file" {
+                    &directory
+                } else {
+                    &checked.source
+                },
+                api,
+                Some(&proxy),
+                timeout,
+            )
+            .await,
+        )
+        .unwrap();
+        let paths = worker.await.unwrap();
+        assert!(paths[0].contains("http://github.invalid/repos/a/b"));
+        match state {
+            "repo-not-found" => assert_eq!(value["state"], state),
+            "rate-403" | "rate-429" => assert_eq!(value["reason"], "rate-limited"),
+            "http" | "oversized" => assert_eq!(value["reason"], "http"),
+            _ => {
+                assert_eq!(value["state"], "checked");
+                assert_eq!(value["repo"]["renamed"], true);
+                assert_eq!(value["repo"]["stars"], 432);
+                assert_eq!(value["repo"]["createdAt"], 1577836800000_i64);
+                assert_eq!(
+                    value["release"]["state"],
+                    if state == "release-unreachable" {
+                        "unreachable"
+                    } else {
+                        state
+                    }
+                );
+                if state == "match" {
+                    assert!(
+                        paths[1].contains("/repositories/7")
+                            && paths[2].contains("/tags/v1.2.0")
+                            && paths[3].contains("/tags/1.2.0")
+                    );
+                    assert_eq!(value["release"]["asset"], "other.zip");
+                }
+            }
+        }
+    }
+    // 绑定但不监听，端口仍由本测试占有，拒绝连接不能误中第三方服务。
+    let socket = TcpSocket::new_v4().unwrap();
+    socket
+        .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+        .unwrap();
+    let proxy = format!("http://{}", socket.local_addr().unwrap());
+    assert!(matches!(
+        facts(repository, "1.2.0", &directory, api, Some(&proxy), timeout).await,
+        GithubFacts::Unreachable {
+            reason: Unreachable::Network,
+            ..
+        }
+    ));
+    let _silent = socket.listen(1).unwrap();
+    assert!(matches!(
+        facts(
+            repository,
+            "1.2.0",
+            &directory,
+            api,
+            Some(&proxy),
+            Duration::from_millis(75)
+        )
+        .await,
+        GithubFacts::Unreachable {
+            reason: Unreachable::Timeout,
+            ..
+        }
+    ));
+}

@@ -7798,7 +7798,7 @@ fn invalid_settings_block_start_but_not_stop_status_or_repair() {
         String::from_utf8_lossy(&out.stdout)
     );
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("[WARN] settings.json 有错误"),
+        String::from_utf8_lossy(&out.stderr).contains("[WARN] settings.json has errors"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );

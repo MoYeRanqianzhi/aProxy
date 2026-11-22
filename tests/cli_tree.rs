@@ -270,6 +270,107 @@ fn help_tree_prints_help_for_every_command() {
     );
 }
 
+/// 在原来的每个入口核对实际可见选项的排列（含隐藏命令）；命令名、选项名都不是翻译键。
+#[test]
+fn localized_help_preserves_baseline_option_order() {
+    const BASELINE: &str = r#".: -V --version -h --help
+__serve: --home --spec -h --help
+__watchdog: --home -h --help
+alias: -h --help
+alias add: -h --help
+alias help:
+alias list: --json -h --help
+alias remove: -h --help
+config: --config -h --help
+config get: --config --json -h --help
+config help:
+config set: --config --json -h --help
+config show: --config --effective --json -h --help
+config unset: --config --json -h --help
+desktop: -h --help
+doctor: --json -h --help
+find: --aliased --unaliased --port --json -h --help
+help:
+install: --from --adopt --abort --force --yes --variant --cpu --allow-downgrade --pre --download-proxy --no-skills --check --json -h --help
+logs: -n --lines -f --follow -h --help
+restart: --idle-threshold-secs --force --json -h --help
+restore: --json -h --help
+restore-at-login: --home -h --help
+settings: -h --help
+settings get: --json -h --help
+settings help:
+settings set: --json -h --help
+settings show: --json -h --help
+settings unset: --json -h --help
+skill: -h --help
+skill __verify-package: --packaged-crate -h --help
+skill help:
+skill install: --download-proxy --json -h --help
+skill list: --json -h --help
+skill show: --files -h --help
+start: --config --base-url --listen-addr --proxy --api-key --log-file --foreground --json -h --help
+status: --idle --busy --json -h --help
+stop: --idle-threshold-secs --force --json -h --help"#;
+    let home = TestHome::new();
+    home.settings(r#"{"language":"zh-CN"}"#);
+    for row in BASELINE.lines() {
+        let (path, expected) = row.split_once(':').unwrap();
+        let path: Vec<_> = path.split_whitespace().filter(|p| *p != ".").collect();
+        let mut args = path.clone();
+        if args.last() == Some(&"help") {
+            args.insert(0, "help");
+        } else {
+            args.push("--help");
+        }
+        for chinese in [false, true] {
+            let mut cmd = home.cmd();
+            if chinese {
+                cmd.env_remove("APROXY_LANG");
+            }
+            let out = cmd.args(&args).output().unwrap();
+            let help = text(&out.stdout);
+            assert!(
+                out.status.success() && out.stderr.is_empty(),
+                "{args:?}: {}",
+                text(&out.stderr)
+            );
+            assert!(
+                help.lines()
+                    .any(|s| s.starts_with(if chinese { "用法:" } else { "Usage:" })),
+                "{args:?}: {help}"
+            );
+            assert!(
+                help.trim_end().ends_with(
+                    "Agents: run 'aproxy skill list' and 'aproxy skill show <name>' for full docs."
+                ),
+                "{args:?}: {help}"
+            );
+            let options: Vec<_> = help
+                .lines()
+                .filter(|line| {
+                    let indent = line.len() - line.trim_start().len();
+                    (2..=6).contains(&indent) && line.trim_start().starts_with('-')
+                })
+                .flat_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    let first = fields.next().unwrap();
+                    [
+                        Some(first.trim_end_matches(',')),
+                        if first.ends_with(',') {
+                            fields.next()
+                        } else {
+                            None
+                        },
+                    ]
+                    .into_iter()
+                    .flatten()
+                })
+                .collect();
+            assert_eq!(options.join(" "), expected.trim(), "{args:?}: {help}");
+        }
+    }
+}
+
 /// 真的触发一条 INFO，分别检查它所在的输出流和默认级别，而不是仅凭空日志推断两者。
 #[test]
 fn cli_logs_stay_off_stdout() {

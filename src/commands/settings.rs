@@ -4,6 +4,8 @@
 //! 密钥的明文：密钥显示成占位对象 `{"secret":true}`，URL 里的口令打码；把占位对象原样写回
 //! 等于不改。
 
+use super::super::boot;
+use aproxy_ipc::i18n::current;
 use std::path::Path;
 
 use aproxy::cli::SettingsCmd;
@@ -93,7 +95,7 @@ fn exit_if_invalid(path: &Path, loaded: &settings::Loaded) {
         return;
     }
     eprintln!();
-    eprintln!("settings.json 有错误:");
+    eprintln!("{}", boot::settings_errors(current()));
     print_errors(&loaded.diagnostics);
     print_repair_hints(path);
     crate::util::exit(EXIT_CONFIG as i32)
@@ -120,15 +122,12 @@ pub(crate) fn print_repair_hints(path: &std::path::Path) {
     keys.dedup();
     eprintln!();
     if !keys.is_empty() {
-        eprintln!("逐项修复（删掉出问题的键，或用 aproxy settings set <键> <值> 改对）:");
+        eprintln!("{}", boot::repair_keys(current()));
         for key in keys {
             eprintln!("  aproxy settings unset '{key}'");
         }
     }
-    eprintln!(
-        "也可以删除整个文件回到内置默认（别名与全局默认会一并丢失）: {}",
-        path.display()
-    );
+    eprintln!("{}", boot::remove_settings(current(), path.display()));
 }
 
 /// 写一个键。`--json` 文档里的 `value` 取写完之后这个键的生效值：删掉一个键之后露出来的

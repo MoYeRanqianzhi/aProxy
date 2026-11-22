@@ -13,26 +13,22 @@
 //! 怎样传递（RT-05，见 aproxy-desktop/Cargo.toml）。单元测试从不执行 main，测试构建里这个
 //! 子命令用的是 headless 的那份实现，只为编译通过。
 
+use aproxy_ipc::i18n::current;
 use std::io::Write as _;
+#[path = "../i18n/desktop.rs"]
+mod text;
 
 /// 无界面构建执行 `aproxy desktop` 时的说明。
 #[cfg(any(test, not(feature = "desktop")))]
 fn headless_message() -> &'static str {
     if cfg!(target_env = "musl") {
         // musl 只发布 headless：带界面的版本要动态链接 webkit2gtk，跑不了 musl 版的意义
-        "这是无界面的 headless 版本的 aproxy，没有桌面界面。musl 构建只发布 headless 版本；\
-         在 glibc 的 Linux 发行版上，可以改装 gnu 构建的带界面版本。"
+        text::musl(current())
     } else if cfg!(target_os = "linux") {
         // 照着换装也安全：本机跑不了带界面的版本时，安装在动任何东西之前报错并说明原因
-        "这是无界面的 headless 版本的 aproxy，没有桌面界面。要用桌面界面，换装带界面的版本：\n  \
-         aproxy install --variant desktop\n\
-         它和升级一样逐个重启实例，不中断服务。带界面的版本需要 WebKitGTK 2.40 或更新\
-         （Debian / Ubuntu：libwebkit2gtk-4.1-0），打开窗口还要图形会话；本机跑不了带界面的版本\
-         时，安装会报错并说明原因。"
+        text::linux(current())
     } else {
-        "这是无界面的 headless 版本的 aproxy，没有桌面界面。要用桌面界面，换装带界面的版本：\n  \
-         aproxy install --variant desktop\n\
-         它和升级一样逐个重启实例，不中断服务。"
+        text::headless(current())
     }
 }
 
@@ -92,15 +88,15 @@ pub(crate) fn handle_desktop_cmd() -> ! {
         std::panic::set_hook(Box::new(move |info| {
             default_hook(info);
             if std::thread::current().id() == main_thread {
-                aproxy_desktop::message_box(
-                    &format!("桌面界面遇到内部错误，即将关闭（代理实例不受影响）。\n\n{info}"),
-                    true,
-                );
+                aproxy_desktop::message_box(&text::panic(current(), info), true);
             }
         }));
     }
 
-    let home = aproxy_ipc::home::resolve_home().unwrap_or_else(|e| fail(&e));
+    let home = aproxy_ipc::home::resolve_home().unwrap_or_else(|_| {
+        let value = std::env::var_os(aproxy_ipc::home::HOME_ENV).unwrap_or_default();
+        fail(&super::super::home_error_text(&value, current()))
+    });
 
     // 同一个 home 只开一个界面。alpha 还不会把已开的窗口切到前台，只说明一下。被杀、崩溃的
     // 界面留下的死条目顺手删掉（删之前重读，确认文件仍是读到的那一条），不必等强制安装来清
@@ -118,18 +114,12 @@ pub(crate) fn handle_desktop_cmd() -> ! {
         }
     }
     if let Some(pid) = running {
-        report(
-            &format!(
-                "aProxy 桌面界面已经在运行（pid {pid}）。这个版本还不会把它切到前台，请在任务栏里找到它。"
-            ),
-            false,
-            dialogs,
-        );
+        report(&text::running(current(), pid), false, dialogs);
         std::process::exit(0);
     }
 
     if let Err(e) = aproxy_desktop::preflight() {
-        fail(&e.to_string());
+        fail(&launch_error(&e));
     }
 
     #[cfg(windows)]
@@ -138,14 +128,10 @@ pub(crate) fn handle_desktop_cmd() -> ! {
     {
         match aproxy::daemon::spawn_detached(&exe, &["desktop".to_string()]) {
             Ok(pid) => {
-                report(
-                    &format!("已打开 aProxy 桌面界面（pid {pid}）。"),
-                    false,
-                    false,
-                );
+                report(&text::opened(current(), pid), false, false);
                 std::process::exit(0);
             }
-            Err(e) => fail(&format!("无法在后台打开桌面界面：{e}")),
+            Err(e) => fail(&text::detach(current(), &e)),
         }
     }
 
@@ -167,13 +153,13 @@ pub(crate) fn handle_desktop_cmd() -> ! {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .unwrap_or_else(|e| fail(&format!("无法建立 tokio 运行时：{e}")));
+        .unwrap_or_else(|e| fail(&text::runtime(current(), &e)));
     let _entered = runtime.enter();
     let host = aproxy::desktop::DesktopHome::new(
         home.clone(),
-        std::env::current_exe().unwrap_or_else(|_| fail("无法定位桌面程序")),
+        std::env::current_exe().unwrap_or_else(|_| fail(text::executable(current()))),
     )
-    .unwrap_or_else(|_| fail("无法初始化桌面主目录"));
+    .unwrap_or_else(|_| fail(text::home(current())));
     let host = std::sync::Arc::new(host);
     let code = match aproxy_desktop::run(aproxy_desktop::Options {
         data_dir: home.join("desktop").join("webview"),
@@ -184,12 +170,37 @@ pub(crate) fn handle_desktop_cmd() -> ! {
     }) {
         Ok(code) => code,
         Err(e) => {
-            report(&e.to_string(), true, dialogs);
+            report(&launch_error(&e), true, dialogs);
             1
         }
     };
     // 删掉台账条目再退出（std::process::exit 不跑析构，守卫管不到这条路）
     crate::util::exit(code)
+}
+
+/// 桌面库提供分类和底层证据，启动器按其终端语言给出相应的处理方法。
+#[cfg(all(feature = "desktop", not(test)))]
+fn launch_error(error: &aproxy_desktop::Error) -> String {
+    use aproxy_desktop::Error;
+    let lang = current();
+    match error {
+        #[cfg(windows)]
+        Error::NoWebview(detail) => {
+            let mut message = text::webview(lang, detail);
+            if let Some(dir) = std::env::var_os("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER") {
+                message.push_str(&text::webview_dir(
+                    lang,
+                    std::path::Path::new(&dir).display(),
+                ));
+            }
+            message.push_str(text::cli_available(lang));
+            message
+        }
+        #[cfg(not(windows))]
+        Error::NoWebview(detail) => text::webkit(lang, detail),
+        Error::NoDisplay => text::no_display(lang).into(),
+        Error::Startup(detail) => text::startup(lang, detail),
+    }
 }
 
 /// 告诉用户一件事：打到终端（错误到 stderr），控制台已经释放时再弹对话框。写失败一律忽略。
@@ -301,7 +312,7 @@ mod tests {
             .render_long_help()
             .to_string();
         assert_eq!(
-            help.contains("打开桌面界面"),
+            help.contains("Open the desktop interface"),
             cfg!(feature = "desktop"),
             "{help}"
         );

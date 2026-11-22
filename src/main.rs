@@ -19,6 +19,8 @@ macro_rules! eprintln {
     }};
 }
 
+#[path = "i18n/boot.rs"]
+mod boot;
 pub(crate) mod commands;
 pub(crate) mod server;
 pub(crate) mod util;
@@ -29,6 +31,7 @@ use std::io::Write as _;
 use aproxy::cli::{Cli, Commands};
 
 use aproxy::settings;
+use aproxy_ipc::i18n::{Lang, current};
 
 pub(crate) fn main() -> std::process::ExitCode {
     // 永久兼容契约 C5（见 aproxy::VERSION_LINE）：安装器以 `<二进制> --version` 认
@@ -110,6 +113,16 @@ fn invalid_home_output(
     )
 }
 
+/// C1 只会拒绝非空相对路径或报告找不到用户目录。按输入区分这两种原因，不解析冻结的文案。
+fn home_error_text(value: &std::ffi::OsStr, lang: Lang) -> String {
+    use aproxy_ipc::home::{HOME_ENV, USER_DIR_ENV};
+    if value.to_str().is_some_and(|s| s.trim().is_empty()) {
+        boot::missing_home(lang, USER_DIR_ENV, HOME_ENV)
+    } else {
+        boot::relative_home(lang, HOME_ENV, &value.to_string_lossy())
+    }
+}
+
 /// 除 `--version` 与 `desktop` 之外的一切命令，在 tokio 运行时里执行。
 async fn run(cli: Cli) -> u8 {
     let output = commands::JsonOutput::for_command(cli.command.as_ref());
@@ -137,8 +150,17 @@ async fn run(cli: Cli) -> u8 {
     };
     let home = match resolved {
         Ok(home) => home,
-        Err(e) => {
+        Err(_) => {
             let value = std::env::var_os(aproxy_ipc::home::HOME_ENV).unwrap_or_default();
+            let lang = if matches!(
+                cli.command,
+                Some(Commands::Serve { .. } | Commands::Watchdog { .. })
+            ) {
+                Lang::En
+            } else {
+                current()
+            };
+            let e = home_error_text(&value, lang);
             let (document, exit) =
                 invalid_home_output(cli.command.as_ref(), &value.to_string_lossy());
             if let Some(doc) = document {
@@ -207,7 +229,11 @@ async fn run(cli: Cli) -> u8 {
         );
         // 诊断接收端可能已经关闭；它不能让 stdout 上独立的命令结果也丢失。
         let level = if tolerated { "WARN" } else { "ERROR" };
-        let _ = writeln!(std::io::stderr(), "[{level}] settings.json 有错误:");
+        let _ = writeln!(
+            std::io::stderr(),
+            "[{level}] {}",
+            boot::settings_errors(current())
+        );
         for d in loaded.diagnostics.iter().filter(|d| d.is_error()) {
             let _ = writeln!(
                 std::io::stderr(),
@@ -218,7 +244,8 @@ async fn run(cli: Cli) -> u8 {
         if tolerated {
             let _ = writeln!(
                 std::io::stderr(),
-                "[{level}] 本次按内置默认运行（别名不可用，请按端口或 all 指定实例）。用 aproxy settings show 查看、aproxy settings unset <键> 修复"
+                "[{level}] {}",
+                boot::using_defaults(current())
             );
         } else {
             commands::settings::print_repair_hints(&settings_path);
@@ -231,7 +258,8 @@ async fn run(cli: Cli) -> u8 {
     // 指向不存在的文件的别名：start/stop 按这个名字操作会失败，每次运行都提醒。doctor 会
     // 汇总输出，这里跳过以免重复
     if loaded.is_valid() && !matches!(cli.command, Some(Commands::Doctor { .. })) {
-        for e in settings::missing_alias_targets(&loaded.settings) {
+        for (name, path) in settings::missing_alias_targets(&loaded.settings) {
+            let e = boot::missing_alias(current(), name, path);
             let _ = writeln!(std::io::stderr(), "[ERROR] {e}");
         }
     }

@@ -455,21 +455,16 @@ pub fn effective_config_dirs_in(settings: &Settings, home: &Path) -> Vec<PathBuf
     out
 }
 
-/// 指向不存在的文件的别名，每个一行文字。这是现场的状态（文件可以随时被移走），不是
-/// settings.json 写错了，所以不算进它的诊断。
-pub fn missing_alias_targets(settings: &Settings) -> Vec<String> {
-    let mut names: Vec<&String> = settings.aliases.keys().collect();
-    names.sort();
-    names
-        .into_iter()
-        .filter(|name| !expand_path(&settings.aliases[*name]).is_file())
-        .map(|name| {
-            format!(
-                "别名 \"{name}\" 指向的配置文件不存在: {}（start/stop 该别名会失败）",
-                settings.aliases[name]
-            )
-        })
-        .collect()
+/// 指向不存在文件的别名与登记路径，按名字排序。文件随时可能被移走，不算设置诊断。
+pub fn missing_alias_targets(settings: &Settings) -> Vec<(&str, &str)> {
+    let mut missing: Vec<_> = settings
+        .aliases
+        .iter()
+        .filter(|(_, path)| !expand_path(path).is_file())
+        .map(|(name, path)| (name.as_str(), path.as_str()))
+        .collect();
+    missing.sort_unstable();
+    missing
 }
 
 #[cfg(test)]
@@ -652,9 +647,11 @@ mod tests {
             "aliases": {"ok": present.display().to_string(), "gone": dir.path().join("gone.toml").display().to_string()}
         });
         std::fs::write(&path, json.to_string()).unwrap();
-        let errors = missing_alias_targets(&read(&path).settings);
+        let loaded = read(&path);
+        let errors = missing_alias_targets(&loaded.settings);
         assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].contains("\"gone\"") && errors[0].contains("不存在"));
+        assert_eq!(errors[0].0, "gone");
+        assert_eq!(Path::new(errors[0].1), dir.path().join("gone.toml"));
 
         std::fs::write(&path, r#"{"nope": 1, "language": "fr"}"#).unwrap();
         let errors = read(&path).diagnostics;

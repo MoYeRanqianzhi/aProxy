@@ -129,6 +129,18 @@ Why a persistent record under the home could not be used. Such records are repor
 | `record_unreadable` | A persistent record cannot be parsed. | — |
 | `record_schema_too_new` | A persistent record has a schema newer than this version understands. | `schema` (integer) |
 
+## Desktop extension faults
+
+Faults returned to the bundled desktop page. They do not change CLI exit codes.
+
+| Code | When | `details` |
+|---|---|---|
+| `desktop_extension_package` | The extension package could not be loaded safely. | `reason` (string), `field` (string) |
+| `desktop_extension_state` | Private extension state could not be trusted or saved. | `reason` (string) |
+| `desktop_extension_denied` | The attributed operation was not authorized. | — |
+| `desktop_extension_runtime` | Scripted extensions are unavailable in this window. | — |
+| `desktop_extension_limit` | An extension resource would exceed its limit. | — |
+
 ## Install codes
 
 Why an install or upgrade failed. `install --force` does not use these; it only promises its own exit codes.

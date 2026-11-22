@@ -33,6 +33,8 @@ pub enum Family {
     Record,
     /// 安装码：install 的失败原因
     Install,
+    /// 桌面窗口内的故障对象，不映射到 CLI 退出码。
+    Desktop,
 }
 
 /// `details` 里一个键的类型。界面按它决定怎样显示（字节数换算成 MiB、毫秒换算成秒等）。
@@ -249,6 +251,36 @@ const INSTALL: &[Family] = &[Family::Install];
 
 /// 整张码表。顺序就是文档里的顺序：按族分段，族内按登记的先后。
 pub const TABLE: &[Code] = &[
+    plain(
+        "desktop_extension_package",
+        &[Family::Desktop],
+        "The extension package could not be loaded safely.",
+        &[req("reason", T::String), req("field", T::String)],
+    ),
+    plain(
+        "desktop_extension_state",
+        &[Family::Desktop],
+        "Private extension state could not be trusted or saved.",
+        &[req("reason", T::String)],
+    ),
+    plain(
+        "desktop_extension_denied",
+        &[Family::Desktop],
+        "The attributed operation was not authorized.",
+        &[],
+    ),
+    plain(
+        "desktop_extension_runtime",
+        &[Family::Desktop],
+        "Scripted extensions are unavailable in this window.",
+        &[],
+    ),
+    plain(
+        "desktop_extension_limit",
+        &[Family::Desktop],
+        "An extension resource would exceed its limit.",
+        &[],
+    ),
     // ----- 数据面终态码 -----
     terminal(
         "inbound_host_rejected",

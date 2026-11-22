@@ -1,4 +1,5 @@
 //! 绑定单个主目录的桌面业务逻辑。私有文件只在宿主侧打开，界面只见字段投影与不透明令牌。
+mod extensions;
 mod forms;
 mod instances;
 mod login;

@@ -1,0 +1,9 @@
+{
+  "manifestVersion": 1,
+  "id": "paper-lilac",
+  "name": "Paper lilac",
+  "version": "1.0.0",
+  "kind": "theme",
+  "entry": "theme.txt",
+  "permissions": []
+}

@@ -92,6 +92,12 @@ const SECTIONS: &[Section] = &[
         column: None,
     },
     Section {
+        family: Family::Desktop,
+        title: "Desktop extension faults",
+        intro: "Faults returned to the bundled desktop page. They do not change CLI exit codes.",
+        column: None,
+    },
+    Section {
         family: Family::Install,
         title: "Install codes",
         intro: "Why an install or upgrade failed. `install --force` does not use these; it only promises \

@@ -3,12 +3,14 @@
 //! may gain fields; projection at this boundary must not make those fields public.
 
 mod codes;
+mod extensions;
 mod frames;
 mod history;
 mod home;
 mod ops;
 mod paging;
 pub use codes::*;
+pub use extensions::*;
 pub use frames::*;
 pub use history::*;
 pub use home::*;

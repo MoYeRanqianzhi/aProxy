@@ -1,5 +1,4 @@
-//! 同一测试既可链接当前拉起方，也可链接旧源码并用 APROXY_STARTUP_WRITER 指向当前写者。
-//! APROXY_STARTUP_LEGACY_WRITER 指定只写日志的旧写者；两种方向都走真实的进程等待与摘录路径。
+//! 当前读者分别检查新旧写者的证据。运行 python tests/startup_compat.py 可同时编译并验证基线读者。
 mod common;
 use aproxy::{
     config::Overrides,
@@ -12,9 +11,7 @@ use std::path::PathBuf;
 
 #[tokio::test(flavor = "current_thread")]
 async fn launch_slot_and_fallback_are_compatible_across_writers() {
-    let current = std::env::var_os("APROXY_STARTUP_WRITER")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| common::APROXY.into());
+    let current = PathBuf::from(common::APROXY);
     let legacy = std::env::var_os("APROXY_STARTUP_LEGACY_WRITER").map(PathBuf::from);
     for (writer, structured) in
         std::iter::once((current, true)).chain(legacy.map(|exe| (exe, false)))
@@ -64,6 +61,17 @@ async fn launch_slot_and_fallback_are_compatible_across_writers() {
         else {
             panic!("{err:?}")
         };
+        let SpawnError::Exited { report, .. } = &err else {
+            unreachable!()
+        };
+        assert_eq!(report.is_some(), structured);
+        let zh = err.excerpt(aproxy_ipc::i18n::Lang::Zh);
+        assert!(zh.contains("配置文件不存在:"));
+        if structured {
+            assert!(!zh.contains(phrase));
+        } else {
+            assert!(zh.contains(&startup_log.lines[0]));
+        }
         assert_eq!(startup_log.lines.len(), 1, "{err:?}");
         assert!(
             startup_log.lines[0].contains(phrase)

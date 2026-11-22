@@ -27,7 +27,7 @@ struct Preset {
 const PING: &str = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
 impl Heartbeat {
     /// 无配置使用标准 Messages 入口；显式配置只启用列出的路径。
-    pub fn load(file: Option<config::Source<'_>>) -> Result<Self, &'static str> {
+    pub fn load(file: Option<config::Source<'_>>) -> Result<Self, config::LoadIssue> {
         let config: Self = match file {
             Some(path) => config::load(path)?,
             None => Self {
@@ -41,10 +41,10 @@ impl Heartbeat {
         let mut paths = HashSet::new();
         for p in &config.preset {
             if !p.path.starts_with('/') || p.path.contains(['?', '#']) || !paths.insert(&p.path) {
-                return Err("心跳路径无效或重复");
+                return Err("invalid or duplicate heartbeat path".into());
             }
             if (p.protocol.as_str(), p.event.as_str()) != ("anthropic_messages", "ping") {
-                return Err("不支持此协议的心跳事件");
+                return Err("unsupported heartbeat event for this protocol".into());
             }
         }
         Ok(config)

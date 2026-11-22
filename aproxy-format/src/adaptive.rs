@@ -82,7 +82,7 @@ fn digest(ctx: &w::Context) -> Option<[u8; 32]> {
 }
 impl Adaptive {
     /// 在公布健康之前校验所有阈值；空文件使用和无文件相同的默认值。
-    pub fn load(path: Option<config::Source<'_>>) -> Result<Self, &'static str> {
+    pub fn load(path: Option<config::Source<'_>>) -> Result<Self, config::LoadIssue> {
         let settings: Settings = match path {
             Some(p) => config::load(p)?,
             None => Default::default(),
@@ -93,7 +93,7 @@ impl Adaptive {
             || settings.recovery_samples == 0
             || !(settings.recovery_success_ratio > 0.0 && settings.recovery_success_ratio <= 1.0)
         {
-            return Err("自适应阈值、容量、寿命或恢复比例无效");
+            return Err("invalid adaptive threshold, capacity, lifetime, or recovery ratio".into());
         }
         Ok(Self {
             sample_time: None,

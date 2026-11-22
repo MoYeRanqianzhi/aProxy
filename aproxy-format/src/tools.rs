@@ -1,18 +1,15 @@
 //! 离线工具只解析显式给出的文件，不查找正在运行的实例，不写入代理 home。
-use crate::{Options, Role, config};
+use crate::{Options, Role, config, config::LoadIssue};
 use aproxy_ipc::config_file::{self as f, FormatEntry, Stage};
+use aproxy_ipc::i18n::{Lang, current};
 use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
 };
 
-/// 诊断不回显可能含凭据的路径；三类离线输入使用同一限额和边界。
-const OFFLINE_TYPE: &str = "离线输入必须是可读的本地普通文件";
-/// 超限的文本不能进入 TOML 或 JSON 解析器。
-const OFFLINE_SIZE: &str = "离线输入超过 8 MiB";
 /// 先取得文件句柄，再按同一句柄的类型和长度读取；多读一个字节可以发现并发增长。
-pub(super) fn offline_read(path: &Path) -> Result<Vec<u8>, &'static str> {
+pub(super) fn offline_read(path: &Path) -> Result<Vec<u8>, LoadIssue> {
     use std::io::Read;
     const LIMIT: u64 = 8 * 1024 * 1024;
     #[cfg(unix)]
@@ -25,20 +22,20 @@ pub(super) fn offline_read(path: &Path) -> Result<Vec<u8>, &'static str> {
     };
     #[cfg(windows)]
     let file = local_disk_file(path);
-    let file = file.map_err(|_| OFFLINE_TYPE)?;
-    let meta = file.metadata().map_err(|_| OFFLINE_TYPE)?;
+    let file = file.map_err(|_| LoadIssue::File)?;
+    let meta = file.metadata().map_err(|_| LoadIssue::File)?;
     if !meta.is_file() {
-        return Err(OFFLINE_TYPE);
+        return Err(LoadIssue::File);
     }
     if meta.len() > LIMIT {
-        return Err(OFFLINE_SIZE);
+        return Err(LoadIssue::Size);
     }
     let mut bytes = Vec::new();
     file.take(LIMIT + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| OFFLINE_TYPE)?;
+        .map_err(|_| LoadIssue::File)?;
     if bytes.len() as u64 > LIMIT {
-        return Err(OFFLINE_SIZE);
+        return Err(LoadIssue::Size);
     }
     Ok(bytes)
 }
@@ -192,13 +189,13 @@ pub(super) fn load(
     args: &[String],
     dir: &Path,
     vars: config::Variables,
-) -> Result<Role, String> {
-    let opt = Options::parse(args)?;
+) -> Result<Role, LoadIssue> {
+    let opt = Options::parse(args, Lang::En)?;
     let text = opt
         .config
-        .map(|p| -> Result<String, &'static str> {
+        .map(|p| -> Result<String, LoadIssue> {
             let bytes = offline_read(&dir.join(config::role_path(p)?))?;
-            String::from_utf8(bytes).map_err(|_| "角色配置不是 UTF-8")
+            String::from_utf8(bytes).map_err(|_| LoadIssue::Utf8)
         })
         .transpose()?;
     Role::configured(
@@ -220,19 +217,7 @@ pub(super) fn base_url(text: &str) -> Result<url::Url, &'static str> {
     }
     Ok(url)
 }
-/// 配置字段诊断来自公开词表，其余加载错误可能含用户提供的环境名称，不展示在工具输出中。
-fn safe_issue(error: String) -> String {
-    if error.starts_with("角色配置字段无效：")
-        || matches!(
-            error.as_str(),
-            OFFLINE_TYPE | OFFLINE_SIZE | "角色配置不是 UTF-8"
-        )
-    {
-        error
-    } else {
-        "角色配置无效".into()
-    }
-}
+
 /// 使用与代理同源的严格 TOML 解析；只报告固定错误码、位置，不转发可能含环境值的解析器原话。
 pub(super) fn chain(path: &Path, home: Option<&Path>, structural: bool) -> Result<Chain, String> {
     let directory = match home {
@@ -245,7 +230,8 @@ pub(super) fn chain(path: &Path, home: Option<&Path>, structural: bool) -> Resul
         }
     };
     let directory = std::path::absolute(directory).map_err(|_| "无法确定角色工作目录")?;
-    let text = String::from_utf8(offline_read(path)?).map_err(|_| "代理配置不是 UTF-8")?;
+    let text = String::from_utf8(offline_read(path).map_err(|e| e.safe_issue(current()))?)
+        .map_err(|_| "代理配置不是 UTF-8")?;
     let (mut cfg, diags) = f::parse(&text, path);
     if let Some(d) = diags.iter().find(|d| d.is_error()) {
         return Err(format!(
@@ -285,7 +271,13 @@ pub(super) fn chain(path: &Path, home: Option<&Path>, structural: bool) -> Resul
                     });
                     continue;
                 }
-                Err(e) => return Err(format!("第 {} 项的 {name}：{}", i + 1, safe_issue(e))),
+                Err(e) => {
+                    return Err(format!(
+                        "第 {} 项的 {name}：{}",
+                        i + 1,
+                        e.safe_issue(current())
+                    ));
+                }
             };
             if entry
                 .stages
@@ -593,7 +585,7 @@ pub(super) fn run(name: &str, args: &[String]) -> Result<(), crate::CliError> {
             Ok(())
         }
         ("check", [r, "--config", p]) => {
-            let role = load(r, &["--config".into(), (*p).into()], home.unwrap_or(Path::new(".")), config::Variables { structural: true, ..Default::default() }).map_err(safe_issue)?;
+            let role = load(r, &["--config".into(), (*p).into()], home.unwrap_or(Path::new(".")), config::Variables { structural: true, ..Default::default() }).map_err(|e|e.safe_issue(current()))?;
             println!("{r} 角色配置结构有效。"); unchecked([&role], false, false); Ok(())
         }
         ("try", [p, "--request", sample]) => crate::dryrun::run(Path::new(p), Path::new(sample), home, false),
@@ -689,9 +681,9 @@ fn offline_accepts_verbatim_disk_but_not_device_or_share_paths() {
         r"\\?\GLOBALROOT\Device\Null",
         "NUL.txt",
     ] {
-        assert_eq!(offline_read(Path::new(name)), Err(OFFLINE_TYPE));
+        assert_eq!(offline_read(Path::new(name)), Err(LoadIssue::File));
     }
-    assert_eq!(offline_read(dir.path()), Err(OFFLINE_TYPE));
+    assert_eq!(offline_read(dir.path()), Err(LoadIssue::File));
 }
 /// FIFO 的写端无需存在；打开后在同一句柄上拒绝它，而不是等待另一进程写入。
 #[cfg(all(test, unix))]
@@ -703,5 +695,5 @@ fn offline_refuses_fifo_without_a_writer() {
     let c = CString::new(path.as_os_str().as_bytes()).unwrap();
     // SAFETY: 名称以 NUL 结尾且只在测试私有目录内创建节点。
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-    assert_eq!(offline_read(&path), Err(OFFLINE_TYPE));
+    assert_eq!(offline_read(&path), Err(LoadIssue::File));
 }

@@ -146,24 +146,27 @@ impl Keys {
             .flat_map(|p| p.keys.iter().map(|k| k.env.as_str()))
     }
     /// 在 hello 前检查份额总数、认证名与 origin 的唯一性。
-    pub fn load(path: config::Source<'_>, variables: &config::Variables) -> Result<Self, String> {
+    pub fn load(
+        path: config::Source<'_>,
+        variables: &config::Variables,
+    ) -> Result<Self, config::LoadIssue> {
         let mut cfg: Self = config::load(path)?;
         let mut origins = std::collections::HashSet::new();
         if cfg.pool.is_empty() {
-            return Err("至少需要一个密钥池".into());
+            return Err("at least one credential pool is required".into());
         }
         if cfg.cooldown_status.iter().any(|s| !(100..=599).contains(s)) {
-            return Err("冷却状态码必须在 100 到 599 之间".into());
+            return Err("cooldown status must be between 100 and 599".into());
         }
         for pool in &mut cfg.pool {
             let url = config::endpoint(&pool.origin)?;
             if url.path() != "/" || url.query().is_some() || !origins.insert(url.origin()) {
-                return Err("密钥池的 origin 无效或重复".into());
+                return Err("invalid or duplicate credential pool origin".into());
             }
             pool.origin = url.origin().ascii_serialization();
             for key in &mut pool.keys {
                 key.value = config::credential(&key.env, &pool.scheme, variables)
-                    .map_err(|f| format!("环境变量 {:?}：{}", key.env, f.wire()))?;
+                    .map_err(|f| format!("environment variable {:?}: {}", key.env, f.wire()))?;
             }
             pool.header = config::credential_header(&pool.header)?.to_string();
             let origin_bytes = config::state_string_bytes(&pool.origin);
@@ -172,7 +175,7 @@ impl Keys {
                 .iter()
                 .any(|k| origin_bytes + config::state_string_bytes(&k.id) + 3 > config::STATE_BYTES)
             {
-                return Err("密钥标识生成的状态超过 64 KiB".into());
+                return Err("state generated from credential identifiers exceeds 64 KiB".into());
             }
             let mut ids = std::collections::HashSet::new();
             if pool.keys.is_empty()
@@ -181,7 +184,9 @@ impl Keys {
                     .iter()
                     .any(|k| k.id.is_empty() || !ids.insert(&k.id) || k.weight == 0)
             {
-                return Err("密钥池为空、标识重复或权重无效".into());
+                return Err(
+                    "empty credential pool, duplicate identifier, or invalid weight".into(),
+                );
             }
         }
         Ok(cfg)

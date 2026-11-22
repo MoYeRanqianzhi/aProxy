@@ -24,7 +24,7 @@ pub fn translate_request(from: WireFormat, to: WireFormat, body: &Value) -> Resu
                     .or_insert_with(|| serde_json::json!({}))
                     .as_object_mut()
             })
-            .ok_or("stream_options 必须是对象")?;
+            .ok_or("stream_options must be an object")?;
         options.insert("include_usage".into(), true.into());
     }
     Ok(out)

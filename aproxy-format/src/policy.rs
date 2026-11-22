@@ -57,7 +57,7 @@ fn pattern<'de, D: serde::Deserializer<'de>>(
 ) -> Result<Option<regex::bytes::Regex>, D::Error> {
     regex::bytes::Regex::new(&String::deserialize(d)?)
         .map(Some)
-        .map_err(|_| serde::de::Error::custom("错误体正则无效"))
+        .map_err(|_| serde::de::Error::custom("invalid error body regular expression"))
 }
 impl Rule {
     /// 明确选择成功状态或纯正文检测时才需要看到成功响应。
@@ -138,7 +138,7 @@ impl Template {
 }
 impl Policy {
     /// 无配置的 policy 只弃权；配置错误在 hello 前报告。
-    pub fn load(path: Option<config::Source<'_>>) -> Result<Self, &'static str> {
+    pub fn load(path: Option<config::Source<'_>>) -> Result<Self, config::LoadIssue> {
         let p: Self = match path {
             Some(p) => config::load(p)?,
             None => Self::default(),
@@ -152,7 +152,7 @@ impl Policy {
                     .as_ref()
                     .is_some_and(|s| s.is_empty() || !ids.insert(s))
             {
-                return Err("判定规则的状态码、错误类或标识无效");
+                return Err("invalid status, failure class, or identifier in decision rule".into());
             }
             if rule.decision == w::Decision::Retry && rule.response.is_some()
                 || rule.decision == w::Decision::Stop
@@ -160,7 +160,7 @@ impl Policy {
                         || rule.delay_ms.is_some()
                         || rule.respect_retry_after)
             {
-                return Err("判定规则的动作与决定不一致");
+                return Err("rule action is inconsistent with the decision".into());
             }
         }
         Ok(p)

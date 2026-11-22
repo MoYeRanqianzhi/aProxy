@@ -842,7 +842,7 @@ fn credential_slots_require_history_protected_names() {
             .unwrap();
         let error = String::from_utf8(out.stderr).unwrap();
         assert!(
-            !out.status.success() && out.stdout.is_empty() && error.contains("脱敏"),
+            !out.status.success() && out.stdout.is_empty() && error.contains("redacted"),
             "{role}: {error}"
         );
         assert!(!error.contains("fixture-private"));
@@ -944,7 +944,7 @@ fn managed_header_slots_fail_before_hello() {
         assert!(!out.status.success() && out.stdout.is_empty());
         let err = String::from_utf8(out.stderr).unwrap();
         assert!(
-            err.contains("代理管理") && !err.contains("private-fixture"),
+            err.contains("proxy-managed") && !err.contains("private-fixture"),
             "{err}"
         );
     }
@@ -2328,7 +2328,7 @@ fn translate_help_distinguishes_single_requests_from_chain_roles() {
         "--from",
         "--to",
         "openai_responses",
-        "标准输入",
+        "stdin",
         "convert",
         "check",
         "try",
@@ -2542,13 +2542,13 @@ fn all_commands_explain_options_and_an_example_before_io() {
                 "{cmd}: {out:?}"
             );
             let text = String::from_utf8(out.stdout).unwrap();
-            for term in ["用法", "示例", cmd, "--help"] {
+            for term in ["Usage:", "Example:", cmd, "--help"] {
                 assert!(text.contains(term), "{cmd}: {text}");
             }
             for term in match cmd {
                 "init" => vec!["--output"],
                 "check" => vec!["--config", "--home"],
-                "try" => vec!["--request", "--home", "--allow-external", "网络"],
+                "try" => vec!["--request", "--home", "--allow-external", "network"],
                 "translate" | "convert" => vec!["--from", "--to"],
                 _ => vec!["--config"],
             } {

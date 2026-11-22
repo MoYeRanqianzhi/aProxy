@@ -22,7 +22,7 @@ pub struct Rewrite {
 }
 impl Rewrite {
     /// 在 hello 之前拒绝无效的指针转义和不能由代理送出的 HTTP 值。
-    pub fn load(path: Option<config::Source<'_>>) -> Result<Self, &'static str> {
+    pub fn load(path: Option<config::Source<'_>>) -> Result<Self, config::LoadIssue> {
         let mut cfg: Self = match path {
             Some(p) => config::load(p)?,
             None => Self::default(),
@@ -30,7 +30,7 @@ impl Rewrite {
         let name = |s: &str| {
             http::HeaderName::from_bytes(s.as_bytes())
                 .map(|h| h.to_string())
-                .map_err(|_| "改写头名称无效")
+                .map_err(|_| "invalid rewrite header name")
         };
         for h in &mut cfg.remove_headers {
             *h = name(h)?;
@@ -39,31 +39,31 @@ impl Rewrite {
             let key = name(&key)?;
             // 此角色不拥有目标 origin；认证值必须由选定渠道或密钥池写入，重试时才不会串用。
             if aproxy_ipc::redact::is_secret_header(&key) {
-                return Err("set_headers 不接受凭据头，请使用 keys 或 route");
+                return Err("set_headers does not accept credentials; use keys or route".into());
             }
             if aproxy_ipc::redact::is_managed_request_header(&key) {
-                return Err("set_headers 不接受代理管理的头");
+                return Err("set_headers does not accept proxy-managed headers".into());
             }
             if !http::HeaderValue::from_str(&value).is_ok_and(|v| v.to_str().is_ok()) {
-                return Err("改写头的值无效");
+                return Err("invalid rewrite header value".into());
             }
             if cfg.set_headers.insert(key, value).is_some() {
-                return Err("改写头名称重复");
+                return Err("duplicate rewrite header name".into());
             }
         }
         for p in cfg.remove.iter().chain(cfg.set.keys()) {
             let mut chars = p.chars();
             if !p.is_empty() && chars.next() != Some('/') {
-                return Err("JSON Pointer 无效");
+                return Err("invalid JSON Pointer".into());
             }
             while let Some(c) = chars.next() {
                 if c == '~' && !matches!(chars.next(), Some('0' | '1')) {
-                    return Err("JSON Pointer 无效");
+                    return Err("invalid JSON Pointer".into());
                 }
             }
         }
         if cfg.remove.iter().any(String::is_empty) {
-            return Err("不能删除 JSON 根值");
+            return Err("cannot remove the JSON root".into());
         }
         Ok(cfg)
     }

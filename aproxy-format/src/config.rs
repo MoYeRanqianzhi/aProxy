@@ -5,6 +5,53 @@ use std::path::{Path, PathBuf};
 use url::Url;
 
 pub(crate) use crate::role_text::Fault;
+use crate::text;
+use aproxy_ipc::i18n::Lang;
+
+/// 角色加载错误有两种读者。只有三个离线文件类别和公开词表里的字段可从工具原样展示；
+/// 工作进程可报告自己的加载原因，但其环境名等不能出现在静态检查的诊断中。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LoadIssue {
+    /// 白名单中的字段名称，不来自用户的原文。
+    Field(&'static str),
+    /// 输入不是可安全读取的本地普通文件。
+    File,
+    /// 按已持有的文件句柄读取时超过限额。
+    Size,
+    /// 离线读取的角色 TOML 不是文本。
+    Utf8,
+    /// 仅供角色工作进程自己诊断，不向离线检查者转述。
+    Other(String),
+}
+impl LoadIssue {
+    /// 按分类挑选可交付的文字，不让任意带有相同前缀的环境名变成可信的字段诊断。
+    pub(super) fn safe_issue(&self, lang: Lang) -> String {
+        match self {
+            Self::Field(field) => format!("{}{field}", text::field(lang)),
+            Self::File => text::file(lang).into(),
+            Self::Size => text::size(lang).into(),
+            Self::Utf8 => text::utf8(lang).into(),
+            Self::Other(_) => text::invalid_role(lang).into(),
+        }
+    }
+    /// 直接运行角色时写入工作进程 stderr 的英文。
+    pub(super) fn worker(self) -> String {
+        match self {
+            Self::Other(s) => s,
+            other => other.safe_issue(Lang::En),
+        }
+    }
+}
+impl From<&str> for LoadIssue {
+    fn from(s: &str) -> Self {
+        Self::Other(s.into())
+    }
+}
+impl From<String> for LoadIssue {
+    fn from(s: String) -> Self {
+        Self::Other(s)
+    }
+}
 
 /// 工具提供已安全读取的文本，而工作进程仍按操作者原有的路径规则打开文件。
 #[derive(Clone, Copy)]
@@ -19,27 +66,28 @@ pub fn role_path(path: &str) -> Result<PathBuf, &'static str> {
     if let Some(rest) = path.strip_prefix("~/") {
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
-            .ok_or("找不到用户目录")?;
+            .ok_or("cannot locate the user directory")?;
         Ok(PathBuf::from(home).join(rest))
     } else {
         Ok(Path::new(path).into())
     }
 }
 /// 工具与工作进程共用配置校验，不向标准错误复制可能含凭据的路径或原文。
-pub fn load<T: DeserializeOwned>(source: Source<'_>) -> Result<T, &'static str> {
+pub fn load<T: DeserializeOwned>(source: Source<'_>) -> Result<T, LoadIssue> {
     let owned;
     let text = match source {
         Source::Worker(path) => {
-            owned = std::fs::read_to_string(role_path(path)?).map_err(|_| "无法读取角色配置")?;
+            owned = std::fs::read_to_string(role_path(path)?)
+                .map_err(|_| "cannot read role configuration")?;
             &owned
         }
         Source::Offline(text) => text,
     };
-    let generic = "角色配置无效，请检查字段名称与类型";
+    let generic = "invalid role configuration; check field names and types";
     let de = toml::de::Deserializer::parse(text).map_err(|_| generic)?;
     serde_path_to_error::deserialize(de).map_err(|err| {
         // 路径中可能有用户自定义的头名、模型名或 JSON 指针。只从公开配置词表选一个诊断，绝不回显原段。
-        macro_rules! known { ($key:expr; $($name:literal),+) => { match $key {$($name=>Some(concat!("角色配置字段无效：",$name)),)+ _=>None} }; }
+        macro_rules! known { ($key:expr; $($name:literal),+) => { match $key {$($name=>Some($name),)+ _=>None} }; }
         let mut field = None;
         for (depth, segment) in err.path().iter().enumerate() {
             let serde_path_to_error::Segment::Map { key } = segment else { continue; };
@@ -48,20 +96,20 @@ pub fn load<T: DeserializeOwned>(source: Source<'_>) -> Result<T, &'static str> 
             // 表边界之后的成员名是操作者的数据，即便恰好与别处的字段同名也不能回显。
             if matches!(key.as_str(), "aliases" | "overrides" | "set" | "set_headers") || depth == 0 && key == "models" { break; }
         }
-        field.unwrap_or(generic)
+        field.map(LoadIssue::Field).unwrap_or_else(||generic.into())
     })
 }
 
 /// 只允许绝对 HTTP(S) 目的地，不把 URL 自带的凭据或片段带到其他渠道。
 pub fn endpoint(value: &str) -> Result<Url, &'static str> {
-    let u = Url::parse(value).map_err(|_| "上游地址无效")?;
+    let u = Url::parse(value).map_err(|_| Fault::UpstreamUrl.wire())?;
     if !matches!(u.scheme(), "http" | "https")
         || u.host().is_none()
         || !u.username().is_empty()
         || u.password().is_some()
         || u.fragment().is_some()
     {
-        return Err("上游地址无效");
+        return Err(Fault::UpstreamUrl.wire());
     }
     Ok(u)
 }
@@ -74,7 +122,7 @@ pub fn state_string_bytes(value: &str) -> usize {
         STATE_BYTES + 1
     } else {
         serde_json::to_string(value)
-            .expect("字符串总能编码为 JSON")
+            .expect("strings must serialize to JSON")
             .len()
     }
 }
@@ -86,12 +134,13 @@ pub fn strip_credentials(h: &mut Headers) {
 
 /// 配置指定的凭据头既要能写入 HTTP 请求，也要能在请求历史里仅凭头名就被脱敏。
 pub fn credential_header(name: &str) -> Result<http::HeaderName, &'static str> {
-    let header = http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| "鉴权头名称无效")?;
+    let header = http::HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| "invalid authentication header name")?;
     if aproxy_ipc::redact::is_managed_request_header(header.as_str()) {
-        return Err("鉴权头不能使用代理管理的名称");
+        return Err("authentication headers must not use a proxy-managed name");
     }
     if !aproxy_ipc::redact::is_secret_header(header.as_str()) {
-        return Err("鉴权头必须使用请求历史会脱敏的名称");
+        return Err("authentication headers must use a name redacted in request history");
     }
     Ok(header)
 }
@@ -186,4 +235,17 @@ fn credential_overlay_uses_windows_name_ordering() {
         credential("T06_Ä_KEY", "", &variables).map_err(|e| e.wire()),
         Ok("last".into())
     );
+}
+
+/// 即使外部诊断伪装成公开字段错误，显示端也只信类型，不信前缀。
+#[test]
+fn offline_diagnostics_only_reveal_typed_fields() {
+    let private = LoadIssue::Other("角色配置字段无效：operator-secret".into());
+    for (lang, expected) in [
+        (Lang::En, "Invalid role configuration field: model"),
+        (Lang::Zh, "角色配置字段无效：model"),
+    ] {
+        assert_eq!(LoadIssue::Field("model").safe_issue(lang), expected);
+        assert!(!private.safe_issue(lang).contains("operator-secret"));
+    }
 }

@@ -1024,7 +1024,8 @@ pub(super) fn run(
             "注意：试跑工具自身不打开网络连接。外部程序会收到样例和环境变量，能任意使用它们，包括访问网络；只运行你信任的程序。"
         );
     }
-    let input = tools::offline_read(sample)?;
+    let input =
+        tools::offline_read(sample).map_err(|e| e.safe_issue(aproxy_ipc::i18n::current()))?;
     let sample: Sample =
         serde_json::from_slice(&input).map_err(|_| "试跑样例不是有效的请求描述")?;
     rehearse(path, sample, home, external, &mut std::io::stdout().lock())

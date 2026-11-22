@@ -19,7 +19,7 @@ pub enum Matcher {
 /// 不把无效表达式（可能误填了凭据）原样写入诊断。
 fn read_regex<'de, D: serde::Deserializer<'de>>(d: D) -> Result<regex::Regex, D::Error> {
     regex::Regex::new(&String::deserialize(d)?)
-        .map_err(|_| serde::de::Error::custom("模型正则无效"))
+        .map_err(|_| serde::de::Error::custom("invalid model regular expression"))
 }
 /// 渠道在同优先级内缺省占一份，最低优先级数字先尝试。
 fn unit_weight() -> u64 {
@@ -226,11 +226,11 @@ impl Route {
         Ok(())
     }
     /// 在握手之前发现重复标识、非法 URL 和无效头名。
-    pub fn load(path: config::Source<'_>) -> Result<Self, &'static str> {
+    pub fn load(path: config::Source<'_>) -> Result<Self, config::LoadIssue> {
         let mut cfg: Self = config::load(path)?;
         let mut ids = std::collections::HashSet::new();
         if cfg.channel.is_empty() {
-            return Err("至少需要一个渠道");
+            return Err("at least one channel is required".into());
         }
         // 未匹配别名时编码 null；预先取最长的别名，不必逐项枚举渠道与别名的笛卡尔积。
         let alias_bytes = cfg
@@ -247,18 +247,20 @@ impl Route {
             .any(|r| r.model.is_empty() || !models.insert(&r.model) || !valid_leaves(&r.overrides))
             || cfg.channel.iter().any(|c| !valid_leaves(&c.overrides))
         {
-            return Err("模型规则重复、为空或覆盖项无效");
+            return Err("duplicate or empty model rule, or invalid override".into());
         }
         for c in &cfg.channel {
             if c.weight == 0 {
-                return Err("渠道权重须为正数");
+                return Err("channel weight must be positive".into());
             }
             if config::state_string_bytes(&c.id) + alias_bytes + 24 > config::STATE_BYTES {
-                return Err("渠道标识与别名生成的状态超过 64 KiB");
+                return Err(
+                    "state generated from channel identifiers and aliases exceeds 64 KiB".into(),
+                );
             }
             config::endpoint(&c.url)?;
             if c.id.is_empty() || !ids.insert(&c.id) {
-                return Err("渠道标识为空或重复");
+                return Err("empty or duplicate channel identifier".into());
             }
             if let Some(name) = &c.credential_env {
                 config::credential_name(name).map_err(|fault| fault.wire())?;
@@ -286,7 +288,9 @@ impl Route {
         let mut wire = w::Overrides::new();
         for (name, v) in entries {
             if self.offered.contains(name) {
-                let (group, leaf) = name.split_once('.').expect("加载时校验叶键");
+                let (group, leaf) = name
+                    .split_once('.')
+                    .expect("leaf keys were validated during loading");
                 wire.entry(group).or_insert_with(|| serde_json::json!({}))[leaf] = v.clone();
             }
         }
@@ -317,7 +321,7 @@ impl Route {
                 crate::selection::preferred(b"route", ticket, group.iter().copied(), |c| {
                     (&c.id, c.weight)
                 })
-                .expect("组非空");
+                .expect("group is nonempty");
             let first = group.iter().position(|c| c.id == selected.id).unwrap();
             group[..=first].rotate_right(1);
         }

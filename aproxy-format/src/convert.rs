@@ -83,7 +83,8 @@ enum Entity {
 }
 /// 不向诊断复制用户输入的协议名。
 pub fn protocol(s: &str) -> Result<F, &'static str> {
-    serde_json::from_value(Value::String(s.into())).map_err(|_| "未知协议名称")
+    serde_json::from_value(Value::String(s.into()))
+        .map_err(|_| crate::text::unknown_protocol(aproxy_ipc::i18n::Lang::En))
 }
 /// 标准客户端路径比共享的 messages 字段更能区分 Anthropic 与 Chat。
 fn path(f: F) -> &'static str {
@@ -118,7 +119,7 @@ impl Convert {
     /// 握手前校验协议、映射唯一性与匹配边界，auto 留到看到实际请求再解析。
     pub fn validate(&mut self) -> Result<(), &'static str> {
         if self.stream_budget_bytes == 0 {
-            return Err("stream_budget_bytes 必须大于零");
+            return Err("stream_budget_bytes must be positive");
         }
         if self.from != "auto" {
             protocol(&self.from)?;
@@ -126,14 +127,14 @@ impl Convert {
         if self.to != "auto" {
             protocol(&self.to)?;
             if !self.upstream.is_empty() {
-                return Err("目的端协议表只用于 to=auto");
+                return Err("destination protocol mappings require to=auto");
             }
         }
         let mut seen = std::collections::HashSet::new();
         for d in &mut self.upstream {
             let mut url = config::endpoint(&d.origin)?;
             if url.path() != "/" || url.query().is_some() {
-                return Err("目的端映射必须给出 origin");
+                return Err("destination mapping requires an origin");
             }
             d.origin = url.origin().ascii_serialization();
             if !d.path_prefix.is_empty()
@@ -141,13 +142,13 @@ impl Convert {
                     || d.path_prefix.contains(['?', '#', '\\'])
                     || !crate::route::safe_child_path(d.path_prefix.as_bytes()))
             {
-                return Err("目的端路径前缀无效");
+                return Err("invalid destination path prefix");
             }
             // URL.path() 使用百分号编码。配置也按 URL 的路径表示归一化，再比较完整段。
             url.set_path(&d.path_prefix);
             d.path_prefix = url.path().trim_end_matches('/').to_owned();
             if !seen.insert((d.origin.clone(), d.path_prefix.clone())) {
-                return Err("目的端协议映射重复");
+                return Err("duplicate destination protocol mapping");
             }
         }
         self.upstream
@@ -239,8 +240,10 @@ impl Convert {
         } else {
             false
         };
-        r.state =
-            Some(serde_json::to_string(&Session(from, to, usage)).expect("可序列化的协议与布尔值"));
+        r.state = Some(
+            serde_json::to_string(&Session(from, to, usage))
+                .expect("protocols and booleans must serialize"),
+        );
         r.report = config::report(
             "Selected the protocol conversion",
             w::StandardAction::ProtocolConvert {
@@ -368,7 +371,8 @@ impl Convert {
             r.response = Some(p);
             // 空正文的实际回信包含已过滤的所有响应头、seq、字段名和引号，换行再占一字节。
             let mut overhead = LineSize(1);
-            serde_json::to_writer(&mut overhead, &r).expect("空正文回信可序列化");
+            serde_json::to_writer(&mut overhead, &r)
+                .expect("a reply with an empty body must serialize");
             let capacity = self
                 .reply_bytes
                 .checked_sub(overhead.0)

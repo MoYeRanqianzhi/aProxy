@@ -1,5 +1,9 @@
 //! 每个角色是独立的协议 1 工作进程。首行协商、逐行应答，直到 aproxy 关闭标准输入。
 //! `translate` 只读一个 JSON 请求，既不参与握手也不运行处理链。
+/// 帮助、工具用法与安全的文件诊断。
+#[path = "i18n/cli.rs"]
+mod text;
+use aproxy_ipc::i18n::{Lang, current};
 mod adaptive;
 mod config;
 mod convert;
@@ -50,22 +54,22 @@ struct Options<'a> {
 }
 impl<'a> Options<'a> {
     /// 重复、缺值或未知选项都是配置错误。
-    fn parse(args: &'a [String]) -> Result<Self, &'static str> {
+    fn parse(args: &'a [String], lang: Lang) -> Result<Self, &'static str> {
         let mut result = Self::default();
         let mut iter = args.iter().map(String::as_str);
         while let Some(arg) = iter.next() {
             let (name, value) = match arg.split_once('=') {
                 Some(pair) => pair,
-                None => (arg, iter.next().ok_or("参数缺少值")?),
+                None => (arg, iter.next().ok_or(text::missing_value(lang))?),
             };
             let slot = match name {
                 "--config" => &mut result.config,
                 "--from" => &mut result.from,
                 "--to" => &mut result.to,
-                _ => return Err("未知参数"),
+                _ => return Err(text::unknown_option(lang)),
             };
             if value.is_empty() || slot.replace(value).is_some() {
-                return Err("参数重复或为空");
+                return Err(text::duplicate(lang));
             }
         }
         Ok(result)
@@ -74,9 +78,10 @@ impl<'a> Options<'a> {
 impl Role {
     /// 握手前完成静态配置检查，不会用半套配置处理请求。
     fn load(name: &str, args: &[String]) -> Result<Self, String> {
-        let opt = Options::parse(args)?;
+        let opt = Options::parse(args, Lang::En)?;
         let file = opt.config.map(config::Source::Worker);
         Self::configured(name, opt, file, config::Variables::default())
+            .map_err(config::LoadIssue::worker)
     }
     /// 工具与协议进程复用同一份加载与校验；只隔离角色文件的位置和环境作用域。
     fn configured(
@@ -84,7 +89,7 @@ impl Role {
         opt: Options<'_>,
         file: Option<config::Source<'_>>,
         vars: config::Variables,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, config::LoadIssue> {
         if name == "convert" {
             return Ok(Self::Convert(match (file, opt.from, opt.to) {
                 (Some(p), None, None) => {
@@ -93,24 +98,27 @@ impl Role {
                     c
                 }
                 (None, Some(f), Some(t)) => convert::Convert::new(f, t)?,
-                _ => return Err("convert 需指定 --config 或 --from 与 --to".into()),
+                _ => return Err("convert requires --config or both --from and --to".into()),
             }));
         }
         if opt.from.is_some() || opt.to.is_some() {
-            return Err("此角色不接受协议参数".into());
+            return Err(text::no_protocol_options(Lang::En).into());
         }
         Ok(match name {
             "heartbeat" => Self::Heartbeat(heartbeat::Heartbeat::load(file)?),
             "policy" => Self::Policy(policy::Policy::load(file)?),
             "rewrite" => Self::Rewrite(rewrite::Rewrite::load(file)?),
-            "keys" => Self::Keys(keys::Keys::load(file.ok_or("keys 需要 --config")?, &vars)?),
+            "keys" => Self::Keys(keys::Keys::load(
+                file.ok_or("keys requires --config")?,
+                &vars,
+            )?),
             "route" => {
-                let mut r = route::Route::load(file.ok_or("route 需要 --config")?)?;
+                let mut r = route::Route::load(file.ok_or("route requires --config")?)?;
                 r.variables = vars;
                 Self::Route(r)
             }
             "adaptive" => Self::Adaptive(adaptive::Adaptive::load(file)?),
-            _ => return Err(USAGE.into()),
+            _ => return Err(text::usage(Lang::En).into()),
         })
     }
     /// 能力同时约束握手与消息分派，配置不启用的回程也不能进入角色处理器。
@@ -270,11 +278,15 @@ pub fn replay_keys_at(
     worker("keys", Role::Keys(keys), input, output).map_err(String::from)
 }
 /// 只在标准输出写一行 JSON 并立即 flush；管道断开直接结束，不循环输出错误。
-fn emit(out: &mut impl Write, value: &impl serde::Serialize) -> Result<(), &'static str> {
-    serde_json::to_writer(&mut *out, value).map_err(|_| "无法写入标准输出")?;
+fn emit(
+    out: &mut impl Write,
+    value: &impl serde::Serialize,
+    lang: Lang,
+) -> Result<(), &'static str> {
+    serde_json::to_writer(&mut *out, value).map_err(|_| text::stdout(lang))?;
     out.write_all(b"\n")
         .and_then(|_| out.flush())
-        .map_err(|_| "无法写入标准输出")
+        .map_err(|_| text::stdout(lang))
 }
 /// 纯元数据帧包括 decide 预览；协商整包或订阅回程的角色须容纳经 JSON 或 base64 转义的实体。
 fn input_limit(hello: &w::HelloReply) -> u64 {
@@ -304,124 +316,121 @@ fn worker(
             .by_ref()
             .take(limit)
             .read_until(b'\n', &mut line)
-            .map_err(|_| "无法读取标准输入")?;
+            .map_err(|_| text::stdin(Lang::En))?;
         if line.is_empty() {
             return Ok(());
         }
         if !line.ends_with(b"\n") {
             return Err(if line.len() as u64 == limit {
-                "协议帧超过长度上限"
+                "protocol frame exceeds the length limit"
             } else {
-                "协议帧缺少结尾换行"
+                "protocol frame is missing its terminating newline"
             });
         }
-        let m: w::Message = serde_json::from_slice(&line).map_err(|_| "协议帧无效")?;
+        let m: w::Message = serde_json::from_slice(&line).map_err(|_| "invalid protocol frame")?;
         if m.v != 1 || m.seq != next {
-            return Err("协议版本或序号不匹配");
+            return Err("protocol version or sequence number mismatch");
         }
         if next == 0 {
             let w::Stage::Hello(offer) = m.stage else {
-                return Err("首帧必须是 hello");
+                return Err("the first frame must be hello");
             };
             if !offer.protocols.contains(&1) {
-                return Err("不支持此协议版本");
+                return Err("unsupported protocol version");
             }
             let hello = role.hello(name, &offer);
             limit = input_limit(&hello);
-            emit(&mut out, &hello)?;
+            emit(&mut out, &hello, Lang::En)?;
         } else {
             if matches!(m.stage, w::Stage::Hello(_)) {
-                return Err("重复的 hello");
+                return Err("duplicate hello");
             }
-            emit(&mut out, &role.handle(&m, aproxy_ipc::i18n::Lang::En))?;
+            emit(&mut out, &role.handle(&m, Lang::En), Lang::En)?;
         }
     }
     Ok(())
 }
 /// 无信封的一次性协议转换。出错只给诊断类别，不回显含消息或密钥的原始输入。
-fn translate_once(args: &[String]) -> Result<(), &'static str> {
-    let opt = Options::parse(args)?;
+fn translate_once(args: &[String], lang: Lang) -> Result<(), &'static str> {
+    let opt = Options::parse(args, lang)?;
     let (None, Some(from), Some(to)) = (opt.config, opt.from, opt.to) else {
-        return Err("用法: aproxy-format translate --from <协议> --to <协议>");
+        return Err(text::translate_usage(lang));
     };
-    let from = convert::protocol(from)?;
-    let to = convert::protocol(to)?;
+    let from = convert::protocol(from).map_err(|_| text::unknown_protocol(lang))?;
+    let to = convert::protocol(to).map_err(|_| text::unknown_protocol(lang))?;
     let mut input = Vec::new();
     std::io::stdin()
         .read_to_end(&mut input)
-        .map_err(|_| "无法读取标准输入")?;
+        .map_err(|_| text::stdin(lang))?;
     let body = std::str::from_utf8(&input)
         .ok()
         .and_then(|s| serde_json::from_str(s.trim()).ok())
-        .ok_or("请求体不是 JSON")?;
-    let value = translate::translate_request(from, to, &body).map_err(|_| "请求协议转换失败")?;
-    emit(&mut std::io::stdout().lock(), &value)
+        .ok_or(Fault::RequestJson.render(lang))?;
+    let value = translate::translate_request(from, to, &body)
+        .map_err(|_| Fault::RequestConversion.render(lang))?;
+    emit(&mut std::io::stdout().lock(), &value, lang)
 }
-/// 角色命令只选一个职责；工具子命令不入协议循环。
-const USAGE: &str = "用法: aproxy-format <convert|keys|route|policy|adaptive|rewrite|heartbeat|init|check|try|translate> [参数]";
 /// 同一入口处理帮助，不触碰配置或标准流协议；示例可独立阅读，不要求先启动实例。
-fn help(name: &str) -> Result<(), String> {
+fn help(name: &str, lang: Lang) -> Result<(), String> {
     let (usage, options, example) = match name {
         "convert" => (
-            "(--from 客户端协议 --to 上游协议 | --config 文件)",
-            "--from、--to 选择两端协议，可用 auto；--config 改用 TOML 指定协议与转换预算。",
+            text::convert_usage(lang),
+            text::convert_help(lang),
             "--from anthropic_messages --to openai_chat",
         ),
         "translate" => (
-            "--from 源协议 --to 目标协议",
-            "--from、--to 可用 anthropic_messages、openai_chat、openai_responses。从标准输入读取一个 JSON 请求，向标准输出写入转换结果。代理链使用 convert，验证用 check，试跑用 try。",
+            text::translate_args(lang),
+            text::translate_help(lang),
             "--from openai_chat --to openai_responses < request.json",
         ),
         "keys" => (
-            "--config 文件",
-            "--config 指定密钥池、来源及环境变量名。",
+            text::config_file(lang),
+            text::keys_help(lang),
             "--config keys.toml",
         ),
         "route" => (
-            "--config 文件",
-            "--config 指定渠道、模型匹配与重试选路规则。",
+            text::config_file(lang),
+            text::route_help(lang),
             "--config route.toml",
         ),
         "rewrite" => (
-            "[--config 文件]",
-            "--config 指定模型、请求头和 JSON 字段的改写规则。",
+            text::config_optional(lang),
+            text::rewrite_help(lang),
             "--config rewrite.toml",
         ),
         "heartbeat" => (
-            "[--config 文件]",
-            "--config 指定保活帧的样式。",
+            text::config_optional(lang),
+            text::heartbeat_help(lang),
             "--config heartbeat.toml",
         ),
         "adaptive" => (
-            "[--config 文件]",
-            "--config 指定故障阈值与恢复条件。",
+            text::config_optional(lang),
+            text::adaptive_help(lang),
             "--config adaptive.toml",
         ),
         "policy" => (
-            "[--config 文件]",
-            "--config 指定尝试结束时的判定规则。",
+            text::config_optional(lang),
+            text::policy_help(lang),
             "--config policy.toml",
         ),
         "init" => (
-            "场景 --output 目录",
-            "--output 指定输出目录，不覆盖已有文件。场景：claude-relay、key-rotation、openrouter、adaptive-relay。",
+            text::init_args(lang),
+            text::init_help(lang),
             "key-rotation --output relay",
         ),
         "check" => (
-            "代理配置 [--home 目录] 或 check 角色 --config 文件 [--home 目录]",
-            "--config 指定单个角色文件；--home 指定实例工作目录。未指定时，链内相对路径以代理配置所在目录为准。只检查结构，不验证密钥是否可用。",
+            text::check_args(lang),
+            text::check_help(lang),
             "proxy.toml --home instance",
         ),
         "try" => (
-            "代理配置 --request 样例 [--home 目录] [--allow-external]",
-            "--request 指定 JSON 请求与模拟上游结果；--home 指定实例工作目录。试跑工具自身不打开网络连接。--allow-external 启动第三方程序，它会收到样例和环境变量，能任意使用它们，包括访问网络。遇到未模拟的步骤时退出码为 2，不继续输出推测结果。",
+            text::try_args(lang),
+            text::try_help(lang),
             "proxy.toml --request sample.json --home instance",
         ),
-        _ => return Err(USAGE.into()),
+        _ => return Err(text::usage(lang).into()),
     };
-    println!(
-        "用法：aproxy-format {name} {usage}\n{options}\n-h、--help 显示本说明。\n示例：aproxy-format {name} {example}"
-    );
+    println!("{}", text::help(lang, name, usage, options, example));
     Ok(())
 }
 /// 普通参数或输入错误与试跑明确不模拟的路径有不同的退出状态，调用者不需解析中文文案。
@@ -454,18 +463,20 @@ impl std::fmt::Display for CliError {
 pub fn run() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     // 协议角色只写给程序，不读取调用者的终端偏好。显式查角色帮助仍属于终端操作。
-    if args.is_empty()
-        || args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
-        || matches!(
-            args.first().map(String::as_str),
-            Some("init" | "check" | "try" | "translate")
-        )
+    let is_role = matches!(
+        args.first().map(String::as_str),
+        Some("adaptive" | "convert" | "heartbeat" | "keys" | "policy" | "rewrite" | "route")
+    );
+    if !is_role
+        || args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
     {
         aproxy_ipc::i18n::init_terminal(|| aproxy_ipc::home::resolve_home().ok());
     }
     let result = match args.split_first() {
         Some((name, [])) if name == "--help" || name == "-h" => {
-            println!("{USAGE}");
+            println!("{}", text::usage(current()));
             Ok(())
         }
         Some((name, rest))
@@ -473,12 +484,24 @@ pub fn run() {
                 .iter()
                 .any(|arg| matches!(arg.as_str(), "--help" | "-h")) =>
         {
-            help(name).map_err(CliError::from)
+            help(name, current()).map_err(CliError::from)
         }
         Some((name, rest)) if matches!(name.as_str(), "init" | "check" | "try") => {
             tools::run(name, rest)
         }
-        Some((name, rest)) if name == "translate" => translate_once(rest).map_err(CliError::from),
+        Some((name, rest)) if name == "translate" => {
+            translate_once(rest, current()).map_err(CliError::from)
+        }
+        Some((_, rest)) if !is_role => Options::parse(rest, current())
+            .map_err(CliError::from)
+            .and_then(|opt| {
+                Err(if opt.from.is_some() || opt.to.is_some() {
+                    text::no_protocol_options(current())
+                } else {
+                    text::usage(current())
+                }
+                .into())
+            }),
         Some((name, rest)) => Role::load(name, rest)
             .and_then(|role| {
                 worker(
@@ -490,7 +513,7 @@ pub fn run() {
                 .map_err(String::from)
             })
             .map_err(CliError::from),
-        None => Err(USAGE.into()),
+        None => Err(text::usage(current()).into()),
     };
     if let Err(e) = result {
         eprintln!("aproxy-format: {e}");
@@ -558,7 +581,7 @@ mod frame_tests {
         boundary.insert(boundary.len() - 1, b' ');
         assert_eq!(
             worker("adaptive", adaptive(), &boundary[..], Vec::new()),
-            Err("协议帧超过长度上限")
+            Err("protocol frame exceeds the length limit")
         );
         let mut convert =
             Role::Convert(convert::Convert::new("openai_chat", "openai_chat").unwrap());

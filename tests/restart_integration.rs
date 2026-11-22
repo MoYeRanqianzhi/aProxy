@@ -483,21 +483,31 @@ fn restart_early_exit_shows_startup_log_excerpt() {
         .as_bytes(),
     )
     .unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        wait_for(Duration::from_secs(20), || ipc_ping_in_dir(
+            &rt, port, &home
+        )
+        .is_ok_and(|s| s.activity.in_flight == 1)),
+        "旧实例应已接收尚未读完的请求"
+    );
 
     let restart = {
         // Command 在本线程里建好再交给子线程：它带着 TestHome 注入的环境
-        let mut cmd = cli(&test_home, &exe, &["restart", &port.to_string()]);
+        let mut cmd = cli(&test_home, &exe, &["restart", &port.to_string(), "--json"]);
         std::thread::spawn(move || cmd.output_ready().expect("运行 aproxy CLI 失败"))
     };
-    // 预检是毫秒级的；此刻旧实例正在等在途连接，新实例尚未 spawn
-    std::thread::sleep(Duration::from_millis(1500));
+    // stopping 只在通过预检并送达 shutdown 后才可见。半截请求仍在旧实例中，
+    // 改坏配置后才释放它，因而错误一定发生在接任进程，而不是发起者的预检里。
+    assert!(
+        wait_for(Duration::from_secs(20), || ipc_ping_in_dir(
+            &rt, port, &home
+        )
+        .is_ok_and(|s| s.state == aproxy::daemon::InstanceState::Stopping)),
+        "旧实例没有进入停止阶段"
+    );
     write_broken_cfg(&cfg, port);
-    std::thread::sleep(Duration::from_millis(300));
-    let released = Instant::now();
     drop(conn);
     let out = restart.join().unwrap();
-    let elapsed = released.elapsed();
     let stderr = text(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "新实例起不来应退出 1: {stderr}");
     assert!(
@@ -508,9 +518,16 @@ fn restart_early_exit_shows_startup_log_excerpt() {
         stderr.contains("TOML"),
         "应展示 startup.log 本次新增的配置错误: {stderr}"
     );
+    // 提前退出与等到就绪期限用的是不同的码；不把机器的调度速度当作判据。
+    let result = common::output_document(&out);
+    let error = &result["results"][0]["error"];
+    assert_eq!(error["code"], "start_failed");
     assert!(
-        elapsed < Duration::from_secs(7),
-        "提前退出应立即报告，不空等满 8 秒（放行停止后耗时 {elapsed:?}）"
+        error["details"]["startup_log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line.as_str().is_some_and(|s| s.contains("TOML")))
     );
 }
 

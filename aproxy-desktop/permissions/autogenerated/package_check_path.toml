@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-package-check-path"
+description = "Enables the package_check_path command without any pre-configured scope."
+commands.allow = ["package_check_path"]
+
+[[permission]]
+identifier = "deny-package-check-path"
+description = "Denies the package_check_path command without any pre-configured scope."
+commands.deny = ["package_check_path"]

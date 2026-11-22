@@ -812,7 +812,7 @@ pub trait UpdateOps: StateOps {
     fn install_update(&self, check: Token, progress: Progress) -> Task<'_, InstallEnd>;
 }
 /// The complete injected desktop service, including explicit opt-in login registration.
-pub trait DesktopOps: UpdateOps {
+pub trait DesktopOps: UpdateOps + super::PackageOps {
     /// Inspect this home's current-user OS registration and installed executable every time.
     fn read_autostart(&self) -> Task<'_, Registration>;
     /// Set/remove just this home's fixed registration, reread and verify.

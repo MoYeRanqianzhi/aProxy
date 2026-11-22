@@ -40,6 +40,9 @@
     "allow-check-update",
     "allow-install-update",
     "allow-read-autostart",
-    "allow-set-autostart"
+    "allow-set-autostart",
+    "allow-package-check-file",
+    "allow-package-check-path",
+    "allow-package-discard"
   ]
 }

@@ -978,3 +978,76 @@ pub(crate) async fn set_autostart(
     let a: Switch = args(&request)?;
     ops.set_autostart(a.enabled).await
 }
+
+/// 请求头使用 encodeURIComponent 的 UTF-8 字节表示；残缺的转义不能当作原文件名。
+fn name_header(request: &Request<'_>) -> R<String> {
+    let s = request
+        .headers()
+        .get("x-aproxy-file-name")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(Fault::DesktopBadInput {})?;
+    if s.is_empty()
+        || s.as_bytes().iter().enumerate().any(|(i, &b)| {
+            b == b'%'
+                && !s
+                    .as_bytes()
+                    .get(i + 1..i + 3)
+                    .is_some_and(|v| v.iter().all(u8::is_ascii_hexdigit))
+        })
+    {
+        return Err(Fault::DesktopBadInput {});
+    }
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8()
+        .map(|s| s.into_owned())
+        .map_err(|_| Fault::DesktopBadInput {})
+}
+/// 从选择器接收原始字节，不用 JSON 字节数组放大大文件。
+#[tauri::command]
+pub(crate) async fn package_check_file(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<PackageCheck> {
+    let name = name_header(&request)?;
+    let InvokeBody::Raw(bytes) = request.body() else {
+        return Err(Fault::DesktopBadInput {});
+    };
+    if bytes.len() > 64 << 20 {
+        return Err(Fault::DesktopPackage(PackageIssue {
+            reason: "limit".into(),
+            field: None,
+            path: None,
+            limit: Some("zip-bytes".into()),
+            max: Some(64 << 20),
+        }));
+    }
+    ops.package_check_file(name, bytes.clone()).await
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PathArgs {
+    path: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TokenArgs {
+    token: String,
+}
+/// 拖放可选 ZIP 或目录，校验后的源路径不进入 DTO。
+#[tauri::command]
+pub(crate) async fn package_check_path(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<PackageCheck> {
+    ops.package_check_path(args::<PathArgs>(&request)?.path)
+        .await
+}
+/// 取消安装只丢弃相应的暂存目录，不修改已安装包。
+#[tauri::command]
+pub(crate) async fn package_discard(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<()> {
+    ops.package_discard(args::<TokenArgs>(&request)?.token)
+        .await
+}

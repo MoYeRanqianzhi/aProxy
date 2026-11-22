@@ -135,6 +135,7 @@ Faults returned to the bundled desktop page. They do not change CLI exit codes.
 
 | Code | When | `details` |
 |---|---|---|
+| `desktop_package` | Package validation or a package operation failed. | `reason` (string), `field`? (string), `path`? (path), `limit`? (string), `max`? (integer) |
 | `desktop_toml` | The desktop preferences file could not be edited. | `kind` (string), `line`? (integer), `column`? (integer), `key`? (string) |
 
 ## Install codes

@@ -217,6 +217,8 @@ pub enum StopReason {
 pub enum StateFile {
     /// Preferences.
     Preferences,
+    /// Installed packages and extension data.
+    Packages,
     /// Bookmarks.
     Bookmarks,
 }
@@ -305,6 +307,8 @@ pub struct Issue {
     rename_all_fields = "camelCase"
 )]
 pub enum Fault {
+    /// Invalid package or package operation with portable context.
+    DesktopPackage(super::PackageIssue),
     /// Malformed arguments; never quote input.
     DesktopBadInput {},
     /// Required local service or IO unavailable.

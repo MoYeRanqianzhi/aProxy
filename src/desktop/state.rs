@@ -125,7 +125,7 @@ fn public_pins(mut list: Vec<Bookmark>, s: Option<&aproxy_ipc::redact::Secrets>)
     list
 }
 impl DesktopHome {
-    async fn state_work<T: Send + 'static>(
+    pub(super) async fn state_work<T: Send + 'static>(
         &self,
         f: StateFile,
         work: impl FnOnce(DesktopHome, Store) -> R<T> + Send + 'static,

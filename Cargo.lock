@@ -145,6 +145,7 @@ version = "0.2.0-alpha.4"
 dependencies = [
  "aproxy-ipc",
  "base64 0.22.1",
+ "percent-encoding",
  "serde",
  "serde_json",
  "tauri",

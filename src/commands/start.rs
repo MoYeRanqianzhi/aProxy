@@ -37,10 +37,7 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) -> u8 {
     if args.api_key.as_deref() == Some("-") {
         match crate::util::read_secret_line() {
             Ok(key) => args.api_key = Some(key),
-            Err(e) => {
-                eprintln!("{e}");
-                return 1;
-            }
+            Err(e) => return e.report(json),
         }
     }
     let target = args.target.clone();

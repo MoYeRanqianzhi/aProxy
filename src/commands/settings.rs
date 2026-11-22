@@ -65,10 +65,12 @@ fn effective_or_exit(path: &Path, json: bool) -> Value {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => {
-            eprintln!("{}", text::read(current(), &e, path.display()));
-            crate::util::exit(1)
-        }
+        Err(e) => Failure::rendered(
+            "command_failed",
+            |lang| text::read(lang, &e, path.display()),
+            json!({}),
+        )
+        .exit(json),
     };
     match edit::effective_value(text.as_deref()) {
         Some(value) => value,
@@ -213,10 +215,7 @@ fn fail(error: &EditError, path: &Path, json: bool) -> ! {
             "write_conflict",
             json!({"file": path.display().to_string()}),
         ),
-        EditError::Io(_) => {
-            eprintln!("{}", message(current()));
-            crate::util::exit(1)
-        }
+        EditError::Io(_) => ("command_failed", json!({})),
     };
     Failure::rendered(code, message, details).exit(json)
 }
@@ -235,10 +234,7 @@ fn print_json(value: &Value) {
 /// - 其余的键只收 JSON 值。
 fn parse_value(key: &str, raw: &str, json: bool) -> Value {
     let raw = if raw == "-" {
-        crate::util::read_secret_line().unwrap_or_else(|e| {
-            eprintln!("{e}");
-            crate::util::exit(1)
-        })
+        crate::util::read_secret_line().unwrap_or_else(|e| e.exit(json))
     } else {
         raw.to_string()
     };

@@ -83,10 +83,14 @@ pub(crate) fn humanize_duration(secs: u64) -> String {
 
 /// 从 stdin 读一行（去掉行尾的换行）：命令行上值写成 `-` 时用，密钥就不必出现在命令行与
 /// shell 历史里。读不到（stdin 已关闭、不是文本）时返回给用户看的原因。
-pub(crate) fn read_secret_line() -> Result<String, String> {
+pub(crate) fn read_secret_line() -> Result<String, crate::commands::Failure> {
     let mut line = String::new();
-    std::io::stdin()
-        .read_line(&mut line)
-        .map_err(|e| text::stdin(current(), &e))?;
+    std::io::stdin().read_line(&mut line).map_err(|e| {
+        crate::commands::Failure::rendered(
+            "command_failed",
+            |lang| text::stdin(lang, &e),
+            serde_json::json!({}),
+        )
+    })?;
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }

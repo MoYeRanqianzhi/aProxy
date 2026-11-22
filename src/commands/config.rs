@@ -12,7 +12,7 @@ use aproxy::cli::{ConfigArgs, ConfigCmd};
 use aproxy::config::edit::{Change, EditError};
 use aproxy::config::{self, Source, view};
 use aproxy::settings;
-use aproxy_ipc::code::{EXIT_CONFIG, EXIT_FAILED};
+use aproxy_ipc::code::EXIT_CONFIG;
 use serde_json::{Value, json};
 
 use super::print_doc;
@@ -86,14 +86,16 @@ fn fail(
 }
 
 /// 读配置文件的文本；不存在时是 None。读不出来（权限、不是 UTF-8）时失败退出。
-fn read_text(path: &Path) -> Option<String> {
+fn read_text(path: &Path, json: bool) -> Option<String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => {
-            eprintln!("{}", text::read(current(), &e, path.display()));
-            crate::util::exit(1)
-        }
+        Err(e) => fail(
+            json,
+            "command_failed",
+            |lang| text::read(lang, &e, path.display()),
+            json!({}),
+        ),
     }
 }
 
@@ -102,20 +104,22 @@ fn global_defaults() -> config::resolve::Defaults {
 }
 
 /// 分层解析 `path` 处的配置（文件不存在时只剩全局默认与内置默认两层）。
-fn resolve(path: &Path) -> config::Resolved {
+fn resolve(path: &Path, json: bool) -> config::Resolved {
     match config::resolve(path, &config::Overrides::default(), &global_defaults()) {
         Ok(resolved) => resolved,
-        Err(e) => {
-            eprintln!("{}", text::read(current(), &e, path.display()));
-            crate::util::exit(1)
-        }
+        Err(e) => fail(
+            json,
+            "command_failed",
+            |lang| text::read(lang, &e, path.display()),
+            json!({}),
+        ),
     }
 }
 
 /// `config show`：文件里写了的值；`--effective` 时是生效的值、各自的来源与没有继承的凭据。
 /// 文件有 error 级诊断时照样显示，然后以 3 退出。
 fn show(path: &Path, explicit: bool, effective: bool, json: bool) {
-    let text = read_text(path);
+    let text = read_text(path, json);
     // 显式 --config 指向的文件不存在时，展示的只会是默认值（抬头却是用户给的路径）——纯粹
     // 的排障误导，报错而不是照样显示。默认路径豁免：还没有 config.toml 是首次配置之前的
     // 正常状态
@@ -127,7 +131,7 @@ fn show(path: &Path, explicit: bool, effective: bool, json: bool) {
             json!({"target": path.display().to_string()}),
         );
     }
-    let resolved = resolve(path);
+    let resolved = resolve(path, json);
     let file_values = text.as_deref().and_then(view::file_value);
     let values = view::redacted(if effective {
         view::effective_value(&resolved, file_values.as_ref())
@@ -238,7 +242,7 @@ fn require_known_key(key: &str, json: bool) -> view::KeyKind {
 /// `config get`：一个键的生效值，与它来自哪一层。密钥给的是占位。
 fn get(path: &Path, key: &str, json: bool) {
     require_known_key(key, json);
-    let Some(text) = read_text(path) else {
+    let Some(text) = read_text(path, json) else {
         fail(
             json,
             "target_not_found",
@@ -246,7 +250,7 @@ fn get(path: &Path, key: &str, json: bool) {
             json!({"target": path.display().to_string()}),
         );
     };
-    let resolved = resolve(path);
+    let resolved = resolve(path, json);
     let Some(file_values) = view::file_value(&text) else {
         // 语法错误：文件里的值一个都读不出来，给出的只会是默认值
         let errors: Vec<_> = resolved.errors().cloned().collect();
@@ -304,10 +308,7 @@ fn get(path: &Path, key: &str, json: bool) {
 fn parse_value(key: &str, raw: &str, json: bool) -> toml_edit::Value {
     let kind = require_known_key(key, json);
     let raw = if raw == "-" {
-        crate::util::read_secret_line().unwrap_or_else(|e| {
-            eprintln!("{e}");
-            crate::util::exit(1)
-        })
+        crate::util::read_secret_line().unwrap_or_else(|e| e.exit(json))
     } else {
         raw.to_string()
     };
@@ -388,10 +389,12 @@ async fn write(path: &Path, change: Change, json: bool) {
             |lang| settings::describe_edit_error(&EditError::LockBusy, path, lang),
             json!({"file": path.display().to_string()}),
         ),
-        Err(EditError::Io(e)) => {
-            eprintln!("{}", text::save_error(current(), &e));
-            crate::util::exit(EXIT_FAILED as i32)
-        }
+        Err(EditError::Io(e)) => fail(
+            json,
+            "command_failed",
+            |lang| text::save_error(lang, &e),
+            json!({}),
+        ),
     };
 
     // 用着这份配置的运行中的实例：它们读的是启动时的配置，要重启才用上这次改动

@@ -600,29 +600,39 @@ fn json_command_io_errors_keep_a_result_after_preflight() {
         &["config", "set", "base_url", "-"],
         &["settings", "set", "default_config", "-"],
     ] {
-        let (reader, mut writer) = std::io::pipe().unwrap();
-        writer.write_all(b"\xff\n").unwrap();
-        drop(writer);
-        let (closed, diagnostic) = std::io::pipe().unwrap();
-        drop(closed);
-        let out = home
-            .cmd()
-            .args(args)
-            .arg("--json")
-            .stdin(reader)
-            .stderr(diagnostic)
-            .output()
-            .report_exit()
-            .unwrap();
-        assert_eq!(
-            out.status.code(),
-            Some(1),
-            "{args:?}: {}",
-            text(&out.stdout)
-        );
-        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(doc["schema"], 1);
-        assert_eq!(doc["error"]["code"], "command_failed", "{args:?}: {doc}");
+        for broken in [true, false] {
+            let (reader, mut writer) = std::io::pipe().unwrap();
+            writer.write_all(b"\xff\n").unwrap();
+            drop(writer);
+            let (closed, diagnostic) = std::io::pipe().unwrap();
+            drop(closed);
+            let mut cmd = home.cmd();
+            if broken {
+                cmd.stderr(diagnostic);
+            }
+            let out = cmd
+                .args(args)
+                .arg("--json")
+                .stdin(reader)
+                .output()
+                .report_exit()
+                .unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "{args:?}: {}",
+                text(&out.stdout)
+            );
+            let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(doc["schema"], 1);
+            assert_eq!(doc["error"]["code"], "command_failed", "{args:?}: {doc}");
+            assert_eq!(doc["error"]["details"], serde_json::json!({}));
+            let msg = doc["error"]["message"].as_str().unwrap();
+            assert_ne!(msg, "The command could not complete.");
+            if !broken {
+                assert_eq!(text(&out.stderr).trim_end(), msg);
+            }
+        }
     }
     // 目录在各平台都不能当设置文件读，不依赖用户权限或 chmod。
     let file = home.path().join("settings.json");

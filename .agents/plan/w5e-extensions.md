@@ -138,6 +138,20 @@ settings.json：这正是审查 format 时要盯的地方。
   （每个条目一个，外加「重启全部 format」）；扩展 `api` 的 `formats.restart(run, names?)`。
 - 官方 aproxy-format 不做热重载（用户 2026-11-23）：只在进程启动时读一次角色文件，改了文件用上面的重启让它生效。文档按这个写。
 
+**t10b 任务书定下的细节（主代理 2026-11-23；以任务书 `.agents/codex.local/t10b-packages.md` 为准）。**
+- 包里的文件经自定义协议 `aproxy-pkg` 交给页面（Windows 上 `http://aproxy-pkg.localhost/<id>/<路径>`），不再用 `blob:`。
+  原因：主题的 `theme.css` 里 `url(assets/…)` 这类相对地址要能解析，`blob:` 做不到。`main.mjs` 也从这个地址加载，
+  于是它可以相对 import `assets/` 下的模块，「打成一个文件」不再是技术限制，只是审查时的建议。审查 skill 的标准页里
+  「从 `blob:` 加载、必须自包含」那句要在 t10b 合入后改掉，且要求审查包里全部脚本文件。
+- 检查分两条命令：`package_check_*` 只做本地的读包、校验、算 sha256，立刻返回；`package_verify` 再去查 GitHub。页面先弹
+  第一个提醒，同时等 GitHub。哈希比对按 digest 在该 release 的全部 asset 里找（浏览器会给下载改名），同名但 digest
+  不同算「不一致」。**只有 digest 对上，仓库的 star 等数字才说明这个包**：没对上时谁都可以在 manifest 里写一个热门仓库。
+- `desktop.toml` 语法错时 `read_desktop_state` 给 `preferences: null` 加问题（行、列），页面保留现有的值；写入一律拒绝、
+  文件原样不动。
+- manifest 的 `network` 与 `writes` 先按可选字段校验并返回（安装弹窗可以显示），用户还没确认；不要的话删掉也简单。
+- 安装记录 `<home>/desktop/packages.json`（来源、sha256、安装时的 GitHub 事实），设置页用来显示「从哪来、当时核对得
+  怎么样」；手工拷进来的包没有记录，页面要说明它没经过安装检查。
+
 **接口暴露。** 扩展模块导出 `activate(api)`。`api` 是界面 store 的薄包装：读（实例卡片、最近请求、分页日志、请求详情）、
 订阅变化、写（启动、停止、重启实例，读写配置，检查与安装更新）、外观接口、format 控制，以及 `api.settings`、`api.storage`、
 `api.files`、`api.assets` 与在左侧导航加一页的 `api.ui.addPage`。写操作不另加授权，安装时的提醒已经说清楚了。

@@ -91,6 +91,11 @@
      租约、授权与审计代码。顺带下面 9a 的 `url` 升级。
    - 验收：临时 home 里装、启停、卸载主题包与扩展包；GitHub 查询用本机假服务器测四种情况（通过、哈希不符、低 star、连不上），
      不碰真实 GitHub；两个变体全量过。
+   - 状态：已派出（2026-11-23，任务书 `.agents/codex.local/t10b-packages.md`，分支 `codex/t10b-packages`，起点 master
+     `a8ab7800`，新会话）。九个部分：0 杂项（`url` 升级；macOS 上两个失败的测试，先判断是产品把活进程误判成死进程还是
+     测试本身不适用）、1 `desktop.toml`、2 删 t10 的设计、3 读包与检查、4 GitHub 事实、5 安装列出启停卸载、6 包地址
+     `aproxy-pkg`、CSP 与拖放、7 扩展的设置键值文件、8 文档与 Gate F。写任务书时定下、与 [w5e-extensions](w5e-extensions.md)
+     顶部一节不同或更细的地方记在那一节的「t10b 任务书定下的细节」。
 9c. **t10c：format 的运行时控制**（t10b 之后，Rust 侧；设计见 [w5e-extensions](w5e-extensions.md) 顶部的「扩展与 format 互通」
    与「重启 format」）
    - 范围：control 进程（hello 回复里的 `control.args`、独立进程的启动与退役、实例 IPC 的转交、桌面命令）；单独重启 format

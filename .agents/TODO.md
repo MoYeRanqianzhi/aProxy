@@ -46,7 +46,8 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
   守护进程拉起的 worker 会不会弹窗未验证）；Linux 上「跟随系统」读不到深浅色（要开 tauri 的 dbus 特性、CI 装
   libdbus-1-dev）；界面偏好由 W5b 存进 `<home>/desktop/`，不进 settings.json（`ui` 段保留不用）；改成可手改的 `desktop.toml` 见
   [w5e-extensions](plan/w5e-extensions.md) 顶部。
-  接入真实数据的设计与分段见 [w5-real-data](plan/w5-real-data.md)（开机自启：三个平台各一种登记；扩展包：0.2.0 做，不做沙箱与授权，安装前逐条提醒，见 w5e-extensions 顶部）
+  接入真实数据的设计与分段见 [w5-real-data](plan/w5-real-data.md)（开机自启：三个平台各一种登记；扩展包：0.2.0 做，不做沙箱与授权，安装前逐条提醒，见 w5e-extensions 顶部；
+  Rust 侧 t10b 2026-11-23 已派出，进度见 [codex-tasks-0.2.0](plan/codex-tasks-0.2.0.md) 的 9b）
 - [ ] **README 截图**（用户 2026-10-12）：UI 完成后构造演示数据，拍中英两套截图，中文版用于 README.md，英文版用于
   README_EN.md。演示数据里不能出现真实的 key、上游地址或个人信息
 - [ ] **W6 审查发现的修复与重构**；另含 W1 留下的：`install --from` 不做降级检查（审查 CI-06）；以及

@@ -156,6 +156,16 @@ settings.json：这正是审查 format 时要盯的地方。
 订阅变化、写（启动、停止、重启实例，读写配置，检查与安装更新）、外观接口、format 控制，以及 `api.settings`、`api.storage`、
 `api.files`、`api.assets` 与在左侧导航加一页的 `api.ui.addPage`。写操作不另加授权，安装时的提醒已经说清楚了。
 
+**前端已做（主代理 2026-11-23，`596bb92c`）。** 契约类型（`contract.ts` 的包一节，按 t10b 任务书 2.11 先写；
+Codex 交回 Strings 后对齐 Fault 码）、演示后端（`lib/backend/demo/packages.ts`：按文件名挑安装场景，审核工具条可模拟）、
+安装流程与逐条提醒（`lib/packages.svelte.ts`、`components/InstallDialog.svelte`、拖放 `DropOverlay.svelte`）、设置页
+「主题与扩展」（`PackagesPanel.svelte`、`UninstallDialog.svelte`）、扩展宿主与接口第 1 版（`lib/extensions/`：
+页面、两个挂载点 `overview.top`/`instance.top`、吉祥物、设置、键值、文件、包内资源；`api.formats` 等 t10c）、
+主题包（theme.json 解析成令牌、theme.css 经包地址挂上）、`desktop.toml` 的语法错误横幅。旧的沙箱吉祥物、授权确认框、
+旧数据层已删。浏览器里逐个场景走过（干净、闭源、对不上、关注少、连不上、不在 GitHub、主题、升级、读包失败），
+`npm run check` 0 错误，`npm run build` 通过。还没在真实窗口里验证：包地址的 CORS 与模块加载、CSP 放开后的样式注入、
+Tauri 拖放交来的路径，都等 t10b 合入后在 W5d 里看。
+
 **分工。** Codex 做 Rust 侧：包的读取与安装、列出、启停、卸载，包文件的 sha256，GitHub 查询，format 的 control 进程（hello 回复里的 control 参数、独立进程的启动与退役、实例 IPC、桌面命令），相应的桌面命令（安装分两步：
 先「检查」返回清单摘要与可信度事实，再带检查时的句柄「安装」），并删掉 master 上 t10 的沙箱、租约、授权与审计代码；按上面的标准校验 manifest 与文件；`desktop.toml` 换掉
 `preferences.json`；扩展的设置、键值与文件三组命令；（用户同意后）format 的数据目录。

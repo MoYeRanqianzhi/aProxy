@@ -3,9 +3,10 @@
 A pattern shows where to look, not what to conclude: read every hit in context before rating it.
 Rule numbers refer to SKILL.md's "Rules for judging".
 
-Search with ripgrep, one group at a time, e.g. `rg -n -i -e 'PATTERN' -e 'PATTERN' main.mjs`.
-Patterns with lookaround need `rg -P`. In minified code a hit lands on a line thousands of
-characters long; `rg -o -i '.{0,120}PATTERN.{0,120}' main.mjs` shows the surroundings instead.
+Search the whole unpacked package with ripgrep, one group at a time, e.g.
+`rg -n -i -e 'PATTERN' -e 'PATTERN' .` from its root: `main.mjs` may import further modules from
+`assets/`. Patterns with lookaround need `rg -P`. In minified code a hit lands on a line thousands
+of characters long; `rg -o -i '.{0,120}PATTERN.{0,120}' .` shows the surroundings instead.
 
 ## Contents
 
@@ -38,7 +39,9 @@ document\.write|insertAdjacentHTML|\.(inner|outer)HTML\s*=
 ```
 
 - `import()` of a URL, a variable, or a string built at run time: High; Critical when the URL is
-  encoded, assembled or comes from a network reply. A bundle never needs `import()` of its own code.
+  encoded, assembled or comes from a network reply. The package's own code is reached with a literal
+  relative path (`import('./assets/chart.mjs')`) and is reviewed like the rest of the package;
+  anything else is code from outside it.
 - `eval`, `new Function` and string timers: High, unless the argument is a constant you can read
   and it is harmless, which is rare.
 - WebAssembly: which binary, from where, built from what source? A `.wasm` with no source in the

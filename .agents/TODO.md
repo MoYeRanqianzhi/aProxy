@@ -74,6 +74,9 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] **用量与费用统计**、**按 key 限速**、**预算上限**（建在生命周期通知上）
 - [ ] **Gemini 协议**（官方 aproxy-format 的协议转换）
 
+- [ ] **给扩展作者的文档**（beta.1 之前）：`docs/` 下写包的标准、manifest、扩展接口第 1 版（`aproxy-desktop/ui/src/lib/extensions/api.svelte.ts`
+  的类型是准绳）、数据位置、发布与核对（release 的 asset、digest）、本地调试（拖入解开的目录）。接口以后只加不改，
+  文档写明这一点。可能还要一个写扩展的 skill，等文档定了再说。
 - [ ] **官方 format 的 UI 扩展样例**（用户 2026-11-23）：给一个官方角色（倾向 keys：看密钥池与冷却状态、临时停用一个 key、
   重启这个 format）做一个扩展样例，示范扩展与 format 的配对、control 进程与 `formats.*` 接口。前提是 t10c 的 control 与
   format 重启做完，且这个角色实现了 control。版本未定。

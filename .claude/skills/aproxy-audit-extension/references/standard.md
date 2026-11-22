@@ -21,7 +21,7 @@ A zip archive, or the same files unpacked into a directory, with these entries a
 |---|---|---|
 | `manifest.json` | yes | metadata, below |
 | `main.mjs` | yes | the entry module |
-| `assets/` | no | files the module uses (images, fonts, data), read through `api.assets` |
+| `assets/` | no | files the module uses (images, fonts, data, further modules), addressed by relative URL or `api.assets.url` |
 | `README*`, `LICENSE*` | no | documentation |
 
 Nothing else: no executables, no scripts in other languages, no archives inside the archive, no
@@ -52,11 +52,14 @@ Fields not listed here do not conform either.
 
 ## Entry module
 
-`main.mjs` is one self-contained ES module that exports `activate(api)` and may export
-`deactivate()`. aProxy loads it from a `blob:` URL, where relative imports cannot resolve, so
-everything is bundled into this one file. It should ship unminified: minifying saves little in a
-local app and costs every reviewer. `deactivate()` undoes what `activate` set up: DOM it mounted,
-timers, listeners, subscriptions.
+`main.mjs` is an ES module that exports `activate(api)` and may export `deactivate()`. aProxy loads
+it from the package's own address (the `aproxy-pkg` scheme, `http://aproxy-pkg.localhost/<id>/` on
+Windows), so it may import further modules from `assets/` by relative path, and
+`new URL('./assets/…', import.meta.url)` resolves inside the package. Every script in the package is
+part of the review, not only `main.mjs`. Code should ship unminified: minifying saves little in a
+local app and costs every reviewer. `deactivate()` undoes what `activate` set up outside what the
+API tracks: timers, listeners, DOM it added outside its own pages and mount points (aProxy removes
+pages, mount points, mascots and subscriptions made through `api` by itself).
 
 ## The extension API
 
@@ -69,11 +72,11 @@ timers, listeners, subscriptions.
 | `api.config` | read, validate and write an instance's configuration file |
 | `api.updates` | check for and install aProxy updates |
 | `api.formats` | the format programs of an instance; call their control methods; restart them |
-| `api.ui` | a page in the navigation, mount points, the theme's color tokens, interface state (current page, mascot mood, retrying and in-flight counts) |
+| `api.ui` | pages in the navigation (`addPage`), panels in fixed mount points (`mount`: `overview.top`, `instance.top`), mascots (`registerMascot`), the theme's color tokens, interface state (current page, language, mascot mood, retrying and in-flight counts), toasts |
 | `api.settings` | the extension's own table in `desktop.toml` |
 | `api.storage` | JSON key-value data in the extension's data directory |
 | `api.files` | files in the extension's data directory, by name without a path |
-| `api.assets` | URLs for the files in the package's `assets/` |
+| `api.assets` | the address of a file in the package (`url('assets/…')`) |
 
 The groups that change things (`api.config`, `api.instances`, `api.updates`, `api.formats`) are
 the ones `writes` discloses. The groups that read request content (`api.requests`) are the most

@@ -5,8 +5,10 @@
 -->
 <script lang="ts">
   import { ui, type Page } from '../lib/state.svelte';
-  import { store } from '../lib/legacy.svelte';
+  import { store } from '../lib/store.svelte';
   import { overlays } from '../lib/overlays.svelte';
+  import { demoControls } from '../lib/backend/demo';
+  // 扩展的写操作还走旧的模拟后端（扩展还没接上桌面契约）；场景与庆祝已经交给新的演示后端
   import { mockControls } from '../lib/backend/mock';
   import { t } from '../lib/i18n';
   import type { Scenario } from '../lib/state.svelte';
@@ -24,14 +26,14 @@
   ]);
 
   // 开发期给审核与截图脚本用的句柄，生产构建里不存在。
-  // 放在这里而不是 App：只有 proto/ 下的原型件可以直接碰 mock 后端，应用本身只认 Backend 接口
+  // 放在这里而不是 App：只有 proto/ 下的原型件可以直接碰演示后端的控制句柄，应用本身只认契约（Link）
   if (import.meta.env.DEV) {
-    (window as unknown as Record<string, unknown>).__aproxyProto = { ui, store, overlays, mock: mockControls };
+    (window as unknown as Record<string, unknown>).__aproxyProto = { ui, store, overlays, demo: demoControls, mock: mockControls };
   }
 
-  // 场景只存在于 mock 后端里：它是原型审核用的开关，不属于 Backend 接口
+  // 场景只存在于演示后端里：它是审核用的开关，不属于契约
   function setScenario(s: Scenario) {
-    mockControls.setScenario(s);
+    demoControls.setScenario(s);
   }
 </script>
 
@@ -100,7 +102,7 @@
         {@render row(t('proto.jump'), pages, ui.page, (v) => ui.go(v))}
 
         <!-- 模拟流量里「长时间重试后救回」要等一阵才碰得上，审核时直接触发一次看总览的庆祝 -->
-        <button class="hide" onclick={() => mockControls.celebrate()}>{t('proto.celebrate')}</button>
+        <button class="hide" onclick={() => demoControls.celebrate()}>{t('proto.celebrate')}</button>
         <!-- 扩展第一次做写操作时的确认框：让「配置同步」先请求改配置、再请求重启 -->
         <button
           class="hide"

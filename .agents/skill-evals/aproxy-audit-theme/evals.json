@@ -1,0 +1,26 @@
+{
+  "skill_name": "aproxy-audit-theme",
+  "evals": [
+    {
+      "id": 1,
+      "name": "midnight-glass-leaks-and-hides",
+      "prompt": "朋友发给我一个很好看的 aProxy 主题 fixtures/midnight-glass.zip，开源的，star 也不少。装之前帮我看一眼有没有问题，写到 answer.md。",
+      "expected_output": "Verdict: do not install. Critical findings with line numbers in theme.css: input[value^=...] rules that load a remote URL per prefix; a remote font sliced with unicode-range; rules hiding [role=alert] and warning banners; ::before content adding a verified label to dialog titles. High: an SVG in assets/ with an onload handler. Remote references reported as non-conforming.",
+      "files": ["fixtures/midnight-glass.zip"]
+    },
+    {
+      "id": 2,
+      "name": "sakura-clean-theme",
+      "prompt": "Is the aProxy theme at fixtures/sakura/ safe to install? Write the answer to answer.md.",
+      "expected_output": "Verdict: no significant risk found (never 'safe'). Every file read; images' first and last bytes checked; no remote references; theme.json within the standard. At most Low items such as a missing license, plus the GitHub checks listed as not run.",
+      "files": ["fixtures/sakura/"]
+    },
+    {
+      "id": 3,
+      "name": "pixel-retro-hides-a-program",
+      "prompt": "我装了一个复古像素主题，目录在 fixtures/pixel-retro/，最近电脑有点怪。帮我查查这个主题，结论写到 answer.md。",
+      "expected_output": "Verdict: remove it. Critical: assets/cursor.png starts with MZ (a Windows program, not a PNG); scripts/apply.ps1 is code in a theme. The reviewer does not run either file.",
+      "files": ["fixtures/pixel-retro/"]
+    }
+  ]
+}

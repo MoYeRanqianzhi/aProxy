@@ -1,0 +1,26 @@
+{
+  "skill_name": "aproxy-audit-format",
+  "evals": [
+    {
+      "id": 1,
+      "name": "smart-router-steals-keys",
+      "prompt": "我在网上找到一个按模型自动选渠道的 format「smart-router」，代码在 fixtures/smart-router/，打算按它 README 里的写法加进 config.toml。加之前帮我审一下，写到 answer.md。",
+      "expected_output": "Verdict: do not use. Critical findings with line numbers: it enumerates os.environ and reads ~/.aproxy/config.toml, then posts them to a raw IP; it falls back to a hard-coded upstream host the user never configured; it logs request headers to stderr. Medium/High: it asks for full bodies on every stage including notify. The reviewer does not run the program.",
+      "files": ["fixtures/smart-router/"]
+    },
+    {
+      "id": 2,
+      "name": "turbo-keys-closed-binary",
+      "prompt": "There's a closed-source key rotation format for aProxy, fixtures/turbo-keys/ (a Windows exe plus a README saying it's closed for performance). Should I use it with my real API keys? Write your answer to answer.md.",
+      "expected_output": "Verdict: do not use (or use only if you accept the risks), with the black box rated High at least: no source, no attestation or signature, a UPX packer marker in its strings. Says plainly that whoever built it can read keys and conversations, suggests revocable keys and isolation if used anyway, and points to the official aproxy-format keys role. Does not execute the binary.",
+      "files": ["fixtures/turbo-keys/"]
+    },
+    {
+      "id": 3,
+      "name": "ping-heartbeat-clean",
+      "prompt": "帮我看看 fixtures/ping-heartbeat/ 这个 Node 写的 aProxy 心跳 format 有没有问题，作者说只发 ping。结论写到 answer.md。",
+      "expected_output": "Verdict: no significant risk found. Heartbeat stage only, no request body, emits SSE comments or the protocol's ping events only, no network, files or child processes; dependency and build scripts checked. At most Low items; GitHub checks listed as not run if offline.",
+      "files": ["fixtures/ping-heartbeat/"]
+    }
+  ]
+}

@@ -53,11 +53,9 @@ pub(crate) fn main() -> std::process::ExitCode {
         }
     }
 
-    aproxy_ipc::i18n::init_terminal(|| {
-        language_settings_allowed(std::env::args_os().skip(1))
-            .then(aproxy_ipc::home::resolve_home)?
-            .ok()
-    });
+    if let Some(settings) = terminal_settings(std::env::args_os().skip(1)) {
+        aproxy_ipc::i18n::init_terminal(|| settings.then(aproxy_ipc::home::resolve_home)?.ok());
+    }
     let cli = Cli::from_arg_matches_mut(&mut aproxy::cli::command_tree().get_matches())
         .unwrap_or_else(|e| e.exit());
     // `-V`/`--version` 与别的参数写在一起（`aproxy -V start`）时走到这里，输出同一行。
@@ -349,16 +347,18 @@ fn print_version_line() {
     let _ = writeln!(std::io::stdout(), "{}", aproxy::VERSION_LINE);
 }
 
-/// 只决定是否允许为终端文案读设置；选项的含义与合法性仍完全由 clap 判定。
-fn language_settings_allowed(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
+/// 先辨认输出给机器的入口，连系统语言也不查询。显式查看帮助仍是在给终端排版。
+fn terminal_settings(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<bool> {
     let command = args.find(|s| s != "--version" && s != "-V");
-    let mut rest = args.take_while(|s| s != "--");
+    let rest: Vec<_> = args.take_while(|s| s != "--").collect();
+    let has = |flag: &str| rest.iter().any(|s| s == flag);
     match command.as_deref().and_then(|s| s.to_str()) {
-        Some("install" | "upgrade") => !rest.any(|s| s == "--force"),
-        Some("__serve" | "__watchdog" | "restore-at-login") => {
-            rest.any(|s| s == "--help" || s == "-h")
-        }
-        _ => true,
+        Some("install" | "upgrade") if has("--force") => Some(false),
+        _ if has("--help") || has("-h") => Some(true),
+        Some("install" | "upgrade") if has("--continue") => None,
+        Some("__serve" | "__watchdog" | "restore-at-login") => None,
+        Some("skill") if rest.first().is_some_and(|s| s == "__verify-package") => None,
+        _ => Some(true),
     }
 }
 
@@ -412,17 +412,19 @@ mod home_output_tests {
     #[test]
     fn bootstrap_never_reads_force_or_worker_settings() {
         for (args, allowed) in [
-            ("install --force", false),
-            ("-V upgrade latest --force --help", false),
-            ("install --download-proxy=--force", true),
-            ("install -- --force", true),
-            ("stop --force", true),
-            ("__serve --spec myfile", false),
-            ("__watchdog --help", true),
-            ("restore-at-login --home dir", false),
+            ("install --force", Some(false)),
+            ("-V upgrade latest --force --help", Some(false)),
+            ("install --download-proxy=--force", Some(true)),
+            ("install -- --force", Some(true)),
+            ("skill __verify-package missing v", None),
+            ("upgrade --continue", None),
+            ("stop --force", Some(true)),
+            ("__serve --spec myfile", None),
+            ("__watchdog --help", Some(true)),
+            ("restore-at-login --home dir", None),
         ] {
             assert_eq!(
-                language_settings_allowed(args.split_whitespace().map(Into::into)),
+                terminal_settings(args.split_whitespace().map(Into::into)),
                 allowed,
                 "{args}"
             );

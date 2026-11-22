@@ -171,3 +171,34 @@ async fn worker_output_does_not_follow_the_launchers_language() {
     let run = |lang| tokio::time::timeout(Duration::from_secs(60), observe(lang, addr));
     assert_eq!(run("en").await.unwrap(), run("zh-CN").await.unwrap());
 }
+
+#[test]
+fn unattended_preflight_and_dispatch_ignore_the_reader_language() {
+    let h = TestHome::new();
+    h.settings(r#"{"unknown":true}"#);
+    let home = h.path().to_str().unwrap();
+    for args in [
+        &["__serve", "--home", "relative", "--spec", "missing"][..],
+        &["__watchdog", "--home", "relative"],
+        &["restore-at-login", "--home", home],
+        &["install", "--continue"],
+        &["skill", "__verify-package", "missing", "0.2.0"],
+    ] {
+        let run = |lang| {
+            h.cmd()
+                .current_dir(h.path())
+                .env("APROXY_LANG", lang)
+                .args(args)
+                .output()
+                .report_exit()
+                .unwrap()
+        };
+        let en = run("en");
+        let zh = run("zh-CN");
+        assert_eq!(
+            (en.status, en.stdout, en.stderr),
+            (zh.status, zh.stdout, zh.stderr),
+            "{args:?}"
+        );
+    }
+}

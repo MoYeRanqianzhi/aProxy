@@ -10,6 +10,9 @@ mod heartbeat;
 mod keys;
 mod policy;
 mod rewrite;
+/// 角色故障共用一份说明；协议帧及工作进程 stderr 明确选择英文。
+#[path = "i18n/role.rs"]
+mod role_text;
 mod route;
 mod selection;
 mod tools;
@@ -156,7 +159,7 @@ impl Role {
         reply
     }
     /// 只在角色声明过的方向产生补丁；业务拒绝是带 seq 的正常回信，不打断持久进程。
-    fn handle(&mut self, m: &w::Message) -> w::Reply {
+    fn handle(&mut self, m: &w::Message, diagnostic_lang: aproxy_ipc::i18n::Lang) -> w::Reply {
         let mut r = w::Reply::new(m.seq);
         let stage = match &m.stage {
             w::Stage::Request(_) => "request",
@@ -169,19 +172,17 @@ impl Role {
             _ => "",
         };
         let result = match &m.stage {
-            _ if !self.stages().contains(&stage) => {
-                Err(Fault::new("阶段不受支持", "unsupported stage"))
-            }
+            _ if !self.stages().contains(&stage) => Err(Fault::Stage),
             w::Stage::Request(input) => self.request(input, None, &mut r),
             w::Stage::Retry(retry) => self.request(&retry.input, Some(&retry.retry), &mut r),
             w::Stage::Response(response) => match self {
                 Self::Convert(c) => c.response(response, &mut r),
                 Self::Route(route) => route.response(response, &mut r),
-                _ => Err(Fault::new("阶段不受支持", "unsupported stage")),
+                _ => Err(Fault::Stage),
             },
             w::Stage::Stream(s) => match self {
                 Self::Convert(c) => c.stream(s, &mut r),
-                _ => Err(Fault::new("阶段不受支持", "unsupported stage")),
+                _ => Err(Fault::Stage),
             },
             w::Stage::Decide(m) => match self {
                 Self::Policy(p) => {
@@ -192,7 +193,7 @@ impl Role {
                     a.decide(m, &mut r);
                     Ok(())
                 }
-                _ => Err(Fault::new("阶段不受支持", "unsupported stage")),
+                _ => Err(Fault::Stage),
             },
             w::Stage::Notify(w::NotifyEvent::RequestEnd(m))
                 if matches!(self, Self::Adaptive(_)) =>
@@ -207,14 +208,18 @@ impl Role {
                     heartbeat.beat(h, &mut r);
                     Ok(())
                 }
-                _ => Err(Fault::new("阶段不受支持", "unsupported stage")),
+                _ => Err(Fault::Stage),
             },
-            _ => Err(Fault::new("阶段不受支持", "unsupported stage")),
+            _ => Err(Fault::Stage),
         };
         if let Err(reason) = result {
             r = w::Reply::new(m.seq);
-            let _ = writeln!(std::io::stderr().lock(), "aproxy-format: {}", reason.local);
-            let mut fail = w::Fail::new(false, reason.wire.into());
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "aproxy-format: {}",
+                reason.render(diagnostic_lang)
+            );
+            let mut fail = w::Fail::new(false, reason.wire().into());
             if let Self::Convert(c) = self {
                 let context = match &m.stage {
                     w::Stage::Response(response) => Some(&response.context),
@@ -246,7 +251,7 @@ impl Role {
                 a.request(m, r);
                 Ok(())
             }
-            _ => Err(Fault::new("阶段不受支持", "unsupported stage")),
+            _ => Err(Fault::Stage),
         }
     }
 }
@@ -328,7 +333,7 @@ fn worker(
             if matches!(m.stage, w::Stage::Hello(_)) {
                 return Err("重复的 hello");
             }
-            emit(&mut out, &role.handle(&m))?;
+            emit(&mut out, &role.handle(&m, aproxy_ipc::i18n::Lang::En))?;
         }
     }
     Ok(())

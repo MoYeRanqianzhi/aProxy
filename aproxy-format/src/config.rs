@@ -4,20 +4,7 @@ use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use url::Url;
 
-/// 同一故障在本地诊断中用中文，在所有协议 1 消费者可见的 fail.reason 中用英文。
-/// 两者都只接受静态文案，解析器、环境变量和原始输入不能进入诊断。
-pub struct Fault {
-    /// 给操作者的 stderr 说明。
-    pub local: &'static str,
-    /// 不随运行环境语言改变的协议说明。
-    pub wire: &'static str,
-}
-impl Fault {
-    /// 在出错的位置一起指定两条消息，避免从一种语言的文本反查另一种。
-    pub fn new(local: &'static str, wire: &'static str) -> Self {
-        Self { local, wire }
-    }
-}
+pub(crate) use crate::role_text::Fault;
 
 /// 工具提供已安全读取的文本，而工作进程仍按操作者原有的路径规则打开文件。
 #[derive(Clone, Copy)]
@@ -148,10 +135,7 @@ impl Variables {
 /// 环境变量名是系统接口的一部分，空名、等号与 NUL 不能表示一个凭据来源。
 pub fn credential_name(env: &str) -> Result<(), Fault> {
     if env.is_empty() || env.contains(['=', '\0']) {
-        return Err(Fault::new(
-            "密钥环境变量名无效",
-            "invalid credential environment variable name",
-        ));
+        return Err(Fault::CredentialName);
     }
     Ok(())
 }
@@ -167,20 +151,14 @@ pub fn credential(env: &str, scheme: &str, variables: &Variables) -> Result<Stri
             .or_else(|| std::env::var(env).ok())
     }
     .filter(|v| !v.is_empty())
-    .ok_or(Fault::new(
-        "密钥环境变量未设置",
-        "credential environment variable is unset",
-    ))?;
+    .ok_or(Fault::CredentialMissing)?;
     let value = if scheme.is_empty() {
         key
     } else {
         format!("{scheme} {key}")
     };
     if !http::HeaderValue::from_str(&value).is_ok_and(|h| h.to_str().is_ok()) {
-        return Err(Fault::new(
-            "鉴权头的值无效",
-            "invalid authentication header value",
-        ));
+        return Err(Fault::AuthValue);
     }
     Ok(value)
 }
@@ -205,7 +183,7 @@ fn credential_overlay_uses_windows_name_ordering() {
         structural: false,
     };
     assert_eq!(
-        credential("T06_Ä_KEY", "", &variables).map_err(|e| e.local),
+        credential("T06_Ä_KEY", "", &variables).map_err(|e| e.wire()),
         Ok("last".into())
     );
 }

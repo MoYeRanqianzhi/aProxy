@@ -27,7 +27,7 @@ impl UsageTotals {
         if usage.is_null() {
             return Ok(());
         }
-        let invalid = || Fault::new("上游用量计数无效", "invalid upstream usage counts");
+        let invalid = || Fault::UsageCounts;
         if !usage.is_object() {
             return Err(invalid());
         }
@@ -233,10 +233,7 @@ impl Events {
                 self.frame.push(b);
             }
             if self.frame.len() > MAX_EVENT {
-                return Err(Fault::new(
-                    "单个流事件超过 8 MiB",
-                    "stream event exceeds 8 MiB",
-                ));
+                return Err(Fault::EventSize);
             }
         }
         Ok(())
@@ -284,7 +281,7 @@ impl Events {
             }
         };
         if failed {
-            return Err(Fault::new("上游事件流报告失败", "upstream stream failed"));
+            return Err(Fault::UpstreamStream);
         }
         let usage = match self.source {
             F::OpenAiChat => &event["usage"],
@@ -612,10 +609,7 @@ impl Events {
     /// 运输层正常 EOF 不代表协议完整。只在源协议已结束且没有半帧时合成剩余的结束事件。
     pub(super) fn finish(&mut self, capacity: usize) -> Result<String, Fault> {
         if !self.frame.is_empty() || !self.terminal {
-            return Err(Fault::new(
-                "事件流没有完整结束",
-                "incomplete upstream event stream",
-            ));
+            return Err(Fault::StreamEnd);
         }
         let mut output = Bounded::new(capacity);
         if self.snapshot_min > capacity {
@@ -636,9 +630,8 @@ impl Events {
     }
     /// 已提交后不能更改 HTTP 状态，原因使用本地固定文本而非上游响应。
     pub(super) fn ending(&self, fault: &Fault) -> String {
-        self.error_event(match fault.wire {
-            LIMIT_REASON => LIMIT_REASON,
-            "upstream stream failed" => fault.wire,
+        self.error_event(match fault {
+            Fault::Budget | Fault::UpstreamStream => fault.wire(),
             _ => "stream conversion aborted",
         })
     }
@@ -727,13 +720,13 @@ fn visible_part(part: &mut Value) {
 }
 /// 不把可能带敏感字段的上游事件或第三方库诊断复制到协议原因或 stderr。
 fn malformed() -> Fault {
-    Fault::new("无法转换流事件", "invalid stream event")
+    Fault::MalformedEvent
 }
 /// 客户端可区分限制与网络中断，不披露原始正文。
-pub(super) const LIMIT_REASON: &str = "response exceeds the configured limit";
+pub(super) const LIMIT_REASON: &str = Fault::Budget.wire();
 /// 输入与输出限制都按协议错误结束，不计入进程熔断。
 pub(super) fn budget() -> Fault {
-    Fault::new("转换响应超过配置的限制", LIMIT_REASON)
+    Fault::Budget
 }
 /// serde_json 在字符串中只转义控制字符、双引号和反斜杠；其余 UTF-8 字节原样写出。
 /// 两层字符串（目标事件放入回信 data）时，第一层引入的反斜杠也须计费。
@@ -883,9 +876,9 @@ mod tests {
                     let mut s = Events::new(source, target, false, 64 << 20);
                     let mut out = String::new();
                     for b in input.as_bytes().chunks(step) {
-                        out += &s.feed(b, 64 << 20).map_err(|(_, e)| e.wire).unwrap();
+                        out += &s.feed(b, 64 << 20).map_err(|(_, e)| e.wire()).unwrap();
                     }
-                    out += &s.finish(64 << 20).map_err(|e| e.wire).unwrap();
+                    out += &s.finish(64 << 20).map_err(|e| e.wire()).unwrap();
                     out
                 };
                 let out = run(1);
@@ -947,7 +940,7 @@ mod tests {
                 let mut feed = |s: &str| {
                     stream
                         .feed(s.as_bytes(), 64 << 20)
-                        .map_err(|(_, f)| f.wire)
+                        .map_err(|(_, f)| f.wire())
                         .unwrap()
                 };
                 feed(&format!("data: {start}\n\n"));
@@ -958,7 +951,7 @@ mod tests {
                 if source == F::OpenAiChat {
                     tail.push_str(&feed("data: [DONE]\n\n"));
                 }
-                tail.push_str(&stream.finish(64 << 20).map_err(|f| f.wire).unwrap());
+                tail.push_str(&stream.finish(64 << 20).map_err(|f| f.wire()).unwrap());
                 assert!(!tail.contains("event: error"));
                 assert!(
                     tail.contains(match target {
@@ -1018,7 +1011,7 @@ mod tests {
                     }
                 };
                 if let Err((_, f)) = stream.feed(format!("data: {event}\n\n").as_bytes(), 4096) {
-                    fault = Some(f.wire);
+                    fault = Some(f.wire());
                     break;
                 }
             }
@@ -1034,7 +1027,7 @@ mod tests {
             json!({"type":"response.created","response":{"id":"fixture","model":"m".repeat(256)}});
         stream
             .feed(format!("data: {start}\n\n").as_bytes(), 2048)
-            .map_err(|(_, f)| f.wire)
+            .map_err(|(_, f)| f.wire())
             .unwrap();
         let parts = vec![json!({"type":"output_text","text":"part"}); 12];
         let end = json!({"type":"response.completed","response":{"output":[{"type":"message","content":parts}]}});
@@ -1043,7 +1036,7 @@ mod tests {
                 .feed(format!("data: {end}\n\n").as_bytes(), 2048)
                 .unwrap_err()
                 .1
-                .wire,
+                .wire(),
             LIMIT_REASON
         );
     }

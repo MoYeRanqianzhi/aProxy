@@ -109,7 +109,7 @@ impl Rewrite {
         }
         if self.needs_body() {
             let mut body = parse_body(m.request.body.as_bytes().unwrap_or_default())
-                .map_err(|_| Fault::new("请求体不是 JSON", "request body is not valid JSON"))?;
+                .map_err(|_| Fault::RequestJson)?;
             let before = report.actions.len();
             for (path, value) in self
                 .remove
@@ -211,7 +211,7 @@ fn restore_keys(value: &mut Value) {
 }
 /// 在已存在的父容器内操作。移除不存在的目标是幂等的；设置不存在的父对象不猜测容器类型。
 fn edit(body: &mut Value, path: &str, value: Option<&Value>) -> Result<bool, Fault> {
-    let invalid = || Fault::new("JSON Pointer 的目标无效", "invalid JSON Pointer target");
+    let invalid = || Fault::Pointer;
     let Some((parent, last)) = path.rsplit_once('/') else {
         let v = value.ok_or_else(invalid)?;
         if body == v {
@@ -277,25 +277,27 @@ mod tests {
     fn edits_object_keys_arrays_null_and_root() {
         let mut b = json!({"x/y":{"~1":[null,2]},"0":false});
         let p = "/x~1y/~01";
-        assert!(edit(&mut b, &format!("{p}/0"), None).unwrap_or_else(|e| panic!("{}", e.wire)));
-        assert!(!edit(&mut b, &format!("{p}/1"), None).unwrap_or_else(|e| panic!("{}", e.wire)));
+        assert!(edit(&mut b, &format!("{p}/0"), None).unwrap_or_else(|e| panic!("{}", e.wire())));
+        assert!(!edit(&mut b, &format!("{p}/1"), None).unwrap_or_else(|e| panic!("{}", e.wire())));
         assert!(
             edit(&mut b, &format!("{p}/-"), Some(&json!(3)))
-                .unwrap_or_else(|e| panic!("{}", e.wire))
+                .unwrap_or_else(|e| panic!("{}", e.wire()))
         );
         assert!(
             edit(&mut b, &format!("{p}/1"), Some(&json!(null)))
-                .unwrap_or_else(|e| panic!("{}", e.wire))
+                .unwrap_or_else(|e| panic!("{}", e.wire()))
         );
         assert!(
             !edit(&mut b, &format!("{p}/1"), Some(&json!(null)))
-                .unwrap_or_else(|e| panic!("{}", e.wire))
+                .unwrap_or_else(|e| panic!("{}", e.wire()))
         );
         assert!(edit(&mut b, &format!("{p}/01"), Some(&json!(5))).is_err());
         assert!(edit(&mut b, "/missing/child", Some(&json!(false))).is_err());
-        assert!(edit(&mut b, "/0", Some(&json!({"n":4}))).unwrap_or_else(|e| panic!("{}", e.wire)));
+        assert!(
+            edit(&mut b, "/0", Some(&json!({"n":4}))).unwrap_or_else(|e| panic!("{}", e.wire()))
+        );
         assert_eq!(b, json!({"x/y":{"~1":[2,null]},"0":{"n":4}}));
-        assert!(edit(&mut b, "", Some(&json!([]))).unwrap_or_else(|e| panic!("{}", e.wire)));
+        assert!(edit(&mut b, "", Some(&json!([]))).unwrap_or_else(|e| panic!("{}", e.wire())));
         assert_eq!(b, json!([]));
     }
     /// 非法配置在首次协商前失败，错误不引用原值。

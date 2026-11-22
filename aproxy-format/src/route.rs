@@ -164,10 +164,7 @@ pub(super) fn safe_child_path(path: &[u8]) -> bool {
 fn preserved_path(raw: &str) -> Result<&str, Fault> {
     let path = raw.split_once('?').map_or(raw, |(p, _)| p);
     if !path.starts_with('/') || !safe_child_path(path.as_bytes()) {
-        return Err(Fault::new(
-            "保留的客户端路径包含无效路径段",
-            "invalid preserved client path segment",
-        ));
+        return Err(Fault::Path);
     }
     Ok(path)
 }
@@ -264,7 +261,7 @@ impl Route {
                 return Err("渠道标识为空或重复");
             }
             if let Some(name) = &c.credential_env {
-                config::credential_name(name).map_err(|fault| fault.local)?;
+                config::credential_name(name).map_err(|fault| fault.wire())?;
             }
             if let Some(h) = &c.auth_header {
                 config::credential_header(h)?;
@@ -338,10 +335,8 @@ impl Route {
     ) -> Result<(), Fault> {
         let mut body: serde_json::Value =
             serde_json::from_slice(m.request.body.as_bytes().unwrap_or_default())
-                .map_err(|_| Fault::new("请求体不是 JSON", "request body is not valid JSON"))?;
-        let original = body["model"]
-            .as_str()
-            .ok_or(Fault::new("请求体缺少 model", "request body has no model"))?;
+                .map_err(|_| Fault::RequestJson)?;
+        let original = body["model"].as_str().ok_or(Fault::MissingModel)?;
         let model = self
             .aliases
             .get(original)
@@ -361,14 +356,9 @@ impl Route {
             .unwrap_or_else(rand::random);
         let channel = self
             .choose(model, ticket, prior.as_ref().map(|p| p.0.as_str()))
-            .ok_or(Fault::new(
-                "模型未命中任何渠道",
-                "no channel matches the model",
-            ))?;
-        let mut url =
-            config::endpoint(&channel.url).map_err(|e| Fault::new(e, "invalid channel URL"))?;
-        let incoming =
-            config::endpoint(&m.request.url).map_err(|e| Fault::new(e, "invalid upstream URL"))?;
+            .ok_or(Fault::NoChannel)?;
+        let mut url = config::endpoint(&channel.url).map_err(|_| Fault::ChannelUrl)?;
+        let incoming = config::endpoint(&m.request.url).map_err(|_| Fault::UpstreamUrl)?;
         if channel.preserve_path {
             url.set_path(&format!(
                 "{}{}",
@@ -520,7 +510,7 @@ mod tests {
             "/%E7%A7%9F%E6%88%B7",
         ] {
             assert_eq!(
-                preserved_path(&format!("{path}?q=..")).map_err(|e| e.wire),
+                preserved_path(&format!("{path}?q=..")).map_err(|e| e.wire()),
                 Ok(path)
             );
         }

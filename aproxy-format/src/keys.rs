@@ -163,7 +163,7 @@ impl Keys {
             pool.origin = url.origin().ascii_serialization();
             for key in &mut pool.keys {
                 key.value = config::credential(&key.env, &pool.scheme, variables)
-                    .map_err(|f| format!("环境变量 {:?}：{}", key.env, f.local))?;
+                    .map_err(|f| format!("环境变量 {:?}：{}", key.env, f.wire()))?;
             }
             pool.header = config::credential_header(&pool.header)?.to_string();
             let origin_bytes = config::state_string_bytes(&pool.origin);
@@ -253,7 +253,7 @@ impl Keys {
             None
         };
         let origin = config::endpoint(&m.request.url)
-            .map_err(|e| Fault::new(e, "invalid upstream URL"))?
+            .map_err(|_| Fault::UpstreamUrl)?
             .origin()
             .ascii_serialization();
         let mut headers = m.request.headers.clone();
@@ -265,10 +265,7 @@ impl Keys {
             .pool
             .iter_mut()
             .find(|p| p.origin == origin)
-            .ok_or(Fault::new(
-                "上游没有对应的密钥池",
-                "no credential pool matches the upstream origin",
-            ))?;
+            .ok_or(Fault::NoPool)?;
         let header = p.header.clone();
         let Some(key) = p.select(&self.strategy, sticky, now, |n| rand::random_range(0..n)) else {
             r.fail = Some(w::Fail::new(

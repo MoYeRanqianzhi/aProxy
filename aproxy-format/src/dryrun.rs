@@ -278,7 +278,7 @@ impl Unit {
                 _ => {}
             }
             let m = serde_json::from_value(msg).map_err(|_| "样例不能构成该阶段的消息")?;
-            let reply = role.handle(&m);
+            let reply = role.handle(&m, aproxy_ipc::i18n::current());
             // 不再分配一份序列化回信；逐段扣除 JSON 字节，最后一字节留给换行。
             let mut budget = LineBudget(limit.saturating_sub(1));
             serde_json::to_writer(&mut budget, &reply).map_err(|_| "试跑回信超过实例上限")?;

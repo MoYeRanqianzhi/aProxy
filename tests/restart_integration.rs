@@ -541,7 +541,7 @@ fn release_asset_named_instance_is_adopted_respawned_and_force_stoppable() {
     assert!(
         wait_for(Duration::from_secs(15), || log_has(
             &wd_log,
-            &["看护者收养实例", &port_s]
+            &["Watchdog adopted instance", &port_s]
         )),
         "以资产名运行的实例应被收养；看护者日志:\n{}",
         read_text(&wd_log)
@@ -580,7 +580,7 @@ fn release_asset_named_instance_is_adopted_respawned_and_force_stoppable() {
     assert!(
         wait_for(Duration::from_secs(10), || log_has(
             &wd_log,
-            &["实例已重拉并就绪", &port_s]
+            &["Respawned instance is ready", &port_s]
         )),
         "看护者应确认重拉就绪；日志:\n{}",
         read_text(&wd_log)
@@ -606,7 +606,7 @@ fn release_asset_named_instance_is_adopted_respawned_and_force_stoppable() {
         read_text(&wd_log)
     );
     assert!(
-        log_has(&wd_log, &["实例已被停止", &port_s]),
+        log_has(&wd_log, &["Instance stopped", &port_s]),
         "看护者应按「已被停止」摘除看护；日志:\n{}",
         read_text(&wd_log)
     );
@@ -634,7 +634,7 @@ fn watchdog_respawn_onto_changed_port_retires_old_record() {
     assert!(
         wait_for(Duration::from_secs(15), || log_has(
             &wd_log,
-            &["看护者收养实例", &port_a.to_string()]
+            &["Watchdog adopted instance", &port_a.to_string()]
         )),
         "实例应被收养；看护者日志:\n{}",
         read_text(&wd_log)
@@ -709,7 +709,7 @@ fn watchdog_respawn_with_port_zero_returns_to_the_same_port() {
     assert!(
         wait_for(Duration::from_secs(15), || log_has(
             &wd_log,
-            &["看护者收养实例", &port_1.to_string()]
+            &["Watchdog adopted instance", &port_1.to_string()]
         )),
         "实例应被收养；看护者日志:\n{}",
         read_text(&wd_log)
@@ -864,7 +864,7 @@ fn concurrent_start_with_release_asset_name_converges_to_one_watchdog() {
         );
         for line in stderr
             .lines()
-            .filter(|l| l.contains("看护者已随实例启动拉起"))
+            .filter(|l| l.contains("Started the watchdog with the instance"))
         {
             let digits: String = line
                 .rsplit("pid=")
@@ -1451,7 +1451,7 @@ fn watchdog_exits_once_it_is_disabled_in_settings() {
     assert!(
         wait_for(Duration::from_secs(15), || log_has(
             &wd_log,
-            &["看护者收养实例", &port.to_string()]
+            &["Watchdog adopted instance", &port.to_string()]
         )),
         "实例应被收养；看护者日志:
 {}",

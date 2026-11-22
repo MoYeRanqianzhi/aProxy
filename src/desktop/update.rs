@@ -150,7 +150,7 @@ async fn lines(
     }
     cmd.kill_on_drop(cancel.is_some());
     let mut child = cmd.spawn().map_err(|_| Fault::DesktopBinary {})?;
-    let mut reader = BufReader::new(child.stdout.take().expect("管道已配置"));
+    let mut reader = BufReader::new(child.stdout.take().expect("pipe was configured"));
     let mut bad = false;
     let mut bytes = Vec::new();
     let status = {
@@ -379,8 +379,9 @@ impl UpdateOps for DesktopHome {
                 return Err(Fault::DesktopChanged {});
             }
             if let Some(version) = result.latest.as_ref().filter(|_| result.update_available) {
-                let token =
-                    self.token(&serde_json::to_vec(&(n, version, hash)).expect("版本可序列化"));
+                let token = self.token(
+                    &serde_json::to_vec(&(n, version, hash)).expect("versions must serialize"),
+                );
                 st.offer = Some(Offer {
                     token: token.clone(),
                     version: version.clone(),

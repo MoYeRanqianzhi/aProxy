@@ -142,7 +142,7 @@ pub fn resolve_runtime_config_in(
             reason = item.reason,
             default_target = %item.default_target,
             target = %item.target,
-            "全局默认里的这项凭据没有继承：它属于另一个目标"
+            "A global default credential was not inherited because it belongs to a different target"
         );
     }
     if resolved.is_valid() {
@@ -213,7 +213,7 @@ pub fn load_lenient(overrides: &Overrides, cfg_path: Option<&Path>) -> Config {
     match resolve_layers(overrides, cfg_path, &settings::load_from(&path), &path) {
         Ok(resolved) => resolved.config,
         Err(e) => {
-            tracing::warn!(error = %e, "读取配置文件失败，使用默认配置");
+            tracing::warn!(error = %e, "Could not read the configuration file; using defaults");
             Config::default()
         }
     }
@@ -347,8 +347,10 @@ fn ensure_watchdog_if_enabled(home: &Path, exe: &Path) {
     }
     // 无效的看护者记录不在这里删：新看护者接管时自己处理，它要靠记录找到假死的前任
     match crate::watchdog::spawn_watchdog(exe, home) {
-        Ok(pid) => tracing::info!(pid, "看护者已随实例启动拉起"),
-        Err(e) => tracing::warn!(error = %e, "看护者拉起失败（守护自检会补种）"),
+        Ok(pid) => tracing::info!(pid, "Started the watchdog with the instance"),
+        Err(e) => {
+            tracing::warn!(error = %e, "Could not start the watchdog; instance self-check will retry")
+        }
     }
 }
 

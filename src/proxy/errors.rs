@@ -71,7 +71,7 @@ impl AttemptFailure {
     pub(super) fn new(code: &'static str, message: String, details: Value) -> Self {
         debug_assert!(
             aproxy_ipc::code::lookup(code).is_some(),
-            "未登记的码: {code}"
+            "unregistered code: {code}"
         );
         Self {
             code,
@@ -197,7 +197,7 @@ impl Terminal {
     pub(super) fn new(code: &'static str, message: String, details: Value) -> Self {
         debug_assert!(
             aproxy_ipc::code::lookup(code).is_some_and(|c| c.http.is_some()),
-            "不是数据面终态码: {code}"
+            "not a data-plane terminal code: {code}"
         );
         Self {
             code,

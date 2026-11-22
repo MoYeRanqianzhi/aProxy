@@ -34,7 +34,7 @@ impl<'de> serde::de::Visitor<'de> for StreamFlagProbe {
     type Value = bool;
 
     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("任意 JSON 值")
+        f.write_str("any JSON value")
     }
 
     fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<bool, E> {
@@ -104,7 +104,7 @@ impl<'de> serde::de::Visitor<'de> for TextOrSkip {
     type Value = Option<String>;
 
     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("任意 JSON 值")
+        f.write_str("any JSON value")
     }
 
     fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Option<String>, E> {
@@ -157,7 +157,7 @@ impl<'de> serde::de::Visitor<'de> for ShapeProbe<'_> {
     type Value = ();
 
     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("一个 JSON 对象")
+        f.write_str("a JSON object")
     }
 
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {

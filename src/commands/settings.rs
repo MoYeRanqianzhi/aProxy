@@ -224,7 +224,7 @@ fn fail(error: &EditError, path: &Path, json: bool) -> ! {
 fn print_json(value: &Value) {
     println!(
         "{}",
-        serde_json::to_string_pretty(value).expect("JSON 值总能序列化")
+        serde_json::to_string_pretty(value).expect("JSON values must serialize")
     );
 }
 

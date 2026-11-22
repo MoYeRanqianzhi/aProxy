@@ -51,7 +51,7 @@ impl DesktopHome {
     fn restore_token(&self, entry: &spec::RestoreEntry) -> String {
         // 外层只有固定长度的随机密钥与内部摘要，原始序列化及其无密钥散列均不离开宿主。
         let bytes = serde_json::to_vec(&(&entry.port, entry.written_at, &entry.spec))
-            .expect("实例规格可序列化");
+            .expect("instance specification must serialize");
         self.token(&bytes)
     }
     fn token(&self, bytes: &[u8]) -> String {
@@ -62,7 +62,7 @@ impl DesktopHome {
         use std::fmt::Write;
         let mut token = String::with_capacity(digest.len() * 2);
         for byte in digest {
-            write!(&mut token, "{byte:02x}").expect("写入字符串不会失败");
+            write!(&mut token, "{byte:02x}").expect("writing to a String cannot fail");
         }
         token
     }

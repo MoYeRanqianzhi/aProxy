@@ -4683,11 +4683,13 @@ async fn credentials_masked_in_logs_last_error_and_502() {
         assert!(!text.contains(secret), "日志泄露 {secret}:\n{text}");
     }
     assert!(
-        text.contains("代理请求") && text.contains("key=***") && text.contains("***@127.0.0.1"),
+        text.contains("Proxy request")
+            && text.contains("key=***")
+            && text.contains("***@127.0.0.1"),
         "日志应以脱敏形态记录请求（path 与 target）:\n{text}"
     );
     assert!(
-        text.contains("代理请求（仅转发）"),
+        text.contains("Proxy request (forward only)"),
         "仅转发路径的请求日志缺失:\n{text}"
     );
 }
@@ -5410,7 +5412,7 @@ fn logs_follows_daemon_and_exits_on_stop() {
     // 首屏应包含守护的启动日志行（tracing 写入日志文件，logs 回读输出）
     let mut saw_startup = false;
     for _ in 0..100 {
-        if collected.lock().unwrap().contains("启动 aProxy") {
+        if collected.lock().unwrap().contains("Starting aProxy") {
             saw_startup = true;
             break;
         }
@@ -6057,7 +6059,7 @@ fn logs_via_alias_connects_and_follows() {
     for _ in 0..100 {
         let hit = {
             let c = collected.lock().unwrap();
-            c.contains("Following pid") && c.contains("启动 aProxy")
+            c.contains("Following pid") && c.contains("Starting aProxy")
         };
         if hit {
             saw_startup = true;
@@ -6344,7 +6346,7 @@ fn watchdog_respawns_on_death_event_and_force_stop_stays_stopped() {
     let adopted = std::time::Instant::now() + Duration::from_secs(10);
     while !std::fs::read_to_string(&watchdog_out)
         .unwrap_or_default()
-        .contains("看护者收养实例")
+        .contains("Watchdog adopted instance")
     {
         assert!(
             std::time::Instant::now() < adopted,

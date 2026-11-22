@@ -80,7 +80,7 @@ impl SpoolBuffer {
                 if let Err(e) = file.flush().await {
                     drop(file); // 先关句柄，再由 SpoolPath 的 Drop 删半截文件
                     drop(path);
-                    return Err(format!("spool 磁盘写入失败（收尾 flush）: {e}"));
+                    return Err(format!("Could not flush the disk spool: {e}"));
                 }
                 drop(file); // 关写句柄，头部快照以只读重新打开
                 let head = match tokio::fs::File::open(&path.0).await {
@@ -188,7 +188,7 @@ impl Drop for SpooledBody {
             if !path.as_os_str().is_empty()
                 && let Err(e) = std::fs::remove_file(&*path)
             {
-                tracing::warn!(error = %e, path = %path.display(), "spool 临时文件删除失败");
+                tracing::warn!(error = %e, path = %path.display(), "Could not remove the temporary spool file");
             }
             *path = PathBuf::new();
         }
@@ -254,7 +254,7 @@ impl SpooledBody {
                     .boxed(),
                     Err(e) => {
                         // 文件丢失（外部清理等）：回放为空 body，日志留痕
-                        tracing::warn!(error = %e, path = %path.display(), "spool 临时文件读取失败，回放为空");
+                        tracing::warn!(error = %e, path = %path.display(), "Could not read the temporary spool file; replay will be empty");
                         futures_util::stream::empty().boxed()
                     }
                 }

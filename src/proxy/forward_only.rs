@@ -416,7 +416,7 @@ pub(super) async fn forward_only_proxy(
             // 也不回 502：发起断开的客户端读不到响应，这里的状态码只是给日志与
             // 中间观测看的，取与缓冲路径同一事件一致的 400。
             if client_gone.load(AtomicOrdering::Relaxed) {
-                tracing::error!(code = %"client_body_aborted", error = %failure.message, target = %masked_target, "客户端请求体传输中断，已中止上游请求");
+                tracing::error!(code = %"client_body_aborted", error = %failure.message, target = %masked_target, "Client upload interrupted; upstream request aborted");
                 rec.try_ended(attempt, 0, None);
                 return Err(Terminal::client_body_aborted());
             }
@@ -428,7 +428,7 @@ pub(super) async fn forward_only_proxy(
             terminal.record_in(&state.stats);
             rec.try_ended(attempt, 0, Some(failure.for_history()));
             rec.decided(attempt, "default".to_string(), false);
-            tracing::warn!(code = %terminal.code(), last_code = failure.code, error = %failure.message, target = %masked_target, "上游请求失败（仅转发模式不重试）");
+            tracing::warn!(code = %terminal.code(), last_code = failure.code, error = %failure.message, target = %masked_target, "Upstream request failed; forward-only mode does not retry");
             return Err(terminal);
         }
     };

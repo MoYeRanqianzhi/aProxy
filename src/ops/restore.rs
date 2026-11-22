@@ -35,7 +35,7 @@ pub async fn restore_entry(entry: &RestoreEntry, exe: &Path) -> Restore {
 pub async fn restore_entry_in(home: &Path, entry: &RestoreEntry, exe: &Path) -> Restore {
     restore_current(home, entry, exe, false)
         .await
-        .expect("按端口恢复不检查观察令牌")
+        .expect("restoring by port does not require an observation token")
 }
 
 /// 根据一次观察恢复，ping 之后、启动之前重读期望记录；等待期间发生的换代不是这次操作的目标。

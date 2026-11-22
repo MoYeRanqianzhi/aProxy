@@ -882,7 +882,8 @@ pub fn lookup(name: &str) -> Option<&'static Code> {
 
 /// 整张表的 JSON（一个数组，每个码一个对象），供界面与文档生成使用。
 pub fn table_json() -> serde_json::Value {
-    serde_json::to_value(TABLE).expect("码表只含字符串、整数与枚举，序列化不会失败")
+    serde_json::to_value(TABLE)
+        .expect("the code table contains only strings, numbers, and enums and must serialize")
 }
 
 #[cfg(test)]

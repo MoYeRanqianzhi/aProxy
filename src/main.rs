@@ -89,7 +89,7 @@ pub(crate) fn main() -> std::process::ExitCode {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("无法建立 tokio 运行时");
+        .expect("could not create the Tokio runtime");
     let code = runtime.block_on(run(cli));
     drop(runtime);
     commands::finish_json(i32::from(code));
@@ -329,13 +329,15 @@ async fn run(cli: Cli) -> u8 {
         Some(Commands::Settings { cmd }) => commands::settings::handle_settings_cmd(cmd).await,
         Some(Commands::Install(args)) => commands::install::handle_install_cmd(args).await,
         Some(Commands::Skill { cmd }) => return commands::skill::run(cmd).await,
-        Some(Commands::Desktop) => unreachable!("desktop 在 main 里、建运行时之前已经分派"),
+        Some(Commands::Desktop) => {
+            unreachable!("desktop was dispatched before the runtime was built")
+        }
         Some(Commands::Serve { .. } | Commands::Watchdog { .. }) => {
-            unreachable!("内部入口在子命令分派之前已经处理")
+            unreachable!("internal entry points were handled before subcommand dispatch")
         }
         // 不带子命令的调用在参数解析时已经打印帮助并以 2 退出；走到这里的只有版本参数与
         // 别的参数写在一起的情形，上面已经处理
-        None => unreachable!("没有子命令的调用在参数解析时已经结束"),
+        None => unreachable!("invocation without a subcommand ended during argument parsing"),
     }
     0
 }

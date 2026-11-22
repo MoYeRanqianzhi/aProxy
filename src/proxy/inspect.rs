@@ -23,7 +23,9 @@ pub(super) fn needs_retry_response(
         // 不可能：磁盘模式必有增量扫描结果。防御性回退到「不重试」并留痕，
         // 而非 panic——代理服务不能因内部不变量被破坏而失能
         (SpooledBody::Disk { .. }, None) => {
-            tracing::error!("内部不变量破坏：磁盘 spool 缺少扫描结果，按成功处理");
+            tracing::error!(
+                "On-disk spool has no scan result; treating the response as successful"
+            );
             false
         }
     }
@@ -54,7 +56,7 @@ pub(super) fn should_retry_response(
 
     // 1. HTTP 状态码可重试：无论是否流式，都重试
     if retry::is_retryable_status(status.as_u16()) {
-        tracing::warn!(attempt, status = %status, is_streaming, "上游返回可重试状态码，重试");
+        tracing::warn!(attempt, status = %status, is_streaming, "Upstream returned a retryable status; retrying");
         warn_preview(raw_headers, body, 500, body.len());
         return true;
     }
@@ -67,7 +69,11 @@ pub(super) fn should_retry_response(
         retry::is_error_body(body)
     };
     if is_error {
-        tracing::warn!(attempt, is_streaming, "上游返回错误内容，重试");
+        tracing::warn!(
+            attempt,
+            is_streaming,
+            "Upstream returned an error in the body; retrying"
+        );
         warn_preview(raw_headers, body, 1000, body.len());
         return true;
     }
@@ -103,14 +109,18 @@ pub(super) fn should_retry_response_disk(
 
     // 1. HTTP 状态码可重试：无论是否流式，都重试
     if retry::is_retryable_status(status.as_u16()) {
-        tracing::warn!(attempt, status = %status, is_streaming, "上游返回可重试状态码，重试");
+        tracing::warn!(attempt, status = %status, is_streaming, "Upstream returned a retryable status; retrying");
         warn_preview(raw_headers, head, 500, total_bytes);
         return true;
     }
 
     // 2. 内容错误：增量扫描结论（SSE data 行 / NDJSON 行级判定）
     if scan_error {
-        tracing::warn!(attempt, is_streaming, "上游返回错误内容，重试");
+        tracing::warn!(
+            attempt,
+            is_streaming,
+            "Upstream returned an error in the body; retrying"
+        );
         warn_preview(raw_headers, head, 1000, total_bytes);
         return true;
     }
@@ -147,7 +157,7 @@ pub(super) fn warn_preview(
         content_type = %header_opt(raw_headers, http::header::CONTENT_TYPE).unwrap_or("-"),
         content_encoding = %header_opt(raw_headers, http::header::CONTENT_ENCODING).unwrap_or("-"),
         preview = %preview_body(body, limit, total_bytes),
-        "错误响应预览"
+        "Error response preview"
     );
 }
 
@@ -174,13 +184,13 @@ pub(super) fn preview_body(body: &[u8], limit: usize, total_bytes: usize) -> Str
         // 二进制/压缩内容：hex 前 48 字节足够识别压缩 magic 与排障
         let hex: String = head.iter().take(48).map(|b| format!("{b:02x} ")).collect();
         format!(
-            "（二进制/压缩内容，共 {total_bytes} 字节，hex 前 48: {}…）",
+            "(binary or compressed, {total_bytes} bytes; first 48 in hex: {}…)",
             hex.trim_end()
         )
     } else {
         let s = text.trim_end();
         if body.len() > limit {
-            format!("{s}…（截断，共 {total_bytes} 字节）")
+            format!("{s}… (truncated, {total_bytes} bytes total)")
         } else {
             s.to_string()
         }

@@ -15,7 +15,7 @@ pub(super) fn log_proxied_request(
         method = %method,
         path = %history.redacted_url(path_and_query),
         target = %history.redacted_url(target_url),
-        "代理请求"
+        "Proxy request"
     );
 }
 

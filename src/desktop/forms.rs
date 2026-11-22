@@ -80,9 +80,9 @@ const FORMAT_KEYS: &[&str] = &[
 ];
 fn fixed<T: serde::Serialize>(key: &T) -> String {
     serde_json::to_value(key)
-        .expect("键可序列化")
+        .expect("keys must serialize")
         .as_str()
-        .expect("键名是字符串")
+        .expect("key names are strings")
         .to_owned()
 }
 fn at<'a>(v: &'a Value, k: &str) -> &'a Value {

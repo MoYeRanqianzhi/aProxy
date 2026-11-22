@@ -95,7 +95,8 @@ impl AppState {
         // 系统代理（不再读取 HTTP_PROXY 等环境变量），避免两者互相干扰。
         // 代理 URL 已在 Config::validate() 校验，此处 expect 不会失败。
         if let Some(proxy_url) = config.proxy.as_deref() {
-            let mut proxy = reqwest::Proxy::all(proxy_url).expect("代理 URL 已在 validate() 校验");
+            let mut proxy =
+                reqwest::Proxy::all(proxy_url).expect("validate() checked the proxy URL");
             // 单独配置的用户名/密码优先于 URL 内嵌凭据；仅配置密码而无用户名则忽略
             if let Some(username) = config.proxy_username.as_deref() {
                 proxy = proxy.basic_auth(username, config.proxy_password.as_deref().unwrap_or(""));
@@ -103,7 +104,7 @@ impl AppState {
             builder = builder.proxy(proxy);
         }
 
-        builder.build().expect("构建 reqwest client 失败")
+        builder.build().expect("could not build the reqwest client")
     }
 
     pub fn new(config: Config) -> Self {
@@ -137,7 +138,7 @@ impl AppState {
                 .map(|rule| CompiledRetryRule {
                     path: rule.path.as_deref().map(|p| {
                         Config::compile_bounded_retry_pattern(p)
-                            .expect("重试规则的 path 模式已在配置校验时确认合法")
+                            .expect("retry path patterns were validated in the configuration")
                     }),
                     status: rule.status.clone(),
                     max_attempts: rule.max_attempts,
@@ -239,7 +240,7 @@ impl AppState {
             } => false,
             _ = async {
                 stopping.await;
-                tracing::info!("10 秒后强制退出（在途请求将中断）");
+                tracing::info!("Forcing exit after 10 seconds; in-flight requests will be interrupted");
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 self.terminate_remaining_formats().await;
             } => true,

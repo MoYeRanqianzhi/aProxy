@@ -199,9 +199,9 @@ fn decode_layers(
             )),
             "zstd" => Box::new(
                 ruzstd::decoding::StreamingDecoder::new(&mut *reader)
-                    .map_err(|e| format!("zstd 帧头无效: {e}"))?,
+                    .map_err(|e| format!("invalid zstd frame header: {e}"))?,
             ),
-            other => return Err(format!("不支持的 content-encoding「{other}」")),
+            other => return Err(format!("unsupported content-encoding: {other}")),
         };
         let mut wrapped = std::io::BufReader::new(decoded);
         let written = decode_layers(&mut wrapped, layers, output, max_output)?;
@@ -225,9 +225,11 @@ fn decode_layers(
     }
     // take(max+1)：多读 1 字节才能区分「恰好等于上限」与「已超限」
     let written = std::io::copy(&mut reader.take(max_output.saturating_add(1)), output)
-        .map_err(|e| format!("解码失败（数据损坏或被截断）: {e}"))?;
+        .map_err(|e| format!("decoding failed (data is corrupt or truncated): {e}"))?;
     if written > max_output {
-        return Err(format!("解码输出超过上限 {max_output} 字节"));
+        return Err(format!(
+            "decoded output exceeds the {max_output}-byte limit"
+        ));
     }
     Ok(written)
 }
@@ -292,14 +294,14 @@ impl<R: std::io::BufRead> Read for StrictInflate<R> {
             if eof {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
-                    "deflate 流被截断",
+                    "truncated deflate stream",
                 ));
             }
             // 有输入却既不消费也不产出：解码器卡死，报错而不是空转
             if consumed == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "deflate 解码无进展",
+                    "deflate decoder made no progress",
                 ));
             }
         }

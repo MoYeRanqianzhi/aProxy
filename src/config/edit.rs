@@ -249,7 +249,7 @@ fn set(document: &mut DocumentMut, path: &[KeySegment], value: Value) {
         table = table
             .get_mut(&segment.name)
             .and_then(Item::as_table_like_mut)
-            .expect("上一步保证了这里是一张表");
+            .expect("the preceding step established a table");
     }
     let value = one_line(value);
     match table.get_mut(&last.name) {

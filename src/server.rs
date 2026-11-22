@@ -97,7 +97,10 @@ pub(crate) async fn serve_forever(
             )));
         }
     };
-    let actual_addr = listener.local_addr().expect("获取监听地址失败").to_string();
+    let actual_addr = listener
+        .local_addr()
+        .expect("could not get the listener address")
+        .to_string();
     let port = daemon::port_of(&actual_addr).to_string();
 
     // 配置的端口是 0（由系统分配）时，台账里登记的也是 0：强制安装据条目里的端口核对
@@ -112,7 +115,7 @@ pub(crate) async fn serve_forever(
         )
         && let Err(e) = aproxy_ipc::ledger::write_entry_in(&aproxy_ipc::home::home(), &entry)
     {
-        tracing::warn!(error = %e, "台账条目没能改写成实际端口");
+        tracing::warn!(error = %e, "Could not update the ledger entry with the bound port");
     }
 
     // R1：先退役比自己旧的看护者，再创建控制端点——旧看护者处理死亡事件时会
@@ -156,7 +159,7 @@ pub(crate) async fn serve_forever(
         foreground: !daemon_child,
     };
     if let Err(e) = daemon::write_instance_file(&info) {
-        tracing::warn!(error = %e, "实例注册表写入失败（不影响代理功能）");
+        tracing::warn!(error = %e, "Could not write the instance registry; proxy traffic is unaffected");
     }
 
     // IPC 控制通道（端点已在注册前创建好）：ping/shutdown 走命名管道，与代理
@@ -223,7 +226,9 @@ pub(crate) async fn serve_forever(
         }
         match control.write_restore(&spec) {
             Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "期望状态记录写入失败（不影响代理功能）"),
+            Err(e) => {
+                tracing::warn!(error = %e, "Could not write the desired-state record; proxy traffic is unaffected")
+            }
         }
     }
 
@@ -252,8 +257,8 @@ pub(crate) async fn serve_forever(
                     continue;
                 }
                 match daemon::write_instance_file_in(&run_dir, &control.record) {
-                    Ok(()) => tracing::warn!("实例记录不在或已被改动，已补写"),
-                    Err(e) => tracing::warn!(error = %e, "实例记录补写失败"),
+                    Ok(()) => tracing::warn!("Missing or modified instance record restored"),
+                    Err(e) => tracing::warn!(error = %e, "Could not restore the instance record"),
                 }
                 // 补写期间开始退出的：退出路径可能已经删过记录，把刚写下的这一份收掉
                 if *control.on_shutdown.borrow() {
@@ -282,7 +287,9 @@ pub(crate) async fn serve_forever(
             }
         });
     } else {
-        tracing::warn!("看门狗心跳创建失败，该实例将不受挂死检测保护（进程死亡检测不受影响）");
+        tracing::warn!(
+            "Could not create the watchdog heartbeat; hang detection is unavailable, but process death detection is unaffected"
+        );
     }
 
     // 守护侧互保（watchdog 总开关，settings 层）：看护者是增值层而非依赖层——
@@ -319,10 +326,13 @@ pub(crate) async fn serve_forever(
                 };
                 match watchdog::spawn_watchdog(&exe, &aproxy_ipc::home::home()) {
                     Ok(pid) => {
-                        tracing::info!(pid, "看护者缺席，已由守护补种（选举胜出者）");
+                        tracing::info!(
+                            pid,
+                            "Watchdog was absent; this instance won the election and started it"
+                        );
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "看护者补种失败（下轮自检重试）");
+                        tracing::error!(error = %e, "Could not start the missing watchdog; the next self-check will retry");
                     }
                 }
             }
@@ -337,16 +347,19 @@ pub(crate) async fn serve_forever(
         if !report.removed.is_empty() {
             tracing::info!(
                 removed = report.removed.len(),
-                "清理了残留的运行期文件与旧日志"
+                "Cleaned up leftover runtime files and old logs"
             );
         }
         let spool = daemon::collect_stale_spool_in(&daemon::spool_root());
         if !spool.is_empty() {
-            tracing::info!(removed = spool.len(), "清理了已退出的进程留下的 spool 目录");
+            tracing::info!(
+                removed = spool.len(),
+                "Cleaned up spool directories left by exited processes"
+            );
         }
         if report.logs_paused {
             tracing::warn!(
-                "run 目录里有读不懂的记录（多半由更新版本的 aproxy 写下），旧日志的清理已暂停"
+                "The run directory contains unreadable records, possibly from a newer version; old-log cleanup is paused"
             );
         }
     });
@@ -371,7 +384,10 @@ pub(crate) async fn serve_forever(
                         // 截断而非 rename 轮转：跟随器与启动时的 2MiB 检查都按
                         // 「文件变小」设计，且不产生需要再治理的轮转文件堆
                         let _ = std::fs::write(&rotate_path, b"");
-                        tracing::info!("日志文件超过 {} MB，已截断", rotate_limit / 1024 / 1024);
+                        tracing::info!(
+                            "Log file exceeded {} MB and was truncated",
+                            rotate_limit / 1024 / 1024
+                        );
                     }
                 }
             });
@@ -384,7 +400,7 @@ pub(crate) async fn serve_forever(
         base_url = %aproxy_ipc::redact::url(&base_url),
         config = %cfg_display,
         pid = %std::process::id(),
-        "启动 aProxy"
+        "Starting aProxy"
     );
     // forward 是默认投递方式而非关闭缓存的全局开关。按协商的正文需求缓冲上传；
     // response 层或错误响应的 decide 可收齐下载，均受相应的磁盘策略与大小上限约束。
@@ -403,7 +419,7 @@ pub(crate) async fn serve_forever(
     {
         tracing::warn!(
             configured = %value,
-            "override_headers 里的 accept-encoding 对保活适用的请求不生效：这些请求发往上游时一律改为 identity（压缩流里无法插入心跳），只有不走保活的请求按配置值发送"
+            "The accept-encoding override does not apply to keepalive requests. They always use identity upstream because heartbeats cannot be inserted into compressed streams. Other requests use the configured value."
         );
     }
     // 格式程序可能改写消息，启动日志逐项列出参与的程序。
@@ -435,7 +451,7 @@ pub(crate) async fn serve_forever(
     if let Some(dir) = &state.spool_dir {
         daemon::remove_spool_dir(dir);
     }
-    tracing::info!("aProxy 已停止");
+    tracing::info!("aProxy stopped");
     Ok(())
 }
 
@@ -458,18 +474,20 @@ async fn stop_signal(mut ipc_rx: tokio::sync::watch::Receiver<bool>) {
             }
         } => {},
     }
-    tracing::info!("收到停止信号，正在关闭...");
+    tracing::info!("Stop signal received; shutting down...");
 }
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c().await.expect("安装 Ctrl+C 监听失败");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("could not install the Ctrl+C listener");
     };
 
     #[cfg(unix)]
     let terminate = async {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("安装 SIGTERM 监听失败")
+            .expect("could not install the SIGTERM listener")
             .recv()
             .await;
     };

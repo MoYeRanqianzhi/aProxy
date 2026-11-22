@@ -206,7 +206,7 @@ fn heartbeat_only_disconnect_logs_generic_client_hint() {
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
     let text = || String::from_utf8_lossy(&logs.0.lock().unwrap()).to_string();
-    const HINT: &str = "流空闲超时";
+    const HINT: &str = "stream idle timeout";
 
     // 尚未提交 / 只收心跳但等待不足 60s（多为主动取消）/ 已开始回放真实字节：
     // 只记断开，不提示
@@ -220,17 +220,17 @@ fn heartbeat_only_disconnect_logs_generic_client_hint() {
             rec: crate::history::Recorder::none(),
         },
     }
-    .log_client_gone("等待上游");
+    .log_client_gone("waiting for upstream");
     let (short, _rx1, _g1) = committed_sink(Duration::from_secs(30), true);
-    short.log_client_gone("等待上游");
+    short.log_client_gone("waiting for upstream");
     let (replaying, _rx2, _g2) = committed_sink(Duration::from_secs(900), false);
-    replaying.log_client_gone("回放");
-    assert!(text().contains("客户端已断开"), "{}", text());
+    replaying.log_client_gone("replay");
+    assert!(text().contains("Client disconnected"), "{}", text());
     assert!(!text().contains(HINT), "以上三种都不应提示: {}", text());
 
     // 只收心跳等了 300s（Codex 的默认事件级超时）后断开：提示，且不点名客户端
     let (codex_like, _rx3, _g3) = committed_sink(Duration::from_secs(300), true);
-    codex_like.log_client_gone("退避等待");
+    codex_like.log_client_gone("backoff");
     let out = text();
     assert!(
         out.contains(HINT) && out.contains("300"),
@@ -472,7 +472,7 @@ async fn spool_finish_surfaces_error_of_last_write() {
 
     let result = buf.finish(StreamErrorScanner::new()).await;
     let err = result.err().expect("收尾 flush 必须暴露最后一块的写失败");
-    assert!(err.contains("spool 磁盘写入失败"), "{err}");
+    assert!(err.contains("Could not flush the disk spool"), "{err}");
     assert!(!path.exists(), "失败的 spool 半截文件必须删除");
 }
 
@@ -602,7 +602,7 @@ fn preview_of_binary_shows_hex_not_mojibake() {
     let mut zstd_like = vec![0x28, 0xb5, 0x2f, 0xfd];
     zstd_like.extend((0..200u8).map(|i| i.wrapping_mul(37)));
     let p = preview_body(&zstd_like, 500, zstd_like.len());
-    assert!(p.contains("二进制/压缩内容"), "{p}");
+    assert!(p.contains("binary or compressed"), "{p}");
     assert!(p.contains("28 b5 2f fd"), "hex 应含 zstd magic: {p}");
     assert!(!p.contains('\u{FFFD}'), "不应输出替换符: {p}");
 }
@@ -612,7 +612,7 @@ fn preview_of_text_is_plain_and_truncated() {
     let text = "上游过载：请稍后重试".repeat(50);
     let p = preview_body(text.as_bytes(), 100, text.len());
     assert!(p.contains("上游过载"), "{p}");
-    assert!(p.contains("截断"), "{p}");
+    assert!(p.contains("truncated"), "{p}");
     // 正常 JSON 错误体
     let json = br#"{"type":"error","error":{"type":"overloaded"}}"#;
     assert_eq!(
@@ -627,19 +627,19 @@ fn preview_byte_count_is_the_response_size_not_the_snapshot_size() {
     //（spool 长度），否则日志会把 10 MB 的响应说成 1 KiB，误导排障
     let snapshot = "上游过载：请稍后重试".repeat(60); // > limit，触发截断分支
     let p = preview_body(snapshot.as_bytes(), 100, 10 * 1024 * 1024);
-    assert!(p.contains("截断"), "{p}");
+    assert!(p.contains("truncated"), "{p}");
     assert!(
-        p.contains("共 10485760 字节"),
+        p.contains("10485760 bytes total"),
         "截断提示应报响应真实大小而非快照长度: {p}"
     );
     assert!(
-        !p.contains(&format!("共 {} 字节", snapshot.len())),
+        !p.contains(&format!("{} bytes total", snapshot.len())),
         "不得把快照长度当成响应大小: {p}"
     );
     // 二进制分支同样按真实大小口径
     let bin = [0x28u8, 0xb5, 0x2f, 0xfd].repeat(500);
     let p = preview_body(&bin, 500, 7_000_000);
-    assert!(p.contains("共 7000000 字节"), "{p}");
+    assert!(p.contains("7000000 bytes"), "{p}");
 }
 
 // ---- is_hop_header：hop-by-hop 头识别（大小写不敏感）----

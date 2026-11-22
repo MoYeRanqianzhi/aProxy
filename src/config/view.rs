@@ -568,7 +568,11 @@ fn fill_table(table: &mut Table, map: &Map<String, Value>) {
                 let mut tables = ArrayOfTables::new();
                 for item in items {
                     let mut nested = Table::new();
-                    fill_table(&mut nested, item.as_object().expect("上面核对过都是对象"));
+                    fill_table(
+                        &mut nested,
+                        item.as_object()
+                            .expect("both values were checked to be objects"),
+                    );
                     tables.push(nested);
                 }
                 table.insert(name, Item::ArrayOfTables(tables));

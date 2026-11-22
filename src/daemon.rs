@@ -75,7 +75,7 @@ pub fn own_spool_dir() -> PathBuf {
 /// 请求体与响应体留在内存里。
 pub fn prepare_spool_dir(dir: &std::path::Path) {
     if let Err(e) = crate::fsx::create_dir_all(dir) {
-        tracing::warn!(error = %e, dir = %dir.display(), "spool 目录创建失败（磁盘缓存将不可用，回退纯内存）");
+        tracing::warn!(error = %e, dir = %dir.display(), "Cannot create the spool directory; disk buffering is unavailable, using memory instead");
     }
 }
 
@@ -87,7 +87,7 @@ pub fn remove_spool_dir(dir: &std::path::Path) -> bool {
         if path.extension().is_some_and(|ext| ext == "spooltmp")
             && let Err(e) = std::fs::remove_file(&path)
         {
-            tracing::warn!(error = %e, path = %path.display(), "spool 残留清理失败");
+            tracing::warn!(error = %e, path = %path.display(), "Could not clean up leftover spool files");
         }
     }
     std::fs::remove_dir(dir).is_ok()
@@ -806,7 +806,7 @@ pub fn write_instance_file_in(run_dir: &std::path::Path, info: &InstanceRecord) 
         schema: INSTANCE_SCHEMA,
         record: info.clone(),
     };
-    let json = serde_json::to_string(&file).expect("序列化实例信息失败");
+    let json = serde_json::to_string(&file).expect("instance information must serialize");
     crate::fsx::write_atomic_private(&path, (json + "\n").as_bytes())
 }
 
@@ -1192,7 +1192,7 @@ where
         result: Some(status),
         error: None,
     })
-    .expect("序列化 IPC 应答失败");
+    .expect("IPC replies must serialize");
     write_line(&mut writer, &reply).await?;
     // 应答先发出去再触发停止：客户端立刻拿到确认，服务随后优雅退出
     if matches!(op, IpcOp::Shutdown { .. }) {
@@ -1498,7 +1498,7 @@ impl SubscriberStatus {
     }
     /// 初始应答和每一条 state 都使用 ping 的既有形状。
     fn json(&self) -> String {
-        serde_json::to_string(&self.snapshot).expect("序列化状态快照失败")
+        serde_json::to_string(&self.snapshot).expect("status snapshots must serialize")
     }
 }
 
@@ -1671,7 +1671,7 @@ mod imp {
                 match security.create(&ServerOptions::new(), &endpoint) {
                     Ok(next) => break next,
                     Err(e) => {
-                        tracing::warn!(error = %e, "控制管道新建监听实例失败，1 秒后重试");
+                        tracing::warn!(error = %e, "Could not create a control pipe listener; retrying in one second");
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 }
@@ -1685,7 +1685,9 @@ mod imp {
                     });
                 }
                 // 客户端在服务端接上之前就断开等：只影响这一个连接
-                Err(e) => tracing::debug!(error = %e, "控制管道连接未建立，换一个监听实例继续"),
+                Err(e) => {
+                    tracing::debug!(error = %e, "Control pipe connection was not established; continuing with another listener")
+                }
             }
         }
     }
@@ -1740,7 +1742,7 @@ mod imp {
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
-                    format!("已有进程在 {endpoint} 上提供控制通道"),
+                    format!("another process is serving the control channel at {endpoint}"),
                 ));
             }
         }
@@ -1778,11 +1780,11 @@ mod imp {
                     match stream.peer_cred().map(|cred| cred.uid()) {
                         Ok(client) if accepted_client_uid(me, client) => {}
                         Ok(client) => {
-                            tracing::warn!(uid = client, "控制 socket 拒绝了另一个用户的连接");
+                            tracing::warn!(uid = client, "Control socket rejected a connection from another user");
                             continue;
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "控制 socket 读不出对端的身份，连接已拒绝");
+                            tracing::warn!(error = %e, "Could not identify the control socket peer; connection refused");
                             continue;
                         }
                     }
@@ -1802,10 +1804,10 @@ mod imp {
                         match bind_private(&path) {
                             Ok(fresh) => {
                                 listener = fresh;
-                                tracing::warn!(path = %path.display(), "控制 socket 文件被删除，已在原路径重建");
+                                tracing::warn!(path = %path.display(), "Control socket file was removed; recreated it at the original path");
                             }
                             Err(e) => {
-                                tracing::warn!(error = %e, "控制 socket 文件被删除，重建失败，1 秒后再试");
+                                tracing::warn!(error = %e, "Control socket file was removed and could not be recreated; retrying in one second");
                             }
                         }
                     }

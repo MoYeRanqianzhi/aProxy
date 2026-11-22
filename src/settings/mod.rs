@@ -249,7 +249,7 @@ pub fn load_from(path: &Path) -> Settings {
             path = %path.display(),
             problems = loaded.diagnostics.len(),
             first = %first,
-            "settings.json 无效，沿用上一次读到的有效设置（没有则用内置默认）"
+            "Invalid settings.json; retaining the last valid settings or the built-in defaults"
         );
     });
     last.get(path).cloned().unwrap_or(loaded.settings)

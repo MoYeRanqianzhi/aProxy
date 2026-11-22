@@ -101,7 +101,7 @@ pub fn terminate_marked_process(pid: u32, expected_start: &str) -> Result<(), Te
 pub fn terminate_verified_process(pid: u32, expected_start: u64) -> Result<(), String> {
     if expected_start == 0 {
         return Err(format!(
-            "pid {pid} 没有登记进程创建时间，无法核验身份，拒绝终止以防误杀"
+            "pid {pid} has no recorded creation time; refusing termination because its identity cannot be verified"
         ));
     }
     imp::terminate_verified(pid, expected_start)
@@ -166,18 +166,20 @@ mod imp {
                 pid,
             );
             if h == 0 {
-                return Err(format!("无法打开 pid {pid}（进程可能已退出）"));
+                return Err(format!(
+                    "cannot open pid {pid} (the process may have exited)"
+                ));
             }
             let mut code: u32 = 0;
             let result = if super::imp_process::handle_start_time(h) != Some(expected_start) {
                 Err(format!(
-                    "pid {pid} 的进程创建时间与登记不符（pid 已被复用），拒绝终止以防误杀"
+                    "the creation time of pid {pid} differs from the record; refusing to terminate a reused pid"
                 ))
             } else if GetExitCodeProcess(h, &mut code) != 0 && code != 259 {
-                Err(format!("pid {pid} 已退出"))
+                Err(format!("pid {pid} has exited"))
             } else if TerminateProcess(h, 1) == 0 {
                 Err(format!(
-                    "终止 pid {pid} 失败（{}）",
+                    "could not terminate pid {pid} ({})",
                     std::io::Error::last_os_error()
                 ))
             } else {
@@ -254,23 +256,27 @@ mod imp {
     /// 无 /proc 的平台读不到创建时间，一律按「已退出/不可核验」拒绝。
     pub fn terminate_verified(pid: u32, expected_start: u64) -> Result<(), String> {
         match super::imp_process::process_start_time(pid) {
-            None => return Err(format!("pid {pid} 已退出（或无法读取进程创建时间）")),
+            None => {
+                return Err(format!(
+                    "pid {pid} has exited or its creation time cannot be read"
+                ));
+            }
             Some(actual) if actual != expected_start => {
                 return Err(format!(
-                    "pid {pid} 的进程创建时间与登记不符（pid 已被复用），拒绝终止以防误杀"
+                    "the creation time of pid {pid} differs from the record; refusing to terminate a reused pid"
                 ));
             }
             Some(_) => {}
         }
         if super::process_exited(pid) == Some(true) {
-            return Err(format!("pid {pid} 已退出"));
+            return Err(format!("pid {pid} has exited"));
         }
         let r = unsafe { kill(pid as i32, 9) };
         if r == 0 {
             Ok(())
         } else {
             Err(format!(
-                "终止 pid {pid} 失败（{}）",
+                "could not terminate pid {pid} ({})",
                 std::io::Error::last_os_error()
             ))
         }

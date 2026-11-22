@@ -99,7 +99,7 @@ pub fn apply_to_text(
         with_schema.append(map);
         *map = with_schema;
     }
-    let mut new = serde_json::to_string_pretty(&root).expect("JSON 值总能序列化");
+    let mut new = serde_json::to_string_pretty(&root).expect("JSON values must serialize");
     new.push('\n');
 
     let errors = |diagnostics: Vec<Diagnostic>| -> Vec<Diagnostic> {
@@ -150,7 +150,7 @@ fn set(root: &mut Value, path: &[KeySegment], value: Value) {
         }
         current = current
             .as_object_mut()
-            .expect("上一步保证了这里是对象")
+            .expect("the preceding step established an object")
             .entry(segment.name.clone())
             .or_insert_with(|| Value::Object(Map::new()));
     }

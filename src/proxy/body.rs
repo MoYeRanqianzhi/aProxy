@@ -375,13 +375,13 @@ impl ClientUpload {
         let (body, model) = read_request_body(self.body, limit, state.spool_dir.as_deref(), history, digest.as_mut()).await.map_err(|e| match e {
             ReadBodyError::TooLarge => body_too_large(limit),
             ReadBodyError::ClientAborted(e) => {
-                tracing::error!(code = %"client_body_aborted", error = %e, "读取请求体失败：客户端在上传途中断开");
+                tracing::error!(code = %"client_body_aborted", error = %e, "Could not read request body: client disconnected during upload");
                 Terminal::client_body_aborted()
             }
             ReadBodyError::Storage(e) => {
                 let t = Terminal::local_storage_failed(StorageOp::WriteRequest, &e.to_string());
                 t.record_in(&state.stats);
-                tracing::error!(code = %t.code(), error = %e, "请求体写入磁盘缓存失败");
+                tracing::error!(code = %t.code(), error = %e, "Could not write request body to disk buffer");
                 t
             }
         })?;
@@ -411,7 +411,7 @@ pub(super) fn body_too_large(body_limit: usize) -> Terminal {
     tracing::warn!(
         code = %"request_too_large",
         limit_bytes = body_limit,
-        "请求体超出上限"
+        "Request body exceeded the size limit"
     );
     Terminal::request_too_large(body_limit)
 }

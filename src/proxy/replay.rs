@@ -19,7 +19,7 @@ pub(super) async fn replay_transformed(
         // 是 chunked 流式）
         SpooledBody::Disk { .. } => retry::is_streaming_content_type(&resp_headers),
     };
-    tracing::info!(attempt, status = %status, is_streaming, "上游成功，回放响应");
+    tracing::info!(attempt, status = %status, is_streaming, "Upstream succeeded; replaying response");
     build_replay_response(status, resp_headers, raw_headers, body, is_streaming).await
 }
 
@@ -50,15 +50,15 @@ pub(super) async fn decode_for_committed_replay(
             }
             SpooledBody::Disk { path, .. } => {
                 let file = std::fs::File::open(path)
-                    .map_err(|e| format!("读取 spool 临时文件失败: {e}"))?;
+                    .map_err(|e| format!("Could not read the spool file: {e}"))?;
                 crate::decode::decode_strict(&encoding, file, &mut out, limit)?
             }
         };
         out.into_body()
-            .map_err(|e| format!("解码结果写入 spool 失败: {e}"))
+            .map_err(|e| format!("Could not write decoded data to the spool: {e}"))
     })
     .await
-    .map_err(|e| format!("解码任务异常结束: {e}"))?
+    .map_err(|e| format!("Decoding task ended unexpectedly: {e}"))?
 }
 
 /// 失败响应的原样回放（受限重试路径达上限、且尚未向客户端提交任何字节时）：

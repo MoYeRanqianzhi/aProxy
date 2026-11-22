@@ -144,15 +144,15 @@ pub fn terminate_watchdogs_in(home: &Path, older_than: Option<&semver::Version>)
         match ledger::terminate(entry, Duration::from_secs(5)) {
             ledger::Termination::Terminated => {
                 ledger::remove_if_unchanged(&found);
-                tracing::info!(pid = entry.pid, version = %entry.version, "已结束看护者");
+                tracing::info!(pid = entry.pid, version = %entry.version, "Watchdog terminated");
                 terminated += 1;
             }
             ledger::Termination::AlreadyGone => {}
             ledger::Termination::NotOwned(owner) => {
-                tracing::warn!(pid = entry.pid, owner = %owner, "看护者属于别的用户，没有结束它");
+                tracing::warn!(pid = entry.pid, owner = %owner, "Watchdog belongs to another user; left it running");
             }
             ledger::Termination::Failed(why) => {
-                tracing::warn!(pid = entry.pid, error = %why, "看护者结束失败");
+                tracing::warn!(pid = entry.pid, error = %why, "Could not terminate watchdog");
             }
         }
     }
@@ -523,7 +523,7 @@ impl WatchdogState {
                 crate::process::close_handle(handle);
                 continue;
             }
-            tracing::info!(port = %entry.port, pid = info.pid, "看护者收养实例");
+            tracing::info!(port = %entry.port, pid = info.pid, "Watchdog adopted instance");
             self.watched.push(Watched {
                 port: entry.port.clone(),
                 pid: info.pid,
@@ -580,10 +580,10 @@ impl WatchdogState {
             // 候选已死（zombie/reaped）时判 Gone → 跳过处决，死亡事件由
             // watcher 兜底
             if record_identity(w.pid, &w.start) != RecordIdentity::Alive {
-                tracing::warn!(port = %w.port, pid = w.pid, "挂死候选的 pid 已不是收编时的进程（已退出或被复用），跳过处决");
+                tracing::warn!(port = %w.port, pid = w.pid, "Hang candidate is no longer the adopted process (exited or pid reused); skipping termination");
                 continue;
             }
-            tracing::error!(port = %w.port, pid = w.pid, "实例心跳过期且 IPC 无响应，判定挂死，终止进程");
+            tracing::error!(port = %w.port, pid = w.pid, "Instance heartbeat expired and IPC did not respond; terminating hung process");
             self.log(&format!(
                 "the instance on port {} (pid {}) is hung: its heartbeat is stale and its control endpoint does not answer; terminating it",
                 w.port, w.pid
@@ -640,7 +640,7 @@ impl WatchdogState {
 
         let restore_path = crate::spec::restore_path_in(&self.cfg.run_dir, port);
         if !restore_path.is_file() {
-            tracing::info!(port = %port, "实例已被停止（没有期望状态记录），摘除看护");
+            tracing::info!(port = %port, "Instance stopped and has no desired-state record; removing it from supervision");
             self.log(&format!(
                 "the instance on port {port} was stopped; no longer watching it"
             ));
@@ -660,7 +660,7 @@ impl WatchdogState {
         }
         let delay = backoff_delay_secs(failures);
         if delay > 0 {
-            tracing::warn!(port = %port, delay_secs = delay, "实例崩溃，进入退避队列");
+            tracing::warn!(port = %port, delay_secs = delay, "Instance crashed; queued for backoff");
             self.log(&format!(
                 "the instance on port {port} went down again ({kind}) soon after a respawn; next attempt in {delay} s"
             ));
@@ -674,7 +674,7 @@ impl WatchdogState {
             return DeathOutcome::RespawnFailed;
         }
 
-        tracing::warn!(port = %port, "实例崩溃，立即重拉");
+        tracing::warn!(port = %port, "Instance crashed; respawning immediately");
         match respawn_instance(&self.cfg.home, &self.cfg.run_dir, port).await {
             Ok((pid, actual_port)) => {
                 self.note_restart(port, kind, Ok(pid));
@@ -704,7 +704,7 @@ impl WatchdogState {
         // 从大到小摘除，保证索引在多次 remove 中保持有效
         for i in due.into_iter().rev() {
             let p = self.pending.remove(i);
-            tracing::info!(port = %p.port, attempt = p.failures + 1, "退避到期，重试重拉");
+            tracing::info!(port = %p.port, attempt = p.failures + 1, "Backoff elapsed; retrying respawn");
             match respawn_instance(&self.cfg.home, &self.cfg.run_dir, &p.port).await {
                 Ok((pid, actual_port)) => {
                     self.note_restart(&p.port, p.kind, Ok(pid));
@@ -712,7 +712,7 @@ impl WatchdogState {
                 }
                 // 记录没了 = 用户在退避期间 stop 了它：不再是要恢复的实例，出队
                 Err(RespawnError::NoRecord) => {
-                    tracing::info!(port = %p.port, "期望状态记录已被删除（实例已被停止），不再重拉");
+                    tracing::info!(port = %p.port, "Desired-state record was removed; stopped instance will not be respawned");
                     self.log(&format!(
                         "the instance on port {} was stopped while waiting for a retry; no longer watching it",
                         p.port
@@ -753,7 +753,7 @@ impl WatchdogState {
                 old_port = %dead_port,
                 new_port = %actual_port,
                 pid,
-                "实例重拉后落在新端口（配置已改端口或端口为 0），已清理旧端口的恢复记录"
+                "Instance respawned on a different port; removed the old port's restore record"
             );
         }
         self.admit_respawned(actual_port, pid, prior_failures);
@@ -767,7 +767,7 @@ impl WatchdogState {
     /// `prior_failures` 是这次重拉之前已经连续失败的次数：实例若没活够
     /// [`HEALTHY_AFTER_SECS`] 就又死了，这次重拉也算失败，从 `prior_failures + 1` 接着数。
     fn admit_respawned(&mut self, port: &str, pid: u32, prior_failures: u32) {
-        tracing::info!(port = %port, new_pid = pid, "实例已重拉并就绪");
+        tracing::info!(port = %port, new_pid = pid, "Respawned instance is ready");
         // 先开句柄再算启动标记：Windows 句柄一旦打开就钉住进程对象，随后按
         // pid 算得的必是同一对象的标记（反序则两次调用之间进程若恰好退出、
         // pid 被复用，基准与句柄会分属两个进程）
@@ -798,7 +798,7 @@ impl WatchdogState {
         err: String,
     ) -> DeathOutcome {
         let failures = failures.saturating_add(1);
-        tracing::error!(port = %port, error = %err, attempt = failures, "重拉失败");
+        tracing::error!(port = %port, error = %err, attempt = failures, "Respawn failed");
         if failures >= self.cfg.max_restarts {
             return self.slow_retry(port, failures, kind);
         }
@@ -825,7 +825,7 @@ impl WatchdogState {
             ));
             tracing::warn!(
                 port = %port,
-                "实例已不在运行；watchdog.max_restarts 为 0，不自动重拉（期望状态记录已保留，可 aproxy restore 手工恢复）"
+                "Instance is not running and watchdog.max_restarts is zero; not restarting automatically. Its desired-state record remains available for aproxy restore."
             );
             self.after_watch_removal();
             return DeathOutcome::GaveUp;
@@ -835,7 +835,7 @@ impl WatchdogState {
                 port = %port,
                 attempts = failures,
                 retry_every_secs = SLOW_RETRY_SECS,
-                "实例连续重拉失败达上限，转入慢速重试（期望状态记录已保留，也可 aproxy restore 手工恢复）"
+                "Consecutive respawn failures reached the limit; switching to slow retries. The desired-state record is retained; aproxy restore can also recover the instance."
             );
             crate::daemon::append_startup_log(&format!(
                 "[watchdog] the instance on port {port} failed to come back {failures} times in a row; retrying every {SLOW_RETRY_SECS} seconds until it starts or `aproxy stop {port}` is run"
@@ -892,7 +892,7 @@ impl WatchdogState {
         };
         let s = settings::load_from(path);
         if !s.watchdog {
-            tracing::info!("settings.json 里的 watchdog.enabled 已关闭，看护者退出");
+            tracing::info!("watchdog.enabled was turned off in settings.json; watchdog exiting");
             self.log("watchdog.enabled was turned off in settings.json; exiting");
             remove_record_in(&self.cfg.run_dir);
             return Tick::Retire;
@@ -913,17 +913,20 @@ impl WatchdogState {
         if !report.removed.is_empty() {
             tracing::info!(
                 removed = report.removed.len(),
-                "清理了残留的运行期文件与旧日志"
+                "Cleaned up leftover runtime files and old logs"
             );
         }
         // spool 里是请求与响应的全文：实例崩溃之后即使迟迟拉不回来，也不该一直留在盘上
         let spool = crate::daemon::collect_stale_spool_in(&self.cfg.home.join("spool"));
         if !spool.is_empty() {
-            tracing::info!(removed = spool.len(), "清理了已退出的进程留下的 spool 目录");
+            tracing::info!(
+                removed = spool.len(),
+                "Cleaned up spool directories left by exited processes"
+            );
         }
         if report.logs_paused && !self.gc_pause_reported {
             tracing::warn!(
-                "run 目录里有读不懂的记录（多半由更新版本的 aproxy 写下），旧日志的清理已暂停"
+                "The run directory contains unreadable records, possibly from a newer version; old-log cleanup is paused"
             );
         }
         self.gc_pause_reported = report.logs_paused;
@@ -941,7 +944,7 @@ impl WatchdogState {
             RecordRead::Readable(existing) if !existing.same_owner(&self.record) => {
                 tracing::warn!(
                     record_pid = existing.pid,
-                    "看护者记录已被其他看护者接管，本进程让位退出"
+                    "Another watchdog owns the record; this process is stepping down"
                 );
                 self.log(&format!(
                     "the watchdog record now belongs to pid {}; exiting",
@@ -950,7 +953,9 @@ impl WatchdogState {
                 return Tick::Retire;
             }
             RecordRead::Unreadable { .. } => {
-                tracing::warn!("看护者记录读不懂（多半由更新版本的看护者写下），本进程让位退出");
+                tracing::warn!(
+                    "Watchdog record is unreadable, possibly from a newer version; this process is stepping down"
+                );
                 self.log("the watchdog record is not readable by this version (a newer watchdog probably wrote it); exiting");
                 return Tick::Retire;
             }
@@ -963,7 +968,7 @@ impl WatchdogState {
         };
         let path = record_path_in(&self.cfg.run_dir);
         if let Err(e) = crate::fsx::write_atomic_private(&path, (json + "\n").as_bytes()) {
-            tracing::warn!(error = %e, "看护者记录重写失败");
+            tracing::warn!(error = %e, "Could not rewrite the watchdog record");
         }
         Tick::Continue
     }
@@ -980,7 +985,7 @@ impl WatchdogState {
         if self.watched.is_empty() && self.pending.is_empty() && registry_empty {
             let since = *self.empty_since.get_or_insert_with(std::time::Instant::now);
             if since.elapsed().as_secs() >= self.cfg.idle_exit_secs {
-                tracing::info!("无任何实例需要看护，看护者退出（闲置自灭）");
+                tracing::info!("No instances need supervision; idle watchdog exiting");
                 self.log("no instance left to watch; exiting");
                 remove_record_in(&self.cfg.run_dir);
                 return Tick::Retire;
@@ -1016,7 +1021,7 @@ impl WatchdogState {
                 && info.pid != old_pid
                 && confirm_registered_instance(&info).is_some()
             {
-                tracing::info!(port = %port, new_pid = info.pid, "安装态复查：实例已以新 pid 回归，重新收养");
+                tracing::info!(port = %port, new_pid = info.pid, "Installation recheck: instance returned with a different pid and was readopted");
                 return Some(info.pid);
             }
         }
@@ -1038,7 +1043,7 @@ impl WatchdogState {
         }
         tracing::warn!(
             installer_pid = ann.installer_pid,
-            "install 宣告心跳过期（挂死/残留），拉起 install --continue 续作"
+            "Installation announcement heartbeat expired; starting install --continue to resume"
         );
         if let Ok(exe) = std::env::current_exe() {
             let _ = crate::daemon::spawn_detached(
@@ -1103,7 +1108,7 @@ enum RespawnError {
 impl std::fmt::Display for RespawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoRecord => f.write_str("期望状态记录不存在"),
+            Self::NoRecord => f.write_str("desired-state record does not exist"),
             Self::Other(reason) => f.write_str(reason),
         }
     }
@@ -1125,7 +1130,7 @@ async fn respawn_instance(
         Ok(None) => return Err(RespawnError::NoRecord),
         Err(reason) => {
             return Err(RespawnError::Other(format!(
-                "期望状态记录读不懂（{reason}）"
+                "cannot read the desired-state record ({reason})"
             )));
         }
     };
@@ -1133,7 +1138,7 @@ async fn respawn_instance(
         && !cfg.exists()
     {
         return Err(RespawnError::Other(format!(
-            "配置文件暂时找不到: {}",
+            "configuration file is temporarily unavailable: {}",
             cfg.display()
         )));
     }
@@ -1165,7 +1170,7 @@ pub async fn serve(cfg: WatchdogConfig) {
         // 已有记录：有效 = 另一个看护者在任，让位退出
         let fallback = heartbeat_fresh_secs(&settings::load());
         if watchdog_in_effect_in(&cfg.run_dir, fallback, now_millis()) {
-            tracing::info!("已有在任的看护者，本进程退出（选举唯一性）");
+            tracing::info!("Another watchdog is active; leaving it in charge");
             return;
         }
         // 无效的记录：前任已经不在，或者还活着却不再扫描（假死）。假死的先结束掉再接管，
@@ -1177,7 +1182,7 @@ pub async fn serve(cfg: WatchdogConfig) {
         {
             tracing::error!(
                 pid = old.pid,
-                "前任看护者仍在但不再扫描（假死），终止后接管"
+                "Previous watchdog is still running but has stopped scanning; terminating it before taking over"
             );
             append_watchdog_log(
                 &cfg.home,
@@ -1197,7 +1202,7 @@ pub async fn serve(cfg: WatchdogConfig) {
                 | aproxy_ipc::ledger::Termination::NotOwned(why),
             ) = outcome
             {
-                tracing::warn!(pid = old.pid, error = %why, "终止假死前任失败");
+                tracing::warn!(pid = old.pid, error = %why, "Could not terminate the unresponsive previous watchdog");
             }
         }
         // 只删刚才判为无效的那一份：这期间另一个竞争者可能已经删掉它、写下了自己的
@@ -1205,11 +1210,13 @@ pub async fn serve(cfg: WatchdogConfig) {
             remove_record_in(&cfg.run_dir);
         }
         if !acquire_record_in(&cfg.run_dir, &mine) {
-            tracing::info!("看护者记录被竞争者抢先写下，本进程退出（选举唯一性）");
+            tracing::info!(
+                "Another candidate wrote the watchdog record first; this process is exiting"
+            );
             return;
         }
     }
-    tracing::info!(pid = std::process::id(), "看护者就绪（watchdog）");
+    tracing::info!(pid = std::process::id(), "Watchdog ready");
     append_watchdog_log(
         &cfg.home,
         0,
@@ -1276,7 +1283,7 @@ pub async fn serve(cfg: WatchdogConfig) {
 /// 进程的 home。
 fn sweep_local_states(home: &Path) {
     if crate::install::state::load_in(home).is_some() {
-        tracing::info!("发现 install 状态文件残留，拉起 install --continue 续作");
+        tracing::info!("Found an interrupted installation; starting install --continue to resume");
         if let Ok(exe) = std::env::current_exe() {
             let _ = crate::daemon::spawn_detached(
                 &exe,

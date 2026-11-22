@@ -125,7 +125,7 @@ pub fn write_spec_file(run_dir: &Path, spec: &InstanceSpec) -> std::io::Result<P
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let path = run_dir.join(format!("{nanos}-{}{SPEC_SUFFIX}", std::process::id()));
-    let json = serde_json::to_string(spec).expect("拉起规格总能序列化");
+    let json = serde_json::to_string(spec).expect("launch specifications must serialize");
     crate::fsx::write_atomic_private(&path, json.as_bytes())?;
     Ok(path)
 }
@@ -181,7 +181,7 @@ pub fn write_restore_in(run_dir: &Path, port: &str, spec: &InstanceSpec) -> std:
         spec: spec.clone(),
         written_at: now_millis(),
     };
-    let json = serde_json::to_string(&record).expect("期望状态记录总能序列化");
+    let json = serde_json::to_string(&record).expect("desired-state records must serialize");
     crate::fsx::write_atomic_private(&restore_path_in(run_dir, port), json.as_bytes())
 }
 

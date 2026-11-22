@@ -359,7 +359,7 @@ impl Responder {
         match self {
             Self::Buffered { out: Some(resp) } => resp,
             _ => {
-                tracing::error!(code = %"internal", "尝试循环没有交出响应");
+                tracing::error!(code = %"internal", "attempt loop ended without a response");
                 Terminal::internal("the attempt loop ended without a response").into_response(trace)
             }
         }
@@ -535,12 +535,12 @@ pub(super) async fn run_attempts(
             });
             rec.backoff(delay);
             if delay.is_zero() {
-                tracing::warn!(attempt, "立即重试");
+                tracing::warn!(attempt, "Retrying immediately");
                 // 进程池关闭后取位可立即失败；零退避的连续失败也要把执行机会还给停机与断连任务。
                 tokio::task::consume_budget().await;
             } else {
-                tracing::warn!(attempt, delay_ms = delay.as_millis() as u64, "重试延迟");
-                if r.wait(tokio::time::sleep(delay), None, "退避等待")
+                tracing::warn!(attempt, delay_ms = delay.as_millis() as u64, "Retry delay");
+                if r.wait(tokio::time::sleep(delay), None, "Waiting for backoff")
                     .await
                     .is_none()
                 {
@@ -953,7 +953,7 @@ pub(super) async fn run_attempts(
                     code = %failure.code,
                     details = %serde_json::Value::Object(failure.details.clone()),
                     reason = %failure.message,
-                    "本次尝试失败，重试"
+                    "Upstream attempt failed; retrying"
                 );
                 rec.decided_with_reroute(attempt, by, true, explicit_reroute);
                 // 需要重试时不在这里提交——保活出口的提交只由节拍与可提交的上游响应头推动，
@@ -1016,7 +1016,7 @@ pub(super) async fn run_attempts(
                 tracing::error!(
                     attempt,
                     code = %terminal.code(),
-                    "上游响应体超出 spool 上限，终止重试"
+                    "Upstream response body exceeded the spool limit; ending retries"
                 );
                 r.finish(terminal, &trace).await;
                 return;
@@ -1029,7 +1029,7 @@ pub(super) async fn run_attempts(
                     (op == StorageOp::ReadRequest).then(|| terminal.for_history()),
                 );
                 terminal.record_in(&state.stats);
-                tracing::error!(attempt, code = %terminal.code(), error = %e, "本地 spool 故障，终止重试");
+                tracing::error!(attempt, code = %terminal.code(), error = %e, "Local spool failure; ending retries");
                 r.finish(terminal, &trace).await;
                 return;
             }
@@ -1188,7 +1188,7 @@ async fn deliver(
     }
     let transform = transform_response_if_configured(state, req, status, headers, body);
     let transformed = r
-        .wait_after_head(transform, !upstream_sse, "响应转换")
+        .wait_after_head(transform, !upstream_sse, "response transformation")
         .await;
     let Some((status, headers, body)) = transformed else {
         return;
@@ -1213,9 +1213,7 @@ async fn deliver(
                 .get(http::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("-"),
-            "已以 text/event-stream 提交的保活响应里回放的是非 SSE 的成功响应体（响应头已发出，无法撤回）；\
-             若该实例的上游会对 stream:true 请求回非 SSE 的流（如 NDJSON）且常需重试，\
-             建议为该实例设置 keepalive_trigger = \"accept\""
+            "Replaying a successful non-SSE body on an already committed text/event-stream response; headers cannot be changed. If the upstream returns non-SSE streams such as NDJSON for stream:true and often needs retries, set keepalive_trigger = \"accept\" for this instance."
         );
     }
     let mut body = match encoding_to_undo(&headers) {
@@ -1229,7 +1227,7 @@ async fn deliver(
                 state.spool_dir.clone(),
                 max_spool_bytes,
             );
-            let Some(decoded) = r.wait(decode, None, "回放前解码").await else {
+            let Some(decoded) = r.wait(decode, None, "decoding before replay").await else {
                 return;
             };
             match decoded {
@@ -1237,7 +1235,7 @@ async fn deliver(
                     tracing::info!(
                         attempt,
                         encoding = %encoding,
-                        "上游无视 identity 仍压缩了响应：已提交的响应头不含 content-encoding，回放前已完整解码（保活通道）"
+                        "Upstream sent compressed data despite identity; decoded it before replay because committed keepalive headers have no content-encoding"
                     );
                     decoded
                 }
@@ -1249,7 +1247,7 @@ async fn deliver(
                         code = %terminal.code(),
                         encoding = %encoding,
                         error = %e,
-                        "已提交的响应无法回放上游压缩体且解码失败，以终态 error 事件收场（保活通道）"
+                        "Could not decode compressed upstream data for the committed stream; ending with a terminal error event"
                     );
                     r.send(Ok(terminal.sse_event(trace))).await;
                     return;
@@ -1261,7 +1259,7 @@ async fn deliver(
         attempt,
         status = %status,
         bytes = body.len(),
-        "上游成功，回放到已提交的响应（保活通道）"
+        "Upstream succeeded; replaying to the committed keepalive response"
     );
     // 空 body 直接结束流，不注入任何上游未发送的字节
     if body.is_empty() {
@@ -1275,7 +1273,7 @@ async fn deliver(
         let bytes = item.as_ref().map_or(0, |chunk| chunk.len() as u64);
         if !r.send(item).await {
             // 客户端在回放中断开：Drop 链负责删临时文件
-            r.log_client_gone("回放");
+            r.log_client_gone("replay");
             break;
         }
         replayed += bytes;

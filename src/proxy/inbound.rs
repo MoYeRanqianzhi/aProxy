@@ -116,7 +116,7 @@ impl InboundPolicy {
             for v in headers.get_all(http::header::HOST) {
                 match v.to_str() {
                     Ok(s) => values.push(s),
-                    Err(_) => return Some(InboundRejection::Host("<非 ASCII>".to_string())),
+                    Err(_) => return Some(InboundRejection::Host("<non-ASCII>".to_string())),
                 }
             }
             let authority = uri.authority().map(|a| a.as_str());
@@ -134,7 +134,7 @@ impl InboundPolicy {
         if let Some(allowed) = &self.origins {
             for v in headers.get_all(http::header::ORIGIN) {
                 let Ok(s) = v.to_str() else {
-                    return Some(InboundRejection::Origin("<非 ASCII>".to_string()));
+                    return Some(InboundRejection::Origin("<non-ASCII>".to_string()));
                 };
                 if !allowed.contains(&normalize_origin(s)) {
                     return Some(InboundRejection::Origin(truncate_for_display(s)));
@@ -156,11 +156,11 @@ pub(super) fn inbound_rejection_response(
     let path = aproxy_ipc::redact::url(uri.path_and_query().map_or("/", |pq| pq.as_str()));
     let terminal = match &rejection {
         InboundRejection::Host(host) => {
-            tracing::warn!(code = %"inbound_host_rejected", request_id = %trace.request_id, method = %method, path = %path, host = %host, "入站请求被拒绝：Host 不在 allowed_hosts 白名单（未转发上游）");
+            tracing::warn!(code = %"inbound_host_rejected", request_id = %trace.request_id, method = %method, path = %path, host = %host, "Inbound request rejected: Host is not in allowed_hosts; request was not forwarded");
             Terminal::inbound_host_rejected(host)
         }
         InboundRejection::Origin(origin) => {
-            tracing::warn!(code = %"inbound_origin_rejected", request_id = %trace.request_id, method = %method, path = %path, origin = %origin, "入站请求被拒绝：Origin 不在 allowed_origins 白名单（未转发上游）");
+            tracing::warn!(code = %"inbound_origin_rejected", request_id = %trace.request_id, method = %method, path = %path, origin = %origin, "Inbound request rejected: Origin is not in allowed_origins; request was not forwarded");
             Terminal::inbound_origin_rejected(origin)
         }
     };

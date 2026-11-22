@@ -90,7 +90,7 @@ async fn handle(
         tracing::warn!(
             code = %"upgrade_unsupported",
             upgrade = %upgrade,
-            "拒绝了连接升级请求（不支持，未转发上游）"
+            "Rejected an unsupported connection upgrade; request was not forwarded"
         );
         return Terminal::upgrade_unsupported(&upgrade).into_response(&trace);
     }
@@ -154,7 +154,7 @@ async fn handle(
     };
     if live && !state.has_format(Stage::Request) {
         delivery.arm_notify(&state, ctx.as_ref());
-        tracing::info!(method = %method, target = %state.history.redacted_url(&target_url), "代理请求（仅转发）");
+        tracing::info!(method = %method, target = %state.history.redacted_url(&target_url), "Proxy request (forward only)");
         trace.attempts = 1;
         return forward_only_proxy(
             state,
@@ -236,7 +236,7 @@ async fn handle(
         // resp_tx.closed() 感知并中止上游请求。Err 只在后台任务未交出响应就结束时
         // 出现（panic）——给客户端一个明确的 500 而不是让连接悬空
         return resp_rx.await.unwrap_or_else(|_| {
-            tracing::error!(code = %"internal", "保活通道后台任务未交出响应即结束");
+            tracing::error!(code = %"internal", "Keepalive task ended without delivering a response");
             Terminal::internal("the keepalive task ended without a response").into_response(&trace)
         });
     }

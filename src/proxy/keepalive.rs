@@ -439,15 +439,16 @@ impl KeepaliveSink {
 /// 特判——各客户端的具体写法放在用户文档里；等待秒数一并打出，便于用户对照
 /// 自己客户端的超时取值。
 pub(super) fn log_client_gone_after(during: &str, heartbeat_only_wait: Option<Duration>) {
-    tracing::info!(during, "客户端已断开，中止上游请求（保活通道）");
+    tracing::info!(
+        during,
+        "Client disconnected; aborting upstream request on the keepalive channel"
+    );
     if let Some(waited) = heartbeat_only_wait
         && waited >= HEARTBEAT_ONLY_HINT_MIN
     {
         tracing::warn!(
             waited_secs = waited.as_secs(),
-            "客户端在只收到心跳的等待中断开（已等约 {} 秒）。若不是主动取消，多半是客户端的流空闲超时到点：\
-             不少客户端按 SSE 事件计时，aProxy 的注释心跳不算事件、重置不了它，超过该超时的重试期或长生成\
-             都会被客户端断开重发。请调大或关闭客户端的流空闲超时，常见客户端的写法见 README「接入 agent 客户端」",
+            "Client disconnected after receiving only heartbeats for about {} seconds. If this was not a cancellation, the client's stream idle timeout may have expired. Many clients count SSE events, not comment heartbeats, and may resend a request during a long generation or retry. Increase or disable the client's stream idle timeout; see the README for client configuration.",
             waited.as_secs()
         );
     }
@@ -537,7 +538,9 @@ pub(super) async fn drive<F: std::future::Future>(
     during: &str,
 ) -> Option<F::Output> {
     if sink.take_skeleton_due() {
-        tracing::info!("上一次尝试暂停期间已到保活间隔，补提交骨架头（保活通道）");
+        tracing::info!(
+            "Keepalive interval elapsed while the previous attempt was paused; committing provisional headers"
+        );
         let deadline = tokio::time::Instant::now() + ticker.period();
         ticker.reset_at(deadline);
         if !sink.commit_skeleton(deadline) {
@@ -557,7 +560,7 @@ pub(super) async fn drive<F: std::future::Future>(
                 sink.log_client_gone(during);
                 return None;
             }
-            head = async { head_rx.as_mut().expect("前置条件保证 Some").await }, if head_rx.is_some() => {
+            head = async { head_rx.as_mut().expect("the precondition guarantees a value").await }, if head_rx.is_some() => {
                 // 每次尝试只通知一次（Err = forward_once 没拿到响应头就结束了）
                 head_rx = None;
                 if let Ok((status, headers)) = head
@@ -565,13 +568,13 @@ pub(super) async fn drive<F: std::future::Future>(
                 {
                     if status.is_success() && !is_event_stream(&headers) {
                         skeleton_paused = true;
-                        tracing::info!(status = %status, "上游回了 2xx 非 SSE 响应头：本次尝试期间暂停提交骨架头（保活通道）");
+                        tracing::info!(status = %status, "Upstream sent 2xx non-SSE headers; pausing provisional response headers for this attempt");
                     } else if real_head_allowed && head_is_committable(status, &headers) {
                         if !sink.commit(status, headers) {
                             sink.log_client_gone(during);
                             return None;
                         }
-                        tracing::info!(status = %status, "上游 SSE 响应头已到，先行提交给客户端（保活通道）");
+                        tracing::info!(status = %status, "Upstream SSE headers arrived; committing them to the client");
                     }
                 }
             }
@@ -585,7 +588,7 @@ pub(super) async fn drive<F: std::future::Future>(
                     sink.mark_skeleton_due();
                     true
                 } else {
-                    tracing::info!("一个保活间隔内上游未给出可提交的结果，先提交骨架头（保活通道）");
+                    tracing::info!("No committable upstream response within the keepalive interval; committing provisional headers");
                     sink.commit_skeleton(deadline)
                 };
                 if !alive {

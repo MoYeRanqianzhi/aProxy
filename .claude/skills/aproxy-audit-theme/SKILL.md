@@ -161,3 +161,9 @@ Write in the user's language, the verdict and severity words included.
 
 Keep findings concrete: quote the rule, name the host, show the bytes. The user needs the evidence,
 not adjectives.
+
+## When this skill misses something
+
+If you find a danger sign this skill does not cover, say so in the report. If the user wants to
+send it to the aProxy project, the aproxy-contribute-security skill describes how: check that it is
+new, add it without weakening anything, and disclose how it was found.

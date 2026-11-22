@@ -44,3 +44,4 @@
 - [Windows login restore carrier](memory/desktop-login-carrier.md) -- Why the per-home Run command uses the headless system console host and how to remeasure it.
 - [CLI language and stored evidence](memory/cli-language-evidence.md) -- When a later reader can localize a recorded failure, and when the original evidence must survive.
 - [Desktop extension trust](memory/desktop-extension-trust.md) -- 扩展包与主题包不做沙箱与授权，只在安装前逐条弹窗讲清风险（用户 2026-11-23 裁定）。
+- [Security contributions](memory/security-contributions.md) -- 给审查 skill 补危险信号：只增不减、先查重，PR 披露发现来源与 AI 参与程度（用户 2026-11-23）。

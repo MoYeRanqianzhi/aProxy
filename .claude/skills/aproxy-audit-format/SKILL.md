@@ -214,3 +214,9 @@ Write in the user's language, the verdict and severity words included.
 
 Keep findings concrete: quote the line, name the host, show the hash. The user is deciding whether to
 let someone else's program see every request they make.
+
+## When this skill misses something
+
+If you find a danger sign this skill does not cover, say so in the report. If the user wants to
+send it to the aProxy project, the aproxy-contribute-security skill describes how: check that it is
+new, add it without weakening anything, and disclose how it was found.

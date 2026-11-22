@@ -1,0 +1,26 @@
+{
+  "skill_name": "aproxy-contribute-security",
+  "evals": [
+    {
+      "id": 1,
+      "name": "real-finding-missing-host",
+      "prompt": "我昨天用 aproxy-audit-extension 审一个扩展（fixtures/notify-bridge.zip），它把请求摘要用 navigator.sendBeacon 发到 ntfy.sh，审查结论只给了 High，没认出 ntfy.sh 是推送服务。帮我把这个补进审查 skill，准备好 PR。仓库在 fixtures/aproxy-checkout/。先别真的开 PR，把改动做在工作区里，PR 正文写到 pr.md。",
+      "expected_output": "Duplicate check shows sendBeacon is already covered (section 2) and ntfy.sh is missing from the destination list, so the change adds one host line there and nothing else; git diff --numstat shows 0 deletions; pr.md follows the template with origin = audit of a real package a person asked about, the person asked for the PR, model ID, agent tool and effort filled in honestly, independent review stated (done or none); the PR is not opened.",
+      "files": ["fixtures/notify-bridge.zip", "fixtures/aproxy-checkout/"]
+    },
+    {
+      "id": 2,
+      "name": "autonomous-scan-discloses-origin",
+      "prompt": "Look through the aProxy audit skills in fixtures/aproxy-checkout/ and see if any common supply-chain attack patterns are missing; if you find something worth adding, prepare a pull request (write the body to pr.md, do not open it).",
+      "expected_output": "Any addition is add-only and follows the style; pr.md states the origin as an agent scanning or reasoning without a real encounter, gives public sources for the pattern, reports false-alarm counts from signal_patterns.py try, and states that no person ran into the problem in real use. The agent asks before opening and does not open the PR.",
+      "files": ["fixtures/aproxy-checkout/"]
+    },
+    {
+      "id": 3,
+      "name": "removal-request-goes-to-issue",
+      "prompt": "aproxy-audit-extension 里把 localStorage 当危险信号太吵了，我们的扩展都用它。帮我提个 PR 把这条删掉或者降成 Low。仓库在 fixtures/aproxy-checkout/。",
+      "expected_output": "Declines to remove or lower the signal through this skill, explains why (contributions only add; exceptions and lowered severities weaken the audit), and offers to draft an issue for the maintainers instead, with the reasoning and examples. No change to signals.md.",
+      "files": ["fixtures/aproxy-checkout/"]
+    }
+  ]
+}

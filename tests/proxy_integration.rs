@@ -4707,7 +4707,7 @@ fn cli_config_flag_rejects_missing_file_on_start() {
     let missing = home.path().join("nope.toml");
     let out = home
         .cmd()
-        .arg("start")
+        .args(["start", "--json"])
         .arg("--config")
         .arg(&missing)
         .output()
@@ -4716,10 +4716,11 @@ fn cli_config_flag_rejects_missing_file_on_start() {
         !out.status.success(),
         "显式指定的配置文件不存在时启动必须失败（而非静默回退默认配置）"
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("Configuration file not found:"),
-        "stderr 应提示文件不存在，实际: {stderr}"
+    let result = common::output_document(&out);
+    assert_eq!(result["error"]["code"], "target_not_found");
+    assert_eq!(
+        std::path::Path::new(result["error"]["details"]["target"].as_str().unwrap()),
+        missing
     );
 }
 
@@ -4985,7 +4986,10 @@ fn stop_from_another_home_does_not_reach_this_instance() {
         format!("base_url = \"https://home-b.example.com\"\nlisten_addr = \"127.0.0.1:{port}\"\n"),
     )
     .unwrap();
-    let start_b = run_in(&home_b, &["start", "--config", cfg_b.to_str().unwrap()]);
+    let start_b = run_in(
+        &home_b,
+        &["start", "--json", "--config", cfg_b.to_str().unwrap()],
+    );
     assert_eq!(
         start_b.status.code(),
         Some(1),
@@ -4993,11 +4997,8 @@ fn stop_from_another_home_does_not_reach_this_instance() {
         String::from_utf8_lossy(&start_b.stdout),
         String::from_utf8_lossy(&start_b.stderr)
     );
-    assert!(
-        String::from_utf8_lossy(&start_b.stderr).contains("Another program is using"),
-        "{}",
-        String::from_utf8_lossy(&start_b.stderr)
-    );
+    let failure = common::output_document(&start_b);
+    assert_eq!(failure["error"]["code"], "port_in_use");
 
     let stop_a = run_in(&home_a, &["stop", &port_s]);
     assert!(
@@ -5090,6 +5091,7 @@ fn cli_config_show_rejects_missing_explicit_file() {
             .arg("--config")
             .arg(&missing)
             .args(args)
+            .arg("--json")
             .output()
             .unwrap();
         assert_eq!(
@@ -5097,10 +5099,11 @@ fn cli_config_show_rejects_missing_explicit_file() {
             Some(4),
             "{args:?} 对不存在的显式 --config 必须报错（而非静默展示默认值）"
         );
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("nope.toml"),
-            "stderr 应提示文件不存在，实际: {stderr}"
+        let failure = common::output_document(&out);
+        assert_eq!(failure["error"]["code"], "target_not_found");
+        assert_eq!(
+            std::path::Path::new(failure["error"]["details"]["target"].as_str().unwrap()),
+            missing
         );
     }
 }
@@ -5246,10 +5249,10 @@ fn daemon_lifecycle_start_status_stop() {
     );
 
     // stop 指定端口：经 IPC 优雅停止并确认退出
-    let out = run(&["stop", &port.to_string()]);
+    let out = run(&["stop", &port.to_string(), "--json"]);
     assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Stopped pid"), "实际: {stdout}");
+    let result = common::output_document(&out);
+    assert_eq!(result["results"][0]["outcome"], "stopped");
 
     // status 不再列出本实例
     let out = run(&["status"]);
@@ -5342,6 +5345,7 @@ fn start_parent_command_output_returns() {
     let out = home
         .cmd()
         .arg("start")
+        .arg("--json")
         .arg("--config")
         .arg(&cfg_file)
         .output()
@@ -5351,11 +5355,9 @@ fn start_parent_command_output_returns() {
         "start 应成功，stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("started in the background"),
-        "start 父进程应报告后台启动，实际: {stdout}"
-    );
+    let result = common::output_document(&out);
+    assert_eq!(result["outcome"], "started");
+    assert_eq!(result["port"], port);
 }
 
 // ---------------------------------------------------------------------------
@@ -5610,38 +5612,31 @@ fn restore_recovers_crashed_daemon_and_is_idempotent() {
     assert!(restore_path.exists(), "崩溃后恢复记录应保留");
 
     // restore：一键拉起崩溃实例
-    let out = home.cmd().arg("restore").output().unwrap();
+    let out = home.cmd().args(["restore", "--json"]).output().unwrap();
     assert!(out.status.success(), "restore 应成功");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("Restored pid") && stdout.contains(&port_str),
-        "restore 应恢复实例: {stdout}"
-    );
+    let result = common::output_document(&out);
+    assert_eq!(result["results"][0]["outcome"], "restored");
+    assert_eq!(result["results"][0]["port"], port);
     // 就绪等待必须按隔离 home 的 run 目录寻址（unix 的 UDS 在其中），见
     // wait_daemon_ready_in 的说明
     assert!(wait_daemon_ready_in(&run_dir, port), "恢复后的实例应就绪");
 
     // 幂等：再次 restore 时已在运行 → 跳过而非报错/重复启动（隔离目录内
     // 只有本测试实例，断言确定性成立）
-    let out = home.cmd().arg("restore").output().unwrap();
+    let out = home.cmd().args(["restore", "--json"]).output().unwrap();
     assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains(&format!("Port {port} is already running. Skipping.")),
-        "幂等跳过本端口: {stdout}"
-    );
+    let result = common::output_document(&out);
+    assert_eq!(result["results"][0]["outcome"], "already_running");
+    assert_eq!(result["results"][0]["port"], port);
 
     // 优雅停止：恢复记录被删除，此后 restore 不再恢复本端口
     let out = home.cmd().args(["stop", &port_str]).output().unwrap();
     assert!(out.status.success(), "stop 恢复实例应成功");
     assert!(!restore_path.exists(), "优雅停止后恢复记录应被删除");
-    let out = home.cmd().arg("restore").output().unwrap();
+    let out = home.cmd().args(["restore", "--json"]).output().unwrap();
     assert!(out.status.success(), "restore 应静默成功（空目录）");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        !stdout.contains("Restored pid") || !stdout.contains(&port_str),
-        "本端口已无记录，不应再被恢复: {stdout}"
-    );
+    let result = common::output_document(&out);
+    assert_eq!(result["results"], serde_json::json!([]));
 }
 
 /// 端口 0（系统分配端口）的恢复记录必须按**实际端口**命名（与 .pid 同键）。
@@ -5786,17 +5781,18 @@ fn alias_start_and_stop_roundtrip() {
     );
 
     // start <别名>：后台启动别名指向的配置
-    let out = home.cmd().args(["start", &alias]).output().unwrap();
+    let out = home
+        .cmd()
+        .args(["start", &alias, "--json"])
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "start 别名应成功: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("started in the background"),
-        "实际: {stdout}"
-    );
+    let result = common::output_document(&out);
+    assert_eq!(result["outcome"], "started");
     // 就绪：隔离 home 的 IPC 寻址（unix UDS 在 home/run/ 下）
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -5823,28 +5819,32 @@ fn alias_start_and_stop_roundtrip() {
     );
 
     // stop <别名>：按 config_path 匹配并停止
-    let out = home.cmd().args(["stop", &alias]).output().unwrap();
+    let out = home
+        .cmd()
+        .args(["stop", &alias, "--json"])
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "stop 别名应成功: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Stopped pid"), "实际: {stdout}");
+    let result = common::output_document(&out);
+    assert_eq!(result["results"][0]["outcome"], "stopped");
 
     // 已停止后再 stop 别名：说明「未在运行」，stop 要的状态已经达成，以 0 退出
-    let out = home.cmd().args(["stop", &alias]).output().unwrap();
+    let out = home
+        .cmd()
+        .args(["stop", &alias, "--json"])
+        .output()
+        .unwrap();
     assert_eq!(
         out.status.code(),
         Some(0),
         "别名配置未运行时 stop 是 already_stopped"
     );
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(text.contains("is not running"), "实际: {text}");
+    let result = common::output_document(&out);
+    assert_eq!(result["results"][0]["outcome"], "already_stopped");
 
     // 清理别名（无论如何执行，不留测试残留——隔离 home 内本就随 tempdir 删除）
     let _ = home.cmd().args(["alias", "remove", &alias]).output();
@@ -5860,27 +5860,26 @@ fn alias_errors_on_unknown_names() {
     let home = TestHome::new();
 
     // start 未知别名：报错并列出管理方式
-    let out = home.cmd().args(["start", &unknown]).output().unwrap();
+    let out = home
+        .cmd()
+        .args(["start", &unknown, "--json"])
+        .output()
+        .unwrap();
     assert!(!out.status.success(), "start 未知别名应失败");
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        text.contains("Unknown alias or configuration file"),
-        "实际: {text}"
-    );
+    let result = common::output_document(&out);
+    assert_eq!(result["error"]["code"], "target_not_found");
+    assert_eq!(result["error"]["details"]["target"], unknown);
 
     // stop 未知别名：报错
-    let out = home.cmd().args(["stop", &unknown]).output().unwrap();
+    let out = home
+        .cmd()
+        .args(["stop", &unknown, "--json"])
+        .output()
+        .unwrap();
     assert!(!out.status.success(), "stop 未知别名应失败");
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(text.contains("Unknown alias or port"), "实际: {text}");
+    let result = common::output_document(&out);
+    assert_eq!(result["error"]["code"], "target_not_found");
+    assert_eq!(result["error"]["details"]["target"], unknown);
 
     // add 保留字：all / 纯数字被拒绝
     for bad in ["all", "12345"] {

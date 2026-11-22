@@ -1005,15 +1005,13 @@ fn concurrent_install_rejected_by_lock() {
 
     let from = env.source_file("lock");
     let out = env
-        .install_cmd(&["--from", &from.display().to_string()])
+        .install_cmd(&["--json", "--from", &from.display().to_string()])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1), "并发安装应被锁拒绝");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("Installation is already in progress"),
-        "{stderr}"
-    );
+    let stdout = std::str::from_utf8(&out.stdout).unwrap();
+    let result: serde_json::Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+    assert_eq!(result["error"]["code"], "install_in_progress");
 }
 
 // ---------------------------------------------------------------------------

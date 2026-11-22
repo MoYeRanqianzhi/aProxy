@@ -7184,7 +7184,9 @@ fn rehearsal_worker_failure_ends_with_distinct_unsimulated_status() {
         assert_eq!(out.status.code(), Some(2), "{out:?}");
         let err = String::from_utf8(out.stderr).unwrap();
         assert!(
-            err.contains("未模拟：") && err.contains("；真实实例会") && err.contains("request")
+            err.contains("Not simulated:")
+                && err.contains("a live instance would")
+                && err.contains("request")
         );
         assert!(
             !String::from_utf8(out.stdout)

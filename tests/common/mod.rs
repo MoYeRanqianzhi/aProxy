@@ -19,6 +19,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, PoisonError};
 
+/// 结构化命令的 stdout 只能有一个完整文档，不能混入给终端的说明。
+pub fn output_document(out: &std::process::Output) -> serde_json::Value {
+    serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("invalid command document: {e}; {out:?}"))
+}
+
 /// 另一个线程 fork 的子进程在 exec 之前可能短暂持有刚复制的镜像的写句柄。
 /// 只重试内核报的执行冲突；路径、权限和格式错误不等待，不重跑已执行的命令。
 pub fn retry_exec<T>(mut exec: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {

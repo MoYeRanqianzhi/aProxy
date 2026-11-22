@@ -1050,9 +1050,15 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, "install_download_failed");
-        assert!(
-            err.message.contains("All download sources failed") && err.message.contains("[url]"),
-            "{err}"
+        let super::super::reason::Cause::Sources { failures, .. } = err.into_cause() else {
+            panic!("expected source failures")
+        };
+        assert_eq!(
+            failures
+                .iter()
+                .map(|(source, _)| source.as_str())
+                .collect::<Vec<_>>(),
+            ["url", "url"]
         );
     }
 }

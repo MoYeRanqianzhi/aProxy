@@ -156,15 +156,13 @@ fn restart_not_running_port_fails() {
 
     let out = home
         .cmd()
-        .args(["restart", &port.to_string()])
+        .args(["restart", &port.to_string(), "--json"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(4), "未启动的 target 应退出 4");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains(&format!("No running aProxy instance on port {port}")),
-        "应提示未在运行，实际: {stderr}"
-    );
+    let failure = common::output_document(&out);
+    assert_eq!(failure["error"]["code"], "target_not_running");
+    assert_eq!(failure["error"]["details"]["target"], port.to_string());
 }
 
 // ---------------------------------------------------------------------------
@@ -587,10 +585,10 @@ fn release_asset_named_instance_is_adopted_respawned_and_force_stoppable() {
     );
 
     // --force 对资产名运行的实例可用（不再因镜像名拒绝）
-    let out = run_cli(&test_home, &bin, &["stop", &port_s, "--force"]);
+    let out = run_cli(&test_home, &bin, &["stop", &port_s, "--force", "--json"]);
     let stdout = text(&out.stdout);
     assert!(
-        out.status.success() && stdout.contains("Terminated pid"),
+        out.status.success() && common::output_document(&out)["results"][0]["outcome"] == "killed",
         "stop --force 应成功: {stdout}{}",
         text(&out.stderr)
     );
@@ -790,9 +788,9 @@ fn restore_onto_changed_port_retires_old_record() {
     // 修复前：stop 新端口后，下一次 restore 会凭旧端口记录把它复活
     let out = run_cli(&test_home, &exe, &["stop", &port_b.to_string()]);
     assert!(out.status.success(), "stop 新端口应成功");
-    let out = run_cli(&test_home, &exe, &["restore"]);
+    let out = run_cli(&test_home, &exe, &["restore", "--json"]);
     assert!(
-        text(&out.stdout).contains("No instances to restore"),
+        out.status.success() && common::output_document(&out)["results"] == serde_json::json!([]),
         "stop 后不应再有可恢复的实例: {}",
         text(&out.stdout)
     );
@@ -844,7 +842,12 @@ fn concurrent_start_with_release_asset_name_converges_to_one_watchdog() {
             let mut cmd = cli(
                 &test_home,
                 &bin,
-                &["start", "--config", cfg.display().to_string().as_str()],
+                &[
+                    "start",
+                    "--json",
+                    "--config",
+                    cfg.display().to_string().as_str(),
+                ],
             );
             cmd.env("APROXY_WATCHDOG_SCAN_SECS", "1")
                 .env("RUST_LOG", "info");
@@ -859,7 +862,7 @@ fn concurrent_start_with_release_asset_name_converges_to_one_watchdog() {
         let stdout = text(&out.stdout);
         let stderr = text(&out.stderr);
         assert!(
-            out.status.success() && stdout.contains("started in the background"),
+            out.status.success() && common::output_document(&out)["outcome"] == "started",
             "start 应成功: {stdout}{stderr}"
         );
         for line in stderr
@@ -1184,9 +1187,10 @@ fn restore_keeps_the_record_while_the_config_is_missing() {
     assert!(ipc_ping_in_dir(&rt, port, home).is_err());
 
     std::fs::rename(&parked, &cfg).unwrap();
-    let out = run_cli(&test_home, &exe, &["restore"]);
+    let out = run_cli(&test_home, &exe, &["restore", "--json"]);
     assert!(
-        text(&out.stdout).contains("Restored pid"),
+        out.status.success()
+            && common::output_document(&out)["results"][0]["outcome"] == "restored",
         "文件回来之后应能恢复: {}{}",
         text(&out.stdout),
         text(&out.stderr)
@@ -1238,9 +1242,10 @@ fn instance_without_a_config_file_restarts_and_restores() {
     assert!(wait_for(Duration::from_secs(5), || {
         ipc_ping_in_dir(&rt, port, home).is_err()
     }));
-    let out = run_cli(&test_home, &exe, &["restore"]);
+    let out = run_cli(&test_home, &exe, &["restore", "--json"]);
     assert!(
-        text(&out.stdout).contains("Restored pid"),
+        out.status.success()
+            && common::output_document(&out)["results"][0]["outcome"] == "restored",
         "restore: {}{}",
         text(&out.stdout),
         text(&out.stderr)
@@ -1284,9 +1289,10 @@ fn stop_of_a_crashed_instance_deletes_its_record() {
             text(&out.stdout)
         );
         assert!(!has_restore(home, port), "stop {target} 应删掉记录");
-        let out = run_cli(&test_home, &exe, &["restore"]);
+        let out = run_cli(&test_home, &exe, &["restore", "--json"]);
         assert!(
-            text(&out.stdout).contains("No instances to restore"),
+            out.status.success()
+                && common::output_document(&out)["results"] == serde_json::json!([]),
             "stop {target} 之后 restore 不该再拉它: {}",
             text(&out.stdout)
         );
@@ -1650,10 +1656,10 @@ fn stop_idle_only_stops_instances_that_are_idle_long_enough() {
     let out = run_cli(
         &test_home,
         &exe,
-        &["stop", "idle", "--idle-threshold-secs", "0"],
+        &["stop", "idle", "--idle-threshold-secs", "0", "--json"],
     );
     assert!(
-        out.status.success() && text(&out.stdout).contains("Stopped pid"),
+        out.status.success() && common::output_document(&out)["results"][0]["outcome"] == "stopped",
         "{}{}",
         text(&out.stdout),
         text(&out.stderr)

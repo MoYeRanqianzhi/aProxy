@@ -292,7 +292,7 @@ async fn binary_and_standalone_install_share_the_download_lock() {
         Duration::from_secs(120),
         tokio::process::Command::from(h.cmd())
             .kill_on_drop(true)
-            .args(["skill", "upgrade"])
+            .args(["skill", "upgrade", "--json"])
             .output(),
     )
     .await
@@ -306,7 +306,10 @@ async fn binary_and_standalone_install_share_the_download_lock() {
         String::from_utf8_lossy(&first.stderr)
     );
     assert_eq!(contender.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&contender.stderr).contains("Another process"));
+    assert_eq!(
+        common::output_document(&contender)["error"]["code"],
+        "install_failed"
+    );
     assert_eq!(count.load(Ordering::SeqCst), 1);
     assert_eq!(
         run(&h, &["skill", "show", "a"], 0).stdout,

@@ -1,67 +1,87 @@
 <!--
-  日志详情抽屉：从右侧弹出，覆盖在列表上（不挤压列表，行的位置不变）。
-  分页签：概览（重试时间线）、请求（头与 JSON 体）、响应（可在多次尝试间切换、并排对比；SSE 逐条列出）、
-  转换（format 改写前后）、原始。密钥一律是打码后的样子。
+  请求详情抽屉：从右侧弹出，覆盖在列表上（不挤压列表，行的位置不变）。
+  分页签：概览（每一次尝试的时间线与这条请求的事实）、请求（客户端发来的头与体）、
+  响应（每一次尝试发出去的与收到的，可以并排对比）、format（format 程序报告自己做了什么）。
+
+  打开时向 Rust 要一次详情（request_detail），这是一次「选择」；在途的请求变了（列表里那一行的 revision 或结局变了）
+  就重新选一次，拿到新的之前旧的先留着。体按块另取（BodyView），关掉抽屉时取消这次选择，Rust 就不再交数据。
+  密钥一律是打码后的样子：头里的密钥只给一个标记，体里的密钥已被等长的 * 盖住。
 -->
 <script lang="ts">
-  import { t, stamp, durShort, durLong, bytes, ago } from '../lib/i18n';
+  import { untrack } from 'svelte';
+  import { t, stamp, durShort, durLong, bytes } from '../lib/i18n';
   import { ui } from '../lib/state.svelte';
-  import { store } from '../lib/legacy.svelte';
+  import { store } from '../lib/store.svelte';
   import { overlays, copyText } from '../lib/overlays.svelte';
-  import type { Attempt, LogEntry, RequestDetail } from '../lib/types';
+  import type { Action, Detail, Header, Ref, Report, Row, Selection, Try, TryDetail } from '../lib/backend/contract';
+  import { toFailure, type Failure } from '../lib/backend/link';
+  import { codeText, faultText } from '../lib/faults';
+  import { aliasOf, durationOf, rescued } from '../lib/view';
   import { drawer, fadeOut, pop } from '../lib/motion';
   import Icon from '../components/Icon.svelte';
-  import ResultChip from '../components/LegacyResultChip.svelte';
-  import JsonView from '../components/JsonView.svelte';
+  import ResultChip from '../components/ResultChip.svelte';
+  import BodyView from '../components/BodyView.svelte';
 
   let {
-    entry,
+    target,
+    row,
     onclose,
     onstep,
-  }: { entry: LogEntry; onclose: () => void; onstep: (dir: 1 | -1) => void } = $props();
+  }: { target: Ref; row: Row | null; onclose: () => void; onstep: (dir: 1 | -1) => void } = $props();
 
-  type Tab = 'overview' | 'request' | 'response' | 'transform' | 'raw';
-  const tabs: Tab[] = ['overview', 'request', 'response', 'transform', 'raw'];
+  type Tab = 'overview' | 'request' | 'response' | 'format';
+  const tabs: Tab[] = ['overview', 'request', 'response', 'format'];
 
   let tab = $state<Tab>('overview');
-  // 默认看最后一次尝试（成功的那次或最近的失败）；打开详情后固定，不随新尝试跳走。
-  // 父组件按条目 key 重建本组件，所以只需在创建时取一次
-  const lastIndex = () => Math.max(0, entry.attempts.length - 1);
-  let attemptIdx = $state(lastIndex());
   let compare = $state(false);
-  let compareIdx = $state(0);
-  let openEvent = $state<number | null>(null);
+  /** 看的是第几次尝试（尝试的编号，不是下标）；null 是最后一次 */
+  let attemptNo = $state<number | null>(null);
+  let compareNo = $state<number | null>(null);
   let copyOpen = $state(false);
   let copyWrap: HTMLDivElement | undefined = $state();
   let tabEls: HTMLButtonElement[] = $state([]);
   let indicator = $state({ left: 0, width: 0 });
 
-  const inst = $derived(store.instance(entry.port));
-  const keys = $derived(inst?.transform?.keys ?? 1);
+  let detail = $state.raw<Detail | null>(null);
+  let selection = $state.raw<Selection | null>(null);
+  let failure = $state.raw<Failure | null>(null);
 
-  // 请求与响应的正文按需取（可能很大，也是最敏感的内容）：打开时取一次；在途的请求每多一次尝试、
-  // 或者结束时再取一次。新的到手之前旧的先留着，免得每拍都闪一下空白
-  let detail = $state<RequestDetail | null>(null);
-  let detailFailed = $state(false);
+  // 在途请求的进展从列表那一行看出来：revision 或结局变了就重新选一次。
+  // 父组件按 Ref 重建本组件，所以换了请求不会走到这里
+  const changeMark = $derived(row ? `${row.revision}/${row.outcome}` : '');
   $effect(() => {
-    const key = entry.key;
-    void entry.attempts.length;
-    void entry.outcome;
-    let alive = true;
-    store.requestDetail(key).then(
-      (d) => {
-        if (!alive) return;
-        detail = d;
-        detailFailed = false;
-      },
-      () => {
-        if (alive) detailFailed = true;
-      },
+    void changeMark;
+    void store.epoch;
+    let live = true;
+    untrack(() =>
+      store.openDetail(target).then(
+        (r) => {
+          if (!live) {
+            void store.cancelDetail(r.selection).catch(() => {});
+            return;
+          }
+          detail = r.detail;
+          selection = r.selection;
+          failure = null;
+        },
+        (raw) => {
+          if (live) failure = toFailure(raw);
+        },
+      ),
     );
-    return () => {
-      alive = false;
-    };
+    return () => (live = false);
   });
+
+  // 关掉抽屉（组件销毁）时取消最后那次选择：还在读的块就此作废
+  $effect(() => () => {
+    const sel = untrack(() => selection);
+    if (sel) void store.cancelDetail(sel).catch(() => {});
+  });
+
+  /** 头部与概览用的记录：详情到了用详情里的（它和体是同一刻读的），之前先用列表那一行 */
+  const record = $derived(detail?.record ?? row);
+  const card = $derived(store.card(target.run.port));
+  const pinned = $derived(store.pinned(target));
 
   $effect(() => {
     const el = tabEls[tabs.indexOf(tab)];
@@ -69,52 +89,72 @@
     if (el) indicator = { left: el.offsetLeft, width: el.offsetWidth };
   });
 
-  // 实例卡住时只剩最后一份快照，倒计时停在快照那一刻（与实例详情页同一口径）
-  const clock = $derived(inst?.status === 'unresponsive' && inst.silentSince !== null ? inst.silentSince : store.now);
+  /** 有记录的尝试，按编号升序。tries 可能省略了中间几次（triesOmitted） */
+  const tries = $derived(record ? [...record.tries].sort((a, b) => a.attempt - b.attempt) : []);
+  const lastNo = $derived(tries.length ? tries[tries.length - 1].attempt : null);
+  const shownNo = $derived(attemptNo ?? lastNo);
+  const otherNo = $derived(compareNo ?? (tries.find((x) => x.attempt !== shownNo)?.attempt ?? null));
+  const anyReports = $derived(!!record && (record.reports.length > 0 || record.tries.some((x) => x.reports.length > 0)));
 
-  function countdown(): number {
-    return Math.max(0, Math.ceil(((entry.phaseEndsAt ?? clock) - clock) / 1000));
+  function tryDetail(n: number | null): TryDetail | undefined {
+    return n === null ? undefined : detail?.tries.find((x) => x.attempt === n);
   }
 
-  function hearts(a: Attempt): number {
-    if (!entry.stream || !inst || inst.forwardOnly || inst.keepalive.interval === 0) return 0;
-    return Math.floor(a.backoffMs / (inst.keepalive.interval * 1000));
+  function countdown(r: Row): number {
+    return Math.max(0, Math.ceil(((r.nextAttemptAt ?? store.now) - store.now) / 1000));
   }
 
-  function failNote(): string | null {
-    if (entry.outcome !== 'failed') return null;
-    const r = entry.attempts[entry.attempts.length - 1]?.reason;
-    if (r === 'notFound') return t('d.passthrough');
-    if (r === 'forwardedError') return t('d.forwarded');
-    if (r === 'clientGone') return t('d.clientGone');
-    if (r === 'stopped') return t('reason.stopped');
+  /** 失败的结局说明一下发生了什么；成功与在途的另有说法 */
+  function failNote(r: Row): string | null {
+    switch (r.outcome) {
+      case 'client-gone':
+        return t('d.clientGone');
+      case 'format-response':
+        return t('d.formatResponse');
+      case 'upstream-error':
+        return r.delivery === 'forward' ? t('d.forwarded') : r.code ? codeText(r.code) : t('d.upstreamError');
+      case 'aproxy-error':
+        return r.code ? codeText(r.code) : t('code.internal');
+      case 'unknown':
+        return t('d.unknownOutcome');
+    }
     return null;
   }
 
-  function peek(i: number) {
-    attemptIdx = i;
+  /** 救回的请求比第一次就成功多等了多久：最后一次尝试开始时，离收到请求过去了多久 */
+  function waitedExtra(r: Row): number {
+    const last = r.tries.find((x) => x.attempt === r.attempts);
+    return last ? Math.max(0, last.startedAt - r.startedAt) : 0;
+  }
+
+  function peek(n: number) {
+    attemptNo = n;
     compare = false;
     tab = 'response';
   }
 
   async function pin() {
-    const next = !entry.pinned;
-    await store.setPinned(entry, next);
-    overlays.toast(t(next ? 'toast.pinned' : 'toast.unpinned'), next ? 'lilac' : 'mint');
+    const next = !pinned;
+    try {
+      await store.setPinned(target, next);
+      overlays.toast(t(next ? 'toast.pinned' : 'toast.unpinned'), next ? 'lilac' : 'mint');
+    } catch (raw) {
+      overlays.toast(faultText(toFailure(raw)), 'coral');
+    }
   }
 
-  async function copyCurl() {
+  async function copyPath() {
     copyOpen = false;
-    if (!detail) return;
-    await copyText(detail.request.curl);
-    overlays.toast(t('toast.copiedCurl'));
+    if (!record) return;
+    await copyText(record.path);
+    overlays.toast(t('toast.copied'));
   }
 
-  async function copyBody() {
+  async function copyId() {
     copyOpen = false;
-    if (!detail) return;
-    await copyText(JSON.stringify(detail.request.body, null, 2));
-    overlays.toast(t('toast.copiedBody'));
+    if (!record) return;
+    await copyText(`${record.ref.run.port}#${record.seq}`);
+    overlays.toast(t('toast.copied'));
   }
 
   function onWindowPointer(ev: PointerEvent) {
@@ -130,132 +170,146 @@
     tabEls[i]?.focus();
   }
 
-  const instName = $derived(inst?.alias ? `${entry.port} ${inst.alias}` : String(entry.port));
-  const waitedExtra = $derived(
-    entry.attempts.slice(0, -1).reduce((s, a) => s + a.durationMs + a.backoffMs, 0),
-  );
+  const instName = $derived(card && aliasOf(card) ? `${target.run.port} ${aliasOf(card)}` : String(target.run.port));
+
+  function headerValue(h: Header): { text: string; secret: boolean } {
+    return typeof h.value === 'string' ? { text: h.value, secret: false } : { text: t('d.hidden'), secret: true };
+  }
+
+  function actionText(a: Action): string {
+    if (a.label) return a.label;
+    switch (a.type) {
+      case 'protocol-convert':
+        return t('d.act.convert', { from: a.from, to: a.to });
+      case 'key-select':
+        return t('d.act.key', { key: a.keyId });
+      case 'route':
+        return a.modelFrom && a.modelTo ? t('d.act.routeModel', { channel: a.channel, from: a.modelFrom, to: a.modelTo }) : t('d.act.route', { channel: a.channel });
+      case 'header-edit':
+        return t(a.op === 'set' ? 'd.act.headerSet' : 'd.act.headerRemove', { name: a.name });
+      case 'body-edit':
+        return t(a.op === 'set' ? 'd.act.bodySet' : 'd.act.bodyRemove', { path: a.path });
+      default:
+        return t('d.act.other');
+    }
+  }
+
+  function tryLabel(x: Try): string {
+    return x.upstreamStatus !== null ? String(x.upstreamStatus) : 'ERR';
+  }
 </script>
 
-{#snippet attemptPicker(current: number, set: (i: number) => void, label: string)}
+{#snippet attemptPicker(current: number | null, set: (n: number) => void, label: string)}
   <div class="picker" role="radiogroup" aria-label={label}>
-    {#each entry.attempts as a, i (a.n)}
-      <button
-        class="pick"
-        class:on={i === current}
-        class:fail={!!a.reason}
-        role="radio"
-        aria-checked={i === current}
-        onclick={() => set(i)}
-      >
-        {t('d.attempt', { n: a.n })}<span class="pick-code">{a.status ?? 'ERR'}</span>
+    {#each tries as x (x.attempt)}
+      <button class="pick" class:on={x.attempt === current} class:fail={!!x.code} role="radio" aria-checked={x.attempt === current} onclick={() => set(x.attempt)}>
+        {t('d.attempt', { n: x.attempt })}<span class="pick-code">{x.durationMs === null ? '…' : tryLabel(x)}</span>
       </button>
     {/each}
   </div>
 {/snippet}
 
-{#snippet headerList(lines: { name: string; value: string; secret?: boolean }[])}
-  <dl class="headers">
-    {#each lines as h (h.name)}
-      <dt class="mono">{h.name}</dt>
-      <dd class="mono" class:secret={h.secret}>
-        {#if h.secret}<Icon name="lock" size={11} stroke={2.4} />{/if}{h.value}
-      </dd>
+{#snippet headerList(lines: Header[])}
+  {#if lines.length === 0}
+    <p class="note">{t('d.noHeaders')}</p>
+  {:else}
+    <dl class="headers">
+      {#each lines as h, i (i)}
+        {@const v = headerValue(h)}
+        <dt class="mono">{h.name}</dt>
+        <dd class="mono" class:secret={v.secret}>
+          {#if v.secret}<Icon name="lock" size={11} stroke={2.4} />{/if}{v.text}
+        </dd>
+      {/each}
+    </dl>
+  {/if}
+{/snippet}
+
+{#snippet loadingNote()}
+  <p class="note">{failure ? faultText(failure) : t('d.loading')}</p>
+{/snippet}
+
+{#snippet reportList(list: Report[])}
+  <ul class="changes">
+    {#each list as rep, i (i)}
+      <li>
+        <div class="ch-head">
+          <code class="mono field">{rep.format}</code>
+          <span class="chip lilac">{t(`d.stage.${rep.stage}`)}</span>
+        </div>
+        {#if rep.summary}<p class="ch-summary">{rep.summary}</p>{/if}
+        {#if rep.actions.length}
+          <div class="ch-body">
+            {#each rep.actions as a, j (j)}
+              <span class="chip">{actionText(a)}</span>
+            {/each}
+          </div>
+        {/if}
+      </li>
     {/each}
-  </dl>
+  </ul>
 {/snippet}
 
-{#snippet loading()}
-  <p class="note">{detailFailed ? t('d.loadFailed') : t('d.loading')}</p>
-{/snippet}
-
-{#snippet response(i: number)}
-  {@const a: Attempt | undefined = entry.attempts[i]}
-  {@const ad = detail?.attempts[i]}
-  {#if !a}
+{#snippet response(n: number | null)}
+  {@const x = tries.find((y) => y.attempt === n)}
+  {@const td = tryDetail(n)}
+  {#if !x}
     <p class="note">{t('d.pending')}</p>
-  {:else if !ad}
-    {@render loading()}
-  {:else if a.status === null}
-    <div class="noresp">
-      <Icon name="plug" size={18} />
-      <div>
-        <strong>{t('d.noResponse')}</strong>
-        <code class="mono">{ad.transportError}</code>
-      </div>
-    </div>
+  {:else if !detail || !selection}
+    {@render loadingNote()}
+  {:else if !td}
+    <p class="note">{t('d.tryOmitted')}</p>
   {:else}
     <div class="statusline">
-      <span class="code-chip" class:fail={!!a.reason}>{a.status}</span>
-      <span class="muted">{a.reason ? t(`reason.${a.reason}`) : t('d.success')}</span>
-      <span class="muted">{durShort(a.durationMs)}</span>
-      {#if a.respBytes}<span class="muted">{bytes(a.respBytes)}</span>{/if}
+      <span class="code-chip" class:fail={!!x.code}>{x.durationMs === null ? '…' : tryLabel(x)}</span>
+      <span class="muted">{x.code ? codeText(x.code, x.upstreamStatus) : x.durationMs === null ? t('d.trying', { n: x.attempt }) : t('d.success')}</span>
+      {#if x.durationMs !== null}<span class="muted">{durShort(x.durationMs)}</span>{/if}
+      {#if x.responseBytes}<span class="muted">{bytes(x.responseBytes)}</span>{/if}
     </div>
-    <h4>{t('d.respHeaders')}</h4>
-    {@render headerList(ad.headers)}
-    <h4>{t('d.body')}</h4>
-    {#if a.reason}
-      {@const b = ad.errorBody}
-      {#if typeof b === 'string'}
-        <pre class="pre mono">{b}</pre>
-      {:else}
-        <JsonView value={b} openDepth={3} />
-      {/if}
-    {:else if entry.outcome === 'streaming'}
-      <p class="note">{t('logs.status.streaming')}…</p>
-    {:else if ad.sse}
-      {@const events = ad.sse}
-      <div class="assembled">
-        <span class="label">{t('d.textPreview')}</span>
-        <p>
-          {events
-            .filter((ev) => ev.event.endsWith('delta'))
-            .map((ev) => {
-              const m = ev.data.match(/"(?:text|delta)":("(?:[^"\\]|\\.)*")/);
-              return m ? JSON.parse(m[1]) : '';
-            })
-            .join('')}
-        </p>
+    {#if td.error}
+      <div class="noresp">
+        <Icon name="plug" size={18} />
+        <div>
+          <strong>{codeText(td.error.code)}</strong>
+          {#if td.error.message}<code class="mono">{td.error.message}</code>{/if}
+        </div>
       </div>
-      <div class="events-head">
-        <span>{t('d.events')}</span><span class="chip">{t('d.eventsN', { n: events.length })}</span>
-      </div>
-      <ol class="events">
-        {#if entry.heartbeats > 0}
-          <li class="ev beat">
-            <span class="ev-name"><Icon name="heart" size={12} stroke={2.4} />{t('d.heartbeatRow', { n: entry.heartbeats })}</span>
-            <span class="ev-data">{t('d.heartbeatNote')}</span>
-          </li>
-        {/if}
-        {#each events as ev, i (i)}
-          <li class="ev" class:open={openEvent === i}>
-            <button class="ev-row" onclick={() => (openEvent = openEvent === i ? null : i)} aria-expanded={openEvent === i}>
-              <span class="ev-name">{ev.event}</span>
-              <span class="ev-data mono">{ev.data}</span>
-            </button>
-            {#if openEvent === i}
-              <div class="ev-json" in:pop={{ y: -4, scale: 0.99, duration: 360 }}>
-                <JsonView value={JSON.parse(ev.data)} openDepth={4} />
-              </div>
-            {/if}
-          </li>
-        {/each}
-      </ol>
-    {:else}
-      <JsonView value={ad.body} openDepth={3} />
+    {/if}
+    {#if td.response}
+      <h4>{t('d.respHeaders')}</h4>
+      {@render headerList(td.response.headers)}
+      <h4>{t('d.body')}</h4>
+      {#key `${selection.generation}/${x.attempt}`}
+        <BodyView {selection} {target} part={{ kind: 'response', attempt: x.attempt }} info={td.response.body} />
+      {/key}
+    {:else if !td.error}
+      <p class="note">{t('d.noResponse')}</p>
+    {/if}
+    {#if td.sent}
+      <details class="sent">
+        <summary>{t('d.sent')}<code class="mono">{td.sent.method} {td.sent.url}</code></summary>
+        {@render headerList(td.sent.headers)}
+        <h4>{t('d.body')}</h4>
+        {#key `${selection.generation}/${x.attempt}`}
+          <BodyView {selection} {target} part={{ kind: 'sent', attempt: x.attempt }} info={td.sent.body} />
+        {/key}
+      </details>
     {/if}
   {/if}
 {/snippet}
 
 <svelte:window onpointerdown={onWindowPointer} />
 
-<aside class="drawer" aria-label={`#${entry.seq} ${entry.path}`} in:drawer out:fadeOut={{ duration: 140 }}>
+<aside class="drawer" aria-label={record ? `#${record.seq} ${record.path}` : t('d.loading')} in:drawer out:fadeOut={{ duration: 140 }}>
   <header class="d-head">
     <div class="d-title">
-      <span class="method">{entry.method}</span>
-      <code class="mono path" title={entry.path}>{entry.path}</code>
+      {#if record}
+        <span class="method">{record.method}</span>
+        <code class="mono path" title={record.path}>{record.path}</code>
+      {/if}
     </div>
     <div class="d-tools">
-      <button class="icon-btn" class:pinned={entry.pinned} onclick={pin} aria-pressed={entry.pinned} title={entry.pinned ? t('logs.unpin') : t('logs.pin')} aria-label={entry.pinned ? t('logs.unpin') : t('logs.pin')}>
+      <button class="icon-btn" class:pinned onclick={pin} aria-pressed={pinned} title={pinned ? t('logs.unpin') : t('logs.pin')} aria-label={pinned ? t('logs.unpin') : t('logs.pin')}>
         <Icon name="pin" size={16} />
       </button>
       <button class="icon-btn" onclick={() => onstep(-1)} title={t('d.prev')} aria-label={t('d.prev')}><Icon name="chevronUp" size={16} stroke={2.4} /></button>
@@ -263,39 +317,28 @@
       <button class="icon-btn close" onclick={onclose} title={t('d.close')} aria-label={t('d.close')}><Icon name="x" size={16} stroke={2.4} /></button>
     </div>
     <div class="d-sub">
-      <span class="mono seq">#{entry.seq}</span>
+      {#if record}<span class="mono seq">#{record.seq}</span>{/if}
       <span class="chip">{instName}</span>
-      {#if entry.model}<span class="chip lilac">{entry.model}</span>{/if}
-      <ResultChip {entry} />
+      {#if record?.model}<span class="chip lilac">{record.model}</span>{/if}
+      {#if record}<ResultChip row={record} />{/if}
     </div>
-    <div class="tabs" role="tablist" aria-label={`#${entry.seq}`} tabindex="-1" onkeydown={onTabKey}>
+    <div class="tabs" role="tablist" aria-label={record ? `#${record.seq}` : ''} tabindex="-1" onkeydown={onTabKey}>
       <span class="tab-ind" style="transform: translateX({indicator.left}px); width: {indicator.width}px"></span>
       {#each tabs as tb, i (tb)}
-        <button
-          role="tab"
-          id="tab-{tb}"
-          aria-selected={tab === tb}
-          aria-controls="panel-{tb}"
-          tabindex={tab === tb ? 0 : -1}
-          bind:this={tabEls[i]}
-          onclick={() => (tab = tb)}
-        >
+        <button role="tab" id="tab-{tb}" aria-selected={tab === tb} aria-controls="panel-{tb}" tabindex={tab === tb ? 0 : -1} bind:this={tabEls[i]} onclick={() => (tab = tb)}>
           {t(`d.tab.${tb}`)}
-          {#if tb === 'transform' && entry.transformed}<span class="tab-dot"></span>{/if}
+          {#if tb === 'format' && anyReports}<span class="tab-dot"></span>{/if}
         </button>
       {/each}
       <span class="grow"></span>
-      <!-- 复制收进一个小菜单：页签一行放不下两个带字的按钮（英文尤其长） -->
       <div class="copy-wrap" bind:this={copyWrap}>
         <button class="copy" aria-haspopup="menu" aria-expanded={copyOpen} onclick={() => (copyOpen = !copyOpen)}>
           <Icon name="copy" size={14} />{t('d.copy')}<Icon name="chevronDown" size={12} stroke={2.6} />
         </button>
         {#if copyOpen}
           <div class="copy-menu" role="menu" in:pop={{ y: -6, scale: 0.96, duration: 380 }} out:fadeOut={{ duration: 100 }}>
-            <button role="menuitem" onclick={copyCurl}><Icon name="terminal" size={14} />{t('d.copyCurl')}</button>
-            {#if entry.method === 'POST'}
-              <button role="menuitem" onclick={copyBody}><Icon name="braces" size={14} />{t('d.copyBody')}</button>
-            {/if}
+            <button role="menuitem" onclick={copyPath}><Icon name="terminal" size={14} />{t('d.copyPath')}</button>
+            <button role="menuitem" onclick={copyId}><Icon name="braces" size={14} />{t('d.copyId')}</button>
           </div>
         {/if}
       </div>
@@ -305,156 +348,142 @@
   <div class="d-body" role="tabpanel" id="panel-{tab}" aria-labelledby="tab-{tab}">
     {#key tab}
       <div class="pane" in:pop={{ y: 6, scale: 1, duration: 380 }}>
-        {#if tab === 'overview'}
-          {#if entry.outcome === 'rescued'}
+        {#if !record}
+          {@render loadingNote()}
+        {:else if tab === 'overview'}
+          {#if failure}
+            <div class="banner coral"><Icon name="info" size={18} /><p>{faultText(failure)}</p></div>
+          {/if}
+          {#if rescued(record)}
             <div class="banner mint">
               <Icon name="umbrella" size={18} />
               <div>
-                <p>{t('d.rescuedNote', { n: entry.attempts.length, d: durLong(waitedExtra) })}</p>
-                {#if entry.heartbeats > 0}<p class="sub">{t('d.heartbeats', { n: entry.heartbeats })}</p>{/if}
+                <p>{t('d.rescuedNote', { n: record.attempts, d: durLong(waitedExtra(record)) })}</p>
+                {#if record.heartbeats > 0}<p class="sub">{t('d.heartbeats', { n: record.heartbeats })}</p>{/if}
               </div>
             </div>
-          {:else if entry.outcome === 'ok'}
+          {:else if record.outcome === 'ok'}
             <div class="banner mint"><Icon name="check" size={18} stroke={2.4} /><p>{t('d.firstTry')}</p></div>
-          {:else if failNote()}
-            <div class="banner coral"><Icon name="info" size={18} /><p>{failNote()}</p></div>
-          {:else if inst?.status === 'unresponsive' && entry.phase !== null}
-            <!-- 实例卡住：下面的倒计时停在最后一份快照上，先说清楚这是过期数据 -->
-            <div class="banner coral"><Icon name="clock" size={18} /><p>{t('inst.stale', { ago: ago(store.now - clock) })}</p></div>
+          {:else if failNote(record)}
+            <div class="banner coral"><Icon name="info" size={18} /><p>{failNote(record)}</p></div>
+          {:else if card?.liveness === 'unresponsive' && record.outcome === 'in-flight'}
+            <div class="banner coral"><Icon name="clock" size={18} /><p>{t('inst.stale')}</p></div>
           {/if}
 
           <h3>{t('d.timeline')}</h3>
           <ol class="timeline">
-            {#each entry.attempts as a, i (a.n)}
-              <li class="att" class:fail={!!a.reason} class:ok={!a.reason && entry.outcome !== 'streaming'}>
-                <span class="node">{#if !a.reason && entry.outcome !== 'streaming'}<Icon name="check" size={14} stroke={3} />{:else}{a.n}{/if}</span>
+            {#if record.triesOmitted > 0}
+              <li class="gap"><span class="gap-pill"><Icon name="info" size={12} stroke={2.4} />{t('d.omitted', { n: record.triesOmitted })}</span></li>
+            {/if}
+            {#each tries as x, i (x.attempt)}
+              {@const running = x.durationMs === null}
+              {@const ok = !x.code && !running}
+              <li class="att" class:fail={!!x.code} class:ok class:pending={running}>
+                <span class="node">{#if ok}<Icon name="check" size={14} stroke={3} />{:else}{x.attempt}{/if}</span>
                 <div class="att-main">
-                  <span class="code-chip" class:fail={!!a.reason}>{a.status ?? 'ERR'}</span>
-                  <span class="att-reason">{a.reason ? t(`reason.${a.reason}`) : entry.outcome === 'streaming' ? t('logs.status.streaming') : t('d.success')}</span>
-                  <span class="att-dur num">{durShort(a.durationMs)}</span>
-                  <button class="peek" onclick={() => peek(i)}>{t('d.peek')}<Icon name="chevronRight" size={12} stroke={2.6} /></button>
+                  {#if running}
+                    <span class="att-reason">{t('d.trying', { n: x.attempt })}</span>
+                  {:else}
+                    <span class="code-chip" class:fail={!!x.code}>{tryLabel(x)}</span>
+                    <span class="att-reason">{x.code ? codeText(x.code, x.upstreamStatus) : t('d.success')}</span>
+                    <span class="att-dur num">{durShort(x.durationMs ?? 0)}</span>
+                  {/if}
+                  <button class="peek" onclick={() => peek(x.attempt)}>{t('d.peek')}<Icon name="chevronRight" size={12} stroke={2.6} /></button>
                 </div>
               </li>
-              {#if i < entry.attempts.length - 1 || (entry.outcome === 'retrying' && entry.phase === 'waiting')}
+              {#if i < tries.length - 1 || (record.outcome === 'in-flight' && record.phase === 'backoff')}
+                {@const live = i === tries.length - 1}
                 <li class="gap">
-                  <span class="gap-pill" class:live={i === entry.attempts.length - 1}>
+                  <span class="gap-pill" class:live>
                     <Icon name="clock" size={12} stroke={2.4} />
-                    {#if i === entry.attempts.length - 1}
-                      {t('d.nextIn', { s: countdown(), n: entry.attempts.length + 1 })}
+                    {#if live}
+                      {t('d.nextIn', { s: countdown(record), n: record.attempts + 1 })}
+                    {:else if x.decision?.delayMs === 0}
+                      {t('d.immediate')}
+                    {:else if x.decision?.delayMs}
+                      {t('d.waited', { d: durLong(x.decision.delayMs) })}
                     {:else}
-                      {a.backoffMs === 0 ? t('d.immediate') : t('d.waited', { d: durLong(a.backoffMs) })}
+                      {t('d.retried')}
                     {/if}
-                    {#if hearts(a) > 0 && i < entry.attempts.length - 1}
-                      <span class="hearts"><Icon name="heart" size={11} stroke={2.4} />×{hearts(a)}</span>
-                    {/if}
+                    {#if x.decision?.by}<span class="by">{t('d.decidedBy', { by: x.decision.by })}</span>{/if}
                   </span>
                 </li>
               {/if}
             {/each}
-            {#if entry.outcome === 'retrying' && entry.phase === 'attempting'}
-              <li class="att pending">
-                <span class="node">{entry.attempts.length + 1}</span>
-                <div class="att-main"><span class="att-reason">{t('d.trying', { n: entry.attempts.length + 1 })}</span></div>
-              </li>
-            {/if}
           </ol>
 
           <h3>{t('d.facts')}</h3>
           <dl class="facts">
             <dt>{t('d.received')}</dt>
-            <dd class="mono">{stamp(entry.time)}</dd>
+            <dd class="mono">{stamp(record.startedAt)}</dd>
             <dt>{t('d.client')}</dt>
-            <dd class="mono">{entry.client}</dd>
+            <dd class="mono">{record.userAgent ?? '—'}</dd>
             <dt>{t('d.total')}</dt>
-            <dd>{durLong(entry.durationMs)}</dd>
+            <dd>{durLong(durationOf(record, store.now))}</dd>
+            <dt>{t('d.delivery')}</dt>
+            <dd>{record.delivery === 'forward' ? t('mode.forwardOnly') : record.upgraded ? t('d.upgraded') : t('cfgsum.retryForever')}{record.stream ? ` · ${t('d.stream')}` : ''}</dd>
             <dt>{t('d.reqSize')}</dt>
-            <dd>{entry.reqBytes ? bytes(entry.reqBytes) : '—'}</dd>
+            <dd>{record.requestBytes ? bytes(record.requestBytes) : '—'}</dd>
             <dt>{t('d.respSize')}</dt>
-            <dd>{entry.respBytes ? bytes(entry.respBytes) : '—'}</dd>
+            <dd>{record.responseBytes ? bytes(record.responseBytes) : '—'}</dd>
             <dt>{t('d.keepalive')}</dt>
-            <dd>{entry.heartbeats > 0 ? t('d.heartbeatRow', { n: entry.heartbeats }) : '—'}</dd>
-            {#if entry.keyIndex}
-              <dt>{t('d.keyUsed')}</dt>
-              <dd>{t('d.keyN', { i: entry.keyIndex, n: keys })}</dd>
-            {/if}
+            <dd>{record.heartbeats > 0 ? t('d.heartbeatRow', { n: record.heartbeats }) : '—'}</dd>
             <dt>{t('d.requestId')}</dt>
-            <dd class="mono">#{entry.seq}</dd>
+            <dd class="mono">#{record.seq}</dd>
           </dl>
+          {#if record.truncated}<p class="note"><Icon name="info" size={14} />{t('d.truncated')}</p>{/if}
         {:else if tab === 'request'}
           <div class="sec-head">
             <h3>{t('d.headers')}</h3>
             <span class="chip pink"><Icon name="lock" size={11} stroke={2.4} />{t('d.secretNote')}</span>
           </div>
-          {#if detail}
+          {#if detail && selection}
             {@render headerList(detail.request.headers)}
+            <h3>{t('d.body')}</h3>
+            {#key selection.generation}
+              <BodyView {selection} {target} part={{ kind: 'request' }} info={detail.request.body} />
+            {/key}
           {:else}
-            {@render loading()}
-          {/if}
-          <h3>{t('d.body')}</h3>
-          {#if entry.method === 'POST'}
-            {#if detail}<JsonView value={detail.request.body} />{:else}{@render loading()}{/if}
-          {:else}
-            <p class="note">{t('d.noBody')}</p>
+            {@render loadingNote()}
           {/if}
         {:else if tab === 'response'}
-          <div class="sec-head">
-            {@render attemptPicker(attemptIdx, (i) => (attemptIdx = i), t('d.whichAttempt'))}
-            {#if entry.attempts.length > 1}
-              <button class="toggle" class:on={compare} aria-pressed={compare} onclick={() => {
-                compare = !compare;
-                if (compare && compareIdx === attemptIdx) compareIdx = attemptIdx === 0 ? entry.attempts.length - 1 : 0;
-              }}>
-                <Icon name="compare" size={14} />{t('d.compare')}
-              </button>
-            {/if}
-          </div>
-          {#if compare}
-            <div class="compare">
-              <div class="col">
-                {@render response(attemptIdx)}
-              </div>
-              <div class="col">
-                {@render attemptPicker(compareIdx, (i) => (compareIdx = i), t('d.compareWith', { n: compareIdx + 1 }))}
-                {@render response(compareIdx)}
-              </div>
+          {#if tries.length === 0}
+            <p class="note">{t('d.pending')}</p>
+          {:else}
+            <div class="sec-head">
+              {@render attemptPicker(shownNo, (n) => (attemptNo = n), t('d.whichAttempt'))}
+              {#if tries.length > 1}
+                <button class="toggle" class:on={compare} aria-pressed={compare} onclick={() => (compare = !compare)}>
+                  <Icon name="compare" size={14} />{t('d.compare')}
+                </button>
+              {/if}
             </div>
-          {:else}
-            {@render response(entry.attempts[attemptIdx] ? attemptIdx : entry.attempts.length - 1)}
+            {#if compare}
+              <div class="compare">
+                <div class="col">
+                  {@render response(shownNo)}
+                </div>
+                <div class="col">
+                  {@render attemptPicker(otherNo, (n) => (compareNo = n), t('d.compareWith', { n: otherNo ?? '' }))}
+                  {@render response(otherNo)}
+                </div>
+              </div>
+            {:else}
+              {@render response(shownNo)}
+            {/if}
           {/if}
-        {:else if tab === 'transform'}
-          {#if !entry.transformed}
-            <p class="note">{t('d.transform.none')}</p>
-          {:else}
-            <h3>{t('d.transform.title')}</h3>
-            <ul class="changes">
-              {#each detail?.transform ?? [] as c (c.field)}
-                <li>
-                  <div class="ch-head">
-                    <code class="mono field">{c.field}</code>
-                    {#if c.note === 'key'}<span class="chip lilac"><Icon name="key" size={11} stroke={2.4} />{t('d.transform.key', { i: entry.keyIndex ?? 1 })}<span class="of">/ {keys}</span></span>{/if}
-                    {#if c.note === 'channel'}<span class="chip lilac"><Icon name="shuffle" size={11} stroke={2.4} />{t('d.transform.channel')}</span>{/if}
-                    {#if c.note === 'model'}<span class="chip lilac">{t('d.transform.model')}</span>{/if}
-                    {#if !c.before}<span class="chip mint">{t('d.transform.added')}</span>{/if}
-                  </div>
-                  <div class="ch-body">
-                    {#if c.before}<code class="mono before" title={t('d.transform.before')}>{c.before}</code>{/if}
-                    <code class="mono after" title={t('d.transform.after')}>{c.after}</code>
-                  </div>
-                </li>
-              {/each}
-            </ul>
-            <p class="note"><Icon name="info" size={14} />{t('d.transform.replay')}</p>
-          {/if}
+        {:else if !anyReports}
+          <p class="note">{t('d.format.none')}</p>
         {:else}
-          <div class="sec-head">
-            {@render attemptPicker(attemptIdx, (i) => (attemptIdx = i), t('d.whichAttempt'))}
-          </div>
-          <p class="note">{t('d.raw.note')}</p>
-          {#if detail}
-            <pre class="pre mono raw">{detail.attempts[attemptIdx]?.raw ?? detail.request.raw}</pre>
-          {:else}
-            {@render loading()}
+          {#if record.reports.length}
+            <h3>{t('d.format.request')}</h3>
+            {@render reportList(record.reports)}
           {/if}
+          {#each tries.filter((x) => x.reports.length) as x (x.attempt)}
+            <h3>{t('d.attempt', { n: x.attempt })}</h3>
+            {@render reportList(x.reports)}
+          {/each}
+          <p class="note"><Icon name="info" size={14} />{t('d.format.note')}</p>
         {/if}
       </div>
     {/key}
@@ -880,18 +909,6 @@
     color: var(--on-fill);
     box-shadow: 0 2px 8px -2px color-mix(in oklab, var(--sky) 90%, transparent);
   }
-  .hearts {
-    display: inline-flex;
-    align-items: center;
-    gap: 2px;
-    margin-left: 4px;
-    padding-left: 8px;
-    border-left: 1.5px solid color-mix(in oklab, currentColor 30%, transparent);
-    color: var(--pink-deep);
-  }
-  .hearts :global(svg) {
-    fill: var(--pink);
-  }
 
   .facts {
     display: grid;
@@ -934,9 +951,6 @@
     /* 头名多由连字符连成（anthropic-ratelimit-…），在连字符处折行比硬拆单词好读 */
     overflow-wrap: anywhere;
   }
-  .of {
-    opacity: 0.7;
-  }
   .headers dd {
     margin: 0;
     padding: 3px 0;
@@ -952,20 +966,6 @@
     border-radius: 6px;
     background: var(--pink-soft);
     color: var(--pink-deep);
-  }
-  .pre {
-    margin: 0;
-    padding: 12px 14px;
-    border-radius: var(--r-md);
-    border: var(--line-w-thin) solid var(--line-soft);
-    background: var(--card-2-bg);
-    font-size: 12.5px;
-    line-height: 1.6;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-  .raw {
-    max-height: none;
   }
   .statusline {
     display: flex;
@@ -1072,84 +1072,6 @@
     border-left: var(--line-w-thin) dashed var(--line-soft);
   }
 
-  .assembled {
-    padding: 10px 14px;
-    border-radius: var(--r-md);
-    background: var(--lilac-soft);
-  }
-  .assembled .label {
-    color: var(--lilac-deep);
-    font-size: var(--fs-xs);
-    font-weight: 600;
-  }
-  .assembled p {
-    margin: 4px 0 0;
-  }
-  .events-head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: var(--fs-sm);
-    font-weight: 600;
-    color: var(--text-2);
-  }
-  .events {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    border-radius: var(--r-md);
-    border: var(--line-w-thin) solid var(--line-soft);
-    overflow: hidden;
-  }
-  .ev + .ev {
-    border-top: var(--line-w-thin) solid var(--line-soft);
-  }
-  .ev-row,
-  .ev.beat {
-    display: grid;
-    grid-template-columns: 170px 1fr;
-    align-items: center;
-    gap: 10px;
-    width: 100%;
-    min-height: 32px;
-    padding: 0 12px;
-    border: 0;
-    background: transparent;
-    text-align: left;
-    font-size: 12px;
-  }
-  .ev-row:hover {
-    background: var(--hover);
-  }
-  .ev.beat {
-    background: var(--pink-soft);
-    color: var(--pink-deep);
-  }
-  .ev-name {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    font-weight: 600;
-    color: var(--text);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .ev.beat .ev-name {
-    color: var(--pink-deep);
-  }
-  .ev.beat :global(svg) {
-    fill: var(--pink);
-  }
-  .ev-data {
-    color: var(--text-3);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .ev-json {
-    padding: 0 10px 10px;
-  }
 
   .changes {
     list-style: none;
@@ -1177,28 +1099,40 @@
     display: grid;
     gap: 5px;
   }
-  .before,
-  .after {
-    display: block;
-    padding: 4px 10px;
-    border-radius: var(--r-sm);
-    font-size: 12px;
-    word-break: break-all;
+
+  /* format 的报告摘要：来自 format 程序的文字，只当纯文本显示 */
+  .ch-summary {
+    margin: 0;
+    color: var(--text-2);
+    font-size: var(--fs-sm);
+    white-space: pre-wrap;
+    word-break: break-word;
   }
-  .before {
-    background: var(--coral-soft);
-    color: var(--coral-deep);
-    text-decoration: line-through;
-    text-decoration-color: color-mix(in oklab, currentColor 50%, transparent);
+  .by {
+    margin-left: 4px;
+    opacity: 0.75;
   }
-  .before::before {
-    content: '− ';
+  /* 发给上游的那一份默认收起：多数时候看收到的就够了 */
+  .sent {
+    margin-top: 10px;
+    padding: 8px 12px;
+    border-radius: var(--r-md);
+    border: var(--line-w-thin) solid var(--line-soft);
   }
-  .after {
-    background: var(--mint-soft);
-    color: var(--mint-deep);
+  .sent summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    color: var(--text-2);
+    font-size: var(--fs-sm);
+    font-weight: 600;
   }
-  .after::before {
-    content: '+ ';
+  .sent summary code {
+    font-weight: 400;
+    color: var(--text-3);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 </style>

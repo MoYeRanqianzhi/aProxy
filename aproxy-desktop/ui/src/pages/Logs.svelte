@@ -1,30 +1,42 @@
 <!--
   请求日志：一条请求一行的结构化列表，点开在右侧抽屉里看详情。
 
-  为将来的虚拟滚动留路（海量日志的性能在审核通过后再做）：
-  - 每一行高度固定为 --row-h，任何内容都不能把行撑高（单行、溢出省略、不做行内展开）；
-  - 列表只有一个滚动容器（.scroller），表头在它外面，不参与滚动；
-  - 详情放在抽屉里而不是插在行之间，选中某行不会改变其它行的位置。
-  到时只需把 {#each} 换成按 scrollTop 截取的窗口，并用总行数 × 行高撑出滚动高度。
+  数据怎么来（契约第 2 节的翻页规矩）：
+  - 第一页（query_logs 不带游标）只读各实例内存里最近的那些，最多 100 条；更早的用它给的游标往前翻，
+    游标只能用一次，再取一次第一页就把之前的游标作废。
+  - 跟随时，请求一变（requests-changed）就重取第一页，之前翻出来的更早的页一并丢掉——它们的游标已经作废了。
+    不跟随时（用户往上翻着看），不动列表，只亮出「有新的变化」，点了才刷新：免得正看着的行被换掉。
+  - 列表按时间从早到晚往下排，最新的在底部（跟随时停在底部）。
+
+  为将来的虚拟滚动留路：每一行高度固定为 --row-h，任何内容都不能把行撑高；列表只有一个滚动容器（.scroller），
+  表头在它外面；详情放在抽屉里而不是插在行之间，选中某行不会改变其它行的位置。
 -->
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
+  import { tick, untrack } from 'svelte';
   import { t, clock, durShort, bytes, fmtNum } from '../lib/i18n';
   import { ui } from '../lib/state.svelte';
-  import { store } from '../lib/legacy.svelte';
+  import { refKey, sameRef, store } from '../lib/store.svelte';
   import { overlays } from '../lib/overlays.svelte';
-  import type { LogEntry } from '../lib/types';
+  import type { Bookmark, Outcome, Ref, Row, Run, Token } from '../lib/backend/contract';
+  import { toFailure, type Failure } from '../lib/backend/link';
+  import { faultText } from '../lib/faults';
+  import { aliasOf, durationOf, rescued, retrying } from '../lib/view';
   import { slideIn, pop, fadeOut } from '../lib/motion';
   import Icon from '../components/Icon.svelte';
   import Segmented from '../components/Segmented.svelte';
   import Dropdown from '../components/Dropdown.svelte';
   import Switch from '../components/Switch.svelte';
-  import ResultChip from '../components/LegacyResultChip.svelte';
+  import ResultChip from '../components/ResultChip.svelte';
   import MascotView from '../components/MascotView.svelte';
   import { mascots } from '../lib/mascot/registry.svelte';
   import LogDetail from './LogDetail.svelte';
 
   type StatusFilter = 'all' | 'rescued' | 'retrying' | 'failed' | 'ok';
+
+  /** 一页取多少条：契约允许 1 到 100 */
+  const PAGE = 100;
+  /** 新到的行高亮多久 */
+  const FRESH_MS = 1_600;
 
   let status = $state<StatusFilter>('all');
   let instance = $state<number | 'all'>(ui.logInstanceFilter);
@@ -34,48 +46,183 @@
   let onlyErrors = $state(false);
   let onlyPinned = $state(false);
   let follow = $state(true);
-  let newCount = $state(0);
+  /** 不跟随时攒下的变化：只说「有新的」，不说几条（一次通知可能是一条新请求，也可能是一条旧请求的进展） */
+  let stale = $state(false);
   let scroller: HTMLDivElement | undefined = $state();
 
   ui.logInstanceFilter = 'all';
 
-  const logs = $derived(store.logs);
+  // ---------------------------------------------------------------------------
+  // 取数据
+  // ---------------------------------------------------------------------------
+
+  /** 已经取到的行，新的在前（契约给的顺序）；显示时倒过来 */
+  let rows = $state.raw<Row[]>([]);
+  let cursor = $state<Token | null>(null);
+  let loaded = $state(false);
+  let loadingOlder = $state(false);
+  let fault = $state.raw<Failure | null>(null);
+  /** 翻页时没能读全的运行 */
+  let missing = $state(0);
+  /** 新到的行高亮到什么时候（界面时钟） */
+  let freshUntil = $state.raw<ReadonlyMap<string, number>>(new Map());
+
+  /** 筛选的实例这次运行；「全部实例」是 null。卡片每次重读都是新对象，所以按键比较 */
+  const scopeCard = $derived(instance === 'all' ? null : store.card(instance));
+  const scopeKey = $derived(instance === 'all' ? 'all' : scopeCard?.run ? `${scopeCard.run.port}/${scopeCard.run.instanceId}` : 'none');
+  /** 这个范围里的请求变过几次 */
+  const scopeChanges = $derived(instance === 'all' ? store.changes : store.revision(scopeCard?.run ?? null));
+
+  /** 当前请求的编号：范围换了、或者又取了一次第一页之后，之前还没回来的结果作废 */
+  let fetchId = 0;
+
+  async function loadHead() {
+    const id = ++fetchId;
+    const run: Run | null = instance === 'all' ? null : (scopeCard?.run ?? null);
+    if (instance !== 'all' && !run) {
+      rows = [];
+      cursor = null;
+      loaded = true;
+      return;
+    }
+    try {
+      const page = await store.queryLogs(run, null, PAGE);
+      if (id !== fetchId) return;
+      // 第一次加载不高亮；之后出现的新行亮一下
+      if (loaded) {
+        const known = new Set(rows.map((r) => refKey(r.ref)));
+        const until = store.now + FRESH_MS;
+        const next = new Map([...freshUntil].filter(([, at]) => at > store.now));
+        for (const r of page.entries) if (!known.has(refKey(r.ref))) next.set(refKey(r.ref), until);
+        freshUntil = next;
+      }
+      rows = page.entries;
+      cursor = page.next;
+      missing = page.missing.length;
+      fault = null;
+      stale = false;
+      const first = !loaded;
+      loaded = true;
+      if (first) await scrollToStart();
+      else if (follow) await toBottom(true);
+    } catch (raw) {
+      if (id === fetchId) {
+        fault = toFailure(raw);
+        loaded = true;
+      }
+    }
+  }
+
+  async function loadOlder() {
+    if (!cursor || loadingOlder) return;
+    loadingOlder = true;
+    const id = fetchId;
+    const run: Run | null = instance === 'all' ? null : (scopeCard?.run ?? null);
+    // 往前翻会把更早的行加在列表顶上：记住离底部多远，加完之后保持用户看着的那几行不动
+    const fromBottom = scroller ? scroller.scrollHeight - scroller.scrollTop : 0;
+    try {
+      const page = await store.queryLogs(run, cursor, PAGE);
+      if (id !== fetchId) return;
+      const have = new Set(rows.map((r) => refKey(r.ref)));
+      rows = [...rows, ...page.entries.filter((r) => !have.has(refKey(r.ref)))];
+      cursor = page.next;
+      missing = page.missing.length;
+      await tick();
+      if (scroller) scroller.scrollTop = scroller.scrollHeight - fromBottom;
+    } catch (raw) {
+      if (id !== fetchId) return;
+      const f = toFailure(raw);
+      // 游标过期了（又取过一次第一页、或者通道重新接上了）：从第一页重新来
+      if (f.code === 'desktop_cursor') void loadHead();
+      else overlays.toast(faultText(f), 'coral');
+    } finally {
+      loadingOlder = false;
+    }
+  }
+
+  // 范围换了、通道重新接上：从第一页重新取，之前的一切作废
+  $effect(() => {
+    void scopeKey;
+    void store.epoch;
+    untrack(() => {
+      rows = [];
+      cursor = null;
+      loaded = false;
+      void loadHead();
+    });
+  });
+
+  // 这个范围里的请求变了：跟随时重取第一页，否则只亮出提示
+  let seenChanges = untrack(() => scopeChanges);
+  $effect(() => {
+    const n = scopeChanges;
+    if (n === seenChanges) return;
+    seenChanges = n;
+    untrack(() => {
+      if (follow) void loadHead();
+      else stale = true;
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 筛选与显示
+  // ---------------------------------------------------------------------------
+
+  function failed(r: Row): boolean {
+    return r.outcome !== 'ok' && r.outcome !== 'in-flight';
+  }
 
   const counts = $derived.by(() => {
     const c = { all: 0, rescued: 0, retrying: 0, failed: 0, ok: 0 };
-    for (const e of logs) {
+    for (const r of rows) {
       c.all += 1;
-      if (e.outcome === 'rescued') c.rescued += 1;
-      else if (e.outcome === 'retrying') c.retrying += 1;
-      else if (e.outcome === 'failed') c.failed += 1;
-      else if (e.outcome === 'ok') c.ok += 1;
+      if (rescued(r)) c.rescued += 1;
+      else if (retrying(r)) c.retrying += 1;
+      else if (failed(r)) c.failed += 1;
+      else if (r.outcome === 'ok') c.ok += 1;
     }
     return c;
   });
 
-  const models = $derived([...new Set(logs.map((e) => e.model ?? ''))].sort());
-  const pinnedCount = $derived(logs.filter((e) => e.pinned).length);
+  const models = $derived([...new Set(rows.map((r) => r.model ?? ''))].sort());
 
-  function matches(e: LogEntry): boolean {
-    if (status !== 'all' && e.outcome !== status) return false;
-    if (instance !== 'all' && e.port !== instance) return false;
-    if (model !== 'all' && (e.model ?? '') !== model) return false;
-    if (onlyRetried && e.attempts.length < 2 && e.outcome !== 'retrying') return false;
-    if (onlyErrors && !e.attempts.some((a) => a.reason)) return false;
-    if (onlyPinned && !e.pinned) return false;
+  function matches(r: Row): boolean {
+    if (status === 'rescued' && !rescued(r)) return false;
+    if (status === 'retrying' && !retrying(r)) return false;
+    if (status === 'failed' && !failed(r)) return false;
+    if (status === 'ok' && !(r.outcome === 'ok' && r.attempts <= 1)) return false;
+    if (model !== 'all' && (r.model ?? '') !== model) return false;
+    if (onlyRetried && r.attempts < 2 && !retrying(r)) return false;
+    if (onlyErrors && r.code === null && !r.tries.some((x) => x.code !== null)) return false;
     const q = query.trim().toLowerCase().replace(/^#/, '');
     if (q) {
-      const hay = `${e.path} ${e.model ?? ''} ${e.seq} ${e.port} ${e.method} ${e.client}`.toLowerCase();
+      const hay = `${r.path} ${r.model ?? ''} ${r.seq} ${r.ref.run.port} ${r.method} ${r.userAgent ?? ''}`.toLowerCase();
       if (!hay.includes(q)) return false;
     }
     return true;
   }
 
-  const filtered = $derived(logs.filter(matches));
-  const selected = $derived(ui.selectedLog ? (logs.find((e) => e.key === ui.selectedLog) ?? null) : null);
-  const filtersActive = $derived(
-    status !== 'all' || instance !== 'all' || model !== 'all' || query !== '' || onlyRetried || onlyErrors || onlyPinned,
-  );
+  /** 一行：一般是取到的请求；只看已固定时也可能是一条只剩摘要的置顶（原记录可能已经被清理了） */
+  type Item = { key: string; ref: Ref; row: Row | null; mark: Bookmark | null };
+
+  const items = $derived.by((): Item[] => {
+    if (onlyPinned) {
+      // 置顶是新的在前，显示时和列表一样从早到晚
+      return store.bookmarks
+        .filter((b) => instance === 'all' || b.ref.run.port === instance)
+        .map((b) => ({ key: refKey(b.ref), ref: b.ref, row: rows.find((r) => sameRef(r.ref, b.ref)) ?? null, mark: b }))
+        .filter((it) => !it.row || matches(it.row))
+        .sort((a, b) => (a.row?.startedAt ?? a.mark!.startedAt) - (b.row?.startedAt ?? b.mark!.startedAt));
+    }
+    return rows
+      .filter(matches)
+      .map((r) => ({ key: refKey(r.ref), ref: r.ref, row: r, mark: null }))
+      .reverse();
+  });
+
+  const selectedKey = $derived(ui.selectedRef ? refKey(ui.selectedRef) : null);
+  const selectedRow = $derived(ui.selectedRef ? (rows.find((r) => sameRef(r.ref, ui.selectedRef)) ?? null) : null);
+  const filtersActive = $derived(status !== 'all' || instance !== 'all' || model !== 'all' || query !== '' || onlyRetried || onlyErrors || onlyPinned);
 
   function clearFilters() {
     status = 'all';
@@ -95,91 +242,98 @@
     scroller?.scrollTo({ top: scroller.scrollHeight, behavior: smooth && !ui.reducedMotion ? 'smooth' : 'auto' });
   }
 
-  // 新条目到达：跟随时滚到底；没跟随时累计成「N 条新日志」胶囊
-  let seenArrivals = store.arrivals;
-  $effect(() => {
-    const n = store.arrivals;
-    const delta = n - seenArrivals;
-    seenArrivals = n;
-    if (delta <= 0) return;
-    if (follow) toBottom(true);
-    else newCount += delta;
-  });
-
   let lastTop = 0;
+  /** 用户最近一次自己动列表（滚轮、触摸、按下滚动条、按键）的时刻 */
+  let userAt = 0;
+  function onUser() {
+    userAt = Date.now();
+  }
+  // 只是旁听用户有没有动列表，不处理这些事件本身，所以挂成被动监听而不是元素上的交互处理
+  $effect(() => {
+    const el = scroller;
+    if (!el) return;
+    const kinds = ['wheel', 'touchmove', 'pointerdown', 'keydown'] as const;
+    for (const k of kinds) el.addEventListener(k, onUser, { passive: true });
+    return () => kinds.forEach((k) => el.removeEventListener(k, onUser));
+  });
   function onScroll() {
     if (!scroller) return;
-    // 只有「往上翻」才算用户想停下来看：程序平滑滚到底的过程中也会触发 scroll，但方向总是向下
+    // 只有用户自己「往上翻」才算想停下来看。列表刷新时顶上的旧行被拿掉、底部的新行还在做进入动画，
+    // 浏览器会把滚动位置夹回去，也是一次向上的 scroll，但那不是用户干的；程序平滑滚到底的方向总是向下
     const top = scroller.scrollTop;
-    if (follow && top < lastTop - 2 && !atBottom()) follow = false;
+    if (follow && top < lastTop - 2 && !atBottom() && Date.now() - userAt < 800) follow = false;
     lastTop = top;
-    if (atBottom()) newCount = 0;
   }
 
   function resume() {
     follow = true;
-    newCount = 0;
-    toBottom(true);
+    if (stale) void loadHead();
+    else void toBottom(true);
   }
 
   function onFollowChange(v: boolean) {
     if (v) resume();
   }
 
-  // 首次进入：有预选条目（从总览、命令面板跳来）就滚到它，否则停在最新处
-  onMount(async () => {
+  /** 第一次取到数据：有预选的那条（从总览、命令面板跳来）就滚到它，否则停在最新处 */
+  async function scrollToStart() {
     await tick();
-    const key = ui.selectedLog;
-    const row = key ? scroller?.querySelector<HTMLElement>(`[data-key="${CSS.escape(key)}"]`) : null;
-    if (row) {
+    const key = selectedKey;
+    const el = key ? scroller?.querySelector<HTMLElement>(`[data-key="${CSS.escape(key)}"]`) : null;
+    if (el) {
       follow = false;
-      row.scrollIntoView({ block: 'center' });
+      el.scrollIntoView({ block: 'center' });
     } else {
-      toBottom(false);
-    }
-  });
-
-  function resultText(e: LogEntry): string {
-    switch (e.outcome) {
-      case 'rescued':
-        return t('logs.filter.rescued');
-      case 'retrying':
-        return t('logs.status.retrying');
-      case 'streaming':
-        return t('logs.status.streaming');
-      case 'failed':
-        return t('logs.status.failed');
-      default:
-        return String(e.attempts[0]?.status ?? 200);
+      void toBottom(false);
     }
   }
 
-  function select(e: LogEntry) {
-    ui.selectedLog = ui.selectedLog === e.key ? null : e.key;
+  const OUTCOME_KEY: Record<Outcome, 'logs.status.inflight' | 'd.success' | 'logs.status.failed' | 'logs.status.clientGone'> = {
+    'in-flight': 'logs.status.inflight',
+    ok: 'd.success',
+    'upstream-error': 'logs.status.failed',
+    'aproxy-error': 'logs.status.failed',
+    'format-response': 'logs.status.failed',
+    'client-gone': 'logs.status.clientGone',
+    unknown: 'logs.status.failed',
+  };
+
+  function resultText(it: Item): string {
+    const r = it.row;
+    if (!r) return t(OUTCOME_KEY[it.mark!.outcome]);
+    if (rescued(r)) return t('logs.filter.rescued');
+    if (retrying(r)) return t('logs.status.retrying');
+    return r.clientStatus !== null ? String(r.clientStatus) : t(OUTCOME_KEY[r.outcome]);
+  }
+
+  function select(it: Item) {
+    ui.selectedRef = selectedKey === it.key ? null : it.ref;
   }
 
   function step(dir: 1 | -1) {
-    if (!selected) return;
-    const idx = filtered.findIndex((e) => e.key === selected.key);
-    const next = filtered[idx + dir];
+    if (!selectedKey) return;
+    const idx = items.findIndex((it) => it.key === selectedKey);
+    const next = items[idx + dir];
     if (!next) return;
-    ui.selectedLog = next.key;
-    tick().then(() =>
-      scroller?.querySelector<HTMLElement>(`[data-key="${CSS.escape(next.key)}"]`)?.scrollIntoView({ block: 'nearest' }),
-    );
+    ui.selectedRef = next.ref;
+    tick().then(() => scroller?.querySelector<HTMLElement>(`[data-key="${CSS.escape(next.key)}"]`)?.scrollIntoView({ block: 'nearest' }));
   }
 
-  async function pin(e: LogEntry) {
-    const next = !e.pinned;
-    await store.setPinned(e, next);
-    overlays.toast(t(next ? 'toast.pinned' : 'toast.unpinned'), next ? 'lilac' : 'mint');
+  async function pin(ref: Ref) {
+    const next = !store.pinned(ref);
+    try {
+      await store.setPinned(ref, next);
+      overlays.toast(t(next ? 'toast.pinned' : 'toast.unpinned'), next ? 'lilac' : 'mint');
+    } catch (raw) {
+      overlays.toast(faultText(toFailure(raw)), 'coral');
+    }
   }
 
   function onKey(ev: KeyboardEvent) {
-    if (!selected || (ev.target as HTMLElement).closest('input, textarea')) return;
+    if (!selectedKey || (ev.target as HTMLElement).closest('input, textarea')) return;
     if (ev.key === 'ArrowDown' || ev.key === 'j') step(1);
     else if (ev.key === 'ArrowUp' || ev.key === 'k') step(-1);
-    else if (ev.key === 'Escape') ui.selectedLog = null;
+    else if (ev.key === 'Escape') ui.selectedRef = null;
     else return;
     ev.preventDefault();
   }
@@ -194,13 +348,19 @@
 
   const instanceOptions = $derived([
     { value: 'all' as number | 'all', label: t('logs.allInstances') },
-    ...store.instances.map((i) => ({ value: i.port as number | 'all', label: `${i.port}`, hint: i.alias ?? undefined })),
+    ...store.cards.map((c) => ({ value: c.port as number | 'all', label: `${c.port}`, hint: aliasOf(c) ?? undefined })),
   ]);
 
-  const modelOptions = $derived([
-    { value: 'all', label: t('logs.allModels') },
-    ...models.map((m) => ({ value: m, label: m || t('logs.noModel') })),
-  ]);
+  const modelOptions = $derived([{ value: 'all', label: t('logs.allModels') }, ...models.map((m) => ({ value: m, label: m || t('logs.noModel') }))]);
+
+  /** 筛选的实例为什么没有请求可看 */
+  const scopeNote = $derived.by(() => {
+    if (instance === 'all' || !store.connected) return null;
+    if (!scopeCard) return t('inst.notFound', { port: instance });
+    if (scopeCard.historyUnavailable === 'source-redaction-missing') return t('card.oldVersionHint');
+    if (!scopeCard.run || !scopeCard.reads.historyFeed) return t('logs.noHistory');
+    return null;
+  });
 </script>
 
 <svelte:window onkeydown={onKey} />
@@ -227,10 +387,10 @@
         <Icon name="alert" size={14} stroke={2.3} />{t('logs.onlyErrors')}
       </button>
       <button class="toggle" class:on={onlyPinned} aria-pressed={onlyPinned} onclick={() => (onlyPinned = !onlyPinned)}>
-        <Icon name="pin" size={14} stroke={2.3} />{t('logs.pinned')}<span class="n">{pinnedCount}</span>
+        <Icon name="pin" size={14} stroke={2.3} />{t('logs.pinned')}<span class="n">{store.bookmarks.length}</span>
       </button>
       <span class="grow"></span>
-      <span class="count num">{t('logs.count', { shown: fmtNum(filtered.length), total: fmtNum(logs.length) })}</span>
+      <span class="count num">{t('logs.count', { shown: fmtNum(items.length), total: fmtNum(rows.length) })}</span>
       <span class="follow">
         <span class="follow-label" class:live={follow}>
           <span class="dot" class:mint={follow} class:gray={!follow} class:breathe={follow}></span>{t('logs.follow')}
@@ -254,37 +414,60 @@
     </div>
 
     <div class="scroller" bind:this={scroller} onscroll={onScroll} role="rowgroup">
-      {#each filtered as e (e.key)}
+      {#if fault}
+        <p class="list-note err"><Icon name="alert" size={14} />{faultText(fault)}<button class="btn ghost sm" onclick={loadHead}>{t('body.reload')}</button></p>
+      {/if}
+      {#if !onlyPinned && cursor && items.length > 0}
+        <div class="older">
+          <button class="btn ghost sm" disabled={loadingOlder} onclick={loadOlder}>
+            <Icon name="chevronUp" size={14} stroke={2.4} />{loadingOlder ? t('d.loading') : t('logs.older')}
+          </button>
+        </div>
+      {/if}
+      {#if missing > 0}
+        <p class="list-note"><Icon name="info" size={14} />{t('logs.missing', { n: missing })}</p>
+      {/if}
+      {#each items as it (it.key)}
+        {@const r = it.row}
+        {@const isPinned = store.pinned(it.ref)}
+        {@const fresh = (freshUntil.get(it.key) ?? 0) > store.now}
         <div
-          class="row o-{e.outcome}"
-          class:selected={selected?.key === e.key}
-          class:fresh={e.fresh}
-          class:pinned={e.pinned}
+          class="row o-{r ? r.outcome : it.mark!.outcome}"
+          class:selected={selectedKey === it.key}
+          class:fresh
+          class:pinned={isPinned}
           role="row"
-          data-key={e.key}
-          in:slideIn={{ enabled: e.fresh }}
+          data-key={it.key}
+          in:slideIn={{ enabled: fresh }}
         >
-          <button class="hit" onclick={() => select(e)} aria-label={t('logs.rowLabel', { method: e.method, path: e.path, result: resultText(e) })}></button>
+          <button class="hit" onclick={() => select(it)} aria-label={t('logs.rowLabel', { method: r?.method ?? it.mark!.method, path: r?.path ?? it.mark!.path, result: resultText(it) })}></button>
           <span class="c-pin" role="cell">
-            <button class="pin" class:on={e.pinned} onclick={() => pin(e)} aria-label={e.pinned ? t('logs.unpin') : t('logs.pin')} aria-pressed={e.pinned}>
+            <button class="pin" class:on={isPinned} onclick={() => pin(it.ref)} aria-label={isPinned ? t('logs.unpin') : t('logs.pin')} aria-pressed={isPinned}>
               <Icon name="pin" size={14} stroke={2.2} />
             </button>
           </span>
-          <span class="time mono" role="cell">{clock(e.time)}</span>
+          <span class="time mono" role="cell">{clock(r?.startedAt ?? it.mark!.startedAt)}</span>
           <span class="req" role="cell">
-            <span class="method m-{e.method}">{e.method}</span>
-            <span class="path mono">{e.path}</span>
+            <span class="method m-{r?.method ?? it.mark!.method}">{r?.method ?? it.mark!.method}</span>
+            <span class="path mono">{r?.path ?? it.mark!.path}</span>
           </span>
-          <span class="model" role="cell">{e.model ?? '—'}</span>
-          <span role="cell"><ResultChip entry={e} /></span>
-          <span class="r num dur" role="cell">{durShort(e.durationMs)}</span>
-          <span class="r num size" role="cell">{e.respBytes ? bytes(e.respBytes) : '—'}</span>
-          <span class="seq mono" role="cell">#{e.seq}</span>
-          <span role="cell"><span class="port">{e.port}</span></span>
+          <span class="model" role="cell">{(r ? r.model : it.mark!.model) ?? '—'}</span>
+          <span role="cell">
+            {#if r}<ResultChip row={r} />{:else}<span class="mark-result">{resultText(it)}{#if it.mark!.attempts > 1}<span class="times">×{it.mark!.attempts - 1}</span>{/if}</span>{/if}
+          </span>
+          <span class="r num dur" role="cell">{r ? durShort(durationOf(r, store.now)) : '—'}</span>
+          <span class="r num size" role="cell">{r?.responseBytes ? bytes(r.responseBytes) : '—'}</span>
+          <span class="seq mono" role="cell">{r ? `#${r.seq}` : ''}</span>
+          <span role="cell"><span class="port">{it.ref.run.port}</span></span>
         </div>
       {:else}
         <div class="empty" in:pop>
-          {#if logs.length === 0}
+          {#if !loaded}
+            <span>{t('d.loading')}</span>
+          {:else if scopeNote}
+            <span class="no-match" aria-hidden="true"><Icon name="info" size={22} stroke={2.2} /></span>
+            <span>{scopeNote}</span>
+          {:else if rows.length === 0 && !onlyPinned}
             <!-- 真正的空状态才放吉祥物；日志页信息密集，所以它是静止的（still） -->
             {#if mascots.current}<MascotView mood="sleeping" size="hero" px={96} still />{/if}
             <strong>{t('logs.noTraffic')}</strong>
@@ -299,15 +482,15 @@
       {/each}
     </div>
 
-    {#if newCount > 0 && !follow}
+    {#if stale && !follow}
       <button class="new-pill" onclick={resume} in:pop={{ y: 16, scale: 0.85 }} out:fadeOut>
-        <Icon name="arrowDown" size={15} stroke={2.6} />{t('logs.newN', { n: newCount })}
+        <Icon name="arrowDown" size={15} stroke={2.6} />{t('logs.updates')}
       </button>
     {/if}
 
-    {#if selected}
-      {#key selected.key}
-        <LogDetail entry={selected} onclose={() => (ui.selectedLog = null)} onstep={step} />
+    {#if ui.selectedRef}
+      {#key selectedKey}
+        <LogDetail target={ui.selectedRef} row={selectedRow} onclose={() => (ui.selectedRef = null)} onstep={step} />
       {/key}
     {/if}
   </div>
@@ -662,5 +845,34 @@
   }
   .new-pill:active {
     transform: translateY(1px) scale(0.97);
+  }
+
+  .older {
+    display: flex;
+    justify-content: center;
+    padding: 8px 0;
+  }
+  .list-note {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin: 6px 22px;
+    color: var(--text-3);
+    font-size: var(--fs-sm);
+  }
+  .list-note.err {
+    color: var(--coral-deep);
+  }
+  /* 原记录已不在列表里的置顶：只剩摘要，结果写成字 */
+  .mark-result {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--text-2);
+    font-size: var(--fs-sm);
+    font-weight: 600;
+  }
+  .mark-result .times {
+    color: var(--text-3);
   }
 </style>

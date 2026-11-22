@@ -110,6 +110,8 @@ class Store {
 
   /** resync 一次加一：分页的游标、详情的选择看到它变了就作废 */
   epoch = $state(0);
+  /** 任何一次运行的请求变了就加一：整个 home 的请求列表据此从第一页重读 */
+  changes = $state(0);
   /** 每次运行的请求变过几次（键是 runKey）：按运行分页的列表据此从第一页重读 */
   revisions = $state.raw<ReadonlyMap<string, number>>(new Map());
 
@@ -209,6 +211,7 @@ class Store {
         const next = new Map(this.revisions);
         next.set(runKey(ev.run), (next.get(runKey(ev.run)) ?? 0) + 1);
         this.revisions = next;
+        this.changes++;
         await this.readSnapshot();
         break;
       }

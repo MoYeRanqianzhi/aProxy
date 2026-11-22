@@ -337,7 +337,10 @@ async fn jurisdiction_check_rejects_foreign_binary() {
     let err = aproxy::install::flow::check_jurisdiction(&run_dir, &env.home(), false)
         .await
         .unwrap_err();
-    assert!(err.contains("--adopt"), "应指路 --adopt: {err}");
+    assert!(
+        err.render(aproxy_ipc::i18n::Lang::En).contains("--adopt"),
+        "应指路 --adopt: {err}"
+    );
     // adopt 豁免
     assert!(
         aproxy::install::flow::check_jurisdiction(&run_dir, &env.home(), true)
@@ -862,7 +865,10 @@ fn handover_to_a_target_that_never_takes_over_fails_without_touching_anything() 
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "应非零退出: {stderr}");
-    assert!(stderr.contains("没有接手"), "应说明目标没有接手: {stderr}");
+    assert!(
+        stderr.contains("did not take over"),
+        "应说明目标没有接手: {stderr}"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(20),
         "接手者退出应被立即发现，而不是等满超时"
@@ -1002,7 +1008,10 @@ fn concurrent_install_rejected_by_lock() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1), "并发安装应被锁拒绝");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("已有安装进行中"), "{stderr}");
+    assert!(
+        stderr.contains("Installation is already in progress"),
+        "{stderr}"
+    );
 }
 
 // ---------------------------------------------------------------------------

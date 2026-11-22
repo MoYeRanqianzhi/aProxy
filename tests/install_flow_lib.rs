@@ -571,7 +571,7 @@ async fn only_the_named_successor_takes_over_a_live_install() {
             .await
             .expect_err("未被指名的续作不得接手");
         assert!(
-            err.message.contains("安装仍在进行"),
+            err.code == "install_in_progress",
             "{handover_from:?}: {err}"
         );
     }

@@ -16,6 +16,7 @@
 //! - 状态文件删除 = 安装完成。任何非终态残留都意味着未完成（恢复机制的
 //!   触发依据）。
 
+use super::{files::FileIssue, flow_issue::FlowIssue};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -383,18 +384,20 @@ pub fn create_new_in(
     if let Some(existing) = load_in(home)
         && !is_stale(&existing, now_secs())
     {
-        return Err(super::InstallFailure::new(
+        return Err(super::InstallFailure::because(
             "install_in_progress",
-            format!(
-                "已有安装进行中（target {}，phase {:?}，pid {}）。\
-             等待其完成，或确认其已中断后等待 {} 秒自动失效",
-                existing.target_version, existing.phase, existing.installer_pid, STALE_AFTER_SECS
-            ),
+            FlowIssue::Concurrent {
+                target: existing.target_version.to_string(),
+                phase: existing.phase,
+                pid: existing.installer_pid,
+                secs: STALE_AFTER_SECS,
+            }
+            .into(),
         ));
     }
     // 走到这里的残留（stale/不存在）即接管：不询问直接续跑（用户调 install
     // 的期望就是装完）
-    write_in(home, &mut state).map_err(|e| format!("install/state.json 写入失败: {e}"))?;
+    write_in(home, &mut state).map_err(|e| FileIssue::WriteState { e: e.to_string() })?;
     Ok(state)
 }
 
@@ -408,7 +411,7 @@ pub fn write_in(home: &Path, state: &mut InstallState) -> std::io::Result<()> {
             .phase_times
             .push((state.phase, crate::watchdog::now_millis()));
     }
-    let json = serde_json::to_string_pretty(state).expect("序列化安装状态失败");
+    let json = serde_json::to_string_pretty(state).expect("installation state must serialize");
     crate::fsx::write_atomic(&state_path_in(home), json.as_bytes()).inspect_err(|_| {
         if record {
             state.phase_times.pop();
@@ -420,12 +423,17 @@ pub fn write_in(home: &Path, state: &mut InstallState) -> std::io::Result<()> {
 
 /// 阶段推进：校验迁移合法性后原子落盘。非法迁移是编程错误（状态机被绕过
 /// 的信号），返回 Err 拒绝落盘。
-pub fn advance_in(home: &Path, state: &mut InstallState, to: InstallPhase) -> Result<(), String> {
+pub fn advance_in(
+    home: &Path,
+    state: &mut InstallState,
+    to: InstallPhase,
+) -> Result<(), super::InstallFailure> {
     if !can_transition(state.phase, to) {
-        return Err(format!(
-            "非法状态迁移 {:?} → {to:?}（状态机被绕过？）",
-            state.phase
-        ));
+        return Err(FlowIssue::Transition {
+            from: state.phase,
+            to,
+        }
+        .into());
     }
     // 结局文件由 done 状态改名而来，不应携带上次失败的私有排版上下文。
     if to == InstallPhase::Done {
@@ -435,7 +443,7 @@ pub fn advance_in(home: &Path, state: &mut InstallState, to: InstallPhase) -> Re
     write_in(home, state).map_err(|e| {
         // 写不成就没有推进；随后记 failed_at 要用上一个成功落盘的相位。
         state.phase = previous;
-        format!("install/state.json 写入失败: {e}")
+        FileIssue::WriteState { e: e.to_string() }.into()
     })
 }
 
@@ -663,7 +671,10 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, "install_in_progress");
-        assert!(err.message.contains("已有安装进行中"), "{err}");
+        assert!(matches!(
+            err.into_cause(),
+            super::super::reason::Cause::Flow(FlowIssue::Concurrent { .. })
+        ));
 
         // 残留接管：updated_at 过期 + pid 已死。直接写文件构造（write_in 会
         // 刷新 updated_at，无法用它伪造过期的锁——这正是它自动刷新的意义）

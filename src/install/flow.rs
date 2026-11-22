@@ -25,7 +25,7 @@
 //!
 //! 无实例快路径：broadcasting 直接跳过（restarting 为空）。
 
-use super::files::FileIssue;
+use super::{files::FileIssue, flow_issue::FlowIssue};
 use aproxy_ipc::i18n::diagnostic::Reason;
 use std::path::Path;
 
@@ -106,7 +106,7 @@ pub async fn check_restartable(home: &Path) -> Result<Vec<u16>, InstallFailure> 
 /// 包管理器管辖目录的实例交给对应渠道升级，或显式 `--adopt` 收编。
 /// 镜像路径不可判（进程刚死/权限）→ 不拦（只拦「确认在管辖外」）。
 /// `--adopt` 自身豁免——它就是管辖外迁移的正规通道。
-pub async fn check_jurisdiction(run_dir: &Path, home: &Path, adopt: bool) -> Result<(), String> {
+pub async fn check_jurisdiction(run_dir: &Path, home: &Path, adopt: bool) -> Result<(), FlowIssue> {
     if adopt {
         return Ok(());
     }
@@ -119,13 +119,11 @@ pub async fn check_jurisdiction(run_dir: &Path, home: &Path, adopt: bool) -> Res
             continue;
         };
         if !super::file_is_within(&image, &bin_dir) {
-            return Err(format!(
-                "实例 {port} 的二进制不在安装管辖目录（{}）下：{}。\n\
-                 该实例由其他渠道安装（包管理器/npm/cargo），请用对应渠道升级，\
-                 或执行 `aproxy install --adopt` 显式收编到标准位置",
-                bin_dir.display(),
-                image.display()
-            ));
+            return Err(FlowIssue::Jurisdiction {
+                port: port.to_string(),
+                dir: bin_dir.display().to_string(),
+                image: image.display().to_string(),
+            });
         }
     }
     Ok(())
@@ -324,11 +322,11 @@ async fn drive_with_skill(
         let phase = match joined {
             Ok(Ok(Ok(_))) => super::state::SkillPhase::Done,
             Ok(Ok(Err(e))) => {
-                tracing::warn!(error=%e,"skill 未更新，不影响二进制安装；请执行 aproxy skill install 重试");
+                tracing::warn!(error=%e,"Skills were not updated. Binary installation is unaffected. Run aproxy skill install to retry.");
                 super::state::SkillPhase::Failed
             }
             _ => {
-                tracing::warn!("skill 更新未完成，请执行 aproxy skill install 重试");
+                tracing::warn!("Skill update did not finish. Run aproxy skill install to retry.");
                 return result;
             }
         };
@@ -468,7 +466,7 @@ async fn lock_install(home: &Path) -> Result<super::InstallLock, InstallFailure>
     let home = home.to_path_buf();
     tokio::task::spawn_blocking(move || super::lock_for_install(&home, BIN_LOCK_WAIT))
         .await
-        .map_err(|e| format!("等安装锁的任务异常结束: {e}"))?
+        .map_err(|e| FlowIssue::LockTask { e: e.to_string() })?
 }
 
 /// 被拉起的接手者进程。unix 留着 Child：它是本进程的子进程，没接手就退出时会
@@ -567,10 +565,12 @@ impl Successor {
 /// 等它退出，它就不可能在本进程放弃之后才接手）→ Err，状态文件仍归本进程。
 /// 调用方的宣告此间照常 beat：没被指名的续作（CLI 入口、看护者拉起的）据此
 /// 判定安装者健在，不来争抢。
-async fn hand_over(home: &Path, exe: &Path) -> Result<FlowExit, String> {
+async fn hand_over(home: &Path, exe: &Path) -> Result<FlowExit, FlowIssue> {
     let me = std::process::id();
-    let mut successor =
-        Successor::spawn(exe).map_err(|e| format!("无法启动 {}: {e}", exe.display()))?;
+    let mut successor = Successor::spawn(exe).map_err(|e| FlowIssue::Start {
+        path: exe.display().to_string(),
+        e: e.to_string(),
+    })?;
     let taken = || match super::state::load_in(home) {
         Some(s) => s.installer_pid != me,
         // 状态文件没了 = 接手者已经做完（done 清场）；读不出来但文件还在不算
@@ -582,15 +582,17 @@ async fn hand_over(home: &Path, exe: &Path) -> Result<FlowExit, String> {
             break Ok(FlowExit::HandedOver);
         }
         let gave_up = if successor.exited() {
-            format!("{}（pid {}）没有接手就退出了", exe.display(), successor.pid)
+            FlowIssue::GaveUp {
+                path: exe.display().to_string(),
+                pid: successor.pid,
+            }
         } else if std::time::Instant::now() >= deadline {
             successor.kill().await;
-            format!(
-                "{}（pid {}）{} 秒内没有接手，已终止",
-                exe.display(),
-                successor.pid,
-                TAKEOVER_TIMEOUT.as_secs()
-            )
+            FlowIssue::TimedOut {
+                path: exe.display().to_string(),
+                pid: successor.pid,
+                secs: TAKEOVER_TIMEOUT.as_secs(),
+            }
         } else {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             continue;
@@ -670,7 +672,7 @@ async fn run_tail(
         state.record_restart(port, &result);
         match result {
             Ok(pid) => {
-                tracing::info!(port = %port, new_pid = pid, "实例已滚动到新版本");
+                tracing::info!(port = %port, new_pid = pid, "Instance restarted on the target version");
             }
             Err(e) => return Err(e.failure(port, format!("实例 {port} 滚动重启失败: {e}"))),
         }
@@ -698,7 +700,7 @@ async fn run_tail(
             break;
         }
         if round == 1 {
-            return Err(format!("终验未通过（版本/阶段不符，已补 restart 一轮）: {bad:?}").into());
+            return Err(FlowIssue::Verify { bad }.into());
         }
         for port in &bad {
             let fallback = rollback_binary(state);
@@ -765,7 +767,7 @@ async fn run_tail(
             break;
         }
         if attempt == 5 {
-            tracing::warn!(old = ?state.old_path, staging = %staging.display(), "旧二进制或 staging 删除失败（仍被占用？），保留待下次安装清理");
+            tracing::warn!(old = ?state.old_path, staging = %staging.display(), "Could not remove the old binary or staging directory; leaving it for the next installation");
         } else {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
@@ -878,7 +880,7 @@ pub async fn continue_install(
         // 起来）。没有什么可重试的，收尾清场——否则这份现场会让看护者每天拉起
         // 一次注定被拒的续作，`install latest` 又报「已是最新」
         if fleet_already_on_target(home, run_dir, &state).await {
-            tracing::info!(target = %state.target_version, "失败现场的实例均已在目标版本上运行，收尾清场");
+            tracing::info!(target = %state.target_version, "All instances in the failed installation are running the target version; cleaning up");
             super::state::remove_in(home);
             return Ok(FlowExit::Completed);
         }
@@ -907,15 +909,16 @@ pub async fn continue_install(
     // 指名的接手者抢同一个安装。
     let named = handover_from.is_some_and(|pid| pid == state.installer_pid);
     if !named && !super::state::is_takeable(home, run_dir, &state, crate::watchdog::now_secs()) {
-        return Err(InstallFailure::new(
+        return Err(InstallFailure::because(
             "install_in_progress",
-            format!(
-                "安装仍在进行（phase {:?}，pid {}），不重复接管",
-                state.phase, state.installer_pid
-            ),
+            FlowIssue::InProgress {
+                phase: state.phase,
+                pid: state.installer_pid,
+            }
+            .into(),
         ));
     }
-    tracing::info!(phase = ?state.phase, target = %state.target_version, named, "install 续作接管");
+    tracing::info!(phase = ?state.phase, target = %state.target_version, named, "Resuming interrupted installation");
     state.installer_pid = std::process::id();
     state.installer_version = Some(env!("CARGO_PKG_VERSION").into());
     write_in(home, &mut state).map_err(|e| FileIssue::WriteState { e: e.to_string() })?;
@@ -946,9 +949,7 @@ pub async fn continue_install(
                     // --from 源路径已记录；网络渠道续作因 from_path 缺失而请用户重跑）
                     InstallPhase::Marking | InstallPhase::Downloading | InstallPhase::Failed => {
                         let Some(from) = state.from_path.clone() else {
-                            return Err("续作缺少 --from 源记录（状态文件损坏？），请重新执行安装"
-                                .to_string()
-                                .into());
+                            return Err(FlowIssue::NoFrom.into());
                         };
                         run_forward(home, run_dir, &mut state, Path::new(&from), !named).await
                     }
@@ -963,9 +964,7 @@ pub async fn continue_install(
                     | InstallPhase::Acked
                     | InstallPhase::Swapping => {
                         let Some(staged_path) = state.staged_path.clone() else {
-                            return Err("续作缺少 staging 记录（状态文件损坏？），请重新执行安装"
-                                .to_string()
-                                .into());
+                            return Err(FlowIssue::NoStage.into());
                         };
                         run_forward_from_staged(
                             home,
@@ -985,7 +984,9 @@ pub async fn continue_install(
                             .await
                             .map(|_| FlowExit::Completed)
                     }
-                    InstallPhase::Done | InstallPhase::Aborted => unreachable!("终态已在入口处理"),
+                    InstallPhase::Done | InstallPhase::Aborted => {
+                        unreachable!("terminal installation phases were handled at entry")
+                    }
                 }
             }
             .await;
@@ -1024,9 +1025,7 @@ async fn run_forward_from_staged(
     if !staged_path.is_file() {
         // staging 也没了（极端中的极端）→ 从 --from 源重新备料兜底
         let Some(from) = state.from_path.clone() else {
-            return Err("staging 与 --from 源均已缺失，请重新执行安装"
-                .to_string()
-                .into());
+            return Err(FlowIssue::BothMissing.into());
         };
         return Box::pin(run_forward(
             home,
@@ -1045,7 +1044,10 @@ async fn run_forward_from_staged(
         && successor_sees_same_home(home, run_dir)
     {
         return hand_over(home, staged_path).await.map_err(|e| {
-            format!("目标版本没有接手安装（{e}）；实例与 bin 里的二进制都未改动").into()
+            FlowIssue::Takeover {
+                e: Box::new(e.into()),
+            }
+            .into()
         });
     }
 
@@ -1079,11 +1081,7 @@ async fn run_forward_from_staged(
         }
         if let Err(e) = super::broadcast::broadcast_prepare_swap(home, run_dir, &live, state).await
         {
-            let message = format!(
-                "PrepareSwap 广播终失败（{e}）。\n\
-                 问题实例有隐患，处置指引：将其关闭后重试安装（不强杀——避免服务中断）"
-            );
-            return Err(e.with_message(message));
+            return Err(e.context(|e| FlowIssue::Prepare { e: Box::new(e) }));
         }
         if state.phase < InstallPhase::Acked {
             super::state::advance_in(home, state, InstallPhase::Acked)?;
@@ -1101,10 +1099,7 @@ async fn run_forward_from_staged(
     if !fresh.is_empty() {
         super::broadcast::broadcast_prepare_swap(home, run_dir, &fresh, state)
             .await
-            .map_err(|e| {
-                let message = format!("广播后新启实例 ACK 失败: {e}");
-                e.with_message(message)
-            })?;
+            .map_err(|e| e.context(|e| FlowIssue::Fresh { e: Box::new(e) }))?;
     }
     super::state::advance_in(home, state, InstallPhase::Swapping)?;
     // 改 bin/ 期间持有安装锁（永久兼容契约 C4）：强制安装先结束全部安装者再拿这把锁，
@@ -1133,7 +1128,7 @@ async fn run_forward_from_staged(
         match hand_over(home, &swap::bin_path_in(home)).await {
             Ok(exit) => return Ok(exit),
             Err(e) => {
-                tracing::warn!(error = %e, "交换后交给 bin 里的二进制失败，本进程继续完成剩余阶段")
+                tracing::warn!(error = %e, "Post-swap handoff to the binary in bin failed; finishing in this process")
             }
         }
     }
@@ -1153,7 +1148,10 @@ async fn stop_old_watchdog(home: &Path) {
             .await
             .unwrap_or(0);
     if stopped > 0 {
-        tracing::info!(stopped, "已停掉旧看护者（换血：它的重拉会用旧镜像）");
+        tracing::info!(
+            stopped,
+            "Stopped the old watchdog to prevent respawns from its old image"
+        );
     }
 }
 

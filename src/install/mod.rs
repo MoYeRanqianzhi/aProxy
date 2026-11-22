@@ -16,7 +16,11 @@ pub mod download;
 #[path = "../i18n/install_files.rs"]
 pub mod files;
 pub mod flow;
+/// 普通交接、锁竞争与滚动安装的私有诊断参数。
+#[path = "../i18n/install_flow.rs"]
+pub mod flow_issue;
 use files::FileIssue;
+use flow_issue::FlowIssue;
 pub mod force;
 pub mod restart;
 pub mod skills;
@@ -81,13 +85,13 @@ impl InstallFailure {
     }
 
     /// 给操作阶段加一层说明，保持原有的码、详情及内层的跨进程排版参数。
-    pub(crate) fn context(mut self, wrap: impl FnOnce(Cause) -> FileIssue) -> Self {
+    pub(crate) fn context<T: Into<Cause>>(mut self, wrap: impl FnOnce(Cause) -> T) -> Self {
         let inner = self
             .cause
             .take()
             .map(|v| *v)
             .unwrap_or_else(|| Cause::Evidence(std::mem::take(&mut self.message)));
-        let cause = Cause::Files(wrap(inner));
+        let cause = wrap(inner).into();
         self.message = cause.render(Lang::En);
         self.cause = Some(Box::new(cause));
         self
@@ -276,7 +280,7 @@ impl Drop for InstallLock {
 /// 一个同名文件再锁上，就会有两个持有者。unix 没有对应的办法，靠所有版本都不删它
 /// （强制安装清空 `<home>/install/` 时也跳过它）。
 pub fn lock_install_in(home: &Path, wait: std::time::Duration) -> Result<InstallLock, String> {
-    lock_for_install(home, wait).map_err(|e| e.message)
+    lock_for_install(home, wait).map_err(|e| e.render(Lang::Zh))
 }
 
 /// 普通安装要区分另一进程持锁与系统调用失败；两种安装仍竞争同一个系统锁。
@@ -286,18 +290,26 @@ fn lock_for_install(home: &Path, wait: std::time::Duration) -> Result<InstallLoc
     let deadline = std::time::Instant::now() + wait;
     loop {
         let failure = match crate::fsx::create_dir_all(&dir).and_then(|()| open_lock_file(&path)) {
-            Err(e) => format!("安装锁 {} 打开失败: {e}", path.display()).into(),
+            Err(e) => FlowIssue::LockOpen {
+                path: path.display().to_string(),
+                e: e.to_string(),
+            }
+            .into(),
             Ok(file) => match try_lock_exclusive(&file) {
                 Ok(true) => return Ok(InstallLock { file }),
-                Ok(false) => InstallFailure::new(
+                Ok(false) => InstallFailure::because(
                     "install_in_progress",
-                    format!(
-                        "安装锁 {} 被别的进程持有，{} 秒内没有等到（另一个安装正在修改 bin/？）",
-                        path.display(),
-                        wait.as_secs()
-                    ),
+                    FlowIssue::Locked {
+                        path: path.display().to_string(),
+                        secs: wait.as_secs(),
+                    }
+                    .into(),
                 ),
-                Err(e) => format!("安装锁 {} 加锁失败: {e}", path.display()).into(),
+                Err(e) => FlowIssue::LockFailed {
+                    path: path.display().to_string(),
+                    e: e.to_string(),
+                }
+                .into(),
             },
         };
         if std::time::Instant::now() >= deadline {

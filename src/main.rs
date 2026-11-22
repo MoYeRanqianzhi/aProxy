@@ -295,23 +295,23 @@ async fn run(cli: Cli) -> u8 {
             threshold,
             force,
             json,
-        }) => commands::stop::handle_stop_cmd(target, threshold, force, json).await,
+        }) => return commands::stop::handle_stop_cmd(target, threshold, force, json).await,
         Some(Commands::Restart {
             target,
             threshold,
             force,
             json,
-        }) => commands::restart::handle_restart_cmd(target, threshold, force, json).await,
+        }) => return commands::restart::handle_restart_cmd(target, threshold, force, json).await,
         Some(Commands::Logs {
             target,
             lines,
             follow,
         }) => commands::logs::handle_logs_cmd(target, lines, follow).await,
         Some(Commands::Restore { json }) => {
-            commands::restore::handle_restore_cmd(&home, json).await
+            return commands::restore::handle_restore_cmd(&home, json).await;
         }
         Some(Commands::RestoreAtLogin { .. }) => {
-            commands::restore::handle_restore_cmd(&home, false).await
+            return commands::restore::handle_restore_cmd(&home, false).await;
         }
         Some(Commands::Alias { cmd }) => commands::alias::handle_alias_cmd(cmd),
         Some(Commands::Doctor { json }) => commands::doctor::handle_doctor_cmd(json).await,

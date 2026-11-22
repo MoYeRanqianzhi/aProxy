@@ -79,16 +79,15 @@ pub(crate) fn require_idle_for_threshold(
     cmd: &str,
     target: Option<&str>,
     threshold: Option<u64>,
-    json: bool,
-) {
+) -> Result<(), Failure> {
     if threshold.is_some() && !target.is_some_and(|t| t.eq_ignore_ascii_case("idle")) {
-        Failure::rendered(
+        return Err(Failure::rendered(
             "usage",
             |lang| text::idle_only(lang, cmd),
-            json!({"reason": "idle_threshold_without_idle"}),
-        )
-        .exit(json)
+            json!({"reason":"idle_threshold_without_idle"}),
+        ));
     }
+    Ok(())
 }
 
 /// `aproxy stop` 入口。
@@ -101,14 +100,16 @@ pub(crate) async fn handle_stop_cmd(
     threshold: Option<u64>,
     force: bool,
     json: bool,
-) {
-    require_idle_for_threshold("stop", target.as_deref(), threshold, json);
+) -> u8 {
+    if let Err(f) = require_idle_for_threshold("stop", target.as_deref(), threshold) {
+        return f.report(json);
+    }
     let mode = StopMode::from_force(force);
     let mut results = Results::new(target.as_deref());
     let selection = match target::select(target.as_deref(), threshold, force).await {
         Ok(selection) => selection,
-        Err(SelectError::UnknownTarget { target }) => unknown_target(&target).exit(json),
-        Err(SelectError::Ambiguous { ports }) => ambiguous("stop", &ports).exit(json),
+        Err(SelectError::UnknownTarget { target }) => return unknown_target(&target).report(json),
+        Err(SelectError::Ambiguous { ports }) => return ambiguous("stop", &ports).report(json),
         Err(SelectError::NothingOnPort { port }) => {
             if forget_stopped_port(&port).await {
                 say(json, text::forgotten(current(), &port));
@@ -116,7 +117,7 @@ pub(crate) async fn handle_stop_cmd(
                 say(json, text::no_port(current(), &port));
             }
             results.ok(&port, "already_stopped", None);
-            results.finish(json)
+            return results.finish(json);
         }
         Err(SelectError::NotRunning {
             target,
@@ -147,13 +148,13 @@ pub(crate) async fn handle_stop_cmd(
                     results.ok(port, "already_stopped", None);
                 }
             }
-            results.finish(json)
+            return results.finish(json);
         }
         Err(SelectError::Unresponsive { target, port, pid }) => {
             let failure = unresponsive(target.as_deref(), &port, pid);
             eprintln!("{}", failure.terminal());
             results.failed(&port, "failed", &failure);
-            results.finish(json)
+            return results.finish(json);
         }
     };
     fail_unresponsive_skipped(&selection, &mut results);

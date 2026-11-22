@@ -38,29 +38,34 @@ pub(crate) async fn handle_restart_cmd(
     threshold: Option<u64>,
     force: bool,
     json: bool,
-) {
-    require_idle_for_threshold("restart", target.as_deref(), threshold, json);
+) -> u8 {
+    if let Err(f) = require_idle_for_threshold("restart", target.as_deref(), threshold) {
+        return f.report(json);
+    }
     let mode = StopMode::from_force(force);
     let mut results = Results::new(target.as_deref());
     let selection = match target::select(target.as_deref(), threshold, force).await {
         Ok(selection) => selection,
-        Err(SelectError::UnknownTarget { target }) => unknown_target(&target).exit(json),
-        Err(SelectError::Ambiguous { ports }) => ambiguous("restart", &ports).exit(json),
+        Err(SelectError::UnknownTarget { target }) => return unknown_target(&target).report(json),
+        Err(SelectError::Ambiguous { ports }) => return ambiguous("restart", &ports).report(json),
         Err(SelectError::NotRunning {
             target,
             config_path,
-        }) => not_running(Some(&target), |lang| {
-            stop_text::no_alias(lang, &target, config_path.display())
-        })
-        .exit(json),
+        }) => {
+            return not_running(Some(&target), |lang| {
+                stop_text::no_alias(lang, &target, config_path.display())
+            })
+            .report(json);
+        }
         Err(SelectError::NothingOnPort { port }) => {
-            not_running(Some(&port), |lang| restart_text::no_port(lang, &port)).exit(json)
+            return not_running(Some(&port), |lang| restart_text::no_port(lang, &port))
+                .report(json);
         }
         Err(SelectError::Unresponsive { target, port, pid }) => {
             let failure = unresponsive(target.as_deref(), &port, pid);
             eprintln!("{}", failure.terminal());
             results.failed(&port, "failed", &failure);
-            results.finish(json)
+            return results.finish(json);
         }
     };
     fail_unresponsive_skipped(&selection, &mut results);
@@ -69,7 +74,8 @@ pub(crate) async fn handle_restart_cmd(
         Some(Empty::NoneRunning)
             if target.is_none() && selection.unresponsive_skipped.is_empty() =>
         {
-            not_running(None, |lang| super::status::text::none(lang).to_owned()).exit(json)
+            return not_running(None, |lang| super::status::text::none(lang).to_owned())
+                .report(json);
         }
         // all：没有运行中的实例就是没有要重启的，无事可做
         Some(Empty::NoneRunning) if selection.unresponsive_skipped.is_empty() => {

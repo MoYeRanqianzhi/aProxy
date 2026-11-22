@@ -317,8 +317,8 @@ impl Results {
         }
     }
 
-    /// 结束命令：`json` 为真时把文档写到 stdout，然后以 [`Self::exit_code`] 退出。
-    pub(crate) fn finish(self, json: bool) -> ! {
+    /// 结束命令：`json` 为真时把文档写到 stdout，返回 [`Self::exit_code`]，由入口回收运行时后再退出。
+    pub(crate) fn finish(self, json: bool) -> u8 {
         let exit = self.exit_code();
         if json {
             print_doc(json!({
@@ -326,7 +326,7 @@ impl Results {
                 "summary": {"ok": self.ok, "failed": self.failed.len()},
             }));
         }
-        crate::util::exit(exit as i32)
+        exit
     }
 }
 
@@ -447,6 +447,17 @@ pub(crate) fn require_cfg_path(cfg_path: Result<PathBuf, Failure>, json: bool) -
 mod tests {
     use super::*;
     use clap::Parser as _;
+
+    // 参数预检不读 home。若处理函数直接退出进程，运行时的所有者连第二个调用都到不了。
+    #[tokio::test]
+    async fn lifecycle_results_return_to_the_runtime_owner() {
+        assert_eq!(stop::handle_stop_cmd(None, Some(1), false, false).await, 2);
+        assert_eq!(
+            restart::handle_restart_cmd(None, Some(1), false, false).await,
+            2
+        );
+        assert_eq!(Results::new(None).finish(false), 0);
+    }
 
     #[test]
     fn failure_formats_only_for_existing_readers() {

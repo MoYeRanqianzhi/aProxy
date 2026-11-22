@@ -311,13 +311,16 @@ pub(crate) fn port_value(port: &str) -> Value {
 
 /// 实例没能拉起来：时限内没就绪是 `ready_timeout`，其余（拉不起进程、进程起来就退出）是
 /// `start_failed`，`details` 里带 startup.log 这次新增的几行。`message` 是给人看的说明。
-pub(crate) fn spawn_failure(error: &aproxy::spawn::SpawnError, message: String) -> Failure {
+pub(crate) fn spawn_failure(
+    error: &aproxy::spawn::SpawnError,
+    message: impl Fn(Lang) -> String,
+) -> Failure {
     use aproxy::spawn::SpawnError;
     match error {
         SpawnError::Exited {
             format: Some(e), ..
         } => Failure::handshake(e),
-        SpawnError::TimedOut { .. } => Failure::new(
+        SpawnError::TimedOut { .. } => Failure::rendered(
             "ready_timeout",
             message,
             json!({"timeout_ms": aproxy::spawn::READY_TIMEOUT.as_millis() as u64}),
@@ -327,7 +330,7 @@ pub(crate) fn spawn_failure(error: &aproxy::spawn::SpawnError, message: String) 
                 .startup_log()
                 .map(|log| log.lines.clone())
                 .unwrap_or_default();
-            Failure::new("start_failed", message, json!({"startup_log": lines}))
+            Failure::rendered("start_failed", message, json!({"startup_log": lines}))
         }
     }
 }
@@ -335,9 +338,10 @@ pub(crate) fn spawn_failure(error: &aproxy::spawn::SpawnError, message: String) 
 /// 监听地址绑定不了：被占用是 `port_in_use`；无权限、地址不可用是这个地址本来就起不来，
 /// 归 `start_failed`。
 pub(crate) fn bind_failure(listen_addr: &str, error: &std::io::Error) -> Failure {
-    let message = crate::server::bind_error_message(listen_addr, error);
+    let reason = aproxy::spawn::startup::LaunchReason::from_bind(listen_addr, error);
+    let message = |lang| reason.render(lang);
     if error.kind() == std::io::ErrorKind::AddrInUse {
-        Failure::new(
+        Failure::rendered(
             "port_in_use",
             message,
             json!({
@@ -346,7 +350,7 @@ pub(crate) fn bind_failure(listen_addr: &str, error: &std::io::Error) -> Failure
             }),
         )
     } else {
-        Failure::new("start_failed", message, json!({"startup_log": []}))
+        Failure::rendered("start_failed", message, json!({"startup_log": []}))
     }
 }
 

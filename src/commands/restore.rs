@@ -1,5 +1,7 @@
 //! `aproxy restore`：一键恢复先前非正常退出的实例。
 
+#[path = "../i18n/restore.rs"]
+mod restore_text;
 use aproxy::ops::restore::{Restore, restore_entry_in};
 
 use super::{Results, say};
@@ -58,15 +60,10 @@ pub(crate) async fn handle_restore_cmd(home: &std::path::Path, json: bool) {
                 results.ok(&port, "restored", None);
             }
             Restore::Failed(e) => {
-                let failure = super::spawn_failure(
-                    &e,
-                    format!(
-                        "端口 {} 恢复失败：{e}{}",
-                        entry.port,
-                        e.startup_log().map(|l| l.excerpt()).unwrap_or_default()
-                    ),
-                );
-                eprintln!("{}", failure.message);
+                let failure = super::spawn_failure(&e, |lang| {
+                    restore_text::failed(lang, &entry.port, &e.render(lang), &e.excerpt(lang))
+                });
+                eprintln!("{}", failure.terminal());
                 results.failed(&entry.port, "failed", &failure);
             }
         }

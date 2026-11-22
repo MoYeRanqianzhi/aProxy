@@ -6,6 +6,8 @@
 //! 逐个重启、把结果说给用户。`restart all` 逐实例处理，失败的跳过、其余照常重启，最后汇总：
 //! 结局是 `restarted`、`failed` 之一，有成有败时退出码 5。
 
+#[path = "../i18n/restart.rs"]
+mod restart_text;
 use aproxy::daemon::{self, InstanceRecord};
 use aproxy::ops::restart::{PrecheckError, RestartFailure, restart_instance};
 use aproxy::ops::stop::{StopFailure, StopMode};
@@ -60,7 +62,7 @@ pub(crate) async fn handle_restart_cmd(
         .exit(json),
         Err(SelectError::Unresponsive { target, port, pid }) => {
             let failure = unresponsive(target.as_deref(), &port, pid);
-            eprintln!("{}", failure.message);
+            eprintln!("{}", failure.terminal());
             results.failed(&port, "failed", &failure);
             results.finish(json)
         }
@@ -115,7 +117,7 @@ pub(crate) async fn handle_restart_cmd(
                     RestartFailure::Start { .. } => "旧实例已停止、新实例未就绪，服务已中断",
                 };
                 let failure = restart_failure(info, &port, failure, json);
-                eprintln!("{}", failure.message);
+                eprintln!("{}", failure.terminal());
                 results.failed(&port, "failed", &failure);
                 failed.push((port, state));
             }
@@ -179,13 +181,14 @@ fn restart_failure(
         } => {
             say(json, stopped_line(info, stopped));
             // 期望状态记录还在：看护者会继续按它重拉，用户排除原因后也可以自己执行 restore
-            let mut message = format!(
-                "端口 {port} 重启失败（旧实例已停止，该端口服务已中断）：{error}{}\n修正上述问题后执行 aproxy restore 恢复服务（看护者开着的话也会自动重试）。",
-                error.startup_log().map(|l| l.excerpt()).unwrap_or_default(),
-            );
-            if let Some(path) = config_path {
-                message.push_str(&format!("\n  配置: {}", path.display()));
-            }
+            let message = |lang| {
+                let mut message =
+                    restart_text::failed(lang, port, &error.render(lang), &error.excerpt(lang));
+                if let Some(path) = &config_path {
+                    message.push_str(&restart_text::config(lang, path.display()));
+                }
+                message
+            };
             super::spawn_failure(&error, message)
         }
     }

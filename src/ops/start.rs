@@ -46,6 +46,28 @@ pub enum ConfigError {
 }
 
 impl ConfigError {
+    /// 私有交接槽携带配置问题的具体原因；终端和写入日志的一方都在显示时才选择语言。
+    pub fn reason(&self) -> crate::spawn::startup::LaunchReason {
+        use crate::spawn::startup::LaunchReason;
+        match self {
+            Self::Missing(path) => LaunchReason::Missing {
+                path: path.display().to_string(),
+            },
+            Self::Read { file, error } => LaunchReason::Read {
+                path: file.display().to_string(),
+                error: error.to_string(),
+            },
+            Self::Settings { file, diagnostics } => LaunchReason::Settings {
+                path: file.display().to_string(),
+                issues: diagnostics.iter().map(Into::into).collect(),
+            },
+            Self::Invalid { file, diagnostics } => LaunchReason::Invalid {
+                path: file.as_ref().map(|p| p.display().to_string()),
+                issues: diagnostics.iter().map(Into::into).collect(),
+            },
+        }
+    }
+
     /// error 级的诊断；文件不在、读不出来时没有
     pub fn diagnostics(&self) -> &[aproxy_ipc::diag::Diagnostic] {
         match self {
@@ -57,45 +79,7 @@ impl ConfigError {
 
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Missing(path) => write!(f, "配置文件不存在: {}", path.display()),
-            Self::Settings { file, diagnostics } => {
-                write!(f, "settings.json 有错误，实例没有启动:")?;
-                for d in diagnostics {
-                    write!(
-                        f,
-                        "\n  {}",
-                        render_diagnostic(d, aproxy_ipc::i18n::Lang::En)
-                    )?;
-                }
-                write!(
-                    f,
-                    "\n\n用 aproxy settings show 查看，aproxy settings unset <键> 删掉出问题的键；也可以删除 {} 回到内置默认",
-                    file.display()
-                )
-            }
-            Self::Read { file, error } => {
-                write!(f, "读取配置文件失败: {error}\n文件: {}", file.display())
-            }
-            Self::Invalid { file, diagnostics } => {
-                write!(f, "配置错误:")?;
-                for d in diagnostics {
-                    write!(
-                        f,
-                        "\n  {}",
-                        render_diagnostic(d, aproxy_ipc::i18n::Lang::En)
-                    )?;
-                }
-                write!(
-                    f,
-                    "\n\n请修改后重试。上游地址可以这样设置:\n  aproxy config set base_url https://api.anthropic.com"
-                )?;
-                if let Some(path) = file {
-                    write!(f, "\n  或手动编辑 {}", path.display())?;
-                }
-                Ok(())
-            }
-        }
+        f.write_str(&self.reason().render(aproxy_ipc::i18n::Lang::En))
     }
 }
 

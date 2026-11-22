@@ -503,7 +503,7 @@ fn restart_early_exit_shows_startup_log_excerpt() {
     let stderr = text(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "新实例起不来应退出 1: {stderr}");
     assert!(
-        stderr.contains("启动后立即退出"),
+        stderr.contains("exited immediately after startup"),
         "应识别新实例提前退出: {stderr}"
     );
     assert!(

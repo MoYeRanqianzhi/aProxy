@@ -102,6 +102,7 @@ unknown_arg invalid_state idle_condition not_found busy""".split())
                 known = path.relative_to(ROOT).as_posix() == "src/i18n/help.rs" and name in english_only
                 diagnostic = path.relative_to(ROOT).as_posix() == "aproxy-ipc/src/i18n/diagnostic.rs" and name in diagnostic_drafts
                 diagnostic |= path.relative_to(ROOT).as_posix() == "aproxy-ipc/src/i18n/ipc.rs" and name in ipc_drafts
+                diagnostic |= path.relative_to(ROOT).as_posix() == "src/i18n/startup.rs" and name == "spec_read"
                 unexpected += not (known or diagnostic)
                 reason = "no previous Chinese help" if known else "English-only diagnostic" if diagnostic else "REVIEW"
                 print(f"{path.relative_to(ROOT)}:{line} {name}: {value!r} ({reason})")

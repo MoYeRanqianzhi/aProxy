@@ -33,6 +33,14 @@ async fn spawn_from_spec_reports_an_early_exit_at_once_and_waits_for_a_healthy_i
         .await
         .expect_err("配置文件不存在，实例应起不来");
     let elapsed = started.elapsed();
+    assert!(
+        err.excerpt(aproxy_ipc::i18n::Lang::Zh)
+            .contains("配置文件不存在:")
+    );
+    assert!(
+        err.excerpt(aproxy_ipc::i18n::Lang::En)
+            .contains("Configuration file not found:")
+    );
     let SpawnError::Exited { startup_log, .. } = &err else {
         panic!("应识别为启动即退出，实际: {err:?}");
     };

@@ -12,7 +12,9 @@ use tracing_subscriber::EnvFilter;
 use aproxy::config::{self, Config};
 use aproxy::daemon;
 use aproxy::settings;
+use aproxy::spawn::startup::{LaunchReason, LaunchReport};
 use aproxy::watchdog;
+use aproxy_ipc::i18n::{Lang, current};
 
 use crate::util::chrono_like_timestamp;
 
@@ -36,8 +38,8 @@ pub(crate) fn resolved_daemon_log() -> Option<PathBuf> {
 
 /// 实例启动失败：绑定错误已经在本地记录，握手错误还要按协议交还父进程。
 pub(crate) enum ServeFailure {
-    /// 监听或 IPC 创建失败，诊断已经写出。
-    Reported,
+    /// 监听或 IPC 创建失败；只在命令入口按读者语言报告一次。
+    Launch(LaunchReason),
     /// 工作进程握手失败，仍须传回静态/暂时失败的类别。
     Format(aproxy::transform::StartupError),
 }
@@ -88,8 +90,10 @@ pub(crate) async fn serve_forever(
             // 守护子进程无控制台，eprintln 会被 Stdio::null 吞掉——失败原因必须
             // 走 report_config_error 落盘（startup.log），否则父进程超时提示指向
             // 的日志里查不到任何线索
-            report_config_error(&bind_error_message(&listen_addr, &e), daemon_child);
-            return Err(ServeFailure::Reported);
+            return Err(ServeFailure::Launch(LaunchReason::from_bind(
+                &listen_addr,
+                &e,
+            )));
         }
     };
     let actual_addr = listener.local_addr().expect("获取监听地址失败").to_string();
@@ -120,14 +124,11 @@ pub(crate) async fn serve_forever(
     let ipc_endpoint = match daemon::bind_ipc(&port).await {
         Ok(endpoint) => endpoint,
         Err(e) => {
-            report_config_error(
-                &format!(
-                    "控制通道 {} 创建失败：{e}。同一 APROXY_HOME 里可能已有使用端口 {port} 的 aProxy 实例（监听地址不同）；unix 上 run 目录路径过长也会导致失败",
-                    daemon::endpoint_for(&port)
-                ),
-                daemon_child,
-            );
-            return Err(ServeFailure::Reported);
+            return Err(ServeFailure::Launch(LaunchReason::Control {
+                endpoint: daemon::endpoint_for(&port),
+                port,
+                error: e.to_string(),
+            }));
         }
     };
 
@@ -434,19 +435,6 @@ pub(crate) async fn serve_forever(
     Ok(())
 }
 
-/// bind 失败分类：「地址被占用」/「权限不足或被系统保留」（Windows 上常见于
-/// Hyper-V/WinNAT 的排除端口区间——netstat 查不到监听者，按占用排查会走弯路）/
-/// 其他原因原样给出 io 错误。避免把非占用失败一律误诊为「被其他程序占用」。
-pub(crate) fn bind_error_message(addr: &str, e: &std::io::Error) -> String {
-    match e.kind() {
-        std::io::ErrorKind::AddrInUse => format!("端口 {addr} 被其他程序占用，无法启动"),
-        std::io::ErrorKind::PermissionDenied => format!(
-            "端口 {addr} 无法绑定：无权限或端口被系统保留（如 Hyper-V/WinNAT 排除区间，可用 netsh interface ipv4 show excludedportrange protocol=tcp 查看）"
-        ),
-        _ => format!("无法监听 {addr}: {e}"),
-    }
-}
-
 /// 优雅停止信号：控制台 Ctrl+C/SIGTERM，或 `aproxy stop` 经 IPC 触发，任一即到。
 ///
 /// 注意 watch 通道关闭（Err）不是停止信号：唯一的 Sender 在 IPC serve 任务里，
@@ -577,7 +565,8 @@ pub(crate) fn init_foreground_logging() {
 /// startup.log——就绪等待超时的提示虽指向端口日志，但配置错误发生在
 /// 日志初始化之前，只有这里能留下线索。logs 目录不可写时退回 config 目录，
 /// 尽量留下线索，两级都失败才放弃。
-pub(crate) fn report_config_error(msg: &str, daemon_child: bool) {
+pub(crate) fn report_config_error(msg: &str, daemon_child: bool) -> String {
+    let stamp = chrono_like_timestamp();
     if daemon_child {
         let _ = aproxy::fsx::create_dir_all(daemon::logs_dir());
         let open = |path: &std::path::Path| {
@@ -593,10 +582,21 @@ pub(crate) fn report_config_error(msg: &str, daemon_child: bool) {
         });
         if let Some(f) = file.as_mut() {
             use std::io::Write;
-            let _ = writeln!(f, "[{}] {msg}", chrono_like_timestamp());
+            let _ = writeln!(f, "[{stamp}] {msg}");
         }
     }
     eprintln!("{msg}");
+    stamp
+}
+
+/// 未登记实例的失败只发布到启动者自己的槽。前台错误不写盘，后台诊断不读进程语言。
+pub(crate) fn report_launch(reason: LaunchReason, spec_slot: Option<&std::path::Path>) {
+    let Some(slot) = spec_slot else {
+        eprintln!("{}", reason.render(current()));
+        return;
+    };
+    let stamp = report_config_error(&reason.render(Lang::En), true);
+    LaunchReport::new(reason, stamp).publish(&daemon::run_dir(), slot);
 }
 
 #[cfg(test)]

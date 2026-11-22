@@ -4716,7 +4716,7 @@ fn cli_config_flag_rejects_missing_file_on_start() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("不存在"),
+        stderr.contains("Configuration file not found:"),
         "stderr 应提示文件不存在，实际: {stderr}"
     );
 }
@@ -4992,7 +4992,7 @@ fn stop_from_another_home_does_not_reach_this_instance() {
         String::from_utf8_lossy(&start_b.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&start_b.stderr).contains("被其他程序占用"),
+        String::from_utf8_lossy(&start_b.stderr).contains("Another program is using"),
         "{}",
         String::from_utf8_lossy(&start_b.stderr)
     );
@@ -5052,7 +5052,7 @@ fn daemon_without_its_control_endpoint_exits_without_registering() {
     assert!(!exit.success());
     let startup =
         std::fs::read_to_string(home.path().join("logs").join("startup.log")).unwrap_or_default();
-    assert!(startup.contains("控制通道"), "startup.log: {startup}");
+    assert!(startup.contains("Cannot create control channel"), "startup.log: {startup}");
     let record = aproxy::daemon::read_instance_file_in(&run_dir, &port.to_string())
         .expect("前者的注册记录应还在");
     assert_eq!(record.pid, pid_a, "后来者不得覆盖前者的注册记录");

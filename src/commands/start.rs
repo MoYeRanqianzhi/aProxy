@@ -18,7 +18,7 @@ use aproxy::spec;
 use serde_json::json;
 
 use super::{Failure, port_value, print_doc};
-use crate::server::{ServeFailure, report_config_error, serve_forever};
+use crate::server::{ServeFailure, report_config_error, report_launch, serve_forever};
 
 /// `aproxy start [别名|路径]`：后台启动实例；--foreground 前台运行。
 ///
@@ -89,7 +89,7 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) -> u8 {
             }
             return 0;
         }
-        Err(PreflightError::Startup(e)) => return super::spawn_failure(&e, e.to_string()).report(json),
+        Err(PreflightError::Startup(e)) => return super::spawn_failure(&e, |lang| e.render(lang)).report(json),
         Ok(Preflight::AlreadyRunning(info)) => {
             if json {
                 print_doc(start_document("already_running", &info));
@@ -123,7 +123,10 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) -> u8 {
     if args.foreground {
         return match serve_forever(cfg, cfg_file, None).await {
             Ok(()) => 0,
-            Err(ServeFailure::Reported) => 1,
+            Err(ServeFailure::Launch(reason)) => {
+                report_launch(reason, None);
+                1
+            }
             Err(ServeFailure::Format(e)) => Failure::handshake(&e).report(json),
         };
     }
@@ -138,8 +141,10 @@ pub(crate) async fn handle_start_cmd(mut args: StartArgs) -> u8 {
     let info = match launch(&exe, &spec).await {
         Ok(info) => info,
         Err(e) => {
-            let excerpt = e.startup_log().map(|l| l.excerpt()).unwrap_or_default();
-            return super::spawn_failure(&e, format!("{e}{excerpt}")).report(json);
+            return super::spawn_failure(&e, |lang| {
+                format!("{}{}", e.render(lang), e.excerpt(lang))
+            })
+            .report(json);
         }
     };
     if json {
@@ -195,22 +200,23 @@ fn start_document(outcome: &str, info: &daemon::InstanceStatus) -> serde_json::V
 /// 配置解析不出一份能用的配置：文件不在是「目标不存在」（4），有 error 级诊断是「配置
 /// 无效」（3），读不出来是一般的失败（1）。
 pub(crate) fn config_failure(error: &ConfigError) -> Failure {
-    let message = error.to_string();
+    let reason = error.reason();
+    let message = |lang| reason.render(lang);
     match error {
-        ConfigError::Missing(path) => Failure::new(
+        ConfigError::Missing(path) => Failure::rendered(
             "target_not_found",
             message,
             json!({"target": path.display().to_string()}),
         ),
         ConfigError::Settings { diagnostics, .. } | ConfigError::Invalid { diagnostics, .. } => {
-            Failure::new(
+            Failure::rendered(
                 "config_invalid",
                 message,
                 json!({"diagnostics": diagnostics}),
             )
         }
         ConfigError::Read { .. } => {
-            Failure::new("start_failed", message, json!({"startup_log": []}))
+            Failure::rendered("start_failed", message, json!({"startup_log": []}))
         }
     }
 }
@@ -224,9 +230,12 @@ pub(crate) async fn handle_serve_cmd(spec_path: &Path) -> u8 {
     let mut spec = match spec::read_spec_file(spec_path) {
         Ok(spec) => spec,
         Err(e) => {
-            report_config_error(
-                &format!("cannot read the launch spec {}: {e}", spec_path.display()),
-                true,
+            report_launch(
+                aproxy::spawn::startup::LaunchReason::SpecRead {
+                    path: spec_path.display().to_string(),
+                    cause: Box::new(e.diagnostic()),
+                },
+                Some(spec_path),
             );
             return 1;
         }
@@ -246,7 +255,7 @@ pub(crate) async fn handle_serve_cmd(spec_path: &Path) -> u8 {
     let mut cfg = match resolve_runtime_config(&spec.overrides, cfg_file) {
         Ok(cfg) => cfg,
         Err(e) => {
-            report_config_error(&e.to_string(), true);
+            report_launch(e.reason(), Some(spec_path));
             return 1;
         }
     };
@@ -266,8 +275,12 @@ pub(crate) async fn handle_serve_cmd(spec_path: &Path) -> u8 {
         report_config_error(&format!("警告: {w}"), true);
     }
     if let Err(failure) = serve_forever(cfg, cfg_file, Some(spec)).await {
-        let ServeFailure::Format(e) = failure else {
-            return 1;
+        let e = match failure {
+            ServeFailure::Launch(reason) => {
+                report_launch(reason, Some(spec_path));
+                return 1;
+            }
+            ServeFailure::Format(e) => e,
         };
         report_config_error(&e.to_string(), true);
         // 规格已读完，原文件仅本次拉起方可读。只覆盖已有文件：若父进程已超时清理，

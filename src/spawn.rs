@@ -11,9 +11,13 @@
 //! 改到别的端口、或监听端口 0 由系统分配，ping 原端口要么永远不通，要么 ping 到别的进程
 //! （restart 换端口误报「未就绪」的实测教训）；pid 是唯一可靠的锚点。
 //!
-//! 子进程没有控制台，配置错误、端口绑定失败这类原因只会写进 startup.log（全部实例共用的追加
-//! 文件）。拉起之前记下它的长度，失败时只取这次新增的内容，免得把陈年旧账当成这次的原因。
+//! 子进程没有控制台，配置错误、端口绑定失败这类原因会写进 startup.log（全部实例共用的追加
+//! 文件）。拉起之前记下它的长度，失败时只取这次新增的内容；本次交接槽另可带有诊断参数。
 
+/// 私有启动诊断；公开错误文档仍只带原有的码、字段与英文摘录。
+#[path = "i18n/startup.rs"]
+pub mod startup;
+use aproxy_ipc::i18n::Lang;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -37,6 +41,8 @@ pub enum SpawnError {
         startup_log: StartupLog,
         /// 子进程离开前写回交接文件的格式诊断，与别的实例的日志无关。
         format: Option<Box<crate::transform::StartupError>>,
+        /// 仅从本次拉起的规格槽读取，不从共享日志或旁观者的文件推测。
+        report: Option<Box<startup::LaunchReport>>,
     },
     /// 时限内没有就绪。`start` 是 spawn 之后立刻读到的进程创建时间（身份锚点）：回收卡住的
     /// 子进程时按「pid + 创建时间」核验再终止，等待期间 pid 若已被系统复用给别的进程，届时
@@ -53,23 +59,43 @@ pub enum SpawnError {
 impl std::fmt::Display for SpawnError {
     /// 一句不带 startup.log 摘录的说明（摘录见 [`StartupLog::excerpt`]，由调用方决定要不要附上）
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Spawn(e) => write!(f, "spawn 失败: {e}"),
-            Self::Exited { pid, .. } => write!(f, "新实例（pid {pid}）启动后立即退出"),
-            Self::TimedOut { pid, alive, .. } => write!(
-                f,
-                "新实例（pid {pid}）未在预期时间内就绪（{}）",
-                if *alive {
-                    "进程存活"
-                } else {
-                    "进程状态不可判"
-                }
-            ),
-        }
+        f.write_str(&self.render(Lang::En))
     }
 }
 
 impl SpawnError {
+    /// 单独排版故障摘要，使清点/日志和终端可以共用原因而不共用语言。
+    pub fn render(&self, lang: Lang) -> String {
+        match self {
+            Self::Spawn(e) => startup::spawn(lang, e),
+            Self::Exited { pid, .. } => startup::exited(lang, *pid),
+            Self::TimedOut { pid, alive, .. } => startup::timeout(
+                lang,
+                *pid,
+                if *alive {
+                    startup::alive(lang)
+                } else {
+                    startup::unknown(lang)
+                },
+            ),
+        }
+    }
+
+    /// 公开证据始终是原始日志；只在能关联到本次交接槽时才在中文终端排版自己的记录。
+    pub fn excerpt(&self, lang: Lang) -> String {
+        let Some(log) = self.startup_log() else {
+            return String::new();
+        };
+        let lines = match self {
+            Self::Exited {
+                report: Some(report),
+                ..
+            } if lang == Lang::Zh => report.localized_lines(&log.lines, lang),
+            _ => None,
+        };
+        log.excerpt_in(lang, lines.as_deref().unwrap_or(&log.lines))
+    }
+
     /// 这次拉起期间 startup.log 新增的内容（spawn 本身失败时没有）
     pub fn startup_log(&self) -> Option<&StartupLog> {
         match self {
@@ -117,18 +143,22 @@ impl StartupLog {
     /// 可直接拼在错误说明后面的片段：有新增内容时逐行列出；没有时指路（运行日志按启动随机
     /// 命名，父进程无法预知文件名，只能指向目录）
     pub fn excerpt(&self) -> String {
-        if self.lines.is_empty() {
-            return format!(
-                "，原因通常记录在:\n  {}\n  {}",
+        self.excerpt_in(Lang::En, &self.lines)
+    }
+
+    fn excerpt_in(&self, lang: Lang, lines: &[String]) -> String {
+        if lines.is_empty() {
+            return startup::look(
+                lang,
                 self.path.display(),
                 self.path
                     .parent()
                     .unwrap_or_else(|| Path::new(""))
-                    .display()
+                    .display(),
             );
         }
-        let mut out = format!("。{} 本次新增内容:", self.path.display());
-        for line in &self.lines {
+        let mut out = startup::excerpt(lang, self.path.display());
+        for line in lines {
             out.push_str("\n  ");
             out.push_str(line);
         }
@@ -262,17 +292,30 @@ async fn wait_ready(
         }
         let exited = crate::process::process_exited(pid) == Some(true);
         // 旁观者只看本次运行原子发布的终态；拉起者的交接文件在退出前还可能含有原始规格。
-        let format = if exited || expected_id.is_some() {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum ResultFile {
+            Format(Box<crate::transform::StartupError>),
+            Launch(Box<startup::LaunchReport>),
+        }
+        let result = if exited || expected_id.is_some() {
             std::fs::File::open(result_path)
                 .ok()
                 .and_then(|f| serde_json::from_reader(f).ok())
         } else {
             None
         };
+        // 旁观者只读已登记实例公开给它的握手故障；绑定之前的原因只属于持有交接槽的启动者。
+        let (format, report) = match result {
+            Some(ResultFile::Format(e)) => (Some(e), None),
+            Some(ResultFile::Launch(e)) if exited && expected_id.is_none() => (None, Some(e)),
+            _ => (None, None),
+        };
         if exited || format.is_some() {
             return Err(SpawnError::Exited {
                 pid,
                 format,
+                report,
                 startup_log: StartupLog::since(home, mark),
             });
         }

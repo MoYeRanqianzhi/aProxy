@@ -749,6 +749,10 @@ fn english_force_guidance_discloses_downgrade_and_process_scope() {
             && help.contains("never below 0.2.0"),
         "{help}"
     );
+    assert!(
+        help.contains("one document with --check") && help.contains("Configure download_chain"),
+        "{help}"
+    );
     let warning = Cause::Unmanaged(vec![17]).render(Lang::En);
     assert!(
         warning.contains("(pid 17)")

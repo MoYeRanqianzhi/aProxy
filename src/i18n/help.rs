@@ -78,7 +78,7 @@ message!(port(), en: "Filter by listening port", zh: "按监听端口过滤");
 
 message!(find_json(), en: "Write a JSON document with matching configurations, aliases and diagnostics", zh: "输出一个 JSON 文档（给程序读）：匹配的配置、别名与错误诊断");
 
-message!(install(), en: "Install or upgrade aProxy under ~/.aproxy/bin/. Restart one instance at a time. `upgrade` is an alias. Online installs use the configured download chain (github, npm, cargo-binstall, cargo), URL templates and --download-proxy. Interrupted installs resume automatically. If an instance cannot start, restore it with the old binary and stop the upgrade with a nonzero exit code. If installation fails or stalls, `install --force` stops all aProxy processes for this home before replacing the binary", zh: "安装/升级 aProxy 到规范位置（~/.aproxy/bin/）：全程对客户端 ≈ 无感 （逐实例滚动重启，任一时刻至多一个实例在重启）。`upgrade` 是它的别名。 在线安装走下载链条（github → npm → cargo-binstall → cargo，可配 settings 的 download_chain/url 模板与 --download-proxy）；中断自动续作。 某实例在新版本下起不来时用旧二进制把它拉回并中止滚动（命令返回非零）。 普通安装失败或卡住时，`install --force` 结束全部 aproxy 进程后直接换二进制。");
+message!(install(), en: "Install or upgrade aProxy under ~/.aproxy/bin/. Restart at most one instance at a time to minimize disruption to clients. `upgrade` is an alias. Online installs try github, npm, cargo-binstall and cargo in order. Configure download_chain and URL templates in settings, or use --download-proxy. Interrupted installs resume automatically. If an instance cannot start, restore it with the old binary and stop the upgrade with a nonzero exit code. If installation fails or stalls, `install --force` stops all aProxy processes for this home before replacing the binary", zh: "安装/升级 aProxy 到规范位置（~/.aproxy/bin/）：全程对客户端 ≈ 无感 （逐实例滚动重启，任一时刻至多一个实例在重启）。`upgrade` 是它的别名。 在线安装走下载链条（github → npm → cargo-binstall → cargo，可配 settings 的 download_chain/url 模板与 --download-proxy）；中断自动续作。 某实例在新版本下起不来时用旧二进制把它拉回并中止滚动（命令返回非零）。 普通安装失败或卡住时，`install --force` 结束全部 aproxy 进程后直接换二进制。");
 
 message!(skill(), en: "Install, list or read the skill documents for aProxy", zh: "安装、列出或读取与 aProxy 配套的 skill 文档");
 
@@ -99,7 +99,7 @@ message!(settings(), en: "View or edit ~/.aproxy/settings.json, including aliase
 #[cfg(feature = "desktop")]
 message!(desktop(), en: "Open the desktop interface in a separate process. Closing it does not stop proxy instances. This preview displays sample data, not live instance data", zh: "打开桌面界面：独立的窗口进程，关掉窗口就退出，不影响运行中的代理实例。 这个版本的界面是预览版，显示的是演示数据，不是本机实例的真实状态。");
 
-message!(install_version(), en: "Install `latest` (default) from the selected update channel or specify a version such as 0.2.0-alpha.1. Stable excludes pre-releases; pre includes them. Skip latest if it is not newer than the running version. Use --allow-downgrade for older versions; versions below 0.2.0 are not supported. With --force, reinstall even if already current. Cannot be combined with --from or --adopt", zh: "安装目标版本：`latest`（默认，按更新通道取最大版本——stable 通道只取 正式版，pre 通道含预发布；通道见 --pre）或具体版本号（如 0.2.0-alpha.1）。latest 不高于当前版本时提示「已是最新」不重装。 默认拒绝降级（--allow-downgrade 放行）；低于 0.2.0 的版本一律拒绝。 加 --force 时不与当前版本比较，总是安装。与 --from/--adopt 互斥。");
+message!(install_version(), en: "Install `latest` (default) from the selected update channel (see --pre) or specify a version such as 0.2.0-alpha.1. Stable excludes pre-releases; pre includes them. Skip latest if it is not newer than the running version. Use --allow-downgrade for older versions; versions below 0.2.0 are not supported. With --force, reinstall even if already current. Cannot be combined with --from or --adopt", zh: "安装目标版本：`latest`（默认，按更新通道取最大版本——stable 通道只取 正式版，pre 通道含预发布；通道见 --pre）或具体版本号（如 0.2.0-alpha.1）。latest 不高于当前版本时提示「已是最新」不重装。 默认拒绝降级（--allow-downgrade 放行）；低于 0.2.0 的版本一律拒绝。 加 --force 时不与当前版本比较，总是安装。与 --from/--adopt 互斥。");
 
 message!(from(), en: "Install from a local binary: copy, verify, swap atomically and restart instances one at a time. Its --version output selects the version (at least 0.2.0). Cannot be combined with --adopt or VERSION", zh: "从本地二进制文件安装（复制 → 校验 → 原子落位 → 滚动重启实例）。 二进制的 `--version` 自报版本即安装目标版本（低于 0.2.0 的拒绝）。");
 
@@ -117,21 +117,21 @@ message!(cpu(), en: "Select x86-64-v3 or baseline. Defaults to x86-64-v3 on Wind
 
 message!(downgrade(), en: "Allow an older version than the installed one. Versions below 0.2.0 are not supported", zh: "允许降级安装（目标版本 < 当前已安装版本时默认拒绝）；低于 0.2.0 的版本 仍然拒绝");
 
-message!(pre(), en: "Select latest across stable and pre-release versions. Without this flag a pre-release follows the pre-release channel and a stable release follows stable. Does not affect explicit versions", zh: "latest 走预发布通道：在全部版本（含正式版与 alpha/beta/rc 预发布） 中取最大。不加时通道跟随当前版本——当前是预发布则默认即为预发布 通道，当前是正式版则只取正式版（不会被带到预发布）。只影响 latest 解析，指定具体版本号时无作用。");
+message!(pre(), en: "Select latest across stable and alpha, beta and release-candidate versions. Without this flag a pre-release follows the pre-release channel and a stable release follows stable. Does not affect explicit versions", zh: "latest 走预发布通道：在全部版本（含正式版与 alpha/beta/rc 预发布） 中取最大。不加时通道跟随当前版本——当前是预发布则默认即为预发布 通道，当前是正式版则只取正式版（不会被带到预发布）。只影响 latest 解析，指定具体版本号时无作用。");
 
-message!(download_proxy(), en: "Proxy URL for this download only, independent of the request proxy in config.toml. Defaults to download_proxy in settings, then the system proxy. Force install skips settings", zh: "仅本次下载使用的代理 URL（与 config.toml 的请求代理绝对分离）； 未指定时用 settings 的 download_proxy，再未配置则走系统环境代理 （--force 不读 settings：只用这个参数，没给就走系统环境代理）");
+message!(download_proxy(), en: "Proxy URL for this download only, independent of the request proxy in config.toml. Defaults to download_proxy in settings, then the system proxy. With --force, only this option or the system proxy is used", zh: "仅本次下载使用的代理 URL（与 config.toml 的请求代理绝对分离）； 未指定时用 settings 的 download_proxy，再未配置则走系统环境代理 （--force 不读 settings：只用这个参数，没给就走系统环境代理）");
 
-message!(no_skills(), en: "Skip the skill update for this install. The global setting is skill_auto_update", zh: "本次安装跳过 skill 文档更新（全局开关在 settings 的 skill_auto_update）");
+message!(no_skills(), en: "Skip the skill update for this install. The global setting is skill_auto_update in settings.json", zh: "本次安装跳过 skill 文档更新（全局开关在 settings 的 skill_auto_update）");
 
 message!(skills_only(), en: "Install only skills matching the running binary. With this installer entry point, --json is a usage error (exit 2); use skill install --json instead", zh: "只安装与当前二进制同版本的 skill；保留已发布安装器给用户的命令行。 旧入口与 --json 同用仍按参数错误退出（2）；文档结果请用 skill install --json。");
 
 message!(check(), en: "Check which version would be installed: report current and latest versions and whether an update is available. Does not download or change anything. Accepts --pre, --variant, --download-proxy and --json", zh: "只查询 install 会装哪个版本：打印当前版本、通道里的最新版本与有没有更新， 不下载、不改动任何东西。可与 --pre、--variant、--download-proxy、--json 同用");
 
-message!(install_json(), en: "Write JSON only to stdout (one event per line during installation). Human-readable messages go to stderr", zh: "机器可读的输出：标准输出上只有 JSON（安装时每行一个事件，--check 时一个文档）， 给人看的文字改写到标准错误");
+message!(install_json(), en: "Write JSON only to stdout (one event per line during installation; one document with --check). Human-readable messages go to stderr", zh: "机器可读的输出：标准输出上只有 JSON（安装时每行一个事件，--check 时一个文档）， 给人看的文字改写到标准错误");
 
-message!(resume(), en: "Internal: resume an interrupted installation from saved state without prompting. Invoked by the watchdog, CLI or previous installer. Do not run manually", zh: "[内部] 续作模式：从 install.state 残留的 phase 幂等推进（看门狗/ CLI 入口/交棒自动拉起，全自动无人工询问）。勿手动使用。");
+message!(resume(), en: "Internal: resume idempotently from the saved install phase without prompting. Invoked by the watchdog, CLI or previous installer. Do not run manually", zh: "[内部] 续作模式：从 install.state 残留的 phase 幂等推进（看门狗/ CLI 入口/交棒自动拉起，全自动无人工询问）。勿手动使用。");
 
-message!(handover(), en: "Internal: PID of the installer handing over ownership. Allows continuation while that owner is alive. Used by installers across versions. Do not run manually", zh: "[内部] 交棒：拉起本进程的安装者的 pid。带着它（且它仍是 install.state 的主人）的续作进程可以接手一个安装者健在的安装。旧版本的安装者会这样 拉起新版本，是永久接口，见 install::flow 模块文档。勿手动使用。");
+message!(handover(), en: "Internal: PID of the installer handing over ownership. Allows continuation while that PID is alive only if it still owns the installation state. This is a permanent cross-version interface; see install::flow. Do not run manually", zh: "[内部] 交棒：拉起本进程的安装者的 pid。带着它（且它仍是 install.state 的主人）的续作进程可以接手一个安装者健在的安装。旧版本的安装者会这样 拉起新版本，是永久接口，见 install::flow 模块文档。勿手动使用。");
 
 message!(verify(), en: "Validate the archive and its documents before publication without modifying the user's installation", zh: "发布前用实际解包和正文读取规则校验文档，不改用户的安装。");
 

@@ -3,6 +3,7 @@ mod extensions;
 mod forms;
 mod instances;
 mod login;
+mod preferences;
 mod state;
 mod update;
 use crate::{config, settings, spec};

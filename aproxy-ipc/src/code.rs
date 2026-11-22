@@ -252,6 +252,17 @@ const INSTALL: &[Family] = &[Family::Install];
 /// 整张码表。顺序就是文档里的顺序：按族分段，族内按登记的先后。
 pub const TABLE: &[Code] = &[
     plain(
+        "desktop_toml",
+        &[Family::Desktop],
+        "The desktop preferences file could not be edited.",
+        &[
+            req("kind", T::String),
+            opt("line", T::Integer),
+            opt("column", T::Integer),
+            opt("key", T::String),
+        ],
+    ),
+    plain(
         "desktop_extension_package",
         &[Family::Desktop],
         "The extension package could not be loaded safely.",

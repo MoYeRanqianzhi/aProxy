@@ -129,12 +129,13 @@ Why a persistent record under the home could not be used. Such records are repor
 | `record_unreadable` | A persistent record cannot be parsed. | — |
 | `record_schema_too_new` | A persistent record has a schema newer than this version understands. | `schema` (integer) |
 
-## Desktop extension faults
+## Desktop faults
 
 Faults returned to the bundled desktop page. They do not change CLI exit codes.
 
 | Code | When | `details` |
 |---|---|---|
+| `desktop_toml` | The desktop preferences file could not be edited. | `kind` (string), `line`? (integer), `column`? (integer), `key`? (string) |
 | `desktop_extension_package` | The extension package could not be loaded safely. | `reason` (string), `field` (string) |
 | `desktop_extension_state` | Private extension state could not be trusted or saved. | `reason` (string) |
 | `desktop_extension_denied` | The attributed operation was not authorized. | — |

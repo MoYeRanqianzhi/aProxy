@@ -422,14 +422,19 @@ async fn private_window_state_is_bounded_resettable_and_write_only_for_secrets()
     );
     let initial = host.read_desktop_state().await.unwrap();
     assert!(initial.reset.is_empty() && initial.bookmarks.is_empty());
-    assert_eq!(initial.preferences.mascot, "tumbler");
+    assert_eq!(initial.preferences.as_ref().unwrap().mascot, "tumbler");
     let patch = |v| serde_json::from_value::<PreferencesPatch>(v).unwrap();
-    let p=host.set_preferences(patch(json!({"lang":"zh-Hant-TW","mascot":"future-cat","theme":"aproxy-theme-v1:{\"unknown\":true}"}))).await.unwrap();
+    let p = host
+        .set_preferences(patch(
+            json!({"lang":"zh-Hant-TW","mascot":"future-cat","theme":"theme.sample"}),
+        ))
+        .await
+        .unwrap();
     assert_eq!(p.lang, "zh-Hant-TW");
     assert_eq!(p.mascot, "future-cat");
-    assert!(p.theme.is_some());
+    assert_eq!(p.theme, "theme.sample");
     assert!(matches!(
-        host.set_preferences(patch(json!({"theme":"aproxy-theme-v1:not json"})))
+        host.set_preferences(patch(json!({"theme":"../not-an-id"})))
             .await,
         Err(Fault::DesktopBadInput {})
     ));
@@ -438,12 +443,10 @@ async fn private_window_state_is_bounded_resettable_and_write_only_for_secrets()
         Err(Fault::DesktopBadInput {})
     ));
     let p = host
-        .set_preferences(patch(
-            json!({"theme":"aproxy-theme-v1:\"private-state-key\""}),
-        ))
+        .set_preferences(patch(json!({"theme":"private-state-key"})))
         .await
         .unwrap();
-    assert_eq!(p.theme, None);
+    assert_eq!(p.theme, "builtin");
     let item:Bookmark=serde_json::from_value(json!({"ref":{"run":{"port":free_port(),"instanceId":"000000000000ba11"},"requestId":"000000000000ba11-1"},"startedAt":1,"method":"GET","path":"/private-state-key","model":null,"outcome":"ok","attempts":1})).unwrap();
     let list = host.set_pinned(PinChange::Pin(item.clone())).await.unwrap();
     assert_eq!(list.len(), 1);
@@ -459,22 +462,51 @@ async fn private_window_state_is_bounded_resettable_and_write_only_for_secrets()
             .is_empty()
     );
     let dir = home.path().join("desktop");
-    std::fs::write(dir.join("preferences.json"), b"[").unwrap();
+    let toml = dir.join("desktop.toml");
+    assert!(
+        std::fs::read_to_string(&toml)
+            .unwrap()
+            .contains("# installed extensions to load, in this order")
+    );
+    let text = "# header\r\nmode  =  'dark'  # keep\r\nmascot = 42\r\n[extensions]\r\nenabled=['zzz','aaa']\r\n[unrelated]\r\nkey = 'strange' # leave alone";
+    std::fs::write(&toml, text).unwrap();
+    let state = host.read_desktop_state().await.unwrap();
+    assert_eq!(state.desktop_toml.len(), 1);
+    assert_eq!(state.desktop_toml[0].key.as_deref(), Some("mascot"));
+    assert_eq!(state.preferences.unwrap().mascot, "tumbler");
+    assert_eq!(state.enabled_extensions.unwrap(), ["zzz", "aaa"]);
+    host.set_preferences(patch(json!({"mode":"light"})))
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&toml).unwrap(),
+        text.replace("'dark'", "\"light\"")
+    );
+    std::fs::write(&toml, "# header\nkey = ?").unwrap();
     std::fs::write(dir.join("bookmarks.json"), vec![b' '; 256 * 1024 + 1]).unwrap();
     let repaired = host.read_desktop_state().await.unwrap();
-    assert_eq!(
-        repaired.reset,
-        vec![StateFile::Preferences, StateFile::Bookmarks]
+    assert_eq!(repaired.reset, vec![StateFile::Bookmarks]);
+    assert!(repaired.preferences.is_none() && repaired.enabled_extensions.is_none());
+    let issue = &repaired.desktop_toml[0];
+    assert_eq!((issue.line, issue.column), (Some(2), Some(7)));
+    assert!(
+        matches!(host.set_preferences(patch(json!({"mica":true}))).await,Err(Fault::DesktopToml(other)) if other == *issue)
     );
-    assert_eq!(repaired.preferences, initial.preferences);
+    assert_eq!(std::fs::read_to_string(&toml).unwrap(), "# header\nkey = ?");
     assert!(host.read_desktop_state().await.unwrap().reset.is_empty());
-    std::fs::write(dir.join("preferences.json"), b"{}").unwrap();
+    let oversized = vec![b' '; 1024 * 1024 + 1];
+    std::fs::write(&toml, &oversized).unwrap();
+    let state = host.read_desktop_state().await.unwrap();
+    assert!(state.preferences.is_none());
+    assert_eq!(
+        state.desktop_toml[0].kind,
+        aproxy_ipc::desktop::TomlIssueKind::TooLarge
+    );
     assert!(matches!(
         host.set_preferences(patch(json!({"mica":true}))).await,
-        Err(Fault::DesktopStateReset {
-            file: StateFile::Preferences
-        })
+        Err(Fault::DesktopToml(_))
     ));
+    assert_eq!(std::fs::read(toml).unwrap(), oversized);
 }
 
 #[tokio::test]
@@ -890,16 +922,16 @@ async fn changed_privacy_applies_to_about_raw_theme_and_old_diagnostic_path() {
     std::fs::write(root.join("settings.json"),r#"{"defaults":{"base_url":"https://other.invalid","extra_headers":{"authorization":"Bearer withheld-secret"}}}"#).unwrap();
     std::fs::write(root.join("config.toml"),"base_url='https://local.invalid'\napi_key='diagnostic-private'\n[extra_headers]\nx-private='123456789'\n").unwrap();
     assert!(!host.about().unwrap().home.contains("diagnostic-private"));
-    let theme = "aproxy-theme-v1:{\"value\":123456789}";
-    let patch: PreferencesPatch = serde_json::from_value(json!({"theme":theme})).unwrap();
-    assert!(host.set_preferences(patch).await.unwrap().theme.is_none());
-    assert!(
+    let patch: PreferencesPatch = serde_json::from_value(json!({"theme":"123456789"})).unwrap();
+    assert_eq!(host.set_preferences(patch).await.unwrap().theme, "builtin");
+    assert_eq!(
         host.read_desktop_state()
             .await
             .unwrap()
             .preferences
-            .theme
-            .is_none()
+            .unwrap()
+            .theme,
+        "builtin"
     );
     let t = ConfigTarget::Default {
         id: host.list_configs().await.unwrap()[0].target.id.clone(),

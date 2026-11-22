@@ -221,6 +221,34 @@ pub enum StateFile {
     Bookmarks,
 }
 
+/// How the page should explain an unreadable file or a defaulted value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TomlIssueKind {
+    /// Invalid UTF-8 or TOML.
+    Syntax,
+    /// The editable file would exceed its byte budget.
+    TooLarge,
+    /// The path could not be safely read or replaced.
+    Io,
+    /// An individual known key has an invalid value.
+    Value,
+}
+
+/// Localization facts only: parser excerpts may contain unrelated private settings.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TomlIssue {
+    /// Determines the localized explanation.
+    pub kind: TomlIssueKind,
+    /// One-based source line, for syntax errors.
+    pub line: Option<usize>,
+    /// One-based Unicode scalar column, for syntax errors.
+    pub column: Option<usize>,
+    /// Known preference path, for a value error.
+    pub key: Option<String>,
+}
+
 /// Which published desktop storage bound was exceeded.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -229,10 +257,6 @@ pub enum LimitResource {
     BookmarkCount,
     /// Bookmark bytes.
     BookmarkBytes,
-    /// Preference bytes.
-    PreferenceBytes,
-    /// Theme bytes.
-    ThemeBytes,
 }
 
 /// Why the OS registration cannot be safely read or changed.
@@ -339,6 +363,8 @@ pub enum Fault {
     },
     /// Stop did not complete or could not be verified.
     DesktopStop { port: u16, reason: StopReason },
+    /// Refused a change without replacing the user's broken desktop.toml.
+    DesktopToml(TomlIssue),
     /// Private desktop file could not be accessed/replaced.
     DesktopStateIo { file: StateFile },
     /// Corrupt state was replaced; reread before retrying the mutation.

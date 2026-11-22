@@ -1,6 +1,6 @@
 //! Typed, home-bound operations injected into the window. Only Rust selects paths,
 //! executables and processes. None of the DTOs in this module are CLI documents.
-use super::{Fault, Issue, SafeUint, StateFile};
+use super::{Fault, Issue, SafeUint, StateFile, TomlIssue};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{future::Future, pin::Pin, sync::Arc};
 
@@ -430,11 +430,11 @@ pub struct Preferences {
     pub mica: bool,
     /// Bounded registry slug, interpreted by the page.
     pub mascot: String,
-    /// Bounded versioned JSON string, interpreted by the page.
-    pub theme: Option<String>,
+    /// Installed theme ID, or `builtin`.
+    pub theme: String,
 }
 
-/// Partial update; missing theme preserves it, explicit null resets it to the built-in.
+/// Partial update: only supplied keys are written to the editable document.
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreferencesPatch {
@@ -455,7 +455,7 @@ pub struct PreferencesPatch {
     pub mascot: Option<String>,
     /// Set `theme` only when the caller supplied it.
     #[serde(default, deserialize_with = "present")]
-    pub theme: Option<Option<String>>,
+    pub theme: Option<String>,
 }
 fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
     T::deserialize(d).map(Some)
@@ -512,7 +512,11 @@ pub struct Bookmark {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DesktopState {
     /// Effective window preferences.
-    pub preferences: Preferences,
+    pub preferences: Option<Preferences>,
+    /// Ordered load list, absent when the document could not be read.
+    pub enabled_extensions: Option<Vec<String>>,
+    /// Non-destructive diagnostics for the editable TOML file.
+    pub desktop_toml: Vec<TomlIssue>,
     /// Newest pins first.
     pub bookmarks: Vec<Bookmark>,
     /// Corrupt files reset with a visible notice.
@@ -840,10 +844,14 @@ mod tests {
         );
     }
     #[test]
-    fn clearing_theme_is_not_an_omitted_patch() {
+    fn selecting_builtin_is_not_an_omitted_patch() {
         let read = |s| serde_json::from_str::<PreferencesPatch>(s).unwrap();
         assert_eq!(read("{}").theme, None);
-        assert_eq!(read(r#"{"theme":null}"#).theme, Some(None));
+        assert_eq!(
+            read(r#"{"theme":"builtin"}"#).theme.as_deref(),
+            Some("builtin")
+        );
+        assert!(serde_json::from_str::<PreferencesPatch>(r#"{"theme":null}"#).is_err());
         assert!(serde_json::from_str::<PreferencesPatch>(r#"{"lang":null}"#).is_err());
     }
 }

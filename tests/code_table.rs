@@ -93,7 +93,7 @@ const SECTIONS: &[Section] = &[
     },
     Section {
         family: Family::Desktop,
-        title: "Desktop extension faults",
+        title: "Desktop faults",
         intro: "Faults returned to the bundled desktop page. They do not change CLI exit codes.",
         column: None,
     },

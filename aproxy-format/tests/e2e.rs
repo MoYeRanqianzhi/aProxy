@@ -4,6 +4,13 @@ use std::{
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
 };
+/// 离线工具与协议角色都从相同的英语环境启动，不继承测试机的界面语言。
+fn format_command() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aproxy-format"));
+    cmd.env("APROXY_LANG", "en");
+    cmd
+}
+
 /// 持久进程，按流水号来回交换一行。
 struct Worker {
     /// 测试创建的子进程，结束时先关闭 stdin 再等待退出。
@@ -20,7 +27,7 @@ struct Worker {
 impl Worker {
     /// 启动编译出来的角色程序，给两个虚构的 key，不依赖父进程的密钥。
     fn new(args: &[&str]) -> Self {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_aproxy-format"));
+        let mut cmd = format_command();
         cmd.args(args);
         Self::connect(cmd, args[0], false, None)
     }
@@ -296,6 +303,7 @@ fn sticky_key_negotiation_and_exhausted_pool_retry() {
     let file = dir.path().join("keys.toml");
     std::fs::write(&file,"sticky=true\n[[pool]]\norigin='https://relay.test'\nheader='x-api-key'\nkeys=[{id='one',env='FORMAT_A'},{id='two',env='FORMAT_B'}]").unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
+    command.env("APROXY_LANG", "en");
     command
         .args(["--exact", "frozen_key_worker", "--ignored", "--nocapture"])
         .env("FORMAT_SAMPLE_CONFIG", &file);
@@ -483,7 +491,7 @@ fn invalid_role_configuration_does_not_echo_secrets() {
         "[[pool]]\norigin='https://x.test'\nheader='authorization'\nkeys=[{id='x',env='FORMAT_A',weight=0}]",
     ] {
         std::fs::write(&f, toml).unwrap();
-        let out = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+        let out = format_command()
             .args(["keys", "--config", f.to_str().unwrap()])
             .output()
             .unwrap();
@@ -491,7 +499,7 @@ fn invalid_role_configuration_does_not_echo_secrets() {
         assert!(!String::from_utf8_lossy(&out.stderr).contains("fixture-private"));
     }
     assert!(
-        !Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+        !format_command()
             .arg("run")
             .output()
             .unwrap()
@@ -552,7 +560,7 @@ fn role_hello_declares_exact_stages_and_body_grades() {
 /// translate 的输入没有 hello 或 seq，只转换一个 JSON 请求后在 EOF 退出。
 #[test]
 fn translate_is_a_one_off_request_converter() {
-    let mut worker = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+    let mut worker = format_command()
         .args([
             "translate",
             "--from",
@@ -778,10 +786,7 @@ fn heartbeat_matches_only_explicit_client_paths() {
         p.replace("'anthropic_messages'", "'openai_responses'"),
     ] {
         std::fs::write(&path, invalid).unwrap();
-        let r = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
-            .args(args)
-            .output()
-            .unwrap();
+        let r = format_command().args(args).output().unwrap();
         assert!(!r.status.success() && r.stdout.is_empty());
     }
 }
@@ -830,7 +835,7 @@ fn credential_slots_require_history_protected_names() {
         ),
     ] {
         std::fs::write(&file, toml).unwrap();
-        let out = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+        let out = format_command()
             .args([role, "--config", file.to_str().unwrap()])
             .env("FORMAT_A", "fixture-private")
             .output()
@@ -870,7 +875,7 @@ fn config_diagnostic_names_the_field_not_the_value() {
         ("route", "[aliases]\nurl=123", "aliases"),
     ] {
         std::fs::write(&f, text).unwrap();
-        let r = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+        let r = format_command()
             .args([role, "--config"])
             .arg(&f)
             .output()
@@ -930,7 +935,7 @@ fn managed_header_slots_fail_before_hello() {
         ),
     ] {
         std::fs::write(&file, text).unwrap();
-        let out = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+        let out = format_command()
             .args([role, "--config"])
             .arg(&file)
             .env("KEY", "private-fixture")
@@ -1097,7 +1102,7 @@ fn oversized_role_state_is_refused_during_configuration() {
         ),
     ] {
         std::fs::write(&file, txt).unwrap();
-        let out = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+        let out = format_command()
             .args([role, "--config", file.to_str().unwrap()])
             .env("FORMAT_A", "test")
             .output()
@@ -1117,7 +1122,7 @@ fn key_pool_rejects_unusable_environment_values_before_hello() {
     let file = dir.path().join("keys.toml");
     std::fs::write(&file,"[[pool]]\norigin='https://a.test'\nheader='authorization'\nkeys=[{id='a',env='FORMAT_A'},{id='b',env='FORMAT_B'}]").unwrap();
     for invalid in [None, Some(""), Some("private\r\nvalue"), Some("privateé")] {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_aproxy-format"));
+        let mut cmd = format_command();
         cmd.args(["keys", "--config", file.to_str().unwrap()])
             .env("FORMAT_A", "first-private")
             .env_remove("FORMAT_B");
@@ -1344,7 +1349,7 @@ fn codec_errors_have_one_typed_ending_even_on_abort() {
 /// 有签名的推理会出现在摘要和封装载荷中；协商上限包括真实响应头、序号和换行。
 #[test]
 fn buffered_replies_fit_the_negotiated_line() {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aproxy-format"));
+    let mut cmd = format_command();
     cmd.args([
         "convert",
         "--from",
@@ -2193,7 +2198,7 @@ fn rewrite_refuses_secret_assignments_but_can_remove_them() {
             format!("set_headers={{'{header}'='private-fixture'}}"),
         )
         .unwrap();
-        let result = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+        let result = format_command()
             .args(["rewrite", "--config", path.to_str().unwrap()])
             .output()
             .unwrap();
@@ -2215,8 +2220,7 @@ fn rewrite_refuses_secret_assignments_but_can_remove_them() {
 #[test]
 fn tools_try_runs_the_sample_chain_without_exposing_the_sample() {
     let d = tempfile::tempdir().unwrap();
-    let binary = env!("CARGO_BIN_EXE_aproxy-format");
-    let init = Command::new(binary)
+    let init = format_command()
         .args(["init", "adaptive-relay", "--output"])
         .arg(d.path())
         .output()
@@ -2224,17 +2228,13 @@ fn tools_try_runs_the_sample_chain_without_exposing_the_sample() {
     assert!(init.status.success(), "{init:?}");
     let config = d.path().join("config.toml");
     let sample = d.path().join("request.json");
-    let check = Command::new(binary)
-        .arg("check")
-        .arg(&config)
-        .output()
-        .unwrap();
+    let check = format_command().arg("check").arg(&config).output().unwrap();
     assert!(check.status.success(), "{check:?}");
     let token = "private-fixture-392";
     let corpus: Value = serde_json::from_str(include_str!("fixtures/protocols.json")).unwrap();
     let request = json!({"path":format!("/v1/messages?auth={token}"),"headers":{"authorization":token},"body":{"model":"m","messages":[{"role":"user","content":token}],"max_tokens":8},"attempts":[{"status":503,"headers":{"retry-after":"0"}},{"status":200,"headers":{"content-type":"application/json"},"body":corpus["openai_chat"]["response"]}]});
     std::fs::write(&sample, request.to_string()).unwrap();
-    let result = Command::new(binary)
+    let result = format_command()
         .arg("try")
         .arg(&config)
         .arg("--request")
@@ -2289,15 +2289,14 @@ fn dry_run_external_execution_requires_opt_in_and_discloses_the_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let fixture = root.join(format!("sample-peer{}", std::env::consts::EXE_SUFFIX));
-    let binary = env!("CARGO_BIN_EXE_aproxy-format");
-    std::fs::copy(binary, &fixture).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_aproxy-format"), &fixture).unwrap();
     let marker = root.join("observed");
     let file = root.join("config.toml");
     let sample = root.join("s.json");
     std::fs::write(&sample, r#"{"path":"/","body":"private-fixture"}"#).unwrap();
     std::fs::write(&file,format!("base_url='https://relay.test'\n[[format]]\nname='peer'\ncommand={}\nargs=['init','key-rotation','--output',{}]\nstages=['request']\nrequired=false",json!(fixture),json!(marker))).unwrap();
     for allow in [false, true] {
-        let mut cmd = Command::new(binary);
+        let mut cmd = format_command();
         cmd.arg("try").arg(&file).arg("--request").arg(&sample);
         if allow {
             cmd.arg("--allow-external");
@@ -2319,7 +2318,7 @@ fn dry_run_external_execution_requires_opt_in_and_discloses_the_boundary() {
 /// 帮助模式不消费标准输入，不与协议 hello 混用，并指出独立转换与链中角色的区别。
 #[test]
 fn translate_help_distinguishes_single_requests_from_chain_roles() {
-    let run = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+    let run = format_command()
         .args(["translate", "--help"])
         .output()
         .unwrap();
@@ -2357,10 +2356,7 @@ fn offline_files_are_bounded_before_parsing() {
         vec!["check", p],
         vec!["try", p, "--request", sample.to_str().unwrap()],
     ] {
-        let out = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
-            .args(&args)
-            .output()
-            .unwrap();
+        let out = format_command().args(&args).output().unwrap();
         assert!(!out.status.success(), "{args:?}: {out:?}");
     }
 }
@@ -2369,9 +2365,8 @@ fn offline_files_are_bounded_before_parsing() {
 #[test]
 fn check_lists_only_structural_guarantees_and_credential_names() {
     let dir = tempfile::tempdir().unwrap();
-    let exe = env!("CARGO_BIN_EXE_aproxy-format");
     assert!(
-        Command::new(exe)
+        format_command()
             .args(["init", "key-rotation", "--output"])
             .arg(dir.path())
             .status()
@@ -2379,7 +2374,7 @@ fn check_lists_only_structural_guarantees_and_credential_names() {
             .success()
     );
     for args in [vec!["config.toml"], vec!["keys", "--config", "keys.toml"]] {
-        let out = Command::new(exe)
+        let out = format_command()
             .current_dir(dir.path())
             .arg("check")
             .args(&args)
@@ -2412,7 +2407,7 @@ fn tools_resolve_role_configs_from_the_selected_home() {
     std::fs::write(&sample, r#"{"path":"/","body":{}}"#).unwrap();
     for name in ["check", "try"] {
         for explicit in [false, true] {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_aproxy-format"));
+            let mut cmd = format_command();
             cmd.arg(name).arg(&proxy);
             if explicit {
                 cmd.arg("--home").arg(&home);
@@ -2444,11 +2439,7 @@ fn check_requires_request_state_for_auto_return_conversion() {
             ("openai_chat", "anthropic_messages", true),
         ] {
             std::fs::write(&file,format!("[[format]]\nname='c'\ncommand='aproxy-format'\nargs=['convert','--from','{from}','--to','{to}']\nprocess='persistent'\nrequired=true\nstages=['{stage}']")).unwrap();
-            let out = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
-                .arg("check")
-                .arg(&file)
-                .output()
-                .unwrap();
+            let out = format_command().arg("check").arg(&file).output().unwrap();
             assert_eq!(out.status.success(), valid, "{out:?}");
         }
     }
@@ -2475,7 +2466,7 @@ fn init_explains_files_and_generates_editable_toml() {
         assert!(link.status.success(), "{link:?}");
     }
     let root = alias.join("with spaces");
-    let out = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+    let out = format_command()
         .args(["init", "adaptive-relay", "--output"])
         .arg(&root)
         .output()
@@ -2542,7 +2533,7 @@ fn all_commands_explain_options_and_an_example_before_io() {
         "translate",
     ] {
         for flag in ["--help", "-h"] {
-            let out = Command::new(env!("CARGO_BIN_EXE_aproxy-format"))
+            let out = format_command()
                 .args([cmd, "--config", "does-not-exist", flag])
                 .output()
                 .unwrap();
@@ -2574,16 +2565,15 @@ fn opted_in_executable_uses_instance_lookup_not_the_driver_path() {
     let home = tmp.path().join("instance");
     let bin = home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    let exe = env!("CARGO_BIN_EXE_aproxy-format");
     let name = format!("format-role{}", std::env::consts::EXE_SUFFIX);
-    std::fs::copy(exe, bin.join(&name)).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_aproxy-format"), bin.join(&name)).unwrap();
     let cfg = tmp.path().join("p.toml");
     let sample = tmp.path().join("s");
     std::fs::write(&sample, r#"{"path":"/","body":{}}"#).unwrap();
     for program in [name.clone(), format!("bin/{name}")] {
         std::fs::write(&cfg,format!("base_url='https://example.test'\n[[format]]\ncommand='{program}'\nargs=['heartbeat']\nstages=['heartbeat']\nrequired=true")).unwrap();
         for selected in [false, true] {
-            let mut cmd = Command::new(exe);
+            let mut cmd = format_command();
             cmd.arg("try")
                 .arg(&cfg)
                 .arg("--request")

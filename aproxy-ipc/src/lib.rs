@@ -26,6 +26,7 @@ pub mod endpoint;
 #[cfg(feature = "client")]
 pub mod enumerate;
 pub mod home;
+pub mod i18n;
 #[cfg(feature = "body-inspection")]
 pub mod inspection;
 pub mod ledger;

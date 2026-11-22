@@ -448,6 +448,16 @@ impl std::fmt::Display for CliError {
 /// 失败诊断始终写 stderr，不破坏 stdout 上的逐行协议。
 pub fn run() {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    // 协议角色只写给程序，不读取调用者的终端偏好。显式查角色帮助仍属于终端操作。
+    if args.is_empty()
+        || args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+        || matches!(
+            args.first().map(String::as_str),
+            Some("init" | "check" | "try" | "translate")
+        )
+    {
+        aproxy_ipc::i18n::init_terminal(|| aproxy_ipc::home::resolve_home().ok());
+    }
     let result = match args.split_first() {
         Some((name, [])) if name == "--help" || name == "-h" => {
             println!("{USAGE}");

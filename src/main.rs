@@ -50,6 +50,11 @@ pub(crate) fn main() -> std::process::ExitCode {
         }
     }
 
+    aproxy_ipc::i18n::init_terminal(|| {
+        language_settings_allowed(std::env::args_os().skip(1))
+            .then(aproxy_ipc::home::resolve_home)?
+            .ok()
+    });
     let cli = Cli::from_arg_matches_mut(&mut aproxy::cli::command_tree().get_matches())
         .unwrap_or_else(|e| e.exit());
     // `-V`/`--version` 与别的参数写在一起（`aproxy -V start`）时走到这里，输出同一行。
@@ -315,6 +320,19 @@ fn print_version_line() {
     let _ = writeln!(std::io::stdout(), "{}", aproxy::VERSION_LINE);
 }
 
+/// 只决定是否允许为终端文案读设置；选项的含义与合法性仍完全由 clap 判定。
+fn language_settings_allowed(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
+    let command = args.find(|s| s != "--version" && s != "-V");
+    let mut rest = args.take_while(|s| s != "--");
+    match command.as_deref().and_then(|s| s.to_str()) {
+        Some("install" | "upgrade") => !rest.any(|s| s == "--force"),
+        Some("__serve" | "__watchdog" | "restore-at-login") => {
+            rest.any(|s| s == "--help" || s == "-h")
+        }
+        _ => true,
+    }
+}
+
 /// 命令行恰好是 `aproxy --version` 或 `aproxy -V`（安装器探测版本就是这样调用的）。
 /// 只认这两种整行写法：与别的参数写在一起时交给 clap，它分得清 `-V` 是版本参数
 /// 还是另一个参数的取值。
@@ -362,6 +380,26 @@ fn resumes_install(command: &Commands) -> bool {
 #[cfg(test)]
 mod home_output_tests {
     use super::*;
+    #[test]
+    fn bootstrap_never_reads_force_or_worker_settings() {
+        for (args, allowed) in [
+            ("install --force", false),
+            ("-V upgrade latest --force --help", false),
+            ("install --download-proxy=--force", true),
+            ("install -- --force", true),
+            ("stop --force", true),
+            ("__serve --spec myfile", false),
+            ("__watchdog --help", true),
+            ("restore-at-login --home dir", false),
+        ] {
+            assert_eq!(
+                language_settings_allowed(args.split_whitespace().map(Into::into)),
+                allowed,
+                "{args}"
+            );
+        }
+    }
+
     /// 用 C1 的纯函数拒绝相对 home，不改变测试进程或任何子进程的真实 home。
     #[test]
     fn status_json_home_failure_returns_its_document_before_dispatch() {

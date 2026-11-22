@@ -13,6 +13,7 @@
 #[path = "../i18n/settings_edit.rs"]
 mod edit_text;
 use aproxy_ipc::i18n::Lang;
+use aproxy_ipc::i18n::diagnostic::Reason;
 pub mod edit;
 pub mod file;
 
@@ -192,7 +193,9 @@ pub fn read(path: &Path) -> Loaded {
                     key: None,
                     line: None,
                     column: None,
-                    message: format!("cannot read the file: {e}"),
+                    message: Reason::ReadFile {
+                        error: e.to_string(),
+                    },
                     details: Default::default(),
                 }],
             };
@@ -240,7 +243,7 @@ pub fn load_from(path: &Path) -> Settings {
         let first = loaded
             .diagnostics
             .first()
-            .map(|d| d.message.clone())
+            .map(|d| d.message.to_string())
             .unwrap_or_default();
         tracing::warn!(
             path = %path.display(),
@@ -291,7 +294,7 @@ pub fn describe_edit_error(
     let list = |diagnostics: &[Diagnostic]| {
         diagnostics
             .iter()
-            .map(|d| format!("\n  {}", crate::ops::start::render_diagnostic(d)))
+            .map(|d| format!("\n  {}", crate::ops::start::render_diagnostic(d, lang)))
             .collect::<String>()
     };
     match error {
@@ -385,15 +388,19 @@ pub enum AliasNameProblem {
 impl AliasNameProblem {
     /// 不从错误文字还原保留目标；同一枚举可由不同语言的接收端显示。
     pub fn render(self, lang: Lang) -> String {
+        self.diagnostic().render(lang)
+    }
+
+    fn diagnostic(self) -> Reason {
         let why = match self {
-            Self::Empty => return edit_text::empty_name(lang).into(),
-            Self::Numeric => return edit_text::numeric_name(lang).into(),
-            Self::All => edit_text::all(lang),
-            Self::Idle => edit_text::idle(lang),
-            Self::Default => edit_text::default_name(lang),
-            Self::Typo => edit_text::typo(lang),
+            Self::Empty => return Reason::AliasEmpty,
+            Self::Numeric => return Reason::AliasNumeric,
+            Self::All => Reason::AliasAll,
+            Self::Idle => Reason::AliasIdle,
+            Self::Default => Reason::AliasDefault,
+            Self::Typo => Reason::AliasTypo,
         };
-        edit_text::reserved(lang, why)
+        Reason::AliasReserved { why: Box::new(why) }
     }
 }
 

@@ -8,6 +8,7 @@
 //!   键路径换回原值，对不上就拒绝，不去猜；
 //! - schema 比这个版本高的文件一个字节都不动。
 
+use aproxy_ipc::i18n::diagnostic::Reason;
 use std::path::Path;
 
 use aproxy_ipc::diag::{Diagnostic, Level};
@@ -197,9 +198,9 @@ fn restore_placeholders(
                 key: Some(key.to_string()),
                 line: None,
                 column: None,
-                message: format!(
-                    "{key} was written back as a secret placeholder, but there is no stored value to keep there; enter the secret again"
-                ),
+                message: Reason::NoStoredSecret {
+                    key: key.to_owned(),
+                },
                 details: Map::new(),
             }])),
         };
@@ -409,6 +410,7 @@ mod tests {
         assert!(
             diagnostics[0]
                 .message
+                .to_string()
                 .contains("set defaults.base_url first")
         );
 

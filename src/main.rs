@@ -238,7 +238,7 @@ async fn run(cli: Cli) -> u8 {
             let _ = writeln!(
                 std::io::stderr(),
                 "[{level}]   {}",
-                aproxy::ops::start::render_diagnostic(d)
+                aproxy::ops::start::render_diagnostic(d, current())
             );
         }
         if tolerated {

@@ -11,6 +11,7 @@
 //!
 //! 诊断的 `message` 是英文；显示端按码去说各自语言的话。
 
+use crate::i18n::diagnostic::Reason;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
@@ -333,7 +334,9 @@ pub fn parse(text: &str, file: &Path) -> (FileConfig, Vec<Diagnostic>) {
                 key: None,
                 line: position.map(|p| p.0),
                 column: position.map(|p| p.1),
-                message: format!("TOML syntax error: {}", e.message()),
+                message: Reason::TomlSyntax {
+                    error: e.message().to_owned(),
+                },
                 details: Map::new(),
             });
             return (FileConfig::default(), ctx.diagnostics);
@@ -417,7 +420,7 @@ fn read_keepalive_trigger(ctx: &mut Ctx, t: &Tbl) -> Option<KeepaliveTrigger> {
             "config_invalid_value",
             &t.key_path("trigger"),
             span,
-            "keepalive.trigger = \"always\" cannot be set in the config file: it would break non-streaming clients. Only a format can ask for it, per request".to_string(),
+            Reason::AlwaysTrigger,
             json!({ "reason": "per_request_only" }),
         );
         return None;
@@ -428,9 +431,7 @@ fn read_keepalive_trigger(ctx: &mut Ctx, t: &Tbl) -> Option<KeepaliveTrigger> {
             "config_invalid_value",
             &t.key_path("trigger"),
             span,
-            format!(
-                "keepalive.trigger must be \"accept\", \"body_stream\" or \"any\", not {value:?}"
-            ),
+            Reason::Trigger { value },
             json!({ "reason": "not_one_of" }),
         );
     }
@@ -449,7 +450,9 @@ fn read_retry_rule(ctx: &mut Ctx, rule: &Tbl) -> Option<RetryRule> {
             "config_invalid_value",
             &rule.key_path("path"),
             rule.span_of("path"),
-            format!("not a valid regular expression: {e}"),
+            Reason::Regex {
+                error: e.to_string(),
+            },
             json!({ "reason": "invalid_regex" }),
         );
     }
@@ -463,7 +466,7 @@ fn read_retry_rule(ctx: &mut Ctx, rule: &Tbl) -> Option<RetryRule> {
                         "config_invalid_value",
                         &rule.key_path("status"),
                         rule.span_of("status"),
-                        format!("{code} is not an HTTP status code (100-599)"),
+                        Reason::HttpStatus { code },
                         json!({ "reason": "out_of_range" }),
                     );
                     None
@@ -477,7 +480,7 @@ fn read_retry_rule(ctx: &mut Ctx, rule: &Tbl) -> Option<RetryRule> {
             "config_not_supported",
             &rule.key_path("body"),
             rule.span_of("body"),
-            "the body matcher of retry rules is not implemented in this version".to_string(),
+            Reason::BodyMatcher,
             json!({}),
         );
     }
@@ -489,7 +492,7 @@ fn read_retry_rule(ctx: &mut Ctx, rule: &Tbl) -> Option<RetryRule> {
             "config_missing_key",
             &rule.key_path("max_attempts"),
             rule.span(),
-            "a retry rule needs max_attempts (0 means no limit)".to_string(),
+            Reason::RetryLimit,
             json!({}),
         );
     }
@@ -510,14 +513,14 @@ fn read_format(ctx: &mut Ctx, entry: &Tbl) -> Option<FormatEntry> {
             "config_missing_key",
             &entry.key_path("command"),
             entry.span(),
-            "a format needs command".to_string(),
+            Reason::MissingCommand,
             json!({}),
         ),
         Some(command) if command.trim().is_empty() => ctx.push(
             "config_invalid_value",
             &entry.key_path("command"),
             entry.span_of("command"),
-            "command must not be empty".to_string(),
+            Reason::EmptyCommand,
             json!({ "reason": "empty" }),
         ),
         #[cfg(windows)]
@@ -526,13 +529,15 @@ fn read_format(ctx: &mut Ctx, entry: &Tbl) -> Option<FormatEntry> {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .and_then(|n| n.rsplit_once('.'))
-                .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")) =>
+                .is_some_and(|(_, ext)| {
+                    ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")
+                }) =>
         {
             ctx.push(
                 "config_invalid_value",
                 &entry.key_path("command"),
                 entry.span_of("command"),
-                "batch files cannot be format commands; put the interpreter in command and the script in args".into(),
+                Reason::BatchCommand,
                 json!({ "reason": "batch_file" }),
             )
         }
@@ -559,7 +564,7 @@ fn read_format(ctx: &mut Ctx, entry: &Tbl) -> Option<FormatEntry> {
             "config_invalid_value",
             &entry.key_path("name"),
             entry.span_of("name").or_else(|| entry.span_of("command")),
-            "set name to 1–64 UTF-8 bytes without control characters".to_string(),
+            Reason::FormatName,
             json!({ "reason": reason }),
         );
     }
@@ -582,7 +587,7 @@ fn read_format(ctx: &mut Ctx, entry: &Tbl) -> Option<FormatEntry> {
             "config_missing_key",
             &entry.key_path("stages"),
             entry.span(),
-            "a format needs stages".to_string(),
+            Reason::MissingStages,
             json!({}),
         ),
         None => {}
@@ -592,7 +597,7 @@ fn read_format(ctx: &mut Ctx, entry: &Tbl) -> Option<FormatEntry> {
                     "config_invalid_value",
                     &entry.key_path("stages"),
                     entry.span_of("stages"),
-                    "stages must name at least one stage".to_string(),
+                    Reason::EmptyStages,
                     json!({ "reason": "empty" }),
                 );
             }
@@ -605,16 +610,16 @@ fn read_format(ctx: &mut Ctx, entry: &Tbl) -> Option<FormatEntry> {
                         "config_not_supported",
                         &entry.key_path("stages"),
                         entry.span_of("stages"),
-                        "the admit stage is not implemented in this version".to_string(),
+                        Reason::AdmitStage,
                         json!({}),
                     ),
                     None => ctx.push(
                         "config_invalid_value",
                         &entry.key_path("stages"),
                         entry.span_of("stages"),
-                        format!(
-                            "{stage:?} is not a stage; the stages are request, retry, decide, response, stream, heartbeat and notify"
-                        ),
+                        Reason::UnknownStage {
+                            stage: stage.to_string(),
+                        },
                         json!({ "reason": "not_one_of" }),
                     ),
                 }
@@ -632,7 +637,7 @@ fn read_format(ctx: &mut Ctx, entry: &Tbl) -> Option<FormatEntry> {
             "config_invalid_value",
             &entry.key_path("pool_max"),
             entry.span_of("pool_max"),
-            "pool_max must be at least 1".to_string(),
+            Reason::EmptyPool,
             json!({ "reason": "out_of_range" }),
         );
     }
@@ -658,8 +663,7 @@ fn read_format(ctx: &mut Ctx, entry: &Tbl) -> Option<FormatEntry> {
             "config_invalid_value",
             &entry.key_path("breaker_cooldown_secs"),
             entry.span_of("breaker_cooldown_secs"),
-            "breaker_cooldown_secs must not be 0; set breaker_failures = 0 to turn the breaker off"
-                .to_string(),
+            Reason::BreakerCooldown,
             json!({ "reason": "out_of_range" }),
         );
     }
@@ -671,7 +675,7 @@ fn read_format(ctx: &mut Ctx, entry: &Tbl) -> Option<FormatEntry> {
             "config_conflict",
             &entry.key_path("stages"),
             entry.span_of("stages"),
-            "a format cannot declare both response and stream".to_string(),
+            Reason::StageConflict,
             json!({}),
         );
     }
@@ -680,7 +684,7 @@ fn read_format(ctx: &mut Ctx, entry: &Tbl) -> Option<FormatEntry> {
             "config_conflict",
             &entry.key_path("process"),
             entry.span_of("stages"),
-            "a format that declares stream or notify must use process = \"persistent\"".to_string(),
+            Reason::PersistentStage,
             json!({}),
         );
     }
@@ -728,10 +732,9 @@ fn check_format_chain(ctx: &mut Ctx, formats: &[FormatEntry], tables: &[Tbl]) {
                 "config_conflict",
                 &format!("{path}.name"),
                 span.clone(),
-                format!(
-                    "two formats are named {:?}; names must be unique in the list",
-                    format.name
-                ),
+                Reason::DuplicateFormat {
+                    name: format.name.clone(),
+                },
                 json!({}),
             );
         }
@@ -744,10 +747,10 @@ fn check_format_chain(ctx: &mut Ctx, formats: &[FormatEntry], tables: &[Tbl]) {
                 "config_conflict",
                 &format!("{path}.stages"),
                 span,
-                format!(
-                    "format {:?} comes after {earlier:?}, which declares retry, so it must declare retry too: on a retry the earlier format produces a new request and this one has to process it again",
-                    format.name
-                ),
+                Reason::RetryChain {
+                    name: format.name.clone(),
+                    earlier: earlier.to_owned(),
+                },
                 json!({}),
             );
         }
@@ -763,7 +766,7 @@ fn narrow(ctx: &mut Ctx, table: &Tbl, key: &'static str, value: u64) -> Option<u
                 "config_invalid_value",
                 &table.key_path(key),
                 table.span_of(key),
-                format!("{value} is too large"),
+                Reason::TooLarge { value },
                 json!({ "reason": "out_of_range" }),
             );
             None
@@ -829,7 +832,7 @@ impl Ctx<'_> {
         code: &'static str,
         key: &str,
         span: Option<std::ops::Range<usize>>,
-        message: String,
+        message: Reason,
         details: Value,
     ) {
         let position = span.map(|span| line_column(self.text, span.start));
@@ -918,12 +921,12 @@ impl<'a> Tbl<'a> {
             .map(str::to_string)
     }
 
-    fn wrong_type(&self, ctx: &mut Ctx, key: &str, expected: &str) {
+    fn wrong_type(&self, ctx: &mut Ctx, key: &str, expected: fn(String) -> Reason) {
         ctx.push(
             "config_type",
             &self.key_path(key),
             self.span_of(key),
-            format!("{} must be {expected}", self.key_path(key)),
+            expected(self.key_path(key)),
             json!({}),
         );
     }
@@ -937,7 +940,7 @@ impl<'a> Tbl<'a> {
         match item.as_str() {
             Some(value) => Some((value.to_string(), self.span_of(key))),
             None => {
-                self.wrong_type(ctx, key, "a string");
+                self.wrong_type(ctx, key, |key| Reason::ExpectedString { key });
                 None
             }
         }
@@ -958,14 +961,16 @@ impl<'a> Tbl<'a> {
                         "config_invalid_value",
                         &self.key_path(key),
                         self.span_of(key),
-                        format!("{} must not be negative", self.key_path(key)),
+                        Reason::Negative {
+                            key: self.key_path(key),
+                        },
                         json!({ "reason": "out_of_range" }),
                     );
                     None
                 }
             },
             None => {
-                self.wrong_type(ctx, key, "an integer");
+                self.wrong_type(ctx, key, |key| Reason::ExpectedInteger { key });
                 None
             }
         }
@@ -975,7 +980,7 @@ impl<'a> Tbl<'a> {
         let item = self.get(key)?;
         let value = item.as_bool();
         if value.is_none() {
-            self.wrong_type(ctx, key, "true or false");
+            self.wrong_type(ctx, key, |key| Reason::ExpectedBoolean { key });
         }
         value
     }
@@ -1001,11 +1006,11 @@ impl<'a> Tbl<'a> {
                 "config_invalid_value",
                 &self.key_path(key),
                 span,
-                format!(
-                    "{} must be one of {}, not {value:?}",
-                    self.key_path(key),
-                    names.join(", ")
-                ),
+                Reason::OneOf {
+                    key: self.key_path(key),
+                    choices: names.join(", "),
+                    value,
+                },
                 json!({ "reason": "not_one_of" }),
             );
         }
@@ -1021,7 +1026,7 @@ impl<'a> Tbl<'a> {
                 .collect()
         });
         if values.is_none() {
-            self.wrong_type(ctx, key, "an array of strings");
+            self.wrong_type(ctx, key, |key| Reason::ExpectedStrings { key });
         }
         values
     }
@@ -1032,7 +1037,7 @@ impl<'a> Tbl<'a> {
             .as_array()
             .and_then(|array| array.iter().map(toml_edit::Value::as_integer).collect());
         if values.is_none() {
-            self.wrong_type(ctx, key, "an array of integers");
+            self.wrong_type(ctx, key, |key| Reason::ExpectedIntegers { key });
         }
         values
     }
@@ -1047,7 +1052,7 @@ impl<'a> Tbl<'a> {
                 .collect()
         });
         if values.is_none() {
-            self.wrong_type(ctx, key, "a table of strings");
+            self.wrong_type(ctx, key, |key| Reason::ExpectedStringTable { key });
         }
         values
     }
@@ -1058,7 +1063,7 @@ impl<'a> Tbl<'a> {
         match item.as_table_like() {
             Some(table) => Some(Tbl::new(table, self.key_path(key))),
             None => {
-                self.wrong_type(ctx, key, "a table");
+                self.wrong_type(ctx, key, |key| Reason::ExpectedTable { key });
                 None
             }
         }
@@ -1089,7 +1094,7 @@ impl<'a> Tbl<'a> {
                 .collect()
         });
         if inline.is_none() {
-            self.wrong_type(ctx, key, "an array of tables");
+            self.wrong_type(ctx, key, |key| Reason::ExpectedTables { key });
         }
         inline
     }
@@ -1108,7 +1113,9 @@ impl<'a> Tbl<'a> {
                 "config_unknown_key",
                 &self.key_path(&key),
                 self.span_of(&key),
-                format!("unknown key {}", self.key_path(&key)),
+                Reason::UnknownKey {
+                    key: self.key_path(&key),
+                },
                 json!({}),
             );
         }

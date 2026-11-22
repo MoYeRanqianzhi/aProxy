@@ -179,7 +179,10 @@ fn show(path: &Path, explicit: bool, effective: bool, json: bool) {
     for d in resolved.diagnostics.iter().filter(|d| !d.is_error()) {
         eprintln!(
             "{}",
-            text::warning(current(), &aproxy::ops::start::render_diagnostic(d))
+            text::warning(
+                current(),
+                &aproxy::ops::start::render_diagnostic(d, current())
+            )
         );
     }
     if !resolved.is_valid() {
@@ -455,7 +458,7 @@ async fn instances_using(written: &Path, given: &Path) -> Vec<u16> {
 /// 逐条打印诊断（stderr）：`文件:行:列: 键: 说明 [码]`。
 fn print_diagnostics(diagnostics: &[aproxy_ipc::diag::Diagnostic]) {
     for d in diagnostics {
-        eprintln!("  {}", aproxy::ops::start::render_diagnostic(d));
+        eprintln!("  {}", aproxy::ops::start::render_diagnostic(d, current()));
     }
 }
 

@@ -106,7 +106,7 @@ fn exit_if_invalid(path: &Path, loaded: &settings::Loaded) {
 /// 只列出阻止使用这份设置的诊断，警告不当作错误报告。
 fn print_errors(diagnostics: &[Diagnostic]) {
     for d in diagnostics.iter().filter(|d| d.is_error()) {
-        eprintln!("  {}", aproxy::ops::start::render_diagnostic(d));
+        eprintln!("  {}", aproxy::ops::start::render_diagnostic(d, current()));
     }
 }
 

@@ -62,7 +62,11 @@ impl std::fmt::Display for ConfigError {
             Self::Settings { file, diagnostics } => {
                 write!(f, "settings.json 有错误，实例没有启动:")?;
                 for d in diagnostics {
-                    write!(f, "\n  {}", render_diagnostic(d))?;
+                    write!(
+                        f,
+                        "\n  {}",
+                        render_diagnostic(d, aproxy_ipc::i18n::Lang::En)
+                    )?;
                 }
                 write!(
                     f,
@@ -76,7 +80,11 @@ impl std::fmt::Display for ConfigError {
             Self::Invalid { file, diagnostics } => {
                 write!(f, "配置错误:")?;
                 for d in diagnostics {
-                    write!(f, "\n  {}", render_diagnostic(d))?;
+                    write!(
+                        f,
+                        "\n  {}",
+                        render_diagnostic(d, aproxy_ipc::i18n::Lang::En)
+                    )?;
                 }
                 write!(
                     f,
@@ -138,7 +146,11 @@ pub fn resolve_runtime_config_in(
         })?;
     // 告警级的诊断（例如全局默认的凭据没有被继承）与扣下的凭据，记进日志
     for d in resolved.diagnostics.iter().filter(|d| !d.is_error()) {
-        tracing::warn!(code = d.code, "{}", render_diagnostic(d));
+        tracing::warn!(
+            code = d.code,
+            "{}",
+            render_diagnostic(d, aproxy_ipc::i18n::Lang::En)
+        );
     }
     for item in &resolved.withheld {
         tracing::info!(
@@ -159,13 +171,13 @@ pub fn resolve_runtime_config_in(
 }
 
 /// 一条诊断写成一行：`文件:行:列: 键: 说明 [码]`，没有的部分省略。
-pub fn render_diagnostic(d: &aproxy_ipc::diag::Diagnostic) -> String {
+pub fn render_diagnostic(d: &aproxy_ipc::diag::Diagnostic, lang: aproxy_ipc::i18n::Lang) -> String {
     render_diagnostic_fields(
         &d.file,
         d.line,
         d.column,
         d.key.as_deref(),
-        &d.message,
+        &d.message.render(lang),
         d.code,
     )
 }

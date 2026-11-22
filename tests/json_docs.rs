@@ -619,3 +619,69 @@ fn local_reports_follow_the_reader() {
         }
     }
 }
+
+/// 同一个类型错误经过设置编辑、配置解析与体检；有结构的原因只供终端排版，
+/// 对外仍是同一条英文句子，既不多出私有字段，也不受终端语言影响。
+#[test]
+fn nested_diagnostics_localize_without_changing_public_documents() {
+    let home = TestHome::new();
+    fs::write(home.path().join("config.toml"), "base_url = true\n").unwrap();
+    let call = |lang, args: &[&str]| {
+        home.cmd()
+            .env("APROXY_LANG", lang)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for (args, plain, key, en, zh) in [
+        (
+            vec!["settings", "set", "watchdog.enabled", "42", "--json"],
+            vec!["settings", "set", "watchdog.enabled", "42"],
+            "watchdog.enabled",
+            "watchdog.enabled must be true or false",
+            "watchdog.enabled 必须为 true 或 false",
+        ),
+        (
+            vec!["doctor", "--json"],
+            vec!["doctor"],
+            "base_url",
+            "base_url must be a string",
+            "base_url 必须为字符串",
+        ),
+    ] {
+        let a = call("en", &args);
+        let b = call("zh-CN", &args);
+        assert_eq!(a.status.code(), Some(3));
+        assert_eq!(b.status.code(), Some(3));
+        assert_eq!(a.stdout, b.stdout);
+        let doc = document(&b);
+        let items = match args[0] {
+            "settings" => doc["error"]["details"]["diagnostics"].as_array().unwrap(),
+            _ => doc["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["kind"] == "config")
+                .unwrap()["diagnostics"]
+                .as_array()
+                .unwrap(),
+        };
+        let d = items
+            .iter()
+            .find(|d| d["code"] == "config_type" && d["key"] == key)
+            .unwrap();
+        assert_eq!(d["message"], en);
+        assert!(d.get("render").is_none());
+        for (lang, want, other) in [("en", en, zh), ("zh-CN", zh, en)] {
+            let out = call(lang, &plain);
+            assert_eq!(out.status.code(), Some(3));
+            let human = String::from_utf8(if args[0] == "doctor" {
+                out.stdout
+            } else {
+                out.stderr
+            })
+            .unwrap();
+            assert!(human.contains(want) && !human.contains(other), "{human}");
+        }
+    }
+}

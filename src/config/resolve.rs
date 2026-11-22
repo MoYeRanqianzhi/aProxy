@@ -11,6 +11,7 @@
 //! 不分大小写，同名以 config.toml 为准，两张表各自合并）。`listen_addr`、`log_file`、`format`
 //! 属于单个实例，不从全局默认继承。
 
+use aproxy_ipc::i18n::diagnostic::Reason;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -435,7 +436,9 @@ pub fn resolve_text(
             Some(Source::Override) => (
                 path,
                 problem.key,
-                format!("{} (given on the command line)", problem.message),
+                Reason::Override {
+                    message: Box::new(problem.message),
+                },
             ),
             _ => (path, problem.key, problem.message),
         };
@@ -473,9 +476,17 @@ pub fn resolve_text(
         }
         let mut details = reason_details(item.reason);
         details.insert("key".to_string(), Value::String(item.key.clone()));
-        let (what, own_target) = match item.reason {
-            "proxy_differs" => ("proxy", "this config's proxy"),
-            _ => ("base_url", "this config's base_url"),
+        let what = if item.reason == "proxy_differs" {
+            "proxy"
+        } else {
+            "base_url"
+        };
+        let target = if item.target.is_empty() {
+            Reason::NotSet
+        } else {
+            Reason::Verbatim {
+                text: item.target.clone(),
+            }
         };
         diagnostics.push(Diagnostic {
             code: "default_credential_withheld",
@@ -484,14 +495,13 @@ pub fn resolve_text(
             key: Some(format!("defaults.{}", item.key)),
             line: None,
             column: None,
-            message: format!(
-                "the default {} was not inherited: it belongs to the default {what} ({}), and {own_target} is {}. This config has no {} of its own; set one in {} if the target needs it",
-                item.key,
-                item.default_target,
-                if item.target.is_empty() { "not set" } else { &item.target },
-                item.key,
-                path.display()
-            ),
+            message: Reason::Withheld {
+                key: item.key.clone(),
+                what: what.to_owned(),
+                default: item.default_target.clone(),
+                target: Box::new(target),
+                file: path.display().to_string(),
+            },
             details,
         });
     }
@@ -876,9 +886,18 @@ x-toml = "1"
             ]
         );
         let proxy = &resolved.diagnostics[0];
-        assert!(proxy.message.ends_with("(given on the command line)"));
+        assert!(
+            proxy
+                .message
+                .to_string()
+                .ends_with("(given on the command line)")
+        );
         // 说明里的 URL 已打码
-        assert!(!proxy.message.contains("secret"), "{}", proxy.message);
+        assert!(
+            !proxy.message.to_string().contains("secret"),
+            "{}",
+            proxy.message
+        );
     }
 
     /// 文件解析已经报过的问题不报第二遍。
@@ -1044,7 +1063,11 @@ stages = ["request"]
         assert_eq!(warning.severity, Level::Warning);
         assert_eq!(warning.details["key"], "api_key");
         assert_eq!(warning.details["reason"], "base_url_differs");
-        assert!(!warning.message.contains("secret"), "{}", warning.message);
+        assert!(
+            !warning.message.to_string().contains("secret"),
+            "{}",
+            warning.message
+        );
 
         // 这份配置自己有 key、有同名的头（不分大小写）：照样列进 withheld，但不告警
         let text = "base_url = \"https://relay.b.example\"\napi_key = \"own\"\n[override_headers]\nx-api-key = \"own-header\"";

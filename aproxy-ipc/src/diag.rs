@@ -4,6 +4,7 @@
 //! `details.diagnostics`，以及界面里。码取自码表的诊断族（[`crate::code`]）；`message` 是
 //! 一句英文，显示端按码与 `details` 去说各自语言的话。
 
+use crate::i18n::diagnostic::Reason;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -34,8 +35,9 @@ pub struct Diagnostic {
     /// 列号，从 1 起，按字符数
     #[serde(skip_serializing_if = "Option::is_none")]
     pub column: Option<u32>,
-    /// 一句英文说明
-    pub message: String,
+    /// 保留带参数的原因直到显示边界；公开文档只写一句英文说明。
+    #[serde(serialize_with = "Reason::serialize_english")]
+    pub message: Reason,
     /// 码表登记的 `details`
     pub details: Map<String, Value>,
 }
@@ -91,7 +93,7 @@ mod tests {
             key: None,
             line: Some(3),
             column: None,
-            message: "x".into(),
+            message: Reason::Verbatim { text: "x".into() },
             details: Map::new(),
         };
         assert_eq!(

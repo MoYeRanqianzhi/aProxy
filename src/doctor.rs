@@ -6,6 +6,7 @@ use crate::fsx::{Access, access_of};
 use crate::ops::enumerate::{self, GcPaused};
 use crate::settings::{self, Settings};
 use aproxy_ipc::diag::{Diagnostic, Level, has_errors};
+use aproxy_ipc::i18n::diagnostic::Reason;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io;
@@ -38,7 +39,7 @@ impl FileReport {
         code: &'static str,
         severity: Level,
         key: Option<&str>,
-        message: impl Into<String>,
+        message: Reason,
         details: Value,
     ) {
         self.diagnostics.push(Diagnostic {
@@ -48,7 +49,7 @@ impl FileReport {
             key: key.map(str::to_owned),
             line: None,
             column: None,
-            message: message.into(),
+            message,
             details: match details {
                 Value::Object(obj) => obj,
                 _ => Default::default(),
@@ -119,7 +120,7 @@ pub async fn run(settings_path: &Path) -> Report {
             code,
             Level::Warning,
             None,
-            "record cannot be read; it is left in place",
+            Reason::UnreadableRecord,
             item.reason.details,
         );
         files.push(file);
@@ -152,9 +153,7 @@ fn settings_report(
             .filter(|n| !aproxy_ipc::redact::is_secret_header(n))
         {
             let key = format!("defaults.{table}.{}", config::quote_key(name));
-            let message = format!(
-                "header {name} is sent to every target; if it carries a credential, move it into the configs that need it",
-            );
+            let message = Reason::SharedHeader { name: name.clone() };
             file.push(
                 "default_header_shared",
                 Level::Info,
@@ -169,9 +168,7 @@ fn settings_report(
         if n > 600 {
             // 两个设置都能写满 u64，放宽后再计算延迟。
             let delay = u128::from(n) * (u128::from(settings.watchdog_stale_after_cycles) + 1);
-            let message = format!(
-                "watchdog.heartbeat_secs is {n}: a hung instance is detected only after about {delay} seconds",
-            );
+            let message = Reason::HangDelay { n, delay };
             file.push(
                 "watchdog_slow_hang_detection",
                 Level::Warning,
@@ -185,7 +182,7 @@ fn settings_report(
                 "watchdog_restarts_disabled",
                 Level::Warning,
                 Some("watchdog.max_restarts"),
-                "watchdog.max_restarts is 0: crashed or hung instances are not restarted",
+                Reason::RestartsDisabled,
                 json!({}),
             );
         }
@@ -204,7 +201,7 @@ fn settings_report(
                 "config_dir_missing",
                 Level::Warning,
                 Some("config_dirs"),
-                format!("config directory {path} does not exist"),
+                Reason::MissingDir { path: path.clone() },
                 json!({"dir": path}),
             );
         }
@@ -218,16 +215,15 @@ fn settings_report(
 fn home_report(home: &Path) -> FileReport {
     let mut file = FileReport::new(home.display().to_string(), "home");
     if let Ok(Access::TooOpen { owned, who }) = access_of(home) {
-        let remedy = if owned {
-            "aproxy tightens it on its next write"
-        } else {
-            "it belongs to another user, so aproxy leaves it alone"
-        };
         file.push(
             "file_permissions_too_open",
             Level::Warning,
             None,
-            format!("the group or others can access the home ({who}); {remedy}"),
+            if owned {
+                Reason::OwnedHome { who }
+            } else {
+                Reason::OtherHome { who }
+            },
             json!({}),
         );
     }
@@ -277,12 +273,20 @@ fn config_reports(home: &Path, settings: &Settings, defaults: &Defaults) -> Vec<
                     continue;
                 }
                 let (reason, mut message) = if e.kind() == io::ErrorKind::NotFound {
-                    ("not_found", "config file does not exist".to_owned())
+                    ("not_found", Reason::MissingConfig)
                 } else {
-                    ("unreadable", format!("config file cannot be read: {e}"))
+                    (
+                        "unreadable",
+                        Reason::UnreadableConfig {
+                            error: e.to_string(),
+                        },
+                    )
                 };
                 if !aliases.is_empty() {
-                    message.push_str(&format!(" (alias {})", aliases.join(", ")));
+                    message = Reason::WithAliases {
+                        message: Box::new(message),
+                        aliases: aliases.join(", "),
+                    };
                 }
                 file.push(
                     "config_file_unreadable",
@@ -309,7 +313,7 @@ fn config_reports(home: &Path, settings: &Settings, defaults: &Defaults) -> Vec<
                                 code.name,
                                 Level::Warning,
                                 Some("delivery"),
-                                code.summary,
+                                Reason::ForwardUnguarded,
                                 json!({}),
                             );
                         }
@@ -326,21 +330,18 @@ fn config_reports(home: &Path, settings: &Settings, defaults: &Defaults) -> Vec<
                                 code.name,
                                 Level::Info,
                                 Some(&format!("format[{index}].stages")),
-                                code.summary,
+                                Reason::ForwardBuffered,
                                 json!({"format":secrets.replace(&f.name)}),
                             );
                         }
                     }
                     let addr = &cfg.listen_addr;
                     if !cfg.listen_is_loopback() {
-                        let suffix = if cfg.injects_credentials() {
-                            ", and the API key it injects"
+                        let message = if cfg.injects_credentials() {
+                            Reason::ExposedKey { addr: addr.clone() }
                         } else {
-                            ""
+                            Reason::ExposedProxy { addr: addr.clone() }
                         };
-                        let message = format!(
-                            "listen_addr {addr} is not a loopback address: any host that can reach this port can use the proxy{suffix}",
-                        );
                         file.push(
                             "listen_not_loopback",
                             Level::Warning,
@@ -360,7 +361,7 @@ fn config_reports(home: &Path, settings: &Settings, defaults: &Defaults) -> Vec<
                         "file_permissions_too_open",
                         Level::Warning,
                         None,
-                        format!("the group or others can access this file ({who})"),
+                        Reason::FilePermissions { who },
                         json!({}),
                     );
                 }
@@ -376,10 +377,10 @@ fn config_reports(home: &Path, settings: &Settings, defaults: &Defaults) -> Vec<
                 .filter(|&&j| j != i)
                 .map(|&j| files[j].file.clone())
                 .collect();
-            let message = format!(
-                "port {port} is also used by {}; these configs cannot run at the same time",
-                others.join(", ")
-            );
+            let message = Reason::SharedPort {
+                port,
+                files: others.join(", "),
+            };
             files[i].push(
                 "port_shared",
                 Level::Warning,
@@ -617,7 +618,10 @@ mod tests {
             ("file_permissions_too_open", Level::Warning)
         );
         assert!(
-            d.message.contains("mode 0750") && d.message.contains("tightens it on its next write")
+            d.message.to_string().contains("mode 0750")
+                && d.message
+                    .to_string()
+                    .contains("tightens it on its next write")
         );
         let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o750, "体检不改权限");
@@ -682,7 +686,7 @@ mod tests {
         let d = exposed[0];
         assert_eq!(d.file, one_file(&report, &open).file);
         assert_eq!(d.severity, Level::Warning);
-        assert!(d.message.contains("and the API key it injects"));
+        assert!(d.message.to_string().contains("and the API key it injects"));
         assert!(!format!("{report:?}").contains("sk-test"));
         assert_eq!(report.errors(), 0);
     }
@@ -709,8 +713,8 @@ mod tests {
                 .filter(|d| d.code == "listen_not_loopback")
                 .collect();
             assert_eq!(exposed.len(), 1);
-            assert!(exposed[0].message.contains("192.168.1.10:0"));
-            assert!(!exposed[0].message.contains("API key"));
+            assert!(exposed[0].message.to_string().contains("192.168.1.10:0"));
+            assert!(!exposed[0].message.to_string().contains("API key"));
         }
     }
 
@@ -737,7 +741,7 @@ mod tests {
             diags
                 .iter()
                 .any(|d| d.code == "watchdog_slow_hang_detection"
-                    && d.message.contains("10800 seconds")
+                    && d.message.to_string().contains("10800 seconds")
                     && d.details["heartbeat_secs"] == 3600)
         );
         assert!(diags.iter().any(|d| d.code == "watchdog_restarts_disabled"
@@ -775,7 +779,7 @@ mod tests {
         let d = &one_file(&report, &gone).diagnostics[0];
         assert_eq!(d.code, "config_file_unreadable");
         assert_eq!(d.details["reason"], "not_found");
-        assert!(d.message.ends_with("(alias a, z)"));
+        assert!(d.message.to_string().ends_with("(alias a, z)"));
     }
 
     #[test]

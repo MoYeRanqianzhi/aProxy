@@ -25,6 +25,7 @@
 //!
 //! 无实例快路径：broadcasting 直接跳过（restarting 为空）。
 
+use aproxy_ipc::i18n::diagnostic::Reason;
 use std::path::Path;
 
 use super::InstallFailure;
@@ -171,7 +172,7 @@ async fn snapshot_with_pending(run_dir: &Path, state: &InstallState) -> (Vec<Str
 }
 
 /// 不能读出重启所需文件时也给出定位到文件的 error 诊断，不能把没有诊断误当作通过。
-fn unreadable(code: &'static str, path: &Path, message: String) -> aproxy_ipc::diag::Diagnostic {
+fn unreadable(code: &'static str, path: &Path, message: Reason) -> aproxy_ipc::diag::Diagnostic {
     aproxy_ipc::diag::Diagnostic {
         code,
         severity: aproxy_ipc::diag::Level::Error,
@@ -193,7 +194,7 @@ fn precheck_snapshot(run_dir: &Path, snapshot: &[String]) -> Result<(), InstallF
             Err(e) => vec![unreadable(
                 "install_restore_unreadable",
                 &crate::spec::restore_path_in(run_dir, port),
-                e.to_string(),
+                e.diagnostic(),
             )],
             Ok(Some(record)) => {
                 let spec = record.spec;
@@ -206,12 +207,14 @@ fn precheck_snapshot(run_dir: &Path, snapshot: &[String]) -> Result<(), InstallF
                     Err(ConfigError::Missing(file)) => vec![unreadable(
                         "install_config_unreadable",
                         &file,
-                        "The configuration file does not exist.".into(),
+                        Reason::InstallMissing,
                     )],
                     Err(ConfigError::Read { file, error }) => vec![unreadable(
                         "install_config_unreadable",
                         &file,
-                        format!("Cannot read the configuration file: {error}"),
+                        Reason::InstallRead {
+                            error: error.to_string(),
+                        },
                     )],
                 }
             }

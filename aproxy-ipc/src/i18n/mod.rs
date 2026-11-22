@@ -1,5 +1,8 @@
 //! 终端文案在显示处选择语言；写日志、文件或协议的代码明确传 English，不受启动者影响。
 
+/// 严格配置解析和体检共用的诊断原因；序列化时只公开英文说明。
+pub mod diagnostic;
+
 use std::{ffi::OsStr, path::Path, sync::OnceLock};
 
 /// 由最终读者决定的文字语言；不序列化，也不跟随工作进程一起传递。
@@ -160,7 +163,7 @@ fn system_language() -> Option<Lang> {
 macro_rules! message {
     ($id:ident (), en: $en:literal, zh: $zh:literal $(,)?) => {
         #[doc = $en]
-        pub(crate) fn $id(lang: $crate::i18n::Lang) -> &'static str {
+        pub(crate) const fn $id(lang: $crate::i18n::Lang) -> &'static str {
             match lang {
                 $crate::i18n::Lang::En => const { format_args!(concat!($en)).as_str().unwrap() },
                 $crate::i18n::Lang::Zh => const { format_args!(concat!($zh)).as_str().unwrap() },

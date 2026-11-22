@@ -28,6 +28,7 @@ mod tests {
             assert!(d.iter().any(|d| {
                 d.code == "config_invalid_value"
                     && d.message
+                        .to_string()
                         .contains("interpreter in command and the script in args")
             }));
         }
@@ -410,7 +411,7 @@ pool_max = 0
                     brief(&diagnostics),
                     ["config_invalid_value format[0].name 2"]
                 );
-                assert!(diagnostics[0].message.contains("set name"));
+                assert!(diagnostics[0].message.to_string().contains("set name"));
             }
         }
         // 命令本身不受名字长度限制：显式取短名时，不检查没有被采用的文件名主干。
@@ -469,7 +470,7 @@ stages = ["request", "retry"]
 "#,
         );
         assert_eq!(brief(&diagnostics), ["config_conflict format[1].stages 8"]);
-        assert!(diagnostics[0].message.contains("\"route\""));
+        assert!(diagnostics[0].message.to_string().contains("\"route\""));
     }
 
     #[test]

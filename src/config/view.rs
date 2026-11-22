@@ -7,6 +7,7 @@
 //! 占位对象可以原样写回：[`restore_placeholders`] 把写回的值里的占位对象换回原值，对不上
 //! 就拒绝，而不是去猜。
 
+use aproxy_ipc::i18n::diagnostic::Reason;
 use std::path::Path;
 
 use aproxy_ipc::diag::{Diagnostic, Level};
@@ -428,9 +429,9 @@ fn unmatched(key: &str, file: &Path) -> EditError {
         key: Some(key.to_string()),
         line: None,
         column: None,
-        message: format!(
-            "{key} was written back as a secret placeholder, but there is no stored value to keep there; enter the secret again"
-        ),
+        message: Reason::NoStoredSecret {
+            key: key.to_owned(),
+        },
         details: Map::new(),
     }])
 }

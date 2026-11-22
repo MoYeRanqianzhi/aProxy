@@ -687,13 +687,13 @@ pub const TABLE: &[Code] = &[
     diagnostic(
         "forward_default_unguarded",
         Severity::Warning,
-        "The default delivery is forward while the chain has a decide program or an optional request program: when they are unavailable, requests are not retried.",
+        crate::i18n::diagnostic::forward_default_unguarded(crate::i18n::Lang::En),
         &[],
     ),
     diagnostic(
         "forward_response_buffered",
         Severity::Info,
-        "The default delivery is forward and the chain has a response program; that layer gathers each response, so those responses are not streamed. Declare stream instead where the program supports it.",
+        crate::i18n::diagnostic::forward_response_buffered(crate::i18n::Lang::En),
         &[req("format", T::String)],
     ),
     diagnostic(

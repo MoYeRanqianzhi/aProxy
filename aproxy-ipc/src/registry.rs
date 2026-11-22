@@ -1,6 +1,7 @@
 //! Home-scoped registry records and liveness probes. No function writes a record,
 //! removes a stale entry or terminates a process. Discovery exposes only the restore configuration path,
 //! never launch overrides or the captured environment.
+use crate::i18n::diagnostic::Reason;
 use crate::{
     client::ipc_ping_in,
     wire::{InstanceRecord, InstanceStatus},
@@ -357,12 +358,17 @@ pub enum Unreadable {
 
 impl std::fmt::Display for Unreadable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.diagnostic().fmt(f)
+    }
+}
+
+impl Unreadable {
+    /// 保留读记录失败的种类，使终端不必从英文说明猜测原因。
+    pub fn diagnostic(&self) -> Reason {
         match self {
-            Self::Io(e) => write!(f, "cannot read: {e}"),
-            Self::Parse(e) => write!(f, "not a valid record: {e}"),
-            Self::SchemaTooNew(schema) => {
-                write!(f, "written by a newer aproxy (schema {schema})")
-            }
+            Self::Io(e) => Reason::RecordRead { error: e.clone() },
+            Self::Parse(e) => Reason::RecordParse { error: e.clone() },
+            Self::SchemaTooNew(schema) => Reason::RecordSchema { schema: *schema },
         }
     }
 }

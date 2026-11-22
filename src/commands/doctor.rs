@@ -49,7 +49,10 @@ pub(crate) async fn handle_doctor_cmd(json: bool) {
                     Level::Warning => "WARN",
                     Level::Info => "INFO",
                 };
-                println!("[{level}] {}", aproxy::ops::start::render_diagnostic(d));
+                println!(
+                    "[{level}] {}",
+                    aproxy::ops::start::render_diagnostic(d, current())
+                );
                 if d.code == "config_unknown_key"
                     && let Some(key) = &d.key
                 {

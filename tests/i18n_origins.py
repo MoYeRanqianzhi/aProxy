@@ -60,11 +60,33 @@ def check():
     # These messages had English text from clap or the root command, but no Chinese
     # at baseline. Keep reporting them for review; do not exempt the rest of the module.
     english_only = {"root", "commands", "arguments", "options", "help_button", "help_short", "help_long", "help_command", "usage_template"}
+    # These variants came from the English-only parsers, semantic validator, registry
+    # and doctor checks. Continue rejecting unreviewed additions, even in the same file.
+    diagnostic_drafts = set("""
+forward_default_unguarded forward_response_buffered AlwaysTrigger BodyMatcher RetryLimit
+MissingCommand EmptyCommand BatchCommand FormatName MissingStages EmptyStages AdmitStage EmptyPool
+BreakerCooldown StageConflict PersistentStage TomlSyntax Trigger Regex HttpStatus UnknownStage
+DuplicateFormat RetryChain TooLarge Negative OneOf UnknownKey ExpectedString ExpectedNullableString
+ExpectedBoolean ExpectedUnsigned ExpectedObject ExpectedStrings ExpectedInteger ExpectedIntegers
+ExpectedStringTable ExpectedTable ExpectedTables SettingsObject HeartbeatMinimum StaleMinimum
+UiObject DefaultsBase DefaultsProxy JsonSyntax NewerSchema Schema Language DownloadChain BadAlias
+EmptyAliasPath InstanceDefault TomlValue MissingBase BaseScheme BaseQuery ListenPort ProxyUrl
+ProxyScheme ProxyHost ProxyMissing KeyHeader HeaderName HeaderValue EmptyHeartbeat HeartbeatLine
+HeartbeatEvent Override Verbatim Withheld NoStoredSecret ReadFile UnreadableRecord SharedHeader
+HangDelay RestartsDisabled MissingDir MissingConfig UnreadableConfig FilePermissions SharedPort
+WithAliases OwnedHome OtherHome ExposedKey ExposedProxy RecordRead RecordParse RecordSchema
+InstallMissing InstallRead
+""".split())
     for path in sorted(p for root in (ROOT, ROOT / "aproxy-format", ROOT / "aproxy-ipc") for p in (root / "src/i18n").glob("*.rs")):
         source = path.read_text(encoding="utf-8")
         tokens = [m for m in TOKEN.finditer(source) if not m[0].startswith(("//", "/*"))]
         name = None
+        declarative = False
         for i, tok in enumerate(tokens[:-4]):
+            if tok[0] == "reasons" and tokens[i + 1][0] == "!":
+                declarative = True
+            if declarative and tok[0][0].isupper() and tokens[i - 1][0] in {"{", ";"}:
+                name = tok[0]
             if tok[0] == "message" and tokens[i + 1][0] == "!":
                 name = tokens[i + 3][0]
             if tok[0] != "zh" or tokens[i + 1][0] != ":" or '"' not in tokens[i + 2][0]:
@@ -75,8 +97,9 @@ def check():
                 misses += 1
                 line = source.count("\n", 0, tok.start()) + 1
                 known = path.relative_to(ROOT).as_posix() == "src/i18n/help.rs" and name in english_only
-                unexpected += not known
-                reason = "no previous Chinese help" if known else "REVIEW"
+                diagnostic = path.relative_to(ROOT).as_posix() == "aproxy-ipc/src/i18n/diagnostic.rs" and name in diagnostic_drafts
+                unexpected += not (known or diagnostic)
+                reason = "no previous Chinese help" if known else "English-only diagnostic" if diagnostic else "REVIEW"
                 print(f"{path.relative_to(ROOT)}:{line} {name}: {value!r} ({reason})")
     print(f"{count} literals checked; {misses} without a baseline match")
     return unexpected != 0

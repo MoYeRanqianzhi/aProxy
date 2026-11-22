@@ -23,6 +23,7 @@ pub mod file;
 pub mod resolve;
 pub mod view;
 
+use aproxy_ipc::i18n::diagnostic::Reason;
 use std::{collections::HashMap, path::PathBuf};
 
 pub use file::{KeepaliveTrigger, KeySegment, RetryRule, parse_key_path};
@@ -39,22 +40,20 @@ pub const DEFAULT_KEEPALIVE_HEARTBEAT: &str = ": keepalive\n\n";
 /// - 含字段行（不以 `:` 开头的非空行，如 `event:`、`data:`）时以空行收尾，
 ///   让解析器把这个事件派发掉、清空缓冲。只含注释行与空行时无此要求。
 ///
-/// 返回违反的规则（一句英文，接在键名之后读），合法时 None。
-pub fn heartbeat_problem(hb: &str) -> Option<&'static str> {
+/// 返回违反的规则；诊断的接收方选择语言，合法时为 None。
+pub fn heartbeat_problem(hb: &str) -> Option<Reason> {
     if hb.is_empty() {
-        return Some("must not be empty (set keepalive.interval_secs = 0 to turn heartbeats off)");
+        return Some(Reason::EmptyHeartbeat);
     }
     let normalized = hb.replace("\r\n", "\n").replace('\r', "\n");
     if !normalized.ends_with('\n') {
-        return Some("must end with a line break, or the half line joins the first replayed line");
+        return Some(Reason::HeartbeatLine);
     }
     let has_field = normalized
         .split('\n')
         .any(|line| !line.is_empty() && !line.starts_with(':'));
     if has_field && !normalized.ends_with("\n\n") {
-        return Some(
-            "must end with a blank line when it has field lines such as event: or data:, or it merges with the first replayed event",
-        );
+        return Some(Reason::HeartbeatEvent);
     }
     None
 }
@@ -369,7 +368,7 @@ impl Config {
     pub fn problems(&self) -> Vec<Problem> {
         let mut out = Vec::new();
         let mut push =
-            |code: &'static str, key: &str, reason: Option<&'static str>, message: String| {
+            |code: &'static str, key: &str, reason: Option<&'static str>, message: Reason| {
                 out.push(Problem {
                     code,
                     key: key.to_string(),
@@ -379,20 +378,11 @@ impl Config {
             };
         let base = aproxy_ipc::redact::url(&self.base_url);
         if self.base_url.trim().is_empty() {
-            push(
-                "config_missing_key",
-                "base_url",
-                None,
-                "base_url is not set: it is the upstream API this instance forwards to".to_string(),
-            );
+            push("config_missing_key", "base_url", None, Reason::MissingBase);
         } else if let Err(reason) = self.base_url_problem() {
             let message = match reason {
-                "not_http_url" => {
-                    format!("base_url must start with http:// or https://, not {base}")
-                }
-                _ => format!(
-                    "base_url must not contain ? or #: the request path is appended to it, so the path would end up in the query ({base})"
-                ),
+                "not_http_url" => Reason::BaseScheme { base },
+                _ => Reason::BaseQuery { base },
             };
             push("config_invalid_value", "base_url", Some(reason), message);
         }
@@ -405,10 +395,9 @@ impl Config {
                 "config_invalid_value",
                 "listen_addr",
                 Some("no_port"),
-                format!(
-                    "listen_addr has no port or the port is not valid: {} (example: 127.0.0.1:12345)",
-                    self.listen_addr
-                ),
+                Reason::ListenPort {
+                    addr: self.listen_addr.clone(),
+                },
             );
         }
         if let Some(p) = &self.proxy {
@@ -418,7 +407,10 @@ impl Config {
                     "config_invalid_value",
                     "proxy",
                     Some("not_a_url"),
-                    format!("proxy is not a URL ({shown}): {e}"),
+                    Reason::ProxyUrl {
+                        shown,
+                        error: e.to_string(),
+                    },
                 ),
                 Ok(url) => {
                     if !matches!(
@@ -429,28 +421,21 @@ impl Config {
                             "config_invalid_value",
                             "proxy",
                             Some("unsupported_scheme"),
-                            format!(
-                                "proxy must be an http, https, socks4 or socks5 URL, not {shown}"
-                            ),
+                            Reason::ProxyScheme { shown },
                         );
                     } else if url.host_str().is_none() {
                         push(
                             "config_invalid_value",
                             "proxy",
                             Some("no_host"),
-                            format!("proxy has no host: {shown}"),
+                            Reason::ProxyHost { shown },
                         );
                     }
                 }
             }
         } else if self.proxy_username.is_some() || self.proxy_password.is_some() {
             // 只有配置了代理 URL，用户名与密码才有意义，否则是配置遗漏
-            push(
-                "config_missing_key",
-                "proxy",
-                None,
-                "proxy_username or proxy_password is set but proxy is not".to_string(),
-            );
+            push("config_missing_key", "proxy", None, Reason::ProxyMissing);
         }
         if let Some(hb) = &self.keepalive_heartbeat
             && let Some(why) = heartbeat_problem(hb)
@@ -459,7 +444,7 @@ impl Config {
                 "config_invalid_value",
                 "keepalive.heartbeat",
                 Some("breaks_sse_framing"),
-                format!("keepalive.heartbeat {why}"),
+                why,
             );
         }
         if let Some(t) = &self.keepalive_trigger
@@ -469,9 +454,9 @@ impl Config {
                 "config_invalid_value",
                 "keepalive.trigger",
                 Some("not_one_of"),
-                format!(
-                    "keepalive.trigger must be \"accept\", \"body_stream\" or \"any\", not {t:?}"
-                ),
+                Reason::Trigger {
+                    value: t.to_owned(),
+                },
             );
         }
         // 头：名字与值要能写进一个 HTTP 请求，否则每个请求都会在组装时失败
@@ -482,7 +467,7 @@ impl Config {
                 "config_invalid_value",
                 "api_key",
                 Some("invalid_header_value"),
-                "api_key contains characters that cannot be sent in an HTTP header".to_string(),
+                Reason::KeyHeader,
             );
         }
         for (table, headers) in [
@@ -498,16 +483,14 @@ impl Config {
                         "config_invalid_value",
                         &key,
                         Some("invalid_header_name"),
-                        format!("{name:?} is not a valid HTTP header name"),
+                        Reason::HeaderName { name: name.clone() },
                     );
                 } else if http::HeaderValue::from_str(&headers[name]).is_err() {
                     push(
                         "config_invalid_value",
                         &key,
                         Some("invalid_header_value"),
-                        format!(
-                            "the value of header {name} contains characters that cannot be sent in an HTTP header"
-                        ),
+                        Reason::HeaderValue { name: name.clone() },
                     );
                 }
             }
@@ -520,7 +503,9 @@ impl Config {
                     "config_invalid_value",
                     &format!("retry.rules[{index}].path"),
                     Some("invalid_regex"),
-                    format!("not a valid regular expression: {e}"),
+                    Reason::Regex {
+                        error: e.to_string(),
+                    },
                 );
             }
         }
@@ -531,7 +516,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         match self.problems().into_iter().next() {
             None => Ok(()),
-            Some(problem) => Err(problem.message),
+            Some(problem) => Err(problem.message.to_string()),
         }
     }
 
@@ -847,7 +832,7 @@ pub struct Problem {
     /// `config_invalid_value` 的 `details.reason`
     pub reason: Option<&'static str>,
     /// 一句英文说明，URL 已打码
-    pub message: String,
+    pub message: Reason,
 }
 
 /// 把一个名字写成 TOML 键路径里的一段：裸键原样，其余加引号（`x-api-key` 是裸键，
@@ -1343,7 +1328,7 @@ mod tests {
             ]
         );
         assert!(
-            !problems[0].message.contains("secret"),
+            !problems[0].message.to_string().contains("secret"),
             "{}",
             problems[0].message
         );

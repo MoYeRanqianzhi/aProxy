@@ -10,6 +10,7 @@
 //!
 //! 诊断的 `message` 是英文；显示端按码去说各自语言的话。
 
+use aproxy_ipc::i18n::diagnostic::Reason;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -49,19 +50,16 @@ pub fn parse(text: &str, file: &Path) -> (Settings, Vec<Diagnostic>) {
                 key: None,
                 line: u32::try_from(e.line()).ok().filter(|l| *l > 0),
                 column: u32::try_from(e.column()).ok().filter(|c| *c > 0),
-                message: format!("JSON syntax error: {e}"),
+                message: Reason::JsonSyntax {
+                    error: e.to_string(),
+                },
                 details: Map::new(),
             });
             return (settings, ctx.diagnostics);
         }
     };
     let Some(root) = root.as_object() else {
-        ctx.push(
-            "config_type",
-            "",
-            "settings.json must be a JSON object".to_string(),
-            json!({}),
-        );
+        ctx.push("config_type", "", Reason::SettingsObject, json!({}));
         return (settings, ctx.diagnostics);
     };
     let root = Obj::new(root, String::new());
@@ -76,9 +74,10 @@ pub fn parse(text: &str, file: &Path) -> (Settings, Vec<Diagnostic>) {
                 ctx.push(
                     "settings_schema_too_new",
                     "schema",
-                    format!(
-                        "settings.json has schema {schema}, written by a newer aproxy; this version reads schema {SCHEMA}. Upgrade aproxy, or go back to the version you need with `aproxy install --force <version>`"
-                    ),
+                    Reason::NewerSchema {
+                        schema,
+                        supported: SCHEMA,
+                    },
                     json!({}),
                 );
                 return (settings, ctx.diagnostics);
@@ -86,7 +85,7 @@ pub fn parse(text: &str, file: &Path) -> (Settings, Vec<Diagnostic>) {
             _ => ctx.push(
                 "config_invalid_value",
                 "schema",
-                format!("schema must be {SCHEMA}"),
+                Reason::Schema { supported: SCHEMA },
                 json!({ "reason": "out_of_range" }),
             ),
         },
@@ -99,7 +98,7 @@ pub fn parse(text: &str, file: &Path) -> (Settings, Vec<Diagnostic>) {
             ctx.push(
                 "config_invalid_value",
                 "language",
-                format!("language must be \"system\", \"en\" or \"zh-CN\", not {language:?}"),
+                Reason::Language { language },
                 json!({ "reason": "not_one_of" }),
             );
         }
@@ -124,7 +123,7 @@ pub fn parse(text: &str, file: &Path) -> (Settings, Vec<Diagnostic>) {
                 ctx.push(
                     "config_invalid_value",
                     &w.key_path("heartbeat_secs"),
-                    "watchdog.heartbeat_secs must be at least 1".to_string(),
+                    Reason::HeartbeatMinimum,
                     json!({ "reason": "out_of_range" }),
                 );
             } else {
@@ -137,7 +136,7 @@ pub fn parse(text: &str, file: &Path) -> (Settings, Vec<Diagnostic>) {
                 ctx.push(
                     "config_invalid_value",
                     &w.key_path("stale_after_cycles"),
-                    "watchdog.stale_after_cycles must be at least 1".to_string(),
+                    Reason::StaleMinimum,
                     json!({ "reason": "out_of_range" }),
                 );
             } else {
@@ -150,7 +149,7 @@ pub fn parse(text: &str, file: &Path) -> (Settings, Vec<Diagnostic>) {
                 Err(_) => ctx.push(
                     "config_invalid_value",
                     &w.key_path("max_restarts"),
-                    format!("{v} is too large"),
+                    Reason::TooLarge { value: v },
                     json!({ "reason": "out_of_range" }),
                 ),
             }
@@ -180,9 +179,9 @@ pub fn parse(text: &str, file: &Path) -> (Settings, Vec<Diagnostic>) {
                 Err(e) => ctx.push(
                     "config_invalid_value",
                     &update.key_path("download_chain"),
-                    format!(
-                        "update.download_chain must be an array of \"github\", \"npm\", \"cargo-binstall\", \"cargo\" or {{\"url\": …}}: {e}"
-                    ),
+                    Reason::DownloadChain {
+                        error: e.to_string(),
+                    },
                     json!({ "reason": "not_one_of" }),
                 ),
             }
@@ -197,12 +196,7 @@ pub fn parse(text: &str, file: &Path) -> (Settings, Vec<Diagnostic>) {
     if let Some(ui) = root.get("ui")
         && !ui.is_object()
     {
-        ctx.push(
-            "config_type",
-            "ui",
-            "ui must be an object".to_string(),
-            json!({}),
-        );
+        ctx.push("config_type", "ui", Reason::UiObject, json!({}));
     }
     root.finish(&mut ctx);
     (settings, ctx.diagnostics)
@@ -218,17 +212,19 @@ fn read_aliases(ctx: &mut Ctx, aliases: &Obj) -> HashMap<String, String> {
             ctx.push(
                 "config_type",
                 &key,
-                format!("{key} must be a string"),
+                Reason::ExpectedString { key: key.clone() },
                 json!({}),
             );
             continue;
         };
         if let Err(problem) = super::validate_alias_name(name) {
-            let reason = problem.render(aproxy_ipc::i18n::Lang::En);
             ctx.push(
                 "config_invalid_value",
                 &key,
-                format!("{name:?} cannot be used as an alias: {reason}"),
+                Reason::BadAlias {
+                    name: name.clone(),
+                    reason: Box::new(problem.diagnostic()),
+                },
                 json!({ "reason": "reserved_name" }),
             );
             continue;
@@ -237,7 +233,7 @@ fn read_aliases(ctx: &mut Ctx, aliases: &Obj) -> HashMap<String, String> {
             ctx.push(
                 "config_invalid_value",
                 &key,
-                format!("alias {name:?} points at an empty path"),
+                Reason::EmptyAliasPath { name: name.clone() },
                 json!({ "reason": "empty" }),
             );
             continue;
@@ -257,9 +253,7 @@ fn read_defaults(ctx: &mut Ctx, defaults: &Obj, file: &Path) -> FileConfig {
             ctx.push(
                 "config_unknown_key",
                 &defaults.key_path(name),
-                format!(
-                    "{name} cannot have a global default: it belongs to a single instance, so set it in that instance's config.toml"
-                ),
+                Reason::InstanceDefault { name: name.clone() },
                 json!({}),
             );
             continue;
@@ -274,7 +268,7 @@ fn read_defaults(ctx: &mut Ctx, defaults: &Obj, file: &Path) -> FileConfig {
                 ctx.push(
                     "config_type",
                     &key,
-                    format!("{key} has a value that a config key cannot hold (null, or a number out of range)"),
+                    Reason::TomlValue { key: key.clone() },
                     json!({}),
                 );
             }
@@ -299,7 +293,7 @@ fn read_defaults(ctx: &mut Ctx, defaults: &Obj, file: &Path) -> FileConfig {
         ctx.push(
             "config_missing_key",
             &defaults.key_path("base_url"),
-            "defaults has an api_key or a credential header but no base_url: set defaults.base_url first, so the credential is only sent to that upstream".to_string(),
+            Reason::DefaultsBase,
             json!({}),
         );
     }
@@ -309,7 +303,7 @@ fn read_defaults(ctx: &mut Ctx, defaults: &Obj, file: &Path) -> FileConfig {
         ctx.push(
             "config_missing_key",
             &defaults.key_path("proxy"),
-            "defaults has proxy credentials but no proxy: set defaults.proxy first".to_string(),
+            Reason::DefaultsProxy,
             json!({}),
         );
     }
@@ -383,7 +377,7 @@ struct Ctx {
 
 impl Ctx {
     /// 记一条 error 级诊断。`key` 为空串表示问题不属于某个键
-    fn push(&mut self, code: &'static str, key: &str, message: String, details: Value) {
+    fn push(&mut self, code: &'static str, key: &str, message: Reason, details: Value) {
         self.diagnostics.push(Diagnostic {
             code,
             severity: Level::Error,
@@ -431,21 +425,16 @@ impl<'a> Obj<'a> {
         self.map.get(key)
     }
 
-    fn wrong_type(&self, ctx: &mut Ctx, key: &str, expected: &str) {
+    fn wrong_type(&self, ctx: &mut Ctx, key: &str, expected: fn(String) -> Reason) {
         let path = self.key_path(key);
-        ctx.push(
-            "config_type",
-            &path,
-            format!("{path} must be {expected}"),
-            json!({}),
-        );
+        ctx.push("config_type", &path, expected(path.clone()), json!({}));
     }
 
     fn string(&self, ctx: &mut Ctx, key: &'static str) -> Option<String> {
         let value = self.get(key)?;
         let string = value.as_str().map(str::to_string);
         if string.is_none() {
-            self.wrong_type(ctx, key, "a string");
+            self.wrong_type(ctx, key, |key| Reason::ExpectedString { key });
         }
         string
     }
@@ -456,7 +445,7 @@ impl<'a> Obj<'a> {
             Value::Null => None,
             Value::String(s) => Some(s.clone()),
             _ => {
-                self.wrong_type(ctx, key, "a string or null");
+                self.wrong_type(ctx, key, |key| Reason::ExpectedNullableString { key });
                 None
             }
         }
@@ -467,7 +456,7 @@ impl<'a> Obj<'a> {
         let value = self.get(key)?;
         let integer = value.as_u64();
         if integer.is_none() {
-            self.wrong_type(ctx, key, "a non-negative integer");
+            self.wrong_type(ctx, key, |key| Reason::ExpectedUnsigned { key });
         }
         integer
     }
@@ -476,7 +465,7 @@ impl<'a> Obj<'a> {
         let value = self.get(key)?;
         let boolean = value.as_bool();
         if boolean.is_none() {
-            self.wrong_type(ctx, key, "true or false");
+            self.wrong_type(ctx, key, |key| Reason::ExpectedBoolean { key });
         }
         boolean
     }
@@ -490,7 +479,7 @@ impl<'a> Obj<'a> {
                 .collect()
         });
         if list.is_none() {
-            self.wrong_type(ctx, key, "an array of strings");
+            self.wrong_type(ctx, key, |key| Reason::ExpectedStrings { key });
         }
         list
     }
@@ -500,7 +489,7 @@ impl<'a> Obj<'a> {
         match value.as_object() {
             Some(map) => Some(Obj::new(map, self.key_path(key))),
             None => {
-                self.wrong_type(ctx, key, "an object");
+                self.wrong_type(ctx, key, |key| Reason::ExpectedObject { key });
                 None
             }
         }
@@ -518,7 +507,7 @@ impl<'a> Obj<'a> {
                 ctx.push(
                     "config_unknown_key",
                     &path,
-                    format!("unknown key {path}"),
+                    Reason::UnknownKey { key: path.clone() },
                     json!({}),
                 );
             }
@@ -696,7 +685,7 @@ mod tests {
             parse_text(r#"{"schema": 2, "brand_new_section": {}, "watchdog": {"enabled": false}}"#);
         // 只报这一条，不为读不懂的内容报一串未知键
         assert_eq!(brief(&diagnostics), ["settings_schema_too_new schema"]);
-        let message = &diagnostics[0].message;
+        let message = diagnostics[0].message.to_string();
         assert!(
             message.contains("Upgrade aproxy") && message.contains("install --force"),
             "{message}"
@@ -770,7 +759,10 @@ mod tests {
         );
         let d = &diagnostics[0];
         assert!(d.is_error());
-        assert_eq!(d.message, "watchdog.stale_after_cycles must be at least 1");
+        assert_eq!(
+            d.message.to_string(),
+            "watchdog.stale_after_cycles must be at least 1"
+        );
         assert_eq!(d.details["reason"], "out_of_range");
         assert_eq!(
             settings.watchdog_stale_after_cycles,
@@ -847,6 +839,7 @@ mod tests {
         assert!(
             diagnostics[0]
                 .message
+                .to_string()
                 .contains("set defaults.base_url first")
         );
 

@@ -35,10 +35,54 @@ message!(exit_status(code: u32), en: "exit status {code} (0x{code:08x})", zh: "�
 
 message!(no_status(), en: "exit status unavailable", zh: "无法取得退出状态");
 
+message!(local_variant(path:&str, got:&str, want:&str), en: "{path} is a {got} build; --variant requires {want}.", zh: "{path} 是 {got} 版本，与 --variant {want} 不符");
+
+message!(unknown_variant(), en: "unknown variant", zh: "未知变体");
+
+message!(self_exe(e:&str), en: "Cannot locate the current executable: {e}", zh: "无法定位自身可执行文件: {e}");
+
+message!(cannot_run(e:&str), en: "The downloaded file cannot run: {e}", zh: "下载产物不可运行: {e}");
+
+message!(bad_download(e:&str), en: "Downloaded file verification failed: {e}", zh: "下载产物校验失败: {e}");
+
+message!(wrong_version(got:&str,target:&str), en: "The downloaded binary reports version {got}; expected {target}.", zh: "下载产物自报 {got}，与目标版本 {target} 不符");
+
+message!(download_variant(asset:&str,got:&str,want:&str), en: "Downloaded {asset} reports variant {got}; expected {want}.", zh: "下载的 {asset} 自报变体 {got}，不是要装的 {want}");
+
+message!(unknown(), en: "unknown", zh: "未知");
+
+message!(asset_failed(asset:&str,e:&str), en: "{asset} cannot run on this system ({e})", zh: "{asset} 在本机不可运行（{e}）");
+
+message!(cannot_abort(phase:InstallPhase), en: "The installation has reached binary replacement (phase {phase:?}) and cannot roll back. Some instances may already run the target version. Interrupted installations resume automatically. For manual recovery, follow the skill’s manual update instructions.", zh: "安装已进入交换阶段（phase {phase:?}），无法回滚——实例可能已开始滚动到新版本。\n中断的安装会自动续作完成；如需手动干预，按 skill 的手动更新兜底路径操作。");
+
 /// 安装接手者留下的私有排版参数，不是事件码，也不进入公开的 details。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "id", content = "args", rename_all = "snake_case")]
 pub enum Cause {
+    /// 显式本地文件与要安装的变体不一致。
+    LocalVariant {
+        path: String,
+        got: Option<String>,
+        want: String,
+    },
+    /// 收编时无法取得本进程的镜像路径。
+    SelfExe(String),
+    /// 下载文件执行探测失败。
+    CannotRun(Box<Cause>),
+    /// 下载的文件不是可验证的 aProxy 发布产物。
+    BadDownload(Box<Cause>),
+    /// 候选文件报告了另一个版本。
+    WrongVersion { got: String, target: String },
+    /// 下载的变体与文件名对应不上。
+    DownloadVariant {
+        asset: String,
+        got: Option<String>,
+        want: String,
+    },
+    /// 候选产物无法在本机运行。
+    AssetFailed { asset: String, cause: Box<Cause> },
+    /// 交换之后可能已有部分实例升级，不能回滚。
+    CannotAbort(InstallPhase),
     /// 旧版本或系统提供的证据不按文字反推类别。
     Evidence(String),
     /// 旧版启动、当前无法管理的实例，临终显示不重新枚举进程。
@@ -78,6 +122,24 @@ impl Cause {
     /// 状态文件、事件和日志选英文，终端可以对相同的事实另选语言。
     pub fn render(&self, lang: Lang) -> String {
         match self {
+            Self::LocalVariant { path, got, want } => local_variant(
+                lang,
+                path,
+                got.as_deref().unwrap_or_else(|| unknown_variant(lang)),
+                want,
+            ),
+            Self::SelfExe(e) => self_exe(lang, e),
+            Self::CannotRun(e) => cannot_run(lang, &e.render(lang)),
+            Self::BadDownload(e) => bad_download(lang, &e.render(lang)),
+            Self::WrongVersion { got, target } => wrong_version(lang, got, target),
+            Self::DownloadVariant { asset, got, want } => download_variant(
+                lang,
+                asset,
+                got.as_deref().unwrap_or_else(|| unknown(lang)),
+                want,
+            ),
+            Self::AssetFailed { asset, cause } => asset_failed(lang, asset, &cause.render(lang)),
+            Self::CannotAbort(phase) => cannot_abort(lang, *phase),
             Self::Evidence(s) => s.clone(),
             Self::Unmanaged(pids) => unmanaged(
                 lang,

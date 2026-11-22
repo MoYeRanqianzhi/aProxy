@@ -252,7 +252,9 @@ fn install_from_with_instance_rolling_restart() {
     );
     // 交棒后 CLI 等到接手者终验通过才退出：退出码 0 + 完成提示即真实结局
     assert!(
-        status.success() && output.contains("新版本进程已接手安装") && output.contains("安装完成"),
+        status.success()
+            && output.contains("The target version has taken over")
+            && output.contains("Installation complete"),
         "CLI 应交棒、在接手者完成后以 0 退出并报告完成; 输出: {output}"
     );
 
@@ -351,7 +353,10 @@ async fn jurisdiction_check_rejects_foreign_binary() {
     );
     assert!(!out.status.success(), "在线安装应被拒绝: {text}");
     assert!(text.contains("--adopt"), "在线安装应报管辖错误: {text}");
-    assert!(!text.contains("开始下载"), "管辖检查应先于下载: {text}");
+    assert!(
+        !text.contains("Downloading aProxy"),
+        "管辖检查应先于下载: {text}"
+    );
 
     let _ = env
         .home
@@ -662,12 +667,12 @@ fn install_instance_failure_exits_nonzero_and_keeps_restore() {
     );
     assert!(
         stderr.contains("Precheck failed for the instance on port")
-            && !stderr.contains("滚动已中止"),
+            && !stderr.contains("Rolling restarts stopped"),
         "应给出预检诊断: {stderr}"
     );
     // 失败发生在接手的目标版本进程里，经 CLI 轮询 install.state 转告
     assert!(
-        stdout.contains("新版本进程已接手安装"),
+        stdout.contains("The target version has taken over"),
         "应交给目标版本驱动: {stdout}"
     );
     assert!(
@@ -933,12 +938,15 @@ fn staged_target_drives_the_install_and_its_failure_reaches_the_installer() {
         Some(1),
         "stdout: {stdout} stderr: {stderr}"
     );
-    assert!(stdout.contains("新版本进程已接手安装"), "{stdout}");
+    assert!(
+        stdout.contains("The target version has taken over"),
+        "{stdout}"
+    );
     // 「实例 <端口> 滚动重启失败」只出现在接手者记下的 last_error 里（中止指引
     // 是安装者自己的文案），据此确认原因是从接手者转告过来的
     assert!(
         stderr.contains(&format!("实例 {} 滚动重启失败", env.port))
-            && stderr.contains("滚动已中止"),
+            && stderr.contains("Rolling restarts stopped"),
         "应转告接手者的失败原因与中止指引: {stderr}"
     );
     let log = std::fs::read_to_string(&calls).unwrap();
@@ -1115,7 +1123,7 @@ fn install_from_checks_the_variant() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains(&format!("是 {own} 版本，与 --variant {other} 不符")),
+        stderr.contains(&format!("is a {own} build; --variant requires {other}")),
         "{stderr}"
     );
     assert_eq!(std::fs::read(&bin).unwrap(), before, "bin 不应被动");
@@ -1148,13 +1156,16 @@ fn a_desktop_build_no_channel_delivers_is_not_replaced() {
         );
         (out.status.code(), text)
     };
-    let hint = "要装的是带桌面界面的版本";
+    let hint = "The default variant includes the desktop interface";
     let own = aproxy::install::force::VersionLine::own().variant.unwrap();
 
     // 没写 --variant：要装的就是本构建的变体，带界面的构建才提示
     let (code, text) = run(&["9.9.9", "--no-skills"]);
     assert_eq!(code, Some(1), "{text}");
-    assert!(!text.contains("改用"), "下载链失败不改试别的产物: {text}");
+    assert!(
+        !text.contains("Trying "),
+        "下载链失败不改试别的产物: {text}"
+    );
     assert_eq!(
         text.contains(hint),
         own == aproxy::install::force::VARIANT_DESKTOP,

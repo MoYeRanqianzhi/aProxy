@@ -337,7 +337,7 @@ async fn install_precheck_failure_changes_nothing() {
     assert!(
         err.contains("Precheck failed for the instance on port")
             && err.contains("config_unknown_key")
-            && !err.contains("滚动已中止"),
+            && !err.contains("Rolling restarts stopped"),
         "{err}"
     );
     let st = state::load_in(h.path()).unwrap();
@@ -454,7 +454,7 @@ fn install_check_reports_a_failed_query() {
     assert!(
         String::from_utf8(out.stderr)
             .unwrap()
-            .contains("查询最新版本")
+            .contains("Checking the latest version")
     );
     for name in ["ledger", "install", "bin"] {
         assert!(!h.path().join(name).exists());

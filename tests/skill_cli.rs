@@ -98,7 +98,7 @@ async fn roundtrip_and_aliases() {
             .contains("--skills-only")
     );
     let bad = run(&h, &["install", OTHER_VERSION, "--skills-only"], 2);
-    assert!(String::from_utf8(bad.stderr).unwrap().contains("先升级"));
+    assert!(String::from_utf8(bad.stderr).unwrap().contains("Upgrade aProxy before installing newer documentation"));
     run(&h, &["skill", "install", VERSION], 2);
     let list: Value =
         serde_json::from_slice(&run(&h, &["skill", "list", "--json"], 0).stdout).unwrap();

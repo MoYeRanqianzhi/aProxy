@@ -1006,7 +1006,7 @@ impl WatchdogState {
     /// install.state 残留——分工原则）。无效/无宣告 → false，常态零改变。
     fn install_announcement_active(&self) -> bool {
         crate::install::announce::read(&self.cfg.home, &self.cfg.run_dir)
-            .is_some_and(|a| crate::install::announce::is_active(&a, now_millis()))
+            .is_some_and(|a| crate::install::announce::is_active(&a, now_millis()) != Some(false))
     }
 
     /// 安装态死亡复查：等 install 以新 exe 重新拉起实例（注册表记录重新
@@ -1038,7 +1038,7 @@ impl WatchdogState {
         let Some(ann) = crate::install::announce::read(&self.cfg.home, &self.cfg.run_dir) else {
             return;
         };
-        if crate::install::announce::is_active(&ann, now_millis()) {
+        if crate::install::announce::is_active(&ann, now_millis()) != Some(false) {
             return;
         }
         tracing::warn!(

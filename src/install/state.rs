@@ -349,10 +349,11 @@ pub fn is_stale(state: &InstallState, now_secs: u64) -> bool {
     match state.installer_pid {
         0 => true,
         pid if pid == std::process::id() => false,
-        pid => match crate::process::process_start_time(pid) {
-            None => true,
-            Some(_) => state.updated_at.saturating_add(STALE_AFTER_SECS) <= now_secs,
-        },
+        // 查不到启动时刻不等于进程已死；只有确认退出才提前接管，否则等更新超时。
+        pid => {
+            crate::process::process_exited(pid) == Some(true)
+                || state.updated_at.saturating_add(STALE_AFTER_SECS) <= now_secs
+        }
     }
 }
 

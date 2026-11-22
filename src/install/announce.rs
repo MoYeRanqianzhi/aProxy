@@ -150,7 +150,7 @@ pub fn clear_expired(home: &Path, run_dir: &Path) {
     {
         let path = location(home, run_dir);
         if imp::load_section(&path)
-            .is_some_and(|ann| !is_active(&ann, crate::watchdog::now_millis()))
+            .is_some_and(|ann| is_active(&ann, crate::watchdog::now_millis()) == Some(false))
         {
             let _ = std::fs::remove_file(&path);
         }
@@ -161,9 +161,12 @@ pub fn clear_expired(home: &Path, run_dir: &Path) {
 
 /// 宣告有效性判定（看护者/守护的唯一入口）：节存在 + 心跳新鲜 + pid 存活。
 /// 心跳旧 = install 挂死/unix 残留 → 无效（走保活续作路径，不是「在安装」）。
-pub fn is_active(ann: &Announcement, now_ms: u64) -> bool {
-    now_ms.saturating_sub(ann.heartbeat_ms) <= FRESH_MS
-        && crate::process::process_start_time(ann.installer_pid).is_some()
+/// 心跳新鲜但进程状态不可查时返回 None：暂不清理或接管，等下一次心跳判定。
+pub fn is_active(ann: &Announcement, now_ms: u64) -> Option<bool> {
+    if now_ms.saturating_sub(ann.heartbeat_ms) > FRESH_MS {
+        return Some(false);
+    }
+    crate::process::process_exited(ann.installer_pid).map(|exited| !exited)
 }
 
 // ---------------------------------------------------------------------------
@@ -349,9 +352,17 @@ mod tests {
         let ann = read(home.path(), run.path()).expect("宣告节应可读");
         assert_eq!(ann.installer_pid, std::process::id());
         // 心跳新鲜 + pid 存活 = 有效
-        assert!(is_active(&ann, crate::watchdog::now_millis()));
+        assert_eq!(is_active(&ann, crate::watchdog::now_millis()), Some(true));
         // 心跳过期 = 无效（挂死/unix 残留的判定路径）——即使 pid 活着
-        assert!(!is_active(&ann, ann.heartbeat_ms + FRESH_MS + 1));
+        assert_eq!(
+            is_active(&ann, ann.heartbeat_ms + FRESH_MS + 1),
+            Some(false)
+        );
+        let absent = Announcement {
+            installer_pid: u32::MAX - 781,
+            ..ann
+        };
+        assert_eq!(is_active(&absent, ann.heartbeat_ms), Some(false));
         drop(a);
         // Windows：进程内节句柄关闭 → 节消失（读不到）；unix：Drop unlink
         // （测试进程未崩，主动解除路径生效）

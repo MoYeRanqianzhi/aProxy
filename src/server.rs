@@ -311,7 +311,10 @@ pub(crate) async fn serve_forever(
                 // 重启误判为崩溃、用旧二进制重拉，与 install 拉锯。install
                 // 结束宣告消失 → 自检恢复 → 新看护者出簇（新 exe）。
                 if aproxy::install::announce::read(&aproxy_ipc::home::home(), &run_dir).is_some_and(
-                    |a| aproxy::install::announce::is_active(&a, watchdog::now_millis()),
+                    |a| {
+                        aproxy::install::announce::is_active(&a, watchdog::now_millis())
+                            != Some(false)
+                    },
                 ) {
                     continue;
                 }

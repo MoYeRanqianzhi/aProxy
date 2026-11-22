@@ -328,7 +328,13 @@ mod process_platform {
     /// EPERM 说明进程仍在；未收割的僵尸要等父进程收割之后才能观察到退出。
     #[cfg(target_os = "macos")]
     pub fn process_exited(pid: u32) -> Option<bool> {
-        let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
+        // 超出 pid_t 表示范围的一定不是进程。不得截断再调用 kill：负值会查询进程组。
+        let Ok(pid) = i32::try_from(pid) else {
+            return Some(true);
+        };
+        if pid == 0 {
+            return None;
+        }
         if unsafe { libc::kill(pid, 0) } == 0 {
             return Some(false);
         }

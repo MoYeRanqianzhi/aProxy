@@ -3,7 +3,7 @@ name: security-contributions
 description: How aProxy treats contributions to its security audit skills, AI-made ones included - recall before reviewing or writing such a pull request, or before changing the contribution rules
 metadata:
   type: feedback
-  scope: pull requests that change .claude/skills/aproxy-audit-*; the aproxy-contribute-security skill
+  scope: pull requests that change .claude/skills/aproxy-audit-*; the aproxy-contribute-security skill; the default pull request template
   status: active
   last_verified: 2026-11-23
 ---
@@ -22,8 +22,14 @@ AI 提的 PR 照样欢迎。
   看有没有给已有信号加例外或降级。
 - 想改或放宽已有信号的，走 issue，由维护者决定，不走这个 skill。
 - aProxy 自身的漏洞走 SECURITY.md 的私密报告，不进公开 PR。
-- 规则写在 `.claude/skills/aproxy-contribute-security/`（SKILL.md 与 `references/pr-template.md`）；改规则时两处与这条记忆一起改。
+- 所有 PR 的默认模板 `.github/pull_request_template.md` 问简版披露（来由、谁写的、工具与模型、谁决定提交、审查），
+  危险信号类 PR 由它指向 skill 里的完整模板（只此一份，不在 `.github/` 另放副本）。命令行 `gh pr create --body`
+  开的 PR 不会带上模板，缺披露的请作者补上。
+- 规则写在 `.claude/skills/aproxy-contribute-security/`（SKILL.md 与 `references/pr-template.md`）和默认模板里；
+  改规则或披露项时这三处与这条记忆一起改。
 
-**Evidence:** 用户 2026-11-23 在本会话里的要求；skill 与脚本见上面的路径。
+**Evidence:** 用户 2026-11-23 在本会话里的要求；同日用户同意加 PR 模板（「可以，放个pr模板」）。默认模板对所有 PR
+都问披露、完整模板只留在 skill 里，是加模板时的设计，用户尚未另行表态。GitHub 的 markdown 渲染接口核对过：模板里的
+注释提示在发布后不显示。
 
 **Recheck when:** 用户改变对 AI 贡献、披露项或只增不减的要求。

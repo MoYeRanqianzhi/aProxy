@@ -172,7 +172,12 @@ pub fn run(options: Options) -> Result<i32, Error> {
     let runtime = options.runtime;
     let bridge = {
         let _enter = runtime.enter();
-        bridge::Bridge::open(options.home, options.inspect, runtime.clone())
+        bridge::Bridge::open(
+            options.home,
+            options.inspect,
+            options.ops.clone(),
+            runtime.clone(),
+        )
     };
 
     // setup 里出的错不能交还给 Tauri（它会 panic），记在这里，请事件循环退出后再报告

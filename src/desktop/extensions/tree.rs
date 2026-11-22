@@ -13,7 +13,7 @@ pub(super) struct Dir {
     #[cfg(windows)]
     path: std::path::PathBuf,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(super) struct Stamp {
     identity: (u64, u64),
     pub(super) bytes: u64,

@@ -402,6 +402,8 @@ pub trait ExtensionOps: Send + Sync + 'static {
     fn detach_extensions(&self, session: Option<&str>);
     /// Refresh the complete on-disk inventory without executing anything.
     fn inventory(&self) -> Inventory;
+    /// Read bounded metadata only. The value is a refresh hint, never authorization.
+    fn package_hint(&self) -> u64;
     /// Compare and set the exact enabled digest from the trusted settings page.
     fn enable_package(&self, key: &ExtKey, enabled: bool) -> super::R<()>;
     /// Capture and mount only one complete enabled identity.

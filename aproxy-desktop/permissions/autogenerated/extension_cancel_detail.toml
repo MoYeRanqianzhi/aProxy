@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-extension-cancel-detail"
+description = "Enables the extension_cancel_detail command without any pre-configured scope."
+commands.allow = ["extension_cancel_detail"]
+
+[[permission]]
+identifier = "deny-extension-cancel-detail"
+description = "Denies the extension_cancel_detail command without any pre-configured scope."
+commands.deny = ["extension_cancel_detail"]

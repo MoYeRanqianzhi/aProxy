@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-extension-answer"
+description = "Enables the extension_answer command without any pre-configured scope."
+commands.allow = ["extension_answer"]
+
+[[permission]]
+identifier = "deny-extension-answer"
+description = "Denies the extension_answer command without any pre-configured scope."
+commands.deny = ["extension_answer"]

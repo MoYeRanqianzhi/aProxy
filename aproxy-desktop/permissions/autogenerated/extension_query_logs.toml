@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-extension-query-logs"
+description = "Enables the extension_query_logs command without any pre-configured scope."
+commands.allow = ["extension_query_logs"]
+
+[[permission]]
+identifier = "deny-extension-query-logs"
+description = "Denies the extension_query_logs command without any pre-configured scope."
+commands.deny = ["extension_query_logs"]

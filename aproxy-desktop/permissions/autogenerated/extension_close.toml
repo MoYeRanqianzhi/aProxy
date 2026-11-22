@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-extension-close"
+description = "Enables the extension_close command without any pre-configured scope."
+commands.allow = ["extension_close"]
+
+[[permission]]
+identifier = "deny-extension-close"
+description = "Denies the extension_close command without any pre-configured scope."
+commands.deny = ["extension_close"]

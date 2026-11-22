@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-extension-update-offer"
+description = "Enables the extension_update_offer command without any pre-configured scope."
+commands.allow = ["extension_update_offer"]
+
+[[permission]]
+identifier = "deny-extension-update-offer"
+description = "Denies the extension_update_offer command without any pre-configured scope."
+commands.deny = ["extension_update_offer"]

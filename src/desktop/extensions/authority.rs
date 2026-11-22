@@ -321,7 +321,9 @@ impl Runtime {
         }
     }
     fn retire(&mut self) {
-        self.lease = None;
+        if self.lease.take().is_some() {
+            self.notify(DesktopEvent::ExtensionsChanged);
+        }
         self.pending.clear();
         self.notify(DesktopEvent::ExtensionConsentsChanged);
     }
@@ -1195,6 +1197,9 @@ impl ExtensionOps for DesktopHome {
     }
     fn detach_extensions(&self, session: Option<&str>) {
         self.extension_detach(session)
+    }
+    fn package_hint(&self) -> u64 {
+        self.hint()
     }
     fn inventory(&self) -> Inventory {
         self.extension_inventory()

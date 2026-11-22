@@ -284,3 +284,50 @@ impl DesktopHome {
         })
     }
 }
+
+impl DesktopHome {
+    // 这只是失效提示：枚举有上限，只检查名字及句柄元数据，绝不把“没有变化”当作授权证据。
+    fn hint(&self) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        fn visit(d: &Dir, level: u8, h: &mut DefaultHasher) -> Result<(), Why> {
+            let count = match level {
+                0 => COUNT,
+                1 => 11,
+                _ => 8,
+            };
+            let ns = d.names(count, Why::FileCount)?;
+            for os in ns {
+                os.hash(h);
+                let Some(n) = os.to_str().filter(|s| format::safe_file(s)) else {
+                    continue;
+                };
+                match d.node(n) {
+                    Ok(Some((_, stamp, is_dir))) => {
+                        stamp.hash(h);
+                        is_dir.hash(h);
+                        if is_dir && (level == 0 || level == 1 && n == "assets") {
+                            let child = d.child(n)?.ok_or(Why::Io)?;
+                            if let Err(e) = visit(&child, level + 1, h) {
+                                (e as u8).hash(h)
+                            }
+                        }
+                    }
+                    Ok(None) => 0xffu8.hash(h),
+                    Err(e) => (e as u8).hash(h),
+                }
+            }
+            Ok(())
+        }
+        let mut h = DefaultHasher::new();
+        let result = (|| {
+            let home = Dir::home(&self.home)?;
+            let d = home.child("desktop")?.ok_or(Why::Io)?;
+            let ext = d.child("extensions")?.ok_or(Why::Layout)?;
+            visit(&ext, 0, &mut h)
+        })();
+        if let Err(e) = result {
+            (e as u8).hash(&mut h)
+        }
+        h.finish()
+    }
+}

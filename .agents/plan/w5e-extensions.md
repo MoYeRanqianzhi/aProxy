@@ -60,6 +60,17 @@ Gate F 已过）加深的正是这些，不合入，留作参考。master 上已
 - **文档。** 协议的改动和「什么时候生效」写进 aproxy-format skill 的 `references/protocol.md` 与 `guide.md`（英文，主代理写；
   Codex 不改 `.claude/`）。官方 aproxy-format 的各角色暂不实现 control，以后按需加。
 
+**重启 format（用户 2026-11-23）。** 重启实例当然会重启它的全部 format；另加一个更细的重启，只重启 format，
+可以全部，也可以指定某个 `[[format]]` 条目（按 `name`）：
+- 语义：选中条目的空闲 worker 立即收到 EOF 退役；正在处理消息的 worker 回完这一条后退役、不再回池；进行中的流留在原来的
+  worker 上直到 close 或 abort 再退役；新消息一律交给新进程（新进程会重新读它自己的配置文件）；熔断清零；control 进程一并
+  重启。之后像启动时一样握手一次，把结果（成功，或握手失败的原因）报告给调用方；失败时这个条目照 `required` 的规则处理，
+  实例不退出。在途请求不受影响。
+- 不重读 config.toml：`[[format]]` 本身的改动（command、args、stages 之类）仍要重启实例，输出里说一声。
+- 入口：实例 IPC 一个操作；`aproxy restart <目标> --formats`（全部）与 `--format <name>`（可重复）；桌面命令与实例页的按钮
+  （每个条目一个，外加「重启全部 format」）；扩展 `api` 的 `formats.restart(run, names?)`。
+- 官方 aproxy-format 不做热重载（用户 2026-11-23）：只在进程启动时读一次角色文件，改了文件用上面的重启让它生效。文档按这个写。
+
 **接口暴露。** 扩展模块导出 `activate(api)`。`api` 是界面 store 的薄包装：读（实例卡片、最近请求、分页日志、请求详情）、
 订阅变化、写（启动、停止、重启实例，读写配置，检查与安装更新）、外观接口、format 控制。写操作不另加授权，安装时的提醒已经说清楚了。
 

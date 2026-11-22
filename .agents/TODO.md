@@ -72,6 +72,10 @@ Claude Code 端到端成立」通过三次（含 rc.1 正式 release 构建）�
 - [ ] **用量与费用统计**、**按 key 限速**、**预算上限**（建在生命周期通知上）
 - [ ] **Gemini 协议**（官方 aproxy-format 的协议转换）
 
+- [ ] **官方 format 的 UI 扩展样例**（用户 2026-11-23）：给一个官方角色（倾向 keys：看密钥池与冷却状态、临时停用一个 key、
+  重启这个 format）做一个扩展样例，示范扩展与 format 的配对、control 进程与 `formats.*` 接口。前提是 t10c 的 control 与
+  format 重启做完，且这个角色实现了 control。版本未定。
+
 ### 以后可能会做（低优先级，暂不做）
 - [ ] embeddings、图片等非对话接口的转换
 

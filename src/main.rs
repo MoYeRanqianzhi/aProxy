@@ -99,10 +99,10 @@ pub(crate) fn main() -> std::process::ExitCode {
 /// home 还未被接受，不能查台账或设置；按已解析的命令构造它约定的 JSON 错误。
 fn invalid_home_output(
     command: Option<&Commands>,
-    value: &str,
+    value: &std::ffi::OsStr,
 ) -> (Option<serde_json::Value>, i32) {
     let mode = commands::JsonOutput::for_command(command);
-    let error = serde_json::json!({"code":"home_invalid","message":"APROXY_HOME does not satisfy the home rules.","details":{"value":value}});
+    let error = serde_json::json!({"code":"home_invalid","message":home_error_text(value, Lang::En),"details":{"value":value.to_string_lossy()}});
     (
         mode.map(|m| m.error_document(error)),
         if mode.is_some() {
@@ -161,8 +161,7 @@ async fn run(cli: Cli) -> u8 {
                 current()
             };
             let e = home_error_text(&value, lang);
-            let (document, exit) =
-                invalid_home_output(cli.command.as_ref(), &value.to_string_lossy());
+            let (document, exit) = invalid_home_output(cli.command.as_ref(), &value);
             if let Some(doc) = document {
                 commands::print_doc(doc);
             }
@@ -250,7 +249,7 @@ async fn run(cli: Cli) -> u8 {
         } else {
             commands::settings::print_repair_hints(&settings_path);
             if let Some(mode) = output {
-                commands::print_doc(mode.error_document(serde_json::json!({"code":"config_invalid","message":"The configuration has error-level diagnostics.","details":{"diagnostics":loaded.diagnostics}})));
+                commands::print_doc(mode.error_document(serde_json::json!({"code":"config_invalid","message":boot::settings_errors(Lang::En),"details":{"diagnostics":loaded.diagnostics}})));
             }
             return aproxy_ipc::code::EXIT_CONFIG;
         }
@@ -437,7 +436,7 @@ mod home_output_tests {
         assert!(aproxy_ipc::home::home_from(Some(value), || unreachable!()).is_err());
         use clap::Parser;
         let cli = Cli::try_parse_from(["aproxy", "status", "--json"]).unwrap();
-        let (doc, exit) = invalid_home_output(cli.command.as_ref(), value.to_str().unwrap());
+        let (doc, exit) = invalid_home_output(cli.command.as_ref(), value);
         assert_eq!(exit, 2);
         let doc = doc.unwrap();
         assert_eq!(doc["error"]["code"], "home_invalid");

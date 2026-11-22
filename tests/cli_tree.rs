@@ -180,7 +180,7 @@ fn logs_prints_recent_lines_and_exits() {
     let out = run(&home, &["logs", &port_text]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let all = text(&out.stdout);
-    assert!(all.contains("启动 aProxy"), "{all}");
+    assert!(all.contains("Starting aProxy"), "{all}");
     assert!(!all.contains("Log file:"), "说明文字应在 stderr: {all}");
     assert!(
         text(&out.stderr).contains("Log file:"),
@@ -374,7 +374,8 @@ stop: --idle-threshold-secs --force --json -h --help"#;
 /// 真的触发一条 INFO，分别检查它所在的输出流和默认级别，而不是仅凭空日志推断两者。
 #[test]
 fn cli_logs_stay_off_stdout() {
-    const INFO: &str = "全局默认里的这项凭据没有继承：它属于另一个目标";
+    const INFO: &str =
+        "A global default credential was not inherited because it belongs to a different target";
     let home = TestHome::new();
     let port = free_port();
     let cfg = config(&home, "logging", port);
@@ -561,6 +562,15 @@ fn json_commands_finish_with_one_document_even_without_stderr() {
                 } else {
                     assert!(!out.status.success());
                     assert_eq!(doc["error"]["code"], expected, "{args:?}: {doc}");
+                    if !broken && (relative || args == ["restore"]) {
+                        let message = doc["error"]["message"].as_str().unwrap();
+                        assert!(
+                            text(&out.stderr)
+                                .lines()
+                                .any(|line| line.strip_prefix("[ERROR] ") == Some(message)),
+                            "{args:?}: {doc}"
+                        );
+                    }
                     assert!(
                         doc["error"]["message"].is_string() && doc["error"]["details"].is_object()
                     );

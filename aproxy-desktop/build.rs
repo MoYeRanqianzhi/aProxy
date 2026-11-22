@@ -48,6 +48,8 @@ fn check_grants() {
         .collect();
     assert_eq!(allowed.len(), grants.len(), "重复授权");
     let mut expected = BTreeSet::from([
+        "core:event:allow-listen".into(),
+        "core:event:allow-unlisten".into(),
         "core:window:allow-show".into(),
         "core:window:allow-set-effects".into(),
         "core:window:allow-set-theme".into(),

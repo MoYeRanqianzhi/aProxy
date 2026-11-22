@@ -6,6 +6,8 @@
     "main"
   ],
   "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
     "core:window:allow-show",
     "core:window:allow-set-effects",
     "core:window:allow-set-theme",

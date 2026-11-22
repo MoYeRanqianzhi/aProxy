@@ -3,6 +3,7 @@ pub mod github;
 mod lifecycle;
 mod manifest;
 use tokio::time::Instant;
+pub mod scheme;
 mod tree;
 mod unpack;
 use super::{

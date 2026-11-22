@@ -665,3 +665,90 @@ async fn lifecycle_preserves_data_order_and_provenance_but_not_removed_code() {
         .unwrap();
     assert!(!d.exists() && !fs::read_to_string(prefs).unwrap().contains("kept = 123"));
 }
+
+#[test]
+fn package_urls_serve_only_regular_descendants_without_a_window() {
+    use aproxy::desktop::packages::scheme::respond;
+    let h = TestHome::new();
+    let root = h.path().join("desktop/extensions");
+    let d = root.join("sample.one");
+    directory(&d, &members("extension"));
+    fs::create_dir_all(root.join(".staging-secret")).unwrap();
+    fs::write(root.join(".staging-secret/x"), b"staged").unwrap();
+    fs::write(root.join("outside"), b"secret").unwrap();
+    let run = |method: &str, path: &str| {
+        respond(
+            h.path(),
+            &http::Request::builder()
+                .method(method)
+                .uri(format!("aproxy-pkg://localhost/{path}"))
+                .body(vec![])
+                .unwrap(),
+        )
+    };
+    for (ext, mime) in [
+        ("mjs", "text/javascript; charset=utf-8"),
+        ("js", "text/javascript; charset=utf-8"),
+        ("css", "text/css; charset=utf-8"),
+        ("json", "application/json"),
+        ("svg", "image/svg+xml"),
+        ("png", "image/png"),
+        ("jpg", "image/jpeg"),
+        ("jpeg", "image/jpeg"),
+        ("webp", "image/webp"),
+        ("gif", "image/gif"),
+        ("avif", "image/avif"),
+        ("woff2", "font/woff2"),
+        ("woff", "font/woff"),
+        ("ttf", "font/ttf"),
+        ("otf", "font/otf"),
+        ("wasm", "application/wasm"),
+        ("html", "text/html; charset=utf-8"),
+        ("htm", "text/html; charset=utf-8"),
+        ("txt", "text/plain; charset=utf-8"),
+        ("md", "text/plain; charset=utf-8"),
+        ("bin", "application/octet-stream"),
+    ] {
+        fs::write(d.join(format!("assets/a b.{ext}")), b"abc").unwrap();
+        let path = format!("sample.one/assets/a%20b.{ext}?v=2&n=1#frag");
+        let r = run("GET", &path);
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.body(), b"abc");
+        for (k, v) in [
+            ("content-type", mime),
+            ("access-control-allow-origin", "*"),
+            ("x-content-type-options", "nosniff"),
+            ("cache-control", "no-cache"),
+        ] {
+            assert_eq!(r.headers()[k], v);
+        }
+        let head = run("HEAD", &path);
+        assert!(head.body().is_empty());
+        assert_eq!(head.headers()["content-length"], "3");
+    }
+    for path in [
+        "sample.one/../outside",
+        "sample.one/%2e%2e/outside",
+        "sample.one/%252e%252e/outside",
+        "sample.one/assets%2fa.PNG",
+        "sample.one/assets%5ca.PNG",
+        "sample.one//outside",
+        "sample.one/C:/outside",
+        "sample.one/nul.txt",
+        ".staging-secret/x",
+        "missing.one/x",
+        "sample.one/absent",
+        "sample.one/assets",
+        "sample.one/%zz",
+    ] {
+        let r = run("GET", path);
+        assert_eq!(r.status(), 404, "{path}");
+        assert!(r.body().is_empty());
+    }
+    assert_eq!(run("POST", "sample.one/main.mjs").status(), 405);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(root.join("outside"), d.join("assets/link")).unwrap();
+        assert_eq!(run("GET", "sample.one/assets/link").status(), 404);
+    }
+}

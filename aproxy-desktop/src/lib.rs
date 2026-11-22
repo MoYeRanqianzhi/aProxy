@@ -7,7 +7,7 @@
 //!
 //! 前端在 `ui/`（Vite + Svelte 5 + TS），构建产物 `dist/` 由 `generate_context!` 在编译期
 //! 嵌进二进制（dist 缺失时 build.rs 报错，见那里）。这一版界面里全是演示数据（前端的 mock
-//! 后端），本包只管窗口：建窗口、自定义标题栏、Mica 支持与否、不联网的 CSP 与导航限制。以后
+//! 后端），本包只管窗口：建窗口、自定义标题栏、Mica 支持与否、页面的 CSP 与导航限制。以后
 //! 真实数据接进来时，前端换一个 Backend 实现，这里加对应的命令。
 //!
 //! tauri.conf.json 写不了注释，其中的取舍记在这里：
@@ -16,13 +16,11 @@
 //!   依赖本包的 aproxy.exe 在 MSVC 上链接失败（tauri#16238）。aproxy 一直用动态 CRT，关掉与之一致。
 //! - `app.windows` 为空：主窗口由 [`run`] 用 `WebviewWindowBuilder` 建，才能指定 webview 的数据
 //!   目录、限制导航、单独放宽吉祥物沙箱页的 CSP。
-//! - `app.security.csp` 不联网：脚本、样式、图片、字体只来自嵌入的资源（图片另许 `data:`），
-//!   `connect-src` 只有 IPC（`ipc:`；WebView2 上是 `http://ipc.localhost`），`frame-src` 只许
-//!   嵌入的沙箱页。`style-src` 不放行 `'unsafe-inline'`：页面不写 style 属性，Svelte 经 CSSOM
-//!   设的样式不受它管。Tauri 给每个 HTML 响应附上这份 CSP，再加上该页内联脚本与样式的哈希。
+//! - 包自带的脚本和样式从 aproxy-pkg 加载；扩展也可以加载 HTTPS 资源。只关闭 Tauri
+//!   对 style-src 的补写：加入 nonce/hash 会让浏览器忽略 unsafe-inline，打断动态样式。
 //! - `withGlobalTauri: false`：页面用打包进来的 @tauri-apps/api，不需要 Tauri 往页面里另注入
 //!   一份全局 API（`window.__TAURI__`）。
-//! - 权限（capabilities/main.json）只授权页面实际用到的窗口接口与本包的三个命令，不含
+//! - 权限（capabilities/main.json）只授权页面实际用到的窗口接口与本包的应用命令，不含
 //!   `core:default`。
 //!
 //! 进程与线程：事件循环必须占住主线程（macOS 硬性要求，Windows 与 Linux 默认也如此）。
@@ -78,10 +76,16 @@ const SHOW_FALLBACK: Duration = Duration::from_secs(3);
 /// CSP 加上 `script-src blob:`；主界面的 CSP 不放行 blob 脚本。
 const MASCOT_SANDBOX: &str = "/mascot-sandbox.html";
 
+/// 无需运行窗口的本地包请求处理器；由注册协议的后台任务调用。
+pub type PackageResource =
+    fn(&std::path::Path, &tauri::http::Request<Vec<u8>>) -> tauri::http::Response<Vec<u8>>;
+
 /// 调用方交给 [`run`] 的东西。
 pub struct Options {
     /// 启动时解析的绝对主目录；所有页面共享一个实例视图。
     pub home: PathBuf,
+    /// 文件读取由宿主绑定到同一个主目录，URI 响应可在无窗口时独立验证。
+    pub package_resource: PackageResource,
     /// 发现时由宿主解析私有配置，供本窗口的内存投影使用。
     pub inspect: aproxy_ipc::desktop::InspectHome,
     /// 只提供绑定此主目录的操作；窗口没有可执行路径或进程选择权。
@@ -170,6 +174,8 @@ pub fn preflight() -> Result<(), Error> {
 pub fn run(options: Options) -> Result<i32, Error> {
     tauri::async_runtime::set(options.runtime.clone());
     let runtime = options.runtime;
+    let package_home = Arc::new(options.home.clone());
+    let resource = options.package_resource;
     let bridge = {
         let _enter = runtime.enter();
         bridge::Bridge::open(options.home, options.inspect, runtime.clone())
@@ -182,6 +188,12 @@ pub fn run(options: Options) -> Result<i32, Error> {
 
     let close_ops = options.ops.clone();
     let builder = tauri::Builder::default()
+        .register_asynchronous_uri_scheme_protocol("aproxy-pkg", move |_, request, responder| {
+            let home = package_home.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                responder.respond(resource(&home, &request))
+            });
+        })
         .manage(Mutex::new(DesktopInfo::default()))
         .manage(bridge.clone())
         .manage(options.ops)

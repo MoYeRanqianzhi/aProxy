@@ -163,6 +163,7 @@ pub(crate) fn handle_desktop_cmd() -> ! {
     let host = std::sync::Arc::new(host);
     let code = match aproxy_desktop::run(aproxy_desktop::Options {
         data_dir: home.join("desktop").join("webview"),
+        package_resource: aproxy::desktop::packages::scheme::respond,
         ops: host.clone(),
         inspect: std::sync::Arc::new(move |members| host.inspect(members)),
         home,

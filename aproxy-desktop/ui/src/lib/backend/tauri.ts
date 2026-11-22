@@ -8,7 +8,7 @@
  *   - 第一帧是 resync，可能比 attach 的返回值先到：先存着，拿到 session 之后再处理。
  *   - 编号对不上、ack 发不出去，都说明这条通道不可靠了：重新 attach，从头再来一次 resync。
  */
-import { Channel, invoke } from '@tauri-apps/api/core';
+import { Channel, convertFileSrc, invoke } from '@tauri-apps/api/core';
 import type { CommandName, Commands, Frame } from './contract';
 import { toFailure, type EventHandler, type Link } from './link';
 
@@ -60,12 +60,12 @@ class TauriLink implements Link {
   }
 
   /**
-   * Tauri 把自定义协议在 Windows 上映射成 http://<协议名>.localhost/，别的平台是 <协议名>://localhost/。
-   * id 与路径逐段编码：路径里的 / 是分隔符，不能像 convertFileSrc 那样整个编码掉
+   * Tauri 把自定义协议在 Windows 上映射成 http://<协议名>.localhost/，别的平台是 <协议名>://localhost/；
+   * convertFileSrc 知道这个窗口用的是哪一种。它会把整个参数编码掉（包括 /），所以只交给它 id，
+   * 包里的路径逐段编码后接在后面：/ 是分隔符，要原样留着
    */
   packageUrl(id: string, path: string): string | null {
-    const base = navigator.userAgent.includes('Windows') ? 'http://aproxy-pkg.localhost' : 'aproxy-pkg://localhost';
-    return `${base}/${encodeURIComponent(id)}/${path.split('/').map(encodeURIComponent).join('/')}`;
+    return `${convertFileSrc(id, 'aproxy-pkg')}/${path.split('/').map(encodeURIComponent).join('/')}`;
   }
 
   attach(handler: EventHandler): void {

@@ -116,6 +116,31 @@ pub struct PackageIssue {
 }
 /// Package operations are home-bound. File and archive work runs off the event loop.
 pub trait PackageOps: Send + Sync + 'static {
+    /// Read the extension table without exposing sibling settings.
+    fn extension_settings_read(&self, id: String) -> Task<'_, Map<String, Value>>;
+    /// Apply a top-level patch without reformatting unrelated TOML.
+    fn extension_settings_write(
+        &self,
+        id: String,
+        changes: Map<String, Value>,
+    ) -> Task<'_, Map<String, Value>>;
+    /// Read the bounded JSON store or report corruption.
+    fn extension_storage_read(&self, id: String) -> Task<'_, Map<String, Value>>;
+    /// Merge top-level changes, optionally recovering a broken store.
+    fn extension_storage_write(
+        &self,
+        id: String,
+        changes: Map<String, Value>,
+        reset: bool,
+    ) -> Task<'_, Map<String, Value>>;
+    /// List regular named data files in lexical order.
+    fn extension_files_list(&self, id: String) -> Task<'_, Vec<FileInfo>>;
+    /// Read bounded bytes without interpreting their format.
+    fn extension_file_read(&self, id: String, name: String) -> Task<'_, Vec<u8>>;
+    /// Replace one data file after checking aggregate quotas.
+    fn extension_file_write(&self, id: String, name: String, bytes: Vec<u8>) -> Task<'_, FileInfo>;
+    /// Remove one regular data file; absence already satisfies the request.
+    fn extension_file_delete(&self, id: String, name: String) -> Task<'_, ()>;
     /// Enumerate installed and hand-copied packages, including broken entries.
     fn package_list(&self) -> Task<'_, Vec<PackageEntry>>;
     /// Commit a single-use staging token without reopening the source.
@@ -218,6 +243,12 @@ pub enum GithubFacts {
         release: ReleaseFacts,
     },
 }
+/// Short explanation for listing a broken installation, distinct from detailed check faults.
+#[derive(Debug, Clone, Serialize)]
+pub struct EntryIssue {
+    /// `manifest`, `entry` or `io` selects the page's localized repair guidance.
+    pub reason: &'static str,
+}
 /// One visible installation. Broken and hand-copied packages remain visible for inspection/removal.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -237,9 +268,21 @@ pub struct PackageEntry {
     /// Last verification performed before this installation.
     pub github: Option<GithubFacts>,
     /// Local inspection failure, if any.
-    pub issue: Option<PackageIssue>,
+    pub issue: Option<EntryIssue>,
     /// Regular file bytes in the extension's retained data directory.
     pub data_bytes: u64,
     /// Parsed theme object only for valid theme installations.
     pub theme: Option<Map<String, Value>>,
+}
+
+/// Public metadata only: data file contents travel in a raw IPC body.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileInfo {
+    /// A single portable filename, never a host path.
+    pub name: String,
+    /// Length in bytes.
+    pub bytes: u64,
+    /// Last modification time as Unix milliseconds.
+    pub modified_at: u64,
 }

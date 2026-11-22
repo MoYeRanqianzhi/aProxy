@@ -140,7 +140,19 @@ fn inspect(
     })();
     let (manifest, theme, issue) = match result {
         Ok((m, t)) => (Some(m), t, None),
-        Err(Fault::DesktopPackage(i)) => (None, None, Some(i)),
+        Err(Fault::DesktopPackage(i)) => (
+            None,
+            None,
+            Some(EntryIssue {
+                reason: if i.reason == "io" {
+                    "io"
+                } else if i.path.as_deref() == Some("manifest.json") {
+                    "manifest"
+                } else {
+                    "entry"
+                },
+            }),
+        ),
         Err(_) => unreachable!(),
     };
     PackageEntry {
@@ -158,7 +170,7 @@ fn inspect(
         data_bytes: size,
     }
 }
-fn read_dir_id(store: &Store, id: &str) -> R<Dir> {
+pub(super) fn read_dir_id(store: &Store, id: &str) -> R<Dir> {
     known(id)?;
     let base = Dir::open(&root(store)?).map_err(|e| file_error(e, None))?;
     match base.node(id).map_err(|e| file_error(e, None))? {
@@ -313,7 +325,7 @@ pub(super) fn set_enabled(store: &Store, id: &str, on: bool) -> R<PackageEntry> 
         data_bytes(store, id)?,
     );
     if on && let Some(e) = entry.issue.clone() {
-        return Err(Fault::DesktopPackage(e));
+        return Err(bad(e.reason, None));
     }
     if entry.kind != PackageKind::Extension {
         return Err(bad("not-extension", None));

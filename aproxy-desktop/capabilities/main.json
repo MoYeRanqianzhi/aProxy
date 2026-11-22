@@ -50,6 +50,14 @@
     "allow-package-list",
     "allow-package-install",
     "allow-package-set-enabled",
-    "allow-package-uninstall"
+    "allow-package-uninstall",
+    "allow-extension-settings-read",
+    "allow-extension-settings-write",
+    "allow-extension-storage-read",
+    "allow-extension-storage-write",
+    "allow-extension-files-list",
+    "allow-extension-file-read",
+    "allow-extension-file-write",
+    "allow-extension-file-delete"
   ]
 }

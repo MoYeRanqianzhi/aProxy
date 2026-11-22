@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-extension-settings-read"
+description = "Enables the extension_settings_read command without any pre-configured scope."
+commands.allow = ["extension_settings_read"]
+
+[[permission]]
+identifier = "deny-extension-settings-read"
+description = "Denies the extension_settings_read command without any pre-configured scope."
+commands.deny = ["extension_settings_read"]

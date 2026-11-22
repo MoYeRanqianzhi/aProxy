@@ -752,3 +752,235 @@ fn package_urls_serve_only_regular_descendants_without_a_window() {
         assert_eq!(run("GET", "sample.one/assets/link").status(), 404);
     }
 }
+
+fn changes(v: Value) -> serde_json::Map<String, Value> {
+    v.as_object().unwrap().clone()
+}
+#[tokio::test]
+async fn extension_settings_round_trip_without_writing_over_a_broken_document() {
+    let h = TestHome::new();
+    let host = host(&h);
+    let id = "sample.one";
+    let c = host
+        .package_check_file("code.zip".into(), archive(&members("extension"), ""))
+        .await
+        .unwrap();
+    host.package_install(c.token, true).await.unwrap();
+    let path = h.path().join("desktop/desktop.toml");
+    let text = "# neighbor\nmode = 'dark'  # exact\n[extensions.settings.\"sample.one\"]\nwhen = 2025-04-05T09:08:07Z\nbig = 9007199254740993\n[extensions.settings.elsewhere]\nother = 'no change'\n";
+    fs::write(&path, text).unwrap();
+    let initial = host.extension_settings_read(id.into()).await.unwrap();
+    assert_eq!(initial["when"], "2025-04-05T09:08:07Z");
+    assert_eq!(initial["big"], "9007199254740993");
+    let patch = json!({"when":null,"nested":{"a.b":[42,true,{"deep":"x"}]},"num":-12.5});
+    let written = host
+        .extension_settings_write(id.into(), changes(patch))
+        .await
+        .unwrap();
+    assert_eq!(
+        host.extension_settings_read(id.into()).await.unwrap(),
+        written
+    );
+    assert!(!written.contains_key("when"));
+    assert_eq!(written["nested"]["a.b"][2]["deep"], "x");
+    let stable = fs::read_to_string(&path).unwrap();
+    assert!(
+        stable.starts_with("# neighbor\nmode = 'dark'  # exact\n")
+            && stable.ends_with("[extensions.settings.elsewhere]\nother = 'no change'\n")
+    );
+    for patch in [
+        json!({"x":[null]}),
+        json!({"x":{"y":null}}),
+        json!({"bad.flag":true}),
+        json!({"big":9007199254740993_i64}),
+        json!({"x":"a".repeat(65536)}),
+    ] {
+        assert!(
+            host.extension_settings_write(id.into(), changes(patch))
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), stable);
+    }
+    fs::write(
+        &path,
+        "extensions = { settings = { 'sample.one' = { x = 1 } } } # inline\n",
+    )
+    .unwrap();
+    let stored = host
+        .extension_settings_write(id.into(), changes(json!({"x":2})))
+        .await
+        .unwrap();
+    assert_eq!(stored["x"], 2);
+    assert_eq!(
+        host.extension_settings_read(id.into()).await.unwrap(),
+        stored
+    );
+    fs::write(&path, "[broken\n").unwrap();
+    assert!(host.extension_settings_read(id.into()).await.is_err());
+    assert!(
+        host.extension_settings_write(id.into(), changes(json!({"x":1})))
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"[broken\n");
+}
+#[tokio::test]
+async fn extension_data_roundtrip_limits_reset_and_link_refusal() {
+    let h = TestHome::new();
+    let host = host(&h);
+    let id = "sample.one";
+    assert!(host.extension_storage_read(id.into()).await.is_err());
+    let dir = h.path().join("desktop/extensions/sample.one");
+    directory(&dir, &members("theme"));
+    assert!(host.extension_files_list(id.into()).await.is_err());
+    fs::write(dir.join("manifest.json"), manifest("extension").to_string()).unwrap();
+    fs::write(dir.join("main.mjs"), b"export {}").unwrap();
+    let d = h
+        .path()
+        .join("desktop")
+        .join("extension-data")
+        .join("sample.one");
+    assert!(
+        host.extension_storage_read(id.into())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        host.extension_files_list(id.into())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!d.exists());
+    let put = |v, r| host.extension_storage_write(id.into(), changes(v), r);
+    let v = json!({"prefs":{"yes":[null,"ok"]},"empty":true});
+    put(v, false).await.unwrap();
+    let store = put(json!({"empty":null}), false).await.unwrap();
+    assert_eq!(store["prefs"]["yes"][0], Value::Null);
+    assert_eq!(store, host.extension_storage_read(id.into()).await.unwrap());
+    for p in [
+        json!({"":true}),
+        json!({"bad\n":1}),
+        json!({"x":"a".repeat(4<<20)}),
+    ] {
+        assert!(put(p, false).await.is_err());
+    }
+    fs::write(d.join("storage.json"), b"[").unwrap();
+    assert_eq!(
+        check_error(host.extension_storage_read(id.into()).await.unwrap_err()).reason,
+        "corrupt-storage"
+    );
+    assert!(put(json!({}), false).await.is_err());
+    assert_eq!(put(json!({"ok":true}), true).await.unwrap()["ok"], true);
+    let write = |n: &str, b: Vec<u8>| host.extension_file_write(id.into(), n.into(), b);
+    let read = |n: &str| host.extension_file_read(id.into(), n.into());
+    let del = |n: &str| host.extension_file_delete(id.into(), n.into());
+    for n in [
+        "", ".hidden", "a.", "a/b", "a\\b", "a:b", "PRN.txt", "lPt9", "é",
+    ] {
+        assert!(write(n, vec![]).await.is_err());
+        assert!(read(n).await.is_err());
+        assert!(del(n).await.is_err());
+    }
+    let f = write("z.bin", vec![0, 255]).await.unwrap();
+    assert_eq!(f.bytes, 2);
+    assert_eq!(read("z.bin").await.unwrap(), [0, 255]);
+    write("a.bin", vec![4]).await.unwrap();
+    let list = host.extension_files_list(id.into()).await.unwrap();
+    assert_eq!(
+        list.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+        ["a.bin", "z.bin"]
+    );
+    del("a.bin").await.unwrap();
+    del("a.bin").await.unwrap();
+    let files = d.join("files");
+    for i in 0..999 {
+        fs::File::create(files.join(format!("x{i}"))).unwrap();
+    }
+    assert_eq!(
+        check_error(write("overflow", vec![]).await.unwrap_err())
+            .limit
+            .as_deref(),
+        Some("extension-files")
+    );
+    write("z.bin", vec![1]).await.unwrap();
+    fs::File::create(files.join("x0"))
+        .unwrap()
+        .set_len(512 << 20)
+        .unwrap();
+    assert_eq!(
+        check_error(write("z.bin", vec![]).await.unwrap_err())
+            .limit
+            .as_deref(),
+        Some("extension-bytes")
+    );
+    assert_eq!(
+        check_error(put(json!({"x":1}), false).await.unwrap_err())
+            .limit
+            .as_deref(),
+        Some("extension-bytes")
+    );
+    assert_eq!(
+        check_error(read("x0").await.unwrap_err()).limit.as_deref(),
+        Some("file-bytes")
+    );
+    assert_eq!(
+        check_error(write("z.bin", vec![0; (64 << 20) + 1]).await.unwrap_err())
+            .limit
+            .as_deref(),
+        Some("file-bytes")
+    );
+    let outside = h.path().join("other");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("important"), b"original").unwrap();
+    let link = files.join("redirect");
+    #[cfg(windows)]
+    {
+        assert!(
+            h.cmd_with("cmd.exe")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(&link)
+                .arg(&outside)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(outside.join("important"), &link).unwrap();
+    assert!(
+        read("redirect").await.is_err()
+            && write("redirect", vec![]).await.is_err()
+            && del("redirect").await.is_err()
+    );
+    assert!(
+        host.extension_files_list(id.into())
+            .await
+            .unwrap()
+            .iter()
+            .all(|f| f.name != "redirect")
+    );
+    fs::rename(&files, d.join("saved")).unwrap();
+    #[cfg(windows)]
+    assert!(
+        h.cmd_with("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&files)
+            .arg(&outside)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &files).unwrap();
+    assert!(
+        read("important").await.is_err()
+            && write("important", vec![]).await.is_err()
+            && del("important").await.is_err()
+    );
+    assert_eq!(fs::read(outside.join("important")).unwrap(), b"original");
+}

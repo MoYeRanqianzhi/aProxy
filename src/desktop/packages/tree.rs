@@ -17,21 +17,28 @@ pub(super) enum Node {
     File(File),
 }
 #[cfg(windows)]
-fn windows_open(path: &Path) -> io::Result<File> {
+fn windows_open(path: &Path, mutable: bool) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
     File::options()
         .read(true)
-        .share_mode(FILE_SHARE_READ)
+        .share_mode(FILE_SHARE_READ | if mutable { FILE_SHARE_WRITE } else { 0 })
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
 }
 impl Dir {
+    /// 包资源只读，Windows 同时拒绝写入及改名共享。
     pub(super) fn open(path: &Path) -> Result<Self, Why> {
+        Self::open_dir(path, false)
+    }
+    /// 可写数据目录仍不共享删除，允许同目录原子替换所需的写共享。
+    pub(super) fn open_dir(path: &Path, mutable: bool) -> Result<Self, Why> {
+        #[cfg(unix)]
+        let _ = mutable;
         #[cfg(windows)]
-        let f = windows_open(path);
+        let f = windows_open(path, mutable);
         #[cfg(unix)]
         let f = {
             use std::os::unix::fs::OpenOptionsExt;
@@ -59,10 +66,15 @@ impl Dir {
     }
     // 名字由上层先按单个路径分量核验，不能让带斜线的外部输入直接到达 openat/join。
     pub(super) fn node(&self, name: &str) -> Result<Option<Node>, Why> {
+        self.open_child(name, false)
+    }
+    fn open_child(&self, name: &str, mutable: bool) -> Result<Option<Node>, Why> {
+        #[cfg(unix)]
+        let _ = mutable;
         #[cfg(windows)]
         let opened = {
             let _keep_open = &self.file;
-            windows_open(&self.path.join(name))
+            windows_open(&self.path.join(name), mutable)
         };
         #[cfg(unix)]
         let opened = {
@@ -130,6 +142,113 @@ impl Dir {
             Ok(Some(Node::File(f)))
         } else {
             Err(Why::FileType)
+        }
+    }
+    /// 目录由父句柄逐级建立；读操作传 false，不会因读到缺项就写磁盘。
+    pub(super) fn directory(&self, name: &str, create: bool) -> Result<Option<Dir>, Why> {
+        match self.open_child(name, true)? {
+            Some(Node::Dir(d)) => return Ok(Some(d)),
+            Some(_) => return Err(Why::FileType),
+            None if !create => return Ok(None),
+            None => {}
+        }
+        {
+            #[cfg(windows)]
+            let result = std::fs::create_dir(self.path.join(name));
+            #[cfg(unix)]
+            let result = {
+                use std::os::fd::AsRawFd;
+                let c = std::ffi::CString::new(name).map_err(|_| Why::FileType)?;
+                if unsafe { libc::mkdirat(self.file.as_raw_fd(), c.as_ptr(), 0o700) } == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            };
+            if let Err(e) = result
+                && e.kind() != io::ErrorKind::AlreadyExists
+            {
+                return Err(Why::Io);
+            }
+        }
+        match self.open_child(name, true)? {
+            Some(Node::Dir(d)) => Ok(Some(d)),
+            None => Err(Why::Io),
+            _ => Err(Why::FileType),
+        }
+    }
+    /// 创建同目录临时文件再原子换名。Unix 的目标相对于已经打开的目录 fd；Windows 的目录句柄不共享删除。
+    pub(super) fn write(&self, name: &str, data: &[u8]) -> Result<(), Why> {
+        if let Some(Node::Dir(_)) = self.node(name)? {
+            return Err(Why::FileType);
+        }
+        #[cfg(windows)]
+        {
+            crate::fsx::write_atomic_private(&self.path.join(name), data).map_err(|_| Why::Io)
+        }
+        #[cfg(unix)]
+        {
+            use std::{
+                ffi::CString,
+                io::Write,
+                os::fd::{AsRawFd, FromRawFd},
+            };
+            let fd = self.file.as_raw_fd();
+            let dest = CString::new(name).map_err(|_| Why::FileType)?;
+            let nonce = getrandom::u64().map_err(|_| Why::Io)?;
+            let tmp = CString::new(format!(".tmp-{nonce:016x}")).unwrap();
+            let raw = unsafe {
+                libc::openat(
+                    fd,
+                    tmp.as_ptr(),
+                    libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_WRONLY
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW,
+                    0o600,
+                )
+            };
+            if raw < 0 {
+                return Err(Why::Io);
+            }
+            let mut f = unsafe { File::from_raw_fd(raw) };
+            let result = f
+                .write_all(data)
+                .and_then(|()| f.sync_all())
+                .and_then(|()| {
+                    if unsafe { libc::renameat(fd, tmp.as_ptr(), fd, dest.as_ptr()) } == 0 {
+                        Ok(())
+                    } else {
+                        Err(io::Error::last_os_error())
+                    }
+                });
+            if result.is_err() {
+                unsafe { libc::unlinkat(fd, tmp.as_ptr(), 0) };
+            }
+            result.map_err(|_| Why::Io)
+        }
+    }
+    /// 只删已核验的普通文件；缺失表示期望状态已达成。
+    pub(super) fn delete(&self, name: &str) -> Result<(), Why> {
+        match self.node(name)? {
+            None => return Ok(()),
+            Some(Node::Dir(_)) => return Err(Why::FileType),
+            _ => (),
+        }
+        #[cfg(windows)]
+        {
+            std::fs::remove_file(self.path.join(name)).map_err(|_| Why::Io)
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let c = std::ffi::CString::new(name).map_err(|_| Why::FileType)?;
+            if unsafe { libc::unlinkat(self.file.as_raw_fd(), c.as_ptr(), 0) } == 0 {
+                Ok(())
+            } else {
+                Err(Why::Io)
+            }
         }
     }
     pub(super) fn names(&self) -> Result<Vec<OsString>, Why> {

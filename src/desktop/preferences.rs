@@ -1,4 +1,5 @@
 //! 人写的窗口设置与机器书签分开：读不懂的文档绝不重置，只报告位置，不把原文送上页面。
+mod settings;
 use super::state::{Store, safe};
 use aproxy_ipc::desktop::*;
 use std::{

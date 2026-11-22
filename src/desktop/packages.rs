@@ -1,6 +1,8 @@
 //! 安装页展示的是暂存副本的事实；确认之后只交换目录，绝不回到用户选择的源路径再读一次。
+mod data;
 pub mod github;
 mod lifecycle;
+use serde_json::{Map, Value};
 mod manifest;
 use tokio::time::Instant;
 pub mod scheme;
@@ -43,7 +45,7 @@ fn field(k: &str) -> Fault {
         ..issue("field", Some("manifest.json"))
     })
 }
-fn limit(k: &str, max: u64, path: Option<&str>) -> Fault {
+pub(super) fn limit(k: &str, max: u64, path: Option<&str>) -> Fault {
     Fault::DesktopPackage(PackageIssue {
         limit: Some(k.into()),
         max: Some(max),
@@ -248,6 +250,56 @@ impl DesktopHome {
     }
 }
 impl PackageOps for DesktopHome {
+    fn extension_settings_read(&self, id: String) -> Task<'_, Map<String, Value>> {
+        Box::pin(self.state_work(StateFile::Packages, move |_, s| {
+            data::extension(&s, &id)?;
+            DesktopToml::read(&s)
+                .map_err(Fault::DesktopToml)?
+                .settings(&id)
+        }))
+    }
+    fn extension_settings_write(
+        &self,
+        id: String,
+        changes: Map<String, Value>,
+    ) -> Task<'_, Map<String, Value>> {
+        Box::pin(self.state_work(StateFile::Packages, move |_, s| {
+            data::extension(&s, &id)?;
+            let mut doc = DesktopToml::read(&s).map_err(Fault::DesktopToml)?;
+            let result = doc.change_settings(&id, changes)?;
+            doc.save(&s)?;
+            Ok(result)
+        }))
+    }
+    fn extension_storage_read(&self, id: String) -> Task<'_, Map<String, Value>> {
+        Box::pin(self.state_work(StateFile::Packages, move |_, s| data::storage_read(&s, &id)))
+    }
+    fn extension_storage_write(
+        &self,
+        id: String,
+        changes: Map<String, Value>,
+        reset: bool,
+    ) -> Task<'_, Map<String, Value>> {
+        Box::pin(self.state_work(StateFile::Packages, move |_, s| {
+            data::storage_write(&s, &id, changes, reset)
+        }))
+    }
+    fn extension_files_list(&self, id: String) -> Task<'_, Vec<FileInfo>> {
+        Box::pin(self.state_work(StateFile::Packages, move |_, s| data::list(&s, &id)))
+    }
+    fn extension_file_read(&self, id: String, name: String) -> Task<'_, Vec<u8>> {
+        Box::pin(self.state_work(StateFile::Packages, move |_, s| data::read(&s, &id, &name)))
+    }
+    fn extension_file_write(&self, id: String, name: String, bytes: Vec<u8>) -> Task<'_, FileInfo> {
+        Box::pin(self.state_work(StateFile::Packages, move |_, s| {
+            data::write(&s, &id, &name, bytes)
+        }))
+    }
+    fn extension_file_delete(&self, id: String, name: String) -> Task<'_, ()> {
+        Box::pin(self.state_work(StateFile::Packages, move |_, s| {
+            data::delete(&s, &id, &name)
+        }))
+    }
     fn package_list(&self) -> Task<'_, Vec<PackageEntry>> {
         Box::pin(self.state_work(StateFile::Packages, move |host, s| {
             lifecycle::list(&host, &s)

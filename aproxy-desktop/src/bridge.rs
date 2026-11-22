@@ -1115,3 +1115,128 @@ pub(crate) async fn package_uninstall(
     let a: UninstallPackage = args(&request)?;
     ops.package_uninstall(a.id, a.remove_data).await
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdOnly {
+    id: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DataChanges {
+    id: String,
+    changes: serde_json::Map<String, serde_json::Value>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StorageChanges {
+    id: String,
+    changes: serde_json::Map<String, serde_json::Value>,
+    reset: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileArgs {
+    id: String,
+    name: String,
+}
+
+/// 读取扩展的 TOML 表，没有设置时返回空对象。
+#[tauri::command]
+pub(crate) async fn extension_settings_read(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<serde_json::Map<String, serde_json::Value>> {
+    let a: IdOnly = args(&request)?;
+    ops.extension_settings_read(a.id).await
+}
+
+/// 只改请求列明的设置键，null 删除该键。
+#[tauri::command]
+pub(crate) async fn extension_settings_write(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<serde_json::Map<String, serde_json::Value>> {
+    let a: DataChanges = args(&request)?;
+    ops.extension_settings_write(a.id, a.changes).await
+}
+
+/// 读取扩展的 JSON 存储，不用默认值掩盖文件损坏。
+#[tauri::command]
+pub(crate) async fn extension_storage_read(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<serde_json::Map<String, serde_json::Value>> {
+    let a: IdOnly = args(&request)?;
+    ops.extension_storage_read(a.id).await
+}
+
+/// 写入合并结果；显式 reset 才覆盖坏文件。
+#[tauri::command]
+pub(crate) async fn extension_storage_write(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<serde_json::Map<String, serde_json::Value>> {
+    let a: StorageChanges = args(&request)?;
+    ops.extension_storage_write(a.id, a.changes, a.reset).await
+}
+
+/// 按名称列出扩展的数据文件，不把本机路径送给页面。
+#[tauri::command]
+pub(crate) async fn extension_files_list(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<Vec<FileInfo>> {
+    let a: IdOnly = args(&request)?;
+    ops.extension_files_list(a.id).await
+}
+
+/// 直接返回二进制 IPC 响应，不把文件转码为 JSON。
+#[tauri::command]
+pub(crate) async fn extension_file_read(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<tauri::ipc::Response> {
+    let a: FileArgs = args(&request)?;
+    ops.extension_file_read(a.id, a.name)
+        .await
+        .map(tauri::ipc::Response::new)
+}
+
+/// 从请求头取 ID 和文件名，原始请求体就是要写入的数据。
+#[tauri::command]
+pub(crate) async fn extension_file_write(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<FileInfo> {
+    let id = request
+        .headers()
+        .get("x-aproxy-extension")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(Fault::DesktopBadInput {})?
+        .to_owned();
+    let name = name_header(&request)?;
+    let InvokeBody::Raw(bytes) = request.body() else {
+        return Err(Fault::DesktopBadInput {});
+    };
+    if bytes.len() > 64 << 20 {
+        return Err(Fault::DesktopPackage(PackageIssue {
+            reason: "limit".into(),
+            field: None,
+            path: None,
+            limit: Some("file-bytes".into()),
+            max: Some(64 << 20),
+        }));
+    }
+    ops.extension_file_write(id, name, bytes.clone()).await
+}
+
+/// 拒绝目录或链接；缺失的文件无需再删除。
+#[tauri::command]
+pub(crate) async fn extension_file_delete(
+    request: Request<'_>,
+    ops: State<'_, Arc<dyn DesktopOps>>,
+) -> R<()> {
+    let a: FileArgs = args(&request)?;
+    ops.extension_file_delete(a.id, a.name).await
+}

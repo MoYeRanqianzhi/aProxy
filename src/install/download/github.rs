@@ -13,6 +13,8 @@
 //!
 //! 指定版本时按 tag `v<version>` 精确定位（`/releases/tags/v<version>`）。
 
+use super::issue::Issue;
+
 use super::{Artifact, Channel, DownloadCtx, Fetched, download_to};
 use std::path::Path;
 
@@ -38,23 +40,26 @@ async fn api_get(
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
-        .map_err(|e| format!("GitHub API 请求失败: {e}"))?;
+        .map_err(|e| Issue::GhApi { e: e.to_string() })?;
     if !resp.status().is_success() {
         let code = if exact_tag && resp.status() == reqwest::StatusCode::NOT_FOUND {
             "install_version_not_found"
         } else {
             "install_download_failed"
         };
-        return Err(crate::install::InstallFailure::new(
+        return Err(crate::install::InstallFailure::because(
             code,
-            format!("GitHub API HTTP {}", resp.status()),
+            Issue::GhStatus {
+                status: resp.status().to_string(),
+            }
+            .into(),
         ));
     }
     let body = super::response_bytes(resp, artifact.budget(super::MAX_ARCHIVE)).await?;
     serde_json::from_slice(&body).map_err(|e| {
-        crate::install::InstallFailure::new(
+        crate::install::InstallFailure::because(
             "install_download_failed",
-            format!("GitHub API 解析失败: {e}"),
+            Issue::GhParse { e: e.to_string() }.into(),
         )
     })
 }
@@ -207,7 +212,10 @@ pub async fn fetch(
         .iter()
         .find(|(n, _)| *n == asset)
         .map(|(_, u)| u.clone())
-        .ok_or_else(|| format!("release v{} 无资产 {asset}", ctx.version))?;
+        .ok_or_else(|| Issue::GhAsset {
+            version: ctx.version.to_string(),
+            asset: asset.to_string(),
+        })?;
     download_to(&ctx.client, &url, dest, artifact).await?;
     // .sha256 强校验
     let sum_url = format!("{url}.sha256");
@@ -216,9 +224,9 @@ pub async fn fetch(
         .get(&sum_url)
         .send()
         .await
-        .map_err(|e| format!(".sha256 下载失败: {e}"))?
+        .map_err(|e| Issue::ShaFetch { e: e.to_string() })?
         .error_for_status()
-        .map_err(|e| format!(".sha256 资产不可用: {e}"))?;
+        .map_err(|e| Issue::ShaStatus { e: e.to_string() })?;
     let body = super::response_bytes(expected, artifact.budget(super::MAX_CHECKSUM)).await?;
     let expected = String::from_utf8_lossy(&body);
     let expected = expected
@@ -229,9 +237,13 @@ pub async fn fetch(
     let actual = crate::install::staging::sha256_hex(dest)?;
     if expected != actual {
         let _ = std::fs::remove_file(dest);
-        return Err(crate::install::InstallFailure::new(
+        return Err(crate::install::InstallFailure::because(
             "install_checksum_mismatch",
-            format!("sha256 不匹配（期望 {expected}，实际 {actual}）"),
+            Issue::Checksum {
+                expected: expected.to_string(),
+                actual: actual.to_string(),
+            }
+            .into(),
         ));
     }
     Ok(Fetched {
@@ -252,7 +264,7 @@ pub async fn latest_version(
     ctx: &DownloadCtx,
     channel: Channel,
     artifact: Artifact,
-) -> Result<Option<LatestRelease>, String> {
+) -> Result<Option<LatestRelease>, crate::install::InstallFailure> {
     // 一页 100 条：两条发版线合计远低于此量级（主线每版一条、format 线
     // 更稀疏）；即便未来超出，被挤出首页的也只会是最旧的 release
     let body = api_get(
@@ -263,7 +275,7 @@ pub async fn latest_version(
     )
     .await?;
     if !body.is_array() {
-        return Err("GitHub Releases 列表格式异常（非数组）".to_string());
+        return Err(Issue::GhList.into());
     }
     Ok(pick_release(
         &body,

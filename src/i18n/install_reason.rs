@@ -59,6 +59,13 @@ message!(cannot_abort(phase:InstallPhase), en: "The installation has reached bin
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "id", content = "args", rename_all = "snake_case")]
 pub enum Cause {
+    /// 原始渠道的失败分类。
+    Download(super::download::issue::Issue),
+    /// 尝试顺序也是诊断的一部分；每个渠道只保留最后一次失败的原因。
+    Sources {
+        asset: String,
+        failures: Vec<(String, Cause)>,
+    },
     /// 独立 skill 命令及普通安装支线保留同一组故障事实。
     Skill(super::skills::issue::Issue),
     /// 显式本地文件与要安装的变体不一致。
@@ -120,10 +127,42 @@ pub enum Cause {
         error: String,
     },
 }
+message!(sources(asset:&str,errors:&str),en:"All download sources failed (asset {asset}):\n  {errors}",zh:"下载链条全失败（asset {asset}）:\n  {errors}");
 impl Cause {
+    /// 只保留可安全记录的文档下载参数；未知的嵌套类型回退到已打码的英文证据。
+    pub(crate) fn scrub_skill_urls(&mut self, clean: &impl Fn(&mut String)) {
+        match self {
+            Self::Sources { asset, failures } => {
+                clean(asset);
+                for (_, e) in failures {
+                    e.scrub_skill_urls(clean);
+                }
+            }
+            Self::Download(e) => e.scrub(clean),
+            Self::Evidence(s) => clean(s),
+            other => {
+                let mut s = other.render(Lang::En);
+                let before = s.clone();
+                clean(&mut s);
+                if before != s {
+                    *other = Self::Evidence(s);
+                }
+            }
+        }
+    }
     /// 状态文件、事件和日志选英文，终端可以对相同的事实另选语言。
     pub fn render(&self, lang: Lang) -> String {
         match self {
+            Self::Download(e) => e.render(lang),
+            Self::Sources { asset, failures } => sources(
+                lang,
+                asset,
+                &failures
+                    .iter()
+                    .map(|(s, e)| format!("[{s}] {}", e.render(lang)))
+                    .collect::<Vec<_>>()
+                    .join("\n  "),
+            ),
             Self::Skill(e) => e.render(lang),
             Self::LocalVariant { path, got, want } => local_variant(
                 lang,

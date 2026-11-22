@@ -28,7 +28,7 @@ pub(crate) async fn install(proxy: Option<&str>, json_output: bool) -> u8 {
     let settings = aproxy::settings::load();
     let result = async {
         let ctx = DownloadCtx::build(version, proxy.or(settings.download_proxy.as_deref()), None)
-            .map_err(|e| InstallFailure::new("install_download_failed", e))?;
+            .map_err(|e| InstallFailure::because("install_download_failed", e.into()))?;
         skills::install(&ctx, &effective_chain(&settings), &home).await
     }
     .await;

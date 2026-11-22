@@ -9,6 +9,8 @@
 //!   跟随 ~/.cargo 的 source replacement 镜像）→ 产物提取。skill 文件随
 //!   crate 分发（include 白名单）→ 从解包目录提取。
 
+use super::issue::Issue;
+
 use super::{Artifact, DownloadCtx, Fetched};
 use std::path::Path;
 
@@ -19,8 +21,8 @@ fn crate_url(version: &str) -> String {
 
 /// 下载并解包 .crate 到 dest_dir（内含 `aproxy-{version}/` 目录）。
 /// 返回解包出的 crate 源码目录。
-async fn fetch_and_unpack_crate(ctx: &DownloadCtx, dest_dir: &Path) -> Result<PathBuf, String> {
-    crate::fsx::create_dir_all(dest_dir).map_err(|e| format!("crate 目录创建失败: {e}"))?;
+async fn fetch_and_unpack_crate(ctx: &DownloadCtx, dest_dir: &Path) -> Result<PathBuf, Issue> {
+    crate::fsx::create_dir_all(dest_dir).map_err(|e| Issue::CrateDir { e: e.to_string() })?;
     let tgz = dest_dir.join("crate.tgz");
     let result = async {
         super::download_to(
@@ -33,15 +35,15 @@ async fn fetch_and_unpack_crate(ctx: &DownloadCtx, dest_dir: &Path) -> Result<Pa
         // crates.io checksum：下载 URL 本身即信任锚（官方 CDN）；
         // .crate 的 sha512 随 API 元数据分发——此处直接以 CDN 内容为准
         //（与 cargo 工具链同一信任级别）
-        let f = std::fs::File::open(&tgz).map_err(|e| format!("crate 打开失败: {e}"))?;
+        let f = std::fs::File::open(&tgz).map_err(|e| Issue::CrateOpen { e: e.to_string() })?;
         let gz = flate2::read::GzDecoder::new(f);
         let mut archive = tar::Archive::new(gz);
         archive
             .unpack(dest_dir)
-            .map_err(|e| format!("crate 解包失败: {e}"))?;
+            .map_err(|e| Issue::CrateUnpack { e: e.to_string() })?;
         let src = dest_dir.join(format!("aproxy-{}", ctx.version));
         if !src.is_dir() {
-            return Err("crate 解包后未找到源码目录".to_string());
+            return Err(Issue::CrateMissing);
         }
         Ok(src)
     }
@@ -57,16 +59,16 @@ use std::path::PathBuf;
 /// 无模板时按本仓库命名兜底（`aproxy-<target><binary-ext>`，pkg-fmt=bin）。
 /// 模板只描述带界面的默认产物：装无界面版本时一律按本仓库命名取
 /// `aproxy-headless-<target><binary-ext>`。
-pub async fn fetch(ctx: &DownloadCtx, artifact: Artifact, dest: &Path) -> Result<Fetched, String> {
+pub async fn fetch(ctx: &DownloadCtx, artifact: Artifact, dest: &Path) -> Result<Fetched, Issue> {
     if artifact != Artifact::Binary {
-        return Err("cargo-binstall 通道不支持 skill（该级跳过）".to_string());
+        return Err(Issue::BinstallSkip);
     }
     let work = dest.parent().unwrap().join("binstall-work");
     let _ = std::fs::remove_dir_all(&work);
     let src = fetch_and_unpack_crate(ctx, &work).await?;
     let manifest = std::fs::read_to_string(src.join("Cargo.toml.toml"))
         .or_else(|_| std::fs::read_to_string(src.join("Cargo.toml")))
-        .map_err(|e| format!("crate manifest 读取失败: {e}"))?;
+        .map_err(|e| Issue::CrateManifest { e: e.to_string() })?;
     // 模板提取（手写解析避免引 toml 依赖的二次成本——只找 [package.metadata.binstall] 的 pkg-url/pkg-fmt 两键）
     let (pkg_url, _pkg_fmt) = parse_binstall_template(&manifest);
     let binary_ext = if cfg!(windows) { ".exe" } else { "" };
@@ -131,7 +133,7 @@ pub async fn fetch_build(
     ctx: &DownloadCtx,
     artifact: Artifact,
     dest: &Path,
-) -> Result<Fetched, String> {
+) -> Result<Fetched, Issue> {
     match artifact {
         Artifact::Binary => {}
         Artifact::Skills => {
@@ -157,19 +159,21 @@ pub async fn fetch_build(
             .arg(src_buf.join("Cargo.toml"))
             .env("CARGO_TARGET_DIR", &target_buf)
             .status()
-            .map_err(|e| format!("cargo 不可用（该级需 Rust 工具链）: {e}"))?;
+            .map_err(|e| Issue::CargoMissing { e: e.to_string() })?;
         if !status.success() {
-            return Err("cargo build 失败（编译输出见 stderr）".to_string());
+            return Err(Issue::CargoFailed);
         }
         Ok(())
     })
     .await
-    .map_err(|e| format!("编译任务失败: {e}"))?;
+    .map_err(|e| Issue::Build { e: e.to_string() })?;
     build?;
     if !out_bin.is_file() {
-        return Err(format!("编译产物不存在: {}", out_bin.display()));
+        return Err(Issue::MissingBuild {
+            path: out_bin.display().to_string(),
+        });
     }
-    std::fs::copy(&out_bin, dest).map_err(|e| format!("产物复制失败: {e}"))?;
+    std::fs::copy(&out_bin, dest).map_err(|e| Issue::Copy { e: e.to_string() })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -185,7 +189,7 @@ pub async fn fetch_build(
 
 /// crate 保留原有文档路径，发布包把同一份清单放在它们旁边。只取普通文件，
 /// 不把 tar 里的任意路径或链接展开到磁盘，也不为没有清单的旧版临时签发清单。
-async fn fetch_build_skills(ctx: &DownloadCtx, dest: &Path) -> Result<Fetched, String> {
+async fn fetch_build_skills(ctx: &DownloadCtx, dest: &Path) -> Result<Fetched, Issue> {
     let tgz = dest.with_extension("crate");
     super::download_to(
         &ctx.client,
@@ -194,9 +198,10 @@ async fn fetch_build_skills(ctx: &DownloadCtx, dest: &Path) -> Result<Fetched, S
         Artifact::Skills,
     )
     .await?;
-    let input = std::fs::File::open(tgz).map_err(|e| format!("crate 打开失败：{e}"))?;
-    let out = std::fs::File::create(dest).map_err(|e| format!("zip 创建失败：{e}"))?;
-    translate_skills(input, out, &ctx.version).map_err(|e| format!("crate 文档读取失败：{e}"))?;
+    let input = std::fs::File::open(tgz).map_err(|e| Issue::CrateSkillOpen { e: e.to_string() })?;
+    let out = std::fs::File::create(dest).map_err(|e| Issue::Zip { e: e.to_string() })?;
+    translate_skills(input, out, &ctx.version)
+        .map_err(|e| Issue::Skill(Box::new(crate::install::skills::issue::Issue::from_io(&e))))?;
     Ok(Fetched {
         path: dest.to_path_buf(),
         sha256: crate::install::staging::sha256_hex(dest)?,

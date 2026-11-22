@@ -309,7 +309,7 @@ async fn query_latest(
     channel: aproxy::install::download::Channel,
     artifact: aproxy::install::download::Artifact,
     json: bool,
-) -> Result<Option<aproxy::install::download::github::LatestRelease>, String> {
+) -> Result<Option<aproxy::install::download::github::LatestRelease>, InstallFailure> {
     super::say(json, text::checking(terminal_lang(), channel.label()));
     match aproxy::install::download::github::latest_version(ctx, channel, artifact).await {
         Ok(v) => Ok(v),
@@ -320,7 +320,7 @@ async fn query_latest(
                         json,
                         text::npm_fallback(
                             terminal_lang(),
-                            &gh_err,
+                            &gh_err.render(terminal_lang()),
                             v.as_deref().unwrap_or(text::empty_channel(terminal_lang())),
                         ),
                     );
@@ -360,13 +360,13 @@ async fn run_check(args: &InstallArgs) {
             };
         }
         let release = query_latest(&ctx, channel, Artifact::Binary, args.json).await?;
-        Ok::<_, String>((ctx.variant, release))
+        Ok::<_, InstallFailure>((ctx.variant, release))
     }
     .await;
     let (variant, release) = match query {
         Ok(pair) => pair,
         Err(e) => {
-            let failure = InstallFailure::new("install_download_failed", e);
+            let failure = InstallFailure::because("install_download_failed", e.into_cause());
             eprintln!("[ERROR] {}", failure.render(terminal_lang()));
             eprintln!("{}", text::proxy_hint(terminal_lang()));
             if args.json {
@@ -431,7 +431,7 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
         args.cpu.as_deref(),
     ) {
         Ok(c) => c,
-        Err(e) => fail(InstallFailure::new("install_download_failed", e)),
+        Err(e) => fail(InstallFailure::because("install_download_failed", e.into())),
     };
     let own_variant = ctx.variant;
     let explicit_variant = args.variant.is_some();
@@ -456,9 +456,9 @@ async fn run_online(home: &std::path::Path, run_dir: &std::path::Path, args: &In
             let candidate = match query_latest(&ctx, channel, Artifact::Binary, args.json).await {
                 Ok(c) => c.map(|r| r.version),
                 Err(gh_err) => {
-                    eprintln!("[ERROR] {gh_err}");
+                    eprintln!("[ERROR] {}", gh_err.render(terminal_lang()));
                     eprintln!("{}", text::explicit_hint(terminal_lang()));
-                    let e = InstallFailure::new("install_download_failed", gh_err);
+                    let e = InstallFailure::because("install_download_failed", gh_err.into_cause());
                     events::result("failed", Some((&e, &e.message)));
                     crate::util::exit(e.exit_code());
                 }

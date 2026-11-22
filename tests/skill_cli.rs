@@ -378,7 +378,27 @@ async fn checksum_response_is_bounded() {
             ),
     )
     .await;
-    assert!(String::from_utf8_lossy(&run(&h, &["skill", "install"], 1).stderr).contains("超限"));
+    let mut documents = Vec::new();
+    for (lang, expected) in [("en", "size limit"), ("zh-CN", "超限")] {
+        let out = h
+            .cmd()
+            .env("APROXY_LANG", lang)
+            .args(["skill", "install", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains(expected), "{stderr}");
+        let document: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(
+            document["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("size limit")
+        );
+        documents.push(out.stdout);
+    }
+    assert_eq!(documents[0], documents[1]);
     assert!(!h.path().join("skills/manifest.json").exists());
 }
 
@@ -402,7 +422,7 @@ async fn download_errors_do_not_echo_urls() {
             assert!(!String::from_utf8_lossy(out).contains("private-"));
         }
         let msg = String::from_utf8_lossy(&o.stderr);
-        assert!(msg.contains("[url]") && msg.contains("请求失败"));
+        assert!(msg.contains("[url]") && msg.contains("Request failed"));
     }
 }
 

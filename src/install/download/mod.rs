@@ -24,6 +24,10 @@ pub mod crates;
 pub mod github;
 pub mod npmpkg;
 
+#[path = "../../i18n/download.rs"]
+pub mod issue;
+use issue::Issue;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -117,7 +121,7 @@ impl<'de> Deserialize<'de> for ChainStep {
                 "cargo-binstall" => Ok(ChainStep::Binstall),
                 "cargo" => Ok(ChainStep::Cargo),
                 other => Err(serde::de::Error::custom(format!(
-                    "未知下载渠道 \"{other}\"（取值：github | npm | cargo-binstall | cargo，或 {{\"url\": \"模板\"}}）"
+                    "unknown download source \"{other}\" (expected github, npm, cargo-binstall, cargo or {{\"url\": \"template\"}})"
                 ))),
             },
             Raw::Url { url } => Ok(ChainStep::Url { url }),
@@ -234,13 +238,16 @@ pub fn check_downgrade(
     current: &semver::Version,
     allow_downgrade: bool,
 ) -> Result<semver::Version, crate::install::InstallFailure> {
-    let t = semver::Version::parse(target)
-        .map_err(|e| format!("版本号 {target} 非法（semver 解析失败: {e}）"))?;
+    let t = semver::Version::parse(target).map_err(|e| Issue::Semver {
+        target: target.to_string(),
+        e: e.to_string(),
+    })?;
     super::check_floor(&t).map_err(|e| super::InstallFailure::new("install_below_floor", e))?;
     if t < *current && !allow_downgrade {
-        return Err(format!(
-            "目标版本 {target} 低于当前 {current}。确认要降级请加 --allow-downgrade。"
-        )
+        return Err(Issue::Downgrade {
+            target: target.to_string(),
+            current: current.to_string(),
+        }
         .into());
     }
     Ok(t)
@@ -313,12 +320,14 @@ impl DownloadCtx {
         version: &str,
         download_proxy: Option<&str>,
         cpu_override: Option<&str>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, Issue> {
         let cpu_suffix = match cpu_override {
             Some("x86-64-v3") => "-v3",
             Some("baseline") => "",
             Some(other) => {
-                return Err(format!("未知指令集档 {other}（取值 x86-64-v3 | baseline）"));
+                return Err(Issue::Cpu {
+                    other: other.to_string(),
+                });
             }
             None if prefers_x86_64_v3() && publishes_v3(runtime_target()) => "-v3",
             None => "",
@@ -332,13 +341,12 @@ impl DownloadCtx {
         if let Some(proxy) = download_proxy {
             // 代理 URL 可能内嵌凭据（user:pass@host）——错误信息打码（计划
             // 定调：与 config --show 的 base_url 同一口径）
-            let p = reqwest::Proxy::all(proxy)
-                .map_err(|_| "下载代理 URL 非法（凭据已隐去）".to_string())?;
+            let p = reqwest::Proxy::all(proxy).map_err(|_| Issue::Proxy)?;
             builder = builder.proxy(p);
         }
         let client = builder
             .build()
-            .map_err(|e| format!("HTTP 客户端构建失败: {e}"))?;
+            .map_err(|e| Issue::Client { e: e.to_string() })?;
         Ok(Self {
             client,
             version: version.to_string(),
@@ -455,26 +463,30 @@ async fn download_to(
     url: &str,
     dest: &Path,
     artifact: Artifact,
-) -> Result<(), String> {
+) -> Result<(), Issue> {
     let resp = client
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("请求失败: {e}"))?;
+        .map_err(|e| Issue::Request { e: e.to_string() })?;
     if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
+        return Err(Issue::Http {
+            status: resp.status().to_string(),
+        });
     }
     save_download(resp, dest, artifact.budget(MAX_ARCHIVE)).await
 }
 
 /// 直接把响应体写入目标，按字节而不是分块数上报进度；写盘失败不发送完成通知。
-async fn save_download(resp: reqwest::Response, dest: &Path, limit: u64) -> Result<(), String> {
-    let file =
-        std::fs::File::create(dest).map_err(|e| format!("{} 创建失败: {e}", dest.display()))?;
+async fn save_download(resp: reqwest::Response, dest: &Path, limit: u64) -> Result<(), Issue> {
+    let file = std::fs::File::create(dest).map_err(|e| Issue::Create {
+        path: dest.display().to_string(),
+        e: e.to_string(),
+    })?;
     receive(resp, file, limit, true).await
 }
 /// 元数据与校验响应也逐块过限额，不能先整载再量长度。
-async fn response_bytes(resp: reqwest::Response, limit: u64) -> Result<Vec<u8>, String> {
+async fn response_bytes(resp: reqwest::Response, limit: u64) -> Result<Vec<u8>, Issue> {
     let mut buf = Vec::new();
     receive(resp, &mut buf, limit, false).await?;
     Ok(buf)
@@ -485,7 +497,7 @@ async fn receive(
     mut file: impl std::io::Write,
     limit: u64,
     progress: bool,
-) -> Result<(), String> {
+) -> Result<(), Issue> {
     let total = resp.content_length().or_else(|| {
         resp.headers()
             .get(reqwest::header::CONTENT_LENGTH)?
@@ -495,24 +507,29 @@ async fn receive(
             .ok()
     });
     if total.is_some_and(|n| n > limit) {
-        return Err("文档下载大小超限".into());
+        return Err(Issue::Limit);
     }
     let mut bytes = 0;
     let mut last = std::time::Instant::now();
     let mut stream = resp;
-    while let Some(chunk) = stream.chunk().await.map_err(|e| format!("下载中断: {e}"))? {
+    while let Some(chunk) = stream
+        .chunk()
+        .await
+        .map_err(|e| Issue::Interrupted { e: e.to_string() })?
+    {
         if chunk.len() as u64 > limit - bytes {
-            return Err("文档下载大小超限".into());
+            return Err(Issue::Limit);
         }
         file.write_all(&chunk)
-            .map_err(|e| format!("写入失败: {e}"))?;
+            .map_err(|e| Issue::Write { e: e.to_string() })?;
         bytes += chunk.len() as u64;
         if progress && last.elapsed() >= std::time::Duration::from_millis(100) {
             let _ = super::state::OBSERVER.try_with(|o| (o.progress)(bytes, total));
             last = std::time::Instant::now();
         }
     }
-    file.flush().map_err(|e| format!("flush 失败: {e}"))?;
+    file.flush()
+        .map_err(|e| Issue::Flush { e: e.to_string() })?;
     if progress {
         let _ = super::state::OBSERVER.try_with(|o| (o.progress)(bytes, total));
     }
@@ -579,7 +596,7 @@ pub async fn fetch_artifact(
     artifact: Artifact,
     dest_dir: &Path,
 ) -> Result<Fetched, super::InstallFailure> {
-    crate::fsx::create_dir_all(dest_dir).map_err(|e| format!("下载目录创建失败: {e}"))?;
+    crate::fsx::create_dir_all(dest_dir).map_err(|e| Issue::Directory { e: e.to_string() })?;
     let asset = artifact.asset_name(ctx.target, ctx.variant, ctx.cpu_suffix);
     let mut errors = Vec::new();
     let mut missing_only = !chain.is_empty();
@@ -611,7 +628,8 @@ pub async fn fetch_artifact(
                     // unix 下载产物必须补可执行位（GitHub 裸下载不带 755，
                     // 缺位会让后续 --version 自证直接 Permission denied）
                     let final_dest = dest_dir.join(&asset);
-                    std::fs::rename(&dest, &final_dest).map_err(|e| format!("落位失败: {e}"))?;
+                    std::fs::rename(&dest, &final_dest)
+                        .map_err(|e| Issue::Publish { e: e.to_string() })?;
                     crate::install::staging::ensure_executable(&final_dest);
                     return Ok(Fetched {
                         path: final_dest,
@@ -623,7 +641,7 @@ pub async fn fetch_artifact(
                     missing_only &= e.code == "install_version_not_found";
                     checksum |= e.code == "install_checksum_mismatch";
                     if attempt == 2 {
-                        errors.push(format!("[{}] {e}", step.name()));
+                        errors.push((step.name().to_owned(), e.into_cause()));
                         break;
                     }
                 }
@@ -638,12 +656,12 @@ pub async fn fetch_artifact(
     } else {
         "install_download_failed"
     };
-    Err(super::InstallFailure::new(
+    Err(super::InstallFailure::because(
         code,
-        format!(
-            "下载链条全失败（asset {asset}）:\n  {}",
-            errors.join("\n  ")
-        ),
+        super::reason::Cause::Sources {
+            asset,
+            failures: errors,
+        },
     ))
 }
 
@@ -679,14 +697,21 @@ async fn fetch_url_template(
                 .to_lowercase();
             if expected != sum {
                 let _ = std::fs::remove_file(dest);
-                return Err(super::InstallFailure::new(
+                return Err(super::InstallFailure::because(
                     "install_checksum_mismatch",
-                    format!("sha256 不匹配（期望 {expected}，实际 {sum}）"),
+                    Issue::Checksum {
+                        expected: expected.to_string(),
+                        actual: sum.to_string(),
+                    }
+                    .into(),
                 ));
             }
         }
         None => {
-            tracing::warn!(asset, "来源为非官方镜像（url 模板），产物未经独立校验");
+            tracing::warn!(
+                asset,
+                "unofficial URL-template source: artifact not independently verified"
+            );
         }
     }
     Ok(Fetched {
@@ -962,7 +987,7 @@ mod tests {
             let err = receive(response.body(body).unwrap().into(), &mut out, 3, false)
                 .await
                 .unwrap_err();
-            assert!(err.contains("超限"));
+            assert!(matches!(err, Issue::Limit));
             assert_eq!(out, if declared { &b""[..] } else { b"ab" });
         }
         assert_eq!(Artifact::Binary.budget(MAX_ARCHIVE), u64::MAX);
@@ -1025,7 +1050,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, "install_download_failed");
         assert!(
-            err.message.contains("全失败") && err.message.contains("[url]"),
+            err.message.contains("All download sources failed") && err.message.contains("[url]"),
             "{err}"
         );
     }

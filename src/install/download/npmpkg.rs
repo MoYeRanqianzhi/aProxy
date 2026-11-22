@@ -5,6 +5,8 @@
 //! 数据流：拉包元数据（各版本 tarball URL 与 dist.integrity sha512）→
 //! 下载 tgz → tar.gz 解包提取产物（二进制在平台包 `bin/`，skill 在主包）。
 
+use super::issue::Issue;
+
 use super::{Artifact, DownloadCtx, Fetched, download_to};
 use std::path::Path;
 
@@ -82,7 +84,7 @@ struct TarballMeta {
 }
 
 /// 拉包元数据。`artifact` 决定查主包（skill）还是平台包（二进制）。
-async fn fetch_meta(ctx: &DownloadCtx, artifact: Artifact) -> Result<TarballMeta, String> {
+async fn fetch_meta(ctx: &DownloadCtx, artifact: Artifact) -> Result<TarballMeta, Issue> {
     let package = match artifact {
         Artifact::Binary => platform_package(ctx),
         Artifact::Skills => "@meowo/aproxy".to_string(),
@@ -95,22 +97,29 @@ async fn fetch_meta(ctx: &DownloadCtx, artifact: Artifact) -> Result<TarballMeta
         .header("Accept", "application/vnd.npm.install-v1+json")
         .send()
         .await
-        .map_err(|e| format!("registry 请求失败（{}）: {e}", registry))?
+        .map_err(|e| Issue::RegistryRequest {
+            registry: registry.to_string(),
+            e: e.to_string(),
+        })?
         .error_for_status()
-        .map_err(|e| format!("registry 无此包/版本（{}）: {e}", registry))?;
+        .map_err(|e| Issue::RegistryVersion {
+            registry: registry.to_string(),
+            e: e.to_string(),
+        })?;
     let bytes = super::response_bytes(resp, artifact.budget(super::MAX_ARCHIVE)).await?;
     let meta: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|e| format!("registry 元数据解析失败: {e}"))?;
+        serde_json::from_slice(&bytes).map_err(|e| Issue::RegistryJson { e: e.to_string() })?;
     let version_meta = &meta["versions"][&ctx.version];
     if version_meta.is_null() {
-        return Err(format!(
-            "registry 上 {package} 无版本 {}（{}）",
-            ctx.version, registry
-        ));
+        return Err(Issue::RegistryMissing {
+            package: package.to_string(),
+            version: ctx.version.to_string(),
+            registry: registry.to_string(),
+        });
     }
     let tarball = version_meta["dist"]["tarball"]
         .as_str()
-        .ok_or("元数据缺 dist.tarball")?
+        .ok_or(Issue::Tarball)?
         .to_string();
     let integrity = version_meta["dist"]["integrity"].as_str().map(String::from);
     Ok(TarballMeta {
@@ -120,7 +129,7 @@ async fn fetch_meta(ctx: &DownloadCtx, artifact: Artifact) -> Result<TarballMeta
 }
 
 /// base64 解码（integrity 是 `sha512-<base64>` 格式）。
-fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+fn b64_decode(s: &str) -> Result<Vec<u8>, Issue> {
     // 手写 base64：sha2 已有，避免引入 base64 依赖；integrity 字符集
     // 受控（npm registry 生成），非法输入按错误处理
     let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -132,7 +141,7 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
                 .iter()
                 .position(|a| *a == b)
                 .map(|p| p as u8)
-                .ok_or_else(|| "integrity 含非法 base64 字符".to_string())
+                .ok_or(Issue::Base64)
         })
         .collect::<Result<_, _>>()?;
     let mut out = Vec::with_capacity(vals.len() * 3 / 4);
@@ -158,8 +167,8 @@ fn extract_from_tgz(
     inner_path: &str,
     dest: &Path,
     artifact: Artifact,
-) -> Result<(), String> {
-    let f = std::fs::File::open(tgz).map_err(|e| format!("tgz 打开失败: {e}"))?;
+) -> Result<(), Issue> {
+    let f = std::fs::File::open(tgz).map_err(|e| Issue::TgzOpen { e: e.to_string() })?;
     let gz = flate2::read::GzDecoder::new(f);
     use std::io::Read;
     let mut archive = tar::Archive::new(super::TarBudget(
@@ -167,12 +176,12 @@ fn extract_from_tgz(
     ));
     for entry in archive
         .entries()
-        .map_err(|e| format!("tar 解包失败: {e}"))?
+        .map_err(|e| Issue::TarRead { e: e.to_string() })?
     {
-        let entry = entry.map_err(|e| format!("tar 条目读取失败: {e}"))?;
+        let entry = entry.map_err(|e| Issue::TarEntry { e: e.to_string() })?;
         let name = entry
             .path()
-            .map_err(|e| format!("tar 路径读取失败: {e}"))?
+            .map_err(|e| Issue::TarPath { e: e.to_string() })?
             .to_string_lossy()
             .to_string();
         // npm tarball 内部统一带 package/ 前缀（组包脚本同款）
@@ -181,16 +190,20 @@ fn extract_from_tgz(
             // entry 内路径——穿越无从谈起
             let limit = artifact.budget(super::MAX_ARCHIVE);
             if entry.size() > limit {
-                return Err("文档下载大小超限".into());
+                return Err(Issue::Limit);
             }
-            let mut out = std::fs::File::create(dest)
-                .map_err(|e| format!("{} 创建失败: {e}", dest.display()))?;
+            let mut out = std::fs::File::create(dest).map_err(|e| Issue::Create {
+                path: dest.display().to_string(),
+                e: e.to_string(),
+            })?;
             std::io::copy(&mut super::TarBudget(entry.take(limit)), &mut out)
-                .map_err(|e| format!("tar 条目提取失败: {e}"))?;
+                .map_err(|e| Issue::Extract { e: e.to_string() })?;
             return Ok(());
         }
     }
-    Err(format!("tgz 内未找到 {inner_path}"))
+    Err(Issue::NotInTgz {
+        inner_path: inner_path.to_string(),
+    })
 }
 
 /// 纯函数选版：从主包 `dist-tags` 按通道取版本。
@@ -227,7 +240,7 @@ pub fn pick_from_dist_tags(
 pub async fn latest_version(
     ctx: &DownloadCtx,
     channel: super::Channel,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, Issue> {
     let registry = registry_from_npmrc();
     let url = format!("{registry}/@meowo/aproxy");
     let resp = ctx
@@ -236,15 +249,21 @@ pub async fn latest_version(
         .header("Accept", "application/vnd.npm.install-v1+json")
         .send()
         .await
-        .map_err(|e| format!("registry 请求失败（{registry}）: {e}"))?
+        .map_err(|e| Issue::RegistryRequest {
+            registry: registry.to_string(),
+            e: e.to_string(),
+        })?
         .error_for_status()
-        .map_err(|e| format!("registry 无主包（{registry}）: {e}"))?;
+        .map_err(|e| Issue::RegistryMain {
+            registry: registry.to_string(),
+            e: e.to_string(),
+        })?;
     let meta: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("registry 元数据解析失败: {e}"))?;
+        .map_err(|e| Issue::RegistryJson { e: e.to_string() })?;
     if !meta["dist-tags"].is_object() {
-        return Err("元数据缺 dist-tags".to_string());
+        return Err(Issue::Tags);
     }
     Ok(pick_from_dist_tags(&meta["dist-tags"], channel))
 }
@@ -262,18 +281,21 @@ pub async fn fetch(
         // integrity（sha512）强校验
         if let Some(integrity) = &meta.integrity_sha512 {
             let Some(encoded) = integrity.strip_prefix("sha512-") else {
-                return Err(format!("不支持的 integrity 格式: {integrity}").into());
+                return Err(Issue::Integrity {
+                    integrity: integrity.to_string(),
+                }
+                .into());
             };
             let expected = b64_decode(encoded)?;
-            let data = std::fs::read(&tgz_dest).map_err(|e| format!("tgz 读取失败: {e}"))?;
+            let data = std::fs::read(&tgz_dest).map_err(|e| Issue::TgzRead { e: e.to_string() })?;
             use sha2::Digest;
             let mut h = sha2::Sha512::new();
             h.update(&data);
             let actual: Vec<u8> = h.finalize().iter().copied().collect();
             if expected != actual {
-                return Err(crate::install::InstallFailure::new(
+                return Err(crate::install::InstallFailure::because(
                     "install_checksum_mismatch",
-                    "integrity sha512 不匹配（npm registry 校验失败）",
+                    Issue::Sha512.into(),
                 ));
             }
         }

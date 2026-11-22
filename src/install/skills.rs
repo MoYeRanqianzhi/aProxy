@@ -188,8 +188,19 @@ pub async fn install(
                 static URL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
                     regex::Regex::new(r"(?i)[a-z][a-z0-9+.\-]*://\S+").unwrap()
                 });
-                let message = URL.replace_all(&e.message, "[URL redacted]").into_owned();
-                e.with_message(message)
+                let mut e = e;
+                let clean = |value: &mut String| {
+                    if let std::borrow::Cow::Owned(s) = URL.replace_all(value, "[URL redacted]") {
+                        *value = s;
+                    }
+                };
+                if let Some(cause) = &mut e.cause {
+                    cause.scrub_skill_urls(&clean);
+                    e.message = cause.render(aproxy_ipc::i18n::Lang::En);
+                } else {
+                    clean(&mut e.message);
+                }
+                e
             })?;
         let (manifest, ignored) = archive::publish(&root, &stage, &fetched.path, &ctx.version)
             .map_err(|e| Issue::Install(Box::new(Issue::from_io(&e))))?;

@@ -238,7 +238,7 @@ pub(crate) fn config_failure(error: &ConfigError) -> Failure {
 /// 这个进程没有控制台：在日志初始化之前出的错（规格读不出来）与配置错误都写进
 /// startup.log，拉起方在子进程退出后从那里摘录原因。
 pub(crate) async fn handle_serve_cmd(spec_path: &Path) -> u8 {
-    let mut spec = match spec::read_spec_file(spec_path) {
+    let (mut spec, revision) = match spec::read_launch_file(spec_path) {
         Ok(spec) => spec,
         Err(e) => {
             report_launch(
@@ -256,14 +256,37 @@ pub(crate) async fn handle_serve_cmd(spec_path: &Path) -> u8 {
 
     // 日志初始化排在校验之前：此刻配置还没有严格校验，用宽松解析定出日志写到哪里
     // （配置或覆盖里的 log_file 优先，否则用规格里记下的文件），校验不过的原因才有处可记
-    let lenient = load_lenient(&spec.overrides, cfg_file);
+    let checked = if let Some(expected) = revision {
+        match resolve_runtime_config(&spec.overrides, cfg_file) {
+            Ok(cfg) if cfg.launch_revision() == expected => Some(cfg),
+            _ => {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(spec_path)
+                {
+                    let _ = f.write_all(b"revision-mismatch");
+                }
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+    let lenient = checked
+        .clone()
+        .unwrap_or_else(|| load_lenient(&spec.overrides, cfg_file));
     let log_path = match lenient.log_file.as_deref() {
         Some(custom) => crate::server::resolve_daemon_log_path(Some(custom)),
         None => PathBuf::from(&spec.log_path),
     };
     crate::server::init_daemon_logging(&log_path);
 
-    let mut cfg = match resolve_runtime_config(&spec.overrides, cfg_file) {
+    let mut cfg = match checked
+        .map(Ok)
+        .unwrap_or_else(|| resolve_runtime_config(&spec.overrides, cfg_file))
+    {
         Ok(cfg) => cfg,
         Err(e) => {
             report_launch(e.reason(), Some(spec_path));

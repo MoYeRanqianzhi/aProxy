@@ -28,6 +28,7 @@ pub struct DesktopHome {
     state_serial: Arc<tokio::sync::Mutex<()>>,
     login_test_slot: Option<String>,
     updates: Arc<std::sync::Mutex<update::Checks>>,
+    extensions: Arc<std::sync::Mutex<extensions::Runtime>>,
     listing: Arc<std::sync::Mutex<Option<[u8; 16]>>>,
 }
 impl DesktopHome {
@@ -44,6 +45,7 @@ impl DesktopHome {
             exe,
             state_serial: Default::default(),
             login_test_slot: None,
+            extensions: Default::default(),
             listing: Default::default(),
             updates: Default::default(),
         };

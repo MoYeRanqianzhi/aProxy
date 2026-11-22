@@ -1,4 +1,6 @@
 //! 扩展包按一整份有界快照核验。发现只产生公开投影，不因文件出现在目录里就运行代码。
+mod authority;
+pub(super) use authority::Runtime;
 mod format;
 mod tree;
 use super::DesktopHome;
@@ -71,7 +73,22 @@ fn layout(dir: &Dir) -> Result<(bool, OpenFiles), Problem> {
     }
     Ok((assets, files))
 }
-fn package(root: &Dir, id: &str, secrets: Option<&Secrets>) -> Result<PackageInfo, Problem> {
+enum Payload {
+    Theme(String),
+    Script(Vec<u8>, BTreeMap<String, Vec<u8>>),
+}
+#[derive(Default)]
+struct Snapshot {
+    packages: Vec<PackageInfo>,
+    invalid: Vec<InvalidPackage>,
+    payload: Option<Payload>,
+}
+fn package(
+    root: &Dir,
+    id: &str,
+    secrets: Option<&Secrets>,
+    capture: bool,
+) -> Result<(PackageInfo, Option<Payload>), Problem> {
     let dir = root
         .child(id)
         .map_err(|r| fail(r, Field::Directory))?
@@ -135,16 +152,17 @@ fn package(root: &Dir, id: &str, secrets: Option<&Secrets>) -> Result<PackageInf
         id,
         secrets,
     )?;
-    if m.kind == ExtKind::Theme {
+    let payload = if m.kind == ExtKind::Theme {
         if assets || bytes.contains_key("main.mjs") {
             return Err(fail(Why::Layout, Field::Theme));
         }
-        format::theme(
+        let theme = format::theme(
             bytes
                 .get("theme.txt")
                 .ok_or(fail(Why::Layout, Field::Entry))?,
             secrets,
         )?;
+        capture.then_some(Payload::Theme(theme))
     } else {
         if bytes.contains_key("theme.txt") {
             return Err(fail(Why::Layout, Field::Directory));
@@ -155,7 +173,21 @@ fn package(root: &Dir, id: &str, secrets: Option<&Secrets>) -> Result<PackageInf
                 .ok_or(fail(Why::Layout, Field::Entry))?,
             Field::Entry,
         )?;
-    }
+        capture.then(|| {
+            Payload::Script(
+                bytes.remove("main.mjs").unwrap(),
+                bytes
+                    .into_iter()
+                    .filter_map(|(p, b)| {
+                        Some((
+                            p.strip_prefix("assets/")?.strip_suffix(".bin")?.to_owned(),
+                            b,
+                        ))
+                    })
+                    .collect(),
+            )
+        })
+    };
     use std::fmt::Write;
     let mut hex = String::with_capacity(64);
     for b in digest.finalize() {
@@ -165,25 +197,29 @@ fn package(root: &Dir, id: &str, secrets: Option<&Secrets>) -> Result<PackageInf
     if secrets.find(digest.as_bytes()).is_some() {
         return Err(fail(Why::PrivateData, Field::Id));
     }
-    Ok(PackageInfo {
-        principal: Principal {
-            key: ExtKey {
-                id: id.to_owned(),
-                digest,
+    Ok((
+        PackageInfo {
+            principal: Principal {
+                key: ExtKey {
+                    id: id.to_owned(),
+                    digest,
+                },
+                name: m.name,
+                version: m.version,
+                kind: m.kind,
             },
-            name: m.name,
-            version: m.version,
-            kind: m.kind,
+            permissions: m.permissions,
+            enabled: false,
+            grants: Vec::new(),
         },
-        permissions: m.permissions,
-        enabled: false,
-        grants: Vec::new(),
-    })
+        payload,
+    ))
 }
 fn discover(
     home: &Path,
     secrets: Option<&Secrets>,
-) -> Result<(Vec<PackageInfo>, Vec<InvalidPackage>), Why> {
+    wanted: Option<&ExtKey>,
+) -> Result<Snapshot, Why> {
     let home = Dir::home(home)?;
     let Some(desktop) = home.child("desktop")? else {
         return Ok(Default::default());
@@ -192,6 +228,7 @@ fn discover(
         return Ok(Default::default());
     };
     let names = root.names(COUNT, Why::PackageCount)?;
+    let mut payload = None;
     let mut good = Vec::new();
     let mut bad = Vec::new();
     for os in &names {
@@ -212,8 +249,13 @@ fn discover(
             bad.push(invalid(show, fail(Why::Path, Field::Directory)));
             continue;
         }
-        match package(&root, id, secrets) {
-            Ok(value) => good.push(value),
+        match package(&root, id, secrets, wanted.is_some_and(|k| k.id == id)) {
+            Ok((value, body)) => {
+                if wanted == Some(&value.principal.key) {
+                    payload = body;
+                }
+                good.push(value)
+            }
             Err(err) => bad.push(invalid(show, err)),
         }
     }
@@ -223,12 +265,22 @@ fn discover(
     {
         return Err(Why::Io);
     }
-    Ok((good, bad))
+    Ok(Snapshot {
+        packages: good,
+        invalid: bad,
+        payload,
+    })
 }
 impl DesktopHome {
     /// 在当前 home 的私有脱敏上下文中核验包；返回清单而非可执行载荷，损坏的包不影响邻居。
     pub fn extension_catalog(&self) -> (Vec<PackageInfo>, Vec<InvalidPackage>) {
-        discover(&self.home, self.display_secrets().as_ref())
-            .unwrap_or_else(|r| (Vec::new(), vec![invalid(None, fail(r, Field::Root))]))
+        let tree = self.extension_snapshot(None);
+        (tree.packages, tree.invalid)
+    }
+    fn extension_snapshot(&self, wanted: Option<&ExtKey>) -> Snapshot {
+        discover(&self.home, self.display_secrets().as_ref(), wanted).unwrap_or_else(|r| Snapshot {
+            invalid: vec![invalid(None, fail(r, Field::Root))],
+            ..Default::default()
+        })
     }
 }

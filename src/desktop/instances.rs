@@ -15,7 +15,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 pub(super) struct Offered {
     pub(super) path: PathBuf,
     pub(super) implicit: bool,
-    choice: Choice,
+    pub(super) choice: Choice,
 }
 
 /// 无法可信地解析文件时，诊断仍可定位到行列，但不引用可能含凭据的原文或键名。
@@ -36,7 +36,7 @@ pub(super) fn issues(ds: &[aproxy_ipc::diag::Diagnostic], secrets: Option<&Secre
         })
         .collect()
 }
-fn config_error(err: &start::ConfigError) -> Fault {
+pub(super) fn config_error(err: &start::ConfigError) -> Fault {
     match err {
         start::ConfigError::Missing(_) => Fault::DesktopTarget {},
         _ => Fault::DesktopConfig {
@@ -44,7 +44,7 @@ fn config_error(err: &start::ConfigError) -> Fault {
         },
     }
 }
-fn start_error(e: spawn::SpawnError, old_stopped: bool) -> Fault {
+pub(super) fn start_error(e: spawn::SpawnError, old_stopped: bool) -> Fault {
     Fault::DesktopStart {
         reason: match e {
             spawn::SpawnError::Spawn(_) => StartReason::Spawn,
@@ -53,7 +53,7 @@ fn start_error(e: spawn::SpawnError, old_stopped: bool) -> Fault {
         old_stopped,
     }
 }
-fn stop_error(port: u16, e: stop::StopFailure) -> Fault {
+pub(super) fn stop_error(port: u16, e: stop::StopFailure) -> Fault {
     match e {
         stop::StopFailure::GenerationChanged => Fault::DesktopChanged {},
         stop::StopFailure::Unresponsive { .. } => Fault::DesktopUnresponsive { port },
@@ -214,7 +214,7 @@ impl DesktopHome {
         }
         Ok(rec)
     }
-    fn ready(&self, rec: daemon::InstanceRecord) -> R<Run> {
+    pub(super) fn ready(&self, rec: daemon::InstanceRecord) -> R<Run> {
         let port = daemon::port_of(&rec.listen_addr)
             .parse()
             .map_err(|_| Fault::DesktopUnavailable {})?;

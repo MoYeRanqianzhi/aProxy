@@ -185,7 +185,7 @@ async fn raced_by_watchdog(
 /// [`resolve_runtime_config_in`]：严格解析、settings 的全局默认、校验），监听地址变了再探测
 /// 新地址可否绑定。只读，无副作用（bind 探测的 listener 随即释放）。通过返回新实例将
 /// 监听的地址（端口为 0、由系统分配时，规格里钉过端口就是那个端口）。
-async fn precheck(
+pub(crate) async fn precheck(
     home: &Path,
     info: &InstanceRecord,
     old_port: &str,

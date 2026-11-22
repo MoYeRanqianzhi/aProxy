@@ -93,12 +93,12 @@ fn safe(path: &Path, f: StateFile, dir: bool) -> R<()> {
     }
     Ok(())
 }
-struct Store {
+pub(super) struct Store {
     dir: PathBuf,
     _lock: crate::install::InstallLock,
 }
 impl Store {
-    fn open(home: &Path, f: StateFile) -> R<Self> {
+    pub(super) fn open(home: &Path, f: StateFile) -> R<Self> {
         let dir = home.join("desktop");
         safe(&dir, f, true)?;
         let lock = dir.join("state.lock");

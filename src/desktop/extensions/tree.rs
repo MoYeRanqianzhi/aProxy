@@ -92,8 +92,30 @@ fn windows_open(path: &Path) -> io::Result<File> {
 }
 impl Dir {
     pub(super) fn home(path: &Path) -> Result<Self, Why> {
+        Self::open_dir(path, false)
+    }
+    // Windows 的同目录原子替换需要父目录允许共享写；仍不共享删除，且拒绝重解析点。
+    pub(super) fn state_dir(path: &Path) -> Result<Self, Why> {
+        Self::open_dir(path, true)
+    }
+    fn open_dir(path: &Path, writable: bool) -> Result<Self, Why> {
+        #[cfg(unix)]
+        let _ = writable;
         #[cfg(windows)]
-        let f = windows_open(path);
+        let f = if writable {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+                FILE_SHARE_WRITE,
+            };
+            File::options()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+        } else {
+            windows_open(path)
+        };
         #[cfg(unix)]
         let f = {
             use std::os::unix::fs::OpenOptionsExt;
@@ -121,7 +143,7 @@ impl Dir {
         }))
     }
     // 名字由上层先按固定 ASCII 词表核验，不能让带斜线的外部输入直接到达 openat/join。
-    fn node(&self, name: &str) -> Result<Option<(File, Stamp, bool)>, Why> {
+    pub(super) fn node(&self, name: &str) -> Result<Option<(File, Stamp, bool)>, Why> {
         #[cfg(windows)]
         let opened = windows_open(&self.path.join(name));
         #[cfg(unix)]

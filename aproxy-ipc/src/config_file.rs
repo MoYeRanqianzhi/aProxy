@@ -136,7 +136,7 @@ impl Delivery {
 }
 
 /// format 程序参与的阶段。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum Stage {
     Request,
     Retry,
@@ -175,7 +175,7 @@ impl Stage {
 }
 
 /// format 程序的进程方式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Process {
     /// 每条消息起一个进程
     Spawn,
@@ -184,7 +184,7 @@ pub enum Process {
 }
 
 /// 一条 `[[format]]`。没写的键已经填上默认值。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct FormatEntry {
     /// 在列表内唯一；没写时取 `command` 的文件名主干
     pub name: String,
@@ -212,7 +212,7 @@ impl FormatEntry {
 }
 
 /// 一条 `[[retry.rules]]`。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RetryRule {
     /// 对客户端请求的「路径?查询串」整体匹配的正则（自动锚定）；没写 = 任何路径
     pub path: Option<String>,

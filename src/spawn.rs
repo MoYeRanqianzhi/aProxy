@@ -258,6 +258,23 @@ pub async fn spawn_from_spec(
     result
 }
 
+/// 启动已核准的规格；子进程在打开日志、绑定或运行格式程序前核对这份有效配置的摘要。
+pub(crate) async fn spawn_checked(
+    home: &Path,
+    exe: &Path,
+    spec: &InstanceSpec,
+    revision: [u8; 32],
+) -> Result<Option<InstanceStatus>, SpawnError> {
+    let mark = startup_log_len(home);
+    let path = spec::write_launch_file(&home.join("run"), spec, Some(revision))
+        .map_err(SpawnError::Spawn)?;
+    let res = launch_and_wait(home, exe, spec, &path, mark, READY_TIMEOUT).await;
+    let changed =
+        res.is_err() && std::fs::read(&path).ok().as_deref() == Some(b"revision-mismatch");
+    let _ = std::fs::remove_file(path);
+    if changed { Ok(None) } else { res.map(Some) }
+}
+
 async fn launch_and_wait(
     home: &Path,
     exe: &Path,
